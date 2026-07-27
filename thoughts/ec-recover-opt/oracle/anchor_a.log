@@ -1,0 +1,11 @@
+{
+  "pass": 669,
+  "fail": 0,
+  "skip_encoding": 8,
+  "reject_ok": 19,
+  "reject_mismatch": 0,
+  "skip_no_point": 47,
+  "skip_edge_scalar": 0,
+  "skip_offcurve_y_valid_x": 9
+}
+ANCHOR A: PASS (669 valid vectors matched, 19 off-curve correctly rejected)

@@ -1,0 +1,64 @@
+
+==============================================================================
+L8 (phase E) — negative controls for ECSM2 / ECDAS2
+==============================================================================
+chip state (read from prover/src/tables/ at run time):
+   ECDAS2 : 658 columns, 288 constraints
+   ECSM2  : 1155 columns
+   JointBit send multiplicity      : Multiplicity::Column
+   (1−MU)·D padding gate present   : True
+   D_INV non-degeneracy present    : True
+
+[ SAT — FORGES ] N1  drop (1−MU)·D1/D2 — padding-row phantom digit
+                 untampered (gate present, chip idx 22..=27): unsat — blocked
+                 ablated: sat — two MU=0 rows supply a round's 2x JointBit
+                 count while the chain skips the add entirely.
+[ SAT — FORGES ] N2  drop D_INV — degenerate add / unconstrained λ
+                 untampered (D_INV present, chip idx 223..=287): the row is
+                 unsatisfiable at the collision (True) — blocked
+                 ablated: acc == addend as points (True) and the λ
+                 relation admits two different λ (True) — forgery reappears
+                 cost: one modular inversion + one scalar mul
+[ SAT — FORGES ] N3  drop xQ/yQ < p — non-canonical output encoding
+                 v = 1234 and v + p both encode in 32 bytes and agree mod p, but differ
+                 as bytes, so the guest hashes a different address. The check's
+                 overflow witness rejects the shifted form (True).
+                 reachable for any coordinate below 2^256 − p = 2^32 + 977.
+[ SAT — FORGES ] N4  drop PH1·(S1+S3−OP·D1) / (S2+S3−OP·D2) — selector tamper
+                 untampered: unsat (digits pin the addend)   ablated: sat (add consumes P2 with digits (1,0))
+[ SAT — FORGES ] N4b drop OP = ΣS — spurious Addend receive (PH1 = 0 rows)
+                 untampered: unsat   ablated: sat
+                 Load-bearing exactly where PH1 = 0: padding rows and the two
+                 off-chain phases, since idx 17/18/19 are vacuous there.
+[UNSAT — REDUNDANT] N4c drop OP = ΣS — on a live main-chain doubling
+                 untampered: unsat   ablated: unsat
+                 PH1 = 1 makes idx 18 (S1+S3 = OP·D1 = 0), idx 19 (S2+S3 = 0) and
+                 idx 17 (S_CORR = 0) force every selector to zero on their own.
+                 Keep idx 14 — N4b shows it is what covers the PH1 = 0 rows.
+[ SAT — FORGES ] N5  drop MU·(STATUS·S_INV − (1−OK)) — status-contract mismatch
+                 untampered: unsat (status 0 forces OK = 1, hence a proven chain)
+                 ablated: sat (guest consumes an unproven result)
+[ SAT — FORGES ] N6  drop the EcT0 lookup — free correction constant
+                 acc + W = chosen target for W = target − acc: True
+                 W differs from the table's −2^len·T₀: True
+                 the lookup is what pins the correction addend to `len`.
+[UNSAT — REDUNDANT] N7  drop yP2 < p — expected redundancy probe
+                 EXPECTED result, recorded as evidence not as a failure.
+                 1. The bytes are MEMW-bound to the guest's write (C4), and the guest
+                    derives y by field arithmetic, so y < p already holds.
+                 2. The only other 32-byte encoding congruent mod p is y + p, which
+                    needs y < 2^256 − p = 4294968273; and it denotes the SAME point.
+                 3. A `< p` test cannot separate a point from its negation anyway:
+                    both y and p − y are below p (True).
+                    Parity is the guest's authority, backed by MEMW — not this column.
+                 Keep it as defence in depth (it keeps the chip's argument standing on
+                 its own constraints), but it closes no forgery.
+
+==============================================================================
+SUMMARY
+==============================================================================
+   genuine forgeries (ablation ⇒ SAT) : 7
+   redundancy probes (UNSAT)          : 2
+   LIVE HOLES in the chip right now   : 0
+   broken controls                    : 0
+

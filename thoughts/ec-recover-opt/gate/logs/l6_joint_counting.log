@@ -1,0 +1,90 @@
+
+==========================================================================
+L6-A — per-row schedule constraints (live main-chain rows)
+==========================================================================
+   digits (1,0) force S1          : unsat (forced)
+   digits (0,1) force S2          : unsat (forced)
+   digits (1,1) force S3          : unsat (forced)
+   digits (0,0) on an add            : unsat (no spurious add possible)
+   doubling consumes no addend       : unsat (forced)
+   set digit forces NB = 1           : unsat (forced)
+   add-after-add impossible (OP·NB)  : unsat (forced)
+
+==========================================================================
+L6-B — the 2x JointBit multiplicity vs 1x
+==========================================================================
+   Scenario: round r with u1_bit(r) = u2_bit(r) = 1. The honest chain
+   has a double and an add, both carrying (D1,D2) = (1,1), so the add
+   selects S3 = P12. Can a prover make the add select P2 instead?
+
+   multiplicity 1x : sat   <-- WRONG ADDEND REACHABLE
+   multiplicity 2x : unsat   (blocked)
+
+   Reading: with 1x the prover splits the two digits across the two
+   rows (double takes D1, add takes D2), the counts still balance, and
+   the add adds P2 where the schedule calls for P12 — a wrong Q.
+   2x forces BOTH rows to carry BOTH digits, which pins S3. The 2x
+   claim is CONFIRMED: 2 = 1+1 is the only decomposition because each
+   row's multiplicity is a single IS_BIT column.
+
+==========================================================================
+L6-C — padding rows as phantom digit senders
+==========================================================================
+   a MU=0 row with D1=1 satisfies all row constraints : sat
+   round r: u1_bit(r)=1 balanced with NO add on chain  : sat
+      witness: double has D1=0, NB=0 (no add), phantom rows [2, 3] each send D1=1 at the same ROUND
+
+   *** BREAK *** The JointBit send's multiplicity is
+   `Multiplicity::Column(cols::D1)` (ecdas2.rs:459-470) and NOTHING
+   ties D1/D2 to MU. A padding row is otherwise inert (its Ecdas,
+   Addend, AreBytes and IsHalfword interactions are all MU-gated)
+   but its digit send is LIVE. Two phantom rows per targeted round
+   satisfy the 2x count while the chain skips the add entirely.
+
+==========================================================================
+L6-D — padding rows as phantom digit senders (WITH the proposed fix)
+==========================================================================
+   a MU=0 row with D1=1 satisfies all row constraints : unsat
+   round r: u1_bit(r)=1 balanced with NO add on chain  : unsat
+
+   With `D1·(1−MU) = 0` / `D2·(1−MU) = 0` added — the exact shape of
+   `ecdas.rs` idx 4 `NEXT_OP·(1−MU) = 0` — both queries go UNSAT.
+
+==========================================================================
+L6-E — exploitability: steering the recovered key to a chosen target
+==========================================================================
+   target pubkey (a key the attacker does NOT hold):
+      (0x23bf4e1744fdfd156a2341064785ec43dc87c1b4f2d43b7d6a13594e4efaac14,
+       0x8c16a140c01fe7f9cc58cefa98f98fe3777427784aaab244c380f618aa56d8c7)
+
+   u1 = 257 (bit 8 will be dropped), u2 = 1, len = 9
+   honest chain  Q  = (0xe96c41125ef76e4ae487b0184b40a3d0f11f1e4ecc77e0161aa3b3699f72a5a9, ...)
+   forged chain  Q' = (0x23bf4e1744fdfd156a2341064785ec43dc87c1b4f2d43b7d6a13594e4efaac14, ...)
+   Q' == target     : True
+   Q' != honest Q   : True
+
+   ecrecover packaging: z=0xda55048488a946f1f890b1303a55d50a83b37332e24791aa6744d786f806181
+                        r=0x4ea3b6f8bef87ceea23e38bc30cb8f1337bbfef507e16395bfcbab34c70a338e
+                        s=0x4ea3b6f8bef87ceea23e38bc30cb8f1337bbfef507e16395bfcbab34c70a338e  v=0
+      guest recomputes u1: True   u2: True   lifts R: True
+
+   Reading: u1' and u2' are free, so R = target − u1'·G is a plain
+   point subtraction — NO discrete log is needed. The attacker gets an
+   ARBITRARY chosen recovered public key, i.e. an arbitrary chosen
+   transaction sender. This is strictly worse than the NUMS finding,
+   which only yielded a one-parameter family.
+
+==========================================================================
+SUMMARY
+==========================================================================
+   chip state: (1−MU)·D gate present = True, D_INV present = True
+
+   L6-A per-row schedule forcing      : PASS
+   L6-B 2x multiplicity load-bearing  : CONFIRMED
+   L6-C padding-row digit forgery     : REPRODUCED
+   L6-D proposed fix closes it        : YES
+   L6-E arbitrary chosen sender       : DEMONSTRATED
+
+   VERDICT: L6 HOLDS. L6-C is now a genuine ablation of a check the
+   chip carries (idx 22..=27); with it present the forgery is UNSAT
+   (L6-D). The break this file was written to demonstrate is closed.

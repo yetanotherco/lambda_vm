@@ -1,0 +1,16 @@
+# Standalone (like oracle/repo-harness): kept out of the lambda_vm workspace so
+# nothing shared has to change. Exists only because
+# `prover::count_elements_by_table` is a library function with no CLI
+# subcommand — see BENCH.md section 6.
+[workspace]
+
+[package]
+name = "ec-bench-harness"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+prover = { path = "/Users/maurofab/workspace/lambda_vm/prover", package = "lambda-vm-prover" }
+
+[profile.release]
+debug = false

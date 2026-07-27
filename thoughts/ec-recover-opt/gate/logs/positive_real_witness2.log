@@ -1,0 +1,9 @@
+POSITIVE ANCHOR + L7 — real lincomb2 witnesses vs the transcribed model
+
+   cases            : 265 (256 L7-small, 6 random, 3 edge)
+   ECDAS2 rows      : 5,960
+   constraint/range checks : 3,317,087
+   L7 Q comparisons : 265 (0 mismatches)
+
+   ALL CHECKS PASS — the transcription is faithful on honest data,
+   and every drained Q matches enumerated / independent ground truth.

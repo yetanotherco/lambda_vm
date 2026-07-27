@@ -1,0 +1,83 @@
+
+==============================================================================
+§1 — L1 / L2 / L3 / L4 / L5a port by relation-body identity
+==============================================================================
+[ PROVED ] ECDAS2's relation builders are ECDAS's, modulo the XB/YB rename
+           s_i::Lambda   : identical
+           s_i::Xr       : identical
+           s_i::Yr       : identical
+           rq            : identical
+           p_byte_expr   : identical
+           r_byte_expr   : identical
+           byte_at       : identical
+[ PROVED ] ⇒ L1 (carry telescoping), L2a (per-limb widths), L3a (convolutions capture
+   the intended polynomial), L3b (chord/tangent stays on curve), L4a/b/c
+   (λ, xR, yR pinned mod p) and L5a (no 2-torsion) port unchanged
+           These lemmas quantify over the relation's operands only; renaming an
+           operand column cannot affect them. The old gate's proofs stand as-is.
+
+==============================================================================
+§2 — L2b: honest carries of the joint chain fit the existing windows
+==============================================================================
+   (measured in ../oracle/width_audit.py over 6,346 real rows of every
+    row type, and differentially checked against the prover's own
+    carries — 38,076 comparisons, 0 mismatches)
+
+   lambda  honest [-4303, 6728]  window [-32636, 32899]  fits
+   xr      honest [-112, 8308]  window [-8161, 57374]  fits
+   yr      honest [-465, 5914]  window [-16320, 49215]  fits
+[ PROVED ] L2b: the joint chain's honest carries fit the unchanged offsets
+           The varying addend does not move this: the relations have the same
+           term counts, and all four addends are canonical for an honest prover.
+
+==============================================================================
+§3 — L5b REPLACED by D_INV·(xB − xA) ≡ 1 (mod p)
+==============================================================================
+   D_INV is present (ECDAS2 idx 223..=287, gated by ΣS).
+
+[ PROVED ] (a1) OP = (Addend receive multiplicity) on every live row
+           The chip gates D_INV by ΣS = S1+S2+S3+S_CORR — the very expression
+           that counts the Addend receive — so the check cannot drift away from
+           the rows that consume an addend. This lemma shows that gate coincides
+           with OP on every live row, so it fires exactly on the add rows.
+[ PROVED ] (a2) all five addend-consuming row types are covered; doublings are not
+           AddP1      : consumes an addend = always
+           AddP2      : consumes an addend = always
+           AddP12     : consumes an addend = always
+           Precompute : consumes an addend = always
+           Correction : consumes an addend = always
+           Double     : consumes an addend = never
+[ PROVED ] (b1) D_INV is unsatisfiable whenever xB ≡ xA (mod p)
+           z3: unsat  —  p·(d·k − m) = 1 has no integer solution for p > 1.
+           Covers the non-canonical case too: the relation is mod p, so a
+           byte-different xB congruent to xA still has (xB − xA) ≡ 0 and no
+           inverse. The degenerate add becomes UNPROVABLE, not merely unlikely.
+[ PROVED ] (b2) D_INV is satisfiable whenever xB ≢ xA (mod p) (completeness)
+           204 residues incl. 1, 2, p−1, p−2: the Fermat inverse is a
+           witness in every case. p is prime (A-PRIME), so the honest prover can
+           always build the column — the check costs no completeness.
+[ PROVED ] (c) the gated-off branch PINS q3 = µ·3p — a doubling is not a hole
+           z3: unsat. With g = 0 the relation is µ·R·P − q3·P, which telescopes
+           to p·(µ·R − q3) = 0. Since p ≠ 0, q3 = 3p on a live doubling and 0 on
+           a padding row — not free. Confirmed on real witnesses too: every
+           doubling row's Q3 column is exactly 3p with zero carries
+           (positive_real_witness2.py).
+[ PROVED ] (d) L5b's obligation is discharged UNCONDITIONALLY
+           L4a pins λ given the side condition p ∤ (xB − xA). D_INV *is* that
+           side condition, witnessed in-circuit. No dlog assumption, no T₀
+           reduction, no appeal to the input distribution.
+
+==============================================================================
+SUMMARY
+==============================================================================
+   [PROVED] ECDAS2's relation builders are ECDAS's, modulo the XB/YB rename
+   [PROVED] ⇒ L1 (carry telescoping), L2a (per-limb widths), L3a (convolutions capture
+   [PROVED] L2b: the joint chain's honest carries fit the unchanged offsets
+   [PROVED] (a1) OP = (Addend receive multiplicity) on every live row
+   [PROVED] (a2) all five addend-consuming row types are covered; doublings are not
+   [PROVED] (b1) D_INV is unsatisfiable whenever xB ≡ xA (mod p)
+   [PROVED] (b2) D_INV is satisfiable whenever xB ≢ xA (mod p) (completeness)
+   [PROVED] (c) the gated-off branch PINS q3 = µ·3p — a doubling is not a hole
+   [PROVED] (d) L5b's obligation is discharged UNCONDITIONALLY
+
+   9/9 proved

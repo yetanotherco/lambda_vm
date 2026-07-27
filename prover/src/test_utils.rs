@@ -57,11 +57,18 @@ use crate::tables::decode::{bus_interactions as decode_bus_interactions, cols as
 use crate::tables::dvrm::{
     DvrmConstraints, bus_interactions as dvrm_bus_interactions, cols as dvrm_cols,
 };
+use crate::tables::ec_t0::{bus_interactions as ec_t0_bus_interactions, cols as ec_t0_cols};
 use crate::tables::ecdas::{
     EcdasConstraints, bus_interactions as ecdas_bus_interactions, cols as ecdas_cols,
 };
+use crate::tables::ecdas2::{
+    Ecdas2Constraints, bus_interactions as ecdas2_bus_interactions, cols as ecdas2_cols,
+};
 use crate::tables::ecsm::{
     EcsmConstraints, bus_interactions as ecsm_bus_interactions, cols as ecsm_cols,
+};
+use crate::tables::ecsm2::{
+    Ecsm2Constraints, bus_interactions as ecsm2_bus_interactions, cols as ecsm2_cols,
 };
 use crate::tables::eq::{EqConstraints, bus_interactions as eq_bus_interactions, cols as eq_cols};
 use crate::tables::halt::{bus_interactions as halt_bus_interactions, cols as halt_cols};
@@ -924,6 +931,21 @@ pub fn create_keccak_rc_air(proof_options: &ProofOptions) -> ConcreteVmAir<Empty
     )
 }
 
+/// Create EC_T0 AIR with bus interactions (preprocessed table).
+///
+/// No transition constraints: every logic column is preprocessed, so the
+/// table's content is fixed by its committed root and only MU varies.
+pub fn create_ec_t0_air(proof_options: &ProofOptions) -> ConcreteVmAir<EmptyConstraints> {
+    build_air(
+        ec_t0_cols::NUM_COLUMNS,
+        ec_t0_bus_interactions(),
+        proof_options,
+        1,
+        EmptyConstraints,
+        "EC_T0",
+    )
+}
+
 /// Create ECSM core AIR (secp256k1 scalar-multiplication orchestrator).
 pub fn create_ecsm_air(proof_options: &ProofOptions) -> ConcreteVmAir<EcsmConstraints> {
     build_air(
@@ -945,5 +967,29 @@ pub fn create_ecdas_air(proof_options: &ProofOptions) -> ConcreteVmAir<EcdasCons
         1,
         EcdasConstraints,
         "ECDAS",
+    )
+}
+
+/// Create ECSM2 core AIR (secp256k1 `lincomb2` orchestrator).
+pub fn create_ecsm2_air(proof_options: &ProofOptions) -> ConcreteVmAir<Ecsm2Constraints> {
+    build_air(
+        ecsm2_cols::NUM_COLUMNS,
+        ecsm2_bus_interactions(),
+        proof_options,
+        1,
+        Ecsm2Constraints,
+        "ECSM2",
+    )
+}
+
+/// Create ECDAS2 AIR (per-step double/add of the lincomb2 joint chain).
+pub fn create_ecdas2_air(proof_options: &ProofOptions) -> ConcreteVmAir<Ecdas2Constraints> {
+    build_air(
+        ecdas2_cols::NUM_COLUMNS,
+        ecdas2_bus_interactions(),
+        proof_options,
+        1,
+        Ecdas2Constraints,
+        "ECDAS2",
     )
 }

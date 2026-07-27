@@ -12,4 +12,6 @@ pub mod reference_field;
 
 mod curve_tests;
 mod lib_tests;
+mod lincomb2_table_tests;
+mod lincomb2_tests;
 mod witness_tests;

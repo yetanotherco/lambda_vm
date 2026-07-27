@@ -47,8 +47,11 @@ use super::cpu::{self, CpuOperation};
 use super::cpu32;
 use super::decode;
 use super::dvrm::{self, DvrmOperation};
+use super::ec_t0;
 use super::ecdas;
+use super::ecdas2;
 use super::ecsm;
+use super::ecsm2;
 use super::eq;
 use super::halt;
 use super::keccak::{self, KeccakOperation};
@@ -532,7 +535,7 @@ fn build_reg_fallback(
 /// MEMW and LOAD collection requires sequential processing with state tracking.
 ///
 /// Returns: (memw_buckets, load_ops, lt_ops, shift_ops, bitwise_ops, commit_ops,
-/// keccak_ops, cpu32_ops, ecsm_ops, ecdas_ops)
+/// keccak_ops, cpu32_ops, ecsm_ops, ecdas_ops, ecsm2_ops, ecdas2_ops)
 #[allow(clippy::type_complexity)]
 fn collect_ops_from_cpu(
     cpu_ops: &[CpuOperation],
@@ -549,6 +552,8 @@ fn collect_ops_from_cpu(
     Vec<cpu32::Cpu32Operation>,
     Vec<ecsm::EcsmOperation>,
     Vec<ecdas::EcdasOperation>,
+    Vec<ecsm2::Ecsm2Operation>,
+    Vec<ecdas2::Ecdas2Operation>,
 ) {
     let mut memw = MemwBuckets::with_register_capacity(cpu_ops.len() * 3);
     let mut load_ops = Vec::with_capacity(cpu_ops.len() / 8 + 1);
@@ -560,6 +565,8 @@ fn collect_ops_from_cpu(
     let mut cpu32_ops = Vec::new();
     let mut ecsm_ops = Vec::new();
     let mut ecdas_ops = Vec::new();
+    let mut ecsm2_ops = Vec::new();
+    let mut ecdas2_ops = Vec::new();
     // Seed from the carried x254 (0 for a monolithic run or the first epoch) so a
     // continuation epoch indexes its commits globally, matching the x254 the
     // register binding transports across epochs. Resetting to 0 here would drift
@@ -654,6 +661,17 @@ fn collect_ops_from_cpu(
             ecdas_ops.extend(ecdas_rows);
         }
 
+        // Collect lincomb2 ecall operations (memory I/O + the two joint-chain
+        // table row sets). Independent of the single-scalar path above: the two
+        // accelerators coexist until the guest switches over.
+        if op.ecall_lincomb2 {
+            let (lc2_memw, ecsm2_op, ecdas2_rows) =
+                collect_lincomb2_ops(op, memory_state, register_state);
+            memw.extend_ops(lc2_memw);
+            ecsm2_ops.push(ecsm2_op);
+            ecdas2_ops.extend(ecdas2_rows);
+        }
+
         // --- ALU chip dispatch (no state tracking) ---
         // Word (`*W`) instructions are delegated to CPU32 (which itself drives
         // the ALU chips); the main CPU does not send the ALU bus for them, so we
@@ -709,6 +727,8 @@ fn collect_ops_from_cpu(
         cpu32_ops,
         ecsm_ops,
         ecdas_ops,
+        ecsm2_ops,
+        ecdas2_ops,
     )
 }
 
@@ -946,6 +966,164 @@ fn collect_ecsm_ops(
     };
 
     (memw_ops, ecsm_op, ecdas_ops)
+}
+
+/// Collects all MEMW ops and the ECSM2 / ECDAS2 table ops for one lincomb2 ecall.
+///
+/// Timestamp scheme: **everything at `T`**. The executor's address guards make
+/// the four 64-byte operand regions pairwise disjoint and 8-byte aligned, and
+/// register addresses live in a separate address space, so no two accesses touch
+/// the same byte — the same single-timestamp pattern KECCAK uses for its 25
+/// lanes, rather than ECSM's `T`/`T+1`/`T+2` spread.
+///
+/// The executor retains no witness (one is ~820 KiB), so this re-derives the
+/// outcome by calling [`lincomb2_outcome`] — the very function the executor arm
+/// calls — which is why the two sides cannot disagree about the status or about
+/// which rows exist.
+///
+/// On the error path (`status != 0`) only the `x10` read+write is emitted: the
+/// chip claims nothing else, so nothing else may appear in the access chain. In
+/// particular the `a1` reads must NOT be emitted, because the chip asserts they
+/// return `G` and `status == 7` is exactly the case where they do not.
+fn collect_lincomb2_ops(
+    op: &CpuOperation,
+    memory_state: &mut MemoryState,
+    register_state: &mut RegisterState,
+) -> (
+    Vec<MemwOperation>,
+    ecsm2::Ecsm2Operation,
+    Vec<ecdas2::Ecdas2Operation>,
+) {
+    let t = op.timestamp;
+    // x10 still holds the pre-ecall value here: ECALL decodes with `rs1 = 17`
+    // and `write_register = false`, so the CPU row never touches x10.
+    let addr_q = register_state.read(10).0;
+    debug_assert_eq!(
+        addr_q, op.lincomb2_addr_q,
+        "lincomb2: x10 in the register model must match the address the CPU log carried"
+    );
+    let addr_p1 = register_state.read(11).0;
+    let addr_p2 = register_state.read(12).0;
+    let addr_u = register_state.read(13).0;
+
+    let read_operand = |memory_state: &MemoryState, addr: u64| {
+        let mut out = [0u8; 64];
+        for (i, byte) in out.iter_mut().enumerate() {
+            *byte = memory_state.read_byte(addr.wrapping_add(i as u64)).0;
+        }
+        out
+    };
+    let p1 = read_operand(memory_state, addr_p1);
+    let p2 = read_operand(memory_state, addr_p2);
+    let u = read_operand(memory_state, addr_u);
+
+    let outcome = executor::vm::instruction::execution::lincomb2_outcome(&p1, &p2, &u);
+    debug_assert_eq!(
+        outcome.status, op.lincomb2_status,
+        "lincomb2: the trace builder's replay must reproduce the executor's status"
+    );
+
+    let mut memw_ops = Vec::with_capacity(37);
+
+    // Combined read+write of x10: old = the result address, new = the status.
+    // Emitted on BOTH paths — it is what makes the error row expressible.
+    {
+        let old_value = pack_register_value(addr_q);
+        let new_value = pack_register_value(outcome.status);
+        let (_old_val, old_ts) = register_state.read(10);
+        memw_ops.push(
+            MemwOperation::new(true, 2 * 10, new_value, t, 2, true)
+                .with_old(old_value, [old_ts, old_ts, 0, 0, 0, 0, 0, 0]),
+        );
+        register_state.write(10, outcome.status, t);
+    }
+
+    let Some(witness) = outcome.witness else {
+        let ecsm2_op = ecsm2::Ecsm2Operation {
+            timestamp: t,
+            addr_q,
+            addr_p1,
+            addr_p2,
+            addr_u,
+            status: outcome.status,
+            witness: None,
+        };
+        return (memw_ops, ecsm2_op, Vec::new());
+    };
+
+    // Register reads of a1/a2/a3.
+    for (reg, val) in [(11u8, addr_p1), (12, addr_p2), (13, addr_u)] {
+        let value = pack_register_value(val);
+        let (_old_val, old_ts) = register_state.read(reg);
+        memw_ops.push(
+            MemwOperation::new(true, 2 * reg as u64, value, t, 2, true)
+                .with_old(value, [old_ts, old_ts, 0, 0, 0, 0, 0, 0]),
+        );
+        register_state.write(reg, val, t);
+    }
+
+    // The three 64-byte operand reads (8 doublewords each). `p1` is read back
+    // from memory rather than from the witness because the chip asserts the
+    // constant `G` there and `lincomb2_outcome` has already established they
+    // agree (status 7 otherwise) — asserted so a future ABI change that drops
+    // that guarantee fails here, not as an opaque constraint violation.
+    debug_assert_eq!(
+        p1,
+        executor::vm::instruction::execution::GENERATOR_LE,
+        "lincomb2: an OK outcome implies the bytes at a1 are the generator, which \
+         is what the chip's constant-valued MEMW reads assert",
+    );
+    for (base, bytes) in [(addr_p1, &p1), (addr_p2, &p2), (addr_u, &u)] {
+        for i in 0..8 {
+            let addr = base.wrapping_add((8 * i) as u64);
+            let mut value = [0u32; 8];
+            let mut dword = 0u64;
+            for j in 0..8 {
+                value[j] = bytes[8 * i + j] as u32;
+                dword |= (bytes[8 * i + j] as u64) << (8 * j);
+            }
+            let (_old, old_ts) = memory_state.read_bytes(addr, 8);
+            memw_ops
+                .push(MemwOperation::new(false, addr, value, t, 8, true).with_old(value, old_ts));
+            memory_state.write_bytes(addr, dword, 8, t);
+        }
+    }
+
+    // The 64-byte result write (8 doublewords), OK path only.
+    let mut q_bytes = [0u8; 64];
+    q_bytes[..32].copy_from_slice(&witness.x_q);
+    q_bytes[32..].copy_from_slice(&witness.y_q);
+    for i in 0..8 {
+        let addr = addr_q.wrapping_add((8 * i) as u64);
+        let mut value = [0u32; 8];
+        let mut dword = 0u64;
+        for j in 0..8 {
+            value[j] = q_bytes[8 * i + j] as u32;
+            dword |= (q_bytes[8 * i + j] as u64) << (8 * j);
+        }
+        let (old_vals, old_ts) = memory_state.read_bytes(addr, 8);
+        memw_ops
+            .push(MemwOperation::new(false, addr, value, t, 8, false).with_old(old_vals, old_ts));
+        memory_state.write_bytes(addr, dword, 8, t);
+    }
+
+    let ecdas2_ops = witness
+        .steps
+        .iter()
+        .cloned()
+        .map(|step| ecdas2::Ecdas2Operation { timestamp: t, step })
+        .collect();
+    let ecsm2_op = ecsm2::Ecsm2Operation {
+        timestamp: t,
+        addr_q,
+        addr_p1,
+        addr_p2,
+        addr_u,
+        status: outcome.status,
+        witness: Some(witness),
+    };
+
+    (memw_ops, ecsm2_op, ecdas2_ops)
 }
 
 /// Collects register read/write operations (M1, M3, M5) from CpuOperation,
@@ -2273,6 +2451,12 @@ fn is_byte_op(b: u8) -> BitwiseOperation {
     BitwiseOperation::byte_op(BitwiseOperationType::AreBytes, b, 0)
 }
 
+/// Paired ARE_BYTES lookup: one send range-checks BOTH bytes (the BITWISE table
+/// enumerates every `(x, y)` byte pair). Tuple order must match the sender's.
+fn are_bytes_op(x: u8, y: u8) -> BitwiseOperation {
+    BitwiseOperation::byte_op(BitwiseOperationType::AreBytes, x, y)
+}
+
 /// BITWISE lookups sent by the ECSM core table (range checks + the `k != 0` ZERO check),
 /// so the BITWISE receiver multiplicities account for them.
 #[allow(clippy::needless_range_loop)]
@@ -2280,17 +2464,16 @@ pub(crate) fn collect_bitwise_from_ecsm(ops: &[ecsm::EcsmOperation]) -> Vec<Bitw
     let mut out = Vec::new();
     for op in ops {
         let w = &op.witness;
-        // IS_BYTE on x2, q0, yG (32 bytes each) and q1 (33 bytes: 0..=32).
-        // x2/q0/y_g loop stays at 0..32; q1[32] is outside because q1 is 33 bytes
-        // while the others are 32. Do NOT merge into a single loop — extending the
-        // loop bound would push q1[32] twice and break AreBytes bus balance.
-        for i in 0..32 {
-            out.push(is_byte_op(w.x2[i]));
-            out.push(is_byte_op(w.q0[i]));
-            out.push(is_byte_op(w.y_g[i]));
-            out.push(is_byte_op(w.q1[i]));
+        // Paired ARE_BYTES on x2, q0, yG and q1's 32-byte prefix: (2i, 2i+1),
+        // mirroring `ecsm::bus_interactions()` exactly (sends and multiplicities
+        // must move together). q1[32] (the odd 33rd byte) rides alone as [b, 0].
+        for i in 0..16 {
+            out.push(are_bytes_op(w.x2[2 * i], w.x2[2 * i + 1]));
+            out.push(are_bytes_op(w.q0[2 * i], w.q0[2 * i + 1]));
+            out.push(are_bytes_op(w.y_g[2 * i], w.y_g[2 * i + 1]));
+            out.push(are_bytes_op(w.q1[2 * i], w.q1[2 * i + 1]));
         }
-        out.push(is_byte_op(w.q1[32])); // q1[32]: 33rd byte, not covered by the loop above
+        out.push(is_byte_op(w.q1[32])); // q1[32]: 33rd byte, unpaired
         // IS_HALF on the shifted carries (i = 0..62).
         for i in 0..63 {
             out.push(is_half_op((w.c0[i] + ecsm::CARRY_OFFSET_X2) as u16));
@@ -2321,21 +2504,108 @@ pub(crate) fn collect_bitwise_from_ecdas(ops: &[ecdas::EcdasOperation]) -> Vec<B
     let mut out = Vec::new();
     for op in ops {
         let s = &op.step;
-        out.push(is_byte_op(s.round));
-        for i in 0..32 {
-            out.push(is_byte_op(s.lambda[i]));
-            out.push(is_byte_op(s.x_r[i]));
-            out.push(is_byte_op(s.y_r[i]));
+        // Paired ARE_BYTES mirroring `ecdas::bus_interactions()` exactly: the
+        // 32-byte prefixes of lambda, x_r, y_r, q0, q1, q2 pair as (2i, 2i+1);
+        // the four odd bytes pair as (round, q0[32]) and (q1[32], q2[32]).
+        for i in 0..16 {
+            out.push(are_bytes_op(s.lambda[2 * i], s.lambda[2 * i + 1]));
+            out.push(are_bytes_op(s.x_r[2 * i], s.x_r[2 * i + 1]));
+            out.push(are_bytes_op(s.y_r[2 * i], s.y_r[2 * i + 1]));
+            out.push(are_bytes_op(s.q0[2 * i], s.q0[2 * i + 1]));
+            out.push(are_bytes_op(s.q1[2 * i], s.q1[2 * i + 1]));
+            out.push(are_bytes_op(s.q2[2 * i], s.q2[2 * i + 1]));
         }
-        for i in 0..33 {
-            out.push(is_byte_op(s.q0[i]));
-            out.push(is_byte_op(s.q1[i]));
-            out.push(is_byte_op(s.q2[i]));
-        }
+        out.push(are_bytes_op(s.round, s.q0[32]));
+        out.push(are_bytes_op(s.q1[32], s.q2[32]));
         for i in 0..63 {
             out.push(is_half_op((s.c0[i] + ecdas::CARRY_OFFSET_LAMBDA) as u16));
             out.push(is_half_op((s.c1[i] + ecdas::CARRY_OFFSET_XR) as u16));
             out.push(is_half_op((s.c2[i] + ecdas::CARRY_OFFSET_YR) as u16));
+        }
+    }
+    out
+}
+
+/// BITWISE lookups sent by the ECSM2 core table (the `P2` membership range
+/// checks, the five overflow blocks, and the two `u != 0` ZERO checks).
+///
+/// Every send here is `OK`-gated in `ecsm2::bus_interactions()`, so error rows
+/// (`witness == None`) contribute nothing — sends and BITWISE multiplicities
+/// must move together or the bus breaks silently.
+#[allow(clippy::needless_range_loop)]
+pub(crate) fn collect_bitwise_from_ecsm2(ops: &[ecsm2::Ecsm2Operation]) -> Vec<BitwiseOperation> {
+    let mut out = Vec::new();
+    for op in ops {
+        let Some(w) = op.witness.as_deref() else {
+            continue;
+        };
+        // Paired ARE_BYTES on the membership sub-witness: (2i, 2i+1) over x2,
+        // q0 and q1's 32-byte prefix; q1[32] rides alone as [b, 0].
+        for i in 0..16 {
+            out.push(are_bytes_op(w.mem_p2.x2[2 * i], w.mem_p2.x2[2 * i + 1]));
+            out.push(are_bytes_op(w.mem_p2.q0[2 * i], w.mem_p2.q0[2 * i + 1]));
+            out.push(are_bytes_op(w.mem_p2.q1[2 * i], w.mem_p2.q1[2 * i + 1]));
+        }
+        out.push(is_byte_op(w.mem_p2.q1[32]));
+        // IS_HALF on the shifted membership carries (i = 0..62).
+        for i in 0..63 {
+            out.push(is_half_op((w.mem_p2.c0[i] + ecsm2::CARRY_OFFSET_X2) as u16));
+            out.push(is_half_op((w.mem_p2.c1[i] + ecsm2::CARRY_OFFSET_YG) as u16));
+        }
+        // IS_HALF on the U256HL limbs of the five overflow blocks, in the same
+        // order `ecsm2::bus_interactions()` emits them.
+        for block in [
+            &w.y_p2_sub_p,
+            &w.u1_sub_n,
+            &w.u2_sub_n,
+            &w.x_q_sub_p,
+            &w.y_q_sub_p,
+        ] {
+            for i in 0..16 {
+                out.push(is_half_op(
+                    block[2 * i] as u16 + ((block[2 * i + 1] as u16) << 8),
+                ));
+            }
+        }
+        // ZERO: assert u1 != 0 and u2 != 0 (sum of each scalar's bytes).
+        for scalar in [&w.u1, &w.u2] {
+            let sum: u32 = scalar.iter().map(|&b| b as u32).sum();
+            out.push(BitwiseOperation::zero(sum));
+        }
+    }
+    out
+}
+
+/// BITWISE lookups sent by every ECDAS2 row. The layout is identical to
+/// `collect_bitwise_from_ecdas` — the addend columns `XB`/`YB` are deliberately
+/// absent, since they inherit byte-ness through the Addend tuple.
+#[allow(clippy::needless_range_loop)]
+pub(crate) fn collect_bitwise_from_ecdas2(
+    ops: &[ecdas2::Ecdas2Operation],
+) -> Vec<BitwiseOperation> {
+    let mut out = Vec::new();
+    for op in ops {
+        let s = &op.step.step;
+        // The non-degeneracy block is derived, not carried by the witness.
+        let d = ecdas2::dinv_witness(&op.step);
+        for i in 0..16 {
+            out.push(are_bytes_op(s.lambda[2 * i], s.lambda[2 * i + 1]));
+            out.push(are_bytes_op(s.x_r[2 * i], s.x_r[2 * i + 1]));
+            out.push(are_bytes_op(s.y_r[2 * i], s.y_r[2 * i + 1]));
+            out.push(are_bytes_op(s.q0[2 * i], s.q0[2 * i + 1]));
+            out.push(are_bytes_op(s.q1[2 * i], s.q1[2 * i + 1]));
+            out.push(are_bytes_op(s.q2[2 * i], s.q2[2 * i + 1]));
+            out.push(are_bytes_op(d.d_inv[2 * i], d.d_inv[2 * i + 1]));
+            out.push(are_bytes_op(d.q3[2 * i], d.q3[2 * i + 1]));
+        }
+        out.push(are_bytes_op(s.round, s.q0[32]));
+        out.push(are_bytes_op(s.q1[32], s.q2[32]));
+        out.push(is_byte_op(d.q3[32]));
+        for i in 0..63 {
+            out.push(is_half_op((s.c0[i] + ecdas2::CARRY_OFFSET_LAMBDA) as u16));
+            out.push(is_half_op((s.c1[i] + ecdas2::CARRY_OFFSET_XR) as u16));
+            out.push(is_half_op((s.c2[i] + ecdas2::CARRY_OFFSET_YR) as u16));
+            out.push(is_half_op((d.c3[i] + ecdas2::CARRY_OFFSET_DINV) as u16));
         }
     }
     out
@@ -2714,6 +2984,15 @@ pub struct Traces {
     /// ECDAS double/add table (variable rows per ecall)
     pub ecdas: TraceTable<GoldilocksField, GoldilocksExtension>,
 
+    /// ECSM2 core table (one row per lincomb2 ecall)
+    pub ecsm2: TraceTable<GoldilocksField, GoldilocksExtension>,
+
+    /// ECDAS2 joint double/add table (variable rows per lincomb2 ecall)
+    pub ecdas2: TraceTable<GoldilocksField, GoldilocksExtension>,
+
+    /// EC_T0 preprocessed `−2^len·T₀` correction table (256 rows)
+    pub ec_t0: TraceTable<GoldilocksField, GoldilocksExtension>,
+
     /// MEMW_R register-only fast-path traces (split into chunks of max_rows::MEMW_R)
     pub memw_registers: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
     /// Local-to-global boundary table for continuation epochs. Empty unless the
@@ -2756,6 +3035,9 @@ struct CollectedOps {
     // EC scalar-multiplication accelerator chips.
     ecsm_ops: Vec<ecsm::EcsmOperation>,
     ecdas_ops: Vec<ecdas::EcdasOperation>,
+    // EC lincomb2 (joint two-scalar) accelerator chips.
+    ecsm2_ops: Vec<ecsm2::Ecsm2Operation>,
+    ecdas2_ops: Vec<ecdas2::Ecdas2Operation>,
 }
 
 /// Chunk raw ops and generate one trace table per chunk. When `storage_mode`
@@ -2810,6 +3092,8 @@ fn collect_all_ops(
     cpu32_ops: Vec<cpu32::Cpu32Operation>,
     ecsm_ops: Vec<ecsm::EcsmOperation>,
     ecdas_ops: Vec<ecdas::EcdasOperation>,
+    ecsm2_ops: Vec<ecsm2::Ecsm2Operation>,
+    ecdas2_ops: Vec<ecdas2::Ecdas2Operation>,
     register_state: &mut RegisterState,
     is_final: bool,
 ) -> CollectedOps {
@@ -2952,6 +3236,8 @@ fn collect_all_ops(
         cpu32_ops,
         ecsm_ops,
         ecdas_ops,
+        ecsm2_ops,
+        ecdas2_ops,
     }
 }
 
@@ -2995,6 +3281,8 @@ fn build_traces<I: ImageSource + Sync>(
         cpu32_ops,
         ecsm_ops,
         ecdas_ops,
+        ecsm2_ops,
+        ecdas2_ops,
     } = ops;
 
     // =====================================================================
@@ -3070,6 +3358,8 @@ fn build_traces<I: ImageSource + Sync>(
         Box::new(|h| h.add_ops(&collect_bitwise_from_keccak(&keccak_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_ecsm(&ecsm_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_ecdas(&ecdas_ops))),
+        Box::new(|h| h.add_ops(&collect_bitwise_from_ecsm2(&ecsm2_ops))),
+        Box::new(|h| h.add_ops(&collect_bitwise_from_ecdas2(&ecdas2_ops))),
         Box::new(|h| add_padding_byte_checks(h, num_padding_rows)),
     ];
     if let Some(image) = initial_image
@@ -3356,6 +3646,24 @@ fn build_traces<I: ImageSource + Sync>(
     // ECSM accelerator traces (empty/all-padding for programs that do not use ECSM).
     let gen_ecsm = || ecsm::generate_ecsm_trace(&ecsm_ops);
     let gen_ecdas = || ecdas::generate_ecdas_trace(&ecdas_ops);
+    // lincomb2 accelerator traces (empty/all-padding for programs that do not
+    // call the syscall).
+    let gen_ecsm2 = || ecsm2::generate_ecsm2_trace(&ecsm2_ops);
+    let gen_ecdas2 = || ecdas2::generate_ecdas2_trace(&ecdas2_ops);
+    // EC_T0's rows are constants fixed by the preprocessed commitment; only its
+    // multiplicities vary, one lookup per PROVEN lincomb2 evaluation (error rows
+    // send nothing, so they must not be counted here either).
+    let gen_ec_t0 = || {
+        let mut trace = ec_t0::generate_ec_t0_trace();
+        ec_t0::update_multiplicities(
+            &mut trace,
+            ecsm2_ops
+                .iter()
+                .filter_map(|op| op.witness.as_deref())
+                .map(|w| w.len),
+        );
+        trace
+    };
 
     let (mut cpus_slot, mut memws_slot, mut memw_aligneds_slot, mut memw_registers_slot) =
         (None, None, None, None);
@@ -3367,7 +3675,8 @@ fn build_traces<I: ImageSource + Sync>(
     let (mut pages_slot, mut register_slot, mut halt_slot) = (None, None, None);
     let (mut eqs_slot, mut bytewises_slot, mut stores_slot, mut cpu32s_slot) =
         (None, None, None, None);
-    let (mut ecsm_slot, mut ecdas_slot) = (None, None);
+    let (mut ecsm_slot, mut ecdas_slot, mut ec_t0_slot) = (None, None, None);
+    let (mut ecsm2_slot, mut ecdas2_slot) = (None, None);
 
     #[cfg(feature = "disk-spill")]
     let sequential = storage_mode == StorageMode::Disk || cfg!(not(feature = "parallel"));
@@ -3409,6 +3718,9 @@ fn build_traces<I: ImageSource + Sync>(
             spawn_into!(cpu32s_slot, gen_cpu32s);
             spawn_into!(ecsm_slot, gen_ecsm);
             spawn_into!(ecdas_slot, gen_ecdas);
+            spawn_into!(ecsm2_slot, gen_ecsm2);
+            spawn_into!(ecdas2_slot, gen_ecdas2);
+            spawn_into!(ec_t0_slot, gen_ec_t0);
         });
     } else {
         cpus_slot = Some(gen_cpus());
@@ -3436,6 +3748,9 @@ fn build_traces<I: ImageSource + Sync>(
         cpu32s_slot = Some(gen_cpu32s());
         ecsm_slot = Some(gen_ecsm());
         ecdas_slot = Some(gen_ecdas());
+        ecsm2_slot = Some(gen_ecsm2());
+        ecdas2_slot = Some(gen_ecdas2());
+        ec_t0_slot = Some(gen_ec_t0());
     }
 
     const PHASE5_RAN: &str = "phase 5 generation ran in one of the branches above";
@@ -3470,6 +3785,9 @@ fn build_traces<I: ImageSource + Sync>(
     let mut halt_trace = halt_slot.expect(PHASE5_RAN);
     let ecsm_trace = ecsm_slot.expect(PHASE5_RAN);
     let ecdas_trace = ecdas_slot.expect(PHASE5_RAN);
+    let ecsm2_trace = ecsm2_slot.expect(PHASE5_RAN);
+    let ecdas2_trace = ecdas2_slot.expect(PHASE5_RAN);
+    let ec_t0_trace = ec_t0_slot.expect(PHASE5_RAN);
 
     // Fixed-size and per-page tables aren't built through `chunk_and_generate`,
     // so spill them here before returning.
@@ -3537,6 +3855,9 @@ fn build_traces<I: ImageSource + Sync>(
         keccak_rc: keccak_rc_trace,
         ecsm: ecsm_trace,
         ecdas: ecdas_trace,
+        ecsm2: ecsm2_trace,
+        ecdas2: ecdas2_trace,
+        ec_t0: ec_t0_trace,
         memw_registers,
         local_to_global,
         touched_memory_cells,
@@ -3777,14 +4098,23 @@ pub fn count_table_lengths(
 }
 
 impl Traces {
-    /// Returns the total number of main-trace field elements across all tables.
+    /// Per-table main- and auxiliary-trace field-element counts, as
+    /// `(table_name, main_elements, aux_elements)`.
     ///
-    /// Counts only the main (base-field) trace columns — equivalent to SP1's
-    /// `main_area` — for apples-to-apples comparison with other zkVMs.
+    /// This is the **single source** for the two totals below, which now just
+    /// sum it — the per-table arithmetic exists once, so a table added to one
+    /// and forgotten in the other is not a failure mode.
     ///
-    /// Preprocessed columns (committed in a separate PCS round during setup, not at
-    /// proving time) are excluded: BITWISE (11), DECODE (5), REGISTER (2), PAGE (2).
-    pub fn total_field_elements(&self) -> u64 {
+    /// Split tables (CPU, MEMW, …) are reported as one entry summed over their
+    /// chunks: a chunk boundary is an artefact of `MaxRowsConfig` rather than
+    /// something a caller wants to see. Preprocessed columns are excluded from
+    /// the main count on the same basis as the totals — they are committed once
+    /// during setup, not at proving time.
+    ///
+    /// Added for the phase-H bench, which needs the EC share of a real block's
+    /// prover cells: the multiplier that turns a per-ecrecover win into a
+    /// whole-prover number.
+    pub fn field_elements_by_table(&self) -> Vec<(&'static str, u64, u64)> {
         use super::bitwise::NUM_PRECOMPUTED_COLS as BITWISE_PRECOMPUTED;
         use super::bitwise::cols::NUM_COLUMNS as BITWISE_COLS;
         use super::branch::cols::NUM_COLUMNS as BRANCH_COLS;
@@ -3795,8 +4125,12 @@ impl Traces {
         use super::decode::NUM_PRECOMPUTED_COLS as DECODE_PRECOMPUTED;
         use super::decode::cols::NUM_COLUMNS as DECODE_COLS;
         use super::dvrm::cols::NUM_COLUMNS as DVRM_COLS;
+        use super::ec_t0::NUM_PRECOMPUTED_COLS as EC_T0_PRECOMPUTED;
+        use super::ec_t0::cols::NUM_COLUMNS as EC_T0_COLS;
         use super::ecdas::cols::NUM_COLUMNS as ECDAS_COLS;
+        use super::ecdas2::cols::NUM_COLUMNS as ECDAS2_COLS;
         use super::ecsm::cols::NUM_COLUMNS as ECSM_COLS;
+        use super::ecsm2::cols::NUM_COLUMNS as ECSM2_COLS;
         use super::eq::cols::NUM_COLUMNS as EQ_COLS;
         use super::halt::cols::NUM_COLUMNS as HALT_COLS;
         use super::keccak::cols::NUM_COLUMNS as KECCAK_COLS;
@@ -3815,6 +4149,11 @@ impl Traces {
         use super::register::cols::NUM_COLUMNS as REGISTER_COLS;
         use super::shift::cols::NUM_COLUMNS as SHIFT_COLS;
         use super::store::cols::NUM_COLUMNS as STORE_COLS;
+        // ⌈N/2⌉ aux EF columns for a table with N bus interactions (LogUp packs
+        // two interactions per committed column).
+        fn aux_cols(n: usize) -> usize {
+            n.div_ceil(2)
+        }
 
         let Traces {
             cpus,
@@ -3837,6 +4176,9 @@ impl Traces {
             keccak_rc,
             ecsm,
             ecdas,
+            ecsm2,
+            ecdas2,
+            ec_t0,
             memw_registers,
             eqs,
             bytewises,
@@ -3848,193 +4190,204 @@ impl Traces {
             touched_memory_cells: _,
         } = self;
 
-        let mut total: u64 = 0;
-        for t in cpus {
-            total += (t.num_rows() * CPU_COLS) as u64;
+        let mut out: Vec<(&'static str, u64, u64)> = Vec::new();
+        // Macros rather than closures: a closure capturing `out` would hold the
+        // mutable borrow across every other push.
+        macro_rules! single {
+            ($name:expr, $trace:expr, $main_cols:expr, $interactions:expr $(,)?) => {{
+                let rows = $trace.num_rows();
+                out.push((
+                    $name,
+                    (rows * $main_cols) as u64,
+                    (rows * aux_cols($interactions)) as u64,
+                ));
+            }};
         }
-        total += (bitwise.num_rows() * (BITWISE_COLS - BITWISE_PRECOMPUTED)) as u64;
-        for t in lts {
-            total += (t.num_rows() * LT_COLS) as u64;
+        macro_rules! split {
+            ($name:expr, $traces:expr, $main_cols:expr, $interactions:expr $(,)?) => {{
+                let (mut m, mut a) = (0u64, 0u64);
+                let aux = aux_cols($interactions);
+                for t in $traces {
+                    m += (t.num_rows() * $main_cols) as u64;
+                    a += (t.num_rows() * aux) as u64;
+                }
+                out.push(($name, m, a));
+            }};
         }
-        for t in shifts {
-            total += (t.num_rows() * SHIFT_COLS) as u64;
-        }
-        for t in memws {
-            total += (t.num_rows() * MEMW_COLS) as u64;
-        }
-        for t in memw_aligneds {
-            total += (t.num_rows() * MEMW_A_COLS) as u64;
-        }
-        for t in loads {
-            total += (t.num_rows() * LOAD_COLS) as u64;
-        }
-        total += (decode.num_rows() * (DECODE_COLS - DECODE_PRECOMPUTED)) as u64;
-        for t in muls {
-            total += (t.num_rows() * MUL_COLS) as u64;
-        }
-        for t in dvrms {
-            total += (t.num_rows() * DVRM_COLS) as u64;
-        }
-        for t in branches {
-            total += (t.num_rows() * BRANCH_COLS) as u64;
-        }
-        total += (halt.num_rows() * HALT_COLS) as u64;
-        total += (commit.num_rows() * COMMIT_COLS) as u64;
-        total += (register.num_rows() * (REGISTER_COLS - REGISTER_PREPROCESSED)) as u64;
-        for t in pages {
-            total += (t.num_rows() * (PAGE_COLS - PAGE_PREPROCESSED)) as u64;
-        }
-        for t in memw_registers {
-            total += (t.num_rows() * MEMW_R_COLS) as u64;
-        }
-        total += (keccak.num_rows() * KECCAK_COLS) as u64;
-        total += (keccak_rnd.num_rows() * KECCAK_RND_COLS) as u64;
-        total += (keccak_rc.num_rows() * (KECCAK_RC_COLS - KECCAK_RC_PRECOMPUTED)) as u64;
-        for t in eqs {
-            total += (t.num_rows() * EQ_COLS) as u64;
-        }
-        for t in bytewises {
-            total += (t.num_rows() * BYTEWISE_COLS) as u64;
-        }
-        for t in stores {
-            total += (t.num_rows() * STORE_COLS) as u64;
-        }
-        for t in cpu32s {
-            total += (t.num_rows() * CPU32_COLS) as u64;
-        }
-        total += (ecsm.num_rows() * ECSM_COLS) as u64;
-        total += (ecdas.num_rows() * ECDAS_COLS) as u64;
-        total
+
+        split!("CPU", cpus, CPU_COLS, super::cpu::bus_interactions().len());
+        single!(
+            "BITWISE",
+            bitwise,
+            BITWISE_COLS - BITWISE_PRECOMPUTED,
+            super::bitwise::bus_interactions().len(),
+        );
+        split!("LT", lts, LT_COLS, super::lt::bus_interactions().len());
+        split!(
+            "SHIFT",
+            shifts,
+            SHIFT_COLS,
+            super::shift::bus_interactions().len()
+        );
+        split!(
+            "MEMW",
+            memws,
+            MEMW_COLS,
+            super::memw::bus_interactions().len()
+        );
+        split!(
+            "MEMW_ALIGNED",
+            memw_aligneds,
+            MEMW_A_COLS,
+            super::memw_aligned::bus_interactions().len()
+        );
+        split!(
+            "LOAD",
+            loads,
+            LOAD_COLS,
+            super::load::bus_interactions().len()
+        );
+        single!(
+            "DECODE",
+            decode,
+            DECODE_COLS - DECODE_PRECOMPUTED,
+            super::decode::bus_interactions().len(),
+        );
+        split!("MUL", muls, MUL_COLS, super::mul::bus_interactions().len());
+        split!(
+            "DVRM",
+            dvrms,
+            DVRM_COLS,
+            super::dvrm::bus_interactions().len()
+        );
+        split!(
+            "BRANCH",
+            branches,
+            BRANCH_COLS,
+            super::branch::bus_interactions().len()
+        );
+        single!(
+            "HALT",
+            halt,
+            HALT_COLS,
+            super::halt::bus_interactions().len()
+        );
+        single!(
+            "COMMIT",
+            commit,
+            COMMIT_COLS,
+            super::commit::bus_interactions().len()
+        );
+        single!(
+            "REGISTER",
+            register,
+            REGISTER_COLS - REGISTER_PREPROCESSED,
+            super::register::bus_interactions().len(),
+        );
+        // `page::bus_interactions` has a constant count regardless of page_base.
+        split!(
+            "PAGE",
+            pages,
+            PAGE_COLS - PAGE_PREPROCESSED,
+            super::page::bus_interactions(0).len()
+        );
+        split!(
+            "MEMW_REGISTER",
+            memw_registers,
+            MEMW_R_COLS,
+            super::memw_register::bus_interactions().len()
+        );
+        single!(
+            "KECCAK",
+            keccak,
+            KECCAK_COLS,
+            super::keccak::bus_interactions().len()
+        );
+        single!(
+            "KECCAK_RND",
+            keccak_rnd,
+            KECCAK_RND_COLS,
+            super::keccak_rnd::bus_interactions().len()
+        );
+        single!(
+            "KECCAK_RC",
+            keccak_rc,
+            KECCAK_RC_COLS - KECCAK_RC_PRECOMPUTED,
+            super::keccak_rc::bus_interactions().len(),
+        );
+        split!("EQ", eqs, EQ_COLS, super::eq::bus_interactions().len());
+        split!(
+            "BYTEWISE",
+            bytewises,
+            BYTEWISE_COLS,
+            super::bytewise::bus_interactions().len()
+        );
+        split!(
+            "STORE",
+            stores,
+            STORE_COLS,
+            super::store::bus_interactions().len()
+        );
+        split!(
+            "CPU32",
+            cpu32s,
+            CPU32_COLS,
+            super::cpu32::bus_interactions().len()
+        );
+        single!(
+            "ECSM",
+            ecsm,
+            ECSM_COLS,
+            super::ecsm::bus_interactions().len()
+        );
+        single!(
+            "ECDAS",
+            ecdas,
+            ECDAS_COLS,
+            super::ecdas::bus_interactions().len()
+        );
+        single!(
+            "ECSM2",
+            ecsm2,
+            ECSM2_COLS,
+            super::ecsm2::bus_interactions().len()
+        );
+        single!(
+            "ECDAS2",
+            ecdas2,
+            ECDAS2_COLS,
+            super::ecdas2::bus_interactions().len()
+        );
+        single!(
+            "EC_T0",
+            ec_t0,
+            EC_T0_COLS - EC_T0_PRECOMPUTED,
+            super::ec_t0::bus_interactions().len(),
+        );
+
+        out
     }
 
-    /// Returns the total number of auxiliary-trace field elements (extension field)
-    /// across all tables.
+    /// Returns the total number of main-trace field elements across all tables.
+    ///
+    /// Counts only the main (base-field) trace columns — equivalent to SP1's
+    /// `main_area` — for apples-to-apples comparison with other zkVMs.
+    ///
+    /// Preprocessed columns (committed in a separate PCS round during setup, not
+    /// at proving time) are excluded: BITWISE, DECODE, REGISTER, PAGE, KECCAK_RC,
+    /// EC_T0.
+    pub fn total_field_elements(&self) -> u64 {
+        self.field_elements_by_table().iter().map(|t| t.1).sum()
+    }
+
+    /// Returns the total number of auxiliary-trace field elements (extension
+    /// field) across all tables.
     ///
     /// The LogUp layout packs N bus interactions into ⌈N/2⌉ EF columns
     /// (`num_committed_pairs + 1` accumulated column). Each EF column costs one
     /// extension-field element per row.
     pub fn total_auxiliary_field_elements(&self) -> u64 {
-        // ⌈N/2⌉ = number of aux EF columns for a table with N bus interactions.
-        fn aux_cols(n: usize) -> usize {
-            n.div_ceil(2)
-        }
-
-        let n_cpu = aux_cols(super::cpu::bus_interactions().len());
-        let n_bitwise = aux_cols(super::bitwise::bus_interactions().len());
-        let n_lt = aux_cols(super::lt::bus_interactions().len());
-        let n_shift = aux_cols(super::shift::bus_interactions().len());
-        let n_memw = aux_cols(super::memw::bus_interactions().len());
-        let n_memw_a = aux_cols(super::memw_aligned::bus_interactions().len());
-        let n_load = aux_cols(super::load::bus_interactions().len());
-        let n_decode = aux_cols(super::decode::bus_interactions().len());
-        let n_mul = aux_cols(super::mul::bus_interactions().len());
-        let n_dvrm = aux_cols(super::dvrm::bus_interactions().len());
-        let n_branch = aux_cols(super::branch::bus_interactions().len());
-        let n_halt = aux_cols(super::halt::bus_interactions().len());
-        let n_commit = aux_cols(super::commit::bus_interactions().len());
-        let n_register = aux_cols(super::register::bus_interactions().len());
-        // page::bus_interactions count is constant regardless of page_base.
-        let n_page = aux_cols(super::page::bus_interactions(0).len());
-        let n_memw_r = aux_cols(super::memw_register::bus_interactions().len());
-        let n_keccak = aux_cols(super::keccak::bus_interactions().len());
-        let n_keccak_rnd = aux_cols(super::keccak_rnd::bus_interactions().len());
-        let n_keccak_rc = aux_cols(super::keccak_rc::bus_interactions().len());
-        let n_eq = aux_cols(super::eq::bus_interactions().len());
-        let n_bytewise = aux_cols(super::bytewise::bus_interactions().len());
-        let n_store = aux_cols(super::store::bus_interactions().len());
-        let n_cpu32 = aux_cols(super::cpu32::bus_interactions().len());
-        let n_ecsm = aux_cols(super::ecsm::bus_interactions().len());
-        let n_ecdas = aux_cols(super::ecdas::bus_interactions().len());
-
-        let Traces {
-            cpus,
-            bitwise,
-            lts,
-            shifts,
-            memws,
-            memw_aligneds,
-            loads,
-            decode,
-            muls,
-            dvrms,
-            pages,
-            register,
-            branches,
-            halt,
-            commit,
-            keccak,
-            keccak_rnd,
-            keccak_rc,
-            ecsm,
-            ecdas,
-            memw_registers,
-            eqs,
-            bytewises,
-            stores,
-            cpu32s,
-            page_configs: _,
-            public_output_bytes: _,
-            local_to_global: _,
-            touched_memory_cells: _,
-        } = self;
-
-        let mut total: u64 = 0;
-        for t in cpus {
-            total += (t.num_rows() * n_cpu) as u64;
-        }
-        total += (bitwise.num_rows() * n_bitwise) as u64;
-        for t in lts {
-            total += (t.num_rows() * n_lt) as u64;
-        }
-        for t in shifts {
-            total += (t.num_rows() * n_shift) as u64;
-        }
-        for t in memws {
-            total += (t.num_rows() * n_memw) as u64;
-        }
-        for t in memw_aligneds {
-            total += (t.num_rows() * n_memw_a) as u64;
-        }
-        for t in loads {
-            total += (t.num_rows() * n_load) as u64;
-        }
-        total += (decode.num_rows() * n_decode) as u64;
-        for t in muls {
-            total += (t.num_rows() * n_mul) as u64;
-        }
-        for t in dvrms {
-            total += (t.num_rows() * n_dvrm) as u64;
-        }
-        for t in branches {
-            total += (t.num_rows() * n_branch) as u64;
-        }
-        total += (halt.num_rows() * n_halt) as u64;
-        total += (commit.num_rows() * n_commit) as u64;
-        total += (register.num_rows() * n_register) as u64;
-        for t in pages {
-            total += (t.num_rows() * n_page) as u64;
-        }
-        for t in memw_registers {
-            total += (t.num_rows() * n_memw_r) as u64;
-        }
-        total += (keccak.num_rows() * n_keccak) as u64;
-        total += (keccak_rnd.num_rows() * n_keccak_rnd) as u64;
-        total += (keccak_rc.num_rows() * n_keccak_rc) as u64;
-        for t in eqs {
-            total += (t.num_rows() * n_eq) as u64;
-        }
-        for t in bytewises {
-            total += (t.num_rows() * n_bytewise) as u64;
-        }
-        for t in stores {
-            total += (t.num_rows() * n_store) as u64;
-        }
-        for t in cpu32s {
-            total += (t.num_rows() * n_cpu32) as u64;
-        }
-        total += (ecsm.num_rows() * n_ecsm) as u64;
-        total += (ecdas.num_rows() * n_ecdas) as u64;
-        total
+        self.field_elements_by_table().iter().map(|t| t.2).sum()
     }
 
     /// Returns the number of chunks for each split table.
@@ -4256,6 +4609,8 @@ impl Traces {
             cpu32_ops,
             ecsm_ops,
             ecdas_ops,
+            ecsm2_ops,
+            ecdas2_ops,
         ) = collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
         #[cfg(feature = "instruments")]
         drop(__sp);
@@ -4274,6 +4629,8 @@ impl Traces {
             cpu32_ops,
             ecsm_ops,
             ecdas_ops,
+            ecsm2_ops,
+            ecdas2_ops,
             &mut register_state,
             is_final,
         );
@@ -4333,6 +4690,8 @@ impl Traces {
             cpu32_ops,
             ecsm_ops,
             ecdas_ops,
+            ecsm2_ops,
+            ecdas2_ops,
         ) = collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
 
         let ops = collect_all_ops(
@@ -4347,6 +4706,8 @@ impl Traces {
             cpu32_ops,
             ecsm_ops,
             ecdas_ops,
+            ecsm2_ops,
+            ecdas2_ops,
             &mut register_state,
             true,
         );

@@ -1,0 +1,58 @@
+==============================================================================
+PART 1 -- SOUNDNESS: does the field equation still imply the integer one?
+==============================================================================
+p_g (Goldilocks) = 18446744069414584321 ~ 2^63
+
+relation    offset           carry window   max |256c - c- - S|       vs p_g
+lambda       32636        [-32636, 32899]            22,771,245 810,089,394,295x
+xr            8161         [-8161, 57374]            16,723,665 1,103,032,383,715x
+yr           16320        [-16320, 49215]            18,739,185 984,394,148,913x
+dinv         32636        [-32636, 32899]            14,578,095 1,265,374,115,713x
+
+worst case over all relations: 22,771,245 ~ 2^24, headroom 2^39
+
+These intervals are over-approximations (repeated variables such as
+lam*lam and xa*xa are treated as independent), and they are maximised
+over BYTE LIMBS ONLY -- no operand is assumed canonical. Restricting
+any operand to [0, p) can only shrink them.
+
+Sensitivity: how large would ONE non-byte limb have to be to break it?
+   3*xa_j*xa_{i-j} (lambda, op=0)     breaks at a limb of ~2^29
+   lam_j*lam_{i-j} (xR)               breaks at a limb of ~2^29
+   => byte-ness of EVERY limb is load-bearing, not hygiene.
+
+==============================================================================
+PART 2 -- random-corner cross-check of the interval method
+==============================================================================
+   36,000 corner/random samples, 0 interval violations
+
+==============================================================================
+PART 3 -- COMPLETENESS: honest carries on real lincomb2 witnesses
+==============================================================================
+   Rust differential: 38,076 (quotient, carry-array) comparisons against `ecsm::lincomb2_witness`, 0 mismatches
+
+6,346 real rows over 15 lincomb2 evaluations (every row type incl. Precompute and Correction)
+
+relation               honest c range                 window   fits  min offset needed
+lambda                  [-4303, 6728]        [-32636, 32899]   True               4303
+xr                       [-112, 8308]         [-8161, 57374]   True                112
+yr                       [-465, 5914]        [-16320, 49215]   True                465
+dinv                     [-581, 6041]        [-32636, 32899]   True                581
+
+quotient headroom (33 bytes = [0, 2^264)):
+   lambda   q in [253 bits, 259 bits]  min q >= 0: True   max q < 2^264: True
+   xr       q in [258 bits, 258 bits]  min q >= 0: True   max q < 2^264: True
+   yr       q in [258 bits, 258 bits]  min q >= 0: True   max q < 2^264: True
+   dinv     q in [258 bits, 258 bits]  min q >= 0: True   max q < 2^264: True
+
+per row type (carry ranges), to show the new row shapes are not outliers:
+   Precompute   lambda=[-95, 4619]  xr=[-24, 6773]  yr=[-170, 4729]
+   Double       lambda=[-4303, 6728]  xr=[-112, 8308]  yr=[-368, 5914]
+   AddP1        lambda=[-304, 5624]  xr=[-94, 7722]  yr=[-300, 5686]
+   AddP2        lambda=[-290, 6170]  xr=[-109, 8074]  yr=[-328, 5509]
+   AddP12       lambda=[-412, 5439]  xr=[-100, 7897]  yr=[-465, 5700]
+   Correction   lambda=[-146, 5019]  xr=[-13, 7493]  yr=[-251, 5156]
+
+==============================================================================
+WIDTH AUDIT: PASS
+==============================================================================

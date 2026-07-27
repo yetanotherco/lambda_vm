@@ -76,7 +76,7 @@ jobs:
           path: |
             executor/program_artifacts/rust
             executor/shared_target
-          key: rust-elf-artifacts-${{ hashFiles('executor/programs/rust/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'syscalls/**', 'Makefile') }}
+          key: rust-elf-artifacts-${{ hashFiles('executor/programs/rust/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'syscalls/**', 'crypto/ethrex-crypto/**', 'Makefile') }}
           restore-keys: |
             rust-elf-artifacts-
 
@@ -213,7 +213,7 @@ jobs:
           path: |
             executor/program_artifacts/rust
             executor/shared_target
-          key: rust-elf-artifacts-${{ hashFiles('executor/programs/rust/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'syscalls/**', 'Makefile') }}
+          key: rust-elf-artifacts-${{ hashFiles('executor/programs/rust/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'syscalls/**', 'crypto/ethrex-crypto/**', 'Makefile') }}
           restore-keys: |
             rust-elf-artifacts-
 
@@ -329,7 +329,7 @@ jobs:
           path: |
             executor/program_artifacts/rust
             executor/shared_target
-          key: rust-elf-artifacts-${{ hashFiles('executor/programs/rust/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'syscalls/**', 'Makefile') }}
+          key: rust-elf-artifacts-${{ hashFiles('executor/programs/rust/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'syscalls/**', 'crypto/ethrex-crypto/**', 'Makefile') }}
           restore-keys: |
             rust-elf-artifacts-
 
@@ -409,7 +409,7 @@ jobs:
           path: |
             executor/program_artifacts/rust
             executor/shared_target
-          key: rust-elf-artifacts-${{ hashFiles('executor/programs/rust/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'syscalls/**', 'Makefile') }}
+          key: rust-elf-artifacts-${{ hashFiles('executor/programs/rust/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'syscalls/**', 'crypto/ethrex-crypto/**', 'Makefile') }}
           restore-keys: |
             rust-elf-artifacts-
 
@@ -493,7 +493,7 @@ jobs:
           path: |
             executor/program_artifacts/rust
             executor/shared_target
-          key: rust-elf-artifacts-${{ hashFiles('executor/programs/rust/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'syscalls/**', 'Makefile') }}
+          key: rust-elf-artifacts-${{ hashFiles('executor/programs/rust/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'syscalls/**', 'crypto/ethrex-crypto/**', 'Makefile') }}
           restore-keys: |
             rust-elf-artifacts-
 

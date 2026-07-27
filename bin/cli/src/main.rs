@@ -412,7 +412,7 @@ fn cmd_execute(
     // below (the flamegraph path drives execution inside the executor and does
     // not expose per-log data). `None` means "not counted", so the accel lines
     // are omitted rather than printed as misleading zeros.
-    let mut accel_counts: Option<(u64, u64)> = None;
+    let mut accel_counts: Option<(u64, u64, u64)> = None;
 
     let cycle_count = if let Some(ref output_path) = flamegraph.path {
         // Shared execute+flamegraph path (executor::flamegraph) instead of
@@ -480,6 +480,7 @@ fn cmd_execute(
         let mut cycle_count: u64 = 0;
         let mut keccak_calls: u64 = 0;
         let mut ecsm_calls: u64 = 0;
+        let mut ecsm_lincomb2_calls: u64 = 0;
         // Reused per chunk: `(current_pc, a7)` for logs whose a7 matches an
         // accelerator syscall number. This is a cheap superset — a non-ECALL
         // instruction can hold the same value in src1 — that `accelerator_of`
@@ -512,6 +513,7 @@ fn cmd_execute(
                 match accelerator_of(executor.instructions.get(pc), a7) {
                     Some(Accelerator::Keccak) => keccak_calls += 1,
                     Some(Accelerator::Ecsm) => ecsm_calls += 1,
+                    Some(Accelerator::EcsmLincomb2) => ecsm_lincomb2_calls += 1,
                     None => {}
                 }
             }
@@ -526,16 +528,17 @@ fn cmd_execute(
         }
 
         if cycles {
-            accel_counts = Some((keccak_calls, ecsm_calls));
+            accel_counts = Some((keccak_calls, ecsm_calls, ecsm_lincomb2_calls));
         }
         cycle_count
     };
 
     if cycles {
         println!("Cycles: {}", cycle_count);
-        if let Some((keccak_calls, ecsm_calls)) = accel_counts {
+        if let Some((keccak_calls, ecsm_calls, ecsm_lincomb2_calls)) = accel_counts {
             println!("Keccak calls: {}", keccak_calls);
             println!("Ecsm calls: {}", ecsm_calls);
+            println!("Ecsm lincomb2 calls: {}", ecsm_lincomb2_calls);
         }
     }
 
@@ -1097,7 +1100,9 @@ mod tests {
     // non-ECALL whose src1 collides with an accelerator number, and a cache miss.
     #[test]
     fn accelerator_of_mirrors_prover_classification() {
-        use executor::vm::instruction::execution::{ECSM_SYSCALL_NUMBER, KECCAK_SYSCALL_NUMBER};
+        use executor::vm::instruction::execution::{
+            ECSM_LINCOMB2_SYSCALL_NUMBER, ECSM_SYSCALL_NUMBER, KECCAK_SYSCALL_NUMBER,
+        };
 
         let ecall = Instruction::EcallEbreak;
 
@@ -1108,6 +1113,10 @@ mod tests {
         assert_eq!(
             accelerator_of(Some(&ecall), ECSM_SYSCALL_NUMBER),
             Some(Accelerator::Ecsm)
+        );
+        assert_eq!(
+            accelerator_of(Some(&ecall), ECSM_LINCOMB2_SYSCALL_NUMBER),
+            Some(Accelerator::EcsmLincomb2)
         );
 
         // Non-accelerator syscalls (Commit=64, Halt=93) count as neither.

@@ -90,12 +90,12 @@ fn biguint_from_fe(f: &FieldElement) -> BigUint {
     BigUint::from_bytes_be(&f.to_bytes())
 }
 
-fn to_k256_affine(a: &AffinePoint) -> K256Affine {
+pub(crate) fn to_k256_affine(a: &AffinePoint) -> K256Affine {
     let ep = EncodedPoint::from_affine_coordinates(&be32(&a.x).into(), &be32(&a.y).into(), false);
     Option::from(K256Affine::from_encoded_point(&ep)).expect("ECSM: point must be on the curve")
 }
 
-fn from_k256_affine(p: &K256Affine) -> AffinePoint {
+pub(crate) fn from_k256_affine(p: &K256Affine) -> AffinePoint {
     let ep = p.to_encoded_point(false);
     AffinePoint {
         x: BigUint::from_bytes_be(ep.x().expect("ECSM: affine point has x")),

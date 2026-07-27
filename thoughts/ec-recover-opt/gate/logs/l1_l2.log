@@ -1,0 +1,46 @@
+[PROVED] L1 telescoping [ecsm_x2]  0.0s
+[PROVED] L1 telescoping [ecsm_yg]  0.0s
+[PROVED] L1 telescoping [ecdas_lambda]  0.0s
+[PROVED] L1 telescoping [ecdas_xr]  0.0s
+[PROVED] L1 telescoping [ecdas_yr]  0.0s
+[PROVED] L2a width [ecsm_x2]  max|LHS| = 16826432 = 2^24.. < p_g=2^63.99 (9.12e-13·p_g)
+[PROVED] L2a width [ecsm_yg]  max|LHS| = 16702249 = 2^23.. < p_g=2^63.99 (9.05e-13·p_g)
+[PROVED] L2a width [ecdas_lambda]  max|LHS| = 14730340 = 2^23.. < p_g=2^63.99 (7.99e-13·p_g)
+[PROVED] L2a width [ecdas_xr]  max|LHS| = 18820530 = 2^24.. < p_g=2^63.99 (1.02e-12·p_g)
+[PROVED] L2a width [ecdas_yr]  max|LHS| = 16723412 = 2^23.. < p_g=2^63.99 (9.07e-13·p_g)
+[PROVED] L2a width [ColIsZero/IS_BIT/deg-1 constraints]  single-column values < 2^17 < p_g by their own contracts
+[PROVED] L2a corner cross-check  9000 sampled corner evaluations inside interval bounds
+[PROVED] L2b window [ecsm_x2]  honest-bound carries ⊂ [-7949, 8159] vs window [-8160, 57376)
+[PROVED] L2b window [ecsm_yg]  honest-bound carries ⊂ [-8371, 15894] vs window [-16319, 49217)
+[PROVED] L2b window [ecdas_lambda]  honest-bound carries ⊂ [-24605, 24137] vs window [-32636, 32900)
+[PROVED] L2b window [ecdas_xr]  honest-bound carries ⊂ [-256, 15979] vs window [-8161, 57375)
+[PROVED] L2b window [ecdas_yr]  honest-bound carries ⊂ [-8289, 15978] vs window [-16320, 49216)
+[PROVED] L2b audit-control [offset below necessity ⇒ audit fails]  per-relation minimal offsets: {'ecsm_x2': 7949, 'ecsm_yg': 8371, 'ecdas_lambda': 24605, 'ecdas_xr': 256, 'ecdas_yr': 8289} (repo offsets {'ecsm_x2': 8160, 'ecsm_yg': 16319, 'ecdas_lambda': 32636, 'ecdas_xr': 8161, 'ecdas_yr': 16320})
+[PROVED] L2b audit-control [r=2p insufficient, r=3p sufficient]  q_min(r=2p)=-115792089237316195423570985008687907853269984665640564039457584007908834671658 < 0 ≤ q_min(r=3p)=5
+[PROVED] L2b quotient headroom  ECDAS q_max≈2^259, ECSM q1_max≈2^257
+[PROVED] L2c word-carry lift  0.0s
+[PROVED] L2c strict-inequality chain  0.0s
+
+Summary:
+  PROVED   L1 telescoping [ecsm_x2]
+  PROVED   L1 telescoping [ecsm_yg]
+  PROVED   L1 telescoping [ecdas_lambda]
+  PROVED   L1 telescoping [ecdas_xr]
+  PROVED   L1 telescoping [ecdas_yr]
+  PROVED   L2a width [ecsm_x2]
+  PROVED   L2a width [ecsm_yg]
+  PROVED   L2a width [ecdas_lambda]
+  PROVED   L2a width [ecdas_xr]
+  PROVED   L2a width [ecdas_yr]
+  PROVED   L2a width [ColIsZero/IS_BIT/deg-1 constraints]
+  PROVED   L2a corner cross-check
+  PROVED   L2b window [ecsm_x2]
+  PROVED   L2b window [ecsm_yg]
+  PROVED   L2b window [ecdas_lambda]
+  PROVED   L2b window [ecdas_xr]
+  PROVED   L2b window [ecdas_yr]
+  PROVED   L2b audit-control [offset below necessity ⇒ audit fails]
+  PROVED   L2b audit-control [r=2p insufficient, r=3p sufficient]
+  PROVED   L2b quotient headroom
+  PROVED   L2c word-carry lift
+  PROVED   L2c strict-inequality chain

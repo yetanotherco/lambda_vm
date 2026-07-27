@@ -52,11 +52,12 @@ use crate::tables::trace_builder::count_table_lengths;
 use crate::tables::types::BusId;
 use crate::test_utils::{
     E, F, VmAir, create_bitwise_air, create_branch_air, create_bytewise_air, create_commit_air,
-    create_cpu_air, create_cpu32_air, create_decode_air, create_dvrm_air, create_ecdas_air,
-    create_ecsm_air, create_eq_air, create_halt_air, create_keccak_air, create_keccak_rc_air,
-    create_keccak_rnd_air, create_load_air, create_lt_air, create_memw_air,
-    create_memw_aligned_air, create_memw_register_air, create_mul_air, create_page_air,
-    create_register_air, create_shift_air, create_store_air,
+    create_cpu_air, create_cpu32_air, create_decode_air, create_dvrm_air, create_ec_t0_air,
+    create_ecdas_air, create_ecdas2_air, create_ecsm_air, create_ecsm2_air, create_eq_air,
+    create_halt_air, create_keccak_air, create_keccak_rc_air, create_keccak_rnd_air,
+    create_load_air, create_lt_air, create_memw_air, create_memw_aligned_air,
+    create_memw_register_air, create_mul_air, create_page_air, create_register_air,
+    create_shift_air, create_store_air,
 };
 
 // Re-exported for downstream hosts and verifier guests (e.g. the in-VM
@@ -82,8 +83,8 @@ pub struct RuntimePageRange {
 
 /// Number of tables that always contribute exactly one sub-proof, regardless
 /// of `TableCounts`: bitwise, decode, halt, commit, keccak, keccak_rnd,
-/// keccak_rc, register, ecsm, ecdas.
-pub const FIXED_TABLE_COUNT: usize = 10;
+/// keccak_rc, register, ecsm, ecdas, ecsm2, ecdas2, ec_t0.
+pub const FIXED_TABLE_COUNT: usize = 13;
 
 /// Number of chunks for each split table.
 /// The verifier needs this to reconstruct matching AIRs.
@@ -503,6 +504,12 @@ pub(crate) struct VmAirs {
     pub keccak_rc: VmAir,
     pub ecsm: VmAir,
     pub ecdas: VmAir,
+    /// ECSM2: the lincomb2 (`Q = u1·P1 + u2·P2`) orchestrator.
+    pub ecsm2: VmAir,
+    /// ECDAS2: one step of the lincomb2 joint double-add chain.
+    pub ecdas2: VmAir,
+    /// EC_T0: preprocessed `−2^len·T₀` table for the lincomb2 correction row.
+    pub ec_t0: VmAir,
     pub register: VmAir,
     pub pages: Vec<VmAir>,
     pub memw_registers: Vec<VmAir>,
@@ -528,6 +535,9 @@ impl VmAirs {
             (self.keccak_rc.as_ref(), &mut traces.keccak_rc, &()),
             (self.ecsm.as_ref(), &mut traces.ecsm, &()),
             (self.ecdas.as_ref(), &mut traces.ecdas, &()),
+            (self.ecsm2.as_ref(), &mut traces.ecsm2, &()),
+            (self.ecdas2.as_ref(), &mut traces.ecdas2, &()),
+            (self.ec_t0.as_ref(), &mut traces.ec_t0, &()),
             (self.register.as_ref(), &mut traces.register, &()),
         ];
         if self.include_halt {
@@ -602,6 +612,9 @@ impl VmAirs {
             self.keccak_rc.as_ref(),
             self.ecsm.as_ref(),
             self.ecdas.as_ref(),
+            self.ecsm2.as_ref(),
+            self.ecdas2.as_ref(),
+            self.ec_t0.as_ref(),
             self.register.as_ref(),
         ];
         if self.include_halt {
@@ -759,6 +772,12 @@ impl VmAirs {
         ));
         let ecsm: VmAir = Box::new(create_ecsm_air(proof_options));
         let ecdas: VmAir = Box::new(create_ecdas_air(proof_options));
+        let ecsm2: VmAir = Box::new(create_ecsm2_air(proof_options));
+        let ecdas2: VmAir = Box::new(create_ecdas2_air(proof_options));
+        let ec_t0: VmAir = Box::new(create_ec_t0_air(proof_options).with_preprocessed(
+            tables::ec_t0::preprocessed_commitment(proof_options),
+            tables::ec_t0::NUM_PRECOMPUTED_COLS,
+        ));
         let register: VmAir =
             if let Some((commitment, num_preprocessed_cols)) = register_preprocessed {
                 Box::new(
@@ -865,6 +884,9 @@ impl VmAirs {
             keccak_rc,
             ecsm,
             ecdas,
+            ecsm2,
+            ecdas2,
+            ec_t0,
             register,
             pages,
             memw_registers,
@@ -1032,6 +1054,43 @@ pub fn count_elements(elf_bytes: &[u8], private_inputs: &[u8]) -> Result<(u64, u
         traces.total_field_elements(),
         traces.total_auxiliary_field_elements(),
     ))
+}
+
+/// The same counts as [`count_elements`], broken down per table.
+///
+/// Returns `(table_name, main_elements, aux_elements)` per table, in a fixed
+/// order. The two columns sum to exactly what [`count_elements`] returns — they
+/// share one implementation (`Traces::field_elements_by_table`), so the
+/// breakdown and the totals cannot drift apart.
+///
+/// Split tables (CPU, MEMW, …) appear once, summed over their chunks: a chunk
+/// boundary is an artefact of `MaxRowsConfig`, not something a caller wants to
+/// see. Preprocessed columns are excluded from the main count, matching
+/// [`count_elements`].
+///
+/// The motivating use is measuring one component's **share** of a real
+/// workload's prover cells — e.g. what fraction of an ethrex block is EC work,
+/// which is the multiplier that converts a per-operation win into a
+/// whole-prover number.
+pub fn count_elements_by_table(
+    elf_bytes: &[u8],
+    private_inputs: &[u8],
+) -> Result<Vec<(&'static str, u64, u64)>, Error> {
+    let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
+    let executor = Executor::new(&program, private_inputs.to_vec())
+        .map_err(|e| Error::Execution(format!("{e}")))?;
+    let result = executor
+        .run()
+        .map_err(|e| Error::Execution(format!("{e}")))?;
+    let traces = Traces::from_elf_and_logs(
+        &program,
+        &result.logs,
+        &MaxRowsConfig::default(),
+        private_inputs,
+        #[cfg(feature = "disk-spill")]
+        StorageMode::Ram,
+    )?;
+    Ok(traces.field_elements_by_table())
 }
 
 /// Prove an ELF binary execution with custom proof options and max rows config.

@@ -1,0 +1,26 @@
+[PROVED] A-PRIME certificate  isprime(p)=True, isprime(N)=True, N odd=True
+[PROVED] L3a composition [ecsm_x2]  3s cumulative
+[PROVED] L3a composition [ecsm_yg]  3s cumulative
+[PROVED] L3a composition [ecdas_lambda]  3s cumulative
+[PROVED] L3a composition [ecdas_xr]  3s cumulative
+[PROVED] L3a composition [ecdas_yr]  4s cumulative
+[PROVED] L3b on-curve preservation [add]  
+[PROVED] L3b on-curve preservation [double]  
+[PROVED] L4a λ-pin [op=1]  side: p∤(xG−xA); + A-PRIME closes gr·dr ≡ 0; 0s
+[PROVED] L4a λ-pin [op=0]  side: p∤2yA; + A-PRIME closes gr·dr ≡ 0; 0s
+[PROVED] L4b xR-pin  0s
+[PROVED] L4c yR-pin  0s
+
+Summary:
+  PROVED   A-PRIME certificate
+  PROVED   L3a composition [ecsm_x2]
+  PROVED   L3a composition [ecsm_yg]
+  PROVED   L3a composition [ecdas_lambda]
+  PROVED   L3a composition [ecdas_xr]
+  PROVED   L3a composition [ecdas_yr]
+  PROVED   L3b on-curve preservation [add]
+  PROVED   L3b on-curve preservation [double]
+  PROVED   L4a λ-pin [op=1]
+  PROVED   L4a λ-pin [op=0]
+  PROVED   L4b xR-pin
+  PROVED   L4c yR-pin

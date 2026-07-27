@@ -29,8 +29,11 @@ pub mod cpu;
 pub mod cpu32;
 pub mod decode;
 pub mod dvrm;
+pub mod ec_t0;
 pub mod ecdas;
+pub mod ecdas2;
 pub mod ecsm;
+pub mod ecsm2;
 pub mod eq;
 pub mod global_memory;
 pub mod halt;
@@ -53,7 +56,7 @@ pub mod trace_builder;
 pub use types::BusId;
 
 /// Blowup factors for which we ship static preprocessed-table commitments
-/// (bitwise and keccak_rc), pinned by the `static_commitments_tests` drift
+/// (bitwise, keccak_rc and ec_t0), pinned by the `static_commitments_tests` drift
 /// suite and emitted by the `compute_static_commitments` binary. Shared
 /// between the generator and the drift tests so adding a blowup here cannot
 /// silently skip a test.

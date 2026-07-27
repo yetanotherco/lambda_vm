@@ -83,7 +83,12 @@ pub struct EcdasStep {
 // =========================================================================
 
 /// Zero-extends a little-endian byte slice (≤ 64 bytes) to 64 `i128` limbs.
-fn ext64(bytes: &[u8]) -> [i128; 64] {
+///
+/// `pub` so the chips can build the *same* limb identities this module does.
+/// There must be exactly one implementation of this arithmetic: a second copy in
+/// the prover would be the classic divergence, where one side is edited years
+/// later and the other is not.
+pub fn ext64(bytes: &[u8]) -> [i128; 64] {
     let mut a = [0i128; 64];
     for (i, &b) in bytes.iter().enumerate() {
         a[i] = b as i128;
@@ -91,8 +96,8 @@ fn ext64(bytes: &[u8]) -> [i128; 64] {
     a
 }
 
-/// Convolution `Σ_{j=0}^{i} a[j]·b[i-j]`.
-fn conv(a: &[i128; 64], b: &[i128; 64], i: usize) -> i128 {
+/// Convolution `Σ_{j=0}^{i} a[j]·b[i-j]`. `pub` for the reason on [`ext64`].
+pub fn conv(a: &[i128; 64], b: &[i128; 64], i: usize) -> i128 {
     let mut s = 0i128;
     for j in 0..=i {
         s += a[j] * b[i - j];
@@ -105,7 +110,9 @@ fn conv(a: &[i128; 64], b: &[i128; 64], i: usize) -> i128 {
 ///
 /// These asserts catch any transcription error in the `terms` builders: for valid inputs
 /// the relation `LHS − RHS = 0` holds exactly, so every partial sum is divisible by 256.
-fn limb_carries(relation: &str, terms: &[i128; 64]) -> [i64; 64] {
+///
+/// `pub` for the reason on [`ext64`]; `relation` names the caller in the panics.
+pub fn limb_carries(relation: &str, terms: &[i128; 64]) -> [i64; 64] {
     let mut c = [0i64; 64];
     let mut carry: i128 = 0;
     for i in 0..64 {
@@ -241,7 +248,8 @@ fn carries_yr(
 // =========================================================================
 
 /// Little-endian 33 bytes of a non-negative value that fits in 264 bits.
-fn to_le_33(relation: &str, v: &BigUint) -> [u8; 33] {
+/// `pub` for the reason on [`ext64`].
+pub fn to_le_33(relation: &str, v: &BigUint) -> [u8; 33] {
     let mut bytes = v.to_bytes_le();
     assert!(
         bytes.len() <= 33,
@@ -455,5 +463,627 @@ fn build_step(
         c0,
         c1,
         c2,
+    }
+}
+
+// =========================================================================
+// lincomb2: Q = u1·P1 + u2·P2 via NUMS-blinded joint Shamir/Straus.
+//
+// PHASE A (this block): witness generation + host validation only. The
+// prover chip, executor syscall, and guest switch come in later phases; this
+// is the layout lock the chip consumes. The per-row math REUSES the audited,
+// gate-verified `build_step` / `carries_*` machinery above — a joint-chain row
+// is exactly one double-or-add step, so only the schedule and the choice of
+// addend differ from the single-scalar chain.
+// =========================================================================
+
+use crate::curve::AffinePoint;
+
+/// NUMS blinding point `T₀` — hash-to-curve of the tag
+/// `"lambdavm/ecsm/lincomb2/T0/v1"` by SHA-256 try-and-increment: candidate
+/// `x = SHA-256(tag || counter_be32)` (big-endian), first `counter` giving a
+/// canonical curve `x` with the even `y`. Result: counter = 1, y even. Derived
+/// and reproduced independently in `thoughts/ec-recover-opt/lincomb2/T0.md`,
+/// the Python `oracle/lincomb2_ref.py::t0_ref`, and the `t0_derivation_matches`
+/// dev test (which re-runs the SHA-256 search). Pinned here as a constant so
+/// the crate needs no runtime hash dependency.
+pub const T0_X_LE: [u8; 32] = [
+    0x64, 0x78, 0xAE, 0xB1, 0x0C, 0x07, 0x49, 0x1B, 0xDB, 0x93, 0x88, 0xA9, 0x9A, 0xA7, 0xFB, 0x5E,
+    0x66, 0x0A, 0x33, 0xDB, 0x5E, 0xE8, 0x7D, 0x29, 0x6B, 0xA8, 0x91, 0x0F, 0xA9, 0x9A, 0x31, 0xAF,
+];
+pub const T0_Y_LE: [u8; 32] = [
+    0xA0, 0x77, 0x62, 0x60, 0x4A, 0x25, 0x3C, 0x3F, 0x19, 0x82, 0x7D, 0x21, 0xFA, 0x24, 0xE6, 0xA2,
+    0x8C, 0x5B, 0xB0, 0xF3, 0xBC, 0xB0, 0x1D, 0x07, 0x32, 0x07, 0x3C, 0x14, 0x38, 0xA0, 0x81, 0x14,
+];
+
+/// The pinned NUMS blinding point `T₀` as an affine point.
+pub fn t0() -> AffinePoint {
+    AffinePoint {
+        x: BigUint::from_bytes_le(&T0_X_LE),
+        y: BigUint::from_bytes_le(&T0_Y_LE),
+    }
+}
+
+/// Reasons a sound lincomb2 witness cannot be built. The executor maps these to
+/// a non-zero status word; the guest then takes its pure-Rust software fallback
+/// (`ProjectivePoint::lincomb`), which is sound because guest code is proven
+/// execution — a lying status only wastes cycles, it can never forge a result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Lincomb2Error {
+    /// `u1` or `u2` is zero.
+    ScalarIsZero,
+    /// `u1` or `u2` is `>= N`.
+    ScalarOutOfRange,
+    /// `P1` or `P2` is not on the curve.
+    PointNotOnCurve,
+    /// `P1` or `P2` has a non-canonical coordinate (`>= p`).
+    PointNotCanonical,
+    /// `P1 = ±P2`: the `P1 + P2` precompute is a double or infinity (the
+    /// addend table would be degenerate).
+    SumDegenerate,
+    /// `Q = u1·P1 + u2·P2` is the point at infinity, or an intermediate
+    /// accumulator collided with its addend (blinding makes the latter a
+    /// discrete-log event; either way there is no affine witness).
+    ResultInfinity,
+}
+
+/// Curve-membership sub-witness proving `y² ≡ x³ + b (mod p)` for a point
+/// `(x, y)` — the same two byte-limb convolutions ECSM proves for its
+/// generator, reused here for the variable point `P2`.
+#[derive(Debug, Clone)]
+pub struct MembershipWitness {
+    /// `x2 = x² mod p`
+    pub x2: [u8; 32],
+    /// quotient for the `x2` relation
+    pub q0: [u8; 32],
+    /// carries for the `x2` relation
+    pub c0: [i64; 64],
+    /// quotient for the `y²` relation (33 bytes)
+    pub q1: [u8; 33],
+    /// carries for the `y²` relation
+    pub c1: [i64; 64],
+}
+
+/// The role of one joint-chain row, and which addend (if any) it consumes.
+/// Distinguishes the rows the chip treats differently even though all share the
+/// double/add convolution core.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JointSel {
+    /// A doubling (`op = 0`); no addend (the addend columns are zero and cancel
+    /// out of all three relations).
+    Double,
+    /// An add of `P1` (joint digit `10`).
+    AddP1,
+    /// An add of `P2` (joint digit `01`).
+    AddP2,
+    /// An add of `P12 = P1 + P2` (joint digit `11`).
+    AddP12,
+    /// The `P1 + P2` precompute row (produces `P12`).
+    Precompute,
+    /// The final blinding correction: add `−2^len·T₀` to strip the blind.
+    Correction,
+}
+
+/// One row of the joint chain: the double/add step witness (identical shape to
+/// [`EcdasStep`], reusing its λ/quotient/carry math) plus the joint-chain
+/// bookkeeping the chip needs (which addend, the two scalar digit bits, and
+/// whether an add follows).
+#[derive(Debug, Clone)]
+pub struct JointStep {
+    pub step: EcdasStep,
+    pub sel: JointSel,
+    /// `u1`'s bit at this row's round (0 on the precompute/correction rows,
+    /// which belong to no round). Set on **both** the double and the add of a
+    /// round: the double needs it to derive [`nb`](Self::nb) and to drive its
+    /// per-stream `Bit` sends, the add needs it to select the addend.
+    pub d1: u8,
+    /// `u2`'s bit at this row's round. Same rows as [`d1`](Self::d1).
+    pub d2: u8,
+    /// "An add follows me at this same round" — `nb = d1 ∨ d2 = d1 + d2 − d1·d2`
+    /// on a double row, and `0` on every add / precompute / correction row.
+    ///
+    /// # Why this exists
+    ///
+    /// The joint schedule emits a doubling and its optional add at the **same**
+    /// round, decrementing only at the loop boundary, so the successor round is
+    /// `round − 1 + nb`. Without `nb` that successor is not a function of the
+    /// row's own columns, and a prover could stall `round` — inserting or
+    /// dropping doublings while every per-row relation still holds. It is the
+    /// joint-chain analogue of `EcdasStep::next_op` in the single-scalar chain
+    /// (`prover/src/tables/ecdas.rs` sends `round - 1 + next_op` on its
+    /// outgoing accumulator tuple), and is mirrored into
+    /// [`EcdasStep::next_op`] so a chip can reuse that column and expression
+    /// unchanged.
+    ///
+    /// The chain still drains at the sentinel round `−1`: the last row of a
+    /// round-0 iteration always has `nb = 0` (an add is never followed by an
+    /// add), so `0 − 1 + 0 = −1` either way.
+    pub nb: u8,
+}
+
+/// Full lincomb2-chip witness for one `Q = u1·P1 + u2·P2` evaluation.
+///
+/// This struct IS the layout lock: every field is a column block the ECSM′/joint
+/// chip must carry. LE byte order throughout, matching the ECSM ABI.
+#[derive(Debug, Clone)]
+pub struct Lincomb2Witness {
+    pub x_p1: [u8; 32],
+    pub y_p1: [u8; 32],
+    pub x_p2: [u8; 32],
+    pub y_p2: [u8; 32],
+    /// `P2` curve-membership witness (`P1` is the fixed generator for ecrecover,
+    /// on-curve by definition — the chip may hardcode it).
+    pub mem_p2: MembershipWitness,
+    /// `yP2 < p` canonicalization (NEW load-bearing: `yP2 + p` would flip the
+    /// effective parity of `P2` as bytes and hence the sign of `Q`).
+    pub y_p2_sub_p: [u8; 32],
+    pub x_p12: [u8; 32],
+    pub y_p12: [u8; 32],
+    pub u1: [u8; 32],
+    pub u2: [u8; 32],
+    /// `u1 < N` / `u2 < N` overflow witnesses (`2^256 + u − N`).
+    pub u1_sub_n: [u8; 32],
+    pub u2_sub_n: [u8; 32],
+    /// Number of doublings = `max(msb(u1), msb(u2)) + 1`; also the exponent of
+    /// the blind `2^len·T₀` the correction row strips.
+    pub len: u16,
+    pub x_q: [u8; 32],
+    pub y_q: [u8; 32],
+    /// `xQ < p` / `yQ < p` canonicalization (NEW load-bearing: a `+p`-shifted
+    /// output coordinate hashes to a different address in the guest's keccak).
+    pub x_q_sub_p: [u8; 32],
+    pub y_q_sub_p: [u8; 32],
+    /// `T₀` and `2^len·T₀`, the blinding constants (from the preprocessed
+    /// T₀ table, indexed by `len`); recorded so the chip can bind them.
+    pub x_t0: [u8; 32],
+    pub y_t0: [u8; 32],
+    pub x_t0_pow: [u8; 32],
+    pub y_t0_pow: [u8; 32],
+    /// The chain rows: `[Precompute, <len doublings interleaved with adds>, Correction]`.
+    pub steps: Vec<JointStep>,
+}
+
+// ---- minimal affine group law over BigInt mod p (witness-side, not perf-critical) ----
+
+/// `v mod p`, always in `[0, p)`.
+fn red(v: &BigInt, p_big: &BigInt) -> BigInt {
+    let m = v % p_big;
+    if m.is_negative() { m + p_big } else { m }
+}
+
+/// Modular inverse via Fermat (`p` prime).
+fn finv_i(a: &BigInt, p_big: &BigInt) -> BigInt {
+    red(a, p_big).modpow(&(p_big - BigInt::from(2)), p_big)
+}
+
+/// Point double, returning `(2·P, λ)` with `λ = 3x²/(2y)`.
+fn ec_double(a: &(BigInt, BigInt), p_big: &BigInt) -> (BigInt, BigInt, BigInt) {
+    let (x, y) = a;
+    let two = BigInt::from(2u32);
+    let three = BigInt::from(3u32);
+    let lam = red(&(&three * x * x * finv_i(&(&two * y), p_big)), p_big);
+    let x3 = red(&(&lam * &lam - &two * x), p_big);
+    let y3 = red(&(&lam * (x - &x3) - y), p_big);
+    (x3, y3, lam)
+}
+
+/// Point add of distinct-x points, returning `(P + G, λ)` with `λ = (yG−y)/(xG−x)`.
+fn ec_add(a: &(BigInt, BigInt), g: &(BigInt, BigInt), p_big: &BigInt) -> (BigInt, BigInt, BigInt) {
+    let (xa, ya) = a;
+    let (xg, yg) = g;
+    let lam = red(&((yg - ya) * finv_i(&(xg - xa), p_big)), p_big);
+    let x3 = red(&(&lam * &lam - xa - xg), p_big);
+    let y3 = red(&(&lam * (xa - &x3) - ya), p_big);
+    (x3, y3, lam)
+}
+
+fn to_pt(a: &AffinePoint) -> (BigInt, BigInt) {
+    (BigInt::from(a.x.clone()), BigInt::from(a.y.clone()))
+}
+
+fn to_affine(p: &(BigInt, BigInt)) -> AffinePoint {
+    AffinePoint {
+        x: p.0.to_biguint().expect("reduced"),
+        y: p.1.to_biguint().expect("reduced"),
+    }
+}
+
+/// `2^256 + v − modulus` as 32 LE bytes — the strict-inequality (`v < modulus`)
+/// overflow witness, mirroring `x_g_sub_p` in `compute_witness`. Requires
+/// `v < modulus` so the result is `< 2^256`.
+fn sub_witness(v: &BigUint, modulus: &BigUint) -> [u8; 32] {
+    let two_256 = BigUint::from(1u8) << 256u32;
+    to_le_32(&((&two_256 + v) - modulus))
+}
+
+/// Curve-membership sub-witness for `(x, y)`: reuses the exact `x2` and `yG`
+/// convolutions of `compute_witness`.
+fn membership_witness(x: &BigUint, y: &BigUint, pp: &[i128; 64]) -> MembershipWitness {
+    let p_big = BigInt::from(p());
+    let x_b = to_le_32(x);
+    let y_b = to_le_32(y);
+
+    let x_sq = x * x;
+    let x2_big = &x_sq % p();
+    let q0_big = (&x_sq - &x2_big) / p(); // exact
+    let x2_b = to_le_32(&x2_big);
+    let q0_b = to_le_32(&q0_big);
+    let c0 = carries_x2(&ext64(&x_b), &ext64(&x2_b), &ext64(&q0_b), pp);
+
+    let num_y = BigInt::from(y * y) - BigInt::from(x * &x2_big) - BigInt::from(B);
+    let q1_big = shifted_quotient("membership-y", &num_y, &p_big, &p_big);
+    let q1_b = to_le_33("membership-y", &q1_big);
+    let b_ext = ext64(&{
+        let mut a = [0u8; 32];
+        a[0] = B as u8;
+        a
+    });
+    let c1 = carries_yg(
+        &ext64(&y_b),
+        pp,
+        &ext64(&x2_b),
+        &ext64(&x_b),
+        &ext64(&q1_b),
+        &b_ext,
+    );
+
+    MembershipWitness {
+        x2: x2_b,
+        q0: q0_b,
+        c0,
+        q1: q1_b,
+        c1,
+    }
+}
+
+/// Validates a point is on-curve and canonical (both coordinates `< p`).
+fn check_point(pt: &AffinePoint) -> Result<(), Lincomb2Error> {
+    if pt.x >= p() || pt.y >= p() {
+        return Err(Lincomb2Error::PointNotCanonical);
+    }
+    let lhs = (&pt.y * &pt.y) % p();
+    let rhs = (&pt.x * &pt.x % p() * &pt.x + B) % p();
+    if lhs != rhs {
+        return Err(Lincomb2Error::PointNotOnCurve);
+    }
+    Ok(())
+}
+
+/// Builds one joint-chain row from a raw (a, addend, op, result, λ) tuple by
+/// delegating to the shared `build_step`. `round`/`nb` are bookkeeping the
+/// convolution relations do not consume (`build_step` copies `next_op` straight
+/// through and never reads it); on a `Double` row the addend is `(0,0)` and
+/// cancels out of all three relations.
+///
+/// `nb` lands in both [`JointStep::nb`] — the named joint-schedule field — and
+/// [`EcdasStep::next_op`], whose documented meaning ("1 ⇒ next row adds at this
+/// round") is exactly the same predicate. Keeping them in sync lets a chip use
+/// either slot; `tests::lincomb2_tests::check_nb_schedule` asserts on every
+/// emitted row that they never diverge.
+#[allow(clippy::too_many_arguments)]
+fn joint_row(
+    a: &AffinePoint,
+    addend: &AffinePoint,
+    op: u8,
+    round: u8,
+    nb: u8,
+    r: &AffinePoint,
+    lambda: BigUint,
+    sel: JointSel,
+    d1: u8,
+    d2: u8,
+    p_big: &BigInt,
+    r_big: &BigInt,
+    r_ext: &[i128; 64],
+    pp: &[i128; 64],
+) -> JointStep {
+    let s = StepPts {
+        a: a.clone(),
+        g: addend.clone(),
+        round,
+        op,
+        next_op: nb,
+        r: r.clone(),
+        lambda,
+    };
+    JointStep {
+        step: build_step(&s, p_big, r_big, r_ext, pp),
+        sel,
+        d1,
+        d2,
+        nb,
+    }
+}
+
+/// Computes the full lincomb2 witness for `Q = u1·P1 + u2·P2` over secp256k1.
+/// `u1_le`, `u2_le` are little-endian 32-byte scalars in `[1, N)`; `p1`, `p2`
+/// are canonical on-curve affine points. For ecrecover `P1 = G`, `P2 = R`.
+pub fn lincomb2_witness(
+    u1_le: &[u8; 32],
+    u2_le: &[u8; 32],
+    p1: &AffinePoint,
+    p2: &AffinePoint,
+) -> Result<Lincomb2Witness, Lincomb2Error> {
+    let u1 = BigUint::from_bytes_le(u1_le);
+    let u2 = BigUint::from_bytes_le(u2_le);
+    for u in [&u1, &u2] {
+        if u.is_zero() {
+            return Err(Lincomb2Error::ScalarIsZero);
+        }
+        if *u >= n() {
+            return Err(Lincomb2Error::ScalarOutOfRange);
+        }
+    }
+    check_point(p1)?;
+    check_point(p2)?;
+
+    let p_big = BigInt::from(p());
+    let r_big = BigInt::from(BigUint::from_bytes_le(&R_BYTES)); // r = 3p
+    let pp = ext64(&P_BYTES);
+    let r_ext = ext64(&R_BYTES);
+    let zero_pt = AffinePoint {
+        x: BigUint::zero(),
+        y: BigUint::zero(),
+    };
+
+    // --- P12 = P1 + P2 (must be a genuine chord: P1 ≠ ±P2) ---
+    if p1.x == p2.x {
+        return Err(Lincomb2Error::SumDegenerate);
+    }
+    let p1_i = to_pt(p1);
+    let p2_i = to_pt(p2);
+    let (x12, y12, lam12) = ec_add(&p1_i, &p2_i, &p_big);
+    let p12 = to_affine(&(x12.clone(), y12.clone()));
+
+    // --- schedule length and the blind exponent ---
+    let len = core::cmp::max(u1.bits(), u2.bits()) as usize; // = max_msb + 1
+    let t0_pt = t0();
+    let t0_i = to_pt(&t0_pt);
+
+    // --- NUMS-blinded joint Shamir/Straus replay ---
+    let mut steps: Vec<JointStep> = Vec::with_capacity(len + 194);
+
+    // Row 0: the P12 precompute (a chord add of P1 + P2).
+    steps.push(joint_row(
+        p1,
+        p2,
+        1,
+        0,
+        0,
+        &p12,
+        lam12.to_biguint().expect("reduced"),
+        JointSel::Precompute,
+        0,
+        0,
+        &p_big,
+        &r_big,
+        &r_ext,
+        &pp,
+    ));
+
+    let mut acc = t0_i.clone();
+    for round in (0..len).rev() {
+        // This round's joint digit, read before the doubling is emitted: the
+        // double row carries it too, because `nb` (whether the add below
+        // follows) is what pins its successor round. See `JointStep::nb`.
+        let d1 = u1.bit(round as u64) as u8;
+        let d2 = u2.bit(round as u64) as u8;
+        // `d1 ∨ d2`; for 0/1 bytes this is exactly `d1 + d2 − d1·d2`, the
+        // degree-2 form the chip constrains.
+        let nb = d1 | d2;
+
+        // double
+        let a_dbl = acc.clone();
+        let (dx, dy, dlam) = ec_double(&a_dbl, &p_big);
+        acc = (dx.clone(), dy.clone());
+        steps.push(joint_row(
+            &to_affine(&a_dbl),
+            &zero_pt,
+            0,
+            round as u8,
+            nb,
+            &to_affine(&acc),
+            dlam.to_biguint().expect("reduced"),
+            JointSel::Double,
+            d1,
+            d2,
+            &p_big,
+            &r_big,
+            &r_ext,
+            &pp,
+        ));
+
+        // conditional add of the selected addend; `nb = 0` on the add row, so
+        // its successor round is `round − 1` (an add is never followed by an add).
+        let (addend_i, addend_pt, sel) = match (d1, d2) {
+            (0, 0) => continue,
+            (1, 0) => (p1_i.clone(), p1.clone(), JointSel::AddP1),
+            (0, 1) => (p2_i.clone(), p2.clone(), JointSel::AddP2),
+            _ => ((x12.clone(), y12.clone()), p12.clone(), JointSel::AddP12),
+        };
+        // acc = ±addend would be a discrete-log collision (blinding); no witness.
+        if acc.0 == addend_i.0 {
+            return Err(Lincomb2Error::ResultInfinity);
+        }
+        let a_add = acc.clone();
+        let (ax, ay, alam) = ec_add(&a_add, &addend_i, &p_big);
+        acc = (ax, ay);
+        steps.push(joint_row(
+            &to_affine(&a_add),
+            &addend_pt,
+            1,
+            round as u8,
+            0,
+            &to_affine(&acc),
+            alam.to_biguint().expect("reduced"),
+            sel,
+            d1,
+            d2,
+            &p_big,
+            &r_big,
+            &r_ext,
+            &pp,
+        ));
+    }
+
+    // --- blind = 2^len·T₀ ---
+    let mut tpow = t0_i.clone();
+    for _ in 0..len {
+        let (x, y, _) = ec_double(&tpow, &p_big);
+        tpow = (x, y);
+    }
+    // acc == Q + 2^len·T₀; correction row adds −2^len·T₀ to recover Q.
+    let neg_tpow = (tpow.0.clone(), red(&(-&tpow.1), &p_big));
+    if acc.0 == neg_tpow.0 {
+        // acc = ±(−tpow): Q = ∞ (or Q = −2^{len+1}T₀, a dlog event) — degenerate.
+        return Err(Lincomb2Error::ResultInfinity);
+    }
+    let a_corr = acc.clone();
+    let (qx, qy, clam) = ec_add(&a_corr, &neg_tpow, &p_big);
+    let q = (qx.clone(), qy.clone());
+    steps.push(joint_row(
+        &to_affine(&a_corr),
+        &to_affine(&neg_tpow),
+        1,
+        0,
+        0,
+        &to_affine(&q),
+        clam.to_biguint().expect("reduced"),
+        JointSel::Correction,
+        0,
+        0,
+        &p_big,
+        &r_big,
+        &r_ext,
+        &pp,
+    ));
+
+    let q_aff = to_affine(&q);
+    let tpow_aff = to_affine(&tpow);
+
+    Ok(Lincomb2Witness {
+        x_p1: to_le_32(&p1.x),
+        y_p1: to_le_32(&p1.y),
+        x_p2: to_le_32(&p2.x),
+        y_p2: to_le_32(&p2.y),
+        mem_p2: membership_witness(&p2.x, &p2.y, &pp),
+        y_p2_sub_p: sub_witness(&p2.y, &p()),
+        x_p12: to_le_32(&p12.x),
+        y_p12: to_le_32(&p12.y),
+        u1: *u1_le,
+        u2: *u2_le,
+        u1_sub_n: sub_witness(&u1, &n()),
+        u2_sub_n: sub_witness(&u2, &n()),
+        len: len as u16,
+        x_q: to_le_32(&q_aff.x),
+        y_q: to_le_32(&q_aff.y),
+        x_q_sub_p: sub_witness(&q_aff.x, &p()),
+        y_q_sub_p: sub_witness(&q_aff.y, &p()),
+        x_t0: T0_X_LE,
+        y_t0: T0_Y_LE,
+        x_t0_pow: to_le_32(&tpow_aff.x),
+        y_t0_pow: to_le_32(&tpow_aff.y),
+        steps,
+    })
+}
+
+// =========================================================================
+// Non-degeneracy witness for the joint chain
+// =========================================================================
+//
+// `D_INV·(xB − xA) ≡ 1 (mod p)` is the ECDAS2 relation that makes an addition
+// provably a genuine chord. It is not part of the data `lincomb2_witness`
+// returns — the schedule above never needs the inverse, because it *refuses*
+// every input whose chain would add a point to itself (`ResultInfinity`). The
+// chip needs it anyway, since a malicious prover's row never passes through this
+// generator.
+//
+// It lives here rather than in the prover so that all of this limb arithmetic
+// has exactly one home. A second copy of `ext64`/`conv`/`limb_carries` in a chip
+// would be the classic silent divergence: one side gets edited, the other does
+// not, and nothing notices until a proof is wrong.
+
+/// The `D_INV·(xB − xA) ≡ 1 (mod p)` columns of one joint-chain row.
+#[derive(Debug, Clone)]
+pub struct DinvWitness {
+    /// `(xB − xA)^{-1} mod p`, little-endian.
+    pub d_inv: [u8; 32],
+    /// Shifted quotient of the relation, `r + numerator/p` with `r = 3p`.
+    pub q3: [u8; 33],
+    /// The 64 limb carries.
+    pub c3: [i64; 64],
+}
+
+impl DinvWitness {
+    /// The shape a row that consumes no addend carries.
+    ///
+    /// The chip gates the relation by `S1 + S2 + S3 + S_CORR`, so on a doubling
+    /// only the `μ·R·P − q3·P` term survives — and it closes at zero carries
+    /// exactly when `q3 = r = 3p`. (An all-zero padding row closes the same term
+    /// at `q3 = 0`, because `μ = 0` kills `R·P` too.)
+    pub fn gated_off() -> Self {
+        Self {
+            d_inv: [0; 32],
+            q3: R_BYTES,
+            c3: [0; 64],
+        }
+    }
+}
+
+/// Builds the non-degeneracy columns for one joint-chain row.
+///
+/// Returns [`DinvWitness::gated_off`] for a doubling (no addend to check) and
+/// also for a *degenerate* add, where `xB ≡ xA (mod p)` and no inverse exists:
+/// no assignment satisfies the relation there, so the right behaviour is to let
+/// the proof fail rather than to panic on prover-supplied data. The honest
+/// schedule never produces such a row.
+///
+/// Both `xB` and `xA` are reduced mod `p` before the difference is taken, so a
+/// non-canonical *encoding* of an equal field element is treated as the
+/// degeneracy it is.
+pub fn dinv_witness(step: &JointStep) -> DinvWitness {
+    if step.sel == JointSel::Double {
+        return DinvWitness::gated_off();
+    }
+
+    let s = &step.step;
+    let p_big = p();
+    let xa = BigUint::from_bytes_le(&s.x_a);
+    let xb = BigUint::from_bytes_le(&s.x_g);
+    let delta = ((&xb % &p_big) + &p_big - (&xa % &p_big)) % &p_big;
+    if delta.is_zero() {
+        return DinvWitness::gated_off();
+    }
+    let d_inv = delta.modpow(&(&p_big - 2u32), &p_big);
+
+    // numerator = d_inv·(xB − xA) − 1, over the RAW limb values: the identity the
+    // chip proves is limb-wise, and raw ≡ canonical (mod p) makes it the same
+    // statement either way.
+    let p_int = BigInt::from(p_big);
+    let numerator =
+        BigInt::from(d_inv.clone()) * (BigInt::from(xb) - BigInt::from(xa)) - BigInt::from(1u32);
+    let r_int = BigInt::from(BigUint::from_bytes_le(&R_BYTES));
+    let q3 = shifted_quotient("d_inv", &numerator, &p_int, &r_int);
+    let q3 = to_le_33("d_inv", &q3);
+
+    let d_inv = to_le_32(&d_inv);
+    let (d_e, xb_e, xa_e) = (ext64(&d_inv), ext64(&s.x_g), ext64(&s.x_a));
+    let (q3_e, r_e, p_e) = (ext64(&q3), ext64(&R_BYTES), ext64(&P_BYTES));
+    let mut terms = [0i128; 64];
+    for (i, slot) in terms.iter_mut().enumerate() {
+        let mut t = 0i128;
+        for j in 0..=i {
+            t += d_e[j] * (xb_e[i - j] - xa_e[i - j]);
+        }
+        if i == 0 {
+            t -= 1;
+        }
+        *slot = t + conv(&r_e, &p_e, i) - conv(&q3_e, &p_e, i);
+    }
+
+    DinvWitness {
+        d_inv,
+        q3,
+        c3: limb_carries("d_inv", &terms),
     }
 }

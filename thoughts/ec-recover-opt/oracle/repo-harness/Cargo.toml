@@ -1,0 +1,14 @@
+# Standalone: keep out of the lambda_vm workspace (this copy lives in thoughts/).
+[workspace]
+
+[package]
+name = "ecsm-oracle-harness"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ecsm = { path = "/Users/maurofab/workspace/lambda_vm/crypto/ecsm" }
+num-bigint = "0.4.6"
+
+[profile.release]
+debug = false
