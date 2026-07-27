@@ -4,30 +4,19 @@ const MAX_MEMORY_SIZE: usize = 0xC000_0000;
 const WORD_SIZE: usize = 4;
 
 // Guest global allocator, selectable at build time:
-//   - default: embedded-alloc TLSF — reclaims freed memory (safe for arbitrary churn).
-//   - `dlmalloc` feature (BENCH): Doug Lea's malloc, backed by a bump "system"
-//     provider that hands dlmalloc page-aligned chunks from the guest heap. dlmalloc
-//     does all sub-allocation churn itself, so — unlike a raw bump allocator — it
-//     reuses freed memory (no OOM) while measuring cheaper than TLSF on zkVM guests
-//     (Bencik's ZisK allocator comparison).
+//   - default: Doug Lea's malloc (dlmalloc), backed by a bump "system" provider that
+//     hands dlmalloc page-aligned chunks from the guest heap. dlmalloc does all
+//     sub-allocation churn itself, so — unlike a raw bump allocator — it reuses freed
+//     memory (no OOM) while executing fewer guest instructions per alloc/free than TLSF
+//     (Bencik's ZisK allocator comparison; measured cheaper on our ethrex proving too).
+//   - `tlsf-alloc` feature: embedded-alloc's TLSF heap — the previous default, kept one
+//     flag away for A/B comparison or fallback.
 //
 // Only the guest installs a #[global_allocator]; on host (e.g. `cargo test` for the
 // sponge's differential tests) the attribute would hijack the test harness's
 // allocator with a never-initialized heap and abort.
 
-#[cfg(not(feature = "dlmalloc"))]
-mod imp {
-    use embedded_alloc::TlsfHeap as Heap;
-
-    #[cfg_attr(target_arch = "riscv64", global_allocator)]
-    static HEAP: Heap = Heap::empty();
-
-    pub fn init(heap_start: usize, heap_end: usize) {
-        unsafe { HEAP.init(heap_start, heap_end - heap_start) }
-    }
-}
-
-#[cfg(feature = "dlmalloc")]
+#[cfg(not(feature = "tlsf-alloc"))]
 mod imp {
     use core::alloc::{GlobalAlloc, Layout};
     use core::cell::RefCell;
@@ -152,6 +141,18 @@ mod imp {
     }
 }
 
+#[cfg(feature = "tlsf-alloc")]
+mod imp {
+    use embedded_alloc::TlsfHeap as Heap;
+
+    #[cfg_attr(target_arch = "riscv64", global_allocator)]
+    static HEAP: Heap = Heap::empty();
+
+    pub fn init(heap_start: usize, heap_end: usize) {
+        unsafe { HEAP.init(heap_start, heap_end - heap_start) }
+    }
+}
+
 pub fn init_allocator() {
     unsafe extern "C" {
         static _end: u8;
@@ -166,7 +167,7 @@ pub fn init_allocator() {
 /// It is only for rust std internal uses
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sys_alloc_aligned(bytes: usize, align: usize) -> *mut u8 {
-    // Route through whichever `#[global_allocator]` is installed (TLSF or dlmalloc).
+    // Route through whichever `#[global_allocator]` is installed (dlmalloc or TLSF).
     unsafe { std::alloc::alloc(core::alloc::Layout::from_size_align(bytes, align).unwrap()) }
 }
 
