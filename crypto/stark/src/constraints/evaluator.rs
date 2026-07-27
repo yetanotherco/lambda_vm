@@ -397,14 +397,12 @@ where
         Field: 'static,
         FieldExtension: 'static,
     {
-        let boundary_zerofiers_inverse_evaluations: Vec<
-            std::sync::Arc<Vec<FieldElement<Field>>>,
-        > = self
-            .boundary_constraints
-            .constraints
-            .iter()
-            .map(|bc| domain.boundary_zerofier_inv(bc.step))
-            .collect();
+        let boundary_zerofiers_inverse_evaluations: Vec<std::sync::Arc<Vec<FieldElement<Field>>>> =
+            self.boundary_constraints
+                .constraints
+                .iter()
+                .map(|bc| domain.boundary_zerofier_inv(bc.step))
+                .collect();
         let zerofier_data = air.transition_zerofier_evaluations_grouped(domain);
         match self.try_evaluate_composition_gpu(
             air,

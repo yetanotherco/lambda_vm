@@ -126,10 +126,7 @@ impl<F: IsFFTField> Domain<F> {
         FieldElement::inplace_batch_inverse_sequential(&mut evals)
             .expect("LDE coset points never coincide with a trace root");
         let v = Arc::new(evals);
-        self.boundary_z_inv
-            .lock()
-            .unwrap()
-            .insert(step, v.clone());
+        self.boundary_z_inv.lock().unwrap().insert(step, v.clone());
         v
     }
 

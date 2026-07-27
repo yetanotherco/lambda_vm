@@ -355,8 +355,7 @@ where
     let b_beta = unsafe { ext3_slice_to_u64(inputs.b_beta) };
     // SAFETY: `F` is Goldilocks (established in `lower_and_pack`);
     // `Vec<FieldElement<F>>` and the concrete Vec share their layout.
-    let b_z_inv_conc: &[GoldilocksBZInv] =
-        unsafe { &*(inputs.b_z_inv as *const _ as *const _) };
+    let b_z_inv_conc: &[GoldilocksBZInv] = unsafe { &*(inputs.b_z_inv as *const _ as *const _) };
     let b_z_inv_handles = bzinv_device_handles(b_z_inv_conc)?;
     let b_z_inv: Vec<&math_cuda::constraint_interp::GpuBaseVec> =
         b_z_inv_handles.iter().map(|h| h.as_ref()).collect();

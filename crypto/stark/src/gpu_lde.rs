@@ -620,7 +620,9 @@ where
     // SAFETY: F == Goldilocks (repr u64); ext3 outputs are [u64; 3] per element.
     let weights_u64: &[u64] =
         unsafe { from_raw_parts(weights.as_ptr() as *const u64, weights.len()) };
-    let ext3_len = lde_size.checked_mul(3).expect("ext3 output length overflow");
+    let ext3_len = lde_size
+        .checked_mul(3)
+        .expect("ext3 output length overflow");
     let out0 = unsafe { from_raw_parts_mut(lde_h0.as_mut_ptr() as *mut u64, ext3_len) };
     let out1 = unsafe { from_raw_parts_mut(lde_h1.as_mut_ptr() as *mut u64, ext3_len) };
     let mut outputs: [&mut [u64]; 2] = [out0, out1];
