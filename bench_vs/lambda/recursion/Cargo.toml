@@ -65,9 +65,7 @@ lambda-vm-prover = { path = "../../../prover", default-features = false, feature
     "profile-markers",
 ] }
 lambda-vm-syscalls = { path = "../../../syscalls" }
-# pointer_width_64: proof-format pointer width — must match the host serializer
-# (see prover/Cargo.toml). Feature unification with the prover dep already
-# implies it; declared here so the in-VM zero-copy reads can't silently drift.
+# pointer_width_64: proof-format pointer width — see prover/Cargo.toml.
 rkyv = { version = "0.8.10", default-features = false, features = ["alloc", "bytecheck", "aligned", "pointer_width_64"] }
 
 [profile.release]
