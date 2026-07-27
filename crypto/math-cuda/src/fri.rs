@@ -138,7 +138,7 @@ impl FriCommitState {
         let tight_total_nodes = 2 * num_leaves - 1;
 
         // H2D zeta.
-        let zeta_dev = { self.stream.clone_htod(&zeta_raw)? };
+        let zeta_dev = self.stream.clone_htod(&zeta_raw)?;
 
         let cfg = LaunchConfig {
             grid_dim: ((n_out as u32).div_ceil(128), 1, 1),
@@ -198,9 +198,7 @@ impl FriCommitState {
                     .launch(kcfg)?;
             }
         }
-        {
-            build_inner_tree_levels(self.stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
-        }
+        build_inner_tree_levels(self.stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
 
         // Update inv_twiddles for the next layer: `new[j] = old[2j]^2` for
         // j in 0..n_out/2. (If n_out == 1, skip; no next fold.) Writes into
@@ -228,9 +226,7 @@ impl FriCommitState {
         }
 
         // Sync and D2H.
-        {
-            self.stream.synchronize()?;
-        }
+        self.stream.synchronize()?;
 
         // Layer evals: 3 * n_out u64 from the output buffer, staged through
         // the per-worker pinned slab (async DMA) instead of a blocking
@@ -256,10 +252,8 @@ impl FriCommitState {
         // This pageable copy drains the stream (including the evals DMA above),
         // so the pending wait after it is instant — one block covers both.
         let mut root = [0u8; 32];
-        {
-            self.stream
-                .memcpy_dtoh(&nodes_dev.slice(0..32), &mut root)?;
-        }
+        self.stream
+            .memcpy_dtoh(&nodes_dev.slice(0..32), &mut root)?;
         let mut layer_evals = vec![0u64; n_evals];
         pending.wait_into_u64(&mut layer_evals)?;
 

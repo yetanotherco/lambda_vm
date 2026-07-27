@@ -80,17 +80,15 @@ pub fn eval_constraints_on_device(
 
     // Upload the program + uniforms (the column data never crosses PCIe — it is
     // already resident in `main.buf` / `aux.buf`).
-    let (d_nodes, d_base_consts, d_ext_consts, d_roots, d_rap, d_alpha, d_offset) = {
-        (
-            stream.clone_htod(nodes)?,
-            stream.clone_htod(base_consts)?,
-            stream.clone_htod(ext_consts)?,
-            stream.clone_htod(roots)?,
-            stream.clone_htod(rap_challenges)?,
-            stream.clone_htod(alpha_powers)?,
-            stream.clone_htod(table_offset)?,
-        )
-    };
+    let (d_nodes, d_base_consts, d_ext_consts, d_roots, d_rap, d_alpha, d_offset) = (
+        stream.clone_htod(nodes)?,
+        stream.clone_htod(base_consts)?,
+        stream.clone_htod(ext_consts)?,
+        stream.clone_htod(roots)?,
+        stream.clone_htod(rap_challenges)?,
+        stream.clone_htod(alpha_powers)?,
+        stream.clone_htod(table_offset)?,
+    );
 
     // Fixed thread count, grid-stride over rows.
     let max_grid = MAX_THREADS / BLOCK_DIM;
@@ -255,40 +253,34 @@ fn eval_composition_launch(
     main.wait_ready_on(&stream)?;
     aux.wait_ready_on(&stream)?;
 
-    let (d_nodes, d_base_consts, d_ext_consts, d_roots, d_rap, d_alpha, d_offset) = {
-        (
-            stream.clone_htod(nodes)?,
-            stream.clone_htod(base_consts)?,
-            stream.clone_htod(ext_consts)?,
-            stream.clone_htod(roots)?,
-            stream.clone_htod(rap_challenges)?,
-            stream.clone_htod(alpha_powers)?,
-            stream.clone_htod(table_offset)?,
-        )
-    };
+    let (d_nodes, d_base_consts, d_ext_consts, d_roots, d_rap, d_alpha, d_offset) = (
+        stream.clone_htod(nodes)?,
+        stream.clone_htod(base_consts)?,
+        stream.clone_htod(ext_consts)?,
+        stream.clone_htod(roots)?,
+        stream.clone_htod(rap_challenges)?,
+        stream.clone_htod(alpha_powers)?,
+        stream.clone_htod(table_offset)?,
+    );
 
-    let (d_beta_trans, d_z_inv, d_b_col, d_b_is_aux, d_b_value, d_b_beta) = {
-        (
-            stream.clone_htod(accum.beta_trans)?,
-            stream.clone_htod(accum.z_inv)?,
-            stream.clone_htod(accum.b_col)?,
-            stream.clone_htod(accum.b_is_aux)?,
-            stream.clone_htod(accum.b_value)?,
-            stream.clone_htod(accum.b_beta)?,
-        )
-    };
+    let (d_beta_trans, d_z_inv, d_b_col, d_b_is_aux, d_b_value, d_b_beta) = (
+        stream.clone_htod(accum.beta_trans)?,
+        stream.clone_htod(accum.z_inv)?,
+        stream.clone_htod(accum.b_col)?,
+        stream.clone_htod(accum.b_is_aux)?,
+        stream.clone_htod(accum.b_value)?,
+        stream.clone_htod(accum.b_beta)?,
+    );
     // D2D from the resident per-constraint columns into the flat
     // `b * num_rows + row` device layout — no PCIe, no flattened host copy,
     // no zeroing (the copies cover every element the kernel reads).
     let mut d_b_z_inv = unsafe { stream.alloc::<u64>((num_boundary * num_rows).max(1)) }?;
-    {
-        for (b, src) in accum.b_z_inv.iter().enumerate() {
-            // Hard assert: a shorter column would leave the window's tail as
-            // uninitialized VRAM the kernel reads — a silently wrong H.
-            assert_eq!(src.len(), num_rows, "b_z_inv column length");
-            let mut dst = d_b_z_inv.slice_mut(b * num_rows..(b + 1) * num_rows);
-            stream.memcpy_dtod(&src.buf, &mut dst)?;
-        }
+    for (b, src) in accum.b_z_inv.iter().enumerate() {
+        // Hard assert: a shorter column would leave the window's tail as
+        // uninitialized VRAM the kernel reads — a silently wrong H.
+        assert_eq!(src.len(), num_rows, "b_z_inv column length");
+        let mut dst = d_b_z_inv.slice_mut(b * num_rows..(b + 1) * num_rows);
+        stream.memcpy_dtod(&src.buf, &mut dst)?;
     }
 
     let max_grid = MAX_THREADS / BLOCK_DIM;
@@ -487,7 +479,9 @@ pub fn decompose_d2_into_slabs(
     let stream = h.stream.clone();
     let mut out = stream.alloc_zeros::<u64>(6 * lde_size)?;
 
-    let grid = (n as u32).div_ceil(BLOCK_DIM).clamp(1, MAX_THREADS / BLOCK_DIM);
+    let grid = (n as u32)
+        .div_ceil(BLOCK_DIM)
+        .clamp(1, MAX_THREADS / BLOCK_DIM);
     let cfg = LaunchConfig {
         grid_dim: (grid, 1, 1),
         block_dim: (BLOCK_DIM, 1, 1),

@@ -1,6 +1,6 @@
 //! Minimal NVTX bindings so Nsight Systems timelines show named host-side
-//! ranges (prover phases, kernel-pipeline entry points) instead of a wall of
-//! anonymous CUDA API calls.
+//! ranges (mirrored instruments spans — prover phases and per-epoch marks)
+//! instead of a wall of anonymous CUDA API calls.
 //!
 //! Loading mirrors the crate's cudarc `dynamic-loading` philosophy: no
 //! build-time or link-time dependency on the CUDA toolkit layout. At first use

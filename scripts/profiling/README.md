@@ -146,8 +146,8 @@ that drives parallelization decisions:
 
 1. every `instruments` span (prover phases) becomes an NVTX range, so Nsight
    timelines carry the same names as the phase table;
-2. every `math-cuda` public entry point pushes a range with its shape, e.g.
-   `lde_tree_base[n=1048576 m=48 bf=4]`;
+2. the finer `gpu_span!`/dynamic ranges some call sites emit (e.g.
+   `epoch_prove[i=3]`) appear nested inside those phase ranges;
 3. `LAMBDA_VM_NSYS_CAPTURE_SPAN=<label>` brackets that span with
    cuProfilerStart/Stop, gating `nsys --capture-range=cudaProfilerApi` (used
    automatically by `run_profile.sh --nsys` when the env var is set).

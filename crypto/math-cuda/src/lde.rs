@@ -438,11 +438,9 @@ fn expand_row_major_on_stream(
     // carry data, the remainder are already zero (zero-padding for LDE). Host
     // input uploads (H2D); device input copies in place (D2D, no PCIe upload).
     let mut buf = stream.alloc_zeros::<u64>(lde_size * total_cols)?;
-    {
-        match input {
-            InnerInput::Host(h) => stream.memcpy_htod(h, &mut buf.slice_mut(0..n * total_cols))?,
-            InnerInput::Dev(d) => stream.memcpy_dtod(d, &mut buf.slice_mut(0..n * total_cols))?,
-        }
+    match input {
+        InnerInput::Host(h) => stream.memcpy_htod(h, &mut buf.slice_mut(0..n * total_cols))?,
+        InnerInput::Dev(d) => stream.memcpy_dtod(d, &mut buf.slice_mut(0..n * total_cols))?,
     }
 
     // Snapshot the trace-domain input (column-major) before the iNTT overwrites
@@ -748,9 +746,7 @@ pub fn coset_lde_row_major_split_trees(
         }
         crate::merkle::build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
         let mut nodes_host = vec![0u8; nodes_bytes];
-        {
-            stream.memcpy_dtoh(&nodes_dev, &mut nodes_host)?;
-        }
+        stream.memcpy_dtoh(&nodes_dev, &mut nodes_host)?;
         Ok(nodes_host)
     };
 
@@ -971,15 +967,13 @@ pub fn coset_lde_base(evals: &[u64], blowup_factor: usize, weights: &[u64]) -> R
     let lde_u64 = lde_size as u64;
 
     // === 1. iNTT on first N: bit_reverse + 8-level-fused DIT body ===
-    {
-        unsafe {
-            stream
-                .launch_builder(&be.bit_reverse_permute)
-                .arg(&mut buf)
-                .arg(&n_u64)
-                .arg(&log_n)
-                .launch(LaunchConfig::for_num_elems(n as u32))?;
-        }
+    unsafe {
+        stream
+            .launch_builder(&be.bit_reverse_permute)
+            .arg(&mut buf)
+            .arg(&n_u64)
+            .arg(&log_n)
+            .launch(LaunchConfig::for_num_elems(n as u32))?;
     }
     // Note: `run_ntt_body` expects a standalone CudaSlice; we pass `buf` and
     // the kernel walks the first `n_u64` elements via its own indexing.
@@ -988,34 +982,28 @@ pub fn coset_lde_base(evals: &[u64], blowup_factor: usize, weights: &[u64]) -> R
     // next pointwise multiply applies both the coset shift and the 1/N factor.
 
     // === 2. Pointwise multiply first N by coset weights (includes 1/N) ===
-    {
-        unsafe {
-            stream
-                .launch_builder(&be.pointwise_mul)
-                .arg(&mut buf)
-                .arg(&weights_dev)
-                .arg(&n_u64)
-                .launch(LaunchConfig::for_num_elems(n as u32))?;
-        }
+    unsafe {
+        stream
+            .launch_builder(&be.pointwise_mul)
+            .arg(&mut buf)
+            .arg(&weights_dev)
+            .arg(&n_u64)
+            .launch(LaunchConfig::for_num_elems(n as u32))?;
     }
 
     // === 3. Forward NTT on full buffer ===
-    {
-        unsafe {
-            stream
-                .launch_builder(&be.bit_reverse_permute)
-                .arg(&mut buf)
-                .arg(&lde_u64)
-                .arg(&log_lde)
-                .launch(LaunchConfig::for_num_elems(lde_size as u32))?;
-        }
+    unsafe {
+        stream
+            .launch_builder(&be.bit_reverse_permute)
+            .arg(&mut buf)
+            .arg(&lde_u64)
+            .arg(&log_lde)
+            .launch(LaunchConfig::for_num_elems(lde_size as u32))?;
     }
     run_ntt_body(stream.as_ref(), &mut buf, fwd_tw.as_ref(), lde_u64, log_lde)?;
 
-    let out = { stream.clone_dtoh(&buf)? };
-    {
-        stream.synchronize()?;
-    }
+    let out = stream.clone_dtoh(&buf)?;
+    stream.synchronize()?;
     Ok(out)
 }
 
@@ -1070,10 +1058,8 @@ pub fn coset_lde_batch_base(
     // Pack columns into the first m*n slots of the pinned buffer. Runs under
     // the pinned-staging lock, where rayon can deadlock. See
     // `Backend::pinned_staging`.
-    {
-        for (c, col) in columns.iter().enumerate() {
-            pinned[c * n..c * n + n].copy_from_slice(col);
-        }
+    for (c, col) in columns.iter().enumerate() {
+        pinned[c * n..c * n + n].copy_from_slice(col);
     }
 
     // Column layout: `buf[c * lde_size + r]`. Zeroed so the [n, lde_size)
@@ -1081,11 +1067,9 @@ pub fn coset_lde_batch_base(
     let mut buf = stream.alloc_zeros::<u64>(m * lde_size)?;
     // One memcpy per column from the pinned buffer into the strided slots.
     // The pinned source hits PCIe line-rate.
-    {
-        for c in 0..m {
-            let mut dst = buf.slice_mut(c * lde_size..c * lde_size + n);
-            stream.memcpy_htod(&pinned[c * n..c * n + n], &mut dst)?;
-        }
+    for c in 0..m {
+        let mut dst = buf.slice_mut(c * lde_size..c * lde_size + n);
+        stream.memcpy_htod(&pinned[c * n..c * n + n], &mut dst)?;
     }
     // The uploads above are truly asynchronous (pinned source), so the
     // staging slot must stay locked until they land; the slot's reusable event marks that
@@ -1171,29 +1155,27 @@ pub fn coset_lde_batch_base(
     // Split pinned into per-column Vec<u64>s. Runs under the pinned-staging
     // lock (held by `pending`), where rayon can deadlock. See
     // `Backend::pinned_staging`.
-    let out: Vec<Vec<u64>> = {
-        pending.wait_and_read(|bytes| {
-            // SAFETY: the pinned slab is u64-aligned by construction and the
-            // copy deposited exactly `m * lde_size` u64s.
-            let pinned =
-                unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const u64, m * lde_size) };
-            (0..m)
-                .map(|c| {
-                    // set_len skips the O(N) zero-init that vec![0; n] would
-                    // do. copy_from_slice below writes every slot before any
-                    // reader sees the Vec.
-                    #[allow(clippy::uninit_vec)]
-                    let mut v = {
-                        let mut v = Vec::<u64>::with_capacity(lde_size);
-                        unsafe { v.set_len(lde_size) };
-                        v
-                    };
-                    v.copy_from_slice(&pinned[c * lde_size..c * lde_size + lde_size]);
+    let out: Vec<Vec<u64>> = pending.wait_and_read(|bytes| {
+        // SAFETY: the pinned slab is u64-aligned by construction and the
+        // copy deposited exactly `m * lde_size` u64s.
+        let pinned =
+            unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const u64, m * lde_size) };
+        (0..m)
+            .map(|c| {
+                // set_len skips the O(N) zero-init that vec![0; n] would
+                // do. copy_from_slice below writes every slot before any
+                // reader sees the Vec.
+                #[allow(clippy::uninit_vec)]
+                let mut v = {
+                    let mut v = Vec::<u64>::with_capacity(lde_size);
+                    unsafe { v.set_len(lde_size) };
                     v
-                })
-                .collect()
-        })?
-    };
+                };
+                v.copy_from_slice(&pinned[c * lde_size..c * lde_size + lde_size]);
+                v
+            })
+            .collect()
+    })?;
     Ok(out)
 }
 
@@ -1244,18 +1226,14 @@ pub fn coset_lde_batch_base_into(
     staging.ensure_capacity(m * lde_size, &be.ctx)?;
     let pinned = unsafe { staging.as_mut_slice(m * lde_size) };
 
-    {
-        for (c, col) in columns.iter().enumerate() {
-            pinned[c * n..c * n + n].copy_from_slice(col);
-        }
+    for (c, col) in columns.iter().enumerate() {
+        pinned[c * n..c * n + n].copy_from_slice(col);
     }
 
     let mut buf = stream.alloc_zeros::<u64>(m * lde_size)?;
-    {
-        for c in 0..m {
-            let mut dst = buf.slice_mut(c * lde_size..c * lde_size + n);
-            stream.memcpy_htod(&pinned[c * n..c * n + n], &mut dst)?;
-        }
+    for c in 0..m {
+        let mut dst = buf.slice_mut(c * lde_size..c * lde_size + n);
+        stream.memcpy_htod(&pinned[c * n..c * n + n], &mut dst)?;
     }
     // The uploads above are truly asynchronous (pinned source); the staging
     // slot stays locked until this event fires (waited before the drain).
@@ -1330,17 +1308,15 @@ pub fn coset_lde_batch_base_into(
     // Copy pinned into caller outputs. Runs under the pinned-staging lock
     // (held by `pending`), where rayon can deadlock. See
     // `Backend::pinned_staging`.
-    {
-        pending.wait_and_read(|bytes| {
-            // SAFETY: the pinned slab is u64-aligned by construction and the
-            // copy deposited exactly `m * lde_size` u64s.
-            let pinned =
-                unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const u64, m * lde_size) };
-            for (c, dst) in outputs.iter_mut().enumerate() {
-                dst.copy_from_slice(&pinned[c * lde_size..c * lde_size + lde_size]);
-            }
-        })?;
-    }
+    pending.wait_and_read(|bytes| {
+        // SAFETY: the pinned slab is u64-aligned by construction and the
+        // copy deposited exactly `m * lde_size` u64s.
+        let pinned =
+            unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const u64, m * lde_size) };
+        for (c, dst) in outputs.iter_mut().enumerate() {
+            dst.copy_from_slice(&pinned[c * lde_size..c * lde_size + lde_size]);
+        }
+    })?;
     Ok(())
 }
 
@@ -1426,18 +1402,14 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
 
     // Pack columns into the pinned buffer. Runs under the pinned-staging
     // lock, where rayon can deadlock. See `Backend::pinned_staging`.
-    {
-        for (c, col) in columns.iter().enumerate() {
-            pinned[c * n..c * n + n].copy_from_slice(col);
-        }
+    for (c, col) in columns.iter().enumerate() {
+        pinned[c * n..c * n + n].copy_from_slice(col);
     }
 
     let mut buf = stream.alloc_zeros::<u64>(m * lde_size)?;
-    {
-        for c in 0..m {
-            let mut dst = buf.slice_mut(c * lde_size..c * lde_size + n);
-            stream.memcpy_htod(&pinned[c * n..c * n + n], &mut dst)?;
-        }
+    for c in 0..m {
+        let mut dst = buf.slice_mut(c * lde_size..c * lde_size + n);
+        stream.memcpy_htod(&pinned[c * n..c * n + n], &mut dst)?;
     }
     // The uploads above are truly asynchronous (pinned source); the staging
     // slot stays locked until this event fires (waited before the drain).
@@ -1552,17 +1524,15 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
     // Copy pinned into caller outputs. Runs under the pinned-staging lock
     // (held by `lde_pending`), where rayon can deadlock. See
     // `Backend::pinned_staging`.
-    {
-        lde_pending.wait_and_read(|bytes| {
-            // SAFETY: the pinned slab is u64-aligned by construction and the
-            // copy deposited exactly `m * lde_size` u64s.
-            let pinned =
-                unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const u64, m * lde_size) };
-            for (c, dst) in outputs.iter_mut().enumerate() {
-                dst.copy_from_slice(&pinned[c * lde_size..c * lde_size + lde_size]);
-            }
-        })?;
-    }
+    lde_pending.wait_and_read(|bytes| {
+        // SAFETY: the pinned slab is u64-aligned by construction and the
+        // copy deposited exactly `m * lde_size` u64s.
+        let pinned =
+            unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const u64, m * lde_size) };
+        for (c, dst) in outputs.iter_mut().enumerate() {
+            dst.copy_from_slice(&pinned[c * lde_size..c * lde_size + lde_size]);
+        }
+    })?;
 
     if keep_device_buf {
         Ok(Some(GpuLdeBase {
@@ -1680,11 +1650,9 @@ fn evaluate_poly_coset_batch_ext3_into_inner(
     pack_ext3_to_pinned_slabs(coefs, pinned, n);
 
     let mut buf = stream.alloc_zeros::<u64>(mb * lde_size)?;
-    {
-        for s in 0..mb {
-            let mut dst = buf.slice_mut(s * lde_size..s * lde_size + n);
-            stream.memcpy_htod(&pinned[s * n..s * n + n], &mut dst)?;
-        }
+    for s in 0..mb {
+        let mut dst = buf.slice_mut(s * lde_size..s * lde_size + n);
+        stream.memcpy_htod(&pinned[s * n..s * n + n], &mut dst)?;
     }
     // The uploads above are truly asynchronous (pinned source); the staging
     // slot stays locked until this event fires (waited before the drain).
@@ -1776,15 +1744,13 @@ fn evaluate_poly_coset_batch_ext3_into_inner(
         d2h_bytes_via_pinned_hashes(&stream, be, &nodes_dev, nodes_out)?;
     }
 
-    {
-        lde_pending.wait_and_read(|bytes| {
-            // SAFETY: the pinned slab is u64-aligned by construction and the
-            // copy deposited exactly `mb * lde_size` u64s.
-            let pinned =
-                unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const u64, mb * lde_size) };
-            unpack_pinned_slabs_to_ext3(pinned, outputs, lde_size);
-        })?;
-    }
+    lde_pending.wait_and_read(|bytes| {
+        // SAFETY: the pinned slab is u64-aligned by construction and the
+        // copy deposited exactly `mb * lde_size` u64s.
+        let pinned =
+            unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const u64, mb * lde_size) };
+        unpack_pinned_slabs_to_ext3(pinned, outputs, lde_size);
+    })?;
     if keep_device_buf {
         Ok(Some(GpuLdeExt3 {
             buf: std::sync::Arc::new(buf),
@@ -1897,11 +1863,9 @@ pub fn coset_lde_batch_ext3_into(
     // Allocate + zero-pad device buffer holding 3M slabs of `lde_size`.
     let mut buf = stream.alloc_zeros::<u64>(mb * lde_size)?;
     // H2D: slab by slab into the first N slots of each `lde_size`-slab.
-    {
-        for s in 0..mb {
-            let mut dst = buf.slice_mut(s * lde_size..s * lde_size + n);
-            stream.memcpy_htod(&pinned[s * n..s * n + n], &mut dst)?;
-        }
+    for s in 0..mb {
+        let mut dst = buf.slice_mut(s * lde_size..s * lde_size + n);
+        stream.memcpy_htod(&pinned[s * n..s * n + n], &mut dst)?;
     }
     // The uploads above are truly asynchronous (pinned source); the staging
     // slot stays locked until this event fires (waited before the drain).
@@ -1977,15 +1941,13 @@ pub fn coset_lde_batch_ext3_into(
     // Unpack: for each output column, re-interleave 3 slabs back into the
     // ext3-per-element layout. Runs under the pinned-staging lock (held by
     // `pending`), where rayon can deadlock. See `Backend::pinned_staging`.
-    {
-        pending.wait_and_read(|bytes| {
-            // SAFETY: the pinned slab is u64-aligned by construction and the
-            // copy deposited exactly `mb * lde_size` u64s.
-            let pinned =
-                unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const u64, mb * lde_size) };
-            unpack_pinned_slabs_to_ext3(pinned, outputs, lde_size);
-        })?;
-    }
+    pending.wait_and_read(|bytes| {
+        // SAFETY: the pinned slab is u64-aligned by construction and the
+        // copy deposited exactly `mb * lde_size` u64s.
+        let pinned =
+            unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const u64, mb * lde_size) };
+        unpack_pinned_slabs_to_ext3(pinned, outputs, lde_size);
+    })?;
     Ok(())
 }
 
@@ -2007,7 +1969,10 @@ pub fn coset_lde_batch_ext3_slabs_keep(
 ) -> Result<GpuLdeExt3> {
     assert!(m > 0 && n.is_power_of_two(), "slab LDE shape");
     assert_eq!(weights.len(), n, "weights length must match n");
-    assert!(blowup_factor.is_power_of_two(), "blowup must be power of two");
+    assert!(
+        blowup_factor.is_power_of_two(),
+        "blowup must be power of two"
+    );
     let lde_size = n * blowup_factor;
     let mb = 3 * m;
     assert_eq!(buf.len(), mb * lde_size, "slab buffer shape");
@@ -2029,7 +1994,15 @@ pub fn coset_lde_batch_ext3_slabs_keep(
     let col_stride_u64 = lde_size as u64;
     let mb_u32 = mb as u32;
 
-    launch_bit_reverse_batched(stream.as_ref(), be, &mut buf, n_u64, log_n, col_stride_u64, mb_u32)?;
+    launch_bit_reverse_batched(
+        stream.as_ref(),
+        be,
+        &mut buf,
+        n_u64,
+        log_n,
+        col_stride_u64,
+        mb_u32,
+    )?;
     run_batched_ntt_body(
         stream.as_ref(),
         &mut buf,

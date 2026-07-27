@@ -180,14 +180,12 @@ fn deep_fully_resident_launch(
     let be = backend()?;
 
     // H2D only the small scalars on the caller's stream.
-    let (h_ood_dev, trace_ood_dev, gammas_h_dev, gammas_tr_dev) = {
-        (
-            stream.clone_htod(h_ood)?,
-            stream.clone_htod(trace_ood)?,
-            stream.clone_htod(gammas_h)?,
-            stream.clone_htod(gammas_tr)?,
-        )
-    };
+    let (h_ood_dev, trace_ood_dev, gammas_h_dev, gammas_tr_dev) = (
+        stream.clone_htod(h_ood)?,
+        stream.clone_htod(trace_ood)?,
+        stream.clone_htod(gammas_h)?,
+        stream.clone_htod(gammas_tr)?,
+    );
 
     // Slice the inv_denoms buffer into the H-term and trace-term views.
     let inv_h_view = inv_denoms_dev.slice(0..ext3_size);
@@ -374,7 +372,6 @@ pub fn deep_composition_ext3_fully_resident_keep(
     })
 }
 
-
 #[allow(clippy::too_many_arguments)]
 fn deep_composition_ext3_impl(
     stream: &Arc<CudaStream>,
@@ -438,16 +435,14 @@ fn deep_composition_ext3_impl(
 
     let be = backend()?;
 
-    let (h_ood_dev, trace_ood_dev, gammas_h_dev, gammas_tr_dev, inv_h_dev, inv_t_dev) = {
-        (
-            stream.clone_htod(h_ood)?,
-            stream.clone_htod(trace_ood)?,
-            stream.clone_htod(gammas_h)?,
-            stream.clone_htod(gammas_tr)?,
-            stream.clone_htod(inv_h)?,
-            stream.clone_htod(inv_t)?,
-        )
-    };
+    let (h_ood_dev, trace_ood_dev, gammas_h_dev, gammas_tr_dev, inv_h_dev, inv_t_dev) = (
+        stream.clone_htod(h_ood)?,
+        stream.clone_htod(trace_ood)?,
+        stream.clone_htod(gammas_h)?,
+        stream.clone_htod(gammas_tr)?,
+        stream.clone_htod(inv_h)?,
+        stream.clone_htod(inv_t)?,
+    );
 
     let h_lde_host_dev;
     let dummy_aux;
@@ -509,20 +504,16 @@ fn deep_composition_ext3_impl(
 
     // DEEP output (domain_size * 3 u64s, ~50 MB): async D2H through the
     // per-worker pinned slab instead of a blocking pageable copy. The
-    // labelled sync keeps its host-block measurement (now covering the
-    // kernels plus the DMA); the pending wait after it is instant.
-    let pending = {
-        crate::device::async_dtoh_via(
-            stream,
-            be.pinned_staging(),
-            &be.ctx,
-            &deep_out,
-            domain_size * 3,
-        )?
-    };
-    {
-        stream.synchronize()?;
-    }
+    // synchronize drains the kernels and the DMA so the pending wait below
+    // is instant.
+    let pending = crate::device::async_dtoh_via(
+        stream,
+        be.pinned_staging(),
+        &be.ctx,
+        &deep_out,
+        domain_size * 3,
+    )?;
+    stream.synchronize()?;
     let mut out = vec![0u64; domain_size * 3];
     pending.wait_into_u64(&mut out)?;
     Ok(out)

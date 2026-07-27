@@ -68,9 +68,8 @@ pub fn batch_inverse_ext3(a: &[u64]) -> Result<Vec<u64>> {
     let input_dev = stream.clone_htod(a)?;
     let out_dev = batch_inverse_ext3_dev(&input_dev, n, &stream)?;
     // Result download (3 * n u64s): async D2H through the per-worker pinned
-    // slab instead of a blocking pageable copy. The labelled sync keeps its
-    // host-block measurement (now covering the kernels plus the DMA); the
-    // pending wait after it is instant.
+    // slab instead of a blocking pageable copy. The synchronize drains the
+    // kernels and the DMA so the pending wait below is instant.
     let pending =
         crate::device::async_dtoh_via(&stream, be.pinned_staging(), &be.ctx, &out_dev, 3 * n)?;
     stream.synchronize()?;
@@ -120,21 +119,15 @@ pub fn batch_inverse_ext3_dev(
     let mut prefix = unsafe { stream.alloc::<u64>(3 * n) }?;
     let mut suffix = unsafe { stream.alloc::<u64>(3 * n) }?;
 
-    {
-        scan_into_fwd(stream, be, input, &mut prefix, n)?;
-        scan_into_rev(stream, be, input, &mut suffix, n)?;
-    }
+    scan_into_fwd(stream, be, input, &mut prefix, n)?;
+    scan_into_rev(stream, be, input, &mut suffix, n)?;
 
     // total = prefix[n-1] = suffix[0]. Invert on host (one Fermat per batch).
-    let last_host: Vec<u64> = { stream.clone_dtoh(&prefix.slice((n - 1) * 3..n * 3))? };
-    {
-        stream.synchronize()?;
-    }
+    let last_host: Vec<u64> = stream.clone_dtoh(&prefix.slice((n - 1) * 3..n * 3))?;
+    stream.synchronize()?;
     let inv_total = invert_ext3_host([last_host[0], last_host[1], last_host[2]])?;
     let mut inv_total_dev = unsafe { stream.alloc::<u64>(3) }?;
-    {
-        stream.memcpy_htod(&inv_total, &mut inv_total_dev)?;
-    }
+    stream.memcpy_htod(&inv_total, &mut inv_total_dev)?;
 
     // Combine: out[i] = prefix[i-1] * inv_total * suffix[i+1].
     // SAFETY: the combine kernel writes every slot before any read.
@@ -204,7 +197,7 @@ pub fn compute_and_invert_denoms_ext3_dev(
         ));
     }
 
-    let z_dev = { stream.clone_htod(z_scalars_host)? };
+    let z_dev = stream.clone_htod(z_scalars_host)?;
     // SAFETY: the compute_denoms_ext3 kernel writes every output slot.
     let mut denoms = unsafe { stream.alloc::<u64>(3 * total) }?;
     let n_u64 = n as u64;

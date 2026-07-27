@@ -237,8 +237,8 @@ def main():
         return []
 
     def coarse_of(chain):
-        """Innermost *phase* range: instruments spans carry no '[shape]'
-        payload, math-cuda entry points do — so the deepest bracket-free
+        """Innermost *phase* range: dynamic ranges carry a '[shape]'
+        payload, instruments spans do not — so the deepest bracket-free
         name is the enclosing prover phase (r1_main_commit, rounds_2to4...)."""
         for name in reversed(chain):
             if "[" not in name:
@@ -315,7 +315,7 @@ def main():
     print()
 
     # --- fine entry-point table ----------------------------------------------
-    print("## math-cuda entry points (innermost NVTX range)")
+    print("## innermost NVTX ranges (finest span at each kernel launch)")
     print()
     print("| entry point | launches | kernel-sum ms | top kernel |")
     print("|---|---|---|---|")

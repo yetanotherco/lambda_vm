@@ -37,9 +37,9 @@ libloading = { version = "0.8", optional = true }
 # Test-only fault injection in FriCommitState. Production builds leave this
 # off so the fault check is fully elided at compile time.
 test-faults = []
-# NVTX ranges around every GPU pipeline entry point, for Nsight Systems
-# profiling. Zero-cost when disabled; when enabled but libnvToolsExt is
-# absent at runtime, every call is a cheap no-op.
+# NVTX bindings for Nsight Systems profiling (ranges are emitted by the
+# stark/prover layers). Zero-cost when disabled; when enabled but
+# libnvToolsExt is absent at runtime, every call is a cheap no-op.
 nvtx = ["dep:libloading"]
 
 [dev-dependencies]
