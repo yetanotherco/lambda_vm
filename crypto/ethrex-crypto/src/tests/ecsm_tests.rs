@@ -36,9 +36,9 @@ fn matches_software_lincomb_on_fixed_inputs() {
     for (p1, k1, p2, k2) in cases {
         let (k1, k2) = (Scalar::from(k1), Scalar::from(k2));
         let expected = ProjectivePoint::lincomb(&p1, &k1, &p2, &k2);
-        let got = lincomb2_with_oracle(&p1, &k1, &p2, &k2, soft_oracle)
+        let got = lincomb2_with_oracle(&p1.to_affine(), &k1, &p2.to_affine(), &k2, soft_oracle)
             .expect("non-degenerate inputs must reconstruct");
-        assert_eq!(got.to_affine(), expected.to_affine());
+        assert_eq!(got, expected.to_affine());
     }
 }
 
@@ -50,9 +50,9 @@ fn matches_software_lincomb_on_recovery_shape() {
     let u1 = Scalar::from(0xdead_beefu64);
     let u2 = Scalar::from(0x0bad_f00du64);
     let expected = ProjectivePoint::lincomb(&g, &u1, &r, &u2);
-    let got = lincomb2_with_oracle(&g, &u1, &r, &u2, soft_oracle)
+    let got = lincomb2_with_oracle(&g.to_affine(), &u1, &r.to_affine(), &u2, soft_oracle)
         .expect("non-degenerate inputs must reconstruct");
-    assert_eq!(got.to_affine(), expected.to_affine());
+    assert_eq!(got, expected.to_affine());
 }
 
 #[test]
@@ -61,8 +61,8 @@ fn edge_scalars_fall_back() {
     let p2 = g_times(5);
     let ok = Scalar::from(12345u64);
     for bad in [Scalar::ZERO, Scalar::ONE, -Scalar::ONE] {
-        assert!(lincomb2_with_oracle(&p1, &bad, &p2, &ok, soft_oracle).is_none());
-        assert!(lincomb2_with_oracle(&p1, &ok, &p2, &bad, soft_oracle).is_none());
+        assert!(lincomb2_with_oracle(&p1.to_affine(), &bad, &p2.to_affine(), &ok, soft_oracle).is_none());
+        assert!(lincomb2_with_oracle(&p1.to_affine(), &ok, &p2.to_affine(), &bad, soft_oracle).is_none());
     }
 }
 
@@ -71,8 +71,8 @@ fn identity_points_fall_back() {
     let p = g_times(3);
     let k = Scalar::from(7u64);
     let id = ProjectivePoint::IDENTITY;
-    assert!(lincomb2_with_oracle(&id, &k, &p, &k, soft_oracle).is_none());
-    assert!(lincomb2_with_oracle(&p, &k, &id, &k, soft_oracle).is_none());
+    assert!(lincomb2_with_oracle(&id.to_affine(), &k, &p.to_affine(), &k, soft_oracle).is_none());
+    assert!(lincomb2_with_oracle(&p.to_affine(), &k, &id.to_affine(), &k, soft_oracle).is_none());
 }
 
 #[test]
@@ -80,8 +80,8 @@ fn cancelling_and_doubling_terms_fall_back() {
     let p = g_times(3);
     let k = Scalar::from(7u64);
     // A = B (doubling chord) and A = −B (Q = O): both share x(A) = x(B).
-    assert!(lincomb2_with_oracle(&p, &k, &p, &k, soft_oracle).is_none());
-    assert!(lincomb2_with_oracle(&p, &k, &(-p), &k, soft_oracle).is_none());
+    assert!(lincomb2_with_oracle(&p.to_affine(), &k, &p.to_affine(), &k, soft_oracle).is_none());
+    assert!(lincomb2_with_oracle(&p.to_affine(), &k, &(-p).to_affine(), &k, soft_oracle).is_none());
 }
 
 #[test]
@@ -100,9 +100,9 @@ fn k_half_n_minus_1_reconstructs_correctly() {
     let k2 = Scalar::from(99999u64);
 
     let expected = ProjectivePoint::lincomb(&p1, &k_half, &p2, &k2);
-    let got = lincomb2_with_oracle(&p1, &k_half, &p2, &k2, soft_oracle)
+    let got = lincomb2_with_oracle(&p1.to_affine(), &k_half, &p2.to_affine(), &k2, soft_oracle)
         .expect("k=(n-1)/2 is not near-edge and must reconstruct correctly");
-    assert_eq!(got.to_affine(), expected.to_affine());
+    assert_eq!(got, expected.to_affine());
 }
 
 #[test]
@@ -118,7 +118,7 @@ fn cross_point_cancellation_falls_back() {
         .expect("3 is invertible mod n");
     let k1 = -(k2 * Scalar::from(7u64) * three_inv);
     assert!(
-        lincomb2_with_oracle(&p1, &k1, &p2, &k2, soft_oracle).is_none(),
+        lincomb2_with_oracle(&p1.to_affine(), &k1, &p2.to_affine(), &k2, soft_oracle).is_none(),
         "cross-point cancellation (P1 ≠ ±P2, result = O) must fall back"
     );
 }
@@ -171,7 +171,7 @@ fn odd_y_base_point_reconstructs_correctly() {
     let k1 = Scalar::from(54321u64);
     let k2 = Scalar::from(11111u64);
     let expected = ProjectivePoint::lincomb(&p1, &k1, &p2, &k2);
-    let got = lincomb2_with_oracle(&p1, &k1, &p2, &k2, soft_oracle)
+    let got = lincomb2_with_oracle(&p1.to_affine(), &k1, &p2.to_affine(), &k2, soft_oracle)
         .expect("odd-y base point is non-degenerate and must reconstruct correctly");
-    assert_eq!(got.to_affine(), expected.to_affine());
+    assert_eq!(got, expected.to_affine());
 }
