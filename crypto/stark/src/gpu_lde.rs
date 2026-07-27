@@ -2147,6 +2147,11 @@ where
     if !n0.is_power_of_two() || n0 < 2 || n0 < gpu_lde_threshold() {
         return None;
     }
+    // Mismatched twiddles would panic inside `FriCommitState::new_dev`;
+    // gate here so a wiring bug degrades to the CPU path instead.
+    if inv_twiddles.len() != n0 / 2 {
+        return None;
+    }
     let mut inv_tw_u64: Vec<u64> = Vec::with_capacity(inv_twiddles.len());
     for t in inv_twiddles {
         // SAFETY: F == Goldilocks per TypeId check.
@@ -2190,6 +2195,14 @@ where
     FieldElement<E>: AsBytes,
     T: IsStarkTranscript<E, F> + Clone,
 {
+    // The unsafe zeta reads below reinterpret `FieldElement<E>` as 3 u64:
+    // every caller gates the tower, but assert here so a future caller with
+    // another `E` aborts instead of reading past the value.
+    assert_eq!(
+        TypeId::of::<E>(),
+        TypeId::of::<Degree3GoldilocksExtensionField>(),
+        "fri_commit_gpu_drive requires the Goldilocks ext3 tower"
+    );
     // Snapshot the transcript before any sampling. On a cudarc failure
     // mid-loop we restore from this snapshot and return None, so the CPU
     // fallback in `commit_phase_from_evaluations` starts from a byte-

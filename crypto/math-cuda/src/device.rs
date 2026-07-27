@@ -327,11 +327,13 @@ impl Backend {
     fn init() -> Result<Self> {
         let ctx = CudaContext::new(0)?;
         // cudarc's default per-slice CudaEvent tracking adds two driver calls
-        // per alloc and serialises under the context lock. Slices are only
-        // shared across streams after the producing stream has been host-
-        // synchronised (e.g. the retained trace snapshot and the resident
-        // LogUp aux buffer; every producer syncs before its handle escapes),
-        // so the tracking is pure overhead. Disable it.
+        // per alloc and serialises under the context lock. Cross-stream
+        // read-after-write on shared handles is ordered explicitly instead:
+        // producers either host-synchronise before the handle escapes (trace
+        // snapshot, resident LogUp aux) or attach a `ready` PooledEvent that
+        // every consumer awaits via `wait_ready_on` (the R1 LDE handles).
+        // Any new cross-stream consumer MUST follow one of those two
+        // patterns; with that upheld the tracking is pure overhead.
         unsafe { ctx.disable_event_tracking() };
 
         // Retain freed device memory in the stream ordered pool for reuse.
@@ -636,6 +638,17 @@ pub fn backend() -> Result<&'static Backend> {
 pub struct PendingD2H<'a> {
     staging: std::sync::MutexGuard<'a, PinnedStaging>,
     n_bytes: usize,
+}
+
+// A dropped pending (e.g. a `?` between enqueue and wait) must not release
+// the slot while the DMA is still writing the slab: the next holder could
+// repack it or `ensure_capacity` could free it mid-copy. Block on the copy's
+// event before the guard drops; errors are ignored (the context is already
+// failing on these paths, and the wait is best-effort protection).
+impl Drop for PendingD2H<'_> {
+    fn drop(&mut self) {
+        let _ = self.staging.sync_event();
+    }
 }
 
 /// Enqueue an async D2H of `n_elems` of `src` into the pinned slab of `slot`,

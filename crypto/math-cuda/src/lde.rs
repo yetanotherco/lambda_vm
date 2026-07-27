@@ -698,6 +698,13 @@ pub fn coset_lde_row_major_split_trees(
     build_precomputed: bool,
 ) -> Result<(Option<Vec<u8>>, Vec<u8>, GpuLdeBase, Vec<u64>)> {
     assert!(split_col > 0 && split_col < m, "split inside the row");
+    assert!(n.is_power_of_two(), "n must be a power of two");
+    assert_eq!(weights.len(), n, "weights length must match n");
+    assert!(
+        blowup_factor.is_power_of_two(),
+        "blowup must be power of two"
+    );
+    assert_eq!(row_major.len(), n * m, "row-major input shape");
     let lde_size = n * blowup_factor;
     assert_u32_domain(lde_size, "coset_lde_row_major_split lde_size");
     let num_leaves = lde_size / 2;

@@ -557,10 +557,14 @@ where
     let _ = d.fri_inv_twiddles();
     let _ = t.composition(&d);
     let _ = t.inv_2x(&d);
-    domain_twiddle_cache()
-        .lock()
-        .unwrap()
-        .insert(key, Box::new((d.clone(), t.clone())));
+    let mut cache = domain_twiddle_cache().lock().unwrap();
+    // Re-check under the lock: concurrent misses both build, and using the
+    // loser would pin ITS per-instance vectors in the pointer-keyed device
+    // caches for the process lifetime, duplicating VRAM. The winner stays.
+    if let Some(e) = cache.get(&key).and_then(|b| b.downcast_ref::<Entry<F>>()) {
+        return e.clone();
+    }
+    cache.insert(key, Box::new((d.clone(), t.clone())));
     (d, t)
 }
 

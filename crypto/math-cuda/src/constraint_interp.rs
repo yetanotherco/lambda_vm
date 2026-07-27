@@ -283,6 +283,9 @@ fn eval_composition_launch(
     let mut d_b_z_inv = unsafe { stream.alloc::<u64>((num_boundary * num_rows).max(1)) }?;
     {
         for (b, src) in accum.b_z_inv.iter().enumerate() {
+            // Hard assert: a shorter column would leave the window's tail as
+            // uninitialized VRAM the kernel reads — a silently wrong H.
+            assert_eq!(src.len(), num_rows, "b_z_inv column length");
             let mut dst = d_b_z_inv.slice_mut(b * num_rows..(b + 1) * num_rows);
             stream.memcpy_dtod(&src.buf, &mut dst)?;
         }
