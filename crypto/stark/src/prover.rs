@@ -1770,10 +1770,16 @@ pub trait IsStarkProver<
         // <<<< Receive challenges: 𝛾ⱼ, 𝛾ⱼ'
         let gammas = deep_composition_coefficients;
 
-        // Compute p₀ (deep composition polynomial) as N evaluations on trace-size coset
+        let domain_size = domain.lde_roots_of_unity_coset.len();
+
+        // Fully device-resident DEEP → FRI: the codeword is computed, bit-
+        // reversed, and folded on device without crossing PCIe. On any miss
+        // (gates, cudarc failure — the FRI driver restores the transcript)
+        // the host path below recomputes DEEP through its own arms.
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
-        let deep_evals = Self::compute_deep_composition_poly_evaluations(
+        #[cfg(feature = "cuda")]
+        let precomputed_fri = Self::try_compute_deep_dev(
             &round_1_result.lde_trace,
             round_2_result,
             round_3_result,
@@ -1782,34 +1788,85 @@ pub trait IsStarkProver<
             &domain.trace_primitive_root,
             &gammas,
             &trace_term_coeffs,
-        );
+        )
+        .and_then(|dw| {
+            crate::gpu_lde::try_fri_commit_gpu_from_dev(
+                dw,
+                transcript,
+                &coset_offset,
+                domain.blowup_factor.trailing_zeros(),
+                air.options().fri_final_poly_log_degree as u32,
+                domain.fri_inv_twiddles(),
+            )
+        });
+        #[cfg(not(feature = "cuda"))]
+        #[allow(clippy::type_complexity)]
+        let precomputed_fri: Option<(
+            Vec<FieldElement<FieldExtension>>,
+            Vec<
+                crate::fri::fri_commitment::FriLayer<
+                    FieldExtension,
+                    crate::config::FriLayerMerkleTreeBackend<FieldExtension>,
+                >,
+            >,
+        )> = None;
         #[cfg(feature = "instruments")]
-        let other_dur_1 = t_sub.elapsed();
+        let mut other_dur_1 = t_sub.elapsed();
+        #[cfg(feature = "instruments")]
+        let mut r4_fft_dur = Duration::ZERO;
+        #[cfg(feature = "instruments")]
+        let mut r4_merkle_dur = Duration::ZERO;
 
-        // DEEP evaluations are already at 2N LDE points — just bit-reverse for FRI.
-        // No iFFT+FFT extension needed (Plonky3-style direct LDE computation).
-        let domain_size = domain.lde_roots_of_unity_coset.len();
-        #[cfg(feature = "instruments")]
-        let t_sub = Instant::now();
-        let mut lde_evals = deep_evals;
-        in_place_bit_reverse_permute(&mut lde_evals);
-        #[cfg(feature = "instruments")]
-        let r4_fft_dur = t_sub.elapsed();
+        let (fri_final_poly_coeffs, fri_layers) = if let Some(res) = precomputed_fri {
+            res
+        } else {
+            // Compute p₀ (deep composition polynomial) as N evaluations on the LDE coset
+            #[cfg(feature = "instruments")]
+            let t_sub = Instant::now();
+            let deep_evals = Self::compute_deep_composition_poly_evaluations(
+                &round_1_result.lde_trace,
+                round_2_result,
+                round_3_result,
+                z,
+                domain,
+                &domain.trace_primitive_root,
+                &gammas,
+                &trace_term_coeffs,
+            );
+            #[cfg(feature = "instruments")]
+            {
+                other_dur_1 += t_sub.elapsed();
+            }
 
-        // FRI commit phase from pre-computed evaluations
-        #[cfg(feature = "instruments")]
-        let t_sub = Instant::now();
-        let (fri_final_poly_coeffs, fri_layers) = fri::commit_phase_from_evaluations(
-            lde_evals,
-            transcript,
-            &coset_offset,
-            domain_size,
-            domain.blowup_factor.trailing_zeros(),
-            air.options().fri_final_poly_log_degree as u32,
-            domain.fri_inv_twiddles(),
-        );
-        #[cfg(feature = "instruments")]
-        let r4_merkle_dur = t_sub.elapsed();
+            // DEEP evaluations are already at 2N LDE points — just bit-reverse for FRI.
+            // No iFFT+FFT extension needed (Plonky3-style direct LDE computation).
+            #[cfg(feature = "instruments")]
+            let t_sub = Instant::now();
+            let mut lde_evals = deep_evals;
+            in_place_bit_reverse_permute(&mut lde_evals);
+            #[cfg(feature = "instruments")]
+            {
+                r4_fft_dur = t_sub.elapsed();
+            }
+
+            // FRI commit phase from pre-computed evaluations
+            #[cfg(feature = "instruments")]
+            let t_sub = Instant::now();
+            let res = fri::commit_phase_from_evaluations(
+                lde_evals,
+                transcript,
+                &coset_offset,
+                domain_size,
+                domain.blowup_factor.trailing_zeros(),
+                air.options().fri_final_poly_log_degree as u32,
+                domain.fri_inv_twiddles(),
+            );
+            #[cfg(feature = "instruments")]
+            {
+                r4_merkle_dur = t_sub.elapsed();
+            }
+            res
+        };
 
         // grinding: generate nonce and append it to the transcript
         #[cfg(feature = "instruments")]
@@ -1871,6 +1928,61 @@ pub trait IsStarkProver<
     /// The DEEP polynomial is:
     ///   deep(X) = Σ_j γ_j * (H_j(X) - H_j(z^K)) / (X - z^K)
     ///           + Σ_{j,k} γ'_{j,k} * (t_j(X) - t_j(z·w^k)) / (X - z·w^k)
+    #[allow(clippy::too_many_arguments)]
+    /// Fully device-resident DEEP: device inv-denoms + resident parts handle,
+    /// codeword kept on device in FRI order for [`gpu_lde::try_fri_commit_gpu_from_dev`].
+    /// `None` → the host DEEP path (which retries its own GPU arms).
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    fn try_compute_deep_dev(
+        lde_trace: &LDETraceTable<Field, FieldExtension>,
+        round_2_result: &Round2<FieldExtension>,
+        round_3_result: &Round3<FieldExtension>,
+        z: &FieldElement<FieldExtension>,
+        domain: &Domain<Field>,
+        primitive_root: &FieldElement<Field>,
+        composition_poly_gammas: &[FieldElement<FieldExtension>],
+        trace_terms_gammas: &[Vec<FieldElement<FieldExtension>>],
+    ) -> Option<math_cuda::deep::GpuDeepCodeword>
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+    {
+        let parts_dev = lde_trace.gpu_composition_parts()?;
+        let num_parts = round_2_result.lde_composition_poly_evaluations.len();
+        let z_power = z.pow(num_parts);
+        let num_eval_points = if trace_terms_gammas.is_empty() {
+            0
+        } else {
+            trace_terms_gammas[0].len()
+        };
+        let mut z_shifted = Vec::with_capacity(num_eval_points);
+        let mut current_z = z.clone();
+        for _ in 0..num_eval_points {
+            z_shifted.push(current_z.clone());
+            current_z = primitive_root * &current_z;
+        }
+        let z_scalars: Vec<FieldElement<FieldExtension>> =
+            core::iter::once(z_power).chain(z_shifted).collect();
+        let (inv_dev, stream) =
+            crate::gpu_lde::try_inv_denoms_dev_with_stream::<Field, FieldExtension>(
+                &domain.lde_roots_of_unity_coset,
+                &z_scalars,
+                math_cuda::inverse::DenomSign::XMinusZ,
+                lde_trace.bound_stream(),
+            )?;
+        crate::gpu_lde::try_deep_composition_gpu_keep::<Field, FieldExtension>(
+            lde_trace,
+            parts_dev,
+            &round_3_result.composition_poly_parts_ood_evaluation,
+            &round_3_result.trace_ood_evaluations.columns(),
+            composition_poly_gammas,
+            trace_terms_gammas,
+            (&inv_dev, &stream),
+            num_eval_points,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn compute_deep_composition_poly_evaluations(
         lde_trace: &LDETraceTable<Field, FieldExtension>,

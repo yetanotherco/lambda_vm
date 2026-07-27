@@ -224,6 +224,7 @@ pub struct Backend {
 
     // deep.cubin
     pub deep_composition_ext3_row: CudaFunction,
+    pub bit_reverse_ext3_kernel: CudaFunction,
 
     // fri.cubin
     pub fri_fold_ext3: CudaFunction,
@@ -448,6 +449,7 @@ impl Backend {
             gather_rows_base: bary.load_function("gather_rows_base")?,
             gather_rows_ext3: bary.load_function("gather_rows_ext3")?,
             deep_composition_ext3_row: deep.load_function("deep_composition_ext3_row")?,
+            bit_reverse_ext3_kernel: deep.load_function("bit_reverse_ext3_interleaved")?,
             fri_fold_ext3: fri.load_function("fri_fold_ext3")?,
             fri_update_twiddles: fri.load_function("fri_update_twiddles")?,
             compute_denoms_ext3: inverse.load_function("compute_denoms_ext3")?,

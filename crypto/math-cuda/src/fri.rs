@@ -88,6 +88,28 @@ impl FriCommitState {
         })
     }
 
+    /// Like [`Self::new`], but adopts a device-resident codeword (already in
+    /// FRI bit-reversed order) and its producing stream — no evals H2D.
+    pub fn new_dev(codeword: crate::deep::GpuDeepCodeword, inv_tw_host: &[u64]) -> Result<Self> {
+        let crate::deep::GpuDeepCodeword { buf, n, stream } = codeword;
+        assert!(n >= 2 && n.is_power_of_two());
+        assert_eq!(buf.len(), 3 * n);
+        assert_eq!(inv_tw_host.len(), n / 2);
+
+        // SAFETY: evals_b is written by the first fold before it is read.
+        let evals_b = unsafe { stream.alloc::<u64>(3 * n) }?;
+        let inv_tw = stream.clone_htod(inv_tw_host)?;
+
+        Ok(Self {
+            stream,
+            evals_a: buf,
+            evals_b,
+            inv_tw,
+            current_n: n,
+            a_is_input: true,
+        })
+    }
+
     /// Fold the current layer using `zeta`, run the row-pair Keccak leaves
     /// + pair-hash Merkle tree kernels on the result, and D2H:
     ///   - the new root (32 bytes)

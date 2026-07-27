@@ -1738,6 +1738,106 @@ where
     Some(u64_to_ext3_vec::<E>(&deep_raw))
 }
 
+/// Fully-resident DEEP keeping the codeword on device in FRI order (no D2H).
+/// Only the all-device arm — on any miss the caller falls back to the
+/// download bridge or to [`try_deep_composition_gpu`]'s host result.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_deep_composition_gpu_keep<F, E>(
+    lde_trace: &LDETraceTable<F, E>,
+    parts_dev: &math_cuda::lde::GpuLdeExt3,
+    h_ood: &[FieldElement<E>],
+    trace_ood_columns: &[Vec<FieldElement<E>>],
+    composition_poly_gammas: &[FieldElement<E>],
+    trace_terms_gammas: &[Vec<FieldElement<E>>],
+    inv_denoms_dev: (&CudaSlice<u64>, &Arc<CudaStream>),
+    num_eval_points: usize,
+) -> Option<math_cuda::deep::GpuDeepCodeword>
+where
+    F: IsField + IsSubFieldOf<E> + 'static,
+    E: IsField + 'static,
+{
+    if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
+        return None;
+    }
+    if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
+        return None;
+    }
+    let main = lde_trace.gpu_main()?;
+    let lde_size = main.lde_size;
+    if lde_size < gpu_lde_threshold() || !lde_size.is_power_of_two() {
+        return None;
+    }
+    let num_main = main.m;
+    let aux_handle = lde_trace.gpu_aux();
+    let num_aux = aux_handle.map(|a| a.m).unwrap_or(0);
+    let num_total_cols = num_main + num_aux;
+    let num_parts = composition_poly_gammas.len();
+    if h_ood.len() != num_parts {
+        return None;
+    }
+    if trace_ood_columns.len() != num_total_cols
+        || trace_ood_columns.iter().any(|c| c.len() != num_eval_points)
+    {
+        return None;
+    }
+    if trace_terms_gammas.len() != num_total_cols
+        || trace_terms_gammas
+            .iter()
+            .any(|c| c.len() != num_eval_points)
+    {
+        return None;
+    }
+    if parts_dev.m != num_parts || parts_dev.lde_size != lde_size {
+        return None;
+    }
+
+    // Pack the small host scalars. SAFETY for ext3 transmutes: E == Ext3.
+    let h_ood_raw: &[u64] = unsafe { ext3_slice_to_u64::<E>(h_ood) };
+    let mut trace_ood_raw: Vec<u64> = Vec::with_capacity(num_total_cols * num_eval_points * 3);
+    for col in trace_ood_columns {
+        trace_ood_raw.extend_from_slice(unsafe { ext3_slice_to_u64::<E>(col) });
+    }
+    let gammas_h_raw: &[u64] = unsafe { ext3_slice_to_u64::<E>(composition_poly_gammas) };
+    let mut gammas_tr_raw: Vec<u64> = Vec::with_capacity(num_total_cols * num_eval_points * 3);
+    for col in trace_terms_gammas {
+        gammas_tr_raw.extend_from_slice(unsafe { ext3_slice_to_u64::<E>(col) });
+    }
+
+    let (inv_dev, stream) = inv_denoms_dev;
+    let dw = math_cuda::deep::deep_composition_ext3_fully_resident_keep(
+        stream,
+        main,
+        aux_handle,
+        parts_dev,
+        inv_dev,
+        h_ood_raw,
+        &trace_ood_raw,
+        gammas_h_raw,
+        &gammas_tr_raw,
+        num_parts,
+        num_main,
+        num_aux,
+        num_eval_points,
+        1,
+        lde_size,
+    )
+    .ok()?;
+    GPU_DEEP_CALLS.fetch_add(1, Ordering::Relaxed);
+    Some(dw)
+}
+
+/// D2H bridge for the FRI fallback: download a resident codeword (already in
+/// FRI order) as field elements ready for `commit_phase_from_evaluations`.
+pub(crate) fn download_deep_fri_ordered<E: IsField + 'static>(
+    dw: &math_cuda::deep::GpuDeepCodeword,
+) -> Option<Vec<FieldElement<E>>> {
+    if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
+        return None;
+    }
+    let raw = math_cuda::deep::download_deep_codeword(dw).ok()?;
+    Some(u64_to_ext3_vec::<E>(&raw))
+}
+
 /// Build `inv_denoms[k*n + i] = 1 / (lift(coset_base[i]) - z_scalars[k])`
 /// entirely on device. Used by both R3 OOD (n = trace_size, k_scalars =
 /// num_eval_points) and R4 DEEP (n = lde_size, k_scalars = 1 +
@@ -2014,11 +2114,92 @@ where
     // SAFETY: E == Ext3; FieldElement<Ext3> backing is [u64; 3].
     let evals_u64: &[u64] = unsafe { ext3_slice_to_u64::<E>(evals) };
 
-    let mut state = match math_cuda::fri::FriCommitState::new(evals_u64, &inv_tw_u64, n0) {
+    let state = match math_cuda::fri::FriCommitState::new(evals_u64, &inv_tw_u64, n0) {
         Ok(s) => s,
         Err(_) => return None,
     };
+    fri_commit_gpu_drive(
+        state,
+        transcript,
+        coset_offset,
+        n0,
+        blowup_log,
+        final_poly_log_degree,
+    )
+}
 
+/// [`try_fri_commit_gpu`] entered from a device-resident DEEP codeword
+/// (already in FRI order): no evals H2D at all.
+pub(crate) fn try_fri_commit_gpu_from_dev<F, E, T>(
+    codeword: math_cuda::deep::GpuDeepCodeword,
+    transcript: &mut T,
+    coset_offset: &FieldElement<F>,
+    blowup_log: u32,
+    final_poly_log_degree: u32,
+    inv_twiddles: &[FieldElement<F>],
+) -> Option<(
+    Vec<FieldElement<E>>,
+    Vec<FriLayer<E, FriLayerMerkleTreeBackend<E>>>,
+)>
+where
+    F: IsFFTField + IsField + IsSubFieldOf<E> + 'static,
+    E: IsField + 'static + Send + Sync,
+    FieldElement<F>: AsBytes,
+    FieldElement<E>: AsBytes,
+    T: IsStarkTranscript<E, F> + Clone,
+{
+    if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
+        return None;
+    }
+    if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
+        return None;
+    }
+    let n0 = codeword.n;
+    if !n0.is_power_of_two() || n0 < 2 || n0 < gpu_lde_threshold() {
+        return None;
+    }
+    let mut inv_tw_u64: Vec<u64> = Vec::with_capacity(inv_twiddles.len());
+    for t in inv_twiddles {
+        // SAFETY: F == Goldilocks per TypeId check.
+        let v: u64 = unsafe { *(t.value() as *const _ as *const u64) };
+        inv_tw_u64.push(v);
+    }
+    let state = match math_cuda::fri::FriCommitState::new_dev(codeword, &inv_tw_u64) {
+        Ok(s) => s,
+        Err(_) => return None,
+    };
+    fri_commit_gpu_drive(
+        state,
+        transcript,
+        coset_offset,
+        n0,
+        blowup_log,
+        final_poly_log_degree,
+    )
+}
+
+/// The shared FRI commit loop over an initialized device state: per committed
+/// layer sample ζ, fold + commit on device, D2H root/evals; then the terminal
+/// fold and CPU coefficient extraction. Restores the transcript and returns
+/// `None` on any mid-loop cudarc failure so the CPU path reruns cleanly.
+fn fri_commit_gpu_drive<F, E, T>(
+    mut state: math_cuda::fri::FriCommitState,
+    transcript: &mut T,
+    coset_offset: &FieldElement<F>,
+    n0: usize,
+    blowup_log: u32,
+    final_poly_log_degree: u32,
+) -> Option<(
+    Vec<FieldElement<E>>,
+    Vec<FriLayer<E, FriLayerMerkleTreeBackend<E>>>,
+)>
+where
+    F: IsFFTField + IsField + IsSubFieldOf<E> + 'static,
+    E: IsField + 'static + Send + Sync,
+    FieldElement<F>: AsBytes,
+    FieldElement<E>: AsBytes,
+    T: IsStarkTranscript<E, F> + Clone,
+{
     // Snapshot the transcript before any sampling. On a cudarc failure
     // mid-loop we restore from this snapshot and return None, so the CPU
     // fallback in `commit_phase_from_evaluations` starts from a byte-
