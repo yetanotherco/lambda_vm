@@ -8,8 +8,14 @@ license.workspace = true
 thiserror = "1.0.68"
 rustc-demangle = "0.1"
 ecsm = { path = "../crypto/ecsm" }
+# The lincomb2 syscall hands `ecsm` its curve points as `AffinePoint { x, y: BigUint }`,
+# so the executor names the same big-integer type the ecsm crate already builds on.
+num-bigint = "0.4.6"
 
 [dev-dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tiny-keccak = { version = "2.0", features = ["keccak"] }
+# Third reference for the lincomb2 syscall tests: `ProjectivePoint::lincomb` is the very
+# software fallback the guest takes when the syscall reports a non-zero status.
+k256 = { version = "0.13", default-features = false, features = ["arithmetic"] }

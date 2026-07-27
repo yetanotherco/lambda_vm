@@ -33,6 +33,16 @@ const KECCAK_SYSCALL_NUMBER: usize = usize::MAX - 1;
 #[cfg(target_arch = "riscv64")]
 const ECSM_SYSCALL_NUMBER: usize = usize::MAX - 10;
 
+/// Syscall number for the ECSM secp256k1 `lincomb2` accelerator (-12 as usize).
+/// Must match `executor::vm::instruction::execution::ECSM_LINCOMB2_SYSCALL_NUMBER`.
+#[cfg(target_arch = "riscv64")]
+const ECSM_LINCOMB2_SYSCALL_NUMBER: usize = usize::MAX - 11;
+
+/// `ecsm_lincomb2` succeeded and wrote `Q`. Every other status means the accelerator
+/// produced nothing and the caller must fall back to software.
+/// Must match `executor::vm::instruction::execution::LINCOMB2_STATUS_OK`.
+pub const ECSM_LINCOMB2_OK: u64 = 0;
+
 /// No-op. The `Print` ecall (a7=1) has no receiver on the Ecall bus, so emitting
 /// it makes the LogUp bus unbalance and the proof fail to verify. Printing isn't
 /// needed in provable programs, so `print_string` does nothing on every target.
@@ -184,6 +194,46 @@ pub fn ecsm_mul(xr: &mut [u8; 32], xg: &[u8; 32], k: &[u8; 32]) {
 #[cfg(not(target_arch = "riscv64"))]
 /// Compute `xR = (k·G)_x` on secp256k1 via the ECSM accelerator (32-byte little-endian values).
 pub fn ecsm_mul(_xr: &mut [u8; 32], _xg: &[u8; 32], _k: &[u8; 32]) {
+    unimplemented!("syscalls are only implemented for riscv64 targets");
+}
+
+#[cfg(target_arch = "riscv64")]
+/// Compute `Q = u1·P1 + u2·P2` on secp256k1 via the ECSM `lincomb2` accelerator.
+///
+/// Every operand is 64 bytes: two 32-byte little-endian values back to back —
+/// `q = xQ‖yQ`, `p1 = xP1‖yP1`, `p2 = xP2‖yP2`, `u = u1‖u2`. All four buffers must be
+/// 8-byte aligned and pairwise non-overlapping, including `q` against the inputs.
+///
+/// `p1` must be the secp256k1 generator `G`: the accelerator has no membership witness
+/// for an arbitrary first point, so it reports a non-zero status for any other `P1`
+/// rather than returning a result it cannot prove.
+///
+/// Returns the status word. [`ECSM_LINCOMB2_OK`] means `q` now holds `Q`. **Any other
+/// value means `q` was left untouched** and the caller must compute the linear
+/// combination in software; the accelerator returns a status rather than trapping so
+/// that degenerate inputs (`u = 0`, `u >= N`, an off-curve or non-canonical point,
+/// `P1 ≠ G`, `P1 = ±P2`, `Q = ∞`) can never abort the proof. Falling back is always
+/// sound: the software path is proven guest execution, so a wrong status only costs
+/// cycles.
+pub fn ecsm_lincomb2(q: &mut [u8; 64], p1: &[u8; 64], p2: &[u8; 64], u: &[u8; 64]) -> u64 {
+    let mut status = q.as_mut_ptr() as usize;
+    unsafe {
+        asm!(
+            "ecall",
+            inlateout("a0") status,   // x10 = address to write Q, status on return
+            in("a1") p1.as_ptr(),     // x11 = address of xP1‖yP1
+            in("a2") p2.as_ptr(),     // x12 = address of xP2‖yP2
+            in("a3") u.as_ptr(),      // x13 = address of u1‖u2
+            in("a7") ECSM_LINCOMB2_SYSCALL_NUMBER,
+        )
+    }
+    status as u64
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+/// Compute `Q = u1·P1 + u2·P2` on secp256k1 via the ECSM `lincomb2` accelerator
+/// (64-byte operands, each two 32-byte little-endian values).
+pub fn ecsm_lincomb2(_q: &mut [u8; 64], _p1: &[u8; 64], _p2: &[u8; 64], _u: &[u8; 64]) -> u64 {
     unimplemented!("syscalls are only implemented for riscv64 targets");
 }
 

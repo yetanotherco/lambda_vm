@@ -11,6 +11,13 @@
 /// - `src1_val` = syscall number (from x17): 64=Commit, 93=Halt, etc.
 /// - `src2_val` = buf_addr (x11) for Commit, 0 otherwise
 /// - `dst_val` = count (x12) for Commit, 0 otherwise
+///
+/// The accelerator syscalls repurpose the two spare fields further:
+/// - Keccak: `src2_val` = state address (x10).
+/// - ECSM: `src2_val` = addr of xG (x11), `dst_val` = addr of k (x12).
+/// - ECSM lincomb2: `src2_val` = addr of the result Q (x10 *before* the call),
+///   `dst_val` = the status word written back to x10. This is the one ECALL that
+///   writes a register, so `dst_val` really is x10's post-execution value.
 #[derive(Debug, Clone)]
 pub struct Log {
     /// PC before instruction execution (use this to look up the instruction)

@@ -1,3 +1,7 @@
+use num_bigint::BigUint;
+
+use ecsm::witness::{Lincomb2Error, Lincomb2Witness};
+
 use crate::vm::{
     instruction::decoding::{ArithOp, Comparison, Instruction, LoadStoreWidth},
     logs::Log,
@@ -16,6 +20,9 @@ pub enum SyscallNumbers {
     Halt = 93,
     // Placeholder discriminant. The actual syscall value is ECSM_SYSCALL_NUMBER.
     Ecsm = 94,
+    // Placeholder discriminant. The actual syscall value is
+    // ECSM_LINCOMB2_SYSCALL_NUMBER.
+    EcsmLincomb2 = 95,
 }
 
 /// Syscall number for KeccakPermute (u64::MAX - 1 = 0xFFFF_FFFF_FFFF_FFFE).
@@ -31,9 +38,22 @@ const KECCAK_STATE_BYTES: u64 = 25 * 8;
 /// bus as `[lo32, hi32] = [2^32 - 11, 2^32 - 1]`.
 pub const ECSM_SYSCALL_NUMBER: u64 = u64::MAX - 10;
 
+/// Syscall number for the ECSM `lincomb2` accelerator: `Q = u1·P1 + u2·P2` on secp256k1
+/// in one call (the ecrecover shape `s·R − z·G`).
+///
+/// ECALL number `-12`, i.e. `u64::MAX - 11 = 0xFFFF_FFFF_FFFF_FFF4` — the slot directly
+/// below ECSM's `-11`, keeping the EC accelerators contiguous. `-2` (Keccak) and `-11`
+/// (ECSM) are the only other negative syscall numbers this VM defines, so `-12` is free.
+pub const ECSM_LINCOMB2_SYSCALL_NUMBER: u64 = u64::MAX - 11;
+
 /// `2^32`. ECSM memory operands must not overflow their lower 32-bit address limb when the
-/// largest per-access offset is added: the 32-byte operands reach offset +31 (last byte).
+/// largest per-access offset is added: the 32-byte operands reach offset +31 (last byte),
+/// the 64-byte `lincomb2` operands offset +63.
 const LOW_LIMB: u64 = 1 << 32;
+
+/// Byte length of one `ecsm_lincomb2` memory operand: two 32-byte little-endian values
+/// (`xP‖yP`, or `u1‖u2`) laid out back to back.
+const LINCOMB2_OPERAND_BYTES: u64 = 64;
 
 impl TryFrom<u64> for SyscallNumbers {
     type Error = ();
@@ -45,6 +65,7 @@ impl TryFrom<u64> for SyscallNumbers {
             93 => Ok(SyscallNumbers::Halt),
             v if v == KECCAK_SYSCALL_NUMBER => Ok(SyscallNumbers::KeccakPermute),
             v if v == ECSM_SYSCALL_NUMBER => Ok(SyscallNumbers::Ecsm),
+            v if v == ECSM_LINCOMB2_SYSCALL_NUMBER => Ok(SyscallNumbers::EcsmLincomb2),
             _ => Err(()),
         }
     }
@@ -55,6 +76,7 @@ impl TryFrom<u64> for SyscallNumbers {
 pub enum Accelerator {
     Keccak,
     Ecsm,
+    EcsmLincomb2,
 }
 
 impl SyscallNumbers {
@@ -65,6 +87,7 @@ impl SyscallNumbers {
         match self {
             SyscallNumbers::KeccakPermute => Some(Accelerator::Keccak),
             SyscallNumbers::Ecsm => Some(Accelerator::Ecsm),
+            SyscallNumbers::EcsmLincomb2 => Some(Accelerator::EcsmLincomb2),
             SyscallNumbers::Print
             | SyscallNumbers::Panic
             | SyscallNumbers::Commit
@@ -93,9 +116,205 @@ fn store_u256_le(memory: &mut Memory, addr: u64, bytes: &[u8; 32]) -> Result<(),
     Ok(())
 }
 
+/// Reads a 512-bit little-endian `ecsm_lincomb2` operand as eight doublewords at `addr + 8i`.
+fn load_u512_le(memory: &Memory, addr: u64) -> Result<[u8; 64], MemoryError> {
+    let mut out = [0u8; 64];
+    for (i, chunk) in out.chunks_mut(8).enumerate() {
+        let dw = memory.load_doubleword(addr + (i as u64) * 8)?;
+        chunk.copy_from_slice(&dw.to_le_bytes());
+    }
+    Ok(out)
+}
+
 /// Checks the ECSM address-alignment assumption: `(addr mod 2^32) + max_offset < 2^32`.
 fn ecsm_addr_ok(addr: u64, max_offset: u64) -> bool {
     (addr % LOW_LIMB) + max_offset < LOW_LIMB
+}
+
+// =============================================================================
+// ECSM lincomb2 status contract
+// =============================================================================
+
+// The word the `ecsm_lincomb2` syscall leaves in `a0`. `0` means "the result at the
+// `a0` buffer is `Q = u1·P1 + u2·P2`"; every other value means "no sound witness
+// exists for these inputs, nothing was written", and the guest falls back to its
+// pure-Rust `ProjectivePoint::lincomb`.
+//
+// A non-zero status is ALWAYS sound: the fallback is proven guest execution, so a
+// lying status can only waste cycles, never forge a result. That is why degenerate
+// *values* return a status instead of trapping the way `ecsm_mul` does — the scalars
+// and points come from transaction data, and a trap would let one crafted transaction
+// abort the proof of an entire block. (Operand *addresses* are a different matter:
+// they are chosen by the guest program, not by the transaction, so a bad address is a
+// guest bug and stays a hard `ExecutionError` — see `lincomb2_addrs_ok`.)
+//
+// The codes are distinct per `Lincomb2Error` variant purely so debugging and bench
+// runs can tell the cases apart; the guest only ever tests `!= 0`.
+
+/// `Q` was computed and written to the `a0` buffer.
+pub const LINCOMB2_STATUS_OK: u64 = 0;
+/// `u1` or `u2` is zero.
+pub const LINCOMB2_STATUS_SCALAR_IS_ZERO: u64 = 1;
+/// `u1` or `u2` is `>= N`.
+pub const LINCOMB2_STATUS_SCALAR_OUT_OF_RANGE: u64 = 2;
+/// `P1` or `P2` is not on the curve.
+pub const LINCOMB2_STATUS_POINT_NOT_ON_CURVE: u64 = 3;
+/// `P1` or `P2` has a coordinate `>= p`.
+pub const LINCOMB2_STATUS_POINT_NOT_CANONICAL: u64 = 4;
+/// `P1 = ±P2`, so the `P1 + P2` precompute is not a chord.
+pub const LINCOMB2_STATUS_SUM_DEGENERATE: u64 = 5;
+/// `Q` is the point at infinity (or an accumulator collided with its addend).
+pub const LINCOMB2_STATUS_RESULT_INFINITY: u64 = 6;
+/// `P1` is not the secp256k1 generator `G`. See [`GENERATOR_LE`].
+pub const LINCOMB2_STATUS_P1_NOT_GENERATOR: u64 = 7;
+
+/// The secp256k1 generator `G` as the syscall's 64-byte operand: `xG ‖ yG`, little-endian.
+///
+/// Pinned here rather than imported because the executor has no curve library of its own;
+/// `generator_le_is_the_secp256k1_generator` re-derives it from `k256` so a typo cannot
+/// survive. Same idiom as `ecsm::witness`'s pinned `T₀`.
+pub const GENERATOR_LE: [u8; 64] = [
+    0x98, 0x17, 0xF8, 0x16, 0x5B, 0x81, 0xF2, 0x59, 0xD9, 0x28, 0xCE, 0x2D, 0xDB, 0xFC, 0x9B, 0x02,
+    0x07, 0x0B, 0x87, 0xCE, 0x95, 0x62, 0xA0, 0x55, 0xAC, 0xBB, 0xDC, 0xF9, 0x7E, 0x66, 0xBE, 0x79,
+    0xB8, 0xD4, 0x10, 0xFB, 0x8F, 0xD0, 0x47, 0x9C, 0x19, 0x54, 0x85, 0xA6, 0x48, 0xB4, 0x17, 0xFD,
+    0xA8, 0x08, 0x11, 0x0E, 0xFC, 0xFB, 0xA4, 0x5D, 0x65, 0xC4, 0xA3, 0x26, 0x77, 0xDA, 0x3A, 0x48,
+];
+
+/// Maps a witness-generation failure to its `a0` status word.
+///
+/// Exhaustive on purpose: a new `Lincomb2Error` variant must be a compile error here
+/// rather than silently collapsing onto an existing code.
+fn lincomb2_status(error: &Lincomb2Error) -> u64 {
+    match error {
+        Lincomb2Error::ScalarIsZero => LINCOMB2_STATUS_SCALAR_IS_ZERO,
+        Lincomb2Error::ScalarOutOfRange => LINCOMB2_STATUS_SCALAR_OUT_OF_RANGE,
+        Lincomb2Error::PointNotOnCurve => LINCOMB2_STATUS_POINT_NOT_ON_CURVE,
+        Lincomb2Error::PointNotCanonical => LINCOMB2_STATUS_POINT_NOT_CANONICAL,
+        Lincomb2Error::SumDegenerate => LINCOMB2_STATUS_SUM_DEGENERATE,
+        Lincomb2Error::ResultInfinity => LINCOMB2_STATUS_RESULT_INFINITY,
+    }
+}
+
+/// The outcome of one `ecsm_lincomb2` invocation: the status word written back to `a0`
+/// and, on success, the chip witness for the call.
+///
+/// This is the "row log" the proving side consumes. The executor deliberately does NOT
+/// retain these: one `Lincomb2Witness` holds ~450 double/add steps of 1,872 bytes each
+/// (three `[i64; 64]` carry arrays apiece), i.e. ~820 KiB per call — a block's worth would
+/// be gigabytes. Instead the trace builder re-reads the operand bytes at the ecall's
+/// timestamp and calls [`lincomb2_outcome`] — the very function the executor arm calls
+/// below — so the two sides cannot disagree about the status or about which rows exist.
+/// This mirrors ECSM, where the executor computes only `xR` and `collect_ecsm_ops`
+/// rebuilds the full witness at trace-build time.
+pub struct Lincomb2Outcome {
+    /// The word written to `a0`. [`LINCOMB2_STATUS_OK`] iff `witness.is_some()`.
+    pub status: u64,
+    /// The chip witness, present exactly when the status is OK. Boxed because it is
+    /// large enough that moving it around by value is measurable.
+    pub witness: Option<Box<Lincomb2Witness>>,
+}
+
+/// Evaluates one `lincomb2` call from its three 64-byte operands, each holding two
+/// 32-byte little-endian values: `p1 = xP1‖yP1`, `p2 = xP2‖yP2`, `u = u1‖u2`.
+///
+/// `status == LINCOMB2_STATUS_OK` holds exactly when the proving side can back the
+/// result, which takes two things:
+///
+///  1. **A witness exists.** The status comes from `lincomb2_witness` itself, never from a
+///     cheaper pre-check. A "just compute Q" shortcut could succeed where witness
+///     generation fails (an interior accumulator collision, say), and the executor would
+///     then promise the guest a result the prover cannot produce.
+///  2. **`P1` is the generator.** `Lincomb2Witness` carries `mem_p2` but no `mem_p1` and
+///     no `P1` canonicalization witness, so ECSM′ binds `a1`'s bytes to `G` by
+///     construction (constant-valued MEMW reads) instead of proving membership. Without
+///     this check a caller passing `P1 ≠ G` would get `status == 0`, the trace builder
+///     would emit a row asserting bytes that are not there, the constraint would fail,
+///     and the whole **block would become unprovable** — a completeness hole, not a
+///     forgery, but one that a non-ecrecover caller could open. Returning
+///     [`LINCOMB2_STATUS_P1_NOT_GENERATOR`] instead degrades that caller to the software
+///     fallback and keeps executor and chip in agreement by construction.
+///
+/// The `P1` operand is still read in full, so the ABI stays general: **if a `mem_p1`
+/// membership witness is added later, deleting the `GENERATOR_LE` comparison below is the
+/// only change needed here.** Today's only caller is the guest's ecrecover, which always
+/// passes `ProjectivePoint::GENERATOR`.
+pub fn lincomb2_outcome(p1: &[u8; 64], p2: &[u8; 64], u: &[u8; 64]) -> Lincomb2Outcome {
+    fn halves(operand: &[u8; 64]) -> ([u8; 32], [u8; 32]) {
+        let mut lo = [0u8; 32];
+        let mut hi = [0u8; 32];
+        lo.copy_from_slice(&operand[..32]);
+        hi.copy_from_slice(&operand[32..]);
+        (lo, hi)
+    }
+    fn point(x: &[u8; 32], y: &[u8; 32]) -> ecsm::AffinePoint {
+        ecsm::AffinePoint {
+            x: BigUint::from_bytes_le(x),
+            y: BigUint::from_bytes_le(y),
+        }
+    }
+
+    // Checked before witness generation: it is the cheapest of the conditions and the one
+    // the chip's row shape depends on, so there is nothing to compute if it fails.
+    if *p1 != GENERATOR_LE {
+        return Lincomb2Outcome {
+            status: LINCOMB2_STATUS_P1_NOT_GENERATOR,
+            witness: None,
+        };
+    }
+
+    let (x_p1, y_p1) = halves(p1);
+    let (x_p2, y_p2) = halves(p2);
+    let (u1, u2) = halves(u);
+
+    match ecsm::witness::lincomb2_witness(&u1, &u2, &point(&x_p1, &y_p1), &point(&x_p2, &y_p2)) {
+        Ok(witness) => Lincomb2Outcome {
+            status: LINCOMB2_STATUS_OK,
+            witness: Some(Box::new(witness)),
+        },
+        Err(error) => Lincomb2Outcome {
+            status: lincomb2_status(&error),
+            witness: None,
+        },
+    }
+}
+
+/// Validates the four `ecsm_lincomb2` operand addresses (`a0` result, then the `a1`/`a2`/`a3`
+/// inputs, in that order).
+///
+/// Each 64-byte region must be 8-byte aligned, stay inside its lower 32-bit address limb,
+/// and be pairwise disjoint from the other three:
+///
+/// * **Alignment** — the proving side reads and writes each region as eight *aligned*
+///   doubleword MEMW accesses, the same requirement the Keccak state address carries.
+/// * **Limb bound** — an operand whose last byte (offset +63) crosses `2^32` would split
+///   across the MEMW address limbs. This also makes `addr + 63` overflow-free in `u64`:
+///   any `addr > u64::MAX - 63` has `addr % 2^32 > 2^32 - 64` and is rejected here.
+/// * **Disjointness** — the chip proves one MEMW access chain per operand within a single
+///   ecall; overlapping regions would touch the same address from two of those chains,
+///   which the MEMW consistency argument cannot order. This is `ecsm_mul`'s
+///   `EcsmOperandOverlap` rule widened to four operands. Note the result region may NOT
+///   alias an input, unlike `ecsm_mul`'s `xR`: it is written after all three reads, so an
+///   alias would leave the stored input bytes disagreeing with what the chip consumed.
+///
+/// These are guest-program bugs, not attacker-controlled input, so they are hard errors
+/// rather than a status word — see the status-contract note above.
+fn lincomb2_addrs_ok(addrs: [u64; 4]) -> Result<(), ExecutionError> {
+    for &addr in &addrs {
+        if !addr.is_multiple_of(8) {
+            return Err(ExecutionError::Lincomb2UnalignedAddress(addr));
+        }
+        if !ecsm_addr_ok(addr, LINCOMB2_OPERAND_BYTES - 1) {
+            return Err(ExecutionError::Lincomb2AddressOverflow(addr));
+        }
+    }
+    for (i, &a) in addrs.iter().enumerate() {
+        for &b in &addrs[i + 1..] {
+            if a.abs_diff(b) < LINCOMB2_OPERAND_BYTES {
+                return Err(ExecutionError::Lincomb2OperandOverlap(a, b));
+            }
+        }
+    }
+    Ok(())
 }
 
 impl Instruction {
@@ -454,6 +673,59 @@ impl Instruction {
                         src2_val = addr_xg;
                         dst_val = addr_k;
                     }
+                    SyscallNumbers::EcsmLincomb2 => {
+                        // ECSM lincomb2(-12): Q = u1·P1 + u2·P2 on secp256k1.
+                        // x10 = addr to write Q, x11 = addr of P1, x12 = addr of P2,
+                        // x13 = addr of the scalars. Every operand is 64 bytes: two
+                        // 32-byte little-endian values back to back (xQ‖yQ, xP‖yP,
+                        // u1‖u2). On return x10 holds the status word: 0 means Q was
+                        // written, non-zero means Q was NOT written and the guest must
+                        // use its software fallback.
+                        //
+                        // THE MEMORY ACCESS PATTERN IS THE SAME ON BOTH PATHS. All three
+                        // operands are read, and x10 is written, whether or not a witness
+                        // exists — only the 64-byte Q store is conditional. The proving
+                        // side gives every lincomb2 ecall one row that receives the Ecall
+                        // bus and performs the same fixed set of MEMW accesses; an early
+                        // return on the degenerate path would desynchronise those
+                        // timestamps and leave the ecall with no receiver, unbalancing the
+                        // bus. Do not "optimize" the reads away: `lincomb2_outcome` takes
+                        // all three operands by value precisely so the status cannot be
+                        // decided before they have been read.
+                        let addr_q = registers.read(10)?;
+                        let addr_p1 = registers.read(11)?;
+                        let addr_p2 = registers.read(12)?;
+                        let addr_u = registers.read(13)?;
+                        // Address faults are the one hard error here, and they abort
+                        // before any read or write, so they never leave a partial trace.
+                        lincomb2_addrs_ok([addr_q, addr_p1, addr_p2, addr_u])?;
+
+                        let p1 = load_u512_le(memory, addr_p1)?;
+                        let p2 = load_u512_le(memory, addr_p2)?;
+                        let u = load_u512_le(memory, addr_u)?;
+
+                        let outcome = lincomb2_outcome(&p1, &p2, &u);
+                        // Q is written only on success: there is no witness to prove on
+                        // the error path, so there must also be no bytes for the guest to
+                        // mistake for a result.
+                        if let Some(witness) = &outcome.witness {
+                            store_u256_le(memory, addr_q, &witness.x_q)?;
+                            store_u256_le(memory, addr_q + 32, &witness.y_q)?;
+                        }
+                        // Unconditional: the status write is what makes the error path
+                        // expressible as a row at all.
+                        registers.write(10, outcome.status)?;
+                        // The three input addresses survive in x11/x12/x13 and are
+                        // recoverable from the register state exactly as ECSM recovers
+                        // its own, but x10 is clobbered by the status, so the CPU log
+                        // carries both: `src2_val` = the result address, `dst_val` =
+                        // x10's post-execution value (the status). Both are redundant
+                        // with a trace-builder replay; they are carried because the
+                        // fields are otherwise unused and the status saves the collector
+                        // a witness recomputation on the error path.
+                        src2_val = addr_q;
+                        dst_val = outcome.status;
+                    }
                     SyscallNumbers::Halt => {
                         // halt
                         return Ok(Log {
@@ -636,6 +908,12 @@ pub enum ExecutionError {
     EcsmOperandOverlap,
     #[error("ECSM scalar multiplication error: {0}")]
     Ecsm(#[from] ecsm::EcsmError),
+    #[error("ECSM lincomb2 operand address is not 8-byte aligned: {0:#018x}")]
+    Lincomb2UnalignedAddress(u64),
+    #[error("ECSM lincomb2 operand range overflows the lower 32-bit limb: {0:#018x}")]
+    Lincomb2AddressOverflow(u64),
+    #[error("ECSM lincomb2 operand ranges overlap: {0:#018x} and {1:#018x}")]
+    Lincomb2OperandOverlap(u64, u64),
 }
 
 // =============================================================================

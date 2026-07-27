@@ -585,6 +585,8 @@ name = "executor"
 version = "0.1.0"
 dependencies = [
  "ecsm",
+ "k256",
+ "num-bigint",
  "rustc-demangle",
  "serde",
  "serde_json",
@@ -834,6 +836,7 @@ dependencies = [
  "log",
  "math",
  "math-cuda",
+ "num-bigint",
  "rayon",
  "rkyv",
  "stark",
