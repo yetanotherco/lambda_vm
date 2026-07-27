@@ -132,23 +132,13 @@ jobs:
             PAIRS=$((PAIRS + 1))
             echo "::notice::rounded odd pair count up to $PAIRS so AB/BA orders balance"
           fi
-          # Fail fast if the PR side predates the pointer_width_64 fix: a >=40tx
-          # continuation proof exceeds rkyv's old 2 GiB cap and only dies after the
-          # full dual build (~1 hr of GPU rental). Skip the check if the fetch fails.
-          if [ "$CONTINUATIONS" = "1" ] && [ "$TX_COUNT" -ge 40 ]; then
-            REF="${OUT_HEAD_SHA:-$OUT_BRANCH}"
-            SIDE=$(gh api "repos/$GITHUB_REPOSITORY/contents/prover/Cargo.toml?ref=$REF" \
-              -H "Accept: application/vnd.github.raw" 2>/dev/null || true)
-            if [ -n "$SIDE" ] && ! printf '%s' "$SIDE" | grep -q pointer_width_64; then
-              echo "::error::PR branch predates the rkyv pointer_width_64 fix — a ${TX_COUNT}tx continuation proof cannot serialize. Rebase onto main, or bench with cont10/mono."
-              exit 1
-            fi
-          fi
           if [ "$CONTINUATIONS" = "1" ]; then
             WORKLOAD="ethrex ${TX_COUNT}tx continuations"
           else
             WORKLOAD="ethrex ${TX_COUNT}tx monolithic"
           fi
+          # Outputs land before the fail-fast below so the always() result
+          # comment is fully labeled even when this step exits early.
           {
             echo "pr_num=$OUT_PR_NUM"
             echo "head_sha=$OUT_HEAD_SHA"
@@ -158,6 +148,23 @@ jobs:
             echo "tx_count=$TX_COUNT"
             echo "workload=$WORKLOAD"
           } >> "$GITHUB_OUTPUT"
+          # Fail fast if the PR side predates the pointer_width_64 fix: a >=40tx
+          # continuation proof exceeds rkyv's old 2 GiB cap and only dies after the
+          # full dual build (~1 hr of GPU rental). Skip the check when the fetch
+          # fails: gh api prints HTTP error bodies to stdout, so gate on its exit
+          # status AND on the payload looking like the manifest (it declares
+          # rkyv) — never treat an error blob as a missing feature. Purely
+          # textual; deletable once every open branch postdates the fix.
+          if [ "$CONTINUATIONS" = "1" ] && [ "$TX_COUNT" -ge 40 ]; then
+            REF="${OUT_HEAD_SHA:-$OUT_BRANCH}"
+            if SIDE=$(gh api "repos/$GITHUB_REPOSITORY/contents/prover/Cargo.toml?ref=$REF" \
+                 -H "Accept: application/vnd.github.raw" 2>/dev/null) \
+               && printf '%s' "$SIDE" | grep -q '^rkyv' \
+               && ! printf '%s' "$SIDE" | grep -q pointer_width_64; then
+              echo "::error::PR branch predates the rkyv pointer_width_64 fix — a ${TX_COUNT}tx continuation proof cannot serialize. Rebase onto main, or bench with cont10/mono."
+              exit 1
+            fi
+          fi
           echo "Using $PAIRS A/B/B/A pairs on $WORKLOAD"
 
       - name: Acknowledge (react + occupancy notice)

@@ -235,6 +235,18 @@ const _: () = {
     );
 };
 
+// With no pointer-width feature enabled rkyv silently falls back to 32-bit
+// rel-ptrs, capping an archive at ~2 GiB — which large continuation proofs
+// exceed, and which nothing else catches: every CI round-trip fits 32-bit
+// offsets, and RECURSION_INPUT_VERSION can't flag it since host and guest
+// compile the constant from this same file. This compiles into both the host
+// and the riscv64 guest graph (the recursion guests path-depend on this
+// crate), so a Cargo.toml losing the feature fails the build here.
+const _: () = assert!(
+    size_of::<rkyv::primitive::ArchivedUsize>() == 8,
+    "proof wire format v2 requires rkyv's pointer_width_64 feature on every proof-format crate",
+);
+
 /// Encode a [`GuestInput`] into the on-wire blob: a 12-byte
 /// `magic + version + reserved` prefix followed by the rkyv archive. The prefix
 /// both aligns the archive in guest memory (so in-place reads don't trap) and
@@ -252,8 +264,9 @@ pub fn encode_recursion_input(input: &GuestInput) -> Result<Vec<u8>, Error> {
 }
 
 /// Validate the wire prefix and return the archive bytes (zero-copy slice).
-/// Returns `None` if the magic or version doesn't match — the caller should
-/// halt cleanly rather than proceed into an `access_unchecked`.
+/// Returns `None` if the blob is too short or the magic or version doesn't
+/// match — callers halt with a legible wrong-format error instead of
+/// surfacing whatever bytecheck makes of old-format bytes.
 pub fn recursion_archive_bytes(blob: &[u8]) -> Option<&[u8]> {
     if blob.len() < RECURSION_INPUT_PREFIX_LEN {
         return None;

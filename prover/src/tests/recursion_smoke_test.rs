@@ -594,6 +594,54 @@ fn run_recursion_pipeline(
     );
 }
 
+/// The wire-prefix rejection path: a stale version (v1 blobs predate rkyv
+/// pointer_width_64), a corrupted magic, and a blob shorter than the prefix
+/// must all yield `None` — the clean "bad magic or version" error the
+/// breaking-change story leans on, rather than a bytecheck error over
+/// old-format bytes. Pure function, no proving needed.
+#[test]
+fn test_recursion_prefix_rejects_wrong_magic_version_and_short_blobs() {
+    let archive = [0xAAu8; 16];
+    let mut blob = Vec::with_capacity(crate::RECURSION_INPUT_PREFIX_LEN + archive.len());
+    blob.extend_from_slice(&crate::RECURSION_INPUT_MAGIC);
+    blob.extend_from_slice(&crate::RECURSION_INPUT_VERSION.to_le_bytes());
+    blob.extend_from_slice(&[0u8; 4]); // reserved
+    blob.extend_from_slice(&archive);
+
+    // Baseline: a well-formed prefix passes and returns exactly the archive.
+    assert_eq!(
+        crate::recursion_archive_bytes(&blob),
+        Some(&archive[..]),
+        "well-formed prefix must expose the archive bytes"
+    );
+
+    // (a) Stale wire version: a v1 blob (32-bit rel-ptrs) must be rejected.
+    let mut stale = blob.clone();
+    stale[4..8].copy_from_slice(&1u32.to_le_bytes());
+    assert_eq!(
+        crate::recursion_archive_bytes(&stale),
+        None,
+        "v1 blob must be rejected by the version check"
+    );
+
+    // (b) Corrupted magic.
+    let mut bad_magic = blob.clone();
+    bad_magic[0] ^= 0xFF;
+    assert_eq!(
+        crate::recursion_archive_bytes(&bad_magic),
+        None,
+        "flipped magic byte must be rejected"
+    );
+
+    // (c) Shorter than the 12-byte prefix (including empty).
+    assert_eq!(
+        crate::recursion_archive_bytes(&blob[..crate::RECURSION_INPUT_PREFIX_LEN - 1]),
+        None,
+        "blob shorter than the prefix must be rejected"
+    );
+    assert_eq!(crate::recursion_archive_bytes(&[]), None);
+}
+
 /// Decode the blob on the host and mirror the guest's verify+attest, then run
 /// the consumer check — a cheap guard on the encode/decode/attest contract
 /// without running the VM.
