@@ -152,8 +152,12 @@ pub fn compute_hint(hint_id: u64, in_be: &[u8; 32]) -> [u8; 32] {
     }
 }
 
-/// Checks the ECSM address-alignment assumption: `(addr mod 2^32) + max_offset < 2^32`.
-fn ecsm_addr_ok(addr: u64, max_offset: u64) -> bool {
+/// Checks that a 32-byte operand does not overflow its lower 32-bit address limb:
+/// `(addr mod 2^32) + max_offset < 2^32`. Tables that send an address to the memory
+/// bus as a `[lo32, hi32]` pair with the per-access offset added to `lo32` alone
+/// cannot represent a carry into `hi32`, so an operand straddling the limb boundary
+/// makes the trace unprovable. Used by the ECSM and Hint ecalls.
+fn addr_limb_ok(addr: u64, max_offset: u64) -> bool {
     (addr % LOW_LIMB) + max_offset < LOW_LIMB
 }
 
@@ -488,9 +492,9 @@ impl Instruction {
                         let addr_xr = registers.read(10)?;
                         let addr_xg = registers.read(11)?;
                         let addr_k = registers.read(12)?;
-                        if !ecsm_addr_ok(addr_xg, 31)
-                            || !ecsm_addr_ok(addr_xr, 31)
-                            || !ecsm_addr_ok(addr_k, 31)
+                        if !addr_limb_ok(addr_xg, 31)
+                            || !addr_limb_ok(addr_xr, 31)
+                            || !addr_limb_ok(addr_k, 31)
                         {
                             return Err(ExecutionError::EcsmAddressOverflow);
                         }
@@ -522,6 +526,15 @@ impl Instruction {
                         let hint_id = registers.read(10)?;
                         let in_addr = registers.read(11)?;
                         let out_addr = registers.read(12)?;
+                        // The HINT table sends the output writes as `[out_addr_lo + 8i,
+                        // out_addr_hi]`, so an `out_addr` whose 32-byte range crosses the
+                        // limb boundary would unbalance the memory bus. `in_addr` is not on
+                        // the bus (the input read is not modeled) but is bounded too, so the
+                        // ecall's operand contract is uniform and `load_u256_le` cannot
+                        // overflow its address arithmetic.
+                        if !addr_limb_ok(in_addr, 31) || !addr_limb_ok(out_addr, 31) {
+                            return Err(ExecutionError::HintAddressOverflow);
+                        }
                         let input = load_u256_le(memory, in_addr)?;
                         let output = compute_hint(hint_id, &input);
                         store_u256_le(memory, out_addr, &output)?;
@@ -708,6 +721,8 @@ pub enum ExecutionError {
     EcsmAddressOverflow,
     #[error("ECSM xG and k operand ranges overlap")]
     EcsmOperandOverlap,
+    #[error("Hint address range overflows the lower 32-bit limb")]
+    HintAddressOverflow,
     #[error("ECSM scalar multiplication error: {0}")]
     Ecsm(#[from] ecsm::EcsmError),
 }
