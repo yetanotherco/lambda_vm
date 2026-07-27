@@ -16,6 +16,7 @@
 //! Curve: secp256k1, `y^2 = x^3 + 7 mod p`, `p = 2^256 - 2^32 - 977`, order `N`.
 
 pub mod curve;
+pub mod lincomb2_table;
 pub mod witness;
 
 #[cfg(test)]

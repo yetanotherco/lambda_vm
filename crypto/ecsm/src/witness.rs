@@ -83,7 +83,12 @@ pub struct EcdasStep {
 // =========================================================================
 
 /// Zero-extends a little-endian byte slice (≤ 64 bytes) to 64 `i128` limbs.
-fn ext64(bytes: &[u8]) -> [i128; 64] {
+///
+/// `pub` so the chips can build the *same* limb identities this module does.
+/// There must be exactly one implementation of this arithmetic: a second copy in
+/// the prover would be the classic divergence, where one side is edited years
+/// later and the other is not.
+pub fn ext64(bytes: &[u8]) -> [i128; 64] {
     let mut a = [0i128; 64];
     for (i, &b) in bytes.iter().enumerate() {
         a[i] = b as i128;
@@ -91,8 +96,8 @@ fn ext64(bytes: &[u8]) -> [i128; 64] {
     a
 }
 
-/// Convolution `Σ_{j=0}^{i} a[j]·b[i-j]`.
-fn conv(a: &[i128; 64], b: &[i128; 64], i: usize) -> i128 {
+/// Convolution `Σ_{j=0}^{i} a[j]·b[i-j]`. `pub` for the reason on [`ext64`].
+pub fn conv(a: &[i128; 64], b: &[i128; 64], i: usize) -> i128 {
     let mut s = 0i128;
     for j in 0..=i {
         s += a[j] * b[i - j];
@@ -105,7 +110,9 @@ fn conv(a: &[i128; 64], b: &[i128; 64], i: usize) -> i128 {
 ///
 /// These asserts catch any transcription error in the `terms` builders: for valid inputs
 /// the relation `LHS − RHS = 0` holds exactly, so every partial sum is divisible by 256.
-fn limb_carries(relation: &str, terms: &[i128; 64]) -> [i64; 64] {
+///
+/// `pub` for the reason on [`ext64`]; `relation` names the caller in the panics.
+pub fn limb_carries(relation: &str, terms: &[i128; 64]) -> [i64; 64] {
     let mut c = [0i64; 64];
     let mut carry: i128 = 0;
     for i in 0..64 {
@@ -241,7 +248,8 @@ fn carries_yr(
 // =========================================================================
 
 /// Little-endian 33 bytes of a non-negative value that fits in 264 bits.
-fn to_le_33(relation: &str, v: &BigUint) -> [u8; 33] {
+/// `pub` for the reason on [`ext64`].
+pub fn to_le_33(relation: &str, v: &BigUint) -> [u8; 33] {
     let mut bytes = v.to_bytes_le();
     assert!(
         bytes.len() <= 33,
@@ -558,15 +566,39 @@ pub enum JointSel {
 
 /// One row of the joint chain: the double/add step witness (identical shape to
 /// [`EcdasStep`], reusing its λ/quotient/carry math) plus the joint-chain
-/// bookkeeping the chip needs (which addend, and the two scalar digit bits).
+/// bookkeeping the chip needs (which addend, the two scalar digit bits, and
+/// whether an add follows).
 #[derive(Debug, Clone)]
 pub struct JointStep {
     pub step: EcdasStep,
     pub sel: JointSel,
-    /// `u1`'s bit at this round (0 on non-schedule rows).
+    /// `u1`'s bit at this row's round (0 on the precompute/correction rows,
+    /// which belong to no round). Set on **both** the double and the add of a
+    /// round: the double needs it to derive [`nb`](Self::nb) and to drive its
+    /// per-stream `Bit` sends, the add needs it to select the addend.
     pub d1: u8,
-    /// `u2`'s bit at this round (0 on non-schedule rows).
+    /// `u2`'s bit at this row's round. Same rows as [`d1`](Self::d1).
     pub d2: u8,
+    /// "An add follows me at this same round" — `nb = d1 ∨ d2 = d1 + d2 − d1·d2`
+    /// on a double row, and `0` on every add / precompute / correction row.
+    ///
+    /// # Why this exists
+    ///
+    /// The joint schedule emits a doubling and its optional add at the **same**
+    /// round, decrementing only at the loop boundary, so the successor round is
+    /// `round − 1 + nb`. Without `nb` that successor is not a function of the
+    /// row's own columns, and a prover could stall `round` — inserting or
+    /// dropping doublings while every per-row relation still holds. It is the
+    /// joint-chain analogue of `EcdasStep::next_op` in the single-scalar chain
+    /// (`prover/src/tables/ecdas.rs` sends `round - 1 + next_op` on its
+    /// outgoing accumulator tuple), and is mirrored into
+    /// [`EcdasStep::next_op`] so a chip can reuse that column and expression
+    /// unchanged.
+    ///
+    /// The chain still drains at the sentinel round `−1`: the last row of a
+    /// round-0 iteration always has `nb = 0` (an add is never followed by an
+    /// add), so `0 − 1 + 0 = −1` either way.
+    pub nb: u8,
 }
 
 /// Full lincomb2-chip witness for one `Q = u1·P1 + u2·P2` evaluation.
@@ -718,16 +750,23 @@ fn check_point(pt: &AffinePoint) -> Result<(), Lincomb2Error> {
 }
 
 /// Builds one joint-chain row from a raw (a, addend, op, result, λ) tuple by
-/// delegating to the shared `build_step`. `round`/`next_op` are bookkeeping the
-/// convolution relations do not consume; on a `Double` row the addend is `(0,0)`
-/// and cancels out of all three relations.
+/// delegating to the shared `build_step`. `round`/`nb` are bookkeeping the
+/// convolution relations do not consume (`build_step` copies `next_op` straight
+/// through and never reads it); on a `Double` row the addend is `(0,0)` and
+/// cancels out of all three relations.
+///
+/// `nb` lands in both [`JointStep::nb`] — the named joint-schedule field — and
+/// [`EcdasStep::next_op`], whose documented meaning ("1 ⇒ next row adds at this
+/// round") is exactly the same predicate. Keeping them in sync lets a chip use
+/// either slot; `tests::lincomb2_tests::check_nb_schedule` asserts on every
+/// emitted row that they never diverge.
 #[allow(clippy::too_many_arguments)]
 fn joint_row(
     a: &AffinePoint,
     addend: &AffinePoint,
     op: u8,
     round: u8,
-    next_op: u8,
+    nb: u8,
     r: &AffinePoint,
     lambda: BigUint,
     sel: JointSel,
@@ -743,7 +782,7 @@ fn joint_row(
         g: addend.clone(),
         round,
         op,
-        next_op,
+        next_op: nb,
         r: r.clone(),
         lambda,
     };
@@ -752,6 +791,7 @@ fn joint_row(
         sel,
         d1,
         d2,
+        nb,
     }
 }
 
@@ -823,6 +863,15 @@ pub fn lincomb2_witness(
 
     let mut acc = t0_i.clone();
     for round in (0..len).rev() {
+        // This round's joint digit, read before the doubling is emitted: the
+        // double row carries it too, because `nb` (whether the add below
+        // follows) is what pins its successor round. See `JointStep::nb`.
+        let d1 = u1.bit(round as u64) as u8;
+        let d2 = u2.bit(round as u64) as u8;
+        // `d1 ∨ d2`; for 0/1 bytes this is exactly `d1 + d2 − d1·d2`, the
+        // degree-2 form the chip constrains.
+        let nb = d1 | d2;
+
         // double
         let a_dbl = acc.clone();
         let (dx, dy, dlam) = ec_double(&a_dbl, &p_big);
@@ -832,21 +881,20 @@ pub fn lincomb2_witness(
             &zero_pt,
             0,
             round as u8,
-            0,
+            nb,
             &to_affine(&acc),
             dlam.to_biguint().expect("reduced"),
             JointSel::Double,
-            0,
-            0,
+            d1,
+            d2,
             &p_big,
             &r_big,
             &r_ext,
             &pp,
         ));
 
-        // conditional add of the selected addend
-        let d1 = u1.bit(round as u64) as u8;
-        let d2 = u2.bit(round as u64) as u8;
+        // conditional add of the selected addend; `nb = 0` on the add row, so
+        // its successor round is `round − 1` (an add is never followed by an add).
         let (addend_i, addend_pt, sel) = match (d1, d2) {
             (0, 0) => continue,
             (1, 0) => (p1_i.clone(), p1.clone(), JointSel::AddP1),
@@ -937,4 +985,105 @@ pub fn lincomb2_witness(
         y_t0_pow: to_le_32(&tpow_aff.y),
         steps,
     })
+}
+
+// =========================================================================
+// Non-degeneracy witness for the joint chain
+// =========================================================================
+//
+// `D_INV·(xB − xA) ≡ 1 (mod p)` is the ECDAS2 relation that makes an addition
+// provably a genuine chord. It is not part of the data `lincomb2_witness`
+// returns — the schedule above never needs the inverse, because it *refuses*
+// every input whose chain would add a point to itself (`ResultInfinity`). The
+// chip needs it anyway, since a malicious prover's row never passes through this
+// generator.
+//
+// It lives here rather than in the prover so that all of this limb arithmetic
+// has exactly one home. A second copy of `ext64`/`conv`/`limb_carries` in a chip
+// would be the classic silent divergence: one side gets edited, the other does
+// not, and nothing notices until a proof is wrong.
+
+/// The `D_INV·(xB − xA) ≡ 1 (mod p)` columns of one joint-chain row.
+#[derive(Debug, Clone)]
+pub struct DinvWitness {
+    /// `(xB − xA)^{-1} mod p`, little-endian.
+    pub d_inv: [u8; 32],
+    /// Shifted quotient of the relation, `r + numerator/p` with `r = 3p`.
+    pub q3: [u8; 33],
+    /// The 64 limb carries.
+    pub c3: [i64; 64],
+}
+
+impl DinvWitness {
+    /// The shape a row that consumes no addend carries.
+    ///
+    /// The chip gates the relation by `S1 + S2 + S3 + S_CORR`, so on a doubling
+    /// only the `μ·R·P − q3·P` term survives — and it closes at zero carries
+    /// exactly when `q3 = r = 3p`. (An all-zero padding row closes the same term
+    /// at `q3 = 0`, because `μ = 0` kills `R·P` too.)
+    pub fn gated_off() -> Self {
+        Self {
+            d_inv: [0; 32],
+            q3: R_BYTES,
+            c3: [0; 64],
+        }
+    }
+}
+
+/// Builds the non-degeneracy columns for one joint-chain row.
+///
+/// Returns [`DinvWitness::gated_off`] for a doubling (no addend to check) and
+/// also for a *degenerate* add, where `xB ≡ xA (mod p)` and no inverse exists:
+/// no assignment satisfies the relation there, so the right behaviour is to let
+/// the proof fail rather than to panic on prover-supplied data. The honest
+/// schedule never produces such a row.
+///
+/// Both `xB` and `xA` are reduced mod `p` before the difference is taken, so a
+/// non-canonical *encoding* of an equal field element is treated as the
+/// degeneracy it is.
+pub fn dinv_witness(step: &JointStep) -> DinvWitness {
+    if step.sel == JointSel::Double {
+        return DinvWitness::gated_off();
+    }
+
+    let s = &step.step;
+    let p_big = p();
+    let xa = BigUint::from_bytes_le(&s.x_a);
+    let xb = BigUint::from_bytes_le(&s.x_g);
+    let delta = ((&xb % &p_big) + &p_big - (&xa % &p_big)) % &p_big;
+    if delta.is_zero() {
+        return DinvWitness::gated_off();
+    }
+    let d_inv = delta.modpow(&(&p_big - 2u32), &p_big);
+
+    // numerator = d_inv·(xB − xA) − 1, over the RAW limb values: the identity the
+    // chip proves is limb-wise, and raw ≡ canonical (mod p) makes it the same
+    // statement either way.
+    let p_int = BigInt::from(p_big);
+    let numerator =
+        BigInt::from(d_inv.clone()) * (BigInt::from(xb) - BigInt::from(xa)) - BigInt::from(1u32);
+    let r_int = BigInt::from(BigUint::from_bytes_le(&R_BYTES));
+    let q3 = shifted_quotient("d_inv", &numerator, &p_int, &r_int);
+    let q3 = to_le_33("d_inv", &q3);
+
+    let d_inv = to_le_32(&d_inv);
+    let (d_e, xb_e, xa_e) = (ext64(&d_inv), ext64(&s.x_g), ext64(&s.x_a));
+    let (q3_e, r_e, p_e) = (ext64(&q3), ext64(&R_BYTES), ext64(&P_BYTES));
+    let mut terms = [0i128; 64];
+    for (i, slot) in terms.iter_mut().enumerate() {
+        let mut t = 0i128;
+        for j in 0..=i {
+            t += d_e[j] * (xb_e[i - j] - xa_e[i - j]);
+        }
+        if i == 0 {
+            t -= 1;
+        }
+        *slot = t + conv(&r_e, &p_e, i) - conv(&q3_e, &p_e, i);
+    }
+
+    DinvWitness {
+        d_inv,
+        q3,
+        c3: limb_carries("d_inv", &terms),
+    }
 }

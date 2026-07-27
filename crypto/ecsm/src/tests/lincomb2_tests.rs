@@ -8,12 +8,15 @@
 //!     time if any quotient/carry is wrong).
 //!  3. the NUMS blind cancels: the pre-correction accumulator equals
 //!     `Q + 2^len·T₀`, and the correction row lands on `Q`.
+//!  4. the joint schedule is self-consistent: `nb` really is the "an add
+//!     follows" bit, and the round recurrence `round − 1 + nb` walks the chain
+//!     from `len − 1` down to the drain sentinel `−1` (`check_nb_schedule`).
 
 use num_bigint::BigUint;
 
 use crate::curve::AffinePoint;
 use crate::tests::reference::{point_add, point_double, step_lambda};
-use crate::witness::{JointSel, Lincomb2Error, lincomb2_witness, t0};
+use crate::witness::{JointSel, Lincomb2Error, Lincomb2Witness, lincomb2_witness, t0};
 use crate::{n, p};
 
 use k256::elliptic_curve::ff::PrimeField as _;
@@ -105,6 +108,142 @@ fn le32(v: &BigUint) -> [u8; 32] {
     crate::to_le_32(v)
 }
 
+/// The joint-schedule invariants the ECDAS′ chip will constrain, checked at the
+/// source.
+///
+/// `nb` is the only thing pinning a double row's successor round — the doubling
+/// and its optional add share a round, so `round − 1 + nb` is not derivable from
+/// the other columns. A prover who could stall `round` would insert or drop
+/// doublings while every per-row relation still held, so a failure here is a
+/// soundness hole in whatever chip consumes this witness, not a cosmetic bug.
+fn check_nb_schedule(w: &Lincomb2Witness, u1: &BigUint, u2: &BigUint) {
+    let steps = &w.steps;
+    assert!(
+        steps.len() >= 3,
+        "chain must be precompute + at least one round + correction"
+    );
+
+    // Row-local facts that hold everywhere, boundary rows included. These are
+    // exactly the two constraints the chip needs to define `nb`:
+    //     OP · NB = 0                                  (degree 2)
+    //     (1 − OP) · (NB − D1 − D2 + D1·D2) = 0        (degree 3)
+    // Note the second is op-gated: an ADD row carries its round's digits (it
+    // needs them to select the addend) but `nb = 0`, because the row after an
+    // add is always the next round's double.
+    for (i, js) in steps.iter().enumerate() {
+        assert!(js.d1 <= 1 && js.d2 <= 1, "row {i}: digits are not bits");
+        assert!(js.nb <= 1, "row {i}: nb is not a bit");
+        assert!(js.step.op <= 1, "row {i}: op is not a bit");
+        // `nb` is mirrored into the EcdasStep slot so a chip may read either.
+        assert_eq!(js.nb, js.step.next_op, "row {i}: nb != step.next_op");
+        // an add is never followed by an add (today's ECDAS `OP · NEXT_OP = 0`)
+        assert_eq!(js.step.op * js.nb, 0, "row {i}: op*nb != 0");
+        // on a double, `nb` is the OR of the digits, in the degree-2 form
+        if js.step.op == 0 {
+            assert_eq!(
+                js.nb,
+                js.d1 + js.d2 - js.d1 * js.d2,
+                "row {i}: double's nb != d1 + d2 - d1*d2"
+            );
+        }
+    }
+
+    // The two rows that sit off the accumulator line carry no digit.
+    let first = &steps[0];
+    assert_eq!(
+        first.sel,
+        JointSel::Precompute,
+        "row 0 must be the precompute"
+    );
+    assert_eq!(
+        (first.d1, first.d2, first.nb),
+        (0, 0, 0),
+        "precompute row must be digit-free"
+    );
+    let last = steps.last().expect("non-empty");
+    assert_eq!(
+        last.sel,
+        JointSel::Correction,
+        "last row must be the correction"
+    );
+    assert_eq!(
+        (last.d1, last.d2, last.nb),
+        (0, 0, 0),
+        "correction row must be digit-free"
+    );
+
+    // Walk the main chain: round starts at len-1 and each row steps it by
+    // `-1 + nb`, draining at the sentinel -1.
+    let main = &steps[1..steps.len() - 1];
+    let mut expected_round = w.len as i32 - 1;
+    for (i, js) in main.iter().enumerate() {
+        assert_eq!(
+            js.step.round as i32, expected_round,
+            "main row {i}: round drifted from the recurrence"
+        );
+        let round = expected_round as u64;
+
+        // Both row kinds carry this round's true digits (the double needs them
+        // for `nb` and its per-stream Bit sends, the add to pick the addend).
+        assert_eq!(
+            js.d1,
+            u1.bit(round) as u8,
+            "row {i} (round {round}): d1 != u1 bit"
+        );
+        assert_eq!(
+            js.d2,
+            u2.bit(round) as u8,
+            "row {i} (round {round}): d2 != u2 bit"
+        );
+
+        match js.sel {
+            JointSel::Double => assert_eq!(js.step.op, 0),
+            JointSel::AddP1 | JointSel::AddP2 | JointSel::AddP12 => {
+                assert_eq!(js.step.op, 1);
+                // the addend is a function of the digits
+                let want = match (js.d1, js.d2) {
+                    (1, 0) => JointSel::AddP1,
+                    (0, 1) => JointSel::AddP2,
+                    (1, 1) => JointSel::AddP12,
+                    _ => panic!("add row at round {round} with a zero joint digit"),
+                };
+                assert_eq!(js.sel, want, "row {i} (round {round}): sel != f(d1, d2)");
+                assert_eq!(js.nb, 0, "an add row must not claim a pending add");
+            }
+            other => panic!("main row {i} carries boundary selector {other:?}"),
+        }
+
+        // `nb == 1` exactly when the next emitted row is this round's add.
+        match main.get(i + 1) {
+            Some(next) if js.nb == 1 => {
+                assert_eq!(
+                    next.step.op, 1,
+                    "row {i}: nb=1 but the next row is not an add"
+                );
+                assert_eq!(
+                    next.step.round, js.step.round,
+                    "row {i}: the add must share the double's round"
+                );
+            }
+            Some(next) => {
+                assert_eq!(next.step.op, 0, "row {i}: nb=0 but the next row is an add");
+                assert_eq!(
+                    next.step.round as i32,
+                    js.step.round as i32 - 1,
+                    "row {i}: nb=0 must step the round down by one"
+                );
+            }
+            None => assert_eq!(js.nb, 0, "the last main row cannot have a pending add"),
+        }
+
+        expected_round = expected_round - 1 + js.nb as i32;
+    }
+    assert_eq!(
+        expected_round, -1,
+        "main chain must drain at the sentinel round -1"
+    );
+}
+
 /// The full validation battery for one input tuple. Returns the row count.
 fn validate(u1: &BigUint, p1: &AffinePoint, u2: &BigUint, p2: &AffinePoint) -> usize {
     let w = lincomb2_witness(&le32(u1), &le32(u2), p1, p2).expect("witness");
@@ -163,6 +302,9 @@ fn validate(u1: &BigUint, p1: &AffinePoint, u2: &BigUint, p2: &AffinePoint) -> u
     let acc_before = pt(&corr.step.x_a, &corr.step.y_a);
     assert_eq!(acc_before, point_add(&q, &t), "acc_before != Q + 2^len·T0");
 
+    // 4. the joint schedule is self-consistent.
+    check_nb_schedule(&w, u1, u2);
+
     // rows = P12-precompute + doublings + adds + correction.
     assert_eq!(n_dbl, w.len as usize, "doubling count != len");
     2 + n_dbl + n_add
@@ -205,6 +347,46 @@ fn lincomb2_random_matches_references() {
         rows_max,
         CASES
     );
+}
+
+/// The whole emitted schedule for a hand-checkable digit pattern, spelled out
+/// row by row. `check_nb_schedule` proves the recurrence is *self*-consistent
+/// over the random corpus; this pins what the recurrence actually produces, so
+/// a change of convention (say, moving the digits onto the add row only, or
+/// decrementing the round on the double) fails here loudly instead of silently
+/// re-balancing.
+///
+/// `u1 = 0b1010`, `u2 = 0b0011`, so `len = 4` and the four rounds carry joint
+/// digits `(1,0) (0,0) (1,1) (0,1)` — every addend selector plus one round with
+/// no add at all.
+#[test]
+fn nb_schedule_matches_hand_worked_example() {
+    let g = generator();
+    let r = ref_scalar_mul(&scalar(42), &g);
+    let (u1, u2) = (BigUint::from(0b1010u32), BigUint::from(0b0011u32));
+
+    let w = lincomb2_witness(&le32(&u1), &le32(&u2), &g, &r).expect("witness");
+    assert_eq!(w.len, 4, "len = max(bits(u1), bits(u2))");
+    check_nb_schedule(&w, &u1, &u2);
+
+    // (sel, round, nb, d1, d2)
+    let expected = [
+        (JointSel::Precompute, 0u8, 0u8, 0u8, 0u8),
+        (JointSel::Double, 3, 1, 1, 0),
+        (JointSel::AddP1, 3, 0, 1, 0),
+        (JointSel::Double, 2, 0, 0, 0),
+        (JointSel::Double, 1, 1, 1, 1),
+        (JointSel::AddP12, 1, 0, 1, 1),
+        (JointSel::Double, 0, 1, 0, 1),
+        (JointSel::AddP2, 0, 0, 0, 1),
+        (JointSel::Correction, 0, 0, 0, 0),
+    ];
+    let got: Vec<_> = w
+        .steps
+        .iter()
+        .map(|js| (js.sel, js.step.round, js.nb, js.d1, js.d2))
+        .collect();
+    assert_eq!(got, expected.to_vec(), "joint schedule changed");
 }
 
 #[test]
