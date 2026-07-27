@@ -1826,18 +1826,6 @@ where
     Some(dw)
 }
 
-/// D2H bridge for the FRI fallback: download a resident codeword (already in
-/// FRI order) as field elements ready for `commit_phase_from_evaluations`.
-pub(crate) fn download_deep_fri_ordered<E: IsField + 'static>(
-    dw: &math_cuda::deep::GpuDeepCodeword,
-) -> Option<Vec<FieldElement<E>>> {
-    if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
-        return None;
-    }
-    let raw = math_cuda::deep::download_deep_codeword(dw).ok()?;
-    Some(u64_to_ext3_vec::<E>(&raw))
-}
-
 /// Build `inv_denoms[k*n + i] = 1 / (lift(coset_base[i]) - z_scalars[k])`
 /// entirely on device. Used by both R3 OOD (n = trace_size, k_scalars =
 /// num_eval_points) and R4 DEEP (n = lde_size, k_scalars = 1 +
@@ -2130,6 +2118,7 @@ where
 
 /// [`try_fri_commit_gpu`] entered from a device-resident DEEP codeword
 /// (already in FRI order): no evals H2D at all.
+#[allow(clippy::type_complexity)]
 pub(crate) fn try_fri_commit_gpu_from_dev<F, E, T>(
     codeword: math_cuda::deep::GpuDeepCodeword,
     transcript: &mut T,
@@ -2182,6 +2171,7 @@ where
 /// layer sample ζ, fold + commit on device, D2H root/evals; then the terminal
 /// fold and CPU coefficient extraction. Restores the transcript and returns
 /// `None` on any mid-loop cudarc failure so the CPU path reruns cleanly.
+#[allow(clippy::type_complexity)]
 fn fri_commit_gpu_drive<F, E, T>(
     mut state: math_cuda::fri::FriCommitState,
     transcript: &mut T,

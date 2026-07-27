@@ -374,20 +374,6 @@ pub fn deep_composition_ext3_fully_resident_keep(
     })
 }
 
-/// D2H a resident codeword (the CPU-FRI fallback bridge).
-pub fn download_deep_codeword(dw: &GpuDeepCodeword) -> Result<Vec<u64>> {
-    let be = backend()?;
-    let pending = crate::device::async_dtoh_via(
-        &dw.stream,
-        be.pinned_staging(),
-        &be.ctx,
-        &dw.buf,
-        dw.n * 3,
-    )?;
-    let mut out = vec![0u64; dw.n * 3];
-    pending.wait_into_u64(&mut out)?;
-    Ok(out)
-}
 
 #[allow(clippy::too_many_arguments)]
 fn deep_composition_ext3_impl(
