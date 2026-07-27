@@ -113,22 +113,20 @@ fn store_u256_le(memory: &mut Memory, addr: u64, bytes: &[u8; 32]) -> Result<(),
 
 /// BENCH ONLY. Compute a non-constraining hint (modular inverse / sqrt) with the
 /// same k256 arithmetic the guest verifies against. Input/output are 32-byte
-/// little-endian (matching the ECSM ABI). On any failure (non-canonical input,
-/// no inverse/sqrt) returns zeros; the guest's verify then fails loudly.
+/// big-endian, k256's own serialization — unlike the ECSM ABI, which is
+/// little-endian because its chip consumes little-endian limbs. The HINT table
+/// only copies these bytes into memory writes, so the order is free to match the
+/// consumers. On any failure (non-canonical input, no inverse/sqrt) returns zeros;
+/// the guest's verify then fails loudly.
 ///
 /// `pub` so the prover's `collect_hint_ops` can reproduce the exact output value
 /// the executor wrote to guest memory (the value is not carried in the CPU log).
-pub fn compute_hint(hint_id: u64, in_le: &[u8; 32]) -> [u8; 32] {
+pub fn compute_hint(hint_id: u64, in_be: &[u8; 32]) -> [u8; 32] {
     use k256::elliptic_curve::PrimeField;
-    // k256 serialization is big-endian; the ABI is little-endian.
-    let mut be = [0u8; 32];
-    for i in 0..32 {
-        be[i] = in_le[31 - i];
-    }
     let mut fb = k256::FieldBytes::default();
-    fb.copy_from_slice(&be);
+    fb.copy_from_slice(in_be);
 
-    let out_be: [u8; 32] = match hint_id {
+    match hint_id {
         HINT_FIELD_INV => {
             let x: Option<k256::FieldElement> = Option::from(k256::FieldElement::from_bytes(&fb));
             match x.and_then(|x| Option::<k256::FieldElement>::from(x.invert())) {
@@ -151,13 +149,7 @@ pub fn compute_hint(hint_id: u64, in_le: &[u8; 32]) -> [u8; 32] {
             }
         }
         _ => [0u8; 32],
-    };
-
-    let mut out_le = [0u8; 32];
-    for i in 0..32 {
-        out_le[i] = out_be[31 - i];
     }
-    out_le
 }
 
 /// Checks the ECSM address-alignment assumption: `(addr mod 2^32) + max_offset < 2^32`.
@@ -524,7 +516,9 @@ impl Instruction {
                     SyscallNumbers::Hint => {
                         // BENCH ONLY. Non-constraining hint: host computes a modular
                         // inverse/sqrt and writes it to the guest, which verifies it.
-                        // a0 = hint_id, a1 = input addr (32-byte LE), a2 = output addr.
+                        // a0 = hint_id, a1 = input addr (32-byte BE), a2 = output addr.
+                        // The `_le` helpers only move bytes in address order, which is
+                        // what a raw big-endian buffer needs.
                         let hint_id = registers.read(10)?;
                         let in_addr = registers.read(11)?;
                         let out_addr = registers.read(12)?;
