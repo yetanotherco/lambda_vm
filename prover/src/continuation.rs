@@ -1133,6 +1133,11 @@ pub fn prove_continuation(
     let results: std::sync::Mutex<Vec<EpochResult>> = std::sync::Mutex::new(Vec::new());
     let first_err: std::sync::Mutex<Option<Error>> = std::sync::Mutex::new(None);
     let decode_artifacts_ref = &decode_artifacts;
+    let first_err_ref = &first_err;
+    // On error the workers DRAIN the channel (discarding items) instead of
+    // returning: the senders are bounded and can only unblock via a recv, so
+    // an early return would leave a builder parked in `send` forever and the
+    // scope would never join. Draining ends when every sender is dropped.
     let prove_worker = |_worker: usize| {
         loop {
             // Take the next prepared epoch (lock released before proving).
@@ -1141,12 +1146,12 @@ pub fn prove_continuation(
                 Ok(Ok(p)) => p,
                 Ok(Err(e)) => {
                     first_err.lock().unwrap().get_or_insert(e);
-                    return;
+                    continue;
                 }
                 Err(_) => return, // channel closed: no more epochs
             };
             if first_err.lock().unwrap().is_some() {
-                return; // another worker failed; stop consuming
+                continue; // another worker failed; drain and discard
             }
             // Per-epoch identity on Nsight timelines (dynamic NVTX name); the
             // instruments span carries a static label and instances are told
@@ -1173,7 +1178,7 @@ pub fn prove_continuation(
                 Ok(epoch) => results.lock().unwrap().push((prepared.index, epoch)),
                 Err(e) => {
                     first_err.lock().unwrap().get_or_insert(e);
-                    return;
+                    continue; // drain mode (see loop comment)
                 }
             }
         }
@@ -1188,13 +1193,15 @@ pub fn prove_continuation(
                 let job = match msg {
                     Ok(Ok(j)) => j,
                     Ok(Err(e)) => {
+                        // Forward and keep draining (same reason as the prove
+                        // workers: a return would strand the producer's send).
                         let _ = tx.send(Err(e));
-                        return;
+                        continue;
                     }
                     Err(_) => return, // channel closed: no more epochs
                 };
                 if first_err.lock().unwrap().is_some() {
-                    return; // a prover failed; stop building
+                    continue; // a prover failed; drain and discard
                 }
                 #[cfg(feature = "nvtx")]
                 let __nvtx = stark::instruments::nvtx_range_fmt(|| {
@@ -1240,7 +1247,7 @@ pub fn prove_continuation(
                     }
                     Err(e) => {
                         let _ = tx.send(Err(e));
-                        return;
+                        continue; // drain mode
                     }
                 }
             }
@@ -1259,6 +1266,11 @@ pub fn prove_continuation(
                 let mut index: u64 = 0;
                 loop {
                     if executor.pc() == 0 {
+                        return Ok(());
+                    }
+                    // A downstream failure is already propagating: stop
+                    // executing epochs so the pipeline can drain and shut down.
+                    if first_err_ref.lock().unwrap().is_some() {
                         return Ok(());
                     }
                     // The cross-epoch ordering check (IsB20 on `fini_epoch - 1 -
@@ -1399,6 +1411,11 @@ pub fn prove_continuation(
             while let Ok(b) = boundary_rx.recv() {
                 all.push(b);
             }
+            // An epoch already failed: its error wins and the bundle is never
+            // assembled — skip the (whole-prove-sized) global prove.
+            if first_err_ref.lock().unwrap().is_some() {
+                return;
+            }
             let run = || -> Result<GlobalResult, Error> {
                 #[cfg(feature = "instruments")]
                 let __sp = stark::instruments::span("prove_global");
@@ -1429,8 +1446,8 @@ pub fn prove_continuation(
         // assembled, so proof bytes are identical to the sequential schedule.
         //
         // Sizing: each concurrent epoch prove costs its own peak VRAM/heap
-        // (~9 GB VRAM per 2^20-cycle epoch measured on ethrex), so the
-        // default is a conservative 2; tune with LAMBDA_VM_EPOCH_CONCURRENCY.
+        // (~9 GB VRAM per 2^20-cycle epoch measured on ethrex); the default
+        // is 3 (see `workers` above); tune with LAMBDA_VM_EPOCH_CONCURRENCY.
         let prover_handles: Vec<_> = (0..workers)
             .map(|k| scope.spawn(move || prove_worker(k)))
             .collect();
