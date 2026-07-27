@@ -80,15 +80,15 @@ impl Crypto for LambdaVmEcsmCrypto {
 /// We compute the recovery directly rather than calling k256's
 /// `recover_from_prehash`, which internally runs a *second* lincomb to
 /// re-verify the key — doubling the ECSM ecalls for no gain here.
-/// Obtain a 32-byte little-endian hint for `x_le` via the executor `hint` ecall
+/// Obtain a 32-byte big-endian hint for `x_be` via the executor `hint` ecall
 /// (the host computes the modular inverse / sqrt; the value is provable via the
 /// prover's HINT table). The result is UNVERIFIED — every caller MUST check it
 /// in-guest (`x·inv == 1`, `y² == x³+7`), since the ecall adds no correctness
 /// constraint. BENCH scaffolding.
 #[cfg(target_arch = "riscv64")]
-fn get_hint(hint_id: usize, x_le: &[u8; 32]) -> [u8; 32] {
+fn get_hint(hint_id: usize, x_be: &[u8; 32]) -> [u8; 32] {
     let mut out = [0u8; 32];
-    lambda_vm_syscalls::syscalls::hint(hint_id, &mut out, x_le);
+    lambda_vm_syscalls::syscalls::hint(hint_id, &mut out, x_be);
     out
 }
 
@@ -99,17 +99,9 @@ fn scalar_inv(x: &Scalar) -> Option<Scalar> {
     #[cfg(target_arch = "riscv64")]
     {
         use k256::elliptic_curve::subtle::ConstantTimeEq;
-        let x_be = x.to_bytes();
-        let mut x_le = [0u8; 32];
-        for i in 0..32 {
-            x_le[i] = x_be[31 - i];
-        }
-        let inv_le = get_hint(lambda_vm_syscalls::syscalls::HINT_SCALAR_INV, &x_le);
-        let mut inv_be = k256::FieldBytes::default();
-        for i in 0..32 {
-            inv_be[i] = inv_le[31 - i];
-        }
-        let inv: Scalar = Option::from(Scalar::from_repr(inv_be))?;
+        let x_be: [u8; 32] = x.to_bytes().into();
+        let inv_be = get_hint(lambda_vm_syscalls::syscalls::HINT_SCALAR_INV, &x_be);
+        let inv: Scalar = Option::from(Scalar::from_repr(inv_be.into()))?;
         // Verify the untrusted hint: x·inv must equal 1 (mod n).
         if bool::from((*x * inv).ct_eq(&Scalar::ONE)) {
             Some(inv)
@@ -136,17 +128,9 @@ fn decompress_r(r_bytes: &FieldBytes, y_is_odd: bool) -> Option<AffinePoint> {
         let seven: FieldElement = Option::from(FieldElement::from_bytes(&seven_bytes.into()))?;
         let x3: FieldElement = x.square() * x;
         let rhs: FieldElement = x3 + seven;
-        // Hinted sqrt (LE in/out), then verify y² == rhs canonically.
-        let rhs_be = rhs.to_bytes();
-        let mut rhs_le = [0u8; 32];
-        for i in 0..32 {
-            rhs_le[i] = rhs_be[31 - i];
-        }
-        let y_le = get_hint(lambda_vm_syscalls::syscalls::HINT_FIELD_SQRT, &rhs_le);
-        let mut y_be = [0u8; 32];
-        for i in 0..32 {
-            y_be[i] = y_le[31 - i];
-        }
+        // Hinted sqrt (BE in/out), then verify y² == rhs canonically.
+        let rhs_be: [u8; 32] = rhs.to_bytes().into();
+        let y_be = get_hint(lambda_vm_syscalls::syscalls::HINT_FIELD_SQRT, &rhs_be);
         let mut y: FieldElement = Option::from(FieldElement::from_bytes(&y_be.into()))?;
         let y2: FieldElement = y.square();
         if y2.to_bytes() != rhs.to_bytes() {
@@ -291,16 +275,8 @@ fn ecsm_oracle(x: &FieldElement, k: &Scalar) -> Option<FieldElement> {
 fn field_inv(x: &FieldElement) -> Option<FieldElement> {
     #[cfg(target_arch = "riscv64")]
     {
-        let x_be = x.to_bytes();
-        let mut x_le = [0u8; 32];
-        for i in 0..32 {
-            x_le[i] = x_be[31 - i];
-        }
-        let inv_le = get_hint(lambda_vm_syscalls::syscalls::HINT_FIELD_INV, &x_le);
-        let mut inv_be = [0u8; 32];
-        for i in 0..32 {
-            inv_be[i] = inv_le[31 - i];
-        }
+        let x_be: [u8; 32] = x.to_bytes().into();
+        let inv_be = get_hint(lambda_vm_syscalls::syscalls::HINT_FIELD_INV, &x_be);
         let inv: FieldElement = Option::from(FieldElement::from_bytes(&inv_be.into()))?;
         if (*x * inv).to_bytes() == FieldElement::ONE.to_bytes() {
             Some(inv)
