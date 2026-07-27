@@ -1,0 +1,55 @@
+ANCHOR A-ECDSA — Wycheproof ECDSA-verify secp256k1 vs the lincomb2 path (phase D0)
+=================================================================================
+Re-run: from thoughts/ec-recover-opt/oracle/,
+  <venv>/bin/python anchor_a_wycheproof.py ecdsa
+Runtime ~1m25s.  (The bare `anchor_a_wycheproof.py` ECDH anchor is unchanged and
+still reproduces `anchor_a.log` byte-for-byte.)
+
+Why these vectors: ECDSA verification IS the lincomb2 shape —
+    w = s^-1 mod N,  u1 = z*w mod N,  u2 = r*w mod N,
+    Q = u1*G + u2*PK,  accept iff Q != infinity and x(Q) mod N == r.
+Wycheproof's corpus is adversarially constructed, so it reaches (r, s) values a
+random corpus never produces: r = 1, s = 1, r = N-1, s = N-1, u1 = 0, PK = ±G,
+and cases whose lincomb output is the point at infinity.
+
+Sources (C2SP/wycheproof `main`, `testvectors_v1`, vendored next to this oracle):
+  ecdsa_secp256k1_sha256_p1363_test.json   252 tests / 108 keys  (raw r||s)
+  ecdsa_secp256k1_sha256_test.json         476 tests / 109 keys  (ASN.1 DER)
+
+Each parseable vector is evaluated three ways, and all three must agree with
+Wycheproof's own verdict:
+  1. `lincomb2_ref.lincomb2`               (affine, MSB-first)
+  2. `lincomb2_ref.lincomb2_rows`          the NUMS-blinded joint chain the chip proves
+  3. `jacobian_ref.ecdsa_verify`           (Jacobian, LSB-first — independent path)
+Signatures whose encoding cannot be decoded unambiguously (short/long P1363,
+non-canonical DER) are skipped and counted: encoding malleability is not what a
+point-math oracle tests.
+
+--- raw output ---
+
+{
+  "pass": 489,
+  "fail": 0,
+  "skip_encoding": 239,
+  "skip_bad_pubkey": 0,
+  "via_lincomb2": 360,
+  "via_fallback": 129,
+  "valid_accepted": 335,
+  "invalid_rejected": 154,
+  "jacobian_disagree": 0
+}
+evaluation path per test: {"infinity": 10, "lincomb2": 360, "p1-eq-p2-fallback": 4, "range": 115}
+ANCHOR A-ECDSA: PASS (489 verdicts matched Wycheproof: 335 valid accepted, 154 invalid rejected; 360 evaluated through the blinded lincomb2 chain, 239 encoding-level cases skipped)
+
+--- reading the evaluation-path histogram ---
+
+lincomb2 (360)  — u1, u2 both in [1, N) and P1 != ±P2: the precompile's domain.
+                  These went through the blinded joint chain and matched.
+range (115)     — r or s outside [1, N): rejected before any point arithmetic.
+infinity (10)   — Q = u1*G + u2*PK is the point at infinity. This is the
+                  `Lincomb2Error::ResultInfinity` / status != 0 path, and Wycheproof
+                  agrees the signature is invalid. Real coverage of the degenerate
+                  output the status contract exists for.
+p1-eq-p2-fallback (4) — PK = ±G, so the P12 = P1 + P2 precompute is degenerate:
+                  `Lincomb2Error::SumDegenerate` / status != 0, software fallback.
+                  Also real coverage of a status-contract path.

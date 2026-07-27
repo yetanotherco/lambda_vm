@@ -8,7 +8,14 @@
 //!   replay <x_hex> <k_hex>     -> steps <n> <final_x> <final_y>
 //!                                 then n lines: step <round> <op> <next_op> <ax> <ay> <lambda> <rx> <ry>
 //!                                 (rejects via prepare-equivalent checks first: err <ErrorKind>)
+//!   lincomb2 <u1> <u2> <x1> <y1> <x2> <y2>
+//!                              -> lincomb2_json {...}  | err <Lincomb2Error>
+//!                                 Full `Lincomb2Witness` summary: Q, len, P12, the
+//!                                 canonicalization witnesses, and every joint row
+//!                                 (sel/round/op/d1/d2/a/addend/lambda/r). Consumed by
+//!                                 the phase-D0 Python differential.
 
+use ecsm::witness::{dinv_witness, lincomb2_witness, JointSel};
 use ecsm::{
     compute_witness, recover_y_canonical, replay_double_and_add, scalar_mul_x, AffinePoint,
     EcsmError,
@@ -41,6 +48,23 @@ fn hex_to_big(h: &str) -> BigUint {
 
 fn hx(v: &BigUint) -> String {
     v.to_str_radix(16)
+}
+
+/// 32 LE bytes -> big-endian hex integer, so the Python side can compare against
+/// plain ints without knowing the ABI byte order.
+fn le_hex(b: &[u8; 32]) -> String {
+    hx(&BigUint::from_bytes_le(b))
+}
+
+fn sel_name(s: &JointSel) -> &'static str {
+    match s {
+        JointSel::Double => "Double",
+        JointSel::AddP1 => "AddP1",
+        JointSel::AddP2 => "AddP2",
+        JointSel::AddP12 => "AddP12",
+        JointSel::Precompute => "Precompute",
+        JointSel::Correction => "Correction",
+    }
 }
 
 fn err_kind(e: &EcsmError) -> &'static str {
@@ -177,6 +201,87 @@ fn main() {
                         writeln!(out, "witness_json {s}").unwrap();
                     }
                     Err(e) => writeln!(out, "err {}", err_kind(&e)).unwrap(),
+                }
+            }
+            // lincomb2 <u1> <u2> <x1> <y1> <x2> <y2>: the phase-A joint-chain
+            // witness, dumped for the Python differential (Q, len, P12, the
+            // canonicalization witnesses, and the full row schedule).
+            "lincomb2" => {
+                let u1 = hex_to_le32(parts[1]);
+                let u2 = hex_to_le32(parts[2]);
+                let p1 = AffinePoint {
+                    x: hex_to_big(parts[3]),
+                    y: hex_to_big(parts[4]),
+                };
+                let p2 = AffinePoint {
+                    x: hex_to_big(parts[5]),
+                    y: hex_to_big(parts[6]),
+                };
+                match lincomb2_witness(&u1, &u2, &p1, &p2) {
+                    Ok(w) => {
+                        let mut s = String::from("{");
+                        s += &format!("\"len\":{},", w.len);
+                        s += &format!("\"x_q\":\"{}\",", le_hex(&w.x_q));
+                        s += &format!("\"y_q\":\"{}\",", le_hex(&w.y_q));
+                        s += &format!("\"x_p12\":\"{}\",", le_hex(&w.x_p12));
+                        s += &format!("\"y_p12\":\"{}\",", le_hex(&w.y_p12));
+                        s += &format!("\"x_t0\":\"{}\",", le_hex(&w.x_t0));
+                        s += &format!("\"y_t0\":\"{}\",", le_hex(&w.y_t0));
+                        s += &format!("\"x_t0_pow\":\"{}\",", le_hex(&w.x_t0_pow));
+                        s += &format!("\"y_t0_pow\":\"{}\",", le_hex(&w.y_t0_pow));
+                        s += &format!("\"y_p2_sub_p\":\"{}\",", le_hex(&w.y_p2_sub_p));
+                        s += &format!("\"x_q_sub_p\":\"{}\",", le_hex(&w.x_q_sub_p));
+                        s += &format!("\"y_q_sub_p\":\"{}\",", le_hex(&w.y_q_sub_p));
+                        s += &format!("\"u1_sub_n\":\"{}\",", le_hex(&w.u1_sub_n));
+                        s += &format!("\"u2_sub_n\":\"{}\",", le_hex(&w.u2_sub_n));
+                        s += "\"rows\":[";
+                        let rows: Vec<String> = w
+                            .steps
+                            .iter()
+                            .map(|js| {
+                                let st = &js.step;
+                                // The prover's OWN non-degeneracy columns, now
+                                // that `dinv_witness` lives in `crypto/ecsm`.
+                                let dw = dinv_witness(js);
+                                format!(
+                                    "{{\"sel\":\"{}\",\"round\":{},\"op\":{},\"d1\":{},\"d2\":{},\
+                                     \"nb\":{},\"next_op\":{},\
+                                     \"x_a\":\"{}\",\"y_a\":\"{}\",\"x_b\":\"{}\",\"y_b\":\"{}\",\
+                                     \"q0\":\"{}\",\"q1\":\"{}\",\"q2\":\"{}\",\
+                                     \"c0\":{},\"c1\":{},\"c2\":{},\
+                                     \"d_inv\":\"{}\",\"q3\":\"{}\",\"c3\":{},\
+                                     \"lambda\":\"{}\",\"x_r\":\"{}\",\"y_r\":\"{}\"}}",
+                                    sel_name(&js.sel),
+                                    st.round,
+                                    st.op,
+                                    js.d1,
+                                    js.d2,
+                                    js.nb,
+                                    st.next_op,
+                                    le_hex(&st.x_a),
+                                    le_hex(&st.y_a),
+                                    le_hex(&st.x_g),
+                                    le_hex(&st.y_g),
+                                    bytes_hex(&st.q0),
+                                    bytes_hex(&st.q1),
+                                    bytes_hex(&st.q2),
+                                    i64s_json(&st.c0),
+                                    i64s_json(&st.c1),
+                                    i64s_json(&st.c2),
+                                    bytes_hex(&dw.d_inv),
+                                    bytes_hex(&dw.q3),
+                                    i64s_json(&dw.c3),
+                                    le_hex(&st.lambda),
+                                    le_hex(&st.x_r),
+                                    le_hex(&st.y_r)
+                                )
+                            })
+                            .collect();
+                        s += &rows.join(",");
+                        s += "]}";
+                        writeln!(out, "lincomb2_json {s}").unwrap();
+                    }
+                    Err(e) => writeln!(out, "err {e:?}").unwrap(),
                 }
             }
             other => panic!("unknown command {other}"),

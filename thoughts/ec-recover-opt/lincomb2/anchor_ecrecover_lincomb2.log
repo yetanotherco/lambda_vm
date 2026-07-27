@@ -1,0 +1,34 @@
+BONUS 3 — the 40-signature ecrecover differential, re-run through lincomb2 (phase D0)
+====================================================================================
+Re-run: from thoughts/ec-recover-opt/oracle/,
+  <venv>/bin/python bonus_ecrecover.py
+Runtime ~1m15s.
+
+`bonus_ecrecover.py` gained a `part3`. Part 1 (unchanged) signs 40 messages with the
+`ecdsa` PyPI package (RFC 6979 deterministic), recovers the key with `ec_ref.ecrecover`,
+and cross-checks against the library's own recovery. It now hands that corpus to
+part 3, so part 3 runs on literally the same 40 signatures — not a regenerated set.
+
+Part 3 redoes the recovery through the lincomb2 path exactly as the guest will:
+lift R from (r, parity v), u1 = -z/r mod N, u2 = s/r mod N, then compute
+pk = u1*G + u2*R via
+  - `lincomb2_ref.lincomb2`        (affine reference),
+  - `jacobian_ref.lincomb2`        (independent Jacobian/LSB-first implementation),
+  - `lincomb2_ref.lincomb2_rows`   (the NUMS-blinded joint chain the chip proves),
+and requires all three to equal the signer's actual public key.
+
+Parts 1 and 2 reproduce their previously committed values (`../oracle/bonus.log`)
+byte-for-byte; part 3 is the new line.
+
+--- raw output ---
+
+BONUS 1 (ecrecover 3-way, 40 sigs): PASS (0 failures)
+BONUS 2 (parity-authority identity, 200 cases): PASS (0 failures)
+BONUS 3 (ecrecover via lincomb2, 40 sigs): PASS (0 failures; 40 recovered through the NUMS-blinded joint chain)
+  chain rows: mean 449.4 min 434 max 469
+
+--- note ---
+
+Chain rows mean 449.4 on real RFC-6979 signatures, against the layout lock's measured
+mean of 449.1 (Rust) / 449.7 (Python, random scalars). Real ecrecover traffic sits
+exactly on the modelled mean; the cost verdict does not move.

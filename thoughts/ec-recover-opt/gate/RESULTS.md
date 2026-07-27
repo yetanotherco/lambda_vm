@@ -1,5 +1,11 @@
 # ECSM/ECDAS z3 gate — lemma board & soundness theorem
 
+> **PHASE E (lincomb2 / ECSM2 / ECDAS2) is a SEPARATE BOARD — see
+> [`RESULTS-lincomb2.md`](RESULTS-lincomb2.md).** The board below verifies the
+> ORIGINAL single-scalar chips (`ecsm.rs` / `ecdas.rs`), which remain in the tree
+> and are unaffected by the joint-chain work. Phase E found and closed two real
+> forgeries in the new chips; neither touches these lemmas.
+
 > **Post-gate rewrite (feat/ec-arebytes-pairing):** the single-byte AreBytes
 > sends were paired ([b,0]×2 → [b_even,b_odd]; ECDAS 388→290, ECSM 579→515
 > interactions/row). The theorem below is unaffected — every lemma consumes the

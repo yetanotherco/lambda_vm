@@ -6,16 +6,37 @@
    VerifyingKey.from_public_key_recovery_with_digest (an independent
    ecrecover implementation). 3-way agreement on 40 signatures.
 
-2. Numeric validation of the lambda-linear y-recovery identity used by
-   crypto/ethrex-crypto/src/lib.rs::solve_y (the guest-side x-only
-   reconstruction):
-       t = xc + xa + xp,  dx = xa - xp
-       lambda = (xa^3 - xp^3 - t*dx^2) / (2*yp*dx),   lambda^2 == t
-       ya = yp + lambda*dx
-   On 200 random (P, k): the reconstructed ya must equal the true y(k*P),
-   and the identity must NOT hold for the wrong sign (checked via the
-   lambda^2 == t consistency check on x((k-1)P) chord), mirroring the
-   guard's rationale.
+2. The PARITY-AUTHORITY identity, on 200 random signature r-values.
+
+   RE-AIMED 2026-07-24. This slot used to validate the lambda-linear
+   y-recovery identity of `crypto/ethrex-crypto/src/lib.rs::solve_y`. Phase G
+   deleted `solve_y` along with the whole x-only reconstruction path, so that
+   check became a GREEN TEST OF CODE THAT NO LONGER EXISTS — worse than no
+   test, because it implies coverage that is not there.
+
+   What it pins now is a property of the CURRENT path, and one that two live
+   claims rest on but nothing else executes:
+
+     - the spec chapter's "the guest is the parity authority, backed by MEMW;
+       the chip's obligations are membership and canonicalisation only", and
+     - the z3 gate's N7 result, that dropping `yP2 < p` is REDUNDANT rather
+       than a forgery.
+
+   Both reduce to: a `< p` range check cannot separate a point from its
+   negation, because both candidate y values are already below p. Part 2 now
+   asserts that numerically, together with the recid convention itself
+   (`y_is_odd = recid & 1`, lib.rs:104-106) and the fact that the recid bit
+   really does change the recovered key.
+
+   Do not restore the solve_y version: the code it tested is gone.
+
+3. (phase D0) The SAME 40 signatures, recovered through the LINCOMB2 path:
+   pk = u1*G + u2*R evaluated by `lincomb2_ref.lincomb2`, by the NUMS-blinded
+   joint chain `lincomb2_ref.lincomb2_rows` (what the chip will prove), and by
+   the independent Jacobian implementation `jacobian_ref.lincomb2`. All must
+   equal the signer's key and the `ecdsa` library's recovery. This is the
+   existing 3-way ecrecover differential re-run end-to-end over lincomb2 --
+   part1 hands its corpus to part3, so it is literally the same signatures.
 """
 
 import hashlib
@@ -33,6 +54,7 @@ rng = random.Random(777)
 
 def part1():
     fails = 0
+    corpus = []  # (digest, v, r, s, want_pk) -- handed to part3
     from ecdsa import VerifyingKey
     for i in range(40):
         sk = SigningKey.generate(curve=SECP256k1, entropy=lambda n: rng.randbytes(n))
@@ -56,6 +78,7 @@ def part1():
             fails += 1
             print(f"FAIL roundtrip {i}: neither parity recovers the signer key")
             continue
+        corpus.append((digest, got[0], r, s, want))
 
         # 3-way: python-ecdsa's own recovery must contain the same key
         cands = VerifyingKey.from_public_key_recovery_with_digest(
@@ -74,49 +97,134 @@ def part1():
             fails += 1
             print(f"FAIL candidate-set {i}: ours={ours} lib={lib_pts}")
     print(f"BONUS 1 (ecrecover 3-way, 40 sigs): {'PASS' if fails == 0 else 'FAIL'} ({fails} failures)")
-    return fails
+    return fails, corpus
 
 
 def part2():
+    """The PARITY AUTHORITY identity — see the module docstring for why this
+    replaced the deleted `solve_y` check.
+
+    Four properties per case, all of the CURRENT path:
+      (a) lifting `r` under the guest's convention `y_is_odd = recid & 1`
+          (lib.rs:104-106) gives an on-curve point whose y-parity is exactly
+          that bit;
+      (b) flipping the recid bit yields exactly the negation `(x, p - y)`;
+      (c) the two parities recover DIFFERENT public keys, so the recid bit
+          genuinely determines the answer — parity is load-bearing;
+      (d) BOTH candidate y values are `< p`, so a `< p` canonicalisation test
+          cannot separate a point from its negation.
+
+    (d) is the numeric statement behind the gate's N7 redundancy result and the
+    spec chapter's correction to DESIGN section 3: `yP2 < p` is defence in
+    depth, and parity is pinned by the guest plus MEMW, not by a range check.
+    """
     fails = 0
+    checked = 0
     for i in range(200):
-        # random on-curve P (both parities exercised) and 2 <= k < N-1
+        # a random valid signature r-value, i.e. a curve x-coordinate < N
         while True:
-            xp = rng.randrange(P)
-            yp0 = recover_even_y(xp)
-            if yp0 is not None:
+            r = rng.randrange(1, N)
+            y_even = recover_even_y(r)
+            if y_even is not None:
                 break
-        yp = yp0 if rng.random() < 0.5 else (P - yp0) % P
-        k = rng.randrange(2, N - 1)
+        y_odd = (P - y_even) % P
+        z = rng.randrange(1, N)
+        s = rng.randrange(1, N)
+        checked += 1
 
-        A = scalar_mul(k, (xp, yp))
-        C = scalar_mul(k + 1, (xp, yp))
-        xa, ya_true = A
-        xc = C[0]
-        dx = (xa - xp) % P
-        if dx == 0:
-            continue  # degenerate, guarded in guest code
-        t = (xc + xa + xp) % P
-        lam = ((pow(xa, 3, P) - pow(xp, 3, P) - t * dx * dx) * finv((2 * yp * dx) % P)) % P
-        if (lam * lam) % P != t:
+        # (a) the guest's convention: recid bit 0 selects the y-parity
+        for recid in (0, 1):
+            y = y_odd if (recid & 1) else y_even
+            if y & 1 != (recid & 1):
+                fails += 1
+                print(f"FAIL parity {i}: lifted parity != recid bit (recid={recid})")
+            if (y * y - pow(r, 3, P) - 7) % P != 0:
+                fails += 1
+                print(f"FAIL parity {i}: lifted point off-curve (recid={recid})")
+
+        # (b) the two lifts are exact negations
+        if (y_even + y_odd) % P != 0:
             fails += 1
-            print(f"FAIL identity {i}: lambda^2 != t (k={k:x} xp={xp:x})")
+            print(f"FAIL parity {i}: the two lifts are not negations")
+
+        # (c) parity is load-bearing: the two recids recover different keys
+        pk0 = ecrecover(z.to_bytes(32, "big"), 0, r, s)
+        pk1 = ecrecover(z.to_bytes(32, "big"), 1, r, s)
+        if pk0 is None or pk1 is None:
+            continue  # degenerate (u1 or u2 zero); the guest falls back
+        if pk0 == pk1:
+            fails += 1
+            print(f"FAIL parity {i}: both recids recover the same key")
+
+        # (d) a `< p` test cannot tell them apart
+        if not (y_even < P and y_odd < P):
+            fails += 1
+            print(f"FAIL parity {i}: a candidate y is not below p")
+
+    print(f"BONUS 2 (parity-authority identity, {checked} cases): "
+          f"{'PASS' if fails == 0 else 'FAIL'} ({fails} failures)")
+    return fails
+
+
+def part3(corpus):
+    """The same 40 signatures, recovered through the lincomb2 path."""
+    import jacobian_ref
+    import lincomb2_ref
+
+    T0, _ = lincomb2_ref.t0_ref()
+    fails = 0
+    via_chain = 0
+    rows_seen = []
+    for i, (digest, v, r, s, want) in enumerate(corpus):
+        # Exactly the guest's decomposition (crypto/ethrex-crypto/src/lib.rs):
+        # R lifted from (r, parity v), u1 = -z/r, u2 = s/r (mod N).
+        y_even = recover_even_y(r)
+        if y_even is None:
+            fails += 1
+            print(f"FAIL lincomb2 {i}: r does not lift to a curve point")
             continue
-        ya = (yp + lam * dx) % P
-        if ya != ya_true:
-            fails += 1
-            print(f"FAIL identity {i}: recovered ya wrong (k={k:x})")
+        R = (r, y_even if v == 0 else (P - y_even) % P)
+        z = int.from_bytes(digest, "big") % N
+        rinv = pow(r, N - 2, N)
+        u1 = (-(rinv * z)) % N
+        u2 = (rinv * s) % N
+        if not (1 <= u1 < N and 1 <= u2 < N):
+            print(f"SKIP lincomb2 {i}: u1 or u2 outside [1, N) (software fallback)")
+            continue
 
-        # wrong-sign separation: the chord through (xp, yp) and (xa, -ya)
-        # lands on x((k-1)P), which must differ from xc (k not near edges)
-        Cm = scalar_mul(k - 1, (xp, yp)) if k >= 2 else None
-        if Cm is not None and Cm[0] == xc:
-            # only possible if 2k = 0 or -1 = 1 mod N: impossible here
+        G = (GX, GY)
+        q_ref = lincomb2_ref.lincomb2(u1, G, u2, R)
+        q_jac = jacobian_ref.lincomb2(u1, G, u2, R)
+        if q_ref != want or q_jac != want:
             fails += 1
-            print(f"FAIL separation {i}: x((k-1)P) == x((k+1)P) at k={k:x}")
-    print(f"BONUS 2 (solve_y identity, 200 cases): {'PASS' if fails == 0 else 'FAIL'} ({fails} failures)")
+            print(f"FAIL lincomb2 {i}: pk mismatch ref={q_ref} jac={q_jac} want={want}")
+            continue
+
+        # the NUMS-blinded joint chain -- what the chip proves
+        try:
+            q_chain, length, rows = lincomb2_ref.lincomb2_rows(u1, G, u2, R, T0)
+        except ValueError as e:
+            fails += 1
+            print(f"FAIL lincomb2 {i}: blinded chain rejected ({e})")
+            continue
+        if q_chain != want:
+            fails += 1
+            print(f"FAIL lincomb2 {i}: blinded chain pk != signer key")
+            continue
+        via_chain += 1
+        rows_seen.append(len(rows))
+
+    print(f"BONUS 3 (ecrecover via lincomb2, {len(corpus)} sigs): "
+          f"{'PASS' if fails == 0 else 'FAIL'} ({fails} failures; "
+          f"{via_chain} recovered through the NUMS-blinded joint chain)")
+    if rows_seen:
+        print(f"  chain rows: mean {sum(rows_seen)/len(rows_seen):.1f} "
+              f"min {min(rows_seen)} max {max(rows_seen)}")
     return fails
 
 
 if __name__ == "__main__":
-    raise SystemExit(1 if (part1() + part2()) else 0)
+    f1, corpus = part1()
+    f2 = part2()
+    f3 = part3(corpus)
+    raise SystemExit(1 if (f1 + f2 + f3) else 0)

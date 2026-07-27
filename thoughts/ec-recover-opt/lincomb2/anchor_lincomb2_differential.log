@@ -1,0 +1,57 @@
+ANCHOR L-A / L-B — lincomb2 differential + small-joint-scalar unrollings (phase D0)
+==================================================================================
+Re-run: from thoughts/ec-recover-opt/oracle/,
+  <venv>/bin/python lincomb2_anchors.py        (venv needs the `ecdsa` package)
+Runtime ~3m45s.
+
+Lineages compared (three, no shared code path):
+  A  lincomb2_ref.lincomb2   — affine, MSB-first double-and-add   (ec_ref.py lineage)
+  B  jacobian_ref.lincomb2   — Jacobian (X:Y:Z), inversion-free, LSB-first double-and-add,
+                               infinity representable as Z=0                (NEW, phase D0)
+  C  `ecdsa` PyPI Point arithmetic                              (independent package)
+plus, per case, the NUMS-blinded joint chain `lincomb2_ref.lincomb2_rows` — the exact
+row list `ecsm::lincomb2_witness` emits — must land on the same Q, and every row is
+re-derived from the group law (slope, result, on-curve, telescoping, digit accounting).
+
+--- raw output ---
+
+T0 = (0xaf319aa90f91a86b297de85edb330a665efba79aa98893db1b49070cb1ae7864, 0x1481a038143c0732071db0bcf3b05b8ca2e624fa217d82193f3c254a606277a0)  counter=1
+ANCHOR L-A (3-way lincomb2 differential + blinded-chain row check): PASS (611 cases compared 3 ways, 0 degenerate/skipped, 0 failures)
+  row census: doubles mean 253.8 max 256   adds mean 190.5 max 256
+  total rows: mean 446.3   max 514   min 4
+ANCHOR L-B (small joint scalars u1,u2 in [1,16], 6 point pairs): PASS (1536 pairs enumerated, 0 failures)
+  wrote 1536 vectors (64 with full row values) to lincomb2_small_vectors.json
+PHASE D0 ORACLE: ALL GREEN
+
+--- notes ---
+
+L-A corpus: 600 random (u1, u2) in [1, N) x random on-curve (P1, P2) (P1 = G on every
+third case, both y-parities exercised), plus 11 edge pairs:
+  (1,1) (1,2) (2,1) (3,5) (N-1,N-1) (N-1,1) (1,N-1)
+  (2^255, 2^255-1) (2^255-1, 2^255) (2^128, 2^128+1) ((N-1)/2, (N+1)/2)
+
+L-B ground truth is FULLY ENUMERATED: u*P is computed by u-1 repeated group additions
+(`enumerated_mul`), i.e. the definition of scalar multiplication with no
+double-and-add, no windowing, no recursion. 6 point pairs x 16 x 16 scalars = 1536
+cases. The `G,3G` pair carries an extra algebraic cross-check: u1*G + u2*(3G) must
+equal (u1 + 3*u2)*G, computed independently — 256 of the 1536 cases carry it.
+
+`lincomb2_small_vectors.json` (in oracle/) is the phase-E L7 anchor: all 1536 cases
+with (u1, u2, len, row count, Q, row-role sequence), and full per-row values
+(sel/round/op/d1/d2/a/addend/lambda/r) for the pinned `G,3G` u1,u2<=8 subset.
+
+--- FINDING: worst-case row count is 514, not 471 ---
+
+The row census above reports max 514, against `layout-lock.md`'s "max 471". Both are
+correct; they measure different things. 471/474 is the max over RANDOM scalar pairs
+(re-measured here: 20,000 random pairs give mean 449.7, max 474, min 420 — the layout
+lock's mean 449.1 stands). 514 is the true maximum over the whole valid input domain,
+reached by e.g. (u1, u2) = (2^255, 2^255 - 1), a perfectly ordinary pair of in-range
+scalars:
+
+     1 precompute + 256 doublings + 256 adds + 1 correction = 514 rows
+
+The joint digit is nonzero at every one of the 256 rounds because the two scalars'
+bit patterns are complementary. Any ecrecover input reaching it is cheap for a
+submitter to construct. Rows-per-ecrecover figures used for capacity (not for the
+mean-cost model) should use 514.

@@ -72,15 +72,18 @@ verbatim; L1/L2/L3/L4 of the gate port unchanged).
 | XA,YA | 64 B | accumulator in (from Ecdas bus) |
 | XB,YB | 64 B | addend; from **Addend bus** on adds, `(0,0)` on doubles (cancels — see below) |
 | round | 1 B | |
-| op, s1,s2,s3, d1,d2 | ~6 bit | op=double/add; s* one-hot addend; d1,d2 = the two scalar digit bits (two Bit streams) |
+| op, s1,s2,s3, d1,d2 | ~6 bit | op=double/add; s* one-hot addend; d1,d2 = this round's two scalar digit bits, carried on **both** the double and the add (two Bit streams) |
+| nb | 1 bit | "an add follows me at this round" — pins the successor round `round − 1 + nb`; see correction #2 |
 | XR,YR | 64 B | result out |
 | LAMBDA | 32 B | |
 | Q0,Q1,Q2 | 33×3 B | quotients (reused) |
 | C0,C1,C2 | 64×3 fe | carries (reused) |
 | MU | 1 | |
 
-≈ **525 logic cols** (DESIGN said 525 — confirmed). Interactions ≈ 390 → with
-AreBytes pairing ≈ 292 → ~963 committed cells/row (DESIGN §2 numbers hold).
+≈ **526 logic cols** (525 + `nb`, correction #2). Interactions ≈ 390 → with
+AreBytes pairing ≈ 292 → ~964 committed cells/row; DESIGN §2's cost numbers hold
+to within 0.1%. `CHIP-LAYOUT.md` §2 carries the full map at 529 cols (adds the
+`PHASE`/`NEXT_PHASE` segment split and `S_CORR`) and §5 recomputes the cells.
 
 **Key algebraic fact (verified against the relations, used by the tests):** on a
 DOUBLE row the addend `xg`/`yg` cancels out of all three convolution relations
@@ -111,10 +114,36 @@ Little-endian throughout, mirroring ECSM (`execution.rs:424-456`, `syscalls.rs`)
 1. **Row count** 448 → measured mean 449.1, max 471. Estimate confirmed; the
    ±5% band collapses.
 2. **Schedule is dense-doubling** (one double every round, always), not the
-   skip-ahead variant DESIGN's `nb_or` helper column implied. Simpler: no
-   `nb_or` column; round decreases by exactly 1 per double, the add shares the
-   double's round. The two Bit streams (mult d1, mult d2) do the counting.
-   → the joint row needs ~2 fewer bookkeeping columns than DESIGN sketched.
+   skip-ahead variant DESIGN sketched. The add shares the double's round, and
+   the round decrements only at the loop boundary. The two Bit streams
+   (mult `d1`, mult `d2`) do the per-scalar counting.
+
+   > **CORRECTED 2026-07-24 — this item previously claimed "no `nb_or` column".
+   > That was wrong; DESIGN's helper column is required.** Dense doubling is
+   > true, but the conclusion does not follow. Because the double and its
+   > optional add share a round, the successor round is
+   > `round − 1 + nb` — and on a double row `nb` ("an add follows me") is **not
+   > a function of that row's other columns**. Without it `round` can stall, so
+   > a prover could insert or drop doublings while every per-row relation still
+   > held. It is the exact analogue of `NEXT_OP` in today's single-scalar chain
+   > (`prover/src/tables/ecdas.rs:243-253` sends `round - 1 + next_op`).
+   >
+   > The witness could not supply it either: all four `joint_row` call sites
+   > passed `next_op = 0`, and double rows were given `d1 = d2 = 0`.
+   > **Fixed in `witness.rs`:** double rows now carry their round's real
+   > digits, `JointStep` gained `nb` (mirrored into `EcdasStep::next_op`), and
+   > `check_nb_schedule` in `tests/lincomb2_tests.rs` asserts the recurrence
+   > over the whole corpus. Purely additive — `next_op` is copied straight
+   > through by `build_step` and read by nothing, so no emitted math changed
+   > (row stats still mean 449.1 / max 471, `cargo test -p ecsm` 26/26).
+   >
+   > The chip's two defining constraints, for phase D:
+   > `OP · NB = 0` (deg 2) and `(1 − OP)·(NB − D1 − D2 + D1·D2) = 0` (deg 3) —
+   > note the op-gating: an add row carries its round's digits (it needs them to
+   > select the addend) but `nb = 0`.
+   >
+   > → the joint row needs **one more** bookkeeping column than this document
+   > previously claimed, not two fewer. See `CHIP-LAYOUT.md` §0.1 and §2.
 3. **P12 precompute is OFF the accumulator line.** DESIGN mused "seeded from T₀";
    it is not — it is a standalone chord add `P1+P2` (a=P1, g=P2). The chip's
    accumulator telescoping must special-case that the precompute row's `a` is P1

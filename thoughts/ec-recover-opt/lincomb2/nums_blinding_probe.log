@@ -1,0 +1,68 @@
+T0 = (0xaf319aa90f91a86b297de85edb330a665efba79aa98893db1b49070cb1ae7864, 0x1481a038143c0732071db0bcf3b05b8ca2e624fa217d82193f3c254a606277a0)
+
+len=   8 r=   3 u1=1 u2=0x88
+   mu = 0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbacd2ae642c4cedbe78cab5667435afca5
+   P2 = mu*T0 = (0x85882c59785c434236e2ec879fd034aca0ede94b97d85b0f39bc3dcbdb39753d,
+                 0x58cb252db487d4c48db6dbb4fac8fe290f5bdc94378bbf0bd210ae382bc019ca)
+   degenerate add at round 3 (target 3): acc == +addend  ->  LAMBDA UNCONSTRAINED (forgeable row)
+   acc == addend as points: True
+   honest reference: rejects with ResultInfinity -> status != 0 -> guest fallback
+   ecrecover packaging: z=0x7a77d3a687a3bcbdc91d1378602fcb5219c0f39b1770452c861620c0f4fccc04
+                        r=0x85882c59785c434236e2ec879fd034aca0ede94b97d85b0f39bc3dcbdb39753d
+                        s=0xf0578f87f103bb2d288da80ce69bfc0e72938914bd148fc0387af9cb87b070a2  v=0
+      guest recomputes u1: True   u2: True   lifts R == P2: True
+
+len=  12 r=   5 u1=1 u2=0x820
+   mu = 0x45145145145145145145145145145144bc8895014bbe439e585535f53c3f66ef
+   P2 = mu*T0 = (0x92f016d1f603b48ad20096c10f098c506eb5e909946111e320eb5544b54bebae,
+                 0xb73170ec1ae4d03efbc38511e03a4ccae0f23866dedd37d63b5d345993adaef7)
+   degenerate add at round 5 (target 5): acc == +addend  ->  LAMBDA UNCONSTRAINED (forgeable row)
+   acc == addend as points: True
+   honest reference: rejects with ResultInfinity -> status != 0 -> guest fallback
+   ecrecover packaging: z=0x6d0fe92e09fc4b752dff693ef0f673ae4bf8f3dd1ae78e589ee709481aea5593
+                        r=0x92f016d1f603b48ad20096c10f098c506eb5e909946111e320eb5544b54bebae
+                        s=0xdeb969eede1ae7ea44c8e09a2d94136f8d21fecebb3e9efa8cba300abc04cdd7  v=1
+      guest recomputes u1: True   u2: True   lifts R == P2: True
+
+len=  16 r=   9 u1=1 u2=0x8200
+   mu = 0x45145145145145145145145145145144bc8895014bbe439e585535f53c3f66ef
+   P2 = mu*T0 = (0x92f016d1f603b48ad20096c10f098c506eb5e909946111e320eb5544b54bebae,
+                 0xb73170ec1ae4d03efbc38511e03a4ccae0f23866dedd37d63b5d345993adaef7)
+   degenerate add at round 9 (target 9): acc == +addend  ->  LAMBDA UNCONSTRAINED (forgeable row)
+   acc == addend as points: True
+   honest reference: rejects with ResultInfinity -> status != 0 -> guest fallback
+   ecrecover packaging: z=0x6d0fe92e09fc4b752dff693ef0f673ae4bf8f3dd1ae78e589ee709481aea5593
+                        r=0x92f016d1f603b48ad20096c10f098c506eb5e909946111e320eb5544b54bebae
+                        s=0xeb969eede1ae7ea44c8e09a2d9413709573eb534cd39cca00df433852d8b8d23  v=1
+      guest recomputes u1: True   u2: True   lifts R == P2: True
+
+len=  32 r=  17 u1=1 u2=0x80020000
+   mu = 0xdf2b7cadf2b7cadf2b7cadf2b7cadf2a611502137f09a313a1bcc02e70198bb6
+   P2 = mu*T0 = (0x197a596710aec891083846b31c46101ac6298fde74c68f7a31704c30b3267b5e,
+                 0x8c7e065d7317dea8501ae0f3e5e54f0d61a9bdb2e7e584c43b0e972e3a867f8)
+   degenerate add at round 17 (target 17): acc == +addend  ->  LAMBDA UNCONSTRAINED (forgeable row)
+   acc == addend as points: True
+   honest reference: rejects with ResultInfinity -> status != 0 -> guest fallback
+   ecrecover packaging: z=0xe685a698ef51376ef7c7b94ce3b9efe3f4854d083a8210c18e62125c1d0fc5e3
+                        r=0x197a596710aec891083846b31c46101ac6298fde74c68f7a31704c30b3267b5e
+                        s=0x3b2585a6153e33ca1b894099937ac85d0cdeceba2372bad597181331f7ed0e58  v=0
+      guest recomputes u1: True   u2: True   lifts R == P2: True
+
+len= 256 r= 128 u1=1 u2=0x8000000000000000000000000000000100000000000000000000000000000000
+   mu = 0xb19602ff6b3b54f91017fdc4bb65087881804b608e761d16b1f5a6d33d7130c4
+   P2 = mu*T0 = (0xa454425a35f0a0231fe675dcbde33df9359d9f694d4b0e1fcf692c483bdb4789,
+                 0x11e3f6683a01b5c6e9fe394ca7537970d17f307728296fcbf3277892bb9c66d7)
+   degenerate add at round 128 (target 128): acc == +addend  ->  LAMBDA UNCONSTRAINED (forgeable row)
+   acc == addend as points: True
+   honest reference: rejects with ResultInfinity -> status != 0 -> guest fallback
+   ecrecover packaging: z=0x5babbda5ca0f5fdce0198a23421cc20585113d7d61fd921bf0693244945af9b8
+                        r=0xa454425a35f0a0231fe675dcbde33df9359d9f694d4b0e1fcf692c483bdb4789
+                        s=0x147967e8558bf5a55ba0d218aa104168ab60877d222f951e5b53cca9977005c6  v=1
+      guest recomputes u1: True   u2: True   lifts R == P2: True
+
+forgeable (lambda-free) degenerate adds constructed: 5/5
+
+READING: the NUMS blind does NOT close the incomplete-addition edge when
+P2 is prover-chosen. The named dlog assumption on T0 is NECESSARY but not
+SUFFICIENT; an explicit non-degeneracy check on add rows (or an equivalent)
+is required. See ../lincomb2/FINDING-nums-blinding.log.

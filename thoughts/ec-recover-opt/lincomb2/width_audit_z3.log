@@ -1,0 +1,23 @@
+z3     limb indices checked: [0, 1, 2, 3, 7, 15, 31, 47, 63]   (timeout 120s each)
+
+--- W1 (interval soundness) ---
+   lambda   i=0:unsat  i=1:unsat  i=2:unsat  i=3:unsat  i=7:unsat  i=15:unsat  i=31:unsat  i=47:unsat  i=63:unsat
+   xr       i=0:unsat  i=1:unsat  i=2:unsat  i=3:unsat  i=7:unsat  i=15:unsat  i=31:unsat  i=47:unsat  i=63:unsat
+   yr       i=0:unsat  i=1:unsat  i=2:unsat  i=3:unsat  i=7:unsat  i=15:unsat  i=31:unsat  i=47:unsat  i=63:unsat
+   dinv     i=0:unsat  i=1:unsat  i=2:unsat  i=3:unsat  i=7:unsat  i=15:unsat  i=31:unsat  i=47:unsat  i=63:unsat
+
+--- W2 (no wraparound mod p_g) ---
+   lambda   i=0:unsat  i=1:unsat  i=2:unsat  i=3:unsat  i=7:unsat  i=15:unsat  i=31:unsat  i=47:unsat  i=63:unsat
+   xr       i=0:unsat  i=1:unsat  i=2:unsat  i=3:unsat  i=7:unsat  i=15:unsat  i=31:unsat  i=47:unsat  i=63:unsat
+   yr       i=0:unsat  i=1:unsat  i=2:unsat  i=3:unsat  i=7:unsat  i=15:unsat  i=31:unsat  i=47:unsat  i=63:unsat
+   dinv     i=0:unsat  i=1:unsat  i=2:unsat  i=3:unsat  i=7:unsat  i=15:unsat  i=31:unsat  i=47:unsat  i=63:unsat
+
+--- N-WIDTH (negative control: addend limbs NOT byte-constrained) ---
+   lambda   i=31:sat  i=63:unsat
+   xr       i=31:sat  i=63:unsat
+   yr       i=31:unsat  i=63:unsat
+   dinv     i=31:sat  i=63:unsat
+
+   3 of the tampered queries are SAT (wraparound becomes reachable once the addend is not byte-bounded)
+
+WIDTH AUDIT z3: PASS (0 soundness violations, 0 unknown/timeout, 3 negative controls SAT)

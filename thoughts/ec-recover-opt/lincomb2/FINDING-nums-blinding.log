@@ -1,0 +1,135 @@
+FINDING — the NUMS blind does NOT close the incomplete-addition edge (phase D0)
+==============================================================================
+Found 2026-07-24 while drafting the spec chapter's assumption section (phase E0).
+Re-run: from thoughts/ec-recover-opt/oracle/,
+  <venv>/bin/python nums_blinding_probe.py
+
+SEVERITY: soundness. The chip as designed would accept traces proving a FALSE
+statement (Q != u1*P1 + u2*P2). It is not a bug in phase A — `lincomb2_witness`
+correctly refuses these inputs; it is a gap in the argument that replaces gate
+lemma L5b, i.e. in DESIGN.md section 4.
+
+WHAT DESIGN.md SECTION 4 CLAIMS
+------------------------------
+  "NUMS accumulator blinding [...] Every intermediate accumulator is
+   2^j*T0 + (c1*P1 + c2*P2); a collision now implies a known linear relation on
+   dlog_G(T0) -- i.e. the attacker computes a discrete log nobody knows."
+
+WHY IT DOES NOT HOLD
+--------------------
+The prover chooses P2. For ecrecover, P2 = R = lift_x(r) where `r` is a
+signature component the submitter picks freely (DESIGN section 4 already relies
+on exactly this freedom for its own attack on the unblinded chain, where it sets
+r = x(rho*G)). Nothing stops the prover from setting
+
+        P2 = mu * T0        for a mu it chooses,   r = x(P2),  v = parity(y(P2))
+
+and then the "known linear relation on dlog(T0)" is satisfiable with NO
+knowledge of dlog_G(T0): the T0 coefficient is cancelled against P2's.
+
+With P1 = G, write the accumulator entering the add at round `rr` as
+        acc = alpha*T0 + beta1*G + beta2*P2 = (alpha + mu*beta2)*T0 + beta1*G
+where alpha, beta1, beta2 are public functions of the schedule and the scalar
+bits. Choosing u1 < 2^rr forces beta1 = e1 = 0, and the collision acc = addend
+= P2 collapses to ONE scalar equation:
+
+        alpha + mu*(beta2 - 1) == 0  (mod N)     ->    mu = -alpha/(beta2 - 1)
+
+One modular inversion, one scalar multiplication. This is CHEAPER than the
+~2^-j-probability search DESIGN section 4 describes against the UNBLINDED chain
+— the blind made the attack easier to aim, not harder.
+
+CONSTRUCTIVE EVIDENCE (nums_blinding_probe.py, 5/5 constructions land)
+----------------------------------------------------------------------
+For each of len = 8, 12, 16, 32, 256 with a chosen target round, the probe
+solves for mu, sets P2 = mu*T0, runs the REAL blinded schedule, and finds
+
+    acc == addend   as points, at exactly the targeted round,
+    with equal y    ->  the forgeable case (see below).
+
+It then packages the full ecrecover input (z, v, r, s) and checks that the
+guest's own decomposition (u1 = -z/r, u2 = s/r, R = lift_x(r) with parity v)
+reproduces the intended u1, u2 and lifts R back to P2 exactly. All five: True.
+
+Worked example (len = 8, round 3, u1 = 1, u2 = 0x88):
+  mu = 0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbacd2ae642c4cedbe78cab5667435afca5
+  P2 = (0x85882c59785c434236e2ec879fd034aca0ede94b97d85b0f39bc3dcbdb39753d,
+        0x58cb252db487d4c48db6dbb4fac8fe290f5bdc94378bbf0bd210ae382bc019ca)
+  z  = 0x7a77d3a687a3bcbdc91d1378602fcb5219c0f39b1770452c861620c0f4fccc04
+  r  = 0x85882c59785c434236e2ec879fd034aca0ede94b97d85b0f39bc3dcbdb39753d
+  s  = 0xf0578f87f103bb2d288da80ce69bfc0e72938914bd148fc0387af9cb87b070a2   v = 0
+
+Independently corroborated:
+  - the Python reference schedule `lincomb2_ref.lincomb2_rows` raises
+    ResultInfinity on this input (same collision, seen by the honest generator);
+  - the repo's Rust `ecsm::lincomb2_witness` (commit bc62f00e, via the harness)
+    answers `err ResultInfinity` on the same input;
+  - P2 = mu*T0 reproduced through the independent Jacobian implementation.
+
+WHY THE COLLISION IS A FORGERY, NOT A REJECTION
+-----------------------------------------------
+On an add row the lambda relation is  lambda*(xB - xA) + yA - yB == 0 (mod p).
+  acc == -addend  =>  xA = xB, yA = -yB  =>  -2*yB == 0, impossible on
+                      secp256k1 (gate L5a)  =>  the row is UNSATISFIABLE: rejects.
+  acc == +addend  =>  xA = xB, yA =  yB  =>  0 == 0: LAMBDA IS UNCONSTRAINED.
+The construction above lands in the second case (verified: acc == addend as
+points, equal y). With lambda free, the row's outputs become a one-parameter
+family
+      xR = lambda^2 - 2*xA,      yR = lambda*(xA - xR) - yA,
+and nothing downstream re-checks curve membership of intermediate accumulators
+(the chip inherits it by induction from the ECSM-checked seed — chips-map.md
+note 4), so the whole rest of the chain follows deterministically to a Q that is
+not u1*P1 + u2*P2.
+
+HOW FAR AN ATTACKER GETS (honest scoping — do not overstate this)
+-----------------------------------------------------------------
+Producing an accepting proof of a FALSE lincomb2 statement is cheap: one scalar
+multiplication. That alone is disqualifying for a proof system.
+
+Steering Q to a CHOSEN value (e.g. a specific victim's public key, which is what
+turns this into fund theft) looks much harder, and this probe does not
+demonstrate it. Per family (mu, u1, u2, len, round) the reachable Q form a
+one-parameter family in lambda; hitting a chosen address means grinding lambda
+and hashing, ~2^160. Making x_A itself a free choice (which would give enough
+equations) requires knowing dlog_{T0} of a point the attacker did not construct
+— i.e. a discrete log again. So: soundness is broken; targeted theft is not
+demonstrated and does not look feasible by this route. I cannot rule out a
+sharper exploitation path, and would not ship on the assumption that none exists.
+
+CONSEQUENCES FOR THE PLAN
+-------------------------
+1. DESIGN.md section 4's chosen mitigation is INCOMPLETE as written. The named
+   assumption ("no efficient prover can produce a known linear relation on
+   dlog(T0)") is NECESSARY but NOT SUFFICIENT. Signing it off would not buy the
+   soundness the design attributes to it.
+2. IMPL-PLAN phase E's "Replaced: L5b -> the NUMS reduction argument" cannot be
+   discharged as specified. The reduction has a hole exactly where the prover
+   controls P2.
+3. Something must actually pin non-degeneracy. The obvious candidate is an
+   explicit witnessed inverse on add rows —
+         d_inv * (xB - xA) == 1  (mod p)
+   — one more byte-convolution relation of the same shape the chip already runs
+   (~32 inverse bytes + 33 quotient + 64 carries + the matching range sends,
+   order +200..250 committed cells/row on a ~963-cell row). That is
+   UNCONDITIONAL: no assumption, no T0 needed for this purpose. It costs roughly
+   a quarter of the per-row budget, taking the headline from about -70% to about
+   -60% EC cells — still far above the 2x bar. DESIGN section 4's own listed
+   fallback ("detect-and-branch rows") is the other option.
+   Choosing between them is a design decision for the lead, not for this phase.
+4. Whatever is chosen, phase E needs a negative control for it: remove the
+   non-degeneracy check, feed the trace built from the construction above, and
+   the gate must report SAT (forgery reappears).
+5. The blind may still be worth keeping for the OTHER thing it buys (dropping
+   the exact-MSB sub-lemma L6.5, per DESIGN section 2), but that is a
+   convenience, not a soundness property.
+
+WHAT IS NOT AFFECTED
+--------------------
+- Phase A is correct. `lincomb2_witness` rejects every one of these inputs
+  (`ResultInfinity`), and anchor D found no discrepancy over 69,431 rows.
+- The existing single-scalar ECSM/ECDAS chips are unaffected: gate lemma L5b is
+  proved unconditionally there from k < N plus the prefix structure, and the
+  accumulator is not prover-steerable in the same way (there is one scalar, one
+  fixed addend, and no blind).
+- The status contract is unaffected: status != 0 -> software fallback is sound
+  regardless.

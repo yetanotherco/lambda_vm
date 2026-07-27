@@ -1,0 +1,67 @@
+ANCHOR D — repo `ecsm::lincomb2_witness` vs the Python oracle (phase D0)
+=======================================================================
+Re-run: from thoughts/ec-recover-opt/oracle/,
+  (cd repo-harness && cargo build --release)
+  <venv>/bin/python anchor_d_lincomb2_repo.py
+Runtime ~30s.
+
+Why this exists: phase A validates the Rust witness against two references that
+are themselves Rust (`crypto/ecsm/src/tests/lincomb2_tests.rs` — an `Fp`
+reference and k256). This anchor is the lineage crossing those tests cannot
+make: the Rust witness compared field-by-field and ROW-BY-ROW against the Python
+oracle (`lincomb2_ref.lincomb2_rows`, affine/ec_ref lineage), with
+`jacobian_ref` (Jacobian, LSB-first) as a third opinion on Q. It needed a new
+`lincomb2` command on the repo harness.
+
+Checked per case:
+  Q, `len`, `P12`, `T0`, `2^len*T0`;
+  the range/canonicalisation witnesses `y_p2_sub_p`, `x_q_sub_p`, `y_q_sub_p`,
+  `u1_sub_n`, `u2_sub_n` (each must equal 2^256 + v - modulus);
+  every row's (sel, round, op, d1, d2, nb, a, addend, lambda, r) — including
+  the two places the accumulator does NOT telescope (the precompute row's `a`
+  is P1; the correction row's addend is -2^len*T0) — and that `nb` is mirrored
+  into the reused `EcdasStep::next_op` column;
+  all 6 `Lincomb2Error` variants on the input classes that should produce them.
+
+--- raw output ---
+
+ANCHOR D (repo lincomb2_witness vs python oracle): PASS (161 witnesses, 69431 rows compared field-by-field, 8 error paths, 0 failures)
+
+--- run history (this anchor caught a live convention change) ---
+
+Run 1 was against `crypto/ecsm` AS OF COMMIT bc62f00e (phase A), extracted with
+`git archive` into a scratchpad crate, because the working tree was being edited
+concurrently. PASS, same counts. Phase A as committed is correct against an
+independent Python lineage, row for row.
+
+Run 2 was against the WORKING TREE and initially FAILED, at row 1 of every
+case — the first `Double` row, and only there. Diagnosis: all point values,
+lambdas, results and Q were identical; the sole difference was bookkeeping.
+A concurrent phase had changed the witness so that
+
+  - `d1`/`d2` (the two scalars' bits for the round) are now carried on BOTH the
+    double and the add of a round, not only on the add, and
+  - a new `nb = d1 | d2` field marks "an add follows me at this same round",
+    mirrored into `EcdasStep::next_op`.
+
+That is a deliberate and well-motivated change, not a defect: without `nb` the
+successor round `round - 1 + nb` is not a function of the row's own columns, so
+a prover could stall `round` — inserting or dropping doublings while every
+per-row relation still holds. The oracle was updated to the new convention
+(`lincomb2_ref.lincomb2_rows` now emits `nb` and sets the digits on double
+rows), and run 3 against the working tree PASSES with the counts above,
+including `nb` and its `next_op` mirror.
+
+Reading: no discrepancy in the arithmetic at any point; one witness-format
+change since the phase-A layout lock, now tracked by the oracle. Note that the
+bc62f00e-pinned harness no longer builds against the current `main.rs` (it has
+no `nb` field) — that is expected; the harness tracks the crate.
+
+--- convention confirmed by reading the emitted witness (for phase C) ---
+
+The correction row's ADDEND columns carry the NEGATION -2^len*T0 (witness.rs
+builds `neg_tpow` and adds it), while the witness's `x_t0_pow`/`y_t0_pow` fields
+carry the POSITIVE 2^len*T0. The preprocessed T0 table feeds the addend columns,
+so it must store -2^i*T0 — IMPL-PLAN open decision #3 resolves to "store the
+negation", and the positive value is only a bookkeeping field. Verified here by
+checking `x_t0_pow`/`y_t0_pow` against `pt_neg(rows[-1]["addend"])`.

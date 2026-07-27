@@ -1,0 +1,20 @@
+[workspace]
+
+[package]
+name = "ecrecover"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+lambda-vm-syscalls = { path = "../../../../syscalls" }
+# The REAL shipping path: `LambdaVmEcsmCrypto::secp256k1_ecrecover` is what the
+# ethrex guest injects, so this bench measures production code rather than a
+# synthetic ladder. Path dep — this crate is not edited here, only called.
+lambda-vm-ethrex-crypto = { path = "../../../../crypto/ethrex-crypto" }
+# Needed only to bring the `Crypto` trait into scope. Same pinned rev and
+# `default-features = false` as `lambda-vm-ethrex-crypto` and the ethrex guest,
+# so feature unification adds nothing to the build.
+ethrex-crypto = { git = "https://github.com/lambdaclass/ethrex.git", rev = "156cb8d6a3974f411d71622eecd1b249ee37ff1c", package = "ethrex-crypto", default-features = false }
+
+[patch."https://github.com/yetanotherco/lambda_vm.git"]
+lambda-vm-syscalls = { path = "../../../../syscalls" }

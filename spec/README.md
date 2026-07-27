@@ -1,6 +1,6 @@
 # Lambda VM Specification
 
-Formal specification of the Lambda VM. Covers the per-chip AIR constraints (CPU, decode, bitwise, branch, LT, shift, MUL, DVRM, MEMW, LOAD, page, register, halt, commit, keccak), the memory argument, and the LogUp lookup framework that links the tables.
+Formal specification of the Lambda VM. Covers the per-chip AIR constraints (CPU, decode, bitwise, branch, LT, shift, MUL, DVRM, MEMW, LOAD, page, register, halt, commit, keccak, ECSM/ECDAS), the memory argument, and the LogUp lookup framework that links the tables.
 
 The specification is written in [Typst](https://typst.app/) and rendered as either a PDF or a browsable HTML wiki using [shiroa](https://myriad-dreamin.github.io/shiroa/).
 
