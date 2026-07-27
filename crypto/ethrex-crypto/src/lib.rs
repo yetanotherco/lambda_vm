@@ -112,11 +112,14 @@ fn ecsm_ecrecover(sig: &[u8; 64], recid: u8, msg: &[u8; 32]) -> Result<[u8; 64],
     let u2 = r_inv * s;
 
     // pk = u1·G + u2·R, accelerated via ECSM with a software fallback.
+    // The ECSM path takes affine inputs and returns the affine result directly:
+    // its inputs (G, R) and output are Z=1 points, so passing affines avoids the
+    // wasteful projective→affine inversions (`to_affine` of a Z=1 point still runs
+    // a full constant-time field inversion in k256). The rare software fallback
+    // still converts via `to_affine`.
     let g = ProjectivePoint::GENERATOR;
-    let pk = ecsm_lincomb2(&g, &u1, &r_proj, &u2)
-        .unwrap_or_else(|| ProjectivePoint::lincomb(&g, &u1, &r_proj, &u2));
-
-    let pk_affine = pk.to_affine();
+    let pk_affine = ecsm_lincomb2(&AffinePoint::GENERATOR, &u1, &r_point, &u2)
+        .unwrap_or_else(|| ProjectivePoint::lincomb(&g, &u1, &r_proj, &u2).to_affine());
     if bool::from(pk_affine.is_identity()) {
         return Err(CryptoError::RecoveryFailed);
     }
@@ -136,21 +139,21 @@ fn ecsm_ecrecover(sig: &[u8; 64], recid: u8, msg: &[u8; 32]) -> Result<[u8; 64],
 /// so the caller uses the pure-Rust `ProjectivePoint::lincomb`.
 #[cfg(target_arch = "riscv64")]
 fn ecsm_lincomb2(
-    p1: &ProjectivePoint,
+    a1: &AffinePoint,
     k1: &Scalar,
-    p2: &ProjectivePoint,
+    a2: &AffinePoint,
     k2: &Scalar,
-) -> Option<ProjectivePoint> {
-    lincomb2_with_oracle(p1, k1, p2, k2, ecsm_oracle)
+) -> Option<AffinePoint> {
+    lincomb2_with_oracle(a1, k1, a2, k2, ecsm_oracle)
 }
 
 #[cfg(not(target_arch = "riscv64"))]
 fn ecsm_lincomb2(
-    _p1: &ProjectivePoint,
+    _a1: &AffinePoint,
     _k1: &Scalar,
-    _p2: &ProjectivePoint,
+    _a2: &AffinePoint,
     _k2: &Scalar,
-) -> Option<ProjectivePoint> {
+) -> Option<AffinePoint> {
     None
 }
 
@@ -193,17 +196,17 @@ fn ecsm_oracle(x: &FieldElement, k: &Scalar) -> Option<FieldElement> {
 /// Generic over the oracle so unit tests can substitute a software stand-in.
 #[cfg(any(target_arch = "riscv64", test))]
 fn lincomb2_with_oracle<O>(
-    p1: &ProjectivePoint,
+    a1: &AffinePoint,
     k1: &Scalar,
-    p2: &ProjectivePoint,
+    a2: &AffinePoint,
     k2: &Scalar,
     oracle: O,
-) -> Option<ProjectivePoint>
+) -> Option<AffinePoint>
 where
     O: Fn(&FieldElement, &Scalar) -> Option<FieldElement>,
 {
-    let a1 = p1.to_affine();
-    let a2 = p2.to_affine();
+    // Inputs are affine already (the ecrecover path lifts them from known Z=1
+    // points), so no projective→affine inversion is needed here.
     if bool::from(a1.is_identity()) || bool::from(a2.is_identity()) {
         return None;
     }
@@ -211,8 +214,8 @@ where
         return None;
     }
 
-    let (x1, y1) = affine_xy(&a1)?;
-    let (x2, y2) = affine_xy(&a2)?;
+    let (x1, y1) = affine_xy(a1)?;
+    let (x2, y2) = affine_xy(a2)?;
 
     let xa = oracle(&x1, k1)?;
     let xc1 = oracle(&x1, &(*k1 + Scalar::ONE))?;
@@ -291,13 +294,12 @@ fn affine_xy(p: &AffinePoint) -> Option<(FieldElement, FieldElement)> {
     Some((x, y))
 }
 
-/// Builds a curve point from affine coordinates, returning `None` if the point
+/// Builds an affine curve point from coordinates, returning `None` if the point
 /// is not on the curve (`AffinePoint::from_encoded_point` validates this).
 #[cfg(any(target_arch = "riscv64", test))]
-fn point_from_xy(x: &FieldElement, y: &FieldElement) -> Option<ProjectivePoint> {
+fn point_from_xy(x: &FieldElement, y: &FieldElement) -> Option<AffinePoint> {
     let ep = EncodedPoint::from_affine_coordinates(&x.to_bytes(), &y.to_bytes(), false);
-    let affine = Option::<AffinePoint>::from(AffinePoint::from_encoded_point(&ep))?;
-    Some(ProjectivePoint::from(affine))
+    Option::<AffinePoint>::from(AffinePoint::from_encoded_point(&ep))
 }
 
 // ── Keccak-256 over the keccak_permute precompile (riscv64 guest) ───────────
