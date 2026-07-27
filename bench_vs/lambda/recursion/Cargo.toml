@@ -21,6 +21,10 @@ blowup8 = []
 # memory-bounded inner prove) instead of a monolithic VmProof. Selects the
 # `recursion-cont-<preset>-bench` bins below.
 continuation = []
+# Orthogonal to the presets: verify a LogUpMode::Gkr inner proof
+# (GkrGuestInput blob). Composes with `continuation` to select the
+# GkrContinuationGuestInput layout (`recursion-gkr-cont-<preset>-bench`).
+gkr = []
 
 # One distinctly named binary per preset (selected by its feature) so a parallel
 # `make -j` builds them to different filenames — structurally race-free, no cp
@@ -59,6 +63,26 @@ required-features = ["continuation", "blowup2"]
 name = "recursion-cont-blowup4-bench"
 path = "src/main.rs"
 required-features = ["continuation", "blowup4"]
+
+[[bin]]
+name = "recursion-gkr-min-bench"
+path = "src/main.rs"
+required-features = ["gkr", "min"]
+
+[[bin]]
+name = "recursion-gkr-blowup2-bench"
+path = "src/main.rs"
+required-features = ["gkr", "blowup2"]
+
+[[bin]]
+name = "recursion-gkr-cont-min-bench"
+path = "src/main.rs"
+required-features = ["gkr", "continuation", "min"]
+
+[[bin]]
+name = "recursion-gkr-cont-blowup2-bench"
+path = "src/main.rs"
+required-features = ["gkr", "continuation", "blowup2"]
 
 [dependencies]
 lambda-vm-prover = { path = "../../../prover", default-features = false, features = [

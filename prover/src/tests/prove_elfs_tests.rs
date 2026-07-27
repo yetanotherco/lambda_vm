@@ -100,6 +100,64 @@ fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
     )
 }
 
+/// [`prove_and_verify_vm_minimal`] under `LogUpMode::Gkr`: the full VM table
+/// set proven with the batch-GKR LogUp path (2 aux columns + bridge per
+/// table) and verified with the GKR verifier, including the verifier-computed
+/// COMMIT bus target against the GKR root claims.
+fn prove_and_verify_vm_minimal_gkr(elf: &Elf, traces: &mut Traces) -> bool {
+    use stark::lookup::LogUpMode;
+
+    let _ = env_logger::builder().is_test(true).try_init();
+    let proof_options = ProofOptions::default_test_options();
+
+    let table_counts = traces.table_counts();
+    let airs = VmAirs::new_with_logup_mode(
+        elf,
+        &proof_options,
+        true,
+        &traces.page_configs,
+        &table_counts,
+        None,
+        true,
+        None,
+        None,
+        None,
+        LogUpMode::Gkr,
+    );
+
+    let air_trace_pairs = airs.air_trace_pairs(traces);
+    let gkr_proof = match crate::test_utils::multi_prove_gkr_ram(
+        air_trace_pairs,
+        &mut DefaultTranscript::<E>::new(&[]),
+    ) {
+        Ok(proof) => proof,
+        Err(_) => return false,
+    };
+
+    let views: Vec<StarkProofView<F, E, ()>> = gkr_proof
+        .multi
+        .proofs
+        .iter()
+        .map(StarkProofView::Owned)
+        .collect();
+    let mut replay_transcript = DefaultTranscript::<E>::new(&[]);
+    let expected_bus_balance = crate::compute_expected_commit_bus_balance_view(
+        &airs.air_refs(),
+        &views,
+        &traces.public_output_bytes,
+        0,
+        &mut replay_transcript,
+    )
+    .expect("fingerprint collision in test");
+
+    Verifier::multi_verify_gkr(
+        &airs.air_refs(),
+        &gkr_proof,
+        &mut DefaultTranscript::<E>::new(&[]),
+        &expected_bus_balance,
+    )
+}
+
 /// Like [`crate::prove_with_options_and_inputs`] but trims the bitwise table to the
 /// rows the program uses instead of proving the full 2^20-row table (TEST ONLY).
 ///
@@ -298,6 +356,20 @@ fn test_prove_elfs_sub_neg_result_fast() {
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
         "Proof verification failed for sub_neg_result program (fast)"
+    );
+}
+
+/// The full VM table set proven and verified under LogUp-GKR mode
+/// (`sub_neg_result`, minimal tables — the GKR twin of the fast test above).
+#[test]
+fn test_prove_elfs_sub_neg_result_gkr() {
+    let (elf, logs, instructions) = run_asm_elf("sub_neg_result");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+
+    assert!(
+        prove_and_verify_vm_minimal_gkr(&elf, &mut traces),
+        "GKR-mode proof verification failed for sub_neg_result program"
     );
 }
 
@@ -1439,6 +1511,36 @@ fn test_verify_rejects_tampered_public_output() {
     assert!(
         !verified,
         "Verifier should reject proof when VmProof.public_output is tampered"
+    );
+}
+
+/// The GKR library path end-to-end: `prove_gkr_with_options_and_inputs` →
+/// `verify_gkr_with_options` on a committing program, so the GKR bus balance
+/// is checked against the NONZERO verifier-computed COMMIT target; a tampered
+/// public output must be rejected.
+#[test]
+fn test_prove_verify_gkr_library_path_commit() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_commit_4");
+    let proof_options = ProofOptions::default_test_options();
+    let gkr_proof = crate::prove_gkr_with_options_and_inputs(
+        &elf_bytes,
+        &[],
+        &proof_options,
+        &Default::default(),
+    )
+    .expect("GKR prover should succeed for test_commit_4");
+    assert!(
+        crate::verify_gkr_with_options(&gkr_proof, &elf_bytes, &proof_options)
+            .expect("valid GKR commit proof should not error"),
+        "GKR proof of a committing program should verify"
+    );
+
+    let mut tampered = gkr_proof.clone();
+    tampered.public_output[0] ^= 0x01;
+    assert!(
+        !crate::verify_gkr_with_options(&tampered, &elf_bytes, &proof_options)
+            .expect("verifier should not error on tampered public output"),
+        "GKR verifier should reject a tampered public output"
     );
 }
 

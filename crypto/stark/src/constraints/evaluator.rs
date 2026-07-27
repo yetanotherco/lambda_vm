@@ -321,6 +321,12 @@ where
         if crate::gpu_lde::gpu_composition_disabled() {
             return None;
         }
+        // GKR mode: the bridge constraint reads challenge leaves beyond the
+        // [z, α] pair the device challenge plumbing was built for — CPU path
+        // until the kernel grows GKR support.
+        if air.logup_mode() != crate::lookup::LogUpMode::Standard {
+            return None;
+        }
         if !zerofier_data.is_uniform() {
             return None;
         }

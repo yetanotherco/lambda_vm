@@ -53,6 +53,8 @@ compile_error!("select exactly one of the `min`/`blowup2`/`blowup4`/`blowup8` fe
     all(feature = "blowup4", feature = "blowup8"),
 ))]
 compile_error!("select exactly one of the `min`/`blowup2`/`blowup4`/`blowup8` features");
+// `continuation` and `gkr` compose: together they select the
+// `GkrContinuationGuestInput` layout (a GKR-mode continuation bundle).
 
 /// The build preset fixing the inner `ProofOptions` (see the module docs).
 #[cfg(feature = "min")]
@@ -88,15 +90,26 @@ pub fn main() -> ! {
     // not self-enforcing here.
     let options = PRESET.options();
 
-    #[cfg(not(feature = "continuation"))]
+    #[cfg(not(any(feature = "continuation", feature = "gkr")))]
     let attestation = lambda_vm_prover::recursion::verify_and_attest_blob(blob, &options)
         .expect("verify errored")
         .expect("inner proof failed verification");
 
-    #[cfg(feature = "continuation")]
+    #[cfg(all(feature = "continuation", not(feature = "gkr")))]
     let attestation = lambda_vm_prover::recursion::verify_continuation_and_attest(blob, &options)
         .expect("verify errored")
         .expect("inner continuation proof failed verification");
+
+    #[cfg(all(feature = "gkr", not(feature = "continuation")))]
+    let attestation = lambda_vm_prover::recursion::verify_and_attest_gkr_blob(blob, &options)
+        .expect("verify errored")
+        .expect("inner GKR proof failed verification");
+
+    #[cfg(all(feature = "gkr", feature = "continuation"))]
+    let attestation =
+        lambda_vm_prover::recursion::verify_gkr_continuation_and_attest(blob, &options)
+            .expect("verify errored")
+            .expect("inner GKR continuation proof failed verification");
 
     lambda_vm_syscalls::syscalls::commit(&attestation);
     lambda_vm_syscalls::syscalls::sys_halt();

@@ -9,8 +9,13 @@ pub use crate::proof::view::PiDeserializer;
 use crate::{
     config::Commitment,
     domain::new_verifier_domain,
-    lookup::{BusPublicInputs, LOGUP_CHALLENGE_ALPHA, LOGUP_NUM_CHALLENGES, compute_alpha_powers},
-    proof::stark::{ArchivedMultiProof, MultiProof},
+    gkr::{BatchGkrProof, gkr_verify_batch, instance_eval_point},
+    logup_gkr::{extend_rap_challenges_with_bridge, reconstruct_and_verify_gkr_claims},
+    lookup::{
+        BusPublicInputs, LOGUP_CHALLENGE_ALPHA, LOGUP_NUM_CHALLENGES, LogUpMode,
+        compute_alpha_powers,
+    },
+    proof::stark::{ArchivedMultiProof, GkrMultiProof, MultiProof},
     proof::view::{
         DeepPolynomialOpeningView, FriDecommitmentView, MultiProofView, PolynomialOpeningsView,
         ProofViewSource, StarkProofView, StarkTableView,
@@ -1125,12 +1130,103 @@ pub trait IsStarkVerifier<
 
     /// The single verification implementation, shared by [`Self::multi_verify`]
     /// (owned) and [`Self::multi_verify_archived`] (archived), operating on
-    /// proof views rather than either's concrete type.
+    /// proof views rather than either's concrete type. Standard LogUp mode
+    /// only: AIRs in [`LogUpMode::Gkr`] must go through
+    /// [`Self::multi_verify_gkr`] (fail-closed here).
     fn multi_verify_views<'p>(
         airs: &[&dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>],
         proofs: impl ProofViewSource<'p, Field, FieldExtension, PI>,
         transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
         expected_bus_balance: &FieldElement<FieldExtension>,
+    ) -> bool
+    where
+        Field: 'p,
+        FieldExtension: 'p,
+        PI: 'p,
+        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+    {
+        if airs.iter().any(|air| air.logup_mode() == LogUpMode::Gkr) {
+            error!("AIRs in LogUpMode::Gkr must be verified with multi_verify_gkr");
+            return false;
+        }
+        Self::multi_verify_views_impl(airs, proofs, transcript, expected_bus_balance, None)
+    }
+
+    /// Verify a [`GkrMultiProof`] ([`LogUpMode::Gkr`] tables): the standard
+    /// per-table round structure plus the batch GKR replay, column-claim
+    /// binding, and the root-claim bus-balance check. Every interacting AIR
+    /// must be in GKR mode (fail-closed).
+    fn multi_verify_gkr(
+        airs: &[&dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>],
+        gkr_proof: &GkrMultiProof<Field, FieldExtension, PI>,
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
+        expected_bus_balance: &FieldElement<FieldExtension>,
+    ) -> bool
+    where
+        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+        PI: Clone,
+    {
+        Self::multi_verify_gkr_views(
+            airs,
+            MultiProofView::Owned(&gkr_proof.multi),
+            &gkr_proof.batch_gkr_proof,
+            gkr_proof.column_claims_by_table.as_slice(),
+            transcript,
+            expected_bus_balance,
+        )
+    }
+
+    /// [`Self::multi_verify_gkr`] over proof VIEWS: the per-table STARK proofs
+    /// come in as a [`ProofViewSource`] (owned or rkyv-archived, read in
+    /// place), while the (small) batch GKR proof and column claims come in as
+    /// borrowed values — the recursion guest deserializes only those and keeps
+    /// the heavy per-table data zero-copy.
+    fn multi_verify_gkr_views<'p>(
+        airs: &[&dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>],
+        proofs: impl ProofViewSource<'p, Field, FieldExtension, PI>,
+        batch_gkr_proof: &BatchGkrProof<FieldExtension>,
+        column_claims_by_table: &[Option<crate::proof::stark::GkrColumnClaims<FieldExtension>>],
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
+        expected_bus_balance: &FieldElement<FieldExtension>,
+    ) -> bool
+    where
+        Field: 'p,
+        FieldExtension: 'p,
+        PI: 'p,
+        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+    {
+        if airs
+            .iter()
+            .any(|air| air.has_trace_interaction() && air.logup_mode() != LogUpMode::Gkr)
+        {
+            error!("multi_verify_gkr requires every interacting AIR in LogUpMode::Gkr");
+            return false;
+        }
+        Self::multi_verify_views_impl(
+            airs,
+            proofs,
+            transcript,
+            expected_bus_balance,
+            Some((batch_gkr_proof, column_claims_by_table)),
+        )
+    }
+
+    /// Shared driver behind [`Self::multi_verify_views`] (standard) and
+    /// [`Self::multi_verify_gkr`]; `gkr` carries the batch proof and per-table
+    /// column claims exactly when the tables run in [`LogUpMode::Gkr`].
+    #[allow(clippy::type_complexity)]
+    fn multi_verify_views_impl<'p, 'g>(
+        airs: &[&dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>],
+        proofs: impl ProofViewSource<'p, Field, FieldExtension, PI>,
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
+        expected_bus_balance: &FieldElement<FieldExtension>,
+        gkr: Option<(
+            &'g BatchGkrProof<FieldExtension>,
+            &'g [Option<Vec<(usize, FieldElement<FieldExtension>)>>],
+        )>,
     ) -> bool
     where
         Field: 'p,
@@ -1227,14 +1323,132 @@ pub trait IsStarkVerifier<
         };
 
         // =====================================================================
+        // Round 1, Phase B′/B″ (GKR mode): batch GKR replay, claims, γ
+        // =====================================================================
+        // Mirrors the prover exactly: replay the batch GKR on the SHARED
+        // transcript (deriving the random point and per-instance leaf claims
+        // from the transcript, never the proof), bind every table's column
+        // claims, sample γ, and build each table's extended challenge vector.
+        let mut table_challenges: Vec<Vec<FieldElement<FieldExtension>>> =
+            vec![lookup_challenges.clone(); airs.len()];
+        if let Some((batch_proof, column_claims_by_table)) = gkr {
+            if column_claims_by_table.len() != airs.len() {
+                error!("column_claims_by_table length does not match table count");
+                return false;
+            }
+            let trace_lengths: Vec<usize> = proofs
+                .view_iter()
+                .map(|proof| proof.trace_length())
+                .collect();
+            let gkr_indices: Vec<usize> = airs
+                .iter()
+                .enumerate()
+                .filter(|(_, air)| air.has_trace_interaction())
+                .map(|(idx, _)| idx)
+                .collect();
+
+            // Instance sizes: interaction bits (a public function of the AIR,
+            // never the proof) + row bits from the proofs' trace lengths
+            // (nonzero was checked in Phase A); reject non-power-of-two.
+            let mut input_vars_by_instance = Vec::with_capacity(gkr_indices.len());
+            let mut n_layers_by_instance = Vec::with_capacity(gkr_indices.len());
+            for &idx in &gkr_indices {
+                let trace_length = trace_lengths[idx];
+                if !trace_length.is_power_of_two() {
+                    error!("Table {idx}: trace length {trace_length} is not a power of two");
+                    return false;
+                }
+                let input_vars =
+                    crate::logup_gkr::gkr_input_num_vars(airs[idx].bus_interactions().len());
+                input_vars_by_instance.push(input_vars);
+                n_layers_by_instance.push(input_vars + trace_length.trailing_zeros() as usize);
+            }
+
+            let (shared_point, per_instance_claims) =
+                match gkr_verify_batch(batch_proof, &n_layers_by_instance, transcript) {
+                    Ok(result) => result,
+                    Err(e) => {
+                        error!("batch GKR verification failed: {e:?}");
+                        return false;
+                    }
+                };
+
+            // Per table: claims must exist, match the canonical column set, and
+            // be consistent with the transcript-derived leaf claims; absorb
+            // them in the prover's order (ascending table index).
+            for (k, &idx) in gkr_indices.iter().enumerate() {
+                let Some(claims) = column_claims_by_table[idx].as_ref() else {
+                    error!("Table {idx}: interacting GKR table is missing column claims");
+                    return false;
+                };
+                let (n_claim, d_claim) = &per_instance_claims[k];
+                let full_point = instance_eval_point(&shared_point, n_layers_by_instance[k]);
+                let (kappa, _rho) =
+                    crate::logup_gkr::split_input_point(&full_point, input_vars_by_instance[k]);
+                if !reconstruct_and_verify_gkr_claims(
+                    n_claim,
+                    d_claim,
+                    claims,
+                    airs[idx].bus_interactions(),
+                    &lookup_challenges,
+                    kappa,
+                ) {
+                    error!("Table {idx}: GKR column-claim reconstruction failed");
+                    return false;
+                }
+                for (_, claim) in claims {
+                    transcript.append_field_element(claim);
+                }
+            }
+            for (idx, claims) in column_claims_by_table.iter().enumerate() {
+                if !airs[idx].has_trace_interaction() && claims.is_some() {
+                    error!("Table {idx}: non-interacting table carries column claims");
+                    return false;
+                }
+            }
+
+            let gamma: FieldElement<FieldExtension> = transcript.sample_field_element();
+
+            for (k, &idx) in gkr_indices.iter().enumerate() {
+                let claims = column_claims_by_table[idx]
+                    .as_ref()
+                    .expect("presence checked above");
+                let trace_length = trace_lengths[idx];
+                let full_point = instance_eval_point(&shared_point, n_layers_by_instance[k]);
+                // ρ (the row part) is the random point for the kernel/bridge.
+                let (_kappa, rho) =
+                    crate::logup_gkr::split_input_point(&full_point, input_vars_by_instance[k]);
+                let mut challenges = lookup_challenges.clone();
+                extend_rap_challenges_with_bridge(
+                    &mut challenges,
+                    claims,
+                    &gamma,
+                    trace_length,
+                    rho,
+                );
+                table_challenges[idx] = challenges;
+            }
+        }
+
+        // =====================================================================
         // Validate bus_public_inputs presence against AIR layout
         // =====================================================================
-        // A dishonest prover could omit bus_public_inputs entirely (None) to
-        // bypass the bus balance check. With circular constraints, there are no
-        // boundary constraints on LogUp columns, so the bus balance check is
-        // the only cross-table validation.
+        // Standard mode: a dishonest prover could omit bus_public_inputs
+        // entirely (None) to bypass the bus balance check; with circular
+        // constraints there are no boundary constraints on LogUp columns, so
+        // the bus balance check is the only cross-table validation. GKR mode:
+        // no table may carry bus_public_inputs at all — the balance check runs
+        // on the batch proof's root claims, and a smuggled L would be absorbed
+        // into the fork transcript below.
 
         for (idx, (air, proof)) in airs.iter().zip(proofs.view_iter()).enumerate() {
+            if gkr.is_some() {
+                if proof.has_bus_public_inputs() {
+                    error!("Table {idx}: GKR-mode proof must not carry bus_public_inputs");
+                    return false;
+                }
+                continue;
+            }
             if air.has_trace_interaction() && !proof.has_bus_public_inputs() {
                 error!(
                     "Table {idx}: AIR has LogUp interactions but proof is missing bus_public_inputs"
@@ -1282,13 +1496,15 @@ pub trait IsStarkVerifier<
                 None => return false,
             };
 
-            // Rounds 2-4: verify
+            // Rounds 2-4: verify (per-table challenge vector — the shared
+            // [z, α] pair in standard mode, the bridge-extended vector in GKR
+            // mode).
             if !Self::verify_rounds_2_to_4(
                 *air,
                 proof,
                 &public_inputs,
                 &mut table_transcript,
-                lookup_challenges.clone(),
+                table_challenges[idx].clone(),
             ) {
                 error!(
                     "Table {} failed verify_rounds_2_to_4 (num_constraints={}, trace_cols={})",
@@ -1310,7 +1526,30 @@ pub trait IsStarkVerifier<
         // receiver contributions are computed externally (e.g. verifier-computed
         // COMMIT output bus), the target is the missing positive remainder.
 
-        if needs_lookup_challenges {
+        if let Some((batch_proof, _)) = gkr {
+            // GKR mode: the balance is the sum of the batch proof's root
+            // claims (each table's total contribution n/d). The root claims
+            // were transcript-bound and reduced to the committed traces by the
+            // batch replay above; a zero denominator is an outright reject.
+            let mut total = FieldElement::<FieldExtension>::zero();
+            for (root_n, root_d) in &batch_proof.root_claims {
+                let Ok(inv) = root_d.inv() else {
+                    error!("GKR root claim has a zero denominator");
+                    return false;
+                };
+                total += root_n * inv;
+            }
+            if total != *expected_bus_balance {
+                #[cfg(not(feature = "test_fiat_shamir"))]
+                error!(
+                    "LogUp bus does not balance (GKR root claims): total={:?}, target={:?}",
+                    total, expected_bus_balance
+                );
+                return false;
+            }
+            #[cfg(feature = "debug-checks")]
+            info!("Bus balance check PASSED (GKR)");
+        } else if needs_lookup_challenges {
             let mut total = FieldElement::<FieldExtension>::zero();
             for (air, proof) in airs.iter().zip(proofs.view_iter()) {
                 if air.has_trace_interaction()

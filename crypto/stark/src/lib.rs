@@ -15,11 +15,14 @@ pub mod domain;
 pub mod examples;
 pub mod frame;
 pub mod fri;
+pub mod gkr;
 #[cfg(feature = "cuda")]
 pub mod gpu_lde;
 pub mod grinding;
 #[cfg(feature = "instruments")]
 pub mod instruments;
+pub mod lagrange_kernel;
+pub mod logup_gkr;
 #[cfg(feature = "cuda")]
 pub mod logup_gpu;
 pub mod lookup;
@@ -31,6 +34,7 @@ pub mod prover;
 pub mod r4_denoms;
 #[cfg(feature = "disk-spill")]
 pub mod storage_mode;
+pub mod sumcheck;
 pub mod table;
 pub mod trace;
 pub mod traits;

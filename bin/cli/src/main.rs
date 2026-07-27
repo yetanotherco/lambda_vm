@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
-use clap::{Parser, Subcommand, ValueHint};
+use clap::{Parser, Subcommand, ValueEnum, ValueHint};
 
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
@@ -18,6 +18,17 @@ use stark::proof::options::GoldilocksCubicProofOptions;
 
 const DEFAULT_CONTINUATION_EPOCH_SIZE_LOG2: u32 = 20;
 const MIN_CONTINUATION_EPOCH_SIZE_LOG2: u32 = 18;
+
+/// LogUp mode for prove/verify. This experimental branch defaults to `gkr` so
+/// a plain `cli prove` (what `/bench` runs) A/Bs the GKR LogUp path against
+/// main's standard path on the same workload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum CliLogUpMode {
+    /// Committed batched term + accumulated columns (production path).
+    Standard,
+    /// Batch-GKR LogUp: 2 aux columns per table, bus sums proven by GKR.
+    Gkr,
+}
 
 /// Read a file into a buffer aligned for `rkyv::from_bytes`. A plain
 /// `Vec<u8>` from `std::fs::read` is align-1 by the type system even though
@@ -180,6 +191,12 @@ enum Commands {
         #[arg(long, conflicts_with = "continuations")]
         elements: bool,
 
+        /// LogUp mode. Defaults to `gkr` on this experimental branch (see
+        /// `CliLogUpMode`); pass `--logup-mode standard` for the production
+        /// path. Applies to --continuations too.
+        #[arg(long, value_enum, default_value_t = CliLogUpMode::Gkr)]
+        logup_mode: CliLogUpMode,
+
         /// Prove with continuations (split execution into epochs; flat peak memory)
         #[arg(long)]
         continuations: bool,
@@ -212,6 +229,11 @@ enum Commands {
         /// Print verification time
         #[arg(long)]
         time: bool,
+
+        /// LogUp mode the proof was generated with (must match `prove`'s).
+        /// Defaults to `gkr`, matching this branch's `prove` default.
+        #[arg(long, value_enum, default_value_t = CliLogUpMode::Gkr)]
+        logup_mode: CliLogUpMode,
 
         /// Verify a continuation proof bundle (produced by `prove --continuations`)
         #[arg(long)]
@@ -262,6 +284,7 @@ fn main() -> ExitCode {
             time,
             cycles,
             elements,
+            logup_mode,
             continuations,
             epoch_size_log2,
         } => {
@@ -274,9 +297,19 @@ fn main() -> ExitCode {
                     blowup,
                     time,
                     cycles,
+                    logup_mode,
                 )
             } else {
-                cmd_prove(elf, output, private_input, blowup, time, cycles, elements)
+                cmd_prove(
+                    elf,
+                    output,
+                    private_input,
+                    blowup,
+                    time,
+                    cycles,
+                    elements,
+                    logup_mode,
+                )
             }
         }
         Commands::Verify {
@@ -284,12 +317,13 @@ fn main() -> ExitCode {
             elf,
             blowup,
             time,
+            logup_mode,
             continuations,
         } => {
             if continuations {
-                cmd_verify_continuation(proof, elf, blowup, time)
+                cmd_verify_continuation(proof, elf, blowup, time, logup_mode)
             } else {
-                cmd_verify(proof, elf, blowup, time)
+                cmd_verify(proof, elf, blowup, time, logup_mode)
             }
         }
         Commands::CountElements { elf, private_input } => cmd_count_elements(elf, private_input),
@@ -542,6 +576,7 @@ fn cmd_execute(
     ExitCode::SUCCESS
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_prove(
     elf_path: PathBuf,
     output_path: PathBuf,
@@ -550,6 +585,7 @@ fn cmd_prove(
     time: bool,
     cycles: bool,
     elements: bool,
+    logup_mode: CliLogUpMode,
 ) -> ExitCode {
     eprintln!("Reading ELF file...");
     let elf_data = match std::fs::read(&elf_path) {
@@ -614,21 +650,57 @@ fn cmd_prove(
         }
     };
     eprintln!(
-        "Generating proof (blowup={blowup}, queries={})...",
+        "Generating proof (blowup={blowup}, queries={}, logup={logup_mode:?})...",
         opts.fri_number_of_queries
     );
-    let proof = prover::prove_with_options_and_inputs(
-        &elf_data,
-        &private_inputs,
-        &opts,
-        &Default::default(),
-    );
-    let prove_elapsed = start.elapsed();
-    let proof = match proof {
-        Ok(proof) => proof,
-        Err(e) => {
-            eprintln!("Proof generation failed: {}", e);
-            return ExitCode::FAILURE;
+    // Prove, timing the proof generation only (serialization happens after
+    // `prove_elapsed` is taken, identically in both modes).
+    let (prove_elapsed, bytes) = match logup_mode {
+        CliLogUpMode::Standard => {
+            let proof = prover::prove_with_options_and_inputs(
+                &elf_data,
+                &private_inputs,
+                &opts,
+                &Default::default(),
+            );
+            let prove_elapsed = start.elapsed();
+            let proof = match proof {
+                Ok(proof) => proof,
+                Err(e) => {
+                    eprintln!("Proof generation failed: {}", e);
+                    return ExitCode::FAILURE;
+                }
+            };
+            match rkyv::to_bytes::<rkyv::rancor::Error>(&proof) {
+                Ok(b) => (prove_elapsed, b),
+                Err(e) => {
+                    eprintln!("Failed to serialize proof: {}", e);
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        CliLogUpMode::Gkr => {
+            let proof = prover::prove_gkr_with_options_and_inputs(
+                &elf_data,
+                &private_inputs,
+                &opts,
+                &Default::default(),
+            );
+            let prove_elapsed = start.elapsed();
+            let proof = match proof {
+                Ok(proof) => proof,
+                Err(e) => {
+                    eprintln!("Proof generation failed: {}", e);
+                    return ExitCode::FAILURE;
+                }
+            };
+            match rkyv::to_bytes::<rkyv::rancor::Error>(&proof) {
+                Ok(b) => (prove_elapsed, b),
+                Err(e) => {
+                    eprintln!("Failed to serialize proof: {}", e);
+                    return ExitCode::FAILURE;
+                }
+            }
         }
     };
 
@@ -641,14 +713,6 @@ fn cmd_prove(
         }
     };
     let mut writer = BufWriter::new(file);
-
-    let bytes = match rkyv::to_bytes::<rkyv::rancor::Error>(&proof) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("Failed to serialize proof: {}", e);
-            return ExitCode::FAILURE;
-        }
-    };
 
     if let Err(e) = writer.write_all(&bytes) {
         eprintln!("Failed to write proof: {}", e);
@@ -674,7 +738,13 @@ fn cmd_prove(
     ExitCode::SUCCESS
 }
 
-fn cmd_verify(proof_path: PathBuf, elf_path: PathBuf, blowup: u8, time: bool) -> ExitCode {
+fn cmd_verify(
+    proof_path: PathBuf,
+    elf_path: PathBuf,
+    blowup: u8,
+    time: bool,
+    logup_mode: CliLogUpMode,
+) -> ExitCode {
     eprintln!("Reading ELF file...");
     let elf_data = match std::fs::read(&elf_path) {
         Ok(data) => data,
@@ -693,16 +763,7 @@ fn cmd_verify(proof_path: PathBuf, elf_path: PathBuf, blowup: u8, time: bool) ->
         }
     };
 
-    let proof: VmProof = match rkyv::from_bytes::<VmProof, rkyv::rancor::Error>(&proof_bytes) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("Failed to deserialize proof: {}", e);
-            return ExitCode::FAILURE;
-        }
-    };
-
-    eprintln!("Verifying proof...");
-    let start = Instant::now();
+    eprintln!("Verifying proof (logup={logup_mode:?})...");
     let opts = match GoldilocksCubicProofOptions::with_blowup(blowup) {
         Ok(opts) => opts,
         Err(e) => {
@@ -710,8 +771,39 @@ fn cmd_verify(proof_path: PathBuf, elf_path: PathBuf, blowup: u8, time: bool) ->
             return ExitCode::FAILURE;
         }
     };
-    let result = prover::verify_with_options(&proof, &elf_data, &opts, None, None);
-    let verify_elapsed = start.elapsed();
+    let start = Instant::now();
+    let (result, verify_elapsed) = match logup_mode {
+        CliLogUpMode::Standard => {
+            let proof: VmProof =
+                match rkyv::from_bytes::<VmProof, rkyv::rancor::Error>(&proof_bytes) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("Failed to deserialize proof: {}", e);
+                        return ExitCode::FAILURE;
+                    }
+                };
+            let result = prover::verify_with_options(&proof, &elf_data, &opts, None, None);
+            (result, start.elapsed())
+        }
+        CliLogUpMode::Gkr => {
+            let proof: prover::GkrVmProof = match rkyv::from_bytes::<
+                prover::GkrVmProof,
+                rkyv::rancor::Error,
+            >(&proof_bytes)
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!(
+                        "Failed to deserialize proof (was it proven with --logup-mode gkr?): {}",
+                        e
+                    );
+                    return ExitCode::FAILURE;
+                }
+            };
+            let result = prover::verify_gkr_with_options(&proof, &elf_data, &opts);
+            (result, start.elapsed())
+        }
+    };
     let result = match result {
         Ok(valid) => valid,
         Err(e) => {
@@ -732,6 +824,7 @@ fn cmd_verify(proof_path: PathBuf, elf_path: PathBuf, blowup: u8, time: bool) ->
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_prove_continuation(
     elf_path: PathBuf,
     output_path: PathBuf,
@@ -740,6 +833,7 @@ fn cmd_prove_continuation(
     blowup: u8,
     time: bool,
     cycles: bool,
+    logup_mode: CliLogUpMode,
 ) -> ExitCode {
     eprintln!("Reading ELF file...");
     let elf_data = match std::fs::read(&elf_path) {
@@ -788,22 +882,56 @@ fn cmd_prove_continuation(
     };
 
     eprintln!(
-        "Generating continuation proof (blowup={blowup}, epoch_size_log2={epoch_size_log2}, epoch_size={epoch_size})...",
+        "Generating continuation proof (blowup={blowup}, epoch_size_log2={epoch_size_log2}, epoch_size={epoch_size}, logup={logup_mode:?})...",
     );
+    // Prove + serialize per mode; timing covers proof generation only.
     let start = Instant::now();
-    let bundle = match prover::continuation::prove_continuation(
-        &elf_data,
-        &private_inputs,
-        epoch_size_log2,
-        &opts,
-    ) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("Continuation proof generation failed: {}", e);
-            return ExitCode::FAILURE;
+    let (prove_elapsed, num_epochs, bytes) = match logup_mode {
+        CliLogUpMode::Standard => {
+            let bundle = match prover::continuation::prove_continuation(
+                &elf_data,
+                &private_inputs,
+                epoch_size_log2,
+                &opts,
+            ) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("Continuation proof generation failed: {}", e);
+                    return ExitCode::FAILURE;
+                }
+            };
+            let prove_elapsed = start.elapsed();
+            match rkyv::to_bytes::<rkyv::rancor::Error>(&bundle) {
+                Ok(b) => (prove_elapsed, bundle.num_epochs(), b),
+                Err(e) => {
+                    eprintln!("Failed to serialize proof: {}", e);
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        CliLogUpMode::Gkr => {
+            let bundle = match prover::continuation::prove_continuation_gkr(
+                &elf_data,
+                &private_inputs,
+                epoch_size_log2,
+                &opts,
+            ) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("Continuation proof generation failed: {}", e);
+                    return ExitCode::FAILURE;
+                }
+            };
+            let prove_elapsed = start.elapsed();
+            match rkyv::to_bytes::<rkyv::rancor::Error>(&bundle) {
+                Ok(b) => (prove_elapsed, bundle.num_epochs(), b),
+                Err(e) => {
+                    eprintln!("Failed to serialize proof: {}", e);
+                    return ExitCode::FAILURE;
+                }
+            }
         }
     };
-    let prove_elapsed = start.elapsed();
 
     eprintln!("Writing proof...");
     let file = match File::create(&output_path) {
@@ -814,13 +942,6 @@ fn cmd_prove_continuation(
         }
     };
     let mut writer = BufWriter::new(file);
-    let bytes = match rkyv::to_bytes::<rkyv::rancor::Error>(&bundle) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("Failed to serialize proof: {}", e);
-            return ExitCode::FAILURE;
-        }
-    };
     if let Err(e) = writer.write_all(&bytes) {
         eprintln!("Failed to write proof: {}", e);
         return ExitCode::FAILURE;
@@ -830,7 +951,7 @@ fn cmd_prove_continuation(
     if let Some(c) = cycle_count {
         println!("Cycles: {}", c);
     }
-    println!("Epochs: {}", bundle.num_epochs());
+    println!("Epochs: {}", num_epochs);
     if time {
         println!("Proving time: {:.3}s", prove_elapsed.as_secs_f64());
     }
@@ -842,6 +963,7 @@ fn cmd_verify_continuation(
     elf_path: PathBuf,
     blowup: u8,
     time: bool,
+    logup_mode: CliLogUpMode,
 ) -> ExitCode {
     eprintln!("Reading ELF file...");
     let elf_data = match std::fs::read(&elf_path) {
@@ -860,17 +982,6 @@ fn cmd_verify_continuation(
             return ExitCode::FAILURE;
         }
     };
-    let bundle: prover::continuation::ContinuationProof =
-        match rkyv::from_bytes::<prover::continuation::ContinuationProof, rkyv::rancor::Error>(
-            &proof_bytes,
-        ) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("Failed to deserialize proof: {}", e);
-                return ExitCode::FAILURE;
-            }
-        };
-
     let opts = match GoldilocksCubicProofOptions::with_blowup(blowup) {
         Ok(opts) => opts,
         Err(e) => {
@@ -879,10 +990,44 @@ fn cmd_verify_continuation(
         }
     };
 
-    eprintln!("Verifying continuation proof...");
+    eprintln!("Verifying continuation proof (logup={logup_mode:?})...");
     let start = Instant::now();
-    let result = prover::continuation::verify_continuation(&elf_data, &bundle, &opts);
-    let verify_elapsed = start.elapsed();
+    let (result, verify_elapsed) = match logup_mode {
+        CliLogUpMode::Standard => {
+            let bundle: prover::continuation::ContinuationProof = match rkyv::from_bytes::<
+                prover::continuation::ContinuationProof,
+                rkyv::rancor::Error,
+            >(&proof_bytes)
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("Failed to deserialize proof: {}", e);
+                    return ExitCode::FAILURE;
+                }
+            };
+            let result = prover::continuation::verify_continuation(&elf_data, &bundle, &opts);
+            (result, start.elapsed())
+        }
+        CliLogUpMode::Gkr => {
+            let bundle: prover::continuation::GkrContinuationProof = match rkyv::from_bytes::<
+                prover::continuation::GkrContinuationProof,
+                rkyv::rancor::Error,
+            >(
+                &proof_bytes
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!(
+                        "Failed to deserialize proof (was it proven with --logup-mode gkr?): {}",
+                        e
+                    );
+                    return ExitCode::FAILURE;
+                }
+            };
+            let result = prover::continuation::verify_continuation_gkr(&elf_data, &bundle, &opts);
+            (result, start.elapsed())
+        }
+    };
 
     match result {
         Ok(Some(output)) => {

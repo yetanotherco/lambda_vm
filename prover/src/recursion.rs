@@ -150,6 +150,33 @@ pub fn encode_guest_input(
     })
 }
 
+/// Build the GKR guest's private-input blob for `inner_proof` of `inner_elf`:
+/// precomputes the roots and rkyv-encodes a [`crate::GkrGuestInput`] behind
+/// the standard aligning prefix — [`encode_guest_input`] for a
+/// [`crate::GkrVmProof`] inner.
+pub fn encode_gkr_guest_input(
+    inner_proof: &crate::GkrVmProof,
+    inner_elf: &[u8],
+    opts: &ProofOptions,
+) -> Result<Vec<u8>, Error> {
+    let (decode_commitment, page_commitments) = precomputed_commitments(inner_elf, opts)?;
+    let input = crate::GkrGuestInput {
+        gkr_proof: inner_proof.clone(),
+        inner_elf: inner_elf.to_vec(),
+        decode_commitment,
+        page_commitments,
+    };
+    let archive = rkyv::to_bytes::<rkyv::rancor::Error>(&input)
+        .map_err(|e| Error::Execution(format!("rkyv encode failed: {e}")))?;
+    let mut blob = Vec::with_capacity(crate::RECURSION_INPUT_PREFIX_LEN + archive.len());
+    blob.extend_from_slice(&crate::RECURSION_INPUT_MAGIC);
+    blob.extend_from_slice(&crate::RECURSION_INPUT_VERSION.to_le_bytes());
+    blob.extend_from_slice(&[0u8; 4]); // reserved
+    debug_assert_eq!(blob.len(), crate::RECURSION_INPUT_PREFIX_LEN);
+    blob.extend_from_slice(&archive);
+    Ok(blob)
+}
+
 /// The continuation guest's private-input layout (the `continuation` guest
 /// feature). Mirrors [`crate::GuestInput`] with the monolithic proof replaced
 /// by the bundle and the PAGE roots replaced by the global-memory genesis
@@ -177,6 +204,47 @@ pub fn encode_continuation_guest_input(
     let (decode_commitment, page_commitments) =
         crate::continuation::continuation_precomputed_commitments(inner_elf, &bundle, opts)?;
     let input = ContinuationGuestInput {
+        bundle,
+        inner_elf: inner_elf.to_vec(),
+        decode_commitment,
+        page_commitments,
+    };
+    let archive = rkyv::to_bytes::<rkyv::rancor::Error>(&input)
+        .map_err(|e| Error::Execution(format!("rkyv encode failed: {e}")))?;
+    let mut blob = Vec::with_capacity(crate::RECURSION_INPUT_PREFIX_LEN + archive.len());
+    blob.extend_from_slice(&crate::RECURSION_INPUT_MAGIC);
+    blob.extend_from_slice(&crate::RECURSION_INPUT_VERSION.to_le_bytes());
+    blob.extend_from_slice(&[0u8; 4]); // reserved
+    debug_assert_eq!(blob.len(), crate::RECURSION_INPUT_PREFIX_LEN);
+    blob.extend_from_slice(&archive);
+    Ok(blob)
+}
+
+/// The GKR continuation guest's private-input layout (the `gkr` +
+/// `continuation` guest features): [`ContinuationGuestInput`] with the bundle
+/// replaced by its [`crate::continuation::GkrContinuationProof`] counterpart.
+/// Same magic-prefixed wire format; a blob of another layout fails the
+/// bytecheck validation.
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct GkrContinuationGuestInput {
+    pub bundle: crate::continuation::GkrContinuationProof,
+    pub inner_elf: Vec<u8>,
+    pub decode_commitment: Commitment,
+    pub page_commitments: Vec<(u64, Commitment)>,
+}
+
+/// Build the GKR continuation guest's private-input blob for `bundle` of
+/// `inner_elf` — [`encode_continuation_guest_input`] for a
+/// [`crate::continuation::GkrContinuationProof`]. Roots are precomputed over
+/// the bundle's standard `base` (the touched-page set is mode-independent).
+pub fn encode_gkr_continuation_guest_input(
+    bundle: crate::continuation::GkrContinuationProof,
+    inner_elf: &[u8],
+    opts: &ProofOptions,
+) -> Result<Vec<u8>, Error> {
+    let (decode_commitment, page_commitments) =
+        crate::continuation::continuation_precomputed_commitments(inner_elf, bundle.base(), opts)?;
+    let input = GkrContinuationGuestInput {
         bundle,
         inner_elf: inner_elf.to_vec(),
         decode_commitment,
@@ -289,6 +357,31 @@ pub fn verify_and_attest_blob(
     Ok(Some(attestation))
 }
 
+/// [`verify_and_attest_blob`] for a [`LogUpMode::Gkr`](stark::lookup::LogUpMode)
+/// inner proof: verifies a [`crate::GkrGuestInput`] blob
+/// ([`encode_gkr_guest_input`]) — per-table proofs in place from the archive,
+/// only the small GKR artifacts materialized — and attests the SAME
+/// `program_id(elf, roots) || inner_public_output` as the standard path (the
+/// LogUp mode changes how bus sums are proven, not the program identity).
+pub fn verify_and_attest_gkr_blob(
+    blob: &[u8],
+    proof_options: &ProofOptions,
+) -> Result<Option<Vec<u8>>, Error> {
+    let verification = crate::verify_gkr_recursion_blob(blob, proof_options)?;
+    if !verification.ok {
+        return Ok(None);
+    }
+    let id = program_id_from_digest(
+        &verification.elf_digest,
+        verification.entry_point,
+        &verification.decode_commitment,
+        &verification.page_commitments,
+    );
+    let mut attestation = id.to_vec();
+    attestation.extend_from_slice(verification.public_output);
+    Ok(Some(attestation))
+}
+
 /// [`verify_and_attest_blob`]'s logic for a continuation bundle: takes the
 /// wire-format blob ([`encode_continuation_guest_input`]) and does the
 /// intended `continuation` guest's whole job in one call — verify every
@@ -349,6 +442,60 @@ pub fn verify_continuation_and_attest(
     };
 
     // Avoids a second `Elf::load` (already done by `verify_continuation_archived`).
+    let digest = elf_digest(inner_elf);
+    let id = program_id_from_digest(&digest, entry_point, &decode_commitment, &page_commitments);
+    let mut attestation = id.to_vec();
+    attestation.extend_from_slice(&public_output);
+    Ok(Some(attestation))
+}
+
+/// [`verify_continuation_and_attest`] for a GKR continuation bundle
+/// ([`encode_gkr_continuation_guest_input`]): epochs + global proof verified
+/// with the batch-GKR replay, per-table proofs read in place from the archive
+/// (only the KB-scale GKR artifacts are deserialized), then the SAME
+/// `program_id(elf, roots) || public_output` attestation as the standard
+/// continuation path.
+pub fn verify_gkr_continuation_and_attest(
+    blob: &[u8],
+    proof_options: &ProofOptions,
+) -> Result<Option<Vec<u8>>, Error> {
+    use rkyv::rancor::Error as RkyvError;
+
+    let archive_bytes = crate::recursion_archive_bytes(blob).ok_or_else(|| {
+        Error::Execution(String::from(
+            "GKR continuation recursion blob: bad magic or version",
+        ))
+    })?;
+    let mut aligned_fallback = rkyv::util::AlignedVec::<{ crate::RECURSION_INPUT_ALIGN }>::new();
+    let archive: &[u8] =
+        if (archive_bytes.as_ptr() as usize).is_multiple_of(crate::RECURSION_INPUT_ALIGN) {
+            archive_bytes
+        } else {
+            aligned_fallback.extend_from_slice(archive_bytes);
+            &aligned_fallback
+        };
+    let archived = rkyv::access::<ArchivedGkrContinuationGuestInput, RkyvError>(archive)
+        .map_err(|e| Error::Execution(format!("GKR continuation blob validation failed: {e}")))?;
+
+    let page_commitments: Vec<(u64, Commitment)> = rkyv::deserialize::<
+        Vec<(u64, Commitment)>,
+        RkyvError,
+    >(&archived.page_commitments)
+    .map_err(|e| Error::Execution(format!("rkyv deserialize page commitments failed: {e}")))?;
+    let decode_commitment: Commitment = archived.decode_commitment;
+    let inner_elf: &[u8] = archived.inner_elf.as_slice();
+
+    let Some((public_output, entry_point)) = crate::continuation::verify_gkr_continuation_archived(
+        &archived.bundle,
+        inner_elf,
+        proof_options,
+        decode_commitment,
+        &page_commitments,
+    )?
+    else {
+        return Ok(None);
+    };
+
     let digest = elf_digest(inner_elf);
     let id = program_id_from_digest(&digest, entry_point, &decode_commitment, &page_commitments);
     let mut attestation = id.to_vec();
