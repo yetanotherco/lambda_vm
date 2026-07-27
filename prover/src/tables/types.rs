@@ -348,6 +348,13 @@ pub enum BusId {
     /// ECDAS self-referential double/add sequence bus:
     /// (timestamp, xA, yA, xG, yG, round, op). ECSM seeds and drains it.
     Ecdas = 28,
+    /// lincomb2 addend bus: `Addend[ts, sel, x(32), y(32)]` where
+    /// `sel ∈ {1 = P1, 2 = P2, 3 = P12, 4 = −2^len·T₀}`. ECSM2 publishes each
+    /// addend once per use (multiplicity = a witnessed count column); every
+    /// ECDAS2 add row receives exactly one. `sel` is never 0, so the
+    /// trailing-zero tuple collapse (`lookup.rs` skips zero elements) can never
+    /// alias two different addends.
+    Addend = 29,
     /// Scalar-bit bus: ECDAS sends Bit[ts, round] per step (mult = next_op);
     /// ECSM receives Bit[ts, i] for each of the 256 k bits (mult = k[i]),
     /// and sends Bit[ts, idx_k] for the MSB (mult = μ).
@@ -359,6 +366,24 @@ pub enum BusId {
     /// Cross-epoch memory bus: the local-to-global table's per-cell init/fini
     /// boundary claims, matched across epochs by the final aggregation LogUp.
     GlobalMemory = 31,
+
+    /// lincomb2 NUMS correction lookup: `EC_T0[len, x, y]` where `(x, y)` is
+    /// `−2^len·T₀`, the blind the joint chain's correction row adds. The EC_T0
+    /// preprocessed table receives; the lincomb2 chip sends one per evaluation.
+    EcT0 = 32,
+
+    /// lincomb2 joint scalar-digit bus: `JointBit[ts, round, stream]` with
+    /// `stream ∈ {1 = u1, 2 = u2}`. ECDAS2 sends one per stream per row
+    /// (multiplicity = that stream's digit bit); ECSM2 receives 512 times,
+    /// keyed by bit position, at multiplicity `2·bit` — twice because a set
+    /// digit is carried by BOTH the round's doubling and its add.
+    ///
+    /// Its own id rather than [`Bit`](BusId::Bit): the old ECSM/ECDAS chips are
+    /// live alongside the new ones until phase G, and a `stream = 0` tag would
+    /// collapse to an exact alias of an old-ECDAS `Bit[ts, round]` send (zero
+    /// elements are skipped by the fingerprint, so trailing-zero padding is
+    /// invisible). The `{1, 2}` tags close the same hole within this bus.
+    JointBit = 33,
 }
 
 impl BusId {
@@ -386,8 +411,11 @@ impl BusId {
             BusId::MemoryOp => "MemoryOp",
             BusId::Cpu32 => "Cpu32",
             BusId::Ecdas => "Ecdas",
+            BusId::Addend => "Addend",
             BusId::Bit => "Bit",
             BusId::GlobalMemory => "GlobalMemory",
+            BusId::EcT0 => "EcT0",
+            BusId::JointBit => "JointBit",
         }
     }
 }
@@ -418,8 +446,11 @@ impl TryFrom<u64> for BusId {
             26 => Ok(BusId::MemoryOp),
             27 => Ok(BusId::Cpu32),
             28 => Ok(BusId::Ecdas),
+            29 => Ok(BusId::Addend),
             30 => Ok(BusId::Bit),
             31 => Ok(BusId::GlobalMemory),
+            32 => Ok(BusId::EcT0),
+            33 => Ok(BusId::JointBit),
             other => Err(other),
         }
     }

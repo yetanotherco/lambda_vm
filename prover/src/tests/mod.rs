@@ -41,6 +41,8 @@ pub mod disk_spill_tests;
 #[cfg(test)]
 pub mod dvrm_tests;
 #[cfg(test)]
+pub mod ec_t0_tests;
+#[cfg(test)]
 pub mod ecdas_tests;
 #[cfg(test)]
 pub mod ecsm_tests;
@@ -48,6 +50,8 @@ pub mod ecsm_tests;
 pub mod eq_tests;
 #[cfg(test)]
 pub mod keccak_rnd_tests;
+#[cfg(test)]
+pub mod lincomb2_tests;
 #[cfg(test)]
 pub mod load_tests;
 #[cfg(test)]
@@ -70,6 +74,8 @@ pub mod ood_window_ir_tests;
 pub mod page_tests;
 #[cfg(test)]
 pub mod prove_elfs_tests;
+#[cfg(test)]
+pub mod range_check_balance_tests;
 #[cfg(test)]
 pub mod recursion_smoke_test;
 #[cfg(test)]

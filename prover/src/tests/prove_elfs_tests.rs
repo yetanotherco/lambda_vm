@@ -2747,6 +2747,59 @@ fn test_prove_commit_sum() {
     assert_eq!(proof.public_output, vec![8u8]);
 }
 
+/// The guest switch took effect: a real ethrex block routes its ecrecovers
+/// through the `ecsm_lincomb2` accelerator.
+///
+/// This is the test that makes the two block proofs below mean something. The
+/// guest's accelerated path ends in
+/// `ecsm_lincomb2(..).unwrap_or_else(|| ProjectivePoint::lincomb(..))`, so an
+/// accelerator that declines every call — a stale ELF, a marshalling slip that
+/// trips the `P1 != G` status, a `None` from any guard — produces exactly the
+/// same block output via the software fallback and every other assertion still
+/// passes. Counting real ECSM2 rows is what separates "accelerated" from
+/// "silently not accelerated".
+///
+/// Execution only: no proving, so this stays in the default suite.
+#[test]
+fn test_ethrex_block_uses_the_lincomb2_accelerator() {
+    use crate::tables::ecsm2::cols as ecsm2_cols;
+
+    let _ = env_logger::builder().is_test(true).try_init();
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let elf_bytes =
+        std::fs::read(workspace_root.join("executor/program_artifacts/rust/ethrex.elf"))
+            .expect("need ethrex.elf — run `make compile-programs-rust`");
+    let input =
+        std::fs::read(workspace_root.join("executor/tests/ethrex_5_transfers.bin")).unwrap();
+
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+    let executor =
+        executor::vm::execution::Executor::new(&elf, input).expect("Failed to create executor");
+    let result = executor.run().expect("Failed to run program");
+    let traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
+
+    let one = FieldElement::<GoldilocksField>::one();
+    let zero = FieldElement::<GoldilocksField>::zero();
+    let accelerated = (0..traces.ecsm2.num_rows())
+        .filter(|&r| {
+            *traces.ecsm2.main_table.get(r, ecsm2_cols::MU) == one
+                && *traces.ecsm2.main_table.get(r, ecsm2_cols::OK) == one
+                && *traces.ecsm2.main_table.get(r, ecsm2_cols::STATUS) == zero
+        })
+        .count();
+
+    // Five transfers, each recovering one sender.
+    assert_eq!(
+        accelerated, 5,
+        "expected one proven lincomb2 per transfer; the accelerator is being \
+         declined and the guest is silently using the software fallback",
+    );
+}
+
 #[test]
 #[ignore = "takes too long"]
 fn test_prove_ethrex_5_transfers() {
@@ -3564,5 +3617,273 @@ fn test_epoch_memory_bus_with_l2g_bookend() {
             &expected_bus_balance,
         ),
         "epoch Memory bus must balance with L2G bookend + PAGE excluding touched cells"
+    );
+}
+
+// =============================================================================
+// lincomb2 (ECSM2 / ECDAS2 joint chain)
+// =============================================================================
+
+/// End-to-end proof of the `ecsm_lincomb2` syscall.
+///
+/// The asm guest computes `Q = 3·G + 5·(2G) = 13·G` and commits
+/// `status(8) ‖ xQ(32) ‖ yQ(32)`. The committed bytes are cross-checked against
+/// an independent `lincomb2_witness` evaluation before the proof is attempted,
+/// so a mismatch is reported as a wrong result rather than as a proof failure.
+#[test]
+fn test_prove_elfs_ecsm_lincomb2() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_ecsm_lincomb2");
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
+    let result = executor.run().expect("Failed to run program");
+
+    let committed = &result.return_values.memory_values;
+    assert_eq!(committed.len(), 72, "expected status(8) ‖ xQ(32) ‖ yQ(32)");
+    assert_eq!(
+        &committed[..8],
+        &[0u8; 8],
+        "lincomb2 must succeed for 3·G + 5·(2G)"
+    );
+
+    let expected = lincomb2_reference_q(3, 5);
+    assert_eq!(&committed[8..40], &expected.0, "committed xQ");
+    assert_eq!(&committed[40..72], &expected.1, "committed yQ");
+
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "lincomb2 prove/verify failed"
+    );
+}
+
+/// Soundness: the verifier REJECTS a forged lincomb2 result.
+///
+/// `xQ` is bound by the phase-2 chain drain, by the `xQ < p` carry chain and by
+/// the output MEMW write, so tampering it must break the proof.
+#[test]
+fn test_prove_elfs_lincomb2_forged_result_rejected() {
+    use crate::tables::ecsm2::cols as ecsm2_cols;
+
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_ecsm_lincomb2");
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
+    let result = executor.run().expect("Failed to run program");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
+
+    let orig = *traces.ecsm2.main_table.get(0, ecsm2_cols::x_q(0));
+    let forged = orig + FieldElement::<GoldilocksField>::one();
+    traces.ecsm2.main_table.set(0, ecsm2_cols::x_q(0), forged);
+
+    assert!(
+        !prove_and_verify_vm_minimal(&elf, &mut traces),
+        "Verifier must reject a forged lincomb2 result xQ"
+    );
+}
+
+/// End-to-end proof of `ecsm_lincomb2` at the ecrecover shape: both scalars
+/// have bit 255 set, so the joint chain runs its maximum schedule (`len = 256`,
+/// ~450 ECDAS2 rows) rather than the 8-row toy chain.
+#[test]
+fn test_prove_elfs_ecsm_lincomb2_full_size() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_ecsm_lincomb2_full");
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
+    let result = executor.run().expect("Failed to run program");
+
+    let committed = &result.return_values.memory_values;
+    assert_eq!(committed.len(), 72);
+    assert_eq!(&committed[..8], &[0u8; 8], "lincomb2 must succeed");
+
+    // u1 = 2^255, u2 = 2^255 - 1: complementary bit patterns, so every round
+    // carries an add and the chain hits its domain maximum.
+    let u1_words = [0u64, 0, 0, 0x8000_0000_0000_0000];
+    let u2_words = [
+        0xFFFF_FFFF_FFFF_FFFFu64,
+        0xFFFF_FFFF_FFFF_FFFF,
+        0xFFFF_FFFF_FFFF_FFFF,
+        0x7FFF_FFFF_FFFF_FFFF,
+    ];
+    let (expected, steps) = lincomb2_reference_q_words(&u1_words, &u2_words);
+    assert_eq!(&committed[8..40], &expected.0, "committed xQ");
+    assert_eq!(&committed[40..72], &expected.1, "committed yQ");
+
+    // The point of this guest: the worst case is 514 rows, not the ~471 a random
+    // corpus reaches. A submitter can construct it deliberately, so any
+    // capacity-shaped bound has to survive here.
+    //
+    assert_eq!(
+        steps,
+        crate::tables::ecdas2::MAX_ROWS_PER_EVALUATION,
+        "expected the 514-row worst case (1 + 256 doublings + 256 adds + 1)",
+    );
+
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
+    let ecdas2_rows = traces.ecdas2.num_rows();
+    assert!(
+        ecdas2_rows >= crate::tables::ecdas2::MAX_ROWS_PER_EVALUATION,
+        "the joint chain must fit its worst case, got {ecdas2_rows} padded rows"
+    );
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "worst-case lincomb2 prove/verify failed"
+    );
+}
+
+/// Two lincomb2 ecalls in one program, against the same operand buffers.
+///
+/// The chip performs every MEMW access of a call at one timestamp, so repeated
+/// calls hitting the same addresses are what would break the access chain if
+/// that scheme were wrong — and repetition is the real shape (a block does many
+/// ecrecovers).
+#[test]
+fn test_prove_elfs_ecsm_lincomb2_multi() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_ecsm_lincomb2_multi");
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
+    let result = executor.run().expect("Failed to run program");
+
+    let committed = &result.return_values.memory_values;
+    assert_eq!(
+        committed.len(),
+        144,
+        "two status(8) + xQ(32) + yQ(32) blocks"
+    );
+    for (i, (u1, u2)) in [(3u64, 5u64), (7, 11)].into_iter().enumerate() {
+        let block = &committed[72 * i..72 * (i + 1)];
+        assert_eq!(&block[..8], &[0u8; 8], "call {i} must succeed");
+        let expected = lincomb2_reference_q(u1, u2);
+        assert_eq!(&block[8..40], &expected.0, "call {i} committed xQ");
+        assert_eq!(&block[40..72], &expected.1, "call {i} committed yQ");
+    }
+
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "multi-call lincomb2 prove/verify failed"
+    );
+}
+
+/// `Q = u1·G + u2·(2G)` from the phase-A witness, as `(xQ, yQ)` little-endian.
+fn lincomb2_reference_q(u1: u64, u2: u64) -> ([u8; 32], [u8; 32]) {
+    use executor::vm::instruction::execution::GENERATOR_LE;
+    use num_bigint::BigUint;
+
+    let point = |bytes: &[u8]| ecsm::AffinePoint {
+        x: BigUint::from_bytes_le(&bytes[..32]),
+        y: BigUint::from_bytes_le(&bytes[32..]),
+    };
+    let two_g_le = asm_two_g_le();
+
+    let mut u1_le = [0u8; 32];
+    let mut u2_le = [0u8; 32];
+    u1_le[..8].copy_from_slice(&u1.to_le_bytes());
+    u2_le[..8].copy_from_slice(&u2.to_le_bytes());
+
+    let w =
+        ecsm::witness::lincomb2_witness(&u1_le, &u2_le, &point(&GENERATOR_LE), &point(&two_g_le))
+            .expect("reference lincomb2 must succeed");
+    (w.x_q, w.y_q)
+}
+
+/// The same, for scalars given as four little-endian doublewords each. Also
+/// returns the number of joint-chain rows the witness emits, so a test can pin
+/// the schedule length as well as the result.
+fn lincomb2_reference_q_words(u1: &[u64; 4], u2: &[u64; 4]) -> (([u8; 32], [u8; 32]), usize) {
+    use executor::vm::instruction::execution::GENERATOR_LE;
+    use num_bigint::BigUint;
+
+    let point = |bytes: &[u8]| ecsm::AffinePoint {
+        x: BigUint::from_bytes_le(&bytes[..32]),
+        y: BigUint::from_bytes_le(&bytes[32..]),
+    };
+    let two_g_le = asm_two_g_le();
+    let pack = |words: &[u64; 4]| {
+        let mut out = [0u8; 32];
+        for (i, w) in words.iter().enumerate() {
+            out[8 * i..8 * i + 8].copy_from_slice(&w.to_le_bytes());
+        }
+        out
+    };
+
+    let w = ecsm::witness::lincomb2_witness(
+        &pack(u1),
+        &pack(u2),
+        &point(&GENERATOR_LE),
+        &point(&two_g_le),
+    )
+    .expect("reference lincomb2 must succeed");
+    ((w.x_q, w.y_q), w.steps.len())
+}
+
+/// `2G` exactly as every lincomb2 asm guest stores it at `sp+64`, so the tests
+/// and the guests cannot drift apart.
+fn asm_two_g_le() -> [u8; 64] {
+    const TWO_G_WORDS: [u64; 8] = [
+        0xABAC_09B9_5C70_9EE5,
+        0x5C77_8E4B_8CEF_3CA7,
+        0x3045_406E_95C0_7CD8,
+        0xC604_7F94_41ED_7D6D,
+        0x2364_31A9_50CF_E52A,
+        0xF7F6_3265_3266_D0E1,
+        0xA3C5_8419_466C_EAEE,
+        0x1AE1_68FE_A63D_C339,
+    ];
+    let mut out = [0u8; 64];
+    for (i, word) in TWO_G_WORDS.iter().enumerate() {
+        out[8 * i..8 * i + 8].copy_from_slice(&word.to_le_bytes());
+    }
+    out
+}
+
+/// `count_elements_by_table` must agree with `count_elements` exactly — they
+/// share one implementation, and this is what keeps that true.
+///
+/// Also asserts the breakdown names the lincomb2 chips, since the phase-H bench
+/// reads the EC share by table name.
+#[test]
+fn test_count_elements_by_table_sums_to_the_totals() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_ecsm_lincomb2");
+
+    let (main, aux) = crate::count_elements(&elf_bytes, &[]).expect("count_elements");
+    let by_table = crate::count_elements_by_table(&elf_bytes, &[]).expect("by_table");
+
+    assert_eq!(by_table.iter().map(|t| t.1).sum::<u64>(), main, "main");
+    assert_eq!(by_table.iter().map(|t| t.2).sum::<u64>(), aux, "aux");
+
+    let names: Vec<&str> = by_table.iter().map(|t| t.0).collect();
+    for expected in ["CPU", "ECSM", "ECDAS", "ECSM2", "ECDAS2", "EC_T0"] {
+        assert!(names.contains(&expected), "missing table {expected}");
+    }
+    assert_eq!(
+        names.len(),
+        names.iter().collect::<std::collections::HashSet<_>>().len(),
+        "table names must be unique — a split table should appear once, summed",
+    );
+
+    // The EC share this guest actually spends, which is what phase H measures.
+    let ec: u64 = by_table
+        .iter()
+        .filter(|(n, _, _)| n.starts_with("EC"))
+        .map(|t| t.1 + t.2)
+        .sum();
+    assert!(
+        ec > 0,
+        "the lincomb2 guest must spend cells on the EC tables"
     );
 }

@@ -188,6 +188,15 @@ pub struct CpuOperation {
 
     /// Whether this ECALL is an ECSM (elliptic-curve scalar multiply) syscall
     pub ecall_ecsm: bool,
+
+    /// Whether this ECALL is an ECSM `lincomb2` syscall (`Q = u1·P1 + u2·P2`).
+    pub ecall_lincomb2: bool,
+    /// For lincomb2 ECALLs: the result address `a0`, carried in the log because
+    /// x10 is clobbered by the status word on return.
+    pub lincomb2_addr_q: u64,
+    /// For lincomb2 ECALLs: the status word left in x10. Redundant with the
+    /// trace builder's replay, and asserted against it.
+    pub lincomb2_status: u64,
 }
 
 impl CpuOperation {
@@ -235,6 +244,16 @@ impl CpuOperation {
         // in the trace builder.
         let ecall_ecsm =
             f.ecall && log.src1_val == executor::vm::instruction::execution::ECSM_SYSCALL_NUMBER;
+        // lincomb2's operand addresses live in x11/x12/x13 and are recovered from
+        // the register state, but x10 is overwritten with the status word before
+        // the trace builder runs, so the result address rides `src2_val`.
+        let ecall_lincomb2 = f.ecall
+            && log.src1_val == executor::vm::instruction::execution::ECSM_LINCOMB2_SYSCALL_NUMBER;
+        let (lincomb2_addr_q, lincomb2_status) = if ecall_lincomb2 {
+            (log.src2_val, log.dst_val)
+        } else {
+            (0, 0)
+        };
 
         // Word instructions are fully handled by CPU32; the main CPU row is a
         // delegate that only advances the PC and sends the CPU32 lookup. We still
@@ -353,6 +372,9 @@ impl CpuOperation {
             ecall_keccak,
             keccak_state_addr,
             ecall_ecsm,
+            ecall_lincomb2,
+            lincomb2_addr_q,
+            lincomb2_status,
         }
     }
 

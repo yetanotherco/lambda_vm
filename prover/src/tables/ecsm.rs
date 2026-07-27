@@ -271,6 +271,16 @@ fn register_value(lo_col: usize, hi_col: usize) -> [BusValue; 8] {
 
 /// The 32 bytes of a U256BL coordinate as bus elements (shared shape for the ECDAS bus,
 /// used identically by ECSM and ECDAS).
+///
+/// **The one-element-per-byte layout is a soundness property, not a formatting choice.**
+/// Because each byte is its own `Packing::Direct` element, tuple equality on this bus is
+/// per-limb, so a receiver inherits byte-ness from the sender's `AreBytes`-checked columns
+/// without re-checking it. Repacking this (e.g. `Word4L`, 4 bytes per element) to shrink
+/// the bus would break that: a receiver could satisfy the same packed value with a
+/// different decomposition (`b₀ + 2⁸k`, `b₁ − k`), and its own limbs carry no range check,
+/// so reachable limb magnitudes run to ~2^63. The convolution relations have ~2^39 of
+/// headroom against honest *byte* limbs but only ~2^29 against malformed ones — a single
+/// non-byte limb breaks the integer identity. Do not repack.
 pub fn point_coord_busvalues(col: usize) -> Vec<BusValue> {
     (0..32).map(|b| packed(col + b)).collect()
 }
