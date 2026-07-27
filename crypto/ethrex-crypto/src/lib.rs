@@ -133,7 +133,12 @@ fn decompress_r(r_bytes: &FieldBytes, y_is_odd: bool) -> Option<AffinePoint> {
         let y_be = get_hint(lambda_vm_syscalls::syscalls::HINT_FIELD_SQRT, &rhs_be);
         let mut y: FieldElement = Option::from(FieldElement::from_bytes(&y_be.into()))?;
         let y2: FieldElement = y.square();
-        if y2.to_bytes() != rhs.to_bytes() {
+        // Verify the untrusted root: y² must equal x³+7. Negate `y2`, not `rhs`:
+        // `Neg` is `negate(1)` and only accepts magnitude 1, which `square()` always
+        // returns, whereas `rhs` is a sum and carries magnitude 2 — negating it would
+        // silently compute the wrong value in release, where the debug assert is gone.
+        // (`ct_eq` is unusable here for the same reason as in `field_inv`.)
+        if !bool::from((rhs + y2.negate(1)).normalizes_to_zero()) {
             return None;
         }
         // Select the root whose canonical LSB matches the requested parity.
@@ -269,8 +274,7 @@ fn ecsm_oracle(x: &FieldElement, k: &Scalar) -> Option<FieldElement> {
 ///
 /// Generic over the oracle so unit tests can substitute a software stand-in.
 /// Base-field inverse `x⁻¹ mod p`. On riscv64 the host supplies it via the
-/// `hint` ecall and we verify `x·inv == 1` (canonical byte compare to sidestep
-/// k256's lazy-normalized magnitudes); off-target it inverts in software.
+/// `hint` ecall and we verify `x·inv == 1`; off-target it inverts in software.
 #[cfg(any(target_arch = "riscv64", test))]
 fn field_inv(x: &FieldElement) -> Option<FieldElement> {
     #[cfg(target_arch = "riscv64")]
@@ -278,7 +282,14 @@ fn field_inv(x: &FieldElement) -> Option<FieldElement> {
         let x_be: [u8; 32] = x.to_bytes().into();
         let inv_be = get_hint(lambda_vm_syscalls::syscalls::HINT_FIELD_INV, &x_be);
         let inv: FieldElement = Option::from(FieldElement::from_bytes(&inv_be.into()))?;
-        if (*x * inv).to_bytes() == FieldElement::ONE.to_bytes() {
+        // Verify the untrusted hint: x·inv must equal 1 (mod p). Compare by asking
+        // whether the difference normalizes to zero — a value-level test that skips
+        // the two full normalizations a `to_bytes()` compare pays. `ct_eq` is NOT a
+        // substitute: k256's FieldElement compares raw limbs *and* the magnitude and
+        // `normalized` tags, so a `mul` result (magnitude 1, unnormalized) never
+        // compares equal to the normalized `ONE` constant whatever its value.
+        // `Neg` is `negate(1)`, valid here because `mul` yields magnitude 1.
+        if bool::from((*x * inv - FieldElement::ONE).normalizes_to_zero()) {
             Some(inv)
         } else {
             None
