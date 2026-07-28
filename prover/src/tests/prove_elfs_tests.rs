@@ -1234,9 +1234,9 @@ fn test_prove_hint_min_rust_guest() {
         "hint_min rust guest should verify"
     );
 
-    // Committed output must equal the hinted value (field inverse of 3, 32-byte LE).
+    // Committed output must equal the hinted value (field inverse of 3, 32-byte BE).
     let mut input = [0u8; 32];
-    input[0] = 3;
+    input[31] = 3; // big-endian hint input (ABI is BE)
     let expected =
         executor::vm::instruction::execution::compute_hint(0 /* HINT_FIELD_INV */, &input);
     assert_eq!(proof.public_output, expected.to_vec());
@@ -1265,11 +1265,11 @@ fn test_prove_hint_multi_rust_guest() {
         "hint_multi rust guest should verify"
     );
 
-    // Expected = XOR of field-inverses of 3, 5, 7 (32-byte LE), matching the guest.
+    // Expected = XOR of field-inverses of 3, 5, 7 (32-byte BE), matching the guest.
     let mut expected = [0u8; 32];
     for seed in [3u8, 5u8, 7u8] {
         let mut input = [0u8; 32];
-        input[0] = seed;
+        input[31] = seed; // big-endian hint input (ABI is BE)
         let inv =
             executor::vm::instruction::execution::compute_hint(0 /* HINT_FIELD_INV */, &input);
         for i in 0..32 {

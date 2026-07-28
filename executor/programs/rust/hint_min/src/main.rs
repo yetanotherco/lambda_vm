@@ -13,7 +13,7 @@ struct Aligned32([u8; 32]);
 pub fn main() {
     // input = 3 (little-endian), a valid invertible field element.
     let mut x = Aligned32([0u8; 32]);
-    x.0[0] = 3;
+    x.0[31] = 3; // big-endian hint input (ABI is BE)
     let mut inv = Aligned32([0u8; 32]);
 
     syscalls::syscalls::hint(

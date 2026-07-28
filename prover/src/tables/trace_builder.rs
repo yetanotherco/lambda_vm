@@ -982,10 +982,12 @@ fn collect_hint_ops(
     let in_addr = register_state.read(11).0;
     let out_addr = register_state.read(12).0;
 
-    // Read the 32-byte little-endian input from the replayed memory.
+    // Read the 32-byte big-endian input from the replayed memory (4 batched
+    // doubleword reads, same map traffic shape as the output writes below).
     let mut input = [0u8; 32];
-    for (i, b) in input.iter_mut().enumerate() {
-        *b = memory_state.read_byte(in_addr.wrapping_add(i as u64)).0;
+    for i in 0..4 {
+        let (vals, _ts) = memory_state.read_bytes(in_addr.wrapping_add((8 * i) as u64), 8);
+        input[8 * i..8 * i + 8].copy_from_slice(&vals.map(|v| v as u8));
     }
 
     // Recompute the output exactly as the executor did (the value isn't in the log).

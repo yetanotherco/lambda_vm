@@ -19,7 +19,7 @@ pub fn main() {
 
     for seed in [3u8, 5u8, 7u8] {
         let mut x = Aligned32([0u8; 32]);
-        x.0[0] = seed;
+        x.0[31] = seed; // big-endian hint input (ABI is BE)
         let mut inv = Aligned32([0u8; 32]);
 
         syscalls::syscalls::hint(syscalls::syscalls::HINT_FIELD_INV, &mut inv.0, &x.0);

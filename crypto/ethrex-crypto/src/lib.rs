@@ -16,6 +16,9 @@
 //! Every other `Crypto` method inherits the trait default (vetted pure-Rust
 //! crates: `ark-bn254`, `bls12_381`, `p256`, `sha2`, `ripemd`, …).
 
+// Only used by the host (non-riscv64) keccak fallback; the guest hashes via the
+// keccak_permute ecall and this import would be dead code there.
+#[cfg(not(target_arch = "riscv64"))]
 use ethrex_crypto::keccak::keccak_hash;
 use ethrex_crypto::{Crypto, CryptoError};
 use k256::elliptic_curve::group::prime::PrimeCurveAffine;
@@ -80,15 +83,15 @@ impl Crypto for LambdaVmEcsmCrypto {
 /// We compute the recovery directly rather than calling k256's
 /// `recover_from_prehash`, which internally runs a *second* lincomb to
 /// re-verify the key — doubling the ECSM ecalls for no gain here.
-/// Obtain a 32-byte little-endian hint for `x_le` via the executor `hint` ecall
+/// Obtain a 32-byte **big-endian** hint for `x_be` via the executor `hint` ecall
 /// (the host computes the modular inverse / sqrt; the value is provable via the
 /// prover's HINT table). The result is UNVERIFIED — every caller MUST check it
 /// in-guest (`x·inv == 1`, `y² == x³+7`), since the ecall adds no correctness
 /// constraint. BENCH scaffolding.
 #[cfg(target_arch = "riscv64")]
-fn get_hint(hint_id: usize, x_le: &[u8; 32]) -> [u8; 32] {
+fn get_hint(hint_id: usize, x_be: &[u8; 32]) -> [u8; 32] {
     let mut out = [0u8; 32];
-    lambda_vm_syscalls::syscalls::hint(hint_id, &mut out, x_le);
+    lambda_vm_syscalls::syscalls::hint(hint_id, &mut out, x_be);
     out
 }
 
@@ -99,17 +102,10 @@ fn scalar_inv(x: &Scalar) -> Option<Scalar> {
     #[cfg(target_arch = "riscv64")]
     {
         use k256::elliptic_curve::subtle::ConstantTimeEq;
-        let x_be = x.to_bytes();
-        let mut x_le = [0u8; 32];
-        for i in 0..32 {
-            x_le[i] = x_be[31 - i];
-        }
-        let inv_le = get_hint(lambda_vm_syscalls::syscalls::HINT_SCALAR_INV, &x_le);
-        let mut inv_be = k256::FieldBytes::default();
-        for i in 0..32 {
-            inv_be[i] = inv_le[31 - i];
-        }
-        let inv: Scalar = Option::from(Scalar::from_repr(inv_be))?;
+        // The hint ABI is big-endian — k256's native serialization, no reversals.
+        let x_be: [u8; 32] = x.to_bytes().into();
+        let inv_be = get_hint(lambda_vm_syscalls::syscalls::HINT_SCALAR_INV, &x_be);
+        let inv: Scalar = Option::from(Scalar::from_repr(inv_be.into()))?;
         // Verify the untrusted hint: x·inv must equal 1 (mod n).
         if bool::from((*x * inv).ct_eq(&Scalar::ONE)) {
             Some(inv)
@@ -136,17 +132,9 @@ fn decompress_r(r_bytes: &FieldBytes, y_is_odd: bool) -> Option<AffinePoint> {
         let seven: FieldElement = Option::from(FieldElement::from_bytes(&seven_bytes.into()))?;
         let x3: FieldElement = x.square() * x;
         let rhs: FieldElement = x3 + seven;
-        // Hinted sqrt (LE in/out), then verify y² == rhs canonically.
-        let rhs_be = rhs.to_bytes();
-        let mut rhs_le = [0u8; 32];
-        for i in 0..32 {
-            rhs_le[i] = rhs_be[31 - i];
-        }
-        let y_le = get_hint(lambda_vm_syscalls::syscalls::HINT_FIELD_SQRT, &rhs_le);
-        let mut y_be = [0u8; 32];
-        for i in 0..32 {
-            y_be[i] = y_le[31 - i];
-        }
+        // Hinted sqrt (BE in/out), then verify y² == rhs.
+        let rhs_be: [u8; 32] = rhs.to_bytes().into();
+        let y_be = get_hint(lambda_vm_syscalls::syscalls::HINT_FIELD_SQRT, &rhs_be);
         let mut y: FieldElement = Option::from(FieldElement::from_bytes(&y_be.into()))?;
         let y2: FieldElement = y.square();
         if y2.to_bytes() != rhs.to_bytes() {
@@ -285,23 +273,17 @@ fn ecsm_oracle(x: &FieldElement, k: &Scalar) -> Option<FieldElement> {
 ///
 /// Generic over the oracle so unit tests can substitute a software stand-in.
 /// Base-field inverse `x⁻¹ mod p`. On riscv64 the host supplies it via the
-/// `hint` ecall and we verify `x·inv == 1` (canonical byte compare to sidestep
-/// k256's lazy-normalized magnitudes); off-target it inverts in software.
+/// `hint` ecall and we verify `x·inv == 1`; off-target it inverts in software.
 #[cfg(any(target_arch = "riscv64", test))]
 fn field_inv(x: &FieldElement) -> Option<FieldElement> {
     #[cfg(target_arch = "riscv64")]
     {
-        let x_be = x.to_bytes();
-        let mut x_le = [0u8; 32];
-        for i in 0..32 {
-            x_le[i] = x_be[31 - i];
-        }
-        let inv_le = get_hint(lambda_vm_syscalls::syscalls::HINT_FIELD_INV, &x_le);
-        let mut inv_be = [0u8; 32];
-        for i in 0..32 {
-            inv_be[i] = inv_le[31 - i];
-        }
+        // The hint ABI is big-endian — k256's native serialization, no reversals.
+        let x_be: [u8; 32] = x.to_bytes().into();
+        let inv_be = get_hint(lambda_vm_syscalls::syscalls::HINT_FIELD_INV, &x_be);
         let inv: FieldElement = Option::from(FieldElement::from_bytes(&inv_be.into()))?;
+        // Canonical compare: k256's ct_eq compares internal (lazy) representations
+        // and can reject an arithmetically-equal product.
         if (*x * inv).to_bytes() == FieldElement::ONE.to_bytes() {
             Some(inv)
         } else {

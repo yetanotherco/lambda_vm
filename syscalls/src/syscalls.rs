@@ -199,8 +199,9 @@ pub fn ecsm_mul(_xr: &mut [u8; 32], _xg: &[u8; 32], _k: &[u8; 32]) {
 
 /// BENCH ONLY. Ask the host for a non-constraining hint (modular inverse/sqrt).
 /// `hint_id` selects the operation ([`HINT_FIELD_INV`]/[`HINT_SCALAR_INV`]/
-/// [`HINT_FIELD_SQRT`]); `input`/`out` are 32-byte little-endian field/scalar
-/// elements. The result is UNVERIFIED — the caller MUST check it in-guest
+/// [`HINT_FIELD_SQRT`]); `input`/`out` are 32-byte **big-endian** field/scalar
+/// elements (k256's native serialization — no byte-reversal loops on either
+/// side). The result is UNVERIFIED — the caller MUST check it in-guest
 /// (e.g. `x·inv == 1`), since this ecall adds no correctness constraint.
 #[cfg(target_arch = "riscv64")]
 pub fn hint(hint_id: usize, out: &mut [u8; 32], input: &[u8; 32]) {
@@ -208,8 +209,8 @@ pub fn hint(hint_id: usize, out: &mut [u8; 32], input: &[u8; 32]) {
         asm!(
             "ecall",
             in("a0") hint_id,           // x10 = hint selector
-            in("a1") input.as_ptr(),    // x11 = input address (32-byte LE)
-            in("a2") out.as_mut_ptr(),  // x12 = output address (32-byte LE)
+            in("a1") input.as_ptr(),    // x11 = input address (32-byte BE)
+            in("a2") out.as_mut_ptr(),  // x12 = output address (32-byte BE)
             in("a7") HINT_SYSCALL_NUMBER,
         )
     }
