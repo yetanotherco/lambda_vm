@@ -191,6 +191,29 @@ pub fn ecsm_mul(xr: &mut [u8; 32], xg: &[u8; 32], k: &[u8; 32]) {
     }
 }
 
+/// AFFINE PoC: compute `k·G` on secp256k1 and write BOTH coordinates into a contiguous
+/// 64-byte buffer (`xR` at `out[0..32]`, `yR` at `out[32..64]`), all 32-byte little-endian.
+/// `yR` follows the even-`yG` convention; the caller flips its sign if the real `yG` is odd.
+/// Same ABI as [`ecsm_mul`] except `x10` points at a 64-byte output. Lets ECDSA recovery
+/// avoid the second `(k+1)·P` query and the x-only y-reconstruction.
+#[cfg(target_arch = "riscv64")]
+pub fn ecsm_mul_affine(out: &mut [u8; 64], xg: &[u8; 32], k: &[u8; 32]) {
+    unsafe {
+        asm!(
+            "ecall",
+            in("a0") out.as_mut_ptr(), // x10 = address to write [xR‖yR] (64 bytes)
+            in("a1") xg.as_ptr(),      // x11 = address of xG
+            in("a2") k.as_ptr(),       // x12 = address of k
+            in("a7") ECSM_SYSCALL_NUMBER,
+        )
+    }
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+pub fn ecsm_mul_affine(_out: &mut [u8; 64], _xg: &[u8; 32], _k: &[u8; 32]) {
+    unimplemented!("syscalls are only implemented for riscv64 targets");
+}
+
 #[cfg(not(target_arch = "riscv64"))]
 /// Compute `xR = (k·G)_x` on secp256k1 via the ECSM accelerator (32-byte little-endian values).
 pub fn ecsm_mul(_xr: &mut [u8; 32], _xg: &[u8; 32], _k: &[u8; 32]) {
