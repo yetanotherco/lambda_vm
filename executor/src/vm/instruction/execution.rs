@@ -496,8 +496,10 @@ impl Instruction {
                         let addr_xr = registers.read(10)?;
                         let addr_xg = registers.read(11)?;
                         let addr_k = registers.read(12)?;
+                        // AFFINE PoC: the output is a contiguous 64-byte buffer at
+                        // addr_xr (xR at +0, yR at +32), so it spans offset 63.
                         if !ecsm_addr_ok(addr_xg, 31)
-                            || !ecsm_addr_ok(addr_xr, 31)
+                            || !ecsm_addr_ok(addr_xr, 63)
                             || !ecsm_addr_ok(addr_k, 31)
                         {
                             return Err(ExecutionError::EcsmAddressOverflow);
@@ -514,8 +516,11 @@ impl Instruction {
                         }
                         let xg = load_u256_le(memory, addr_xg)?;
                         let k = load_u256_le(memory, addr_k)?;
-                        let xr = ecsm::scalar_mul_x(&k, &xg)?;
+                        // AFFINE PoC: return both coordinates so the guest skips the
+                        // x-only (k+1)·P y-reconstruction. xR at addr_xr, yR at +32.
+                        let (xr, yr) = ecsm::scalar_mul_xy(&k, &xg)?;
                         store_u256_le(memory, addr_xr, &xr)?;
+                        store_u256_le(memory, addr_xr.wrapping_add(32), &yr)?;
                         // Carry addr_xG/addr_k in the CPU log; addr_xR is recovered from x10
                         // by the ECSM register-read path in the trace builder.
                         src2_val = addr_xg;

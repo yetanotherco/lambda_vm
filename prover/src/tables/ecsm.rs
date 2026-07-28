@@ -443,6 +443,33 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ));
     }
 
+    // AFFINE PoC: write yR as 4 doublewords at addr_xR + 32 + 8i (ts + 3). Reuses the
+    // ADDR_XR register (output buffer is the contiguous 64-byte [xR‖yR]); no new column
+    // or register read. yR (col YR) is the ECDAS-constrained y of k·(xG, even-yG). The
+    // guest fixes the sign from its known yG parity. ts + 3 is the free 4th sub-timestamp
+    // (instruction stride is 4; xG@T, k@T+1, xR@T+2 use the first three).
+    for i in 0..4 {
+        let base_lo = BusValue::linear(vec![
+            LinearTerm::Column {
+                coefficient: 1,
+                column: cols::ADDR_XR_0,
+            },
+            LinearTerm::Constant((32 + 8 * i) as i64),
+        ]);
+        out.push(BusInteraction::sender(
+            BusId::Memw,
+            mu(),
+            memw_write(
+                dword_bytes(cols::YR, i),
+                base_lo,
+                packed(cols::ADDR_XR_1),
+                ts_lo_plus(3),
+                ts_hi(),
+                1,
+            ),
+        ));
+    }
+
     // IS_BYTE range checks (single byte → AreBytes[x, 0]).
     let is_byte = |col: usize, len: usize, out: &mut Vec<BusInteraction>| {
         for i in 0..len {

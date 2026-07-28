@@ -151,11 +151,19 @@ fn schedule(k: &BigUint) -> Vec<(u8, u8, u8)> {
 /// multiplication. Needs no step list or slopes, so it skips all witness work.
 /// `k` must be in `[1, N)` (guaranteed by `prepare`).
 pub fn scalar_mul_affine_x(k: &BigUint, g: &AffinePoint) -> BigUint {
+    scalar_mul_affine(k, g).x
+}
+
+/// Executor fast path (affine PoC): the full affine point `k·g`. Same convention as
+/// `scalar_mul_affine_x` / the witness — `g` is the even-`y` lift of its x-coordinate,
+/// so `k·g`'s y matches the ECDAS-constrained `y_r`. Returns both coordinates so the
+/// `ecsm_mul_affine` syscall can hand `y` back to the guest.
+pub fn scalar_mul_affine(k: &BigUint, g: &AffinePoint) -> AffinePoint {
     let scalar = Option::<Scalar>::from(Scalar::from_repr(be32(k).into()))
         .expect("ECSM: scalar k must be < N");
     let g_proj = ProjectivePoint::from(to_k256_affine(g));
     let r = (g_proj * scalar).to_affine();
-    from_k256_affine(&r).x
+    from_k256_affine(&r)
 }
 
 /// Replays the ECDAS double-and-add for `k·g` using k256 projective arithmetic and

@@ -942,6 +942,23 @@ fn collect_ecsm_ops(
         memory_state.write_bytes(addr, dword, 8, t + 2);
     }
 
+    // AFFINE PoC: yR writes at T + 3 (4 doublewords at addr_xR + 32 + 8i). Matches the
+    // ecsm.rs YR sender block; the executor wrote yR to addr_xR + 32.
+    for i in 0..4 {
+        let addr = addr_xr.wrapping_add((32 + 8 * i) as u64);
+        let mut value = [0u32; 8];
+        let mut dword = 0u64;
+        for j in 0..8 {
+            value[j] = witness.y_r[8 * i + j] as u32;
+            dword |= (witness.y_r[8 * i + j] as u64) << (8 * j);
+        }
+        let (old_vals, old_ts) = memory_state.read_bytes(addr, 8);
+        memw_ops.push(
+            MemwOperation::new(false, addr, value, t + 3, 8, false).with_old(old_vals, old_ts),
+        );
+        memory_state.write_bytes(addr, dword, 8, t + 3);
+    }
+
     let ecdas_ops = witness
         .steps
         .iter()
