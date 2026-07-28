@@ -1482,6 +1482,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_dma_memcpy_across_continuation_epochs() {
+        let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("workspace root")
+            .to_path_buf();
+        let elf_bytes = std::fs::read(
+            workspace_root.join("executor/program_artifacts/rust/dma_memcpy_min.elf"),
+        )
+        .expect("dma_memcpy_min.elf not found — build its make target");
+        let opts = ProofOptions::default_test_options();
+
+        let bundle = prove_continuation(&elf_bytes, &[], 6, &opts)
+            .expect("DMA continuation proof generation");
+        assert!(
+            bundle.num_epochs() > 1,
+            "64-cycle epochs must split the DMA guest"
+        );
+
+        let output = verify_continuation(&elf_bytes, &bundle, &opts)
+            .expect("DMA continuation verification")
+            .expect("honest DMA continuation must verify");
+        assert_eq!(
+            output, b"DMA copies eight-byte rows and a short tail",
+            "continuation output must match the copied bytes"
+        );
+    }
+
     // Supplied genesis roots must verify identically to the trustless recompute,
     // and a tampered root (DECODE or a page) must be rejected. `data_page_touch`
     // touches a real ELF `.data` page, unlike this file's stack-only fixtures.

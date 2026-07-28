@@ -1,3 +1,4 @@
+pub mod dma_tests;
 pub mod ecsm_tests;
 pub mod flamegraph_tests;
 pub mod keccak_tests;

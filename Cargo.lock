@@ -586,6 +586,7 @@ name = "executor"
 version = "0.1.0"
 dependencies = [
  "ecsm",
+ "proptest",
  "rustc-demangle",
  "serde",
  "serde_json",

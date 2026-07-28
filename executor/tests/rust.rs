@@ -1,6 +1,7 @@
 use executor::{
     elf::Elf,
     vm::execution::{Executor, ReturnValues},
+    vm::instruction::{decoding::Instruction, execution::DMA_MEMCPY_SYSCALL_NUMBER},
 };
 
 // NOTE: These tests require 64-bit RISC-V ELF files (RV64IM).
@@ -113,6 +114,37 @@ fn test_vector() {
     run_program_and_check_public_output(
         "./program_artifacts/rust/vector.elf",
         [1, 2, 3, 4, 5].to_vec(),
+        vec![],
+    );
+}
+
+#[test]
+fn test_dma_memcpy() {
+    let elf_data = std::fs::read("./program_artifacts/rust/dma_memcpy_min.elf").unwrap();
+    let program = Elf::load(&elf_data).unwrap();
+    let result = Executor::new(&program, vec![]).unwrap().run().unwrap();
+
+    assert_eq!(
+        result.return_values.memory_values,
+        b"DMA copies eight-byte rows and a short tail"
+    );
+    assert!(
+        result.logs.iter().any(|log| {
+            log.src1_val == DMA_MEMCPY_SYSCALL_NUMBER
+                && matches!(
+                    result.instructions.get(&log.current_pc),
+                    Some(Instruction::EcallEbreak)
+                )
+        }),
+        "the strong memcpy symbol must execute at least one DMA ecall"
+    );
+}
+
+#[test]
+fn test_dma_memcpy_cases() {
+    run_program_and_check_public_output(
+        "./program_artifacts/rust/dma_memcpy_cases.elf",
+        b"dma-cases-ok".to_vec(),
         vec![],
     );
 }
