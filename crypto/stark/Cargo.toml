@@ -20,7 +20,8 @@ log = "0.4.17"
 digest = "0.10.7"
 serde = { version = "1.0", features = ["derive"] }
 itertools = "0.11.0"
-rkyv = { version = "0.8.10", default-features = false, features = ["alloc", "bytecheck", "aligned"] }
+# pointer_width_64: proof-format pointer width — see prover/Cargo.toml.
+rkyv = { version = "0.8.10", default-features = false, features = ["alloc", "bytecheck", "aligned", "pointer_width_64"] }
 
 # Parallelization crates
 rayon = { version = "1.8.0", optional = true }
