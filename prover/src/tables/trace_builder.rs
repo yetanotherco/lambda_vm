@@ -847,26 +847,34 @@ fn collect_ecsm_ops(
     Vec<ecdas::EcdasOperation>,
 ) {
     let t = op.timestamp;
+    let is_affine = op.ecsm_affine;
     let addr_xr = register_state.read(10).0;
     let addr_xg = register_state.read(11).0;
     let addr_k = register_state.read(12).0;
 
-    // Read the operands from memory: xG‖yG (64 contiguous bytes) and k (32 bytes).
-    // AFFINE: yG is the caller's real input y (pinned below by a memory read), so the
-    // witnessed/returned point is the caller's actual point — no even-parity convention.
+    // Read the operands from memory. x-only reads xG (32B) + k (32B); affine also reads yG
+    // (the caller's real input y, pinned below by a memory read at T) so the returned point
+    // is the caller's actual point — no even-parity convention.
     let mut xg = [0u8; 32];
     let mut yg = [0u8; 32];
     let mut k = [0u8; 32];
     for i in 0..32 {
         xg[i] = memory_state.read_byte(addr_xg.wrapping_add(i as u64)).0;
-        yg[i] = memory_state
-            .read_byte(addr_xg.wrapping_add(32 + i as u64))
-            .0;
+        if is_affine {
+            yg[i] = memory_state
+                .read_byte(addr_xg.wrapping_add(32 + i as u64))
+                .0;
+        }
         k[i] = memory_state.read_byte(addr_k.wrapping_add(i as u64)).0;
     }
 
-    let witness = ::ecsm::compute_witness_with_y(&k, &xg, &yg)
-        .expect("ECSM witness: executor validates 0 < k < N, xG/yG < p, (xG,yG) on curve");
+    let witness = if is_affine {
+        ::ecsm::compute_witness_with_y(&k, &xg, &yg)
+            .expect("ECSM witness: executor validates 0 < k < N, xG/yG < p, (xG,yG) on curve")
+    } else {
+        ::ecsm::compute_witness(&k, &xg)
+            .expect("ECSM witness: executor validates 0 < k < N and xG on curve")
+    };
 
     let mut memw_ops = Vec::with_capacity(15);
 
@@ -895,19 +903,23 @@ fn collect_ecsm_ops(
         memory_state.write_bytes(addr, dword, 8, t);
     }
 
-    // AFFINE: yG: 4 doubleword reads at T (addr_xG + 32 + 8i). Pins the witnessed yG to
-    // the caller's input, closing the parity soundness gap of the x-only-input version.
-    for i in 0..4 {
-        let addr = addr_xg.wrapping_add((32 + 8 * i) as u64);
-        let mut value = [0u32; 8];
-        let mut dword = 0u64;
-        for j in 0..8 {
-            value[j] = witness.y_g[8 * i + j] as u32;
-            dword |= (witness.y_g[8 * i + j] as u64) << (8 * j);
+    // AFFINE only: yG: 4 doubleword reads at T (addr_xG + 32 + 8i). Pins the witnessed yG to
+    // the caller's input, closing the parity soundness gap. x-only guests pass only xG, so
+    // this block (and the ECSM table's yG-read bus, gated by IS_AFFINE) does not run.
+    if is_affine {
+        for i in 0..4 {
+            let addr = addr_xg.wrapping_add((32 + 8 * i) as u64);
+            let mut value = [0u32; 8];
+            let mut dword = 0u64;
+            for j in 0..8 {
+                value[j] = witness.y_g[8 * i + j] as u32;
+                dword |= (witness.y_g[8 * i + j] as u64) << (8 * j);
+            }
+            let (_old, old_ts) = memory_state.read_bytes(addr, 8);
+            memw_ops
+                .push(MemwOperation::new(false, addr, value, t, 8, true).with_old(value, old_ts));
+            memory_state.write_bytes(addr, dword, 8, t);
         }
-        let (_old, old_ts) = memory_state.read_bytes(addr, 8);
-        memw_ops.push(MemwOperation::new(false, addr, value, t, 8, true).with_old(value, old_ts));
-        memory_state.write_bytes(addr, dword, 8, t);
     }
 
     // x12 -> addr_k (register read at T+1).
@@ -963,21 +975,24 @@ fn collect_ecsm_ops(
         memory_state.write_bytes(addr, dword, 8, t + 2);
     }
 
-    // AFFINE PoC: yR writes at T + 3 (4 doublewords at addr_xR + 32 + 8i). Matches the
-    // ecsm.rs YR sender block; the executor wrote yR to addr_xR + 32.
-    for i in 0..4 {
-        let addr = addr_xr.wrapping_add((32 + 8 * i) as u64);
-        let mut value = [0u32; 8];
-        let mut dword = 0u64;
-        for j in 0..8 {
-            value[j] = witness.y_r[8 * i + j] as u32;
-            dword |= (witness.y_r[8 * i + j] as u64) << (8 * j);
+    // AFFINE only: yR writes at T + 3 (4 doublewords at addr_xR + 32 + 8i). Matches the
+    // ecsm.rs YR sender block (gated by IS_AFFINE); the executor wrote yR to addr_xR + 32.
+    // x-only guests get only xR written back.
+    if is_affine {
+        for i in 0..4 {
+            let addr = addr_xr.wrapping_add((32 + 8 * i) as u64);
+            let mut value = [0u32; 8];
+            let mut dword = 0u64;
+            for j in 0..8 {
+                value[j] = witness.y_r[8 * i + j] as u32;
+                dword |= (witness.y_r[8 * i + j] as u64) << (8 * j);
+            }
+            let (old_vals, old_ts) = memory_state.read_bytes(addr, 8);
+            memw_ops.push(
+                MemwOperation::new(false, addr, value, t + 3, 8, false).with_old(old_vals, old_ts),
+            );
+            memory_state.write_bytes(addr, dword, 8, t + 3);
         }
-        let (old_vals, old_ts) = memory_state.read_bytes(addr, 8);
-        memw_ops.push(
-            MemwOperation::new(false, addr, value, t + 3, 8, false).with_old(old_vals, old_ts),
-        );
-        memory_state.write_bytes(addr, dword, 8, t + 3);
     }
 
     let ecdas_ops = witness
@@ -991,6 +1006,7 @@ fn collect_ecsm_ops(
         addr_xg,
         addr_k,
         addr_xr,
+        is_affine,
         witness,
     };
 
