@@ -851,16 +851,22 @@ fn collect_ecsm_ops(
     let addr_xg = register_state.read(11).0;
     let addr_k = register_state.read(12).0;
 
-    // Read the xG and k operands (32 little-endian bytes each) from memory.
+    // Read the operands from memory: xG‖yG (64 contiguous bytes) and k (32 bytes).
+    // AFFINE: yG is the caller's real input y (pinned below by a memory read), so the
+    // witnessed/returned point is the caller's actual point — no even-parity convention.
     let mut xg = [0u8; 32];
+    let mut yg = [0u8; 32];
     let mut k = [0u8; 32];
     for i in 0..32 {
         xg[i] = memory_state.read_byte(addr_xg.wrapping_add(i as u64)).0;
+        yg[i] = memory_state
+            .read_byte(addr_xg.wrapping_add(32 + i as u64))
+            .0;
         k[i] = memory_state.read_byte(addr_k.wrapping_add(i as u64)).0;
     }
 
-    let witness = ::ecsm::compute_witness(&k, &xg)
-        .expect("ECSM witness: executor validates 0 < k < N and xG on curve");
+    let witness = ::ecsm::compute_witness_with_y(&k, &xg, &yg)
+        .expect("ECSM witness: executor validates 0 < k < N, xG/yG < p, (xG,yG) on curve");
 
     let mut memw_ops = Vec::with_capacity(15);
 
@@ -883,6 +889,21 @@ fn collect_ecsm_ops(
         for j in 0..8 {
             value[j] = witness.x_g[8 * i + j] as u32;
             dword |= (witness.x_g[8 * i + j] as u64) << (8 * j);
+        }
+        let (_old, old_ts) = memory_state.read_bytes(addr, 8);
+        memw_ops.push(MemwOperation::new(false, addr, value, t, 8, true).with_old(value, old_ts));
+        memory_state.write_bytes(addr, dword, 8, t);
+    }
+
+    // AFFINE: yG: 4 doubleword reads at T (addr_xG + 32 + 8i). Pins the witnessed yG to
+    // the caller's input, closing the parity soundness gap of the x-only-input version.
+    for i in 0..4 {
+        let addr = addr_xg.wrapping_add((32 + 8 * i) as u64);
+        let mut value = [0u32; 8];
+        let mut dword = 0u64;
+        for j in 0..8 {
+            value[j] = witness.y_g[8 * i + j] as u32;
+            dword |= (witness.y_g[8 * i + j] as u64) << (8 * j);
         }
         let (_old, old_ts) = memory_state.read_bytes(addr, 8);
         memw_ops.push(MemwOperation::new(false, addr, value, t, 8, true).with_old(value, old_ts));
