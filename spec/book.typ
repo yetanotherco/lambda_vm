@@ -53,6 +53,7 @@
       ("sha256.typ", [`SHA256` accelerator], <sha256>),
       ("keccak.typ", [`KECCAK` accelerator], <keccak>),
       ("ecsm.typ", [`ECSM` accelerator], <ecsm>),
+      ("fext.typ", [Extension field accelerator], <fext>),
     )),
     ("MATHEMATICS", (
       ("limbs_and_carries.typ", [On limb decomposition and carries], <limbs>),

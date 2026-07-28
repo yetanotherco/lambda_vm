@@ -4,9 +4,9 @@ code = "MMW"
 # Input
 
 [[variables.input]]
-name = "is_register"
-type = "Bit"
-desc = "Whether the address represents a register index"
+name = "domain"
+type = "BaseField"
+desc = "The memory domain"
 pad = 0
 
 [[variables.input]]
@@ -218,52 +218,52 @@ name = "memory"
 [[constraints.memory]]
 kind = "interaction"
 tag = "memory"
-input = ["is_register", "base_address", ["idx", "old_timestamp", 0], ["idx", "old", 0]]
+input = ["domain", "base_address", ["idx", "old_timestamp", 0], ["idx", "old", 0]]
 multiplicity = "μ_sum"
 
 [[constraints.memory]]
 kind = "interaction"
 tag = "memory"
-input = ["is_register", "base_address", "timestamp", ["idx", "value", 0]]
+input = ["domain", "base_address", "timestamp", ["idx", "value", 0]]
 multiplicity = ["-", "μ_sum"]
 
 [[constraints.memory]]
 kind = "interaction"
 tag = "memory"
-input = ["is_register", ["idx", "address_add", 0], ["idx", "old_timestamp", 1], ["idx", "old", 1]]
+input = ["domain", ["idx", "address_add", 0], ["idx", "old_timestamp", 1], ["idx", "old", 1]]
 multiplicity = "w2"
 
 [[constraints.memory]]
 kind = "interaction"
 tag = "memory"
-input = ["is_register", ["idx", "address_add", 0], "timestamp", ["idx", "value", 1]]
+input = ["domain", ["idx", "address_add", 0], "timestamp", ["idx", "value", 1]]
 multiplicity = ["-", "w2"]
 
 [[constraints.memory]]
 kind = "interaction"
 tag = "memory"
-input = ["is_register", ["idx", "address_add", ["-", "i", 1]], ["idx", "old_timestamp", "i"], ["idx", "old", "i"]]
+input = ["domain", ["idx", "address_add", ["-", "i", 1]], ["idx", "old_timestamp", "i"], ["idx", "old", "i"]]
 multiplicity = "w4"
 iter = ["i", 2, 3]
 
 [[constraints.memory]]
 kind = "interaction"
 tag = "memory"
-input = ["is_register", ["idx", "address_add", ["-", "i", 1]], "timestamp", ["idx", "value", "i"]]
+input = ["domain", ["idx", "address_add", ["-", "i", 1]], "timestamp", ["idx", "value", "i"]]
 multiplicity = ["-", "w4"]
 iter = ["i", 2, 3]
 
 [[constraints.memory]]
 kind = "interaction"
 tag = "memory"
-input = ["is_register", ["idx", "address_add", ["-", "i", 1]], ["idx", "old_timestamp", "i"], ["idx", "old", "i"]]
+input = ["domain", ["idx", "address_add", ["-", "i", 1]], ["idx", "old_timestamp", "i"], ["idx", "old", "i"]]
 multiplicity = "write8"
 iter = ["i", 4, 7]
 
 [[constraints.memory]]
 kind = "interaction"
 tag = "memory"
-input = ["is_register", ["idx", "address_add", ["-", "i", 1]], "timestamp", ["idx", "value", "i"]]
+input = ["domain", ["idx", "address_add", ["-", "i", 1]], "timestamp", ["idx", "value", "i"]]
 multiplicity = ["-", "write8"]
 iter = ["i", 4, 7]
 
@@ -274,12 +274,12 @@ name = "output"
 [[constraints.output]]
 kind = "interaction"
 tag = "MEMW"
-input = ["is_register", "base_address", "value", "timestamp", "write2", "write4", "write8"]
+input = ["domain", "base_address", "value", "timestamp", "write2", "write4", "write8"]
 output = "old"
 multiplicity = ["-", "μ_read"]
 
 [[constraints.output]]
 kind = "interaction"
 tag = "MEMW"
-input = ["is_register", "base_address", "value", "timestamp", "write2", "write4", "write8"]
+input = ["domain", "base_address", "value", "timestamp", "write2", "write4", "write8"]
 multiplicity = ["-", "μ_write"]

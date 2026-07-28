@@ -39,7 +39,7 @@ provide these below.
 
 #render_constraint_table(chip, config, groups: "assumptions")
 
-Our assumptions do not explicitly cover any range checks for the `is_register` and `value` columns,
+Our assumptions do not explicitly cover any range checks for the `value` column,
 as these are not necessary for the correctness of this chip in isolation.
 Still, these properties are necessary for the consistency of the system as a whole, and therefore
 we document it here, keeping the type information as a reading help.

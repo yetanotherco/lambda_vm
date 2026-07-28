@@ -113,7 +113,7 @@ Even though they are not touched by the current epoch, the #l2g chips claims the
 and simply has finalization clean up the spurious initialization, by setting
 `fini_value = init_value` and `fini_timestamp = 0`.
 
-= #page chip
+= #page chip<streaming:chip:page>
 
 We resume here the description of memory initialization and finalization from @memory,
 as it applies after integration of the epoch system described above.
@@ -121,7 +121,10 @@ Concretely, each page gets an associated `PAGE` table, consisting of #total_nr_v
 over #total_nr_instantiated_columns(pagechip, config) columns.
 For each such table, the `page` variable is instantiated as the constant base address of the page.
 The `offset` column is preprocessed, which helps the verifier ensure that each page has a single fixed size,
-but the verifier should still check that no pages overlap and all `page` values are page-aligned.
+but the verifier should still check that no pages overlap (per domain) and all `page` values are page-aligned.
+The domain variable is instantiated with the specific memory domain (see @memory) for which to instantiate a page,
+if the domain is paged.
+For unpaged domains, the verifier must ensure no #page chips are present.
 
 Observe that this table deals with boundaries on the RAM memory.
 Registers can still be initialized and finalized in the global memory directly by the verifier,

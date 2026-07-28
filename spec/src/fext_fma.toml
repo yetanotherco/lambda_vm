@@ -1,0 +1,144 @@
+name = "FEXT_FMA"
+code = "FMA"
+
+[[variables.input]]
+name = "input_addrs"
+type = ["DWordWL", 3]
+desc = "The addresses of `values`"
+pad = 0
+
+[[variables.input]]
+name = "output_addr"
+type = "DWordWL"
+desc = "The address of `output`"
+pad = 0
+
+[[variables.input]]
+name = "timestamp"
+type = "Word"
+desc = "The timestamp"
+pad = 0
+
+[[variables.auxiliary]]
+name = "values"
+type = [["BaseField", 3], 3]
+desc = "The value to operate on: `a`, `b`, `c` in order to compute `a * b + c`"
+pad = 0
+
+[[variables.output]]
+name = "output"
+type = ["BaseField", 3]
+desc = "The output value"
+pad = 0
+
+[[variables.constant]]
+name = "α"
+type = "BaseField"
+desc = "The $#`X`^2$ coefficient of the defining polynomial"
+
+[[variables.constant]]
+name = "β"
+type = "BaseField"
+desc = "The $#`X`^1$ coefficient of the defining polynomial"
+
+[[variables.constant]]
+name = "γ"
+type = "BaseField"
+desc = "The $#`X`^0$ coefficient of the defining polynomial"
+
+[[variables.virtual]]
+name = "a"
+type = ["BaseField", 3]
+def = ["idx", "values", 0]
+desc = ""
+
+[[variables.virtual]]
+name = "b"
+type = ["BaseField", 3]
+def = ["idx", "values", 1]
+desc = ""
+
+[[variables.virtual]]
+name = "c"
+type = ["BaseField", 3]
+def = ["idx", "values", 2]
+desc = ""
+
+[[variables.multiplicity]]
+name = "μ"
+type = "Bit"
+desc = ""
+pad = 0
+
+[[constraint_groups]]
+name = "all"
+
+[[constraints.all]]
+kind = "template"
+tag = "REG"
+input = [["+", 10, "i"], ["idx", "input_addrs", "i"], "timestamp"]
+output = ["idx", "input_addrs", "i"]
+iter = ["i", 0, 2]
+cond = "μ"
+
+[[constraints.all]]
+kind = "template"
+tag = "REG"
+input = [13, "output_addr", "timestamp"]
+output = "output_addr"
+cond = "μ"
+
+[[constraints.all]]
+kind = "interaction"
+tag = "MEMW"
+input = [["+", 3, "d"], ["idx", "input_addrs", "i"], ["arr", ["idx", ["idx", "values", "i"], "d"], 0, 0, 0, 0, 0, 0, 0], ["+", "timestamp", "i"], 0, 0, 0]
+output = ["arr", ["idx", ["idx", "values", "i"], "d"], 0, 0, 0, 0, 0, 0, 0]
+iters = [["d", 0, 2], ["i", 0, 2]]
+multiplicity = "μ"
+
+[[constraints.all]]
+kind = "interaction"
+tag = "MEMW"
+input = [["+", 3, "d"], "output_addr", ["arr", ["idx", "output", "d"], 0, 0, 0, 0, 0, 0, 0], ["+", "timestamp", 3], 0, 0, 0]
+multiplicity = "μ"
+iter = ["d", 0, 2]
+
+[[constraints.all]]
+kind = "arith"
+constraint = "$#`output[0]` = a_0 b_0 + gamma (a_1 b_2 + a_2 b_1 + alpha dot a_2 b_2) + c_0$"
+poly = ["-", ["idx", "output", 0],
+  ["*", ["idx", "a", 0], ["idx", "b", 0]],
+  ["*", "γ", ["+",
+      ["*", ["idx", "a", 1], ["idx", "b", 2]],
+      ["*", ["idx", "a", 2], ["idx", "b", 1]],
+      ["*", "α", ["idx", "a", 2], ["idx", "b", 2]]]],
+  ["idx", "c", 0]]
+
+[[constraints.all]]
+kind = "arith"
+constraint = "$#`output[1]` = a_0 b_1 + a_1 b_0 + beta (a_1 b_2 + a_2 b_1) + (alpha beta + gamma) a_2 b_2 + c_1$"
+poly = ["-", ["idx", "output", 1],
+  ["*", ["idx", "a", 0], ["idx", "b", 1]],
+  ["*", ["idx", "a", 1], ["idx", "b", 0]],
+  ["*", "β", ["idx", "a", 1], ["idx", "b", 2]],
+  ["*", "β", ["idx", "a", 2], ["idx", "b", 1]],
+  ["*", ["+", ["*", "α", "β"], "γ"], ["idx", "a", 2], ["idx", "b", 2]],
+  ["idx", "c", 1]]
+
+[[constraints.all]]
+kind = "arith"
+constraint = "$#`output[2]` = a_0 b_2 + a_1 b_1 + a_2 b_0 + alpha (a_1 b_2 + a_2 b_1) + (alpha^2 + beta) a_2 b_2 + c_2$"
+poly = ["-", ["idx", "output", 2],
+  ["*", ["idx", "a", 0], ["idx", "b", 2]],
+  ["*", ["idx", "a", 1], ["idx", "b", 1]],
+  ["*", ["idx", "a", 2], ["idx", "b", 0]],
+  ["*", "α", ["idx", "a", 1], ["idx", "b", 2]],
+  ["*", "α", ["idx", "a", 2], ["idx", "b", 1]],
+  ["*", ["+", ["*", "α", "α"], "β"], ["idx", "a", 2], ["idx", "b", 2]],
+  ["idx", "c", 2]]
+
+[[constraints.all]]
+kind = "interaction"
+tag = "ECALL"
+input = ["timestamp", ["arr", ["-", ["^", 2, 32], 21], ["-", ["^", 2, 32], 1]]]
+multiplicity = ["-", "μ"]

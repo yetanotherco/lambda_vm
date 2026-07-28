@@ -1,0 +1,45 @@
+name = "FEXT_ZERO"
+code = "FXZ"
+
+[[variables.input]]
+name = "timestamp"
+type = "Word"
+desc = "The timestamp"
+pad = 0
+
+[[variables.input]]
+name = "addr"
+type = "DWordWL"
+desc = "The address to assert equal to zero"
+pad = 0
+
+[[variables.multiplicity]]
+name = "μ"
+type = "Bit"
+desc = ""
+pad = 0
+
+[[constraint_groups]]
+name = "all"
+
+[[constraints.all]]
+kind = "template"
+tag = "REG"
+input = [10, "addr", "timestamp"]
+output = "addr"
+cond = "μ"
+
+[[constraints.all]]
+kind = "interaction"
+tag = "MEMW"
+input = [["+", 3, "d"], "addr", ["cast", 0, ["BaseField", 8]], "timestamp", 0, 0, 0]
+output = ["cast", 0, ["BaseField", 8]]
+multiplicity = "μ"
+iter = ["d", 0, 2]
+
+[[constraints.all]]
+kind = "interaction"
+tag = "ECALL"
+input = ["timestamp", ["arr", ["-", ["^", 2, 32], 22], ["-", ["^", 2, 32], 1]]]
+multiplicity = ["-", "μ"]
+

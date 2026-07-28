@@ -7,6 +7,12 @@ name = "page"
 type = "DWordWL"
 desc = "Constant column containing the page base address; should be integrated into the constraints directly"
 
+[[variables.constant]]
+name = "domain"
+type = "Byte"
+desc = "The memory domain to provide a page for"
+
+
 [[variables.input]]
 name = "offset"
 type = "RowIndex"
@@ -35,7 +41,6 @@ type = "DWordWL"
 desc = "Adding `offset` to the page base address `page`. `page` is a constant with respect to a single instance of this table."
 def = ["+", "page", ["*", "offset", ["cast", 1, "DWordWL"]]]
 
-
 [[constraint_groups]]
 name = "all"
 
@@ -47,11 +52,11 @@ input = ["init"]
 [[constraints.all]]
 kind = "interaction"
 tag = "GLOBAL_MEM"
-input = [0, "address", 0, "init"]
+input = ["domain", "address", 0, "init"]
 multiplicity = -1
 
 [[constraints.all]]
 kind = "interaction"
 tag = "GLOBAL_MEM"
-input = [0, "address", "fini_epoch", "fini"]
+input = ["domain", "address", "fini_epoch", "fini"]
 multiplicity = 1

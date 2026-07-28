@@ -25,11 +25,14 @@ and are therefore handled simultaneously.
   While RAM is byte addressed, we do choose to store registers as a `DWordWL` over two word addresses.
 ]
 In particular, our memory addressing scheme will consist of two parts: a domain separator, and an address within the domain.
-For specific domains and domain separators, we use the following assignment.
+For specific domains and domain separators, we use the following assignment, where we indicate
+whether or not each domain should be "paged".
+For information on paging, refer to @memory:s:init_fini and @streaming:chip:page.
 
-/ RAM memory: $0$
-/ Registers: $1$
-/ Committed values: $2$
+/ RAM memory: $0$, paged
+/ Registers: $1$, unpaged
+/ Committed values: $2$, unpaged
+/ (Extension) field values: $3$, $4$, $5$, paged
 
 On a high level, we ensure memory consistency by an interacting system of
 reads and writes to a lookup argument, combined with an initialization and finalization scheme.
@@ -129,7 +132,7 @@ The `CPU` merely passes in the current timestamp, while `MEMW` can recall the pr
   ]
 ]
 
-= Initialization and Finalization
+= Initialization and Finalization<memory:s:init_fini>
 
 Because the LogUp argument handling token consumption and emission needs to be fully balanced
 --- every token emitted should be consumed, and vice versa ---

@@ -4,9 +4,9 @@ code = "MWA"
 # Input
 
 [[variables.input]]
-name = "is_register"
-type = "Bit"
-desc = "Whether the address represents a register index"
+name = "domain"
+type = "BaseField"
+desc = "The memory domain"
 pad = 0
 
 [[variables.input]]
@@ -183,52 +183,52 @@ name = "memory"
 [[constraints.memory]]
 kind = "interaction"
 tag = "memory"
-input = ["is_register", ["cast", "base_address", "DWordWL"], "old_timestamp", ["idx", "old", 0]]
+input = ["domain", ["cast", "base_address", "DWordWL"], "old_timestamp", ["idx", "old", 0]]
 multiplicity = "μ_sum"
 
 [[constraints.memory]]
 kind = "interaction"
 tag = "memory"
-input = ["is_register", ["cast", "base_address", "DWordWL"], "timestamp", ["idx", "value", 0]]
+input = ["domain", ["cast", "base_address", "DWordWL"], "timestamp", ["idx", "value", 0]]
 multiplicity = ["-", "μ_sum"]
 
 [[constraints.memory]]
 kind = "interaction"
 tag = "memory"
-input = ["is_register", ["+", ["cast", "base_address", "DWordWL"], ["cast", 1, "DWordWL"]], "old_timestamp", ["idx", "old", 1]]
+input = ["domain", ["+", ["cast", "base_address", "DWordWL"], ["cast", 1, "DWordWL"]], "old_timestamp", ["idx", "old", 1]]
 multiplicity = "w2"
 
 [[constraints.memory]]
 kind = "interaction"
 tag = "memory"
-input = ["is_register", ["+", ["cast", "base_address", "DWordWL"], ["cast", 1, "DWordWL"]], "timestamp", ["idx", "value", 1]]
+input = ["domain", ["+", ["cast", "base_address", "DWordWL"], ["cast", 1, "DWordWL"]], "timestamp", ["idx", "value", 1]]
 multiplicity = ["-", "w2"]
 
 [[constraints.memory]]
 kind = "interaction"
 tag = "memory"
-input = ["is_register", ["+", ["cast", "base_address", "DWordWL"], ["cast", "i", "DWordWL"]], "old_timestamp", ["idx", "old", "i"]]
+input = ["domain", ["+", ["cast", "base_address", "DWordWL"], ["cast", "i", "DWordWL"]], "old_timestamp", ["idx", "old", "i"]]
 multiplicity = "w4"
 iter = ["i", 2, 3]
 
 [[constraints.memory]]
 kind = "interaction"
 tag = "memory"
-input = ["is_register", ["+", ["cast", "base_address", "DWordWL"], ["cast", "i", "DWordWL"]], "timestamp", ["idx", "value", "i"]]
+input = ["domain", ["+", ["cast", "base_address", "DWordWL"], ["cast", "i", "DWordWL"]], "timestamp", ["idx", "value", "i"]]
 multiplicity = ["-", "w4"]
 iter = ["i", 2, 3]
 
 [[constraints.memory]]
 kind = "interaction"
 tag = "memory"
-input = ["is_register", ["+", ["cast", "base_address", "DWordWL"], ["cast", "i", "DWordWL"]], "old_timestamp", ["idx", "old", "i"]]
+input = ["domain", ["+", ["cast", "base_address", "DWordWL"], ["cast", "i", "DWordWL"]], "old_timestamp", ["idx", "old", "i"]]
 multiplicity = "write8"
 iter = ["i", 4, 7]
 
 [[constraints.memory]]
 kind = "interaction"
 tag = "memory"
-input = ["is_register", ["+", ["cast", "base_address", "DWordWL"], ["cast", "i", "DWordWL"]], "timestamp", ["idx", "value", "i"]]
+input = ["domain", ["+", ["cast", "base_address", "DWordWL"], ["cast", "i", "DWordWL"]], "timestamp", ["idx", "value", "i"]]
 multiplicity = ["-", "write8"]
 iter = ["i", 4, 7]
 
@@ -239,12 +239,12 @@ name = "output"
 [[constraints.output]]
 kind = "interaction"
 tag = "MEMW"
-input = ["is_register", ["cast", "base_address", "DWordWL"], "value", "timestamp", "write2", "write4", "write8"]
+input = ["domain", ["cast", "base_address", "DWordWL"], "value", "timestamp", "write2", "write4", "write8"]
 output = "old"
 multiplicity = ["-", "μ_read"]
 
 [[constraints.output]]
 kind = "interaction"
 tag = "MEMW"
-input = ["is_register", ["cast", "base_address", "DWordWL"], "value", "timestamp", "write2", "write4", "write8"]
+input = ["domain", ["cast", "base_address", "DWordWL"], "value", "timestamp", "write2", "write4", "write8"]
 multiplicity = ["-", "μ_write"]
