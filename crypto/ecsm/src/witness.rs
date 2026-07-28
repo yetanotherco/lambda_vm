@@ -19,6 +19,7 @@
 use num_bigint::{BigInt, BigUint};
 use num_integer::Integer;
 use num_traits::{Signed, Zero};
+#[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
 use crate::curve::{StepPts, replay_double_and_add};
@@ -329,9 +330,15 @@ pub fn compute_witness(k_le: &[u8; 32], xg_le: &[u8; 32]) -> Result<EcsmWitness,
     let x_r_sub_p = to_le_32(&((&two_256 + &result.x) - p()));
 
     // Steps are independent witnesses (each builds its own λ/quotient/carry data
-    // from one StepPts), so they parallelize freely.
+    // from one StepPts), so they parallelize freely when rayon is available.
+    #[cfg(feature = "parallel")]
     let steps = steps_pts
         .par_iter()
+        .map(|s| build_step(s, &p_big, &r_big, &r_ext, &pp))
+        .collect();
+    #[cfg(not(feature = "parallel"))]
+    let steps = steps_pts
+        .iter()
         .map(|s| build_step(s, &p_big, &r_big, &r_ext, &pp))
         .collect();
 

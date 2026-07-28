@@ -58,13 +58,16 @@ pub fn msb_position(k: &BigUint) -> u32 {
 }
 
 // =========================================================================
-// k256-backed fast path: projective double-and-add replay + batch inversion.
+// k256-backed fast path: hand-rolled Jacobian double-and-add replay (dbl-2009-l /
+// madd-2007-bl) over k256's public field arithmetic, plus two Montgomery batch
+// inversions (z-normalization and slope denominators).
 //
 // The witness generator is untrusted (the ECDAS chip re-proves every step), so
-// any audited arithmetic is sound here. We replay the schedule in k256
-// projective coordinates (no per-op inversion), `batch_normalize` all points to
-// affine in one shot, and batch-invert the slope denominators — replacing the
-// ~2*len_k Fermat inversions of the reference with two batched inversions.
+// any audited arithmetic is sound here. We replay the schedule in Jacobian
+// coordinates (no per-op inversion), batch-invert every z at once for the
+// Jacobian→affine conversion, and batch-invert the slope denominators —
+// replacing the ~2*len_k Fermat inversions of the reference with two batched
+// inversions.
 // =========================================================================
 
 use k256::elliptic_curve::ff::PrimeField as _;
@@ -159,9 +162,11 @@ pub fn scalar_mul_affine_x(k: &BigUint, g: &AffinePoint) -> BigUint {
 
 /// Jacobian doubling (dbl-2009-l) for `y² = x³ + 7`: on `(X:Y:Z)` with
 /// `x = X/Z²`, `y = Y/Z³`. Intermediates are normalized where a later
-/// subtraction would otherwise negate a high-magnitude lazy value (k256's
-/// `negate(1)` is only correct below ~2p; k256's own formulas normalize for
-/// the same reason).
+/// subtraction would otherwise negate a high-magnitude lazy value, and no
+/// subtraction ever negates a magnitude-2 value: k256's `negate(1)` requires
+/// the operand's magnitude to be ≤ 1 — a contract k256 *enforces with an
+/// assertion in debug builds* (release builds have slack, dev-profile tests
+/// don't).
 fn jac_double(
     x: FieldElement,
     y: FieldElement,
@@ -173,7 +178,9 @@ fn jac_double(
     let d = ((x + b) * (x + b) - a - c).double().normalize(); // 2·((X1+B)² − A − C)
     let e = a.double() + a; // 3A
     let f = e * e; // E²
-    let x3 = (f - d.double()).normalize(); // F − 2D
+    // F − 2D as two subtractions of the normalized d (never `d.double()`: that
+    // operand would be magnitude 2 and break negate(1)'s contract).
+    let x3 = (f - d - d).normalize(); // F − 2D
     let c8 = FieldElement::from_u64(8) * c; // 8C (mul output, subtraction-safe)
     let y3 = (e * (d - x3) - c8).normalize(); // E·(D − X3) − 8C
     let z3 = (y * z).double(); // 2·Y1·Z1
@@ -197,7 +204,8 @@ fn jac_madd(
     let hh = h * h;
     let hhh = h * hh;
     let x1hh = (x1 * hh).normalize();
-    let x3 = (r * r - hhh - x1hh.double()).normalize();
+    // R² − HHH − 2·X1·HH as two subtractions of the normalized x1hh (see jac_double).
+    let x3 = (r * r - hhh - x1hh - x1hh).normalize();
     let y3 = (r * (x1hh - x3) - y1 * hhh).normalize();
     let z3 = h * z1;
     (x3, y3, z3)
@@ -221,12 +229,13 @@ pub fn replay_double_and_add(k: &BigUint, g: &AffinePoint) -> (Vec<StepPts>, Aff
     let gx = fe_from_biguint(&g.x);
     let gy = fe_from_biguint(&g.y);
 
-    // 1. Jacobian replay (no inversions): record (x, y, z) of every a and r.
-    //    pts = [a_0, r_0, a_1, r_1, ...] — a_i at 2i, r_i at 2i+1.
-    let mut pts: Vec<(FieldElement, FieldElement, FieldElement)> = Vec::with_capacity(2 * n);
+    // 1. Jacobian replay (no inversions): record the n+1 DISTINCT points of the
+    //    ladder — a_i = pts[i], r_i = pts[i+1]. (Pushing a_i and r_i separately
+    //    would hold 2n entries with n−1 exact duplicates: r_i is a_{i+1}.)
+    let mut pts: Vec<(FieldElement, FieldElement, FieldElement)> = Vec::with_capacity(n + 1);
     let (mut ax, mut ay, mut az) = (gx, gy, FieldElement::ONE);
+    pts.push((ax, ay, az));
     for &(_, op, _) in &sched {
-        pts.push((ax, ay, az));
         let (rx, ry, rz) = if op == 0 {
             jac_double(ax, ay, az)
         } else {
@@ -237,17 +246,26 @@ pub fn replay_double_and_add(k: &BigUint, g: &AffinePoint) -> (Vec<StepPts>, Aff
     }
 
     // 2. one batched inversion for every z (Jacobian: affine = (x/z², y/z³)).
+    //    Affine coordinates are kept in BOTH forms: FieldElement for the slope
+    //    algebra in steps 3-4 (they are mul outputs, so the subtractions there
+    //    stay within negate(1)'s contract), BigUint for the StepPts the witness
+    //    consumes — each value is converted exactly once, not converted and then
+    //    re-parsed.
     let zs: Vec<FieldElement> = pts.iter().map(|p| p.2).collect();
     let zinvs = batch_invert(&zs);
-    let aff: Vec<AffinePoint> = pts
+    let aff_fe: Vec<(FieldElement, FieldElement)> = pts
         .iter()
         .zip(&zinvs)
         .map(|(&(x, y, _), zi)| {
             let zi2 = zi * zi;
-            AffinePoint {
-                x: biguint_from_fe(&(x * zi2)),
-                y: biguint_from_fe(&(y * zi2 * zi)),
-            }
+            (x * zi2, y * zi2 * zi)
+        })
+        .collect();
+    let aff: Vec<AffinePoint> = aff_fe
+        .iter()
+        .map(|&(x, y)| AffinePoint {
+            x: biguint_from_fe(&x),
+            y: biguint_from_fe(&y),
         })
         .collect();
 
@@ -255,9 +273,9 @@ pub fn replay_double_and_add(k: &BigUint, g: &AffinePoint) -> (Vec<StepPts>, Aff
     let denoms: Vec<FieldElement> = (0..n)
         .map(|i| {
             if sched[i].1 == 1 {
-                gx - fe_from_biguint(&aff[2 * i].x)
+                gx - aff_fe[i].0
             } else {
-                let ya = fe_from_biguint(&aff[2 * i].y);
+                let ya = aff_fe[i].1;
                 ya + ya
             }
         })
@@ -268,26 +286,23 @@ pub fn replay_double_and_add(k: &BigUint, g: &AffinePoint) -> (Vec<StepPts>, Aff
     let steps: Vec<StepPts> = (0..n)
         .map(|i| {
             let num = if sched[i].1 == 1 {
-                gy - fe_from_biguint(&aff[2 * i].y)
+                gy - aff_fe[i].1
             } else {
-                let x2 = {
-                    let xa = fe_from_biguint(&aff[2 * i].x);
-                    xa * xa
-                };
+                let x2 = aff_fe[i].0 * aff_fe[i].0;
                 x2 + x2 + x2 // 3 xA^2
             };
             StepPts {
-                a: aff[2 * i].clone(),
+                a: aff[i].clone(),
                 g: g.clone(),
                 round: sched[i].0,
                 op: sched[i].1,
                 next_op: sched[i].2,
-                r: aff[2 * i + 1].clone(),
+                r: aff[i + 1].clone(),
                 lambda: biguint_from_fe(&(num * inv_denoms[i])),
             }
         })
         .collect();
 
-    let result = aff[2 * n - 1].clone();
+    let result = aff[n].clone();
     (steps, result)
 }
