@@ -80,8 +80,14 @@ fn k256_replay_matches_reference_non_generator_base() {
     for k in scalars {
         let (steps, result) = replay_double_and_add(&k, &base);
         let (steps_ref, result_ref) = replay_double_and_add_reference(&k, &base);
-        assert_eq!(result, result_ref, "final point mismatch for k = {k} (non-G base)");
-        assert_eq!(steps, steps_ref, "step list mismatch for k = {k} (non-G base)");
+        assert_eq!(
+            result, result_ref,
+            "final point mismatch for k = {k} (non-G base)"
+        );
+        assert_eq!(
+            steps, steps_ref,
+            "step list mismatch for k = {k} (non-G base)"
+        );
     }
 }
 
