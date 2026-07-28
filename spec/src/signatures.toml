@@ -77,11 +77,11 @@ kind = "interaction"
 input = ["DWordWL", "DWordWL", "DWordWL", "Bit"]
 output = "DWordWL"
 
-# MEMW[old; is_register, base_address, value, timestamp, write2, write4, write8]
+# MEMW[old; domain, base_address, value, timestamp, write2, write4, write8]
 [[signatures]]
 tag = "MEMW"
 kind = "interaction"
-input = ["Bit", "DWordWL", ["BaseField", 8], "Word", "Bit", "Bit", "Bit"]
+input = ["BaseField", "DWordWL", ["BaseField", 8], "Word", "Bit", "Bit", "Bit"]
 output = ["BaseField", 8]
 
 # REG[old; base_address, value, timestamp]
@@ -92,11 +92,11 @@ input = ["Byte", "DWordWL", "Word"]
 output = "DWordWL"
 cond = "BaseField"
 
-# MEMW[is_register, base_address, value, timestamp, write2, write4, write8]
+# MEMW[domain, base_address, value, timestamp, write2, write4, write8]
 [[signatures]]
 tag = "MEMW"
 kind = "interaction"
-input = ["Bit", "DWordWL", ["BaseField", 8], "Word", "Bit", "Bit", "Bit"]
+input = ["BaseField", "DWordWL", ["BaseField", 8], "Word", "Bit", "Bit", "Bit"]
 
 # REG[base_address, value, timestamp]
 [[signatures]]

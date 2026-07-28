@@ -25,7 +25,14 @@ or a degree three extension field thereof.
 Our approach is to offer an arithmetic black box (ABB), consisting of the #fma and #zero chips,
 that operates on a separate memory domain, and the #load chip to bridge the gap
 from normal byte-addressed RAM memory to this separate field-storage.
-As noted in @memory, we reserve the domain separator values $3$, $4$ and $5$ for field-storage.
+Each 64 bit value is a possibly valid address within the ABB, providing a handle for a single extension field element.
+As noted in @memory, we reserve the domain separator values $3$, $4$ and $5$ for field-storage,
+such that domain $3 + i$ stores the coefficient for the $X^i$ term of an extension field element.
+For global initialization and finalization of the field-storage, we recommend using the same
+constant-zero `PAGE` chip as described in @streaming, emitting `GLOBAL_MEM` interactions for domains
+$3$, $4$, and $5$.
+As an optimization, these three `PAGE` chips could be merge into a single one emitting all three domains,
+avoiding the cost of having to commit to the columns multiple times.
 
 = The #load chip
 #let nr_variables = total_nr_variables(loadchip)
