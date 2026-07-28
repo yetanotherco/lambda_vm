@@ -188,6 +188,9 @@ pub struct CpuOperation {
 
     /// Whether this ECALL is an ECSM (elliptic-curve scalar multiply) syscall
     pub ecall_ecsm: bool,
+
+    /// Whether this ECALL is a DMA memcpy. Operands are recovered from x10/x11/x12.
+    pub ecall_dma_memcpy: bool,
 }
 
 impl CpuOperation {
@@ -235,6 +238,8 @@ impl CpuOperation {
         // in the trace builder.
         let ecall_ecsm =
             f.ecall && log.src1_val == executor::vm::instruction::execution::ECSM_SYSCALL_NUMBER;
+        let ecall_dma_memcpy = f.ecall
+            && log.src1_val == executor::vm::instruction::execution::DMA_MEMCPY_SYSCALL_NUMBER;
 
         // Word instructions are fully handled by CPU32; the main CPU row is a
         // delegate that only advances the PC and sends the CPU32 lookup. We still
@@ -353,6 +358,7 @@ impl CpuOperation {
             ecall_keccak,
             keccak_state_addr,
             ecall_ecsm,
+            ecall_dma_memcpy,
         }
     }
 

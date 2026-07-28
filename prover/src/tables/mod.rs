@@ -28,6 +28,7 @@ pub mod commit;
 pub mod cpu;
 pub mod cpu32;
 pub mod decode;
+pub mod dma;
 pub mod dvrm;
 pub mod ecdas;
 pub mod ecsm;
