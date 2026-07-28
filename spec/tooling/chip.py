@@ -1051,7 +1051,13 @@ class Chip:
                 t = v.type
             typemap[v.name] = t
 
-        env = Environment(self.config, {}, typemap)
+        valmap = {}
+        for v in self.variables:
+            if v.category != "constant":
+                continue
+            valmap[v.name] = CastExpr(LitExpr(0), v.type).typecheck(Environment(self.config, {}, {}))
+
+        env = Environment(self.config, valmap, typemap)
         for v in self.virtual_vars:
             with reporter.context(v.name):
                 v.typecheck(env)
