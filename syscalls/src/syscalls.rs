@@ -29,9 +29,14 @@ pub enum SyscallNumbers {
 #[cfg(target_arch = "riscv64")]
 const KECCAK_SYSCALL_NUMBER: usize = usize::MAX - 1;
 
-/// Syscall number for the ECSM secp256k1 scalar-multiply accelerator (-11 as usize).
+/// Syscall number for the x-only ECSM secp256k1 scalar-multiply accelerator (-11 as usize).
 #[cfg(target_arch = "riscv64")]
 const ECSM_SYSCALL_NUMBER: usize = usize::MAX - 10;
+
+/// Syscall number for the affine ECSM variant (full point in/out).
+/// Must match `executor::...::execution::ECSM_AFFINE_SYSCALL_NUMBER` (u64::MAX - 11).
+#[cfg(target_arch = "riscv64")]
+const ECSM_AFFINE_SYSCALL_NUMBER: usize = usize::MAX - 11;
 
 /// Syscall number for the non-constraining Hint ecall (BENCH ONLY).
 /// Must match `executor::...::execution::HINT_SYSCALL_NUMBER` (u64::MAX - 20).
@@ -206,7 +211,7 @@ pub fn ecsm_mul_affine(out: &mut [u8; 64], input: &[u8; 64], k: &[u8; 32]) {
             in("a0") out.as_mut_ptr(),  // x10 = address to write [xR‖yR] (64 bytes)
             in("a1") input.as_ptr(),    // x11 = address of [xG‖yG] (64 bytes)
             in("a2") k.as_ptr(),        // x12 = address of k
-            in("a7") ECSM_SYSCALL_NUMBER,
+            in("a7") ECSM_AFFINE_SYSCALL_NUMBER,
         )
     }
 }

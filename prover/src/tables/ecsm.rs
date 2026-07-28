@@ -1,10 +1,20 @@
 //! ECSM core chip — orchestrates one secp256k1 scalar multiplication `k·G`.
 //!
-//! One row per `ECALL(-11)`. It reads `xG` and `k` from memory, witnesses `yG` and proves
+//! One row per ECSM `ECALL`. It reads `xG` and `k` from memory, witnesses `yG` and proves
 //! `yG² ≡ xG³ + b mod p` (via two byte-limb convolution relations with quotients `q0,q1`
 //! and 64-entry carry arrays `c0,c1`), enforces `0 < k < N` and `xR < p`, writes `xR` back,
 //! serves the scalar bits directly via the `Bit` bus, and delegates the double-and-add to ECDAS
 //! over the `Ecdas`/`Bit` buses.
+//!
+//! ## Two modes (`IS_AFFINE` selector)
+//! The chip serves both ecall variants with one prover, selected by the `IS_AFFINE` column:
+//! - **x-only** (`ECSM_SYSCALL_NUMBER`): input `xG` (32B), output `xR` (32B). `yG` is the
+//!   canonical even lift (not read from memory), `yR` is witnessed only for ECDAS.
+//! - **affine** (`ECSM_AFFINE_SYSCALL_NUMBER`): input `xG‖yG` (64B), output `xR‖yR` (64B);
+//!   the yG-read and yR-write MEMW buses fire with `mult = IS_AFFINE`.
+//!
+//! `IS_AFFINE` is pinned to the actual ecall number by the `Ecall` receiver, so it can't be
+//! forged (see `bus_interactions`).
 //!
 //! See `spec/src/ecsm.toml`. All multi-limb arithmetic uses 8-bit limbs; the witness is built
 //! by `ecsm::compute_witness`, which reproduces these exact recurrences.
@@ -15,7 +25,7 @@
 //! relation has no standalone constant and also closes at all-zero. The range checks /
 //! virtual-carry checks remain µ-gated as before.
 
-use executor::vm::instruction::execution::ECSM_SYSCALL_NUMBER;
+use executor::vm::instruction::execution::{ECSM_AFFINE_SYSCALL_NUMBER, ECSM_SYSCALL_NUMBER};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
@@ -28,7 +38,7 @@ pub(crate) const CARRY_OFFSET_X2: i64 = 8160;
 pub(crate) const CARRY_OFFSET_YG: i64 = 16319;
 
 // =========================================================================
-// Column indices (667 columns; keep in sync with NUM_COLUMNS below)
+// Column indices (668 columns; keep in sync with NUM_COLUMNS below)
 // =========================================================================
 
 pub mod cols {
@@ -56,8 +66,11 @@ pub mod cols {
     pub const K_SUB_N: usize = 634; // U256HL (16 halfwords)
     pub const XR_SUB_P: usize = 650; // U256HL (16 halfwords)
     pub const MU: usize = 666;
+    /// Mode selector: 1 = affine ecall (read yG, write yR), 0 = x-only / padding.
+    /// Pinned to the actual ecall number by the `Ecall` receiver (see `bus_interactions`).
+    pub const IS_AFFINE: usize = 667;
 
-    pub const NUM_COLUMNS: usize = 667;
+    pub const NUM_COLUMNS: usize = 668;
 
     #[inline]
     pub const fn xr(i: usize) -> usize {
@@ -121,6 +134,9 @@ pub struct EcsmOperation {
     pub addr_xg: u64,
     pub addr_k: u64,
     pub addr_xr: u64,
+    /// Affine variant (full point in/out): drives the `IS_AFFINE` column and the
+    /// yG-read / yR-write memory ops. `false` for the x-only variant.
+    pub is_affine: bool,
     pub witness: EcsmWitness,
 }
 
@@ -190,6 +206,9 @@ pub fn generate_ecsm_trace(
         }
 
         table.set_fe(row_idx, cols::MU, FE::one());
+        if op.is_affine {
+            table.set_fe(row_idx, cols::IS_AFFINE, FE::one());
+        }
     }
 
     trace
@@ -299,19 +318,42 @@ fn k_dword_busvalues(dword_idx: usize) -> [BusValue; 8] {
 
 pub fn bus_interactions() -> Vec<BusInteraction> {
     let mu = || Multiplicity::Column(cols::MU);
+    // Affine-only multiplicity: fires only when IS_AFFINE = 1 (never on x-only or padding
+    // rows, where IS_AFFINE is constrained to 0). Used for the yG-read / yR-write buses.
+    let affine = || Multiplicity::Column(cols::IS_AFFINE);
     let ts_lo = || packed(cols::TIMESTAMP_0);
     let ts_hi = || packed(cols::TIMESTAMP_1);
     let mut out = Vec::new();
 
     // ECALL receiver (mult = mu): [ts_lo, ts_hi, syscall_lo32, syscall_hi32].
+    //
+    // The received syscall number is LINEAR in IS_AFFINE:
+    //   syscall = xonly + IS_AFFINE·(affine − xonly).
+    // The CPU sends the *actual* a7 (rv1) on the `Ecall` bus, so this pins IS_AFFINE to the
+    // real ecall variant — a prover that flips IS_AFFINE without changing the guest's ecall
+    // number makes the bus fingerprint mismatch and the LogUp argument fail. This is the
+    // soundness anchor that lets the yG-read / yR-write buses key off IS_AFFINE below.
+    let xonly_lo = (ECSM_SYSCALL_NUMBER & 0xFFFF_FFFF) as i64;
+    let xonly_hi = (ECSM_SYSCALL_NUMBER >> 32) as i64;
+    let affine_lo = (ECSM_AFFINE_SYSCALL_NUMBER & 0xFFFF_FFFF) as i64;
+    let affine_hi = (ECSM_AFFINE_SYSCALL_NUMBER >> 32) as i64;
+    let syscall_word = |xonly: i64, affine: i64| {
+        BusValue::linear(vec![
+            LinearTerm::Constant(xonly),
+            LinearTerm::Column {
+                coefficient: affine - xonly,
+                column: cols::IS_AFFINE,
+            },
+        ])
+    };
     out.push(BusInteraction::receiver(
         BusId::Ecall,
         mu(),
         vec![
             ts_lo(),
             ts_hi(),
-            BusValue::constant(ECSM_SYSCALL_NUMBER & 0xFFFF_FFFF),
-            BusValue::constant(ECSM_SYSCALL_NUMBER >> 32),
+            syscall_word(xonly_lo, affine_lo),
+            syscall_word(xonly_hi, affine_hi),
         ],
     ));
 
@@ -354,10 +396,11 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             ),
         ));
     }
-    // AFFINE: read yG: 4 doublewords at addr_xG + 32 + 8i (ts). Pins the witnessed yG
-    // (col YG) to the caller's input point, so the returned yR corresponds to the
-    // caller's actual (xG, yG) — closes the parity soundness gap. Same low address limb
-    // (the +63 span is guarded to not cross the 2^32 limb boundary).
+    // AFFINE (mult = IS_AFFINE): read yG: 4 doublewords at addr_xG + 32 + 8i (ts). Pins the
+    // witnessed yG (col YG) to the caller's input point, so the returned yR corresponds to
+    // the caller's actual (xG, yG) — closes the parity soundness gap. Fires only on affine
+    // rows; x-only guests pass a 32-byte xG (no yG in memory), so these must not fire there.
+    // Same low address limb (the +63 span is guarded to not cross the 2^32 limb boundary).
     for i in 0..4 {
         let base_lo = BusValue::linear(vec![
             LinearTerm::Column {
@@ -368,7 +411,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ]);
         out.push(BusInteraction::sender(
             BusId::Memw,
-            mu(),
+            affine(),
             memw_read(
                 dword_bytes(cols::YG, i),
                 0,
@@ -470,11 +513,11 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ));
     }
 
-    // AFFINE PoC: write yR as 4 doublewords at addr_xR + 32 + 8i (ts + 3). Reuses the
-    // ADDR_XR register (output buffer is the contiguous 64-byte [xR‖yR]); no new column
-    // or register read. yR (col YR) is the ECDAS-constrained y of k·(xG, even-yG). The
-    // guest fixes the sign from its known yG parity. ts + 3 is the free 4th sub-timestamp
-    // (instruction stride is 4; xG@T, k@T+1, xR@T+2 use the first three).
+    // AFFINE (mult = IS_AFFINE): write yR as 4 doublewords at addr_xR + 32 + 8i (ts + 3).
+    // Reuses the ADDR_XR register (output buffer is the contiguous 64-byte [xR‖yR]); no new
+    // column or register read. yR (col YR) is the ECDAS-constrained y of k·(xG, yG). Fires
+    // only on affine rows; x-only guests get only xR written back. ts + 3 is the free 4th
+    // sub-timestamp (instruction stride is 4; xG@T, k@T+1, xR@T+2 use the first three).
     for i in 0..4 {
         let base_lo = BusValue::linear(vec![
             LinearTerm::Column {
@@ -485,7 +528,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ]);
         out.push(BusInteraction::sender(
             BusId::Memw,
-            mu(),
+            affine(),
             memw_write(
                 dword_bytes(cols::YR, i),
                 base_lo,
@@ -725,7 +768,7 @@ impl OverflowKind {
 // =========================================================================
 //
 // One body against the generic `ConstraintBuilder` serves the compiled prover
-// folder, the verifier folder and IR capture. Constraint indices 0..413:
+// folder, the verifier folder and IR capture. Constraint indices 0..415:
 //   0        : IS_BIT(MU)
 //   1..257   : IS_BIT(k[i]) for the 256 scalar bits
 //   257      : KBitsZeroOnPadding — (Σ k_bit[i])·(1−µ)
@@ -740,10 +783,12 @@ impl OverflowKind {
 //   404      : OverflowRequired(KLtN)
 //   405..412 : CarryBit(XrLtP, 0..7)
 //   412      : OverflowRequired(XrLtP)
+//   413      : IS_BIT(IS_AFFINE)
+//   414      : AffineZeroOnPadding — IS_AFFINE·(1−µ)
 
 use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
-/// ECSM transition constraints as a single-source [`ConstraintSet`] (413
+/// ECSM transition constraints as a single-source [`ConstraintSet`] (415
 /// total). No column configuration needed (the layout is fixed via `cols`).
 pub struct EcsmConstraints;
 
@@ -950,6 +995,20 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for EcsmConstraints {
             idx += 1;
         }
 
-        debug_assert_eq!(idx, 413);
+        // idx 413: IS_BIT(IS_AFFINE): a·(1−a). The mode selector is a bit. (deg 2)
+        let is_affine = b.main(0, cols::IS_AFFINE);
+        let one = b.one();
+        b.emit_base(idx, is_affine.clone() * (one - is_affine));
+        idx += 1;
+
+        // idx 414: AffineZeroOnPadding: IS_AFFINE·(1−µ). Forces IS_AFFINE = 0 on padding
+        // rows (µ=0), so the affine-gated yG-read / yR-write buses can't fire there. (deg 2)
+        let is_affine = b.main(0, cols::IS_AFFINE);
+        let mu = b.main(0, cols::MU);
+        let one = b.one();
+        b.emit_base(idx, is_affine * (one - mu));
+        idx += 1;
+
+        debug_assert_eq!(idx, 415);
     }
 }

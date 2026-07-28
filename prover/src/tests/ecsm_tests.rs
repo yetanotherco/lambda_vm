@@ -44,6 +44,7 @@ fn op_for(k: u64) -> EcsmOperation {
         addr_xg: 0x2000,
         addr_k: 0x3000,
         addr_xr: 0x1000,
+        is_affine: false,
         witness,
     }
 }
@@ -94,7 +95,7 @@ fn constraints_hold_on_generated_trace() {
 
 #[test]
 fn constraint_set_count() {
-    assert_eq!(EcsmConstraints.meta().len(), 413);
+    assert_eq!(EcsmConstraints.meta().len(), 415);
 }
 
 /// The yG carry recurrence closes on all-zero padding because both the `µ·p²` offset and the
@@ -231,6 +232,7 @@ fn q1_bit32_equals_one_path() {
         addr_xg: 0x2000,
         addr_k: 0x3000,
         addr_xr: 0x1000,
+        is_affine: false,
         witness,
     };
     let trace = generate_ecsm_trace(&[op]);
@@ -257,6 +259,7 @@ fn constraints_hold_for_k_eq_n_minus_one() {
         addr_xg: 0x2000,
         addr_k: 0x3000,
         addr_xr: 0x1000,
+        is_affine: false,
         witness,
     };
     let trace = generate_ecsm_trace(&[op]);

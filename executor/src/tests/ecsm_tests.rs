@@ -1,7 +1,9 @@
 //! Tests for the ECSM (elliptic-curve scalar multiplication) syscall.
 
 use crate::vm::instruction::decoding::Instruction;
-use crate::vm::instruction::execution::{ECSM_SYSCALL_NUMBER, ExecutionError};
+use crate::vm::instruction::execution::{
+    ECSM_AFFINE_SYSCALL_NUMBER, ECSM_SYSCALL_NUMBER, ExecutionError,
+};
 use crate::vm::memory::Memory;
 use crate::vm::registers::Registers;
 
@@ -11,6 +13,17 @@ fn gx_le() -> [u8; 32] {
         0x79, 0xBE, 0x66, 0x7E, 0xF9, 0xDC, 0xBB, 0xAC, 0x55, 0xA0, 0x62, 0x95, 0xCE, 0x87, 0x0B,
         0x07, 0x02, 0x9B, 0xFC, 0xDB, 0x2D, 0xCE, 0x28, 0xD9, 0x59, 0xF2, 0x81, 0x5B, 0x16, 0xF8,
         0x17, 0x98,
+    ];
+    be.reverse();
+    be
+}
+
+/// secp256k1 generator y-coordinate, little-endian.
+fn gy_le() -> [u8; 32] {
+    let mut be = [
+        0x48, 0x3A, 0xDA, 0x77, 0x26, 0xA3, 0xC4, 0x65, 0x5D, 0xA4, 0xFB, 0xFC, 0x0E, 0x11, 0x08,
+        0xA8, 0xFD, 0x17, 0xB4, 0x48, 0xA6, 0x85, 0x54, 0x19, 0x9C, 0x47, 0xD0, 0x8F, 0xFB, 0x10,
+        0xD4, 0xB8,
     ];
     be.reverse();
     be
@@ -61,6 +74,60 @@ fn k_le(v: u64) -> [u8; 32] {
     let mut k = [0u8; 32];
     k[..8].copy_from_slice(&v.to_le_bytes());
     k
+}
+
+/// Runs the AFFINE ECSM syscall (full point in/out) with the given scalar, `xG` and `yG`,
+/// returning the `(xR, yR)` written back to the contiguous 64-byte output buffer.
+fn run_ecsm_affine(
+    k_le: &[u8; 32],
+    xg_le: &[u8; 32],
+    yg_le: &[u8; 32],
+) -> Result<([u8; 32], [u8; 32]), ExecutionError> {
+    let mut pc = 0;
+    let mut registers = Registers::default();
+    let mut memory = Memory::default();
+
+    let addr_xr = 0x1000u64; // output xR‖yR (64 bytes)
+    let addr_xg = 0x2000u64; // input xG‖yG (64 bytes)
+    let addr_k = 0x3000u64;
+    write_u256_le(&mut memory, addr_xg, xg_le);
+    write_u256_le(&mut memory, addr_xg + 32, yg_le);
+    write_u256_le(&mut memory, addr_k, k_le);
+
+    registers.write(17, ECSM_AFFINE_SYSCALL_NUMBER).unwrap();
+    registers.write(10, addr_xr).unwrap();
+    registers.write(11, addr_xg).unwrap();
+    registers.write(12, addr_k).unwrap();
+
+    Instruction::EcallEbreak.run(&mut pc, &mut registers, &mut memory)?;
+    Ok((
+        read_u256_le(&memory, addr_xr),
+        read_u256_le(&memory, addr_xr + 32),
+    ))
+}
+
+#[test]
+fn ecsm_affine_syscall_writes_both_coords() {
+    let (xg, yg) = (gx_le(), gy_le());
+    for v in [1u64, 2, 3, 5, 0xFFFF, 1_000_003] {
+        let (xr, yr) = run_ecsm_affine(&k_le(v), &xg, &yg).unwrap();
+        let (exr, eyr) = ecsm::scalar_mul_xy_with_y(&k_le(v), &xg, &yg).unwrap();
+        assert_eq!(xr, exr, "xR mismatch for k = {v}");
+        assert_eq!(yr, eyr, "yR mismatch for k = {v}");
+    }
+}
+
+#[test]
+fn ecsm_affine_syscall_rejects_point_not_on_curve() {
+    // A valid xG paired with the wrong yG (here yG = Gy of a different point) must be
+    // rejected on-curve, unlike the x-only variant which lifts its own canonical y.
+    let mut yg = gy_le();
+    yg[0] ^= 1; // perturb so (xG, yG) is no longer on the curve
+    let err = run_ecsm_affine(&k_le(5), &gx_le(), &yg).unwrap_err();
+    assert!(matches!(
+        err,
+        ExecutionError::Ecsm(ecsm::EcsmError::NotOnCurve)
+    ));
 }
 
 #[test]
