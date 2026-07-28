@@ -41,5 +41,5 @@ iter = ["d", 0, 2]
 kind = "interaction"
 tag = "ECALL"
 input = ["timestamp", ["arr", ["-", ["^", 2, 32], 22], ["-", ["^", 2, 32], 1]]]
-multiplicity = "μ"
+multiplicity = ["-", "μ"]
 

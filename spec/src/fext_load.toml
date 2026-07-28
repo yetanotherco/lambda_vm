@@ -56,7 +56,6 @@ multiplicity = "μ"
 kind = "interaction"
 tag = "MEMW"
 input = [["+", 3, "i"], "addr", ["arr", ["+", ["*", ["^", 2, 32], ["idx", ["idx", "coeffs", "i"], 1]], ["idx", ["idx", "coeffs", "i"], 0]], 0, 0, 0, 0, 0, 0, 0], "timestamp", 0, 0, 0]
-output = ["arr", ["+", ["*", ["^", 2, 32], ["idx", ["idx", "coeffs", "i"], 1]], ["idx", ["idx", "coeffs", "i"], 0]], 0, 0, 0, 0, 0, 0, 0]
 iter = ["i", 0, 2]
 multiplicity = "μ"
 

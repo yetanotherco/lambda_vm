@@ -34,17 +34,17 @@ pad = 0
 [[variables.constant]]
 name = "α"
 type = "BaseField"
-desc = "The $#`X`^2$ coefficient of the definining polynomial"
+desc = "The $#`X`^2$ coefficient of the defining polynomial"
 
 [[variables.constant]]
 name = "β"
 type = "BaseField"
-desc = "The $#`X`^1$ coefficient of the definining polynomial"
+desc = "The $#`X`^1$ coefficient of the defining polynomial"
 
 [[variables.constant]]
 name = "γ"
 type = "BaseField"
-desc = "The $#`X`^0$ coefficient of the definining polynomial"
+desc = "The $#`X`^0$ coefficient of the defining polynomial"
 
 [[variables.virtual]]
 name = "a"
