@@ -24,7 +24,9 @@ rayon = { version = "1.8.0", optional = true }
 sysinfo = { version = "0.31", default-features = false, features = ["system"] }
 log = "0.4"
 digest = "0.10.7"
-rkyv = { version = "0.8.10", default-features = false, features = ["alloc", "bytecheck", "aligned"] }
+# pointer_width_64: 32-bit rel-ptrs cap an archive at ~2 GiB, which large
+# continuation proofs exceed. Keep in sync across all proof-format crates.
+rkyv = { version = "0.8.10", default-features = false, features = ["alloc", "bytecheck", "aligned", "pointer_width_64"] }
 
 [dev-dependencies]
 env_logger = "*"

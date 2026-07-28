@@ -22,10 +22,12 @@ rand_chacha = { version = "0.3.1", default-features = false }
 memmap2 = { version = "0.9", optional = true }
 tempfile = { version = "3", optional = true }
 libc = { version = "0.2", optional = true }
+# pointer_width_64: proof-format pointer width — see prover/Cargo.toml.
 rkyv = { version = "0.8.10", default-features = false, features = [
     "alloc",
     "bytecheck",
     "aligned",
+    "pointer_width_64",
 ], optional = true }
 
 [target.'cfg(target_arch = "riscv64")'.dependencies]

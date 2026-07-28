@@ -9,7 +9,8 @@ executor = { path = "../../executor" }
 prover = { path = "../../prover", package = "lambda-vm-prover" }
 stark = { path = "../../crypto/stark" }
 clap = { version = "4.3.10", features = ["derive"] }
-rkyv = { version = "0.8.10", default-features = false, features = ["alloc", "bytecheck", "aligned"] }
+# pointer_width_64: proof-format pointer width — see prover/Cargo.toml.
+rkyv = { version = "0.8.10", default-features = false, features = ["alloc", "bytecheck", "aligned", "pointer_width_64"] }
 tempfile = "3"
 tikv-jemallocator = "0.6"
 tikv-jemalloc-ctl = { version = "0.6", features = ["stats"], optional = true }
