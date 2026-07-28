@@ -16,6 +16,9 @@ pub enum SyscallNumbers {
     Halt = 93,
     // Placeholder discriminant. The actual syscall value is ECSM_SYSCALL_NUMBER.
     Ecsm = 94,
+    // Placeholder discriminant. The actual syscall value is DMA_MEMCPY_SYSCALL_NUMBER.
+    // DMA memcpy chunks are proven by the dedicated DMA table.
+    DmaMemcpy = 95,
 }
 
 /// Syscall number for KeccakPermute (u64::MAX - 1 = 0xFFFF_FFFF_FFFF_FFFE).
@@ -31,6 +34,12 @@ const KECCAK_STATE_BYTES: u64 = 25 * 8;
 /// bus as `[lo32, hi32] = [2^32 - 11, 2^32 - 1]`.
 pub const ECSM_SYSCALL_NUMBER: u64 = u64::MAX - 10;
 
+/// DMA memcpy syscall number. Must match `syscalls/src/syscalls.rs`.
+pub const DMA_MEMCPY_SYSCALL_NUMBER: u64 = u64::MAX - 2;
+/// Maximum bytes accepted by one DMA ecall. The guest `memcpy` stub chunks
+/// larger copies, and the prover enforces this bound on every first DMA row.
+pub const DMA_MEMCPY_MAX_BYTES: u64 = 256;
+
 /// `2^32`. ECSM memory operands must not overflow their lower 32-bit address limb when the
 /// largest per-access offset is added: the 32-byte operands reach offset +31 (last byte).
 const LOW_LIMB: u64 = 1 << 32;
@@ -45,6 +54,7 @@ impl TryFrom<u64> for SyscallNumbers {
             93 => Ok(SyscallNumbers::Halt),
             v if v == KECCAK_SYSCALL_NUMBER => Ok(SyscallNumbers::KeccakPermute),
             v if v == ECSM_SYSCALL_NUMBER => Ok(SyscallNumbers::Ecsm),
+            v if v == DMA_MEMCPY_SYSCALL_NUMBER => Ok(SyscallNumbers::DmaMemcpy),
             _ => Err(()),
         }
     }
@@ -68,7 +78,8 @@ impl SyscallNumbers {
             SyscallNumbers::Print
             | SyscallNumbers::Panic
             | SyscallNumbers::Commit
-            | SyscallNumbers::Halt => None,
+            | SyscallNumbers::Halt
+            | SyscallNumbers::DmaMemcpy => None,
         }
     }
 }
@@ -454,6 +465,32 @@ impl Instruction {
                         src2_val = addr_xg;
                         dst_val = addr_k;
                     }
+                    SyscallNumbers::DmaMemcpy => {
+                        // memcpy(dst = x10, src = x11, n = x12). Snapshot the input
+                        // before writing, which also gives this ecall well-defined
+                        // memmove semantics when the regions overlap. The DMA trace
+                        // authenticates the same read-at-T+1/write-at-T+2 relation.
+                        let dst = registers.read(10)?;
+                        let src = registers.read(11)?;
+                        let n = registers.read(12)?;
+                        if n > DMA_MEMCPY_MAX_BYTES {
+                            return Err(ExecutionError::DmaMemcpyChunkTooLarge(n));
+                        }
+                        dst.checked_add(n).ok_or(MemoryError::AddressOverflow)?;
+                        src.checked_add(n).ok_or(MemoryError::AddressOverflow)?;
+
+                        // The fixed-size scratch avoids a heap allocation on every
+                        // hot-path ecall while preserving snapshot semantics.
+                        let mut bytes = [0u8; DMA_MEMCPY_MAX_BYTES as usize];
+                        for (i, byte) in bytes[..n as usize].iter_mut().enumerate() {
+                            *byte = memory.load_byte(src + i as u64);
+                        }
+                        for (i, &byte) in bytes[..n as usize].iter().enumerate() {
+                            memory.store_byte(dst + i as u64, byte);
+                        }
+                        src2_val = src;
+                        dst_val = n;
+                    }
                     SyscallNumbers::Halt => {
                         // halt
                         return Ok(Log {
@@ -634,6 +671,8 @@ pub enum ExecutionError {
     EcsmAddressOverflow,
     #[error("ECSM xG and k operand ranges overlap")]
     EcsmOperandOverlap,
+    #[error("DMA memcpy chunk has {0} bytes; maximum per ecall is {DMA_MEMCPY_MAX_BYTES}")]
+    DmaMemcpyChunkTooLarge(u64),
     #[error("ECSM scalar multiplication error: {0}")]
     Ecsm(#[from] ecsm::EcsmError),
 }
