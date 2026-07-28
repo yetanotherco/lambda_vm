@@ -59,6 +59,38 @@ fn k256_replay_matches_reference() {
     }
 }
 
+/// Same parity sweep with a non-generator base point: production feeds the
+/// replay guest-supplied points (e.g. the recovered R in ecrecover), and every
+/// other test uses G.
+#[test]
+fn k256_replay_matches_reference_non_generator_base() {
+    let g = generator();
+    let base_x = scalar_mul_affine_x(&BigUint::from(5u64), &g);
+    let base = AffinePoint {
+        y: recover_y_canonical(&base_x).expect("base on curve"),
+        x: base_x,
+    };
+    let mut scalars: Vec<BigUint> = (1u64..40).map(BigUint::from).collect();
+    for &kv in &[0xFFu64, 0xABCD, 1 << 20, 123_456_789, u64::MAX] {
+        scalars.push(BigUint::from(kv));
+    }
+    scalars.push(&n() / BigUint::from(2u8));
+    scalars.push(&n() - BigUint::from(1u8));
+
+    for k in scalars {
+        let (steps, result) = replay_double_and_add(&k, &base);
+        let (steps_ref, result_ref) = replay_double_and_add_reference(&k, &base);
+        assert_eq!(
+            result, result_ref,
+            "final point mismatch for k = {k} (non-G base)"
+        );
+        assert_eq!(
+            steps, steps_ref,
+            "step list mismatch for k = {k} (non-G base)"
+        );
+    }
+}
+
 /// The executor's fast path (`scalar_mul_affine_x`) and the prover's replay must agree
 /// on `x(k·G)`: the executor writes it to guest memory and the prover proves it, so any
 /// divergence would make a correct execution unprovable. They run through two distinct
