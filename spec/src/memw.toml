@@ -6,7 +6,7 @@ code = "MMW"
 [[variables.input]]
 name = "domain"
 type = "BaseField"
-desc = "The mmeory domain"
+desc = "The memory domain"
 pad = 0
 
 [[variables.input]]
