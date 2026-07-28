@@ -236,25 +236,27 @@ fn ecsm_lincomb2(
     None
 }
 
-/// AFFINE oracle backed by the ECSM precompile: computes the full point `k·P_even`,
-/// where `P_even` is the EVEN-`y` lift of the passed x-coordinate (the precompile's
-/// canonical convention). Returns `(x, y)` of `k·P_even` as normalized field elements.
-/// The caller ([`lincomb2_with_oracle`]) flips `y` if the real input point's `y` is
-/// odd. `x` must be a valid curve x-coordinate and `k` in `(0, N)`. Values cross the
-/// ABI as 32-byte little-endian; `x_le`/`k_le` are distinct stack arrays (executor's
-/// `|addr_x − addr_k| ≥ 32` assumption) and `out` is a 64-byte `[xR‖yR]` buffer.
+/// AFFINE oracle backed by the ECSM precompile: computes the full point `k·(x, y)` for the
+/// caller's actual input point `(x, y)`. Returns `(xR, yR)` as normalized field elements —
+/// no parity convention or sign flip, because the precompile receives the real `y` and the
+/// prover pins it by a memory read. `(x, y)` must be a curve point and `k` in `(0, N)`.
+/// Values cross the ABI as 32-byte little-endian; `input` is a 64-byte `[xG‖yG]` buffer,
+/// `out` a 64-byte `[xR‖yR]` buffer, `k_le` a distinct 32-byte array (executor's
+/// `|addr_input − addr_k| ≥ 64` disjointness assumption).
 #[cfg(target_arch = "riscv64")]
-fn ecsm_oracle(x: &FieldElement, k: &Scalar) -> Option<(FieldElement, FieldElement)> {
+fn ecsm_oracle(x: &FieldElement, y: &FieldElement, k: &Scalar) -> Option<(FieldElement, FieldElement)> {
     let x_be = x.to_bytes();
+    let y_be = y.to_bytes();
     let k_be = k.to_bytes();
-    let mut x_le = [0u8; 32];
+    let mut input = [0u8; 64];
     let mut k_le = [0u8; 32];
     for i in 0..32 {
-        x_le[i] = x_be[31 - i];
+        input[i] = x_be[31 - i];
+        input[32 + i] = y_be[31 - i];
         k_le[i] = k_be[31 - i];
     }
     let mut out = [0u8; 64];
-    lambda_vm_syscalls::syscalls::ecsm_mul_affine(&mut out, &x_le, &k_le);
+    lambda_vm_syscalls::syscalls::ecsm_mul_affine(&mut out, &input, &k_le);
     let mut xr_be = [0u8; 32];
     let mut yr_be = [0u8; 32];
     for i in 0..32 {
@@ -317,7 +319,7 @@ fn lincomb2_with_oracle<O>(
     oracle: O,
 ) -> Option<AffinePoint>
 where
-    O: Fn(&FieldElement, &Scalar) -> Option<(FieldElement, FieldElement)>,
+    O: Fn(&FieldElement, &FieldElement, &Scalar) -> Option<(FieldElement, FieldElement)>,
 {
     // Inputs are affine already (the ecrecover path lifts them from known Z=1
     // points), so no projective→affine inversion is needed here.
@@ -331,21 +333,11 @@ where
     let (x1, y1) = affine_xy(a1)?;
     let (x2, y2) = affine_xy(a2)?;
 
-    // The oracle returns k·(x, y_even) (even-y lift). The real input point may be the
-    // odd-y sibling, i.e. −(x, y_even); then k·(real) = −(k·(x, y_even)), so flip yR.
-    // y parity = LSB of the big-endian canonical coordinate (byte 31).
-    let (xa, ya_even) = oracle(&x1, k1)?;
-    let (xb, yb_even) = oracle(&x2, k2)?;
-    let ya = if y1.to_bytes()[31] & 1 == 1 {
-        ya_even.negate(1).normalize()
-    } else {
-        ya_even
-    };
-    let yb = if y2.to_bytes()[31] & 1 == 1 {
-        yb_even.negate(1).normalize()
-    } else {
-        yb_even
-    };
+    // The oracle receives the full point (x, y) and returns k·(x, y) directly — no parity
+    // convention or sign flip, since the precompile gets the real y (pinned in the prover
+    // by a memory read).
+    let (xa, ya) = oracle(&x1, &y1, k1)?;
+    let (xb, yb) = oracle(&x2, &y2, k2)?;
 
     // Q = A + B via one chord addition (A ≠ ±B ⇒ dxq ≠ 0). One field inversion.
     let dxq = (xb - xa).normalize();

@@ -23,7 +23,7 @@ use num_traits::{Signed, Zero};
 use rayon::prelude::*;
 
 use crate::curve::{StepPts, replay_double_and_add};
-use crate::{B, EcsmError, P_BYTES, R_BYTES, n, p, prepare, to_le_32};
+use crate::{B, EcsmError, P_BYTES, R_BYTES, n, p, prepare, prepare_with_y, to_le_32};
 
 /// Full ECSM-chip witness for one scalar multiplication (one ECSM row).
 #[derive(Debug, Clone)]
@@ -280,7 +280,26 @@ fn shifted_quotient(relation: &str, numerator: &BigInt, p_big: &BigInt, r_big: &
 /// little-endian 32-byte values. This is the prover's entry point.
 pub fn compute_witness(k_le: &[u8; 32], xg_le: &[u8; 32]) -> Result<EcsmWitness, EcsmError> {
     let (k, g) = prepare(k_le, xg_le)?;
+    compute_witness_inner(k_le, k, g)
+}
 
+/// Like [`compute_witness`] but with an explicit input `yG` (the caller's full point),
+/// validated on-curve by [`prepare_with_y`]. The affine path uses this so the witnessed
+/// `yG`/`yR` match the caller's actual point rather than the canonical even lift.
+pub fn compute_witness_with_y(
+    k_le: &[u8; 32],
+    xg_le: &[u8; 32],
+    yg_le: &[u8; 32],
+) -> Result<EcsmWitness, EcsmError> {
+    let (k, g) = prepare_with_y(k_le, xg_le, yg_le)?;
+    compute_witness_inner(k_le, k, g)
+}
+
+fn compute_witness_inner(
+    k_le: &[u8; 32],
+    k: BigUint,
+    g: crate::curve::AffinePoint,
+) -> Result<EcsmWitness, EcsmError> {
     let p_big = BigInt::from(p());
     let r_big = BigInt::from(BigUint::from_bytes_le(&R_BYTES)); // r = 3p
 

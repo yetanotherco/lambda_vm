@@ -354,6 +354,33 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             ),
         ));
     }
+    // AFFINE: read yG: 4 doublewords at addr_xG + 32 + 8i (ts). Pins the witnessed yG
+    // (col YG) to the caller's input point, so the returned yR corresponds to the
+    // caller's actual (xG, yG) — closes the parity soundness gap. Same low address limb
+    // (the +63 span is guarded to not cross the 2^32 limb boundary).
+    for i in 0..4 {
+        let base_lo = BusValue::linear(vec![
+            LinearTerm::Column {
+                coefficient: 1,
+                column: cols::ADDR_XG_0,
+            },
+            LinearTerm::Constant((32 + 8 * i) as i64),
+        ]);
+        out.push(BusInteraction::sender(
+            BusId::Memw,
+            mu(),
+            memw_read(
+                dword_bytes(cols::YG, i),
+                0,
+                base_lo,
+                packed(cols::ADDR_XG_1),
+                ts_lo(),
+                ts_hi(),
+                0,
+                1,
+            ),
+        ));
+    }
 
     let ts_lo_plus = |d: i64| {
         BusValue::linear(vec![

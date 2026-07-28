@@ -24,7 +24,7 @@ mod tests;
 use num_bigint::BigUint;
 
 pub use curve::{AffinePoint, recover_y_canonical, replay_double_and_add};
-pub use witness::{EcdasStep, EcsmWitness, compute_witness};
+pub use witness::{EcdasStep, EcsmWitness, compute_witness, compute_witness_with_y};
 
 /// secp256k1 curve coefficient `b`.
 pub const B: u64 = 7;
@@ -117,6 +117,49 @@ pub(crate) fn prepare(
     }
     let yg = recover_y_canonical(&xg).ok_or(EcsmError::NotOnCurve)?;
     Ok((k, AffinePoint { x: xg, y: yg }))
+}
+
+/// Like [`prepare`] but takes an explicit `yG` (the caller's full input point) instead of
+/// lifting `xG` to the canonical even root. Validates `0 < k < N`, `xG < p`, `yG < p`, and
+/// that `(xG, yG)` is on the curve (`yG² ≡ xG³ + b mod p`). Used by the affine path so the
+/// returned `yR` matches the caller's actual point (no parity convention / guest-side sign
+/// flip). `yG`'s value is pinned in the prover by a memory read of the caller's input.
+pub(crate) fn prepare_with_y(
+    k_le: &[u8; 32],
+    xg_le: &[u8; 32],
+    yg_le: &[u8; 32],
+) -> Result<(BigUint, AffinePoint), EcsmError> {
+    let k = BigUint::from_bytes_le(k_le);
+    if k == BigUint::from(0u8) {
+        return Err(EcsmError::ScalarIsZero);
+    }
+    if k >= n() {
+        return Err(EcsmError::ScalarOutOfRange);
+    }
+    let xg = BigUint::from_bytes_le(xg_le);
+    let yg = BigUint::from_bytes_le(yg_le);
+    if xg >= p() || yg >= p() {
+        return Err(EcsmError::CoordinateOutOfRange);
+    }
+    // On-curve: yG² ≡ xG³ + b (mod p).
+    let lhs = (&yg * &yg) % p();
+    let rhs = (&xg * &xg % p() * &xg + BigUint::from(B)) % p();
+    if lhs != rhs {
+        return Err(EcsmError::NotOnCurve);
+    }
+    Ok((k, AffinePoint { x: xg, y: yg }))
+}
+
+/// Affine entry point with an explicit input `yG`: both coordinates of `k·(xG, yG)` as
+/// little-endian 32-byte values. The executor writes `xR` then `yR` back (64-byte output).
+pub fn scalar_mul_xy_with_y(
+    k_le: &[u8; 32],
+    xg_le: &[u8; 32],
+    yg_le: &[u8; 32],
+) -> Result<([u8; 32], [u8; 32]), EcsmError> {
+    let (k, g) = prepare_with_y(k_le, xg_le, yg_le)?;
+    let r = curve::scalar_mul_affine(&k, &g);
+    Ok((to_le_32(&r.x), to_le_32(&r.y)))
 }
 
 /// Computes the x-coordinate of `k·G` over secp256k1, given `k` and `xG` as little-endian

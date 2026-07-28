@@ -4,27 +4,11 @@
 
 use crate::*;
 
-/// secp256k1 curve constant `b = 7`.
-fn curve_b() -> FieldElement {
-    let mut bytes = [0u8; 32];
-    bytes[31] = 7;
-    FieldElement::from_bytes(&bytes.into()).unwrap()
-}
-
-/// Software stand-in for the affine ECSM precompile: lift `x` to the EVEN-`y` curve
-/// point `P_even` and return `(x, y)` of `k·P_even` (matching the real ecall's
-/// even-`y` convention; the caller flips the sign for odd-`y` inputs).
-fn soft_oracle(x: &FieldElement, k: &Scalar) -> Option<(FieldElement, FieldElement)> {
-    let xn = x.normalize();
-    let y2 = (xn.square() * xn + curve_b()).normalize();
-    let y = Option::<FieldElement>::from(y2.sqrt())?.normalize();
-    // Even-y lift: pick the root whose LSB (big-endian byte 31) is 0.
-    let y_even = if y.to_bytes()[31] & 1 == 0 {
-        y
-    } else {
-        y.negate(1).normalize()
-    };
-    let p = point_from_xy(&xn, &y_even)?;
+/// Software stand-in for the affine ECSM precompile: form the curve point `(x, y)` from
+/// the caller's actual coordinates and return `(xR, yR)` of `k·(x, y)`. No parity
+/// convention — the real ecall receives the full input point too.
+fn soft_oracle(x: &FieldElement, y: &FieldElement, k: &Scalar) -> Option<(FieldElement, FieldElement)> {
+    let p = point_from_xy(&x.normalize(), &y.normalize())?;
     let prod = (p * k).to_affine();
     let (xr, yr) = affine_xy(&prod)?;
     Some((xr.normalize(), yr.normalize()))
