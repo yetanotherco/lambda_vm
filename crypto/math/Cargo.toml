@@ -24,10 +24,12 @@ num-traits = { version = "0.2.19", default-features = false }
 
 # rkyv zero-copy (de)serialization. Optional; used by the recursion verifier to
 # read a proof straight from its byte buffer with no deserialization pass.
+# pointer_width_64: proof-format pointer width — see prover/Cargo.toml.
 rkyv = { version = "0.8.10", default-features = false, features = [
     "alloc",
     "bytecheck",
     "aligned",
+    "pointer_width_64",
 ], optional = true }
 
 [dev-dependencies]
