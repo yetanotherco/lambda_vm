@@ -81,6 +81,24 @@ authors' reference implementation and is entirely independent of
 still labels it "Official test_vectors.json". Read it as "checked against the
 official reference implementation using the official vector parameters".
 
+### What the two reviews pinned that no anchor covers
+
+- **Counter split order at `t ≥ 2^32` — confirmed.** `t_lo = t mod 2^32 → v[12]`,
+  `t_hi = t >> 32 → v[13]`. Verified *behaviourally* against the official crate
+  through two independent counter paths (`OutputReader::set_position` and
+  `hazmat::HasherExt::set_input_offset`), over counters 0 … 2^47 including
+  2^32−1, 2^32, 2^32+1: **44/44**. Negative control — swapping the halves —
+  breaks 5 of 6 chunk cases, the sixth being `counter = 0`, correctly invariant.
+  This closes ORACLE.md's own open question O5.
+- **Message schedule count *and direction*.** Iterating `permute` from the
+  identity reproduces **all seven rows** of the crate's precomputed
+  `MSG_SCHEDULE`. Three mutants (permute before round 0, skip the 0→1 permute,
+  inverse direction) are all caught. A fourth — permuting *after* the last
+  round — is provably a no-op, so the trailing-permute guard is an optimisation
+  and cannot hide an off-by-one either way.
+- `compress` does not mutate its arguments; incremental `update()` equals the
+  one-shot path over 60 random split patterns.
+
 ### Known harness defects (found by review, not yet fixed)
 
 1. `main()` prints `VALIDATION STATUS: VALIDATED … anchored on official test
@@ -90,6 +108,22 @@ official reference implementation using the official vector parameters".
 2. `test_internal_consistency` carries a comment describing a feed-forward
    recomputation (*"recompute v to check"*) that **is not implemented** — it only
    checks output length and the CV prefix.
+3. **The missing-file failure cascades.** The `FileNotFoundError` at
+   `test_oracle.py:282` kills anchors 2 and 3 *and the canonical-vector
+   emitter* — which is why the z3 gate's positive controls were blocked on an
+   unrelated download. That single coupling is what made this recovery look
+   worse than it was. Anchors should fail independently.
+4. **`test_6round_derivation`'s first assertion is a tautology** —
+   `compress_6round`'s body *is* `compress(rounds=6)`. ORACLE.md §2.6 calls it
+   the "Code-diff anchor"; it establishes nothing. The differs-from-7r half is
+   real.
+5. **Footgun for the Rust phase:** `compress(...)` defaults to `rounds=7`, so a
+   6-round caller that omits the kwarg silently gets 7. Trace generators must
+   call `compress_6round` — make it mandatory rather than conventional.
+6. ORACLE.md §5's closing ratio is internally inconsistent: ~5–6k cell-equiv
+   against 24×1480 = 35,520 is ≈1/6, not the "¼–⅓" its prose claims. Superseded
+   by DESIGN.md §6's ≈1/15 against a 77,000 baseline — which is the number that
+   was actually derived.
 
 ## Open findings against the DESIGN (review, 2026-07-29)
 
@@ -111,6 +145,28 @@ official reference implementation using the official vector parameters".
    monolithic UNSAT before shipping.
 3. **The 3-op add carry encoding is ambiguous** — `(c1,c2) = (1,0)` and `(0,1)`
    both encode carry 1. Harmless for soundness; noted so nobody "fixes" it.
+
+## Still unaudited — where to send the next reviewer
+
+Two independent reviews established that **the oracle defines the right
+function**, so the gate's UNSATs are about the right function. They did *not*
+audit the step after that: **nobody has checked the z3 gate's transcription of
+the oracle into constraints.** Only its constants block
+(`z3_blake_verify.py:50-80`) was spot-checked, and it matches exactly.
+
+That is the highest-value next pass, and the EC campaign is the reason to take
+it seriously: the equivalent audit there
+(`thoughts/ec-recover-opt/gate/TRANSCRIPTION-AUDIT.md`) found three premises the
+gate asserted about the chip and never read, one of them hiding a working
+forgery. The dangerous direction is a model **stronger** than the thing it
+models — it yields UNSAT where the real object is forgeable, and a positive
+anchor cannot catch it, because honest inputs satisfy a correct model and an
+over-strong one equally well.
+
+Also still thin: neither review verified the recovery is *byte-identical to the
+original* — only that the artifact is correct BLAKE3, which is a different and
+weaker claim; and the historical counts ("35/35×3", "92/92" against PyPI
+v1.0.9) remain unreproduced as recorded.
 
 ## If this is picked up again
 
