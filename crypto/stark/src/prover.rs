@@ -20,10 +20,7 @@ use math::{
 };
 
 #[cfg(feature = "parallel")]
-use rayon::prelude::{
-    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator,
-    IntoParallelRefMutIterator, ParallelIterator,
-};
+use rayon::prelude::{IntoParallelIterator, ParallelIterator};
 
 #[cfg(feature = "debug-checks")]
 use crate::debug::validate_trace;
@@ -581,7 +578,18 @@ pub fn table_parallelism() -> usize {
                 let cores = std::thread::available_parallelism()
                     .map(|n| n.get())
                     .unwrap_or(4);
-                (cores / 3).max(1)
+                // GPU builds: with the admission scheduler most in-flight
+                // tables sit in GPU waits, so more of them pay (swept flat at
+                // ~2/3 of the cores on a 16-core/RTX 5090 box). CPU builds
+                // stay at cores/3 — every table is pure host work there.
+                #[cfg(feature = "cuda")]
+                {
+                    (cores * 2 / 3).max(1)
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    (cores / 3).max(1)
+                }
             })
     }
     #[cfg(not(feature = "parallel"))]
@@ -613,28 +621,100 @@ fn estimate_table_vram_bytes(main_cols: usize, aux_cols: usize, lde_size: usize)
 /// or VRAM not binding) chunks fall back to fixed size `k`, identical to the
 /// old `step_by(k)`, so scheduling and the proof are unchanged. Returns
 /// `(start, end)` half open ranges covering `0..estimates.len()` in order.
-fn plan_table_chunks(estimates: &[u64], k: usize, budget: u64) -> Vec<(usize, usize)> {
-    let n = estimates.len();
-    let k = k.max(1);
-    let budget = budget as u128;
-    let mut chunks = Vec::new();
-    let mut start = 0;
-    while start < n {
-        let mut end = start;
-        let mut acc: u128 = 0;
-        while end < n {
-            let next = estimates[end] as u128;
-            // Always admit at least one table per chunk (oversized → solo).
-            if end > start && (end - start >= k || acc + next > budget) {
-                break;
-            }
-            acc += next;
-            end += 1;
+/// Byte-budget admission gate for concurrently proven tables. `acquire`
+/// blocks until the requested bytes fit under the budget, releasing on
+/// permit drop. An oversized request is admitted alone (when nothing else
+/// holds bytes), so tables larger than the whole budget still prove.
+///
+/// Only OS driver threads block here (see `run_admitted`) — never rayon
+/// workers, whose pool the admitted tables use internally and which a
+/// blocked worker would starve.
+struct VramGate {
+    used: std::sync::Mutex<u64>,
+    freed: std::sync::Condvar,
+    budget: u64,
+}
+
+struct VramPermit<'a> {
+    gate: &'a VramGate,
+    bytes: u64,
+}
+
+impl VramGate {
+    fn new(budget: u64) -> Self {
+        Self {
+            used: std::sync::Mutex::new(0),
+            freed: std::sync::Condvar::new(),
+            budget,
         }
-        chunks.push((start, end));
-        start = end;
     }
-    chunks
+
+    fn acquire(&self, bytes: u64) -> VramPermit<'_> {
+        let mut used = self.used.lock().unwrap();
+        loop {
+            if *used == 0 || used.saturating_add(bytes) <= self.budget {
+                *used = used.saturating_add(bytes);
+                return VramPermit { gate: self, bytes };
+            }
+            used = self.freed.wait(used).unwrap();
+        }
+    }
+}
+
+impl Drop for VramPermit<'_> {
+    fn drop(&mut self) {
+        let mut used = self.gate.used.lock().unwrap();
+        *used = used.saturating_sub(self.bytes);
+        drop(used);
+        self.gate.freed.notify_all();
+    }
+}
+
+/// Run `task` once per table index on `workers` OS driver threads, admitting
+/// each index through `gate` with its estimated bytes. `order` fixes the
+/// start order (heaviest table first, so the long pole starts early and small
+/// tables fill around it — the fixed chunks this replaces made every table
+/// wait for the slowest of its chunk). Returns one slot per original index.
+fn run_admitted<T: Send>(
+    order: &[usize],
+    estimates: &[u64],
+    gate: &VramGate,
+    workers: usize,
+    task: impl Fn(usize) -> T + Sync,
+) -> Vec<Option<T>> {
+    let results: Vec<std::sync::Mutex<Option<T>>> = estimates
+        .iter()
+        .map(|_| std::sync::Mutex::new(None))
+        .collect();
+    let cursor = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..workers.max(1).min(order.len().max(1)) {
+            scope.spawn(|| {
+                loop {
+                    let pos = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if pos >= order.len() {
+                        return;
+                    }
+                    let idx = order[pos];
+                    let permit = gate.acquire(estimates[idx]);
+                    let out = task(idx);
+                    *results[idx].lock().unwrap() = Some(out);
+                    drop(permit);
+                }
+            });
+        }
+    });
+    results
+        .into_iter()
+        .map(|m| m.into_inner().unwrap())
+        .collect()
+}
+
+/// Table indices sorted heaviest-first by estimate.
+fn heaviest_first(estimates: &[u64]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..estimates.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(estimates[i]));
+    order
 }
 
 /// A container for the results of the second round of the STARK Prove protocol.
@@ -1321,7 +1401,7 @@ pub trait IsStarkProver<
     /// validate each trace. Called once after Phase C commits.
     #[cfg(feature = "debug-checks")]
     fn run_debug_checks(
-        air_trace_pairs: &[AirTracePair<'_, Field, FieldExtension, PI>],
+        pair_cells: &[std::sync::Mutex<AirTracePair<'_, Field, FieldExtension, PI>>],
         commitments: &[Round1Commitments<Field, FieldExtension>],
         domains: &[Arc<Domain<Field>>],
         twiddle_caches: &[Arc<LdeTwiddles<Field>>],
@@ -1331,13 +1411,15 @@ pub trait IsStarkProver<
         PI: Send + Sync + Clone,
     {
         let mut temp_results: Vec<Round1<Field, FieldExtension>> =
-            Vec::with_capacity(air_trace_pairs.len());
-        for (((air, trace, _), commitment), (domain, twiddles)) in air_trace_pairs
+            Vec::with_capacity(pair_cells.len());
+        for ((cell, commitment), (domain, twiddles)) in pair_cells
             .iter()
             .zip(commitments.iter())
             .zip(domains.iter().zip(twiddle_caches.iter()))
         {
-            let result = Self::reconstruct_round1(*air, *trace, domain, commitment, twiddles)
+            let pair = cell.lock().unwrap();
+            let (air, trace, _) = &*pair;
+            let result = Self::reconstruct_round1(*air, trace, domain, commitment, twiddles)
                 .expect("reconstruct_round1 failed in debug-checks");
             temp_results.push(result);
         }
@@ -1348,15 +1430,17 @@ pub trait IsStarkProver<
             .collect();
         print_bus_balance_report(&all_bus_public_inputs);
 
-        for (((air, trace, pub_inputs), round_1_result), domain) in air_trace_pairs
+        for ((cell, round_1_result), domain) in pair_cells
             .iter()
             .zip(temp_results.iter())
             .zip(domains.iter())
         {
+            let pair = cell.lock().unwrap();
+            let (air, trace, pub_inputs) = &*pair;
             validate_trace(
                 *air,
                 *pub_inputs,
-                *trace,
+                trace,
                 domain,
                 &round_1_result.rap_challenges,
                 round_1_result.bus_public_inputs.as_ref(),
@@ -2933,7 +3017,7 @@ pub trait IsStarkProver<
     ///
     /// The transcript must be safely initialized before passing it to this method.
     fn multi_prove(
-        mut air_trace_pairs: Vec<AirTracePair<'_, Field, FieldExtension, PI>>,
+        #[allow(unused_mut)] mut air_trace_pairs: Vec<AirTracePair<'_, Field, FieldExtension, PI>>,
         transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone + Send),
         #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
     ) -> Result<MultiProof<Field, FieldExtension, PI>, ProvingError>
@@ -3000,20 +3084,18 @@ pub trait IsStarkProver<
         // don't re-add pre-sizing without a shared-slab design that bounds the
         // number of allocations.
 
+        let vram_gate = VramGate::new(vram_budget);
+
         // R1 main commit: only the main LDE and its Merkle scratch are resident,
         // so the aux columns add nothing to this phase's working set.
-        let main_chunks = {
-            let estimates: Vec<u64> = air_trace_pairs
-                .iter()
-                .enumerate()
-                .map(|(idx, (_, trace, _))| {
-                    let lde_size =
-                        domains[idx].interpolation_domain_size * domains[idx].blowup_factor;
-                    estimate_table_vram_bytes(trace.num_main_columns, 0, lde_size)
-                })
-                .collect();
-            plan_table_chunks(&estimates, k, vram_budget)
-        };
+        let main_estimates: Vec<u64> = air_trace_pairs
+            .iter()
+            .enumerate()
+            .map(|(idx, (_, trace, _))| {
+                let lde_size = domains[idx].interpolation_domain_size * domains[idx].blowup_factor;
+                estimate_table_vram_bytes(trace.num_main_columns, 0, lde_size)
+            })
+            .collect();
 
         // Spill main traces to mmap before Round 1 LDE.
         #[cfg(feature = "disk-spill")]
@@ -3055,51 +3137,55 @@ pub trait IsStarkProver<
         let mut main_gpu_handles: Vec<Option<math_cuda::lde::GpuLdeBase>> =
             Vec::with_capacity(num_airs);
 
-        for &(chunk_start, chunk_end) in &main_chunks {
-            let chunk_range = chunk_start..chunk_end;
+        // All main commits with continuous VRAM admission (no chunk barriers);
+        // the transcript only needs the roots absorbed in index order, done
+        // sequentially below once every commit completed — the one ordering
+        // Fiat-Shamir requires before sampling the shared challenges.
+        let main_results = run_admitted(
+            &heaviest_first(&main_estimates),
+            &main_estimates,
+            &vram_gate,
+            k,
+            |idx| {
+                let (air, trace, _) = &air_trace_pairs[idx];
+                let domain = &domains[idx];
+                let twiddles = &twiddle_caches[idx];
 
-            let chunk_results: Vec<Result<_, ProvingError>> =
-                crate::par::par_map_collect(chunk_range, |idx| {
-                    let (air, trace, _) = &air_trace_pairs[idx];
-                    let domain = &domains[idx];
-                    let twiddles = &twiddle_caches[idx];
+                let precomputed = air
+                    .is_preprocessed()
+                    .then(|| (air.precomputed_commitment(), air.num_precomputed_columns()));
 
-                    let precomputed = air
-                        .is_preprocessed()
-                        .then(|| (air.precomputed_commitment(), air.num_precomputed_columns()));
+                // Stage-3 device-only gate: when it holds, `commit_main_trace`
+                // keeps the R1 LDE device-resident and skips the host D2H.
+                #[cfg(feature = "cuda")]
+                let device_only = Self::device_only_for(*air, domain);
 
-                    // Stage-3 device-only gate: when it holds, `commit_main_trace`
-                    // keeps the R1 LDE device-resident and skips the host D2H.
+                Self::commit_main_trace(
+                    *trace,
+                    domain,
+                    twiddles,
+                    precomputed,
                     #[cfg(feature = "cuda")]
-                    let device_only = Self::device_only_for(*air, domain);
-
-                    Self::commit_main_trace(
-                        *trace,
-                        domain,
-                        twiddles,
-                        precomputed,
-                        #[cfg(feature = "cuda")]
-                        device_only,
-                        #[cfg(feature = "disk-spill")]
-                        storage_mode,
-                    )
-                });
-
-            // Sequential: append roots to shared transcript (Fiat-Shamir ordering)
-            for result in chunk_results {
-                #[cfg(feature = "cuda")]
-                let (commit, cached_main, gpu_main) = result?;
-                #[cfg(not(feature = "cuda"))]
-                let (commit, cached_main) = result?;
-                if let Some(ref pre_root) = commit.precomputed_root {
-                    transcript.append_bytes(pre_root);
-                }
-                transcript.append_bytes(&commit.root);
-                main_commits.push(commit);
-                main_ldes.push(cached_main);
-                #[cfg(feature = "cuda")]
-                main_gpu_handles.push(gpu_main);
+                    device_only,
+                    #[cfg(feature = "disk-spill")]
+                    storage_mode,
+                )
+            },
+        );
+        for result in main_results {
+            let result = result.expect("run_admitted fills every slot");
+            #[cfg(feature = "cuda")]
+            let (commit, cached_main, gpu_main) = result?;
+            #[cfg(not(feature = "cuda"))]
+            let (commit, cached_main) = result?;
+            if let Some(ref pre_root) = commit.precomputed_root {
+                transcript.append_bytes(pre_root);
             }
+            transcript.append_bytes(&commit.root);
+            main_commits.push(commit);
+            main_ldes.push(cached_main);
+            #[cfg(feature = "cuda")]
+            main_gpu_handles.push(gpu_main);
         }
 
         #[cfg(feature = "instruments")]
@@ -3134,13 +3220,9 @@ pub trait IsStarkProver<
         //   Pass 1 (parallel): Build all auxiliary traces (fingerprint + batch inversion)
         //   Pass 2 (parallel): Fork transcript → extract → LDE → commit
 
-        // Pass 1: Build aux traces in parallel.
-        // Each build_auxiliary_trace has internal parallelism (batch_inverse, par_chunks),
-        // but outer parallelism over 12 tables also helps on high-core-count machines.
-        #[cfg(feature = "instruments")]
-        let phase_start = Instant::now();
-        #[cfg(feature = "instruments")]
-        let __sp = crate::instruments::span("r1_aux_build");
+        // Aux build, aux commit and rounds 2-4 run FUSED per table below (one
+        // driver chains all three for its table, so tables never wait on a
+        // phase barrier); only this sequential prep runs here.
 
         // Disk-spill needs the aux columns in the host trace to spill them, so
         // disable the GPU-resident aux build (it would keep them device-only).
@@ -3165,67 +3247,13 @@ pub trait IsStarkProver<
             }
         }
 
-        #[cfg(feature = "parallel")]
-        let aux_iter = air_trace_pairs.par_iter_mut();
-        #[cfg(not(feature = "parallel"))]
-        let aux_iter = air_trace_pairs.iter_mut();
-        let bus_inputs_vec: Vec<Option<BusPublicInputs<FieldExtension>>> = aux_iter
-            .map(|(air, trace, _)| {
-                if air.has_aux_trace() {
-                    air.build_auxiliary_trace(*trace, &lookup_challenges)
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        // The trace-domain snapshots retained by the R1 main LDE (both Arcs:
-        // trace.main_trace_dev and GpuLdeBase.trace_dev) have exactly one
-        // consumer — the aux build above. Drop them now so the main-trace-sized
-        // device buffers are reclaimed before the aux-commit + DEEP/FRI VRAM
-        // peak instead of living to the end of the proof.
-        #[cfg(feature = "cuda")]
-        {
-            for (_, trace, _) in air_trace_pairs.iter_mut() {
-                trace.clear_main_trace_dev();
-            }
-            for handle in main_gpu_handles.iter_mut().flatten() {
-                handle.trace_dev = None;
-                handle.trace_rows = 0;
-            }
-        }
-
-        // Spill all aux trace tables to mmap before any Round 1 aux LDE work.
-        #[cfg(feature = "disk-spill")]
-        if storage_mode == StorageMode::Disk {
-            crate::par::par_try_for_each_mut(&mut air_trace_pairs, |(air, trace, _)| {
-                if air.has_aux_trace() {
-                    trace
-                        .spill_aux_to_disk()
-                        .map_err(|e| ProvingError::DiskSpill(format!("aux trace: {e}")))?;
-                }
-                Ok::<(), ProvingError>(())
-            })?;
-        }
-
+        // The per-table aux build (inside the fused chain) reports through the
+        // per-table spans; the phase-level buckets are folded into rounds_2_4.
         #[cfg(feature = "instruments")]
-        drop(__sp);
-        #[cfg(feature = "instruments")]
-        let aux_build_elapsed = phase_start.elapsed();
-        #[cfg(feature = "instruments")]
-        if let Some(s) = crate::instruments::snap("After aux build") {
-            heap_snaps.push(s);
-        }
-
-        // Pass 2: Parallel fork transcript → extract → LDE → commit in chunks of K.
-        // Each table gets its own transcript fork.
-        #[cfg(feature = "instruments")]
-        let phase_start = Instant::now();
-        #[cfg(feature = "instruments")]
-        let __sp = crate::instruments::span("r1_aux_commit");
+        let aux_build_elapsed = Duration::ZERO;
 
         // Pre-fork all transcripts (cheap, sequential — must match verifier ordering)
-        let mut table_transcripts: Vec<_> = (0..num_airs)
+        let table_transcripts: Vec<_> = (0..num_airs)
             .map(|idx| {
                 let mut t = transcript.clone();
                 if num_airs > 1 {
@@ -3247,40 +3275,100 @@ pub trait IsStarkProver<
         );
         #[cfg(not(feature = "cuda"))]
         type AuxResult<FE> = (Option<TableCommit<FE>>, (Vec<FieldElement<FE>>, usize));
-        #[allow(clippy::type_complexity)]
-        let mut aux_results: Vec<AuxResult<FieldExtension>> = Vec::with_capacity(num_airs);
-
         // R1 aux commit and rounds 2 to 4 share the peak working set: the main
         // and aux LDEs are co-resident, plus the composition and Merkle
-        // transients (in the scratch factor). `num_aux_columns` is populated by
-        // the aux build above, so this estimate is accurate for both phases.
-        let peak_chunks = {
-            let estimates: Vec<u64> = air_trace_pairs
-                .iter()
-                .enumerate()
-                .map(|(idx, (_, trace, _))| {
-                    let lde_size =
-                        domains[idx].interpolation_domain_size * domains[idx].blowup_factor;
-                    estimate_table_vram_bytes(
-                        trace.num_main_columns,
-                        trace.num_aux_columns,
-                        lde_size,
-                    )
-                })
+        // transients (in the scratch factor). The aux width comes from the AIR
+        // layout (the aux build itself runs inside the admitted chain below).
+        let peak_estimates: Vec<u64> = air_trace_pairs
+            .iter()
+            .enumerate()
+            .map(|(idx, (air, trace, _))| {
+                let lde_size = domains[idx].interpolation_domain_size * domains[idx].blowup_factor;
+                let (_, aux_cols) = air.trace_layout();
+                estimate_table_vram_bytes(trace.num_main_columns, aux_cols, lde_size)
+            })
+            .collect();
+
+        // Per-table slots for the fused chain: each driver takes or locks only
+        // its own index, so every mutex is uncontended by construction.
+        let pair_cells: Vec<std::sync::Mutex<AirTracePair<'_, Field, FieldExtension, PI>>> =
+            air_trace_pairs
+                .into_iter()
+                .map(std::sync::Mutex::new)
                 .collect();
-            plan_table_chunks(&estimates, k, vram_budget)
-        };
+        let main_commit_cells: Vec<std::sync::Mutex<Option<TableCommit<Field>>>> = main_commits
+            .into_iter()
+            .map(|c| std::sync::Mutex::new(Some(c)))
+            .collect();
+        #[allow(clippy::type_complexity)]
+        let main_lde_cells: Vec<
+            std::sync::Mutex<Option<(Vec<FieldElement<Field>>, usize)>>,
+        > = main_ldes
+            .into_iter()
+            .map(|l| std::sync::Mutex::new(Some(l)))
+            .collect();
+        #[cfg(feature = "cuda")]
+        let gpu_main_cells: Vec<std::sync::Mutex<Option<math_cuda::lde::GpuLdeBase>>> =
+            main_gpu_handles
+                .into_iter()
+                .map(std::sync::Mutex::new)
+                .collect();
+        let transcript_cells: Vec<_> = table_transcripts
+            .into_iter()
+            .map(std::sync::Mutex::new)
+            .collect();
+        #[cfg(feature = "instruments")]
+        #[allow(clippy::type_complexity)]
+        let table_timings_mx: std::sync::Mutex<
+            Vec<(String, usize, Duration, crate::instruments::TableSubOps)>,
+        > = std::sync::Mutex::new(Vec::new());
 
-        for &(chunk_start, chunk_end) in &peak_chunks {
-            let chunk_range = chunk_start..chunk_end;
+        // Fused chain, stage 1: aux build → aux commit → aux root into the
+        // table's transcript fork → Round1 assembly.
+        #[allow(clippy::type_complexity)]
+        let aux_stage = |idx: usize| -> Result<
+            (
+                Round1Commitments<Field, FieldExtension>,
+                Lde<Field, FieldExtension>,
+            ),
+            ProvingError,
+        > {
+            let mut pair = pair_cells[idx].lock().unwrap();
+            let (air, trace, _) = &mut *pair;
+            let domain = &domains[idx];
+            let twiddles = &twiddle_caches[idx];
 
-            #[allow(clippy::type_complexity)]
-            let chunk_aux: Vec<Result<AuxResult<FieldExtension>, ProvingError>> =
-                crate::par::par_map_collect(chunk_range, |idx| {
-                    let (air, trace, _) = &air_trace_pairs[idx];
-                    let domain = &domains[idx];
-                    let twiddles = &twiddle_caches[idx];
+            #[cfg(feature = "instruments")]
+            let __sp = crate::instruments::span("r1_aux_build");
+            let bus_public_inputs = if air.has_aux_trace() {
+                air.build_auxiliary_trace(*trace, &lookup_challenges)
+            } else {
+                None
+            };
+            // The trace-domain snapshot retained by the R1 main LDE has exactly
+            // one consumer — the aux build above. Reclaim it before this
+            // table's aux-commit + DEEP/FRI VRAM peak.
+            #[cfg(feature = "cuda")]
+            {
+                trace.clear_main_trace_dev();
+                if let Some(handle) = gpu_main_cells[idx].lock().unwrap().as_mut() {
+                    handle.trace_dev = None;
+                    handle.trace_rows = 0;
+                }
+            }
+            #[cfg(feature = "disk-spill")]
+            if storage_mode == StorageMode::Disk && air.has_aux_trace() {
+                trace
+                    .spill_aux_to_disk()
+                    .map_err(|e| ProvingError::DiskSpill(format!("aux trace: {e}")))?;
+            }
+            #[cfg(feature = "instruments")]
+            drop(__sp);
 
+            #[cfg(feature = "instruments")]
+            let __sp = crate::instruments::span("r1_aux_commit");
+            let aux_full: AuxResult<FieldExtension> =
+                (|| -> Result<AuxResult<FieldExtension>, ProvingError> {
                     if air.has_aux_trace() {
                         let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
 
@@ -3418,179 +3506,155 @@ pub trait IsStarkProver<
                         #[cfg(not(feature = "cuda"))]
                         Ok((None, (Vec::new(), 0)))
                     }
-                });
-
-            // Sequential: append aux roots to forked transcripts.
-            for (j, result) in chunk_aux.into_iter().enumerate() {
-                let aux_full = result?;
-                // Tuple shape is cfg-gated; `.0` is the optional TableCommit
-                // in both variants.
-                if let Some(ref c) = aux_full.0 {
-                    table_transcripts[chunk_start + j].append_bytes(&c.root);
-                }
-                aux_results.push(aux_full);
+                })()?;
+            // Tuple shape is cfg-gated; `.0` is the optional TableCommit in
+            // both variants. Aux roots go to the table's OWN fork, so no
+            // cross-table ordering is needed here.
+            if let Some(ref c) = aux_full.0 {
+                transcript_cells[idx].lock().unwrap().append_bytes(&c.root);
             }
-        }
+            #[cfg(feature = "instruments")]
+            drop(__sp);
 
-        // Build commitments and cached LDEs as separate vecs:
-        // commitments are borrowed in Phase D, LDEs are consumed by value.
-        let mut commitments: Vec<Round1Commitments<Field, FieldExtension>> =
-            Vec::with_capacity(num_airs);
-        let mut cached_ldes: Vec<Lde<Field, FieldExtension>> = Vec::with_capacity(num_airs);
-        // Under cuda, fold main_gpu_handles into the zip chain so each handle
-        // stays paired with its table by construction.
-        #[cfg(feature = "cuda")]
-        let main_iter = main_commits
-            .into_iter()
-            .zip(main_ldes)
-            .zip(main_gpu_handles);
-        #[cfg(not(feature = "cuda"))]
-        let main_iter = main_commits.into_iter().zip(main_ldes);
-
-        for ((main_pack, aux_full), bus_public_inputs) in
-            main_iter.zip(aux_results).zip(bus_inputs_vec)
-        {
-            #[cfg(feature = "cuda")]
-            let ((main_commit, main_lde), gpu_main) = main_pack;
-            #[cfg(not(feature = "cuda"))]
-            let (main_commit, main_lde) = main_pack;
             #[cfg(feature = "cuda")]
             let (aux_commit, cached_aux, gpu_aux) = aux_full;
             #[cfg(not(feature = "cuda"))]
             let (aux_commit, cached_aux) = aux_full;
-            commitments.push(Round1Commitments {
+            let main_commit = main_commit_cells[idx]
+                .lock()
+                .unwrap()
+                .take()
+                .expect("main commit consumed once per table");
+            let main_lde = main_lde_cells[idx]
+                .lock()
+                .unwrap()
+                .take()
+                .expect("main lde consumed once per table");
+            #[cfg(feature = "cuda")]
+            let gpu_main = gpu_main_cells[idx].lock().unwrap().take();
+            let commitment = Round1Commitments {
                 main: main_commit,
                 aux: aux_commit,
                 rap_challenges: lookup_challenges.clone(),
                 bus_public_inputs,
-            });
+            };
             #[cfg(feature = "cuda")]
-            cached_ldes.push(Lde {
+            let lde = Lde {
                 main: main_lde,
                 aux: cached_aux,
                 gpu_main,
                 gpu_aux,
-            });
+            };
             #[cfg(not(feature = "cuda"))]
-            cached_ldes.push(Lde {
+            let lde = Lde {
                 main: main_lde,
                 aux: cached_aux,
-            });
-        }
+            };
+            Ok((commitment, lde))
+        };
 
-        #[cfg(feature = "instruments")]
-        drop(__sp);
-        #[cfg(feature = "instruments")]
-        let aux_commit_elapsed = phase_start.elapsed();
-        #[cfg(feature = "instruments")]
-        if let Some(s) = crate::instruments::snap("After aux commit") {
-            heap_snaps.push(s);
-        }
+        // Fused chain, stage 2: Round1 from the cached LDE (consumed by value,
+        // no recomputation) → rounds 2-4 against the table's transcript fork.
+        let rounds_stage = |idx: usize,
+                            commitment: Round1Commitments<Field, FieldExtension>,
+                            lde: Lde<Field, FieldExtension>|
+         -> Result<StarkProof<Field, FieldExtension, PI>, ProvingError> {
+            let pair = pair_cells[idx].lock().unwrap();
+            let (air, trace, pub_inputs) = &*pair;
+            let _ = trace; // used by instruments
+            let domain = &domains[idx];
 
-        #[cfg(feature = "debug-checks")]
-        Self::run_debug_checks(&air_trace_pairs, &commitments, &domains, &twiddle_caches);
+            #[cfg(feature = "instruments")]
+            let __sp = crate::instruments::span("rounds_2to4");
+            #[cfg(feature = "instruments")]
+            let table_start = Instant::now();
 
-        // =====================================================================
-        // Rounds 2-4: Parallel per-table proving in chunks of K
-        // =====================================================================
-        // Each chunk of K tables is processed in parallel. Cached LDE columns
-        // from Phase A/C are consumed here (zero-copy move), eliminating the
-        // expensive reconstruct_round1 recomputation.
+            let mut round_1_result =
+                commitment.build_round1(lde, air.step_size(), domain.blowup_factor);
+
+            let mut tguard = transcript_cells[idx].lock().unwrap();
+            if let Some(ref bpi) = round_1_result.bus_public_inputs {
+                tguard.append_field_element(&bpi.table_contribution);
+            }
+
+            let proof = Self::prove_rounds_2_to_4(
+                *air,
+                *pub_inputs,
+                &mut round_1_result,
+                &mut *tguard,
+                domain,
+                &twiddle_caches[idx],
+            )?;
+
+            #[cfg(feature = "instruments")]
+            {
+                let sub_ops = crate::instruments::take_round_sub_ops().unwrap_or_default();
+                table_timings_mx.lock().unwrap().push((
+                    air.name().to_string(),
+                    trace.num_rows(),
+                    table_start.elapsed(),
+                    sub_ops,
+                ));
+            }
+            Ok(proof)
+        };
 
         #[cfg(feature = "instruments")]
         let phase_start = Instant::now();
         #[cfg(feature = "instruments")]
-        let __sp = crate::instruments::span("rounds_2to4");
-        #[cfg(feature = "instruments")]
-        let mut table_timings: Vec<(
-            String,
-            usize,
-            Duration,
-            crate::instruments::TableSubOps,
-        )> = Vec::with_capacity(num_airs);
+        let aux_commit_elapsed = Duration::ZERO;
+
+        let peak_order = heaviest_first(&peak_estimates);
+
+        // One fused task per table: while a heavy table works through a
+        // host-bound stretch, the others' GPU stages fill the device. The
+        // shared transcript is untouched past this point (each fork is
+        // per-table), so any order is sound; proofs are drained in index order.
+        #[cfg(not(feature = "debug-checks"))]
+        let table_results = run_admitted(&peak_order, &peak_estimates, &vram_gate, k, |idx| {
+            let (commitment, lde) = aux_stage(idx)?;
+            rounds_stage(idx, commitment, lde)
+        });
+
+        // debug-checks needs every table's commitments and traces between the
+        // aux and rounds stages (cross-table bus balance), so it splits the
+        // fused chain into two admitted passes around the check.
+        #[cfg(feature = "debug-checks")]
+        let table_results = {
+            let aux_outs = run_admitted(&peak_order, &peak_estimates, &vram_gate, k, aux_stage);
+            let mut commitments = Vec::with_capacity(num_airs);
+            let mut ldes = Vec::with_capacity(num_airs);
+            for out in aux_outs {
+                let (c, l) = out.expect("run_admitted fills every slot")?;
+                commitments.push(c);
+                ldes.push(l);
+            }
+            Self::run_debug_checks(&pair_cells, &commitments, &domains, &twiddle_caches);
+            #[allow(clippy::type_complexity)]
+            let staged: Vec<
+                std::sync::Mutex<
+                    Option<(
+                        Round1Commitments<Field, FieldExtension>,
+                        Lde<Field, FieldExtension>,
+                    )>,
+                >,
+            > = commitments
+                .into_iter()
+                .zip(ldes)
+                .map(|p| std::sync::Mutex::new(Some(p)))
+                .collect();
+            run_admitted(&peak_order, &peak_estimates, &vram_gate, k, |idx| {
+                let (c, l) = staged[idx].lock().unwrap().take().unwrap();
+                rounds_stage(idx, c, l)
+            })
+        };
 
         let mut proofs = Vec::with_capacity(num_airs);
-        let mut lde_drain = cached_ldes.into_iter();
-        for &(chunk_start, chunk_end) in &peak_chunks {
-            let chunk_size = chunk_end - chunk_start;
-
-            let chunk_ldes: Vec<Lde<Field, FieldExtension>> =
-                lde_drain.by_ref().take(chunk_size).collect();
-            let chunk_commitments = &commitments[chunk_start..chunk_end];
-            let chunk_transcripts = &mut table_transcripts[chunk_start..chunk_end];
-
-            #[cfg(feature = "parallel")]
-            let iter = chunk_ldes
-                .into_par_iter()
-                .zip(chunk_commitments.par_iter())
-                .zip(chunk_transcripts.par_iter_mut())
-                .enumerate();
-            #[cfg(not(feature = "parallel"))]
-            let iter = chunk_ldes
-                .into_iter()
-                .zip(chunk_commitments.iter())
-                .zip(chunk_transcripts.iter_mut())
-                .enumerate();
-
-            let chunk_results: Vec<Result<_, ProvingError>> = iter
-                .map(|(j, ((lde, commitment), table_transcript))| {
-                    let idx = chunk_start + j;
-                    let (air, trace, pub_inputs) = &air_trace_pairs[idx];
-                    let _ = trace; // used by instruments
-                    let domain = &domains[idx];
-
-                    #[cfg(feature = "instruments")]
-                    let table_start = Instant::now();
-
-                    // Build Round1 from cached LDE (consumed by value, no recomputation).
-                    let mut round_1_result =
-                        commitment.build_round1(lde, air.step_size(), domain.blowup_factor);
-
-                    if let Some(ref bpi) = round_1_result.bus_public_inputs {
-                        table_transcript.append_field_element(&bpi.table_contribution);
-                    }
-
-                    let proof = Self::prove_rounds_2_to_4(
-                        *air,
-                        *pub_inputs,
-                        &mut round_1_result,
-                        table_transcript,
-                        domain,
-                        &twiddle_caches[idx],
-                    )?;
-
-                    #[cfg(feature = "instruments")]
-                    let table_timing = {
-                        let sub_ops = crate::instruments::take_round_sub_ops().unwrap_or_default();
-                        (
-                            air.name().to_string(),
-                            trace.num_rows(),
-                            table_start.elapsed(),
-                            sub_ops,
-                        )
-                    };
-
-                    #[cfg(feature = "instruments")]
-                    return Ok((proof, table_timing));
-                    #[cfg(not(feature = "instruments"))]
-                    Ok(proof)
-                })
-                .collect();
-
-            for result in chunk_results {
-                #[cfg(feature = "instruments")]
-                {
-                    let (proof, timing) = result?;
-                    proofs.push(proof);
-                    table_timings.push(timing);
-                }
-                #[cfg(not(feature = "instruments"))]
-                proofs.push(result?);
-            }
+        for result in table_results {
+            proofs.push(result.expect("run_admitted fills every slot")?);
         }
-
         #[cfg(feature = "instruments")]
-        drop(__sp);
+        let table_timings = table_timings_mx.into_inner().unwrap();
         #[cfg(feature = "instruments")]
         {
             // Store timing data for the top-level report in prove_with_options.
