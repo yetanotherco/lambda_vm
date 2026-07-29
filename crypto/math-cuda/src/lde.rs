@@ -268,7 +268,7 @@ fn run_row_major_ntt_body(
     if n >= 256 {
         let t: u32 = 8.min(m as u32).max(1);
         let cfg = LaunchConfig {
-            grid_dim: ((m as u32).div_ceil(t), (n / 256) as u32, 1),
+            grid_dim: ((m as u32).div_ceil(t), ((n / 256) as u32).min(65535), 1),
             block_dim: (t, 128, 1),
             shared_mem_bytes: 256 * (t + 1) * 8,
         };
@@ -704,17 +704,16 @@ pub fn coset_lde_row_major_with_merkle_tree_keep(
 /// `[split_col, m)` commit to separate trees over the same row-major LDE,
 /// mirroring the CPU `commit_rows_bit_reversed_subset` pair.
 ///
-/// Both trees' complete node buffers are downloaded to host
-/// (`(2*num_leaves - 1) * 32` bytes each, inner nodes first, root at offset 0,
+/// The precomputed tree's complete node buffer is downloaded to host
+/// (`(2*num_leaves - 1) * 32` bytes, inner nodes first, root at offset 0,
 /// leaves at the tail — the exact `MerkleTree::from_precomputed_nodes`
-/// layout), because preprocessed-table openings walk host trees. The
-/// precomputed tree is only built when `build_precomputed` is true (the
-/// caller skips it on a process-cache hit).
+/// layout) because it feeds the process-wide host tree cache; it is only
+/// built when `build_precomputed` is true (the caller skips it on a cache
+/// hit). The multiplicity tree stays resident in `handle.tree` — openings
+/// gather its paths on device.
 ///
-/// Returns `(precomputed_nodes, mult_nodes, handle, row_major_lde)`. The
-/// handle carries the column-major LDE + trace snapshot for downstream GPU
-/// rounds but NO device tree (`tree: None`) — openings for preprocessed
-/// tables never gather from device.
+/// Returns `(precomputed_nodes, handle, row_major_lde)`. The handle also
+/// carries the column-major LDE + trace snapshot for downstream GPU rounds.
 #[allow(clippy::type_complexity)]
 pub fn coset_lde_row_major_split_trees(
     row_major: &[u64],

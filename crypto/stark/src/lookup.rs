@@ -1286,7 +1286,7 @@ where
         let (per_bus_sums, per_bus_sender_sums, per_bus_receiver_sums) =
             compute_debug_bus_sums_batched(
                 &self.auxiliary_trace_build_data.interactions,
-                &main_segment_cols,
+                main_segment_cols,
                 trace_len,
                 challenges,
                 _table_name,

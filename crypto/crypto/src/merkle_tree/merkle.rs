@@ -172,6 +172,19 @@ where
     /// but no nodes. Used when paths are gathered from a device resident copy
     /// (GPU) instead of this host tree, so the host nodes are never built.
     /// [`get_proof_by_pos`](Self::get_proof_by_pos) must NOT be called on it.
+    /// True when this tree carries only its root (the nodes live elsewhere,
+    /// e.g. device-resident): openings must not walk this tree.
+    pub fn is_root_only(&self) -> bool {
+        #[cfg(feature = "disk-spill")]
+        {
+            self.nodes.is_empty() && self.mmap_backing.is_none()
+        }
+        #[cfg(not(feature = "disk-spill"))]
+        {
+            self.nodes.is_empty()
+        }
+    }
+
     pub fn from_root(root: B::Node) -> Self {
         MerkleTree {
             root,

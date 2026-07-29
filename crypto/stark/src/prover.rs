@@ -1642,6 +1642,14 @@ pub trait IsStarkProver<
                     (host_tree, root, Some(dev_tree))
                 }
                 None => {
+                    // The host part evals are empty under device-only (the R2
+                    // drain is skipped); abort with the device-only contract's
+                    // message instead of a misleading EmptyCommitment.
+                    assert!(
+                        !round_1_result.lde_trace.host_trace_empty(),
+                        "R2 composition commit fell back to the host part evals, \
+                         but they are device-only (empty)"
+                    );
                     let (tree, root) = crate::commitment::commit_bit_reversed(
                         &lde_composition_poly_parts_evaluations,
                         crate::commitment::ROWS_PER_LEAF,
@@ -2721,9 +2729,23 @@ pub trait IsStarkProver<
                                 )
                             },
                         ),
-                        None => Self::open_polys_with(domain, &main_commit.tree, *index, |row| {
-                            lde_trace.gather_main_row_range(row, num_precomputed_cols, total_cols)
-                        }),
+                        None => {
+                            // A root-only host tree means the nodes are
+                            // device-resident: this arm would emit an empty
+                            // path for query position 0 instead of failing.
+                            assert!(
+                                !main_commit.tree.is_root_only(),
+                                "preprocessed opening fell back to the host tree, \
+                                 but it is root-only (nodes device-resident)"
+                            );
+                            Self::open_polys_with(domain, &main_commit.tree, *index, |row| {
+                                lde_trace.gather_main_row_range(
+                                    row,
+                                    num_precomputed_cols,
+                                    total_cols,
+                                )
+                            })
+                        }
                     }
                 }
                 #[cfg(not(feature = "cuda"))]
