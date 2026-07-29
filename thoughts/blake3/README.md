@@ -99,52 +99,69 @@ official reference implementation using the official vector parameters".
 - `compress` does not mutate its arguments; incremental `update()` equals the
   one-shot path over 60 random split patterns.
 
-### Known harness defects (found by review, not yet fixed)
+### Harness defects — FIXED
 
-1. `main()` prints `VALIDATION STATUS: VALIDATED … anchored on official test
-   vectors + official PyPI package + Plonky3` **even when anchor 2 SKIPs** — the
-   `status["external_anchor"]` dict is written and never consulted. Observed
-   firing. The per-anchor lines are honest; the summary overstates.
-2. `test_internal_consistency` carries a comment describing a feed-forward
+1. ~~`main()` printed `VALIDATION STATUS: VALIDATED … anchored on official test
+   vectors + official PyPI package + Plonky3` **even when anchor 2 SKIPped**~~ —
+   the `status` dict was written and never read. **Fixed:** the banner now
+   reports what actually ran (`VALIDATED` / `PARTIALLY VALIDATED` / `NOT
+   VALIDATED`) and names the anchors it is *not* anchored on. Verified by
+   running with a fixture removed.
+2. ~~The missing-file failure **cascaded**~~ — one `FileNotFoundError` killed
+   anchors 2 and 3 *and* the canonical-vector emitter, which is why the gate's
+   positive controls were blocked on an unrelated download. **Fixed:** anchors
+   are independent; a missing fixture SKIPs only itself. Verified — with
+   `official_test_vectors.json` removed, anchor 3 still runs and the vectors are
+   still emitted.
+3. ~~Anchor 1 was labelled "Official test_vectors.json"~~ — it is regenerated
+   from the crate. **Fixed:** relabelled "Official-parameter vectors" and the
+   run prints its provenance.
+
+### Known harness defects — still open (low severity)
+
+4. `test_internal_consistency` carries a comment describing a feed-forward
    recomputation (*"recompute v to check"*) that **is not implemented** — it only
    checks output length and the CV prefix.
-3. **The missing-file failure cascades.** The `FileNotFoundError` at
-   `test_oracle.py:282` kills anchors 2 and 3 *and the canonical-vector
-   emitter* — which is why the z3 gate's positive controls were blocked on an
-   unrelated download. That single coupling is what made this recovery look
-   worse than it was. Anchors should fail independently.
-4. **`test_6round_derivation`'s first assertion is a tautology** —
+5. **`test_6round_derivation`'s first assertion is a tautology** —
    `compress_6round`'s body *is* `compress(rounds=6)`. ORACLE.md §2.6 calls it
    the "Code-diff anchor"; it establishes nothing. The differs-from-7r half is
    real.
-5. **Footgun for the Rust phase:** `compress(...)` defaults to `rounds=7`, so a
+6. **Footgun for the Rust phase:** `compress(...)` defaults to `rounds=7`, so a
    6-round caller that omits the kwarg silently gets 7. Trace generators must
-   call `compress_6round` — make it mandatory rather than conventional.
-6. ORACLE.md §5's closing ratio is internally inconsistent: ~5–6k cell-equiv
+   call `compress_6round`. Left as-is deliberately: changing the validated
+   oracle's signature would invalidate the anchors it just passed.
+7. ORACLE.md §5's closing ratio is internally inconsistent: ~5–6k cell-equiv
    against 24×1480 = 35,520 is ≈1/6, not the "¼–⅓" its prose claims. Superseded
    by DESIGN.md §6's ≈1/15 against a 77,000 baseline — which is the number that
    was actually derived.
 
-## Open findings against the DESIGN (review, 2026-07-29)
+## DESIGN findings (review, 2026-07-29) — FIXED IN THE DESIGN
 
-1. **The internal `Blake3` bus has no input↔output binding.** §1.1 defines a
+1. **The internal `Blake3` bus had no input↔output binding.** §1.1 defined a
    receive of `(h, m, t, block_len, flags)` and a separate send of `out[0..16]`,
-   both at multiplicity μ, and §3 lists `TIMESTAMP_0/1` as "bus binding
-   (internal variant **may omit**)". If omitted, with two compressions in a
-   trace a prover can have row A receive inputs_A and send out_B while row B
-   does the reverse: every tuple appears once on each side, **all buses
-   balance**, and both callers get the wrong answer. The design's own cited
-   precedent does not do this — keccak's internal bus carries
-   `TIMESTAMP_0, TIMESTAMP_1` in *both* halves (`keccak.rs`, send at round 0 /
-   receive at round 24). **Do not omit the timestamp.** The gate cannot catch
-   this: it models arithmetic only and has no bus layer.
+   both at multiplicity μ, while §3 listed `TIMESTAMP_0/1` as "bus binding
+   (internal variant **may omit**)". Omit it and, with two compressions in a
+   trace, row A can receive inputs_A and send out_B while row B does the
+   reverse: every tuple appears once on each side, **the bus balances**, and
+   both callers read a wrong result. The design's own cited precedent does not
+   do this — keccak carries `TIMESTAMP_0, TIMESTAMP_1` in *both* halves of its
+   internal bus (send at round 0, receive at round 24).
+   **Fixed:** §1.1 now states the binding is mandatory in both tuples, with the
+   attack and the keccak precedent spelled out; §3's "may omit" is gone; and it
+   is item 10 of §7's soundness-critical list. Also recorded there: **the gate
+   cannot catch a violation**, since it models arithmetic with no bus layer.
 2. **"Covers every G, hence every round" is a model argument.** MAIN 0 proves
-   one G under free inputs; in Rust, 48 G instances are emitted separately and a
-   wrong column index in instance #37 is not covered by it. The concrete
-   positive controls do cover it — keep them runnable, and prefer `--full`'s
-   monolithic UNSAT before shipping.
+   one G under free inputs; in Rust the 48 instances are emitted separately, so
+   a wrong column index in instance #37 is invisible to it.
+   **Fixed:** now item 11 of §7, pointing at the concrete positive controls as
+   the thing that covers it and requiring `--full`'s monolithic UNSAT before
+   Rust ships. The controls themselves were unrunnable at review time and now
+   run and pass 4/4, so the residual risk is materially lower than when the
+   finding was written.
 3. **The 3-op add carry encoding is ambiguous** — `(c1,c2) = (1,0)` and `(0,1)`
-   both encode carry 1. Harmless for soundness; noted so nobody "fixes" it.
+   both encode carry 1. Checked: it does not admit a wrong `s`, so this is a
+   note rather than a defect, recorded so nobody "fixes" it into a bug. **No
+   change made, deliberately.**
 
 ## Still unaudited — where to send the next reviewer
 

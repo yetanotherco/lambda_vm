@@ -46,6 +46,23 @@ child chaining values as the message and reads back the truncated CV.
 call sites read `out[0:8]`; the chip always produces all 16 (the XOF root needs
 them, oracle §2.4).
 
+**Both tuples MUST lead with `TIMESTAMP_0, TIMESTAMP_1` — this is mandatory,
+not optional.** The receive and the send are two separate interactions, so
+without a key present in *both* nothing ties a row's inputs to its own outputs.
+With two compressions in a trace a prover could then have row A receive
+`inputs_A` and send `out_B` while row B does the reverse: every tuple still
+appears exactly once on each side, **so the bus balances**, and both callers
+read a result that is not the compression of their own input.
+
+This is not a hypothetical hardening: `keccak.rs` — the chip this design copies
+its I/O idiom from (§1.2) — carries `TIMESTAMP_0, TIMESTAMP_1` in *both* halves
+of its internal `Keccak` bus (send at `round = 0`, receive at `round = 24`)
+for exactly this reason. Do not deviate from it.
+
+**The gate cannot check this.** `z3_blake_verify.py` models arithmetic only and
+has no bus-interaction layer at all, so a missing binding leaves every UNSAT on
+the board unchanged. It has to be got right by construction.
+
 `IV[0..4]` (v[8..11]) are **compile-time constants inlined** into the round-0
 arithmetic — not columns, not on the bus.
 
@@ -108,7 +125,7 @@ One row = one compression call. Names group by role; counts are for `ROUNDS=6`.
 
 | block | columns | count | notes |
 |---|---|---:|---|
-| `TIMESTAMP_0/1` | 2 | 2 | bus binding (internal variant may omit) |
+| `TIMESTAMP_0/1` | 2 | 2 | bus binding — **mandatory in both the receive and the send** (§1.1); omitting it lets two rows swap outputs with the bus still balancing |
 | `MU` | 1 | 1 | multiplicity / gate flag |
 | `H[0..8]` | 8 words | 32 | input CV bytes |
 | `M[0..16]` | 16 words | 64 | input message bytes |
@@ -340,6 +357,17 @@ oracle's prose "¼–⅓ of a keccak permutation" is inconsistent with its own
    expressions stay `< 2^35 ≪ p`, so `≡0 mod p` ⇒ `=0` as integers; the whole
    soundness argument depends on operands being genuine ≤32-bit (byte columns)
    and carries being genuine bits.
+10. **`TIMESTAMP_0/1` in BOTH the `Blake3` receive and send** (§1.1). Without a
+    key in both tuples nothing binds a row's inputs to its own outputs, and two
+    compressions can swap results while the bus still balances. `keccak.rs` does
+    this correctly and is the pattern to copy. **The gate cannot catch a
+    violation** — it models arithmetic only, with no bus layer — so this one is
+    on the implementer, not on a green board.
+11. **Every G instance must be wired as MAIN 0 models it.** MAIN 0 proves *one*
+    G under free inputs; the 48 unrolled instances are emitted separately, so a
+    wrong column or message index in a single instance is invisible to it. The
+    concrete positive controls are what cover that — keep them runnable, and run
+    `--full`'s monolithic UNSAT before shipping Rust.
 
 ---
 

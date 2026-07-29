@@ -276,24 +276,43 @@ def main():
     print("BLAKE3 compression-function ORACLE — validation")
     print("=" * 74)
 
-    status = {"external_anchor": False}
+    # Each anchor is independent: a missing fixture SKIPs that anchor only. It must
+    # never cascade — a FileNotFoundError here used to abort anchors 2 and 3 AND the
+    # canonical-vector emitter below, which silently blocked the z3 gate's positive
+    # controls on an unrelated download.
+    status = {}
 
-    # Anchor 1
-    checked, total, ctx = test_official_vectors()
-    print(f"[1] Official test_vectors.json : PASS  ({checked}/{total} cases x 3 modes)")
-    print(f"    modes: default hash, keyed hash, derive_key   context={ctx!r}")
-    status["external_anchor"] = True
+    # Anchor 1. NOTE: the vector file ships regenerated from the official `blake3`
+    # Rust crate (see ../ground-truth/), not downloaded from upstream. Same official
+    # parameters and a non-circular reference, but not the published artifact — the
+    # label says so rather than claiming more than we have.
+    try:
+        checked, total, ctx = test_official_vectors()
+        print(f"[1] Official-parameter vectors : PASS  ({checked}/{total} cases x 3 modes)")
+        print(f"    modes: default hash, keyed hash, derive_key   context={ctx!r}")
+        print("    source: regenerated from the official blake3 crate, not the published file")
+        status["official_vectors"] = "PASS"
+    except FileNotFoundError as e:
+        print(f"[1] Official-parameter vectors : SKIP  (missing fixture: {os.path.basename(str(e.filename or e))})")
+        status["official_vectors"] = "SKIP"
 
     # Anchor 2
     n2 = test_pypi_blake3()
     if n2 is None:
         print("[2] Official `blake3` PyPI pkg : SKIP  (package not importable)")
+        status["pypi"] = "SKIP"
     else:
         print(f"[2] Official `blake3` PyPI pkg : PASS  ({n2} randomised differential checks, 3 modes)")
+        status["pypi"] = "PASS"
 
     # Anchor 3
-    n3 = test_plonky3_differential()
-    print(f"[3] Plonky3 blake3-air (direct): PASS  ({n3} random compressions, flags=0)")
+    try:
+        n3 = test_plonky3_differential()
+        print(f"[3] Plonky3 blake3-air (direct): PASS  ({n3} random compressions, flags=0)")
+        status["plonky3"] = "PASS"
+    except (FileNotFoundError, ImportError) as e:
+        print(f"[3] Plonky3 blake3-air (direct): SKIP  ({e})")
+        status["plonky3"] = "SKIP"
 
     # Internal
     ni = test_internal_consistency()
@@ -303,10 +322,28 @@ def main():
     differ = test_6round_derivation()
     print(f"[4] 6-round variant derivation : PASS  (=compress(rounds=6); differs from 7r on {differ}/2000)")
 
+    # The banner reports what actually ran. It previously printed "VALIDATED ...
+    # anchored on official test vectors + official PyPI package + Plonky3"
+    # unconditionally, including when anchors had SKIPped — the status dict was
+    # written and never read. Claiming an anchor you did not run is worse than
+    # running none.
+    passed = [k for k, v in status.items() if v == "PASS"]
+    skipped = [k for k, v in status.items() if v == "SKIP"]
+    label = {
+        "official_vectors": "official-parameter vectors",
+        "pypi": "official PyPI package",
+        "plonky3": "Plonky3 independent compression",
+    }
     print("=" * 74)
-    print("VALIDATION STATUS: VALIDATED")
-    print("  7-round reference: anchored on official test vectors + official")
-    print("  PyPI package + Plonky3 independent compression.")
+    if not passed:
+        print("VALIDATION STATUS: NOT VALIDATED  (no external anchor ran)")
+    elif skipped:
+        print("VALIDATION STATUS: PARTIALLY VALIDATED")
+    else:
+        print("VALIDATION STATUS: VALIDATED")
+    print(f"  7-round reference: anchored on {', '.join(label[k] for k in passed) or 'nothing'}.")
+    if skipped:
+        print(f"  NOT anchored on : {', '.join(label[k] for k in skipped)} (skipped this run).")
     print("  6-round variant : derivative anchor (loop-bound diff) + canonical vectors below.")
     print("=" * 74)
 
