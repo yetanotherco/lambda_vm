@@ -1155,8 +1155,10 @@ where
             return None;
         }
 
-        // Clone main columns once (shared across all interactions)
-        let main_segment_cols = trace.columns_main();
+        // Host main columns, materialized lazily: the resident GPU aux path
+        // reads the device main in place and must not pay this transpose.
+        let main_cols_cell: std::cell::OnceCell<Vec<Vec<FieldElement<F>>>> =
+            std::cell::OnceCell::new();
         let trace_len = trace.num_rows();
         let _table_name = self.name.as_deref().unwrap_or("UNKNOWN");
 
@@ -1188,7 +1190,12 @@ where
         if trace.resident_aux_ok()
             && let Some(ra) = crate::logup_gpu::try_build_aux_resident_gpu::<F, E>(
                 interactions,
-                &main_segment_cols,
+                trace.num_main_columns,
+                || {
+                    main_cols_cell
+                        .get_or_init(|| trace.columns_main())
+                        .as_slice()
+                },
                 resident_main.as_ref().map(|r| (r.buf.as_ref(), r.rows)),
                 trace_len,
                 challenges,
@@ -1201,12 +1208,14 @@ where
             return Some(BusPublicInputs { table_contribution });
         }
 
+        let main_segment_cols = main_cols_cell.get_or_init(|| trace.columns_main());
+
         // GPU aux build (Goldilocks + ext3 + above threshold) computes all term
         // columns on device, byte identical, and falls back to the CPU build.
         #[cfg(feature = "cuda")]
         let gpu_term_cols = crate::logup_gpu::try_build_term_columns_gpu::<F, E>(
             interactions,
-            &main_segment_cols,
+            main_segment_cols,
             trace_len,
             challenges,
         );
@@ -1220,7 +1229,7 @@ where
                 let build_pair = |i: usize| {
                     compute_logup_term_column(
                         &[&interactions[i * 2], &interactions[i * 2 + 1]],
-                        &main_segment_cols,
+                        main_segment_cols,
                         trace_len,
                         challenges,
                         _table_name,
@@ -1248,7 +1257,7 @@ where
                             &interactions[num_interactions - 2],
                             &interactions[num_interactions - 1],
                         ],
-                        &main_segment_cols,
+                        main_segment_cols,
                         trace_len,
                         challenges,
                         _table_name,
@@ -1256,7 +1265,7 @@ where
                 } else {
                     compute_logup_term_column(
                         &[&interactions[num_interactions - 1]],
-                        &main_segment_cols,
+                        main_segment_cols,
                         trace_len,
                         challenges,
                         _table_name,

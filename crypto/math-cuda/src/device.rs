@@ -186,6 +186,7 @@ pub struct Backend {
     // row-major NTT kernels
     pub bit_reverse_row_major: CudaFunction,
     pub ntt_dit_level_row_major: CudaFunction,
+    pub ntt_dit_8_levels_row_major: CudaFunction,
     pub pointwise_mul_row_major: CudaFunction,
     pub matrix_transpose_strided: CudaFunction,
 
@@ -198,6 +199,7 @@ pub struct Backend {
     pub keccak_comp_poly_leaves_ext3: CudaFunction,
     pub keccak_fri_leaves_ext3: CudaFunction,
     pub keccak_merkle_level: CudaFunction,
+    pub keccak_merkle_tail: CudaFunction,
     pub merkle_gather_paths: CudaFunction,
 
     // barycentric.cubin
@@ -214,6 +216,7 @@ pub struct Backend {
 
     // fri.cubin
     pub fri_fold_ext3: CudaFunction,
+    pub gather_ext3_at: CudaFunction,
     pub fri_update_twiddles: CudaFunction,
 
     // inverse.cubin
@@ -223,6 +226,7 @@ pub struct Backend {
     pub block_inclusive_scan_rev_ext3: CudaFunction,
     pub apply_block_offsets_rev_ext3: CudaFunction,
     pub batch_inverse_combine_ext3: CudaFunction,
+    pub invert_total_ext3: CudaFunction,
     pub logup_fingerprint_ext3: CudaFunction,
     pub logup_term_ext3: CudaFunction,
     pub logup_row_sum_ext3: CudaFunction,
@@ -412,6 +416,7 @@ impl Backend {
             scalar_mul_batched: ntt.load_function("scalar_mul_batched")?,
             bit_reverse_row_major: ntt.load_function("bit_reverse_row_major")?,
             ntt_dit_level_row_major: ntt.load_function("ntt_dit_level_row_major")?,
+            ntt_dit_8_levels_row_major: ntt.load_function("ntt_dit_8_levels_row_major")?,
             pointwise_mul_row_major: ntt.load_function("pointwise_mul_row_major")?,
             matrix_transpose_strided: ntt.load_function("matrix_transpose_strided")?,
             keccak256_leaves_base_row_major_row_pair: keccak
@@ -425,6 +430,7 @@ impl Backend {
             keccak_comp_poly_leaves_ext3: keccak.load_function("keccak_comp_poly_leaves_ext3")?,
             keccak_fri_leaves_ext3: keccak.load_function("keccak_fri_leaves_ext3")?,
             keccak_merkle_level: keccak.load_function("keccak_merkle_level")?,
+            keccak_merkle_tail: keccak.load_function("keccak_merkle_tail")?,
             merkle_gather_paths: keccak.load_function("merkle_gather_paths")?,
             barycentric_base_batched: bary.load_function("barycentric_base_batched")?,
             barycentric_ext3_batched: bary.load_function("barycentric_ext3_batched")?,
@@ -437,6 +443,7 @@ impl Backend {
             deep_composition_ext3_row: deep.load_function("deep_composition_ext3_row")?,
             bit_reverse_ext3_kernel: deep.load_function("bit_reverse_ext3_interleaved")?,
             fri_fold_ext3: fri.load_function("fri_fold_ext3")?,
+            gather_ext3_at: fri.load_function("gather_ext3_at")?,
             fri_update_twiddles: fri.load_function("fri_update_twiddles")?,
             compute_denoms_ext3: inverse.load_function("compute_denoms_ext3")?,
             block_inclusive_scan_fwd_ext3: inverse
@@ -446,6 +453,7 @@ impl Backend {
                 .load_function("block_inclusive_scan_rev_ext3")?,
             apply_block_offsets_rev_ext3: inverse.load_function("apply_block_offsets_rev_ext3")?,
             batch_inverse_combine_ext3: inverse.load_function("batch_inverse_combine_ext3")?,
+            invert_total_ext3: inverse.load_function("invert_total_ext3")?,
             logup_fingerprint_ext3: logup.load_function("logup_fingerprint_ext3")?,
             logup_term_ext3: logup.load_function("logup_term_ext3")?,
             logup_row_sum_ext3: logup.load_function("logup_row_sum_ext3")?,
@@ -631,6 +639,47 @@ impl Drop for PendingD2H<'_> {
 /// stream-ordered on its own stream, so a `src` allocated on `stream` may be
 /// dropped after this call — the free queues behind the copy. Do NOT pass a
 /// `src` owned by a *different* stream and drop it before waiting.
+/// Host→device copy staged through the pinned slot: one host memcpy into
+/// pinned memory + one async DMA, instead of the driver's internal pageable
+/// staging (small chunks; 2-3x slower for multi-hundred-MB traces and it
+/// convoys under multi-thread load). Blocks until the DMA lands, so the slot
+/// and `src_host` are both reusable on return.
+pub fn htod_via<T: cudarc::driver::DeviceRepr>(
+    stream: &Arc<CudaStream>,
+    slot: &Mutex<PinnedStaging>,
+    ctx: &CudaContext,
+    src_host: &[T],
+    dst: &mut cudarc::driver::CudaViewMut<'_, T>,
+) -> Result<()> {
+    use cudarc::driver::DevicePtrMut;
+    let n_bytes = std::mem::size_of_val(src_host);
+    let u64_len = n_bytes.div_ceil(8);
+    let mut staging = slot.lock().unwrap();
+    staging.ensure_capacity(u64_len, ctx)?;
+    ctx.bind_to_thread()?;
+    // SAFETY: the pinned allocation is stable while the lock is held and at
+    // least `n_bytes` long (`ensure_capacity`). The DMA reads it after the
+    // host memcpy (program order); `device_ptr_mut` orders the device write
+    // on `stream`.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            src_host.as_ptr() as *const u8,
+            staging.ptr as *mut u8,
+            n_bytes,
+        );
+        let (dst_ptr, _record) = dst.device_ptr_mut(stream);
+        cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+            dst_ptr,
+            staging.ptr as *const core::ffi::c_void,
+            n_bytes,
+            stream.cu_stream(),
+        )
+        .result()?;
+    }
+    staging.record_event(stream)?;
+    staging.sync_event()
+}
+
 pub fn async_dtoh_via<'a, T: cudarc::driver::DeviceRepr>(
     stream: &Arc<CudaStream>,
     slot: &'a Mutex<PinnedStaging>,

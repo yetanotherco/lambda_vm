@@ -78,12 +78,56 @@ pub fn batch_inverse_ext3(a: &[u64]) -> Result<Vec<u64>> {
     Ok(out)
 }
 
+/// `p^3 - 2` as little-endian u64 limbs: the Fermat exponent for inversion in
+/// the Goldilocks cubic extension (`|F_{p^3}^*| = p^3 - 1`).
+const EXT3_FERMAT_EXP: [u64; 3] = ext3_fermat_exponent();
+
+const fn ext3_fermat_exponent() -> [u64; 3] {
+    const P: u128 = 0xFFFF_FFFF_0000_0001;
+    let p2 = P * P;
+    let m0 = ((p2 as u64) as u128) * P;
+    let m1 = (p2 >> 64) * P + (m0 >> 64);
+    let l0 = m0 as u64;
+    // p^3 mod 2^64 ends in ...0001, so subtracting 2 never borrows.
+    assert!(l0 >= 2);
+    [l0 - 2, m1 as u64, (m1 >> 64) as u64]
+}
+
+/// One-thread Fermat inversion of `src[n-1]` into `out[0..3]`, stream-ordered.
+fn launch_invert_total(
+    stream: &Arc<CudaStream>,
+    be: &crate::device::Backend,
+    src: &CudaSlice<u64>,
+    n: usize,
+    out: &mut CudaSlice<u64>,
+) -> Result<()> {
+    let cfg = LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (1, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let n_u64 = n as u64;
+    let [e0, e1, e2] = EXT3_FERMAT_EXP;
+    unsafe {
+        stream
+            .launch_builder(&be.invert_total_ext3)
+            .arg(src)
+            .arg(&n_u64)
+            .arg(&e0)
+            .arg(&e1)
+            .arg(&e2)
+            .arg(&mut *out)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
 /// Device-input batch inverse. Allocates and returns a fresh `CudaSlice<u64>`
 /// of length `3 * n` holding the inverses. Requires `n >= 1`.
 ///
-/// The caller's `stream` is used for every launch and synchronised at the
-/// end (so the returned slice's data is committed before this function
-/// returns).
+/// Stream-ordered end to end: every launch (including the total's Fermat
+/// inversion) goes on the caller's `stream`, so downstream same-stream
+/// consumers need no synchronize.
 pub fn batch_inverse_ext3_dev(
     input: &CudaSlice<u64>,
     n: usize,
@@ -101,13 +145,11 @@ pub fn batch_inverse_ext3_dev(
         ));
     }
     if n == 1 {
-        // Single element: D2H, host invert, H2D. Avoids running the
-        // scan + combine machinery for a degenerate case.
-        let host_view: Vec<u64> = stream.clone_dtoh(&input.slice(0..3))?;
-        stream.synchronize()?;
-        let inv = invert_ext3_host([host_view[0], host_view[1], host_view[2]])?;
+        // Single element: one-thread Fermat kernel, skipping the scan +
+        // combine machinery (and any host round-trip).
+        let be = backend()?;
         let mut out = unsafe { stream.alloc::<u64>(3) }?;
-        stream.memcpy_htod(&inv, &mut out)?;
+        launch_invert_total(stream, be, input, 1, &mut out)?;
         return Ok(out);
     }
 
@@ -122,12 +164,11 @@ pub fn batch_inverse_ext3_dev(
     scan_into_fwd(stream, be, input, &mut prefix, n)?;
     scan_into_rev(stream, be, input, &mut suffix, n)?;
 
-    // total = prefix[n-1] = suffix[0]. Invert on host (one Fermat per batch).
-    let last_host: Vec<u64> = stream.clone_dtoh(&prefix.slice((n - 1) * 3..n * 3))?;
-    stream.synchronize()?;
-    let inv_total = invert_ext3_host([last_host[0], last_host[1], last_host[2]])?;
+    // total = prefix[n-1] = suffix[0]. One-thread Fermat inversion on device,
+    // keeping the whole batch inverse stream-ordered (the host round-trip here
+    // blocked the calling thread once per batch).
     let mut inv_total_dev = unsafe { stream.alloc::<u64>(3) }?;
-    stream.memcpy_htod(&inv_total, &mut inv_total_dev)?;
+    launch_invert_total(stream, be, &prefix, n, &mut inv_total_dev)?;
 
     // Combine: out[i] = prefix[i-1] * inv_total * suffix[i+1].
     // SAFETY: the combine kernel writes every slot before any read.
