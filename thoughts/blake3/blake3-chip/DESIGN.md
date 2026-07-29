@@ -6,6 +6,20 @@ external anchors). Cost model = the verified one in `../keccak-verify/tier2_cost
 (a committed cell is expensive; each bus send ≈ 1.5 base cells of aux; **hard**
 max constraint degree 3 *including* the ×μ gating factor).
 
+> **⚠ Every `../keccak-verify/` citation in this document is DEAD.** That
+> directory lived in the same 2026-07-23 session scratchpad this design was
+> recovered from and was never committed — it exists on no branch. Two
+> conclusions were deferred to it, and both have since been re-established
+> independently, so nothing here rests on the missing files:
+> * the **cost model** above (1.5 aux cells/send, degree ≤ 3 incl. ×μ) — the
+>   per-G and per-compression arithmetic in §2/§3/§6 was recomputed from
+>   scratch and checks out;
+> * the **shift-identity bound necessity** cited at §4.2 and §9 — re-derived
+>   symbolically over all 2^32 inputs by the 2026-07-29 transcription audits,
+>   which is stronger than the single-point check the lost file made.
+>
+> Do not go looking for them; read the citations as historical.
+
 **Verdict (numbers derived below, gate in `z3_blake_verify.py`):**
 * **Layout: B — one row per compression, fully unrolled.** Chosen by arithmetic
   (≈5,030 cell-equiv vs ≈5,510 for one-row-per-round), and it deletes the
@@ -194,8 +208,10 @@ read in-place. Eval constraints: none (pure lookup). Degree: n/a.
   SLLC_hi` = 4 sends/rotation (`bitwise.rs:783`). `Y` is range-checked *free* by
   the downstream XOR that consumes it.
 
-  Soundness (proven in `../keccak-verify/hwsl_inline_test.py` Part 2, and by the
-  width audit in the gate): given `SLL_* ∈ [0,2^16)` (the tight remainder bound
+  Soundness (originally deferred to `../keccak-verify/hwsl_inline_test.py`
+  Part 2 — **that file is lost, see the banner at the top; the result was
+  re-derived independently and more strongly by the 2026-07-29 audits** — and by
+  the width audit in the gate): given `SLL_* ∈ [0,2^16)` (the tight remainder bound
   from AreBytes) and `2^16` invertible mod p, the identity **uniquely** pins
   `SLL = (xlo·2^r) mod 2^16` and `SLLC = (xlo·2^r) >> 16`; the loose 16-bit bound
   on `SLLC` suffices because it is the quotient, not the remainder. The two
