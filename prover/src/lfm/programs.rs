@@ -302,6 +302,86 @@ pub fn append_ext_program() -> LfmProgram {
     compile(append_ext_program_source())
 }
 
+// ==================== R1e slice b: the byte-level splice ====================
+
+/// Deterministic constant bytes for the splice programs; the tests build the
+/// host reference from the same function, so the two cannot drift apart.
+pub fn splice_prefix(len: usize) -> Vec<u8> {
+    (0..len)
+        .map(|i| (i as u8).wrapping_mul(37).wrapping_add(11))
+        .collect()
+}
+
+/// Deterministic machine-supplied bytes for the splice programs.
+pub fn splice_dynamic(len: usize) -> Vec<u8> {
+    (0..len)
+        .map(|i| (i as u8).wrapping_mul(53).wrapping_add(29))
+        .collect()
+}
+
+/// A constant prefix of `prefix_len` bytes followed by `num_halves` hinted
+/// machine halves, then a raw squeeze. The shift under test is
+/// `prefix_len % 4`; at 0 it takes the aligned fast path and serves as control.
+pub fn splice_program_source(prefix_len: usize, num_halves: u32) -> LfmProgramSource {
+    use super::builder::Felt;
+    use super::transcript_replay::TranscriptReplay;
+
+    let mut b = LfmBuilder::new();
+    let arena = b.declare_arena(num_halves);
+    let halves: Vec<Felt> = (0..num_halves).map(|i| b.hint_felt(arena, i)).collect();
+    let mut t = TranscriptReplay::new(&splice_prefix(prefix_len));
+    t.append_halves_misaligned(&halves);
+    let s = t.sample(&mut b);
+    b.public(s[0]);
+    b.public(s[1]);
+    b.finish()
+}
+
+pub fn splice_program(prefix_len: usize, num_halves: u32) -> LfmProgram {
+    compile(splice_program_source(prefix_len, num_halves))
+}
+
+/// Tag length of the alternating splice program — the real
+/// `LAMBDAVM_CONTINUATION_EPOCH_V2` is exactly this long.
+pub const SPLICE_ALT_TAG: usize = 30;
+pub const SPLICE_ALT_DIGEST_HALVES: u32 = 8;
+pub const SPLICE_ALT_FIELD_HALVES: u32 = 2;
+
+/// The continuation-epoch statement's shape in miniature: alternating constant
+/// and dynamic runs, with the shift CHANGING mid-stream.
+///
+/// The byte offsets are the whole point. A 30-byte tag leaves shift 2; the
+/// 32-byte digest and an 8-byte field keep it there; then a ONE-byte field —
+/// standing for the real encoding's `fri_final_poly_log_degree` — moves every
+/// later dynamic value to shift 3. A splice that handles only a single fixed
+/// shift passes the fixed-prefix test above and fails this one.
+pub fn splice_alternating_program_source() -> LfmProgramSource {
+    use super::builder::Felt;
+    use super::transcript_replay::TranscriptReplay;
+
+    let total = SPLICE_ALT_DIGEST_HALVES + 2 * SPLICE_ALT_FIELD_HALVES;
+    let mut b = LfmBuilder::new();
+    let arena = b.declare_arena(total);
+    let h: Vec<Felt> = (0..total).map(|i| b.hint_felt(arena, i)).collect();
+    let d = SPLICE_ALT_DIGEST_HALVES as usize;
+    let f = SPLICE_ALT_FIELD_HALVES as usize;
+
+    let mut t = TranscriptReplay::new(&splice_prefix(SPLICE_ALT_TAG));
+    t.append_halves_misaligned(&h[..d]);
+    t.append_const_bytes(&splice_prefix(8));
+    t.append_halves_misaligned(&h[d..d + f]);
+    t.append_const_bytes(&splice_prefix(1));
+    t.append_halves_misaligned(&h[d + f..]);
+    let s = t.sample(&mut b);
+    b.public(s[0]);
+    b.public(s[1]);
+    b.finish()
+}
+
+pub fn splice_alternating_program() -> LfmProgram {
+    compile(splice_alternating_program_source())
+}
+
 /// A harness for the candidate canonicity guard alone: `(lo, hi)` arrive as
 /// hinted halves, the guard runs, the recomposed felt is published.
 ///

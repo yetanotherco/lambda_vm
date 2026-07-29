@@ -1837,3 +1837,158 @@ fn felt_be_halves_cost() {
         "two accumulators, each 1 Mul + 31 MulAdd over its 32 bits"
     );
 }
+
+// ==================== R1e slice b: the byte-level splice ====================
+
+use super::programs::{
+    SPLICE_ALT_DIGEST_HALVES, SPLICE_ALT_FIELD_HALVES, SPLICE_ALT_TAG, splice_alternating_program,
+    splice_dynamic, splice_prefix, splice_program,
+};
+
+fn splice_arenas(byte_len: usize) -> Vec<Vec<LfmWord>> {
+    vec![
+        keccak_host::pack_stream(&splice_dynamic(byte_len))
+            .into_iter()
+            .map(super::word::base_word)
+            .collect(),
+    ]
+}
+
+/// The splice at every shift, against the REAL transcript.
+///
+/// The oracle is `DefaultTranscript` over the concatenated byte string, which is
+/// the definition of what the machine must reproduce: append boundaries leave no
+/// trace in the digest input, so the whole segment is one byte string and the
+/// machine's job is to hash exactly it.
+///
+/// Shift 0 is included as the control — it takes the aligned fast path, so if
+/// the splice were silently applied there it would show up here.
+#[test]
+fn splice_matches_default_transcript_at_every_shift() {
+    use crate::tables::types::GoldilocksField;
+    use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+
+    const DYN_BYTES: usize = 32;
+    let halves = (DYN_BYTES / keccak_host::BYTES_PER_HALF) as u32;
+    for prefix_len in [0usize, 1, 2, 3, 4, 5, 6, 7, 29, 30, 31, 32] {
+        let program = splice_program(prefix_len, halves);
+        validate(&program).unwrap_or_else(|e| panic!("prefix {prefix_len}: admission: {e:?}"));
+        let exec = super::executor::execute(
+            &program,
+            &splice_arenas(DYN_BYTES),
+            &super::hash::TestPermutation,
+        )
+        .unwrap_or_else(|e| panic!("prefix {prefix_len}: execution failed: {e:?}"));
+
+        let mut bytes = splice_prefix(prefix_len);
+        bytes.extend_from_slice(&splice_dynamic(DYN_BYTES));
+        let mut h = DefaultTranscript::<GoldilocksField>::new(&bytes);
+        assert_eq!(
+            digest_bytes(&exec.public_words),
+            h.sample(),
+            "prefix {prefix_len} (shift {}): spliced bytes must equal the concatenation",
+            prefix_len % keccak_host::BYTES_PER_HALF
+        );
+    }
+}
+
+/// The statement's real shape: alternating constant and dynamic runs where a
+/// one-byte field moves the shift from 2 to 3 partway through.
+#[test]
+fn splice_alternating_runs_match_default_transcript() {
+    use crate::tables::types::GoldilocksField;
+    use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+
+    let d = SPLICE_ALT_DIGEST_HALVES as usize * keccak_host::BYTES_PER_HALF;
+    let f = SPLICE_ALT_FIELD_HALVES as usize * keccak_host::BYTES_PER_HALF;
+    let program = splice_alternating_program();
+    validate(&program).expect("admission");
+    let exec = super::executor::execute(
+        &program,
+        &splice_arenas(d + 2 * f),
+        &super::hash::TestPermutation,
+    )
+    .expect("execution");
+
+    // The same byte string, built independently in absorb order.
+    let dynamic = splice_dynamic(d + 2 * f);
+    let mut bytes = splice_prefix(SPLICE_ALT_TAG);
+    bytes.extend_from_slice(&dynamic[..d]);
+    bytes.extend_from_slice(&splice_prefix(8));
+    bytes.extend_from_slice(&dynamic[d..d + f]);
+    bytes.extend_from_slice(&splice_prefix(1));
+    bytes.extend_from_slice(&dynamic[d + f..]);
+
+    let mut h = DefaultTranscript::<GoldilocksField>::new(&bytes);
+    assert_eq!(
+        digest_bytes(&exec.public_words),
+        h.sample(),
+        "alternating const/dynamic runs across a shift change must match"
+    );
+}
+
+/// The splice PROVED, not just executed: it leans on `BitDec` plus a weighted
+/// sum plus the recomposition assert, and only a proof sees the chips.
+#[test]
+fn splice_proves_and_verifies() {
+    let opts = options();
+    let program = splice_program(30, 8);
+    let artifacts = build_artifacts(&program, &opts);
+    let proved = lfm_prove(&program, &artifacts, &splice_arenas(32), &opts).expect("prove");
+    assert!(
+        verify_against(
+            &artifacts.roots,
+            &artifacts.program_id,
+            &proved.proof,
+            &proved.public_words,
+            &opts,
+        ),
+        "the spliced absorb must verify"
+    );
+}
+
+/// A half at or above `2^32` has no four-byte rendering, so the splice must
+/// refuse it rather than silently absorb the wrong bytes.
+///
+/// `bit_dec` alone bounds its input by `p`, not by `2^32`; the recomposition
+/// assert inside `split_half` is what closes the gap, and this is the test that
+/// fails if it is removed.
+#[test]
+fn splice_rejects_a_non_u32_half() {
+    let program = splice_program(2, 8);
+    let mut arenas = splice_arenas(32);
+    arenas[0][0][0] = FE::from(1u64 << 32);
+    match super::executor::execute(&program, &arenas, &super::hash::TestPermutation) {
+        Err(LfmExecError::DivByZero { .. }) => {}
+        other => panic!(
+            "a half at 2^32 must fail the splice's recomposition assert, got {:?}",
+            other.map(|_| "accepted")
+        ),
+    }
+}
+
+/// Pins the splice's cost, and that the ALIGNED path is still free.
+#[test]
+fn splice_cost() {
+    let spliced = splice_program(2, 8);
+    let aligned = splice_program(4, 8);
+    println!(
+        "splice 8 halves @shift2: bitdec {}, balu {} | aligned: bitdec {}, balu {}",
+        spliced.groups.bitdec.real_rows,
+        spliced.groups.balu.real_rows,
+        aligned.groups.bitdec.real_rows,
+        aligned.groups.balu.real_rows,
+    );
+    assert_eq!(
+        spliced.groups.bitdec.real_rows, 8,
+        "one decomposition per spliced half"
+    );
+    assert_eq!(
+        aligned.groups.bitdec.real_rows, 0,
+        "the aligned path must emit no splice at all"
+    );
+    assert_eq!(
+        aligned.groups.balu.real_rows, 0,
+        "the aligned path must stay instruction-free"
+    );
+}

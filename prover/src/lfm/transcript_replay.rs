@@ -56,7 +56,7 @@ use crate::tables::types::FE;
 
 use super::builder::{Bit, Cell, Ext, Felt, LfmBuilder};
 use super::edsl;
-use super::keccak_host::{BYTES_PER_HALF, SQUEEZE_LEN, pack_stream};
+use super::keccak_host::{BYTES_PER_HALF, SQUEEZE_LEN};
 use super::layout::keccak::DIGEST_WORDS;
 
 /// `u32` halves in one 32-byte squeeze.
@@ -257,40 +257,48 @@ impl TranscriptReplay {
         );
     }
 
-    /// Packs the segment into `u32` halves: constant runs concatenated first,
-    /// then chunked, with machine halves passed through.
+    /// Absorb machine-computed data that does NOT start on a 4-byte boundary.
     ///
-    /// A constant run can only be partial at the very END of the segment, since
-    /// `append_halves` requires 4-byte alignment — which is exactly the
-    /// obligation `edsl::keccak256` relies on, and `pack_stream` zeroes that
-    /// final half's unused high bytes so the padding constant merges with an
-    /// `add` rather than carrying.
-    fn pack_segment(&self, b: &mut LfmBuilder) -> Vec<Felt> {
-        fn flush(b: &mut LfmBuilder, run: &mut Vec<u8>, out: &mut Vec<Felt>) {
-            for half in pack_stream(run) {
-                out.push(b.felt_const(half));
-            }
-            run.clear();
-        }
+    /// Same bytes as [`TranscriptReplay::append_halves`], but it permits the
+    /// misalignment that method rejects, and pays for it: each half then
+    /// straddles two output halves and has to be split byte-wise (see
+    /// [`split_half`] for the gadget and its cost). Use the aligned method
+    /// wherever the encoding allows — this one exists for the statement leg,
+    /// where a 30-byte domain tag and a 1-byte `fri` field between fixed-width
+    /// fields make misalignment unavoidable.
+    ///
+    /// The splice itself happens in [`TranscriptReplay::pack_segment`], not
+    /// here, because only the packer knows the byte cursor.
+    pub fn append_halves_misaligned(&mut self, halves: &[Felt]) {
+        self.segment.push(SegPiece::Halves(halves.to_vec()));
+        self.segment_len += BYTES_PER_HALF * halves.len();
+        self.out_pos = SQUEEZE_LEN;
+        self.buf = None;
+    }
 
-        let mut out = Vec::new();
-        let mut run: Vec<u8> = Vec::new();
+    /// Packs the segment into `u32` halves, walking it at BYTE granularity.
+    ///
+    /// Constant bytes accumulate host-side; a machine half drops straight in
+    /// when the cursor is 4-byte aligned — the path every aligned program takes,
+    /// which must stay instruction-free — and is split when it is not. The
+    /// packer is the only place that knows the cursor, which is why the splice
+    /// lives here rather than at the append.
+    fn pack_segment(&self, b: &mut LfmBuilder) -> Vec<Felt> {
+        let mut p = Packer {
+            out: Vec::new(),
+            partial: Partial::Const(Vec::new()),
+        };
         for piece in &self.segment {
             match piece {
-                SegPiece::Const(bytes) => run.extend_from_slice(bytes),
+                SegPiece::Const(bytes) => p.push_const(b, bytes),
                 SegPiece::Halves(halves) => {
-                    assert_eq!(
-                        run.len() % BYTES_PER_HALF,
-                        0,
-                        "constant run ahead of machine data must be whole halves"
-                    );
-                    flush(b, &mut run, &mut out);
-                    out.extend_from_slice(halves);
+                    for h in halves {
+                        p.push_half(b, *h);
+                    }
                 }
             }
         }
-        flush(b, &mut run, &mut out);
-        out
+        p.finish(b)
     }
 
     /// `DefaultTranscript::sample()` — finalize, reverse the 32 digest bytes,
@@ -475,6 +483,136 @@ pub fn assert_canonical(b: &mut LfmBuilder, c: Candidate) {
 pub fn candidate_to_felt(b: &mut LfmBuilder, c: Candidate) -> Felt {
     let two32 = b.felt_const(FE::from(1u64 << 32));
     b.mul_add(c.hi, two32, c.lo)
+}
+
+// =============================== the packer ===============================
+
+/// The half currently under construction.
+enum Partial {
+    /// Its bytes so far, all compile-time. Always fewer than four.
+    Const(Vec<u8>),
+    /// A machine value occupying the LOW `filled` bytes of the half, with
+    /// `filled` in `1..4`. Its unfilled high bytes are zero, so completing it is
+    /// an addition rather than an or.
+    Mixed(Felt, usize),
+}
+
+/// Emits a segment's `u32` halves from a byte-granular walk of its pieces.
+struct Packer {
+    out: Vec<Felt>,
+    partial: Partial,
+}
+
+/// The little-endian value of up to four bytes.
+fn le_value(bytes: &[u8]) -> u64 {
+    bytes
+        .iter()
+        .enumerate()
+        .fold(0u64, |acc, (i, &v)| acc | (u64::from(v) << (8 * i)))
+}
+
+impl Packer {
+    fn filled(&self) -> usize {
+        match &self.partial {
+            Partial::Const(v) => v.len(),
+            Partial::Mixed(_, f) => *f,
+        }
+    }
+
+    fn push_const(&mut self, b: &mut LfmBuilder, bytes: &[u8]) {
+        for &byte in bytes {
+            match core::mem::replace(&mut self.partial, Partial::Const(Vec::new())) {
+                Partial::Const(mut v) => {
+                    v.push(byte);
+                    if v.len() == BYTES_PER_HALF {
+                        let c = b.felt_const(FE::from(le_value(&v)));
+                        self.out.push(c);
+                        v.clear();
+                    }
+                    self.partial = Partial::Const(v);
+                }
+                Partial::Mixed(m, filled) => {
+                    // The byte lands above what is already there, and the high
+                    // bytes are zero, so `add` is exactly an or.
+                    let w = b.felt_const(FE::from(u64::from(byte) << (8 * filled)));
+                    let m = b.add(m, w);
+                    if filled + 1 == BYTES_PER_HALF {
+                        self.out.push(m);
+                        self.partial = Partial::Const(Vec::new());
+                    } else {
+                        self.partial = Partial::Mixed(m, filled + 1);
+                    }
+                }
+            }
+        }
+    }
+
+    fn push_half(&mut self, b: &mut LfmBuilder, d: Felt) {
+        let filled = self.filled();
+        if filled == 0 {
+            // Aligned: the felt IS the half. No instructions — this is the path
+            // every aligned program takes and it must stay free, or every
+            // registered digest moves.
+            self.out.push(d);
+            return;
+        }
+        // `d` contributes its low `4 − filled` bytes to the half under
+        // construction and its high `filled` bytes to the next one.
+        let (lo, hi) = split_half(b, d, BYTES_PER_HALF - filled);
+        let shift = b.felt_const(FE::from(1u64 << (8 * filled)));
+        let half = match core::mem::replace(&mut self.partial, Partial::Const(Vec::new())) {
+            Partial::Const(v) => {
+                let base = b.felt_const(FE::from(le_value(&v)));
+                b.mul_add(lo, shift, base)
+            }
+            Partial::Mixed(m, _) => b.mul_add(lo, shift, m),
+        };
+        self.out.push(half);
+        self.partial = Partial::Mixed(hi, filled);
+    }
+
+    fn finish(mut self, b: &mut LfmBuilder) -> Vec<Felt> {
+        match self.partial {
+            // A trailing partial half's unused high bytes are zero either way,
+            // which is the property `edsl::keccak256` needs to merge the padding
+            // constant with an `add`.
+            Partial::Const(v) if v.is_empty() => {}
+            Partial::Const(v) => {
+                let c = b.felt_const(FE::from(le_value(&v)));
+                self.out.push(c);
+            }
+            Partial::Mixed(m, _) => self.out.push(m),
+        }
+        self.out
+    }
+}
+
+/// Splits a `u32` half into its low `k` bytes and its high `4 − k` bytes.
+///
+/// This is the byte-level splice the misaligned statement encoding needs. A byte
+/// split is not field arithmetic, so it goes through the canonical bit
+/// decomposition and two weighted sums over disjoint bit ranges.
+///
+/// The recomposition assert is load-bearing, not a belt: `bit_dec` bounds its
+/// input by `p`, not by `2^32`, and a "half" at or above `2^32` has no four-byte
+/// rendering at all. Pinning `d = lo + hi·2^(8k)` forces `d < 2^32` and the
+/// split's correctness in the same constraint.
+///
+/// Cost: one `LFM_BITDEC` row and ~33 `LFM_BALU` rows per spliced half. It only
+/// ever runs on the statement leg — a few dozen halves per proof — and never in
+/// FRI or Merkle traffic.
+pub fn split_half(b: &mut LfmBuilder, d: Felt, k: usize) -> (Felt, Felt) {
+    assert!(
+        (1..BYTES_PER_HALF).contains(&k),
+        "split_half: k must be in 1..4, got {k}"
+    );
+    let bits = b.bit_dec(d, 8 * BYTES_PER_HALF);
+    let lo = edsl::bits_to_felt(b, &bits[..8 * k]);
+    let hi = edsl::bits_to_felt(b, &bits[8 * k..]);
+    let shift = b.felt_const(FE::from(1u64 << (8 * k)));
+    let recomposed = b.mul_add(hi, shift, lo);
+    b.assert_eq(d, recomposed);
+    (lo, hi)
 }
 
 /// The two `u32` halves of a base felt's 8-byte BIG-endian rendering — what
