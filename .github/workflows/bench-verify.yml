@@ -130,9 +130,10 @@ jobs:
         timeout-minutes: 70
         env:
           HEAD_SHA: ${{ steps.cfg.outputs.head_sha }}
-          # Share build-std and the host cargo target across ref worktrees, rooted under
-          # the script's /tmp cache dir: cuts cold build time and per-worktree disk.
-          GUEST_TARGET_DIR: /tmp/recursion_cycles_run/shared_guest_target
+          # Base path for the per-ref guest target dirs (`<base>_<sha8>`) and the shared
+          # host cargo target, both rooted under the script's /tmp cache dir: build-std
+          # and native deps survive across runs instead of being rebuilt cold.
+          GUEST_TARGET_DIR: /tmp/recursion_cycles_run/guest_target
           HOST_TARGET_DIR: /tmp/recursion_cycles_run/shared_host_target
         run: |
           export SYSROOT_DIR="$HOME/.lambda-vm-sysroot"

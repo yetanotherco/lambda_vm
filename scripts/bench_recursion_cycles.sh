@@ -59,9 +59,10 @@
 #     REBUILD=1            force rebuild of each ref's measuring CLI and re-run of every
 #                          ref (guest build + blob dump + measurement); ignore caches.
 #     SYSROOT_DIR=<path>   guest-build sysroot (default $HOME/.lambda-vm-sysroot).
-#     GUEST_TARGET_DIR=<p> share the RV64 guest build dir across ref worktrees
-#                          (reuses build-std → big speedup for the 2nd ref's guest
-#                          build). Unset = per-worktree (default, fully isolated).
+#     GUEST_TARGET_DIR=<p> base path for the RV64 guest build dir. Each ref gets its
+#                          OWN dir, `<p>_<sha8>` — NEVER one dir shared by both refs
+#                          (see the cross-ref clobbering note below). Unset =
+#                          per-worktree (cargo's default target/, also isolated).
 #     HOST_TARGET_DIR=<p>  share the host cargo target dir for the blob-dump test
 #                          build across refs. Unset = per-worktree (default).
 #     PRUNE_KEEP=<n>       cap on cached ref worktrees kept under $WORK (default 10);
@@ -80,6 +81,18 @@
 # mid-run is removed immediately. The dumped input blob is also cached (keyed on SHA +
 # preset), so re-proving blowup4-block's real ethrex block only happens once per ref.
 # REBUILD=1 forces everything.
+#
+# NEVER point two refs at one guest CARGO_TARGET_DIR. Two worktrees are two distinct
+# source roots; building both into a single target dir makes cargo consider the crates
+# that did NOT change between the refs "fresh" and reuse rlibs compiled from the OTHER
+# worktree, while rebuilding the ones that did — so a build that alternates refs dies
+# with `multiple different versions of crate math in the dependency graph` naming both
+# worktrees. That is exactly how the blowup2/blowup4 regimes silently went "unavailable"
+# in CI: the FIRST preset's two builds are both first-sight and succeed, and every later
+# preset returns to an already-built worktree and fails. Hence the per-ref
+# `${GUEST_TARGET_DIR}_<sha8>` below: each source root owns its target dir, so build-std
+# is still reused across presets AND across runs (just not across refs), and a repeated
+# `make compile-recursion-elfs` for the same ref is the intended cargo no-op.
 #
 set -euo pipefail
 
@@ -124,6 +137,12 @@ prune_worktree_cache() {
           "$WORK"/build_guest_"${s8}".log "$WORK"/dump_"${s8}"*.log \
           "$WORK"/measure_"${s8}"*.err "$WORK"/measure_cli_"${s8}"* \
           "$WORK"/build_cli_"${s8}".log
+    # The per-ref guest target dir is the biggest artifact of all (build-std + the
+    # guest builds) and its name escapes the wt_* glob above, so drop it here too or
+    # the disk-bounding claim stops holding.
+    if [ -n "${GUEST_TARGET_DIR:-}" ]; then
+      rm -rf "${GUEST_TARGET_DIR}_${s8}"
+    fi
   done <<< "$stale"
   git worktree prune >/dev/null 2>&1 || true
 }
@@ -135,6 +154,18 @@ prune_worktree_cache
 # fixed names escape the per-SHA prune globs above, so on the long-lived bench runner
 # they would linger forever. Drop them so the disk-bounding claim actually holds.
 rm -f "$WORK"/measure_cli "$WORK"/measure_cli.sha "$WORK"/build_measure_cli.log
+
+# Same for the retired single-shared-guest-target scheme: CI used to point
+# GUEST_TARGET_DIR at this one fixed path for BOTH refs, which is exactly what poisoned
+# every regime after the first. Nothing writes or reads it now (each ref builds into
+# ${GUEST_TARGET_DIR}_<sha8>), its name escapes the per-SHA prune globs, and it is the
+# largest thing on disk — so reclaim it once. The CACHEDIR.TAG check keeps this an
+# rm -rf of a cargo target dir and nothing else: cargo writes that file into every
+# target dir it creates.
+if [ -f "$WORK/shared_guest_target/CACHEDIR.TAG" ]; then
+  echo "==> Removing retired shared guest target dir $WORK/shared_guest_target" >&2
+  rm -rf "$WORK/shared_guest_target"
+fi
 
 echo "==> Refs"
 git fetch origin --quiet || echo "WARNING: 'git fetch origin' failed — resolving against possibly-stale local refs." >&2
@@ -245,7 +276,7 @@ measure_ref() {
   fi
   local -a make_args=("${make_goals[@]}")
   if [ -n "${GUEST_TARGET_DIR:-}" ]; then
-    make_args+=("SHARED_TARGET_DIR=$GUEST_TARGET_DIR")
+    make_args+=("SHARED_TARGET_DIR=${GUEST_TARGET_DIR}_${sha8}")
   fi
   if ! ( cd "$wt" && SYSROOT_DIR="$SYSROOT_DIR" make "${make_args[@]}" ) >"$glog" 2>&1; then
     echo "ERROR: [$role] 'make ${make_goals[*]}' failed for $ref ($sha8). Tail of $glog:" >&2
