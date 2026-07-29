@@ -62,7 +62,7 @@ use super::memw::{self, MemwOperation};
 use super::memw_aligned;
 use super::memw_register::{self, RegRow};
 use super::mul::{self, MulOperation};
-use super::page::{self, FinalByteState, FinalStateMap, PageConfig};
+use super::page::{self, PageConfig};
 use super::register::{self, FinalRegisterStateMap, FinalRegisterWordState};
 use super::shift::{self, ShiftOperation};
 use super::store;
@@ -2193,30 +2193,23 @@ fn collect_bitwise_from_page<I: ImageSource>(
     // Derive ALL page bases from memory_state (includes ELF + runtime pages)
     let page_bases: BTreeSet<u64> = memory_state.cells.page_bases().collect();
 
-    // Build final state map from memory_state, matching `generate_page_tables`:
-    // when `exclude_touched`, touched cells (timestamp > 0) are dropped so PAGE
-    // emits `fini == init` for them, and the ARE_BYTES multiplicities here must
-    // agree (otherwise the AreBytes bus would not balance).
-    let final_state: FinalStateMap = memory_state
-        .cells
-        .iter()
-        .filter(|(_, cell)| !exclude_touched || cell.1 == 0)
-        .map(|(addr, (value, timestamp))| (addr, FinalByteState { timestamp, value }))
-        .collect();
-
-    // For each page and each byte, add ARE_BYTES lookups for init and fini
+    // Read each offset's final `(value, timestamp)` straight from the dense
+    // per-page store instead of a sparse `FinalStateMap` lookup per offset
+    // (mostly-miss) — same optimization as `generate_page_tables`. `page_final`
+    // derives the final `(fini, ts)` exactly as `generate_page_trace_from_dense`
+    // does, so the ARE_BYTES multiplicities match the PAGE table's FINI column and
+    // the AreBytes bus stays balanced.
     for &page_base in &page_bases {
         let init_data = init_page_data.get(&page_base);
+        let final_page = memory_state.cells.page_data(page_base);
 
         for offset in 0..page_size {
-            let addr = page_base + offset as u64;
-
-            // Get init value (from ELF or 0). `.get().unwrap_or(0)` to match the
-            // relaxed `init_values` contract: a shorter vec reads as trailing zeros.
+            // Init value (from ELF or 0). `.get().unwrap_or(0)` matches the relaxed
+            // `init_values` contract: a shorter vec reads as trailing zeros.
             let init = init_data.map_or(0u8, |data| data.get(offset).copied().unwrap_or(0));
 
-            // Get fini value (from final_state or init if never accessed)
-            let fini = final_state.get(&addr).map_or(init, |state| state.value);
+            let (value, timestamp) = final_page.map_or((0u8, 0u64), |p| p[offset]);
+            let (fini, _) = page::page_final(init, value, timestamp, exclude_touched);
 
             // C1+C2: ARE_BYTES[init, fini] — batched range check for both bytes.
             // Bumped straight into the histogram: this loop visits every byte of
@@ -2682,16 +2675,13 @@ fn generate_page_tables<I: ImageSource>(
     // Derive ALL page bases from memory_state (includes ELF + runtime pages)
     let page_bases: BTreeSet<u64> = memory_state.cells.page_bases().collect();
 
-    // Build final state map from memory_state. When `exclude_touched` (continuation
-    // epoch with L2G bookend), drop touched cells (timestamp > 0) so PAGE self-
-    // cancels them (init == fini, ts == 0) and the local-to-global table owns their
-    // Memory-bus init/fini instead.
-    let final_state: FinalStateMap = memory_state
-        .cells
-        .iter()
-        .filter(|(_, cell)| !exclude_touched || cell.1 == 0)
-        .map(|(addr, (value, timestamp))| (addr, FinalByteState { timestamp, value }))
-        .collect();
+    // The per-page final `(value, timestamp)` is read straight from the dense
+    // `memory_state.cells` store (one indexed read per offset) rather than routing
+    // through a sparse `FinalStateMap` whose per-page (mostly-miss) lookups dominated
+    // PAGE generation. `exclude_touched` (continuation epoch with L2G bookend) drops
+    // runtime-written cells (ts > 0) so PAGE self-cancels them (init == fini, ts == 0)
+    // and the local-to-global table owns their Memory-bus init/fini instead — applied
+    // per offset inside `generate_page_trace_from_dense`.
 
     // Generate PAGE tables and configs
     let mut pages = Vec::new();
@@ -2711,7 +2701,8 @@ fn generate_page_tables<I: ImageSource>(
             PageConfig::zero_init(page_base)
         };
 
-        let trace = page::generate_page_trace(&config, &final_state);
+        let final_page = memory_state.cells.page_data(page_base);
+        let trace = page::generate_page_trace_from_dense(&config, final_page, exclude_touched);
         pages.push(trace);
         page_configs.push(config);
     }
