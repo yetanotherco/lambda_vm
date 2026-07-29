@@ -1004,16 +1004,19 @@ where
     }
 
     fn trace_ood_next_row_columns(&self) -> Vec<usize> {
-        // The only transition constraint that reads the next row is the circular
-        // LogUp accumulator, and after forward accumulation it reads only the
-        // accumulated column there (all committed terms and absorbed operands
-        // read the current row). Its full-width index is the main width plus the
-        // accumulated column's aux index. No interactions => no next-row reads.
-        if self.auxiliary_trace_build_data.interactions.is_empty() {
-            Vec::new()
-        } else {
-            vec![self.trace_layout.0 + self.logup.acc_column_idx]
+        // Columns read on the next row: the table's own constraint-set reads
+        // (`main(1, ·)`, statically declared) plus, when the table has LogUp
+        // interactions, the circular accumulator's aux column (main width + its
+        // aux index). The verifier opens OOD next-row evaluations only for these;
+        // a next-row read that is not declared here is pruned and reconstructed as
+        // zero, silently corrupting this table's transition evaluation.
+        let mut cols = self.constraint_set.next_row_columns();
+        if !self.auxiliary_trace_build_data.interactions.is_empty() {
+            cols.push(self.trace_layout.0 + self.logup.acc_column_idx);
         }
+        cols.sort_unstable();
+        cols.dedup();
+        cols
     }
 
     fn has_trace_interaction(&self) -> bool {

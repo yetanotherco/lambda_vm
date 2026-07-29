@@ -385,6 +385,172 @@ fn test_prove_elfs_arith_8() {
     );
 }
 
+/// End-to-end FEXT accelerator test: FEXT_LOAD a/b/c into field-storage, then
+/// FEXT_FMA out = a*b + c over the native degree-3 Goldilocks extension. Proves
+/// and verifies the full VM (exercises the FEXT_LOAD/FEXT_FMA/FEXT_STORE chips +
+/// FEXT_PAGE bookend + their Memory/Alu/Ecall/Memw bus interactions balancing).
+#[test]
+fn test_prove_elfs_fext() {
+    let (elf, logs, instructions) = run_asm_elf("test_fext");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "Proof verification failed for test_fext program"
+    );
+}
+
+/// Adversarial: a FEXT_STORE read-back forged into the non-canonical `V + p`
+/// word pair (same field element mod p, so the field-storage `Memory` read still
+/// balances, but a 64-bit value >= p) must be rejected — the `coeff_lt_p` ALU-LT
+/// canonicality check is the guard. Complements the AIR-only recompose test in
+/// `fext_store_tests.rs` (which never drives the bus lookup).
+#[test]
+fn test_prove_elfs_fext_rejects_noncanonical_store_readback() {
+    use crate::tables::fext_store::cols as sc;
+    const P: u64 = 0xFFFF_FFFF_0000_0001;
+
+    let (elf, logs, instructions) = run_asm_elf("test_fext");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+
+    let nrows = traces.fext_store.num_rows();
+    let t = &mut traces.fext_store.main_table;
+    let row = (0..nrows)
+        .find(|&r| *t.get(r, sc::MU).value() == 1)
+        .expect("test_fext must have an active FEXT_STORE row");
+    let v = *t.get(row, sc::C0_LO).value() | (*t.get(row, sc::C0_HI).value() << 32);
+    assert!(
+        v < (1u64 << 32) - 1,
+        "stored coeff must be small enough for the V+p alias to fit in u64"
+    );
+    let alias = v + P;
+    let (lo, hi) = (alias & 0xFFFF_FFFF, alias >> 32);
+    t.set(row, sc::C0_LO, FieldElement::<GoldilocksField>::from(lo));
+    t.set(row, sc::C0_HI, FieldElement::<GoldilocksField>::from(hi));
+    // Keep the half-word recompose AIR constraints satisfied so the forgery can
+    // only be caught by the bus-level `coeff_lt_p` check, not the recompose.
+    t.set(
+        row,
+        sc::hw(sc::C0_LO),
+        FieldElement::<GoldilocksField>::from(lo & 0xFFFF),
+    );
+    t.set(
+        row,
+        sc::hw(sc::C0_LO) + 1,
+        FieldElement::<GoldilocksField>::from(lo >> 16),
+    );
+    t.set(
+        row,
+        sc::hw(sc::C0_HI),
+        FieldElement::<GoldilocksField>::from(hi & 0xFFFF),
+    );
+    t.set(
+        row,
+        sc::hw(sc::C0_HI) + 1,
+        FieldElement::<GoldilocksField>::from(hi >> 16),
+    );
+
+    assert!(
+        !prove_and_verify_vm_minimal(&elf, &mut traces),
+        "non-canonical STORE read-back (V+p alias) must be rejected"
+    );
+}
+
+/// Adversarial: forging a touched field cell's finalized value in the FEXT_PAGE
+/// bookend must be rejected — the `Memory`/GlobalFieldMemory token for that cell
+/// no longer matches its last access, so the bus cannot balance. Guards the
+/// field-storage carry/bookend value integrity (the AIR-only page tests never
+/// drive this bus).
+#[test]
+fn test_prove_elfs_fext_rejects_tampered_field_final_value() {
+    use crate::tables::fext_page::cols as pc;
+
+    let (elf, logs, instructions) = run_asm_elf("test_fext");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+
+    let nrows = traces.fext_page.num_rows();
+    let t = &mut traces.fext_page.main_table;
+    let row = (0..nrows)
+        .find(|&r| *t.get(r, pc::MU).value() == 1)
+        .expect("test_fext must have an active FEXT_PAGE row");
+    let forged = t.get(row, pc::FINAL_VAL).value().wrapping_add(1);
+    t.set(
+        row,
+        pc::FINAL_VAL,
+        FieldElement::<GoldilocksField>::from(forged),
+    );
+
+    assert!(
+        !prove_and_verify_vm_minimal(&elf, &mut traces),
+        "a tampered field-cell final value must be rejected"
+    );
+}
+
+/// Regression: the prover must be deterministic for a fixed program.
+///
+/// `generate_lt_trace` once ordered its rows by `HashMap` iteration (per-process
+/// random), so the LT main-trace Merkle root — and thus the shared Fiat-Shamir
+/// LogUp challenges derived from all main roots — varied run to run, which made
+/// FEXT_PAGE's composition check flaky in CI. Prove `test_fext` repeatedly and
+/// require every table's committed data to match. The grinding nonce and the
+/// query openings it selects are excluded: a parallel grinding search legitimately
+/// returns different valid nonces.
+#[test]
+fn test_prover_deterministic_fext() {
+    use std::hash::{Hash, Hasher};
+    let (elf, logs, instructions) = run_asm_elf("test_fext");
+
+    let prove_core_hash = || -> u64 {
+        let mut traces =
+            Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+        let proof_options = ProofOptions::default_test_options();
+        let table_counts = traces.table_counts();
+        let airs = VmAirs::new(
+            &elf,
+            &proof_options,
+            true,
+            &traces.page_configs,
+            &table_counts,
+            None,
+            true,
+            None,
+            None,
+            None,
+        );
+        let air_trace_pairs = airs.air_trace_pairs(&mut traces);
+        let mp = multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for p in &mp.proofs {
+            // Committed data only — nonce/query_list/deep_poly_openings vary with
+            // the parallel grinding search and are intentionally excluded.
+            format!(
+                "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+                p.trace_length,
+                p.lde_trace_main_merkle_root,
+                p.lde_trace_aux_merkle_root,
+                p.lde_trace_precomputed_merkle_root,
+                p.trace_ood_evaluations,
+                p.composition_poly_root,
+                p.composition_poly_parts_ood_evaluation,
+                (&p.fri_layers_merkle_roots, &p.fri_final_poly_coeffs),
+            )
+            .hash(&mut h);
+        }
+        h.finish()
+    };
+
+    let baseline = prove_core_hash();
+    for i in 0..8 {
+        assert_eq!(
+            baseline,
+            prove_core_hash(),
+            "prover produced nondeterministic committed data on reprove {i}"
+        );
+    }
+}
+
 /// Basic arithmetic test with 32 instructions covering:
 /// - 64-bit ADD with positive, negative, and edge cases
 /// - 64-bit SUB with underflow, negative results
@@ -3406,6 +3572,38 @@ fn test_continuation_pipeline_end_to_end() {
             MultiProofView::Owned(&final_proof)
         ),
         "final proof must be bound to the real per-epoch L2G roots"
+    );
+}
+
+/// FEXT accelerator ecalls under continuation (`l2g_memory_bookend = true`) are now
+/// supported: field-storage is carried across epochs by the fext_local_to_global
+/// bookend + GlobalFieldMemory aggregation, so trace building no longer rejects them.
+/// (End-to-end prove+verify across epochs is `fext_works_under_continuation` in the
+/// continuation module.)
+#[test]
+fn fext_trace_builds_under_continuation() {
+    use crate::tables::register;
+    use crate::tables::trace_builder::build_initial_image;
+
+    let (elf, logs, _instructions) = run_asm_elf("test_fext");
+    let image = build_initial_image(&elf, &[]);
+    let register_init = register::register_init_from_entry_point(elf.entry_point);
+    let result = Traces::from_image_and_logs(
+        &elf,
+        &image,
+        &register_init,
+        &logs,
+        &MaxRowsConfig::default(),
+        &[],
+        true,
+        true,
+        #[cfg(feature = "disk-spill")]
+        stark::storage_mode::StorageMode::Ram,
+    );
+    assert!(
+        result.is_ok(),
+        "FEXT trace building under continuation must succeed now: {:?}",
+        result.err()
     );
 }
 

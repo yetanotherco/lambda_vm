@@ -4,6 +4,9 @@ use crate::vm::{
     memory::{Memory, MemoryError},
     registers::Registers,
 };
+use math::field::element::FieldElement;
+use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
+use math::field::goldilocks::{GOLDILOCKS_PRIME, GoldilocksElement};
 
 const REGULAR_PC_UPDATE: u64 = 4;
 
@@ -16,6 +19,12 @@ pub enum SyscallNumbers {
     Halt = 93,
     // Placeholder discriminant. The actual syscall value is ECSM_SYSCALL_NUMBER.
     Ecsm = 94,
+    // Placeholder discriminant. The actual syscall value is FEXT_LOAD_SYSCALL_NUMBER.
+    FextLoad = 95,
+    // Placeholder discriminant. The actual syscall value is FEXT_FMA_SYSCALL_NUMBER.
+    FextFma = 96,
+    // Placeholder discriminant. The actual syscall value is FEXT_STORE_SYSCALL_NUMBER.
+    FextStore = 97,
 }
 
 /// Syscall number for KeccakPermute (u64::MAX - 1 = 0xFFFF_FFFF_FFFF_FFFE).
@@ -31,6 +40,21 @@ const KECCAK_STATE_BYTES: u64 = 25 * 8;
 /// bus as `[lo32, hi32] = [2^32 - 11, 2^32 - 1]`.
 pub const ECSM_SYSCALL_NUMBER: u64 = u64::MAX - 10;
 
+/// Syscall number for `FEXT_LOAD` (spec ECALL `-20`): load a degree-3 extension
+/// field element from three registers into field-storage. Unsigned it is
+/// `u64::MAX - 19`, placed on the `Ecall` bus as `[2^32 - 20, 2^32 - 1]`.
+pub const FEXT_LOAD_SYSCALL_NUMBER: u64 = u64::MAX - 19;
+
+/// Syscall number for `FEXT_FMA` (spec ECALL `-21`): compute `a*b + c` over the
+/// native degree-3 Goldilocks extension. Unsigned it is `u64::MAX - 20`, placed
+/// on the `Ecall` bus as `[2^32 - 21, 2^32 - 1]`.
+pub const FEXT_FMA_SYSCALL_NUMBER: u64 = u64::MAX - 20;
+
+/// Syscall number for `FEXT_STORE` (ECALL `-22`): read a degree-3 extension
+/// element from field-storage and write its three coefficients to RAM (the
+/// read-back companion to FEXT_LOAD). Unsigned it is `u64::MAX - 21`.
+pub const FEXT_STORE_SYSCALL_NUMBER: u64 = u64::MAX - 21;
+
 /// `2^32`. ECSM memory operands must not overflow their lower 32-bit address limb when the
 /// largest per-access offset is added: the 32-byte operands reach offset +31 (last byte).
 const LOW_LIMB: u64 = 1 << 32;
@@ -45,6 +69,9 @@ impl TryFrom<u64> for SyscallNumbers {
             93 => Ok(SyscallNumbers::Halt),
             v if v == KECCAK_SYSCALL_NUMBER => Ok(SyscallNumbers::KeccakPermute),
             v if v == ECSM_SYSCALL_NUMBER => Ok(SyscallNumbers::Ecsm),
+            v if v == FEXT_LOAD_SYSCALL_NUMBER => Ok(SyscallNumbers::FextLoad),
+            v if v == FEXT_FMA_SYSCALL_NUMBER => Ok(SyscallNumbers::FextFma),
+            v if v == FEXT_STORE_SYSCALL_NUMBER => Ok(SyscallNumbers::FextStore),
             _ => Err(()),
         }
     }
@@ -55,6 +82,9 @@ impl TryFrom<u64> for SyscallNumbers {
 pub enum Accelerator {
     Keccak,
     Ecsm,
+    FextLoad,
+    FextFma,
+    FextStore,
 }
 
 impl SyscallNumbers {
@@ -65,6 +95,9 @@ impl SyscallNumbers {
         match self {
             SyscallNumbers::KeccakPermute => Some(Accelerator::Keccak),
             SyscallNumbers::Ecsm => Some(Accelerator::Ecsm),
+            SyscallNumbers::FextLoad => Some(Accelerator::FextLoad),
+            SyscallNumbers::FextFma => Some(Accelerator::FextFma),
+            SyscallNumbers::FextStore => Some(Accelerator::FextStore),
             SyscallNumbers::Print
             | SyscallNumbers::Panic
             | SyscallNumbers::Commit
@@ -96,6 +129,28 @@ fn store_u256_le(memory: &mut Memory, addr: u64, bytes: &[u8; 32]) -> Result<(),
 /// Checks the ECSM address-alignment assumption: `(addr mod 2^32) + max_offset < 2^32`.
 fn ecsm_addr_ok(addr: u64, max_offset: u64) -> bool {
     (addr % LOW_LIMB) + max_offset < LOW_LIMB
+}
+
+/// Computes `a*b + c` over the native degree-3 Goldilocks extension
+/// `Fp[x]/(x^3 - 2)`, returning canonical coefficients. Inputs must already be
+/// canonical (`< p`). Matches `Degree3GoldilocksExtensionField::mul`, so the
+/// executor and the FEXT prover chip (and its trace builder) agree bit-for-bit.
+pub fn fext_fma(a: [u64; 3], b: [u64; 3], c: [u64; 3]) -> [u64; 3] {
+    type Fp3 = FieldElement<Degree3GoldilocksExtensionField>;
+    let to_fp3 = |x: [u64; 3]| {
+        Fp3::from_raw([
+            GoldilocksElement::from(x[0]),
+            GoldilocksElement::from(x[1]),
+            GoldilocksElement::from(x[2]),
+        ])
+    };
+    let res = to_fp3(a) * to_fp3(b) + to_fp3(c);
+    let coeffs = res.value();
+    [
+        coeffs[0].canonical_u64(),
+        coeffs[1].canonical_u64(),
+        coeffs[2].canonical_u64(),
+    ]
 }
 
 impl Instruction {
@@ -454,6 +509,64 @@ impl Instruction {
                         src2_val = addr_xg;
                         dst_val = addr_k;
                     }
+                    SyscallNumbers::FextLoad => {
+                        // FEXT_LOAD(-20): store a degree-3 extension element into
+                        // field-storage. x10 = destination field-storage address;
+                        // x11/x12/x13 = the three coefficients (native u64 form,
+                        // each must be a canonical Goldilocks element `< p`).
+                        let addr = registers.read(10)?;
+                        let mut coeffs = [0u64; 3];
+                        for (i, slot) in coeffs.iter_mut().enumerate() {
+                            let v = registers.read(11 + i as u32)?;
+                            if v >= GOLDILOCKS_PRIME {
+                                return Err(ExecutionError::FextCoefficientNotCanonical(v));
+                            }
+                            *slot = v;
+                        }
+                        memory.field_store(addr, coeffs);
+                        src2_val = addr;
+                    }
+                    SyscallNumbers::FextFma => {
+                        // FEXT_FMA(-21): output = a*b + c over Fp[x]/(x^3-2).
+                        // Per spec: x10/x11/x12 = addresses of a/b/c, x13 = output
+                        // address, all in field-storage.
+                        let a_addr = registers.read(10)?;
+                        let b_addr = registers.read(11)?;
+                        let c_addr = registers.read(12)?;
+                        let out_addr = registers.read(13)?;
+                        // The chip uses a single timestamp for all field-storage
+                        // accesses, so the four cells must be pairwise distinct:
+                        // otherwise the same (domain, address) is touched twice at
+                        // one timestamp and the memory argument can't prove the
+                        // access chain. (This forbids in-place `out == a` and
+                        // squaring `a == b`.)
+                        let addrs = [out_addr, a_addr, b_addr, c_addr];
+                        for i in 0..addrs.len() {
+                            for j in (i + 1)..addrs.len() {
+                                if addrs[i] == addrs[j] {
+                                    return Err(ExecutionError::FextOperandOverlap);
+                                }
+                            }
+                        }
+                        let a = memory.field_load(a_addr);
+                        let b = memory.field_load(b_addr);
+                        let c = memory.field_load(c_addr);
+                        memory.field_store(out_addr, fext_fma(a, b, c));
+                        src2_val = a_addr;
+                        dst_val = b_addr;
+                    }
+                    SyscallNumbers::FextStore => {
+                        // FEXT_STORE(-22): read a degree-3 extension element from
+                        // field-storage (a0 = source address) and write its three
+                        // coefficients back to registers a1/a2/a3 (the read-back
+                        // companion to FEXT_LOAD, which reads coeffs from a1/a2/a3).
+                        let src_addr = registers.read(10)?;
+                        let coeffs = memory.field_load(src_addr);
+                        registers.write(11, coeffs[0])?;
+                        registers.write(12, coeffs[1])?;
+                        registers.write(13, coeffs[2])?;
+                        src2_val = src_addr;
+                    }
                     SyscallNumbers::Halt => {
                         // halt
                         return Ok(Log {
@@ -636,6 +749,10 @@ pub enum ExecutionError {
     EcsmOperandOverlap,
     #[error("ECSM scalar multiplication error: {0}")]
     Ecsm(#[from] ecsm::EcsmError),
+    #[error("FEXT_LOAD coefficient is not a canonical field element: {0:#018x}")]
+    FextCoefficientNotCanonical(u64),
+    #[error("FEXT_FMA operand/output addresses must be pairwise distinct")]
+    FextOperandOverlap,
 }
 
 // =============================================================================

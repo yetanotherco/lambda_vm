@@ -11,6 +11,18 @@ use crate::tables::commit::{bus_interactions as commit_buses, cols::NUM_COLUMNS 
 use crate::tables::cpu::{bus_interactions as cpu_buses, cols::NUM_COLUMNS as CPU_COLS};
 use crate::tables::decode::{bus_interactions as decode_buses, cols::NUM_COLUMNS as DECODE_COLS};
 use crate::tables::dvrm::{bus_interactions as dvrm_buses, cols::NUM_COLUMNS as DVRM_COLS};
+use crate::tables::fext_fma::{
+    bus_interactions as fext_fma_buses, cols::NUM_COLUMNS as FEXT_FMA_COLS,
+};
+use crate::tables::fext_load::{
+    bus_interactions as fext_load_buses, cols::NUM_COLUMNS as FEXT_LOAD_COLS,
+};
+use crate::tables::fext_page::{
+    bus_interactions as fext_page_buses, cols::NUM_COLUMNS as FEXT_PAGE_COLS,
+};
+use crate::tables::fext_store::{
+    bus_interactions as fext_store_buses, cols::NUM_COLUMNS as FEXT_STORE_COLS,
+};
 use crate::tables::halt::{bus_interactions as halt_buses, cols::NUM_COLUMNS as HALT_COLS};
 use crate::tables::load::{bus_interactions as load_buses, cols::NUM_COLUMNS as LOAD_COLS};
 use crate::tables::lt::{bus_interactions as lt_buses, cols::NUM_COLUMNS as LT_COLS};
@@ -175,6 +187,31 @@ fn table_specs(lengths: &TableLengths) -> Vec<TableSpec> {
             lengths.commit_padded_rows,
             COMMIT_COLS as u64,
             aux_cols(commit_buses().len()),
+            1,
+        ),
+        // FEXT accelerator tables (non-preprocessed, one main tree each).
+        (
+            lengths.fext_load_padded_rows,
+            FEXT_LOAD_COLS as u64,
+            aux_cols(fext_load_buses().len()),
+            1,
+        ),
+        (
+            lengths.fext_fma_padded_rows,
+            FEXT_FMA_COLS as u64,
+            aux_cols(fext_fma_buses().len()),
+            1,
+        ),
+        (
+            lengths.fext_store_padded_rows,
+            FEXT_STORE_COLS as u64,
+            aux_cols(fext_store_buses().len()),
+            1,
+        ),
+        (
+            lengths.fext_page_padded_rows,
+            FEXT_PAGE_COLS as u64,
+            aux_cols(fext_page_buses().len()),
             1,
         ),
         // BITWISE / DECODE / PAGE / REGISTER take the preprocessed-trace commit

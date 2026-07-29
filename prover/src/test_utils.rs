@@ -64,6 +64,18 @@ use crate::tables::ecsm::{
     EcsmConstraints, bus_interactions as ecsm_bus_interactions, cols as ecsm_cols,
 };
 use crate::tables::eq::{EqConstraints, bus_interactions as eq_bus_interactions, cols as eq_cols};
+use crate::tables::fext_fma::{
+    FextFmaConstraints, bus_interactions as fext_fma_bus_interactions, cols as fext_fma_cols,
+};
+use crate::tables::fext_load::{
+    FextLoadConstraints, bus_interactions as fext_load_bus_interactions, cols as fext_load_cols,
+};
+use crate::tables::fext_page::{
+    FextPageConstraints, bus_interactions as fext_page_bus_interactions, cols as fext_page_cols,
+};
+use crate::tables::fext_store::{
+    FextStoreConstraints, bus_interactions as fext_store_bus_interactions, cols as fext_store_cols,
+};
 use crate::tables::halt::{bus_interactions as halt_bus_interactions, cols as halt_cols};
 use crate::tables::keccak::{
     KeccakConstraints, bus_interactions as keccak_bus_interactions, cols as keccak_cols,
@@ -945,5 +957,53 @@ pub fn create_ecdas_air(proof_options: &ProofOptions) -> ConcreteVmAir<EcdasCons
         1,
         EcdasConstraints,
         "ECDAS",
+    )
+}
+
+/// Create FEXT_LOAD AIR.
+pub fn create_fext_load_air(proof_options: &ProofOptions) -> ConcreteVmAir<FextLoadConstraints> {
+    build_air(
+        fext_load_cols::NUM_COLUMNS,
+        fext_load_bus_interactions(),
+        proof_options,
+        1,
+        FextLoadConstraints,
+        "FEXT_LOAD",
+    )
+}
+
+/// Create FEXT_FMA AIR.
+pub fn create_fext_fma_air(proof_options: &ProofOptions) -> ConcreteVmAir<FextFmaConstraints> {
+    build_air(
+        fext_fma_cols::NUM_COLUMNS,
+        fext_fma_bus_interactions(),
+        proof_options,
+        1,
+        FextFmaConstraints,
+        "FEXT_FMA",
+    )
+}
+
+/// Create FEXT_STORE AIR.
+pub fn create_fext_store_air(proof_options: &ProofOptions) -> ConcreteVmAir<FextStoreConstraints> {
+    build_air(
+        fext_store_cols::NUM_COLUMNS,
+        fext_store_bus_interactions(),
+        proof_options,
+        1,
+        FextStoreConstraints,
+        "FEXT_STORE",
+    )
+}
+
+/// Create FEXT_PAGE AIR (field-storage init/finalization bookend).
+pub fn create_fext_page_air(proof_options: &ProofOptions) -> ConcreteVmAir<FextPageConstraints> {
+    build_air(
+        fext_page_cols::NUM_COLUMNS,
+        fext_page_bus_interactions(),
+        proof_options,
+        1,
+        FextPageConstraints,
+        "FEXT_PAGE",
     )
 }

@@ -277,6 +277,17 @@ pub trait ConstraintSet<F: IsField, E: IsField>: Send + Sync {
         2
     }
 
+    /// Main-trace columns this set reads on the NEXT row (via `main(1, col)`).
+    /// The verifier opens OOD next-row evaluations only for these columns (unioned
+    /// with the LogUp accumulator); an undeclared next-row read is pruned and
+    /// reconstructed as zero, silently corrupting this table's transition eval.
+    /// Statically declared so the verify/recursion path never materializes the IR;
+    /// a test asserts the IR's actual next-row reads are a subset of this. Default
+    /// empty (most tables read only the current row).
+    fn next_row_columns(&self) -> Vec<usize> {
+        Vec::new()
+    }
+
     /// Idx-ordered metadata, derived by running [`Self::eval`] through a
     /// [`MetaBuilder`] (which records the `{kind, end_exemptions}` at each
     /// `emit_*`). Never overridden — the body is the source.

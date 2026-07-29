@@ -47,6 +47,18 @@ pub mod ecsm_tests;
 #[cfg(test)]
 pub mod eq_tests;
 #[cfg(test)]
+pub mod fext_fma_tests;
+#[cfg(test)]
+pub mod fext_load_tests;
+#[cfg(test)]
+pub mod fext_local_to_global_tests;
+#[cfg(test)]
+pub mod fext_page_tests;
+#[cfg(test)]
+pub mod fext_store_tests;
+#[cfg(test)]
+pub mod global_field_memory_tests;
+#[cfg(test)]
 pub mod keccak_rnd_tests;
 #[cfg(test)]
 pub mod load_tests;

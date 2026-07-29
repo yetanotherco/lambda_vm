@@ -18,6 +18,7 @@ use crate::{
     table::Table,
 };
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
+use crypto::field_ext::Fp3Fma;
 use crypto::merkle_tree::proof::{verify_merkle_path, verify_merkle_path_from_leaf_hash};
 #[cfg(not(feature = "test_fiat_shamir"))]
 use log::error;
@@ -39,7 +40,7 @@ use std::time::Instant;
 /// A default STARK verifier implementing `IsStarkVerifier`.
 pub struct Verifier<
     Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
-    FieldExtension: Send + Sync + IsField,
+    FieldExtension: Send + Sync + IsField + Fp3Fma,
     PI,
 > {
     phantom: PhantomData<(Field, FieldExtension, PI)>,
@@ -47,7 +48,7 @@ pub struct Verifier<
 
 impl<
     Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
-    FieldExtension: IsField + Send + Sync,
+    FieldExtension: IsField + Send + Sync + Fp3Fma,
     PI,
 > IsStarkVerifier<Field, FieldExtension, PI> for Verifier<Field, FieldExtension, PI>
 where
@@ -62,7 +63,7 @@ where
 /// to validate the proof-of-work nonce.
 pub struct Challenges<FieldExtension>
 where
-    FieldExtension: Send + Sync + IsField,
+    FieldExtension: Send + Sync + IsField + Fp3Fma,
 {
     /// The out-of-domain challenge.
     pub z: FieldElement<FieldExtension>,
@@ -90,7 +91,7 @@ pub type DeepPolynomialEvaluations<F> = (Vec<FieldElement<F>>, Vec<FieldElement<
 /// single proof (see `compute_query_invariant_deep_terms`).
 pub struct QueryInvariantDeepTerms<FieldExtension>
 where
-    FieldExtension: Send + Sync + IsField,
+    FieldExtension: Send + Sync + IsField + Fp3Fma,
 {
     /// `ood_row_sum[row] = sum_col trace_term_coeffs[col][row] * ood(row, col)`,
     /// over the reconstructed full OOD grid (g·z-pruned positions are zero).
@@ -122,7 +123,7 @@ compile_error!("the zero-copy STARK verifier requires a little-endian target");
 /// downstream check — no serialization, no duplicated logic.
 pub trait IsStarkVerifier<
     Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
-    FieldExtension: Send + Sync + IsField,
+    FieldExtension: Send + Sync + IsField + Fp3Fma,
     PI,
 > where
     Field::BaseType: math::field::element::NativeArchived,
@@ -782,13 +783,21 @@ pub trait IsStarkVerifier<
             let mut sum = FieldElement::<FieldExtension>::zero();
             if row_idx < step_size {
                 for col_idx in 0..ood_evaluations_table_width {
-                    sum += &trace_term_coeffs[col_idx][row_idx] * &ood_row[col_idx];
+                    sum = FieldExtension::fma(
+                        &trace_term_coeffs[col_idx][row_idx],
+                        &ood_row[col_idx],
+                        &sum,
+                    );
                 }
             } else {
                 // Next-row row: off-window columns contribute coeff·0 with a
                 // zero coeff too, so the window-only sum is exact.
                 for &col_idx in next_row_cols {
-                    sum += &trace_term_coeffs[col_idx][row_idx] * &ood_row[col_idx];
+                    sum = FieldExtension::fma(
+                        &trace_term_coeffs[col_idx][row_idx],
+                        &ood_row[col_idx],
+                        &sum,
+                    );
                 }
             }
             ood_row_sum.push(sum);
@@ -806,7 +815,7 @@ pub trait IsStarkVerifier<
         }
         let mut h_sum_zpow = FieldElement::<FieldExtension>::zero();
         for (h_i_zpower, gamma) in composition_parts_ood.iter().zip(challenges.gammas.iter()) {
-            h_sum_zpow += h_i_zpower * gamma;
+            h_sum_zpow = FieldExtension::fma(h_i_zpower, gamma, &h_sum_zpow);
         }
 
         Some(QueryInvariantDeepTerms {
@@ -999,19 +1008,35 @@ pub trait IsStarkVerifier<
         let mut trace_term_sym = FieldElement::<FieldExtension>::zero();
         for row_idx in 0..ood_evaluations_table_height {
             let ood_row_sum = &query_invariant_terms.ood_row_sum[row_idx];
+            // Base columns (the cheap asymmetric F * E product) accumulate
+            // natively; aux columns (the Ext * Ext product) fold through a
+            // resident accumulator kept in field-storage on the accelerated
+            // guest — regular on slot 0, symmetric on slot 1 — so the running
+            // aux sum is never stored/reloaded per column. Splitting the two
+            // reorders the row sum, which is exact (field addition is
+            // associative/commutative).
             let mut base_row_sum = FieldElement::<FieldExtension>::zero();
             let mut base_row_sum_sym = FieldElement::<FieldExtension>::zero();
+            let mut aux_acc = FieldExtension::mul_acc_new(0);
+            let mut aux_acc_sym = FieldExtension::mul_acc_new(1);
             if row_idx < step_size {
                 for (col_idx, coeff_col) in trace_term_coeffs.iter().enumerate() {
                     let coeff = &coeff_col[row_idx];
                     if col_idx < num_base {
-                        // F: IsSubFieldOf<E> gives the cheap asymmetric F * E -> E product.
                         base_row_sum += base_at(col_idx) * coeff;
                         base_row_sum_sym += base_at_sym(col_idx) * coeff;
                     } else {
                         let aux_idx = col_idx - num_base;
-                        base_row_sum += coeff * &lde_trace_aux_evaluations[aux_idx];
-                        base_row_sum_sym += coeff * &lde_trace_aux_evaluations_sym[aux_idx];
+                        FieldExtension::mul_acc_add(
+                            &mut aux_acc,
+                            coeff,
+                            &lde_trace_aux_evaluations[aux_idx],
+                        );
+                        FieldExtension::mul_acc_add(
+                            &mut aux_acc_sym,
+                            coeff,
+                            &lde_trace_aux_evaluations_sym[aux_idx],
+                        );
                     }
                 }
             } else {
@@ -1027,13 +1052,27 @@ pub trait IsStarkVerifier<
                         base_row_sum_sym += base_at_sym(col_idx) * coeff;
                     } else {
                         let aux_idx = col_idx - num_base;
-                        base_row_sum += coeff * &lde_trace_aux_evaluations[aux_idx];
-                        base_row_sum_sym += coeff * &lde_trace_aux_evaluations_sym[aux_idx];
+                        FieldExtension::mul_acc_add(
+                            &mut aux_acc,
+                            coeff,
+                            &lde_trace_aux_evaluations[aux_idx],
+                        );
+                        FieldExtension::mul_acc_add(
+                            &mut aux_acc_sym,
+                            coeff,
+                            &lde_trace_aux_evaluations_sym[aux_idx],
+                        );
                     }
                 }
             }
-            trace_term += &denoms_trace[row_idx] * &(&base_row_sum - ood_row_sum);
-            trace_term_sym += &denoms_trace_sym[row_idx] * &(&base_row_sum_sym - ood_row_sum);
+            let base_row_sum = &base_row_sum + &FieldExtension::prod_acc_finish(aux_acc);
+            let base_row_sum_sym =
+                &base_row_sum_sym + &FieldExtension::prod_acc_finish(aux_acc_sym);
+            let trace_diff = &base_row_sum - ood_row_sum;
+            trace_term = FieldExtension::fma(&denoms_trace[row_idx], &trace_diff, &trace_term);
+            let trace_diff_sym = &base_row_sum_sym - ood_row_sum;
+            trace_term_sym =
+                FieldExtension::fma(&denoms_trace_sym[row_idx], &trace_diff_sym, &trace_term_sym);
         }
 
         let number_of_parts = query_invariant_terms.number_of_parts;
@@ -1057,11 +1096,17 @@ pub trait IsStarkVerifier<
             let h_i_upsilon = &lde_composition_poly_parts_evaluation[j];
             let h_i_upsilon_sym = &lde_composition_poly_parts_evaluation_sym[j];
             let gamma = &challenges.gammas[j];
-            h_sum += h_i_upsilon * gamma;
-            h_sum_sym += h_i_upsilon_sym * gamma;
+            h_sum = FieldExtension::fma(h_i_upsilon, gamma, &h_sum);
+            h_sum_sym = FieldExtension::fma(h_i_upsilon_sym, gamma, &h_sum_sym);
         }
-        let h_terms = (&h_sum - &query_invariant_terms.h_sum_zpow) * denom_composition;
-        let h_terms_sym = (&h_sum_sym - &query_invariant_terms.h_sum_zpow) * denom_composition_sym;
+        let h_terms = FieldExtension::ext_mul(
+            &(&h_sum - &query_invariant_terms.h_sum_zpow),
+            &denom_composition,
+        );
+        let h_terms_sym = FieldExtension::ext_mul(
+            &(&h_sum_sym - &query_invariant_terms.h_sum_zpow),
+            &denom_composition_sym,
+        );
 
         Some((trace_term + h_terms, trace_term_sym + h_terms_sym))
     }
