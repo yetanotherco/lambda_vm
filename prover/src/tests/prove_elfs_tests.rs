@@ -1279,18 +1279,24 @@ fn test_prove_hint_multi_rust_guest() {
     assert_eq!(proof.public_output, expected.to_vec());
 }
 
-/// Soundness (BENCH ONLY): the verifier REJECTS a forged hint output.
+/// Consistency (BENCH ONLY): the verifier REJECTS a HINT row that disagrees with the
+/// MEMW rows.
 ///
 /// The HINT table's `out_bytes` are unconstrained *by the table* — the point of a
-/// non-constraining hint. They are pinned instead by the memory argument: the HINT
-/// table *sends* the output as MEMW writes, and the MEMW table *receives* the honest
-/// values `collect_hint_ops` derived (recomputed from the input, written into
-/// `memory_state`). Forge one output byte on the (single) real HINT row and the MEMW
-/// write it sends no longer matches the received write → the Memw LogUp bus unbalances
-/// → the proof must fail to verify. This is what makes the hint value load-bearing
-/// even though the guest here does no in-circuit verify. Mirrors the ECSM analog.
+/// non-constraining hint. Editing one output byte on the (single) real HINT row makes
+/// the MEMW write it sends stop matching the write the MEMW table received (the honest
+/// value `collect_hint_ops` derived), so the Memw LogUp bus unbalances and the proof
+/// must fail to verify.
+///
+/// What this covers is an *internally inconsistent* trace — the failure mode of a buggy
+/// trace builder. It is **not** a forgery test: a prover that edits the HINT row and the
+/// corresponding MEMW rows together satisfies every constraint, because nothing in the
+/// AIR pins *which* value was hinted. That guarantee lives in the guest's verify
+/// (`x·inv == 1`, `y² == x³+7`), which this minimal guest deliberately omits. What the
+/// AIR does pin is *where* the value lands and that it is 32 bytes — see
+/// `test_hint_binds_out_addr_to_x12` and `test_hint_range_checks_its_output_bytes`.
 #[test]
-fn test_prove_hint_min_forged_result_rejected() {
+fn test_prove_hint_min_inconsistent_output_rejected() {
     use crate::tables::hint::cols as hint_cols;
 
     let _ = env_logger::builder().is_test(true).try_init();
@@ -1316,6 +1322,129 @@ fn test_prove_hint_min_forged_result_rejected() {
     assert!(
         !prove_and_verify_vm_minimal(&elf, &mut traces),
         "Verifier must reject a forged hint output byte"
+    );
+}
+
+/// Column a bus value reads, for the structural HINT tests below.
+fn hint_bus_column(v: &stark::lookup::BusValue) -> Option<usize> {
+    match v {
+        stark::lookup::BusValue::Packed { start_column, .. } => Some(*start_column),
+        stark::lookup::BusValue::Linear(_) => None,
+    }
+}
+
+/// Constant a bus value holds, for the structural HINT tests below.
+fn hint_bus_constant(v: &stark::lookup::BusValue) -> Option<i64> {
+    match v {
+        stark::lookup::BusValue::Linear(terms) => match terms.as_slice() {
+            [stark::lookup::LinearTerm::Constant(c)] => Some(*c),
+            _ => None,
+        },
+        stark::lookup::BusValue::Packed { .. } => None,
+    }
+}
+
+/// Soundness: the HINT table must bind its output address to `x12` (the ecall's `a2`).
+///
+/// The four output writes take their base from `ADDR_OUT_0`, an ordinary column in a
+/// table with no algebraic constraints, so the register read asserted here is the only
+/// thing pinning that column to the register the CPU actually held. Without it the
+/// witness chooses *where* the 32 hinted bytes land — an arbitrary memory write, which
+/// is a strictly larger hole than the unconstrained value the table is designed around.
+///
+/// Asserted structurally rather than by tampering: editing `ADDR_OUT_0` in a trace also
+/// unbalances the honest MEMW rows, so a tamper test passes either way and would not
+/// notice this interaction being dropped.
+#[test]
+fn test_hint_binds_out_addr_to_x12() {
+    use crate::tables::hint::{bus_interactions, cols as hint_cols};
+    use crate::tables::types::BusId;
+    use stark::lookup::Multiplicity;
+
+    let memw_id = u64::from(BusId::Memw);
+    let reads: Vec<_> = bus_interactions()
+        .into_iter()
+        .filter(|i| i.bus_id == memw_id && i.is_sender && i.values.len() == 24)
+        .collect();
+    assert_eq!(
+        reads.len(),
+        1,
+        "HINT must send exactly one MEMW register read (out_addr → x12)"
+    );
+    let v = &reads[0].values;
+
+    // CO24 read layout: old[8], is_register, base_lo, base_hi, value[8], ts_lo, ts_hi,
+    // w2, w4, w8.
+    assert_eq!(hint_bus_constant(&v[8]), Some(1), "is_register must be 1");
+    assert_eq!(
+        hint_bus_constant(&v[9]),
+        Some(2 * 12),
+        "register address must be x12 (the ecall's a2)"
+    );
+    assert_eq!(hint_bus_constant(&v[10]), Some(0), "address hi must be 0");
+    assert_eq!(
+        hint_bus_constant(&v[21]),
+        Some(1),
+        "w2 must be 1 for a 2-word register access"
+    );
+    for (slot, col) in [(0, hint_cols::ADDR_OUT_0), (1, hint_cols::ADDR_OUT_1)] {
+        assert_eq!(
+            hint_bus_column(&v[slot]),
+            Some(col),
+            "old[{slot}] must carry out_addr"
+        );
+        assert_eq!(
+            hint_bus_column(&v[11 + slot]),
+            Some(col),
+            "value[{slot}] must carry out_addr (a read leaves the register unchanged)"
+        );
+    }
+    assert!(
+        matches!(reads[0].multiplicity, Multiplicity::Column(c) if c == hint_cols::MU),
+        "the register read must be gated by mu, like every other HINT interaction"
+    );
+}
+
+/// Soundness: the HINT table must range-check all 32 output cells as bytes.
+///
+/// The cells are free columns that enter memory as MEMW write values, and MEMW
+/// range-checks nothing it receives — every table that writes fresh values into memory
+/// (STORE, KECCAK, ECSM, PAGE) checks its own cells for that reason. The hinted value is
+/// allowed to be wrong; it is not allowed to be a field element outside `[0, 256)`, or
+/// the witness can smuggle non-bytes into memory and break the byte decomposition that
+/// loads and the ALU rely on.
+#[test]
+fn test_hint_range_checks_its_output_bytes() {
+    use crate::tables::hint::{bus_interactions, cols as hint_cols};
+    use crate::tables::types::BusId;
+    use stark::lookup::Multiplicity;
+
+    let are_bytes_id = u64::from(BusId::AreBytes);
+    let checks: Vec<_> = bus_interactions()
+        .into_iter()
+        .filter(|i| i.bus_id == are_bytes_id)
+        .collect();
+    assert_eq!(checks.len(), 16, "32 output cells, paired two per lookup");
+
+    let mut covered = std::collections::BTreeSet::new();
+    for check in &checks {
+        assert!(check.is_sender, "range checks are sends; BITWISE receives");
+        assert_eq!(check.values.len(), 2, "ARE_BYTES takes exactly two values");
+        assert!(
+            matches!(check.multiplicity, Multiplicity::Column(c) if c == hint_cols::MU),
+            "range checks must be gated by mu, or padding rows unbalance BITWISE"
+        );
+        for v in &check.values {
+            covered
+                .insert(hint_bus_column(v).expect("a range check must reference an output column"));
+        }
+    }
+
+    // 16 lookups × 2 slots = 32 slots; 32 distinct columns means each cell exactly once.
+    let expected: std::collections::BTreeSet<usize> = (0..32).map(hint_cols::out).collect();
+    assert_eq!(
+        covered, expected,
+        "every output cell must be range-checked exactly once"
     );
 }
 

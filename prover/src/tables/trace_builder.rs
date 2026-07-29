@@ -982,6 +982,24 @@ fn collect_hint_ops(
     let in_addr = register_state.read(11).0;
     let out_addr = register_state.read(12).0;
 
+    let mut memw_ops = Vec::with_capacity(5);
+
+    // Read x12 (out_addr) at ts. This is what ties the write addresses below to the
+    // ecall's a2: they are emitted from a HINT trace column, and only this memory-
+    // argument access pins that column to the register the CPU actually held.
+    // x10/x11 are not emitted on purpose — neither reaches the memory argument (the
+    // value is unconstrained by design and the input read is not modelled), so an
+    // access for them would be dead weight. See `tables::hint`.
+    {
+        let reg_value = pack_register_value(out_addr);
+        let (_old_val, old_ts) = register_state.read(12);
+        memw_ops.push(
+            MemwOperation::new(true, 2 * 12, reg_value, t, 2, true)
+                .with_old(reg_value, [old_ts, old_ts, 0, 0, 0, 0, 0, 0]),
+        );
+        register_state.write(12, out_addr, t);
+    }
+
     // Read the 32-byte big-endian input from the replayed memory.
     let mut input = [0u8; 32];
     for (i, b) in input.iter_mut().enumerate() {
@@ -992,7 +1010,6 @@ fn collect_hint_ops(
     let out_bytes = executor::vm::instruction::execution::compute_hint(hint_id, &input);
 
     // Emit the 32-byte output as four 8-byte MEMW writes at ts = T.
-    let mut memw_ops = Vec::with_capacity(4);
     for i in 0..4 {
         let addr = out_addr.wrapping_add((8 * i) as u64);
         let mut value = [0u32; 8];
@@ -2316,6 +2333,23 @@ fn collect_bitwise_from_commit(commit_ops: &[CommitOperation]) -> Vec<BitwiseOpe
     lookups
 }
 
+/// BITWISE lookups sent by the HINT table: `ARE_BYTES[out[2i], out[2i+1]]` for the
+/// 32 output cells, paired exactly as `hint::bus_interactions` pairs its senders, so
+/// the BITWISE receiver multiplicities account for them.
+fn collect_bitwise_from_hint(hint_ops: &[hint::HintOperation]) -> Vec<BitwiseOperation> {
+    let mut lookups = Vec::with_capacity(16 * hint_ops.len());
+    for op in hint_ops {
+        for i in 0..16 {
+            lookups.push(BitwiseOperation::byte_op(
+                BitwiseOperationType::AreBytes,
+                op.out_bytes[2 * i],
+                op.out_bytes[2 * i + 1],
+            ));
+        }
+    }
+    lookups
+}
+
 // =============================================================================
 // BITWISE lookup helpers
 // =============================================================================
@@ -3107,7 +3141,8 @@ fn build_traces<I: ImageSource + Sync>(
     // chunk size used to split them into instances so multiplicities match the per-instance
     // sends. MEMW_R sends IS_HALFWORD[timestamp_0 - old_timestamp_lo - 1]. PAGE does a
     // batched ARE_BYTES[init, fini] per row (skipped in continuation epochs, which the L2G
-    // table owns). COMMIT sends AreBytes+IsHalfword; KECCAK_RND sends XOR/AND/ARE_BYTES/HWSL.
+    // table owns). COMMIT sends AreBytes+IsHalfword; KECCAK_RND sends XOR/AND/ARE_BYTES/HWSL;
+    // HINT sends ARE_BYTES for its 32 output cells.
     // We never concatenate the lookups into one giant `Vec<BitwiseOperation>` (~140 M ops /
     // ~560 MB at 10-tx whose only consumer is the multiplicity count). Each collector bumps
     // the `BitwiseHistogram` it is handed: the heavy sources (MEMW_R one-per-row, PAGE
@@ -3146,6 +3181,7 @@ fn build_traces<I: ImageSource + Sync>(
         Box::new(|h| h.add_ops(&collect_bitwise_from_keccak(&keccak_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_ecsm(&ecsm_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_ecdas(&ecdas_ops))),
+        Box::new(|h| h.add_ops(&collect_bitwise_from_hint(&hint_ops))),
         Box::new(|h| add_padding_byte_checks(h, num_padding_rows)),
     ];
     if let Some(image) = initial_image
