@@ -1,0 +1,130 @@
+
+==============================================================================
+A — Ecdas2Row vs an independent transcription of idx 0..=27 (2^11 cases)
+==============================================================================
+   model 11 / chip 11 admitted assignments
+   [ PASS ] model ⊆ chip (no over-strong boolean constraint)
+   [ PASS ] chip ⊆ model (no omitted boolean constraint)
+   [ PASS ] `padding_gate` defaults to the chip (True), not to a weaker model
+            padding_gate=False still models the pre-fix chip (22 assignments vs 11) — ablations must now opt in explicitly.
+
+==============================================================================
+B — F4: where `OP = ΣS` (idx 14) is actually load-bearing
+==============================================================================
+   [ PASS ] the OLD N4b target (MU=0 padding row) is NOT a forgery on the chip
+            padding_gate=False (as N4b used to run): sat
+            padding_gate=True  (the chip as written): unsat
+            idx 24..=27 zero every selector on a MU=0 row regardless of idx 14.
+   [ PASS ] the NEW N4b target (live PH1=0 phases) IS a forgery
+            precompute (MU=1, PH1=PH2=0)   untampered unsat   ablate-14 sat
+            correction  (MU=1, PH2=1)      untampered unsat   ablate-14 sat
+            idx 14 stays — the conclusion survives; only the justification was wrong.
+
+==============================================================================
+C — F3: the PORT lemma now covers the prologue, conv_carry, and ECSM2
+==============================================================================
+   [ PASS ] untampered ECDAS/ECDAS2 port is clean
+            s_i::Lambda  s_i::Xr  s_i::Yr  s_i::prologue  conv_carry  rq  p_byte_expr  r_byte_expr  byte_at
+   [ PASS ] untampered ECSM/ECSM2 membership port is clean
+            s_i::X2  s_i::Yg  s_i::prologue  conv_carry  p_byte_expr  byte_at
+            This pair was never compared before; the soundness theorem's "P2 is on the curve" clause depends on it.
+   [ PASS ] a rebound operand column (xa → cols::XR) is DETECTED
+            flagged: ['s_i::prologue']
+            Every value lemma (L3a, L4a/b/c) is false on that chip. This tamper used to report all-identical.
+   [ PASS ] a broken carry recurrence (dropped c_prev) is DETECTED
+            L1's telescoping IS this recurrence; conv_carry was never compared before.
+   [ PASS ] a tampered ECSM2 membership relation is DETECTED
+            flagged: ['s_i::Yg']
+            Without `b` the y² relation no longer pins P2 to the curve.
+
+==============================================================================
+D — F2: the padding gate is parsed, and matched against the multiplicities
+==============================================================================
+   [ PASS ] untampered: gate present, and gated set == raw multiplicity set
+            gated              ['D1', 'D2', 'S1', 'S2', 'S3', 'S_CORR']
+            raw multiplicities ['D1', 'D2', 'S1', 'S2', 'S3', 'S_CORR']
+            unparsed           []
+   [ PASS ] deleting the defence while KEEPING its comment is DETECTED
+            reason: no `(1 - mu) * <column>` emission found
+            The old detector matched the comment, so this reported the defence present and scored N1 as a passing ablation.
+   [ PASS ] a digit send escaping the gate is DETECTED (the original bug's shape)
+            gated ['S1', 'S2', 'S3', 'S_CORR']
+            UNGATED MULTIPLICITY: ['D1', 'D2']
+   [ PASS ] a NEW ungated multiplicity column (NB) is DETECTED
+            UNGATED MULTIPLICITY: ['NB']
+            The invariant is an EQUALITY, so it fires on a new raw multiplicity as well as on a deleted gate. That is the direction the original JointBit bug arrived from.
+   [ PASS ] dropping Dinv from the emit loop is DETECTED
+            reason: the Dinv block is never emitted by `eval`
+            The old detector was `"D_INV" in src and "Dinv" in src`, which survives this untouched.
+
+==============================================================================
+E — F1: the D_INV gate is parsed and matched to the Addend receive
+==============================================================================
+   [ PASS ] untampered: gate expression == Addend receive multiplicity
+            gate    ['S1', 'S2', 'S3', 'S_CORR']
+            addend  ['S1', 'S2', 'S3', 'S_CORR']
+            applied as `g * s`: True   emitted: True
+   [ PASS ] dropping S_CORR from the gate is DETECTED
+            reason: gate ['S1', 'S2', 'S3'] != Addend receive ['S1', 'S2', 'S3', 'S_CORR']
+            gate ['S1', 'S2', 'S3'] vs addend ['S1', 'S2', 'S3', 'S_CORR']
+            (the PORT check still reports all-identical: True — it excludes the Dinv arm by design, which is exactly why the gate needed an invariant of its own.)
+
+   THE FORGERY (no discrete log — one point subtraction):
+      u1 = u2 = 1, len = 1, P2 = -2^(len+1)*T0 - G
+      P2 = (0x6d2601d3ba4652d07eec0066ed211b5cdbdf3c1cf8d0cbe07877b0871e15eb14,
+            0x15d65f47ef5cb786daaf7273f57fd2d9d80c4d9a8ac63e0bd716c5bad616431c)
+      correction row: xA == xB True, yA == yB True
+      lambda relation identically 0 (free lambda): True
+      honest  Q = (0x3f0bcb55c7dbd41b34aaa2e82d5503a722cbc385fd8aaf74a6505d1ae51e77b, ...)
+      forged  Q' family: 5 distinct, none honest: True
+   [ PASS ] with the real gate, the forged correction row is UNSATISFIABLE
+            d·(xB − xA) = 1 with xB = xA has no solution — the chip as written blocks it.
+
+==============================================================================
+F — the `JointSel → phase_bits/selector_bits` mapping, arm for arm
+==============================================================================
+   [ PASS ] the anchor's hand copy matches the chip's `match` arms
+            phase_bits        : MATCHES 
+            selector_bits     : MATCHES 
+            JointSel variants : MATCHES 6 variants, all mapped
+   [ PASS ] a changed phase_bits arm is DETECTED
+            chip now maps Correction → (1, 1) while the anchor's dict still says (0, 1), so `check_sel_maps` fails.
+            RESULTS §7 called this the anchor's last modelled step; it is now machine-checked.
+
+==============================================================================
+G — the detectors fail CLOSED on an unrecognised chip shape
+==============================================================================
+   [ PASS ] an unparsed gate shape reports ABSENT, not present
+            reason: no `(1 - mu) * <column>` emission found
+            A detector that guesses 'probably fine' is the failure mode this file exists to prevent.
+   [ PASS ] an opaque D_INV gate helper is not silently accepted
+            present=False  reason: the gate is not a plain sum of columns: `gate_expr(b) * b.main(0, cols::S1) + b.main(0, cols::S2) + b.main(0, cols::S3) + b.main(0,`
+            parsed gate columns ['S1', 'S2', 'S3', 'S_CORR']
+
+==============================================================================
+SUMMARY
+==============================================================================
+   [ PASS ] model ⊆ chip (no over-strong boolean constraint)
+   [ PASS ] chip ⊆ model (no omitted boolean constraint)
+   [ PASS ] `padding_gate` defaults to the chip (True), not to a weaker model
+   [ PASS ] the OLD N4b target (MU=0 padding row) is NOT a forgery on the chip
+   [ PASS ] the NEW N4b target (live PH1=0 phases) IS a forgery
+   [ PASS ] untampered ECDAS/ECDAS2 port is clean
+   [ PASS ] untampered ECSM/ECSM2 membership port is clean
+   [ PASS ] a rebound operand column (xa → cols::XR) is DETECTED
+   [ PASS ] a broken carry recurrence (dropped c_prev) is DETECTED
+   [ PASS ] a tampered ECSM2 membership relation is DETECTED
+   [ PASS ] untampered: gate present, and gated set == raw multiplicity set
+   [ PASS ] deleting the defence while KEEPING its comment is DETECTED
+   [ PASS ] a digit send escaping the gate is DETECTED (the original bug's shape)
+   [ PASS ] a NEW ungated multiplicity column (NB) is DETECTED
+   [ PASS ] dropping Dinv from the emit loop is DETECTED
+   [ PASS ] untampered: gate expression == Addend receive multiplicity
+   [ PASS ] dropping S_CORR from the gate is DETECTED
+   [ PASS ] with the real gate, the forged correction row is UNSATISFIABLE
+   [ PASS ] the anchor's hand copy matches the chip's `match` arms
+   [ PASS ] a changed phase_bits arm is DETECTED
+   [ PASS ] an unparsed gate shape reports ABSENT, not present
+   [ PASS ] an opaque D_INV gate helper is not silently accepted
+
+   22/22 checks pass

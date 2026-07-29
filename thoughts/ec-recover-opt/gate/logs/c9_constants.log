@@ -1,0 +1,69 @@
+==============================================================================
+C9 PROBE — compile-time curve constants of the joint chain
+==============================================================================
+T0 (NUMS, tag counter 1) = (0xaf319aa90f91a86b..., 0x1481a038143c0732...)
+instance: u1=0xb3d57a1e u2=0x4f2c9e07 P2=7*G  len=32  rows=61
+
+[baseline] honest EC_T0 table
+  per-row: 61 rows x (4 relations + 17 schedule) OK
+  Ecdas bus: 3 segments telescope seed -> drain, round hits -1
+  JointBit bus: 512 receives at 2*bit, balanced by the digit sends
+  Addend bus: N1=11 N2=9 N3=8, correction receive = 1 = OK
+  EcT0 bus: send key len=32 matches the table row it looks up
+  chain drains Q = MATCHES u1*G + u2*P2
+  => ACCEPTED, correct
+
+[tamper] A. SIGN FLIP  (table stores +2^len*T0; ec_t0.rs:28-41 warns about exactly this)
+  per-row: 61 rows x (4 relations + 17 schedule) OK
+  Ecdas bus: 3 segments telescope seed -> drain, round hits -1
+  JointBit bus: 512 receives at 2*bit, balanced by the digit sends
+  Addend bus: N1=11 N2=9 N3=8, correction receive = 1 = OK
+  EcT0 bus: send key len=32 matches the table row it looks up
+  Q_chain != Q_true            : True
+  Q_chain is a canonical point : True
+  Q_true  x = 0x722639f922da5252efe11c7444ad4a7071cb313f7d4ac68b16a5b18a9a5f7ba7
+  Q_chain x = 0xf2529f1a363bfe05e53f84ce9e375edce112b65f52d32c65246b509dcc4044eb
+  => ACCEPTED with a WRONG Q. Every constraint and every bus is
+     satisfied; the only thing that would have caught it is the
+     correctness of the preprocessed EC_T0 table itself.
+
+[tamper] B. OFF-BY-ONE (table row for len holds -2^(len+1)*T0; ec_t0.rs:143 index)
+  per-row: 61 rows x (4 relations + 17 schedule) OK
+  Ecdas bus: 3 segments telescope seed -> drain, round hits -1
+  JointBit bus: 512 receives at 2*bit, balanced by the digit sends
+  Addend bus: N1=11 N2=9 N3=8, correction receive = 1 = OK
+  EcT0 bus: send key len=32 matches the table row it looks up
+  Q_chain != Q_true            : True
+  Q_chain is a canonical point : True
+  Q_true  x = 0x722639f922da5252efe11c7444ad4a7071cb313f7d4ac68b16a5b18a9a5f7ba7
+  Q_chain x = 0x6c083e021ea8a269a1d3ff97b6a0601eee4fe6e00d267aa216c31a3770ca4d3a
+  => ACCEPTED with a WRONG Q. Every constraint and every bus is
+     satisfied; the only thing that would have caught it is the
+     correctness of the preprocessed EC_T0 table itself.
+
+[contrast] wrong GENERATOR_LE — anchored, therefore NOT a forgery
+  ecsm2.rs:612-629 reads P1 as 8 MEMW doublewords with CONSTANT values.
+  The tuple must match the memory token the guest wrote at a1, so a
+  GENERATOR_LE != G makes the Memw bus unbalance: rejection, not forgery.
+  (Executor-side it returns status 7 -> software fallback -> correct.)
+  T0 and the EC_T0 rows have NO such anchor: no guest write, no executor
+  read, no in-circuit curve check. They are pure AIR constants.
+
+==============================================================================
+RESULT: 2/2 tampered constant sets produce an accepted, wrong Q.
+The joint chain therefore rests on a contract the board does not name:
+  C9  the compile-time EC constants (T0, and the 256 EC_T0 rows bound by
+      the verifier's compiled-in preprocessed commitment) are the
+      intended, on-curve, mutually consistent values.
+Discharged today by TESTS + a static commitment, never by a constraint:
+  crypto/ecsm/src/tests/lincomb2_tests.rs::t0_is_on_curve_and_pinned
+  crypto/ecsm/src/tests/lincomb2_tests.rs::t0_derivation_matches
+  prover/src/tests/ec_t0_tests.rs::every_entry_is_on_curve_and_canonical
+  prover/src/tests/ec_t0_tests.rs::trace_rows_recompute_from_t0_by_doubling
+  prover/src/tests/ec_t0_tests.rs::table_matches_lincomb2_witness_correction_row
+  prover/src/tests/ec_t0_tests.rs::commitment_is_stable_and_matches_the_shipped_static_bytes
+Those tests are good and they close BOTH constructions above. The finding
+is not that the constants are wrong — it is that the board's contract list
+does not say they are load-bearing, so nothing tells a future reader that
+those tests are part of the soundness argument rather than hygiene.
+==============================================================================

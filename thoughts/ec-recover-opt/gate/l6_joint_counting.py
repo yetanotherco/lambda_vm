@@ -1,8 +1,8 @@
 """L6 — the lincomb2 joint-schedule counting argument, checked against the chips.
 
-Model transcribed by READING `prover/src/tables/ecdas2.rs` (217 constraints, the
-schedule-relevant ones are idx 0..=21) and `ecsm2.rs` (693 constraints; the bus
-wiring at :743-899). Convolution carries are out of scope here — they are the
+Model transcribed by READING `prover/src/tables/ecdas2.rs` (288 constraints, the
+schedule-relevant ones are idx 0..=27) and `ecsm2.rs` (693 constraints; the bus
+wiring at :543-923). Convolution carries are out of scope here — they are the
 width audit's subject (`../lincomb2/WIDTH-AUDIT.md`) — this file is about the
 SCHEDULE: which rows exist, in what order, and which digits they consume.
 
@@ -12,13 +12,21 @@ Sections:
         on live rows (round monotonicity, the add/addend agreement table).
   L6-B  the 2x JointBit multiplicity is strictly stronger than 1x — the 1x
         variant admits a WRONG ADDEND at a round where both digits are set.
-  L6-C  *** THE BREAK ***  padding rows (MU = 0) can send live JointBit
-        digits, because the send's multiplicity is `Column(D1)` and no
-        constraint ties D1/D2 to MU. Two phantom rows satisfy a round's 2x
+  L6-C  *** THE BREAK, NOW CLOSED ***  padding rows (MU = 0) could send live
+        JointBit digits, because the send's multiplicity is `Column(D1)` and no
+        constraint tied D1/D2 to MU. Two phantom rows satisfy a round's 2x
         count with NO add row on the chain — a set bit of u1 is "consumed"
-        without ever being added.
-  L6-D  the one-line fix (`D1·(1−MU) = 0`, `D2·(1−MU) = 0`, mirroring
-        `ecdas.rs` idx 4 `NEXT_OP·(1−MU) = 0`) turns L6-C UNSAT.
+        without ever being added. Reproduced here as the ABLATION of a defence
+        the chip now carries; L6-E is what it was worth.
+  L6-D  the fix — `(1−MU)·{D1, D2, S1, S2, S3, S_CORR} = 0`, mirroring
+        `ecdas.rs` idx 4 `NEXT_OP·(1−MU) = 0` — turns L6-C UNSAT. It LANDED as
+        `ecdas2.rs:988-1003`, idx 22..=27; `gate2_common.chip_state()` parses
+        the emitted expression and cross-checks the gated column set against the
+        columns that actually supply a bus multiplicity.
+
+Note this file keeps its own `Row` class rather than using
+`gate2_common.Ecdas2Row`: it is the historical derivation of the break, and it
+must be able to model the pre-fix chip.
 
 Run:  <venv>/bin/python l6_joint_counting.py
 """
@@ -67,13 +75,16 @@ class Row:
         s.add(self.ph2 * (self.sc - 1) == 0)                               # 21
 
         if fix_padding_gate:
-            # PROPOSED, mirroring ecdas.rs idx 4 (`NEXT_OP·(1−MU) = 0`).
+            # LANDED as ecdas2.rs idx 22, 23, mirroring ecdas.rs idx 4
+            # (`NEXT_OP·(1−MU) = 0`). The chip also gates the four selectors
+            # (idx 24..=27); only the digit half matters to this file.
             s.add((1 - self.mu) * self.d1 == 0)
             s.add((1 - self.mu) * self.d2 == 0)
 
     def sends_stream(self, stream):
         """Multiplicity of this row's JointBit send. NOT MU-gated in the chip:
-        `Multiplicity::Column(cols::D1)` (ecdas2.rs:459-470)."""
+        `Multiplicity::Column(cols::D1)` (ecdas2.rs:601-612). What makes a
+        padding row inert is idx 22, 23, not the send."""
         return self.d1 if stream == 1 else self.d2
 
 
@@ -225,15 +236,17 @@ def l6_c(fix=False):
               f"phantom rows {live} each send D1=1 at the same ROUND")
     print()
     if not fix:
-        print("   *** BREAK *** The JointBit send's multiplicity is")
-        print("   `Multiplicity::Column(cols::D1)` (ecdas2.rs:459-470) and NOTHING")
-        print("   ties D1/D2 to MU. A padding row is otherwise inert (its Ecdas,")
-        print("   Addend, AreBytes and IsHalfword interactions are all MU-gated)")
-        print("   but its digit send is LIVE. Two phantom rows per targeted round")
-        print("   satisfy the 2x count while the chain skips the add entirely.")
+        print("   *** BREAK (ablation) *** The JointBit send's multiplicity is")
+        print("   `Multiplicity::Column(cols::D1)` (ecdas2.rs:601-612) and, before")
+        print("   idx 22..=27, NOTHING tied D1/D2 to MU. A padding row is otherwise")
+        print("   inert (its Ecdas, AreBytes and IsHalfword interactions are all")
+        print("   MU-gated, its Addend receive is ΣS-gated) but its digit send was")
+        print("   LIVE. Two phantom rows per targeted round satisfy the 2x count")
+        print("   while the chain skips the add entirely.")
     else:
-        print("   With `D1·(1−MU) = 0` / `D2·(1−MU) = 0` added — the exact shape of")
-        print("   `ecdas.rs` idx 4 `NEXT_OP·(1−MU) = 0` — both queries go UNSAT.")
+        print("   With `(1−MU)·{D1, D2, S1, S2, S3, S_CORR} = 0` — the exact shape")
+        print("   of `ecdas.rs` idx 4 `NEXT_OP·(1−MU) = 0` — both queries go UNSAT.")
+        print("   This is `ecdas2.rs:988-1003`, idx 22..=27, in the chip today.")
 
     if fix:
         return v_row == unsat and v_sched == unsat
@@ -331,9 +344,16 @@ def main():
 
     from gate2_common import chip_state
     st = chip_state()
+    pad = st["padding_gate_detail"]
     hdr("SUMMARY")
-    print(f"   chip state: (1−MU)·D gate present = {st['padding_digit_gate']}, "
+    print(f"   chip state: (1−MU)·X gate present = {st['padding_digit_gate']}, "
           f"D_INV present = {st['dinv_relation']}")
+    print(f"   gated columns {sorted(pad['gated'])}")
+    print(f"   == raw bus multiplicities {sorted(pad['raw_multiplicity'])}: "
+          f"{pad['exact']}")
+    if pad["ungated_multiplicities"]:
+        print("   *** A BUS MULTIPLICITY HAS ESCAPED THE GATE: "
+              f"{sorted(pad['ungated_multiplicities'])} ***")
     print()
     print(f"   L6-A per-row schedule forcing      : {'PASS' if a else 'FAIL'}")
     print(f"   L6-B 2x multiplicity load-bearing  : {'CONFIRMED' if b else 'NOT CONFIRMED'}")

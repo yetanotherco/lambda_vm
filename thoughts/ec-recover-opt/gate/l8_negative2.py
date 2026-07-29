@@ -67,19 +67,30 @@ def control_1():
     with_gate = query(True)
     without = query(False)
     ok = with_gate == z3.unsat and without == z3.sat
+    pad = STATE["padding_gate_detail"]
 
     if not STATE["padding_digit_gate"]:
         verdict = "LIVE HOLE"
-        detail = ("the `(1−MU)·D` gate is NOT in the chip, so this is the current\n"
-                  "state rather than an ablation.\n"
+        detail = ("the `(1−MU)·X` gate is NOT in the chip — parsed from the emitted\n"
+                  f"expression, reason: {pad['reason']}\n"
+                  "so this is the current state rather than an ablation.\n"
                   f"blocked when the gate is added: {with_gate}   "
                   f"reachable without it: {without}")
+    elif pad["ungated_multiplicities"]:
+        # The gate exists but a bus multiplicity has escaped it. That is the
+        # original JointBit bug's exact shape, caught from the multiplicity side.
+        verdict = "LIVE HOLE"
+        detail = ("the gate is present but does NOT cover every raw bus\n"
+                  f"multiplicity. UNGATED: {sorted(pad['ungated_multiplicities'])}\n"
+                  "A MU=0 row can still fire those interactions.")
     else:
         verdict = "SAT — FORGES" if ok else "CONTROL BROKEN"
         detail = ("untampered (gate present, chip idx 22..=27): "
                   f"{with_gate} — blocked\n"
                   f"ablated: {without} — two MU=0 rows supply a round's 2x JointBit\n"
-                  "count while the chain skips the add entirely.")
+                  "count while the chain skips the add entirely.\n"
+                  f"gated columns == raw bus multiplicities: {pad['exact']} "
+                  f"({sorted(pad['gated'])})")
     report("N1  drop (1−MU)·D1/D2 — padding-row phantom digit", verdict, detail)
     return ok
 
@@ -141,20 +152,29 @@ def control_2():
     dinv_blocks = s.check() == z3.unsat
 
     ok = same_point and free and dinv_blocks
+    gate = STATE["dinv_gate_detail"]
     if not STATE["dinv_relation"]:
         verdict = "LIVE HOLE"
-        detail = ("`D_INV` is NOT in the chip, so this is the current state.\n"
+        detail = ("`D_INV` does not protect every addend-consuming row — parsed\n"
+                  f"from the Dinv arm, reason: {gate['reason']}\n"
+                  f"gate columns {sorted(gate['gate'])} vs Addend receive "
+                  f"{sorted(gate['addend'])}\n"
                   f"collision at round {r}: acc == addend as points: {same_point}\n"
                   f"λ relation satisfied by two different λ (unconstrained): {free}\n"
-                  f"with D_INV the row is unsatisfiable: {dinv_blocks}\n"
-                  f"cost to construct: one modular inversion + one scalar mul")
+                  f"with a correct D_INV gate the row is unsatisfiable: {dinv_blocks}\n"
+                  "cost to construct: one modular inversion + one scalar mul.\n"
+                  "NOTE a narrowed gate is a DIFFERENT forgery on whichever row\n"
+                  "type it drops — see TRANSCRIPTION-AUDIT.md F1 for the S_CORR\n"
+                  "case, which needs only one point subtraction.")
     else:
         verdict = "SAT — FORGES" if ok else "CONTROL BROKEN"
         detail = ("untampered (D_INV present, chip idx 223..=287): the row is\n"
                   f"unsatisfiable at the collision ({dinv_blocks}) — blocked\n"
                   f"ablated: acc == addend as points ({same_point}) and the λ\n"
                   f"relation admits two different λ ({free}) — forgery reappears\n"
-                  f"cost: one modular inversion + one scalar mul")
+                  "cost: one modular inversion + one scalar mul\n"
+                  f"gate expression == Addend receive multiplicity: "
+                  f"{gate['matches_addend']} ({sorted(gate['gate'])})")
     report("N2  drop D_INV — degenerate add / unconstrained λ", verdict, detail)
     return ok
 
@@ -211,24 +231,61 @@ def control_4():
 
 
 def control_4b():
-    """Drop `OP = ΣS`, on a row where PH1 = 0 (padding, or the two off-chain
-    phases). There idx 17/18/19 are all vacuous, so nothing else pins ΣS and a
-    spurious Addend receive is mintable."""
-    def query(ablate):
-        s = z3.Solver()
-        r = Ecdas2Row(s, "pad", ablate=ablate)
-        s.add(r.mu == 0, r.ph1 == 0, r.ph2 == 0, r.op == 0)
-        s.add(r.addend_receive() > 0)
-        return s.check()
+    """Drop `OP = ΣS` on a LIVE off-chain-phase row (precompute or correction).
 
-    blocked = query(())
-    ablated = query((14,))
-    ok = blocked == z3.unsat and ablated == z3.sat
-    report("N4b drop OP = ΣS — spurious Addend receive (PH1 = 0 rows)",
+    Corrected per `TRANSCRIPTION-AUDIT.md` F4. This control used to aim at a
+    `MU = 0` padding row and build it with `padding_gate=False`, i.e. against a
+    chip WITHOUT idx 22..=27; it reported `SAT — FORGES` for a forgery the real
+    chip blocks, because idx 24..=27 zero every selector on a padding row
+    regardless of idx 14. On the chip's real constraint set that query is UNSAT
+    both ways — recorded below as the `MU = 0` control line.
+
+    Where idx 14 IS load-bearing is the two live `PH1 = 0` phases, where idx
+    17/18/19 are vacuous: without it the precompute or correction row can be an
+    `OP = 0` doubling that still consumes its addend.
+    """
+    def query(ablate, mu, extra, padding_gate=True, want_model=False):
+        s = z3.Solver()
+        r = Ecdas2Row(s, "r", ablate=ablate, padding_gate=padding_gate)
+        s.add(r.mu == mu)
+        extra(s, r)
+        s.add(r.op == 0, r.addend_receive() > 0)   # a doubling that eats an addend
+        v = s.check()
+        if want_model and v == z3.sat:
+            m = s.model()
+            cols = ("mu", "op", "nb", "d1", "d2", "s1", "s2", "s3", "sc", "ph1", "ph2")
+            return v, " ".join(f"{c.upper()}={m.evaluate(getattr(r, c))}"
+                               for c in cols)
+        return v, None
+
+    live = {
+        "precompute (MU=1, PH1=PH2=0)": lambda s, r: s.add(r.ph1 == 0, r.ph2 == 0),
+        "correction  (MU=1, PH2=1)": lambda s, r: s.add(r.ph2 == 1),
+    }
+    rows, ok = [], True
+    for name, extra in live.items():
+        blocked, _ = query((), 1, extra)
+        ablated, witness = query((14,), 1, extra, want_model=True)
+        rows.append(f"{name:28} untampered {blocked}   ablated {ablated}")
+        if witness:
+            rows.append(f"   forged row: {witness}")
+        ok &= (blocked == z3.unsat and ablated == z3.sat)
+
+    # the old target, kept as evidence rather than deleted
+    pad_no_gate, _ = query((14,), 0, lambda s, r: s.add(r.ph1 == 0, r.ph2 == 0),
+                           padding_gate=False)
+    pad_real, _ = query((14,), 0, lambda s, r: s.add(r.ph1 == 0, r.ph2 == 0),
+                        padding_gate=True)
+
+    report("N4b drop OP = ΣS — addend on a non-add row (live PH1 = 0 phases)",
            "SAT — FORGES" if ok else "CONTROL BROKEN",
-           f"untampered: {blocked}   ablated: {ablated}\n"
-           "Load-bearing exactly where PH1 = 0: padding rows and the two\n"
-           "off-chain phases, since idx 17/18/19 are vacuous there.")
+           "\n".join(rows) + "\n"
+           "Load-bearing on the two LIVE off-chain phases: idx 17/18/19 are\n"
+           "vacuous at PH1 = 0, so only idx 14 stops an OP = 0 row consuming an\n"
+           "addend (idx 20 / 21 still force S2 / S_CORR = 1 there).\n"
+           f"MU = 0 padding row, same ablation: {pad_real} on the real chip "
+           f"(was {pad_no_gate}\nwithout idx 22..=27) — idx 24..=27 cover that "
+           "case, not idx 14.")
     return ok
 
 
@@ -252,7 +309,8 @@ def control_4c():
            f"untampered: {blocked}   ablated: {ablated}\n"
            "PH1 = 1 makes idx 18 (S1+S3 = OP·D1 = 0), idx 19 (S2+S3 = 0) and\n"
            "idx 17 (S_CORR = 0) force every selector to zero on their own.\n"
-           "Keep idx 14 — N4b shows it is what covers the PH1 = 0 rows.")
+           "Keep idx 14 — N4b shows it is what covers the two LIVE PH1 = 0\n"
+           "phases (padding rows are covered by idx 22..=27, not by idx 14).")
     return ok
 
 
@@ -368,6 +426,11 @@ def main():
     redun = [n for n, v, _ in results if v.startswith("UNSAT")]
     broken = [n for n, v, _ in results if v == "CONTROL BROKEN"]
     print(f"   genuine forgeries (ablation ⇒ SAT) : {len(forge)}")
+    print("      (was 6 before TRANSCRIPTION-AUDIT F4: the old N4b aimed at a")
+    print("       MU=0 padding row and was built WITHOUT idx 22..=27, so its SAT")
+    print("       came from the model, not the chip. Re-pointed at the two live")
+    print("       PH1=0 phases it is a real forgery again — hence 7, for a")
+    print("       different reason than the board previously claimed.)")
     print(f"   redundancy probes (UNSAT)          : {len(redun)}")
     print(f"   LIVE HOLES in the chip right now   : {len(live)}")
     for n in live:

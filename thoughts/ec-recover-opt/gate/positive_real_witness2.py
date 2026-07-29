@@ -12,14 +12,26 @@ Two jobs in one pass over real witnesses:
   small joint scalars (`u1, u2 ∈ [1,16]`, ground truth by repeated group
   addition), and must equal the independent references on random inputs.
 
-Constraint enumeration mirrors `Ecdas2Constraints::eval` (idx 0..=216):
+Constraint enumeration mirrors `Ecdas2Constraints::eval` (idx 0..=287):
   0..=10   IS_BIT on MU, OP, NB, D1, D2, S1, S2, S3, S_CORR, PH1, PH2
   11..=21  the schedule constraints
-  22..=216 3 × (64 ConvCarry + 1 ColIsZero)
+  22..=27  (1 − MU)·{D1, D2, S1, S2, S3, S_CORR} — vacuous on honest rows
+  28..=287 4 × (64 ConvCarry + 1 ColIsZero), the fourth being `Dinv`
 
 `PH*` and `S*` are not columns of the witness struct — the chip derives them
 from `JointSel` (`Ecdas2Operation::phase_bits` / `selector_bits`). That mapping
-is reproduced here and is a MODELLED step, flagged as such in RESULTS.md.
+is reproduced here and is a MODELLED step, flagged as such in RESULTS.md §7.
+
+## What this anchor structurally CANNOT catch
+
+It evaluates CONSTRAINT VALUES on honest rows. It never evaluates a bus
+multiplicity, and never exercises a gating factor — every honest row has
+`MU = 1`, so idx 22..=27 and idx 20's `MU` factor are vacuous here by
+construction. The ECDAS2 JointBit bug (an ungated `Multiplicity::Column(D1)`)
+would have passed this file unchanged, and so would a narrowed `D_INV` gate.
+Those two classes are covered by `gate2_common.chip_state()`'s parsed
+invariants instead, and by the L8 controls — not by volume of checks here.
+See `RESULTS-lincomb2.md` §7 and `TRANSCRIPTION-AUDIT.md` F1/F2.
 
 Run:  <venv>/bin/python positive_real_witness2.py
 """
@@ -33,7 +45,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "oracle"))
 import lincomb2_ref
 from ec_ref import GX, GY, N, P, pt_add, pt_double, recover_even_y, scalar_mul
 from gate_common import OFF, PG, s_ecdas_lambda, s_ecdas_xr, s_ecdas_yr
-from gate2_common import lincomb2_witness
+from gate2_common import joint_sel_maps, lincomb2_witness
 
 checks = 0
 failures = []
@@ -68,7 +80,7 @@ def hex_bytes(s):
     return list(bytes.fromhex(s))
 
 
-# `Ecdas2Operation::phase_bits` / `selector_bits`, reproduced.
+# `Ecdas2Operation::phase_bits` / `selector_bits`, reproduced by hand.
 PHASE = {"Precompute": (0, 0), "Correction": (0, 1),
          "Double": (1, 0), "AddP1": (1, 0), "AddP2": (1, 0), "AddP12": (1, 0)}
 SELECT = {"Double": (0, 0, 0, 0), "AddP1": (1, 0, 0, 0),
@@ -76,8 +88,33 @@ SELECT = {"Double": (0, 0, 0, 0), "AddP1": (1, 0, 0, 0),
           "AddP12": (0, 0, 1, 0), "Correction": (0, 0, 0, 1)}
 
 
+def check_sel_maps():
+    """The hand copy above vs the chip's own `match` arms, parsed.
+
+    RESULTS §7 called this "the one remaining modelled gap in the anchor". It no
+    longer is: the two dicts are compared arm for arm against
+    `Ecdas2Operation::phase_bits` / `selector_bits`, and against the `JointSel`
+    variant list, so a changed OR added arm fails here instead of silently
+    re-deriving a different chip.
+    """
+    chip = joint_sel_maps()
+    rows = []
+    for name, mine, theirs in (("phase_bits", PHASE, chip["phase_bits"]),
+                               ("selector_bits", SELECT, chip["selector_bits"])):
+        ok = mine == theirs
+        rows.append((name, ok, "" if ok else f"model {mine} != chip {theirs}"))
+        ck(ok, f"{name}: hand copy == chip `match` arms")
+    missing = set(chip["variants"]) - set(PHASE) - set()
+    unknown = set(PHASE) - set(chip["variants"])
+    ck(not missing, f"JointSel variants absent from the model: {sorted(missing)}")
+    ck(not unknown, f"model names that are not JointSel variants: {sorted(unknown)}")
+    rows.append(("JointSel variants", not (missing or unknown),
+                 f"{len(chip['variants'])} variants, all mapped"))
+    return rows
+
+
 def check_row(row, tag):
-    """All 217 ECDAS2 constraints on one live (MU = 1) row, plus the ranges."""
+    """All 288 ECDAS2 constraints on one live (MU = 1) row, plus the ranges."""
     sel = row["sel"]
     ph1, ph2 = PHASE[sel]
     s1, s2, s3, sc = SELECT[sel]
@@ -193,6 +230,10 @@ def main():
     T0, _ = lincomb2_ref.t0_ref()
     G = (GX, GY)
     print("POSITIVE ANCHOR + L7 — real lincomb2 witnesses vs the transcribed model")
+    print()
+    print("   JointSel → PH*/S* derivation, parsed from the chip:")
+    for name, ok, note in check_sel_maps():
+        print(f"      {name:18}: {'MATCHES' if ok else 'DIFFERS'}  {note}")
     print()
 
     # ── the corpus ───────────────────────────────────────────────────────────

@@ -6,6 +6,8 @@
            s_i::Lambda   : identical
            s_i::Xr       : identical
            s_i::Yr       : identical
+           s_i::prologue : identical
+           conv_carry    : identical
            rq            : identical
            p_byte_expr   : identical
            r_byte_expr   : identical
@@ -15,6 +17,22 @@
    (λ, xR, yR pinned mod p) and L5a (no 2-torsion) port unchanged
            These lemmas quantify over the relation's operands only; renaming an
            operand column cannot affect them. The old gate's proofs stand as-is.
+           The comparison covers the s_i PROLOGUE and `conv_carry` as well as the
+           three arms: without the prologue a chip whose relations read the WRONG
+           columns still compares identical (TRANSCRIPTION-AUDIT.md F3).
+[ PROVED ] ECSM2's P2-membership relations are ECSM's, modulo the column rename and
+   the µ → OK gate swap
+           s_i::X2       : identical
+           s_i::Yg       : identical
+           s_i::prologue : identical
+           conv_carry    : identical
+           p_byte_expr   : identical
+           byte_at       : identical
+           OK is IS_BIT and OK·(1−MU) = 0 (ecsm2.rs idx 1, 2), so OK = 1 rows are
+           a subset of MU = 1 rows and every ECSM membership lemma applies to
+           them verbatim. `carry_chain` is excluded: ECSM2 has five
+           OverflowKinds to ECSM's three, so those bodies differ by design
+           (covered by L8 N3 / N7 instead).
 
 ==============================================================================
 §2 — L2b: honest carries of the joint chain fit the existing windows
@@ -33,7 +51,12 @@
 ==============================================================================
 §3 — L5b REPLACED by D_INV·(xB − xA) ≡ 1 (mod p)
 ==============================================================================
-   D_INV is present (ECDAS2 idx 223..=287, gated by ΣS).
+   D_INV is present (ECDAS2 idx 223..=287), and its gate expression
+   is PARSED from the `Relation::Dinv` arm: ['S1', 'S2', 'S3', 'S_CORR'],
+   which EQUALS the Addend receive's Multiplicity::Linear terms
+   ['S1', 'S2', 'S3', 'S_CORR']. That equality is what (a1)/(a2) below
+   quantify over; before TRANSCRIPTION-AUDIT.md F1 nothing checked
+   it, and dropping S_CORR from the gate was a working forgery.
 
 [ PROVED ] (a1) OP = (Addend receive multiplicity) on every live row
            The chip gates D_INV by ΣS = S1+S2+S3+S_CORR — the very expression
@@ -72,6 +95,7 @@ SUMMARY
 ==============================================================================
    [PROVED] ECDAS2's relation builders are ECDAS's, modulo the XB/YB rename
    [PROVED] ⇒ L1 (carry telescoping), L2a (per-limb widths), L3a (convolutions capture
+   [PROVED] ECSM2's P2-membership relations are ECSM's, modulo the column rename and
    [PROVED] L2b: the joint chain's honest carries fit the unchanged offsets
    [PROVED] (a1) OP = (Addend receive multiplicity) on every live row
    [PROVED] (a2) all five addend-consuming row types are covered; doublings are not
@@ -80,4 +104,4 @@ SUMMARY
    [PROVED] (c) the gated-off branch PINS q3 = µ·3p — a doubling is not a hole
    [PROVED] (d) L5b's obligation is discharged UNCONDITIONALLY
 
-   9/9 proved
+   10/10 proved

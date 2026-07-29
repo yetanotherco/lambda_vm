@@ -29,7 +29,9 @@ sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "oracle"))
 
 from gate_common import OFF, P, PG
-from gate2_common import Ecdas2Row, chip_state, relation_bodies_identical
+from gate2_common import (
+    Ecdas2Row, chip_state, membership_bodies_identical, relation_bodies_identical,
+)
 
 verdicts = []
 
@@ -64,8 +66,25 @@ def port_argument():
            "curve), L4a/b/c\n   (λ, xR, yR pinned mod p) and L5a (no 2-torsion) "
            "port unchanged", all_same,
            "These lemmas quantify over the relation's operands only; renaming an\n"
-           "operand column cannot affect them. The old gate's proofs stand as-is.")
-    return all_same
+           "operand column cannot affect them. The old gate's proofs stand as-is.\n"
+           "The comparison covers the s_i PROLOGUE and `conv_carry` as well as the\n"
+           "three arms: without the prologue a chip whose relations read the WRONG\n"
+           "columns still compares identical (TRANSCRIPTION-AUDIT.md F3).")
+
+    # The membership port. The soundness theorem's "P2 is on the curve" clause
+    # rests on it and nothing used to check it (TRANSCRIPTION-AUDIT.md, gap 2).
+    mem = membership_bodies_identical()
+    mem_same = all(mem.values())
+    report("ECSM2's P2-membership relations are ECSM's, modulo the column rename "
+           "and\n   the µ → OK gate swap", mem_same,
+           "\n".join(f"{k:14}: {'identical' if v else 'DIFFERS'}"
+                     for k, v in mem.items())
+           + "\nOK is IS_BIT and OK·(1−MU) = 0 (ecsm2.rs idx 1, 2), so OK = 1 rows are"
+             "\na subset of MU = 1 rows and every ECSM membership lemma applies to"
+             "\nthem verbatim. `carry_chain` is excluded: ECSM2 has five"
+             "\nOverflowKinds to ECSM's three, so those bodies differ by design"
+             "\n(covered by L8 N3 / N7 instead).")
+    return all_same and mem_same
 
 
 # ── §2 L2b — the carry windows for the NEW row population ───────────────────
@@ -100,12 +119,19 @@ def l2b_offsets():
 def l5b_replacement():
     hdr("§3 — L5b REPLACED by D_INV·(xB − xA) ≡ 1 (mod p)")
     st = chip_state()
+    gate = st["dinv_gate_detail"]
     if not st["dinv_relation"]:
-        print("   NOTE: D_INV is not in the chip. What follows is then a")
-        print("   SPECIFICATION for the landing change rather than a check of it.")
+        print("   NOTE: D_INV does not protect every addend-consuming row.")
+        print(f"   reason: {gate['reason']}")
+        print("   What follows is then a SPECIFICATION rather than a check.")
         print()
     else:
-        print("   D_INV is present (ECDAS2 idx 223..=287, gated by ΣS).")
+        print("   D_INV is present (ECDAS2 idx 223..=287), and its gate expression")
+        print(f"   is PARSED from the `Relation::Dinv` arm: {sorted(gate['gate'])},")
+        print(f"   which EQUALS the Addend receive's Multiplicity::Linear terms")
+        print(f"   {sorted(gate['addend'])}. That equality is what (a1)/(a2) below")
+        print("   quantify over; before TRANSCRIPTION-AUDIT.md F1 nothing checked")
+        print("   it, and dropping S_CORR from the gate was a working forgery.")
         print()
 
     # (a) imposed on exactly the addend-consuming rows.

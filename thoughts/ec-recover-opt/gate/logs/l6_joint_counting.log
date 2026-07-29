@@ -32,14 +32,15 @@ L6-C — padding rows as phantom digit senders
 ==========================================================================
    a MU=0 row with D1=1 satisfies all row constraints : sat
    round r: u1_bit(r)=1 balanced with NO add on chain  : sat
-      witness: double has D1=0, NB=0 (no add), phantom rows [2, 3] each send D1=1 at the same ROUND
+      witness: double has D1=0, NB=0 (no add), phantom rows [1, 3] each send D1=1 at the same ROUND
 
-   *** BREAK *** The JointBit send's multiplicity is
-   `Multiplicity::Column(cols::D1)` (ecdas2.rs:459-470) and NOTHING
-   ties D1/D2 to MU. A padding row is otherwise inert (its Ecdas,
-   Addend, AreBytes and IsHalfword interactions are all MU-gated)
-   but its digit send is LIVE. Two phantom rows per targeted round
-   satisfy the 2x count while the chain skips the add entirely.
+   *** BREAK (ablation) *** The JointBit send's multiplicity is
+   `Multiplicity::Column(cols::D1)` (ecdas2.rs:601-612) and, before
+   idx 22..=27, NOTHING tied D1/D2 to MU. A padding row is otherwise
+   inert (its Ecdas, AreBytes and IsHalfword interactions are all
+   MU-gated, its Addend receive is ΣS-gated) but its digit send was
+   LIVE. Two phantom rows per targeted round satisfy the 2x count
+   while the chain skips the add entirely.
 
 ==========================================================================
 L6-D — padding rows as phantom digit senders (WITH the proposed fix)
@@ -47,8 +48,9 @@ L6-D — padding rows as phantom digit senders (WITH the proposed fix)
    a MU=0 row with D1=1 satisfies all row constraints : unsat
    round r: u1_bit(r)=1 balanced with NO add on chain  : unsat
 
-   With `D1·(1−MU) = 0` / `D2·(1−MU) = 0` added — the exact shape of
-   `ecdas.rs` idx 4 `NEXT_OP·(1−MU) = 0` — both queries go UNSAT.
+   With `(1−MU)·{D1, D2, S1, S2, S3, S_CORR} = 0` — the exact shape
+   of `ecdas.rs` idx 4 `NEXT_OP·(1−MU) = 0` — both queries go UNSAT.
+   This is `ecdas2.rs:988-1003`, idx 22..=27, in the chip today.
 
 ==========================================================================
 L6-E — exploitability: steering the recovered key to a chosen target
@@ -77,7 +79,9 @@ L6-E — exploitability: steering the recovered key to a chosen target
 ==========================================================================
 SUMMARY
 ==========================================================================
-   chip state: (1−MU)·D gate present = True, D_INV present = True
+   chip state: (1−MU)·X gate present = True, D_INV present = True
+   gated columns ['D1', 'D2', 'S1', 'S2', 'S3', 'S_CORR']
+   == raw bus multiplicities ['D1', 'D2', 'S1', 'S2', 'S3', 'S_CORR']: True
 
    L6-A per-row schedule forcing      : PASS
    L6-B 2x multiplicity load-bearing  : CONFIRMED

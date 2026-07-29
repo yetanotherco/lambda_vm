@@ -1,10 +1,28 @@
 # L6 — the joint-schedule counting argument
 
-**Verdict: L6 does NOT hold for `ecdas2.rs` as written. There is a constructive
-break, and it is worse than the NUMS finding — it yields an ARBITRARY CHOSEN
-recovered public key, i.e. an arbitrary chosen transaction sender, with no
-discrete log and no search.** The fix is two degree-2 constraints and no new
-columns.
+> ## STATUS: the break in §2 is CLOSED. L6 HOLDS.
+>
+> This document was written against a chip that did **not** gate its digit
+> sends. That gate landed as `ecdas2.rs` **idx 22..=27**,
+> `(1 − MU)·{D1, D2, S1, S2, S3, S_CORR} = 0` — the §4 fix plus the recommended
+> selector companions. With it present, both z3 queries of §2 go **UNSAT**
+> (`gate/l6_joint_counting.py`, L6-D) and §3's argument goes through
+> unconditionally.
+>
+> **§2 is kept verbatim, as the derivation of a live hole that this gate found
+> and as the specification of the negative control that now guards it**
+> (`gate/l8_negative2.py` N1). Read it as history, not as the current state.
+> Findings §6.1 and §6.2 are both **DONE**; §6.3 (the `JOINT_CHAIN_ID` comment)
+> is done in `ecdas2.rs:160-171`.
+>
+> Column indices and line numbers below are refreshed to `feat/ec-lincomb2`
+> @ `bc62f00e` (ECDAS2: 658 columns, **288** constraints).
+
+**Historical verdict (pre-fix): L6 does NOT hold for `ecdas2.rs` as written.
+There is a constructive break, and it is worse than the NUMS finding — it yields
+an ARBITRARY CHOSEN recovered public key, i.e. an arbitrary chosen transaction
+sender, with no discrete log and no search.** The fix is two degree-2
+constraints and no new columns.
 
 Everything else in L6 holds. §3 writes out the parts that are proved; §2 is the
 break; §4 is the fix; §5 records the four mechanisms that were checked rather
@@ -15,9 +33,10 @@ Reproduce: `<venv>/bin/python thoughts/ec-recover-opt/gate/l6_joint_counting.py`
 and `ecsm2.rs`; convolution carries are out of scope here (that is
 `WIDTH-AUDIT.md`) — this is about the *schedule*.
 
-> **Column indices in this document are today's and will move.** `D_INV` is
-> still owed and adds ~100 columns. Nothing in the argument depends on an index:
-> it depends on *which constraints and which multiplicities exist*.
+> **Column indices in this document are today's and will move.** They did:
+> `D_INV` landed and took ECDAS2 from 529 to 658 columns and 217 to 288
+> constraints. Nothing in the argument depends on an index: it depends on
+> *which constraints and which multiplicities exist*.
 
 ---
 
@@ -39,12 +58,15 @@ The exact-MSB sub-lemma (old L6.5) drops: blinding makes any
 
 ## 2. THE BREAK — padding rows are live digit senders
 
+*(Closed by idx 22..=27 — see the status header. Kept as the derivation and as
+the spec of negative control N1.)*
+
 ### 2.1 The mechanism
 
 ECDAS2 sends the per-stream digits as
 
 ```rust
-// ecdas2.rs:459-470
+// ecdas2.rs:601-612 (was :459-470 when this was written)
 for (stream, col) in [(1u64, cols::D1), (2u64, cols::D2)] {
     out.push(BusInteraction::sender(
         BusId::JointBit,
@@ -54,10 +76,11 @@ for (stream, col) in [(1u64, cols::D1), (2u64, cols::D2)] {
 }
 ```
 
-and **no constraint ties `D1`/`D2` to `MU`.** Reading every occurrence of `MU`
-in `Ecdas2Constraints::eval`, it appears exactly three times: idx 0 (`IS_BIT`),
-idx 20 (`MU·(1−PH1−PH2)·(S2−1)`), and inside `rq()`. There is no
-`D1·(1−MU) = 0`.
+and — **at the time this was written** — no constraint tied `D1`/`D2` to `MU`.
+Reading every occurrence of `MU` in `Ecdas2Constraints::eval`, it appeared
+exactly three times: idx 0 (`IS_BIT`), idx 20 (`MU·(1−PH1−PH2)·(S2−1)`), and
+inside `rq()`. There was no `D1·(1−MU) = 0`. There is now: idx 22..=27,
+`ecdas2.rs:988-1003`.
 
 **The old chip has precisely this defence, for precisely this reason.**
 `ecdas.rs` idx 4 is `NEXT_OP·(1−MU) = 0`, gating the multiplicity of its own
@@ -70,7 +93,8 @@ is gated by `ΣS`. But its digit send is **live**.
 ### 2.2 The padding row is satisfiable
 
 With `MU = 0, PH1 = 1, D1 = 1, ROUND = r` and everything else zero except
-`NB = 1` (forced by idx 13), all 217 constraints hold:
+`NB = 1` (forced by idx 13), every constraint of the pre-fix chip held (217 of
+them then; the same rows are idx 0..=21 and 28..=287 of the 288 today):
 
 | constraint | check |
 |---|---|
@@ -83,7 +107,8 @@ With `MU = 0, PH1 = 1, D1 = 1, ROUND = r` and everything else zero except
 | idx 17-19 | all zero |
 | idx 20 | **µ-gated — `MU = 0` kills it** |
 | idx 21 | `PH2 = 0` |
-| idx 22-216 conv | all limbs zero, `rq` is µ-gated ⇒ `S_i = 0`, carries 0 |
+| the conv blocks (idx 28..=287 today) | all limbs zero, `rq` is µ-gated ⇒ `S_i = 0`, carries 0 |
+| idx 22..=27 (**the fix**) | `(1 − MU)·D1 = 1 ≠ 0` — **this is what now rejects the row** |
 
 z3: **SAT**. Note also that `ROUND` is only byte-checked through a µ-gated
 `AreBytes` send, so on a padding row it is entirely free.
@@ -191,7 +216,7 @@ Combining (a)-(g): the chain is exactly the honest schedule, and by the Addend
 balance each consumed addend is the one ECSM2 published — `G` (a constant), `P2`
 (MEMW-bound), `P12` (the phase-0 drain) or the `EC_T0` constant.
 
-## 4. The fix
+## 4. The fix — LANDED
 
 ```
 (1 − MU)·D1 = 0
@@ -207,10 +232,24 @@ injects nothing into the chain and merely forces the publisher to inflate `N1` �
 but it is the same class of hole and `(1−MU)·S* = 0` closes it for four more
 degree-2 constraints. Alternatively make the multiplicities `MU·D1` / `MU·ΣS` if
 the `Multiplicity` type admits a product; that is the structurally right fix and
-removes the need for the constraints entirely.
+removes the need for the constraints entirely. (It does not: `Multiplicity`
+offers `Column`/`Sum`/`Sum3`/`Diff`/`Negated`/`Linear`, all linear —
+`crypto/stark/src/lookup.rs:1328-1363`. So the constraint form is the only one
+available today.)
 
-**Phase E needs a negative control for this**: remove the gate, feed the §2.3
-schedule, and the gate must report SAT.
+**Both landed together** as `ecdas2.rs:988-1003`, idx 22..=27, over all six
+columns `{D1, D2, S1, S2, S3, S_CORR}`.
+
+**Phase E's negative control** is `gate/l8_negative2.py` N1: it ablates the gate,
+feeds the §2.3 schedule, and requires SAT — with the untampered gate the same
+query must be UNSAT. Both hold. Note the selector half of the gate makes the
+spurious-`Addend`-receive scenario unreachable on `MU = 0` rows *independently of
+idx 14*; see `RESULTS-lincomb2.md` §4 N4b, which was corrected for exactly this.
+
+A structural guard was added afterwards (`gate2_common.padding_gate_state()`):
+the gated column set must **equal** the set of columns supplying a multiplicity
+in `ecdas2::bus_interactions()`. That is the invariant this section is really
+about, and it is now machine-checked in both directions rather than restated.
 
 ## 5. Mechanisms checked, and clean
 
@@ -234,8 +273,12 @@ row can simply set `PH1 = 1`.)
 
 ### 5.2 The bus-28 separator holds — but not for the stated reason
 
-`JOINT_CHAIN_ID = 1` in tuple position 0 where the old chain pins `0`. The claim
-is sound. The stated justification is not the operative mechanism:
+`JOINT_CHAIN_ID = 1` in **tuple element 0** — `values[0]`, which lands at the
+**α¹** coefficient because `alpha_offset` starts at 1 (`lookup.rs:1653`) — where
+the old chain pins `0`. (`RESULTS-lincomb2.md` §3 says the same thing as
+"position 1", meaning the α exponent. Element 0 / exponent 1; they are the same
+element.) The claim is sound. The stated justification is not the operative
+mechanism:
 
 - **There is no re-alignment risk to begin with.** In `compute_fingerprints`
   (`lookup.rs:1651-1663`) `alpha_offset` advances by `num_bus_elements()` for
@@ -272,16 +315,18 @@ prover sets `S2 = 1` on a doubling and mints a spurious receive.
 
 ## 6. Findings
 
-1. **[CRITICAL — fix before anything else] Padding rows are live digit senders**
-   (§2). Arbitrary chosen recovered public key. Fix: `(1−MU)·D1 = 0`,
-   `(1−MU)·D2 = 0`.
-2. **[recommended] Gate the selectors too** — `(1−MU)·S* = 0`, or make the bus
-   multiplicities products with `MU` (§4).
-3. **[documentation] Reword the `JOINT_CHAIN_ID` comment** (§5.2). The separator
-   is sound; the "trailing-zero collapse / re-alignment" reasoning is not what
-   makes it sound, and it misdescribes how the fingerprint is built.
+1. **DONE.** ~~[CRITICAL — fix before anything else]~~ **Padding rows are live
+   digit senders** (§2). Arbitrary chosen recovered public key. Fixed by
+   `(1−MU)·D1 = 0`, `(1−MU)·D2 = 0` — `ecdas2.rs:988-1003` idx 22, 23.
+2. **DONE.** ~~[recommended]~~ **Gate the selectors too** — `(1−MU)·S* = 0`
+   landed in the same loop, idx 24..=27. The `MU·D1` product form is not
+   expressible (§4).
+3. **DONE.** ~~[documentation]~~ **Reword the `JOINT_CHAIN_ID` comment** (§5.2)
+   — `ecdas2.rs:160-171` now states the α¹-coefficient mechanism and explicitly
+   disclaims the re-alignment story.
 4. **[no action] 2× multiplicity confirmed**, with the 1× counterexample
    recorded as a phase-E negative control (§5.1).
-5. **[phase E] Negative controls to add**: drop the §4 gate (must go SAT); use
-   1× JointBit multiplicity (must go SAT); drop `(1−PH1)·D` (must go SAT); drop
-   `OP = ΣS` (must go SAT).
+5. **DONE.** ~~[phase E]~~ **Negative controls**: `l8_negative2.py` N1 (drop the
+   §4 gate), N4 (drop idx 18/19), N4b/N4c (drop `OP = ΣS`);
+   `l6_joint_counting.py` L6-B (1× JointBit) and §5.1's `(1−PH1)·D` companions.
+   All present and reproducing.
