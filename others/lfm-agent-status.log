@@ -1,0 +1,7 @@
+[phase0] 2026-07-29 slice 1 — constraint artifact ("constraints as data") landed on feat/phase0-constraint-ir off origin/main e0add1d5.
+[phase0]   Built: crypto/stark/src/constraint_ir/artifact.rs (ConstraintArtifact = flat program + ConstraintMeta + AirShape + composition degree multiplier, rkyv codec, lift/validate); artifact_tests.rs (17 tests); prover/src/tests/constraint_artifact_tests.rs (4 tests, 25 AIRs x 100 frames x 3 eval paths); prover/src/bin/compute_constraint_artifacts.rs.
+[phase0]   Trait: AIR::precaptured_constraint_program() added (never captures, guest-safe); AIR::constraint_program() default still panics. AirWithBuses::with_precaptured() supplies a build-time program.
+[phase0]   Refactor: the 25-AIR list was hand-copied into 3 test suites; now test_utils::production_airs() once.
+[phase0]   MEASURED: 73,539 nodes / 1,220,256 bytes (1191.7 KiB) over 25 tables. ECDAS 404KB + ECSM 368KB + KECCAK_RND 271KB = 85.5% of total.
+[phase0]   FINDINGS: (a) PAGE's constraints are parameterized by page_base (folded into IR constants) - not one static blob per continuation proof. (b) No production constraint uses end_exemptions; all 25 are RowDomain::ALL. (c) No production constraint uses an extension constant (ext_consts = 0 everywhere). (d) composition max_degree is absent from both AirContext and ConstraintMeta.
+[phase0]   FALSIFIED: lift SUB->ADD => structural wire check fails; device_program const swap => evaluation differential fails (the path with no structural check). Both reverted.

@@ -947,3 +947,68 @@ pub fn create_ecdas_air(proof_options: &ProofOptions) -> ConcreteVmAir<EcdasCons
         "ECDAS",
     )
 }
+
+/// A production AIR behind the common trait object, paired with its label.
+pub type LabeledAir = (
+    &'static str,
+    Box<dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>>,
+);
+
+/// The page base used wherever a test needs a concrete PAGE AIR.
+///
+/// PAGE is the one production table whose constraints are PARAMETERIZED: its
+/// bus interactions fold `page_base` into constant terms (see
+/// `crate::tables::page::bus_interactions`), so a different base yields a
+/// different captured program. Tests pin one base; anything reasoning about a
+/// real continuation proof must account for one PAGE program per page base.
+pub const PAGE_TEST_BASE: u64 = 0x1000;
+
+/// Every production table AIR, constructed and boxed behind the common trait
+/// object.
+///
+/// AIR-construction only — no ELF, no program execution — so this runs
+/// anywhere. It exists because the per-table list was previously copied into
+/// each IR test suite by hand: a table added to one copy and forgotten in
+/// another lost that suite's coverage silently, which is exactly the failure a
+/// per-table suite is supposed to catch. There is no ELF-free registry to
+/// iterate instead (`VmAirs::n` needs a real ELF plus preprocessed-commitment
+/// builds), so this list is still hand-maintained — but now once.
+pub fn production_airs(proof_options: &ProofOptions) -> Vec<LabeledAir> {
+    vec![
+        ("CPU", Box::new(create_cpu_air(proof_options))),
+        ("BITWISE", Box::new(create_bitwise_air(proof_options))),
+        ("LT", Box::new(create_lt_air(proof_options))),
+        ("SHIFT", Box::new(create_shift_air(proof_options))),
+        ("EQ", Box::new(create_eq_air(proof_options))),
+        ("BYTEWISE", Box::new(create_bytewise_air(proof_options))),
+        ("STORE", Box::new(create_store_air(proof_options))),
+        ("CPU32", Box::new(create_cpu32_air(proof_options))),
+        ("MEMW", Box::new(create_memw_air(proof_options))),
+        ("MEMW_A", Box::new(create_memw_aligned_air(proof_options))),
+        ("MEMW_R", Box::new(create_memw_register_air(proof_options))),
+        ("LOAD", Box::new(create_load_air(proof_options))),
+        ("DECODE", Box::new(create_decode_air(proof_options))),
+        ("MUL", Box::new(create_mul_air(proof_options))),
+        ("DVRM", Box::new(create_dvrm_air(proof_options))),
+        ("BRANCH", Box::new(create_branch_air(proof_options))),
+        ("HALT", Box::new(create_halt_air(proof_options))),
+        ("COMMIT", Box::new(create_commit_air(proof_options))),
+        (
+            "PAGE",
+            Box::new(create_page_air(proof_options, PAGE_TEST_BASE)),
+        ),
+        ("REGISTER", Box::new(create_register_air(proof_options))),
+        ("KECCAK", Box::new(create_keccak_air(proof_options))),
+        ("KECCAK_RND", Box::new(create_keccak_rnd_air(proof_options))),
+        ("KECCAK_RC", Box::new(create_keccak_rc_air(proof_options))),
+        ("ECSM", Box::new(create_ecsm_air(proof_options))),
+        ("ECDAS", Box::new(create_ecdas_air(proof_options))),
+    ]
+}
+
+/// The number of production table AIRs [`production_airs`] yields.
+///
+/// Pinned as a constant so a table dropped from the list — rather than added —
+/// fails a test instead of quietly shrinking every per-table suite at once.
+/// Bump it deliberately when a table is genuinely added or removed.
+pub const NUM_PRODUCTION_AIRS: usize = 25;

@@ -153,30 +153,14 @@ fn check_air(air: &dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = ()>
 #[test]
 fn all_table_programs_match_folders() {
     let opts = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
+    let airs = production_airs(&opts);
+    assert_eq!(
+        airs.len(),
+        NUM_PRODUCTION_AIRS,
+        "production AIR list changed size"
+    );
 
-    check_air(&create_cpu_air(&opts), "CPU");
-    check_air(&create_bitwise_air(&opts), "BITWISE");
-    check_air(&create_lt_air(&opts), "LT");
-    check_air(&create_shift_air(&opts), "SHIFT");
-    check_air(&create_eq_air(&opts), "EQ");
-    check_air(&create_bytewise_air(&opts), "BYTEWISE");
-    check_air(&create_store_air(&opts), "STORE");
-    check_air(&create_cpu32_air(&opts), "CPU32");
-    check_air(&create_memw_air(&opts), "MEMW");
-    check_air(&create_memw_aligned_air(&opts), "MEMW_A");
-    check_air(&create_memw_register_air(&opts), "MEMW_R");
-    check_air(&create_load_air(&opts), "LOAD");
-    check_air(&create_decode_air(&opts), "DECODE");
-    check_air(&create_mul_air(&opts), "MUL");
-    check_air(&create_dvrm_air(&opts), "DVRM");
-    check_air(&create_branch_air(&opts), "BRANCH");
-    check_air(&create_halt_air(&opts), "HALT");
-    check_air(&create_commit_air(&opts), "COMMIT");
-    check_air(&create_page_air(&opts, 0x1000), "PAGE");
-    check_air(&create_register_air(&opts), "REGISTER");
-    check_air(&create_keccak_air(&opts), "KECCAK");
-    check_air(&create_keccak_rnd_air(&opts), "KECCAK_RND");
-    check_air(&create_keccak_rc_air(&opts), "KECCAK_RC");
-    check_air(&create_ecsm_air(&opts), "ECSM");
-    check_air(&create_ecdas_air(&opts), "ECDAS");
+    for (label, air) in &airs {
+        check_air(&**air, label);
+    }
 }

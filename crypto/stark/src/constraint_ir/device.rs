@@ -73,7 +73,7 @@ pub const DIM_EXT: u32 = 1;
 /// ids for arithmetic, table indices for constants/uniforms, packed [`Op::Var`]
 /// fields for [`OP_VAR`]); `dim` is [`DIM_BASE`] or [`DIM_EXT`].
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct DeviceNode {
     pub op: u32,
     pub a: u32,

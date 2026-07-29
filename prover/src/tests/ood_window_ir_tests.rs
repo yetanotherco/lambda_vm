@@ -21,10 +21,12 @@
 //! the real constraints rather than a copy of the declaration.
 //!
 //! It only CONSTRUCTS AIRs (no program execution, no ELF), so it runs anywhere.
-//! The table list mirrors the enumeration in `constraint_program_tests.rs` — the
-//! canonical per-table `create_*_air` constructors from `test_utils`; there is no
-//! ELF-free registry to iterate (`VmAirs::air_refs` needs a real ELF plus
-//! preprocessed-commitment builds), so a new table must be added here.
+//! The table list is `test_utils::production_airs` — shared with the other
+//! per-table IR suites, since three hand-maintained copies of it meant a new
+//! table could be added to one and silently skipped by the others. There is
+//! still no ELF-free registry to iterate (`VmAirs::air_refs` needs a real ELF
+//! plus preprocessed-commitment builds), so a new table must be added to
+//! `production_airs`.
 
 use stark::proof::options::GoldilocksCubicProofOptions;
 use stark::traits::AIR;
@@ -88,30 +90,14 @@ fn assert_ood_window_matches_ir(
 #[test]
 fn all_table_windows_match_captured_ir() {
     let opts = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
+    let airs = production_airs(&opts);
+    assert_eq!(
+        airs.len(),
+        NUM_PRODUCTION_AIRS,
+        "production AIR list changed size"
+    );
 
-    assert_ood_window_matches_ir(&create_cpu_air(&opts), true, "CPU");
-    assert_ood_window_matches_ir(&create_bitwise_air(&opts), true, "BITWISE");
-    assert_ood_window_matches_ir(&create_lt_air(&opts), true, "LT");
-    assert_ood_window_matches_ir(&create_shift_air(&opts), true, "SHIFT");
-    assert_ood_window_matches_ir(&create_eq_air(&opts), true, "EQ");
-    assert_ood_window_matches_ir(&create_bytewise_air(&opts), true, "BYTEWISE");
-    assert_ood_window_matches_ir(&create_store_air(&opts), true, "STORE");
-    assert_ood_window_matches_ir(&create_cpu32_air(&opts), true, "CPU32");
-    assert_ood_window_matches_ir(&create_memw_air(&opts), true, "MEMW");
-    assert_ood_window_matches_ir(&create_memw_aligned_air(&opts), true, "MEMW_A");
-    assert_ood_window_matches_ir(&create_memw_register_air(&opts), true, "MEMW_R");
-    assert_ood_window_matches_ir(&create_load_air(&opts), true, "LOAD");
-    assert_ood_window_matches_ir(&create_decode_air(&opts), true, "DECODE");
-    assert_ood_window_matches_ir(&create_mul_air(&opts), true, "MUL");
-    assert_ood_window_matches_ir(&create_dvrm_air(&opts), true, "DVRM");
-    assert_ood_window_matches_ir(&create_branch_air(&opts), true, "BRANCH");
-    assert_ood_window_matches_ir(&create_halt_air(&opts), true, "HALT");
-    assert_ood_window_matches_ir(&create_commit_air(&opts), true, "COMMIT");
-    assert_ood_window_matches_ir(&create_page_air(&opts, 0x1000), true, "PAGE");
-    assert_ood_window_matches_ir(&create_register_air(&opts), true, "REGISTER");
-    assert_ood_window_matches_ir(&create_keccak_air(&opts), true, "KECCAK");
-    assert_ood_window_matches_ir(&create_keccak_rnd_air(&opts), true, "KECCAK_RND");
-    assert_ood_window_matches_ir(&create_keccak_rc_air(&opts), true, "KECCAK_RC");
-    assert_ood_window_matches_ir(&create_ecsm_air(&opts), true, "ECSM");
-    assert_ood_window_matches_ir(&create_ecdas_air(&opts), true, "ECDAS");
+    for (label, air) in &airs {
+        assert_ood_window_matches_ir(&**air, true, label);
+    }
 }
