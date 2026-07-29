@@ -429,42 +429,49 @@ extern "C" __global__ void ntt_dit_8_levels_row_major(uint64_t *data,
     uint32_t pitch = T + 1;
     uint64_t col = (uint64_t)blockIdx.x * T + threadIdx.x;
     bool live = col < m;
-    uint64_t row_base = (uint64_t)blockIdx.y * 256;
-
-    for (uint32_t r = threadIdx.y; r < 256; r += blockDim.y) {
-        if (live) tile[r * pitch + threadIdx.x] = data[(row_base + r) * m + col];
-    }
-    __syncthreads();
 
     uint32_t n_loc_steps = (uint32_t)min((uint64_t)8, log_n);
     uint32_t remaining_high_bits = (uint32_t)(log_n - 1);
     uint32_t high_mask = (1u << remaining_high_bits) - 1u;
 
-    for (uint32_t loc_step = 0; loc_step < n_loc_steps; ++loc_step) {
-        for (uint32_t i = threadIdx.y; i < 128; i += blockDim.y) {
-            uint32_t half    = 1u << loc_step;
-            uint32_t grp     = i >> loc_step;
-            uint32_t grp_pos = i & (half - 1);
-            uint32_t idx1 = (grp << (loc_step + 1)) + grp_pos;
-            uint32_t idx2 = idx1 + half;
+    // Grid-stride over 256-row blocks: gridDim.y caps at 65535, so lde sizes
+    // >= 2^24 need more than one row block per y-slot. The trip count is
+    // uniform across the block, keeping every __syncthreads converged.
+    for (uint64_t rb = blockIdx.y; rb < (n >> 8); rb += gridDim.y) {
+        uint64_t row_base = rb * 256;
 
-            uint32_t gs  = loc_step;
-            uint32_t ggp = ((uint32_t)blockIdx.y << 7) + i;
-            ggp = (ggp & high_mask) + (ggp >> remaining_high_bits);
-            ggp = ggp & ((1u << gs) - 1u);
-            uint64_t factor = tw[(uint64_t)ggp * (n >> (gs + 1))];
-
-            if (live) {
-                uint64_t u = tile[idx1 * pitch + threadIdx.x];
-                uint64_t v = mul(tile[idx2 * pitch + threadIdx.x], factor);
-                tile[idx1 * pitch + threadIdx.x] = add(u, v);
-                tile[idx2 * pitch + threadIdx.x] = sub(u, v);
-            }
+        for (uint32_t r = threadIdx.y; r < 256; r += blockDim.y) {
+            if (live) tile[r * pitch + threadIdx.x] = data[(row_base + r) * m + col];
         }
         __syncthreads();
-    }
 
-    for (uint32_t r = threadIdx.y; r < 256; r += blockDim.y) {
-        if (live) data[(row_base + r) * m + col] = tile[r * pitch + threadIdx.x];
+        for (uint32_t loc_step = 0; loc_step < n_loc_steps; ++loc_step) {
+            for (uint32_t i = threadIdx.y; i < 128; i += blockDim.y) {
+                uint32_t half    = 1u << loc_step;
+                uint32_t grp     = i >> loc_step;
+                uint32_t grp_pos = i & (half - 1);
+                uint32_t idx1 = (grp << (loc_step + 1)) + grp_pos;
+                uint32_t idx2 = idx1 + half;
+
+                uint32_t gs  = loc_step;
+                uint32_t ggp = ((uint32_t)rb << 7) + i;
+                ggp = (ggp & high_mask) + (ggp >> remaining_high_bits);
+                ggp = ggp & ((1u << gs) - 1u);
+                uint64_t factor = tw[(uint64_t)ggp * (n >> (gs + 1))];
+
+                if (live) {
+                    uint64_t u = tile[idx1 * pitch + threadIdx.x];
+                    uint64_t v = mul(tile[idx2 * pitch + threadIdx.x], factor);
+                    tile[idx1 * pitch + threadIdx.x] = add(u, v);
+                    tile[idx2 * pitch + threadIdx.x] = sub(u, v);
+                }
+            }
+            __syncthreads();
+        }
+
+        for (uint32_t r = threadIdx.y; r < 256; r += blockDim.y) {
+            if (live) data[(row_base + r) * m + col] = tile[r * pitch + threadIdx.x];
+        }
+        __syncthreads();
     }
 }

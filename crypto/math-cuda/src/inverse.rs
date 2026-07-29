@@ -94,6 +94,11 @@ const fn ext3_fermat_exponent() -> [u64; 3] {
 }
 
 /// One-thread Fermat inversion of `src[n-1]` into `out[0..3]`, stream-ordered.
+///
+/// Unlike the host Fermat this used to call, a zero total maps silently to
+/// zero instead of `Err`. Unreachable with honest inputs (LogUp/barycentric
+/// denominators are nonzero w.h.p.); callers must not rely on a zero-total
+/// error.
 fn launch_invert_total(
     stream: &Arc<CudaStream>,
     be: &crate::device::Backend,
@@ -133,6 +138,8 @@ pub fn batch_inverse_ext3_dev(
     n: usize,
     stream: &Arc<CudaStream>,
 ) -> Result<CudaSlice<u64>> {
+    #[cfg(feature = "test-faults")]
+    check_inverse_fault_injection()?;
     assert!(n >= 1, "batch_inverse_ext3_dev requires n >= 1");
     // Runtime guard (not debug_assert): a u32 grid_dim is truncated past
     // u32::MAX / BLOCK_SIZE, which would silently launch too few blocks
@@ -220,8 +227,6 @@ pub fn compute_and_invert_denoms_ext3_dev(
     sign: DenomSign,
     stream: &Arc<CudaStream>,
 ) -> Result<CudaSlice<u64>> {
-    #[cfg(feature = "test-faults")]
-    check_inverse_fault_injection()?;
     assert_eq!(z_scalars_host.len(), k_scalars * 3);
     assert!(n >= 1 && k_scalars >= 1);
 

@@ -767,10 +767,11 @@ where
 /// one row-major GPU LDE of ALL columns plus TWO subset Merkle trees — the
 /// precomputed columns `[0, split_col)` and the multiplicity columns
 /// `[split_col, m)` — matching the CPU `commit_rows_bit_reversed_subset`
-/// pair bit for bit. Trees come back as full HOST trees (openings for
-/// preprocessed tables walk host trees); the handle keeps the column-major
-/// LDE + trace snapshot device-resident for the downstream GPU rounds, with
-/// no device tree.
+/// pair bit for bit. The precomputed tree comes back as a full HOST tree
+/// (it feeds the process-wide cache); the multiplicity tree stays resident
+/// in the handle (root-only host tree, R4 openings gather paths on device).
+/// The handle also keeps the column-major LDE + trace snapshot for the
+/// downstream GPU rounds.
 ///
 /// `build_precomputed=false` skips the precomputed tree (process-cache hit);
 /// the first element is then `None`.
@@ -1405,12 +1406,12 @@ pub fn gpu_fri_calls() -> u64 {
 
 /// Batch-invert dispatch counter (one per
 /// [`try_compute_and_invert_inv_denoms_dev`] call that actually built a
-/// device handle). Fires at most twice per prove per table: once for R3
-/// OOD's `num_eval_points * trace_size` denominators and once for R4
-/// DEEP's `(1 + num_eval_points) * lde_size` denominators. R4 has two
-/// chances at it (device-only DEEP, then the host DEEP arm), and both are
-/// counted here, so a single failed dispatch does not necessarily lower the
-/// total; R3's fallback is CPU-only, so a failure there does.
+/// device handle). Fires up to three times per prove per table: R3 trace
+/// OOD's `num_eval_points * trace_size` denominators, R3 parts OOD's single
+/// point, and R4 DEEP's `(1 + num_eval_points) * lde_size` denominators. R4
+/// has two chances at it (device-only DEEP, then the host DEEP arm), and both
+/// are counted here, so a single failed dispatch does not necessarily lower
+/// the total; R3's fallbacks are CPU-only, so a failure there does.
 pub(crate) static GPU_BATCH_INVERT_CALLS: AtomicU64 = AtomicU64::new(0);
 pub fn gpu_batch_invert_calls() -> u64 {
     GPU_BATCH_INVERT_CALLS.load(Ordering::Relaxed)
@@ -2376,11 +2377,14 @@ where
             .unwrap_or_default();
         let root = dev_tree.root;
         let merkle_tree = MerkleTree::<FriLayerMerkleTreeBackend<E>>::from_root(root);
+        // Retain the device evals only when no host copy exists (device-only):
+        // with a host copy the query phase reads it, and the retained buffer
+        // would be ~24 bytes/LDE-row of dead VRAM per table.
         fri_layer_list.push(FriLayer {
             evaluation,
             merkle_tree,
             gpu_tree: Some(dev_tree),
-            gpu_evals: Some(evals_dev),
+            gpu_evals: (!want_host).then_some(evals_dev),
         });
 
         // >>>> Send commitment: [p_k]

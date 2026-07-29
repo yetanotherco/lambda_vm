@@ -611,7 +611,9 @@ pub fn backend() -> Result<&'static Backend> {
 ///
 /// Holding this value keeps the staging slot's mutex locked, which is what
 /// makes the whole scheme safe: no other caller (and no capacity growth) can
-/// touch the slab while the DMA is in flight.
+/// touch the slab while the DMA is in flight. Corollary: never call
+/// `htod_via`/`async_dtoh_via` on the same slot from the thread holding a
+/// live `PendingD2H` — the non-reentrant slot mutex self-deadlocks.
 pub struct PendingD2H<'a> {
     staging: std::sync::MutexGuard<'a, PinnedStaging>,
     n_bytes: usize,
@@ -628,17 +630,6 @@ impl Drop for PendingD2H<'_> {
     }
 }
 
-/// Enqueue an async D2H of `n_elems` of `src` into the pinned slab of `slot`,
-/// without synchronizing the stream. Unlike `stream.memcpy_dtoh` into a plain
-/// (pageable) slice — which the driver services synchronously — this returns
-/// as soon as the copy is queued; the returned [`PendingD2H`] is awaited at
-/// the point the host actually needs the bytes.
-///
-/// SAFETY contract (upheld by construction for our callers): `src` must stay
-/// alive until the copy completes. Dropping a `CudaSlice` frees it
-/// stream-ordered on its own stream, so a `src` allocated on `stream` may be
-/// dropped after this call — the free queues behind the copy. Do NOT pass a
-/// `src` owned by a *different* stream and drop it before waiting.
 /// Host→device copy staged through the pinned slot: one host memcpy into
 /// pinned memory + one async DMA, instead of the driver's internal pageable
 /// staging (small chunks; 2-3x slower for multi-hundred-MB traces and it
@@ -652,7 +643,14 @@ pub fn htod_via<T: cudarc::driver::DeviceRepr>(
     dst: &mut cudarc::driver::CudaViewMut<'_, T>,
 ) -> Result<()> {
     use cudarc::driver::DevicePtrMut;
+    assert!(
+        dst.len() >= src_host.len(),
+        "htod_via: destination shorter than source"
+    );
     let n_bytes = std::mem::size_of_val(src_host);
+    if n_bytes == 0 {
+        return Ok(());
+    }
     let u64_len = n_bytes.div_ceil(8);
     let mut staging = slot.lock().unwrap();
     staging.ensure_capacity(u64_len, ctx)?;
@@ -680,6 +678,17 @@ pub fn htod_via<T: cudarc::driver::DeviceRepr>(
     staging.sync_event()
 }
 
+/// Enqueue an async D2H of `n_elems` of `src` into the pinned slab of `slot`,
+/// without synchronizing the stream. Unlike `stream.memcpy_dtoh` into a plain
+/// (pageable) slice — which the driver services synchronously — this returns
+/// as soon as the copy is queued; the returned [`PendingD2H`] is awaited at
+/// the point the host actually needs the bytes.
+///
+/// SAFETY contract (upheld by construction for our callers): `src` must stay
+/// alive until the copy completes. Dropping a `CudaSlice` frees it
+/// stream-ordered on its own stream, so a `src` allocated on `stream` may be
+/// dropped after this call — the free queues behind the copy. Do NOT pass a
+/// `src` owned by a *different* stream and drop it before waiting.
 pub fn async_dtoh_via<'a, T: cudarc::driver::DeviceRepr>(
     stream: &Arc<CudaStream>,
     slot: &'a Mutex<PinnedStaging>,
