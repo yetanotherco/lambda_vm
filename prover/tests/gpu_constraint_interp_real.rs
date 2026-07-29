@@ -252,4 +252,5 @@ fn all_table_programs_gpu_match_cpu_oracle() {
     check_air(&create_keccak_rc_air(&opts), "KECCAK_RC");
     check_air(&create_ecsm_air(&opts), "ECSM");
     check_air(&create_ecdas_air(&opts), "ECDAS");
+    check_air(&create_dma_air(&opts), "DMA");
 }

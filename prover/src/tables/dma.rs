@@ -21,7 +21,8 @@
 //! - `dst`: DWordWL (2) — current destination byte address
 //! - `dst_incr`: DWordHL (4) — dst + selected width
 //! - `count`: DWordWL (2) — remaining byte count (including this byte; 0 on the end row)
-//! - `count_decr`: DWordHL (4) — count - 1 (or all 0xFFFF when count == 0)
+//! - `count_decr`: DWordHL (4) — count - width (all 0xFFFF when count == 0, since
+//!   the terminal row is a one-byte row and `0 - 1` wraps every halfword to 0xFFFF)
 //! - `first`: Bit — first row of a copy
 //! - `end`: Bit — last row (count was 0)
 //! - `tail`: Bit — `count < 8`; selects a 1-byte rather than 8-byte row
