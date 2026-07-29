@@ -1,9 +1,24 @@
 #!/usr/bin/env bash
 #
-# Runs scripts/bench_recursion_cycles.sh across every preset regime (min,
-# blowup2/blowup4, blowup4-block) and appends each result — or an
-# "unavailable" note when the ref/preset combo isn't supported — to
-# /tmp/recursion_result.txt for the bench-verify.yml PR comment.
+# Runs scripts/bench_recursion_cycles.sh across the regimes /bench-verify reports and
+# appends each result — or an explicit failure note — to /tmp/recursion_result.txt for
+# the bench-verify.yml PR comment.
+#
+# Two regimes, deliberately:
+#   min            cheap canary over the `empty` diagnostic program (blowup=2, 1 query).
+#                  Seconds per ref, so it catches a broken guest before the expensive
+#                  regime runs, and it's the one arm whose absolute cycle count is
+#                  meaningless on its own.
+#   blowup4-block  the representative regime: a REAL ethrex 20-tx block proved via
+#                  CONTINUATIONS and verified in-VM at a real query count (blowup=4,
+#                  110 queries). Real prover minutes per ref; the dumped blob is cached
+#                  by ref SHA so a repeat run skips re-proving.
+#
+# The `empty`-program full-query regimes (blowup2/blowup4) used to run here too. They
+# only ever varied the query count over a trivial inner trace, which blowup4-block now
+# covers at a realistic trace size, so they were dropped to pay for the 20-tx block
+# instead. They still work for manual runs:
+#   scripts/bench_recursion_cycles.sh <sha> origin/main blowup2
 #
 # Usage: .github/scripts/run_recursion_bench.sh HEAD_SHA
 set -euo pipefail
@@ -16,9 +31,12 @@ run_preset() {
   local preset="$1"
   local log="/tmp/recursion_out_${preset}.txt"
   if scripts/bench_recursion_cycles.sh "$HEAD_SHA" origin/main "$preset" 2>&1 | tee "$log"; then
-    { echo; sed -n '/=== Recursion-guest cycle/,$p' "$log"; } >> "$RESULT"
+    { echo; sed -n '/<!-- recursion-cycle-report -->/,$p' "$log"; } >> "$RESULT"
   else
-    { echo; echo "_(${preset} regime unavailable for these refs — see the workflow log.)_"; } >> "$RESULT"
+    # Say it FAILED, not that it's "unavailable for these refs": the old wording read as
+    # a ref-capability limit and hid a real infra bug (a shared guest target dir that
+    # poisoned every regime after the first) for as long as it was there.
+    { echo; echo "_(${preset} regime FAILED — see the workflow log.)_"; } >> "$RESULT"
   fi
 }
 
@@ -26,18 +44,11 @@ run_preset min
 # Post-result's raw-log fallback reads /tmp/recursion_out.txt (unsuffixed).
 cp -f /tmp/recursion_out_min.txt /tmp/recursion_out.txt
 
-# blowup2/blowup4: full-query base-layer regimes over the `empty` diagnostic
-# program. Need origin/main's RECURSION_DUMP_PRESET support to dump a
-# non-min blob; checked once up front instead of failing each preset in turn.
-if git grep -q RECURSION_DUMP_PRESET origin/main -- prover/src/tests/ 2>/dev/null; then
-  run_preset blowup2
-  run_preset blowup4
-else
-  { echo; echo "_(blowup2/blowup4 full-query regimes need \`origin/main\` to have the preset-aware dump test (RECURSION_DUMP_PRESET) — not merged yet, so only \`min\` is compared for this PR.)_"; } >> "$RESULT"
-fi
-
-# blowup4-block: same blowup=4 verifier over a REAL ethrex block (via the
-# `continuation` guest). Needs origin/main's RECURSION_DUMP_EPOCH_LOG2 support.
+# blowup4-block: blowup=4 verifier over a REAL ethrex block proved with continuations
+# (via the `continuation` guest). Needs origin/main's RECURSION_DUMP_EPOCH_LOG2 support.
+# BLOCK_TXS/BLOCK_EPOCH_LOG2 keep the script's own defaults; see its header for why
+# 20 txs at 2^21 with blowup4 is the largest shape whose bundle still fits the guest's
+# MAX_PRIVATE_INPUT_SIZE.
 if git grep -q RECURSION_DUMP_EPOCH_LOG2 origin/main -- prover/src/tests/ 2>/dev/null; then
   run_preset blowup4-block
 else
