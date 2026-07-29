@@ -147,7 +147,7 @@ where
     (final_poly_coeffs, fri_layer_list)
 }
 
-pub fn query_phase<F: IsField>(
+pub fn query_phase<F: IsField + 'static>(
     fri_layers: &[FriLayer<F, FriLayerMerkleTreeBackend<F>>],
     iotas: &[usize],
 ) -> Vec<FriDecommitment<F>>

@@ -411,3 +411,60 @@ extern "C" __global__ void matrix_transpose_strided(
         __syncthreads();
     }
 }
+
+// First-8-levels fused DIT on row-major data: one block stages 256 consecutive
+// rows x blockDim.x columns in shmem and runs levels 0..min(8,log_n) with
+// __syncthreads between levels (row-major analog of ntt_dit_8_levels_batched
+// with base_step == 0, whose twiddle math this reuses verbatim). Grid:
+// x = column tiles, y = n/256 row blocks. Requires n >= 256. Shmem tile is
+// padded (pitch = T+1) to break bank conflicts on the butterfly accesses.
+extern "C" __global__ void ntt_dit_8_levels_row_major(uint64_t *data,
+                                                      const uint64_t *tw,
+                                                      uint64_t n,
+                                                      uint64_t log_n,
+                                                      uint64_t m)
+{
+    extern __shared__ uint64_t tile[];
+    uint32_t T = blockDim.x;
+    uint32_t pitch = T + 1;
+    uint64_t col = (uint64_t)blockIdx.x * T + threadIdx.x;
+    bool live = col < m;
+    uint64_t row_base = (uint64_t)blockIdx.y * 256;
+
+    for (uint32_t r = threadIdx.y; r < 256; r += blockDim.y) {
+        if (live) tile[r * pitch + threadIdx.x] = data[(row_base + r) * m + col];
+    }
+    __syncthreads();
+
+    uint32_t n_loc_steps = (uint32_t)min((uint64_t)8, log_n);
+    uint32_t remaining_high_bits = (uint32_t)(log_n - 1);
+    uint32_t high_mask = (1u << remaining_high_bits) - 1u;
+
+    for (uint32_t loc_step = 0; loc_step < n_loc_steps; ++loc_step) {
+        for (uint32_t i = threadIdx.y; i < 128; i += blockDim.y) {
+            uint32_t half    = 1u << loc_step;
+            uint32_t grp     = i >> loc_step;
+            uint32_t grp_pos = i & (half - 1);
+            uint32_t idx1 = (grp << (loc_step + 1)) + grp_pos;
+            uint32_t idx2 = idx1 + half;
+
+            uint32_t gs  = loc_step;
+            uint32_t ggp = ((uint32_t)blockIdx.y << 7) + i;
+            ggp = (ggp & high_mask) + (ggp >> remaining_high_bits);
+            ggp = ggp & ((1u << gs) - 1u);
+            uint64_t factor = tw[(uint64_t)ggp * (n >> (gs + 1))];
+
+            if (live) {
+                uint64_t u = tile[idx1 * pitch + threadIdx.x];
+                uint64_t v = mul(tile[idx2 * pitch + threadIdx.x], factor);
+                tile[idx1 * pitch + threadIdx.x] = add(u, v);
+                tile[idx2 * pitch + threadIdx.x] = sub(u, v);
+            }
+        }
+        __syncthreads();
+    }
+
+    for (uint32_t r = threadIdx.y; r < 256; r += blockDim.y) {
+        if (live) data[(row_base + r) * m + col] = tile[r * pitch + threadIdx.x];
+    }
+}

@@ -262,9 +262,32 @@ fn run_row_major_ntt_body(
     log_n: u64,
     m: u64,
 ) -> Result<()> {
+    // Levels 0..8 fused in shmem (one DRAM pass instead of eight); the
+    // remaining high-stride levels keep one kernel per level.
+    let mut first_level = 0u64;
+    if n >= 256 {
+        let t: u32 = 8.min(m as u32).max(1);
+        let cfg = LaunchConfig {
+            grid_dim: ((m as u32).div_ceil(t), (n / 256) as u32, 1),
+            block_dim: (t, 128, 1),
+            shared_mem_bytes: 256 * (t + 1) * 8,
+        };
+        unsafe {
+            stream
+                .launch_builder(&be.ntt_dit_8_levels_row_major)
+                .arg(&mut *buf)
+                .arg(tw)
+                .arg(&n)
+                .arg(&log_n)
+                .arg(&m)
+                .launch(cfg)?;
+        }
+        first_level = 8.min(log_n);
+    }
+
     let col_tile: u32 = 32.min(m as u32);
     let row_tile: u32 = (256 / col_tile).max(1);
-    for level in 0..log_n {
+    for level in first_level..log_n {
         let cfg = LaunchConfig {
             grid_dim: (
                 (m as u32).div_ceil(col_tile),
@@ -437,8 +460,15 @@ fn expand_row_major_on_stream(
     // Fill a zeroed lde_size*total_cols buffer; only the first n*total_cols rows
     // carry data, the remainder are already zero (zero-padding for LDE). Host
     // input uploads (H2D); device input copies in place (D2D, no PCIe upload).
+    // Big host traces go through the pinned staging slot: the driver's
+    // internal pageable staging is 2-3x slower and convoys across threads.
+    const PINNED_H2D_MIN_U64: usize = 1 << 20;
     let mut buf = stream.alloc_zeros::<u64>(lde_size * total_cols)?;
     match input {
+        InnerInput::Host(h) if h.len() >= PINNED_H2D_MIN_U64 => {
+            let mut dst = buf.slice_mut(0..n * total_cols);
+            crate::device::htod_via(stream, be.pinned_staging(), &be.ctx, h, &mut dst)?;
+        }
         InnerInput::Host(h) => stream.memcpy_htod(h, &mut buf.slice_mut(0..n * total_cols))?,
         InnerInput::Dev(d) => stream.memcpy_dtod(d, &mut buf.slice_mut(0..n * total_cols))?,
     }
@@ -694,7 +724,7 @@ pub fn coset_lde_row_major_split_trees(
     weights: &[u64],
     split_col: usize,
     build_precomputed: bool,
-) -> Result<(Option<Vec<u8>>, Vec<u8>, GpuLdeBase, Vec<u64>)> {
+) -> Result<(Option<Vec<u8>>, GpuLdeBase, Vec<u64>)> {
     assert!(split_col > 0 && split_col < m, "split inside the row");
     assert!(n.is_power_of_two(), "n must be a power of two");
     assert_eq!(weights.len(), n, "weights length must match n");
@@ -727,7 +757,7 @@ pub fn coset_lde_row_major_split_trees(
     )?;
 
     // One subset tree per column range, built sequentially on the stream.
-    let build_subset_tree = |col_start: u64, col_end: u64| -> Result<Vec<u8>> {
+    let build_subset_tree_dev = |col_start: u64, col_end: u64| -> Result<CudaSlice<u8>> {
         let mut nodes_dev = unsafe { stream.alloc::<u8>(nodes_bytes) }?;
         {
             let mut leaves_view =
@@ -745,17 +775,32 @@ pub fn coset_lde_row_major_split_trees(
             )?;
         }
         crate::merkle::build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
-        let mut nodes_host = vec![0u8; nodes_bytes];
-        stream.memcpy_dtoh(&nodes_dev, &mut nodes_host)?;
-        Ok(nodes_host)
+        Ok(nodes_dev)
     };
 
+    // Precomputed subset tree: full nodes to host (feeds the process-wide
+    // host tree cache keyed by root; built once per prove on cache miss).
     let precomputed_nodes = if build_precomputed {
-        Some(build_subset_tree(0, split_col as u64)?)
+        let nodes_dev = build_subset_tree_dev(0, split_col as u64)?;
+        let mut nodes_host = vec![0u8; nodes_bytes];
+        stream.memcpy_dtoh(&nodes_dev, &mut nodes_host)?;
+        Some(nodes_host)
     } else {
         None
     };
-    let mult_nodes = build_subset_tree(split_col as u64, cols_u64)?;
+    // Multiplicity subset tree: resident (per-epoch; the ~2x-leaves node
+    // download and host rebuild it used to pay are dropped — R4 openings
+    // gather paths on device).
+    let mult_tree = {
+        let nodes_dev = build_subset_tree_dev(split_col as u64, cols_u64)?;
+        let mut root = [0u8; 32];
+        stream.memcpy_dtoh(&nodes_dev.slice(0..32), &mut root)?;
+        GpuMerkleTree {
+            nodes: Arc::new(nodes_dev),
+            leaves_len: num_leaves,
+            root,
+        }
+    };
 
     // D2H the row-major LDE (preprocessed tables always keep the host copy —
     // they are excluded from the device-only gate).
@@ -778,12 +823,12 @@ pub fn coset_lde_row_major_split_trees(
         buf: Arc::new(col_major_dev),
         m,
         lde_size,
-        tree: None,
+        tree: Some(mult_tree),
         ready: Some(Arc::new(ready)),
         trace_dev: trace_col_major.map(Arc::new),
         trace_rows: n,
     };
-    Ok((precomputed_nodes, mult_nodes, handle, lde_out))
+    Ok((precomputed_nodes, handle, lde_out))
 }
 
 /// Row-major ext3 LDE + Keccak + Merkle, all on-device.
@@ -1954,10 +1999,11 @@ pub fn coset_lde_batch_ext3_into(
 /// Batched ext3 coset LDE over columns ALREADY resident on device in slab
 /// layout (`3m` slabs of `lde_size` u64, first `n` of each filled, rest
 /// zero-padded), e.g. from the on-device degree-2 decomposition. Runs the
-/// same butterfly pipeline as [`coset_lde_batch_ext3_into`], drains the
-/// evaluations to `outputs` (interleaved ext3, `3*lde_size` u64 each), and
-/// keeps the device buffer as a [`GpuLdeExt3`] handle (synchronized by the
-/// drain, so `ready: None`).
+/// same butterfly pipeline as [`coset_lde_batch_ext3_into`] and keeps the
+/// device buffer as a [`GpuLdeExt3`] handle. With `outputs = Some(..)` the
+/// evaluations are also drained to host (interleaved ext3, `3*lde_size` u64
+/// each; the drain synchronizes, so `ready: None`). With `None` nothing
+/// leaves the device and the handle carries a `ready` event instead.
 pub fn coset_lde_batch_ext3_slabs_keep(
     stream: &Arc<CudaStream>,
     mut buf: CudaSlice<u64>,
@@ -1965,7 +2011,7 @@ pub fn coset_lde_batch_ext3_slabs_keep(
     n: usize,
     blowup_factor: usize,
     weights: &[u64],
-    outputs: &mut [&mut [u64]],
+    outputs: Option<&mut [&mut [u64]]>,
 ) -> Result<GpuLdeExt3> {
     assert!(m > 0 && n.is_power_of_two(), "slab LDE shape");
     assert_eq!(weights.len(), n, "weights length must match n");
@@ -1976,9 +2022,11 @@ pub fn coset_lde_batch_ext3_slabs_keep(
     let lde_size = n * blowup_factor;
     let mb = 3 * m;
     assert_eq!(buf.len(), mb * lde_size, "slab buffer shape");
-    assert_eq!(outputs.len(), m, "outputs must match column count");
-    for o in outputs.iter() {
-        assert_eq!(o.len(), 3 * lde_size, "each output must be 3*lde_size u64s");
+    if let Some(outputs) = outputs.as_ref() {
+        assert_eq!(outputs.len(), m, "outputs must match column count");
+        for o in outputs.iter() {
+            assert_eq!(o.len(), 3 * lde_size, "each output must be 3*lde_size u64s");
+        }
     }
     assert_u32_domain(lde_size, "coset_lde_batch_ext3_slabs_keep lde_size");
     let log_n = n.trailing_zeros() as u64;
@@ -2040,22 +2088,38 @@ pub fn coset_lde_batch_ext3_slabs_keep(
         mb_u32,
     )?;
 
-    let pending =
-        crate::device::async_dtoh_via(stream, be.pinned_staging(), &be.ctx, &buf, mb * lde_size)?;
-    pending.wait_and_read(|bytes| {
-        // SAFETY: the pinned slab is u64-aligned by construction and the copy
-        // deposited exactly `mb * lde_size` u64s.
-        let pinned =
-            unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const u64, mb * lde_size) };
-        unpack_pinned_slabs_to_ext3(pinned, outputs, lde_size);
-    })?;
+    let ready = match outputs {
+        Some(outputs) => {
+            let pending = crate::device::async_dtoh_via(
+                stream,
+                be.pinned_staging(),
+                &be.ctx,
+                &buf,
+                mb * lde_size,
+            )?;
+            pending.wait_and_read(|bytes| {
+                // SAFETY: the pinned slab is u64-aligned by construction and the
+                // copy deposited exactly `mb * lde_size` u64s.
+                let pinned = unsafe {
+                    std::slice::from_raw_parts(bytes.as_ptr() as *const u64, mb * lde_size)
+                };
+                unpack_pinned_slabs_to_ext3(pinned, outputs, lde_size);
+            })?;
+            None
+        }
+        None => {
+            let ready = be.take_event()?;
+            ready.event().record(stream)?;
+            Some(Arc::new(ready))
+        }
+    };
 
     Ok(GpuLdeExt3 {
         buf: Arc::new(buf),
         m,
         lde_size,
         tree: None,
-        ready: None,
+        ready,
     })
 }
 
