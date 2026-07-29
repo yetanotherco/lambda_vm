@@ -31,8 +31,6 @@ lambda-vm-syscalls = { path = "../../syscalls" }
 
 [dev-dependencies]
 math = { path = "../math", features = ["test-utils"] }
-rand = "0.8.5"
-rand_chacha = "0.3.1"
 sha2 = { version = "0.10", default-features = false }
 bincode = "1"
 
