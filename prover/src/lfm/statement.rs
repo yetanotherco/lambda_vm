@@ -32,9 +32,15 @@ const LFM_PROGRAM_TAG: &[u8] = b"LAMBDAVM_LFM_PROGRAM_V1";
 const LFM_STATEMENT_TAG: &[u8] = b"LAMBDAVM_LFM_STATEMENT_V1";
 
 /// The program digest over the frozen chip order.
+///
+/// `keccak_rnd_chunks` is bound alongside the roots and heights because it is
+/// program shape too: it decides how many `KECCAK_RND` instances the verifier
+/// builds. Binding it here is what makes the registry entry — rather than the
+/// proof — the authority on that shape.
 pub fn lfm_program_id(
     roots: &[Commitment; NUM_LFM_CHIPS],
     log_heights: &[u8; NUM_LFM_CHIPS],
+    keccak_rnd_chunks: usize,
 ) -> Commitment {
     let mut h = Keccak256::new();
     h.update(LFM_PROGRAM_TAG);
@@ -45,6 +51,7 @@ pub fn lfm_program_id(
         h.update(roots[i]);
         h.update([log_heights[i]]);
     }
+    h.update((keccak_rnd_chunks as u64).to_le_bytes());
     h.finalize().into()
 }
 

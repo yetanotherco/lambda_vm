@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use crate::tables::types::FE;
 
 use super::builder::{ArenaSchema, LfmProgramSource};
+use super::chunking::KeccakChunking;
 use super::instr::{Addr, BaseOp, ExtOp, HashMode, Instr, KeccakMode};
 use super::layout::{self, padded_rows};
 
@@ -85,6 +86,23 @@ pub struct LfmProgram {
     pub arena_schema: ArenaSchema,
     pub public_len: u32,
     pub groups: LfmColumnGroups,
+    /// How this program's permutations are spread over `KECCAK_RND`
+    /// instances. Program shape, not a runtime knob: it is fixed here, bound
+    /// into the program digest and pinned in the registry.
+    pub chunking: KeccakChunking,
+}
+
+impl LfmProgram {
+    /// Replaces the `KECCAK_RND` chunking policy.
+    ///
+    /// Chunking affects only how the round-chip rows are distributed over AIR
+    /// instances — never what is compiled — so it is safe to set after
+    /// compilation. Tests use it to force several chunks out of a program with
+    /// a handful of permutations; retuning uses it to size chunks per preset.
+    pub fn with_keccak_chunking(mut self, chunking: KeccakChunking) -> Self {
+        self.chunking = chunking;
+        self
+    }
 }
 
 /// Emission backends. Backend 1 (column groups) is the machine; backend 2 is
@@ -203,6 +221,7 @@ pub fn compile(source: LfmProgramSource) -> LfmProgram {
         arena_schema,
         public_len,
         groups,
+        chunking: KeccakChunking::default(),
     }
 }
 

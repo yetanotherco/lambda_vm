@@ -35,7 +35,11 @@ pub struct LfmTraces {
     /// The three production keccak-family tables, proved unchanged. They carry
     /// no LFM instruction column group: `KECCAK_RND` has no preprocessed
     /// columns at all, and the other two have fixed, program-independent ones.
-    pub keccak_rnd: TraceTable<F, E>,
+    ///
+    /// `KECCAK_RND` is one trace per chunk (see [`super::chunking`]); the
+    /// other two stay single shared instances whose multiplicities count the
+    /// lookups from *every* chunk.
+    pub keccak_rnd: Vec<TraceTable<F, E>>,
     pub keccak_rc: TraceTable<F, E>,
     pub bitwise: TraceTable<F, E>,
 }
@@ -97,9 +101,21 @@ pub fn build_traces(program: &LfmProgram, records: &LfmRecords) -> LfmTraces {
         })
         .collect();
 
-    let keccak_rnd_trace =
-        keccak_rnd::generate_keccak_rnd_trace(&keccak_adapter::round_operations(&keccak_ops));
+    // The round operations split across `KECCAK_RND` chunks; the chip has no
+    // row-to-row constraints, so a chunk is just a slice of the permutations
+    // (see `chunking`). The chunk *count* is program shape, so this uses the
+    // program's pinned policy rather than anything derived here.
+    let round_ops = keccak_adapter::round_operations(&keccak_ops);
+    let keccak_rnd_traces: Vec<_> = program
+        .chunking
+        .split(&round_ops)
+        .into_iter()
+        .map(keccak_rnd::generate_keccak_rnd_trace)
+        .collect();
 
+    // KECCAK_RC and BITWISE are single shared tables: their multiplicities are
+    // totals over the whole proof, so they are fed the complete operation list
+    // regardless of how the round rows were chunked.
     let mut keccak_rc_trace = keccak_rc::generate_keccak_rc_trace();
     keccak_rc::update_multiplicities(&mut keccak_rc_trace, keccak_ops.len());
 
@@ -180,7 +196,7 @@ pub fn build_traces(program: &LfmProgram, records: &LfmRecords) -> LfmTraces {
             super::chips::range::cols::NUM_COLUMNS,
             |_, _| {},
         ),
-        keccak_rnd: keccak_rnd_trace,
+        keccak_rnd: keccak_rnd_traces,
         keccak_rc: keccak_rc_trace,
         bitwise: bitwise_trace,
     }

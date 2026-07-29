@@ -54,6 +54,10 @@ fn main() {
                 .collect::<Vec<_>>()
                 .join(", ");
             println!("        log_heights: [{heights}],");
+            println!(
+                "        keccak_rnd_chunks: {},",
+                artifacts.keccak_rnd_chunks
+            );
             println!("        program_id: {},", fmt_bytes(&artifacts.program_id));
             println!("    }},");
         }
