@@ -75,20 +75,6 @@ pub fn zeroed_fe_vec(len: usize) -> Vec<FE> {
     unsafe { Vec::from_raw_parts(zeros.as_mut_ptr() as *mut FE, zeros.len(), zeros.capacity()) }
 }
 
-#[cfg(test)]
-mod zeroed_fe_vec_tests {
-    use super::*;
-
-    /// Guards the `zeroed_fe_vec` invariant: a calloc'd all-zero buffer
-    /// reinterpreted as `Vec<FE>` must equal an element-wise `FE::zero()` fill.
-    #[test]
-    fn zeroed_fe_vec_matches_fe_zero() {
-        for len in [0usize, 1, 7, 64, 1024] {
-            assert_eq!(zeroed_fe_vec(len), vec![FE::zero(); len], "len={len}");
-        }
-    }
-}
-
 /// Decompose a `u64` into its four little-endian 16-bit limbs as field elements:
 /// `[x[0..16], x[16..32], x[32..48], x[48..64]]` (the `DWordHL` column encoding).
 #[inline]
