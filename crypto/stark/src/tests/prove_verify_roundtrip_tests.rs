@@ -15,8 +15,8 @@ use crate::lookup::{
     NullBoundaryConstraintBuilder, Packing,
 };
 use crate::proof::options::ProofOptions;
-use crate::proof::stark::MultiProof;
-use crate::test_utils::multi_prove_ram;
+use crate::proof::stark::BatchedMultiProof;
+use crate::test_utils::multi_prove_batched_ram;
 use crate::traits::AIR;
 use crate::verifier::{IsStarkVerifier, Verifier};
 
@@ -135,7 +135,7 @@ fn test_verify_serialized_multi_table_proofs() {
             (&mul_air, &mut mul_trace, &()),
         ];
 
-        multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap()
+        multi_prove_batched_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap()
     };
 
     // =========================================================================
@@ -147,7 +147,7 @@ fn test_verify_serialized_multi_table_proofs() {
     // At this point, the prover's data is dropped (out of scope above)
     // The verifier only has the serialized data
 
-    let received_proofs: MultiProof<F, E, ()> =
+    let received_proofs: BatchedMultiProof<F, E, ()> =
         serde_cbor::from_slice(&serialized).expect("Failed to deserialize proofs");
 
     // =========================================================================
@@ -168,7 +168,7 @@ fn test_verify_serialized_multi_table_proofs() {
         vec![&cpu_air, &add_air, &mul_air];
 
     assert!(
-        Verifier::multi_verify(
+        Verifier::batched_multi_verify(
             &airs,
             &received_proofs,
             &mut DefaultTranscript::<E>::new(&[]),

@@ -26,7 +26,7 @@ use stark::lookup::{
     AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, BusValue, NullBoundaryConstraintBuilder,
 };
 use stark::proof::options::ProofOptions;
-use stark::proof::stark::MultiProof;
+use stark::proof::stark::{BatchedMultiProof, MultiProof};
 use stark::prover::{IsStarkProver, Prover, ProvingError};
 #[cfg(feature = "disk-spill")]
 use stark::storage_mode::StorageMode;
@@ -135,6 +135,21 @@ where
     PI: Send + Sync + Clone,
 {
     Prover::<F, E, PI>::multi_prove(
+        air_trace_pairs,
+        transcript,
+        #[cfg(feature = "disk-spill")]
+        StorageMode::Ram,
+    )
+}
+
+pub fn multi_prove_batched_ram<PI>(
+    air_trace_pairs: Vec<GoldilocksPair<'_, PI>>,
+    transcript: &mut (impl IsStarkTranscript<E, F> + Clone + Send),
+) -> Result<BatchedMultiProof<F, E, PI>, ProvingError>
+where
+    PI: Send + Sync + Clone,
+{
+    Prover::<F, E, PI>::multi_prove_batched(
         air_trace_pairs,
         transcript,
         #[cfg(feature = "disk-spill")]

@@ -1,6 +1,7 @@
 use super::{
     config::BatchedMerkleTreeBackend,
     domain::VerifierDomain,
+    fri::{batched::derive_batched_fri_challenges, mmcs::MixedMmcs},
     grinding,
     proof::stark::StarkProof,
     traits::{AIR, TransitionEvaluationContext},
@@ -10,7 +11,7 @@ use crate::{
     config::Commitment,
     domain::new_verifier_domain,
     lookup::{BusPublicInputs, LOGUP_CHALLENGE_ALPHA, LOGUP_NUM_CHALLENGES, compute_alpha_powers},
-    proof::stark::{ArchivedMultiProof, MultiProof},
+    proof::stark::{ArchivedMultiProof, BatchedMultiProof, BatchedTableData, MultiProof},
     proof::view::{
         DeepPolynomialOpeningView, FriDecommitmentView, MultiProofView, PolynomialOpeningsView,
         ProofViewSource, StarkProofView, StarkTableView,
@@ -82,6 +83,24 @@ where
     pub rap_challenges: Vec<FieldElement<FieldExtension>>,
     /// The seed used to verify the proof-of-work nonce.
     pub grinding_seed: [u8; 32],
+}
+
+/// Verifier state carried across the batched (unified-shard) round-4 seam:
+/// everything `batched_verify_round_4` needs that rounds 1-3 derived from the
+/// transcript (per-table domains/heights, the shared OOD point `z`, the round-2
+/// constraint coefficients, and the shared LogUp challenges). Produced by
+/// `batched_verify_rounds_1_to_3`; lets the continuation epoch verifier weave the
+/// separate L2G lane in at the seam.
+pub struct VmMidState<Field: IsFFTField, FieldExtension: IsField + Send + Sync> {
+    pub(crate) domains: Vec<VerifierDomain<Field>>,
+    pub(crate) heights: Vec<usize>,
+    pub(crate) h_max: usize,
+    pub(crate) tallest: usize,
+    pub(crate) needs_lookup_challenges: bool,
+    pub(crate) lookup_challenges: Vec<FieldElement<FieldExtension>>,
+    pub(crate) boundary_coeffs_all: Vec<Vec<FieldElement<FieldExtension>>>,
+    pub(crate) transition_coeffs_all: Vec<Vec<FieldElement<FieldExtension>>>,
+    pub(crate) z: FieldElement<FieldExtension>,
 }
 
 pub type DeepPolynomialEvaluations<F> = (Vec<FieldElement<F>>, Vec<FieldElement<F>>);
@@ -1675,5 +1694,748 @@ pub trait IsStarkVerifier<
         }
 
         true
+    }
+
+    /// Build a lightweight per-table `StarkProof` carrying only the fields
+    /// `step_2_verify_claimed_composition_polynomial` and
+    /// `reconstruct_deep_composition_poly_evaluation_pair` actually read
+    /// (trace_length, OOD evaluations, precomputed root, bus/public inputs). All
+    /// commitment/opening/FRI fields are placeholders those two helpers never
+    /// inspect — this lets the batched verifier reuse them unchanged.
+    fn batched_synthetic_table_proof(
+        table: &BatchedTableData<FieldExtension, PI>,
+    ) -> StarkProof<Field, FieldExtension, PI>
+    where
+        PI: Clone,
+    {
+        StarkProof {
+            trace_length: table.trace_length,
+            lde_trace_main_merkle_root: [0u8; 32],
+            lde_trace_aux_merkle_root: None,
+            lde_trace_precomputed_merkle_root: table.precomputed_root,
+            // Split OOD (g·z pruning): current-row block + pruned next-row block,
+            // the same shape the non-batched `StarkProof` carries. The batched
+            // verifier reconstructs the full grid from these two exactly as
+            // `verify_rounds_2_to_4` does.
+            trace_ood_evaluations: table.trace_ood_evaluations.clone(),
+            trace_ood_next_evaluations: table.trace_ood_next_evaluations.clone(),
+            composition_poly_root: [0u8; 32],
+            composition_poly_parts_ood_evaluation: table
+                .composition_poly_parts_ood_evaluation
+                .clone(),
+            fri_layers_merkle_roots: Vec::new(),
+            fri_final_poly_coeffs: Vec::new(),
+            query_list: Vec::new(),
+            deep_poly_openings: Vec::new(),
+            nonce: None,
+            bus_public_inputs: table.bus_public_inputs.clone(),
+            public_inputs: table.public_inputs.clone(),
+        }
+    }
+
+    /// Verify a `BatchedMultiProof` (unified-shard): ONE linear transcript, ONE
+    /// shared OOD point z, and ONE FRI over the height-combined per-table DEEP
+    /// codewords, with all tables opened from three shared mixed-height MMCS
+    /// trees per query. Mirrors `Prover::multi_prove_batched`.
+    #[allow(clippy::too_many_lines)]
+    fn batched_multi_verify(
+        airs: &[&dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>],
+        proof: &BatchedMultiProof<Field, FieldExtension, PI>,
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
+        expected_bus_balance: &FieldElement<FieldExtension>,
+    ) -> bool
+    where
+        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+        PI: Clone,
+    {
+        let mid = match Self::batched_verify_rounds_1_to_3(airs, proof, transcript) {
+            Some(m) => m,
+            None => return false,
+        };
+        Self::batched_verify_round_4(mid, airs, proof, transcript, expected_bus_balance)
+    }
+
+    /// Rounds 1-3 of the batched (unified-shard) verifier: replays the Fiat-Shamir
+    /// transcript from Phase A (preprocessed roots + the single main MMCS root)
+    /// through the OOD absorption, returning the derived `VmMidState` that round 4
+    /// consumes. Split out of `batched_multi_verify` (behavior-preserving) so the
+    /// continuation epoch verifier can weave the separate L2G lane in at the seam.
+    /// Returns `None` on any structural rejection.
+    fn batched_verify_rounds_1_to_3(
+        airs: &[&dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>],
+        proof: &BatchedMultiProof<Field, FieldExtension, PI>,
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
+    ) -> Option<VmMidState<Field, FieldExtension>>
+    where
+        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+        PI: Clone,
+    {
+        let num_tables = airs.len();
+        if num_tables == 0 || num_tables != proof.per_table.len() {
+            return None;
+        }
+
+        // Per-table lightweight domains + FRI heights (= lde_log_height).
+        let domains: Vec<VerifierDomain<Field>> = airs
+            .iter()
+            .zip(&proof.per_table)
+            .map(|(air, t)| new_verifier_domain(*air, t.trace_length))
+            .collect();
+        let heights: Vec<usize> = domains
+            .iter()
+            .map(|d| d.lde_length.trailing_zeros() as usize)
+            .collect();
+        let h_max = *heights.iter().max().expect("num_tables > 0");
+        // Any tallest table works: all tables at h_max share identical domain
+        // params (global blowup + coset_offset), so z, the FRI point and the
+        // query domain are the same whichever we pick. Mirrors the prover's
+        // `max_by_key` choice (which value it lands on is immaterial here).
+        let tallest = heights
+            .iter()
+            .position(|h| *h == h_max)
+            .expect("h_max is present");
+
+        let needs_lookup_challenges = airs.iter().any(|air| air.has_aux_trace());
+
+        // ===== Round 1 replay =====
+        // Phase A: per preprocessed table, append its hardcoded precomputed root
+        // (checked against the AIR), then the SINGLE batched main-trace MMCS root.
+        for (air, t) in airs.iter().zip(&proof.per_table) {
+            // Soundness: composition part count is fixed by the AIR degree bound,
+            // not chosen by the prover.
+            if t.trace_length == 0
+                || t.composition_poly_parts_ood_evaluation.len()
+                    != air.composition_poly_degree_bound(t.trace_length) / t.trace_length
+            {
+                return None;
+            }
+            // Both OOD blocks' shapes are a public function of the AIR (invariant
+            // I3), never the prover's. Reject any table whose current/next-row
+            // block disagrees BEFORE Round 3 absorbs them and before the round-4
+            // frame/DEEP reconstruction indexes into them. Mirrors the non-batched
+            // `ood_blocks_well_formed`, but the current-row width is checked against
+            // `context().trace_columns` (the physical OOD width = main + aux, the
+            // same figure `OodLayout.num_total_cols` and the DEEP trace-term grid
+            // use) rather than `trace_layout().0 + num_aux`: the batched lane
+            // includes step-packed AIRs (e.g. BitFlags) whose `trace_layout().0` is
+            // a logical, not physical, column count. The width check is load-bearing
+            // (a wrong width desyncs the frame/grid reconstruction and would make
+            // `compute_query_invariant_deep_terms` reject a valid proof, or let a
+            // too-narrow row index out of bounds). All owned tables here, but
+            // `dimensions_consistent` still rejects a mis-deserialized one.
+            let layout = Self::ood_layout(*air);
+            let ood_current = &t.trace_ood_evaluations;
+            let ood_next = &t.trace_ood_next_evaluations;
+            if !ood_current.dimensions_consistent()
+                || ood_current.width != air.context().trace_columns
+                || ood_current.height != layout.step_size()
+                || !ood_next.dimensions_consistent()
+                || ood_next.width != layout.expected_next_width()
+                || ood_next.height != layout.expected_next_height()
+            {
+                return None;
+            }
+            if air.is_preprocessed() {
+                let expected = air.precomputed_commitment();
+                match t.precomputed_root {
+                    Some(actual) if actual == expected => {}
+                    _ => return None,
+                }
+                transcript.append_bytes(&expected);
+            } else if t.precomputed_root.is_some() {
+                return None;
+            }
+        }
+        transcript.append_bytes(&proof.main_root);
+
+        // Bus-input presence must match the AIR layout (a dishonest prover could
+        // omit bus_public_inputs to bypass the balance check).
+        for (air, t) in airs.iter().zip(&proof.per_table) {
+            if air.has_trace_interaction() != t.bus_public_inputs.is_some() {
+                return None;
+            }
+        }
+
+        // Phase B: shared LogUp challenges.
+        let lookup_challenges: Vec<FieldElement<FieldExtension>> = if needs_lookup_challenges {
+            (0..LOGUP_NUM_CHALLENGES)
+                .map(|_| transcript.sample_field_element())
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        // Phase C: single batched aux MMCS root (present iff any table has aux).
+        if needs_lookup_challenges != proof.aux_root.is_some() {
+            return None;
+        }
+        if let Some(root) = proof.aux_root {
+            transcript.append_bytes(&root);
+        }
+
+        // Bus contributions bind before the round-2 challenges.
+        for t in &proof.per_table {
+            if let Some(bpi) = &t.bus_public_inputs {
+                transcript.append_field_element(&bpi.table_contribution);
+            }
+        }
+
+        // ===== Round 2: per-table beta -> boundary/transition coeffs, then the
+        // single batched composition MMCS root. =====
+        let mut boundary_coeffs_all: Vec<Vec<FieldElement<FieldExtension>>> =
+            Vec::with_capacity(num_tables);
+        let mut transition_coeffs_all: Vec<Vec<FieldElement<FieldExtension>>> =
+            Vec::with_capacity(num_tables);
+        for (air, t) in airs.iter().zip(&proof.per_table) {
+            let beta = transcript.sample_field_element();
+            let num_boundary = air
+                .boundary_constraints(
+                    &t.public_inputs,
+                    &lookup_challenges,
+                    t.bus_public_inputs.as_ref(),
+                    t.trace_length,
+                )
+                .constraints
+                .len();
+            let num_transition = air.context().num_transition_constraints;
+            let mut coeffs = compute_alpha_powers(&beta, num_boundary + num_transition);
+            let transition_coeffs: Vec<_> = coeffs.drain(..num_transition).collect();
+            transition_coeffs_all.push(transition_coeffs);
+            boundary_coeffs_all.push(coeffs);
+        }
+        transcript.append_bytes(&proof.composition_root);
+
+        // ===== Round 3: shared z (tallest domain), per-table OOD absorbed. =====
+        let z = transcript.sample_z_ood_with_domain_params(
+            domains[tallest].trace_length,
+            domains[tallest].lde_length,
+            &domains[tallest].coset_offset,
+        );
+        for t in &proof.per_table {
+            // g·z pruning: absorb the current-row block then the pruned next-row
+            // block, each column-major, in the exact order the prover sent them.
+            for block in [&t.trace_ood_evaluations, &t.trace_ood_next_evaluations] {
+                for col in block.columns().iter() {
+                    for elem in col.iter() {
+                        transcript.append_field_element(elem);
+                    }
+                }
+            }
+            for elem in t.composition_poly_parts_ood_evaluation.iter() {
+                transcript.append_field_element(elem);
+            }
+        }
+
+        Some(VmMidState {
+            domains,
+            heights,
+            h_max,
+            tallest,
+            needs_lookup_challenges,
+            lookup_challenges,
+            boundary_coeffs_all,
+            transition_coeffs_all,
+            z,
+        })
+    }
+
+    /// Round 4 of the batched (unified-shard) verifier: the FRI + query phase over
+    /// the height-combined per-table DEEP codewords, plus the bus-balance check.
+    /// Split out of `batched_multi_verify` (behavior-preserving) so the
+    /// continuation epoch verifier can run it AFTER the L2G lane at the seam.
+    fn batched_verify_round_4(
+        mid: VmMidState<Field, FieldExtension>,
+        airs: &[&dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>],
+        proof: &BatchedMultiProof<Field, FieldExtension, PI>,
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
+        expected_bus_balance: &FieldElement<FieldExtension>,
+    ) -> bool
+    where
+        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+        PI: Clone,
+    {
+        let VmMidState {
+            domains,
+            heights,
+            h_max,
+            tallest,
+            needs_lookup_challenges,
+            lookup_challenges,
+            boundary_coeffs_all,
+            transition_coeffs_all,
+            z,
+        } = mid;
+        let num_tables = airs.len();
+
+        // Per-table pruned-OOD layout (AIR-derived, never proof-derived — I3),
+        // built once and shared by the round-4 challenge replay, the full-grid
+        // reconstruction, step 2, the query-invariant hoist, and the per-query
+        // DEEP reconstruction. Mirrors the single `layout` the non-batched
+        // `verify_rounds_2_to_4` threads through those sites.
+        let layouts: Vec<crate::ood::OodLayout> =
+            airs.iter().map(|air| Self::ood_layout(*air)).collect();
+
+        // ===== Round 4: shared gamma, per-table DEEP coeffs, batched FRI challenges. =====
+        let gamma = transcript.sample_field_element();
+        let mut trace_term_coeffs_all: Vec<Vec<Vec<FieldElement<FieldExtension>>>> =
+            Vec::with_capacity(num_tables);
+        let mut gammas_all: Vec<Vec<FieldElement<FieldExtension>>> = Vec::with_capacity(num_tables);
+        for (i, t) in proof.per_table.iter().enumerate() {
+            let num_terms_comp = t.composition_poly_parts_ood_evaluation.len();
+            // g·z pruning: draw only the surviving trace-term powers (current-row
+            // block all columns + next-row block masked columns) and scatter them
+            // into the rectangular W×num_eval_points grid with zeros at pruned
+            // positions — identical to the prover's `build_trace_term_coeffs` and
+            // the non-batched round-4 replay.
+            let layout = &layouts[i];
+            let num_terms_trace = layout.num_surviving();
+            let mut coeffs: Vec<_> =
+                core::iter::successors(Some(FieldElement::one()), |x| Some(x * &gamma))
+                    .take(num_terms_comp + num_terms_trace)
+                    .collect();
+            let trace_term_powers: Vec<_> = coeffs.drain(..num_terms_trace).collect();
+            let trace_term_coeffs = layout.build_trace_term_coeffs(&trace_term_powers);
+            trace_term_coeffs_all.push(trace_term_coeffs);
+            gammas_all.push(coeffs);
+        }
+
+        let grinding_factor = airs[0].context().proof_options.grinding_factor;
+        let num_queries = airs[0].options().fri_number_of_queries;
+        let fri_domain_size = 1usize << h_max;
+        let fri_challenges = derive_batched_fri_challenges(
+            transcript,
+            &heights,
+            &proof.fri_layers_merkle_roots,
+            &proof.fri_last_value,
+            grinding_factor,
+            proof.nonce,
+            num_queries,
+            fri_domain_size,
+        );
+        let alpha = fri_challenges.alpha;
+        let betas_fri = fri_challenges.betas;
+        let iotas = fri_challenges.iotas;
+
+        // Grinding.
+        if grinding_factor > 0 {
+            let ok = proof.nonce.is_some_and(|n| {
+                grinding::is_valid_nonce(&fri_challenges.grinding_seed, n, grinding_factor)
+            });
+            if !ok {
+                return false;
+            }
+        }
+
+        if proof.query_list.len() < num_queries || proof.deep_poly_openings.len() < num_queries {
+            return false;
+        }
+
+        // Per-table synthetic proofs + Challenges (reused by step 2 and the query loop).
+        let synth_proofs: Vec<StarkProof<Field, FieldExtension, PI>> = proof
+            .per_table
+            .iter()
+            .map(Self::batched_synthetic_table_proof)
+            .collect();
+        // Move (not clone) each table's per-table coefficient vectors into its
+        // `Challenges`; they are never read again after this. Only `z` (one field
+        // element) and the shared `rap_challenges` are cloned per table.
+        let table_challenges: Vec<Challenges<FieldExtension>> = itertools::izip!(
+            boundary_coeffs_all,
+            transition_coeffs_all,
+            trace_term_coeffs_all,
+            gammas_all,
+        )
+        .map(
+            |(boundary_coeffs, transition_coeffs, trace_term_coeffs, gammas)| Challenges {
+                z: z.clone(),
+                boundary_coeffs,
+                transition_coeffs,
+                trace_term_coeffs,
+                gammas,
+                zetas: Vec::new(),
+                iotas: Vec::new(),
+                rap_challenges: lookup_challenges.clone(),
+                grinding_seed: [0u8; 32],
+            },
+        )
+        .collect();
+
+        // The full current+next-row OOD grid, reconstructed once per table from
+        // the two pruned proof blocks and shared by step 2, the query-invariant
+        // hoist, and the per-query DEEP reconstruction — exactly as
+        // `verify_rounds_2_to_4` reconstructs it once and threads it through.
+        // Pruned next-row entries are zero: no constraint reads them and DEEP
+        // skips them.
+        let ood_fulls: Vec<Table<FieldExtension>> = (0..num_tables)
+            .map(|i| {
+                let current = &synth_proofs[i].trace_ood_evaluations;
+                let next = &synth_proofs[i].trace_ood_next_evaluations;
+                layouts[i].reconstruct_full(
+                    current.row_major_data(),
+                    current.width,
+                    next.row_major_data(),
+                )
+            })
+            .collect();
+
+        // ===== Step 2 (claimed composition polynomial) per table. =====
+        for i in 0..num_tables {
+            if !Self::step_2_verify_claimed_composition_polynomial(
+                airs[i],
+                StarkProofView::Owned(&synth_proofs[i]),
+                &synth_proofs[i].public_inputs,
+                &domains[i],
+                &table_challenges[i],
+                &ood_fulls[i],
+                layouts[i].step_size(),
+            ) {
+                return false;
+            }
+        }
+
+        // MMCS binding data (all public / from the AIRs).
+        // Committed main-split width per table = full main columns minus the
+        // precomputed prefix. `context().trace_columns` counts every committed
+        // trace column (main + aux), so subtracting the aux and precomputed
+        // counts yields the main-split width. All three are AIR-intrinsic (not
+        // proof-supplied), so this binds the MMCS leaf boundaries independently
+        // of the prover. NB: `trace_layout().0` is NOT usable here — for
+        // step-packed AIRs (e.g. BitFlags) it is a logical layout figure, not
+        // the physical column count.
+        let main_widths: Vec<usize> = airs
+            .iter()
+            .map(|a| {
+                a.context().trace_columns
+                    - a.num_auxiliary_rap_columns()
+                    - a.num_precomputed_columns()
+            })
+            .collect();
+        let comp_widths: Vec<usize> = proof
+            .per_table
+            .iter()
+            .map(|t| t.composition_poly_parts_ood_evaluation.len())
+            .collect();
+        let aux_indices: Vec<usize> = (0..num_tables)
+            .filter(|&i| airs[i].has_aux_trace())
+            .collect();
+        let aux_heights: Vec<usize> = aux_indices.iter().map(|&i| heights[i]).collect();
+        let aux_widths: Vec<usize> = aux_indices
+            .iter()
+            .map(|&i| airs[i].num_auxiliary_rap_columns())
+            .collect();
+        let precomputed_indices: Vec<usize> = (0..num_tables)
+            .filter(|&i| airs[i].is_preprocessed())
+            .collect();
+
+        // alpha^i powers for the cross-table combination.
+        let mut alpha_pows: Vec<FieldElement<FieldExtension>> = Vec::with_capacity(num_tables);
+        {
+            let mut cur = FieldElement::<FieldExtension>::one();
+            for _ in 0..num_tables {
+                alpha_pows.push(cur.clone());
+                cur = &cur * &alpha;
+            }
+        }
+        let num_layers = proof.fri_layers_merkle_roots.len();
+
+        // Per-table DEEP query-invariant terms, hoisted out of the query loop
+        // (#826): the OOD/gamma sums depend only on each table's challenges and
+        // reconstructed OOD grid, not on the query point. g·z pruning: the
+        // transition-window columns (`layouts[i].next_row_cols()`) are the only
+        // next-row openings that survive, derived from the AIR (never the proof),
+        // and the pruned-away next-row terms are skipped — the same reconstruction
+        // the non-batched path performs and the batched prover's DEEP codeword
+        // committed.
+        let mut query_invariant_terms_all = Vec::with_capacity(num_tables);
+        for i in 0..num_tables {
+            let terms = match Self::compute_query_invariant_deep_terms(
+                &table_challenges[i],
+                StarkProofView::Owned(&synth_proofs[i]),
+                &ood_fulls[i],
+                layouts[i].next_row_cols(),
+                layouts[i].step_size(),
+            ) {
+                Some(t) => t,
+                None => return false,
+            };
+            query_invariant_terms_all.push(terms);
+        }
+
+        // ===== Per query: MMCS openings, DEEP reconstruction, fold-and-inject FRI. =====
+        for (q, &iota) in iotas.iter().enumerate() {
+            let qo = &proof.deep_poly_openings[q];
+
+            // 1) Authenticate the shared per-phase openings.
+            if !MixedMmcs::<Field>::verify_batch(
+                &proof.main_root,
+                iota,
+                &qo.main,
+                &heights,
+                &main_widths,
+            ) {
+                return false;
+            }
+            match (&proof.aux_root, &qo.aux) {
+                (Some(root), Some(aux_op)) => {
+                    if !MixedMmcs::<FieldExtension>::verify_batch(
+                        root,
+                        iota,
+                        aux_op,
+                        &aux_heights,
+                        &aux_widths,
+                    ) {
+                        return false;
+                    }
+                }
+                (None, None) => {}
+                _ => return false,
+            }
+            if !MixedMmcs::<FieldExtension>::verify_batch(
+                &proof.composition_root,
+                iota,
+                &qo.composition,
+                &heights,
+                &comp_widths,
+            ) {
+                return false;
+            }
+
+            // Precomputed openings (one per preprocessed table, in that order).
+            if qo.precomputed.len() != precomputed_indices.len() {
+                return false;
+            }
+            for (pc, &ti) in precomputed_indices.iter().enumerate() {
+                let root = match proof.per_table[ti].precomputed_root {
+                    Some(r) => r,
+                    None => return false,
+                };
+                let local = iota >> (h_max - heights[ti]);
+                if !Self::verify_opening_pair::<Field>(
+                    PolynomialOpeningsView::Owned(&qo.precomputed[pc]),
+                    &root,
+                    local,
+                ) {
+                    return false;
+                }
+            }
+
+            // 2) Reconstruct each table's DEEP value at its opened row pair.
+            let mut deep_primary = vec![FieldElement::<FieldExtension>::zero(); num_tables];
+            let mut deep_sym = vec![FieldElement::<FieldExtension>::zero(); num_tables];
+            for i in 0..num_tables {
+                let leaf = iota >> (h_max - heights[i]);
+                let main_op = &qo.main.per_matrix[i];
+                let comp_op = &qo.composition.per_matrix[i];
+                let precomp_op = precomputed_indices
+                    .iter()
+                    .position(|&x| x == i)
+                    .map(|pc| &qo.precomputed[pc]);
+                let aux_op = aux_indices
+                    .iter()
+                    .position(|&x| x == i)
+                    .and_then(|ai| qo.aux.as_ref().map(|a| &a.per_matrix[ai]));
+
+                // Base columns as two borrowed slices in commit order
+                // (precomputed FIRST, then main) — the pair reconstruction
+                // resolves a base column via its own `base_at`, so there is no
+                // per-query concat allocation.
+                let precomp_p: &[FieldElement<Field>] =
+                    precomp_op.map(|p| p.evaluations.as_slice()).unwrap_or(&[]);
+                let precomp_s: &[FieldElement<Field>] = precomp_op
+                    .map(|p| p.evaluations_sym.as_slice())
+                    .unwrap_or(&[]);
+                let aux_p: &[FieldElement<FieldExtension>] =
+                    aux_op.map(|a| a.evaluations.as_slice()).unwrap_or(&[]);
+                let aux_s: &[FieldElement<FieldExtension>] =
+                    aux_op.map(|a| a.evaluations_sym.as_slice()).unwrap_or(&[]);
+
+                let prim_root = &domains[i].trace_primitive_root;
+                let ep_p = domains[i]
+                    .lde_coset_element(reverse_index(leaf * 2, domains[i].lde_length as u64));
+                let ep_s = domains[i]
+                    .lde_coset_element(reverse_index(leaf * 2 + 1, domains[i].lde_length as u64));
+
+                // Reconstruct the DEEP value at the query's row pair (regular +
+                // symmetric) together, sharing the hoisted OOD/gamma sums (#826).
+                let (dp, ds) = match Self::reconstruct_deep_composition_poly_evaluation_pair(
+                    &ep_p,
+                    &ep_s,
+                    prim_root,
+                    &table_challenges[i],
+                    &query_invariant_terms_all[i],
+                    layouts[i].next_row_cols(),
+                    layouts[i].step_size(),
+                    precomp_p,
+                    &main_op.evaluations,
+                    aux_p,
+                    &comp_op.evaluations,
+                    precomp_s,
+                    &main_op.evaluations_sym,
+                    aux_s,
+                    &comp_op.evaluations_sym,
+                ) {
+                    Some(v) => v,
+                    None => return false,
+                };
+                deep_primary[i] = dp;
+                deep_sym[i] = ds;
+            }
+
+            // combined[h] at a codeword position selected by `bit` (0 -> primary
+            // row, 1 -> symmetric row): Sum over tables at height h of alpha^i * deep_i.
+            let combined_at = |h: usize, bit: usize| -> FieldElement<FieldExtension> {
+                let mut acc = FieldElement::<FieldExtension>::zero();
+                for i in 0..num_tables {
+                    if heights[i] == h {
+                        let d = if bit == 0 {
+                            &deep_primary[i]
+                        } else {
+                            &deep_sym[i]
+                        };
+                        acc += &alpha_pows[i] * d;
+                    }
+                }
+                acc
+            };
+
+            // 3) Fold-and-inject FRI (inverse of `batched_commit_phase`).
+            let c_hmax = combined_at(h_max, 0);
+            let c_hmax_sym = combined_at(h_max, 1);
+
+            let ep0 = domains[tallest]
+                .lde_coset_element(reverse_index(iota * 2, domains[tallest].lde_length as u64));
+            let ep0_inv = match ep0.inv() {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+
+            // Initial fold of the (uncommitted) tallest layer with betas_fri[0].
+            let mut v =
+                (&c_hmax + &c_hmax_sym) + ep0_inv.clone() * &betas_fri[0] * (&c_hmax - &c_hmax_sym);
+            let mut index = iota;
+            let mut point_inv = ep0_inv.square();
+
+            let fri_deco = &proof.query_list[q];
+            if fri_deco.layers_auth_paths.len() != num_layers
+                || fri_deco.layers_evaluations_sym.len() != num_layers
+            {
+                return false;
+            }
+
+            let mut fold_ok = true;
+            for iter in 0..num_layers {
+                let h = h_max - 1 - iter;
+                // Inject the tables entering at this height (adds zero if none).
+                let inj = combined_at(h, index & 1);
+                v += betas_fri[iter].square() * inj;
+
+                let eval_sym = &fri_deco.layers_evaluations_sym[iter];
+                fold_ok &= Self::verify_fri_layer_openings(
+                    &proof.fri_layers_merkle_roots[iter],
+                    &fri_deco.layers_auth_paths[iter].merkle_path,
+                    &v,
+                    eval_sym,
+                    index,
+                );
+
+                v = (&v + eval_sym) + point_inv.clone() * &betas_fri[iter + 1] * (&v - eval_sym);
+                index >>= 1;
+                point_inv = point_inv.square();
+            }
+            if !fold_ok || v != proof.fri_last_value {
+                return false;
+            }
+        }
+
+        // ===== Bus balance. =====
+        if needs_lookup_challenges {
+            let mut total = FieldElement::<FieldExtension>::zero();
+            for (air, t) in airs.iter().zip(&proof.per_table) {
+                if air.has_trace_interaction()
+                    && let Some(bpi) = &t.bus_public_inputs
+                {
+                    total = total + &bpi.table_contribution;
+                }
+            }
+            if total != *expected_bus_balance {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    /// Continuation epoch verifier: verify the epoch's VM tables with the batched
+    /// (unified-shard) FRI while verifying the single L2G sub-table as a SEPARATE
+    /// commitment lane. Mirrors `IsStarkProver::multi_prove_batched_epoch`'s
+    /// transcript order exactly:
+    ///
+    /// 1. Absorb the L2G main root FIRST.
+    /// 2. `batched_verify_rounds_1_to_3` over the VM tables (to the round-4 seam).
+    /// 3. At the seam, FORK the transcript (single lane -> no idx bytes; then absorb
+    ///    the L2G aux root, then the L2G bus `table_contribution`) and verify the
+    ///    L2G lane via `verify_rounds_2_to_4` with the shared LogUp challenges.
+    /// 4. `batched_verify_round_4` for the VM tables on the main transcript.
+    fn batched_verify_epoch(
+        vm_refs: &[&dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>],
+        l2g_ref: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        vm_proof: &BatchedMultiProof<Field, FieldExtension, PI>,
+        l2g_proof: &StarkProof<Field, FieldExtension, PI>,
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
+        expected_bus_balance: &FieldElement<FieldExtension>,
+    ) -> bool
+    where
+        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+        PI: Clone,
+    {
+        // (1) Mirror the prover: absorb the L2G main root FIRST (canonical order).
+        transcript.append_bytes(&l2g_proof.lde_trace_main_merkle_root);
+
+        // (2) VM rounds 1-3 to the round-4 seam.
+        let mid = match Self::batched_verify_rounds_1_to_3(vm_refs, vm_proof, transcript) {
+            Some(m) => m,
+            None => return false,
+        };
+
+        // (3) L2G lane on a fork of the post-seam transcript. Single lane -> no idx
+        // bytes; absorb the aux root then the bus table_contribution (matches the
+        // prover's fork in `multi_prove_batched_epoch`).
+        let mut l2g_fork = transcript.clone();
+        if let Some(aux_root) = l2g_proof.lde_trace_aux_merkle_root {
+            l2g_fork.append_bytes(&aux_root);
+        }
+        if let Some(bpi) = l2g_proof.bus_public_inputs.as_ref() {
+            l2g_fork.append_field_element(&bpi.table_contribution);
+        }
+        let l2g_ok = Self::verify_rounds_2_to_4(
+            l2g_ref,
+            StarkProofView::Owned(l2g_proof),
+            &l2g_proof.public_inputs,
+            &mut l2g_fork,
+            mid.lookup_challenges.clone(),
+        );
+
+        // (4) VM batched Round 4 continues on the main (un-cloned) transcript.
+        //
+        // Bus balance: L2G shares the in-trace Memory / range-check buses with the
+        // VM tables. The monolithic check summed table_contribution over VM + L2G
+        // against the COMMIT offset; batched_verify_round_4 sums only the VM lane,
+        // so fold L2G's contribution into the target:
+        //   Sum_VM table_contribution == expected - L2G_contribution
+        // i.e. Sum_VM + L2G == expected. L2G's table_contribution is bound to its
+        // committed trace by the L2G proof verified above, so this stays sound.
+        let mut vm_expected = expected_bus_balance.clone();
+        if l2g_ref.has_trace_interaction()
+            && let Some(bpi) = l2g_proof.bus_public_inputs.as_ref()
+        {
+            vm_expected = &vm_expected - &bpi.table_contribution;
+        }
+        let vm_ok = Self::batched_verify_round_4(mid, vm_refs, vm_proof, transcript, &vm_expected);
+
+        l2g_ok && vm_ok
     }
 }

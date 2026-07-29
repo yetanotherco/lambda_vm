@@ -23,7 +23,7 @@ use stark::verifier::{IsStarkVerifier, Verifier};
 
 use crate::tables::lt::{LtOperation, cols, generate_lt_trace};
 use crate::tables::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
-use crate::test_utils::multi_prove_ram;
+use crate::test_utils::{multi_prove_batched_ram, multi_prove_ram};
 
 type F = GoldilocksField;
 type E = GoldilocksExtension;
@@ -289,12 +289,12 @@ fn prove_and_verify(ops: &[LtOperation]) -> bool {
     ];
 
     let multi_proof =
-        multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        multi_prove_batched_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&sender_air, &receiver_air];
 
-    Verifier::multi_verify(
+    Verifier::batched_multi_verify(
         &airs,
         &multi_proof,
         &mut DefaultTranscript::<E>::new(&[]),

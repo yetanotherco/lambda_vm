@@ -18,7 +18,6 @@ use math::field::element::FieldElement;
 use stark::constraints::builder::EmptyConstraints;
 use stark::lookup::{AirWithBuses, AuxiliaryTraceBuildData};
 use stark::proof::options::ProofOptions;
-use stark::proof::view::{MultiProofView, StarkProofView};
 use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
@@ -32,6 +31,7 @@ use executor::vm::execution::Executor;
 
 // Import shared utilities
 use crate::VmAirs;
+use crate::test_utils::multi_prove_batched_ram;
 use crate::test_utils::multi_prove_ram;
 use crate::test_utils::run_asm_elf;
 
@@ -76,15 +76,10 @@ fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
     };
 
     // Compute the verifier-side expected COMMIT bus balance from public output bytes
-    let views: Vec<StarkProofView<F, E, ()>> = multi_proof
-        .proofs
-        .iter()
-        .map(StarkProofView::Owned)
-        .collect();
     let mut replay_transcript = DefaultTranscript::<E>::new(&[]);
-    let expected_bus_balance = crate::compute_expected_commit_bus_balance_view(
+    let expected_bus_balance = crate::compute_expected_commit_bus_balance(
         &airs.air_refs(),
-        &views,
+        &multi_proof,
         &traces.public_output_bytes,
         0,
         &mut replay_transcript,
@@ -92,9 +87,9 @@ fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
     .expect("fingerprint collision in test");
 
     // Verify using centralized air_refs() which includes all tables
-    Verifier::multi_verify_views(
+    Verifier::multi_verify(
         &airs.air_refs(),
-        &views,
+        &multi_proof,
         &mut DefaultTranscript::<E>::new(&[]),
         &expected_bus_balance,
     )
@@ -126,7 +121,7 @@ fn prove_vm_minimal(elf_bytes: &[u8], private_inputs: &[u8], max_rows: &MaxRowsC
         None,
     );
     let runtime_page_ranges = traces.runtime_page_ranges();
-    let proof = multi_prove_ram(
+    let proof = multi_prove_batched_ram(
         airs.air_trace_pairs(&mut traces),
         &mut DefaultTranscript::<E>::new(&[]),
     )
@@ -169,24 +164,19 @@ fn verify_vm_minimal(vm_proof: &VmProof, elf_bytes: &[u8]) -> bool {
         None,
     );
     let air_refs = airs.air_refs();
-    let views: Vec<StarkProofView<F, E, ()>> = vm_proof
-        .proof
-        .proofs
-        .iter()
-        .map(StarkProofView::Owned)
-        .collect();
     let mut replay_transcript = DefaultTranscript::<E>::new(&[]);
-    let expected_bus_balance = crate::compute_expected_commit_bus_balance_view(
+    let expected_bus_balance = crate::compute_expected_commit_bus_balance_batched(
         &air_refs,
-        &views,
+        &vm_proof.proof,
         &vm_proof.public_output,
         0,
+        None,
         &mut replay_transcript,
     )
     .expect("fingerprint collision in test");
-    Verifier::multi_verify_views(
+    Verifier::batched_multi_verify(
         &air_refs,
-        &views,
+        &vm_proof.proof,
         &mut DefaultTranscript::<E>::new(&[]),
         &expected_bus_balance,
     )
@@ -1390,21 +1380,19 @@ fn test_prove_elfs_test_commit_4_wrong_pages_rejected() {
         None,
     );
     let verifier_air_refs = verifier_airs.air_refs();
-    let views: Vec<StarkProofView<F, E, ()>> =
-        proof.proofs.iter().map(StarkProofView::Owned).collect();
     let mut replay_transcript = DefaultTranscript::<E>::new(&[]);
-    let expected_bus_balance = crate::compute_expected_commit_bus_balance_view(
+    let expected_bus_balance = crate::compute_expected_commit_bus_balance(
         &verifier_air_refs,
-        &views,
+        &proof,
         &traces.public_output_bytes,
         0,
         &mut replay_transcript,
     )
     .expect("fingerprint collision in test");
 
-    let verified = Verifier::multi_verify_views(
+    let verified = Verifier::multi_verify(
         &verifier_air_refs,
-        &views,
+        &proof,
         &mut DefaultTranscript::<E>::new(&[]),
         &expected_bus_balance,
     );
@@ -2147,21 +2135,19 @@ fn test_deep_stack_runtime_pages_roundtrip() {
         None,
     );
     let verifier_air_refs = verifier_airs.air_refs();
-    let views: Vec<StarkProofView<F, E, ()>> =
-        proof.proofs.iter().map(StarkProofView::Owned).collect();
     let mut replay_transcript = DefaultTranscript::<E>::new(&[]);
-    let expected_bus_balance = crate::compute_expected_commit_bus_balance_view(
+    let expected_bus_balance = crate::compute_expected_commit_bus_balance(
         &verifier_air_refs,
-        &views,
+        &proof,
         &traces.public_output_bytes,
         0,
         &mut replay_transcript,
     )
     .expect("fingerprint collision in test");
 
-    let verified = Verifier::multi_verify_views(
+    let verified = Verifier::multi_verify(
         &verifier_air_refs,
-        &views,
+        &proof,
         &mut DefaultTranscript::<E>::new(&[]),
         &expected_bus_balance,
     );
@@ -2222,21 +2208,19 @@ fn test_deep_stack_missing_pages_rejected() {
         None,
     );
     let verifier_air_refs = verifier_airs.air_refs();
-    let views: Vec<StarkProofView<F, E, ()>> =
-        proof.proofs.iter().map(StarkProofView::Owned).collect();
     let mut replay_transcript = DefaultTranscript::<E>::new(&[]);
-    let expected_bus_balance = crate::compute_expected_commit_bus_balance_view(
+    let expected_bus_balance = crate::compute_expected_commit_bus_balance(
         &verifier_air_refs,
-        &views,
+        &proof,
         &traces.public_output_bytes,
         0,
         &mut replay_transcript,
     )
     .expect("fingerprint collision in test");
 
-    let verified = Verifier::multi_verify_views(
+    let verified = Verifier::multi_verify(
         &verifier_air_refs,
-        &views,
+        &proof,
         &mut DefaultTranscript::<E>::new(&[]),
         &expected_bus_balance,
     );
@@ -2332,21 +2316,19 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
         None,
     );
     let verifier_air_refs = verifier_airs.air_refs();
-    let views: Vec<StarkProofView<F, E, ()>> =
-        proof.proofs.iter().map(StarkProofView::Owned).collect();
     let mut replay_transcript = DefaultTranscript::<E>::new(&[]);
-    let expected_bus_balance = crate::compute_expected_commit_bus_balance_view(
+    let expected_bus_balance = crate::compute_expected_commit_bus_balance(
         &verifier_air_refs,
-        &views,
+        &proof,
         &traces.public_output_bytes,
         0,
         &mut replay_transcript,
     )
     .expect("fingerprint collision in test");
 
-    let verified = Verifier::multi_verify_views(
+    let verified = Verifier::multi_verify(
         &verifier_air_refs,
-        &views,
+        &proof,
         &mut DefaultTranscript::<E>::new(&[]),
         &expected_bus_balance,
     );
@@ -2935,7 +2917,7 @@ fn test_count_elements_nonzero() {
 /// not terminate, so it is proven with the HALT table excluded (`include_halt = false`).
 #[test]
 fn test_prove_first_epoch_without_halt() {
-    use crate::compute_expected_commit_bus_balance_view;
+    use crate::compute_expected_commit_bus_balance;
     use crate::tables::trace_builder::build_initial_image;
     use crate::test_utils::asm_elf_bytes;
 
@@ -2992,15 +2974,10 @@ fn test_prove_first_epoch_without_halt() {
     )
     .expect("first epoch failed to prove");
 
-    let views: Vec<StarkProofView<F, E, ()>> = multi_proof
-        .proofs
-        .iter()
-        .map(StarkProofView::Owned)
-        .collect();
     let mut replay = DefaultTranscript::<E>::new(&[]);
-    let expected_bus_balance = compute_expected_commit_bus_balance_view(
+    let expected_bus_balance = compute_expected_commit_bus_balance(
         &airs.air_refs(),
-        &views,
+        &multi_proof,
         &traces.public_output_bytes,
         0,
         &mut replay,
@@ -3008,9 +2985,9 @@ fn test_prove_first_epoch_without_halt() {
     .expect("fingerprint collision in test");
 
     assert!(
-        Verifier::multi_verify_views(
+        Verifier::multi_verify(
             &airs.air_refs(),
-            &views,
+            &multi_proof,
             &mut DefaultTranscript::<E>::new(&[]),
             &expected_bus_balance,
         ),
@@ -3023,7 +3000,7 @@ fn test_prove_first_epoch_without_halt() {
 /// does not terminate (HALT excluded).
 #[test]
 fn test_prove_second_epoch_from_snapshot() {
-    use crate::compute_expected_commit_bus_balance_view;
+    use crate::compute_expected_commit_bus_balance;
     use crate::tables::register;
     use crate::test_utils::asm_elf_bytes;
 
@@ -3081,15 +3058,10 @@ fn test_prove_second_epoch_from_snapshot() {
     )
     .expect("second epoch failed to prove");
 
-    let views: Vec<StarkProofView<F, E, ()>> = multi_proof
-        .proofs
-        .iter()
-        .map(StarkProofView::Owned)
-        .collect();
     let mut replay = DefaultTranscript::<E>::new(&[]);
-    let expected_bus_balance = compute_expected_commit_bus_balance_view(
+    let expected_bus_balance = compute_expected_commit_bus_balance(
         &airs.air_refs(),
-        &views,
+        &multi_proof,
         &traces.public_output_bytes,
         0,
         &mut replay,
@@ -3097,9 +3069,9 @@ fn test_prove_second_epoch_from_snapshot() {
     .expect("fingerprint collision in test");
 
     assert!(
-        Verifier::multi_verify_views(
+        Verifier::multi_verify(
             &airs.air_refs(),
-            &views,
+            &multi_proof,
             &mut DefaultTranscript::<E>::new(&[]),
             &expected_bus_balance,
         ),
@@ -3113,7 +3085,7 @@ fn test_prove_second_epoch_from_snapshot() {
 /// will bind to. The cross-epoch GlobalMemory matching is proven separately.
 #[test]
 fn test_epoch_proof_commits_l2g() {
-    use crate::compute_expected_commit_bus_balance_view;
+    use crate::compute_expected_commit_bus_balance;
     use crate::tables::local_to_global;
     use crate::tables::register;
     use crate::tables::trace_builder::{build_initial_image, epoch_touched_cells};
@@ -3197,15 +3169,10 @@ fn test_epoch_proof_commits_l2g() {
     let mut refs = airs.air_refs();
     refs.push(&inert_l2g_air);
 
-    let views: Vec<StarkProofView<F, E, ()>> = multi_proof
-        .proofs
-        .iter()
-        .map(StarkProofView::Owned)
-        .collect();
     let mut replay = DefaultTranscript::<E>::new(&[]);
-    let expected_bus_balance = compute_expected_commit_bus_balance_view(
+    let expected_bus_balance = compute_expected_commit_bus_balance(
         &refs,
-        &views,
+        &multi_proof,
         &traces.public_output_bytes,
         0,
         &mut replay,
@@ -3213,9 +3180,9 @@ fn test_epoch_proof_commits_l2g() {
     .expect("fingerprint collision in test");
 
     assert!(
-        Verifier::multi_verify_views(
+        Verifier::multi_verify(
             &refs,
-            &views,
+            &multi_proof,
             &mut DefaultTranscript::<E>::new(&[]),
             &expected_bus_balance,
         ),
@@ -3245,7 +3212,7 @@ fn test_epoch_proof_commits_l2g() {
 /// argument.
 #[test]
 fn test_continuation_pipeline_end_to_end() {
-    use crate::compute_expected_commit_bus_balance_view;
+    use crate::compute_expected_commit_bus_balance;
     use crate::tables::local_to_global;
     use crate::tables::register;
     use crate::tables::trace_builder::{build_initial_image, epoch_touched_cells};
@@ -3358,24 +3325,19 @@ fn test_continuation_pipeline_end_to_end() {
 
         let mut refs = airs.air_refs();
         refs.push(&inert_l2g_air);
-        let views: Vec<StarkProofView<F, E, ()>> = multi_proof
-            .proofs
-            .iter()
-            .map(StarkProofView::Owned)
-            .collect();
         let mut replay = DefaultTranscript::<E>::new(&[]);
-        let expected_bus_balance = compute_expected_commit_bus_balance_view(
+        let expected_bus_balance = compute_expected_commit_bus_balance(
             &refs,
-            &views,
+            &multi_proof,
             &traces.public_output_bytes,
             0,
             &mut replay,
         )
         .expect("fingerprint collision in test");
         assert!(
-            Verifier::multi_verify_views(
+            Verifier::multi_verify(
                 &refs,
-                &views,
+                &multi_proof,
                 &mut DefaultTranscript::<E>::new(&[]),
                 &expected_bus_balance,
             ),
@@ -3401,10 +3363,7 @@ fn test_continuation_pipeline_end_to_end() {
     // epoch proof exposed equals the per-epoch L2G sub-table root in the final proof.
     let final_proof = crate::tests::local_to_global_bus_tests::prove_global(&boundaries);
     assert!(
-        crate::verify_l2g_commitment_binding_view(
-            &epoch_roots,
-            MultiProofView::Owned(&final_proof)
-        ),
+        crate::verify_l2g_commitment_binding(&epoch_roots, &final_proof),
         "final proof must be bound to the real per-epoch L2G roots"
     );
 }
@@ -3415,7 +3374,7 @@ fn test_continuation_pipeline_end_to_end() {
 /// `Memory` bus still nets to zero — L2G has replaced PAGE as the bookend.
 #[test]
 fn test_epoch_memory_bus_with_l2g_bookend() {
-    use crate::compute_expected_commit_bus_balance_view;
+    use crate::compute_expected_commit_bus_balance;
     use crate::tables::local_to_global;
     use crate::tables::register;
     use crate::tables::trace_builder::build_initial_image;
@@ -3501,15 +3460,10 @@ fn test_epoch_memory_bus_with_l2g_bookend() {
 
     let mut refs = airs.air_refs();
     refs.push(&l2g_air);
-    let views: Vec<StarkProofView<F, E, ()>> = multi_proof
-        .proofs
-        .iter()
-        .map(StarkProofView::Owned)
-        .collect();
     let mut replay = DefaultTranscript::<E>::new(&[]);
-    let expected_bus_balance = compute_expected_commit_bus_balance_view(
+    let expected_bus_balance = compute_expected_commit_bus_balance(
         &refs,
-        &views,
+        &multi_proof,
         &traces.public_output_bytes,
         0,
         &mut replay,
@@ -3517,9 +3471,9 @@ fn test_epoch_memory_bus_with_l2g_bookend() {
     .expect("fingerprint collision in test");
 
     assert!(
-        Verifier::multi_verify_views(
+        Verifier::multi_verify(
             &refs,
-            &views,
+            &multi_proof,
             &mut DefaultTranscript::<E>::new(&[]),
             &expected_bus_balance,
         ),
