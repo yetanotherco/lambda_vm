@@ -140,7 +140,9 @@ pub fn print_report(
             entry.sub_ops.deep_comp += sub_ops.deep_comp;
             entry.sub_ops.deep_extend += sub_ops.deep_extend;
             entry.sub_ops.fri_commit += sub_ops.fri_commit;
-            entry.sub_ops.queries += sub_ops.queries;
+            entry.sub_ops.grinding += sub_ops.grinding;
+            entry.sub_ops.fri_query += sub_ops.fri_query;
+            entry.sub_ops.openings += sub_ops.openings;
         }
 
         let mut sorted: Vec<_> = merged.into_iter().collect();
@@ -177,7 +179,9 @@ pub fn print_report(
         let mut total_deep_comp = Duration::ZERO;
         let mut total_deep_extend = Duration::ZERO;
         let mut total_fri_commit = Duration::ZERO;
-        let mut total_queries = Duration::ZERO;
+        let mut total_grinding = Duration::ZERO;
+        let mut total_fri_query = Duration::ZERO;
+        let mut total_openings = Duration::ZERO;
         for (_, t) in &sorted {
             total_constraints += t.sub_ops.constraints;
             total_comp_decompose += t.sub_ops.comp_decompose;
@@ -186,7 +190,9 @@ pub fn print_report(
             total_deep_comp += t.sub_ops.deep_comp;
             total_deep_extend += t.sub_ops.deep_extend;
             total_fri_commit += t.sub_ops.fri_commit;
-            total_queries += t.sub_ops.queries;
+            total_grinding += t.sub_ops.grinding;
+            total_fri_query += t.sub_ops.fri_query;
+            total_openings += t.sub_ops.openings;
         }
 
         let sub_ops_sum = total_constraints
@@ -196,7 +202,9 @@ pub fn print_report(
             + total_deep_comp
             + total_deep_extend
             + total_fri_commit
-            + total_queries;
+            + total_grinding
+            + total_fri_query
+            + total_openings;
         if sub_ops_sum > Duration::ZERO {
             let mut sub_ops: Vec<(&str, Duration)> = vec![
                 ("R2  evaluate", total_constraints),
@@ -204,9 +212,11 @@ pub fn print_report(
                 ("R2  commit_bit_reversed (comp-poly)", total_comp_commit),
                 ("R3  OOD evaluation", total_ood),
                 ("R4  deep_composition_poly_evals", total_deep_comp),
-                ("R4  interpolate+evaluate_fft", total_deep_extend),
+                ("R4  DEEP->FRI CPU bit-reverse", total_deep_extend),
                 ("R4  fri::commit_phase", total_fri_commit),
-                ("R4  queries & openings", total_queries),
+                ("R4  grinding", total_grinding),
+                ("R4  FRI query", total_fri_query),
+                ("R4  trace/composition openings", total_openings),
             ];
             sub_ops.sort_by(|a, b| b.1.cmp(&a.1));
             eprintln!(

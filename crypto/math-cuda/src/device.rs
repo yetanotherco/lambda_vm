@@ -180,6 +180,7 @@ pub struct Backend {
 
     // fri.cubin
     pub fri_fold_ext3: CudaFunction,
+    pub fri_fold_ext3_from_natural: CudaFunction,
     pub fri_update_twiddles: CudaFunction,
 
     // inverse.cubin
@@ -379,6 +380,7 @@ impl Backend {
             gather_rows_ext3: bary.load_function("gather_rows_ext3")?,
             deep_composition_ext3_row: deep.load_function("deep_composition_ext3_row")?,
             fri_fold_ext3: fri.load_function("fri_fold_ext3")?,
+            fri_fold_ext3_from_natural: fri.load_function("fri_fold_ext3_from_natural")?,
             fri_update_twiddles: fri.load_function("fri_update_twiddles")?,
             compute_denoms_ext3: inverse.load_function("compute_denoms_ext3")?,
             block_inclusive_scan_fwd_ext3: inverse

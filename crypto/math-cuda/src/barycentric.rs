@@ -257,6 +257,11 @@ pub fn barycentric_ext3_on_device(
 
     let be = backend()?;
     let stream = be.next_stream();
+    // Order this stream against the producer's fill of the LDE (no-op unless the
+    // handle carries a ready event, i.e. the composition device-only path).
+    if let Some(ev) = aux_handle.ready.as_deref() {
+        stream.wait(ev)?;
+    }
 
     let points_dev = stream.clone_htod(coset_points)?;
     let inv_dev = stream.clone_htod(inv_denoms_ext3)?;
@@ -390,6 +395,11 @@ pub fn gather_rows_ext3_on_device(
         return Ok(Vec::new());
     }
     let be = backend()?;
+    // Order the caller's stream against the producer's fill (no-op unless the
+    // handle carries a ready event, i.e. the composition device-only path).
+    if let Some(ev) = aux.ready.as_deref() {
+        stream.wait(ev)?;
+    }
     let rows_dev = stream.clone_htod(rows)?;
     let mut out = stream.alloc_zeros::<u64>(rows.len() * num_cols * 3)?;
     let col_stride = aux.lde_size as u64;

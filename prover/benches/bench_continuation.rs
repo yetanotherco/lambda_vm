@@ -26,7 +26,7 @@ use std::time::Instant;
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        eprintln!("usage: bench_continuation <count|main|cont> <elf_path> [epoch_size]");
+        eprintln!("usage: bench_continuation <count|main|warm|cont> <elf_path> [epoch_size]");
         std::process::exit(2);
     }
     let mode = args[1].as_str();
@@ -107,9 +107,31 @@ fn main() {
             }
         }
         "main" => {
+            #[cfg(feature = "cuda")]
+            stark::stagebytes::reset();
             lambda_vm_prover::prove_with_inputs(&elf, &private_inputs)
                 .expect("monolithic prove failed");
             println!("main prove ok ({} bytes ELF)", elf.len());
+            #[cfg(feature = "cuda")]
+            if let Some(r) = stark::stagebytes::report() {
+                print!("{r}");
+            }
+        }
+        "mainverify" => {
+            // Monolithic prove + verify (the wall workload), so the
+            // composition-resident change is checked end-to-end on the exact
+            // path measured, not only via continuation.
+            #[cfg(feature = "cuda")]
+            stark::stagebytes::reset();
+            let proof = lambda_vm_prover::prove_with_inputs(&elf, &private_inputs)
+                .expect("monolithic prove failed");
+            let ok = lambda_vm_prover::verify(&proof, &elf).expect("verify errored");
+            assert!(ok, "monolithic proof did NOT verify");
+            println!("main prove+verify ok");
+            #[cfg(feature = "cuda")]
+            if let Some(r) = stark::stagebytes::report() {
+                print!("{r}");
+            }
         }
         "cont" => {
             let epoch_size_log2: u32 = args
@@ -132,8 +154,31 @@ fn main() {
                 1usize << epoch_size_log2
             );
         }
+        "warm" => {
+            // Run N proves in one process (arg 3, default 2). The first prove
+            // pays one-time costs (PTX/cubin load, pinned-buffer growth,
+            // stream-pool warm-up); later proves isolate steady-state cost. Under
+            // nsys the proves are separated by each prove's CPU-only
+            // execution+trace-gen gap, so the timeline can be split per prove
+            // (e.g. to check whether pinned-buffer allocation converges to ~0).
+            let n_proves: usize = args
+                .get(3)
+                .map(|s| s.parse().expect("bad prove count"))
+                .unwrap_or(2);
+            for i in 0..n_proves {
+                #[cfg(feature = "cuda")]
+                stark::stagebytes::reset();
+                let t = Instant::now();
+                lambda_vm_prover::prove_with_inputs(&elf, &private_inputs).expect("prove failed");
+                println!("prove {} ok ({:.2}s)", i + 1, t.elapsed().as_secs_f64());
+                #[cfg(feature = "cuda")]
+                if let Some(r) = stark::stagebytes::report() {
+                    print!("{r}");
+                }
+            }
+        }
         other => {
-            eprintln!("unknown mode {other:?}; use count|footprint|main|cont");
+            eprintln!("unknown mode {other:?}; use count|footprint|main|warm|cont");
             std::process::exit(2);
         }
     }

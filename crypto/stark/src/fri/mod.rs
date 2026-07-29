@@ -37,6 +37,10 @@ pub fn commit_phase_from_evaluations<
     domain_size: usize,
     blowup_log: u32,
     final_poly_log_degree: u32,
+    // When true, skip the GPU fast path and commit on CPU. Used by the R4
+    // GPU-fault recovery: once a device FRI attempt has failed, retrying the GPU
+    // would silently re-run it (masking the fallback), so recovery forces CPU.
+    force_cpu: bool,
 ) -> (
     Vec<FieldElement<E>>,
     Vec<FriLayer<E, FriLayerMerkleTreeBackend<E>>>,
@@ -52,8 +56,11 @@ where
     // snapshots the transcript before mutating it so a mid-loop cudarc
     // error restores state and lets the CPU loop below run as if the GPU
     // had never been tried.
+    #[cfg(not(feature = "cuda"))]
+    let _ = force_cpu;
+
     #[cfg(feature = "cuda")]
-    {
+    if !force_cpu {
         // Try the GPU early-termination FRI commit first. `try_fri_commit_gpu`
         // drives the same commit phase on-device (Goldilocks + Ext3, above the
         // LDE size threshold, and only when folding actually happens) and returns
@@ -62,6 +69,7 @@ where
         // the CPU path below then runs as if the GPU had never been tried.
         if let Some(result) = crate::gpu_lde::try_fri_commit_gpu::<F, E, T>(
             &evals,
+            None,
             transcript,
             coset_offset,
             domain_size,
@@ -145,7 +153,7 @@ where
     (final_poly_coeffs, fri_layer_list)
 }
 
-pub fn query_phase<F: IsField>(
+pub fn query_phase<F: IsField + 'static>(
     fri_layers: &[FriLayer<F, FriLayerMerkleTreeBackend<F>>],
     iotas: &[usize],
 ) -> Vec<FriDecommitment<F>>

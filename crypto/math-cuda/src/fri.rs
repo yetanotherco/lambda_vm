@@ -3,8 +3,9 @@
 //! The host loop (in the stark crate) samples each layer's `zeta` from the
 //! transcript and feeds it in. This module keeps the folded evaluations,
 //! twiddles, and per-layer Merkle trees on device, only D2H'ing each
-//! layer's root (to append to the transcript), plus its full evals and
-//! tree nodes (to plug into `FriLayer` for the query phase).
+//! layer's root (to append to the transcript). Folded evals and Merkle nodes
+//! remain resident for the query phase; the terminal codeword alone returns
+//! to the host for coefficient extraction.
 //!
 //! Mirrors `commit_phase_from_evaluations` at
 //! `crypto/stark/src/fri/mod.rs`.
@@ -40,6 +41,17 @@ fn check_fault_injection() -> Result<()> {
     Ok(())
 }
 
+/// A FRI layer's folded evaluations kept resident on device. `buf` is the
+/// layer's ext3 evals **interleaved** (`3 * len` u64, `[a0,b0,c0, a1,b1,c1, …]`),
+/// and `len` is the number of ext3 evals in the layer (`n_out`), carried
+/// explicitly so the query phase has the metadata even once the host `Vec` is
+/// dropped (Step F2). Freed when the `buf` Arc drops.
+#[derive(Clone)]
+pub struct GpuFriEvals {
+    pub buf: Arc<CudaSlice<u64>>,
+    pub len: usize,
+}
+
 /// Device-side state across FRI commit iterations. Owns two ext3 eval
 /// buffers (flip-flopped as layer input / output) and the inv_twiddles
 /// buffer. Freed when dropped.
@@ -57,6 +69,9 @@ pub struct FriCommitState {
     pub current_n: usize,
     /// Which buffer holds the current layer's input. Toggles each fold.
     a_is_input: bool,
+    /// The direct DEEP handoff arrives in natural LDE order. Only the first
+    /// fold needs bit-reversed reads; its output has the ordinary FRI layout.
+    first_input_natural: bool,
 }
 
 impl FriCommitState {
@@ -76,6 +91,7 @@ impl FriCommitState {
         let mut evals_a = unsafe { stream.alloc::<u64>(3 * n0) }?;
         let evals_b = unsafe { stream.alloc::<u64>(3 * n0) }?;
         stream.memcpy_htod(evals_host, &mut evals_a)?;
+        crate::stagebytes::add_fri_initial_h2d(core::mem::size_of_val(evals_host));
         let inv_tw = stream.clone_htod(inv_tw_host)?;
 
         Ok(Self {
@@ -85,6 +101,41 @@ impl FriCommitState {
             inv_tw,
             current_n: n0,
             a_is_input: true,
+            first_input_natural: false,
+        })
+    }
+
+    /// Start FRI by taking ownership of a natural-order DEEP codeword already
+    /// resident on device. No D2H, CPU bit-reverse, H2D, or D2D staging pass is
+    /// performed. The first fold applies the legacy bit-reverse mapping while
+    /// loading; subsequent folds use the normal contiguous-pair kernel.
+    pub fn from_deep(
+        deep: crate::deep::GpuDeepEvals,
+        inv_tw_host: &[u64],
+        n0: usize,
+    ) -> Result<Self> {
+        assert!(n0 >= 2 && n0.is_power_of_two());
+        assert_eq!(deep.len, n0);
+        assert_eq!(deep.buf.len(), 3 * n0);
+        assert_eq!(inv_tw_host.len(), n0 / 2);
+
+        let crate::deep::GpuDeepEvals {
+            buf: evals_a,
+            len: _,
+            stream,
+        } = deep;
+        // SAFETY: the first fold writes every output slot before evals_b is read.
+        let evals_b = unsafe { stream.alloc::<u64>(3 * n0) }?;
+        let inv_tw = stream.clone_htod(inv_tw_host)?;
+
+        Ok(Self {
+            stream,
+            evals_a,
+            evals_b,
+            inv_tw,
+            current_n: n0,
+            a_is_input: true,
+            first_input_natural: true,
         })
     }
 
@@ -98,7 +149,9 @@ impl FriCommitState {
     pub fn fold_and_commit_layer(
         &mut self,
         zeta_raw: [u64; 3],
-    ) -> Result<(Vec<u64>, crate::lde::GpuMerkleTree)> {
+        retain_evals: bool,
+        retain_host: bool,
+    ) -> Result<(Vec<u64>, crate::lde::GpuMerkleTree, Option<GpuFriEvals>)> {
         #[cfg(feature = "test-faults")]
         check_fault_injection()?;
         let be = backend()?;
@@ -134,15 +187,31 @@ impl FriCommitState {
         } else {
             (&self.evals_b, &mut self.evals_a)
         };
-        unsafe {
-            self.stream
-                .launch_builder(&be.fri_fold_ext3)
-                .arg(input_evals)
-                .arg(&n_out_u64)
-                .arg(&self.inv_tw)
-                .arg(&zeta_dev)
-                .arg(output_evals)
-                .launch(cfg)?;
+        if self.first_input_natural {
+            let log_n_in = n_in.trailing_zeros() as u64;
+            unsafe {
+                self.stream
+                    .launch_builder(&be.fri_fold_ext3_from_natural)
+                    .arg(input_evals)
+                    .arg(&n_out_u64)
+                    .arg(&log_n_in)
+                    .arg(&self.inv_tw)
+                    .arg(&zeta_dev)
+                    .arg(output_evals)
+                    .launch(cfg)?;
+            }
+            self.first_input_natural = false;
+        } else {
+            unsafe {
+                self.stream
+                    .launch_builder(&be.fri_fold_ext3)
+                    .arg(input_evals)
+                    .arg(&n_out_u64)
+                    .arg(&self.inv_tw)
+                    .arg(&zeta_dev)
+                    .arg(output_evals)
+                    .launch(cfg)?;
+            }
         }
 
         // SAFETY: keccak_fri_leaves_ext3 writes the leaves [num_leaves-1, 2*num_leaves-1)
@@ -206,13 +275,35 @@ impl FriCommitState {
         // Sync and D2H.
         self.stream.synchronize()?;
 
-        // Layer evals: 3 * n_out u64 from the output buffer.
-        let layer_evals: Vec<u64> = if self.a_is_input {
-            let view = self.evals_b.slice(0..3 * n_out);
-            self.stream.clone_dtoh(&view)?
+        // The folded output buffer for this layer (3 * n_out ext3 u64).
+        let out_view = if self.a_is_input {
+            self.evals_b.slice(0..3 * n_out)
         } else {
-            let view = self.evals_a.slice(0..3 * n_out);
-            self.stream.clone_dtoh(&view)?
+            self.evals_a.slice(0..3 * n_out)
+        };
+        // Host copy of the folded evals. Under device-only (F2) `retain_host` is
+        // false for committed layers and this big D2H is skipped (query openings
+        // are gathered on device); kept when `retain_host` (GPU_RETAIN_FRI_HOST,
+        // and always the terminal fold whose evals become the final-poly coeffs).
+        let layer_evals: Vec<u64> = if retain_host {
+            let v = self.stream.clone_dtoh(&out_view)?;
+            crate::stagebytes::add_fri_layer_d2h(v.len() * 8);
+            v
+        } else {
+            Vec::new()
+        };
+        // F0: for committed (queried) layers, retain the folded evals on device in
+        // a fresh buffer (the ping-pong scratch `evals_a`/`evals_b` is overwritten
+        // by later folds) so the query phase can gather opened values on device.
+        // The terminal fold is never queried, so `retain_evals` is false there and
+        // this D2D copy is skipped.
+        let retained_evals = if retain_evals {
+            Some(GpuFriEvals {
+                buf: Arc::new(self.stream.clone_dtod(&out_view)?),
+                len: n_out,
+            })
+        } else {
+            None
         };
 
         // Keep the layer tree resident on device; copy only the 32-byte root so
@@ -230,6 +321,9 @@ impl FriCommitState {
             leaves_len: num_leaves,
             root,
         };
-        Ok((layer_evals, tree))
+        Ok((layer_evals, tree, retained_evals))
     }
+
+    // (retained_evals is `Some` only when `retain_evals` is passed for a
+    // committed layer; the terminal fold passes false and gets `None`.)
 }

@@ -233,3 +233,36 @@ fn comp_poly_tree_medium() {
 fn comp_poly_tree_large() {
     run_parity(14, 2, 4, 9999);
 }
+
+/// Direct parity for `build_comp_poly_tree_from_dev_buf` (the Step B
+/// resident-handle Merkle commit): random ext3 eval columns → device buf →
+/// tree root, compared against the CPU row-pair tree. Covers m = 1, 2, 3 (the
+/// d==2 path uses m=2; d>2 would use m=3) across several sizes.
+fn run_dev_buf_parity(lde_log: u32, num_parts: usize, seed: u64) {
+    let lde_size = 1usize << lde_log;
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    let parts: Vec<Vec<Fp3>> = (0..num_parts)
+        .map(|_| (0..lde_size).map(|_| rand_ext3(&mut rng)).collect())
+        .collect();
+    let cpu_nodes = cpu_tree_nodes(&parts);
+
+    let parts_u64: Vec<Vec<u64>> = parts.iter().map(|c| ext3_to_u64s(c)).collect();
+    let slices: Vec<&[u64]> = parts_u64.iter().map(|v| v.as_slice()).collect();
+    let tree = math_cuda::merkle::build_comp_poly_tree_from_host_parts_via_dev_buf(&slices)
+        .expect("dev-buf comp-poly tree");
+
+    assert_eq!(tree.leaves_len, lde_size / 2);
+    assert_eq!(
+        tree.root, cpu_nodes[0],
+        "dev-buf root mismatch parts={num_parts} lde_log={lde_log}"
+    );
+}
+
+#[test]
+fn comp_poly_tree_dev_buf_parity() {
+    for &parts in &[1usize, 2, 3] {
+        for lde_log in 2u32..=7 {
+            run_dev_buf_parity(lde_log, parts, 7000 + parts as u64 * 131 + lde_log as u64);
+        }
+    }
+}

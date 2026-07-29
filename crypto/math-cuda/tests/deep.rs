@@ -187,6 +187,7 @@ fn run_parity(
             m: num_aux,
             lde_size,
             tree: None,
+            ready: None,
         })
     } else {
         drop(aux_dev);

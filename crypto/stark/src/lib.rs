@@ -17,6 +17,9 @@ pub mod frame;
 pub mod fri;
 #[cfg(feature = "cuda")]
 pub mod gpu_lde;
+/// Re-export of the GPU per-stage byte counters (profiling only).
+#[cfg(feature = "cuda")]
+pub use math_cuda::stagebytes;
 pub mod grinding;
 #[cfg(feature = "instruments")]
 pub mod instruments;

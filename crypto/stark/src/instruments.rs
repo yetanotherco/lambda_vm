@@ -185,12 +185,16 @@ pub struct TableSubOps {
     pub ood: Duration,
     /// Round 4: compute_deep_composition_poly_evaluations
     pub deep_comp: Duration,
-    /// Round 4: interpolate_fft + evaluate_fft
+    /// Round 4: serial CPU bit-reverse between GPU DEEP and GPU FRI.
     pub deep_extend: Duration,
     /// fri::commit_phase_from_evaluations
     pub fri_commit: Duration,
-    /// Round 4: grinding + FRI query + Merkle openings
-    pub queries: Duration,
+    /// Round 4: proof-of-work nonce search.
+    pub grinding: Duration,
+    /// Round 4: query-index sampling and FRI-layer decommitment.
+    pub fri_query: Duration,
+    /// Round 4: trace/composition Merkle openings.
+    pub openings: Duration,
 }
 
 /// Sub-operation breakdown for Round 1 aux commit pass.
@@ -239,12 +243,15 @@ static AUX_INVERT_US: AtomicU64 = AtomicU64::new(0);
 static AUX_TERM_US: AtomicU64 = AtomicU64::new(0);
 static AUX_ACCUM_US: AtomicU64 = AtomicU64::new(0);
 
+type R4SubDurations = (Duration, Duration, Duration, Duration, Duration, Duration);
+
 thread_local! {
     static TIMING_DATA: RefCell<Option<MultiProveTiming>> = const { RefCell::new(None) };
     /// Round 2 sub-timings: (constraints, fft, merkle)
     static R2_SUB: RefCell<Option<(Duration, Duration, Duration)>> = const { RefCell::new(None) };
-    /// Round 4 sub-timings: (fft, merkle, deep_comp, queries)
-    static R4_SUB: RefCell<Option<(Duration, Duration, Duration, Duration)>> = const { RefCell::new(None) };
+    /// Round 4 sub-timings: (bit_reverse, fri_commit, deep_comp, grinding,
+    /// fri_query, openings).
+    static R4_SUB: RefCell<Option<R4SubDurations>> = const { RefCell::new(None) };
     /// Assembled sub-ops from prove_rounds_2_to_4 (without reconstruct_round1 LDE time).
     static ROUND_SUB_OPS: RefCell<Option<TableSubOps>> = const { RefCell::new(None) };
 }
@@ -333,11 +340,27 @@ pub fn take_r2_sub() -> Option<(Duration, Duration, Duration)> {
     R2_SUB.with(|cell| cell.borrow_mut().take())
 }
 
-pub fn store_r4_sub(fft: Duration, merkle: Duration, deep_comp: Duration, queries: Duration) {
-    R4_SUB.with(|cell| *cell.borrow_mut() = Some((fft, merkle, deep_comp, queries)));
+pub fn store_r4_sub(
+    bit_reverse: Duration,
+    fri_commit: Duration,
+    deep_comp: Duration,
+    grinding: Duration,
+    fri_query: Duration,
+    openings: Duration,
+) {
+    R4_SUB.with(|cell| {
+        *cell.borrow_mut() = Some((
+            bit_reverse,
+            fri_commit,
+            deep_comp,
+            grinding,
+            fri_query,
+            openings,
+        ));
+    });
 }
 
-pub fn take_r4_sub() -> Option<(Duration, Duration, Duration, Duration)> {
+pub fn take_r4_sub() -> Option<(Duration, Duration, Duration, Duration, Duration, Duration)> {
     R4_SUB.with(|cell| cell.borrow_mut().take())
 }
 

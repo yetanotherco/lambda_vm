@@ -625,6 +625,9 @@ pub fn coset_lde_ext3_row_major_with_merkle_tree_keep(
         m,
         lde_size: n * blowup_factor,
         tree: Some(tree),
+        // This path already `synchronize()`s the fill before returning, so no
+        // cross-stream event is needed.
+        ready: None,
     };
     Ok((handle, lde_out))
 }
@@ -656,6 +659,9 @@ pub fn coset_lde_ext3_row_major_with_merkle_tree_keep_dev(
         m,
         lde_size: n * blowup_factor,
         tree: Some(tree),
+        // This path already `synchronize()`s the fill before returning, so no
+        // cross-stream event is needed.
+        ready: None,
     };
     Ok((handle, lde_out))
 }
@@ -692,6 +698,13 @@ pub struct GpuLdeExt3 {
     /// Optionally the aux or composition Merkle tree kept resident on device
     /// (the keep path), so R4 openings gather paths on device. None otherwise.
     pub tree: Option<GpuMerkleTree>,
+    /// "LDE ready" event recorded on the producer stream after the NTT that
+    /// fills `buf`. A consumer on a different stream must `stream.wait(ready)`
+    /// before reading `buf`. `Some` only when the producer left a resident buffer
+    /// without a host-side `synchronize()` barrier (the composition path headed
+    /// for device-only openings); `None` when a `synchronize()` already ordered
+    /// the fill (all current paths), so waiting is unnecessary.
+    pub ready: Option<Arc<cudarc::driver::CudaEvent>>,
 }
 
 /// Merkle tree kept resident on device after a commit, so query openings gather
@@ -1459,6 +1472,8 @@ fn evaluate_poly_coset_batch_ext3_into_inner(
             m,
             lde_size,
             tree: None,
+            // d>2 path: still `synchronize()`s the fill above; no event needed.
+            ready: None,
         }))
     } else {
         drop(buf);
@@ -1519,15 +1534,56 @@ pub fn coset_lde_batch_ext3_into(
     weights: &[u64],
     outputs: &mut [&mut [u64]],
 ) -> Result<()> {
+    coset_lde_batch_ext3_into_inner(columns, n, blowup_factor, weights, outputs, false, true)?;
+    Ok(())
+}
+
+/// Like [`coset_lde_batch_ext3_into`] but also retains the device buffer and
+/// returns it as a [`GpuLdeExt3`] handle (slab layout `(c*3+k)*lde_size`), so
+/// the composition Merkle commit and DEEP can reuse it without re-uploading it
+/// from host. When `retain_host_lde` is true the host `outputs` are also filled;
+/// when false the large D2H and CPU unpack are skipped and `outputs` may be
+/// empty. Device consumers order their reads through the handle's `ready` event.
+pub fn coset_lde_batch_ext3_into_keep(
+    columns: &[&[u64]],
+    n: usize,
+    blowup_factor: usize,
+    weights: &[u64],
+    outputs: &mut [&mut [u64]],
+    retain_host_lde: bool,
+) -> Result<GpuLdeExt3> {
+    let opt = coset_lde_batch_ext3_into_inner(
+        columns,
+        n,
+        blowup_factor,
+        weights,
+        outputs,
+        true,
+        retain_host_lde,
+    )?;
+    Ok(opt.expect("keep_device_buf=true must return Some"))
+}
+
+fn coset_lde_batch_ext3_into_inner(
+    columns: &[&[u64]],
+    n: usize,
+    blowup_factor: usize,
+    weights: &[u64],
+    outputs: &mut [&mut [u64]],
+    keep_device_buf: bool,
+    retain_host_lde: bool,
+) -> Result<Option<GpuLdeExt3>> {
     if columns.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     let m = columns.len();
-    assert_eq!(outputs.len(), m, "outputs must match columns count");
+    if retain_host_lde {
+        assert_eq!(outputs.len(), m, "outputs must match columns count");
+    }
     // Empty domain must short-circuit before the power-of-two assert
     // (is_power_of_two returns false for 0).
     if n == 0 {
-        return Ok(());
+        return Ok(None);
     }
     assert!(n.is_power_of_two(), "n must be a power of two");
     assert_eq!(weights.len(), n, "weights length must match n");
@@ -1539,8 +1595,10 @@ pub fn coset_lde_batch_ext3_into(
         assert_eq!(c.len(), 3 * n, "each ext3 column must be 3*n u64s");
     }
     let lde_size = n * blowup_factor;
-    for o in outputs.iter() {
-        assert_eq!(o.len(), 3 * lde_size, "each output must be 3*lde_size u64s");
+    if retain_host_lde {
+        for o in outputs.iter() {
+            assert_eq!(o.len(), 3 * lde_size, "each output must be 3*lde_size u64s");
+        }
     }
     assert_u32_domain(lde_size, "coset_lde_batch_ext3_into lde_size");
     let log_n = n.trailing_zeros() as u64;
@@ -1553,18 +1611,45 @@ pub fn coset_lde_batch_ext3_into(
     let stream = be.next_stream();
     let staging_slot = be.pinned_staging();
 
-    let mut staging = staging_slot.lock().unwrap();
-    staging.ensure_capacity(mb * lde_size, &be.ctx)?;
-    let pinned = unsafe { staging.as_mut_slice(mb * lde_size) };
+    let mut staging = Some(staging_slot.lock().unwrap());
+    staging
+        .as_mut()
+        .expect("staging present")
+        .ensure_capacity(mb * lde_size, &be.ctx)?;
 
-    pack_ext3_to_pinned_slabs(columns, pinned, n);
+    {
+        let pinned = unsafe {
+            staging
+                .as_mut()
+                .expect("staging present")
+                .as_mut_slice(mb * lde_size)
+        };
+        pack_ext3_to_pinned_slabs(columns, pinned, n);
+    }
 
     // Allocate + zero-pad device buffer holding 3M slabs of `lde_size`.
     let mut buf = stream.alloc_zeros::<u64>(mb * lde_size)?;
     // H2D: slab by slab into the first N slots of each `lde_size`-slab.
-    for s in 0..mb {
-        let mut dst = buf.slice_mut(s * lde_size..s * lde_size + n);
-        stream.memcpy_htod(&pinned[s * n..s * n + n], &mut dst)?;
+    {
+        let pinned = unsafe {
+            staging
+                .as_mut()
+                .expect("staging present")
+                .as_mut_slice(mb * lde_size)
+        };
+        for s in 0..mb {
+            let mut dst = buf.slice_mut(s * lde_size..s * lde_size + n);
+            stream.memcpy_htod(&pinned[s * n..s * n + n], &mut dst)?;
+        }
+    }
+
+    // Device-only releases the shared pinned staging before the long NTT. The
+    // H2Ds are asynchronous, so wait for just those copies before another
+    // worker can reuse the host buffer. We intentionally do not synchronize
+    // after the NTT; the `ready` event orders downstream device consumers.
+    if !retain_host_lde {
+        stream.synchronize()?;
+        drop(staging.take());
     }
 
     let inv_tw = be.inv_twiddles_for(log_n)?;
@@ -1624,14 +1709,38 @@ pub fn coset_lde_batch_ext3_into(
         mb_u32,
     )?;
 
-    stream.memcpy_dtoh(&buf, &mut pinned[..mb * lde_size])?;
-    stream.synchronize()?;
+    if retain_host_lde {
+        let pinned = unsafe {
+            staging
+                .as_mut()
+                .expect("host-retained path keeps staging")
+                .as_mut_slice(mb * lde_size)
+        };
+        stream.memcpy_dtoh(&buf, &mut pinned[..mb * lde_size])?;
+        stream.synchronize()?;
 
-    // Unpack: for each output column, re-interleave 3 slabs back into the
-    // ext3-per-element layout.
-    unpack_pinned_slabs_to_ext3(pinned, outputs, lde_size);
+        // Re-interleave 3 base-field slabs per output ext3 column.
+        unpack_pinned_slabs_to_ext3(pinned, outputs, lde_size);
+    }
     drop(staging);
-    Ok(())
+    if keep_device_buf {
+        // Same slab layout the comp-poly Merkle kernel and DEEP expect:
+        // `buf[(c*3 + k) * lde_size + r]`.
+        // Record an "LDE ready" event on the producer stream so a consumer on
+        // another stream can order its reads of `buf` against the fill. On the
+        // device-only path this is the only post-NTT ordering barrier.
+        let ready = Some(std::sync::Arc::new(stream.record_event(None)?));
+        Ok(Some(GpuLdeExt3 {
+            buf: std::sync::Arc::new(buf),
+            m,
+            lde_size,
+            tree: None,
+            ready,
+        }))
+    } else {
+        drop(buf);
+        Ok(None)
+    }
 }
 
 /// Run the DIT butterfly body of a bit-reversed-input NTT over `m` batched

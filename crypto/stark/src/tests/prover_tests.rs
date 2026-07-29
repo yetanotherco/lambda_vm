@@ -272,11 +272,26 @@ fn test_decompose_and_extend_d2_matches_original() {
     // --- New path: algebraic decomposition ---
     let twiddles = LdeTwiddles::new(&domain);
     assert!(!twiddles.has_composition_cache());
+    #[cfg(not(feature = "cuda"))]
     let new_result = Prover::<GoldilocksField, GoldilocksField, ()>::decompose_and_extend_d2(
         &constraint_evaluations,
         &domain,
         &twiddles,
     );
+    #[cfg(feature = "cuda")]
+    let new_result = {
+        // The cuda signature adds a resident-handle out-param and a
+        // retain-host-LDE flag; retain the host evals so the parity comparison
+        // below has them (falls back to the CPU extend without a GPU present).
+        let mut gpu_parts: Option<math_cuda::lde::GpuLdeExt3> = None;
+        Prover::<GoldilocksField, GoldilocksField, ()>::decompose_and_extend_d2(
+            &constraint_evaluations,
+            &domain,
+            &twiddles,
+            &mut gpu_parts,
+            true,
+        )
+    };
     #[cfg(not(feature = "cuda"))]
     assert!(twiddles.has_composition_cache());
 

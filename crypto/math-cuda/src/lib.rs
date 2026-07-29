@@ -15,6 +15,7 @@ pub mod lde;
 pub mod logup;
 pub mod merkle;
 pub mod ntt;
+pub mod stagebytes;
 
 // Re-exported for downstream crates so they can refer to CUDA primitive
 // types without depending on cudarc directly.

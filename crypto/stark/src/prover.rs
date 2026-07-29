@@ -512,8 +512,15 @@ where
     F: IsField,
     FieldElement<F>: AsBytes,
 {
-    /// Evaluations of the composition polynomial parts over the LDE domain.
-    pub(crate) lde_composition_poly_evaluations: Vec<Vec<FieldElement<F>>>,
+    /// Host-side evaluations of the composition polynomial parts over the LDE
+    /// domain. `Some` on the CPU path and while the composition LDE is retained
+    /// on host (Steps A–C2, and C4 under `GPU_RETAIN_COMPOSITION_HOST`); `None`
+    /// when the composition LDE is device-only (C4), so every host consumer must
+    /// handle the device-only case explicitly instead of indexing empty data.
+    pub(crate) host_composition_lde: Option<Vec<Vec<FieldElement<F>>>>,
+    /// Number of composition parts, always available even when the host LDE is
+    /// dropped (device-only). Equals `air.composition_poly_degree_bound / trace_length`.
+    pub(crate) num_composition_parts: usize,
     /// The Merkle tree built to compute the commitment to the composition polynomial parts.
     pub(crate) composition_poly_merkle_tree: BatchedMerkleTree<F>,
     /// The commitment to the composition polynomial parts.
@@ -524,6 +531,25 @@ where
     /// `None` on the CPU path.
     #[cfg(feature = "cuda")]
     pub(crate) gpu_composition_tree: Option<math_cuda::lde::GpuMerkleTree>,
+}
+
+impl<F> Round2<F>
+where
+    F: IsField,
+    FieldElement<F>: AsBytes,
+{
+    /// The host composition-LDE evaluations. Panics if the composition LDE is
+    /// device-only (`host_composition_lde` is `None`): every caller of this must
+    /// be on a path that retained the host copy. The device-only paths read the
+    /// resident handle instead and never call this.
+    pub(crate) fn host_evals(&self) -> &[Vec<FieldElement<F>>] {
+        self.host_composition_lde
+            .as_ref()
+            .expect(
+                "host composition LDE present (device-only paths must read the resident handle)",
+            )
+            .as_slice()
+    }
 }
 
 /// A container for the results of the third round of the STARK Prove protocol.
@@ -549,6 +575,15 @@ pub(crate) struct Round4<F: IsSubFieldOf<E>, E: IsField> {
     query_list: Vec<FriDecommitment<E>>,
     /// The proof of work nonce.
     nonce: Option<u64>,
+}
+
+/// Natural-order DEEP evaluations plus the optional device handle produced by
+/// the fully-resident GPU arm. The host vector remains present during the
+/// cross-check stage and is removed only after the direct FRI path is proven.
+struct DeepCompositionOutput<E: IsField> {
+    host: Vec<FieldElement<E>>,
+    #[cfg(feature = "cuda")]
+    device: Option<math_cuda::deep::GpuDeepEvals>,
 }
 
 /// Returns the evaluations of the polynomial `p` over the lde domain defined by the given
@@ -1144,6 +1179,8 @@ pub trait IsStarkProver<
         constraint_evaluations: &[FieldElement<FieldExtension>],
         domain: &Domain<Field>,
         twiddles: &LdeTwiddles<Field>,
+        #[cfg(feature = "cuda")] gpu_parts_out: &mut Option<math_cuda::lde::GpuLdeExt3>,
+        #[cfg(feature = "cuda")] retain_host_lde: bool,
     ) -> Vec<Vec<FieldElement<FieldExtension>>>
     where
         FieldElement<Field>: AsBytes + Sync + Send,
@@ -1180,9 +1217,12 @@ pub trait IsStarkProver<
         // GPU fast path: batch both halves into one ext3 LDE call. Requires
         // `cuda` feature and a qualifying size. Falls through to CPU when not.
         #[cfg(feature = "cuda")]
-        if let Some((lde_h0, lde_h1)) =
-            crate::gpu_lde::try_extend_two_halves_gpu(&h0_evals, &h1_evals, domain)
+        if let Some((lde_h0, lde_h1, handle)) =
+            crate::gpu_lde::try_extend_two_halves_gpu(&h0_evals, &h1_evals, domain, retain_host_lde)
         {
+            // Hand the resident extended-LDE buffer to the session so the
+            // composition Merkle commit and DEEP reuse it (mirrors the d>2 path).
+            *gpu_parts_out = Some(handle);
             return vec![lde_h0, lde_h1];
         }
 
@@ -1258,6 +1298,23 @@ pub trait IsStarkProver<
 
         let number_of_parts = air.composition_poly_degree_bound(trace_length) / trace_length;
 
+        // Dropping the composition host LDE is safe only when DEEP has every
+        // trace input resident too. A composition handle alone is insufficient:
+        // some tables qualify for the R2 LDE but not for the R1 main/aux path.
+        #[cfg(feature = "cuda")]
+        let retain_host_composition_lde = {
+            let expected_lde_size = domain.lde_roots_of_unity_coset.len();
+            let main_resident = round_1_result.lde_trace.gpu_main().is_some_and(|h| {
+                h.m == round_1_result.lde_trace.num_main_cols() && h.lde_size == expected_lde_size
+            });
+            let aux_resident = round_1_result.lde_trace.num_aux_cols() == 0
+                || round_1_result.lde_trace.gpu_aux().is_some_and(|h| {
+                    h.m == round_1_result.lde_trace.num_aux_cols()
+                        && h.lde_size == expected_lde_size
+                });
+            crate::gpu_lde::retain_composition_host() || !main_resident || !aux_resident
+        };
+
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
         #[cfg(feature = "cuda")]
@@ -1268,7 +1325,20 @@ pub trait IsStarkProver<
             //   H₀(x²) = (H(x) + H(-x)) / 2
             //   H₁(x²) = (H(x) - H(-x)) / (2x)
             // On the LDE coset {g·ω^i}, we have -g·ω^i = g·ω^{i+N} since ω^N = -1.
-            Self::decompose_and_extend_d2(&constraint_evaluations, domain, twiddles)
+            #[cfg(feature = "cuda")]
+            {
+                Self::decompose_and_extend_d2(
+                    &constraint_evaluations,
+                    domain,
+                    twiddles,
+                    &mut gpu_composition_parts,
+                    retain_host_composition_lde,
+                )
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                Self::decompose_and_extend_d2(&constraint_evaluations, domain, twiddles)
+            }
         } else if number_of_parts == 1 {
             // Degree bound equals trace length: constraint evals are the LDE directly.
             vec![constraint_evaluations]
@@ -1330,12 +1400,25 @@ pub trait IsStarkProver<
         // copy) and returns a root only host tree. The device tree is threaded
         // to R4 in `Round2.gpu_composition_tree`.
         #[cfg(feature = "cuda")]
-        let (composition_poly_merkle_tree, composition_poly_root, gpu_composition_tree) =
-            match crate::gpu_lde::try_build_comp_poly_tree_gpu::<
-                FieldExtension,
-                BatchedMerkleTreeBackend<FieldExtension>,
-            >(&lde_composition_poly_parts_evaluations)
-            {
+        let (composition_poly_merkle_tree, composition_poly_root, gpu_composition_tree) = {
+            // Prefer the resident extended-LDE handle (no host re-upload); fall
+            // back to committing from the host eval Vecs when there is no handle
+            // (e.g. the CPU-extend path or the d>2 branch), then to full CPU.
+            // GPU_NO_RESIDENT_MERKLE=1 forces the host-evals re-upload (the
+            // pre-Step-B path) for interleaved A-B-B-A measurement.
+            let use_handle =
+                gpu_composition_parts.is_some() && !crate::gpu_lde::merkle_resident_disabled();
+            let gpu_tree = if use_handle {
+                crate::gpu_lde::try_build_comp_poly_tree_from_handle::<
+                    BatchedMerkleTreeBackend<FieldExtension>,
+                >(gpu_composition_parts.as_ref().unwrap())
+            } else {
+                crate::gpu_lde::try_build_comp_poly_tree_gpu::<
+                    FieldExtension,
+                    BatchedMerkleTreeBackend<FieldExtension>,
+                >(&lde_composition_poly_parts_evaluations)
+            };
+            match gpu_tree {
                 Some((host_tree, dev_tree)) => {
                     let root = host_tree.root;
                     (host_tree, root, Some(dev_tree))
@@ -1348,7 +1431,8 @@ pub trait IsStarkProver<
                     .ok_or(ProvingError::EmptyCommitment)?;
                     (tree, root, None)
                 }
-            };
+            }
+        };
         #[cfg(not(feature = "cuda"))]
         let (composition_poly_merkle_tree, composition_poly_root) =
             crate::commitment::commit_bit_reversed(
@@ -1362,15 +1446,42 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         crate::instruments::store_r2_sub(constraints_dur, fft_dur, merkle_dur);
 
-        // Fold the R2 device composition parts handle into the session (resident
-        // R2 to R4). The host evaluations stay in `Round2` for R4 openings.
+        let num_composition_parts = lde_composition_poly_parts_evaluations.len();
         #[cfg(feature = "cuda")]
-        if let Some(handle) = gpu_composition_parts {
-            round_1_result.lde_trace.set_gpu_composition_parts(handle);
+        let composition_device_only = gpu_composition_parts.is_some()
+            && num_composition_parts > 0
+            && lde_composition_poly_parts_evaluations
+                .iter()
+                .all(Vec::is_empty);
+        #[cfg(feature = "cuda")]
+        if composition_device_only {
+            crate::gpu_lde::GPU_COMPOSITION_DEVICE_ONLY_CALLS
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
+        // Fold the R2 device composition parts handle into the session (resident
+        // R2 to R4).
+        #[cfg(feature = "cuda")]
+        if let Some(handle) = gpu_composition_parts {
+            // GPU_NO_RESIDENT_DEEP=1 withholds the handle so DEEP re-uploads
+            // (the pre-Step-A baseline), for interleaved A-B-B-A measurement.
+            if !crate::gpu_lde::deep_resident_disabled() {
+                round_1_result.lde_trace.set_gpu_composition_parts(handle);
+            }
+        }
+
+        #[cfg(feature = "cuda")]
+        let host_composition_lde = if composition_device_only {
+            None
+        } else {
+            Some(lde_composition_poly_parts_evaluations)
+        };
+        #[cfg(not(feature = "cuda"))]
+        let host_composition_lde = Some(lde_composition_poly_parts_evaluations);
+
         Ok(Round2 {
-            lde_composition_poly_evaluations: lde_composition_poly_parts_evaluations,
+            host_composition_lde,
+            num_composition_parts,
             composition_poly_merkle_tree,
             composition_poly_root,
             #[cfg(feature = "cuda")]
@@ -1390,7 +1501,7 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
     {
-        let num_parts = round_2_result.lde_composition_poly_evaluations.len();
+        let num_parts = round_2_result.num_composition_parts;
         let z_power = z.pow(num_parts);
         let domain_size = domain.interpolation_domain_size;
         let blowup_factor = domain.blowup_factor;
@@ -1402,25 +1513,46 @@ pub trait IsStarkProver<
         let comp_z_pow_n = z_power.pow(domain_size);
         let comp_inv_denoms = math::polynomial::barycentric_inv_denoms(&z_power, &dc.points);
 
-        let composition_poly_parts_ood_evaluation: Vec<_> = round_2_result
-            .lde_composition_poly_evaluations
-            .iter()
-            .map(|lde_evals| {
-                // Extract trace-size evaluations (stride = blowup_factor)
-                let evals: Vec<FieldElement<FieldExtension>> = (0..domain_size)
-                    .map(|i| lde_evals[i * blowup_factor].clone())
-                    .collect();
-                math::polynomial::interpolate_coset_eval_ext_with_g_n_inv(
-                    &comp_z_pow_n,
+        let cpu_comp_ood = || -> Vec<FieldElement<FieldExtension>> {
+            round_2_result
+                .host_evals()
+                .iter()
+                .map(|lde_evals| {
+                    let evals: Vec<FieldElement<FieldExtension>> = (0..domain_size)
+                        .map(|i| lde_evals[i * blowup_factor].clone())
+                        .collect();
+                    math::polynomial::interpolate_coset_eval_ext_with_g_n_inv(
+                        &comp_z_pow_n,
+                        &dc.offset_pow_n,
+                        &dc.size_inv,
+                        &dc.offset_pow_n_inv,
+                        &dc.points,
+                        &evals,
+                        &comp_inv_denoms,
+                    )
+                })
+                .collect()
+        };
+
+        #[cfg(feature = "cuda")]
+        let composition_poly_parts_ood_evaluation = round_1_result
+            .lde_trace
+            .gpu_composition_parts()
+            .and_then(|handle| {
+                crate::gpu_lde::try_barycentric_ext3_on_comp_handle::<Field, FieldExtension>(
+                    handle,
+                    blowup_factor,
+                    &dc.points,
                     &dc.offset_pow_n,
                     &dc.size_inv,
                     &dc.offset_pow_n_inv,
-                    &dc.points,
-                    &evals,
+                    &comp_z_pow_n,
                     &comp_inv_denoms,
                 )
             })
-            .collect();
+            .unwrap_or_else(cpu_comp_ood);
+        #[cfg(not(feature = "cuda"))]
+        let composition_poly_parts_ood_evaluation = cpu_comp_ood();
 
         // === Trace polynomials: barycentric evaluation via LDE ===
         let trace_ood_evaluations = crate::trace::get_trace_evaluations_from_lde(
@@ -1474,7 +1606,7 @@ pub trait IsStarkProver<
 
         let gamma = transcript.sample_field_element();
 
-        let n_terms_composition_poly = round_2_result.lde_composition_poly_evaluations.len();
+        let n_terms_composition_poly = round_2_result.num_composition_parts;
         // g·z pruning: only the current-row block (all columns) plus the masked
         // next-row columns get an opening / DEEP coefficient.
         let layout = Self::ood_layout(air);
@@ -1497,10 +1629,35 @@ pub trait IsStarkProver<
         // <<<< Receive challenges: 𝛾ⱼ, 𝛾ⱼ'
         let gammas = deep_composition_coefficients;
 
+        let domain_size = domain.lde_roots_of_unity_coset.len();
+
+        // A valid FRI configuration may intentionally perform no folds (for
+        // example, a tiny trace or a terminal degree clamped to the full
+        // codeword). Keep the host DEEP output in those cases: the direct
+        // handoff is only authoritative when the GPU FRI dispatcher can
+        // actually consume it.
+        #[cfg(feature = "cuda")]
+        let direct_handoff_configured = {
+            let layout = crate::fri::terminal::FriFoldLayout::new(
+                domain_size.trailing_zeros(),
+                domain.blowup_factor.trailing_zeros(),
+                air.options().fri_final_poly_log_degree as u32,
+            );
+            crate::gpu_lde::deep_fri_resident_enabled()
+                && layout.total_folds > 0
+                && layout.terminal_len >= 2
+        };
+        #[cfg(feature = "cuda")]
+        let crosscheck_direct = crate::gpu_lde::deep_fri_crosscheck();
+        #[cfg(feature = "cuda")]
+        let retain_fully_resident_host = !direct_handoff_configured || crosscheck_direct;
+        #[cfg(not(feature = "cuda"))]
+        let retain_fully_resident_host = true;
+
         // Compute p₀ (deep composition polynomial) as N evaluations on trace-size coset
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
-        let deep_evals = Self::compute_deep_composition_poly_evaluations(
+        let deep_output = Self::compute_deep_composition_poly_evaluations(
             &round_1_result.lde_trace,
             round_2_result,
             round_3_result,
@@ -1509,23 +1666,138 @@ pub trait IsStarkProver<
             &domain.trace_primitive_root,
             &gammas,
             &trace_term_coeffs,
+            retain_fully_resident_host,
         );
         #[cfg(feature = "instruments")]
         let other_dur_1 = t_sub.elapsed();
 
-        // DEEP evaluations are already at 2N LDE points — just bit-reverse for FRI.
-        // No iFFT+FFT extension needed (Plonky3-style direct LDE computation).
-        let domain_size = domain.lde_roots_of_unity_coset.len();
+        #[cfg(feature = "cuda")]
+        let deep_device = deep_output.device;
+
+        // DEEP evaluations are already at 2N LDE points. The legacy bridge
+        // bit-reverses them on CPU; the resident bridge folds that permutation
+        // into the first GPU FRI kernel and never materialises a host codeword.
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
-        let mut lde_evals = deep_evals;
-        in_place_bit_reverse_permute(&mut lde_evals);
+        let mut lde_evals = deep_output.host;
+        #[cfg(feature = "cuda")]
+        let direct_requested = direct_handoff_configured && deep_device.is_some();
+
+        #[cfg(feature = "cuda")]
+        let needs_host_bridge = !direct_requested || crosscheck_direct;
+        #[cfg(not(feature = "cuda"))]
+        let needs_host_bridge = true;
+
+        if needs_host_bridge {
+            assert_eq!(
+                lde_evals.len(),
+                domain_size,
+                "R4 DEEP host codeword missing while the host FRI bridge is required"
+            );
+            in_place_bit_reverse_permute(&mut lde_evals);
+        }
         #[cfg(feature = "instruments")]
         let r4_fft_dur = t_sub.elapsed();
 
         // FRI commit phase from pre-computed evaluations
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
+        #[cfg(feature = "cuda")]
+        let (fri_final_poly_coeffs, fri_layers) = if direct_requested {
+            let deep = deep_device.expect("direct DEEP->FRI requested without a device handle");
+            let transcript_before = transcript.clone();
+            let result = crate::gpu_lde::try_fri_commit_gpu::<Field, FieldExtension, _>(
+                &lde_evals,
+                Some(deep),
+                transcript,
+                &coset_offset,
+                domain_size,
+                domain.blowup_factor.trailing_zeros(),
+                air.options().fri_final_poly_log_degree as u32,
+            );
+            match result {
+                Some(direct) => {
+                    if crosscheck_direct {
+                        let mut reference_transcript = transcript_before;
+                        let reference = fri::commit_phase_from_evaluations(
+                            lde_evals.clone(),
+                            &mut reference_transcript,
+                            &coset_offset,
+                            domain_size,
+                            domain.blowup_factor.trailing_zeros(),
+                            air.options().fri_final_poly_log_degree as u32,
+                            false,
+                        );
+                        let direct_roots: Vec<_> =
+                            direct.1.iter().map(|l| l.merkle_tree.root).collect();
+                        let reference_roots: Vec<_> =
+                            reference.1.iter().map(|l| l.merkle_tree.root).collect();
+                        assert_eq!(
+                            direct.0, reference.0,
+                            "DEEP->FRI terminal coefficients mismatch"
+                        );
+                        assert_eq!(
+                            direct_roots, reference_roots,
+                            "DEEP->FRI layer roots mismatch"
+                        );
+                        assert_eq!(
+                            transcript.state(),
+                            reference_transcript.state(),
+                            "DEEP->FRI transcript state mismatch"
+                        );
+                    }
+                    direct
+                }
+                // Device-only GPU FRI failed (e.g. a GPU fault mid-fold). The host
+                // codeword was dropped for residency, so recover it instead of
+                // aborting: restore the transcript to before the failed attempt,
+                // recompute the DEEP codeword on host, and run the CPU FRI. The
+                // recompute only happens on this rare failure path, so the happy
+                // path keeps the residency win (no host D2H).
+                None => {
+                    *transcript = transcript_before;
+                    let mut recovered = Self::compute_deep_composition_poly_evaluations(
+                        &round_1_result.lde_trace,
+                        round_2_result,
+                        round_3_result,
+                        z,
+                        domain,
+                        &domain.trace_primitive_root,
+                        &gammas,
+                        &trace_term_coeffs,
+                        true,
+                    )
+                    .host;
+                    assert_eq!(
+                        recovered.len(),
+                        domain_size,
+                        "recovered DEEP codeword size mismatch on GPU-FRI fallback"
+                    );
+                    in_place_bit_reverse_permute(&mut recovered);
+                    fri::commit_phase_from_evaluations(
+                        recovered,
+                        transcript,
+                        &coset_offset,
+                        domain_size,
+                        domain.blowup_factor.trailing_zeros(),
+                        air.options().fri_final_poly_log_degree as u32,
+                        true, // force CPU: the GPU FRI already failed for this table
+                    )
+                }
+            }
+        } else {
+            fri::commit_phase_from_evaluations(
+                lde_evals,
+                transcript,
+                &coset_offset,
+                domain_size,
+                domain.blowup_factor.trailing_zeros(),
+                air.options().fri_final_poly_log_degree as u32,
+                false,
+            )
+        };
+
+        #[cfg(not(feature = "cuda"))]
         let (fri_final_poly_coeffs, fri_layers) = fri::commit_phase_from_evaluations(
             lde_evals,
             transcript,
@@ -1533,6 +1805,7 @@ pub trait IsStarkProver<
             domain_size,
             domain.blowup_factor.trailing_zeros(),
             air.options().fri_final_poly_log_degree as u32,
+            false,
         );
         #[cfg(feature = "instruments")]
         let r4_merkle_dur = t_sub.elapsed();
@@ -1548,12 +1821,20 @@ pub trait IsStarkProver<
             transcript.append_bytes(&nonce_value.to_be_bytes());
             nonce = Some(nonce_value);
         }
+        #[cfg(feature = "instruments")]
+        let grinding_dur = t_sub.elapsed();
 
+        #[cfg(feature = "instruments")]
+        let t_sub = Instant::now();
         let number_of_queries = air.options().fri_number_of_queries;
         let iotas = Self::sample_query_indexes(number_of_queries, domain, transcript);
 
         let query_list = fri::query_phase(&fri_layers, &iotas);
+        #[cfg(feature = "instruments")]
+        let fri_query_dur = t_sub.elapsed();
 
+        #[cfg(feature = "instruments")]
+        let t_sub = Instant::now();
         let fri_layers_merkle_roots: Vec<_> = fri_layers
             .iter()
             .map(|layer| layer.merkle_tree.root)
@@ -1564,8 +1845,15 @@ pub trait IsStarkProver<
 
         #[cfg(feature = "instruments")]
         {
-            let queries_dur = t_sub.elapsed();
-            crate::instruments::store_r4_sub(r4_fft_dur, r4_merkle_dur, other_dur_1, queries_dur);
+            let openings_dur = t_sub.elapsed();
+            crate::instruments::store_r4_sub(
+                r4_fft_dur,
+                r4_merkle_dur,
+                other_dur_1,
+                grinding_dur,
+                fri_query_dur,
+                openings_dur,
+            );
         }
 
         Round4 {
@@ -1607,12 +1895,16 @@ pub trait IsStarkProver<
         primitive_root: &FieldElement<Field>,
         composition_poly_gammas: &[FieldElement<FieldExtension>],
         trace_terms_gammas: &[Vec<FieldElement<FieldExtension>>],
-    ) -> Vec<FieldElement<FieldExtension>>
+        retain_fully_resident_host: bool,
+    ) -> DeepCompositionOutput<FieldExtension>
     where
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
     {
-        let num_parts = round_2_result.lde_composition_poly_evaluations.len();
+        #[cfg(not(feature = "cuda"))]
+        let _ = retain_fully_resident_host;
+
+        let num_parts = round_2_result.num_composition_parts;
         let z_power = z.pow(num_parts); // pole for H terms
 
         // Number of evaluation points per trace column (= transition_offsets.len() * step_size)
@@ -1661,7 +1953,10 @@ pub trait IsStarkProver<
                     crate::gpu_lde::try_deep_composition_gpu::<Field, FieldExtension>(
                         lde_trace,
                         lde_trace.gpu_composition_parts(),
-                        &round_2_result.lde_composition_poly_evaluations,
+                        round_2_result
+                            .host_composition_lde
+                            .as_deref()
+                            .unwrap_or(&[]),
                         h_ood,
                         &trace_ood_columns,
                         composition_poly_gammas,
@@ -1669,9 +1964,13 @@ pub trait IsStarkProver<
                         &[],
                         Some((&inv_dev, &stream)),
                         num_eval_points,
+                        retain_fully_resident_host,
                     )
             {
-                return deep_evals;
+                return DeepCompositionOutput {
+                    host: deep_evals.host,
+                    device: deep_evals.device,
+                };
             }
         }
 
@@ -1697,7 +1996,10 @@ pub trait IsStarkProver<
                 crate::gpu_lde::try_deep_composition_gpu::<Field, FieldExtension>(
                     lde_trace,
                     lde_trace.gpu_composition_parts(),
-                    &round_2_result.lde_composition_poly_evaluations,
+                    round_2_result
+                        .host_composition_lde
+                        .as_deref()
+                        .unwrap_or(&[]),
                     h_ood,
                     &trace_ood_columns,
                     composition_poly_gammas,
@@ -1705,9 +2007,13 @@ pub trait IsStarkProver<
                     &denoms,
                     None,
                     num_eval_points,
+                    true,
                 )
             {
-                return deep_evals;
+                return DeepCompositionOutput {
+                    host: deep_evals.host,
+                    device: deep_evals.device,
+                };
             }
         }
 
@@ -1719,6 +2025,11 @@ pub trait IsStarkProver<
         assert!(
             !lde_trace.host_trace_empty(),
             "R4 DEEP composition fell back to the host trace, but it is device-only (empty)"
+        );
+        #[cfg(feature = "cuda")]
+        assert!(
+            round_2_result.host_composition_lde.is_some(),
+            "R4 DEEP composition fell back to the host loop, but the composition LDE is device-only"
         );
 
         // OOD column compression (Plonky3-style): precompute one value per eval point,
@@ -1758,12 +2069,12 @@ pub trait IsStarkProver<
             })
             .collect();
 
-        crate::par::par_map_collect(0..lde_size, |i| {
+        let host = crate::par::par_map_collect(0..lde_size, |i| {
             let mut result = FieldElement::<FieldExtension>::zero();
 
             // H terms
             for j in 0..num_parts {
-                let h_j_val = &round_2_result.lde_composition_poly_evaluations[j][i];
+                let h_j_val = &round_2_result.host_evals()[j][i];
                 let h_j_ood = &h_ood[j];
                 result += &composition_poly_gammas[j] * (h_j_val - h_j_ood) * &inv_h[i];
             }
@@ -1783,7 +2094,12 @@ pub trait IsStarkProver<
             }
 
             result
-        })
+        });
+        DeepCompositionOutput {
+            host,
+            #[cfg(feature = "cuda")]
+            device: None,
+        }
     }
 
     /// Computes values and validity proofs of the evaluations of the composition polynomial parts
@@ -2194,6 +2510,34 @@ pub trait IsStarkProver<
                 })
             });
 
+        // Step C2: gather the composition parts' query row-pairs off the resident
+        // handle (same `query_rows`, same lde_size as the trace). Cross-checked
+        // against the host `open_composition_poly_with_proof` values per query in
+        // the loop below (host authoritative this stage); becomes the sole source
+        // at C4 when the host composition LDE is dropped.
+        #[cfg(feature = "cuda")]
+        let comp_dev_values: Option<Vec<FieldElement<FieldExtension>>> =
+            comp_dev_proofs.as_ref().and_then(|_| {
+                round_1_result.lde_trace.gpu_composition_parts().and_then(|h| {
+                    Self::gather_query_rows_device(
+                        lde_trace,
+                        "composition",
+                        |stream| {
+                            math_cuda::barycentric::gather_rows_ext3_on_device(
+                                h,
+                                &query_rows,
+                                stream,
+                            )
+                        },
+                        |raw| {
+                            crate::constraint_ir::gpu_interp::ext3_u64_to_field::<FieldExtension>(
+                                raw,
+                            )
+                        },
+                    )
+                })
+            });
+
         for (qi, index) in indexes_to_open.iter().enumerate() {
             #[cfg(not(feature = "cuda"))]
             let _ = qi;
@@ -2238,15 +2582,25 @@ pub trait IsStarkProver<
                 #[cfg(feature = "cuda")]
                 {
                     if let Some(proofs) = &comp_dev_proofs {
-                        Self::open_composition_poly_with_proof(
-                            proofs[qi].clone(),
-                            &round_2_result.lde_composition_poly_evaluations,
-                            *index,
-                        )
+                        match comp_dev_values.as_ref() {
+                            Some(dev_vals) => {
+                                let (even, odd) = Self::device_row_pair::<FieldExtension>(
+                                    dev_vals,
+                                    qi,
+                                    round_2_result.num_composition_parts,
+                                );
+                                Self::open_polys_from_values(proofs[qi].clone(), even, odd)
+                            }
+                            None => Self::open_composition_poly_with_proof(
+                                proofs[qi].clone(),
+                                round_2_result.host_evals(),
+                                *index,
+                            ),
+                        }
                     } else {
                         Self::open_composition_poly(
                             &round_2_result.composition_poly_merkle_tree,
-                            &round_2_result.lde_composition_poly_evaluations,
+                            round_2_result.host_evals(),
                             *index,
                         )
                     }
@@ -2255,7 +2609,7 @@ pub trait IsStarkProver<
                 {
                     Self::open_composition_poly(
                         &round_2_result.composition_poly_merkle_tree,
-                        &round_2_result.lde_composition_poly_evaluations,
+                        round_2_result.host_evals(),
                         *index,
                     )
                 }
@@ -3164,17 +3518,25 @@ pub trait IsStarkProver<
             let zero = Duration::ZERO;
             let (r2_constraints, r2_fft, r2_merkle) =
                 crate::instruments::take_r2_sub().unwrap_or((zero, zero, zero));
-            let (r4_fft, r4_merkle, r4_deep_comp, r4_queries) =
-                crate::instruments::take_r4_sub().unwrap_or((zero, zero, zero, zero));
+            let (
+                r4_bit_reverse,
+                r4_fri_commit,
+                r4_deep_comp,
+                r4_grinding,
+                r4_fri_query,
+                r4_openings,
+            ) = crate::instruments::take_r4_sub().unwrap_or((zero, zero, zero, zero, zero, zero));
             crate::instruments::store_round_sub_ops(crate::instruments::TableSubOps {
                 constraints: r2_constraints,
                 comp_decompose: r2_fft,
                 comp_commit: r2_merkle,
                 ood: round_3_dur,
                 deep_comp: r4_deep_comp,
-                deep_extend: r4_fft,
-                fri_commit: r4_merkle,
-                queries: r4_queries,
+                deep_extend: r4_bit_reverse,
+                fri_commit: r4_fri_commit,
+                grinding: r4_grinding,
+                fri_query: r4_fri_query,
+                openings: r4_openings,
             });
         }
 

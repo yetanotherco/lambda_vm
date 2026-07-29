@@ -61,6 +61,7 @@ fn run_ext3(lde_size: usize, num_cols: usize, seed: u64) {
         m: num_cols,
         lde_size,
         tree: None,
+        ready: None,
     };
 
     let rows: Vec<u32> = (0..9).map(|_| rng.gen_range(0..lde_size) as u32).collect();
