@@ -2031,17 +2031,21 @@ fn statement_fixture() -> StatementFixture {
     }
 }
 
+/// Each field gets its OWN halves. The arena is a vector of `u32` words, not a
+/// byte stream, so concatenating first and packing after would let a field whose
+/// length is not a multiple of four shift every field behind it — which is
+/// exactly what an unaligned `public_output` does. `pack_stream` zeroes the
+/// trailing half's unused high bytes, the property the machine's mask pins.
 fn statement_arenas(f: &StatementFixture) -> Vec<Vec<LfmWord>> {
-    let mut bytes = f.elf_digest.to_vec();
-    bytes.extend_from_slice(&f.public_output);
-    bytes.extend_from_slice(&f.epoch_label.to_le_bytes());
+    let mut halves = keccak_host::pack_stream(&f.elf_digest);
+    halves.extend(keccak_host::pack_stream(&f.public_output));
+    halves.extend(keccak_host::pack_stream(&f.epoch_label.to_le_bytes()));
     for (prep, main) in &f.roots {
         if let Some(p) = prep {
-            bytes.extend_from_slice(p);
+            halves.extend(keccak_host::pack_stream(p));
         }
-        bytes.extend_from_slice(main);
+        halves.extend(keccak_host::pack_stream(main));
     }
-    let halves = keccak_host::pack_stream(&bytes);
     assert_eq!(halves.len(), stmt_arena_halves() as usize);
     vec![halves.into_iter().map(super::word::base_word).collect()]
 }
@@ -2125,21 +2129,34 @@ fn assert_challenges_match(public: &[(u32, LfmWord)], f: &StatementFixture, what
     }
 }
 
-/// Pins the misalignment claim in `statement_replay`'s module docs rather than
-/// leaving it as prose: the epoch statement ends 3 bytes past a half boundary,
-/// which is why every Phase-A root absorb is spliced.
+/// Pins where the epoch statement leaves the byte cursor, which decides whether
+/// Phase A is spliced and at what shift.
+///
+/// CORRECTION to an earlier claim of mine: the statement is NOT unconditionally
+/// 3 bytes past a boundary. Its length is `207 + L + 16R`, so the shift Phase A
+/// inherits is `(3 + L) mod 4` — it is 3 only when the public output happens to
+/// be a multiple of four, and it is ZERO (Phase A entirely unspliced) whenever
+/// `L ≡ 1 (mod 4)`. Since `L` is one byte per COMMIT op and therefore workload-
+/// determined, the Phase-A splice cost is workload-dependent and free for about
+/// one workload in four.
 #[test]
-fn epoch_statement_ends_three_bytes_past_a_boundary() {
+fn epoch_statement_cursor_is_three_plus_output_len() {
     let shape = epoch_statement_shape();
-    assert_eq!(
-        shape.byte_len(),
-        207 + STMT_PUBLIC_OUTPUT_LEN + 16 * shape.page_ranges.len()
-    );
-    assert_eq!(
-        shape.byte_len() % keccak_host::BYTES_PER_HALF,
-        3,
-        "the statement leaves the cursor at shift 3, so Phase A is spliced"
-    );
+    let r = shape.page_ranges.len();
+    assert_eq!(shape.byte_len(), 207 + STMT_PUBLIC_OUTPUT_LEN + 16 * r);
+    for l in 0..8usize {
+        let total = 207 + l + 16 * r;
+        assert_eq!(
+            total % keccak_host::BYTES_PER_HALF,
+            (3 + l) % keccak_host::BYTES_PER_HALF,
+            "Phase A inherits shift (3 + L) mod 4"
+        );
+    }
+    // The acceptance shape is chosen to exercise BOTH new paths at once: an
+    // unaligned public output (so the trailing half is masked) and a nonzero
+    // inherited shift (so Phase A is spliced).
+    assert_ne!(STMT_PUBLIC_OUTPUT_LEN % keccak_host::BYTES_PER_HALF, 0);
+    assert_ne!(shape.byte_len() % keccak_host::BYTES_PER_HALF, 0);
 }
 
 #[test]
@@ -2241,4 +2258,33 @@ fn statement_replay_cell_counts() {
         program.groups.balu.real_rows,
     );
     assert!(main > 0 && aux > 0);
+}
+
+/// The masked trailing half's soundness obligation: bytes PAST the encoded
+/// length must not reach the sponge.
+///
+/// `public_output` is length-prefixed, so its final arena half has live bytes
+/// only up to `len % 4`. The high bytes of that felt are arena data and
+/// otherwise unconstrained — without the zero-pin in `Packer::push_masked` a
+/// prover could put anything there and change the absorbed byte string while the
+/// length prefix said otherwise. Here byte 3 of the trailing half is past the
+/// 14-byte length, so the program must refuse to execute rather than absorb it.
+#[test]
+fn statement_rejects_garbage_past_the_public_output_length() {
+    let f = statement_fixture();
+    let mut arenas = statement_arenas(&f);
+    // Halves: elf 0..8, public_output 8..12 (14 bytes = 3 whole + 2 live),
+    // so half 11's top two bytes are past the length.
+    arenas[0][11][0] = &arenas[0][11][0] + FE::from(1u64 << 24);
+    match super::executor::execute(
+        &statement_replay_program(),
+        &arenas,
+        &super::hash::TestPermutation,
+    ) {
+        Err(LfmExecError::DivByZero { .. }) => {}
+        other => panic!(
+            "bytes past the public-output length must be pinned to zero, got {:?}",
+            other.map(|_| "accepted")
+        ),
+    }
 }

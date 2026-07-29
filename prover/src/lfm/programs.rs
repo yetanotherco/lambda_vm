@@ -384,9 +384,10 @@ pub fn splice_alternating_program() -> LfmProgram {
 
 // ============ R1e slices c+d: the epoch statement and Phase A ============
 
-/// Public-output length of the acceptance shape. A multiple of four, per the
-/// documented gap in `statement_replay::absorb_epoch_statement`.
-pub const STMT_PUBLIC_OUTPUT_LEN: usize = 12;
+/// Public-output length of the acceptance shape. Deliberately NOT a multiple of
+/// four: an epoch's public output is collected one byte per COMMIT op, so the
+/// unaligned case is the general one and the acceptance must exercise it.
+pub const STMT_PUBLIC_OUTPUT_LEN: usize = 14;
 
 /// Whether each of the acceptance shape's sub-proofs is preprocessed. Mixed on
 /// purpose: the verifier absorbs a preprocessed commitment only for the airs
@@ -398,7 +399,7 @@ const ROOT_HALVES: u32 = 8;
 
 /// Arena halves the statement-replay program reads.
 pub fn stmt_arena_halves() -> u32 {
-    let vars = ROOT_HALVES + (STMT_PUBLIC_OUTPUT_LEN / 4) as u32 + 2;
+    let vars = ROOT_HALVES + STMT_PUBLIC_OUTPUT_LEN.div_ceil(4) as u32 + 2;
     let roots: u32 = STMT_PREPROCESSED
         .iter()
         .map(|&p| if p { 2 * ROOT_HALVES } else { ROOT_HALVES })
@@ -437,7 +438,7 @@ pub fn statement_replay_program_source() -> LfmProgramSource {
     let arena = b.declare_arena(total);
     let h: Vec<Felt> = (0..total).map(|i| b.hint_felt(arena, i)).collect();
 
-    let out_halves = STMT_PUBLIC_OUTPUT_LEN / 4;
+    let out_halves = STMT_PUBLIC_OUTPUT_LEN.div_ceil(4);
     let (elf, rest) = h.split_at(ROOT_HALVES as usize);
     let (public_output, rest) = rest.split_at(out_halves);
     let (epoch_label, mut roots) = rest.split_at(2);

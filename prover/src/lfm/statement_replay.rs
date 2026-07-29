@@ -98,16 +98,8 @@ pub fn absorb_epoch_statement(
     vars: &EpochStatementVars,
 ) {
     assert_eq!(
-        shape.public_output_len % BYTES_PER_HALF,
-        0,
-        "public_output_len must be a multiple of 4 for now: a partial trailing \
-         half needs masking (split_half at len % 4, then assert the high part is \
-         zero — about 34 rows, once per proof), which is a deliberate gap rather \
-         than a silent miscoding"
-    );
-    assert_eq!(
         vars.public_output.len(),
-        shape.public_output_len / BYTES_PER_HALF,
+        shape.public_output_len.div_ceil(BYTES_PER_HALF),
         "public_output halves must match the declared length"
     );
     assert_eq!(vars.elf_digest.len(), 8, "the ELF digest is 32 bytes");
@@ -116,7 +108,11 @@ pub fn absorb_epoch_statement(
     t.append_const_bytes(CONTINUATION_EPOCH_TAG);
     t.append_halves_misaligned(vars.elf_digest);
     t.append_const_bytes(&(shape.public_output_len as u64).to_le_bytes());
-    t.append_halves_misaligned(vars.public_output);
+    // Byte-granular on purpose. `public_output` is collected one byte per COMMIT
+    // operation (`trace_builder`), so an epoch's length is whatever the workload
+    // produced — nothing aligns it, and the trailing half must be masked rather
+    // than absorbed whole.
+    t.append_bytes_misaligned(vars.public_output, shape.public_output_len);
 
     // One constant run: the counts, the page total, the FRI byte and the range
     // list are all shape-static, so they concatenate into a single run and the

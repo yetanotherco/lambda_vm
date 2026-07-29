@@ -83,6 +83,10 @@ enum SegPiece {
     /// Machine-computed `u32` halves, four bytes each little-endian. Opaque
     /// felts, so they must land on a 4-byte boundary of the segment.
     Halves(Vec<Felt>),
+    /// A machine half carrying only its low `n` bytes (`n` in `1..4`) — the
+    /// trailing piece of a byte string whose length is not a multiple of four.
+    /// The packer masks it and pins the unused high bytes to zero.
+    Partial(Felt, usize),
 }
 
 /// A 64-bit candidate as the two `u32` halves the machine actually holds:
@@ -276,6 +280,34 @@ impl TranscriptReplay {
         self.buf = None;
     }
 
+    /// Absorb `byte_len` machine-computed bytes carried in
+    /// `ceil(byte_len / 4)` halves — the general case, where the byte string's
+    /// length need not be a multiple of four.
+    ///
+    /// The trailing half is masked to its live bytes and its unused high bytes
+    /// are pinned to zero (see [`Packer::push_masked`]). That matters for any
+    /// length-prefixed field: `public_output` in the epoch statement is
+    /// collected one byte per COMMIT operation, so its length is whatever the
+    /// workload produced and is not aligned in general.
+    pub fn append_bytes_misaligned(&mut self, halves: &[Felt], byte_len: usize) {
+        assert_eq!(
+            halves.len(),
+            byte_len.div_ceil(BYTES_PER_HALF),
+            "byte_len must match the supplied halves"
+        );
+        let full = byte_len / BYTES_PER_HALF;
+        let rem = byte_len % BYTES_PER_HALF;
+        if full > 0 {
+            self.segment.push(SegPiece::Halves(halves[..full].to_vec()));
+        }
+        if rem > 0 {
+            self.segment.push(SegPiece::Partial(halves[full], rem));
+        }
+        self.segment_len += byte_len;
+        self.out_pos = SQUEEZE_LEN;
+        self.buf = None;
+    }
+
     /// Packs the segment into `u32` halves, walking it at BYTE granularity.
     ///
     /// Constant bytes accumulate host-side; a machine half drops straight in
@@ -296,6 +328,7 @@ impl TranscriptReplay {
                         p.push_half(b, *h);
                     }
                 }
+                SegPiece::Partial(v, nbytes) => p.push_masked(b, *v, *nbytes),
             }
         }
         p.finish(b)
@@ -547,28 +580,73 @@ impl Packer {
         }
     }
 
-    fn push_half(&mut self, b: &mut LfmBuilder, d: Felt) {
+    /// Merges `v` into the half under construction at byte offset `filled`.
+    /// The destination's higher bytes are zero, so `mul_add` is exactly an or.
+    fn merge(&mut self, b: &mut LfmBuilder, v: Felt, filled: usize) -> Felt {
+        let shift = b.felt_const(FE::from(1u64 << (8 * filled)));
+        match core::mem::replace(&mut self.partial, Partial::Const(Vec::new())) {
+            Partial::Const(c) => {
+                let base = b.felt_const(FE::from(le_value(&c)));
+                b.mul_add(v, shift, base)
+            }
+            Partial::Mixed(m, _) => b.mul_add(v, shift, m),
+        }
+    }
+
+    /// Places a machine value carrying `nbytes` live bytes at the cursor.
+    ///
+    /// One routine covers both a whole half (`nbytes == 4`) and the masked tail
+    /// of an odd-length byte string, because they differ only in width.
+    fn push_partial(&mut self, b: &mut LfmBuilder, v: Felt, nbytes: usize) {
+        debug_assert!((1..=BYTES_PER_HALF).contains(&nbytes));
         let filled = self.filled();
         if filled == 0 {
-            // Aligned: the felt IS the half. No instructions — this is the path
-            // every aligned program takes and it must stay free, or every
+            // Nothing to merge with: `v` already sits in the low bytes of a
+            // fresh half and its high bytes are zero. No instructions — the path
+            // every aligned program takes, which must stay free or every
             // registered digest moves.
-            self.out.push(d);
+            if nbytes == BYTES_PER_HALF {
+                self.out.push(v);
+            } else {
+                self.partial = Partial::Mixed(v, nbytes);
+            }
             return;
         }
-        // `d` contributes its low `4 − filled` bytes to the half under
-        // construction and its high `filled` bytes to the next one.
-        let (lo, hi) = split_half(b, d, BYTES_PER_HALF - filled);
-        let shift = b.felt_const(FE::from(1u64 << (8 * filled)));
-        let half = match core::mem::replace(&mut self.partial, Partial::Const(Vec::new())) {
-            Partial::Const(v) => {
-                let base = b.felt_const(FE::from(le_value(&v)));
-                b.mul_add(lo, shift, base)
-            }
-            Partial::Mixed(m, _) => b.mul_add(lo, shift, m),
-        };
-        self.out.push(half);
-        self.partial = Partial::Mixed(hi, filled);
+        let room = BYTES_PER_HALF - filled;
+        if nbytes < room {
+            let merged = self.merge(b, v, filled);
+            self.partial = Partial::Mixed(merged, filled + nbytes);
+        } else if nbytes == room {
+            let merged = self.merge(b, v, filled);
+            self.out.push(merged);
+            self.partial = Partial::Const(Vec::new());
+        } else {
+            // Crosses the boundary: the low `room` bytes finish this half and
+            // the rest opens the next.
+            let (lo, hi) = split_half(b, v, room);
+            let merged = self.merge(b, lo, filled);
+            self.out.push(merged);
+            self.partial = Partial::Mixed(hi, nbytes - room);
+        }
+    }
+
+    fn push_half(&mut self, b: &mut LfmBuilder, d: Felt) {
+        self.push_partial(b, d, BYTES_PER_HALF);
+    }
+
+    /// Masks a trailing half to its `nbytes` live bytes and PINS the rest to
+    /// zero, then places it.
+    ///
+    /// The zero-pin is a soundness obligation, not tidiness: the high bytes of
+    /// an arena-supplied felt are otherwise unconstrained, and without it a
+    /// prover could put arbitrary content there. Those bytes are past the
+    /// encoding's length prefix, so they would change the absorbed byte string
+    /// while the length said otherwise.
+    fn push_masked(&mut self, b: &mut LfmBuilder, v: Felt, nbytes: usize) {
+        let (lo, hi) = split_half(b, v, nbytes);
+        let zero = b.felt_const(FE::zero());
+        b.assert_eq(hi, zero);
+        self.push_partial(b, lo, nbytes);
     }
 
     fn finish(mut self, b: &mut LfmBuilder) -> Vec<Felt> {
