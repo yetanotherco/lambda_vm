@@ -406,7 +406,7 @@ struct PreparedEpoch {
 /// advancing memory image, boundary + register-fini derivation) already
 /// happened on the producer; a builder turns `collected` into full trace
 /// tables ([`Traces::build_from_collected`]) — pure epoch-local work — and
-/// forwards the resulting [`PreparedEpoch`] to the epoch provers.
+/// forwards the resulting [`PreparedEpoch`] to the epoch prover.
 struct BuildJob {
     index: u64,
     register_init: Vec<u32>,
@@ -1082,7 +1082,7 @@ pub fn prove_continuation(
     // page-base set is shipped (see `touched_page_bases`).
     //
     // The producer publishes each epoch's boundary (an `Arc` share of the one it
-    // sends to the epoch provers) on this dedicated channel, in epoch order. The
+    // sends to the epoch prover) on this dedicated channel, in epoch order. The
     // global-prove thread drains it until the producer hangs up (last epoch
     // prepared) — the global proof depends only on these execution artifacts,
     // never on an epoch *proof*, so it overlaps the epoch proves' tail instead
@@ -1092,7 +1092,7 @@ pub fn prove_continuation(
     // Three-stage epoch pipeline: a producer thread runs the
     // sequential-critical work (execute + op collection over the advancing
     // memory image + boundary/fini derivation), a small pool of trace builders
-    // turns collected epochs into trace tables, and `workers` provers prove
+    // turns collected epochs into trace tables, and a single prover proves
     // them. Everything the next epoch's preparation needs is derived from
     // execution, not from proofs or traces: `register_init` comes from the
     // collected register end state (`register_fini`, the same value the
@@ -1101,23 +1101,9 @@ pub fn prove_continuation(
     // table to be built. Proof bytes are unchanged — only the schedule is.
     //
     // The bounded channels cap peak memory: at most one collected epoch
-    // queued, `builders` building, one built epoch queued, `workers` proving.
+    // queued, `builders` building, one built epoch queued, one proving.
     let (tx, rx) = std::sync::mpsc::sync_channel::<Result<PreparedEpoch, Error>>(1);
     let (build_tx, build_rx) = std::sync::mpsc::sync_channel::<Result<BuildJob, Error>>(1);
-    // Shared prover-pool state; declared outside the scope so scoped threads
-    // can borrow it.
-    //
-    // Default 3: measured on ethrex-10tx / RTX 5090 32 GB (8×8 interleaved
-    // runs), 3 concurrent epoch proves beat 2 by ~4% (14.9s vs 15.5s) at
-    // ~15 GB peak VRAM. On smaller cards (< 32 GB) set
-    // LAMBDA_VM_EPOCH_CONCURRENCY=2 — each concurrent 2^20-cycle epoch prove
-    // peaks at ~9 GB and the device-only GPU paths abort hard on VRAM
-    // exhaustion rather than degrade.
-    let workers = std::env::var("LAMBDA_VM_EPOCH_CONCURRENCY")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&k| k >= 1)
-        .unwrap_or(3);
     // Trace builders: each turns one collected epoch into full trace tables
     // (the bulk of the old per-epoch producer latency). 2 is enough to keep
     // the prove pipeline fed on the measured workloads; builds compete with
@@ -1127,31 +1113,28 @@ pub fn prove_continuation(
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&b| b >= 1)
         .unwrap_or(2);
-    let rx = std::sync::Mutex::new(rx);
     let build_rx = std::sync::Mutex::new(build_rx);
     type EpochResult = (u64, EpochProof);
-    let results: std::sync::Mutex<Vec<EpochResult>> = std::sync::Mutex::new(Vec::new());
     let first_err: std::sync::Mutex<Option<Error>> = std::sync::Mutex::new(None);
     let decode_artifacts_ref = &decode_artifacts;
     let first_err_ref = &first_err;
-    // On error the workers DRAIN the channel (discarding items) instead of
+    // On error the prover DRAINS the channel (discarding items) instead of
     // returning: the senders are bounded and can only unblock via a recv, so
     // an early return would leave a builder parked in `send` forever and the
     // scope would never join. Draining ends when every sender is dropped.
-    let prove_worker = |_worker: usize| {
+    let prove_worker = |rx: std::sync::mpsc::Receiver<Result<PreparedEpoch, Error>>| {
+        let mut proved: Vec<EpochResult> = Vec::new();
         loop {
-            // Take the next prepared epoch (lock released before proving).
-            let msg = { rx.lock().unwrap().recv() };
-            let prepared = match msg {
+            let prepared = match rx.recv() {
                 Ok(Ok(p)) => p,
                 Ok(Err(e)) => {
                     first_err.lock().unwrap().get_or_insert(e);
                     continue;
                 }
-                Err(_) => return, // channel closed: no more epochs
+                Err(_) => return proved, // channel closed: no more epochs
             };
             if first_err.lock().unwrap().is_some() {
-                continue; // another worker failed; drain and discard
+                continue; // an earlier failure is propagating; drain and discard
             }
             // Per-epoch identity on Nsight timelines (dynamic NVTX name); the
             // instruments span carries a static label and instances are told
@@ -1175,7 +1158,7 @@ pub fn prove_continuation(
                 opts,
                 decode_commitment,
             ) {
-                Ok(epoch) => results.lock().unwrap().push((prepared.index, epoch)),
+                Ok(epoch) => proved.push((prepared.index, epoch)),
                 Err(e) => {
                     first_err.lock().unwrap().get_or_insert(e);
                     continue; // drain mode (see loop comment)
@@ -1184,93 +1167,92 @@ pub fn prove_continuation(
         }
     };
     // Trace-builder worker: drain collected epochs, build their trace tables
-    // (pure epoch-local work) and forward the prepared epoch to the provers.
+    // (pure epoch-local work) and forward the prepared epoch to the prover.
     // Errors propagate through the prove channel, exactly like producer errors.
     //
     // Test-only fault injection, keyed by a magic private input no real caller
     // passes (stateless, so concurrent tests can never trip it): exercises the
     // mid-pipeline error path, which must return `Err` instead of wedging the
     // bounded channels (see `test_fault`).
-    let build_worker =
-        |_lane: usize, tx: std::sync::mpsc::SyncSender<Result<PreparedEpoch, Error>>| {
-            loop {
-                let msg = { build_rx.lock().unwrap().recv() };
-                let job = match msg {
-                    Ok(Ok(j)) => j,
-                    Ok(Err(e)) => {
-                        // Forward and keep draining (same reason as the prove
-                        // workers: a return would strand the producer's send).
-                        let _ = tx.send(Err(e));
-                        continue;
-                    }
-                    Err(_) => return, // channel closed: no more epochs
-                };
-                if first_err.lock().unwrap().is_some() {
-                    continue; // a prover failed; drain and discard
-                }
-                #[cfg(test)]
-                if job.index == test_fault::FAIL_INDEX && private_inputs == test_fault::MAGIC {
-                    let _ = tx.send(Err(Error::ContinuationInvariant(
-                        "injected pipeline fault (test)".to_string(),
-                    )));
+    let build_worker = |tx: std::sync::mpsc::SyncSender<Result<PreparedEpoch, Error>>| {
+        loop {
+            let msg = { build_rx.lock().unwrap().recv() };
+            let job = match msg {
+                Ok(Ok(j)) => j,
+                Ok(Err(e)) => {
+                    // Forward and keep draining (same reason as the
+                    // prover: a return would strand the producer's send).
+                    let _ = tx.send(Err(e));
                     continue;
                 }
-                #[cfg(feature = "nvtx")]
-                let __nvtx = stark::instruments::nvtx_range_fmt(|| {
-                    format!("epoch_trace_build[i={}]", job.index)
-                });
-                #[cfg(feature = "instruments")]
-                let __sp = stark::instruments::span("epoch_trace_build");
-                let traces = Traces::build_from_collected(
-                    decode_artifacts_ref,
-                    job.collected,
-                    // Continuation epochs use the L2G bookend: PAGE tables (the
-                    // only image consumers in the build) are skipped.
-                    None::<&std::collections::HashMap<u64, u8>>,
-                    &job.register_init,
-                    &MaxRowsConfig::default(),
-                    private_inputs,
-                    job.is_final,
-                    true,
-                    #[cfg(feature = "disk-spill")]
-                    stark::storage_mode::StorageMode::Ram,
-                );
-                // Close the build span BEFORE forwarding: the send below blocks
-                // on prove-channel backpressure, which is waiting, not building.
-                #[cfg(feature = "instruments")]
-                drop(__sp);
-                #[cfg(feature = "nvtx")]
-                drop(__nvtx);
-                match traces {
-                    Ok(traces) => {
-                        let prepared = PreparedEpoch {
-                            index: job.index,
-                            register_init: job.register_init,
-                            label: job.label,
-                            traces,
-                            boundary: job.boundary,
-                            is_final: job.is_final,
-                        };
-                        // A send error means the prover side hung up (its error is
-                        // already propagating) — stop quietly.
-                        if tx.send(Ok(prepared)).is_err() {
-                            return;
-                        }
-                    }
-                    Err(e) => {
-                        let _ = tx.send(Err(e));
-                        continue; // drain mode
+                Err(_) => return, // channel closed: no more epochs
+            };
+            if first_err.lock().unwrap().is_some() {
+                continue; // the prover failed; drain and discard
+            }
+            #[cfg(test)]
+            if job.index == test_fault::FAIL_INDEX && private_inputs == test_fault::MAGIC {
+                let _ = tx.send(Err(Error::ContinuationInvariant(
+                    "injected pipeline fault (test)".to_string(),
+                )));
+                continue;
+            }
+            #[cfg(feature = "nvtx")]
+            let __nvtx = stark::instruments::nvtx_range_fmt(|| {
+                format!("epoch_trace_build[i={}]", job.index)
+            });
+            #[cfg(feature = "instruments")]
+            let __sp = stark::instruments::span("epoch_trace_build");
+            let traces = Traces::build_from_collected(
+                decode_artifacts_ref,
+                job.collected,
+                // Continuation epochs use the L2G bookend: PAGE tables (the
+                // only image consumers in the build) are skipped.
+                None::<&std::collections::HashMap<u64, u8>>,
+                &job.register_init,
+                &MaxRowsConfig::default(),
+                private_inputs,
+                job.is_final,
+                true,
+                #[cfg(feature = "disk-spill")]
+                stark::storage_mode::StorageMode::Ram,
+            );
+            // Close the build span BEFORE forwarding: the send below blocks
+            // on prove-channel backpressure, which is waiting, not building.
+            #[cfg(feature = "instruments")]
+            drop(__sp);
+            #[cfg(feature = "nvtx")]
+            drop(__nvtx);
+            match traces {
+                Ok(traces) => {
+                    let prepared = PreparedEpoch {
+                        index: job.index,
+                        register_init: job.register_init,
+                        label: job.label,
+                        traces,
+                        boundary: job.boundary,
+                        is_final: job.is_final,
+                    };
+                    // A send error means the prover side hung up (its error is
+                    // already propagating) — stop quietly.
+                    if tx.send(Ok(prepared)).is_err() {
+                        return;
                     }
                 }
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                    continue; // drain mode
+                }
             }
-        };
+        }
+    };
 
     // The global prove's result, produced by its own scoped thread. `None` only
     // if that thread never ran to completion (a panic — surfaced by the scope).
     type GlobalResult = (MultiProof<F, E, ()>, Vec<u64>, usize);
     let global_result: std::sync::Mutex<Option<Result<GlobalResult, Error>>> =
         std::sync::Mutex::new(None);
-    std::thread::scope(|scope| -> Result<(), Error> {
+    let mut results = std::thread::scope(|scope| -> Result<Vec<EpochResult>, Error> {
         let elf_ref = &elf;
         let producer = scope.spawn(move || {
             let mut prepare_all = || -> Result<(), Error> {
@@ -1395,7 +1377,7 @@ pub fn prove_continuation(
             };
             if let Err(e) = prepare_all() {
                 // Surface preparation errors through the builder channel (a
-                // builder forwards them to the provers); if the downstream side
+                // builder forwards them to the prover); if the downstream side
                 // is already gone the error there wins.
                 let _ = build_tx.send(Err(e));
             }
@@ -1403,11 +1385,11 @@ pub fn prove_continuation(
 
         // Trace-builder pool: collected epochs → trace tables → prove channel.
         // Each builder owns a clone of the prove sender; the original is
-        // dropped below so the provers' channel closes once the producer and
+        // dropped below so the prover's channel closes once the producer and
         // every builder are done.
-        for lane in 0..builders {
+        for _ in 0..builders {
             let tx = tx.clone();
-            scope.spawn(move || build_worker(lane, tx));
+            scope.spawn(move || build_worker(tx));
         }
         drop(tx);
 
@@ -1449,34 +1431,24 @@ pub fn prove_continuation(
             *global_result_ref.lock().unwrap() = Some(run());
         });
 
-        // Prove epochs concurrently. Epoch proofs are mutually independent —
-        // each is seeded by its own label-domain-separated transcript
-        // (`epoch_transcript`) and nothing in an epoch's proof feeds the next
-        // one (the execution chain lives entirely in the producer above) — so
-        // `workers` provers pull prepared epochs and prove in parallel.
-        // Results are re-ordered by epoch index before the bundle is
-        // assembled, so proof bytes are identical to the sequential schedule.
-        //
-        // Sizing: each concurrent epoch prove costs its own peak VRAM/heap
-        // (~9 GB VRAM per 2^20-cycle epoch measured on ethrex); the default
-        // is 3 (see `workers` above); tune with LAMBDA_VM_EPOCH_CONCURRENCY.
-        let prover_handles: Vec<_> = (0..workers)
-            .map(|k| scope.spawn(move || prove_worker(k)))
-            .collect();
-        for h in prover_handles {
-            h.join().map_err(|_| {
-                Error::ContinuationInvariant("epoch prover thread panicked".to_string())
-            })?;
-        }
+        // Prove epochs as the builders hand them over. Builders can finish
+        // out of index order, so results are re-ordered by epoch index before
+        // the bundle is assembled — proof bytes are identical to the
+        // sequential schedule (each epoch is seeded by its own
+        // label-domain-separated transcript and no epoch's proof feeds
+        // another).
+        let prover = scope.spawn(move || prove_worker(rx));
+        let proved = prover.join().map_err(|_| {
+            Error::ContinuationInvariant("epoch prover thread panicked".to_string())
+        })?;
         producer.join().map_err(|_| {
             Error::ContinuationInvariant("epoch preparation thread panicked".to_string())
         })?;
-        Ok(())
+        Ok(proved)
     })?;
     if let Some(e) = first_err.into_inner().unwrap() {
         return Err(e);
     }
-    let mut results = results.into_inner().unwrap();
     results.sort_by_key(|(index, _)| *index);
     for (_, epoch) in results {
         epochs.push(epoch);

@@ -504,8 +504,8 @@ impl<F: IsFFTField> LdeTwiddles<F> {
 }
 
 /// Process-wide `Domain` + `LdeTwiddles` cache keyed by
-/// `(field, trace_length, blowup, coset_offset)`. Continuation epochs and
-/// concurrent epoch proves otherwise rebuild the same ~24 MB `Domain` and
+/// `(field, trace_length, blowup, coset_offset)`. Continuation epochs
+/// otherwise rebuild the same ~24 MB `Domain` and
 /// ~32 MB twiddle set per epoch; sharing the `Arc`s also lets every lazy
 /// domain-derived cache (composition twiddles, `inv_2x`, OOD constants, FRI
 /// inverse twiddles) fill once per process instead of once per epoch.
