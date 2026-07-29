@@ -8,12 +8,32 @@ if [ -z "$WEBHOOK_URL" ]; then
     exit 0
 fi
 
-METRICS_FILE="bench_vs_artifacts/metrics.txt"
+# All overridable so the GPU nightly can reuse this publisher; the defaults reproduce the
+# CPU nightly's message byte for byte.
+ARTIFACT_DIR="${BENCH_ARTIFACT_DIR:-bench_vs_artifacts}"
+SLACK_HEADER="${BENCH_SLACK_HEADER:-Lambda VM vs SP1 v6 - Nightly Benchmark}"
+DEVICE_LABEL="${BENCH_SLACK_DEVICE:-CPU}"
+PROGRAM_LABEL="${BENCH_SLACK_PROGRAM:-Fibonacci}"
+# Set both to render the ethrex GPU-vs-CPU section (same workload, same host, two builds).
+GPU_DIR="${BENCH_GPU_DIR:-}"
+CPU_DIR="${BENCH_CPU_DIR:-}"
+# Suppress the extrapolated-projection block. Set it whenever the run measures only one
+# prover: a lone "projected at 500M cycles" number gets read against the other nightly's
+# number, which was fitted over different sizes on a different machine. The fit itself is
+# still in the artifact for whoever wants it.
+NO_PROJECTION="${BENCH_SLACK_NO_PROJECTION:-}"
 
-if [ ! -f "$METRICS_FILE" ]; then
+METRICS_FILE="$ARTIFACT_DIR/metrics.txt"
+
+HAVE_FIB=false
+[ -f "$METRICS_FILE" ] && HAVE_FIB=true
+HAVE_GPU=false
+[ -n "$GPU_DIR" ] && [ -f "$GPU_DIR/ethrex_metrics.txt" ] && HAVE_GPU=true
+
+if ! $HAVE_FIB && ! $HAVE_GPU; then
     curl -X POST "$WEBHOOK_URL" \
         -H 'Content-Type: application/json; charset=utf-8' \
-        --data '{"blocks":[{"type":"header","text":{"type":"plain_text","text":"Lambda VM vs SP1 v6 - Nightly Benchmark"}},{"type":"section","text":{"type":"mrkdwn","text":":x: Benchmark failed - no metrics found. Check the workflow logs."}}]}'
+        --data '{"blocks":[{"type":"header","text":{"type":"plain_text","text":"'"$SLACK_HEADER"'"}},{"type":"section","text":{"type":"mrkdwn","text":":x: Benchmark failed - no metrics found. Check the workflow logs."}}]}'
     exit 0
 fi
 
@@ -21,6 +41,14 @@ parse_metric() {
     { grep "^${1}=" "$METRICS_FILE" || true; } | cut -d= -f2-
 }
 
+# Read a key from an arbitrary metrics file: parse_from <file> <key>
+parse_from() {
+    { grep "^${2}=" "$1" 2>/dev/null || true; } | cut -d= -f2-
+}
+
+FIB_SECTION=""
+PROJ_SECTION=""
+if $HAVE_FIB; then
 TARGET_STEPS_SERIES=$(parse_metric "target_steps_series")
 LAMBDA_TIMES=$(parse_metric "lambda_times")
 SP1_TIMES=$(parse_metric "sp1_times")
@@ -61,9 +89,9 @@ done
 if [ -z "$RESULTS_MRKDWN" ]; then
     RESULTS_MRKDWN="(no data)"
 fi
+FIB_SECTION=',{"type":"divider"},{"type":"section","text":{"type":"mrkdwn","text":"'"$RESULTS_MRKDWN"'"}}'
 
-PROJ_SECTION=""
-if [ -n "$LAMBDA_PROJECTED_H" ] || [ -n "$SP1_PROJECTED_H" ]; then
+if [ -z "$NO_PROJECTION" ] && { [ -n "$LAMBDA_PROJECTED_H" ] || [ -n "$SP1_PROJECTED_H" ]; }; then
     TARGET_M=$(LC_NUMERIC=C awk -v c="$TARGET_CYCLES" 'BEGIN { printf "%dM", c/1000000 }')
     PROJ_MRKDWN="Projected @ ${TARGET_M} cycles:"
     if [ -n "$LAMBDA_PROJECTED_H" ]; then
@@ -78,8 +106,9 @@ if [ -n "$LAMBDA_PROJECTED_H" ] || [ -n "$SP1_PROJECTED_H" ]; then
     fi
     PROJ_SECTION=',{"type":"divider"},{"type":"header","text":{"type":"plain_text","text":"Linear Projection"}},{"type":"section","text":{"type":"mrkdwn","text":"'"$PROJ_MRKDWN"'"}}'
 fi
+fi
 
-ETHREX_METRICS_FILE="bench_vs_artifacts/ethrex_metrics.txt"
+ETHREX_METRICS_FILE="$ARTIFACT_DIR/ethrex_metrics.txt"
 ETHREX_SECTION=""
 if [ -f "$ETHREX_METRICS_FILE" ]; then
     # Render one "*<label>:* <time>s (<cycles> cycles)" line per block.
@@ -104,6 +133,51 @@ if [ -f "$ETHREX_METRICS_FILE" ]; then
     fi
 fi
 
+GPU_SECTION=""
+if $HAVE_GPU; then
+    GM="$GPU_DIR/ethrex_metrics.txt"
+    CM="$CPU_DIR/ethrex_metrics.txt"
+    # One block per slug present on the GPU side, with the CPU/GPU speedup. Verification
+    # never touches CUDA, so its ratio is a control: it should sit near 1.00, and a drift
+    # means the host was noisy and the prove speedup from this run is suspect.
+    GPU_MRKDWN=""
+    add_line() {
+        if [ -n "$GPU_MRKDWN" ]; then GPU_MRKDWN="${GPU_MRKDWN}\\n${1}"; else GPU_MRKDWN="$1"; fi
+    }
+    ratio() {  # $1=cpu $2=gpu -> "N.NNx" or empty
+        [ -z "$1" ] || [ -z "$2" ] && return 0
+        [ "$1" = "n/a" ] || [ "$2" = "n/a" ] && return 0
+        LC_NUMERIC=C awk -v c="$1" -v g="$2" 'BEGIN { if (g+0 > 0) printf "%.2fx", c/g }'
+    }
+    for slug in $(grep -oE '^[a-z0-9_]+_time_s=' "$GM" | sed 's/_time_s=$//'); do
+        gp=$(parse_from "$GM" "${slug}_time_s"); cp=$(parse_from "$CM" "${slug}_time_s")
+        gv=$(parse_from "$GM" "${slug}_verify_s"); cv=$(parse_from "$CM" "${slug}_verify_s")
+        cyc=$(parse_from "$GM" "${slug}_cycles"); ep=$(parse_from "$GM" "${slug}_epochs")
+        heap=$(parse_from "$GM" "${slug}_peak_heap_mb")
+        pbytes=$(parse_from "$GM" "${slug}_proof_bytes")
+        [ -z "$gp" ] && continue
+        label=$(printf '%s' "$slug" | tr '_' ' ')
+        sp=$(ratio "$cp" "$gp")
+        line="*${label}* prove: GPU ${gp}s / CPU ${cp:-n/a}s"
+        [ -n "$sp" ] && line="${line} - *${sp}*"
+        add_line "$line"
+        vr=$(ratio "$cv" "$gv")
+        vline="   verify (CPU path, control): ${gv:-n/a}s / ${cv:-n/a}s"
+        [ -n "$vr" ] && vline="${vline} - ratio ${vr}"
+        add_line "$vline"
+        det="   ${cyc:-n/a} cycles"
+        [ -n "$ep" ] && [ "$ep" != "n/a" ] && det="${det} · ${ep} epochs"
+        [ -n "$heap" ] && [ "$heap" != "n/a" ] && det="${det} · ${heap} MB peak heap"
+        [ -n "$pbytes" ] && det="${det} · $(LC_NUMERIC=C awk -v b="$pbytes" 'BEGIN { printf "%.2f GiB proof", b/1073741824 }')"
+        add_line "$det"
+    done
+    if [ -n "$GPU_MRKDWN" ]; then
+        add_line " "
+        add_line "_Absolute times carry ±10-20% host noise across nightly rentals — trust the ratio._"
+        GPU_SECTION=',{"type":"divider"},{"type":"header","text":{"type":"plain_text","text":"Ethrex continuations - GPU vs CPU (same host)"}},{"type":"section","text":{"type":"mrkdwn","text":"'"$GPU_MRKDWN"'"}}'
+    fi
+fi
+
 curl -X POST "$WEBHOOK_URL" \
     -H 'Content-Type: application/json; charset=utf-8' \
-    --data '{"blocks":[{"type":"header","text":{"type":"plain_text","text":"Lambda VM vs SP1 v6 - Nightly Benchmark"}},{"type":"context","elements":[{"type":"mrkdwn","text":"*Program:* Fibonacci  ·  *Device:* CPU"}]},{"type":"divider"},{"type":"section","text":{"type":"mrkdwn","text":"'"$RESULTS_MRKDWN"'"}}'"$PROJ_SECTION$ETHREX_SECTION"']}'
+    --data '{"blocks":[{"type":"header","text":{"type":"plain_text","text":"'"$SLACK_HEADER"'"}},{"type":"context","elements":[{"type":"mrkdwn","text":"*Program:* '"$PROGRAM_LABEL"'  ·  *Device:* '"$DEVICE_LABEL"'"}]}'"$FIB_SECTION$PROJ_SECTION$ETHREX_SECTION$GPU_SECTION"']}'

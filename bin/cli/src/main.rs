@@ -790,6 +790,10 @@ fn cmd_prove_continuation(
     eprintln!(
         "Generating continuation proof (blowup={blowup}, epoch_size_log2={epoch_size_log2}, epoch_size={epoch_size})...",
     );
+
+    #[cfg(feature = "jemalloc-stats")]
+    let tracker = heap_tracker::HeapTracker::start();
+
     let start = Instant::now();
     let bundle = match prover::continuation::prove_continuation(
         &elf_data,
@@ -833,6 +837,11 @@ fn cmd_prove_continuation(
     println!("Epochs: {}", bundle.num_epochs());
     if time {
         println!("Proving time: {:.3}s", prove_elapsed.as_secs_f64());
+    }
+    #[cfg(feature = "jemalloc-stats")]
+    {
+        let peak_bytes = tracker.stop();
+        println!("Peak heap: {} MB", peak_bytes / (1024 * 1024));
     }
     ExitCode::SUCCESS
 }

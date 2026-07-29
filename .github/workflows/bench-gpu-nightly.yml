@@ -1,0 +1,478 @@
+name: Bench GPU Nightly
+
+# Nightly benchmark of the production proving flow — an ethrex block proved with
+# `--continuations` (prove + verify) — on a rented Vast.ai RTX 5090.
+#
+# The same workload runs TWICE on the SAME box: once with the CUDA prover path
+# (`prover/cuda`) and once without. Absolute times can't be compared across nights
+# because each night is a different rented host (±10-20%), but the GPU/CPU ratio
+# measured within one run is self-normalizing and is the number to watch.
+#
+# This does NOT replace `bench-vs-nightly.yml` (CPU, self-hosted, fibonacci vs SP1 +
+# small ethrex blocks). That workflow and its historical series are untouched; this is a
+# separate workflow so a bad/expensive GPU box can't turn the CPU nightly red, and so
+# `act4-nightly.yml` (which chains off "Bench Vs Nightly" via workflow_run to serialize
+# the shared bench runner) isn't delayed by GPU provisioning.
+#
+# The box is ALWAYS destroyed, immediately after the report is copied back.
+#
+# Requires repo secrets:
+#   VAST_API_KEY                — https://cloud.vast.ai/manage-keys/
+#   VAST_TEMPLATE_HASH          — hash of the "NVIDIA CUDA Lambda VM 64GB" template
+#   BENCH_VS_SLACK_WEBHOOK      — nightly channel (schedule)
+#   BENCH_VS_SLACK_WEBHOOK_TEST — test channel (workflow_dispatch)
+
+on:
+  schedule:
+    # 02:17 America/Argentina/Buenos_Aires = 05:17 UTC. An hour before the CPU nightly
+    # (06:00 UTC) and off the contended :00 slot.
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+    inputs:
+      cont_txs:
+        description: "Transfer count of the continuation block (use 10 for a cheap smoke run)"
+        default: "100"
+      ref:
+        description: "Ref to benchmark (defaults to this workflow's ref)"
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  # Not ref-scoped: only ever one paid box in flight, whatever the ref.
+  group: bench-gpu-nightly
+  cancel-in-progress: false
+
+env:
+  GPU_NAME: RTX_5090
+  # Escalating price bands ($/hr, ascending); cheapest band with capacity wins, last is the cap.
+  PRICE_THRESHOLDS: "0.6 0.8 1.0"
+  # 96 (not 64): two cli builds with different feature sets in one target dir, plus a
+  # multi-GB continuation proof on disk.
+  VAST_IMAGE_DISK: "96"
+  RUN_LABEL: "bench-gpu-nightly-${{ github.run_id }}-${{ github.run_attempt }}"
+  # Pin the Vast CLI to an immutable commit (a PyPI version can be re-published).
+  VAST_CLI_COMMIT: "28494d92c6c03d887f8375085243c22eb68c5874"
+  REPORT_DIR: bench_gpu_artifacts
+  SP1_VERSION: v6.0.1
+
+jobs:
+  bench-gpu:
+    runs-on: ubuntu-latest
+    # Hang guardrail, not expected duration: provisioning + two cli builds (~40 min) + the
+    # ELF + fixture + a GPU and a CPU prove/verify of the 100tx block is ~1.5 hr.
+    timeout-minutes: 180
+    steps:
+      - name: Resolve config
+        id: cfg
+        env:
+          IN_TXS: ${{ github.event.inputs.cont_txs }}
+          IN_REF: ${{ github.event.inputs.ref }}
+        run: |
+          TXS="${IN_TXS:-100}"
+          case "$TXS" in
+            ''|*[!0-9]*) echo "::warning::invalid cont_txs '$TXS'; using 100"; TXS=100 ;;
+          esac
+          if [ "$TXS" -lt 1 ] || [ "$TXS" -gt 2000 ]; then
+            echo "::warning::cont_txs $TXS out of range [1,2000]; using 100"; TXS=100
+          fi
+          REF="${IN_REF:-${GITHUB_REF}}"
+          # Defense-in-depth: this is interpolated into a remote `bash -lc`.
+          case "$REF" in
+            ''|*[!A-Za-z0-9._/-]*) echo "::error::invalid ref: '$REF'"; exit 1 ;;
+          esac
+          { echo "cont_txs=$TXS"; echo "ref=$REF"; } >> "$GITHUB_OUTPUT"
+          echo "Benchmarking $REF with a ${TXS}tx continuation block"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Vast CLI
+        # No secrets in this step's env: install-time code can't read the API key during pip
+        # install. Pinned to an immutable commit for the same reason.
+        run: pip install --quiet --break-system-packages "git+https://github.com/vast-ai/vast-cli.git@${VAST_CLI_COMMIT}"
+
+      - name: Authenticate Vast CLI
+        env:
+          VAST_API_KEY: ${{ secrets.VAST_API_KEY }}
+        run: vastai set api-key "$VAST_API_KEY"
+
+      - name: Generate ephemeral SSH key
+        id: sshkey
+        run: |
+          mkdir -p "$HOME/.ssh"
+          KEY="$HOME/.ssh/vast_bench_gpu_nightly"
+          ssh-keygen -t ed25519 -N "" -f "$KEY" -C "gh-actions-bench-gpu-${GITHUB_RUN_ID}" >/dev/null
+          echo "key_path=$KEY" >> "$GITHUB_OUTPUT"
+
+      # Rent → provision → wait-for-ready, retrying across DIFFERENT offers (a box that never
+      # becomes ready is destroyed and another host is tried). Lifted from gpu-tests.yml.
+      - name: Provision instance (retry across offers)
+        id: provision
+        env:
+          VAST_TEMPLATE_HASH: ${{ secrets.VAST_TEMPLATE_HASH }}
+          KEY: ${{ steps.sshkey.outputs.key_path }}
+          MAX_TRIES: "5"
+          PROVISION_TIMEOUT: "600"
+          OFFER_ATTEMPTS: "10"
+          OFFER_INTERVAL: "30"
+          # Require driver major >= this so cudarc matches the runtime driver (older drivers
+          # lack newer symbols and the GPU path silently falls back to CPU).
+          MIN_DRIVER: "580"
+        run: |
+          # We handle failures explicitly (retry/destroy), so don't let -e abort the step.
+          set +e
+          SSH_OPTS="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o BatchMode=yes"
+          PUB="$(cat "$KEY.pub")"
+          read -r -a THRESHOLDS <<< "$PRICE_THRESHOLDS"
+          # cpu_ram filter is in GB (the returned .cpu_ram field is in MB). 48 GB floor: a
+          # continuation prove is flat-memory (~10 GB at epoch_size_log2=20) plus the proof
+          # serialization buffer.
+          BASE="gpu_name=${GPU_NAME} num_gpus=1 cpu_cores_effective>=16 cpu_ram>=48 disk_space>=${VAST_IMAGE_DISK} verified=true rentable=true cuda_max_good>=12.8"
+          TRIED=""
+
+          destroy() {
+            for _ in 1 2 3; do
+              vastai destroy instance "$1" --yes && return 0
+              sleep 10
+            done
+            echo "::warning::failed to destroy instance $1 after 3 tries (label $RUN_LABEL)"
+          }
+
+          # Priciest offer in the cheapest non-empty band, excluding hosts already tried.
+          pick_offer() {
+            OFFER_ID=""; MACHINE_ID=""; OFFER_PRICE=""; SPECS=""
+            local excl sel
+            excl="[$(echo "$TRIED" | tr -s ' ' ',' | sed 's/^,//; s/,$//')]"
+            for band in "${THRESHOLDS[@]}"; do
+              vastai search offers "$BASE dph_total<=$band" --raw -o dph_total > offers.json 2>/dev/null || true
+              sel=$(jq -c --argjson excl "$excl" '
+                map(select((try (.driver_version|split(".")[0]|tonumber) catch 0) >= '"$MIN_DRIVER"'))
+                | map(select(([.machine_id] | inside($excl)) | not))
+                | sort_by(.dph_total) | reverse | .[0] // empty' offers.json)
+              if [ -n "$sel" ]; then
+                OFFER_ID=$(echo "$sel" | jq -r '.id')
+                MACHINE_ID=$(echo "$sel" | jq -r '.machine_id')
+                OFFER_PRICE=$(echo "$sel" | jq -r '.dph_total')
+                SPECS=$(echo "$sel" | jq -r '"cores=\(.cpu_cores_effective) ram=\(.cpu_ram)MB disk=\(.disk_space)GB driver=\(.driver_version) geo=\(.geolocation)"')
+                echo "  band<=\$$band -> offer $OFFER_ID (machine $MACHINE_ID) at \$$OFFER_PRICE/hr | $SPECS"
+                return 0
+              fi
+              echo "  band<=\$$band -> no capacity"
+            done
+            return 1
+          }
+
+          # Running + sshd accepts our key + onstart bootstrap finished + the box can actually
+          # run this workload. Sets HOST/PORT. 0 ready, 1 timeout, 2 unrecoverable.
+          wait_ready() {
+            local iid="$1" waited=0 status host port msg
+            HOST=""; PORT=""
+            while [ "$waited" -lt "$PROVISION_TIMEOUT" ]; do
+              vastai show instance "$iid" --raw > inst.json 2>/dev/null || true
+              status=$(jq -r '.actual_status // empty' inst.json)
+              msg=$(jq -r '.status_msg // empty' inst.json)
+              case "$msg" in
+                *"not started loading"*|*"cannot be met"*|*"Error response from daemon"*)
+                  echo "  unrecoverable: $msg"; return 2 ;;
+              esac
+              host=$(jq -r '.public_ipaddr // empty' inst.json)
+              port=$(jq -r '.ports["22/tcp"][0].HostPort // empty' inst.json)
+              if [ "$status" = "running" ] && [ -n "$host" ] && [ -n "$port" ]; then
+                HOST="$host"; PORT="$port"
+                # shellcheck disable=SC2086  # $SSH_OPTS is intentionally word-split into flags
+                if ssh $SSH_OPTS -i "$KEY" -p "$PORT" "root@$HOST" true 2>/dev/null; then
+                  # onstart's final stdout line is "=== done ==="; fall back to its artifacts.
+                  # Plus a smoke check that the GPU is visible, so a broken box is SWAPPED
+                  # rather than accepted and discovered 30 min into a cuda build.
+                  # shellcheck disable=SC2016,SC2086  # $HOME expands remotely; $SSH_OPTS word-splits
+                  if ssh $SSH_OPTS -i "$KEY" -p "$PORT" "root@$HOST" \
+                       '{ grep -q "=== done ===" /var/log/onstart.log 2>/dev/null || { test -x "$HOME/.cargo/bin/cargo" && test -f /opt/lambda-vm-sysroot/include/stdlib.h && test -d /workspace/lambda_vm/.git; }; } && nvidia-smi -L | grep -q GPU' 2>/dev/null; then
+                    echo "  ready at $HOST:$PORT (onstart done, GPU visible, ${waited}s)"; return 0
+                  fi
+                  echo "  status=$status ssh ok, onstart still running / GPU not visible (${waited}s)"
+                else
+                  echo "  status=$status ssh=$HOST:$PORT sshd not accepting yet (${waited}s)"
+                fi
+              else
+                echo "  status=$status host=$host port=$port (${waited}s)"
+              fi
+              sleep 15; waited=$((waited + 15))
+            done
+            echo "  not ready within ${PROVISION_TIMEOUT}s"; return 1
+          }
+
+          for try in $(seq 1 "$MAX_TRIES"); do
+            echo "=== provisioning attempt $try/$MAX_TRIES (bands: $PRICE_THRESHOLDS, driver>=$MIN_DRIVER) ==="
+            got=""
+            for scan in $(seq 1 "$OFFER_ATTEMPTS"); do
+              if pick_offer; then got=1; break; fi
+              echo "  no capacity in any band (scan $scan/$OFFER_ATTEMPTS); retry in ${OFFER_INTERVAL}s"
+              sleep "$OFFER_INTERVAL"
+            done
+            if [ -z "$got" ]; then
+              echo "::error::No ${GPU_NAME} offer matched after $OFFER_ATTEMPTS scans (bands: $PRICE_THRESHOLDS, >=16 cores, >=48GB RAM, >=${VAST_IMAGE_DISK}GB disk, driver>=${MIN_DRIVER})"
+              exit 1
+            fi
+            TRIED="$TRIED $MACHINE_ID"
+
+            vastai create instance "$OFFER_ID" \
+              --template_hash "$VAST_TEMPLATE_HASH" \
+              --disk "$VAST_IMAGE_DISK" \
+              --label "$RUN_LABEL" \
+              --ssh --direct --raw > create.json 2>/dev/null
+            jq '{success, new_contract: (.new_contract // .instances.new_contract)}' create.json 2>/dev/null || true
+            IID=$(jq -r '.new_contract // .instances.new_contract // empty' create.json 2>/dev/null)
+            if [ -z "$IID" ]; then
+              echo "::warning::create failed for offer $OFFER_ID; trying another host"
+              continue
+            fi
+            # Persist immediately so the always() teardown destroys this box even if we're
+            # cancelled mid-wait.
+            echo "$IID" > "$RUNNER_TEMP/vast_instance_id"
+            echo "created instance $IID (offer $OFFER_ID, machine $MACHINE_ID, label $RUN_LABEL)"
+
+            attached=""
+            for _ in $(seq 1 12); do
+              vastai attach ssh "$IID" "$PUB" && { attached=1; break; }
+              sleep 10
+            done
+            if [ -z "$attached" ]; then
+              echo "::warning::could not attach ssh key to $IID; destroying and trying another host"
+              destroy "$IID"; rm -f "$RUNNER_TEMP/vast_instance_id"; continue
+            fi
+
+            if wait_ready "$IID"; then
+              {
+                echo "host=$HOST"; echo "port=$PORT"; echo "id=$IID"
+                echo "price=$OFFER_PRICE"; echo "specs=$SPECS"
+              } >> "$GITHUB_OUTPUT"
+              {
+                echo "### GPU box"
+                echo "- offer \`$OFFER_ID\` (machine \`$MACHINE_ID\`) at \$$OFFER_PRICE/hr"
+                echo "- $SPECS"
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            else
+              rc=$?
+            fi
+            echo "::warning::instance $IID not ready (rc=$rc: 1=timeout, 2=image/scheduling failure); destroying and trying another host"
+            destroy "$IID"; rm -f "$RUNNER_TEMP/vast_instance_id"
+          done
+
+          echo "::error::Could not provision a ready GPU box after $MAX_TRIES distinct offers"
+          exit 1
+
+      - name: Print machine info
+        id: machine
+        env:
+          HOST: ${{ steps.provision.outputs.host }}
+          PORT: ${{ steps.provision.outputs.port }}
+          KEY: ${{ steps.sshkey.outputs.key_path }}
+        run: |
+          SSH="ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o BatchMode=yes -i $KEY -p $PORT root@$HOST"
+          # shellcheck disable=SC2016  # $(nproc) must expand on the remote box, not here
+          $SSH 'nvidia-smi; echo; nvcc --version | tail -n2; echo; \
+                echo "CPU: $(nproc) cores"; grep -m1 "model name" /proc/cpuinfo; free -h'
+          GPU=$($SSH 'nvidia-smi --query-gpu=name,driver_version --format=csv,noheader' | head -1)
+          echo "gpu=$GPU" >> "$GITHUB_OUTPUT"
+
+      # Both passes, same box, back to back. GPU first so a broken CUDA build fails before
+      # we spend time on the CPU pass.
+      - name: Run ethrex continuation bench (GPU + CPU)
+        id: bench
+        continue-on-error: true
+        timeout-minutes: 120
+        env:
+          HOST: ${{ steps.provision.outputs.host }}
+          PORT: ${{ steps.provision.outputs.port }}
+          KEY: ${{ steps.sshkey.outputs.key_path }}
+          REF: ${{ steps.cfg.outputs.ref }}
+          CONT_TXS: ${{ steps.cfg.outputs.cont_txs }}
+        run: |
+          # ServerAlive*: ConnectTimeout only covers connection setup; without keepalives a box
+          # that wedges mid-prove hangs this step until the timeout.
+          SSH="ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o ServerAliveInterval=60 -o ServerAliveCountMax=10 -o BatchMode=yes -i $KEY -p $PORT root@$HOST"
+          # The cli has no `cuda` feature of its own — the GPU path is selected through the
+          # prover dependency. jemalloc-stats is what makes `Peak heap:` available.
+          REMOTE="set -e; cd /workspace/lambda_vm; \
+            git fetch --force origin '$REF'; \
+            git checkout -f FETCH_HEAD; \
+            export SYSROOT_DIR=/opt/lambda-vm-sysroot; \
+            BENCH_FEATURES=jemalloc-stats,prover/cuda \
+              bash bench_vs/run_ethrex.sh --cont-txs $CONT_TXS --report-dir $REPORT_DIR/gpu --no-color; \
+            BENCH_FEATURES=jemalloc-stats \
+              bash bench_vs/run_ethrex.sh --cont-txs $CONT_TXS --report-dir $REPORT_DIR/cpu --no-color"
+          set -o pipefail
+          $SSH "bash -lc \"$REMOTE\"" 2>&1 | tee "$RUNNER_TEMP/bench_out.txt"
+
+      # SP1's GPU prover, on the fibonacci series only (SP1 does not run ethrex here).
+      # Isolated + continue-on-error: `sp1-cuda` downloads a PREBUILT gpu-server binary whose
+      # CUDA arch coverage we can't verify from source, so a Blackwell/sm_120 mismatch must not
+      # take down the ethrex numbers above. cuobjdump lists what the binary actually embeds.
+      - name: Run fibonacci vs SP1 (SP1 on GPU)
+        id: sp1gpu
+        continue-on-error: true
+        timeout-minutes: 60
+        env:
+          HOST: ${{ steps.provision.outputs.host }}
+          PORT: ${{ steps.provision.outputs.port }}
+          KEY: ${{ steps.sshkey.outputs.key_path }}
+          REF: ${{ steps.cfg.outputs.ref }}
+        run: |
+          SSH="ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o ServerAliveInterval=60 -o ServerAliveCountMax=10 -o BatchMode=yes -i $KEY -p $PORT root@$HOST"
+          # Piped to a remote `bash -s` instead of being interpolated into `bash -lc "..."`:
+          # this block needs $HOME/$PATH to expand remotely, and nesting that inside three
+          # levels of quoting is how those commands get silently mangled. We ssh as root, so
+          # the toolchain lives under /root.
+          set -o pipefail
+          $SSH 'bash -ls' <<REMOTE 2>&1 | tee "$RUNNER_TEMP/sp1_gpu_out.txt"
+          set -e
+          cd /workspace/lambda_vm
+          git fetch --force origin '$REF'
+          git checkout -f FETCH_HEAD
+          # protoc: the Vast CUDA template doesn't ship it, and sp1-sdk's build fails with
+          # "Could not find \`protoc\`" without it. Verified on a rented box.
+          command -v protoc >/dev/null || { apt-get update -qq && apt-get install -y -qq protobuf-compiler; }
+          export PATH="\$HOME/.cargo/bin:\$HOME/.sp1/bin:\$PATH"
+          if ! cargo prove --version 2>/dev/null | grep -qE '6[.]0[.]1'; then
+            curl -L https://sp1up.succinct.xyz | bash
+            "\$HOME/.sp1/bin/sp1up" --version $SP1_VERSION
+          fi
+          cargo prove --version
+          # This warm-up pays the 125 MB gpu-server download and the first CUDA context init,
+          # so neither lands inside a measured window. The SDK respawns the server per process
+          # but the download is cached under ~/.sp1/bin.
+          SP1_PROVER=cuda bash bench_vs/run.sh --sp1-only --steps 1000000 \
+            --report-dir /tmp/sp1_warmup --no-color >/dev/null 2>&1 || true
+          # Which SM architectures the PREBUILT server actually embeds — the one thing that
+          # can't be determined from source. Absent sm_120 means we're relying on PTX JIT.
+          cuobjdump --list-elf "\$HOME/.sp1/bin/sp1-gpu-server" 2>/dev/null \
+            | grep -oE 'sm_[0-9]+' | sort -u || echo 'cuobjdump unavailable'
+          SP1_PROVER=cuda bash bench_vs/run.sh --sp1-only \
+            --steps 1000000 2000000 4000000 8000000 16000000 \
+            --report-dir $REPORT_DIR/sp1_cuda --no-color
+          REMOTE
+
+      - name: Copy report back
+        id: copy
+        if: always() && steps.provision.outputs.host != ''
+        env:
+          HOST: ${{ steps.provision.outputs.host }}
+          PORT: ${{ steps.provision.outputs.port }}
+          KEY: ${{ steps.sshkey.outputs.key_path }}
+        run: |
+          # tar over ssh rather than scp: OpenSSH >= 9 scp speaks SFTP and fails if the
+          # container has no sftp-server.
+          SSH="ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o ServerAliveInterval=60 -o ServerAliveCountMax=10 -o BatchMode=yes -i $KEY -p $PORT root@$HOST"
+          mkdir -p "$REPORT_DIR"
+          if $SSH "tar -cz -C /workspace/lambda_vm/$REPORT_DIR ." > "$RUNNER_TEMP/report.tgz" 2>/dev/null; then
+            tar -xzf "$RUNNER_TEMP/report.tgz" -C "$REPORT_DIR"
+            find "$REPORT_DIR" -maxdepth 2 -type f | sort
+          else
+            echo "::warning::could not retrieve $REPORT_DIR from the box"
+          fi
+
+      # Destroy BEFORE uploading/summarizing/posting: those steps take minutes that would
+      # otherwise be billed. Everything after this is local to the runner.
+      - name: Destroy instance
+        if: always()
+        run: |
+          command -v vastai >/dev/null || { echo "::notice::vastai not installed; nothing was provisioned"; exit 0; }
+          destroy() {
+            iid="$1"; destroyed=""
+            for attempt in 1 2 3; do
+              if vastai destroy instance "$iid" --yes; then destroyed=1; break; fi
+              echo "destroy attempt $attempt failed; retrying in 10s..."
+              sleep 10
+            done
+            [ -n "$destroyed" ] || echo "::warning::Failed to destroy instance $iid after 3 attempts — check the Vast console (label $RUN_LABEL)"
+          }
+          if [ -f "$RUNNER_TEMP/vast_instance_id" ]; then
+            IID=$(cat "$RUNNER_TEMP/vast_instance_id")
+            echo "Destroying instance $IID"
+            destroy "$IID"
+          else
+            # The id file is written only after create succeeds, so a box can exist unrecorded
+            # if the run was cancelled in that window. Fall back to our unique RUN_LABEL.
+            echo "No instance id recorded; searching Vast for any box labelled $RUN_LABEL..."
+            vastai show instances --raw > all_inst.json 2>/dev/null || echo '[]' > all_inst.json
+            LEAKED=$(jq -r --arg L "$RUN_LABEL" \
+              '(if type=="array" then . else (.instances // []) end) | .[] | select(.label == $L) | .id' \
+              all_inst.json 2>/dev/null || true)
+            if [ -z "$LEAKED" ]; then
+              echo "No instance labelled $RUN_LABEL found; nothing to destroy."
+            else
+              for IID in $LEAKED; do
+                echo "Destroying leaked instance $IID (label $RUN_LABEL)"
+                destroy "$IID"
+              done
+            fi
+          fi
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-gpu-nightly-${{ github.run_number }}-${{ github.sha }}
+          path: |
+            ${{ env.REPORT_DIR }}
+            ${{ runner.temp }}/bench_out.txt
+            ${{ runner.temp }}/sp1_gpu_out.txt
+          if-no-files-found: warn
+          retention-days: 90
+
+      - name: Publish summary
+        if: always()
+        env:
+          OUTCOME: ${{ steps.bench.outcome }}
+          SP1_OUTCOME: ${{ steps.sp1gpu.outcome }}
+          GPU: ${{ steps.machine.outputs.gpu }}
+          CONT_TXS: ${{ steps.cfg.outputs.cont_txs }}
+        run: |
+          {
+            echo "## Ethrex ${CONT_TXS}tx continuations — GPU vs CPU (${GPU:-unknown GPU})"
+            if [ -f "$REPORT_DIR/gpu/ethrex_summary.md" ]; then
+              echo "### GPU (prover/cuda)"; cat "$REPORT_DIR/gpu/ethrex_summary.md"
+            fi
+            if [ -f "$REPORT_DIR/cpu/ethrex_summary.md" ]; then
+              echo "### CPU"; cat "$REPORT_DIR/cpu/ethrex_summary.md"
+            fi
+            [ "$OUTCOME" = "failure" ] && {
+              echo "### :x: ethrex bench failed"; echo '```'
+              tail -n 30 "$RUNNER_TEMP/bench_out.txt" 2>/dev/null || echo "(no output)"; echo '```'
+            }
+            if [ -f "$REPORT_DIR/sp1_cuda/summary.md" ]; then
+              echo "### Fibonacci — SP1 on GPU"
+              echo "<sub>Smoke/plumbing signal: at 1M-16M cycles SP1's fixed cost dominates and"
+              echo "the workload is 1-4 shards, so this is not a throughput measurement.</sub>"
+              cat "$REPORT_DIR/sp1_cuda/summary.md"
+            elif [ "$SP1_OUTCOME" = "failure" ]; then
+              echo "### :warning: SP1 GPU leg failed (does not affect the ethrex numbers)"
+              echo '```'; tail -n 20 "$RUNNER_TEMP/sp1_gpu_out.txt" 2>/dev/null || echo "(no output)"; echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Post results to Slack
+        if: always()
+        env:
+          SLACK_WEBHOOK: ${{ github.event_name == 'workflow_dispatch' && secrets.BENCH_VS_SLACK_WEBHOOK_TEST || secrets.BENCH_VS_SLACK_WEBHOOK }}
+          BENCH_SLACK_HEADER: "Lambda VM - Nightly GPU Benchmark"
+          BENCH_SLACK_PROGRAM: "ethrex ${{ steps.cfg.outputs.cont_txs }}tx continuations (+ fibonacci vs SP1)"
+          BENCH_SLACK_DEVICE: "${{ steps.machine.outputs.gpu }} · Vast.ai @ $${{ steps.provision.outputs.price }}/hr"
+          BENCH_GPU_DIR: ${{ env.REPORT_DIR }}/gpu
+          BENCH_CPU_DIR: ${{ env.REPORT_DIR }}/cpu
+          BENCH_ARTIFACT_DIR: ${{ env.REPORT_DIR }}/sp1_cuda
+          # The fibonacci leg here is SP1-only, so its 500M-cycle projection would be a lone
+          # number with no Lambda counterpart — and the CPU nightly posts a Lambda projection
+          # fitted over different sizes on a different machine. Publishing both invites a
+          # comparison between them that isn't one. The fit stays in the artifact.
+          BENCH_SLACK_NO_PROJECTION: "1"
+        run: bash .github/scripts/publish_bench_vs.sh "$SLACK_WEBHOOK"
+
+      - name: Fail if the ethrex bench failed
+        if: always() && steps.bench.outcome == 'failure'
+        run: |
+          echo "::error::ethrex continuation bench failed — see the 'Run ethrex continuation bench' step log"
+          exit 1

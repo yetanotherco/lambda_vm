@@ -23,6 +23,16 @@ REPORT_DIR=""
 NO_COLOR=false
 TARGET_CYCLES="${TARGET_CYCLES:-${TARGET_STEPS:-500000000}}"
 APPROX_STEPS_PER_ITERATION=5
+# Above this cycle count the Lambda side proves with --continuations instead of
+# monolithically. 0 = never (the historical behaviour). A monolithic prove hits a
+# ~2^25-padded-row memory wall (~120-160 GB), so larger sizes are only reachable in
+# continuation mode — which is also the like-for-like comparison, since SP1's `core`
+# mode shards by trace area/height rather than proving one monolithic trace.
+CONT_ABOVE_CYCLES=0
+CONT_EPOCH_SIZE_LOG2=20
+# Extra cargo features for the cli build, e.g. "jemalloc-stats,prover/cuda" to measure the
+# GPU prover path. Unset = default features (the historical CPU behaviour).
+BENCH_FEATURES="${BENCH_FEATURES:-}"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -89,12 +99,29 @@ while [[ $# -gt 0 ]]; do
             echo "Warning: --target-steps is deprecated; use --target-cycles" >&2
             shift 2
             ;;
+        --cont-above)
+            if [[ $# -lt 2 ]]; then echo "--cont-above requires an argument"; exit 1; fi
+            case $2 in
+                ''|*[!0-9]*) echo "--cont-above must be a non-negative integer (got: $2)"; exit 1 ;;
+            esac
+            CONT_ABOVE_CYCLES=$2
+            shift 2
+            ;;
+        --epoch-size-log2)
+            if [[ $# -lt 2 ]]; then echo "--epoch-size-log2 requires an argument"; exit 1; fi
+            case $2 in
+                ''|*[!0-9]*) echo "--epoch-size-log2 must be an integer (got: $2)"; exit 1 ;;
+            esac
+            if [ "$2" -lt 18 ]; then echo "--epoch-size-log2 must be >= 18 (the CLI floor)"; exit 1; fi
+            CONT_EPOCH_SIZE_LOG2=$2
+            shift 2
+            ;;
         --no-color)
             NO_COLOR=true
             shift
             ;;
         -h|--help)
-            echo "Usage: $0 [-n N1 N2 ... | --steps S1 S2 ...] [--lambda-only | --sp1-only] [--report-dir DIR] [--target-cycles N] [--no-color]"
+            echo "Usage: $0 [-n N1 N2 ... | --steps S1 S2 ...] [--lambda-only | --sp1-only] [--report-dir DIR] [--target-cycles N] [--cont-above N] [--epoch-size-log2 N] [--no-color]"
             echo ""
             echo "  -n N1 N2 ...      Fibonacci iteration counts (space-separated)"
             echo "                    Default iteration series: ${DEFAULT_ITERATION_SERIES[*]}"
@@ -105,6 +132,10 @@ while [[ $# -gt 0 ]]; do
             echo "  --report-dir DIR   Write TSV, metrics, markdown summary, and raw outputs"
             echo "  --target-cycles N  Projection target in cycles (default: $TARGET_CYCLES)"
             echo "  --target-steps N   Deprecated alias for --target-cycles"
+            echo "  --cont-above N     Prove the Lambda side with --continuations for sizes above N"
+            echo "                     cycles (0 = never, the default). Required past ~33M cycles,"
+            echo "                     where a monolithic prove hits the memory wall."
+            echo "  --epoch-size-log2 N  Continuation epoch size, log2(cycles) (default: $CONT_EPOCH_SIZE_LOG2, min 18)"
             echo "  --no-color        Disable ANSI colors"
             exit 0
             ;;
@@ -273,6 +304,25 @@ extract_cycles() {
     }'
 }
 
+extract_epochs() {
+    sed -nE '/^Epochs: [0-9]+/ {
+        s/^Epochs: ([0-9]+).*/\1/
+        p
+        q
+    }'
+}
+
+# SP1 shard count: its `core` proof is a sequence of shard proofs, and the shard count is
+# what explains the shape of its cost curve (per-shard fixed cost amortizing, then
+# parallelism across shards). Printed by the SP1 script from the Core(shards) match.
+extract_shards() {
+    sed -nE '/^Shards: [0-9]+/ {
+        s/^Shards: ([0-9]+).*/\1/
+        p
+        q
+    }'
+}
+
 echo -e "${BOLD}=== Fibonacci Benchmark: Lambda VM vs SP1 v6 ===${NC}"
 echo -e "Series mode: ${YELLOW}${SERIES_MODE}${NC}"
 echo -e "Requested series: ${YELLOW}${SERIES[*]}${NC}"
@@ -287,8 +337,14 @@ TARGET_SPEC="$ROOT_DIR/executor/programs/riscv64im-lambda-vm-elf.json"
 LAMBDA_ELF="$LAMBDA_DIR/target/riscv64im-lambda-vm-elf/release/fibonacci-bench"
 
 if $RUN_LAMBDA; then
-    echo -e "${GREEN}[Lambda VM] Building CLI...${NC}"
-    cargo build --release -p cli --manifest-path "$ROOT_DIR/Cargo.toml" 2>&1 | tail -5
+    if [ -n "$BENCH_FEATURES" ]; then
+        echo -e "${GREEN}[Lambda VM] Building CLI (features: $BENCH_FEATURES)...${NC}"
+        cargo build --release -p cli --manifest-path "$ROOT_DIR/Cargo.toml" \
+            --features "$BENCH_FEATURES" 2>&1 | tail -5
+    else
+        echo -e "${GREEN}[Lambda VM] Building CLI...${NC}"
+        cargo build --release -p cli --manifest-path "$ROOT_DIR/Cargo.toml" 2>&1 | tail -5
+    fi
 fi
 
 if $RUN_LAMBDA; then
@@ -341,6 +397,21 @@ for value in "${SERIES[@]}"; do
     RUN_TARGET_STEPS+=("$target_steps")
 done
 
+# A prove over more than ~2^22 padded rows (~4M cycles here) aborts under `prover/cuda`:
+# the device working set leaves no room for GPU composition, the allocation failure is
+# swallowed into an Option, and the CPU fallback then reads a host trace the device-only
+# gate never materialised (crypto/stark/src/constraints/evaluator.rs:242). Continuations cap
+# the per-proof trace, so --cont-above sidesteps it.
+if $RUN_LAMBDA && [[ "$BENCH_FEATURES" == *cuda* ]]; then
+    for ts in "${RUN_TARGET_STEPS[@]}"; do
+        if [ "$ts" -gt 4000000 ] && { [ "$CONT_ABOVE_CYCLES" -eq 0 ] || [ "$ts" -le "$CONT_ABOVE_CYCLES" ]; }; then
+            echo -e "${YELLOW}WARNING: ${ts} cycles monolithic on the GPU path exceeds ~2^22 padded rows and will abort.${NC}" >&2
+            echo -e "${YELLOW}         Pass --cont-above 4000000 to prove the large points with continuations.${NC}" >&2
+            break
+        fi
+    done
+fi
+
 if [ "$SERIES_MODE" = "steps" ]; then
     echo -e "Iterations used: ${YELLOW}${RUN_ITERATIONS[*]}${NC}"
     echo ""
@@ -354,6 +425,9 @@ RESULT_LAMBDA_CYCLES=()
 RESULT_SP1=()
 RESULT_SP1_AXIS=()
 RESULT_SP1_CYCLES=()
+RESULT_SP1_SHARDS=()
+RESULT_LAMBDA_MODE=()
+RESULT_LAMBDA_EPOCHS=()
 RESULT_RATIO=()
 
 LAMBDA_PROJECTION_STEPS=()
@@ -373,8 +447,10 @@ run_one() {
     local target_steps=$2
     local lambda_time="n/a"
     local lambda_cycles="n/a"
+    local lambda_epochs="n/a"
     local sp1_time="n/a"
     local sp1_cycles="n/a"
+    local sp1_shards="n/a"
     local ratio="n/a"
 
     echo ""
@@ -386,9 +462,21 @@ run_one() {
         local stderr_file="$TMP_DIR/lambda_${n}.stderr"
         write_u64_le "$n" "$input_file"
 
-        echo -e "  ${GREEN}[Lambda VM] Proving...${NC}"
+        # Above CONT_ABOVE_CYCLES prove with continuations: a monolithic prove can't reach
+        # those sizes (memory wall), and SP1's `core` mode is itself sharded, so this is the
+        # like-for-like mode rather than a handicap.
+        local cont_args=() lambda_mode="mono"
+        if [ "$CONT_ABOVE_CYCLES" -gt 0 ] && [ "$target_steps" -gt "$CONT_ABOVE_CYCLES" ]; then
+            cont_args=(--continuations --epoch-size-log2 "$CONT_EPOCH_SIZE_LOG2")
+            lambda_mode="cont"
+            echo -e "  ${GREEN}[Lambda VM] Proving (continuations, epoch_size_log2=$CONT_EPOCH_SIZE_LOG2)...${NC}"
+        else
+            echo -e "  ${GREEN}[Lambda VM] Proving...${NC}"
+        fi
         local lambda_output
-        if ! lambda_output=$("$CLI" prove "$LAMBDA_ELF" -o "$proof_file" --private-input "$input_file" --time --cycles 2>"$stderr_file"); then
+        # ${arr[@]+...}: expanding an empty array under `set -u` errors on bash 3.2.
+        if ! lambda_output=$("$CLI" prove "$LAMBDA_ELF" -o "$proof_file" --private-input "$input_file" \
+                ${cont_args[@]+"${cont_args[@]}"} --time --cycles 2>"$stderr_file"); then
             echo -e "  ${RED}[Lambda VM] FAILED:${NC}"
             cat "$stderr_file"
             exit 1
@@ -397,6 +485,10 @@ run_one() {
 
         lambda_time=$(printf "%s\n" "$lambda_output" | extract_proving_time)
         lambda_cycles=$(printf "%s\n" "$lambda_output" | extract_cycles)
+        lambda_epochs=$(printf "%s\n" "$lambda_output" | extract_epochs)
+        : "${lambda_epochs:=n/a}"
+        RESULT_LAMBDA_MODE+=("$lambda_mode")
+        RESULT_LAMBDA_EPOCHS+=("$lambda_epochs")
         if [ -z "$lambda_time" ]; then
             echo -e "  ${RED}[Lambda VM] FAILED: could not parse proving time${NC}"
             printf "%s\n" "$lambda_output"
@@ -421,21 +513,33 @@ run_one() {
     if $RUN_SP1; then
         echo -e "  ${GREEN}[SP1 v6] Proving...${NC}"
         local sp1_output_file="$TMP_DIR/sp1_${n}.stdout"
-        if ! "$SP1_BIN" "$n" > "$sp1_output_file" 2>&1; then
-            echo -e "  ${RED}[SP1 v6] FAILED:${NC}"
-            cat "$sp1_output_file"
-            exit 1
-        fi
+        # Deliberately not `if ! ...; then exit`: with SP1_PROVER=cuda, sp1-cuda 6.0.1 proves
+        # and verifies fine and then aborts in CudaClientInner's Drop ("there is no reactor
+        # running", sp1-cuda/src/pk.rs:63) — exit 134 after a complete, valid measurement.
+        # So judge the run by whether the output parses, not by the exit status, and only
+        # surface the failure when there's nothing to parse.
+        local sp1_rc=0
+        "$SP1_BIN" "$n" > "$sp1_output_file" 2>&1 || sp1_rc=$?
 
         sp1_time=$(extract_proving_time < "$sp1_output_file")
         sp1_cycles=$(extract_cycles < "$sp1_output_file")
+        sp1_shards=$(extract_shards < "$sp1_output_file")
+        : "${sp1_shards:=n/a}"
+        RESULT_SP1_SHARDS+=("$sp1_shards")
         if [ -z "$sp1_time" ] || [ -z "$sp1_cycles" ]; then
-            echo -e "  ${RED}[SP1 v6] FAILED: could not parse output${NC}"
+            echo -e "  ${RED}[SP1 v6] FAILED (exit $sp1_rc, no parseable output):${NC}"
             cat "$sp1_output_file"
             exit 1
         fi
+        if [ "$sp1_rc" -ne 0 ]; then
+            echo -e "  ${YELLOW}[SP1 v6] exited $sp1_rc after reporting results; measurement kept${NC}"
+        fi
 
-        echo -e "  SP1 v6:    ${BOLD}${sp1_time}s${NC} (${sp1_cycles} cycles)"
+        if [ "$sp1_shards" != "n/a" ]; then
+            echo -e "  SP1 v6:    ${BOLD}${sp1_time}s${NC} (${sp1_cycles} cycles, ${sp1_shards} shards)"
+        else
+            echo -e "  SP1 v6:    ${BOLD}${sp1_time}s${NC} (${sp1_cycles} cycles)"
+        fi
 
         if [ -n "$REPORT_DIR" ]; then
             cp "$sp1_output_file" "$REPORT_DIR/raw/sp1_${n}.stdout"
@@ -632,6 +736,18 @@ if [ -n "$REPORT_DIR" ]; then
         echo "sp1_axis_values=$(join_slash "${RESULT_SP1_AXIS[@]}")"
         echo "sp1_cycles=$(join_slash "${RESULT_SP1_CYCLES[@]}")"
         echo "ratios=$(join_slash "${RESULT_RATIO[@]}")"
+        # Regime markers: without these the cost curve can't be read. `lambda_modes` says
+        # which points are monolithic vs continuations, and `sp1_shards` says where SP1
+        # crosses from one shard to many.
+        echo "cont_above_cycles=$CONT_ABOVE_CYCLES"
+        echo "cont_epoch_size_log2=$CONT_EPOCH_SIZE_LOG2"
+        if [ ${#RESULT_LAMBDA_MODE[@]} -gt 0 ]; then
+            echo "lambda_modes=$(join_slash "${RESULT_LAMBDA_MODE[@]}")"
+            echo "lambda_epochs=$(join_slash "${RESULT_LAMBDA_EPOCHS[@]}")"
+        fi
+        if [ ${#RESULT_SP1_SHARDS[@]} -gt 0 ]; then
+            echo "sp1_shards=$(join_slash "${RESULT_SP1_SHARDS[@]}")"
+        fi
         if [ -n "$LAMBDA_PROJECTED_S" ]; then
             echo "lambda_slope_s_per_1m=$LAMBDA_SLOPE"
             echo "lambda_intercept_s=$LAMBDA_INTERCEPT"

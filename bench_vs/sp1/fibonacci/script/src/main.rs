@@ -40,6 +40,13 @@ fn main() {
 
     println!("Proving time: {:.3}s", elapsed.as_secs_f64());
 
+    // SP1 splits a core proof by trace area / AIR height, not by cycle count, so the shard
+    // count changes regime within a cycle sweep — and that regime change is what shapes its
+    // cost curve (per-shard fixed cost amortizing, then parallelism across shards).
+    if let sp1_sdk::SP1Proof::Core(shards) = &proof.proof {
+        println!("Shards: {}", shards.len());
+    }
+
     // Count main-trace field elements from the proof shards.
     // round 0 = preprocessed, round 1 = main trace.
     let total_elements: usize = match &proof.proof {
