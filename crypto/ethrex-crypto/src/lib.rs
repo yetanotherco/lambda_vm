@@ -63,23 +63,6 @@ impl Crypto for LambdaVmEcsmCrypto {
 
 // ── ECDSA secp256k1 recovery via the ECSM precompile ────────────────────────
 
-/// Recover the uncompressed public key bytes (X‖Y, 64 bytes) from a 64-byte
-/// signature, recovery id, and 32-byte message hash. Used by the ECRECOVER
-/// precompile (0x01).
-///
-/// Returns the raw 64-byte key; the caller is responsible for hashing it.
-/// Keeping keccak out of this function lets `secp256k1_ecrecover` route the
-/// hash through `self.keccak256`, which uses the keccak_permute precompile on
-/// riscv64 instead of always falling back to software.
-///
-/// Mirrors the pure-Rust recovery in the `Crypto` trait default
-/// (`pk = r⁻¹·(s·R − z·G)`), but evaluates the 2-term linear combination
-/// `lincomb(G, u1, R, u2)` through the ECSM accelerator via [`ecsm_lincomb2`],
-/// falling back to the software `ProjectivePoint::lincomb` whenever the
-/// accelerated path declines (degenerate scalars/points, or non-riscv builds).
-/// We compute the recovery directly rather than calling k256's
-/// `recover_from_prehash`, which internally runs a *second* lincomb to
-/// re-verify the key — doubling the ECSM ecalls for no gain here.
 /// Obtain a 32-byte big-endian hint for `x_be` via the executor `hint` ecall
 /// (the host computes the modular inverse / sqrt; the value is provable via the
 /// prover's HINT table). The result is UNVERIFIED — every caller MUST check it
@@ -157,6 +140,23 @@ fn decompress_r(r_bytes: &FieldBytes, y_is_odd: bool) -> Option<AffinePoint> {
     }
 }
 
+/// Recover the uncompressed public key bytes (X‖Y, 64 bytes) from a 64-byte
+/// signature, recovery id, and 32-byte message hash. Used by the ECRECOVER
+/// precompile (0x01).
+///
+/// Returns the raw 64-byte key; the caller is responsible for hashing it.
+/// Keeping keccak out of this function lets `secp256k1_ecrecover` route the
+/// hash through `self.keccak256`, which uses the keccak_permute precompile on
+/// riscv64 instead of always falling back to software.
+///
+/// Mirrors the pure-Rust recovery in the `Crypto` trait default
+/// (`pk = r⁻¹·(s·R − z·G)`), but evaluates the 2-term linear combination
+/// `lincomb(G, u1, R, u2)` through the ECSM accelerator via [`ecsm_lincomb2`],
+/// falling back to the software `ProjectivePoint::lincomb` whenever the
+/// accelerated path declines (degenerate scalars/points, or non-riscv builds).
+/// We compute the recovery directly rather than calling k256's
+/// `recover_from_prehash`, which internally runs a *second* lincomb to
+/// re-verify the key — doubling the ECSM ecalls for no gain here.
 fn ecsm_ecrecover(sig: &[u8; 64], recid: u8, msg: &[u8; 32]) -> Result<[u8; 64], CryptoError> {
     let r_bytes = <&FieldBytes>::from(&sig[..32]);
     let s_bytes = <&FieldBytes>::from(&sig[32..]);
@@ -259,20 +259,6 @@ fn ecsm_oracle(x: &FieldElement, k: &Scalar) -> Option<FieldElement> {
     Option::from(FieldElement::from_bytes(&xr_le.into()))
 }
 
-/// Computes `k1·P1 + k2·P2` from four x-only oracle queries, or `None` if any
-/// degenerate-configuration guard trips.
-///
-/// The lambda-vm ECSM precompile returns only `x(k·P)`. For `A = k1·P1` with
-/// `P1 = (xp, yp)` fully known, query `xa = x(k1·P1)` and `xc = x((k1+1)·P1)`.
-/// The chord-addition law gives `λ² = xc + xa + xp =: t` and `ya = yp + λ·dx`
-/// with `dx = xa − xp`; substituting into `ya² = xa³ + b` makes λ *linear*:
-/// `λ = (xa³ − xp³ − t·dx²) / (2·yp·dx)`. The wrong sign `−ya` would force
-/// `x((k1−1)·P1) = xc`, i.e. `k1 ≡ 0` or `2·k1 ≡ 0 (mod n)`, excluded by the
-/// scalar guards. x-only queries are parity-invariant (`x(k·P) = x(k·(−P))`),
-/// so the precompile's canonical-y lift never matters. Same for `B = k2·P2`,
-/// then `Q = A + B` is one affine addition. All three inversions are batched.
-///
-/// Generic over the oracle so unit tests can substitute a software stand-in.
 /// Base-field inverse `x⁻¹ mod p`. On riscv64 the host supplies it via the
 /// `hint` ecall and we verify `x·inv == 1`; off-target it inverts in software.
 #[cfg(any(target_arch = "riscv64", test))]
@@ -301,6 +287,20 @@ fn field_inv(x: &FieldElement) -> Option<FieldElement> {
     }
 }
 
+/// Computes `k1·P1 + k2·P2` from four x-only oracle queries, or `None` if any
+/// degenerate-configuration guard trips.
+///
+/// The lambda-vm ECSM precompile returns only `x(k·P)`. For `A = k1·P1` with
+/// `P1 = (xp, yp)` fully known, query `xa = x(k1·P1)` and `xc = x((k1+1)·P1)`.
+/// The chord-addition law gives `λ² = xc + xa + xp =: t` and `ya = yp + λ·dx`
+/// with `dx = xa − xp`; substituting into `ya² = xa³ + b` makes λ *linear*:
+/// `λ = (xa³ − xp³ − t·dx²) / (2·yp·dx)`. The wrong sign `−ya` would force
+/// `x((k1−1)·P1) = xc`, i.e. `k1 ≡ 0` or `2·k1 ≡ 0 (mod n)`, excluded by the
+/// scalar guards. x-only queries are parity-invariant (`x(k·P) = x(k·(−P))`),
+/// so the precompile's canonical-y lift never matters. Same for `B = k2·P2`,
+/// then `Q = A + B` is one affine addition. All three inversions are batched.
+///
+/// Generic over the oracle so unit tests can substitute a software stand-in.
 #[cfg(any(target_arch = "riscv64", test))]
 fn lincomb2_with_oracle<O>(
     a1: &AffinePoint,

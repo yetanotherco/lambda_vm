@@ -3,7 +3,3 @@ rustflags = [
   "--cfg", "getrandom_backend=\"custom\"",
   "-C", "passes=lower-atomic"
 ]
-
-[env]
-CC_riscv64im_lambda_vm_elf = "clang"
-CFLAGS_riscv64im_lambda_vm_elf = "--target=riscv64 -march=rv64im -mabi=lp64 --sysroot=/opt/lambda-vm-sysroot"
