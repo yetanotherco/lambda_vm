@@ -202,6 +202,23 @@ read in-place. Eval constraints: none (pure lookup). Degree: n/a.
   recombination sums are over non-overlapping bit ranges, so `+` = `OR` and each
   is an exact 16-bit halfword.
 
+  **Refined by the transcription audits (2026-07-29), symbolically over all
+  2^32 inputs — the earlier wording was coarser than the truth:**
+  * The load-bearing bound set is **at least one of `{SLL_lo, SLL_hi}`**. Every
+    configuration with neither is forgeable; every configuration with either is
+    pinned. **The two `SLLC` bounds are not load-bearing at all** — so of the 4
+    `AreBytes` sends per rotation, only the `SLL` pair carries soundness weight.
+    Read the sentence above as "a tight bound on at least one `SLL` halfword",
+    not "the tight `SLL` bound".
+  * The *composed* forgery (both `SLL` bounds dropped) exists for exactly **one**
+    input, `X = 0xFFFFFFFF` → forged `Y = 0`, exhaustively confirmed for both
+    `r = 4` and `r = 9`. The gate's isolated control makes it look reachable for
+    arbitrary inputs; it is not. Narrow, but a forgery is a forgery.
+  * The rotation **output** needs no range check of its own: the two recombine
+    identities pin its value even with free field cells. So the §4.7 "free range
+    check" argument is load-bearing for the **add** outputs and one `SLL`
+    halfword per rotation — not for the rotation output.
+
   **HWSL alternative, priced:** replace each shift identity with an `Hwsl` send
   (`bitwise.rs:831`). Cost/rotation: +2 Hwsl sends, same AreBytes, same columns.
   Per compression that is +4 sends/G × 48 = +192 sends → +288 aux cells (≈6%).
@@ -282,7 +299,7 @@ output feeds a downstream XOR ⇒ free.
 | 3-op add sum identity | 1 | 2 | ✅ |
 | 3-op add carry booleanity ×2 | 2 | 3 | ✅ |
 | shift identity (×2) | 1 | 2 | ✅ |
-| recombine identity (×2) | 2 | 3 | ✅ |
+| recombine identity (×2) | 1 (was stated as 2) | 2 | ✅ |
 | (rejected) ternary carry | 3 | **4** | ❌ |
 
 Worst legal constraint = 3. **No constraint exceeds 3.**
@@ -335,14 +352,31 @@ oracle's prose "¼–⅓ of a keccak permutation" is inconsistent with its own
 2. **3-op add = two summed carry bits with the explicit sum identity** — not a
    single ternary carry (degree 4 after gating), and the sum identity must be
    present (without it, `s` is only constrained mod nothing). (§4.4)
-3. **Shift identity needs the tight `SLL ∈ [0,2^16)` AreBytes bound**; dropping it
+3. **Shift identity needs a tight `∈ [0,2^16)` AreBytes bound on at least one of
+   `SLL_lo`/`SLL_hi`** (the `SLLC` bounds are *not* load-bearing — audited
+   2026-07-29, §4.2); dropping it
    makes the rotation forgeable (a wrong `SLL` admits a large field `SLLC`).
    Soundness relies on `2^16` invertible mod p — a BV model cannot see this;
    verify in the field (gate width audit + `hwsl_inline_test.py`). (§4.2)
-4. **Every add/shift output must actually feed a downstream XOR** (its only range
+4. **Every add output must actually feed a downstream XOR** (its only range
    check). If a future refactor reorders so an add output is *last* with no XOR
    consumer, add an explicit AreBytes or the carry argument is unsound. (§5)
+
+   ⚠ **THE GATE CANNOT CHECK THIS, and both 2026-07-29 audits confirmed it with
+   explicit forgeries.** `build_g` returns each add output as `fresh_word()` =
+   4×`BitVec(...,8)`, so byte range is **declared by construction, never derived
+   from a modelled lookup**. The gate therefore proves the identical UNSAT for a
+   chip that has the downstream XOR and for one that does not. Drop it and the
+   sum is forgeable — witness `a = b = 0x80000000`, honest `s = 0`, forged
+   `s = 2^32` with `carry = 0`, satisfying every modelled constraint. This
+   invariant rests entirely on the implementer, and a green board is not
+   evidence for it.
 5. **Message `m` needs explicit AreBytes** — it is never XORed. (§4.7)
+   ⚠ Same blind spot: the gate declares `m` as 16×4 `BitVec(...,8)`, so it proves
+   the same UNSAT with or without those 32 `AreBytes` sends. Without them a
+   message word has many cell representations of one value over `F_p` (e.g.
+   `[0x9A,0,0x13,0x7F]` and `[0x19A,p−1,0x13,0x7F]`), because the chip binds
+   `Σ m_i·2^(8i)`, not the 64 bytes.
 6. **rotr16/rotr8 byte order** exactly `[b2,b3,b0,b1]` / `[b1,b2,b3,b0]`
    (little-endian). A wrong relabel silently corrupts. (§4.2)
 7. **Message permutation `permute^r`** wired per round from the *original* 16
