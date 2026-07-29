@@ -382,6 +382,105 @@ pub fn splice_alternating_program() -> LfmProgram {
     compile(splice_alternating_program_source())
 }
 
+// ============ R1e slices c+d: the epoch statement and Phase A ============
+
+/// Public-output length of the acceptance shape. A multiple of four, per the
+/// documented gap in `statement_replay::absorb_epoch_statement`.
+pub const STMT_PUBLIC_OUTPUT_LEN: usize = 12;
+
+/// Whether each of the acceptance shape's sub-proofs is preprocessed. Mixed on
+/// purpose: the verifier absorbs a preprocessed commitment only for the airs
+/// that have one, so a replay that absorbs unconditionally must diverge.
+pub const STMT_PREPROCESSED: [bool; 3] = [true, false, true];
+
+/// Halves per 32-byte commitment.
+const ROOT_HALVES: u32 = 8;
+
+/// Arena halves the statement-replay program reads.
+pub fn stmt_arena_halves() -> u32 {
+    let vars = ROOT_HALVES + (STMT_PUBLIC_OUTPUT_LEN / 4) as u32 + 2;
+    let roots: u32 = STMT_PREPROCESSED
+        .iter()
+        .map(|&p| if p { 2 * ROOT_HALVES } else { ROOT_HALVES })
+        .sum();
+    vars + roots
+}
+
+/// The acceptance shape's shape-static statement fields.
+pub fn epoch_statement_shape() -> super::statement_replay::EpochStatementShape {
+    super::statement_replay::EpochStatementShape {
+        public_output_len: STMT_PUBLIC_OUTPUT_LEN,
+        table_counts: [3, 1, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+        num_private_input_pages: 2,
+        fri_final_poly_log_degree: 7,
+        page_ranges: vec![(0x1000, 4), (0x8000, 1)],
+    }
+}
+
+/// The R1e headline program: a continuation-epoch statement bound into the
+/// transcript, then Phase A over three sub-proofs, publishing the shared LogUp
+/// challenges `z` and `α`.
+///
+/// This is the first leg of a real verifier the machine runs end to end —
+/// everything a `multi_verify` does before the per-table forks. What `z` and `α`
+/// feed into (the bus-balance replay, the chaining obligations) is R1f.
+pub fn statement_replay_program_source() -> LfmProgramSource {
+    use super::builder::Felt;
+    use super::statement_replay::{
+        EpochStatementVars, PhaseATable, absorb_epoch_statement, replay_phase_a,
+    };
+    use super::transcript_replay::TranscriptReplay;
+
+    let shape = epoch_statement_shape();
+    let total = stmt_arena_halves();
+    let mut b = LfmBuilder::new();
+    let arena = b.declare_arena(total);
+    let h: Vec<Felt> = (0..total).map(|i| b.hint_felt(arena, i)).collect();
+
+    let out_halves = STMT_PUBLIC_OUTPUT_LEN / 4;
+    let (elf, rest) = h.split_at(ROOT_HALVES as usize);
+    let (public_output, rest) = rest.split_at(out_halves);
+    let (epoch_label, mut roots) = rest.split_at(2);
+
+    // The verifier seeds an empty transcript and binds the statement first.
+    let mut t = TranscriptReplay::new(&[]);
+    absorb_epoch_statement(
+        &mut t,
+        &shape,
+        &EpochStatementVars {
+            elf_digest: elf,
+            public_output,
+            epoch_label,
+        },
+    );
+
+    let mut tables = Vec::new();
+    for &preprocessed in &STMT_PREPROCESSED {
+        let prep = if preprocessed {
+            let (p, r) = roots.split_at(ROOT_HALVES as usize);
+            roots = r;
+            Some(p)
+        } else {
+            None
+        };
+        let (main, r) = roots.split_at(ROOT_HALVES as usize);
+        roots = r;
+        tables.push(PhaseATable {
+            preprocessed_root: prep,
+            main_root: main,
+        });
+    }
+    let (z, alpha) = replay_phase_a(&mut t, &mut b, &tables);
+
+    b.public(z.as_cell());
+    b.public(alpha.as_cell());
+    b.finish()
+}
+
+pub fn statement_replay_program() -> LfmProgram {
+    compile(statement_replay_program_source())
+}
+
 /// A harness for the candidate canonicity guard alone: `(lo, hi)` arrive as
 /// hinted halves, the guard runs, the recomposed felt is published.
 ///

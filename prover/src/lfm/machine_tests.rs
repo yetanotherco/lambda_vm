@@ -1992,3 +1992,253 @@ fn splice_cost() {
         "the aligned path must stay instruction-free"
     );
 }
+
+// ========== R1e slices c+d: the epoch statement and Phase A ==========
+
+use super::programs::{
+    STMT_PREPROCESSED, STMT_PUBLIC_OUTPUT_LEN, epoch_statement_shape, statement_replay_program,
+    stmt_arena_halves,
+};
+
+/// The per-proof statement values and the Phase-A roots, as bytes. The machine
+/// arena and the host oracle are both built from this, so they cannot drift.
+struct StatementFixture {
+    elf_digest: [u8; 32],
+    public_output: Vec<u8>,
+    epoch_label: u64,
+    /// `(preprocessed_root, main_root)` per sub-proof, in air order.
+    roots: Vec<(Option<[u8; 32]>, [u8; 32])>,
+}
+
+fn statement_fixture() -> StatementFixture {
+    let root = |seed: u8| -> [u8; 32] {
+        core::array::from_fn(|i| (i as u8).wrapping_mul(seed).wrapping_add(seed))
+    };
+    StatementFixture {
+        elf_digest: root(7),
+        public_output: (0..STMT_PUBLIC_OUTPUT_LEN)
+            .map(|i| (i as u8).wrapping_mul(19).wrapping_add(5))
+            .collect(),
+        epoch_label: 0x0123_4567_89ab_cdef,
+        roots: STMT_PREPROCESSED
+            .iter()
+            .enumerate()
+            .map(|(i, &prep)| {
+                let p = prep.then(|| root(11 + 2 * i as u8));
+                (p, root(31 + 2 * i as u8))
+            })
+            .collect(),
+    }
+}
+
+fn statement_arenas(f: &StatementFixture) -> Vec<Vec<LfmWord>> {
+    let mut bytes = f.elf_digest.to_vec();
+    bytes.extend_from_slice(&f.public_output);
+    bytes.extend_from_slice(&f.epoch_label.to_le_bytes());
+    for (prep, main) in &f.roots {
+        if let Some(p) = prep {
+            bytes.extend_from_slice(p);
+        }
+        bytes.extend_from_slice(main);
+    }
+    let halves = keccak_host::pack_stream(&bytes);
+    assert_eq!(halves.len(), stmt_arena_halves() as usize);
+    vec![halves.into_iter().map(super::word::base_word).collect()]
+}
+
+/// The host reference: the REAL `absorb_statement_with_digest`, then Phase A.
+///
+/// The statement half of this is production code, not a reimplementation — which
+/// matters, because that encoding has ten fields and is exactly where a replay
+/// would go wrong. The Phase-A half is a four-line transcription of
+/// `crate::replay_transcript_phase_a_view` (`lib.rs`: for each air, the
+/// precomputed commitment when `is_preprocessed()`, then
+/// `lde_trace_main_merkle_root()`, then `z` and `α`); calling the helper itself
+/// would mean synthesising `dyn AIR`s and proof views for three fake tables,
+/// which would test the fakes rather than the replay.
+type ExtFE = math::field::element::FieldElement<crate::tables::types::GoldilocksExtension>;
+
+fn host_statement_challenges(f: &StatementFixture) -> (ExtFE, ExtFE) {
+    use crate::statement::{StatementKind, absorb_statement_with_digest};
+    use crate::tables::types::GoldilocksExtension;
+    use crate::{RuntimePageRange, TableCounts};
+    use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+    use crypto::fiat_shamir::is_transcript::IsTranscript;
+
+    let shape = epoch_statement_shape();
+    let c = shape.table_counts.map(|v| v as usize);
+    let counts = TableCounts {
+        cpu: c[0],
+        lt: c[1],
+        memw: c[2],
+        memw_aligned: c[3],
+        load: c[4],
+        mul: c[5],
+        dvrm: c[6],
+        shift: c[7],
+        branch: c[8],
+        memw_register: c[9],
+        eq: c[10],
+        bytewise: c[11],
+        store: c[12],
+        cpu32: c[13],
+    };
+    let ranges: Vec<RuntimePageRange> = shape
+        .page_ranges
+        .iter()
+        .map(|&(base, count)| RuntimePageRange { base, count })
+        .collect();
+
+    let mut t = DefaultTranscript::<GoldilocksExtension>::new(&[]);
+    absorb_statement_with_digest(
+        &mut t,
+        StatementKind::ContinuationEpoch {
+            epoch_label: f.epoch_label,
+        },
+        &f.elf_digest,
+        &f.public_output,
+        &counts,
+        shape.num_private_input_pages as usize,
+        &ranges,
+        shape.fri_final_poly_log_degree,
+    );
+    for (prep, main) in &f.roots {
+        if let Some(p) = prep {
+            t.append_bytes(p);
+        }
+        t.append_bytes(main);
+    }
+    (t.sample_field_element(), t.sample_field_element())
+}
+
+fn assert_challenges_match(public: &[(u32, LfmWord)], f: &StatementFixture, what: &str) {
+    let (z, alpha) = host_statement_challenges(f);
+    assert_eq!(public.len(), 2, "{what}: z and alpha");
+    for (i, (name, want)) in [("z", z), ("alpha", alpha)].iter().enumerate() {
+        for lane in 0..3 {
+            assert_eq!(
+                public[i].1[lane],
+                want.value()[lane],
+                "{what}: {name} coordinate {lane}"
+            );
+        }
+    }
+}
+
+/// Pins the misalignment claim in `statement_replay`'s module docs rather than
+/// leaving it as prose: the epoch statement ends 3 bytes past a half boundary,
+/// which is why every Phase-A root absorb is spliced.
+#[test]
+fn epoch_statement_ends_three_bytes_past_a_boundary() {
+    let shape = epoch_statement_shape();
+    assert_eq!(
+        shape.byte_len(),
+        207 + STMT_PUBLIC_OUTPUT_LEN + 16 * shape.page_ranges.len()
+    );
+    assert_eq!(
+        shape.byte_len() % keccak_host::BYTES_PER_HALF,
+        3,
+        "the statement leaves the cursor at shift 3, so Phase A is spliced"
+    );
+}
+
+#[test]
+fn statement_replay_program_is_admissible() {
+    validate(&statement_replay_program()).expect("admission");
+}
+
+/// R1e's acceptance: the machine's `(z, α)` must equal what the REAL statement
+/// absorb plus Phase A produce.
+#[test]
+fn statement_replay_matches_the_host_challenges() {
+    let f = statement_fixture();
+    let exec = super::executor::execute(
+        &statement_replay_program(),
+        &statement_arenas(&f),
+        &super::hash::TestPermutation,
+    )
+    .expect("execution");
+    assert_challenges_match(&exec.public_words, &f, "execute");
+}
+
+/// The same, PROVED and verified through the registry.
+#[test]
+fn statement_replay_proves_and_verifies() {
+    let opts = options();
+    let f = statement_fixture();
+    let program = statement_replay_program();
+    let artifacts = build_artifacts(&program, &opts);
+    let proved = lfm_prove(&program, &artifacts, &statement_arenas(&f), &opts).expect("prove");
+    assert_challenges_match(&proved.public_words, &f, "prove");
+    assert!(
+        lfm_verify(
+            LfmProgramKind::StatementReplayV0,
+            &proved.proof,
+            &proved.public_words,
+            &opts,
+        )
+        .expect("StatementReplayV0 is registered"),
+        "the registered statement replay must verify"
+    );
+}
+
+/// Both tamper vectors: a flipped Phase-A root half and a flipped statement
+/// byte. Each must move the challenges, and claiming the honest ones must reject.
+#[test]
+fn tampered_statement_or_root_rejects() {
+    let opts = options();
+    let f = statement_fixture();
+    let program = statement_replay_program();
+    let artifacts = build_artifacts(&program, &opts);
+    let honest = lfm_prove(&program, &artifacts, &statement_arenas(&f), &opts).expect("prove");
+
+    // Half 0 is the ELF digest (statement); half 14 is inside the first
+    // sub-proof's preprocessed root (Phase A).
+    for (half, what) in [(0usize, "statement byte"), (14, "Phase-A root half")] {
+        let mut arenas = statement_arenas(&f);
+        arenas[0][half][0] = &arenas[0][half][0] + FE::from(1u64);
+        let forged = lfm_prove(&program, &artifacts, &arenas, &opts).expect("prove");
+        assert_ne!(
+            forged.public_words, honest.public_words,
+            "{what}: a flip must move z or alpha"
+        );
+        assert!(
+            !verify_against(
+                &artifacts.roots,
+                &artifacts.program_id,
+                &forged.proof,
+                &honest.public_words,
+                &opts,
+            ),
+            "{what}: claiming the honest challenges must reject"
+        );
+    }
+}
+
+#[test]
+fn registry_drift_statement_replay_v0_blowup2() {
+    let opts = options();
+    let artifacts = build_artifacts(&statement_replay_program(), &opts);
+    let entry = resolve(LfmProgramKind::StatementReplayV0, 2)
+        .expect("StatementReplayV0@2 must be registered");
+    assert_eq!(entry.roots, artifacts.roots, "group roots drifted");
+    assert_eq!(
+        entry.log_heights, artifacts.log_heights,
+        "group heights drifted"
+    );
+    assert_eq!(entry.program_id, artifacts.program_id, "program_id drifted");
+}
+
+#[test]
+fn statement_replay_cell_counts() {
+    let program = statement_replay_program();
+    let (main, aux) = super::airs::lfm_cell_counts(&program);
+    println!(
+        "StatementReplayV0: {} instructions, keccak {}, bitdec {}, balu {}, {main} main cells, {aux} aux",
+        program.instrs.len(),
+        program.groups.keccak.real_rows,
+        program.groups.bitdec.real_rows,
+        program.groups.balu.real_rows,
+    );
+    assert!(main > 0 && aux > 0);
+}

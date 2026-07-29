@@ -32,6 +32,7 @@ pub mod programs;
 pub mod proof;
 pub mod registry;
 pub mod statement;
+pub mod statement_replay;
 pub mod trace;
 pub mod transcript_replay;
 pub mod validator;

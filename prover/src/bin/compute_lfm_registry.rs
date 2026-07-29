@@ -8,7 +8,7 @@
 use lambda_vm_prover::GoldilocksCubicProofOptions;
 use lambda_vm_prover::lfm::programs::{
     KECCAK_SPONGE_LEN, fri_toy_program, keccak_chain_program, keccak_sponge_program,
-    transcript_replay_program, trivial_program,
+    statement_replay_program, transcript_replay_program, trivial_program,
 };
 use lambda_vm_prover::lfm::registry::build_artifacts;
 
@@ -32,6 +32,7 @@ fn main() {
         ("KeccakChainV0", keccak_chain_program()),
         ("KeccakSpongeV0", keccak_sponge_program(KECCAK_SPONGE_LEN)),
         ("TranscriptReplayV0", transcript_replay_program()),
+        ("StatementReplayV0", statement_replay_program()),
     ];
     println!("pub static LFM_REGISTRY: &[LfmRegistryEntry] = &[");
     for (kind, program) in &programs {
