@@ -41,10 +41,13 @@ jobs:
     # understands that ref's own guest syscalls). Cached in /tmp; build-std is per ref and
     # the host cargo target is shared across ref worktrees (see the recursion step's env),
     # so the second ref's native builds mostly reuse the first ref's compiled deps.
-    # 110 rather than 90 to absorb the continuation arms: a 20-tx continuation prove per
+    # 125 rather than 90 to absorb the continuation arms: a 20-tx continuation prove per
     # ref on each side of the verifier bench, plus a 20-tx (was 4-tx) block for the cycle
-    # comparison.
-    timeout-minutes: 110
+    # comparison. Keep this ABOVE the sum of the step caps below (50 + 70 = 120) so a
+    # runaway step always trips its OWN timeout first: a step timeout still runs the
+    # `always()` Post result step, whereas hitting the job cap is a cancellation and is far
+    # less dependable about doing so — which would lose the comment entirely.
+    timeout-minutes: 125
     steps:
       - name: Acknowledge (react + occupancy notice)
         if: github.event_name == 'issue_comment'
@@ -175,6 +178,15 @@ jobs:
               body += 'and exact Wilcoxon — trust the verdict when the two agree. Proof sizes are ';
               body += 'single exact readings (no averaging). - = PR faster.</sub>\n';
             } else {
+              // A step timeout or OOM kill takes the whole script down, so the graceful
+              // CONT_SKIP path never runs. bench_verify.sh renders the monolithic report as
+              // soon as that arm finishes, so post it rather than throwing away a verdict
+              // that was already measured. Path is $WORK/result_mono.txt in that script.
+              const mono = read('/tmp/verify_run/result_mono.txt');
+              if (mono) {
+                body += '⚠️ Run did not complete — the monolithic arm had already finished, ';
+                body += 'so its result is below. The continuation arm is missing.\n\n' + mono + '\n';
+              }
               body += `❌ Run failed. Last log lines:\n\n` + '```\n' + tail(read('/tmp/verify_out.txt'), 30) + '\n```\n';
             }
             // Additive recursion-guest cycle section, kept clearly separated from the

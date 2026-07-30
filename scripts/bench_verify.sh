@@ -92,6 +92,21 @@ if [ "$CONT_PAIRS" -eq 1 ]; then
   echo "ERROR: CONT_PAIRS must be 0 (skip the arm) or >= 2 (got $CONT_PAIRS)." >&2
   exit 2
 fi
+# CONT_EPOCH_LOG2 is the one knob with a hard floor (MIN_CONTINUATION_EPOCH_SIZE_LOG2 in
+# bin/cli/src/main.rs). Catch it here rather than letting clap reject it after two cli
+# builds and the whole monolithic arm, which would then degrade to a bland
+# "continuation prove failed" note that doesn't say why.
+if ! [[ "$CONT_EPOCH_LOG2" =~ ^[0-9]+$ ]] || [ "$CONT_EPOCH_LOG2" -lt 18 ]; then
+  echo "ERROR: CONT_EPOCH_LOG2 must be an integer >= 18 (got '$CONT_EPOCH_LOG2')." >&2
+  exit 2
+fi
+# A warning, not an error: 2..5 pairs is a legitimate quick smoke run, and the monolithic
+# arm already accepts N_PAIRS=2 (the workflow clamps its own input to [2,40]). Just say
+# the verdict can't reach significance so nobody reads BORDERLINE as a real result.
+if [ "$CONT_PAIRS" -ge 2 ] && [ "$CONT_PAIRS" -lt 6 ]; then
+  echo "   WARNING: CONT_PAIRS=$CONT_PAIRS < 6; the exact Wilcoxon's smallest attainable"
+  echo "            two-sided p is 2/2^n, so this arm can only ever report BORDERLINE."
+fi
 if [ $((N_PAIRS % 2)) -ne 0 ]; then
   echo "   WARNING: N_PAIRS=$N_PAIRS is odd; use an even count so AB/BA orders balance."
 fi
@@ -102,6 +117,10 @@ echo "   pairs=$N_PAIRS  (=$((N_PAIRS * 2)) verify runs)"
 echo "   continuation pairs=$CONT_PAIRS  epoch=2^$CONT_EPOCH_LOG2"
 
 mkdir -p "$WORK"
+# Drop any previous run's monolithic report before measuring. It is the CI fallback for a
+# run that dies mid-continuation-arm, so a leftover from an earlier run would be posted as
+# if it belonged to this one.
+rm -f "$WORK/result_mono.txt"
 
 # --- 1. Guest ELF + fixture (identical for both sides; build once if missing) ---
 if [ ! -f "$ELF_REL" ]; then
@@ -210,6 +229,11 @@ prove_cached() {  # $1=binary $2=proof-path $3=sha $4...=extra prove args
     return 0
   fi
   echo "==> Proving with $(basename "$bin") (${sha:0:10}) $*"
+  # Wipe the old sidecar before proving: on failure neither it nor the .sha is rewritten,
+  # so a previous run's count would survive and get printed next to the NEW epoch size —
+  # e.g. change CONT_EPOCH_LOG2, have the prove fail, and the skip note claims the old
+  # epoch count for a bundle that no longer exists.
+  rm -f "$out.epochs"
   prove_once "$bin" "$out" "$@" || return 1
   # Persist the epoch count next to the proof rather than parsing the prove log at report
   # time: on a cache hit the prove is skipped entirely, so that log is stale or gone. The
@@ -289,38 +313,6 @@ run_abba() {  # $1=pairs $2=csv $3...=extra verify args
       "$i" "$pairs" "$a" "$b" "$(awk "BEGIN{print ($a-$b)/$b*100}")"
   done
 }
-
-decide_mode "$PROOF_B" "$PROOF_A"
-run_abba "$N_PAIRS" "$WORK/pairs.csv" || exit 1
-MONO_MODE="$MODE"
-MONO_NOTE="$PER_SIDE_NOTE"
-
-# --- 3b. Same measurement over a CONTINUATION bundle of the same block ---------
-# Best-effort: this is the memory-hungry arm (the whole bundle is materialised to
-# serialize it), so any failure here degrades to a note in the report instead of
-# sinking the monolithic verdict above.
-CONT_SKIP=""
-CONT_ARGS=(--continuations --epoch-size-log2 "$CONT_EPOCH_LOG2")
-if [ "$CONT_PAIRS" -eq 0 ]; then
-  CONT_SKIP="skipped (CONT_PAIRS=0)"
-elif ! prove_cached "$WORK/cli_B" "$CPROOF_B" "$SHA_B" "${CONT_ARGS[@]}"; then
-  CONT_SKIP="baseline continuation prove failed"
-elif ! prove_cached "$WORK/cli_A" "$CPROOF_A" "$SHA_A" "${CONT_ARGS[@]}"; then
-  CONT_SKIP="PR continuation prove failed"
-else
-  CSIZE_B="$(wc -c < "$CPROOF_B" | tr -d '[:space:]')"
-  CSIZE_A="$(wc -c < "$CPROOF_A" | tr -d '[:space:]')"
-  decide_mode "$CPROOF_B" "$CPROOF_A" --continuations
-  CONT_MODE="$MODE"
-  CONT_NOTE="$PER_SIDE_NOTE"
-  if ! run_abba "$CONT_PAIRS" "$WORK/pairs_cont.csv" --continuations; then
-    CONT_SKIP="continuation verify failed mid-run"
-  fi
-fi
-if [ -n "$CONT_SKIP" ]; then
-  echo "==> Continuation arm $CONT_SKIP"
-fi
-# Proofs are kept in $WORK as a cache (invalidated by their .sha markers), not deleted.
 
 # --- 4. Paired t-test + robust median/Wilcoxon (same stats as bench_abba.sh) ---
 # Both arms are reported AFTER all measuring is done: bench-verify.yml extracts the PR
@@ -462,6 +454,50 @@ else:
 PY
 }
 
+decide_mode "$PROOF_B" "$PROOF_A"
+run_abba "$N_PAIRS" "$WORK/pairs.csv" || exit 1
+MONO_MODE="$MODE"
+MONO_NOTE="$PER_SIDE_NOTE"
+# Render the monolithic report NOW, not at the end with the continuation one. Both are
+# still emitted together at the end (the extractor needs them contiguous after the
+# anchor), but computing this one here means it also survives the run dying during the
+# continuation arm. The best-effort CONT_SKIP path only covers a clean non-zero exit; a
+# step timeout or an OOM kill takes the whole process down, and CI would then post
+# "Run failed" and throw away a monolithic verdict it had already measured. bench-verify.yml
+# falls back to this file in that case.
+MONO_TITLE="ethrex 20-tx block · monolithic · blowup=2, 219 queries"
+MONO_REPORT="$(print_stats "$WORK/pairs.csv" "$MONO_TITLE" \
+  "$SIZE_A" "$SIZE_B" "$MONO_MODE" "$MONO_NOTE")"
+printf '%s\n' "$MONO_REPORT" > "$WORK/result_mono.txt"
+
+# --- 3b. Same measurement over a CONTINUATION bundle of the same block ---------
+# Best-effort: this is the memory-hungry arm (the whole bundle is materialised to
+# serialize it), so any failure here degrades to a note in the report instead of
+# sinking the monolithic verdict above.
+CONT_SKIP=""
+CONT_ARGS=(--continuations --epoch-size-log2 "$CONT_EPOCH_LOG2")
+if [ "$CONT_PAIRS" -eq 0 ]; then
+  CONT_SKIP="skipped (CONT_PAIRS=0)"
+elif ! prove_cached "$WORK/cli_B" "$CPROOF_B" "$SHA_B" "${CONT_ARGS[@]}"; then
+  CONT_SKIP="baseline continuation prove failed"
+elif ! prove_cached "$WORK/cli_A" "$CPROOF_A" "$SHA_A" "${CONT_ARGS[@]}"; then
+  CONT_SKIP="PR continuation prove failed"
+else
+  CSIZE_B="$(wc -c < "$CPROOF_B" | tr -d '[:space:]')"
+  CSIZE_A="$(wc -c < "$CPROOF_A" | tr -d '[:space:]')"
+  decide_mode "$CPROOF_B" "$CPROOF_A" --continuations
+  CONT_MODE="$MODE"
+  CONT_NOTE="$PER_SIDE_NOTE"
+  if ! run_abba "$CONT_PAIRS" "$WORK/pairs_cont.csv" --continuations; then
+    CONT_SKIP="continuation verify failed mid-run"
+  fi
+fi
+if [ -n "$CONT_SKIP" ]; then
+  echo "==> Continuation arm $CONT_SKIP"
+fi
+# Proofs are kept in $WORK as a cache (invalidated by their .sha markers), not deleted.
+
+
 echo
 # Machine anchor for bench-verify.yml's extractor; an HTML comment so it doesn't render
 # in the PR comment (the arm headings below are the human entry point).
@@ -474,21 +510,23 @@ echo "<!-- verify-abba-report -->"
 # at prove time. Show both sides when they disagree — a PR that changes epoch splitting is
 # exactly the kind of thing this arm should surface, not average away. Falls back to no
 # parenthetical if either side is unknown (e.g. an older cached proof with no sidecar),
-# because a wrong count is worse than a missing one.
+# because a wrong count is worse than a missing one. Only consulted when the arm actually
+# ran: with CONT_PAIRS=0 nothing validates a bundle this run, so a sidecar left in the
+# long-lived $WORK by an earlier run would otherwise be reported as this run's count.
 epochs_of() { local f="$1.epochs"; [ -s "$f" ] && head -1 "$f" | tr -d '[:space:]' || true; }
-EPO_A="$(epochs_of "$CPROOF_A")"; EPO_B="$(epochs_of "$CPROOF_B")"
-if [ -n "$EPO_A" ] && [ -n "$EPO_B" ]; then
-  if [ "$EPO_A" = "$EPO_B" ]; then
-    CONT_EPOCHS=" ($EPO_A epochs)"
-  else
-    CONT_EPOCHS=" (main $EPO_B / PR $EPO_A epochs)"
+CONT_EPOCHS=""
+if [ -z "$CONT_SKIP" ]; then
+  EPO_A="$(epochs_of "$CPROOF_A")"; EPO_B="$(epochs_of "$CPROOF_B")"
+  if [ -n "$EPO_A" ] && [ -n "$EPO_B" ]; then
+    if [ "$EPO_A" = "$EPO_B" ]; then
+      CONT_EPOCHS=" ($EPO_A epochs)"
+    else
+      CONT_EPOCHS=" (main $EPO_B / PR $EPO_A epochs)"
+    fi
   fi
-else
-  CONT_EPOCHS=""
 fi
 CONT_TITLE="ethrex 20-tx block · continuations, epoch 2^$CONT_EPOCH_LOG2$CONT_EPOCHS · blowup=2, 219 queries"
-print_stats "$WORK/pairs.csv" "ethrex 20-tx block · monolithic · blowup=2, 219 queries" \
-  "$SIZE_A" "$SIZE_B" "$MONO_MODE" "$MONO_NOTE"
+printf '%s\n' "$MONO_REPORT"
 if [ -n "$CONT_SKIP" ]; then
   echo
   echo "#### $CONT_TITLE"

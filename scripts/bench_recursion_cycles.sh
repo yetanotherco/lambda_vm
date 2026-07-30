@@ -155,7 +155,7 @@ prune_worktree_cache() {
     s8="$(basename "$wt")"; s8="${s8#wt_}"
     echo "==> Pruning old ref worktree $wt (keeping newest $PRUNE_KEEP)" >&2
     git worktree remove --force "$wt" >/dev/null 2>&1 || rm -rf "$wt"
-    rm -f "$WORK"/result_"${s8}"_*.txt "$WORK"/blob_"${s8}"_*.bin \
+    rm -f "$WORK"/result_"${s8}"_*.txt "$WORK"/blob_"${s8}"_*.bin* \
           "$WORK"/build_guest_"${s8}".log "$WORK"/dump_"${s8}"*.log \
           "$WORK"/measure_"${s8}"*.err "$WORK"/measure_cli_"${s8}"* \
           "$WORK"/build_cli_"${s8}".log
@@ -281,28 +281,34 @@ valid_result() {
 # different block.
 resolve_block_fixture() {
   local txs="$1"
+  # The checkout copy WINS over the $WORK cache whenever it exists. $WORK lives forever on
+  # the bench runner, so a cache that outranked the checkout would keep verifying an old
+  # block after the committed fixture or the generator changed — and since both sections of
+  # the comment say "ethrex <N>-tx block", one comment would silently be comparing two
+  # different workloads. scripts/bench_verify.sh generates the 20-tx fixture into the
+  # checkout earlier in the same CI job, so this is the normal path there too.
+  local committed="$ROOT/executor/tests/ethrex_bench_${txs}.bin"
+  if [ -f "$committed" ]; then
+    printf '%s\n' "$committed"
+    return 0
+  fi
   local cached="$WORK/ethrex_bench_${txs}.bin"
   if [ "${REBUILD:-0}" != "1" ] && [ -s "$cached" ]; then
     printf '%s\n' "$cached"
     return 0
   fi
-  local committed="$ROOT/executor/tests/ethrex_bench_${txs}.bin"
-  if [ -f "$committed" ]; then
-    cp "$committed" "$cached.tmp"
-  else
-    echo "==> Generating missing ${txs}-tx ethrex fixture (tooling/ethrex-fixtures)" >&2
-    local flog="$WORK/build_fixtures.log"
-    if ! ( cd "$ROOT/tooling/ethrex-fixtures" && cargo build --release ) >"$flog" 2>&1; then
-      echo "ERROR: ethrex-fixtures build failed. Tail of $flog:" >&2
-      tail -40 "$flog" >&2
-      exit 1
-    fi
-    if ! "$ROOT/tooling/ethrex-fixtures/target/release/ethrex-fixtures" \
-           "$txs" "$cached.tmp" distinct >>"$flog" 2>&1; then
-      echo "ERROR: ethrex-fixtures failed to generate a ${txs}-tx block. Tail of $flog:" >&2
-      tail -40 "$flog" >&2
-      exit 1
-    fi
+  echo "==> Generating missing ${txs}-tx ethrex fixture (tooling/ethrex-fixtures)" >&2
+  local flog="$WORK/build_fixtures.log"
+  if ! ( cd "$ROOT/tooling/ethrex-fixtures" && cargo build --release ) >"$flog" 2>&1; then
+    echo "ERROR: ethrex-fixtures build failed. Tail of $flog:" >&2
+    tail -40 "$flog" >&2
+    exit 1
+  fi
+  if ! "$ROOT/tooling/ethrex-fixtures/target/release/ethrex-fixtures" \
+         "$txs" "$cached.tmp" distinct >>"$flog" 2>&1; then
+    echo "ERROR: ethrex-fixtures failed to generate a ${txs}-tx block. Tail of $flog:" >&2
+    tail -40 "$flog" >&2
+    exit 1
   fi
   mv -f "$cached.tmp" "$cached"
   printf '%s\n' "$cached"
@@ -349,8 +355,13 @@ measure_ref() {
     if valid_result < "$result"; then
       echo "==> [$role] Reusing cached measurement: $ref ($sha8) preset=$PRESET" >&2
       # Mark this ref as recently used so the startup prune keeps its worktree/result.
+      # The guest target dir too: it ages out under the much tighter GUEST_TARGET_KEEP, so
+      # a ref whose results are all cached would otherwise lose it and pay a cold rebuild.
       touch "$result" 2>/dev/null || true
       if [ -d "$wt" ]; then touch "$wt" 2>/dev/null || true; fi
+      if [ -n "${GUEST_TARGET_DIR:-}" ] && [ -d "${GUEST_TARGET_DIR}_${sha8}" ]; then
+        touch "${GUEST_TARGET_DIR}_${sha8}" 2>/dev/null || true
+      fi
       cat "$result"
       return 0
     fi
@@ -369,8 +380,9 @@ measure_ref() {
   touch "$wt" 2>/dev/null || true
 
   # 2a. Build the recursion guest ELF(s) (+ empty.elf inner program), and for
-  # block mode also the ethrex inner guest. GUEST_TARGET_DIR, when set, shares
-  # the RV64 build dir across ref worktrees (reuses build-std).
+  # block mode also the ethrex inner guest. GUEST_TARGET_DIR, when set, is a BASE
+  # path: this ref builds into ${GUEST_TARGET_DIR}_<sha8>, so build-std is reused
+  # across presets and across runs for the SAME ref, never across refs.
   echo "==> [$role] make compile-recursion-elfs @ $sha8 (slow the first time) ..." >&2
   local glog="$WORK/build_guest_${sha8}.log"
   local -a make_goals=(compile-recursion-elfs)
