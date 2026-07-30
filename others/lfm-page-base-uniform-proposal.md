@@ -314,10 +314,57 @@ down so that nobody does.
 
 Small and additive:
 
-- `AirShape` gains `num_base_uniforms: u32`.
+- `AirShape` gains `num_base_uniforms: u32` — the COUNT, never the values.
 - `validate_against` gains that one field comparison.
 - `ConstraintArtifact::program()` gains the `OP_BASE_UNIFORM` decode arm.
 - Values are **not** stored — they are supplied at verify time. That is the point.
+
+### 5.1 DESIGN REFINEMENT — uniforms ride in the program, not in every signature
+
+My first sketch put a `&[F]` uniform slice on every evaluation entry point:
+`eval_program`, `eval_program_verifier`, `eval_device_program`, and the interp
+`run` helper. That is a lot of signature churn across the interpreter, the device
+walker, the CUDA kernel's host side, and every test that calls them — for a value
+that behaves exactly like a constant at evaluation time.
+
+**Better: resolve the uniforms into the program struct, alongside the constants.**
+
+```rust
+ConstraintProgram { …, base_uniforms: Vec<FieldElement<F>> }   // resolved values
+DeviceProgram     { …, base_uniforms: Vec<u64> }               // raw limbs
+ConstraintArtifact{ …, shape.num_base_uniforms: u32 }          // COUNT ONLY
+```
+
+`OP_BASE_UNIFORM`'s `a` operand indexes `base_uniforms` exactly as
+`OP_CONST_BASE`'s indexes `base_consts`. Consequences:
+
+- **No evaluation signature changes at all.** Both walkers read the table off the
+  program they were already handed. The CUDA kernel gains one buffer, uploaded
+  the same way `base_consts` already is — not a new parameter threaded through
+  the host API.
+- The AIR fills the table at CONSTRUCTION time from its verifier-derived value
+  (§4.3), which is the natural place for it: the AIR already knows its own
+  `epoch_label`.
+- `ConstraintArtifact::program()` needs the values to produce a runnable program,
+  so it becomes `program_with_uniforms(&[FieldElement<Gl>])`, with `program()`
+  retained for the `num_base_uniforms == 0` case and erroring otherwise. That
+  error is useful: it makes "you forgot to supply the uniform" a loud failure
+  rather than a silent zero.
+
+**The hazard this creates, and it must be documented at the field.**
+`ConstraintProgram` becomes a hybrid: `base_consts` is program identity,
+`base_uniforms` is per-instance. If anything ever hashed a `ConstraintProgram`
+including its uniforms, the digest would go back to varying per epoch — the exact
+bug being fixed, reintroduced one layer down.
+
+Today nothing hashes a `ConstraintProgram` (the artifact is the serialized,
+registry-pinned object, and it stores only the count), so the hazard is latent
+rather than live. It should be closed by construction if cheap — e.g. the field
+carries a `#[doc]` warning and the artifact codec has no path that reads it — and
+called out in review either way.
+
+**This refinement is a design decision, not an implementation detail**, which is
+why it is written here rather than made unilaterally in code.
 
 Payoff, in the artifact's own terms: the four parameterized tables collapse from
 "one artifact per parameter value" to one artifact each, and the node-count /
