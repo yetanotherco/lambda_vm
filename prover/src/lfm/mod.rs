@@ -31,6 +31,7 @@ pub mod keccak_host;
 pub mod layout;
 pub mod programs;
 pub mod proof;
+pub mod proof_arena;
 pub mod proof_fixture;
 pub mod registry;
 pub mod statement;

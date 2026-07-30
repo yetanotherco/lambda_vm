@@ -2769,3 +2769,37 @@ fn continuation_fixture_generates_two_epochs() {
     // Cache it for the slices that consume it.
     let _ = std::fs::write(fixture_cache(), &blob);
 }
+
+/// R1f(a): the arena filler reads a REAL proof's committed roots out of the
+/// guest's wire-format blob, in place, exactly as the recursion guest would.
+#[test]
+fn arena_filler_reads_real_committed_roots() {
+    use super::proof_arena;
+    use super::proof_fixture::FixtureArchive;
+
+    let blob = proof_fixture::load_or_generate(&fixture_cache());
+    let archive = FixtureArchive::open(&blob);
+
+    let epochs = proof_arena::num_epochs(&archive);
+    assert_eq!(epochs, 2, "the fixture is a two-epoch continuation");
+
+    for epoch in 0..epochs {
+        let tables = proof_arena::epoch_num_tables(&archive, epoch);
+        let roots = proof_arena::epoch_main_roots(&archive, epoch);
+        assert_eq!(roots.len(), tables, "one main root per sub-proof");
+        assert!(tables > 0, "epoch {epoch} must have sub-proofs");
+        // Real commitments, not defaults: an all-zero root would mean the reader
+        // is looking at the wrong bytes rather than at the proof.
+        assert!(
+            roots.iter().all(|r| *r != [0u8; 32]),
+            "epoch {epoch}: every committed root must be nonzero"
+        );
+        let halves = proof_arena::roots_to_halves(&roots);
+        assert_eq!(halves.len(), tables * proof_arena::ROOT_HALVES);
+        println!(
+            "R1f arena: epoch {epoch} -> {tables} sub-proofs, {} arena halves, output {} bytes",
+            halves.len(),
+            proof_arena::epoch_public_output(&archive, epoch).len()
+        );
+    }
+}

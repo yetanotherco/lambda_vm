@@ -116,3 +116,33 @@ pub fn has_recursion_prefix(blob: &[u8]) -> bool {
     blob.len() > crate::RECURSION_INPUT_PREFIX_LEN
         && blob.starts_with(&crate::RECURSION_INPUT_MAGIC)
 }
+
+/// An opened fixture blob, holding the aligned bytes the archived view borrows
+/// from.
+///
+/// Mirrors `recursion::verify_continuation_and_attest`'s decode exactly: strip
+/// the magic/version prefix, re-align if the host `Vec` is not on rkyv's
+/// alignment (guest slices are aligned by construction; host ones carry no such
+/// guarantee), then `rkyv::access` with validation. The owning struct exists
+/// because the archived view borrows from the aligned buffer.
+pub struct FixtureArchive {
+    aligned: rkyv::util::AlignedVec<{ crate::RECURSION_INPUT_ALIGN }>,
+}
+
+impl FixtureArchive {
+    pub fn open(blob: &[u8]) -> Self {
+        let archive_bytes = crate::recursion_archive_bytes(blob)
+            .expect("fixture blob must carry the recursion magic and version");
+        let mut aligned = rkyv::util::AlignedVec::new();
+        aligned.extend_from_slice(archive_bytes);
+        Self { aligned }
+    }
+
+    /// The validated archived guest input.
+    pub fn guest_input(&self) -> &crate::recursion::ArchivedContinuationGuestInput {
+        rkyv::access::<crate::recursion::ArchivedContinuationGuestInput, rkyv::rancor::Error>(
+            &self.aligned,
+        )
+        .expect("fixture blob must validate")
+    }
+}

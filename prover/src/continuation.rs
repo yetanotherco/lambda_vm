@@ -447,6 +447,34 @@ impl ContinuationProof {
     }
 }
 
+/// Zero-copy readers over an ARCHIVED bundle, for the LFM arena filler.
+///
+/// Deliberately on the archived type only. The recursion guest never holds a
+/// `ContinuationProof` — it reads a blob from private input and verifies in
+/// place ([`verify_continuation_archived`]) — so these expose a path production
+/// actually traverses. The equivalent on the owned type would expose a structure
+/// the real recursion path never sees, which is a weaker proposition.
+///
+/// Methods rather than relaxed field visibility because rkyv mirrors the source
+/// field's visibility onto the archived struct: opening `epochs` would open the
+/// owned type at the same time.
+impl ArchivedContinuationProof {
+    pub(crate) fn num_epochs(&self) -> usize {
+        self.epochs.len()
+    }
+
+    /// Epoch `i`'s STARK proof (its tables, epoch-local L2G sub-table last), as
+    /// the same view the verifier reads in place.
+    pub(crate) fn epoch_proof(&self, i: usize) -> MultiProofView<'_, F, E, ()> {
+        MultiProofView::Archived(&self.epochs[i].proof)
+    }
+
+    /// Bytes epoch `i` committed.
+    pub(crate) fn epoch_public_output(&self, i: usize) -> &[u8] {
+        self.epochs[i].public_output.as_slice()
+    }
+}
+
 /// Borrowed view over an [`EpochProof`] (owned or archived-in-place). Lets
 /// `verify_epoch` take a single argument again instead of the field-by-field
 /// parameter list the owned/archived split used to force on every caller:
