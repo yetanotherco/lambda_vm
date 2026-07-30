@@ -2850,13 +2850,22 @@ use super::proof_arena::MainTraceOpening;
 
 /// Which opening the leg authenticates.
 ///
-/// Epoch 0's first sub-proof, chosen on measured grounds and not arbitrarily:
-/// of the 49 sub-proofs in the fixture it is the only one that combines a deep
-/// tree with a UNIQUE leaf index. Most of the others are tiny tables whose
-/// traces are mostly padding, so identical rows hash to identical leaves and
-/// every index in the tree verifies — on those, "flip an index bit" is not a
-/// tamper at all and the (d) vector would silently pass while testing nothing.
-/// `real_opening_is_a_usable_tamper_target` pins that property.
+/// Epoch 0's first sub-proof, chosen on measured grounds. Two things make it
+/// the right target, and only the first is stable across blobs.
+///
+/// **Depth.** It is one of exactly two depth-20 trees in the fixture (the other
+/// is epoch 1's table 0); everything else is depth 7 or less, and half the
+/// sub-proofs are depth 2. Depth is SHAPE, so it does not move when the blob
+/// does — see `fixture_generation_is_not_reproducible`.
+///
+/// **A unique leaf index.** Measured on one blob, 24 of the 49 sub-proofs have
+/// exactly one index that verifies and 25 have several: a table whose trace is
+/// mostly padding commits identical rows, so identical leaves sit under
+/// identical subtrees and every index checks out. On one of those, "flip an
+/// index bit" is not a tamper at all and the (d) vector would pass while
+/// testing nothing. That split is blob-dependent, so it is NOT pinned as a
+/// constant — `real_opening_is_a_usable_tamper_target` asserts uniqueness at
+/// run time on whatever blob it is handed.
 const R1F_EPOCH: usize = 0;
 const R1F_TABLE: usize = 0;
 const R1F_QUERY: usize = 0;
@@ -3117,6 +3126,29 @@ fn permutation_cells() -> u64 {
     use crate::tables::keccak_rnd;
     let keccak_w = (keccak::cols::NUM_COLUMNS - layout::keccak::PREP_WIDTH) as u64;
     keccak_w + ROUNDS as u64 * keccak_rnd::cols::NUM_COLUMNS as u64
+}
+
+/// Pins the widths the cost model above is built on.
+///
+/// Not ceremony: the inline `// 52 / 252 / 388 / 588 / 788` comments on
+/// `chips::keccak::cols` were stale by 4 (R1d widened `PREP_WIDTH` for the
+/// reversed-digest columns and they were not updated), and reading them instead
+/// of the constants is what produced a wrong per-permutation figure on the first
+/// pass through this measurement. A wrong width silently rescales every cell
+/// number in `keccak_merkle_opening_cost`, so the widths get an assertion of
+/// their own rather than a comment.
+#[test]
+fn cost_model_widths_are_what_the_chips_declare() {
+    use super::chips::{balu, bitdec, keccak};
+    use super::layout;
+    use crate::tables::keccak_rnd;
+    assert_eq!(keccak::cols::NUM_COLUMNS, 792, "LFM_KECCAK total width");
+    assert_eq!(layout::keccak::PREP_WIDTH, 56, "LFM_KECCAK preprocessed");
+    assert_eq!(balu::cols::NUM_COLUMNS - layout::balu::PREP_WIDTH, 4);
+    assert_eq!(bitdec::cols::NUM_COLUMNS - layout::bitdec::PREP_WIDTH, 66);
+    assert_eq!(keccak_rnd::cols::NUM_COLUMNS, 1480);
+    assert_eq!(byteswap_cells(), 322, "66 + 64 x 4");
+    assert_eq!(permutation_cells(), 36_256, "736 + 24 x 1480");
 }
 
 /// ★ The leg's headline measurement — and it REFUTES the prediction it was set
