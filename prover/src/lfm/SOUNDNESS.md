@@ -165,9 +165,14 @@ The verified per-proof draw schedule, for a multi-proof over `T` tables, is
 >   with `L_t = max(log2(trace_length_t) − 7, 0)`, **independent of the blowup factor**.
 
 `β` and `γ` are one draw each no matter how many terms they batch (both expand to powers), which
-is what keeps `E` small. At the structural minimum `T = 24` with tables at their row cap
-(`L_t = 12`), `E = 364`, so `3E = 1,092` base candidates and `P ≈ 2.5·10^−7`. At a realistic
-`T ≈ 60`, `E = 904` and `P ≈ 6.3·10^−7`.
+is what keeps `E` small. At `T = 24` with tables at their row cap (`L_t = 12`), `E = 364`, so
+`3E = 1,092` base candidates and `P ≈ 2.5·10^−7`. At a larger `T ≈ 60`, `E = 904` and
+`P ≈ 6.3·10^−7`.
+
+`T = 24` is **measured, not assumed**: reading a real two-epoch continuation proof
+(`machine_tests::arena_filler_reads_real_committed_roots`) gives 24 sub-proofs for an
+intermediate epoch and 25 for the final one, the extra being HALT. It was an honest hedge when
+this section was written; it no longer needs to be.
 
 **State it as `< 10^−6` per proof at production shapes**, growing by `≈ 1.05·10^−8` per additional
 table — each table contributes `3 + L_t ≈ 15` extension draws, so the per-table increment is 15×

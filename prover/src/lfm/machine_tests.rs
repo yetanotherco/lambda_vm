@@ -2803,3 +2803,32 @@ fn arena_filler_reads_real_committed_roots() {
         );
     }
 }
+
+/// Verifies the team lead's ruling premise directly against the blob: the
+/// SUPPLIED preprocessed roots really are embedded, so replaying Phase A does
+/// not need `build_epoch_airs` reachable.
+///
+/// Checked here rather than taken on trust, because the whole leg's shape
+/// depends on it.
+#[test]
+fn supplied_preprocessed_roots_are_embedded_in_the_blob() {
+    use super::proof_fixture::FixtureArchive;
+
+    let blob = proof_fixture::load_or_generate(&fixture_cache());
+    let archive = FixtureArchive::open(&blob);
+    let gi = archive.guest_input();
+
+    // DECODE: one commitment, directly in the guest input.
+    assert_ne!(
+        gi.decode_commitment, [0u8; 32],
+        "the DECODE root must be embedded and nonzero"
+    );
+    // Per-page genesis roots: (base, commitment) pairs, also directly embedded.
+    println!(
+        "R1f supplied roots: decode present, {} page commitments",
+        gi.page_commitments.len()
+    );
+    for pair in gi.page_commitments.iter() {
+        assert_ne!(pair.1, [0u8; 32], "page genesis roots must be nonzero");
+    }
+}
