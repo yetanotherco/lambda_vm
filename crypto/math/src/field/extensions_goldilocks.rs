@@ -6,7 +6,7 @@
 use crate::field::{
     element::FieldElement,
     errors::FieldError,
-    goldilocks::{GOLDILOCKS_PRIME, GoldilocksField, dot_product_2, dot_product_3, mul_by_7_raw},
+    goldilocks::{GoldilocksField, dot_product_2, dot_product_3, mul_by_7_raw},
     traits::{HasDefaultTranscript, IsField, IsSubFieldOf},
 };
 use crate::traits::{AsBytes, ByteConversion};
@@ -572,22 +572,12 @@ impl AsBytes for FieldElement<Degree3GoldilocksExtensionField> {
 }
 
 impl HasDefaultTranscript for Degree3GoldilocksExtensionField {
-    fn get_random_field_element_from_rng(rng: &mut impl rand::Rng) -> FieldElement<Self> {
-        let mut sample = [0u8; 8];
-        let mut coeffs = [FpE::zero(), FpE::zero(), FpE::zero()];
-
-        for coeff in &mut coeffs {
-            loop {
-                rng.fill(&mut sample);
-                let int_sample = u64::from_be_bytes(sample);
-                if int_sample < GOLDILOCKS_PRIME {
-                    *coeff = FpE::from(int_sample);
-                    break;
-                }
-            }
-        }
-
-        FieldElement::<Self>::new(coeffs)
+    fn sample_field_element_from(mut next_u64: impl FnMut() -> u64) -> FieldElement<Self> {
+        // Three base coordinates, each via the base field's rejection sampler
+        // (coordinate order 0, 1, 2 — `from_fn` evaluates in index order).
+        FieldElement::<Self>::new(core::array::from_fn(|_| {
+            GoldilocksField::sample_field_element_from(&mut next_u64)
+        }))
     }
 }
 

@@ -435,8 +435,6 @@ dependencies = [
  "libc",
  "math",
  "memmap2",
- "rand 0.8.5",
- "rand_chacha 0.3.1",
  "rayon",
  "rkyv",
  "serde",
@@ -502,7 +500,9 @@ version = "0.1.0"
 dependencies = [
  "k256",
  "num-bigint",
+ "num-integer",
  "num-traits",
+ "rayon",
 ]
 
 [[package]]

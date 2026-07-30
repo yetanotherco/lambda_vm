@@ -1,9 +1,14 @@
 name: Bench ABBA tiebreaker
 
 # Drift-free paired (A/B/B/A) prover benchmark for resolving small (~1%) deltas the
-# cheap PR benchmark can't confirm. It builds both binaries and runs ~20 interleaved
-# pairs, so it OCCUPIES THE SINGLE BENCH SERVER FOR ~30-40 MIN. For that reason it
-# NEVER auto-triggers -- it runs only on an explicit `/bench-abba` comment on a PR.
+# cheap PR benchmark can't confirm. At the default workload it OCCUPIES THE SINGLE
+# BENCH SERVER FOR SEVERAL HOURS, so it NEVER auto-triggers -- it runs only on an
+# explicit `/bench-abba` comment on a PR.
+#
+# Syntax: "/bench-abba [N] [cont[TX]|mono[TX]]" (default: 20 pairs, ethrex 100tx
+# --continuations; "cont10" is the quick coarse option, "mono[TX]" the legacy
+# monolithic prove). Cont proofs need rkyv pointer_width_64 on both sides, so PR
+# branches older than that fix must rebase before a cont bench.
 on:
   issue_comment:
     types: [created]
@@ -26,12 +31,101 @@ jobs:
       startsWith(github.event.comment.body, '/bench-abba') &&
       contains(fromJSON('["MEMBER","OWNER","COLLABORATOR"]'), github.event.comment.author_association)
     runs-on: [self-hosted, bench]
-    # Generous ceiling so a hang/OOM can't strand the single bench runner; the
-    # workload itself is ~30-40 min at the default 20 pairs (clamped to <=40).
-    timeout-minutes: 120
+    # Hang guardrail, not expected duration: a cont100 CPU prove is ~7 min, so the
+    # default 20 pairs runs ~4.5-5 hr and the 40-pair clamp ~9.5 hr, plus builds.
+    timeout-minutes: 720
     steps:
+      - name: Resolve PR head + bench config
+        id: cfg
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUM: ${{ github.event.issue.number }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          # The runner is persistent self-hosted: drop the previous run's logs so
+          # the always() result comment never tails a stale /tmp/abba_out.txt.
+          rm -f /tmp/abba_out.txt /tmp/abba_result.txt
+          # Resolve the head SHA (not the branch name): pinning the commit works for
+          # fork PRs too (the branch lives in the fork, not origin/) and avoids a
+          # force-push race mid-run.
+          HEAD_SHA=$(gh pr view "$PR_NUM" --repo "$GITHUB_REPOSITORY" --json headRefOid -q .headRefOid)
+          echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          # Everything after "/bench-abba" on its line, tokens in any order: a number =
+          # pair count; cont[TX]/mono[TX] = workload.
+          ARGS=$(printf '%s' "$COMMENT_BODY" | tr -d '\r' | sed -n 's|^/bench-abba||p' | head -n1)
+          PAIRS=20; CONTINUATIONS=1; TX_COUNT=100
+          set -f  # tokens must not glob-expand against the runner's CWD
+          for tok in $ARGS; do
+            case "$tok" in
+              cont)       CONTINUATIONS=1; TX_COUNT=100 ;;
+              mono)       CONTINUATIONS=0; TX_COUNT=5 ;;
+              cont[0-9]*) CONTINUATIONS=1; TX_COUNT="${tok#cont}" ;;
+              mono[0-9]*) CONTINUATIONS=0; TX_COUNT="${tok#mono}" ;;
+              [0-9]*)     PAIRS="$tok" ;;
+              *)          echo "::warning::ignoring unrecognized token '$tok'" ;;
+            esac
+          done
+          # Digits-only + clamps: PAIRS capped so one comment can't monopolize the
+          # single bench server; mono capped at 5tx (monolithic peak heap grows with
+          # the trace; 20tx needs ~78 GB).
+          if [ "$CONTINUATIONS" = "1" ]; then TX_DEFAULT=100; TX_MAX=100; else TX_DEFAULT=5; TX_MAX=5; fi
+          case "$TX_COUNT" in
+            ''|*[!0-9]*) echo "::warning::invalid tx count '$TX_COUNT'; using $TX_DEFAULT"; TX_COUNT=$TX_DEFAULT ;;
+          esac
+          if [ "$TX_COUNT" -lt 1 ] || [ "$TX_COUNT" -gt "$TX_MAX" ]; then
+            echo "::warning::tx count $TX_COUNT out of range [1,$TX_MAX] for this mode; using $TX_DEFAULT"
+            TX_COUNT=$TX_DEFAULT
+          fi
+          case "$PAIRS" in
+            ''|*[!0-9]*) echo "::warning::invalid pair count '$PAIRS'; using 20"; PAIRS=20 ;;
+          esac
+          if [ "$PAIRS" -lt 2 ] || [ "$PAIRS" -gt 40 ]; then
+            echo "::warning::pair count $PAIRS out of range [2,40]; using 20"
+            PAIRS=20
+          fi
+          # Even is ideal so the AB/BA orders balance; round an odd request up by one.
+          if [ "$((PAIRS % 2))" -ne 0 ]; then
+            PAIRS=$((PAIRS + 1))
+            echo "::notice::rounded odd pair count up to $PAIRS so AB/BA orders balance"
+          fi
+          if [ "$CONTINUATIONS" = "1" ]; then
+            WORKLOAD="ethrex ${TX_COUNT}tx continuations"
+          else
+            WORKLOAD="ethrex ${TX_COUNT}tx monolithic"
+          fi
+          # Outputs land before the fail-fast below so the always() result
+          # comment is fully labeled even when this step exits early.
+          {
+            echo "pairs=$PAIRS"
+            echo "continuations=$CONTINUATIONS"
+            echo "tx_count=$TX_COUNT"
+            echo "workload=$WORKLOAD"
+          } >> "$GITHUB_OUTPUT"
+          # Fail fast if the PR side predates the pointer_width_64 fix: a >=40tx
+          # continuation proof exceeds rkyv's old 2 GiB cap and only dies after
+          # blocking the single bench server for hours. Skip the check when the
+          # fetch fails: gh api prints HTTP error bodies to stdout, so gate on
+          # its exit status AND on the payload looking like the manifest (it
+          # declares rkyv) — never treat an error blob as a missing feature.
+          # Purely textual; deletable once every open branch postdates the fix.
+          if [ "$CONTINUATIONS" = "1" ] && [ "$TX_COUNT" -ge 40 ]; then
+            if SIDE=$(gh api "repos/$GITHUB_REPOSITORY/contents/prover/Cargo.toml?ref=$HEAD_SHA" \
+                 -H "Accept: application/vnd.github.raw" 2>/dev/null) \
+               && printf '%s' "$SIDE" | grep -q '^rkyv' \
+               && ! printf '%s' "$SIDE" | grep -q pointer_width_64; then
+              MSG="PR branch predates the rkyv pointer_width_64 fix — a ${TX_COUNT}tx continuation proof cannot serialize. Rebase onto main, or bench with cont10/mono."
+              echo "$MSG" > /tmp/abba_out.txt  # surfaces in the result comment
+              echo "::error::$MSG"
+              exit 1
+            fi
+          fi
+          echo "Using $PAIRS A/B/B/A pairs on $WORKLOAD"
+
       - name: Acknowledge (react + occupancy notice)
         uses: actions/github-script@v7
+        env:
+          PAIRS: ${{ steps.cfg.outputs.pairs }}
+          WORKLOAD: ${{ steps.cfg.outputs.workload }}
         with:
           script: |
             await github.rest.reactions.createForIssueComment({
@@ -41,30 +135,8 @@ jobs:
             await github.rest.issues.createComment({
               owner: context.repo.owner, repo: context.repo.repo,
               issue_number: context.issue.number,
-              body: '⏳ **ABBA tiebreaker started** on the bench server (~30–40 min). The bench server is occupied until it finishes.'
+              body: `⏳ **ABBA tiebreaker started** on the bench server: ${process.env.PAIRS} pairs of ${process.env.WORKLOAD} (a cont100 pair is ~15 min, so the default 20 pairs runs ~4.5-5 hr; pass a smaller pair count or \`cont10\` for a quicker, coarser run). The bench server is occupied until it finishes.`
             });
-
-      - name: Resolve PR head + pair count
-        id: cfg
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PR_NUM: ${{ github.event.issue.number }}
-          COMMENT_BODY: ${{ github.event.comment.body }}
-        run: |
-          # Resolve the head SHA (not the branch name): pinning the commit works for
-          # fork PRs too (the branch lives in the fork, not origin/) and avoids a
-          # force-push race mid-run.
-          HEAD_SHA=$(gh pr view "$PR_NUM" --repo "$GITHUB_REPOSITORY" --json headRefOid -q .headRefOid)
-          echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
-          # Optional pair count, e.g. "/bench-abba 32"; default 20. Clamp to [2,40]
-          # so a "/bench-abba 10000" can't monopolize the single bench server.
-          N=$(echo "$COMMENT_BODY" | sed -n 's|^/bench-abba[[:space:]]*\([0-9]\+\).*|\1|p')
-          N=${N:-20}
-          if [ "$N" -lt 2 ] 2>/dev/null || [ "$N" -gt 40 ] 2>/dev/null; then
-            echo "::warning::pair count $N out of range [2,40]; using 20"
-            N=20
-          fi
-          echo "pairs=$N" >> "$GITHUB_OUTPUT"
 
       - name: Checkout (full history for ref resolution)
         uses: actions/checkout@v4
@@ -84,6 +156,8 @@ jobs:
         env:
           HEAD_SHA: ${{ steps.cfg.outputs.head_sha }}
           PAIRS: ${{ steps.cfg.outputs.pairs }}
+          CONTINUATIONS: ${{ steps.cfg.outputs.continuations }}
+          TX_COUNT: ${{ steps.cfg.outputs.tx_count }}
         run: |
           export SYSROOT_DIR="$HOME/.lambda-vm-sysroot"
           set -o pipefail
@@ -100,12 +174,14 @@ jobs:
           HEAD_SHA: ${{ steps.cfg.outputs.head_sha }}
           PAIRS: ${{ steps.cfg.outputs.pairs }}
           OUTCOME: ${{ steps.run.outcome }}
+          WORKLOAD: ${{ steps.cfg.outputs.workload }}
         with:
           script: |
             const fs = require('fs');
             const read = (p) => { try { return fs.readFileSync(p, 'utf8').trim(); } catch { return ''; } };
             const head = (process.env.HEAD_SHA || '').slice(0, 10), pairs = process.env.PAIRS;
-            let body = `## ABBA tiebreaker — \`${head}\` vs \`main\` (${pairs} pairs)\n\n`;
+            const workload = process.env.WORKLOAD || 'ethrex';
+            let body = `## ABBA tiebreaker — \`${head}\` vs \`main\` (${pairs} pairs, ${workload})\n\n`;
             if (process.env.OUTCOME === 'success') {
               const res = read('/tmp/abba_result.txt') || read('/tmp/abba_out.txt');
               body += '```\n' + res + '\n```\n';
