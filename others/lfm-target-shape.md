@@ -130,6 +130,69 @@ theoretical one, since page bases are not a small ladder. When the constant set
 stops being enumerable, the answer is the runtime-uniform promotion — a value
 supplied at verify time and authenticated, not a constant.
 
+## Next-row PRUNING is program text, not arena data (constraint leg)
+
+Same class as the shape-static principle, and it bites the other way round.
+
+The verifier opens every trace column at `z` but prunes the `g·z` block down to
+each AIR's DECLARED `trace_ood_next_row_columns`, reconstructing **ZERO** for
+every column outside that set (`ood::OodLayout::reconstruct_full`). So a machine
+that hinted a value into an undeclared next-row slot would evaluate constraints
+over a frame **no verifier can produce** — accepting proofs the real verifier
+rejects. The declared set is AIR shape, it is carried in `AirShape`, and the
+zeros belong in the emitted program as the pooled zero constant.
+
+`lfm::constraints::hint_ood_frame` does this, and
+`pruned_next_row_columns_are_program_zeros` pins it by asserting, column by
+column on CPU's real shape, that a slot is the pooled zero cell **iff** the AIR
+does not declare it. The cheap consequence is that a frame costs
+`width + (steps − 1)·|next_row_columns|` arena words instead of `steps · width`;
+the expensive consequence is the one above.
+
+The generalisation for any leg that touches openings: **when the verifier
+reconstructs a value rather than reading it, the machine must reconstruct it
+too — from program text.** Reading it from an arena hands the prover a degree of
+freedom the protocol does not give them, and it is invisible in a differential
+test that feeds both sides the same frame.
+
+## A degenerate parameter hides implementations from every real test
+
+Third member of the same family, and the most general.
+
+**When every production instance shares one value of a parameter, a differential
+over production data cannot distinguish implementations that differ only off
+that value.** The real data does not exercise the difference, so the wrong
+implementation passes — not by luck, but structurally. The synthetic case is the
+only witness there can be.
+
+Two instances so far, both in the constraint/DEEP legs:
+
+- **`step_size = 1`.** `build_pruned_trace_term_coeffs` walks column-major, so
+  along a fixed row the γ exponent advances by the block's ROW COUNT, not by one.
+  Every one of the 28 production AIRs has `step_size = 1` and a single next row,
+  collapsing both strides to one. A per-row Horner in plain γ therefore passes
+  the real-proof differential against the production reconstruction, the census,
+  and every other test in the suite — and is wrong for the first AIR that widens
+  a step. Witnessed by `the_coefficient_exponent_formula_holds_at_a_wider_step`,
+  which builds a `step_size = 2` layout through the verifier's own
+  `build_pruned_trace_term_coeffs`.
+- **`end_exemptions = 0`.** Every production constraint emits through
+  `RowDomain::ALL`, so a consumer that ignored the field entirely would pass the
+  whole production sweep. `crypto/stark`'s `ExemptConstraints` exists for exactly
+  this reason, and its author says so: "so that *always zero in production*
+  cannot decay into *never tested*".
+
+**The falsification needs two halves.** Showing the synthetic case passes proves
+nothing on its own — a test that only checks the right answer passes against
+both implementations if the wrong one happens to agree there too. It must also
+assert that the DEGENERATE reading gives a DIFFERENT answer at the synthetic
+value. Without that second half the test passes against the wrong emitter, which
+is the failure mode it exists to prevent.
+
+How to find these: for each parameter a leg consumes, ask what values production
+actually takes. If the answer is "one", that parameter needs a synthetic witness
+before the leg can be called tested.
+
 ## Alignment is a property of the cursor, not the field (R1e)
 
 A 32-byte root is self-aligned and still lands misaligned if it inherits an odd
