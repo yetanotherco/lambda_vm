@@ -98,16 +98,44 @@ pub fn generate() -> (Vec<u8>, usize) {
 /// checked-in binary is worse: it can drift from the encoder silently. So the
 /// cache lives outside the repository and the GENERATION path is what tests
 /// exercise on a cold cache.
+///
+/// ## ⚠ The blob is NOT reproducible — measured, and it constrains callers
+///
+/// Two `generate()` calls on identical inputs produce blobs that differ in
+/// ~65k of 587k bytes, and the difference is SEMANTIC, not archive padding:
+/// some sub-proofs commit to different roots, which moves the Fiat-Shamir
+/// challenges, which opens different leaves. (`machine_tests::
+/// fixture_generation_is_not_reproducible` is the standing evidence.)
+///
+/// So **nothing derived from a specific blob may be pinned as a constant** —
+/// not a query index, not a leaf value, not a root. Pin SHAPE (column counts,
+/// tree depths), which is stable, and recover per-blob values from the blob.
+/// R1f's `R1F_SHAPE` and its recovered leaf index are built that way; a pinned
+/// index would have broken on the very next cold cache.
+///
+/// The write is atomic (temp file then rename) because the cache is shared by
+/// tests that run in parallel and one of them regenerates it: without the
+/// rename a reader can observe a half-written blob, and since blobs differ,
+/// "it was fine last time" proves nothing.
 pub fn load_or_generate(cache: &Path) -> Vec<u8> {
     if let Ok(bytes) = std::fs::read(cache) {
         return bytes;
     }
     let (blob, _) = generate();
+    write_cache(cache, &blob);
+    blob
+}
+
+/// Publishes `blob` at `cache` atomically, so a concurrent reader sees either
+/// the old complete blob or the new one, never a torn prefix.
+pub fn write_cache(cache: &Path, blob: &[u8]) {
     if let Some(dir) = cache.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let _ = std::fs::write(cache, &blob);
-    blob
+    let staging = cache.with_extension(format!("tmp{}", std::process::id()));
+    if std::fs::write(&staging, blob).is_ok() {
+        let _ = std::fs::rename(&staging, cache);
+    }
 }
 
 /// Checks the blob carries the recursion input's magic prefix — i.e. that it is

@@ -199,7 +199,7 @@ impl RowDomain {
 /// [`num_base_from_meta`]. Degree is intentionally absent: only the per-table
 /// max is consumed (by `composition_poly_degree_bound`), declared once via
 /// [`ConstraintSet::max_degree`].
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConstraintMeta {
     pub constraint_idx: usize,
     /// Base | Ext; Base entries MUST be a prefix.

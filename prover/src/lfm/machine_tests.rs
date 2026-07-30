@@ -2766,8 +2766,10 @@ fn continuation_fixture_generates_two_epochs() {
         "a CONTINUATION fixture needs more than one epoch, got {num_epochs} — \
          lower FIXTURE_EPOCH_LOG2"
     );
-    // Cache it for the slices that consume it.
-    let _ = std::fs::write(fixture_cache(), &blob);
+    // Cache it for the slices that consume it. Atomic: this test runs in
+    // parallel with readers of the same path, and blobs are not reproducible,
+    // so a torn write would hand someone a truncated proof.
+    proof_fixture::write_cache(&fixture_cache(), &blob);
 }
 
 /// R1f(a): the arena filler reads a REAL proof's committed roots out of the
@@ -3239,4 +3241,71 @@ fn keccak_merkle_opening_cost() {
     let (main, aux) = super::airs::lfm_cell_counts(&program);
     println!("R1f whole program: {main} main cells, {aux} aux cells");
     assert_eq!(opening.values.len(), R1F_SHAPE.leaf_values);
+}
+
+/// ⚠ STANDING EVIDENCE that the fixture is not reproducible.
+///
+/// Two `generate()` calls on identical inputs — same ELF, same empty input,
+/// same epoch size, same options — produce different blobs, and the difference
+/// is semantic rather than archive padding: sub-proof roots move, which moves
+/// the Fiat-Shamir challenges, which opens different leaves. Measured at ~65k
+/// of 587k bytes differing.
+///
+/// This is why R1f pins SHAPE (`R1F_SHAPE`) and RECOVERS per-blob values
+/// (`r1f_opening`) instead of pinning a query index or a root. A pinned index
+/// would pass for exactly as long as the cache survived and then fail on the
+/// next cold run, which is the worst possible failure mode for a fixture.
+///
+/// `#[ignore]`d because it costs two full continuation proofs (~17 s) and
+/// asserts nothing the rest of the suite depends on. Run it with
+/// `--ignored` when the question comes up again; it is here so the claim has
+/// evidence attached rather than being folklore in a status log.
+#[test]
+#[ignore]
+fn fixture_generation_is_not_reproducible() {
+    let (a, _) = proof_fixture::generate();
+    let (b, _) = proof_fixture::generate();
+    let differing = a.iter().zip(b.iter()).filter(|(x, y)| x != y).count();
+    println!(
+        "two fixture generations: {} vs {} bytes, {differing} differing",
+        a.len(),
+        b.len()
+    );
+    assert_ne!(
+        a, b,
+        "if this ever passes, the prover became reproducible \
+                      and the no-pinning rule in proof_fixture can be relaxed"
+    );
+
+    // The difference reaches the committed data, so it is not archive padding.
+    let (aa, bb) = (
+        super::proof_fixture::FixtureArchive::open(&a),
+        super::proof_fixture::FixtureArchive::open(&b),
+    );
+    assert_ne!(
+        super::proof_arena::epoch_main_roots(&aa, 0),
+        super::proof_arena::epoch_main_roots(&bb, 0),
+        "the divergence must be semantic — if the roots match, this is padding \
+         and the no-pinning rule is too strong"
+    );
+
+    // The tree this leg authenticates keeps its SHAPE across runs, which is the
+    // property R1F_SHAPE relies on, while its opened values do not.
+    let oa = MainTraceOpening::extract(&aa, 0, 0, 0);
+    let ob = MainTraceOpening::extract(&bb, 0, 0, 0);
+    assert_eq!(
+        oa.depth(),
+        ob.depth(),
+        "tree depth is shape and must be stable"
+    );
+    assert_eq!(
+        oa.num_columns, ob.num_columns,
+        "column count is shape and must be stable"
+    );
+    println!(
+        "table 0 across runs: depth {} stable, same root = {}, same opened values = {}",
+        oa.depth(),
+        oa.root == ob.root,
+        oa.values == ob.values
+    );
 }
