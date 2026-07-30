@@ -95,7 +95,7 @@ fn constraints_hold_on_generated_trace() {
 
 #[test]
 fn constraint_set_count() {
-    assert_eq!(EcsmConstraints.meta().len(), 415);
+    assert_eq!(EcsmConstraints.meta().len(), 423);
 }
 
 /// The yG carry recurrence closes on all-zero padding because both the `µ·p²` offset and the

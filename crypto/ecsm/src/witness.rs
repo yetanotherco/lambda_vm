@@ -47,6 +47,11 @@ pub struct EcsmWitness {
     pub k_sub_n: [u8; 32],
     /// `(xR - p) mod 2^256`
     pub x_r_sub_p: [u8; 32],
+    /// `(yR - p) mod 2^256`. Forces `yR < p`: without it the byte range checks only
+    /// bound `yR < 2^256`, and the quotient columns absorb a multiple of `p`, so a
+    /// witness could publish `yR + p` for any `yR < 2^256 - p` (~2^32) — points with
+    /// such a tiny `y` are constructible, since `3 | p-1` makes cubing 3-to-1.
+    pub y_r_sub_p: [u8; 32],
     /// position of the most significant set bit of `k`
     pub len_k: u8,
     pub x_r: [u8; 32],
@@ -347,6 +352,7 @@ fn compute_witness_inner(
     let x_r = to_le_32(&result.x);
     let y_r = to_le_32(&result.y);
     let x_r_sub_p = to_le_32(&((&two_256 + &result.x) - p()));
+    let y_r_sub_p = to_le_32(&((&two_256 + &result.y) - p()));
 
     // Steps are independent witnesses (each builds its own λ/quotient/carry data
     // from one StepPts), so they parallelize freely when rayon is available.
@@ -373,6 +379,7 @@ fn compute_witness_inner(
         x_g_sub_p,
         k_sub_n,
         x_r_sub_p,
+        y_r_sub_p,
         len_k,
         x_r,
         y_r,

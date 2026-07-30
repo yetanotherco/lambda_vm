@@ -69,8 +69,10 @@ pub mod cols {
     /// Mode selector: 1 = affine ecall (read yG, write yR), 0 = x-only / padding.
     /// Pinned to the actual ecall number by the `Ecall` receiver (see `bus_interactions`).
     pub const IS_AFFINE: usize = 667;
+    /// `(yR - p) mod 2^256`, the addend that forces `yR < p` (see `OverflowKind::YrLtP`).
+    pub const YR_SUB_P: usize = 668; // U256HL (16 halfwords)
 
-    pub const NUM_COLUMNS: usize = 668;
+    pub const NUM_COLUMNS: usize = 684;
 
     #[inline]
     pub const fn xr(i: usize) -> usize {
@@ -120,6 +122,10 @@ pub mod cols {
     #[inline]
     pub const fn xr_sub_p(i: usize) -> usize {
         XR_SUB_P + i
+    }
+    #[inline]
+    pub const fn yr_sub_p(i: usize) -> usize {
+        YR_SUB_P + i
     }
 }
 
@@ -197,6 +203,7 @@ pub fn generate_ecsm_trace(
         write_halfwords(table, row_idx, cols::XG_SUB_P, &w.x_g_sub_p);
         write_halfwords(table, row_idx, cols::K_SUB_N, &w.k_sub_n);
         write_halfwords(table, row_idx, cols::XR_SUB_P, &w.x_r_sub_p);
+        write_halfwords(table, row_idx, cols::YR_SUB_P, &w.y_r_sub_p);
 
         for i in 0..64 {
             debug_assert!((0..1 << 16).contains(&(w.c0[i] + CARRY_OFFSET_X2)));
@@ -601,6 +608,13 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             vec![packed(cols::xr_sub_p(i))],
         ));
     }
+    for i in 0..16 {
+        out.push(BusInteraction::sender(
+            BusId::IsHalfword,
+            mu(),
+            vec![packed(cols::yr_sub_p(i))],
+        ));
+    }
 
     // ZERO bus: assert k != 0 (sum of byte_k[0..31] is nonzero).
     // byte_k[i] = Σ_{j=0}^{7} 2^j · k[8i+j], so Σ byte_k = Σ_{b=0}^{255} 2^(b%8) · k[b].
@@ -725,6 +739,7 @@ pub enum OverflowKind {
     XgLtP,
     KLtN,
     XrLtP,
+    YrLtP,
 }
 
 impl OverflowKind {
@@ -734,6 +749,7 @@ impl OverflowKind {
             OverflowKind::XgLtP => &P_BYTES,
             OverflowKind::KLtN => &N_BYTES,
             OverflowKind::XrLtP => &P_BYTES,
+            OverflowKind::YrLtP => &P_BYTES,
         };
         let mut w = 0u64;
         for b in 0..4 {
@@ -747,6 +763,7 @@ impl OverflowKind {
             OverflowKind::XgLtP => cols::XG_SUB_P,
             OverflowKind::KLtN => cols::K_SUB_N,
             OverflowKind::XrLtP => cols::XR_SUB_P,
+            OverflowKind::YrLtP => cols::YR_SUB_P,
         }
     }
     /// Column base of the sum.
@@ -755,6 +772,7 @@ impl OverflowKind {
             OverflowKind::XgLtP => cols::XG,
             OverflowKind::KLtN => cols::K,
             OverflowKind::XrLtP => cols::XR,
+            OverflowKind::YrLtP => cols::YR,
         }
     }
     /// Whether the sum is stored as individual bits (k) rather than bytes (xG/xR).
@@ -768,7 +786,7 @@ impl OverflowKind {
 // =========================================================================
 //
 // One body against the generic `ConstraintBuilder` serves the compiled prover
-// folder, the verifier folder and IR capture. Constraint indices 0..415:
+// folder, the verifier folder and IR capture. Constraint indices 0..423:
 //   0        : IS_BIT(MU)
 //   1..257   : IS_BIT(k[i]) for the 256 scalar bits
 //   257      : KBitsZeroOnPadding — (Σ k_bit[i])·(1−µ)
@@ -783,12 +801,14 @@ impl OverflowKind {
 //   404      : OverflowRequired(KLtN)
 //   405..412 : CarryBit(XrLtP, 0..7)
 //   412      : OverflowRequired(XrLtP)
-//   413      : IS_BIT(IS_AFFINE)
-//   414      : AffineZeroOnPadding — IS_AFFINE·(1−µ)
+//   413..420 : CarryBit(YrLtP, 0..7)
+//   420      : OverflowRequired(YrLtP)
+//   421      : IS_BIT(IS_AFFINE)
+//   422      : AffineZeroOnPadding — IS_AFFINE·(1−µ)
 
 use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
-/// ECSM transition constraints as a single-source [`ConstraintSet`] (415
+/// ECSM transition constraints as a single-source [`ConstraintSet`] (423
 /// total). No column configuration needed (the layout is fixed via `cols`).
 pub struct EcsmConstraints;
 
@@ -979,7 +999,12 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for EcsmConstraints {
         idx += 1;
 
         // xG < p, k < N and xR < p: 7 carry bits (deg 3) + overflow-required (deg 2) each.
-        for kind in [OverflowKind::XgLtP, OverflowKind::KLtN, OverflowKind::XrLtP] {
+        for kind in [
+            OverflowKind::XgLtP,
+            OverflowKind::KLtN,
+            OverflowKind::XrLtP,
+            OverflowKind::YrLtP,
+        ] {
             let c = Self::carry_chain(b, kind);
             for ci in c.iter().take(7) {
                 // µ · c_i · (1 − c_i)
@@ -995,13 +1020,13 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for EcsmConstraints {
             idx += 1;
         }
 
-        // idx 413: IS_BIT(IS_AFFINE): a·(1−a). The mode selector is a bit. (deg 2)
+        // idx 421: IS_BIT(IS_AFFINE): a·(1−a). The mode selector is a bit. (deg 2)
         let is_affine = b.main(0, cols::IS_AFFINE);
         let one = b.one();
         b.emit_base(idx, is_affine.clone() * (one - is_affine));
         idx += 1;
 
-        // idx 414: AffineZeroOnPadding: IS_AFFINE·(1−µ). Forces IS_AFFINE = 0 on padding
+        // idx 422: AffineZeroOnPadding: IS_AFFINE·(1−µ). Forces IS_AFFINE = 0 on padding
         // rows (µ=0), so the affine-gated yG-read / yR-write buses can't fire there. (deg 2)
         let is_affine = b.main(0, cols::IS_AFFINE);
         let mu = b.main(0, cols::MU);
@@ -1009,6 +1034,6 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for EcsmConstraints {
         b.emit_base(idx, is_affine * (one - mu));
         idx += 1;
 
-        debug_assert_eq!(idx, 415);
+        debug_assert_eq!(idx, 423);
     }
 }
