@@ -954,25 +954,46 @@ pub type LabeledAir = (
     Box<dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>>,
 );
 
-/// The page base used wherever a test needs a concrete PAGE AIR.
+/// The page base used wherever a test needs a concrete PAGE or GLOBAL_MEMORY
+/// AIR.
 ///
-/// PAGE is the one production table whose constraints are PARAMETERIZED: its
-/// bus interactions fold `page_base` into constant terms (see
-/// `crate::tables::page::bus_interactions`), so a different base yields a
-/// different captured program. Tests pin one base; anything reasoning about a
-/// real continuation proof must account for one PAGE program per page base.
+/// See [`production_airs`] on why a base has to be pinned at all.
 pub const PAGE_TEST_BASE: u64 = 0x1000;
+
+/// The epoch label used wherever a test needs a concrete L2G AIR. A 1-based fini
+/// epoch — `l2g_memory_air` debug-asserts `>= 1`.
+pub const EPOCH_TEST_LABEL: u64 = 1;
 
 /// Every production table AIR, constructed and boxed behind the common trait
 /// object.
 ///
 /// AIR-construction only — no ELF, no program execution — so this runs
-/// anywhere. It exists because the per-table list was previously copied into
-/// each IR test suite by hand: a table added to one copy and forgotten in
-/// another lost that suite's coverage silently, which is exactly the failure a
-/// per-table suite is supposed to catch. There is no ELF-free registry to
-/// iterate instead (`VmAirs::n` needs a real ELF plus preprocessed-commitment
-/// builds), so this list is still hand-maintained — but now once.
+/// anywhere. There is no ELF-free registry to iterate instead (`VmAirs::n` needs
+/// a real ELF plus preprocessed-commitment builds, and omits zero-count tables),
+/// so this list is hand-maintained — but exactly once. It previously existed as
+/// three hand-copied per-suite lists, and all three shared the same blind spot:
+/// the continuation-only tables at the end were in none of them.
+///
+/// # This list includes the CONTINUATION tables
+///
+/// The last three come from `crate::continuation` and appear in no monolithic
+/// proof. They are not optional extras: a continuation proof is what the
+/// recursion path actually verifies, so a per-table sweep that stops at the
+/// monolithic 25 is complete for a proof shape we do not care about.
+///
+/// # Four of these AIRs are PARAMETERIZED
+///
+/// `PAGE` and `GLOBAL_MEMORY` fold a `page_base` into constant bus terms; the
+/// two `L2G` tables fold an `epoch_label` into constant terms
+/// (`BusValue::constant(epoch_label)` and `LinearTerm::Constant(epoch_label-1)`
+/// respectively). Those constants reach the captured IR, so each of these four
+/// has a DIFFERENT constraint program per parameter value — there is no single
+/// "the PAGE program". This list pins one value each
+/// ([`PAGE_TEST_BASE`], [`EPOCH_TEST_LABEL`]) so the per-table suites have
+/// something concrete to check; anything reasoning about a whole continuation
+/// proof must account for one program per distinct base and per distinct epoch.
+/// `constraint_artifact_tests::parameterized_airs_vary_per_parameter_value`
+/// characterizes exactly how they differ.
 pub fn production_airs(proof_options: &ProofOptions) -> Vec<LabeledAir> {
     vec![
         ("CPU", Box::new(create_cpu_air(proof_options))),
@@ -1003,12 +1024,50 @@ pub fn production_airs(proof_options: &ProofOptions) -> Vec<LabeledAir> {
         ("KECCAK_RC", Box::new(create_keccak_rc_air(proof_options))),
         ("ECSM", Box::new(create_ecsm_air(proof_options))),
         ("ECDAS", Box::new(create_ecdas_air(proof_options))),
+        // ---- continuation-only tables (no monolithic proof contains these) ----
+        (
+            "L2G_GLOBAL",
+            Box::new(crate::continuation::l2g_global_air(
+                proof_options,
+                EPOCH_TEST_LABEL,
+            )),
+        ),
+        (
+            "L2G_MEMORY",
+            Box::new(crate::continuation::l2g_memory_air(
+                proof_options,
+                EPOCH_TEST_LABEL,
+            )),
+        ),
+        (
+            "GLOBAL_MEMORY",
+            Box::new(create_global_memory_air(proof_options, PAGE_TEST_BASE)),
+        ),
     ]
 }
 
-/// The number of production table AIRs [`production_airs`] yields.
+/// Create the GLOBAL_MEMORY AIR for one page, as a continuation proof would.
 ///
-/// Pinned as a constant so a table dropped from the list — rather than added —
-/// fails a test instead of quietly shrinking every per-table suite at once.
-/// Bump it deliberately when a table is genuinely added or removed.
-pub const NUM_PRODUCTION_AIRS: usize = 25;
+/// The preprocessed commitment is supplied rather than recomputed: it is a
+/// blowup-dependent Merkle root over the page's genesis values, and it is NOT
+/// part of the constraint artifact (the verifier gets it through the existing
+/// static-commitment mechanism). Recomputing it here would cost an FFT plus a
+/// Merkle build per call and change nothing any IR suite looks at.
+pub fn create_global_memory_air(
+    proof_options: &ProofOptions,
+    page_base: u64,
+) -> ConcreteVmAir<EmptyConstraints> {
+    let config = crate::tables::page::PageConfig::zero_init(page_base);
+    crate::continuation::global_memory_air(proof_options, &config, Some([0u8; 32]))
+}
+
+/// The number of production table AIRs [`production_airs`] yields: 25 monolithic
+/// plus 3 continuation-only.
+///
+/// Every suite that iterates the list asserts against this. That assert is the
+/// point: the list is hand-maintained, so without it a table added to
+/// `test_utils` or to `continuation.rs` and forgotten here escapes every
+/// per-table suite at once and silently — which is exactly what happened to the
+/// three continuation tables. Bump it deliberately when a table is genuinely
+/// added or removed.
+pub const NUM_PRODUCTION_AIRS: usize = 28;

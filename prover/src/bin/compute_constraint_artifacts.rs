@@ -12,9 +12,20 @@
 //! which is exactly what a guest must not do. That is the point of writing the
 //! result down — see `stark::constraint_ir::artifact`.
 //!
-//! The artifacts are NOT proof-options dependent (pinned by
-//! `artifacts_are_invariant_across_proof_options`), so one file per table
-//! covers every blowup factor.
+//! The artifacts are NOT proof-options or trace-length dependent (pinned by
+//! `artifacts_are_invariant_across_proof_options` and
+//! `artifacts_are_invariant_across_trace_length`), so a table's file covers every
+//! blowup factor and every epoch size.
+//!
+//! ⚠️  But four tables are PARAMETERIZED, so this emits ONE REPRESENTATIVE, not
+//! the complete set: `PAGE` and `GLOBAL_MEMORY` fold a page base into constant
+//! bus terms, and both `L2G` tables fold an epoch label. Their files are the
+//! artifact at `test_utils::PAGE_TEST_BASE` / `EPOCH_TEST_LABEL` only. A real
+//! continuation proof needs one artifact per distinct page base and per distinct
+//! epoch label — see
+//! `constraint_artifact_tests::parameterized_airs_vary_per_parameter_value`.
+//! Treating this directory as "the constraint artifacts" would be wrong for
+//! exactly the tables a continuation proof cares most about.
 //!
 //! ⚠️  These bytes are not an oracle. Nothing about a serialized artifact proves
 //! it matches the compiled folder — only

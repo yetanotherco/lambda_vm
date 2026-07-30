@@ -23,6 +23,21 @@
 //!    (`AIR::transition_zerofier_evaluations_grouped` keys its dedup groups on
 //!    exactly this field). A program without it evaluates the right algebra
 //!    against the wrong divisor.
+//!
+//!    **Production zerofiers are UNIFORM.** Measured, not assumed: every
+//!    production constraint across all 28 tables emits through `RowDomain::ALL`
+//!    — `RowDomain::except_last` appears only in `crate::examples` and in tests.
+//!    So `end_exemptions` is 0 everywhere and every table has exactly ONE
+//!    zerofier group. Two things follow. The GPU constraint path already
+//!    *requires* a uniform zerofier, so that precondition holds in fact rather
+//!    than by luck. And a consumer evaluating these constraints needs one
+//!    zerofier per AIR, not one per distinct exemption value — worth knowing
+//!    before speccing the general case defensively.
+//!
+//!    The field is still carried, and is still load-bearing for anything that
+//!    is not a production VM table (the example AIRs use exemptions). It is
+//!    covered by `ExemptConstraints` in `artifact_tests`, deliberately, so that
+//!    "always zero in production" cannot decay into "never tested".
 //! 3. **The AIR shape** — widths, step size, transition offsets, the next-row
 //!    column set (which decides the pruned `g·z` OOD opening), max bus elements.
 //! 4. **The composition degree multiplier** — see
@@ -39,6 +54,17 @@
 //!   would multiply the artifact count by the number of blowup factors for no
 //!   information gain, and would wrongly imply the constraints are
 //!   options-dependent. Options are supplied at AIR construction.
+//! - **Trace length / epoch size.** No AIR constructor takes one, so the axis is
+//!   structurally absent; the only route by which it could reach the artifact is
+//!   `composition_poly_degree_bound(n)`, which the artifact stores divided
+//!   through by `n`. That division is sound only if the bound is exactly linear,
+//!   which `artifacts_are_invariant_across_trace_length` sweeps per table rather
+//!   than assuming.
+//! - **The preprocessed COMMITMENT.** `AIR::precomputed_commitment` is a
+//!   blowup-dependent Merkle root, delivered by the existing static-commitment
+//!   mechanism. Only the `is_preprocessed` / `num_precomputed_columns` shape
+//!   flags are artifact material; putting the root here would reintroduce the
+//!   options dependence the previous point removes.
 //! - **Boundary constraints.** `AIR::boundary_constraints` is a function of the
 //!   public inputs, not a static property of the AIR, so it is not data in the
 //!   sense this artifact means. Serializing it is a separate problem.

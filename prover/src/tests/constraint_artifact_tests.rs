@@ -363,6 +363,212 @@ fn artifacts_are_invariant_across_proof_options() {
     }
 }
 
+/// The captured artifact does not depend on the trace length either.
+///
+/// Same failure mode as the proof-options axis, different variable: if anything
+/// in a captured program folded a domain-size-dependent constant, artifacts
+/// would multiply per epoch shape.
+///
+/// The axis is structurally absent — no AIR constructor takes a trace length —
+/// so the only route by which one could reach the artifact is
+/// `composition_poly_degree_bound(n)`, the single trace-length-dependent method
+/// on the trait, whose value the artifact stores divided through by `n`. That
+/// division is only sound if the bound is exactly linear, so this sweeps a wide
+/// range of `n` per table rather than trusting the two probe points
+/// `ConstraintArtifact::capture` checks. A table whose bound had any constant
+/// term or any non-linearity would be misrepresented by the stored multiplier,
+/// and would show up here.
+#[test]
+fn artifacts_are_invariant_across_trace_length() {
+    let opts = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
+    let airs = production_airs(&opts);
+    assert_eq!(airs.len(), NUM_PRODUCTION_AIRS);
+
+    for (label, air) in &airs {
+        let artifact = ConstraintArtifact::capture(&**air);
+        let k = artifact.shape.composition_degree_multiplier as usize;
+
+        for log_n in 4usize..=24 {
+            let n = 1usize << log_n;
+            assert_eq!(
+                air.composition_poly_degree_bound(n),
+                k * n,
+                "[{label}] composition_poly_degree_bound is not k·n at n=2^{log_n}; the artifact \
+                 stores only the linear coefficient, so a trace-length-dependent AIR would need \
+                 an artifact per epoch shape"
+            );
+        }
+
+        // Nothing else on the artifact can vary with the trace length, but pin
+        // capture determinism so a future source of nondeterminism (map
+        // iteration order in the constant tables, say) is caught here.
+        let again = ConstraintArtifact::capture(&**air);
+        assert_eq!(artifact, again, "[{label}] capture is not deterministic");
+    }
+}
+
+/// The four PARAMETERIZED tables produce a different program per parameter
+/// value.
+///
+/// `PAGE` / `GLOBAL_MEMORY` fold a page base into constant bus terms; the two
+/// `L2G` tables fold an epoch label. This test does not assert that away — it
+/// characterizes it, because it is a real property of the current constraints
+/// and the recursion machine has to plan around it.
+///
+/// # The variation is NOT confined to constant VALUES
+///
+/// The obvious guess is that two parameter values give the same node array with
+/// one constant swapped. That is what `PAGE` and `GLOBAL_MEMORY` do, and it is
+/// wrong in general: the builder interns constants by value, so a parameter
+/// whose value happens to already be in the constant table costs no new node,
+/// while a fresh value appends one — which shifts every later node id and hence
+/// the constraint ROOTS. `L2G_GLOBAL` at `epoch_label = 1` reuses the existing
+/// `1` constant; at `epoch_label = 7` it appends. Same algebra, different node
+/// count and different root ids.
+///
+/// This matters for the machine-side fix: "swap one constant per page" would be
+/// a cheap patch and it is not available. Promoting the parameter to a runtime
+/// uniform is, because the ALGEBRA is invariant — which is what the shape and
+/// metadata assertions below pin.
+#[test]
+fn parameterized_airs_vary_per_parameter_value() {
+    let opts = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
+
+    // (label, artifact at parameter A, artifact at parameter B)
+    let cases: Vec<(&str, ConstraintArtifact, ConstraintArtifact)> = vec![
+        (
+            "PAGE",
+            ConstraintArtifact::capture(&create_page_air(&opts, 0x1000)),
+            ConstraintArtifact::capture(&create_page_air(&opts, 0x9000)),
+        ),
+        (
+            "GLOBAL_MEMORY",
+            ConstraintArtifact::capture(&create_global_memory_air(&opts, 0x1000)),
+            ConstraintArtifact::capture(&create_global_memory_air(&opts, 0x9000)),
+        ),
+        (
+            "L2G_GLOBAL",
+            ConstraintArtifact::capture(&crate::continuation::l2g_global_air(&opts, 1)),
+            ConstraintArtifact::capture(&crate::continuation::l2g_global_air(&opts, 7)),
+        ),
+        (
+            "L2G_MEMORY",
+            ConstraintArtifact::capture(&crate::continuation::l2g_memory_air(&opts, 1)),
+            ConstraintArtifact::capture(&crate::continuation::l2g_memory_air(&opts, 7)),
+        ),
+    ];
+
+    println!("\nparameterized tables: how two parameter values differ");
+    for (label, a, b) in &cases {
+        assert_ne!(
+            a, b,
+            "[{label}] is documented as parameterized but two parameter values gave the same \
+             artifact; either the parameter stopped reaching the IR or the test picked two \
+             values that collide"
+        );
+
+        // Invariant: the ALGEBRA. Same widths, same constraint count, same
+        // zerofier shapes, same degree bound — only the embedded parameter
+        // moves. This is the property that makes the parameter promotable to a
+        // runtime uniform.
+        assert_eq!(a.shape, b.shape, "[{label}] shape must not vary");
+        assert_eq!(a.meta, b.meta, "[{label}] metadata must not vary");
+        assert_eq!(a.num_base, b.num_base, "[{label}] num_base must not vary");
+        assert_eq!(
+            a.roots.len(),
+            b.roots.len(),
+            "[{label}] constraint count must not vary"
+        );
+
+        // Variable: node count and root ids — an artifact of the builder's
+        // hash-consing, not of the constraints. A parameter value already in the
+        // constant table costs no new ConstBase node while a fresh one appends,
+        // which shifts every later node id.
+        //
+        // MEASURED, and note the counts are not all +1: L2G_GLOBAL moves 1 node
+        // for 1 constant, L2G_MEMORY moves 2 for 1. The second node is some
+        // further CSE difference downstream of the reused constant (L2G_MEMORY
+        // at epoch_label = 1 contributes the constant 0, which IS node id 0, so
+        // expressions over it have more chance to coincide with existing ones) —
+        // that specific explanation is inferred, not verified, so the bound
+        // below is deliberately loose. What is being pinned is only that the
+        // delta stays local rather than the algebra changing shape.
+        let node_delta = a.nodes.len().abs_diff(b.nodes.len());
+        let const_delta = a.base_consts.len().abs_diff(b.base_consts.len());
+        assert!(
+            node_delta <= 4 && const_delta <= 1,
+            "[{label}] two parameter values changed the program by {node_delta} nodes and \
+             {const_delta} constants — too much to be the parameter's own interned constant and \
+             its enclosing ops; the variation is structural, not just parametric"
+        );
+        let roots_moved = a.roots != b.roots;
+
+        println!(
+            "  {label:<14} nodes {:>3} vs {:>3}   consts {:>2} vs {:>2}   roots moved: {}",
+            a.nodes.len(),
+            b.nodes.len(),
+            a.base_consts.len(),
+            b.base_consts.len(),
+            roots_moved
+        );
+    }
+    println!();
+}
+
+/// GLOBAL_MEMORY has a second, ENUMERABLE axis: private-input pages are built
+/// non-preprocessed, which changes the artifact's SHAPE rather than a constant.
+///
+/// Worth separating from the parameter axis above because the two have very
+/// different consequences. A page base is an arbitrary address, so its artifact
+/// set is unbounded; `is_private_input` is a boolean, so GLOBAL_MEMORY simply has
+/// two shape variants and both can be enumerated. This pins that the difference
+/// is confined to the preprocessed-column fields and does not touch the program.
+#[test]
+fn global_memory_private_input_is_a_second_shape_not_a_second_program() {
+    use crate::tables::page::PageConfig;
+    let opts = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
+
+    let elf_page = PageConfig::zero_init(PAGE_TEST_BASE);
+    let mut private_page = PageConfig::zero_init(PAGE_TEST_BASE);
+    private_page.is_private_input = true;
+
+    let elf = ConstraintArtifact::capture(&crate::continuation::global_memory_air(
+        &opts,
+        &elf_page,
+        Some([0u8; 32]),
+    ));
+    let private = ConstraintArtifact::capture(&crate::continuation::global_memory_air(
+        &opts,
+        &private_page,
+        Some([0u8; 32]),
+    ));
+
+    // Same constraints, same metadata: the bus interactions depend only on the
+    // page base, which is equal here.
+    assert_eq!(elf.nodes, private.nodes, "the program must not vary");
+    assert_eq!(elf.base_consts, private.base_consts);
+    assert_eq!(elf.roots, private.roots);
+    assert_eq!(elf.meta, private.meta);
+
+    // The shape does vary, in exactly the preprocessed fields.
+    assert!(elf.shape.is_preprocessed, "an ELF page is preprocessed");
+    assert!(
+        !private.shape.is_preprocessed,
+        "a private-input page is not preprocessed — the verifier never recomputes its genesis \
+         column from the ELF"
+    );
+    assert!(elf.shape.num_precomputed_columns > 0);
+    assert_eq!(private.shape.num_precomputed_columns, 0);
+
+    let mut normalized = private.shape.clone();
+    normalized.is_preprocessed = elf.shape.is_preprocessed;
+    normalized.num_precomputed_columns = elf.shape.num_precomputed_columns;
+    assert_eq!(
+        normalized, elf.shape,
+        "the two variants must differ ONLY in the preprocessed-column fields"
+    );
+}
+
 /// An artifact captured from one table must not validate against another.
 ///
 /// The suite above only ever shows the shape check ACCEPTING. Without this, a

@@ -139,7 +139,7 @@ fn global_transcript(
 /// identical trace (root-bound), so it inherits it.
 /// The L2G epoch-local table's single transition constraint: `MU ∈ {0,1}`
 /// (`MU·(1−MU) = 0`) at constraint index 0.
-struct L2gMemoryConstraints;
+pub(crate) struct L2gMemoryConstraints;
 
 impl ConstraintSet<F, E> for L2gMemoryConstraints {
     fn eval<B: ConstraintBuilder<F, E>>(&self, b: &mut B) {
@@ -159,7 +159,7 @@ impl ConstraintSet<F, E> for L2gMemoryConstraints {
 /// committed trace (equal Merkle roots). So under collision resistance the trace the
 /// global bus runs over already satisfies all those constraints — do not add them
 /// here (it would be redundant, not a missing check).
-fn l2g_global_air(
+pub(crate) fn l2g_global_air(
     opts: &ProofOptions,
     epoch_label: u64,
 ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), EmptyConstraints> {
@@ -180,7 +180,7 @@ fn l2g_global_air(
 /// check too: this proof has the BITWISE provider, and the global proof commits
 /// the identical trace (the commitment binding compares roots), so checking here
 /// covers both. `epoch_label` is the `fini_epoch` constant used by both.
-fn l2g_memory_air(
+pub(crate) fn l2g_memory_air(
     opts: &ProofOptions,
     epoch_label: u64,
 ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), L2gMemoryConstraints> {
@@ -217,7 +217,7 @@ fn l2g_memory_air(
 /// genesis commitment from `config.init_values` — the recursion guest's
 /// supplied roots skip the in-VM FFT + Merkle build (see `verify_global`).
 /// `None` recomputes from `config` as before.
-fn global_memory_air(
+pub(crate) fn global_memory_air(
     opts: &ProofOptions,
     config: &PageConfig,
     preprocessed: Option<Commitment>,
