@@ -47,13 +47,59 @@ Verifying epochs in isolation is not verifying a continuation. The chaining
 obligations, all of which the RV64 guest already performs and the machine will
 have to emit:
 
-- epoch *i*'s `reg_fini` equals epoch *i+1*'s supplied REGISTER root
-  (`build_epoch_airs` is the single prove/verify source of truth; the verifier
-  derives `register_init` from the entry point for epoch 0 and from the previous
-  epoch's `reg_fini` thereafter);
+- epoch *i*'s `reg_fini` feeds epoch *i+1*'s REGISTER root — a DERIVATION, not a
+  comparison, and nothing is supplied (see below);
 - L2G root equality between each epoch's own L2G commitment and the
   corresponding sub-proof in the global proof;
 - the attestation fold `program_id ‖ concatenated public_output`.
+
+### ★ The REGISTER derivation IS the binding — decided, not a TODO (R1g)
+
+The first obligation is often written as "compare `reg_fini` against the next
+epoch's supplied REGISTER root". There is no supplied root and no comparison.
+The chaining loop carries `register_init = epoch.reg_fini()` forward and
+`build_epoch_airs` (`continuation.rs:636`) *constructs* the next epoch's
+preprocessed commitment from it via
+`register::compute_precomputed_commitment_with_fini`. Lie about `reg_fini` and
+the constructed commitment no longer matches the one the proof was made against,
+so the proof fails. The binding is structural.
+
+This settles the long-carried Phase-0 item **"wire the REGISTER verify-side
+supply route"**. `VmAirs::new` does have a `register_preprocessed:
+Option<(Commitment, usize)>` parameter that every verify caller passes `None`
+to, so the plumbing looks like an unfinished route. It is not unfinished — it
+must stay unwired. **Computing the commitment from `reg_fini` is what ties the
+VALUES to the commitment.** Supply the root instead and `reg_fini` has no
+remaining role, so a prover can offer a root consistent with a `reg_fini` it
+never honoured, and the cross-epoch chain that `reg_fini` carries goes
+unenforced. The in-guest RV64 verifier's per-epoch recomputation is therefore
+load-bearing, not wasteful.
+
+Consequence for the machine: it must EMIT that derivation — 3 columns × 128
+rows, an inverse FFT and an LDE FFT each, then a full Merkle tree build. Its
+output is exactly the preprocessed root Phase A absorbs, which is why Phase A
+cannot be replayed over a real epoch without it. Cost is negligible: 255
+permutations at blowup 2 against ~1.4M for the epoch verify (~0.02%), 1023
+against ~460k at blowup 8 (~0.2%). See the sizing note below before quoting any
+ratio.
+
+### Sizing rule — compare against the WHOLE leg, never a sample of it
+
+Two gadget-sizing errors this phase produced ratios that were arithmetically
+correct and pointed the wrong way:
+
+1. **Rows are not a cost unit across chips.** An `LFM_BALU` row is 4
+   non-preprocessed columns; one keccak permutation expands into 24
+   `KECCAK_RND` rounds of 1480. Compare CELLS. (This killed the byteswap-chiplet
+   proposal: 322 cells vs 36,256, no crossover at any table width.)
+2. **A sample of a leg is not the leg.** The REGISTER tree was first sized
+   against R1f's opening program — 22 permutations — giving "12–46× the opening
+   leg" and the conclusion that it was expensive. But R1f was ONE query on ONE
+   table, roughly `1/(queries × tables)` of the epoch's opening work. Against the
+   whole epoch verify the same gadget is ~0.02%. Same number, opposite decision.
+
+Baseline to size against, from *Scale* below: **~1.4M keccak permutations per
+epoch verify at blowup 2 / 219 queries, ~460k at blowup 8 / 73 queries.**
 
 ## Consequence 4 — page-parameterized constraints are an identity risk
 
