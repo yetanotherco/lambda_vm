@@ -22,6 +22,7 @@ pub mod chunking;
 pub mod commit;
 pub mod compiler;
 pub mod constraints;
+pub mod deep;
 pub mod edsl;
 pub mod executor;
 pub mod fixture;

@@ -35,7 +35,7 @@ use super::constraints::{
 use super::executor::execute;
 use super::hash::TestPermutation;
 use super::validator::validate;
-use super::word::{LfmWord, ext_word, word_as_ext};
+use super::word::{LfmWord, base_word, ext_word, word_as_ext};
 
 type Gl = GoldilocksField;
 type Ext3 = GoldilocksExtension;
@@ -860,13 +860,18 @@ struct RealSubProof {
     table_offset: FEE,
     zeta: FEE,
     beta: FEE,
+    challenges: Challenges<Ext3>,
     claimed_parts: Vec<FEE>,
     quotient: QuotientShape,
 }
 
 /// Proves L2G_MEMORY — a real continuation table, and the only continuation AIR
 /// with genuine constraints — over a real boundary-claim trace.
-fn real_sub_proof() -> RealSubProof {
+///
+/// Returns the AIR alongside the proof because the DEEP differential needs both:
+/// its oracle is the production reconstruction, which takes the AIR's layout and
+/// the proof's own openings.
+fn real_fixture() -> (BoxedAir, MultiProof<Gl, Ext3, ()>) {
     use crate::tables::local_to_global::{
         CellBoundary, FiniClaim, InitClaim, generate_local_to_global_trace,
     };
@@ -900,7 +905,14 @@ fn real_sub_proof() -> RealSubProof {
     let proof = multi_prove_ram(pairs, &mut DefaultTranscript::<Ext3>::new(&[]))
         .expect("the L2G_MEMORY fixture must prove");
 
-    open_sub_proof(&air, &proof)
+    (Box::new(air), proof)
+}
+
+type BoxedAir = Box<dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = ()>>;
+
+fn real_sub_proof() -> RealSubProof {
+    let (air, proof) = real_fixture();
+    open_sub_proof(&*air, &proof)
 }
 
 /// Replays the production verifier's rounds over a real single-table proof and
@@ -1043,6 +1055,7 @@ fn open_sub_proof(
         table_offset,
         zeta: challenges.z,
         beta,
+        challenges,
         claimed_parts,
     }
 }
@@ -1538,5 +1551,453 @@ fn continuation_epoch_constraint_leg_cost() {
     assert!(
         intermediate < design_intermediate,
         "fusion must not make the leg more expensive"
+    );
+}
+
+// =============================================================================
+// The DEEP leg — differential against the production reconstruction
+// =============================================================================
+
+use super::deep::{DeepOpening, DeepShape, emit_deep_invariants, emit_deep_point};
+
+/// The DEEP shape and the γ challenge, read off a real proof's replayed
+/// challenges rather than modelled.
+fn deep_shape(
+    sp: &RealSubProof,
+    air: &dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = ()>,
+) -> (DeepShape, FEE) {
+    let layout = Verifier::ood_layout(air);
+    let (main_width, aux_width) = air.trace_layout();
+    let num_total_cols = main_width + aux_width;
+
+    let shape = DeepShape {
+        step_size: layout.step_size(),
+        num_eval_points: sp.num_steps * layout.step_size(),
+        num_total_cols,
+        next_row_cols: layout.next_row_cols().to_vec(),
+        num_composition_parts: sp.claimed_parts.len(),
+        log2_trace_length: sp.quotient.log2_trace_length,
+    };
+
+    // γ, recovered from the coefficient run and CHECKED against every entry the
+    // verifier built: coeff[c][r] is γ raised to a position-determined exponent,
+    // so if the emitter's exponent formula is wrong this assertion is what says
+    // so — not the differential, which would only say the answer differs.
+    let coeffs = &sp.challenges.trace_term_coeffs;
+    let gamma = coeffs[1][0];
+    #[allow(clippy::needless_range_loop)] // `row` is a column-index, not a row-index, into `coeffs`
+    for row in 0..shape.num_eval_points {
+        let (cols, start, stride) = shape.block_for_test(row);
+        for (k, &c) in cols.iter().enumerate() {
+            assert_eq!(
+                coeffs[c][row],
+                gamma.pow((start + k * stride) as u64),
+                "trace_term_coeffs[{c}][{row}] disagrees with the emitter's \
+                 exponent formula"
+            );
+        }
+        // Every column OUTSIDE the block must carry a zero coefficient — that is
+        // the pruning, and it is what makes folding the window alone exact.
+        if row >= shape.step_size {
+            for c in 0..num_total_cols {
+                if !cols.contains(&c) {
+                    assert_eq!(
+                        coeffs[c][row],
+                        FEE::zero(),
+                        "column {c} is pruned at row {row}"
+                    );
+                }
+            }
+        }
+    }
+    for (j, g) in sp.challenges.gammas.iter().enumerate() {
+        assert_eq!(
+            *g,
+            gamma.pow((shape.num_surviving() + j) as u64),
+            "composition gamma {j} must continue the same geometric run"
+        );
+    }
+
+    (shape, gamma)
+}
+
+/// ★ The machine's DEEP reconstruction equals the production verifier's, on a
+/// real proof's real query openings.
+///
+/// The oracle is `reconstruct_deep_composition_poly_evaluation_pair` itself,
+/// fed through `compute_query_invariant_deep_terms` — the exact pair of
+/// functions `verify_rounds_2_to_4` calls, with the exact values a real proof
+/// carries. Nothing about the algebra is transcribed into the test.
+#[test]
+fn deep_reconstruction_matches_the_production_verifier() {
+    let (air, proof) = real_fixture();
+    let sp = open_sub_proof(&*air, &proof);
+    let (shape, gamma) = deep_shape(&sp, &*air);
+
+    let view = StarkProofView::Owned(&proof.proofs[0]);
+    let layout = Verifier::ood_layout(&*air);
+    let invariants = Verifier::<Gl, Ext3, ()>::compute_query_invariant_deep_terms(
+        &sp.challenges,
+        view,
+        &sp.ood_full,
+        layout.next_row_cols(),
+        layout.step_size(),
+    )
+    .expect("a real proof's invariant terms");
+
+    let domain = new_verifier_domain(&*air, view.trace_length());
+    let generator = <Gl as math::field::traits::IsFFTField>::get_primitive_root_of_unity(
+        sp.quotient.log2_trace_length as u64,
+    )
+    .expect("root of unity");
+
+    let mut checked = 0usize;
+    for (q, iota) in sp.challenges.iotas.iter().enumerate() {
+        let opening = view.deep_poly_opening(q);
+        let precomputed: &[FE] = opening
+            .precomputed_trace_polys()
+            .map(|p| p.evaluations())
+            .unwrap_or(&[]);
+        let main = opening.main_trace_polys().evaluations();
+        let aux: &[FEE] = opening
+            .aux_trace_polys()
+            .map(|a| a.evaluations())
+            .unwrap_or(&[]);
+        let precomputed_sym: &[FE] = opening
+            .precomputed_trace_polys()
+            .map(|p| p.evaluations_sym())
+            .unwrap_or(&[]);
+        let main_sym = opening.main_trace_polys().evaluations_sym();
+        let aux_sym: &[FEE] = opening
+            .aux_trace_polys()
+            .map(|a| a.evaluations_sym())
+            .unwrap_or(&[]);
+
+        type V = Verifier<Gl, Ext3, ()>;
+        let point = V::query_challenge_to_evaluation_point(*iota, false, &domain);
+        let point_sym = V::query_challenge_to_evaluation_point(*iota, true, &domain);
+
+        // --- oracle ---
+        let (want, want_sym) = V::reconstruct_deep_composition_poly_evaluation_pair(
+            &point,
+            &point_sym,
+            &generator,
+            &sp.challenges,
+            &invariants,
+            layout.next_row_cols(),
+            layout.step_size(),
+            precomputed,
+            main,
+            aux,
+            opening.composition_poly().evaluations(),
+            precomputed_sym,
+            main_sym,
+            aux_sym,
+            opening.composition_poly().evaluations_sym(),
+        )
+        .expect("a real proof reconstructs");
+
+        // --- the machine ---
+        let trace: Vec<FEE> = precomputed
+            .iter()
+            .chain(main.iter())
+            .map(|v| v.to_extension::<Ext3>())
+            .chain(aux.iter().copied())
+            .collect();
+        let trace_sym: Vec<FEE> = precomputed_sym
+            .iter()
+            .chain(main_sym.iter())
+            .map(|v| v.to_extension::<Ext3>())
+            .chain(aux_sym.iter().copied())
+            .collect();
+        assert_eq!(trace.len(), shape.num_total_cols);
+
+        let ood_words: Vec<LfmWord> = (0..shape.num_eval_points)
+            .flat_map(|r| {
+                let row = sp.ood_full.get_row(r);
+                (0..shape.num_total_cols)
+                    .map(|c| ext_word(&row[c]))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        let mut b = LfmBuilder::new();
+        let words: Vec<LfmWord> = std::iter::once(ext_word(&gamma))
+            .chain(std::iter::once(ext_word(&sp.zeta)))
+            .chain(ood_words.iter().copied())
+            .chain(sp.claimed_parts.iter().map(ext_word))
+            .chain(std::iter::once(base_word(point)))
+            .chain(trace.iter().map(ext_word))
+            .chain(
+                opening
+                    .composition_poly()
+                    .evaluations()
+                    .iter()
+                    .map(ext_word),
+            )
+            .chain(std::iter::once(base_word(point_sym)))
+            .chain(trace_sym.iter().map(ext_word))
+            .chain(
+                opening
+                    .composition_poly()
+                    .evaluations_sym()
+                    .iter()
+                    .map(ext_word),
+            )
+            .collect();
+        let arena = b.declare_arena(words.len() as u32);
+        let mut idx = 0u32;
+        let mut take = |b: &mut LfmBuilder| {
+            let c = b.hint_word(arena, idx).as_ext();
+            idx += 1;
+            c
+        };
+        let g_cell = take(&mut b);
+        let z_cell = take(&mut b);
+        let ood_steps: Vec<Vec<_>> = (0..shape.num_eval_points)
+            .map(|_| (0..shape.num_total_cols).map(|_| take(&mut b)).collect())
+            .collect();
+        let parts: Vec<_> = (0..shape.num_composition_parts)
+            .map(|_| take(&mut b))
+            .collect();
+        let inv = emit_deep_invariants(&mut b, &shape, g_cell, z_cell, &ood_steps, &parts);
+
+        let read_opening = |b: &mut LfmBuilder, idx: &mut u32| {
+            let p = super::builder::Felt(b.hint_word(arena, *idx).addr());
+            *idx += 1;
+            let mut cells = Vec::with_capacity(shape.num_total_cols);
+            for _ in 0..shape.num_total_cols {
+                cells.push(b.hint_word(arena, *idx).as_ext());
+                *idx += 1;
+            }
+            let mut ps = Vec::with_capacity(shape.num_composition_parts);
+            for _ in 0..shape.num_composition_parts {
+                ps.push(b.hint_word(arena, *idx).as_ext());
+                *idx += 1;
+            }
+            DeepOpening {
+                point: p,
+                trace: cells,
+                parts: ps,
+            }
+        };
+        let regular = read_opening(&mut b, &mut idx);
+        let symmetric = read_opening(&mut b, &mut idx);
+        let got = emit_deep_point(&mut b, &shape, g_cell, &inv, &regular);
+        let got_sym = emit_deep_point(&mut b, &shape, g_cell, &inv, &symmetric);
+        b.public(got.as_cell());
+        b.public(got_sym.as_cell());
+
+        let program = compile(b.finish());
+        validate(&program).expect("the DEEP program is admissible");
+        let exec = execute(&program, &[words], &TestPermutation).expect("DEEP executes");
+        assert_eq!(
+            word_as_ext(&exec.public_words[0].1).expect("ext"),
+            want,
+            "query {q}: DEEP at the regular point"
+        );
+        assert_eq!(
+            word_as_ext(&exec.public_words[1].1).expect("ext"),
+            want_sym,
+            "query {q}: DEEP at the symmetric point"
+        );
+        assert_ne!(want, FEE::zero(), "query {q} must not be vacuously zero");
+
+        checked += 1;
+        if checked == 3 {
+            break;
+        }
+    }
+    assert!(checked > 0, "the fixture must carry at least one query");
+    println!("DEEP differential: {checked} queries, both points each");
+}
+
+/// ★ The coefficient-exponent formula holds where no production AIR reaches:
+/// `step_size = 2` with two next rows.
+///
+/// The DEEP differential above runs on L2G_MEMORY, and every production AIR has
+/// `step_size = 1` and a single next row — which collapses both strides to one.
+/// A plain Horner in γ would therefore pass every test we have. This one builds
+/// the verifier's own coefficient table at a wider step through
+/// `build_pruned_trace_term_coeffs` and checks the emitter against it, then
+/// shows the stride-1 reading DISAGREES. Without that second half the test would
+/// pass against the wrong emitter.
+#[test]
+fn the_coefficient_exponent_formula_holds_at_a_wider_step() {
+    use stark::ood::build_pruned_trace_term_coeffs;
+
+    const COLS: usize = 5;
+    const STEP: usize = 2;
+    const EVAL_POINTS: usize = 4; // two offsets x step 2
+    let next_row_cols = vec![1usize, 3];
+
+    let shape = DeepShape {
+        step_size: STEP,
+        num_eval_points: EVAL_POINTS,
+        num_total_cols: COLS,
+        next_row_cols: next_row_cols.clone(),
+        num_composition_parts: 2,
+        log2_trace_length: 4,
+    };
+    let surviving = shape.num_surviving();
+    assert_eq!(
+        surviving,
+        COLS * STEP + next_row_cols.len() * (EVAL_POINTS - STEP)
+    );
+
+    let gamma = FEE::new([FE::from(7u64), FE::from(11u64), FE::from(13u64)]);
+    let powers: Vec<FEE> = (0..surviving).map(|p| gamma.pow(p as u64)).collect();
+    let coeffs = build_pruned_trace_term_coeffs(&powers, COLS, EVAL_POINTS, STEP, &next_row_cols);
+
+    let mut stride_ever_exceeds_one = false;
+    let mut plain_horner_would_differ = false;
+
+    #[allow(clippy::needless_range_loop)] // `row` is a column-index, not a row-index, into `coeffs`
+    for row in 0..EVAL_POINTS {
+        let (cols, start, stride) = shape.block_for_test(row);
+        if stride > 1 {
+            stride_ever_exceeds_one = true;
+        }
+        for (k, &c) in cols.iter().enumerate() {
+            assert_eq!(
+                coeffs[c][row],
+                gamma.pow((start + k * stride) as u64),
+                "coeffs[{c}][{row}] disagrees with the emitter's (start {start}, \
+                 stride {stride}) formula"
+            );
+            // The falsification: what a stride-1 fold would have used.
+            if coeffs[c][row] != gamma.pow((start + k) as u64) {
+                plain_horner_would_differ = true;
+            }
+        }
+        // Pruned columns carry a zero coefficient on next rows.
+        if row >= STEP {
+            for c in 0..COLS {
+                if !cols.contains(&c) {
+                    assert_eq!(coeffs[c][row], FEE::zero(), "column {c} at row {row}");
+                }
+            }
+        }
+    }
+
+    assert!(
+        stride_ever_exceeds_one,
+        "the fixture must actually produce a stride above one"
+    );
+    assert!(
+        plain_horner_would_differ,
+        "a plain Horner in gamma must give a DIFFERENT coefficient here, or this \
+         test does not show the stride is load-bearing"
+    );
+}
+
+/// ★ What a DEEP query costs, per sub-proof and per epoch.
+///
+/// ### What this instrument cannot see
+///
+/// The query COUNT. It is a proof-options property (219 at blowup 2, 73 at
+/// blowup 8), not an AIR property, so the per-epoch line below is parameterised
+/// on it rather than measured. It also excludes the Merkle authentication of the
+/// openings this leg consumes, which is the R1f leg's cost, and the FRI folding
+/// that consumes this leg's output.
+#[test]
+fn deep_leg_cost() {
+    /// Queries at blowup 2 — stated, not measured here.
+    const QUERIES: usize = 219;
+
+    let opts = options();
+    let airs = production_airs(&opts);
+
+    println!("\nDEEP cost per query point, by AIR");
+    println!(
+        "{:<14} {:>6} {:>7} {:>6} {:>9} {:>10}",
+        "table", "cols", "window", "parts", "rows/pt", "rows/query"
+    );
+
+    let mut total_per_query = 0usize;
+    for (label, air) in &airs {
+        let artifact = ConstraintArtifact::capture(&**air);
+        let layout = Verifier::<Gl, Ext3, ()>::ood_layout(&**air);
+        let (main_width, aux_width) = air.trace_layout();
+        let shape = DeepShape {
+            step_size: layout.step_size(),
+            num_eval_points: artifact.shape.transition_offsets.len() * layout.step_size(),
+            num_total_cols: main_width + aux_width,
+            next_row_cols: layout.next_row_cols().to_vec(),
+            num_composition_parts: artifact.shape.composition_degree_multiplier as usize,
+            log2_trace_length: 20,
+        };
+
+        // Measure by emitting, twice, and differencing out the plumbing.
+        let plumb = |b: &mut LfmBuilder| {
+            let n = 2
+                + shape.num_eval_points * shape.num_total_cols
+                + 2 * shape.num_composition_parts
+                + shape.num_total_cols
+                + 1;
+            let arena = b.declare_arena(n as u32);
+            let mut i = 0u32;
+            let mut take = |b: &mut LfmBuilder| {
+                let c = b.hint_word(arena, i).as_ext();
+                i += 1;
+                c
+            };
+            let g = take(b);
+            let z = take(b);
+            let steps: Vec<Vec<_>> = (0..shape.num_eval_points)
+                .map(|_| (0..shape.num_total_cols).map(|_| take(b)).collect())
+                .collect();
+            let parts: Vec<_> = (0..shape.num_composition_parts).map(|_| take(b)).collect();
+            let trace: Vec<_> = (0..shape.num_total_cols).map(|_| take(b)).collect();
+            let qparts: Vec<_> = (0..shape.num_composition_parts).map(|_| take(b)).collect();
+            let point = super::builder::Felt(take(b).addr());
+            (g, z, steps, parts, trace, qparts, point)
+        };
+
+        let mut bare = LfmBuilder::new();
+        let _ = plumb(&mut bare);
+        let baseline = bare.finish().instrs.len();
+
+        let mut inv_only = LfmBuilder::new();
+        let (g, z, steps, parts, _, _, _) = plumb(&mut inv_only);
+        let _ = emit_deep_invariants(&mut inv_only, &shape, g, z, &steps, &parts);
+        let invariant_rows = inv_only.finish().instrs.len() - baseline;
+
+        let mut full = LfmBuilder::new();
+        let (g, z, steps, parts, trace, qparts, point) = plumb(&mut full);
+        let inv = emit_deep_invariants(&mut full, &shape, g, z, &steps, &parts);
+        emit_deep_point(
+            &mut full,
+            &shape,
+            g,
+            &inv,
+            &DeepOpening {
+                point,
+                trace,
+                parts: qparts,
+            },
+        );
+        let point_rows = full.finish().instrs.len() - baseline - invariant_rows;
+
+        let per_query = 2 * point_rows;
+        total_per_query += per_query;
+        println!(
+            "{:<14} {:>6} {:>7} {:>6} {:>9} {:>10}",
+            label,
+            shape.num_total_cols,
+            shape.next_row_cols.len(),
+            shape.num_composition_parts,
+            point_rows,
+            per_query
+        );
+    }
+
+    println!(
+        "\nSum over all 28 AIRs, one query each (both points): {total_per_query} rows.\n\
+         At {QUERIES} queries that is {} rows if every AIR appeared once — an\n\
+         ORDER-OF-MAGNITUDE figure, not an epoch: an epoch's sub-proof set is not\n\
+         the 28-AIR set, and this excludes the Merkle authentication of these same\n\
+         openings and the FRI folding that consumes the result.",
+        total_per_query * QUERIES
     );
 }
