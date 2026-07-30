@@ -11,12 +11,16 @@ edition = "2024"
 # so the generated ProgramInput rkyv layout matches what the guest deserializes.
 ethrex-common = { git = "https://github.com/lambdaclass/ethrex.git", rev = "156cb8d6a3974f411d71622eecd1b249ee37ff1c", package = "ethrex-common", default-features = false }
 ethrex-config = { git = "https://github.com/lambdaclass/ethrex.git", rev = "156cb8d6a3974f411d71622eecd1b249ee37ff1c", package = "ethrex-config", default-features = false }
-# `default-features = false, features = ["lambdavm"]` mirrors the guest
-# (executor/programs/rust/ethrex/Cargo.toml) exactly, so the parity test below
-# executes the block against the same precompile surface the guest has — most
-# importantly WITHOUT KZG, which `lambdavm` does not link (only `sp1` pulls
-# `ethrex-crypto/kzg-rs`). Under the default `secp256k1` feature the test would
-# silently exercise a richer set of precompiles than the guest actually ships.
+# Matches the guest's own declaration (executor/programs/rust/ethrex/Cargo.toml).
+#
+# CAVEAT: this line alone does NOT reproduce the guest's precompile surface. The
+# `ethrex-config` dep above pulls `ethrex-p2p`, whose `default = ["c-kzg"]`
+# propagates to `ethrex-crypto/c-kzg` — and `default-features = false` cannot
+# switch it off, because ethrex's own workspace declares `ethrex-p2p` with its
+# defaults on. So this graph links a working c-kzg (and malachite modexp, and
+# `ark-ff/asm` BN254) that the guest does not have; verify with
+# `cargo tree -e features -i ethrex-crypto`. Closing that gap means dropping
+# `ethrex-config` and sourcing `ChainConfig` another way — see the README.
 ethrex-guest-program = { git = "https://github.com/lambdaclass/ethrex.git", rev = "156cb8d6a3974f411d71622eecd1b249ee37ff1c", package = "ethrex-guest-program", default-features = false, features = ["lambdavm"] }
 
 # Exact pin: the fixture writer and the guest/executor readers must agree on the
@@ -26,9 +30,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [dev-dependencies]
-# The very `Crypto` impl the guest injects. On host its keccak/ECSM accelerator
-# paths fall back to the same pure-Rust routines, so executing with it here
-# reproduces the guest's crypto semantics without needing an RV64 toolchain.
+# The `Crypto` impl the guest injects. Off riscv64 its keccak and ECSM paths
+# both fall back to software, so this exercises the guest's *fallback* crypto
+# semantics — not the accelerators themselves.
 lambda-vm-ethrex-crypto = { path = "../../crypto/ethrex-crypto" }
 sha2 = "0.10"
 

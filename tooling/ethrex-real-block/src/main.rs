@@ -100,16 +100,21 @@ mod tests {
 
     const CACHE: &str = "caches/cache_hoodi_1265656.json";
 
-    /// Executes the converted block against the guest's exact precompile
-    /// surface: `ethrex-guest-program` with `default-features = false,
-    /// features = ["lambdavm"]` (see Cargo.toml) plus `LambdaVmEcsmCrypto`,
-    /// the same `Crypto` impl the guest injects.
+    /// Executes the converted block with `LambdaVmEcsmCrypto`, the `Crypto` impl
+    /// the guest injects, so the block is exercised through the same trait
+    /// dispatch the guest uses. Stateless re-execution ends in a post-state-root
+    /// check, so any divergence from consensus fails here — on the host, with no
+    /// RV64 toolchain and no proving run.
     ///
-    /// This is the screen for "does the block need an accelerator we don't
-    /// have". Stateless re-execution ends in a post-state-root check, so a
-    /// block reaching an unlinked precompile — KZG point evaluation (0x0a) is
-    /// the one `lambdavm` omits — diverges from consensus and fails here,
-    /// on the host, without needing an RV64 toolchain or a proving run.
+    /// This is NOT a complete guest-precompile screen, despite what an earlier
+    /// version of this comment claimed. This crate's dependency graph links
+    /// `c-kzg` (via `ethrex-config` → `ethrex-p2p`, see Cargo.toml), so KZG point
+    /// evaluation (0x0a) resolves to a working implementation here while the
+    /// guest has none. A block calling 0x0a would pass this test.
+    ///
+    /// What does screen 0x0a today is `test_ethrex_real_block_native` in
+    /// `tooling/ethrex-tests`, whose graph happens to link no KZG backend at all
+    /// — accidentally, and enforced by `no_kzg_backend_linked` there.
     #[test]
     fn real_block_executes_under_guest_crypto() {
         use ethrex_guest_program::l1::execution_program;
@@ -125,6 +130,8 @@ mod tests {
     /// fixture (and its README checksum) needs regenerating.
     #[test]
     fn conversion_is_reproducible() {
+        use sha2::Digest;
+
         let (program_input, summary) = program_input_from_cache(CACHE).unwrap();
         let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&program_input).unwrap();
 
@@ -132,14 +139,16 @@ mod tests {
         assert_eq!(summary.transactions, 11);
         assert_eq!(summary.gas_used, 4_402_947);
 
-        // Pin the exact serialized bytes, not just length: HashMap iteration order
-        // could vary the output while keeping size fixed.
-        let expected: [u8; 32] = [
-            0x1f, 0x7d, 0x4c, 0x4c, 0xdf, 0x9b, 0xd5, 0x24,
-            0x72, 0xd9, 0xeb, 0xaf, 0xdb, 0x40, 0x38, 0xf5,
-            0x7a, 0x88, 0xc3, 0xc9, 0x2d, 0x65, 0xc9, 0x6f,
-            0xd8, 0x6d, 0x7e, 0x32, 0x3d, 0xb8, 0x71, 0x42,
-        ];
-        assert_eq!(sha2::Sha256::digest(&bytes).as_slice(), expected);
+        // Digest, not length: a layout change can preserve the byte count exactly
+        // (`ChainConfig` is fixed-size, and rkyv's `big_endian` feature would only
+        // byte-swap in place), so `len()` cannot pin the archived form.
+        let digest: String = sha2::Sha256::digest(&bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(
+            digest, "1f7d4c4cdf9bd52472d9ebafdb4038f57a88c3c92d65c96fd86d7e323db87142",
+            "fixture bytes changed — regenerate it and update the README checksum",
+        );
     }
 }

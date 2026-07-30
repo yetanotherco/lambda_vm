@@ -110,18 +110,28 @@ version-tolerant JSON instead of a pinned binary is the mitigation.
 Three checks, cheapest first. The first two run on the host in milliseconds and
 need no RV64 toolchain.
 
-**`cargo test` here — `real_block_executes_under_guest_crypto`.** The screen for
-*"does this block need an accelerator we don't have?"*. It builds
-`ethrex-guest-program` with `default-features = false, features = ["lambdavm"]`
-and executes with `LambdaVmEcsmCrypto` — byte-for-byte the guest's own
-configuration. Stateless re-execution ends in a post-state-root check, so a
-block reaching a precompile the guest doesn't link diverges from consensus and
-fails here. KZG point evaluation (0x0a) is the notable omission: `lambdavm` does
-not pull `ethrex-crypto/kzg-rs` (only `sp1` does).
+**`cargo test` here — `real_block_executes_under_guest_crypto`.** Executes the
+block through `LambdaVmEcsmCrypto`, the `Crypto` impl the guest injects, so it is
+exercised via the guest's own trait dispatch. Stateless re-execution ends in a
+post-state-root check, so any divergence from consensus fails here.
 
-Getting this configuration right matters. Under the default `secp256k1` feature
-the same test passes while exercising a *richer* precompile set than the guest
-ships — green, and meaningless.
+**It is not a full guest-precompile screen.** Declaring
+`ethrex-guest-program` with `default-features = false, features = ["lambdavm"]`
+is necessary but not sufficient: the `ethrex-config` dependency (used only for
+`Network::get_genesis()`) pulls `ethrex-p2p`, whose `default = ["c-kzg"]`
+propagates down to `ethrex-crypto/c-kzg`, and `default-features = false` cannot
+switch it off because ethrex's own workspace declares `ethrex-p2p` with defaults
+on. Verify with `cargo tree -e features -i ethrex-crypto`. Consequences: KZG
+point evaluation (0x0a) resolves to a working c-kzg here but to nothing in the
+guest; modexp runs malachite here and num-bigint there; BN254 gets `ark-ff/asm`.
+
+Closing that gap means dropping `ethrex-config` and sourcing `ChainConfig`
+another way, which is a design change — tracked as follow-up, not done here.
+
+**What screens 0x0a today** is `test_ethrex_real_block_native` in
+`tooling/ethrex-tests`, whose graph links no KZG backend at all. That was
+incidental to its dependencies, so `no_kzg_backend_linked` in the same file now
+asserts it and will go red if anything pulls a backend in.
 
 **`cargo test` here — `conversion_is_reproducible`.** Pins the block's stats and
 the serialized length, so an ethrex rev bump that moves the rkyv layout is

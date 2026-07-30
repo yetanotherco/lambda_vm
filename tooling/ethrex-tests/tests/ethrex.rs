@@ -98,11 +98,14 @@ const REAL_BLOCK_FIXTURE: &str = "ethrex_hoodi_1265656.bin";
 ///
 /// Checks the *serialized artifact* specifically — that the committed rkyv
 /// bytes deserialize and execute — which is why it reads the `.bin` rather
-/// than converting the cache itself. It runs under `NativeCrypto` (ethrex's
-/// full precompile set) because this crate builds `ethrex-guest-program` with
-/// default features, so it does NOT speak to the guest's reduced surface;
-/// `tooling/ethrex-real-block`'s `real_block_executes_under_guest_crypto`
-/// covers that, under `lambdavm` features + `LambdaVmEcsmCrypto`.
+/// than converting the cache itself.
+///
+/// It is also, in practice, the check that the block needs no KZG: this crate's
+/// dependency graph links no KZG backend, so a block calling point evaluation
+/// (0x0a) diverges from consensus here and fails. That property is incidental to
+/// the dep graph rather than declared, so `no_kzg_backend_linked` below pins it.
+/// (`tooling/ethrex-real-block`'s parity test does NOT cover 0x0a — it links
+/// `c-kzg` transitively via `ethrex-config`.)
 #[test]
 fn test_ethrex_real_block_native() {
     use ethrex_guest_program::crypto::NativeCrypto;
@@ -112,6 +115,24 @@ fn test_ethrex_real_block_native() {
     let inputs = std::fs::read(format!("{FIXTURES_DIR}/{REAL_BLOCK_FIXTURE}")).unwrap();
     let input = rkyv::from_bytes::<ProgramInput, Error>(&inputs).unwrap();
     execution_program(input, Arc::new(NativeCrypto)).unwrap();
+}
+
+/// Pins the property the test above leans on: this crate's dependency graph must
+/// link no KZG backend, so a block calling point evaluation (0x0a) diverges from
+/// consensus and fails rather than passing on a surface the guest doesn't have.
+/// If a future dependency pulls `c-kzg` or `kzg-rs` in, this goes red instead of
+/// the screen silently disappearing.
+#[test]
+fn no_kzg_backend_linked() {
+    use ethrex_guest_program::crypto::{Crypto, NativeCrypto};
+    let err = NativeCrypto
+        .verify_kzg_proof(&[0u8; 32], &[0u8; 32], &[0u8; 48], &[0u8; 48])
+        .expect_err("a KZG backend is linked: verify_kzg_proof succeeded on zero input");
+    assert!(
+        format!("{err:?}").contains("unimplemented"),
+        "a KZG backend got linked into ethrex-tests, so test_ethrex_real_block_native \
+         no longer screens precompile 0x0a: {err:?}"
+    );
 }
 
 /// The same real block through the guest ELF, checking the VM's committed
