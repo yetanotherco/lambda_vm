@@ -692,6 +692,95 @@ fn epoch_chunk_multiplier() {
     }
 }
 
+/// The constraint leg for a real CONTINUATION EPOCH — the shape we actually
+/// recurse.
+///
+/// The monolithic measurement above is the wrong shape for the target: a
+/// continuation epoch passes `page_configs = &[]`, so PAGE never appears, and it
+/// carries an L2G_MEMORY sub-proof instead. Its composition is
+///
+/// ```text
+///   14 split-table families (>= 1 chunk each)
+/// + FIXED_TABLE_COUNT       (10 final, 9 intermediate — HALT only on the last)
+/// + 1 L2G_MEMORY
+/// ```
+///
+/// which gives **24 sub-proofs intermediate, 25 final** — independently measured
+/// on the LFM fibonacci epoch fixture. This test asserts that arithmetic so the
+/// composition is pinned rather than inferred: if the epoch shape changes, the
+/// count here stops matching the measured one and this fails.
+///
+/// The instruction total is then a minimum, since it assumes one chunk per
+/// family — a larger epoch adds chunks of the CHEAP AIRs (see
+/// `epoch_chunk_multiplier`).
+#[test]
+fn continuation_epoch_constraint_leg() {
+    let opts = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
+    let instr: std::collections::BTreeMap<&str, usize> = production_airs(&opts)
+        .iter()
+        .map(|(label, air)| (*label, leg_instructions(&**air)))
+        .collect();
+    let get = |k: &str| *instr.get(k).unwrap_or_else(|| panic!("no AIR {k}"));
+
+    // The 14 chunked split-table families, at their minimum of one chunk each.
+    let families = [
+        "CPU", "LT", "SHIFT", "MEMW", "MEMW_A", "LOAD", "MUL", "DVRM", "BRANCH", "MEMW_R", "EQ",
+        "BYTEWISE", "STORE", "CPU32",
+    ];
+    // FIXED_TABLE_COUNT = 10 (`prover/src/lib.rs`): always exactly one sub-proof
+    // each, REGARDLESS of TableCounts — a zero-row table still needs its proof,
+    // or its constraints drop out of verification. HALT is the one an
+    // intermediate epoch omits.
+    let fixed_final = [
+        "BITWISE",
+        "DECODE",
+        "HALT",
+        "COMMIT",
+        "KECCAK",
+        "KECCAK_RND",
+        "KECCAK_RC",
+        "REGISTER",
+        "ECSM",
+        "ECDAS",
+    ];
+
+    let families_instr: usize = families.iter().map(|l| get(l)).sum();
+    let fixed_final_instr: usize = fixed_final.iter().map(|l| get(l)).sum();
+    let fixed_intermediate_instr = fixed_final_instr - get("HALT");
+    let l2g = get("L2G_MEMORY");
+
+    let intermediate = families_instr + fixed_intermediate_instr + l2g;
+    let final_epoch = families_instr + fixed_final_instr + l2g;
+
+    let n_intermediate = families.len() + fixed_final.len() - 1 + 1;
+    let n_final = families.len() + fixed_final.len() + 1;
+    assert_eq!(
+        (n_intermediate, n_final),
+        (24, 25),
+        "epoch sub-proof composition no longer reproduces the measured 24 intermediate / 25 final"
+    );
+
+    println!(
+        "\ncontinuation epoch constraint leg (minimum: one chunk per family)\n  \
+           14 split families      {families_instr}\n  \
+           9 fixed (no HALT)      {fixed_intermediate_instr}\n  \
+           1 L2G_MEMORY           {l2g}\n  \
+           INTERMEDIATE epoch     {intermediate} instr over {n_intermediate} sub-proofs\n  \
+           FINAL epoch (+HALT)    {final_epoch} instr over {n_final} sub-proofs\n  \
+           fixed share            {:.0}% — the leg is workload-INDEPENDENT\n",
+        100.0 * fixed_intermediate_instr as f64 / intermediate as f64
+    );
+
+    // The global proof is one L2G_GLOBAL per epoch plus one GLOBAL_MEMORY per
+    // touched page — negligible at any plausible page count, which is what
+    // settles the page-base question as identity-only rather than size.
+    println!(
+        "  global proof: {} instr/epoch (L2G_GLOBAL) + {} instr/page (GLOBAL_MEMORY)\n",
+        get("L2G_GLOBAL"),
+        get("GLOBAL_MEMORY")
+    );
+}
+
 /// Constraint-leg instructions for one AIR: extension ALU plus MulBase-routed
 /// multiplies. Shared by `constraint_op_census` and `epoch_chunk_multiplier` so
 /// the two cannot drift apart.

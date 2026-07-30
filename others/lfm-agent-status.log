@@ -43,3 +43,8 @@
 [phase0]   epoch_label is NOT symmetric with page_base: it is verifier-derived from enumerate() position, no supply route to get wrong. My "move them together, same risk" recommendation was wrong; revised to epoch_label-first as lower risk.
 [phase0]   Page counts from the gate trace: 11 distinct ELF page bases (PT_LOAD headers, 1<<18) + 1 private-input page per fixture. Continuation touched-set size NOT recorded, NOT statically derivable — labelled inference.
 [phase0]   Hash-consing-vs-fusion trap moved into the CODE (crypto/stark/src/constraint_ir/artifact.rs, ConstraintArtifact doc) per ruling, not just the design doc.
+[phase0] 2026-07-30 slice 7 — continuation-epoch leg computed and PINNED against the measured 24/25 sub-proof count.
+[phase0]   NEW: continuation_epoch_constraint_leg. INTERMEDIATE epoch 63,393 instr over 24 sub-proofs; FINAL 64,094 over 25. Composition = 14 split families (3,640, min 1 chunk each) + 9 fixed no-HALT (59,688) + 1 L2G_MEMORY (65). Test ASSERTS the 24/25 count so the shape is pinned, not inferred — if the epoch composition changes the arithmetic stops matching and it fails.
+[phase0]   94% of the epoch leg is the fixed block => sharpest statement of the workload-independence correction.
+[phase0]   Global proof: 27 instr/epoch (L2G_GLOBAL) + 25 instr/page (GLOBAL_MEMORY) — settles page-base as identity-only, never size.
+[phase0]   REMAINING INFERENCE (narrowed): chunk GROWTH for a large continuation epoch is still monolithic-derived. Shape of growth is the same (cheap AIRs chunk, expensive ones do not) so ~96K is the ceiling, but the exact continuation curve is not run.

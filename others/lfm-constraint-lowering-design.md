@@ -38,11 +38,12 @@ Three corrections to how the number should be read:
    dims understates extension traffic by 14×.
 2. **Constants are interned program-wide**, so the 655 per-AIR pooled constants
    are **315** actual `Const` rows (§4.2).
-3. **57,583 is per distinct AIR.** The per-EPOCH figure is now measured (§8.2):
-   **≈65K at 1–2M cycles, ≈96K at 20M**, a 1.01–1.49× multiplier. Small, because
-   chunking multiplies the cheap AIRs while the expensive ones are never chunked.
-   §8.2.1 corrects an earlier claim of mine that the leg is workload-shaped — it
-   is not, and the architecture says so.
+3. **57,583 is per distinct AIR.** For the shape we actually recurse — a
+   CONTINUATION EPOCH — the leg is **63,393 instructions over 24 sub-proofs**
+   (intermediate) or 64,094 over 25 (final), against a measured sub-proof count
+   (§8.2.2). Larger epochs grow to ≈96K as cheap AIRs chunk (§8.2). §8.2.1
+   corrects an earlier claim of mine that the leg is workload-shaped — it is not,
+   and the architecture says so.
 
 **Nothing in the IR is structurally inexpressible on a straight-line machine.**
 The IR is already in precisely the form the machine's soundness argument demands
@@ -421,20 +422,41 @@ instruction mix. That is a better property to have — the leg is predictable �
 I asserted the reverse from the census alone without checking how sub-proofs are
 actually assembled, and the census cannot see that.
 
-### 8.2.2 Continuation epochs specifically
+### 8.2.2 The continuation epoch — the shape we actually recurse
 
-The table above is the monolithic shape. A continuation epoch differs in three
-small ways, none of which changes the magnitude:
+The table above is the monolithic shape, which is the wrong one for the target.
+A continuation epoch differs in three ways:
 
-- **PAGE does not appear.** Continuation epochs pass `page_configs = &[]`
-  (`continuation.rs:693`, `:797`, enforced prover-side at `:677-681`), so the
-  41-instruction-per-page term vanishes from the epoch proof.
+- **PAGE does not appear.** Epochs pass `page_configs = &[]`
+  (`continuation.rs:693`, `:797`, enforced prover-side at `:677-681`), so
+  `create_page_air` is never called and the per-page term vanishes.
 - **One L2G_MEMORY sub-proof** per epoch: +65 instructions.
-- **Intermediate epochs drop HALT** (9 fixed tables, not 10): −701 instructions.
+- **Intermediate epochs drop HALT** (9 fixed tables, not 10): −701.
+
+Composition and totals, computed by `continuation_epoch_constraint_leg`:
+
+```
+14 split families (>= 1 chunk each)      3,640
+ 9 fixed, no HALT                       59,688
+ 1 L2G_MEMORY                               65
+INTERMEDIATE epoch                      63,393 instr over 24 sub-proofs
+FINAL epoch (+HALT)                     64,094 instr over 25 sub-proofs
+```
+
+**The 24/25 sub-proof count is independently measured** on the LFM fibonacci
+epoch fixture, and the test asserts that this composition reproduces it — so the
+shape is pinned rather than inferred. If the epoch shape changes, the arithmetic
+stops matching and the test fails.
+
+**94% of it is the fixed block**, which is the sharpest statement of §8.2.1: the
+constraint leg for a continuation epoch is ≈63K instructions essentially
+regardless of what the workload does, growing only with epoch size as cheap AIRs
+chunk.
 
 The global proof carries one L2G_GLOBAL per epoch (27 each) plus one
 GLOBAL_MEMORY per touched page (25 each) — negligible at any plausible page
-count.
+count, which is what settles the page-base question as an identity problem rather
+than a size one.
 
 ### 8.3 Against the design doc's claim
 
@@ -490,10 +512,13 @@ a subtract from zero (§2.1). A lowering detail, not a structural obstacle.
 
 ## 10. What I did not verify
 
-- **A continuation-epoch fixture.** §8.2's multiplier is measured on MONOLITHIC
-  runs; §8.2.2 derives the continuation differences by reading the code rather
-  than by running one. The differences are small and structural, but they are
-  inferred.
+- **Chunk growth for a LARGE continuation epoch.** §8.2.2's 63,393 assumes the
+  minimum one chunk per family, and its 24/25 sub-proof count is measured. What
+  is still monolithic-derived is §8.2's growth curve — how many chunks a
+  multi-million-cycle epoch actually produces. The shape of that growth is the
+  same (cheap AIRs chunk, expensive ones do not), so the ceiling is ≈96K, but
+  the exact per-epoch curve for the continuation path is inferred from
+  monolithic runs.
 - **The machine-side cost facts listed in §2.3**, taken from the ISA inventory
   rather than read by me. The instruction counts survive if any is wrong; the row
   and cell conclusions do not.
