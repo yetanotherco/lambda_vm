@@ -16,7 +16,10 @@ const WORD_SIZE: usize = 4;
 // sponge's differential tests) the attribute would hijack the test harness's
 // allocator with a never-initialized heap and abort.
 
+// Off riscv only `init` is reachable (no `#[global_allocator]` is installed and
+// `sys_alloc_aligned` goes through `std::alloc`), so the dlmalloc plumbing is dead there.
 #[cfg(not(feature = "tlsf-alloc"))]
+#[cfg_attr(not(target_arch = "riscv64"), allow(dead_code))]
 mod imp {
     use core::alloc::{GlobalAlloc, Layout};
     use core::cell::RefCell;
@@ -42,13 +45,22 @@ mod imp {
 
     unsafe impl Allocator for BumpSystem {
         fn alloc(&self, size: usize) -> (*mut u8, usize, u32) {
-            // Round up to a page so consecutive segments stay page-aligned.
-            let size = size.wrapping_add(PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+            // Round up to a page so consecutive segments stay page-aligned. Checked, so
+            // a size near `usize::MAX` declines instead of wrapping to a small one.
+            let Some(size) = size
+                .checked_add(PAGE_SIZE - 1)
+                .map(|rounded| rounded & !(PAGE_SIZE - 1))
+            else {
+                return (core::ptr::null_mut(), 0, 0);
+            };
             let pos = HEAP_POS.load(Ordering::Relaxed);
             match pos.checked_add(size) {
                 Some(new_pos) if new_pos <= HEAP_END.load(Ordering::Relaxed) => {
                     HEAP_POS.store(new_pos, Ordering::Relaxed);
-                    // flags = 0: a plain external segment (never partially released).
+                    // flags = 0: no `EXTERN` bit, so dlmalloc may coalesce a new segment
+                    // onto the previous one (ours are contiguous, so it usually just
+                    // extends `top`). Releasing is gated on `can_release_part` below,
+                    // which declines, so `sys_trim`/`release_unused_segments` are no-ops.
                     (pos as *mut u8, size, 0)
                 }
                 // Out of heap → null makes dlmalloc return null → handle_alloc_error.
@@ -73,9 +85,15 @@ mod imp {
         }
 
         fn allocates_zeros(&self) -> bool {
-            // Guest memory is zero-initialized and this provider never reuses a
-            // segment, so system-fresh bytes read as 0 → dlmalloc's calloc skips the
-            // memset for system-fresh memory (it still zeroes recycled blocks itself).
+            // Guest memory is zero-initialized and this provider never reuses a segment,
+            // so system-fresh bytes read as 0. dlmalloc consults this only in
+            // `calloc_must_clear` = `!allocates_zeros() || !mmapped(chunk)`, i.e. it may
+            // skip calloc's memset only for a chunk it marked mmapped. Two independent
+            // reasons that is safe here: the Rust port has no mmap path at all (nothing
+            // ever sets the mmapped marker, so calloc always zeroes), and even if it
+            // grew one, freeing an mmapped chunk whose system `free` declines drops the
+            // chunk instead of re-binning it — so a recycled block is never mmapped.
+            // Locked by `calloc_zeroes_recycled_dirty_blocks` below.
             true
         }
 
@@ -137,6 +155,170 @@ mod imp {
                     new_size,
                 )
             })
+        }
+    }
+
+    // Host tests for the provider and for dlmalloc's behaviour on top of it. They drive
+    // a local `Dlmalloc<BumpSystem>` rather than the `DLMALLOC` static: the static's
+    // `critical_section::with` has no implementation off riscv (the impl comes from
+    // `riscv`'s `critical-section-single-hart`), and a local instance exercises the same
+    // allocator code. `BumpSystem`'s cursor is global, so the tests serialize on
+    // `HEAP_LOCK` and each re-points it at its own leaked, page-aligned buffer.
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::sync::{Mutex, MutexGuard};
+
+        static HEAP_LOCK: Mutex<()> = Mutex::new(());
+
+        // Leaks on purpose: the buffer must outlive every pointer dlmalloc derives from
+        // it, and `BumpSystem` hands segments out by raw address.
+        fn with_heap(bytes: usize) -> (MutexGuard<'static, ()>, Dlmalloc<BumpSystem>) {
+            let guard = HEAP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let layout = core::alloc::Layout::from_size_align(bytes, PAGE_SIZE).unwrap();
+            // Zeroed, like guest memory: reads of never-written heap return 0 there.
+            let base = unsafe { std::alloc::alloc_zeroed(layout) };
+            assert!(!base.is_null());
+            init(base as usize, base as usize + bytes);
+            (guard, Dlmalloc::new_with_allocator(BumpSystem))
+        }
+
+        fn layout(size: usize) -> (usize, usize) {
+            (size, core::mem::align_of::<usize>())
+        }
+
+        /// The load-bearing consequence of `allocates_zeros() == true`: dlmalloc's
+        /// `calloc` may skip its memset when it believes a block is system-fresh, so
+        /// recycling a dirtied block through `calloc` must still come back zeroed.
+        /// Checked at a small size and at one past dlmalloc's 64 KiB granularity (the
+        /// size class the C original would serve from a fresh mmap).
+        #[test]
+        fn calloc_zeroes_recycled_dirty_blocks() {
+            for size in [64usize, 512 * 1024] {
+                let (_guard, mut dl) = with_heap(8 * 1024 * 1024);
+                let (sz, al) = layout(size);
+
+                let dirty = unsafe { dl.malloc(sz, al) };
+                assert!(!dirty.is_null(), "malloc({size}) failed");
+                unsafe { core::ptr::write_bytes(dirty, 0xAA, size) };
+                unsafe { dl.free(dirty, sz, al) };
+
+                let fresh = unsafe { dl.calloc(sz, al) };
+                assert!(!fresh.is_null(), "calloc({size}) failed");
+                let bytes = unsafe { core::slice::from_raw_parts(fresh, size) };
+                assert!(
+                    bytes.iter().all(|&b| b == 0),
+                    "calloc({size}) returned dirty memory: {} non-zero bytes",
+                    bytes.iter().filter(|&&b| b != 0).count()
+                );
+            }
+        }
+
+        /// What dlmalloc buys over a raw bump allocator: churn is served out of freed
+        /// blocks, so a heap far smaller than the total allocated volume never runs out.
+        #[test]
+        fn freed_blocks_are_reused_so_churn_does_not_exhaust_the_heap() {
+            let (_guard, mut dl) = with_heap(1024 * 1024);
+            let (sz, al) = layout(4096);
+            // 40 MiB of traffic through a 1 MiB heap.
+            for i in 0..10_000 {
+                let p = unsafe { dl.malloc(sz, al) };
+                assert!(!p.is_null(), "malloc failed on iteration {i} — no reuse");
+                unsafe { dl.free(p, sz, al) };
+            }
+        }
+
+        #[test]
+        fn segments_are_page_aligned_disjoint_and_page_rounded() {
+            let (_guard, _dl) = with_heap(1024 * 1024);
+            let (first, first_size, flags) = BumpSystem.alloc(PAGE_SIZE + 1);
+            assert!(!first.is_null());
+            assert_eq!(flags, 0);
+            assert_eq!(first as usize % PAGE_SIZE, 0);
+            assert_eq!(first_size, 2 * PAGE_SIZE, "size must round up to a page");
+
+            let (second, second_size, _) = BumpSystem.alloc(1);
+            assert_eq!(second as usize % PAGE_SIZE, 0);
+            assert_eq!(second_size, PAGE_SIZE);
+            assert_eq!(
+                second as usize,
+                first as usize + first_size,
+                "segments must be contiguous and non-overlapping"
+            );
+        }
+
+        #[test]
+        fn provider_declines_instead_of_handing_out_memory_past_the_heap() {
+            let (_guard, _dl) = with_heap(2 * PAGE_SIZE);
+            assert!(!BumpSystem.alloc(PAGE_SIZE).0.is_null());
+            assert!(!BumpSystem.alloc(PAGE_SIZE).0.is_null());
+            let (ptr, size, _) = BumpSystem.alloc(1);
+            assert!(ptr.is_null(), "handed out memory past HEAP_END");
+            assert_eq!(size, 0);
+
+            // A request that would overflow the page rounding must also decline, not
+            // wrap to a small size and succeed.
+            let (ptr, size, _) = BumpSystem.alloc(usize::MAX - 8);
+            assert!(ptr.is_null());
+            assert_eq!(size, 0);
+        }
+
+        /// dlmalloc must return null rather than a bogus pointer once the provider is
+        /// exhausted — that null is what reaches `handle_alloc_error` on the guest.
+        #[test]
+        fn allocation_fails_cleanly_when_the_heap_is_exhausted() {
+            let (_guard, mut dl) = with_heap(64 * PAGE_SIZE);
+            let (sz, al) = layout(1024 * 1024);
+            let mut last = core::ptr::null_mut();
+            for _ in 0..8 {
+                last = unsafe { dl.malloc(sz, al) };
+                if last.is_null() {
+                    break;
+                }
+            }
+            assert!(
+                last.is_null(),
+                "1 MiB allocations never exhausted a 256 KiB heap"
+            );
+        }
+
+        /// Nothing calls `init` before `init_allocator` on the guest, but a stray
+        /// allocation before it must fail closed (HEAP_END == 0) rather than write to
+        /// address 0.
+        #[test]
+        fn uninitialized_provider_hands_out_nothing() {
+            let _guard = HEAP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            init(0, 0);
+            assert!(BumpSystem.alloc(1).0.is_null());
+        }
+
+        #[test]
+        fn realloc_preserves_contents_when_growing() {
+            let (_guard, mut dl) = with_heap(1024 * 1024);
+            let (sz, al) = layout(128);
+            let p = unsafe { dl.malloc(sz, al) };
+            assert!(!p.is_null());
+            unsafe { core::ptr::write_bytes(p, 0x5A, 128) };
+
+            let grown = unsafe { dl.realloc(p, sz, al, 4096) };
+            assert!(!grown.is_null());
+            let kept = unsafe { core::slice::from_raw_parts(grown, 128) };
+            assert!(
+                kept.iter().all(|&b| b == 0x5A),
+                "realloc lost the old bytes"
+            );
+            unsafe { dl.free(grown, 4096, al) };
+        }
+
+        #[test]
+        fn alignment_requests_are_honored() {
+            let (_guard, mut dl) = with_heap(1024 * 1024);
+            for align in [16usize, 64, 256, 4096] {
+                let p = unsafe { dl.malloc(align * 3, align) };
+                assert!(!p.is_null(), "malloc with align {align} failed");
+                assert_eq!(p as usize % align, 0, "align {align} not honored");
+                unsafe { dl.free(p, align * 3, align) };
+            }
         }
     }
 }
