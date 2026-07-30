@@ -1065,6 +1065,14 @@ pub fn coset_lde_batch_base(
     // Column layout: `buf[c * lde_size + r]`. Zeroed so the [n, lde_size)
     // tail of each column is already the zero-pad the CPU path does.
     let mut buf = stream.alloc_zeros::<u64>(m * lde_size)?;
+    // Any `?` between the first upload below and `sync_event` would release
+    // the slot with async H2D reads of the slab still in flight; this guard
+    // (declared after `staging`, so it drops first) drains the stream on
+    // those error paths.
+    let mut drain_on_err = crate::device::DrainOnErr {
+        stream: &stream,
+        armed: true,
+    };
     // One memcpy per column from the pinned buffer into the strided slots.
     // The pinned source hits PCIe line-rate.
     for c in 0..m {
@@ -1144,6 +1152,7 @@ pub fn coset_lde_batch_base(
     // the slot event fires (the NTT kernels above are queued behind them, so the
     // GPU stays busy while the host waits here).
     staging.sync_event()?;
+    drain_on_err.armed = false;
     drop(staging);
 
     // Single big D2H into the reusable pinned staging buffer — pinned, one

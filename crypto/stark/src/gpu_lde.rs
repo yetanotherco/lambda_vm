@@ -2089,6 +2089,12 @@ where
     if n0 < gpu_lde_threshold() {
         return None;
     }
+    // Mismatched twiddles would panic inside `FriCommitState::new`; gate here
+    // so a wiring bug degrades to the CPU path instead (same gate as
+    // `try_fri_commit_gpu_from_dev`).
+    if inv_twiddles.len() != n0 / 2 {
+        return None;
+    }
 
     // Pack the per-domain cached inv_twiddles to u64 before any transcript
     // mutation, so on H2D / state construction failure the caller's

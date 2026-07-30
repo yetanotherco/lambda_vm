@@ -660,9 +660,32 @@ pub fn async_dtoh_via<'a, T: cudarc::driver::DeviceRepr>(
         .result()?;
     }
     // Re-record the slot's reusable event (created once — per-call
-    // cuEventCreate/Destroy convoys the driver lock under load).
-    staging.record_event(stream)?;
+    // cuEventCreate/Destroy convoys the driver lock under load). The DMA is
+    // already in flight: if the record fails, drain the stream before the
+    // guard drops, or the next locker could free the slab mid-copy.
+    if let Err(e) = staging.record_event(stream) {
+        let _ = stream.synchronize();
+        return Err(e);
+    }
     Ok(PendingD2H { staging, n_bytes })
+}
+
+/// Best-effort stream drain on error paths: while `armed`, dropping this guard
+/// synchronizes the stream. Arm after the first enqueue that reads a
+/// pinned-staging slab; defuse once the slab is safe to release. Declared
+/// AFTER the slot's `MutexGuard`, it drops first, so an `?`-return can never
+/// release the slot with a DMA still reading it.
+pub(crate) struct DrainOnErr<'a> {
+    pub stream: &'a CudaStream,
+    pub armed: bool,
+}
+
+impl Drop for DrainOnErr<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.stream.synchronize();
+        }
+    }
 }
 
 impl PendingD2H<'_> {

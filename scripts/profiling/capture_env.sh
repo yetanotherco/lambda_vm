@@ -8,7 +8,7 @@ q() { # first line of a command's stdout, or "" on failure
 }
 
 GIT_SHA="$(q git rev-parse HEAD)"
-GIT_DIRTY="$(git status --porcelain 2>/dev/null | head -1 >/dev/null && echo true || echo false)"
+GIT_DIRTY="$(test -n "$(git status --porcelain 2>/dev/null)" && echo true || echo false)"
 
 SMI_QUERY="name,compute_cap,driver_version,clocks.sm,clocks.max.sm,clocks.mem,power.limit,temperature.gpu,memory.total,memory.free,persistence_mode"
 SMI="$(q nvidia-smi "--query-gpu=${SMI_QUERY}" --format=csv,noheader)"
