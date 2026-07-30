@@ -824,3 +824,719 @@ impl<F: IsField, E: IsField> ConstraintSet<F, E> for NegConstraints {
 fn neg_air() -> FixtureAir<NegConstraints> {
     fixture_air(2, NegConstraints, "NEG")
 }
+
+// =============================================================================
+// (c) + (d) — the quotient recombination, against a REAL proof
+// =============================================================================
+
+use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+use crypto::fiat_shamir::is_transcript::IsTranscript;
+use stark::domain::new_verifier_domain;
+use stark::lookup::{BusPublicInputs, LOGUP_CHALLENGE_ALPHA, LOGUP_NUM_CHALLENGES};
+use stark::proof::stark::MultiProof;
+use stark::proof::view::StarkProofView;
+use stark::table::Table;
+use stark::traits::AIR;
+use stark::verifier::{Challenges, IsStarkVerifier, Verifier};
+
+use super::constraints::{BoundaryTerm, QuotientShape, emit_quotient};
+use super::proof::{lfm_prove, verify_against};
+use super::registry::build_artifacts;
+
+/// A genuine STARK proof of a production AIR, opened up far enough that the
+/// machine can be asked to redo the verifier's composition check on it.
+///
+/// Everything here is READ OFF a real proof or replayed from a real transcript.
+/// Nothing is synthesized: the OOD frame is the prover's, the composition parts
+/// are the prover's, and the challenges come out of the production verifier's
+/// own `replay_rounds_after_round_1` rather than a local Fiat-Shamir model.
+struct RealSubProof {
+    artifact: ConstraintArtifact,
+    ood_full: Table<Ext3>,
+    main_width: usize,
+    num_steps: usize,
+    rap_challenges: Vec<FEE>,
+    alpha_powers: Vec<FEE>,
+    table_offset: FEE,
+    zeta: FEE,
+    beta: FEE,
+    claimed_parts: Vec<FEE>,
+    quotient: QuotientShape,
+}
+
+/// Proves L2G_MEMORY — a real continuation table, and the only continuation AIR
+/// with genuine constraints — over a real boundary-claim trace.
+fn real_sub_proof() -> RealSubProof {
+    use crate::tables::local_to_global::{
+        CellBoundary, FiniClaim, InitClaim, generate_local_to_global_trace,
+    };
+    use crate::test_utils::{EPOCH_TEST_LABEL, multi_prove_ram};
+
+    let opts = options();
+    let air = crate::continuation::l2g_memory_air(&opts, EPOCH_TEST_LABEL);
+
+    let boundaries: Vec<CellBoundary> = (0..4u64)
+        .map(|i| CellBoundary {
+            address: 0x1000 + 8 * i,
+            init: InitClaim {
+                value: i + 1,
+                timestamp: 0,
+                originating_epoch: 0,
+            },
+            fini: FiniClaim {
+                value: 2 * i + 3,
+                epoch: EPOCH_TEST_LABEL,
+                timestamp: 17 + i,
+            },
+        })
+        .collect();
+    let mut trace = generate_local_to_global_trace(&boundaries);
+
+    let pairs: Vec<(
+        &dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = ()>,
+        _,
+        _,
+    )> = vec![(&air, &mut trace, &())];
+    let proof = multi_prove_ram(pairs, &mut DefaultTranscript::<Ext3>::new(&[]))
+        .expect("the L2G_MEMORY fixture must prove");
+
+    open_sub_proof(&air, &proof)
+}
+
+/// Replays the production verifier's rounds over a real single-table proof and
+/// packages everything the constraint leg needs.
+fn open_sub_proof(
+    air: &dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = ()>,
+    proof: &MultiProof<Gl, Ext3, ()>,
+) -> RealSubProof {
+    let view = StarkProofView::Owned(&proof.proofs[0]);
+
+    // ---- Round 1, Phase A/B/C, transcribed from `multi_verify_views` for the
+    // single-table case (no per-table domain separator).
+    let mut transcript = DefaultTranscript::<Ext3>::new(&[]);
+    if air.is_preprocessed() {
+        transcript.append_bytes(&air.precomputed_commitment());
+    }
+    transcript.append_bytes(view.lde_trace_main_merkle_root());
+    let rap_challenges: Vec<FEE> = if air.has_aux_trace() {
+        (0..LOGUP_NUM_CHALLENGES)
+            .map(|_| transcript.sample_field_element())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if let Some(root) = view.lde_trace_aux_merkle_root() {
+        transcript.append_bytes(root);
+    }
+    if let Some(contribution) = view.bus_table_contribution() {
+        transcript.append_field_element(&contribution);
+    }
+
+    let trace_length = view.trace_length();
+    let domain = new_verifier_domain(air, trace_length);
+    let layout = Verifier::ood_layout(air);
+    let challenges: Challenges<Ext3> = Verifier::replay_rounds_after_round_1(
+        air,
+        view,
+        &(),
+        &domain,
+        &mut transcript,
+        rap_challenges.clone(),
+        &layout,
+    );
+
+    // ---- β, recovered from the verifier's own coefficient run and CHECKED.
+    //
+    // `replay_rounds_after_round_1` expands one geometric run of β and splits it
+    // into the transition coefficients then the boundary ones. That split is
+    // exactly the term ordering `emit_quotient` folds, so asserting it here —
+    // against the verifier's values, not a model — is what pins the Horner.
+    let nt = challenges.transition_coeffs.len();
+    assert_eq!(
+        challenges.transition_coeffs[0],
+        FEE::one(),
+        "the coefficient run starts at beta^0"
+    );
+    let beta = challenges.transition_coeffs[1];
+    for (c, coeff) in challenges.transition_coeffs.iter().enumerate() {
+        assert_eq!(*coeff, beta.pow(c as u64), "transition coefficient {c}");
+    }
+    for (k, coeff) in challenges.boundary_coeffs.iter().enumerate() {
+        assert_eq!(
+            *coeff,
+            beta.pow((nt + k) as u64),
+            "boundary coefficient {k} must continue the same run past the \
+             transition constraints"
+        );
+    }
+
+    // ---- the OOD grid, reconstructed by the verifier's own layout so the
+    // pruning is not modelled here.
+    let ood_current = view.trace_ood_evaluations();
+    let ood_next = view.trace_ood_next_evaluations();
+    let ood_full = layout.reconstruct_full(
+        ood_current.row_major_data(),
+        ood_current.width(),
+        ood_next.row_major_data(),
+    );
+
+    let (main_width, _) = air.trace_layout();
+    let bus_public_inputs = view
+        .bus_table_contribution()
+        .map(BusPublicInputs::from_contribution);
+    let logup_alpha_powers: Vec<FEE> = if rap_challenges.len() > LOGUP_CHALLENGE_ALPHA {
+        let alpha = rap_challenges[LOGUP_CHALLENGE_ALPHA];
+        (0..air.max_bus_elements())
+            .map(|i| alpha.pow(i as u64))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let table_offset = match view.bus_table_contribution() {
+        Some(contribution) => {
+            FE::from(trace_length as u64)
+                .inv()
+                .expect("a nonzero trace length")
+                * contribution
+        }
+        None => FEE::zero(),
+    };
+
+    let boundary_constraints = air.boundary_constraints(
+        &(),
+        &rap_challenges,
+        bus_public_inputs.as_ref(),
+        trace_length,
+    );
+    // `VerifierDomain::trace_primitive_root` is crate-private, so the generator
+    // is rederived the same way `new_verifier_domain` does: the root of unity of
+    // order `trace_length`.
+    let generator = <Gl as math::field::traits::IsFFTField>::get_primitive_root_of_unity(
+        trace_length.trailing_zeros() as u64,
+    )
+    .expect("a power-of-two trace length has a root of unity");
+    let boundary: Vec<BoundaryTerm> = boundary_constraints
+        .constraints
+        .iter()
+        .map(|c| BoundaryTerm {
+            col: if c.is_aux { main_width + c.col } else { c.col },
+            point: generator.pow(c.step as u64),
+            value: c.value,
+        })
+        .collect();
+
+    let claimed_parts: Vec<FEE> = view.composition_poly_parts_ood_evaluation().to_vec();
+    let artifact = ConstraintArtifact::capture(air);
+
+    RealSubProof {
+        num_steps: artifact.shape.transition_offsets.len(),
+        quotient: QuotientShape {
+            log2_trace_length: trace_length.trailing_zeros(),
+            num_composition_parts: claimed_parts.len(),
+            boundary,
+        },
+        artifact,
+        ood_full,
+        main_width,
+        rap_challenges,
+        alpha_powers: logup_alpha_powers,
+        table_offset,
+        zeta: challenges.z,
+        beta,
+        claimed_parts,
+    }
+}
+
+impl RealSubProof {
+    /// The OOD frame as the machine's arena sees it: opened entries only, in
+    /// [`hint_ood_frame`]'s order.
+    fn frame_arena(&self) -> Vec<LfmWord> {
+        let shape = &self.artifact.shape;
+        let width = (shape.main_width + shape.aux_width) as usize;
+        let mut out = Vec::new();
+        for offset in 0..self.num_steps {
+            let row = self.ood_full.get_row(offset);
+            for (col, v) in row.iter().enumerate().take(width) {
+                if offset == 0 || shape.next_row_columns.contains(&(col as u32)) {
+                    out.push(ext_word(v));
+                }
+            }
+        }
+        out
+    }
+
+    fn uniform_arena(&self) -> Vec<LfmWord> {
+        self.rap_challenges
+            .iter()
+            .chain(&self.alpha_powers)
+            .chain([&self.table_offset, &self.zeta, &self.beta])
+            .map(ext_word)
+            .collect()
+    }
+
+    fn parts_arena(&self) -> Vec<LfmWord> {
+        self.claimed_parts.iter().map(ext_word).collect()
+    }
+
+    fn arenas(&self) -> Vec<Vec<LfmWord>> {
+        vec![self.frame_arena(), self.uniform_arena(), self.parts_arena()]
+    }
+}
+
+/// The full composition-check program for one sub-proof: lower the AIR's
+/// transition constraints at ζ, recombine them against the shared zerofier and
+/// the boundary quotient, and ASSERT the result equals the composition value the
+/// proof claims.
+///
+/// The assert is the point. A program that merely computed the composition would
+/// be a calculator; asserting it against the claimed parts is what makes the
+/// machine's acceptance mean something, and it is what the tamper vectors below
+/// have to break.
+fn composition_program_source(sp: &RealSubProof) -> super::builder::LfmProgramSource {
+    let mut b = LfmBuilder::new();
+
+    let frame_arena = b.declare_arena(ood_frame_words(&sp.artifact));
+    let (steps, _) = hint_ood_frame(&mut b, &sp.artifact, frame_arena, 0);
+
+    let num_uniforms = (sp.rap_challenges.len() + sp.alpha_powers.len() + 3) as u32;
+    let uniform_arena = b.declare_arena(num_uniforms);
+    let mut next = 0u32;
+    let mut take = |b: &mut LfmBuilder| {
+        let c = b.hint_word(uniform_arena, next).as_ext();
+        next += 1;
+        c
+    };
+    let rap_challenges: Vec<_> = (0..sp.rap_challenges.len()).map(|_| take(&mut b)).collect();
+    let alpha_powers: Vec<_> = (0..sp.alpha_powers.len()).map(|_| take(&mut b)).collect();
+    let table_offset = take(&mut b);
+    let zeta = take(&mut b);
+    let beta = take(&mut b);
+
+    let parts_arena = b.declare_arena(sp.claimed_parts.len() as u32);
+    let claimed_parts: Vec<_> = (0..sp.claimed_parts.len() as u32)
+        .map(|i| b.hint_word(parts_arena, i).as_ext())
+        .collect();
+
+    let ood = OodOperands {
+        steps,
+        main_width: sp.main_width,
+        rap_challenges,
+        alpha_powers,
+        table_offset,
+    };
+    let (evals, _) = super::constraints::emit_constraint_evals(&mut b, &sp.artifact, &ood);
+    let q = emit_quotient(
+        &mut b,
+        &sp.quotient,
+        &ood,
+        zeta,
+        beta,
+        &evals,
+        &claimed_parts,
+    );
+
+    b.assert_eq_ext(q.claimed, q.composition);
+    b.public(q.composition.as_cell());
+    b.finish()
+}
+
+/// ★ (c) The machine reproduces the verifier's composition check on a REAL
+/// proof of a REAL production table.
+///
+/// The oracle is the proof itself: an honestly generated proof satisfies
+/// `Σ_j part_j·ζ^j = boundary_quotient + Σ_c β^c·C_c/Z`, so a machine that
+/// computes either side differently cannot execute the in-machine assert. That
+/// makes this a differential against the production prover and verifier
+/// together, not against a transcription of one formula.
+#[test]
+fn composition_check_matches_a_real_proof() {
+    let sp = real_sub_proof();
+
+    // Make the coverage legible, and fail rather than silently degrade if the
+    // fixture ever stops exercising a term.
+    assert_eq!(
+        sp.quotient.boundary.len(),
+        1,
+        "L2G_MEMORY has bus interactions, so it carries the framework's \
+         acc[0] = 0 boundary constraint — without it the boundary half of the \
+         recombination would be untested"
+    );
+    assert!(
+        sp.quotient.log2_trace_length >= 2,
+        "the zerofier must cost more than a squaring or two"
+    );
+    assert!(
+        !sp.alpha_powers.is_empty(),
+        "the LogUp uniforms must be live"
+    );
+
+    let program = compile(composition_program_source(&sp));
+    validate(&program).expect("the composition program is admissible");
+
+    let leg = analyze(&sp.artifact).report().clone();
+    println!(
+        "L2G_MEMORY composition check: {} instructions total, of which {} are \
+         the constraint leg ({} constraints, {} parts, log2(N) = {})",
+        program.instrs.len(),
+        leg.alu_rows(),
+        sp.artifact.roots.len(),
+        sp.quotient.num_composition_parts,
+        sp.quotient.log2_trace_length,
+    );
+
+    let exec = execute(&program, &sp.arenas(), &TestPermutation)
+        .expect("an honest proof's composition check must execute");
+
+    // The published value is the recomputed composition; it must equal the
+    // Horner fold of the parts the proof carries.
+    let expected = sp
+        .claimed_parts
+        .iter()
+        .rev()
+        .fold(FEE::zero(), |acc, part| acc * sp.zeta + part);
+    let (_, word) = exec.public_words[0];
+    assert_eq!(
+        word_as_ext(&word).expect("ext"),
+        expected,
+        "the machine's composition must equal the claimed composition"
+    );
+    assert!(
+        expected != FEE::zero(),
+        "a zero composition would make the assert vacuous"
+    );
+}
+
+/// ★ (c) falsification: every input the check depends on, broken one at a time.
+///
+/// Each vector leaves a genuine proof's data in place and changes exactly one
+/// word. The in-machine `assert_eq_ext` lowers to `diff / ZERO`, which under the
+/// machine's `x/0 = error` convention makes a mismatching run UNEXECUTABLE — the
+/// earliest and loudest failure, and the one that shows the assert is carrying
+/// the check rather than decorating it.
+#[test]
+fn a_tampered_composition_input_cannot_execute() {
+    let sp = real_sub_proof();
+    let program = compile(composition_program_source(&sp));
+    execute(&program, &sp.arenas(), &TestPermutation).expect("baseline honest run");
+
+    /// One tamper: a name and the single word it corrupts.
+    type Vector = (&'static str, Box<dyn Fn(&mut Vec<Vec<LfmWord>>)>);
+
+    let vectors: Vec<Vector> = vec![
+        (
+            "a wrong OOD frame value",
+            Box::new(|a: &mut Vec<Vec<LfmWord>>| a[0][0][0] += FE::one()),
+        ),
+        (
+            "a wrong LogUp challenge",
+            Box::new(|a: &mut Vec<Vec<LfmWord>>| a[1][0][0] += FE::one()),
+        ),
+        (
+            "a wrong out-of-domain point zeta",
+            Box::new(|a: &mut Vec<Vec<LfmWord>>| {
+                let i = a[1].len() - 2;
+                a[1][i][0] += FE::one();
+            }),
+        ),
+        (
+            "a wrong composition challenge beta",
+            Box::new(|a: &mut Vec<Vec<LfmWord>>| {
+                let i = a[1].len() - 1;
+                a[1][i][0] += FE::one();
+            }),
+        ),
+        (
+            "a wrong claimed composition part",
+            Box::new(|a: &mut Vec<Vec<LfmWord>>| a[2][0][0] += FE::one()),
+        ),
+    ];
+
+    // A zeta ON the trace domain, which makes the zerofier vanish. The
+    // out-of-domain sampler cannot produce it, but the constraint leg does not
+    // contain the sampler, so the reciprocal guard rather than an argument about
+    // a component elsewhere is what rules it out. `g` is chosen over `1` on
+    // purpose: at zeta = 1 the BOUNDARY denominator vanishes too, and the run
+    // would fail without saying which guard caught it.
+    {
+        let generator = <Gl as math::field::traits::IsFFTField>::get_primitive_root_of_unity(
+            sp.quotient.log2_trace_length as u64,
+        )
+        .expect("root of unity");
+        assert_eq!(
+            generator.pow(1u64 << sp.quotient.log2_trace_length),
+            FE::one(),
+            "g^N = 1, so the zerofier vanishes at zeta = g"
+        );
+        assert_ne!(
+            generator,
+            FE::one(),
+            "but the boundary denominator does not"
+        );
+        let mut arenas = sp.arenas();
+        let i = arenas[1].len() - 2;
+        arenas[1][i] = ext_word(&generator.to_extension::<Ext3>());
+        assert!(
+            execute(&program, &arenas, &TestPermutation).is_err(),
+            "a zeta on the trace domain must be rejected by the zerofier's \
+             reciprocal guard, not silently return 0/0 = 1"
+        );
+    }
+
+    for (what, tamper) in vectors {
+        let mut arenas = sp.arenas();
+        tamper(&mut arenas);
+        assert!(
+            execute(&program, &arenas, &TestPermutation).is_err(),
+            "{what} must make the composition check unexecutable"
+        );
+    }
+}
+
+/// ★ (d) The composition check PROVES and VERIFIES.
+///
+/// Per method rule 2 this is the only test in this file that says anything about
+/// the chips: everything above runs the executor, which mirrors the very ALU it
+/// is checking. Here the emitted rows are proved by `LFM_XALU` and friends and
+/// the proof is verified against the program's own committed artifacts.
+///
+/// It uses `verify_against` rather than the registry. That is deliberate and is
+/// the sanctioned path for a shape that is not registered: this program is one
+/// AIR's leg, not the epoch verifier, and pinning its digest would pin a shape
+/// that has to move once the DEEP and opening legs land.
+#[test]
+fn constraint_leg_proves_and_verifies() {
+    let opts = options();
+    let sp = real_sub_proof();
+    let program = compile(composition_program_source(&sp));
+    let artifacts = build_artifacts(&program, &opts);
+
+    let proved = lfm_prove(&program, &artifacts, &sp.arenas(), &opts)
+        .expect("the honest composition check must execute and prove");
+
+    assert!(
+        verify_against(
+            &artifacts.roots,
+            &artifacts.program_id,
+            artifacts.keccak_rnd_chunks,
+            &proved.proof,
+            &proved.public_words,
+            &opts,
+        ),
+        "the proved composition check must verify"
+    );
+
+    // A verifier that claims a different composition value must reject, even
+    // though the proof itself is untouched: the claimed public words are what
+    // bind the machine's output to the statement.
+    let mut wrong = proved.public_words.clone();
+    wrong[0].1[0] += FE::one();
+    assert!(
+        !verify_against(
+            &artifacts.roots,
+            &artifacts.program_id,
+            artifacts.keccak_rnd_chunks,
+            &proved.proof,
+            &wrong,
+            &opts,
+        ),
+        "a mismatched claimed composition must be rejected"
+    );
+}
+
+/// The emitted program is deterministic — same builder calls, same instructions,
+/// same digest. That is the property registration would pin, asserted here for a
+/// shape that is deliberately not in `LFM_REGISTRY`.
+#[test]
+fn composition_program_is_deterministic() {
+    let sp = real_sub_proof();
+    let a = compile(composition_program_source(&sp));
+    let b = compile(composition_program_source(&sp));
+    assert_eq!(a.instrs.len(), b.instrs.len());
+    assert_eq!(a.num_addrs, b.num_addrs);
+    let opts = options();
+    assert_eq!(
+        build_artifacts(&a, &opts).program_id,
+        build_artifacts(&b, &opts).program_id,
+        "the same source must produce the same program identity"
+    );
+}
+
+// =============================================================================
+// (b) — the per-epoch budget
+// =============================================================================
+
+/// Rows the recombination costs for one sub-proof, MEASURED by emitting it into
+/// a throwaway builder rather than counted off the source by eye.
+///
+/// The operand plumbing (hints for the frame, the challenges, the constraint
+/// values and the claimed parts) is built twice into two independent builders —
+/// once alone and once followed by the quotient — and the difference is the
+/// quotient's own rows. Emission is deterministic, so the two plumbings are
+/// identical by construction.
+fn quotient_rows(artifact: &ConstraintArtifact, log2_trace_length: u32) -> usize {
+    let shape = &artifact.shape;
+    let width = (shape.main_width + shape.aux_width) as usize;
+    let num_steps = shape.transition_offsets.len().max(1);
+    let num_parts = shape.composition_degree_multiplier as usize;
+    let num_constraints = artifact.roots.len();
+
+    let quotient = QuotientShape {
+        log2_trace_length,
+        num_composition_parts: num_parts,
+        // Every table with bus interactions carries the framework's single
+        // acc[0] = 0 constraint on the last aux column, and no production table
+        // declares any other boundary constraint.
+        boundary: if shape.has_trace_interaction {
+            vec![BoundaryTerm {
+                col: width - 1,
+                point: FE::one(),
+                value: FEE::zero(),
+            }]
+        } else {
+            Vec::new()
+        },
+    };
+
+    let plumbing = |b: &mut LfmBuilder| {
+        let total = num_steps * width + 2 + num_constraints + num_parts + 1;
+        let arena = b.declare_arena(total as u32);
+        let mut idx = 0u32;
+        let mut take = |b: &mut LfmBuilder| {
+            let c = b.hint_word(arena, idx).as_ext();
+            idx += 1;
+            c
+        };
+        let steps: Vec<Vec<_>> = (0..num_steps)
+            .map(|_| (0..width).map(|_| take(b)).collect())
+            .collect();
+        let ood = OodOperands {
+            steps,
+            main_width: shape.main_width as usize,
+            rap_challenges: Vec::new(),
+            alpha_powers: Vec::new(),
+            table_offset: take(b),
+        };
+        let zeta = take(b);
+        let beta = take(b);
+        let evals: Vec<_> = (0..num_constraints).map(|_| take(b)).collect();
+        let parts: Vec<_> = (0..num_parts).map(|_| take(b)).collect();
+        (ood, zeta, beta, evals, parts)
+    };
+
+    let mut bare = LfmBuilder::new();
+    let _ = plumbing(&mut bare);
+    let baseline = bare.finish().instrs.len();
+
+    let mut full = LfmBuilder::new();
+    let (ood, zeta, beta, evals, parts) = plumbing(&mut full);
+    let q = emit_quotient(&mut full, &quotient, &ood, zeta, beta, &evals, &parts);
+    full.assert_eq_ext(q.claimed, q.composition);
+    full.finish().instrs.len() - baseline
+}
+
+/// ★ The constraint leg for a CONTINUATION EPOCH, against the design's budget.
+///
+/// The composition is `others/lfm-constraint-lowering-design.md` §8.2.2's, which
+/// `tests::constraint_artifact_tests::continuation_epoch_constraint_leg` derives
+/// from the real epoch shape and pins against a measured 24/25 sub-proof count:
+/// 14 split-table families at one chunk each, plus the nine fixed tables an
+/// intermediate epoch carries (all ten on the final one), plus one L2G_MEMORY.
+/// PAGE does not appear — epochs pass `page_configs = &[]`.
+///
+/// ### What this instrument cannot see
+///
+/// It assumes the MINIMUM epoch, one chunk per family. A larger epoch adds
+/// chunks of the cheap tables, which the design measures at +642 instructions
+/// per doubling past 2^19 cycles. It also fixes one trace length for the
+/// zerofier across every sub-proof, so the recombination term is a
+/// representative figure rather than a per-chunk one.
+#[test]
+fn continuation_epoch_constraint_leg_cost() {
+    /// Trace length assumed for the zerofier's squaring chain.
+    const LOG2_TRACE_LENGTH: u32 = 20;
+
+    /// The 14 chunked split-table families.
+    const SPLIT_FAMILIES: &[&str] = &[
+        "CPU", "LT", "SHIFT", "EQ", "BYTEWISE", "STORE", "CPU32", "MEMW", "MEMW_A", "MEMW_R",
+        "LOAD", "MUL", "DVRM", "BRANCH",
+    ];
+    /// `FIXED_TABLE_COUNT`'s ten, which contribute exactly one sub-proof each
+    /// regardless of `TableCounts`. HALT is last: an intermediate epoch drops it.
+    const FIXED: &[&str] = &[
+        "BITWISE",
+        "DECODE",
+        "COMMIT",
+        "KECCAK",
+        "KECCAK_RND",
+        "KECCAK_RC",
+        "REGISTER",
+        "ECSM",
+        "ECDAS",
+        "HALT",
+    ];
+
+    let opts = options();
+    let airs = production_airs(&opts);
+    let cost: std::collections::BTreeMap<&str, (usize, usize, usize)> = airs
+        .iter()
+        .map(|(label, air)| {
+            let artifact = ConstraintArtifact::capture(&**air);
+            let r = analyze(&artifact).report().clone();
+            (
+                *label,
+                (
+                    r.alu_rows(),
+                    r.unfused_alu_rows(),
+                    quotient_rows(&artifact, LOG2_TRACE_LENGTH),
+                ),
+            )
+        })
+        .collect();
+
+    let sum = |labels: &[&str], pick: fn(&(usize, usize, usize)) -> usize| -> usize {
+        labels.iter().map(|l| pick(&cost[l])).sum()
+    };
+
+    let families = sum(SPLIT_FAMILIES, |c| c.0);
+    let fixed_no_halt = sum(&FIXED[..9], |c| c.0);
+    let halt = cost["HALT"].0;
+    let l2g = cost["L2G_MEMORY"].0;
+
+    let families_unfused = sum(SPLIT_FAMILIES, |c| c.1);
+    let fixed_unfused = sum(&FIXED[..9], |c| c.1);
+    let l2g_unfused = cost["L2G_MEMORY"].1;
+
+    let recombination =
+        sum(SPLIT_FAMILIES, |c| c.2) + sum(&FIXED[..9], |c| c.2) + cost["L2G_MEMORY"].2;
+
+    let intermediate = families + fixed_no_halt + l2g;
+    let final_leg = intermediate + halt;
+    let final_total = final_leg + recombination + cost["HALT"].2;
+    let design_intermediate = families_unfused + fixed_unfused + l2g_unfused;
+
+    println!(
+        "\ncontinuation epoch, constraint leg (minimum shape, 24 sub-proofs)\n\
+         \x20 14 split families        {families:>7}  (unfused {families_unfused})\n\
+         \x20  9 fixed, no HALT        {fixed_no_halt:>7}  (unfused {fixed_unfused})\n\
+         \x20  1 L2G_MEMORY            {l2g:>7}  (unfused {l2g_unfused})\n\
+         \x20 INTERMEDIATE leg         {intermediate:>7}  vs the design's {design_intermediate}\n\
+         \x20 + recombination @ log2(N) = {LOG2_TRACE_LENGTH}  {recombination:>7}  \
+         (zerofier, beta-fold, one division, claimed-parts Horner, assert)\n\
+         \x20 INTERMEDIATE total       {:>7}  over 24 sub-proofs\n\
+         \x20 FINAL epoch (+HALT)      {final_leg:>7} leg, {final_total} total, \
+         over 25 sub-proofs",
+        intermediate + recombination
+    );
+
+    // The design's §8.2.2 arithmetic, reproduced from the emitter's own unfused
+    // counts. A mismatch means the epoch composition changed, which is a finding
+    // about the epoch, not about this pass.
+    assert_eq!(
+        design_intermediate, 63_393,
+        "the design's intermediate-epoch budget no longer reproduces"
+    );
+    assert!(
+        intermediate < design_intermediate,
+        "fusion must not make the leg more expensive"
+    );
+}

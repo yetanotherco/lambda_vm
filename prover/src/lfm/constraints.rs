@@ -650,3 +650,164 @@ pub fn ood_frame_words(artifact: &ConstraintArtifact) -> u32 {
     let steps = shape.transition_offsets.len().max(1) as u32;
     width + (steps - 1) * shape.next_row_columns.len() as u32
 }
+
+// =============================================================================
+// zerofier and quotient recombination
+// =============================================================================
+
+/// One boundary constraint, as program SHAPE.
+///
+/// Boundary constraints are deliberately NOT part of a [`ConstraintArtifact`] —
+/// `AIR::boundary_constraints` is a function of the public inputs, so it is not
+/// a static property of the AIR and serializing it is a separate problem. Every
+/// production VM table uses `NullBoundaryConstraintBuilder`, whose only output is
+/// the framework's `acc[0] = 0` on the last aux column, so in practice this is a
+/// zero- or one-element list whose `point` is `g^0 = 1` and whose `value` is
+/// zero. The general form is carried anyway: an emitter that silently assumed
+/// the degenerate case would be wrong the first time an AIR grew a real one.
+#[derive(Clone, Debug)]
+pub struct BoundaryTerm {
+    /// Full-width `[main | aux]` column index of the value opened at ζ.
+    pub col: usize,
+    /// The trace-domain point `g^step` the constraint is anchored at.
+    pub point: FE,
+    /// The value that column must take there.
+    pub value: FEE,
+}
+
+/// Everything about the recombination that is compile-time for one sub-proof.
+#[derive(Clone, Debug)]
+pub struct QuotientShape {
+    /// `log2(N)`. The zerofier costs exactly this many squarings, so the trace
+    /// length is program SHAPE — a machine that read it from an arena would be
+    /// letting the prover pick the domain it is checked against.
+    pub log2_trace_length: u32,
+    /// `composition_poly_degree_bound(N) / N`, i.e. how many parts the claimed
+    /// composition evaluation is split into. Also shape: the verifier rejects a
+    /// proof whose part count disagrees with the AIR.
+    pub num_composition_parts: usize,
+    /// The AIR's boundary constraints.
+    pub boundary: Vec<BoundaryTerm>,
+}
+
+/// What the recombination computed.
+pub struct QuotientEval {
+    /// `ζ^N − 1`.
+    pub zerofier: Ext,
+    /// `Σ_c β^c·C_c / Z  +  Σ_k β^{n+k}·(t_k(ζ) − v_k)/(ζ − p_k)`.
+    pub composition: Ext,
+    /// `Σ_j part_j·ζ^j`, the claimed value the proof carries.
+    pub claimed: Ext,
+}
+
+/// Emit the zerofier, the β-power fold and the claimed-composition Horner for
+/// one sub-proof.
+///
+/// # One division, not one per constraint
+///
+/// Every production constraint applies to every row (`RowDomain::ALL`, measured
+/// across all 28 tables), so `end_exemptions` is zero everywhere and all of an
+/// AIR's constraints share the zerofier `Z = ζ^N − 1`. That lets the division
+/// factor out of the β-power sum:
+///
+/// ```text
+///   Σ_c β^c·C_c/Z  =  (Σ_c β^c·C_c)/Z
+/// ```
+///
+/// one division per AIR rather than one per constraint. The boundary terms do
+/// NOT share `Z` — they have their own denominators — so they are pre-scaled by
+/// `Z` before entering the same fold, which keeps the single division while
+/// still giving each boundary term its own `β` power. Naively recomputing `ζ^N`
+/// and a full extension inversion per constraint, as the verifier does today,
+/// would cost about 24 rows per constraint instead of per AIR.
+///
+/// # Why the reciprocal rather than a direct divide
+///
+/// `Z` and each `ζ − p_k` are inverted against the interned one, and the
+/// quotient is then a multiply. That costs one extra row apiece and closes a
+/// hole: the machine's convention is `0/0 = 1`, so a direct `Div` would silently
+/// return 1 for a zero denominator with a zero numerator, whereas `1/0` has no
+/// satisfying assignment (`B·OUT = A` becomes `0 = 1`) and is therefore
+/// unprovable. `z` is sampled outside the trace domain so neither denominator
+/// can vanish in an honest proof — but "the sampler prevents it" is a property
+/// of a component this leg does not contain, and the guard costs two rows.
+///
+/// `constraint_evals` are in `constraint_idx` order, `claimed_parts` in the
+/// order the proof carries them (part `j` multiplying `ζ^j`).
+pub fn emit_quotient(
+    b: &mut LfmBuilder,
+    shape: &QuotientShape,
+    ood: &OodOperands,
+    zeta: Ext,
+    beta: Ext,
+    constraint_evals: &[Ext],
+    claimed_parts: &[Ext],
+) -> QuotientEval {
+    assert!(
+        !constraint_evals.is_empty() || !shape.boundary.is_empty(),
+        "a sub-proof with neither transition nor boundary constraints has no \
+         composition to check"
+    );
+    assert!(
+        !claimed_parts.is_empty(),
+        "the composition is claimed in at least one part"
+    );
+    assert_eq!(
+        claimed_parts.len(),
+        shape.num_composition_parts,
+        "the supplied parts must match the AIR's part count, which is shape and \
+         never read off the proof"
+    );
+
+    let one = b.ext_const(&FEE::one());
+
+    // Z = ζ^N − 1, by repeated squaring. log2(N) rows, not N.
+    let mut power = zeta;
+    for _ in 0..shape.log2_trace_length {
+        power = b.emul(power, power);
+    }
+    let zerofier = b.esub(power, one);
+    let z_inv = b.ediv(one, zerofier);
+
+    // Terms of Σ_k β^k·X_k, highest power first: the boundary terms occupy the
+    // indices past the transition constraints, exactly as `replay_rounds_after_
+    // round_1` splits one geometric run of β into transition then boundary
+    // coefficients.
+    let mut terms: Vec<Ext> = Vec::with_capacity(constraint_evals.len() + shape.boundary.len());
+    for term in shape.boundary.iter().rev() {
+        let opened = *ood.steps[0]
+            .get(term.col)
+            .unwrap_or_else(|| panic!("boundary column {} is outside the frame", term.col));
+        let numerator = if term.value == FEE::zero() {
+            opened
+        } else {
+            let v = b.ext_const(&term.value);
+            b.esub(opened, v)
+        };
+        let point = b.felt_const(term.point).as_ext();
+        let denominator = b.esub(zeta, point);
+        let den_inv = b.ediv(one, denominator);
+        let quotient = b.emul(numerator, den_inv);
+        terms.push(b.emul(quotient, zerofier));
+    }
+    terms.extend(constraint_evals.iter().rev().copied());
+
+    let mut acc = terms[0];
+    for t in &terms[1..] {
+        acc = b.emul_add(acc, beta, *t);
+    }
+    let composition = b.emul(acc, z_inv);
+
+    // claimed = Σ_j part_j·ζ^j, the same Horner the verifier folds.
+    let mut iter = claimed_parts.iter().rev();
+    let mut claimed = *iter.next().expect("checked non-empty");
+    for p in iter {
+        claimed = b.emul_add(claimed, zeta, *p);
+    }
+
+    QuotientEval {
+        zerofier,
+        composition,
+        claimed,
+    }
+}
