@@ -31,16 +31,16 @@
 //! stores, and nothing depends on the ecall having re-read it — so omitting it is
 //! sound and avoids the mixed-timestamp bookkeeping of a partial-buffer read.
 //!
-//! The table's only algebraic constraint is `mu·(1−mu) = 0` (`HintConstraints`):
-//! `mu` is the multiplicity of every bus interaction, so it must be boolean. The
-//! LogUp argument already pins its *value* — the `Ecall` receiver's tuple contains
-//! the timestamp, which is unique per instruction (`ts = 4i + 4`), so the identity
-//! matches each `(ts, syscall)` tuple on its own and forces `mu` to the CPU's send
-//! multiplicity for that ecall (1 where the CPU issued one, 0 elsewhere; a nonzero
-//! `mu` on a tuple the CPU never sent leaves the bus unbalanced). The boolean
-//! constraint is nonetheless carried explicitly, matching every other
-//! multiplicity-column table (ECSM/ECDAS/COMMIT/STORE/MEMW_R): a multiplicity column
-//! is bit-constrained in-circuit rather than left to rest on a bus-balance argument.
+//! `mu` is constrained to a bit (`IS_BIT`, the table's only algebraic constraint) —
+//! the same guard every other multiplicity-column table carries (ECSM/ECDAS/COMMIT/
+//! STORE/MEMW_R). The `Ecall` bus alone does not establish it: its tuple carries the
+//! timestamp, a free column, so the LogUp identity pins only the *sum* of `mu` over
+//! the rows sharing a `(ts, syscall)` tuple to the CPU's send — it does not rule out
+//! two rows splitting `mu = 1/2 + 1/2` while each keeps its own `out_addr` (and
+//! `out_addr` is the base the four output writes take). Such a witness is in fact
+//! caught today, but only downstream and non-locally: MEMW boolean-constrains its own
+//! multiplicities, so a half-weighted write finds no receiver. Constraining `mu` here
+//! makes the argument local, independent of how MEMW happens to handle multiplicities.
 //!
 //! ## Columns (37)
 //! - `timestamp[0..1]` (DWordWL): the ecall timestamp `T`
