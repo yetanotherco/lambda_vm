@@ -3341,3 +3341,195 @@ fn fixture_generation_is_not_reproducible() {
         oa.values == ob.values
     );
 }
+
+// ============ R1g (ii): the cross-epoch L2G commitment binding ============
+//
+// The first obligation of the chaining leg, and the first time the machine
+// reads ACROSS structures: each epoch's own committed L2G root against the
+// corresponding sub-proof of the one global proof. R1f stayed inside a single
+// epoch's own sub-proof.
+
+use super::programs::l2g_binding_program;
+
+/// Epochs the binding program is compiled for. SHAPE, not a blob-derived
+/// constant: the epoch count follows from the inner ELF and
+/// `FIXTURE_EPOCH_LOG2`, not from anything the prover chooses per run. Asserted
+/// against the real bundle rather than read from it, so a fixture change is
+/// loud — the same discipline `R1F_SHAPE` uses.
+const R1G_EPOCHS: usize = 2;
+
+/// The `i`-th 32-byte root in a program's published words.
+fn published_root(public: &[(u32, LfmWord)], i: usize) -> [u8; 32] {
+    use math::field::traits::IsPrimeField;
+    let mut out = [0u8; 32];
+    for h in 0..8 {
+        let lane = public[2 * i + h / 4].1[h % 4];
+        let half = crate::tables::types::GoldilocksField::canonical(lane.value()) as u32;
+        out[4 * h..4 * h + 4].copy_from_slice(&half.to_le_bytes());
+    }
+    out
+}
+
+fn l2g_arenas(
+    epoch: &[stark::config::Commitment],
+    global: &[stark::config::Commitment],
+) -> Vec<Vec<LfmWord>> {
+    use super::proof_arena::commitments_to_arena;
+    vec![commitments_to_arena(epoch), commitments_to_arena(global)]
+}
+
+/// The real bundle's L2G roots, resolved once.
+fn r1g_l2g_roots() -> &'static (
+    Vec<stark::config::Commitment>,
+    Vec<stark::config::Commitment>,
+) {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<(
+        Vec<stark::config::Commitment>,
+        Vec<stark::config::Commitment>,
+    )> = OnceLock::new();
+    CELL.get_or_init(|| {
+        let blob = proof_fixture::load_or_generate(&fixture_cache());
+        let archive = super::proof_fixture::FixtureArchive::open(&blob);
+        let epoch = super::proof_arena::epoch_l2g_roots(&archive);
+        let global = super::proof_arena::global_l2g_roots(&archive, epoch.len());
+        (epoch, global)
+    })
+}
+
+/// Scrutinises the oracle before building on it: production's binding really
+/// does hold on the real bundle, and — the part that matters for (d) — the
+/// per-epoch roots are DISTINCT, so swapping two of them is a real tamper.
+///
+/// Without that second check the position-swap vector would pass while testing
+/// nothing, exactly as an index-bit flip would have on a degenerate tree in R1f.
+#[test]
+fn l2g_binding_holds_on_the_real_bundle() {
+    let (epoch, global) = r1g_l2g_roots();
+    assert_eq!(
+        epoch.len(),
+        R1G_EPOCHS,
+        "the fixture's epoch count moved; R1G_EPOCHS is program shape"
+    );
+    assert_eq!(epoch, global, "production's own L2G binding must hold");
+    assert!(
+        epoch.iter().all(|r| *r != [0u8; 32]),
+        "every L2G root must be nonzero"
+    );
+    for i in 0..epoch.len() {
+        for j in (i + 1)..epoch.len() {
+            assert_ne!(
+                epoch[i], epoch[j],
+                "epochs {i} and {j} share an L2G root, so swapping them is not a tamper"
+            );
+        }
+    }
+    println!(
+        "R1g(ii): {} epochs, binding holds, roots pairwise distinct",
+        epoch.len()
+    );
+}
+
+/// ★ The binding, emitted and PROVED against the real bundle.
+#[test]
+fn l2g_binding_proves_and_verifies() {
+    let opts = options();
+    let (epoch, global) = r1g_l2g_roots();
+    let program = l2g_binding_program(R1G_EPOCHS);
+    let artifacts = build_artifacts(&program, &opts);
+    let proved = lfm_prove(&program, &artifacts, &l2g_arenas(epoch, global), &opts)
+        .expect("the honest binding must execute and prove");
+
+    for (i, root) in epoch.iter().enumerate().take(R1G_EPOCHS) {
+        assert_eq!(
+            published_root(&proved.public_words, i),
+            *root,
+            "published root {i} must be epoch {i}'s committed L2G root"
+        );
+    }
+    assert!(
+        verify_against(
+            &artifacts.roots,
+            &artifacts.program_id,
+            artifacts.keccak_rnd_chunks,
+            &proved.proof,
+            &proved.public_words,
+            &opts,
+        ),
+        "the L2G binding must verify"
+    );
+}
+
+/// ★ (d) Tamper. Same two-mode structure as R1f: incoherent trips the assert,
+/// coherent satisfies every assert and then fails on the published roots.
+///
+/// The SWAP vector is the one that matters — it is what "position-sensitive"
+/// means. Epoch `i`'s root must meet global sub-proof `i` and no other, so a
+/// bundle whose L2G roots are correct as a SET but wrong in ORDER must reject.
+#[test]
+fn tampered_l2g_binding_rejects() {
+    let opts = options();
+    let (epoch, global) = r1g_l2g_roots();
+    let program = l2g_binding_program(R1G_EPOCHS);
+    let artifacts = build_artifacts(&program, &opts);
+    let honest =
+        lfm_prove(&program, &artifacts, &l2g_arenas(epoch, global), &opts).expect("honest prove");
+
+    // Incoherent: one side changed, the other left honest — the assert must fire.
+    //
+    // The two byte positions are chosen, not arbitrary. A digest spans TWO
+    // machine words (bytes 0-15 and 16-31) and each needs its own
+    // `assert_word_eq`; vectors that all land in byte 0 would leave an emitter
+    // that compares only the first word completely uncaught. Byte 31 covers the
+    // second word. Falsification F32 confirmed the gap was real before this.
+    let mut bad_epoch = epoch.clone();
+    bad_epoch[0][0] ^= 1;
+    let mut bad_global = global.clone();
+    bad_global[1][31] ^= 1;
+    let swapped_one_side = {
+        let mut s = epoch.clone();
+        s.swap(0, 1);
+        s
+    };
+    for (what, arenas) in [
+        ("wrong epoch root", l2g_arenas(&bad_epoch, global)),
+        ("wrong global root", l2g_arenas(epoch, &bad_global)),
+        (
+            "epoch roots swapped on one side",
+            l2g_arenas(&swapped_one_side, global),
+        ),
+    ] {
+        let err = super::executor::execute(&program, &arenas, &super::hash::TestPermutation)
+            .err()
+            .unwrap_or_else(|| panic!("{what}: must not execute"));
+        println!("R1g tamper {what}: rejected with {err:?}");
+    }
+
+    // Coherent: BOTH sides swapped consistently. Every assert passes — the
+    // bundle's roots are the right set — but the order is wrong, so the
+    // published roots are not the ones the real bundle commits to.
+    let mut swapped = epoch.clone();
+    swapped.swap(0, 1);
+    let proved = lfm_prove(&program, &artifacts, &l2g_arenas(&swapped, &swapped), &opts)
+        .expect("the coherent swap must prove — every assert is satisfied");
+    assert_eq!(
+        published_root(&proved.public_words, 0),
+        epoch[1],
+        "the coherent forgery publishes the swapped order"
+    );
+    assert_ne!(
+        proved.public_words, honest.public_words,
+        "a reordered binding must not publish the honest roots"
+    );
+    assert!(
+        !verify_against(
+            &artifacts.roots,
+            &artifacts.program_id,
+            artifacts.keccak_rnd_chunks,
+            &proved.proof,
+            &honest.public_words,
+            &opts,
+        ),
+        "claiming the real per-epoch roots for a reordered binding must reject"
+    );
+}
