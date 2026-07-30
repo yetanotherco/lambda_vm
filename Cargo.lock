@@ -435,8 +435,6 @@ dependencies = [
  "libc",
  "math",
  "memmap2",
- "rand 0.8.5",
- "rand_chacha 0.3.1",
  "rayon",
  "rkyv",
  "serde",
