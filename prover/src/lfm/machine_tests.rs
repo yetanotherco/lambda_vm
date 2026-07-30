@@ -3119,6 +3119,29 @@ fn permutation_cells() -> u64 {
     keccak_w + ROUNDS as u64 * keccak_rnd::cols::NUM_COLUMNS as u64
 }
 
+/// Pins the widths the cost model above is built on.
+///
+/// Not ceremony: the inline `// 52 / 252 / 388 / 588 / 788` comments on
+/// `chips::keccak::cols` were stale by 4 (R1d widened `PREP_WIDTH` for the
+/// reversed-digest columns and they were not updated), and reading them instead
+/// of the constants is what produced a wrong per-permutation figure on the first
+/// pass through this measurement. A wrong width silently rescales every cell
+/// number in `keccak_merkle_opening_cost`, so the widths get an assertion of
+/// their own rather than a comment.
+#[test]
+fn cost_model_widths_are_what_the_chips_declare() {
+    use super::chips::{balu, bitdec, keccak};
+    use super::layout;
+    use crate::tables::keccak_rnd;
+    assert_eq!(keccak::cols::NUM_COLUMNS, 792, "LFM_KECCAK total width");
+    assert_eq!(layout::keccak::PREP_WIDTH, 56, "LFM_KECCAK preprocessed");
+    assert_eq!(balu::cols::NUM_COLUMNS - layout::balu::PREP_WIDTH, 4);
+    assert_eq!(bitdec::cols::NUM_COLUMNS - layout::bitdec::PREP_WIDTH, 66);
+    assert_eq!(keccak_rnd::cols::NUM_COLUMNS, 1480);
+    assert_eq!(byteswap_cells(), 322, "66 + 64 x 4");
+    assert_eq!(permutation_cells(), 36_256, "736 + 24 x 1480");
+}
+
 /// ★ The leg's headline measurement — and it REFUTES the prediction it was set
 /// up to confirm.
 ///

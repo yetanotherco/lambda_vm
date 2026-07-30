@@ -612,20 +612,20 @@ pub mod keccak {
         pub use crate::lfm::layout::keccak::*;
         /// The state as received from memory, 200 byte columns, lane-major:
         /// `STATE + lane * 8 + b`.
-        pub const STATE: usize = PREP_WIDTH; // 52
+        pub const STATE: usize = PREP_WIDTH; // 56
         /// The rate block as received, 136 byte columns. Block byte `k` is byte
         /// `k % 8` of lane `k / 8` — rate bytes are lane-major and
         /// little-endian within a lane, exactly like the state columns, so
         /// block byte `k` pairs with state byte `k`. (The column-major traversal
         /// that bites elsewhere is a property of the *token element order*, not
         /// of this column layout — see `keccak_token`.)
-        pub const BLOCK: usize = STATE + 200; // 252
+        pub const BLOCK: usize = STATE + 200; // 256
         /// What enters the permutation: `STATE ⊕ BLOCK` over the rate region on
         /// absorb rows, `STATE` everywhere else.
-        pub const PERM_IN: usize = BLOCK + RATE_BYTES; // 388
+        pub const PERM_IN: usize = BLOCK + RATE_BYTES; // 392
         /// The permuted state, 200 byte columns.
-        pub const OUT: usize = PERM_IN + 200; // 588
-        pub const NUM_COLUMNS: usize = OUT + 200; // 788
+        pub const OUT: usize = PERM_IN + 200; // 592
+        pub const NUM_COLUMNS: usize = OUT + 200; // 792
 
         pub const fn state_byte(lane: usize, b: usize) -> usize {
             STATE + lane * 8 + b
