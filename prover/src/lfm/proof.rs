@@ -19,7 +19,7 @@ use stark::verifier::{IsStarkVerifier, Verifier};
 
 use crate::tables::types::{BusId, GoldilocksExtension, GoldilocksField};
 
-use super::airs::{LfmAirs, NUM_LFM_CHIPS};
+use super::airs::{LfmAirs, NUM_LFM_CHIPS, num_lfm_airs};
 use super::compiler::LfmProgram;
 use super::executor::{LfmExecError, execute};
 use super::hash::TestPermutation;
@@ -73,7 +73,7 @@ pub(crate) fn prove_traces(
     public_words: &[(u32, LfmWord)],
     options: &ProofOptions,
 ) -> Result<MultiProof<F, E, ()>, ProvingError> {
-    let airs = LfmAirs::new(&artifacts.roots, options);
+    let airs = LfmAirs::new(&artifacts.roots, options, artifacts.keccak_rnd_chunks);
     let mut transcript = DefaultTranscript::<E>::new(&[]);
     absorb_lfm_statement(
         &mut transcript,
@@ -101,33 +101,44 @@ pub fn lfm_verify(
     Ok(verify_against(
         &entry.roots,
         &entry.program_id,
+        entry.keccak_rnd_chunks,
         proof,
         claimed_public,
         options,
     ))
 }
 
-/// Verifies against a supplied root vector and program digest instead of a
-/// registry entry.
+/// Verifies against a supplied root vector, program digest and `KECCAK_RND`
+/// chunk count instead of a registry entry.
 ///
 /// The registry lookup in [`lfm_verify`] is the soundness argument's first
 /// premise and has no off-switch; this is not one. It exists for callers that
 /// legitimately hold freshly built artifacts — the registry regeneration path,
 /// and tests covering program shapes that are not (and need not be) registered,
 /// such as the per-length keccak256 programs.
+///
+/// The chunk count is supplied for the same reason the roots are: it is
+/// program shape the verifier must know to build the AIR set, and it is never
+/// read off the proof.
 pub fn verify_against(
     roots: &[Commitment; NUM_LFM_CHIPS],
     program_id: &Commitment,
+    keccak_rnd_chunks: usize,
     proof: &MultiProof<F, E, ()>,
     claimed_public: &[(u32, LfmWord)],
     options: &ProofOptions,
 ) -> bool {
+    // A zero chunk count would drop KECCAK_RND — and its constraints — from
+    // the set entirely. Reject the shape rather than build it.
+    if keccak_rnd_chunks == 0 {
+        return false;
+    }
     let view = MultiProofView::Owned(proof);
-    if view.len() != NUM_LFM_CHIPS {
+    if view.len() != num_lfm_airs(keccak_rnd_chunks) {
         return false;
     }
 
-    let airs = LfmAirs::new(roots, options);
+    let airs = LfmAirs::new(roots, options, keccak_rnd_chunks);
     let refs = airs.air_refs();
 
     let mut transcript = DefaultTranscript::<E>::new(&[]);

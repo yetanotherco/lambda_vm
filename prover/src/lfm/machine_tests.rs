@@ -125,6 +125,10 @@ fn registry_drift_trivial_v0_blowup2() {
         entry.log_heights, artifacts.log_heights,
         "group heights drifted"
     );
+    assert_eq!(
+        entry.keccak_rnd_chunks, artifacts.keccak_rnd_chunks,
+        "KECCAK_RND chunk count drifted"
+    );
     assert_eq!(entry.program_id, artifacts.program_id, "program_id drifted");
 }
 
@@ -231,6 +235,10 @@ fn registry_drift_fri_toy_v0_blowup2() {
     assert_eq!(
         entry.log_heights, artifacts.log_heights,
         "group heights drifted"
+    );
+    assert_eq!(
+        entry.keccak_rnd_chunks, artifacts.keccak_rnd_chunks,
+        "KECCAK_RND chunk count drifted"
     );
     assert_eq!(entry.program_id, artifacts.program_id, "program_id drifted");
 }
@@ -509,6 +517,10 @@ fn registry_drift_keccak_chain_v0_blowup2() {
         entry.log_heights, artifacts.log_heights,
         "group heights drifted"
     );
+    assert_eq!(
+        entry.keccak_rnd_chunks, artifacts.keccak_rnd_chunks,
+        "KECCAK_RND chunk count drifted"
+    );
     assert_eq!(entry.program_id, artifacts.program_id, "program_id drifted");
 }
 
@@ -621,6 +633,7 @@ fn keccak_sponge_reference_lengths_prove_and_verify() {
             verify_against(
                 &artifacts.roots,
                 &artifacts.program_id,
+                artifacts.keccak_rnd_chunks,
                 &proved.proof,
                 &proved.public_words,
                 &opts,
@@ -681,6 +694,7 @@ fn tampered_stream_half_rejects() {
         !verify_against(
             &artifacts.roots,
             &artifacts.program_id,
+            artifacts.keccak_rnd_chunks,
             &forged.proof,
             &honest.public_words,
             &opts,
@@ -721,6 +735,7 @@ fn tampered_absorb_xor_rejects() {
         !verify_against(
             &artifacts.roots,
             &artifacts.program_id,
+            artifacts.keccak_rnd_chunks,
             &proof,
             &exec.public_words,
             &opts,
@@ -740,6 +755,10 @@ fn registry_drift_keccak_sponge_v0_blowup2() {
     assert_eq!(
         entry.log_heights, artifacts.log_heights,
         "group heights drifted"
+    );
+    assert_eq!(
+        entry.keccak_rnd_chunks, artifacts.keccak_rnd_chunks,
+        "KECCAK_RND chunk count drifted"
     );
     assert_eq!(entry.program_id, artifacts.program_id, "program_id drifted");
 }
@@ -804,6 +823,7 @@ fn permute_row_cannot_substitute_the_permuted_state() {
         !verify_against(
             &artifacts.roots,
             &artifacts.program_id,
+            artifacts.keccak_rnd_chunks,
             &proof,
             &exec.public_words,
             &opts,
@@ -909,6 +929,7 @@ fn machine_proves_the_sample_replay() {
             verify_against(
                 &artifacts.roots,
                 &artifacts.program_id,
+                artifacts.keccak_rnd_chunks,
                 &proved.proof,
                 &proved.public_words,
                 &opts,
@@ -1197,6 +1218,7 @@ fn canonicity_guard_rejects_an_out_of_range_candidate_in_the_proof() {
         !verify_against(
             &artifacts.roots,
             &artifacts.program_id,
+            artifacts.keccak_rnd_chunks,
             &proof,
             &exec.public_words,
             &opts,
@@ -1370,6 +1392,7 @@ fn tampered_transcript_absorb_half_rejects() {
             !verify_against(
                 &artifacts.roots,
                 &artifacts.program_id,
+                artifacts.keccak_rnd_chunks,
                 &forged.proof,
                 &honest.public_words,
                 &opts,
@@ -1390,6 +1413,10 @@ fn registry_drift_transcript_replay_v0_blowup2() {
     assert_eq!(
         entry.log_heights, artifacts.log_heights,
         "group heights drifted"
+    );
+    assert_eq!(
+        entry.keccak_rnd_chunks, artifacts.keccak_rnd_chunks,
+        "KECCAK_RND chunk count drifted"
     );
     assert_eq!(entry.program_id, artifacts.program_id, "program_id drifted");
 }
@@ -1809,6 +1836,7 @@ fn append_ext_proves_and_verifies() {
         verify_against(
             &artifacts.roots,
             &artifacts.program_id,
+            artifacts.keccak_rnd_chunks,
             &proved.proof,
             &proved.public_words,
             &opts,
@@ -1939,6 +1967,7 @@ fn splice_proves_and_verifies() {
         verify_against(
             &artifacts.roots,
             &artifacts.program_id,
+            artifacts.keccak_rnd_chunks,
             &proved.proof,
             &proved.public_words,
             &opts,
@@ -2223,6 +2252,7 @@ fn tampered_statement_or_root_rejects() {
             !verify_against(
                 &artifacts.roots,
                 &artifacts.program_id,
+                artifacts.keccak_rnd_chunks,
                 &forged.proof,
                 &honest.public_words,
                 &opts,
@@ -2242,6 +2272,10 @@ fn registry_drift_statement_replay_v0_blowup2() {
     assert_eq!(
         entry.log_heights, artifacts.log_heights,
         "group heights drifted"
+    );
+    assert_eq!(
+        entry.keccak_rnd_chunks, artifacts.keccak_rnd_chunks,
+        "KECCAK_RND chunk count drifted"
     );
     assert_eq!(entry.program_id, artifacts.program_id, "program_id drifted");
 }
@@ -2287,4 +2321,415 @@ fn statement_rejects_garbage_past_the_public_output_length() {
             other.map(|_| "accepted")
         ),
     }
+}
+// ======================= KECCAK_RND chunking =======================
+//
+// `KECCAK_RND` costs 24 rows per permutation, so one instance cannot hold the
+// ~460k permutations a real proof wrap needs. These tests cover the split: the
+// shape it produces, that a multi-chunk program proves and verifies, and the
+// two ways the split itself can be wrong (a corrupted chunk, a dropped
+// permutation).
+
+use super::airs::{keccak_rnd_chunk_permutations, keccak_rnd_chunk_rows, num_lfm_airs};
+use super::chunking::KeccakChunking;
+use crate::tables::keccak_rnd;
+
+/// A 3-permutation sponge: `pad10*1` grows 280 bytes to 3 rate blocks, so at
+/// two permutations per chunk it splits unevenly (2 + 1) — the partial-final
+/// chunk is the case a uniform split would miss.
+const CHUNKED_SPONGE_LEN: usize = 280;
+
+/// Two permutations per chunk. Small enough that the multi-chunk tests prove in
+/// seconds instead of the 21,845 permutations the default policy would need.
+fn test_chunking() -> KeccakChunking {
+    KeccakChunking::from_permutations(2)
+}
+
+fn chunked_sponge_program() -> LfmProgram {
+    keccak_sponge_program(CHUNKED_SPONGE_LEN).with_keccak_chunking(test_chunking())
+}
+
+fn chunked_sponge_msg() -> Vec<u8> {
+    (0..CHUNKED_SPONGE_LEN)
+        .map(|i| (i as u8).wrapping_mul(31).wrapping_add(7))
+        .collect()
+}
+
+/// The permutation-level round operations a program's execution produces —
+/// the same list `build_traces` chunks, rebuilt here so the tamper tests can
+/// re-chunk it by hand.
+fn round_ops_of(
+    program: &LfmProgram,
+    arenas: &[Vec<LfmWord>],
+) -> Vec<crate::tables::keccak_rnd::KeccakRoundOperation> {
+    let exec = super::executor::execute(program, arenas, &super::hash::TestPermutation)
+        .expect("honest execution");
+    let ops: Vec<_> = exec
+        .records
+        .keccak
+        .iter()
+        .enumerate()
+        .map(|(row, r)| keccak_adapter::KeccakAdapterOperation {
+            tag: klayout::tag_for_row(row),
+            input: r.perm_in,
+        })
+        .collect();
+    keccak_adapter::round_operations(&ops)
+}
+
+/// Every registered program is single-chunk under the default policy, so the
+/// production path is unchanged by this feature — chunking is dormant until a
+/// program exceeds 21,845 permutations.
+#[test]
+fn registered_programs_are_single_chunk() {
+    for entry in super::registry::LFM_REGISTRY {
+        assert_eq!(
+            entry.keccak_rnd_chunks, 1,
+            "{:?} is registered with a chunk count other than 1",
+            entry.kind
+        );
+    }
+}
+
+/// The split's shape: chunk count, per-chunk permutation counts, per-chunk
+/// trace heights, AIR count and trace count all agree.
+#[test]
+fn chunking_splits_the_sponge_into_two_uneven_chunks() {
+    let program = chunked_sponge_program();
+    assert_eq!(
+        program.groups.keccak.real_rows, 3,
+        "a {CHUNKED_SPONGE_LEN}-byte message must be 3 rate blocks"
+    );
+
+    assert_eq!(keccak_rnd_chunk_permutations(&program), vec![2, 1]);
+    // 2 permutations = 48 rows → 64; 1 permutation = 24 rows → 32.
+    assert_eq!(keccak_rnd_chunk_rows(&program), vec![64, 32]);
+
+    let artifacts = build_artifacts(&program, &options());
+    assert_eq!(artifacts.keccak_rnd_chunks, 2);
+    assert_eq!(num_lfm_airs(2), super::NUM_LFM_CHIPS + 1);
+
+    let exec = super::executor::execute(
+        &program,
+        &sponge_arenas(&chunked_sponge_msg()),
+        &super::hash::TestPermutation,
+    )
+    .expect("honest execution");
+    let traces = build_traces(&program, &exec.records);
+    assert_eq!(traces.keccak_rnd.len(), 2, "one KECCAK_RND trace per chunk");
+    assert_eq!(
+        traces
+            .keccak_rnd
+            .iter()
+            .map(|t| t.num_rows())
+            .collect::<Vec<_>>(),
+        vec![64, 32],
+        "chunk traces must match the heights the artifacts predict"
+    );
+}
+
+/// ★ The acceptance test: a program needing more than one `KECCAK_RND` chunk
+/// proves and verifies end to end, and its digest still matches the production
+/// hasher.
+#[test]
+fn chunked_sponge_proves_and_verifies() {
+    let opts = options();
+    let msg = chunked_sponge_msg();
+    let program = chunked_sponge_program();
+    let artifacts = build_artifacts(&program, &opts);
+    assert_eq!(artifacts.keccak_rnd_chunks, 2, "this test needs 2 chunks");
+
+    let proved = lfm_prove(&program, &artifacts, &sponge_arenas(&msg), &opts).expect("prove");
+    assert_eq!(
+        digest_bytes(&proved.public_words),
+        keccak_host::keccak256(&msg),
+        "a chunked proof must hash the same as the production hasher"
+    );
+    assert_eq!(
+        stark::proof::view::MultiProofView::Owned(&proved.proof).len(),
+        num_lfm_airs(2),
+        "the proof must carry one sub-proof per AIR instance"
+    );
+    assert!(
+        verify_against(
+            &artifacts.roots,
+            &artifacts.program_id,
+            artifacts.keccak_rnd_chunks,
+            &proved.proof,
+            &proved.public_words,
+            &opts,
+        ),
+        "a two-chunk KECCAK_RND proof must verify"
+    );
+}
+
+/// Chunking is a prover-side layout choice, not a semantic one: the same
+/// message proved at 1 and at 2 chunks yields the same public output. (The
+/// program *identity* does differ — the chunk count is bound into the digest —
+/// which is exactly why the two need different artifacts.)
+#[test]
+fn chunking_does_not_change_what_is_proved() {
+    let opts = options();
+    let msg = chunked_sponge_msg();
+
+    let one = keccak_sponge_program(CHUNKED_SPONGE_LEN);
+    let one_artifacts = build_artifacts(&one, &opts);
+    assert_eq!(one_artifacts.keccak_rnd_chunks, 1);
+    let one_proof = lfm_prove(&one, &one_artifacts, &sponge_arenas(&msg), &opts).expect("prove");
+
+    let two = chunked_sponge_program();
+    let two_artifacts = build_artifacts(&two, &opts);
+    let two_proof = lfm_prove(&two, &two_artifacts, &sponge_arenas(&msg), &opts).expect("prove");
+
+    assert_eq!(
+        one_proof.public_words, two_proof.public_words,
+        "chunking must not change the program's output"
+    );
+    assert_eq!(
+        one_artifacts.roots, two_artifacts.roots,
+        "chunking must not move any preprocessed root"
+    );
+    assert_ne!(
+        one_artifacts.program_id, two_artifacts.program_id,
+        "the chunk count is program shape and must be bound into the digest"
+    );
+    for (artifacts, proof) in [(&one_artifacts, &one_proof), (&two_artifacts, &two_proof)] {
+        assert!(
+            verify_against(
+                &artifacts.roots,
+                &artifacts.program_id,
+                artifacts.keccak_rnd_chunks,
+                &proof.proof,
+                &proof.public_words,
+                &opts,
+            ),
+            "both chunkings must verify against their own artifacts"
+        );
+    }
+}
+
+/// ★ Tamper: corrupting a permutation that lives in the *second* chunk must
+/// reject. The first chunk is untouched, so this only rejects if chunk 1's
+/// rows are really part of the proof's bus balance.
+#[test]
+fn tampered_second_chunk_permutation_rejects() {
+    let opts = options();
+    let msg = chunked_sponge_msg();
+    let program = chunked_sponge_program();
+    let artifacts = build_artifacts(&program, &opts);
+    let exec = super::executor::execute(
+        &program,
+        &sponge_arenas(&msg),
+        &super::hash::TestPermutation,
+    )
+    .expect("honest execution");
+
+    let mut traces = build_traces(&program, &exec.records);
+    assert_eq!(traces.keccak_rnd.len(), 2);
+    // Byte 0 of lane (0,0) on the second chunk's first row: the `Keccak`
+    // receive token no longer matches the send that fed it.
+    let col = keccak_rnd::cols::start(0, 0, 0);
+    let old = traces.keccak_rnd[1].main_table.get_row(0)[col];
+    traces.keccak_rnd[1]
+        .main_table
+        .set_fe(0, col, old + FE::from(1u64));
+
+    let proof =
+        prove_traces(&artifacts, &mut traces, &exec.public_words, &opts).expect("prover accepts");
+    assert!(
+        !verify_against(
+            &artifacts.roots,
+            &artifacts.program_id,
+            artifacts.keccak_rnd_chunks,
+            &proof,
+            &exec.public_words,
+            &opts,
+        ),
+        "a corrupted permutation in the second chunk must reject"
+    );
+}
+
+/// ★ Falsifies the split itself: drop the permutation the second chunk holds.
+/// The `LFM_KECCAK` chip still sends its request token, so the `Keccak` bus is
+/// left with a send that nothing receives. If this ever accepts, chunks are
+/// not actually contributing their rows to the balance.
+#[test]
+fn dropping_the_second_chunks_permutation_rejects() {
+    let opts = options();
+    let msg = chunked_sponge_msg();
+    let program = chunked_sponge_program();
+    let artifacts = build_artifacts(&program, &opts);
+    let exec = super::executor::execute(
+        &program,
+        &sponge_arenas(&msg),
+        &super::hash::TestPermutation,
+    )
+    .expect("honest execution");
+
+    let mut traces = build_traces(&program, &exec.records);
+    // Same chunk COUNT — so the AIR set and the digest still match — but the
+    // last chunk is now empty.
+    traces.keccak_rnd[1] = keccak_rnd::generate_keccak_rnd_trace(&[]);
+
+    let proof =
+        prove_traces(&artifacts, &mut traces, &exec.public_words, &opts).expect("prover accepts");
+    assert!(
+        !verify_against(
+            &artifacts.roots,
+            &artifacts.program_id,
+            artifacts.keccak_rnd_chunks,
+            &proof,
+            &exec.public_words,
+            &opts,
+        ),
+        "a chunk missing its permutation must reject"
+    );
+}
+
+/// The mechanism's foundation, stated positively: which chunk a permutation
+/// lands in is free. `KECCAK_RND` has no row-to-row constraints and its rounds
+/// are linked by `Keccak` bus tokens rather than row adjacency, so LogUp
+/// cannot tell a 2+1 split from a 1+2 one. This is why chunking needs no
+/// pairing logic — and if it ever fails, the round chip has grown a
+/// cross-row dependency that chunking would silently break.
+#[test]
+fn permutations_may_be_reassigned_across_chunk_boundaries() {
+    let opts = options();
+    let msg = chunked_sponge_msg();
+    let program = chunked_sponge_program();
+    let artifacts = build_artifacts(&program, &opts);
+    let exec = super::executor::execute(
+        &program,
+        &sponge_arenas(&msg),
+        &super::hash::TestPermutation,
+    )
+    .expect("honest execution");
+
+    let round_ops = round_ops_of(&program, &sponge_arenas(&msg));
+    assert_eq!(round_ops.len(), 3);
+
+    let mut traces = build_traces(&program, &exec.records);
+    // Canonical split is 2 + 1; re-split as 1 + 2.
+    traces.keccak_rnd[0] = keccak_rnd::generate_keccak_rnd_trace(&round_ops[..1]);
+    traces.keccak_rnd[1] = keccak_rnd::generate_keccak_rnd_trace(&round_ops[1..]);
+
+    let proof =
+        prove_traces(&artifacts, &mut traces, &exec.public_words, &opts).expect("prover accepts");
+    assert!(
+        verify_against(
+            &artifacts.roots,
+            &artifacts.program_id,
+            artifacts.keccak_rnd_chunks,
+            &proof,
+            &exec.public_words,
+            &opts,
+        ),
+        "chunk assignment is free — a 1+2 split proves the same statement as 2+1"
+    );
+}
+
+/// The verifier builds its AIR set from the supplied chunk count, so a count
+/// that disagrees with the proof's shape must be rejected — including zero,
+/// which would drop `KECCAK_RND` and its constraints from the set.
+///
+/// Two layers enforce this and the test does not distinguish them: the
+/// explicit length check in `verify_against`, and the framework's own
+/// AIR-count handling. Measured: deleting the explicit check leaves this test
+/// green, so it pins the *behaviour*, not that particular guard. The guard
+/// stays because it makes the shape contract local and legible, not because
+/// this test would catch its removal.
+#[test]
+fn verify_rejects_a_chunk_count_that_does_not_match_the_proof() {
+    let opts = options();
+    let msg = chunked_sponge_msg();
+    let program = chunked_sponge_program();
+    let artifacts = build_artifacts(&program, &opts);
+    let proved = lfm_prove(&program, &artifacts, &sponge_arenas(&msg), &opts).expect("prove");
+
+    for wrong in [0usize, 1, 3, 14] {
+        assert!(
+            !verify_against(
+                &artifacts.roots,
+                &artifacts.program_id,
+                wrong,
+                &proved.proof,
+                &proved.public_words,
+                &opts,
+            ),
+            "chunk count {wrong} must not verify a 2-chunk proof"
+        );
+    }
+}
+
+/// What chunking costs: `KECCAK_RND` pads each chunk to its own power of two,
+/// so the only overhead is padding, and splitting can even reduce it.
+#[test]
+fn chunking_cell_cost() {
+    let one = keccak_sponge_program(CHUNKED_SPONGE_LEN);
+    let two = chunked_sponge_program();
+    let perms = one.groups.keccak.real_rows as u64;
+
+    let (main_one, aux_one) = super::airs::lfm_cell_counts(&one);
+    let (main_two, aux_two) = super::airs::lfm_cell_counts(&two);
+    println!(
+        "{CHUNKED_SPONGE_LEN}-byte sponge, {perms} permutations:\n  \
+         1 chunk  rows {:?} main {main_one} aux {aux_one}\n  \
+         2 chunks rows {:?} main {main_two} aux {aux_two}\n  \
+         delta main {} aux {}",
+        keccak_rnd_chunk_rows(&one),
+        keccak_rnd_chunk_rows(&two),
+        main_two as i64 - main_one as i64,
+        aux_two as i64 - aux_one as i64,
+    );
+
+    // KECCAK_RND rows are the only thing chunking moves; here 128 padded rows
+    // in one chunk versus 64 + 32 in two.
+    assert_eq!(keccak_rnd_chunk_rows(&one).iter().sum::<usize>(), 128);
+    assert_eq!(keccak_rnd_chunk_rows(&two).iter().sum::<usize>(), 96);
+    assert!(
+        main_two < main_one,
+        "this split lands on tighter power-of-two boundaries, so it is cheaper"
+    );
+}
+
+/// At the default policy's geometry chunking does not cost rows, it saves
+/// them. A single table must pad to one power of two for the whole program; N
+/// chunks each pad to their own, and every full chunk is within 8 rows of its
+/// power of two by construction.
+#[test]
+fn default_policy_beats_a_single_table_at_wrap_scale() {
+    let c = KeccakChunking::default();
+    let per = c.permutations_per_chunk();
+    let full_chunk_rows = (per * 24).next_power_of_two();
+    assert_eq!(full_chunk_rows, 1 << 19);
+    assert_eq!(
+        full_chunk_rows - per * 24,
+        8,
+        "a full chunk wastes 8 rows of 524,288"
+    );
+
+    // The proof wrap this feature exists for.
+    const WRAP_PERMUTATIONS: usize = 460_000;
+    let chunks = c.chunk_count(WRAP_PERMUTATIONS);
+    assert_eq!(chunks, 22, "21 full chunks plus a partial one");
+
+    let chunked_rows: usize = (0..chunks)
+        .map(|i| {
+            let perms = WRAP_PERMUTATIONS.saturating_sub(i * per).min(per);
+            (perms * 24).next_power_of_two().max(4)
+        })
+        .sum();
+    let single_table_rows = (WRAP_PERMUTATIONS * 24).next_power_of_two();
+
+    println!(
+        "{WRAP_PERMUTATIONS} permutations: {chunks} chunks = {chunked_rows} rows, \
+         single table = {single_table_rows} rows ({:.1}% saved)",
+        100.0 * (1.0 - chunked_rows as f64 / single_table_rows as f64),
+    );
+    assert!(
+        chunked_rows < single_table_rows,
+        "chunking must not cost more rows than one table would"
+    );
+    // 2^24 rows at 1480 columns is also far past what one table can hold.
+    assert_eq!(single_table_rows, 1 << 24);
 }

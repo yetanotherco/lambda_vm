@@ -18,6 +18,7 @@
 pub mod airs;
 pub mod builder;
 pub mod chips;
+pub mod chunking;
 pub mod commit;
 pub mod compiler;
 pub mod edsl;
@@ -38,8 +39,9 @@ pub mod transcript_replay;
 pub mod validator;
 pub mod word;
 
-pub use airs::{LfmAirs, NUM_LFM_CHIPS};
+pub use airs::{LfmAirs, NUM_LFM_CHIPS, num_lfm_airs};
 pub use builder::{ArenaSchema, LfmBuilder, LfmProgramSource};
+pub use chunking::{KECCAK_RND_MAX_CHUNK_ROWS, KeccakChunking};
 pub use commit::{commit_columns, commit_group};
 pub use compiler::{ColumnGroup, LfmColumnGroups, LfmProgram, compile};
 pub use executor::{LfmExecError, LfmExecution, LfmRecords, execute};

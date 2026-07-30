@@ -40,6 +40,12 @@ pub type DynLfmAir<'a> = &'a dyn AIR<Field = F, FieldExtension = E, PublicInputs
 /// heights do, so a program stays nothing but a vector of preprocessed roots
 /// plus a registry entry. Making the set program-dependent would move shape
 /// negotiation onto the verify path, which this design refuses.
+///
+/// This is the count of chip *classes*, and the width of the roots and
+/// log-heights arrays. `KECCAK_RND` (slot 11) may be instantiated more than
+/// once — see [`num_lfm_airs`] — but its chunk count is program shape read
+/// from the registry, not shape negotiated on the verify path, so the
+/// principle above holds.
 pub const NUM_LFM_CHIPS: usize = 14;
 pub const LFM_CHIP_NAMES: [&str; NUM_LFM_CHIPS] = [
     "LFM_CONST",
@@ -60,14 +66,39 @@ pub const LFM_CHIP_NAMES: [&str; NUM_LFM_CHIPS] = [
 
 /// Slot of `KECCAK_RND`, the one AIR in the set with **no** preprocessed
 /// columns — it has no root to supply, pin, or bind into the program digest.
+/// It is also the one slot that expands into several AIR instances; the
+/// chunks sit contiguously at 11.., so `KECCAK_RC` and `BITWISE` follow them
+/// in the AIR list while keeping chip-class indices 12 and 13 in the roots
+/// and log-heights arrays.
 pub const KECCAK_RND_SLOT: usize = 11;
 
-/// `KECCAK_RND`'s trace height: 24 rows per permutation, padded — the same
-/// `.next_power_of_two().max(4)` rule `generate_keccak_rnd_trace` applies.
-fn keccak_rnd_rows(program: &super::compiler::LfmProgram) -> usize {
-    (program.groups.keccak.real_rows * 24)
-        .next_power_of_two()
-        .max(4)
+/// AIR instances (and sub-proofs) in a proof whose `KECCAK_RND` is split into
+/// `keccak_rnd_chunks` instances.
+pub const fn num_lfm_airs(keccak_rnd_chunks: usize) -> usize {
+    NUM_LFM_CHIPS - 1 + keccak_rnd_chunks
+}
+
+/// Permutations in each `KECCAK_RND` chunk, in chunk order.
+pub fn keccak_rnd_chunk_permutations(program: &super::compiler::LfmProgram) -> Vec<usize> {
+    let total = program.groups.keccak.real_rows;
+    let per = program.chunking.permutations_per_chunk();
+    (0..program.chunking.chunk_count(total))
+        .map(|i| total.saturating_sub(i * per).min(per))
+        .collect()
+}
+
+/// Each `KECCAK_RND` chunk's trace height: 24 rows per permutation, padded —
+/// the same `.next_power_of_two().max(4)` rule `generate_keccak_rnd_trace`
+/// applies, now once per chunk.
+pub fn keccak_rnd_chunk_rows(program: &super::compiler::LfmProgram) -> Vec<usize> {
+    keccak_rnd_chunk_permutations(program)
+        .into_iter()
+        .map(|perms| {
+            (perms * super::chunking::KECCAK_RND_ROWS_PER_PERMUTATION)
+                .next_power_of_two()
+                .max(4)
+        })
+        .collect()
 }
 
 /// Trace-cell counts for a compiled program, the LFM analogue of the VM's
@@ -79,7 +110,8 @@ fn keccak_rnd_rows(program: &super::compiler::LfmProgram) -> usize {
 pub fn lfm_cell_counts(program: &super::compiler::LfmProgram) -> (u64, u64) {
     let range_rows = layout::range::NUM_ROWS as u64;
     let g = &program.groups;
-    let per_chip: [(u64, usize, usize, usize); NUM_LFM_CHIPS] = [
+    // Every chip class except `KECCAK_RND`, which is counted per chunk below.
+    let per_chip: [(u64, usize, usize, usize); NUM_LFM_CHIPS - 1] = [
         (
             g.const_.padded_rows as u64,
             const_::cols::NUM_COLUMNS,
@@ -146,14 +178,7 @@ pub fn lfm_cell_counts(program: &super::compiler::LfmProgram) -> (u64, u64) {
             layout::range::PREP_WIDTH,
             range::bus_interactions().len(),
         ),
-        // The keccak family's own heights: KECCAK_RND is 24 rows per
-        // permutation, the other two are fixed tables.
-        (
-            keccak_rnd_rows(program) as u64,
-            keccak_rnd::cols::NUM_COLUMNS,
-            0,
-            keccak_rnd::bus_interactions().len(),
-        ),
+        // The keccak family's two fixed tables. `KECCAK_RND`'s chunks follow.
         (
             keccak_rc::NUM_ROWS as u64,
             keccak_rc::cols::NUM_COLUMNS,
@@ -173,6 +198,11 @@ pub fn lfm_cell_counts(program: &super::compiler::LfmProgram) -> (u64, u64) {
         main += rows * (num_cols - prep) as u64;
         aux += rows * interactions.div_ceil(2) as u64;
     }
+    let rnd_interactions = keccak_rnd::bus_interactions().len();
+    for rows in keccak_rnd_chunk_rows(program) {
+        main += rows as u64 * keccak_rnd::cols::NUM_COLUMNS as u64;
+        aux += rows as u64 * rnd_interactions.div_ceil(2) as u64;
+    }
     (main, aux)
 }
 
@@ -188,7 +218,10 @@ pub struct LfmAirs {
     hint: LfmAir<EmptyConstraints>,
     public: LfmAir<EmptyConstraints>,
     range: LfmAir<EmptyConstraints>,
-    keccak_rnd: LfmAir<keccak_rnd::KeccakRndConstraints>,
+    /// One instance per `KECCAK_RND` chunk. Every instance is the identical
+    /// AIR — chunking changes only how many rows each one carries — so they
+    /// are built in a loop rather than named individually.
+    keccak_rnd: Vec<LfmAir<keccak_rnd::KeccakRndConstraints>>,
     keccak_rc: LfmAir<EmptyConstraints>,
     bitwise: LfmAir<EmptyConstraints>,
 }
@@ -234,8 +267,17 @@ fn build_air<CS: ConstraintSet<F, E> + 'static>(
 
 impl LfmAirs {
     /// Builds the chip set against the supplied (registry-resolved or
-    /// freshly built) instruction-column-group roots, in the frozen order.
-    pub fn new(roots: &[Commitment; NUM_LFM_CHIPS], options: &ProofOptions) -> Self {
+    /// freshly built) instruction-column-group roots, in the frozen order,
+    /// with `KECCAK_RND` instantiated `keccak_rnd_chunks` times.
+    ///
+    /// A zero chunk count builds no `KECCAK_RND` at all; callers on the verify
+    /// path must reject that shape before getting here rather than relying on
+    /// the resulting AIR-count mismatch (`verify_against` does).
+    pub fn new(
+        roots: &[Commitment; NUM_LFM_CHIPS],
+        options: &ProofOptions,
+        keccak_rnd_chunks: usize,
+    ) -> Self {
         LfmAirs {
             const_: build_air(
                 const_::cols::NUM_COLUMNS,
@@ -339,14 +381,20 @@ impl LfmAirs {
             // KECCAK_RND has no preprocessed columns: `roots[KECCAK_RND_SLOT]`
             // is the all-zero sentinel and is never consulted. Its correctness
             // is entirely its own constraints plus bus balance, both
-            // program-independent, so there is nothing for a root to pin.
-            keccak_rnd: build_air_no_prep(
-                keccak_rnd::cols::NUM_COLUMNS,
-                keccak_rnd::bus_interactions(),
-                options,
-                keccak_rnd::KeccakRndConstraints,
-                LFM_CHIP_NAMES[11],
-            ),
+            // program-independent, so there is nothing for a root to pin —
+            // and nothing that differs between chunks either, which is why
+            // every instance is built from the same arguments.
+            keccak_rnd: (0..keccak_rnd_chunks)
+                .map(|_| {
+                    build_air_no_prep(
+                        keccak_rnd::cols::NUM_COLUMNS,
+                        keccak_rnd::bus_interactions(),
+                        options,
+                        keccak_rnd::KeccakRndConstraints,
+                        LFM_CHIP_NAMES[11],
+                    )
+                })
+                .collect(),
             keccak_rc: build_air(
                 keccak_rc::cols::NUM_COLUMNS,
                 keccak_rc::bus_interactions(),
@@ -368,9 +416,14 @@ impl LfmAirs {
         }
     }
 
+    /// Number of `KECCAK_RND` instances this set was built with.
+    pub fn keccak_rnd_chunks(&self) -> usize {
+        self.keccak_rnd.len()
+    }
+
     /// Verify-side projection, frozen order (must match `air_trace_pairs`).
     pub fn air_refs(&self) -> Vec<DynLfmAir<'_>> {
-        vec![
+        let mut refs: Vec<DynLfmAir<'_>> = vec![
             &self.const_,
             &self.balu,
             &self.xalu,
@@ -382,19 +435,29 @@ impl LfmAirs {
             &self.hint,
             &self.public,
             &self.range,
-            &self.keccak_rnd,
-            &self.keccak_rc,
-            &self.bitwise,
-        ]
+        ];
+        refs.extend(self.keccak_rnd.iter().map(|a| a as DynLfmAir<'_>));
+        refs.push(&self.keccak_rc);
+        refs.push(&self.bitwise);
+        refs
     }
 
     /// Prove-side projection, frozen order (must match `air_refs`).
+    ///
+    /// `traces.keccak_rnd` must have exactly one trace per chunk; a mismatch
+    /// would silently shorten the pair list under `zip`, so it is asserted.
     #[allow(clippy::type_complexity)]
     pub fn air_trace_pairs<'a>(
         &'a self,
         traces: &'a mut LfmTraces,
     ) -> Vec<(DynLfmAir<'a>, &'a mut TraceTable<F, E>, &'a ())> {
-        vec![
+        debug_assert_eq!(
+            self.keccak_rnd.len(),
+            traces.keccak_rnd.len(),
+            "KECCAK_RND chunk count differs between the AIR set and the traces \
+             — artifacts and traces were built from different chunking policies"
+        );
+        let mut pairs: Vec<(DynLfmAir<'a>, &'a mut TraceTable<F, E>, &'a ())> = vec![
             (&self.const_, &mut traces.const_, &()),
             (&self.balu, &mut traces.balu, &()),
             (&self.xalu, &mut traces.xalu, &()),
@@ -406,9 +469,15 @@ impl LfmAirs {
             (&self.hint, &mut traces.hint, &()),
             (&self.public, &mut traces.public, &()),
             (&self.range, &mut traces.range, &()),
-            (&self.keccak_rnd, &mut traces.keccak_rnd, &()),
-            (&self.keccak_rc, &mut traces.keccak_rc, &()),
-            (&self.bitwise, &mut traces.bitwise, &()),
-        ]
+        ];
+        pairs.extend(
+            self.keccak_rnd
+                .iter()
+                .zip(traces.keccak_rnd.iter_mut())
+                .map(|(air, trace)| (air as DynLfmAir<'a>, trace, &())),
+        );
+        pairs.push((&self.keccak_rc, &mut traces.keccak_rc, &()));
+        pairs.push((&self.bitwise, &mut traces.bitwise, &()));
+        pairs
     }
 }
