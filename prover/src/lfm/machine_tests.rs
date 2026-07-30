@@ -2733,3 +2733,39 @@ fn default_policy_beats_a_single_table_at_wrap_scale() {
     // 2^24 rows at 1480 columns is also far past what one table can hold.
     assert_eq!(single_table_rows, 1 << 24);
 }
+
+// ================= R1f slice b: real continuation-proof bytes =================
+
+use super::proof_fixture;
+
+/// Cache path for the fixture blob. Outside the repository on purpose: a
+/// checked-in binary can drift from the encoder silently, so the generation path
+/// is what a cold run exercises.
+fn fixture_cache() -> std::path::PathBuf {
+    std::env::temp_dir().join("lfm-r1f-continuation-fixture.bin")
+}
+
+/// R1f(b): the machine's fixture is a REAL two-epoch continuation proof, encoded
+/// by the same function that builds the recursion guest's private input.
+#[test]
+fn continuation_fixture_generates_two_epochs() {
+    let (blob, num_epochs) = proof_fixture::generate();
+    println!(
+        "R1f fixture: inner={} epoch_log2={} epochs={} blob={} bytes",
+        proof_fixture::FIXTURE_INNER_ELF,
+        proof_fixture::FIXTURE_EPOCH_LOG2,
+        num_epochs,
+        blob.len()
+    );
+    assert!(
+        proof_fixture::has_recursion_prefix(&blob),
+        "the blob must carry the recursion input wire format's magic prefix"
+    );
+    assert!(
+        num_epochs >= 2,
+        "a CONTINUATION fixture needs more than one epoch, got {num_epochs} — \
+         lower FIXTURE_EPOCH_LOG2"
+    );
+    // Cache it for the slices that consume it.
+    let _ = std::fs::write(fixture_cache(), &blob);
+}
