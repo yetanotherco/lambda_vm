@@ -473,6 +473,20 @@ impl ArchivedContinuationProof {
     pub(crate) fn epoch_public_output(&self, i: usize) -> &[u8] {
         self.epochs[i].public_output.as_slice()
     }
+
+    /// Epoch `i`'s own committed L2G table root — the left-hand side of the
+    /// cross-epoch binding [`crate::verify_l2g_commitment_binding_view`] checks
+    /// against the global proof's `i`-th sub-proof.
+    pub(crate) fn epoch_l2g_root(&self, i: usize) -> Commitment {
+        self.epochs[i].l2g_root
+    }
+
+    /// The one cross-epoch global-memory proof, as the same view the verifier
+    /// reads in place. Its first `num_epochs()` sub-proofs are the per-epoch L2G
+    /// tables the binding ties to.
+    pub(crate) fn global_proof(&self) -> MultiProofView<'_, F, E, ()> {
+        MultiProofView::Archived(&self.global)
+    }
 }
 
 /// Borrowed view over an [`EpochProof`] (owned or archived-in-place). Lets

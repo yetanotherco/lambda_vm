@@ -751,3 +751,66 @@ pub fn keccak_merkle_opening_program_source(shape: MerkleOpeningShape) -> LfmPro
 pub fn keccak_merkle_opening_program(shape: MerkleOpeningShape) -> LfmProgram {
     compile(keccak_merkle_opening_program_source(shape))
 }
+
+// ============ R1g(ii): the cross-epoch L2G commitment binding ============
+
+/// Ties each epoch's own committed L2G root to the corresponding sub-proof of
+/// the global proof — `verify_l2g_commitment_binding_view` (`lib.rs:993`),
+/// emitted.
+///
+/// Two arenas, each root in its own two words:
+///
+/// 0. the per-epoch L2G roots, `EpochProof::l2g_root`, epoch order;
+/// 1. the global proof's first `num_epochs` sub-proof main-trace roots.
+///
+/// Every pair is asserted equal and the epoch side is published. As in
+/// [`keccak_merkle_opening_program_source`], the assert is the relation and the
+/// publish is what makes it a claim: the equality alone would be satisfied by
+/// any two matching arena values, so the published roots are what a verifier
+/// pins against the real bundle.
+///
+/// ## What binds each side, and what this slice does not do
+///
+/// This program asserts the RELATION. What binds each root to its proof is the
+/// composition's job: the epoch root is bound by that epoch's own Phase A
+/// absorb, the global root by the global proof's. Until those legs exist, both
+/// sides are arena values and a prover could satisfy the equality with two
+/// matching lies — which is exactly why the roots are published rather than
+/// merely compared.
+///
+/// ## Why the epoch count is a constant
+///
+/// `num_epochs` is shape: it fixes how many roots are read and how many asserts
+/// are emitted. Production's `final_proof.len() >= epoch_l2g_roots.len()` guard
+/// has no counterpart here because a program compiled for `n` epochs cannot read
+/// an `n+1`-epoch bundle — the arena schema would not match.
+pub fn l2g_binding_program_source(num_epochs: usize) -> LfmProgramSource {
+    use super::edsl;
+
+    assert!(num_epochs > 0, "a continuation has at least one epoch");
+
+    let words = 2 * num_epochs as u32;
+    let mut b = LfmBuilder::new();
+    let epoch_arena = b.declare_arena(words);
+    let global_arena = b.declare_arena(words);
+
+    for i in 0..num_epochs as u32 {
+        let epoch = [
+            b.hint_word(epoch_arena, 2 * i),
+            b.hint_word(epoch_arena, 2 * i + 1),
+        ];
+        let global = [
+            b.hint_word(global_arena, 2 * i),
+            b.hint_word(global_arena, 2 * i + 1),
+        ];
+        edsl::assert_word_eq(&mut b, epoch[0], global[0]);
+        edsl::assert_word_eq(&mut b, epoch[1], global[1]);
+        b.public(epoch[0]);
+        b.public(epoch[1]);
+    }
+    b.finish()
+}
+
+pub fn l2g_binding_program(num_epochs: usize) -> LfmProgram {
+    compile(l2g_binding_program_source(num_epochs))
+}

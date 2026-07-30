@@ -253,3 +253,41 @@ pub fn walk_to_root(leaf: Commitment, index: usize, siblings: &[Commitment]) -> 
     }
     node
 }
+
+// ==================== the cross-epoch L2G binding ====================
+
+/// Each epoch's own committed L2G table root, in epoch order.
+///
+/// The left-hand side of `verify_l2g_commitment_binding_view`: epoch `i`'s
+/// `EpochProof::l2g_root`, which that epoch's own proof commits to.
+pub fn epoch_l2g_roots(archive: &FixtureArchive) -> Vec<Commitment> {
+    let bundle = &archive.guest_input().bundle;
+    (0..bundle.num_epochs())
+        .map(|i| bundle.epoch_l2g_root(i))
+        .collect()
+}
+
+/// The global proof's first `count` sub-proof main-trace roots — the right-hand
+/// side of the same binding.
+///
+/// The global proof carries one L2G sub-proof per epoch FIRST, then
+/// GLOBAL_MEMORY, so sub-proof `i` is epoch `i`'s L2G table. Production also
+/// checks `final_proof.len() >= epoch_l2g_roots.len()`; here that is structural,
+/// since a machine program compiled for `n` epochs reads exactly `n` roots and
+/// this function panics rather than short-reading.
+pub fn global_l2g_roots(archive: &FixtureArchive, count: usize) -> Vec<Commitment> {
+    let global = archive.guest_input().bundle.global_proof();
+    assert!(
+        global.len() >= count,
+        "the global proof has {} sub-proofs, need {count}",
+        global.len()
+    );
+    (0..count)
+        .map(|i| *global.get(i).lde_trace_main_merkle_root())
+        .collect()
+}
+
+/// Commitments as arena words, two per root, in order.
+pub fn commitments_to_arena(roots: &[Commitment]) -> Vec<LfmWord> {
+    roots.iter().flat_map(commitment_words).collect()
+}
