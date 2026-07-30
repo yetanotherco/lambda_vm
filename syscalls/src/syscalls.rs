@@ -33,7 +33,7 @@ const KECCAK_SYSCALL_NUMBER: usize = usize::MAX - 1;
 #[cfg(target_arch = "riscv64")]
 const ECSM_SYSCALL_NUMBER: usize = usize::MAX - 10;
 
-/// Syscall number for the non-constraining Hint ecall (BENCH ONLY).
+/// Syscall number for the non-constraining Hint ecall.
 /// Must match `executor::...::execution::HINT_SYSCALL_NUMBER` (u64::MAX - 20).
 #[cfg(target_arch = "riscv64")]
 const HINT_SYSCALL_NUMBER: usize = usize::MAX - 20;
@@ -197,13 +197,14 @@ pub fn ecsm_mul(_xr: &mut [u8; 32], _xg: &[u8; 32], _k: &[u8; 32]) {
     unimplemented!("syscalls are only implemented for riscv64 targets");
 }
 
-/// BENCH ONLY. Ask the host for a non-constraining hint (modular inverse/sqrt).
+/// Ask the host for a non-constraining hint (modular inverse/sqrt).
 /// `hint_id` selects the operation ([`HINT_FIELD_INV`]/[`HINT_SCALAR_INV`]/
 /// [`HINT_FIELD_SQRT`]); `input`/`out` are 32-byte **big-endian** field/scalar
 /// elements — k256's own serialization, so consumers pass `to_bytes()` straight
 /// through. Note this differs from [`ecsm_mul`], which is little-endian.
-/// The result is UNVERIFIED — the caller MUST check it in-guest
-/// (e.g. `x·inv == 1`), since this ecall adds no correctness constraint.
+/// The result is UNTRUSTED — the caller MUST verify it in-guest (e.g. `x·inv == 1`)
+/// AND recompute in software on failure, since this ecall adds no correctness
+/// constraint and the prover chooses the returned bytes.
 #[cfg(target_arch = "riscv64")]
 pub fn hint(hint_id: usize, out: &mut [u8; 32], input: &[u8; 32]) {
     unsafe {

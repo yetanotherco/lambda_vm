@@ -657,7 +657,7 @@ fn collect_ops_from_cpu(
             ecdas_ops.extend(ecdas_rows);
         }
 
-        // Collect Hint ecall operations (the 32-byte output write). BENCH ONLY.
+        // Collect Hint ecall operations (the 32-byte output write).
         if op.ecall_hint {
             let (hint_memw, hint_op) = collect_hint_ops(op, memory_state, register_state);
             memw.extend_ops(hint_memw);
@@ -959,7 +959,7 @@ fn collect_ecsm_ops(
     (memw_ops, ecsm_op, ecdas_ops)
 }
 
-/// Collects the memory operations for a `Hint` ecall (BENCH ONLY).
+/// Collects the memory operations for a `Hint` ecall.
 ///
 /// The `hint` ecall writes a 32-byte value (a modular inverse / sqrt) to guest
 /// memory *directly* — bypassing the CPU load/store decode — so the trace builder
@@ -2816,7 +2816,7 @@ pub struct Traces {
     /// ECDAS double/add table (variable rows per ecall)
     pub ecdas: TraceTable<GoldilocksField, GoldilocksExtension>,
 
-    /// HINT table (one row per non-constraining hint ecall). BENCH ONLY.
+    /// HINT table (one row per non-constraining hint ecall).
     pub hint: TraceTable<GoldilocksField, GoldilocksExtension>,
 
     /// MEMW_R register-only fast-path traces (split into chunks of max_rows::MEMW_R)
@@ -2861,7 +2861,7 @@ struct CollectedOps {
     // EC scalar-multiplication accelerator chips.
     ecsm_ops: Vec<ecsm::EcsmOperation>,
     ecdas_ops: Vec<ecdas::EcdasOperation>,
-    // Non-constraining hint ecall (BENCH ONLY).
+    // Non-constraining hint ecall.
     hint_ops: Vec<hint::HintOperation>,
 }
 
@@ -3468,7 +3468,7 @@ fn build_traces<I: ImageSource + Sync>(
     // ECSM accelerator traces (empty/all-padding for programs that do not use ECSM).
     let gen_ecsm = || ecsm::generate_ecsm_trace(&ecsm_ops);
     let gen_ecdas = || ecdas::generate_ecdas_trace(&ecdas_ops);
-    // HINT table (all-padding for programs that make no hint ecalls). BENCH ONLY.
+    // HINT table (all-padding for programs that make no hint ecalls).
     let gen_hint = || hint::generate_hint_trace(&hint_ops);
 
     let (mut cpus_slot, mut memws_slot, mut memw_aligneds_slot, mut memw_registers_slot) =

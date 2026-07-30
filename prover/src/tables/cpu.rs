@@ -189,9 +189,9 @@ pub struct CpuOperation {
     /// Whether this ECALL is an ECSM (elliptic-curve scalar multiply) syscall
     pub ecall_ecsm: bool,
 
-    /// Whether this ECALL is a non-constraining Hint syscall (BENCH ONLY). The
-    /// hint operand addresses (x10/x11/x12) are recovered from the register state
-    /// in the trace builder, exactly like ECSM.
+    /// Whether this ECALL is a non-constraining Hint syscall. The hint operand
+    /// addresses (x10/x11/x12) are recovered from the register state in the trace
+    /// builder, exactly like ECSM.
     pub ecall_hint: bool,
 }
 
