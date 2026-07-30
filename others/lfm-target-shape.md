@@ -155,6 +155,44 @@ too — from program text.** Reading it from an arena hands the prover a degree 
 freedom the protocol does not give them, and it is invisible in a differential
 test that feeds both sides the same frame.
 
+## A degenerate parameter hides implementations from every real test
+
+Third member of the same family, and the most general.
+
+**When every production instance shares one value of a parameter, a differential
+over production data cannot distinguish implementations that differ only off
+that value.** The real data does not exercise the difference, so the wrong
+implementation passes — not by luck, but structurally. The synthetic case is the
+only witness there can be.
+
+Two instances so far, both in the constraint/DEEP legs:
+
+- **`step_size = 1`.** `build_pruned_trace_term_coeffs` walks column-major, so
+  along a fixed row the γ exponent advances by the block's ROW COUNT, not by one.
+  Every one of the 28 production AIRs has `step_size = 1` and a single next row,
+  collapsing both strides to one. A per-row Horner in plain γ therefore passes
+  the real-proof differential against the production reconstruction, the census,
+  and every other test in the suite — and is wrong for the first AIR that widens
+  a step. Witnessed by `the_coefficient_exponent_formula_holds_at_a_wider_step`,
+  which builds a `step_size = 2` layout through the verifier's own
+  `build_pruned_trace_term_coeffs`.
+- **`end_exemptions = 0`.** Every production constraint emits through
+  `RowDomain::ALL`, so a consumer that ignored the field entirely would pass the
+  whole production sweep. `crypto/stark`'s `ExemptConstraints` exists for exactly
+  this reason, and its author says so: "so that *always zero in production*
+  cannot decay into *never tested*".
+
+**The falsification needs two halves.** Showing the synthetic case passes proves
+nothing on its own — a test that only checks the right answer passes against
+both implementations if the wrong one happens to agree there too. It must also
+assert that the DEGENERATE reading gives a DIFFERENT answer at the synthetic
+value. Without that second half the test passes against the wrong emitter, which
+is the failure mode it exists to prevent.
+
+How to find these: for each parameter a leg consumes, ask what values production
+actually takes. If the answer is "one", that parameter needs a synthetic witness
+before the leg can be called tested.
+
 ## Alignment is a property of the cursor, not the field (R1e)
 
 A 32-byte root is self-aligned and still lands misaligned if it inherits an odd
