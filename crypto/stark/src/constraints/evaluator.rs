@@ -358,8 +358,9 @@ where
             b_is_aux: &b_is_aux,
             b_value: &b_value,
             b_beta: boundary_coefficients,
-            // Per-constraint vectors as-is; the device layer uploads each slice
-            // directly (no flattened host copy of num_boundary × lde_size).
+            // Per-constraint vectors as-is; the device layer D2D-copies each
+            // column from the process-wide resident `GpuBaseVec` cache (no
+            // flattened host copy of num_boundary × lde_size, no re-upload).
             b_z_inv: boundary_z_inv,
         };
 

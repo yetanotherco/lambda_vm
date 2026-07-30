@@ -25,10 +25,6 @@ use crate::ntt::{twiddles_forward, twiddles_inverse};
 pub struct PinnedStaging {
     ptr: *mut u64,
     capacity_elems: usize,
-    /// Pool-wide first-allocation size hint (u64 elems), shared by every slot
-    /// of the pool this staging belongs to. Published by the prover once table
-    /// sizes are known (see [`Backend::set_staging_size_hints`]); zero = none.
-    hint_u64s: Arc<AtomicUsize>,
     /// Reusable completion event for [`async_dtoh_via`] copies through this
     /// slot. Created once on first use and re-recorded per drain — per-call
     /// cuEventCreate/Destroy measurably convoys the driver lock under load.
@@ -44,11 +40,10 @@ unsafe impl Send for PinnedStaging {}
 unsafe impl Sync for PinnedStaging {}
 
 impl PinnedStaging {
-    fn empty(hint_u64s: Arc<AtomicUsize>) -> Self {
+    fn empty() -> Self {
         Self {
             ptr: std::ptr::null_mut(),
             capacity_elems: 0,
-            hint_u64s,
             event: None,
         }
     }
@@ -67,12 +62,7 @@ impl PinnedStaging {
             self.ptr = std::ptr::null_mut();
             self.capacity_elems = 0;
         }
-        // First allocation of this slot jumps straight to the prove-wide size
-        // hint (when the prover published one), so a slot pays cuMemHostAlloc
-        // once instead of climbing a realloc ladder (pinned alloc/free is
-        // ~50ms+ per step — see docs/gpu_baseline_ethrex_5090.md).
-        let target = min_elems.max(self.hint_u64s.load(Ordering::Relaxed));
-        let new_cap = target.next_power_of_two().max(1 << 20); // at least 8 MB
+        let new_cap = min_elems.next_power_of_two().max(1 << 20); // at least 8 MB
         let bytes = new_cap * std::mem::size_of::<u64>();
         let ptr = unsafe {
             cudarc::driver::result::malloc_host(bytes, 0 /* flags: non-WC */)?
@@ -164,10 +154,6 @@ pub struct Backend {
     /// `pinned_staging`; sized `num_rows * 32` bytes per slot. Lives
     /// alongside the LDE staging so the GPU→host D2H runs at PCIe line-rate.
     pinned_hashes: Vec<Mutex<PinnedStaging>>,
-    /// First-allocation size hints for the two staging pools (u64 elems),
-    /// shared with every slot. See [`Backend::set_staging_size_hints`].
-    staging_hint_u64s: Arc<AtomicUsize>,
-    hashes_hint_u64s: Arc<AtomicUsize>,
     util_stream: Arc<CudaStream>,
     /// Free-list of pre-created events for [`Backend::take_event`].
     event_pool: Mutex<Vec<cudarc::driver::CudaEvent>>,
@@ -370,22 +356,20 @@ impl Backend {
         // when no custom pool is in use. Stable across the backend's lifetime
         // since rayon's pool is fixed at first use.
         let n_slots = rayon::current_num_threads().max(1);
-        let staging_hint = Arc::new(AtomicUsize::new(0));
-        let hashes_hint = Arc::new(AtomicUsize::new(0));
         // Pre-create each slot's reusable event here, off the prove's critical
         // path — a mid-prove cuEventCreate convoys the driver lock (~30 ms
         // measured under load vs ~µs at init).
-        let make_pool = |hint: &Arc<AtomicUsize>| -> Result<Vec<Mutex<PinnedStaging>>> {
+        let make_pool = || -> Result<Vec<Mutex<PinnedStaging>>> {
             let mut pool = Vec::with_capacity(n_slots);
             for _ in 0..n_slots {
-                let mut slot = PinnedStaging::empty(Arc::clone(hint));
+                let mut slot = PinnedStaging::empty();
                 slot.event = Some(ctx.new_event(None)?);
                 pool.push(Mutex::new(slot));
             }
             Ok(pool)
         };
-        let pinned_staging = make_pool(&staging_hint)?;
-        let pinned_hashes = make_pool(&hashes_hint)?;
+        let pinned_staging = make_pool()?;
+        let pinned_hashes = make_pool()?;
         // Pre-create the handle-readiness event pool (see `take_event`): one
         // event per device-resident handle a prove can have alive; creation
         // here is ~µs each, mid-prove it convoys the driver lock.
@@ -481,8 +465,6 @@ impl Backend {
             pinned_staging,
             pinned_hashes,
             event_pool,
-            staging_hint_u64s: staging_hint,
-            hashes_hint_u64s: hashes_hint,
             util_stream,
             next: AtomicUsize::new(0),
             vram_budget_bytes,
@@ -493,19 +475,6 @@ impl Backend {
     /// when budgeting is disabled (query failed). See the field docs.
     pub fn vram_budget_bytes(&self) -> u64 {
         self.vram_budget_bytes
-    }
-
-    /// Publish first-allocation size hints (u64 elems) for the pinned staging
-    /// pools, so each worker slot allocates its slab once at final size
-    /// instead of climbing a realloc ladder (each pinned alloc/free step costs
-    /// ~50ms+). Call once per prove, as soon as table sizes are known; only
-    /// raises (never shrinks) the current hints, and only affects slots that
-    /// have not allocated yet.
-    pub fn set_staging_size_hints(&self, lde_u64s: usize, hashes_u64s: usize) {
-        self.staging_hint_u64s
-            .fetch_max(lde_u64s, Ordering::Relaxed);
-        self.hashes_hint_u64s
-            .fetch_max(hashes_u64s, Ordering::Relaxed);
     }
 
     /// Round-robin over the stream pool. Concurrent callers get different

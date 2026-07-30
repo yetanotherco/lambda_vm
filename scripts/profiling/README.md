@@ -1,8 +1,8 @@
 # GPU profiling toolkit
 
-Tooling for profiling the CUDA prover on the dedicated RTX 5090 box. The full
-methodology (what to measure, in what order, and how to read it) lives in
-`thoughts/gpu-profiling/plan.md`; this directory is the executable part.
+Tooling for profiling the CUDA prover on the dedicated RTX 5090 box: this
+directory is the executable part of the profiling methodology (measure with
+`run_profile.sh`, rank phases by `phase_busy.md`, then drill into kernels).
 
 ## One-time machine setup
 
@@ -27,6 +27,13 @@ not comparable across sessions.
 
 ## The main entry point
 
+The ethrex transfer fixtures are generated, not checked in — build one first:
+
+```bash
+( cd tooling/ethrex-fixtures && cargo build --release )
+tooling/ethrex-fixtures/target/release/ethrex-fixtures 5 executor/tests/ethrex_5_transfers.bin distinct
+```
+
 ```bash
 # 3 instrumented runs + phase table with GPU util per phase:
 scripts/profiling/run_profile.sh executor/program_artifacts/rust/ethrex.elf \
@@ -37,7 +44,7 @@ scripts/profiling/run_profile.sh --nsys \
   executor/program_artifacts/rust/ethrex.elf \
   --private-input executor/tests/ethrex_5_transfers.bin
 
-# big continuation run, nsys capture limited to one `proving` span (one epoch):
+# big continuation run, nsys capture limited to one `epoch_prove` span (one epoch):
 LAMBDA_VM_NSYS_CAPTURE_SPAN=epoch_prove scripts/profiling/run_profile.sh --nsys --continuations \
   executor/program_artifacts/rust/ethrex.elf \
   --private-input executor/tests/ethrex_10_transfers.bin

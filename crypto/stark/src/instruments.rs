@@ -50,7 +50,7 @@ pub struct SpanGuard {
 
 /// Label of the span that brackets an `nsys --capture-range=cudaProfilerApi`
 /// session, from `LAMBDA_VM_NSYS_CAPTURE_SPAN` (e.g. `rounds_2to4`, or
-/// `proving` to capture one epoch of a continuations run). None = never.
+/// `epoch_prove` to capture one epoch of a continuations run). None = never.
 #[cfg(feature = "nvtx")]
 fn capture_span_label() -> Option<&'static str> {
     static LABEL: OnceLock<Option<String>> = OnceLock::new();

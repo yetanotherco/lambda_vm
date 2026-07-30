@@ -2778,11 +2778,12 @@ pub trait IsStarkProver<
         let vram_budget = u64::MAX;
 
         // NOTE: an earlier revision published prove-wide pinned-staging size
-        // hints here (`set_staging_size_hints`) so slabs allocated once at
-        // final size. Measured on a 5090 it BACKFIRED: every worker slot then
-        // pays a max-size cuMemHostAlloc (~160ms avg, 7.5s total vs 4.2s of
-        // ladder churn), and those allocations convoy the driver lock. Left
-        // out until a shared-slab design bounds the number of allocations.
+        // hints here so worker slabs allocated once at final size. Measured on
+        // a 5090 it BACKFIRED: every worker slot then pays a max-size
+        // cuMemHostAlloc (~160ms avg, 7.5s total vs 4.2s of ladder churn), and
+        // those allocations convoy the driver lock. The mechanism was removed;
+        // don't re-add pre-sizing without a shared-slab design that bounds the
+        // number of allocations.
 
         // R1 main commit: only the main LDE and its Merkle scratch are resident,
         // so the aux columns add nothing to this phase's working set.
@@ -2937,8 +2938,9 @@ pub trait IsStarkProver<
 
         // Thread each table's device-resident trace-domain main columns (kept by
         // the R1 main LDE) onto its trace so the LogUp aux fingerprint kernel
-        // reads them in place instead of re-uploading ~3 GB. Tables without a GPU
-        // main handle (CPU LDE, preprocessed) fall back to the host upload path.
+        // reads them in place instead of re-uploading ~3 GB. Preprocessed tables
+        // also carry a handle with `trace_dev` (the split-tree path); only
+        // CPU-LDE tables fall back to the host upload path.
         #[cfg(all(feature = "cuda", not(feature = "debug-checks")))]
         for ((_, trace, _), gpu_main) in air_trace_pairs.iter_mut().zip(main_gpu_handles.iter()) {
             if let Some(handle) = gpu_main
