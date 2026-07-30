@@ -2850,13 +2850,22 @@ use super::proof_arena::MainTraceOpening;
 
 /// Which opening the leg authenticates.
 ///
-/// Epoch 0's first sub-proof, chosen on measured grounds and not arbitrarily:
-/// of the 49 sub-proofs in the fixture it is the only one that combines a deep
-/// tree with a UNIQUE leaf index. Most of the others are tiny tables whose
-/// traces are mostly padding, so identical rows hash to identical leaves and
-/// every index in the tree verifies — on those, "flip an index bit" is not a
-/// tamper at all and the (d) vector would silently pass while testing nothing.
-/// `real_opening_is_a_usable_tamper_target` pins that property.
+/// Epoch 0's first sub-proof, chosen on measured grounds. Two things make it
+/// the right target, and only the first is stable across blobs.
+///
+/// **Depth.** It is one of exactly two depth-20 trees in the fixture (the other
+/// is epoch 1's table 0); everything else is depth 7 or less, and half the
+/// sub-proofs are depth 2. Depth is SHAPE, so it does not move when the blob
+/// does — see `fixture_generation_is_not_reproducible`.
+///
+/// **A unique leaf index.** Measured on one blob, 24 of the 49 sub-proofs have
+/// exactly one index that verifies and 25 have several: a table whose trace is
+/// mostly padding commits identical rows, so identical leaves sit under
+/// identical subtrees and every index checks out. On one of those, "flip an
+/// index bit" is not a tamper at all and the (d) vector would pass while
+/// testing nothing. That split is blob-dependent, so it is NOT pinned as a
+/// constant — `real_opening_is_a_usable_tamper_target` asserts uniqueness at
+/// run time on whatever blob it is handed.
 const R1F_EPOCH: usize = 0;
 const R1F_TABLE: usize = 0;
 const R1F_QUERY: usize = 0;
