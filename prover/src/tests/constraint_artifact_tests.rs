@@ -332,6 +332,243 @@ fn report_sizes(sizes: &[ArtifactSize]) {
     );
 }
 
+/// Per-AIR instruction census for the recursion machine's constraint leg.
+///
+/// The machine is straight-line and cannot interpret, so a serialized program is
+/// UNROLLED: one machine instruction per arithmetic IR node. That makes the node
+/// census a direct instruction-count estimate for the constraint-evaluation leg,
+/// which is the last unmeasured piece of the epoch-verifier budget.
+///
+/// The classification that matters, and why:
+///
+/// - **Leaves are addresses, not instructions.** `Var` reads an OOD frame value
+///   the DEEP/opening leg already placed in memory; `RapChallenge` / `AlphaPow` /
+///   `TableOffset` are transcript-derived values computed once per proof. The
+///   constraint leg pays nothing marginal for them.
+/// - **Constants are `Const` instructions**, one per distinct pooled value.
+/// - **Arithmetic nodes are ALU instructions**, and the base/ext split is the
+///   expensive distinction: a base node is a `BaseAlu` over one Goldilocks
+///   element, an extension node an `ExtAlu` over three.
+/// - **A `Mul` with an extension result and exactly one base operand** is the
+///   `MulBase` form — 3 base multiplies instead of 9. Counting these separately
+///   is the difference between a real estimate and a pessimistic one.
+///
+/// # The IR's own `dim` tags are the WRONG split for the machine
+///
+/// `Dim` records what the PROVER computes: its frame is base-field, so a
+/// trace-only subexpression stays in the base field. The machine runs the
+/// VERIFIER's evaluation at the OOD point, where the frame holds only extension
+/// elements — `eval_program_verifier` resolves every `Var` to `Value::Ext`
+/// regardless of `main`. So a node is base at verify time only if its whole
+/// subtree is constants.
+///
+/// Both splits are reported because the difference is large and load-bearing,
+/// and taking the declared one would badly understate the machine's extension
+/// traffic. The verifier-side column is the one to budget against.
+///
+/// A consequence worth naming: a base-at-verify-time node is a constant-only
+/// subtree, so the emitter can FOLD it at build time into a pooled constant. It
+/// costs zero instructions, which is why the instruction estimate below counts
+/// only extension work plus the pool.
+///
+/// Printed rather than asserted (beyond a loose ceiling): this is an instrument,
+/// and pinning exact counts would turn every constraint edit into a test failure.
+#[test]
+fn constraint_op_census() {
+    use stark::constraint_ir::device::{
+        DIM_BASE, OP_ADD, OP_ALPHA_POW, OP_CONST_BASE, OP_CONST_EXT, OP_EMBED, OP_MUL, OP_NEG,
+        OP_RAP_CHALLENGE, OP_SUB, OP_TABLE_OFFSET, OP_VAR,
+    };
+
+    let opts = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
+    let airs = production_airs(&opts);
+    assert_eq!(airs.len(), NUM_PRODUCTION_AIRS);
+
+    println!("\nconstraint-leg instruction census (one instruction per arithmetic node)");
+    println!("  prover-dim = what the IR declares; verify-dim = what the machine runs");
+    println!(
+        "{:<14} {:>7} {:>7} {:>6} {:>8} {:>8} {:>7} {:>8} {:>8}",
+        "table", "nodes", "leaves", "const", "pv-base", "fold", "ext", "mulbase", "instr"
+    );
+
+    let (mut t_nodes, mut t_leaves, mut t_const) = (0usize, 0usize, 0usize);
+    let (mut t_pv_base, mut t_fold, mut t_ext, mut t_mulbase) = (0usize, 0usize, 0usize, 0usize);
+    let mut t_constraints = 0usize;
+
+    for (label, air) in &airs {
+        let artifact = ConstraintArtifact::capture(&**air);
+        let nodes = &artifact.nodes;
+
+        // Verifier-side dim: base ONLY for constant-only subtrees, because the
+        // OOD frame is all-extension.
+        let mut v_base = vec![false; nodes.len()];
+
+        let (mut leaves, mut consts, mut pv_base, mut foldable, mut ext_alu, mut mulbase) =
+            (0, 0, 0, 0, 0, 0);
+        for (i, n) in nodes.iter().enumerate() {
+            match n.op {
+                OP_VAR | OP_RAP_CHALLENGE | OP_ALPHA_POW | OP_TABLE_OFFSET => {
+                    leaves += 1;
+                    v_base[i] = false;
+                }
+                OP_CONST_BASE => {
+                    consts += 1;
+                    v_base[i] = true;
+                }
+                OP_CONST_EXT => {
+                    consts += 1;
+                    v_base[i] = false;
+                }
+                OP_ADD | OP_SUB | OP_MUL | OP_NEG | OP_EMBED => {
+                    if n.dim == DIM_BASE {
+                        pv_base += 1;
+                    }
+                    let (ba, bb) = match n.op {
+                        OP_NEG => (v_base[n.a as usize], true),
+                        OP_EMBED => (false, false),
+                        _ => (v_base[n.a as usize], v_base[n.b as usize]),
+                    };
+                    // Mirrors `interp::binop`: base only when both operands are
+                    // base values AND the declared dim is base.
+                    v_base[i] = ba && bb && n.dim == DIM_BASE;
+                    if v_base[i] {
+                        // Constant-only subtree: the emitter folds it at build
+                        // time, so it emits no instruction at all.
+                        foldable += 1;
+                    } else {
+                        let is_mulbase = n.op == OP_MUL && (ba != bb);
+                        if is_mulbase {
+                            mulbase += 1;
+                        } else {
+                            ext_alu += 1;
+                        }
+                    }
+                }
+                other => panic!("[{label}] unclassified op tag {other}"),
+            }
+        }
+
+        // Instructions the constraint leg actually emits: extension ALU work
+        // plus one Const per pooled constant. Leaves are addresses, and
+        // constant-only subtrees fold away at build time.
+        let instr = ext_alu + mulbase + consts;
+        println!(
+            "{:<14} {:>7} {:>7} {:>6} {:>8} {:>8} {:>7} {:>8} {:>8}",
+            label,
+            nodes.len(),
+            leaves,
+            consts,
+            pv_base,
+            foldable,
+            ext_alu,
+            mulbase,
+            instr
+        );
+
+        t_nodes += nodes.len();
+        t_leaves += leaves;
+        t_const += consts;
+        t_pv_base += pv_base;
+        t_fold += foldable;
+        t_ext += ext_alu;
+        t_mulbase += mulbase;
+        t_constraints += artifact.roots.len();
+
+        // Every constant node must correspond to exactly one pooled table entry;
+        // if that ever stopped holding, the Const instruction count above would
+        // be wrong.
+        assert_eq!(
+            consts,
+            artifact.base_consts.len() + artifact.ext_consts.len(),
+            "[{label}] constant nodes and pooled constants disagree"
+        );
+    }
+
+    // --- two emitter properties the design depends on, measured ---
+    //
+    // 1. MulAdd fusability. `ExtAlu` carries MulAdd as a first-class op, but the
+    //    IR has no MulAdd node — it emits Mul then Add. A peephole can fuse
+    //    `Add(Mul(a,b), c)` into one instruction, but ONLY when the Mul feeds
+    //    exactly one consumer; hash-consing means a shared Mul would have to be
+    //    recomputed, turning a saving into a cost.
+    // 2. `Op::Embed` usage. It should be zero — the builder documents it as
+    //    unreachable from the single-body capture path — which matters because
+    //    Embed is the one op whose machine lowering depends on the word model.
+    let (mut t_fusable, mut t_embed, mut t_dead, mut t_maxfan) = (0usize, 0usize, 0usize, 0u32);
+    for (_, air) in &airs {
+        let artifact = ConstraintArtifact::capture(&**air);
+        let nodes = &artifact.nodes;
+
+        let mut uses = vec![0u32; nodes.len()];
+        for n in nodes {
+            match n.op {
+                OP_ADD | OP_SUB | OP_MUL => {
+                    uses[n.a as usize] += 1;
+                    uses[n.b as usize] += 1;
+                }
+                OP_NEG | OP_EMBED => uses[n.a as usize] += 1,
+                _ => {}
+            }
+        }
+        // A root is a consumer too: fusing away a node that a constraint roots at
+        // would delete the value the quotient recombination needs.
+        for &r in &artifact.roots {
+            uses[r as usize] += 1;
+        }
+
+        // A node nobody reads is a write with mult = 0 — wasted instructions, and
+        // the emitter must DCE it rather than emit a zero-multiplicity write.
+        t_dead += uses.iter().filter(|&&u| u == 0).count();
+        t_maxfan = t_maxfan.max(uses.iter().copied().max().unwrap_or(0));
+
+        for n in nodes {
+            if n.op == OP_EMBED {
+                t_embed += 1;
+            }
+            if n.op == OP_ADD {
+                let a_fusable = nodes[n.a as usize].op == OP_MUL && uses[n.a as usize] == 1;
+                let b_fusable = nodes[n.b as usize].op == OP_MUL && uses[n.b as usize] == 1;
+                if a_fusable || b_fusable {
+                    t_fusable += 1;
+                }
+            }
+        }
+    }
+
+    let arith = t_fold + t_ext + t_mulbase;
+    let instr = t_ext + t_mulbase + t_const;
+    println!(
+        "{:<14} {:>7} {:>7} {:>6} {:>8} {:>8} {:>7} {:>8} {:>8}",
+        "TOTAL", t_nodes, t_leaves, t_const, t_pv_base, t_fold, t_ext, t_mulbase, instr
+    );
+    println!(
+        "\n  arithmetic nodes            {arith}\n  \
+           base by the IR's own dim    {t_pv_base}   (prover-side; NOT the machine's split)\n  \
+           base at verify time         {t_fold}   (constant-only subtrees -> fold at build time)\n  \
+           extension ALU               {t_ext}\n  \
+           of which MulBase-eligible   {t_mulbase}   (ext x base: 3 base muls, not 9)\n  \
+           pooled constants            {t_const}\n  \
+           = constraint-leg instr      {instr}\n  \
+           + quotient recombination    {t_constraints} beta-folds (one per constraint)\n  \
+           = total                     {}\n  \
+           leaves (addresses, free)    {t_leaves}\n\n  \
+           MulAdd-fusable Add nodes    {t_fusable}   (Add over a single-use Mul -> one instr)\n  \
+           after fusion                {}\n  \
+           Op::Embed nodes             {t_embed}\n  \
+           dead nodes (mult = 0)       {t_dead}\n  \
+           max fanout (max mult)       {t_maxfan}\n",
+        instr + t_constraints,
+        instr + t_constraints - t_fusable
+    );
+
+    // Loose ceiling: the design budget treats this leg as ~1% of the epoch
+    // program. An order-of-magnitude regression should fail here.
+    assert!(
+        instr < 200_000,
+        "constraint-leg instruction estimate {instr} has grown past the design budget"
+    );
+}
+
 /// The captured artifact does not depend on the proof options.
 ///
 /// This is the premise behind leaving `ProofOptions` OUT of the artifact — if it
