@@ -72,6 +72,26 @@ SHA_A="$(git rev-parse "$REF_A")"
 SHA_B="$(git rev-parse "$REF_B")"
 echo "   A (PR)       $REF_A  -> ${SHA_A:0:10}"
 echo "   B (baseline) $REF_B  -> ${SHA_B:0:10}"
+# Validate both counts BEFORE any building/proving. Two ways a bad value bites otherwise:
+# under `set -u` a non-numeric one makes the arithmetic below die with a bare
+# "abc: unbound variable", and a value that makes `seq` produce nothing yields a
+# header-only pairs CSV whose ZeroDivisionError only surfaces in the stats step at the
+# very END — after both arms have been measured, so the run fails with nothing to show
+# and CI posts "Run failed" instead of the results it already had.
+for v in N_PAIRS CONT_PAIRS; do
+  if ! [[ "${!v}" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: $v must be a non-negative integer (got '${!v}')." >&2
+    exit 2
+  fi
+done
+if [ "$N_PAIRS" -lt 2 ]; then
+  echo "ERROR: N_PAIRS must be >= 2 (got $N_PAIRS)." >&2
+  exit 2
+fi
+if [ "$CONT_PAIRS" -eq 1 ]; then
+  echo "ERROR: CONT_PAIRS must be 0 (skip the arm) or >= 2 (got $CONT_PAIRS)." >&2
+  exit 2
+fi
 if [ $((N_PAIRS % 2)) -ne 0 ]; then
   echo "   WARNING: N_PAIRS=$N_PAIRS is odd; use an even count so AB/BA orders balance."
 fi

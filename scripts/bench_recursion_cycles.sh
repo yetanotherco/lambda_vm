@@ -68,6 +68,11 @@
 #     PRUNE_KEEP=<n>       cap on cached ref worktrees kept under $WORK (default 10);
 #                          older ones (+ their results/blobs/logs) are pruned at startup
 #                          to bound disk on the long-lived bench runner.
+#     GUEST_TARGET_KEEP=<n> cap on per-ref guest target dirs kept (default 3). Separate
+#                          from PRUNE_KEEP and much tighter: these are GBs each, and only
+#                          the current run's two refs need one (3 leaves room to re-run
+#                          the same PR without a cold rebuild). See
+#                          prune_guest_target_dirs for why they need their own sweep.
 #     BLOCK_TXS=20         PRESET=blowup4-block only: ethrex block size. Reads
 #                          executor/tests/ethrex_bench_<BLOCK_TXS>.bin when present
 #                          (only _4 is committed) and generates any other size via
@@ -116,6 +121,7 @@ REF_B="${2:-origin/main}"
 PRESET="${3:-min}"
 SYSROOT_DIR="${SYSROOT_DIR:-$HOME/.lambda-vm-sysroot}"
 PRUNE_KEEP="${PRUNE_KEEP:-10}"
+GUEST_TARGET_KEEP="${GUEST_TARGET_KEEP:-3}"
 BLOCK_TXS="${BLOCK_TXS:-20}"
 BLOCK_EPOCH_LOG2="${BLOCK_EPOCH_LOG2:-21}"
 
@@ -157,6 +163,49 @@ prune_worktree_cache() {
   git worktree prune >/dev/null 2>&1 || true
 }
 prune_worktree_cache
+
+# The per-ref guest target dirs need their OWN sweep, not just the per-worktree removal
+# above, for two reasons. (1) They are not discoverable from the wt_* glob once their
+# worktree is gone, and the mid-run build-failure path removes a worktree IMMEDIATELY —
+# which would strand that ref's target dir forever, unreclaimable, on a long-lived
+# runner. Guest builds failing is exactly the scenario this script exists to measure, so
+# that is not a rare path. (2) They are the biggest thing here (build-std + the guest
+# builds, GBs each), and only the CURRENT run's two refs need one, so they deserve a
+# tighter cap than the worktrees (which are cheaper and worth keeping around longer for
+# checkout reuse).
+#
+# The invariant enforced is "a target dir survives only while its worktree does": a
+# worktree that vanished either aged out or died mid-build, and in both cases a clean
+# rebuild is what we want. This is self-healing — it also reclaims dirs orphaned by runs
+# that predate this sweep.
+#
+# Deliberately NOT extended to the cached blobs: an orphaned blob_<sha>_<preset>.bin is
+# keyed on the ref SHA, stays valid without its worktree, and represents real prover
+# minutes (a 20-tx continuation prove), so dropping it would throw away an expensive and
+# still-correct cache to reclaim ~300 MB.
+prune_guest_target_dirs() {
+  [ -n "${GUEST_TARGET_DIR:-}" ] || return 0
+  local d s8 stale
+  for d in "${GUEST_TARGET_DIR}"_*; do
+    [ -d "$d" ] || continue
+    s8="$(basename "$d")"; s8="${s8##*_}"
+    if [ ! -d "$WORK/wt_${s8}" ]; then
+      echo "==> Pruning orphaned guest target dir $d (no worktree $WORK/wt_${s8})" >&2
+      rm -rf "$d"
+    fi
+  done
+  # Same ls -t recency ordering as the worktree prune; names are <base>_<sha8>, so
+  # word-splitting is safe. Each dir is `touch`ed after its build, so this tracks use.
+  # shellcheck disable=SC2012
+  stale="$(ls -1dt "${GUEST_TARGET_DIR}"_* 2>/dev/null | tail -n +"$((GUEST_TARGET_KEEP + 1))" || true)"
+  [ -n "$stale" ] || return 0
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    echo "==> Pruning old guest target dir $d (keeping newest $GUEST_TARGET_KEEP)" >&2
+    rm -rf "$d"
+  done <<< "$stale"
+}
+prune_guest_target_dirs
 
 # One-time sweep of the retired single-CLI scheme's fixed-name artifacts. Before this
 # script measured per ref it built one shared counter at $WORK/measure_cli (+ its .sha
@@ -334,7 +383,18 @@ measure_ref() {
     # poisons a later reuse. (The startup prune also caps total worktrees.)
     git worktree remove --force "$wt" >/dev/null 2>&1 || rm -rf "$wt"
     git worktree prune >/dev/null 2>&1 || true
+    # Reclaim this ref's guest target dir now rather than leaving GBs behind until the
+    # next run's prune_guest_target_dirs notices it has no worktree. Its contents are a
+    # half-finished build anyway, so a clean rebuild is what we want next time.
+    if [ -n "${GUEST_TARGET_DIR:-}" ]; then
+      rm -rf "${GUEST_TARGET_DIR}_${sha8}"
+    fi
     exit 1
+  fi
+  # Mark the target dir as recently used so prune_guest_target_dirs keeps it. Guarded on
+  # -d: a bare `touch` on a first build would create a FILE at that path and break cargo.
+  if [ -n "${GUEST_TARGET_DIR:-}" ] && [ -d "${GUEST_TARGET_DIR}_${sha8}" ]; then
+    touch "${GUEST_TARGET_DIR}_${sha8}" 2>/dev/null || true
   fi
 
   # 2b. Detect the guest ELF: block mode always wants recursion-cont-<preset>.elf;
