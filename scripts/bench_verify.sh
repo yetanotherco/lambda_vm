@@ -211,6 +211,14 @@ prove_cached() {  # $1=binary $2=proof-path $3=sha $4...=extra prove args
   fi
   echo "==> Proving with $(basename "$bin") (${sha:0:10}) $*"
   prove_once "$bin" "$out" "$@" || return 1
+  # Persist the epoch count next to the proof rather than parsing the prove log at report
+  # time: on a cache hit the prove is skipped entirely, so that log is stale or gone. The
+  # sidecar is written with the proof and invalidated with it. Continuation proves only —
+  # `cli prove` prints no "Epochs:" line in monolithic mode, so no sidecar appears there.
+  local ep
+  ep="$(awk -F': ' '/^Epochs:/{print $2; exit}' "$WORK/prove_$(basename "$out").log")"
+  # `if` rather than `[ -n "$ep" ] && ...`: a failing &&-list is fatal under `set -e`.
+  if [ -n "$ep" ]; then printf '%s\n' "$ep" > "$out.epochs"; fi
   echo "$marker" > "$out.sha"
 }
 prove_cached "$WORK/cli_B" "$PROOF_B" "$SHA_B" || exit 1
@@ -461,7 +469,24 @@ echo "<!-- verify-abba-report -->"
 # Arm titles follow the same `workload · mode · params` shape as the recursion cycle
 # regimes (bench_recursion_cycles.sh), so every table in the PR comment says what it
 # proved and how, and no two arms can be confused for each other.
-CONT_TITLE="ethrex 20-tx block · continuations, epoch 2^$CONT_EPOCH_LOG2 · blowup=2, 219 queries"
+# Epoch COUNT alongside the epoch SIZE: the size alone doesn't tell you the bundle shape,
+# and the count is what drives verify cost and bundle size. Read from the sidecars written
+# at prove time. Show both sides when they disagree — a PR that changes epoch splitting is
+# exactly the kind of thing this arm should surface, not average away. Falls back to no
+# parenthetical if either side is unknown (e.g. an older cached proof with no sidecar),
+# because a wrong count is worse than a missing one.
+epochs_of() { local f="$1.epochs"; [ -s "$f" ] && head -1 "$f" | tr -d '[:space:]' || true; }
+EPO_A="$(epochs_of "$CPROOF_A")"; EPO_B="$(epochs_of "$CPROOF_B")"
+if [ -n "$EPO_A" ] && [ -n "$EPO_B" ]; then
+  if [ "$EPO_A" = "$EPO_B" ]; then
+    CONT_EPOCHS=" ($EPO_A epochs)"
+  else
+    CONT_EPOCHS=" (main $EPO_B / PR $EPO_A epochs)"
+  fi
+else
+  CONT_EPOCHS=""
+fi
+CONT_TITLE="ethrex 20-tx block · continuations, epoch 2^$CONT_EPOCH_LOG2$CONT_EPOCHS · blowup=2, 219 queries"
 print_stats "$WORK/pairs.csv" "ethrex 20-tx block · monolithic · blowup=2, 219 queries" \
   "$SIZE_A" "$SIZE_B" "$MONO_MODE" "$MONO_NOTE"
 if [ -n "$CONT_SKIP" ]; then

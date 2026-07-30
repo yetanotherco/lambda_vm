@@ -121,9 +121,9 @@ jobs:
 
       # Additive: deterministic recursion-guest cycle+accelerator diff (PR vs main), in
       # two regimes: `min` (cheap canary over the empty diagnostic program) and
-      # `blowup4-block` (the same verifier over a REAL ethrex 20-tx block proved with
+      # `blowup2-block` (the same verifier over a REAL ethrex 20-tx block proved with
       # continuations, via the `continuation` guest). One exact `execute --cycles`
-      # reading per ref (no ABBA); blowup4-block's dumped blob is cached by ref SHA
+      # reading per ref (no ABBA); blowup2-block's dumped blob is cached by ref SHA
       # (bench_recursion_cycles.sh), so a repeat run skips re-proving.
       # GUEST_TARGET_DIR is a BASE path — bench_recursion_cycles.sh appends the ref SHA
       # so each worktree owns its guest target dir (sharing one dir across refs made

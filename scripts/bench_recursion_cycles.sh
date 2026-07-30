@@ -51,10 +51,10 @@
 #            than let the guest reject the blob in-VM. Different artifact
 #            names across refs (e.g. recursion.elf vs recursion-min.elf) is
 #            expected — both verify under the SAME preset options.
-#            `blowup4-block` isn't a build preset: it's the `continuation` guest
-#            (recursion-cont-blowup4.elf) verifying a real ethrex block instead
-#            of the `empty` diagnostic program — real prover minutes per ref
-#            (see the blob cache below), not seconds.
+#            `blowup2-block`/`blowup4-block` aren't build presets: they are the
+#            `continuation` guest (recursion-cont-<blowup>.elf) verifying a real
+#            ethrex block instead of the `empty` diagnostic program — real
+#            prover minutes per ref (see the blob cache below), not seconds.
 #   Env:
 #     REBUILD=1            force rebuild of each ref's measuring CLI and re-run of every
 #                          ref (guest build + blob dump + measurement); ignore caches.
@@ -73,17 +73,23 @@
 #                          the current run's two refs need one (3 leaves room to re-run
 #                          the same PR without a cold rebuild). See
 #                          prune_guest_target_dirs for why they need their own sweep.
-#     BLOCK_TXS=20         PRESET=blowup4-block only: ethrex block size. Reads
+#     BLOCK_TXS=20         PRESET=blowup<N>-block only: ethrex block size. Reads
 #                          executor/tests/ethrex_bench_<BLOCK_TXS>.bin when present
 #                          (only _4 is committed) and generates any other size via
 #                          tooling/ethrex-fixtures (see resolve_block_fixture).
-#     BLOCK_EPOCH_LOG2=21  PRESET=blowup4-block only: inner continuation epoch size.
-#                          Do not lower this for a big block without checking the blob
-#                          size: smaller epochs mean MORE of them, and the whole bundle
-#                          has to fit in the guest's MAX_PRIVATE_INPUT_SIZE (512 MiB).
-#                          20 txs at 2^21 lands around 335 MB; blowup2 (219 queries
-#                          instead of 110) would roughly double that and not fit, which
-#                          is why the real-block regime is pinned to blowup4.
+#     BLOCK_EPOCH_LOG2=21  PRESET=blowup<N>-block only: inner continuation epoch size.
+#                          Smaller epochs mean MORE of them, and the whole bundle has to
+#                          fit the guest's MAX_PRIVATE_INPUT_SIZE (512 MiB), so check the
+#                          blob size if you lower it for a big block. Measured room at
+#                          the defaults: an ethrex 20-tx block is 9,073,658 cycles
+#                          (`cli execute --cycles`), so 2^21 is 5 epochs; the CI 4-tx
+#                          blob was 70.6 MB for 2 epochs, i.e. ~35 MB/epoch, putting 20
+#                          txs near 175 MB at blowup4 and ~350 MB at blowup2 — both
+#                          inside the cap. (An earlier version of this comment claimed
+#                          ~335 MB at blowup4 and that blowup2 would not fit; that was
+#                          extrapolated from the stale ~4M cycles/transfer figure in
+#                          tooling/ethrex-fixtures/README.md, which predates the
+#                          ecrecover accelerator and overstates the block by ~9x.)
 #
 # Caching: each ref's result is cached in $WORK keyed on its resolved SHA + preset. The
 # measuring CLI is built from that same SHA, so the SHA already identifies the counter (no
@@ -92,7 +98,7 @@
 # Ref worktrees are kept (named by SHA) so a re-measure is a cargo no-op; the newest
 # PRUNE_KEEP are retained and older ones pruned. A worktree whose guest build fails
 # mid-run is removed immediately. The dumped input blob is also cached (keyed on SHA +
-# preset), so re-proving blowup4-block's real ethrex block only happens once per ref.
+# preset), so re-proving a blowup<N>-block real ethrex block only happens once per ref.
 # REBUILD=1 forces everything.
 #
 # NEVER point two refs at one guest CARGO_TARGET_DIR. Two worktrees are two distinct
@@ -263,7 +269,7 @@ valid_result() {
     }'
 }
 
-# Resolve the ethrex block fixture for PRESET=blowup4-block and echo its path. Both refs
+# Resolve the ethrex block fixture for PRESET=blowup<N>-block and echo its path. Both refs
 # are handed the SAME bytes (cached in $WORK, keyed on tx count) rather than each reading
 # its own worktree copy: the fixture is the WORKLOAD, so a per-ref copy would risk
 # comparing two different blocks. Only ethrex_bench_4.bin is committed; other sizes are
@@ -308,16 +314,15 @@ resolve_block_fixture() {
 measure_ref() {
   local ref="$1" sha="$2" role="$3"
   local sha8="${sha:0:8}"
-  # `blowup4-block`: same cache/worktree/measure plumbing, but a real ethrex
+  # `blowup<N>-block`: same cache/worktree/measure plumbing, but a real ethrex
   # block through the continuation guest instead of the `min`/`blowup*`
-  # presets' `empty`-program blob. BLOCK_PRESET is the underlying build
-  # preset (blowup4); BLOCK_TXS/BLOCK_EPOCH_LOG2 pin the fixture and epoch
-  # size to what `make recursion-profile-block-input` proves.
+  # presets' `empty`-program blob. block_preset is the underlying build preset;
+  # BLOCK_TXS/BLOCK_EPOCH_LOG2 pin the fixture and epoch size.
   local is_block=0 block_preset=""
-  if [ "$PRESET" = "blowup4-block" ]; then
-    is_block=1
-    block_preset="blowup4"
-  fi
+  case "$PRESET" in
+    blowup2-block) is_block=1; block_preset="blowup2" ;;
+    blowup4-block) is_block=1; block_preset="blowup4" ;;
+  esac
   local block_txs="$BLOCK_TXS"
   local block_epoch_log2="$BLOCK_EPOCH_LOG2"
 
@@ -453,7 +458,7 @@ measure_ref() {
     local -a dump_env=("RECURSION_DUMP_PRESET=${block_preset:-$PRESET}")
     if [ "$is_block" = 1 ]; then
       if ! grep -rq "RECURSION_DUMP_EPOCH_LOG2" "$wt/prover/src/tests/" 2>/dev/null; then
-        echo "ERROR: [$role] ref $ref ($sha8) predates RECURSION_DUMP_EPOCH_LOG2 — blowup4-block is not measurable for it." >&2
+        echo "ERROR: [$role] ref $ref ($sha8) predates RECURSION_DUMP_EPOCH_LOG2 — blowup<N>-block is not measurable for it." >&2
         exit 1
       fi
       local block_fixture
@@ -485,8 +490,16 @@ measure_ref() {
       exit 1
     fi
     mv /tmp/recursion_input.bin "$blob"
+    # Epoch count comes from the dump test's own log line. Persist it beside the blob:
+    # a blob cache hit skips the dump entirely, so the log is not a reliable source at
+    # report time. Empty for the non-block presets, which prove monolithically.
+    awk -F': ' '/continuation epochs:/{print $NF; exit}' "$dlog" > "$blob.epochs"
   fi
-  echo "==> [$role] blob: $(wc -c <"$blob" | tr -d '[:space:]') bytes -> $blob" >&2
+  local epochs=""
+  if [ -s "$blob.epochs" ]; then
+    epochs="$(head -1 "$blob.epochs" | tr -d '[:space:]')"
+  fi
+  echo "==> [$role] blob: $(wc -c <"$blob" | tr -d '[:space:]') bytes${epochs:+, $epochs epochs} -> $blob" >&2
 
   # 2c2. Build the measuring CLI FROM THIS REF's worktree (native release `cli`) and keep
   # it at a per-ref stable path. This is the crux of the per-ref design: the guest ELF
@@ -553,6 +566,10 @@ measure_ref() {
     printf 'keccak=%s\n' "$kec"
     printf 'wall=%s\n' "$dt"
     printf 'elf=%s\n' "$(basename "$guest_elf")"
+    # Optional: only the block presets have epochs, and caches written before this line
+    # existed have none. valid_result deliberately does not require it, so a missing
+    # value degrades to omitting the count rather than reporting a wrong one.
+    printf 'epochs=%s\n' "$epochs"
   } > "$result.tmp"
   mv -f "$result.tmp" "$result"
   cat "$result"
@@ -580,6 +597,22 @@ CYC_B="$(getv "$RES_B" cycles)"; KEC_B="$(getv "$RES_B" keccak)"
 WALL_B="$(getv "$RES_B" wall)"; ELF_B="$(getv "$RES_B" elf)"
 CYC_A="$(getv "$RES_A" cycles)"; KEC_A="$(getv "$RES_A" keccak)"
 WALL_A="$(getv "$RES_A" wall)"; ELF_A="$(getv "$RES_A" elf)"
+EPO_B="$(getv "$RES_B" epochs)"; EPO_A="$(getv "$RES_A" epochs)"
+
+# Epoch COUNT next to the epoch SIZE in the regime label: the size alone doesn't say how
+# many epochs the bundle holds, which is what drives both its size and the verifier work.
+# Show both sides when they differ — a PR that changes epoch splitting should be visible
+# here, not hidden behind one number. Empty when unknown (non-block preset, or a result
+# cached before `epochs=` existed): a missing count beats a wrong one.
+if [ -n "$EPO_A" ] && [ -n "$EPO_B" ]; then
+  if [ "$EPO_A" = "$EPO_B" ]; then
+    EPOCHS_LABEL=" ($EPO_A epochs)"
+  else
+    EPOCHS_LABEL=" (main $EPO_B / PR $EPO_A epochs)"
+  fi
+else
+  EPOCHS_LABEL=""
+fi
 
 # signed integer delta (A - B); 0 prints bare, >0 gets a leading '+'
 sd() { local d=$(( $1 - $2 )); if [ "$d" -gt 0 ]; then printf '+%d' "$d"; else printf '%d' "$d"; fi; }
@@ -600,14 +633,16 @@ mcycd() {
 
 # Human label for the proof regime this preset measures, so a reader can't mistake the
 # single-query `min` number for the full 128-bit verifier cost. CI passes `min` (cheap
-# canary) and `blowup4-block` (the representative regime); `blowup2`/`blowup4` stay
+# canary) and `blowup2-block` (the representative regime); `blowup2`/`blowup4`/
+# `blowup4-block` stay
 # available for manual runs (see .github/scripts/run_recursion_bench.sh).
 case "$PRESET" in
   min)     REGIME="empty program · monolithic · blowup=2, 1 query (diagnostic — NOT a real verifier cost)" ;;
   blowup2) REGIME="empty program · monolithic · blowup=2, 219 queries (128-bit)" ;;
   blowup4) REGIME="empty program · monolithic · blowup=4, 110 queries (128-bit)" ;;
   blowup8) REGIME="empty program · monolithic · blowup=8, 73 queries (128-bit)" ;;
-  blowup4-block) REGIME="ethrex ${BLOCK_TXS}-tx block · continuations, epoch 2^$BLOCK_EPOCH_LOG2 · blowup=4, 110 queries (128-bit)" ;;
+  blowup2-block) REGIME="ethrex ${BLOCK_TXS}-tx block · continuations, epoch 2^$BLOCK_EPOCH_LOG2$EPOCHS_LABEL · blowup=2, 219 queries (128-bit)" ;;
+  blowup4-block) REGIME="ethrex ${BLOCK_TXS}-tx block · continuations, epoch 2^$BLOCK_EPOCH_LOG2$EPOCHS_LABEL · blowup=4, 110 queries (128-bit)" ;;
   *)       REGIME="$PRESET" ;;
 esac
 
