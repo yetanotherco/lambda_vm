@@ -1,4 +1,4 @@
-//! HINT table — receiver for the non-constraining `hint` ecall (BENCH ONLY).
+//! HINT table — receiver for the non-constraining `hint` ecall.
 //!
 //! The `hint` ecall (syscall `u64::MAX - 20`) lets the executor hand the guest a
 //! value that is expensive to compute but cheap to verify (modular inverse, sqrt,
@@ -31,14 +31,16 @@
 //! stores, and nothing depends on the ecall having re-read it — so omitting it is
 //! sound and avoids the mixed-timestamp bookkeeping of a partial-buffer read.
 //!
-//! The table has no algebraic constraints (`EmptyConstraints`), so `mu` is a free
-//! column, but it needs no boolean constraint: every interaction is gated by it, and
-//! the `Ecall` receiver's tuple contains the timestamp, which is unique per
-//! instruction (`ts = 4i + 4`). The LogUp identity therefore matches each `(ts,
-//! syscall)` tuple on its own, forcing `mu` to equal the CPU's send multiplicity for
-//! that ecall — 1 where the CPU issued one, and 0 everywhere else, since a nonzero
-//! `mu` on a tuple the CPU never sent leaves the bus unbalanced. Pinning `mu` this
-//! way is what also pins the writes and range checks below to real calls.
+//! `mu` is constrained to a bit (`IS_BIT`, the table's only algebraic constraint) —
+//! the same guard every other multiplicity-column table carries (ECSM/ECDAS/COMMIT/
+//! STORE/MEMW_R). The `Ecall` bus alone does not establish it: its tuple carries the
+//! timestamp, a free column, so the LogUp identity pins only the *sum* of `mu` over
+//! the rows sharing a `(ts, syscall)` tuple to the CPU's send — it does not rule out
+//! two rows splitting `mu = 1/2 + 1/2` while each keeps its own `out_addr` (and
+//! `out_addr` is the base the four output writes take). Such a witness is in fact
+//! caught today, but only downstream and non-locally: MEMW boolean-constrains its own
+//! multiplicities, so a half-weighted write finds no receiver. Constraining `mu` here
+//! makes the argument local, independent of how MEMW happens to handle multiplicities.
 //!
 //! ## Columns (37)
 //! - `timestamp[0..1]` (DWordWL): the ecall timestamp `T`
@@ -47,8 +49,11 @@
 //! - `mu`: multiplicity flag (1 = real hint call, 0 = padding) — gates every bus
 
 use executor::vm::instruction::execution::HINT_SYSCALL_NUMBER;
+use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
+
+use crate::constraints::templates::emit_is_bit;
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable};
 
@@ -237,4 +242,26 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     }
 
     out
+}
+
+// =========================================================================
+// Single-source constraint set (ConstraintBuilder front-end)
+// =========================================================================
+
+/// The HINT table's single transition constraint: `mu·(1−mu) = 0`.
+///
+/// `mu` is the multiplicity gating every one of this table's bus interactions
+/// (the `Ecall` receive, the `x12` register read, the four output writes, the
+/// 16 byte range-checks). It must be boolean, or a witness could put a non-`{0,1}`
+/// value on the `AreBytes`/MEMW sends. The LogUp argument already fixes `mu`'s value
+/// via the timestamp-unique `Ecall` tuple, but every other multiplicity-column table
+/// bit-constrains its column in-circuit; HINT does the same rather than being the
+/// lone exception that relies solely on bus balance.
+pub struct HintConstraints;
+
+impl ConstraintSet<GoldilocksField, GoldilocksExtension> for HintConstraints {
+    fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
+        // idx 0: IS_BIT for mu.
+        emit_is_bit(b, 0, cols::MU, None);
+    }
 }

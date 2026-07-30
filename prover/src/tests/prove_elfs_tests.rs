@@ -1210,8 +1210,8 @@ fn test_prove_ecsm_rust_guest() {
     );
 }
 
-/// P0 for the non-constraining `Hint` ecall (BENCH ONLY): the minimal Rust guest
-/// does one `hint` call (secp256k1 base-field inverse of 3) and commits the result.
+/// End-to-end prove→verify for the non-constraining `Hint` ecall: the minimal Rust
+/// guest does one `hint` call (secp256k1 base-field inverse of 3) and commits the result.
 /// This exercises exactly the HINT table's bus surface (Ecall receive + the four
 /// 8-byte output MEMW writes) end-to-end through prove→verify, de-risking the bus
 /// balance before scaling to real consumers. The committed output must equal the
@@ -1242,7 +1242,7 @@ fn test_prove_hint_min_rust_guest() {
     assert_eq!(proof.public_output, expected.to_vec());
 }
 
-/// Multi-hint P0/P2 (BENCH ONLY): three `hint` ecalls, each result read back with
+/// Multi-hint: three `hint` ecalls, each result read back with
 /// ordinary `LOAD`s. Complements `test_prove_hint_min_rust_guest` by proving the
 /// paths the ethrex consumer relies on that a single-call guest doesn't: **multiple
 /// real HINT rows** (padded) and **read-back via normal LOAD** (MEMW reads chaining
@@ -1279,7 +1279,7 @@ fn test_prove_hint_multi_rust_guest() {
     assert_eq!(proof.public_output, expected.to_vec());
 }
 
-/// Consistency (BENCH ONLY): the verifier REJECTS a HINT row that disagrees with the
+/// Consistency: the verifier REJECTS a HINT row that disagrees with the
 /// MEMW rows.
 ///
 /// The HINT table's `out_bytes` are unconstrained *by the table* — the point of a
@@ -1399,6 +1399,20 @@ fn test_hint_binds_out_addr_to_x12() {
             "value[{slot}] must carry out_addr (a read leaves the register unchanged)"
         );
     }
+    // The read must happen at THE ecall's timestamp (ts_lo/ts_hi = slots 19/20). A
+    // register read bound to x12 but at some other timestamp would pin out_addr to
+    // whatever x12 held then, not at the ecall — the writes below all use the same
+    // TIMESTAMP columns, so the binding is only meaningful if it reads x12 at T.
+    assert_eq!(
+        hint_bus_column(&v[19]),
+        Some(hint_cols::TIMESTAMP_0),
+        "ts_lo must be the ecall timestamp (the read must occur at T)"
+    );
+    assert_eq!(
+        hint_bus_column(&v[20]),
+        Some(hint_cols::TIMESTAMP_1),
+        "ts_hi must be the ecall timestamp (the read must occur at T)"
+    );
     assert!(
         matches!(reads[0].multiplicity, Multiplicity::Column(c) if c == hint_cols::MU),
         "the register read must be gated by mu, like every other HINT interaction"

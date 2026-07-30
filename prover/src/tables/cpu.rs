@@ -195,9 +195,9 @@ pub struct CpuOperation {
     /// memory ops. `false` for the x-only variant and for non-ECSM rows.
     pub ecsm_affine: bool,
 
-    /// Whether this ECALL is a non-constraining Hint syscall (BENCH ONLY). The
-    /// hint operand addresses (x10/x11/x12) are recovered from the register state
-    /// in the trace builder, exactly like ECSM.
+    /// Whether this ECALL is a non-constraining Hint syscall. The hint operand
+    /// addresses (x10/x11/x12) are recovered from the register state in the trace
+    /// builder, exactly like ECSM.
     pub ecall_hint: bool,
 }
 

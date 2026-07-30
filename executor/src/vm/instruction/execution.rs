@@ -19,7 +19,7 @@ pub enum SyscallNumbers {
     // Placeholder discriminant. The actual syscall value is ECSM_AFFINE_SYSCALL_NUMBER.
     EcsmAffine = 96,
     // Placeholder discriminant. The actual syscall value is HINT_SYSCALL_NUMBER.
-    // BENCH ONLY: non-constraining hint (host computes modular inverse/sqrt, guest verifies).
+    // Non-constraining hint (host computes modular inverse/sqrt, guest verifies).
     Hint = 95,
 }
 
@@ -47,12 +47,13 @@ pub const ECSM_SYSCALL_NUMBER: u64 = u64::MAX - 10;
 /// the mode with an `IS_AFFINE` column pinned to this number via the `Ecall` bus.
 pub const ECSM_AFFINE_SYSCALL_NUMBER: u64 = u64::MAX - 11;
 
-/// Syscall number for the non-constraining `Hint` ecall (BENCH ONLY).
+/// Syscall number for the non-constraining `Hint` ecall.
 ///
 /// The host computes a modular inverse or square root and writes it back to the
-/// guest, which must verify it (e.g. `x·inv == 1`). This adds no in-circuit
-/// correctness constraint of its own — it exists to measure the cost of the
-/// hint-then-verify pattern versus computing the operation in the guest.
+/// guest, which MUST verify it (e.g. `x·inv == 1`) and recompute in software on a
+/// verification failure. The ecall adds no in-circuit correctness constraint of its
+/// own — it lets the guest replace an expensive computation with a cheap check,
+/// without letting the (prover-chosen) hinted value change the guest's result.
 pub const HINT_SYSCALL_NUMBER: u64 = u64::MAX - 20;
 
 /// Hint operation selector passed in `a0`.
@@ -125,13 +126,19 @@ fn store_u256_le(memory: &mut Memory, addr: u64, bytes: &[u8; 32]) -> Result<(),
     Ok(())
 }
 
-/// BENCH ONLY. Compute a non-constraining hint (modular inverse / sqrt) with the
-/// same k256 arithmetic the guest verifies against. Input/output are 32-byte
-/// big-endian, k256's own serialization — unlike the ECSM ABI, which is
-/// little-endian because its chip consumes little-endian limbs. The HINT table
-/// only copies these bytes into memory writes, so the order is free to match the
-/// consumers. On any failure (non-canonical input, no inverse/sqrt) returns zeros;
-/// the guest's verify then fails loudly.
+/// Compute a non-constraining hint (modular inverse / sqrt) with the same k256
+/// arithmetic the guest verifies against. Input/output are 32-byte big-endian,
+/// k256's own serialization — unlike the ECSM ABI, which is little-endian because
+/// its chip consumes little-endian limbs. The HINT table only copies these bytes
+/// into memory writes, so the order is free to match the consumers.
+///
+/// On a numeric failure (non-canonical input, no inverse/sqrt) returns zeros. This
+/// is NOT a loud failure and must not be treated as one: the guest's in-circuit
+/// verify rejects the value and recomputes it in software (see the `ethrex-crypto`
+/// crate), so a zero/garbage hint only costs the guest extra work — it can never
+/// change the guest's result. An *unknown* `hint_id` never reaches here: the ecall
+/// dispatch rejects it up front with [`ExecutionError::HintUnknownSelector`], so the
+/// `_` arm below is defensive only.
 ///
 /// `pub` so the prover's `collect_hint_ops` can reproduce the exact output value
 /// the executor wrote to guest memory (the value is not carried in the CPU log).
@@ -571,14 +578,22 @@ impl Instruction {
                         dst_val = addr_k;
                     }
                     SyscallNumbers::Hint => {
-                        // BENCH ONLY. Non-constraining hint: host computes a modular
-                        // inverse/sqrt and writes it to the guest, which verifies it.
-                        // a0 = hint_id, a1 = input addr (32-byte BE), a2 = output addr.
-                        // The `_le` helpers only move bytes in address order, which is
-                        // what a raw big-endian buffer needs.
+                        // Non-constraining hint: host computes a modular inverse/sqrt
+                        // and writes it to the guest, which verifies it (and falls back
+                        // to software on failure). a0 = hint_id, a1 = input addr
+                        // (32-byte BE), a2 = output addr. The `_le` helpers only move
+                        // bytes in address order, which is what a raw big-endian buffer
+                        // needs.
                         let hint_id = registers.read(10)?;
                         let in_addr = registers.read(11)?;
                         let out_addr = registers.read(12)?;
+                        // Reject an unrecognized selector up front: an unknown `hint_id`
+                        // would otherwise silently produce a zero output (see
+                        // `compute_hint`), indistinguishable from a legitimate numeric
+                        // failure. Fail loudly instead so a guest bug surfaces here.
+                        if !matches!(hint_id, HINT_FIELD_INV | HINT_SCALAR_INV | HINT_FIELD_SQRT) {
+                            return Err(ExecutionError::HintUnknownSelector(hint_id));
+                        }
                         // The HINT table sends the output writes as `[out_addr_lo + 8i,
                         // out_addr_hi]`, so an `out_addr` whose 32-byte range crosses the
                         // limb boundary would unbalance the memory bus. `in_addr` is not on
@@ -776,6 +791,8 @@ pub enum ExecutionError {
     EcsmOperandOverlap,
     #[error("Hint address range overflows the lower 32-bit limb")]
     HintAddressOverflow,
+    #[error("Unknown hint selector: {0}")]
+    HintUnknownSelector(u64),
     #[error("ECSM scalar multiplication error: {0}")]
     Ecsm(#[from] ecsm::EcsmError),
 }
