@@ -53,6 +53,28 @@ Last updated 2026-07-29 by team-lead.
 4. **Soundness claims need coherent forgeries**, not trace tampering — build
    the attack so every bus balances and every claimed value is consistent,
    then show the one constraint that rejects it.
+5. **A deferral's safety argument is itself a claim needing evidence.**
+   Deferring work behind a loud assert is fine. Deferring it because you
+   believe it is cosmetic, without checking, is not — the check is what tells
+   you whether the thing you postponed was a convenience or a soundness
+   obligation. Two instances this phase: a trailing-half mask that looked
+   cosmetic actually pinned arena bytes past a length prefix (without it a
+   prover rewrites the absorbed string while the prefix claims otherwise), and
+   a "public output is surely 4-byte aligned" recollection that was simply
+   false — public output is one byte per COMMIT op with no alignment
+   guarantee. Verify the premise, then defer.
+6. **Mark provenance; never assert past your evidence.** In any document,
+   separate what you verified first-hand from what you took from someone
+   else's report — and give every instrument a "what this cannot see" note
+   naming the questions it is structurally unable to answer. Not bookkeeping:
+   the one claim this phase that was flat wrong ("the constraint leg is
+   workload-shaped, a no-EC epoch drops 65%") was the single sentence its
+   author wrote without marking provenance. It was asserted from a node
+   census, which cannot see how sub-proofs are ASSEMBLED — and ten tables
+   contribute a sub-proof each regardless of whether they have any rows. It
+   reached the team lead's durable notes before the author's own
+   re-measurement pulled it back. Both halves of this rule answer the same
+   question: *how do I stop myself asserting past my evidence?*
 
 ## Coordination
 
