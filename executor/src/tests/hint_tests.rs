@@ -1,8 +1,9 @@
-//! Tests for the non-constraining `Hint` syscall (BENCH ONLY).
+//! Tests for the non-constraining `Hint` syscall.
 
 use crate::vm::instruction::decoding::Instruction;
 use crate::vm::instruction::execution::{
-    ExecutionError, HINT_FIELD_INV, HINT_SYSCALL_NUMBER, compute_hint,
+    ExecutionError, HINT_FIELD_INV, HINT_FIELD_SQRT, HINT_SCALAR_INV, HINT_SYSCALL_NUMBER,
+    compute_hint,
 };
 use crate::vm::memory::Memory;
 use crate::vm::registers::Registers;
@@ -105,14 +106,62 @@ fn hint_syscall_accepts_operand_ending_at_the_limb_boundary() {
         .expect("operand ending at the limb boundary must run");
 }
 
-/// An unknown `hint_id` is not an error — the ecall writes zeros and the guest's
-/// verify is what rejects the value. Pins that contract so a future selector can't
-/// silently start trapping instead.
+/// The scalar-field inverse hint (mod n) round-trips through guest memory and
+/// satisfies `x·inv == 1 (mod n)` — the check the guest performs on the untrusted
+/// value. Used by production ecrecover (`r⁻¹`).
 #[test]
-fn hint_syscall_writes_zeros_for_an_unknown_selector() {
+fn hint_syscall_writes_the_scalar_inverse() {
+    use k256::elliptic_curve::PrimeField;
+
+    let mut input = [0u8; 32];
+    input[31] = 3; // 3, big-endian
+
+    let out = run_hint_at(HINT_SCALAR_INV, 0x1000, 0x2000, &input).expect("hint must run");
+    assert_eq!(out, compute_hint(HINT_SCALAR_INV, &input));
+
+    let three: k256::Scalar = Option::from(k256::Scalar::from_repr(input.into())).unwrap();
+    let inv: k256::Scalar = Option::from(k256::Scalar::from_repr(out.into())).unwrap();
+    assert_eq!(
+        (three * inv).to_bytes(),
+        k256::Scalar::ONE.to_bytes(),
+        "hinted scalar inverse must satisfy x·inv == 1 (mod n)"
+    );
+}
+
+/// The base-field sqrt hint (mod p) round-trips and satisfies `y² == rhs (mod p)`.
+/// Used by production ecrecover (decompressing R). `4 = 2²` is a residue.
+#[test]
+fn hint_syscall_writes_the_field_sqrt() {
+    let mut input = [0u8; 32];
+    input[31] = 4; // rhs = 4, big-endian
+
+    let out = run_hint_at(HINT_FIELD_SQRT, 0x1000, 0x2000, &input).expect("hint must run");
+    assert_eq!(out, compute_hint(HINT_FIELD_SQRT, &input));
+
+    let rhs: k256::FieldElement =
+        Option::from(k256::FieldElement::from_bytes(&input.into())).unwrap();
+    let y: k256::FieldElement = Option::from(k256::FieldElement::from_bytes(&out.into())).unwrap();
+    assert_eq!(
+        y.square().to_bytes(),
+        rhs.to_bytes(),
+        "hinted sqrt must satisfy y² == rhs (mod p)"
+    );
+}
+
+/// An unknown `hint_id` is rejected up front. Silently writing zeros would be
+/// indistinguishable from a legitimate numeric failure and — because the guest reads
+/// the value back — could let a prover-chosen selector steer a caller's accept/reject
+/// outcome. The executor traps so a guest bug surfaces loudly. `HINT_FIELD_SQRT = 2`
+/// is the last known selector, so 3 is the first unknown one.
+#[test]
+fn hint_syscall_rejects_an_unknown_selector() {
     let mut input = [0u8; 32];
     input[31] = 3;
-    let out =
-        run_hint_at(u64::MAX, 0x1000, 0x2000, &input).expect("unknown selector must not trap");
-    assert_eq!(out, [0u8; 32]);
+    for bad in [3u64, 100, u64::MAX] {
+        let err = run_hint_at(bad, 0x1000, 0x2000, &input).expect_err("unknown selector must trap");
+        assert!(
+            matches!(err, ExecutionError::HintUnknownSelector(id) if id == bad),
+            "expected HintUnknownSelector({bad}), got {err:?}"
+        );
+    }
 }

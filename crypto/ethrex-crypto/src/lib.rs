@@ -20,9 +20,10 @@ use ethrex_crypto::keccak::keccak_hash;
 use ethrex_crypto::{Crypto, CryptoError};
 use k256::elliptic_curve::group::prime::PrimeCurveAffine;
 use k256::elliptic_curve::ops::{LinearCombination, Reduce};
-// `Invert` (software `x.invert()`) is only used by the host fallback; on the
-// riscv64 guest all inversions go through the `hint` ecall.
-#[cfg(not(target_arch = "riscv64"))]
+// `Invert` provides the software `x.invert()/invert_vartime()`. It is used by the
+// host path AND, on the riscv64 guest, by the mandatory software fallback that
+// runs whenever a hinted inverse fails to verify (a lying host). It is therefore
+// needed in every build, not only off-target.
 use k256::elliptic_curve::ops::Invert;
 use k256::elliptic_curve::sec1::ToEncodedPoint;
 use k256::elliptic_curve::PrimeField;
@@ -65,32 +66,42 @@ impl Crypto for LambdaVmEcsmCrypto {
 
 /// Obtain a 32-byte big-endian hint for `x_be` via the executor `hint` ecall
 /// (the host computes the modular inverse / sqrt; the value is provable via the
-/// prover's HINT table). The result is UNVERIFIED — every caller MUST check it
-/// in-guest (`x·inv == 1`, `y² == x³+7`), since the ecall adds no correctness
-/// constraint. BENCH scaffolding.
+/// prover's HINT table). The result is UNTRUSTED — the ecall adds no correctness
+/// constraint, so every caller MUST verify it in-guest (`x·inv == 1`, `y² == x³+7`)
+/// AND recompute in software on any verification failure. The hint is only ever
+/// allowed to save work, never to change the answer: because the prover chooses the
+/// bytes, an unverified-or-rejected-outright hint would let it steer a caller's
+/// accept/reject outcome (e.g. force a valid signature to look invalid). See
+/// [`scalar_inv`] / [`decompress_r`] for the fallback that closes that hole.
 #[cfg(target_arch = "riscv64")]
 fn get_hint(hint_id: usize, x_be: &[u8; 32]) -> [u8; 32] {
-    let mut out = [0u8; 32];
-    lambda_vm_syscalls::syscalls::hint(hint_id, &mut out, x_be);
-    out
+    // 8-byte-aligned output buffer so the HINT table's four 8-byte writes land on the
+    // aligned memory path (MEMW_A) instead of the general MEMW path. An `[u8; 32]` on
+    // the stack is only 1-aligned, which forces the four writes onto the unaligned
+    // path and inflates the trace.
+    #[repr(C, align(8))]
+    struct Aligned32([u8; 32]);
+    let mut out = Aligned32([0u8; 32]);
+    lambda_vm_syscalls::syscalls::hint(hint_id, &mut out.0, x_be);
+    out.0
 }
 
-/// Scalar-field inverse `x⁻¹ mod n`. On riscv64 (guest) the inverse comes from the
-/// `hint` ecall and we verify `x·inv == 1`; off-target (host tests) it computes the
-/// inverse in software. BENCH scaffolding.
+/// Scalar-field inverse `x⁻¹ mod n`.
+///
+/// On riscv64 the inverse is first requested from the untrusted `hint` ecall and
+/// verified in-guest (`x·inv == 1`); **on any verification failure it is recomputed
+/// in software.** `x⁻¹` exists for every `x` this is called with — the only caller,
+/// `ecsm_ecrecover`, guarantees `r ≠ 0` before calling — so a failed verify can only
+/// mean the host lied, and the software value is authoritative. This is what keeps
+/// the result independent of the prover-chosen hint: a bad hint makes the guest do
+/// more work, it can never change the answer, so it cannot turn a valid signature
+/// into a recovery failure. Off-target (host) it inverts in software directly.
 fn scalar_inv(x: &Scalar) -> Option<Scalar> {
     #[cfg(target_arch = "riscv64")]
     {
-        use k256::elliptic_curve::subtle::ConstantTimeEq;
-        let x_be: [u8; 32] = x.to_bytes().into();
-        let inv_be = get_hint(lambda_vm_syscalls::syscalls::HINT_SCALAR_INV, &x_be);
-        let inv: Scalar = Option::from(Scalar::from_repr(inv_be.into()))?;
-        // Verify the untrusted hint: x·inv must equal 1 (mod n).
-        if bool::from((*x * inv).ct_eq(&Scalar::ONE)) {
-            Some(inv)
-        } else {
-            None
-        }
+        scalar_inv_with_oracle(x, |x_be| {
+            get_hint(lambda_vm_syscalls::syscalls::HINT_SCALAR_INV, x_be)
+        })
     }
     #[cfg(not(target_arch = "riscv64"))]
     {
@@ -98,46 +109,108 @@ fn scalar_inv(x: &Scalar) -> Option<Scalar> {
     }
 }
 
-/// Decompress R from its x-coordinate + parity. On riscv64 the `y = sqrt(x³+7)`
-/// is an `hint`-ecall value verified in-guest (`y² == x³+7`), with parity
-/// selection; off-target it uses k256's software `decompress`. BENCH scaffolding.
+/// Core of [`scalar_inv`], generic over the hint source so host tests can inject an
+/// honest or a lying oracle and assert the software fallback keeps the result
+/// correct either way. See [`scalar_inv`] for the verify-then-fallback rationale.
+#[cfg(any(target_arch = "riscv64", test))]
+fn scalar_inv_with_oracle<O>(x: &Scalar, hint: O) -> Option<Scalar>
+where
+    O: FnOnce(&[u8; 32]) -> [u8; 32],
+{
+    use k256::elliptic_curve::subtle::ConstantTimeEq;
+    let x_be: [u8; 32] = x.to_bytes().into();
+    let inv_be = hint(&x_be);
+    // Fast path: a canonical hint that verifies (x·inv == 1 mod n) is used as-is.
+    if let Some(inv) = Option::<Scalar>::from(Scalar::from_repr(inv_be.into())) {
+        if bool::from((*x * inv).ct_eq(&Scalar::ONE)) {
+            return Some(inv);
+        }
+    }
+    // Hint absent / malformed / wrong: recompute authoritatively. `x⁻¹` exists for
+    // every input the callers pass (`r ≠ 0`), so this is `Some` on the honest path.
+    x.invert_vartime().into()
+}
+
+/// Decompress R from its x-coordinate + parity.
+///
+/// On riscv64 the square root `y = sqrt(x³+7)` is first requested from the untrusted
+/// `hint` ecall and verified in-guest (`y² == x³+7`), with parity selection; **on any
+/// verification failure the point is recomputed with the software
+/// `AffinePoint::decompress`.** Unlike the inverse, a failure here is *not*
+/// necessarily a lying host: a genuine non-residue (an invalid signature) has no
+/// root and must legitimately yield `None`. So the fallback is the authoritative
+/// software decompress, which returns `Some` for a residue and `None` for a
+/// non-residue regardless of the prover-chosen hint — the hint can only save work,
+/// never steer the accept/reject outcome. Off-target it uses the software
+/// decompress directly.
 fn decompress_r(r_bytes: &FieldBytes, y_is_odd: bool) -> Option<AffinePoint> {
     #[cfg(target_arch = "riscv64")]
     {
-        let x: FieldElement = Option::from(FieldElement::from_bytes(r_bytes))?;
-        // secp256k1: y² = x³ + 7.
-        let mut seven_bytes = [0u8; 32];
-        seven_bytes[31] = 7;
-        let seven: FieldElement = Option::from(FieldElement::from_bytes(&seven_bytes.into()))?;
-        let x3: FieldElement = x.square() * x;
-        let rhs: FieldElement = x3 + seven;
-        // Hinted sqrt (BE in/out), then verify y² == rhs canonically.
-        let rhs_be: [u8; 32] = rhs.to_bytes().into();
-        let y_be = get_hint(lambda_vm_syscalls::syscalls::HINT_FIELD_SQRT, &rhs_be);
-        let mut y: FieldElement = Option::from(FieldElement::from_bytes(&y_be.into()))?;
-        let y2: FieldElement = y.square();
-        // Verify the untrusted root: y² must equal x³+7. Negate `y2`, not `rhs`:
-        // `Neg` is `negate(1)` and only accepts magnitude 1, which `square()` always
-        // returns, whereas `rhs` is a sum and carries magnitude 2 — negating it would
-        // silently compute the wrong value in release, where the debug assert is gone.
-        // (`ct_eq` is unusable here for the same reason as in `field_inv`.)
-        if !bool::from((rhs + y2.negate(1)).normalizes_to_zero()) {
-            return None;
-        }
-        // Select the root whose canonical LSB matches the requested parity.
-        let y_odd = (y.to_bytes()[31] & 1) == 1;
-        if y_odd != y_is_odd {
-            y = -y;
-        }
-        // Build the affine point; `from_encoded_point` re-checks it's on-curve.
-        let ep = EncodedPoint::from_affine_coordinates(&x.to_bytes(), &y.to_bytes(), false);
-        Option::from(AffinePoint::from_encoded_point(&ep))
+        decompress_r_with_oracle(r_bytes, y_is_odd, |rhs_be| {
+            get_hint(lambda_vm_syscalls::syscalls::HINT_FIELD_SQRT, rhs_be)
+        })
     }
     #[cfg(not(target_arch = "riscv64"))]
     {
         use k256::elliptic_curve::point::DecompressPoint;
         AffinePoint::decompress(r_bytes, u8::from(y_is_odd).into()).into()
     }
+}
+
+/// Core of [`decompress_r`], generic over the hint source for host tests: try the
+/// hinted sqrt, then fall back to the authoritative software decompress on any
+/// failure. See [`decompress_r`] for the rationale.
+#[cfg(any(target_arch = "riscv64", test))]
+fn decompress_r_with_oracle<O>(r_bytes: &FieldBytes, y_is_odd: bool, hint: O) -> Option<AffinePoint>
+where
+    O: FnOnce(&[u8; 32]) -> [u8; 32],
+{
+    if let Some(p) = decompress_r_hinted(r_bytes, y_is_odd, hint) {
+        return Some(p);
+    }
+    // Hinted root absent / malformed / wrong, OR a genuine non-residue: the software
+    // decompress is authoritative — `Some` for a residue, `None` for a non-residue.
+    use k256::elliptic_curve::point::DecompressPoint;
+    AffinePoint::decompress(r_bytes, u8::from(y_is_odd).into()).into()
+}
+
+/// The hint-accelerated decompress attempt: returns the point only if the hinted
+/// root verifies (`y² == x³+7`); `None` on any failure, so the caller falls back to
+/// the software decompress. Never the last word — a `None` here is not a decision
+/// that R is invalid, only that the fast path did not produce a verified root.
+#[cfg(any(target_arch = "riscv64", test))]
+fn decompress_r_hinted<O>(r_bytes: &FieldBytes, y_is_odd: bool, hint: O) -> Option<AffinePoint>
+where
+    O: FnOnce(&[u8; 32]) -> [u8; 32],
+{
+    let x: FieldElement = Option::from(FieldElement::from_bytes(r_bytes))?;
+    // secp256k1: y² = x³ + 7.
+    let mut seven_bytes = [0u8; 32];
+    seven_bytes[31] = 7;
+    let seven: FieldElement = Option::from(FieldElement::from_bytes(&seven_bytes.into()))?;
+    let x3: FieldElement = x.square() * x;
+    let rhs: FieldElement = x3 + seven;
+    // Hinted sqrt (BE in/out), then verify y² == rhs canonically.
+    let rhs_be: [u8; 32] = rhs.to_bytes().into();
+    let y_be = hint(&rhs_be);
+    let mut y: FieldElement = Option::from(FieldElement::from_bytes(&y_be.into()))?;
+    let y2: FieldElement = y.square();
+    // Verify the untrusted root: y² must equal x³+7. Negate `y2`, not `rhs`:
+    // `Neg` is `negate(1)` and only accepts magnitude 1, which `square()` always
+    // returns, whereas `rhs` is a sum and carries magnitude 2 — negating it would
+    // silently compute the wrong value in release, where the debug assert is gone.
+    // (`ct_eq` is unusable here for the same reason as in `field_inv`.)
+    if !bool::from((rhs + y2.negate(1)).normalizes_to_zero()) {
+        return None;
+    }
+    // Select the root whose canonical LSB matches the requested parity.
+    let y_odd = (y.to_bytes()[31] & 1) == 1;
+    if y_odd != y_is_odd {
+        y = -y;
+    }
+    // Build the affine point; `from_encoded_point` re-checks it's on-curve.
+    let ep = EncodedPoint::from_affine_coordinates(&x.to_bytes(), &y.to_bytes(), false);
+    Option::from(AffinePoint::from_encoded_point(&ep))
 }
 
 /// Recover the uncompressed public key bytes (X‖Y, 64 bytes) from a 64-byte
