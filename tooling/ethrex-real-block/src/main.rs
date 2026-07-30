@@ -122,15 +122,16 @@ mod tests {
     /// check, so any divergence from consensus fails here — on the host, with no
     /// RV64 toolchain and no proving run.
     ///
-    /// This is NOT a complete guest-precompile screen, despite what an earlier
-    /// version of this comment claimed. This crate's dependency graph links
-    /// `c-kzg` (via `ethrex-config` → `ethrex-p2p`, see Cargo.toml), so KZG point
-    /// evaluation (0x0a) resolves to a working implementation here while the
-    /// guest has none. A block calling 0x0a would pass this test.
+    /// It does NOT screen KZG: this crate's graph links `c-kzg` (via
+    /// `ethrex-config` → `ethrex-p2p`, see Cargo.toml), so point evaluation
+    /// (0x0a) resolves to a working implementation here while the guest has none.
+    /// A block calling 0x0a would pass this test.
     ///
-    /// What does screen 0x0a today is `test_ethrex_real_block_native` in
-    /// `tooling/ethrex-tests`, whose graph happens to link no KZG backend at all
-    /// — accidentally, and enforced by `no_kzg_backend_linked` there.
+    /// `test_ethrex_real_block_native` in `tooling/ethrex-tests` is what covers
+    /// 0x0a, and `no_kzg_backend_linked` there keeps it covered. That split is
+    /// sufficient rather than a workaround: KZG is the only precompile in
+    /// `ethrex-crypto` whose *availability* is feature-gated — the other gates
+    /// swap between two working implementations.
     #[test]
     fn real_block_executes_under_guest_crypto() {
         use ethrex_guest_program::l1::execution_program;
@@ -151,7 +152,10 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(CACHE).unwrap()).unwrap();
         cache["network"] = serde_json::json!("LocalDevnet");
 
-        let path = std::env::temp_dir().join("ethrex_real_block_localdevnet.json");
+        let path = std::env::temp_dir().join(format!(
+            "ethrex_real_block_localdevnet_{}.json",
+            std::process::id()
+        ));
         std::fs::write(&path, serde_json::to_vec(&cache).unwrap()).unwrap();
         let result = program_input_from_cache(path.to_str().unwrap());
         std::fs::remove_file(&path).ok();

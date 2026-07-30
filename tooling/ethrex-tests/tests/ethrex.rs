@@ -122,16 +122,27 @@ fn test_ethrex_real_block_native() {
 /// consensus and fails rather than passing on a surface the guest doesn't have.
 /// If a future dependency pulls `c-kzg` or `kzg-rs` in, this goes red instead of
 /// the screen silently disappearing.
+/// Detection is by error *text*, deliberately: zero input fails under a linked
+/// backend too (invalid G1 encoding), and both paths surface as
+/// `CryptoError::Other`, so the variant can't tell them apart. The string comes
+/// from `ethrex-crypto`'s `KzgError::Unimplemented`; if upstream rewords it this
+/// test goes red, which is the safe direction.
+///
+/// Worth knowing why this can regress: `ethrex-crypto`'s own default feature set
+/// is `["std", "kzg-rs", "secp256k1"]`, so any future dependency pulling it in
+/// with defaults on restores a backend and silently removes the screen.
 #[test]
 fn no_kzg_backend_linked() {
     use ethrex_guest_program::crypto::{Crypto, NativeCrypto};
-    let err = NativeCrypto
-        .verify_kzg_proof(&[0u8; 32], &[0u8; 32], &[0u8; 48], &[0u8; 48])
-        .expect_err("a KZG backend is linked: verify_kzg_proof succeeded on zero input");
+    let result = NativeCrypto.verify_kzg_proof(&[0u8; 32], &[0u8; 32], &[0u8; 48], &[0u8; 48]);
+    let message = match result {
+        Ok(()) => "verify_kzg_proof accepted zero input".to_string(),
+        Err(err) => format!("{err:?}"),
+    };
     assert!(
-        format!("{err:?}").contains("unimplemented"),
-        "a KZG backend got linked into ethrex-tests, so test_ethrex_real_block_native \
-         no longer screens precompile 0x0a: {err:?}"
+        message.contains("One of features c-kzg, openvm-kzg or kzg-rs should be active"),
+        "a KZG backend is linked into ethrex-tests, so test_ethrex_real_block_native no \
+         longer screens precompile 0x0a: {message}"
     );
 }
 

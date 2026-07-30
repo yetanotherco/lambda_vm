@@ -91,8 +91,10 @@ the block under invented rules while still passing every check here, since the
 witness is only ever validated against whichever config we chose. The converter
 refuses instead; `unmappable_network_is_rejected` pins that.
 
-Then point this tool at the resulting JSON. To make a new block the default,
-override `ETHREX_REAL_BLOCK` (Makefile) or add a rule alongside it.
+Then point this tool at the resulting JSON. Adopting a different block as the
+default is an edit, not a flag: `ETHREX_REAL_BLOCK` and `ETHREX_REPLAY_REV` in the
+Makefile, the `hoodi` in the cache URL, `CACHE` and the assertions in
+`src/main.rs`, and `REAL_BLOCK_FIXTURE` in `tooling/ethrex-tests`.
 
 ## Why the JSON and not ethrex-replay's own `.bin`
 
@@ -122,18 +124,22 @@ block through `LambdaVmEcsmCrypto`, the `Crypto` impl the guest injects, so it i
 exercised via the guest's own trait dispatch. Stateless re-execution ends in a
 post-state-root check, so any divergence from consensus fails here.
 
-**It is not a full guest-precompile screen.** Declaring
-`ethrex-guest-program` with `default-features = false, features = ["lambdavm"]`
-is necessary but not sufficient: the `ethrex-config` dependency (used only for
+**It does not screen KZG.** Declaring `ethrex-guest-program` with
+`default-features = false, features = ["lambdavm"]` is necessary but not
+sufficient: the `ethrex-config` dependency (used only for
 `Network::get_genesis()`) pulls `ethrex-p2p`, whose `default = ["c-kzg"]`
-propagates down to `ethrex-crypto/c-kzg`, and `default-features = false` cannot
-switch it off because ethrex's own workspace declares `ethrex-p2p` with defaults
-on. Verify with `cargo tree -e features -i ethrex-crypto`. Consequences: KZG
-point evaluation (0x0a) resolves to a working c-kzg here but to nothing in the
-guest; modexp runs malachite here and num-bigint there; BN254 gets `ark-ff/asm`.
+propagates down to `ethrex-crypto/c-kzg` — and `default-features = false` cannot
+switch it off, because ethrex's own workspace declares `ethrex-p2p` with defaults
+on. Verify with `cargo tree -e features -i ethrex-crypto`. So point evaluation
+(0x0a) resolves to a working c-kzg here and to nothing in the guest.
 
-Closing that gap means dropping `ethrex-config` and sourcing `ChainConfig`
-another way, which is a design change — tracked as follow-up, not done here.
+Scope of the gap: in `ethrex-crypto`, KZG is the **only** precompile whose
+*availability* is feature-gated. The other two gates swap between working
+implementations — `secp256k1` picks libsecp256k1 over k256, `std` picks malachite
+over num-bigint for modexp — so they change which code runs, not whether a block
+can execute. Dropping `ethrex-config` would therefore be a CI-time improvement
+(it also sheds `ethrex-p2p`, `ethrex-blockchain`, `ethrex-storage` and the c-kzg
+and secp256k1 C builds), not a correctness fix.
 
 **What screens 0x0a today** is `test_ethrex_real_block_native` in
 `tooling/ethrex-tests`, whose graph links no KZG backend at all. That was

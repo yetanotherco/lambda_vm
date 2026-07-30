@@ -291,7 +291,7 @@ ethrex-real-block-fixture: $(ETHREX_REAL_BLOCK_FIXTURE)
 
 $(ETHREX_REAL_BLOCK_CACHE):
 	mkdir -p $(dir $@)
-	curl -fsSL -o $@.tmp \
+	curl -fsSL --retry 3 --retry-delay 2 --retry-all-errors -o $@.tmp \
 		https://raw.githubusercontent.com/lambdaclass/ethrex-replay/$(ETHREX_REPLAY_REV)/caches/cache_hoodi_$(ETHREX_REAL_BLOCK).json
 	mv $@.tmp $@
 
@@ -304,9 +304,12 @@ $(ETHREX_REAL_BLOCK_FIXTURE): $(ETHREX_REAL_BLOCK_CACHE) tooling/ethrex-real-blo
 test-ethrex: compile-programs-rust $(ETHREX_REAL_BLOCK_FIXTURE)
 	cd tooling/ethrex-tests && cargo test --release -- --include-ignored --skip test_ethrex_real_block_vm
 
-# Offline variant: skips the real-block fixture (no network required).
+# Offline variant: no network. `--skip test_ethrex_real_block` is a substring
+# match, so it drops both real-block tests — the `_vm` one and the `_native` one,
+# which reads the downloaded fixture and would otherwise fail on a clean checkout.
+# The committed synthetic fixtures and `no_kzg_backend_linked` still run.
 test-ethrex-offline: compile-programs-rust
-	cd tooling/ethrex-tests && cargo test --release -- --include-ignored --skip test_ethrex_real_block_vm
+	cd tooling/ethrex-tests && cargo test --release -- --include-ignored --skip test_ethrex_real_block
 
 test-flamegraph:
 	cargo test -p executor --test flamegraph
