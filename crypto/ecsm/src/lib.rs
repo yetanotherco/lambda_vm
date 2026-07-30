@@ -169,12 +169,3 @@ pub fn scalar_mul_x(k_le: &[u8; 32], xg_le: &[u8; 32]) -> Result<[u8; 32], EcsmE
     let (k, g) = prepare(k_le, xg_le)?;
     Ok(to_le_32(&curve::scalar_mul_affine_x(&k, &g)))
 }
-
-/// Affine PoC entry point: both coordinates of `k·G` as little-endian 32-byte values,
-/// with `y` on the even-`y` convention (matching the witness / ECDAS-constrained `y_r`).
-/// The executor writes `xR` then `yR` (contiguous 64-byte output) back to guest memory.
-pub fn scalar_mul_xy(k_le: &[u8; 32], xg_le: &[u8; 32]) -> Result<([u8; 32], [u8; 32]), EcsmError> {
-    let (k, g) = prepare(k_le, xg_le)?;
-    let r = curve::scalar_mul_affine(&k, &g);
-    Ok((to_le_32(&r.x), to_le_32(&r.y)))
-}

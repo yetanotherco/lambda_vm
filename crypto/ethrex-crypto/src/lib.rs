@@ -296,18 +296,20 @@ fn field_inv(x: &FieldElement) -> Option<FieldElement> {
     }
 }
 
-/// Computes `k1·P1 + k2·P2` from four x-only oracle queries, or `None` if any
-/// degenerate-configuration guard trips.
+/// Computes `k1·P1 + k2·P2` from two affine oracle queries, or `None` if a
+/// degenerate configuration trips a guard.
 ///
-/// The lambda-vm ECSM precompile returns only `x(k·P)`. For `A = k1·P1` with
-/// `P1 = (xp, yp)` fully known, query `xa = x(k1·P1)` and `xc = x((k1+1)·P1)`.
-/// The chord-addition law gives `λ² = xc + xa + xp =: t` and `ya = yp + λ·dx`
-/// with `dx = xa − xp`; substituting into `ya² = xa³ + b` makes λ *linear*:
-/// `λ = (xa³ − xp³ − t·dx²) / (2·yp·dx)`. The wrong sign `−ya` would force
-/// `x((k1−1)·P1) = xc`, i.e. `k1 ≡ 0` or `2·k1 ≡ 0 (mod n)`, excluded by the
-/// scalar guards. x-only queries are parity-invariant (`x(k·P) = x(k·(−P))`),
-/// so the precompile's canonical-y lift never matters. Same for `B = k2·P2`,
-/// then `Q = A + B` is one affine addition. All three inversions are batched.
+/// The affine ECSM ecall returns the full point, so `A = k1·P1` and `B = k2·P2`
+/// each cost one query and `Q = A + B` is a single chord addition — one field
+/// inversion, for `1/(xb − xa)`. `dx = 0` covers both degenerate cases at once
+/// (two curve points share an x only when they are equal or negatives), so the
+/// caller falls back to the software `lincomb` there.
+///
+/// The x-only predecessor needed a second query `x((k+1)·P)` per point to solve
+/// for `y` through the chord-addition law, which is what made `k1 = 1` and
+/// `k1 = N−1` degenerate; with `y` supplied by the chip those scalars are
+/// ordinary. secp256k1 has cofactor 1 and prime `N`, so `k·P ≠ O` for every
+/// `k ∈ (0, N)` and no further scalar guard is needed.
 ///
 /// Generic over the oracle so unit tests can substitute a software stand-in.
 #[cfg(any(target_arch = "riscv64", test))]

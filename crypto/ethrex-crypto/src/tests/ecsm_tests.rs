@@ -125,8 +125,9 @@ fn cross_point_cancellation_falls_back() {
 
 #[test]
 fn odd_y_base_point_reconstructs_correctly() {
-    // Validates the affine oracle's odd-y sign flip: when P1 has odd y the caller
-    // must negate the oracle's even-y result, matching ProjectivePoint::lincomb.
+    // A base point with odd y needs no special handling: the affine oracle receives the
+    // caller's actual y and returns the actual k·P, so there is no even-y convention to
+    // undo. Pins that, by checking the result against ProjectivePoint::lincomb.
     let (p1, _k_gen) = (2u64..200)
         .find_map(|n| {
             let p = g_times(n);
