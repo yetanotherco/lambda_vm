@@ -495,6 +495,13 @@ fn constraint_op_census() {
     //    unreachable from the single-body capture path — which matters because
     //    Embed is the one op whose machine lowering depends on the word model.
     let (mut t_fusable, mut t_embed, mut t_dead, mut t_maxfan) = (0usize, 0usize, 0usize, 0u32);
+    // Machine constants are interned PROGRAM-WIDE, keyed on the canonical
+    // 4-lane word — one `Const` row per distinct value however many AIRs and
+    // however many nodes use it. Summing the per-AIR pools therefore overcounts,
+    // and small structural constants (0, 1, byte/halfword shifts) recur across
+    // every table.
+    let mut distinct_words: std::collections::BTreeSet<[u64; 4]> =
+        std::collections::BTreeSet::new();
     for (_, air) in &airs {
         let artifact = ConstraintArtifact::capture(&**air);
         let nodes = &artifact.nodes;
@@ -514,6 +521,13 @@ fn constraint_op_census() {
         // would delete the value the quotient recombination needs.
         for &r in &artifact.roots {
             uses[r as usize] += 1;
+        }
+
+        for &c in &artifact.base_consts {
+            distinct_words.insert([c, 0, 0, 0]);
+        }
+        for &e in &artifact.ext_consts {
+            distinct_words.insert([e[0], e[1], e[2], 0]);
         }
 
         // A node nobody reads is a write with mult = 0 — wasted instructions, and
@@ -536,29 +550,33 @@ fn constraint_op_census() {
     }
 
     let arith = t_fold + t_ext + t_mulbase;
-    let instr = t_ext + t_mulbase + t_const;
+    // One row per instruction, and every constant is one interned row
+    // program-wide — so the pool is counted once, not once per AIR.
+    let pool = distinct_words.len();
+    let instr = t_ext + t_mulbase + pool;
     println!(
         "{:<14} {:>7} {:>7} {:>6} {:>8} {:>8} {:>7} {:>8} {:>8}",
         "TOTAL", t_nodes, t_leaves, t_const, t_pv_base, t_fold, t_ext, t_mulbase, instr
     );
+    let unfused = instr + t_constraints;
+    let fused = unfused - t_fusable;
     println!(
         "\n  arithmetic nodes            {arith}\n  \
            base by the IR's own dim    {t_pv_base}   (prover-side; NOT the machine's split)\n  \
            base at verify time         {t_fold}   (constant-only subtrees -> fold at build time)\n  \
            extension ALU               {t_ext}\n  \
-           of which MulBase-eligible   {t_mulbase}   (ext x base: 3 base muls, not 9)\n  \
-           pooled constants            {t_const}\n  \
+           of which MulBase-routed     {t_mulbase}   (ext x base: 1 XALU row, vs 4+ if lowered by hand)\n  \
+           per-AIR constant pools      {t_const}   (sum; NOT the machine's cost)\n  \
+           interned program-wide       {pool}   (one Const row per distinct 4-lane word)\n  \
            = constraint-leg instr      {instr}\n  \
            + quotient recombination    {t_constraints} beta-folds (one per constraint)\n  \
-           = total                     {}\n  \
-           leaves (addresses, free)    {t_leaves}\n\n  \
-           MulAdd-fusable Add nodes    {t_fusable}   (Add over a single-use Mul -> one instr)\n  \
-           after fusion                {}\n  \
-           Op::Embed nodes             {t_embed}\n  \
+           = upper bound               {unfused}\n  \
+           MulAdd-fusable Add nodes    {t_fusable}   (Add over a single-use Mul; MulAdd costs the same as Mul, so ALWAYS fuse)\n  \
+           = ESTIMATE, fused           {fused}\n\n  \
+           leaves (addresses, free)    {t_leaves}\n  \
+           Op::Embed nodes             {t_embed}   (base->ext is free; would emit nothing)\n  \
            dead nodes (mult = 0)       {t_dead}\n  \
-           max fanout (max mult)       {t_maxfan}\n",
-        instr + t_constraints,
-        instr + t_constraints - t_fusable
+           max fanout (max mult)       {t_maxfan}\n"
     );
 
     // Loose ceiling: the design budget treats this leg as ~1% of the epoch

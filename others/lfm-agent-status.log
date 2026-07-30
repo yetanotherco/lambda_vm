@@ -27,3 +27,10 @@
 [phase0]   SCALING FLAG: 66,992 is per DISTINCT AIR, not per epoch — each sub-proof needs its own evaluation and chunking gives a family several. lfm-design.md 5.2's 69K line reads per-epoch but is per-distinct-AIR. Also workload-shaped: ECDAS+ECSM+KECCAK_RND = 86.9% of the total; no-EC workloads drop 65%.
 [phase0]   EXPRESSIBILITY: nothing blocked. IR is a pure DAG, nodes[i] references only < i — IDENTICAL to the machine's acyclicity premise (A), so dense address assignment in node order satisfies it by construction. Static fanout gives mult directly (max 1,632; 3 dead nodes need DCE). No Div in the constraint algebra.
 [phase0]   NOT VERIFIED: chunk counts per family (=> no per-epoch multiplier); instruction->trace-row factor; MulBase row shape taken from SOUNDNESS.md not the chip.
+[phase0] 2026-07-30 slice 5 — lowering design REVISED against the ISA inventory's cost facts.
+[phase0]   REVISED ESTIMATE: 66,652 upper bound - 9,069 fused = 57,583. The doc's ~69K assumed ~1:1 with nodes; MulAdd costs the SAME row as Mul, so fusion is mandatory and the real number lands 16.5% UNDER.
+[phase0]   Constants interned PROGRAM-WIDE, not per AIR: 655 summed pools -> 315 distinct 4-lane words. More than half the apparent constant cost was cross-table duplication.
+[phase0]   MulBase reframed: it is 1 XALU row, same as Mul — NOT a reduction. It is a ROUTING OBLIGATION (4+ rows if lowered by hand as 3 base muls + repack). 5,041 sites; would be 9,413 and wrong from prover dims.
+[phase0]   base->ext confirmed FREE => Op::Embed emits nothing (my independent analysis agreed). ext->base costs 1 LANES row but this leg NEVER needs it: nothing in the IR narrows, Dim only widens through binop's join.
+[phase0]   Cost model: 1 instruction = 1 row on 1 chip; group heights pad to next_power_of_two().max(4), so padded-cell cost needs the whole program's per-chip distribution (airs::lfm_cell_counts) and cannot be costed for this leg alone.
+[phase0]   Doc now separates what I verified myself (op inventory, Neg/Embed/ConstExt, no narrowing, all counts) from what I took on report (row parity facts, interning, padding) — sec 2.3.
