@@ -39,11 +39,12 @@ Three corrections to how the number should be read:
 2. **Constants are interned program-wide**, so the 655 per-AIR pooled constants
    are **315** actual `Const` rows (§4.2).
 3. **57,583 is per distinct AIR.** For the shape we actually recurse — a
-   CONTINUATION EPOCH — the leg is **63,393 instructions over 24 sub-proofs**
-   (intermediate) or 64,094 over 25 (final), against a measured sub-proof count
-   (§8.2.2). Larger epochs grow to ≈96K as cheap AIRs chunk (§8.2). §8.2.1
-   corrects an earlier claim of mine that the leg is workload-shaped — it is not,
-   and the architecture says so.
+   CONTINUATION EPOCH — the leg is **63,393 instructions over 24 sub-proofs** at
+   the minimum epoch and **64,035 over 26 at 2^20 cycles**, both measured
+   (§8.2.2). Doubling the epoch past CPU's chunk bound costs 642 instructions, so
+   the leg is ≈63–65K across any plausible epoch size. §8.2.1 corrects an earlier
+   claim of mine that the leg is workload-shaped — it is not, the architecture
+   says so, and that is what collapses the registry ladder to one dimension.
 
 **Nothing in the IR is structurally inexpressible on a straight-line machine.**
 The IR is already in precisely the form the machine's soundness argument demands
@@ -418,9 +419,37 @@ fixed block.
 The correct statement is the opposite of what I wrote: **the constraint leg is
 essentially workload-INDEPENDENT.** ~94% of it is the always-present fixed block;
 what varies is the chunked remainder, which tracks epoch size rather than
-instruction mix. That is a better property to have — the leg is predictable — but
-I asserted the reverse from the census alone without checking how sub-proofs are
-actually assembled, and the census cannot see that.
+instruction mix.
+
+#### Why this matters more than an erratum: it collapses the registry ladder
+
+This lands directly on the open profile-ladder question — *how many distinct
+programs must the registry carry?*
+
+A constraint leg that were workload-shaped would make the emitted program vary
+with workload class, and the registry would have to carry a **cross-product**:
+workload classes × epoch shapes. That is the feared outcome, and it is the shape
+that makes registry entries hard to enumerate.
+
+Because the leg is ~94% fixed, the emitted program barely varies with what the
+workload computes. What remains is the chunked term, which tracks **epoch SIZE**
+— the 1.01× → 1.49× growth measured in §8.2. So the ladder is
+**one-dimensional**: a short list of epoch shapes, not a cross-product. Each rung
+is an epoch size, and every workload of that size shares a program.
+
+That is the most consequential consequence of the measurement, and it is the
+opposite of what my erratum-version claimed. It also composes with the
+`page_base` uniform promotion, which removes the *other* source of
+workload-dependence (§0.1 of the uniform proposal): with both, the emitted
+program's identity depends on epoch shape alone.
+
+#### The generalizable lesson
+
+The node census cannot see how sub-proofs are **assembled**. It reads captured
+IR, one AIR at a time; nothing in it knows that `FIXED_TABLE_COUNT` forces a
+sub-proof for a zero-row table. Any inference about workload sensitivity, epoch
+composition, or sub-proof count is therefore outside what that instrument can
+support, however tempting the per-AIR table makes it. I asserted one anyway.
 
 ### 8.2.2 The continuation epoch — the shape we actually recurse
 
@@ -447,6 +476,30 @@ FINAL epoch (+HALT)                     64,094 instr over 25 sub-proofs
 epoch fixture, and the test asserts that this composition reproduces it — so the
 shape is pinned rather than inferred. If the epoch shape changes, the arithmetic
 stops matching and the test fails.
+
+Those 24/25 are the **minimum**: one chunk per family, i.e. an epoch of ≤2^19
+cycles. `continuation_epoch_chunk_counts_measured` drives the real continuation
+path — `Executor::resume_with_limit` for one epoch's cycles, then
+`Traces::from_image_and_logs` — to measure a larger epoch first-hand:
+
+| epoch | cycles | chunked sub-proofs | **total sub-proofs** | **instr** |
+|---|---:|---:|---:|---:|
+| minimum | ≤2^19 | 14 | **24** | **63,393** |
+| measured | 2^20 | 16 (CPU ×2, MEMW_R ×2) | **26** | **64,035** |
+
+Doubling the epoch past CPU's 2^19 chunk bound costs **642 instructions** — one
+extra CPU chunk (489) and one extra MEMW_R (153). That is the whole growth term,
+and it is why §8.2's monolithic 1.49× at 20M cycles is an over-estimate for an
+epoch: an epoch never gets that large, because it is capped at `epoch_size`.
+
+Two things fell out of running it that are worth more than the numbers:
+
+- **`fib_iterative_2M` and `array_multipass_20M` produce IDENTICAL chunk counts**
+  for their first 2^20 cycles — two quite different workloads, same 16 sub-proofs
+  and same 4,282 instructions. Workload-independence, visible directly rather
+  than argued from `FIXED_TABLE_COUNT`.
+- **The test asserts `traces.page_configs.is_empty()`**, so "a continuation epoch
+  never builds PAGE" is now pinned by a run rather than read off a comment.
 
 **94% of it is the fixed block**, which is the sharpest statement of §8.2.1: the
 constraint leg for a continuation epoch is ≈63K instructions essentially
@@ -512,13 +565,10 @@ a subtract from zero (§2.1). A lowering detail, not a structural obstacle.
 
 ## 10. What I did not verify
 
-- **Chunk growth for a LARGE continuation epoch.** §8.2.2's 63,393 assumes the
-  minimum one chunk per family, and its 24/25 sub-proof count is measured. What
-  is still monolithic-derived is §8.2's growth curve — how many chunks a
-  multi-million-cycle epoch actually produces. The shape of that growth is the
-  same (cheap AIRs chunk, expensive ones do not), so the ceiling is ≈96K, but
-  the exact per-epoch curve for the continuation path is inferred from
-  monolithic runs.
+- Nothing remaining on the epoch numbers. §8.2.2 is now first-hand for the
+  continuation path at both the minimum epoch and 2^20 cycles; §8.2's monolithic
+  table is retained only as the whole-execution comparison, and is explicitly
+  the wrong shape for the target.
 - **The machine-side cost facts listed in §2.3**, taken from the ISA inventory
   rather than read by me. The instruction counts survive if any is wrong; the row
   and cell conclusions do not.

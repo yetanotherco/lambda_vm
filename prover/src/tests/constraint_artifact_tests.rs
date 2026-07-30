@@ -374,9 +374,23 @@ fn report_sizes(sizes: &[ArtifactSize]) {
 /// Printed rather than asserted (beyond a loose ceiling): this is an instrument,
 /// and pinning exact counts would turn every constraint edit into a test failure.
 ///
-/// See also `epoch_chunk_multiplier`, which turns this per-AIR table into a
-/// per-EPOCH figure — the counts here are per distinct AIR, and an epoch
-/// evaluates the leg once per sub-proof.
+/// # WHAT THIS INSTRUMENT CANNOT SEE
+///
+/// It reads captured IR, one AIR at a time. It knows nothing about how a proof
+/// is ASSEMBLED from sub-proofs — not that the split-table families are chunked,
+/// not that `FIXED_TABLE_COUNT` forces a sub-proof for a table with zero rows,
+/// not which tables a continuation epoch even contains.
+///
+/// So any conclusion about workload sensitivity, epoch composition or sub-proof
+/// count is outside what these numbers support, however inviting the per-table
+/// breakdown makes it. This is not hypothetical: a previous reading of this
+/// table concluded the constraint leg was "workload-shaped" because ECDAS, ECSM
+/// and KECCAK_RND are 87% of it — and that is false, because those tables are
+/// present in every proof whether the workload touches them or not. The leg is
+/// workload-INDEPENDENT, and only `epoch_chunk_multiplier` and
+/// `continuation_epoch_constraint_leg` can tell you so.
+///
+/// Use those two for anything per-proof. Use this one for per-AIR facts only.
 #[test]
 fn constraint_op_census() {
     use stark::constraint_ir::device::{
@@ -779,6 +793,130 @@ fn continuation_epoch_constraint_leg() {
         get("L2G_GLOBAL"),
         get("GLOBAL_MEMORY")
     );
+}
+
+/// The chunk counts of a REAL continuation epoch, measured first-hand.
+///
+/// `epoch_chunk_multiplier` measures monolithic runs, which is the wrong shape:
+/// a monolithic proof covers the whole execution, while an epoch covers exactly
+/// `2^epoch_size_log2` cycles and carries a different table set. This drives the
+/// actual continuation path — `Executor::resume_with_limit` for one epoch's
+/// cycles, then `Traces::from_image_and_logs` — so the chunk counts are the
+/// prover's own, for an epoch.
+///
+/// Only epoch 0 is measured, and that is sufficient rather than a shortcut:
+/// epoch 0's `register_init` comes from the entry point, so it needs no previous
+/// epoch, and every INTERMEDIATE epoch runs exactly `epoch_size` cycles by
+/// construction (`continuation.rs` errors otherwise). Later epochs differ only
+/// in which instructions those cycles execute.
+///
+/// Proving is deliberately not run: the register chaining that would require it
+/// (`prev_fini` comes out of `prove_epoch`) has no bearing on table sizes.
+#[test]
+fn continuation_epoch_chunk_counts_measured() {
+    use crate::tables::MaxRowsConfig;
+    use crate::tables::register;
+    use crate::tables::trace_builder::{Traces, build_initial_image_paged};
+    use executor::elf::Elf;
+    use executor::vm::execution::Executor;
+
+    let opts = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
+    let instr: std::collections::BTreeMap<&str, usize> = production_airs(&opts)
+        .iter()
+        .map(|(label, air)| (*label, leg_instructions(&**air)))
+        .collect();
+    let get = |k: &str| *instr.get(k).unwrap_or_else(|| panic!("no AIR {k}"));
+
+    // 2^20 cycles: past CPU's 2^19 chunk bound, so chunking is actually
+    // exercised, while staying cheap enough to build traces for.
+    const EPOCH_SIZE_LOG2: u32 = 20;
+    let epoch_size = 1usize << EPOCH_SIZE_LOG2;
+
+    for name in ["fib_iterative_2M", "array_multipass_20M"] {
+        let elf_bytes = asm_elf_bytes(name);
+        let elf = Elf::load(&elf_bytes).expect("load elf");
+        let mut executor = Executor::new(&elf, vec![]).expect("executor");
+        let image = build_initial_image_paged(&elf, &[]);
+        let register_init = register::register_init_from_entry_point(elf.entry_point);
+
+        let logs = executor
+            .resume_with_limit(epoch_size)
+            .expect("resume")
+            .expect("program runs at least one epoch")
+            .to_vec();
+        let is_final = executor.pc() == 0;
+        assert!(
+            !is_final && logs.len() == epoch_size,
+            "[{name}] wanted a full intermediate epoch, got {} cycles (final={is_final})",
+            logs.len()
+        );
+
+        let traces = Traces::from_image_and_logs(
+            &elf,
+            &image,
+            &register_init,
+            &logs,
+            &MaxRowsConfig::default(),
+            &[],
+            is_final,
+            true,
+            #[cfg(feature = "disk-spill")]
+            stark::storage_mode::StorageMode::Ram,
+        )
+        .expect("epoch trace build");
+
+        let chunked: Vec<(&str, usize)> = vec![
+            ("CPU", traces.cpus.len()),
+            ("LT", traces.lts.len()),
+            ("SHIFT", traces.shifts.len()),
+            ("MEMW", traces.memws.len()),
+            ("MEMW_A", traces.memw_aligneds.len()),
+            ("LOAD", traces.loads.len()),
+            ("MUL", traces.muls.len()),
+            ("DVRM", traces.dvrms.len()),
+            ("BRANCH", traces.branches.len()),
+            ("MEMW_R", traces.memw_registers.len()),
+            ("EQ", traces.eqs.len()),
+            ("BYTEWISE", traces.bytewises.len()),
+            ("STORE", traces.stores.len()),
+            ("CPU32", traces.cpu32s.len()),
+        ];
+
+        // An epoch never builds PAGE — the continuation path passes
+        // `page_configs = &[]`. Pin that here rather than trusting the comment.
+        assert!(
+            traces.page_configs.is_empty(),
+            "[{name}] a continuation epoch must not build PAGE tables"
+        );
+
+        let families: usize = chunked.iter().map(|(l, n)| get(l) * n).sum();
+        let n_chunks: usize = chunked.iter().map(|(_, n)| *n).sum();
+        // Intermediate epoch: 9 fixed tables (no HALT) + 1 L2G_MEMORY.
+        let fixed = get("BITWISE")
+            + get("DECODE")
+            + get("COMMIT")
+            + get("KECCAK")
+            + get("KECCAK_RND")
+            + get("KECCAK_RC")
+            + get("REGISTER")
+            + get("ECSM")
+            + get("ECDAS");
+        let total = families + fixed + get("L2G_MEMORY");
+
+        println!(
+            "\n{name}, epoch 0 @ 2^{EPOCH_SIZE_LOG2} cycles\n  \
+               {n_chunks} chunked sub-proofs -> {families} instr\n  \
+               9 fixed + L2G_MEMORY          -> {} instr\n  \
+               EPOCH TOTAL {total} instr over {} sub-proofs",
+            fixed + get("L2G_MEMORY"),
+            n_chunks + 10
+        );
+        for (l, n) in &chunked {
+            if *n > 1 {
+                println!("    {l:<10} {n} chunks x {} = {}", get(l), get(l) * n);
+            }
+        }
+    }
 }
 
 /// Constraint-leg instructions for one AIR: extension ALU plus MulBase-routed
