@@ -38,9 +38,11 @@ Three corrections to how the number should be read:
    dims understates extension traffic by 14×.
 2. **Constants are interned program-wide**, so the 655 per-AIR pooled constants
    are **315** actual `Const` rows (§4.2).
-3. **57,583 is per distinct AIR, not per epoch.** An epoch evaluates the leg once
-   per SUB-PROOF, and chunking gives a family several (§8.2). This is the one
-   place the design doc's figure is optimistic.
+3. **57,583 is per distinct AIR.** The per-EPOCH figure is now measured (§8.2):
+   **≈65K at 1–2M cycles, ≈96K at 20M**, a 1.01–1.49× multiplier. Small, because
+   chunking multiplies the cheap AIRs while the expensive ones are never chunked.
+   §8.2.1 corrects an earlier claim of mine that the leg is workload-shaped — it
+   is not, and the architecture says so.
 
 **Nothing in the IR is structurally inexpressible on a straight-line machine.**
 The IR is already in precisely the form the machine's soundness argument demands
@@ -365,27 +367,74 @@ Leaves are free; constant-only subtrees fold at build time.
 Program-wide: + 315 interned `Const` rows + 2,150 β-folds = **66,652 upper
 bound**; − 9,069 fused = **57,583 estimate**.
 
-### 8.2 Two things that scale it — read before using the total
+### 8.2 The per-epoch multiplier, MEASURED
 
-**The leg is workload-shaped.** ECDAS + ECSM + KECCAK_RND = 55,998 instructions,
-**87% of the total**. An epoch doing no elliptic-curve work has no ECSM/ECDAS
-sub-proofs and drops 41,982 (65%). A single number for "the constraint leg"
-misleads in both directions; quote it per workload class.
-
-**The total is per distinct AIR, not per epoch.** Each SUB-PROOF carries its own
-trace and needs its own evaluation, and an epoch has more sub-proofs than 28:
-`T_epoch = table_counts.total()` (14 split-table families, **chunked**) `+ 9 or 10
-fixed + page_configs.len() + 1` (`lfm-target-shape.md`). So
+The §8.1 total is per distinct AIR. An epoch evaluates the leg once per
+SUB-PROOF, and the 14 split-table families are chunked —
+`chunks = ceil(rows / max_rows[table])`, with `max_rows` sized per table so each
+chunk costs about the same memory (`tables/mod.rs::max_rows`). So
 
 ```
 constraint rows per epoch = Σ over sub-proofs  instr(that sub-proof's AIR)
 ```
 
-A chunked family contributes its count once per chunk; each touched page
-contributes PAGE's 41. **This is the one place `lfm-design.md` §5.2 is
-optimistic** — its 69K line reads as per-epoch but is per-distinct-AIR. Cheap for
-the small AIRs; a four-figure count multiplied by a chunk factor is not. I do not
-have chunk counts, so I give the formula and no multiplier.
+Measured by `epoch_chunk_multiplier`, which builds real traces so the chunk
+counts are the prover's own splitting rather than a reconstruction of it:
+
+| fixture | cycles | chunked sub-proofs | chunked | fixed | pages | **epoch total** | **multiplier** |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `fib_iterative_1M` | 1.0M | 16 | 4,282 | 60,389 | 41 | **64,712** | **1.01×** |
+| `fib_iterative_2M` | 2.0M | 20 | 5,566 | 60,389 | 41 | **65,996** | **1.03×** |
+| `array_multipass_20M` | 20.4M | 123 | 34,938 | 60,389 | 205 | **95,532** | **1.49×** |
+
+**The multiplier is small, and the reason is structural**: chunking multiplies
+the CHEAP AIRs. CPU is 489 instructions, MEMW_R 153; even 40 CPU chunks at 20M
+cycles adds only 19,560. The expensive AIRs — ECSM 19,264, ECDAS 22,718,
+KECCAK_RND 14,016 — are never chunked, contributing exactly one sub-proof each.
+
+So the leg runs **≈65K per epoch at 1–2M cycles, ≈96K at 20M**. `lfm-design.md`
+§5.2's ≈69K was closer to right than my earlier warning implied; the correction
+is a modest growth term in epoch size, not a multiplier on the whole figure.
+
+### 8.2.1 CORRECTION — my "workload-shaped" claim was wrong
+
+An earlier version of this document said the leg was workload-shaped: that
+ECDAS + ECSM + KECCAK_RND are 87% of the per-AIR total, so an epoch doing no
+elliptic-curve work would drop 65%. **That is false, and the architecture says
+so plainly.**
+
+`FIXED_TABLE_COUNT = 10` is documented as "tables that always contribute exactly
+one sub-proof, **regardless of `TableCounts`**: bitwise, decode, halt, commit,
+keccak, keccak_rnd, keccak_rc, register, ecsm, ecdas" (`prover/src/lib.rs`).
+ECSM, ECDAS and the keccak tables are present in **every** epoch whether the
+workload touches them or not — a zero-row table still needs its sub-proof, since
+dropping it would remove its constraints from verification.
+
+The measurement above confirms it: the `fib_iterative` fixtures use no
+elliptic-curve and no keccak work, and still carry the full 60,389-instruction
+fixed block.
+
+The correct statement is the opposite of what I wrote: **the constraint leg is
+essentially workload-INDEPENDENT.** ~94% of it is the always-present fixed block;
+what varies is the chunked remainder, which tracks epoch size rather than
+instruction mix. That is a better property to have — the leg is predictable — but
+I asserted the reverse from the census alone without checking how sub-proofs are
+actually assembled, and the census cannot see that.
+
+### 8.2.2 Continuation epochs specifically
+
+The table above is the monolithic shape. A continuation epoch differs in three
+small ways, none of which changes the magnitude:
+
+- **PAGE does not appear.** Continuation epochs pass `page_configs = &[]`
+  (`continuation.rs:693`, `:797`, enforced prover-side at `:677-681`), so the
+  41-instruction-per-page term vanishes from the epoch proof.
+- **One L2G_MEMORY sub-proof** per epoch: +65 instructions.
+- **Intermediate epochs drop HALT** (9 fixed tables, not 10): −701 instructions.
+
+The global proof carries one L2G_GLOBAL per epoch (27 each) plus one
+GLOBAL_MEMORY per touched page (25 each) — negligible at any plausible page
+count.
 
 ### 8.3 Against the design doc's claim
 
@@ -397,8 +446,9 @@ have chunk counts, so I give the formula and no multiplier.
 | with mandatory fusion | — | **57,583** |
 
 The ≈69K claim assumed roughly 1:1 with nodes. Fusion is common — 9,069 pairs —
-so the real figure lands **16.5% under**, subject to §8.2's per-sub-proof
-multiplier, which is now the number that most needs pinning.
+so the per-distinct-AIR figure lands **16.5% under**. Applying §8.2's measured
+per-epoch multiplier (1.01–1.49×) puts a real epoch at **≈58K–86K instructions**,
+which brackets the ≈69K claim rather than contradicting it.
 
 ### 8.4 On converting rows to cells
 
@@ -440,8 +490,10 @@ a subtract from zero (§2.1). A lowering detail, not a structural obstacle.
 
 ## 10. What I did not verify
 
-- **Chunk counts per table family for a realistic workload**, hence no per-epoch
-  multiplier in §8.2. This is now the most valuable missing number for the budget.
+- **A continuation-epoch fixture.** §8.2's multiplier is measured on MONOLITHIC
+  runs; §8.2.2 derives the continuation differences by reading the code rather
+  than by running one. The differences are small and structural, but they are
+  inferred.
 - **The machine-side cost facts listed in §2.3**, taken from the ISA inventory
   rather than read by me. The instruction counts survive if any is wrong; the row
   and cell conclusions do not.

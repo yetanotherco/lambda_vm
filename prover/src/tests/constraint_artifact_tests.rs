@@ -373,6 +373,10 @@ fn report_sizes(sizes: &[ArtifactSize]) {
 ///
 /// Printed rather than asserted (beyond a loose ceiling): this is an instrument,
 /// and pinning exact counts would turn every constraint edit into a test failure.
+///
+/// See also `epoch_chunk_multiplier`, which turns this per-AIR table into a
+/// per-EPOCH figure — the counts here are per distinct AIR, and an epoch
+/// evaluates the leg once per sub-proof.
 #[test]
 fn constraint_op_census() {
     use stark::constraint_ir::device::{
@@ -585,6 +589,142 @@ fn constraint_op_census() {
         instr < 200_000,
         "constraint-leg instruction estimate {instr} has grown past the design budget"
     );
+}
+
+/// The constraint leg's per-EPOCH multiplier, measured on real fixtures.
+///
+/// `constraint_op_census` counts instructions per distinct AIR. An epoch does
+/// not evaluate each AIR once: every SUB-PROOF carries its own trace and needs
+/// its own constraint evaluation, and the split-table families are CHUNKED —
+/// `chunks = ceil(rows / max_rows[table])`, with `max_rows` sized per table so
+/// each chunk costs about the same memory (`tables/mod.rs::max_rows`).
+///
+/// So the epoch cost is `Σ over sub-proofs instr(that sub-proof's AIR)`, and the
+/// multiplier against the per-AIR total is what this measures. It is the number
+/// `lfm-design.md` §5.2 is missing: its ≈69K line reads as per-epoch but is
+/// per-distinct-AIR.
+///
+/// Measured by building real traces, so the chunk counts are the prover's own
+/// splitting rather than a reconstruction of it.
+#[test]
+fn epoch_chunk_multiplier() {
+    use crate::tables::MaxRowsConfig;
+    use crate::tables::trace_builder::Traces;
+
+    let opts = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
+
+    // Per-AIR constraint-leg instruction counts, keyed by label.
+    let instr: std::collections::BTreeMap<&str, usize> = production_airs(&opts)
+        .iter()
+        .map(|(label, air)| (*label, leg_instructions(&**air)))
+        .collect();
+    let get = |k: &str| *instr.get(k).unwrap_or_else(|| panic!("no AIR {k}"));
+
+    // Fixtures spanning roughly an epoch's worth of execution. An intermediate
+    // continuation epoch runs exactly 2^epoch_size_log2 cycles, so a fixture's
+    // cycle count is the axis to read these against.
+    for name in [
+        "fib_iterative_1M",
+        "fib_iterative_2M",
+        "array_multipass_20M",
+    ] {
+        let (elf, logs, _) = run_asm_elf(name);
+        let max_rows = MaxRowsConfig::default();
+        let traces = Traces::from_elf_and_logs_minimal(&elf, &logs, &max_rows, &[])
+            .expect("trace build succeeds");
+
+        // (label, chunk count) for every sub-proof the epoch would contain.
+        let chunked: Vec<(&str, usize)> = vec![
+            ("CPU", traces.cpus.len()),
+            ("LT", traces.lts.len()),
+            ("SHIFT", traces.shifts.len()),
+            ("MEMW", traces.memws.len()),
+            ("MEMW_A", traces.memw_aligneds.len()),
+            ("LOAD", traces.loads.len()),
+            ("MUL", traces.muls.len()),
+            ("DVRM", traces.dvrms.len()),
+            ("BRANCH", traces.branches.len()),
+            ("MEMW_R", traces.memw_registers.len()),
+            ("EQ", traces.eqs.len()),
+            ("BYTEWISE", traces.bytewises.len()),
+            ("STORE", traces.stores.len()),
+            ("CPU32", traces.cpu32s.len()),
+        ];
+
+        let chunked_total: usize = chunked.iter().map(|(l, n)| get(l) * n).sum();
+        let chunk_count: usize = chunked.iter().map(|(_, n)| *n).sum();
+
+        // Fixed (unchunked) tables present once per proof, plus one PAGE per
+        // touched page. A continuation epoch substitutes L2G/GLOBAL_MEMORY for
+        // PAGE (page_configs is empty there), so this monolithic shape is an
+        // upper bound on the page contribution.
+        let pages = traces.pages.len();
+        let fixed = get("BITWISE")
+            + get("DECODE")
+            + get("REGISTER")
+            + get("COMMIT")
+            + get("HALT")
+            + get("KECCAK")
+            + get("KECCAK_RND")
+            + get("KECCAK_RC")
+            + get("ECSM")
+            + get("ECDAS");
+        let page_total = get("PAGE") * pages;
+        let epoch_total = chunked_total + fixed + page_total;
+
+        let per_air_total: usize = instr.values().sum();
+        println!(
+            "\n{name}: {} cycles\n  \
+             chunked sub-proofs {chunk_count} (of 14 families) -> {chunked_total} instr\n  \
+             fixed tables                                       -> {fixed} instr\n  \
+             {pages} pages x {} instr                                 -> {page_total} instr\n  \
+             EPOCH TOTAL {epoch_total} instr   vs per-distinct-AIR {per_air_total}   \
+             multiplier {:.2}x",
+            logs.len(),
+            get("PAGE"),
+            epoch_total as f64 / per_air_total as f64
+        );
+        for (l, n) in &chunked {
+            if *n > 1 {
+                println!("    {l:<10} {n} chunks x {} = {}", get(l), get(l) * n);
+            }
+        }
+    }
+}
+
+/// Constraint-leg instructions for one AIR: extension ALU plus MulBase-routed
+/// multiplies. Shared by `constraint_op_census` and `epoch_chunk_multiplier` so
+/// the two cannot drift apart.
+fn leg_instructions(air: &dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = ()>) -> usize {
+    use stark::constraint_ir::device::{
+        DIM_BASE, OP_ADD, OP_ALPHA_POW, OP_CONST_BASE, OP_CONST_EXT, OP_EMBED, OP_MUL, OP_NEG,
+        OP_RAP_CHALLENGE, OP_SUB, OP_TABLE_OFFSET, OP_VAR,
+    };
+    let artifact = ConstraintArtifact::capture(air);
+    let nodes = &artifact.nodes;
+    let mut v_base = vec![false; nodes.len()];
+    let mut count = 0usize;
+    for (i, n) in nodes.iter().enumerate() {
+        match n.op {
+            OP_VAR | OP_RAP_CHALLENGE | OP_ALPHA_POW | OP_TABLE_OFFSET | OP_CONST_EXT => {
+                v_base[i] = false
+            }
+            OP_CONST_BASE => v_base[i] = true,
+            OP_ADD | OP_SUB | OP_MUL | OP_NEG | OP_EMBED => {
+                let (ba, bb) = match n.op {
+                    OP_NEG => (v_base[n.a as usize], true),
+                    OP_EMBED => (false, false),
+                    _ => (v_base[n.a as usize], v_base[n.b as usize]),
+                };
+                v_base[i] = ba && bb && n.dim == DIM_BASE;
+                if !v_base[i] {
+                    count += 1;
+                }
+            }
+            other => panic!("unclassified op tag {other}"),
+        }
+    }
+    count
 }
 
 /// The captured artifact does not depend on the proof options.

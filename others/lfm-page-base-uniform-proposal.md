@@ -1,7 +1,19 @@
 # Proposal: promote `page_base` (and `epoch_label`) to runtime uniforms
 
-Status: **proposal only — no semantics touched.** Written by the phase0 agent
-2026-07-30 against `feat/phase0-constraint-ir`. Decide before implementing.
+Status: **GATE CLEARED 2026-07-30** by an independent read-only trace; proposal
+revised accordingly. Still proposal only — no semantics touched.
+
+Three things the gate trace changed, all of which made the proposal *safer* and
+one of which retargets it:
+
+1. **The constant was never a binding.** I argued the uniform would be sound
+   *because* `page_base` is already bound by the preprocessed commitment. That
+   premise was wrong — it is not bound by anything (§4). The conclusion survives
+   and is stronger: there is nothing to break.
+2. **On the continuation path the AIR that matters is GLOBAL_MEMORY, not PAGE**
+   (§0.1). PAGE is never constructed for a continuation epoch.
+3. **`epoch_label` is materially safer than `page_base`**, so my recommendation
+   to move them together as equal-risk was wrong (§4.2).
 
 ## The problem, stated precisely
 
@@ -18,6 +30,20 @@ constraint IR as a literal constant:
 `BusValue::constant` / `LinearTerm::Constant` lower through
 `ConstraintBuilder::const_base`, so the value becomes an `Op::ConstBase` leaf in
 the captured program. A different parameter value is a different program.
+
+### 0.1 SCOPE — on the continuation path, PAGE is never built
+
+Continuation epochs pass `page_configs = &[]` (`continuation.rs:693`, `:797`,
+enforced prover-side at `:677-681`), so `create_page_air` is **not called** for
+an epoch proof. The page-base-as-constant AIR on the critical path is
+**`GLOBAL_MEMORY`** — `global_memory::bus_interactions(page_base)`
+(`tables/global_memory.rs:172-214`) via `global_memory_air`
+(`continuation.rs:220`).
+
+We recurse continuation epochs, so **GLOBAL_MEMORY is the target**; PAGE matters
+only for monolithic proofs. The mechanism below is identical for both — the two
+tables differ only in which constants they fold — but the priority is not, and
+an implementation that fixed PAGE alone would leave the target path untouched.
 
 **Why this is an identity problem, not a size problem.** Size is negligible
 (measured below). The blocker is that LFM program identity is a registry-pinned
@@ -51,15 +77,25 @@ constraint count are identical across parameter values (asserted by
 makes the uniform promotion viable — the parameter is genuinely a value, not a
 structural choice.
 
-### Scale (verified where marked)
+### Scale
 
 - Page size `DEFAULT_PAGE_SIZE = 1 << 18` = 256 KiB (`tables/page.rs:50`) —
   VERIFIED.
 - `local_to_global::MAX_EPOCHS = 1 << 20` (`tables/local_to_global.rs:83`), a
   hard cap from the `IsB20` range — VERIFIED. Real epoch counts are far smaller
-  (the target-shape doc puts a small ethrex block at 1–2 epochs).
-- Distinct page count for a realistic workload — **NOT MEASURED HERE.** I do not
-  have a number I can point at code for, so I am not giving one.
+  (a small ethrex block is 1–2 epochs).
+- **11 distinct ELF page bases** for the committed ethrex ELF, derived statically
+  from its `PT_LOAD` headers (not file size, which overcounts). All carry
+  `init_values`, so a monolithic ethrex `program_id` folds exactly 11 pairs.
+  Plus 1 private-input page for every committed ethrex fixture. — from the gate
+  trace.
+- **Continuation touched-set size: NOT MEASURED and not statically derivable.**
+  It is recorded nowhere. The design comments imply tens rather than thousands;
+  that is INFERENCE, not measurement, and is labelled as such wherever it is used.
+
+Either way this confirms size was never the issue: at 25 instructions per
+GLOBAL_MEMORY sub-proof, even a four-figure page count is noise against a ~65K
+constraint leg. The problem was only ever identity.
 
 ## Proposed mechanism
 
@@ -138,29 +174,58 @@ alongside the existing `Constant` variants, lowering to `b.base_uniform(idx)`.
 Then four call sites change — `page.rs`, `global_memory.rs`, and two in
 `local_to_global.rs`.
 
-### 4. SOUNDNESS OBLIGATION — the part I will not hand-wave
+### 4. SOUNDNESS — gate cleared, and my premise was wrong in my favour
 
-Today `page_base` is baked into the constraints, so a prover cannot lie about it.
-Making it a supplied value moves it out of the program, and something must bind
-it.
+I argued the uniform would be sound *because* `page_base` is already bound by the
+preprocessed commitment. **That premise is false.** The gate trace established:
 
-The argument that it is already bound: `page_base` is a **public,
-verifier-derived** value. The verifier's page set comes from the ELF and the
-declared page ranges, and each page's genesis commitment
-(`page::compute_precomputed_commitment`) is recomputed by the verifier rather
-than taken from the proof. So the verifier already knows every page base
-independently of the prover.
+- `page::compute_precomputed_commitment` covers only OFFSET and INIT.
+  `page.rs:380-383` says the commitment "depends only on the blowup factor — not
+  on page_base", pinned by `static_commitments_tests.rs:82`.
+- `page_base` is **not absorbed into the transcript** — the verifier absorbs only
+  preprocessed and trace roots.
+- It reaches `program_id` only for ELF-backed data pages.
 
-**That argument is necessary but I have not verified it end-to-end, and it is
-the single thing that must be checked before implementing.** The rule to hold to
-is the one `trace_ood_next_row_columns` already states: the value must be
-computed identically by prover and verifier and never read from the
-prover-controlled proof. If any path lets the proof choose a base, this proposal
-is unsound as written and the uniform must instead be bound by a constraint.
+So the compile-time constant is a **verifier-side local, not a commitment**.
+Removing it costs nothing, because it was never buying anything. The conclusion
+survives and is stronger than the argument I made for it — but I had the reason
+backwards, and a proposal resting on a false premise is one edit away from
+resting on nothing.
 
-Same question, separately, for `epoch_label` — it is a counter the verifier
-derives from the epoch chain, so the argument looks stronger there, but it is
-still an argument that needs checking rather than asserting.
+#### 4.1 THE LOAD-BEARING INVARIANT
+
+> **The uniform MUST be populated from the same verifier-side sources that
+> produce the constant today: `page_configs` / `canonical_page_bases(
+> bundle.touched_page_bases)`. It must NEVER be sourced from the proof or from
+> the trace.**
+
+This is not a note. It is the entire soundness content of the change, and it is
+*more* critical precisely because §4 found no binding: if a prover-chosen base
+ever reached this uniform, **nothing downstream would catch it**. No preprocessed
+root covers it. No transcript absorb covers it. `program_id` is not a safety net
+(it folds page bases only for ELF-backed data pages). The value would be
+unconstrained, and the failure would be silent.
+
+The rule is the one `trace_ood_next_row_columns` already states: computed
+identically by prover and verifier, never read from the prover-controlled proof.
+
+#### 4.2 `epoch_label` is NOT symmetric with `page_base`
+
+I recommended moving them together as the same mechanism at the same risk. The
+mechanism is the same; **the risk is not**, and the proposal should not have
+flattened them.
+
+`epoch_label` is **verifier-derived by construction**: it comes from the
+verifier's own `enumerate()` position (`continuation.rs:1293-1295`,
+`local_to_global::epoch_label(index) = index + 1`) and is never read from the
+bundle. Prover and verifier compute it identically because neither has a choice —
+it is a loop counter. There is no supply route to get wrong.
+
+`page_base` has a real supply route (`bundle.touched_page_bases` →
+`canonical_page_bases`), which is exactly where §4.1's invariant has to hold.
+
+So `epoch_label` is the lower-risk promotion and a reasonable one to do first;
+`page_base` is the one that needs the invariant enforced and reviewed.
 
 ### 5. Effect on the artifact format
 
@@ -203,13 +268,26 @@ base; `L2G_GLOBAL` stops oscillating between 47 and 48).
   is the shape-static question from the target-shape doc and it is the lead's
   call, not mine.
 
-## What I recommend
+## What I recommend (revised)
 
-Do it for `page_base` and `epoch_label` together — same mechanism, and
-`epoch_label` is the one that actually demonstrated root instability, so fixing
-only `page_base` would leave the sharper edge in place.
+**Target GLOBAL_MEMORY first, not PAGE** — it is the one on the continuation
+path (§0.1). Then `epoch_label`'s two L2G tables, which are lower-risk (§4.2) and
+where the root instability actually showed up. PAGE last: it is monolithic-only,
+and it gets the fix for free once the mechanism exists.
 
-Sequence: (1) verify the soundness obligation in §4 — that is the gate; (2) IR
-leaf + both consumers + artifact field, with the existing 28-AIR differential
-suites as the safety net; (3) bus-layer variants and the four call sites; (4)
-re-measure and confirm the four tables collapse to one artifact each.
+Sequence:
+
+1. IR leaf (`Op::BaseUniform`, tag 11) + both `DeviceProgram` consumers +
+   `AirShape::num_base_uniforms`, with the existing 28-AIR differential suites as
+   the safety net.
+2. Bus-layer `BusValue::Uniform` / `LinearTerm::Uniform`.
+3. `GLOBAL_MEMORY` call site, **with §4.1's invariant enforced at the supply
+   point and called out in review** — it is the only thing standing between this
+   change and an unconstrained value.
+4. The two L2G call sites, then PAGE.
+5. Re-measure: the four tables should collapse to one artifact each, and
+   `parameterized_airs_vary_per_parameter_value` should be able to be deleted —
+   if it still passes afterwards, the promotion did not take.
+
+That last point is worth stating as the acceptance test: the existing
+characterization test becomes the falsifier for the fix.

@@ -205,6 +205,24 @@ pub struct AirShape {
 ///
 /// Produced by [`ConstraintArtifact::capture`] (build time, captures) and
 /// consumed by [`ConstraintArtifact::program`] (guest-safe, pure data).
+///
+/// # A trap for anyone optimizing a consumer of this program
+///
+/// The node list is HASH-CONSED: structurally identical subexpressions share one
+/// node, which is why the program is compact. That same sharing makes the
+/// obvious peepholes UNSOUND if applied naively.
+///
+/// Concretely, fusing `Add(Mul(a,b), c)` into a fused multiply-add is only valid
+/// when the `Mul` has exactly ONE consumer. A shared `Mul` feeds several
+/// parents, and fusing it into each would recompute it per parent — turning a
+/// saving into a loss. A node named by [`Self::roots`] counts as a consumer too:
+/// fusing it away deletes the value the quotient recombination reads.
+///
+/// The rule generalizes to any rewrite that moves work into a consumer: compute
+/// the fanout over `nodes` (plus `roots`) first and require it to be 1. The
+/// property that makes this IR small is the property that makes rewriting it
+/// hazardous, and the two are easy to reason about separately and get wrong
+/// together.
 #[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct ConstraintArtifact {
     /// Topologically ordered flat instruction list (id `i` references only
