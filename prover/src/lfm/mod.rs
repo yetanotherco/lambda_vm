@@ -21,6 +21,7 @@ pub mod chips;
 pub mod chunking;
 pub mod commit;
 pub mod compiler;
+pub mod constraints;
 pub mod edsl;
 pub mod executor;
 pub mod fixture;
@@ -59,6 +60,8 @@ pub use transcript_replay::{Candidate, TranscriptReplay};
 pub use validator::{LfmViolation, validate};
 pub use word::{LfmWord, base_word, ext_word, pack_digest, unpack_digest};
 
+#[cfg(test)]
+mod constraint_tests;
 #[cfg(test)]
 mod framework_probe;
 #[cfg(test)]
