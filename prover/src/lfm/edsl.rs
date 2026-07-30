@@ -78,6 +78,106 @@ pub fn merkle_walk(
     current
 }
 
+// ===================== production keccak Merkle =====================
+
+/// A 32-byte keccak digest as it lives in the machine: two words of four `u32`
+/// halves each, half `h` carrying digest bytes `4h..4h+4`.
+pub type KeccakDigest = [Cell; 2];
+
+/// Halves in a 32-byte digest.
+pub const DIGEST_HALVES: usize = 8;
+
+/// The eight halves of a keccak digest, ready to be streamed into another
+/// `keccak256`.
+pub fn keccak_digest_halves(b: &mut LfmBuilder, d: KeccakDigest) -> [Felt; DIGEST_HALVES] {
+    let lo = b.unpack(d[0]);
+    let hi = b.unpack(d[1]);
+    core::array::from_fn(|h| if h < 4 { lo[h] } else { hi[h - 4] })
+}
+
+/// The Merkle LEAF hash of a row pair, in the production commitment layout.
+///
+/// `values` is `evaluations ‖ evaluations_sym` — the two bit-reversed rows the
+/// leaf covers, each written column by column. Every element is a base field
+/// element rendered as its canonical `u64` in BIG-endian bytes
+/// (`FieldElement<GoldilocksField>::stream_bytes`), so each costs one
+/// [`super::transcript_replay::felt_be_halves`]: one `LFM_BITDEC` row and 64
+/// `LFM_BALU` rows. The hash itself is `keccak256` over `8 · values.len()`
+/// bytes.
+///
+/// ## The byteswapping is NOT what this costs — measured, against expectation
+///
+/// A `c`-column table gives `2c` elements, so `2c` decompositions and `128c`
+/// ALU rows against only `⌈(16c + 1) / 136⌉` permutations. On row counts the
+/// byteswapping looks overwhelming, which is what the R1f handoff predicted.
+/// That reading is wrong: rows of different chips are not comparable units. An
+/// `LFM_BALU` row carries 4 non-preprocessed columns, while one permutation
+/// expands into 24 `KECCAK_RND` rounds of 1480 columns — so in main-trace cells
+/// a permutation costs 113 byteswaps, and the hash term dominates at every
+/// table width. `machine_tests::keccak_merkle_opening_cost` measures it and
+/// asserts the inequality holds.
+///
+/// The swap is real work regardless, and it is not avoidable by pre-swapping in
+/// the arena: the same opened values are consumed as FIELD ELEMENTS by the FRI
+/// algebra and as BYTES by this hash, so something has to connect the two
+/// representations, and only the machine can do it in a way the proof binds.
+pub fn keccak_leaf_hash(b: &mut LfmBuilder, values: &[Felt]) -> KeccakDigest {
+    use super::keccak_host::BYTES_PER_HALF;
+    use super::transcript_replay::felt_be_halves;
+
+    assert!(!values.is_empty(), "a leaf covers at least one column");
+    let mut stream = Vec::with_capacity(2 * values.len());
+    for v in values {
+        stream.extend(felt_be_halves(b, *v));
+    }
+    let len_bytes = BYTES_PER_HALF * stream.len();
+    keccak256(b, &stream, len_bytes)
+}
+
+/// Walk one Merkle authentication path under the PRODUCTION hash.
+///
+/// This is the keccak counterpart of [`merkle_walk`], and the two are not
+/// interchangeable: `merkle_walk` compresses with `LFM_HASH`/`TestPermutation`,
+/// the deliberately non-cryptographic Milestone-C placeholder, so it can only
+/// ever authenticate the Milestone-C fixture tree. Production trees are keccak
+/// throughout, and this is the walk that authenticates them.
+///
+/// `bits` are the leaf index low-to-high, level 0 first; `bit = 0` means the
+/// current node is the LEFT child, matching `verify_merkle_path_from_leaf_hash`
+/// (`index % 2 == 0 ⇒ hash(current, sibling)`).
+///
+/// ## The parent step
+///
+/// `hash_new_parent(l, r) = keccak(l ‖ r)` — 64 bytes, no domain separation and
+/// no ordering flag, so the ordering is carried entirely by the index bit. 64
+/// bytes sits inside one 136-byte rate block, so a level is exactly ONE
+/// permutation. Per level the machine pays two `Select`s (a digest is two words
+/// and both must swap on the same bit), four `Unpack`s and that permutation.
+pub fn keccak_merkle_walk(
+    b: &mut LfmBuilder,
+    leaf: KeccakDigest,
+    bits: &[Bit],
+    siblings: &[KeccakDigest],
+) -> KeccakDigest {
+    assert_eq!(bits.len(), siblings.len(), "one sibling per level");
+    let mut current = leaf;
+    for (bit, sibling) in bits.iter().zip(siblings) {
+        // Both halves of the digest must swap on the SAME bit.
+        let (l0, r0) = b.select(*bit, current[0], sibling[0]);
+        let (l1, r1) = b.select(*bit, current[1], sibling[1]);
+        let left = keccak_digest_halves(b, [l0, l1]);
+        let right = keccak_digest_halves(b, [r0, r1]);
+        let mut stream = Vec::with_capacity(2 * DIGEST_HALVES);
+        stream.extend(left);
+        stream.extend(right);
+        current = keccak256(b, &stream, 2 * COMMITMENT_BYTES);
+    }
+    current
+}
+
+/// Bytes in a commitment / Merkle node.
+pub const COMMITMENT_BYTES: usize = 32;
+
 /// Assert two words are equal, lane by lane (2 unpacks + 4 lowered asserts).
 pub fn assert_word_eq(b: &mut LfmBuilder, x: Cell, y: Cell) {
     let yl = b.unpack(y);

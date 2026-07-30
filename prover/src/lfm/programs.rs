@@ -644,3 +644,110 @@ pub fn fri_toy_program_source() -> LfmProgramSource {
 pub fn fri_toy_program() -> LfmProgram {
     compile(fri_toy_program_source())
 }
+
+// ============ R1f: a real Merkle opening under the production hash ============
+
+/// Everything about a Merkle-opening program that is compile-time.
+///
+/// Both fields are SHAPE, in the sense of `others/lfm-target-shape.md`: they fix
+/// how many arena words the program reads, how many byteswaps it emits and how
+/// many permutations the walk costs. A program that read them from an arena
+/// would be claiming to authenticate a tree whose geometry the prover chose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MerkleOpeningShape {
+    /// Field elements in the leaf. A leaf is a row PAIR (`ROWS_PER_LEAF = 2`),
+    /// so this is `2 × columns`.
+    pub leaf_values: usize,
+    /// Tree depth: index bits consumed, siblings read, permutations walked.
+    pub depth: usize,
+}
+
+impl MerkleOpeningShape {
+    pub const fn columns(self) -> usize {
+        self.leaf_values / 2
+    }
+}
+
+/// Authenticates one FRI query's main-trace opening against a committed root,
+/// under the PRODUCTION keccak Merkle conventions.
+///
+/// Four arenas, each field in its own words (the R1e packing rule):
+///
+/// 0. the leaf's field elements, one base word each, in hash order
+///    (`evaluations ‖ evaluations_sym`);
+/// 1. the sibling digests, two `u32`-half words per level, LEAF LEVEL FIRST;
+/// 2. the leaf index, one base word;
+/// 3. the committed root, two `u32`-half words.
+///
+/// The walked root is asserted equal to arena 3 and then PUBLISHED. Both matter
+/// and they do different jobs. The assert is the composition-ready shape — in
+/// the assembled verifier the expected root arrives exactly like this, as an
+/// arena value that Phase A has already bound into the transcript, and
+/// `fri_toy_program` compares its roots the same way. Publishing is what makes
+/// the result a claim rather than an internal fact: public words are absorbed
+/// into the LFM statement, so a verifier that supplies the real committed root
+/// as the claimed output is checking the machine reached THAT root and not some
+/// other one the prover found convenient.
+///
+/// ## What this program does and does not bind
+///
+/// It binds the leaf, the path and the low `depth` bits of the index to the
+/// root. It does not bind the index to a transcript — `bit_dec` constrains the
+/// hinted index to its own decomposition and the walk uses the low `depth`
+/// bits, so a prover may add any multiple of `2^depth` without changing
+/// anything. That is correct here and unsound alone: in the assembled verifier
+/// the bits come from `TranscriptReplay::sample_u64_pow2`, which produces
+/// exactly this `Vec<Bit>` from a squeezed candidate. This program is the
+/// authentication half of that pair, built and measured before the sampler is
+/// wired to it.
+pub fn keccak_merkle_opening_program_source(shape: MerkleOpeningShape) -> LfmProgramSource {
+    use super::edsl;
+
+    assert!(shape.leaf_values > 0, "a leaf covers at least one column");
+    assert!(
+        shape.leaf_values.is_multiple_of(2),
+        "a leaf is a row PAIR, so it holds an even number of values"
+    );
+    assert!(
+        (1..=32).contains(&shape.depth),
+        "depth must be in 1..=32: below, there is no path; above, the index \
+         would outrun a single transcript candidate half"
+    );
+
+    let mut b = LfmBuilder::new();
+    let leaf_arena = b.declare_arena(shape.leaf_values as u32);
+    let sibling_arena = b.declare_arena(2 * shape.depth as u32);
+    let index_arena = b.declare_arena(1);
+    let root_arena = b.declare_arena(2);
+
+    let values: Vec<_> = (0..shape.leaf_values as u32)
+        .map(|i| b.hint_felt(leaf_arena, i))
+        .collect();
+    let leaf = edsl::keccak_leaf_hash(&mut b, &values);
+
+    let index = b.hint_felt(index_arena, 0);
+    let bits = b.bit_dec(index, shape.depth);
+
+    let siblings: Vec<[Cell; 2]> = (0..shape.depth as u32)
+        .map(|l| {
+            [
+                b.hint_word(sibling_arena, 2 * l),
+                b.hint_word(sibling_arena, 2 * l + 1),
+            ]
+        })
+        .collect();
+
+    let root = edsl::keccak_merkle_walk(&mut b, leaf, &bits, &siblings);
+
+    let expected = [b.hint_word(root_arena, 0), b.hint_word(root_arena, 1)];
+    edsl::assert_word_eq(&mut b, root[0], expected[0]);
+    edsl::assert_word_eq(&mut b, root[1], expected[1]);
+
+    b.public(root[0]);
+    b.public(root[1]);
+    b.finish()
+}
+
+pub fn keccak_merkle_opening_program(shape: MerkleOpeningShape) -> LfmProgram {
+    compile(keccak_merkle_opening_program_source(shape))
+}

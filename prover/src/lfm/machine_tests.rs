@@ -2832,3 +2832,411 @@ fn supplied_preprocessed_roots_are_embedded_in_the_blob() {
         assert_ne!(pair.1, [0u8; 32], "page genesis roots must be nonzero");
     }
 }
+
+// ============ R1f (c)+(d): a REAL Merkle opening, in the machine ============
+//
+// Everything up to here ran on data this machine produced. This is the first
+// leg that authenticates production-committed data: one FRI query's main-trace
+// opening from a real two-epoch continuation proof, walked under the production
+// keccak Merkle conventions, against that proof's own committed root.
+//
+// The oracle is the proof's root. Nothing here recomputes an expected answer
+// with a local model and compares the machine against itself.
+
+use super::programs::{MerkleOpeningShape, keccak_merkle_opening_program};
+use super::proof_arena::MainTraceOpening;
+
+/// Which opening the leg authenticates.
+///
+/// Epoch 0's first sub-proof, chosen on measured grounds and not arbitrarily:
+/// of the 49 sub-proofs in the fixture it is the only one that combines a deep
+/// tree with a UNIQUE leaf index. Most of the others are tiny tables whose
+/// traces are mostly padding, so identical rows hash to identical leaves and
+/// every index in the tree verifies — on those, "flip an index bit" is not a
+/// tamper at all and the (d) vector would silently pass while testing nothing.
+/// `real_opening_is_a_usable_tamper_target` pins that property.
+const R1F_EPOCH: usize = 0;
+const R1F_TABLE: usize = 0;
+const R1F_QUERY: usize = 0;
+
+/// The pinned shape, asserted against the real proof rather than read from it —
+/// program shape is compile-time by construction, so if the fixture ever moves,
+/// this must fail loudly rather than quietly recompile to a new program.
+const R1F_SHAPE: MerkleOpeningShape = MerkleOpeningShape {
+    leaf_values: 20,
+    depth: 20,
+};
+
+/// The opening and its recovered leaf index, resolved once per test binary.
+///
+/// The index costs a `2^depth` sweep (~4 s at depth 20) because `iota` is a
+/// transcript challenge and is not in the proof; see
+/// [`MainTraceOpening::indices_that_verify`]. Sharing it across the tests that
+/// need it keeps that to one sweep.
+fn r1f_opening() -> &'static (MainTraceOpening, usize) {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<(MainTraceOpening, usize)> = OnceLock::new();
+    CELL.get_or_init(|| {
+        let blob = proof_fixture::load_or_generate(&fixture_cache());
+        let archive = super::proof_fixture::FixtureArchive::open(&blob);
+        let opening = MainTraceOpening::extract(&archive, R1F_EPOCH, R1F_TABLE, R1F_QUERY);
+        let hits = opening.indices_that_verify();
+        assert_eq!(
+            hits.len(),
+            1,
+            "the authenticated opening must sit at exactly one index, else the \
+             index-tamper vector tests nothing; got {hits:?}"
+        );
+        (opening, hits[0])
+    })
+}
+
+fn merkle_arenas(opening: &MainTraceOpening, index: usize) -> Vec<Vec<LfmWord>> {
+    vec![
+        opening.leaf_arena(),
+        opening.sibling_arena(),
+        vec![super::word::base_word(FE::from(index as u64))],
+        opening.root_arena(),
+    ]
+}
+
+/// Scrutinises the oracle before anything is built on it: the opening really is
+/// what the leg assumes, and PRODUCTION's own path check accepts it.
+#[test]
+fn real_opening_is_a_usable_tamper_target() {
+    let (opening, index) = r1f_opening();
+    assert_eq!(
+        opening.depth(),
+        R1F_SHAPE.depth,
+        "the fixture's tree depth moved; R1F_SHAPE is program shape and must be updated deliberately"
+    );
+    assert_eq!(
+        opening.values.len(),
+        R1F_SHAPE.leaf_values,
+        "the fixture's column count moved"
+    );
+    assert_eq!(opening.num_columns, R1F_SHAPE.columns());
+    assert!(
+        opening.verifies_at(*index),
+        "production's own checker must accept the opening we are about to \
+         authenticate in the machine"
+    );
+    assert!(
+        !opening.verifies_at(index ^ 1),
+        "flipping the low index bit must break production's check"
+    );
+    println!(
+        "R1f target: epoch {R1F_EPOCH} table {R1F_TABLE} query {R1F_QUERY} — \
+         {} columns, row pair = {} values, depth {}, index {index}",
+        opening.num_columns,
+        opening.values.len(),
+        opening.depth()
+    );
+}
+
+/// ★ The headline: the machine walks a real opening to a real committed root,
+/// PROVED and verified.
+///
+/// Two independent things are checked. The published root equals the root the
+/// proof committed to — that is the authentication, and its oracle is the proof
+/// itself. And the machine proof verifies against those published words — that
+/// is what makes it a proof rather than an execution, which per method rule 2
+/// is the only thing that says anything about the chips.
+#[test]
+fn keccak_merkle_walk_authenticates_a_real_opening() {
+    let opts = options();
+    let (opening, index) = r1f_opening();
+    let program = keccak_merkle_opening_program(R1F_SHAPE);
+    let artifacts = build_artifacts(&program, &opts);
+    let proved = lfm_prove(&program, &artifacts, &merkle_arenas(opening, *index), &opts)
+        .expect("the honest opening must execute and prove");
+
+    assert_eq!(
+        digest_bytes(&proved.public_words),
+        opening.root,
+        "the walked root must be the root the proof committed to"
+    );
+    assert!(
+        verify_against(
+            &artifacts.roots,
+            &artifacts.program_id,
+            artifacts.keccak_rnd_chunks,
+            &proved.proof,
+            &proved.public_words,
+            &opts,
+        ),
+        "the authenticated opening must verify"
+    );
+}
+
+/// One tamper vector: corrupted arenas, plus the root those arenas really fold
+/// to — which is what lets the same vector be run both incoherently (claiming
+/// the real root) and coherently (claiming its own).
+struct TamperVector {
+    what: &'static str,
+    arenas: Vec<Vec<LfmWord>>,
+    root: [u8; 32],
+}
+
+/// ★ (d) Tamper, both ways round, for all three inputs the walk consumes.
+///
+/// INCOHERENT: change one input and leave the claimed root alone. The
+/// in-machine root assert makes the program unexecutable — the earliest and
+/// loudest failure, and the one that shows the assert is load-bearing.
+///
+/// COHERENT (method rule 4): change the input AND supply the root that input
+/// really folds to, so every value in the run is consistent with every other,
+/// nothing asserts, and a proof comes out. The forgery then fails on the one
+/// thing it cannot fake — the published root is not the root the proof
+/// committed to, so a verifier claiming the real one rejects.
+#[test]
+fn tampered_merkle_opening_rejects() {
+    let opts = options();
+    let (opening, index) = r1f_opening();
+    let program = keccak_merkle_opening_program(R1F_SHAPE);
+    let artifacts = build_artifacts(&program, &opts);
+    let honest = lfm_prove(&program, &artifacts, &merkle_arenas(opening, *index), &opts)
+        .expect("honest prove");
+
+    let mut vectors: Vec<TamperVector> = Vec::new();
+
+    // 1. A wrong sibling at the leaf level.
+    {
+        let mut siblings = opening.siblings.clone();
+        siblings[0][0] ^= 1;
+        let mut arenas = merkle_arenas(opening, *index);
+        arenas[1] = siblings
+            .iter()
+            .flat_map(super::proof_arena::commitment_words)
+            .collect();
+        let root = super::proof_arena::walk_to_root(opening.leaf_hash(), *index, &siblings);
+        vectors.push(TamperVector {
+            what: "wrong sibling",
+            arenas,
+            root,
+        });
+    }
+
+    // 2. Wrong index bits: the same leaf and the same path, walked in the other
+    //    order at level 0.
+    {
+        let bad = index ^ 1;
+        let arenas = merkle_arenas(opening, bad);
+        let root = super::proof_arena::walk_to_root(opening.leaf_hash(), bad, &opening.siblings);
+        vectors.push(TamperVector {
+            what: "wrong index bits",
+            arenas,
+            root,
+        });
+    }
+
+    // 3. A wrong opened value: one field element of the row pair.
+    {
+        let mut tampered = MainTraceOpening {
+            root: opening.root,
+            values: opening.values.clone(),
+            num_columns: opening.num_columns,
+            siblings: opening.siblings.clone(),
+        };
+        tampered.values[0] = &tampered.values[0] + FE::from(1u64);
+        let mut arenas = merkle_arenas(opening, *index);
+        arenas[0] = tampered.leaf_arena();
+        let root =
+            super::proof_arena::walk_to_root(tampered.leaf_hash(), *index, &tampered.siblings);
+        vectors.push(TamperVector {
+            what: "wrong leaf value",
+            arenas,
+            root,
+        });
+    }
+
+    for TamperVector {
+        what,
+        arenas,
+        root: forged_root,
+    } in vectors
+    {
+        assert_ne!(
+            forged_root, opening.root,
+            "{what}: the tamper must actually move the root, or the vector is vacuous"
+        );
+
+        // Incoherent: still claiming the real root.
+        let err = super::executor::execute(&program, &arenas, &super::hash::TestPermutation)
+            .err()
+            .unwrap_or_else(|| panic!("{what}: claiming the real root must not execute"));
+        println!("R1f tamper {what}: incoherent run rejected with {err:?}");
+
+        // Coherent: claim the root the tampered inputs really reach.
+        let mut coherent = arenas;
+        coherent[3] = super::proof_arena::commitment_words(&forged_root).to_vec();
+        let proved = lfm_prove(&program, &artifacts, &coherent, &opts)
+            .unwrap_or_else(|e| panic!("{what}: the coherent forgery must prove: {e:?}"));
+        assert_eq!(
+            digest_bytes(&proved.public_words),
+            forged_root,
+            "{what}: the coherent forgery must publish its own root"
+        );
+        assert_ne!(
+            proved.public_words, honest.public_words,
+            "{what}: the forgery must not publish the honest root"
+        );
+        assert!(
+            !verify_against(
+                &artifacts.roots,
+                &artifacts.program_id,
+                artifacts.keccak_rnd_chunks,
+                &proved.proof,
+                &honest.public_words,
+                &opts,
+            ),
+            "{what}: claiming the real committed root for a forged walk must reject"
+        );
+    }
+}
+
+/// Main-trace cells one byteswap costs: one `LFM_BITDEC` row and 64 `LFM_BALU`
+/// rows, each at its chip's non-preprocessed width — the same accounting
+/// [`super::airs::lfm_cell_counts`] uses.
+fn byteswap_cells() -> u64 {
+    use super::chips::{balu, bitdec};
+    use super::layout;
+    let bitdec_w = (bitdec::cols::NUM_COLUMNS - layout::bitdec::PREP_WIDTH) as u64;
+    let balu_w = (balu::cols::NUM_COLUMNS - layout::balu::PREP_WIDTH) as u64;
+    bitdec_w + 64 * balu_w
+}
+
+/// Main-trace cells one keccak permutation costs: the `LFM_KECCAK` row that
+/// requests it, plus the 24 `KECCAK_RND` rounds that carry it.
+fn permutation_cells() -> u64 {
+    use super::chips::keccak;
+    use super::chunking::KECCAK_RND_ROWS_PER_PERMUTATION as ROUNDS;
+    use super::layout;
+    use crate::tables::keccak_rnd;
+    let keccak_w = (keccak::cols::NUM_COLUMNS - layout::keccak::PREP_WIDTH) as u64;
+    keccak_w + ROUNDS as u64 * keccak_rnd::cols::NUM_COLUMNS as u64
+}
+
+/// ★ The leg's headline measurement — and it REFUTES the prediction it was set
+/// up to confirm.
+///
+/// The R1f handoff predicted that byteswapping the opened values would dominate
+/// the leaf, "not the hashing", on the strength of the row counts: a 10-column
+/// table pays 20 `LFM_BITDEC` + 1280 `LFM_BALU` rows of byteswapping against
+/// only 22 permutations. Those row counts are right. The conclusion drawn from
+/// them is wrong, because rows of different chips are not comparable units.
+///
+/// A byteswap's rows are narrow — `LFM_BALU` carries 4 non-preprocessed columns
+/// — while a permutation expands into 24 `KECCAK_RND` rounds at 1480 columns
+/// each. Priced in main-trace cells, the unit the proof actually pays in, the
+/// measured figures are **322 cells per byteswap against 36,256 per
+/// permutation, a factor of 113**. Hashing then dominates at every width in the
+/// fixture: 124× at the 10-column table this leg authenticates, 8.9× at 511
+/// columns, 7.4× at 1480. The crossover this test was written to find does not
+/// exist. Both terms are linear in the column count — `2c` byteswaps against
+/// `≈16c/136` rate blocks — so the ratio flattens near 6.6× rather than
+/// inverting.
+///
+/// This is why a byteswap chiplet is NOT the lever it looked like, and the
+/// measurement rather than the intuition is what says so. The attribution is
+/// MARGINAL (real rows, not padded), so it answers "what does one more column
+/// cost" and not "what does this proof cost"; the whole-program figure is
+/// printed alongside because the fixed floor — `BITWISE` is 2^20 rows whatever
+/// the program does — dwarfs both terms at these sizes.
+#[test]
+fn keccak_merkle_opening_cost() {
+    let (opening, _) = r1f_opening();
+    println!(
+        "one byteswap = {} main cells; one permutation = {} main cells ({:.0}x)",
+        byteswap_cells(),
+        permutation_cells(),
+        permutation_cells() as f64 / byteswap_cells() as f64,
+    );
+    println!("shape                 instrs  keccak  bitdec    balu  select   lanes");
+    let mut shapes = vec![R1F_SHAPE];
+    // Two wider tables from the same fixture, to show the scaling rather than
+    // assert a single point. 511 and 1480 columns are real widths in it.
+    for columns in [511usize, 1480] {
+        shapes.push(MerkleOpeningShape {
+            leaf_values: 2 * columns,
+            depth: R1F_SHAPE.depth,
+        });
+    }
+    for shape in &shapes {
+        let program = keccak_merkle_opening_program(*shape);
+        println!(
+            "{:>4} cols d={:<3}  {:>7} {:>7} {:>7} {:>7} {:>7} {:>7}",
+            shape.columns(),
+            shape.depth,
+            program.instrs.len(),
+            program.groups.keccak.real_rows,
+            program.groups.bitdec.real_rows,
+            program.groups.balu.real_rows,
+            program.groups.select.real_rows,
+            program.groups.lanes.real_rows,
+        );
+    }
+
+    // The same three shapes priced in main-trace cells, which is where the
+    // prediction inverts. `swap` counts only the byteswapping; `hash` counts
+    // every permutation (leaf blocks and walk levels alike).
+    println!("shape                    swap cells   hash cells   hash/swap   whole program");
+    for shape in &shapes {
+        let program = keccak_merkle_opening_program(*shape);
+        let swap = shape.leaf_values as u64 * byteswap_cells();
+        let hash = program.groups.keccak.real_rows as u64 * permutation_cells();
+        let (main, _aux) = super::airs::lfm_cell_counts(&program);
+        println!(
+            "{:>4} cols d={:<3} {:>12} {:>12} {:>11.1} {:>15}",
+            shape.columns(),
+            shape.depth,
+            swap,
+            hash,
+            hash as f64 / swap as f64,
+            main,
+        );
+        assert!(
+            hash > swap,
+            "{} columns: hashing must dominate — if this ever flips, the \
+             byteswap-chiplet argument becomes live and the docs above are stale",
+            shape.columns()
+        );
+    }
+
+    // Pin the real shape's decomposition, so a regression in either half shows.
+    let program = keccak_merkle_opening_program(R1F_SHAPE);
+    let leaf_bytes = 8 * R1F_SHAPE.leaf_values;
+    let leaf_perms = super::keccak_host::num_blocks(leaf_bytes);
+    assert_eq!(
+        program.groups.keccak.real_rows,
+        leaf_perms + R1F_SHAPE.depth,
+        "one permutation per rate block of the leaf, plus one per level"
+    );
+    assert_eq!(
+        program.groups.bitdec.real_rows,
+        R1F_SHAPE.leaf_values + 1,
+        "one decomposition per opened value, plus one for the index"
+    );
+    assert_eq!(
+        program.groups.balu.real_rows,
+        64 * R1F_SHAPE.leaf_values + 8 * 2,
+        "64 rows per byteswap, plus the two root asserts (4 sub + 4 div each)"
+    );
+    assert_eq!(
+        program.groups.select.real_rows,
+        2 * R1F_SHAPE.depth,
+        "two selects per level: a digest is two words and both swap together"
+    );
+    println!(
+        "R1f leaf: {} values -> {leaf_bytes} bytes -> {leaf_perms} permutations, \
+         against {} bitdec + {} balu rows of byteswapping",
+        R1F_SHAPE.leaf_values,
+        R1F_SHAPE.leaf_values,
+        64 * R1F_SHAPE.leaf_values,
+    );
+    // The fixed floor, for scale: BITWISE alone is 2^20 rows regardless of what
+    // the program does, so nothing above is a claim about total proof cost.
+    let (main, aux) = super::airs::lfm_cell_counts(&program);
+    println!("R1f whole program: {main} main cells, {aux} aux cells");
+    assert_eq!(opening.values.len(), R1F_SHAPE.leaf_values);
+}

@@ -12,8 +12,9 @@
 //! That bug cost real debugging time in R1e and it is silent — the halves count
 //! still comes out right, only the values are wrong.
 
+use crypto::merkle_tree::proof::verify_merkle_path_from_leaf_hash;
 use math::field::element::FieldElement;
-use stark::config::Commitment;
+use stark::config::{BatchedMerkleTreeBackend, Commitment};
 
 use crate::tables::types::GoldilocksField;
 
@@ -22,6 +23,10 @@ use super::proof_fixture::FixtureArchive;
 use super::word::{LfmWord, base_word};
 
 type FE = FieldElement<GoldilocksField>;
+
+/// The Merkle backend the main trace is committed under — the production alias,
+/// not a locally chosen equivalent, so a backend change reaches this module.
+type MainBackend = BatchedMerkleTreeBackend<GoldilocksField>;
 
 /// Halves in one 32-byte commitment.
 pub const ROOT_HALVES: usize = 8;
@@ -77,4 +82,174 @@ pub fn roots_to_halves(roots: &[Commitment]) -> Vec<FE> {
 /// Wraps packed halves as arena words.
 pub fn halves_to_arena(halves: Vec<FE>) -> Vec<LfmWord> {
     halves.into_iter().map(base_word).collect()
+}
+
+/// A 32-byte commitment as the two machine words a keccak digest occupies:
+/// four `u32` halves per word, half `h` = bytes `4h..4h+4` little-endian.
+///
+/// This is NOT [`super::word::pack_digest`]'s layout. That one packs four FULL
+/// felts, which is the `LFM_HASH` (Milestone-C) digest; a keccak digest lives on
+/// the bus as eight `u32` halves and must be handed to the chip that way.
+pub fn commitment_words(c: &Commitment) -> [LfmWord; 2] {
+    let halves = pack_stream(c);
+    debug_assert_eq!(halves.len(), ROOT_HALVES);
+    [
+        [halves[0], halves[1], halves[2], halves[3]],
+        [halves[4], halves[5], halves[6], halves[7]],
+    ]
+}
+
+// ==================== one query's main-trace opening ====================
+
+/// One FRI query's MAIN-trace opening, in the form the machine consumes it.
+///
+/// This is the input to [`crate::lfm::edsl::keccak_merkle_walk`] and the thing
+/// R1f authenticates: a real row pair from a real continuation-epoch proof,
+/// against that proof's own committed root.
+///
+/// ## What the verifier does with these fields
+///
+/// `Verifier::verify_opening_pair` hashes `evaluations ‖ evaluations_sym` into
+/// one leaf and folds it up `merkle_path` at index `iota`. The pair is one leaf
+/// because `ROWS_PER_LEAF = 2`: a query opens a value and its symmetric
+/// counterpart, which are the two bit-reversed rows `2·iota` and `2·iota+1`, so
+/// a single path authenticates both.
+pub struct MainTraceOpening {
+    /// The committed root, read off the proof — the oracle for the whole leg.
+    pub root: Commitment,
+    /// `evaluations ‖ evaluations_sym` in hash order: the row pair written
+    /// column by column, each element rendered big-endian by the leaf hasher.
+    pub values: Vec<FE>,
+    /// Where `evaluations_sym` starts — i.e. the table's column count.
+    pub num_columns: usize,
+    /// Sibling digests, LEAF LEVEL FIRST. That is the order
+    /// `verify_merkle_path_from_leaf_hash` consumes them in: it walks the vector
+    /// forwards while shifting the index right, so element 0 pairs with the
+    /// index's least significant bit. (`Proof`'s doc comment describes the
+    /// reverse; the code is what this mirrors.)
+    pub siblings: Vec<Commitment>,
+}
+
+impl MainTraceOpening {
+    /// Reads query `query` of sub-proof `table` in epoch `epoch`.
+    pub fn extract(
+        archive: &FixtureArchive,
+        epoch: usize,
+        table: usize,
+        query: usize,
+    ) -> MainTraceOpening {
+        let bundle = &archive.guest_input().bundle;
+        assert!(epoch < bundle.num_epochs(), "epoch {epoch} out of range");
+        let proofs = bundle.epoch_proof(epoch);
+        assert!(table < proofs.len(), "table {table} out of range");
+        let proof = proofs.get(table);
+        assert!(
+            query < proof.deep_poly_openings_len(),
+            "query {query} out of range ({} openings)",
+            proof.deep_poly_openings_len()
+        );
+        let opening = proof.deep_poly_opening(query).main_trace_polys();
+        let evaluations = opening.evaluations();
+        let sym = opening.evaluations_sym();
+        assert_eq!(
+            evaluations.len(),
+            sym.len(),
+            "a row pair's two rows must have the same width"
+        );
+        MainTraceOpening {
+            root: *proof.lde_trace_main_merkle_root(),
+            num_columns: evaluations.len(),
+            values: evaluations.iter().chain(sym.iter()).cloned().collect(),
+            siblings: opening.merkle_path().to_vec(),
+        }
+    }
+
+    /// Path length = tree depth = the number of index bits the walk consumes.
+    pub fn depth(&self) -> usize {
+        self.siblings.len()
+    }
+
+    /// The leaf hash, computed by the PRODUCTION hasher on the production
+    /// split — literally the call `verify_opening_pair` makes.
+    pub fn leaf_hash(&self) -> Commitment {
+        MainBackend::hash_data_from_slices(
+            &self.values[..self.num_columns],
+            &self.values[self.num_columns..],
+        )
+    }
+
+    /// Whether production's own path check accepts this opening at `index`.
+    pub fn verifies_at(&self, index: usize) -> bool {
+        verify_merkle_path_from_leaf_hash::<MainBackend>(
+            &self.siblings,
+            &self.root,
+            index,
+            self.leaf_hash(),
+        )
+    }
+
+    /// Every leaf index at which this opening authenticates.
+    ///
+    /// ## Why a search, and why that is honest
+    ///
+    /// The index is the FRI query challenge `iota`, and it is NOT in the proof —
+    /// the verifier derives it from the transcript, which needs the epoch's
+    /// statement and its AIR set, neither of which a byte blob carries (the
+    /// preprocessed commitments come from `air.precomputed_commitment()`). Since
+    /// the path, the leaf and the root are all fixed by the proof, the index is
+    /// nonetheless determined by them, so recovering it by exhaustion asks the
+    /// proof rather than inventing an answer — and the oracle doing the asking
+    /// is production's `verify_merkle_path_from_leaf_hash`, not a local model.
+    ///
+    /// The result is a LIST because a degenerate tree has several: a table
+    /// whose trace is mostly padding commits identical rows, so identical
+    /// leaves sit under identical subtrees and many indices verify. Any opening
+    /// used for an index-tamper vector must have exactly one — otherwise
+    /// "flip an index bit" is not a tamper at all. Callers assert that.
+    ///
+    /// Costs `2^depth` path walks; fine at the fixture's depths, not a
+    /// mechanism anything but a fixture should use.
+    pub fn indices_that_verify(&self) -> Vec<usize> {
+        (0..(1usize << self.depth()))
+            .filter(|i| self.verifies_at(*i))
+            .collect()
+    }
+
+    /// The leaf's field elements as arena words: one base word each, since the
+    /// machine byteswaps them itself (they are full felts, not `u32` halves).
+    pub fn leaf_arena(&self) -> Vec<LfmWord> {
+        self.values.iter().copied().map(base_word).collect()
+    }
+
+    /// The sibling digests as arena words, two per level, leaf level first.
+    pub fn sibling_arena(&self) -> Vec<LfmWord> {
+        self.siblings.iter().flat_map(commitment_words).collect()
+    }
+
+    /// The committed root as arena words.
+    pub fn root_arena(&self) -> Vec<LfmWord> {
+        commitment_words(&self.root).to_vec()
+    }
+}
+
+/// Host mirror of the machine's walk, returning the root it reaches.
+///
+/// Production's checker returns a bool, so it cannot supply the root a TAMPERED
+/// input folds to — which a coherent forgery needs (the forged run must claim a
+/// root consistent with its own inputs, or it fails in-machine before the
+/// interesting check). Built from the production parent hash, so the only thing
+/// local about it is the loop.
+pub fn walk_to_root(leaf: Commitment, index: usize, siblings: &[Commitment]) -> Commitment {
+    use crypto::merkle_tree::traits::IsMerkleTreeBackend;
+    let mut node = leaf;
+    let mut index = index;
+    for sibling in siblings {
+        node = if index.is_multiple_of(2) {
+            MainBackend::hash_new_parent(&node, sibling)
+        } else {
+            MainBackend::hash_new_parent(sibling, &node)
+        };
+        index >>= 1;
+    }
+    node
 }
