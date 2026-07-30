@@ -814,3 +814,101 @@ pub fn l2g_binding_program_source(num_epochs: usize) -> LfmProgramSource {
 pub fn l2g_binding_program(num_epochs: usize) -> LfmProgram {
     compile(l2g_binding_program_source(num_epochs))
 }
+
+// ============ R1g(iii): the attestation's program id ============
+
+/// Halves in a `u64` rendered little-endian.
+const U64_HALVES: u32 = 2;
+
+/// Everything about a `program_id` fold that is compile-time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProgramIdShape {
+    /// Page genesis commitments folded in. SHAPE: it fixes the byte length of
+    /// the hashed string, hence the block count and every padding position.
+    pub num_pages: usize,
+}
+
+impl ProgramIdShape {
+    /// Bytes the fold hashes — `tag ‖ elf_digest ‖ pc_start ‖ decode ‖ n ‖
+    /// (base ‖ commitment)*`.
+    pub fn byte_len(self) -> usize {
+        use crate::recursion::PROGRAM_ID_TAG;
+        PROGRAM_ID_TAG.len() + 32 + 8 + 32 + 8 + 40 * self.num_pages
+    }
+}
+
+/// Emits `recursion::program_id_from_digest` — the fold the recursion guest
+/// commits as the first 32 bytes of its attestation.
+///
+/// One arena, each field in its own halves (the R1e packing rule):
+/// the 32-byte ELF digest, the `u64` entry point, the 32-byte DECODE root, then
+/// per page a `u64` base and a 32-byte commitment.
+///
+/// ## Why the tag makes this the splice case
+///
+/// `PROGRAM_ID_TAG` is 22 bytes, `≡ 2 (mod 4)`, so the ELF digest immediately
+/// after it straddles half boundaries and so does everything behind it — the
+/// same shape as R1e's 30-byte epoch tag. [`super::transcript_replay::ByteString`]
+/// carries the byte-granular packer that handles it; alignment is a property of
+/// the cursor, not of the field.
+///
+/// ## What this program does NOT establish
+///
+/// The attestation is deliberately **not self-enforcing**, and emitting the fold
+/// in the machine does not change that. The guest uses SUPPLIED roots verbatim
+/// without binding them to the inner ELF; the binding happens outside, when a
+/// consumer recomputes the id from an ELF it trusts and compares
+/// (`recursion::check_attestation`, an expensive native FFT + Merkle pass done
+/// once at top level, never in-VM). A machine-emitted attestation inherits that
+/// model unchanged — the same consumer-side compare closes it. Do not read
+/// "the machine folded the roots" as "the machine bound the roots".
+///
+/// ## Page ordering
+///
+/// `program_id_from_digest` SORTS pages by base before folding. This program
+/// folds them in supplied order, so the arena filler owes sortedness. That is
+/// not a soundness hole: an unsorted fold yields an id that differs from the
+/// consumer's recompute, so the proof is rejected there — the prover only
+/// breaks their own attestation. It IS a completeness obligation, so it is
+/// stated rather than assumed.
+pub fn program_id_program_source(shape: ProgramIdShape) -> LfmProgramSource {
+    use super::builder::Felt;
+    use super::transcript_replay::ByteString;
+    use crate::recursion::PROGRAM_ID_TAG;
+
+    let root_halves = ROOT_HALVES;
+    let per_page = U64_HALVES + root_halves;
+    let total = root_halves + U64_HALVES + root_halves + per_page * shape.num_pages as u32;
+
+    let mut b = LfmBuilder::new();
+    let arena = b.declare_arena(total);
+    let h: Vec<Felt> = (0..total).map(|i| b.hint_felt(arena, i)).collect();
+
+    let (elf_digest, rest) = h.split_at(root_halves as usize);
+    let (pc_start, rest) = rest.split_at(U64_HALVES as usize);
+    let (decode, mut pages) = rest.split_at(root_halves as usize);
+
+    let mut s = ByteString::new();
+    s.push_const(PROGRAM_ID_TAG);
+    s.push_halves(elf_digest);
+    s.push_halves(pc_start);
+    s.push_halves(decode);
+    s.push_const(&(shape.num_pages as u64).to_le_bytes());
+    for _ in 0..shape.num_pages {
+        let (base, r) = pages.split_at(U64_HALVES as usize);
+        let (commitment, r) = r.split_at(root_halves as usize);
+        pages = r;
+        s.push_halves(base);
+        s.push_halves(commitment);
+    }
+    assert_eq!(s.len(), shape.byte_len(), "byte accounting must agree");
+
+    let id = s.keccak256(&mut b);
+    b.public(id[0]);
+    b.public(id[1]);
+    b.finish()
+}
+
+pub fn program_id_program(shape: ProgramIdShape) -> LfmProgram {
+    compile(program_id_program_source(shape))
+}

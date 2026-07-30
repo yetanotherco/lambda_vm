@@ -194,7 +194,12 @@ pub fn encode_continuation_guest_input(
 }
 
 /// Domain tag for [`program_id`].
-const PROGRAM_ID_TAG: &[u8] = b"LAMBDAVM_PROGRAM_ID_V1";
+/// Domain tag for the attestation's program id.
+///
+/// `pub(crate)` so the LFM emitter binds the same literal instead of
+/// duplicating it — the precedent `CONTINUATION_EPOCH_TAG` set in R1e. 22 bytes,
+/// so it is `≡ 2 (mod 4)` and every machine value folded after it is spliced.
+pub(crate) const PROGRAM_ID_TAG: &[u8] = b"LAMBDAVM_PROGRAM_ID_V1";
 
 /// [`program_id`] from a precomputed ELF digest and entry point — the guest
 /// path, sharing one full-ELF Keccak pass with the verify-side statement

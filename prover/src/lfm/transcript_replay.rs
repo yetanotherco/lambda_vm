@@ -316,22 +316,7 @@ impl TranscriptReplay {
     /// packer is the only place that knows the cursor, which is why the splice
     /// lives here rather than at the append.
     fn pack_segment(&self, b: &mut LfmBuilder) -> Vec<Felt> {
-        let mut p = Packer {
-            out: Vec::new(),
-            partial: Partial::Const(Vec::new()),
-        };
-        for piece in &self.segment {
-            match piece {
-                SegPiece::Const(bytes) => p.push_const(b, bytes),
-                SegPiece::Halves(halves) => {
-                    for h in halves {
-                        p.push_half(b, *h);
-                    }
-                }
-                SegPiece::Partial(v, nbytes) => p.push_masked(b, *v, *nbytes),
-            }
-        }
-        p.finish(b)
+        pack_pieces(&self.segment, b)
     }
 
     /// `DefaultTranscript::sample()` — finalize, reverse the 32 digest bytes,
@@ -766,4 +751,101 @@ pub fn reject_probability_per_candidate() -> f64 {
 /// `1 − (1 − q)^n`, indistinguishable at these magnitudes.
 pub fn reject_probability_per_proof(base_draws: usize) -> f64 {
     base_draws as f64 * reject_probability_per_candidate()
+}
+
+/// Packs a piece list into `u32` halves, walking it at BYTE granularity.
+///
+/// Constant bytes accumulate host-side; a machine half drops straight in when
+/// the cursor is 4-byte aligned — the path every aligned program takes, which
+/// must stay instruction-free — and is split when it is not. The packer is the
+/// only place that knows the cursor, which is why the splice lives here rather
+/// than at the append.
+fn pack_pieces(pieces: &[SegPiece], b: &mut LfmBuilder) -> Vec<Felt> {
+    let mut p = Packer {
+        out: Vec::new(),
+        partial: Partial::Const(Vec::new()),
+    };
+    for piece in pieces {
+        match piece {
+            SegPiece::Const(bytes) => p.push_const(b, bytes),
+            SegPiece::Halves(halves) => {
+                for h in halves {
+                    p.push_half(b, *h);
+                }
+            }
+            SegPiece::Partial(v, nbytes) => p.push_masked(b, *v, *nbytes),
+        }
+    }
+    p.finish(b)
+}
+
+/// A structured byte string of compile-time constants and machine values,
+/// hashed directly rather than absorbed into a transcript.
+///
+/// Same byte-granular packer the transcript's segments use — one implementation,
+/// so the splice semantics cannot drift between the two callers. This exists for
+/// folds like the recursion attestation's `program_id`, which is a plain
+/// `keccak256` over `tag ‖ fields`, not a Fiat-Shamir absorb.
+///
+/// The alignment lesson from R1e applies unchanged and is why this is not just
+/// "concatenate then hash": alignment is a property of the CURSOR, not of the
+/// field. `PROGRAM_ID_TAG` is 22 bytes, so every machine value after it lands
+/// mid-half and must be spliced.
+#[derive(Default)]
+pub struct ByteString {
+    pieces: Vec<SegPiece>,
+    len: usize,
+}
+
+impl ByteString {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Append compile-time constant bytes, any length, any alignment.
+    pub fn push_const(&mut self, bytes: &[u8]) {
+        self.pieces.push(SegPiece::Const(bytes.to_vec()));
+        self.len += bytes.len();
+    }
+
+    /// Append `4 · halves.len()` machine-computed bytes at any alignment.
+    pub fn push_halves(&mut self, halves: &[Felt]) {
+        self.pieces.push(SegPiece::Halves(halves.to_vec()));
+        self.len += BYTES_PER_HALF * halves.len();
+    }
+
+    /// Append `byte_len` machine-computed bytes carried in
+    /// `ceil(byte_len / 4)` halves, masking the trailing partial half.
+    pub fn push_bytes(&mut self, halves: &[Felt], byte_len: usize) {
+        assert_eq!(
+            halves.len(),
+            byte_len.div_ceil(BYTES_PER_HALF),
+            "byte_len must match the supplied halves"
+        );
+        let full = byte_len / BYTES_PER_HALF;
+        let rem = byte_len % BYTES_PER_HALF;
+        if full > 0 {
+            self.pieces.push(SegPiece::Halves(halves[..full].to_vec()));
+        }
+        if rem > 0 {
+            self.pieces.push(SegPiece::Partial(halves[full], rem));
+        }
+        self.len += byte_len;
+    }
+
+    /// Bytes the string will hash — its own accounting, so a test can pin the
+    /// resulting alignment rather than trust prose.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// `keccak256` over the assembled bytes.
+    pub fn keccak256(&self, b: &mut LfmBuilder) -> [Cell; DIGEST_WORDS] {
+        let packed = pack_pieces(&self.pieces, b);
+        edsl::keccak256(b, &packed, self.len)
+    }
 }

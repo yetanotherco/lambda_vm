@@ -3533,3 +3533,219 @@ fn tampered_l2g_binding_rejects() {
         "claiming the real per-epoch roots for a reordered binding must reject"
     );
 }
+
+// ============ R1g (iii): the attestation's program id ============
+
+use super::programs::{ProgramIdShape, program_id_program};
+
+/// Arena for a `program_id` fold, each field in its own halves.
+fn program_id_arenas(
+    elf_digest: &[u8; 32],
+    pc_start: u64,
+    decode: &stark::config::Commitment,
+    pages: &[(u64, stark::config::Commitment)],
+) -> Vec<Vec<LfmWord>> {
+    let mut halves = keccak_host::pack_stream(elf_digest);
+    halves.extend(keccak_host::pack_stream(&pc_start.to_le_bytes()));
+    halves.extend(keccak_host::pack_stream(decode));
+    for (base, c) in pages {
+        halves.extend(keccak_host::pack_stream(&base.to_le_bytes()));
+        halves.extend(keccak_host::pack_stream(c));
+    }
+    vec![halves.into_iter().map(super::word::base_word).collect()]
+}
+
+/// The real fixture's program-id inputs.
+fn r1g_program_id_inputs() -> (
+    [u8; 32],
+    u64,
+    stark::config::Commitment,
+    Vec<(u64, stark::config::Commitment)>,
+) {
+    use super::proof_arena;
+    let blob = proof_fixture::load_or_generate(&fixture_cache());
+    let archive = super::proof_fixture::FixtureArchive::open(&blob);
+    let elf_bytes = proof_arena::inner_elf(&archive).to_vec();
+    let elf = executor::elf::Elf::load(&elf_bytes).expect("the fixture's inner ELF must load");
+    (
+        crate::statement::elf_digest(&elf_bytes),
+        elf.entry_point,
+        proof_arena::decode_commitment(&archive),
+        proof_arena::page_commitments(&archive),
+    )
+}
+
+/// ★ The fold, PROVED, bit-exact against production's own `program_id_from_digest`.
+///
+/// The oracle is the production function, not a local re-implementation.
+#[test]
+fn program_id_matches_production_on_the_real_fixture() {
+    let opts = options();
+    let (elf_digest, pc_start, decode, pages) = r1g_program_id_inputs();
+    assert!(
+        pages.is_empty(),
+        "the fibonacci fixture is expected to touch no data pages; if this \
+         changes, the shape below must change with it"
+    );
+    let shape = ProgramIdShape {
+        num_pages: pages.len(),
+    };
+    let program = program_id_program(shape);
+    let artifacts = build_artifacts(&program, &opts);
+    let arenas = program_id_arenas(&elf_digest, pc_start, &decode, &pages);
+    let proved = lfm_prove(&program, &artifacts, &arenas, &opts).expect("prove");
+
+    let expected = crate::recursion::program_id_from_digest(&elf_digest, pc_start, &decode, &pages);
+    assert_eq!(
+        digest_bytes(&proved.public_words),
+        expected,
+        "the machine's program id must equal production's"
+    );
+    assert!(
+        verify_against(
+            &artifacts.roots,
+            &artifacts.program_id,
+            artifacts.keccak_rnd_chunks,
+            &proved.proof,
+            &proved.public_words,
+            &opts,
+        ),
+        "the program-id fold must verify"
+    );
+    println!(
+        "R1g(iii): {} pages, {} bytes hashed, tag {} bytes (shift {})",
+        shape.num_pages,
+        shape.byte_len(),
+        crate::recursion::PROGRAM_ID_TAG.len(),
+        crate::recursion::PROGRAM_ID_TAG.len() % 4,
+    );
+}
+
+/// ★ The page loop, exercised. The fixture has ZERO page commitments, so the
+/// sorted-page path is present-but-untested on real data — the caveat the team
+/// lead flagged for the supplied roots applies here too. This drives it with a
+/// synthetic shape against the same production oracle, so "it compiles" is not
+/// mistaken for "it is covered".
+///
+/// Proved, not just executed: the fold's byte length changes with the page
+/// count, which moves every padding position, and only a proof sees the keccak
+/// chip agree with the executor about that.
+#[test]
+fn program_id_folds_pages_in_the_production_layout() {
+    let opts = options();
+    let (elf_digest, pc_start, decode, _) = r1g_program_id_inputs();
+    for num_pages in [1usize, 3] {
+        let pages: Vec<(u64, stark::config::Commitment)> = (0..num_pages)
+            .map(|i| {
+                let base = 0x1000u64 * (i as u64 + 1);
+                let mut c = [0u8; 32];
+                for (j, b) in c.iter_mut().enumerate() {
+                    *b = (17 * i + j) as u8;
+                }
+                (base, c)
+            })
+            .collect();
+        let shape = ProgramIdShape { num_pages };
+        let program = program_id_program(shape);
+        let artifacts = build_artifacts(&program, &opts);
+        let arenas = program_id_arenas(&elf_digest, pc_start, &decode, &pages);
+        let proved = lfm_prove(&program, &artifacts, &arenas, &opts).expect("prove");
+        let expected =
+            crate::recursion::program_id_from_digest(&elf_digest, pc_start, &decode, &pages);
+        assert_eq!(
+            digest_bytes(&proved.public_words),
+            expected,
+            "{num_pages} pages: the machine's fold must match production's"
+        );
+        assert!(
+            verify_against(
+                &artifacts.roots,
+                &artifacts.program_id,
+                artifacts.keccak_rnd_chunks,
+                &proved.proof,
+                &proved.public_words,
+                &opts,
+            ),
+            "{num_pages} pages: the fold must verify"
+        );
+    }
+}
+
+/// ★ (d) Tamper: every folded field must move the id.
+///
+/// Coherent by construction — nothing asserts, so each forgery proves cleanly
+/// and fails on the published id, which is the whole mechanism: the id IS the
+/// claim, and a consumer comparing against its own recompute rejects.
+#[test]
+fn tampered_program_id_inputs_change_the_id() {
+    let opts = options();
+    let (elf_digest, pc_start, decode, _) = r1g_program_id_inputs();
+    let pages = vec![(0x1000u64, [7u8; 32]), (0x2000u64, [9u8; 32])];
+    let shape = ProgramIdShape {
+        num_pages: pages.len(),
+    };
+    let program = program_id_program(shape);
+    let artifacts = build_artifacts(&program, &opts);
+    let honest = lfm_prove(
+        &program,
+        &artifacts,
+        &program_id_arenas(&elf_digest, pc_start, &decode, &pages),
+        &opts,
+    )
+    .expect("honest prove");
+
+    let mut d2 = elf_digest;
+    d2[31] ^= 1;
+    let mut dec2 = decode;
+    dec2[0] ^= 1;
+    let mut pages_value = pages.clone();
+    pages_value[1].1[31] ^= 1;
+    let mut pages_base = pages.clone();
+    pages_base[0].0 ^= 1;
+    let mut pages_order = pages.clone();
+    pages_order.swap(0, 1);
+
+    for (what, arenas) in [
+        (
+            "elf digest",
+            program_id_arenas(&d2, pc_start, &decode, &pages),
+        ),
+        (
+            "entry point",
+            program_id_arenas(&elf_digest, pc_start ^ 1, &decode, &pages),
+        ),
+        (
+            "decode root",
+            program_id_arenas(&elf_digest, pc_start, &dec2, &pages),
+        ),
+        (
+            "page commitment",
+            program_id_arenas(&elf_digest, pc_start, &decode, &pages_value),
+        ),
+        (
+            "page base",
+            program_id_arenas(&elf_digest, pc_start, &decode, &pages_base),
+        ),
+        (
+            "page ORDER",
+            program_id_arenas(&elf_digest, pc_start, &decode, &pages_order),
+        ),
+    ] {
+        let forged = lfm_prove(&program, &artifacts, &arenas, &opts).expect("prove");
+        assert_ne!(
+            forged.public_words, honest.public_words,
+            "{what}: a change must move the program id"
+        );
+        assert!(
+            !verify_against(
+                &artifacts.roots,
+                &artifacts.program_id,
+                artifacts.keccak_rnd_chunks,
+                &forged.proof,
+                &honest.public_words,
+                &opts,
+            ),
+            "{what}: claiming the honest id must reject"
+        );
+    }
+}

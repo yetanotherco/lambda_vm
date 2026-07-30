@@ -291,3 +291,29 @@ pub fn global_l2g_roots(archive: &FixtureArchive, count: usize) -> Vec<Commitmen
 pub fn commitments_to_arena(roots: &[Commitment]) -> Vec<LfmWord> {
     roots.iter().flat_map(commitment_words).collect()
 }
+
+// ==================== the attestation's program id ====================
+
+/// The inner ELF bytes the guest input carries.
+pub fn inner_elf(archive: &FixtureArchive) -> &[u8] {
+    archive.guest_input().inner_elf.as_slice()
+}
+
+/// The supplied DECODE preprocessed root.
+pub fn decode_commitment(archive: &FixtureArchive) -> Commitment {
+    archive.guest_input().decode_commitment
+}
+
+/// The supplied per-page genesis roots, `(base, commitment)`.
+///
+/// ⚠ EMPTY for the `fibonacci` fixture — that guest touches no data pages — so
+/// any test that only uses the fixture leaves the page path unexercised. Drive
+/// it with a synthetic shape rather than treating it as covered.
+pub fn page_commitments(archive: &FixtureArchive) -> Vec<(u64, Commitment)> {
+    archive
+        .guest_input()
+        .page_commitments
+        .iter()
+        .map(|p| (p.0.to_native(), p.1))
+        .collect()
+}
