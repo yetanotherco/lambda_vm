@@ -574,3 +574,113 @@ a subtract from zero (§2.1). A lowering detail, not a structural obstacle.
   and cell conclusions do not.
 - **Padded-cell cost**, which needs the whole program's per-chip distribution
   (§8.4), not this leg alone.
+
+---
+
+# Corrections from building it — the emitter agent, 2026-07-30
+
+Added by the agent that implemented this design as `prover/src/lfm/constraints.rs`
+(branch `feat/lfm-constraint-emitter`). The original text above is left as its
+author wrote it; everything below is measured by
+`lfm::constraint_tests::constraint_leg_instruction_census` and
+`..::continuation_epoch_constraint_leg_cost`, both of which fail if the numbers
+move. Where a correction is a judgement rather than a measurement, it says so.
+
+## What reproduced exactly
+
+- **§8.1's whole per-AIR `instr` column**, all 28 tables, total **64,187**. The
+  census test asserts it table by table and fails loudly if any entry drifts.
+- **§8.2.2's `63,393` intermediate-epoch budget**, rebuilt from those counts by
+  the same 14-families / 9-fixed / 1-L2G_MEMORY composition.
+- **§4.3's "3 dead nodes (fanout 0)"** — but see below for what they are.
+- **§2.2's claim that production has no `Embed` and no `ConstExt`**, and §9's
+  claim that dense address assignment in node order satisfies acyclicity by
+  construction. The emitter needed no reordering pass.
+
+## What the emitter actually costs
+
+```
+per distinct AIR (28)      64,187 unfused  →  55,147 emitted
+per INTERMEDIATE epoch     54,358 leg + 2,894 recombination = 57,252 over 24 sub-proofs
+per FINAL epoch            55,058 leg + 2,944 recombination = 58,002 over 25 sub-proofs
+```
+
+**9.7% under the 63,393 budget**, with the recombination included — which §8.2.2
+does not count.
+
+## Three corrections
+
+### 1. `MulBase` is cost-neutral, not a 4× routing obligation (§3)
+
+§3 says an emitter that fails to detect the ext×base case "pays 4× for it",
+comparing against a hand-lowering as three base multiplies plus a repack.
+**That comparison has no basis.** Read against `chips::xalu`: `Mul` and
+`MulBase` are selectors on the SAME chip at the same width, so both are one row;
+and the `B` operand is received through `ext_token` on every selector, so a
+base-valued word `(c, 0, 0, 0)` is already a legal `Mul` operand yielding the
+same product. Nobody would lower an ext×base multiply by hand when `ExtOp::Mul`
+exists, so the 4× alternative is not a lowering anyone would reach for.
+
+Detection is therefore **optional, not obligatory, and worth zero rows**. The
+emitter does it anyway — it states the intent, and the chip's constraints 18–19
+pin the operand's high lanes to zero on those rows — but a reader sizing this leg
+should not expect a saving, and 5,041 is a count of `MulBase` rows rather than of
+rows avoided.
+
+### 2. Fusion saves 9,040, not 9,069 (§5)
+
+Measured by construction: the emitter writes exactly 9,040 `MulAdd` rows.
+
+**9,113** `(Add, Mul)` operand pairs individually satisfy the single-consumer
+guard, but an `Add` carries ONE multiply, so a sum whose two operands are both
+single-consumer products can absorb only one of them. There are 73 such sums.
+The achievable saving is bounded by the pairs, not equal to them — 9,069 sits
+between the two counts and I could not reproduce it under either rule.
+
+The consequence for §0's arithmetic is small (29 rows on 57,583) but the shape of
+the claim matters: a candidate count is an upper bound on a fusion saving, never
+the saving itself.
+
+### 3. The "3 dead nodes" cost no rows, and a reachability count is not comparable
+
+§4.3's three fanout-0 nodes reproduce exactly under its own local measure — but
+**none of them is arithmetic**. Across all 28 AIRs there are **zero** arithmetic
+nodes with local fanout 0, so dead-code elimination saves **zero rows** on any
+production artifact. The emitter does DCE anyway, and its test has to INJECT an
+unreachable node to exercise the path, because the capture front-end does not
+produce one.
+
+Separately, **2,376 nodes are unreachable from any root** once one notices that a
+folded constant does not keep its operands alive. Every one of them is itself a
+constant, and the census already counts them under `fold` — ECSM 1,186 of its
+1,513, ECDAS 1,190 of its 1,262. **Anyone adding §8.1's `fold` column to a
+reachability-based dead count will double-count exactly those 2,376.** The
+emitter's report keeps them in a separate `unreached_const` field for this
+reason; it was the one place the implementation and the design first disagreed,
+and the disagreement was in the bookkeeping, not in the program.
+
+## Two deliberate departures from the spec
+
+- **Two extra rows per sub-proof for reciprocal guards.** §6 divides the β-fold
+  by `Z` and §7 divides the boundary numerator by `ζ − p`. Under the machine's
+  `0/0 = 1` convention a direct divide silently returns 1 when the denominator
+  AND numerator vanish, so a `ζ` on the trace domain would be accepted. The
+  emitter inverts against the interned one instead (`1/0` has no satisfying
+  assignment) and multiplies. §6.1's ≈22–26 row zerofier block measures at ≈24–28.
+  The out-of-domain sampler already excludes such a `ζ`, but the sampler is not
+  in this leg, and per method rule 5 a deferral's safety argument is itself a
+  claim — the guard costs two rows and removes the need for one.
+- **Boundary constraints are an explicit shape parameter**, not read from the
+  artifact, because `AIR::boundary_constraints` is a function of the public
+  inputs and the artifact deliberately excludes it. §7 is right that production
+  has exactly one per interacting AIR (`acc[0] = 0` on the last aux column, at
+  `g^0`), and the emitter carries the general `{col, point, value}` form anyway.
+
+## What the implementation cannot tell you
+
+The differential runs every one of the 28 AIRs against `eval_program_verifier`,
+and the composition check runs against a real proof of L2G_MEMORY — but only
+L2G_MEMORY is checked against a real proof, and only its trace length, part count
+and single boundary constraint are exercised end to end. Nothing here says a
+27-AIR epoch assembles correctly; that is the assembly leg's question, and the
+per-epoch figures above are compositions of per-AIR measurements, not a run.
