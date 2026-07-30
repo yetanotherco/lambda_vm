@@ -31,6 +31,34 @@ constraint IR as a literal constant:
 `ConstraintBuilder::const_base`, so the value becomes an `Op::ConstBase` leaf in
 the captured program. A different parameter value is a different program.
 
+### 0.0 PRIORITY — `epoch_label` is on the critical path; `page_base` is not
+
+This reordering follows from the epoch composition measured in the lowering
+design, and I did not draw it myself:
+
+```
+epoch proof = 14 split families + 9 or 10 fixed + 1 L2G_MEMORY
+```
+
+No PAGE (`page_configs = &[]`). No GLOBAL_MEMORY — that lives in the *global*
+proof. So **the only parameterized AIR in an epoch proof is `L2G_MEMORY`, and its
+parameter is `epoch_label`.**
+
+`epoch_label` is `index + 1`. Unpromoted, the registry therefore needs **one
+distinct program per epoch index**, and the ladder grows **linearly with epoch
+count** — which is precisely the workload-dependence the constraint leg was just
+shown NOT to have (a ~94%-fixed leg collapses the ladder to one dimension in
+epoch size). Winning that structurally and then losing it to a bus constant would
+be a poor trade.
+
+`page_base` reaches the machine only through GLOBAL_MEMORY, i.e. only when the
+GLOBAL proof comes into scope — a later leg, and one where size was never the
+issue (25 instructions per touched page against a ~63K leg).
+
+**Order: `epoch_label` first (§4.3), then `page_base`/GLOBAL_MEMORY.** For
+`epoch_label` the framing is ladder-collapsing, not low-risk-warm-up; it is both,
+but the first is why it goes first.
+
 ### 0.1 SCOPE — on the continuation path, PAGE is never built
 
 Continuation epochs pass `page_configs = &[]` (`continuation.rs:693`, `:797`,
@@ -224,8 +252,63 @@ it is a loop counter. There is no supply route to get wrong.
 `page_base` has a real supply route (`bundle.touched_page_bases` →
 `canonical_page_bases`), which is exactly where §4.1's invariant has to hold.
 
-So `epoch_label` is the lower-risk promotion and a reasonable one to do first;
-`page_base` is the one that needs the invariant enforced and reviewed.
+So `epoch_label` has no supply route to get wrong, while `page_base` does. That
+makes it the safer promotion — but "safer" is not "free", and the threat if the
+invariant is broken is SHARPER here, not softer. §4.3.
+
+### 4.3 THE `epoch_label` THREAT MODEL — prover-chosen POSITION
+
+`epoch_label` is not an incidental constant. **It is what pins an epoch's
+position in the chain**, in two places:
+
+- `L2G_MEMORY` (`local_to_global.rs:447`): `IsB20[epoch_label − 1 − init_epoch]`.
+  This is the cross-epoch ORDERING check — a cell's originating epoch must
+  precede its finalizing epoch. The range check is what forces
+  `init_epoch < epoch_label`.
+- `L2G_GLOBAL` (`:360`): `BusValue::constant(epoch_label)` is the `fini_epoch`
+  carried by the token the next epoch consumes. It is the chain link itself.
+
+Today the constant is compiled into the AIR, and **the verifier builds that AIR
+from its own `enumerate()` index** — so the verifier's AIR encodes the position
+it expects, and a prover cannot assert a different one. Promotion moves that
+value out of program text. If it were ever sourced from the bundle:
+
+> **Threat: a prover-chosen POSITION.** Inflating `epoch_label` relaxes
+> `IsB20[label − 1 − init_epoch]`, admitting `init_epoch` values the ordering
+> check exists to reject. Choosing labels freely lets two epochs claim the same
+> position (**replay**) or claim positions out of order (**reorder**).
+
+This is sharper than the `page_base` case. There the risk is a wrong *address*;
+here it is the integrity of the epoch chain — the property continuation
+soundness rests on.
+
+So the invariant has the same shape as §4.1 and a different reason:
+
+> **The `epoch_label` uniform MUST be derived positionally from the verifier's
+> own `enumerate()` (`continuation.rs:1293-1295`,
+> `local_to_global::epoch_label(index) = index + 1`). It must NEVER be read from
+> the bundle.**
+
+Note this is *easier* to honour than §4.1's, because the value is a loop counter
+the verifier already computes — there is no plausible implementation that reads
+it from the proof unless someone deliberately adds one. The invariant is written
+down so that nobody does.
+
+#### Acceptance criteria for the `epoch_label` promotion
+
+1. **`parameterized_airs_vary_per_parameter_value` must become deletable** for
+   the two L2G tables — and deleted only after being shown to fail *for the right
+   reason* (artifacts now equal across labels), not merely to fail.
+2. **`test_split_verify_rejects_reordered_epochs` and
+   `test_split_verify_rejects_dropped_last_epoch` must still pass, unchanged.**
+   These are the existing falsifiers for the ordering property, and they are the
+   real acceptance test: if promotion weakened the chain, they are what should
+   catch it. A promotion that required editing them is a promotion that broke
+   something.
+3. A new negative test: supplying a `epoch_label` uniform that disagrees with the
+   verifier's positional derivation must be rejected. If it cannot be rejected —
+   because nothing checks it — that is the finding, and it means the invariant
+   needs a mechanism rather than a review rule.
 
 ### 5. Effect on the artifact format
 
@@ -268,26 +351,29 @@ base; `L2G_GLOBAL` stops oscillating between 47 and 48).
   is the shape-static question from the target-shape doc and it is the lead's
   call, not mine.
 
-## What I recommend (revised)
+## What I recommend (revised twice)
 
-**Target GLOBAL_MEMORY first, not PAGE** — it is the one on the continuation
-path (§0.1). Then `epoch_label`'s two L2G tables, which are lower-risk (§4.2) and
-where the root instability actually showed up. PAGE last: it is monolithic-only,
-and it gets the fix for free once the mechanism exists.
+**`epoch_label` first** — it is the only parameterized AIR in an epoch proof, and
+leaving it unpromoted makes the registry ladder grow linearly with epoch count
+(§0.0). `page_base`/GLOBAL_MEMORY follows when the global-proof leg comes into
+scope. PAGE last: monolithic-only, and it gets the fix for free once the
+mechanism exists.
 
 Sequence:
 
 1. IR leaf (`Op::BaseUniform`, tag 11) + both `DeviceProgram` consumers +
    `AirShape::num_base_uniforms`, with the existing 28-AIR differential suites as
-   the safety net.
+   the safety net. Falsify the walker parity by breaking each side
+   independently — a suite that has never been shown to catch a divergence is not
+   yet a safety net.
 2. Bus-layer `BusValue::Uniform` / `LinearTerm::Uniform`.
-3. `GLOBAL_MEMORY` call site, **with §4.1's invariant enforced at the supply
-   point and called out in review** — it is the only thing standing between this
-   change and an unconstrained value.
-4. The two L2G call sites, then PAGE.
-5. Re-measure: the four tables should collapse to one artifact each, and
-   `parameterized_airs_vary_per_parameter_value` should be able to be deleted —
-   if it still passes afterwards, the promotion did not take.
+3. **`L2G_MEMORY` and `L2G_GLOBAL`** (`epoch_label`), with §4.3's invariant
+   enforced at the supply point. Acceptance is §4.3's three criteria — in
+   particular the two existing epoch-ordering rejection tests must pass
+   unchanged.
+4. Then `GLOBAL_MEMORY` (`page_base`) with §4.1's invariant; then PAGE.
+5. Re-measure: each promoted table collapses to one artifact, and
+   `parameterized_airs_vary_per_parameter_value` becomes deletable for it.
 
-That last point is worth stating as the acceptance test: the existing
-characterization test becomes the falsifier for the fix.
+The acceptance test is a test that must **stop** passing — a sharper contract
+than one that must keep passing, since it cannot be satisfied by doing nothing.
