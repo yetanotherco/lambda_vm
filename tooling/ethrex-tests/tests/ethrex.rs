@@ -40,8 +40,8 @@ const ELF_PATH: &str = "../../executor/program_artifacts/rust/ethrex.elf";
 const FIXTURES_DIR: &str = "../../executor/tests";
 
 /// Larger-block smoke test: a synthetic ethrex block with 10 ETH transfers.
-/// (Replaces the old `ethrex_hoodi.bin` real-block fixture, which was in the
-/// pre-Crypto-trait ethrex format and no longer deserializes.)
+/// (The old `ethrex_hoodi.bin` real-block fixture predated the `Crypto` trait
+/// and no longer deserializes; the current real-block fixture is separate.)
 #[ignore = "heavier synthetic block (10 txs); run in the dedicated --ignored CI step"]
 #[test]
 fn test_ethrex() {

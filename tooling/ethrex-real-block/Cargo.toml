@@ -9,8 +9,8 @@ edition = "2024"
 [dependencies]
 # Pinned to the SAME ethrex rev as the guest (open LambdaVM-backend PR branch)
 # so the generated ProgramInput rkyv layout matches what the guest deserializes.
-ethrex-common = { git = "https://github.com/lambdaclass/ethrex.git", rev = "156cb8d6a3974f411d71622eecd1b249ee37ff1c", package = "ethrex-common" }
-ethrex-config = { git = "https://github.com/lambdaclass/ethrex.git", rev = "156cb8d6a3974f411d71622eecd1b249ee37ff1c", package = "ethrex-config" }
+ethrex-common = { git = "https://github.com/lambdaclass/ethrex.git", rev = "156cb8d6a3974f411d71622eecd1b249ee37ff1c", package = "ethrex-common", default-features = false }
+ethrex-config = { git = "https://github.com/lambdaclass/ethrex.git", rev = "156cb8d6a3974f411d71622eecd1b249ee37ff1c", package = "ethrex-config", default-features = false }
 # `default-features = false, features = ["lambdavm"]` mirrors the guest
 # (executor/programs/rust/ethrex/Cargo.toml) exactly, so the parity test below
 # executes the block against the same precompile surface the guest has — most
@@ -30,6 +30,7 @@ serde_json = "1"
 # paths fall back to the same pure-Rust routines, so executing with it here
 # reproduces the guest's crypto semantics without needing an RV64 toolchain.
 lambda-vm-ethrex-crypto = { path = "../../crypto/ethrex-crypto" }
+sha2 = "0.10"
 
 # `ethrex-guest-program`'s `lambdavm` feature pins `lambda-vm-syscalls` to an
 # older commit; override it with our working-tree copy, as the guest does.

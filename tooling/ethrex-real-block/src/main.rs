@@ -53,7 +53,7 @@ fn program_input_from_cache(
     };
 
     // `into_execution_witness` rebuilds the trie structures from the flat node
-    // list and needs the parent header, which the cache carries in `headers`.
+    // list and needs the parent header, which the cache carries inside `witness`.
     let chain_config = cache.network.get_genesis()?.config;
     let witness = cache
         .witness
@@ -131,6 +131,15 @@ mod tests {
         assert_eq!(summary.first_block_number, 1_265_656);
         assert_eq!(summary.transactions, 11);
         assert_eq!(summary.gas_used, 4_402_947);
-        assert_eq!(bytes.len(), 1_021_207);
+
+        // Pin the exact serialized bytes, not just length: HashMap iteration order
+        // could vary the output while keeping size fixed.
+        let expected: [u8; 32] = [
+            0x1f, 0x7d, 0x4c, 0x4c, 0xdf, 0x9b, 0xd5, 0x24,
+            0x72, 0xd9, 0xeb, 0xaf, 0xdb, 0x40, 0x38, 0xf5,
+            0x7a, 0x88, 0xc3, 0xc9, 0x2d, 0x65, 0xc9, 0x6f,
+            0xd8, 0x6d, 0x7e, 0x32, 0x3d, 0xb8, 0x71, 0x42,
+        ];
+        assert_eq!(sha2::Sha256::digest(&bytes).as_slice(), expected);
     }
 }

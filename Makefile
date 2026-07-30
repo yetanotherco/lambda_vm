@@ -279,7 +279,7 @@ test-rust: compile-programs-rust
 # The source is ethrex-replay's cache JSON, not that tool's own rkyv output:
 # ethrex-replay tracks ethrex `main`, where `ProgramInput` has diverged from the
 # rev our guest pins, so only the JSON is safe to read across the two.
-ETHREX_REAL_BLOCK ?= 1265656
+ETHREX_REAL_BLOCK := 1265656
 # Pinned by immutable `rev`, as the guest pins ethrex itself: a branch ref would
 # let the benchmark's input change under a fixed fixture name, silently breaking
 # comparability across runs. Re-pin deliberately when adopting a new block.
@@ -291,17 +291,22 @@ ethrex-real-block-fixture: $(ETHREX_REAL_BLOCK_FIXTURE)
 
 $(ETHREX_REAL_BLOCK_CACHE):
 	mkdir -p $(dir $@)
-	curl -fsSL -o $@ \
+	curl -fsSL -o $@.tmp \
 		https://raw.githubusercontent.com/lambdaclass/ethrex-replay/$(ETHREX_REPLAY_REV)/caches/cache_hoodi_$(ETHREX_REAL_BLOCK).json
+	mv $@.tmp $@
 
-$(ETHREX_REAL_BLOCK_FIXTURE): $(ETHREX_REAL_BLOCK_CACHE) tooling/ethrex-real-block/src/main.rs
+$(ETHREX_REAL_BLOCK_FIXTURE): $(ETHREX_REAL_BLOCK_CACHE) tooling/ethrex-real-block/src/main.rs tooling/ethrex-real-block/Cargo.toml tooling/ethrex-real-block/Cargo.lock
 	cd tooling/ethrex-real-block && \
 		cargo run --release -- ../../$(ETHREX_REAL_BLOCK_CACHE) ../../$@
 
 # ethrex host-reference tests live in the detached `tooling/ethrex-tests`
 # workspace (ethrex pins rkyv's `unaligned` feature; isolated Cargo.lock).
 test-ethrex: compile-programs-rust $(ETHREX_REAL_BLOCK_FIXTURE)
-	cd tooling/ethrex-tests && cargo test --release -- --include-ignored
+	cd tooling/ethrex-tests && cargo test --release -- --include-ignored --skip test_ethrex_real_block_vm
+
+# Offline variant: skips the real-block fixture (no network required).
+test-ethrex-offline: compile-programs-rust
+	cd tooling/ethrex-tests && cargo test --release -- --include-ignored --skip test_ethrex_real_block_vm
 
 test-flamegraph:
 	cargo test -p executor --test flamegraph
