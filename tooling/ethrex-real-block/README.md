@@ -84,6 +84,13 @@ ethrex-replay cache <block-number> --rpc-url <url>
 (Alchemy, Infura) do not serve it. `ethrex-replay` also supports `eth_getProof`
 for geth/nethermind.
 
+Only **mainnet, Hoodi and Sepolia** caches are accepted. ethrex-replay writes
+`network: "LocalDevnet"` for any other chain, and that resolves to a test chain
+(chain_id 9, every fork active from timestamp 0) — so converting it would replay
+the block under invented rules while still passing every check here, since the
+witness is only ever validated against whichever config we chose. The converter
+refuses instead; `unmappable_network_is_rejected` pins that.
+
 Then point this tool at the resulting JSON. To make a new block the default,
 override `ETHREX_REAL_BLOCK` (Makefile) or add a rule alongside it.
 

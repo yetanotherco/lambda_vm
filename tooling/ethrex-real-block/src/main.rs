@@ -52,6 +52,22 @@ fn program_input_from_cache(
         gas_used: cache.blocks.iter().map(|b| b.header.gas_used).sum(),
     };
 
+    // The chain rules come from `network`, and ethrex-replay maps every chain it
+    // doesn't recognise (anything but mainnet / Hoodi / Sepolia) onto
+    // `LocalDevnet` — which resolves to a test chain: chain_id 9, every fork
+    // active from timestamp 0. Converting under that would execute the block
+    // against invented rules while still satisfying every check downstream (the
+    // witness is replayed against whatever config we picked, and host and guest
+    // read the same one), so refuse rather than guess.
+    if !matches!(cache.network, Network::PublicNetwork(_)) {
+        return Err(format!(
+            "unsupported network `{}`: its chain rules would be guessed, not read \
+             (ethrex-replay writes LocalDevnet for any chain it does not recognise)",
+            cache.network
+        )
+        .into());
+    }
+
     // `into_execution_witness` rebuilds the trie structures from the flat node
     // list and needs the parent header, which the cache carries inside `witness`.
     let chain_config = cache.network.get_genesis()?.config;
@@ -123,6 +139,30 @@ mod tests {
 
         let (program_input, _) = program_input_from_cache(CACHE).unwrap();
         execution_program(program_input, Arc::new(LambdaVmEcsmCrypto)).unwrap();
+    }
+
+    /// A cache whose `network` we can't map to real chain rules must be refused,
+    /// not converted under substituted ones. Only the `network` field is changed
+    /// here, and the result is byte-length-identical to the real fixture — which
+    /// is exactly why the other tests cannot catch this on their own.
+    #[test]
+    fn unmappable_network_is_rejected() {
+        let mut cache: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(CACHE).unwrap()).unwrap();
+        cache["network"] = serde_json::json!("LocalDevnet");
+
+        let path = std::env::temp_dir().join("ethrex_real_block_localdevnet.json");
+        std::fs::write(&path, serde_json::to_vec(&cache).unwrap()).unwrap();
+        let result = program_input_from_cache(path.to_str().unwrap());
+        std::fs::remove_file(&path).ok();
+        let Err(err) = result else {
+            panic!("LocalDevnet resolves to chain_id 9 with all forks at 0; must not convert");
+        };
+
+        assert!(
+            err.to_string().contains("unsupported network"),
+            "wrong rejection reason: {err}"
+        );
     }
 
     /// The serialized form is what the guest actually reads, so pin it: a
