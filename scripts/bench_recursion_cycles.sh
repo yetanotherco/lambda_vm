@@ -618,6 +618,12 @@ echo
 echo "<!-- recursion-cycle-report -->"
 echo "#### $REGIME"
 echo
+# State the measurement method, because the verifier bench above this in the same PR
+# comment IS A/B/B/A with statistics and a reader will otherwise carry that framing down
+# here. Nothing on this table is averaged or interleaved.
+echo "_Single exact reading per ref — no ABBA: guest cycles are deterministic for a fixed"
+echo "(guest ELF, input blob), so there is no machine drift to cancel._"
+echo
 # Same column names as bench_verify.sh's tables (main / PR / Δ) rather than REF_B / REF_A:
 # one comment holds both, and two namings for the same two sides is just friction.
 echo "| Metric | main | PR | Δ |"

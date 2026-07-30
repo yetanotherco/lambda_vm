@@ -168,8 +168,12 @@ jobs:
             if (process.env.OUTCOME === 'success') {
               const res = read('/tmp/verify_result.txt') || tail(read('/tmp/verify_out.txt'), 30);
               body += res + '\n';
-              body += '\n<sub>Drift-free interleaved A/B/B/A measurement. - = PR faster. ';
-              body += 'Trust the verdict when paired-t and Wilcoxon agree.</sub>\n';
+              // Scope this to the rows it actually describes: only the Verify-time rows are
+              // ABBA. It used to be a blanket claim, which was wrong for the proof sizes here
+              // and for every guest-cycle number in the section below.
+              body += '\n<sub>Verify-time rows only: drift-free interleaved A/B/B/A, with paired-t ';
+              body += 'and exact Wilcoxon — trust the verdict when the two agree. Proof sizes are ';
+              body += 'single exact readings (no averaging). - = PR faster.</sub>\n';
             } else {
               body += `❌ Run failed. Last log lines:\n\n` + '```\n' + tail(read('/tmp/verify_out.txt'), 30) + '\n```\n';
             }

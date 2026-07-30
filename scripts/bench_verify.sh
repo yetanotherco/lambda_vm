@@ -416,12 +416,15 @@ size_impr = (size_a - size_b) / size_b * 100.0 if size_b else 0.0
 size_icon = "🟢" if size_impr < -0.005 else "🔴" if size_impr > 0.005 else "⚪"
 to_mib = lambda b: b / (1024.0 * 1024.0)
 
-# In per-side mode A and B verify different proofs, so label the metric (M2).
-vt_label = "Verify time (per-side)" if mode == "per-side" else "Verify time"
+# Say per row how it was measured. Only the timing row is ABBA; the byte size is one
+# exact reading per side. Without this the reader applies the ABBA/statistics framing to
+# every number in the comment, including the ones it does not describe.
+# In per-side mode A and B verify different proofs, so label that too (M2).
+vt_qual = f"ABBA, {n} pairs, per-side" if mode == "per-side" else f"ABBA, {n} pairs"
 print("| Metric | main | PR | Δ |")
 print("|--------|------|----|---|")
-print(f"| **{vt_label}** | {mB:.3f}s | {mA:.3f}s | {sign(mean)}% {icon} |")
-print(f"| **Proof size** | {to_mib(size_b):.2f} MiB | {to_mib(size_a):.2f} MiB | {sign(size_impr)}% {size_icon} |")
+print(f"| **Verify time** ({vt_qual}) | {mB:.3f}s | {mA:.3f}s | {sign(mean)}% {icon} |")
+print(f"| **Proof size** (exact, 1 reading) | {to_mib(size_b):.2f} MiB | {to_mib(size_a):.2f} MiB | {sign(size_impr)}% {size_icon} |")
 
 # Surface why per-side kicked in (format change vs possible regression) so a green
 # table can't silently hide a backward-compat verify break (M1/M2).
