@@ -1305,8 +1305,11 @@ pub fn gpu_deep_calls() -> u64 {
     GPU_DEEP_CALLS.load(Ordering::Relaxed)
 }
 
-/// FRI commit-phase dispatch counter (one per `try_fri_commit_gpu` call,
-/// not per layer).
+/// FRI commit-phase dispatch counter (one per successful commit, not per
+/// layer). Counts BOTH entry points, so a table whose device-resident attempt
+/// ([`try_fri_commit_gpu_from_dev`]) fails and then commits from host evals
+/// ([`try_fri_commit_gpu`]) still contributes exactly one — the count alone
+/// cannot tell "the GPU path was skipped" from "it succeeded on the retry".
 pub(crate) static GPU_FRI_CALLS: AtomicU64 = AtomicU64::new(0);
 pub fn gpu_fri_calls() -> u64 {
     GPU_FRI_CALLS.load(Ordering::Relaxed)
@@ -1316,7 +1319,10 @@ pub fn gpu_fri_calls() -> u64 {
 /// [`try_compute_and_invert_inv_denoms_dev`] call that actually built a
 /// device handle). Fires at most twice per prove per table: once for R3
 /// OOD's `num_eval_points * trace_size` denominators and once for R4
-/// DEEP's `(1 + num_eval_points) * lde_size` denominators.
+/// DEEP's `(1 + num_eval_points) * lde_size` denominators. R4 has two
+/// chances at it (device-only DEEP, then the host DEEP arm), and both are
+/// counted here, so a single failed dispatch does not necessarily lower the
+/// total; R3's fallback is CPU-only, so a failure there does.
 pub(crate) static GPU_BATCH_INVERT_CALLS: AtomicU64 = AtomicU64::new(0);
 pub fn gpu_batch_invert_calls() -> u64 {
     GPU_BATCH_INVERT_CALLS.load(Ordering::Relaxed)
@@ -1338,6 +1344,23 @@ pub fn schedule_fri_fold_fault(n_calls_until_err: i64) {
 pub fn schedule_inverse_fault(n_calls_until_err: i64) {
     math_cuda::inverse::FAULT_INVERSE_REMAINING_UNTIL_ERR
         .store(n_calls_until_err, Ordering::Relaxed);
+}
+
+/// Test-only: whether a scheduled fault has already fired. The hook stores -1
+/// when it triggers, so after an armed prove a negative value means the error
+/// path genuinely ran. Only meaningful right after arming: -1 is also the
+/// idle/disarmed state, so this returns true if the hook was never armed.
+/// Tests assert this instead of comparing dispatch counts, which a
+/// second-tier retry can restore to the fault-free total.
+#[cfg(feature = "test-cuda-faults")]
+pub fn fri_fold_fault_fired() -> bool {
+    math_cuda::fri::FAULT_FOLDS_REMAINING_UNTIL_ERR.load(Ordering::Relaxed) < 0
+}
+
+/// Test-only counterpart of [`fri_fold_fault_fired`] for the batch-invert hook.
+#[cfg(feature = "test-cuda-faults")]
+pub fn inverse_fault_fired() -> bool {
+    math_cuda::inverse::FAULT_INVERSE_REMAINING_UNTIL_ERR.load(Ordering::Relaxed) < 0
 }
 
 /// R2 GPU dispatch: batched ext3 LDE over `parts_coefs` (composition-poly
