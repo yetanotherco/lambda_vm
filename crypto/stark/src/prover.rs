@@ -1644,9 +1644,16 @@ pub trait IsStarkProver<
                 None => {
                     // The host part evals are empty under device-only (the R2
                     // drain is skipped); abort with the device-only contract's
-                    // message instead of a misleading EmptyCommitment.
+                    // message instead of a misleading EmptyCommitment. Gate on
+                    // the parts the CPU fallback actually consumes, not on
+                    // `host_trace_empty()`: the trace can stay device-resident
+                    // while these parts were downloaded to the host anyway (the
+                    // GPU decompose fell back to `decompose_and_extend_d2`), in
+                    // which case this fallback is valid and must not panic.
                     assert!(
-                        !round_1_result.lde_trace.host_trace_empty(),
+                        lde_composition_poly_parts_evaluations
+                            .first()
+                            .is_none_or(|p| !p.is_empty()),
                         "R2 composition commit fell back to the host part evals, \
                          but they are device-only (empty)"
                     );
