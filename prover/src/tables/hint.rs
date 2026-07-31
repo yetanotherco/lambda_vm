@@ -1,6 +1,6 @@
 //! HINT table — receiver for the non-constraining `hint` ecall.
 //!
-//! The `hint` ecall (syscall `u64::MAX - 20`) lets the executor hand the guest a
+//! The `hint` ecall (syscall `u64::MAX - 30`) lets the executor hand the guest a
 //! value that is expensive to compute but cheap to verify (modular inverse, sqrt,
 //! …); the guest verifies it with ordinary constrained instructions. Unlike a
 //! normal `STORE`, the ecall writes the 32-byte output to guest memory *directly*
@@ -36,11 +36,13 @@
 //! STORE/MEMW_R). The `Ecall` bus alone does not establish it: its tuple carries the
 //! timestamp, a free column, so the LogUp identity pins only the *sum* of `mu` over
 //! the rows sharing a `(ts, syscall)` tuple to the CPU's send — it does not rule out
-//! two rows splitting `mu = 1/2 + 1/2` while each keeps its own `out_addr` (and
-//! `out_addr` is the base the four output writes take). Such a witness is in fact
-//! caught today, but only downstream and non-locally: MEMW boolean-constrains its own
-//! multiplicities, so a half-weighted write finds no receiver. Constraining `mu` here
-//! makes the argument local, independent of how MEMW happens to handle multiplicities.
+//! a witness that spreads `mu` across rows with integer weights summing to 1 (a `+1`
+//! row plus a `+1`/`-1` pair, each keeping its own `out_addr`, the base the four
+//! output writes take). MEMW does NOT catch this: it only ever receives the legal
+//! `+1`, while the `-1` cancels an honest STORE on the sender side, so MEMW's own
+//! multiplicity constraints stay satisfied and nothing downstream rejects it. The
+//! `IS_BIT` on `mu` here is therefore load-bearing -- not a redundant restatement of
+//! a check some other table performs.
 //!
 //! ## Columns (37)
 //! - `timestamp[0..1]` (DWordWL): the ecall timestamp `T`
