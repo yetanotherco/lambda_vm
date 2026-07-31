@@ -1603,6 +1603,41 @@ fn test_prove_ecsm_forged_yr_rejected() {
     );
 }
 
+/// Soundness: `IS_AFFINE` cannot be forged. It is what gates the yG-read and yR-write MEMW
+/// buses, and it is pinned by the `Ecall` receiver, whose syscall word is
+/// `xonly + IS_AFFINE·(affine − xonly)` — the CPU sends the guest's real `a7`, so clearing
+/// the selector on a row that ran the affine ecall leaves that bus (and the two it gates)
+/// unbalanced.
+#[test]
+fn test_prove_ecsm_forged_is_affine_rejected() {
+    use crate::tables::ecsm::cols as ecsm_cols;
+
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let elf_bytes = ecsm_affine_elf_bytes();
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
+    let result = executor.run().expect("Failed to run program");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
+
+    assert_eq!(
+        *traces.ecsm.main_table.get(0, ecsm_cols::IS_AFFINE),
+        FieldElement::<GoldilocksField>::one(),
+        "sanity: the ecsm_affine guest produces an affine row"
+    );
+    traces
+        .ecsm
+        .main_table
+        .set(0, ecsm_cols::IS_AFFINE, FieldElement::zero());
+
+    assert!(
+        !prove_and_verify_vm_minimal(&elf, &mut traces),
+        "Verifier must reject an ECSM row that claims the wrong ecall variant"
+    );
+}
+
 /// Verifier REJECTS a forged trace where an addr byte cell is set to a
 /// non-byte field element.
 ///
