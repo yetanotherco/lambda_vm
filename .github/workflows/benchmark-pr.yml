@@ -47,7 +47,7 @@ env:
   # This is not a representative block — 20 plain transfers are ecrecover-heavy and
   # touch almost no state: 8.73M cycles, 411 keccak calls, 80 ecsm calls. It stays
   # the per-comment default only because it proves in ~25s; the representative
-  # number is the real block below, which runs on push/dispatch and `/bench-real`.
+  # number is the real block below, which runs on every invocation alongside it.
   #
   # Cycle counts here are for the ELF THIS JOB BUILDS (see "Build ethrex guest ELF"),
   # as of main @ 9ccdaf2 with clang 21. They move with guest optimisation (#861 gave the
@@ -90,14 +90,23 @@ env:
   # 2^23's 60 GiB does not fit safely — memory, not speed, is what picks 2^22 here.
   # Moving off 2^21 is worth ~14% wall on the calibration box. That box is NOT this
   # runner (it measured 8.6 s/Mcycle against this runner's 5.3-5.6), so treat the
-  # ratio as transferable and the absolute seconds as not: the first /bench-real run
-  # establishes this runner's actual time.
+  # ratio as transferable and the absolute seconds as not: the first /bench run at
+  # this epoch establishes this runner's actual time.
   #
   # Deliberately NOT the CLI's DEFAULT_CONTINUATION_EPOCH_SIZE_LOG2, which stays 20 so
   # a laptop can still prove; and not the GPU path's 2^22, which happens to coincide
   # but is chosen by VRAM rather than host RAM (see benchmark-gpu.yml).
   REAL_BLOCK_EPOCH_LOG2: "22"
-  BENCH_RUNS_REAL: 1
+  # Sampled like the synthetic screen, 3 runs, and reported the same way (median +
+  # spread). Fewer than the synthetic's 5 because each run is minutes rather than
+  # seconds; enough that one slow run shows up as spread instead of moving the median.
+  #
+  # THIS IS THE DIAL. The runner's per-run real-block time is still unmeasured — the
+  # calibration ran on a different box (see REAL_BLOCK_EPOCH_LOG2 above). If the first
+  # runs land above ~6 min each, /bench becomes a ~25 min occupancy of a runner every
+  # other bench queues behind, and this count is what to turn down (2, or 1) before
+  # reaching for anything else.
+  BENCH_RUNS_REAL: 3
   BENCH_RUNS_PR: 3
   # Cheap-tier screen: catches regressions down to ~1.5% on its own and leaves
   # smaller/ambiguous deltas to the manual drift-free ABBA tiebreaker. Pushing either
@@ -114,9 +123,10 @@ jobs:
   benchmark:
     runs-on: [self-hosted, bench]
     # Skip unless: push to main, workflow_dispatch, or "/bench" comment on a PR.
-    # "/bench-real" and "/bench-growth" are handled by THIS job (they are prefixed
-    # by "/bench" and deliberately absent from the exclusion list below); they only
-    # switch which sections run, in the "Determine run count" step.
+    # "/bench-growth" is handled by THIS job (it is prefixed by "/bench" and
+    # deliberately absent from the exclusion list below); it only switches whether the
+    # growth sweep runs, in the "Determine run count" step. The real block needs no
+    # token — it runs on every invocation.
     if: >-
       github.event_name == 'push' ||
       github.event_name == 'workflow_dispatch' ||
@@ -198,22 +208,17 @@ jobs:
             echo "run_growth=false" >> "$GITHUB_OUTPUT"
           fi
 
-          # Real-block benchmark: same gating as growth (/bench-real, push to main,
-          # workflow_dispatch), and for the same reason — it is far too slow for the
-          # per-comment tier. One continuation prove of the real block is ~4.5-4.8 min of
-          # CPU on this runner (50.78M cycles at the 5.31-5.62 s/Mcycle measured on
-          # this box in run 30631871174), against ~25s for the synthetic block, and
-          # the runner is single and serialized across every /bench, /bench-abba and
-          # /bench-verify in the repo.
+          # The real block runs on EVERY invocation — plain `/bench`, push to main, and
+          # workflow_dispatch alike. It is the number that means something, so it should
+          # not need a second command to ask for; the synthetic screen rides along
+          # unchanged as the cheap, high-sensitivity half.
           #
-          # Because push-to-main always runs it, the baseline artifact carries a
-          # real-block number, so `/bench-real` on a PR pays for the PR side only.
-          RUN_REAL=false
-          if [ "$EVENT_NAME" = "issue_comment" ] && echo "$COMMENT_BODY" | grep -q '^/bench-real'; then
-            RUN_REAL=true
-          elif [ "$EVENT_NAME" = "push" ] || [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            RUN_REAL=true
-          fi
+          # The cost is real and lands on a shared runner: ~4.5-4.8 min per run x
+          # BENCH_RUNS_REAL, so every /bench and every push to main now occupies the
+          # bench server for roughly 15-20 min, and /bench-abba and /bench-verify queue
+          # behind it. That trade was made deliberately — see BENCH_RUNS_REAL above for
+          # the dial if it proves too expensive.
+          RUN_REAL=true
 
           # The fixture is FETCHED from a pinned URL + sha256, not built (see the
           # Makefile). The guard covers the window after a repoint but before the new
@@ -466,14 +471,24 @@ jobs:
             EPOCHS="$E"
           done
 
+          # Same summary as the synthetic screen: median for the headline, spread so a
+          # single slow run is visible rather than silently shifting the verdict, and
+          # every raw value so a reader can judge for themselves.
           MEDIAN_POS=$(( (RUNS + 1) / 2 ))
           TIME_MEDIAN=$(echo $TIMES | tr ' ' '\n' | sort -n | awk "NR==$MEDIAN_POS")
           HEAP_MEDIAN=$(echo $HEAPS | tr ' ' '\n' | sort -n | awk "NR==$MEDIAN_POS")
+          TIME_MIN=$(echo $TIMES | tr ' ' '\n' | sort -n | head -1)
+          TIME_MAX=$(echo $TIMES | tr ' ' '\n' | sort -n | tail -1)
+          TIME_SPREAD=$(awk "BEGIN { if ($TIME_MEDIAN > 0) printf \"%.1f\", (($TIME_MAX - $TIME_MIN) / $TIME_MEDIAN) * 100; else print \"0.0\" }")
+          ALL_TIMES=$(echo $TIMES | tr ' ' '\n' | paste -sd '/' -)
 
           {
             echo "real_time_s=$TIME_MEDIAN"
             echo "real_peak_mb=$HEAP_MEDIAN"
             echo "real_epochs=$EPOCHS"
+            echo "real_runs=$RUNS"
+            echo "real_time_spread=$TIME_SPREAD"
+            echo "real_all_times=$ALL_TIMES"
             echo "real_input=$(basename "$REAL_INPUT")"
           } | tee -a /tmp/metrics.txt >> "$GITHUB_OUTPUT"
 
@@ -663,28 +678,37 @@ jobs:
 
           # --- Real block (continuations, 1 sample) ---
           # Only reached when no cached baseline exists, which is the expensive case:
-          # push-to-main normally publishes the real-block numbers, so a /bench-real
-          # comment pays for the PR side alone. $REAL_INPUT was resolved before this
+          # push-to-main normally publishes the real-block numbers, so a /bench comment
+          # pays for the PR side alone. $REAL_INPUT was resolved before this
           # checkout and the fixture is untracked, so main proves the identical block.
           if [ "$RUN_REAL" != "true" ]; then
-            echo "Skipping real-block baseline (use /bench-real to enable)"
+            echo "Skipping real-block baseline (fixture URL unset)"
           else
-            echo "--- Baseline real block (continuations, epoch 2^$REAL_BLOCK_EPOCH_LOG2) ---"
-            ./target/release/cli prove "$ELF" --private-input "$REAL_INPUT" \
-              --continuations --epoch-size-log2 "$REAL_BLOCK_EPOCH_LOG2" \
-              -o /tmp/real_proof.bin --time | tee /tmp/baseline_real.txt
-            rm -f /tmp/real_proof.bin
-            T=$(grep -o 'Proving time: [0-9.]*' /tmp/baseline_real.txt | awk '{print $3}')
-            # Optional, as on the PR side: a main that predates continuation heap
-            # reporting prints no such line, and that must not fail the comparison.
-            H=$(grep -o 'Peak heap: [0-9]*' /tmp/baseline_real.txt | awk '{print $3}')
-            if [ -z "$T" ]; then
-              echo "::error::Failed to parse baseline real-block proving time"
-              cat /tmp/baseline_real.txt
-              exit 1
-            fi
-            echo "real_time_s=$T" >> "$GITHUB_OUTPUT"
-            echo "real_peak_mb=$H" >> "$GITHUB_OUTPUT"
+            # Sampled to the same count as the PR side. A 3-vs-1 comparison would put
+            # the two sides' noise on different footings, which is precisely the error
+            # sampling exists to avoid.
+            RTIMES=""; RHEAPS=""
+            for i in $(seq 1 "$BENCH_RUNS_REAL"); do
+              echo "--- Baseline real block run $i/$BENCH_RUNS_REAL (epoch 2^$REAL_BLOCK_EPOCH_LOG2) ---"
+              ./target/release/cli prove "$ELF" --private-input "$REAL_INPUT" \
+                --continuations --epoch-size-log2 "$REAL_BLOCK_EPOCH_LOG2" \
+                -o /tmp/real_proof.bin --time | tee /tmp/baseline_real_$i.txt
+              rm -f /tmp/real_proof.bin
+              T=$(grep -o 'Proving time: [0-9.]*' /tmp/baseline_real_$i.txt | awk '{print $3}')
+              # Optional, as on the PR side: a main that predates continuation heap
+              # reporting prints no such line, and that must not fail the comparison.
+              H=$(grep -o 'Peak heap: [0-9]*' /tmp/baseline_real_$i.txt | awk '{print $3}')
+              if [ -z "$T" ]; then
+                echo "::error::Failed to parse baseline real-block proving time from run $i"
+                cat /tmp/baseline_real_$i.txt
+                exit 1
+              fi
+              RTIMES="$RTIMES $T"
+              if [ -n "$H" ]; then RHEAPS="$RHEAPS $H"; fi
+            done
+            RMED_POS=$(( (BENCH_RUNS_REAL + 1) / 2 ))
+            echo "real_time_s=$(echo $RTIMES | tr ' ' '\n' | sort -n | awk "NR==$RMED_POS")" >> "$GITHUB_OUTPUT"
+            echo "real_peak_mb=$(echo $RHEAPS | tr ' ' '\n' | sort -n | awk "NR==$RMED_POS")" >> "$GITHUB_OUTPUT"
           fi
 
           # Restore PR checkout
@@ -744,6 +768,9 @@ jobs:
           PR_REAL_PEAK: ${{ steps.pr-real.outputs.real_peak_mb }}
           PR_REAL_EPOCHS: ${{ steps.pr-real.outputs.real_epochs }}
           PR_REAL_INPUT: ${{ steps.pr-real.outputs.real_input }}
+          PR_REAL_RUNS: ${{ steps.pr-real.outputs.real_runs }}
+          PR_REAL_TIME_SPREAD: ${{ steps.pr-real.outputs.real_time_spread }}
+          PR_REAL_ALL_TIMES: ${{ steps.pr-real.outputs.real_all_times }}
         run: |
           # Pick baseline source
           if [ "$BASELINE_FOUND" = "true" ]; then
@@ -829,6 +856,9 @@ jobs:
           echo "pr_real_peak=$PR_REAL_PEAK" >> "$GITHUB_OUTPUT"
           echo "pr_real_epochs=$PR_REAL_EPOCHS" >> "$GITHUB_OUTPUT"
           echo "pr_real_input=$PR_REAL_INPUT" >> "$GITHUB_OUTPUT"
+          echo "pr_real_runs=$PR_REAL_RUNS" >> "$GITHUB_OUTPUT"
+          echo "pr_real_time_spread=$PR_REAL_TIME_SPREAD" >> "$GITHUB_OUTPUT"
+          echo "pr_real_all_times=$PR_REAL_ALL_TIMES" >> "$GITHUB_OUTPUT"
           echo "baseline_real_time=$BASELINE_REAL_TIME" >> "$GITHUB_OUTPUT"
           echo "baseline_real_peak=$BASELINE_REAL_PEAK" >> "$GITHUB_OUTPUT"
           echo "baseline_real_input=$BASELINE_REAL_INPUT" >> "$GITHUB_OUTPUT"
@@ -903,6 +933,9 @@ jobs:
           REAL_PEAK_PCT: ${{ steps.compare.outputs.real_peak_pct }}
           REAL_MISMATCH: ${{ steps.compare.outputs.real_mismatch }}
           REAL_EPOCH_LOG2: ${{ env.REAL_BLOCK_EPOCH_LOG2 }}
+          REAL_RUNS: ${{ steps.compare.outputs.pr_real_runs }}
+          REAL_TIME_SPREAD: ${{ steps.compare.outputs.pr_real_time_spread }}
+          REAL_ALL_TIMES: ${{ steps.compare.outputs.pr_real_all_times }}
           COMMIT_SHA: ${{ steps.pr-ref.outputs.sha || github.sha }}
           TABLE_PARALLELISM: ${{ steps.config.outputs.table_parallelism }}
         with:
@@ -955,18 +988,23 @@ jobs:
             const realPeakPct = process.env.REAL_PEAK_PCT;
             const realMismatch = process.env.REAL_MISMATCH;
             const realEpochLog2 = process.env.REAL_EPOCH_LOG2;
+            const realRuns = process.env.REAL_RUNS || '1';
+            const realTimeSpread = process.env.REAL_TIME_SPREAD;
+            const realAllTimes = process.env.REAL_ALL_TIMES;
 
             // Stable marker: the "find and update the existing comment" lookup at the
             // bottom keys off it, so section headings can change without orphaning
             // every comment already posted. Legacy title matches stay as a fallback.
             let body = `<!-- lambda-vm-benchmark -->\n`;
 
-            // --- Section 1: Real block (headline; only present on /bench-real, push, dispatch) ---
+            // --- Section 1: Real block (headline; present whenever the fixture is fetchable) ---
             if (realTime) {
-              body += `## Benchmark — real block${realInput ? ` (\`${realInput}\`)` : ''}\n\n`;
+              body += `## Benchmark — real block${realInput ? ` (\`${realInput}\`)` : ''}${parseInt(realRuns) > 1 ? ` (median of ${realRuns})` : ''}\n\n`;
+              // Run count lives in the heading ("median of N"), as on the synthetic
+              // section — repeating it here just made the two disagree in tone.
               body += `<sub>continuations · epoch 2^${realEpochLog2}`;
               if (realEpochs) body += ` · ${realEpochs} epochs`;
-              body += ` · 1 sample</sub>\n\n`;
+              body += `</sub>\n\n`;
 
               if (realMismatch) {
                 body += `> ⚠️ Baseline measured a different block (\`${realMismatch}\`) — showing the PR side only.\n\n`;
@@ -981,18 +1019,24 @@ jobs:
                 }
                 body += `| **Prove time** | ${baseRealTime}s | ${realTime}s | ${fmt(realTimeDiff)}s (${fmt(realTimePct)}%) ${icon(realTimePct)} |\n\n`;
 
-                // 1 sample, so the >5% band that gates the synthetic screen is not
-                // supportable here: call out only what is far outside run-to-run noise,
-                // and say plainly that the middle band is unresolved rather than "fine".
+                // Wider bands than the synthetic screen's 5%: 3 runs of a minutes-long
+                // prove resolve less than 5 runs of a 25s one, so the middle is reported
+                // as unresolved rather than as "fine".
                 const rp = parseFloat(realTimePct);
                 if (rp > 10) {
                   body += `> ⚠️ **Regression on the real block** — prove time up ${fmt(realTimePct)}%.\n`;
                 } else if (rp < -10) {
                   body += `> 🎉 **Improvement on the real block** — prove time down ${realTimePct}%.\n`;
                 } else if (Math.abs(rp) >= 3) {
-                  body += `> ❓ **${fmt(realTimePct)}% — not resolved by one sample.** Re-run \`/bench-real\`, or use \`/bench-abba\` for a paired test.\n`;
+                  body += `> ❓ **${fmt(realTimePct)}% — beyond what ${realRuns} runs resolve.** Use \`/bench-abba\` for a paired test.\n`;
                 } else {
                   body += `> ✅ No significant change.\n`;
+                }
+                if (realTimeSpread && parseFloat(realTimeSpread) > 5.0) {
+                  const vals = realAllTimes ? realAllTimes.split('/').map(t => `${t}s`).join(' / ') : '';
+                  body += `>\n> ⚠️ Real-block prove-time spread: ${realTimeSpread}% (${vals}) — the median above is less trustworthy than usual.\n`;
+                } else if (realTimeSpread && parseInt(realRuns) > 1) {
+                  body += `>\n> <sub>Prove-time spread ${realTimeSpread}%${realAllTimes ? ` (${realAllTimes.split('/').map(t => `${t}s`).join(' / ')})` : ''}</sub>\n`;
                 }
               } else {
                 body += `| Metric | PR |\n`;
@@ -1011,7 +1055,7 @@ jobs:
             const tableParallelism = process.env.TABLE_PARALLELISM;
             const tpLabel = tableParallelism ? tableParallelism : 'auto (cores / 3)';
             body += `## Benchmark — ethrex 20 transfers${nLabel}\n\n`;
-            body += `<sub>Synthetic screen — 20 plain transfers, ~6x less work than a real block and a very different keccak:ecrecover mix. Fast, so it runs on every \`/bench\`; comment \`/bench-real\` for the representative number. Table parallelism: ${tpLabel}</sub>\n\n`;
+            body += `<sub>Synthetic screen — 20 plain transfers, ~6x less work than the real block above and a very different keccak:ecrecover mix. Cheap enough to sample 5x, so it stays the high-sensitivity half of the pair. Table parallelism: ${tpLabel}</sub>\n\n`;
             body += `| Metric | main | PR | Δ |\n`;
             body += `|--------|------|----|---|\n`;
             body += `| **Peak heap** | ${basePeak} MB | ${peak} MB | ${fmt(peakDiff)} MB (${fmt(peakPct)}%) ${icon(peakPct)} |\n`;
@@ -1135,9 +1179,13 @@ jobs:
             }
 
             // --- Footer ---
+            // The real block runs on every invocation, so its absence means the fixture
+            // could not be fetched — say that plainly rather than offering a command to
+            // re-request it, which no longer exists.
             if (!realTime) {
-              body += `\n> 🧱 **This ran on synthetic blocks only.** Comment \`/bench-real\` to prove a real Ethereum block `;
-              body += `(keccak/trie-dominated rather than ecrecover-dominated). It adds ~5 min to the run.\n`;
+              body += `\n> 🧱 **Synthetic blocks only — the real-block fixture was not available.** `;
+              body += `Check that \`ETHREX_REAL_BLOCK_FIXTURE_URL\` is set in the Makefile and that the artifact is reachable; `;
+              body += `the run log carries the warning.\n`;
             }
             const sha = process.env.COMMIT_SHA.substring(0, 8);
             body += `\n<sub>Commit: ${sha} · Baseline: ${baseSrc} · Runner: self-hosted bench</sub>\n`;

@@ -140,7 +140,7 @@ it — see [Measured cost of candidate blocks](#measured-cost-of-candidate-block
 
 | Where | How to run it | Cost (current default) |
 |---|---|---|
-| `benchmark-pr.yml` | `/bench-real` on a PR; automatic on push to main and `workflow_dispatch` | ~4–5 min (first run at epoch 2^22 confirms) |
+| `benchmark-pr.yml` | **`/bench`** on a PR — no separate command; also push to main and `workflow_dispatch` | 3 runs, ~4–5 min each (first run at epoch 2^22 confirms) |
 | `scripts/bench_verify.sh` | `WORKLOAD=real scripts/bench_verify.sh <ref>` | ~4.5–4.8 min per side, then cached |
 | `scripts/perf_diff.sh` | `WORKLOAD=real scripts/perf_diff.sh <ref>` | 5 recordings, so ~25 min |
 | `benchmark-gpu.yml` | `/bench-gpu` on a PR — **the default there** | 59.87 s/prove on an RTX 5090 (see below) |
@@ -206,10 +206,19 @@ and the other tiers. The
 bundle on disk is ~1.9 GB; note that a heavier block pushes it past 2 GiB, which
 needs rkyv `pointer_width_64` to serialize.
 
-Plain `/bench` deliberately stays on the synthetic 20-transfer block: it proves in
-~25s against ~4.5–4.8 min, and one runner carries every `/bench`, `/bench-abba` and
-`/bench-verify` in the repo. The synthetic number is a fast screen; the real block
-is the number that means something.
+**`/bench` runs both halves, one command.** The synthetic screen (5 runs, ~25s each)
+and the real block (3 runs, ~4–5 min each) go out together; there is no separate
+trigger for the real one. They answer different questions and neither replaces the
+other — the synthetic block is cheap enough to sample hard, so it resolves smaller
+deltas, while the real block is the one whose number means something.
+
+**The cost is a shared resource.** One runner carries every `/bench`, `/bench-abba`
+and `/bench-verify` in the repo, and folding the real block in takes a `/bench` from
+roughly a minute of proving to **~15–20 min**, on every comment and every push to
+main. That was a deliberate trade — one command beating two — and `BENCH_RUNS_REAL`
+in `benchmark-pr.yml` is the dial if it proves too expensive. Its per-run time on the
+runner is still unmeasured (the calibration ran on a different box), so the first run
+is what tells you whether 3 was the right number.
 
 Cycle counts here (8.73M synthetic, 50.78M real) are from merge `fdb92f67` (main @
 `9ccdaf2`, clang 21). They move with guest optimisation and ~2% with the clang major,
@@ -367,8 +376,8 @@ peak RSS is set by the epoch size rather than the trace length.
 
 **Do not read absolute seconds off this table for another machine.** The calibration box
 runs ~8.6 s/Mcycle against the bench runner's 5.31–5.62, so the *ratios* between epochs
-transfer and the wall times do not. `/bench-real` now runs at 2^22 (it was 2^21); the
-first run after that change establishes the runner's real number.
+transfer and the wall times do not. `/bench`'s real-block arm now runs at 2^22 (it was
+2^21); the first run after that change establishes the runner's real number.
 
 ### Verifying a repoint
 
