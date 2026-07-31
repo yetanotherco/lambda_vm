@@ -675,7 +675,9 @@ pub fn htod_via<T: cudarc::driver::DeviceRepr>(
     // smaller). If another path (`async_dtoh_via` on the host-retaining flow)
     // already grew this slot larger, it stays larger — grow-only — and we just
     // use the first chunk of it.
-    let want_u64 = (chunk_elems * elem_size).div_ceil(8).min(n_bytes.div_ceil(8));
+    let want_u64 = (chunk_elems * elem_size)
+        .div_ceil(8)
+        .min(n_bytes.div_ceil(8));
     staging.ensure_capacity(want_u64, ctx)?;
     ctx.bind_to_thread()?;
 
