@@ -18,12 +18,13 @@
 //! whether the epoch's OTHER sub-proofs compose, since a sub-proof is verified
 //! in isolation here.
 //!
-//! And it cannot see DEPTH. Both fixtures are 4-row traces at blowup 2, so
-//! every executed walk is two levels; `join_leg_cost` emits at depth 22 but
-//! never runs it, and R1f's `keccak_merkle_walk_authenticates_a_real_opening`
-//! is the only executed deep walk in the suite (depth 20, main trace only). A
-//! level-count bug that needed more than two levels to show would survive this
-//! file.
+//! DEPTH it sees only as far as the fixtures go: six levels on the
+//! preprocessed fixture (64 rows at blowup 2), two on the production one.
+//! `join_leg_cost` emits at depth 22 but never runs it, and R1f's
+//! `keccak_merkle_walk_authenticates_a_real_opening` remains the only executed
+//! walk at production depth (20, main trace only). Six levels is enough to
+//! distinguish a per-level walk from a two-level one; it is not enough to catch
+//! something that only appears past a word boundary in the index.
 
 use math::field::traits::IsFFTField;
 use stark::config::Commitment;
@@ -758,6 +759,44 @@ fn join_leg_cost() {
         total_perm * QUERIES,
         total_cells * QUERIES as u64,
     );
+
+    // ---- what a SHARED commitment would cost, exactly, under one assumption -
+    //
+    // `others/lfm-team-lead-shared-commitment-ruling.md` parks the lever and
+    // pins a prediction of 55-70k permutations, noting that leaf WIDENING under
+    // a shared tree is unmeasured and could offset the walk saving. It can be
+    // settled without building anything: a permutation count is a function of
+    // the shape alone -- `ceil(leaf_bytes / 136)` absorbs plus one per level --
+    // so the only thing being assumed is the SHAPE (one tree per sub-proof
+    // whose leaf is the four matrices' row pairs concatenated in matrix order).
+    // Nothing about the arithmetic is estimated.
+    //
+    // Widening cannot offset much, and the reason is structural: absorbs scale
+    // with total bytes, which do not change when the matrices share a leaf,
+    // while walks scale with the number of TREES, which is what collapses. The
+    // only bytes lost are the per-leaf padding of the groups that disappear.
+    const RATE_BYTES: usize = 136;
+    let mut shared_perm = 0usize;
+    for (label, air) in &airs {
+        let num_precomputed = production_num_precomputed(label, &**air);
+        let shape = shape_for(&**air, num_precomputed, LOG2_TRACE, LOG2_BLOWUP);
+        let leaf_bytes: usize = shape.groups().iter().map(GroupShape::leaf_bytes).sum();
+        shared_perm += leaf_bytes.div_ceil(RATE_BYTES) + shape.merkle_depth;
+    }
+    println!(
+        "\nOne shared tree per sub-proof instead of four: {shared_perm} \
+         permutations per query against {total_perm} ({:.0}% collapse), \
+         {} per epoch at {QUERIES} queries.",
+        100.0 * (1.0 - shared_perm as f64 / total_perm as f64),
+        shared_perm * QUERIES,
+    );
+    println!(
+        "Absorbs are {} of the shared figure and walks {}; widening costs \
+         nothing here because total leaf BYTES do not change when matrices \
+         share a leaf -- only the padding of the vanished leaves.",
+        shared_perm - airs.len() * (LOG2_TRACE + LOG2_BLOWUP - 1) as usize,
+        airs.len() * (LOG2_TRACE + LOG2_BLOWUP - 1) as usize,
+    );
 }
 
 // =============================================================================
@@ -1008,11 +1047,23 @@ fn the_join_proves_and_verifies() {
 /// in the run is inconsistent) must execute — and then publish a DEEP value
 /// that is not the production one, against a root that is not the committed
 /// one. A prover who wants the wrong fold must pay with the wrong root.
+///
+/// Run over BOTH fixtures. The three-matrix one is the real production table;
+/// the four-matrix one is the only fixture in which the precomputed group's own
+/// leaf and path are ever tampered, and its 64-row trace is the only executed
+/// walk in this file deeper than two levels.
 #[test]
 fn no_tampered_value_can_move_the_fold_without_moving_the_root() {
+    sweep_tampers(host_sub_proof(), "L2G_MEMORY (3 matrices, depth 2)");
+    sweep_tampers(
+        preprocessed_sub_proof(),
+        "PREPROCESSED_FIXTURE (4 matrices, depth 6)",
+    );
+}
+
+fn sweep_tampers(h: &HostSubProof, label: &str) {
     use super::proof_arena::{commitments_to_arena, walk_to_root};
 
-    let h = host_sub_proof();
     let q = 0usize;
     let groups = h.shape.groups();
 
@@ -1045,7 +1096,7 @@ fn no_tampered_value_can_move_the_fold_without_moving_the_root() {
             let err = execute(&program, &arenas, &TestPermutation)
                 .err()
                 .unwrap_or_else(|| {
-                    panic!("group {g} slot {slot}: a moved value must not authenticate")
+                    panic!("{label}: group {g} slot {slot}: a moved value must not authenticate")
                 });
 
             // Coherent: recompute the leaf the tampered values really give and
@@ -1054,14 +1105,14 @@ fn no_tampered_value_can_move_the_fold_without_moving_the_root() {
             let forged = walk_to_root(leaf, h.iotas[q], &h.openings[q][g].siblings);
             assert_ne!(
                 forged, h.roots[g],
-                "group {g} slot {slot}: the tamper must move the root, or the \
+                "{label}: group {g} slot {slot}: the tamper must move the root, or the \
                  vector is vacuous"
             );
             let mut coherent_roots = h.roots.clone();
             coherent_roots[g] = forged;
             arenas[3] = commitments_to_arena(&coherent_roots);
             let forged_run = execute(&program, &arenas, &TestPermutation).unwrap_or_else(|e| {
-                panic!("group {g} slot {slot}: the coherent forgery must execute: {e:?}")
+                panic!("{label}: group {g} slot {slot}: the coherent forgery must execute: {e:?}")
             });
             // Which of the two points moves is not incidental: a leaf holds
             // the row PAIR, its first half is the regular point and its second
@@ -1076,7 +1127,7 @@ fn no_tampered_value_can_move_the_fold_without_moving_the_root() {
             assert_eq!(
                 moved,
                 [regular_half, !regular_half],
-                "group {g} slot {slot}: a value in the leaf's {} half must move \
+                "{label}: group {g} slot {slot}: a value in the leaf's {} half must move \
                  DEEP at {} and nothing else",
                 if regular_half { "first" } else { "second" },
                 if regular_half {
@@ -1091,7 +1142,7 @@ fn no_tampered_value_can_move_the_fold_without_moving_the_root() {
             vectors += 1;
         }
     }
-    println!("{vectors} tamper vectors, every value slot of every group, both ways round");
+    println!("{label}: {vectors} tamper vectors, every value slot of every group, both ways round");
 
     // ---- the index, which this leg binds to the POINT as well as the leaf --
     //
@@ -1123,24 +1174,30 @@ fn no_tampered_value_can_move_the_fold_without_moving_the_root() {
         }
         assert!(
             moved_a_root,
-            "flipping index bit {level} left every root unchanged — the fixture's \
+            "{label}: flipping index bit {level} left every root unchanged — the fixture's \
              trees are degenerate at this index and the walk half of this vector \
              tests nothing"
         );
         execute(&program, &arenas, &TestPermutation)
             .err()
-            .unwrap_or_else(|| panic!("index bit {level}: a moved index must not authenticate"));
+            .unwrap_or_else(|| {
+                panic!("{label}: index bit {level}: a moved index must not authenticate")
+            });
 
         arenas[3] = commitments_to_arena(&coherent_roots);
-        let forged = execute(&program, &arenas, &TestPermutation)
-            .unwrap_or_else(|e| panic!("index bit {level}: coherent forgery must execute: {e:?}"));
+        let forged = execute(&program, &arenas, &TestPermutation).unwrap_or_else(|e| {
+            panic!("{label}: index bit {level}: coherent forgery must execute: {e:?}")
+        });
         assert_ne!(
             forged.public_words[0].1, honest.public_words[0].1,
-            "index bit {level}: the index derives the evaluation point, so a \
+            "{label}: index bit {level}: the index derives the evaluation point, so a \
              forged walk at another index must also fold at another point"
         );
     }
-    println!("{} index vectors, one per level", h.shape.merkle_depth);
+    println!(
+        "{label}: {} index vectors, one per level",
+        h.shape.merkle_depth
+    );
 
     // ---- a sibling, at every level -------------------------------------
     for level in 0..h.shape.merkle_depth {
@@ -1152,9 +1209,14 @@ fn no_tampered_value_can_move_the_fold_without_moving_the_root() {
             .copy_from_slice(&commitments_to_arena(&siblings));
         execute(&program, &arenas, &TestPermutation)
             .err()
-            .unwrap_or_else(|| panic!("sibling level {level}: a moved path must not authenticate"));
+            .unwrap_or_else(|| {
+                panic!("{label}: sibling level {level}: a moved path must not authenticate")
+            });
     }
-    println!("{} sibling vectors, one per level", h.shape.merkle_depth);
+    println!(
+        "{label}: {} sibling vectors, one per level",
+        h.shape.merkle_depth
+    );
 
     /// The leaf hash a tampered opening really produces, under production's own
     /// backend rather than a local model.
@@ -1298,7 +1360,12 @@ fn preprocessed_fixture() -> (
     /// `beta` from its second element.
     const NUM_COLS: usize = 6;
     const NUM_PRECOMPUTED: usize = 3;
-    const NUM_ROWS: usize = 4;
+    /// 64 rows, not the 4 the other fixture uses. Trace length only enters this
+    /// leg through the Merkle depth, and at 4 rows every executed walk in the
+    /// suite is two levels deep — enough to hide a level-count error. 64 rows at
+    /// blowup 2 gives depth 6, which is the only executed multi-level walk over
+    /// all four committed matrices.
+    const NUM_ROWS: usize = 64;
 
     let opts = stark::proof::options::GoldilocksCubicProofOptions::with_blowup(2)
         .expect("blowup=2 is valid");
