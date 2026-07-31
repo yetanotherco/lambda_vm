@@ -85,9 +85,11 @@ The machine proves and verifies, end to end, through the registry:
 
 ## Decisions already made — do not relitigate
 
-- **Prove the inner proof at BLOWUP 8.** Two independent legs point there:
-  DEEP scales with query count (73 vs 219 ⇒ ~3×), and the keccak bill does
-  too (~460k vs ~1.4M permutations).
+- **Prove the inner proof at BLOWUP 8.** Three independent legs point
+  there: DEEP scales with query count (73 vs 219 ⇒ ~3×), the keccak bill
+  does too (~460k vs ~1.4M permutations), and FRI is 2.6× cheaper (14,454
+  vs 38,106 permutations — query count falls 3× while per-query cost rises
+  only 14%; reg-tree, FRI slice 0, derived from the verified spec).
 - **The REGISTER derivation IS the binding.** `VmAirs::new`'s
   `register_preprocessed` parameter looks like unfinished plumbing; it must
   stay unwired. Computing the commitment from `reg_fini` is what ties the

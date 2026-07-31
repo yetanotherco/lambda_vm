@@ -21,6 +21,20 @@ entry only with the verifying evidence named in it.
    Default is the range check: if assembly arrives and the argument is
    still unverified, emit the check.
 
+## STATED DEFERRALS (safety argument given and accepted — not open debts)
+
+- **`coset_offset ≠ 3` is unexercised in the FRI leg** (reg-tree, FRI
+  slice 0; accepted 2026-07-31). No production config produces another
+  value and the domain constants are baked into the program, so the
+  emitter's handling of a different offset has no witness. Safety argument:
+  a wrong coset offset moves every domain point and therefore every leaf
+  and every fold — it can only REJECT proofs (honest ones included), never
+  accept a forgery, in either direction of the error. Residual plumbing
+  condition: the emitter must derive the baked constants from
+  `ProofOptions`' offset (or assert its literal against that source of
+  truth), so the deferral covers test coverage only, not a hardcoded-3
+  emitter.
+
 ## WATCH (anomalies assembly should confirm or explain, not obligations)
 
 - **HALT's constraint-leg cost line is out of step**: 9,859 instructions
@@ -33,8 +47,22 @@ entry only with the verifying evidence named in it.
 
 - Every per-epoch number so far is a COMPOSITION of per-AIR measurements,
   not a run. Assembly is what confirms or falsifies them.
-- The arena-value join obligation (constraint/DEEP values = authenticated
-  values) is DISCHARGED for the DEEP leg (deep-join slice 1, by shared
-  cells + bound index). Any NEW leg that reads opened values (FRI, LogUp
-  closure) inherits the same obligation and must join through the same
-  cells, not parallel copies.
+- The arena-value join obligation — WIDENED 2026-07-31 (deep-join, LogUp
+  scoping): it is NOT about opened values; it is about **any value two legs
+  consume**. Opened values were merely the first instance. Every such value
+  must be one arena cell (or derived in-machine from one), never parallel
+  copies, one per leg.
+  - Instance 1, DISCHARGED: constraint/DEEP values = authenticated values
+    (deep-join slice 1, shared cells + bound index).
+  - Instance 2, found live in a leg considered DONE: the constraint leg
+    hinted `table_offset = L/N` host-side and the machine never saw `L` —
+    a prover could satisfy every accumulator with truthful `L₁/N` while the
+    closure sums arbitrary `L₂`, making bus balance vacuous. Fix in flight
+    (deep-join): machine reads `L`, derives `L/N` in-machine as `L · N⁻¹`
+    (N is shape, so `N⁻¹` is a program constant); the closure sums the same
+    `L` cell. This entry closes when that fix + its split-L control test
+    are merged.
+  - Lesson for assembly: a hinted arena word that a differential never
+    catches (because the host packs it truthfully) is exactly where this
+    class hides. Audit every remaining hinted word against the two-consumer
+    rule before assembly is called done.
