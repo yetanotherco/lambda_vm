@@ -4,28 +4,29 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-# embedded-alloc TLSF heap: the previous default guest allocator, now selectable via
-# the `tlsf-alloc` feature. Kept a hard dep (like the codebase's other allocator
-# toggles) so switching needs no dependency edits; it's only linked into the guest and
-# dropped when dlmalloc (the default) is selected.
-embedded-alloc = "0.6"
+# embedded-alloc TLSF heap: the original default guest allocator, now behind
+# `tlsf-alloc`. Optional, so the default build (bump) doesn't compile it.
+embedded-alloc = { version = "0.6", optional = true }
 riscv = { version = "0.15", features = ["critical-section-single-hart"] }
 thiserror = "1.0"
 getrandom = { version = "0.3.4", default-features = false }
 getrandom_v2 = {version = "0.2.15", features = ["custom"], package = "getrandom"}
 lazy_static = "1.5.0"
 rand = "0.9.2"
-# Default guest allocator: Doug Lea's malloc. Cheaper per alloc/free than TLSF on zkVM
-# guests (fewer guest cycles) while still reclaiming freed memory (no OOM). `critical-
-# section` gives the Sync a #[global_allocator] static needs; its single-hart impl comes
-# from `riscv` above (same as embedded-alloc's TLSF heap uses). See `src/allocator.rs`.
-dlmalloc = { version = "0.2.14", default-features = false }
-critical-section = "1.2"
+# Doug Lea's malloc, behind `dlmalloc-alloc`: slower than the default bump allocator on
+# every workload measured, but it reclaims freed memory, so it is the allocator to pick
+# for continuations. `critical-section` gives the Sync a #[global_allocator] static
+# needs; its single-hart impl comes from `riscv` above. See `src/allocator.rs`.
+dlmalloc = { version = "0.2.14", default-features = false, optional = true }
+critical-section = { version = "1.2", optional = true }
 
 [features]
-# Fallback/BENCH: use the embedded-alloc TLSF heap instead of the default dlmalloc guest
-# allocator (to A/B the two or fall back). Off by default. See `src/allocator.rs`.
-tlsf-alloc = []
+# Guest allocator overrides. Default (neither flag) is the bump allocator; see
+# `src/allocator.rs` for the measurements behind that choice.
+# dlmalloc: reclaims freed memory, so pick it for continuations.
+dlmalloc-alloc = ["dep:dlmalloc", "dep:critical-section"]
+# TLSF: the original default, kept as a fallback. Wins over `dlmalloc-alloc` if both set.
+tlsf-alloc = ["dep:embedded-alloc"]
 
 [dev-dependencies]
 keccak = "0.1"

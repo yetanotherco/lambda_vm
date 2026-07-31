@@ -3,22 +3,189 @@ use riscv as _;
 const MAX_MEMORY_SIZE: usize = 0xC000_0000;
 const WORD_SIZE: usize = 4;
 
-// Guest global allocator, selectable at build time:
-//   - default: Doug Lea's malloc (dlmalloc), backed by a bump "system" provider that
-//     hands dlmalloc page-aligned chunks from the guest heap. dlmalloc does all
-//     sub-allocation churn itself, so — unlike a raw bump allocator — it reuses freed
-//     memory (no OOM) while executing fewer guest instructions per alloc/free than TLSF
-//     (Bencik's ZisK allocator comparison; measured cheaper on our ethrex proving too).
-//   - `tlsf-alloc` feature: embedded-alloc's TLSF heap — the previous default, kept one
-//     flag away for A/B comparison or fallback.
+// Guest global allocator, selectable at build time. The default was chosen on a measured
+// three-way A/B (ethrex blocks of 1..1500 transfers, both 1-to-1 and distinct-account
+// fixtures; guest cycles, trace elements, proving time and peak RSS):
+//
+//   - default: a monotonic bump allocator. No free lists and no coalescing -- `alloc`
+//     moves a cursor, `dealloc` is empty -- so it spends the fewest guest instructions
+//     per allocation of the three. Against dlmalloc that measured ~9% fewer guest
+//     cycles, ~8% fewer main-trace elements, ~6% faster proving and ~8% lower peak RSS,
+//     flat across every block size tried. It never reuses a freed region, so its
+//     footprint grows monotonically -- see the ceiling note below.
+//   - `dlmalloc-alloc` feature: Doug Lea's malloc on a bump "system" provider that hands
+//     it page-aligned segments. Its footprint is bounded by live bytes instead of total
+//     bytes ever allocated, which makes it the only one of the three safe under
+//     unbounded churn -- use it for continuations, where one execution spans many blocks
+//     and bump's growth has no bound.
+//   - `tlsf-alloc` feature: embedded-alloc's TLSF heap. The original default, and the
+//     slowest of the three (bump proved ~11% faster, dlmalloc ~6%). Kept as a fallback.
+//
+// Bump's ceiling: the guest heap is [_end, MAX_MEMORY_SIZE), about 3 GiB, and a block's
+// allocation is bounded by its gas. A gas-full block of the cheapest transactions (1500
+// transfers, 31.5M gas, 523M cycles) executes without exhausting it, and any other
+// composition fits fewer transactions into the same gas. Contract-heavy blocks allocate
+// more per transaction and are not covered by that bound; if one ever exhausts the heap,
+// `dlmalloc-alloc` is a one-flag fallback.
 //
 // Only the guest installs a #[global_allocator]; on host (e.g. `cargo test` for the
 // sponge's differential tests) the attribute would hijack the test harness's
 // allocator with a never-initialized heap and abort.
 
 // Off riscv only `init` is reachable (no `#[global_allocator]` is installed and
-// `sys_alloc_aligned` goes through `std::alloc`), so the dlmalloc plumbing is dead there.
-#[cfg(not(feature = "tlsf-alloc"))]
+// `sys_alloc_aligned` goes through `std::alloc`), so the plumbing is dead there.
+#[cfg(not(any(feature = "tlsf-alloc", feature = "dlmalloc-alloc")))]
+#[cfg_attr(not(target_arch = "riscv64"), allow(dead_code))]
+mod imp {
+    use core::alloc::{GlobalAlloc, Layout};
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    struct BumpAlloc;
+
+    // Single-hart guest -> `Relaxed` atomics are contention-free and avoid the
+    // `static mut` edition-2024 lints.
+    static HEAP_POS: AtomicUsize = AtomicUsize::new(0);
+    static HEAP_END: AtomicUsize = AtomicUsize::new(0);
+
+    #[cfg_attr(target_arch = "riscv64", global_allocator)]
+    static ALLOC: BumpAlloc = BumpAlloc;
+
+    pub fn init(heap_start: usize, heap_end: usize) {
+        HEAP_POS.store(heap_start, Ordering::Relaxed);
+        HEAP_END.store(heap_end, Ordering::Relaxed);
+    }
+
+    unsafe impl GlobalAlloc for BumpAlloc {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let align = layout.align();
+            let pos = HEAP_POS.load(Ordering::Relaxed);
+            // `align` is a power of two per the Layout contract.
+            let aligned = pos.wrapping_add(align - 1) & !(align - 1);
+            match aligned.checked_add(layout.size()) {
+                Some(new_pos) if new_pos <= HEAP_END.load(Ordering::Relaxed) => {
+                    HEAP_POS.store(new_pos, Ordering::Relaxed);
+                    aligned as *mut u8
+                }
+                // Out of heap -> null makes the caller's `handle_alloc_error` abort.
+                _ => core::ptr::null_mut(),
+            }
+        }
+
+        unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {
+            // A bump allocator never reclaims.
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            // Guest memory is zero-initialized and bump never reuses a freed region,
+            // so freshly bumped memory already reads as zero -- skip the memset.
+            unsafe { self.alloc(layout) }
+        }
+    }
+
+    // Host tests. `BumpAlloc`'s cursor is global, so they serialize on `HEAP_LOCK` and
+    // each re-points it at its own leaked, page-aligned buffer.
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::sync::{Mutex, MutexGuard};
+
+        static HEAP_LOCK: Mutex<()> = Mutex::new(());
+
+        // Leaks on purpose: `BumpAlloc` hands out raw addresses into this region, so it
+        // must outlive every pointer derived from it.
+        fn with_heap(bytes: usize) -> MutexGuard<'static, ()> {
+            let guard = HEAP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let l = Layout::from_size_align(bytes, 4096).unwrap();
+            // Zeroed, like guest memory: reads of never-written heap return 0 there.
+            let base = unsafe { std::alloc::alloc_zeroed(l) };
+            assert!(!base.is_null());
+            init(base as usize, base as usize + bytes);
+            guard
+        }
+
+        fn layout(size: usize, align: usize) -> Layout {
+            Layout::from_size_align(size, align).unwrap()
+        }
+
+        /// `alloc_zeroed` skips the memset, which is only sound because bump never hands
+        /// back a region it already served. Dirty a block, free it, and check the next
+        /// `alloc_zeroed` gets fresh (still-zero) memory rather than the dirt.
+        #[test]
+        fn alloc_zeroed_never_returns_a_dirtied_region() {
+            let _guard = with_heap(1024 * 1024);
+            let l = layout(256, 8);
+            let dirty = unsafe { BumpAlloc.alloc(l) };
+            assert!(!dirty.is_null());
+            unsafe { core::ptr::write_bytes(dirty, 0xAA, 256) };
+            unsafe { BumpAlloc.dealloc(dirty, l) };
+
+            let fresh = unsafe { BumpAlloc.alloc_zeroed(l) };
+            assert!(!fresh.is_null());
+            assert_ne!(fresh, dirty, "bump must not re-serve a freed region");
+            let bytes = unsafe { core::slice::from_raw_parts(fresh, 256) };
+            assert!(bytes.iter().all(|&b| b == 0), "alloc_zeroed returned dirt");
+        }
+
+        /// The defining property, and what bounds the footprint: a free is a no-op, so
+        /// the cursor only ever moves forward.
+        #[test]
+        fn dealloc_does_not_reclaim() {
+            let _guard = with_heap(1024 * 1024);
+            let l = layout(4096, 8);
+            let first = unsafe { BumpAlloc.alloc(l) };
+            unsafe { BumpAlloc.dealloc(first, l) };
+            let second = unsafe { BumpAlloc.alloc(l) };
+            assert_eq!(
+                second as usize,
+                first as usize + 4096,
+                "the cursor must not rewind over a freed block"
+            );
+        }
+
+        #[test]
+        fn alignment_requests_are_honored() {
+            let _guard = with_heap(1024 * 1024);
+            // Start off-alignment so the padding path is exercised.
+            let _ = unsafe { BumpAlloc.alloc(layout(1, 1)) };
+            for align in [16usize, 64, 256, 4096] {
+                let p = unsafe { BumpAlloc.alloc(layout(align * 3, align)) };
+                assert!(!p.is_null(), "alloc with align {align} failed");
+                assert_eq!(p as usize % align, 0, "align {align} not honored");
+            }
+        }
+
+        /// Exhaustion must return null (which becomes `handle_alloc_error` on the guest),
+        /// never a pointer past `HEAP_END`.
+        #[test]
+        fn exhaustion_returns_null_instead_of_running_past_the_heap() {
+            let _guard = with_heap(8192);
+            let l = layout(4096, 8);
+            assert!(!unsafe { BumpAlloc.alloc(l) }.is_null());
+            assert!(!unsafe { BumpAlloc.alloc(l) }.is_null());
+            assert!(
+                unsafe { BumpAlloc.alloc(l) }.is_null(),
+                "handed out memory past HEAP_END"
+            );
+            // An absurd size declines too. It declines on the bounds check rather than
+            // on the `checked_add`: `Layout` requires size rounded up to align to fit in
+            // `isize::MAX`, so a size that would overflow the cursor arithmetic can't be
+            // constructed in the first place.
+            let huge = layout(isize::MAX as usize - 7, 8);
+            assert!(unsafe { BumpAlloc.alloc(huge) }.is_null());
+        }
+
+        /// Before `init_allocator` runs HEAP_END is 0 -- allocation must fail closed
+        /// rather than hand out address 0.
+        #[test]
+        fn uninitialized_allocator_hands_out_nothing() {
+            let _guard = HEAP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            init(0, 0);
+            assert!(unsafe { BumpAlloc.alloc(layout(1, 1)) }.is_null());
+        }
+    }
+}
+
+#[cfg(all(feature = "dlmalloc-alloc", not(feature = "tlsf-alloc")))]
 #[cfg_attr(not(target_arch = "riscv64"), allow(dead_code))]
 mod imp {
     use core::alloc::{GlobalAlloc, Layout};
