@@ -1682,3 +1682,190 @@ fn the_exposed_bits_are_the_cells_the_walk_consumed() {
         }
     }
 }
+
+// ==================== FRI slice 1: the fold layout ====================
+
+use super::fri::FriShape;
+
+/// ★ The shape mirror against production's observable BEHAVIOUR on the real
+/// proof — the vector lengths the verifier structurally enforces.
+///
+/// `FriFoldLayout` is `pub(crate)` inside `crypto/stark`, so the mirror cannot
+/// be compared against the struct. It is compared against what a real proof
+/// actually carries instead, which is the better oracle: `verifier.rs:426-448`
+/// rejects on exactly these two lengths before its query loop runs, and the
+/// spec notes they are the ONLY thing pinning vectors Fiat-Shamir does not bind.
+#[test]
+fn the_fri_shape_predicts_the_real_proofs_vector_lengths() {
+    let (_air, proof) = real_fixture();
+    let h = host_sub_proof();
+    let opts = prove_options();
+    let shape = FriShape::from_options(&opts, h.shape.log2_lde_length);
+    shape.check();
+
+    let p = &proof.proofs[0];
+    println!(
+        "FRI shape: lde 2^{}, blowup 2^{}, k {}, terminal_log {}, total_folds {}, \
+         committed {}, coeffs {}",
+        shape.log2_lde_length,
+        shape.blowup_log,
+        shape.final_poly_log_degree,
+        shape.terminal_log(),
+        shape.total_folds(),
+        shape.num_committed(),
+        shape.num_terminal_coeffs(),
+    );
+    assert_eq!(
+        p.fri_layers_merkle_roots.len(),
+        shape.num_committed(),
+        "committed layer count must match what the proof carries"
+    );
+    assert_eq!(
+        p.fri_final_poly_coeffs.len(),
+        shape.num_terminal_coeffs(),
+        "terminal coefficient count must match 2^effective_k"
+    );
+    assert_eq!(
+        shape.coset_offset, opts.coset_offset,
+        "the shape must take its coset offset from the options, not a literal"
+    );
+}
+
+/// ★ The synthetic sweep §7 requires, and the reason it is needed.
+///
+/// Production pins `k = 7` and `coset_offset = 3` in every configuration, so no
+/// real proof distinguishes an implementation that reads `k` from one that
+/// hardcodes 7, and none reaches the clamp (`trace_bits <= 7`) at all. In LFM
+/// these are not dead emitted branches — shape is compile-time, so they are
+/// host-side arithmetic — which is exactly why they are testable here for free,
+/// with no proving.
+///
+/// Each row is `(trace_bits, blowup_log, k)` with its expected
+/// `(total_folds, num_committed, effective_k, terminal_len)`, derived by hand
+/// from `terminal.rs:45-54` rather than from this module.
+///
+/// ## ★ Falsified, and the result is the leg's blindness finding made concrete
+///
+/// Deleting the `saturating_sub(1)` from `FriShape::num_committed` — the
+/// off-by-one that makes a verifier authenticate one layer FEWER than the proof
+/// commits — fails this test and
+/// [`the_fri_sizing_prediction`], and **passes**
+/// [`the_fri_shape_predicts_the_real_proofs_vector_lengths`]. The fixture has
+/// `total_folds = 0`, so `0` and `0.saturating_sub(1)` are the same number and
+/// the real proof cannot tell the two implementations apart.
+///
+/// So the most soundness-relevant constant in this leg is invisible to the only
+/// real data available. That is not an argument for a better fixture; it is the
+/// reason these synthetic rows are the primary instrument rather than a
+/// supplement.
+#[test]
+fn the_fold_layout_is_right_off_productions_constants() {
+    /// `(total_folds, num_committed, effective_k, terminal_len)`.
+    type Layout = (u32, usize, u32, usize);
+    // (trace_bits, blowup_log, k) -> Layout
+    let cases: [(u32, u32, u32, Layout); 10] = [
+        // The production point, at three blowups. k = 7 throughout. Note
+        // `total_folds = trace_bits - k` is INDEPENDENT of the blowup: the
+        // blowup enters `n` and `terminal_log` identically and cancels. That
+        // cancellation is what makes the scout's `num_committed = trace_bits - 8`
+        // invariant hold across every preset, and mis-expanding it (subtracting
+        // the blowup twice) is how the first version of this table was wrong.
+        (20, 1, 7, (13, 12, 7, 256)),
+        (20, 2, 7, (13, 12, 7, 512)),
+        (20, 3, 7, (13, 12, 7, 1024)),
+        // k = 0: fold all the way down to one coefficient per coset.
+        (10, 1, 0, (10, 9, 0, 2)),
+        // k = 6, one below production.
+        (10, 1, 6, (4, 3, 6, 128)),
+        // The CLAMP regime, trace_bits <= k: terminal_log pins to lde_log, so
+        // nothing folds and effective_k drops below the requested k.
+        (7, 1, 7, (0, 0, 7, 256)),
+        (4, 1, 7, (0, 0, 4, 32)),
+        (2, 3, 7, (0, 0, 2, 32)),
+        // k = 63 — far past any real trace, so the clamp always wins.
+        (5, 1, 63, (0, 0, 5, 64)),
+        // A single fold — `trace_bits = k + 1` — commits NOTHING, because the
+        // last fold is never committed. The row that catches the off-by-one.
+        (8, 1, 7, (1, 0, 7, 256)),
+    ];
+    for (trace_bits, blowup_log, k, expected) in cases {
+        let shape = FriShape {
+            log2_lde_length: trace_bits + blowup_log,
+            blowup_log,
+            final_poly_log_degree: k,
+            coset_offset: 3,
+            num_queries: 1,
+        };
+        shape.check();
+        let got = (
+            shape.total_folds(),
+            shape.num_committed(),
+            shape.effective_k(),
+            shape.terminal_len(),
+        );
+        assert_eq!(
+            got, expected,
+            "trace_bits {trace_bits} blowup 2^{blowup_log} k {k}: \
+             (total_folds, committed, effective_k, terminal_len)"
+        );
+        // Folds exceed committed layers by exactly one whenever anything folds.
+        if shape.total_folds() > 0 {
+            assert_eq!(
+                shape.num_folds(),
+                shape.num_committed() + 1,
+                "the final fold is never committed"
+            );
+        }
+    }
+}
+
+/// ★ The sizing prediction, PINNED BEFORE MEASURING — the leg's
+/// measurements-vs-prediction target.
+///
+/// Derived from `others/lfm-fri-verify-spec.md` §8: `pathlen(i) = n − i − 2`,
+/// so a query walks `Σ pathlen(i)` steps and pays one permutation per step plus
+/// one leaf hash per committed layer. The blowup-2 row reproduces the spec's
+/// own worked example (162 steps, 174 permutations, 38,106 total), which is
+/// what says the formula is being read as written rather than re-derived.
+///
+/// Recorded as a test rather than a comment so that the emitter, when it
+/// arrives, is measured against a number that was fixed beforehand.
+#[test]
+fn the_fri_sizing_prediction() {
+    println!("blowup  n   C   Q   steps/q  perms/q     total");
+    // (blowup_log, queries, expected steps/q, perms/q, total) at trace_bits = 20.
+    for (blowup_log, queries, steps, perms, total) in [
+        (1u32, 219usize, 162usize, 174usize, 38_106usize),
+        (2, 110, 174, 186, 20_460),
+        (3, 73, 186, 198, 14_454),
+    ] {
+        let shape = FriShape {
+            log2_lde_length: 20 + blowup_log,
+            blowup_log,
+            final_poly_log_degree: 7,
+            coset_offset: 3,
+            num_queries: queries,
+        };
+        shape.check();
+        println!(
+            "  2^{blowup_log} {:>3} {:>3} {:>4} {:>8} {:>8} {:>9}",
+            shape.log2_lde_length,
+            shape.num_committed(),
+            shape.num_queries,
+            shape.path_steps_per_query(),
+            shape.permutations_per_query(),
+            shape.permutations(),
+        );
+        assert_eq!(
+            shape.path_steps_per_query(),
+            steps,
+            "blowup 2^{blowup_log} steps"
+        );
+        assert_eq!(
+            shape.permutations_per_query(),
+            perms,
+            "blowup 2^{blowup_log} perms/query"
+        );
+        assert_eq!(shape.permutations(), total, "blowup 2^{blowup_log} total");
+    }
+}

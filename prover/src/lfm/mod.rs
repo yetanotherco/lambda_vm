@@ -26,6 +26,7 @@ pub mod deep;
 pub mod edsl;
 pub mod executor;
 pub mod fixture;
+pub mod fri;
 pub mod hash;
 pub mod instr;
 pub mod keccak_adapter;
