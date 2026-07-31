@@ -134,10 +134,26 @@ it — see [Measured cost of candidate blocks](#measured-cost-of-candidate-block
 | `benchmark-pr.yml` | `/bench-real` on a PR; automatic on push to main and `workflow_dispatch` | ~6 min |
 | `scripts/bench_verify.sh` | `WORKLOAD=real scripts/bench_verify.sh <ref>` | ~6 min per side, then cached |
 | `scripts/perf_diff.sh` | `WORKLOAD=real scripts/perf_diff.sh <ref>` | 5 recordings, so ~30 min |
+| `benchmark-gpu.yml` | `/bench-gpu` on a PR — **the default there** | **unmeasured** (see below) |
+| `scripts/bench_abba.sh` | `WORKLOAD=real scripts/bench_abba.sh <ref>` | ~6 min × 2 × pairs |
 
 None of them hardcode the fixture path or a block number — they read the path from
 `make -s print-real-block-fixture` and run `make ethrex-real-block-fixture` when
 the `.bin` is absent.
+
+**Why the GPU default differs from the CPU one.** `/bench-gpu` rents its own box per
+run, so the cost is money rather than queue time on a runner every other bench is
+waiting for. That removes the reason to keep the real block opt-in, so there it is
+the default and the synthetic fixtures stay reachable via the existing `cont[TX]` /
+`mono[TX]` tokens — old numbers reproduce with the exact syntax that produced them.
+On the CPU side the shared runner makes the opposite trade correct.
+
+**GPU prove time for the real block is UNMEASURED.** Do not extrapolate the CPU rate
+(5.31–5.62 s/Mcycle): it does not transfer. The relevant prior is the RTX 5090 sweep's
+finding that above epoch 2^21 the prover was CPU-bound at the serial producer, which
+means real-block GPU time may land closer to CPU time than expected rather than far
+below it. The first `/bench-gpu` run establishes the baseline; treat any number quoted
+before that as a guess.
 
 **Continuations are mandatory, not a tuning choice.** Peak heap on a monolithic
 prove grows ~4.9 GB per million cycles on this workload family (measured on the
