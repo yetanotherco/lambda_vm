@@ -76,9 +76,20 @@ jobs:
           path: |
             executor/program_artifacts/rust
             executor/shared_target
-          key: rust-elf-artifacts-${{ hashFiles('executor/programs/rust/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'syscalls/**', 'Makefile') }}
+          key: rust-elf-artifacts-cc21-${{ hashFiles('executor/programs/rust/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'syscalls/**', 'Makefile') }}
+          # cc21 in the prefix too, not just the exact key: a bare `rust-elf-artifacts-`
+          # restore-key would prefix-match an entry built before the clang pin and hand
+          # back exactly the ELF the pin exists to prevent. Bump when GUEST_CC_MAJOR does.
           restore-keys: |
-            rust-elf-artifacts-
+            rust-elf-artifacts-cc21-
+
+      # Only on a cache miss, i.e. only when the guest is actually rebuilt — the same
+      # gate the compile step below uses. On a cache hit this costs nothing, which is
+      # the common case; the pin still holds because the restored ELF was itself built
+      # with the pinned clang (see the cc21 cache-key prefix above).
+      - name: Install the pinned guest C compiler
+        if: steps.cache-rust-elfs.outputs.cache-hit != 'true'
+        uses: ./.github/actions/install-guest-clang
 
       - name: Compile Rust programs to ELF
         if: steps.cache-rust-elfs.outputs.cache-hit != 'true'
@@ -213,9 +224,20 @@ jobs:
           path: |
             executor/program_artifacts/rust
             executor/shared_target
-          key: rust-elf-artifacts-${{ hashFiles('executor/programs/rust/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'syscalls/**', 'Makefile') }}
+          key: rust-elf-artifacts-cc21-${{ hashFiles('executor/programs/rust/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'syscalls/**', 'Makefile') }}
+          # cc21 in the prefix too, not just the exact key: a bare `rust-elf-artifacts-`
+          # restore-key would prefix-match an entry built before the clang pin and hand
+          # back exactly the ELF the pin exists to prevent. Bump when GUEST_CC_MAJOR does.
           restore-keys: |
-            rust-elf-artifacts-
+            rust-elf-artifacts-cc21-
+
+      # Only on a cache miss, i.e. only when the guest is actually rebuilt — the same
+      # gate the compile step below uses. On a cache hit this costs nothing, which is
+      # the common case; the pin still holds because the restored ELF was itself built
+      # with the pinned clang (see the cc21 cache-key prefix above).
+      - name: Install the pinned guest C compiler
+        if: steps.cache-rust-elfs.outputs.cache-hit != 'true'
+        uses: ./.github/actions/install-guest-clang
 
       - name: Compile Rust programs to ELF
         if: steps.cache-rust-elfs.outputs.cache-hit != 'true'
@@ -329,13 +351,24 @@ jobs:
           path: |
             executor/program_artifacts/rust
             executor/shared_target
-          key: rust-elf-artifacts-${{ hashFiles('executor/programs/rust/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'syscalls/**', 'Makefile') }}
+          key: rust-elf-artifacts-cc21-${{ hashFiles('executor/programs/rust/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'syscalls/**', 'Makefile') }}
+          # cc21 in the prefix too, not just the exact key: a bare `rust-elf-artifacts-`
+          # restore-key would prefix-match an entry built before the clang pin and hand
+          # back exactly the ELF the pin exists to prevent. Bump when GUEST_CC_MAJOR does.
           restore-keys: |
-            rust-elf-artifacts-
+            rust-elf-artifacts-cc21-
 
       - name: Setup Rust Environment
         if: steps.cache-rust-elfs.outputs.cache-hit != 'true'
         uses: ./.github/actions/setup-rust
+
+      # Only on a cache miss, i.e. only when the guest is actually rebuilt — the same
+      # gate the compile step below uses. On a cache hit this costs nothing, which is
+      # the common case; the pin still holds because the restored ELF was itself built
+      # with the pinned clang (see the cc21 cache-key prefix above).
+      - name: Install the pinned guest C compiler
+        if: steps.cache-rust-elfs.outputs.cache-hit != 'true'
+        uses: ./.github/actions/install-guest-clang
 
       - name: Compile Rust programs to ELF
         if: steps.cache-rust-elfs.outputs.cache-hit != 'true'
@@ -409,13 +442,24 @@ jobs:
           path: |
             executor/program_artifacts/rust
             executor/shared_target
-          key: rust-elf-artifacts-${{ hashFiles('executor/programs/rust/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'syscalls/**', 'Makefile') }}
+          key: rust-elf-artifacts-cc21-${{ hashFiles('executor/programs/rust/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'syscalls/**', 'Makefile') }}
+          # cc21 in the prefix too, not just the exact key: a bare `rust-elf-artifacts-`
+          # restore-key would prefix-match an entry built before the clang pin and hand
+          # back exactly the ELF the pin exists to prevent. Bump when GUEST_CC_MAJOR does.
           restore-keys: |
-            rust-elf-artifacts-
+            rust-elf-artifacts-cc21-
 
       - name: Setup Rust Environment
         if: steps.cache-rust-elfs.outputs.cache-hit != 'true'
         uses: ./.github/actions/setup-rust
+
+      # Only on a cache miss, i.e. only when the guest is actually rebuilt — the same
+      # gate the compile step below uses. On a cache hit this costs nothing, which is
+      # the common case; the pin still holds because the restored ELF was itself built
+      # with the pinned clang (see the cc21 cache-key prefix above).
+      - name: Install the pinned guest C compiler
+        if: steps.cache-rust-elfs.outputs.cache-hit != 'true'
+        uses: ./.github/actions/install-guest-clang
 
       - name: Compile Rust programs to ELF
         if: steps.cache-rust-elfs.outputs.cache-hit != 'true'
@@ -493,13 +537,24 @@ jobs:
           path: |
             executor/program_artifacts/rust
             executor/shared_target
-          key: rust-elf-artifacts-${{ hashFiles('executor/programs/rust/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'syscalls/**', 'Makefile') }}
+          key: rust-elf-artifacts-cc21-${{ hashFiles('executor/programs/rust/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'syscalls/**', 'Makefile') }}
+          # cc21 in the prefix too, not just the exact key: a bare `rust-elf-artifacts-`
+          # restore-key would prefix-match an entry built before the clang pin and hand
+          # back exactly the ELF the pin exists to prevent. Bump when GUEST_CC_MAJOR does.
           restore-keys: |
-            rust-elf-artifacts-
+            rust-elf-artifacts-cc21-
 
       - name: Setup Rust Environment
         if: steps.cache-rust-elfs.outputs.cache-hit != 'true'
         uses: ./.github/actions/setup-rust
+
+      # Only on a cache miss, i.e. only when the guest is actually rebuilt — the same
+      # gate the compile step below uses. On a cache hit this costs nothing, which is
+      # the common case; the pin still holds because the restored ELF was itself built
+      # with the pinned clang (see the cc21 cache-key prefix above).
+      - name: Install the pinned guest C compiler
+        if: steps.cache-rust-elfs.outputs.cache-hit != 'true'
+        uses: ./.github/actions/install-guest-clang
 
       - name: Compile Rust programs to ELF
         if: steps.cache-rust-elfs.outputs.cache-hit != 'true'

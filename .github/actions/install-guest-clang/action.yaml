@@ -1,0 +1,53 @@
+name: 'Install the pinned guest C compiler'
+description: >
+  Installs the clang major version the Makefile pins for the guest's C dependencies,
+  from apt.llvm.org. Only needed by jobs that actually BUILD guest ELFs.
+
+runs:
+  using: "composite"
+  steps:
+    # The ethrex guest embeds C (secp256k1-sys), and clang's major version moves the
+    # guest's dynamic instruction count by ~2% — so a runner-default clang produces an
+    # ELF whose cycle counts nobody else can reproduce. The Makefile pins the version
+    # and fails the build on a mismatch (`check-guest-cc`); this step is what makes the
+    # runner satisfy that pin instead of tripping it.
+    #
+    # Version comes from `make -s print-guest-cc-major` rather than being repeated here,
+    # so the Makefile stays the single source of truth for the pin.
+    #
+    # Mirrors infra/provision.sh, including the GPG fingerprint check: apt.llvm.org is a
+    # third-party repo, so its signing key is verified against a pinned fingerprint
+    # before it can sign anything we install.
+    - name: Install clang from apt.llvm.org
+      shell: bash
+      run: |
+        set -euo pipefail
+        V="$(make -s print-guest-cc-major)"
+        if command -v "clang-$V" >/dev/null 2>&1; then
+          echo "clang-$V already present: $("clang-$V" -dumpversion)"
+          exit 0
+        fi
+        LLVM_GPG_FINGERPRINT="6084F3CF814B57C1CF12EFD515CF4D18AF4F7421"
+        # shellcheck disable=SC1091  # runner-provided, not in the repo
+        . /etc/os-release
+        CODENAME="${VERSION_CODENAME:-}"
+        if [ -z "$CODENAME" ]; then
+          echo "::error::could not determine Ubuntu codename from /etc/os-release"
+          exit 1
+        fi
+        sudo install -d -m 0755 /etc/apt/keyrings
+        wget -qO /tmp/apt.llvm.org.asc https://apt.llvm.org/llvm-snapshot.gpg.key
+        actual="$(gpg --show-keys --with-colons /tmp/apt.llvm.org.asc | awk -F: '/^fpr:/ { print $10; exit }')"
+        if [ "$actual" != "$LLVM_GPG_FINGERPRINT" ]; then
+          echo "::error::apt.llvm.org GPG key fingerprint mismatch (got $actual, expected $LLVM_GPG_FINGERPRINT)"
+          exit 1
+        fi
+        sudo install -m 0644 /tmp/apt.llvm.org.asc /etc/apt/keyrings/apt.llvm.org.asc
+        echo "deb [signed-by=/etc/apt/keyrings/apt.llvm.org.asc] http://apt.llvm.org/$CODENAME/ llvm-toolchain-$CODENAME-$V main" \
+          | sudo tee "/etc/apt/sources.list.d/apt.llvm.org.list" >/dev/null
+        sudo apt-get update -y
+        sudo apt-get install -y --no-install-recommends "clang-$V" "lld-$V"
+        "clang-$V" --version | head -n 1
+        # The Makefile resolves GUEST_CC to clang-$V on PATH; prove that now rather than
+        # letting the guest build be the thing that discovers a broken install.
+        make check-guest-cc

@@ -29,15 +29,19 @@ Install gh CLI (v2.87.3):
 gh --version
 ```
 
-Install and set up LLVM 18 toolchain:
+Install and set up the LLVM 21 toolchain. **The major version matters**: the guest
+embeds C (secp256k1-sys) and its dynamic instruction count moves ~2% between clang
+majors, so a box on the wrong one produces cycle counts nobody else can reproduce.
+`GUEST_CC_MAJOR` in the Makefile pins it and the build fails loudly on a mismatch;
+`infra/provision.sh` installs the same version automatically.
 
 ```bash
 wget -qO llvm.sh https://apt.llvm.org/llvm.sh
 # review llvm.sh before running
-sudo bash llvm.sh 18
-sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-18 100
-sudo update-alternatives --install /usr/bin/lld lld /usr/bin/lld-18 100
-clang --version # must be clang 18
+sudo bash llvm.sh 21
+sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-21 100
+sudo update-alternatives --install /usr/bin/lld lld /usr/bin/lld-21 100
+clang --version # must be clang 21
 ```
 
 ## As app user

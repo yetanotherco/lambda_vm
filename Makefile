@@ -83,6 +83,25 @@ SYSROOT_SHA256 := 420e394a096f3859235e3a8121a8d5a10f995ac48e636e8d700f17d50803a0
 # $(abspath ...) because the build rule cd's into the program dir before invoking cargo.
 SYSROOT_CFLAGS := --target=riscv64 -march=rv64im -mabi=lp64 --sysroot=$(abspath $(SYSROOT_DIR))
 
+# C compiler for the guest's C dependencies (secp256k1-sys compiles 8 objects into
+# the ethrex guest). Pinned by MAJOR VERSION because the guest's dynamic instruction
+# count depends on it: the same commit and fixture measured 53,757,588 cycles under
+# clang 21 and 54,924,071 under clang 18 (-2.12%), which makes "how many cycles does
+# this block take" a property of whoever's laptop built the ELF. Benchmark numbers
+# travel between people, so that has to be nailed down.
+#
+# Only CFLAGS_* was set before; cc-rs therefore resolved the compiler itself and took
+# whatever unversioned `clang` was on PATH (its build log shows
+# `CC_riscv64im_lambda_vm_elf = Some(clang)`).
+#
+# 21 is canonical because infra/provision.sh installs LLVM 21 on the bench boxes.
+# Accept either a version-suffixed `clang-21` (Debian/Ubuntu packaging, what
+# provision.sh gives you) or a plain `clang` that IS 21 (Homebrew), so the pin works
+# on both without forcing a symlink. Override GUEST_CC to build with something else
+# deliberately — but expect different cycle counts, which is the point of the check.
+GUEST_CC_MAJOR ?= 21
+GUEST_CC ?= $(shell command -v clang-$(GUEST_CC_MAJOR) 2>/dev/null || echo clang)
+
 CLANG ?= clang
 ASM_CFLAGS ?= --target=riscv64 -march=rv64im -mabi=lp64
 ASM_LDFLAGS ?= -fuse-ld=lld -nostdlib -Wl,-e,main
@@ -191,9 +210,46 @@ FORCE:
 # presets below), the built binary's filename ($(2)), and optional extra cargo
 # args ($(3), e.g. `--features min`). cargo owns the dep graph (see FORCE
 # above), so the recipe always runs and lets cargo decide what to rebuild.
+# Fails the build rather than letting a wrong-version compiler through: a silently
+# mis-versioned ELF is worse than no ELF, because it produces cycle counts that look
+# like a regression and cost someone an afternoon. Order-only prerequisite on every
+# guest .elf rule, so it runs once per build and costs a `--version` call.
+.PHONY: check-guest-cc
+check-guest-cc:
+	@set -e; \
+	if ! command -v "$(GUEST_CC)" >/dev/null 2>&1; then \
+		echo "check-guest-cc: guest C compiler '$(GUEST_CC)' not found." >&2; \
+		echo "  The guest's C dependencies must be built with clang $(GUEST_CC_MAJOR)" >&2; \
+		echo "  (infra/provision.sh installs LLVM $(GUEST_CC_MAJOR)). Install it, or set" >&2; \
+		echo "  GUEST_CC=/path/to/clang-$(GUEST_CC_MAJOR)." >&2; \
+		exit 1; \
+	fi; \
+	have="$$("$(GUEST_CC)" -dumpversion 2>/dev/null | cut -d. -f1)"; \
+	if [ "$$have" != "$(GUEST_CC_MAJOR)" ]; then \
+		echo "check-guest-cc: '$(GUEST_CC)' is clang major $$have, expected $(GUEST_CC_MAJOR)." >&2; \
+		echo "  Guest cycle counts depend on the C compiler major version (~2% between" >&2; \
+		echo "  clang 18 and 21), so building with another one produces an ELF whose" >&2; \
+		echo "  benchmark numbers cannot be compared with anyone else's." >&2; \
+		echo "  Install clang $(GUEST_CC_MAJOR), or set GUEST_CC / GUEST_CC_MAJOR to" >&2; \
+		echo "  override deliberately." >&2; \
+		exit 1; \
+	fi
+
+# The pinned major, so CI installs the right toolchain without repeating the number
+# (.github/actions/install-guest-clang). Keeps this file the single source of truth.
+.PHONY: print-guest-cc-major
+print-guest-cc-major:
+	@echo $(GUEST_CC_MAJOR)
+
+# The resolved compiler's full version, for diagnostics.
+.PHONY: print-guest-cc-version
+print-guest-cc-version:
+	@"$(GUEST_CC)" -dumpversion 2>/dev/null || echo unknown
+
 define build_guest_elf
 cd $(1) && \
 	CARGO_TARGET_DIR=$(abspath $(SHARED_TARGET_DIR)) \
+	CC_riscv64im_lambda_vm_elf="$(GUEST_CC)" \
 	CFLAGS_riscv64im_lambda_vm_elf="$(SYSROOT_CFLAGS)" \
 	rustup run nightly-2026-02-01 cargo build --release \
 		--target $(RV64_TARGET_SPEC) \
@@ -206,23 +262,25 @@ cp $(SHARED_TARGET_DIR)/riscv64im-lambda-vm-elf/release/$(2) $@
 endef
 
 # Compile rust (64-bit)
-# Order-only `| prepare-sysroot` so a direct `make .../foo.elf` provisions the sysroot
-# first (the aggregate compile-programs-rust/compile-bench targets already do, but a
-# bare pattern-rule invocation like `make -B .../ethrex.elf` would otherwise skip it
-# and fail to compile guest C dependencies). Order-only because prepare-sysroot is
-# .PHONY — a normal prereq would force a rebuild every time; its recipe is idempotent.
-$(RUST_ARTIFACTS_DIR)/%.elf: FORCE | prepare-sysroot $(RUST_ARTIFACTS_DIR)
+# Order-only `| prepare-sysroot check-guest-cc` so a direct `make .../foo.elf` provisions
+# the sysroot and validates the guest C compiler first (the aggregate
+# compile-programs-rust/compile-bench targets already do, but a bare pattern-rule
+# invocation like `make -B .../ethrex.elf` would otherwise skip them and either fail to
+# compile guest C dependencies or build them with an unpinned clang). Order-only because
+# both are .PHONY — a normal prereq would force a rebuild every time; both recipes are
+# idempotent and check-guest-cc is a single `--version` call.
+$(RUST_ARTIFACTS_DIR)/%.elf: FORCE | prepare-sysroot check-guest-cc $(RUST_ARTIFACTS_DIR)
 	$(call build_guest_elf,$(RUST_PROGRAMS_DIR)/$*,$*)
 
 # Compile rust benches (64-bit)
-$(BENCH_ARTIFACTS_DIR)/%.elf: FORCE | prepare-sysroot $(BENCH_ARTIFACTS_DIR)
+$(BENCH_ARTIFACTS_DIR)/%.elf: FORCE | prepare-sysroot check-guest-cc $(BENCH_ARTIFACTS_DIR)
 	$(call build_guest_elf,$(BENCH_PROGRAMS_DIR)/$*,$*)
 
 # Recursion-suite guests (bench_vs/lambda/): the crate's binary is <name>-bench, so
 # copy <name>-bench -> <name>.elf. std-inclusive build-std covers both the no_std
 # inner guests and the std recursion verifier. Prover tests read these prebuilt
 # artifacts like every other program (see prover/src/tests/recursion_smoke_test.rs).
-$(RECURSION_ARTIFACTS_DIR)/%.elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
+$(RECURSION_ARTIFACTS_DIR)/%.elf: FORCE | prepare-sysroot check-guest-cc $(RECURSION_ARTIFACTS_DIR)
 	$(call build_guest_elf,$(RECURSION_GUESTS_DIR)/$*,$*-bench)
 
 # One differently named [[bin]] per preset (recursion-<preset>-bench, gated on
@@ -232,7 +290,7 @@ $(RECURSION_ARTIFACTS_DIR)/%.elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_
 # $(1) is the preset; the recipe uses $$ so `$$(call build_guest_elf,...)`
 # expands at recipe-run time (where $@ is defined).
 define recursion_verifier_rule
-$(RECURSION_ARTIFACTS_DIR)/recursion-$(1).elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
+$(RECURSION_ARTIFACTS_DIR)/recursion-$(1).elf: FORCE | prepare-sysroot check-guest-cc $(RECURSION_ARTIFACTS_DIR)
 	$$(call build_guest_elf,$$(RECURSION_GUESTS_DIR)/recursion,recursion-$(1)-bench,--features $(1))
 endef
 $(foreach preset,$(RECURSION_VERIFIER_PRESETS),$(eval $(call recursion_verifier_rule,$(preset))))
@@ -240,7 +298,7 @@ $(foreach preset,$(RECURSION_VERIFIER_PRESETS),$(eval $(call recursion_verifier_
 # Continuation variants: same crate, `continuation` feature on top of the preset
 # feature -> recursion-cont-<preset>-bench -> recursion-cont-<preset>.elf.
 define recursion_cont_verifier_rule
-$(RECURSION_ARTIFACTS_DIR)/recursion-cont-$(1).elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
+$(RECURSION_ARTIFACTS_DIR)/recursion-cont-$(1).elf: FORCE | prepare-sysroot check-guest-cc $(RECURSION_ARTIFACTS_DIR)
 	$$(call build_guest_elf,$$(RECURSION_GUESTS_DIR)/recursion,recursion-cont-$(1)-bench,--features "continuation $(1)")
 endef
 $(foreach preset,$(RECURSION_CONT_PRESETS),$(eval $(call recursion_cont_verifier_rule,$(preset))))
