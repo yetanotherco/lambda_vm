@@ -373,7 +373,8 @@ pub fn emit_add_pair<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>
     b.emit_base(idx + 1, root_1);
 }
 
-/// A 64-bit ADD that rejects unsigned overflow while `active - end == 1`.
+/// A 64-bit ADD that rejects unsigned overflow on active, non-terminal rows —
+/// those where the `active_column` value minus the `end_column` value equals 1.
 ///
 /// The low-word carry remains boolean on every row. On active non-terminal
 /// rows, the high-word carry is constrained to zero instead of merely boolean,
