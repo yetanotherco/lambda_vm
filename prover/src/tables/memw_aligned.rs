@@ -667,6 +667,7 @@ fn w2_expr<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(b: &B) ->
 /// - idx 2,3: `IS_BIT` on `μ_read`, `μ_write`;
 /// - idx 4-6: `IS_BIT` on `write2`, `write4`, `write8`;
 /// - idx 7:   `IS_BIT<w2>` (width sum is a bit).
+#[derive(Clone, Copy)]
 pub struct MemwAlignedConstraints;
 
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for MemwAlignedConstraints {

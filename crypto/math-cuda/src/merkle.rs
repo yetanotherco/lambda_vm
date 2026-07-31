@@ -373,8 +373,14 @@ pub fn gather_merkle_paths_dev(
             .arg(&mut out)
             .launch(cfg)?;
     }
-    let host = stream.clone_dtoh(&out)?;
-    stream.synchronize()?;
+    // Async drain via the pinned-hashes slot (path nodes are hash output):
+    // enqueued without blocking, then the host waits only on the copy's event
+    // (which also covers the gather kernel queued before it) instead of a
+    // full stream sync.
+    let pending =
+        crate::device::async_dtoh_via(stream, be.pinned_hashes(), &be.ctx, &out, out.len())?;
+    let mut host = vec![0u8; out.len()];
+    pending.wait_into_bytes(&mut host)?;
     Ok(host)
 }
 

@@ -461,6 +461,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 ///   `state_ptr` DWordHL);
 /// - idx 50:   `μ · carry_1 = 0` (top-lane no-overflow), where `carry_1` is the
 ///   high carry of `addr + 192 = state_ptr[24]`.
+#[derive(Clone, Copy)]
 pub struct KeccakConstraints;
 
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for KeccakConstraints {

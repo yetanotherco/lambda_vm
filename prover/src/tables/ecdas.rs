@@ -272,6 +272,7 @@ use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
 /// ECDAS transition constraints as a single-source [`ConstraintSet`] (200
 /// total). No column configuration needed (the layout is fixed via `cols`).
+#[derive(Clone, Copy)]
 pub struct EcdasConstraints;
 
 impl EcdasConstraints {

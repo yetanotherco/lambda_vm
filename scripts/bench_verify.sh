@@ -4,37 +4,53 @@
 # Reported % = (PR - baseline)/baseline, matching the classic /bench:
 # NEGATIVE numbers are improvements (PR faster/smaller); positive = regression.
 #
+# TWO arms over the same ethrex 20-tx block, both at blowup=2 / 219 queries:
+#   monolithic     one VmProof for the whole execution.
+#   continuations  the same block proved as 2^CONT_EPOCH_LOG2-cycle epochs and verified
+#                  as a ContinuationProof bundle — what /bench proves and what an L2
+#                  actually runs, so a verifier change that only moves per-epoch or
+#                  aggregation cost is invisible in the monolithic arm alone.
+# The continuation arm is best-effort: if its prove or verify fails (it is the
+# memory-hungry one) the arm is skipped with a note and the monolithic verdict still
+# posts, rather than failing the whole bench.
+#
 # Usage: scripts/bench_verify.sh REF_A [REF_B=origin/main] [N_PAIRS=20]
 #   REF_A/REF_B  refs to compare (A = PR side); N_PAIRS even, default 20 (~5-6 min).
 #   Env: REBUILD=1 forces rebuild + re-prove; BENCH_FEATURES=<list> (default: jemalloc-stats).
 #        PROVE_PER_SIDE=auto|1|0 (default auto): 1 = each side proves+verifies its
 #        own proof (required when REF_A changes the proof format); 0 = force one
 #        shared proof (best precision); auto = share if the PR binary can verify the
-#        baseline's proof, else fall back to per-side.
-#        WORKLOAD=synthetic|real (default synthetic): which block the proof under
-#        test is built from. See "Workload" below.
-#        EPOCH_SIZE_LOG2=<n> (default 21): continuation epoch size, WORKLOAD=real only.
+#        baseline's proof, else fall back to per-side. Decided per arm.
+#        CONT_PAIRS=<n> pairs for the continuation arm (even, default 8; 0 skips it).
+#        Fewer than N_PAIRS because one continuation verify covers every epoch proof
+#        plus the aggregation, so it costs multiples of a monolithic verify. Don't go
+#        below 6: the exact Wilcoxon's smallest attainable two-sided p is 2/2^n, so at
+#        n=4 it is 0.125 and the arm can only ever report BORDERLINE, however large and
+#        clean the effect.
+#        WORKLOAD=synthetic|real (default synthetic) which BLOCK both arms prove.
+#        `real` fetches the real-block fixture (identity lives in the Makefile) and runs
+#        the continuation arm ONLY — a real block is hundreds of GB monolithically, so
+#        that arm is skipped rather than left to OOM. See "Workload" below.
+#        CONT_EPOCH_LOG2=<n> continuation epoch size (default 20, min 18). 20 matches
+#        scripts/bench_abba.sh, so this arm proves the same bundle shape /bench already
+#        proves on the same server — and 20 txs at 2^20 is strictly cheaper than the
+#        100 txs at 2^20 that /bench runs by default, so it can't be the thing that OOMs
+#        the box. (`cli prove --epoch-size-log2 --help` measured ethrex 10tx at ~9.5 GB
+#        for 2^20 vs ~15.8 GB for 2^21.) Note this does NOT match
+#        bench_recursion_cycles.sh's BLOCK_EPOCH_LOG2=21: that arm needs FEW epochs so
+#        the bundle fits the guest's 512 MiB private-input cap, a constraint that
+#        doesn't apply to host-side verification.
 #
-# Workload. What this script measures is VERIFY cost, and verify cost is structural
-# in the proof — table mix, trace lengths, query count — so it is the block that
-# decides what is being measured, not the loop around it. The synthetic default is 20
-# plain transfers: ecrecover-heavy, near-empty state (9.06M cycles, 411 keccak calls,
-# 80 ecsm calls). A real block inverts that mix (~65.6M cycles, 10,478 keccak, 116
-# ecsm), so a verifier change can move the two differently. Both counts are for a
-# current guest ELF; they shift ~14% with ELF vintage, so pin the ELF when quoting one.
+# Workload. What this script measures is VERIFY cost, and verify cost is structural in
+# the proof — table mix, trace lengths, query count — so the block decides what is being
+# measured, not the loop around it. The synthetic default is 20 plain transfers:
+# ecrecover-heavy over a near-empty state. A real block inverts that mix (keccak- and
+# trie-bound), so a verifier change can move the two differently.
 #
-# WORKLOAD=real is therefore the honest number and WORKLOAD=synthetic the cheap one;
-# the default is cheap because the real block must be proven with continuations
-# (~6 min per side, once, then cached in $WORK) before any verify run happens.
-# Both sides always use the same block, so a comparison is never mixed.
-#
-# Disk: a real-block continuation bundle is ~2 GB and this script CACHES both sides'
-# proofs in $WORK, so budget ~4 GB there (more for a heavier block). The fixture itself is fetched by URL +
-# sha256 (see the Makefile); while that URL is unset, WORKLOAD=real cannot run.
-#
-# `/bench-verify` runs the synthetic default: that job already budgets 90 minutes
-# for the verifier bench plus a 70-minute recursion step, and two real-block proves
-# do not fit under the cap. Run WORKLOAD=real by hand on the bench server.
+# `synthetic` stays the default because it is what `/bench-verify` runs and what every
+# number recorded so far used; `real` is the representative one, and costs a ~6 min
+# continuation prove per side (cached in $WORK afterwards) before any verify run starts.
+# Both sides always prove the same block, so a comparison is never mixed.
 
 set -euo pipefail
 
@@ -47,12 +63,20 @@ REF_A="$1"
 REF_B="${2:-origin/main}"
 N_PAIRS="${3:-20}"
 BENCH_FEATURES="${BENCH_FEATURES:-jemalloc-stats}"
+CONT_PAIRS="${CONT_PAIRS:-8}"
+CONT_EPOCH_LOG2="${CONT_EPOCH_LOG2:-20}"
 WORKLOAD="${WORKLOAD:-synthetic}"
-EPOCH_SIZE_LOG2="${EPOCH_SIZE_LOG2:-21}"
 case "$WORKLOAD" in
   synthetic|real) ;;
   *) echo "ERROR: WORKLOAD must be 'synthetic' or 'real' (got '$WORKLOAD')." >&2; exit 2 ;;
 esac
+# WORKLOAD=real skips the monolithic arm, so CONT_PAIRS=0 on top of it would build both
+# binaries, prove nothing and report nothing. Fail before the ~30-min build rather than
+# after it.
+if [ "$WORKLOAD" = "real" ] && [ "${CONT_PAIRS}" -eq 0 ] 2>/dev/null; then
+  echo "ERROR: WORKLOAD=real runs the continuation arm only, so CONT_PAIRS=0 would measure nothing." >&2
+  exit 2
+fi
 
 ELF_REL="executor/program_artifacts/rust/ethrex.elf"
 # Resolved after the cd to the repo root (WORKLOAD=real reads it from the Makefile).
@@ -61,6 +85,8 @@ WORK="/tmp/verify_run"
 WT="/tmp/verify_wt"
 PROOF_B="$WORK/proof_b.bin"   # baseline's proof (cached in $WORK, keyed like the binaries)
 PROOF_A="$WORK/proof_a.bin"   # PR's proof (cached likewise)
+CPROOF_B="$WORK/cproof_b.bin" # baseline's continuation bundle (cached likewise)
+CPROOF_A="$WORK/cproof_a.bin" # PR's continuation bundle (cached likewise)
 
 ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT"
@@ -74,24 +100,74 @@ SHA_A="$(git rev-parse "$REF_A")"
 SHA_B="$(git rev-parse "$REF_B")"
 echo "   A (PR)       $REF_A  -> ${SHA_A:0:10}"
 echo "   B (baseline) $REF_B  -> ${SHA_B:0:10}"
+# Validate both counts BEFORE any building/proving. Two ways a bad value bites otherwise:
+# under `set -u` a non-numeric one makes the arithmetic below die with a bare
+# "abc: unbound variable", and a value that makes `seq` produce nothing yields a
+# header-only pairs CSV whose ZeroDivisionError only surfaces in the stats step at the
+# very END — after both arms have been measured, so the run fails with nothing to show
+# and CI posts "Run failed" instead of the results it already had.
+for v in N_PAIRS CONT_PAIRS; do
+  if ! [[ "${!v}" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: $v must be a non-negative integer (got '${!v}')." >&2
+    exit 2
+  fi
+done
+if [ "$N_PAIRS" -lt 2 ]; then
+  echo "ERROR: N_PAIRS must be >= 2 (got $N_PAIRS)." >&2
+  exit 2
+fi
+if [ "$CONT_PAIRS" -eq 1 ]; then
+  echo "ERROR: CONT_PAIRS must be 0 (skip the arm) or >= 2 (got $CONT_PAIRS)." >&2
+  exit 2
+fi
+# CONT_EPOCH_LOG2 is the one knob with a hard floor (MIN_CONTINUATION_EPOCH_SIZE_LOG2 in
+# bin/cli/src/main.rs). Catch it here rather than letting clap reject it after two cli
+# builds and the whole monolithic arm, which would then degrade to a bland
+# "continuation prove failed" note that doesn't say why.
+if ! [[ "$CONT_EPOCH_LOG2" =~ ^[0-9]+$ ]] || [ "$CONT_EPOCH_LOG2" -lt 18 ]; then
+  echo "ERROR: CONT_EPOCH_LOG2 must be an integer >= 18 (got '$CONT_EPOCH_LOG2')." >&2
+  exit 2
+fi
+# A warning, not an error: 2..5 pairs is a legitimate quick smoke run, and the monolithic
+# arm already accepts N_PAIRS=2 (the workflow clamps its own input to [2,40]). Just say
+# the verdict can't reach significance so nobody reads BORDERLINE as a real result.
+if [ "$CONT_PAIRS" -ge 2 ] && [ "$CONT_PAIRS" -lt 6 ]; then
+  echo "   WARNING: CONT_PAIRS=$CONT_PAIRS < 6; the exact Wilcoxon's smallest attainable"
+  echo "            two-sided p is 2/2^n, so this arm can only ever report BORDERLINE."
+fi
 if [ $((N_PAIRS % 2)) -ne 0 ]; then
   echo "   WARNING: N_PAIRS=$N_PAIRS is odd; use an even count so AB/BA orders balance."
 fi
-echo "   pairs=$N_PAIRS  (=$((N_PAIRS * 2)) verify runs)"
-
-# The real block's name lives in the Makefile and nowhere else, so repointing the
-# benchmark to a different block never needs an edit here.
+if [ $((CONT_PAIRS % 2)) -ne 0 ]; then
+  echo "   WARNING: CONT_PAIRS=$CONT_PAIRS is odd; use an even count so AB/BA orders balance."
+fi
+# The real block's identity lives in the Makefile and nowhere else, so repointing it
+# never needs an edit here. A real block cannot be proven monolithically (~4.9 GB of peak
+# heap per million cycles puts it in the hundreds of GB), so that arm is skipped outright
+# rather than left to OOM halfway through a rented or shared machine's run.
+RUN_MONO=1
 if [ "$WORKLOAD" = "real" ]; then
   INPUT_REL="$(make -s print-real-block-fixture)"
-  CONT_ARGS="--continuations --epoch-size-log2 $EPOCH_SIZE_LOG2"
-  echo "   workload=real  $INPUT_REL  (continuations, epoch 2^$EPOCH_SIZE_LOG2)"
+  RUN_MONO=0
+  BLOCK_LABEL="ethrex real block $(basename "$INPUT_REL")"
 else
   INPUT_REL="executor/tests/ethrex_bench_20.bin"
-  CONT_ARGS=""
-  echo "   workload=synthetic  $INPUT_REL  (set WORKLOAD=real for a real block)"
+  BLOCK_LABEL="ethrex 20-tx block"
 fi
 
+echo "   workload=$WORKLOAD  $INPUT_REL"
+if [ "$RUN_MONO" = "1" ]; then
+  echo "   pairs=$N_PAIRS  (=$((N_PAIRS * 2)) verify runs)"
+else
+  echo "   monolithic arm SKIPPED (a real block exceeds the monolithic memory ceiling)"
+fi
+echo "   continuation pairs=$CONT_PAIRS  epoch=2^$CONT_EPOCH_LOG2"
+
 mkdir -p "$WORK"
+# Drop any previous run's monolithic report before measuring. It is the CI fallback for a
+# run that dies mid-continuation-arm, so a leftover from an earlier run would be posted as
+# if it belonged to this one.
+rm -f "$WORK/result_mono.txt"
 
 # --- 1. Guest ELF + fixture (identical for both sides; build once if missing) ---
 if [ ! -f "$ELF_REL" ]; then
@@ -101,8 +177,8 @@ if [ ! -f "$ELF_REL" ]; then
 fi
 if [ ! -f "$INPUT_REL" ]; then
   if [ "$WORKLOAD" = "real" ]; then
-    # ~1 MB, gitignored, never in a fresh checkout. Fetched by URL + sha256, not
-    # built: no converter and no ethrex host dependency tree on this path.
+    # ~1 MB, gitignored, never in a fresh checkout. Fetched by URL + sha256, not built:
+    # no converter and no ethrex host dependency tree on this path.
     echo "==> Fetching ethrex real-block fixture (missing)"
     make ethrex-real-block-fixture
   else
@@ -157,65 +233,81 @@ fi
 # per-side proofs (each binary proves and verifies its own). PROVE_PER_SIDE overrides.
 PROVE_PER_SIDE="${PROVE_PER_SIDE:-auto}"
 
-# $CONT_ARGS is empty for the synthetic workload, so both paths below are the
-# original command there. WORKLOAD=real adds --continuations on BOTH prove and
-# verify: a continuation bundle is a different proof type, and `verify` without
-# the flag would try to deserialize it as a monolithic proof and fail.
-VERIFY_ARGS=""
-if [ "$WORKLOAD" = "real" ]; then VERIFY_ARGS="--continuations"; fi
-
-prove_once() {  # $1=binary $2=proof-path
-  # shellcheck disable=SC2086  # CONT_ARGS is a deliberate multi-word flag list
-  if ! "$1" prove "$ELF" --private-input "$INPUT" $CONT_ARGS -o "$2" --time >"$WORK/prove_$(basename "$2").log" 2>&1; then
-    echo "ERROR: prove failed for $1. Tail of log:" >&2
-    tail -20 "$WORK/prove_$(basename "$2").log" >&2
-    exit 1
+# The trailing "$@" on each of these carries the arm's extra flags: empty for the
+# monolithic arm, `--continuations` (plus `--epoch-size-log2` when proving) for the
+# continuation one. Failures RETURN non-zero instead of exiting so the caller decides
+# whether the arm is fatal (monolithic) or skippable (continuations).
+prove_once() {  # $1=binary $2=proof-path $3...=extra prove args
+  local bin="$1" out="$2"; shift 2
+  if ! "$bin" prove "$ELF" --private-input "$INPUT" -o "$out" --time "$@" \
+       >"$WORK/prove_$(basename "$out").log" 2>&1; then
+    echo "ERROR: prove failed for $bin. Tail of log:" >&2
+    tail -20 "$WORK/prove_$(basename "$out").log" >&2
+    return 1
   fi
 }
-verify_time() {  # $1=binary $2=proof-path -> echoes time on success, empty on failure (never exits)
+verify_time() {  # $1=binary $2=proof-path $3...=extra verify args -> time, empty on failure
+  local bin="$1" proof="$2"; shift 2
   local out
-  # shellcheck disable=SC2086
-  out="$("$1" verify "$2" "$ELF" $VERIFY_ARGS --time 2>&1)" || true
+  out="$("$bin" verify "$proof" "$ELF" --time "$@" 2>&1)" || true
   printf '%s\n' "$out" | grep -o 'Verification time: [0-9.]*' | awk '{print $3}' || true
 }
-run_verify() {  # $1=binary $2=proof-path -> echoes verification time (s), exits on failure
+run_verify() {  # $1=binary $2=proof-path $3...=extra verify args -> time (s), 1 on failure
+  local bin="$1" proof="$2"; shift 2
   local t
-  t="$(verify_time "$1" "$2")"
+  t="$(verify_time "$bin" "$proof" "$@")"
   if [ -z "$t" ]; then
-    echo "ERROR: could not parse 'Verification time' from '$1 verify $2':" >&2
-    # shellcheck disable=SC2086
-    "$1" verify "$2" "$ELF" $VERIFY_ARGS --time >&2 2>&1 || true
+    echo "ERROR: could not parse 'Verification time' from '$bin verify $proof $*':" >&2
+    "$bin" verify "$proof" "$ELF" --time "$@" >&2 2>&1 || true
     echo "HINT: if REF_A changes the proof format, run with PROVE_PER_SIDE=1." >&2
-    exit 1
+    return 1
   fi
   echo "$t"
 }
 
 # Both sides prove their own proof (needed for the proof-size row; per-side verify
 # needs both). Proofs are cached in $WORK like the binaries, marker
-# "<sha> <features> <ELF+input hash> <prove flags>". Bytes are non-deterministic
-# (parallel grinding) but size + verify cost are structural, so reusing a cached proof
-# is valid. $CONT_ARGS is in the marker because it changes the proof TYPE, and without
-# it a WORKLOAD switch would silently reuse the other workload's proof; keep adding any
-# future proof-option flag (--blowup, ...) the same way.
+# "<sha> <features> <ELF+input hash>". Bytes are non-deterministic (parallel grinding)
+# but size + verify cost are structural, so reusing a cached proof is valid. Any extra
+# prove flags (--continuations, --epoch-size-log2) go into the marker too; if the call
+# ever gains one that is NOT passed through here (--blowup, ...), add it as well.
 sha256_of() { if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi; }
 PROOF_KEY_INPUT="$(cat "$ELF" "$INPUT" | sha256_of | cut -c1-16)"
-prove_cached() {  # $1=binary $2=proof-path $3=sha
-  local marker="$3 $BENCH_FEATURES $PROOF_KEY_INPUT $CONT_ARGS"
-  if [ "${REBUILD:-0}" != "1" ] && [ -f "$2" ] && [ "$(cat "$2.sha" 2>/dev/null)" = "$marker" ]; then
-    echo "==> Reusing cached proof for ${3:0:10} ($(basename "$2"))"
-  else
-    echo "==> Proving with $(basename "$1") (${3:0:10})"
-    prove_once "$1" "$2"
-    echo "$marker" > "$2.sha"
+prove_cached() {  # $1=binary $2=proof-path $3=sha $4...=extra prove args
+  local bin="$1" out="$2" sha="$3"; shift 3
+  # The extra args are part of the marker: a monolithic and a continuation proof of the
+  # same (ref, features, ELF+input) must never share a cache entry.
+  local marker="$sha $BENCH_FEATURES $PROOF_KEY_INPUT $*"
+  if [ "${REBUILD:-0}" != "1" ] && [ -f "$out" ] && [ "$(cat "$out.sha" 2>/dev/null)" = "$marker" ]; then
+    echo "==> Reusing cached proof for ${sha:0:10} ($(basename "$out"))"
+    return 0
   fi
+  echo "==> Proving with $(basename "$bin") (${sha:0:10}) $*"
+  # Wipe the old sidecar before proving: on failure neither it nor the .sha is rewritten,
+  # so a previous run's count would survive and get printed next to the NEW epoch size —
+  # e.g. change CONT_EPOCH_LOG2, have the prove fail, and the skip note claims the old
+  # epoch count for a bundle that no longer exists.
+  rm -f "$out.epochs"
+  prove_once "$bin" "$out" "$@" || return 1
+  # Persist the epoch count next to the proof rather than parsing the prove log at report
+  # time: on a cache hit the prove is skipped entirely, so that log is stale or gone. The
+  # sidecar is written with the proof and invalidated with it. Continuation proves only —
+  # `cli prove` prints no "Epochs:" line in monolithic mode, so no sidecar appears there.
+  local ep
+  ep="$(awk -F': ' '/^Epochs:/{print $2; exit}' "$WORK/prove_$(basename "$out").log")"
+  # `if` rather than `[ -n "$ep" ] && ...`: a failing &&-list is fatal under `set -e`.
+  if [ -n "$ep" ]; then printf '%s\n' "$ep" > "$out.epochs"; fi
+  echo "$marker" > "$out.sha"
 }
-prove_cached "$WORK/cli_B" "$PROOF_B" "$SHA_B"
-prove_cached "$WORK/cli_A" "$PROOF_A" "$SHA_A"
+SIZE_B=0; SIZE_A=0
+if [ "$RUN_MONO" = "1" ]; then
+  prove_cached "$WORK/cli_B" "$PROOF_B" "$SHA_B" || exit 1
+  prove_cached "$WORK/cli_A" "$PROOF_A" "$SHA_A" || exit 1
 
-# Proof sizes (bytes) for the Proof size row.
-SIZE_B="$(wc -c < "$PROOF_B" | tr -d '[:space:]')"
-SIZE_A="$(wc -c < "$PROOF_A" | tr -d '[:space:]')"
+  # Proof sizes (bytes) for the Proof size row.
+  SIZE_B="$(wc -c < "$PROOF_B" | tr -d '[:space:]')"
+  SIZE_A="$(wc -c < "$PROOF_A" | tr -d '[:space:]')"
+fi
 
 # Decide whether both sides can VERIFY one shared proof (baseline's) — tightest
 # timing precision — or must verify their own. In auto mode, distinguish a real
@@ -223,61 +315,68 @@ SIZE_A="$(wc -c < "$PROOF_A" | tr -d '[:space:]')"
 # baseline proof (a verify regression). Both fall back to per-side, but they mean
 # very different things, so carry the reason into the report — otherwise a real
 # backward-compat break gets silently reclassified as a format change and shown green.
-per_side=0
-per_side_note=""
-case "$PROVE_PER_SIDE" in
-  1) per_side=1; per_side_note="forced via PROVE_PER_SIDE=1" ;;
-  0) per_side=0 ;;
-  *)  # shellcheck disable=SC2086
-      probe="$("$WORK/cli_A" verify "$PROOF_B" "$ELF" $VERIFY_ARGS --time 2>&1 || true)"
-      if printf '%s\n' "$probe" | grep -q 'Verification time'; then
-        per_side=0                                     # PR verifies main's proof -> shared
-      elif printf '%s\n' "$probe" | grep -q 'Failed to deserialize'; then
-        per_side=1
-        per_side_note="PR can't deserialize the baseline's proof — proof-format change"
-        echo "==> $per_side_note; verifying per-side."
-      else
-        per_side=1
-        per_side_note="⚠️ PR REJECTS the baseline's valid proof — likely a VERIFY REGRESSION, not a format change"
-        echo "==> $per_side_note"
-        echo "    verifying per-side, but the Verify-time numbers below are NOT a safe signal."
-      fi ;;
-esac
-
-if [ "$per_side" = "1" ]; then
-  MODE="per-side"
-  echo "==> Per-side verify: each binary verifies its OWN proof."
-  PROOF_FOR_A="$PROOF_A"
-  PROOF_FOR_B="$PROOF_B"
-else
-  MODE="shared"
-  echo "==> Shared verify: both sides verify the baseline's proof (best precision)."
-  PROOF_FOR_A="$PROOF_B"
-  PROOF_FOR_B="$PROOF_B"
-fi
-
-echo "==> Running $N_PAIRS interleaved pairs  (improvement: - = PR faster)"
-printf 'pair,a_time,b_time\n' > "$WORK/pairs.csv"
-for i in $(seq 1 "$N_PAIRS"); do
-  if [ $((i % 2)) -eq 1 ]; then          # odd pair: A then B
-    a="$(run_verify "$WORK/cli_A" "$PROOF_FOR_A")"; b="$(run_verify "$WORK/cli_B" "$PROOF_FOR_B")"
-  else                                   # even pair: B then A (ABBA pattern)
-    b="$(run_verify "$WORK/cli_B" "$PROOF_FOR_B")"; a="$(run_verify "$WORK/cli_A" "$PROOF_FOR_A")"
+# Decided per arm (sets MODE/PER_SIDE_NOTE/PROOF_FOR_A/PROOF_FOR_B): a PR can change the
+# continuation bundle format without touching the monolithic one, or vice versa.
+decide_mode() {  # $1=baseline proof $2=PR proof $3...=extra verify args
+  local pb="$1" pa="$2"; shift 2
+  local per_side=0
+  PER_SIDE_NOTE=""
+  case "$PROVE_PER_SIDE" in
+    1) per_side=1; PER_SIDE_NOTE="forced via PROVE_PER_SIDE=1" ;;
+    0) per_side=0 ;;
+    *)  local probe
+        probe="$("$WORK/cli_A" verify "$pb" "$ELF" --time "$@" 2>&1 || true)"
+        if printf '%s\n' "$probe" | grep -q 'Verification time'; then
+          per_side=0                                   # PR verifies main's proof -> shared
+        elif printf '%s\n' "$probe" | grep -q 'Failed to deserialize'; then
+          per_side=1
+          PER_SIDE_NOTE="PR can't deserialize the baseline's proof — proof-format change"
+          echo "==> $PER_SIDE_NOTE; verifying per-side."
+        else
+          per_side=1
+          PER_SIDE_NOTE="⚠️ PR REJECTS the baseline's valid proof — likely a VERIFY REGRESSION, not a format change"
+          echo "==> $PER_SIDE_NOTE"
+          echo "    verifying per-side, but the Verify-time numbers below are NOT a safe signal."
+        fi ;;
+  esac
+  if [ "$per_side" = "1" ]; then
+    MODE="per-side"
+    echo "==> Per-side verify: each binary verifies its OWN proof."
+    PROOF_FOR_A="$pa"
+    PROOF_FOR_B="$pb"
+  else
+    MODE="shared"
+    echo "==> Shared verify: both sides verify the baseline's proof (best precision)."
+    PROOF_FOR_A="$pb"
+    PROOF_FOR_B="$pb"
   fi
-  printf '%d,%s,%s\n' "$i" "$a" "$b" >> "$WORK/pairs.csv"
-  printf '   pair %2d/%d   A=%ss  B=%ss   PR %+.2f%% (-=faster)\n' \
-    "$i" "$N_PAIRS" "$a" "$b" "$(awk "BEGIN{print ($a-$b)/$b*100}")"
-done
-# Proofs are kept in $WORK as a cache (invalidated by their .sha markers), not deleted.
+}
+
+run_abba() {  # $1=pairs $2=csv $3...=extra verify args
+  local pairs="$1" csv="$2"; shift 2
+  local i a b
+  echo "==> Running $pairs interleaved pairs  (improvement: - = PR faster)"
+  printf 'pair,a_time,b_time\n' > "$csv"
+  for i in $(seq 1 "$pairs"); do
+    if [ $((i % 2)) -eq 1 ]; then          # odd pair: A then B
+      a="$(run_verify "$WORK/cli_A" "$PROOF_FOR_A" "$@")" || return 1
+      b="$(run_verify "$WORK/cli_B" "$PROOF_FOR_B" "$@")" || return 1
+    else                                   # even pair: B then A (ABBA pattern)
+      b="$(run_verify "$WORK/cli_B" "$PROOF_FOR_B" "$@")" || return 1
+      a="$(run_verify "$WORK/cli_A" "$PROOF_FOR_A" "$@")" || return 1
+    fi
+    printf '%d,%s,%s\n' "$i" "$a" "$b" >> "$csv"
+    printf '   pair %2d/%d   A=%ss  B=%ss   PR %+.2f%% (-=faster)\n' \
+      "$i" "$pairs" "$a" "$b" "$(awk "BEGIN{print ($a-$b)/$b*100}")"
+  done
+}
 
 # --- 4. Paired t-test + robust median/Wilcoxon (same stats as bench_abba.sh) ---
-if [ "$WORKLOAD" = "real" ]; then
-  WORKLOAD_LABEL="real block \`$(basename "$INPUT_REL")\` · continuations · epoch 2^$EPOCH_SIZE_LOG2"
-else
-  WORKLOAD_LABEL="synthetic ethrex 20 transfers (set WORKLOAD=real for a real block)"
-fi
-SIZE_A="$SIZE_A" SIZE_B="$SIZE_B" MODE="$MODE" PER_SIDE_NOTE="$per_side_note" \
-WORKLOAD_LABEL="$WORKLOAD_LABEL" python3 - "$WORK/pairs.csv" <<'PY'
+# Both arms are reported AFTER all measuring is done: bench-verify.yml extracts the PR
+# comment with `sed -n '/<!-- verify-abba-report -->/,$p'`, so anything printed between
+# the two tables (per-pair progress) would land in the comment.
+print_stats() {  # $1=csv $2=title $3=size_a $4=size_b $5=mode $6=note
+  TITLE="$2" SIZE_A="$3" SIZE_B="$4" MODE="$5" PER_SIDE_NOTE="$6" python3 - "$1" <<'PY'
 import sys, csv, math, os
 
 rows = list(csv.DictReader(open(sys.argv[1])))
@@ -364,10 +463,7 @@ icon = "🟢" if (hi < 0 and p < 0.05) else "🔴" if (lo > 0 and p < 0.05) else
 mode = os.environ.get('MODE', 'shared')
 per_side_note = os.environ.get('PER_SIDE_NOTE', '')
 
-print("\n=== Verify ABBA result ===")
-# A verify time is only interpretable against the block that produced the proof,
-# and these results get pasted into PRs, so the workload travels with the number.
-print(f"<sub>Workload: {os.environ.get('WORKLOAD_LABEL', 'unknown')}</sub>")
+print(f"\n#### {os.environ.get('TITLE', '')}")
 print()
 
 # Proof size row: exact (the .bin byte size), no ABBA. - = PR smaller = better.
@@ -377,12 +473,15 @@ size_impr = (size_a - size_b) / size_b * 100.0 if size_b else 0.0
 size_icon = "🟢" if size_impr < -0.005 else "🔴" if size_impr > 0.005 else "⚪"
 to_mib = lambda b: b / (1024.0 * 1024.0)
 
-# In per-side mode A and B verify different proofs, so label the metric (M2).
-vt_label = "Verify time (per-side)" if mode == "per-side" else "Verify time"
+# Say per row how it was measured. Only the timing row is ABBA; the byte size is one
+# exact reading per side. Without this the reader applies the ABBA/statistics framing to
+# every number in the comment, including the ones it does not describe.
+# In per-side mode A and B verify different proofs, so label that too (M2).
+vt_qual = f"ABBA, {n} pairs, per-side" if mode == "per-side" else f"ABBA, {n} pairs"
 print("| Metric | main | PR | Δ |")
 print("|--------|------|----|---|")
-print(f"| **{vt_label}** | {mB:.3f}s | {mA:.3f}s | {sign(mean)}% {icon} |")
-print(f"| **Proof size** | {to_mib(size_b):.2f} MiB | {to_mib(size_a):.2f} MiB | {sign(size_impr)}% {size_icon} |")
+print(f"| **Verify time** ({vt_qual}) | {mB:.3f}s | {mA:.3f}s | {sign(mean)}% {icon} |")
+print(f"| **Proof size** (exact, 1 reading) | {to_mib(size_b):.2f} MiB | {to_mib(size_a):.2f} MiB | {sign(size_impr)}% {size_icon} |")
 
 # Surface why per-side kicked in (format change vs possible regression) so a green
 # table can't silently hide a backward-compat verify break (M1/M2).
@@ -410,3 +509,96 @@ elif (hi < 0) != (p < 0.05):
 else:
     print(f"\n> ⚪ **INCONCLUSIVE** — effect not separable from 0 at n={n} (point estimate ~{med:+.2f}%). Add pairs to resolve.")
 PY
+}
+
+MONO_SKIP=""
+if [ "$RUN_MONO" = "1" ]; then
+  decide_mode "$PROOF_B" "$PROOF_A"
+  run_abba "$N_PAIRS" "$WORK/pairs.csv" || exit 1
+  MONO_MODE="$MODE"
+  MONO_NOTE="$PER_SIDE_NOTE"
+else
+  MONO_SKIP="not run: a real block exceeds the monolithic memory ceiling, so only the continuation arm below applies"
+fi
+# Render the monolithic report NOW, not at the end with the continuation one. Both are
+# still emitted together at the end (the extractor needs them contiguous after the
+# anchor), but computing this one here means it also survives the run dying during the
+# continuation arm. The best-effort CONT_SKIP path only covers a clean non-zero exit; a
+# step timeout or an OOM kill takes the whole process down, and CI would then post
+# "Run failed" and throw away a monolithic verdict it had already measured. bench-verify.yml
+# falls back to this file in that case.
+MONO_TITLE="$BLOCK_LABEL · monolithic · blowup=2, 219 queries"
+if [ -n "$MONO_SKIP" ]; then
+  MONO_REPORT="$(printf '#### %s\n\n_(Monolithic arm %s.)_\n' "$MONO_TITLE" "$MONO_SKIP")"
+else
+  MONO_REPORT="$(print_stats "$WORK/pairs.csv" "$MONO_TITLE" \
+    "$SIZE_A" "$SIZE_B" "$MONO_MODE" "$MONO_NOTE")"
+fi
+printf '%s\n' "$MONO_REPORT" > "$WORK/result_mono.txt"
+
+# --- 3b. Same measurement over a CONTINUATION bundle of the same block ---------
+# Best-effort: this is the memory-hungry arm (the whole bundle is materialised to
+# serialize it), so any failure here degrades to a note in the report instead of
+# sinking the monolithic verdict above.
+CONT_SKIP=""
+CONT_ARGS=(--continuations --epoch-size-log2 "$CONT_EPOCH_LOG2")
+if [ "$CONT_PAIRS" -eq 0 ]; then
+  CONT_SKIP="skipped (CONT_PAIRS=0)"
+elif ! prove_cached "$WORK/cli_B" "$CPROOF_B" "$SHA_B" "${CONT_ARGS[@]}"; then
+  CONT_SKIP="baseline continuation prove failed"
+elif ! prove_cached "$WORK/cli_A" "$CPROOF_A" "$SHA_A" "${CONT_ARGS[@]}"; then
+  CONT_SKIP="PR continuation prove failed"
+else
+  CSIZE_B="$(wc -c < "$CPROOF_B" | tr -d '[:space:]')"
+  CSIZE_A="$(wc -c < "$CPROOF_A" | tr -d '[:space:]')"
+  decide_mode "$CPROOF_B" "$CPROOF_A" --continuations
+  CONT_MODE="$MODE"
+  CONT_NOTE="$PER_SIDE_NOTE"
+  if ! run_abba "$CONT_PAIRS" "$WORK/pairs_cont.csv" --continuations; then
+    CONT_SKIP="continuation verify failed mid-run"
+  fi
+fi
+if [ -n "$CONT_SKIP" ]; then
+  echo "==> Continuation arm $CONT_SKIP"
+fi
+# Proofs are kept in $WORK as a cache (invalidated by their .sha markers), not deleted.
+
+
+echo
+# Machine anchor for bench-verify.yml's extractor; an HTML comment so it doesn't render
+# in the PR comment (the arm headings below are the human entry point).
+echo "<!-- verify-abba-report -->"
+# Arm titles follow the same `workload · mode · params` shape as the recursion cycle
+# regimes (bench_recursion_cycles.sh), so every table in the PR comment says what it
+# proved and how, and no two arms can be confused for each other.
+# Epoch COUNT alongside the epoch SIZE: the size alone doesn't tell you the bundle shape,
+# and the count is what drives verify cost and bundle size. Read from the sidecars written
+# at prove time. Show both sides when they disagree — a PR that changes epoch splitting is
+# exactly the kind of thing this arm should surface, not average away. Falls back to no
+# parenthetical if either side is unknown (e.g. an older cached proof with no sidecar),
+# because a wrong count is worse than a missing one. Only consulted when the arm actually
+# ran: with CONT_PAIRS=0 nothing validates a bundle this run, so a sidecar left in the
+# long-lived $WORK by an earlier run would otherwise be reported as this run's count.
+epochs_of() { local f="$1.epochs"; [ -s "$f" ] && head -1 "$f" | tr -d '[:space:]' || true; }
+CONT_EPOCHS=""
+if [ -z "$CONT_SKIP" ]; then
+  EPO_A="$(epochs_of "$CPROOF_A")"; EPO_B="$(epochs_of "$CPROOF_B")"
+  if [ -n "$EPO_A" ] && [ -n "$EPO_B" ]; then
+    if [ "$EPO_A" = "$EPO_B" ]; then
+      CONT_EPOCHS=" ($EPO_A epochs)"
+    else
+      CONT_EPOCHS=" (main $EPO_B / PR $EPO_A epochs)"
+    fi
+  fi
+fi
+CONT_TITLE="$BLOCK_LABEL · continuations, epoch 2^$CONT_EPOCH_LOG2$CONT_EPOCHS · blowup=2, 219 queries"
+printf '%s\n' "$MONO_REPORT"
+if [ -n "$CONT_SKIP" ]; then
+  echo
+  echo "#### $CONT_TITLE"
+  echo
+  echo "_(Continuation arm $CONT_SKIP — see the workflow log. Does not affect the monolithic verdict above.)_"
+else
+  print_stats "$WORK/pairs_cont.csv" "$CONT_TITLE" \
+    "$CSIZE_A" "$CSIZE_B" "$CONT_MODE" "$CONT_NOTE"
+fi
