@@ -39,7 +39,9 @@ use super::compiler::compile;
 use super::constraint_tests::{deep_shape, open_sub_proof, real_fixture};
 use super::executor::execute;
 use super::hash::TestPermutation;
-use super::sub_proof::{GroupShape, ROWS_PER_LEAF, SubProofShape, emit_sub_proof};
+use super::sub_proof::{
+    GroupShape, ROWS_PER_LEAF, SubProofShape, emit_sub_proof, emit_sub_proof_with_bits,
+};
 use super::validator::validate;
 use super::word::{LfmWord, base_word, ext_word, word_as_ext};
 
@@ -1557,4 +1559,126 @@ fn the_precomputed_group_comes_first_and_that_is_checkable() {
          checked queries",
         queries.len()
     );
+}
+
+/// ⚠ The FRI leg's instrument problem, pinned: the proof fixture carries ZERO
+/// committed FRI layers, so a differential over it cannot see the fold loop,
+/// the per-layer walks, or the terminal check.
+///
+/// `FriFoldLayout::new(lde_log, blowup_log, k)` sets
+/// `terminal_log = min(blowup_log + k, lde_log)` and
+/// `num_committed = (lde_log - terminal_log) - 1`. The fixture is the `min`
+/// preset — blowup 2 (`blowup_log = 1`), `fri_final_poly_log_degree = 7` — over
+/// an epoch of 2^4 steps, so its sub-proof has `log2(lde) = 3` and
+/// `terminal_log = min(8, 3) = 3`: no folds at all, and `query_phase` returns
+/// the empty-decommitment branch.
+///
+/// This is the degenerate-parameter rule in its most extreme form. Not "one
+/// value hides a difference between two implementations" but "the production
+/// instance exercises none of the mechanism", which no amount of care with the
+/// real data can repair. The FRI leg's primary instrument must therefore be
+/// SYNTHETIC codewords driven through production's own commit and query phases,
+/// with the layer count swept; this test exists so that the day the fixture
+/// grows and starts folding, the change is announced rather than silently
+/// altering what every FRI test covers.
+///
+/// The zero-layer case is not merely an artifact to route around, either — it
+/// is a real production path (small tables fold no further than their terminal)
+/// and the emitted verifier has to handle it.
+#[test]
+fn the_fixture_carries_no_fri_layers_so_it_cannot_witness_the_fold() {
+    let (_air, proof) = real_fixture();
+    assert_eq!(
+        proof.proofs.len(),
+        1,
+        "the join fixture is a single sub-proof"
+    );
+    let p = &proof.proofs[0];
+    println!(
+        "fixture sub-proof: fri_layers_merkle_roots = {}, fri_final_poly_coeffs = {}, \
+         query decommitments = {}",
+        p.fri_layers_merkle_roots.len(),
+        p.fri_final_poly_coeffs.len(),
+        p.deep_poly_openings.len(),
+    );
+    assert_eq!(
+        p.fri_layers_merkle_roots.len(),
+        0,
+        "the fixture is expected to carry no committed FRI layers; if it now \
+         folds, the FRI leg's coverage story changed and its synthetic sweep \
+         should be re-justified against what the real proof now exercises"
+    );
+    // The coefficient count is `2^effective_k` with
+    // `effective_k = terminal_log - blowup_log = 3 - 1`. Checking it is what
+    // says the layout arithmetic above is read correctly rather than merely
+    // asserted: a wrong reading of `FriFoldLayout` would land on a different
+    // power of two here.
+    assert_eq!(
+        p.fri_final_poly_coeffs.len(),
+        4,
+        "terminal codeword encodes a degree-<2^2 polynomial at this shape"
+    );
+}
+
+/// ★ The bits handed to a later leg are the cells the WALK ITSELF consumed.
+///
+/// The FRI leg reuses a query's index per layer (leaf position `index >> 1`,
+/// partner `index ^ 1`, halving each layer). Were it to decompose its own copy
+/// it would authenticate at one index and fold at another — the gap this module
+/// closes, reopened one level up.
+///
+/// ## Why this is not the obvious test
+///
+/// The obvious test compares the program `emit_sub_proof` emits against the one
+/// `emit_sub_proof_with_bits` emits and asserts they are identical. That test is
+/// VACUOUS and I wrote it before catching it: `emit_sub_proof` is implemented by
+/// delegating to `emit_sub_proof_with_bits`, so the two sides are the same
+/// program by construction and any defect lands on both and cancels. Injecting a
+/// second `bit_dec` — the precise failure this is meant to deny — left it green.
+///
+/// What discriminates is an ABSOLUTE property rather than a relative one: every
+/// returned bit must be consumed by a `Select`. The walk selects sibling order
+/// on each bit and `pow_bits` selects the point factors on the same bits, so a
+/// bit the emitter actually used is necessarily read by one. A freshly
+/// decomposed second copy would be read by nothing.
+#[test]
+fn the_exposed_bits_are_the_cells_the_walk_consumed() {
+    let h = host_sub_proof();
+    const QUERIES: usize = 3;
+
+    let mut b = LfmBuilder::new();
+    let (_, out) = emit_sub_proof_with_bits(&mut b, &h.shape, QUERIES);
+    let src = b.finish();
+    assert_eq!(out.len(), QUERIES);
+
+    // Every address any Select reads as its selector.
+    let selector_bits: std::collections::HashSet<u64> = src
+        .instrs
+        .iter()
+        .filter_map(|i| match i {
+            super::instr::Instr::Select { bit, .. } => Some(bit.0),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !selector_bits.is_empty(),
+        "the walk and the point derivation both select on bits; an empty set \
+         means this test is looking at the wrong instruction"
+    );
+
+    for (q, output) in out.iter().enumerate() {
+        assert_eq!(
+            output.bits.len(),
+            h.shape.merkle_depth,
+            "query {q}: one bit per Merkle level"
+        );
+        for (level, bit) in output.bits.iter().enumerate() {
+            assert!(
+                selector_bits.contains(&bit.0.0),
+                "query {q} level {level}: the returned bit is read by no Select, \
+                 so it is not a cell the walk or the point derivation used — a \
+                 second decomposition of the index has been handed out"
+            );
+        }
+    }
 }
