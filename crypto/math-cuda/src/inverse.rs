@@ -97,8 +97,11 @@ const fn ext3_fermat_exponent() -> [u64; 3] {
 ///
 /// Unlike the host Fermat this used to call, a zero total maps silently to
 /// zero instead of `Err`. Unreachable with honest inputs (LogUp/barycentric
-/// denominators are nonzero w.h.p.); callers must not rely on a zero-total
-/// error.
+/// denominators are nonzero w.h.p. under random Fiat-Shamir challenges);
+/// callers must not rely on a zero-total error. Debug builds add a D2H+sync
+/// invertibility guard (see below) that panics on a zero total so a
+/// construction/kernel bug fails loudly in tests; release elides it to keep
+/// the batch inverse fully stream-ordered (no per-batch host round-trip).
 fn launch_invert_total(
     stream: &Arc<CudaStream>,
     be: &crate::device::Backend,
@@ -124,6 +127,23 @@ fn launch_invert_total(
             .arg(&mut *out)
             .launch(cfg)?;
     }
+    // Debug-only invertibility guard. The Fermat kernel maps a zero total
+    // (some denominator was zero) silently to zero, so the batch would ship
+    // all-zero "inverses" instead of erroring. A valid inverse is never zero,
+    // so `out == 0` unambiguously flags a zero total. Gated off release: the
+    // D2H+sync would reintroduce the per-batch host block this path exists to
+    // avoid, and a zero total is unreachable with honest inputs — a hit here
+    // is a construction or kernel bug, which tests/CI are the place to catch.
+    #[cfg(debug_assertions)]
+    {
+        let mut host = [0u64; 3];
+        stream.memcpy_dtoh(&out.slice(0..3), &mut host)?;
+        stream.synchronize()?;
+        assert_ne!(
+            host, [0u64; 3],
+            "batch inverse: zero total has no inverse (a denominator was zero)"
+        );
+    }
     Ok(())
 }
 
@@ -138,8 +158,6 @@ pub fn batch_inverse_ext3_dev(
     n: usize,
     stream: &Arc<CudaStream>,
 ) -> Result<CudaSlice<u64>> {
-    #[cfg(feature = "test-faults")]
-    check_inverse_fault_injection()?;
     assert!(n >= 1, "batch_inverse_ext3_dev requires n >= 1");
     // Runtime guard (not debug_assert): a u32 grid_dim is truncated past
     // u32::MAX / BLOCK_SIZE, which would silently launch too few blocks
@@ -227,6 +245,12 @@ pub fn compute_and_invert_denoms_ext3_dev(
     sign: DenomSign,
     stream: &Arc<CudaStream>,
 ) -> Result<CudaSlice<u64>> {
+    // Fault-injection hook lives here (not in the shared `batch_inverse_ext3_dev`)
+    // so `schedule_inverse_fault(N)` targets exactly the Nth R3/R4 denominator
+    // inversion the fallback test exercises — not the LogUp aux inverses that
+    // also route through `batch_inverse_ext3_dev` earlier in the prove.
+    #[cfg(feature = "test-faults")]
+    check_inverse_fault_injection()?;
     assert_eq!(z_scalars_host.len(), k_scalars * 3);
     assert!(n >= 1 && k_scalars >= 1);
 
