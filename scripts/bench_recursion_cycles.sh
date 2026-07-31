@@ -129,8 +129,15 @@
 # executor: the guest's new ecalls ran, no table existed to prove them, and
 # `verify_continuation` returned None — surfacing as the PR's `continuation bundle must
 # verify on host before dumping` on a PR whose own binary verifies that bundle fine. Hence
-# `${HOST_TARGET_DIR}_<sha8>` too. Cost: one cold host build per ref (~35 s on the bench
-# runner), still warm across presets and across runs for the same ref.
+# `${HOST_TARGET_DIR}_<sha8>` too. Cost: one cold host build per ref — measured on the bench
+# runner at ~25 s for the prover test harness plus ~10 s for the CLI, so ~35 s — still warm
+# across presets and across runs for the same ref.
+#
+# In CI the reuse precondition is stronger than "the worktree exists": `git -C "$wt"
+# checkout -f` FAILS there, because actions/checkout rebuilds $ROOT/.git every job and
+# orphans the worktree registrations (`fatal: not a git repository: .../worktrees/wt_<sha8>`
+# in the logs). The failure is swallowed, so a reused worktree is never refreshed and its
+# file mtimes stay as old as its first checkout.
 #
 set -euo pipefail
 
@@ -258,8 +265,27 @@ for retired in "$WORK/shared_guest_target" "$WORK/shared_host_target"; do
   if [ -f "$retired/CACHEDIR.TAG" ]; then
     echo "==> Removing retired shared target dir $retired" >&2
     rm -rf "$retired"
+    # Host-only flag: a guest build produces ELFs inside its worktree, not cached copies,
+    # and it failed LOUDLY when it mixed refs — nothing of unknown provenance survives it.
+    case "$retired" in */shared_host_target) retired_host=1 ;; esac
   fi
 done
+
+# Dropping the retired host dir is not enough: everything a build INSIDE it produced was
+# copied out and is cached under a name the sweep above does not touch, and each cache is
+# reused on presence alone — `[ -x ]` for the measuring CLI, `[ -s ]` for the blob. A
+# measuring CLI or an input blob that a skipped build handed over from the other ref would
+# therefore survive the fix and keep feeding one more comparison. Their provenance is not
+# checkable after the fact, so retire them with the dir that could have produced them: the
+# cost is re-proving each ref's blob once (~50 s) and rebuilding its CLI (~10 s), against
+# an advisory number measured on the wrong binary. This is a ONE-TIME branch — steady
+# state keeps every cache, and the per-ref dirs mean no later build can poison one.
+if [ "${retired_host:-0}" = 1 ]; then
+  echo "==> Retiring artifacts copied out of the shared host dir (CLIs, blobs, results)" >&2
+  rm -f "$WORK"/measure_cli_* "$WORK"/build_cli_*.log \
+        "$WORK"/blob_*.bin "$WORK"/blob_*.bin.epochs "$WORK"/result_*.txt \
+        "$WORK"/dump_*.log
+fi
 
 echo "==> Refs"
 git fetch origin --quiet || echo "WARNING: 'git fetch origin' failed — resolving against possibly-stale local refs." >&2

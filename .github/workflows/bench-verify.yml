@@ -38,9 +38,9 @@ jobs:
     runs-on: [self-hosted, bench]
     # Job cap. On a cold runner the recursion BUILDS dominate: per ref a guest build, a
     # prover-test build, and a measuring-CLI build (the CLI is built FROM each ref so it
-    # understands that ref's own guest syscalls). Cached in /tmp; build-std is per ref and
-    # the host cargo target is shared across ref worktrees (see the recursion step's env),
-    # so the second ref's native builds mostly reuse the first ref's compiled deps.
+    # understands that ref's own guest syscalls). Cached in /tmp; build-std and the host
+    # cargo target are both per ref (see the recursion step's env), so a ref's second and
+    # later presets reuse its own compiled deps — but the two refs never share a dir.
     # 125 rather than 90 to absorb the continuation arms: a 20-tx continuation prove per
     # ref on each side of the verifier bench, plus a 20-tx (was 4-tx) block for the cycle
     # comparison. Keep this ABOVE the sum of the step caps below (50 + 70 = 120) so a
