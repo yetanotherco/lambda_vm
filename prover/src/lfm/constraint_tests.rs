@@ -1081,9 +1081,11 @@ impl RealSubProof {
     }
 
     fn uniform_arena(&self) -> Vec<LfmWord> {
+        // `alpha_powers` are DERIVED in-machine from `rap_challenges[ALPHA]`
+        // (`constraints::emit_alpha_powers`), so they are deliberately absent
+        // here — a hinted power is a claim about alpha that nothing checks.
         self.rap_challenges
             .iter()
-            .chain(&self.alpha_powers)
             .chain([&self.contribution, &self.zeta, &self.beta])
             .map(ext_word)
             .collect()
@@ -1113,7 +1115,9 @@ fn composition_program_source(sp: &RealSubProof) -> super::builder::LfmProgramSo
     let frame_arena = b.declare_arena(ood_frame_words(&sp.artifact));
     let (steps, _) = hint_ood_frame(&mut b, &sp.artifact, frame_arena, 0);
 
-    let num_uniforms = (sp.rap_challenges.len() + sp.alpha_powers.len() + 3) as u32;
+    // The alpha POWERS are no longer hinted: they are derived from the one
+    // alpha challenge, so the uniform arena is that much shorter.
+    let num_uniforms = (sp.rap_challenges.len() + 3) as u32;
     let uniform_arena = b.declare_arena(num_uniforms);
     let mut next = 0u32;
     let mut take = |b: &mut LfmBuilder| {
@@ -1122,7 +1126,11 @@ fn composition_program_source(sp: &RealSubProof) -> super::builder::LfmProgramSo
         c
     };
     let rap_challenges: Vec<_> = (0..sp.rap_challenges.len()).map(|_| take(&mut b)).collect();
-    let alpha_powers: Vec<_> = (0..sp.alpha_powers.len()).map(|_| take(&mut b)).collect();
+    let alpha_powers = super::constraints::emit_alpha_powers(
+        &mut b,
+        rap_challenges[stark::lookup::LOGUP_CHALLENGE_ALPHA],
+        sp.alpha_powers.len(),
+    );
     // `L`, undivided. The per-row offset is DERIVED from it so the constraint
     // leg and the LogUp closure consume one cell rather than two independently
     // hinted ones (`constraints::emit_table_offset`).
