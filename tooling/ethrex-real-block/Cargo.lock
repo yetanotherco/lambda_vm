@@ -1080,6 +1080,7 @@ dependencies = [
  "ethrex-common",
  "ethrex-config",
  "ethrex-guest-program",
+ "k256",
  "lambda-vm-ethrex-crypto",
  "rkyv",
  "serde",
