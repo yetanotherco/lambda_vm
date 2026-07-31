@@ -4,9 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-# embedded-alloc TLSF heap: the original default guest allocator, now behind
-# `tlsf-alloc`. Optional, so the default build (bump) doesn't compile it.
-embedded-alloc = { version = "0.6", optional = true }
 riscv = { version = "0.15", features = ["critical-section-single-hart"] }
 thiserror = "1.0"
 getrandom = { version = "0.3.4", default-features = false }
@@ -21,12 +18,10 @@ dlmalloc = { version = "0.2.14", default-features = false, optional = true }
 critical-section = { version = "1.2", optional = true }
 
 [features]
-# Guest allocator overrides. Default (neither flag) is the bump allocator; see
-# `src/allocator.rs` for the measurements behind that choice.
-# dlmalloc: reclaims freed memory, so pick it for continuations.
+# Guest allocator override. The default (no flag) is the bump allocator; see
+# `src/allocator.rs` for the measurements behind that choice. Select dlmalloc when the
+# execution's cumulative allocation isn't bounded per block.
 dlmalloc-alloc = ["dep:dlmalloc", "dep:critical-section"]
-# TLSF: the original default, kept as a fallback. Wins over `dlmalloc-alloc` if both set.
-tlsf-alloc = ["dep:embedded-alloc"]
 
 [dev-dependencies]
 keccak = "0.1"

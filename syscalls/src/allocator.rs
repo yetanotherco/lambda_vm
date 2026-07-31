@@ -4,29 +4,29 @@ const MAX_MEMORY_SIZE: usize = 0xC000_0000;
 const WORD_SIZE: usize = 4;
 
 // Guest global allocator, selectable at build time. The default was chosen on a measured
-// three-way A/B (ethrex blocks of 1..1500 transfers, both 1-to-1 and distinct-account
-// fixtures; guest cycles, trace elements, proving time and peak RSS):
+// three-way A/B against embedded-alloc's TLSF heap (the previous default, now removed) over
+// ethrex blocks of 1..1500 transfers plus a real Hoodi block, monolithic and with
+// continuations, on cycles, trace elements, proving time, proof size and peak RSS:
 //
-//   - default: a monotonic bump allocator. No free lists and no coalescing -- `alloc`
-//     moves a cursor, `dealloc` is empty -- so it spends the fewest guest instructions
-//     per allocation of the three. Against dlmalloc that measured ~9% fewer guest
-//     cycles, ~8% fewer main-trace elements, ~6% faster proving and ~8% lower peak RSS,
-//     flat across every block size tried. It never reuses a freed region, so its
-//     footprint grows monotonically -- see the ceiling note below.
-//   - `dlmalloc-alloc` feature: Doug Lea's malloc on a bump "system" provider that hands
-//     it page-aligned segments. Its footprint is bounded by live bytes instead of total
-//     bytes ever allocated, which makes it the only one of the three safe under
-//     unbounded churn -- use it for continuations, where one execution spans many blocks
-//     and bump's growth has no bound.
-//   - `tlsf-alloc` feature: embedded-alloc's TLSF heap. The original default, and the
-//     slowest of the three (bump proved ~11% faster, dlmalloc ~6%). Kept as a fallback.
+//   - default: a monotonic bump allocator. No free lists and no coalescing -- `alloc` moves
+//     a cursor, `dealloc` is empty -- so it spends the fewest guest instructions per
+//     allocation. It never came out behind on any deterministic metric on any workload:
+//     ~9% fewer guest cycles than dlmalloc on transfer blocks, ~3% on the real Hoodi block
+//     (where keccak and trie work dominate and the allocator's share dilutes), ~11% faster
+//     than TLSF to prove. It never reuses a freed region, so its footprint grows
+//     monotonically -- see the ceiling note below.
+//   - `dlmalloc-alloc` feature: Doug Lea's malloc on a bump "system" provider that hands it
+//     page-aligned segments. Slower than bump everywhere measured, but its footprint is
+//     bounded by live bytes rather than total bytes ever allocated, so it is the allocator
+//     to select for an execution whose churn has no per-block bound.
 //
-// Bump's ceiling: the guest heap is [_end, MAX_MEMORY_SIZE), about 3 GiB, and a block's
-// allocation is bounded by its gas. A gas-full block of the cheapest transactions (1500
-// transfers, 31.5M gas, 523M cycles) executes without exhausting it, and any other
-// composition fits fewer transactions into the same gas. Contract-heavy blocks allocate
-// more per transaction and are not covered by that bound; if one ever exhausts the heap,
-// `dlmalloc-alloc` is a one-flag fallback.
+// Bump's ceiling is cumulative allocation, measured at ~3 GiB -- the size of
+// [_end, MAX_MEMORY_SIZE). A single block cannot reach it: allocation is bounded by gas, and
+// a gas-full block of the cheapest transactions (1500 transfers, 31.5M gas, 523M cycles)
+// executes with room to spare. A guest program that processes many blocks in one execution
+// has no such bound, which is what `dlmalloc-alloc` is for. Note that exhausting the heap
+// does not abort cleanly today -- execution spins rather than failing -- so the fallback
+// matters.
 //
 // Only the guest installs a #[global_allocator]; on host (e.g. `cargo test` for the
 // sponge's differential tests) the attribute would hijack the test harness's
@@ -34,7 +34,7 @@ const WORD_SIZE: usize = 4;
 
 // Off riscv only `init` is reachable (no `#[global_allocator]` is installed and
 // `sys_alloc_aligned` goes through `std::alloc`), so the plumbing is dead there.
-#[cfg(not(any(feature = "tlsf-alloc", feature = "dlmalloc-alloc")))]
+#[cfg(not(feature = "dlmalloc-alloc"))]
 #[cfg_attr(not(target_arch = "riscv64"), allow(dead_code))]
 mod imp {
     use core::alloc::{GlobalAlloc, Layout};
@@ -185,7 +185,7 @@ mod imp {
     }
 }
 
-#[cfg(all(feature = "dlmalloc-alloc", not(feature = "tlsf-alloc")))]
+#[cfg(feature = "dlmalloc-alloc")]
 #[cfg_attr(not(target_arch = "riscv64"), allow(dead_code))]
 mod imp {
     use core::alloc::{GlobalAlloc, Layout};
@@ -271,7 +271,7 @@ mod imp {
 
     // Dlmalloc is Send but !Sync, so it can't sit in a static directly. A single-hart
     // critical section serializes access and supplies the Sync a #[global_allocator]
-    // static requires — the same primitive embedded-alloc's TLSF heap uses.
+    // static requires. Its single-hart implementation comes from the `riscv` crate.
     static DLMALLOC: Mutex<RefCell<Dlmalloc<BumpSystem>>> =
         Mutex::new(RefCell::new(Dlmalloc::new_with_allocator(BumpSystem)));
 
@@ -487,18 +487,6 @@ mod imp {
                 unsafe { dl.free(p, align * 3, align) };
             }
         }
-    }
-}
-
-#[cfg(feature = "tlsf-alloc")]
-mod imp {
-    use embedded_alloc::TlsfHeap as Heap;
-
-    #[cfg_attr(target_arch = "riscv64", global_allocator)]
-    static HEAP: Heap = Heap::empty();
-
-    pub fn init(heap_start: usize, heap_end: usize) {
-        unsafe { HEAP.init(heap_start, heap_end - heap_start) }
     }
 }
 

@@ -134,13 +134,10 @@ jobs:
       - name: Run syscalls host tests (allocator + keccak differential vs sha3)
         run: make test-syscalls
 
-      # The two non-default guest allocators are selected by feature, so nothing else in
-      # CI compiles them and they can rot silently. Their tests run here too.
-      - name: Test the non-default guest allocators
-        run: |
-          cd syscalls
-          cargo test --features dlmalloc-alloc
-          cargo test --features tlsf-alloc
+      # The dlmalloc fallback is feature-selected, so nothing else in CI compiles it and it
+      # can rot silently. Its tests run here too.
+      - name: Test the dlmalloc guest allocator fallback
+        run: cd syscalls && cargo test --features dlmalloc-alloc
 
   # "Test" is a required check — keep this name to avoid branch protection changes.
   # This gate job passes only when CLI, executor, disk-spill, and prover tests succeed.
