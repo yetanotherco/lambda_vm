@@ -481,6 +481,13 @@ impl ArchivedContinuationProof {
         self.epochs[i].l2g_root
     }
 
+    /// Epoch `i`'s final register file `R_{i+1}`, the vector
+    /// [`build_epoch_airs`] preprocesses as FINI and the chaining loop carries
+    /// forward as epoch `i+1`'s INIT.
+    pub(crate) fn epoch_reg_fini(&self, i: usize) -> Result<Vec<u32>, Error> {
+        EpochProofView::Archived(&self.epochs[i]).reg_fini()
+    }
+
     /// The one cross-epoch global-memory proof, as the same view the verifier
     /// reads in place. Its first `num_epochs()` sub-proofs are the per-epoch L2G
     /// tables the binding ties to.

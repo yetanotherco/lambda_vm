@@ -317,3 +317,30 @@ pub fn page_commitments(archive: &FixtureArchive) -> Vec<(u64, Commitment)> {
         .map(|p| (p.0.to_native(), p.1))
         .collect()
 }
+
+// ============ the cross-epoch REGISTER boundary ============
+
+/// Epoch `i`'s `(register_init, reg_fini)` — the pair
+/// `register::compute_precomputed_commitment_with_fini` turns into that epoch's
+/// preprocessed REGISTER commitment.
+///
+/// INIT is the VERIFIER's derivation, never a bundled value: epoch 0's comes
+/// from the inner ELF's entry point and every later epoch's is the previous
+/// epoch's `reg_fini`. That is the whole point of the chaining obligation, so
+/// reading INIT off the proof here would quietly test a different mechanism —
+/// the walk below is the same one `verify_continuation_archived` performs.
+pub fn register_boundary(archive: &FixtureArchive, epoch: usize) -> (Vec<u32>, Vec<u32>) {
+    let bundle = &archive.guest_input().bundle;
+    assert!(
+        epoch < bundle.num_epochs(),
+        "epoch {epoch} out of range ({} epochs)",
+        bundle.num_epochs()
+    );
+    let elf = executor::elf::Elf::load(inner_elf(archive)).expect("the inner ELF must load");
+    let mut init = crate::tables::register::register_init_from_entry_point(elf.entry_point);
+    for i in 0..epoch {
+        init = bundle.epoch_reg_fini(i).expect("reg_fini deserializes");
+    }
+    let fini = bundle.epoch_reg_fini(epoch).expect("reg_fini deserializes");
+    (init, fini)
+}

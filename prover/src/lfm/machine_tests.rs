@@ -3749,3 +3749,550 @@ fn tampered_program_id_inputs_change_the_id() {
         );
     }
 }
+
+// ============ R1g (i): the REGISTER preprocessed derivation ============
+
+use super::programs::{RegisterDerivationShape, lde_probe_program, register_derivation_program};
+
+/// The inner proof's blowup for the real target (`lfm-RESUME.md`), and the
+/// sweep the leg was asked to measure.
+const INNER_BLOWUPS: [usize; 3] = [2, 4, 8];
+
+/// Every production `ProofOptions` uses this offset.
+const PRODUCTION_COSET_OFFSET: u64 = 3;
+
+fn derivation_shape(blowup: usize) -> RegisterDerivationShape {
+    RegisterDerivationShape {
+        blowup,
+        coset_offset: PRODUCTION_COSET_OFFSET,
+    }
+}
+
+/// The inner proof's options at a given blowup — the ones whose REGISTER
+/// commitment is being derived, which are NOT the LFM proof's own options.
+fn inner_options(blowup: usize) -> ProofOptions {
+    let opts = GoldilocksCubicProofOptions::with_blowup(blowup as u8).expect("inner options");
+    assert_eq!(
+        opts.coset_offset, PRODUCTION_COSET_OFFSET,
+        "the shape constant must track production's coset offset"
+    );
+    opts
+}
+
+/// Deterministic pseudo-random `u32`s (splitmix64, high word) — a register file
+/// whose rows are pairwise distinct and all nonzero, asserted by
+/// [`the_fixture_register_boundary_is_mostly_zeros`] rather than assumed.
+fn synthetic_register_file(seed: u64) -> Vec<u32> {
+    let mut state = seed;
+    (0..crate::tables::register::NUM_REGISTER_ADDRESSES)
+        .map(|_| {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            ((z ^ (z >> 31)) >> 32) as u32
+        })
+        .collect()
+}
+
+fn register_arenas(init: &[u32], fini: &[u32]) -> Vec<Vec<LfmWord>> {
+    let column = |v: &[u32]| {
+        v.iter()
+            .map(|&x| super::word::base_word(FE::from(x as u64)))
+            .collect()
+    };
+    vec![column(init), column(fini)]
+}
+
+/// ★ Oracle scrutiny, before anything is built on it: the row order this leg
+/// restates really is production's.
+///
+/// `register_word_address_list` is private, so the program assembles the same
+/// list from the public per-register helper. This pins the result against the
+/// layout the table's own docs state (x0–x31 at 0..63, x254 at 508, x255 at
+/// 510–511) — a check with teeth only because it is written from the docs
+/// rather than from the assembly under test.
+#[test]
+fn the_register_offset_column_is_productions_row_order() {
+    use crate::tables::register::{
+        NUM_REGISTER_ADDRESSES, PC_HI_INDEX, PC_LO_INDEX, X254_INDEX, register_word_addresses,
+    };
+    let mut expected: Vec<u64> = (0..64).collect();
+    expected.extend([508, 510, 511]);
+    assert_eq!(expected.len(), NUM_REGISTER_ADDRESSES);
+
+    let mut derived = Vec::new();
+    for reg in 0..32u8 {
+        derived.extend(register_word_addresses(reg));
+    }
+    derived.extend(register_word_addresses(254));
+    derived.extend(register_word_addresses(255));
+    assert_eq!(
+        derived, expected,
+        "the REGISTER row order moved; the derivation's OFFSET column is built \
+         from this list and every derived root depends on it"
+    );
+    // The positional constants the table exports must agree with it too.
+    assert_eq!(derived[X254_INDEX], 508);
+    assert_eq!(derived[PC_LO_INDEX], 510);
+    assert_eq!(derived[PC_HI_INDEX], 511);
+}
+
+/// ★ The emitted LDE against production's own `interpolate_fft` +
+/// `evaluate_polynomial_on_lde_domain`, at sizes and offsets production never
+/// takes.
+///
+/// The register leg only ever runs the transform at `n = 128`, offset 3. Per
+/// `lfm-target-shape.md`'s degenerate-parameter rule, that means the real
+/// differential cannot tell a general emitter from one that is accidentally
+/// right there, so the synthetic sizes are the only witness. Execute-only: this
+/// is pure `LFM_BALU` arithmetic and the proved test below covers the chips.
+#[test]
+fn the_emitted_lde_matches_productions_transform() {
+    use math::polynomial::Polynomial;
+    use stark::prover::evaluate_polynomial_on_lde_domain;
+
+    for (n, blowup, offset) in [
+        (2usize, 2usize, 3u64),
+        (4, 2, 3),
+        (8, 2, 3),
+        (8, 4, 3),
+        (8, 8, 3),
+        (16, 4, 7),
+        (32, 2, 1),
+        (8, 1, 3),
+        (128, 2, 3),
+    ] {
+        let program = lde_probe_program(n, blowup, offset);
+        validate(&program).expect("admission");
+        let source = synthetic_register_file(n as u64 * 31 + offset);
+        let values: Vec<FE> = (0..n)
+            .map(|i| FE::from(source[i % source.len()] as u64 + 1))
+            .collect();
+        let arenas = vec![values.iter().copied().map(super::word::base_word).collect()];
+        let exec = super::executor::execute(&program, &arenas, &super::hash::TestPermutation)
+            .unwrap_or_else(|e| panic!("n={n} blowup={blowup}: execution failed: {e:?}"));
+
+        let poly = Polynomial::interpolate_fft::<crate::tables::types::GoldilocksField>(&values)
+            .expect("interpolate");
+        let expected =
+            evaluate_polynomial_on_lde_domain(&poly, blowup, n, &FE::from(offset)).expect("lde");
+        let got: Vec<FE> = exec.public_words.iter().map(|(_, w)| w[0]).collect();
+        assert_eq!(
+            got.len(),
+            n * blowup,
+            "n={n} blowup={blowup}: the extension must cover the whole domain"
+        );
+        assert_eq!(
+            got, expected,
+            "n={n} blowup={blowup} offset={offset}: the emitted LDE must equal production's"
+        );
+    }
+}
+
+/// ★ The whole derivation, against production's own
+/// `compute_precomputed_commitment_with_fini`, across the blowup sweep.
+///
+/// Two register files per blowup and they do different jobs. The REAL fixture's
+/// file is what the target runs on; a SYNTHETIC one where all 67 entries are
+/// distinct and nonzero is what makes the test able to fail — a real register
+/// file is mostly zeros, so an emitter that dropped or duplicated rows could
+/// agree with production on it and disagree everywhere else.
+#[test]
+fn the_register_derivation_matches_production() {
+    for blowup in INNER_BLOWUPS {
+        let shape = derivation_shape(blowup);
+        let opts = inner_options(blowup);
+        let program = register_derivation_program(shape);
+        validate(&program).expect("admission");
+
+        for (what, init, fini) in register_file_cases() {
+            let arenas = register_arenas(&init, &fini);
+            let exec = super::executor::execute(&program, &arenas, &super::hash::TestPermutation)
+                .unwrap_or_else(|e| panic!("blowup {blowup} / {what}: execution failed: {e:?}"));
+            let expected = crate::tables::register::compute_precomputed_commitment_with_fini(
+                &opts, &init, &fini,
+            );
+            assert_eq!(
+                digest_bytes(&exec.public_words),
+                expected,
+                "blowup {blowup} / {what}: the derived root must equal production's"
+            );
+        }
+    }
+}
+
+/// The register files the differential runs on: the fixture's real boundary
+/// pair, plus synthetics that exercise every row.
+fn register_file_cases() -> Vec<(&'static str, Vec<u32>, Vec<u32>)> {
+    let (init, fini) = fixture_register_boundary();
+    vec![
+        ("the fixture's real epoch boundary", init, fini),
+        (
+            "a synthetic file with every row distinct",
+            synthetic_register_file(1),
+            synthetic_register_file(2),
+        ),
+        (
+            "init and fini equal (an epoch that changed nothing)",
+            synthetic_register_file(3),
+            synthetic_register_file(3),
+        ),
+    ]
+}
+
+/// Epoch 0's real `(register_init, reg_fini)` from the proof fixture — the
+/// verifier-derived INIT from the entry point and the epoch's bound FINI.
+fn fixture_register_boundary() -> (Vec<u32>, Vec<u32>) {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<(Vec<u32>, Vec<u32>)> = OnceLock::new();
+    CELL.get_or_init(|| {
+        let blob = proof_fixture::load_or_generate(&fixture_cache());
+        let archive = super::proof_fixture::FixtureArchive::open(&blob);
+        super::proof_arena::register_boundary(&archive, 0)
+    })
+    .clone()
+}
+
+/// ★ Scrutinise the fixture boundary before trusting the differential that
+/// runs on it.
+///
+/// A register file is mostly zeros and `init` differs from `fini` in only a
+/// handful of places, so "the real case passed" is weak evidence on its own.
+/// This says exactly how weak, in numbers, which is what justifies the
+/// synthetic cases carrying the load in
+/// [`the_register_derivation_matches_production`].
+#[test]
+fn the_fixture_register_boundary_is_mostly_zeros() {
+    use crate::tables::register::{NUM_REGISTER_ADDRESSES, PC_LO_INDEX};
+    let (init, fini) = fixture_register_boundary();
+    assert_eq!(init.len(), NUM_REGISTER_ADDRESSES);
+    assert_eq!(fini.len(), NUM_REGISTER_ADDRESSES);
+
+    let nonzero = |v: &[u32]| v.iter().filter(|&&x| x != 0).count();
+    let differing = init.iter().zip(&fini).filter(|(a, b)| a != b).count();
+    println!(
+        "R1g(i) fixture boundary: init {}/{} nonzero, fini {}/{} nonzero, \
+         {differing} rows differ (pc {} -> {})",
+        nonzero(&init),
+        NUM_REGISTER_ADDRESSES,
+        nonzero(&fini),
+        NUM_REGISTER_ADDRESSES,
+        init[PC_LO_INDEX],
+        fini[PC_LO_INDEX],
+    );
+    assert_ne!(
+        init, fini,
+        "an epoch that changed no register would be a degenerate case"
+    );
+    assert!(
+        nonzero(&fini) > 0,
+        "an all-zero fini would make the differential blind to the FINI column"
+    );
+    // Nonzero is not enough: rows that share a value are still indistinguishable
+    // to a differential, so the synthetic file has to be pairwise DISTINCT for
+    // "it exercises every row" to mean anything.
+    let synthetic = synthetic_register_file(1);
+    assert_eq!(
+        nonzero(&synthetic),
+        NUM_REGISTER_ADDRESSES,
+        "the synthetic file must exercise every row, which the real one does not"
+    );
+    let distinct: std::collections::HashSet<u32> = synthetic.iter().copied().collect();
+    assert_eq!(
+        distinct.len(),
+        NUM_REGISTER_ADDRESSES,
+        "the synthetic file's rows must be pairwise distinct, else a dropped or \
+         duplicated row could still agree with production"
+    );
+}
+
+/// ★ The measurement the leg was asked for: permutations against the predicted
+/// 255 / 511 / 1023, and the derivation's share of an epoch verify.
+///
+/// The prediction is `2·leaves − 1` with `leaves = 128·blowup / ROWS_PER_LEAF`,
+/// i.e. `128·blowup − 1`. A miss is not something to round off: it would mean
+/// the leaf grouping, the domain size or the padding is not what the design
+/// says, so this asserts rather than prints.
+#[test]
+fn register_derivation_cost() {
+    // `lfm-target-shape.md`'s *Scale*: keccak permutations per epoch verify.
+    let epoch_permutations = |blowup: usize| match blowup {
+        2 => Some(1_400_000f64),
+        8 => Some(460_000f64),
+        _ => None,
+    };
+    println!(
+        "one permutation = {} main cells; one byteswap = {} main cells; \
+         KECCAK_RND chunk ceiling {} rows",
+        permutation_cells(),
+        byteswap_cells(),
+        super::chunking::KECCAK_RND_MAX_CHUNK_ROWS,
+    );
+    println!(
+        "blowup  rows   leaves   perms  predicted   instrs   const    balu  bitdec  keccak   \
+         main cells   % of epoch hashing"
+    );
+    for blowup in INNER_BLOWUPS {
+        let shape = derivation_shape(blowup);
+        let predicted = 128 * blowup - 1;
+        let program = register_derivation_program(shape);
+        let (main, _aux) = super::airs::lfm_cell_counts(&program);
+        let share = epoch_permutations(blowup)
+            .map(|total| format!("{:.4}%", 100.0 * shape.permutations() as f64 / total))
+            .unwrap_or_else(|| "-".to_string());
+        println!(
+            "{blowup:>6} {:>6} {:>8} {:>7} {:>10} {:>8} {:>7} {:>7} {:>7} {:>7} {:>12} {:>19}",
+            shape.lde_rows(),
+            shape.leaves(),
+            program.groups.keccak.real_rows,
+            predicted,
+            program.instrs.len(),
+            program.groups.const_.real_rows,
+            program.groups.balu.real_rows,
+            program.groups.bitdec.real_rows,
+            program.groups.keccak.real_rows,
+            main,
+            share,
+        );
+        assert_eq!(
+            shape.permutations(),
+            predicted,
+            "blowup {blowup}: the shape's own arithmetic must give the predicted count"
+        );
+        assert_eq!(
+            program.groups.keccak.real_rows, predicted,
+            "blowup {blowup}: the EMITTED permutation count must be 2·leaves − 1 \
+             ({predicted}); a miss means the tree's shape is not what the design says"
+        );
+        // Every leaf is 48 bytes and every parent 64 — one rate block each, so
+        // the permutation count is exactly the node count and nothing else.
+        assert_eq!(
+            super::keccak_host::num_blocks(8 * 3 * stark::commitment::ROWS_PER_LEAF),
+            1,
+            "a three-column row pair must fit one keccak rate block"
+        );
+        assert_eq!(
+            super::keccak_host::num_blocks(2 * super::edsl::COMMITMENT_BYTES),
+            1,
+            "a Merkle parent must fit one keccak rate block"
+        );
+
+        // Where the arithmetic goes, to the row. The transform is
+        // `2 · (n/2·log₂n butterflies + blowup · (n scalings + n/2·log₂n
+        // butterflies))` at two rows per butterfly and one per scaling, over
+        // the TWO dynamic columns; the swap is 64 rows for each of the leaf's
+        // six values. Pinning the split is what makes a later change to either
+        // half visible instead of showing up as one moved total.
+        let n = shape.num_rows() as u64;
+        let butterflies = n / 2 * n.trailing_zeros() as u64;
+        let per_column = 2 * butterflies + blowup as u64 * (n + 2 * butterflies);
+        let transform = 2 * per_column;
+        let swap = shape.leaves() as u64 * 6 * 64;
+        assert_eq!(
+            program.groups.balu.real_rows as u64,
+            transform + swap,
+            "blowup {blowup}: LFM_BALU rows must be {transform} of transform plus \
+             {swap} of byte swapping"
+        );
+        assert_eq!(
+            program.groups.bitdec.real_rows,
+            shape.leaves() * 6,
+            "blowup {blowup}: one bit decomposition per leaf value — the leaf \
+             gadget is `keccak_leaf_hash` reused, not a second one"
+        );
+        // Chunking is not a constraint at this scale and the leg should say so
+        // rather than leave the next reader to work it out: the whole tree at
+        // blowup 8 is 1023 permutations against a ceiling of 2^19 ROWS.
+        assert_eq!(
+            super::chunking::KeccakChunking::default().chunk_count(shape.permutations()),
+            1,
+            "blowup {blowup}: the register tree must fit one KECCAK_RND chunk"
+        );
+        assert_eq!(
+            program.groups.select.real_rows, 0,
+            "blowup {blowup}: a TREE build knows every child's side at emission \
+             time, so it must emit no Select at all; routing it through \
+             `keccak_merkle_walk` would put one per parent here"
+        );
+        println!(
+            "  blowup {blowup}: transform {transform} balu rows ({:.1}%), \
+             byteswap {swap} ({:.1}%); a Select would cost {} cells against a \
+             permutation's {}",
+            100.0 * transform as f64 / (transform + swap) as f64,
+            100.0 * swap as f64 / (transform + swap) as f64,
+            select_cells(),
+            permutation_cells(),
+        );
+    }
+}
+
+/// Main-trace cells one `LFM_SELECT` row costs — the unit the tree build avoids
+/// by knowing child order at emission time.
+fn select_cells() -> u64 {
+    use super::chips::select;
+    use super::layout;
+    (select::cols::NUM_COLUMNS - layout::select::PREP_WIDTH) as u64
+}
+
+/// ★ The derivation PROVED, not merely executed — and against the REAL
+/// fixture's own options rather than a reconstruction of them.
+///
+/// The executor mirrors the keccak the chip also does, so an execute-only
+/// differential cannot see the `LFM_KECCAK` adapter, the `KECCAK_RND` chunking
+/// or the lane plumbing agree with it. Blowup 2 (255 permutations) is the cheap
+/// end of the sweep; the shape's arithmetic is what carries 4 and 8, and
+/// `register_derivation_cost` asserts it.
+///
+/// `fixture_options()` is `MIN_PROOF_OPTIONS` — blowup 2, coset offset 3, the
+/// only two fields that reach the commitment — so this is not merely "the
+/// machine agrees with a production function on some inputs". The root proved
+/// here IS the preprocessed REGISTER commitment epoch 0 of the fixture's own
+/// continuation was built against.
+#[test]
+fn the_register_derivation_proves_and_verifies() {
+    let opts = options();
+    let inner = proof_fixture::fixture_options();
+    let shape = RegisterDerivationShape {
+        blowup: inner.blowup_factor as usize,
+        coset_offset: inner.coset_offset,
+    };
+    assert_eq!(
+        shape,
+        derivation_shape(2),
+        "the fixture is proved at blowup 2 / offset 3; if that moves, this test          is no longer about the fixture's own commitment"
+    );
+    let program = register_derivation_program(shape);
+    let artifacts = build_artifacts(&program, &opts);
+    let (init, fini) = fixture_register_boundary();
+    let arenas = register_arenas(&init, &fini);
+    let proved = lfm_prove(&program, &artifacts, &arenas, &opts).expect("prove");
+
+    assert_eq!(
+        digest_bytes(&proved.public_words),
+        crate::tables::register::compute_precomputed_commitment_with_fini(&inner, &init, &fini),
+        "the proved root must equal the fixture epoch's own REGISTER commitment"
+    );
+    assert!(
+        verify_against(
+            &artifacts.roots,
+            &artifacts.program_id,
+            artifacts.keccak_rnd_chunks,
+            &proved.proof,
+            &proved.public_words,
+            &opts,
+        ),
+        "the derivation must verify"
+    );
+    println!(
+        "R1g(i) proved: blowup {}, {} permutations, {} KECCAK_RND chunks",
+        shape.blowup, program.groups.keccak.real_rows, artifacts.keccak_rnd_chunks,
+    );
+}
+
+/// ★ Tamper: every register word must move the derived root, and claiming the
+/// honest root for a tampered file must reject.
+///
+/// Coherent by construction — the program asserts nothing, so each forgery
+/// proves cleanly and fails on the PUBLISHED root. That is the mechanism
+/// working: the root is the claim, and in the assembled verifier it is what
+/// Phase A absorbs, so a `reg_fini` the prover did not honour produces a root
+/// the epoch's own proof was not made against.
+#[test]
+fn tampering_the_register_files_moves_the_derived_root() {
+    let opts = options();
+    let shape = derivation_shape(2);
+    let program = register_derivation_program(shape);
+    let artifacts = build_artifacts(&program, &opts);
+    let (init, fini) = fixture_register_boundary();
+    let honest = lfm_prove(&program, &artifacts, &register_arenas(&init, &fini), &opts)
+        .expect("honest prove");
+
+    use crate::tables::register::{NUM_REGISTER_ADDRESSES, PC_HI_INDEX, X254_INDEX};
+    // A zero row, a row the epoch changed, and the two whose values are not
+    // plain GPR words — the PC high half and the synthetic commit index, which
+    // are the rows an implementation is most likely to mislay.
+    let mut cases: Vec<(String, Vec<u32>, Vec<u32>)> = Vec::new();
+    for row in [
+        0usize,
+        5,
+        X254_INDEX,
+        PC_HI_INDEX,
+        NUM_REGISTER_ADDRESSES - 1,
+    ] {
+        let mut i2 = init.clone();
+        i2[row] ^= 1;
+        cases.push((format!("init row {row}"), i2, fini.clone()));
+        let mut f2 = fini.clone();
+        f2[row] ^= 1;
+        cases.push((format!("fini row {row}"), init.clone(), f2));
+    }
+
+    for (what, i, f) in cases {
+        let forged = lfm_prove(&program, &artifacts, &register_arenas(&i, &f), &opts)
+            .unwrap_or_else(|e| panic!("{what}: a tampered file must still prove: {e:?}"));
+        assert_ne!(
+            forged.public_words, honest.public_words,
+            "{what}: a changed register must move the derived root"
+        );
+        assert!(
+            !verify_against(
+                &artifacts.roots,
+                &artifacts.program_id,
+                artifacts.keccak_rnd_chunks,
+                &forged.proof,
+                &honest.public_words,
+                &opts,
+            ),
+            "{what}: claiming the honest root must reject"
+        );
+    }
+}
+
+/// ⚠ Documents a LIVE gap — **asserts it SUCCEEDS**, per the guard-test map's
+/// convention. If this ever starts failing, something began constraining the
+/// arena; re-derive before relaxing it.
+///
+/// Production's `reg_fini` is a `Vec<u32>`, so every value it can commit is
+/// below 2^32 and the type is the whole enforcement. An LFM arena is untyped
+/// field elements, and nothing in the derivation narrows them: the program
+/// happily extends and commits a column production could not have built.
+///
+/// ## What is and is not claimed
+///
+/// This is NOT a hole in the derivation. A root over a non-`u32` column matches
+/// no commitment a production epoch proof was made against, so the epoch fails
+/// — the same argument that makes the derivation a binding at all. What it IS
+/// is a place where the machine's accepted set is WIDER than the RV64
+/// verifier's, and the assembled verifier owes one of two things: an arena
+/// range check (67 extra `bit_dec`s per column, cheap at this scale), or the
+/// argument that no epoch proof can exist over such a column in the first
+/// place. That second argument is PLAUSIBLE — REG-C2 puts FINI on the Memory
+/// bus as a value word and the memory side decomposes values into bytes — but
+/// it is unverified here, and per the standing rule a deferral's safety
+/// argument is itself a claim needing evidence. Stated, not assumed.
+#[test]
+fn the_derivation_extends_a_non_u32_register_value_demonstrating_hazard() {
+    let shape = derivation_shape(2);
+    let program = register_derivation_program(shape);
+    let (init, fini) = fixture_register_boundary();
+
+    let honest = register_arenas(&init, &fini);
+    let mut wide = honest.clone();
+    // 2^32 — one past every value a `Vec<u32>` can hold.
+    wide[1][0] = super::word::base_word(FE::from(1u64 << 32));
+
+    let run = |arenas: &[Vec<LfmWord>]| {
+        digest_bytes(
+            &super::executor::execute(&program, arenas, &super::hash::TestPermutation)
+                .expect("the machine must accept any felt in the arena")
+                .public_words,
+        )
+    };
+    assert_ne!(
+        run(&wide),
+        run(&honest),
+        "the out-of-range value must actually reach the commitment, else this \
+         test documents nothing"
+    );
+}
