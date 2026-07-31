@@ -737,6 +737,12 @@ fn prove_epoch(
     )
     .map_err(|e| Error::Prover(format!("{e:?}")))?;
 
+    // Emit this epoch's per-table timing report (same formatter as the monolithic
+    // path). `start.label` is 1-based (index + 1), so subtract 1 for the 0-based
+    // epoch number. Gated: zero overhead when the feature is off.
+    #[cfg(feature = "instruments")]
+    crate::instruments::print_epoch_report(&format!("EPOCH {}", start.label - 1));
+
     let l2g_root = proof
         .proofs
         .last()
@@ -917,7 +923,7 @@ fn prove_global(
         pairs.push((air as AirRef, trace, &()));
     }
 
-    Prover::multi_prove(
+    let proof = Prover::multi_prove(
         pairs,
         &mut global_transcript(
             elf_bytes,
@@ -929,7 +935,14 @@ fn prove_global(
         #[cfg(feature = "disk-spill")]
         stark::storage_mode::StorageMode::Ram,
     )
-    .map_err(|e| Error::Prover(format!("{e:?}")))
+    .map_err(|e| Error::Prover(format!("{e:?}")))?;
+
+    // Cross-epoch global-memory proof: emit its per-table timing report too,
+    // using the shared monolithic formatter. Gated: zero overhead when off.
+    #[cfg(feature = "instruments")]
+    crate::instruments::print_epoch_report("GLOBAL");
+
+    Ok(proof)
 }
 
 #[allow(clippy::too_many_arguments)]
