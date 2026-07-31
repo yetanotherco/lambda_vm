@@ -275,7 +275,7 @@ test-rust: compile-programs-rust
 
 # ===== Real-block benchmark fixture =====
 #
-# A genuine Ethereum block (Hoodi 1265656: 4.4M gas, 11 txs, ~124 KB of contract
+# A genuine Ethereum block (currently Hoodi 1265656: 4.4M gas, 11 txs, ~124 KB of contract
 # bytecode, 1705 state-trie nodes), as opposed to the synthetic N-plain-transfer
 # blocks from tooling/ethrex-fixtures. ~1 MB, gitignored.
 #
@@ -291,15 +291,21 @@ test-rust: compile-programs-rust
 # It is now a regeneration tool (ethrex rev bumps, roughly twice a year), not a
 # build step.
 #
-# Which block the benchmarks run is these THREE lines and nothing else. Every path
+# Which block the benchmarks run is these FOUR lines and nothing else. Every path
 # below is derived from them, and the benchmark scripts / CI resolve the fixture
-# through `make -s print-real-block-fixture` rather than spelling it out.
-# To adopt mainnet 25453112 (measured ~110M cycles, ~25% CHEAPER to prove than
-# Hoodi's 147.5M): set NETWORK to `mainnet`, the number to 25453112, and SHA256 to
-# 0298663d33ae635b5e76266b54ce0f778388c7455e19be3d5207528092b2284f — then upload
-# that .bin, point the URL at it, and update REAL_BLOCK_FIXTURE in
-# tooling/ethrex-tests. The converter's own pins stay on Hoodi and do not move; see
-# tooling/ethrex-real-block/README.md.
+# through `make -s print-real-block-fixture` rather than spelling it out. No
+# workflow, script or test outside this block names a block number.
+#
+# Repointing: set NETWORK and the block number, upload that .bin somewhere and put
+# its location and sha256 in the two lines below, then update REAL_BLOCK_FIXTURE in
+# tooling/ethrex-tests so the usability screen follows. Nothing else moves — in
+# particular the converter's own pins stay on Hoodi, because that is the one
+# ethrex-replay cache upstream hosts. Full procedure and the measured cost of each
+# candidate block: tooling/ethrex-real-block/README.md.
+#
+# Hoodi 1265656 is the current default because it is the block whose fixture and
+# digest already exist, not because it is the best candidate; the mainnet blocks
+# under evaluation are cheaper to prove.
 ETHREX_REAL_BLOCK_NETWORK := hoodi
 ETHREX_REAL_BLOCK := 1265656
 ETHREX_REAL_BLOCK_FIXTURE_SHA256 := 1f7d4c4cdf9bd52472d9ebafdb4038f57a88c3c92d65c96fd86d7e323db87142

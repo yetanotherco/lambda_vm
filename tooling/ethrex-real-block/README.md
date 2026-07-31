@@ -9,7 +9,10 @@ they execute no contract code, touch a genesis state trie only a couple of
 levels deep, and carry no bytecode in the witness. This tool produces the
 opposite — a block that actually looks like Ethereum.
 
-| | `ethrex_bench_20.bin` (synthetic) | `ethrex_hoodi_1265656.bin` (real) |
+Figures below are for the **current default** real block; a repoint replaces them
+(see [Adopting a different block](#adopting-a-different-block)).
+
+| | `ethrex_bench_20.bin` (synthetic) | `ethrex_hoodi_1265656.bin` (real, default) |
 |---|---|---|
 | gas used | 420,000 | **4,402,947** |
 | transactions | 20 (all plain transfers) | 11 (7× EIP-1559, 4× EIP-4844 blob) |
@@ -101,23 +104,26 @@ asserts it. The pinned commit keeps the *input* immutable; the digest keeps the
 
 ## What benchmarks with it
 
-| Where | How to run it | Cost |
+Costs below are for the **current default block** (hoodi 1265656) and move with it —
+see [Measured cost of candidate blocks](#measured-cost-of-candidate-blocks).
+
+| Where | How to run it | Cost (current default) |
 |---|---|---|
 | `benchmark-pr.yml` | `/bench-real` on a PR; automatic on push to main and `workflow_dispatch` | ~13 min |
 | `scripts/bench_verify.sh` | `WORKLOAD=real scripts/bench_verify.sh <ref>` | ~13 min per side, then cached |
 | `scripts/perf_diff.sh` | `WORKLOAD=real scripts/perf_diff.sh <ref>` | 5 recordings, so >1 h |
 
-None of them hardcode the fixture path — they read it from
+None of them hardcode the fixture path or a block number — they read the path from
 `make -s print-real-block-fixture` and run `make ethrex-real-block-fixture` when
 the `.bin` is absent.
 
 **Continuations are mandatory, not a tuning choice.** Peak heap on a monolithic
 prove grows ~4.9 GB per million cycles on this workload family (measured on the
 bench server: `10,728 MB + 2,007 MB/transfer`, R² = 0.998 across 4→20 transfers),
-and the real block is 147.5M cycles — roughly **700 GB**. `--continuations` makes
-peak heap a function of the epoch size instead of the trace length, so the same
-block fits in **~21 GB** at epoch 2^21: a 15.8 GB epoch working set plus ~69 MB per
-epoch of accumulated proofs over 68 epochs. The bundle on disk is ~5 GB, and
+so a real block in the 110–150M cycle range needs **500–700 GB**. `--continuations`
+makes peak heap a function of the epoch size instead of the trace length, so the
+same block fits in **~19–21 GB** at epoch 2^21: a 15.8 GB epoch working set plus
+~69 MB per epoch of accumulated proofs. The bundle on disk is ~4–5 GB, and
 serializing it past 2 GiB needs rkyv `pointer_width_64`.
 
 Plain `/bench` deliberately stays on the synthetic 20-transfer block: it proves in
@@ -183,31 +189,43 @@ reads it — and none of its pins move when the benchmark block changes.
 Swapping the benchmark block is **four lines**, once the new `.bin` is hosted:
 
 ```make
-# Makefile
-ETHREX_REAL_BLOCK_NETWORK        := hoodi      # -> mainnet
-ETHREX_REAL_BLOCK                := 1265656    # -> 25453112
-ETHREX_REAL_BLOCK_FIXTURE_SHA256 := 1f7d4c…    # -> 0298663d…
-ETHREX_REAL_BLOCK_FIXTURE_URL    := …          # -> the new artifact
+# Makefile — the ONLY place a block number appears
+ETHREX_REAL_BLOCK_NETWORK        := <mainnet|hoodi|sepolia>
+ETHREX_REAL_BLOCK                := <block number>
+ETHREX_REAL_BLOCK_FIXTURE_SHA256 := <sha256 of the .bin>
+ETHREX_REAL_BLOCK_FIXTURE_URL    := <where you uploaded it>
 ```
 
 plus `REAL_BLOCK_FIXTURE` in `tooling/ethrex-tests` (which points the usability
 screen at the block actually being benchmarked). Everything else derives from the
-Makefile — fixture name, and through `make -s print-real-block-fixture` the
-benchmark scripts and `benchmark-pr.yml`. Nothing in `executor/.gitignore` needs
-touching: it already ignores every accepted network's fixture name, so a repointed
-~1 MB fixture cannot become committable by accident.
+Makefile — the fixture name, and through `make -s print-real-block-fixture` the
+benchmark scripts and `benchmark-pr.yml`. No workflow, script or env var names a
+block. Nothing in `executor/.gitignore` needs touching either: it already ignores
+every accepted network's fixture name, so a repointed ~1 MB fixture cannot become
+committable by accident.
 
-**Mainnet 25453112 is ready to adopt.** It passes the usability screen (stateless
-re-execution reaches a matching post-state root with the KZG screen live), its
-digest is `0298663d33ae635b5e76266b54ce0f778388c7455e19be3d5207528092b2284f`, and
-at ~110M cycles it is ~25% *cheaper* to prove than Hoodi's 147.5M — roughly 10 min
-rather than 13. It is 1.93 MiB (3% of the 64 MiB private-input clamp). The only
-thing missing is a host for the `.bin`.
+### Measured cost of candidate blocks
 
-Note it cannot be produced by `make regen-real-block-fixture`: that route needs an
-ethrex-replay cache, upstream hosts only Hoodi's, and generating a mainnet one takes
-~4 minutes and ~700 calls against an archive RPC. This is precisely why the fixture
-is fetched rather than converted.
+Cost is a property of the block, so it changes with the repoint. Cycles are given
+for a **current guest ELF**; prove time and heap are for the CPU bench runner at
+epoch 2^21, using the 5.31–5.62 s per Mcycle measured on that box.
+
+| block | cycles | prove | peak heap | fixture |
+|---|---|---|---|---|
+| hoodi 1265656 — *current default* | 147.5M | ~13 min | ~21 GB | 1,021,207 B, `1f7d4c4c…` |
+| mainnet 25453112 | ~110M | ~10 min | ~19 GB | 2,019,747 B, `0298663d…` |
+
+These are measurements, not estimates: the mainnet block executes in 125,932,956
+cycles on the mid-July ELF against Hoodi's 168,319,360 on the same ELF, i.e. ~25%
+**cheaper** despite being the larger fixture — cycles per gas is not constant across
+blocks. Both clear the usability screen. Further candidates are being measured; add
+a row rather than editing the wiring.
+
+Hoodi is the default only because its fixture and digest already exist. Note it is
+also the only block `make regen-real-block-fixture` can rebuild: that route needs an
+ethrex-replay cache, upstream hosts Hoodi's alone, and producing another takes ~4
+minutes and ~700 calls against an archive RPC. That asymmetry is exactly why the
+fixture is fetched rather than converted.
 
 Benchmark comparability does not survive the swap, and that is intentional rather
 than a wrinkle to work around: `benchmark-pr.yml` records which block it measured
