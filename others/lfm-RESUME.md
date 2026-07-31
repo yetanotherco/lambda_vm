@@ -49,33 +49,47 @@ The machine proves and verifies, end to end, through the registry:
 8. **Chaining (ii) and (iii)** — cross-epoch L2G root binding, and the
    attestation's `program_id` fold bit-exact vs production.
 
-## What is left, in order
+## What is left, in order (updated 2026-07-31)
 
-1. **Chaining (i)**: derive the next epoch's REGISTER preprocessed commitment
-   from `reg_fini`. This is a full Merkle TREE build (255/511/1023
-   permutations at blowup 2/4/8), not a path walk, plus 3 small FFTs.
-   Predicted noise (0.018% of an epoch's hashing at blowup 2, 0.22% at 8 —
-   both, they differ 10×). **Measure against 255/511/1023; a miss means the
-   shape is not what we think.** Also: does it need a second hashing gadget
-   distinct from `keccak_merkle_walk`? FRI will want a third.
-2. **DEEP across a full sub-proof**, wired to R1f's Merkle authentication —
-   this discharges the obligation the constraint leg deferred: the arena
-   values these legs consume must be the ones the authentication leg
-   authenticates. Until that join exists both legs are correct in isolation
-   and neither proves anything about the other.
-3. **FRI folding leg.**
-4. **LogUp closure** (Σ L vs the recomputed expected bus balance).
+1. ~~**Chaining (i)**: REGISTER preprocessed commitment from `reg_fini`~~ —
+   **DONE** (reg-tree, merged at 69b4a915). Prediction confirmed exactly:
+   255/511/1023 permutations, 0.0182%/0.2224% noise. No second hashing
+   gadget — `keccak_hash_pair` unwelded from the walk sufficed. ⚠ Left an
+   OPEN assembly obligation: the `reg_fini` felt-width gap — see
+   `lfm-assembly-obligations.md`, which is now the ledger every leg's
+   deferral goes into.
+2. ~~**DEEP across a full sub-proof**, wired to R1f's Merkle
+   authentication~~ — **DONE** (deep-join, merged at 703f742b). Join is
+   structural: same arena cells, index bits bound (a hinted point is the
+   same gap one level over), control programs run the denied attacks.
+   Cost inversion found: authentication is 99.0% of the leg, DEEP 1.0%;
+   213,744 permutations/epoch at blowup 8 for openings (~46% of the
+   predicted epoch keccak bill). Shared-commitment lever measured at 48%
+   collapse (111,471) — parked, see
+   `lfm-team-lead-shared-commitment-ruling.md`.
+3. **FRI folding leg** — IN FLIGHT (reg-tree, same worktree/branch as its
+   chaining leg). Production verify path fully mapped and cited in
+   `lfm-fri-verify-spec.md`; targets the unbatched shape per the ruling.
+   Differential blindness to k=7/coset_offset=3 must be closed with
+   synthetic fixtures or pinned structural assertions.
+4. **LogUp closure** (Σ L vs the recomputed expected bus balance) — IN
+   FLIGHT (deep-join, same worktree/branch). Opened aux values must join
+   through the same sub_proof.rs cells authentication authenticates.
 5. **Assembly** into one epoch-verifier program. ⚠ Every per-epoch number so
    far is a COMPOSITION of per-AIR measurements, not a run. Assembly is what
-   confirms or falsifies them.
+   confirms or falsifies them. Discharge `lfm-assembly-obligations.md`
+   (currently: reg_fini width check-or-argument; HALT cost-line anomaly on
+   WATCH).
 6. **The wrap run** on the box (see `[[scaleway-box-idp]]` in memory:
    195.154.218.198, 124 GB, warm-built).
 
 ## Decisions already made — do not relitigate
 
-- **Prove the inner proof at BLOWUP 8.** Two independent legs point there:
-  DEEP scales with query count (73 vs 219 ⇒ ~3×), and the keccak bill does
-  too (~460k vs ~1.4M permutations).
+- **Prove the inner proof at BLOWUP 8.** Three independent legs point
+  there: DEEP scales with query count (73 vs 219 ⇒ ~3×), the keccak bill
+  does too (~460k vs ~1.4M permutations), and FRI is 2.6× cheaper (14,454
+  vs 38,106 permutations — query count falls 3× while per-query cost rises
+  only 14%; reg-tree, FRI slice 0, derived from the verified spec).
 - **The REGISTER derivation IS the binding.** `VmAirs::new`'s
   `register_preprocessed` parameter looks like unfinished plumbing; it must
   stay unwired. Computing the commitment from `reg_fini` is what ties the

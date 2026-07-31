@@ -304,6 +304,37 @@ pub fn emit_query(
     index: Felt,
     openings: &[GroupOpening],
 ) -> (Ext, Ext) {
+    emit_query_with_bits(b, shape, gamma, inv, commitments, index, openings).deep
+}
+
+/// What one query contributes when the caller needs more than the DEEP pair.
+pub struct QueryOutput {
+    /// `(DEEP(υ), DEEP(−υ))`.
+    pub deep: (Ext, Ext),
+    /// The query index decomposed low-to-high — the SAME cells the Merkle walk
+    /// consumed and the query points were derived from.
+    ///
+    /// Handing these out is what lets a later leg join to this one rather than
+    /// run beside it. FRI reuses the index per layer (leaf position `index >> 1`,
+    /// partner `index ^ 1`, halving each layer), and a leg that decomposed its
+    /// own copy would authenticate one index while folding at another — the
+    /// exact gap this module exists to close, reopened one level up. There is
+    /// no way to return a DIFFERENT decomposition from here: `bit_dec` is
+    /// called once and its result feeds the walk, the points and this field.
+    pub bits: Vec<Bit>,
+}
+
+/// [`emit_query`], additionally returning the index bits — see [`QueryOutput`].
+#[allow(clippy::too_many_arguments)]
+pub fn emit_query_with_bits(
+    b: &mut LfmBuilder,
+    shape: &SubProofShape,
+    gamma: Ext,
+    inv: &DeepInvariants,
+    commitments: &[GroupCommitment],
+    index: Felt,
+    openings: &[GroupOpening],
+) -> QueryOutput {
     shape.check();
     let groups = shape.groups();
     assert_eq!(commitments.len(), groups.len(), "one commitment per group");
@@ -350,10 +381,13 @@ pub fn emit_query(
         trace: trace_sym,
         parts: parts_sym,
     };
-    (
-        emit_deep_point(b, &shape.deep, gamma, inv, &regular),
-        emit_deep_point(b, &shape.deep, gamma, inv, &symmetric),
-    )
+    QueryOutput {
+        deep: (
+            emit_deep_point(b, &shape.deep, gamma, inv, &regular),
+            emit_deep_point(b, &shape.deep, gamma, inv, &symmetric),
+        ),
+        bits,
+    }
 }
 
 // ===================== the whole sub-proof =====================
@@ -390,6 +424,17 @@ pub fn emit_sub_proof(
     shape: &SubProofShape,
     num_queries: usize,
 ) -> (SubProofArenas, Vec<(Ext, Ext)>) {
+    let (arenas, out) = emit_sub_proof_with_bits(b, shape, num_queries);
+    (arenas, out.into_iter().map(|q| q.deep).collect())
+}
+
+/// [`emit_sub_proof`], additionally returning each query's index bits — see
+/// [`QueryOutput`]. The FRI leg folds from these same cells.
+pub fn emit_sub_proof_with_bits(
+    b: &mut LfmBuilder,
+    shape: &SubProofShape,
+    num_queries: usize,
+) -> (SubProofArenas, Vec<QueryOutput>) {
     use super::deep::emit_deep_invariants;
 
     shape.check();
@@ -462,7 +507,7 @@ pub fn emit_sub_proof(
                 GroupOpening { values, siblings }
             })
             .collect();
-        out.push(emit_query(
+        out.push(emit_query_with_bits(
             b,
             shape,
             gamma,

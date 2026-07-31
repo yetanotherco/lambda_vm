@@ -1,7 +1,7 @@
 # Standing decisions — Phase R agents
 
 Read this before stopping to ask. If your question is answered here, proceed.
-Last updated 2026-07-29 by team-lead.
+Last updated 2026-07-31 by team-lead (added method rule 7).
 
 ## Pre-authorized — do NOT ask
 
@@ -75,6 +75,19 @@ Last updated 2026-07-29 by team-lead.
    reached the team lead's durable notes before the author's own
    re-measurement pulled it back. Both halves of this rule answer the same
    question: *how do I stop myself asserting past my evidence?*
+
+7. **A relative test dies the moment its two sides unify.** A differential
+   between two code paths is worthless once one is implemented in terms of
+   the other — the refactor that makes an API additive-by-delegation is
+   exactly what kills any test comparing the two forms, silently, at that
+   moment. When you delegate, replace the comparison with an ABSOLUTE
+   property of the output. Demonstrated (reg-tree, bits exposure): the
+   guard comparing `emit_sub_proof` against `emit_sub_proof_with_bits`
+   stayed green with the exact denied defect injected, because both sides
+   were the same program by construction; the replacement asserts every
+   returned bit is consumed by some `Select`, which the walk's own bits
+   satisfy and a fresh copy cannot. This is rule 1 applied to a guard:
+   falsify the guard itself, especially right after a delegation refactor.
 
 ## Coordination
 
