@@ -1,5 +1,5 @@
 //! Host tests for the untrusted-hint verify-then-fallback paths (`scalar_inv`,
-//! `decompress_r`).
+//! `field_inv`, `decompress_r`).
 //!
 //! The guest asks the (untrusted, prover-chosen) `hint` ecall for a modular
 //! inverse / square root, then verifies it in-circuit. These tests inject the
@@ -141,5 +141,49 @@ fn decompress_r_non_residue_is_none_regardless_of_hint() {
             decompress_r_with_oracle(&rb, false, |_| lie).is_none(),
             "a lying hint must not force a non-residue to decompress"
         );
+    }
+}
+
+/// Honest base-field inverse oracle (BE in/out, mod p) — mirrors the executor's
+/// `compute_hint(HINT_FIELD_INV, ..)`: the inverse if it exists, else zeros.
+fn honest_field_inv(x_be: &[u8; 32]) -> [u8; 32] {
+    let x = Option::<FieldElement>::from(FieldElement::from_bytes(&(*x_be).into()))
+        .expect("canonical input");
+    match Option::<FieldElement>::from(x.invert()) {
+        Some(inv) => inv.to_bytes().into(),
+        None => [0u8; 32],
+    }
+}
+
+#[test]
+fn field_inv_honest_hint_matches_software() {
+    for k in [1u64, 2, 3, 7, 1000, 12345] {
+        let x = fe_from_u64(k);
+        let sw = Option::<FieldElement>::from(x.invert()).expect("k != 0 is invertible");
+        let got = field_inv_with_oracle(&x, honest_field_inv).expect("inverse exists");
+        assert_eq!(
+            got.normalize().to_bytes(),
+            sw.normalize().to_bytes(),
+            "honest hint must equal the software inverse (k={k})"
+        );
+    }
+}
+
+#[test]
+fn field_inv_lying_hint_falls_back_to_software() {
+    // A prover-chosen garbage inverse must not change the result: `x⁻¹` exists for
+    // every input the callers pass (guarded non-zero denominators), so the software
+    // fallback is authoritative — a lie can only cost work, never steer the outcome.
+    for lie in [[0u8; 32], [0xFFu8; 32]] {
+        for k in [1u64, 2, 12345] {
+            let x = fe_from_u64(k);
+            let sw = Option::<FieldElement>::from(x.invert()).unwrap();
+            let got = field_inv_with_oracle(&x, |_| lie).expect("fallback recomputes");
+            assert_eq!(
+                got.normalize().to_bytes(),
+                sw.normalize().to_bytes(),
+                "lying hint must fall back to the software inverse (k={k})"
+            );
+        }
     }
 }
