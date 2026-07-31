@@ -38,10 +38,16 @@ jobs:
     runs-on: [self-hosted, bench]
     # Job cap. On a cold runner the recursion BUILDS dominate: per ref a guest build, a
     # prover-test build, and a measuring-CLI build (the CLI is built FROM each ref so it
-    # understands that ref's own guest syscalls). Cached in /tmp; build-std / host cargo
-    # target shared across ref worktrees (see the recursion step's env), so the second
-    # ref's native builds mostly reuse the first ref's compiled deps.
-    timeout-minutes: 90
+    # understands that ref's own guest syscalls). Cached in /tmp; build-std is per ref and
+    # the host cargo target is shared across ref worktrees (see the recursion step's env),
+    # so the second ref's native builds mostly reuse the first ref's compiled deps.
+    # 125 rather than 90 to absorb the continuation arms: a 20-tx continuation prove per
+    # ref on each side of the verifier bench, plus a 20-tx (was 4-tx) block for the cycle
+    # comparison. Keep this ABOVE the sum of the step caps below (50 + 70 = 120) so a
+    # runaway step always trips its OWN timeout first: a step timeout still runs the
+    # `always()` Post result step, whereas hitting the job cap is a cancellation and is far
+    # less dependable about doing so — which would lose the comment entirely.
+    timeout-minutes: 125
     steps:
       - name: Acknowledge (react + occupancy notice)
         if: github.event_name == 'issue_comment'
@@ -55,7 +61,7 @@ jobs:
             await github.rest.issues.createComment({
               owner: context.repo.owner, repo: context.repo.repo,
               issue_number: context.issue.number,
-              body: '⏳ **Benchmark started** on the bench server. The recursion-guest cycle comparison adds guest builds on top of the verifier bench, longer on a cold runner. The bench server is occupied until it finishes.'
+              body: '⏳ **Benchmark started** on the bench server. Two verifier arms (monolithic + continuations over an ethrex 20-tx block), then the recursion-guest cycle comparison, which adds guest builds on top — longer on a cold runner. The bench server is occupied until it finishes.'
             });
 
       - name: Resolve PR head + pair count
@@ -104,6 +110,9 @@ jobs:
 
       - name: Run verifier benchmark
         id: run
+        # Own cap so a hung continuation prove/verify can't eat the whole job budget and
+        # starve the recursion step. On timeout `always()` still posts the failure tail.
+        timeout-minutes: 50
         env:
           HEAD_SHA: ${{ steps.cfg.outputs.head_sha }}
           PAIRS: ${{ steps.cfg.outputs.pairs }}
@@ -111,16 +120,19 @@ jobs:
           export SYSROOT_DIR="$HOME/.lambda-vm-sysroot"
           set -o pipefail
           scripts/bench_verify.sh "$HEAD_SHA" origin/main "$PAIRS" 2>&1 | tee /tmp/verify_out.txt
-          sed -n '/=== Verify ABBA result/,$p' /tmp/verify_out.txt > /tmp/verify_result.txt
+          sed -n '/<!-- verify-abba-report -->/,$p' /tmp/verify_out.txt > /tmp/verify_result.txt
 
       # Additive: deterministic recursion-guest cycle+accelerator diff (PR vs main), in
-      # four regimes: `min`, `blowup2`, `blowup4` (empty diagnostic inner program) plus
-      # `blowup4-block` (same verifier over a REAL ethrex block, via the `continuation`
-      # guest). One exact `execute --cycles` reading per ref (no ABBA); blowup4-block's
-      # dumped blob is cached by ref SHA (bench_recursion_cycles.sh), so a repeat run
-      # skips re-proving. GUEST_TARGET_DIR / HOST_TARGET_DIR share build-std and the
-      # host cargo target across ref worktrees. continue-on-error + `!cancelled()`
-      # isolate this from the verifier bench above.
+      # two regimes: `min` (cheap canary over the empty diagnostic program) and
+      # `blowup2-block` (the same verifier over a REAL ethrex 20-tx block proved with
+      # continuations, via the `continuation` guest). One exact `execute --cycles`
+      # reading per ref (no ABBA); blowup2-block's dumped blob is cached by ref SHA
+      # (bench_recursion_cycles.sh), so a repeat run skips re-proving.
+      # GUEST_TARGET_DIR is a BASE path — bench_recursion_cycles.sh appends the ref SHA
+      # so each worktree owns its guest target dir (sharing one dir across refs made
+      # cargo mix rlibs from both worktrees and broke every regime after the first).
+      # HOST_TARGET_DIR is genuinely shared: native deps compile once for both refs.
+      # continue-on-error + `!cancelled()` isolate this from the verifier bench above.
       - name: Run recursion guest cycle benchmark
         id: recursion
         if: ${{ !cancelled() }}
@@ -130,9 +142,10 @@ jobs:
         timeout-minutes: 70
         env:
           HEAD_SHA: ${{ steps.cfg.outputs.head_sha }}
-          # Share build-std and the host cargo target across ref worktrees, rooted under
-          # the script's /tmp cache dir: cuts cold build time and per-worktree disk.
-          GUEST_TARGET_DIR: /tmp/recursion_cycles_run/shared_guest_target
+          # Base path for the per-ref guest target dirs (`<base>_<sha8>`) and the shared
+          # host cargo target, both rooted under the script's /tmp cache dir: build-std
+          # and native deps survive across runs instead of being rebuilt cold.
+          GUEST_TARGET_DIR: /tmp/recursion_cycles_run/guest_target
           HOST_TARGET_DIR: /tmp/recursion_cycles_run/shared_host_target
         run: |
           export SYSROOT_DIR="$HOME/.lambda-vm-sysroot"
@@ -154,18 +167,31 @@ jobs:
             // can't dump the entire build log into the PR comment.
             const tail = (s, n) => s.split('\n').slice(-n).join('\n');
             const head = (process.env.HEAD_SHA || '').slice(0, 10), pairs = process.env.PAIRS;
-            let body = `## Verifier benchmark — \`${head}\` vs \`main\` (${pairs} pairs)\n\n`;
+            let body = `## Verifier benchmark — \`${head}\` vs \`main\` (${pairs} pairs, monolithic + continuations)\n\n`;
             if (process.env.OUTCOME === 'success') {
               const res = read('/tmp/verify_result.txt') || tail(read('/tmp/verify_out.txt'), 30);
               body += res + '\n';
-              body += '\n<sub>Drift-free interleaved A/B/B/A measurement. - = PR faster. ';
-              body += 'Trust the verdict when paired-t and Wilcoxon agree.</sub>\n';
+              // Scope this to the rows it actually describes: only the Verify-time rows are
+              // ABBA. It used to be a blanket claim, which was wrong for the proof sizes here
+              // and for every guest-cycle number in the section below.
+              body += '\n<sub>Verify-time rows only: drift-free interleaved A/B/B/A, with paired-t ';
+              body += 'and exact Wilcoxon — trust the verdict when the two agree. Proof sizes are ';
+              body += 'single exact readings (no averaging). - = PR faster.</sub>\n';
             } else {
+              // A step timeout or OOM kill takes the whole script down, so the graceful
+              // CONT_SKIP path never runs. bench_verify.sh renders the monolithic report as
+              // soon as that arm finishes, so post it rather than throwing away a verdict
+              // that was already measured. Path is $WORK/result_mono.txt in that script.
+              const mono = read('/tmp/verify_run/result_mono.txt');
+              if (mono) {
+                body += '⚠️ Run did not complete — the monolithic arm had already finished, ';
+                body += 'so its result is below. The continuation arm is missing.\n\n' + mono + '\n';
+              }
               body += `❌ Run failed. Last log lines:\n\n` + '```\n' + tail(read('/tmp/verify_out.txt'), 30) + '\n```\n';
             }
             // Additive recursion-guest cycle section, kept clearly separated from the
             // verifier verdict above so a failure here can't change how the bench reads.
-            body += '\n---\n\n## Recursion guest cycles (main vs PR)\n\n';
+            body += '\n---\n\n## Recursion guest cycles — verifier running INSIDE the VM (main vs PR)\n\n';
             if (process.env.RECURSION_OUTCOME === 'success') {
               const rec = read('/tmp/recursion_result.txt') || tail(read('/tmp/recursion_out.txt'), 20);
               if (rec) {
