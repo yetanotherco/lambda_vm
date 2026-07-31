@@ -876,7 +876,8 @@ fn collect_ecsm_ops(
             .expect("ECSM witness: executor validates 0 < k < N and xG on curve")
     };
 
-    let mut memw_ops = Vec::with_capacity(15);
+    // 15 ops on the x-only path; the affine path adds 4 yG reads and 4 yR writes.
+    let mut memw_ops = Vec::with_capacity(if is_affine { 23 } else { 15 });
 
     // x11 -> addr_xG (register read at T), x12 -> addr_k (register read at T+1).
     {

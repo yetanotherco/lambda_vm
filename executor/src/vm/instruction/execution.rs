@@ -16,11 +16,11 @@ pub enum SyscallNumbers {
     Halt = 93,
     // Placeholder discriminant. The actual syscall value is ECSM_SYSCALL_NUMBER.
     Ecsm = 94,
-    // Placeholder discriminant. The actual syscall value is ECSM_AFFINE_SYSCALL_NUMBER.
-    EcsmAffine = 96,
     // Placeholder discriminant. The actual syscall value is HINT_SYSCALL_NUMBER.
     // Non-constraining hint (host computes modular inverse/sqrt, guest verifies).
     Hint = 95,
+    // Placeholder discriminant. The actual syscall value is ECSM_AFFINE_SYSCALL_NUMBER.
+    EcsmAffine = 96,
 }
 
 /// Syscall number for KeccakPermute (u64::MAX - 1 = 0xFFFF_FFFF_FFFF_FFFE).

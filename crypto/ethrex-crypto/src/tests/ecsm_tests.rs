@@ -1,13 +1,17 @@
-//! Tests for the x-only ECSM linear-combination reconstruction
-//! (`lincomb2_with_oracle`) against the software `ProjectivePoint::lincomb`,
-//! plus the degenerate-configuration fallback guards.
+//! Tests for the ECSM linear combination (`lincomb2_with_oracle`) against the
+//! software `ProjectivePoint::lincomb`, plus the degenerate-configuration
+//! fallback guards.
 
 use crate::*;
 
 /// Software stand-in for the affine ECSM precompile: form the curve point `(x, y)` from
 /// the caller's actual coordinates and return `(xR, yR)` of `k·(x, y)`. No parity
 /// convention — the real ecall receives the full input point too.
-fn soft_oracle(x: &FieldElement, y: &FieldElement, k: &Scalar) -> Option<(FieldElement, FieldElement)> {
+fn soft_oracle(
+    x: &FieldElement,
+    y: &FieldElement,
+    k: &Scalar,
+) -> Option<(FieldElement, FieldElement)> {
     let p = point_from_xy(&x.normalize(), &y.normalize())?;
     let prod = (p * k).to_affine();
     let (xr, yr) = affine_xy(&prod)?;
@@ -49,16 +53,19 @@ fn matches_software_lincomb_on_recovery_shape() {
 
 #[test]
 fn edge_scalars_fall_back() {
-    // AFFINE PoC: only k=0 falls back now. The old x-only path also rejected k=1
-    // and k=n−1 (the (k+1)·P query wrapped); the affine oracle makes no such query,
-    // so those scalars reconstruct normally.
+    // Only k=0 falls back. The old x-only path also rejected k=1 and k=n−1 (the
+    // (k+1)·P query wrapped); the affine oracle makes no such query, so those
+    // scalars reconstruct normally.
     let p1 = g_times(3);
     let p2 = g_times(5);
     let ok = Scalar::from(12345u64);
-    for bad in [Scalar::ZERO] {
-        assert!(lincomb2_with_oracle(&p1.to_affine(), &bad, &p2.to_affine(), &ok, soft_oracle).is_none());
-        assert!(lincomb2_with_oracle(&p1.to_affine(), &ok, &p2.to_affine(), &bad, soft_oracle).is_none());
-    }
+    let bad = Scalar::ZERO;
+    assert!(
+        lincomb2_with_oracle(&p1.to_affine(), &bad, &p2.to_affine(), &ok, soft_oracle).is_none()
+    );
+    assert!(
+        lincomb2_with_oracle(&p1.to_affine(), &ok, &p2.to_affine(), &bad, soft_oracle).is_none()
+    );
     // k=1 and k=n−1 now reconstruct correctly.
     for good in [Scalar::ONE, -Scalar::ONE] {
         let expected = ProjectivePoint::lincomb(&p1, &good, &p2, &ok);

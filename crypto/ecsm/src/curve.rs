@@ -156,10 +156,10 @@ pub fn scalar_mul_affine_x(k: &BigUint, g: &AffinePoint) -> BigUint {
     scalar_mul_affine(k, g).x
 }
 
-/// Executor fast path (affine PoC): the full affine point `k·g`. Same convention as
-/// `scalar_mul_affine_x` / the witness — `g` is the even-`y` lift of its x-coordinate,
-/// so `k·g`'s y matches the ECDAS-constrained `y_r`. Returns both coordinates so the
-/// `ecsm_mul_affine` syscall can hand `y` back to the guest.
+/// Executor fast path: the full affine point `k·g`, so the `ecsm_mul_affine` syscall can
+/// hand `y` back to the guest. `g` is whatever point the caller prepared — the even-`y` lift
+/// of `xG` on the x-only path, the caller's own input point on the affine one — and `k·g`'s
+/// y matches the ECDAS-constrained `y_r` either way.
 pub fn scalar_mul_affine(k: &BigUint, g: &AffinePoint) -> AffinePoint {
     let scalar = Option::<Scalar>::from(Scalar::from_repr(be32(k).into()))
         .expect("ECSM: scalar k must be < N");

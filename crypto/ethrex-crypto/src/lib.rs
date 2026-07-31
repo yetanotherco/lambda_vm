@@ -285,10 +285,10 @@ fn ecsm_ecrecover(sig: &[u8; 64], recid: u8, msg: &[u8; 32]) -> Result<[u8; 64],
 
 /// ECSM-accelerated 2-term linear combination `k1·P1 + k2·P2`.
 ///
-/// AFFINE PoC: on riscv64 this uses TWO affine ECSM queries (the precompile now
-/// returns `(x, y)`, see [`lincomb2_with_oracle`]) instead of four x-only queries
-/// plus chord-law y-reconstruction; on other targets, and whenever a guard trips,
-/// it returns `None` so the caller uses the pure-Rust `ProjectivePoint::lincomb`.
+/// On riscv64 this uses two affine ECSM queries (the precompile returns `(x, y)`,
+/// see [`lincomb2_with_oracle`]) instead of four x-only queries plus chord-law
+/// y-reconstruction; on other targets, and whenever a guard trips, it returns
+/// `None` so the caller uses the pure-Rust `ProjectivePoint::lincomb`.
 #[cfg(target_arch = "riscv64")]
 fn ecsm_lincomb2(
     a1: &AffinePoint,
