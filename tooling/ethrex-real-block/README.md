@@ -15,12 +15,18 @@ opposite — a block that actually looks like Ethereum.
 | transactions | 20 (all plain transfers) | 11 (7× EIP-1559, 4× EIP-4844 blob) |
 | contract calls | 0 | 5, at ~830–955k gas each |
 | contract bytecode in witness | 0 | 22 contracts, ~124 KB |
-| state-trie nodes | a handful | 1,705 |
+| state trie | 40 accounts, fresh genesis | 1,705 nodes |
 | storage keys | 0 | 422 |
-| serialized size | 17 KB | 1,021,207 B |
+| serialized size | 32,766 B | 1,021,207 B |
 
 Note it has *fewer* transactions than the synthetic fixture while being far more
 representative — transaction count is not the axis that matters.
+
+The synthetic column is `ethrex_bench_20.bin` as the benchmark scripts actually
+generate it — `ethrex-fixtures 20 … distinct`, i.e. 20 distinct genesis-funded
+senders to 20 distinct recipients (`scripts/bench_verify.sh`,
+`scripts/bench_recursion_scaling.sh`). The same block in `same` mode (one sender,
+one recipient) serializes to 16,811 B.
 
 Block 1265656 is **verified to run on the guest's precompile surface** (see
 [Validation](#validation)); it needs no accelerator we don't have. Any
@@ -96,6 +102,12 @@ default is an edit, not a flag: `ETHREX_REAL_BLOCK` and `ETHREX_REPLAY_REV` in t
 Makefile, the `hoodi` in the cache URL, `CACHE` and the assertions in
 `src/main.rs`, and `REAL_BLOCK_FIXTURE` in `tooling/ethrex-tests`.
 
+Then run **`make test-ethrex`**, not just this crate's tests. A new block is only
+usable if it needs no accelerator the guest lacks, and this crate cannot tell you
+that — its graph links a working c-kzg, so a block calling point evaluation (0x0a)
+passes here and fails in the guest. `test_ethrex_real_block_native` in
+`tooling/ethrex-tests` is the screen. See [Validation](#validation).
+
 ## Why the JSON and not ethrex-replay's own `.bin`
 
 `ethrex-replay` can already emit a rkyv `ProgramInput`, but it tracks ethrex
@@ -116,9 +128,16 @@ version-tolerant JSON instead of a pinned binary is the mitigation.
 
 ## Validation
 
-Six checks, cheapest first. Five run on the host and need no RV64 toolchain; they
-execute in milliseconds, though a cold build compiles the ethrex host dependency
-tree, which is what costs ~60s in CI rather than the tests themselves.
+Six checks, ordered so the argument builds: the host-side parity test first, then
+what it does *not* cover, then the checks in `tooling/ethrex-tests` that close the
+gap. Five run on the host and need no RV64 toolchain, and each executes in
+milliseconds.
+
+What costs time is a cold build of the ethrex host dependency tree — ~335
+packages, including the `blst`, `c-kzg` and `secp256k1-sys` C builds, `malachite`
+and `ark-ff/asm` — not the tests. CI caches this workspace's `target/` (see the
+`workspaces:` list on the `test-executor` job's `rust-cache` step), so only cold
+runs pay it.
 
 **`cargo test` here — `real_block_executes_under_guest_crypto`.** Executes the
 block through `LambdaVmEcsmCrypto`, the `Crypto` impl the guest injects, so it is

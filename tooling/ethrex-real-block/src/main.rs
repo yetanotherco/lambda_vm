@@ -113,8 +113,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ethrex_config::networks::HOODI_CHAIN_ID;
 
     const CACHE: &str = "caches/cache_hoodi_1265656.json";
+
+    /// `caches/` is gitignored and fetched on demand, so every test here fails on
+    /// a clean checkout until the cache is downloaded. Say so instead of surfacing
+    /// a bare `No such file or directory` from `unwrap()`.
+    const CACHE_MISSING: &str = "caches/cache_hoodi_1265656.json is missing — run \
+                                 `make ethrex-real-block-fixture` from the repo root first";
 
     /// Executes the converted block with `LambdaVmEcsmCrypto`, the `Crypto` impl
     /// the guest injects, so the block is exercised through the same trait
@@ -138,7 +145,7 @@ mod tests {
         use lambda_vm_ethrex_crypto::LambdaVmEcsmCrypto;
         use std::sync::Arc;
 
-        let (program_input, _) = program_input_from_cache(CACHE).unwrap();
+        let (program_input, _) = program_input_from_cache(CACHE).expect(CACHE_MISSING);
         execution_program(program_input, Arc::new(LambdaVmEcsmCrypto)).unwrap();
     }
 
@@ -149,7 +156,7 @@ mod tests {
     #[test]
     fn unmappable_network_is_rejected() {
         let mut cache: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(CACHE).unwrap()).unwrap();
+            serde_json::from_str(&std::fs::read_to_string(CACHE).expect(CACHE_MISSING)).unwrap();
         cache["network"] = serde_json::json!("LocalDevnet");
 
         let path = std::env::temp_dir().join(format!(
@@ -176,12 +183,22 @@ mod tests {
     fn conversion_is_reproducible() {
         use sha2::Digest;
 
-        let (program_input, summary) = program_input_from_cache(CACHE).unwrap();
+        let (program_input, summary) = program_input_from_cache(CACHE).expect(CACHE_MISSING);
         let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&program_input).unwrap();
 
         assert_eq!(summary.first_block_number, 1_265_656);
         assert_eq!(summary.transactions, 11);
         assert_eq!(summary.gas_used, 4_402_947);
+
+        // Asserted separately from the digest below, not covered by it. The digest
+        // is exactly what a legitimate ethrex rev bump forces someone to rewrite
+        // (the layout moves, this goes red, a fresh digest gets pasted in) — and at
+        // that moment it stops covering the substituted-chain-config case it was
+        // chosen for. This assert survives that churn.
+        assert_eq!(
+            program_input.execution_witness.chain_config.chain_id, HOODI_CHAIN_ID,
+            "chain config is not Hoodi's — the block would replay under other rules",
+        );
 
         // Digest, not length: a layout change can preserve the byte count exactly
         // (`ChainConfig` is fixed-size, and rkyv's `big_endian` feature would only
