@@ -17,14 +17,16 @@
 #        EPOCH_SIZE_LOG2=<n> (default 21) sizes the epoch, WORKLOAD=real only.
 #
 # Pick the workload that matches the run you are localizing, because the symbol
-# mix follows the block: the synthetic default is 20 plain transfers (9.06M cycles,
-# 411 keccak calls, 80 ecsm calls) and a real block inverts that (~65.6M cycles,
+# mix follows the block: the synthetic default is 20 plain transfers (8.73M cycles,
+# 411 keccak calls, 80 ecsm calls) and a real block inverts that (50.78M cycles,
 # 10,478 keccak, 116 ecsm), so a hot symbol in one need not be hot in the other.
-# Both counts are for a current guest ELF; they shift ~14% with ELF vintage.
+# Both counts are from the same guest ELF (merge fdb92f67, main @ 9ccdaf2, clang 21);
+# they move with guest optimisation (#861's thin LTO) and ~2% with the clang major, so
+# pin the ELF when quoting one.
 #
-# WORKLOAD=real also switches to a continuation prove (monolithic would need
-# ~330 GB at that trace length), which is ~6 min per recording — five recordings,
-# so budget ~30 min, plus ~2 GB of disk per bundle.
+# WORKLOAD=real also switches to a continuation prove (monolithic would need ~240 GB
+# at that trace length), which is ~4.5-4.8 min per recording — five recordings, so
+# budget ~25 min, plus ~2 GB of disk per bundle.
 #
 # Produces:
 #   - two perf-diff tables (recorded twice per side, interleaved B A B A —

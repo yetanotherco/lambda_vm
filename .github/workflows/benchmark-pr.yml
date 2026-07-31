@@ -45,19 +45,20 @@ env:
   # "Generate ethrex bench fixtures" step).
   #
   # This is not a representative block — 20 plain transfers are ecrecover-heavy and
-  # touch almost no state: 9.06M cycles, 411 keccak calls, 80 ecsm calls. It stays
+  # touch almost no state: 8.73M cycles, 411 keccak calls, 80 ecsm calls. It stays
   # the per-comment default only because it proves in ~25s; the representative
   # number is the real block below, which runs on push/dispatch and `/bench-real`.
   #
-  # Cycle counts here are for the ELF THIS JOB BUILDS (see "Build ethrex guest ELF").
-  # They move ~14% with guest-ELF vintage, so a count quoted against a different ELF
-  # will read as a regression — always pin the ELF when repeating one.
+  # Cycle counts here are for the ELF THIS JOB BUILDS (see "Build ethrex guest ELF"),
+  # as of main @ 9ccdaf2 with clang 21. They move with guest optimisation (#861 gave the
+  # guest thin LTO) and ~2% with the clang major on PATH, so a count quoted against a
+  # different ELF reads as a regression — always pin the ELF when repeating one.
   ELF: executor/program_artifacts/rust/ethrex.elf
   INPUT: executor/tests/ethrex_bench_20.bin
   # Headline (representative) workload: a real Ethereum block. WHICH block lives in
   # the Makefile and nowhere else — nothing in this file names one, so a repoint
-  # moves this job without editing it. At the current default that is ~65.6M cycles,
-  # 10,478 keccak calls and 116 ecsm calls: ~7x the work of the synthetic block with a
+  # moves this job without editing it. At the current default that is 50.78M cycles,
+  # 10,478 keccak calls and 116 ecsm calls: ~5.8x the work of the synthetic block with a
   # ~18x different keccak:ecrecover mix. That is the whole point — a prover change
   # can move the synthetic number and the real one in opposite directions.
   #
@@ -69,10 +70,10 @@ env:
   # Continuations are mandatory here, not a preference: a monolithic prove costs
   # ~4.9 GB of peak heap per million cycles on this workload family (from the
   # measured growth fit, 10,728 MB + 2,007 MB/transfer at R^2 = 0.998), so the
-  # current default would need ~330 GB and a heavier candidate up to ~700 GB.
+  # current default would need ~240 GB and a heavier candidate far more.
   # `--continuations` makes peak heap a function of the epoch size instead of the
-  # trace length: ~18 GB here (a 15.8 GB epoch-2^21 working set plus ~60 MB per
-  # epoch of accumulated proofs over ~32 epochs). Costs move with the block; the
+  # trace length: ~18 GB here (a 15.8 GB epoch-2^21 working set plus ~69 MB per
+  # epoch of accumulated proofs over ~25 epochs). Costs move with the block; the
   # per-candidate table is in tooling/ethrex-real-block/README.md.
   #
   # Budget ~2 GB of disk for the bundle each run — hence the `rm -f` after every
@@ -182,8 +183,8 @@ jobs:
 
           # Real-block benchmark: same gating as growth (/bench-real, push to main,
           # workflow_dispatch), and for the same reason — it is far too slow for the
-          # per-comment tier. One continuation prove of the real block is ~6 min of
-          # CPU on this runner (~65.6M cycles at the 5.31-5.62 s/Mcycle measured on
+          # per-comment tier. One continuation prove of the real block is ~4.5-4.8 min of
+          # CPU on this runner (50.78M cycles at the 5.31-5.62 s/Mcycle measured on
           # this box in run 30631871174), against ~25s for the synthetic block, and
           # the runner is single and serialized across every /bench, /bench-abba and
           # /bench-verify in the repo.
@@ -993,7 +994,7 @@ jobs:
             const tableParallelism = process.env.TABLE_PARALLELISM;
             const tpLabel = tableParallelism ? tableParallelism : 'auto (cores / 3)';
             body += `## Benchmark — ethrex 20 transfers${nLabel}\n\n`;
-            body += `<sub>Synthetic screen — 20 plain transfers, ~7x less work than a real block and a very different keccak:ecrecover mix. Fast, so it runs on every \`/bench\`; comment \`/bench-real\` for the representative number. Table parallelism: ${tpLabel}</sub>\n\n`;
+            body += `<sub>Synthetic screen — 20 plain transfers, ~6x less work than a real block and a very different keccak:ecrecover mix. Fast, so it runs on every \`/bench\`; comment \`/bench-real\` for the representative number. Table parallelism: ${tpLabel}</sub>\n\n`;
             body += `| Metric | main | PR | Δ |\n`;
             body += `|--------|------|----|---|\n`;
             body += `| **Peak heap** | ${basePeak} MB | ${peak} MB | ${fmt(peakDiff)} MB (${fmt(peakPct)}%) ${icon(peakPct)} |\n`;
@@ -1119,7 +1120,7 @@ jobs:
             // --- Footer ---
             if (!realTime) {
               body += `\n> 🧱 **This ran on synthetic blocks only.** Comment \`/bench-real\` to prove a real Ethereum block `;
-              body += `(keccak/trie-dominated rather than ecrecover-dominated). It adds ~6 min to the run.\n`;
+              body += `(keccak/trie-dominated rather than ecrecover-dominated). It adds ~5 min to the run.\n`;
             }
             const sha = process.env.COMMIT_SHA.substring(0, 8);
             body += `\n<sub>Commit: ${sha} · Baseline: ${baseSrc} · Runner: self-hosted bench</sub>\n`;

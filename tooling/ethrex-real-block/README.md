@@ -18,17 +18,26 @@ All are measured.
 | gas used | 420,000 | **2,428,684** |
 | transactions | 20 (all plain transfers) | 29 (real mix) |
 | serialized size | 32,766 B | 1,110,156 B |
-| cycles | 9,063,727 | **~65.6M** |
+| cycles | 8,734,622 | **50,781,557** |
 | keccak / ecsm calls | 411 / 80 | **10,478** / 116 |
 | keccaks per ecrecover | 5.1 | **90** |
 
-Note the real block uses only ~5.8x the gas while costing ~7.2x the cycles, and
-that it inverts the crypto mix: the synthetic block is ecrecover-bound, the real one
-keccak- and trie-bound. That inversion is the entire point — a prover change can
-move the two numbers in opposite directions.
+Note the real block uses ~5.8x the gas and costs ~5.8x the cycles here, and that it
+inverts the crypto mix: the synthetic block is ecrecover-bound, the real one keccak-
+and trie-bound. That inversion is the point — a prover change can move the two
+numbers in opposite directions. (The gas and cycle ratios agreeing is a coincidence
+of this pair, not a rule: cycles/gas is 20.9 here and ranges ~21–38 across the
+candidate blocks.)
 
-Cycle counts are for a **current guest ELF** and move ~14% with ELF vintage (this
-block reads 74,819,518 on a mid-July ELF); pin the ELF whenever you quote one.
+**Pin the ELF whenever you quote a cycle count.** Counts above were measured on this
+branch at merge `fdb92f67` (main @ `9ccdaf2`), guest built with **clang 21.1.8**.
+Two things move them:
+- **Guest optimisation.** #861 gave the guest thin LTO; this block read 74,819,518
+  on a mid-July pre-LTO ELF, so anything quoting ~74.8M or ~65.6M is **superseded**.
+- **clang major version**, by ~2%. The guest embeds C (secp256k1-sys) and the
+  Makefile pins target flags but not the compiler, so `cc` picks up whatever `clang`
+  is on PATH. The RTX 5090 box (clang-18) measured **50,713,534** for this block on
+  main @ `9ccdaf2` — 0.13% below the number above, same commit, different compiler.
 
 Why this block specifically: it was the **only** block in a 90-day Dune sweep that
 matched the shape constraints in the 1.6–2.6M gas band — exactly 2 heavy
@@ -131,10 +140,10 @@ it — see [Measured cost of candidate blocks](#measured-cost-of-candidate-block
 
 | Where | How to run it | Cost (current default) |
 |---|---|---|
-| `benchmark-pr.yml` | `/bench-real` on a PR; automatic on push to main and `workflow_dispatch` | ~6 min |
-| `scripts/bench_verify.sh` | `WORKLOAD=real scripts/bench_verify.sh <ref>` | ~6 min per side, then cached |
-| `scripts/perf_diff.sh` | `WORKLOAD=real scripts/perf_diff.sh <ref>` | 5 recordings, so ~30 min |
-| `benchmark-gpu.yml` | `/bench-gpu` on a PR — **the default there** | **unmeasured** (see below) |
+| `benchmark-pr.yml` | `/bench-real` on a PR; automatic on push to main and `workflow_dispatch` | ~4.5–4.8 min |
+| `scripts/bench_verify.sh` | `WORKLOAD=real scripts/bench_verify.sh <ref>` | ~4.5–4.8 min per side, then cached |
+| `scripts/perf_diff.sh` | `WORKLOAD=real scripts/perf_diff.sh <ref>` | 5 recordings, so ~25 min |
+| `benchmark-gpu.yml` | `/bench-gpu` on a PR — **the default there** | 59.87 s/prove on an RTX 5090 (see below) |
 | `scripts/bench_abba.sh` | `WORKLOAD=real scripts/bench_abba.sh <ref>` | ~4 h at 20 pairs — **manual only** |
 
 None of them hardcode the fixture path or a block number — they read the path from
@@ -143,8 +152,8 @@ the `.bin` is absent.
 
 **`/bench-abba` is deliberately NOT wired to the real block.** The script supports
 it (`WORKLOAD=real`, which is what the GPU workflow drives), but the CPU ABBA
-workflow still defaults to the synthetic fixture: 20 pairs × 2 proves × ~6 min is
-**~4 hours** on the one shared bench runner, which every other bench queues behind.
+workflow still defaults to the synthetic fixture: 20 pairs × 2 proves × ~4.5–4.8 min
+is **~3 hours** on the one shared bench runner, which every other bench queues behind.
 Run it by hand when a paired test on a real workload is worth that; the option is
 here rather than a footgun on a comment trigger.
 
@@ -155,31 +164,36 @@ the default and the synthetic fixtures stay reachable via the existing `cont[TX]
 `mono[TX]` tokens — old numbers reproduce with the exact syntax that produced them.
 On the CPU side the shared runner makes the opposite trade correct.
 
-**GPU prove time for the real block is UNMEASURED.** Do not extrapolate the CPU rate
-(5.31–5.62 s/Mcycle): it does not transfer. The relevant prior is the RTX 5090 sweep's
-finding that above epoch 2^21 the prover was CPU-bound at the serial producer, which
-means real-block GPU time may land closer to CPU time than expected rather than far
-below it. The first `/bench-gpu` run establishes the baseline; treat any number quoted
-before that as a guess.
+**GPU baseline (measured).** On an RTX 5090 (32 GiB) against main @ `9ccdaf2`, the
+real block proves in **59.87 s wall at `--epoch-size-log2 22`** — the recommended GPU
+epoch. VRAM is what binds: 2^22 leaves 28.9% headroom, and **2^23 does not fit a 32 GiB
+card** (no card below 48 GiB can move up). The CPU bench runner is roughly **4.5–4.8x**
+that wall time for the same block.
+
+Do not derive one from the other in general: the CPU rate (5.31–5.62 s/Mcycle) does not
+transfer to the GPU, and the RTX 5090 sweep found the prover CPU-bound at the serial
+producer above epoch 2^21, so GPU time lands closer to CPU time than a naive
+device-throughput estimate suggests.
 
 **Continuations are mandatory, not a tuning choice.** Peak heap on a monolithic
 prove grows ~4.9 GB per million cycles on this workload family (measured on the
 bench server: `10,728 MB + 2,007 MB/transfer`, R² = 0.998 across 4→20 transfers),
-so this block would need **~330 GB** monolithically — and a heavier candidate up to
-~700 GB. `--continuations` makes peak heap a function of the epoch size instead of
-the trace length, so the same block fits in **~18 GB** at epoch 2^21: a 15.8 GB
-epoch working set plus ~60 MB per epoch of accumulated proofs over ~32 epochs. The
+so this block would need **~240 GB** monolithically — and a heavier candidate far
+more. `--continuations` makes peak heap a function of the epoch size instead of the
+trace length, so the same block fits in **~18 GB** at epoch 2^21: a 15.8 GB epoch
+working set plus ~69 MB per epoch of accumulated proofs over ~25 epochs. (The GPU path
+uses epoch 2^22, where VRAM rather than host RAM is the binding constraint.) The
 bundle on disk is ~1.9 GB; note that a heavier block pushes it past 2 GiB, which
 needs rkyv `pointer_width_64` to serialize.
 
 Plain `/bench` deliberately stays on the synthetic 20-transfer block: it proves in
-~25s against ~6 min, and one runner carries every `/bench`, `/bench-abba` and
+~25s against ~4.5–4.8 min, and one runner carries every `/bench`, `/bench-abba` and
 `/bench-verify` in the repo. The synthetic number is a fast screen; the real block
 is the number that means something.
 
-Cycle counts here (9.06M synthetic, ~65.6M real) are for a **current guest ELF**.
-They move ~14% with ELF vintage — this block reads 74,819,518 on a mid-July ELF — so
-pin the ELF whenever you quote one, or it will look like a regression the next time
+Cycle counts here (8.73M synthetic, 50.78M real) are from merge `fdb92f67` (main @
+`9ccdaf2`, clang 21). They move with guest optimisation and ~2% with the clang major,
+so pin the ELF whenever you quote one, or it will look like a regression the next time
 someone measures.
 
 ## Where validation runs
@@ -257,27 +271,43 @@ repointed ~1 MB fixture cannot become committable by accident.
 
 ### Measured cost of candidate blocks
 
-Cost is a property of the block, so it changes with the repoint. Cycles are given
-for a **current guest ELF**; prove time and heap are for the CPU bench runner at
-epoch 2^21, using the 5.31–5.62 s per Mcycle measured on that box.
+Cost is a property of the block, so it changes with the repoint. All figures are
+measured, never derived from gas — **cycles per gas is not constant** (20.9 for the
+current default), so ranking candidates by gas mispredicts cost.
 
-| block | gas | cycles | prove | peak heap | proof | fixture |
+**Current default — main-vintage (merge `fdb92f67`, main @ `9ccdaf2`):**
+
+| block | gas | cycles | GPU prove (RTX 5090) | CPU prove | proof | fixture |
 |---|---|---|---|---|---|---|
-| **mainnet 25368371** — *current default* | 2.43M | **~65.6M** | **~6 min** | ~18 GB | ~1.9 GB | 1,110,156 B, `61eba49b…` |
-| mainnet 25453112 | 4.24M | ~110M | ~10 min | ~19 GB | ~3.7 GB | 2,019,747 B, `0298663d…` |
-| hoodi 1265656 | 4.40M | ~147.5M | ~13 min | ~21 GB | ~4.7 GB | 1,021,207 B, `1f7d4c4c…` |
+| **mainnet 25368371** | 2.43M | **50,781,557** (clang 21)<br>50,713,534 (clang 18) | **59.87 s** @ epoch 2^22 | ~4.5–4.8x the GPU wall | ~1.9 GB | 1,110,156 B, `61eba49b…` |
 
-These are measurements, not estimates. All three clear the usability screen. Add a
-row rather than editing the wiring.
+Epoch 2^22 is the GPU recommendation: VRAM binds, 2^22 leaves 28.9% headroom on a
+32 GiB card and 2^23 does not fit one at all. **The CPU-server epoch recommendation is
+pending calibration** — that measurement is still running; do not fill this in by
+analogy with the GPU number.
 
-Two things the table shows that a gas-based estimate would have got wrong. **Cycles
-per gas is not constant** — it ranges ~26–38 across these blocks — so ranking
-candidates by gas mispredicts cost; 25453112 has *more* gas than hoodi 1265656 yet
-costs ~25% fewer cycles. And **fixture size does not track cost** either: the current
-default is the cheapest block and the middle-sized fixture.
+**Alternates — PRE-LTO vintage, superseded, re-measure before quoting.** These were
+taken on a mid-July guest ELF, before #861 gave the guest thin LTO; the same build
+change took the current default from 74,819,518 to ~50.7M, so expect these to fall by
+a comparable factor. Kept because they are the selection evidence, not because the
+numbers are current:
 
-The default is the cheapest of the three, which matters because this workload sits on
-a single shared bench runner. It was also the only block in a 90-day Dune sweep
+| block | gas | cycles (pre-LTO) | fixture |
+|---|---|---|---|
+| mainnet 25453112 | 4.24M | 125,932,956 | 2,019,747 B, `0298663d…` |
+| hoodi 1265656 | 4.40M | 168,319,360 | 1,021,207 B, `1f7d4c4c…` |
+
+All three clear the usability screen. Add a row rather than editing the wiring, and
+say which ELF a number came from.
+
+Two things these numbers show that a gas-based estimate would have got wrong, and both
+survive the vintage change because they are same-ELF comparisons. **Gas does not order
+cost:** 25453112 carries *more* gas than hoodi 1265656 yet costs ~25% fewer cycles.
+And **fixture size does not track cost** either: the current default is the cheapest
+block and the middle-sized fixture.
+
+The default is the cheapest of the three, which matters because the CPU workload sits
+on a single shared bench runner. It was also the only block in a 90-day Dune sweep
 matching the shape constraints (2 heavy transactions, no whale, sane transfer share)
 in the 1.6–2.6M gas band — so it is cheap *and* structurally typical, not cheap
 because it is degenerate.

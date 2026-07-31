@@ -48,8 +48,8 @@
 # trie-bound), so a verifier change can move the two differently.
 #
 # `synthetic` stays the default because it is what `/bench-verify` runs and what every
-# number recorded so far used; `real` is the representative one, and costs a ~6 min
-# continuation prove per side (cached in $WORK afterwards) before any verify run starts.
+# number recorded so far used; `real` is the representative one, and costs a ~4.5-4.8
+# min continuation prove per side (cached in $WORK afterwards) before any verify run.
 # Both sides always prove the same block, so a comparison is never mixed.
 
 set -euo pipefail
