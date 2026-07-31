@@ -35,3 +35,10 @@ rkyv = { version = "=0.8.16", features = ["std", "unaligned"] }
 # current syscalls (keccak_permute + the Print-ecall no-op fix).
 [patch."https://github.com/yetanotherco/lambda_vm.git"]
 lambda-vm-syscalls = { path = "../../../../syscalls" }
+
+# Route ALL guest keccak through the Lambda keccak chip: the vendored
+# tiny-keccak patch (crypto/tiny-keccak) makes `keccakf` an ecall on riscv64,
+# so the ethrex free-fn `keccak_hash` path (trie/RLP/tx hashing) stops running
+# the permutation in software. ~6% of a 20-tx ERC20 block measured.
+[patch.crates-io]
+tiny-keccak = { path = "../../../../crypto/tiny-keccak" }
