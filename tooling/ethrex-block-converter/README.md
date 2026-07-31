@@ -157,12 +157,11 @@ is **~3 hours** on the one shared bench runner, which every other bench queues b
 Run it by hand when a paired test on a real workload is worth that; the option is
 here rather than a footgun on a comment trigger.
 
-**Why the GPU default differs from the CPU one.** `/bench-gpu` rents its own box per
-run, so the cost is money rather than queue time on a runner every other bench is
-waiting for. That removes the reason to keep the real block opt-in, so there it is
-the default and the synthetic fixtures stay reachable via the existing `cont[TX]` /
-`mono[TX]` tokens — old numbers reproduce with the exact syntax that produced them.
-On the CPU side the shared runner makes the opposite trade correct.
+**Both bench flows prove this block.** `/bench` runs it sampled on the shared
+runner, against the cached baseline main publishes; `/bench-gpu [N]` runs it as
+N A/B/B/A pairs on a rented box, comparing PR vs main on the same machine —
+absolute GPU times are host-CPU-dependent, so only same-box deltas are
+meaningful.
 
 **GPU baseline (measured), and why the GPU epoch is 2^22.** On an RTX 5090 (32,607 MiB)
 against main @ `9ccdaf2`, same fixture and CLI, one prove per setting:
