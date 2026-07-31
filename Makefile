@@ -286,10 +286,23 @@ ETHREX_REAL_BLOCK := 1265656
 ETHREX_REPLAY_REV := 2693e0182a8734117151d8ea2891eda5afc60383
 ETHREX_REAL_BLOCK_CACHE := tooling/ethrex-real-block/caches/cache_hoodi_$(ETHREX_REAL_BLOCK).json
 ETHREX_REAL_BLOCK_FIXTURE := executor/tests/ethrex_hoodi_$(ETHREX_REAL_BLOCK).bin
+# The cache filename is keyed on the block number only, and its download rule has
+# no other prerequisite, so make would treat an already-present cache as up to
+# date across an `ETHREX_REPLAY_REV` bump and silently keep converting the old
+# input. Depending on a rev-stamped marker makes a re-pin discard the stale cache;
+# without it the mismatch only surfaces downstream as a `conversion_is_reproducible`
+# digest failure, which reads as "regenerate the fixture" and points at the wrong
+# thing. CI never hits this (fresh checkout, `caches/` gitignored) — local re-pins do.
+ETHREX_REPLAY_REV_STAMP := tooling/ethrex-real-block/caches/.replay-rev-$(ETHREX_REPLAY_REV)
 
 ethrex-real-block-fixture: $(ETHREX_REAL_BLOCK_FIXTURE)
 
-$(ETHREX_REAL_BLOCK_CACHE):
+$(ETHREX_REPLAY_REV_STAMP):
+	mkdir -p $(dir $@)
+	rm -f $(ETHREX_REAL_BLOCK_CACHE) $(dir $@).replay-rev-*
+	touch $@
+
+$(ETHREX_REAL_BLOCK_CACHE): $(ETHREX_REPLAY_REV_STAMP)
 	mkdir -p $(dir $@)
 	curl -fsSL --retry 3 --retry-delay 2 --retry-all-errors -o $@.tmp \
 		https://raw.githubusercontent.com/lambdaclass/ethrex-replay/$(ETHREX_REPLAY_REV)/caches/cache_hoodi_$(ETHREX_REAL_BLOCK).json
