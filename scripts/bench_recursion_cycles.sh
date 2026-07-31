@@ -125,13 +125,16 @@
 # both refs overwrite one path). The direction is fixed: the ref that only ADDS files is
 # the one that gets skipped, because in the reverse order cargo finds the added file
 # missing from the other worktree and rebuilds. In a /bench-verify run on the DMA PR the
-# blob dump for the PR ref therefore executed main's prover linked against the PR's
-# executor: the guest's new ecalls ran, no table existed to prove them, and
-# `verify_continuation` returned None — surfacing as the PR's `continuation bundle must
-# verify on host before dumping` on a PR whose own binary verifies that bundle fine. Hence
-# `${HOST_TARGET_DIR}_<sha8>` too. Cost: one cold host build per ref — measured on the bench
-# runner at ~25 s for the prover test harness plus ~10 s for the CLI, so ~35 s — still warm
-# across presets and across runs for the same ref.
+# blob dump for the PR ref therefore ran the BASELINE's harness — same
+# `<host_target>/release/deps/lambda_vm_prover-<hash>` path, `Finished` in 0.06s, and 546
+# tests where that PR's own harness has 562. That count is the cheapest fingerprint: the
+# rest of the log reads like a normal run. What executes is the other ref's WHOLE binary,
+# so there is no per-crate mix to attribute. It produced a bundle that did not verify,
+# surfacing as the PR's `continuation bundle must verify on host before dumping` on a PR
+# whose own binary verifies that bundle fine. Hence `${HOST_TARGET_DIR}_<sha8>` too. Cost:
+# one cold host build per ref — measured on the bench runner at ~25 s for the prover test
+# harness plus ~10 s for the CLI, so ~35 s — still warm across presets and across runs for
+# the same ref.
 #
 # In CI the reuse precondition is stronger than "the worktree exists": `git -C "$wt"
 # checkout -f` FAILS there, because actions/checkout rebuilds $ROOT/.git every job and
