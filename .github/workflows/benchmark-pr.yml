@@ -45,28 +45,36 @@ env:
   # "Generate ethrex bench fixtures" step).
   #
   # This is not a representative block — 20 plain transfers are ecrecover-heavy and
-  # touch almost no state (measured, same ELF: 14.2M cycles, 411 keccak calls, 80
-  # ecsm calls). It stays the per-comment default only because it proves in ~25s;
-  # the representative number is REAL_BLOCK below, which runs on push/dispatch and
-  # on an explicit `/bench-real`.
+  # touch almost no state: 9.06M cycles, 411 keccak calls, 80 ecsm calls. It stays
+  # the per-comment default only because it proves in ~25s; the representative
+  # number is the real block below, which runs on push/dispatch and `/bench-real`.
+  #
+  # Cycle counts here are for the ELF THIS JOB BUILDS (see "Build ethrex guest ELF").
+  # They move ~14% with guest-ELF vintage, so a count quoted against a different ELF
+  # will read as a regression — always pin the ELF when repeating one.
   ELF: executor/program_artifacts/rust/ethrex.elf
   INPUT: executor/tests/ethrex_bench_20.bin
-  # Headline (representative) workload: a real Ethereum block, converted from an
-  # ethrex-replay cache by tooling/ethrex-real-block. Same measured ELF: 168.3M
-  # cycles, 9,046 keccak calls, 44 ecsm calls — i.e. ~12x the work of the synthetic
-  # block with a ~40x different keccak:ecrecover mix. That is the whole point: a
-  # prover change can move the synthetic number and the real one in opposite
-  # directions.
+  # Headline (representative) workload: a real Ethereum block. 147.5M cycles, 9,046
+  # keccak calls, 44 ecsm calls — ~16x the work of the synthetic block with a ~40x
+  # different keccak:ecrecover mix. That is the whole point: a prover change can move
+  # the synthetic number and the real one in opposite directions.
   #
   # The path is NOT hardcoded here: it is resolved from the Makefile
   # (`make -s print-real-block-fixture`) into REAL_INPUT at run time, so repointing
-  # the block is a Makefile edit and nothing else. The .bin is ~1 MB and gitignored,
-  # so the job generates it (see "Generate ethrex real-block fixture").
+  # the block is a Makefile edit and nothing else. The ~1 MB .bin is gitignored and
+  # FETCHED by URL + sha256 (see "Fetch ethrex real-block fixture"); while that URL
+  # is unset the whole section degrades to a warning rather than failing the job.
   #
   # Continuations are mandatory here, not a preference: a monolithic prove costs
-  # ~3.1 GB of peak heap per million cycles on this workload family (measured
-  # growth slope, R^2 = 0.998), so 168M cycles would need ~500 GB. `--continuations`
-  # makes peak heap flat in the epoch size instead of the trace length.
+  # ~4.9 GB of peak heap per million cycles on this workload family (from the
+  # measured growth fit, 10,728 MB + 2,007 MB/transfer at R^2 = 0.998), so 147.5M
+  # cycles would need ~700 GB. `--continuations` makes peak heap a function of the
+  # epoch size instead of the trace length: ~21 GB here (a 15.8 GB epoch-2^21
+  # working set plus ~69 MB per epoch of accumulated proofs over 68 epochs).
+  #
+  # Budget ~5 GB of disk for the bundle each run — hence the `rm -f` after every
+  # prove. Serializing it past 2 GiB needs rkyv `pointer_width_64`, so a PR branch
+  # predating that fix fails here at write time rather than mismeasuring.
   REAL_BLOCK_EPOCH_LOG2: "21"
   BENCH_RUNS_REAL: 1
   BENCH_RUNS_PR: 3
@@ -171,20 +179,30 @@ jobs:
 
           # Real-block benchmark: same gating as growth (/bench-real, push to main,
           # workflow_dispatch), and for the same reason — it is far too slow for the
-          # per-comment tier. One continuation prove of the real block is ~15 min of
-          # CPU on this runner (extrapolated from the ~7 min cont100 figure in
-          # bench-abba.yml at ~2.5x the cycles), against ~25s for the synthetic
-          # block, and the runner is single and serialized across all PRs.
+          # per-comment tier. One continuation prove of the real block is ~13 min of
+          # CPU on this runner (147.5M cycles at the 5.31-5.62 s/Mcycle measured on
+          # this box in run 30631871174), against ~25s for the synthetic block, and
+          # the runner is single and serialized across every /bench, /bench-abba and
+          # /bench-verify in the repo.
           #
           # Because push-to-main always runs it, the baseline artifact carries a
           # real-block number, so `/bench-real` on a PR pays for the PR side only.
+          RUN_REAL=false
           if [ "$EVENT_NAME" = "issue_comment" ] && echo "$COMMENT_BODY" | grep -q '^/bench-real'; then
-            echo "run_real=true" >> "$GITHUB_OUTPUT"
+            RUN_REAL=true
           elif [ "$EVENT_NAME" = "push" ] || [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            echo "run_real=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "run_real=false" >> "$GITHUB_OUTPUT"
+            RUN_REAL=true
           fi
+
+          # The fixture is FETCHED from a pinned URL + sha256, not built (see the
+          # Makefile). While that URL is unset the block cannot be obtained at all, so
+          # degrade to the synthetic sections with a warning rather than failing —
+          # otherwise every push to main goes red over an upload nobody in CI can do.
+          if [ "$RUN_REAL" = "true" ] && [ -z "$(make -s print-real-block-fixture-url)" ]; then
+            echo "::warning::Real-block benchmark skipped: ETHREX_REAL_BLOCK_FIXTURE_URL is unset in the Makefile."
+            RUN_REAL=false
+          fi
+          echo "run_real=$RUN_REAL" >> "$GITHUB_OUTPUT"
 
           # Resolve the real-block fixture path from its single source of truth (the
           # Makefile) and pin it in the job env. Captured HERE, before the baseline
@@ -226,13 +244,14 @@ jobs:
             echo "Using $RUNS iterations, TABLE_PARALLELISM=default"
           fi
 
-      - name: Generate ethrex real-block fixture
+      - name: Fetch ethrex real-block fixture
         if: steps.config.outputs.run_real == 'true'
         run: |
-          # ~1 MB and gitignored, so it is never in the checkout: build it rather
-          # than failing on a missing file, the same way the synthetic fixtures are
-          # generated above. Cold runs also fetch a ~1.5 MB ethrex-replay cache over
-          # the network (pinned to an immutable rev, so the input can't drift).
+          # ~1 MB, gitignored, and never in the checkout: fetch it rather than failing
+          # on a missing file, the same way the synthetic fixtures are generated above.
+          # This is a URL + sha256 download, not a build — no converter, no ethrex host
+          # dependency tree, no ethrex-replay cache. The step is already gated on the
+          # URL being set (see "Determine run count").
           #
           # Untracked, so like the ELF it survives `git checkout origin/main` and both
           # sides prove the identical block.
@@ -970,7 +989,7 @@ jobs:
             const tableParallelism = process.env.TABLE_PARALLELISM;
             const tpLabel = tableParallelism ? tableParallelism : 'auto (cores / 3)';
             body += `## Benchmark — ethrex 20 transfers${nLabel}\n\n`;
-            body += `<sub>Synthetic screen — 20 plain transfers, ~12x less work than a real block and a very different keccak:ecrecover mix. Fast, so it runs on every \`/bench\`; comment \`/bench-real\` for the representative number. Table parallelism: ${tpLabel}</sub>\n\n`;
+            body += `<sub>Synthetic screen — 20 plain transfers, ~16x less work than a real block and a very different keccak:ecrecover mix. Fast, so it runs on every \`/bench\`; comment \`/bench-real\` for the representative number. Table parallelism: ${tpLabel}</sub>\n\n`;
             body += `| Metric | main | PR | Δ |\n`;
             body += `|--------|------|----|---|\n`;
             body += `| **Peak heap** | ${basePeak} MB | ${peak} MB | ${fmt(peakDiff)} MB (${fmt(peakPct)}%) ${icon(peakPct)} |\n`;
@@ -1096,7 +1115,7 @@ jobs:
             // --- Footer ---
             if (!realTime) {
               body += `\n> 🧱 **This ran on synthetic blocks only.** Comment \`/bench-real\` to prove a real Ethereum block `;
-              body += `(keccak/trie-dominated rather than ecrecover-dominated). It adds ~15 min to the run.\n`;
+              body += `(keccak/trie-dominated rather than ecrecover-dominated). It adds ~13 min to the run.\n`;
             }
             const sha = process.env.COMMIT_SHA.substring(0, 8);
             body += `\n<sub>Commit: ${sha} · Baseline: ${baseSrc} · Runner: self-hosted bench</sub>\n`;

@@ -17,12 +17,14 @@
 #        EPOCH_SIZE_LOG2=<n> (default 21) sizes the epoch, WORKLOAD=real only.
 #
 # Pick the workload that matches the run you are localizing, because the symbol
-# mix follows the block: the synthetic default is 20 plain transfers (measured:
-# 14.2M cycles, 411 keccak calls, 80 ecsm calls) and a real block inverts that
-# (168.3M cycles, 9,046 keccak, 44 ecsm), so a hot symbol in one need not be hot
-# in the other. WORKLOAD=real also switches to a continuation prove (monolithic
-# would need ~500 GB at that trace length), which is ~15 min per recording — five
-# recordings, so budget over an hour.
+# mix follows the block: the synthetic default is 20 plain transfers (9.06M cycles,
+# 411 keccak calls, 80 ecsm calls) and a real block inverts that (147.5M cycles,
+# 9,046 keccak, 44 ecsm), so a hot symbol in one need not be hot in the other.
+# Both counts are for a current guest ELF; they shift ~14% with ELF vintage.
+#
+# WORKLOAD=real also switches to a continuation prove (monolithic would need
+# ~700 GB at that trace length), which is ~13 min per recording — five recordings,
+# so budget over an hour, plus ~5 GB of disk per bundle.
 #
 # Produces:
 #   - two perf-diff tables (recorded twice per side, interleaved B A B A —
@@ -69,9 +71,9 @@ command -v perf >/dev/null 2>&1 || { echo "ERROR: perf not installed (linux-tool
 [ -f "$ELF_REL" ] || { echo "ERROR: missing $ELF_REL — run bench_abba.sh once (it builds the guest)." >&2; exit 1; }
 if [ ! -f "$INPUT_REL" ]; then
   if [ "$WORKLOAD" = "real" ]; then
-    # ~1 MB and gitignored, so it is never in a fresh checkout; generate rather than
-    # abort. A cold run also downloads a ~1.5 MB ethrex-replay cache (pinned rev).
-    echo "==> Generating ethrex real-block fixture (missing; downloads a cache on a cold run)"
+    # ~1 MB, gitignored, never in a fresh checkout; fetch rather than abort. This is
+    # a URL + sha256 download, not a build.
+    echo "==> Fetching ethrex real-block fixture (missing)"
     make ethrex-real-block-fixture
   else
     echo "ERROR: missing $INPUT_REL — run bench_abba.sh once (it builds the fixture)." >&2

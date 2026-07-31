@@ -56,15 +56,17 @@ jobs:
         with:
           shared-key: "lambda-vm-test"
           cache-all-crates: "true"
-          # Both ethrex tool workspaces are detached (own Cargo.lock, own target
-          # dir), so the default `. -> target` misses them and their release
-          # trees rebuild from scratch on every run — ~335 packages for
-          # ethrex-real-block alone, including the blst, c-kzg and secp256k1-sys
-          # C builds, malachite and ark-ff/asm. `cache-all-crates` only covers
-          # the registry, not compiled artifacts.
+          # ethrex-tests is a detached workspace (own Cargo.lock, own target dir), so
+          # the default `. -> target` misses it and its release tree would rebuild
+          # from scratch every run. `cache-all-crates` only covers the registry, not
+          # compiled artifacts.
+          #
+          # ethrex-real-block is deliberately NOT here: this job no longer builds it.
+          # That workspace is the expensive one (~335 packages, including the blst,
+          # c-kzg and secp256k1-sys C builds, malachite and ark-ff/asm) and it now
+          # builds only in ethrex-real-block.yml, which carries its own cache entry.
           workspaces: |
             . -> target
-            tooling/ethrex-real-block -> target
             tooling/ethrex-tests -> target
 
       - name: Cache compiled ASM ELF artifacts
@@ -111,33 +113,30 @@ jobs:
         run: |
           cargo test --release -p executor test_ckzg -- --ignored
 
-      # The real-block fixture (~1 MB) is gitignored and generated on demand;
-      # test_ethrex_real_block_native below needs it present. This also
-      # downloads the ethrex-replay cache the converter's own tests read.
-      - name: Generate ethrex real-block fixture
-        run: make ethrex-real-block-fixture
-
-      # Detached workspace. Executes the block through `LambdaVmEcsmCrypto`, the
-      # guest's own `Crypto` impl, and pins the fixture's sha256. Note it does NOT
-      # screen KZG (its graph links c-kzg via ethrex-config — see that crate's
-      # Cargo.toml); the ethrex-tests step below is what covers 0x0a.
-      - name: Run ethrex real-block converter tests (detached workspace)
-        run: |
-          cd tooling/ethrex-real-block && cargo test --release
-
       # ethrex host-reference tests live in the detached `tooling/ethrex-tests`
       # workspace (ethrex pins rkyv's `unaligned` feature, which must not
       # feature-unify with the main workspace's aligned proof format), so run
       # them from that directory to use its isolated Cargo.lock. The guest ELF
       # and committed fixtures are already present from the steps above.
       # --include-ignored also runs the heavier synthetic-block test.
-      # `test_ethrex_real_block_vm` is skipped: it drives a real block through
-      # the VM and its runtime is not yet measured, so it stays opt-in rather
-      # than sitting in the PR gate. Run it manually on a build server.
+      #
+      # `--skip test_ethrex_real_block` is a substring match, so it drops BOTH
+      # real-block tests (the `_vm` and `_native` ones) and with them this job's need
+      # for the real-block fixture. That fixture is a benchmark input: it has to be
+      # right once, not on every PR, and fetching plus screening it here put a network
+      # download and a ~335-package build in the required gate for an artifact with no
+      # bearing on correctness. Both moved to ethrex-real-block.yml, which runs when
+      # the converter or the block pin actually changes. `no_kzg_backend_linked` still
+      # runs here — it is a pure unit test, and it is the property the real-block
+      # screen over there depends on.
+      #
+      # This is `make test-ethrex-offline` spelled out, matching the other test steps
+      # in this job: they all bypass make so its dependency check cannot decide the
+      # cache-restored ELFs are stale and trigger a rebuild.
       - name: Run ethrex host-reference tests (detached workspace)
         run: |
           cd tooling/ethrex-tests && \
-            cargo test --release -- --include-ignored --skip test_ethrex_real_block_vm
+            cargo test --release -- --include-ignored --skip test_ethrex_real_block
 
   test-cli:
     name: CLI tests

@@ -18,9 +18,14 @@ opposite — a block that actually looks like Ethereum.
 | state trie | 40 accounts, fresh genesis | 1,705 nodes |
 | storage keys | 0 | 422 |
 | serialized size | 32,766 B | 1,021,207 B |
+| cycles | 9,063,727 | **147,482,439** |
+| keccak / ecsm calls | 411 / 80 | **9,046** / 44 |
 
-Note it has *fewer* transactions than the synthetic fixture while being far more
-representative — transaction count is not the axis that matters.
+Note it has *fewer* transactions than the synthetic fixture while being ~16x the
+work — transaction count is not the axis that matters. The crypto mix inverts too:
+the synthetic block runs ~5 keccaks per ecrecover, the real one ~206. Cycle counts
+are for a current guest ELF and move ~14% with ELF vintage; pin the ELF when quoting
+one.
 
 The synthetic column is `ethrex_bench_20.bin` as the benchmark scripts actually
 generate it — `ethrex-fixtures 20 … distinct`, i.e. 20 distinct genesis-funded
@@ -33,27 +38,46 @@ Block 1265656 is **verified to run on the guest's precompile surface** (see
 replacement block must clear the same check — that is what makes it usable, not
 just realistic.
 
-## Prerequisites
-Rust (stable) and network access on first run (cargo fetches the pinned ethrex
-crates; `make` downloads the cache). **No RV64 target or sysroot needed** — this
-is a host tool.
+## Getting the fixture
 
-## How to run
-
-From the repo root, the committed default (Hoodi block 1265656):
+The fixture is **fetched, not built**:
 
 ```bash
 make ethrex-real-block-fixture
 ```
 
-That downloads the cache to `caches/` (gitignored) and writes
-`executor/tests/ethrex_hoodi_1265656.bin` (gitignored — ~1 MB, too large to
-commit; see `executor/.gitignore`).
+That downloads the finished `.bin` from `ETHREX_REAL_BLOCK_FIXTURE_URL` and
+verifies `ETHREX_REAL_BLOCK_FIXTURE_SHA256` before moving it into place —
+the same contract as `prepare-sysroot`. The file is gitignored (~1 MB; see
+`executor/.gitignore`), and a corrupt or interrupted download is discarded rather
+than left looking valid.
 
-The cache URL is pinned to an ethrex-replay **commit**, not to `main`
-(`ETHREX_REPLAY_REV` in the Makefile), matching how the guest pins ethrex. A
-branch ref would let the benchmark's input change under a fixed fixture name,
-which would quietly destroy comparability between runs.
+> The URL is currently **unset**. Until the artifact is hosted, this target fails
+> with an actionable message and every consumer degrades gracefully: the benchmark
+> workflow warns and skips its real-block section, and the usability screen in
+> `.github/workflows/ethrex-real-block.yml` skips too.
+
+This crate is *not* on that path. Fetching a verified binary is what takes the
+converter, the ~335-package ethrex host dependency tree, the ethrex-replay cache
+and the `rev` pin off the critical path of everyone who just wants to run a
+benchmark. It also decouples the block from what upstream hosts: ethrex-replay
+publishes a cache for Hoodi and nothing else, so a mainnet block is unreachable by
+the convert-locally route and trivial by this one.
+
+## Regenerating it (ethrex rev bumps)
+
+Needed roughly twice a year, when the guest's ethrex `rev` moves and the rkyv
+layout changes with it:
+
+```bash
+make regen-real-block-fixture     # downloads the pinned cache, rebuilds the .bin
+sha256sum executor/tests/ethrex_hoodi_1265656.bin
+```
+
+Then upload the result and update `ETHREX_REAL_BLOCK_FIXTURE_URL` /
+`_SHA256`. The cache URL is pinned to an ethrex-replay **commit**, not `main`
+(`ETHREX_REPLAY_REV`), matching how the guest pins ethrex — a branch ref would let
+the derivation drift under a fixed input.
 
 Directly, against any cache file:
 
@@ -79,27 +103,55 @@ asserts it. The pinned commit keeps the *input* immutable; the digest keeps the
 
 | Where | How to run it | Cost |
 |---|---|---|
-| `benchmark-pr.yml` | `/bench-real` on a PR; automatic on push to main and `workflow_dispatch` | ~15 min |
-| `scripts/bench_verify.sh` | `WORKLOAD=real scripts/bench_verify.sh <ref>` | ~15 min per side, then cached |
+| `benchmark-pr.yml` | `/bench-real` on a PR; automatic on push to main and `workflow_dispatch` | ~13 min |
+| `scripts/bench_verify.sh` | `WORKLOAD=real scripts/bench_verify.sh <ref>` | ~13 min per side, then cached |
 | `scripts/perf_diff.sh` | `WORKLOAD=real scripts/perf_diff.sh <ref>` | 5 recordings, so >1 h |
 
 None of them hardcode the fixture path — they read it from
 `make -s print-real-block-fixture` and run `make ethrex-real-block-fixture` when
-the (gitignored) `.bin` is absent.
+the `.bin` is absent.
 
 **Continuations are mandatory, not a tuning choice.** Peak heap on a monolithic
-prove grows ~3.1 GB per million cycles on this workload family (measured on the
-bench server: 2007 MB per transfer at R² = 0.998 across 4→20 transfers), and the
-real block is 168.3M cycles — roughly 500 GB. `--continuations` makes peak heap a
-function of the epoch size instead of the trace length, so the same block fits in
-~16 GB at epoch 2^21.
+prove grows ~4.9 GB per million cycles on this workload family (measured on the
+bench server: `10,728 MB + 2,007 MB/transfer`, R² = 0.998 across 4→20 transfers),
+and the real block is 147.5M cycles — roughly **700 GB**. `--continuations` makes
+peak heap a function of the epoch size instead of the trace length, so the same
+block fits in **~21 GB** at epoch 2^21: a 15.8 GB epoch working set plus ~69 MB per
+epoch of accumulated proofs over 68 epochs. The bundle on disk is ~5 GB, and
+serializing it past 2 GiB needs rkyv `pointer_width_64`.
 
 Plain `/bench` deliberately stays on the synthetic 20-transfer block: it proves in
-~25s against ~15 min, and the bench runner is single and serialized across all PRs.
-The synthetic number is a fast screen; the real block is the number that means
-something.
+~25s against ~13 min, and one runner carries every `/bench`, `/bench-abba` and
+`/bench-verify` in the repo. The synthetic number is a fast screen; the real block
+is the number that means something.
 
-## Getting a cache for a different block
+Cycle counts here (9.06M synthetic, 147.5M real) are for a **current guest ELF**.
+They move ~14% with ELF vintage — the same Hoodi block reads 168.3M on a
+mid-July ELF — so pin the ELF whenever you quote one, or it will look like a
+regression the next time someone measures.
+
+## Where validation runs
+
+The checks themselves are described under [Validation](#validation) below; this is
+where each one executes.
+
+`.github/workflows/ethrex-real-block.yml` runs them on changes to this crate,
+`tooling/ethrex-tests`, or the `Makefile` — **not** on every PR. The fixture is a
+benchmark input, read by no product code; it has to be right when it changes, not on
+every commit, and running it per-PR put a network fetch and a cold build of ~335
+packages in the required gate.
+
+`no_kzg_backend_linked` is the exception and stays in the required gate
+(`pr_main.yaml`): it is a pure unit test costing microseconds, and it is the property
+the usability screen depends on, so it should fail on the PR that breaks it rather
+than on some later, unrelated one.
+
+## Prerequisites (for regeneration only)
+Rust (stable) and network access on first run (cargo fetches the pinned ethrex
+crates; `make` downloads the cache). **No RV64 target or sysroot needed** — this
+is a host tool.
+
+## Getting a cache for a different block (regeneration only)
 
 The cache format is `ethrex-replay`'s, so use that tool to produce one — it
 handles the RPC fetching, multiple client backends, and the `eth_getProof`
@@ -121,32 +173,41 @@ the block under invented rules while still passing every check here, since the
 witness is only ever validated against whichever config we chose. The converter
 refuses instead; `unmappable_network_is_rejected` pins that.
 
-Then point this tool at the resulting JSON. Adopting a different block as the
-default is an edit, not a flag. Three of the four edits are the block's identity;
-the fourth is the digest that proves the conversion still matches.
+## Adopting a different block
 
-**1. The Makefile — this is what moves every benchmark.** Two lines:
+Since the fixture is fetched rather than converted locally, the **benchmark block
+and this crate's test block are independent**. This crate stays pinned to Hoodi
+1265656 — that is the one cache ethrex-replay hosts, and `conversion_is_reproducible`
+reads it — and none of its pins move when the benchmark block changes.
+
+Swapping the benchmark block is **four lines**, once the new `.bin` is hosted:
 
 ```make
-ETHREX_REAL_BLOCK_NETWORK := hoodi      # -> mainnet
-ETHREX_REAL_BLOCK         := 1265656    # -> 25453112
+# Makefile
+ETHREX_REAL_BLOCK_NETWORK        := hoodi      # -> mainnet
+ETHREX_REAL_BLOCK                := 1265656    # -> 25453112
+ETHREX_REAL_BLOCK_FIXTURE_SHA256 := 1f7d4c…    # -> 0298663d…
+ETHREX_REAL_BLOCK_FIXTURE_URL    := …          # -> the new artifact
 ```
 
-Everything downstream is derived from them: the cache path, the download URL, the
-fixture name, and — through `make -s print-real-block-fixture` — the benchmark
-scripts and `benchmark-pr.yml`. Nothing else names the block. Re-pin
-`ETHREX_REPLAY_REV` in the same edit if the new cache landed in a later commit.
+plus `REAL_BLOCK_FIXTURE` in `tooling/ethrex-tests` (which points the usability
+screen at the block actually being benchmarked). Everything else derives from the
+Makefile — fixture name, and through `make -s print-real-block-fixture` the
+benchmark scripts and `benchmark-pr.yml`. Nothing in `executor/.gitignore` needs
+touching: it already ignores every accepted network's fixture name, so a repointed
+~1 MB fixture cannot become committable by accident.
 
-**2. `src/main.rs`** — `CACHE` and the block assertions in
-`conversion_is_reproducible`, including the **sha256**. The digest cannot be
-guessed: run `make ethrex-real-block-fixture`, take the printed `sha256:` line,
-and paste it in. That is the check that keeps the derivation honest.
+**Mainnet 25453112 is ready to adopt.** It passes the usability screen (stateless
+re-execution reaches a matching post-state root with the KZG screen live), its
+digest is `0298663d33ae635b5e76266b54ce0f778388c7455e19be3d5207528092b2284f`, and
+at ~110M cycles it is ~25% *cheaper* to prove than Hoodi's 147.5M — roughly 10 min
+rather than 13. It is 1.93 MiB (3% of the 64 MiB private-input clamp). The only
+thing missing is a host for the `.bin`.
 
-**3. `tooling/ethrex-tests`** — `REAL_BLOCK_FIXTURE`.
-
-**4. Nothing in `executor/.gitignore`** — it already ignores every accepted
-network's fixture name, so a repointed ~1 MB fixture cannot become committable by
-accident.
+Note it cannot be produced by `make regen-real-block-fixture`: that route needs an
+ethrex-replay cache, upstream hosts only Hoodi's, and generating a mainnet one takes
+~4 minutes and ~700 calls against an archive RPC. This is precisely why the fixture
+is fetched rather than converted.
 
 Benchmark comparability does not survive the swap, and that is intentional rather
 than a wrinkle to work around: `benchmark-pr.yml` records which block it measured
@@ -186,9 +247,10 @@ milliseconds.
 
 What costs time is a cold build of the ethrex host dependency tree — ~335
 packages, including the `blst`, `c-kzg` and `secp256k1-sys` C builds, `malachite`
-and `ark-ff/asm` — not the tests. CI caches this workspace's `target/` (see the
-`workspaces:` list on the `test-executor` job's `rust-cache` step), so only cold
-runs pay it.
+and `ark-ff/asm` — not the tests. That build is why these checks live in their own
+path-filtered workflow rather than the PR gate (see [Where validation
+runs](#where-validation-runs)); `ethrex-real-block.yml` caches this workspace's
+`target/` under its own key, so only cold runs pay it.
 
 **`cargo test` here — `real_block_executes_under_guest_crypto`.** Executes the
 block through `LambdaVmEcsmCrypto`, the `Crypto` impl the guest injects, so it is
