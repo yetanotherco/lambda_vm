@@ -257,6 +257,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 /// via the timestamp-unique `Ecall` tuple, but every other multiplicity-column table
 /// bit-constrains its column in-circuit; HINT does the same rather than being the
 /// lone exception that relies solely on bus balance.
+#[derive(Clone, Copy)]
 pub struct HintConstraints;
 
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for HintConstraints {

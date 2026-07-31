@@ -121,7 +121,7 @@ pub fn deep_composition_ext3_with_dev_parts(
 /// trace terms. Same layout `compute_and_invert_denoms_ext3_dev`
 /// produces when called with `z_scalars = [z_power, z_shifted[0..]]`.
 #[allow(clippy::too_many_arguments)]
-pub fn deep_composition_ext3_with_dev_parts_and_inv_denoms(
+fn deep_fully_resident_launch(
     stream: &Arc<CudaStream>,
     main_lde: &GpuLdeBase,
     aux_lde: Option<&GpuLdeExt3>,
@@ -137,7 +137,12 @@ pub fn deep_composition_ext3_with_dev_parts_and_inv_denoms(
     num_eval_points: usize,
     row_stride: usize,
     domain_size: usize,
-) -> Result<Vec<u64>> {
+) -> Result<CudaSlice<u64>> {
+    main_lde.wait_ready_on(stream)?;
+    if let Some(aux) = aux_lde {
+        aux.wait_ready_on(stream)?;
+    }
+    h_parts_dev.wait_ready_on(stream)?;
     assert_eq!(main_lde.m, num_main);
     assert_eq!(h_parts_dev.m, num_parts);
     assert_eq!(h_parts_dev.lde_size, main_lde.lde_size);
@@ -175,10 +180,12 @@ pub fn deep_composition_ext3_with_dev_parts_and_inv_denoms(
     let be = backend()?;
 
     // H2D only the small scalars on the caller's stream.
-    let h_ood_dev = stream.clone_htod(h_ood)?;
-    let trace_ood_dev = stream.clone_htod(trace_ood)?;
-    let gammas_h_dev = stream.clone_htod(gammas_h)?;
-    let gammas_tr_dev = stream.clone_htod(gammas_tr)?;
+    let (h_ood_dev, trace_ood_dev, gammas_h_dev, gammas_tr_dev) = (
+        stream.clone_htod(h_ood)?,
+        stream.clone_htod(trace_ood)?,
+        stream.clone_htod(gammas_h)?,
+        stream.clone_htod(gammas_tr)?,
+    );
 
     // Slice the inv_denoms buffer into the H-term and trace-term views.
     let inv_h_view = inv_denoms_dev.slice(0..ext3_size);
@@ -232,9 +239,137 @@ pub fn deep_composition_ext3_with_dev_parts_and_inv_denoms(
             .launch(cfg)?;
     }
 
-    let out = stream.clone_dtoh(&deep_out)?;
+    Ok(deep_out)
+}
+
+/// Fully-resident DEEP composition: every large input is a device handle; the
+/// codeword is D2H'd through the per-worker pinned slab.
+#[allow(clippy::too_many_arguments)]
+pub fn deep_composition_ext3_with_dev_parts_and_inv_denoms(
+    stream: &Arc<CudaStream>,
+    main_lde: &GpuLdeBase,
+    aux_lde: Option<&GpuLdeExt3>,
+    h_parts_dev: &GpuLdeExt3,
+    inv_denoms_dev: &CudaSlice<u64>,
+    h_ood: &[u64],
+    trace_ood: &[u64],
+    gammas_h: &[u64],
+    gammas_tr: &[u64],
+    num_parts: usize,
+    num_main: usize,
+    num_aux: usize,
+    num_eval_points: usize,
+    row_stride: usize,
+    domain_size: usize,
+) -> Result<Vec<u64>> {
+    let deep_out = deep_fully_resident_launch(
+        stream,
+        main_lde,
+        aux_lde,
+        h_parts_dev,
+        inv_denoms_dev,
+        h_ood,
+        trace_ood,
+        gammas_h,
+        gammas_tr,
+        num_parts,
+        num_main,
+        num_aux,
+        num_eval_points,
+        row_stride,
+        domain_size,
+    )?;
+    let be = backend()?;
+    // DEEP output (domain_size * 3 u64s, ~50 MB): async D2H through the
+    // per-worker pinned slab instead of a blocking pageable copy.
+    let pending = crate::device::async_dtoh_via(
+        stream,
+        be.pinned_staging(),
+        &be.ctx,
+        &deep_out,
+        domain_size * 3,
+    )?;
     stream.synchronize()?;
+    let mut out = vec![0u64; domain_size * 3];
+    pending.wait_into_u64(&mut out)?;
     Ok(out)
+}
+
+/// The DEEP codeword resident on device in FRI (bit-reversed) order, with the
+/// stream that produced it.
+pub struct GpuDeepCodeword {
+    pub(crate) buf: CudaSlice<u64>,
+    pub n: usize,
+    pub(crate) stream: Arc<CudaStream>,
+}
+
+/// [`deep_composition_ext3_with_dev_parts_and_inv_denoms`] keeping the
+/// codeword on device, already bit-reverse-permuted into FRI order — the
+/// exact input [`crate::fri::FriCommitState::new_dev`] consumes. No D2H.
+#[allow(clippy::too_many_arguments)]
+pub fn deep_composition_ext3_fully_resident_keep(
+    stream: &Arc<CudaStream>,
+    main_lde: &GpuLdeBase,
+    aux_lde: Option<&GpuLdeExt3>,
+    h_parts_dev: &GpuLdeExt3,
+    inv_denoms_dev: &CudaSlice<u64>,
+    h_ood: &[u64],
+    trace_ood: &[u64],
+    gammas_h: &[u64],
+    gammas_tr: &[u64],
+    num_parts: usize,
+    num_main: usize,
+    num_aux: usize,
+    num_eval_points: usize,
+    row_stride: usize,
+    domain_size: usize,
+) -> Result<GpuDeepCodeword> {
+    assert!(
+        domain_size.is_power_of_two() && domain_size >= 2,
+        "bit-reverse needs a power-of-two codeword"
+    );
+    let deep_out = deep_fully_resident_launch(
+        stream,
+        main_lde,
+        aux_lde,
+        h_parts_dev,
+        inv_denoms_dev,
+        h_ood,
+        trace_ood,
+        gammas_h,
+        gammas_tr,
+        num_parts,
+        num_main,
+        num_aux,
+        num_eval_points,
+        row_stride,
+        domain_size,
+    )?;
+    let be = backend()?;
+    // SAFETY: every element is written by the permutation kernel below.
+    let mut reversed = unsafe { stream.alloc::<u64>(domain_size * 3) }?;
+    let log_n = domain_size.trailing_zeros();
+    let n_u64 = domain_size as u64;
+    let grid = (domain_size as u32).div_ceil(128).max(1);
+    let cfg = LaunchConfig {
+        grid_dim: (grid, 1, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        stream
+            .launch_builder(&be.bit_reverse_ext3_kernel)
+            .arg(&deep_out)
+            .arg(&mut reversed)
+            .arg(&n_u64)
+            .arg(&log_n)
+            .launch(cfg)?;
+    }
+    Ok(GpuDeepCodeword {
+        buf: reversed,
+        n: domain_size,
+        stream: stream.clone(),
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -257,6 +392,13 @@ fn deep_composition_ext3_impl(
     row_stride: usize,
     domain_size: usize,
 ) -> Result<Vec<u64>> {
+    main_lde.wait_ready_on(stream)?;
+    if let Some(aux) = aux_lde {
+        aux.wait_ready_on(stream)?;
+    }
+    if let Some(parts) = h_parts_dev {
+        parts.wait_ready_on(stream)?;
+    }
     assert_eq!(main_lde.m, num_main);
     if let Some(a) = aux_lde {
         assert_eq!(a.m, num_aux);
@@ -293,12 +435,14 @@ fn deep_composition_ext3_impl(
 
     let be = backend()?;
 
-    let h_ood_dev = stream.clone_htod(h_ood)?;
-    let trace_ood_dev = stream.clone_htod(trace_ood)?;
-    let gammas_h_dev = stream.clone_htod(gammas_h)?;
-    let gammas_tr_dev = stream.clone_htod(gammas_tr)?;
-    let inv_h_dev = stream.clone_htod(inv_h)?;
-    let inv_t_dev = stream.clone_htod(inv_t)?;
+    let (h_ood_dev, trace_ood_dev, gammas_h_dev, gammas_tr_dev, inv_h_dev, inv_t_dev) = (
+        stream.clone_htod(h_ood)?,
+        stream.clone_htod(trace_ood)?,
+        stream.clone_htod(gammas_h)?,
+        stream.clone_htod(gammas_tr)?,
+        stream.clone_htod(inv_h)?,
+        stream.clone_htod(inv_t)?,
+    );
 
     let h_lde_host_dev;
     let dummy_aux;
@@ -358,7 +502,19 @@ fn deep_composition_ext3_impl(
             .launch(cfg)?;
     }
 
-    let out = stream.clone_dtoh(&deep_out)?;
+    // DEEP output (domain_size * 3 u64s, ~50 MB): async D2H through the
+    // per-worker pinned slab instead of a blocking pageable copy. The
+    // synchronize drains the kernels and the DMA so the pending wait below
+    // is instant.
+    let pending = crate::device::async_dtoh_via(
+        stream,
+        be.pinned_staging(),
+        &be.ctx,
+        &deep_out,
+        domain_size * 3,
+    )?;
     stream.synchronize()?;
+    let mut out = vec![0u64; domain_size * 3];
+    pending.wait_into_u64(&mut out)?;
     Ok(out)
 }
