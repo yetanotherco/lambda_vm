@@ -21,6 +21,14 @@ entry only with the verifying evidence named in it.
    Default is the range check: if assembly arrives and the argument is
    still unverified, emit the check.
 
+## WATCH (anomalies assembly should confirm or explain, not obligations)
+
+- **HALT's constraint-leg cost line is out of step**: 9,859 instructions
+  for 22 columns, inconsistent with its neighbours (deep-join, final
+  report — noticed, not chased). Assembly composes per-AIR numbers; an
+  unexplained per-AIR outlier is exactly where a composition error would
+  hide.
+
 ## STANDING (from the RESUME, restated so this file is self-contained)
 
 - Every per-epoch number so far is a COMPOSITION of per-AIR measurements,

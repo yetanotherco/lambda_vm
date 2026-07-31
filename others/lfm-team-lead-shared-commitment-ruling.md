@@ -40,15 +40,23 @@ was requested before the FRI leg adds a fifth tree per query.
    FINAL shape wants the batched inner proof. The hash-matrix phase after
    e2e must therefore include a batched-shape cell, measured, not argued.
 
-4. **Prediction pinned for that future cell:** ~3/4 of opening-walk
-   permutations collapse (deep-join's figure), i.e. per-epoch opening
-   authentication ~213,744 → roughly 55–70k permutations at blowup 8,
-   before FRI-tree effects. A measured miss means the shape model is wrong.
+4. **Prediction — CORRECTED 2026-07-31 after measurement** (deep-join,
+   b728043c). My original pin (~3/4 collapse, 213,744 → 55–70k at blowup 8)
+   was too optimistic by ~1.7×. The measured figure is **111,471 — a 48%
+   collapse**. The reasoning was right about walks and wrong about their
+   share: walks DO collapse 69% (1,958 → 616 permutations per query), but
+   they are only two thirds of the bill; the other third is leaf absorbs,
+   which sharing barely touches (absorbs scale with total bytes, walks with
+   tree count, and only the tree count collapses). This is arithmetic over
+   the shape — `ceil(leaf_bytes/136)` absorbs plus one permutation per
+   level — under one assumption: one tree per sub-proof, leaf = the
+   matrices' row pairs concatenated in matrix order.
 
-## What this ruling cannot see
+## What this ruling could not see — CLOSED
 
-The LFM instruction/permutation cost of leaf WIDENING under a shared tree:
-wider leaves absorb more blocks per leaf, offsetting part of the walk
-saving. The guest-side analogue was measured (+266M opening-hash when
-sim/4's shared tree widened leaves); the LFM analogue is unmeasured and is
-part of what the batched-shape cell must answer.
+The original version flagged leaf WIDENING under a shared tree as
+unmeasured. Measured (deep-join, b728043c): widening is a small SAVING,
+not a cost — absorbs go 970 → 911 per query, structurally, because total
+leaf bytes do not change when matrices share a leaf; the only bytes that
+move are the padding of the leaves that vanish. The sim/4 guest-side
++266M analogue does not transfer to LFM's permutation-count model.
