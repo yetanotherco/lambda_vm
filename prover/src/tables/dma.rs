@@ -484,6 +484,7 @@ fn halfword(column: usize) -> BusInteraction {
 /// - active first/end rows;
 /// - `step = 8 - 7*tail` address/count arithmetic;
 /// - unused bytes are zero on one-byte tail rows.
+#[derive(Clone, Copy)]
 pub struct DmaConstraints;
 
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for DmaConstraints {
