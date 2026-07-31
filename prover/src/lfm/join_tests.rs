@@ -759,6 +759,44 @@ fn join_leg_cost() {
         total_perm * QUERIES,
         total_cells * QUERIES as u64,
     );
+
+    // ---- what a SHARED commitment would cost, exactly, under one assumption -
+    //
+    // `others/lfm-team-lead-shared-commitment-ruling.md` parks the lever and
+    // pins a prediction of 55-70k permutations, noting that leaf WIDENING under
+    // a shared tree is unmeasured and could offset the walk saving. It can be
+    // settled without building anything: a permutation count is a function of
+    // the shape alone -- `ceil(leaf_bytes / 136)` absorbs plus one per level --
+    // so the only thing being assumed is the SHAPE (one tree per sub-proof
+    // whose leaf is the four matrices' row pairs concatenated in matrix order).
+    // Nothing about the arithmetic is estimated.
+    //
+    // Widening cannot offset much, and the reason is structural: absorbs scale
+    // with total bytes, which do not change when the matrices share a leaf,
+    // while walks scale with the number of TREES, which is what collapses. The
+    // only bytes lost are the per-leaf padding of the groups that disappear.
+    const RATE_BYTES: usize = 136;
+    let mut shared_perm = 0usize;
+    for (label, air) in &airs {
+        let num_precomputed = production_num_precomputed(label, &**air);
+        let shape = shape_for(&**air, num_precomputed, LOG2_TRACE, LOG2_BLOWUP);
+        let leaf_bytes: usize = shape.groups().iter().map(GroupShape::leaf_bytes).sum();
+        shared_perm += leaf_bytes.div_ceil(RATE_BYTES) + shape.merkle_depth;
+    }
+    println!(
+        "\nOne shared tree per sub-proof instead of four: {shared_perm} \
+         permutations per query against {total_perm} ({:.0}% collapse), \
+         {} per epoch at {QUERIES} queries.",
+        100.0 * (1.0 - shared_perm as f64 / total_perm as f64),
+        shared_perm * QUERIES,
+    );
+    println!(
+        "Absorbs are {} of the shared figure and walks {}; widening costs \
+         nothing here because total leaf BYTES do not change when matrices \
+         share a leaf -- only the padding of the vanished leaves.",
+        shared_perm - airs.len() * (LOG2_TRACE + LOG2_BLOWUP - 1) as usize,
+        airs.len() * (LOG2_TRACE + LOG2_BLOWUP - 1) as usize,
+    );
 }
 
 // =============================================================================
