@@ -630,11 +630,26 @@ impl Drop for PendingD2H<'_> {
     }
 }
 
-/// Host→device copy staged through the pinned slot: one host memcpy into
-/// pinned memory + one async DMA, instead of the driver's internal pageable
-/// staging (small chunks; 2-3x slower for multi-hundred-MB traces and it
-/// convoys under multi-thread load). Blocks until the DMA lands, so the slot
-/// and `src_host` are both reusable on return.
+/// Chunk size for [`htod_via`]'s staged upload — the upper bound a single H2D
+/// puts on a staging slot's page-locked footprint. 64 MB is large enough to
+/// amortize the per-chunk DMA launch + event sync, small enough to keep the
+/// pinned slab independent of trace size.
+const HTOD_CHUNK_BYTES: usize = 64 << 20; // 64 MB
+
+/// Host→device copy staged through the pinned slot, in fixed-size chunks: each
+/// chunk is one host memcpy into pinned memory + one async DMA, instead of the
+/// driver's internal pageable staging (small chunks; 2-3x slower for
+/// multi-hundred-MB traces and it convoys under multi-thread load). Blocks
+/// until the last DMA lands, so the slot and `src_host` are both reusable on
+/// return.
+///
+/// Chunking caps the slot's page-locked footprint at [`HTOD_CHUNK_BYTES`]
+/// regardless of trace size. This matters on the device-only path
+/// (`retain_host_lde = false`): there is no [`async_dtoh_via`] drain to size
+/// the slot, so `htod_via` is its only writer — an uncapped copy would grow
+/// the per-worker slab to a whole trace and, being grow-only, never shrink it.
+/// The host-retaining path is unaffected: its later `async_dtoh_via` grows the
+/// same slot to the full LDE anyway, and we simply reuse the first chunk of it.
 pub fn htod_via<T: cudarc::driver::DeviceRepr>(
     stream: &Arc<CudaStream>,
     slot: &Mutex<PinnedStaging>,
@@ -651,31 +666,51 @@ pub fn htod_via<T: cudarc::driver::DeviceRepr>(
     if n_bytes == 0 {
         return Ok(());
     }
-    let u64_len = n_bytes.div_ceil(8);
+    let elem_size = std::mem::size_of::<T>();
+    // Chunk in whole elements so a `T` never straddles a chunk boundary.
+    let chunk_elems = (HTOD_CHUNK_BYTES / elem_size.max(1)).max(1);
+
     let mut staging = slot.lock().unwrap();
-    staging.ensure_capacity(u64_len, ctx)?;
+    // Only ask for a chunk's worth of pinned memory (or the whole copy when
+    // smaller). If another path (`async_dtoh_via` on the host-retaining flow)
+    // already grew this slot larger, it stays larger — grow-only — and we just
+    // use the first chunk of it.
+    let want_u64 = (chunk_elems * elem_size).div_ceil(8).min(n_bytes.div_ceil(8));
+    staging.ensure_capacity(want_u64, ctx)?;
     ctx.bind_to_thread()?;
-    // SAFETY: the pinned allocation is stable while the lock is held and at
-    // least `n_bytes` long (`ensure_capacity`). The DMA reads it after the
-    // host memcpy (program order); `device_ptr_mut` orders the device write
-    // on `stream`.
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            src_host.as_ptr() as *const u8,
-            staging.ptr as *mut u8,
-            n_bytes,
-        );
-        let (dst_ptr, _record) = dst.device_ptr_mut(stream);
-        cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
-            dst_ptr,
-            staging.ptr as *const core::ffi::c_void,
-            n_bytes,
-            stream.cu_stream(),
-        )
-        .result()?;
+
+    // SAFETY: `device_ptr_mut` yields the destination base pointer and orders
+    // the device writes on `stream`; `dst.len() >= src_host.len()` (asserted),
+    // so every chunk's byte range stays within `dst`.
+    let (dst_base, _record) = dst.device_ptr_mut(stream);
+    let src = src_host.as_ptr() as *const u8;
+    let n_elems = src_host.len();
+    let mut elem_off = 0usize;
+    while elem_off < n_elems {
+        let this_elems = (n_elems - elem_off).min(chunk_elems);
+        let this_bytes = this_elems * elem_size;
+        let byte_off = elem_off * elem_size;
+        // SAFETY: the pinned slab holds at least `chunk_elems * elem_size`
+        // bytes (or the whole copy when smaller). The previous chunk's DMA is
+        // synced below before this memcpy overwrites the slab, so the slab is
+        // never read (by an in-flight DMA) and written at the same time.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.add(byte_off), staging.ptr as *mut u8, this_bytes);
+            cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+                dst_base + byte_off as u64,
+                staging.ptr as *const core::ffi::c_void,
+                this_bytes,
+                stream.cu_stream(),
+            )
+            .result()?;
+        }
+        // Single-buffered: wait for this chunk's DMA before the next memcpy
+        // reuses the slab.
+        staging.record_event(stream)?;
+        staging.sync_event()?;
+        elem_off += this_elems;
     }
-    staging.record_event(stream)?;
-    staging.sync_event()
+    Ok(())
 }
 
 /// Enqueue an async D2H of `n_elems` of `src` into the pinned slab of `slot`,
