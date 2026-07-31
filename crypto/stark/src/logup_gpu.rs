@@ -364,7 +364,11 @@ where
         return None;
     }
     // Escape hatch for A/B measurement: force the CPU aux build.
-    if std::env::var_os("LAMBDA_VM_NO_GPU_LOGUP").is_some() {
+    if std::env::var_os("LAMBDA_VM_NO_GPU_LOGUP").is_some()
+        || crate::runtime_overrides::get()
+            .no_gpu_logup
+            .unwrap_or(false)
+    {
         return None;
     }
 
@@ -434,7 +438,11 @@ where
     if trace_len < GPU_LOGUP_MIN_ROWS || main_cols.is_empty() || interactions.is_empty() {
         return None;
     }
-    if std::env::var_os("LAMBDA_VM_NO_GPU_LOGUP").is_some() {
+    if std::env::var_os("LAMBDA_VM_NO_GPU_LOGUP").is_some()
+        || crate::runtime_overrides::get()
+            .no_gpu_logup
+            .unwrap_or(false)
+    {
         return None;
     }
     let desc = build_fingerprint_descriptor(interactions);

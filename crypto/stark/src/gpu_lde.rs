@@ -48,6 +48,7 @@ fn gpu_lde_threshold() -> usize {
         std::env::var("LAMBDA_VM_GPU_LDE_THRESHOLD")
             .ok()
             .and_then(|s| s.parse().ok())
+            .or(crate::runtime_overrides::get().gpu_lde_threshold)
             .unwrap_or(DEFAULT_GPU_LDE_THRESHOLD)
     })
 }
@@ -142,6 +143,8 @@ pub(crate) fn gpu_composition_disabled() -> bool {
     *ENV_DISABLED.get_or_init(|| {
         std::env::var("LAMBDA_VM_DISABLE_GPU_COMPOSITION")
             .map(|v| v == "1")
+            .ok()
+            .or(crate::runtime_overrides::get().disable_gpu_composition)
             .unwrap_or(false)
     })
 }
@@ -163,6 +166,8 @@ pub(crate) fn device_only_disabled() -> bool {
     *ENV_DISABLED.get_or_init(|| {
         std::env::var("LAMBDA_VM_DISABLE_DEVICE_ONLY")
             .map(|v| v == "1")
+            .ok()
+            .or(crate::runtime_overrides::get().disable_device_only)
             .unwrap_or(false)
     })
 }
@@ -812,6 +817,7 @@ fn gpu_bary_threshold() -> usize {
         std::env::var("LAMBDA_VM_GPU_BARY_THRESHOLD")
             .ok()
             .and_then(|s| s.parse().ok())
+            .or(crate::runtime_overrides::get().gpu_bary_threshold)
             .unwrap_or(DEFAULT_GPU_BARY_THRESHOLD)
     })
 }

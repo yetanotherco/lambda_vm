@@ -106,6 +106,21 @@ const LOGUP_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/logup.cubin
 const CONSTRAINT_INTERP_CUBIN: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/constraint_interp.cubin"));
 
+/// Runtime overrides for the device knobs, installed once at startup (before
+/// backend init) by the config-file layer in the stark crate. Env vars keep
+/// priority at each read site.
+static RUNTIME_OVERRIDES: std::sync::OnceLock<(Option<u64>, Option<u64>)> =
+    std::sync::OnceLock::new();
+
+/// `(vram_budget_mb, mempool_release_mb)`; first install wins.
+pub fn set_runtime_overrides(vram_budget_mb: Option<u64>, mempool_release_mb: Option<u64>) {
+    let _ = RUNTIME_OVERRIDES.set((vram_budget_mb, mempool_release_mb));
+}
+
+fn runtime_overrides() -> (Option<u64>, Option<u64>) {
+    RUNTIME_OVERRIDES.get().copied().unwrap_or((None, None))
+}
+
 /// Number of CUDA streams in the pool. Larger pools let many rayon-parallel
 /// callers overlap on the GPU without serializing on stream ownership. The
 /// default stream is deliberately excluded because it synchronises with all
@@ -231,6 +246,7 @@ fn retain_default_mempool(ctx: &CudaContext) {
         let threshold: u64 = std::env::var("LAMBDA_VM_MEMPOOL_RELEASE_MB")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
+            .or(runtime_overrides().1)
             .map(|mb| mb.saturating_mul(1024 * 1024))
             .unwrap_or(u64::MAX);
         let _ = sys::cuMemPoolSetAttribute(
@@ -253,6 +269,9 @@ fn detect_vram_budget_bytes(ctx: &CudaContext) -> u64 {
     if let Ok(mb) = std::env::var("LAMBDA_VM_VRAM_BUDGET_MB")
         && let Ok(mb) = mb.parse::<u64>()
     {
+        return mb.saturating_mul(1024 * 1024);
+    }
+    if let (Some(mb), _) = runtime_overrides() {
         return mb.saturating_mul(1024 * 1024);
     }
     use cudarc::driver::sys;
