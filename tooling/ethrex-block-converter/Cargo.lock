@@ -878,6 +878,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "ethrex-block-converter"
+version = "0.1.0"
+dependencies = [
+ "ethrex-common",
+ "ethrex-config",
+ "ethrex-guest-program",
+ "k256",
+ "lambda-vm-ethrex-crypto",
+ "rkyv",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "ethrex-blockchain"
 version = "13.0.0"
 source = "git+https://github.com/lambdaclass/ethrex.git?rev=156cb8d6a3974f411d71622eecd1b249ee37ff1c#156cb8d6a3974f411d71622eecd1b249ee37ff1c"
@@ -1071,21 +1086,6 @@ dependencies = [
  "tokio-stream",
  "tokio-util",
  "tracing",
-]
-
-[[package]]
-name = "ethrex-real-block"
-version = "0.1.0"
-dependencies = [
- "ethrex-common",
- "ethrex-config",
- "ethrex-guest-program",
- "k256",
- "lambda-vm-ethrex-crypto",
- "rkyv",
- "serde",
- "serde_json",
- "sha2",
 ]
 
 [[package]]

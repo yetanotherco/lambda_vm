@@ -85,7 +85,9 @@ fn usage_and_exit(program: &str) -> ! {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args();
-    let program = args.next().unwrap_or_else(|| "ethrex-real-block".into());
+    let program = args
+        .next()
+        .unwrap_or_else(|| "ethrex-block-converter".into());
     let (Some(cache_path), Some(out_path)) = (args.next(), args.next()) else {
         usage_and_exit(&program);
     };
@@ -121,7 +123,7 @@ mod tests {
     /// block the benchmarks currently prove: it is the one cache ethrex-replay hosts
     /// upstream, so keeping the converter's test input there costs us no hosting and
     /// cannot drift. What is under test here is the CONVERSION, not the benchmark
-    /// workload — see tooling/ethrex-real-block/README.md.
+    /// workload — see tooling/ethrex-block-converter/README.md.
     ///
     /// `caches/` is gitignored and fetched on demand, so every test here fails on
     /// a clean checkout until the cache is downloaded. Say so instead of surfacing

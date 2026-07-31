@@ -302,7 +302,7 @@ test-rust: compile-programs-rust
 # names a block. Outside this file the repoint touches only REAL_BLOCK_FIXTURE in
 # tooling/ethrex-tests, which points the usability screen at the block actually
 # being proven. The converter's own pins do NOT move — see below.
-# tooling/ethrex-real-block/README.md carries the procedure and each candidate's
+# tooling/ethrex-block-converter/README.md carries the procedure and each candidate's
 # measured cost.
 ETHREX_REAL_BLOCK_NETWORK := mainnet
 ETHREX_REAL_BLOCK := 25368371
@@ -315,7 +315,7 @@ ETHREX_REAL_BLOCK_CACHE_SHA256 := 7aa88a5f7c5755b7575870f95e6c5c26186947f5e9e0d5
 
 ETHREX_REAL_BLOCK_ID := $(ETHREX_REAL_BLOCK_NETWORK)_$(ETHREX_REAL_BLOCK)
 ETHREX_REAL_BLOCK_FIXTURE := executor/tests/ethrex_$(ETHREX_REAL_BLOCK_ID).bin
-ETHREX_REAL_BLOCK_CACHE := tooling/ethrex-real-block/caches/cache_$(ETHREX_REAL_BLOCK_ID).json
+ETHREX_REAL_BLOCK_CACHE := tooling/ethrex-block-converter/caches/cache_$(ETHREX_REAL_BLOCK_ID).json
 
 # $(call ensure_verified,url,sha256,dest,label,url-var-name)
 #
@@ -350,7 +350,7 @@ define ensure_verified
 		echo "$(4): $(5) is unset." >&2; \
 		echo "  The $(ETHREX_REAL_BLOCK_ID) $(4) is fetched, not built. Set $(5) in the" >&2; \
 		echo "  Makefile to wherever the artifact is hosted; see" >&2; \
-		echo "  tooling/ethrex-real-block/README.md for how to produce and host one." >&2; \
+		echo "  tooling/ethrex-block-converter/README.md for how to produce and host one." >&2; \
 		exit 1; \
 	fi; \
 	mkdir -p $(dir $(3)); \
@@ -405,14 +405,14 @@ print-real-block-fixture-url:
 # the converter's reproducibility digest drift under a fixed input.
 ETHREX_REPLAY_REV := 2693e0182a8734117151d8ea2891eda5afc60383
 ETHREX_CONVERTER_TEST_BLOCK := hoodi_1265656
-ETHREX_CONVERTER_CACHE := tooling/ethrex-real-block/caches/cache_$(ETHREX_CONVERTER_TEST_BLOCK).json
+ETHREX_CONVERTER_CACHE := tooling/ethrex-block-converter/caches/cache_$(ETHREX_CONVERTER_TEST_BLOCK).json
 # The cache filename is keyed on the block only, and its download rule has no other
 # prerequisite, so make would treat an already-present cache as up to date across an
 # `ETHREX_REPLAY_REV` bump and silently keep reading the old input. Depending on a
 # rev-stamped marker makes a re-pin discard the stale cache; without it the mismatch
 # only surfaces downstream as a `conversion_is_reproducible` digest failure, which
 # reads as "regenerate the fixture" and points at the wrong thing.
-ETHREX_REPLAY_REV_STAMP := tooling/ethrex-real-block/caches/.replay-rev-$(ETHREX_REPLAY_REV)
+ETHREX_REPLAY_REV_STAMP := tooling/ethrex-block-converter/caches/.replay-rev-$(ETHREX_REPLAY_REV)
 
 $(ETHREX_REPLAY_REV_STAMP):
 	mkdir -p $(dir $@)
@@ -429,22 +429,22 @@ ethrex-real-block-converter-cache: $(ETHREX_CONVERTER_CACHE)
 
 # Converter correctness: host-side parity through the guest's own Crypto impl, the
 # network-rejection guard, and the reproducibility digest. Runs on changes to the
-# converter (see .github/workflows/ethrex-real-block.yml), not on every PR.
+# converter (see .github/workflows/ethrex-block-converter.yml), not on every PR.
 test-ethrex-real-block-converter: $(ETHREX_CONVERTER_CACHE)
-	cd tooling/ethrex-real-block && cargo test --release
+	cd tooling/ethrex-block-converter && cargo test --release
 
 # Manual regeneration of the BENCHMARK fixture (not the converter's test block):
 # fetches that block's own cache and re-converts it, overwriting the fixture in
 # place so you can hash the result and upload it. That upload, plus SHA256/URL at
 # the top, is how the fixture is actually replaced.
 regen-real-block-fixture: ethrex-real-block-cache
-	cd tooling/ethrex-real-block && \
+	cd tooling/ethrex-block-converter && \
 		cargo run --release -- ../../$(ETHREX_REAL_BLOCK_CACHE) ../../$(ETHREX_REAL_BLOCK_FIXTURE)
 
 # ethrex host-reference tests live in the detached `tooling/ethrex-tests`
 # workspace (ethrex pins rkyv's `unaligned` feature; isolated Cargo.lock).
 # Needs the real-block fixture, so it needs the fixture URL to be set; CI runs the
-# `-offline` variant below in the PR gate and this one only in ethrex-real-block.yml.
+# `-offline` variant below in the PR gate and this one only in ethrex-block-converter.yml.
 test-ethrex: compile-programs-rust ethrex-real-block-fixture
 	cd tooling/ethrex-tests && cargo test --release -- --include-ignored --skip test_ethrex_real_block_vm
 

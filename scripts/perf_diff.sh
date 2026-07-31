@@ -16,7 +16,7 @@
 #   Env: WORKLOAD=synthetic|real (default synthetic) picks the block to profile;
 #        EPOCH_SIZE_LOG2=<n> (default 22) sizes the epoch, WORKLOAD=real only.
 #          22 is the calibrated bench-runner tier, matching /bench; use 23 on a
-#          128 GiB box (tooling/ethrex-real-block/README.md, "Choosing the epoch size").
+#          128 GiB box (tooling/ethrex-block-converter/README.md, "Choosing the epoch size").
 #
 # Pick the workload that matches the run you are localizing, because the symbol
 # mix follows the block: the synthetic default is 20 plain transfers (8.73M cycles,

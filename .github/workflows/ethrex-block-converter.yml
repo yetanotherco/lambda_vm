@@ -1,4 +1,4 @@
-name: ethrex real-block fixture tests
+name: ethrex block-converter tests
 
 # Validation for the real-block benchmark fixture and the converter that produces
 # it. Deliberately NOT part of the required PR gate (pr_main.yaml): the fixture is a
@@ -15,14 +15,14 @@ on:
   pull_request:
     branches: ["**"]
     paths:
-      - 'tooling/ethrex-real-block/**'
+      - 'tooling/ethrex-block-converter/**'
       - 'tooling/ethrex-tests/**'
       - 'Makefile'
-      - '.github/workflows/ethrex-real-block.yml'
+      - '.github/workflows/ethrex-block-converter.yml'
   push:
     branches: ["main"]
     paths:
-      - 'tooling/ethrex-real-block/**'
+      - 'tooling/ethrex-block-converter/**'
       - 'tooling/ethrex-tests/**'
       - 'Makefile'
 
@@ -35,7 +35,7 @@ concurrency:
 
 jobs:
   converter:
-    name: Real-block converter tests
+    name: Block converter tests
     runs-on: ubuntu-latest
     steps:
       - name: Checkout sources
@@ -49,12 +49,12 @@ jobs:
         with:
           # Own key, not pr_main.yaml's "lambda-vm-test": a shared key across jobs
           # that build different crate sets causes recompilation on both sides.
-          shared-key: "lambda-vm-ethrex-real-block"
+          shared-key: "lambda-vm-ethrex-block-converter"
           cache-all-crates: "true"
           # Detached workspace (own Cargo.lock, own target dir), so the default
           # `. -> target` would miss it and rebuild the ethrex tree every run.
           workspaces: |
-            tooling/ethrex-real-block -> target
+            tooling/ethrex-block-converter -> target
 
       # Downloads the pinned ethrex-replay cache (the converter's test input) and
       # runs the crate's tests: host-side parity through the guest's own

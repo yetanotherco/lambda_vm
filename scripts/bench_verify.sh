@@ -34,7 +34,7 @@
 #        CONT_EPOCH_LOG2=<n> continuation epoch size (default 20, min 18). For
 #        WORKLOAD=real prefer the calibrated tier for the box you are on — 2^22 on the
 #        bench runner or a 64 GiB machine, 2^23 on a 128 GiB one (see
-#        tooling/ethrex-real-block/README.md, "Choosing the epoch size"); the default
+#        tooling/ethrex-block-converter/README.md, "Choosing the epoch size"); the default
 #        below is chosen for the SYNTHETIC arm. 20 matches
 #        scripts/bench_abba.sh, so this arm proves the same bundle shape /bench already
 #        proves on the same server — and 20 txs at 2^20 is strictly cheaper than the

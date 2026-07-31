@@ -1,4 +1,4 @@
-# ethrex-real-block
+# ethrex-block-converter
 
 Converts a **real Ethereum block** into a serialized `ProgramInput` `.bin` for
 the lambda-vm ethrex guest, reading an [`ethrex-replay`][replay] cache JSON.
@@ -116,7 +116,7 @@ Then upload the result and update `ETHREX_REAL_BLOCK_FIXTURE_SHA256` and its URL
 Directly, against any cache file:
 
 ```bash
-cd tooling/ethrex-real-block
+cd tooling/ethrex-block-converter
 cargo run --release -- <cache.json> <output_path>
 ```
 
@@ -242,7 +242,7 @@ someone measures.
 The checks themselves are described under [Validation](#validation) below; this is
 where each one executes.
 
-`.github/workflows/ethrex-real-block.yml` runs them on changes to this crate,
+`.github/workflows/ethrex-block-converter.yml` runs them on changes to this crate,
 `tooling/ethrex-tests`, or the `Makefile` — **not** on every PR. The fixture is a
 benchmark input, read by no product code; it has to be right when it changes, not on
 every commit, and running it per-PR put a network fetch and a cold build of ~335
@@ -441,7 +441,7 @@ What costs time is a cold build of the ethrex host dependency tree — ~335
 packages, including the `blst`, `c-kzg` and `secp256k1-sys` C builds, `malachite`
 and `ark-ff/asm` — not the tests. That build is why these checks live in their own
 path-filtered workflow rather than the PR gate (see [Where validation
-runs](#where-validation-runs)); `ethrex-real-block.yml` caches this workspace's
+runs](#where-validation-runs)); `ethrex-block-converter.yml` caches this workspace's
 `target/` under its own key, so only cold runs pay it.
 
 These run against this crate's own pinned block (Hoodi 1265656), **not** the

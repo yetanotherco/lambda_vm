@@ -1,5 +1,5 @@
 [package]
-name = "ethrex-real-block"
+name = "ethrex-block-converter"
 version = "0.1.0"
 edition = "2024"
 

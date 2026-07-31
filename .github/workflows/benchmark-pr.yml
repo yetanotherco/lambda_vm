@@ -17,7 +17,7 @@ on:
       # bytes, the Makefile decides which block it is. Without them a repointed
       # block would leave main's baseline stale until some prover file happened
       # to change — and the comparison guard would suppress the table until then.
-      - 'tooling/ethrex-real-block/**'
+      - 'tooling/ethrex-block-converter/**'
       - 'Makefile'
   # Uncomment to auto-run on PRs:
   # pull_request:
@@ -77,14 +77,14 @@ env:
   # current default would need ~240 GB and a heavier candidate far more.
   # `--continuations` makes peak heap a function of the epoch size instead of the
   # trace length. Costs move with the block; the per-candidate table is in
-  # tooling/ethrex-real-block/README.md.
+  # tooling/ethrex-block-converter/README.md.
   #
   # Budget ~1.2 GB of disk for the bundle each run — hence the `rm -f` after every
   # prove. A heavier block pushes it past 2 GiB, which needs rkyv `pointer_width_64`;
   # a PR branch predating that fix fails at write time rather than mismeasuring.
   #
   # Epoch 2^22, from the CPU sweep on 2026-07-31 (124 GiB / 32-core box, real block,
-  # branch vintage; full table in tooling/ethrex-real-block/README.md):
+  # branch vintage; full table in tooling/ethrex-block-converter/README.md):
   #
   #   2^21   464.26 s   18.43 GiB RSS   26 epochs   1.72 GB proof
   #   2^22   397.88 s   32.21 GiB RSS   13 epochs   1.15 GB proof

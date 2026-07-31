@@ -90,7 +90,7 @@ fn test_ethrex_empty_block() {
 const REAL_BLOCK_FIXTURE: &str = "ethrex_mainnet_25368371.bin";
 
 /// Host-only acceptance gate for the real-block fixture produced by
-/// `tooling/ethrex-real-block` (`make ethrex-real-block-fixture`): the block is
+/// `tooling/ethrex-block-converter` (`make ethrex-real-block-fixture`): the block is
 /// re-executed statelessly against its own witness, so a successful run means
 /// the recovered tries, codes and headers reproduce the header's post-state
 /// root. Needs no guest ELF, which is what keeps it runnable where the RV64
@@ -104,7 +104,7 @@ const REAL_BLOCK_FIXTURE: &str = "ethrex_mainnet_25368371.bin";
 /// dependency graph links no KZG backend, so a block calling point evaluation
 /// (0x0a) diverges from consensus here and fails. That property is incidental to
 /// the dep graph rather than declared, so `no_kzg_backend_linked` below pins it.
-/// (`tooling/ethrex-real-block`'s parity test does NOT cover 0x0a — it links
+/// (`tooling/ethrex-block-converter`'s parity test does NOT cover 0x0a — it links
 /// `c-kzg` transitively via `ethrex-config`.)
 #[test]
 fn test_ethrex_real_block_native() {

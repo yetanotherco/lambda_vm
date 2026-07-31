@@ -61,10 +61,10 @@ jobs:
           # from scratch every run. `cache-all-crates` only covers the registry, not
           # compiled artifacts.
           #
-          # ethrex-real-block is deliberately NOT here: this job no longer builds it.
+          # ethrex-block-converter is deliberately NOT here: this job no longer builds it.
           # That workspace is the expensive one (~335 packages, including the blst,
           # c-kzg and secp256k1-sys C builds, malachite and ark-ff/asm) and it now
-          # builds only in ethrex-real-block.yml, which carries its own cache entry.
+          # builds only in ethrex-block-converter.yml, which carries its own cache entry.
           workspaces: |
             . -> target
             tooling/ethrex-tests -> target
@@ -125,7 +125,7 @@ jobs:
       # for the real-block fixture. That fixture is a benchmark input: it has to be
       # right once, not on every PR, and fetching plus screening it here put a network
       # download and a ~335-package build in the required gate for an artifact with no
-      # bearing on correctness. Both moved to ethrex-real-block.yml, which runs when
+      # bearing on correctness. Both moved to ethrex-block-converter.yml, which runs when
       # the converter or the block pin actually changes. `no_kzg_backend_linked` still
       # runs here — it is a pure unit test, and it is the property the real-block
       # screen over there depends on.
