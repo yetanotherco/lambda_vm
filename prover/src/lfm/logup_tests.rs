@@ -629,3 +629,273 @@ fn the_derived_uniforms_are_not_arena_words() {
         alpha_powers.len()
     );
 }
+
+// =============================================================================
+// Degenerate parameter: per-CHUNK vs per-FAMILY accumulation
+// =============================================================================
+
+/// One sender and TWO receiver chunks of the same family, proved together.
+///
+/// A continuation epoch splits each table family into chunks, and `VmAirs::new`
+/// builds one AIR per chunk (`lib.rs`: `(0..table_counts.cpu).map(|i| … CPU[i])`),
+/// so a family of `k` chunks is `k` entries in the AIR vector and `k`
+/// sub-proofs. The closure iterates those entries, so it accumulates PER CHUNK.
+///
+/// Every fixture up to here had one sub-proof per family, which makes
+/// per-chunk and per-family the same sum — the degenerate case. Two chunks of
+/// one family is the smallest shape that tells them apart: the sender's two
+/// lookups are answered one per chunk, so dropping either chunk leaves a
+/// nonzero remainder.
+fn chunked_family() -> (Vec<BoxedAir>, MultiProof<Gl, Ext3, ()>) {
+    use crate::tables::types::{BusId, alu_op};
+    use crate::test_utils::multi_prove_ram;
+    use stark::constraints::builder::EmptyConstraints;
+    use stark::lookup::{
+        AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, BusValue, Multiplicity,
+        NullBoundaryConstraintBuilder, Packing,
+    };
+    use stark::trace::TraceTable;
+
+    /// The two lookups, answered by one receiver chunk each.
+    const LOOKUPS: [(u64, u64); 2] = [(5, 3), (9, 6)];
+    const NUM_ROWS: usize = 4;
+
+    type Air = AirWithBuses<Gl, Ext3, NullBoundaryConstraintBuilder, (), EmptyConstraints>;
+    let opts = options();
+
+    let values = || {
+        vec![
+            BusValue::constant(alu_op::AND as u64),
+            BusValue::Packed {
+                start_column: 0,
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: 1,
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: 2,
+                packing: Packing::Direct,
+            },
+        ]
+    };
+    let build = |sender: bool, name: &str| {
+        let interaction = if sender {
+            BusInteraction::sender(BusId::ByteAlu, Multiplicity::Column(3), values())
+        } else {
+            BusInteraction::receiver(BusId::ByteAlu, Multiplicity::Column(3), values())
+        };
+        Air::new(
+            4,
+            AuxiliaryTraceBuildData {
+                interactions: vec![interaction],
+            },
+            &opts,
+            1,
+            EmptyConstraints,
+        )
+        .with_name(name)
+    };
+
+    // The two receiver chunks are the SAME construction — one family, two
+    // instances, exactly as `CPU[0]` and `CPU[1]` are.
+    let sender = build(true, "SENDER");
+    let recv0 = build(false, "RECEIVER[0]");
+    let recv1 = build(false, "RECEIVER[1]");
+
+    let trace_for = |rows: &[(u64, u64)]| {
+        let mut data = vec![FE::zero(); NUM_ROWS * 4];
+        for (r, (x, y)) in rows.iter().enumerate() {
+            data[r * 4] = FE::from(*x);
+            data[r * 4 + 1] = FE::from(*y);
+            data[r * 4 + 2] = FE::from(x & y);
+            data[r * 4 + 3] = FE::one();
+        }
+        TraceTable::<Gl, Ext3>::new_main(data, 4, 1)
+    };
+    let mut sender_trace = trace_for(&LOOKUPS);
+    let mut recv0_trace = trace_for(&LOOKUPS[..1]);
+    let mut recv1_trace = trace_for(&LOOKUPS[1..]);
+
+    let pairs: Vec<(
+        &dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = ()>,
+        _,
+        _,
+    )> = vec![
+        (&sender, &mut sender_trace, &()),
+        (&recv0, &mut recv0_trace, &()),
+        (&recv1, &mut recv1_trace, &()),
+    ];
+    let proof = multi_prove_ram(pairs, &mut DefaultTranscript::<Ext3>::new(&[]))
+        .expect("the chunked family must prove");
+    (
+        vec![Box::new(sender), Box::new(recv0), Box::new(recv1)],
+        proof,
+    )
+}
+
+/// ★ The closure accumulates per CHUNK, and that is observable.
+///
+/// Both halves of the degenerate-parameter rule. The machine's three-term sum
+/// closes a bus production accepts at target zero; and every two-term sum — a
+/// per-family reading, which would collapse the two receiver chunks into one
+/// contribution — is NONZERO, so the distinction is load-bearing on this
+/// fixture rather than merely stated.
+///
+/// Without the second half this test would pass against an emitter that folded
+/// a family's chunks into a single term, because on every earlier fixture, and
+/// on any workload whose families happen to be one chunk each, the two readings
+/// agree.
+#[test]
+fn the_closure_accumulates_per_chunk_not_per_family() {
+    let (airs, proof) = chunked_family();
+    let air_refs: Vec<&dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = ()>> =
+        airs.iter().map(|a| &**a).collect();
+    assert_eq!(air_refs.len(), 3, "one sender and two chunks of one family");
+
+    assert!(
+        Verifier::multi_verify(
+            &air_refs,
+            &proof,
+            &mut DefaultTranscript::<Ext3>::new(&[]),
+            &FEE::zero(),
+        ),
+        "production must accept the chunked family at target zero, or the \
+         fixture is not a balanced bus"
+    );
+
+    let contributions: Vec<FEE> = (0..proof.proofs.len())
+        .map(|i| {
+            StarkProofView::Owned(&proof.proofs[i])
+                .bus_table_contribution()
+                .expect("every table here has interactions")
+        })
+        .collect();
+    assert!(
+        contributions.iter().all(|c| *c != FEE::zero()),
+        "each chunk must carry its OWN nonzero contribution — a zero one would \
+         make dropping it invisible: {contributions:?}"
+    );
+
+    // Half one: the per-chunk sum closes, in the machine.
+    let shape = LogUpShape {
+        num_contributing_tables: 3,
+        num_output_bytes: 0,
+    };
+    let mut b = LfmBuilder::new();
+    let arena = b.declare_arena(3);
+    let cells: Vec<_> = (0..3u32).map(|i| b.hint_word(arena, i).as_ext()).collect();
+    let zero = b.ext_const(&FEE::zero());
+    let total = emit_bus_closure(&mut b, &shape, &cells, zero);
+    b.public(total.as_cell());
+    let program = compile(b.finish());
+    validate(&program).expect("admissible");
+
+    let words: Vec<LfmWord> = contributions.iter().map(ext_word).collect();
+    let exec = execute(&program, std::slice::from_ref(&words), &TestPermutation)
+        .expect("the per-chunk sum must close");
+    assert_eq!(
+        word_as_ext(&exec.public_words[0].1).expect("ext"),
+        FEE::zero()
+    );
+
+    // Half two: every two-term reading DISAGREES. Dropping chunk 1 or chunk 2
+    // is exactly what a per-family accumulator would do.
+    for dropped in 0..3usize {
+        let partial: FEE = contributions
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != dropped)
+            .map(|(_, c)| *c)
+            .fold(FEE::zero(), |a, c| a + c);
+        assert_ne!(
+            partial,
+            FEE::zero(),
+            "dropping table {dropped} must break the balance, or the per-chunk \
+             reading is not observable on this fixture"
+        );
+    }
+    // …and the same statement in the MACHINE: a closure compiled for two
+    // contributing tables — what a per-family emitter would build, one term per
+    // family — fed a well-formed two-word arena, must not close.
+    let family_shape = LogUpShape {
+        num_contributing_tables: 2,
+        num_output_bytes: 0,
+    };
+    let mut b = LfmBuilder::new();
+    let arena = b.declare_arena(2);
+    let cells: Vec<_> = (0..2u32).map(|i| b.hint_word(arena, i).as_ext()).collect();
+    let zero = b.ext_const(&FEE::zero());
+    emit_bus_closure(&mut b, &family_shape, &cells, zero);
+    let per_family = compile(b.finish());
+    for dropped in 1..3usize {
+        let words: Vec<LfmWord> = contributions
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != dropped)
+            .map(|(_, c)| ext_word(c))
+            .collect();
+        assert!(
+            execute(&per_family, &[words], &TestPermutation).is_err(),
+            "a per-family closure that folded chunk {dropped} away must not \
+             close the bus"
+        );
+    }
+
+    println!(
+        "per-chunk accumulation witnessed: 3 chunks close, all 3 two-term \
+         readings nonzero, and a per-family closure rejects both chunk drops"
+    );
+}
+
+/// ★ `has_trace_interaction()` is SHAPE, and production checks the proof's
+/// presence against it in BOTH directions.
+///
+/// `verifier.rs:1238` rejects an AIR with interactions whose proof carries no
+/// bus public inputs, and `:1244` rejects the converse. So the count of
+/// contributing tables is fixed by the AIR set, never read off the proof —
+/// which is why [`LogUpShape::num_contributing_tables`] is a program constant.
+/// A machine that sized its sum from the arena would let a prover drop a
+/// table's contribution from the bus by omitting it.
+#[test]
+fn the_contributing_table_count_is_shape() {
+    let (airs, proof) = chunked_family();
+    for (i, air) in airs.iter().enumerate() {
+        let view = StarkProofView::Owned(&proof.proofs[i]);
+        assert!(
+            air.has_trace_interaction(),
+            "table {i} of this fixture declares interactions"
+        );
+        assert_eq!(
+            air.has_trace_interaction(),
+            view.has_bus_public_inputs(),
+            "table {i}: production rejects any disagreement between the AIR's \
+             declared interactions and the proof's bus public inputs, in both \
+             directions — so the two can never disagree in a proof that verifies"
+        );
+    }
+
+    // The shape is the AIR set's property. A program compiled for three
+    // contributing tables cannot read a two-table arena: the schema mismatches.
+    let shape = LogUpShape {
+        num_contributing_tables: 3,
+        num_output_bytes: 0,
+    };
+    let mut b = LfmBuilder::new();
+    let arena = b.declare_arena(3);
+    let cells: Vec<_> = (0..3u32).map(|i| b.hint_word(arena, i).as_ext()).collect();
+    let zero = b.ext_const(&FEE::zero());
+    emit_bus_closure(&mut b, &shape, &cells, zero);
+    let program = compile(b.finish());
+    assert!(
+        execute(
+            &program,
+            &[vec![ext_word(&FEE::zero()); 2]],
+            &TestPermutation
+        )
+        .is_err(),
+        "a short arena must not satisfy a program compiled for three tables"
+    );
+    println!("contributing-table count is shape: a short arena is rejected");
+}
