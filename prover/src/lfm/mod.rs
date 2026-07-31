@@ -32,6 +32,7 @@ pub mod keccak_adapter;
 pub mod keccak_host;
 pub mod layout;
 pub mod lde;
+pub mod logup;
 pub mod programs;
 pub mod proof;
 pub mod proof_arena;
@@ -71,6 +72,8 @@ mod framework_probe;
 mod join_tests;
 #[cfg(test)]
 mod keccak_probe;
+#[cfg(test)]
+mod logup_tests;
 #[cfg(test)]
 mod machine_tests;
 #[cfg(test)]

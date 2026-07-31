@@ -858,6 +858,11 @@ pub(super) struct RealSubProof {
     pub(super) rap_challenges: Vec<FEE>,
     pub(super) alpha_powers: Vec<FEE>,
     pub(super) table_offset: FEE,
+    /// The table's total bus contribution `L`, undivided. The machine derives
+    /// `L/N` from THIS cell rather than reading a second arena word — see
+    /// `constraints::emit_table_offset` for why that is a soundness
+    /// requirement rather than a saving.
+    pub(super) contribution: FEE,
     pub(super) zeta: FEE,
     pub(super) beta: FEE,
     pub(super) challenges: Challenges<Ext3>,
@@ -1004,15 +1009,11 @@ pub(super) fn open_sub_proof(
     } else {
         Vec::new()
     };
-    let table_offset = match view.bus_table_contribution() {
-        Some(contribution) => {
-            FE::from(trace_length as u64)
-                .inv()
-                .expect("a nonzero trace length")
-                * contribution
-        }
-        None => FEE::zero(),
-    };
+    let contribution = view.bus_table_contribution().unwrap_or_else(FEE::zero);
+    let table_offset = FE::from(trace_length as u64)
+        .inv()
+        .expect("a nonzero trace length")
+        * contribution;
 
     let boundary_constraints = air.boundary_constraints(
         &(),
@@ -1053,6 +1054,7 @@ pub(super) fn open_sub_proof(
         rap_challenges,
         alpha_powers: logup_alpha_powers,
         table_offset,
+        contribution,
         zeta: challenges.z,
         beta,
         challenges,
@@ -1082,7 +1084,7 @@ impl RealSubProof {
         self.rap_challenges
             .iter()
             .chain(&self.alpha_powers)
-            .chain([&self.table_offset, &self.zeta, &self.beta])
+            .chain([&self.contribution, &self.zeta, &self.beta])
             .map(ext_word)
             .collect()
     }
@@ -1091,7 +1093,7 @@ impl RealSubProof {
         self.claimed_parts.iter().map(ext_word).collect()
     }
 
-    fn arenas(&self) -> Vec<Vec<LfmWord>> {
+    pub(super) fn arenas(&self) -> Vec<Vec<LfmWord>> {
         vec![self.frame_arena(), self.uniform_arena(), self.parts_arena()]
     }
 }
@@ -1121,7 +1123,12 @@ fn composition_program_source(sp: &RealSubProof) -> super::builder::LfmProgramSo
     };
     let rap_challenges: Vec<_> = (0..sp.rap_challenges.len()).map(|_| take(&mut b)).collect();
     let alpha_powers: Vec<_> = (0..sp.alpha_powers.len()).map(|_| take(&mut b)).collect();
-    let table_offset = take(&mut b);
+    // `L`, undivided. The per-row offset is DERIVED from it so the constraint
+    // leg and the LogUp closure consume one cell rather than two independently
+    // hinted ones (`constraints::emit_table_offset`).
+    let contribution = take(&mut b);
+    let table_offset =
+        super::constraints::emit_table_offset(&mut b, contribution, sp.quotient.log2_trace_length);
     let zeta = take(&mut b);
     let beta = take(&mut b);
 
