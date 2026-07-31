@@ -97,3 +97,4 @@
 [phase0] 2026-07-30 slice 7 — continuation-epoch leg computed and PINNED against the measured 24/25 sub-proof count.
 [phase0] 2026-07-30 slice 8 — §8.2 is now FIRST-HAND for the continuation path; registry implication surfaced.
 [phase0] 2026-07-30 slice 9 — PRIORITY REORDERED (team-lead, drawn from my own composition which I had not taken the step from): epoch_label FIRST, page_base after.
+[deep-join] 2026-07-31 slice 1 — DEEP across a FULL sub-proof, joined to the Merkle authentication: same cells, four committed matrices, query point derived from the walk's own index bits. 219/219 queries vs the production reconstruction; 32 tamper vectors; two control programs run the attacks the join denies. MEASURED: authentication is 99.0% of the joined leg's instructions (DEEP is 1.0%), 213,744 permutations per epoch's sub-proofs at blowup 8.
