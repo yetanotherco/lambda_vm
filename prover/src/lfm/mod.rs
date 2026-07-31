@@ -39,6 +39,7 @@ pub mod proof_fixture;
 pub mod registry;
 pub mod statement;
 pub mod statement_replay;
+pub mod sub_proof;
 pub mod trace;
 pub mod transcript_replay;
 pub mod validator;
@@ -66,6 +67,8 @@ pub use word::{LfmWord, base_word, ext_word, pack_digest, unpack_digest};
 mod constraint_tests;
 #[cfg(test)]
 mod framework_probe;
+#[cfg(test)]
+mod join_tests;
 #[cfg(test)]
 mod keccak_probe;
 #[cfg(test)]

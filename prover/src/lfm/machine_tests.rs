@@ -3109,7 +3109,7 @@ fn tampered_merkle_opening_rejects() {
 /// Main-trace cells one byteswap costs: one `LFM_BITDEC` row and 64 `LFM_BALU`
 /// rows, each at its chip's non-preprocessed width — the same accounting
 /// [`super::airs::lfm_cell_counts`] uses.
-fn byteswap_cells() -> u64 {
+pub(super) fn byteswap_cells() -> u64 {
     use super::chips::{balu, bitdec};
     use super::layout;
     let bitdec_w = (bitdec::cols::NUM_COLUMNS - layout::bitdec::PREP_WIDTH) as u64;
@@ -3119,7 +3119,7 @@ fn byteswap_cells() -> u64 {
 
 /// Main-trace cells one keccak permutation costs: the `LFM_KECCAK` row that
 /// requests it, plus the 24 `KECCAK_RND` rounds that carry it.
-fn permutation_cells() -> u64 {
+pub(super) fn permutation_cells() -> u64 {
     use super::chips::keccak;
     use super::chunking::KECCAK_RND_ROWS_PER_PERMUTATION as ROUNDS;
     use super::layout;

@@ -850,19 +850,19 @@ use super::registry::build_artifacts;
 /// Nothing is synthesized: the OOD frame is the prover's, the composition parts
 /// are the prover's, and the challenges come out of the production verifier's
 /// own `replay_rounds_after_round_1` rather than a local Fiat-Shamir model.
-struct RealSubProof {
-    artifact: ConstraintArtifact,
-    ood_full: Table<Ext3>,
-    main_width: usize,
-    num_steps: usize,
-    rap_challenges: Vec<FEE>,
-    alpha_powers: Vec<FEE>,
-    table_offset: FEE,
-    zeta: FEE,
-    beta: FEE,
-    challenges: Challenges<Ext3>,
-    claimed_parts: Vec<FEE>,
-    quotient: QuotientShape,
+pub(super) struct RealSubProof {
+    pub(super) artifact: ConstraintArtifact,
+    pub(super) ood_full: Table<Ext3>,
+    pub(super) main_width: usize,
+    pub(super) num_steps: usize,
+    pub(super) rap_challenges: Vec<FEE>,
+    pub(super) alpha_powers: Vec<FEE>,
+    pub(super) table_offset: FEE,
+    pub(super) zeta: FEE,
+    pub(super) beta: FEE,
+    pub(super) challenges: Challenges<Ext3>,
+    pub(super) claimed_parts: Vec<FEE>,
+    pub(super) quotient: QuotientShape,
 }
 
 /// Proves L2G_MEMORY — a real continuation table, and the only continuation AIR
@@ -871,7 +871,7 @@ struct RealSubProof {
 /// Returns the AIR alongside the proof because the DEEP differential needs both:
 /// its oracle is the production reconstruction, which takes the AIR's layout and
 /// the proof's own openings.
-fn real_fixture() -> (BoxedAir, MultiProof<Gl, Ext3, ()>) {
+pub(super) fn real_fixture() -> (BoxedAir, MultiProof<Gl, Ext3, ()>) {
     use crate::tables::local_to_global::{
         CellBoundary, FiniClaim, InitClaim, generate_local_to_global_trace,
     };
@@ -908,16 +908,16 @@ fn real_fixture() -> (BoxedAir, MultiProof<Gl, Ext3, ()>) {
     (Box::new(air), proof)
 }
 
-type BoxedAir = Box<dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = ()>>;
+pub(super) type BoxedAir = Box<dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = ()>>;
 
-fn real_sub_proof() -> RealSubProof {
+pub(super) fn real_sub_proof() -> RealSubProof {
     let (air, proof) = real_fixture();
     open_sub_proof(&*air, &proof)
 }
 
 /// Replays the production verifier's rounds over a real single-table proof and
 /// packages everything the constraint leg needs.
-fn open_sub_proof(
+pub(super) fn open_sub_proof(
     air: &dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = ()>,
     proof: &MultiProof<Gl, Ext3, ()>,
 ) -> RealSubProof {
@@ -1562,7 +1562,7 @@ use super::deep::{DeepOpening, DeepShape, emit_deep_invariants, emit_deep_point}
 
 /// The DEEP shape and the γ challenge, read off a real proof's replayed
 /// challenges rather than modelled.
-fn deep_shape(
+pub(super) fn deep_shape(
     sp: &RealSubProof,
     air: &dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = ()>,
 ) -> (DeepShape, FEE) {
