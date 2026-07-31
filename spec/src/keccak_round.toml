@@ -210,7 +210,7 @@ ref = "keccak:c:theta_cxz"
 
 [[constraints.theta]]
 kind = "arith"
-constraint = "$μ => 2 dot #`(Cxz[x][3] as DWordHL)[z]` = #`(Cxz_left[x] as DWordHL)[z]` + 2^16 * #`Cxz_right[x][z]`$"
+constraint = "$μ => 2 dot #`(Cxz[x][3] as DWordHL)[z]` = #`(Cxz_left[x] as DWordHL)[z]` + 2^16 dot #`Cxz_right[x][z]`$"
 poly = ["*", "μ", ["-",
     ["*", 2, ["idx", ["cast", ["idx", ["idx", "Cxz", "x"], 3], "DWordHL"], "z"]],
     ["idx", ["cast", ["idx", "Cxz_left", "x"], "DWordHL"], "z"],
