@@ -744,6 +744,10 @@ jobs:
           COMMIT_SHA: ${{ steps.pr-ref.outputs.sha || github.sha }}
           TABLE_PARALLELISM: ${{ steps.config.outputs.table_parallelism }}
         with:
+          # Renderable offline: `node scripts/render_bench_comment.js` extracts this block
+          # and prints the markdown for a set of scenarios, so wording and formatting can
+          # be checked without occupying the bench server for 15-20 min. Add a scenario
+          # there when you add a branch here.
           script: |
             const baseSrc = process.env.BASELINE_SRC;
 
