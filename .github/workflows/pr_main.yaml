@@ -134,6 +134,9 @@ jobs:
       - name: Run syscalls host tests (keccak differential vs sha3)
         run: make test-syscalls
 
+      - name: Run ethrex-crypto host tests (hint verify-then-fallback + ecrecover)
+        run: make test-ethrex-crypto
+
   # "Test" is a required check — keep this name to avoid branch protection changes.
   # This gate job passes only when CLI, executor, disk-spill, and prover tests succeed.
   test:
