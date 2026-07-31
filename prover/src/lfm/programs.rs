@@ -912,3 +912,218 @@ pub fn program_id_program_source(shape: ProgramIdShape) -> LfmProgramSource {
 pub fn program_id_program(shape: ProgramIdShape) -> LfmProgram {
     compile(program_id_program_source(shape))
 }
+
+// ======== R1g(i): the next epoch's REGISTER preprocessed commitment ========
+
+/// Everything about a REGISTER-derivation program that is compile-time.
+///
+/// Both fields belong to the INNER proof's `ProofOptions`, and both are SHAPE
+/// in the sense of `others/lfm-target-shape.md`: they fix the LDE domain, hence
+/// every twiddle, every leaf's byte layout and the whole tree's permutation
+/// count. A program that read them from an arena would let the prover pick the
+/// domain its commitment was computed over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegisterDerivationShape {
+    /// The inner proof's blowup factor.
+    pub blowup: usize,
+    /// The inner proof's coset offset (`ProofOptions::coset_offset`).
+    pub coset_offset: u64,
+}
+
+impl RegisterDerivationShape {
+    /// Rows in the interpolation domain — `NUM_REGISTER_ADDRESSES` rounded up.
+    pub fn num_rows(self) -> usize {
+        crate::tables::register::NUM_REGISTER_ADDRESSES.next_power_of_two()
+    }
+
+    /// Rows in the LDE domain.
+    pub fn lde_rows(self) -> usize {
+        self.num_rows() * self.blowup
+    }
+
+    /// Merkle leaves — one per row PAIR (`ROWS_PER_LEAF = 2`).
+    pub fn leaves(self) -> usize {
+        self.lde_rows() / stark::commitment::ROWS_PER_LEAF
+    }
+
+    /// Permutations the tree costs: one per leaf plus one per internal node.
+    /// Leaves are 48 bytes and parents 64, so each is a single rate block.
+    pub fn permutations(self) -> usize {
+        2 * self.leaves() - 1
+    }
+}
+
+/// The REGISTER preprocessed columns' word addresses, in row order.
+///
+/// Mirrors the private `register::register_word_address_list`, but assembled
+/// from the PUBLIC `register_word_addresses` rather than hand-copied, so only
+/// the ORDER is restated here. Nothing pins that order locally and nothing
+/// needs to: the derived root is compared against production's own
+/// `compute_precomputed_commitment_with_fini`, and any disagreement about which
+/// address sits in which row moves the root.
+fn register_offsets() -> Vec<u64> {
+    use crate::tables::register::{NUM_REGISTER_ADDRESSES, register_word_addresses};
+    let mut addrs = Vec::with_capacity(NUM_REGISTER_ADDRESSES);
+    for reg in 0..32u8 {
+        addrs.extend(register_word_addresses(reg));
+    }
+    addrs.extend(register_word_addresses(254));
+    addrs.extend(register_word_addresses(255));
+    assert_eq!(
+        addrs.len(),
+        NUM_REGISTER_ADDRESSES,
+        "the register address list must cover every table row"
+    );
+    addrs
+}
+
+/// Derives the next epoch's REGISTER preprocessed commitment from `reg_fini` —
+/// `register::compute_precomputed_commitment_with_fini`, emitted.
+///
+/// Two arenas, one base word per register word address (the R1e packing rule):
+///
+/// 0. `R_i`, the epoch's INIT register file;
+/// 1. `R_{i+1}`, the epoch's `reg_fini`.
+///
+/// The derived root is PUBLISHED. There is nothing to assert it against, and
+/// that is the mechanism rather than an omission — see below.
+///
+/// ## Why this is a derivation and not a comparison
+///
+/// The chaining obligation is often written as "check `reg_fini` against the
+/// next epoch's supplied REGISTER root". There is no supplied root.
+/// `build_epoch_airs` (`continuation.rs:636`) CONSTRUCTS the preprocessed
+/// commitment from `register_init` and `reg_fini`, and `VmAirs::new`'s
+/// `register_preprocessed` parameter — which every verify caller passes `None`
+/// to — must stay unwired: computing the commitment from the values is what
+/// ties the values to it. Supply the root instead and `reg_fini` has no
+/// remaining role, so a prover could offer a root consistent with a `reg_fini`
+/// it never honoured and the cross-epoch chain would go unenforced.
+///
+/// ## Three columns, one of them free
+///
+/// Production commits OFFSET ‖ INIT ‖ FINI. OFFSET holds the register word
+/// addresses, which are fixed, so its LDE is a program CONSTANT — the shape
+/// rule applying in the machine's favour for once. Only INIT and FINI carry
+/// arena values and only they pay for a transform, which is why the derivation
+/// emits two LDEs for three columns.
+///
+/// The constant column still costs at leaf-hashing time: its values are
+/// byte-swapped into the leaf like any other. That swap is what
+/// [`RegisterDerivationShape::permutations`] does NOT count, and the cost test
+/// prints both.
+///
+/// ## What this program does NOT bind
+///
+/// The two arenas are unbound here. In the assembled verifier `R_{i+1}` is the
+/// same vector the next epoch reads as its INIT and the published root is what
+/// that epoch's Phase A absorbs; until those joins exist a prover may supply
+/// any pair and get the honestly-derived root for it. The derivation is
+/// correct in isolation and binds nothing in isolation — the same standing
+/// caveat as the L2G binding leg.
+pub fn register_derivation_program_source(shape: RegisterDerivationShape) -> LfmProgramSource {
+    use super::edsl;
+    use super::lde::coset_lde;
+    use crate::tables::register::{NUM_PREPROCESSED_COLS_WITH_FINI, NUM_REGISTER_ADDRESSES};
+    use math::fft::bit_reversing::reverse_index;
+    use stark::commitment::ROWS_PER_LEAF;
+
+    assert_eq!(
+        NUM_PREPROCESSED_COLS_WITH_FINI, 3,
+        "the derivation commits OFFSET ‖ INIT ‖ FINI; a fourth preprocessed \
+         column changes the leaf layout and the arena schema together"
+    );
+    let supplied = NUM_REGISTER_ADDRESSES as u32;
+    let num_rows = shape.num_rows();
+    let coset_offset = FE::from(shape.coset_offset);
+
+    let mut b = LfmBuilder::new();
+    let init_arena = b.declare_arena(supplied);
+    let fini_arena = b.declare_arena(supplied);
+
+    // Padding rows are zero in all three columns, exactly as `zeroed_fe_vec`
+    // leaves them: production writes only the first NUM_REGISTER_ADDRESSES.
+    let zero = b.felt_const(FE::zero());
+    let offsets = register_offsets();
+    let offset_col: Vec<FE> = (0..num_rows)
+        .map(|r| offsets.get(r).map_or(FE::zero(), |&a| FE::from(a)))
+        .collect();
+    let column = |b: &mut LfmBuilder, arena| {
+        (0..num_rows as u32)
+            .map(|r| {
+                if r < supplied {
+                    b.hint_felt(arena, r)
+                } else {
+                    zero
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    let init_col = column(&mut b, init_arena);
+    let fini_col = column(&mut b, fini_arena);
+
+    // OFFSET is fixed, so its extension is interned constants rather than an
+    // emitted transform — and it is taken from PRODUCTION's own transform, not
+    // from `lde`'s. That is deliberate: the three columns land in one tree, so
+    // a root that matches production pins the emitter against the very function
+    // it is emitting, inside the same hash.
+    let offset_lde: Vec<_> = {
+        use math::polynomial::Polynomial;
+        use stark::prover::evaluate_polynomial_on_lde_domain;
+        let poly =
+            Polynomial::interpolate_fft::<crate::tables::types::GoldilocksField>(&offset_col)
+                .expect("the OFFSET column interpolates");
+        evaluate_polynomial_on_lde_domain(&poly, shape.blowup, num_rows, &coset_offset)
+            .expect("the OFFSET polynomial extends")
+            .into_iter()
+            .map(|v| b.felt_const(v))
+            .collect()
+    };
+    let init_lde = coset_lde(&mut b, &init_col, shape.blowup, coset_offset);
+    let fini_lde = coset_lde(&mut b, &fini_col, shape.blowup, coset_offset);
+
+    // Leaf `i` hashes the bit-reversed rows `2i` and `2i+1`, each written
+    // column by column in big-endian — `keccak_leaves_bit_reversed_grouped`.
+    let lde_rows = shape.lde_rows();
+    let leaves: Vec<_> = (0..shape.leaves())
+        .map(|leaf| {
+            let mut values = Vec::with_capacity(ROWS_PER_LEAF * NUM_PREPROCESSED_COLS_WITH_FINI);
+            for k in 0..ROWS_PER_LEAF {
+                let row = reverse_index(ROWS_PER_LEAF * leaf + k, lde_rows as u64);
+                values.extend([offset_lde[row], init_lde[row], fini_lde[row]]);
+            }
+            edsl::keccak_leaf_hash(&mut b, &values)
+        })
+        .collect();
+
+    let root = edsl::keccak_merkle_tree_root(&mut b, &leaves);
+    b.public(root[0]);
+    b.public(root[1]);
+    b.finish()
+}
+
+pub fn register_derivation_program(shape: RegisterDerivationShape) -> LfmProgram {
+    compile(register_derivation_program_source(shape))
+}
+
+/// A bare [`super::lde::coset_lde`], publishing every extended value.
+///
+/// The instrument behind the LDE differential. `register_derivation_program`
+/// exercises the transform only at the register shape — `n = 128`, coset offset
+/// 3 — and every production REGISTER table has exactly that shape, so a
+/// differential over production data cannot distinguish an emitter that is
+/// right in general from one that is accidentally right at 128. This drives
+/// synthetic sizes and offsets against production's own transform.
+pub fn lde_probe_program_source(n: usize, blowup: usize, coset_offset: u64) -> LfmProgramSource {
+    let mut b = LfmBuilder::new();
+    let arena = b.declare_arena(n as u32);
+    let values: Vec<_> = (0..n as u32).map(|i| b.hint_felt(arena, i)).collect();
+    for v in super::lde::coset_lde(&mut b, &values, blowup, FE::from(coset_offset)) {
+        b.public(v.as_cell());
+    }
+    b.finish()
+}
+
+pub fn lde_probe_program(n: usize, blowup: usize, coset_offset: u64) -> LfmProgram {
+    compile(lde_probe_program_source(n, blowup, coset_offset))
+}
