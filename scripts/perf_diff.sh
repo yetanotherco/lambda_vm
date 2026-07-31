@@ -14,7 +14,9 @@
 # USAGE (on the bench server):
 #   scripts/perf_diff.sh REF_A [REF_B=origin/main]
 #   Env: WORKLOAD=synthetic|real (default synthetic) picks the block to profile;
-#        EPOCH_SIZE_LOG2=<n> (default 21) sizes the epoch, WORKLOAD=real only.
+#        EPOCH_SIZE_LOG2=<n> (default 22) sizes the epoch, WORKLOAD=real only.
+#          22 is the calibrated bench-runner tier, matching /bench-real; use 23 on a
+#          128 GiB box (tooling/ethrex-real-block/README.md, "Choosing the epoch size").
 #
 # Pick the workload that matches the run you are localizing, because the symbol
 # mix follows the block: the synthetic default is 20 plain transfers (8.73M cycles,
@@ -25,8 +27,8 @@
 # pin the ELF when quoting one.
 #
 # WORKLOAD=real also switches to a continuation prove (monolithic would need ~240 GB
-# at that trace length), which is ~4.5-4.8 min per recording — five recordings, so
-# budget ~25 min, plus ~2 GB of disk per bundle.
+# at that trace length), which is ~4-5 min per recording — five recordings, so budget
+# ~25 min, plus ~1.2 GB of disk per bundle and ~32 GiB of RAM at the default epoch.
 #
 # Produces:
 #   - two perf-diff tables (recorded twice per side, interleaved B A B A —
@@ -45,7 +47,10 @@ fi
 REF_A="$1"
 REF_B="${2:-origin/main}"
 WORKLOAD="${WORKLOAD:-synthetic}"
-EPOCH_SIZE_LOG2="${EPOCH_SIZE_LOG2:-21}"
+# 2^22: the calibrated tier for the bench server this script targets, same as
+# /bench-real. Memory picks it, not speed — 32.2 GiB fits a >=64 GiB box with ~50%
+# headroom where 2^23's 60 GiB does not.
+EPOCH_SIZE_LOG2="${EPOCH_SIZE_LOG2:-22}"
 case "$WORKLOAD" in
   synthetic|real) ;;
   *) echo "ERROR: WORKLOAD must be 'synthetic' or 'real' (got '$WORKLOAD')." >&2; exit 2 ;;

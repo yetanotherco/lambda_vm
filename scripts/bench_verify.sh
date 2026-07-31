@@ -31,7 +31,11 @@
 #        `real` fetches the real-block fixture (identity lives in the Makefile) and runs
 #        the continuation arm ONLY — a real block is hundreds of GB monolithically, so
 #        that arm is skipped rather than left to OOM. See "Workload" below.
-#        CONT_EPOCH_LOG2=<n> continuation epoch size (default 20, min 18). 20 matches
+#        CONT_EPOCH_LOG2=<n> continuation epoch size (default 20, min 18). For
+#        WORKLOAD=real prefer the calibrated tier for the box you are on — 2^22 on the
+#        bench runner or a 64 GiB machine, 2^23 on a 128 GiB one (see
+#        tooling/ethrex-real-block/README.md, "Choosing the epoch size"); the default
+#        below is chosen for the SYNTHETIC arm. 20 matches
 #        scripts/bench_abba.sh, so this arm proves the same bundle shape /bench already
 #        proves on the same server — and 20 txs at 2^20 is strictly cheaper than the
 #        100 txs at 2^20 that /bench runs by default, so it can't be the thing that OOMs

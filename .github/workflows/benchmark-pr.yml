@@ -72,14 +72,31 @@ env:
   # measured growth fit, 10,728 MB + 2,007 MB/transfer at R^2 = 0.998), so the
   # current default would need ~240 GB and a heavier candidate far more.
   # `--continuations` makes peak heap a function of the epoch size instead of the
-  # trace length: ~18 GB here (a 15.8 GB epoch-2^21 working set plus ~69 MB per
-  # epoch of accumulated proofs over ~25 epochs). Costs move with the block; the
-  # per-candidate table is in tooling/ethrex-real-block/README.md.
+  # trace length. Costs move with the block; the per-candidate table is in
+  # tooling/ethrex-real-block/README.md.
   #
-  # Budget ~2 GB of disk for the bundle each run — hence the `rm -f` after every
+  # Budget ~1.2 GB of disk for the bundle each run — hence the `rm -f` after every
   # prove. A heavier block pushes it past 2 GiB, which needs rkyv `pointer_width_64`;
   # a PR branch predating that fix fails at write time rather than mismeasuring.
-  REAL_BLOCK_EPOCH_LOG2: "21"
+  #
+  # Epoch 2^22, from the CPU sweep on 2026-07-31 (124 GiB / 32-core box, real block,
+  # branch vintage; full table in tooling/ethrex-real-block/README.md):
+  #
+  #   2^21   464.26 s   18.43 GiB RSS   26 epochs   1.72 GB proof
+  #   2^22   397.88 s   32.21 GiB RSS   13 epochs   1.15 GB proof
+  #   2^23   356.47 s   60.01 GiB RSS    7 epochs   0.90 GB proof
+  #
+  # This runner's floor is >=64 GiB, so 2^22's 32.2 GiB fits with ~50% headroom while
+  # 2^23's 60 GiB does not fit safely — memory, not speed, is what picks 2^22 here.
+  # Moving off 2^21 is worth ~14% wall on the calibration box. That box is NOT this
+  # runner (it measured 8.6 s/Mcycle against this runner's 5.3-5.6), so treat the
+  # ratio as transferable and the absolute seconds as not: the first /bench-real run
+  # establishes this runner's actual time.
+  #
+  # Deliberately NOT the CLI's DEFAULT_CONTINUATION_EPOCH_SIZE_LOG2, which stays 20 so
+  # a laptop can still prove; and not the GPU path's 2^22, which happens to coincide
+  # but is chosen by VRAM rather than host RAM (see benchmark-gpu.yml).
+  REAL_BLOCK_EPOCH_LOG2: "22"
   BENCH_RUNS_REAL: 1
   BENCH_RUNS_PR: 3
   # Cheap-tier screen: catches regressions down to ~1.5% on its own and leaves

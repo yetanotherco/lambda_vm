@@ -140,7 +140,7 @@ it — see [Measured cost of candidate blocks](#measured-cost-of-candidate-block
 
 | Where | How to run it | Cost (current default) |
 |---|---|---|
-| `benchmark-pr.yml` | `/bench-real` on a PR; automatic on push to main and `workflow_dispatch` | ~4.5–4.8 min |
+| `benchmark-pr.yml` | `/bench-real` on a PR; automatic on push to main and `workflow_dispatch` | ~4–5 min (first run at epoch 2^22 confirms) |
 | `scripts/bench_verify.sh` | `WORKLOAD=real scripts/bench_verify.sh <ref>` | ~4.5–4.8 min per side, then cached |
 | `scripts/perf_diff.sh` | `WORKLOAD=real scripts/perf_diff.sh <ref>` | 5 recordings, so ~25 min |
 | `benchmark-gpu.yml` | `/bench-gpu` on a PR — **the default there** | 59.87 s/prove on an RTX 5090 (see below) |
@@ -199,9 +199,10 @@ prove grows ~4.9 GB per million cycles on this workload family (measured on the
 bench server: `10,728 MB + 2,007 MB/transfer`, R² = 0.998 across 4→20 transfers),
 so this block would need **~240 GB** monolithically — and a heavier candidate far
 more. `--continuations` makes peak heap a function of the epoch size instead of the
-trace length, so the same block fits in **~18 GB** at epoch 2^21: a 15.8 GB epoch
-working set plus ~69 MB per epoch of accumulated proofs over ~25 epochs. (The GPU path
-uses epoch 2^22, where VRAM rather than host RAM is the binding constraint.) The
+trace length, so the same block fits in **~32 GiB** at epoch 2^22, the setting both the
+CPU bench runner and the GPU path now use — picked by host RAM on one and by VRAM on
+the other. See [Choosing the epoch size](#choosing-the-epoch-size) for the full curve
+and the other tiers. The
 bundle on disk is ~1.9 GB; note that a heavier block pushes it past 2 GiB, which
 needs rkyv `pointer_width_64` to serialize.
 
@@ -301,9 +302,8 @@ current default), so ranking candidates by gas mispredicts cost.
 | **mainnet 25368371** | 2.43M | **50,781,557** (clang 21)<br>50,713,534 (clang 18) | **59.87 s** @ epoch 2^22 | ~4.5–4.8x the GPU wall | ~1.9 GB | 1,110,156 B, `61eba49b…` |
 
 Epoch 2^22 is the GPU recommendation: VRAM binds, 2^22 leaves 28.9% headroom on a
-32 GiB card and 2^23 does not fit one at all. **The CPU-server epoch recommendation is
-pending calibration** — that measurement is still running; do not fill this in by
-analogy with the GPU number.
+32 GiB card and 2^23 does not fit one at all. See
+[Choosing the epoch size](#choosing-the-epoch-size) for the CPU tiers.
 
 **Alternates — PRE-LTO vintage, superseded, re-measure before quoting.** These were
 taken on a mid-July guest ELF, before #861 gave the guest thin LTO; the same build
@@ -330,6 +330,45 @@ on a single shared bench runner. It was also the only block in a 90-day Dune swe
 matching the shape constraints (2 heavy transactions, no whale, sane transfer share)
 in the 1.6–2.6M gas band — so it is cheap *and* structurally typical, not cheap
 because it is degenerate.
+
+### Choosing the epoch size
+
+`--epoch-size-log2` trades memory for speed, and **the right value is a property of the
+machine, not of the block**. Three tiers, all measured:
+
+| where | epoch | why |
+|---|---|---|
+| GPU, 32 GiB card | **2^22** | VRAM-bound — 2^23 does not fit |
+| CPU bench runner (≥64 GiB) | **2^22** | host-RAM-bound — 2^23's 60 GiB does not fit safely |
+| CPU server, 128 GiB class | **2^23** | the knee; 2^24 fits but is not worth it |
+| laptops (CLI default) | **2^20** | unchanged, so a plain `cli prove` still works |
+
+CPU sweep, 2026-07-31, on a 124 GiB / 32-core box, real block, **branch vintage**
+(53,757,588 cycles on that box's clang-21 pre-LTO ELF):
+
+| epoch | epochs | wall | peak RSS | proof |
+|---|---|---|---|---|
+| 2^20 | 52 | 616.90 s | 14.56 GiB | 2.83 GB |
+| 2^21 | 26 | 464.26 s | 18.43 GiB | 1.72 GB |
+| 2^22 | 13 | 397.88 s | 32.21 GiB | 1.15 GB |
+| **2^23** | 7 | **356.47 s** | **60.01 GiB** | 0.90 GB |
+| 2^24 | 4 | ~334 s | ~97–105 GiB *(provisional)* | — |
+
+**There is a real knee.** Speed gained per doubling shrinks — 24.7%, 14.3%, 10.4%,
+~6% — while memory roughly doubles at each step near the top. 2^23 uses 48% of a
+124 GiB box (~52% headroom); 2^24 buys only ~6% more speed for ~15% headroom, so it
+**fits but is not recommended on a shared box**, where one co-tenant turns a tight fit
+into an OOM. The 2^24 RSS figure is provisional pending the calibration agent's formal
+report.
+
+A main-vintage anchor also ran on the same box: 2^23 = 344.12 s / 58.87 GiB, i.e. ~3%
+faster than branch vintage at the same memory — as expected, since #861 cut cycles and
+peak RSS is set by the epoch size rather than the trace length.
+
+**Do not read absolute seconds off this table for another machine.** The calibration box
+runs ~8.6 s/Mcycle against the bench runner's 5.31–5.62, so the *ratios* between epochs
+transfer and the wall times do not. `/bench-real` now runs at 2^22 (it was 2^21); the
+first run after that change establishes the runner's real number.
 
 ### Verifying a repoint
 
