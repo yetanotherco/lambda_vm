@@ -87,7 +87,12 @@ impl<F: IsField> FieldElement<F> {
         Self::inplace_batch_inverse_sequential(numbers)
     }
 
-    fn inplace_batch_inverse_sequential(numbers: &mut [Self]) -> Result<(), FieldError> {
+    /// Single-threaded batch inversion. Callers that run inside a lazy-init
+    /// cell (e.g. `OnceLock::get_or_init`) MUST use this variant: the parallel
+    /// one farms work to the rayon pool, and if pool workers are blocked
+    /// waiting on that same cell the initializer starves and the prove
+    /// deadlocks.
+    pub fn inplace_batch_inverse_sequential(numbers: &mut [Self]) -> Result<(), FieldError> {
         if numbers.is_empty() {
             return Ok(());
         }

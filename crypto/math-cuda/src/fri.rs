@@ -88,6 +88,28 @@ impl FriCommitState {
         })
     }
 
+    /// Like [`Self::new`], but adopts a device-resident codeword (already in
+    /// FRI bit-reversed order) and its producing stream — no evals H2D.
+    pub fn new_dev(codeword: crate::deep::GpuDeepCodeword, inv_tw_host: &[u64]) -> Result<Self> {
+        let crate::deep::GpuDeepCodeword { buf, n, stream } = codeword;
+        assert!(n >= 2 && n.is_power_of_two());
+        assert_eq!(buf.len(), 3 * n);
+        assert_eq!(inv_tw_host.len(), n / 2);
+
+        // SAFETY: evals_b is written by the first fold before it is read.
+        let evals_b = unsafe { stream.alloc::<u64>(3 * n) }?;
+        let inv_tw = stream.clone_htod(inv_tw_host)?;
+
+        Ok(Self {
+            stream,
+            evals_a: buf,
+            evals_b,
+            inv_tw,
+            current_n: n,
+            a_is_input: true,
+        })
+    }
+
     /// Fold the current layer using `zeta`, run the row-pair Keccak leaves
     /// + pair-hash Merkle tree kernels on the result, and D2H:
     ///   - the new root (32 bytes)
@@ -206,21 +228,34 @@ impl FriCommitState {
         // Sync and D2H.
         self.stream.synchronize()?;
 
-        // Layer evals: 3 * n_out u64 from the output buffer.
-        let layer_evals: Vec<u64> = if self.a_is_input {
-            let view = self.evals_b.slice(0..3 * n_out);
-            self.stream.clone_dtoh(&view)?
-        } else {
-            let view = self.evals_a.slice(0..3 * n_out);
-            self.stream.clone_dtoh(&view)?
+        // Layer evals: 3 * n_out u64 from the output buffer, staged through
+        // the per-worker pinned slab (async DMA) instead of a blocking
+        // pageable copy. The wait is deferred past the root copy below.
+        let n_evals = 3 * n_out;
+        let pending = {
+            let output_evals: &CudaSlice<u64> = if self.a_is_input {
+                &self.evals_b
+            } else {
+                &self.evals_a
+            };
+            crate::device::async_dtoh_via(
+                &self.stream,
+                be.pinned_staging(),
+                &be.ctx,
+                output_evals,
+                n_evals,
+            )?
         };
 
         // Keep the layer tree resident on device; copy only the 32-byte root so
         // R4 query openings gather paths on device instead of copying the tree.
+        // This pageable copy drains the stream (including the evals DMA above),
+        // so the pending wait after it is instant — one block covers both.
         let mut root = [0u8; 32];
         self.stream
             .memcpy_dtoh(&nodes_dev.slice(0..32), &mut root)?;
-        self.stream.synchronize()?;
+        let mut layer_evals = vec![0u64; n_evals];
+        pending.wait_into_u64(&mut layer_evals)?;
 
         self.a_is_input = !self.a_is_input;
         self.current_n = n_out;

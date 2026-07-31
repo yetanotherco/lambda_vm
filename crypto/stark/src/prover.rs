@@ -1,5 +1,6 @@
+use std::any::Any;
 use std::marker::PhantomData;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 #[cfg(feature = "instruments")]
 use std::time::{Duration, Instant};
 
@@ -36,7 +37,7 @@ use crate::trace::LDETraceTable;
 
 use super::config::{BatchedMerkleTree, BatchedMerkleTreeBackend, Commitment};
 use super::constraints::evaluator::ConstraintEvaluator;
-use super::domain::{Domain, DomainConstants};
+use super::domain::Domain;
 use super::fri::fri_decommit::FriDecommitment;
 use super::grinding;
 use super::lookup::BusPublicInputs;
@@ -139,18 +140,20 @@ where
         }
     }
 
-    /// Build a `TableCommit` for a preprocessed table.
+    /// Build a `TableCommit` for a preprocessed table. The precomputed tree
+    /// arrives as an `Arc` because it may be shared from the process-wide
+    /// cache (see [`precomputed_tree_cache_get`]).
     fn preprocessed(
         tree: BatchedMerkleTree<F>,
         root: Commitment,
-        precomputed_tree: BatchedMerkleTree<F>,
+        precomputed_tree: Arc<BatchedMerkleTree<F>>,
         precomputed_root: Commitment,
         num_precomputed_cols: usize,
     ) -> Self {
         Self {
             tree: Arc::new(tree),
             root,
-            precomputed_tree: Some(Arc::new(precomputed_tree)),
+            precomputed_tree: Some(precomputed_tree),
             precomputed_root: Some(precomputed_root),
             num_precomputed_cols,
         }
@@ -170,6 +173,47 @@ where
     fn is_preprocessed(&self) -> bool {
         self.precomputed_tree.is_some()
     }
+}
+
+/// Process-wide cache of precomputed-column Merkle trees, keyed by their
+/// commitment root. The root fully determines the tree (column content,
+/// domain, blowup and leaf layout all feed the hash), so a hit needs no
+/// re-verification: the lookup key IS the root a rebuild would be checked
+/// against. This is what makes continuation epochs stop re-committing the
+/// same DECODE/BITWISE/range tables once per epoch — those trees are
+/// execution-independent; only the multiplicity columns change per run.
+/// Type-erased so one static serves every field instantiation.
+fn precomputed_tree_cache()
+-> &'static Mutex<std::collections::HashMap<Commitment, Arc<dyn std::any::Any + Send + Sync>>> {
+    static CACHE: OnceLock<
+        Mutex<std::collections::HashMap<Commitment, Arc<dyn std::any::Any + Send + Sync>>>,
+    > = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+fn precomputed_tree_cache_get<F: IsField + 'static>(
+    root: &Commitment,
+) -> Option<Arc<BatchedMerkleTree<F>>>
+where
+    FieldElement<F>: AsBytes,
+{
+    let cache = precomputed_tree_cache().lock().unwrap();
+    cache
+        .get(root)
+        .cloned()
+        .and_then(|any| any.downcast::<BatchedMerkleTree<F>>().ok())
+}
+
+fn precomputed_tree_cache_put<F: IsField + 'static>(
+    root: Commitment,
+    tree: Arc<BatchedMerkleTree<F>>,
+) where
+    FieldElement<F>: AsBytes,
+{
+    precomputed_tree_cache()
+        .lock()
+        .unwrap()
+        .insert(root, tree as Arc<dyn std::any::Any + Send + Sync>);
 }
 
 /// A container for the results of the first round of the STARK Prove protocol.
@@ -344,6 +388,8 @@ pub(crate) struct LdeTwiddles<F: IsFFTField> {
     /// Composition half-extension cache, initialized only when the degree-2
     /// decomposition path actually runs on CPU.
     composition: OnceLock<CompositionLdeTwiddles<F>>,
+    /// `1/(2·g·ωⁱ)` for the degree-2 quotient decomposition — see [`Self::inv_2x`].
+    inv_2x: OnceLock<Arc<Vec<FieldElement<F>>>>,
 }
 
 pub(crate) struct CompositionLdeTwiddles<F: IsFFTField> {
@@ -420,6 +466,7 @@ impl<F: IsFFTField> LdeTwiddles<F> {
                 .expect("valid forward two-half twiddles"),
             coset_weights,
             composition: OnceLock::new(),
+            inv_2x: OnceLock::new(),
         }
     }
 
@@ -435,6 +482,90 @@ impl<F: IsFFTField> LdeTwiddles<F> {
     pub(crate) fn has_composition_cache(&self) -> bool {
         self.composition.get().is_some()
     }
+
+    /// `1/(2·g·ωⁱ)` for the degree-2 quotient decomposition, computed once per
+    /// domain (an LDE/2-size batch inversion per table per epoch otherwise).
+    /// `Arc`'d so the device-resident copy can pin it (see
+    /// `gpu_interp::base_vec_device_handle`).
+    fn inv_2x(&self, domain: &Domain<F>) -> &Arc<Vec<FieldElement<F>>> {
+        self.inv_2x.get_or_init(|| {
+            let n = domain.lde_roots_of_unity_coset.len() / 2;
+            let mut inv: Vec<FieldElement<F>> = (0..n)
+                // 2·(g·ωⁱ) = (g·ωⁱ).double() — one add, vs a base mul+reduce per element.
+                .map(|i| domain.lde_roots_of_unity_coset[i].double())
+                .collect();
+            // Sequential: parallel inversion inside a OnceLock init can
+            // deadlock the rayon pool (workers block on this same cell).
+            FieldElement::inplace_batch_inverse_sequential(&mut inv)
+                .expect("Coset points are non-zero");
+            Arc::new(inv)
+        })
+    }
+}
+
+/// Process-wide `Domain` + `LdeTwiddles` cache keyed by
+/// `(field, trace_length, blowup, coset_offset)`. Continuation epochs
+/// otherwise rebuild the same ~24 MB `Domain` and
+/// ~32 MB twiddle set per epoch; sharing the `Arc`s also lets every lazy
+/// domain-derived cache (composition twiddles, `inv_2x`, OOD constants, FRI
+/// inverse twiddles) fill once per process instead of once per epoch.
+#[allow(clippy::type_complexity)]
+fn domain_twiddle_cache() -> &'static std::sync::Mutex<
+    std::collections::HashMap<(std::any::TypeId, usize, usize, u64), Box<dyn Any + Send + Sync>>,
+> {
+    static CACHE: OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<
+                (std::any::TypeId, usize, usize, u64),
+                Box<dyn Any + Send + Sync>,
+            >,
+        >,
+    > = OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+fn domain_and_twiddles<F, A>(air: &A, trace_length: usize) -> (Arc<Domain<F>>, Arc<LdeTwiddles<F>>)
+where
+    F: IsFFTField + 'static,
+    FieldElement<F>: Send + Sync,
+    A: AIR<Field = F> + ?Sized,
+{
+    type Entry<F> = (Arc<Domain<F>>, Arc<LdeTwiddles<F>>);
+    let key = (
+        std::any::TypeId::of::<F>(),
+        trace_length,
+        air.options().blowup_factor as usize,
+        air.options().coset_offset,
+    );
+    {
+        let cache = domain_twiddle_cache().lock().unwrap();
+        if let Some(e) = cache.get(&key).and_then(|b| b.downcast_ref::<Entry<F>>()) {
+            #[cfg(test)]
+            crate::tests::domain_cache_stats::record(true);
+            return e.clone();
+        }
+    }
+    #[cfg(test)]
+    crate::tests::domain_cache_stats::record(false);
+    let d = Arc::new(Domain::new(air, trace_length));
+    let t = Arc::new(LdeTwiddles::new(&d));
+    // Pre-fill every lazy domain-derived cache from this setup thread, so no
+    // rayon worker ever runs — or blocks waiting on — an initializer
+    // mid-prove (a worker parked on a OnceLock can starve the initializer's
+    // own pool work and deadlock the prove).
+    let _ = d.ood_constants();
+    let _ = d.fri_inv_twiddles();
+    let _ = t.composition(&d);
+    let _ = t.inv_2x(&d);
+    let mut cache = domain_twiddle_cache().lock().unwrap();
+    // Re-check under the lock: concurrent misses both build, and using the
+    // loser would pin ITS per-instance vectors in the pointer-keyed device
+    // caches for the process lifetime, duplicating VRAM. The winner stays.
+    if let Some(e) = cache.get(&key).and_then(|b| b.downcast_ref::<Entry<F>>()) {
+        return e.clone();
+    }
+    cache.insert(key, Box::new((d.clone(), t.clone())));
+    (d, t)
 }
 
 /// Number of tables to process concurrently in `multi_prove`.
@@ -893,6 +1024,86 @@ pub trait IsStarkProver<
             }
         }
 
+        // Fused GPU split path for preprocessed tables (cuda only): one
+        // row-major LDE of ALL columns plus two subset Merkle trees
+        // (precomputed / multiplicity) built on device — leaves and levels are
+        // bit-identical to `commit_rows_bit_reversed_subset`, and the trees
+        // come back as full host trees so the preprocessed opening path and
+        // the process-wide precomputed-tree cache work unchanged. The handle
+        // keeps the LDE device-resident for the downstream GPU rounds.
+        #[cfg(feature = "cuda")]
+        if let Some((expected_precomputed_root, num_precomputed)) = precomputed {
+            let (trace_slice, num_cols) = trace.main_data_row_major();
+            let n = if num_cols > 0 {
+                trace_slice.len() / num_cols
+            } else {
+                0
+            };
+            #[cfg(feature = "disk-spill")]
+            let cache_ok = storage_mode != StorageMode::Disk;
+            #[cfg(not(feature = "disk-spill"))]
+            let cache_ok = true;
+            let cached_pre = cache_ok
+                .then(|| precomputed_tree_cache_get::<Field>(&expected_precomputed_root))
+                .flatten();
+            #[cfg(feature = "instruments")]
+            let t_sub = Instant::now();
+            if let Some((pre_tree, mult_tree, handle, main_data)) =
+                crate::gpu_lde::try_expand_split_trees_row_major_keep::<
+                    Field,
+                    Field,
+                    BatchedMerkleTreeBackend<Field>,
+                >(
+                    trace_slice,
+                    n,
+                    num_cols,
+                    domain.blowup_factor,
+                    &twiddles.coset_weights,
+                    num_precomputed,
+                    cached_pre.is_none(),
+                )
+            {
+                #[cfg(feature = "instruments")]
+                crate::instruments::accum_r1_main(t_sub.elapsed(), std::time::Duration::ZERO);
+                let precomputed_tree = match cached_pre {
+                    // Cache key == the root a rebuild would be verified
+                    // against, so a hit needs no re-check.
+                    Some(tree) => tree,
+                    None => {
+                        #[allow(unused_mut)]
+                        let mut tree = pre_tree.expect("precomputed tree requested on cache miss");
+                        if tree.root != expected_precomputed_root {
+                            return Err(ProvingError::PrecomputedCommitmentMismatch);
+                        }
+                        #[cfg(feature = "disk-spill")]
+                        Self::spill_tree(&mut tree, storage_mode, "precomputed Merkle tree")?;
+                        let tree = Arc::new(tree);
+                        if cache_ok {
+                            precomputed_tree_cache_put::<Field>(
+                                expected_precomputed_root,
+                                Arc::clone(&tree),
+                            );
+                        }
+                        tree
+                    }
+                };
+                #[allow(unused_mut)]
+                let mut mult_tree = mult_tree;
+                #[cfg(feature = "disk-spill")]
+                Self::spill_tree(&mut mult_tree, storage_mode, "mult Merkle tree")?;
+                let mult_root = mult_tree.root;
+                let commit = TableCommit::preprocessed(
+                    mult_tree,
+                    mult_root,
+                    precomputed_tree,
+                    expected_precomputed_root,
+                    num_precomputed,
+                );
+                return Ok((commit, (main_data, num_cols), Some(handle)));
+            }
+            // GPU split path declined (size threshold / tower) → CPU path below.
+        }
+
         // CPU path: the trace `Table` is already row-major, so copy it directly
         // (one memcpy — no transpose) and expand in place with the cache-blocked
         // batched two-half FFT. Row-major end-to-end: no LDE-size transpose,
@@ -936,15 +1147,47 @@ pub trait IsStarkProver<
                 TableCommit::plain(tree, root)
             }
             Some((expected_precomputed_root, num_precomputed)) => {
-                #[allow(unused_mut)]
-                let (mut precomputed_tree, precomputed_root) =
-                    Self::commit_rows_bit_reversed_subset(
-                        &main_data,
-                        total_cols,
-                        0,
-                        num_precomputed,
-                    )
-                    .ok_or(ProvingError::EmptyCommitment)?;
+                // Only the multiplicity columns depend on the execution; the
+                // precomputed-columns tree is a pure function of (content,
+                // domain) already pinned by `expected_precomputed_root`, so it
+                // is reused from the process cache when this exact commitment
+                // was built before — across epochs and across proves. Bypassed
+                // in disk-spill Disk mode, where trees are spilled (mutated).
+                #[cfg(feature = "disk-spill")]
+                let cache_ok = storage_mode != StorageMode::Disk;
+                #[cfg(not(feature = "disk-spill"))]
+                let cache_ok = true;
+                let precomputed_tree = match cache_ok
+                    .then(|| precomputed_tree_cache_get::<Field>(&expected_precomputed_root))
+                    .flatten()
+                {
+                    // Cache key == the root a rebuild would be verified
+                    // against, so a hit needs no re-check.
+                    Some(tree) => tree,
+                    None => {
+                        #[allow(unused_mut)]
+                        let (mut tree, root) = Self::commit_rows_bit_reversed_subset(
+                            &main_data,
+                            total_cols,
+                            0,
+                            num_precomputed,
+                        )
+                        .ok_or(ProvingError::EmptyCommitment)?;
+                        if root != expected_precomputed_root {
+                            return Err(ProvingError::PrecomputedCommitmentMismatch);
+                        }
+                        #[cfg(feature = "disk-spill")]
+                        Self::spill_tree(&mut tree, storage_mode, "precomputed Merkle tree")?;
+                        let tree = Arc::new(tree);
+                        if cache_ok {
+                            precomputed_tree_cache_put::<Field>(
+                                expected_precomputed_root,
+                                Arc::clone(&tree),
+                            );
+                        }
+                        tree
+                    }
+                };
                 #[allow(unused_mut)]
                 let (mut mult_tree, mult_root) = Self::commit_rows_bit_reversed_subset(
                     &main_data,
@@ -953,23 +1196,13 @@ pub trait IsStarkProver<
                     total_cols,
                 )
                 .ok_or(ProvingError::EmptyCommitment)?;
-                if precomputed_root != expected_precomputed_root {
-                    return Err(ProvingError::PrecomputedCommitmentMismatch);
-                }
                 #[cfg(feature = "disk-spill")]
-                {
-                    Self::spill_tree(
-                        &mut precomputed_tree,
-                        storage_mode,
-                        "precomputed Merkle tree",
-                    )?;
-                    Self::spill_tree(&mut mult_tree, storage_mode, "mult Merkle tree")?;
-                }
+                Self::spill_tree(&mut mult_tree, storage_mode, "mult Merkle tree")?;
                 TableCommit::preprocessed(
                     mult_tree,
                     mult_root,
                     precomputed_tree,
-                    precomputed_root,
+                    expected_precomputed_root,
                     num_precomputed,
                 )
             }
@@ -1153,20 +1386,17 @@ pub trait IsStarkProver<
         let n = two_n / 2;
         debug_assert_eq!(two_n, n * 2);
 
-        // Step 1: Compute 1/(2·g·ω^i) for i=0..N-1 via batch inversion.
-        // The LDE coset points are g·ω^i = domain.lde_roots_of_unity_coset[i].
-        // Compute entirely in base field — mixed F×E multiplication when used with extension values.
-        let two_base = FieldElement::<Field>::from(2u64);
-        let mut inv_2x: Vec<FieldElement<Field>> = (0..n)
-            // 2·(g·ωⁱ) = (g·ωⁱ).double() — one add, vs a base mul+reduce per element.
-            .map(|i| domain.lde_roots_of_unity_coset[i].double())
-            .collect();
-        FieldElement::inplace_batch_inverse(&mut inv_2x).expect("Coset points are non-zero");
+        // Step 1: 1/(2·g·ω^i) for i=0..N-1, cached once per domain in the
+        // shared twiddles (base field — mixed F×E multiplication below).
+        let inv_2x = twiddles.inv_2x(domain);
+        debug_assert_eq!(inv_2x.len(), n);
 
         // Step 2: Pointwise decomposition.
         // H₀((g·ω^i)²) = (evals[i] + evals[i+N]) / 2
         // H₁((g·ω^i)²) = (evals[i] - evals[i+N]) / (2·g·ω^i)
-        let two_inv = two_base.inv().expect("2 is non-zero in the field");
+        let two_inv = FieldElement::<Field>::from(2u64)
+            .inv()
+            .expect("2 is non-zero in the field");
         let (h0_evals, h1_evals) = crate::par::map_unzip(n, |i| {
             let sum = &constraint_evaluations[i] + &constraint_evaluations[i + n];
             let diff = &constraint_evaluations[i] - &constraint_evaluations[i + n];
@@ -1243,37 +1473,95 @@ pub trait IsStarkProver<
             round_1_result.bus_public_inputs.as_ref(),
             trace_length,
         );
-        #[cfg(feature = "instruments")]
-        let t_sub = Instant::now();
-        let constraint_evaluations = evaluator.evaluate(
-            air,
-            &round_1_result.lde_trace,
-            domain,
-            transition_coefficients,
-            boundary_coefficients,
-            &round_1_result.rap_challenges,
-        );
-        #[cfg(feature = "instruments")]
-        let constraints_dur = t_sub.elapsed();
-
         let number_of_parts = air.composition_poly_degree_bound(trace_length) / trace_length;
 
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
         #[cfg(feature = "cuda")]
         let mut gpu_composition_parts: Option<math_cuda::lde::GpuLdeExt3> = None;
-        let lde_composition_poly_parts_evaluations = if number_of_parts == 2 {
+
+        // Fully device-resident d=2 path: H stays on device through decompose +
+        // half extension, the parts handle feeds R4 DEEP, and only the final
+        // evaluations are drained to host (for the commit tree and openings).
+        // Any miss falls through to the host path below (downloading H when
+        // the evaluation itself already ran on device).
+        #[cfg(feature = "cuda")]
+        let mut precomputed_parts: Option<Vec<Vec<FieldElement<FieldExtension>>>> = None;
+        #[cfg(feature = "cuda")]
+        if number_of_parts == 2
+            && let Some(h_dev) = evaluator.evaluate_dev(
+                air,
+                &round_1_result.lde_trace,
+                domain,
+                transition_coefficients,
+                boundary_coefficients,
+                &round_1_result.rap_challenges,
+            )
+        {
+            match crate::gpu_lde::try_decompose_extend_d2_dev::<Field, FieldExtension>(
+                &h_dev,
+                twiddles.inv_2x(domain),
+                &twiddles.composition(domain).weights,
+            ) {
+                Some((parts, handle)) => {
+                    gpu_composition_parts = Some(handle);
+                    precomputed_parts = Some(parts);
+                }
+                None => {
+                    if let Some(h) =
+                        crate::gpu_lde::download_comp_h_to_field::<FieldExtension>(&h_dev)
+                    {
+                        precomputed_parts =
+                            Some(Self::decompose_and_extend_d2(&h, domain, twiddles));
+                    }
+                }
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        let precomputed_parts: Option<Vec<Vec<FieldElement<FieldExtension>>>> = None;
+
+        #[cfg(feature = "instruments")]
+        let constraints_dur = t_sub.elapsed();
+        #[cfg(feature = "instruments")]
+        let t_sub = Instant::now();
+
+        let lde_composition_poly_parts_evaluations = if let Some(parts) = precomputed_parts {
+            parts
+        } else if number_of_parts == 2 {
             // Direct quotient decomposition: avoid full-size iFFT by algebraically
             // splitting H(x) = H₀(x²) + x·H₁(x²) using:
             //   H₀(x²) = (H(x) + H(-x)) / 2
             //   H₁(x²) = (H(x) - H(-x)) / (2x)
             // On the LDE coset {g·ω^i}, we have -g·ω^i = g·ω^{i+N} since ω^N = -1.
+            let constraint_evaluations = evaluator.evaluate(
+                air,
+                &round_1_result.lde_trace,
+                domain,
+                transition_coefficients,
+                boundary_coefficients,
+                &round_1_result.rap_challenges,
+            );
             Self::decompose_and_extend_d2(&constraint_evaluations, domain, twiddles)
         } else if number_of_parts == 1 {
             // Degree bound equals trace length: constraint evals are the LDE directly.
-            vec![constraint_evaluations]
+            vec![evaluator.evaluate(
+                air,
+                &round_1_result.lde_trace,
+                domain,
+                transition_coefficients,
+                boundary_coefficients,
+                &round_1_result.rap_challenges,
+            )]
         } else {
             // Fallback for any future AIR with d > 2.
+            let constraint_evaluations = evaluator.evaluate(
+                air,
+                &round_1_result.lde_trace,
+                domain,
+                transition_coefficients,
+                boundary_coefficients,
+                &round_1_result.rap_challenges,
+            );
             let composition_poly =
                 Polynomial::interpolate_offset_fft(&constraint_evaluations, &domain.coset_offset)?;
             let composition_poly_parts = composition_poly.break_in_parts(number_of_parts);
@@ -1395,8 +1683,8 @@ pub trait IsStarkProver<
         let domain_size = domain.interpolation_domain_size;
         let blowup_factor = domain.blowup_factor;
 
-        // === Shared domain constants for barycentric evaluation ===
-        let dc = DomainConstants::from_domain(domain);
+        // === Shared domain constants for barycentric evaluation (cached per domain) ===
+        let dc = domain.ood_constants();
 
         // === Composition poly parts: barycentric evaluation at z^num_parts ===
         let comp_z_pow_n = z_power.pow(domain_size);
@@ -1429,7 +1717,7 @@ pub trait IsStarkProver<
             z,
             &air.context().transition_offsets,
             air.step_size(),
-            &dc,
+            dc,
         );
 
         Round3 {
@@ -1497,10 +1785,16 @@ pub trait IsStarkProver<
         // <<<< Receive challenges: 𝛾ⱼ, 𝛾ⱼ'
         let gammas = deep_composition_coefficients;
 
-        // Compute p₀ (deep composition polynomial) as N evaluations on trace-size coset
+        let domain_size = domain.lde_roots_of_unity_coset.len();
+
+        // Fully device-resident DEEP → FRI: the codeword is computed, bit-
+        // reversed, and folded on device without crossing PCIe. On any miss
+        // (gates, cudarc failure — the FRI driver restores the transcript)
+        // the host path below recomputes DEEP through its own arms.
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
-        let deep_evals = Self::compute_deep_composition_poly_evaluations(
+        #[cfg(feature = "cuda")]
+        let precomputed_fri = Self::try_compute_deep_dev(
             &round_1_result.lde_trace,
             round_2_result,
             round_3_result,
@@ -1509,33 +1803,85 @@ pub trait IsStarkProver<
             &domain.trace_primitive_root,
             &gammas,
             &trace_term_coeffs,
-        );
+        )
+        .and_then(|dw| {
+            crate::gpu_lde::try_fri_commit_gpu_from_dev(
+                dw,
+                transcript,
+                &coset_offset,
+                domain.blowup_factor.trailing_zeros(),
+                air.options().fri_final_poly_log_degree as u32,
+                domain.fri_inv_twiddles(),
+            )
+        });
+        #[cfg(not(feature = "cuda"))]
+        #[allow(clippy::type_complexity)]
+        let precomputed_fri: Option<(
+            Vec<FieldElement<FieldExtension>>,
+            Vec<
+                crate::fri::fri_commitment::FriLayer<
+                    FieldExtension,
+                    crate::config::FriLayerMerkleTreeBackend<FieldExtension>,
+                >,
+            >,
+        )> = None;
         #[cfg(feature = "instruments")]
-        let other_dur_1 = t_sub.elapsed();
+        let mut other_dur_1 = t_sub.elapsed();
+        #[cfg(feature = "instruments")]
+        let mut r4_fft_dur = Duration::ZERO;
+        #[cfg(feature = "instruments")]
+        let mut r4_merkle_dur = Duration::ZERO;
 
-        // DEEP evaluations are already at 2N LDE points — just bit-reverse for FRI.
-        // No iFFT+FFT extension needed (Plonky3-style direct LDE computation).
-        let domain_size = domain.lde_roots_of_unity_coset.len();
-        #[cfg(feature = "instruments")]
-        let t_sub = Instant::now();
-        let mut lde_evals = deep_evals;
-        in_place_bit_reverse_permute(&mut lde_evals);
-        #[cfg(feature = "instruments")]
-        let r4_fft_dur = t_sub.elapsed();
+        let (fri_final_poly_coeffs, fri_layers) = if let Some(res) = precomputed_fri {
+            res
+        } else {
+            // Compute p₀ (deep composition polynomial) as N evaluations on the LDE coset
+            #[cfg(feature = "instruments")]
+            let t_sub = Instant::now();
+            let deep_evals = Self::compute_deep_composition_poly_evaluations(
+                &round_1_result.lde_trace,
+                round_2_result,
+                round_3_result,
+                z,
+                domain,
+                &domain.trace_primitive_root,
+                &gammas,
+                &trace_term_coeffs,
+            );
+            #[cfg(feature = "instruments")]
+            {
+                other_dur_1 += t_sub.elapsed();
+            }
 
-        // FRI commit phase from pre-computed evaluations
-        #[cfg(feature = "instruments")]
-        let t_sub = Instant::now();
-        let (fri_final_poly_coeffs, fri_layers) = fri::commit_phase_from_evaluations(
-            lde_evals,
-            transcript,
-            &coset_offset,
-            domain_size,
-            domain.blowup_factor.trailing_zeros(),
-            air.options().fri_final_poly_log_degree as u32,
-        );
-        #[cfg(feature = "instruments")]
-        let r4_merkle_dur = t_sub.elapsed();
+            // DEEP evaluations are already at 2N LDE points — just bit-reverse for FRI.
+            // No iFFT+FFT extension needed (Plonky3-style direct LDE computation).
+            #[cfg(feature = "instruments")]
+            let t_sub = Instant::now();
+            let mut lde_evals = deep_evals;
+            in_place_bit_reverse_permute(&mut lde_evals);
+            #[cfg(feature = "instruments")]
+            {
+                r4_fft_dur = t_sub.elapsed();
+            }
+
+            // FRI commit phase from pre-computed evaluations
+            #[cfg(feature = "instruments")]
+            let t_sub = Instant::now();
+            let res = fri::commit_phase_from_evaluations(
+                lde_evals,
+                transcript,
+                &coset_offset,
+                domain_size,
+                domain.blowup_factor.trailing_zeros(),
+                air.options().fri_final_poly_log_degree as u32,
+                domain.fri_inv_twiddles(),
+            );
+            #[cfg(feature = "instruments")]
+            {
+                r4_merkle_dur = t_sub.elapsed();
+            }
+            res
+        };
 
         // grinding: generate nonce and append it to the transcript
         #[cfg(feature = "instruments")]
@@ -1597,6 +1943,61 @@ pub trait IsStarkProver<
     /// The DEEP polynomial is:
     ///   deep(X) = Σ_j γ_j * (H_j(X) - H_j(z^K)) / (X - z^K)
     ///           + Σ_{j,k} γ'_{j,k} * (t_j(X) - t_j(z·w^k)) / (X - z·w^k)
+    #[allow(clippy::too_many_arguments)]
+    /// Fully device-resident DEEP: device inv-denoms + resident parts handle,
+    /// codeword kept on device in FRI order for [`gpu_lde::try_fri_commit_gpu_from_dev`].
+    /// `None` → the host DEEP path (which retries its own GPU arms).
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    fn try_compute_deep_dev(
+        lde_trace: &LDETraceTable<Field, FieldExtension>,
+        round_2_result: &Round2<FieldExtension>,
+        round_3_result: &Round3<FieldExtension>,
+        z: &FieldElement<FieldExtension>,
+        domain: &Domain<Field>,
+        primitive_root: &FieldElement<Field>,
+        composition_poly_gammas: &[FieldElement<FieldExtension>],
+        trace_terms_gammas: &[Vec<FieldElement<FieldExtension>>],
+    ) -> Option<math_cuda::deep::GpuDeepCodeword>
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+    {
+        let parts_dev = lde_trace.gpu_composition_parts()?;
+        let num_parts = round_2_result.lde_composition_poly_evaluations.len();
+        let z_power = z.pow(num_parts);
+        let num_eval_points = if trace_terms_gammas.is_empty() {
+            0
+        } else {
+            trace_terms_gammas[0].len()
+        };
+        let mut z_shifted = Vec::with_capacity(num_eval_points);
+        let mut current_z = z.clone();
+        for _ in 0..num_eval_points {
+            z_shifted.push(current_z.clone());
+            current_z = primitive_root * &current_z;
+        }
+        let z_scalars: Vec<FieldElement<FieldExtension>> =
+            core::iter::once(z_power).chain(z_shifted).collect();
+        let (inv_dev, stream) =
+            crate::gpu_lde::try_inv_denoms_dev_with_stream::<Field, FieldExtension>(
+                &domain.lde_roots_of_unity_coset,
+                &z_scalars,
+                math_cuda::inverse::DenomSign::XMinusZ,
+                lde_trace.bound_stream(),
+            )?;
+        crate::gpu_lde::try_deep_composition_gpu_keep::<Field, FieldExtension>(
+            lde_trace,
+            parts_dev,
+            &round_3_result.composition_poly_parts_ood_evaluation,
+            &round_3_result.trace_ood_evaluations.columns(),
+            composition_poly_gammas,
+            trace_terms_gammas,
+            (&inv_dev, &stream),
+            num_eval_points,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn compute_deep_composition_poly_evaluations(
         lde_trace: &LDETraceTable<Field, FieldExtension>,
@@ -2353,44 +2754,14 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         let __sp = crate::instruments::span("r1_prepass");
 
-        // Deduplicate Domain + LdeTwiddles by (trace_length, blowup_factor, coset_offset).
-        // Many tables share the same domain size (e.g., 7+ tables at 2^20).
-        // Without dedup, each creates its own Domain (~24 MB) and LdeTwiddles (~32 MB).
-        type DomainEntry<F> = (Arc<Domain<F>>, Arc<LdeTwiddles<F>>);
-        let mut domain_cache: std::collections::HashMap<(usize, usize, u64), DomainEntry<Field>> =
-            std::collections::HashMap::new();
-
         let mut domains = Vec::with_capacity(num_airs);
         let mut twiddle_caches: Vec<Arc<LdeTwiddles<Field>>> = Vec::with_capacity(num_airs);
 
         for (air, trace, _pub_inputs) in &*air_trace_pairs {
-            let trace_length = trace.num_rows();
-            let blowup = air.options().blowup_factor as usize;
-            let coset_offset = air.options().coset_offset;
-            let key = (trace_length, blowup, coset_offset);
-
-            #[cfg(test)]
-            let was_hit = domain_cache.contains_key(&key);
-
-            let (domain, twiddles) = domain_cache
-                .entry(key)
-                .or_insert_with(|| {
-                    let d = Domain::new(*air, trace_length);
-                    let t = LdeTwiddles::new(&d);
-                    (Arc::new(d), Arc::new(t))
-                })
-                .clone();
-
-            #[cfg(test)]
-            crate::tests::domain_cache_stats::record(was_hit);
-
+            let (domain, twiddles) = domain_and_twiddles(*air, trace.num_rows());
             domains.push(domain);
             twiddle_caches.push(twiddles);
         }
-        // Free the HashMap (which holds extra strong Arc references) before the
-        // long proving rounds begin. `domains` and `twiddle_caches` already hold
-        // the only surviving Arcs we care about.
-        drop(domain_cache);
 
         let k = table_parallelism().min(num_airs).max(1);
 
@@ -2405,6 +2776,14 @@ pub trait IsStarkProver<
             .unwrap_or(u64::MAX);
         #[cfg(not(feature = "cuda"))]
         let vram_budget = u64::MAX;
+
+        // NOTE: an earlier revision published prove-wide pinned-staging size
+        // hints here so worker slabs allocated once at final size. Measured on
+        // a 5090 it BACKFIRED: every worker slot then pays a max-size
+        // cuMemHostAlloc (~160ms avg, 7.5s total vs 4.2s of ladder churn), and
+        // those allocations convoy the driver lock. The mechanism was removed;
+        // don't re-add pre-sizing without a shared-slab design that bounds the
+        // number of allocations.
 
         // R1 main commit: only the main LDE and its Merkle scratch are resident,
         // so the aux columns add nothing to this phase's working set.
@@ -2559,8 +2938,9 @@ pub trait IsStarkProver<
 
         // Thread each table's device-resident trace-domain main columns (kept by
         // the R1 main LDE) onto its trace so the LogUp aux fingerprint kernel
-        // reads them in place instead of re-uploading ~3 GB. Tables without a GPU
-        // main handle (CPU LDE, preprocessed) fall back to the host upload path.
+        // reads them in place instead of re-uploading ~3 GB. Preprocessed tables
+        // also carry a handle with `trace_dev` (the split-tree path); only
+        // CPU-LDE tables fall back to the host upload path.
         #[cfg(all(feature = "cuda", not(feature = "debug-checks")))]
         for ((_, trace, _), gpu_main) in air_trace_pairs.iter_mut().zip(main_gpu_handles.iter()) {
             if let Some(handle) = gpu_main

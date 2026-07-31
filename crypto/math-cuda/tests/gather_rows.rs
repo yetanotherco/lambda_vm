@@ -23,6 +23,7 @@ fn run_base(lde_size: usize, num_cols: usize, seed: u64) {
     let dev = stream.clone_htod(&buf).unwrap();
     stream.synchronize().unwrap();
     let handle = GpuLdeBase {
+        ready: None,
         buf: Arc::new(dev),
         m: num_cols,
         lde_size,
@@ -57,6 +58,7 @@ fn run_ext3(lde_size: usize, num_cols: usize, seed: u64) {
     let dev = stream.clone_htod(&buf).unwrap();
     stream.synchronize().unwrap();
     let handle = GpuLdeExt3 {
+        ready: None,
         buf: Arc::new(dev),
         m: num_cols,
         lde_size,
