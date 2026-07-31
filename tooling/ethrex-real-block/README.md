@@ -65,9 +65,9 @@ ethrex_hoodi_1265656.bin
   source: ethrex-replay caches/cache_hoodi_1265656.json @ 2693e018
 ```
 
-That checksum is documentation of what the fixture should be, not an enforced
-gate — the pinned commit is what makes the input immutable, and
-`conversion_is_reproducible` pins the block's stats and serialized length.
+That checksum is enforced, not just documented: `conversion_is_reproducible`
+asserts it. The pinned commit keeps the *input* immutable; the digest keeps the
+*derivation* honest.
 
 ## Getting a cache for a different block
 
@@ -116,8 +116,9 @@ version-tolerant JSON instead of a pinned binary is the mitigation.
 
 ## Validation
 
-Three checks, cheapest first. The first two run on the host in milliseconds and
-need no RV64 toolchain.
+Six checks, cheapest first. Five run on the host and need no RV64 toolchain; they
+execute in milliseconds, though a cold build compiles the ethrex host dependency
+tree, which is what costs ~60s in CI rather than the tests themselves.
 
 **`cargo test` here — `real_block_executes_under_guest_crypto`.** Executes the
 block through `LambdaVmEcsmCrypto`, the `Crypto` impl the guest injects, so it is
@@ -141,19 +142,26 @@ can execute. Dropping `ethrex-config` would therefore be a CI-time improvement
 (it also sheds `ethrex-p2p`, `ethrex-blockchain`, `ethrex-storage` and the c-kzg
 and secp256k1 C builds), not a correctness fix.
 
-**What screens 0x0a today** is `test_ethrex_real_block_native` in
-`tooling/ethrex-tests`, whose graph links no KZG backend at all. That was
-incidental to its dependencies, so `no_kzg_backend_linked` in the same file now
-asserts it and will go red if anything pulls a backend in.
+**`cargo test` here — `unmappable_network_is_rejected`.** Refuses a cache whose
+`network` cannot be mapped to real chain rules rather than converting it under
+substituted ones — see [above](#getting-a-cache-for-a-different-block) for why
+that matters.
 
 **`cargo test` here — `conversion_is_reproducible`.** Pins the block's stats and
-the serialized length, so an ethrex rev bump that moves the rkyv layout is
-caught rather than silently producing a fixture the guest can't read.
+the fixture's **sha256**. A length assert would not do: `ChainConfig` is
+fixed-size, so a substituted chain config yields a byte-length-identical fixture,
+and rkyv's `big_endian` feature would byte-swap in place — neither changes the
+byte count. This is what catches an ethrex rev bump that moves the rkyv layout
+instead of silently producing a fixture the guest can't read.
+
+**`tooling/ethrex-tests` — `no_kzg_backend_linked`.** Asserts that crate links no
+KZG backend. That was incidental to its dependency graph, and it is the property
+the next check relies on, so it is pinned here rather than assumed.
 
 **`tooling/ethrex-tests` — `test_ethrex_real_block_native`.** Checks the
-serialized `.bin` itself deserializes and executes. That crate builds
-`ethrex-guest-program` with default features, so this covers the artifact, not
-the guest's precompile surface.
+serialized `.bin` itself deserializes and executes. Since that crate links no KZG
+backend, this is also **what screens point evaluation (0x0a)**: a block reaching
+it diverges from consensus and fails here.
 
 **`tooling/ethrex-tests` — `test_ethrex_real_block_vm`** (`#[ignore]`, excluded
 from PR CI). The block through the guest ELF, comparing the VM's committed
