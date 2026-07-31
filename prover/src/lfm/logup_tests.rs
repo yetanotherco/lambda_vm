@@ -347,8 +347,8 @@ fn the_closure_matches_a_bus_that_really_balances() {
 
 use super::constraint_tests::{RealSubProof, real_sub_proof};
 use super::constraints::{
-    OodOperands, emit_constraint_evals, emit_quotient, emit_table_offset, hint_ood_frame,
-    ood_frame_words,
+    OodOperands, emit_alpha_powers, emit_constraint_evals, emit_quotient, emit_table_offset,
+    hint_ood_frame, ood_frame_words,
 };
 
 /// Where the per-row offset comes from.
@@ -378,7 +378,7 @@ fn composition_and_closure_source(
     let frame_arena = b.declare_arena(ood_frame_words(&sp.artifact));
     let (steps, _) = hint_ood_frame(&mut b, &sp.artifact, frame_arena, 0);
 
-    let num_uniforms = (sp.rap_challenges.len() + sp.alpha_powers.len() + 3) as u32;
+    let num_uniforms = (sp.rap_challenges.len() + 3) as u32;
     let uniform_arena = b.declare_arena(num_uniforms);
     let mut next = 0u32;
     let mut take = |b: &mut LfmBuilder| {
@@ -387,7 +387,11 @@ fn composition_and_closure_source(
         c
     };
     let rap_challenges: Vec<_> = (0..sp.rap_challenges.len()).map(|_| take(&mut b)).collect();
-    let alpha_powers: Vec<_> = (0..sp.alpha_powers.len()).map(|_| take(&mut b)).collect();
+    let alpha_powers = emit_alpha_powers(
+        &mut b,
+        rap_challenges[stark::lookup::LOGUP_CHALLENGE_ALPHA],
+        sp.alpha_powers.len(),
+    );
     let contribution = take(&mut b);
     let zeta = take(&mut b);
     let beta = take(&mut b);
@@ -443,7 +447,7 @@ fn join_arenas(sp: &RealSubProof, offset: Offset, delta: FEE) -> Vec<Vec<LfmWord
     let mut arenas = sp.arenas();
     let forged = sp.contribution + delta;
     // Slot of `contribution` inside the uniform arena.
-    let slot = sp.rap_challenges.len() + sp.alpha_powers.len();
+    let slot = sp.rap_challenges.len();
     arenas[1][slot] = ext_word(&forged);
     let mut closure = vec![ext_word(&forged)];
     if offset == Offset::HintedSeparately {
@@ -537,5 +541,91 @@ fn the_closure_cannot_sum_a_contribution_the_constraints_rejected() {
         "join: {} forged contributions rejected by the derivation, all accepted \
          by the split control",
         deltas.len()
+    );
+}
+
+/// ★ The two-consumer rule, as an ABSOLUTE property of the emitted program.
+///
+/// Method rule 7: a relative test dies the moment its two sides unify, so this
+/// asserts nothing about variants and everything about the program itself —
+/// which cells are arena hints and which are computed. `L/N` and every alpha
+/// power must be COMPUTED, because a hinted one is a claim about `L` or `α`
+/// that no other constraint checks; `L` itself and the raw challenges must be
+/// hints, or the test would pass vacuously against an emitter that simply
+/// dropped them.
+///
+/// This survives any refactor of how the offset is produced. It only fails if
+/// something starts reading these values out of an arena again, which is
+/// exactly the regression it exists to catch.
+#[test]
+fn the_derived_uniforms_are_not_arena_words() {
+    use super::instr::Instr;
+
+    let sp = real_sub_proof();
+    assert!(
+        !sp.alpha_powers.is_empty(),
+        "the fixture must exercise LogUp alpha powers"
+    );
+
+    let mut b = LfmBuilder::new();
+    let uniform_arena = b.declare_arena((sp.rap_challenges.len() + 1) as u32);
+    let rap: Vec<_> = (0..sp.rap_challenges.len() as u32)
+        .map(|i| b.hint_word(uniform_arena, i).as_ext())
+        .collect();
+    let contribution = b
+        .hint_word(uniform_arena, sp.rap_challenges.len() as u32)
+        .as_ext();
+    let alpha_powers = emit_alpha_powers(
+        &mut b,
+        rap[stark::lookup::LOGUP_CHALLENGE_ALPHA],
+        sp.alpha_powers.len(),
+    );
+    let table_offset = emit_table_offset(&mut b, contribution, sp.quotient.log2_trace_length);
+    let source = b.finish();
+
+    let hinted: std::collections::HashSet<u64> = source
+        .instrs
+        .iter()
+        .filter_map(|i| match i {
+            Instr::Hint { out, .. } => Some(out.0),
+            _ => None,
+        })
+        .collect();
+
+    // Positive control: the things that SHOULD be arena words are.
+    assert!(
+        hinted.contains(&contribution.addr().0),
+        "L itself is proof data and must be hinted, or this test is checking \
+         an emitter that reads nothing"
+    );
+    for (i, c) in rap.iter().enumerate() {
+        assert!(
+            hinted.contains(&c.addr().0),
+            "rap challenge {i} is hinted in this isolated slice"
+        );
+    }
+
+    // The property: derived values are not arena words.
+    assert!(
+        !hinted.contains(&table_offset.addr().0),
+        "L/N must be COMPUTED from L; a hinted offset lets a prover satisfy \
+         every accumulator while the closure sums a different L"
+    );
+    for (i, p) in alpha_powers.iter().enumerate() {
+        // alpha^1 IS the alpha cell, which is legitimately hinted here; every
+        // other power must be computed (alpha^0 is an interned constant).
+        if i == stark::lookup::LOGUP_CHALLENGE_ALPHA {
+            continue;
+        }
+        assert!(
+            !hinted.contains(&p.addr().0),
+            "alpha power {i} must be COMPUTED from alpha; a hinted power is a \
+             claim about alpha that nothing checks, and the LogUp fingerprints \
+             are built out of exactly these"
+        );
+    }
+    println!(
+        "absolute check: L/N and {} alpha powers are computed, not hinted",
+        alpha_powers.len()
     );
 }

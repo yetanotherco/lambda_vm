@@ -125,6 +125,41 @@ pub fn emit_table_offset(b: &mut LfmBuilder, contribution: Ext, log2_trace_lengt
     b.emul_base(contribution, c)
 }
 
+/// `[α⁰, α¹, …, α^{n−1}]` — the LogUp alpha powers, DERIVED from the one α the
+/// transcript produced rather than hinted one word each.
+///
+/// # Why these cannot be arena words
+///
+/// Same class as [`emit_table_offset`], and worse in degree. `Op::AlphaPow{idx}`
+/// resolves to `alpha_powers[idx]`, and those powers are what build every LogUp
+/// FINGERPRINT: a row's tuple `(v₀, v₁, …)` enters the constraint as
+/// `z − Σ vⱼ·αʲ`. A prover who supplies the powers independently of α chooses
+/// the fingerprints, and with the fingerprints goes the entire lookup argument —
+/// any tuple can be made to match any other. The powers are not merely a second
+/// consumer of α, they are a CLAIM about α that nothing else checks.
+///
+/// Deriving them costs one `ExtAlu{Mul}` per power beyond the first two (α⁰ is
+/// the interned one and α¹ is α itself), and `n = AIR::max_bus_elements()` is
+/// shape, so the chain length is program text.
+///
+/// The alpha this consumes must itself come from the transcript replay, never
+/// from an arena — that part is an assembly obligation this function cannot
+/// enforce, since it takes α as a cell and cannot see where the cell came from.
+pub fn emit_alpha_powers(b: &mut LfmBuilder, alpha: Ext, n: usize) -> Vec<Ext> {
+    let mut powers = Vec::with_capacity(n);
+    for i in 0..n {
+        powers.push(match i {
+            0 => b.ext_const(&FEE::one()),
+            1 => alpha,
+            _ => {
+                let prev = powers[i - 1];
+                b.emul(prev, alpha)
+            }
+        });
+    }
+    powers
+}
+
 /// What one AIR's lowering cost, measured by the pass that emitted it.
 ///
 /// Every field is a count of what the pass DID, not a prediction: [`analyze`]
