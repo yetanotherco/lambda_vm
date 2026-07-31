@@ -56,6 +56,16 @@ jobs:
         with:
           shared-key: "lambda-vm-test"
           cache-all-crates: "true"
+          # Both ethrex tool workspaces are detached (own Cargo.lock, own target
+          # dir), so the default `. -> target` misses them and their release
+          # trees rebuild from scratch on every run — ~335 packages for
+          # ethrex-real-block alone, including the blst, c-kzg and secp256k1-sys
+          # C builds, malachite and ark-ff/asm. `cache-all-crates` only covers
+          # the registry, not compiled artifacts.
+          workspaces: |
+            . -> target
+            tooling/ethrex-real-block -> target
+            tooling/ethrex-tests -> target
 
       - name: Cache compiled ASM ELF artifacts
         id: cache-asm-elfs

@@ -24,16 +24,32 @@ ethrex-config = { git = "https://github.com/lambdaclass/ethrex.git", rev = "156c
 ethrex-guest-program = { git = "https://github.com/lambdaclass/ethrex.git", rev = "156cb8d6a3974f411d71622eecd1b249ee37ff1c", package = "ethrex-guest-program", default-features = false, features = ["lambdavm"] }
 
 # Exact pin: the fixture writer and the guest/executor readers must agree on the
-# rkyv layout. Keep this in sync with executor/{Cargo.toml,programs/rust/ethrex/Cargo.toml}.
+# rkyv layout. Keep this in sync with the guest
+# (executor/programs/rust/ethrex/Cargo.toml) and the other two detached ethrex
+# tool workspaces (tooling/ethrex-fixtures, tooling/ethrex-tests). The `executor`
+# crate itself declares no rkyv — the guest is what deserializes ProgramInput.
 rkyv = { version = "=0.8.16", features = ["std", "unaligned"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-[dev-dependencies]
-# The `Crypto` impl the guest injects. Off riscv64 its keccak and ECSM paths
-# both fall back to software, so this exercises the guest's *fallback* crypto
-# semantics — not the accelerators themselves.
+# The `Crypto` impl the guest injects. Off riscv64 its keccak and ECSM paths both
+# fall back to software, so this exercises the guest's *fallback* crypto semantics
+# — not the accelerators themselves.
+#
+# Used only by the tests, but declared here rather than in `[dev-dependencies]` on
+# purpose: it is the only thing that asks for k256's `expose-field`, and under
+# resolver 3 a dev-dependency's features are not unified into builds that exclude
+# dev-dependencies. As a dev-dep, `cargo run` (the `make ethrex-real-block-fixture`
+# step) and the `cargo test` that follows it in CI resolve two different k256
+# feature sets, so k256 and every ethrex crate above it compile a second time in
+# the same job. Confirm with:
+#   cargo tree -e features,no-dev -i k256   # must list expose-field
+#   cargo tree -e features -i k256          # must match the above
 lambda-vm-ethrex-crypto = { path = "../../crypto/ethrex-crypto" }
+
+[dev-dependencies]
+# No feature delta against the rest of the graph (sha2/std is already on), so this
+# one can stay a dev-dependency without forcing the rebuild described above.
 sha2 = "0.10"
 
 # `ethrex-guest-program`'s `lambdavm` feature pins `lambda-vm-syscalls` to an
