@@ -17,6 +17,13 @@
 //! the value the production verifier would have computed. It also cannot see
 //! whether the epoch's OTHER sub-proofs compose, since a sub-proof is verified
 //! in isolation here.
+//!
+//! And it cannot see DEPTH. Both fixtures are 4-row traces at blowup 2, so
+//! every executed walk is two levels; `join_leg_cost` emits at depth 22 but
+//! never runs it, and R1f's `keccak_merkle_walk_authenticates_a_real_opening`
+//! is the only executed deep walk in the suite (depth 20, main trace only). A
+//! level-count bug that needed more than two levels to show would survive this
+//! file.
 
 use math::field::traits::IsFFTField;
 use stark::config::Commitment;
@@ -65,6 +72,12 @@ struct HostSubProof {
     iotas: Vec<usize>,
     /// The production reconstruction's answer per query, `(regular, sym)`.
     expected: Vec<(FEE, FEE)>,
+    /// The same, asked of production with the PRECOMPUTED and MAIN slices
+    /// swapped — the alternative column order a fixture without a precomputed
+    /// group cannot distinguish. Empty when there is no precomputed group, or
+    /// when the two base groups are different widths (the swap would not be a
+    /// well-formed reading).
+    expected_base_swapped: Vec<(FEE, FEE)>,
     /// Production's query points, kept so the machine's derivation can be
     /// checked against them rather than against a local formula.
     points: Vec<(FE, FE)>,
@@ -73,13 +86,18 @@ struct HostSubProof {
 fn host_sub_proof() -> &'static HostSubProof {
     use std::sync::OnceLock;
     static CELL: OnceLock<HostSubProof> = OnceLock::new();
-    CELL.get_or_init(build_host_sub_proof)
+    CELL.get_or_init(|| {
+        let (air, proof) = real_fixture();
+        build_host_sub_proof(&*air, &proof)
+    })
 }
 
-fn build_host_sub_proof() -> HostSubProof {
-    let (air, proof) = real_fixture();
-    let sp = open_sub_proof(&*air, &proof);
-    let (deep, gamma) = deep_shape(&sp, &*air);
+fn build_host_sub_proof(
+    air: &dyn stark::traits::AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = ()>,
+    proof: &stark::proof::stark::MultiProof<Gl, Ext3, ()>,
+) -> HostSubProof {
+    let sp = open_sub_proof(air, proof);
+    let (deep, gamma) = deep_shape(&sp, air);
     let view = StarkProofView::Owned(&proof.proofs[0]);
 
     let (main_width, aux_width) = air.trace_layout();
@@ -130,8 +148,8 @@ fn build_host_sub_proof() -> HostSubProof {
     }
     roots.push(*view.composition_poly_root());
 
-    let domain = new_verifier_domain(&*air, view.trace_length());
-    let layout = V::ood_layout(&*air);
+    let domain = new_verifier_domain(air, view.trace_length());
+    let layout = V::ood_layout(air);
     let invariants = V::compute_query_invariant_deep_terms(
         &sp.challenges,
         view,
@@ -143,8 +161,11 @@ fn build_host_sub_proof() -> HostSubProof {
     let generator = <Gl as IsFFTField>::get_primitive_root_of_unity(deep.log2_trace_length as u64)
         .expect("root of unity");
 
+    let swap_is_well_formed =
+        num_precomputed > 0 && main_width - num_precomputed == num_precomputed;
     let mut openings = Vec::new();
     let mut expected = Vec::new();
+    let mut expected_base_swapped = Vec::new();
     let mut points = Vec::new();
     for (q, iota) in sp.challenges.iotas.iter().enumerate() {
         let o = view.deep_poly_opening(q);
@@ -223,6 +244,30 @@ fn build_host_sub_proof() -> HostSubProof {
         )
         .expect("a real proof reconstructs");
         expected.push((want, want_sym));
+        if swap_is_well_formed {
+            let p = o.precomputed_trace_polys().expect("precomputed opening");
+            let swapped = V::reconstruct_deep_composition_poly_evaluation_pair(
+                &point,
+                &point_sym,
+                &generator,
+                &sp.challenges,
+                &invariants,
+                layout.next_row_cols(),
+                layout.step_size(),
+                m.evaluations(),
+                p.evaluations(),
+                o.aux_trace_polys().map(|a| a.evaluations()).unwrap_or(&[]),
+                c.evaluations(),
+                m.evaluations_sym(),
+                p.evaluations_sym(),
+                o.aux_trace_polys()
+                    .map(|a| a.evaluations_sym())
+                    .unwrap_or(&[]),
+                c.evaluations_sym(),
+            )
+            .expect("the swapped reading is well formed, so it reconstructs");
+            expected_base_swapped.push(swapped);
+        }
         points.push((point, point_sym));
     }
 
@@ -240,6 +285,7 @@ fn build_host_sub_proof() -> HostSubProof {
         openings,
         iotas: sp.challenges.iotas.clone(),
         expected,
+        expected_base_swapped,
         points,
     }
 }
@@ -303,8 +349,12 @@ fn the_join_premises_hold_on_a_real_proof() {
         "a leaf is a row pair, so the tree has one level fewer than the domain"
     );
     assert_eq!(
-        ROWS_PER_LEAF, 2,
-        "the row-pair leaf is what makes that true"
+        ROWS_PER_LEAF,
+        stark::commitment::ROWS_PER_LEAF,
+        "the machine's leaf shape is a copy of the commitment layer's constant; \
+         if that moves, every leaf hash and every DEEP index in this module goes \
+         with it, and no differential would say so because both sides would move \
+         together"
     );
     for (q, per_group) in h.openings.iter().enumerate() {
         for (g, opening) in per_group.iter().enumerate() {
@@ -1202,5 +1252,242 @@ fn the_controls_show_what_the_join_denies() {
     println!(
         "HintedPoint control: query {q}'s leaf authenticated, folded at query \
          {other}'s point, accepted"
+    );
+}
+
+// =============================================================================
+// The degenerate parameter this leg introduced: the precomputed group
+// =============================================================================
+
+/// A PREPROCESSED sub-proof, so the four-group shape is exercised.
+///
+/// L2G_MEMORY — the fixture everything above runs on — is not preprocessed, and
+/// neither is any AIR a single-table proof can cheaply be built from: the real
+/// preprocessed tables are BITWISE (2^20 rows), DECODE, KECCAK_RC, REGISTER and
+/// PAGE. So on that fixture the precomputed group is ABSENT, DEEP's column
+/// order `precomputed ‖ main ‖ aux` degenerates to `main ‖ aux`, and an emitter
+/// that put main first would pass every test in this file. That is the same
+/// hazard as `step_size = 1` and it needs the same answer: a case production
+/// does not produce.
+///
+/// Built the way `tests::bitwise_tests` builds its preprocessed receiver — a
+/// small `AirWithBuses` whose commitment comes from the prover's own
+/// `compute_precomputed_commitment_for_testing`, so the precomputed root in the
+/// proof and the one the AIR declares are computed by the same code the real
+/// tables use. Widths are 2 and 2 so the two base groups can be SWAPPED, which
+/// the falsification half needs.
+fn preprocessed_fixture() -> (
+    super::constraint_tests::BoxedAir,
+    stark::proof::stark::MultiProof<Gl, Ext3, ()>,
+) {
+    use crate::tables::types::{BusId, alu_op};
+    use crate::test_utils::multi_prove_ram;
+    use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+    use stark::lookup::{
+        AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, BusValue, Multiplicity,
+        NullBoundaryConstraintBuilder, Packing,
+    };
+    use stark::prover::IsStarkProver;
+    use stark::trace::TraceTable;
+    use stark::traits::AIR;
+
+    /// Columns 0..3 are precomputed (x, y, x&y); 3..6 are the multiplicity
+    /// block (a copy of x&y, a spare, and the bus multiplicity). The copy is
+    /// there so the table carries a real TRANSITION constraint: `EmptyConstraints`
+    /// leaves a single coefficient in the run and `open_sub_proof` recovers
+    /// `beta` from its second element.
+    const NUM_COLS: usize = 6;
+    const NUM_PRECOMPUTED: usize = 3;
+    const NUM_ROWS: usize = 4;
+
+    let opts = stark::proof::options::GoldilocksCubicProofOptions::with_blowup(2)
+        .expect("blowup=2 is valid");
+
+    let build = |commitment: Option<stark::config::Commitment>| {
+        let air = AirWithBuses::<Gl, Ext3, NullBoundaryConstraintBuilder, (), CopiedColumn>::new(
+            NUM_COLS,
+            AuxiliaryTraceBuildData {
+                interactions: vec![BusInteraction::receiver(
+                    BusId::ByteAlu,
+                    // The multiplicity is the LAST column, past the precomputed
+                    // block — the production split (`0..n` precomputed, the
+                    // rest multiplicities).
+                    Multiplicity::Column(5),
+                    vec![
+                        BusValue::constant(alu_op::AND as u64),
+                        BusValue::Packed {
+                            start_column: 0,
+                            packing: Packing::Direct,
+                        },
+                        BusValue::Packed {
+                            start_column: 1,
+                            packing: Packing::Direct,
+                        },
+                        BusValue::Packed {
+                            start_column: 2,
+                            packing: Packing::Direct,
+                        },
+                    ],
+                )],
+            },
+            &opts,
+            1,
+            CopiedColumn,
+        )
+        .with_name("PREPROCESSED_FIXTURE");
+        match commitment {
+            Some(c) => air.with_preprocessed(c, NUM_PRECOMPUTED),
+            None => air,
+        }
+    };
+
+    // Distinct rows, so the committed leaves are distinct and the tree is not
+    // the degenerate one R1f warns about.
+    let make_trace = || {
+        let mut data = vec![FE::zero(); NUM_ROWS * NUM_COLS];
+        for r in 0..NUM_ROWS {
+            let x = 5u64 + r as u64;
+            let y = 3u64 + 2 * r as u64;
+            data[r * NUM_COLS] = FE::from(x);
+            data[r * NUM_COLS + 1] = FE::from(y);
+            data[r * NUM_COLS + 2] = FE::from(x & y);
+            data[r * NUM_COLS + 3] = FE::from(x & y);
+            data[r * NUM_COLS + 5] = FE::one();
+        }
+        TraceTable::<Gl, Ext3>::new_main(data, NUM_COLS, 1)
+    };
+
+    let trace = make_trace();
+    let commitment = <stark::prover::Prover<Gl, Ext3, ()> as IsStarkProver<Gl, Ext3, ()>>::
+        compute_precomputed_commitment_for_testing(&trace, &build(None), NUM_PRECOMPUTED)
+        .expect("the precomputed columns commit");
+
+    let air = build(Some(commitment));
+    let mut trace = make_trace();
+    let pairs: Vec<(
+        &dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = ()>,
+        _,
+        _,
+    )> = vec![(&air, &mut trace, &())];
+    let proof = multi_prove_ram(pairs, &mut DefaultTranscript::<Ext3>::new(&[]))
+        .expect("the preprocessed fixture must prove");
+    (Box::new(air), proof)
+}
+
+/// `main[3] == main[2]` — one transition constraint, satisfied by the fixture
+/// trace, spanning the precomputed/multiplicity boundary.
+struct CopiedColumn;
+
+impl<F: math::field::traits::IsField, E: math::field::traits::IsField>
+    stark::constraints::builder::ConstraintSet<F, E> for CopiedColumn
+{
+    fn eval<B: stark::constraints::builder::ConstraintBuilder<F, E>>(&self, b: &mut B) {
+        let precomputed_and = b.main(0, 2);
+        let copied_and = b.main(0, 3);
+        b.emit_base(0, copied_and - precomputed_and);
+    }
+}
+
+fn preprocessed_sub_proof() -> &'static HostSubProof {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<HostSubProof> = OnceLock::new();
+    CELL.get_or_init(|| {
+        let (air, proof) = preprocessed_fixture();
+        build_host_sub_proof(&*air, &proof)
+    })
+}
+
+/// ★ The four-group shape, and the witness that the group ORDER is
+/// load-bearing.
+///
+/// Both halves, as the degenerate-parameter rule requires. The machine
+/// reproduces the production reconstruction on a proof that HAS a precomputed
+/// group — and production's own reconstruction, handed the same two base
+/// groups in the opposite order, gives a DIFFERENT answer. Without the second
+/// half this test would pass against a main-first emitter, which is the exact
+/// failure mode it exists to prevent.
+#[test]
+fn the_precomputed_group_comes_first_and_that_is_checkable() {
+    let h = preprocessed_sub_proof();
+    let groups = h.shape.groups();
+
+    assert_eq!(
+        groups.len(),
+        4,
+        "the point of this fixture is a sub-proof with all four committed \
+         matrices; got {groups:?}"
+    );
+    assert_eq!(h.shape.trace_groups[0].num_columns, 3, "precomputed width");
+    assert!(!h.shape.trace_groups[0].is_ext);
+    assert_eq!(h.shape.trace_groups[1].num_columns, 3, "main width");
+    assert_eq!(
+        h.shape.trace_groups[0].num_columns, h.shape.trace_groups[1].num_columns,
+        "the two base groups must be the same width, or the swap below is not \
+         a well-formed alternative reading"
+    );
+    println!(
+        "preprocessed fixture: groups {:?}, depth {}, {} queries",
+        groups
+            .iter()
+            .map(|g| (g.num_columns, g.is_ext))
+            .collect::<Vec<_>>(),
+        h.shape.merkle_depth,
+        h.iotas.len()
+    );
+
+    // ---- half one: the machine agrees with production. -------------------
+    let queries: Vec<usize> = (0..h.iotas.len().min(16)).collect();
+    let mut b = LfmBuilder::new();
+    let (_, outs) = emit_sub_proof(&mut b, &h.shape, queries.len());
+    for (p, s) in &outs {
+        b.public(p.as_cell());
+        b.public(s.as_cell());
+    }
+    let program = compile(b.finish());
+    validate(&program).expect("admissible");
+    let exec = execute(&program, &h.arenas(&queries), &TestPermutation)
+        .expect("the four-group sub-proof must authenticate and fold");
+    for (k, q) in queries.iter().enumerate() {
+        assert_eq!(
+            word_as_ext(&exec.public_words[2 * k].1).expect("ext"),
+            h.expected[*q].0,
+            "query {q}: DEEP at the regular point"
+        );
+        assert_eq!(
+            word_as_ext(&exec.public_words[2 * k + 1].1).expect("ext"),
+            h.expected[*q].1,
+            "query {q}: DEEP at the symmetric point"
+        );
+    }
+
+    // ---- half two: the swapped reading DISAGREES. ------------------------
+    //
+    // Asked of production's own reconstruction, not of a model of it: hand it
+    // the main slice where the precomputed one belongs and vice versa. If that
+    // came out equal, the order would be unobservable and this fixture would be
+    // no witness at all.
+    let swapped = &h.expected_base_swapped;
+    assert_eq!(
+        swapped.len(),
+        h.expected.len(),
+        "the swapped reading must have been computed for this fixture"
+    );
+    let mut differs = 0usize;
+    for q in &queries {
+        if swapped[*q].0 != h.expected[*q].0 || swapped[*q].1 != h.expected[*q].1 {
+            differs += 1;
+        }
+    }
+    assert_eq!(
+        differs,
+        queries.len(),
+        "swapping the precomputed and main slices must change the \
+         reconstruction at every query, or the column order is not observable \
+         on this fixture and it witnesses nothing"
+    );
+    println!(
+        "column order is load-bearing: the swapped reading differs at all {} \
+         checked queries",
+        queries.len()
     );
 }
