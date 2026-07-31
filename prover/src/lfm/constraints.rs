@@ -82,7 +82,47 @@ pub struct OodOperands {
     /// Precomputed LogUp alpha powers.
     pub alpha_powers: Vec<Ext>,
     /// The LogUp table offset `L/N`.
+    ///
+    /// ⚠ In any program that ALSO runs the LogUp closure, this must be the cell
+    /// [`emit_table_offset`] returns, not a separate hint. See that function for
+    /// why — the two legs consuming `L` independently makes the bus-balance
+    /// check vacuous. The synthetic IR-lowering differential is exempt: it has
+    /// no trace length and no closure, so there is no second consumer to agree
+    /// with.
     pub table_offset: Ext,
+}
+
+/// `L/N` — the LogUp per-row offset — DERIVED from the table's total bus
+/// contribution `L` rather than hinted alongside it.
+///
+/// # Why this is a soundness requirement and not a convenience
+///
+/// `L` has two consumers that never meet. The circular accumulator constraint
+/// (`lookup.rs`'s `emit_logup_accumulated`) enforces
+/// `acc_next − acc_curr − Σterms + L/N = 0`, which together with the `acc[0] = 0`
+/// boundary pins `L` to the aux trace: the accumulator wraps to zero after `N`
+/// rows only if `L` really is that table's total. The bus-balance closure
+/// separately checks `Σ_tables L = expected`. Production computes the offset
+/// from the one `L` the proof carries (`verifier.rs`'s `logup_table_offset`), so
+/// the two agree by construction.
+///
+/// A machine that hinted `L/N` for the constraint leg and `L` for the closure
+/// would hand the prover two independent arena words. Supply a truthful `L₁/N`
+/// so every accumulator wraps, and an arbitrary `L₂` so the sum hits the target:
+/// both legs pass in isolation and the bus balance is a statement about numbers
+/// attached to nothing. Deriving one from the other is what denies that, and it
+/// costs a single `MulBase` against a program constant, since `N` is shape.
+///
+/// This is the same failure the DEEP/authentication join closes one leg over —
+/// two consumers of one value, agreeing only because the host filling the arena
+/// agreed with itself.
+pub fn emit_table_offset(b: &mut LfmBuilder, contribution: Ext, log2_trace_length: u32) -> Ext {
+    let n = FE::from(1u64 << log2_trace_length);
+    let n_inv = n
+        .inv()
+        .expect("a power-of-two trace length is nonzero, so invertible");
+    let c = b.felt_const(n_inv);
+    b.emul_base(contribution, c)
 }
 
 /// What one AIR's lowering cost, measured by the pass that emitted it.
