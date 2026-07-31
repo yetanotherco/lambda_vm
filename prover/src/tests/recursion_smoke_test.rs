@@ -827,6 +827,13 @@ fn test_recursion_execute_1query() {
 /// the `3,4,5,6` cycle (one per table). A transition outside
 /// `{1->2, 2->3, 3->4, 4->5, 5->6, 6->3}` means the marker convention broke —
 /// wrong immediate decoded, or a stale/mismatched build.
+///
+/// That transition set is the monolithic path's. The continuation guest
+/// (`continuation` feature) re-emits `STEP_AIRS_AND_BUS_BALANCE_DONE` before
+/// each epoch's `multi_verify_views` (`continuation::verify_epoch`) and once
+/// more before the global-memory verify (`continuation::verify_global`), so
+/// there `6->2` is also a valid transition. This test runs the monolithic
+/// guest, where those markers never fire.
 #[test]
 #[ignore = "slow: runs the in-VM STARK verifier (minutes on CI)"]
 fn test_recursion_step_markers_observed_in_order() {
