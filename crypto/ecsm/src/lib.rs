@@ -65,11 +65,14 @@ pub enum EcsmError {
     ScalarIsZero,
     /// `k >= N`: outside the valid scalar range `[1, N)`.
     ScalarOutOfRange,
-    /// `x^3 + b` is not a quadratic residue, so `xG` is not a valid x-coordinate.
+    /// The input point is not on the curve: on the x-only path `x³ + b` is not a quadratic
+    /// residue, so `xG` is not a valid x-coordinate; on the affine path the caller's own
+    /// `yG` fails `yG² ≡ xG³ + b`.
     NotOnCurve,
-    /// `xG >= p`: not a canonical field element. Reducing it silently would
-    /// diverge from the prover, whose `xR < p` range check makes a non-canonical
-    /// input unprovable (with `k = 1` the input is echoed back as `xR`).
+    /// A coordinate is `>= p`, so it is not a canonical field element — `xG` on either path,
+    /// `yG` on the affine one. Reducing it silently would diverge from the prover, whose
+    /// `xR < p` / `yR < p` range checks make a non-canonical input unprovable (with `k = 1`
+    /// the x-only input is echoed back as `xR`).
     CoordinateOutOfRange,
 }
 
@@ -78,8 +81,8 @@ impl core::fmt::Display for EcsmError {
         match self {
             EcsmError::ScalarIsZero => write!(f, "ECSM scalar k must be non-zero"),
             EcsmError::ScalarOutOfRange => write!(f, "ECSM scalar k must be < N"),
-            EcsmError::NotOnCurve => write!(f, "ECSM xG is not a valid curve x-coordinate"),
-            EcsmError::CoordinateOutOfRange => write!(f, "ECSM xG must be < p"),
+            EcsmError::NotOnCurve => write!(f, "ECSM input point is not on the curve"),
+            EcsmError::CoordinateOutOfRange => write!(f, "ECSM coordinates must be < p"),
         }
     }
 }
@@ -136,14 +139,15 @@ pub(crate) fn prepare_with_y(
     if k >= n() {
         return Err(EcsmError::ScalarOutOfRange);
     }
+    let p = p();
     let xg = BigUint::from_bytes_le(xg_le);
     let yg = BigUint::from_bytes_le(yg_le);
-    if xg >= p() || yg >= p() {
+    if xg >= p || yg >= p {
         return Err(EcsmError::CoordinateOutOfRange);
     }
     // On-curve: yG² ≡ xG³ + b (mod p).
-    let lhs = (&yg * &yg) % p();
-    let rhs = (&xg * &xg % p() * &xg + BigUint::from(B)) % p();
+    let lhs = (&yg * &yg) % &p;
+    let rhs = (&xg * &xg % &p * &xg + BigUint::from(B)) % &p;
     if lhs != rhs {
         return Err(EcsmError::NotOnCurve);
     }
