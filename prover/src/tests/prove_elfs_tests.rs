@@ -1355,10 +1355,11 @@ fn hint_min_traces() -> (Elf, Traces) {
 fn test_prove_hint_min_forged_selector_rejected() {
     use crate::tables::hint::cols as hint_cols;
     let (elf, mut traces) = hint_min_traces();
-    traces
-        .hint
-        .main_table
-        .set(0, hint_cols::SEL_0, FieldElement::<GoldilocksField>::from(3u64));
+    traces.hint.main_table.set(
+        0,
+        hint_cols::SEL_0,
+        FieldElement::<GoldilocksField>::from(3u64),
+    );
     assert!(
         !prove_and_verify_vm_minimal(&elf, &mut traces),
         "Verifier must reject a hint with an out-of-range selector"
