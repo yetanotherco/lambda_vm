@@ -350,6 +350,166 @@ pub fn barycentric_ext3_on_device_with_dev_inv_denoms(
     Ok(out)
 }
 
+/// Compile-time cap of the multi kernels' per-thread accumulator array
+/// (`BARY_MAX_K` in barycentric.cu). Callers with more evaluation points fall
+/// back to the per-point kernels.
+pub const BARY_MAX_EVAL_POINTS: usize = 8;
+
+/// Row-chunk count for the multi kernels: enough `cols * chunks` blocks to
+/// occupy the device, without shrinking a chunk's row range below the point
+/// where launch + combine overhead dominates.
+fn bary_num_chunks(num_cols: usize, n: usize) -> usize {
+    let by_occupancy = (2048 / num_cols.max(1)).max(1);
+    let by_rows = (n / 8192).max(1);
+    by_occupancy.min(by_rows).min(64)
+}
+
+/// Multi-eval-point counterpart of
+/// [`barycentric_base_on_device_with_dev_inv_denoms`]: one pass over the LDE
+/// column data computes the barycentric sums for ALL `k_points` evaluation
+/// points (their inv_denom blocks live contiguously in `inv_denoms_dev`, the
+/// layout `compute_and_invert_denoms_ext3_dev` produces). Returns
+/// `3 * k_points * num_cols` u64: `k_points` concatenated per-column blocks,
+/// each in the same layout as the single-point kernels.
+pub fn barycentric_base_multi_on_device(
+    stream: &Arc<CudaStream>,
+    main_handle: &GpuLdeBase,
+    row_stride: usize,
+    coset_points_dev: &CudaSlice<u64>,
+    inv_denoms_dev: &CudaSlice<u64>,
+    n: usize,
+    k_points: usize,
+) -> Result<Vec<u64>> {
+    main_handle.wait_ready_on(stream)?;
+    assert!(k_points >= 1 && k_points <= BARY_MAX_EVAL_POINTS);
+    assert!(coset_points_dev.len() >= n);
+    assert!(inv_denoms_dev.len() >= k_points * 3 * n);
+    let num_cols = main_handle.m;
+    if num_cols == 0 || n == 0 {
+        return Ok(vec![0; 3 * k_points * num_cols]);
+    }
+    let be = backend()?;
+    let num_chunks = bary_num_chunks(num_cols, n);
+    let total = k_points * num_cols;
+    let mut partials = stream.alloc_zeros::<u64>(total * num_chunks * 3)?;
+    let mut out_dev = stream.alloc_zeros::<u64>(3 * total)?;
+    let points_view = coset_points_dev.slice(0..n);
+    let inv_view = inv_denoms_dev.slice(0..k_points * 3 * n);
+
+    let col_stride_u64 = main_handle.lde_size as u64;
+    let row_stride_u64 = row_stride as u64;
+    let n_u64 = n as u64;
+    let k_u64 = k_points as u64;
+    let chunks_u64 = num_chunks as u64;
+    let total_u64 = total as u64;
+    let cfg = LaunchConfig {
+        grid_dim: (num_cols as u32, num_chunks as u32, 1),
+        block_dim: (BLOCK_DIM, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        stream
+            .launch_builder(&be.barycentric_base_strided_multi)
+            .arg(main_handle.buf.as_ref())
+            .arg(&col_stride_u64)
+            .arg(&row_stride_u64)
+            .arg(&points_view)
+            .arg(&inv_view)
+            .arg(&n_u64)
+            .arg(&k_u64)
+            .arg(&chunks_u64)
+            .arg(&mut partials)
+            .launch(cfg)?;
+    }
+    let combine_cfg = LaunchConfig {
+        grid_dim: (total.div_ceil(BLOCK_DIM as usize) as u32, 1, 1),
+        block_dim: (BLOCK_DIM, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        stream
+            .launch_builder(&be.barycentric_combine_partials)
+            .arg(&partials)
+            .arg(&chunks_u64)
+            .arg(&total_u64)
+            .arg(&mut out_dev)
+            .launch(combine_cfg)?;
+    }
+    let out = stream.clone_dtoh(&out_dev)?;
+    stream.synchronize()?;
+    Ok(out)
+}
+
+/// Ext3 counterpart of [`barycentric_base_multi_on_device`].
+pub fn barycentric_ext3_multi_on_device(
+    stream: &Arc<CudaStream>,
+    aux_handle: &GpuLdeExt3,
+    row_stride: usize,
+    coset_points_dev: &CudaSlice<u64>,
+    inv_denoms_dev: &CudaSlice<u64>,
+    n: usize,
+    k_points: usize,
+) -> Result<Vec<u64>> {
+    aux_handle.wait_ready_on(stream)?;
+    assert!(k_points >= 1 && k_points <= BARY_MAX_EVAL_POINTS);
+    assert!(coset_points_dev.len() >= n);
+    assert!(inv_denoms_dev.len() >= k_points * 3 * n);
+    let num_cols = aux_handle.m;
+    if num_cols == 0 || n == 0 {
+        return Ok(vec![0; 3 * k_points * num_cols]);
+    }
+    let be = backend()?;
+    let num_chunks = bary_num_chunks(num_cols, n);
+    let total = k_points * num_cols;
+    let mut partials = stream.alloc_zeros::<u64>(total * num_chunks * 3)?;
+    let mut out_dev = stream.alloc_zeros::<u64>(3 * total)?;
+    let points_view = coset_points_dev.slice(0..n);
+    let inv_view = inv_denoms_dev.slice(0..k_points * 3 * n);
+
+    let col_stride_u64 = aux_handle.lde_size as u64;
+    let row_stride_u64 = row_stride as u64;
+    let n_u64 = n as u64;
+    let k_u64 = k_points as u64;
+    let chunks_u64 = num_chunks as u64;
+    let total_u64 = total as u64;
+    let cfg = LaunchConfig {
+        grid_dim: (num_cols as u32, num_chunks as u32, 1),
+        block_dim: (BLOCK_DIM, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        stream
+            .launch_builder(&be.barycentric_ext3_strided_multi)
+            .arg(aux_handle.buf.as_ref())
+            .arg(&col_stride_u64)
+            .arg(&row_stride_u64)
+            .arg(&points_view)
+            .arg(&inv_view)
+            .arg(&n_u64)
+            .arg(&k_u64)
+            .arg(&chunks_u64)
+            .arg(&mut partials)
+            .launch(cfg)?;
+    }
+    let combine_cfg = LaunchConfig {
+        grid_dim: (total.div_ceil(BLOCK_DIM as usize) as u32, 1, 1),
+        block_dim: (BLOCK_DIM, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        stream
+            .launch_builder(&be.barycentric_combine_partials)
+            .arg(&partials)
+            .arg(&chunks_u64)
+            .arg(&total_u64)
+            .arg(&mut out_dev)
+            .launch(combine_cfg)?;
+    }
+    let out = stream.clone_dtoh(&out_dev)?;
+    stream.synchronize()?;
+    Ok(out)
+}
+
 /// Gather full rows from a device-resident base-field LDE handle. `rows` are LDE
 /// row indices; returns their column values row-major (`rows.len() * main.m`
 /// u64, `out[q*num_cols + col]`) — i.e. the concatenation of

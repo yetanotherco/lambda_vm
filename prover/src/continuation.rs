@@ -1225,6 +1225,17 @@ pub fn prove_continuation(
             drop(__nvtx);
             match traces {
                 Ok(traces) => {
+                    // Pre-upload the big main traces from this builder thread
+                    // (idle slack ahead of the prover), so the R1 main commits
+                    // skip their H2D.
+                    #[cfg(feature = "cuda")]
+                    let traces = {
+                        let mut traces = traces;
+                        #[cfg(feature = "instruments")]
+                        let __sp = stark::instruments::span("p6_trace_preupload");
+                        traces.preupload_main_traces();
+                        traces
+                    };
                     let prepared = PreparedEpoch {
                         index: job.index,
                         register_init: job.register_init,

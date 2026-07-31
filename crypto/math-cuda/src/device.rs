@@ -221,6 +221,9 @@ pub struct Backend {
     pub barycentric_ext3_batched: CudaFunction,
     pub barycentric_base_batched_strided: CudaFunction,
     pub barycentric_ext3_batched_strided: CudaFunction,
+    pub barycentric_base_strided_multi: CudaFunction,
+    pub barycentric_ext3_strided_multi: CudaFunction,
+    pub barycentric_combine_partials: CudaFunction,
     pub gather_rows_base: CudaFunction,
     pub gather_rows_ext3: CudaFunction,
 
@@ -454,6 +457,9 @@ impl Backend {
                 .load_function("barycentric_base_batched_strided")?,
             barycentric_ext3_batched_strided: bary
                 .load_function("barycentric_ext3_batched_strided")?,
+            barycentric_base_strided_multi: bary.load_function("barycentric_base_strided_multi")?,
+            barycentric_ext3_strided_multi: bary.load_function("barycentric_ext3_strided_multi")?,
+            barycentric_combine_partials: bary.load_function("barycentric_combine_partials")?,
             gather_rows_base: bary.load_function("gather_rows_base")?,
             gather_rows_ext3: bary.load_function("gather_rows_ext3")?,
             deep_composition_ext3_row: deep.load_function("deep_composition_ext3_row")?,

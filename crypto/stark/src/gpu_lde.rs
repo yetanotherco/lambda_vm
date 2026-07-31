@@ -39,10 +39,12 @@ use crate::trace::LDETraceTable;
 /// check is on **lde size**, not trace length, because that's what
 /// determines the FFT workload.
 ///
-/// 2^19 is a conservative default calibrated against a 46-core machine where
-/// rayon-parallel CPU LDE is already fast. Override via env var for tuning
-/// on smaller machines, see `crypto/math-cuda/tests/bench_quick.rs`.
-const DEFAULT_GPU_LDE_THRESHOLD: usize = 1 << 19;
+/// The commit itself is not the whole cost: a table committed on CPU has no
+/// device handle, so every R2-R4 GPU dispatch re-uploads its LDE. 2^14 is the
+/// measured sweep optimum on ethrex continuations (2^14 beats 2^15..2^19 and
+/// also beats "everything on GPU", where sub-2^14 tables lose to launch
+/// overhead). Override via env var for tuning.
+const DEFAULT_GPU_LDE_THRESHOLD: usize = 1 << 14;
 
 fn gpu_lde_threshold() -> usize {
     static CACHED: OnceLock<usize> = OnceLock::new();
@@ -189,7 +191,6 @@ pub(crate) fn device_only_disabled() -> bool {
 pub(crate) fn device_only_gate<F, E>(
     lde_size: usize,
     n: usize,
-    is_preprocessed: bool,
     offsets_contiguous: bool,
     zerofier_uniform: bool,
 ) -> bool
@@ -207,7 +208,6 @@ where
         && lde_size.is_power_of_two()
         && lde_size >= gpu_lde_threshold()
         && n >= gpu_bary_threshold()
-        && !is_preprocessed
         && offsets_contiguous
         && zerofier_uniform
 }
@@ -679,6 +679,7 @@ pub fn gpu_leaf_hash_calls() -> u64 {
 /// openings gather paths from the device tree via [`gather_proofs_dev`].
 pub(crate) fn try_expand_leaf_and_tree_row_major_keep<F, E, B>(
     row_major: &[FieldElement<E>],
+    predev: Option<&math_cuda::CudaSlice<u64>>,
     n: usize,
     m: usize,
     blowup_factor: usize,
@@ -719,6 +720,7 @@ where
     // `retain_host_lde=false` additionally skips the row-major D2H (device-only).
     let (handle, lde_u64) = math_cuda::lde::coset_lde_row_major_with_merkle_tree_keep(
         raw,
+        predev,
         n,
         m,
         blowup_factor,
@@ -774,16 +776,20 @@ where
 /// downstream GPU rounds.
 ///
 /// `build_precomputed=false` skips the precomputed tree (process-cache hit);
-/// the first element is then `None`.
+/// the first element is then `None`. With `want_host=false` the row-major LDE
+/// D2H is skipped and the returned Vec is empty (device-only tables: every
+/// consumer reads the handle).
 #[allow(clippy::type_complexity)]
 pub(crate) fn try_expand_split_trees_row_major_keep<F, E, B>(
     row_major: &[FieldElement<E>],
+    predev: Option<&math_cuda::CudaSlice<u64>>,
     n: usize,
     m: usize,
     blowup_factor: usize,
     weights: &[FieldElement<F>],
     split_col: usize,
     build_precomputed: bool,
+    want_host: bool,
 ) -> Option<(
     Option<MerkleTree<B>>,
     MerkleTree<B>,
@@ -821,12 +827,14 @@ where
 
     let (pre_nodes, handle, lde_u64) = math_cuda::lde::coset_lde_row_major_split_trees(
         raw,
+        predev,
         n,
         m,
         blowup_factor,
         &weights_u64,
         split_col,
         build_precomputed,
+        want_host,
     )
     .ok()?;
 
@@ -1273,6 +1281,146 @@ where
 
     let scalar = ood_ext3_scalar::<F, E>(coset_offset_pow_n, n_inv, g_n_inv, z_pow_n);
     Some(apply_ext3_scalar::<E>(&sums_raw, scalar, num_cols))
+}
+
+/// Multi-eval-point variant of [`try_barycentric_base_on_handle`]: one kernel
+/// pass over the main LDE computes the OOD sums for every evaluation point at
+/// once (their inv_denom blocks are contiguous in the [`R3DevContext`] buffer),
+/// instead of re-reading the column data per point. Returns one scaled eval Vec
+/// per point, or `None` (→ per-point dispatch / CPU fallback) when the handle
+/// is absent, thresholds miss, there are more points than the kernel's
+/// accumulator cap, or the math-cuda call errs.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_barycentric_base_on_handle_multi<F, E>(
+    lde_trace: &LDETraceTable<F, E>,
+    row_stride: usize,
+    coset_points_len: usize,
+    coset_offset_pow_n: &FieldElement<F>,
+    n_inv: &FieldElement<F>,
+    g_n_inv: &FieldElement<F>,
+    z_pows: &[FieldElement<E>],
+    ctx: &R3DevContext,
+) -> Option<Vec<Vec<FieldElement<E>>>>
+where
+    F: IsField + IsSubFieldOf<E> + 'static,
+    E: IsField + 'static,
+{
+    if !is_goldilocks_ext3_tower::<F, E>() {
+        return None;
+    }
+    let k_points = z_pows.len();
+    if k_points == 0 || k_points > math_cuda::barycentric::BARY_MAX_EVAL_POINTS {
+        return None;
+    }
+    let main = lde_trace.gpu_main()?;
+    let num_cols = main.m;
+    if num_cols == 0 {
+        return Some(vec![Vec::new(); k_points]);
+    }
+    let n = coset_points_len;
+    if !n.is_power_of_two() || n < gpu_bary_threshold() {
+        return None;
+    }
+    if main.lde_size != n.checked_mul(row_stride)? {
+        return None;
+    }
+    if ctx.inv_denoms.len() < k_points * 3 * n {
+        return None;
+    }
+
+    let sums_raw = math_cuda::barycentric::barycentric_base_multi_on_device(
+        &ctx.stream,
+        main,
+        row_stride,
+        &ctx.coset_points,
+        &ctx.inv_denoms,
+        n,
+        k_points,
+    )
+    .ok()?;
+    GPU_BARY_CALLS.fetch_add(k_points as u64, Ordering::Relaxed);
+
+    Some(
+        z_pows
+            .iter()
+            .enumerate()
+            .map(|(k, z_pow_n)| {
+                let scalar = ood_ext3_scalar::<F, E>(coset_offset_pow_n, n_inv, g_n_inv, z_pow_n);
+                apply_ext3_scalar::<E>(
+                    &sums_raw[k * 3 * num_cols..(k + 1) * 3 * num_cols],
+                    scalar,
+                    num_cols,
+                )
+            })
+            .collect(),
+    )
+}
+
+/// Aux (ext3) counterpart of [`try_barycentric_base_on_handle_multi`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_barycentric_ext3_on_handle_multi<F, E>(
+    lde_trace: &LDETraceTable<F, E>,
+    row_stride: usize,
+    coset_points_len: usize,
+    coset_offset_pow_n: &FieldElement<F>,
+    n_inv: &FieldElement<F>,
+    g_n_inv: &FieldElement<F>,
+    z_pows: &[FieldElement<E>],
+    ctx: &R3DevContext,
+) -> Option<Vec<Vec<FieldElement<E>>>>
+where
+    F: IsField + IsSubFieldOf<E> + 'static,
+    E: IsField + 'static,
+{
+    if !is_goldilocks_ext3_tower::<F, E>() {
+        return None;
+    }
+    let k_points = z_pows.len();
+    if k_points == 0 || k_points > math_cuda::barycentric::BARY_MAX_EVAL_POINTS {
+        return None;
+    }
+    let aux = lde_trace.gpu_aux()?;
+    let num_cols = aux.m;
+    if num_cols == 0 {
+        return Some(vec![Vec::new(); k_points]);
+    }
+    let n = coset_points_len;
+    if !n.is_power_of_two() || n < gpu_bary_threshold() {
+        return None;
+    }
+    if aux.lde_size != n.checked_mul(row_stride)? {
+        return None;
+    }
+    if ctx.inv_denoms.len() < k_points * 3 * n {
+        return None;
+    }
+
+    let sums_raw = math_cuda::barycentric::barycentric_ext3_multi_on_device(
+        &ctx.stream,
+        aux,
+        row_stride,
+        &ctx.coset_points,
+        &ctx.inv_denoms,
+        n,
+        k_points,
+    )
+    .ok()?;
+    GPU_BARY_CALLS.fetch_add(k_points as u64, Ordering::Relaxed);
+
+    Some(
+        z_pows
+            .iter()
+            .enumerate()
+            .map(|(k, z_pow_n)| {
+                let scalar = ood_ext3_scalar::<F, E>(coset_offset_pow_n, n_inv, g_n_inv, z_pow_n);
+                apply_ext3_scalar::<E>(
+                    &sums_raw[k * 3 * num_cols..(k + 1) * 3 * num_cols],
+                    scalar,
+                    num_cols,
+                )
+            })
+            .collect(),
+    )
 }
 
 /// Ext3 counterpart of [`try_barycentric_base_on_handle`] for the aux LDE.
@@ -1956,10 +2104,7 @@ where
     // SAFETY: F == Goldilocks per TypeId check; FieldElement<F> is
     // #[repr(transparent)] over u64.
     let coset_u64: &[u64] = unsafe { from_raw_parts(coset_base.as_ptr() as *const u64, n) };
-    let coset_dev = match stream.clone_htod(coset_u64) {
-        Ok(s) => s,
-        Err(_) => return None,
-    };
+    let coset_dev = coset_points_device_handle(coset_u64, stream)?;
 
     // SAFETY: E == Ext3 per TypeId check.
     let z_u64: &[u64] = unsafe { ext3_slice_to_u64::<E>(z_scalars) };
@@ -1974,6 +2119,48 @@ where
         }
         Err(_) => None,
     }
+}
+
+/// Device-resident coset point buffers, keyed by `(len, points[0], points[1])`
+/// — a geometric coset is fully determined by its length and first two terms,
+/// so the key needs no allocation pinning. R3 OOD and the R4 DEEP inv_denoms
+/// build used to re-upload the SAME domain points per table per epoch (~19 GB
+/// per 100tx prove measured); one upload per distinct coset now serves the
+/// whole process (a handful of sizes, ~2-16 MiB each, never evicted — same
+/// policy as the host-side domain caches).
+#[allow(clippy::type_complexity)]
+fn coset_points_device_cache()
+-> &'static std::sync::Mutex<std::collections::HashMap<(usize, u64, u64), Arc<CudaSlice<u64>>>> {
+    static CACHE: OnceLock<
+        std::sync::Mutex<std::collections::HashMap<(usize, u64, u64), Arc<CudaSlice<u64>>>>,
+    > = OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// Resolve a host coset-points slice to its device-resident copy, uploading
+/// once per distinct coset. The first upload synchronizes its stream so the
+/// buffer is safe to read from any other stream afterwards. Returns `None` on
+/// upload failure (→ the caller's fallback).
+fn coset_points_device_handle(
+    coset_u64: &[u64],
+    stream: &Arc<CudaStream>,
+) -> Option<Arc<CudaSlice<u64>>> {
+    if coset_u64.len() < 2 {
+        return stream.clone_htod(coset_u64).ok().map(Arc::new);
+    }
+    let key = (coset_u64.len(), coset_u64[0], coset_u64[1]);
+    if let Some(h) = coset_points_device_cache().lock().unwrap().get(&key) {
+        return Some(h.clone());
+    }
+    let buf = stream.clone_htod(coset_u64).ok()?;
+    // Settle the copy before publishing: consumers run on other streams.
+    stream.synchronize().ok()?;
+    let h = Arc::new(buf);
+    coset_points_device_cache()
+        .lock()
+        .unwrap()
+        .insert(key, h.clone());
+    Some(h)
 }
 
 /// Convenience wrapper for prover callers that don't yet own a stream:
@@ -2061,7 +2248,7 @@ pub(crate) fn gather_proofs_dev(
 #[derive(Debug)]
 pub(crate) struct R3DevContext {
     pub inv_denoms: CudaSlice<u64>,
-    pub coset_points: CudaSlice<u64>,
+    pub coset_points: Arc<CudaSlice<u64>>,
     pub stream: Arc<CudaStream>,
 }
 
@@ -2107,7 +2294,7 @@ where
     // SAFETY: F == Goldilocks per TypeId check; FieldElement<F> is
     // #[repr(transparent)] over u64.
     let coset_u64: &[u64] = unsafe { from_raw_parts(coset_base.as_ptr() as *const u64, n) };
-    let coset_points = stream.clone_htod(coset_u64).ok()?;
+    let coset_points = coset_points_device_handle(coset_u64, &stream)?;
 
     // SAFETY: E == Ext3 per TypeId check.
     let z_u64: &[u64] = unsafe { ext3_slice_to_u64::<E>(z_scalars) };
@@ -2547,7 +2734,7 @@ mod split_tree_tests {
 
         let (pre_tree, mult_tree, handle, lde) =
             try_expand_split_trees_row_major_keep::<F, F, BatchedMerkleTreeBackend<F>>(
-                &data, n, m, blowup, &weights, split, true,
+                &data, None, n, m, blowup, &weights, split, true, true,
             )
             .expect("GPU split path must engage above the threshold");
         let pre_tree = pre_tree.expect("precomputed tree was requested");

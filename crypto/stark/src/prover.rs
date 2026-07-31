@@ -1028,7 +1028,6 @@ pub trait IsStarkProver<
         crate::gpu_lde::device_only_gate::<Field, FieldExtension>(
             lde_size,
             n,
-            air.is_preprocessed(),
             offsets_contiguous,
             zerofier_uniform,
         )
@@ -1077,6 +1076,7 @@ pub trait IsStarkProver<
                     BatchedMerkleTreeBackend<Field>,
                 >(
                     trace_slice,
+                    trace.main_rowmajor_dev(),
                     n,
                     num_cols,
                     domain.blowup_factor,
@@ -1135,16 +1135,22 @@ pub trait IsStarkProver<
                     BatchedMerkleTreeBackend<Field>,
                 >(
                     trace_slice,
+                    trace.main_rowmajor_dev(),
                     n,
                     num_cols,
                     domain.blowup_factor,
                     &twiddles.coset_weights,
                     num_precomputed,
                     cached_pre.is_none(),
+                    !device_only,
                 )
             {
                 #[cfg(feature = "instruments")]
                 crate::instruments::accum_r1_main(t_sub.elapsed(), std::time::Duration::ZERO);
+                if device_only {
+                    crate::gpu_lde::GPU_DEVICE_ONLY_CALLS
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 let precomputed_tree = match cached_pre {
                     // Cache key == the root a rebuild would be verified
                     // against, so a hit needs no re-check.
@@ -2555,9 +2561,12 @@ pub trait IsStarkProver<
     /// One query's trace-poly opening with the device-resident fast paths:
     /// device Merkle proof + device-gathered values when both are present, the
     /// device proof with a host gather when only the tree is resident, and the
-    /// full host walk otherwise. One body for the main and aux arms, so the
-    /// device↔host cross-check and the R4 `host_trace_empty` hard-abort guards
-    /// exist exactly once.
+    /// full host walk otherwise. One body for the main, aux and preprocessed
+    /// multiplicity arms, so the device↔host cross-check and the R4
+    /// `host_trace_empty` hard-abort guards exist exactly once. The device
+    /// gather always pulls the full `ncols` row; `col_range` selects the
+    /// committed subset (the full row for plain arms, `[split, ncols)` for the
+    /// multiplicity subset) and must match what `gather` returns.
     #[cfg(feature = "cuda")]
     #[allow(clippy::too_many_arguments)]
     fn open_trace_polys_device<C, G>(
@@ -2569,6 +2578,7 @@ pub trait IsStarkProver<
         qi: usize,
         challenge: usize,
         ncols: usize,
+        col_range: std::ops::Range<usize>,
         what: &str,
         gather: G,
     ) -> PolynomialOpenings<C>
@@ -2581,6 +2591,13 @@ pub trait IsStarkProver<
             assert!(
                 !lde_trace.host_trace_empty(),
                 "R4 {what} opening fell back to the host tree, but it is device-only (empty)"
+            );
+            // A root-only host tree means the nodes are device-resident: the
+            // host walk would emit an empty path for position 0 instead of
+            // failing, so a broken proofs↔tree pairing must abort here.
+            assert!(
+                !tree.is_root_only(),
+                "R4 {what} opening fell back to a root-only host tree (nodes device-resident)"
             );
             return Self::open_polys_with(domain, tree, challenge, gather);
         };
@@ -2595,6 +2612,7 @@ pub trait IsStarkProver<
             return Self::open_polys_with_proofs(domain, proof, challenge, gather);
         };
         let (even, odd) = Self::device_row_pair(dev_vals, qi, ncols);
+        let (even, odd) = (even[col_range.clone()].to_vec(), odd[col_range].to_vec());
         // Cross-check the device gather against the host LDE. Skipped under
         // device-only (host trace empty): the gather was proven bit-identical
         // while the host copy was resident, and there is nothing to check
@@ -2662,8 +2680,8 @@ pub trait IsStarkProver<
         // is a hard abort. When the tree is not device resident the value is
         // `None` and the openings below walk the full host tree.
         // For preprocessed tables the resident tree is the multiplicity subset
-        // tree (the host `main_commit.tree` is root only); values still come
-        // from the host LDE range gather below.
+        // tree (the host `main_commit.tree` is root only); values come from the
+        // same device row gather as plain tables, sliced per subset below.
         #[cfg(feature = "cuda")]
         let main_dev_proofs: Option<Vec<Proof<Commitment>>> = lde_trace
             .gpu_main()
@@ -2717,10 +2735,8 @@ pub trait IsStarkProver<
         // *_dev_values.is_some()` on the Goldilocks path) and we never gather
         // rows for a tree that is not device resident.
         #[cfg(feature = "cuda")]
-        let main_dev_values: Option<Vec<FieldElement<Field>>> = (!is_preprocessed)
-            .then_some(())
-            .and(main_dev_proofs.as_ref())
-            .and_then(|_| {
+        let main_dev_values: Option<Vec<FieldElement<Field>>> =
+            main_dev_proofs.as_ref().and_then(|_| {
                 lde_trace.gpu_main().and_then(|h| {
                     Self::gather_query_rows_device(
                         lde_trace,
@@ -2796,41 +2812,25 @@ pub trait IsStarkProver<
             // For preprocessed tables, open the main split (multiplicities only);
             // for normal tables, open all main columns.
             let main_trace_opening = if is_preprocessed {
-                // Multiplicity subset: device proof (resident subset tree) +
-                // host range gather for the values.
+                // Multiplicity subset: same device fast paths as the plain
+                // arm, sliced to the committed `[split, total)` column range.
                 #[cfg(feature = "cuda")]
                 {
-                    match &main_dev_proofs {
-                        Some(proofs) => Self::open_polys_with_proofs(
-                            domain,
-                            proofs[qi].clone(),
-                            *index,
-                            |row| {
-                                lde_trace.gather_main_row_range(
-                                    row,
-                                    num_precomputed_cols,
-                                    total_cols,
-                                )
-                            },
-                        ),
-                        None => {
-                            // A root-only host tree means the nodes are
-                            // device-resident: this arm would emit an empty
-                            // path for query position 0 instead of failing.
-                            assert!(
-                                !main_commit.tree.is_root_only(),
-                                "preprocessed opening fell back to the host tree, \
-                                 but it is root-only (nodes device-resident)"
-                            );
-                            Self::open_polys_with(domain, &main_commit.tree, *index, |row| {
-                                lde_trace.gather_main_row_range(
-                                    row,
-                                    num_precomputed_cols,
-                                    total_cols,
-                                )
-                            })
-                        }
-                    }
+                    Self::open_trace_polys_device(
+                        domain,
+                        lde_trace,
+                        main_dev_proofs.as_ref(),
+                        main_dev_values.as_ref(),
+                        &main_commit.tree,
+                        qi,
+                        *index,
+                        total_cols,
+                        num_precomputed_cols..total_cols,
+                        "multiplicity",
+                        |row| {
+                            lde_trace.gather_main_row_range(row, num_precomputed_cols, total_cols)
+                        },
+                    )
                 }
                 #[cfg(not(feature = "cuda"))]
                 Self::open_polys_with(domain, &main_commit.tree, *index, |row| {
@@ -2848,6 +2848,7 @@ pub trait IsStarkProver<
                         qi,
                         *index,
                         total_cols,
+                        0..total_cols,
                         "main",
                         |row| lde_trace.gather_main_row(row),
                     )
@@ -2861,7 +2862,58 @@ pub trait IsStarkProver<
             };
 
             // For preprocessed tables, also open the precomputed-columns tree.
+            // The tree is always a full host tree (process-wide cache), so the
+            // Merkle path comes from the host walk; the VALUES come from the
+            // device row gather when the LDE is resident (sliced to the
+            // `[0, split)` range), host range gather otherwise.
             let precomputed_trace_opening = main_commit.precomputed_tree.as_ref().map(|tree| {
+                #[cfg(feature = "cuda")]
+                {
+                    match main_dev_values.as_ref() {
+                        Some(vals) => {
+                            let (even, odd) = Self::device_row_pair(vals, qi, total_cols);
+                            let (even, odd) = (
+                                even[..num_precomputed_cols].to_vec(),
+                                odd[..num_precomputed_cols].to_vec(),
+                            );
+                            if !lde_trace.host_trace_empty() {
+                                let r_even = reverse_index(*index * 2, domain_size);
+                                let r_odd = reverse_index(*index * 2 + 1, domain_size);
+                                assert_eq!(
+                                    even,
+                                    lde_trace.gather_main_row_range(
+                                        r_even,
+                                        0,
+                                        num_precomputed_cols
+                                    ),
+                                    "device precomputed-row gather mismatch (even), query {qi}"
+                                );
+                                assert_eq!(
+                                    odd,
+                                    lde_trace.gather_main_row_range(r_odd, 0, num_precomputed_cols),
+                                    "device precomputed-row gather mismatch (odd), query {qi}"
+                                );
+                            }
+                            Self::open_polys_from_values(
+                                tree.get_proof_by_pos(*index)
+                                    .expect("FRI query index in bounds"),
+                                even,
+                                odd,
+                            )
+                        }
+                        None => {
+                            assert!(
+                                !lde_trace.host_trace_empty(),
+                                "R4 precomputed opening fell back to the host gather, \
+                                 but it is device-only (empty)"
+                            );
+                            Self::open_polys_with(domain, tree, *index, |row| {
+                                lde_trace.gather_main_row_range(row, 0, num_precomputed_cols)
+                            })
+                        }
+                    }
+                }
+                #[cfg(not(feature = "cuda"))]
                 Self::open_polys_with(domain, tree, *index, |row| {
                     lde_trace.gather_main_row_range(row, 0, num_precomputed_cols)
                 })
@@ -2945,6 +2997,7 @@ pub trait IsStarkProver<
                         qi,
                         *index,
                         lde_trace.num_aux_cols(),
+                        0..lde_trace.num_aux_cols(),
                         "aux",
                         |row| lde_trace.gather_aux_row(row),
                     )
@@ -3321,6 +3374,7 @@ pub trait IsStarkProver<
             #[cfg(feature = "cuda")]
             {
                 trace.clear_main_trace_dev();
+                trace.clear_main_rowmajor_dev();
                 if let Some(handle) = gpu_main_cells[idx].lock().unwrap().as_mut() {
                     handle.trace_dev = None;
                     handle.trace_rows = 0;
