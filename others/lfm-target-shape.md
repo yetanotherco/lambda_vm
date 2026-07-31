@@ -83,6 +83,77 @@ permutations at blowup 2 against ~1.4M for the epoch verify (~0.02%), 1023
 against ~460k at blowup 8 (~0.2%). See the sizing note below before quoting any
 ratio.
 
+### ★ The derivation, BUILT and MEASURED (R1g(i))
+
+First-hand, from `machine_tests::register_derivation_cost` and
+`the_register_derivation_matches_production` on branch
+`feat/lfm-register-derivation`. Everything in this subsection is measured or
+asserted by a test unless marked otherwise.
+
+**The permutation prediction was exactly right.** 255 / 511 / 1023 at blowup
+2 / 4 / 8, matching `2·leaves − 1` with `leaves = 128·blowup / ROWS_PER_LEAF`,
+i.e. `128·blowup − 1`. So was the noise figure: **0.0182%** of an epoch's
+hashing at blowup 2 and **0.2224%** at blowup 8, against the ~1.4M / ~460k
+baselines above. A leaf is 48 bytes (three columns × a row pair) and a parent
+64, so each is exactly one rate block and the permutation count is the node
+count with nothing else in it.
+
+**The FFT half of the prediction was wrong in an interesting direction.** The
+text above says "3 columns × 128 rows, an inverse FFT and an LDE FFT each".
+Measured, the transform is **8.5% of the derivation's own arithmetic at blowup
+8** (18,176 `LFM_BALU` rows of 214,784) and the remaining **91.5% is byte
+swapping** — turning each extended field element into the big-endian bytes the
+leaf hash absorbs, 64 rows per value via `felt_be_halves`. Anyone budgeting this
+leg from "it is two FFTs" is budgeting the small half. Two corrections feed
+that:
+
+- **Only two of the three columns need a transform.** OFFSET holds the register
+  word addresses, which are fixed, so its extension is a program CONSTANT — the
+  shape-static principle paying out for once. It is computed at program-build
+  time by production's own `interpolate_fft`/`evaluate_polynomial_on_lde_domain`
+  and interned, which also means the three columns reach one tree by two
+  different routes and a matching root pins the emitter against the function it
+  emits.
+- **The constant column is not free at leaf time.** Its values are byte-swapped
+  into the leaf like any other, one bit decomposition and 64 ALU rows each.
+  Pre-computing those halves as constants would drop 32,768 rows at blowup 8 —
+  and save **zero committed cells**, because `layout::padded_rows` rounds the
+  group to a power of two and 214,784 and 182,016 both land on 2^18. Measured,
+  not estimated; the same holds at blowup 2 and 4. Left undone deliberately.
+
+**Answer to the gadget question: no second hashing gadget.** The tree build
+needs no gadget `keccak_merkle_walk` does not already contain. What it needed
+was for the PARENT step to stop being welded to the walk's `Select`:
+`edsl::keccak_hash_pair` is now that step, `keccak_merkle_walk` calls it after
+its select, and `keccak_merkle_tree_root` calls it with no select at all — a
+tree knows every child's side when the program is emitted. The leaf gadget is
+`keccak_leaf_hash`, reused unchanged. Applying the sizing rule to the
+alternative: a `Select` is **17 main cells against a permutation's 36,256**, so
+the two selects a walk step carries would add 0.09% to each parent (0.03% over
+the whole tree) — the case against routing the tree through the walk is
+structural, not economic. A walk visits one node per level; a tree visits `2^k`.
+
+For the FRI leg the shape of the answer transfers but the answer does not, and
+this leg did not check which: a verifier RECEIVES layer roots from the proof and
+authenticates openings against them, so FRI plausibly wants the WALK with a
+different leaf width rather than a build — and `keccak_leaf_hash` is already
+parameterized by leaf width. Unverified; the FRI leg should settle it rather
+than inherit this sentence.
+
+**What this leg does not establish.** The two arenas are unbound. In the
+assembled verifier `R_{i+1}` is the vector the next epoch reads as its INIT and
+the published root is what that epoch's Phase A absorbs; until those joins exist
+a prover may supply any pair and get the honestly-derived root for it. Same
+standing caveat as the L2G binding.
+
+**A fourth member of the degenerate-parameter family, demonstrated.** A real
+register file is mostly zeros — the fixture's epoch-0 boundary is **3/67 nonzero
+INIT, 10/67 nonzero FINI, 9 rows differing**. Deliberately dropping row 40 from
+the emitted columns PASSED the differential against the real fixture and was
+caught only by a synthetic file with all 67 rows distinct. The falsification is
+recorded because it is the rule's clearest instance so far: the real data is not
+merely a weak witness here, it is blind over 57 of 67 rows.
+
 ### Sizing rule — compare against the WHOLE leg, never a sample of it
 
 Two gadget-sizing errors this phase produced ratios that were arithmetically
