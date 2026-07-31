@@ -21,6 +21,14 @@ entry only with the verifying evidence named in it.
    Default is the range check: if assembly arrives and the argument is
    still unverified, emit the check.
 
+2. **`start_index` is unbound to the chain** (flagged by deep-join, LogUp
+   closure slice 1). The COMMIT-bus target reads `start_index` (the carried
+   x254) as arena data; nothing yet binds it to the previous epoch's output
+   length. A chaining obligation of the same family as the L2G root binding
+   and the REGISTER derivation: assembly (or a dedicated chaining slice)
+   owes the binding, and no binding should be invented without reading how
+   production carries it across epochs.
+
 ## STATED DEFERRALS (safety argument given and accepted — not open debts)
 
 - **`coset_offset ≠ 3` is unexercised in the FRI leg** (reg-tree, FRI
@@ -37,6 +45,11 @@ entry only with the verifying evidence named in it.
 
 ## WATCH (anomalies assembly should confirm or explain, not obligations)
 
+- **The COMMIT-bus target is an unbudgeted per-byte cost item**: the
+  closure's second half is `Σ 1/(z − fingerprint(byte_i))` over public
+  output BYTES — one inverse chain per byte, scaling with output length
+  (deep-join, LogUp slice 1). Not in the target-shape budget. Assembly
+  must price it against the real epoch's public-output length.
 - **HALT's constraint-leg cost line is out of step**: 9,859 instructions
   for 22 columns, inconsistent with its neighbours (deep-join, final
   report — noticed, not chased). Assembly composes per-AIR numbers; an
@@ -54,14 +67,16 @@ entry only with the verifying evidence named in it.
   copies, one per leg.
   - Instance 1, DISCHARGED: constraint/DEEP values = authenticated values
     (deep-join slice 1, shared cells + bound index).
-  - Instance 2, found live in a leg considered DONE: the constraint leg
-    hinted `table_offset = L/N` host-side and the machine never saw `L` —
-    a prover could satisfy every accumulator with truthful `L₁/N` while the
-    closure sums arbitrary `L₂`, making bus balance vacuous. Fix in flight
-    (deep-join): machine reads `L`, derives `L/N` in-machine as `L · N⁻¹`
-    (N is shape, so `N⁻¹` is a program constant); the closure sums the same
-    `L` cell. This entry closes when that fix + its split-L control test
-    are merged.
+  - Instance 2, found live in a leg considered DONE — now DISCHARGED
+    (deep-join 6712b814, merged 94a55e17): the constraint leg hinted
+    `table_offset = L/N` host-side and the machine never saw `L` — a
+    prover could satisfy every accumulator with truthful `L₁/N` while the
+    closure sums arbitrary `L₂`, making bus balance vacuous. Fixed by
+    in-machine derivation (`emit_table_offset`: `L · N⁻¹`, N⁻¹ a program
+    constant); the closure sums the same `L` cell. Falsified both ways:
+    4 forged contributions rejected by the derivation and accepted by a
+    split control, and a pass-through stub fails exactly the composition
+    check + join test.
   - Lesson for assembly: a hinted arena word that a differential never
     catches (because the host packs it truthfully) is exactly where this
     class hides. Audit every remaining hinted word against the two-consumer
