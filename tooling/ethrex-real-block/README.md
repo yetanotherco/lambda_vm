@@ -164,11 +164,30 @@ the default and the synthetic fixtures stay reachable via the existing `cont[TX]
 `mono[TX]` tokens — old numbers reproduce with the exact syntax that produced them.
 On the CPU side the shared runner makes the opposite trade correct.
 
-**GPU baseline (measured).** On an RTX 5090 (32 GiB) against main @ `9ccdaf2`, the
-real block proves in **59.87 s wall at `--epoch-size-log2 22`** — the recommended GPU
-epoch. VRAM is what binds: 2^22 leaves 28.9% headroom, and **2^23 does not fit a 32 GiB
-card** (no card below 48 GiB can move up). The CPU bench runner is roughly **4.5–4.8x**
-that wall time for the same block.
+**GPU baseline (measured), and why the GPU epoch is 2^22.** On an RTX 5090 (32,607 MiB)
+against main @ `9ccdaf2`, same fixture and CLI, one prove per setting:
+
+| epoch | wall | VRAM | epochs | proof |
+|---|---|---|---|---|
+| 2^21 | 70.52 s | 19,193 MiB (58.9%) | 25 | 1.65 GB |
+| **2^22** | **59.87 s** | 23,193 MiB (71.1%) | 13 | 1.12 GB |
+| 2^23 | OOM after 9.7 s | 32,079 MiB (98.4%) — needs ~44 GiB | — | — |
+
+**VRAM is the binding constraint**, so 2^22 is simply the largest setting that fits a
+32 GiB card — and it is ~15% faster than 2^21 (equivalently, 2^21 is ~18% slower) with
+28.9% headroom to spare. 2^23 is out of reach for every card below 48 GiB, not just
+this one. `benchmark-gpu.yml` defaults the real-block path to 2^22 for this reason;
+raw traces are in `~/workspace/lambda_vm_bench_cache/gpu_epoch_calib_2026-07-31/`
+(`PROVENANCE.txt`).
+
+That default is **GPU-path only**. `bench_abba.sh` still defaults to 2^20 for the CPU
+`/bench-abba`, and the CLI's own `DEFAULT_CONTINUATION_EPOCH_SIZE_LOG2` is still 20:
+2^22 needs ~28 GiB of *host* memory on a CPU build, which would break laptops. VRAM
+binds on one path and host RAM on the other, so they are not the same question and the
+GPU number must not be copied across. **The CPU-server epoch recommendation is pending
+calibration.**
+
+The CPU bench runner is roughly **4.5–4.8x** the GPU wall time for the same block.
 
 Do not derive one from the other in general: the CPU rate (5.31–5.62 s/Mcycle) does not
 transfer to the GPU, and the RTX 5090 sweep found the prover CPU-bound at the serial

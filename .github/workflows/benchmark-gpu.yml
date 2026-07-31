@@ -53,6 +53,25 @@ env:
   VAST_IMAGE_DISK: "64"
   # cli features for the ABBA build — the GPU (cuda) prover path plus jemalloc heap stats.
   BENCH_FEATURES: "jemalloc-stats,prover/cuda"
+  # Continuation epoch for the REAL-BLOCK path, from the RTX 5090 calibration on
+  # 2026-07-31 against main @9ccdaf2 (raw traces:
+  # ~/workspace/lambda_vm_bench_cache/gpu_epoch_calib_2026-07-31/, PROVENANCE.txt).
+  # Measured on the 32,607 MiB card, same fixture and CLI, one prove per setting:
+  #
+  #   2^21   70.52 s wall   19,193 MiB VRAM (58.9%)   25 epochs   1.65 GB proof
+  #   2^22   59.87 s wall   23,193 MiB VRAM (71.1%)   13 epochs   1.12 GB proof
+  #   2^23   OOM at 32,079 MiB (98.4%) after 9.7 s — needs ~44 GiB
+  #
+  # So 2^22 is the largest setting that fits a 32 GiB card, and it is ~15% faster than
+  # 2^21 (equivalently, 2^21 is ~18% slower) with 28.9% VRAM headroom left. 2^23 is out
+  # of reach for every card below 48 GiB, not just this one.
+  #
+  # GPU PATH ONLY, and deliberately so. It is NOT pushed into bench_abba.sh's default
+  # (2^20, which the CPU /bench-abba uses) nor into the CLI's
+  # DEFAULT_CONTINUATION_EPOCH_SIZE_LOG2 (also 20): 2^22 needs ~28 GiB of HOST memory on
+  # a CPU build, which would break laptops. VRAM is the binding constraint here and host
+  # RAM is the binding constraint there, so the two defaults are not the same question.
+  GPU_REAL_EPOCH_LOG2: "22"
   # Unique per-run label set on the instance, for easy identification in the Vast console.
   RUN_LABEL: "gpu-bench-${{ github.run_id }}-${{ github.run_attempt }}"
   # Pin the Vast CLI to an immutable commit (a PyPI version can be re-published; a commit
@@ -388,6 +407,15 @@ jobs:
           KEY: ${{ steps.sshkey.outputs.key_path }}
         run: |
           SSH="ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o BatchMode=yes -i $KEY -p $PORT root@$HOST"
+
+          # The calibrated epoch applies to the real block only. The synthetic cont[TX]
+          # tokens keep bench_abba.sh's 2^20 so a number recorded before this change still
+          # reproduces with the syntax that produced it — that reproducibility is the whole
+          # reason those tokens were kept. mono[TX] has no epoch at all.
+          EPOCH_ENV=""
+          if [ "$BENCH_WORKLOAD" = "real" ]; then
+            EPOCH_ENV="EPOCH_SIZE_LOG2=$GPU_REAL_EPOCH_LOG2"
+          fi
           echo "Waiting for the template onstart script to finish (Rust + LLVM + sysroot + clone)..."
           # The bootstrap's final stdout line is "=== done ===". Vast captures onstart
           # output to /var/log/onstart.log; fall back to checking the artifacts it leaves.
@@ -465,7 +493,7 @@ jobs:
             git fetch --force origin main; $FETCH; \
             git checkout -f origin/main; \
             REBUILD=1 CUDARC_PIN=cuda-12080 SYSROOT_DIR=/opt/lambda-vm-sysroot BENCH_FEATURES='$BENCH_FEATURES' \
-            WORKLOAD=$BENCH_WORKLOAD CONTINUATIONS=$CONTINUATIONS TX_COUNT=$TX_COUNT \
+            WORKLOAD=$BENCH_WORKLOAD CONTINUATIONS=$CONTINUATIONS TX_COUNT=$TX_COUNT $EPOCH_ENV \
             scripts/bench_abba.sh $REF_A origin/main $PAIRS"
 
           # pipefail so a failed remote bench (e.g. a prove that dies) propagates through the
