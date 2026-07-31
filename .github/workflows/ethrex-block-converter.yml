@@ -78,7 +78,7 @@ jobs:
       - name: Cache cargo build artifacts
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "lambda-vm-ethrex-real-block-usable"
+          shared-key: "lambda-vm-real-block-usable"
           cache-all-crates: "true"
           workspaces: |
             tooling/ethrex-tests -> target
