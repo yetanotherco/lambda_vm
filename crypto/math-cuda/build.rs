@@ -82,6 +82,7 @@ fn compile_kernel(src: &str, out_name: &str, have_nvcc: bool) {
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed=CUDARC_NVCC_ARCH");
+    println!("cargo:rerun-if-env-changed=LAMBDA_VM_NVCC_LINEINFO");
 
     // When nvcc is missing from PATH, emit an empty cubin stub so the crate
     // still compiles. include_bytes! in src/device.rs needs the file to exist
@@ -115,8 +116,15 @@ fn compile_kernel(src: &str, out_name: &str, have_nvcc: bool) {
         .map(|a| to_real_arch(&a))
         .unwrap_or_else(|_| detect_arch());
 
-    let status = Command::new(nvcc_path())
-        .args(["--cubin", "-O3", "-std=c++17", "-arch", &arch, "-o"])
+    let mut cmd = Command::new(nvcc_path());
+    cmd.args(["--cubin", "-O3", "-std=c++17", "-arch", &arch]);
+    // SASS→source line mapping for Nsight Compute. Unlike -G this does not
+    // change codegen, but keep it opt-in so production cubins stay byte-stable.
+    if env::var("LAMBDA_VM_NVCC_LINEINFO").is_ok_and(|v| v != "0" && !v.is_empty()) {
+        cmd.arg("-lineinfo");
+    }
+    let status = cmd
+        .arg("-o")
         .arg(&out_path)
         .arg(&src_path)
         .status()

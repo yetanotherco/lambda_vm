@@ -30,11 +30,17 @@ cudarc = { version = "0.19", default-features = false, features = [
 ] }
 math = { path = "../math" }
 rayon = "1.7"
+# NVTX range emission for Nsight timelines (dlopen'd at runtime, see src/nvtx.rs).
+libloading = { version = "0.8", optional = true }
 
 [features]
 # Test-only fault injection in FriCommitState. Production builds leave this
 # off so the fault check is fully elided at compile time.
 test-faults = []
+# NVTX bindings for Nsight Systems profiling (ranges are emitted by the
+# stark/prover layers). Zero-cost when disabled; when enabled but
+# libnvToolsExt is absent at runtime, every call is a cheap no-op.
+nvtx = ["dep:libloading"]
 
 [dev-dependencies]
 crypto = { path = "../crypto" }

@@ -409,13 +409,12 @@ fn test_multi_prove_dedups_shared_domain_params() {
     .expect("proving should succeed");
 
     let (hits, misses) = domain_cache_stats::get();
-    assert_eq!(
-        misses, 1,
-        "only one Domain/LdeTwiddles must be constructed for 3 AIRs sharing domain params"
-    );
-    assert_eq!(
-        hits, 2,
-        "remaining 2 AIRs must hit the cache instead of reconstructing"
+    // The cache is process-wide, so another test may have pre-populated this
+    // key: at most one construction, everything else must hit.
+    assert_eq!(hits + misses, 3, "all 3 AIRs must consult the cache");
+    assert!(
+        misses <= 1,
+        "at most one Domain/LdeTwiddles construction for 3 AIRs sharing domain params (got {misses})"
     );
 
     let airs: Vec<

@@ -67,8 +67,14 @@ pub fn batch_inverse_ext3(a: &[u64]) -> Result<Vec<u64>> {
     let stream = be.next_stream();
     let input_dev = stream.clone_htod(a)?;
     let out_dev = batch_inverse_ext3_dev(&input_dev, n, &stream)?;
-    let out = stream.clone_dtoh(&out_dev)?;
+    // Result download (3 * n u64s): async D2H through the per-worker pinned
+    // slab instead of a blocking pageable copy. The synchronize drains the
+    // kernels and the DMA so the pending wait below is instant.
+    let pending =
+        crate::device::async_dtoh_via(&stream, be.pinned_staging(), &be.ctx, &out_dev, 3 * n)?;
     stream.synchronize()?;
+    let mut out = vec![0u64; 3 * n];
+    pending.wait_into_u64(&mut out)?;
     Ok(out)
 }
 
