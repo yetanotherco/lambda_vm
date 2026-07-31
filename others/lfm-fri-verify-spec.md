@@ -426,3 +426,103 @@ $$(C+1)\times(2\ \text{ext-add} + 1\ \text{ext-sub} + 1\ \text{base}\!\times\!\t
 8. Folds = layers **+ 1**; the first fold has no Merkle check. §1.
 9. The three structural length checks must run **before** the query loop. §1.
 10. `zetas[i+1]` in the loop, `zetas[0]` for the first fold — off-by-one here verifies nothing. §1.
+
+---
+
+# Addendum — the fri leg's own measurements and decisions
+
+Appended 2026-07-31 by the fri leg. The spec above is the scout's; this section
+is FIRST-HAND from this worktree and is where the two disagree or the spec is
+silent.
+
+## ★ The fixture folds NOTHING — the leg's instrument problem
+
+**Measured, not inferred**, off the real proof: `fri_layers_merkle_roots = 0`,
+`fri_final_poly_coeffs = 4`, 219 query decommitments. Pinned by
+`join_tests::the_fixture_carries_no_fri_layers_so_it_cannot_witness_the_fold`.
+
+The fixture is the `min` preset over a `2^4`-step epoch, so its sub-proof has
+`log2(lde) = 3`; §2's arithmetic gives `terminal_log = min(1+7, 3) = 3`,
+`total_folds = 0`, `num_committed = 0`, and `query_phase` takes its
+empty-decommitment branch.
+
+This is §7's blindness taken one step further. §7 says a differential over real
+proofs cannot distinguish implementations that differ only off `k = 7` /
+`coset_offset = 3`. On the fixture specifically it is worse: **the production
+instance exercises none of the mechanism at all** — no fold, no walk, no
+terminal lookup. An emitter differentialled only against it would fold nothing
+and pass everything.
+
+Consequence: the primary instrument is synthetic codewords driven through
+production's own `commit_phase_from_evaluations` + `query_phase`, differentialled
+against the verifier's own check, with `num_committed` swept. Only the INPUT is
+synthetic; it remains a differential against production code.
+
+## Correction to §4 — and to what I first reported
+
+I told the team lead the FRI layer leaf is committed under
+`PairKeccak256Backend` and **"not the trace's `BatchedMerkleTreeBackend`"**.
+That is true prover-side and **wrong as a statement about the verify path**,
+which is what the machine emits. §4's "both, and they are byte-identical" is the
+correct account: `verify_fri_layer_openings` (`verifier.rs:643`) calls
+`verify_merkle_path::<BatchedMerkleTreeBackend<FieldExtension>>` over a
+two-element vector. The emitted leaf bytes are unaffected — both stream the two
+elements into one fresh keccak — but the claim as I stated it was wrong.
+
+The verify-side reading also surfaces something the prover-side reading hides:
+**the leaf ordering is parity-dependent** (`verifier.rs:637-641`,
+`if iota % 2 == 1 { [sym, v] } else { [v, sym] }`). The verifier holds the
+folded `v` and receives `sym`, so the machine must SELECT the order on the low
+index bit. Reading only the prover's `chunks_exact(2)` would have missed it.
+
+## Predictions, written BEFORE measuring
+
+Per §8, with `n = trace_bits + b`, `C = num_committed = trace_bits − 8` at
+`k = 7`, `steps = C(n−2) − C(C−1)/2`, `perms/query = C + steps`:
+
+| blowup | b | n  | C  | Q   | steps/q | perms/q | FRI perms/epoch-table |
+|--------|---|----|----|-----|---------|---------|-----------------------|
+| 2      | 1 | 21 | 12 | 219 | 162     | 174     | **38,106**            |
+| 4      | 2 | 22 | 12 | 110 | 174     | 186     | **20,460**            |
+| 8      | 3 | 23 | 12 |  73 | 186     | 198     | **14,454**            |
+
+at `trace_bits = 20`. The blowup-2 row reproduces §8's worked example exactly,
+which is the check that the formula is being read as written rather than
+re-derived by guess.
+
+⚠ This also corrects an arithmetic slip in my first report to the team lead: I
+quoted "180 path steps, ≈192 perms/query" for blowup 8. The correct figures are
+**186 and 198** — I mis-summed `Σ_{i=0}^{11}(21−i)`.
+
+**Standalone result worth carrying out of this leg:** FRI is **2.6× cheaper at
+blowup 8 than at blowup 2** (14,454 vs 38,106), because the query count falls
+3× while per-query cost rises only 14%. The blowup-8 decision was made on DEEP
+and on the keccak bill; this is an independent third leg pointing the same way.
+
+## Decision on §7's dead branches — deferral with its argument
+
+§7 lists the clamp path, the `zetas.is_empty()` no-fold branch, and
+`effective_k != k` as unreachable under production presets. The team-lead
+charter requires either synthetic coverage or a structural pin. **Neither
+option is quite right for this machine, and the reason is worth stating.**
+
+In LFM, shape is COMPILE-TIME. `num_committed`, `terminal_len` and
+`effective_k` are program constants, so none of these is emitted control flow —
+there is no branch in the program to leave dead. What exists instead is:
+
+1. **Host-side shape arithmetic** in the emitter (the `FriFoldLayout`
+   computation, clamp included). This is ordinary Rust running at program-build
+   time, so it is covered by ordinary unit tests over synthetic
+   `(trace_bits, blowup, k)` — including `k ∈ {0, 6, 63}` and `trace_bits ≤ 7` —
+   at no proving cost. This is where §7's requirement is discharged.
+2. **Two program SHAPES**: `num_committed = 0` and `num_committed > 0`. Both are
+   emitted and both are differentialled. The zero case is not a dead branch to
+   pin — it is the fixture's own shape and a real production path for small
+   tables.
+
+So: no dead program text is emitted, and nothing is left unexercised. The one
+thing genuinely NOT covered is a proof whose `coset_offset ≠ 3`, because no
+production configuration produces one and the LDE domain constants are baked
+into the program; that is a deferral, and its safety argument is that a wrong
+coset offset changes every domain point and therefore every leaf, so it cannot
+produce a passing proof — it can only fail. Stated rather than assumed.
