@@ -135,11 +135,18 @@ it — see [Measured cost of candidate blocks](#measured-cost-of-candidate-block
 | `scripts/bench_verify.sh` | `WORKLOAD=real scripts/bench_verify.sh <ref>` | ~6 min per side, then cached |
 | `scripts/perf_diff.sh` | `WORKLOAD=real scripts/perf_diff.sh <ref>` | 5 recordings, so ~30 min |
 | `benchmark-gpu.yml` | `/bench-gpu` on a PR — **the default there** | **unmeasured** (see below) |
-| `scripts/bench_abba.sh` | `WORKLOAD=real scripts/bench_abba.sh <ref>` | ~6 min × 2 × pairs |
+| `scripts/bench_abba.sh` | `WORKLOAD=real scripts/bench_abba.sh <ref>` | ~4 h at 20 pairs — **manual only** |
 
 None of them hardcode the fixture path or a block number — they read the path from
 `make -s print-real-block-fixture` and run `make ethrex-real-block-fixture` when
 the `.bin` is absent.
+
+**`/bench-abba` is deliberately NOT wired to the real block.** The script supports
+it (`WORKLOAD=real`, which is what the GPU workflow drives), but the CPU ABBA
+workflow still defaults to the synthetic fixture: 20 pairs × 2 proves × ~6 min is
+**~4 hours** on the one shared bench runner, which every other bench queues behind.
+Run it by hand when a paired test on a real workload is worth that; the option is
+here rather than a footgun on a comment trigger.
 
 **Why the GPU default differs from the CPU one.** `/bench-gpu` rents its own box per
 run, so the cost is money rather than queue time on a runner every other bench is
