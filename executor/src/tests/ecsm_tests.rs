@@ -189,6 +189,83 @@ fn ecsm_syscall_rejects_xg_not_on_curve() {
     ));
 }
 
+#[test]
+fn ecsm_affine_syscall_rejects_non_canonical_yg() {
+    // yG = p is a non-canonical zero. The prover reads yG straight out of the caller's
+    // buffer, so nothing downstream would reduce it — the executor must reject it.
+    let err = run_ecsm_affine(&k_le(5), &gx_le(), &ecsm::P_BYTES).unwrap_err();
+    assert!(matches!(
+        err,
+        ExecutionError::Ecsm(ecsm::EcsmError::CoordinateOutOfRange)
+    ));
+}
+
+#[test]
+fn ecsm_affine_syscall_rejects_zero_scalar() {
+    let err = run_ecsm_affine(&k_le(0), &gx_le(), &gy_le()).unwrap_err();
+    assert!(matches!(
+        err,
+        ExecutionError::Ecsm(ecsm::EcsmError::ScalarIsZero)
+    ));
+}
+
+/// Runs the affine ECSM syscall with caller-chosen operand addresses, input point `G`
+/// and `k = 5`.
+fn run_ecsm_affine_at(addr_xr: u64, addr_xg: u64, addr_k: u64) -> Result<(), ExecutionError> {
+    let mut pc = 0;
+    let mut registers = Registers::default();
+    let mut memory = Memory::default();
+    write_u256_le(&mut memory, addr_xg, &gx_le());
+    write_u256_le(&mut memory, addr_xg.wrapping_add(32), &gy_le());
+    write_u256_le(&mut memory, addr_k, &k_le(5));
+    registers.write(17, ECSM_AFFINE_SYSCALL_NUMBER).unwrap();
+    registers.write(10, addr_xr).unwrap();
+    registers.write(11, addr_xg).unwrap();
+    registers.write(12, addr_k).unwrap();
+    Instruction::EcallEbreak.run(&mut pc, &mut registers, &mut memory)?;
+    Ok(())
+}
+
+#[test]
+fn ecsm_affine_syscall_rejects_overlapping_point_k() {
+    // The input point spans 64 bytes, so any k landing inside [xG, xG + 64) is read at
+    // both T and T+1 and makes the trace unprovable.
+    for addr_k in [0x2000u64, 0x2008, 0x2020, 0x2038] {
+        let err = run_ecsm_affine_at(0x1000, 0x2000, addr_k).unwrap_err();
+        assert!(
+            matches!(err, ExecutionError::EcsmOperandOverlap),
+            "addr_k = {addr_k:#x} overlaps the 64-byte input point and must be rejected"
+        );
+    }
+    // Disjoint is disjoint regardless of distance: k directly below the point is 32 bytes
+    // away, which a `|diff| >= 64` bound would have rejected. Guest stack layouts produce
+    // exactly this case, so it must run.
+    run_ecsm_affine_at(0x1000, 0x2000, 0x1FE0).expect("k immediately below the point must run");
+    run_ecsm_affine_at(0x1000, 0x2000, 0x2040).expect("k immediately above the point must run");
+    // The output may alias either operand: its accesses are at later timestamps.
+    run_ecsm_affine_at(0x2000, 0x2000, 0x3000).expect("xR aliasing the input point is allowed");
+    run_ecsm_affine_at(0x3000, 0x2000, 0x3000).expect("xR aliasing k is allowed");
+}
+
+#[test]
+fn ecsm_affine_syscall_rejects_address_overflow() {
+    // Point and output span offset 63 (not 31), so their last accessed byte must stay in
+    // the limb: 0xFFFF_FFE8 fits a 32-byte operand but not a 64-byte one.
+    for (addr_xr, addr_xg, addr_k) in [
+        (0xFFFF_FFE8, 0x2000, 0x3000),
+        (0x1000, 0xFFFF_FFE8, 0x3000),
+        (0xFFFF_FFC8, 0x2000, 0x3000),
+        (0x1000, 0xFFFF_FFC8, 0x3000),
+        (0x1000, 0x2000, 0xFFFF_FFF0),
+    ] {
+        let err = run_ecsm_affine_at(addr_xr, addr_xg, addr_k).unwrap_err();
+        assert!(
+            matches!(err, ExecutionError::EcsmAddressOverflow),
+            "expected address overflow for xR={addr_xr:#x}, point={addr_xg:#x}, k={addr_k:#x}"
+        );
+    }
+}
+
 /// Runs the ECSM syscall with caller-chosen operand addresses, `xG = Gx` and `k = 5`.
 fn run_ecsm_at(addr_xr: u64, addr_xg: u64, addr_k: u64) -> Result<(), ExecutionError> {
     let mut pc = 0;

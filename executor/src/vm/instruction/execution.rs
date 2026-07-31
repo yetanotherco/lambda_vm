@@ -560,7 +560,13 @@ impl Instruction {
                         // the MEMW consistency argument can't prove the chain. The guard is
                         // about trace provability, not correctness. xR (output) may alias
                         // either: its accesses are at a later timestamp.
-                        if addr_xg.abs_diff(addr_k) < 64 {
+                        //
+                        // Exact range test rather than a distance bound: the two operands have
+                        // different sizes, so a k placed just below the point (`addr_k + 32 ==
+                        // addr_xg`) is disjoint at a distance of 32. A `< 64` bound would reject
+                        // it, making the ecall depend on which operand the guest's compiler
+                        // happens to lay out first.
+                        if addr_k < addr_xg.wrapping_add(64) && addr_xg < addr_k.wrapping_add(32) {
                             return Err(ExecutionError::EcsmOperandOverlap);
                         }
                         let xg = load_u256_le(memory, addr_xg)?;

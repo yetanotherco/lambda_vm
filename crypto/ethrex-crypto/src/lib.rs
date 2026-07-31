@@ -314,10 +314,15 @@ fn ecsm_lincomb2(
 /// no parity convention or sign flip, because the precompile receives the real `y` and the
 /// prover pins it by a memory read. `(x, y)` must be a curve point and `k` in `(0, N)`.
 /// Values cross the ABI as 32-byte little-endian; `input` is a 64-byte `[xG‖yG]` buffer,
-/// `out` a 64-byte `[xR‖yR]` buffer, `k_le` a distinct 32-byte array (executor's
-/// `|addr_input − addr_k| ≥ 64` disjointness assumption).
+/// `out` a 64-byte `[xR‖yR]` buffer and `k_le` a distinct 32-byte array, so the two
+/// operand ranges are disjoint as the executor requires (it tests the ranges, not their
+/// distance, so either stack layout is fine).
 #[cfg(target_arch = "riscv64")]
-fn ecsm_oracle(x: &FieldElement, y: &FieldElement, k: &Scalar) -> Option<(FieldElement, FieldElement)> {
+fn ecsm_oracle(
+    x: &FieldElement,
+    y: &FieldElement,
+    k: &Scalar,
+) -> Option<(FieldElement, FieldElement)> {
     let x_be = x.to_bytes();
     let y_be = y.to_bytes();
     let k_be = k.to_bytes();
