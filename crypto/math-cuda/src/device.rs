@@ -25,6 +25,12 @@ use crate::ntt::{twiddles_forward, twiddles_inverse};
 pub struct PinnedStaging {
     ptr: *mut u64,
     capacity_elems: usize,
+    /// Reusable completion event for [`async_dtoh_via`] copies through this
+    /// slot. Created once on first use and re-recorded per drain — per-call
+    /// cuEventCreate/Destroy measurably convoys the driver lock under load.
+    /// At most one drain per slot is in flight (the pending holds the slot
+    /// mutex), so a single event can never be aliased.
+    event: Option<cudarc::driver::CudaEvent>,
 }
 
 // SAFETY: the raw pointer aliases host memory allocated via cuMemHostAlloc.
@@ -34,10 +40,11 @@ unsafe impl Send for PinnedStaging {}
 unsafe impl Sync for PinnedStaging {}
 
 impl PinnedStaging {
-    const fn empty() -> Self {
+    fn empty() -> Self {
         Self {
             ptr: std::ptr::null_mut(),
             capacity_elems: 0,
+            event: None,
         }
     }
 
@@ -63,6 +70,29 @@ impl PinnedStaging {
         self.ptr = ptr;
         self.capacity_elems = new_cap;
         Ok(())
+    }
+
+    /// Record the slot's reusable event on `stream` (creating it on first use;
+    /// normally pre-created at backend init so no mid-prove cuEventCreate).
+    /// Pairs with [`PinnedStaging::sync_event`]; also re-recorded by
+    /// [`async_dtoh_via`] — safe because slot access is serialized by its
+    /// mutex, so a recorded event is always synchronized before re-recording.
+    pub fn record_event(&mut self, stream: &Arc<CudaStream>) -> Result<()> {
+        match self.event.as_ref() {
+            Some(ev) => ev.record(stream),
+            None => {
+                self.event = Some(stream.record_event(None)?);
+                Ok(())
+            }
+        }
+    }
+
+    /// Block until the last [`PinnedStaging::record_event`] point completes.
+    pub fn sync_event(&self) -> Result<()> {
+        match self.event.as_ref() {
+            Some(ev) => ev.synchronize(),
+            None => Ok(()),
+        }
     }
 
     /// View of the first `len` elements. Caller must hold this `PinnedStaging`
@@ -140,6 +170,8 @@ pub struct Backend {
     /// alongside the LDE staging so the GPU→host D2H runs at PCIe line-rate.
     pinned_hashes: Vec<Mutex<PinnedStaging>>,
     util_stream: Arc<CudaStream>,
+    /// Free-list of pre-created events for [`Backend::take_event`].
+    event_pool: Mutex<Vec<cudarc::driver::CudaEvent>>,
     next: AtomicUsize,
     /// VRAM budget (bytes) for table-session admission control. See
     /// [`detect_vram_budget_bytes`].
@@ -174,6 +206,7 @@ pub struct Backend {
 
     // keccak.cubin
     pub keccak256_leaves_base_row_major_row_pair: CudaFunction,
+    pub keccak256_leaves_base_row_major_row_pair_range: CudaFunction,
     pub keccak256_leaves_base_batched: CudaFunction,
     pub keccak256_leaves_base_row_pair_batched: CudaFunction,
     pub keccak256_leaves_ext3_batched: CudaFunction,
@@ -192,6 +225,7 @@ pub struct Backend {
 
     // deep.cubin
     pub deep_composition_ext3_row: CudaFunction,
+    pub bit_reverse_ext3_kernel: CudaFunction,
 
     // fri.cubin
     pub fri_fold_ext3: CudaFunction,
@@ -215,6 +249,7 @@ pub struct Backend {
     // constraint_interp.cubin
     pub constraint_interp_kernel: CudaFunction,
     pub constraint_composition_kernel: CudaFunction,
+    pub decompose_d2_kernel: CudaFunction,
 
     // Twiddle caches keyed by log_n.
     fwd_twiddles: Mutex<Vec<Option<Arc<CudaSlice<u64>>>>>,
@@ -297,11 +332,13 @@ impl Backend {
     fn init() -> Result<Self> {
         let ctx = CudaContext::new(0)?;
         // cudarc's default per-slice CudaEvent tracking adds two driver calls
-        // per alloc and serialises under the context lock. Slices are only
-        // shared across streams after the producing stream has been host-
-        // synchronised (e.g. the retained trace snapshot and the resident
-        // LogUp aux buffer; every producer syncs before its handle escapes),
-        // so the tracking is pure overhead. Disable it.
+        // per alloc and serialises under the context lock. Cross-stream
+        // read-after-write on shared handles is ordered explicitly instead:
+        // producers either host-synchronise before the handle escapes (trace
+        // snapshot, resident LogUp aux) or attach a `ready` PooledEvent that
+        // every consumer awaits via `wait_ready_on` (the R1 LDE handles).
+        // Any new cross-stream consumer MUST follow one of those two
+        // patterns; with that upheld the tracking is pure overhead.
         unsafe { ctx.disable_event_tracking() };
 
         // Retain freed device memory in the stream ordered pool for reuse.
@@ -338,12 +375,30 @@ impl Backend {
         // when no custom pool is in use. Stable across the backend's lifetime
         // since rayon's pool is fixed at first use.
         let n_slots = rayon::current_num_threads().max(1);
-        let pinned_staging: Vec<Mutex<PinnedStaging>> = (0..n_slots)
-            .map(|_| Mutex::new(PinnedStaging::empty()))
-            .collect();
-        let pinned_hashes: Vec<Mutex<PinnedStaging>> = (0..n_slots)
-            .map(|_| Mutex::new(PinnedStaging::empty()))
-            .collect();
+        // Pre-create each slot's reusable event here, off the prove's critical
+        // path — a mid-prove cuEventCreate convoys the driver lock (~30 ms
+        // measured under load vs ~µs at init).
+        let make_pool = || -> Result<Vec<Mutex<PinnedStaging>>> {
+            let mut pool = Vec::with_capacity(n_slots);
+            for _ in 0..n_slots {
+                let mut slot = PinnedStaging::empty();
+                slot.event = Some(ctx.new_event(None)?);
+                pool.push(Mutex::new(slot));
+            }
+            Ok(pool)
+        };
+        let pinned_staging = make_pool()?;
+        let pinned_hashes = make_pool()?;
+        // Pre-create the handle-readiness event pool (see `take_event`): one
+        // event per device-resident handle a prove can have alive; creation
+        // here is ~µs each, mid-prove it convoys the driver lock.
+        let event_pool = {
+            let mut pool = Vec::with_capacity(512);
+            for _ in 0..512 {
+                pool.push(ctx.new_event(None)?);
+            }
+            Mutex::new(pool)
+        };
         // Separate "utility" stream for twiddle uploads and other bookkeeping;
         // not part of the pool that callers rotate through.
         let util_stream = ctx.new_stream()?;
@@ -380,6 +435,8 @@ impl Backend {
             matrix_transpose_strided: ntt.load_function("matrix_transpose_strided")?,
             keccak256_leaves_base_row_major_row_pair: keccak
                 .load_function("keccak256_leaves_base_row_major_row_pair")?,
+            keccak256_leaves_base_row_major_row_pair_range: keccak
+                .load_function("keccak256_leaves_base_row_major_row_pair_range")?,
             keccak256_leaves_base_batched: keccak.load_function("keccak256_leaves_base_batched")?,
             keccak256_leaves_base_row_pair_batched: keccak
                 .load_function("keccak256_leaves_base_row_pair_batched")?,
@@ -397,6 +454,7 @@ impl Backend {
             gather_rows_base: bary.load_function("gather_rows_base")?,
             gather_rows_ext3: bary.load_function("gather_rows_ext3")?,
             deep_composition_ext3_row: deep.load_function("deep_composition_ext3_row")?,
+            bit_reverse_ext3_kernel: deep.load_function("bit_reverse_ext3_interleaved")?,
             fri_fold_ext3: fri.load_function("fri_fold_ext3")?,
             fri_update_twiddles: fri.load_function("fri_update_twiddles")?,
             compute_denoms_ext3: inverse.load_function("compute_denoms_ext3")?,
@@ -418,12 +476,14 @@ impl Backend {
                 .load_function("constraint_interp_kernel")?,
             constraint_composition_kernel: constraint_interp
                 .load_function("constraint_composition_kernel")?,
+            decompose_d2_kernel: constraint_interp.load_function("decompose_d2_ext3")?,
             fwd_twiddles: Mutex::new(vec![None; max_log]),
             inv_twiddles: Mutex::new(vec![None; max_log]),
             ctx,
             streams,
             pinned_staging,
             pinned_hashes,
+            event_pool,
             util_stream,
             next: AtomicUsize::new(0),
             vram_budget_bytes,
@@ -551,4 +611,180 @@ pub fn backend() -> Result<&'static Backend> {
     };
     let _ = BACKEND.set(b);
     Ok(BACKEND.get().expect("backend just initialised"))
+}
+
+// ── Asynchronous D2H through the pinned staging slabs ────────────────────────
+
+/// A device→host copy enqueued into a per-worker pinned staging slab, not yet
+/// awaited. Created by [`async_dtoh_via`]; consumed by one of the `wait_*`
+/// methods, which block only until the copy (and everything queued before it
+/// on its stream) lands.
+///
+/// Holding this value keeps the staging slot's mutex locked, which is what
+/// makes the whole scheme safe: no other caller (and no capacity growth) can
+/// touch the slab while the DMA is in flight.
+pub struct PendingD2H<'a> {
+    staging: std::sync::MutexGuard<'a, PinnedStaging>,
+    n_bytes: usize,
+}
+
+// A dropped pending (e.g. a `?` between enqueue and wait) must not release
+// the slot while the DMA is still writing the slab: the next holder could
+// repack it or `ensure_capacity` could free it mid-copy. Block on the copy's
+// event before the guard drops; errors are ignored (the context is already
+// failing on these paths, and the wait is best-effort protection).
+impl Drop for PendingD2H<'_> {
+    fn drop(&mut self) {
+        let _ = self.staging.sync_event();
+    }
+}
+
+/// Enqueue an async D2H of `n_elems` of `src` into the pinned slab of `slot`,
+/// without synchronizing the stream. Unlike `stream.memcpy_dtoh` into a plain
+/// (pageable) slice — which the driver services synchronously — this returns
+/// as soon as the copy is queued; the returned [`PendingD2H`] is awaited at
+/// the point the host actually needs the bytes.
+///
+/// SAFETY contract (upheld by construction for our callers): `src` must stay
+/// alive until the copy completes. Dropping a `CudaSlice` frees it
+/// stream-ordered on its own stream, so a `src` allocated on `stream` may be
+/// dropped after this call — the free queues behind the copy. Do NOT pass a
+/// `src` owned by a *different* stream and drop it before waiting.
+pub fn async_dtoh_via<'a, T: cudarc::driver::DeviceRepr>(
+    stream: &Arc<CudaStream>,
+    slot: &'a Mutex<PinnedStaging>,
+    ctx: &CudaContext,
+    src: &CudaSlice<T>,
+    n_elems: usize,
+) -> Result<PendingD2H<'a>> {
+    use cudarc::driver::DevicePtr;
+    assert!(n_elems <= src.len());
+    let n_bytes = n_elems * std::mem::size_of::<T>();
+    let u64_len = n_bytes.div_ceil(8);
+    let mut staging = slot.lock().unwrap();
+    staging.ensure_capacity(u64_len, ctx)?;
+    ctx.bind_to_thread()?;
+    // SAFETY: dst is this slot's pinned allocation — stable address (only
+    // `ensure_capacity` moves it, and we hold the lock), pinned (registered
+    // via cuMemHostAlloc, so the driver DMAs directly, asynchronously).
+    // `device_ptr` orders the read after prior writes on `stream`.
+    unsafe {
+        let (src_ptr, _record) = src.device_ptr(stream);
+        cudarc::driver::sys::cuMemcpyDtoHAsync_v2(
+            staging.ptr as *mut core::ffi::c_void,
+            src_ptr,
+            n_bytes,
+            stream.cu_stream(),
+        )
+        .result()?;
+    }
+    // Re-record the slot's reusable event (created once — per-call
+    // cuEventCreate/Destroy convoys the driver lock under load). The DMA is
+    // already in flight: if the record fails, drain the stream before the
+    // guard drops, or the next locker could free the slab mid-copy.
+    if let Err(e) = staging.record_event(stream) {
+        let _ = stream.synchronize();
+        return Err(e);
+    }
+    Ok(PendingD2H { staging, n_bytes })
+}
+
+/// Best-effort stream drain on error paths: while `armed`, dropping this guard
+/// synchronizes the stream. Arm after the first enqueue that reads a
+/// pinned-staging slab; defuse once the slab is safe to release. Declared
+/// AFTER the slot's `MutexGuard`, it drops first, so an `?`-return can never
+/// release the slot with a DMA still reading it.
+pub(crate) struct DrainOnErr<'a> {
+    pub stream: &'a CudaStream,
+    pub armed: bool,
+}
+
+impl Drop for DrainOnErr<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.stream.synchronize();
+        }
+    }
+}
+
+impl PendingD2H<'_> {
+    /// Number of bytes the copy deposits.
+    pub fn len_bytes(&self) -> usize {
+        self.n_bytes
+    }
+
+    /// Block until the copy lands, then read the pinned bytes through `f`.
+    /// Consumes the pending (releasing the staging slot when `f` returns).
+    pub fn wait_and_read<R>(self, f: impl FnOnce(&[u8]) -> R) -> Result<R> {
+        self.staging
+            .event
+            .as_ref()
+            .expect("recorded by async_dtoh_via")
+            .synchronize()?;
+        // SAFETY: event completion orders the DMA before this read; the slab
+        // is exclusively ours while the guard lives.
+        let bytes =
+            unsafe { std::slice::from_raw_parts(self.staging.ptr as *const u8, self.n_bytes) };
+        Ok(f(bytes))
+    }
+
+    /// Wait and copy the bytes out into `dst` (pageable is fine — this is a
+    /// plain host memcpy at RAM speed, not a DMA target).
+    pub fn wait_into_bytes(self, dst: &mut [u8]) -> Result<()> {
+        assert_eq!(dst.len(), self.n_bytes);
+        self.wait_and_read(|src| dst.copy_from_slice(src))
+    }
+
+    /// Wait and copy out as u64s. `dst.len() * 8` must equal the copied bytes.
+    pub fn wait_into_u64(self, dst: &mut [u64]) -> Result<()> {
+        assert_eq!(dst.len() * 8, self.n_bytes);
+        self.staging
+            .event
+            .as_ref()
+            .expect("recorded by async_dtoh_via")
+            .synchronize()?;
+        // SAFETY: as in `wait_and_read`; the slab is u64-aligned by
+        // construction.
+        let src = unsafe { std::slice::from_raw_parts(self.staging.ptr as *const u64, dst.len()) };
+        dst.copy_from_slice(src);
+        Ok(())
+    }
+}
+
+// ── Pooled events for handle-readiness tracking ──────────────────────────────
+
+/// A pre-created CUDA event borrowed from the backend's free-list; returns
+/// itself to the list on drop. Used as the `ready` marker on device-resident
+/// handles (`GpuLdeBase`/`GpuLdeExt3`) so consumers on other streams can wait
+/// device-side (`stream.wait`) instead of the producer host-blocking in a
+/// final synchronize. Pooled because a mid-prove cuEventCreate convoys the
+/// driver lock (see `PinnedStaging::record_event`).
+pub struct PooledEvent {
+    event: Option<cudarc::driver::CudaEvent>,
+}
+
+impl PooledEvent {
+    pub fn event(&self) -> &cudarc::driver::CudaEvent {
+        self.event.as_ref().expect("present until drop")
+    }
+}
+
+impl Drop for PooledEvent {
+    fn drop(&mut self) {
+        if let (Some(ev), Ok(be)) = (self.event.take(), backend()) {
+            be.event_pool.lock().unwrap().push(ev);
+        }
+    }
+}
+
+impl Backend {
+    /// Take a pre-created event from the pool (creating one only if the pool
+    /// ran dry, which should not happen in a normal prove).
+    pub fn take_event(&self) -> Result<PooledEvent> {
+        let ev = match self.event_pool.lock().unwrap().pop() {
+            Some(ev) => ev,
+            None => self.ctx.new_event(None)?,
+        };
+        Ok(PooledEvent { event: Some(ev) })
+    }
 }

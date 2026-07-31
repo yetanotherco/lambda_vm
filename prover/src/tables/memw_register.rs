@@ -491,6 +491,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 /// The MEMW_R table's 3 transition constraints as a single [`ConstraintSet`]:
 /// - idx 0,1: `IS_BIT` on `μ_read`, `μ_write`;
 /// - idx 2:   `IS_BIT<μ_sum>` with `μ_sum = μ_read + μ_write`.
+#[derive(Clone, Copy)]
 pub struct MemwRegisterConstraints;
 
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for MemwRegisterConstraints {

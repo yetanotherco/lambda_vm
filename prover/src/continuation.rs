@@ -48,6 +48,7 @@
 //! and ELF alone (`prove_and_verify_continuation` is a thin wrapper over both).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use executor::elf::Elf;
@@ -68,7 +69,9 @@ use crate::statement::{StatementKind, absorb_continuation_global_statement, abso
 use crate::tables::local_to_global::{self, CellBoundary};
 use crate::tables::page::{self, PageConfig};
 use crate::tables::register;
-use crate::tables::trace_builder::{Traces, build_init_page_data, build_initial_image_paged};
+use crate::tables::trace_builder::{
+    DecodeArtifacts, Traces, build_init_page_data, build_initial_image_paged,
+};
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 use crate::tables::{MaxRowsConfig, global_memory};
 use crate::{
@@ -139,6 +142,7 @@ fn global_transcript(
 /// identical trace (root-bound), so it inherits it.
 /// The L2G epoch-local table's single transition constraint: `MU ∈ {0,1}`
 /// (`MU·(1−MU) = 0`) at constraint index 0.
+#[derive(Clone, Copy)]
 struct L2gMemoryConstraints;
 
 impl ConstraintSet<F, E> for L2gMemoryConstraints {
@@ -251,10 +255,10 @@ fn global_memory_air(
 /// and verifier iterate the identical sequence — `multi_verify` matches AIRs to sub-proofs
 /// positionally. Carries page bases ONLY: no cell values, so private-input bytes never
 /// enter the bundle (unlike the full `CellBoundary`, whose `init.value` is a private byte).
-fn touched_page_bases(boundaries: &[Vec<CellBoundary>]) -> Vec<u64> {
+fn touched_page_bases(boundaries: &[Arc<Vec<CellBoundary>>]) -> Vec<u64> {
     boundaries
         .iter()
-        .flatten()
+        .flat_map(|epoch| epoch.iter())
         .map(|b| page::page_base_for_address(b.address))
         .collect::<std::collections::BTreeSet<u64>>()
         .into_iter()
@@ -379,6 +383,37 @@ struct EpochStart<'a> {
     register_init: &'a [u32],
     /// This epoch's 1-based table label (the `fini_epoch` constant).
     label: u64,
+}
+
+/// One epoch's proving inputs, fully derived from execution (register init,
+/// traces, boundary — no dependency on any previous epoch's *proof*), so the
+/// preparation of epoch i+1 can run on a producer thread while epoch i proves.
+///
+/// `boundary` is shared (`Arc`): the same per-epoch boundary feeds both this
+/// epoch's prove and the cross-epoch global prove, which starts as soon as the
+/// producer has prepared the last epoch (see `prove_continuation`).
+struct PreparedEpoch {
+    index: u64,
+    register_init: Vec<u32>,
+    label: u64,
+    traces: Traces,
+    boundary: Arc<Vec<CellBoundary>>,
+    is_final: bool,
+}
+
+/// A collected-but-not-yet-built epoch, handed from the producer to the trace
+/// builder pool. Everything sequential (execution, op collection over the
+/// advancing memory image, boundary + register-fini derivation) already
+/// happened on the producer; a builder turns `collected` into full trace
+/// tables ([`Traces::build_from_collected`]) — pure epoch-local work — and
+/// forwards the resulting [`PreparedEpoch`] to the epoch prover.
+struct BuildJob {
+    index: u64,
+    register_init: Vec<u32>,
+    label: u64,
+    collected: crate::tables::trace_builder::CollectedEpoch,
+    boundary: Arc<Vec<CellBoundary>>,
+    is_final: bool,
 }
 
 /// One epoch's proof plus everything a standalone verifier needs to re-check it
@@ -635,6 +670,7 @@ fn prove_epoch(
     is_final: bool,
     boundary: &[CellBoundary],
     opts: &ProofOptions,
+    decode_commitment: Commitment,
 ) -> Result<EpochProof, Error> {
     // Count this L2G table's range-check lookups into the BITWISE table so its
     // AreBytes/IsHalfword multiplicities balance the range-check senders.
@@ -667,7 +703,10 @@ fn prove_epoch(
         start.register_init,
         &reg_fini,
         is_final,
-        None,
+        // Computed once per prove_continuation — the DECODE commitment is a
+        // function of (ELF, opts) only, identical for every epoch; passing
+        // None here would rebuild the whole DECODE trace+LDE+tree per epoch.
+        Some(decode_commitment),
     );
 
     let label = start.label;
@@ -823,7 +862,7 @@ fn verify_epoch(
 /// The bus balances iff every `fini` matches the next epoch's `init` and every genesis
 /// matches its source (the ELF for ELF/runtime pages).
 fn prove_global(
-    boundaries: &[Vec<CellBoundary>],
+    boundaries: &[Arc<Vec<CellBoundary>>],
     elf_bytes: &[u8],
     init_page_data: &HashMap<u64, Vec<u8>>,
     page_bases: &[u64],
@@ -833,7 +872,7 @@ fn prove_global(
     // Each cell's final state (boundaries are in epoch order, so the last fini wins).
     let mut final_state: global_memory::FiniStateMap = HashMap::new();
     for epoch in boundaries {
-        for b in epoch {
+        for b in epoch.iter() {
             final_state.insert(
                 b.address,
                 global_memory::FiniState {
@@ -853,7 +892,7 @@ fn prove_global(
 
     let mut l2g_traces: Vec<TraceTable<F, E>> = boundaries
         .iter()
-        .map(|epoch| local_to_global::generate_local_to_global_trace(epoch))
+        .map(|epoch| local_to_global::generate_local_to_global_trace(epoch.as_slice()))
         .collect();
     let mut gm_traces: Vec<TraceTable<F, E>> = gm_configs
         .iter()
@@ -1027,9 +1066,25 @@ pub fn prove_continuation_with_max_rows(
         ))
     })?;
 
+    // Root span for the profiling toolkit (scripts/profiling): the whole
+    // continuation prove is one tree; per-stage spans below are recorded from
+    // their worker threads and told apart by label + instance order.
+    #[cfg(feature = "instruments")]
+    stark::instruments::reset_timeline();
+    #[cfg(feature = "instruments")]
+    let __root = stark::instruments::span("prove_continuation_total");
+
     let elf = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
     let mut executor = Executor::new(&elf, private_inputs.to_vec())
         .map_err(|e| Error::Execution(format!("{e}")))?;
+    // The DECODE precomputed commitment depends only on (ELF, opts): compute
+    // it once here instead of once per epoch inside `build_epoch_airs`.
+    let decode_commitment = crate::tables::decode::commitment_from_elf(&elf, opts)
+        .map_err(|e| Error::Recursion(format!("DECODE commitment from ELF: {e}")))?;
+    // Same for the DECODE trace artifacts (instruction map + pristine trace):
+    // a pure function of the ELF, built once and shared by every epoch's trace
+    // build instead of re-parsed/regenerated inside the serial producer chain.
+    let decode_artifacts = DecodeArtifacts::from_elf(&elf)?;
 
     // The cross-epoch memory image, carried forward: epoch i+1's init is epoch i's
     // fini, updated in place with each epoch's touched-cell final values.
@@ -1043,59 +1098,320 @@ pub fn prove_continuation_with_max_rows(
     // final-state). Deliberately NOT stored in `EpochProof`/the bundle — `CellBoundary`
     // holds cell values (private-input bytes for private reads); only the value-free
     // page-base set is shipped (see `touched_page_bases`).
-    let mut all_boundaries: Vec<Vec<CellBoundary>> = Vec::new();
-    // The previous epoch's bound final register file R_{i+1}; epoch i+1's init is
-    // derived from it (the cross-epoch register binding).
-    let mut prev_fini: Option<Vec<u32>> = None;
+    //
+    // The producer publishes each epoch's boundary (an `Arc` share of the one it
+    // sends to the epoch prover) on this dedicated channel, in epoch order. The
+    // global-prove thread drains it until the producer hangs up (last epoch
+    // prepared) — the global proof depends only on these execution artifacts,
+    // never on an epoch *proof*, so it overlaps the epoch proves' tail instead
+    // of serializing after them. Proof bytes are unchanged — only the schedule.
+    let (boundary_tx, boundary_rx) = std::sync::mpsc::channel::<Arc<Vec<CellBoundary>>>();
 
-    let mut index: u64 = 0;
-    loop {
-        if executor.pc() == 0 {
-            break;
+    // Three-stage epoch pipeline: a producer thread runs the
+    // sequential-critical work (execute + op collection over the advancing
+    // memory image + boundary/fini derivation), a small pool of trace builders
+    // turns collected epochs into trace tables, and a single prover proves
+    // them. Everything the next epoch's preparation needs is derived from
+    // execution, not from proofs or traces: `register_init` comes from the
+    // collected register end state (`register_fini`, the same value the
+    // generated REGISTER trace binds) and the memory image update comes from
+    // the boundary — so the producer chains epochs without waiting for any
+    // table to be built. Proof bytes are unchanged — only the schedule is.
+    //
+    // The bounded channels cap peak memory: at most one collected epoch
+    // queued, `builders` building, one built epoch queued, one proving.
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Result<PreparedEpoch, Error>>(1);
+    let (build_tx, build_rx) = std::sync::mpsc::sync_channel::<Result<BuildJob, Error>>(1);
+    // Trace builders: each turns one collected epoch into full trace tables
+    // (the bulk of the old per-epoch producer latency). 2 is enough to keep
+    // the prove pipeline fed on the measured workloads; builds compete with
+    // proves for CPU, so more builders mostly reshuffle the same cores.
+    let builders = std::env::var("LAMBDA_VM_TRACE_BUILDERS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&b| b >= 1)
+        .unwrap_or(2);
+    let build_rx = std::sync::Mutex::new(build_rx);
+    type EpochResult = (u64, EpochProof);
+    let first_err: std::sync::Mutex<Option<Error>> = std::sync::Mutex::new(None);
+    let decode_artifacts_ref = &decode_artifacts;
+    let first_err_ref = &first_err;
+    // On error the prover DRAINS the channel (discarding items) instead of
+    // returning: the senders are bounded and can only unblock via a recv, so
+    // an early return would leave a builder parked in `send` forever and the
+    // scope would never join. Draining ends when every sender is dropped.
+    let prove_worker = |rx: std::sync::mpsc::Receiver<Result<PreparedEpoch, Error>>| {
+        let mut proved: Vec<EpochResult> = Vec::new();
+        loop {
+            let prepared = match rx.recv() {
+                Ok(Ok(p)) => p,
+                Ok(Err(e)) => {
+                    first_err.lock().unwrap().get_or_insert(e);
+                    continue;
+                }
+                Err(_) => return proved, // channel closed: no more epochs
+            };
+            if first_err.lock().unwrap().is_some() {
+                continue; // an earlier failure is propagating; drain and discard
+            }
+            // Per-epoch identity on Nsight timelines (dynamic NVTX name); the
+            // instruments span carries a static label and instances are told
+            // apart by order (phase_table.py reports them per instance).
+            #[cfg(feature = "nvtx")]
+            let __nvtx =
+                stark::instruments::nvtx_range_fmt(|| format!("epoch_prove[i={}]", prepared.index));
+            #[cfg(feature = "instruments")]
+            let __sp = stark::instruments::span("epoch_prove");
+            let start = EpochStart {
+                register_init: &prepared.register_init,
+                label: prepared.label,
+            };
+            match prove_epoch(
+                &elf,
+                elf_bytes,
+                &start,
+                prepared.traces,
+                prepared.is_final,
+                &prepared.boundary,
+                opts,
+                decode_commitment,
+            ) {
+                Ok(epoch) => proved.push((prepared.index, epoch)),
+                Err(e) => {
+                    first_err.lock().unwrap().get_or_insert(e);
+                    continue; // drain mode (see loop comment)
+                }
+            }
         }
-        // The cross-epoch ordering check (IsB20 on `fini_epoch - 1 - init_epoch`)
-        // only spans `local_to_global::MAX_EPOCHS` epochs. Beyond that the IsB20 bus
-        // cannot balance, so an honest proof is impossible — fail fast with a clear
-        // error instead of building an unprovable trace. The verifier already
-        // rejects any such proof; this is a prover-side guard for a clean message.
-        if index >= local_to_global::MAX_EPOCHS {
-            return Err(Error::InvalidContinuationEpochSize(format!(
-                "execution needs more than {} continuation epochs (the IsB20 cross-epoch \
-                 ordering range); use a larger epoch size",
-                local_to_global::MAX_EPOCHS
-            )));
+    };
+    // Trace-builder worker: drain collected epochs, build their trace tables
+    // (pure epoch-local work) and forward the prepared epoch to the prover.
+    // Errors propagate through the prove channel, exactly like producer errors.
+    //
+    // Test-only fault injection, keyed by a magic private input no real caller
+    // passes (stateless, so concurrent tests can never trip it): exercises the
+    // mid-pipeline error path, which must return `Err` instead of wedging the
+    // bounded channels (see `test_fault`).
+    let build_worker = |tx: std::sync::mpsc::SyncSender<Result<PreparedEpoch, Error>>| {
+        loop {
+            let msg = { build_rx.lock().unwrap().recv() };
+            let job = match msg {
+                Ok(Ok(j)) => j,
+                Ok(Err(e)) => {
+                    // Forward and keep draining (same reason as the
+                    // prover: a return would strand the producer's send).
+                    let _ = tx.send(Err(e));
+                    continue;
+                }
+                Err(_) => return, // channel closed: no more epochs
+            };
+            if first_err.lock().unwrap().is_some() {
+                continue; // the prover failed; drain and discard
+            }
+            #[cfg(test)]
+            if job.index == test_fault::FAIL_INDEX && private_inputs == test_fault::MAGIC {
+                let _ = tx.send(Err(Error::ContinuationInvariant(
+                    "injected pipeline fault (test)".to_string(),
+                )));
+                continue;
+            }
+            #[cfg(feature = "nvtx")]
+            let __nvtx = stark::instruments::nvtx_range_fmt(|| {
+                format!("epoch_trace_build[i={}]", job.index)
+            });
+            #[cfg(feature = "instruments")]
+            let __sp = stark::instruments::span("epoch_trace_build");
+            let traces = Traces::build_from_collected(
+                decode_artifacts_ref,
+                job.collected,
+                // Continuation epochs use the L2G bookend: PAGE tables (the
+                // only image consumers in the build) are skipped.
+                None::<&std::collections::HashMap<u64, u8>>,
+                &job.register_init,
+                &MaxRowsConfig::default(),
+                private_inputs,
+                job.is_final,
+                true,
+                #[cfg(feature = "disk-spill")]
+                stark::storage_mode::StorageMode::Ram,
+            );
+            // Close the build span BEFORE forwarding: the send below blocks
+            // on prove-channel backpressure, which is waiting, not building.
+            #[cfg(feature = "instruments")]
+            drop(__sp);
+            #[cfg(feature = "nvtx")]
+            drop(__nvtx);
+            match traces {
+                Ok(traces) => {
+                    let prepared = PreparedEpoch {
+                        index: job.index,
+                        register_init: job.register_init,
+                        label: job.label,
+                        traces,
+                        boundary: job.boundary,
+                        is_final: job.is_final,
+                    };
+                    // A send error means the prover side hung up (its error is
+                    // already propagating) — stop quietly.
+                    if tx.send(Ok(prepared)).is_err() {
+                        return;
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                    continue; // drain mode
+                }
+            }
         }
-        let register_init: Vec<u32> = if index == 0 {
-            register::register_init_from_entry_point(elf.entry_point)
-        } else {
-            // Epoch i+1's init is epoch i's bound fini, reused directly (same
-            // `register_word_address_list` order) — the cross-epoch register binding.
-            prev_fini.clone().ok_or_else(|| {
-                Error::ContinuationInvariant(
-                    "previous epoch final registers are missing after the first epoch".to_string(),
-                )
-            })?
-        };
+    };
 
-        // Run one epoch; `logs` is this epoch's chunk only (the executor clears it).
-        let logs = match executor
-            .resume_with_limit(epoch_size)
-            .map_err(|e| Error::Execution(format!("{e}")))?
-        {
-            Some(logs) => logs.to_vec(),
-            None => break,
-        };
-        let is_final = executor.pc() == 0;
+    // The global prove's result, produced by its own scoped thread. `None` only
+    // if that thread never ran to completion (a panic — surfaced by the scope).
+    type GlobalResult = (MultiProof<F, E, ()>, Vec<u64>, usize);
+    let global_result: std::sync::Mutex<Option<Result<GlobalResult, Error>>> =
+        std::sync::Mutex::new(None);
+    let mut results = std::thread::scope(|scope| -> Result<Vec<EpochResult>, Error> {
+        let elf_ref = &elf;
+        let producer = scope.spawn(move || {
+            let mut prepare_all = || -> Result<(), Error> {
+                let mut prev_fini: Option<Vec<u32>> = None;
+                let mut index: u64 = 0;
+                loop {
+                    if executor.pc() == 0 {
+                        return Ok(());
+                    }
+                    // A downstream failure is already propagating: stop
+                    // executing epochs so the pipeline can drain and shut down.
+                    if first_err_ref.lock().unwrap().is_some() {
+                        return Ok(());
+                    }
+                    // The cross-epoch ordering check (IsB20 on `fini_epoch - 1 -
+                    // init_epoch`) only spans `local_to_global::MAX_EPOCHS` epochs.
+                    // Beyond that the IsB20 bus cannot balance, so an honest proof
+                    // is impossible — fail fast with a clear error instead of
+                    // building an unprovable trace.
+                    if index >= local_to_global::MAX_EPOCHS {
+                        return Err(Error::InvalidContinuationEpochSize(format!(
+                            "execution needs more than {} continuation epochs (the IsB20 \
+                             cross-epoch ordering range); use a larger epoch size",
+                            local_to_global::MAX_EPOCHS
+                        )));
+                    }
+                    let register_init: Vec<u32> = match (index, prev_fini.take()) {
+                        (0, _) => register::register_init_from_entry_point(elf_ref.entry_point),
+                        // Epoch i+1's init is epoch i's bound fini, reused directly
+                        // (same `register_word_address_list` order) — the cross-epoch
+                        // register binding.
+                        (_, Some(fini)) => fini,
+                        (_, None) => {
+                            return Err(Error::ContinuationInvariant(
+                                "previous epoch final registers are missing after the first epoch"
+                                    .to_string(),
+                            ));
+                        }
+                    };
 
-        // Invariant: a non-final epoch ran the full `epoch_size` (a power of two),
-        // so its CPU table has no padding rows.
-        if !is_final && logs.len() != epoch_size {
-            return Err(Error::ContinuationInvariant(format!(
-                "intermediate epoch ran {} cycles, expected {epoch_size}",
-                logs.len()
-            )));
+                    // Run one epoch; `logs` is this epoch's chunk only (the executor
+                    // clears it).
+                    #[cfg(feature = "instruments")]
+                    let __sp = stark::instruments::span("epoch_execute");
+                    let logs = match executor
+                        .resume_with_limit(epoch_size)
+                        .map_err(|e| Error::Execution(format!("{e}")))?
+                    {
+                        Some(logs) => logs.to_vec(),
+                        None => return Ok(()),
+                    };
+                    #[cfg(feature = "instruments")]
+                    drop(__sp);
+                    let is_final = executor.pc() == 0;
+
+                    // Invariant: a non-final epoch ran the full `epoch_size` (a power
+                    // of two), so its CPU table has no padding rows.
+                    if !is_final && logs.len() != epoch_size {
+                        return Err(Error::ContinuationInvariant(format!(
+                            "intermediate epoch ran {} cycles, expected {epoch_size}",
+                            logs.len()
+                        )));
+                    }
+
+                    let label = local_to_global::epoch_label(index);
+                    // Sequential-critical half only (Phases 1-2): op collection
+                    // over the pre-epoch image. The table build (Phases 3-5)
+                    // happens on the builder pool — nothing below needs it.
+                    #[cfg(feature = "nvtx")]
+                    let __nvtx =
+                        stark::instruments::nvtx_range_fmt(|| format!("epoch_collect[i={index}]"));
+                    #[cfg(feature = "instruments")]
+                    let __sp = stark::instruments::span("epoch_collect");
+                    let collected = Traces::collect_epoch(
+                        decode_artifacts_ref,
+                        &image,
+                        &register_init,
+                        &logs,
+                        is_final,
+                    )?;
+                    let boundary = Arc::new(local_to_global::epoch_boundary(
+                        &mut provenance,
+                        label,
+                        &collected.touched_memory_cells(),
+                    ));
+                    // Publish this epoch's boundary for the global prove (in
+                    // epoch order; the channel closes when the producer ends).
+                    let _ = boundary_tx.send(Arc::clone(&boundary));
+
+                    // R_{i+1} from the collected register end state — the exact
+                    // value the generated REGISTER trace binds (`fini_from_trace`
+                    // equivalence pinned by `fini_from_final_state_matches_trace`).
+                    prev_fini = Some(collected.register_fini(&register_init));
+
+                    // Carry the image forward: this epoch's fini is the next
+                    // epoch's init.
+                    for cell in boundary.iter() {
+                        image.set(cell.address, (cell.fini.value & 0xFF) as u8);
+                    }
+
+                    // Close the collect span BEFORE handing off: the send below
+                    // blocks on builder backpressure, which is waiting, not work.
+                    #[cfg(feature = "instruments")]
+                    drop(__sp);
+                    #[cfg(feature = "nvtx")]
+                    drop(__nvtx);
+                    let job = BuildJob {
+                        index,
+                        register_init,
+                        label,
+                        collected,
+                        boundary,
+                        is_final,
+                    };
+                    // A send error means the builder side hung up (its error is
+                    // already propagating) — stop preparing quietly.
+                    if build_tx.send(Ok(job)).is_err() || is_final {
+                        return Ok(());
+                    }
+                    index += 1;
+                }
+            };
+            if let Err(e) = prepare_all() {
+                // Surface preparation errors through the builder channel (a
+                // builder forwards them to the prover); if the downstream side
+                // is already gone the error there wins.
+                let _ = build_tx.send(Err(e));
+            }
+        });
+
+        // Trace-builder pool: collected epochs → trace tables → prove channel.
+        // Each builder owns a clone of the prove sender; the original is
+        // dropped below so the prover's channel closes once the producer and
+        // every builder are done.
+        for _ in 0..builders {
+            let tx = tx.clone();
+            scope.spawn(move || build_worker(tx));
         }
+        drop(tx);
 
+<<<<<<< HEAD
         let label = local_to_global::epoch_label(index);
         let traces = Traces::from_image_and_logs(
             &elf,
@@ -1111,41 +1427,91 @@ pub fn prove_continuation_with_max_rows(
         )?;
         let boundary =
             local_to_global::epoch_boundary(&mut provenance, label, &traces.touched_memory_cells);
+=======
+        // Global prove, overlapped: drain the boundary channel until the
+        // producer hangs up (last epoch prepared), then prove the cross-epoch
+        // global memory argument WHILE the tail epochs are still proving. The
+        // global proof consumes only execution artifacts (boundaries, ELF,
+        // genesis pages) — never an epoch proof — so this is pure schedule.
+        let global_result_ref = &global_result;
+        let init_page_data_ref = &init_page_data;
+        scope.spawn(move || {
+            let mut all: Vec<Arc<Vec<CellBoundary>>> = Vec::new();
+            while let Ok(b) = boundary_rx.recv() {
+                all.push(b);
+            }
+            // An epoch already failed: its error wins and the bundle is never
+            // assembled — skip the (whole-prove-sized) global prove.
+            if first_err_ref.lock().unwrap().is_some() {
+                return;
+            }
+            let run = || -> Result<GlobalResult, Error> {
+                #[cfg(feature = "instruments")]
+                let __sp = stark::instruments::span("prove_global");
+                let num_private_input_pages = page::private_input_page_count(private_inputs);
+                // SINGLE source of truth: the same page-base list drives the
+                // committed GLOBAL_MEMORY tables and is shipped in the bundle,
+                // so the two can never diverge in set or order.
+                let touched = touched_page_bases(&all);
+                let global = prove_global(
+                    &all,
+                    elf_bytes,
+                    init_page_data_ref,
+                    &touched,
+                    num_private_input_pages,
+                    opts,
+                )?;
+                Ok((global, touched, num_private_input_pages))
+            };
+            *global_result_ref.lock().unwrap() = Some(run());
+        });
+>>>>>>> main
 
-        let start = EpochStart {
-            register_init: &register_init,
-            label,
-        };
-        let epoch = prove_epoch(&elf, elf_bytes, &start, traces, is_final, &boundary, opts)?;
-        prev_fini = Some(epoch.reg_fini.clone());
-
-        // Carry the image forward: this epoch's fini is the next epoch's init.
-        for cell in &boundary {
-            image.set(cell.address, (cell.fini.value & 0xFF) as u8);
-        }
+        // Prove epochs as the builders hand them over. Builders can finish
+        // out of index order, so results are re-ordered by epoch index before
+        // the bundle is assembled — proof bytes are identical to the
+        // sequential schedule (each epoch is seeded by its own
+        // label-domain-separated transcript and no epoch's proof feeds
+        // another).
+        let prover = scope.spawn(move || prove_worker(rx));
+        let proved = prover.join().map_err(|_| {
+            Error::ContinuationInvariant("epoch prover thread panicked".to_string())
+        })?;
+        producer.join().map_err(|_| {
+            Error::ContinuationInvariant("epoch preparation thread panicked".to_string())
+        })?;
+        Ok(proved)
+    })?;
+    if let Some(e) = first_err.into_inner().unwrap() {
+        return Err(e);
+    }
+    results.sort_by_key(|(index, _)| *index);
+    for (_, epoch) in results {
         epochs.push(epoch);
-        all_boundaries.push(boundary);
-
-        if is_final {
-            break;
-        }
-        index += 1;
     }
 
-    // One global LogUp over all the (kept) local-to-global tables. `all_boundaries` was
-    // accumulated locally in the loop (never round-tripped through the bundle).
-    let num_private_input_pages = page::private_input_page_count(private_inputs);
-    // SINGLE source of truth: the same page-base list drives the committed GLOBAL_MEMORY
-    // tables and is shipped in the bundle, so the two can never diverge in set or order.
-    let touched_page_bases = touched_page_bases(&all_boundaries);
-    let global = prove_global(
-        &all_boundaries,
-        elf_bytes,
-        &init_page_data,
-        &touched_page_bases,
-        num_private_input_pages,
-        opts,
-    )?;
+    // One global LogUp over all the (kept) local-to-global tables — proven
+    // concurrently by the scoped thread above; collect its result here. The
+    // scope guarantees the thread finished, so `None` is unreachable.
+    let (global, touched_page_bases, num_private_input_pages) =
+        global_result.into_inner().unwrap().ok_or_else(|| {
+            Error::ContinuationInvariant("global prove thread produced no result".to_string())
+        })??;
+
+    // Same timeline output as the monolithic path (prover/src/lib.rs): print
+    // the wall-clock span tree and honor LAMBDA_VM_TIMELINE_JSON. Without this,
+    // continuation runs record spans that are never drained (the profiling
+    // toolkit's phase_table.py consumes the JSON).
+    #[cfg(feature = "instruments")]
+    {
+        drop(__root);
+        let spans = stark::instruments::take_timeline();
+        print!("{}", stark::instruments::format_timeline(&spans));
+        if let Ok(path) = std::env::var("LAMBDA_VM_TIMELINE_JSON") {
+            let _ = std::fs::write(&path, stark::instruments::timeline_json(&spans));
+            println!("[timeline] wrote {path}");
+        }
+    }
 
     Ok(ContinuationProof {
         epochs,
@@ -1413,6 +1779,15 @@ pub fn prove_and_verify_continuation(
     verify_continuation(elf_bytes, &bundle, opts)
 }
 
+/// Stateless test-only fault trigger for the epoch pipeline: the builder
+/// injects an error at epoch [`FAIL_INDEX`] when the prove's private input is
+/// exactly [`MAGIC`]. Constants only — concurrent tests can never trip it.
+#[cfg(test)]
+pub(crate) mod test_fault {
+    pub(crate) const MAGIC: &[u8] = b"__inject_pipeline_fault__";
+    pub(crate) const FAIL_INDEX: u64 = 3;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1463,6 +1838,36 @@ mod tests {
             split.as_deref(),
             Some(&expected_output[..]),
             "commit in a later epoch must verify and aggregate to the same output"
+        );
+    }
+
+    // The pipeline's error path: a mid-run failure with several epochs still
+    // pending (past the bounded channels' slack) must surface as `Err` — the
+    // regression this guards wedged every channel and hung `prove_continuation`
+    // forever. Run under a timeout so a regression fails instead of hanging CI.
+    #[test]
+    fn test_prove_error_mid_pipeline_returns_err() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let elf_bytes = asm_elf_bytes("all_loadstore_32");
+        // 4-cycle epochs over ~34 cycles → ~9 epochs; the injected failure at
+        // epoch 3 leaves enough pending work to fill every bounded channel.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let r = prove_continuation(
+                &elf_bytes,
+                test_fault::MAGIC,
+                2,
+                &ProofOptions::default_test_options(),
+            );
+            let _ = done_tx.send(r.map(|_| ()));
+        });
+        let result = done_rx
+            .recv_timeout(std::time::Duration::from_secs(300))
+            .expect("prove_continuation wedged: the pipeline did not shut down on error");
+        let err = result.expect_err("the injected fault must surface as Err");
+        assert!(
+            format!("{err:?}").contains("injected pipeline fault"),
+            "unexpected error: {err:?}"
         );
     }
 
