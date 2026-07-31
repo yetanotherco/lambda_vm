@@ -84,9 +84,9 @@ jobs:
             tooling/ethrex-tests -> target
 
       # Fetch-and-verify, not build: no converter, no ethrex-replay cache, no rev pin.
-      # Skipped while the fixture has no host — the screen below is the only consumer,
-      # and failing the job on an unset URL would block PRs on an upload nobody in the
-      # PR can perform. Remove this guard once ETHREX_REAL_BLOCK_FIXTURE_URL is set.
+      # The guard covers the window after a repoint but before the new artifact is
+      # uploaded: the screen below is its only consumer, and failing the job on an
+      # unset URL would block PRs on an upload nobody in the PR can perform.
       - name: Fetch real-block fixture
         id: fixture
         run: |

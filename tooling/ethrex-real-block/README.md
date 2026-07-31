@@ -67,31 +67,38 @@ only when the file is missing — so a stale copy left over from a re-upload und
 same block number, a corrupted file, or a hand-placed one is all caught and
 re-fetched. That check is the reason these are phony targets rather than file rules.
 
-> Both URLs are currently **unset**. Until the artifacts are hosted, these targets
-> fail with an actionable message and every consumer degrades gracefully: the
-> benchmark workflow warns and skips its real-block section, and the usability
-> screen in `.github/workflows/ethrex-real-block.yml` skips too.
+Artifacts live in the **[`bench-fixtures-v1`][release]** release on
+`yetanotherco/lambda_vm`, fetched unauthenticated:
 
-The second artifact is the **cache** — the ethrex-replay JSON the fixture was
-converted from (`make ethrex-real-block-cache`, ~2 MB, same verify-then-move
-contract). Only the converter's tests and `regen-real-block-fixture` read it.
+| asset | sha256 | read by |
+|---|---|---|
+| `ethrex_mainnet_25368371.bin` | `61eba49b…` | every benchmark (**current default**) |
+| `cache_mainnet_25368371.json` | `7aa88a5f…` | `regen-real-block-fixture` |
+| `ethrex_mainnet_25453112.bin` | `0298663d…` | alternate candidate |
+| `cache_mainnet_25453112.json` | `20ffbbc1…` | alternate candidate |
 
-This crate is *not* on the fixture's path. Fetching a verified binary takes the
+Each block has two assets: the fixture and the **cache** it was converted from
+(`make ethrex-real-block-cache`, ~2 MB, same verify-then-move contract). Only
+`regen-real-block-fixture` reads the cache. Note it is *not* the cache the
+converter's own tests use — see [Validation](#validation).
+
+This crate is not on the fixture's path at all. Fetching a verified binary takes the
 converter, the ~335-package ethrex host dependency tree and an ethrex-replay `rev`
 pin off the critical path of everyone who just wants to run a benchmark. It also
-decouples the block from what upstream hosts: ethrex-replay publishes a cache for
-Hoodi and nothing else, so any mainnet block is unreachable by the convert-locally
-route — producing its cache takes ~4 minutes and ~700 calls against an archive RPC —
-and trivial by this one. Hosting our own cache is what lets the converter's tests
-assert against the *same* block the benchmarks prove.
+decouples the benchmark block from what upstream hosts: ethrex-replay publishes a
+cache for Hoodi and nothing else, so any mainnet block is unreachable by the
+convert-locally route — producing its cache takes ~4 minutes and ~700 calls against
+an archive RPC — and trivial by this one.
 
-## Regenerating it (ethrex rev bumps)
+[release]: https://github.com/yetanotherco/lambda_vm/releases/tag/bench-fixtures-v1
+
+## Regenerating the fixture (ethrex rev bumps)
 
 Needed roughly twice a year, when the guest's ethrex `rev` moves and the rkyv
 layout changes with it:
 
 ```bash
-make regen-real-block-fixture     # fetches the cache, rebuilds the .bin in place
+make regen-real-block-fixture     # fetches that block's cache, rebuilds the .bin
 sha256sum "$(make -s print-real-block-fixture)"
 ```
 
@@ -111,11 +118,11 @@ wrote ../../executor/tests/ethrex_mainnet_25368371.bin (1110156 bytes): 1 block(
   from mainnet starting at #25368371, 29 transaction(s), 2428684 gas
 ```
 
-That determinism is enforced, not just documented: `conversion_is_reproducible`
-pins the block's stats **and** the fixture's sha256, so the digest keeps the
-derivation honest. Verified: regenerating from the cache reproduces
-`61eba49b…` byte for byte, which is also what proves the hosted `.bin` and the
-hosted cache describe the same block.
+Verified: regenerating from the hosted cache reproduces `61eba49b…` byte for byte,
+which is what proves the hosted `.bin` and the hosted cache describe the same block.
+
+The converter's `conversion_is_reproducible` test enforces the same property, but
+against its own pinned block rather than this one — see [Validation](#validation).
 
 ## What benchmarks with it
 
@@ -197,30 +204,27 @@ refuses instead; `unmappable_network_is_rejected` pins that.
 
 ## Adopting a different block
 
-Because we host both artifacts, the converter's tests assert against the **same**
-block the benchmarks prove, so a repoint moves them together. Two files:
+The benchmark block and this crate's test block are **independent** — the fetch is
+what decouples them — so a repoint touches two files and neither is this crate's
+source.
 
-**1. The Makefile — the only place a block number appears.** Six lines:
+**1. The Makefile — the only place a block number appears.** Five lines:
 
 ```make
 ETHREX_REAL_BLOCK_NETWORK        := <mainnet|hoodi|sepolia>
 ETHREX_REAL_BLOCK                := <block number>
+ETHREX_REAL_BLOCK_FIXTURE_URL    := <release asset URL for the .bin>
 ETHREX_REAL_BLOCK_FIXTURE_SHA256 := <sha256 of the .bin>
-ETHREX_REAL_BLOCK_CACHE_SHA256   := <sha256 of the cache JSON>
-ETHREX_REAL_BLOCK_FIXTURE_URL    := <where you uploaded the .bin>
-ETHREX_REAL_BLOCK_CACHE_URL      := <where you uploaded the cache>
+ETHREX_REAL_BLOCK_CACHE_URL / _SHA256 := <same, for its source cache>
 ```
 
-**2. The test constants**, which are what prove the repoint is self-consistent:
-- `src/main.rs` — `CACHE`, `CACHE_MISSING`, the chain-ID import and assert
-  (`MAINNET_CHAIN_ID` / `HOODI_CHAIN_ID` / `SEPOLIA_CHAIN_ID` from
-  `ethrex_config::networks`), and in `conversion_is_reproducible` the
-  `first_block_number` / `transactions` / `gas_used` / digest asserts.
-- `tooling/ethrex-tests` — `REAL_BLOCK_FIXTURE`, which points the usability screen
-  at the block actually being benchmarked.
+**2. `REAL_BLOCK_FIXTURE` in `tooling/ethrex-tests`**, which points the usability
+screen at the block actually being benchmarked. That is the whole of it.
 
-Then run `make test-ethrex-real-block-converter`. It passing means the cache, the
-`.bin`, the digest and the block stats all describe one block.
+**Nothing in this crate moves.** Its test constants stay pinned to Hoodi 1265656
+across every repoint — what they exercise is the conversion, not the workload, and
+Hoodi's is the one cache ethrex-replay publishes, so pinning there costs no hosting
+and cannot drift.
 
 Everything else derives from the Makefile — the fixture name, and through
 `make -s print-real-block-fixture` the benchmark scripts and `benchmark-pr.yml`. No
@@ -260,11 +264,12 @@ because it is degenerate.
 Run **both**, in this order:
 
 ```bash
-make test-ethrex-real-block-converter   # cache, .bin, digest and stats agree
+make ethrex-real-block-fixture          # fetch + verify the new .bin
 make test-ethrex                        # the block is USABLE on the guest
 ```
 
-The second is not optional and the first cannot replace it: a new block is only
+`make test-ethrex` is the one that matters here, and the converter's tests cannot
+replace it — they run against a different block. A new block is only
 usable if it needs no accelerator the guest lacks, and this crate cannot tell you
 that — its graph links a working c-kzg, so a block calling point evaluation (0x0a)
 passes here and fails in the guest. `test_ethrex_real_block_native` in
@@ -307,6 +312,11 @@ path-filtered workflow rather than the PR gate (see [Where validation
 runs](#where-validation-runs)); `ethrex-real-block.yml` caches this workspace's
 `target/` under its own key, so only cold runs pay it.
 
+These run against this crate's own pinned block (Hoodi 1265656), **not** the
+benchmark block — they test the conversion, which any real block exercises equally,
+and Hoodi's is the one cache ethrex-replay publishes. Only
+`test_ethrex_real_block_native` follows the benchmark block.
+
 **`cargo test` here — `real_block_executes_under_guest_crypto`.** Executes the
 block through `LambdaVmEcsmCrypto`, the `Crypto` impl the guest injects, so it is
 exercised via the guest's own trait dispatch. Stateless re-execution ends in a
@@ -345,8 +355,9 @@ instead of silently producing a fixture the guest can't read.
 KZG backend. That was incidental to its dependency graph, and it is the property
 the next check relies on, so it is pinned here rather than assumed.
 
-**`tooling/ethrex-tests` — `test_ethrex_real_block_native`.** Checks the
-serialized `.bin` itself deserializes and executes. Since that crate links no KZG
+**`tooling/ethrex-tests` — `test_ethrex_real_block_native`.** The one check that
+follows the BENCHMARK block. Checks the serialized `.bin` itself deserializes and
+executes. Since that crate links no KZG
 backend, this is also **what screens point evaluation (0x0a)**: a block reaching
 it diverges from consensus and fails here.
 

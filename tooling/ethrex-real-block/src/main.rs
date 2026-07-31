@@ -113,15 +113,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ethrex_config::networks::MAINNET_CHAIN_ID;
+    use ethrex_config::networks::HOODI_CHAIN_ID;
 
-    const CACHE: &str = "caches/cache_mainnet_25368371.json";
+    const CACHE: &str = "caches/cache_hoodi_1265656.json";
 
+    /// This crate is pinned to Hoodi 1265656 on purpose, independently of whichever
+    /// block the benchmarks currently prove: it is the one cache ethrex-replay hosts
+    /// upstream, so keeping the converter's test input there costs us no hosting and
+    /// cannot drift. What is under test here is the CONVERSION, not the benchmark
+    /// workload — see tooling/ethrex-real-block/README.md.
+    ///
     /// `caches/` is gitignored and fetched on demand, so every test here fails on
     /// a clean checkout until the cache is downloaded. Say so instead of surfacing
     /// a bare `No such file or directory` from `unwrap()`.
-    const CACHE_MISSING: &str = "caches/cache_mainnet_25368371.json is missing — run \
-                                 `make ethrex-real-block-cache` from the repo root first";
+    const CACHE_MISSING: &str = "caches/cache_hoodi_1265656.json is missing — run \
+                                 `make ethrex-real-block-converter-cache` from the repo root first";
 
     /// Executes the converted block with `LambdaVmEcsmCrypto`, the `Crypto` impl
     /// the guest injects, so the block is exercised through the same trait
@@ -186,9 +192,9 @@ mod tests {
         let (program_input, summary) = program_input_from_cache(CACHE).expect(CACHE_MISSING);
         let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&program_input).unwrap();
 
-        assert_eq!(summary.first_block_number, 25_368_371);
-        assert_eq!(summary.transactions, 29);
-        assert_eq!(summary.gas_used, 2_428_684);
+        assert_eq!(summary.first_block_number, 1_265_656);
+        assert_eq!(summary.transactions, 11);
+        assert_eq!(summary.gas_used, 4_402_947);
 
         // Asserted separately from the digest below, not covered by it. The digest
         // is exactly what a legitimate ethrex rev bump forces someone to rewrite
@@ -196,8 +202,8 @@ mod tests {
         // that moment it stops covering the substituted-chain-config case it was
         // chosen for. This assert survives that churn.
         assert_eq!(
-            program_input.execution_witness.chain_config.chain_id, MAINNET_CHAIN_ID,
-            "chain config is not mainnet's — the block would replay under other rules",
+            program_input.execution_witness.chain_config.chain_id, HOODI_CHAIN_ID,
+            "chain config is not Hoodi's — the block would replay under other rules",
         );
 
         // Digest, not length: a layout change can preserve the byte count exactly
@@ -208,7 +214,7 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect();
         assert_eq!(
-            digest, "61eba49b6b254f4a05def5a47b08a21ae3eee56f0d37bcd7b3a24b0cc1e4a300",
+            digest, "1f7d4c4cdf9bd52472d9ebafdb4038f57a88c3c92d65c96fd86d7e323db87142",
             "fixture bytes changed — regenerate it and update the README checksum",
         );
     }

@@ -198,9 +198,10 @@ jobs:
           fi
 
           # The fixture is FETCHED from a pinned URL + sha256, not built (see the
-          # Makefile). While that URL is unset the block cannot be obtained at all, so
-          # degrade to the synthetic sections with a warning rather than failing —
-          # otherwise every push to main goes red over an upload nobody in CI can do.
+          # Makefile). The guard covers the window after a repoint but before the new
+          # artifact is uploaded: degrade to the synthetic sections with a warning
+          # rather than failing, so a push to main cannot go red over an upload nobody
+          # in CI can perform.
           if [ "$RUN_REAL" = "true" ] && [ -z "$(make -s print-real-block-fixture-url)" ]; then
             echo "::warning::Real-block benchmark skipped: ETHREX_REAL_BLOCK_FIXTURE_URL is unset in the Makefile."
             RUN_REAL=false
