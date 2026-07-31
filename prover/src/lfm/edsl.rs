@@ -165,14 +165,69 @@ pub fn keccak_merkle_walk(
         // Both halves of the digest must swap on the SAME bit.
         let (l0, r0) = b.select(*bit, current[0], sibling[0]);
         let (l1, r1) = b.select(*bit, current[1], sibling[1]);
-        let left = keccak_digest_halves(b, [l0, l1]);
-        let right = keccak_digest_halves(b, [r0, r1]);
-        let mut stream = Vec::with_capacity(2 * DIGEST_HALVES);
-        stream.extend(left);
-        stream.extend(right);
-        current = keccak256(b, &stream, 2 * COMMITMENT_BYTES);
+        current = keccak_hash_pair(b, [l0, l1], [r0, r1]);
     }
     current
+}
+
+/// The production Merkle PARENT hash: `keccak(left ‖ right)`.
+///
+/// `hash_new_parent` streams the two 32-byte nodes into one digest with no
+/// domain separation and no ordering flag, so 64 bytes sit inside a single
+/// 136-byte rate block and a parent is exactly ONE permutation.
+///
+/// This is the step [`keccak_merkle_walk`] performs once per level after its
+/// `Select`, and the step a whole-tree build performs once per internal node
+/// with no `Select` at all — a tree's child ORDER is known when the program is
+/// emitted, so there is no bit to swap on. Keeping the two callers on one
+/// primitive is what makes "the walk and the build hash the same way" a
+/// property of the code rather than of a comment.
+pub fn keccak_hash_pair(
+    b: &mut LfmBuilder,
+    left: KeccakDigest,
+    right: KeccakDigest,
+) -> KeccakDigest {
+    let left_halves = keccak_digest_halves(b, left);
+    let right_halves = keccak_digest_halves(b, right);
+    let mut stream = Vec::with_capacity(2 * DIGEST_HALVES);
+    stream.extend(left_halves);
+    stream.extend(right_halves);
+    keccak256(b, &stream, 2 * COMMITMENT_BYTES)
+}
+
+/// Build a whole Merkle TREE bottom-up and return its root.
+///
+/// The counterpart of [`keccak_merkle_walk`]: the walk authenticates ONE leaf
+/// against a root it is given, this CONSTRUCTS the root from every leaf. A
+/// derivation needs the second — there is no root to authenticate against,
+/// producing it is the point.
+///
+/// Cost is `leaves − 1` permutations on top of the leaves' own, so a tree over
+/// `L` leaves is `2L − 1` permutations in total.
+///
+/// ## Power-of-two leaves
+///
+/// `MerkleTree::build_from_hashed_leaves` runs `complete_until_power_of_two`
+/// first, which pads by REPEATING the last leaf. This asserts a power of two
+/// instead of emitting that padding: leaf counts here are shape (an LDE row
+/// count over `ROWS_PER_LEAF`), so a non-power-of-two is a caller bug rather
+/// than a case to handle, and emitting duplicate-leaf padding no production
+/// commitment can reach would be dead program text.
+pub fn keccak_merkle_tree_root(b: &mut LfmBuilder, leaves: &[KeccakDigest]) -> KeccakDigest {
+    assert!(!leaves.is_empty(), "a tree has at least one leaf");
+    assert!(
+        leaves.len().is_power_of_two(),
+        "leaf counts are shape and must be a power of two; production would \
+         pad by repeating the last leaf and no caller here needs that"
+    );
+    let mut level = leaves.to_vec();
+    while level.len() > 1 {
+        level = level
+            .chunks_exact(2)
+            .map(|pair| keccak_hash_pair(b, pair[0], pair[1]))
+            .collect();
+    }
+    level[0]
 }
 
 /// Bytes in a commitment / Merkle node.

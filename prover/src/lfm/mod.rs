@@ -31,6 +31,7 @@ pub mod instr;
 pub mod keccak_adapter;
 pub mod keccak_host;
 pub mod layout;
+pub mod lde;
 pub mod programs;
 pub mod proof;
 pub mod proof_arena;
