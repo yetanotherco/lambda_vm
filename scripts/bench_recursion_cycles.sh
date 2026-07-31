@@ -30,8 +30,8 @@
 # fine. Building the counter per ref makes each VM understand exactly its own guest's
 # syscalls, so it is robust for PRs that add OR remove a syscall in either direction —
 # mirroring the per-side build already done by scripts/bench_verify.sh. Cost: one extra
-# native release `cli` build per ref; it shares HOST_TARGET_DIR with the blob-dump build
-# when that is set, so most deps are already warm, and it fits the recursion step's
+# native release `cli` build per ref; it shares that ref's own host target dir with the
+# blob-dump build, so most deps are already warm, and it fits the recursion step's
 # existing multi-build budget (two guest builds + two blob dumps already).
 #
 # Improvement convention matches scripts/bench_verify.sh:
@@ -63,8 +63,11 @@
 #                          OWN dir, `<p>_<sha8>` — NEVER one dir shared by both refs
 #                          (see the cross-ref clobbering note below). Unset =
 #                          per-worktree (cargo's default target/, also isolated).
-#     HOST_TARGET_DIR=<p>  share the host cargo target dir for the blob-dump test
-#                          build across refs. Unset = per-worktree (default).
+#     HOST_TARGET_DIR=<p>  base path for the host cargo target dir (blob-dump test +
+#                          measuring CLI). Each ref gets its OWN dir, `<p>_<sha8>` —
+#                          NEVER one dir shared by both refs (see the cross-ref
+#                          clobbering note below). Unset = per-worktree (cargo's
+#                          default target/, also isolated).
 #     PRUNE_KEEP=<n>       cap on cached ref worktrees kept under $WORK (default 10);
 #                          older ones (+ their results/blobs/logs) are pruned at startup
 #                          to bound disk on the long-lived bench runner.
@@ -72,7 +75,8 @@
 #                          from PRUNE_KEEP and much tighter: these are GBs each, and only
 #                          the current run's two refs need one (3 leaves room to re-run
 #                          the same PR without a cold rebuild). See
-#                          prune_guest_target_dirs for why they need their own sweep.
+#                          prune_ref_target_dirs for why they need their own sweep.
+#     HOST_TARGET_KEEP=<n> same cap for the per-ref HOST target dirs (default 3).
 #     BLOCK_TXS=20         PRESET=blowup<N>-block only: ethrex block size. Reads
 #                          executor/tests/ethrex_bench_<BLOCK_TXS>.bin when present
 #                          (only _4 is committed) and generates any other size via
@@ -101,9 +105,9 @@
 # preset), so re-proving a blowup<N>-block real ethrex block only happens once per ref.
 # REBUILD=1 forces everything.
 #
-# NEVER point two refs at one guest CARGO_TARGET_DIR. Two worktrees are two distinct
-# source roots; building both into a single target dir makes cargo consider the crates
-# that did NOT change between the refs "fresh" and reuse rlibs compiled from the OTHER
+# NEVER point two refs at one CARGO_TARGET_DIR, guest or host. Two worktrees are two
+# distinct source roots; building both into a single target dir makes cargo consider the
+# crates that did NOT change between the refs "fresh" and reuse rlibs compiled from the OTHER
 # worktree, while rebuilding the ones that did — so a build that alternates refs dies
 # with `multiple different versions of crate math in the dependency graph` naming both
 # worktrees. That is exactly how the blowup2/blowup4 regimes silently went "unavailable"
@@ -112,6 +116,21 @@
 # `${GUEST_TARGET_DIR}_<sha8>` below: each source root owns its target dir, so build-std
 # is still reused across presets AND across runs (just not across refs), and a repeated
 # `make compile-recursion-elfs` for the same ref is the intended cargo no-op.
+#
+# On the HOST side the same sharing fails SILENTLY, which is worse: it does not error, it
+# measures the wrong binary. Cargo's freshness check walks a dep-info list of paths
+# RELATIVE to the invocation, so from the other worktree they all resolve and their mtimes
+# are older than the artifact — cargo prints `Finished` in 0.06s and the run executes the
+# binary the OTHER ref linked (the test-harness filename carries no worktree component, so
+# both refs overwrite one path). The direction is fixed: the ref that only ADDS files is
+# the one that gets skipped, because in the reverse order cargo finds the added file
+# missing from the other worktree and rebuilds. In a /bench-verify run on the DMA PR the
+# blob dump for the PR ref therefore executed main's prover linked against the PR's
+# executor: the guest's new ecalls ran, no table existed to prove them, and
+# `verify_continuation` returned None — surfacing as the PR's `continuation bundle must
+# verify on host before dumping` on a PR whose own binary verifies that bundle fine. Hence
+# `${HOST_TARGET_DIR}_<sha8>` too. Cost: one cold host build per ref (~35 s on the bench
+# runner), still warm across presets and across runs for the same ref.
 #
 set -euo pipefail
 
@@ -128,6 +147,7 @@ PRESET="${3:-min}"
 SYSROOT_DIR="${SYSROOT_DIR:-$HOME/.lambda-vm-sysroot}"
 PRUNE_KEEP="${PRUNE_KEEP:-10}"
 GUEST_TARGET_KEEP="${GUEST_TARGET_KEEP:-3}"
+HOST_TARGET_KEEP="${HOST_TARGET_KEEP:-3}"
 BLOCK_TXS="${BLOCK_TXS:-20}"
 BLOCK_EPOCH_LOG2="${BLOCK_EPOCH_LOG2:-21}"
 
@@ -159,26 +179,30 @@ prune_worktree_cache() {
           "$WORK"/build_guest_"${s8}".log "$WORK"/dump_"${s8}"*.log \
           "$WORK"/measure_"${s8}"*.err "$WORK"/measure_cli_"${s8}"* \
           "$WORK"/build_cli_"${s8}".log
-    # The per-ref guest target dir is the biggest artifact of all (build-std + the
-    # guest builds) and its name escapes the wt_* glob above, so drop it here too or
-    # the disk-bounding claim stops holding.
+    # The per-ref target dirs are the biggest artifacts of all (build-std + the guest
+    # builds; the native deps + prover test harness + CLI on the host side) and their
+    # names escape the wt_* glob above, so drop them here too or the disk-bounding claim
+    # stops holding.
     if [ -n "${GUEST_TARGET_DIR:-}" ]; then
       rm -rf "${GUEST_TARGET_DIR}_${s8}"
+    fi
+    if [ -n "${HOST_TARGET_DIR:-}" ]; then
+      rm -rf "${HOST_TARGET_DIR}_${s8}"
     fi
   done <<< "$stale"
   git worktree prune >/dev/null 2>&1 || true
 }
 prune_worktree_cache
 
-# The per-ref guest target dirs need their OWN sweep, not just the per-worktree removal
+# The per-ref target dirs need their OWN sweep, not just the per-worktree removal
 # above, for two reasons. (1) They are not discoverable from the wt_* glob once their
 # worktree is gone, and the mid-run build-failure path removes a worktree IMMEDIATELY —
 # which would strand that ref's target dir forever, unreclaimable, on a long-lived
 # runner. Guest builds failing is exactly the scenario this script exists to measure, so
 # that is not a rare path. (2) They are the biggest thing here (build-std + the guest
-# builds, GBs each), and only the CURRENT run's two refs need one, so they deserve a
-# tighter cap than the worktrees (which are cheaper and worth keeping around longer for
-# checkout reuse).
+# builds; the native deps + prover test harness + CLI on the host side — GBs each), and
+# only the CURRENT run's two refs need one, so they deserve a tighter cap than the
+# worktrees (which are cheaper and worth keeping around longer for checkout reuse).
 #
 # The invariant enforced is "a target dir survives only while its worktree does": a
 # worktree that vanished either aged out or died mid-build, and in both cases a clean
@@ -189,29 +213,31 @@ prune_worktree_cache
 # keyed on the ref SHA, stays valid without its worktree, and represents real prover
 # minutes (a 20-tx continuation prove), so dropping it would throw away an expensive and
 # still-correct cache to reclaim ~300 MB.
-prune_guest_target_dirs() {
-  [ -n "${GUEST_TARGET_DIR:-}" ] || return 0
+prune_ref_target_dirs() {
+  local base="$1" keep="$2" label="$3"
+  [ -n "$base" ] || return 0
   local d s8 stale
-  for d in "${GUEST_TARGET_DIR}"_*; do
+  for d in "${base}"_*; do
     [ -d "$d" ] || continue
     s8="$(basename "$d")"; s8="${s8##*_}"
     if [ ! -d "$WORK/wt_${s8}" ]; then
-      echo "==> Pruning orphaned guest target dir $d (no worktree $WORK/wt_${s8})" >&2
+      echo "==> Pruning orphaned $label target dir $d (no worktree $WORK/wt_${s8})" >&2
       rm -rf "$d"
     fi
   done
   # Same ls -t recency ordering as the worktree prune; names are <base>_<sha8>, so
   # word-splitting is safe. Each dir is `touch`ed after its build, so this tracks use.
   # shellcheck disable=SC2012
-  stale="$(ls -1dt "${GUEST_TARGET_DIR}"_* 2>/dev/null | tail -n +"$((GUEST_TARGET_KEEP + 1))" || true)"
+  stale="$(ls -1dt "${base}"_* 2>/dev/null | tail -n +"$((keep + 1))" || true)"
   [ -n "$stale" ] || return 0
   while IFS= read -r d; do
     [ -n "$d" ] || continue
-    echo "==> Pruning old guest target dir $d (keeping newest $GUEST_TARGET_KEEP)" >&2
+    echo "==> Pruning old $label target dir $d (keeping newest $keep)" >&2
     rm -rf "$d"
   done <<< "$stale"
 }
-prune_guest_target_dirs
+prune_ref_target_dirs "${GUEST_TARGET_DIR:-}" "$GUEST_TARGET_KEEP" guest
+prune_ref_target_dirs "${HOST_TARGET_DIR:-}" "$HOST_TARGET_KEEP" host
 
 # One-time sweep of the retired single-CLI scheme's fixed-name artifacts. Before this
 # script measured per ref it built one shared counter at $WORK/measure_cli (+ its .sha
@@ -220,17 +246,20 @@ prune_guest_target_dirs
 # they would linger forever. Drop them so the disk-bounding claim actually holds.
 rm -f "$WORK"/measure_cli "$WORK"/measure_cli.sha "$WORK"/build_measure_cli.log
 
-# Same for the retired single-shared-guest-target scheme: CI used to point
-# GUEST_TARGET_DIR at this one fixed path for BOTH refs, which is exactly what poisoned
-# every regime after the first. Nothing writes or reads it now (each ref builds into
-# ${GUEST_TARGET_DIR}_<sha8>), its name escapes the per-SHA prune globs, and it is the
-# largest thing on disk — so reclaim it once. The CACHEDIR.TAG check keeps this an
+# Same for the retired single-shared-target schemes, guest and host: CI used to point
+# GUEST_TARGET_DIR / HOST_TARGET_DIR at one fixed path for BOTH refs, which is exactly
+# what poisoned every regime after the first (guest) and silently ran one ref's binary
+# for the other (host). Nothing writes or reads them now (each ref builds into
+# ${*_TARGET_DIR}_<sha8>), their names escape the per-SHA prune globs, and they are the
+# largest things on disk — so reclaim them once. The CACHEDIR.TAG check keeps this an
 # rm -rf of a cargo target dir and nothing else: cargo writes that file into every
 # target dir it creates.
-if [ -f "$WORK/shared_guest_target/CACHEDIR.TAG" ]; then
-  echo "==> Removing retired shared guest target dir $WORK/shared_guest_target" >&2
-  rm -rf "$WORK/shared_guest_target"
-fi
+for retired in "$WORK/shared_guest_target" "$WORK/shared_host_target"; do
+  if [ -f "$retired/CACHEDIR.TAG" ]; then
+    echo "==> Removing retired shared target dir $retired" >&2
+    rm -rf "$retired"
+  fi
+done
 
 echo "==> Refs"
 git fetch origin --quiet || echo "WARNING: 'git fetch origin' failed — resolving against possibly-stale local refs." >&2
@@ -332,6 +361,15 @@ measure_ref() {
   local block_txs="$BLOCK_TXS"
   local block_epoch_log2="$BLOCK_EPOCH_LOG2"
 
+  # HOST_TARGET_DIR, like GUEST_TARGET_DIR, is a BASE path: this ref's host builds go to
+  # ${HOST_TARGET_DIR}_<sha8>. Never the bare base — that is one dir for two source roots,
+  # and cargo then declares the second ref fresh and hands it the first ref's binary (see
+  # the header note).
+  local host_target=""
+  if [ -n "${HOST_TARGET_DIR:-}" ]; then
+    host_target="${HOST_TARGET_DIR}_${sha8}"
+  fi
+
   # Blob cache: keyed on sha + preset (+ block fixture/epoch), persists across runs.
   local blob_key="$PRESET"
   if [ "$is_block" = 1 ]; then
@@ -355,12 +393,15 @@ measure_ref() {
     if valid_result < "$result"; then
       echo "==> [$role] Reusing cached measurement: $ref ($sha8) preset=$PRESET" >&2
       # Mark this ref as recently used so the startup prune keeps its worktree/result.
-      # The guest target dir too: it ages out under the much tighter GUEST_TARGET_KEEP, so
-      # a ref whose results are all cached would otherwise lose it and pay a cold rebuild.
+      # The target dirs too: they age out under the much tighter *_TARGET_KEEP caps, so
+      # a ref whose results are all cached would otherwise lose them and pay a cold rebuild.
       touch "$result" 2>/dev/null || true
       if [ -d "$wt" ]; then touch "$wt" 2>/dev/null || true; fi
       if [ -n "${GUEST_TARGET_DIR:-}" ] && [ -d "${GUEST_TARGET_DIR}_${sha8}" ]; then
         touch "${GUEST_TARGET_DIR}_${sha8}" 2>/dev/null || true
+      fi
+      if [ -n "$host_target" ] && [ -d "$host_target" ]; then
+        touch "$host_target" 2>/dev/null || true
       fi
       cat "$result"
       return 0
@@ -400,18 +441,24 @@ measure_ref() {
     # poisons a later reuse. (The startup prune also caps total worktrees.)
     git worktree remove --force "$wt" >/dev/null 2>&1 || rm -rf "$wt"
     git worktree prune >/dev/null 2>&1 || true
-    # Reclaim this ref's guest target dir now rather than leaving GBs behind until the
-    # next run's prune_guest_target_dirs notices it has no worktree. Its contents are a
+    # Reclaim this ref's target dirs now rather than leaving GBs behind until the next
+    # run's prune_ref_target_dirs notices they have no worktree. Their contents are a
     # half-finished build anyway, so a clean rebuild is what we want next time.
     if [ -n "${GUEST_TARGET_DIR:-}" ]; then
       rm -rf "${GUEST_TARGET_DIR}_${sha8}"
     fi
+    if [ -n "$host_target" ]; then
+      rm -rf "$host_target"
+    fi
     exit 1
   fi
-  # Mark the target dir as recently used so prune_guest_target_dirs keeps it. Guarded on
+  # Mark the target dirs as recently used so prune_ref_target_dirs keeps them. Guarded on
   # -d: a bare `touch` on a first build would create a FILE at that path and break cargo.
   if [ -n "${GUEST_TARGET_DIR:-}" ] && [ -d "${GUEST_TARGET_DIR}_${sha8}" ]; then
     touch "${GUEST_TARGET_DIR}_${sha8}" 2>/dev/null || true
+  fi
+  if [ -n "$host_target" ] && [ -d "$host_target" ]; then
+    touch "$host_target" 2>/dev/null || true
   fi
 
   # 2b. Detect the guest ELF: block mode always wants recursion-cont-<preset>.elf;
@@ -484,8 +531,8 @@ measure_ref() {
     echo "==> [$role] dumping recursion input blob (cargo test test_dump_recursion_input, preset=$PRESET) ..." >&2
     rm -f /tmp/recursion_input.bin
     local dlog="$WORK/dump_${sha8}_${PRESET}.log"
-    if [ -n "${HOST_TARGET_DIR:-}" ]; then
-      if ! ( cd "$wt" && env "${dump_env[@]}" CARGO_TARGET_DIR="$HOST_TARGET_DIR" cargo test --release -p lambda-vm-prover --lib test_dump_recursion_input -- --ignored --nocapture ) >"$dlog" 2>&1; then
+    if [ -n "$host_target" ]; then
+      if ! ( cd "$wt" && env "${dump_env[@]}" CARGO_TARGET_DIR="$host_target" cargo test --release -p lambda-vm-prover --lib test_dump_recursion_input -- --ignored --nocapture ) >"$dlog" 2>&1; then
         echo "ERROR: [$role] blob-dump test failed for $ref ($sha8). Tail of $dlog:" >&2
         tail -40 "$dlog" >&2
         exit 1
@@ -517,24 +564,25 @@ measure_ref() {
   # it at a per-ref stable path. This is the crux of the per-ref design: the guest ELF
   # above may emit a syscall this ref introduced, so it must be executed by an executor
   # built from the same ref — a CLI built from another ref (e.g. main) would abort with
-  # UnknownSyscall. Share HOST_TARGET_DIR (when set) with the blob-dump build so common
-  # native deps are already compiled, and copy the result out so a shared target dir's
-  # `cli` isn't clobbered by the other ref's build. The copy-out is ATOMIC (cp to a tmp
-  # path + mv within $WORK), so a run killed mid-copy can never leave a truncated-but-
-  # executable binary that the `[ -x ]` reuse check would then trust — matching the
-  # atomic tmp+mv used for result files below. The per-ref binary name encodes the SHA,
-  # so it doubles as its own cache (rebuilt only on REBUILD=1 or first sight).
+  # UnknownSyscall, or worse count the wrong ref's cycles without saying so. Shares this
+  # ref's ${HOST_TARGET_DIR}_<sha8> with the blob-dump build so common native deps are
+  # already compiled, and copies the result out to its per-ref path. The copy-out is
+  # ATOMIC (cp to a tmp path + mv within $WORK), so a run killed mid-copy can never leave
+  # a truncated-but-executable binary that the `[ -x ]` reuse check would then trust —
+  # matching the atomic tmp+mv used for result files below. The per-ref binary name
+  # encodes the SHA, so it doubles as its own cache (rebuilt only on REBUILD=1 or first
+  # sight).
   local measure_cli="$WORK/measure_cli_${sha8}"
   if [ "${REBUILD:-0}" = "1" ] || [ ! -x "$measure_cli" ]; then
     echo "==> [$role] building measuring CLI (cli, release) @ $sha8 ..." >&2
     local clilog="$WORK/build_cli_${sha8}.log"
-    if [ -n "${HOST_TARGET_DIR:-}" ]; then
-      if ! ( cd "$wt" && CARGO_TARGET_DIR="$HOST_TARGET_DIR" cargo build --release -p cli ) >"$clilog" 2>&1; then
+    if [ -n "$host_target" ]; then
+      if ! ( cd "$wt" && CARGO_TARGET_DIR="$host_target" cargo build --release -p cli ) >"$clilog" 2>&1; then
         echo "ERROR: [$role] cli build failed for $ref ($sha8). Tail of $clilog:" >&2
         tail -40 "$clilog" >&2
         exit 1
       fi
-      cp "$HOST_TARGET_DIR/release/cli" "$measure_cli.tmp"
+      cp "$host_target/release/cli" "$measure_cli.tmp"
     else
       if ! ( cd "$wt" && cargo build --release -p cli ) >"$clilog" 2>&1; then
         echo "ERROR: [$role] cli build failed for $ref ($sha8). Tail of $clilog:" >&2
