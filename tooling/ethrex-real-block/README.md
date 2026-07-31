@@ -140,7 +140,7 @@ it — see [Measured cost of candidate blocks](#measured-cost-of-candidate-block
 
 | Where | How to run it | Cost (current default) |
 |---|---|---|
-| `benchmark-pr.yml` | **`/bench`** on a PR — no separate command; also push to main and `workflow_dispatch` | 3 runs, ~4–5 min each (first run at epoch 2^22 confirms) |
+| `benchmark-pr.yml` | **`/bench`** on a PR — the only workload it proves; also push to main and `workflow_dispatch` | 3 runs, ~4–5 min each (first run at epoch 2^22 confirms) |
 | `scripts/bench_verify.sh` | `WORKLOAD=real scripts/bench_verify.sh <ref>` | ~4.5–4.8 min per side, then cached |
 | `scripts/perf_diff.sh` | `WORKLOAD=real scripts/perf_diff.sh <ref>` | 5 recordings, so ~25 min |
 | `benchmark-gpu.yml` | `/bench-gpu` on a PR — **the default there** | 59.87 s/prove on an RTX 5090 (see below) |
@@ -206,19 +206,31 @@ and the other tiers. The
 bundle on disk is ~1.9 GB; note that a heavier block pushes it past 2 GiB, which
 needs rkyv `pointer_width_64` to serialize.
 
-**`/bench` runs both halves, one command.** The synthetic screen (5 runs, ~25s each)
-and the real block (3 runs, ~4–5 min each) go out together; there is no separate
-trigger for the real one. They answer different questions and neither replaces the
-other — the synthetic block is cheap enough to sample hard, so it resolves smaller
-deltas, while the real block is the one whose number means something.
+**`/bench` proves this block and nothing else** — 3 sampled runs against the cached
+3-run baseline main publishes on every push. `/bench N` changes the sample count
+(clamped to 5).
+
+The synthetic N-transfer screen that used to run alongside it was **removed**. Two
+reasons, recorded here because "add a cheap screen back" is an easy suggestion to
+make twice:
+
+1. Its only unique coverage was the **monolithic** prove path, which is vestigial —
+   reportedly slower than a single-epoch continuation. Spending runner time to cover
+   a path we intend to delete is not a trade worth making.
+2. Its crypto mix is one **no real block has**: 8.83 ECSM per Mcycle, against a real
+   block's ~1.3–1.6. Screening against it tunes the prover for a worst case that
+   cannot occur.
+
+The synthetic fixtures themselves are not gone — `/bench-growth` still sweeps them for
+a heap-vs-block-size slope, which needs a family of blocks and so cannot come from one
+real one. `/bench-abba` and `/bench-verify` are untouched.
 
 **The cost is a shared resource.** One runner carries every `/bench`, `/bench-abba`
-and `/bench-verify` in the repo, and folding the real block in takes a `/bench` from
-roughly a minute of proving to **~15–20 min**, on every comment and every push to
-main. That was a deliberate trade — one command beating two — and `BENCH_RUNS_REAL`
-in `benchmark-pr.yml` is the dial if it proves too expensive. Its per-run time on the
-runner is still unmeasured (the calibration ran on a different box), so the first run
-is what tells you whether 3 was the right number.
+and `/bench-verify` in the repo, and a `/bench` now occupies it for **~15–20 min**, on
+every comment and every push to main. `BENCH_RUNS_REAL` in `benchmark-pr.yml` is the
+dial. Its per-run time on that runner is still unmeasured — the epoch calibration ran
+on a different box — so the first run is what tells you whether 3 was the right
+number; above ~6 min a run, turn it down.
 
 Cycle counts here (8.73M synthetic, 50.78M real) are from merge `fdb92f67` (main @
 `9ccdaf2`, clang 21). They move with guest optimisation and ~2% with the clang major,
