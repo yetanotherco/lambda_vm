@@ -39,9 +39,9 @@ const ECSM_SYSCALL_NUMBER: usize = usize::MAX - 10;
 const ECSM_AFFINE_SYSCALL_NUMBER: usize = usize::MAX - 11;
 
 /// Syscall number for the non-constraining Hint ecall.
-/// Must match `executor::...::execution::HINT_SYSCALL_NUMBER` (u64::MAX - 20).
+/// Must match `executor::...::execution::HINT_SYSCALL_NUMBER` (u64::MAX - 30).
 #[cfg(target_arch = "riscv64")]
-const HINT_SYSCALL_NUMBER: usize = usize::MAX - 20;
+const HINT_SYSCALL_NUMBER: usize = usize::MAX - 30;
 
 /// Hint selectors passed in `a0` (must match the executor's `HINT_*`).
 pub const HINT_FIELD_INV: usize = 0;

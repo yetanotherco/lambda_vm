@@ -54,7 +54,7 @@ pub const ECSM_AFFINE_SYSCALL_NUMBER: u64 = u64::MAX - 11;
 /// verification failure. The ecall adds no in-circuit correctness constraint of its
 /// own — it lets the guest replace an expensive computation with a cheap check,
 /// without letting the (prover-chosen) hinted value change the guest's result.
-pub const HINT_SYSCALL_NUMBER: u64 = u64::MAX - 20;
+pub const HINT_SYSCALL_NUMBER: u64 = u64::MAX - 30;
 
 /// Hint operation selector passed in `a0`.
 pub const HINT_FIELD_INV: u64 = 0; // secp256k1 base-field inverse (mod p)

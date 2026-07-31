@@ -2805,6 +2805,68 @@ fn generate_page_tables<I: ImageSource>(
 // Trace Generation
 // =============================================================================
 
+/// Per-ELF DECODE artifacts: the parsed instruction map, the pristine DECODE
+/// trace (multiplicities all zero) and its PC→row index. They are a pure
+/// function of the ELF, so continuation epochs build them once
+/// ([`DecodeArtifacts::from_elf`]) and share them across every epoch's trace
+/// build ([`Traces::from_image_and_logs_with_decode`]) instead of re-parsing
+/// the ELF and regenerating the trace per epoch.
+pub struct DecodeArtifacts {
+    instructions: U64HashMap<Instruction>,
+    decode_trace: TraceTable<GoldilocksField, GoldilocksExtension>,
+    decode_pc_to_row: decode::PcToRow,
+}
+
+impl DecodeArtifacts {
+    /// Parse the ELF and generate the pristine DECODE trace.
+    ///
+    /// IMPORTANT: uses `generate_decode_trace` (same as
+    /// `compute_precomputed_commitment`) so the DECODE trace row ordering
+    /// matches the AIR's hardcoded commitment.
+    pub fn from_elf(elf: &Elf) -> Result<Self, Error> {
+        let instructions = decode::instructions_from_elf(elf)
+            .map_err(|e| Error::Execution(format!("Failed to parse instructions: {e}")))?;
+        let (decode_trace, decode_pc_to_row) = decode::generate_decode_trace(&instructions);
+        Ok(Self {
+            instructions,
+            decode_trace,
+            decode_pc_to_row,
+        })
+    }
+}
+
+/// An epoch's collected operations and end state (Phases 1-2 of the trace
+/// build), produced by [`Traces::collect_epoch`] and consumed by
+/// [`Traces::build_from_collected`]. Collection must run in epoch order (it
+/// reads the advancing memory image); everything downstream of this struct is
+/// epoch-local. The cross-epoch values a continuation producer needs — the
+/// touched-cell set and the final register file — are derivable here, before
+/// any table is generated.
+pub struct CollectedEpoch {
+    ops: CollectedOps,
+    memory_state: MemoryState,
+    register_state: RegisterState,
+}
+
+impl CollectedEpoch {
+    /// The epoch's touched memory cells (sorted by address): the exact values
+    /// `build_traces` later stores in `Traces::touched_memory_cells` (both are
+    /// [`touched_cells_from_memory_state`] over the same immutable
+    /// `memory_state`), available before any table is built.
+    pub fn touched_memory_cells(&self) -> local_to_global::EpochTouches {
+        touched_cells_from_memory_state(&self.memory_state)
+    }
+
+    /// The epoch's final register file (`R_{i+1}`) in
+    /// `register_word_address_list` order: the exact values
+    /// [`register::fini_from_trace`] reads off the generated REGISTER trace
+    /// (see [`register::fini_from_final_state`]), available before the trace
+    /// exists.
+    pub fn register_fini(&self, register_init: &[u32]) -> Vec<u32> {
+        register::fini_from_final_state(&self.register_state.to_final_state_map(), register_init)
+    }
+}
+
 /// All generated trace tables.
 pub struct Traces {
     /// CPU execution traces (split into chunks of max_rows::CPU)
@@ -3133,7 +3195,7 @@ fn build_traces<I: ImageSource + Sync>(
     memory_state: &MemoryState,
     register_init: &[u32],
     decode_trace: TraceTable<GoldilocksField, GoldilocksExtension>,
-    decode_pc_to_row: decode::PcToRow,
+    decode_pc_to_row: &decode::PcToRow,
     mut register_state: RegisterState,
     max_rows: &super::MaxRowsConfig,
     #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
@@ -3490,7 +3552,7 @@ fn build_traces<I: ImageSource + Sync>(
         let mut decode = decode_trace;
         let mut decode_lookups: Vec<u64> = cpu_ops_ref.iter().map(|op| op.decode.pc).collect();
         decode_lookups.extend(std::iter::repeat_n(cpu::CPU_PADDING_PC, num_padding_rows));
-        decode::update_multiplicities(&mut decode, &decode_pc_to_row, &decode_lookups);
+        decode::update_multiplicities(&mut decode, decode_pc_to_row, &decode_lookups);
         decode
     };
     let gen_commit = || commit::generate_commit_trace(&commit_ops);
@@ -4396,6 +4458,68 @@ impl Traces {
         l2g_memory_bookend: bool,
         #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
     ) -> Result<Self, Error> {
+        let artifacts = DecodeArtifacts::from_elf(elf)?;
+        Self::from_image_and_logs_with_decode(
+            &artifacts,
+            initial_image,
+            register_init,
+            logs,
+            max_rows,
+            private_input,
+            is_final,
+            l2g_memory_bookend,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )
+    }
+
+    /// [`Self::from_image_and_logs`] with the per-ELF DECODE artifacts supplied
+    /// by the caller. Continuation epochs of the same ELF build
+    /// [`DecodeArtifacts`] once and reuse them here, so the per-epoch producer
+    /// chain skips the ELF re-parse and the pristine DECODE trace regeneration
+    /// (Phase 0) — the trace is cloned (a memcpy) and its multiplicities are
+    /// filled per epoch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_image_and_logs_with_decode<I: ImageSource + Sync>(
+        artifacts: &DecodeArtifacts,
+        initial_image: &I,
+        register_init: &[u32],
+        logs: &[Log],
+        max_rows: &super::MaxRowsConfig,
+        private_input: &[u8],
+        is_final: bool,
+        l2g_memory_bookend: bool,
+        #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
+    ) -> Result<Self, Error> {
+        let collected =
+            Self::collect_epoch(artifacts, initial_image, register_init, logs, is_final)?;
+        Self::build_from_collected(
+            artifacts,
+            collected,
+            Some(initial_image),
+            register_init,
+            max_rows,
+            private_input,
+            is_final,
+            l2g_memory_bookend,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )
+    }
+
+    /// The sequential-critical half of an epoch's trace build: log collection
+    /// and op routing (Phases 1-2), which read the pre-epoch memory image and
+    /// produce the epoch's memory/register end state. This must run in epoch
+    /// order (the image advances between epochs); the table generation that
+    /// consumes the result ([`Self::build_from_collected`]) is epoch-local and
+    /// can run on another thread.
+    pub fn collect_epoch<I: ImageSource + Sync>(
+        artifacts: &DecodeArtifacts,
+        initial_image: &I,
+        register_init: &[u32],
+        logs: &[Log],
+        is_final: bool,
+    ) -> Result<CollectedEpoch, Error> {
         // A non-final epoch must not contain the program-terminating instruction
         // (next_pc == 0). Otherwise the CPU sends an ECALL bus token with no HALT
         // table to receive it (HALT is excluded when !is_final), producing an
@@ -4404,21 +4528,10 @@ impl Traces {
             return Err(Error::HaltInNonFinalEpoch);
         }
 
-        // Phase 0: ELF → DECODE + instructions
-        // IMPORTANT: Use generate_decode_trace (same as compute_precomputed_commitment)
-        // so the DECODE trace row ordering matches the AIR's hardcoded commitment.
-        #[cfg(feature = "instruments")]
-        let __sp = stark::instruments::span("p0_decode");
-        let instructions = decode::instructions_from_elf(elf)
-            .map_err(|e| Error::Execution(format!("Failed to parse instructions: {e}")))?;
-        let (decode_trace, decode_pc_to_row) = decode::generate_decode_trace(&instructions);
-        #[cfg(feature = "instruments")]
-        drop(__sp);
-
         // Phase 1: Logs → CPU operations
         #[cfg(feature = "instruments")]
         let __sp = stark::instruments::span("p1_cpu_ops");
-        let cpu_ops = collect_cpu_ops(logs, &instructions)?;
+        let cpu_ops = collect_cpu_ops(logs, &artifacts.instructions)?;
         #[cfg(feature = "instruments")]
         drop(__sp);
 
@@ -4464,17 +4577,51 @@ impl Traces {
         #[cfg(feature = "instruments")]
         drop(__sp);
 
+        Ok(CollectedEpoch {
+            ops,
+            memory_state,
+            register_state,
+        })
+    }
+
+    /// The epoch-local half of an epoch's trace build: table generation
+    /// (Phases 3-5) over an already-collected epoch. Reads nothing sequential —
+    /// continuation callers run this on a builder-pool thread while the
+    /// producer collects the next epoch. `initial_image` is only used for PAGE
+    /// tables and their bitwise lookups, both skipped in continuation mode
+    /// (`l2g_memory_bookend`), where callers pass `None`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_from_collected<I: ImageSource + Sync>(
+        artifacts: &DecodeArtifacts,
+        collected: CollectedEpoch,
+        initial_image: Option<&I>,
+        register_init: &[u32],
+        max_rows: &super::MaxRowsConfig,
+        private_input: &[u8],
+        is_final: bool,
+        l2g_memory_bookend: bool,
+        #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
+    ) -> Result<Self, Error> {
+        // Phase 0 (cached): the pristine DECODE trace is cloned so
+        // `build_traces` can fill this epoch's multiplicities.
+        #[cfg(feature = "instruments")]
+        let __sp = stark::instruments::span("p0_decode");
+        let decode_trace = artifacts.decode_trace.clone();
+        let decode_pc_to_row = &artifacts.decode_pc_to_row;
+        #[cfg(feature = "instruments")]
+        drop(__sp);
+
         // Phases 3-5
         #[cfg(feature = "instruments")]
         let __sp = stark::instruments::span("p3to5_build_traces");
         let result = build_traces(
-            ops,
-            Some(initial_image),
-            &memory_state,
+            collected.ops,
+            initial_image,
+            &collected.memory_state,
             register_init,
             decode_trace,
             decode_pc_to_row,
-            register_state,
+            collected.register_state,
             max_rows,
             #[cfg(feature = "disk-spill")]
             storage_mode,
@@ -4547,7 +4694,7 @@ impl Traces {
             &memory_state,
             &register_init,
             decode_trace,
-            decode_pc_to_row,
+            &decode_pc_to_row,
             register_state,
             max_rows,
             #[cfg(feature = "disk-spill")]

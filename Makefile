@@ -90,7 +90,7 @@ ASM_LDFLAGS ?= -fuse-ld=lld -nostdlib -Wl,-e,main
 # Custom RV64IM target spec location
 RV64_TARGET_SPEC=$(CURDIR)/executor/programs/riscv64im-lambda-vm-elf.json
 
-.PHONY: test prepare-sysroot
+.PHONY: test test-syscalls test-ethrex-crypto prepare-sysroot
 
 # The guard checks for include/stdlib.h (not just the include/ dir) so that a PARTIAL
 # sysroot — directories present but missing the C standard library headers — is detected
@@ -332,7 +332,12 @@ check-ethrex-fixture-checksums:
 test-syscalls:
 	cd syscalls && cargo test
 
-test: compile-programs test-syscalls
+# ethrex-crypto is a detached workspace (excluded from the root members), so a
+# root `cargo test` never runs it. Run it explicitly, like test-syscalls.
+test-ethrex-crypto:
+	cd crypto/ethrex-crypto && cargo test
+
+test: compile-programs test-syscalls test-ethrex-crypto
 	cargo test
 
 # === Quick test shortcuts ===

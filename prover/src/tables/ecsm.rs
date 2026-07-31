@@ -810,6 +810,7 @@ use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
 /// ECSM transition constraints as a single-source [`ConstraintSet`] (423
 /// total). No column configuration needed (the layout is fixed via `cols`).
+#[derive(Clone, Copy)]
 pub struct EcsmConstraints;
 
 impl EcsmConstraints {

@@ -341,32 +341,53 @@ fn ecsm_oracle(x: &FieldElement, y: &FieldElement, k: &Scalar) -> Option<(FieldE
     Some((xr.normalize(), yr.normalize()))
 }
 
-/// Base-field inverse `x⁻¹ mod p`. On riscv64 the host supplies it via the
-/// `hint` ecall and we verify `x·inv == 1`; off-target it inverts in software.
+/// Base-field inverse `x⁻¹ mod p`.
+///
+/// On riscv64 the inverse is first requested from the untrusted `hint` ecall and
+/// verified in-guest (`x·inv == 1`); **on any verification failure it is recomputed
+/// in software.** A bad hint can only cost the guest extra work, never change the
+/// answer — it cannot steer a caller's accept/reject outcome. Off-target it inverts
+/// in software directly. Returns `None` only for a genuinely non-invertible input
+/// (`x = 0`), which the callers' degeneracy guards already exclude.
 #[cfg(any(target_arch = "riscv64", test))]
 fn field_inv(x: &FieldElement) -> Option<FieldElement> {
     #[cfg(target_arch = "riscv64")]
     {
-        let x_be: [u8; 32] = x.to_bytes().into();
-        let inv_be = get_hint(lambda_vm_syscalls::syscalls::HINT_FIELD_INV, &x_be);
-        let inv: FieldElement = Option::from(FieldElement::from_bytes(&inv_be.into()))?;
-        // Verify the untrusted hint: x·inv must equal 1 (mod p). Compare by asking
-        // whether the difference normalizes to zero — a value-level test that skips
-        // the two full normalizations a `to_bytes()` compare pays. `ct_eq` is NOT a
-        // substitute: k256's FieldElement compares raw limbs *and* the magnitude and
-        // `normalized` tags, so a `mul` result (magnitude 1, unnormalized) never
-        // compares equal to the normalized `ONE` constant whatever its value.
-        // `Neg` is `negate(1)`, valid here because `mul` yields magnitude 1.
-        if bool::from((*x * inv - FieldElement::ONE).normalizes_to_zero()) {
-            Some(inv)
-        } else {
-            None
-        }
+        field_inv_with_oracle(x, |x_be| {
+            get_hint(lambda_vm_syscalls::syscalls::HINT_FIELD_INV, x_be)
+        })
     }
     #[cfg(not(target_arch = "riscv64"))]
     {
         Option::from(x.invert())
     }
+}
+
+/// Core of [`field_inv`], generic over the hint source so host tests can inject an
+/// honest or a lying oracle and assert the software fallback keeps the result
+/// correct either way. See [`scalar_inv`] for the verify-then-fallback rationale.
+#[cfg(any(target_arch = "riscv64", test))]
+fn field_inv_with_oracle<O>(x: &FieldElement, hint: O) -> Option<FieldElement>
+where
+    O: FnOnce(&[u8; 32]) -> [u8; 32],
+{
+    let x_be: [u8; 32] = x.to_bytes().into();
+    let inv_be = hint(&x_be);
+    // Fast path: a canonical hint that verifies (x·inv == 1 mod p) is used as-is.
+    // Verify by asking whether the difference normalizes to zero — a value-level test
+    // that skips the two full normalizations a `to_bytes()` compare pays. `ct_eq` is
+    // NOT a substitute: k256's FieldElement compares raw limbs *and* the magnitude and
+    // `normalized` tags, so a `mul` result (magnitude 1, unnormalized) never compares
+    // equal to the normalized `ONE` constant whatever its value.
+    // `Neg` is `negate(1)`, valid here because `mul` yields magnitude 1.
+    if let Some(inv) = Option::<FieldElement>::from(FieldElement::from_bytes(&inv_be.into())) {
+        if bool::from((*x * inv - FieldElement::ONE).normalizes_to_zero()) {
+            return Some(inv);
+        }
+    }
+    // Hint absent / malformed / wrong: recompute authoritatively. `None` only for a
+    // genuine `x = 0`, excluded by the callers' guards.
+    Option::from(x.invert())
 }
 
 /// Computes `k1·P1 + k2·P2` from two affine oracle queries, or `None` if a

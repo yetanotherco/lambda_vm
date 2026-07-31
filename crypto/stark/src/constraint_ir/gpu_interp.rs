@@ -28,13 +28,13 @@ use math_cuda::lde::{GpuLdeBase, GpuLdeExt3};
 use super::device::DeviceProgram;
 use super::ir::ConstraintProgram;
 
-/// Pack the lowered node list into 2 `u64` per node (`op | a<<32`, `b | dim<<32`),
+/// Pack the lowered node list into 2 `u64` per node (`op | a<<32`, `b | res<<32`),
 /// the encoding the kernel's `load_node` decodes.
 fn pack_nodes(dev: &DeviceProgram) -> Vec<u64> {
     let mut out = Vec::with_capacity(dev.nodes.len() * 2);
     for n in &dev.nodes {
         out.push(n.op as u64 | ((n.a as u64) << 32));
-        out.push(n.b as u64 | ((n.dim as u64) << 32));
+        out.push(n.b as u64 | ((n.res as u64) << 32));
     }
     out
 }
@@ -124,22 +124,125 @@ pub struct CompositionInputs<'a, F: IsField, E: IsField> {
     /// Boundary coefficients β_b.
     pub b_beta: &'a [FieldElement<E>],
     /// Boundary zerofier inverses (base field): one `num_rows`-length vector
-    /// per boundary constraint, borrowed as-is from the evaluator — the device
-    /// layer uploads each slice into the flat `b * num_rows + row` device
-    /// buffer, so no flattened host copy is ever built.
-    pub b_z_inv: &'a [Vec<FieldElement<F>>],
+    /// per boundary constraint (constraints sharing a step share the Arc,
+    /// cached per domain) — resolved to device-resident columns via
+    /// [`bzinv_device_handles`], so nothing LDE-sized crosses PCIe per dispatch.
+    pub b_z_inv: &'a [std::sync::Arc<Vec<FieldElement<F>>>],
+}
+
+pub(crate) type GoldilocksBZInv = std::sync::Arc<Vec<FieldElement<GoldilocksField>>>;
+
+/// Device-resident boundary-zerofier columns, keyed by the host Arc
+/// allocation. The entry stores the Arc, pinning the allocation: a key can
+/// never be reused while its entry lives (entries live for the process, like
+/// the per-domain host cache that feeds them).
+#[allow(clippy::type_complexity)]
+fn bzinv_device_cache() -> &'static std::sync::Mutex<
+    std::collections::HashMap<
+        usize,
+        (
+            GoldilocksBZInv,
+            std::sync::Arc<math_cuda::constraint_interp::GpuBaseVec>,
+        ),
+    >,
+> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<
+                usize,
+                (
+                    GoldilocksBZInv,
+                    std::sync::Arc<math_cuda::constraint_interp::GpuBaseVec>,
+                ),
+            >,
+        >,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// Resolve a host base-field column to its device-resident copy, uploading
+/// once per distinct Arc. Returns `None` on upload failure (→ CPU fallback).
+pub(crate) fn base_vec_device_handle(
+    v: &GoldilocksBZInv,
+) -> Option<std::sync::Arc<math_cuda::constraint_interp::GpuBaseVec>> {
+    let key = std::sync::Arc::as_ptr(v) as usize;
+    if let Some((_, h)) = bzinv_device_cache().lock().unwrap().get(&key) {
+        return Some(h.clone());
+    }
+    // SAFETY: `F == GoldilocksField` by the type alias.
+    let raw = unsafe { base_slice_as_u64(v.as_slice()) };
+    let h = std::sync::Arc::new(math_cuda::constraint_interp::upload_base_vec(raw).ok()?);
+    bzinv_device_cache()
+        .lock()
+        .unwrap()
+        .insert(key, (v.clone(), h.clone()));
+    Some(h)
+}
+
+fn bzinv_device_handles(
+    vecs: &[GoldilocksBZInv],
+) -> Option<Vec<std::sync::Arc<math_cuda::constraint_interp::GpuBaseVec>>> {
+    vecs.iter().map(base_vec_device_handle).collect()
+}
+
+/// The program-derived half of a lowered call: the flat device blob plus its
+/// packed program uniforms. Depends only on the program content — identical
+/// across continuation epochs and table shards — so it is cached process-wide
+/// (see [`lowering_cache`]).
+struct LoweredProgram {
+    dev: DeviceProgram,
+    nodes: Vec<u64>,
+    ext_consts: Vec<u64>,
+    roots: Vec<u64>,
 }
 
 /// The lowered device program plus the packed per-proof uniforms shared by both
 /// GPU dispatch entry points. Produced by [`lower_and_pack`].
 struct LoweredCall {
-    dev: DeviceProgram,
-    nodes: Vec<u64>,
-    ext_consts: Vec<u64>,
-    roots: Vec<u64>,
+    lowered: std::sync::Arc<LoweredProgram>,
     rap: Vec<u64>,
     alpha: Vec<u64>,
     offset: Vec<u64>,
+}
+
+type GoldilocksProgram = ConstraintProgram<GoldilocksField, GoldilocksExtension>;
+
+/// Process-wide cache of lowered programs, keyed by content fingerprint. A hit
+/// must pass the full-equality check against the stored snapshot — a
+/// fingerprint collision re-lowers, never aliases another program.
+#[allow(clippy::type_complexity)]
+fn lowering_cache() -> &'static std::sync::Mutex<
+    std::collections::HashMap<u64, (GoldilocksProgram, std::sync::Arc<LoweredProgram>)>,
+> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<u64, (GoldilocksProgram, std::sync::Arc<LoweredProgram>)>,
+        >,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+fn program_fingerprint(p: &GoldilocksProgram) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    p.nodes.hash(&mut h);
+    p.dims.hash(&mut h);
+    // The const tables lack `Hash`: hash their canonical limbs.
+    // SAFETY: `p` is the concrete Goldilocks program.
+    unsafe { base_slice_as_u64(&p.base_consts) }.hash(&mut h);
+    unsafe { ext3_slice_to_u64(&p.ext_consts) }.hash(&mut h);
+    p.roots.hash(&mut h);
+    p.num_base.hash(&mut h);
+    h.finish()
+}
+
+fn program_eq(a: &GoldilocksProgram, b: &GoldilocksProgram) -> bool {
+    a.num_base == b.num_base
+        && a.roots == b.roots
+        && a.nodes == b.nodes
+        && a.dims == b.dims
+        && a.base_consts == b.base_consts
+        && a.ext_consts == b.ext_consts
 }
 
 /// The single concrete-Goldilocks lowering seam shared by
@@ -165,13 +268,36 @@ where
     // `E = Degree3GoldilocksExtensionField`; the generic program has the exact
     // layout of the concrete one (constants are `#[repr(transparent)]` over
     // `u64` / `[u64; 3]`).
-    let prog: &ConstraintProgram<GoldilocksField, GoldilocksExtension> =
-        unsafe { &*(prog as *const _ as *const _) };
+    let prog: &GoldilocksProgram = unsafe { &*(prog as *const _ as *const _) };
 
-    let dev = DeviceProgram::lower(prog);
-    let nodes = pack_nodes(&dev);
-    let ext_consts = flatten_ext3(&dev.ext_consts);
-    let roots: Vec<u64> = dev.roots.iter().map(|&r| r as u64).collect();
+    let key = program_fingerprint(prog);
+    let hit = {
+        let cache = lowering_cache().lock().unwrap();
+        match cache.get(&key) {
+            Some((snapshot, low)) if program_eq(snapshot, prog) => Some(low.clone()),
+            _ => None,
+        }
+    };
+    let lowered = match hit {
+        Some(low) => low,
+        None => {
+            let dev = DeviceProgram::lower(prog);
+            let nodes = pack_nodes(&dev);
+            let ext_consts = flatten_ext3(&dev.ext_consts);
+            let roots: Vec<u64> = dev.roots.iter().map(|&r| r as u64).collect();
+            let low = std::sync::Arc::new(LoweredProgram {
+                dev,
+                nodes,
+                ext_consts,
+                roots,
+            });
+            lowering_cache()
+                .lock()
+                .unwrap()
+                .insert(key, (prog.clone(), low.clone()));
+            low
+        }
+    };
 
     // SAFETY: `E` is the ext3 tower (gated above).
     let rap = unsafe { ext3_slice_to_u64(rap_challenges) };
@@ -179,18 +305,23 @@ where
     let offset = unsafe { ext3_slice_to_u64(std::slice::from_ref(table_offset)) };
 
     Some(LoweredCall {
-        dev,
-        nodes,
-        ext_consts,
-        roots,
+        lowered,
         rap,
         alpha,
         offset,
     })
 }
 
-/// Fused composition-poly evaluation on the GPU: returns `H(row)` as raw ext3
-/// limbs (`num_rows * 3` u64), or `None` for non-Goldilocks towers (→ CPU
+/// The result of a fused GPU composition evaluation: `H` downloaded to host
+/// (raw ext3 limbs, `num_rows * 3` u64) or kept resident on device for the
+/// on-device degree-2 decomposition.
+pub enum GpuComposition {
+    Host(Vec<u64>),
+    Dev(math_cuda::constraint_interp::GpuCompH),
+}
+
+/// Fused composition-poly evaluation on the GPU: returns `H(row)` (host or
+/// device-resident per `keep`), or `None` for non-Goldilocks towers (→ CPU
 /// fallback). `H(row) = z_inv·Σβᵢ·Cᵢ + Σ_b z_b_inv·β_b·(trace_b − value_b)`,
 /// the uniform-zerofier accumulation of `evaluator::evaluate`.
 #[allow(clippy::too_many_arguments)]
@@ -204,16 +335,14 @@ pub fn try_eval_composition_gpu<F, E>(
     next_step: usize,
     num_rows: usize,
     inputs: &CompositionInputs<F, E>,
-) -> Option<Vec<u64>>
+    keep: bool,
+) -> Option<GpuComposition>
 where
     F: IsField + 'static,
     E: IsField + 'static,
 {
     let LoweredCall {
-        dev,
-        nodes,
-        ext_consts,
-        roots,
+        lowered,
         rap,
         alpha,
         offset,
@@ -224,12 +353,12 @@ where
     let z_inv = unsafe { base_slice_to_u64(inputs.z_inv) };
     let b_value = unsafe { ext3_slice_to_u64(inputs.b_value) };
     let b_beta = unsafe { ext3_slice_to_u64(inputs.b_beta) };
-    let b_z_inv: Vec<&[u64]> = inputs
-        .b_z_inv
-        .iter()
-        // SAFETY: `F` is Goldilocks (established in `lower_and_pack`).
-        .map(|v| unsafe { base_slice_as_u64(v.as_slice()) })
-        .collect();
+    // SAFETY: `F` is Goldilocks (established in `lower_and_pack`);
+    // `Vec<FieldElement<F>>` and the concrete Vec share their layout.
+    let b_z_inv_conc: &[GoldilocksBZInv] = unsafe { &*(inputs.b_z_inv as *const _ as *const _) };
+    let b_z_inv_handles = bzinv_device_handles(b_z_inv_conc)?;
+    let b_z_inv: Vec<&math_cuda::constraint_interp::GpuBaseVec> =
+        b_z_inv_handles.iter().map(|h| h.as_ref()).collect();
     let b_col: Vec<u64> = inputs.b_col.iter().map(|&c| c as u64).collect();
     let b_is_aux: Vec<u64> = inputs.b_is_aux.iter().map(|&a| a as u64).collect();
 
@@ -243,21 +372,45 @@ where
         b_z_inv: &b_z_inv,
     };
 
-    let result = math_cuda::constraint_interp::eval_composition_on_device(
-        &nodes,
-        dev.nodes.len(),
-        &dev.base_consts,
-        &ext_consts,
-        &roots,
-        &rap,
-        &alpha,
-        &offset,
-        main,
-        aux,
-        next_step,
-        num_rows,
-        &accum,
-    );
+    let result = if keep {
+        math_cuda::constraint_interp::eval_composition_on_device_keep(
+            &lowered.nodes,
+            lowered.dev.nodes.len(),
+            lowered.dev.num_base_slots as usize,
+            lowered.dev.num_ext_slots as usize,
+            &lowered.dev.base_consts,
+            &lowered.ext_consts,
+            &lowered.roots,
+            &rap,
+            &alpha,
+            &offset,
+            main,
+            aux,
+            next_step,
+            num_rows,
+            &accum,
+        )
+        .map(GpuComposition::Dev)
+    } else {
+        math_cuda::constraint_interp::eval_composition_on_device(
+            &lowered.nodes,
+            lowered.dev.nodes.len(),
+            lowered.dev.num_base_slots as usize,
+            lowered.dev.num_ext_slots as usize,
+            &lowered.dev.base_consts,
+            &lowered.ext_consts,
+            &lowered.roots,
+            &rap,
+            &alpha,
+            &offset,
+            main,
+            aux,
+            next_step,
+            num_rows,
+            &accum,
+        )
+        .map(GpuComposition::Host)
+    };
     if result.is_ok() {
         crate::gpu_lde::GPU_COMPOSITION_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
@@ -288,21 +441,20 @@ where
     E: IsField + 'static,
 {
     let LoweredCall {
-        dev,
-        nodes,
-        ext_consts,
-        roots,
+        lowered,
         rap,
         alpha,
         offset,
     } = lower_and_pack(prog, rap_challenges, alpha_powers, table_offset)?;
 
     let result = math_cuda::constraint_interp::eval_constraints_on_device(
-        &nodes,
-        dev.nodes.len(),
-        &dev.base_consts,
-        &ext_consts,
-        &roots,
+        &lowered.nodes,
+        lowered.dev.nodes.len(),
+        lowered.dev.num_base_slots as usize,
+        lowered.dev.num_ext_slots as usize,
+        &lowered.dev.base_consts,
+        &lowered.ext_consts,
+        &lowered.roots,
         &rap,
         &alpha,
         &offset,
