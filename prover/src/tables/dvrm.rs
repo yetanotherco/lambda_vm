@@ -980,6 +980,7 @@ use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
 /// DVRM table constraints as a single-source [`ConstraintSet`]. No column
 /// configuration is needed (the DVRM layout is fixed via `cols`).
+#[derive(Clone, Copy)]
 pub struct DvrmConstraints;
 
 impl DvrmConstraints {

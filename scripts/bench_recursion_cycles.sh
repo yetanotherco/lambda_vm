@@ -15,19 +15,24 @@
 # "total verifier work for each side's own proof", not an isolated guest-code delta.
 #
 # For each ref we report two numbers, both read from one `execute --cycles` run of a
-# single measuring CLI (MEASURE_CLI) built once from the checkout this script runs in:
+# measuring CLI built FROM THAT REF (its own worktree, release `cli`):
 #   * Guest cycles  — retired instructions.
 #   * Keccak calls  — keccak-permutation accelerator ecalls (one cycle each, but each
 #                     runs a whole permutation invisibly, so it's the companion signal:
 #                     the verifier's Merkle/transcript hashing rides on this syscall).
 # The CLI also prints an Ecsm (EC scalar-mul) count, but the STARK verifier does no
 # scalar-mul, so it is structurally 0 for a recursion proof — dropped as noise, not read.
-# MEASURE_CLI's executor counts ANY ref's guest ELF correctly (it just feeds the blob
-# as private input and reads the counters), so building it once is fine — indeed
-# preferable: the SAME counter reads both refs. In CI's issue_comment flow the checkout
-# has no explicit ref, so MEASURE_CLI is built from the repo default branch (main),
-# whose `cli` has `execute --cycles` with the keccak/ecsm counters (#807); that is
-# intentional — one stable counter applied identically to both refs.
+# Each ref is measured by a CLI built from THAT SAME ref — never a single shared counter
+# built from the checkout (main, in CI's issue_comment flow). A shared main-built CLI
+# only counts guests whose syscalls main already knows; the moment a PR guest emits a
+# NEW syscall (e.g. a new accelerator ecall) the main executor aborts with
+# `UnknownSyscall(...)` and the whole cycle bench fails — even though the PR itself is
+# fine. Building the counter per ref makes each VM understand exactly its own guest's
+# syscalls, so it is robust for PRs that add OR remove a syscall in either direction —
+# mirroring the per-side build already done by scripts/bench_verify.sh. Cost: one extra
+# native release `cli` build per ref; it shares HOST_TARGET_DIR with the blob-dump build
+# when that is set, so most deps are already warm, and it fits the recursion step's
+# existing multi-build budget (two guest builds + two blob dumps already).
 #
 # Improvement convention matches scripts/bench_verify.sh:
 #   NEGATIVE Δ  =  REF_A (PR) does fewer cycles/calls  =  better.
@@ -46,35 +51,67 @@
 #            than let the guest reject the blob in-VM. Different artifact
 #            names across refs (e.g. recursion.elf vs recursion-min.elf) is
 #            expected — both verify under the SAME preset options.
-#            `blowup4-block` isn't a build preset: it's the `continuation` guest
-#            (recursion-cont-blowup4.elf) verifying a real ethrex block instead
-#            of the `empty` diagnostic program — real prover minutes per ref
-#            (see the blob cache below), not seconds.
+#            `blowup2-block`/`blowup4-block` aren't build presets: they are the
+#            `continuation` guest (recursion-cont-<blowup>.elf) verifying a real
+#            ethrex block instead of the `empty` diagnostic program — real
+#            prover minutes per ref (see the blob cache below), not seconds.
 #   Env:
-#     REBUILD=1            force rebuild of MEASURE_CLI and re-run of every ref
-#                          (guest build + blob dump + measurement); ignore caches.
+#     REBUILD=1            force rebuild of each ref's measuring CLI and re-run of every
+#                          ref (guest build + blob dump + measurement); ignore caches.
 #     SYSROOT_DIR=<path>   guest-build sysroot (default $HOME/.lambda-vm-sysroot).
-#     GUEST_TARGET_DIR=<p> share the RV64 guest build dir across ref worktrees
-#                          (reuses build-std → big speedup for the 2nd ref's guest
-#                          build). Unset = per-worktree (default, fully isolated).
+#     GUEST_TARGET_DIR=<p> base path for the RV64 guest build dir. Each ref gets its
+#                          OWN dir, `<p>_<sha8>` — NEVER one dir shared by both refs
+#                          (see the cross-ref clobbering note below). Unset =
+#                          per-worktree (cargo's default target/, also isolated).
 #     HOST_TARGET_DIR=<p>  share the host cargo target dir for the blob-dump test
 #                          build across refs. Unset = per-worktree (default).
 #     PRUNE_KEEP=<n>       cap on cached ref worktrees kept under $WORK (default 10);
 #                          older ones (+ their results/blobs/logs) are pruned at startup
 #                          to bound disk on the long-lived bench runner.
-#     BLOCK_TXS=4          PRESET=blowup4-block only: ethrex block size, reading
-#                          executor/tests/ethrex_bench_<BLOCK_TXS>.bin (only _4 committed).
-#     BLOCK_EPOCH_LOG2=21  PRESET=blowup4-block only: inner continuation epoch size.
+#     GUEST_TARGET_KEEP=<n> cap on per-ref guest target dirs kept (default 3). Separate
+#                          from PRUNE_KEEP and much tighter: these are GBs each, and only
+#                          the current run's two refs need one (3 leaves room to re-run
+#                          the same PR without a cold rebuild). See
+#                          prune_guest_target_dirs for why they need their own sweep.
+#     BLOCK_TXS=20         PRESET=blowup<N>-block only: ethrex block size. Reads
+#                          executor/tests/ethrex_bench_<BLOCK_TXS>.bin when present
+#                          (only _4 is committed) and generates any other size via
+#                          tooling/ethrex-fixtures (see resolve_block_fixture).
+#     BLOCK_EPOCH_LOG2=21  PRESET=blowup<N>-block only: inner continuation epoch size.
+#                          Smaller epochs mean MORE of them, and the whole bundle has to
+#                          fit the guest's MAX_PRIVATE_INPUT_SIZE (512 MiB), so check the
+#                          blob size if you lower it for a big block. Measured room at
+#                          the defaults: an ethrex 20-tx block is 9,073,658 cycles
+#                          (`cli execute --cycles`), so 2^21 is 5 epochs; the CI 4-tx
+#                          blob was 70.6 MB for 2 epochs, i.e. ~35 MB/epoch, putting 20
+#                          txs near 175 MB at blowup4 and ~350 MB at blowup2 — both
+#                          inside the cap. (An earlier version of this comment claimed
+#                          ~335 MB at blowup4 and that blowup2 would not fit; that was
+#                          extrapolated from the stale ~4M cycles/transfer figure in
+#                          tooling/ethrex-fixtures/README.md, which predates the
+#                          ecrecover accelerator and overstates the block by ~9x.)
 #
-# Caching: each ref's result is cached in $WORK keyed on its resolved SHA + preset + the
-# MEASURE_CLI source SHA (so a baseline and PR side are never compared across two
-# different counters). Result files are written ATOMICALLY (tmp + mv) and VALIDATED on
+# Caching: each ref's result is cached in $WORK keyed on its resolved SHA + preset. The
+# measuring CLI is built from that same SHA, so the SHA already identifies the counter (no
+# separate CLI-SHA key component). Result files are written ATOMICALLY (tmp + mv) and VALIDATED on
 # read: a truncated/partial cache is discarded and re-measured, never emitted as zeros.
 # Ref worktrees are kept (named by SHA) so a re-measure is a cargo no-op; the newest
 # PRUNE_KEEP are retained and older ones pruned. A worktree whose guest build fails
 # mid-run is removed immediately. The dumped input blob is also cached (keyed on SHA +
-# preset), so re-proving blowup4-block's real ethrex block only happens once per ref.
+# preset), so re-proving a blowup<N>-block real ethrex block only happens once per ref.
 # REBUILD=1 forces everything.
+#
+# NEVER point two refs at one guest CARGO_TARGET_DIR. Two worktrees are two distinct
+# source roots; building both into a single target dir makes cargo consider the crates
+# that did NOT change between the refs "fresh" and reuse rlibs compiled from the OTHER
+# worktree, while rebuilding the ones that did — so a build that alternates refs dies
+# with `multiple different versions of crate math in the dependency graph` naming both
+# worktrees. That is exactly how the blowup2/blowup4 regimes silently went "unavailable"
+# in CI: the FIRST preset's two builds are both first-sight and succeed, and every later
+# preset returns to an already-built worktree and fails. Hence the per-ref
+# `${GUEST_TARGET_DIR}_<sha8>` below: each source root owns its target dir, so build-std
+# is still reused across presets AND across runs (just not across refs), and a repeated
+# `make compile-recursion-elfs` for the same ref is the intended cargo no-op.
 #
 set -euo pipefail
 
@@ -90,6 +127,9 @@ REF_B="${2:-origin/main}"
 PRESET="${3:-min}"
 SYSROOT_DIR="${SYSROOT_DIR:-$HOME/.lambda-vm-sysroot}"
 PRUNE_KEEP="${PRUNE_KEEP:-10}"
+GUEST_TARGET_KEEP="${GUEST_TARGET_KEEP:-3}"
+BLOCK_TXS="${BLOCK_TXS:-20}"
+BLOCK_EPOCH_LOG2="${BLOCK_EPOCH_LOG2:-21}"
 
 ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT"
@@ -115,13 +155,82 @@ prune_worktree_cache() {
     s8="$(basename "$wt")"; s8="${s8#wt_}"
     echo "==> Pruning old ref worktree $wt (keeping newest $PRUNE_KEEP)" >&2
     git worktree remove --force "$wt" >/dev/null 2>&1 || rm -rf "$wt"
-    rm -f "$WORK"/result_"${s8}"_*.txt "$WORK"/blob_"${s8}"_*.bin \
+    rm -f "$WORK"/result_"${s8}"_*.txt "$WORK"/blob_"${s8}"_*.bin* \
           "$WORK"/build_guest_"${s8}".log "$WORK"/dump_"${s8}"*.log \
-          "$WORK"/measure_"${s8}"*.err
+          "$WORK"/measure_"${s8}"*.err "$WORK"/measure_cli_"${s8}"* \
+          "$WORK"/build_cli_"${s8}".log
+    # The per-ref guest target dir is the biggest artifact of all (build-std + the
+    # guest builds) and its name escapes the wt_* glob above, so drop it here too or
+    # the disk-bounding claim stops holding.
+    if [ -n "${GUEST_TARGET_DIR:-}" ]; then
+      rm -rf "${GUEST_TARGET_DIR}_${s8}"
+    fi
   done <<< "$stale"
   git worktree prune >/dev/null 2>&1 || true
 }
 prune_worktree_cache
+
+# The per-ref guest target dirs need their OWN sweep, not just the per-worktree removal
+# above, for two reasons. (1) They are not discoverable from the wt_* glob once their
+# worktree is gone, and the mid-run build-failure path removes a worktree IMMEDIATELY —
+# which would strand that ref's target dir forever, unreclaimable, on a long-lived
+# runner. Guest builds failing is exactly the scenario this script exists to measure, so
+# that is not a rare path. (2) They are the biggest thing here (build-std + the guest
+# builds, GBs each), and only the CURRENT run's two refs need one, so they deserve a
+# tighter cap than the worktrees (which are cheaper and worth keeping around longer for
+# checkout reuse).
+#
+# The invariant enforced is "a target dir survives only while its worktree does": a
+# worktree that vanished either aged out or died mid-build, and in both cases a clean
+# rebuild is what we want. This is self-healing — it also reclaims dirs orphaned by runs
+# that predate this sweep.
+#
+# Deliberately NOT extended to the cached blobs: an orphaned blob_<sha>_<preset>.bin is
+# keyed on the ref SHA, stays valid without its worktree, and represents real prover
+# minutes (a 20-tx continuation prove), so dropping it would throw away an expensive and
+# still-correct cache to reclaim ~300 MB.
+prune_guest_target_dirs() {
+  [ -n "${GUEST_TARGET_DIR:-}" ] || return 0
+  local d s8 stale
+  for d in "${GUEST_TARGET_DIR}"_*; do
+    [ -d "$d" ] || continue
+    s8="$(basename "$d")"; s8="${s8##*_}"
+    if [ ! -d "$WORK/wt_${s8}" ]; then
+      echo "==> Pruning orphaned guest target dir $d (no worktree $WORK/wt_${s8})" >&2
+      rm -rf "$d"
+    fi
+  done
+  # Same ls -t recency ordering as the worktree prune; names are <base>_<sha8>, so
+  # word-splitting is safe. Each dir is `touch`ed after its build, so this tracks use.
+  # shellcheck disable=SC2012
+  stale="$(ls -1dt "${GUEST_TARGET_DIR}"_* 2>/dev/null | tail -n +"$((GUEST_TARGET_KEEP + 1))" || true)"
+  [ -n "$stale" ] || return 0
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    echo "==> Pruning old guest target dir $d (keeping newest $GUEST_TARGET_KEEP)" >&2
+    rm -rf "$d"
+  done <<< "$stale"
+}
+prune_guest_target_dirs
+
+# One-time sweep of the retired single-CLI scheme's fixed-name artifacts. Before this
+# script measured per ref it built one shared counter at $WORK/measure_cli (+ its .sha
+# marker and build_measure_cli.log). Those are never written or read anymore, and their
+# fixed names escape the per-SHA prune globs above, so on the long-lived bench runner
+# they would linger forever. Drop them so the disk-bounding claim actually holds.
+rm -f "$WORK"/measure_cli "$WORK"/measure_cli.sha "$WORK"/build_measure_cli.log
+
+# Same for the retired single-shared-guest-target scheme: CI used to point
+# GUEST_TARGET_DIR at this one fixed path for BOTH refs, which is exactly what poisoned
+# every regime after the first. Nothing writes or reads it now (each ref builds into
+# ${GUEST_TARGET_DIR}_<sha8>), its name escapes the per-SHA prune globs, and it is the
+# largest thing on disk — so reclaim it once. The CACHEDIR.TAG check keeps this an
+# rm -rf of a cargo target dir and nothing else: cargo writes that file into every
+# target dir it creates.
+if [ -f "$WORK/shared_guest_target/CACHEDIR.TAG" ]; then
+  echo "==> Removing retired shared guest target dir $WORK/shared_guest_target" >&2
+  rm -rf "$WORK/shared_guest_target"
+fi
 
 echo "==> Refs"
 git fetch origin --quiet || echo "WARNING: 'git fetch origin' failed — resolving against possibly-stale local refs." >&2
@@ -137,26 +246,12 @@ if [ ! -d "$SYSROOT_DIR/lib" ]; then
   exit 1
 fi
 
-# --- 1. Build MEASURE_CLI once (release) from the checkout we run in ------------
-# `cli` on main has `execute --cycles` with the keccak/ecsm counters (#807), so the
-# checkout this script runs in builds a counter that reads any ref's guest ELF
-# correctly. In CI's issue_comment flow the checkout is the default branch (main) — a
-# single stable counter for both refs, which is exactly what we want.
-HEAD_SHA="$(git rev-parse HEAD)"
-MEASURE_CLI="$WORK/measure_cli"
-if [ "${REBUILD:-0}" = "1" ] || [ ! -x "$MEASURE_CLI" ] || \
-   [ "$(cat "$MEASURE_CLI.sha" 2>/dev/null)" != "$HEAD_SHA" ]; then
-  echo "==> Building MEASURE_CLI (cli, release) from ${HEAD_SHA:0:10} ..."
-  if ! cargo build --release -p cli >"$WORK/build_measure_cli.log" 2>&1; then
-    echo "ERROR: MEASURE_CLI build failed. Tail of $WORK/build_measure_cli.log:" >&2
-    tail -40 "$WORK/build_measure_cli.log" >&2
-    exit 1
-  fi
-  cp "$ROOT/target/release/cli" "$MEASURE_CLI"
-  echo "$HEAD_SHA" > "$MEASURE_CLI.sha"
-else
-  echo "==> Reusing cached MEASURE_CLI (${HEAD_SHA:0:10})"
-fi
+# --- 1. Measuring CLI is built PER REF (see measure_ref, step 2c2) --------------
+# There is deliberately no single shared counter built here. Each ref's guest is
+# executed by a `cli` built from that same ref's worktree, so the executor always knows
+# exactly the syscalls its own guest emits. A main-built CLI cannot run a PR guest that
+# introduces a new syscall — it aborts with `UnknownSyscall(...)` — which is precisely
+# the failure this per-ref scheme replaces.
 
 # Validate a result record (key=value lines on stdin): the three numeric keys must be
 # present and integer, and elf must be non-empty. Exit 0 iff trustworthy. Used both to
@@ -174,24 +269,68 @@ valid_result() {
     }'
 }
 
+# Resolve the ethrex block fixture for PRESET=blowup<N>-block and echo its path. Both refs
+# are handed the SAME bytes (cached in $WORK, keyed on tx count) rather than each reading
+# its own worktree copy: the fixture is the WORKLOAD, so a per-ref copy would risk
+# comparing two different blocks. Only ethrex_bench_4.bin is committed; other sizes are
+# generated by tooling/ethrex-fixtures, which is deterministic for a given
+# (n_transfers, mode) — see its README. In the CI flow scripts/bench_verify.sh has
+# already generated the 20-tx fixture into the checkout, so step 2 below hits and nothing
+# is rebuilt here. A ref that bumps the pinned ethrex rev makes these bytes undecodable
+# for that side; the blob dump then fails loudly rather than silently benching a
+# different block.
+resolve_block_fixture() {
+  local txs="$1"
+  # The checkout copy WINS over the $WORK cache whenever it exists. $WORK lives forever on
+  # the bench runner, so a cache that outranked the checkout would keep verifying an old
+  # block after the committed fixture or the generator changed — and since both sections of
+  # the comment say "ethrex <N>-tx block", one comment would silently be comparing two
+  # different workloads. scripts/bench_verify.sh generates the 20-tx fixture into the
+  # checkout earlier in the same CI job, so this is the normal path there too.
+  local committed="$ROOT/executor/tests/ethrex_bench_${txs}.bin"
+  if [ -f "$committed" ]; then
+    printf '%s\n' "$committed"
+    return 0
+  fi
+  local cached="$WORK/ethrex_bench_${txs}.bin"
+  if [ "${REBUILD:-0}" != "1" ] && [ -s "$cached" ]; then
+    printf '%s\n' "$cached"
+    return 0
+  fi
+  echo "==> Generating missing ${txs}-tx ethrex fixture (tooling/ethrex-fixtures)" >&2
+  local flog="$WORK/build_fixtures.log"
+  if ! ( cd "$ROOT/tooling/ethrex-fixtures" && cargo build --release ) >"$flog" 2>&1; then
+    echo "ERROR: ethrex-fixtures build failed. Tail of $flog:" >&2
+    tail -40 "$flog" >&2
+    exit 1
+  fi
+  if ! "$ROOT/tooling/ethrex-fixtures/target/release/ethrex-fixtures" \
+         "$txs" "$cached.tmp" distinct >>"$flog" 2>&1; then
+    echo "ERROR: ethrex-fixtures failed to generate a ${txs}-tx block. Tail of $flog:" >&2
+    tail -40 "$flog" >&2
+    exit 1
+  fi
+  mv -f "$cached.tmp" "$cached"
+  printf '%s\n' "$cached"
+}
+
 # --- 2. Per-ref: worktree + guest build + blob dump + measurement ---------------
 # Prints progress to stderr; emits the parseable result block (key=value lines) to
 # stdout so the caller can capture it.
 measure_ref() {
   local ref="$1" sha="$2" role="$3"
   local sha8="${sha:0:8}"
-  # `blowup4-block`: same cache/worktree/measure plumbing, but a real ethrex
+  # `blowup<N>-block`: same cache/worktree/measure plumbing, but a real ethrex
   # block through the continuation guest instead of the `min`/`blowup*`
-  # presets' `empty`-program blob. BLOCK_PRESET is the underlying build
-  # preset (blowup4); BLOCK_TXS/BLOCK_EPOCH_LOG2 pin the fixture and epoch
-  # size to what `make recursion-profile-block-input` proves.
+  # presets' `empty`-program blob. block_preset is the underlying build preset;
+  # BLOCK_TXS/BLOCK_EPOCH_LOG2 pin the fixture and epoch size.
   local is_block=0 block_preset=""
-  if [ "$PRESET" = "blowup4-block" ]; then
-    is_block=1
-    block_preset="blowup4"
-  fi
-  local block_txs="${BLOCK_TXS:-4}"
-  local block_epoch_log2="${BLOCK_EPOCH_LOG2:-21}"
+  case "$PRESET" in
+    blowup2-block) is_block=1; block_preset="blowup2" ;;
+    blowup4-block) is_block=1; block_preset="blowup4" ;;
+  esac
+  local block_txs="$BLOCK_TXS"
+  local block_epoch_log2="$BLOCK_EPOCH_LOG2"
 
   # Blob cache: keyed on sha + preset (+ block fixture/epoch), persists across runs.
   local blob_key="$PRESET"
@@ -199,9 +338,11 @@ measure_ref() {
     blob_key="${PRESET}_txs${block_txs}_epoch${block_epoch_log2}"
   fi
   # Key the result cache on ref SHA + blob_key (so a BLOCK_TXS/BLOCK_EPOCH_LOG2
-  # override never reuses a stale measurement) AND the MEASURE_CLI source SHA
-  # (so a baseline and PR side measured by different counters never share a result).
-  local result="$WORK/result_${sha8}_${blob_key}_m${HEAD_SHA:0:8}.txt"
+  # override never reuses a stale measurement). The counter is now built from this same
+  # ref SHA, so the SHA already identifies the counter — no separate CLI-SHA component is
+  # needed. This new key shape also naturally ignores any caches written by the old
+  # single-main-CLI scheme (which carried a `_m<head_sha>` suffix).
+  local result="$WORK/result_${sha8}_${blob_key}.txt"
   local wt="$WORK/wt_${sha8}"
 
   local blob="$WORK/blob_${sha8}_${blob_key}.bin"
@@ -214,8 +355,13 @@ measure_ref() {
     if valid_result < "$result"; then
       echo "==> [$role] Reusing cached measurement: $ref ($sha8) preset=$PRESET" >&2
       # Mark this ref as recently used so the startup prune keeps its worktree/result.
+      # The guest target dir too: it ages out under the much tighter GUEST_TARGET_KEEP, so
+      # a ref whose results are all cached would otherwise lose it and pay a cold rebuild.
       touch "$result" 2>/dev/null || true
       if [ -d "$wt" ]; then touch "$wt" 2>/dev/null || true; fi
+      if [ -n "${GUEST_TARGET_DIR:-}" ] && [ -d "${GUEST_TARGET_DIR}_${sha8}" ]; then
+        touch "${GUEST_TARGET_DIR}_${sha8}" 2>/dev/null || true
+      fi
       cat "$result"
       return 0
     fi
@@ -234,8 +380,9 @@ measure_ref() {
   touch "$wt" 2>/dev/null || true
 
   # 2a. Build the recursion guest ELF(s) (+ empty.elf inner program), and for
-  # block mode also the ethrex inner guest. GUEST_TARGET_DIR, when set, shares
-  # the RV64 build dir across ref worktrees (reuses build-std).
+  # block mode also the ethrex inner guest. GUEST_TARGET_DIR, when set, is a BASE
+  # path: this ref builds into ${GUEST_TARGET_DIR}_<sha8>, so build-std is reused
+  # across presets and across runs for the SAME ref, never across refs.
   echo "==> [$role] make compile-recursion-elfs @ $sha8 (slow the first time) ..." >&2
   local glog="$WORK/build_guest_${sha8}.log"
   local -a make_goals=(compile-recursion-elfs)
@@ -244,7 +391,7 @@ measure_ref() {
   fi
   local -a make_args=("${make_goals[@]}")
   if [ -n "${GUEST_TARGET_DIR:-}" ]; then
-    make_args+=("SHARED_TARGET_DIR=$GUEST_TARGET_DIR")
+    make_args+=("SHARED_TARGET_DIR=${GUEST_TARGET_DIR}_${sha8}")
   fi
   if ! ( cd "$wt" && SYSROOT_DIR="$SYSROOT_DIR" make "${make_args[@]}" ) >"$glog" 2>&1; then
     echo "ERROR: [$role] 'make ${make_goals[*]}' failed for $ref ($sha8). Tail of $glog:" >&2
@@ -253,7 +400,18 @@ measure_ref() {
     # poisons a later reuse. (The startup prune also caps total worktrees.)
     git worktree remove --force "$wt" >/dev/null 2>&1 || rm -rf "$wt"
     git worktree prune >/dev/null 2>&1 || true
+    # Reclaim this ref's guest target dir now rather than leaving GBs behind until the
+    # next run's prune_guest_target_dirs notices it has no worktree. Its contents are a
+    # half-finished build anyway, so a clean rebuild is what we want next time.
+    if [ -n "${GUEST_TARGET_DIR:-}" ]; then
+      rm -rf "${GUEST_TARGET_DIR}_${sha8}"
+    fi
     exit 1
+  fi
+  # Mark the target dir as recently used so prune_guest_target_dirs keeps it. Guarded on
+  # -d: a bare `touch` on a first build would create a FILE at that path and break cargo.
+  if [ -n "${GUEST_TARGET_DIR:-}" ] && [ -d "${GUEST_TARGET_DIR}_${sha8}" ]; then
+    touch "${GUEST_TARGET_DIR}_${sha8}" 2>/dev/null || true
   fi
 
   # 2b. Detect the guest ELF: block mode always wants recursion-cont-<preset>.elf;
@@ -278,6 +436,23 @@ measure_ref() {
   fi
   echo "==> [$role] guest ELF: $(basename "$guest_elf")" >&2
 
+  # The measuring CLI is now built from THIS ref (step 2c2), not from main. The old
+  # shared-from-main counter always carried the `execute --cycles` keccak/ecsm counters
+  # (#807, 7dbbb1ff), so it could measure any ref; a per-ref CLI can only if THIS ref has
+  # them. A ref predating #807 still builds a `cli` that runs, but prints no
+  # `Keccak calls:` line — the parse in step 2d would then fail late with an opaque
+  # message. Refuse up front (before the expensive blob dump), matching the other
+  # "ref predates X" guards below (which likewise grep the ref's source recursively). We
+  # search the whole cli source tree, not just main.rs, so relocating the counter println
+  # into another module doesn't trip a false rejection; the literal stays coupled to the
+  # step-2d parser (/^Keccak calls:/), so a genuine output-format change fails here AND
+  # there in lockstep. The default baseline origin/main always has #807, so normal
+  # PR-vs-main runs never hit this; it only bites a deliberately old baseline.
+  if ! grep -rq "Keccak calls:" "$wt/bin/cli/src/" 2>/dev/null; then
+    echo "ERROR: [$role] ref $ref ($sha8) predates the execute --cycles keccak/ecsm counters (#807, 7dbbb1ff): its CLI emits no 'Keccak calls:' line, so guest cycles/keccak are not measurable. Use a baseline at or after #807." >&2
+    exit 1
+  fi
+
   # 2c. Generate this ref's own input blob via its ignored dump test, unless a
   # cached blob covers this sha/preset already (need_dump=0). Refuse up front if
   # the ref predates a needed knob, instead of failing in-VM verification later.
@@ -295,14 +470,11 @@ measure_ref() {
     local -a dump_env=("RECURSION_DUMP_PRESET=${block_preset:-$PRESET}")
     if [ "$is_block" = 1 ]; then
       if ! grep -rq "RECURSION_DUMP_EPOCH_LOG2" "$wt/prover/src/tests/" 2>/dev/null; then
-        echo "ERROR: [$role] ref $ref ($sha8) predates RECURSION_DUMP_EPOCH_LOG2 — blowup4-block is not measurable for it." >&2
+        echo "ERROR: [$role] ref $ref ($sha8) predates RECURSION_DUMP_EPOCH_LOG2 — blowup<N>-block is not measurable for it." >&2
         exit 1
       fi
-      local block_fixture="$wt/executor/tests/ethrex_bench_${block_txs}.bin"
-      if [ ! -f "$block_fixture" ]; then
-        echo "ERROR: [$role] ref $ref ($sha8) is missing $block_fixture (ethrex block fixture) — blowup4-block is not measurable for it." >&2
-        exit 1
-      fi
+      local block_fixture
+      block_fixture="$(resolve_block_fixture "$block_txs")"
       dump_env+=(
         "RECURSION_DUMP_EPOCH_LOG2=$block_epoch_log2"
         "RECURSION_DUMP_INNER_ELF=$wt/executor/program_artifacts/rust/ethrex.elf"
@@ -330,15 +502,58 @@ measure_ref() {
       exit 1
     fi
     mv /tmp/recursion_input.bin "$blob"
+    # Epoch count comes from the dump test's own log line. Persist it beside the blob:
+    # a blob cache hit skips the dump entirely, so the log is not a reliable source at
+    # report time. Empty for the non-block presets, which prove monolithically.
+    awk -F': ' '/continuation epochs:/{print $NF; exit}' "$dlog" > "$blob.epochs"
   fi
-  echo "==> [$role] blob: $(wc -c <"$blob" | tr -d '[:space:]') bytes -> $blob" >&2
+  local epochs=""
+  if [ -s "$blob.epochs" ]; then
+    epochs="$(head -1 "$blob.epochs" | tr -d '[:space:]')"
+  fi
+  echo "==> [$role] blob: $(wc -c <"$blob" | tr -d '[:space:]') bytes${epochs:+, $epochs epochs} -> $blob" >&2
+
+  # 2c2. Build the measuring CLI FROM THIS REF's worktree (native release `cli`) and keep
+  # it at a per-ref stable path. This is the crux of the per-ref design: the guest ELF
+  # above may emit a syscall this ref introduced, so it must be executed by an executor
+  # built from the same ref — a CLI built from another ref (e.g. main) would abort with
+  # UnknownSyscall. Share HOST_TARGET_DIR (when set) with the blob-dump build so common
+  # native deps are already compiled, and copy the result out so a shared target dir's
+  # `cli` isn't clobbered by the other ref's build. The copy-out is ATOMIC (cp to a tmp
+  # path + mv within $WORK), so a run killed mid-copy can never leave a truncated-but-
+  # executable binary that the `[ -x ]` reuse check would then trust — matching the
+  # atomic tmp+mv used for result files below. The per-ref binary name encodes the SHA,
+  # so it doubles as its own cache (rebuilt only on REBUILD=1 or first sight).
+  local measure_cli="$WORK/measure_cli_${sha8}"
+  if [ "${REBUILD:-0}" = "1" ] || [ ! -x "$measure_cli" ]; then
+    echo "==> [$role] building measuring CLI (cli, release) @ $sha8 ..." >&2
+    local clilog="$WORK/build_cli_${sha8}.log"
+    if [ -n "${HOST_TARGET_DIR:-}" ]; then
+      if ! ( cd "$wt" && CARGO_TARGET_DIR="$HOST_TARGET_DIR" cargo build --release -p cli ) >"$clilog" 2>&1; then
+        echo "ERROR: [$role] cli build failed for $ref ($sha8). Tail of $clilog:" >&2
+        tail -40 "$clilog" >&2
+        exit 1
+      fi
+      cp "$HOST_TARGET_DIR/release/cli" "$measure_cli.tmp"
+    else
+      if ! ( cd "$wt" && cargo build --release -p cli ) >"$clilog" 2>&1; then
+        echo "ERROR: [$role] cli build failed for $ref ($sha8). Tail of $clilog:" >&2
+        tail -40 "$clilog" >&2
+        exit 1
+      fi
+      cp "$wt/target/release/cli" "$measure_cli.tmp"
+    fi
+    mv -f "$measure_cli.tmp" "$measure_cli"
+  else
+    echo "==> [$role] reusing cached measuring CLI ($measure_cli)" >&2
+  fi
 
   # 2d. Measure: one deterministic execute --cycles run. Time it (CI feasibility).
-  echo "==> [$role] measuring: $MEASURE_CLI execute $(basename "$guest_elf") --private-input <blob> --cycles" >&2
+  echo "==> [$role] measuring: $measure_cli execute $(basename "$guest_elf") --private-input <blob> --cycles" >&2
   local t0 t1 dt out
   t0=$(date +%s)
-  if ! out="$("$MEASURE_CLI" execute "$guest_elf" --private-input "$blob" --cycles 2>"$WORK/measure_${sha8}_${PRESET}.err")"; then
-    echo "ERROR: [$role] MEASURE_CLI execute failed for $ref ($sha8). Tail of stderr:" >&2
+  if ! out="$("$measure_cli" execute "$guest_elf" --private-input "$blob" --cycles 2>"$WORK/measure_${sha8}_${PRESET}.err")"; then
+    echo "ERROR: [$role] measuring-CLI execute failed for $ref ($sha8). Tail of stderr:" >&2
     tail -20 "$WORK/measure_${sha8}_${PRESET}.err" >&2
     exit 1
   fi
@@ -350,7 +565,7 @@ measure_ref() {
   # The CLI also prints an "Ecsm calls:" line; we intentionally don't read it — it is
   # structurally 0 for a recursion proof (no EC scalar-mul), so it's dropped as noise.
   if [ -z "$cyc" ] || [ -z "$kec" ]; then
-    echo "ERROR: [$role] could not parse Cycles/Keccak from MEASURE_CLI output for $ref ($sha8):" >&2
+    echo "ERROR: [$role] could not parse Cycles/Keccak from measuring-CLI output for $ref ($sha8):" >&2
     printf '%s\n' "$out" >&2
     exit 1
   fi
@@ -363,6 +578,10 @@ measure_ref() {
     printf 'keccak=%s\n' "$kec"
     printf 'wall=%s\n' "$dt"
     printf 'elf=%s\n' "$(basename "$guest_elf")"
+    # Optional: only the block presets have epochs, and caches written before this line
+    # existed have none. valid_result deliberately does not require it, so a missing
+    # value degrades to omitting the count rather than reporting a wrong one.
+    printf 'epochs=%s\n' "$epochs"
   } > "$result.tmp"
   mv -f "$result.tmp" "$result"
   cat "$result"
@@ -390,6 +609,22 @@ CYC_B="$(getv "$RES_B" cycles)"; KEC_B="$(getv "$RES_B" keccak)"
 WALL_B="$(getv "$RES_B" wall)"; ELF_B="$(getv "$RES_B" elf)"
 CYC_A="$(getv "$RES_A" cycles)"; KEC_A="$(getv "$RES_A" keccak)"
 WALL_A="$(getv "$RES_A" wall)"; ELF_A="$(getv "$RES_A" elf)"
+EPO_B="$(getv "$RES_B" epochs)"; EPO_A="$(getv "$RES_A" epochs)"
+
+# Epoch COUNT next to the epoch SIZE in the regime label: the size alone doesn't say how
+# many epochs the bundle holds, which is what drives both its size and the verifier work.
+# Show both sides when they differ — a PR that changes epoch splitting should be visible
+# here, not hidden behind one number. Empty when unknown (non-block preset, or a result
+# cached before `epochs=` existed): a missing count beats a wrong one.
+if [ -n "$EPO_A" ] && [ -n "$EPO_B" ]; then
+  if [ "$EPO_A" = "$EPO_B" ]; then
+    EPOCHS_LABEL=" ($EPO_A epochs)"
+  else
+    EPOCHS_LABEL=" (main $EPO_B / PR $EPO_A epochs)"
+  fi
+else
+  EPOCHS_LABEL=""
+fi
 
 # signed integer delta (A - B); 0 prints bare, >0 gets a leading '+'
 sd() { local d=$(( $1 - $2 )); if [ "$d" -gt 0 ]; then printf '+%d' "$d"; else printf '%d' "$d"; fi; }
@@ -409,31 +644,51 @@ mcycd() {
 }
 
 # Human label for the proof regime this preset measures, so a reader can't mistake the
-# single-query `min` number for the full 128-bit verifier cost. CI passes `min` plus
-# the full-query regimes `blowup2`/`blowup4` (see .github/workflows/bench-verify.yml).
+# single-query `min` number for the full 128-bit verifier cost. CI passes `min` (cheap
+# canary) and `blowup2-block` (the representative regime); `blowup2`/`blowup4`/
+# `blowup4-block` stay
+# available for manual runs (see .github/scripts/run_recursion_bench.sh).
 case "$PRESET" in
-  min)     REGIME="single query (blowup=2, 1 query)" ;;
-  blowup2) REGIME="128-bit (blowup=2, 219 queries — realistic base-layer)" ;;
-  blowup4) REGIME="128-bit (blowup=4, 110 queries — realistic base-layer)" ;;
-  blowup8) REGIME="128-bit (blowup=8, 73 queries)" ;;
-  blowup4-block) REGIME="128-bit (blowup=4, 110 queries) — real ethrex block, 4 transfers" ;;
+  min)     REGIME="empty program · monolithic · blowup=2, 1 query (diagnostic — NOT a real verifier cost)" ;;
+  blowup2) REGIME="empty program · monolithic · blowup=2, 219 queries (128-bit)" ;;
+  blowup4) REGIME="empty program · monolithic · blowup=4, 110 queries (128-bit)" ;;
+  blowup8) REGIME="empty program · monolithic · blowup=8, 73 queries (128-bit)" ;;
+  blowup2-block) REGIME="ethrex ${BLOCK_TXS}-tx block · continuations, epoch 2^$BLOCK_EPOCH_LOG2$EPOCHS_LABEL · blowup=2, 219 queries (128-bit)" ;;
+  blowup4-block) REGIME="ethrex ${BLOCK_TXS}-tx block · continuations, epoch 2^$BLOCK_EPOCH_LOG2$EPOCHS_LABEL · blowup=4, 110 queries (128-bit)" ;;
   *)       REGIME="$PRESET" ;;
 esac
 
 echo
-echo "=== Recursion-guest cycle comparison — $REGIME — deterministic to ~±100k cycles ==="
-echo "   REF_B (baseline) $REF_B  ${SHA_B:0:10}  guest=$ELF_B"
-echo "   REF_A (PR)       $REF_A  ${SHA_A:0:10}  guest=$ELF_A"
+# Machine anchor for the CI extractor (.github/scripts/run_recursion_bench.sh). An HTML
+# comment, so unlike the visible `=== ... ===` banner it replaces it doesn't render in the
+# PR comment — the heading below is the human entry point, matching bench_verify.sh.
+echo "<!-- recursion-cycle-report -->"
+echo "#### $REGIME"
 echo
-echo "| Metric        | REF_B (baseline) | REF_A (PR) | Δ (A-B) |"
-echo "|---------------|------------------|------------|---------|"
+# State the measurement method, because the verifier bench above this in the same PR
+# comment IS A/B/B/A with statistics and a reader will otherwise carry that framing down
+# here. Nothing on this table is averaged or interleaved.
+echo "_Single exact reading per ref — no ABBA: guest cycles are deterministic for a fixed"
+echo "(guest ELF, input blob), so there is no machine drift to cancel._"
+echo
+# Same column names as bench_verify.sh's tables (main / PR / Δ) rather than REF_B / REF_A:
+# one comment holds both, and two namings for the same two sides is just friction.
+echo "| Metric | main | PR | Δ |"
+echo "|--------|------|----|---|"
 # Guest cycles are shown in MILLIONS (one decimal); the exact integer counts are in
 # the collapsed raw block below. Keccak stays a plain integer call count.
-printf '| Guest cycles  | %s | %s | %s |\n' "$(mcyc "$CYC_B")" "$(mcyc "$CYC_A")" "$(mcycd "$CYC_A" "$CYC_B")"
-printf '| Keccak calls  | %s | %s | %s |\n' "$KEC_B" "$KEC_A" "$(sd "$KEC_A" "$KEC_B")"
-# One terse reproducibility caveat; the blank line before it ends the markdown table.
+printf '| **Guest cycles** | %s | %s | %s |\n' "$(mcyc "$CYC_B")" "$(mcyc "$CYC_A")" "$(mcycd "$CYC_A" "$CYC_B")"
+printf '| **Keccak calls** | %s | %s | %s |\n' "$KEC_B" "$KEC_A" "$(sd "$KEC_A" "$KEC_B")"
+# Which refs/guests produced the numbers, plus the reproducibility caveat. Inside a fence
+# because GitHub collapses consecutive plain lines into ONE paragraph — as bare lines these
+# ran together into an unreadable smear, and the fence also preserves the alignment.
 echo
-echo "note: cycles reproduce to ~±100k (build codegen + proof nondeterminism); treat sub-100k deltas as noise, not signal."
+echo '```'
+printf '  baseline  %s  %s  guest=%s\n' "$REF_B" "${SHA_B:0:10}" "$ELF_B"
+printf '  PR        %s  %s  guest=%s\n' "$REF_A" "${SHA_A:0:10}" "$ELF_A"
+echo "  note: cycles reproduce to ~±100k (build codegen + proof nondeterminism);"
+echo "        treat sub-100k deltas as noise, not signal."
+echo '```'
 # Exact machine-parseable counts, collapsed so they don't clutter the PR comment (the
 # table above is rounded to millions; these are the exact integers). The blank lines
 # around the fence are required for GitHub to render the code block inside <details>.
