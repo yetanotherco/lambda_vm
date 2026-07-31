@@ -84,6 +84,8 @@ That is, $#`rho_offset[x][y]` = #`rnc[x][y]` + 16 dot #`rbc[x][y][0]` + 32 dot #
 
 The following constraints ensure that `theta` captures the state after applying the first subpermutation of the round-permutation: $theta$.
 Note here that `Cxz_left` and `Cxz_right` do have to be range-checked; it cannot be assumed that this implicitly follows from @keccak:c:Dxz combined with `rotated_Cxz`'s definition.
+Both here and in the constraints for `rho`, we can represent a halfword shift by a byte amount directly with
+an arithmetic constraint, avoiding the need for an interaction with `HWSL`.
 #render_constraint_table(round_chip, config, groups: "theta")
 
 Next, we constrain that `rho` captures the state after applying subpermutation $rho$.
@@ -115,6 +117,8 @@ Lastly, the round chip contributes the following interactions to the lookup:
 - $#`rc[2]` = #`rc[4]` = #`rc[5]` = #`rc[6]` = 0$. As such, those elements need not be stored in `rc`, and need not be XORed into the state in the $iota$-step. This saves 8 columns and 4 `XOR_BYTE` interactions.
 - when executed in large volumnes, `KECCAK_RND` could benefit from having a three-way XOR lookup table. With this in place, the 80 interactions in @keccak:c:theta_cxz_start and @keccak:c:theta_cxz could be dropped.
   Likewise, 80 columns could be removed from the chip (a \~5% savings).
+- Since we don't need to strictly split `rho` into `Half`s for interactions with `HWSL`, we may be able to do a larger part of the round constant at once and reduce the need for `rbc`
+- At the cost of complicating the padding, the degree of the shift constraints in `theta` and `rho` can be reduced to 2, by omitting the dependency on the multiplicity.
 
 = Round constant lookup
 #let rc_chip = load_chip("src/keccak_rc.toml", config)
