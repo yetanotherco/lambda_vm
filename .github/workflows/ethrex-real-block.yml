@@ -1,4 +1,4 @@
-name: ethrex real block
+name: ethrex real-block fixture tests
 
 # Validation for the real-block benchmark fixture and the converter that produces
 # it. Deliberately NOT part of the required PR gate (pr_main.yaml): the fixture is a
