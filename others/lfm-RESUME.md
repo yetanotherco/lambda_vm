@@ -102,6 +102,32 @@ The machine proves and verifies, end to end, through the registry:
   as designed ("not self-enforcing"), but the design assumes a consumer who
   performs the ritual and nothing in the CLI does.
 
+## How to restart the work
+
+Both worker agents died on session limits, so this is a cold start; there is
+nothing to resume, only to re-spawn. What worked:
+
+- **One agent per leg, one worktree per agent.** Create the worktree off
+  `feat/lfm` first (`git worktree add <path> -b <branch> feat/lfm`, then
+  symlink `executor/program_artifacts` from the main checkout, or prover
+  tests fail on missing fixtures).
+- **Brief with pointers, not content**: this file, then
+  `lfm-standing-decisions.md` (binding), then the leg's own section above.
+  Tell the agent to verify ground truth (`cargo test -p lambda-vm-prover
+  --lib lfm`) before writing anything.
+- **Have them merge `feat/lfm` INTO their branch** as it moves, never the
+  other direction, and consolidate only when no agent is live.
+- **Ask for the report format** the phase used: headline, what landed, tests
+  verbatim, measurements vs prediction, deviations with reasoning,
+  surprises, falsification runs. The measurements-vs-prediction line is what
+  caught most of the errors.
+- Agents append to `lfm-agent-status.log` at slice boundaries; that log is
+  the history if a mailbox message is lost, which happened repeatedly.
+
+Two legs are ready to start immediately: the REGISTER tree derivation
+(chaining item 1 above) and the DEEP/Merkle join (item 2). They are
+independent and can run in parallel.
+
 ## How to work here
 
 `lfm-standing-decisions.md` is binding: six method rules, the
