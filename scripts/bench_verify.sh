@@ -19,17 +19,17 @@
 # in the proof — table mix, trace lengths, query count — so it is the block that
 # decides what is being measured, not the loop around it. The synthetic default is 20
 # plain transfers: ecrecover-heavy, near-empty state (9.06M cycles, 411 keccak calls,
-# 80 ecsm calls). A real block inverts that mix (147.5M cycles, 9,046 keccak, 44
+# 80 ecsm calls). A real block inverts that mix (~65.6M cycles, 10,478 keccak, 116
 # ecsm), so a verifier change can move the two differently. Both counts are for a
 # current guest ELF; they shift ~14% with ELF vintage, so pin the ELF when quoting one.
 #
 # WORKLOAD=real is therefore the honest number and WORKLOAD=synthetic the cheap one;
 # the default is cheap because the real block must be proven with continuations
-# (~13 min per side, once, then cached in $WORK) before any verify run happens.
+# (~6 min per side, once, then cached in $WORK) before any verify run happens.
 # Both sides always use the same block, so a comparison is never mixed.
 #
-# Disk: a real-block continuation bundle is ~5 GB and this script CACHES both sides'
-# proofs in $WORK, so budget ~10 GB there. The fixture itself is fetched by URL +
+# Disk: a real-block continuation bundle is ~2 GB and this script CACHES both sides'
+# proofs in $WORK, so budget ~4 GB there (more for a heavier block). The fixture itself is fetched by URL +
 # sha256 (see the Makefile); while that URL is unset, WORKLOAD=real cannot run.
 #
 # `/bench-verify` runs the synthetic default: that job already budgets 90 minutes

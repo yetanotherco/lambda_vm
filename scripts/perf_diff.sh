@@ -18,13 +18,13 @@
 #
 # Pick the workload that matches the run you are localizing, because the symbol
 # mix follows the block: the synthetic default is 20 plain transfers (9.06M cycles,
-# 411 keccak calls, 80 ecsm calls) and a real block inverts that (147.5M cycles,
-# 9,046 keccak, 44 ecsm), so a hot symbol in one need not be hot in the other.
+# 411 keccak calls, 80 ecsm calls) and a real block inverts that (~65.6M cycles,
+# 10,478 keccak, 116 ecsm), so a hot symbol in one need not be hot in the other.
 # Both counts are for a current guest ELF; they shift ~14% with ELF vintage.
 #
 # WORKLOAD=real also switches to a continuation prove (monolithic would need
-# ~700 GB at that trace length), which is ~13 min per recording — five recordings,
-# so budget over an hour, plus ~5 GB of disk per bundle.
+# ~330 GB at that trace length), which is ~6 min per recording — five recordings,
+# so budget ~30 min, plus ~2 GB of disk per bundle.
 #
 # Produces:
 #   - two perf-diff tables (recorded twice per side, interleaved B A B A —

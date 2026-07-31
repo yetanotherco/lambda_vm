@@ -9,26 +9,33 @@ they execute no contract code, touch a genesis state trie only a couple of
 levels deep, and carry no bytecode in the witness. This tool produces the
 opposite — a block that actually looks like Ethereum.
 
-Figures below are for the **current default** real block; a repoint replaces them
-(see [Adopting a different block](#adopting-a-different-block)).
+Figures below are for the **current default** real block, mainnet 25368371; a
+repoint replaces them (see [Adopting a different block](#adopting-a-different-block)).
+All are measured.
 
-| | `ethrex_bench_20.bin` (synthetic) | `ethrex_hoodi_1265656.bin` (real, default) |
+| | `ethrex_bench_20.bin` (synthetic) | `ethrex_mainnet_25368371.bin` (real, default) |
 |---|---|---|
-| gas used | 420,000 | **4,402,947** |
-| transactions | 20 (all plain transfers) | 11 (7× EIP-1559, 4× EIP-4844 blob) |
-| contract calls | 0 | 5, at ~830–955k gas each |
-| contract bytecode in witness | 0 | 22 contracts, ~124 KB |
-| state trie | 40 accounts, fresh genesis | 1,705 nodes |
-| storage keys | 0 | 422 |
-| serialized size | 32,766 B | 1,021,207 B |
-| cycles | 9,063,727 | **147,482,439** |
-| keccak / ecsm calls | 411 / 80 | **9,046** / 44 |
+| gas used | 420,000 | **2,428,684** |
+| transactions | 20 (all plain transfers) | 29 (real mix) |
+| serialized size | 32,766 B | 1,110,156 B |
+| cycles | 9,063,727 | **~65.6M** |
+| keccak / ecsm calls | 411 / 80 | **10,478** / 116 |
+| keccaks per ecrecover | 5.1 | **90** |
 
-Note it has *fewer* transactions than the synthetic fixture while being ~16x the
-work — transaction count is not the axis that matters. The crypto mix inverts too:
-the synthetic block runs ~5 keccaks per ecrecover, the real one ~206. Cycle counts
-are for a current guest ELF and move ~14% with ELF vintage; pin the ELF when quoting
-one.
+Note the real block uses only ~5.8x the gas while costing ~7.2x the cycles, and
+that it inverts the crypto mix: the synthetic block is ecrecover-bound, the real one
+keccak- and trie-bound. That inversion is the entire point — a prover change can
+move the two numbers in opposite directions.
+
+Cycle counts are for a **current guest ELF** and move ~14% with ELF vintage (this
+block reads 74,819,518 on a mid-July ELF); pin the ELF whenever you quote one.
+
+Why this block specifically: it was the **only** block in a 90-day Dune sweep that
+matched the shape constraints in the 1.6–2.6M gas band — exactly 2 heavy
+transactions, no single whale transaction dominating, and a sane plain-transfer
+share. Its composition is 11.94 tx/Mgas, 44.3% of gas in heavy transactions, 22.5%
+in the top transaction, p50 transaction gas 41,297. A block that is merely *large*
+is easy to find; one that is structurally typical is not.
 
 The synthetic column is `ethrex_bench_20.bin` as the benchmark scripts actually
 generate it — `ethrex-fixtures 20 … distinct`, i.e. 20 distinct genesis-funded
@@ -36,7 +43,7 @@ senders to 20 distinct recipients (`scripts/bench_verify.sh`,
 `scripts/bench_recursion_scaling.sh`). The same block in `same` mode (one sender,
 one recipient) serializes to 16,811 B.
 
-Block 1265656 is **verified to run on the guest's precompile surface** (see
+Block 25368371 is **verified to run on the guest's precompile surface** (see
 [Validation](#validation)); it needs no accelerator we don't have. Any
 replacement block must clear the same check — that is what makes it usable, not
 just realistic.
@@ -55,17 +62,28 @@ the same contract as `prepare-sysroot`. The file is gitignored (~1 MB; see
 `executor/.gitignore`), and a corrupt or interrupted download is discarded rather
 than left looking valid.
 
-> The URL is currently **unset**. Until the artifact is hosted, this target fails
-> with an actionable message and every consumer degrades gracefully: the benchmark
-> workflow warns and skips its real-block section, and the usability screen in
-> `.github/workflows/ethrex-real-block.yml` skips too.
+The digest of whatever is already on disk is re-checked on every invocation, not
+only when the file is missing — so a stale copy left over from a re-upload under the
+same block number, a corrupted file, or a hand-placed one is all caught and
+re-fetched. That check is the reason these are phony targets rather than file rules.
 
-This crate is *not* on that path. Fetching a verified binary is what takes the
-converter, the ~335-package ethrex host dependency tree, the ethrex-replay cache
-and the `rev` pin off the critical path of everyone who just wants to run a
-benchmark. It also decouples the block from what upstream hosts: ethrex-replay
-publishes a cache for Hoodi and nothing else, so a mainnet block is unreachable by
-the convert-locally route and trivial by this one.
+> Both URLs are currently **unset**. Until the artifacts are hosted, these targets
+> fail with an actionable message and every consumer degrades gracefully: the
+> benchmark workflow warns and skips its real-block section, and the usability
+> screen in `.github/workflows/ethrex-real-block.yml` skips too.
+
+The second artifact is the **cache** — the ethrex-replay JSON the fixture was
+converted from (`make ethrex-real-block-cache`, ~2 MB, same verify-then-move
+contract). Only the converter's tests and `regen-real-block-fixture` read it.
+
+This crate is *not* on the fixture's path. Fetching a verified binary takes the
+converter, the ~335-package ethrex host dependency tree and an ethrex-replay `rev`
+pin off the critical path of everyone who just wants to run a benchmark. It also
+decouples the block from what upstream hosts: ethrex-replay publishes a cache for
+Hoodi and nothing else, so any mainnet block is unreachable by the convert-locally
+route — producing its cache takes ~4 minutes and ~700 calls against an archive RPC —
+and trivial by this one. Hosting our own cache is what lets the converter's tests
+assert against the *same* block the benchmarks prove.
 
 ## Regenerating it (ethrex rev bumps)
 
@@ -73,14 +91,11 @@ Needed roughly twice a year, when the guest's ethrex `rev` moves and the rkyv
 layout changes with it:
 
 ```bash
-make regen-real-block-fixture     # downloads the pinned cache, rebuilds the .bin
-sha256sum executor/tests/ethrex_hoodi_1265656.bin
+make regen-real-block-fixture     # fetches the cache, rebuilds the .bin in place
+sha256sum "$(make -s print-real-block-fixture)"
 ```
 
-Then upload the result and update `ETHREX_REAL_BLOCK_FIXTURE_URL` /
-`_SHA256`. The cache URL is pinned to an ethrex-replay **commit**, not `main`
-(`ETHREX_REPLAY_REV`), matching how the guest pins ethrex — a branch ref would let
-the derivation drift under a fixed input.
+Then upload the result and update `ETHREX_REAL_BLOCK_FIXTURE_SHA256` and its URL.
 
 Directly, against any cache file:
 
@@ -92,26 +107,26 @@ cargo run --release -- <cache.json> <output_path>
 Output is deterministic for a given cache file:
 
 ```text
-ethrex_hoodi_1265656.bin
-  block:  hoodi #1265656 — 11 transactions, 4,402,947 gas
-  sha256: 1f7d4c4cdf9bd52472d9ebafdb4038f57a88c3c92d65c96fd86d7e323db87142
-  source: ethrex-replay caches/cache_hoodi_1265656.json @ 2693e018
+wrote ../../executor/tests/ethrex_mainnet_25368371.bin (1110156 bytes): 1 block(s) \
+  from mainnet starting at #25368371, 29 transaction(s), 2428684 gas
 ```
 
-That checksum is enforced, not just documented: `conversion_is_reproducible`
-asserts it. The pinned commit keeps the *input* immutable; the digest keeps the
-*derivation* honest.
+That determinism is enforced, not just documented: `conversion_is_reproducible`
+pins the block's stats **and** the fixture's sha256, so the digest keeps the
+derivation honest. Verified: regenerating from the cache reproduces
+`61eba49b…` byte for byte, which is also what proves the hosted `.bin` and the
+hosted cache describe the same block.
 
 ## What benchmarks with it
 
-Costs below are for the **current default block** (hoodi 1265656) and move with it —
-see [Measured cost of candidate blocks](#measured-cost-of-candidate-blocks).
+Costs below are for the **current default block** (mainnet 25368371) and move with
+it — see [Measured cost of candidate blocks](#measured-cost-of-candidate-blocks).
 
 | Where | How to run it | Cost (current default) |
 |---|---|---|
-| `benchmark-pr.yml` | `/bench-real` on a PR; automatic on push to main and `workflow_dispatch` | ~13 min |
-| `scripts/bench_verify.sh` | `WORKLOAD=real scripts/bench_verify.sh <ref>` | ~13 min per side, then cached |
-| `scripts/perf_diff.sh` | `WORKLOAD=real scripts/perf_diff.sh <ref>` | 5 recordings, so >1 h |
+| `benchmark-pr.yml` | `/bench-real` on a PR; automatic on push to main and `workflow_dispatch` | ~6 min |
+| `scripts/bench_verify.sh` | `WORKLOAD=real scripts/bench_verify.sh <ref>` | ~6 min per side, then cached |
+| `scripts/perf_diff.sh` | `WORKLOAD=real scripts/perf_diff.sh <ref>` | 5 recordings, so ~30 min |
 
 None of them hardcode the fixture path or a block number — they read the path from
 `make -s print-real-block-fixture` and run `make ethrex-real-block-fixture` when
@@ -120,21 +135,22 @@ the `.bin` is absent.
 **Continuations are mandatory, not a tuning choice.** Peak heap on a monolithic
 prove grows ~4.9 GB per million cycles on this workload family (measured on the
 bench server: `10,728 MB + 2,007 MB/transfer`, R² = 0.998 across 4→20 transfers),
-so a real block in the 110–150M cycle range needs **500–700 GB**. `--continuations`
-makes peak heap a function of the epoch size instead of the trace length, so the
-same block fits in **~19–21 GB** at epoch 2^21: a 15.8 GB epoch working set plus
-~69 MB per epoch of accumulated proofs. The bundle on disk is ~4–5 GB, and
-serializing it past 2 GiB needs rkyv `pointer_width_64`.
+so this block would need **~330 GB** monolithically — and a heavier candidate up to
+~700 GB. `--continuations` makes peak heap a function of the epoch size instead of
+the trace length, so the same block fits in **~18 GB** at epoch 2^21: a 15.8 GB
+epoch working set plus ~60 MB per epoch of accumulated proofs over ~32 epochs. The
+bundle on disk is ~1.9 GB; note that a heavier block pushes it past 2 GiB, which
+needs rkyv `pointer_width_64` to serialize.
 
 Plain `/bench` deliberately stays on the synthetic 20-transfer block: it proves in
-~25s against ~13 min, and one runner carries every `/bench`, `/bench-abba` and
+~25s against ~6 min, and one runner carries every `/bench`, `/bench-abba` and
 `/bench-verify` in the repo. The synthetic number is a fast screen; the real block
 is the number that means something.
 
-Cycle counts here (9.06M synthetic, 147.5M real) are for a **current guest ELF**.
-They move ~14% with ELF vintage — the same Hoodi block reads 168.3M on a
-mid-July ELF — so pin the ELF whenever you quote one, or it will look like a
-regression the next time someone measures.
+Cycle counts here (9.06M synthetic, ~65.6M real) are for a **current guest ELF**.
+They move ~14% with ELF vintage — this block reads 74,819,518 on a mid-July ELF — so
+pin the ELF whenever you quote one, or it will look like a regression the next time
+someone measures.
 
 ## Where validation runs
 
@@ -181,28 +197,36 @@ refuses instead; `unmappable_network_is_rejected` pins that.
 
 ## Adopting a different block
 
-Since the fixture is fetched rather than converted locally, the **benchmark block
-and this crate's test block are independent**. This crate stays pinned to Hoodi
-1265656 — that is the one cache ethrex-replay hosts, and `conversion_is_reproducible`
-reads it — and none of its pins move when the benchmark block changes.
+Because we host both artifacts, the converter's tests assert against the **same**
+block the benchmarks prove, so a repoint moves them together. Two files:
 
-Swapping the benchmark block is **four lines**, once the new `.bin` is hosted:
+**1. The Makefile — the only place a block number appears.** Six lines:
 
 ```make
-# Makefile — the ONLY place a block number appears
 ETHREX_REAL_BLOCK_NETWORK        := <mainnet|hoodi|sepolia>
 ETHREX_REAL_BLOCK                := <block number>
 ETHREX_REAL_BLOCK_FIXTURE_SHA256 := <sha256 of the .bin>
-ETHREX_REAL_BLOCK_FIXTURE_URL    := <where you uploaded it>
+ETHREX_REAL_BLOCK_CACHE_SHA256   := <sha256 of the cache JSON>
+ETHREX_REAL_BLOCK_FIXTURE_URL    := <where you uploaded the .bin>
+ETHREX_REAL_BLOCK_CACHE_URL      := <where you uploaded the cache>
 ```
 
-plus `REAL_BLOCK_FIXTURE` in `tooling/ethrex-tests` (which points the usability
-screen at the block actually being benchmarked). Everything else derives from the
-Makefile — the fixture name, and through `make -s print-real-block-fixture` the
-benchmark scripts and `benchmark-pr.yml`. No workflow, script or env var names a
-block. Nothing in `executor/.gitignore` needs touching either: it already ignores
-every accepted network's fixture name, so a repointed ~1 MB fixture cannot become
-committable by accident.
+**2. The test constants**, which are what prove the repoint is self-consistent:
+- `src/main.rs` — `CACHE`, `CACHE_MISSING`, the chain-ID import and assert
+  (`MAINNET_CHAIN_ID` / `HOODI_CHAIN_ID` / `SEPOLIA_CHAIN_ID` from
+  `ethrex_config::networks`), and in `conversion_is_reproducible` the
+  `first_block_number` / `transactions` / `gas_used` / digest asserts.
+- `tooling/ethrex-tests` — `REAL_BLOCK_FIXTURE`, which points the usability screen
+  at the block actually being benchmarked.
+
+Then run `make test-ethrex-real-block-converter`. It passing means the cache, the
+`.bin`, the digest and the block stats all describe one block.
+
+Everything else derives from the Makefile — the fixture name, and through
+`make -s print-real-block-fixture` the benchmark scripts and `benchmark-pr.yml`. No
+workflow, script or env var names a block. Nothing in `executor/.gitignore` needs
+touching either: it already ignores every accepted network's fixture name, so a
+repointed ~1 MB fixture cannot become committable by accident.
 
 ### Measured cost of candidate blocks
 
@@ -210,33 +234,46 @@ Cost is a property of the block, so it changes with the repoint. Cycles are give
 for a **current guest ELF**; prove time and heap are for the CPU bench runner at
 epoch 2^21, using the 5.31–5.62 s per Mcycle measured on that box.
 
-| block | cycles | prove | peak heap | fixture |
-|---|---|---|---|---|
-| hoodi 1265656 — *current default* | 147.5M | ~13 min | ~21 GB | 1,021,207 B, `1f7d4c4c…` |
-| mainnet 25453112 | ~110M | ~10 min | ~19 GB | 2,019,747 B, `0298663d…` |
+| block | gas | cycles | prove | peak heap | proof | fixture |
+|---|---|---|---|---|---|---|
+| **mainnet 25368371** — *current default* | 2.43M | **~65.6M** | **~6 min** | ~18 GB | ~1.9 GB | 1,110,156 B, `61eba49b…` |
+| mainnet 25453112 | 4.24M | ~110M | ~10 min | ~19 GB | ~3.7 GB | 2,019,747 B, `0298663d…` |
+| hoodi 1265656 | 4.40M | ~147.5M | ~13 min | ~21 GB | ~4.7 GB | 1,021,207 B, `1f7d4c4c…` |
 
-These are measurements, not estimates: the mainnet block executes in 125,932,956
-cycles on the mid-July ELF against Hoodi's 168,319,360 on the same ELF, i.e. ~25%
-**cheaper** despite being the larger fixture — cycles per gas is not constant across
-blocks. Both clear the usability screen. Further candidates are being measured; add
-a row rather than editing the wiring.
+These are measurements, not estimates. All three clear the usability screen. Add a
+row rather than editing the wiring.
 
-Hoodi is the default only because its fixture and digest already exist. Note it is
-also the only block `make regen-real-block-fixture` can rebuild: that route needs an
-ethrex-replay cache, upstream hosts Hoodi's alone, and producing another takes ~4
-minutes and ~700 calls against an archive RPC. That asymmetry is exactly why the
-fixture is fetched rather than converted.
+Two things the table shows that a gas-based estimate would have got wrong. **Cycles
+per gas is not constant** — it ranges ~26–38 across these blocks — so ranking
+candidates by gas mispredicts cost; 25453112 has *more* gas than hoodi 1265656 yet
+costs ~25% fewer cycles. And **fixture size does not track cost** either: the current
+default is the cheapest block and the middle-sized fixture.
+
+The default is the cheapest of the three, which matters because this workload sits on
+a single shared bench runner. It was also the only block in a 90-day Dune sweep
+matching the shape constraints (2 heavy transactions, no whale, sane transfer share)
+in the 1.6–2.6M gas band — so it is cheap *and* structurally typical, not cheap
+because it is degenerate.
+
+### Verifying a repoint
+
+Run **both**, in this order:
+
+```bash
+make test-ethrex-real-block-converter   # cache, .bin, digest and stats agree
+make test-ethrex                        # the block is USABLE on the guest
+```
+
+The second is not optional and the first cannot replace it: a new block is only
+usable if it needs no accelerator the guest lacks, and this crate cannot tell you
+that — its graph links a working c-kzg, so a block calling point evaluation (0x0a)
+passes here and fails in the guest. `test_ethrex_real_block_native` in
+`tooling/ethrex-tests` is the screen. See [Validation](#validation).
 
 Benchmark comparability does not survive the swap, and that is intentional rather
 than a wrinkle to work around: `benchmark-pr.yml` records which block it measured
 and refuses to diff a PR against a baseline that measured a different one, so the
 first run after a repoint reports one-sided numbers until main republishes.
-
-Then run **`make test-ethrex`**, not just this crate's tests. A new block is only
-usable if it needs no accelerator the guest lacks, and this crate cannot tell you
-that — its graph links a working c-kzg, so a block calling point evaluation (0x0a)
-passes here and fails in the guest. `test_ethrex_real_block_native` in
-`tooling/ethrex-tests` is the screen. See [Validation](#validation).
 
 ## Why the JSON and not ethrex-replay's own `.bin`
 

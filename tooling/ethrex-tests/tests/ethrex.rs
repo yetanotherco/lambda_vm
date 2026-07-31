@@ -87,7 +87,7 @@ fn test_ethrex_empty_block() {
     run_program_and_check_public_output(ELF_PATH, output.encode(), inputs);
 }
 
-const REAL_BLOCK_FIXTURE: &str = "ethrex_hoodi_1265656.bin";
+const REAL_BLOCK_FIXTURE: &str = "ethrex_mainnet_25368371.bin";
 
 /// Host-only acceptance gate for the real-block fixture produced by
 /// `tooling/ethrex-real-block` (`make ethrex-real-block-fixture`): the block is
