@@ -485,6 +485,7 @@ use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
 /// LOAD table constraints as a single-source [`ConstraintSet`]. No column
 /// configuration is needed (the LOAD layout is fixed via `cols`).
+#[derive(Clone, Copy)]
 pub struct LoadConstraints;
 
 impl LoadConstraints {

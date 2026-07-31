@@ -34,7 +34,8 @@ use math_cuda::device::backend;
 use math_cuda::lde::{GpuLdeBase, GpuLdeExt3};
 
 use stark::constraint_ir::device::{
-    DeviceProgram, OP_ALPHA_POW, OP_RAP_CHALLENGE, OP_VAR, eval_device_program, unpack_var,
+    DeviceProgram, OP_ADD, OP_ALPHA_POW, OP_EMBED, OP_MUL, OP_NEG, OP_RAP_CHALLENGE, OP_SUB,
+    OP_VAR, OPK_ALPHA, OPK_PAYLOAD_MASK, OPK_RAP, OPK_SHIFT, eval_device_program, unpack_var,
 };
 use stark::constraint_ir::{ConstraintProgram, IrBuilder};
 
@@ -119,6 +120,17 @@ fn all_ops_program() -> ConstraintProgram<Gl, Ext> {
 /// #rap challenges, #alpha powers, and the max frame offset.
 fn program_footprint(dev: &DeviceProgram) -> (usize, usize, usize, usize, usize) {
     let (mut main_cols, mut aux_cols, mut rap_len, mut alpha_len, mut max_off) = (0, 0, 0, 0, 0);
+    // Uniform leaves are propagated into operand encodings, so the RAP/alpha
+    // footprint must be read from the operands of arithmetic nodes (the
+    // root-pinned leaf-node forms are kept for completeness).
+    let scan_operand = |enc: u32, rap_len: &mut usize, alpha_len: &mut usize| {
+        let payload = (enc & OPK_PAYLOAD_MASK) as usize;
+        match enc >> OPK_SHIFT {
+            OPK_RAP => *rap_len = (*rap_len).max(payload + 1),
+            OPK_ALPHA => *alpha_len = (*alpha_len).max(payload + 1),
+            _ => {}
+        }
+    };
     for n in &dev.nodes {
         match n.op {
             OP_VAR => {
@@ -133,6 +145,11 @@ fn program_footprint(dev: &DeviceProgram) -> (usize, usize, usize, usize, usize)
             }
             OP_RAP_CHALLENGE => rap_len = rap_len.max(n.a as usize + 1),
             OP_ALPHA_POW => alpha_len = alpha_len.max(n.a as usize + 1),
+            OP_ADD | OP_SUB | OP_MUL => {
+                scan_operand(n.a, &mut rap_len, &mut alpha_len);
+                scan_operand(n.b, &mut rap_len, &mut alpha_len);
+            }
+            OP_NEG | OP_EMBED => scan_operand(n.a, &mut rap_len, &mut alpha_len),
             _ => {}
         }
     }
@@ -194,6 +211,7 @@ fn check_program(prog: &ConstraintProgram<Gl, Ext>, label: &str, seed: u64) {
     stream.synchronize().expect("sync uploads");
 
     let main = GpuLdeBase {
+        ready: None,
         buf: Arc::new(base_dev),
         m: main_cols,
         lde_size,
@@ -202,6 +220,7 @@ fn check_program(prog: &ConstraintProgram<Gl, Ext>, label: &str, seed: u64) {
         trace_rows: 0,
     };
     let aux = GpuLdeExt3 {
+        ready: None,
         buf: Arc::new(aux_dev),
         m: aux_cols,
         lde_size,
@@ -382,10 +401,10 @@ fn check_composition(prog: &ConstraintProgram<Gl, Ext>, label: &str, seed: u64) 
     let b_value: Vec<Fp3> = (0..num_boundary).map(|_| rng.fp3()).collect();
     let b_beta: Vec<Fp3> = (0..num_boundary).map(|_| rng.fp3()).collect();
     // b_z_inv: one num_rows-length vector per boundary constraint (the
-    // per-constraint shape the evaluator hands over; device layout is still
-    // b*num_rows + row).
-    let b_z_inv: Vec<Vec<Fp>> = (0..num_boundary)
-        .map(|_| (0..NUM_ROWS).map(|_| fp(rng.next_u64())).collect())
+    // per-constraint Arc-shared shape the evaluator hands over; device layout
+    // is still b*num_rows + row).
+    let b_z_inv: Vec<std::sync::Arc<Vec<Fp>>> = (0..num_boundary)
+        .map(|_| std::sync::Arc::new((0..NUM_ROWS).map(|_| fp(rng.next_u64())).collect()))
         .collect();
 
     // Upload the LDE and build handles.
@@ -409,6 +428,7 @@ fn check_composition(prog: &ConstraintProgram<Gl, Ext>, label: &str, seed: u64) 
     let aux_dev = stream.clone_htod(&aux_flat).expect("upload aux");
     stream.synchronize().expect("sync");
     let main = GpuLdeBase {
+        ready: None,
         buf: Arc::new(base_dev),
         m: main_cols,
         lde_size,
@@ -417,6 +437,7 @@ fn check_composition(prog: &ConstraintProgram<Gl, Ext>, label: &str, seed: u64) 
         trace_rows: 0,
     };
     let aux = GpuLdeExt3 {
+        ready: None,
         buf: Arc::new(aux_dev),
         m: aux_cols,
         lde_size,
@@ -432,10 +453,12 @@ fn check_composition(prog: &ConstraintProgram<Gl, Ext>, label: &str, seed: u64) 
         b_beta: &b_beta,
         b_z_inv: &b_z_inv,
     };
-    let gpu = try_eval_composition_gpu(
-        prog, &main, &aux, &rap, &alpha, &offset, NEXT_STEP, NUM_ROWS, &inputs,
-    )
-    .unwrap_or_else(|| panic!("[{label}] GPU composition path must engage"));
+    let gpu = match try_eval_composition_gpu(
+        prog, &main, &aux, &rap, &alpha, &offset, NEXT_STEP, NUM_ROWS, &inputs, false,
+    ) {
+        Some(stark::constraint_ir::gpu_interp::GpuComposition::Host(raw)) => raw,
+        _ => panic!("[{label}] GPU composition path must engage (host mode)"),
+    };
     assert_eq!(gpu.len(), NUM_ROWS * 3, "[{label}] H shape");
 
     // CPU oracle, row by row.

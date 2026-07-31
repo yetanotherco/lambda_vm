@@ -292,6 +292,7 @@ pub trait ConstraintSet<F: IsField, E: IsField>: Send + Sync {
 /// PAGE, REGISTER, the continuation GLOBAL_MEMORY / global L2G sub-tables).
 /// The framework still appends the LogUp constraints; this contributes nothing
 /// before them.
+#[derive(Clone, Copy)]
 pub struct EmptyConstraints;
 
 impl<F: IsField, E: IsField> ConstraintSet<F, E> for EmptyConstraints {
