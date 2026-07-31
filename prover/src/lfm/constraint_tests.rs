@@ -161,8 +161,10 @@ impl OodFixture {
 ///
 /// The uniforms are hinted HERE and only here. In the assembled verifier they
 /// come from `TranscriptReplay` — an arena would let a prover choose its own
-/// challenges — so this shortcut is a property of the isolated slice and is
-/// asserted against in `challenges_are_not_an_arena_in_the_assembled_verifier`.
+/// challenges — so this shortcut is a property of the isolated slice. The
+/// guard asserting it (`challenges_are_not_an_arena_in_the_assembled_verifier`)
+/// cannot exist until the assembled verifier does; it is owed as an OPEN entry
+/// in `others/lfm-assembly-obligations.md`, not by this file.
 fn differential_program(
     artifact: &ConstraintArtifact,
     an: &Analysis,

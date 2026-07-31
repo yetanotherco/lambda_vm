@@ -29,6 +29,27 @@ entry only with the verifying evidence named in it.
    owes the binding, and no binding should be invented without reading how
    production carries it across epochs.
 
+3. **Assembly must unify the five remaining two-consumer values** (deep-join
+   audit, 5e93fe6d). Each is hinted twice today — not exploitable while the
+   legs are separate programs, every one a landmine the moment they share an
+   arena. Unification means deciding the assembled program's arena layout,
+   which is assembly's call — that is WHY they were not fixed leg-side:
+   - the OOD frame values (constraint eval vs DEEP invariants, `ood_steps`);
+   - the claimed composition parts at `z` (constraint quotient vs DEEP
+     `h_sum_zpow`);
+   - `ζ` (constraint zerofier vs DEEP `row_points`/`z_pow`);
+   - the main-trace roots (Phase A absorb vs authentication root compare);
+   - the public output bytes (attestation `program_id` fold vs COMMIT-bus
+     target).
+
+4. **The challenges guard cited in comments does not exist yet.** Write
+   `challenges_are_not_an_arena_in_the_assembled_verifier` once the
+   assembled verifier exists: raw challenges (z, α, ζ, per-table forks)
+   must come from `TranscriptReplay`, never from `Instr::Hint` arena words.
+   Until then the per-slice differential programs hint them as a documented
+   shortcut (`constraint_tests.rs` `differential_program` doc comment, which
+   previously cited this guard as if it existed — corrected 2026-07-31).
+
 ## STATED DEFERRALS (safety argument given and accepted — not open debts)
 
 - **`coset_offset ≠ 3` is unexercised in the FRI leg** (reg-tree, FRI
@@ -77,7 +98,17 @@ entry only with the verifying evidence named in it.
     4 forged contributions rejected by the derivation and accepted by a
     split control, and a pass-through stub fails exactly the composition
     check + join test.
+  - Instance 3, found by the audit the L gap triggered — DISCHARGED
+    (deep-join 5e93fe6d, merged 1418e0b7): `alpha_powers` were hinted, one
+    arena word each, and `Op::AlphaPow{idx}` read them straight. Every
+    LogUp fingerprint is built from these powers, so a prover supplying
+    them independently of α chooses the fingerprints — any tuple can match
+    any other; strictly worse in degree than the L gap. Fixed by chaining
+    from the one α the challenges carry (`emit_alpha_powers`, one ExtAlu
+    per power, count = `max_bus_elements`, which is shape). Guarded by an
+    absolute rule-7-compliant test (`the_derived_uniforms_are_not_arena_words`)
+    with positive controls, both negative branches falsified independently.
   - Lesson for assembly: a hinted arena word that a differential never
     catches (because the host packs it truthfully) is exactly where this
-    class hides. Audit every remaining hinted word against the two-consumer
-    rule before assembly is called done.
+    class hides. The full audit is done (5e93fe6d): everything else either
+    discharged or in OPEN entry 3.
