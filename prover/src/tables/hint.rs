@@ -44,11 +44,14 @@
 //! `IS_BIT` on `mu` here is therefore load-bearing -- not a redundant restatement of
 //! a check some other table performs.
 //!
-//! ## Columns (37)
+//! ## Columns (41)
 //! - `timestamp[0..1]` (DWordWL): the ecall timestamp `T`
 //! - `out_addr[0..1]` (DWordWL): base address of the 32-byte output buffer
 //! - `out_bytes[0..31]`: the 32 output bytes (the hint) — **unconstrained**
 //! - `mu`: multiplicity flag (1 = real hint call, 0 = padding) — gates every bus
+//! - `selector[0..1]` (DWordWL): `a0`, bound to `x10` and range-checked `< 3`
+//! - `in_addr[0..1]` (DWordWL): `a1`, bound to `x11`; its low limb is range-checked
+//!   so the ecall's input range cannot straddle the 32-bit limb boundary
 
 use executor::vm::instruction::execution::HINT_SYSCALL_NUMBER;
 use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
@@ -57,7 +60,17 @@ use stark::trace::TraceTable;
 
 use crate::constraints::templates::emit_is_bit;
 
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable};
+use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable, alu_op};
+
+/// One past the largest valid hint selector (`a0 ∈ {0, 1, 2}` = FIELD_INV /
+/// SCALAR_INV / FIELD_SQRT). The executor rejects anything else up front, so the
+/// AIR range-checks `selector < 3` to accept exactly the same set.
+pub const HINT_SELECTOR_BOUND: u64 = 3;
+
+/// Bound the low 32-bit limb of `in_addr` must stay under so the ecall's 32-byte
+/// input range (`+0..+31`) cannot straddle the 2^32 limb boundary. Mirrors the
+/// executor's `addr_limb_ok(in_addr, 31)`: `(in_addr % 2^32) + 31 < 2^32`.
+pub const HINT_IN_ADDR_LIMB_BOUND: u64 = (1 << 32) - 31;
 
 pub mod cols {
     /// timestamp[0]: lower 32 bits of the ecall timestamp
@@ -72,8 +85,16 @@ pub mod cols {
     pub const OUT: usize = 4;
     /// multiplicity flag (1 = real hint call, 0 = padding)
     pub const MU: usize = 36;
+    /// selector[0]: lower 32 bits of `a0` (the hint id)
+    pub const SEL_0: usize = 37;
+    /// selector[1]: upper 32 bits of `a0`
+    pub const SEL_1: usize = 38;
+    /// in_addr[0]: lower 32 bits of `a1` (the input base address)
+    pub const ADDR_IN_0: usize = 39;
+    /// in_addr[1]: upper 32 bits of `a1`
+    pub const ADDR_IN_1: usize = 40;
 
-    pub const NUM_COLUMNS: usize = 37;
+    pub const NUM_COLUMNS: usize = 41;
 
     /// Column of output byte `i` (0..32).
     #[inline]
@@ -89,6 +110,10 @@ pub struct HintOperation {
     pub timestamp: u64,
     pub out_addr: u64,
     pub out_bytes: [u8; 32],
+    /// `a0` — the hint selector, bound to `x10` and range-checked `< 3`.
+    pub hint_id: u64,
+    /// `a1` — the input base address, bound to `x11` and low-limb range-checked.
+    pub in_addr: u64,
 }
 
 /// Generates the HINT trace: one row per hint-ecall call (in program order),
@@ -114,6 +139,8 @@ pub fn generate_hint_trace(
         table.set_dword_wl(row, cols::TIMESTAMP_0, op.timestamp);
         table.set_dword_wl(row, cols::ADDR_OUT_0, op.out_addr);
         table.set_bytes(row, cols::OUT, &op.out_bytes);
+        table.set_dword_wl(row, cols::SEL_0, op.hint_id);
+        table.set_dword_wl(row, cols::ADDR_IN_0, op.in_addr);
         table.set_fe(row, cols::MU, FE::one());
     }
 
@@ -186,12 +213,17 @@ fn memw_register_read(reg: u64, lo_col: usize, hi_col: usize) -> Vec<BusValue> {
 ///   at `out_addr` +0/8/16/24, timestamp `T`. Received by the MEMW table.
 /// - **`AreBytes` senders** (mult `mu`, ×16): range-check the 32 output cells.
 ///
-/// `a0` (the selector) and `a1` (the input address) are deliberately not bound: the
-/// table constrains nothing about the value, and the input read is not modelled, so
-/// neither reaches the memory argument. `a2` is the only operand that does.
+/// - **MEMW register-read senders** (mult `mu`, ×2): bind `a0` (`x10`, the selector)
+///   and `a1` (`x11`, the input address) to their register columns.
+/// - **ALU `LT` senders** (mult `mu`, ×2): assert `selector < 3` and that `in_addr`'s
+///   low limb `< 2^32 − 31`, matching the executor's up-front rejections
+///   (`HintUnknownSelector`, `HintAddressOverflow`). Without them the AIR would accept
+///   hints the executor rejects — a malicious prover could prove an execution the VM
+///   would halt on. The value stays unconstrained (the guest verifies it); this only
+///   pins the *operands* to the executor's accepted set.
 pub fn bus_interactions() -> Vec<BusInteraction> {
     let mu = || Multiplicity::Column(cols::MU);
-    let mut out = Vec::with_capacity(22);
+    let mut out = Vec::with_capacity(26);
 
     // ECALL receiver: [ts_lo, ts_hi, syscall_lo32, syscall_hi32].
     out.push(BusInteraction::receiver(
@@ -210,6 +242,60 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusId::Memw,
         mu(),
         memw_register_read(12, cols::ADDR_OUT_0, cols::ADDR_OUT_1),
+    ));
+
+    // Bind a0 (x10 = selector) and a1 (x11 = in_addr). Without these the range-checks
+    // below would constrain free columns instead of the registers the CPU held.
+    out.push(BusInteraction::sender(
+        BusId::Memw,
+        mu(),
+        memw_register_read(10, cols::SEL_0, cols::SEL_1),
+    ));
+    out.push(BusInteraction::sender(
+        BusId::Memw,
+        mu(),
+        memw_register_read(11, cols::ADDR_IN_0, cols::ADDR_IN_1),
+    ));
+
+    // ALU LT: selector < 3 (full 64-bit value), asserting the result is 1. A witness
+    // with an out-of-range selector has no matching LT row and unbalances the bus.
+    // ALU LT tuple (matching the LT table's receiver): `[lhs_lo, lhs_hi, rhs_lo,
+    // rhs_hi, op_encoding, result, 0]` — both operands are two elements (low, high
+    // 32-bit words), `op_encoding = LT` for an unsigned non-inverted compare, and
+    // `result = 1` asserts the strict inequality holds.
+    //
+    // selector < 3 (full 64-bit value: SEL_0/SEL_1).
+    out.push(BusInteraction::sender(
+        BusId::Alu,
+        mu(),
+        vec![
+            BusValue::Packed {
+                start_column: cols::SEL_0,
+                packing: Packing::DWordWL,
+            },
+            BusValue::constant(HINT_SELECTOR_BOUND),
+            BusValue::constant(0),
+            BusValue::constant(alu_op::LT as u64),
+            BusValue::constant(1),
+            BusValue::constant(0),
+        ],
+    ));
+
+    // in_addr's low limb < 2^32 - 31, matching addr_limb_ok(in_addr, 31). The lhs high
+    // word is a literal 0, so only ADDR_IN_0 (the low limb) is compared — exactly the
+    // executor's check, which ignores the high limb.
+    out.push(BusInteraction::sender(
+        BusId::Alu,
+        mu(),
+        vec![
+            packed(cols::ADDR_IN_0),
+            BusValue::constant(0),
+            BusValue::constant(HINT_IN_ADDR_LIMB_BOUND),
+            BusValue::constant(0),
+            BusValue::constant(alu_op::LT as u64),
+            BusValue::constant(1),
+            BusValue::constant(0),
+        ],
     ));
 
     // write output: 4 doublewords at out_addr + 8i (timestamp T).

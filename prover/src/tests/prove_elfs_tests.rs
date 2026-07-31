@@ -1325,6 +1325,65 @@ fn test_prove_hint_min_inconsistent_output_rejected() {
     );
 }
 
+/// Load `hint_min` and build its minimal traces (for the operand-forgery tests below).
+fn hint_min_traces() -> (Elf, Traces) {
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .to_path_buf();
+    let elf_bytes =
+        std::fs::read(workspace_root.join("executor/program_artifacts/rust/hint_min.elf"))
+            .expect("hint_min.elf not found — run `make compile-programs-rust`");
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+    let result = Executor::new(&elf, vec![])
+        .expect("Failed to create executor")
+        .run()
+        .expect("Failed to run program");
+    let traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
+    (elf, traces)
+}
+
+/// Soundness: the verifier REJECTS a HINT row whose selector is out of range.
+///
+/// The executor rejects `hint_id ∉ {0,1,2}` up front (`HintUnknownSelector`). The AIR
+/// now matches that: it binds the selector to `x10` and range-checks it `< 3`, so a
+/// witness cannot prove a hint the executor would reject. Before `a0` was bound this
+/// forgery verified. Forcing the selector to 3 (one past the valid set) unbalances both
+/// the `x10` register read and the `LT(selector, 3)` interaction.
+#[test]
+fn test_prove_hint_min_forged_selector_rejected() {
+    use crate::tables::hint::cols as hint_cols;
+    let (elf, mut traces) = hint_min_traces();
+    traces
+        .hint
+        .main_table
+        .set(0, hint_cols::SEL_0, FieldElement::<GoldilocksField>::from(3u64));
+    assert!(
+        !prove_and_verify_vm_minimal(&elf, &mut traces),
+        "Verifier must reject a hint with an out-of-range selector"
+    );
+}
+
+/// Soundness: the verifier REJECTS a HINT row whose input address would straddle the
+/// 32-bit limb boundary — the executor rejects it (`HintAddressOverflow`), and the AIR
+/// now binds `in_addr` to `x11` and range-checks its low limb `< 2^32 - 31`. Forcing
+/// the low limb to `2^32 - 1` unbalances the `x11` read and the `LT` interaction.
+#[test]
+fn test_prove_hint_min_forged_input_address_rejected() {
+    use crate::tables::hint::cols as hint_cols;
+    let (elf, mut traces) = hint_min_traces();
+    traces.hint.main_table.set(
+        0,
+        hint_cols::ADDR_IN_0,
+        FieldElement::<GoldilocksField>::from(0xFFFF_FFFFu64),
+    );
+    assert!(
+        !prove_and_verify_vm_minimal(&elf, &mut traces),
+        "Verifier must reject a hint whose input range crosses the limb boundary"
+    );
+}
+
 /// Column a bus value reads, for the structural HINT tests below.
 fn hint_bus_column(v: &stark::lookup::BusValue) -> Option<usize> {
     match v {
@@ -1368,10 +1427,16 @@ fn test_hint_binds_out_addr_to_x12() {
         .collect();
     assert_eq!(
         reads.len(),
-        1,
-        "HINT must send exactly one MEMW register read (out_addr → x12)"
+        3,
+        "HINT must send three MEMW register reads (a0 → x10, a1 → x11, a2 → x12)"
     );
-    let v = &reads[0].values;
+    // The out_addr binding is the x12 read (base address 2*12); the a0/a1 reads bind
+    // the selector and input address, checked by the range-check interactions.
+    let out_read = reads
+        .iter()
+        .find(|r| hint_bus_constant(&r.values[9]) == Some(2 * 12))
+        .expect("HINT must send a MEMW register read for x12 (out_addr)");
+    let v = &out_read.values;
 
     // CO24 read layout: old[8], is_register, base_lo, base_hi, value[8], ts_lo, ts_hi,
     // w2, w4, w8.
@@ -1414,7 +1479,7 @@ fn test_hint_binds_out_addr_to_x12() {
         "ts_hi must be the ecall timestamp (the read must occur at T)"
     );
     assert!(
-        matches!(reads[0].multiplicity, Multiplicity::Column(c) if c == hint_cols::MU),
+        matches!(out_read.multiplicity, Multiplicity::Column(c) if c == hint_cols::MU),
         "the register read must be gated by mu, like every other HINT interaction"
     );
 }
