@@ -57,6 +57,10 @@ debug-checks = []                                                    # Enables v
 parallel = ["dep:rayon", "crypto/parallel"]
 cuda = ["dep:math-cuda"]
 test-cuda-faults = ["cuda", "math-cuda/test-faults"]
+# NVTX ranges for Nsight Systems: every instruments span (prover phases,
+# per-epoch marks) becomes a named timeline range. Pulls in `instruments`
+# so the span tree exists to mirror, and `cuda` for math-cuda's bindings.
+nvtx = ["cuda", "instruments", "math-cuda/nvtx"]
 wasm = ["dep:wasm-bindgen", "dep:serde-wasm-bindgen", "dep:web-sys"]
 disk-spill = ["dep:memmap2", "dep:tempfile", "dep:libc", "crypto/disk-spill"]
 

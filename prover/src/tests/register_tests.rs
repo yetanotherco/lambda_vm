@@ -133,3 +133,43 @@ fn test_precomputed_commitment_with_fini_binds_fini() {
     // The 3-column (with-fini) commitment differs from the 2-column monolithic one.
     assert_ne!(root_a, compute_precomputed_commitment(&opts, &init));
 }
+
+/// `fini_from_final_state` must return exactly what `fini_from_trace` reads off
+/// the generated REGISTER trace, for both accessed and never-accessed
+/// registers — it is the continuation producer's trace-free replacement.
+#[test]
+fn fini_from_final_state_matches_trace() {
+    let entry_point = 0x8000_0123u64;
+    let init = register_init_from_entry_point(entry_point);
+
+    // Touch a scattered subset of word addresses (lo/hi words, x255 PC word)
+    // with distinct values; leave the rest untouched.
+    let addr_list = register_word_address_list();
+    let mut final_state = FinalRegisterStateMap::new();
+    for (k, &word_addr) in addr_list.iter().take(NUM_REGISTER_ADDRESSES).enumerate() {
+        if k % 3 == 0 {
+            final_state.insert(
+                word_addr,
+                FinalRegisterWordState {
+                    timestamp: 1000 + k as u64,
+                    value: 0xABC0_0000 | k as u32,
+                },
+            );
+        }
+    }
+
+    let trace = generate_register_trace(&final_state, &init);
+    assert_eq!(
+        fini_from_final_state(&final_state, &init),
+        fini_from_trace(&trace),
+        "trace-free FINI derivation must match the generated trace"
+    );
+
+    // Empty final state: FINI == init on every row.
+    let empty = FinalRegisterStateMap::new();
+    let trace = generate_register_trace(&empty, &init);
+    assert_eq!(
+        fini_from_final_state(&empty, &init),
+        fini_from_trace(&trace)
+    );
+}
