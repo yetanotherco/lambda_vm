@@ -75,6 +75,30 @@ That checksum is enforced, not just documented: `conversion_is_reproducible`
 asserts it. The pinned commit keeps the *input* immutable; the digest keeps the
 *derivation* honest.
 
+## What benchmarks with it
+
+| Where | How to run it | Cost |
+|---|---|---|
+| `benchmark-pr.yml` | `/bench-real` on a PR; automatic on push to main and `workflow_dispatch` | ~15 min |
+| `scripts/bench_verify.sh` | `WORKLOAD=real scripts/bench_verify.sh <ref>` | ~15 min per side, then cached |
+| `scripts/perf_diff.sh` | `WORKLOAD=real scripts/perf_diff.sh <ref>` | 5 recordings, so >1 h |
+
+None of them hardcode the fixture path — they read it from
+`make -s print-real-block-fixture` and run `make ethrex-real-block-fixture` when
+the (gitignored) `.bin` is absent.
+
+**Continuations are mandatory, not a tuning choice.** Peak heap on a monolithic
+prove grows ~3.1 GB per million cycles on this workload family (measured on the
+bench server: 2007 MB per transfer at R² = 0.998 across 4→20 transfers), and the
+real block is 168.3M cycles — roughly 500 GB. `--continuations` makes peak heap a
+function of the epoch size instead of the trace length, so the same block fits in
+~16 GB at epoch 2^21.
+
+Plain `/bench` deliberately stays on the synthetic 20-transfer block: it proves in
+~25s against ~15 min, and the bench runner is single and serialized across all PRs.
+The synthetic number is a fast screen; the real block is the number that means
+something.
+
 ## Getting a cache for a different block
 
 The cache format is `ethrex-replay`'s, so use that tool to produce one — it
@@ -98,9 +122,36 @@ witness is only ever validated against whichever config we chose. The converter
 refuses instead; `unmappable_network_is_rejected` pins that.
 
 Then point this tool at the resulting JSON. Adopting a different block as the
-default is an edit, not a flag: `ETHREX_REAL_BLOCK` and `ETHREX_REPLAY_REV` in the
-Makefile, the `hoodi` in the cache URL, `CACHE` and the assertions in
-`src/main.rs`, and `REAL_BLOCK_FIXTURE` in `tooling/ethrex-tests`.
+default is an edit, not a flag. Three of the four edits are the block's identity;
+the fourth is the digest that proves the conversion still matches.
+
+**1. The Makefile — this is what moves every benchmark.** Two lines:
+
+```make
+ETHREX_REAL_BLOCK_NETWORK := hoodi      # -> mainnet
+ETHREX_REAL_BLOCK         := 1265656    # -> 25453112
+```
+
+Everything downstream is derived from them: the cache path, the download URL, the
+fixture name, and — through `make -s print-real-block-fixture` — the benchmark
+scripts and `benchmark-pr.yml`. Nothing else names the block. Re-pin
+`ETHREX_REPLAY_REV` in the same edit if the new cache landed in a later commit.
+
+**2. `src/main.rs`** — `CACHE` and the block assertions in
+`conversion_is_reproducible`, including the **sha256**. The digest cannot be
+guessed: run `make ethrex-real-block-fixture`, take the printed `sha256:` line,
+and paste it in. That is the check that keeps the derivation honest.
+
+**3. `tooling/ethrex-tests`** — `REAL_BLOCK_FIXTURE`.
+
+**4. Nothing in `executor/.gitignore`** — it already ignores every accepted
+network's fixture name, so a repointed ~1 MB fixture cannot become committable by
+accident.
+
+Benchmark comparability does not survive the swap, and that is intentional rather
+than a wrinkle to work around: `benchmark-pr.yml` records which block it measured
+and refuses to diff a PR against a baseline that measured a different one, so the
+first run after a repoint reports one-sided numbers until main republishes.
 
 Then run **`make test-ethrex`**, not just this crate's tests. A new block is only
 usable if it needs no accelerator the guest lacks, and this crate cannot tell you

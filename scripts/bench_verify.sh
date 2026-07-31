@@ -11,6 +11,25 @@
 #        own proof (required when REF_A changes the proof format); 0 = force one
 #        shared proof (best precision); auto = share if the PR binary can verify the
 #        baseline's proof, else fall back to per-side.
+#        WORKLOAD=synthetic|real (default synthetic): which block the proof under
+#        test is built from. See "Workload" below.
+#        EPOCH_SIZE_LOG2=<n> (default 21): continuation epoch size, WORKLOAD=real only.
+#
+# Workload. What this script measures is VERIFY cost, and verify cost is structural
+# in the proof — table mix, trace lengths, query count — so it is the block that
+# decides what is being measured, not the loop around it. The synthetic 20-transfer
+# default is 20 plain transfers: ecrecover-heavy, near-empty state (measured: 14.2M
+# cycles, 411 keccak calls, 80 ecsm calls). A real block inverts that mix (168.3M
+# cycles, 9,046 keccak, 44 ecsm), so a verifier change can move the two differently.
+#
+# WORKLOAD=real is therefore the honest number and WORKLOAD=synthetic the cheap one;
+# the default is cheap because the real block must be proven with continuations
+# (~15 min per side, once, then cached in $WORK) before any verify run happens.
+# Both sides always use the same block, so a comparison is never mixed.
+#
+# `/bench-verify` runs the synthetic default: that job already budgets 90 minutes
+# for the verifier bench plus a 70-minute recursion step, and two real-block proves
+# do not fit under the cap. Run WORKLOAD=real by hand on the bench server.
 
 set -euo pipefail
 
@@ -23,9 +42,16 @@ REF_A="$1"
 REF_B="${2:-origin/main}"
 N_PAIRS="${3:-20}"
 BENCH_FEATURES="${BENCH_FEATURES:-jemalloc-stats}"
+WORKLOAD="${WORKLOAD:-synthetic}"
+EPOCH_SIZE_LOG2="${EPOCH_SIZE_LOG2:-21}"
+case "$WORKLOAD" in
+  synthetic|real) ;;
+  *) echo "ERROR: WORKLOAD must be 'synthetic' or 'real' (got '$WORKLOAD')." >&2; exit 2 ;;
+esac
 
 ELF_REL="executor/program_artifacts/rust/ethrex.elf"
-INPUT_REL="executor/tests/ethrex_bench_20.bin"
+# Resolved after the cd to the repo root (WORKLOAD=real reads it from the Makefile).
+INPUT_REL=""
 WORK="/tmp/verify_run"
 WT="/tmp/verify_wt"
 PROOF_B="$WORK/proof_b.bin"   # baseline's proof (cached in $WORK, keyed like the binaries)
@@ -48,6 +74,18 @@ if [ $((N_PAIRS % 2)) -ne 0 ]; then
 fi
 echo "   pairs=$N_PAIRS  (=$((N_PAIRS * 2)) verify runs)"
 
+# The real block's name lives in the Makefile and nowhere else, so repointing the
+# benchmark to a different block never needs an edit here.
+if [ "$WORKLOAD" = "real" ]; then
+  INPUT_REL="$(make -s print-real-block-fixture)"
+  CONT_ARGS="--continuations --epoch-size-log2 $EPOCH_SIZE_LOG2"
+  echo "   workload=real  $INPUT_REL  (continuations, epoch 2^$EPOCH_SIZE_LOG2)"
+else
+  INPUT_REL="executor/tests/ethrex_bench_20.bin"
+  CONT_ARGS=""
+  echo "   workload=synthetic  $INPUT_REL  (set WORKLOAD=real for a real block)"
+fi
+
 mkdir -p "$WORK"
 
 # --- 1. Guest ELF + fixture (identical for both sides; build once if missing) ---
@@ -57,9 +95,16 @@ if [ ! -f "$ELF_REL" ]; then
   make "$ELF_REL"
 fi
 if [ ! -f "$INPUT_REL" ]; then
-  echo "==> Generating ethrex 20-transfer fixture (missing)"
-  ( cd tooling/ethrex-fixtures && cargo build --release )
-  tooling/ethrex-fixtures/target/release/ethrex-fixtures 20 "$INPUT_REL" distinct
+  if [ "$WORKLOAD" = "real" ]; then
+    # ~1 MB and gitignored, so it is never in a fresh checkout. Cold runs also
+    # download a ~1.5 MB ethrex-replay cache (pinned rev, so the input can't drift).
+    echo "==> Generating ethrex real-block fixture (missing; downloads a cache on a cold run)"
+    make ethrex-real-block-fixture
+  else
+    echo "==> Generating ethrex 20-transfer fixture (missing)"
+    ( cd tooling/ethrex-fixtures && cargo build --release )
+    tooling/ethrex-fixtures/target/release/ethrex-fixtures 20 "$INPUT_REL" distinct
+  fi
 fi
 ELF="$(cd "$(dirname "$ELF_REL")" && pwd)/$(basename "$ELF_REL")"
 INPUT="$(cd "$(dirname "$INPUT_REL")" && pwd)/$(basename "$INPUT_REL")"
@@ -107,8 +152,16 @@ fi
 # per-side proofs (each binary proves and verifies its own). PROVE_PER_SIDE overrides.
 PROVE_PER_SIDE="${PROVE_PER_SIDE:-auto}"
 
+# $CONT_ARGS is empty for the synthetic workload, so both paths below are the
+# original command there. WORKLOAD=real adds --continuations on BOTH prove and
+# verify: a continuation bundle is a different proof type, and `verify` without
+# the flag would try to deserialize it as a monolithic proof and fail.
+VERIFY_ARGS=""
+if [ "$WORKLOAD" = "real" ]; then VERIFY_ARGS="--continuations"; fi
+
 prove_once() {  # $1=binary $2=proof-path
-  if ! "$1" prove "$ELF" --private-input "$INPUT" -o "$2" --time >"$WORK/prove_$(basename "$2").log" 2>&1; then
+  # shellcheck disable=SC2086  # CONT_ARGS is a deliberate multi-word flag list
+  if ! "$1" prove "$ELF" --private-input "$INPUT" $CONT_ARGS -o "$2" --time >"$WORK/prove_$(basename "$2").log" 2>&1; then
     echo "ERROR: prove failed for $1. Tail of log:" >&2
     tail -20 "$WORK/prove_$(basename "$2").log" >&2
     exit 1
@@ -116,7 +169,8 @@ prove_once() {  # $1=binary $2=proof-path
 }
 verify_time() {  # $1=binary $2=proof-path -> echoes time on success, empty on failure (never exits)
   local out
-  out="$("$1" verify "$2" "$ELF" --time 2>&1)" || true
+  # shellcheck disable=SC2086
+  out="$("$1" verify "$2" "$ELF" $VERIFY_ARGS --time 2>&1)" || true
   printf '%s\n' "$out" | grep -o 'Verification time: [0-9.]*' | awk '{print $3}' || true
 }
 run_verify() {  # $1=binary $2=proof-path -> echoes verification time (s), exits on failure
@@ -124,7 +178,8 @@ run_verify() {  # $1=binary $2=proof-path -> echoes verification time (s), exits
   t="$(verify_time "$1" "$2")"
   if [ -z "$t" ]; then
     echo "ERROR: could not parse 'Verification time' from '$1 verify $2':" >&2
-    "$1" verify "$2" "$ELF" --time >&2 2>&1 || true
+    # shellcheck disable=SC2086
+    "$1" verify "$2" "$ELF" $VERIFY_ARGS --time >&2 2>&1 || true
     echo "HINT: if REF_A changes the proof format, run with PROVE_PER_SIDE=1." >&2
     exit 1
   fi
@@ -133,13 +188,15 @@ run_verify() {  # $1=binary $2=proof-path -> echoes verification time (s), exits
 
 # Both sides prove their own proof (needed for the proof-size row; per-side verify
 # needs both). Proofs are cached in $WORK like the binaries, marker
-# "<sha> <features> <ELF+input hash>". Bytes are non-deterministic (parallel grinding)
-# but size + verify cost are structural, so reusing a cached proof is valid. The prove
-# call passes no proof-option flags; if it ever gains one (--blowup, ...), add it to the marker.
+# "<sha> <features> <ELF+input hash> <prove flags>". Bytes are non-deterministic
+# (parallel grinding) but size + verify cost are structural, so reusing a cached proof
+# is valid. $CONT_ARGS is in the marker because it changes the proof TYPE, and without
+# it a WORKLOAD switch would silently reuse the other workload's proof; keep adding any
+# future proof-option flag (--blowup, ...) the same way.
 sha256_of() { if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi; }
 PROOF_KEY_INPUT="$(cat "$ELF" "$INPUT" | sha256_of | cut -c1-16)"
 prove_cached() {  # $1=binary $2=proof-path $3=sha
-  local marker="$3 $BENCH_FEATURES $PROOF_KEY_INPUT"
+  local marker="$3 $BENCH_FEATURES $PROOF_KEY_INPUT $CONT_ARGS"
   if [ "${REBUILD:-0}" != "1" ] && [ -f "$2" ] && [ "$(cat "$2.sha" 2>/dev/null)" = "$marker" ]; then
     echo "==> Reusing cached proof for ${3:0:10} ($(basename "$2"))"
   else
@@ -166,7 +223,8 @@ per_side_note=""
 case "$PROVE_PER_SIDE" in
   1) per_side=1; per_side_note="forced via PROVE_PER_SIDE=1" ;;
   0) per_side=0 ;;
-  *)  probe="$("$WORK/cli_A" verify "$PROOF_B" "$ELF" --time 2>&1 || true)"
+  *)  # shellcheck disable=SC2086
+      probe="$("$WORK/cli_A" verify "$PROOF_B" "$ELF" $VERIFY_ARGS --time 2>&1 || true)"
       if printf '%s\n' "$probe" | grep -q 'Verification time'; then
         per_side=0                                     # PR verifies main's proof -> shared
       elif printf '%s\n' "$probe" | grep -q 'Failed to deserialize'; then
@@ -208,7 +266,13 @@ done
 # Proofs are kept in $WORK as a cache (invalidated by their .sha markers), not deleted.
 
 # --- 4. Paired t-test + robust median/Wilcoxon (same stats as bench_abba.sh) ---
-SIZE_A="$SIZE_A" SIZE_B="$SIZE_B" MODE="$MODE" PER_SIDE_NOTE="$per_side_note" python3 - "$WORK/pairs.csv" <<'PY'
+if [ "$WORKLOAD" = "real" ]; then
+  WORKLOAD_LABEL="real block \`$(basename "$INPUT_REL")\` · continuations · epoch 2^$EPOCH_SIZE_LOG2"
+else
+  WORKLOAD_LABEL="synthetic ethrex 20 transfers (set WORKLOAD=real for a real block)"
+fi
+SIZE_A="$SIZE_A" SIZE_B="$SIZE_B" MODE="$MODE" PER_SIDE_NOTE="$per_side_note" \
+WORKLOAD_LABEL="$WORKLOAD_LABEL" python3 - "$WORK/pairs.csv" <<'PY'
 import sys, csv, math, os
 
 rows = list(csv.DictReader(open(sys.argv[1])))
@@ -296,6 +360,9 @@ mode = os.environ.get('MODE', 'shared')
 per_side_note = os.environ.get('PER_SIDE_NOTE', '')
 
 print("\n=== Verify ABBA result ===")
+# A verify time is only interpretable against the block that produced the proof,
+# and these results get pasted into PRs, so the workload travels with the number.
+print(f"<sub>Workload: {os.environ.get('WORKLOAD_LABEL', 'unknown')}</sub>")
 print()
 
 # Proof size row: exact (the .bin byte size), no ABBA. - = PR smaller = better.

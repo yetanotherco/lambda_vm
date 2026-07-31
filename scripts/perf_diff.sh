@@ -13,6 +13,17 @@
 #
 # USAGE (on the bench server):
 #   scripts/perf_diff.sh REF_A [REF_B=origin/main]
+#   Env: WORKLOAD=synthetic|real (default synthetic) picks the block to profile;
+#        EPOCH_SIZE_LOG2=<n> (default 21) sizes the epoch, WORKLOAD=real only.
+#
+# Pick the workload that matches the run you are localizing, because the symbol
+# mix follows the block: the synthetic default is 20 plain transfers (measured:
+# 14.2M cycles, 411 keccak calls, 80 ecsm calls) and a real block inverts that
+# (168.3M cycles, 9,046 keccak, 44 ecsm), so a hot symbol in one need not be hot
+# in the other. WORKLOAD=real also switches to a continuation prove (monolithic
+# would need ~500 GB at that trace length), which is ~15 min per recording — five
+# recordings, so budget over an hour.
+#
 # Produces:
 #   - two perf-diff tables (recorded twice per side, interleaved B A B A —
 #     symbols whose delta repeats across both tables are real, one-off
@@ -29,9 +40,14 @@ if [ $# -lt 1 ]; then
 fi
 REF_A="$1"
 REF_B="${2:-origin/main}"
+WORKLOAD="${WORKLOAD:-synthetic}"
+EPOCH_SIZE_LOG2="${EPOCH_SIZE_LOG2:-21}"
+case "$WORKLOAD" in
+  synthetic|real) ;;
+  *) echo "ERROR: WORKLOAD must be 'synthetic' or 'real' (got '$WORKLOAD')." >&2; exit 2 ;;
+esac
 
 ELF_REL="executor/program_artifacts/rust/ethrex.elf"
-INPUT_REL="executor/tests/ethrex_bench_20.bin"
 WORK="/tmp/perf_diff"
 WT="/tmp/perf_diff_wt"
 PROOF="/tmp/perf_diff_proof.bin"
@@ -39,9 +55,30 @@ PROOF="/tmp/perf_diff_proof.bin"
 ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT"
 
+# The real block's name lives in the Makefile and nowhere else, so repointing the
+# benchmark to a different block never needs an edit here.
+if [ "$WORKLOAD" = "real" ]; then
+  INPUT_REL="$(make -s print-real-block-fixture)"
+  CONT_ARGS="--continuations --epoch-size-log2 $EPOCH_SIZE_LOG2"
+else
+  INPUT_REL="executor/tests/ethrex_bench_20.bin"
+  CONT_ARGS=""
+fi
+
 command -v perf >/dev/null 2>&1 || { echo "ERROR: perf not installed (linux-tools)." >&2; exit 1; }
 [ -f "$ELF_REL" ] || { echo "ERROR: missing $ELF_REL — run bench_abba.sh once (it builds the guest)." >&2; exit 1; }
-[ -f "$INPUT_REL" ] || { echo "ERROR: missing $INPUT_REL — run bench_abba.sh once (it builds the fixture)." >&2; exit 1; }
+if [ ! -f "$INPUT_REL" ]; then
+  if [ "$WORKLOAD" = "real" ]; then
+    # ~1 MB and gitignored, so it is never in a fresh checkout; generate rather than
+    # abort. A cold run also downloads a ~1.5 MB ethrex-replay cache (pinned rev).
+    echo "==> Generating ethrex real-block fixture (missing; downloads a cache on a cold run)"
+    make ethrex-real-block-fixture
+  else
+    echo "ERROR: missing $INPUT_REL — run bench_abba.sh once (it builds the fixture)." >&2
+    exit 1
+  fi
+fi
+echo "==> Workload: $WORKLOAD ($INPUT_REL${CONT_ARGS:+, continuations epoch 2^$EPOCH_SIZE_LOG2})"
 
 echo "==> Refs"
 git fetch origin --quiet || echo "WARNING: 'git fetch origin' failed -- resolving against possibly-stale local refs." >&2
@@ -86,14 +123,16 @@ fi
 
 # --- Record: warmup, then B A B A (interleaved so drift hits both sides) ---
 record() { # $1=binary $2=out.data
+  # shellcheck disable=SC2086  # CONT_ARGS is a deliberate multi-word flag list (empty when synthetic)
   perf record -F 599 -o "$WORK/$2" -- \
-    "$WORK/$1" prove "$ELF_REL" --private-input "$INPUT_REL" -o "$PROOF" --time \
+    "$WORK/$1" prove "$ELF_REL" --private-input "$INPUT_REL" $CONT_ARGS -o "$PROOF" --time \
     >"$WORK/$2.log" 2>&1
   rm -f "$PROOF"
   grep -o 'Proving time: [0-9.]*' "$WORK/$2.log" || true
 }
 echo "==> Warmup (B, not recorded)"
-"$WORK/cli_B" prove "$ELF_REL" --private-input "$INPUT_REL" -o "$PROOF" --time >/dev/null 2>&1
+# shellcheck disable=SC2086
+"$WORK/cli_B" prove "$ELF_REL" --private-input "$INPUT_REL" $CONT_ARGS -o "$PROOF" --time >/dev/null 2>&1
 rm -f "$PROOF"
 echo "==> Recording B (main), run 1";  record cli_B B1.data
 echo "==> Recording A (PR),   run 1";  record cli_A A1.data

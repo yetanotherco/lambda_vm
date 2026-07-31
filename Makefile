@@ -6,7 +6,8 @@ test-profile-recursion-block recursion-profile-block-input \
 test-fast test-prover test-prover-all test-prover-debug test-disk-spill test-math-cuda test-cuda-integration test-cuda-fallback \
 test-prover-cuda test-prover-comprehensive-cuda \
 bench-math-cuda bench-prover bench-prover-cuda build check clippy fmt lint regen-ethrex-fixtures \
-update-ethrex-fixture-checksums check-ethrex-fixture-checksums ethrex-real-block-fixture
+update-ethrex-fixture-checksums check-ethrex-fixture-checksums ethrex-real-block-fixture \
+print-real-block-fixture
 
 UNAME := $(shell uname)
 
@@ -279,13 +280,23 @@ test-rust: compile-programs-rust
 # The source is ethrex-replay's cache JSON, not that tool's own rkyv output:
 # ethrex-replay tracks ethrex `main`, where `ProgramInput` has diverged from the
 # rev our guest pins, so only the JSON is safe to read across the two.
+#
+# Which block the benchmarks run is these TWO lines and nothing else: every path
+# below (cache file, download URL, fixture name) is derived from them, and the
+# benchmark scripts / CI resolve the fixture through `make -s print-real-block-fixture`
+# rather than spelling it out. Repointing to, say, mainnet 25453112 is
+# `ETHREX_REAL_BLOCK_NETWORK := mainnet` + the new number + a matching
+# `ETHREX_REPLAY_REV`, then the test-side pins listed in
+# tooling/ethrex-real-block/README.md ("Getting a cache for a different block").
+ETHREX_REAL_BLOCK_NETWORK := hoodi
 ETHREX_REAL_BLOCK := 1265656
 # Pinned by immutable `rev`, as the guest pins ethrex itself: a branch ref would
 # let the benchmark's input change under a fixed fixture name, silently breaking
 # comparability across runs. Re-pin deliberately when adopting a new block.
 ETHREX_REPLAY_REV := 2693e0182a8734117151d8ea2891eda5afc60383
-ETHREX_REAL_BLOCK_CACHE := tooling/ethrex-real-block/caches/cache_hoodi_$(ETHREX_REAL_BLOCK).json
-ETHREX_REAL_BLOCK_FIXTURE := executor/tests/ethrex_hoodi_$(ETHREX_REAL_BLOCK).bin
+ETHREX_REAL_BLOCK_ID := $(ETHREX_REAL_BLOCK_NETWORK)_$(ETHREX_REAL_BLOCK)
+ETHREX_REAL_BLOCK_CACHE := tooling/ethrex-real-block/caches/cache_$(ETHREX_REAL_BLOCK_ID).json
+ETHREX_REAL_BLOCK_FIXTURE := executor/tests/ethrex_$(ETHREX_REAL_BLOCK_ID).bin
 # The cache filename is keyed on the block number only, and its download rule has
 # no other prerequisite, so make would treat an already-present cache as up to
 # date across an `ETHREX_REPLAY_REV` bump and silently keep converting the old
@@ -297,6 +308,13 @@ ETHREX_REPLAY_REV_STAMP := tooling/ethrex-real-block/caches/.replay-rev-$(ETHREX
 
 ethrex-real-block-fixture: $(ETHREX_REAL_BLOCK_FIXTURE)
 
+# Single source of truth for the benchmark tooling. scripts/bench_verify.sh,
+# scripts/perf_diff.sh and .github/workflows/benchmark-pr.yml read the fixture
+# path from here instead of hardcoding it, so repointing the block above moves
+# every benchmark at once. `-s` on the caller's side keeps the output clean.
+print-real-block-fixture:
+	@echo $(ETHREX_REAL_BLOCK_FIXTURE)
+
 $(ETHREX_REPLAY_REV_STAMP):
 	mkdir -p $(dir $@)
 	rm -f $(ETHREX_REAL_BLOCK_CACHE) $(dir $@).replay-rev-*
@@ -305,7 +323,7 @@ $(ETHREX_REPLAY_REV_STAMP):
 $(ETHREX_REAL_BLOCK_CACHE): $(ETHREX_REPLAY_REV_STAMP)
 	mkdir -p $(dir $@)
 	curl -fsSL --retry 3 --retry-delay 2 --retry-all-errors -o $@.tmp \
-		https://raw.githubusercontent.com/lambdaclass/ethrex-replay/$(ETHREX_REPLAY_REV)/caches/cache_hoodi_$(ETHREX_REAL_BLOCK).json
+		https://raw.githubusercontent.com/lambdaclass/ethrex-replay/$(ETHREX_REPLAY_REV)/caches/cache_$(ETHREX_REAL_BLOCK_ID).json
 	mv $@.tmp $@
 
 $(ETHREX_REAL_BLOCK_FIXTURE): $(ETHREX_REAL_BLOCK_CACHE) tooling/ethrex-real-block/src/main.rs tooling/ethrex-real-block/Cargo.toml tooling/ethrex-real-block/Cargo.lock
