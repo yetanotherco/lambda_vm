@@ -1228,7 +1228,7 @@ pub fn prove_continuation_with_max_rows(
                 // only image consumers in the build) are skipped.
                 None::<&std::collections::HashMap<u64, u8>>,
                 &job.register_init,
-                &MaxRowsConfig::default(),
+                max_rows,
                 private_inputs,
                 job.is_final,
                 true,
@@ -1411,23 +1411,6 @@ pub fn prove_continuation_with_max_rows(
         }
         drop(tx);
 
-<<<<<<< HEAD
-        let label = local_to_global::epoch_label(index);
-        let traces = Traces::from_image_and_logs(
-            &elf,
-            &image,
-            &register_init,
-            &logs,
-            max_rows,
-            private_inputs,
-            is_final,
-            true,
-            #[cfg(feature = "disk-spill")]
-            stark::storage_mode::StorageMode::Ram,
-        )?;
-        let boundary =
-            local_to_global::epoch_boundary(&mut provenance, label, &traces.touched_memory_cells);
-=======
         // Global prove, overlapped: drain the boundary channel until the
         // producer hangs up (last epoch prepared), then prove the cross-epoch
         // global memory argument WHILE the tail epochs are still proving. The
@@ -1465,7 +1448,6 @@ pub fn prove_continuation_with_max_rows(
             };
             *global_result_ref.lock().unwrap() = Some(run());
         });
->>>>>>> main
 
         // Prove epochs as the builders hand them over. Builders can finish
         // out of index order, so results are re-ordered by epoch index before
