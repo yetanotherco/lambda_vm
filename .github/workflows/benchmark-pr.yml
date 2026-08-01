@@ -114,7 +114,8 @@ env:
   # occupancy of a runner every other bench queues behind, and this count is what to
   # turn down (2, or 1) before reaching for anything else.
   # `/bench N` overrides this, clamped to [1,5]. Past 5 the cached comparison can't
-  # beat the ~1% session-drift wall anyway — that is what /bench-abba is for.
+  # beat the ~1% session-drift wall anyway — that is what /bench-abba is for, and it
+  # proves this same block at this same epoch, so escalating keeps the question fixed.
   BENCH_RUNS_REAL: 3
   # Memory-scaling sweep: same ELF, different N-transfer inputs. GROWTH_PROGRAMS
   # are the generated (gitignored) fixture basenames in executor/tests/; GROWTH_STEPS
@@ -258,7 +259,8 @@ jobs:
           fi
 
           # Clamp to 1-5. Beyond 5 the single-session cached comparison barely improves
-          # (it can't beat the ~1% drift wall); use the ABBA tiebreaker for finer deltas.
+          # (it can't beat the ~1% drift wall); use /bench-abba for finer deltas — it
+          # resolves ~1% over the same block in ~72 min at its default 12 pairs.
           # At 158.8 s a run this is also the difference between a ~10 min and a ~20 min
           # occupancy of the one bench runner.
           if [ "$RUNS" -lt 1 ] 2>/dev/null || [ "$RUNS" -gt 5 ] 2>/dev/null; then
@@ -837,7 +839,9 @@ jobs:
                 } else if (rp < -10) {
                   body += `> 🎉 **Improvement on the real block** — prove time down ${Math.abs(rp).toFixed(1)}%.\n`;
                 } else if (Math.abs(rp) >= 3) {
-                  body += `> ❓ **${fmt(realTimePct)}% — beyond what ${realRuns} runs resolve.** Use \`/bench-abba\` for a paired test.\n`;
+                  // /bench-abba proves this same block at this same epoch, so the
+                  // escalation resolves the reading rather than changing the question.
+                  body += `> ❓ **${fmt(realTimePct)}% — beyond what ${realRuns} runs resolve.** Use \`/bench-abba\` for a paired test of the same block (default 12 pairs, ~72 min, resolves ~1%).\n`;
                 } else {
                   body += `> ✅ No significant change.\n`;
                 }

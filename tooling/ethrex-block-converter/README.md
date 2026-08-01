@@ -163,11 +163,31 @@ None of them hardcode the fixture path or a block number — they read the path 
 `make -s print-real-block-fixture` and run `make ethrex-real-block-fixture` on every
 invocation, so the digest is re-checked rather than trusted.
 
-**Both bench flows prove this block.** `/bench` runs it sampled on the shared
-runner, against the cached baseline main publishes; `/bench-gpu [N]` runs it as
-N A/B/B/A pairs on a rented box, comparing PR vs main on the same machine —
-absolute GPU times are host-CPU-dependent, so only same-box deltas are
-meaningful.
+**Every bench flow proves this block.** `/bench` runs it sampled on the shared
+runner, against the cached baseline main publishes; `/bench-abba [N]` runs it as
+N A/B/B/A pairs on that same runner; `/bench-gpu [N]` runs the same pairs on a
+rented box, comparing PR vs main on the same machine — absolute GPU times are
+host-CPU-dependent, so only same-box deltas are meaningful.
+
+**Escalating from `/bench` to `/bench-abba`.** `/bench` resolves about 3%: three
+runs of a 158.8 s prove, so it reports 3–10% as unresolved rather than as a
+verdict. The paired test resolves a 95% delta of `t* × sd / sqrt(N)`, where `sd`
+is the pair-delta standard deviation on the runner. **That sd is not measured
+yet.** The columns below bracket it between 1.0% — the GPU box's measured 0.64%
+pair sd plus margin — and 2.0%, which is `sqrt(2) ×` this runner's measured 1.43%
+single-run CV:
+
+| pairs | wall | resolves (sd 2.0%) | resolves (sd 1.0%) |
+|---|---|---|---|
+| 8 | ~50 min | 1.7% | 0.8% |
+| **12** | **~72 min** | **1.3%** | **0.6%** |
+| 20 | ~1h55m | 0.9% | 0.5% |
+| 32 | ~3h | 0.7% | 0.4% |
+
+12 pairs is the default. Wall is two 158.8 s proves per pair plus ~8 min of
+setup. The first real `/bench-abba` run **measures** the sd — it is the `sd`
+field of the paired-t line in the result comment — and this table should be
+re-pinned to that value once it exists.
 
 **GPU baseline (measured), and why the GPU epoch is 2^22.** On an RTX 5090 (32,607 MiB)
 against main @ `9ccdaf2`, same fixture and CLI, one prove per setting:
@@ -185,12 +205,14 @@ this one. `benchmark-gpu.yml` defaults the real-block path to 2^22 for this reas
 raw traces are in `~/workspace/lambda_vm_bench_cache/gpu_epoch_calib_2026-07-31/`
 (`PROVENANCE.txt`).
 
-That default is **GPU-path only**. `bench_abba.sh` still defaults to 2^20 for the CPU
-`/bench-abba`, and the CLI's own `DEFAULT_CONTINUATION_EPOCH_SIZE_LOG2` is still 20:
-2^22 needs ~32 GiB of *host* memory on a CPU build (peak RSS on the calibration box),
-which would break laptops. VRAM binds on one path and host RAM on the other, so they
-are not the same question and the GPU number must not be copied across. See
-[Choosing the epoch size](#choosing-the-epoch-size) for the CPU tiers.
+2^22 is also what the CPU runner uses, but the two arrive there for different reasons
+and must not be derived from each other: VRAM binds on the GPU path and host RAM on the
+CPU one. The workflows pin it on both sides (`GPU_REAL_EPOCH_LOG2` here,
+`REAL_BLOCK_EPOCH_LOG2` in `benchmark-pr.yml`, `ABBA_REAL_EPOCH_LOG2` in
+`bench-abba.yml`); `bench_abba.sh` and `bench_verify.sh` still *default* to 2^20, as
+does the CLI's `DEFAULT_CONTINUATION_EPOCH_SIZE_LOG2`, because 2^22 needs ~32 GiB of
+host memory on a CPU build (peak RSS on the calibration box) and would break laptops.
+See [Choosing the epoch size](#choosing-the-epoch-size) for the CPU tiers.
 
 The CPU bench runner is roughly **2.65x** the GPU wall time for the same block: 158.8 s
 median against the calibration RTX 5090's 59.87 s, both at epoch 2^22.
@@ -231,7 +253,8 @@ make twice:
 
 The synthetic fixtures themselves are not gone — `/bench-growth` still sweeps them for
 a heap-vs-block-size slope, which needs a family of blocks and so cannot come from one
-real one. `/bench-abba` and `/bench-verify` are untouched.
+real one, and `/bench-verify` still proves the 20-transfer block so it can report a
+monolithic arm as well as a continuation one.
 
 **The cost is a shared resource.** One runner carries every `/bench`, `/bench-abba`
 and `/bench-verify` in the repo, and a `/bench` now occupies it for **~15 min**, on
