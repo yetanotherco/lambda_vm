@@ -693,6 +693,7 @@ use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
 /// MUL table constraints as a single-source [`ConstraintSet`]. No column
 /// configuration is needed (the MUL layout is fixed via `cols`).
+#[derive(Clone, Copy)]
 pub struct MulConstraints;
 
 impl MulConstraints {

@@ -20,9 +20,10 @@
 //!
 //! [`program_id`] deliberately does not fold the `ProofOptions`: the security
 //! level is pinned by which verifier guest the outer proof is checked against
-//! (`recursion-min.elf` vs `recursion-blowup8.elf`, fixed at build time — see
-//! [`Preset`]). A consumer must pin that outer ELF too, or a 1-query `min`
-//! attestation is indistinguishable from a 128-bit `blowup8` one.
+//! (`recursion-min.elf` vs `recursion-blowup2.elf`/`recursion-blowup4.elf`/
+//! `recursion-blowup8.elf`, fixed at build time — see [`Preset`]). A consumer
+//! must pin that outer ELF too, or a 1-query `min` attestation is
+//! indistinguishable from a 128-bit one.
 
 use crypto::hash::platform_keccak::PlatformKeccak256 as Keccak256;
 use digest::Digest;
@@ -52,15 +53,33 @@ pub const MIN_PROOF_OPTIONS: ProofOptions = ProofOptions {
 pub enum Preset {
     /// Blowup=2, 1 query ([`MIN_PROOF_OPTIONS`]) — insecure, diagnostics only.
     Min,
-    /// Blowup=8, multi-query — 128-bit security.
+    /// Blowup=2, 219 queries — 128-bit, realistic base-layer shape (low
+    /// blowup, high query count; final wrap uses high blowup instead).
+    Blowup2,
+    /// Blowup=4, 110 queries — the other realistic base-layer point.
+    Blowup4,
+    /// Blowup=8, 73 queries — 128-bit, final-wrap-style parameters.
     Blowup8,
 }
 
 impl Preset {
+    /// Every preset, for name→preset lookups (e.g. the blob-dump test's
+    /// `RECURSION_DUMP_PRESET`). Keep in sync with the enum.
+    pub const ALL: [Preset; 4] = [
+        Preset::Min,
+        Preset::Blowup2,
+        Preset::Blowup4,
+        Preset::Blowup8,
+    ];
+
     /// The fixed `ProofOptions` this preset's guest verifies with.
     pub fn options(&self) -> ProofOptions {
         match self {
             Preset::Min => MIN_PROOF_OPTIONS,
+            Preset::Blowup2 => crate::GoldilocksCubicProofOptions::with_blowup(2)
+                .expect("blowup=2 is always valid"),
+            Preset::Blowup4 => crate::GoldilocksCubicProofOptions::with_blowup(4)
+                .expect("blowup=4 is always valid"),
             Preset::Blowup8 => crate::GoldilocksCubicProofOptions::with_blowup(8)
                 .expect("blowup=8 is always valid"),
         }
@@ -71,6 +90,8 @@ impl Preset {
     pub fn artifact_stem(&self) -> &'static str {
         match self {
             Preset::Min => "recursion-min",
+            Preset::Blowup2 => "recursion-blowup2",
+            Preset::Blowup4 => "recursion-blowup4",
             Preset::Blowup8 => "recursion-blowup8",
         }
     }
@@ -79,6 +100,8 @@ impl Preset {
     pub fn name(&self) -> &'static str {
         match self {
             Preset::Min => "min",
+            Preset::Blowup2 => "blowup2",
+            Preset::Blowup4 => "blowup4",
             Preset::Blowup8 => "blowup8",
         }
     }
@@ -125,6 +148,49 @@ pub fn encode_guest_input(
         decode_commitment,
         page_commitments,
     })
+}
+
+/// The continuation guest's private-input layout (the `continuation` guest
+/// feature). Mirrors [`crate::GuestInput`] with the monolithic proof replaced
+/// by the bundle and the PAGE roots replaced by the global-memory genesis
+/// roots (see [`crate::continuation::continuation_precomputed_commitments`]).
+/// Rkyv-archived on the same magic-prefixed wire format as the monolithic
+/// blob ([`crate::encode_recursion_input`]); the guest is feature-pinned to
+/// one layout, and a blob of the other kind fails the bytecheck validation.
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct ContinuationGuestInput {
+    pub bundle: crate::continuation::ContinuationProof,
+    pub inner_elf: Vec<u8>,
+    pub decode_commitment: Commitment,
+    pub page_commitments: Vec<(u64, Commitment)>,
+}
+
+/// Build the continuation guest's private-input blob for `bundle` of
+/// `inner_elf`: precomputes the roots and rkyv-encodes a
+/// [`ContinuationGuestInput`] behind the standard aligning prefix. Takes the
+/// bundle by value (it is large; the encoder is its last consumer).
+pub fn encode_continuation_guest_input(
+    bundle: crate::continuation::ContinuationProof,
+    inner_elf: &[u8],
+    opts: &ProofOptions,
+) -> Result<Vec<u8>, Error> {
+    let (decode_commitment, page_commitments) =
+        crate::continuation::continuation_precomputed_commitments(inner_elf, &bundle, opts)?;
+    let input = ContinuationGuestInput {
+        bundle,
+        inner_elf: inner_elf.to_vec(),
+        decode_commitment,
+        page_commitments,
+    };
+    let archive = rkyv::to_bytes::<rkyv::rancor::Error>(&input)
+        .map_err(|e| Error::Execution(format!("rkyv encode failed: {e}")))?;
+    let mut blob = Vec::with_capacity(crate::RECURSION_INPUT_PREFIX_LEN + archive.len());
+    blob.extend_from_slice(&crate::RECURSION_INPUT_MAGIC);
+    blob.extend_from_slice(&crate::RECURSION_INPUT_VERSION.to_le_bytes());
+    blob.extend_from_slice(&[0u8; 4]); // reserved
+    debug_assert_eq!(blob.len(), crate::RECURSION_INPUT_PREFIX_LEN);
+    blob.extend_from_slice(&archive);
+    Ok(blob)
 }
 
 /// Domain tag for [`program_id`].
@@ -220,6 +286,73 @@ pub fn verify_and_attest_blob(
     );
     let mut attestation = id.to_vec();
     attestation.extend_from_slice(verification.public_output);
+    Ok(Some(attestation))
+}
+
+/// [`verify_and_attest_blob`]'s logic for a continuation bundle: takes the
+/// wire-format blob ([`encode_continuation_guest_input`]) and does the
+/// intended `continuation` guest's whole job in one call — verify every
+/// epoch + the global memory proof against the supplied roots, then attest
+/// `program_id(elf, roots) || public_output`. Uses the same [`program_id`] as
+/// the monolithic path over the continuation's root set (DECODE + touched
+/// data-page genesis roots), so a consumer re-binds with
+/// [`crate::continuation::continuation_precomputed_commitments`] over the
+/// bundle it holds — the touched-page set is bundle-dependent, unlike the
+/// monolithic path's ELF-only page set. The archive is bytecheck-validated,
+/// then verified zero-copy via
+/// [`crate::continuation::verify_continuation_archived`] — no owned
+/// deserialize of the (large) bundle, same as [`crate::verify_recursion_blob`]
+/// for the monolithic proof.
+pub fn verify_continuation_and_attest(
+    blob: &[u8],
+    proof_options: &ProofOptions,
+) -> Result<Option<Vec<u8>>, Error> {
+    use rkyv::rancor::Error as RkyvError;
+
+    let archive_bytes = crate::recursion_archive_bytes(blob).ok_or_else(|| {
+        Error::Execution(String::from(
+            "continuation recursion blob: bad magic or version",
+        ))
+    })?;
+    // Host callers' Vec<u8> carries no alignment guarantee; the guest slice is
+    // aligned by construction (same prefix arithmetic as the monolithic blob).
+    let mut aligned_fallback = rkyv::util::AlignedVec::<{ crate::RECURSION_INPUT_ALIGN }>::new();
+    let archive: &[u8] =
+        if (archive_bytes.as_ptr() as usize).is_multiple_of(crate::RECURSION_INPUT_ALIGN) {
+            archive_bytes
+        } else {
+            aligned_fallback.extend_from_slice(archive_bytes);
+            &aligned_fallback
+        };
+    let archived = rkyv::access::<ArchivedContinuationGuestInput, RkyvError>(archive)
+        .map_err(|e| Error::Execution(format!("continuation blob validation failed: {e}")))?;
+
+    // Only small metadata here; the bundle's proofs stay in the archive (read
+    // in place by `verify_continuation_archived`).
+    let page_commitments: Vec<(u64, Commitment)> = rkyv::deserialize::<
+        Vec<(u64, Commitment)>,
+        RkyvError,
+    >(&archived.page_commitments)
+    .map_err(|e| Error::Execution(format!("rkyv deserialize page commitments failed: {e}")))?;
+    let decode_commitment: Commitment = archived.decode_commitment;
+    let inner_elf: &[u8] = archived.inner_elf.as_slice();
+
+    let Some((public_output, entry_point)) = crate::continuation::verify_continuation_archived(
+        &archived.bundle,
+        inner_elf,
+        proof_options,
+        decode_commitment,
+        &page_commitments,
+    )?
+    else {
+        return Ok(None);
+    };
+
+    // Avoids a second `Elf::load` (already done by `verify_continuation_archived`).
+    let digest = elf_digest(inner_elf);
+    let id = program_id_from_digest(&digest, entry_point, &decode_commitment, &page_commitments);
+    let mut attestation = id.to_vec();
+    attestation.extend_from_slice(&public_output);
     Ok(Some(attestation))
 }
 

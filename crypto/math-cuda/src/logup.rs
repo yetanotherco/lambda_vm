@@ -158,12 +158,21 @@ pub fn logup_term_columns(
         return Ok(Vec::new());
     }
 
-    let out_col_offsets = stream.clone_htod(d.out_col_offsets)?;
-    let out_col_interactions = stream.clone_htod(d.out_col_interactions)?;
-    let mult_const = stream.clone_htod(d.mult_const)?;
-    let mult_term_offsets = stream.clone_htod(d.mult_term_offsets)?;
-    let mult_term_coef = stream.clone_htod(d.mult_term_coef)?;
-    let mult_term_col = stream.clone_htod(d.mult_term_col)?;
+    let (
+        out_col_offsets,
+        out_col_interactions,
+        mult_const,
+        mult_term_offsets,
+        mult_term_coef,
+        mult_term_col,
+    ) = (
+        stream.clone_htod(d.out_col_offsets)?,
+        stream.clone_htod(d.out_col_interactions)?,
+        stream.clone_htod(d.mult_const)?,
+        stream.clone_htod(d.mult_term_offsets)?,
+        stream.clone_htod(d.mult_term_coef)?,
+        stream.clone_htod(d.mult_term_col)?,
+    );
     let num_rows_u32 = num_rows as u32;
     let num_out_u32 = d.num_out_cols as u32;
     unsafe {
@@ -186,8 +195,15 @@ pub fn logup_term_columns(
         stream.synchronize()?;
     }
     let t2 = std::time::Instant::now();
-    let host = stream.clone_dtoh(&out)?;
+    // Terms download (num_out_cols * num_rows * 3 u64s): async D2H through
+    // the per-worker pinned slab instead of a blocking pageable copy. The
+    // synchronize drains the kernels and the DMA so the pending wait below
+    // is instant.
+    let pending =
+        crate::device::async_dtoh_via(&stream, be.pinned_staging(), &be.ctx, &out, total * 3)?;
     stream.synchronize()?;
+    let mut host = vec![0u64; total * 3];
+    pending.wait_into_u64(&mut host)?;
     let t3 = std::time::Instant::now();
     if timing {
         eprintln!(
@@ -349,12 +365,21 @@ pub fn logup_aux_resident(
     }
     let num_out = d.num_out_cols;
     let mut terms = unsafe { stream.alloc::<u64>(num_out * num_rows * 3) }?;
-    let out_col_offsets = stream.clone_htod(d.out_col_offsets)?;
-    let out_col_interactions = stream.clone_htod(d.out_col_interactions)?;
-    let mult_const = stream.clone_htod(d.mult_const)?;
-    let mult_term_offsets = stream.clone_htod(d.mult_term_offsets)?;
-    let mult_term_coef = stream.clone_htod(d.mult_term_coef)?;
-    let mult_term_col = stream.clone_htod(d.mult_term_col)?;
+    let (
+        out_col_offsets,
+        out_col_interactions,
+        mult_const,
+        mult_term_offsets,
+        mult_term_coef,
+        mult_term_col,
+    ) = (
+        stream.clone_htod(d.out_col_offsets)?,
+        stream.clone_htod(d.out_col_interactions)?,
+        stream.clone_htod(d.mult_const)?,
+        stream.clone_htod(d.mult_term_offsets)?,
+        stream.clone_htod(d.mult_term_coef)?,
+        stream.clone_htod(d.mult_term_col)?,
+    );
     sync_if(timing)?;
     let t_desc = std::time::Instant::now();
     let num_rows_u32 = num_rows as u32;
@@ -379,46 +404,50 @@ pub fn logup_aux_resident(
     let t_term = std::time::Instant::now();
 
     // row_sum over all term columns → additive scan → accumulated column.
-    let mut row_sum = unsafe { stream.alloc::<u64>(num_rows * 3) }?;
-    unsafe {
-        stream
-            .launch_builder(&be.logup_row_sum_ext3)
-            .arg(&terms)
-            .arg(&num_out_u32)
-            .arg(&num_rows_u32)
-            .arg(&mut row_sum)
-            .launch(cfg(num_rows)?)?;
-    }
-    scan_add_inplace(stream, be, &mut row_sum, num_rows)?; // row_sum now holds S
-    let (i0, i1, i2) = (inv_n[0], inv_n[1], inv_n[2]);
-    let mut accumulated = unsafe { stream.alloc::<u64>(num_rows * 3) }?;
-    let n_u64 = num_rows as u64;
-    unsafe {
-        stream
-            .launch_builder(&be.logup_finalize_accum_ext3)
-            .arg(&row_sum)
-            .arg(&n_u64)
-            .arg(&i0)
-            .arg(&i1)
-            .arg(&i2)
-            .arg(&mut accumulated)
-            .launch(cfg(num_rows)?)?;
-    }
-
-    // Assemble row-major aux buffer: committed (num_out-1) cols + accumulated.
     let num_committed = num_out - 1;
     let num_aux_cols = num_committed + 1;
-    let mut aux = unsafe { stream.alloc::<u64>(num_aux_cols * num_rows * 3) }?;
-    let num_committed_u32 = num_committed as u32;
-    unsafe {
-        stream
-            .launch_builder(&be.logup_assemble_aux_ext3)
-            .arg(&terms)
-            .arg(&num_committed_u32)
-            .arg(&accumulated)
-            .arg(&num_rows_u32)
-            .arg(&mut aux)
-            .launch(cfg(num_rows)?)?;
+    let mut row_sum;
+    let mut aux;
+    {
+        row_sum = unsafe { stream.alloc::<u64>(num_rows * 3) }?;
+        unsafe {
+            stream
+                .launch_builder(&be.logup_row_sum_ext3)
+                .arg(&terms)
+                .arg(&num_out_u32)
+                .arg(&num_rows_u32)
+                .arg(&mut row_sum)
+                .launch(cfg(num_rows)?)?;
+        }
+        scan_add_inplace(stream, be, &mut row_sum, num_rows)?; // row_sum now holds S
+        let (i0, i1, i2) = (inv_n[0], inv_n[1], inv_n[2]);
+        let mut accumulated = unsafe { stream.alloc::<u64>(num_rows * 3) }?;
+        let n_u64 = num_rows as u64;
+        unsafe {
+            stream
+                .launch_builder(&be.logup_finalize_accum_ext3)
+                .arg(&row_sum)
+                .arg(&n_u64)
+                .arg(&i0)
+                .arg(&i1)
+                .arg(&i2)
+                .arg(&mut accumulated)
+                .launch(cfg(num_rows)?)?;
+        }
+
+        // Assemble row-major aux buffer: committed (num_out-1) cols + accumulated.
+        aux = unsafe { stream.alloc::<u64>(num_aux_cols * num_rows * 3) }?;
+        let num_committed_u32 = num_committed as u32;
+        unsafe {
+            stream
+                .launch_builder(&be.logup_assemble_aux_ext3)
+                .arg(&terms)
+                .arg(&num_committed_u32)
+                .arg(&accumulated)
+                .arg(&num_rows_u32)
+                .arg(&mut aux)
+                .launch(cfg(num_rows)?)?;
+        }
     }
     sync_if(timing)?;
     let t_accum_done = std::time::Instant::now();

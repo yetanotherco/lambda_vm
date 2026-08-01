@@ -7,8 +7,12 @@ name: Benchmark GPU (PR)
 # posts the paired-t + Wilcoxon verdict back to the PR, then ALWAYS destroys the box.
 #
 # Triggered by a "/bench-gpu [N]" comment on a PR (N = pair count, default 14) or via
-# workflow_dispatch. Orchestration runs on a GitHub-hosted runner; all GPU work happens
-# on the rented Vast box (provisioned by the template onstart).
+# workflow_dispatch.
+#
+# Workload: the real block (see tooling/ethrex-block-converter/README.md), proven with
+# --continuations at the calibrated epoch size below.
+# Orchestration runs on a GitHub-hosted runner; all GPU work happens on the rented
+# Vast box (provisioned by the template onstart).
 #
 # Requires repo secrets:
 #   VAST_API_KEY        — https://cloud.vast.ai/manage-keys/
@@ -41,6 +45,25 @@ env:
   VAST_IMAGE_DISK: "64"
   # cli features for the ABBA build — the GPU (cuda) prover path plus jemalloc heap stats.
   BENCH_FEATURES: "jemalloc-stats,prover/cuda"
+  # Continuation epoch for the REAL-BLOCK path, from the RTX 5090 calibration on
+  # 2026-07-31 against main @9ccdaf2 (raw traces:
+  # ~/workspace/lambda_vm_bench_cache/gpu_epoch_calib_2026-07-31/, PROVENANCE.txt).
+  # Measured on the 32,607 MiB card, same fixture and CLI, one prove per setting:
+  #
+  #   2^21   70.52 s wall   19,193 MiB VRAM (58.9%)   25 epochs   1.65 GB proof
+  #   2^22   59.87 s wall   23,193 MiB VRAM (71.1%)   13 epochs   1.12 GB proof
+  #   2^23   OOM at 32,079 MiB (98.4%) after 9.7 s — needs ~44 GiB
+  #
+  # So 2^22 is the largest setting that fits a 32 GiB card, and it is ~15% faster than
+  # 2^21 (equivalently, 2^21 is ~18% slower) with 28.9% VRAM headroom left. 2^23 is out
+  # of reach for every card below 48 GiB, not just this one.
+  #
+  # GPU PATH ONLY, and deliberately so. It is NOT pushed into bench_abba.sh's default
+  # (2^20, which the CPU /bench-abba uses) nor into the CLI's
+  # DEFAULT_CONTINUATION_EPOCH_SIZE_LOG2 (also 20): 2^22 needs ~28 GiB of HOST memory on
+  # a CPU build, which would break laptops. VRAM is the binding constraint here and host
+  # RAM is the binding constraint there, so the two defaults are not the same question.
+  GPU_REAL_EPOCH_LOG2: "22"
   # Unique per-run label set on the instance, for easy identification in the Vast console.
   RUN_LABEL: "gpu-bench-${{ github.run_id }}-${{ github.run_attempt }}"
   # Pin the Vast CLI to an immutable commit (a PyPI version can be re-published; a commit
@@ -57,12 +80,12 @@ jobs:
        github.event.issue.pull_request &&
        startsWith(github.event.comment.body, '/bench-gpu') &&
        contains(fromJSON('["MEMBER","OWNER","COLLABORATOR"]'), github.event.comment.author_association))
-    # ABBA on the GPU: provisioning + dual cuda build (~30 min) + 2*pairs proves
-    # (~95s each). At the max 32 pairs (64 proves) a slow-provision box runs ~3 hr,
-    # so allow headroom over that; teardown still always destroys the box.
-    timeout-minutes: 210
+    # Provisioning + dual cuda build + 2*pairs real-block proves (~2 min each,
+    # host-CPU-dependent). Sized for the 32-pair worst case with generous headroom;
+    # teardown still always destroys the box.
+    timeout-minutes: 330
     steps:
-      - name: Resolve PR ref + pair count
+      - name: Resolve PR ref + bench config
         id: config
         env:
           GH_TOKEN: ${{ github.token }}
@@ -76,18 +99,31 @@ jobs:
             # Pin the head SHA (works for fork PRs; avoids a force-push race mid-run).
             HEAD_SHA=$(gh pr view "$PR_NUM" --repo "$GITHUB_REPOSITORY" --json headRefOid -q .headRefOid)
             OUT_PR_NUM="$PR_NUM"; OUT_HEAD_SHA="$HEAD_SHA"; OUT_BRANCH=""
-            # "/bench-gpu 20" -> 20 pairs; otherwise default.
-            N=$(echo "$COMMENT_BODY" | sed -n 's|^/bench-gpu[[:space:]]*\([0-9]\+\).*|\1|p')
-            PAIRS=${N:-14}
+            # Everything after "/bench-gpu" on its line: the only token is an
+            # optional pair count.
+            ARGS=$(printf '%s' "$COMMENT_BODY" | tr -d '\r' | sed -n 's|^/bench-gpu||p' | head -n1)
+            PAIRS=14
           else
             # workflow_dispatch: compare this branch vs main.
             OUT_PR_NUM=""; OUT_HEAD_SHA=""; OUT_BRANCH="$DISPATCH_REF"
+            ARGS=""
             PAIRS=${DISPATCH_PAIRS:-14}
           fi
+          set -f  # tokens must not glob-expand against the runner's CWD
+          for tok in $ARGS; do
+            case "$tok" in
+              [0-9]*)     PAIRS="$tok" ;;
+              *)          echo "::warning::ignoring unrecognized token '$tok'" ;;
+            esac
+          done
+          # PAIRS is interpolated into the remote bash -lc below: enforce digits-only.
+          case "$PAIRS" in
+            ''|*[!0-9]*) echo "::warning::invalid pair count '$PAIRS'; using 14"; PAIRS=14 ;;
+          esac
           # Clamp to [2,32]; out-of-range -> default. 14 ~ resolves a 2% delta. The ceiling
           # keeps the worst-case run (64 proves + provisioning + dual build) under the job
           # timeout above.
-          if [ "$PAIRS" -lt 2 ] 2>/dev/null || [ "$PAIRS" -gt 32 ] 2>/dev/null; then
+          if [ "$PAIRS" -lt 2 ] || [ "$PAIRS" -gt 32 ]; then
             echo "::warning::pair count out of range [2,32], defaulting to 14"
             PAIRS=14
           fi
@@ -96,19 +132,22 @@ jobs:
             PAIRS=$((PAIRS + 1))
             echo "::notice::rounded odd pair count up to $PAIRS so AB/BA orders balance"
           fi
+          WORKLOAD="ethrex real block, continuations"
           {
             echo "pr_num=$OUT_PR_NUM"
             echo "head_sha=$OUT_HEAD_SHA"
             echo "branch=$OUT_BRANCH"
             echo "pairs=$PAIRS"
+            echo "workload=$WORKLOAD"
           } >> "$GITHUB_OUTPUT"
-          echo "Using $PAIRS A/B/B/A pairs"
+          echo "Using $PAIRS A/B/B/A pairs on $WORKLOAD"
 
       - name: Acknowledge (react + occupancy notice)
         if: github.event_name == 'issue_comment'
         uses: actions/github-script@v7
         env:
           PAIRS: ${{ steps.config.outputs.pairs }}
+          WORKLOAD: ${{ steps.config.outputs.workload }}
         with:
           script: |
             await github.rest.reactions.createForIssueComment({
@@ -118,7 +157,12 @@ jobs:
             // Post the "started" notice under the SAME marker the result step uses, so the
             // result updates this comment in place (and re-runs reuse it rather than stacking).
             const marker = 'GPU Benchmark (ABBA)';
-            const body = `## GPU Benchmark (ABBA) — running…\n\n⏳ Renting an RTX 5090 on Vast.ai and running ${process.env.PAIRS} interleaved pairs (PR vs main) on the CUDA prover path. This takes ~1 hr; the result will replace this comment.`;
+            // Reference: 4 pairs measured ~20 min end-to-end (rental + dual build +
+            // 8 proves). Per-prove wall varies with the rented host's CPU (the prover
+            // is partly host-CPU-bound), so scale expectations from pair count, not
+            // from a fixed per-run figure.
+            const mins = 12 + Number(process.env.PAIRS) * 2;
+            const body = `## GPU Benchmark (ABBA) — running…\n\n⏳ Renting an RTX 5090 on Vast.ai and running ${process.env.PAIRS} interleaved pairs (PR vs main) of ${process.env.WORKLOAD} on the CUDA prover path. Rough ETA ~${mins} min. The result will replace this comment.`;
             const comments = await github.paginate(github.rest.issues.listComments, {
               owner: context.repo.owner, repo: context.repo.repo,
               issue_number: context.issue.number, per_page: 100,
@@ -170,10 +214,11 @@ jobs:
           # because vast can't numerically compare the driver_version string server-side.
           MIN_DRIVER: "580"
         run: |
-          # cpu_ram filter is in GB. Floor 48 GB: the bench workload moved to the
-          # 5-transfer ethrex fixture (executor/tests/ethrex_5_transfers.bin), far smaller
-          # than the old 20-transfer prove (~78 GB heap) that set the previous 96 GB floor.
-          # 48 GB widens the dedicated pool (~15 vs ~11 offers).
+          # cpu_ram filter is in GB. Floor 48 GB: the real block at epoch 2^22 peaks at
+          # ~36 GB host RSS on the CUDA path (measured, main vintage) — ~25% headroom.
+          # Continuation peak is set by the epoch size, not the block, so bigger blocks
+          # don't move it; raising the epoch would (see the calibration tables in
+          # tooling/ethrex-block-converter/README.md).
           # gpu_frac=1 requires a WHOLE-MACHINE offer (you rent every GPU on the host), so
           # Vast places no other tenant on the box: CPU cores, RAM/memory bandwidth, PCIe,
           # and NVMe are fully dedicated. Without it the "most expensive" sort below lands on
@@ -203,7 +248,7 @@ jobs:
             sleep "$OFFER_INTERVAL"
           done
           if [ -z "$OFFER_ID" ]; then
-            echo "::error::No RTX 5090 offer matched after $OFFER_ATTEMPTS attempts (>=16 cores, >=96GB RAM, >=64GB disk, driver>=${MIN_DRIVER}, <= \$${PRICE_CAP}/hr)"
+            echo "::error::No RTX 5090 offer matched after $OFFER_ATTEMPTS attempts (>=16 cores, >=48GB RAM, >=64GB disk, driver>=${MIN_DRIVER}, <= \$${PRICE_CAP}/hr)"
             exit 1
           fi
           echo "id=$OFFER_ID" >> "$GITHUB_OUTPUT"
@@ -300,6 +345,7 @@ jobs:
           KEY: ${{ steps.sshkey.outputs.key_path }}
         run: |
           SSH="ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o BatchMode=yes -i $KEY -p $PORT root@$HOST"
+
           echo "Waiting for the template onstart script to finish (Rust + LLVM + sysroot + clone)..."
           # The bootstrap's final stdout line is "=== done ===". Vast captures onstart
           # output to /var/log/onstart.log; fall back to checking the artifacts it leaves.
@@ -355,8 +401,10 @@ jobs:
           # explicit and robust to the template default changing.) The harness still builds the
           # cli at REF_A (the PR) and origin/main in isolated worktrees, runs PAIRS interleaved
           # A/B/B/A proves, and prints the paired-t CI + Wilcoxon verdict. BENCH_FEATURES routes
-          # the build through the CUDA prover path. NOTE: requires this PR's bench_abba.sh change
-          # (the BENCH_FEATURES env) to be on main — i.e. it only takes effect after merge.
+          # the build through the CUDA prover path. bench_abba.sh is shared with the CPU ABBA
+          # flow and has its own defaults, so its knobs are pinned explicitly here: the real
+          # block, continuations, the calibrated epoch.
+          # The harness runs from main, so workflow/script changes take effect post-merge.
           # REBUILD=1: each Vast box is fresh, GPU-specific hardware — always rebuild both
           # binaries (cubin is compiled for the detected arch); never trust a cached binary.
           # CUDARC_PIN: compat shim for pre-pin baseline shas. cudarc's CUDA version is now pinned
@@ -371,6 +419,7 @@ jobs:
             git fetch --force origin main; $FETCH; \
             git checkout -f origin/main; \
             REBUILD=1 CUDARC_PIN=cuda-12080 SYSROOT_DIR=/opt/lambda-vm-sysroot BENCH_FEATURES='$BENCH_FEATURES' \
+            WORKLOAD=real CONTINUATIONS=1 EPOCH_SIZE_LOG2=$GPU_REAL_EPOCH_LOG2 \
             scripts/bench_abba.sh $REF_A origin/main $PAIRS"
 
           # pipefail so a failed remote bench (e.g. a prove that dies) propagates through the
@@ -386,9 +435,10 @@ jobs:
         if: always() && (steps.bench.outcome == 'success' || steps.bench.outcome == 'failure')
         env:
           OUTCOME: ${{ steps.bench.outcome }}
+          WORKLOAD: ${{ steps.config.outputs.workload }}
         run: |
           {
-            echo "## GPU ABBA — ethrex 20 transfers (vs main)"
+            echo "## GPU ABBA — ${WORKLOAD:-ethrex} (vs main)"
             if [ "$OUTCOME" = "success" ] && [ -s "$RUNNER_TEMP/abba_result.txt" ]; then
               echo '```'
               cat "$RUNNER_TEMP/abba_result.txt"
@@ -410,6 +460,7 @@ jobs:
           OUTCOME: ${{ steps.bench.outcome }}
           GPU_NAME: ${{ env.GPU_NAME }}
           OFFER_PRICE: ${{ steps.offer.outputs.price }}
+          WORKLOAD: ${{ steps.config.outputs.workload }}
         with:
           script: |
             const fs = require('fs');
@@ -419,9 +470,10 @@ jobs:
             const pairs = process.env.PAIRS;
             const gpu = (process.env.GPU_NAME || '').replace('_', ' ');
             const price = process.env.OFFER_PRICE;
+            const workload = process.env.WORKLOAD || 'ethrex';
 
             let body = `## GPU Benchmark (ABBA) — \`${head}\` vs \`main\` (${pairs} pairs)\n\n`;
-            body += `<sub>${gpu} · Vast.ai datacenter${price ? ` @ \$${price}/hr` : ''} · \`prover/cuda\` · drift-free A/B/B/A</sub>\n\n`;
+            body += `<sub>${gpu} · Vast.ai datacenter${price ? ` @ \$${price}/hr` : ''} · \`prover/cuda\` · ${workload} · drift-free A/B/B/A</sub>\n\n`;
             if (process.env.OUTCOME === 'success') {
               const res = read(`${tmp}/abba_result.txt`) || read(`${tmp}/abba_out.txt`);
               body += '```\n' + res + '\n```\n';

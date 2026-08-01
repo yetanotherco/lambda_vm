@@ -258,6 +258,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 /// - idx 0-3: `IS_BIT` on `write2`, `write4`, `write8`, `μ` (unconditional);
 /// - idx 4:   `(Σ width)·(1 − Σ width) = 0` (width sum is a bit);
 /// - idx 5:   `(Σ width)·(1 − μ) = 0` (width ⇒ μ).
+#[derive(Clone, Copy)]
 pub struct StoreConstraints;
 
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for StoreConstraints {

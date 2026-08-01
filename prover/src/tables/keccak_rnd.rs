@@ -903,6 +903,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 /// The KECCAK round table's 20 transition constraints as a single
 /// [`ConstraintSet`]: for `x ∈ 0..5`, `hw ∈ 0..4` (idx `x·4 + hw`), the μ-gated
 /// `IS_BIT` on `Cxz_right[x][hw]` — `μ · Cxz_right·(1 − Cxz_right)`.
+#[derive(Clone, Copy)]
 pub struct KeccakRndConstraints;
 
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for KeccakRndConstraints {

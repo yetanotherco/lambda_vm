@@ -892,7 +892,7 @@ fn test_run_with_flamegraph_returns_generator_on_executor_new_failure() {
     // even on failure.
     let elf_bytes = std::fs::read("./program_artifacts/rust/add.elf").unwrap();
     let program = executor::elf::Elf::load(&elf_bytes).unwrap();
-    let oversized_input = vec![0u8; 64 * 1024 * 1024 + 1];
+    let oversized_input = vec![0u8; executor::vm::memory::MAX_PRIVATE_INPUT_SIZE as usize + 1];
 
     let (generator, result) = executor::flamegraph::run_with_flamegraph(
         &elf_bytes,

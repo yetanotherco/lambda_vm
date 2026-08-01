@@ -10,10 +10,10 @@ use crate::{
     config::Commitment,
     domain::new_verifier_domain,
     lookup::{BusPublicInputs, LOGUP_CHALLENGE_ALPHA, LOGUP_NUM_CHALLENGES, compute_alpha_powers},
-    proof::stark::{ArchivedStarkProof, MultiProof},
+    proof::stark::{ArchivedMultiProof, MultiProof},
     proof::view::{
-        DeepPolynomialOpeningView, FriDecommitmentView, PolynomialOpeningsView, StarkProofView,
-        StarkTableView,
+        DeepPolynomialOpeningView, FriDecommitmentView, MultiProofView, PolynomialOpeningsView,
+        ProofViewSource, StarkProofView, StarkTableView,
     },
     table::Table,
 };
@@ -1141,19 +1141,19 @@ pub trait IsStarkVerifier<
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
-        let views: Vec<StarkProofView<Field, FieldExtension, PI>> = multi_proof
-            .proofs
-            .iter()
-            .map(StarkProofView::Owned)
-            .collect();
-        Self::multi_verify_views(airs, &views, transcript, expected_bus_balance)
+        Self::multi_verify_views(
+            airs,
+            MultiProofView::Owned(multi_proof),
+            transcript,
+            expected_bus_balance,
+        )
     }
 
     /// Verifies one or more rkyv-archived STARK proofs read **in place** from
     /// their archive buffer — no proof deserialization, no per-field allocation.
     fn multi_verify_archived(
         airs: &[&dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>],
-        proofs: &[ArchivedStarkProof<Field, FieldExtension, PI>],
+        multi_proof: &ArchivedMultiProof<Field, FieldExtension, PI>,
         transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
         expected_bus_balance: &FieldElement<FieldExtension>,
     ) -> bool
@@ -1161,29 +1161,35 @@ pub trait IsStarkVerifier<
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
-        let views: Vec<StarkProofView<Field, FieldExtension, PI>> =
-            proofs.iter().map(StarkProofView::Archived).collect();
-        Self::multi_verify_views(airs, &views, transcript, expected_bus_balance)
+        Self::multi_verify_views(
+            airs,
+            MultiProofView::Archived(multi_proof),
+            transcript,
+            expected_bus_balance,
+        )
     }
 
     /// The single verification implementation, shared by [`Self::multi_verify`]
     /// (owned) and [`Self::multi_verify_archived`] (archived), operating on
     /// proof views rather than either's concrete type.
-    fn multi_verify_views(
+    fn multi_verify_views<'p>(
         airs: &[&dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>],
-        proofs: &[StarkProofView<Field, FieldExtension, PI>],
+        proofs: impl ProofViewSource<'p, Field, FieldExtension, PI>,
         transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
         expected_bus_balance: &FieldElement<FieldExtension>,
     ) -> bool
     where
+        Field: 'p,
+        FieldExtension: 'p,
+        PI: 'p,
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
-        if airs.len() != proofs.len() {
+        if airs.len() != proofs.view_len() {
             error!(
                 "AIR count ({}) does not match proof count ({})",
                 airs.len(),
-                proofs.len()
+                proofs.view_len()
             );
             return false;
         }
@@ -1197,8 +1203,7 @@ pub trait IsStarkVerifier<
         // For preprocessed tables, use the hardcoded commitment (verifier cannot
         // trust the prover). For normal tables, use the commitment from the proof.
 
-        for (idx, (air, proof)) in airs.iter().zip(proofs).enumerate() {
-            let proof = *proof;
+        for (idx, (air, proof)) in airs.iter().zip(proofs.view_iter()).enumerate() {
             // Soundness: the number of composition-poly parts is fixed by the AIR's
             // degree bound, NOT chosen by the prover. Deriving it from the proof would
             // let a malicious prover inflate the part count, widening the composition
@@ -1275,8 +1280,7 @@ pub trait IsStarkVerifier<
         // boundary constraints on LogUp columns, so the bus balance check is
         // the only cross-table validation.
 
-        for (idx, (air, proof)) in airs.iter().zip(proofs).enumerate() {
-            let proof = *proof;
+        for (idx, (air, proof)) in airs.iter().zip(proofs.view_iter()).enumerate() {
             if air.has_trace_interaction() && !proof.has_bus_public_inputs() {
                 error!(
                     "Table {idx}: AIR has LogUp interactions but proof is missing bus_public_inputs"
@@ -1298,8 +1302,7 @@ pub trait IsStarkVerifier<
         // state after Phase B, domain-separated by table index). This matches
         // the prover's forking and makes per-table verification independent.
 
-        for (idx, (air, proof)) in airs.iter().zip(proofs).enumerate() {
-            let proof = *proof;
+        for (idx, (air, proof)) in airs.iter().zip(proofs.view_iter()).enumerate() {
             // Must match prover: fork with domain separator for multi-table,
             // use original transcript directly for single-table.
             let num_tables = airs.len();
@@ -1355,7 +1358,7 @@ pub trait IsStarkVerifier<
 
         if needs_lookup_challenges {
             let mut total = FieldElement::<FieldExtension>::zero();
-            for (air, proof) in airs.iter().zip(proofs) {
+            for (air, proof) in airs.iter().zip(proofs.view_iter()) {
                 if air.has_trace_interaction()
                     && let Some(contribution) = proof.bus_table_contribution()
                 {
@@ -1391,7 +1394,7 @@ pub trait IsStarkVerifier<
     {
         Self::multi_verify_views(
             &[air],
-            &[StarkProofView::Owned(proof)],
+            &[StarkProofView::Owned(proof)][..],
             transcript,
             &FieldElement::zero(),
         )
