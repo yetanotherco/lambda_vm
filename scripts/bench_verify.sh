@@ -42,8 +42,8 @@
 #        scripts/bench_abba.sh, so this arm proves the same bundle shape /bench-abba
 #        already proves on the same server — and 20 txs at 2^20 is strictly cheaper than
 #        the 100 txs at 2^20 that /bench-abba runs by default, so it can't be the thing
-#        that OOMs the box. (`cli prove --epoch-size-log2 --help` measured ethrex 10tx at ~9.5 GB
-#        for 2^20 vs ~15.8 GB for 2^21.) Note this does NOT match
+#        that OOMs the box. (`cli prove --epoch-size-log2 --help` measured ethrex 10tx
+#        at ~9.5 GB for 2^20 vs ~15.8 GB for 2^21.) Note this does NOT match
 #        bench_recursion_cycles.sh's BLOCK_EPOCH_LOG2=21: that arm needs FEW epochs so
 #        the bundle fits the guest's 512 MiB private-input cap, a constraint that
 #        doesn't apply to host-side verification.

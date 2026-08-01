@@ -154,8 +154,8 @@ it — see [Measured cost of candidate blocks](#measured-cost-of-candidate-block
 | `scripts/bench_abba.sh` | `WORKLOAD=real scripts/bench_abba.sh <ref>` | ~1.8 h at 20 pairs — **manual only** |
 
 None of them hardcode the fixture path or a block number — they read the path from
-`make -s print-real-block-fixture` and run `make ethrex-real-block-fixture` when
-the `.bin` is absent.
+`make -s print-real-block-fixture` and run `make ethrex-real-block-fixture` on every
+invocation, so the digest is re-checked rather than trusted.
 
 **`/bench-abba` is deliberately NOT wired to the real block.** The script supports
 it (`WORKLOAD=real`, which is what the GPU workflow drives), but the CPU ABBA
@@ -196,10 +196,10 @@ are not the same question and the GPU number must not be copied across. See
 The CPU bench runner is roughly **2.65x** the GPU wall time for the same block: 158.8 s
 median against the calibration RTX 5090's 59.87 s, both at epoch 2^22.
 
-Do not derive one from the other in general: the CPU rate (3.13 s/Mcycle on this block)
-does not transfer to the GPU, and the RTX 5090 sweep found the prover CPU-bound at the serial
-producer above epoch 2^21, so GPU time lands closer to CPU time than a naive
-device-throughput estimate suggests.
+Do not derive one from the other in general: the CPU rate (3.13 s/Mcycle on this
+block) does not transfer to the GPU, and the RTX 5090 sweep found the prover
+CPU-bound at the serial producer above epoch 2^21, so GPU time lands closer to CPU
+time than a naive device-throughput estimate suggests.
 
 **Continuations are mandatory, not a tuning choice.** Peak heap on a monolithic
 prove grows ~4.9 GB per million cycles on this workload family (measured on the
@@ -351,8 +351,8 @@ All three clear the usability screen. Add a row rather than editing the wiring, 
 say which ELF a number came from.
 
 Two things these numbers show that a gas-based estimate would have got wrong, and both
-survive the vintage change because they are same-ELF comparisons. **Gas does not
-predict how much cost:** on one common pre-LTO ELF the three blocks run at 30.8, 29.7
+survive the vintage change because they are same-ELF comparisons. **Gas does not size
+cost:** on one common pre-LTO ELF the three blocks run at 30.8, 29.7
 and 38.2 cycles per gas, so budgeting a candidate from gas alone is off by up to ~29%
 — 25453112 and hoodi 1265656 sit within 4% of each other on gas (4.24M vs 4.40M) yet
 25453112 costs ~25% fewer cycles (125.9M vs 168.3M). Gas happens to *order* these

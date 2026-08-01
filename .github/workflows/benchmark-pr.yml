@@ -12,12 +12,13 @@ on:
       - 'executor/**'
       - 'bin/cli/**'
       - 'tooling/ethrex-fixtures/**'
-      # A baseline is only valid for the workload it measured, and these two
-      # define the real-block workload: the converter decides the fixture's
-      # bytes, the Makefile decides which block it is. Without them a repointed
-      # block would leave main's baseline stale until some prover file happened
-      # to change — and the comparison guard would suppress the table until then.
-      - 'tooling/ethrex-block-converter/**'
+      # A baseline is only valid for the workload it measured, and the Makefile is
+      # what defines that workload: it names the block and pins the URL and sha256
+      # of the .bin this job fetches. Without it a repointed block would leave
+      # main's baseline stale until some prover file happened to change — and the
+      # comparison guard would suppress the table until then. The converter is not
+      # listed: CI never runs it, so changing it cannot change the bytes proven
+      # here.
       - 'Makefile'
   # Uncomment to auto-run on PRs:
   # pull_request:
@@ -103,9 +104,9 @@ env:
   # a laptop can still prove; and not the GPU path's 2^22, which happens to coincide
   # but is chosen by VRAM rather than host RAM (see benchmark-gpu.yml).
   REAL_BLOCK_EPOCH_LOG2: "22"
-  # Sampled like the synthetic screen, 3 runs, and reported the same way (median +
-  # spread). Fewer than the synthetic's 5 because each run is minutes rather than
-  # seconds; enough that one slow run shows up as spread instead of moving the median.
+  # Sampled 3 times and reported as median + spread. Three rather than five because
+  # each run is minutes rather than seconds; enough that one slow run shows up as
+  # spread instead of moving the median.
   #
   # THIS IS THE DIAL. A run measures 158.8 s on this runner (median of 3, 2.8% spread,
   # at the epoch above), so 3 runs is ~8 min of proving and the right count. Should a
@@ -241,9 +242,9 @@ jobs:
           # workload even when main's Makefile names a different block.
           echo "REAL_INPUT=$(make -s print-real-block-fixture)" >> "$GITHUB_ENV"
 
-          # Every metrics writer appends; the step that used to create this file was the
-          # synthetic screen, which is gone. Truncate here (this step always runs) so a
-          # previous run's values can't survive on the persistent self-hosted runner.
+          # Every metrics writer appends, and no step creates this file. Truncate here
+          # (this step always runs) so a previous run's values can't survive on the
+          # persistent self-hosted runner.
           : > /tmp/metrics.txt
 
           # `/bench N` sets the real-block sample count. Both sides use the same count
@@ -414,9 +415,9 @@ jobs:
             EPOCHS="$E"
           done
 
-          # Same summary as the synthetic screen: median for the headline, spread so a
-          # single slow run is visible rather than silently shifting the verdict, and
-          # every raw value so a reader can judge for themselves.
+          # Median for the headline, spread so a single slow run is visible rather than
+          # silently shifting the verdict, and every raw value so a reader can judge for
+          # themselves.
           MEDIAN_POS=$(( (RUNS + 1) / 2 ))
           TIME_MEDIAN=$(echo $TIMES | tr ' ' '\n' | sort -n | awk "NR==$MEDIAN_POS")
           HEAP_MEDIAN=$(echo $HEAPS | tr ' ' '\n' | sort -n | awk "NR==$MEDIAN_POS")
@@ -567,7 +568,7 @@ jobs:
           echo "growth_r2=$R2" >> "$GITHUB_OUTPUT"
           fi  # end run_growth check
 
-          # --- Real block (continuations, 1 sample) ---
+          # --- Real block (continuations, sampled to the PR side's count) ---
           # Only reached when no cached baseline exists, which is the expensive case:
           # push-to-main normally publishes the real-block numbers, so a /bench comment
           # pays for the PR side alone. $REAL_INPUT was resolved before this
@@ -808,8 +809,8 @@ jobs:
             // --- Section 1: Real block (headline; present whenever the fixture is fetchable) ---
             if (realTime) {
               body += `## Benchmark — real block${realInput ? ` (\`${realInput}\`)` : ''}${parseInt(realRuns) > 1 ? ` (median of ${realRuns})` : ''}\n\n`;
-              // Run count lives in the heading ("median of N"), as on the synthetic
-              // section — repeating it here just made the two disagree in tone.
+              // Run count lives in the heading ("median of N"); the subheading carries
+              // only the prove configuration.
               body += `<sub>continuations · epoch 2^${realEpochLog2}`;
               if (realEpochs) body += ` · ${realEpochs} epochs`;
               body += `</sub>\n\n`;
@@ -827,9 +828,9 @@ jobs:
                 }
                 body += `| **Prove time** | ${baseRealTime}s | ${realTime}s | ${fmt(realTimeDiff)}s (${fmt(realTimePct)}%) ${icon(realTimePct)} |\n\n`;
 
-                // Wider bands than the synthetic screen's 5%: 3 runs of a minutes-long
-                // prove resolve less than 5 runs of a 25s one, so the middle is reported
-                // as unresolved rather than as "fine".
+                // Bands of 10%/3%, wider than a fast workload would need: 3 runs of a
+                // minutes-long prove resolve coarsely, so the middle is reported as
+                // unresolved rather than as "fine".
                 const rp = parseFloat(realTimePct);
                 if (rp > 10) {
                   body += `> ⚠️ **Regression on the real block** — prove time up ${Math.abs(rp).toFixed(1)}%.\n`;
@@ -858,7 +859,7 @@ jobs:
               body += `\n`;
             }
 
-            // --- Section 3: Memory growth ---
+            // --- Section 2: Memory growth (only when the growth sweep ran) ---
             // Synthetic on purpose: this plots heap against BLOCK SIZE, which needs a
             // family of blocks that differ only in transaction count. A real block is
             // one point and cannot produce a slope.

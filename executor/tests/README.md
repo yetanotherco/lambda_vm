@@ -57,8 +57,11 @@ ethrex_10_transfers.bin
 
 The blocks above are synthetic (N plain ETH transfers over a small genesis).
 For a representative workload — real contract execution, real trie depth, real
-bytecode — `make ethrex-real-block-fixture` generates
-`ethrex_hoodi_1265656.bin` from an ethrex-replay cache. It is ~1 MB, so it is
-gitignored and generated on demand rather than committed, and its checksum is
-pinned in `tooling/ethrex-block-converter/README.md` rather than above (the
-checksum script only covers committed fixtures).
+bytecode — `make ethrex-real-block-fixture` downloads
+`ethrex_mainnet_25368371.bin` (1,110,156 B) from the `bench-fixtures-v1` release
+and verifies it against `ETHREX_REAL_BLOCK_FIXTURE_SHA256` in the Makefile before
+moving it into place. It is gitignored rather than committed, so the checksum
+lives next to the URL in the Makefile rather than in the table above (the checksum
+script only covers committed fixtures). See
+`tooling/ethrex-block-converter/README.md` for how the fixture is produced and
+repointed.
