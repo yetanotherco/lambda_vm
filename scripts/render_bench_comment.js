@@ -43,27 +43,41 @@ const src = body.join('\n');
 // into $GITHUB_OUTPUT. A step that builds key names at runtime (`echo "$key=..."`)
 // cannot be enumerated statically, so it is skipped rather than guessed at.
 const stepStart = (l) => /^ {6}- name:/.test(l);
-const produced = new Map();
+const produced = new Map();   // id -> Set of statically enumerable output keys
+const allIds = new Set();     // every step id, so a typoed reference cannot pass
+const opaque = new Set();     // outputs not statically enumerable: `uses:` actions
+                              // (native outputs) and runtime-built `echo "$key=..."`
 for (let i = 0; i < lines.length; i++) {
   if (!stepStart(lines[i])) continue;
   let end = i + 1;
   while (end < lines.length && !stepStart(lines[end])) end++;
   const block = lines.slice(i, end).join('\n');
   const id = (block.match(/^ {8}id: (\S+)$/m) || [])[1];
-  if (!id || !block.includes('$GITHUB_OUTPUT')) continue;
-  if (/echo "\$\{?[A-Za-z_][^"]*=/.test(block)) continue;
-  produced.set(id, new Set([...block.matchAll(/echo "([a-z0-9_]+)=/g)].map(m => m[1])));
+  if (!id) continue;
+  allIds.add(id);
+  if (/^ {8}uses:/m.test(block) || /echo "\$\{?[A-Za-z_][^"]*=/.test(block)) {
+    opaque.add(id);
+    continue;
+  }
+  // A run: step with no $GITHUB_OUTPUT produces nothing — reads from it must fail.
+  produced.set(id, new Set(
+    block.includes('$GITHUB_OUTPUT')
+      ? [...block.matchAll(/echo "([a-z0-9_]+)=/g)].map(m => m[1])
+      : []
+  ));
 }
-const unwired = [...new Set(
-  [...wf.matchAll(/steps\.([a-z0-9_-]+)\.outputs\.([a-z0-9_]+)/g)]
-    .filter(([, id, key]) => produced.has(id) && !produced.get(id).has(key))
-    .map(([ref]) => ref)
-)];
-if (unwired.length) {
-  console.error(`Unwired step outputs — read but never written:\n  ${unwired.join('\n  ')}`);
+const problems = [];
+for (const m of wf.matchAll(/steps\.([a-z0-9_-]+)\.outputs\.([a-z0-9_]+)/g)) {
+  const [ref, id, key] = m;
+  if (!allIds.has(id)) problems.push(`${ref}  (no step with id '${id}' — typo?)`);
+  else if (opaque.has(id)) continue;  // uses:/dynamic — cannot verify statically
+  else if (!produced.get(id).has(key)) problems.push(`${ref}  (step '${id}' never writes '${key}')`);
+}
+if (problems.length) {
+  console.error(`Unwired step outputs:\n  ${[...new Set(problems)].join('\n  ')}`);
   process.exit(1);
 }
-console.log(`Wiring OK: ${produced.size} steps checked, every consumed output has a producer.`);
+console.log(`Wiring OK: ${produced.size} producer steps verified, ${opaque.size} opaque (uses:/dynamic) skipped, no unknown step ids.`);
 
 const captured = [];
 const github = { rest: { issues: {
