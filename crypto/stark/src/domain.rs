@@ -152,7 +152,6 @@ impl<F: IsFFTField> Domain<F> {
 /// which only needs to compute specific elements on-demand.
 /// This avoids allocating O(n) memory for domains that would be O(millions) of elements.
 pub struct VerifierDomain<F: IsFFTField> {
-    pub(crate) root_order: u32,
     pub(crate) trace_length: usize,
     pub(crate) lde_length: usize,
     pub(crate) trace_primitive_root: FieldElement<F>,
@@ -190,7 +189,6 @@ where
     let lde_primitive_root = Field::get_primitive_root_of_unity(lde_root_order as u64).unwrap();
 
     VerifierDomain {
-        root_order,
         trace_length,
         lde_length,
         trace_primitive_root,

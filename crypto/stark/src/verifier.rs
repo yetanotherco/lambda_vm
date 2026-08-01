@@ -425,6 +425,18 @@ pub trait IsStarkVerifier<
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
         crate::profile_markers::step_marker::<{ crate::profile_markers::STEP_VERIFY_FRI }>();
+
+        // The Q primary FRI evaluation points 𝜐 = offset·lde_root^iota, computed once
+        // (one `pow` each) and shared between the DEEP reconstruction — whose symmetric
+        // point is −𝜐, so it needs no second `pow` — and the FRI fold's 𝜐⁻¹ below.
+        // Previously the driver recomputed all 2Q (primary + symmetric) and the fold
+        // recomputed Q more.
+        let query_points: Vec<FieldElement<Field>> = challenges
+            .iotas
+            .iter()
+            .map(|iota| Self::query_challenge_to_evaluation_point(*iota, false, domain))
+            .collect();
+
         let (deep_poly_evaluations, deep_poly_evaluations_sym) =
             match Self::reconstruct_deep_composition_poly_evaluations_for_all_queries(
                 challenges,
@@ -433,6 +445,7 @@ pub trait IsStarkVerifier<
                 ood_full,
                 next_row_cols,
                 step_size,
+                &query_points,
             ) {
                 Some(pair) => pair,
                 None => return false,
@@ -479,12 +492,9 @@ pub trait IsStarkVerifier<
                 layout.terminal_len,
             );
 
-        // verify FRI
-        let mut evaluation_point_inverse = challenges
-            .iotas
-            .iter()
-            .map(|iota| Self::query_challenge_to_evaluation_point(*iota, false, domain))
-            .collect::<Vec<FieldElement<Field>>>();
+        // verify FRI: the fold needs 𝜐⁻¹ per query — reuse the primary points computed
+        // above (moved in) instead of recomputing them.
+        let mut evaluation_point_inverse = query_points;
         // Any zero evaluation point means a malformed query index, reject.
         if FieldElement::inplace_batch_inverse(&mut evaluation_point_inverse).is_err() {
             return false;
@@ -849,6 +859,9 @@ pub trait IsStarkVerifier<
         ood_full: &Table<FieldExtension>,
         next_row_cols: &[usize],
         step_size: usize,
+        // The Q primary FRI evaluation points 𝜐, computed once by the caller and shared
+        // with the FRI fold. Each query's symmetric point is −𝜐 (no extra `pow`).
+        query_points: &[FieldElement<Field>],
     ) -> Option<DeepPolynomialEvaluations<FieldExtension>> {
         let num_queries = challenges.iotas.len();
 
@@ -863,8 +876,10 @@ pub trait IsStarkVerifier<
             return None;
         }
 
-        let primitive_root = &Field::get_primitive_root_of_unity(domain.root_order as u64)
-            .expect("verifier domain root_order is a valid power of two");
+        // The trace-size primitive root is precomputed once when the verifier domain
+        // is built; reuse it instead of recomputing (which needed `root_order` and a
+        // `get_primitive_root_of_unity` — repeated squarings — every proof).
+        let primitive_root = &domain.trace_primitive_root;
 
         let query_invariant_terms = Self::compute_query_invariant_deep_terms(
             challenges,
@@ -894,14 +909,16 @@ pub trait IsStarkVerifier<
         // denominator; points ordered [q0 primary, q0 sym, q1 primary, q1 sym, …].
         let stride = ood_height + 1;
         let mut denominators = Vec::with_capacity(2 * num_queries * stride);
-        for iota in challenges.iotas.iter() {
-            for is_sym in [false, true] {
-                let evaluation_point =
-                    Self::query_challenge_to_evaluation_point(*iota, is_sym, domain);
+        // The symmetric point of each primary FRI point 𝜐 is −𝜐 (its bit-reversed LDE
+        // index is `primary + N/2` and `lde_root^(N/2) = −1`), so negate instead of a
+        // second `pow`.
+        for primary in query_points {
+            let sym = -primary;
+            for evaluation_point in [primary, &sym] {
                 for z_row_point in &z_row_points {
-                    denominators.push(&evaluation_point - z_row_point);
+                    denominators.push(evaluation_point - z_row_point);
                 }
-                denominators.push(&evaluation_point - z_pow_parts);
+                denominators.push(evaluation_point - z_pow_parts);
             }
         }
         // One inversion for the whole proof's DEEP denominators. Fails closed if any
