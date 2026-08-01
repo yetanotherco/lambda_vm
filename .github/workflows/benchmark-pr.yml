@@ -703,6 +703,19 @@ jobs:
             fi
           fi
 
+          # Growth comparison. The renderer keys the whole growth section off
+          # pr_growth_heaps, so these pass through even when only one side ran.
+          {
+            echo "pr_growth_heaps=$PR_GROWTH_HEAPS"
+            echo "pr_growth_times=$PR_GROWTH_TIMES"
+            echo "pr_growth_slope=$PR_GROWTH_SLOPE"
+            echo "pr_growth_r2=$PR_GROWTH_R2"
+            echo "baseline_growth_heaps=$BASELINE_GROWTH_HEAPS"
+            echo "baseline_growth_times=$BASELINE_GROWTH_TIMES"
+            echo "baseline_growth_slope=$BASELINE_GROWTH_SLOPE"
+            echo "baseline_growth_r2=$BASELINE_GROWTH_R2"
+          } >> "$GITHUB_OUTPUT"
+
           # Growth slope comparison
           if [ -n "$BASELINE_GROWTH_SLOPE" ] && [ -n "$PR_GROWTH_SLOPE" ]; then
             SLOPE_DIFF=$((PR_GROWTH_SLOPE - BASELINE_GROWTH_SLOPE))

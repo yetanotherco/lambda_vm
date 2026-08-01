@@ -12,6 +12,11 @@
 // that have actually broken before: sign handling on the verdict lines, the
 // no-baseline and block-mismatch paths, and the fixture-unavailable footer.
 //
+// The one thing it does check is step wiring, because the scenarios cannot: they
+// hand env to the script directly, so a `steps.X.outputs.Y` that no step writes
+// still renders perfectly here while arriving empty in CI — which drops a whole
+// section with no error anywhere. That check runs first and exits non-zero.
+//
 // USAGE:  node scripts/render_bench_comment.js
 //
 // Add a scenario by adding a key to `scenarios`; each is the env the comment step
@@ -32,6 +37,33 @@ for (let i = start + 1; i < lines.length; i++) {
   body.push(l.slice(indent));
 }
 const src = body.join('\n');
+
+// --- Wiring check: every consumed step output has a producer --------------------
+// Steps are `      - name:` at six spaces; a step's outputs are the `key=` it echoes
+// into $GITHUB_OUTPUT. A step that builds key names at runtime (`echo "$key=..."`)
+// cannot be enumerated statically, so it is skipped rather than guessed at.
+const stepStart = (l) => /^ {6}- name:/.test(l);
+const produced = new Map();
+for (let i = 0; i < lines.length; i++) {
+  if (!stepStart(lines[i])) continue;
+  let end = i + 1;
+  while (end < lines.length && !stepStart(lines[end])) end++;
+  const block = lines.slice(i, end).join('\n');
+  const id = (block.match(/^ {8}id: (\S+)$/m) || [])[1];
+  if (!id || !block.includes('$GITHUB_OUTPUT')) continue;
+  if (/echo "\$\{?[A-Za-z_][^"]*=/.test(block)) continue;
+  produced.set(id, new Set([...block.matchAll(/echo "([a-z0-9_]+)=/g)].map(m => m[1])));
+}
+const unwired = [...new Set(
+  [...wf.matchAll(/steps\.([a-z0-9_-]+)\.outputs\.([a-z0-9_]+)/g)]
+    .filter(([, id, key]) => produced.has(id) && !produced.get(id).has(key))
+    .map(([ref]) => ref)
+)];
+if (unwired.length) {
+  console.error(`Unwired step outputs — read but never written:\n  ${unwired.join('\n  ')}`);
+  process.exit(1);
+}
+console.log(`Wiring OK: ${produced.size} steps checked, every consumed output has a producer.`);
 
 const captured = [];
 const github = { rest: { issues: {
@@ -57,8 +89,11 @@ const scenarios = {
     REAL_TIME_DIFF: '-58.600', REAL_TIME_PCT: '-17.2', REAL_PEAK_DIFF: '5', REAL_PEAK_PCT: '0.0',
   },
   'C: clear regression': {
+    // Diffs are unsigned as the Compare step prints them (awk "%.3f"/"%.1f", `$((a-b))`);
+    // the renderer's own `fmt` adds the sign, so feeding one signed here would test
+    // a format CI never produces.
     ...REAL, BASE_REAL_TIME: '240.000', BASE_REAL_PEAK: '32975',
-    REAL_TIME_DIFF: '+41.400', REAL_TIME_PCT: '17.3', REAL_PEAK_DIFF: '5', REAL_PEAK_PCT: '0.0',
+    REAL_TIME_DIFF: '41.400', REAL_TIME_PCT: '17.3', REAL_PEAK_DIFF: '5', REAL_PEAK_PCT: '0.0',
   },
   'D: unresolved middle band (3-10%)': {
     ...REAL, BASE_REAL_TIME: '300.000', BASE_REAL_PEAK: '32975',
@@ -75,7 +110,9 @@ const scenarios = {
     REAL_MISMATCH: 'ethrex_hoodi_1265656.bin',
   },
   'H: fixture unavailable': { COMMIT_SHA: 'c4e42b2900', REAL_EPOCH_LOG2: '22', BASELINE_SRC: 'cached' },
-  'I: with growth sweep (push-style)': {
+  // The growth sweep reaches a comment only on /bench-growth: run_growth is also true
+  // on push and workflow_dispatch, but the Comment step is skipped for both.
+  'I: /bench-growth — real block plus the growth sweep': {
     ...REAL, BASE_REAL_TIME: '288.900', BASE_REAL_PEAK: '32975',
     REAL_TIME_DIFF: '-7.500', REAL_TIME_PCT: '-2.6', REAL_PEAK_DIFF: '5', REAL_PEAK_PCT: '0.0',
     PR_GROWTH_HEAPS: '18756/26966/34748/43896/50431',

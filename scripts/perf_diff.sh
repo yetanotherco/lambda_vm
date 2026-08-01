@@ -76,16 +76,16 @@ fi
 
 command -v perf >/dev/null 2>&1 || { echo "ERROR: perf not installed (linux-tools)." >&2; exit 1; }
 [ -f "$ELF_REL" ] || { echo "ERROR: missing $ELF_REL — run bench_abba.sh once (it builds the guest)." >&2; exit 1; }
-if [ ! -f "$INPUT_REL" ]; then
-  if [ "$WORKLOAD" = "real" ]; then
-    # ~1 MB, gitignored, never in a fresh checkout; fetch rather than abort. This is
-    # a URL + sha256 download, not a build.
-    echo "==> Fetching ethrex real-block fixture (missing)"
-    make ethrex-real-block-fixture
-  else
-    echo "ERROR: missing $INPUT_REL — run bench_abba.sh once (it builds the fixture)." >&2
-    exit 1
-  fi
+if [ "$WORKLOAD" = "real" ]; then
+  # ~1 MB, gitignored, never in a fresh checkout; fetch rather than abort. This is a
+  # URL + sha256 download, not a build. Unconditional on purpose: the target hashes
+  # whatever is on disk on every invocation, which is how a stale copy gets caught.
+  # A match costs ~35 ms.
+  echo "==> Verifying ethrex real-block fixture (fetches on a digest miss)"
+  make ethrex-real-block-fixture
+elif [ ! -f "$INPUT_REL" ]; then
+  echo "ERROR: missing $INPUT_REL — run bench_abba.sh once (it builds the fixture)." >&2
+  exit 1
 fi
 echo "==> Workload: $WORKLOAD ($INPUT_REL${CONT_ARGS:+, continuations epoch 2^$EPOCH_SIZE_LOG2})"
 

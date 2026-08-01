@@ -179,17 +179,18 @@ if [ ! -f "$ELF_REL" ]; then
   export SYSROOT_DIR="${SYSROOT_DIR:-$HOME/.lambda-vm-sysroot}"
   make "$ELF_REL"
 fi
-if [ ! -f "$INPUT_REL" ]; then
-  if [ "$WORKLOAD" = "real" ]; then
-    # ~1 MB, gitignored, never in a fresh checkout. Fetched by URL + sha256, not built:
-    # no converter and no ethrex host dependency tree on this path.
-    echo "==> Fetching ethrex real-block fixture (missing)"
-    make ethrex-real-block-fixture
-  else
-    echo "==> Generating ethrex 20-transfer fixture (missing)"
-    ( cd tooling/ethrex-fixtures && cargo build --release )
-    tooling/ethrex-fixtures/target/release/ethrex-fixtures 20 "$INPUT_REL" distinct
-  fi
+if [ "$WORKLOAD" = "real" ]; then
+  # ~1 MB, gitignored, never in a fresh checkout. Fetched by URL + sha256, not built:
+  # no converter and no ethrex host dependency tree on this path. Unconditional on
+  # purpose: the target hashes whatever is already on disk on every invocation, which
+  # is how a stale copy left by an earlier block or an interrupted fetch gets caught.
+  # A match costs ~35 ms, so there is nothing to gate it on.
+  echo "==> Verifying ethrex real-block fixture (fetches on a digest miss)"
+  make ethrex-real-block-fixture
+elif [ ! -f "$INPUT_REL" ]; then
+  echo "==> Generating ethrex 20-transfer fixture (missing)"
+  ( cd tooling/ethrex-fixtures && cargo build --release )
+  tooling/ethrex-fixtures/target/release/ethrex-fixtures 20 "$INPUT_REL" distinct
 fi
 ELF="$(cd "$(dirname "$ELF_REL")" && pwd)/$(basename "$ELF_REL")"
 INPUT="$(cd "$(dirname "$INPUT_REL")" && pwd)/$(basename "$INPUT_REL")"

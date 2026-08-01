@@ -157,11 +157,12 @@ jobs:
             // Post the "started" notice under the SAME marker the result step uses, so the
             // result updates this comment in place (and re-runs reuse it rather than stacking).
             const marker = 'GPU Benchmark (ABBA)';
-            // Reference: 4 pairs measured ~20 min end-to-end (rental + dual build +
-            // 8 proves). Per-prove wall varies with the rented host's CPU (the prover
-            // is partly host-CPU-bound), so scale expectations from pair count, not
-            // from a fixed per-run figure.
-            const mins = 12 + Number(process.env.PAIRS) * 2;
+            // Reference: 4 pairs measured 20 min 11 s end-to-end — 3 min 56 s of rental,
+            // checkout and dual cuda build, then 4.06 min per pair, since a pair is TWO
+            // proves at ~2 min each. Per-prove wall varies with the rented host's CPU
+            // (the prover is partly host-CPU-bound), so the slope is the measured one
+            // and the intercept carries slack for a colder box.
+            const mins = 12 + Number(process.env.PAIRS) * 4;
             const body = `## GPU Benchmark (ABBA) — running…\n\n⏳ Renting an RTX 5090 on Vast.ai and running ${process.env.PAIRS} interleaved pairs (PR vs main) of ${process.env.WORKLOAD} on the CUDA prover path. Rough ETA ~${mins} min. The result will replace this comment.`;
             const comments = await github.paginate(github.rest.issues.listComments, {
               owner: context.repo.owner, repo: context.repo.repo,

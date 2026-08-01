@@ -136,18 +136,18 @@ if [ ! -f "$ELF_REL" ]; then
   export SYSROOT_DIR="${SYSROOT_DIR:-$HOME/.lambda-vm-sysroot}"
   make "$ELF_REL"
 fi
-if [ ! -f "$INPUT_REL" ]; then
-  if [ "$WORKLOAD" = "real" ]; then
-    # ~1 MB, gitignored, never in a fresh checkout — and a rented GPU box is always a
-    # fresh checkout. Fetched by URL + sha256, not built: no converter, no ethrex host
-    # dependency tree, so this costs seconds on the box.
-    echo "==> Fetching ethrex real-block fixture (missing)"
-    make ethrex-real-block-fixture
-  else
-    echo "==> Generating ethrex ${TX_COUNT}-transfer fixture (missing)"
-    ( cd tooling/ethrex-fixtures && cargo build --release )
-    tooling/ethrex-fixtures/target/release/ethrex-fixtures "$TX_COUNT" "$INPUT_REL" distinct
-  fi
+if [ "$WORKLOAD" = "real" ]; then
+  # ~1 MB, gitignored, never in a fresh checkout — and a rented GPU box is always a
+  # fresh checkout. Fetched by URL + sha256, not built: no converter, no ethrex host
+  # dependency tree, so this costs seconds on the box. Unconditional on purpose: the
+  # target hashes whatever is on disk on every invocation, which is what catches a
+  # copy left behind by an earlier run in the same rental. A match costs ~35 ms.
+  echo "==> Verifying ethrex real-block fixture (fetches on a digest miss)"
+  make ethrex-real-block-fixture
+elif [ ! -f "$INPUT_REL" ]; then
+  echo "==> Generating ethrex ${TX_COUNT}-transfer fixture (missing)"
+  ( cd tooling/ethrex-fixtures && cargo build --release )
+  tooling/ethrex-fixtures/target/release/ethrex-fixtures "$TX_COUNT" "$INPUT_REL" distinct
 fi
 ELF="$(cd "$(dirname "$ELF_REL")" && pwd)/$(basename "$ELF_REL")"
 INPUT="$(cd "$(dirname "$INPUT_REL")" && pwd)/$(basename "$INPUT_REL")"
