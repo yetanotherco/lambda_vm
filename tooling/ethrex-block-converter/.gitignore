@@ -1,0 +1,4 @@
+/target
+# Downloaded ethrex-replay cache JSONs (~1.5 MB each), fetched on demand by
+# `make ethrex-real-block-fixture`.
+/caches/
