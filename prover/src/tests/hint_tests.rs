@@ -31,6 +31,8 @@ fn op(timestamp: u64, out_addr: u64) -> HintOperation {
         timestamp,
         out_addr,
         out_bytes: std::array::from_fn(|i| i as u8),
+        hint_id: 0,
+        in_addr: 0x3000,
     }
 }
 
@@ -58,11 +60,11 @@ fn constraints_hold_on_generated_trace() {
 ///
 /// The `Ecall` bus does not establish this on its own: its tuple carries a
 /// per-instruction timestamp, so LogUp pins the *sum* of `mu` over the rows sharing a
-/// tuple, which a witness can satisfy by splitting `mu = 1/2 + 1/2` across two rows
-/// that each keep their own `out_addr`. Such a witness is caught downstream too (MEMW
-/// boolean-constrains its own multiplicities, so a half-weighted write finds no
-/// receiver), but that protection lives in another table; this constraint makes it
-/// local.
+/// tuple, which a witness can satisfy by spreading `mu` across rows with integer
+/// weights summing to 1 (the real exploit uses a `+1`/`-1` pair, not a fractional
+/// split; MEMW does not catch it — it only sees the legal `+1`, the `-1` cancelling an
+/// honest STORE). This constraint rejects any non-boolean `mu` locally. The test below
+/// tampers with a fractional `1/2`, which `IS_BIT` also rejects.
 #[test]
 fn is_bit_mu_rejects_non_boolean_multiplicity() {
     let trace = generate_hint_trace(&[op(4, 0x1000)]);

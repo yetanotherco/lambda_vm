@@ -1037,22 +1037,21 @@ fn collect_hint_ops(
     let in_addr = register_state.read(11).0;
     let out_addr = register_state.read(12).0;
 
-    let mut memw_ops = Vec::with_capacity(5);
+    let mut memw_ops = Vec::with_capacity(7);
 
-    // Read x12 (out_addr) at ts. This is what ties the write addresses below to the
-    // ecall's a2: they are emitted from a HINT trace column, and only this memory-
-    // argument access pins that column to the register the CPU actually held.
-    // x10/x11 are not emitted on purpose — neither reaches the memory argument (the
-    // value is unconstrained by design and the input read is not modelled), so an
-    // access for them would be dead weight. See `tables::hint`.
-    {
-        let reg_value = pack_register_value(out_addr);
-        let (_old_val, old_ts) = register_state.read(12);
+    // Bind a0/a1/a2 (x10/x11/x12) at ts through the memory argument. x12 ties the
+    // output-write base below to the ecall's a2; x10 (selector) and x11 (in_addr) pin
+    // the operands the HINT table range-checks against the executor's accepted set, so
+    // the AIR cannot prove a hint the executor would reject. All three are register
+    // reads (old == value; a read leaves the register unchanged). See `tables::hint`.
+    for (reg, value) in [(10u8, hint_id), (11, in_addr), (12, out_addr)] {
+        let reg_value = pack_register_value(value);
+        let (_old_val, old_ts) = register_state.read(reg);
         memw_ops.push(
-            MemwOperation::new(true, 2 * 12, reg_value, t, 2, true)
+            MemwOperation::new(true, 2 * reg as u64, reg_value, t, 2, true)
                 .with_old(reg_value, [old_ts, old_ts, 0, 0, 0, 0, 0, 0]),
         );
-        register_state.write(12, out_addr, t);
+        register_state.write(reg, value, t);
     }
 
     // Read the 32-byte big-endian input from the replayed memory.
@@ -1084,6 +1083,8 @@ fn collect_hint_ops(
         timestamp: t,
         out_addr,
         out_bytes,
+        hint_id,
+        in_addr,
     };
     (memw_ops, hint_op)
 }
@@ -3232,6 +3233,19 @@ fn build_traces<I: ImageSource + Sync>(
     // =====================================================================
     lt_ops.extend(collect_lt_from_memw(&memw_ops));
     lt_ops.extend(collect_lt_from_memw_aligned(&memw_aligned_ops));
+    // HINT range-checks: selector < 3 and in_addr's low limb < 2^32 - 31 (matching the
+    // executor's HintUnknownSelector / HintAddressOverflow rejections). Two LT ops per
+    // hint call; the HINT table sends the matching ALU LT interactions.
+    lt_ops.extend(hint_ops.iter().flat_map(|op| {
+        [
+            LtOperation::new(op.hint_id, hint::HINT_SELECTOR_BOUND, false),
+            LtOperation::new(
+                op.in_addr & 0xFFFF_FFFF,
+                hint::HINT_IN_ADDR_LIMB_BOUND,
+                false,
+            ),
+        ]
+    }));
 
     // =====================================================================
     // PHASE 4: All → Bitwise lookups
@@ -3947,6 +3961,24 @@ pub fn count_table_lengths(
             current_commit_index = current_commit_index
                 .checked_add(count)
                 .ok_or_else(|| Error::Execution("commit index exceeds u32 range".into()))?;
+        }
+
+        if cpu_op.ecall_hint {
+            // Mirror `collect_hint_ops`: three register reads (a0/a1/a2) and four
+            // 8-byte output writes go through the memory argument, plus the two LT
+            // range-checks (selector < 3, in_addr low limb). Replaying it here keeps
+            // memory/register state in sync with generation, exactly like commit above.
+            let (hint_memw, _hint_op) =
+                collect_hint_ops(&cpu_op, &mut memory_state, &mut register_state);
+            for memw_op in &hint_memw {
+                partition_memw(
+                    memw_op,
+                    &mut memw_by_width,
+                    &mut memw_aligned_count,
+                    &mut memw_register_count,
+                );
+            }
+            lt_count += 2;
         }
 
         // CPU-side per-instruction-kind counters (non-word; word → CPU32, B5b)
