@@ -233,8 +233,8 @@ RAM on one and by VRAM on the other. Host peaks are machine-specific: the bench 
 itself measured **~52 GB** of peak heap for the same block and epoch. See
 [Choosing the epoch size](#choosing-the-epoch-size) for the full curve and the other
 tiers. The bundle on disk is ~1.15 GB (1.12 GB on the GPU path); a block would have to
-be ~1.7x heavier to push it past 2 GiB, which needs rkyv `pointer_width_64` to
-serialize.
+be ~1.9x heavier to push it past the 2 GiB (2.147 GB) rkyv offset limit, which needs
+`pointer_width_64` to serialize.
 
 **`/bench` proves this block and nothing else** — 3 sampled runs against the cached
 3-run baseline main publishes on every push. `/bench N` changes the sample count
