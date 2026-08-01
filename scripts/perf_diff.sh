@@ -85,7 +85,7 @@ if [ "$WORKLOAD" = "real" ]; then
   echo "==> Verifying ethrex real-block fixture (fetches on a digest miss)"
   make ethrex-real-block-fixture
 elif [ ! -f "$INPUT_REL" ]; then
-  echo "ERROR: missing $INPUT_REL — run bench_abba.sh once (it builds the fixture)." >&2
+  echo "ERROR: missing $INPUT_REL — run WORKLOAD=synthetic scripts/bench_abba.sh once (it generates the synthetic fixture; the default workload is real and would not)." >&2
   exit 1
 fi
 echo "==> Workload: $WORKLOAD ($INPUT_REL${CONT_ARGS:+, continuations epoch 2^$EPOCH_SIZE_LOG2})"
