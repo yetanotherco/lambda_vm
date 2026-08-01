@@ -229,8 +229,9 @@ jobs:
           # Makefile). The guard covers the window after a repoint but before the new
           # artifact is uploaded: warn instead of failing, so a push to main cannot go
           # red over an upload nobody in CI can perform. On push and workflow_dispatch
-          # the growth sweep still runs and the comment renders it; on a plain /bench
-          # nothing is left to measure, and the comment footer says exactly that.
+          # the growth sweep still runs and feeds the baseline artifact (no comment is
+          # posted on those events — the Comment step is gated to comment triggers);
+          # on a plain /bench nothing is left to measure, and the footer says so.
           if [ "$RUN_REAL" = "true" ] && [ -z "$(make -s print-real-block-fixture-url)" ]; then
             echo "::warning::Real-block benchmark skipped: ETHREX_REAL_BLOCK_FIXTURE_URL is unset in the Makefile."
             RUN_REAL=false
