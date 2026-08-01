@@ -13,15 +13,15 @@
 #
 # USAGE (on the bench server):
 #   scripts/perf_diff.sh REF_A [REF_B=origin/main]
-#   Env: WORKLOAD=synthetic|real (default synthetic) picks the block to profile;
+#   Env: WORKLOAD=real|synthetic (default real) picks the block to profile;
 #        EPOCH_SIZE_LOG2=<n> (default 22) sizes the epoch, WORKLOAD=real only.
 #          22 is the calibrated bench-runner tier, matching /bench; use 23 on a
 #          128 GiB box (tooling/ethrex-block-converter/README.md, "Choosing the epoch size").
 #
 # Pick the workload that matches the run you are localizing, because the symbol
-# mix follows the block: the synthetic default is 20 plain transfers (8.73M cycles,
-# 411 keccak calls, 80 ecsm calls) and a real block inverts that (50.78M cycles,
-# 10,478 keccak, 116 ecsm), so a hot symbol in one need not be hot in the other.
+# mix follows the block: the real default is 50.78M cycles, 10,478 keccak calls and
+# 116 ecsm calls, and the synthetic option (20 plain transfers) inverts that at
+# 8.73M cycles, 411 keccak, 80 ecsm — so a hot symbol in one need not be hot in the other.
 # Both counts are from the same guest ELF (merge fdb92f67, main @ 9ccdaf2, clang 21);
 # they move with guest optimisation (#861's thin LTO) and ~2% with the clang major, so
 # pin the ELF when quoting one.
@@ -47,7 +47,7 @@ if [ $# -lt 1 ]; then
 fi
 REF_A="$1"
 REF_B="${2:-origin/main}"
-WORKLOAD="${WORKLOAD:-synthetic}"
+WORKLOAD="${WORKLOAD:-real}"
 # 2^22: the calibrated tier for the bench server this script targets, same as
 # /bench's real-block arm. Memory picks it, not speed — that server peaks at ~52 GB on
 # a >=64 GiB floor, and 2^23 measured 60 GiB on a roomier box, so it would not fit here.

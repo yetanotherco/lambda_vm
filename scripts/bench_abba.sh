@@ -37,22 +37,33 @@
 #        TX_COUNT=<n> ethrex transfer fixture to prove (default 5; use 20 for a
 #          large continuation trace where GPU-residency wins are visible).
 #          Ignored when WORKLOAD=real.
-#        WORKLOAD=synthetic|real (default synthetic) which block to prove. `real`
+#        WORKLOAD=real|synthetic (default real) which block to prove. `real`
 #          fetches the real-block fixture (block identity lives in the Makefile) and
 #          forces --continuations; TX_COUNT and CONTINUATIONS do not apply to it.
 #
-#   On WORKLOAD: the synthetic default is N plain transfers — ecrecover-heavy over a
-#   near-empty state — while a real block is keccak- and trie-bound, so a prover change
-#   can move the two in opposite directions. `real` is what benchmark-gpu.yml runs by
-#   default; `synthetic` stays the default HERE so CPU /bench-abba results remain
-#   comparable with everything recorded before.
+#   On WORKLOAD: a real block is keccak- and trie-bound, while the synthetic option is
+#   N plain transfers — ecrecover-heavy over a near-empty state — so a prover change can
+#   move the two in opposite directions. `real` is the default here, in benchmark-gpu.yml
+#   and in /bench, so the screen and its tiebreaker resolve the same workload; pass
+#   WORKLOAD=synthetic to reproduce a number recorded against that fixture.
 #
-#   Sizing (ethrex pair-noise sd ~1.2%, 80% power): ~12 pairs for a 1% effect,
-#   ~18 for 0.8%, ~32 for 0.6%. Default 20 -> solid on 0.8-1%, ~60% power at 0.6%
-#   (if a 20-pair run straddles 0 on a ~0.6%-looking effect, extend to 32).
+#   Sizing at WORKLOAD=real, from the paired t-test (resolvable 95% delta =
+#   t* x sd / sqrt(N)). The pair-delta sd on the bench runner is NOT yet measured; the
+#   two columns bracket it between 1.0% (the GPU box's measured 0.64% plus margin) and
+#   2.0% (sqrt(2) x the runner's measured 1.43% single-run CV):
+#
+#     pairs   wall      resolves (sd 2.0% / sd 1.0%)
+#      8      ~50 min    1.7% / 0.8%
+#     12      ~72 min    1.3% / 0.6%   <- workflow default
+#     20      ~1h55m     0.9% / 0.5%
+#     32      ~3h        0.7% / 0.4%
+#
+#   Wall assumes epoch 2^22 (158.8 s per prove, two per pair) plus ~8 min of setup.
+#   The first real ABBA run MEASURES that sd — read it off the `sd` field of the
+#   paired-t line printed below — and this table should be re-pinned to it.
 #
 #   scripts/bench_abba.sh origin/my-pr-branch                # vs main, 20 pairs
-#   scripts/bench_abba.sh origin/my-pr-branch origin/main 32 # 32 pairs (~0.6%)
+#   scripts/bench_abba.sh origin/my-pr-branch origin/main 32 # 32 pairs
 
 set -euo pipefail
 
@@ -76,7 +87,7 @@ CONTINUATIONS="${CONTINUATIONS:-0}"
 EPOCH_SIZE_LOG2="${EPOCH_SIZE_LOG2:-20}"
 # ethrex transfer-count fixture to prove (executor/tests/ethrex_${TX_COUNT}_transfers.bin).
 TX_COUNT="${TX_COUNT:-5}"
-WORKLOAD="${WORKLOAD:-synthetic}"
+WORKLOAD="${WORKLOAD:-real}"
 case "$WORKLOAD" in
   synthetic|real) ;;
   *) echo "ERROR: WORKLOAD must be 'synthetic' or 'real' (got '$WORKLOAD')." >&2; exit 2 ;;

@@ -30,34 +30,32 @@
 #        below 6: the exact Wilcoxon's smallest attainable two-sided p is 2/2^n, so at
 #        n=4 it is 0.125 and the arm can only ever report BORDERLINE, however large and
 #        clean the effect.
-#        WORKLOAD=synthetic|real (default synthetic) which BLOCK both arms prove.
+#        WORKLOAD=real|synthetic (default real) which BLOCK both arms prove.
 #        `real` fetches the real-block fixture (identity lives in the Makefile) and runs
 #        the continuation arm ONLY — a real block is hundreds of GB monolithically, so
 #        that arm is skipped rather than left to OOM. See "Workload" below.
-#        CONT_EPOCH_LOG2=<n> continuation epoch size (default 20, min 18). For
-#        WORKLOAD=real prefer the calibrated tier for the box you are on — 2^22 on the
-#        bench runner or a 64 GiB machine, 2^23 on a 128 GiB one (see
-#        tooling/ethrex-block-converter/README.md, "Choosing the epoch size"); the default
-#        below is chosen for the SYNTHETIC arm. 20 matches
-#        scripts/bench_abba.sh, so this arm proves the same bundle shape /bench-abba
-#        already proves on the same server — and 20 txs at 2^20 is strictly cheaper than
-#        the 100 txs at 2^20 that /bench-abba runs by default, so it can't be the thing
-#        that OOMs the box. (`cli prove --epoch-size-log2 --help` measured ethrex 10tx
-#        at ~9.5 GB for 2^20 vs ~15.8 GB for 2^21.) Note this does NOT match
-#        bench_recursion_cycles.sh's BLOCK_EPOCH_LOG2=21: that arm needs FEW epochs so
-#        the bundle fits the guest's 512 MiB private-input cap, a constraint that
-#        doesn't apply to host-side verification.
+#        CONT_EPOCH_LOG2=<n> continuation epoch size (default 20, min 18). 20 is the
+#        laptop-safe setting, not the fast one: prefer the calibrated tier for the box
+#        you are on — 2^22 on the bench runner or a 64 GiB machine, 2^23 on a 128 GiB
+#        one (see tooling/ethrex-block-converter/README.md, "Choosing the epoch size"),
+#        which is what /bench and /bench-abba pin. (`cli prove --epoch-size-log2 --help`
+#        measured ethrex 10tx at ~9.5 GB for 2^20 vs ~15.8 GB for 2^21.) Note this does
+#        NOT match bench_recursion_cycles.sh's BLOCK_EPOCH_LOG2=21: that arm needs FEW
+#        epochs so the bundle fits the guest's 512 MiB private-input cap, a constraint
+#        that doesn't apply to host-side verification.
 #
 # Workload. What this script measures is VERIFY cost, and verify cost is structural in
 # the proof — table mix, trace lengths, query count — so the block decides what is being
-# measured, not the loop around it. The synthetic default is 20 plain transfers:
-# ecrecover-heavy over a near-empty state. A real block inverts that mix (keccak- and
-# trie-bound), so a verifier change can move the two differently.
+# measured, not the loop around it. A real block is keccak- and trie-bound; the synthetic
+# option is 20 plain transfers, ecrecover-heavy over a near-empty state, and inverts that
+# mix, so a verifier change can move the two differently.
 #
-# `synthetic` stays the default because it is what `/bench-verify` runs and what every
-# number recorded so far used; `real` is the representative one, and costs a ~2.6 min
-# continuation prove per side (cached in $WORK afterwards) before any verify run.
-# Both sides always prove the same block, so a comparison is never mixed.
+# `real` is the default here because it is the representative one and what /bench and
+# /bench-abba measure. It costs a ~2.6 min continuation prove per side (cached in $WORK
+# afterwards) before any verify run, and skips the monolithic arm. `/bench-verify` pins
+# WORKLOAD=synthetic so its two-arm reports stay comparable with the numbers recorded
+# against that fixture. Both sides always prove the same block, so a comparison is
+# never mixed.
 
 set -euo pipefail
 
@@ -72,7 +70,7 @@ N_PAIRS="${3:-20}"
 BENCH_FEATURES="${BENCH_FEATURES:-jemalloc-stats}"
 CONT_PAIRS="${CONT_PAIRS:-8}"
 CONT_EPOCH_LOG2="${CONT_EPOCH_LOG2:-20}"
-WORKLOAD="${WORKLOAD:-synthetic}"
+WORKLOAD="${WORKLOAD:-real}"
 case "$WORKLOAD" in
   synthetic|real) ;;
   *) echo "ERROR: WORKLOAD must be 'synthetic' or 'real' (got '$WORKLOAD')." >&2; exit 2 ;;

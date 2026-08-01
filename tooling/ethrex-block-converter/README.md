@@ -147,22 +147,21 @@ it — see [Measured cost of candidate blocks](#measured-cost-of-candidate-block
 
 | Where | How to run it | Cost (current default) |
 |---|---|---|
-| `benchmark-pr.yml` | **`/bench`** on a PR — the only workload it proves; also push to main and `workflow_dispatch` | 3 runs, 158.8 s each (~8 min of proving) |
-| `scripts/bench_verify.sh` | `WORKLOAD=real scripts/bench_verify.sh <ref>` | ~2.6 min per side, then cached |
-| `scripts/perf_diff.sh` | `WORKLOAD=real scripts/perf_diff.sh <ref>` | 5 recordings, so ~13 min of proving |
-| `benchmark-gpu.yml` | `/bench-gpu` on a PR — **the default there** | 59.87 s/prove on an RTX 5090 (see below) |
-| `scripts/bench_abba.sh` | `WORKLOAD=real scripts/bench_abba.sh <ref>` | ~1.8 h at 20 pairs — **manual only** |
+| `benchmark-pr.yml` | **`/bench`** on a PR — also push to main and `workflow_dispatch` | 3 runs, 158.8 s each (~8 min of proving) |
+| `bench-abba.yml` | **`/bench-abba [N]`** on a PR | ~72 min at the default 12 pairs (see below) |
+| `benchmark-gpu.yml` | **`/bench-gpu [N]`** on a PR | 59.87 s/prove on an RTX 5090 (see below) |
+| `scripts/bench_verify.sh` | `scripts/bench_verify.sh <ref>` | ~2.6 min per side, then cached |
+| `scripts/perf_diff.sh` | `scripts/perf_diff.sh <ref>` | 5 recordings, so ~13 min of proving |
+| `scripts/bench_abba.sh` | `scripts/bench_abba.sh <ref> [base] [pairs]` | 2 x 158.8 s per pair |
+
+This block is what all three scripts prove by default (`WORKLOAD=real`); pass
+`WORKLOAD=synthetic` for the N-plain-transfer fixture instead. `/bench-verify` is the
+one flow that pins `synthetic`, because it reports a monolithic arm as well as a
+continuation one and a real block does not fit monolithically.
 
 None of them hardcode the fixture path or a block number — they read the path from
 `make -s print-real-block-fixture` and run `make ethrex-real-block-fixture` on every
 invocation, so the digest is re-checked rather than trusted.
-
-**`/bench-abba` is deliberately NOT wired to the real block.** The script supports
-it (`WORKLOAD=real`, which is what the GPU workflow drives), but the CPU ABBA
-workflow still defaults to the synthetic fixture: 20 pairs × 2 proves × 158.8 s
-is **~1.8 h** on the one shared bench runner, which every other bench queues behind.
-Run it by hand when a paired test on a real workload is worth that; the option is
-here rather than a footgun on a comment trigger.
 
 **Both bench flows prove this block.** `/bench` runs it sampled on the shared
 runner, against the cached baseline main publishes; `/bench-gpu [N]` runs it as
