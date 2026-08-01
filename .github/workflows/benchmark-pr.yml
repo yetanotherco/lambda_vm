@@ -46,8 +46,8 @@ env:
   #   1. Its only unique coverage was the MONOLITHIC prove path, which is vestigial
   #      (reportedly slower than a 1-epoch continuation). Coverage of a path we intend
   #      to delete is not a reason to spend runner time.
-  #   2. Its crypto mix is one no real block has: 8.83 ECSM per Mcycle against a real
-  #      block's ~1.3-1.6. Screening against it tunes the prover for a worst case that
+  #   2. Its crypto mix is one no real block has: 9.16 ECSM per Mcycle against a real
+  #      block's 2.28. Screening against it tunes the prover for a worst case that
   #      cannot occur.
   #
   # The synthetic fixtures themselves are NOT gone — /bench-growth still sweeps them to
@@ -90,12 +90,14 @@ env:
   #   2^22   397.88 s   32.21 GiB RSS   13 epochs   1.15 GB proof
   #   2^23   356.47 s   60.01 GiB RSS    7 epochs   0.90 GB proof
   #
-  # This runner's floor is >=64 GiB, so 2^22's 32.2 GiB fits with ~50% headroom while
-  # 2^23's 60 GiB does not fit safely — memory, not speed, is what picks 2^22 here.
-  # Moving off 2^21 is worth ~14% wall on the calibration box. That box is NOT this
-  # runner (it measured 8.6 s/Mcycle against this runner's 5.3-5.6), so treat the
-  # ratio as transferable and the absolute seconds as not: the first /bench run at
-  # this epoch establishes this runner's actual time.
+  # Those RSS figures are the CALIBRATION BOX's, and memory does not transfer between
+  # machines any better than seconds do: this runner measured ~52 GB of peak heap for
+  # the same block at 2^22 — over 1.5x the calibration box's 32.21 GiB, and close
+  # enough to its >=64 GiB floor that 2^23 (60 GiB on the roomier box, so more here)
+  # is out of the question. Memory, not speed, is what picks 2^22. Moving off 2^21 is
+  # worth ~14% wall on the calibration box; treat that ratio as transferable and
+  # neither the absolute seconds nor the RSS column as such. This runner's own
+  # measured time at 2^22 is 158.8 s (median of 3, 2.8% spread, 13 epochs).
   #
   # Deliberately NOT the CLI's DEFAULT_CONTINUATION_EPOCH_SIZE_LOG2, which stays 20 so
   # a laptop can still prove; and not the GPU path's 2^22, which happens to coincide
@@ -105,11 +107,11 @@ env:
   # spread). Fewer than the synthetic's 5 because each run is minutes rather than
   # seconds; enough that one slow run shows up as spread instead of moving the median.
   #
-  # THIS IS THE DIAL. The runner's per-run real-block time is still unmeasured — the
-  # calibration ran on a different box (see REAL_BLOCK_EPOCH_LOG2 above). If the first
-  # runs land above ~6 min each, /bench becomes a ~25 min occupancy of a runner every
-  # other bench queues behind, and this count is what to turn down (2, or 1) before
-  # reaching for anything else.
+  # THIS IS THE DIAL. A run measures 158.8 s on this runner (median of 3, 2.8% spread,
+  # at the epoch above), so 3 runs is ~8 min of proving and the right count. Should a
+  # future block or prover change take a run past ~6 min, /bench becomes a ~25 min
+  # occupancy of a runner every other bench queues behind, and this count is what to
+  # turn down (2, or 1) before reaching for anything else.
   # `/bench N` overrides this, clamped to [1,5]. Past 5 the cached comparison can't
   # beat the ~1% session-drift wall anyway — that is what /bench-abba is for.
   BENCH_RUNS_REAL: 3
@@ -210,21 +212,23 @@ jobs:
 
           # The real block runs on EVERY invocation — plain `/bench`, push to main, and
           # workflow_dispatch alike. It is the number that means something, so it should
-          # not need a second command to ask for; the synthetic screen rides along
-          # unchanged as the cheap, high-sensitivity half.
+          # not need a second command to ask for, and it is the only workload /bench
+          # proves.
           #
-          # The cost is real and lands on a shared runner: ~4.5-4.8 min per run x
-          # BENCH_RUNS_REAL, so every /bench and every push to main now occupies the
-          # bench server for roughly 15-20 min, and /bench-abba and /bench-verify queue
-          # behind it. That trade was made deliberately — see BENCH_RUNS_REAL above for
-          # the dial if it proves too expensive.
+          # The cost is real and lands on a shared runner: 158.8 s per run x
+          # BENCH_RUNS_REAL is ~8 min of proving, so every /bench and every push to main
+          # occupies the bench server for roughly 15 min once checkout, the two-sided
+          # build, the fixture fetch and the guest ELF are counted, and /bench-abba and
+          # /bench-verify queue behind it. That trade was made deliberately — see
+          # BENCH_RUNS_REAL above for the dial if it proves too expensive.
           RUN_REAL=true
 
           # The fixture is FETCHED from a pinned URL + sha256, not built (see the
           # Makefile). The guard covers the window after a repoint but before the new
-          # artifact is uploaded: degrade to the synthetic sections with a warning
-          # rather than failing, so a push to main cannot go red over an upload nobody
-          # in CI can perform.
+          # artifact is uploaded: warn instead of failing, so a push to main cannot go
+          # red over an upload nobody in CI can perform. On push and workflow_dispatch
+          # the growth sweep still runs and the comment renders it; on a plain /bench
+          # nothing is left to measure, and the comment footer says exactly that.
           if [ "$RUN_REAL" = "true" ] && [ -z "$(make -s print-real-block-fixture-url)" ]; then
             echo "::warning::Real-block benchmark skipped: ETHREX_REAL_BLOCK_FIXTURE_URL is unset in the Makefile."
             RUN_REAL=false
@@ -254,7 +258,7 @@ jobs:
 
           # Clamp to 1-5. Beyond 5 the single-session cached comparison barely improves
           # (it can't beat the ~1% drift wall); use the ABBA tiebreaker for finer deltas.
-          # At ~4-5 min a run this is also the difference between a 15 min and a 25 min
+          # At 158.8 s a run this is also the difference between a ~10 min and a ~20 min
           # occupancy of the one bench runner.
           if [ "$RUNS" -lt 1 ] 2>/dev/null || [ "$RUNS" -gt 5 ] 2>/dev/null; then
             echo "::warning::Run count $RUNS out of range [1,5], defaulting to $BENCH_RUNS_REAL"
@@ -759,7 +763,7 @@ jobs:
         with:
           # Renderable offline: `node scripts/render_bench_comment.js` extracts this block
           # and prints the markdown for a set of scenarios, so wording and formatting can
-          # be checked without occupying the bench server for 15-20 min. Add a scenario
+          # be checked without occupying the bench server for ~15 min. Add a scenario
           # there when you add a branch here.
           script: |
             const baseSrc = process.env.BASELINE_SRC;

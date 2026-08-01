@@ -60,9 +60,11 @@ env:
   #
   # GPU PATH ONLY, and deliberately so. It is NOT pushed into bench_abba.sh's default
   # (2^20, which the CPU /bench-abba uses) nor into the CLI's
-  # DEFAULT_CONTINUATION_EPOCH_SIZE_LOG2 (also 20): 2^22 needs ~28 GiB of HOST memory on
-  # a CPU build, which would break laptops. VRAM is the binding constraint here and host
-  # RAM is the binding constraint there, so the two defaults are not the same question.
+  # DEFAULT_CONTINUATION_EPOCH_SIZE_LOG2 (also 20): 2^22 needs ~32 GiB of HOST memory on
+  # a CPU build (measured peak RSS on the 124 GiB calibration box; the CUDA path's host
+  # peak is a different number, ~36 GB — see the cpu_ram floor below), which would break
+  # laptops. VRAM is the binding constraint here and host RAM is the binding constraint
+  # there, so the two defaults are not the same question.
   GPU_REAL_EPOCH_LOG2: "22"
   # Unique per-run label set on the instance, for easy identification in the Vast console.
   RUN_LABEL: "gpu-bench-${{ github.run_id }}-${{ github.run_attempt }}"

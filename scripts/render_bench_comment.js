@@ -4,7 +4,7 @@
 //
 // WHY: that comment is ~200 lines of JS embedded in YAML, and the only other way to
 // see its output is to push and run a real benchmark on the shared bench server
-// (~15-20 min of occupancy). This extracts the `script:` block from the workflow,
+// (~15 min of occupancy). This extracts the `script:` block from the workflow,
 // runs it against synthetic env values, and prints the markdown — so a wording or
 // formatting change is checked in a second.
 //

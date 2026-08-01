@@ -4,12 +4,15 @@
 # Reported % = (PR - baseline)/baseline, matching the classic /bench:
 # NEGATIVE numbers are improvements (PR faster/smaller); positive = regression.
 #
-# TWO arms over the same ethrex 20-tx block, both at blowup=2 / 219 queries:
+# Arms over one block, both at blowup=2 / 219 queries:
 #   monolithic     one VmProof for the whole execution.
 #   continuations  the same block proved as 2^CONT_EPOCH_LOG2-cycle epochs and verified
 #                  as a ContinuationProof bundle — what /bench proves and what an L2
 #                  actually runs, so a verifier change that only moves per-epoch or
 #                  aggregation cost is invisible in the monolithic arm alone.
+# WORKLOAD picks the block: `synthetic` (default) is the ethrex 20-tx one and runs both
+# arms; `real` runs the continuation arm only, since a real block does not fit
+# monolithically. See "Workload" below.
 # The continuation arm is best-effort: if its prove or verify fails (it is the
 # memory-hungry one) the arm is skipped with a note and the monolithic verdict still
 # posts, rather than failing the whole bench.
@@ -36,10 +39,10 @@
 #        bench runner or a 64 GiB machine, 2^23 on a 128 GiB one (see
 #        tooling/ethrex-block-converter/README.md, "Choosing the epoch size"); the default
 #        below is chosen for the SYNTHETIC arm. 20 matches
-#        scripts/bench_abba.sh, so this arm proves the same bundle shape /bench already
-#        proves on the same server — and 20 txs at 2^20 is strictly cheaper than the
-#        100 txs at 2^20 that /bench runs by default, so it can't be the thing that OOMs
-#        the box. (`cli prove --epoch-size-log2 --help` measured ethrex 10tx at ~9.5 GB
+#        scripts/bench_abba.sh, so this arm proves the same bundle shape /bench-abba
+#        already proves on the same server — and 20 txs at 2^20 is strictly cheaper than
+#        the 100 txs at 2^20 that /bench-abba runs by default, so it can't be the thing
+#        that OOMs the box. (`cli prove --epoch-size-log2 --help` measured ethrex 10tx at ~9.5 GB
 #        for 2^20 vs ~15.8 GB for 2^21.) Note this does NOT match
 #        bench_recursion_cycles.sh's BLOCK_EPOCH_LOG2=21: that arm needs FEW epochs so
 #        the bundle fits the guest's 512 MiB private-input cap, a constraint that
@@ -52,8 +55,8 @@
 # trie-bound), so a verifier change can move the two differently.
 #
 # `synthetic` stays the default because it is what `/bench-verify` runs and what every
-# number recorded so far used; `real` is the representative one, and costs a ~4.5-4.8
-# min continuation prove per side (cached in $WORK afterwards) before any verify run.
+# number recorded so far used; `real` is the representative one, and costs a ~2.6 min
+# continuation prove per side (cached in $WORK afterwards) before any verify run.
 # Both sides always prove the same block, so a comparison is never mixed.
 
 set -euo pipefail

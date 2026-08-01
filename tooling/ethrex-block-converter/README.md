@@ -20,14 +20,21 @@ All are measured.
 | serialized size | 32,766 B | 1,110,156 B |
 | cycles | 8,734,622 | **50,781,557** |
 | keccak / ecsm calls | 411 / 80 | **10,478** / 116 |
-| keccaks per ecrecover | 5.1 | **90** |
+| keccaks per ECSM call | 5.1 | **90** |
+
+The last row counts keccaks per **ECSM call**, which is the ratio of the two rows
+above it. One ecrecover issues four ECSM ecalls — `lincomb2_with_oracle` in
+`crypto/ethrex-crypto/src/lib.rs` makes four oracle queries, each an `ecsm_mul` — so
+per *ecrecover* the figures are 20.6 and 361, and the 80 and 116 above are 4x the 20
+synthetic and 29 real signature checks.
 
 Note the real block uses ~5.8x the gas and costs ~5.8x the cycles here, and that it
 inverts the crypto mix: the synthetic block is ecrecover-bound, the real one keccak-
 and trie-bound. That inversion is the point — a prover change can move the two
 numbers in opposite directions. (The gas and cycle ratios agreeing is a coincidence
-of this pair, not a rule: cycles/gas is 20.9 here and ranges ~21–38 across the
-candidate blocks.)
+of this pair, not a rule: cycles/gas is 20.9 for this block on this ELF, and spans
+29.7–38.2 across the three candidate blocks when all three are measured on one
+common pre-LTO ELF — a ~29% spread.)
 
 **Pin the ELF whenever you quote a cycle count.** Counts above were measured on this
 branch at merge `fdb92f67` (main @ `9ccdaf2`), guest built with **clang 21.1.8**.
@@ -140,11 +147,11 @@ it — see [Measured cost of candidate blocks](#measured-cost-of-candidate-block
 
 | Where | How to run it | Cost (current default) |
 |---|---|---|
-| `benchmark-pr.yml` | **`/bench`** on a PR — the only workload it proves; also push to main and `workflow_dispatch` | 3 runs, ~4–5 min each (first run at epoch 2^22 confirms) |
-| `scripts/bench_verify.sh` | `WORKLOAD=real scripts/bench_verify.sh <ref>` | ~4.5–4.8 min per side, then cached |
-| `scripts/perf_diff.sh` | `WORKLOAD=real scripts/perf_diff.sh <ref>` | 5 recordings, so ~25 min |
+| `benchmark-pr.yml` | **`/bench`** on a PR — the only workload it proves; also push to main and `workflow_dispatch` | 3 runs, 158.8 s each (~8 min of proving) |
+| `scripts/bench_verify.sh` | `WORKLOAD=real scripts/bench_verify.sh <ref>` | ~2.6 min per side, then cached |
+| `scripts/perf_diff.sh` | `WORKLOAD=real scripts/perf_diff.sh <ref>` | 5 recordings, so ~13 min of proving |
 | `benchmark-gpu.yml` | `/bench-gpu` on a PR — **the default there** | 59.87 s/prove on an RTX 5090 (see below) |
-| `scripts/bench_abba.sh` | `WORKLOAD=real scripts/bench_abba.sh <ref>` | ~4 h at 20 pairs — **manual only** |
+| `scripts/bench_abba.sh` | `WORKLOAD=real scripts/bench_abba.sh <ref>` | ~1.8 h at 20 pairs — **manual only** |
 
 None of them hardcode the fixture path or a block number — they read the path from
 `make -s print-real-block-fixture` and run `make ethrex-real-block-fixture` when
@@ -152,8 +159,8 @@ the `.bin` is absent.
 
 **`/bench-abba` is deliberately NOT wired to the real block.** The script supports
 it (`WORKLOAD=real`, which is what the GPU workflow drives), but the CPU ABBA
-workflow still defaults to the synthetic fixture: 20 pairs × 2 proves × ~4.5–4.8 min
-is **~3 hours** on the one shared bench runner, which every other bench queues behind.
+workflow still defaults to the synthetic fixture: 20 pairs × 2 proves × 158.8 s
+is **~1.8 h** on the one shared bench runner, which every other bench queues behind.
 Run it by hand when a paired test on a real workload is worth that; the option is
 here rather than a footgun on a comment trigger.
 
@@ -181,15 +188,16 @@ raw traces are in `~/workspace/lambda_vm_bench_cache/gpu_epoch_calib_2026-07-31/
 
 That default is **GPU-path only**. `bench_abba.sh` still defaults to 2^20 for the CPU
 `/bench-abba`, and the CLI's own `DEFAULT_CONTINUATION_EPOCH_SIZE_LOG2` is still 20:
-2^22 needs ~28 GiB of *host* memory on a CPU build, which would break laptops. VRAM
-binds on one path and host RAM on the other, so they are not the same question and the
-GPU number must not be copied across. **The CPU-server epoch recommendation is pending
-calibration.**
+2^22 needs ~32 GiB of *host* memory on a CPU build (peak RSS on the calibration box),
+which would break laptops. VRAM binds on one path and host RAM on the other, so they
+are not the same question and the GPU number must not be copied across. See
+[Choosing the epoch size](#choosing-the-epoch-size) for the CPU tiers.
 
-The CPU bench runner is roughly **4.5–4.8x** the GPU wall time for the same block.
+The CPU bench runner is roughly **2.65x** the GPU wall time for the same block: 158.8 s
+median against the calibration RTX 5090's 59.87 s, both at epoch 2^22.
 
-Do not derive one from the other in general: the CPU rate (5.31–5.62 s/Mcycle) does not
-transfer to the GPU, and the RTX 5090 sweep found the prover CPU-bound at the serial
+Do not derive one from the other in general: the CPU rate (3.13 s/Mcycle on this block)
+does not transfer to the GPU, and the RTX 5090 sweep found the prover CPU-bound at the serial
 producer above epoch 2^21, so GPU time lands closer to CPU time than a naive
 device-throughput estimate suggests.
 
@@ -198,12 +206,14 @@ prove grows ~4.9 GB per million cycles on this workload family (measured on the
 bench server: `10,728 MB + 2,007 MB/transfer`, R² = 0.998 across 4→20 transfers),
 so this block would need **~240 GB** monolithically — and a heavier candidate far
 more. `--continuations` makes peak heap a function of the epoch size instead of the
-trace length, so the same block fits in **~32 GiB** at epoch 2^22, the setting both the
-CPU bench runner and the GPU path now use — picked by host RAM on one and by VRAM on
-the other. See [Choosing the epoch size](#choosing-the-epoch-size) for the full curve
-and the other tiers. The
-bundle on disk is ~1.9 GB; note that a heavier block pushes it past 2 GiB, which
-needs rkyv `pointer_width_64` to serialize.
+trace length, so the same block fits in **~32 GiB** at epoch 2^22 on the calibration
+box — the setting both the CPU bench runner and the GPU path now use, picked by host
+RAM on one and by VRAM on the other. Host peaks are machine-specific: the bench runner
+itself measured **~52 GB** of peak heap for the same block and epoch. See
+[Choosing the epoch size](#choosing-the-epoch-size) for the full curve and the other
+tiers. The bundle on disk is ~1.15 GB (1.12 GB on the GPU path); a block would have to
+be ~1.7x heavier to push it past 2 GiB, which needs rkyv `pointer_width_64` to
+serialize.
 
 **`/bench` proves this block and nothing else** — 3 sampled runs against the cached
 3-run baseline main publishes on every push. `/bench N` changes the sample count
@@ -216,8 +226,8 @@ make twice:
 1. Its only unique coverage was the **monolithic** prove path, which is vestigial —
    reportedly slower than a single-epoch continuation. Spending runner time to cover
    a path we intend to delete is not a trade worth making.
-2. Its crypto mix is one **no real block has**: 8.83 ECSM per Mcycle, against a real
-   block's ~1.3–1.6. Screening against it tunes the prover for a worst case that
+2. Its crypto mix is one **no real block has**: 9.16 ECSM per Mcycle, against a real
+   block's 2.28. Screening against it tunes the prover for a worst case that
    cannot occur.
 
 The synthetic fixtures themselves are not gone — `/bench-growth` still sweeps them for
@@ -225,11 +235,12 @@ a heap-vs-block-size slope, which needs a family of blocks and so cannot come fr
 real one. `/bench-abba` and `/bench-verify` are untouched.
 
 **The cost is a shared resource.** One runner carries every `/bench`, `/bench-abba`
-and `/bench-verify` in the repo, and a `/bench` now occupies it for **~15–20 min**, on
-every comment and every push to main. `BENCH_RUNS_REAL` in `benchmark-pr.yml` is the
-dial. Its per-run time on that runner is still unmeasured — the epoch calibration ran
-on a different box — so the first run is what tells you whether 3 was the right
-number; above ~6 min a run, turn it down.
+and `/bench-verify` in the repo, and a `/bench` now occupies it for **~15 min**, on
+every comment and every push to main — ~8 min of that is the three proves, the rest is
+checkout, a two-sided build, the fixture fetch and the guest ELF. `BENCH_RUNS_REAL` in
+`benchmark-pr.yml` is the dial. A run measured **158.8 s** on that runner (median of 3,
+2.8% spread, 13 epochs, epoch 2^22), so 3 runs is the right count; the dial is there
+for a future block or prover change that takes a run past ~6 min.
 
 Cycle counts here (8.73M synthetic, 50.78M real) are from merge `fdb92f67` (main @
 `9ccdaf2`, clang 21). They move with guest optimisation and ~2% with the clang major,
@@ -313,13 +324,13 @@ repointed ~1 MB fixture cannot become committable by accident.
 
 Cost is a property of the block, so it changes with the repoint. All figures are
 measured, never derived from gas — **cycles per gas is not constant** (20.9 for the
-current default), so ranking candidates by gas mispredicts cost.
+current default), so sizing a candidate from its gas mispredicts cost.
 
 **Current default — main-vintage (merge `fdb92f67`, main @ `9ccdaf2`):**
 
 | block | gas | cycles | GPU prove (RTX 5090) | CPU prove | proof | fixture |
 |---|---|---|---|---|---|---|
-| **mainnet 25368371** | 2.43M | **50,781,557** (clang 21)<br>50,713,534 (clang 18) | **59.87 s** @ epoch 2^22 | ~4.5–4.8x the GPU wall | ~1.9 GB | 1,110,156 B, `61eba49b…` |
+| **mainnet 25368371** | 2.43M | **50,781,557** (clang 21)<br>50,713,534 (clang 18) | **59.87 s** @ epoch 2^22 | **158.8 s** @ epoch 2^22 (2.65x the GPU wall) | 1.15 GB CPU / 1.12 GB GPU | 1,110,156 B, `61eba49b…` |
 
 Epoch 2^22 is the GPU recommendation: VRAM binds, 2^22 leaves 28.9% headroom on a
 32 GiB card and 2^23 does not fit one at all. See
@@ -340,10 +351,13 @@ All three clear the usability screen. Add a row rather than editing the wiring, 
 say which ELF a number came from.
 
 Two things these numbers show that a gas-based estimate would have got wrong, and both
-survive the vintage change because they are same-ELF comparisons. **Gas does not order
-cost:** 25453112 carries *more* gas than hoodi 1265656 yet costs ~25% fewer cycles.
-And **fixture size does not track cost** either: the current default is the cheapest
-block and the middle-sized fixture.
+survive the vintage change because they are same-ELF comparisons. **Gas does not
+predict how much cost:** on one common pre-LTO ELF the three blocks run at 30.8, 29.7
+and 38.2 cycles per gas, so budgeting a candidate from gas alone is off by up to ~29%
+— 25453112 and hoodi 1265656 sit within 4% of each other on gas (4.24M vs 4.40M) yet
+25453112 costs ~25% fewer cycles (125.9M vs 168.3M). Gas happens to *order* these
+three correctly; it does not size them. And **fixture size does not track cost**
+either: the current default is the cheapest block and the middle-sized fixture.
 
 The default is the cheapest of the three, which matters because the CPU workload sits
 on a single shared bench runner. It was also the only block in a 90-day Dune sweep
@@ -359,7 +373,7 @@ machine, not of the block**. Three tiers, all measured:
 | where | epoch | why |
 |---|---|---|
 | GPU, 32 GiB card | **2^22** | VRAM-bound — 2^23 does not fit |
-| CPU bench runner (≥64 GiB) | **2^22** | host-RAM-bound — 2^23's 60 GiB does not fit safely |
+| CPU bench runner (≥64 GiB) | **2^22** | host-RAM-bound — it already peaks at ~52 GB here, and 2^23 measured 60 GiB on a roomier box |
 | CPU server, 128 GiB class | **2^23** | the knee; 2^24 fits but is not worth it |
 | laptops (CLI default) | **2^20** | unchanged, so a plain `cli prove` still works |
 
@@ -385,10 +399,12 @@ A main-vintage anchor also ran on the same box: 2^23 = 344.12 s / 58.87 GiB, i.e
 faster than branch vintage at the same memory — as expected, since #861 cut cycles and
 peak RSS is set by the epoch size rather than the trace length.
 
-**Do not read absolute seconds off this table for another machine.** The calibration box
-runs ~8.6 s/Mcycle against the bench runner's 5.31–5.62, so the *ratios* between epochs
-transfer and the wall times do not. `/bench`'s real-block arm now runs at 2^22 (it was
-2^21); the first run after that change establishes the runner's real number.
+**Do not read absolute seconds or peak memory off this table for another machine.** This
+box took 397.88 s at 2^22 on its branch-vintage ELF; the bench runner takes 158.8 s at
+the same epoch on the main-vintage one — a 2.5x gap, against the ~6% the two cycle
+counts differ by. The *ratios* between epochs transfer; the wall times do not. Memory
+transfers no better: the bench runner peaks at ~52 GB of heap at 2^22 where this box
+measured 32.21 GiB RSS.
 
 ### Verifying a repoint
 

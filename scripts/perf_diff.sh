@@ -27,8 +27,9 @@
 # pin the ELF when quoting one.
 #
 # WORKLOAD=real also switches to a continuation prove (monolithic would need ~240 GB
-# at that trace length), which is ~4-5 min per recording — five recordings, so budget
-# ~25 min, plus ~1.2 GB of disk per bundle and ~32 GiB of RAM at the default epoch.
+# at that trace length), which is 158.8 s per recording on the bench runner — five
+# recordings, so budget ~13 min of proving, plus ~1.2 GB of disk per bundle and ~52 GB
+# of RAM at the default epoch.
 #
 # Produces:
 #   - two perf-diff tables (recorded twice per side, interleaved B A B A —
@@ -48,8 +49,8 @@ REF_A="$1"
 REF_B="${2:-origin/main}"
 WORKLOAD="${WORKLOAD:-synthetic}"
 # 2^22: the calibrated tier for the bench server this script targets, same as
-# /bench's real-block arm. Memory picks it, not speed — 32.2 GiB fits a >=64 GiB box with ~50%
-# headroom where 2^23's 60 GiB does not.
+# /bench's real-block arm. Memory picks it, not speed — that server peaks at ~52 GB on
+# a >=64 GiB floor, and 2^23 measured 60 GiB on a roomier box, so it would not fit here.
 EPOCH_SIZE_LOG2="${EPOCH_SIZE_LOG2:-22}"
 case "$WORKLOAD" in
   synthetic|real) ;;
