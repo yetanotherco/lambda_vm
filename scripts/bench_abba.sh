@@ -10,8 +10,9 @@
 # than an unpaired two-sample test.
 #
 # WHAT IT DOES:
-#   1. Builds the ethrex guest ELF + 5-transfer fixture once (identical for both
-#      sides — a prover-only change doesn't touch the guest).
+#   1. Builds the ethrex guest ELF and obtains the workload fixture once (identical
+#      for both sides — a prover-only change doesn't touch the guest). Which fixture
+#      is WORKLOAD's business; see below.
 #   2. Builds the `cli` prover at REF_A and REF_B (skips the build and reuses the
 #      cached binaries if they already exist; set REBUILD=1 to force).
 #   3. Runs N_PAIRS interleaved pairs in A B B A ... order (alternating which side
@@ -35,6 +36,16 @@
 #        EPOCH_SIZE_LOG2=<n> continuation epoch size (default 20; min 18).
 #        TX_COUNT=<n> ethrex transfer fixture to prove (default 5; use 20 for a
 #          large continuation trace where GPU-residency wins are visible).
+#          Ignored when WORKLOAD=real.
+#        WORKLOAD=synthetic|real (default synthetic) which block to prove. `real`
+#          fetches the real-block fixture (block identity lives in the Makefile) and
+#          forces --continuations; TX_COUNT and CONTINUATIONS do not apply to it.
+#
+#   On WORKLOAD: the synthetic default is N plain transfers — ecrecover-heavy over a
+#   near-empty state — while a real block is keccak- and trie-bound, so a prover change
+#   can move the two in opposite directions. `real` is what benchmark-gpu.yml runs by
+#   default; `synthetic` stays the default HERE so CPU /bench-abba results remain
+#   comparable with everything recorded before.
 #
 #   Sizing (ethrex pair-noise sd ~1.2%, 80% power): ~12 pairs for a 1% effect,
 #   ~18 for 0.8%, ~32 for 0.6%. Default 20 -> solid on 0.8-1%, ~60% power at 0.6%
@@ -65,6 +76,18 @@ CONTINUATIONS="${CONTINUATIONS:-0}"
 EPOCH_SIZE_LOG2="${EPOCH_SIZE_LOG2:-20}"
 # ethrex transfer-count fixture to prove (executor/tests/ethrex_${TX_COUNT}_transfers.bin).
 TX_COUNT="${TX_COUNT:-5}"
+WORKLOAD="${WORKLOAD:-synthetic}"
+case "$WORKLOAD" in
+  synthetic|real) ;;
+  *) echo "ERROR: WORKLOAD must be 'synthetic' or 'real' (got '$WORKLOAD')." >&2; exit 2 ;;
+esac
+# A real block sits far past the monolithic memory ceiling (~4.9 GB of peak heap per
+# million cycles puts it in the hundreds of GB), so continuations are forced rather
+# than offered: CONTINUATIONS=0 here could only produce an OOM.
+if [ "$WORKLOAD" = "real" ] && [ "$CONTINUATIONS" != "1" ]; then
+  echo "   NOTE: WORKLOAD=real always proves with continuations (monolithic would OOM)."
+  CONTINUATIONS=1
+fi
 if [ "$CONTINUATIONS" = "1" ]; then
   CONT_ARGS="--continuations --epoch-size-log2 $EPOCH_SIZE_LOG2"
 else
@@ -72,7 +95,8 @@ else
 fi
 
 ELF_REL="executor/program_artifacts/rust/ethrex.elf"
-INPUT_REL="executor/tests/ethrex_${TX_COUNT}_transfers.bin"
+# Resolved after the cd to the repo root (WORKLOAD=real reads it from the Makefile).
+INPUT_REL=""
 WORK="/tmp/abba_run"
 WT="/tmp/abba_wt"
 PROOF="/tmp/abba_proof.bin"
@@ -94,6 +118,16 @@ if [ $((N_PAIRS % 2)) -ne 0 ]; then
 fi
 echo "   pairs=$N_PAIRS  (=$((N_PAIRS * 2)) prove runs)"
 
+# The real block's identity lives in the Makefile and nowhere else, so repointing it
+# never needs an edit here.
+if [ "$WORKLOAD" = "real" ]; then
+  INPUT_REL="$(make -s print-real-block-fixture)"
+  echo "   workload=real  $INPUT_REL  (continuations, epoch 2^$EPOCH_SIZE_LOG2)"
+else
+  INPUT_REL="executor/tests/ethrex_${TX_COUNT}_transfers.bin"
+  echo "   workload=synthetic  ${TX_COUNT}tx  $INPUT_REL"
+fi
+
 mkdir -p "$WORK"
 
 # --- 1. Guest ELF + fixture (identical for both sides; build once if missing) ---
@@ -103,9 +137,17 @@ if [ ! -f "$ELF_REL" ]; then
   make "$ELF_REL"
 fi
 if [ ! -f "$INPUT_REL" ]; then
-  echo "==> Generating ethrex ${TX_COUNT}-transfer fixture (missing)"
-  ( cd tooling/ethrex-fixtures && cargo build --release )
-  tooling/ethrex-fixtures/target/release/ethrex-fixtures "$TX_COUNT" "$INPUT_REL" distinct
+  if [ "$WORKLOAD" = "real" ]; then
+    # ~1 MB, gitignored, never in a fresh checkout — and a rented GPU box is always a
+    # fresh checkout. Fetched by URL + sha256, not built: no converter, no ethrex host
+    # dependency tree, so this costs seconds on the box.
+    echo "==> Fetching ethrex real-block fixture (missing)"
+    make ethrex-real-block-fixture
+  else
+    echo "==> Generating ethrex ${TX_COUNT}-transfer fixture (missing)"
+    ( cd tooling/ethrex-fixtures && cargo build --release )
+    tooling/ethrex-fixtures/target/release/ethrex-fixtures "$TX_COUNT" "$INPUT_REL" distinct
+  fi
 fi
 ELF="$(cd "$(dirname "$ELF_REL")" && pwd)/$(basename "$ELF_REL")"
 INPUT="$(cd "$(dirname "$INPUT_REL")" && pwd)/$(basename "$INPUT_REL")"
