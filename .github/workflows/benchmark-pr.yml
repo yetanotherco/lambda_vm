@@ -435,7 +435,10 @@ jobs:
           # numbers become the cached baseline, and a noisy one mis-verdicts every
           # /bench until the next refresh (2026-08-03: a 65.8%-spread baseline made
           # healthy PRs read as ±20-35% for half an hour).
-          if awk "BEGIN { exit !($TIME_SPREAD > 5.0) }"; then
+          # 3%: the comment's verdict bands treat >=3% as a reportable delta, so a
+          # spread that could manufacture one is by definition too noisy. Keep in
+          # sync with the two 3.0 thresholds in the Comment step's renderer.
+          if awk "BEGIN { exit !($TIME_SPREAD > 3.0) }"; then
             echo "::warning::Real-block prove-time spread ${TIME_SPREAD}% ($ALL_TIMES) — if this run publishes a baseline, /bench will flag comparisons against it as unreliable."
           fi
 
@@ -835,7 +838,9 @@ jobs:
                 // A noisy baseline invalidates every Δ in the table, so the row icons
                 // go neutral too — a 🟢 beside a number the warning below calls
                 // unreliable reads as a verdict anyway.
-                const baseNoisy = !!(baseRealSpread && parseFloat(baseRealSpread) > 5.0);
+                // 3%, matching the verdict band below: a delta >=3% is reportable, so
+                // a spread that could manufacture one makes the baseline unusable.
+                const baseNoisy = !!(baseRealSpread && parseFloat(baseRealSpread) > 3.0);
                 const rowIcon = (pct) => baseNoisy ? '❔' : icon(pct);
                 body += `| Metric | main | PR | Δ |\n`;
                 body += `|--------|------|----|---|\n`;
@@ -850,7 +855,7 @@ jobs:
                 const rp = parseFloat(realTimePct);
                 // A noisy baseline invalidates the verdict, not just softens it: on
                 // 2026-08-03 a 65.8%-spread baseline verdicted healthy PRs at ±20-35%.
-                // Same 5% threshold as the PR-side spread note below.
+                // Same 3% threshold as the PR-side spread note below.
                 if (baseNoisy) {
                   body += `> ⚠️ **The cached baseline was noisy when it was recorded** (prove-time spread ${baseRealSpread}%), so the Δ column compares against an unreliable number and no verdict is drawn. Refresh it (Actions → "Benchmark (PR)" → Run workflow on main), then re-run \`/bench\` — or use \`/bench-abba\`, which measures both sides itself.\n`;
                 } else if (rp > 10) {
@@ -864,7 +869,7 @@ jobs:
                 } else {
                   body += `> ✅ No significant change.\n`;
                 }
-                if (realTimeSpread && parseFloat(realTimeSpread) > 5.0) {
+                if (realTimeSpread && parseFloat(realTimeSpread) > 3.0) {
                   const vals = realAllTimes ? realAllTimes.split('/').map(t => `${t}s`).join(' / ') : '';
                   body += `>\n> ⚠️ Real-block prove-time spread: ${realTimeSpread}% (${vals}) — the median above is less trustworthy than usual.\n`;
                 } else if (realTimeSpread && parseInt(realRuns) > 1) {

@@ -138,6 +138,15 @@ const scenarios = {
     BASE_GROWTH_SLOPE: '2000', BASE_GROWTH_R2: '0.9980',
     GROWTH_SLOPE_DIFF: '7', GROWTH_SLOPE_PCT: '0.4',
   },
+  // Boundary for the 3% threshold: 3.5% must already suppress the verdict (a spread
+  // that can manufacture a reportable >=3% delta makes the baseline unusable). If
+  // someone loosens the threshold back past 3.5, this scenario's ❔/warning vanish.
+  'K: baseline spread just past the 3% line': {
+    ...REAL, PR_REAL_TIME: '158.407', PR_REAL_PEAK: '52004',
+    REAL_RUNS: '3', REAL_TIME_SPREAD: '0.6', REAL_ALL_TIMES: '158.407/157.853/158.730',
+    BASE_REAL_TIME: '162.100', BASE_REAL_PEAK: '52060', BASE_REAL_SPREAD: '3.5',
+    REAL_TIME_DIFF: '-3.693', REAL_TIME_PCT: '-2.3', REAL_PEAK_DIFF: '-56', REAL_PEAK_PCT: '-0.1',
+  },
   // The 2026-08-03 incident, verbatim: a baseline recorded during an external-load
   // disturbance (spread 65.8%) verdicted a healthy, tight PR run (0.6% spread) as a
   // -19.4% improvement. The warning must REPLACE the celebration, not sit beside it.
