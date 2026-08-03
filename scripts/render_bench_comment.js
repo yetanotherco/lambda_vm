@@ -138,6 +138,15 @@ const scenarios = {
     BASE_GROWTH_SLOPE: '2000', BASE_GROWTH_R2: '0.9980',
     GROWTH_SLOPE_DIFF: '7', GROWTH_SLOPE_PCT: '0.4',
   },
+  // The 2026-08-03 incident, verbatim: a baseline recorded during an external-load
+  // disturbance (spread 65.8%) verdicted a healthy, tight PR run (0.6% spread) as a
+  // -19.4% improvement. The warning must REPLACE the celebration, not sit beside it.
+  'J: noisy cached baseline — suppress the verdict': {
+    ...REAL, PR_REAL_TIME: '158.407', PR_REAL_PEAK: '52004',
+    REAL_RUNS: '3', REAL_TIME_SPREAD: '0.6', REAL_ALL_TIMES: '158.407/157.853/158.730',
+    BASE_REAL_TIME: '196.587', BASE_REAL_PEAK: '52060', BASE_REAL_SPREAD: '65.8',
+    REAL_TIME_DIFF: '-38.180', REAL_TIME_PCT: '-19.4', REAL_PEAK_DIFF: '-56', REAL_PEAK_PCT: '-0.1',
+  },
 };
 
 (async () => {

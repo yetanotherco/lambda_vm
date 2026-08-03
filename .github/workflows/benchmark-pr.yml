@@ -431,6 +431,14 @@ jobs:
           TIME_SPREAD=$(awk "BEGIN { if ($TIME_MEDIAN > 0) printf \"%.1f\", (($TIME_MAX - $TIME_MIN) / $TIME_MEDIAN) * 100; else print \"0.0\" }")
           ALL_TIMES=$(echo $TIMES | tr ' ' '\n' | paste -sd '/' -)
 
+          # Say it at record time, not only at consume time: on push/dispatch these
+          # numbers become the cached baseline, and a noisy one mis-verdicts every
+          # /bench until the next refresh (2026-08-03: a 65.8%-spread baseline made
+          # healthy PRs read as ±20-35% for half an hour).
+          if awk "BEGIN { exit !($TIME_SPREAD > 5.0) }"; then
+            echo "::warning::Real-block prove-time spread ${TIME_SPREAD}% ($ALL_TIMES) — if this run publishes a baseline, /bench will flag comparisons against it as unreliable."
+          fi
+
           {
             echo "real_time_s=$TIME_MEDIAN"
             echo "real_peak_mb=$HEAP_MEDIAN"
@@ -471,7 +479,7 @@ jobs:
                 # grep could match two lines and write a multi-line step output.
                 get() { grep "^$1=" "$BASELINE_FILE" | head -1 | cut -d= -f2; }
                 for key in growth_heaps growth_slope_mb growth_r2 \
-                           real_time_s real_peak_mb real_input; do
+                           real_time_s real_peak_mb real_time_spread real_input; do
                   # A baseline predating the real block simply has no real_* keys; empty
                   # values hide the table rather than producing a bogus comparison.
                   echo "$key=$(get "$key")" >> "$GITHUB_OUTPUT"
@@ -620,6 +628,7 @@ jobs:
           BA_GROWTH_R2: ${{ steps.baseline-artifact.outputs.growth_r2 }}
           BA_REAL_TIME: ${{ steps.baseline-artifact.outputs.real_time_s }}
           BA_REAL_PEAK: ${{ steps.baseline-artifact.outputs.real_peak_mb }}
+          BA_REAL_SPREAD: ${{ steps.baseline-artifact.outputs.real_time_spread }}
           BA_REAL_INPUT: ${{ steps.baseline-artifact.outputs.real_input }}
           # Baseline run outputs
           BR_GROWTH_HEAPS: ${{ steps.baseline-run.outputs.growth_heaps }}
@@ -648,6 +657,7 @@ jobs:
             BASELINE_GROWTH_R2="$BA_GROWTH_R2"
             BASELINE_REAL_TIME="$BA_REAL_TIME"
             BASELINE_REAL_PEAK="$BA_REAL_PEAK"
+            BASELINE_REAL_SPREAD="$BA_REAL_SPREAD"
             BASELINE_REAL_INPUT="$BA_REAL_INPUT"
           else
             BASELINE_SRC="built from main"
@@ -656,6 +666,9 @@ jobs:
             BASELINE_GROWTH_R2="$BR_GROWTH_R2"
             BASELINE_REAL_TIME="$BR_REAL_TIME"
             BASELINE_REAL_PEAK="$BR_REAL_PEAK"
+            # A freshly-built baseline runs in this same session, so there is no
+            # recorded-earlier spread to distrust; empty suppresses the noise warning.
+            BASELINE_REAL_SPREAD=""
             # Freshly proven on this runner from $REAL_INPUT, so by construction the
             # same block the PR side used; the cached path carries its own label.
             BASELINE_REAL_INPUT="$PR_REAL_INPUT"
@@ -684,6 +697,7 @@ jobs:
           echo "pr_real_all_times=$PR_REAL_ALL_TIMES" >> "$GITHUB_OUTPUT"
           echo "baseline_real_time=$BASELINE_REAL_TIME" >> "$GITHUB_OUTPUT"
           echo "baseline_real_peak=$BASELINE_REAL_PEAK" >> "$GITHUB_OUTPUT"
+          echo "baseline_real_spread=$BASELINE_REAL_SPREAD" >> "$GITHUB_OUTPUT"
           # No baseline_real_input output: the comment never names the baseline's block
           # except on a mismatch, which real_mismatch below already carries.
 
@@ -746,6 +760,7 @@ jobs:
           PR_REAL_INPUT: ${{ steps.compare.outputs.pr_real_input }}
           BASE_REAL_TIME: ${{ steps.compare.outputs.baseline_real_time }}
           BASE_REAL_PEAK: ${{ steps.compare.outputs.baseline_real_peak }}
+          BASE_REAL_SPREAD: ${{ steps.compare.outputs.baseline_real_spread }}
           REAL_TIME_DIFF: ${{ steps.compare.outputs.real_time_diff }}
           REAL_TIME_PCT: ${{ steps.compare.outputs.real_time_pct }}
           REAL_PEAK_DIFF: ${{ steps.compare.outputs.real_peak_diff }}
@@ -786,6 +801,7 @@ jobs:
             const realInput = process.env.PR_REAL_INPUT;
             const baseRealTime = process.env.BASE_REAL_TIME;
             const baseRealPeak = process.env.BASE_REAL_PEAK;
+            const baseRealSpread = process.env.BASE_REAL_SPREAD;
             const realTimeDiff = process.env.REAL_TIME_DIFF;
             const realTimePct = process.env.REAL_TIME_PCT;
             const realPeakDiff = process.env.REAL_PEAK_DIFF;
@@ -816,18 +832,28 @@ jobs:
 
               const haveRealCmp = !!(baseRealTime && realTimePct && !realMismatch);
               if (haveRealCmp) {
+                // A noisy baseline invalidates every Δ in the table, so the row icons
+                // go neutral too — a 🟢 beside a number the warning below calls
+                // unreliable reads as a verdict anyway.
+                const baseNoisy = !!(baseRealSpread && parseFloat(baseRealSpread) > 5.0);
+                const rowIcon = (pct) => baseNoisy ? '❔' : icon(pct);
                 body += `| Metric | main | PR | Δ |\n`;
                 body += `|--------|------|----|---|\n`;
                 if (realPeak && baseRealPeak && realPeakPct) {
-                  body += `| **Peak heap** | ${baseRealPeak} MB | ${realPeak} MB | ${fmt(realPeakDiff)} MB (${fmt(realPeakPct)}%) ${icon(realPeakPct)} |\n`;
+                  body += `| **Peak heap** | ${baseRealPeak} MB | ${realPeak} MB | ${fmt(realPeakDiff)} MB (${fmt(realPeakPct)}%) ${rowIcon(realPeakPct)} |\n`;
                 }
-                body += `| **Prove time** | ${baseRealTime}s | ${realTime}s | ${fmt(realTimeDiff)}s (${fmt(realTimePct)}%) ${icon(realTimePct)} |\n\n`;
+                body += `| **Prove time** | ${baseRealTime}s | ${realTime}s | ${fmt(realTimeDiff)}s (${fmt(realTimePct)}%) ${rowIcon(realTimePct)} |\n\n`;
 
                 // Bands of 10%/3%, wider than a fast workload would need: 3 runs of a
                 // minutes-long prove resolve coarsely, so the middle is reported as
                 // unresolved rather than as "fine".
                 const rp = parseFloat(realTimePct);
-                if (rp > 10) {
+                // A noisy baseline invalidates the verdict, not just softens it: on
+                // 2026-08-03 a 65.8%-spread baseline verdicted healthy PRs at ±20-35%.
+                // Same 5% threshold as the PR-side spread note below.
+                if (baseNoisy) {
+                  body += `> ⚠️ **The cached baseline was noisy when it was recorded** (prove-time spread ${baseRealSpread}%), so the Δ column compares against an unreliable number and no verdict is drawn. Refresh it (Actions → "Benchmark (PR)" → Run workflow on main), then re-run \`/bench\` — or use \`/bench-abba\`, which measures both sides itself.\n`;
+                } else if (rp > 10) {
                   body += `> ⚠️ **Regression on the real block** — prove time up ${Math.abs(rp).toFixed(1)}%.\n`;
                 } else if (rp < -10) {
                   body += `> 🎉 **Improvement on the real block** — prove time down ${Math.abs(rp).toFixed(1)}%.\n`;
