@@ -425,6 +425,24 @@ jobs:
             WORKLOAD=real CONTINUATIONS=1 EPOCH_SIZE_LOG2=$GPU_REAL_EPOCH_LOG2 \
             scripts/bench_abba.sh $REF_A origin/main $PAIRS"
 
+          # Record the host CPU before the long run. The paired Δ% cancels the host,
+          # but absolute seconds do not transfer between hosts — three RTX 5090
+          # rentals at the same price measured 59.9s / ~76s / ~114s per prove on the
+          # same block (2026-08-01/03 runs), tracking host CPU class — so every number
+          # this run prints should arrive with its host attached. Model + threads go
+          # to the PR comment and summary; full lscpu to the step log. Captured before
+          # the bench so a failed run still records which host class it failed on
+          # (outputs written before a later command fails survive the step failure).
+          $SSH "lscpu" || true
+          CPU_MODEL=$($SSH "lscpu 2>/dev/null | sed -n 's/^Model name:[[:space:]]*//p' | head -1" 2>/dev/null || true)
+          [ -n "$CPU_MODEL" ] || CPU_MODEL=$($SSH "sed -n 's/^model name[[:space:]]*: //p' /proc/cpuinfo | head -1" 2>/dev/null || true)
+          CPU_THREADS=$($SSH "nproc" 2>/dev/null || true)
+          echo "Host CPU: ${CPU_MODEL:-unknown} (${CPU_THREADS:-?} threads)"
+          {
+            echo "cpu_model=${CPU_MODEL}"
+            echo "cpu_threads=${CPU_THREADS}"
+          } >> "$GITHUB_OUTPUT"
+
           # pipefail so a failed remote bench (e.g. a prove that dies) propagates through the
           # tee pipe and fails this step, instead of being masked by tee's exit 0.
           set -o pipefail
@@ -439,9 +457,14 @@ jobs:
         env:
           OUTCOME: ${{ steps.bench.outcome }}
           WORKLOAD: ${{ steps.config.outputs.workload }}
+          CPU_MODEL: ${{ steps.bench.outputs.cpu_model }}
+          CPU_THREADS: ${{ steps.bench.outputs.cpu_threads }}
         run: |
           {
             echo "## GPU ABBA — ${WORKLOAD:-ethrex} (vs main)"
+            # The host line makes the absolute seconds interpretable — they vary ~2x
+            # across same-price rentals with the host CPU; only the Δ% transfers.
+            [ -n "$CPU_MODEL" ] && echo "Host: $CPU_MODEL (${CPU_THREADS:-?} threads)"
             if [ "$OUTCOME" = "success" ] && [ -s "$RUNNER_TEMP/abba_result.txt" ]; then
               echo '```'
               cat "$RUNNER_TEMP/abba_result.txt"
@@ -464,6 +487,8 @@ jobs:
           GPU_NAME: ${{ env.GPU_NAME }}
           OFFER_PRICE: ${{ steps.offer.outputs.price }}
           WORKLOAD: ${{ steps.config.outputs.workload }}
+          CPU_MODEL: ${{ steps.bench.outputs.cpu_model }}
+          CPU_THREADS: ${{ steps.bench.outputs.cpu_threads }}
         with:
           script: |
             const fs = require('fs');
@@ -474,9 +499,16 @@ jobs:
             const gpu = (process.env.GPU_NAME || '').replace('_', ' ');
             const price = process.env.OFFER_PRICE;
             const workload = process.env.WORKLOAD || 'ethrex';
+            // Host CPU: the seconds below vary ~2x across same-price rentals with the
+            // host CPU class (the prover is host-CPU-bound at the serial producer at
+            // this epoch), so the comment names the host the seconds belong to. On
+            // both success and failure — failures correlate with host classes too.
+            const cpuModel = process.env.CPU_MODEL;
+            const cpuThreads = process.env.CPU_THREADS;
+            const host = cpuModel ? ` · ${cpuModel}${cpuThreads ? ` (${cpuThreads} threads)` : ''}` : '';
 
             let body = `## GPU Benchmark (ABBA) — \`${head}\` vs \`main\` (${pairs} pairs)\n\n`;
-            body += `<sub>${gpu} · Vast.ai datacenter${price ? ` @ \$${price}/hr` : ''} · \`prover/cuda\` · ${workload} · drift-free A/B/B/A</sub>\n\n`;
+            body += `<sub>${gpu}${host} · Vast.ai datacenter${price ? ` @ \$${price}/hr` : ''} · \`prover/cuda\` · ${workload} · drift-free A/B/B/A</sub>\n\n`;
             if (process.env.OUTCOME === 'success') {
               const res = read(`${tmp}/abba_result.txt`) || read(`${tmp}/abba_out.txt`);
               body += '```\n' + res + '\n```\n';
