@@ -4,13 +4,18 @@
 //
 // WHY: that comment is ~200 lines of JS embedded in YAML, and the only other way to
 // see its output is to push and run a real benchmark on the shared bench server
-// (~15-20 min of occupancy). This extracts the `script:` block from the workflow,
+// (~15 min of occupancy). This extracts the `script:` block from the workflow,
 // runs it against synthetic env values, and prints the markdown — so a wording or
 // formatting change is checked in a second.
 //
 // It renders; it does not assert. Read the output. The scenarios below are the ones
 // that have actually broken before: sign handling on the verdict lines, the
 // no-baseline and block-mismatch paths, and the fixture-unavailable footer.
+//
+// The one thing it does check is step wiring, because the scenarios cannot: they
+// hand env to the script directly, so a `steps.X.outputs.Y` that no step writes
+// still renders perfectly here while arriving empty in CI — which drops a whole
+// section with no error anywhere. That check runs first and exits non-zero.
 //
 // USAGE:  node scripts/render_bench_comment.js
 //
@@ -32,6 +37,47 @@ for (let i = start + 1; i < lines.length; i++) {
   body.push(l.slice(indent));
 }
 const src = body.join('\n');
+
+// --- Wiring check: every consumed step output has a producer --------------------
+// Steps are `      - name:` at six spaces; a step's outputs are the `key=` it echoes
+// into $GITHUB_OUTPUT. A step that builds key names at runtime (`echo "$key=..."`)
+// cannot be enumerated statically, so it is skipped rather than guessed at.
+const stepStart = (l) => /^ {6}- name:/.test(l);
+const produced = new Map();   // id -> Set of statically enumerable output keys
+const allIds = new Set();     // every step id, so a typoed reference cannot pass
+const opaque = new Set();     // outputs not statically enumerable: `uses:` actions
+                              // (native outputs) and runtime-built `echo "$key=..."`
+for (let i = 0; i < lines.length; i++) {
+  if (!stepStart(lines[i])) continue;
+  let end = i + 1;
+  while (end < lines.length && !stepStart(lines[end])) end++;
+  const block = lines.slice(i, end).join('\n');
+  const id = (block.match(/^ {8}id: (\S+)$/m) || [])[1];
+  if (!id) continue;
+  allIds.add(id);
+  if (/^ {8}uses:/m.test(block) || /echo "\$\{?[A-Za-z_][^"]*=/.test(block)) {
+    opaque.add(id);
+    continue;
+  }
+  // A run: step with no $GITHUB_OUTPUT produces nothing — reads from it must fail.
+  produced.set(id, new Set(
+    block.includes('$GITHUB_OUTPUT')
+      ? [...block.matchAll(/echo "([a-z0-9_]+)=/g)].map(m => m[1])
+      : []
+  ));
+}
+const problems = [];
+for (const m of wf.matchAll(/steps\.([a-z0-9_-]+)\.outputs\.([a-z0-9_]+)/g)) {
+  const [ref, id, key] = m;
+  if (!allIds.has(id)) problems.push(`${ref}  (no step with id '${id}' — typo?)`);
+  else if (opaque.has(id)) continue;  // uses:/dynamic — cannot verify statically
+  else if (!produced.get(id).has(key)) problems.push(`${ref}  (step '${id}' never writes '${key}')`);
+}
+if (problems.length) {
+  console.error(`Unwired step outputs:\n  ${[...new Set(problems)].join('\n  ')}`);
+  process.exit(1);
+}
+console.log(`Wiring OK: ${produced.size} producer steps verified, ${opaque.size} opaque (uses:/dynamic) skipped, no unknown step ids.`);
 
 const captured = [];
 const github = { rest: { issues: {
@@ -57,8 +103,11 @@ const scenarios = {
     REAL_TIME_DIFF: '-58.600', REAL_TIME_PCT: '-17.2', REAL_PEAK_DIFF: '5', REAL_PEAK_PCT: '0.0',
   },
   'C: clear regression': {
+    // Diffs are unsigned as the Compare step prints them (awk "%.3f"/"%.1f", `$((a-b))`);
+    // the renderer's own `fmt` adds the sign, so feeding one signed here would test
+    // a format CI never produces.
     ...REAL, BASE_REAL_TIME: '240.000', BASE_REAL_PEAK: '32975',
-    REAL_TIME_DIFF: '+41.400', REAL_TIME_PCT: '17.3', REAL_PEAK_DIFF: '5', REAL_PEAK_PCT: '0.0',
+    REAL_TIME_DIFF: '41.400', REAL_TIME_PCT: '17.3', REAL_PEAK_DIFF: '5', REAL_PEAK_PCT: '0.0',
   },
   'D: unresolved middle band (3-10%)': {
     ...REAL, BASE_REAL_TIME: '300.000', BASE_REAL_PEAK: '32975',
@@ -75,11 +124,15 @@ const scenarios = {
     REAL_MISMATCH: 'ethrex_hoodi_1265656.bin',
   },
   'H: fixture unavailable': { COMMIT_SHA: 'c4e42b2900', REAL_EPOCH_LOG2: '22', BASELINE_SRC: 'cached' },
-  'I: with growth sweep (push-style)': {
+  // The growth sweep reaches a comment only on /bench-growth: run_growth is also true
+  // on push and workflow_dispatch, but the Comment step is skipped for both.
+  'I: /bench-growth — real block plus the growth sweep': {
     ...REAL, BASE_REAL_TIME: '288.900', BASE_REAL_PEAK: '32975',
     REAL_TIME_DIFF: '-7.500', REAL_TIME_PCT: '-2.6', REAL_PEAK_DIFF: '5', REAL_PEAK_PCT: '0.0',
+    // GROWTH_STEPS is the workflow-level env the sweep iterates; it supplies the
+    // table's x-axis, so a growth scenario has to carry it.
+    GROWTH_STEPS: '4 8 12 16 20',
     PR_GROWTH_HEAPS: '18756/26966/34748/43896/50431',
-    PR_GROWTH_TIMES: '10.685/13.434/18.854/21.094/24.737',
     PR_GROWTH_SLOPE: '2007', PR_GROWTH_R2: '0.9981',
     BASE_GROWTH_HEAPS: '18700/26900/34700/43800/50217',
     BASE_GROWTH_SLOPE: '2000', BASE_GROWTH_R2: '0.9980',

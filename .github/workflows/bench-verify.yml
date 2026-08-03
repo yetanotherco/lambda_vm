@@ -116,6 +116,12 @@ jobs:
         env:
           HEAD_SHA: ${{ steps.cfg.outputs.head_sha }}
           PAIRS: ${{ steps.cfg.outputs.pairs }}
+          # The script defaults to the real block; this job pins the synthetic one.
+          # /bench-verify reports TWO arms and the real path runs only the continuation
+          # one (a real block does not fit monolithically), so inheriting the default
+          # would silently drop an arm and break comparability with every verify number
+          # recorded so far.
+          WORKLOAD: synthetic
         run: |
           export SYSROOT_DIR="$HOME/.lambda-vm-sysroot"
           set -o pipefail
