@@ -67,14 +67,26 @@ The machine proves and verifies, end to end, through the registry:
    predicted epoch keccak bill). Shared-commitment lever measured at 48%
    collapse (111,471) — parked, see
    `lfm-team-lead-shared-commitment-ruling.md`.
-3. **FRI folding leg** — HALF DONE, agent retired at session limit
-   (2026-07-31). Shape arithmetic, blindness demonstration, and the pinned
-   prediction test are on feat/lfm (85f99c81); the EMITTER (per-layer
-   walk + fold + terminal) is NOT STARTED. Successor brief:
-   `lfm-fri-verify-spec.md` (incl. addendum) + `lfm-fri-leg-state.md`
-   (what the retiring agent knew but never wrote — including one OWED
-   byte-level check on leaf-gadget reuse). Targets the unbatched shape per
-   the ruling; measure against the committed prediction test.
+3. ~~**FRI folding leg**~~ — **DONE, leg CLOSED** (fri-emitter, merged at
+   5a246ba5; spec now carries Addendum 2). Emitter (per-layer walk + fold
+   chain + terminal check) differentialled entirely against REAL
+   production proofs that fold: the leg's blindness premise was FALSE —
+   the L2G fixture's trace sizes with boundary count, so 512/1024/2048
+   boundaries give real proofs with 1/2/3 committed layers in under a
+   second. Measured = predicted on all six pinned numbers (174/186/198
+   perms/query; 38,106/20,460/14,454 per sub-proof at blowup 2/4/8).
+   Proves+verifies end to end. Two approved deviations: the terminal
+   check EVALUATES at υ^(2^total_folds) instead of emitting the FFT (a
+   codeword lookup is a 1,023-wide Select tree on this machine — the
+   guest's economics do not transfer; equivalence checked at 876
+   index/shape points, and the zero-fold branch unifies), and
+   `fri_fold`'s mul association differs from production's while the
+   field element does not. The OWED leaf-gadget byte check discharged
+   executably vs BOTH production backends. Left ledger entries 4 (FRI
+   challenges from the transcript in production's interleaved order;
+   coefficients+roots are proof DATA the transcript must absorb —
+   nothing leg-side can catch this) and 5 (informational:
+   isolation-driver index width).
 4. ~~**LogUp closure**~~ — **DONE, leg CLOSED** (deep-join, 7 slices,
    merged at 1145041a; handoff `lfm-logup-handoff.md`). Closure built
    against production's own oracles; found and closed THREE soundness
@@ -91,9 +103,11 @@ The machine proves and verifies, end to end, through the registry:
    with every multiplicity column zero: "unused" ≠ "blank".
 5. **Assembly** into one epoch-verifier program. ⚠ Every per-epoch number so
    far is a COMPOSITION of per-AIR measurements, not a run. Assembly is what
-   confirms or falsifies them. Discharge `lfm-assembly-obligations.md`
-   (currently: reg_fini width check-or-argument; HALT cost-line anomaly on
-   WATCH).
+   confirms or falsifies them. Discharge `lfm-assembly-obligations.md` —
+   six OPEN entries as of 2026-08-03 (reg_fini width, start_index binding,
+   the five two-consumer unifications, the FRI transcript obligations, the
+   index-as-bits requirement, the challenges guard); the ledger IS the
+   assembly spec's skeleton.
 6. **The wrap run** on the box (see `[[scaleway-box-idp]]` in memory:
    195.154.218.198, 124 GB, warm-built).
 
@@ -154,15 +168,19 @@ worked, twice now:
 - Agents append to `lfm-agent-status.log` at slice boundaries; that log is
   the history if a mailbox message is lost, which happened repeatedly.
 
-Ready to start immediately (wave 3):
-- **The FRI emitter** — the one substantial build left before assembly.
-  Brief: `lfm-fri-verify-spec.md` (incl. addendum) + `lfm-fri-leg-state.md`.
-  Spawn it first.
-- ~~The zero-row fixed-table experiment~~ — **DONE** (zerorow, 2026-08-03).
-  Answer `Some(zero)`; see item 4 above and the handoff's §4.
+Wave 3 CLOSED 2026-08-03 (both legs same day, both agents stood down
+cleanly — first wave that did not end at a session limit). feat/lfm @
+6d5f197f, 188 green, lint 0.
 
-After those: assembly (discharge `lfm-assembly-obligations.md` — its OPEN
-entries are the assembly spec's skeleton), then the wrap run.
+Ready to start immediately (wave 4):
+- **Assembly** — compose the legs into ONE epoch-verifier program and
+  run it. The brief is `lfm-assembly-obligations.md` (the six OPEN
+  entries are the spec's skeleton) plus the leg handoffs
+  (`lfm-logup-handoff.md`, `lfm-fri-verify-spec.md` Addendum 2, the
+  join/reg-tree sections above). The composed per-epoch numbers are
+  predictions to confirm or falsify, not facts.
+
+After that: the wrap run on the box.
 
 ## How to work here
 
@@ -176,7 +194,13 @@ generally:
 > differ only off that value. The synthetic case is the only witness.
 
 Three members so far: next-row pruning, the DEEP coefficient stride, and the
-`step_size = 1` collapse. Expect more.
+`step_size = 1` collapse. Expect more — but check the premise first: the
+FRI leg's "no real proof can witness the fold" turned out to be a claim
+about the FIXTURES ON HAND, not about the prover, and fell to a
+one-parameter change (boundary count) that made real folding proofs in
+under a second. "All production instances share the value" and "all
+fixtures we happen to have share the value" are different claims; only
+the first forces a synthetic witness.
 
 Second-highest: **falsify your own test guards, not just the mechanism.**
 Three separate agents found real holes that way — including a tamper suite

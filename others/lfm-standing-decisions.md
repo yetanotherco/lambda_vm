@@ -1,7 +1,7 @@
 # Standing decisions — Phase R agents
 
 Read this before stopping to ask. If your question is answered here, proceed.
-Last updated 2026-07-31 by team-lead (added method rule 7).
+Last updated 2026-08-03 by team-lead (rule-7 refinement from the FRI leg).
 
 ## Pre-authorized — do NOT ask
 
@@ -88,6 +88,20 @@ Last updated 2026-07-31 by team-lead (added method rule 7).
    returned bit is consumed by some `Select`, which the walk's own bits
    satisfy and a fresh copy cannot. This is rule 1 applied to a guard:
    falsify the guard itself, especially right after a delegation refactor.
+
+   REFINEMENT (fri-emitter, 2026-08-03): **a difference of two counts taken
+   from our own emitter is still a relative test**, however much it looks
+   like an absolute count. `selects(joined) − selects(trace_only)` stayed
+   green with the exact denied defect injected, because the defect lived in
+   the function BOTH sides call and the difference never moved. The
+   marginal-cost idiom (`marginal()`, `marginal_fri`) is safe only when the
+   result is compared against a number that did not come from the emitter —
+   a pinned prediction, or a closed form over the shapes. Corollary from the
+   same session, rule 3 applied to instruments: a falsification harness that
+   parses `cargo test -q` for per-test FAILED lines reports every breakage
+   as "nothing failed" (failures are named only in the trailing summary
+   block) — check the instrument against a known breakage before believing
+   "my mutation changed nothing".
 
 ## Coordination
 
