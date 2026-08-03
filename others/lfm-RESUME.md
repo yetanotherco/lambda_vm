@@ -67,14 +67,24 @@ The machine proves and verifies, end to end, through the registry:
    predicted epoch keccak bill). Shared-commitment lever measured at 48%
    collapse (111,471) — parked, see
    `lfm-team-lead-shared-commitment-ruling.md`.
-3. **FRI folding leg** — IN FLIGHT (reg-tree, same worktree/branch as its
-   chaining leg). Production verify path fully mapped and cited in
-   `lfm-fri-verify-spec.md`; targets the unbatched shape per the ruling.
-   Differential blindness to k=7/coset_offset=3 must be closed with
-   synthetic fixtures or pinned structural assertions.
-4. **LogUp closure** (Σ L vs the recomputed expected bus balance) — IN
-   FLIGHT (deep-join, same worktree/branch). Opened aux values must join
-   through the same sub_proof.rs cells authentication authenticates.
+3. **FRI folding leg** — HALF DONE, agent retired at session limit
+   (2026-07-31). Shape arithmetic, blindness demonstration, and the pinned
+   prediction test are on feat/lfm (85f99c81); the EMITTER (per-layer
+   walk + fold + terminal) is NOT STARTED. Successor brief:
+   `lfm-fri-verify-spec.md` (incl. addendum) + `lfm-fri-leg-state.md`
+   (what the retiring agent knew but never wrote — including one OWED
+   byte-level check on leaf-gadget reuse). Targets the unbatched shape per
+   the ruling; measure against the committed prediction test.
+4. ~~**LogUp closure**~~ — **DONE, leg CLOSED** (deep-join, 7 slices,
+   merged at 1145041a; handoff `lfm-logup-handoff.md`). Closure built
+   against production's own oracles; found and closed THREE soundness
+   gaps (L two-consumer split, hinted alpha powers — instance 3, worse in
+   degree — and the earlier DEEP/auth parallel-copy class), witnessed
+   per-chunk accumulation with a ≥2-chunk fixture, resolved
+   has_trace_interaction by reading. One precise unknown remains: whether
+   a zero-row fixed table reports `Some(zero)` or `None` for its
+   contribution — inference says `Some(zero)`, the cheap settling
+   experiment is named in the handoff.
 5. **Assembly** into one epoch-verifier program. ⚠ Every per-epoch number so
    far is a COMPOSITION of per-AIR measurements, not a run. Assembly is what
    confirms or falsifies them. Discharge `lfm-assembly-obligations.md`
