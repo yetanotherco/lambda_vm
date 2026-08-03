@@ -160,9 +160,20 @@ pub(crate) fn build_inner_tree_levels(
 ) -> Result<()> {
     // Once a level fits this many pairs, one single-block launch
     // (`keccak_merkle_tail`) builds all remaining levels with barriers
-    // between them: the top ~11 levels of a big tree are each smaller than
-    // the per-launch overhead they used to pay.
-    const TAIL_MAX_PAIRS: u64 = 2048;
+    // between them: the top levels of a big tree are each smaller than the
+    // per-launch overhead they used to pay.
+    //
+    // Set to the block width, so the entry level is exactly one permutation
+    // per thread and the tail adds NO serialization over the per-level
+    // launches it replaces. Going wider is not free: the tail grid-strides a
+    // single 128-thread block on one SM, so a level of `k` pairs costs
+    // `k / 128` *sequential* keccak-f1600s where separate launches would have
+    // spread them over `k / 128` parallel blocks. At 2048 the first four
+    // levels alone are 16+8+4+2 = 30 serial permutations against 4 parallel
+    // waves — order +100 us per large tree, to save 4 launches worth order
+    // 10 us. It stays on the critical path because the caller's 32-byte root
+    // `memcpy_dtoh` host-blocks on everything queued before it.
+    const TAIL_MAX_PAIRS: u64 = KECCAK_BLOCK_DIM as u64;
     let mut level_begin: u64 = (leaves_len - 1) as u64;
     while level_begin != 0 {
         let new_begin = level_begin / 2;

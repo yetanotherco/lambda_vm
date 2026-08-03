@@ -1027,10 +1027,12 @@ pub trait IsStarkProver<
         // Fused GPU split path for preprocessed tables (cuda only): one
         // row-major LDE of ALL columns plus two subset Merkle trees
         // (precomputed / multiplicity) built on device — leaves and levels are
-        // bit-identical to `commit_rows_bit_reversed_subset`, and the trees
-        // come back as full host trees so the preprocessed opening path and
-        // the process-wide precomputed-tree cache work unchanged. The handle
-        // keeps the LDE device-resident for the downstream GPU rounds.
+        // bit-identical to `commit_rows_bit_reversed_subset`. The precomputed
+        // tree comes back as a full host tree, so the process-wide
+        // precomputed-tree cache works unchanged; the multiplicity tree stays
+        // device-resident behind a root-only host tree and its opening paths
+        // are gathered on device. The handle keeps the LDE device-resident for
+        // the downstream GPU rounds.
         #[cfg(feature = "cuda")]
         if let Some((expected_precomputed_root, num_precomputed)) = precomputed {
             let (trace_slice, num_cols) = trace.main_data_row_major();
@@ -1527,6 +1529,20 @@ pub trait IsStarkProver<
         let constraints_dur = t_sub.elapsed();
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
+
+        // Every arm below runs the HOST evaluator, which reads `get_main` /
+        // `get_aux`. Under device-only those buffers are intentionally empty,
+        // so landing here means the device decompose AND the `H` download both
+        // failed. Abort with the device-only contract's message rather than a
+        // bare index-out-of-bounds from somewhere inside the evaluator.
+        #[cfg(feature = "cuda")]
+        if precomputed_parts.is_none() {
+            assert!(
+                !round_1_result.lde_trace.host_trace_empty(),
+                "R2 composition fell back to the host evaluator, but the trace \
+                 is device-only (empty)"
+            );
+        }
 
         let lde_composition_poly_parts_evaluations = if let Some(parts) = precomputed_parts {
             parts
