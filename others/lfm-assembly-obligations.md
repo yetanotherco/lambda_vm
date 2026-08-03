@@ -42,7 +42,37 @@ entry only with the verifying evidence named in it.
    - the public output bytes (attestation `program_id` fold vs COMMIT-bus
      target).
 
-4. **The challenges guard cited in comments does not exist yet.** Write
+4. **The FRI leg's three per-sub-proof values are arena words and must be
+   bound at assembly** (fri-emitter, emitter slice). `declare_fri` hints the
+   folding challenges `ζ₀..ζ_C`, the terminal-polynomial coefficients and
+   the committed layer roots, exactly as `emit_sub_proof` hints `γ`/`ζ`.
+   Two different obligations sit here and they are not interchangeable:
+   - **`ζ_k` are CHALLENGES.** They must come from `TranscriptReplay`, and
+     production's own order is load-bearing: sample `ζ_k`, THEN absorb root
+     `k`, per layer, and only then sample the final-fold `ζ_C` — and that
+     last one only when `total_folds > 0` (`verifier.rs:1461-1483`,
+     mirroring `fri/mod.rs:86-118`). A prover who chose `ζ` chooses the
+     fold, so this is entry 4's family and not a convenience.
+   - **The coefficients and the layer roots are proof DATA** that the
+     transcript must absorb, because later challenges (the query indices
+     among them) depend on them: the roots are appended inside the loop
+     above and every coefficient is appended after it. Absorbing them in
+     the wrong order, or not at all, does not fail any test in
+     `fri_tests` — that suite supplies the real values — so assembly owns
+     this and nothing leg-side can catch it.
+
+5. **The standalone FRI driver's hinted index is wider than production's**
+   (fri-emitter, noted not deferred). `fri_tests::fri_only_program` hints
+   `iota` as a felt and takes its low `log2(lde) − 1` bits, so `iota` and
+   `iota + 2^(n−1)` are the same query to the machine, where production's
+   `terminal_codeword.get(iota >> C)` would reject the second as
+   out-of-range. This is a property of the ISOLATION driver, not of the
+   assembled machine: `SpongeVar::squeeze_bits` produces exactly `nbits`
+   bits, so an assembled verifier's index is in range by construction.
+   Assembly owes only that the index reaches the query legs as those bits
+   and never as a hinted felt.
+
+6. **The challenges guard cited in comments does not exist yet.** Write
    `challenges_are_not_an_arena_in_the_assembled_verifier` once the
    assembled verifier exists: raw challenges (z, α, ζ, per-table forks)
    must come from `TranscriptReplay`, never from `Instr::Hint` arena words.

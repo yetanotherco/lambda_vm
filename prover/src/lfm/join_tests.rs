@@ -51,7 +51,7 @@ type V = Verifier<Gl, Ext3, ()>;
 
 /// One committed matrix's data for one query, host side: the row pair in leaf
 /// order and the path that authenticates it.
-struct HostGroupOpening {
+pub(super) struct HostGroupOpening {
     /// `evaluations ‖ evaluations_sym`, as arena words.
     values: Vec<LfmWord>,
     siblings: Vec<Commitment>,
@@ -61,10 +61,10 @@ struct HostGroupOpening {
 ///
 /// Assembled once and shared, because `open_sub_proof` replays the whole
 /// verifier transcript and the fixture proof is regenerated on every call.
-struct HostSubProof {
-    shape: SubProofShape,
-    gamma: FEE,
-    zeta: FEE,
+pub(super) struct HostSubProof {
+    pub(super) shape: SubProofShape,
+    pub(super) gamma: FEE,
+    pub(super) zeta: FEE,
     /// The OOD grid, row-major.
     ood: Vec<FEE>,
     claimed_parts: Vec<FEE>,
@@ -72,9 +72,14 @@ struct HostSubProof {
     roots: Vec<Commitment>,
     /// `[query][group]`.
     openings: Vec<Vec<HostGroupOpening>>,
-    iotas: Vec<usize>,
+    pub(super) iotas: Vec<usize>,
+    /// The FRI folding challenges, from the production verifier's own
+    /// `replay_rounds_after_round_1` (`verifier.rs:1461-1483`) — one per
+    /// committed layer plus the final-fold one. The FRI leg reads them; the
+    /// trace leg does not.
+    pub(super) zetas: Vec<FEE>,
     /// The production reconstruction's answer per query, `(regular, sym)`.
-    expected: Vec<(FEE, FEE)>,
+    pub(super) expected: Vec<(FEE, FEE)>,
     /// The same, asked of production with the PRECOMPUTED and MAIN slices
     /// swapped — the alternative column order a fixture without a precomputed
     /// group cannot distinguish. Empty when there is no precomputed group, or
@@ -95,7 +100,7 @@ fn host_sub_proof() -> &'static HostSubProof {
     })
 }
 
-fn build_host_sub_proof(
+pub(super) fn build_host_sub_proof(
     air: &dyn stark::traits::AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = ()>,
     proof: &stark::proof::stark::MultiProof<Gl, Ext3, ()>,
 ) -> HostSubProof {
@@ -287,6 +292,7 @@ fn build_host_sub_proof(
         roots,
         openings,
         iotas: sp.challenges.iotas.clone(),
+        zetas: sp.challenges.zetas.clone(),
         expected,
         expected_base_swapped,
         points,
@@ -295,7 +301,7 @@ fn build_host_sub_proof(
 
 impl HostSubProof {
     /// The arenas [`emit_sub_proof`] declares, in its declaration order.
-    fn arenas(&self, queries: &[usize]) -> Vec<Vec<LfmWord>> {
+    pub(super) fn arenas(&self, queries: &[usize]) -> Vec<Vec<LfmWord>> {
         vec![
             vec![ext_word(&self.gamma), ext_word(&self.zeta)],
             self.ood.iter().map(ext_word).collect(),
@@ -307,7 +313,7 @@ impl HostSubProof {
 
     /// Per query: the index, then per group the row-pair values and the
     /// sibling digests — the order the emitter's cursor walks.
-    fn query_arena(&self, queries: &[usize]) -> Vec<LfmWord> {
+    pub(super) fn query_arena(&self, queries: &[usize]) -> Vec<LfmWord> {
         let mut out = Vec::new();
         for &q in queries {
             out.push(base_word(FE::from(self.iotas[q] as u64)));
@@ -813,7 +819,7 @@ use super::sub_proof::{
     GroupCommitment, GroupOpening, emit_group_authentication, emit_query_points,
 };
 
-fn prove_options() -> stark::proof::options::ProofOptions {
+pub(super) fn prove_options() -> stark::proof::options::ProofOptions {
     stark::proof::options::GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is valid")
 }
 
@@ -1575,16 +1581,34 @@ fn the_precomputed_group_comes_first_and_that_is_checkable() {
 ///
 /// This is the degenerate-parameter rule in its most extreme form. Not "one
 /// value hides a difference between two implementations" but "the production
-/// instance exercises none of the mechanism", which no amount of care with the
-/// real data can repair. The FRI leg's primary instrument must therefore be
-/// SYNTHETIC codewords driven through production's own commit and query phases,
-/// with the layer count swept; this test exists so that the day the fixture
-/// grows and starts folding, the change is announced rather than silently
-/// altering what every FRI test covers.
+/// instance exercises none of the mechanism". The assertions below are still
+/// exactly true of THIS fixture, and this test still earns its place: the day
+/// the fixture grows and starts folding, the change is announced rather than
+/// silently altering what the FRI tests cover.
+///
+/// ## ⚠ CORRECTION — the conclusion drawn from this was wrong
+///
+/// This test's original text went on to say that no amount of care with real
+/// data could repair the gap, and that the FRI leg's primary instrument had to
+/// be SYNTHETIC codewords. That is false, and the counterexample is one line of
+/// the fixture: the trace is `boundaries.len().next_power_of_two()`
+/// (`local_to_global.rs:269`), and `num_committed = trace_bits − 8`. So the same
+/// construction with 512, 1024 or 2048 boundaries yields real production proofs
+/// with one, two or three committed layers — real roots, real paths, real
+/// terminal coefficients, real folding challenges — in under a second each.
+/// `fri_tests::the_real_prover_folds_and_the_layer_count_follows_the_row_count`
+/// is that sweep, and the FRI leg is differentialled entirely against real
+/// proofs. Nothing in it is synthetic.
+///
+/// The lesson is narrower than the one first drawn here. "The production
+/// instances all share a degenerate parameter" was a claim about the fixtures on
+/// hand, not about the prover, and the two are not the same claim. Worth
+/// checking which one is being made before concluding that real data cannot
+/// reach a mechanism.
 ///
 /// The zero-layer case is not merely an artifact to route around, either — it
 /// is a real production path (small tables fold no further than their terminal)
-/// and the emitted verifier has to handle it.
+/// and the emitted verifier handles it as a first-class shape.
 #[test]
 fn the_fixture_carries_no_fri_layers_so_it_cannot_witness_the_fold() {
     let (_air, proof) = real_fixture();

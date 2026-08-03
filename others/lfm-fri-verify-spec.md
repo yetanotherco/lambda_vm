@@ -526,3 +526,150 @@ production configuration produces one and the LDE domain constants are baked
 into the program; that is a deferral, and its safety argument is that a wrong
 coset offset changes every domain point and therefore every leaf, so it cannot
 produce a passing proof — it can only fail. Stated rather than assumed.
+
+---
+
+# Addendum 2 — the emitter, and the correction the emitter forced
+
+Appended 2026-08-03 by the fri-emitter agent. FIRST-HAND from this worktree
+unless marked otherwise. Where this and the sections above disagree, this is
+later and was measured.
+
+## ★ The blindness premise above is FALSE, and cheaply so
+
+§7 and Addendum 1 conclude that no real proof can witness the fold mechanism,
+and that synthetic codewords through production's commit phase are the only
+instrument. That is true of the fixture AS WRITTEN and false of the fixture as
+available. The L2G trace is `boundaries.len().next_power_of_two()`
+(`prover/src/tables/local_to_global.rs:269`) and `num_committed = trace_bits − 8`,
+so asking `real_fixture`'s own construction for more boundaries produces real
+production proofs that fold:
+
+| boundaries | n  | total_folds | num_committed | coeffs | zetas | queries |
+|-----------:|---:|------------:|--------------:|-------:|------:|--------:|
+| 4          |  3 | 0           | 0             | 4      | 0     | 219     |
+| 512        | 10 | 2           | 1             | 128    | 2     | 219     |
+| 1024       | 11 | 3           | 2             | 128    | 3     | 219     |
+| 2048       | 12 | 4           | 3             | 128    | 4     | 219     |
+
+Real committed roots, real authentication paths at real depths, real terminal
+coefficients, and the folding challenges out of production's own
+`replay_rounds_after_round_1`. All four prove in well under a second.
+`fri_tests` uses these throughout; **nothing in the FRI leg is synthetic.**
+
+The consequence that matters: the `num_committed = total_folds.saturating_sub(1)`
+off-by-one — Addendum 1's headline example of a soundness-relevant constant
+invisible to real data — is now caught by SEVEN tests on real proofs, including
+an executed walk that cannot reach a committed root. Addendum 1's conclusion was
+right about the 4-row fixture and wrong about the prover.
+
+`join_tests::the_fixture_carries_no_fri_layers_so_it_cannot_witness_the_fold`
+stays as written: it is still true of that fixture and still worth announcing if
+it changes. Only its reasoning about what real data *could* do is superseded.
+
+## Deviations from the emission checklist, with derivations
+
+**Checklist item 6 — "Terminal is an FFT, not Horner" — OVERRIDDEN.** The
+emitter evaluates the terminal polynomial at `υ^(2^total_folds)` per query and
+never materializes the codeword. The sim/24 measurement behind item 6 is sound
+and does not transfer, because the two machines disagree about the price of an
+array index: production's `terminal_codeword.get(index)` is one load, while a
+straight-line machine with no addressable memory needs a `Select` tree
+`terminal_len − 1` wide. At blowup 8 that is 1,023 selects per query (74,679 at
+73 queries), against which the FFT — 5,120 butterflies at ~3 rows — is the
+smaller half of the bill. Evaluating costs `total_folds` squarings plus
+`2^effective_k − 1` ext `MulAdd`s: 140 rows per query, ~10,220 at 73 queries,
+against ~90,000. The direction reverses because the guest amortizes one FFT
+across queries and pays nothing per lookup, and this machine pays nothing for
+the FFT it does not run and everything for the lookup it cannot do.
+
+Equivalence, and it is exact rather than approximate: the terminal codeword is
+`P` over the terminal coset in bit-reversed order, so position `index` holds
+`P(terminal_offset · ω_T^{br(index)})`, and with `index = iota >> C`,
+`terminal_offset = coset_offset^(2^total_folds)` and `ω_T = g^(2^total_folds)`
+that point is exactly `υ^(2^total_folds)` — the bits of `iota` the shift keeps
+are the bits `br` puts inside `ω_T`'s order. Checked against production's own
+`evaluate_offset_fft` + `in_place_bit_reverse_permute` at all 219 indices of all
+four shapes (`the_terminal_point_is_the_query_point_folded`).
+
+A bonus the FFT form does not have: **the two branches unify.** At
+`total_folds = 0` the exponent is 1, the two positions `2·iota` and `2·iota+1`
+are `υ` and `−υ`, and production's `zetas.is_empty()` branch becomes "evaluate
+`P` twice" rather than a separate code path. And the terminal point is BOUND to
+the query point by construction instead of by a second derivation.
+
+**Checklist item 2 — mul association — DEVIATED, deliberately.** The emitter
+reuses `edsl::fri_fold`, which computes `(ζ·diff)·x⁻¹` where production writes
+`(x⁻¹·ζ)·diff`. Same operation count (one `Mul`, one `MulBase`), same field
+element — Fp3 multiplication in the chip is exact, so associativity is exact —
+and reusing the tested primitive avoids re-deriving a registry digest. The
+real-proof differential is what says the values agree.
+
+**Checklist item 9 — "the three structural length checks must run before the
+query loop" — DISCHARGED BY CONSTRUCTION, not by emitted checks.** `declare_fri`
+fixes each arena's length from the shape and the executor refuses any other
+length before an instruction runs. The attack production's comment names — send
+the per-query vectors EMPTY so the fold loop runs zero iterations and accepts
+vacuously — has no encoding here. Demonstrated in
+`the_shape_pins_the_lengths_production_must_check_at_runtime`.
+
+Items 1, 3, 4, 5, 7, 8, 10 are emitted as written and each was falsified
+individually (see the leg's report).
+
+## Measured against Addendum 1's pinned prediction — exactly
+
+| blowup | perms/query | predicted | per sub-proof | predicted |
+|-------:|------------:|----------:|--------------:|----------:|
+| 2      | 174         | 174       | 38,106        | 38,106    |
+| 4      | 186         | 186       | 20,460        | 20,460    |
+| 8      | 198         | 198       | 14,454        | 14,454    |
+
+At `trace_bits = 20`, counted as emitted `LFM_KECCAK` rows, marginal per query.
+The same formula on EXECUTED programs at n = 10/11/12 gives 1,971 / 4,161 / 6,570
+permutations for 219 queries, also exactly.
+
+Where the leg's rows go depends on the currency, and the two currencies point
+OPPOSITE ways — the trap `edsl::keccak_leaf_hash`'s own doc comment warns about,
+met again here. At blowup 8, `trace_bits = 20`, per query: 8,682 instructions,
+198 permutations, 73 byteswaps (`1 + 6 · num_committed`: two extension values,
+three components each, per layer leaf, plus the index).
+
+- **In INSTRUCTIONS the byteswaps dominate.** Each is one `LFM_BITDEC` row plus
+  64 `LFM_BALU` rows, so 73 of them are ~4,745 of the 8,682 — about 55%.
+- **In main-trace CELLS the hashing dominates overwhelmingly.** A permutation is
+  36,256 cells and a byteswap 322, so 198 permutations are 7.18M cells against
+  23.5K — hashing is ~305× the swap bill.
+
+Neither number is the leg's cost on its own; which one binds depends on which
+chip is the constraint. The rows-of-different-chips-are-not-comparable rule in
+`others/lfm-target-shape.md` is the reason both are reported. What is not
+avoidable either way: the same values are consumed as field elements by the fold
+and as bytes by the hash, so something must connect the two representations.
+
+Addendum 1's 2.6× blowup-8 advantage is unaffected and confirmed.
+
+## ★ A new instance of method rule 7: a subtraction of two emissions IS a differential
+
+The leg's structural guard — "the FRI join adds no second point derivation" —
+was written as `selects(joined) − selects(trace_only) == C + 2·path_steps`, on
+the reasoning that a second derivation would add `index_bits`. That guard is
+VACUOUS, and injecting the exact defect it denies (a `QueryOutput` handing out a
+freshly derived point) left it green. The defect lives in
+`emit_sub_proof_with_bits`, which both sides of the subtraction call, so both
+gained `index_bits` selects and the difference never moved.
+
+Rule 7 says a relative test dies when its two sides unify. The instance worth
+adding is that **a difference of two counts taken from our own emitter is still
+a relative test**, however much it looks like a count — the marginal-cost idiom
+this phase uses everywhere (`marginal()` in `join_tests`, `marginal_fri` here) is
+safe only when the result is compared against a number that did not come from
+the emitter. The fix was to write the count as a closed form over the SHAPES
+(`index_bits + 2·merkle_depth·num_groups + num_committed + 2·path_steps`) and
+compare against that; it then fails with a surplus of exactly `index_bits`.
+
+Related trap, hit in the same session: the falsification harness itself reported
+all seven deliberate breakages as "nothing failed", because `cargo test -q`
+names failures only in its trailing summary block and the parser was looking for
+per-test `FAILED` lines. Rule 3 applies to instruments, not just to oracles —
+and "my breakage changed nothing" is the reading that should always be checked
+against the tool before it is believed.
