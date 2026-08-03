@@ -101,13 +101,28 @@ The machine proves and verifies, end to end, through the registry:
    table-set-LENGTH gap (closure run over a real epoch's 24
    contributions) and found that three of the five have NON-blank traces
    with every multiplicity column zero: "unused" ≠ "blank".
-5. **Assembly** into one epoch-verifier program. ⚠ Every per-epoch number so
-   far is a COMPOSITION of per-AIR measurements, not a run. Assembly is what
-   confirms or falsifies them. Discharge `lfm-assembly-obligations.md` —
-   six OPEN entries as of 2026-08-03 (reg_fini width, start_index binding,
-   the five two-consumer unifications, the FRI transcript obligations, the
-   index-as-bits requirement, the challenges guard); the ledger IS the
-   assembly spec's skeleton.
+5. **Assembly** into one epoch-verifier program — **SPINE DONE, LEGS NOT
+   WIRED** (assembly, wave 4, branch `feat/lfm-assembly`).
+   - **DONE**: the Fiat-Shamir spine RUNS on a real 24-sub-proof continuation
+     epoch that production accepts. `prover/src/lfm/epoch.rs` replays the
+     fork, Phase C, and rounds 2-4 in production's order;
+     `epoch_tests::the_epoch_challenge_spine_matches_production` matches
+     production's own `replay_rounds_after_round_1` on all 111 challenges
+     (shared z/α, then per table β, z, γ, every ζ, every query index), and the
+     LogUp closure on top reaches production's COMMIT-bus target. Ledger
+     entries 4, 5 and 6 DISCHARGED; 2 half (the cell is right, the derivation
+     is not built); 3 partially (one cell + two views is now a construction,
+     but the second consumers are not wired).
+   - **NOT DONE**: the verification legs do not hang off the spine yet. The
+     constraint/quotient evaluation, the opening authentication, the DEEP
+     fold and the FRI walk are all still driven by their own isolation
+     programs with hinted challenges. Wiring them onto `TableAbsorbs` is what
+     closes entry 3 and what turns the composed per-epoch predictions into
+     measurements — they remain PREDICTIONS.
+   - **NEW ledger entries** 7 (the preprocessed commitments are hinted, and
+     PAGE's cannot become a program constant because it is a function of the
+     inner ELF) and 8 (the OOD absorb ORDER has no production witness: every
+     OOD block of all 24 sub-proofs is one row tall).
 6. **The wrap run** on the box (see `[[scaleway-box-idp]]` in memory:
    195.154.218.198, 124 GB, warm-built).
 
@@ -188,15 +203,34 @@ Bonus: FINI's u32 commitment forces `start_index < 2^32`, which bears
 on ledger entry 1 (may upgrade the REG-C2 argument route over the
 range check).
 
-Ready to start immediately (wave 4 respawn):
-- **Assembly** — compose the legs into ONE epoch-verifier program and
-  run it. The brief is `lfm-assembly-obligations.md` (the six OPEN
-  entries are the spec's skeleton) plus the leg handoffs
-  (`lfm-logup-handoff.md`, `lfm-fri-verify-spec.md` Addendum 2, the
-  join/reg-tree sections above) — and point the agent at
-  `lfm-team-lead-start-index-research.md` so entry 2's reading is not
-  re-derived. The composed per-epoch numbers are predictions to confirm
-  or falsify, not facts.
+Wave 4 (assembly) RAN 2026-08-03 on `feat/lfm-assembly` (3 commits off
+35845e4c). Suite 196 green, `make lint` exit 0. See item 5 above for what
+landed. ⚠ `lfm-team-lead-start-index-research.md` is not a document — it is
+a raw 518 KB JSONL session transcript that was committed under a `.md`
+name. Its research is real and correct (extracted and acted on), but a
+reader must pull the last assistant message out of the JSONL; the
+findings are summarised in ledger entry 2 so nobody has to.
+
+Ready to start next (wave 5):
+- **Assembly, part 2 — hang the legs off the spine.** The seam already
+  exists: `epoch::TableAbsorbs` carries every proof-carried cell and
+  `epoch::TableChallenges` every derived challenge, per table. What is
+  needed is, per sub-proof: reconstruct the full OOD grid from the two
+  pruned blocks with program-constant zeros, run the constraint
+  evaluation and quotient check at the spine's `z` and `β` powers, then
+  per query take `TableChallenges::iota_bits` straight into
+  `sub_proof::emit_query_with_bits` and `fri::emit_query_fri`. Only then
+  do the composed per-epoch numbers become measurements. Start from
+  `epoch_tests::epoch_challenge_program`, which is the assembled program
+  minus exactly these legs.
+- **Ledger entries 7 + 2, which close together**: intern the three
+  constant preprocessed commitments, wire reg-tree's derivation into
+  Phase A so REGISTER's root is computed from the register-boundary
+  arena the spine already declares (which is what binds `start_index`),
+  and decide what to do about PAGE's ELF-dependent commitment.
+- **Ledger entry 8** needs a synthetic AIR with three transition offsets
+  (or `step_size > 1`), proved by the production prover, or the OOD
+  absorb order stays unwitnessed.
 
 After that: the wrap run on the box.
 

@@ -81,7 +81,10 @@ struct HostTable {
 
 /// Read a real single-table proof into [`HostTable`], taking the challenges
 /// from the production verifier rather than recomputing them.
-fn host_table(air: &dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = ()>, proof: &MultiProof<Gl, Ext3, ()>) -> HostTable {
+fn host_table(
+    air: &dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = ()>,
+    proof: &MultiProof<Gl, Ext3, ()>,
+) -> HostTable {
     let sp = super::constraint_tests::open_sub_proof(air, proof);
     let view = StarkProofView::Owned(&proof.proofs[0]);
     let opts = air.options();
@@ -248,7 +251,7 @@ fn challenge_arenas(h: &HostTable) -> Vec<Vec<LfmWord>> {
         out.push(vec![ext_word(&c)]);
     }
     out.push(super::proof_arena::commitments_to_arena(&[
-        h.composition_root,
+        h.composition_root
     ]));
     out.push(h.ood_current.iter().map(ext_word).collect());
     out.push(h.ood_next.iter().map(ext_word).collect());
@@ -489,6 +492,12 @@ struct RealEpoch {
     tables: Vec<HostTable>,
     /// The shared LogUp challenges Phase A ends on.
     z_alpha: (FEE, FEE),
+    /// The carried commit index — `reg_init[X254_INDEX]` of this epoch, which
+    /// is the PREVIOUS epoch's `reg_fini[64]`.
+    start_index: u64,
+    /// The COMMIT-bus target production computed, and therefore the value the
+    /// closure must reach.
+    expected_bus_balance: FEE,
 }
 
 fn real_epoch() -> RealEpoch {
@@ -682,6 +691,8 @@ fn real_epoch() -> RealEpoch {
         phase_a,
         tables,
         z_alpha,
+        start_index,
+        expected_bus_balance: expected,
     }
 }
 
@@ -796,6 +807,12 @@ fn epoch_challenge_program(e: &RealEpoch) -> LfmProgram {
     let num_prep = e.phase_a.iter().filter(|(p, _)| p.is_some()).count();
     let a_prep_roots = b.declare_arena(2 * num_prep as u32);
     let a_main_roots = b.declare_arena(2 * n as u32);
+    // The register boundary vector, declared at production's width. Only the
+    // carried commit index is READ today; the rest is the arena the REGISTER
+    // preprocessed derivation will consume, and declaring it here is what makes
+    // `start_index` the same cell that derivation binds rather than a word of
+    // its own.
+    let a_reg_init = b.declare_arena(crate::tables::register::NUM_REGISTER_ADDRESSES as u32);
     let per_table: Vec<Arenas> = e
         .tables
         .iter()
@@ -804,9 +821,8 @@ fn epoch_challenge_program(e: &RealEpoch) -> LfmProgram {
             aux_root: h.shape.has_aux_root.then(|| b.declare_arena(2)),
             contribution: h.shape.has_contribution.then(|| b.declare_arena(1)),
             composition_root: b.declare_arena(2),
-            ood_current: b.declare_arena(
-                (h.shape.ood_current_dims.0 * h.shape.ood_current_dims.1) as u32,
-            ),
+            ood_current: b
+                .declare_arena((h.shape.ood_current_dims.0 * h.shape.ood_current_dims.1) as u32),
             ood_next: b.declare_arena((h.shape.ood_next_dims.0 * h.shape.ood_next_dims.1) as u32),
             parts: b.declare_arena(h.shape.num_parts as u32),
             fri_roots: b.declare_arena(2 * h.shape.fri.num_committed() as u32),
@@ -865,6 +881,7 @@ fn epoch_challenge_program(e: &RealEpoch) -> LfmProgram {
     b.public(alpha.as_cell());
 
     // ---- one fork per table ----
+    let mut contributions: Vec<super::builder::Ext> = Vec::new();
     for (i, h) in e.tables.iter().enumerate() {
         let a = &per_table[i];
         let aux = a.aux_root.map(|id| RootCells::hint(&mut b, id, 0));
@@ -888,6 +905,9 @@ fn epoch_challenge_program(e: &RealEpoch) -> LfmProgram {
             .collect();
         let nonce = a.nonce.map(|id| b.hint_felt(id, 0));
 
+        if let Some(c) = contribution {
+            contributions.push(c);
+        }
         let mut fork = fork_table(&t, h.shape.index, h.shape.num_tables);
         let ch = emit_table_challenges(
             &mut b,
@@ -917,6 +937,22 @@ fn epoch_challenge_program(e: &RealEpoch) -> LfmProgram {
         }
     }
 
+    // ---- the LogUp closure, on the cells the forks already absorbed ----
+    //
+    // Every `L` here is the cell its own fork bound into the transcript, and
+    // the output bytes are derived from the halves the statement absorbed — so
+    // the closure cannot be summing a different `L`, or folding a different
+    // output, from the one the challenges were drawn against.
+    let shape = super::logup::LogUpShape {
+        num_contributing_tables: contributions.len(),
+        num_output_bytes: e.statement.public_output_len,
+    };
+    let start = b.hint_felt(a_reg_init, crate::tables::register::X254_INDEX as u32);
+    let bytes = super::epoch::emit_output_bytes(&mut b, public_output, shape.num_output_bytes);
+    let target = super::logup::emit_commit_bus_target(&mut b, &shape, z, alpha, start, &bytes);
+    let total = super::logup::emit_bus_closure(&mut b, &shape, &contributions, target);
+    b.public(total.as_cell());
+
     let program = compile(b.finish());
     validate(&program).expect("the epoch challenge program must be admissible");
     program
@@ -942,10 +978,13 @@ fn epoch_arenas(e: &RealEpoch) -> Vec<Vec<LfmWord>> {
     let prep: Vec<Commitment> = e.phase_a.iter().filter_map(|(p, _)| *p).collect();
     let main: Vec<Commitment> = e.phase_a.iter().map(|(_, m)| *m).collect();
 
+    let mut reg_init = vec![base_word(FE::zero()); crate::tables::register::NUM_REGISTER_ADDRESSES];
+    reg_init[crate::tables::register::X254_INDEX] = base_word(FE::from(e.start_index));
     let mut out = vec![
         stmt.iter().map(|h| base_word(*h)).collect(),
         super::proof_arena::commitments_to_arena(&prep),
         super::proof_arena::commitments_to_arena(&main),
+        reg_init,
     ];
     for h in &e.tables {
         if let Some(r) = h.aux_root {
@@ -955,7 +994,7 @@ fn epoch_arenas(e: &RealEpoch) -> Vec<Vec<LfmWord>> {
             out.push(vec![ext_word(&c)]);
         }
         out.push(super::proof_arena::commitments_to_arena(&[
-            h.composition_root,
+            h.composition_root
         ]));
         out.push(h.ood_current.iter().map(ext_word).collect());
         out.push(h.ood_next.iter().map(ext_word).collect());
@@ -1017,6 +1056,14 @@ fn the_epoch_challenge_spine_matches_production() {
             h.shape.log2_trace_length
         );
     }
+    // The closure's total, published last. Reaching it at all means the
+    // in-machine `assert_eq_ext` against the COMMIT-bus target already held.
+    assert_eq!(
+        word_as_ext(&exec.public_words[cursor].1).expect("the bus total is ext"),
+        e.expected_bus_balance,
+        "the LogUp closure must reach production's own COMMIT-bus target"
+    );
+    cursor += 1;
     assert_eq!(
         cursor,
         exec.public_words.len(),
@@ -1040,10 +1087,169 @@ fn the_epoch_challenge_spine_matches_production() {
         "an OOD block taller than one row appeared: the absorb-order blindness \
          recorded here is over, and the differential now covers it"
     );
+    // ---- THE MEASUREMENT ----
+    //
+    // What this is and is NOT: the spine is the Fiat-Shamir half of the
+    // verifier — statement, Phase A, 24 forks, rounds 2-4 and the LogUp
+    // closure. The opening/DEEP/FRI-walk and constraint legs are NOT in this
+    // program, so these numbers say nothing about the composed per-epoch
+    // predictions (213,744 opening permutations at blowup 8, ~460k total).
+    // Those remain unconfirmed. This is the first per-epoch figure that is a
+    // RUN rather than a composition, and it is the cost of the part that had
+    // no per-epoch number at all.
+    let perms = program
+        .instrs
+        .iter()
+        .filter(|i| matches!(i, super::instr::Instr::KeccakF(_)))
+        .count();
+    let hints = program
+        .instrs
+        .iter()
+        .filter(|i| matches!(i, super::instr::Instr::Hint { .. }))
+        .count();
+    let arena_words: usize = program.arena_schema.lens.iter().map(|l| *l as usize).sum();
+    let bit_decs = program
+        .instrs
+        .iter()
+        .filter(|i| matches!(i, super::instr::Instr::BitDec { .. }))
+        .count();
+    // Attribution, not a guess: every EXTENSION value the transcript absorbs is
+    // three base felts, and each base felt is streamed BIG-endian, which costs
+    // one `felt_be_halves` — a `BitDec` plus its recomposition. So the absorbed
+    // ext count times three should account for nearly every `BitDec` here.
+    let ext_absorbs: usize = e
+        .tables
+        .iter()
+        .map(|h| {
+            h.ood_current.len()
+                + h.ood_next.len()
+                + h.parts.len()
+                + h.fri_coeffs.len()
+                + usize::from(h.contribution.is_some())
+        })
+        .sum();
     println!(
-        "epoch spine: {} sub-proofs, {} with multi-row OOD blocks, {} published words",
+        "\nepoch spine (min preset: blowup 2, {} quer{}/table, grinding {}):\n\
+         \x20 sub-proofs        {}\n\
+         \x20 instructions      {}\n\
+         \x20 keccak perms      {}\n\
+         \x20 arena words       {} ({} hinted)\n\
+         \x20 published words   {}\n\
+         \x20 multi-row OOD     {}\n\
+         \x20 BitDec rows       {}\n\
+         \x20 ext values absorbed {} (x3 felts = {} big-endian streams, \
+         {:.1}% of the BitDecs)",
+        e.tables[0].shape.num_queries,
+        if e.tables[0].shape.num_queries == 1 {
+            "y"
+        } else {
+            "ies"
+        },
+        e.tables[0].shape.grinding_factor,
         e.tables.len(),
+        program.instrs.len(),
+        perms,
+        arena_words,
+        hints,
+        exec.public_words.len(),
         multi_row_ood,
-        exec.public_words.len()
+        bit_decs,
+        ext_absorbs,
+        3 * ext_absorbs,
+        100.0 * (3 * ext_absorbs) as f64 / bit_decs as f64
     );
+}
+
+/// ★ An ABSOLUTE structural guard (standing-decisions rule 7): no proof value
+/// in the assembled spine is hinted twice.
+///
+/// The two-consumer class hides exactly where a differential cannot look — a
+/// value hinted once per consumer, with the host packing the same number into
+/// both, passes every comparison against production and still lets a real
+/// prover supply two different numbers. So this is a count over the emitted
+/// program, not a comparison of two runs: every arena word is read by at most
+/// one `Hint`, and the arenas whose values have two consumers (the roots, the
+/// contributions, the statement's public output) are read exactly once.
+///
+/// The register-boundary arena is the deliberate exception: only the carried
+/// commit index is read today, and the rest is the space the REGISTER
+/// derivation will consume.
+#[test]
+fn the_spine_hints_each_proof_value_once() {
+    use std::collections::HashMap;
+
+    let e = real_epoch();
+    let program = epoch_challenge_program(&e);
+
+    let mut hints: HashMap<(super::instr::ArenaId, u32), usize> = HashMap::new();
+    for instr in &program.instrs {
+        if let super::instr::Instr::Hint { arena, index, .. } = instr {
+            *hints.entry((*arena, *index)).or_default() += 1;
+        }
+    }
+    let doubled: Vec<_> = hints.iter().filter(|(_, n)| **n > 1).collect();
+    assert!(
+        doubled.is_empty(),
+        "these arena words are hinted more than once, which is the two-consumer \
+         hazard the assembly exists to remove: {doubled:?}"
+    );
+
+    // Positive control: the count is nonzero and covers the whole proof, so a
+    // guard that simply found no hints would not pass for the wrong reason.
+    let declared: usize = program.arena_schema.lens.iter().map(|l| *l as usize).sum();
+    let reg_init = crate::tables::register::NUM_REGISTER_ADDRESSES;
+    assert_eq!(
+        hints.len(),
+        declared - reg_init + 1,
+        "every declared arena word must be read exactly once, bar the register \
+         boundary vector of which only the commit index is read yet"
+    );
+}
+
+/// ★ The closure's two joins, falsified by tampering.
+///
+/// The COMMIT-bus target is a function of the carried commit index and of the
+/// public output, and both reach it through cells another consumer already
+/// used — `start_index` from the register-boundary arena the REGISTER
+/// derivation will bind, the output bytes from the halves the STATEMENT
+/// absorbed. Moving either must break the run.
+#[test]
+fn the_closure_rejects_a_moved_index_or_output() {
+    let e = real_epoch();
+    let program = epoch_challenge_program(&e);
+    let good = epoch_arenas(&e);
+    assert!(
+        execute(&program, &good, &TestPermutation).is_ok(),
+        "the untampered epoch must run"
+    );
+
+    // The carried commit index. Production derives it from the previous epoch's
+    // FINI vector; a machine that let the prover pick it would let them
+    // renumber the whole output stream.
+    for delta in [1u64, 2, 7] {
+        let mut arenas = good.clone();
+        arenas[3][crate::tables::register::X254_INDEX] = base_word(FE::from(e.start_index + delta));
+        assert!(
+            execute(&program, &arenas, &TestPermutation).is_err(),
+            "start_index + {delta} must not close the bus"
+        );
+    }
+
+    // The public output. Moving a half moves both the statement the challenges
+    // were drawn against and the bytes the target folds, so this rejects
+    // whichever check notices first — but reject it must.
+    assert!(
+        !e.public_output.is_empty(),
+        "the fixture epoch must actually commit output, or this proves nothing"
+    );
+    for half in 0..e.statement.public_output_len.div_ceil(4) {
+        let mut arenas = good.clone();
+        let idx = 8 + half;
+        let bumped = arenas[0][idx][0] + FE::one();
+        arenas[0][idx] = base_word(bumped);
+        assert!(
+            execute(&program, &arenas, &TestPermutation).is_err(),
+            "moving output half {half} must not verify"
+        );
+    }
 }

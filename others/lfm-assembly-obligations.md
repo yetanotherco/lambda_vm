@@ -22,12 +22,25 @@ entry only with the verifying evidence named in it.
    still unverified, emit the check.
 
 2. **`start_index` is unbound to the chain** (flagged by deep-join, LogUp
-   closure slice 1). The COMMIT-bus target reads `start_index` (the carried
-   x254) as arena data; nothing yet binds it to the previous epoch's output
-   length. A chaining obligation of the same family as the L2G root binding
-   and the REGISTER derivation: assembly (or a dedicated chaining slice)
-   owes the binding, and no binding should be invented without reading how
-   production carries it across epochs.
+   closure slice 1). **HALF DISCHARGED** (assembly, slice 3): the reading is
+   settled and the CELL is now the right one; the derivation that closes it is
+   not built.
+   - Settled by research (`lfm-team-lead-start-index-research.md`): production
+     has no arithmetic `start + len` check anywhere. It rebuilds epoch N's
+     REGISTER preprocessed commitment from epoch N−1's FINI vector and rejects
+     unless the proof's root matches, and `verify_epoch` then simply reads
+     `register_init[X254_INDEX]` (`continuation.rs:840-851`). Confirmed
+     first-hand in the assembly fixture: `compute_expected_commit_bus_balance_view`
+     takes `register_init[register::X254_INDEX] as u64`.
+   - Done: the assembled spine declares the register-boundary vector as ONE
+     arena at production's width and takes `start` from slot 64 of it, so the
+     COMMIT-bus target and the future REGISTER derivation read the same cell
+     rather than two words. `the_closure_rejects_a_moved_index_or_output`
+     moves it by 1, 2 and 7 and the bus fails to close each time.
+   - Left: the derivation itself. `start_index` is bound to the chain only
+     once Phase A's REGISTER preprocessed root is COMPUTED from that arena
+     (reg-tree's emitter) instead of hinted — which is entry 7's work, and
+     the two now close together.
 
 3. **Assembly must unify the five remaining two-consumer values** (deep-join
    audit, 5e93fe6d). **PARTIALLY DISCHARGED** (assembly, slice 1+2): the
@@ -160,6 +173,15 @@ entry only with the verifying evidence named in it.
 
 ## WATCH (anomalies assembly should confirm or explain, not obligations)
 
+- **PRICED** (assembly, slice 3): the fixture epoch's public output is **8
+  bytes**, so the COMMIT-bus gadget is 8 inverse chains — negligible here, and
+  still unpriced for a production epoch, whose output length is workload-shaped.
+  What assembly added is the JOIN: the bytes are no longer an arena of their
+  own but are derived from the halves the statement absorbed
+  (`epoch::emit_output_bytes`, one `BitDec` and one `MulAdd` per half, whose
+  recomposition assert doubles as the `< 2^32` range check). So the cost line
+  is "per output half" for the derivation plus "per output byte" for the fold.
+  Original entry:
 - **The COMMIT-bus target is an unbudgeted per-byte cost item**: the
   closure's second half is `Σ 1/(z − fingerprint(byte_i))` over public
   output BYTES — one inverse chain per byte, scaling with output length

@@ -135,7 +135,10 @@ impl TableChallengeShape {
     }
 
     fn check(&self) {
-        assert!(self.index < self.num_tables, "the table index must be in range");
+        assert!(
+            self.index < self.num_tables,
+            "the table index must be in range"
+        );
         assert_eq!(
             self.fri.log2_lde_length,
             self.log2_lde_length(),
@@ -227,7 +230,11 @@ pub fn fork_table(shared: &TranscriptReplay, index: usize, num_tables: usize) ->
 /// (`log2_trace_length` extension squarings) serves both, and each
 /// non-equality is one extension division: `1/(a − b)` is provable exactly when
 /// `a ≠ b`, the idiom `assert_canonical` uses on the candidate halves.
-pub fn emit_z_ood(b: &mut LfmBuilder, t: &mut TranscriptReplay, shape: &TableChallengeShape) -> Ext {
+pub fn emit_z_ood(
+    b: &mut LfmBuilder,
+    t: &mut TranscriptReplay,
+    shape: &TableChallengeShape,
+) -> Ext {
     let z = t.sample_ext(b);
     assert_z_outside_domains(b, z, shape);
     z
@@ -484,4 +491,55 @@ fn append_ext_cell(b: &mut LfmBuilder, t: &mut TranscriptReplay, v: Ext) {
 /// free choice of every constraint coefficient.
 pub fn emit_beta_powers(b: &mut LfmBuilder, beta: Ext, n: usize) -> Vec<Ext> {
     super::constraints::emit_alpha_powers(b, beta, n)
+}
+
+/// The public output as one cell per BYTE, derived from the `u32` halves the
+/// statement absorbed.
+///
+/// The output has two consumers with incompatible shapes: the statement absorb
+/// wants four-byte halves, and the COMMIT-bus target folds one term per byte
+/// (`logup::emit_commit_bus_target`). Two arenas would be two claims about the
+/// same string — the assembly obligation's fifth instance. So the halves are
+/// the arena, and the bytes are DERIVED here.
+///
+/// Each half costs one `BitDec` and one `MulAdd`, and the recomposition assert
+/// is what makes it a range check as well: a hinted half at or above `2^32`
+/// cannot equal the sum of the four bytes read out of its low 32 bits, so the
+/// program is unprovable rather than absorbing one string and folding another.
+///
+/// A trailing partial half is masked the same way the transcript masks it: only
+/// `len_bytes` bytes are returned, and the unused high bytes of the last half
+/// are pinned to zero — without that a prover could absorb one string while the
+/// length prefix claimed another.
+pub fn emit_output_bytes(b: &mut LfmBuilder, halves: &[Felt], len_bytes: usize) -> Vec<Felt> {
+    assert_eq!(
+        halves.len(),
+        len_bytes.div_ceil(4),
+        "one half per four output bytes, the last one partial"
+    );
+    let mut out = Vec::with_capacity(len_bytes);
+    let zero = b.felt_const(FE::zero());
+    for (h, half) in halves.iter().enumerate() {
+        let bits = b.bit_dec(*half, 32);
+        let bytes: Vec<Felt> = (0..4)
+            .map(|k| super::edsl::bits_to_felt(b, &bits[8 * k..8 * k + 8]))
+            .collect();
+        // half = Σ byteₖ·2^{8k}, which pins the half to its four bytes AND to
+        // the range `[0, 2^32)`.
+        let mut acc = bytes[3];
+        for k in (0..3).rev() {
+            let shift = b.felt_const(FE::from(256u64));
+            acc = b.mul_add(acc, shift, bytes[k]);
+        }
+        b.assert_eq(*half, acc);
+
+        for (k, byte) in bytes.into_iter().enumerate() {
+            if 4 * h + k < len_bytes {
+                out.push(byte);
+            } else {
+                b.assert_eq(byte, zero);
+            }
+        }
+    }
+    out
 }
