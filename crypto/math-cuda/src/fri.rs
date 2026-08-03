@@ -41,8 +41,10 @@ fn check_fault_injection() -> Result<()> {
 }
 
 /// Device-side state across FRI commit iterations. Owns the current fold
-/// input (the previous layer's evals, Arc-shared with that layer's retained
-/// `gpu_evals`) and the inv_twiddles buffer. Freed when dropped.
+/// input (the previous layer's evals) and the inv_twiddles buffer. The input
+/// is an `Arc` because the caller may also retain it as that layer's
+/// `gpu_evals` — it does so only on the device-only path, where no host copy
+/// of the evals exists. Freed when the last holder drops.
 pub struct FriCommitState {
     pub stream: Arc<CudaStream>,
     /// Current fold input. Each fold allocates a fresh output buffer that is

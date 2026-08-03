@@ -685,6 +685,15 @@ pub fn htod_via<T: cudarc::driver::DeviceRepr>(
     // the device writes on `stream`; `dst.len() >= src_host.len()` (asserted),
     // so every chunk's byte range stays within `dst`.
     let (dst_base, _record) = dst.device_ptr_mut(stream);
+    // Declared after the slot's MutexGuard so it drops FIRST: once a chunk's
+    // DMA is in flight, any `?`-return below must drain the stream before the
+    // guard releases the slot, or the next locker's `ensure_capacity` could
+    // `cuMemFreeHost` the slab while the device is still reading it. Same
+    // hazard `async_dtoh_via` guards against on its record-event failure.
+    let mut drain = DrainOnErr {
+        stream,
+        armed: false,
+    };
     let src = src_host.as_ptr() as *const u8;
     let n_elems = src_host.len();
     let mut elem_off = 0usize;
@@ -698,18 +707,26 @@ pub fn htod_via<T: cudarc::driver::DeviceRepr>(
         // never read (by an in-flight DMA) and written at the same time.
         unsafe {
             std::ptr::copy_nonoverlapping(src.add(byte_off), staging.ptr as *mut u8, this_bytes);
-            cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+            let r = cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
                 dst_base + byte_off as u64,
                 staging.ptr as *const core::ffi::c_void,
                 this_bytes,
                 stream.cu_stream(),
             )
-            .result()?;
+            .result();
+            // Armed even on failure: the driver may have enqueued the copy
+            // before reporting the error.
+            drain.armed = true;
+            r?;
         }
         // Single-buffered: wait for this chunk's DMA before the next memcpy
-        // reuses the slab.
+        // reuses the slab. Both calls can fail with the DMA still in flight,
+        // which is what `drain` covers.
         staging.record_event(stream)?;
         staging.sync_event()?;
+        // This chunk has landed; nothing is reading the slab until the next
+        // iteration re-arms.
+        drain.armed = false;
         elem_off += this_elems;
     }
     Ok(())
