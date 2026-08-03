@@ -76,6 +76,7 @@ const HI_MAX: u64 = 0xFFFF_FFFF;
 /// Packing is per SEGMENT, never per append — see
 /// [`TranscriptReplay::append_const_bytes`] for why that distinction is the
 /// whole design.
+#[derive(Clone)]
 enum SegPiece {
     /// Compile-time bytes. Consecutive runs of these are concatenated before
     /// being chunked into halves, so a constant of any length may sit anywhere.
@@ -102,12 +103,21 @@ pub struct Candidate {
 /// Held as the PLAIN digest's two words with their lane unpacks memoized:
 /// candidates 0 and 1 live in word 1 and candidates 2 and 3 in word 0, so a
 /// draw that consumes one or two candidates emits a single `Unpack`.
+#[derive(Clone)]
 struct SqueezeBuf {
     words: [Cell; DIGEST_WORDS],
     lanes: [Option<[Felt; 4]>; DIGEST_WORDS],
 }
 
 /// Emit-time replay of `DefaultTranscript`.
+///
+/// `Clone` is production's `transcript.clone()` — the per-table fork
+/// (`verifier.rs:1263`), and the only reason this type is cloneable. It is a
+/// pure emitter-state copy: the pending segment is a list of program constants
+/// and CELL handles, so a fork shares the cells its prefix already produced and
+/// emits nothing. That is exactly the production semantics — the shared prefix
+/// is hashed once and each fork diverges only past its domain separator.
+#[derive(Clone)]
 pub struct TranscriptReplay {
     /// The pending segment — the hasher's unfinalized input — as unpacked
     /// pieces. Packed into halves at squeeze time, not at append time.
@@ -449,6 +459,24 @@ impl TranscriptReplay {
         );
         let c = self.next_candidate(b);
         b.bit_dec(c.lo, nbits)
+    }
+
+    /// `DefaultTranscript::state()` — the sponge's digest RIGHT NOW, without
+    /// advancing it (production finalizes a CLONE of the hasher,
+    /// `default_transcript.rs:128-130`).
+    ///
+    /// Only grinding needs this: the seed it hashes is the state before the
+    /// nonce is absorbed, and the nonce is then absorbed into the live
+    /// transcript. Neither the segment nor the output buffer moves here, so a
+    /// later `sample` still hashes `segment ‖ nonce` exactly as production does.
+    ///
+    /// The segment is packed twice as a result (once here, once at that later
+    /// squeeze). Packing is free for an aligned segment — which this one is,
+    /// every caller reaching grinding through a `sample` — and a re-emitted
+    /// splice would only be redundant work, never a different value.
+    pub fn state(&mut self, b: &mut LfmBuilder) -> [Cell; DIGEST_WORDS] {
+        let packed = self.pack_segment(b);
+        edsl::keccak256(b, &packed, self.segment_len)
     }
 
     /// Emit-time buffer position, for tests that pin the consumption schedule.

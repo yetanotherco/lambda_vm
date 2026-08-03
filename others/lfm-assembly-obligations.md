@@ -30,7 +30,19 @@ entry only with the verifying evidence named in it.
    production carries it across epochs.
 
 3. **Assembly must unify the five remaining two-consumer values** (deep-join
-   audit, 5e93fe6d). Each is hinted twice today — not exploitable while the
+   audit, 5e93fe6d). **PARTIALLY DISCHARGED** (assembly, slice 1+2): the
+   assembled spine gives each value ONE cell and hands both views out of one
+   struct, so the unification is now a construction rather than a rule —
+   `epoch::RootCells` holds a root's two words AND the eight halves the
+   transcript absorbs, from a single hint and a single `Unpack`, and
+   `epoch::TableAbsorbs` is the surface every later leg reads its cells from.
+   `ζ` is fully discharged: it is no longer a value at all, but the `z` the
+   transcript samples. The other four are STAGED, not closed — their second
+   consumers (constraint evaluation, the DEEP fold, the Merkle root compare,
+   the `program_id` fold) are not yet wired onto the spine, so there is
+   nothing yet to disagree. They close when those legs hang off
+   `TableAbsorbs`, and the entry stays OPEN until they do.
+   Original text: each is hinted twice today — not exploitable while the
    legs are separate programs, every one a landmine the moment they share an
    arena. Unification means deciding the assembled program's arena layout,
    which is assembly's call — that is WHY they were not fixed leg-side:
@@ -42,8 +54,20 @@ entry only with the verifying evidence named in it.
    - the public output bytes (attestation `program_id` fold vs COMMIT-bus
      target).
 
-4. **The FRI leg's three per-sub-proof values are arena words and must be
-   bound at assembly** (fri-emitter, emitter slice). `declare_fri` hints the
+4. ~~**The FRI leg's three per-sub-proof values are arena words and must be
+   bound at assembly**~~ — **DISCHARGED** (assembly, slice 1+2).
+   `epoch::emit_table_challenges` samples each `ζ_k` from the transcript and
+   absorbs layer root `k` immediately after it, draws `ζ_C` only when
+   `total_folds > 0`, and absorbs every terminal coefficient after the loop —
+   production's order at `verifier.rs:1461-1489`. Falsified four ways, each
+   caught by the differential: absorbing the root BEFORE its `ζ`, never
+   absorbing the roots, skipping the final-fold draw, and never absorbing the
+   coefficients. Witnessed at `num_committed = 0/1/2/3` on single-table
+   fixtures and at **12 committed layers** on the real epoch's CPU sub-proof.
+   The layer roots remain arena cells, which is correct — they are proof data
+   — and they are now the SAME cells the FRI walk compares against.
+   (Original text kept below for the record.)
+   `declare_fri` hints the
    folding challenges `ζ₀..ζ_C`, the terminal-polynomial coefficients and
    the committed layer roots, exactly as `emit_sub_proof` hints `γ`/`ζ`.
    Two different obligations sit here and they are not interchangeable:
@@ -61,7 +85,14 @@ entry only with the verifying evidence named in it.
      `fri_tests` — that suite supplies the real values — so assembly owns
      this and nothing leg-side can catch it.
 
-5. **The standalone FRI driver's hinted index is wider than production's**
+5. ~~**The standalone FRI driver's hinted index is wider than production's**~~
+   — **DISCHARGED** (assembly, slice 1+2). The assembled verifier's query
+   index reaches the legs as `TranscriptReplay::sample_u64_pow2`'s BITS and
+   never as a felt: `TableChallenges::iota_bits` is the only index the epoch
+   spine produces, `log2(lde) − 1` of them, which is production's
+   `sample_u64(lde_length >> 1)` (`verifier.rs:138-141`) and exactly the
+   Merkle depth the walk consumes. Checked against production's own `iotas`
+   for every query of every sub-proof of a real epoch. (Original text below.)
    (fri-emitter, noted not deferred). `fri_tests::fri_only_program` hints
    `iota` as a felt and takes its low `log2(lde) − 1` bits, so `iota` and
    `iota + 2^(n−1)` are the same query to the machine, where production's
@@ -72,13 +103,46 @@ entry only with the verifying evidence named in it.
    Assembly owes only that the index reaches the query legs as those bits
    and never as a hinted felt.
 
-6. **The challenges guard cited in comments does not exist yet.** Write
-   `challenges_are_not_an_arena_in_the_assembled_verifier` once the
-   assembled verifier exists: raw challenges (z, α, ζ, per-table forks)
-   must come from `TranscriptReplay`, never from `Instr::Hint` arena words.
-   Until then the per-slice differential programs hint them as a documented
-   shortcut (`constraint_tests.rs` `differential_program` doc comment, which
-   previously cited this guard as if it existed — corrected 2026-07-31).
+6. ~~**The challenges guard cited in comments does not exist yet.**~~ —
+   **DISCHARGED** (assembly, slice 1+2). The guard is no longer a test to
+   write but a construction: `epoch::emit_table_challenges` DERIVES β, z, γ,
+   every `ζ_k` and every query index from `TranscriptReplay`, and
+   `epoch_tests::the_epoch_challenge_spine_matches_production` checks all 111
+   of them against production's own `replay_rounds_after_round_1` over a real
+   24-sub-proof epoch. The per-slice differential programs still hint their
+   challenges; that is now a property of the ISOLATION drivers, not of the
+   assembled verifier, and the assembled path has no `Instr::Hint` for any
+   challenge because nothing hints one.
+
+7. **The preprocessed commitments are hinted in the assembled spine, and four
+   of the five have no in-machine derivation** (assembly, slice 2). Production
+   takes each preprocessed root from the AIR and REJECTS a proof whose copy
+   disagrees (`verifier.rs:1184-1209`); the root it absorbs is the verifier's,
+   never the prover's. `epoch_tests::epoch_challenge_program` hints all of
+   them. Only REGISTER's has a derivation today (reg-tree, from the previous
+   epoch's `reg_fini`). BITWISE, DECODE and KECCAK_RC are compile-time
+   constants of the AIR set and could simply be interned — but **PAGE's cannot
+   be**: it is a function of the inner ELF, which is per-proof arena data, so
+   baking it would make program identity proof-dependent (an always-stop
+   item). PAGE therefore needs a derivation of the same family as REGISTER's,
+   and that derivation does not exist. Assembly owes: intern the three
+   constants, wire REGISTER's derivation into Phase A, and either build PAGE's
+   or state why the ELF-digest binding already covers it.
+
+8. **The OOD absorb ORDER has no production witness** (assembly, slice 2 —
+   measured, not argued). Production absorbs each pruned OOD block
+   column-major (`verifier.rs:1425-1429`). Injecting a ROW-major absorb leaves
+   BOTH the single-table differential and the 24-sub-proof epoch spine green,
+   because every OOD block in either is ONE ROW TALL: the current block's
+   height is `step_size` (`ood.rs:110-114`) and the phase already knows
+   `step_size = 1` collapses production, while the next block's height is
+   `num_eval_points − step_size`, which is 1 for any AIR with two transition
+   offsets — all 24 of the epoch's are. Measured dims are printed by the spine
+   test. This is a fourth member of the degenerate-parameter family and the
+   premise check the RESUME asks for was done: it is a claim about
+   PRODUCTION, not about fixtures on hand. Closing it needs a synthetic AIR
+   with three transition offsets (or `step_size > 1`), proved by the
+   production prover so the oracle stays real.
 
 ## STATED DEFERRALS (safety argument given and accepted — not open debts)
 

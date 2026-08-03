@@ -74,7 +74,7 @@ fn embed(x: &FE) -> FEE {
 /// folds. `num_boundaries` must be a power of two so the trace length is exactly
 /// it (the generator pads to the next power of two, which would silently change
 /// the shape this suite is measuring).
-fn folding_fixture(num_boundaries: usize, blowup: usize) -> (BoxedAir, MultiProof<Gl, Ext3, ()>) {
+pub(super) fn folding_fixture(num_boundaries: usize, blowup: usize) -> (BoxedAir, MultiProof<Gl, Ext3, ()>) {
     use crate::tables::local_to_global::{
         CellBoundary, FiniClaim, InitClaim, generate_local_to_global_trace,
     };
