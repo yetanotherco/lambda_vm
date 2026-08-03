@@ -434,14 +434,10 @@ jobs:
             WORKLOAD=real CONTINUATIONS=1 EPOCH_SIZE_LOG2=$GPU_REAL_EPOCH_LOG2 \
             scripts/bench_abba.sh $REF_A origin/main $PAIRS"
 
-          # Record the host CPU before the long run. The paired Δ% cancels the host,
-          # but absolute seconds do not transfer between hosts — three RTX 5090
-          # rentals at the same price measured 59.9s / ~76s / ~114s per prove on the
-          # same block (2026-08-01/03 runs), tracking host CPU class — so every number
-          # this run prints should arrive with its host attached. Model + threads go
-          # to the PR comment and summary; full lscpu to the step log. Captured before
-          # the bench so a failed run still records which host class it failed on
-          # (outputs written before a later command fails survive the step failure).
+          # Absolute seconds don't transfer between hosts (same-price 5090 rentals
+          # span ~2x per prove with the host CPU; the paired Δ% cancels it), so every
+          # number this run prints arrives with its host attached. Captured before
+          # the bench so a failed run still records the host it failed on.
           $SSH "lscpu" || true
           CPU_MODEL=$($SSH "lscpu 2>/dev/null | sed -n 's/^Model name:[[:space:]]*//p' | head -1" 2>/dev/null || true)
           [ -n "$CPU_MODEL" ] || CPU_MODEL=$($SSH "sed -n 's/^model name[[:space:]]*: //p' /proc/cpuinfo | head -1" 2>/dev/null || true)
@@ -471,8 +467,6 @@ jobs:
         run: |
           {
             echo "## GPU ABBA — ${WORKLOAD:-ethrex} (vs main)"
-            # The host line makes the absolute seconds interpretable — they vary ~2x
-            # across same-price rentals with the host CPU; only the Δ% transfers.
             [ -n "$CPU_MODEL" ] && echo "Host: $CPU_MODEL (${CPU_THREADS:-?} threads)"
             if [ "$OUTCOME" = "success" ] && [ -s "$RUNNER_TEMP/abba_result.txt" ]; then
               echo '```'
@@ -508,10 +502,8 @@ jobs:
             const gpu = (process.env.GPU_NAME || '').replace('_', ' ');
             const price = process.env.OFFER_PRICE;
             const workload = process.env.WORKLOAD || 'ethrex';
-            // Host CPU: the seconds below vary ~2x across same-price rentals with the
-            // host CPU class (the prover is host-CPU-bound at the serial producer at
-            // this epoch), so the comment names the host the seconds belong to. On
-            // both success and failure — failures correlate with host classes too.
+            // Absolute seconds vary ~2x with the rented host's CPU — name the host
+            // they belong to (on failure too, so failures correlate with hosts).
             const cpuModel = process.env.CPU_MODEL;
             const cpuThreads = process.env.CPU_THREADS;
             const host = cpuModel ? ` · ${cpuModel}${cpuThreads ? ` (${cpuThreads} threads)` : ''}` : '';
