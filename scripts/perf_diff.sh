@@ -13,22 +13,23 @@
 #
 # USAGE (on the bench server):
 #   scripts/perf_diff.sh REF_A [REF_B=origin/main]
-#   Env: WORKLOAD=synthetic|real (default synthetic) picks the block to profile;
+#   Env: WORKLOAD=real|synthetic (default real) picks the block to profile;
 #        EPOCH_SIZE_LOG2=<n> (default 22) sizes the epoch, WORKLOAD=real only.
 #          22 is the calibrated bench-runner tier, matching /bench; use 23 on a
 #          128 GiB box (tooling/ethrex-block-converter/README.md, "Choosing the epoch size").
 #
 # Pick the workload that matches the run you are localizing, because the symbol
-# mix follows the block: the synthetic default is 20 plain transfers (8.73M cycles,
-# 411 keccak calls, 80 ecsm calls) and a real block inverts that (50.78M cycles,
-# 10,478 keccak, 116 ecsm), so a hot symbol in one need not be hot in the other.
+# mix follows the block: the real default is 50.78M cycles, 10,478 keccak calls and
+# 116 ecsm calls, and the synthetic option (20 plain transfers) inverts that at
+# 8.73M cycles, 411 keccak, 80 ecsm — so a hot symbol in one need not be hot in the other.
 # Both counts are from the same guest ELF (merge fdb92f67, main @ 9ccdaf2, clang 21);
 # they move with guest optimisation (#861's thin LTO) and ~2% with the clang major, so
 # pin the ELF when quoting one.
 #
 # WORKLOAD=real also switches to a continuation prove (monolithic would need ~240 GB
-# at that trace length), which is ~4-5 min per recording — five recordings, so budget
-# ~25 min, plus ~1.2 GB of disk per bundle and ~32 GiB of RAM at the default epoch.
+# at that trace length), which is 158.8 s per recording on the bench runner — five
+# recordings, so budget ~13 min of proving, plus ~1.2 GB of disk per bundle and ~52 GB
+# of RAM at the default epoch.
 #
 # Produces:
 #   - two perf-diff tables (recorded twice per side, interleaved B A B A —
@@ -46,10 +47,10 @@ if [ $# -lt 1 ]; then
 fi
 REF_A="$1"
 REF_B="${2:-origin/main}"
-WORKLOAD="${WORKLOAD:-synthetic}"
+WORKLOAD="${WORKLOAD:-real}"
 # 2^22: the calibrated tier for the bench server this script targets, same as
-# /bench's real-block arm. Memory picks it, not speed — 32.2 GiB fits a >=64 GiB box with ~50%
-# headroom where 2^23's 60 GiB does not.
+# /bench's real-block arm. Memory picks it, not speed — that server peaks at ~52 GB on
+# a >=64 GiB floor, and 2^23 measured 60 GiB on a roomier box, so it would not fit here.
 EPOCH_SIZE_LOG2="${EPOCH_SIZE_LOG2:-22}"
 case "$WORKLOAD" in
   synthetic|real) ;;
@@ -76,16 +77,16 @@ fi
 
 command -v perf >/dev/null 2>&1 || { echo "ERROR: perf not installed (linux-tools)." >&2; exit 1; }
 [ -f "$ELF_REL" ] || { echo "ERROR: missing $ELF_REL — run bench_abba.sh once (it builds the guest)." >&2; exit 1; }
-if [ ! -f "$INPUT_REL" ]; then
-  if [ "$WORKLOAD" = "real" ]; then
-    # ~1 MB, gitignored, never in a fresh checkout; fetch rather than abort. This is
-    # a URL + sha256 download, not a build.
-    echo "==> Fetching ethrex real-block fixture (missing)"
-    make ethrex-real-block-fixture
-  else
-    echo "ERROR: missing $INPUT_REL — run bench_abba.sh once (it builds the fixture)." >&2
-    exit 1
-  fi
+if [ "$WORKLOAD" = "real" ]; then
+  # ~1 MB, gitignored, never in a fresh checkout; fetch rather than abort. This is a
+  # URL + sha256 download, not a build. Unconditional on purpose: the target hashes
+  # whatever is on disk on every invocation, which is how a stale copy gets caught.
+  # A match costs ~35 ms.
+  echo "==> Verifying ethrex real-block fixture (fetches on a digest miss)"
+  make ethrex-real-block-fixture
+elif [ ! -f "$INPUT_REL" ]; then
+  echo "ERROR: missing $INPUT_REL — run WORKLOAD=synthetic scripts/bench_abba.sh once (it generates the synthetic fixture; the default workload is real and would not)." >&2
+  exit 1
 fi
 echo "==> Workload: $WORKLOAD ($INPUT_REL${CONT_ARGS:+, continuations epoch 2^$EPOCH_SIZE_LOG2})"
 
