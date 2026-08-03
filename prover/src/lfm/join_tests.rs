@@ -1581,16 +1581,34 @@ fn the_precomputed_group_comes_first_and_that_is_checkable() {
 ///
 /// This is the degenerate-parameter rule in its most extreme form. Not "one
 /// value hides a difference between two implementations" but "the production
-/// instance exercises none of the mechanism", which no amount of care with the
-/// real data can repair. The FRI leg's primary instrument must therefore be
-/// SYNTHETIC codewords driven through production's own commit and query phases,
-/// with the layer count swept; this test exists so that the day the fixture
-/// grows and starts folding, the change is announced rather than silently
-/// altering what every FRI test covers.
+/// instance exercises none of the mechanism". The assertions below are still
+/// exactly true of THIS fixture, and this test still earns its place: the day
+/// the fixture grows and starts folding, the change is announced rather than
+/// silently altering what the FRI tests cover.
+///
+/// ## ⚠ CORRECTION — the conclusion drawn from this was wrong
+///
+/// This test's original text went on to say that no amount of care with real
+/// data could repair the gap, and that the FRI leg's primary instrument had to
+/// be SYNTHETIC codewords. That is false, and the counterexample is one line of
+/// the fixture: the trace is `boundaries.len().next_power_of_two()`
+/// (`local_to_global.rs:269`), and `num_committed = trace_bits − 8`. So the same
+/// construction with 512, 1024 or 2048 boundaries yields real production proofs
+/// with one, two or three committed layers — real roots, real paths, real
+/// terminal coefficients, real folding challenges — in under a second each.
+/// `fri_tests::the_real_prover_folds_and_the_layer_count_follows_the_row_count`
+/// is that sweep, and the FRI leg is differentialled entirely against real
+/// proofs. Nothing in it is synthetic.
+///
+/// The lesson is narrower than the one first drawn here. "The production
+/// instances all share a degenerate parameter" was a claim about the fixtures on
+/// hand, not about the prover, and the two are not the same claim. Worth
+/// checking which one is being made before concluding that real data cannot
+/// reach a mechanism.
 ///
 /// The zero-layer case is not merely an artifact to route around, either — it
 /// is a real production path (small tables fold no further than their terminal)
-/// and the emitted verifier has to handle it.
+/// and the emitted verifier handles it as a first-class shape.
 #[test]
 fn the_fixture_carries_no_fri_layers_so_it_cannot_witness_the_fold() {
     let (_air, proof) = real_fixture();

@@ -740,7 +740,6 @@ fn count_matching<F: Fn(&super::instr::Instr) -> bool>(program: &LfmProgram, f: 
 /// coefficient hints) lands in the figure.
 struct PerQuery {
     perms: usize,
-    selects: usize,
     swaps: usize,
     instrs: usize,
 }
@@ -760,13 +759,10 @@ fn marginal_fri(shape: FriShape) -> PerQuery {
         },
         2,
     );
-    let sel =
-        |p: &LfmProgram| count_matching(p, |i| matches!(i, super::instr::Instr::Select { .. }));
     let dec =
         |p: &LfmProgram| count_matching(p, |i| matches!(i, super::instr::Instr::BitDec { .. }));
     PerQuery {
         perms: permutations(&two) - permutations(&one),
-        selects: sel(&two) - sel(&one),
         swaps: dec(&two) - dec(&one),
         instrs: two.instrs.len() - one.instrs.len(),
     }
@@ -787,14 +783,25 @@ fn marginal_fri(shape: FriShape) -> PerQuery {
 /// n = 10/11/12, where 219 queries produced exactly 1,971 / 4,161 / 6,570
 /// permutations against `219 × (C + Σ pathlen)` = 219 × 9 / 19 / 30.
 ///
-/// The other three currencies are reported because permutations alone hide where
-/// the leg's rows go: the byteswaps needed to render two extension values into 48
-/// leaf bytes are `6C` per query and turn out to dominate the instruction count.
+/// ## Two currencies that point opposite ways
+///
+/// The other columns are reported because permutations alone hide where the rows
+/// go, and because the two honest answers disagree. Rendering the two extension
+/// values of a layer leaf into 48 big-endian bytes costs `6C` byteswaps per
+/// query, each one `LFM_BITDEC` row plus 64 `LFM_BALU` rows — which makes
+/// byteswapping the majority of the leg's INSTRUCTIONS. In main-trace CELLS the
+/// same comparison inverts by two orders of magnitude, because a permutation
+/// expands into 24 `KECCAK_RND` rounds of 1,480 columns while a byteswap carries
+/// 322 cells. `others/lfm-target-shape.md`'s rule that rows of different chips
+/// are not comparable is exactly this, so both are printed and neither is called
+/// "the" cost.
 #[test]
 fn the_emitted_permutation_count_meets_the_pinned_prediction() {
     const TRACE_BITS: u32 = 20;
+    let swap_cells = super::machine_tests::byteswap_cells();
+    let perm_cells = super::machine_tests::permutation_cells();
     println!(
-        "blowup   C   Q  perms/q  predicted    total  predicted   selects/q  swaps/q  instr/q"
+        "blowup   C   Q  perms/q  predicted    total  predicted  swaps/q  instr/q           hash cells/q  swap cells/q"
     );
     for (blowup_log, queries, predicted_per_query, predicted_total) in [
         (1u32, 219usize, 174usize, 38_106usize),
@@ -811,16 +818,17 @@ fn the_emitted_permutation_count_meets_the_pinned_prediction() {
         shape.check();
         let per = marginal_fri(shape);
         println!(
-            "   2^{blowup_log} {:>3} {:>3} {:>8} {:>10} {:>8} {:>10} {:>11} {:>8} {:>8}",
+            "   2^{blowup_log} {:>3} {:>3} {:>8} {:>10} {:>8} {:>10} {:>8} {:>8}              {:>13} {:>13}",
             shape.num_committed(),
             queries,
             per.perms,
             predicted_per_query,
             per.perms * queries,
             predicted_total,
-            per.selects,
             per.swaps,
             per.instrs,
+            per.perms as u64 * perm_cells,
+            per.swaps as u64 * swap_cells,
         );
         assert_eq!(
             per.perms, predicted_per_query,
@@ -849,85 +857,124 @@ fn the_emitted_permutation_count_meets_the_pinned_prediction() {
             1 + 6 * shape.num_committed(),
             "the index decomposition plus six component byteswaps per layer"
         );
+        // The inversion, asserted rather than left to the reader: byteswapping
+        // is the majority of the instructions and a rounding error in cells.
+        let swap_instrs = per.swaps * 65;
+        assert!(
+            swap_instrs * 2 > per.instrs,
+            "byteswapping should be the majority of the leg's instructions              ({swap_instrs} of {})",
+            per.instrs
+        );
+        assert!(
+            per.perms as u64 * perm_cells > 100 * per.swaps as u64 * swap_cells,
+            "and a rounding error in main-trace cells"
+        );
     }
 }
 
 /// ★ ABSOLUTE (rule 7): the joined program contains ONE point derivation per
-/// query, not two.
+/// query and ONE decomposition of the index, and every term of the count comes
+/// from a SHAPE rather than from a second emission.
 ///
-/// The tempting test — emit the FRI leg twice, once given the trace leg's point
-/// and once deriving its own, and assert the programs differ — is worthless,
-/// because both are programs this file wrote and the defect being denied would
-/// have to be introduced deliberately to be observed. The property that
-/// discriminates is a COUNT, and it is closed-form: `pow_bits` emits exactly one
-/// `Select` per index bit (`edsl.rs:257-262`), the trace walk two per level per
-/// group, and the FRI leg one per committed layer plus two per path step. So the
-/// selects the FRI leg adds to a joined program must be exactly
-/// `C + 2 · path_steps` — with no `index_bits` term, because the point it folds
-/// at is the one DEEP already evaluated at.
+/// ## This test was wrong first, and how it was caught matters more than the fix
 ///
-/// A `QueryOutput` that handed out a freshly derived point, or a FRI leg that
-/// re-decomposed the index, adds `index_bits` selects per query and fails here.
+/// Its first form measured the FRI leg's marginal `Select` count as
+/// `selects(joined) − selects(trace_only)` and asserted the difference was
+/// `C + 2 · path_steps`, reasoning that a second point derivation would add
+/// `index_bits`. That is vacuous, and injecting the exact defect it denies — a
+/// `QueryOutput` handing out a freshly derived point — left it GREEN. The reason
+/// is rule 7's failure mode wearing a different hat: the defect lives in
+/// `emit_sub_proof_with_bits`, which is what BOTH sides of the subtraction call,
+/// so both gained `index_bits` selects and the difference never moved.
+///
+/// **A difference of two counts taken from our own emitter is still a relative
+/// test, however much it looks like a count.** The marginal-cost idiom this phase
+/// uses everywhere is safe only when the RESULT is compared against a number that
+/// did not come from the emitter — a pinned prediction, or a closed form over the
+/// shapes:
+///
+/// ```text
+///   selects/query = index_bits                     (pow_bits, once per query)
+///                 + 2 · merkle_depth · num_groups  (trace walks)
+///                 + num_committed                  (FRI leaf ordering)
+///                 + 2 · path_steps_per_query       (FRI walks)
+/// ```
+///
+/// `pow_bits` emits one `Select` per bit (`edsl.rs:257-262`) and each walk level
+/// two, since a digest is two words and both must swap on the same bit
+/// (`edsl.rs:164-169`). A second derivation makes the measured count exceed the
+/// closed form by exactly `index_bits`, and nothing cancels it. Re-falsified in
+/// that form: the injected defect now fails with "a surplus of 11 index bits".
 #[test]
 fn the_fri_join_adds_no_second_point_derivation() {
     let h = host_fri(2048, 2);
-    let shape = FriShape {
-        num_queries: 2,
-        ..h.shape
-    };
+    let sub = &h.trace.shape;
+    let groups = sub.groups();
     let selects =
         |p: &LfmProgram| count_matching(p, |i| matches!(i, super::instr::Instr::Select { .. }));
     let decs =
         |p: &LfmProgram| count_matching(p, |i| matches!(i, super::instr::Instr::BitDec { .. }));
 
-    // Marginal per-query selects of the trace legs alone, and of both legs.
-    let emit = |n: usize, with_fri: bool| {
+    let emit = |n: usize| {
         let mut b = LfmBuilder::new();
-        if with_fri {
-            super::fri::emit_sub_proof_with_fri(
-                &mut b,
-                &h.trace.shape,
-                FriShape {
-                    num_queries: n,
-                    ..shape
-                },
-                n,
-            );
-        } else {
-            super::sub_proof::emit_sub_proof_with_bits(&mut b, &h.trace.shape, n);
-        }
+        super::fri::emit_sub_proof_with_fri(
+            &mut b,
+            sub,
+            FriShape {
+                num_queries: n,
+                ..h.shape
+            },
+            n,
+        );
         compile(b.finish())
     };
-    let trace_only = selects(&emit(2, false)) - selects(&emit(1, false));
-    let joined = selects(&emit(2, true)) - selects(&emit(1, true));
-    let expected = h.shape.num_committed() + 2 * h.shape.path_steps_per_query();
+    // Marginal, so the per-sub-proof plumbing is out of the figure — but the
+    // figure is then compared against the shapes, never against another emission.
+    let one = emit(1);
+    let two = emit(2);
+    let per_query_selects = selects(&two) - selects(&one);
+    let per_query_decs = decs(&two) - decs(&one);
 
+    let expected_selects = h.shape.index_bits()
+        + 2 * sub.merkle_depth * groups.len()
+        + h.shape.num_committed()
+        + 2 * h.shape.path_steps_per_query();
     assert_eq!(
-        joined - trace_only,
-        expected,
-        "the FRI leg must add {expected} selects per query ({} leaf orderings and \
-         two per each of {} path steps). It added {}; the difference of {} is \
-         {} index bits, which is a second point derivation or a second index \
-         decomposition",
+        per_query_selects,
+        expected_selects,
+        "selects per query: {} index bits for the ONE point derivation, {} for \
+         {} trace walks over {} levels, {} FRI leaf orderings, {} for {} FRI path \
+         steps. A surplus of {} index bits is a second point derivation or a \
+         second index decomposition",
+        h.shape.index_bits(),
+        2 * sub.merkle_depth * groups.len(),
+        groups.len(),
+        sub.merkle_depth,
         h.shape.num_committed(),
+        2 * h.shape.path_steps_per_query(),
         h.shape.path_steps_per_query(),
-        joined - trace_only,
-        joined - trace_only - expected,
         h.shape.index_bits(),
     );
-    // And exactly one decomposition of the index per query, shared by both legs:
-    // one for the index itself plus the byteswaps each leaf value needs.
-    let trace_decs = decs(&emit(2, false)) - decs(&emit(1, false));
-    let joined_decs = decs(&emit(2, true)) - decs(&emit(1, true));
+
+    // One decomposition of the index, plus one byteswap per field element that
+    // enters a leaf: a base element is one, an extension element three.
+    let leaf_swaps: usize = groups
+        .iter()
+        .map(|g| g.num_values() * if g.is_ext { 3 } else { 1 })
+        .sum();
+    let expected_decs = 1 + leaf_swaps + 6 * h.shape.num_committed();
     assert_eq!(
-        joined_decs - trace_decs,
+        per_query_decs,
+        expected_decs,
+        "decompositions per query: ONE for the index, {leaf_swaps} for the trace \
+         leaves, {} for the FRI layer leaves. A surplus of one is a second index \
+         decomposition",
         6 * h.shape.num_committed(),
-        "the FRI leg's only decompositions are the six extension components per \
-         layer leaf; a seventh would be a second index decomposition"
     );
     println!(
-        "per query: trace legs {trace_only} selects, joined {joined}, FRI adds \
-         {expected} and no point derivation"
+        "per query: {per_query_selects} selects and {per_query_decs} \
+         decompositions, both equal to the closed form over the shapes — one \
+         point derivation, one index decomposition"
     );
 }
 
