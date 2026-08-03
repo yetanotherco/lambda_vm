@@ -6,11 +6,13 @@ license.workspace = true
 
 [features]
 default = ["parallel"]
-parallel = ["stark/parallel", "math/parallel", "crypto/parallel", "dep:rayon"]
+parallel = ["stark/parallel", "math/parallel", "crypto/parallel", "ecsm/parallel", "dep:rayon"]
 cuda = ["stark/cuda"]
 test-cuda-faults = ["cuda", "stark/test-cuda-faults"]
 debug-checks = ["stark/debug-checks"]
 instruments = ["stark/instruments"]
+# GPU profiling build (Nsight): implies cuda — the toolkit always traces the GPU prover.
+nvtx = ["cuda", "instruments", "stark/nvtx"]
 profile-markers = ["stark/profile-markers"]
 disk-spill = ["stark/disk-spill"]
 
@@ -24,7 +26,9 @@ rayon = { version = "1.8.0", optional = true }
 sysinfo = { version = "0.31", default-features = false, features = ["system"] }
 log = "0.4"
 digest = "0.10.7"
-rkyv = { version = "0.8.10", default-features = false, features = ["alloc", "bytecheck", "aligned"] }
+# pointer_width_64: 32-bit rel-ptrs cap an archive at ~2 GiB, which large
+# continuation proofs exceed. Keep in sync across all proof-format crates.
+rkyv = { version = "0.8.10", default-features = false, features = ["alloc", "bytecheck", "aligned", "pointer_width_64"] }
 
 [dev-dependencies]
 env_logger = "*"

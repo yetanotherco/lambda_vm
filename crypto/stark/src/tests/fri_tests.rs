@@ -174,6 +174,8 @@ fn test_commit_phase_early_termination_roundtrip() {
 
     // ---- Commit phase with early termination ----
     let mut transcript = DefaultTranscript::<F>::new(&[]);
+    let inv_twiddles =
+        crate::fri::fri_functions::compute_coset_twiddles_inv::<F>(&offset, initial_len);
     let (final_poly_coeffs, fri_layers) = commit_phase_from_evaluations::<F, F, _>(
         codeword.clone(),
         &mut transcript,
@@ -181,6 +183,7 @@ fn test_commit_phase_early_termination_roundtrip() {
         initial_len,
         blowup_log,
         final_poly_log_degree,
+        &inv_twiddles,
     );
 
     assert_eq!(

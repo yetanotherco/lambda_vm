@@ -284,6 +284,86 @@ pub fn generate_page_trace(
     trace
 }
 
+/// The final `(value, timestamp)` a PAGE offset contributes, from its init byte
+/// and the dense-store cell `(value, timestamp)`. An untouched/image offset
+/// (`timestamp == 0`, where value already equals init) or a runtime write dropped
+/// by `exclude_touched` collapses to `(init, 0)`; otherwise it keeps the written
+/// `(value, timestamp)`.
+///
+/// Single source of truth for the PAGE table's FINI/TIMESTAMP columns
+/// ([`generate_page_trace_from_dense`]) AND the ARE_BYTES bitwise multiplicities
+/// (`collect_bitwise_from_page`), so the two cannot drift and the AreBytes bus
+/// stays balanced.
+pub fn page_final(init: u8, value: u8, timestamp: u64, exclude_touched: bool) -> (u8, u64) {
+    // The `ts == 0 → (init, 0)` collapse only matches the sparse path when every
+    // ts==0 cell holds its init byte: image bytes are seeded `(init, 0)` from the
+    // same image `init_values` is read from, and runtime writes carry `ts >= 4`.
+    // Pin it here so both call sites inherit the check; debug-only, free in release.
+    debug_assert!(
+        timestamp != 0 || value == init,
+        "page_final: a ts==0 cell must equal its init byte (value={value}, init={init})"
+    );
+    if timestamp == 0 || (exclude_touched && timestamp > 0) {
+        (init, 0)
+    } else {
+        (value, timestamp)
+    }
+}
+
+/// Like [`generate_page_trace`] but reads each offset's final `(value, timestamp)`
+/// straight from the dense per-page memory store ([`crate::paged_mem::PagedMem::page_data`])
+/// — one indexed read per offset, no hashing. Equivalent to looking each byte up in a
+/// `FinalStateMap` built from the same cells, but avoids the sparse map and its
+/// `page_size` (mostly-miss) lookups per page — the dominant cost of PAGE generation.
+///
+/// `final_page` is `None` for a page with no runtime cells (every offset falls back to
+/// init, ts 0). `exclude_touched` drops runtime-written cells (ts > 0) so PAGE
+/// self-cancels them — the continuation-epoch case where the L2G table owns them.
+///
+/// `ts == 0` marks an offset that is either untouched or an initial-image byte; either
+/// way its final value equals its init value, so we emit `(init, 0)` (matching the
+/// `FinalStateMap`-miss branch of [`generate_page_trace`]).
+pub fn generate_page_trace_from_dense(
+    config: &PageConfig,
+    final_page: Option<&[(u8, u64)]>,
+    exclude_touched: bool,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    let page_size = DEFAULT_PAGE_SIZE;
+    assert!(
+        config.page_base.is_multiple_of(page_size as u64),
+        "Page base must be page-aligned"
+    );
+    if let Some(page) = final_page {
+        debug_assert_eq!(page.len(), page_size, "dense page slice must span the page");
+    }
+
+    let num_rows = page_size;
+    let mut trace = TraceTable::new_main(
+        crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
+        cols::NUM_COLUMNS,
+        1,
+    );
+    let table = &mut trace.main_table;
+
+    for offset in 0..page_size {
+        table.set_u64(offset, cols::OFFSET, offset as u64);
+
+        let init_value = config
+            .init_values
+            .as_ref()
+            .and_then(|v| v.get(offset).copied())
+            .unwrap_or(0);
+        table.set_byte(offset, cols::INIT, init_value);
+
+        let (value, timestamp) = final_page.map_or((0u8, 0u64), |p| p[offset]);
+        let (fini_value, fini_ts) = page_final(init_value, value, timestamp, exclude_touched);
+        table.set_byte(offset, cols::FINI, fini_value);
+        table.set_dword_wl(offset, cols::TIMESTAMP_LO, fini_ts);
+    }
+
+    trace
+}
+
 // =========================================================================
 // Preprocessed commitment
 // =========================================================================

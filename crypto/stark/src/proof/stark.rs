@@ -16,6 +16,17 @@ use crate::{
 // `tests/bus_tests/completeness_tests.rs`. Do not add a production serde
 // dependency on these types.
 
+// With no pointer-width feature enabled rkyv silently falls back to 32-bit
+// rel-ptrs, capping an archive at ~2 GiB — which large continuation proofs
+// exceed, and which CI round-trips (all under 2 GiB) can't catch. Pinned here,
+// where the archived proof types live, so standalone builds of this crate fail
+// if a Cargo.toml loses `pointer_width_64`; lambda-vm-prover repeats the
+// assert to cover the host + riscv64 guest graphs.
+const _: () = assert!(
+    size_of::<rkyv::primitive::ArchivedUsize>() == 8,
+    "proof wire format requires rkyv's pointer_width_64 feature on every proof-format crate",
+);
+
 #[derive(
     Debug,
     Clone,

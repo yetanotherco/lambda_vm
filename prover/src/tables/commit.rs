@@ -732,6 +732,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 /// - idx 3:   `(first + end)·(1 − μ) = 0` (first/end ⇒ μ);
 /// - idx 4,5: `ADD` pair `address + 1 = address_incr` (unconditional);
 /// - idx 6,7: `ADD` pair `count_decr + 1 = count` (unconditional).
+#[derive(Clone, Copy)]
 pub struct CommitConstraints;
 
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for CommitConstraints {

@@ -854,6 +854,7 @@ fn halfword<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
 /// (left, right) decomposition rests on the ARE_BYTES range checks bounding both
 /// halves to `[0, 2¹⁶)` and on `2¹⁶` being invertible mod the Goldilocks prime
 /// (z3-verified equivalent to the HWSL contract).
+#[derive(Clone, Copy)]
 pub struct KeccakRndConstraints;
 
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for KeccakRndConstraints {

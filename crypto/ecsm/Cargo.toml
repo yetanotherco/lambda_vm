@@ -7,8 +7,14 @@ license.workspace = true
 
 [dependencies]
 num-bigint = "0.4.6"
+num-integer = "0.1.46"
 num-traits = "0.2.19"
+rayon = { version = "1.8.0", optional = true }
 # Audited secp256k1 arithmetic (host-side witness generation only; never in the
-# constraint system). Used for executor scalar multiplication and for the projective
-# double-and-add replay + batch inversion that builds ECDAS step witnesses efficiently.
+# constraint system). Used for executor scalar multiplication and for the
+# hand-rolled Jacobian double-and-add replay that builds ECDAS step witnesses
+# efficiently.
 k256 = { version = "0.13", default-features = false, features = ["arithmetic", "expose-field"] }
+
+[features]
+parallel = ["dep:rayon"]
