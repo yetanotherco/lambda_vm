@@ -127,14 +127,15 @@ fn launch_invert_total(
             .arg(&mut *out)
             .launch(cfg)?;
     }
-    // Debug-only invertibility guard. The Fermat kernel maps a zero total
-    // (some denominator was zero) silently to zero, so the batch would ship
+    // Invertibility guard. The Fermat kernel maps a zero total (some
+    // denominator was zero) silently to zero, so the batch would ship
     // all-zero "inverses" instead of erroring. A valid inverse is never zero,
-    // so `out == 0` unambiguously flags a zero total. Gated off release: the
-    // D2H+sync would reintroduce the per-batch host block this path exists to
-    // avoid, and a zero total is unreachable with honest inputs — a hit here
-    // is a construction or kernel bug, which tests/CI are the place to catch.
-    #[cfg(debug_assertions)]
+    // so `out == 0` unambiguously flags a zero total. Gated off plain release
+    // (the D2H+sync would reintroduce the per-batch host block this path
+    // exists to avoid); `test-faults` keeps it live in the GPU fallback
+    // suite, which runs --release — a hit is a construction or kernel bug,
+    // and that suite is where CI can actually catch it.
+    #[cfg(any(debug_assertions, feature = "test-faults"))]
     {
         let mut host = [0u64; 3];
         stream.memcpy_dtoh(&out.slice(0..3), &mut host)?;

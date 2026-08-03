@@ -2521,8 +2521,10 @@ pub trait IsStarkProver<
         // Cross-check the device gather against the host LDE. Skipped under
         // device-only (host trace empty): the gather was proven bit-identical
         // while the host copy was resident, and there is nothing to check
-        // against.
-        if !lde_trace.host_trace_empty() {
+        // against. Release keeps query 0 as a canary (the GPU test suites run
+        // --release, and gather failure modes — stride/offset/layout — are
+        // systematic, so one query catches them); debug checks every query.
+        if (cfg!(debug_assertions) || qi == 0) && !lde_trace.host_trace_empty() {
             let domain_size = domain.lde_roots_of_unity_coset.len() as u64;
             let r_even = reverse_index(challenge * 2, domain_size);
             let r_odd = reverse_index(challenge * 2 + 1, domain_size);
@@ -2799,10 +2801,13 @@ pub trait IsStarkProver<
                             // Cross-check against the host part evals while
                             // they are still resident (absent under full
                             // residency, where the gather is the only source).
-                            if round_2_result
-                                .lde_composition_poly_evaluations
-                                .first()
-                                .is_some_and(|p| !p.is_empty())
+                            // Query 0 stays a release canary, same rationale
+                            // as `open_trace_polys_device`.
+                            if (cfg!(debug_assertions) || qi == 0)
+                                && round_2_result
+                                    .lde_composition_poly_evaluations
+                                    .first()
+                                    .is_some_and(|p| !p.is_empty())
                             {
                                 let expected = Self::open_composition_poly_with_proof(
                                     proofs[qi].clone(),

@@ -264,6 +264,14 @@ pub fn gather_ext3_at(
     if q == 0 {
         return Ok(Vec::new());
     }
+    // Guard the kernel's device reads: a position past the evals buffer would
+    // be a silent out-of-bounds read. Positions are valid by construction;
+    // this catches a caller bug host-side before it becomes device garbage
+    // (matching `gather_merkle_paths_dev`).
+    assert!(
+        positions.iter().all(|&p| (p as usize) < evals.len() / 3),
+        "gather_ext3_at: position >= evals length"
+    );
     let be = backend()?;
     let pos_dev = stream.clone_htod(positions)?;
     // SAFETY: the gather kernel writes all 3 * q slots.
