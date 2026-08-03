@@ -129,8 +129,10 @@ const scenarios = {
   'I: /bench-growth — real block plus the growth sweep': {
     ...REAL, BASE_REAL_TIME: '288.900', BASE_REAL_PEAK: '32975',
     REAL_TIME_DIFF: '-7.500', REAL_TIME_PCT: '-2.6', REAL_PEAK_DIFF: '5', REAL_PEAK_PCT: '0.0',
+    // GROWTH_STEPS is the workflow-level env the sweep iterates; it supplies the
+    // table's x-axis, so a growth scenario has to carry it.
+    GROWTH_STEPS: '4 8 12 16 20',
     PR_GROWTH_HEAPS: '18756/26966/34748/43896/50431',
-    PR_GROWTH_TIMES: '10.685/13.434/18.854/21.094/24.737',
     PR_GROWTH_SLOPE: '2007', PR_GROWTH_R2: '0.9981',
     BASE_GROWTH_HEAPS: '18700/26900/34700/43800/50217',
     BASE_GROWTH_SLOPE: '2000', BASE_GROWTH_R2: '0.9980',

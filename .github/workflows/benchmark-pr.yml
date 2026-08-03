@@ -362,13 +362,15 @@ jobs:
             printf "%.0f %.4f\n", slope, r2
           }')
 
-          echo "growth_steps=$STEPS_SLASH" >> "$GITHUB_OUTPUT"
+          # Only what Compare reads is a step output. growth_steps and growth_times had
+          # no consumer, so they live in the metrics artifact below instead.
           echo "growth_heaps=$GROWTH_HEAPS" >> "$GITHUB_OUTPUT"
-          echo "growth_times=$GROWTH_TIMES" >> "$GITHUB_OUTPUT"
           echo "growth_slope_mb=$SLOPE" >> "$GITHUB_OUTPUT"
           echo "growth_r2=$R2" >> "$GITHUB_OUTPUT"
 
-          # Append to metrics artifact
+          # The metrics artifact is the durable record, so it keeps the per-point times
+          # and the x-axis this sweep used even though the comment renders neither —
+          # a stored baseline's heaps cannot be read back without them.
           echo "growth_steps=$STEPS_SLASH" >> /tmp/metrics.txt
           echo "growth_heaps=$GROWTH_HEAPS" >> /tmp/metrics.txt
           echo "growth_times=$GROWTH_TIMES" >> /tmp/metrics.txt
@@ -468,7 +470,7 @@ jobs:
                 # Anchored (`^key=`): `real_time_s` contains `time_s`, so an unanchored
                 # grep could match two lines and write a multi-line step output.
                 get() { grep "^$1=" "$BASELINE_FILE" | head -1 | cut -d= -f2; }
-                for key in growth_heaps growth_times growth_slope_mb growth_r2 \
+                for key in growth_heaps growth_slope_mb growth_r2 \
                            real_time_s real_peak_mb real_input; do
                   # A baseline predating the real block simply has no real_* keys; empty
                   # values hide the table rather than producing a bogus comparison.
@@ -514,14 +516,12 @@ jobs:
           PROGRAMS=($GROWTH_PROGRAMS)
           STEPS_ARR=($GROWTH_STEPS)
           GROWTH_HEAPS=""
-          GROWTH_TIMES=""
           SAMPLES=1
 
           for idx in "${!PROGRAMS[@]}"; do
             prog="${PROGRAMS[$idx]}"
             INPUT_PATH="executor/tests/${prog}.bin"
             SAMPLE_HEAPS=""
-            SAMPLE_TIMES=""
             for s in $(seq 1 $SAMPLES); do
               echo "--- Baseline growth: $prog (sample $s/$SAMPLES, default parallelism) ---"
               ./target/release/cli prove "$ELF" --private-input "$INPUT_PATH" -o /tmp/proof.bin --time \
@@ -529,17 +529,16 @@ jobs:
               rm -f /tmp/proof.bin
               T=$(grep -o 'Proving time: [0-9.]*' /tmp/baseline_growth_${prog}_${s}.txt | awk '{print $3}')
               H=$(grep -o 'Peak heap: [0-9]*' /tmp/baseline_growth_${prog}_${s}.txt | awk '{print $3}')
+              # T is parsed only to catch a prove that emitted no timing line; the
+              # baseline side compares heap alone.
               if [ -z "$T" ] || [ -z "$H" ]; then
                 echo "::error::Failed to parse baseline growth metrics for $prog sample $s"
                 exit 1
               fi
               SAMPLE_HEAPS="$SAMPLE_HEAPS $H"
-              SAMPLE_TIMES="$SAMPLE_TIMES $T"
             done
             H=$(echo $SAMPLE_HEAPS | tr ' ' '\n' | sort -n | head -1)
-            T=$(echo $SAMPLE_TIMES | tr ' ' '\n' | sort -n | head -1)
             GROWTH_HEAPS="${GROWTH_HEAPS:+$GROWTH_HEAPS/}$H"
-            GROWTH_TIMES="${GROWTH_TIMES:+$GROWTH_TIMES/}$T"
           done
 
           STEPS_SLASH=$(echo "${STEPS_ARR[@]}" | tr ' ' '/')
@@ -566,7 +565,6 @@ jobs:
           }')
 
           echo "growth_heaps=$GROWTH_HEAPS" >> "$GITHUB_OUTPUT"
-          echo "growth_times=$GROWTH_TIMES" >> "$GITHUB_OUTPUT"
           echo "growth_slope_mb=$SLOPE" >> "$GITHUB_OUTPUT"
           echo "growth_r2=$R2" >> "$GITHUB_OUTPUT"
           fi  # end run_growth check
@@ -618,7 +616,6 @@ jobs:
           # Baseline artifact outputs
           BASELINE_FOUND: ${{ steps.baseline-artifact.outputs.found }}
           BA_GROWTH_HEAPS: ${{ steps.baseline-artifact.outputs.growth_heaps }}
-          BA_GROWTH_TIMES: ${{ steps.baseline-artifact.outputs.growth_times }}
           BA_GROWTH_SLOPE: ${{ steps.baseline-artifact.outputs.growth_slope_mb }}
           BA_GROWTH_R2: ${{ steps.baseline-artifact.outputs.growth_r2 }}
           BA_REAL_TIME: ${{ steps.baseline-artifact.outputs.real_time_s }}
@@ -626,14 +623,12 @@ jobs:
           BA_REAL_INPUT: ${{ steps.baseline-artifact.outputs.real_input }}
           # Baseline run outputs
           BR_GROWTH_HEAPS: ${{ steps.baseline-run.outputs.growth_heaps }}
-          BR_GROWTH_TIMES: ${{ steps.baseline-run.outputs.growth_times }}
           BR_GROWTH_SLOPE: ${{ steps.baseline-run.outputs.growth_slope_mb }}
           BR_GROWTH_R2: ${{ steps.baseline-run.outputs.growth_r2 }}
           BR_REAL_TIME: ${{ steps.baseline-run.outputs.real_time_s }}
           BR_REAL_PEAK: ${{ steps.baseline-run.outputs.real_peak_mb }}
           # PR growth outputs
           PR_GROWTH_HEAPS: ${{ steps.pr-growth.outputs.growth_heaps }}
-          PR_GROWTH_TIMES: ${{ steps.pr-growth.outputs.growth_times }}
           PR_GROWTH_SLOPE: ${{ steps.pr-growth.outputs.growth_slope_mb }}
           PR_GROWTH_R2: ${{ steps.pr-growth.outputs.growth_r2 }}
           # PR real-block outputs
@@ -649,7 +644,6 @@ jobs:
           if [ "$BASELINE_FOUND" = "true" ]; then
             BASELINE_SRC="cached"
             BASELINE_GROWTH_HEAPS="$BA_GROWTH_HEAPS"
-            BASELINE_GROWTH_TIMES="$BA_GROWTH_TIMES"
             BASELINE_GROWTH_SLOPE="$BA_GROWTH_SLOPE"
             BASELINE_GROWTH_R2="$BA_GROWTH_R2"
             BASELINE_REAL_TIME="$BA_REAL_TIME"
@@ -658,7 +652,6 @@ jobs:
           else
             BASELINE_SRC="built from main"
             BASELINE_GROWTH_HEAPS="$BR_GROWTH_HEAPS"
-            BASELINE_GROWTH_TIMES="$BR_GROWTH_TIMES"
             BASELINE_GROWTH_SLOPE="$BR_GROWTH_SLOPE"
             BASELINE_GROWTH_R2="$BR_GROWTH_R2"
             BASELINE_REAL_TIME="$BR_REAL_TIME"
@@ -691,7 +684,8 @@ jobs:
           echo "pr_real_all_times=$PR_REAL_ALL_TIMES" >> "$GITHUB_OUTPUT"
           echo "baseline_real_time=$BASELINE_REAL_TIME" >> "$GITHUB_OUTPUT"
           echo "baseline_real_peak=$BASELINE_REAL_PEAK" >> "$GITHUB_OUTPUT"
-          echo "baseline_real_input=$BASELINE_REAL_INPUT" >> "$GITHUB_OUTPUT"
+          # No baseline_real_input output: the comment never names the baseline's block
+          # except on a mismatch, which real_mismatch below already carries.
 
           if [ -n "$PR_REAL_TIME" ] && [ -n "$BASELINE_REAL_TIME" ]; then
             if [ -n "$BASELINE_REAL_INPUT" ] && [ "$BASELINE_REAL_INPUT" != "$PR_REAL_INPUT" ]; then
@@ -715,11 +709,9 @@ jobs:
           # pr_growth_heaps, so these pass through even when only one side ran.
           {
             echo "pr_growth_heaps=$PR_GROWTH_HEAPS"
-            echo "pr_growth_times=$PR_GROWTH_TIMES"
             echo "pr_growth_slope=$PR_GROWTH_SLOPE"
             echo "pr_growth_r2=$PR_GROWTH_R2"
             echo "baseline_growth_heaps=$BASELINE_GROWTH_HEAPS"
-            echo "baseline_growth_times=$BASELINE_GROWTH_TIMES"
             echo "baseline_growth_slope=$BASELINE_GROWTH_SLOPE"
             echo "baseline_growth_r2=$BASELINE_GROWTH_R2"
           } >> "$GITHUB_OUTPUT"
@@ -737,12 +729,13 @@ jobs:
         uses: actions/github-script@v7
         env:
           BASELINE_SRC: ${{ steps.compare.outputs.baseline_src }}
+          # The growth table's x-axis, straight from the env the sweep itself iterates,
+          # so the labels cannot drift from the points they label.
+          GROWTH_STEPS: ${{ env.GROWTH_STEPS }}
           PR_GROWTH_HEAPS: ${{ steps.compare.outputs.pr_growth_heaps }}
-          PR_GROWTH_TIMES: ${{ steps.compare.outputs.pr_growth_times }}
           PR_GROWTH_SLOPE: ${{ steps.compare.outputs.pr_growth_slope }}
           PR_GROWTH_R2: ${{ steps.compare.outputs.pr_growth_r2 }}
           BASE_GROWTH_HEAPS: ${{ steps.compare.outputs.baseline_growth_heaps }}
-          BASE_GROWTH_TIMES: ${{ steps.compare.outputs.baseline_growth_times }}
           BASE_GROWTH_SLOPE: ${{ steps.compare.outputs.baseline_growth_slope }}
           BASE_GROWTH_R2: ${{ steps.compare.outputs.baseline_growth_r2 }}
           GROWTH_SLOPE_DIFF: ${{ steps.compare.outputs.growth_slope_diff }}
@@ -773,12 +766,11 @@ jobs:
             const baseSrc = process.env.BASELINE_SRC;
 
             // Growth data
+            const growthSteps = process.env.GROWTH_STEPS;
             const prGrowthHeaps = process.env.PR_GROWTH_HEAPS;
-            const prGrowthTimes = process.env.PR_GROWTH_TIMES;
             const prGrowthSlope = process.env.PR_GROWTH_SLOPE;
             const prGrowthR2 = process.env.PR_GROWTH_R2;
             const baseGrowthHeaps = process.env.BASE_GROWTH_HEAPS;
-            const baseGrowthTimes = process.env.BASE_GROWTH_TIMES;
             const baseGrowthSlope = process.env.BASE_GROWTH_SLOPE;
             const baseGrowthR2 = process.env.BASE_GROWTH_R2;
             const growthSlopeDiff = process.env.GROWTH_SLOPE_DIFF;
@@ -871,8 +863,9 @@ jobs:
             if (prGrowthHeaps) {
               const prHeaps = prGrowthHeaps.split('/');
               const baseHeaps = baseGrowthHeaps ? baseGrowthHeaps.split('/') : null;
-              // Transfer counts (x-axis); keep in sync with GROWTH_STEPS in the env block.
-              const labels = ['4', '8', '12', '16', '20'];
+              // Transfer counts (x-axis) from GROWTH_STEPS — the same list the sweep
+              // iterates, so the labels cannot drift from the heaps beside them.
+              const labels = (growthSteps || '').trim().split(/\s+/).filter(Boolean);
               const n = prHeaps.length;
 
               body += `\n## Memory Growth\n\n`;
