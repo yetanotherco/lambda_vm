@@ -89,14 +89,15 @@ fn test_ethrex_empty_block() {
 
 const REAL_BLOCK_FIXTURE: &str = "ethrex_mainnet_25368371.bin";
 
-/// Host-only acceptance gate for the real-block fixture produced by
-/// `tooling/ethrex-block-converter` (`make ethrex-real-block-fixture`): the block is
+/// Host-only acceptance gate for the real-block fixture that
+/// `make ethrex-real-block-fixture` fetches and checksums (produced offline by
+/// `tooling/ethrex-block-converter`): the block is
 /// re-executed statelessly against its own witness, so a successful run means
 /// the recovered tries, codes and headers reproduce the header's post-state
 /// root. Needs no guest ELF, which is what keeps it runnable where the RV64
 /// toolchain isn't available.
 ///
-/// Checks the *serialized artifact* specifically — that the committed rkyv
+/// Checks the *serialized artifact* specifically — that the published rkyv
 /// bytes deserialize and execute — which is why it reads the `.bin` rather
 /// than converting the cache itself.
 ///
