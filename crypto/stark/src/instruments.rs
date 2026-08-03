@@ -4,22 +4,26 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-// Wall clock span timeline: the trustworthy per step latency breakdown.
+// Wall clock span timeline: the per step latency breakdown.
 //
-// Top level phase spans open and close on the main thread at phase boundaries.
-// They do not overlap and sum to their parent, so that part of the tree is a
-// true latency breakdown (unlike the accum_* thread local sub timers below,
-// which sum per worker CPU time across rayon threads and can exceed 100%). A
-// parallel region is one span around the blocking call; its internal split is
-// reported separately as CPU time, never mixed into the wall tree.
+// Phase spans open and close on the thread that drives the phase, at phase
+// boundaries. Those are a true latency breakdown: they do not overlap and they
+// sum to their parent, unlike the accum_* thread local sub timers below, which
+// sum per worker CPU time across rayon threads and can exceed 100%. A parallel
+// region is one span around the blocking call; its internal split is reported
+// separately as CPU time, never mixed into the wall tree.
 //
-// Per table spans are the exception. `multi_prove` runs one driver thread per
-// in flight table (`r1_aux_build`, `r1_aux_commit`, `rounds_2to4`), so up to
-// `table_parallelism()` of them are open at once: they DO overlap in wall time
-// and their sum exceeds their parent. They still nest correctly, because each
-// driver seeds its span depth from the spawning thread (`current_depth` /
-// `enter_depth`) instead of starting a fresh thread at depth 0 — but read them
-// as per table wall time, not as a share of the enclosing phase.
+// Two properties of the recorded data are easy to misread:
+//
+//  - Spans are ALSO opened on worker threads, not only on the main thread —
+//    the per table drivers in `multi_prove` (`*_table` labels) and the
+//    per stage workers in `continuation.rs`. `SPAN_DEPTH` is thread local and
+//    a fresh thread starts at 0, so those records carry depth 0 and their
+//    siblings overlap in wall time. Read them as per instance wall time.
+//  - `scripts/profiling/phase_table.py` SUMS spans that share a label, so a
+//    label used once per table reports the sum over all tables, which can
+//    exceed the enclosing phase's wall clock by up to `table_parallelism()`.
+//    Give a per instance span its own label; never reuse a phase label for it.
 //
 //     let _s = instruments::span("trace_build");   // RAII, stops on drop
 //
@@ -42,32 +46,6 @@ static SPAN_ORDER: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
     static SPAN_DEPTH: std::cell::Cell<u16> = const { std::cell::Cell::new(0) };
-}
-
-/// Depth the next span opened on this thread would be stamped with.
-///
-/// Read this on the thread that spawns workers and hand the value to
-/// [`enter_depth`] inside each worker: a freshly spawned OS thread starts at
-/// depth 0, so without it every span opened off the main thread is recorded as
-/// a root sibling of `prove_total` and the tree stops being a breakdown.
-pub fn current_depth() -> u16 {
-    SPAN_DEPTH.with(|d| d.get())
-}
-
-/// Restores the span depth this thread had before [`enter_depth`].
-#[must_use]
-pub struct DepthGuard(u16);
-
-/// Seed this thread's span depth from a parent thread, restoring the previous
-/// value when the returned guard drops.
-pub fn enter_depth(depth: u16) -> DepthGuard {
-    DepthGuard(SPAN_DEPTH.with(|d| d.replace(depth)))
-}
-
-impl Drop for DepthGuard {
-    fn drop(&mut self) {
-        SPAN_DEPTH.with(|d| d.set(self.0));
-    }
 }
 
 #[must_use]
@@ -296,16 +274,13 @@ pub struct Round1SubOps {
 /// Timing data collected inside `multi_prove`.
 pub struct MultiProveTiming {
     pub prepass: Duration,
+    /// Round 1 main trace commits. The last phase-wide barrier — every main
+    /// root must be absorbed before the shared LogUp challenges are sampled.
     pub main_commits: Duration,
-    /// Aux build wall time summed over the concurrent per-table drivers. It is
-    /// no longer a phase of its own — the fused chain runs it inside
-    /// `rounds_2_4`, so it overlaps itself and is a subset of that wall time,
-    /// not an addend.
-    pub aux_build: Duration,
-    /// Aux commit, same accounting as `aux_build`.
-    pub aux_commit: Duration,
-    /// Wall clock of the fused per-table region: aux build + aux commit +
-    /// rounds 2-4, all of it concurrent across `table_parallelism()` drivers.
+    /// Wall clock of the fused per-table region: aux build, aux commit and
+    /// rounds 2-4, which run as one task per table across `table_parallelism()`
+    /// drivers. There is no phase-level wall for the aux stages on their own
+    /// any more; their CPU time shows up in `round1_sub`.
     pub rounds_2_4: Duration,
     /// Sub-op breakdown for Round 1 (main + aux LDE vs Merkle).
     pub round1_sub: Round1SubOps,
@@ -319,11 +294,6 @@ static R1_MAIN_LDE_US: AtomicU64 = AtomicU64::new(0);
 static R1_MAIN_MERKLE_US: AtomicU64 = AtomicU64::new(0);
 static R1_AUX_LDE_US: AtomicU64 = AtomicU64::new(0);
 static R1_AUX_MERKLE_US: AtomicU64 = AtomicU64::new(0);
-// Aux build / aux commit wall time per table, summed across the concurrent
-// per-table drivers of the fused chain (so, like the sub-timers, this is a
-// CPU-style total that can exceed the fused region's wall clock).
-static AUX_BUILD_US: AtomicU64 = AtomicU64::new(0);
-static AUX_COMMIT_US: AtomicU64 = AtomicU64::new(0);
 // Aux build (LogUp) sub-phases, CPU time accumulated across tables/chunks.
 static AUX_FINGERPRINT_US: AtomicU64 = AtomicU64::new(0);
 static AUX_INVERT_US: AtomicU64 = AtomicU64::new(0);
@@ -372,20 +342,6 @@ pub fn accum_aux_accumulate(d: Duration) {
     AUX_ACCUM_US.fetch_add(d.as_micros() as u64, Ordering::Relaxed);
 }
 
-/// One table's aux build and aux commit wall time, from its fused-chain driver.
-pub fn accum_aux_phases(build: Duration, commit: Duration) {
-    AUX_BUILD_US.fetch_add(build.as_micros() as u64, Ordering::Relaxed);
-    AUX_COMMIT_US.fetch_add(commit.as_micros() as u64, Ordering::Relaxed);
-}
-
-/// Drain the summed per-table aux build / aux commit times.
-pub fn take_aux_phases() -> (Duration, Duration) {
-    (
-        Duration::from_micros(AUX_BUILD_US.swap(0, Ordering::Relaxed)),
-        Duration::from_micros(AUX_COMMIT_US.swap(0, Ordering::Relaxed)),
-    )
-}
-
 pub fn take_r1_sub() -> Round1SubOps {
     Round1SubOps {
         main_lde: Duration::from_micros(R1_MAIN_LDE_US.swap(0, Ordering::Relaxed)),
@@ -412,8 +368,6 @@ pub fn reset_all() {
     R1_MAIN_MERKLE_US.store(0, Ordering::Relaxed);
     R1_AUX_LDE_US.store(0, Ordering::Relaxed);
     R1_AUX_MERKLE_US.store(0, Ordering::Relaxed);
-    AUX_BUILD_US.store(0, Ordering::Relaxed);
-    AUX_COMMIT_US.store(0, Ordering::Relaxed);
     AUX_FINGERPRINT_US.store(0, Ordering::Relaxed);
     AUX_INVERT_US.store(0, Ordering::Relaxed);
     AUX_TERM_US.store(0, Ordering::Relaxed);

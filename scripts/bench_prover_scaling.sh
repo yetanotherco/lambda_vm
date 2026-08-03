@@ -74,17 +74,12 @@ parse_run() {
     /^  Trace build/         { v = secs(); if (v) print "t_trace_build=" v }
     /^  AIR construction/    { v = secs(); if (v) print "t_air="         v }
     /^  Pre-pass/            { v = secs(); if (v) print "t_prepass="     v }
-    # "Round 1 (main trace commits)" is the whole of round 1 now; aux build and
-    # aux commit are fused into the per-table region and reported under
-    # "Rounds 2-4" as sums over the concurrent drivers, so they can exceed it.
     /^  Round 1 /            { v = secs(); if (v) print "t_round1="      v }
-    /Aux trace build/        { v = secs(); if (v) print "t_aux_build="   v }
-    /Aux trace commit/       { v = secs(); if (v) print "t_aux_commit="  v }
     /Rounds 2/               { v = secs(); if (v) print "t_rounds24="    v }
-    /Main LDE/               { v = secs(); if (v) print "t_main_lde="    v }
-    /Aux LDE/                { v = secs(); if (v) print "t_aux_lde="     v }
-    /Main commit \(Merkle/   { v = secs(); if (v) print "t_main_merkle=" v }
-    /Aux commit \(Merkle/    { v = secs(); if (v) print "t_aux_merkle="  v }
+    /Main expand_columns_to_lde/{ v = secs(); if (v) print "t_main_lde=" v }
+    /Aux expand_columns_to_lde/ { v = secs(); if (v) print "t_aux_lde="  v }
+    /Main commit \(Merkle\)/ { v = secs(); if (v) print "t_main_merkle=" v }
+    /Aux commit \(Merkle\)/  { v = secs(); if (v) print "t_aux_merkle="  v }
     /^  Total FFT/           { v = secs(); if (v) print "t_total_fft="   v }
     /^  Total Merkle/        { v = secs(); if (v) print "t_total_merkle="v }
     /^  TOTAL /              { v = secs(); if (v) print "t_total="       v }
@@ -92,13 +87,13 @@ parse_run() {
     /After trace build/      { print "h_trace_build="  $(NF-1) }
     /After AIR/              { print "h_air="          $(NF-1) }
     /After pool alloc/       { print "h_pool_alloc="   $(NF-1) }
-    # NOTE: the "After aux build" / "After aux commit" heap snapshots were
-    # removed when aux build/commit were fused into the per-table scheduler --
-    # with k tables in flight there is no single moment at which either has
-    # finished, so the snapshot had no meaning. "After main commits" is the
-    # last phase-wide barrier, and "Peak heap" still guards the region below
-    # it, so the heap-growth regressions keep coverage of the fused region.
     /After main commits/     { print "h_main_commits=" $(NF-1) }
+    # No "After aux build"/"After aux commit" rows: aux build and aux commit are
+    # fused into the per-table scheduler, so with k tables in flight there is no
+    # single moment at which either has finished, and the prover no longer takes
+    # those snapshots. "Aux trace build"/"Aux trace commit" timing rows are gone
+    # for the same reason. "After main commits" and "Peak heap" still bracket
+    # the fused region.
     ' "$stderr"
 
     grep -o 'Peak heap: [0-9]*' "$stdout" | awk '{print "peak=" $3}'
@@ -190,14 +185,12 @@ print_row "Execute"                t_execute     s
 print_row "Trace build"            t_trace_build s
 print_row "AIR construction"       t_air         s
 print_row "Pre-pass"               t_prepass     s
-print_row "Round 1 (main commits)"  t_round1      s
+print_row "Round 1"                t_round1      s
 print_row "    Main LDE"           t_main_lde    s
 print_row "    Main Merkle"        t_main_merkle s
-print_row "Rounds 2-4 (fused)"     t_rounds24    s
-print_row "  Aux trace build"      t_aux_build   s
-print_row "  Aux trace commit"     t_aux_commit  s
 print_row "    Aux LDE"            t_aux_lde     s
 print_row "    Aux Merkle"         t_aux_merkle  s
+print_row "Rounds 2-4"             t_rounds24    s
 print_row "Total FFT (all rounds)" t_total_fft   s
 print_row "Total Merkle"           t_total_merkle s
 print_row "TOTAL"                  t_total       s
@@ -211,8 +204,6 @@ if [[ "$MODE" == "heap" ]]; then
     print_row "After AIR construction" h_air          mb
     print_row "After pool alloc"       h_pool_alloc   mb
     print_row "After main commits"     h_main_commits mb
-    # "After aux build" / "After aux commit" intentionally absent: see the NOTE
-    # in parse_run. Peak heap covers the fused region they used to bracket.
     print_row "Peak heap"              peak           mb
 fi
 
@@ -275,9 +266,6 @@ if [[ "$MODE" == "heap" ]]; then
     regress "After AIR construction" h_air          mb
     regress "After pool alloc"       h_pool_alloc   mb
     regress "After main commits"     h_main_commits mb
-    # The "After aux build" / "After aux commit" heap-growth guards were dropped
-    # with their snapshots (see the NOTE in parse_run). "Peak heap" is the
-    # remaining regression guard over the fused per-table region.
     regress "Peak heap"              peak           mb
 fi
 

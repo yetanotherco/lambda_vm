@@ -71,11 +71,12 @@ pub fn print_report(
     row_top("AIR construction", air_construction, total);
 
     if let Some(ref mp) = mp {
-        // Round 1's main commits are the last phase-level barrier: every main
-        // root must be in the transcript before the shared LogUp challenges are
-        // sampled. Aux build, aux commit and rounds 2-4 are fused per table, so
-        // they are reported under one wall-clock parent below, with their
-        // components as concurrent (summed-over-drivers) sub-rows.
+        // Only two wall-clock phases are left. Round 1's main commits are the
+        // last phase-wide barrier (every main root must be absorbed before the
+        // shared LogUp challenges are sampled); everything after it — aux
+        // build, aux commit, rounds 2-4 — runs as one fused task per table, so
+        // those three have no wall-clock phase of their own to report. Their
+        // CPU time is listed under the fused phase instead.
         row_top("Pre-pass (domains/twiddles)", mp.prepass, total);
         row_top("Round 1 (main trace commits)", mp.main_commits, total);
         row_sub(
@@ -89,14 +90,11 @@ pub fn print_report(
             total,
         );
         row_top(
-            "Rounds 2\u{2013}4 (aux build+commit fused)",
+            "Rounds 2\u{2013}4 (aux build+commit fused in)",
             mp.rounds_2_4,
             total,
         );
-        eprintln!(
-            "      \u{2500}\u{2500} below: summed across concurrent drivers \u{2500}\u{2500}"
-        );
-        row_sub("  Aux trace build", mp.aux_build, total);
+        eprintln!("      \u{2500}\u{2500} aux build (CPU, summed over tables) \u{2500}\u{2500}");
         row_sub(
             "    LogUp fingerprint (CPU)",
             mp.round1_sub.aux_fingerprint,
@@ -117,7 +115,7 @@ pub fn print_report(
             mp.round1_sub.aux_accumulate,
             total,
         );
-        row_sub("  Aux trace commit", mp.aux_commit, total);
+        eprintln!("      \u{2500}\u{2500} aux commit (CPU, summed over tables) \u{2500}\u{2500}");
         row_sub(
             "    Aux LDE (fused GPU: LDE+Keccak+Merkle / CPU: LDE only)",
             mp.round1_sub.aux_lde,
@@ -128,7 +126,7 @@ pub fn print_report(
             mp.round1_sub.aux_merkle,
             total,
         );
-        eprintln!("      \u{2500}\u{2500} per table (R2\u{2013}4) \u{2500}\u{2500}");
+        eprintln!("      \u{2500}\u{2500} per table (R2\u{2013}4 wall) \u{2500}\u{2500}");
 
         // Merge split tables: MEMW[0..4] → MEMW x5
         let mut merged: BTreeMap<String, MergedTable> = BTreeMap::new();

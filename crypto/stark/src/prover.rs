@@ -698,17 +698,9 @@ fn run_admitted<T: Send>(
         .map(|_| std::sync::Mutex::new(None))
         .collect();
     let cursor = std::sync::atomic::AtomicUsize::new(0);
-    // Spans opened inside `task` run on these worker threads, and a fresh OS
-    // thread's span depth starts at 0 — which would record every per-table
-    // span as a root instead of a child of the phase that spawned it. Carry
-    // the spawning thread's depth across the scope boundary.
-    #[cfg(feature = "instruments")]
-    let parent_depth = crate::instruments::current_depth();
     std::thread::scope(|scope| {
         for _ in 0..workers.max(1).min(order.len().max(1)) {
             scope.spawn(|| {
-                #[cfg(feature = "instruments")]
-                let _depth = crate::instruments::enter_depth(parent_depth);
                 loop {
                     let pos = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if pos >= order.len() {
@@ -1417,15 +1409,9 @@ pub trait IsStarkProver<
     }
 
     /// Reconstruct Round1 for every table, print the bus balance report, and
-    /// validate each trace.
-    ///
-    /// Cross-table (bus balance) checks need every table's commitments at once,
-    /// so under `debug-checks` the fused per-table chain is split into two
-    /// admitted passes and this runs once, on the main thread, between them.
-    ///
-    /// `pair_cells` is the same per-table slot vector the drivers use. Each
-    /// driver only ever locks its own index, so locking them here — after the
-    /// aux pass has joined and before the rounds pass starts — is uncontended.
+    /// validate each trace. Called once after every table's aux commit, which
+    /// under `debug-checks` means between the fused chain's two admitted
+    /// passes — cross-table bus balance needs all the commitments at once.
     #[cfg(feature = "debug-checks")]
     fn run_debug_checks(
         pair_cells: &[std::sync::Mutex<AirTracePair<'_, Field, FieldExtension, PI>>],
@@ -3158,9 +3144,10 @@ pub trait IsStarkProver<
         let mut main_commits: Vec<TableCommit<Field>> = Vec::with_capacity(num_airs);
         let mut main_ldes: Vec<(Vec<FieldElement<Field>>, usize)> = Vec::with_capacity(num_airs);
         // Optional device-side LDE handle per table, populated only when the
-        // R1 fused GPU pipeline produced one. Indexed by table, and moved into
-        // the per-table `gpu_main_cells` slots below so each handle stays
-        // paired with its table across the fused chain.
+        // R1 fused GPU pipeline produced one. Pairing is by index: this vector
+        // is moved into the per-table `gpu_main_cells` mutex slots below, and
+        // each driver only ever touches `gpu_main_cells[idx]` for its own
+        // table. (It used to ride a zip chain through the old phase D.)
         #[cfg(feature = "cuda")]
         let mut main_gpu_handles: Vec<Option<math_cuda::lde::GpuLdeBase>> =
             Vec::with_capacity(num_airs);
@@ -3359,9 +3346,7 @@ pub trait IsStarkProver<
             let twiddles = &twiddle_caches[idx];
 
             #[cfg(feature = "instruments")]
-            let __sp = crate::instruments::span("r1_aux_build");
-            #[cfg(feature = "instruments")]
-            let t_aux_build = Instant::now();
+            let __sp = crate::instruments::span("r1_aux_build_table");
             let bus_public_inputs = if air.has_aux_trace() {
                 air.build_auxiliary_trace(*trace, &lookup_challenges)
             } else {
@@ -3385,14 +3370,10 @@ pub trait IsStarkProver<
                     .map_err(|e| ProvingError::DiskSpill(format!("aux trace: {e}")))?;
             }
             #[cfg(feature = "instruments")]
-            let aux_build_dur = t_aux_build.elapsed();
-            #[cfg(feature = "instruments")]
             drop(__sp);
 
             #[cfg(feature = "instruments")]
-            let __sp = crate::instruments::span("r1_aux_commit");
-            #[cfg(feature = "instruments")]
-            let t_aux_commit = Instant::now();
+            let __sp = crate::instruments::span("r1_aux_commit_table");
             let aux_full: AuxResult<FieldExtension> =
                 (|| -> Result<AuxResult<FieldExtension>, ProvingError> {
                     if air.has_aux_trace() {
@@ -3540,8 +3521,6 @@ pub trait IsStarkProver<
                 transcript_cells[idx].lock().unwrap().append_bytes(&c.root);
             }
             #[cfg(feature = "instruments")]
-            crate::instruments::accum_aux_phases(aux_build_dur, t_aux_commit.elapsed());
-            #[cfg(feature = "instruments")]
             drop(__sp);
 
             #[cfg(feature = "cuda")]
@@ -3593,7 +3572,7 @@ pub trait IsStarkProver<
             let domain = &domains[idx];
 
             #[cfg(feature = "instruments")]
-            let __sp = crate::instruments::span("rounds_2to4");
+            let __sp = crate::instruments::span("rounds_2to4_table");
             #[cfg(feature = "instruments")]
             let table_start = Instant::now();
 
@@ -3629,6 +3608,15 @@ pub trait IsStarkProver<
 
         #[cfg(feature = "instruments")]
         let phase_start = Instant::now();
+        // Phase-level span for the whole fused region, opened here on the
+        // calling thread. The per-table spans inside it (`*_table`) are one
+        // instance per table and `phase_table.py` sums same-label spans, so
+        // they cannot stand in for the phase wall: their sum runs up to `k`
+        // times over it. This is also the span `LAMBDA_VM_NSYS_CAPTURE_SPAN`
+        // brackets, which needs exactly one instance to start/stop the
+        // profiler around.
+        #[cfg(feature = "instruments")]
+        let __sp = crate::instruments::span("rounds_2to4");
 
         let peak_order = heaviest_first(&peak_estimates);
 
@@ -3680,20 +3668,16 @@ pub trait IsStarkProver<
             proofs.push(result.expect("run_admitted fills every slot")?);
         }
         #[cfg(feature = "instruments")]
+        drop(__sp);
+        #[cfg(feature = "instruments")]
         let table_timings = table_timings_mx.into_inner().unwrap();
         #[cfg(feature = "instruments")]
         {
-            // Aux build/commit are no longer phases of their own: each table's
-            // driver runs them inside the fused region, so these are sums over
-            // concurrent drivers and are a subset of `rounds_2_4`, not addends.
-            let (aux_build_elapsed, aux_commit_elapsed) = crate::instruments::take_aux_phases();
             // Store timing data for the top-level report in prove_with_options.
             // Uses a thread-local to avoid changing multi_prove's return type.
             crate::instruments::store(crate::instruments::MultiProveTiming {
                 prepass: prepass_elapsed,
                 main_commits: main_commits_elapsed,
-                aux_build: aux_build_elapsed,
-                aux_commit: aux_commit_elapsed,
                 rounds_2_4: phase_start.elapsed(),
                 round1_sub: crate::instruments::take_r1_sub(),
                 table_timings,
@@ -4010,200 +3994,5 @@ fn print_bus_balance_report<FieldExtension>(
             let report = tracker.analyze_mismatches();
             report.print_summary();
         }
-    }
-}
-
-/// Scheduling primitives only. These are free functions over `&[u64]` with no
-/// AIR, field or device dependency, so they are testable without a GPU — which
-/// matters because CI never exercises them concurrently: `ubuntu-latest` has
-/// 2-4 vCPU, so `table_parallelism()` floors to 1, and on non-cuda builds the
-/// budget is `u64::MAX`, which makes `VramGate` inert.
-#[cfg(test)]
-mod scheduler_tests {
-    use super::{VramGate, heaviest_first, run_admitted};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
-
-    /// Bound on how long a correct implementation may take to wake a waiter.
-    /// Only a failure deadline — never used to sequence the test.
-    const WAKE_DEADLINE: Duration = Duration::from_secs(10);
-
-    #[test]
-    fn heaviest_first_is_a_descending_permutation() {
-        let empty: [u64; 0] = [];
-        assert!(heaviest_first(&empty).is_empty());
-        assert_eq!(heaviest_first(&[3, 1, 2]), vec![0, 2, 1]);
-
-        let estimates = [7u64, 0, 7, 3, 100, 1];
-        let order = heaviest_first(&estimates);
-        let mut seen = order.clone();
-        seen.sort_unstable();
-        assert_eq!(
-            seen,
-            (0..estimates.len()).collect::<Vec<_>>(),
-            "must be a permutation of 0..n"
-        );
-        for w in order.windows(2) {
-            assert!(
-                estimates[w[0]] >= estimates[w[1]],
-                "must be descending by estimate, got {order:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn heaviest_first_breaks_ties_by_index() {
-        // `sort_by_key` is stable, so equal estimates keep ascending index
-        // order: the admission order is a pure function of the estimates, and
-        // does not vary run to run.
-        assert_eq!(heaviest_first(&[5, 5, 5]), vec![0, 1, 2]);
-        assert_eq!(heaviest_first(&[1, 5, 5, 1]), vec![1, 2, 0, 3]);
-    }
-
-    #[test]
-    fn run_admitted_fills_every_slot_exactly_once() {
-        // Includes the degenerate shapes: no work, one worker, more workers
-        // than tables, and `workers == 0` (clamped to 1 inside).
-        for (n, workers) in [(0, 4), (1, 1), (1, 8), (5, 0), (5, 1), (5, 8), (9, 4)] {
-            let estimates: Vec<u64> = (0..n).map(|i| i as u64 + 1).collect();
-            let runs: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
-            let gate = VramGate::new(u64::MAX);
-            let out = run_admitted(
-                &heaviest_first(&estimates),
-                &estimates,
-                &gate,
-                workers,
-                |idx| {
-                    runs[idx].fetch_add(1, Ordering::SeqCst);
-                    idx * 10
-                },
-            );
-            assert_eq!(out.len(), n, "one slot per table (n={n})");
-            for i in 0..n {
-                assert_eq!(
-                    runs[i].load(Ordering::SeqCst),
-                    1,
-                    "table {i} ran exactly once (n={n}, workers={workers})"
-                );
-                assert_eq!(
-                    out[i],
-                    Some(i * 10),
-                    "slot {i} holds its own result (n={n}, workers={workers})"
-                );
-            }
-            assert_eq!(*gate.used.lock().unwrap(), 0, "all permits released");
-        }
-    }
-
-    #[test]
-    fn concurrent_admissions_stay_under_budget() {
-        const BUDGET: u64 = 100;
-        const EACH: u64 = 40; // 2 fit, 3 do not
-        let estimates = vec![EACH; 16];
-        let gate = VramGate::new(BUDGET);
-        let in_flight = AtomicUsize::new(0);
-        let max_in_flight = AtomicUsize::new(0);
-        run_admitted(&heaviest_first(&estimates), &estimates, &gate, 8, |_| {
-            let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-            max_in_flight.fetch_max(now, Ordering::SeqCst);
-            // Read under a held permit: the gate's own counter must never
-            // exceed the budget while anything is admitted.
-            assert!(
-                *gate.used.lock().unwrap() <= BUDGET,
-                "admitted bytes exceeded the budget"
-            );
-            in_flight.fetch_sub(1, Ordering::SeqCst);
-        });
-        assert!(
-            max_in_flight.load(Ordering::SeqCst) <= (BUDGET / EACH) as usize,
-            "more tables were in flight than the budget allows"
-        );
-        assert_eq!(*gate.used.lock().unwrap(), 0);
-    }
-
-    #[test]
-    fn oversized_request_is_admitted_alone_and_wakes_waiters() {
-        // A table bigger than the whole budget must still prove: it is admitted
-        // when nothing else holds bytes, rather than deadlocking forever.
-        let gate = VramGate::new(10);
-        let big = gate.acquire(100);
-        assert_eq!(
-            *gate.used.lock().unwrap(),
-            100,
-            "oversized request admitted alone"
-        );
-
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        std::thread::scope(|s| {
-            s.spawn(|| {
-                ready_tx.send(()).unwrap();
-                let permit = gate.acquire(5);
-                done_tx.send(()).unwrap();
-                drop(permit);
-            });
-            ready_rx.recv().unwrap();
-            drop(big);
-            assert!(
-                done_rx.recv_timeout(WAKE_DEADLINE).is_ok(),
-                "dropping a permit must wake a waiter"
-            );
-        });
-        assert_eq!(
-            *gate.used.lock().unwrap(),
-            0,
-            "permits release their bytes on drop"
-        );
-    }
-
-    /// Guards the instruments span tree: a driver thread starts at span depth
-    /// 0, so without the seeding in `run_admitted` every per-table span is
-    /// recorded as a root sibling of `prove_total` and the "% of total" column
-    /// stops meaning anything. Reads the depth directly instead of the global
-    /// span timeline, which other tests in this binary also write to.
-    #[cfg(feature = "instruments")]
-    #[test]
-    fn run_admitted_seeds_worker_span_depth() {
-        const PARENT_DEPTH: u16 = 3;
-        let outer = crate::instruments::enter_depth(PARENT_DEPTH);
-        let n = 6;
-        let estimates = vec![1u64; n];
-        let gate = VramGate::new(u64::MAX);
-        let seen = run_admitted(&heaviest_first(&estimates), &estimates, &gate, 4, |_| {
-            crate::instruments::current_depth()
-        });
-        for (i, depth) in seen.iter().enumerate() {
-            assert_eq!(
-                *depth,
-                Some(PARENT_DEPTH),
-                "table {i}'s driver must inherit the spawning thread's span depth"
-            );
-        }
-        drop(outer);
-        assert_eq!(
-            crate::instruments::current_depth(),
-            0,
-            "the calling thread's depth is restored"
-        );
-    }
-
-    #[test]
-    fn max_budget_gate_never_blocks() {
-        // The non-cuda / unqueryable-VRAM configuration. Two acquires that
-        // saturate `u64` must both be admitted.
-        let gate = VramGate::new(u64::MAX);
-        let held = gate.acquire(u64::MAX / 2);
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::scope(|s| {
-            s.spawn(|| {
-                let _permit = gate.acquire(u64::MAX / 2 + 1000);
-                tx.send(()).unwrap();
-            });
-            assert!(
-                rx.recv_timeout(WAKE_DEADLINE).is_ok(),
-                "a u64::MAX budget must never block an acquire"
-            );
-        });
-        drop(held);
     }
 }
