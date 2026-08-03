@@ -169,16 +169,34 @@ worked, twice now:
   the history if a mailbox message is lost, which happened repeatedly.
 
 Wave 3 CLOSED 2026-08-03 (both legs same day, both agents stood down
-cleanly — first wave that did not end at a session limit). feat/lfm @
-6d5f197f, 188 green, lint 0.
+cleanly — first wave that did not end at a session limit). 188 green,
+lint 0.
 
-Ready to start immediately (wave 4):
+Wave 4 (assembly) SPAWNED and ABORTED same day: the agent hit the
+session token limit ~25 minutes in (reset 16:40 America/Buenos_Aires),
+branch untouched. Its worktree is ALIVE and clean — reuse it, do not
+create another:
+`/private/tmp/claude-501/-Users-maurofab-workspace-lambda-vm-3/0f390d07-adf0-4a3e-a1b5-d6a58e444fae/scratchpad/wt-assembly`,
+branch `feat/lfm-assembly` @ 35845e4c (artifacts symlink in place).
+One deliverable survived and is COMMITTED:
+`lfm-team-lead-start-index-research.md` answers ledger entry 2 —
+production binds `start_index` (x254, reg slot 64) by REBUILDING epoch
+N's REGISTER preprocessed commitment from epoch N−1's FINI vector; no
+arithmetic start+len check exists anywhere; the LFM analogue is binding
+the arena word to `reg_fini[64]`, which the reg leg already handles.
+Bonus: FINI's u32 commitment forces `start_index < 2^32`, which bears
+on ledger entry 1 (may upgrade the REG-C2 argument route over the
+range check).
+
+Ready to start immediately (wave 4 respawn):
 - **Assembly** — compose the legs into ONE epoch-verifier program and
   run it. The brief is `lfm-assembly-obligations.md` (the six OPEN
   entries are the spec's skeleton) plus the leg handoffs
   (`lfm-logup-handoff.md`, `lfm-fri-verify-spec.md` Addendum 2, the
-  join/reg-tree sections above). The composed per-epoch numbers are
-  predictions to confirm or falsify, not facts.
+  join/reg-tree sections above) — and point the agent at
+  `lfm-team-lead-start-index-research.md` so entry 2's reading is not
+  re-derived. The composed per-epoch numbers are predictions to confirm
+  or falsify, not facts.
 
 After that: the wrap run on the box.
 
