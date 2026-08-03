@@ -204,7 +204,7 @@ on ledger entry 1 (may upgrade the REG-C2 argument route over the
 range check).
 
 Wave 4 (assembly) RAN 2026-08-03 on `feat/lfm-assembly` (3 commits off
-35845e4c). Suite 196 green, `make lint` exit 0. See item 5 above for what
+35845e4c). Suite 195 green (188 + 7), `make lint` exit 0. See item 5 above for what
 landed. ⚠ `lfm-team-lead-start-index-research.md` is not a document — it is
 a raw 518 KB JSONL session transcript that was committed under a `.md`
 name. Its research is real and correct (extracted and acted on), but a
