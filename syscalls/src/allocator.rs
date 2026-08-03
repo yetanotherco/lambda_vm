@@ -504,7 +504,7 @@ pub fn init_allocator() {
 /// It is only for rust std internal uses
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sys_alloc_aligned(bytes: usize, align: usize) -> *mut u8 {
-    // Route through whichever `#[global_allocator]` is installed (dlmalloc or TLSF).
+    // Route through whichever `#[global_allocator]` is installed (bump or dlmalloc).
     unsafe { std::alloc::alloc(core::alloc::Layout::from_size_align(bytes, align).unwrap()) }
 }
 
