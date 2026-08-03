@@ -88,10 +88,17 @@ Artifacts live in the **[`bench-fixtures-v1`][release]** release on
 
 | asset | sha256 | read by |
 |---|---|---|
-| `ethrex_mainnet_25368371.bin` | `61eba49b…` | every benchmark (**current default**) |
+| `ethrex_mainnet_25368371.bin` | `0a301731…` | every benchmark (**current default**) |
 | `cache_mainnet_25368371.json` | `7aa88a5f…` | `regen-real-block-fixture` |
 | `ethrex_mainnet_25453112.bin` | `0298663d…` | alternate candidate |
 | `cache_mainnet_25453112.json` | `20ffbbc1…` | alternate candidate |
+
+> **Re-upload pending.** The `0a301731…` above is what the Makefile verifies against
+> after the ethrex `4f658c2b` bump, which moved the rkyv layout and so changed the
+> fixture bytes. The hosted asset still carries the pre-bump `61eba49b…` until it is
+> replaced in the release, so `make ethrex-real-block-fixture` fails its checksum on a
+> clean checkout in the meantime — loudly, which is the designed failure mode. Only the
+> `.bin` is stale; the caches are inputs and are unaffected.
 
 Each block has two assets: the fixture and the **cache** it was converted from
 (`make ethrex-real-block-cache`, ~2 MB, same verify-then-move contract). Only
@@ -130,12 +137,15 @@ cargo run --release -- <cache.json> <output_path>
 Output is deterministic for a given cache file:
 
 ```text
-wrote ../../executor/tests/ethrex_mainnet_25368371.bin (1110156 bytes): 1 block(s) \
+wrote ../../executor/tests/ethrex_mainnet_25368371.bin (1110165 bytes): 1 block(s) \
   from mainnet starting at #25368371, 29 transaction(s), 2428684 gas
 ```
 
-Verified: regenerating from the hosted cache reproduces `61eba49b…` byte for byte,
-which is what proves the hosted `.bin` and the hosted cache describe the same block.
+Verified at the current ethrex rev: regenerating from the hosted cache reproduces
+`0a301731…` byte for byte, and the result passes `test_ethrex_real_block_native` —
+which is what proves the hosted cache and the fixture the Makefile expects describe
+the same block. (Byte count and digest are both rev-dependent: the `4f658c2b` bump
+moved them from 1,110,156 B / `61eba49b…`, the bytes still hosted in the release.)
 
 The converter's `conversion_is_reproducible` test enforces the same property, but
 against its own pinned block rather than this one — see [Validation](#validation).
@@ -350,6 +360,15 @@ current default), so sizing a candidate from its gas mispredicts cost.
 
 **Current default — main-vintage (merge `fdb92f67`, main @ `9ccdaf2`):**
 
+These figures were measured on the pre-bump fixture (`61eba49b…`, 1,110,156 B) and are
+left as measured rather than restamped. The ethrex `4f658c2b` bump changed the fixture
+bytes, so they are a baseline for a workload that no longer exists byte-for-byte.
+
+Post-bump CPU counterparts, measured ABBA on `vm-benchmarks-1` at the same epoch 2^22
+(see `ETHREX_BUMP_CYCLE_RESULTS.md`): **45,074,552 cycles** (−11.24%), **142.37 s** CPU
+prove (−10.87%), **936.7 MB** proof (−12.22%), peak RSS flat at ~48 GB. The GPU column
+has no post-bump counterpart yet.
+
 | block | gas | cycles | GPU prove (RTX 5090) | CPU prove | proof | fixture |
 |---|---|---|---|---|---|---|
 | **mainnet 25368371** | 2.43M | **50,781,557** (clang 21)<br>50,713,534 (clang 18) | **59.87 s** @ epoch 2^22 | **158.8 s** @ epoch 2^22 (2.65x the GPU wall) | 1.15 GB CPU / 1.12 GB GPU | 1,110,156 B, `61eba49b…` |
@@ -452,10 +471,16 @@ first run after a repoint reports one-sided numbers until main republishes.
 ## Why the JSON and not ethrex-replay's own `.bin`
 
 `ethrex-replay` can already emit a rkyv `ProgramInput`, but it tracks ethrex
-`main`, where the type has diverged from the rev our guest pins
-(`156cb8d6…`): `main` has an extra `fee_configs` field, moved the type from
-`l1::` to `input::`, and uses rkyv 0.8.10 against our exact `=0.8.16`. Its
-binary would not deserialize in our guest.
+`main` while we pin a branch off it, and the type has diverged between the two
+before: against the previously pinned rev (`156cb8d6…`) `main` carried an extra
+`fee_configs` field and had moved the type from `l1::` to `input::`, so replay's
+binary would not deserialize in our guest at all.
+
+At the currently pinned rev (`4f658c2b…`, rebased onto recent `main`) the
+`ProgramInput` definition matches `main`'s again, and that gap has closed for
+now. What has not closed: replay resolves rkyv itself from ethrex's `^0.8.10`
+rather than our exact `=0.8.16`, `main` has no `lambdavm` feature to build the
+guest side against, and the next bump can reopen the type gap without warning.
 
 The cache JSON carries only `blocks` + `witness` + `network` as plain serde, so
 it survives that drift. This tool re-reads it with **our** pinned ethrex types

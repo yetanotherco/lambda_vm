@@ -25,13 +25,16 @@ lambda-vm-ethrex-crypto = { path = "../../../../crypto/ethrex-crypto" }
 # crypto defaults); ethrex's own `LambdaVmCrypto` compiles unused — we inject our
 # own. KZG is NOT linked under this feature, so the point-evaluation precompile
 # (0x0a) is unsupported — see src/main.rs.
-ethrex-guest-program = { git = "https://github.com/lambdaclass/ethrex.git", rev = "156cb8d6a3974f411d71622eecd1b249ee37ff1c", package = "ethrex-guest-program", default-features = false, features = ["lambdavm"] }
+ethrex-guest-program = { git = "https://github.com/lambdaclass/ethrex.git", rev = "4f658c2b3d10e3f21d35ce546870f55ca3f940fc", package = "ethrex-guest-program", default-features = false, features = ["lambdavm"] }
 # Exact pin: must match the fixture writer (tooling/ethrex-fixtures) and the
 # executor test reader so the rkyv ProgramInput layout stays consistent.
 rkyv = { version = "=0.8.16", features = ["std", "unaligned"] }
 
-# `ethrex-guest-program`'s `lambdavm` feature pins `lambda-vm-syscalls` to an
-# older commit. Override it with our working-tree copy so the guest links our
-# current syscalls (keccak_permute + the Print-ecall no-op fix).
+# `ethrex-guest-program`'s `lambdavm` feature git-deps `lambda-vm-syscalls` at a
+# pinned commit of THIS repo, which upstream bumps on its own schedule. Override it
+# with the working-tree copy so the guest always links the same syscalls as the rest
+# of the repo — including uncommitted local edits — rather than whatever commit
+# ethrex last pinned. (At the current ethrex rev the two happen to coincide; this
+# override is what keeps that coincidence from being load-bearing.)
 [patch."https://github.com/yetanotherco/lambda_vm.git"]
 lambda-vm-syscalls = { path = "../../../../syscalls" }

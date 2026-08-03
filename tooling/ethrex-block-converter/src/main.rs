@@ -5,18 +5,23 @@
 //!   cargo run --release -- <cache.json> <output_path>
 
 use ethrex_common::types::Block;
-use ethrex_common::types::block_execution_witness::RpcExecutionWitness;
+use ethrex_common::types::block_execution_witness::{RpcExecutionWitness, decode_witness_headers};
 use ethrex_config::networks::Network;
+use ethrex_crypto::NativeCrypto;
 use ethrex_guest_program::l1::ProgramInput;
 use serde::Deserialize;
 
 /// The subset of `ethrex-replay`'s on-disk cache that a `ProgramInput` needs.
 ///
 /// Deliberately deserialized with *our* pinned ethrex types rather than by
-/// depending on `ethrex-replay`: it tracks ethrex `main`, where `ProgramInput`
-/// has diverged (extra `fee_configs` field, different module path, rkyv 0.8.10
-/// vs our `=0.8.16`), so its own `.bin` output would not deserialize in our
-/// guest. This JSON is the version-tolerant interface between the two.
+/// depending on `ethrex-replay`: it tracks ethrex `main`, we pin a branch off it,
+/// and `ProgramInput` has diverged between the two before (it once carried an
+/// extra `fee_configs` field and lived at a different module path). At the
+/// currently pinned rev the type happens to match `main`'s again, but replay
+/// still resolves rkyv itself from ethrex's `^0.8.10` against our exact `=0.8.16`,
+/// and nothing stops the type drifting apart on the next bump. This JSON carries
+/// only `blocks` + `witness` + `network` as plain serde, so it is the
+/// version-tolerant interface between the two regardless.
 ///
 /// Extra fields in the file (L2 blob data, custom `chain_config`) are ignored.
 #[derive(Deserialize)]
@@ -70,10 +75,19 @@ fn program_input_from_cache(
 
     // `into_execution_witness` rebuilds the trie structures from the flat node
     // list and needs the parent header, which the cache carries inside `witness`.
+    // Those headers are now decoded by the caller rather than inside the call, and
+    // the `Crypto` argument is what recomputes the block hashes the parent lookup
+    // matches on. `NativeCrypto` is keccak-only here, so it produces the same bytes
+    // as the `LambdaVmEcsmCrypto` the guest injects (whose host path is also
+    // software keccak) — the fixture does not depend on which one converts it.
     let chain_config = cache.network.get_genesis()?.config;
-    let witness = cache
-        .witness
-        .into_execution_witness(chain_config, summary.first_block_number)?;
+    let decoded_headers = decode_witness_headers(&cache.witness.headers)?;
+    let witness = cache.witness.into_execution_witness(
+        chain_config,
+        summary.first_block_number,
+        &decoded_headers,
+        &NativeCrypto,
+    )?;
 
     Ok((ProgramInput::new(cache.blocks, witness), summary))
 }
@@ -216,7 +230,7 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect();
         assert_eq!(
-            digest, "1f7d4c4cdf9bd52472d9ebafdb4038f57a88c3c92d65c96fd86d7e323db87142",
+            digest, "6ffc80b25ec9ed3c203c35bdb8a4a05aff08d98b1a9c71648447bc199a552dc9",
             "fixture bytes changed — regenerate it and update the README checksum",
         );
     }

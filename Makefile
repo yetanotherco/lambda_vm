@@ -308,7 +308,7 @@ test-rust: compile-programs-rust
 ETHREX_REAL_BLOCK_NETWORK := mainnet
 ETHREX_REAL_BLOCK := 25368371
 ETHREX_REAL_BLOCK_FIXTURE_URL := https://github.com/yetanotherco/lambda_vm/releases/download/bench-fixtures-v1/ethrex_mainnet_25368371.bin
-ETHREX_REAL_BLOCK_FIXTURE_SHA256 := 61eba49b6b254f4a05def5a47b08a21ae3eee56f0d37bcd7b3a24b0cc1e4a300
+ETHREX_REAL_BLOCK_FIXTURE_SHA256 := 0a301731b84515260c2ad7779fef3e4ef8b2424fbcc055ee2f5a224bc88120ab
 # The block's source cache, hosted in the same release. Only `regen-real-block-fixture`
 # reads it — the converter's TESTS use a different, upstream-pinned cache (below).
 ETHREX_REAL_BLOCK_CACHE_URL := https://github.com/yetanotherco/lambda_vm/releases/download/bench-fixtures-v1/cache_mainnet_25368371.json

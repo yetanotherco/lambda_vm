@@ -9,8 +9,13 @@ edition = "2024"
 [dependencies]
 # Pinned to the SAME ethrex rev as the guest (open LambdaVM-backend PR branch)
 # so the generated ProgramInput rkyv layout matches what the guest deserializes.
-ethrex-common = { git = "https://github.com/lambdaclass/ethrex.git", rev = "156cb8d6a3974f411d71622eecd1b249ee37ff1c", package = "ethrex-common", default-features = false }
-ethrex-config = { git = "https://github.com/lambdaclass/ethrex.git", rev = "156cb8d6a3974f411d71622eecd1b249ee37ff1c", package = "ethrex-config", default-features = false }
+ethrex-common = { git = "https://github.com/lambdaclass/ethrex.git", rev = "4f658c2b3d10e3f21d35ce546870f55ca3f940fc", package = "ethrex-common", default-features = false }
+ethrex-config = { git = "https://github.com/lambdaclass/ethrex.git", rev = "4f658c2b3d10e3f21d35ce546870f55ca3f940fc", package = "ethrex-config", default-features = false }
+# Only for `NativeCrypto`, the host `Crypto` impl that `into_execution_witness`
+# now takes. Nothing re-exports it, and this crate's own guest-crypto impl is a
+# dev-dependency, so the bin build needs its own line. Already in the graph via
+# `ethrex-config` → `ethrex-p2p`, so this adds no compilation.
+ethrex-crypto = { git = "https://github.com/lambdaclass/ethrex.git", rev = "4f658c2b3d10e3f21d35ce546870f55ca3f940fc", package = "ethrex-crypto", default-features = false }
 # Matches the guest's own declaration (executor/programs/rust/ethrex/Cargo.toml).
 #
 # CAVEAT: this line alone does NOT reproduce the guest's precompile surface. The
@@ -21,7 +26,7 @@ ethrex-config = { git = "https://github.com/lambdaclass/ethrex.git", rev = "156c
 # `ark-ff/asm` BN254) that the guest does not have; verify with
 # `cargo tree -e features -i ethrex-crypto`. Closing that gap means dropping
 # `ethrex-config` and sourcing `ChainConfig` another way — see the README.
-ethrex-guest-program = { git = "https://github.com/lambdaclass/ethrex.git", rev = "156cb8d6a3974f411d71622eecd1b249ee37ff1c", package = "ethrex-guest-program", default-features = false, features = ["lambdavm"] }
+ethrex-guest-program = { git = "https://github.com/lambdaclass/ethrex.git", rev = "4f658c2b3d10e3f21d35ce546870f55ca3f940fc", package = "ethrex-guest-program", default-features = false, features = ["lambdavm"] }
 
 # Exact pin: the fixture writer and the guest/executor readers must agree on the
 # rkyv layout. Keep this in sync with the guest
@@ -55,7 +60,8 @@ lambda-vm-ethrex-crypto = { path = "../../crypto/ethrex-crypto" }
 # one can stay a dev-dependency without forcing the rebuild described above.
 sha2 = "0.10"
 
-# `ethrex-guest-program`'s `lambdavm` feature pins `lambda-vm-syscalls` to an
-# older commit; override it with our working-tree copy, as the guest does.
+# `ethrex-guest-program`'s `lambdavm` feature git-deps `lambda-vm-syscalls` at a
+# pinned commit of this repo; override it with the working-tree copy, as the guest
+# does, so both resolve the same syscalls.
 [patch."https://github.com/yetanotherco/lambda_vm.git"]
 lambda-vm-syscalls = { path = "../../syscalls" }

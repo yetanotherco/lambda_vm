@@ -15,7 +15,7 @@ merges to `main`):
 
 ```text
 https://github.com/lambdaclass/ethrex.git
-156cb8d6a3974f411d71622eecd1b249ee37ff1c
+4f658c2b3d10e3f21d35ce546870f55ca3f940fc
 ```
 
 ### Generation
@@ -41,15 +41,15 @@ Known fixtures:
 
 ```text
 ethrex_empty_block.bin
-  sha256: d3e594f07cc74e4ddc9db9e9db220a65a2d2e578b619fc3ce06e346007b3ca43
+  sha256: ca7454142f13db5d04356366e3917d264cbea709ddd1b5e6526720dbaa12064d
   contents: stateless ethrex empty block ProgramInput (0 transactions)
 
 ethrex_simple_tx.bin
-  sha256: 15e3b3efa434186682537755d828ac8bbdde4be3fc7cbe34f26687b618a6c6ab
+  sha256: 29c1607297d21d88accb33767c8e03eb6536d746e6b2399930afdc9d67f1fe3f
   contents: stateless ethrex block with one plain ETH transfer transaction
 
 ethrex_10_transfers.bin
-  sha256: 38901ee4d40b99cf0aa7f642a92f0fc8db76d974bf43033a1673839020c3c28e
+  sha256: d04cfed35bd16c8248ab8ebf2f3ca2ff01c08269271b17e5d5db3b1f22ea03ad
   contents: stateless ethrex block with ten plain ETH transfer transactions
 ```
 
@@ -58,7 +58,7 @@ ethrex_10_transfers.bin
 The blocks above are synthetic (N plain ETH transfers over a small genesis).
 For a representative workload — real contract execution, real trie depth, real
 bytecode — `make ethrex-real-block-fixture` downloads
-`ethrex_mainnet_25368371.bin` (1,110,156 B) from the `bench-fixtures-v1` release
+`ethrex_mainnet_25368371.bin` (1,110,165 B) from the `bench-fixtures-v1` release
 and verifies it against `ETHREX_REAL_BLOCK_FIXTURE_SHA256` in the Makefile before
 moving it into place. It is gitignored rather than committed, so the checksum
 lives next to the URL in the Makefile rather than in the table above (the checksum
