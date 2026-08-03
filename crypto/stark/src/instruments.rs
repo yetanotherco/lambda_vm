@@ -297,8 +297,15 @@ pub struct Round1SubOps {
 pub struct MultiProveTiming {
     pub prepass: Duration,
     pub main_commits: Duration,
+    /// Aux build wall time summed over the concurrent per-table drivers. It is
+    /// no longer a phase of its own — the fused chain runs it inside
+    /// `rounds_2_4`, so it overlaps itself and is a subset of that wall time,
+    /// not an addend.
     pub aux_build: Duration,
+    /// Aux commit, same accounting as `aux_build`.
     pub aux_commit: Duration,
+    /// Wall clock of the fused per-table region: aux build + aux commit +
+    /// rounds 2-4, all of it concurrent across `table_parallelism()` drivers.
     pub rounds_2_4: Duration,
     /// Sub-op breakdown for Round 1 (main + aux LDE vs Merkle).
     pub round1_sub: Round1SubOps,
@@ -312,6 +319,11 @@ static R1_MAIN_LDE_US: AtomicU64 = AtomicU64::new(0);
 static R1_MAIN_MERKLE_US: AtomicU64 = AtomicU64::new(0);
 static R1_AUX_LDE_US: AtomicU64 = AtomicU64::new(0);
 static R1_AUX_MERKLE_US: AtomicU64 = AtomicU64::new(0);
+// Aux build / aux commit wall time per table, summed across the concurrent
+// per-table drivers of the fused chain (so, like the sub-timers, this is a
+// CPU-style total that can exceed the fused region's wall clock).
+static AUX_BUILD_US: AtomicU64 = AtomicU64::new(0);
+static AUX_COMMIT_US: AtomicU64 = AtomicU64::new(0);
 // Aux build (LogUp) sub-phases, CPU time accumulated across tables/chunks.
 static AUX_FINGERPRINT_US: AtomicU64 = AtomicU64::new(0);
 static AUX_INVERT_US: AtomicU64 = AtomicU64::new(0);
@@ -360,6 +372,20 @@ pub fn accum_aux_accumulate(d: Duration) {
     AUX_ACCUM_US.fetch_add(d.as_micros() as u64, Ordering::Relaxed);
 }
 
+/// One table's aux build and aux commit wall time, from its fused-chain driver.
+pub fn accum_aux_phases(build: Duration, commit: Duration) {
+    AUX_BUILD_US.fetch_add(build.as_micros() as u64, Ordering::Relaxed);
+    AUX_COMMIT_US.fetch_add(commit.as_micros() as u64, Ordering::Relaxed);
+}
+
+/// Drain the summed per-table aux build / aux commit times.
+pub fn take_aux_phases() -> (Duration, Duration) {
+    (
+        Duration::from_micros(AUX_BUILD_US.swap(0, Ordering::Relaxed)),
+        Duration::from_micros(AUX_COMMIT_US.swap(0, Ordering::Relaxed)),
+    )
+}
+
 pub fn take_r1_sub() -> Round1SubOps {
     Round1SubOps {
         main_lde: Duration::from_micros(R1_MAIN_LDE_US.swap(0, Ordering::Relaxed)),
@@ -386,6 +412,8 @@ pub fn reset_all() {
     R1_MAIN_MERKLE_US.store(0, Ordering::Relaxed);
     R1_AUX_LDE_US.store(0, Ordering::Relaxed);
     R1_AUX_MERKLE_US.store(0, Ordering::Relaxed);
+    AUX_BUILD_US.store(0, Ordering::Relaxed);
+    AUX_COMMIT_US.store(0, Ordering::Relaxed);
     AUX_FINGERPRINT_US.store(0, Ordering::Relaxed);
     AUX_INVERT_US.store(0, Ordering::Relaxed);
     AUX_TERM_US.store(0, Ordering::Relaxed);

@@ -3255,11 +3255,6 @@ pub trait IsStarkProver<
             }
         }
 
-        // The per-table aux build (inside the fused chain) reports through the
-        // per-table spans; the phase-level buckets are folded into rounds_2_4.
-        #[cfg(feature = "instruments")]
-        let aux_build_elapsed = Duration::ZERO;
-
         // Pre-fork all transcripts (cheap, sequential — must match verifier ordering)
         let table_transcripts: Vec<_> = (0..num_airs)
             .map(|idx| {
@@ -3348,6 +3343,8 @@ pub trait IsStarkProver<
 
             #[cfg(feature = "instruments")]
             let __sp = crate::instruments::span("r1_aux_build");
+            #[cfg(feature = "instruments")]
+            let t_aux_build = Instant::now();
             let bus_public_inputs = if air.has_aux_trace() {
                 air.build_auxiliary_trace(*trace, &lookup_challenges)
             } else {
@@ -3371,16 +3368,20 @@ pub trait IsStarkProver<
                     .map_err(|e| ProvingError::DiskSpill(format!("aux trace: {e}")))?;
             }
             #[cfg(feature = "instruments")]
+            let aux_build_dur = t_aux_build.elapsed();
+            #[cfg(feature = "instruments")]
             drop(__sp);
 
             #[cfg(feature = "instruments")]
             let __sp = crate::instruments::span("r1_aux_commit");
+            #[cfg(feature = "instruments")]
+            let t_aux_commit = Instant::now();
             let aux_full: AuxResult<FieldExtension> =
                 (|| -> Result<AuxResult<FieldExtension>, ProvingError> {
                     if air.has_aux_trace() {
                         let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
 
-                        // Same gate as the main commit (Phase A): skip the aux
+                        // Same gate as the Round 1 main commit: skip the aux
                         // host D2H when device-only, so both buffers are left
                         // empty together for this table.
                         #[cfg(feature = "cuda")]
@@ -3522,6 +3523,8 @@ pub trait IsStarkProver<
                 transcript_cells[idx].lock().unwrap().append_bytes(&c.root);
             }
             #[cfg(feature = "instruments")]
+            crate::instruments::accum_aux_phases(aux_build_dur, t_aux_commit.elapsed());
+            #[cfg(feature = "instruments")]
             drop(__sp);
 
             #[cfg(feature = "cuda")]
@@ -3609,8 +3612,6 @@ pub trait IsStarkProver<
 
         #[cfg(feature = "instruments")]
         let phase_start = Instant::now();
-        #[cfg(feature = "instruments")]
-        let aux_commit_elapsed = Duration::ZERO;
 
         let peak_order = heaviest_first(&peak_estimates);
 
@@ -3665,6 +3666,10 @@ pub trait IsStarkProver<
         let table_timings = table_timings_mx.into_inner().unwrap();
         #[cfg(feature = "instruments")]
         {
+            // Aux build/commit are no longer phases of their own: each table's
+            // driver runs them inside the fused region, so these are sums over
+            // concurrent drivers and are a subset of `rounds_2_4`, not addends.
+            let (aux_build_elapsed, aux_commit_elapsed) = crate::instruments::take_aux_phases();
             // Store timing data for the top-level report in prove_with_options.
             // Uses a thread-local to avoid changing multi_prove's return type.
             crate::instruments::store(crate::instruments::MultiProveTiming {
