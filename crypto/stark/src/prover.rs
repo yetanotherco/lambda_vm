@@ -246,7 +246,7 @@ type MainCommitTuple<F> = (
 type MainCommitTuple<F> = (TableCommit<F>, (Vec<FieldElement<F>>, usize));
 
 /// Round 1 commitment artifacts — Merkle trees, roots, challenges, and bus inputs.
-/// Borrowed (not consumed) when building `Round1` in Phase D.
+/// Borrowed (not consumed) when building `Round1`.
 pub(crate) struct Round1Commitments<Field, FieldExtension>
 where
     Field: IsFFTField + IsSubFieldOf<FieldExtension>,
@@ -260,10 +260,18 @@ where
     bus_public_inputs: Option<BusPublicInputs<FieldExtension>>,
 }
 
-/// LDE columns for main (Phase A) and auxiliary (Phase C) traces, consumed by value in Phase D.
+/// Main and auxiliary LDE columns, consumed by value when the table's `Round1`
+/// is assembled.
 ///
-/// Memory trade-off: all N tables' LDE columns are live simultaneously between Phase A/C
-/// and Phase D (O(N × cols × lde_size)).
+/// Memory trade-off, asymmetric since the per-table scheduler fused aux build,
+/// aux commit and rounds 2-4 into one task:
+/// - main: produced by the Round 1 main commit, which is a phase-wide barrier,
+///   so all N tables' main LDEs are live at once (O(N × main_cols × lde_size)).
+/// - aux: produced and consumed inside the same fused task, so at most
+///   `table_parallelism()` of them coexist (O(k × aux_cols × lde_size)).
+///
+/// Under `debug-checks` the fused task is split around the cross-table bus
+/// balance check, so there the aux LDEs are all-N-live like the main ones.
 struct Lde<Field: IsFFTField, FieldExtension: IsField> {
     /// Row-major main LDE buffer + its column count.
     main: (Vec<FieldElement<Field>>, usize),
@@ -566,8 +574,17 @@ where
 }
 
 /// Number of tables to process concurrently in `multi_prove`.
-/// Default: num_cores / 3 (benchmarked optimal on both M3 Pro and EPYC 9454P).
-/// Override with `TABLE_PARALLELISM` env var.
+///
+/// Defaults: `num_cores / 3` on CPU builds (benchmarked optimal on both M3 Pro
+/// and EPYC 9454P — every table there is pure host work), `num_cores * 2 / 3`
+/// under `cuda`, where most in-flight tables sit in GPU waits so more of them
+/// pay (swept flat at ~2/3 of the cores on a 16-core/RTX 5090 box). Both arms
+/// are overridden by the `TABLE_PARALLELISM` env var. Without the `parallel`
+/// feature this is hardcoded to 1 and the env var is ignored.
+///
+/// Not only the prover's `k`: `auto_storage::decide` feeds this into the
+/// RAM-vs-Disk storage estimate, so the `cuda` arm also doubles that transient
+/// term (see `peak_bytes`).
 pub fn table_parallelism() -> usize {
     #[cfg(feature = "parallel")]
     {
@@ -615,12 +632,6 @@ fn estimate_table_vram_bytes(main_cols: usize, aux_cols: usize, lde_size: usize)
     lde_term.saturating_add(tree_term)
 }
 
-/// Plan contiguous table chunks for parallel proving. A chunk grows until it
-/// hits `k` tables or its summed VRAM estimate would exceed `budget`; a single
-/// table larger than `budget` runs solo. With `budget == u64::MAX` (non-cuda,
-/// or VRAM not binding) chunks fall back to fixed size `k`, identical to the
-/// old `step_by(k)`, so scheduling and the proof are unchanged. Returns
-/// `(start, end)` half open ranges covering `0..estimates.len()` in order.
 /// Byte-budget admission gate for concurrently proven tables. `acquire`
 /// blocks until the requested bytes fit under the budget, releasing on
 /// permit drop. An oversized request is admitted alone (when nothing else
@@ -1043,9 +1054,9 @@ pub trait IsStarkProver<
     }
 
     /// Compute the main-trace LDE and commit. Returns a `TableCommit` along
-    /// with the owned LDE columns (consumed later in Phase D) and (under
-    /// cuda) the optional device LDE buffer kept alive for downstream rounds
-    /// when the R1 fused GPU pipeline ran.
+    /// with the owned LDE columns (consumed later by the table's fused task)
+    /// and (under cuda) the optional device LDE buffer kept alive for
+    /// downstream rounds when the R1 fused GPU pipeline ran.
     ///
     /// `precomputed`: if present, the leading `num_cols` columns are committed
     /// as a separate Merkle tree (the precomputed split for preprocessed
@@ -1329,8 +1340,8 @@ pub trait IsStarkProver<
 
     /// Recompute Round1 from the trace, reusing the Merkle trees stored in commitments.
     ///
-    /// Only used by `run_debug_checks` — Phase D consumes the cached LDE
-    /// directly and does not go through this path.
+    /// Only used by `run_debug_checks` — the production path consumes the
+    /// cached LDE directly and does not go through here.
     #[cfg(feature = "debug-checks")]
     fn reconstruct_round1(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
@@ -1406,7 +1417,15 @@ pub trait IsStarkProver<
     }
 
     /// Reconstruct Round1 for every table, print the bus balance report, and
-    /// validate each trace. Called once after Phase C commits.
+    /// validate each trace.
+    ///
+    /// Cross-table (bus balance) checks need every table's commitments at once,
+    /// so under `debug-checks` the fused per-table chain is split into two
+    /// admitted passes and this runs once, on the main thread, between them.
+    ///
+    /// `pair_cells` is the same per-table slot vector the drivers use. Each
+    /// driver only ever locks its own index, so locking them here — after the
+    /// aux pass has joined and before the rounds pass starts — is uncontended.
     #[cfg(feature = "debug-checks")]
     fn run_debug_checks(
         pair_cells: &[std::sync::Mutex<AirTracePair<'_, Field, FieldExtension, PI>>],
@@ -3076,7 +3095,7 @@ pub trait IsStarkProver<
         // of the tables proved concurrently so large blocks don't exhaust VRAM.
         // It is an extra ceiling on top of `k` (it never raises concurrency). On
         // non-cuda builds, or when the budget can't be queried, it is `u64::MAX`
-        // and chunking falls back to fixed size `k`.
+        // and the gate is inert — concurrency is then bounded by `k` alone.
         #[cfg(feature = "cuda")]
         let vram_budget = math_cuda::device::backend()
             .map(|b| b.vram_budget_bytes())
@@ -3126,7 +3145,7 @@ pub trait IsStarkProver<
         }
 
         // =====================================================================
-        // Round 1, Phase A: Commit all main traces (parallel in chunks of K)
+        // Round 1: Commit all main traces (VRAM-admitted, up to K concurrent)
         // =====================================================================
         // All main trace commitments must be in the transcript before sampling
         // LogUp challenges.
@@ -3139,8 +3158,9 @@ pub trait IsStarkProver<
         let mut main_commits: Vec<TableCommit<Field>> = Vec::with_capacity(num_airs);
         let mut main_ldes: Vec<(Vec<FieldElement<Field>>, usize)> = Vec::with_capacity(num_airs);
         // Optional device-side LDE handle per table, populated only when the
-        // R1 fused GPU pipeline produced one. Threaded through Phase D's zip
-        // chain so each handle stays paired with its table by construction.
+        // R1 fused GPU pipeline produced one. Indexed by table, and moved into
+        // the per-table `gpu_main_cells` slots below so each handle stays
+        // paired with its table across the fused chain.
         #[cfg(feature = "cuda")]
         let mut main_gpu_handles: Vec<Option<math_cuda::lde::GpuLdeBase>> =
             Vec::with_capacity(num_airs);
@@ -3206,7 +3226,7 @@ pub trait IsStarkProver<
         }
 
         // =====================================================================
-        // Round 1, Phase B: Sample shared LogUp challenges
+        // Round 1: Sample shared LogUp challenges
         // =====================================================================
 
         let lookup_challenges: Vec<FieldElement<FieldExtension>> = if needs_lookup_challenges {
@@ -3218,16 +3238,13 @@ pub trait IsStarkProver<
         };
 
         // =====================================================================
-        // Phase C + Rounds 2-4: Forked per table
+        // Aux build + aux commit + Rounds 2-4: fused per table
         // =====================================================================
         // Each table gets an independent transcript fork (cloned from the shared
-        // state after Phase B, domain-separated by table index). This matches
-        // the verifier's forking and makes per-table proving independent.
+        // state after the LogUp challenges, domain-separated by table index).
+        // This matches the verifier's forking and makes per-table proving
+        // independent.
         //
-        // Split into two passes for parallelism:
-        //   Pass 1 (parallel): Build all auxiliary traces (fingerprint + batch inversion)
-        //   Pass 2 (parallel): Fork transcript → extract → LDE → commit
-
         // Aux build, aux commit and rounds 2-4 run FUSED per table below (one
         // driver chains all three for its table, so tables never wait on a
         // phase barrier); only this sequential prep runs here.
@@ -3266,10 +3283,10 @@ pub trait IsStarkProver<
             })
             .collect();
 
-        // Parallel aux commit in chunks of K. The closure returns a cfg-gated
-        // AuxResult. Under cuda it carries the optional ext3 GPU LDE handle as
-        // a third element, so Phase D's zip chain keeps it paired with its
-        // table without a separate handle vector.
+        // The aux stage of the fused chain returns a cfg-gated AuxResult. Under
+        // cuda it carries the optional ext3 GPU LDE handle as a third element,
+        // so the handle stays inside its own table's task and never needs a
+        // separate handle vector.
         #[cfg(feature = "cuda")]
         type AuxResult<FE> = (
             Option<TableCommit<FE>>,
