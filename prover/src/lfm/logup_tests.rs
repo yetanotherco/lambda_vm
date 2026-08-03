@@ -13,9 +13,13 @@
 //! Whether `L` is bound to a table's aux TRACE. That binding is the circular
 //! accumulator constraint plus the `acc[0] = 0` boundary, and it belongs to the
 //! constraint leg; this suite checks only that the closure consumes the same
-//! `L` that leg divides by `N`. It also cannot see a full epoch's table set —
-//! the fixture is two tables, not the twenty-odd a continuation epoch carries,
-//! so the SUM is exercised but its length is not.
+//! `L` that leg divides by `N`.
+//!
+//! Most fixtures here are two or three tables rather than the twenty-odd a
+//! continuation epoch carries, so they exercise the SUM but not its length. One
+//! is not: [`a_zero_row_fixed_table_carries_some_zero_not_none`] proves and
+//! verifies a real epoch and runs the closure over all twenty-four of its
+//! contributions.
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use stark::proof::stark::MultiProof;
@@ -898,4 +902,530 @@ fn the_contributing_table_count_is_shape() {
         "a short arena must not satisfy a program compiled for three tables"
     );
     println!("contributing-table count is shape: a short arena is rejected");
+}
+
+// =============================================================================
+// Degenerate parameter: a fixed table with NO rows, on a real epoch
+// =============================================================================
+
+/// How a fixed table's "no rows on the bus" claim is witnessed from its TRACE.
+///
+/// Needed because a zero-row table is not the same thing as a blank one. Two
+/// padding conventions are in play, and taking either for the general case would
+/// have mislabelled the other:
+///
+/// - `generate_keccak_rnd_trace` and ECSM's write nothing at all when there are
+///   no operations, so their traces are literally zero.
+/// - `generate_keccak_trace` pads with `state_ptr[lane] = 8·lane` (and KECCAK_RC
+///   is a preprocessed constant table, ECDAS pads likewise). Those traces are
+///   NOT zero, yet no row of them is on any bus, because every interaction's
+///   multiplicity column is zero.
+///
+/// So the second form names the multiplicity columns. They come from each
+/// table's own `bus_interactions()`, read there rather than through the AIR:
+/// `&dyn AIR` does not expose the interaction list. KECCAK's eight interactions
+/// and KECCAK_RND's fourteen are all `Multiplicity::Column(cols::MU)`, KECCAK_RC's
+/// single one likewise, and ECDAS's three are `MU` twice plus `NEXT_OP` once.
+/// ECSM's include `cols::k_bit(i)` as well, which is why the blank witness — the
+/// stronger of the two — is the one used for it.
+enum RowWitness {
+    /// Every main cell is zero: the generator wrote nothing, so there is no row
+    /// to participate in anything.
+    Blank,
+    /// Padding carries canonical values, so the trace is not blank. The witness
+    /// is that every column any interaction uses as MULTIPLICITY is zero on
+    /// every row, which gates every LogUp term off.
+    GatedOff(&'static [usize]),
+    /// This workload populates the table; no zero-row claim is made. Checked to
+    /// be non-blank, so a misclassification here does not pass silently.
+    Populated,
+}
+
+/// ★ MEASURED: a fixed table with no rows carries `Some(zero)`, never `None`.
+///
+/// ## Why this had to be measured
+///
+/// `FIXED_TABLE_COUNT` forces a sub-proof for all ten fixed tables whatever the
+/// workload, so a real epoch always carries tables with no real rows. The
+/// closure's [`LogUpShape::num_contributing_tables`] is a program CONSTANT, so
+/// if such a table reported `None` the count would be workload-dependent and the
+/// constant wrong. The LogUp leg closed with this labelled INFERENCE: production
+/// rejects any AIR/proof disagreement (`verifier.rs:1238`), and
+/// `has_trace_interaction()` is shape, so `None` would make every real epoch
+/// unverifiable — therefore it must be `Some`. True, but an argument, and the
+/// experiment is cheap. This is the experiment.
+///
+/// Note where the damage would have been: a zero `L` is arithmetically inert, so
+/// dropping one would not move the SUM. What `None` would break is the arena
+/// SCHEMA — a program compiled for `n` contributions fed `n − 1` words — which is
+/// why the answer matters to the count and not to the balance.
+///
+/// ## What is measured, and against what
+///
+/// One REAL continuation epoch — epoch 0 of the LFM fixture guest, built by
+/// `Traces::from_image_and_logs` and proved over the production epoch AIR set
+/// (`VmAirs` + the epoch-local L2G table) under the real epoch statement, then
+/// ACCEPTED by `Verifier::multi_verify_views` against production's own
+/// `compute_expected_commit_bus_balance_view`. The acceptance is load-bearing
+/// twice over: it is what makes this "what a verifying epoch proof carries"
+/// rather than "what some prover run emitted", and it is what runs
+/// `verifier.rs:1238`'s presence check over these very sub-proofs.
+///
+/// "No rows" is read off the TRACE, not inferred from the workload, and not read
+/// back off the contribution being measured — see [`RowWitness`] for the two
+/// forms it takes and why one would not do. `FIXED_TABLE_COUNT` keeps the
+/// sub-proof either way: `generate_keccak_trace` pads a zero-operation table to
+/// four rows rather than dropping it.
+///
+/// ## Which sub-proof is which table
+///
+/// Positional, because `VmAirs::new` builds these nine without `.with_name(…)` —
+/// `AIR::name()` answers `"unknown"` for every one of them, so there is no name
+/// on the proof side to match. The order is `lib.rs`'s own, and `air_refs()` and
+/// `air_trace_pairs()` list it identically; that identity is what makes sub-proof
+/// `i` this table's proof. It is not taken on trust: each position's sub-proof
+/// must report the trace length that position's TRACE built.
+///
+/// ## What this test cannot see
+///
+/// The row-count cross-check cannot separate two tables of equal height, so
+/// swapping (say) KECCAK and ECSM — both four rows here — would relabel two
+/// results without failing. It catches the reorderings that change a height,
+/// which is every one that could move a populated table into a zero-row slot.
+///
+/// Whether a fixed table whose interactions took a CONSTANT multiplicity would
+/// answer differently. None does today — every multiplicity in the five zero-row
+/// tables is a column, checked by reading their `bus_interactions()` — but such a
+/// table would carry a nonzero `L` with no real rows, and this test would report
+/// the changed contribution without explaining it. It measures an INTERMEDIATE
+/// epoch, so HALT is out of scope, and one workload, so it says nothing about
+/// which tables are unused in general — only what a table with no rows carries.
+#[test]
+fn a_zero_row_fixed_table_carries_some_zero_not_none() {
+    use crate::tables::trace_builder::{Traces, build_initial_image_paged};
+    use crate::tables::{MaxRowsConfig, bitwise, local_to_global, register};
+    use executor::elf::Elf;
+    use executor::vm::execution::Executor;
+    use math::field::traits::IsPrimeField;
+    use stark::proof::view::MultiProofView;
+    use stark::trace::TraceTable;
+
+    let opts = super::proof_fixture::fixture_options();
+    let elf_bytes = super::proof_fixture::read_inner_elf();
+    let elf = Elf::load(&elf_bytes).expect("the fixture ELF must load");
+    let epoch_size = 1usize << super::proof_fixture::FIXTURE_EPOCH_LOG2;
+
+    // ---- epoch 0, built exactly as `prove_continuation` builds it ----
+    let mut executor = Executor::new(&elf, vec![]).expect("executor");
+    let image = build_initial_image_paged(&elf, &[]);
+    let register_init = register::register_init_from_entry_point(elf.entry_point);
+    let logs = executor
+        .resume_with_limit(epoch_size)
+        .expect("resume")
+        .expect("the guest runs at least one epoch")
+        .to_vec();
+    let is_final = executor.pc() == 0;
+    assert!(
+        !is_final,
+        "wanted an INTERMEDIATE epoch (nine fixed tables, no HALT), but the \
+         guest finished inside one epoch of {epoch_size} cycles"
+    );
+
+    let mut traces = Traces::from_image_and_logs(
+        &elf,
+        &image,
+        &register_init,
+        &logs,
+        &MaxRowsConfig::default(),
+        &[],
+        is_final,
+        true,
+        #[cfg(feature = "disk-spill")]
+        stark::storage_mode::StorageMode::Ram,
+    )
+    .expect("the epoch trace must build");
+
+    let label = local_to_global::epoch_label(0);
+    let mut provenance =
+        local_to_global::genesis_provenance(image.iter().map(|(a, v)| (a, v as u64)));
+    let boundary =
+        local_to_global::epoch_boundary(&mut provenance, label, &traces.touched_memory_cells);
+    // `prove_epoch`'s first act: the L2G table's range-check lookups must be
+    // counted into BITWISE, or the epoch's own bus does not close.
+    bitwise::update_multiplicities(
+        &mut traces.bitwise,
+        &local_to_global::collect_bitwise_from_l2g(&boundary),
+    );
+
+    // ---- the trace-side census, taken before proving borrows the traces ----
+    let all_main_zero = |t: &TraceTable<Gl, Ext3>| -> bool {
+        (0..t.main_table.height).all(|r| t.main_table.get_row(r).iter().all(|v| *v == FE::zero()))
+    };
+    let columns_zero = |t: &TraceTable<Gl, Ext3>, cols: &[usize]| -> bool {
+        (0..t.main_table.height).all(|r| {
+            let row = t.main_table.get_row(r);
+            cols.iter().all(|c| row[*c] == FE::zero())
+        })
+    };
+    // `(name, rows, has_no_bus_rows)`.
+    //
+    // ONE list, name and trace and witness together, deliberately: a version
+    // that kept the nine names in a separate constant and zipped them onto the
+    // traces passed with two names swapped — the swap moved only the label, so
+    // the row-count cross-check below still compared the right trace against the
+    // right sub-proof and saw nothing wrong. Merged, a reordering moves the
+    // TRACE too, which that cross-check does catch.
+    let census: Vec<(&str, usize, bool)> = {
+        use crate::tables::{ecdas, keccak, keccak_rc};
+        let fixed: [(&str, &TraceTable<Gl, Ext3>, RowWitness); 9] = [
+            ("BITWISE", &traces.bitwise, RowWitness::Populated),
+            ("DECODE", &traces.decode, RowWitness::Populated),
+            ("COMMIT", &traces.commit, RowWitness::Populated),
+            (
+                "KECCAK",
+                &traces.keccak,
+                RowWitness::GatedOff(&[keccak::cols::MU]),
+            ),
+            ("KECCAK_RND", &traces.keccak_rnd, RowWitness::Blank),
+            (
+                "KECCAK_RC",
+                &traces.keccak_rc,
+                RowWitness::GatedOff(&[keccak_rc::cols::MU]),
+            ),
+            ("ECSM", &traces.ecsm, RowWitness::Blank),
+            (
+                "ECDAS",
+                &traces.ecdas,
+                RowWitness::GatedOff(&[ecdas::cols::MU, ecdas::cols::NEXT_OP]),
+            ),
+            ("REGISTER", &traces.register, RowWitness::Populated),
+        ];
+        fixed
+            .into_iter()
+            .map(|(name, t, witness)| {
+                let no_bus_rows = match witness {
+                    RowWitness::Blank => {
+                        assert!(
+                            all_main_zero(t),
+                            "{name} was expected to have NO rows in this epoch \
+                             (its generator writes nothing when there is no \
+                             work), but its main trace is not all zero"
+                        );
+                        true
+                    }
+                    RowWitness::GatedOff(cols) => {
+                        assert!(
+                            columns_zero(t, cols),
+                            "{name} was expected to have no rows on any bus, but \
+                             one of its multiplicity columns {cols:?} is nonzero"
+                        );
+                        true
+                    }
+                    RowWitness::Populated => {
+                        assert!(
+                            !all_main_zero(t),
+                            "{name} was classified as populated by this workload \
+                             but its main trace is entirely zero — the \
+                             classification, not the measurement, is wrong"
+                        );
+                        false
+                    }
+                };
+                (name, t.num_rows(), no_bus_rows)
+            })
+            .collect()
+    };
+
+    // ---- prove it, over the production epoch AIR set ----
+    let reg_fini = register::fini_from_trace(&traces.register);
+    let table_counts = traces.table_counts();
+    let public_output = traces.public_output_bytes.clone();
+    let runtime_page_ranges = traces.runtime_page_ranges();
+
+    let airs = crate::VmAirs::new(
+        &elf,
+        &opts,
+        false,
+        &[],
+        &table_counts,
+        None,
+        is_final,
+        None,
+        None,
+        Some((
+            register::compute_precomputed_commitment_with_fini(&opts, &register_init, &reg_fini),
+            register::NUM_PREPROCESSED_COLS_WITH_FINI,
+        )),
+    );
+    let l2g_air = crate::continuation::l2g_memory_air(&opts, label);
+    let mut l2g_trace = local_to_global::generate_local_to_global_trace(&boundary);
+
+    // The real epoch statement, so the challenges are the ones a production
+    // epoch proof is bound to.
+    let seed = || {
+        let mut t = DefaultTranscript::<Ext3>::new(&[]);
+        crate::statement::absorb_statement(
+            &mut t,
+            crate::statement::StatementKind::ContinuationEpoch { epoch_label: label },
+            &elf_bytes,
+            &public_output,
+            &table_counts,
+            0,
+            &runtime_page_ranges,
+            opts.fri_final_poly_log_degree,
+        );
+        t
+    };
+
+    let proof = {
+        let mut pairs = airs.air_trace_pairs(&mut traces);
+        pairs.push((&l2g_air, &mut l2g_trace, &()));
+        crate::test_utils::multi_prove_ram(pairs, &mut seed()).expect("the epoch must prove")
+    };
+
+    let refs = {
+        let mut r = airs.air_refs();
+        r.push(&l2g_air);
+        r
+    };
+    let view = MultiProofView::Owned(&proof);
+    assert_eq!(
+        view.len(),
+        census.len() + table_counts.total() + 1,
+        "an intermediate epoch is nine fixed tables, the chunked families, and \
+         one L2G_MEMORY"
+    );
+    assert_eq!(refs.len(), view.len(), "one AIR per sub-proof");
+
+    // ---- production must ACCEPT it, or nothing below is about a real proof ----
+    let expected = crate::compute_expected_commit_bus_balance_view(
+        &refs,
+        view,
+        &public_output,
+        register_init[register::X254_INDEX] as u64,
+        &mut seed(),
+    )
+    .expect("the COMMIT-bus target must exist");
+    assert!(
+        Verifier::multi_verify_views(&refs, view, &mut seed(), &expected),
+        "production must ACCEPT this epoch proof — the measurement is about what \
+         a VERIFYING proof carries, and this is also the run of \
+         verifier.rs:1238's presence check"
+    );
+
+    // ---- THE MEASUREMENT ----
+    println!(
+        "\nreal continuation epoch (intermediate, {} sub-proofs), fixed tables:\n\
+         \x20 {:<11} {:>9} {:>10} {:>5} {:>5} {:>4}  contribution",
+        view.len(),
+        "table",
+        "rows",
+        "proof_len",
+        "iact",
+        "bpi",
+        "zero"
+    );
+    let mut zero_row = Vec::new();
+    let mut with_rows = Vec::new();
+    for (i, (name, rows, no_rows)) in census.iter().enumerate() {
+        let sp = view.get(i);
+        let interacts = refs[i].has_trace_interaction();
+        let present = sp.has_bus_public_inputs();
+        let contribution = sp.bus_table_contribution();
+        assert_eq!(
+            sp.trace_length(),
+            *rows,
+            "position {i} was labelled {name} but proved a trace of {} rows, not \
+             the {rows} that table built — the census order no longer matches \
+             air_refs()/air_trace_pairs()",
+            sp.trace_length()
+        );
+        assert_eq!(
+            interacts, present,
+            "{name}: production rejects any disagreement between the AIR's \
+             declared interactions and the proof's bus public inputs, in both \
+             directions (verifier.rs:1238 and :1244)"
+        );
+        println!(
+            "\x20 {:<11} {:>9} {:>10} {:>5} {:>5} {:>4}  {}",
+            name,
+            rows,
+            sp.trace_length(),
+            interacts,
+            present,
+            contribution.as_ref().is_some_and(|c| *c == FEE::zero()),
+            match &contribution {
+                None => "None".to_string(),
+                Some(c) => format!(
+                    "Some({:?})",
+                    c.value()
+                        .iter()
+                        .map(|l| Gl::canonical(l.value()))
+                        .collect::<Vec<_>>()
+                ),
+            }
+        );
+        if *no_rows {
+            // THE ANSWER. A zero-row fixed table is still a contributing table.
+            assert!(
+                present,
+                "{name} has no rows on any bus and must STILL carry bus public \
+                 inputs — a None here would make num_contributing_tables \
+                 workload-dependent, and the closure's program constant wrong"
+            );
+            assert_eq!(
+                contribution,
+                Some(FEE::zero()),
+                "{name} has no rows on any bus, so every LogUp term is gated to \
+                 zero and its L must be exactly zero"
+            );
+            zero_row.push(*name);
+        } else {
+            with_rows.push((*name, contribution));
+        }
+    }
+
+    // Non-vacuity, both directions: there IS a zero-row fixed table in a real
+    // epoch, and the observation distinguishes it from a populated one. Without
+    // the second half, "every zero-row table reports Some(zero)" could hold
+    // because every table reports Some(zero).
+    assert!(
+        !zero_row.is_empty(),
+        "this epoch has no zero-row fixed table, so it cannot settle the \
+         question — pick a guest that leaves one unused"
+    );
+    assert!(
+        census
+            .iter()
+            .enumerate()
+            .all(|(i, _)| view.get(i).has_bus_public_inputs()),
+        "every fixed table of an epoch is a contributing table, populated or not"
+    );
+    assert!(
+        with_rows.iter().any(|(_, c)| *c != Some(FEE::zero())),
+        "no fixed table carries a NONZERO contribution, so Some(zero) is not a \
+         distinguishing observation on this epoch: {with_rows:?}"
+    );
+    println!(
+        "\x20 ANSWER: Some(zero), not None. {} zero-row fixed tables {:?}, each \
+         Some(zero); {} populated, {} of them nonzero.",
+        zero_row.len(),
+        zero_row,
+        with_rows.len(),
+        with_rows
+            .iter()
+            .filter(|(_, c)| *c != Some(FEE::zero()))
+            .count()
+    );
+
+    // ---- the converse, also measured: None would be REJECTED ----
+    // The inference this experiment replaces ran the other way — a zero-row
+    // table cannot report None, because production checks presence against
+    // has_trace_interaction() before anything else (verifier.rs:1238), so a
+    // None would make every real epoch unverifiable. That is now a run: strip
+    // the bus public inputs off a zero-row sub-proof and watch this very proof
+    // stop verifying. Only the `is_some` direction can be tested on an epoch —
+    // all 24 sub-proofs declare interactions, so :1244's converse has no
+    // subject here.
+    for (i, (name, _, no_rows)) in census.iter().enumerate() {
+        if !no_rows {
+            continue;
+        }
+        let mut tampered = proof.clone();
+        tampered.proofs[i].bus_public_inputs = None;
+        assert!(
+            !Verifier::multi_verify_views(
+                &refs,
+                MultiProofView::Owned(&tampered),
+                &mut seed(),
+                &expected,
+            ),
+            "{name} has no rows, but dropping its bus public inputs must still \
+             be REJECTED — that rejection is why Some(zero) is forced rather \
+             than merely observed"
+        );
+    }
+
+    // ---- and the closure itself, over the REAL epoch's whole table set ----
+    // The handoff's other open item: every earlier fixture is two or three
+    // tables, so the SUM was exercised but its LENGTH was not.
+    let contributions: Vec<FEE> = (0..view.len())
+        .filter(|i| refs[*i].has_trace_interaction())
+        .map(|i| {
+            view.get(i)
+                .bus_table_contribution()
+                .expect("presence was just checked against the AIR")
+        })
+        .collect();
+    let shape = LogUpShape {
+        num_contributing_tables: contributions.len(),
+        num_output_bytes: public_output.len(),
+    };
+    let (z, alpha) = crate::replay_transcript_phase_a_view(&refs, view, &mut seed());
+
+    let n_tables = contributions.len() as u32;
+    let n_bytes = public_output.len() as u32;
+    let mut b = LfmBuilder::new();
+    // Only the cells the gadget reads may be declared: an unread arena word is a
+    // compile error, and an empty output makes the target a constant that reads
+    // neither z, alpha, start nor any byte.
+    let head = if n_bytes == 0 { 0 } else { 3 + n_bytes };
+    let arena = b.declare_arena(head + n_tables);
+    let target = if n_bytes == 0 {
+        b.ext_const(&FEE::zero())
+    } else {
+        let z_cell = b.hint_word(arena, 0).as_ext();
+        let alpha_cell = b.hint_word(arena, 1).as_ext();
+        let start_cell = b.hint_felt(arena, 2);
+        let byte_cells: Vec<_> = (0..n_bytes).map(|i| b.hint_felt(arena, 3 + i)).collect();
+        emit_commit_bus_target(&mut b, &shape, z_cell, alpha_cell, start_cell, &byte_cells)
+    };
+    let contrib_cells: Vec<_> = (0..n_tables)
+        .map(|i| b.hint_word(arena, head + i).as_ext())
+        .collect();
+    let total = emit_bus_closure(&mut b, &shape, &contrib_cells, target);
+    b.public(total.as_cell());
+    let program = compile(b.finish());
+    validate(&program).expect("the epoch closure program is admissible");
+
+    let mut words: Vec<LfmWord> = Vec::new();
+    if n_bytes > 0 {
+        words.push(ext_word(&z));
+        words.push(ext_word(&alpha));
+        words.push(base_word(FE::from(
+            register_init[register::X254_INDEX] as u64,
+        )));
+        words.extend(public_output.iter().map(|v| base_word(FE::from(*v as u64))));
+    }
+    words.extend(contributions.iter().map(ext_word));
+    let exec = execute(&program, std::slice::from_ref(&words), &TestPermutation)
+        .expect("a real epoch's LogUp bus must close in the machine");
+    assert_eq!(
+        word_as_ext(&exec.public_words[0].1).expect("ext"),
+        expected,
+        "the machine's published total must be production's own expected balance"
+    );
+
+    // Falsification: move any one contribution, in any lane. Every zero-row
+    // table is in here too, so this is also the check that a Some(zero) term is
+    // a real summand and not a no-op the emitter could drop.
+    let mut vectors = 0usize;
+    for table in 0..contributions.len() {
+        for lane in 0..3usize {
+            let mut arenas = vec![words.clone()];
+            arenas[0][head as usize + table][lane] += FE::one();
+            assert!(
+                execute(&program, &arenas, &TestPermutation).is_err(),
+                "table {table} lane {lane}: a moved contribution must not close"
+            );
+            vectors += 1;
+        }
+    }
+    println!(
+        "\x20 the closure also runs on the real epoch: {} contributing tables of \
+         {} sub-proofs, {} output bytes, {vectors} single-lane moves rejected\n",
+        contributions.len(),
+        view.len(),
+        public_output.len()
+    );
 }

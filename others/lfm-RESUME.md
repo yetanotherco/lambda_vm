@@ -81,10 +81,14 @@ The machine proves and verifies, end to end, through the registry:
    gaps (L two-consumer split, hinted alpha powers — instance 3, worse in
    degree — and the earlier DEEP/auth parallel-copy class), witnessed
    per-chunk accumulation with a ≥2-chunk fixture, resolved
-   has_trace_interaction by reading. One precise unknown remains: whether
-   a zero-row fixed table reports `Some(zero)` or `None` for its
-   contribution — inference says `Some(zero)`, the cheap settling
-   experiment is named in the handoff.
+   has_trace_interaction by reading. The one unknown it left is now
+   **SETTLED** (zerorow, 2026-08-03): a zero-row fixed table reports
+   `Some(zero)`, measured on a real accepted epoch — five of them
+   (KECCAK, KECCAK_RND, KECCAK_RC, ECSM, ECDAS) — and stripping the field
+   makes the proof fail, so `Some` is forced. Same test closes the
+   table-set-LENGTH gap (closure run over a real epoch's 24
+   contributions) and found that three of the five have NON-blank traces
+   with every multiplicity column zero: "unused" ≠ "blank".
 5. **Assembly** into one epoch-verifier program. ⚠ Every per-epoch number so
    far is a COMPOSITION of per-AIR measurements, not a run. Assembly is what
    confirms or falsifies them. Discharge `lfm-assembly-obligations.md`
@@ -154,10 +158,8 @@ Ready to start immediately (wave 3):
 - **The FRI emitter** — the one substantial build left before assembly.
   Brief: `lfm-fri-verify-spec.md` (incl. addendum) + `lfm-fri-leg-state.md`.
   Spawn it first.
-- **The zero-row fixed-table experiment** (small; can ride along or wait):
-  prove one epoch with an unused fixed table, read whether its
-  `bus_table_contribution` is `Some(zero)` or `None` — settles the one
-  unknown the LogUp handoff left labelled as inference.
+- ~~The zero-row fixed-table experiment~~ — **DONE** (zerorow, 2026-08-03).
+  Answer `Some(zero)`; see item 4 above and the handoff's §4.
 
 After those: assembly (discharge `lfm-assembly-obligations.md` — its OPEN
 entries are the assembly spec's skeleton), then the wrap run.
