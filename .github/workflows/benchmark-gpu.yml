@@ -33,7 +33,16 @@ permissions:
   issues: write
 
 concurrency:
-  group: benchmark-gpu-${{ github.event.issue.number || github.run_id }}
+  # See bench-verify.yml: this workflow fires on EVERY issue_comment, and GitHub
+  # claims the concurrency group when the run is CREATED — before the job-level
+  # `if` skips it. With the old plain per-issue group, any comment on the PR
+  # evicted a running GPU ABBA mid-rental (2026-08-03: a `/bench 5` comment
+  # killed the run started 20 minutes earlier, ~40 min of paid box). Real
+  # /bench-gpu comments share the per-issue group, so a deliberate re-fire still
+  # replaces a stale run (cancel-in-progress stays true for that case — one
+  # rental per PR, newest request wins); every other comment and
+  # workflow_dispatch falls to a throwaway group and cannot evict anything.
+  group: ${{ startsWith(github.event.comment.body, '/bench-gpu') && format('benchmark-gpu-{0}', github.event.issue.number) || format('benchmark-gpu-ignore-{0}', github.run_id) }}
   cancel-in-progress: true
 
 env:
