@@ -75,7 +75,6 @@ parse_run() {
     /^  AIR construction/    { v = secs(); if (v) print "t_air="         v }
     /^  Pre-pass/            { v = secs(); if (v) print "t_prepass="     v }
     /^  Round 1 /            { v = secs(); if (v) print "t_round1="      v }
-    /Main trace commits/     { v = secs(); if (v) print "t_main_commits="v }
     /Rounds 2/               { v = secs(); if (v) print "t_rounds24="    v }
     /Main expand_columns_to_lde/{ v = secs(); if (v) print "t_main_lde=" v }
     /Aux expand_columns_to_lde/ { v = secs(); if (v) print "t_aux_lde="  v }
@@ -187,7 +186,6 @@ print_row "Trace build"            t_trace_build s
 print_row "AIR construction"       t_air         s
 print_row "Pre-pass"               t_prepass     s
 print_row "Round 1"                t_round1      s
-print_row "  Main trace commits"   t_main_commits s
 print_row "    Main LDE"           t_main_lde    s
 print_row "    Main Merkle"        t_main_merkle s
 print_row "    Aux LDE"            t_aux_lde     s
