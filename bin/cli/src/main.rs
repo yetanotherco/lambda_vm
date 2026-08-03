@@ -852,6 +852,12 @@ fn cmd_prove_continuation(
     eprintln!(
         "Generating continuation proof (blowup={blowup}, epoch_size_log2={epoch_size_log2}, epoch_size={epoch_size})...",
     );
+    // Same tracker as the monolithic path: the peak here is the flat per-epoch
+    // working set rather than a whole-trace high-water mark, and it is the metric
+    // that decides which epoch size a machine can run, so the benchmarks need it
+    // reported identically on both paths.
+    #[cfg(feature = "jemalloc-stats")]
+    let tracker = heap_tracker::HeapTracker::start();
     let start = Instant::now();
     let bundle = match prover::continuation::prove_continuation_with_max_rows(
         &elf_data,
@@ -896,6 +902,11 @@ fn cmd_prove_continuation(
     println!("Epochs: {}", bundle.num_epochs());
     if time {
         println!("Proving time: {:.3}s", prove_elapsed.as_secs_f64());
+    }
+    #[cfg(feature = "jemalloc-stats")]
+    {
+        let peak_bytes = tracker.stop();
+        println!("Peak heap: {} MB", peak_bytes / (1024 * 1024));
     }
     ExitCode::SUCCESS
 }

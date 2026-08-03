@@ -27,7 +27,15 @@
 #        below 6: the exact Wilcoxon's smallest attainable two-sided p is 2/2^n, so at
 #        n=4 it is 0.125 and the arm can only ever report BORDERLINE, however large and
 #        clean the effect.
-#        CONT_EPOCH_LOG2=<n> continuation epoch size (default 20, min 18). 20 matches
+#        WORKLOAD=synthetic|real (default synthetic) which BLOCK both arms prove.
+#        `real` fetches the real-block fixture (identity lives in the Makefile) and runs
+#        the continuation arm ONLY — a real block is hundreds of GB monolithically, so
+#        that arm is skipped rather than left to OOM. See "Workload" below.
+#        CONT_EPOCH_LOG2=<n> continuation epoch size (default 20, min 18). For
+#        WORKLOAD=real prefer the calibrated tier for the box you are on — 2^22 on the
+#        bench runner or a 64 GiB machine, 2^23 on a 128 GiB one (see
+#        tooling/ethrex-block-converter/README.md, "Choosing the epoch size"); the default
+#        below is chosen for the SYNTHETIC arm. 20 matches
 #        scripts/bench_abba.sh, so this arm proves the same bundle shape /bench already
 #        proves on the same server — and 20 txs at 2^20 is strictly cheaper than the
 #        100 txs at 2^20 that /bench runs by default, so it can't be the thing that OOMs
@@ -36,6 +44,17 @@
 #        bench_recursion_cycles.sh's BLOCK_EPOCH_LOG2=21: that arm needs FEW epochs so
 #        the bundle fits the guest's 512 MiB private-input cap, a constraint that
 #        doesn't apply to host-side verification.
+#
+# Workload. What this script measures is VERIFY cost, and verify cost is structural in
+# the proof — table mix, trace lengths, query count — so the block decides what is being
+# measured, not the loop around it. The synthetic default is 20 plain transfers:
+# ecrecover-heavy over a near-empty state. A real block inverts that mix (keccak- and
+# trie-bound), so a verifier change can move the two differently.
+#
+# `synthetic` stays the default because it is what `/bench-verify` runs and what every
+# number recorded so far used; `real` is the representative one, and costs a ~4.5-4.8
+# min continuation prove per side (cached in $WORK afterwards) before any verify run.
+# Both sides always prove the same block, so a comparison is never mixed.
 
 set -euo pipefail
 
@@ -50,9 +69,22 @@ N_PAIRS="${3:-20}"
 BENCH_FEATURES="${BENCH_FEATURES:-jemalloc-stats}"
 CONT_PAIRS="${CONT_PAIRS:-8}"
 CONT_EPOCH_LOG2="${CONT_EPOCH_LOG2:-20}"
+WORKLOAD="${WORKLOAD:-synthetic}"
+case "$WORKLOAD" in
+  synthetic|real) ;;
+  *) echo "ERROR: WORKLOAD must be 'synthetic' or 'real' (got '$WORKLOAD')." >&2; exit 2 ;;
+esac
+# WORKLOAD=real skips the monolithic arm, so CONT_PAIRS=0 on top of it would build both
+# binaries, prove nothing and report nothing. Fail before the ~30-min build rather than
+# after it.
+if [ "$WORKLOAD" = "real" ] && [ "${CONT_PAIRS}" -eq 0 ] 2>/dev/null; then
+  echo "ERROR: WORKLOAD=real runs the continuation arm only, so CONT_PAIRS=0 would measure nothing." >&2
+  exit 2
+fi
 
 ELF_REL="executor/program_artifacts/rust/ethrex.elf"
-INPUT_REL="executor/tests/ethrex_bench_20.bin"
+# Resolved after the cd to the repo root (WORKLOAD=real reads it from the Makefile).
+INPUT_REL=""
 WORK="/tmp/verify_run"
 WT="/tmp/verify_wt"
 PROOF_B="$WORK/proof_b.bin"   # baseline's proof (cached in $WORK, keyed like the binaries)
@@ -113,7 +145,26 @@ fi
 if [ $((CONT_PAIRS % 2)) -ne 0 ]; then
   echo "   WARNING: CONT_PAIRS=$CONT_PAIRS is odd; use an even count so AB/BA orders balance."
 fi
-echo "   pairs=$N_PAIRS  (=$((N_PAIRS * 2)) verify runs)"
+# The real block's identity lives in the Makefile and nowhere else, so repointing it
+# never needs an edit here. A real block cannot be proven monolithically (~4.9 GB of peak
+# heap per million cycles puts it in the hundreds of GB), so that arm is skipped outright
+# rather than left to OOM halfway through a rented or shared machine's run.
+RUN_MONO=1
+if [ "$WORKLOAD" = "real" ]; then
+  INPUT_REL="$(make -s print-real-block-fixture)"
+  RUN_MONO=0
+  BLOCK_LABEL="ethrex real block $(basename "$INPUT_REL")"
+else
+  INPUT_REL="executor/tests/ethrex_bench_20.bin"
+  BLOCK_LABEL="ethrex 20-tx block"
+fi
+
+echo "   workload=$WORKLOAD  $INPUT_REL"
+if [ "$RUN_MONO" = "1" ]; then
+  echo "   pairs=$N_PAIRS  (=$((N_PAIRS * 2)) verify runs)"
+else
+  echo "   monolithic arm SKIPPED (a real block exceeds the monolithic memory ceiling)"
+fi
 echo "   continuation pairs=$CONT_PAIRS  epoch=2^$CONT_EPOCH_LOG2"
 
 mkdir -p "$WORK"
@@ -129,9 +180,16 @@ if [ ! -f "$ELF_REL" ]; then
   make "$ELF_REL"
 fi
 if [ ! -f "$INPUT_REL" ]; then
-  echo "==> Generating ethrex 20-transfer fixture (missing)"
-  ( cd tooling/ethrex-fixtures && cargo build --release )
-  tooling/ethrex-fixtures/target/release/ethrex-fixtures 20 "$INPUT_REL" distinct
+  if [ "$WORKLOAD" = "real" ]; then
+    # ~1 MB, gitignored, never in a fresh checkout. Fetched by URL + sha256, not built:
+    # no converter and no ethrex host dependency tree on this path.
+    echo "==> Fetching ethrex real-block fixture (missing)"
+    make ethrex-real-block-fixture
+  else
+    echo "==> Generating ethrex 20-transfer fixture (missing)"
+    ( cd tooling/ethrex-fixtures && cargo build --release )
+    tooling/ethrex-fixtures/target/release/ethrex-fixtures 20 "$INPUT_REL" distinct
+  fi
 fi
 ELF="$(cd "$(dirname "$ELF_REL")" && pwd)/$(basename "$ELF_REL")"
 INPUT="$(cd "$(dirname "$INPUT_REL")" && pwd)/$(basename "$INPUT_REL")"
@@ -245,12 +303,15 @@ prove_cached() {  # $1=binary $2=proof-path $3=sha $4...=extra prove args
   if [ -n "$ep" ]; then printf '%s\n' "$ep" > "$out.epochs"; fi
   echo "$marker" > "$out.sha"
 }
-prove_cached "$WORK/cli_B" "$PROOF_B" "$SHA_B" || exit 1
-prove_cached "$WORK/cli_A" "$PROOF_A" "$SHA_A" || exit 1
+SIZE_B=0; SIZE_A=0
+if [ "$RUN_MONO" = "1" ]; then
+  prove_cached "$WORK/cli_B" "$PROOF_B" "$SHA_B" || exit 1
+  prove_cached "$WORK/cli_A" "$PROOF_A" "$SHA_A" || exit 1
 
-# Proof sizes (bytes) for the Proof size row.
-SIZE_B="$(wc -c < "$PROOF_B" | tr -d '[:space:]')"
-SIZE_A="$(wc -c < "$PROOF_A" | tr -d '[:space:]')"
+  # Proof sizes (bytes) for the Proof size row.
+  SIZE_B="$(wc -c < "$PROOF_B" | tr -d '[:space:]')"
+  SIZE_A="$(wc -c < "$PROOF_A" | tr -d '[:space:]')"
+fi
 
 # Decide whether both sides can VERIFY one shared proof (baseline's) — tightest
 # timing precision — or must verify their own. In auto mode, distinguish a real
@@ -454,10 +515,15 @@ else:
 PY
 }
 
-decide_mode "$PROOF_B" "$PROOF_A"
-run_abba "$N_PAIRS" "$WORK/pairs.csv" || exit 1
-MONO_MODE="$MODE"
-MONO_NOTE="$PER_SIDE_NOTE"
+MONO_SKIP=""
+if [ "$RUN_MONO" = "1" ]; then
+  decide_mode "$PROOF_B" "$PROOF_A"
+  run_abba "$N_PAIRS" "$WORK/pairs.csv" || exit 1
+  MONO_MODE="$MODE"
+  MONO_NOTE="$PER_SIDE_NOTE"
+else
+  MONO_SKIP="not run: a real block exceeds the monolithic memory ceiling, so only the continuation arm below applies"
+fi
 # Render the monolithic report NOW, not at the end with the continuation one. Both are
 # still emitted together at the end (the extractor needs them contiguous after the
 # anchor), but computing this one here means it also survives the run dying during the
@@ -465,9 +531,13 @@ MONO_NOTE="$PER_SIDE_NOTE"
 # step timeout or an OOM kill takes the whole process down, and CI would then post
 # "Run failed" and throw away a monolithic verdict it had already measured. bench-verify.yml
 # falls back to this file in that case.
-MONO_TITLE="ethrex 20-tx block · monolithic · blowup=2, 219 queries"
-MONO_REPORT="$(print_stats "$WORK/pairs.csv" "$MONO_TITLE" \
-  "$SIZE_A" "$SIZE_B" "$MONO_MODE" "$MONO_NOTE")"
+MONO_TITLE="$BLOCK_LABEL · monolithic · blowup=2, 219 queries"
+if [ -n "$MONO_SKIP" ]; then
+  MONO_REPORT="$(printf '#### %s\n\n_(Monolithic arm %s.)_\n' "$MONO_TITLE" "$MONO_SKIP")"
+else
+  MONO_REPORT="$(print_stats "$WORK/pairs.csv" "$MONO_TITLE" \
+    "$SIZE_A" "$SIZE_B" "$MONO_MODE" "$MONO_NOTE")"
+fi
 printf '%s\n' "$MONO_REPORT" > "$WORK/result_mono.txt"
 
 # --- 3b. Same measurement over a CONTINUATION bundle of the same block ---------
@@ -525,7 +595,7 @@ if [ -z "$CONT_SKIP" ]; then
     fi
   fi
 fi
-CONT_TITLE="ethrex 20-tx block · continuations, epoch 2^$CONT_EPOCH_LOG2$CONT_EPOCHS · blowup=2, 219 queries"
+CONT_TITLE="$BLOCK_LABEL · continuations, epoch 2^$CONT_EPOCH_LOG2$CONT_EPOCHS · blowup=2, 219 queries"
 printf '%s\n' "$MONO_REPORT"
 if [ -n "$CONT_SKIP" ]; then
   echo
