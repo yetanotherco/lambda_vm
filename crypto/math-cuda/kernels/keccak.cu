@@ -366,13 +366,11 @@ extern "C" __global__ void keccak_fri_leaves_ext3(
 // concatenation of two 32-byte siblings, identical to
 // `FieldElementVectorBackend::hash_new_parent` on host.
 // ---------------------------------------------------------------------------
-extern "C" __global__ void keccak_merkle_level(
+__device__ __forceinline__ void hash_merkle_parent(
     uint8_t *nodes,
     uint64_t parent_begin,     // node index (counted in 32-byte nodes)
-    uint64_t n_pairs) {
-    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= n_pairs) return;
-
+    uint64_t n_pairs,
+    uint64_t tid) {
     uint64_t st[25];
     #pragma unroll
     for (int i = 0; i < 25; ++i) st[i] = 0;
@@ -391,6 +389,35 @@ extern "C" __global__ void keccak_merkle_level(
     for (int i = 0; i < 4; ++i) absorb_lane(st, rate_pos, right[i]);
 
     finalize_keccak256(st, rate_pos, nodes + (parent_begin + tid) * 32);
+}
+
+extern "C" __global__ void keccak_merkle_level(
+    uint8_t *nodes,
+    uint64_t parent_begin,     // node index (counted in 32-byte nodes)
+    uint64_t n_pairs) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n_pairs) return;
+    hash_merkle_parent(nodes, parent_begin, n_pairs, tid);
+}
+
+// Build every remaining level (from `level_begin` up to the root) in ONE
+// single-block launch: each level's pairs are grid-strided over the block,
+// with a __syncthreads() barrier between levels. Replaces log2 launches of
+// `keccak_merkle_level` for the small top levels of the tree, whose per-level
+// work is dwarfed by launch overhead.
+extern "C" __global__ void keccak_merkle_tail(
+    uint8_t *nodes,
+    uint64_t level_begin) {
+    uint64_t lb = level_begin;
+    while (lb != 0) {
+        uint64_t nb = lb / 2;
+        uint64_t n_pairs = lb - nb;
+        for (uint64_t tid = threadIdx.x; tid < n_pairs; tid += blockDim.x) {
+            hash_merkle_parent(nodes, nb, n_pairs, tid);
+        }
+        __syncthreads();
+        lb = nb;
+    }
 }
 
 // Gather Merkle authentication paths for a batch of leaf positions, reading the

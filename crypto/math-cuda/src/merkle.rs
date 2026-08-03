@@ -158,10 +158,41 @@ pub(crate) fn build_inner_tree_levels(
     nodes_dev: &mut CudaSlice<u8>,
     leaves_len: usize,
 ) -> Result<()> {
+    // Once a level fits this many pairs, one single-block launch
+    // (`keccak_merkle_tail`) builds all remaining levels with barriers
+    // between them: the top levels of a big tree are each smaller than the
+    // per-launch overhead they used to pay.
+    //
+    // Set to the block width, so the entry level is exactly one permutation
+    // per thread and the tail adds NO serialization over the per-level
+    // launches it replaces. Going wider is not free: the tail grid-strides a
+    // single 128-thread block on one SM, so a level of `k` pairs costs
+    // `k / 128` *sequential* keccak-f1600s where separate launches would have
+    // spread them over `k / 128` parallel blocks. At 2048 the first four
+    // levels alone are 16+8+4+2 = 30 serial permutations against 4 parallel
+    // waves — order +100 us per large tree, to save 4 launches worth order
+    // 10 us. It stays on the critical path because the caller's 32-byte root
+    // `memcpy_dtoh` host-blocks on everything queued before it.
+    const TAIL_MAX_PAIRS: u64 = KECCAK_BLOCK_DIM as u64;
     let mut level_begin: u64 = (leaves_len - 1) as u64;
     while level_begin != 0 {
         let new_begin = level_begin / 2;
         let n_pairs = level_begin - new_begin;
+        if n_pairs <= TAIL_MAX_PAIRS {
+            let cfg = LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (KECCAK_BLOCK_DIM, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe {
+                stream
+                    .launch_builder(&be.keccak_merkle_tail)
+                    .arg(&mut *nodes_dev)
+                    .arg(&level_begin)
+                    .launch(cfg)?;
+            }
+            return Ok(());
+        }
         let cfg = keccak_launch_cfg(n_pairs);
         unsafe {
             stream
@@ -454,6 +485,56 @@ fn build_comp_poly_tree_nodes_dev(
 
     build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
     Ok((nodes_dev, num_leaves, stream))
+}
+
+/// Build the composition Merkle tree straight from a device-resident slab
+/// buffer (`3*m` slabs of `lde_size` u64s, component `k` of part `c` at
+/// `(c*3 + k) * lde_size` — the [`crate::lde::GpuLdeExt3`] layout). No host
+/// staging and no H2D: the leaves kernel reads `buf` in place on `stream`.
+pub fn build_comp_poly_tree_from_slabs_dev(
+    stream: &Arc<CudaStream>,
+    buf: &CudaSlice<u64>,
+    m: usize,
+    lde_size: usize,
+) -> Result<crate::lde::GpuMerkleTree> {
+    assert!(m > 0);
+    assert!(lde_size.is_power_of_two() && lde_size >= 2);
+    assert_eq!(buf.len(), 3 * m * lde_size, "slab buffer shape");
+    let num_leaves = lde_size / 2;
+    let tight_total_nodes = 2 * num_leaves - 1;
+    let be = backend()?;
+
+    let mut nodes_dev = unsafe { stream.alloc::<u8>(tight_total_nodes * 32) }?;
+    let leaves_offset_bytes = (num_leaves - 1) * 32;
+    {
+        let mut leaves_view =
+            nodes_dev.slice_mut(leaves_offset_bytes..leaves_offset_bytes + num_leaves * 32);
+        let col_stride_u64 = lde_size as u64;
+        let num_parts_u64 = m as u64;
+        let num_rows_u64 = lde_size as u64;
+        let log_num_rows = lde_size.trailing_zeros() as u64;
+        let cfg = keccak_launch_cfg(num_leaves as u64);
+        unsafe {
+            stream
+                .launch_builder(&be.keccak_comp_poly_leaves_ext3)
+                .arg(buf)
+                .arg(&col_stride_u64)
+                .arg(&num_parts_u64)
+                .arg(&num_rows_u64)
+                .arg(&log_num_rows)
+                .arg(&mut leaves_view)
+                .launch(cfg)?;
+        }
+    }
+    build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
+    let mut root = [0u8; 32];
+    stream.memcpy_dtoh(&nodes_dev.slice(0..32), &mut root)?;
+    stream.synchronize()?;
+    Ok(crate::lde::GpuMerkleTree {
+        nodes: Arc::new(nodes_dev),
+        leaves_len: num_leaves,
+        root,
+    })
 }
 
 /// Build the comp poly Merkle tree on device and keep the nodes resident

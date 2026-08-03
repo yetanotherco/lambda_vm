@@ -1027,10 +1027,12 @@ pub trait IsStarkProver<
         // Fused GPU split path for preprocessed tables (cuda only): one
         // row-major LDE of ALL columns plus two subset Merkle trees
         // (precomputed / multiplicity) built on device — leaves and levels are
-        // bit-identical to `commit_rows_bit_reversed_subset`, and the trees
-        // come back as full host trees so the preprocessed opening path and
-        // the process-wide precomputed-tree cache work unchanged. The handle
-        // keeps the LDE device-resident for the downstream GPU rounds.
+        // bit-identical to `commit_rows_bit_reversed_subset`. The precomputed
+        // tree comes back as a full host tree, so the process-wide
+        // precomputed-tree cache works unchanged; the multiplicity tree stays
+        // device-resident behind a root-only host tree and its opening paths
+        // are gathered on device. The handle keeps the LDE device-resident for
+        // the downstream GPU rounds.
         #[cfg(feature = "cuda")]
         if let Some((expected_precomputed_root, num_precomputed)) = precomputed {
             let (trace_slice, num_cols) = trace.main_data_row_major();
@@ -1481,10 +1483,12 @@ pub trait IsStarkProver<
         let mut gpu_composition_parts: Option<math_cuda::lde::GpuLdeExt3> = None;
 
         // Fully device-resident d=2 path: H stays on device through decompose +
-        // half extension, the parts handle feeds R4 DEEP, and only the final
-        // evaluations are drained to host (for the commit tree and openings).
-        // Any miss falls through to the host path below (downloading H when
-        // the evaluation itself already ran on device).
+        // half extension, and the parts handle feeds the commit tree, R3 OOD,
+        // R4 DEEP and the openings. The evaluations are drained to host only
+        // while a host trace copy exists (fallback consumers); under
+        // device-only nothing leaves the device and the placeholders below
+        // stay empty. Any miss falls through to the host path (downloading H
+        // when the evaluation itself already ran on device).
         #[cfg(feature = "cuda")]
         let mut precomputed_parts: Option<Vec<Vec<FieldElement<FieldExtension>>>> = None;
         #[cfg(feature = "cuda")]
@@ -1502,6 +1506,7 @@ pub trait IsStarkProver<
                 &h_dev,
                 twiddles.inv_2x(domain),
                 &twiddles.composition(domain).weights,
+                !round_1_result.lde_trace.host_trace_empty(),
             ) {
                 Some((parts, handle)) => {
                     gpu_composition_parts = Some(handle);
@@ -1524,6 +1529,20 @@ pub trait IsStarkProver<
         let constraints_dur = t_sub.elapsed();
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
+
+        // Every arm below runs the HOST evaluator, which reads `get_main` /
+        // `get_aux`. Under device-only those buffers are intentionally empty,
+        // so landing here means the device decompose AND the `H` download both
+        // failed. Abort with the device-only contract's message rather than a
+        // bare index-out-of-bounds from somewhere inside the evaluator.
+        #[cfg(feature = "cuda")]
+        if precomputed_parts.is_none() {
+            assert!(
+                !round_1_result.lde_trace.host_trace_empty(),
+                "R2 composition fell back to the host evaluator, but the trace \
+                 is device-only (empty)"
+            );
+        }
 
         let lde_composition_poly_parts_evaluations = if let Some(parts) = precomputed_parts {
             parts
@@ -1612,23 +1631,48 @@ pub trait IsStarkProver<
 
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
-        // GPU fast path for the comp-poly Merkle commit: row-pair Keccak
-        // leaves + device-side inner tree, both wrapping the host eval Vecs.
-        // GPU path keeps the composition tree resident on device (no whole tree
-        // copy) and returns a root only host tree. The device tree is threaded
-        // to R4 in `Round2.gpu_composition_tree`.
+        // GPU fast path for the comp-poly Merkle commit: hash straight from
+        // the resident parts handle when R2 kept one (no host pack + H2D
+        // re-upload); otherwise wrap the host eval Vecs. Either way the tree
+        // stays resident on device (no whole-tree copy), a root-only host tree
+        // is returned, and the device tree is threaded to R4 in
+        // `Round2.gpu_composition_tree`.
         #[cfg(feature = "cuda")]
         let (composition_poly_merkle_tree, composition_poly_root, gpu_composition_tree) =
-            match crate::gpu_lde::try_build_comp_poly_tree_gpu::<
-                FieldExtension,
-                BatchedMerkleTreeBackend<FieldExtension>,
-            >(&lde_composition_poly_parts_evaluations)
-            {
+            match gpu_composition_parts
+                .as_ref()
+                .and_then(|h| {
+                    crate::gpu_lde::try_build_comp_poly_tree_gpu_from_dev::<
+                        FieldExtension,
+                        BatchedMerkleTreeBackend<FieldExtension>,
+                    >(h)
+                })
+                .or_else(|| {
+                    crate::gpu_lde::try_build_comp_poly_tree_gpu::<
+                        FieldExtension,
+                        BatchedMerkleTreeBackend<FieldExtension>,
+                    >(&lde_composition_poly_parts_evaluations)
+                }) {
                 Some((host_tree, dev_tree)) => {
                     let root = host_tree.root;
                     (host_tree, root, Some(dev_tree))
                 }
                 None => {
+                    // The host part evals are empty under device-only (the R2
+                    // drain is skipped); abort with the device-only contract's
+                    // message instead of a misleading EmptyCommitment. Gate on
+                    // the parts the CPU fallback actually consumes, not on
+                    // `host_trace_empty()`: the trace can stay device-resident
+                    // while these parts were downloaded to the host anyway (the
+                    // GPU decompose fell back to `decompose_and_extend_d2`), in
+                    // which case this fallback is valid and must not panic.
+                    assert!(
+                        lde_composition_poly_parts_evaluations
+                            .first()
+                            .is_none_or(|p| !p.is_empty()),
+                        "R2 composition commit fell back to the host part evals, \
+                         but they are device-only (empty)"
+                    );
                     let (tree, root) = crate::commitment::commit_bit_reversed(
                         &lde_composition_poly_parts_evaluations,
                         crate::commitment::ROWS_PER_LEAF,
@@ -1688,27 +1732,86 @@ pub trait IsStarkProver<
 
         // === Composition poly parts: barycentric evaluation at z^num_parts ===
         let comp_z_pow_n = z_power.pow(domain_size);
-        let comp_inv_denoms = math::polynomial::barycentric_inv_denoms(&z_power, &dc.points);
 
-        let composition_poly_parts_ood_evaluation: Vec<_> = round_2_result
-            .lde_composition_poly_evaluations
-            .iter()
-            .map(|lde_evals| {
-                // Extract trace-size evaluations (stride = blowup_factor)
-                let evals: Vec<FieldElement<FieldExtension>> = (0..domain_size)
-                    .map(|i| lde_evals[i * blowup_factor].clone())
-                    .collect();
-                math::polynomial::interpolate_coset_eval_ext_with_g_n_inv(
-                    &comp_z_pow_n,
-                    &dc.offset_pow_n,
-                    &dc.size_inv,
-                    &dc.offset_pow_n_inv,
-                    &dc.points,
-                    &evals,
-                    &comp_inv_denoms,
-                )
-            })
-            .collect();
+        // GPU fast path: strided barycentric straight over the resident R2
+        // parts handle (device inv_denoms for the single point z^P), skipping
+        // the host stride-extract and the sequential CPU fold per part.
+        #[cfg(feature = "cuda")]
+        let gpu_parts_ood: Option<Vec<FieldElement<FieldExtension>>> =
+            round_1_result
+                .lde_trace
+                .gpu_composition_parts()
+                .and_then(|parts_dev| {
+                    let dispatch = |inv_host: &[FieldElement<FieldExtension>],
+                                ctx: Option<(&crate::gpu_lde::R3DevContext, usize)>| {
+                    crate::gpu_lde::try_barycentric_ext3_on_ext3_handle::<Field, FieldExtension>(
+                        parts_dev,
+                        blowup_factor,
+                        &dc.points,
+                        &dc.offset_pow_n,
+                        &dc.size_inv,
+                        &dc.offset_pow_n_inv,
+                        &comp_z_pow_n,
+                        inv_host,
+                        ctx,
+                    )
+                };
+                    match crate::gpu_lde::try_prep_r3_dev_context::<Field, FieldExtension>(
+                        &dc.points,
+                        std::slice::from_ref(&z_power),
+                        round_1_result.lde_trace.bound_stream(),
+                    ) {
+                        Some(ctx) => dispatch(&[], Some((&ctx, 0))),
+                        // Below the dev-context threshold (single eval point):
+                        // host inv_denoms + the same strided kernel, mirroring the
+                        // trace OOD's mixed arm.
+                        None => {
+                            let inv =
+                                math::polynomial::barycentric_inv_denoms(&z_power, &dc.points);
+                            dispatch(&inv, None)
+                        }
+                    }
+                });
+        #[cfg(not(feature = "cuda"))]
+        let gpu_parts_ood: Option<Vec<FieldElement<FieldExtension>>> = None;
+
+        let composition_poly_parts_ood_evaluation: Vec<_> = match gpu_parts_ood {
+            Some(v) => v,
+            None => {
+                // The host part evals are empty under device-only (the R2
+                // drain is skipped); reaching this arm there is a mis-gate.
+                #[cfg(feature = "cuda")]
+                assert!(
+                    round_2_result
+                        .lde_composition_poly_evaluations
+                        .first()
+                        .is_none_or(|p| !p.is_empty()),
+                    "R3 parts OOD fell back to the host part evals, but they are \
+                     device-only (empty)"
+                );
+                let comp_inv_denoms =
+                    math::polynomial::barycentric_inv_denoms(&z_power, &dc.points);
+                round_2_result
+                    .lde_composition_poly_evaluations
+                    .iter()
+                    .map(|lde_evals| {
+                        // Extract trace-size evaluations (stride = blowup_factor)
+                        let evals: Vec<FieldElement<FieldExtension>> = (0..domain_size)
+                            .map(|i| lde_evals[i * blowup_factor].clone())
+                            .collect();
+                        math::polynomial::interpolate_coset_eval_ext_with_g_n_inv(
+                            &comp_z_pow_n,
+                            &dc.offset_pow_n,
+                            &dc.size_inv,
+                            &dc.offset_pow_n_inv,
+                            &dc.points,
+                            &evals,
+                            &comp_inv_denoms,
+                        )
+                    })
+                    .collect()
+            }
+        };
 
         // === Trace polynomials: barycentric evaluation via LDE ===
         let trace_ood_evaluations = crate::trace::get_trace_evaluations_from_lde(
@@ -1812,6 +1915,7 @@ pub trait IsStarkProver<
                 domain.blowup_factor.trailing_zeros(),
                 air.options().fri_final_poly_log_degree as u32,
                 domain.fri_inv_twiddles(),
+                !round_1_result.lde_trace.host_trace_empty(),
             )
         });
         #[cfg(not(feature = "cuda"))]
@@ -2433,8 +2537,10 @@ pub trait IsStarkProver<
         // Cross-check the device gather against the host LDE. Skipped under
         // device-only (host trace empty): the gather was proven bit-identical
         // while the host copy was resident, and there is nothing to check
-        // against.
-        if !lde_trace.host_trace_empty() {
+        // against. Release keeps query 0 as a canary (the GPU test suites run
+        // --release, and gather failure modes — stride/offset/layout — are
+        // systematic, so one query catches them); debug checks every query.
+        if (cfg!(debug_assertions) || qi == 0) && !lde_trace.host_trace_empty() {
             let domain_size = domain.lde_roots_of_unity_coset.len() as u64;
             let r_even = reverse_index(challenge * 2, domain_size);
             let r_odd = reverse_index(challenge * 2 + 1, domain_size);
@@ -2496,23 +2602,21 @@ pub trait IsStarkProver<
         // must succeed: there is no host tree to fall back to, so a gather error
         // is a hard abort. When the tree is not device resident the value is
         // `None` and the openings below walk the full host tree.
+        // For preprocessed tables the resident tree is the multiplicity subset
+        // tree (the host `main_commit.tree` is root only); values still come
+        // from the host LDE range gather below.
         #[cfg(feature = "cuda")]
-        let main_dev_proofs: Option<Vec<Proof<Commitment>>> = if is_preprocessed {
-            None
-        } else {
-            lde_trace
-                .gpu_main()
-                .and_then(|h| h.tree.as_ref())
-                .map(|tree| {
-                    let stream = lde_trace
-                        .bound_stream()
-                        .expect("bound stream for device-resident main-tree opening");
-                    // Row-pair leaves: one proof per query at position `challenge`.
-                    crate::gpu_lde::gather_proofs_dev(tree, indexes_to_open, &stream).expect(
-                        "device main-tree gather failed; resident tree has no host fallback",
-                    )
-                })
-        };
+        let main_dev_proofs: Option<Vec<Proof<Commitment>>> = lde_trace
+            .gpu_main()
+            .and_then(|h| h.tree.as_ref())
+            .map(|tree| {
+                let stream = lde_trace
+                    .bound_stream()
+                    .expect("bound stream for device-resident main-tree opening");
+                // Row-pair leaves: one proof per query at position `challenge`.
+                crate::gpu_lde::gather_proofs_dev(tree, indexes_to_open, &stream)
+                    .expect("device main-tree gather failed; resident tree has no host fallback")
+            });
 
         // Same for the aux trace tree, when it is device resident.
         #[cfg(feature = "cuda")]
@@ -2554,8 +2658,10 @@ pub trait IsStarkProver<
         // *_dev_values.is_some()` on the Goldilocks path) and we never gather
         // rows for a tree that is not device resident.
         #[cfg(feature = "cuda")]
-        let main_dev_values: Option<Vec<FieldElement<Field>>> =
-            main_dev_proofs.as_ref().and_then(|_| {
+        let main_dev_values: Option<Vec<FieldElement<Field>>> = (!is_preprocessed)
+            .then_some(())
+            .and(main_dev_proofs.as_ref())
+            .and_then(|_| {
                 lde_trace.gpu_main().and_then(|h| {
                     Self::gather_query_rows_device(
                         lde_trace,
@@ -2595,12 +2701,79 @@ pub trait IsStarkProver<
                 })
             });
 
+        // Composition part values off the resident R2 parts handle (one ext3
+        // "column" per part), same row-pair gather as main/aux above.
+        #[cfg(feature = "cuda")]
+        let comp_num_parts = lde_trace
+            .gpu_composition_parts()
+            .map(|h| h.m)
+            .unwrap_or_else(|| round_2_result.lde_composition_poly_evaluations.len());
+        #[cfg(feature = "cuda")]
+        let comp_dev_values: Option<Vec<FieldElement<FieldExtension>>> =
+            comp_dev_proofs.as_ref().and_then(|_| {
+                lde_trace.gpu_composition_parts().and_then(|h| {
+                    Self::gather_query_rows_device(
+                        lde_trace,
+                        "composition",
+                        |stream| {
+                            math_cuda::barycentric::gather_rows_ext3_on_device(
+                                h,
+                                &query_rows,
+                                stream,
+                            )
+                        },
+                        |raw| {
+                            crate::constraint_ir::gpu_interp::ext3_u64_to_field::<FieldExtension>(
+                                raw,
+                            )
+                        },
+                    )
+                })
+            });
+
         for (qi, index) in indexes_to_open.iter().enumerate() {
             #[cfg(not(feature = "cuda"))]
             let _ = qi;
             // For preprocessed tables, open the main split (multiplicities only);
             // for normal tables, open all main columns.
             let main_trace_opening = if is_preprocessed {
+                // Multiplicity subset: device proof (resident subset tree) +
+                // host range gather for the values.
+                #[cfg(feature = "cuda")]
+                {
+                    match &main_dev_proofs {
+                        Some(proofs) => Self::open_polys_with_proofs(
+                            domain,
+                            proofs[qi].clone(),
+                            *index,
+                            |row| {
+                                lde_trace.gather_main_row_range(
+                                    row,
+                                    num_precomputed_cols,
+                                    total_cols,
+                                )
+                            },
+                        ),
+                        None => {
+                            // A root-only host tree means the nodes are
+                            // device-resident: this arm would emit an empty
+                            // path for query position 0 instead of failing.
+                            assert!(
+                                !main_commit.tree.is_root_only(),
+                                "preprocessed opening fell back to the host tree, \
+                                 but it is root-only (nodes device-resident)"
+                            );
+                            Self::open_polys_with(domain, &main_commit.tree, *index, |row| {
+                                lde_trace.gather_main_row_range(
+                                    row,
+                                    num_precomputed_cols,
+                                    total_cols,
+                                )
+                            })
+                        }
+                    }
+                }
+                #[cfg(not(feature = "cuda"))]
                 Self::open_polys_with(domain, &main_commit.tree, *index, |row| {
                     lde_trace.gather_main_row_range(row, num_precomputed_cols, total_cols)
                 })
@@ -2638,18 +2811,60 @@ pub trait IsStarkProver<
             let composition_openings = {
                 #[cfg(feature = "cuda")]
                 {
-                    if let Some(proofs) = &comp_dev_proofs {
-                        Self::open_composition_poly_with_proof(
-                            proofs[qi].clone(),
-                            &round_2_result.lde_composition_poly_evaluations,
-                            *index,
-                        )
-                    } else {
-                        Self::open_composition_poly(
+                    match (&comp_dev_proofs, &comp_dev_values) {
+                        (Some(proofs), Some(vals)) => {
+                            let (even, odd) = Self::device_row_pair(vals, qi, comp_num_parts);
+                            // Cross-check against the host part evals while
+                            // they are still resident (absent under full
+                            // residency, where the gather is the only source).
+                            // Query 0 stays a release canary, same rationale
+                            // as `open_trace_polys_device`.
+                            if (cfg!(debug_assertions) || qi == 0)
+                                && round_2_result
+                                    .lde_composition_poly_evaluations
+                                    .first()
+                                    .is_some_and(|p| !p.is_empty())
+                            {
+                                let expected = Self::open_composition_poly_with_proof(
+                                    proofs[qi].clone(),
+                                    &round_2_result.lde_composition_poly_evaluations,
+                                    *index,
+                                );
+                                assert_eq!(
+                                    even, expected.evaluations,
+                                    "device composition-row gather mismatch (even), query {qi}"
+                                );
+                                assert_eq!(
+                                    odd, expected.evaluations_sym,
+                                    "device composition-row gather mismatch (odd), query {qi}"
+                                );
+                            }
+                            PolynomialOpenings {
+                                proof: proofs[qi].clone(),
+                                evaluations: even,
+                                evaluations_sym: odd,
+                            }
+                        }
+                        (Some(proofs), None) => {
+                            assert!(
+                                round_2_result
+                                    .lde_composition_poly_evaluations
+                                    .first()
+                                    .is_none_or(|p| !p.is_empty()),
+                                "R4 composition opening fell back to the host part evals, \
+                                 but they are device-only (empty)"
+                            );
+                            Self::open_composition_poly_with_proof(
+                                proofs[qi].clone(),
+                                &round_2_result.lde_composition_poly_evaluations,
+                                *index,
+                            )
+                        }
+                        _ => Self::open_composition_poly(
                             &round_2_result.composition_poly_merkle_tree,
                             &round_2_result.lde_composition_poly_evaluations,
                             *index,
-                        )
+                        ),
                     }
                 }
                 #[cfg(not(feature = "cuda"))]
