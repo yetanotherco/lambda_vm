@@ -38,9 +38,9 @@ jobs:
     runs-on: [self-hosted, bench]
     # Job cap. On a cold runner the recursion BUILDS dominate: per ref a guest build, a
     # prover-test build, and a measuring-CLI build (the CLI is built FROM each ref so it
-    # understands that ref's own guest syscalls). Cached in /tmp; build-std is per ref and
-    # the host cargo target is shared across ref worktrees (see the recursion step's env),
-    # so the second ref's native builds mostly reuse the first ref's compiled deps.
+    # understands that ref's own guest syscalls). Cached in /tmp; build-std and the host
+    # cargo target are both per ref (see the recursion step's env), so a ref's second and
+    # later presets reuse its own compiled deps — but the two refs never share a dir.
     # 125 rather than 90 to absorb the continuation arms: a 20-tx continuation prove per
     # ref on each side of the verifier bench, plus a 20-tx (was 4-tx) block for the cycle
     # comparison. Keep this ABOVE the sum of the step caps below (50 + 70 = 120) so a
@@ -134,10 +134,11 @@ jobs:
       # continuations, via the `continuation` guest). One exact `execute --cycles`
       # reading per ref (no ABBA); blowup2-block's dumped blob is cached by ref SHA
       # (bench_recursion_cycles.sh), so a repeat run skips re-proving.
-      # GUEST_TARGET_DIR is a BASE path — bench_recursion_cycles.sh appends the ref SHA
-      # so each worktree owns its guest target dir (sharing one dir across refs made
-      # cargo mix rlibs from both worktrees and broke every regime after the first).
-      # HOST_TARGET_DIR is genuinely shared: native deps compile once for both refs.
+      # GUEST_TARGET_DIR and HOST_TARGET_DIR are BASE paths — bench_recursion_cycles.sh
+      # appends the ref SHA so each worktree owns its target dirs. Sharing one dir across
+      # refs made cargo mix rlibs from both worktrees: loudly on the guest side (broke
+      # every regime after the first) and SILENTLY on the host side (cargo declared the
+      # second ref fresh and the run measured the first ref's binary).
       # continue-on-error + `!cancelled()` isolate this from the verifier bench above.
       - name: Run recursion guest cycle benchmark
         id: recursion
@@ -148,11 +149,11 @@ jobs:
         timeout-minutes: 70
         env:
           HEAD_SHA: ${{ steps.cfg.outputs.head_sha }}
-          # Base path for the per-ref guest target dirs (`<base>_<sha8>`) and the shared
-          # host cargo target, both rooted under the script's /tmp cache dir: build-std
-          # and native deps survive across runs instead of being rebuilt cold.
+          # Base paths for the per-ref guest and host target dirs (`<base>_<sha8>`), both
+          # rooted under the script's /tmp cache dir: build-std and native deps survive
+          # across runs (and across presets within a run) instead of being rebuilt cold.
           GUEST_TARGET_DIR: /tmp/recursion_cycles_run/guest_target
-          HOST_TARGET_DIR: /tmp/recursion_cycles_run/shared_host_target
+          HOST_TARGET_DIR: /tmp/recursion_cycles_run/host_target
         run: |
           export SYSROOT_DIR="$HOME/.lambda-vm-sysroot"
           .github/scripts/run_recursion_bench.sh "$HEAD_SHA"
