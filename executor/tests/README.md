@@ -30,7 +30,14 @@ cd tooling/ethrex-fixtures
 cargo run --release -- 0  ../../executor/tests/ethrex_empty_block.bin   # empty block
 cargo run --release -- 1  ../../executor/tests/ethrex_simple_tx.bin     # 1 transfer
 cargo run --release -- 10 ../../executor/tests/ethrex_10_transfers.bin  # 10 transfers
+cargo run --release -- 4  ../../executor/tests/ethrex_bench_4.bin distinct  # recursion profile
 ```
+
+`ethrex_bench_4.bin` is the odd one out: `distinct` mode, and it is read by the
+recursion profile target rather than the executor tests (see the Makefile's
+`recursion-profile-block-input`). It is committed like the rest, so it is
+regenerated and checksummed with them — a rev bump makes every one of these
+undecodable, not just the three the executor reads.
 
 To regenerate after an ethrex rev bump, update the `rev` in
 `tooling/ethrex-fixtures/Cargo.toml` (and the guest's), then run
@@ -51,6 +58,11 @@ ethrex_simple_tx.bin
 ethrex_10_transfers.bin
   sha256: d04cfed35bd16c8248ab8ebf2f3ca2ff01c08269271b17e5d5db3b1f22ea03ad
   contents: stateless ethrex block with ten plain ETH transfer transactions
+
+ethrex_bench_4.bin
+  sha256: bb26e6d6595f537c2fd57bfd59da6abe82241bd92690a21c2225da94d5cf507a
+  contents: stateless ethrex block with four plain ETH transfers, `distinct` mode
+            (N senders -> N recipients); read by the recursion profile target
 ```
 
 ## Real-block fixtures

@@ -499,7 +499,8 @@ regen-ethrex-fixtures:
 	cd tooling/ethrex-fixtures && \
 		cargo run --release -- 0  ../../executor/tests/ethrex_empty_block.bin && \
 		cargo run --release -- 1  ../../executor/tests/ethrex_simple_tx.bin && \
-		cargo run --release -- 10 ../../executor/tests/ethrex_10_transfers.bin
+		cargo run --release -- 10 ../../executor/tests/ethrex_10_transfers.bin && \
+		cargo run --release -- 4  ../../executor/tests/ethrex_bench_4.bin distinct
 	$(MAKE) update-ethrex-fixture-checksums
 
 update-ethrex-fixture-checksums:

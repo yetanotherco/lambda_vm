@@ -12,6 +12,10 @@ FIXTURES = (
     "ethrex_empty_block.bin",
     "ethrex_simple_tx.bin",
     "ethrex_10_transfers.bin",
+    # Committed like the three above, but generated in `distinct` mode and read by
+    # the recursion profile target rather than the executor tests. Omitting it left
+    # a committed fixture that a rev bump silently staled with nothing to catch it.
+    "ethrex_bench_4.bin",
 )
 
 
