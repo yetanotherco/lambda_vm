@@ -110,18 +110,28 @@ Both are recorded in `lfm-assembly-obligations.md`. The generalised rule —
 
 ## 4. What is NOT witnessed — precise statements
 
-- **Zero-row fixed tables.** `T_epoch` includes fixed tables regardless of
-  workload (the `FIXED_TABLE_COUNT = 10` lesson), so an epoch carries sub-proofs
-  for tables with no real rows. UNVERIFIED first-hand: whether such a table's
-  `L` is zero (expected — all-padding rows have multiplicity zero, so every term
-  vanishes) and whether it still carries `bus_table_contribution: Some(zero)`
-  rather than `None`. It matters only for the COUNT: if a zero-row table reports
-  `None`, `has_trace_interaction()` is still true and `verifier.rs:1238` would
-  REJECT, so the answer is probably "Some(zero)" — but that is inference from
-  the guard, not a measurement. **Next agent: prove one epoch with an unused
-  fixed table and read its contribution.** Cheap.
-- **Real epoch table-set length.** Every fixture here is 2 or 3 tables. The SUM
-  is exercised; its length (twenty-odd for a real epoch) is not.
+- ~~**Zero-row fixed tables.**~~ — **SETTLED BY MEASUREMENT** 2026-08-03
+  (zerorow, `logup_tests::a_zero_row_fixed_table_carries_some_zero_not_none`).
+  The answer is **`Some(zero)`**, and the inference held exactly. A real
+  intermediate epoch (epoch 0 of the fibonacci fixture, proved over the
+  production epoch AIR set and ACCEPTED by `multi_verify_views`) carries **five**
+  zero-row fixed tables — KECCAK, KECCAK_RND, KECCAK_RC, ECSM, ECDAS — each with
+  `has_bus_public_inputs() == true` and `L` exactly zero. `num_contributing_tables`
+  is therefore safe as a program constant. Two things the closure did not know:
+  * The other half of the old argument is now a run too, not a deduction:
+    stripping `bus_public_inputs` from any of those five sub-proofs makes the same
+    proof FAIL to verify. So `Some` is forced, not merely observed.
+  * **A zero-row table is not a blank one.** KECCAK_RND's and ECSM's traces are
+    literally all zero, but KECCAK pads with `state_ptr[lane] = 8·lane`, KECCAK_RC
+    is a preprocessed constant table, and ECDAS pads likewise — those three have
+    NO rows on any bus (every multiplicity column is zero) over a trace that is
+    not blank. Any future emitter that treats "unused table" as "blank trace"
+    would be wrong on three of the five.
+- ~~**Real epoch table-set length.**~~ — closed by the same test, which runs the
+  closure over all **24** contributions of a real epoch (8 output bytes, target
+  from production's own `compute_expected_commit_bus_balance_view`), and rejects
+  all 72 single-lane moves. The two- and three-table fixtures remain the ones
+  that isolate per-chunk accumulation.
 - **`start_index`** is unbound to the chain — ledger OPEN entry 2. Do not invent
   a binding; read how production carries it across epochs first.
 - **The five remaining two-consumer values** — ledger OPEN entry 3. Deliberately

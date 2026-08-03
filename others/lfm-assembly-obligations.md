@@ -71,6 +71,11 @@ entry only with the verifying evidence named in it.
   output BYTES — one inverse chain per byte, scaling with output length
   (deep-join, LogUp slice 1). Not in the target-shape budget. Assembly
   must price it against the real epoch's public-output length.
+  First data point (zerorow, 2026-08-03): the fixture epoch's output is
+  **8 bytes**, so the gadget is nonempty in practice and the empty
+  short-circuit is not the common case. That is a 16-cycle epoch and says
+  nothing about a production epoch's output length — it only rules out
+  "usually zero".
 - **HALT's constraint-leg cost line is out of step**: 9,859 instructions
   for 22 columns, inconsistent with its neighbours (deep-join, final
   report — noticed, not chased). Assembly composes per-AIR numbers; an
