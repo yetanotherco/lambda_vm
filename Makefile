@@ -307,7 +307,11 @@ test-rust: compile-programs-rust
 # measured cost.
 ETHREX_REAL_BLOCK_NETWORK := mainnet
 ETHREX_REAL_BLOCK := 25368371
-ETHREX_REAL_BLOCK_FIXTURE_URL := https://github.com/yetanotherco/lambda_vm/releases/download/bench-fixtures-v1/ethrex_mainnet_25368371.bin
+# The asset name carries the ethrex rev because the bytes are a function of it: the
+# archived ProgramInput layout moves with the pin, so one block has one fixture per rev.
+# Uploading under a new name rather than replacing the old one keeps `main` — which still
+# expects the pre-bump sha256 — fetching its own artifact while this branch is open.
+ETHREX_REAL_BLOCK_FIXTURE_URL := https://github.com/yetanotherco/lambda_vm/releases/download/bench-fixtures-v1/ethrex_mainnet_25368371_4f658c2b.bin
 ETHREX_REAL_BLOCK_FIXTURE_SHA256 := 0a301731b84515260c2ad7779fef3e4ef8b2424fbcc055ee2f5a224bc88120ab
 # The block's source cache, hosted in the same release. Only `regen-real-block-fixture`
 # reads it — the converter's TESTS use a different, upstream-pinned cache (below).
