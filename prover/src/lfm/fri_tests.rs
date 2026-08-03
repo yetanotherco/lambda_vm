@@ -1146,3 +1146,85 @@ fn the_shape_pins_the_lengths_production_must_check_at_runtime() {
         println!("  {label:<52} refused as {err:?}\n    mirrors {mirrors}");
     }
 }
+
+/// ★ The FRI leg PROVES and VERIFIES — method rule 2, discharged rather than
+/// argued.
+///
+/// Every other test here calls `execute`, which runs the executor and the
+/// arena/assert semantics but never builds a trace or a proof. Rule 2 is explicit
+/// that an execute-only test says nothing about the chips: where the executor
+/// mirrors a computation the chip also does, only a prove+verify run sees the
+/// chip.
+///
+/// It is tempting to argue the coverage away — the FRI leg emits no instruction
+/// the trace legs do not already emit, and `join_tests::the_join_proves_and_verifies`
+/// proves those. That argument is probably true and is exactly the kind of thing
+/// rule 5 says to check instead of assert, so this proves the JOINED program: the
+/// openings authenticated, DEEP folded, and FRI folded to the terminal check, all
+/// in one proved and verified run over a real folding sub-proof.
+///
+/// One query, because the point is the chips rather than the sweep — the fold
+/// mechanism's coverage is
+/// [`the_fri_emitter_verifies_every_query_of_a_real_folding_proof`]'s, over all
+/// 219 of three shapes.
+#[test]
+fn the_fri_leg_proves_and_verifies() {
+    use super::proof::{lfm_prove, verify_against};
+    use super::registry::build_artifacts;
+
+    let h = host_fri(512, 2);
+    assert_eq!(
+        h.shape.num_committed(),
+        1,
+        "one committed layer is enough to put a leaf hash, a walk, a root compare \
+         and both folds through the prover"
+    );
+    let queries = [0usize];
+    let opts = super::join_tests::prove_options();
+    let shape = FriShape {
+        num_queries: queries.len(),
+        ..h.shape
+    };
+
+    let mut b = LfmBuilder::new();
+    let (_, _, terminal) =
+        super::fri::emit_sub_proof_with_fri(&mut b, &h.trace.shape, shape, queries.len());
+    for v in &terminal {
+        b.public(v.as_cell());
+    }
+    let program = compile(b.finish());
+    validate(&program).expect("the joined program is admissible");
+
+    let mut arenas = h.trace.arenas(&queries);
+    arenas.extend(h.fri_arenas(&queries));
+    let artifacts = build_artifacts(&program, &opts);
+    let proved = lfm_prove(&program, &artifacts, &arenas, &opts)
+        .expect("the joined trace+DEEP+FRI program must prove");
+
+    // The proved run's published terminal value, against production's own
+    // codeword — so the proof is not merely valid but computes the right thing.
+    let codeword = h.terminal_codeword();
+    assert_eq!(
+        word_as_ext(&proved.public_words[0].1).expect("ext"),
+        codeword[h.trace.iotas[queries[0]] >> h.shape.num_committed()],
+        "the PROVED run must publish the terminal codeword value production \
+         would have looked up"
+    );
+    assert!(
+        verify_against(
+            &artifacts.roots,
+            &artifacts.program_id,
+            artifacts.keccak_rnd_chunks,
+            &proved.proof,
+            &proved.public_words,
+            &opts,
+        ),
+        "the joined FRI run must verify"
+    );
+    println!(
+        "proved and verified: {} instructions, {} permutations, {} committed layer",
+        program.instrs.len(),
+        permutations(&program),
+        h.shape.num_committed(),
+    );
+}
