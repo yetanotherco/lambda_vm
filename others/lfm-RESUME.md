@@ -128,8 +128,10 @@ The machine proves and verifies, end to end, through the registry:
 
 ## How to restart the work
 
-Both worker agents died on session limits, so this is a cold start; there is
-nothing to resume, only to re-spawn. What worked:
+(Updated 2026-08-03 after wave 2.) Every wave so far ended the same way —
+worker agents hit session limits, so a restart is always a cold start:
+nothing to resume, only to re-spawn against the committed briefs. What
+worked, twice now:
 
 - **One agent per leg, one worktree per agent.** Create the worktree off
   `feat/lfm` first (`git worktree add <path> -b <branch> feat/lfm`, then
@@ -148,9 +150,17 @@ nothing to resume, only to re-spawn. What worked:
 - Agents append to `lfm-agent-status.log` at slice boundaries; that log is
   the history if a mailbox message is lost, which happened repeatedly.
 
-Two legs are ready to start immediately: the REGISTER tree derivation
-(chaining item 1 above) and the DEEP/Merkle join (item 2). They are
-independent and can run in parallel.
+Ready to start immediately (wave 3):
+- **The FRI emitter** — the one substantial build left before assembly.
+  Brief: `lfm-fri-verify-spec.md` (incl. addendum) + `lfm-fri-leg-state.md`.
+  Spawn it first.
+- **The zero-row fixed-table experiment** (small; can ride along or wait):
+  prove one epoch with an unused fixed table, read whether its
+  `bus_table_contribution` is `Some(zero)` or `None` — settles the one
+  unknown the LogUp handoff left labelled as inference.
+
+After those: assembly (discharge `lfm-assembly-obligations.md` — its OPEN
+entries are the assembly spec's skeleton), then the wrap run.
 
 ## How to work here
 
