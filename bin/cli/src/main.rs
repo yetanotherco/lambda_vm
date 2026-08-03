@@ -293,14 +293,19 @@ fn main() -> ExitCode {
             file_cfg.warn_env_shadowing();
             file_cfg.install_runtime_overrides();
             let blowup = blowup.or(file_cfg.prove.blowup).unwrap_or(2);
-            let epoch_size_log2 = epoch_size_log2.or_else(|| {
-                file_cfg.prove.epoch_size_log2.map(|v| {
-                    parse_epoch_size_log2(&v.to_string()).unwrap_or_else(|e| {
-                        eprintln!("config [prove].epoch_size_log2: {e}");
-                        std::process::exit(2);
-                    })
-                })
-            });
+            let epoch_size_log2 = match epoch_size_log2 {
+                Some(v) => Some(v),
+                None => match file_cfg.prove.epoch_size_log2 {
+                    Some(v) => match parse_epoch_size_log2(&v.to_string()) {
+                        Ok(parsed) => Some(parsed),
+                        Err(e) => {
+                            eprintln!("config [prove].epoch_size_log2: {e}");
+                            return ExitCode::FAILURE;
+                        }
+                    },
+                    None => None,
+                },
+            };
             let max_rows = file_cfg.max_rows();
             if continuations {
                 cmd_prove_continuation(
