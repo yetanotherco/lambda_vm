@@ -509,6 +509,12 @@ impl Backend {
 
     /// Map `rayon::current_thread_index()` to a slot index, with a defensive
     /// clamp in case the rayon pool grew past the Vec we sized at init.
+    ///
+    /// The per-table scheduler's driver threads are not rayon workers: they
+    /// all resolve to slot 0 and deliberately share one slab. Spreading them
+    /// over per-driver slots costs more in repeated pinned allocation than
+    /// the shared mutex does — the staged transfers are already hidden by
+    /// cross-table overlap.
     fn worker_slot(&self, len: usize) -> usize {
         let idx = rayon::current_thread_index().unwrap_or(0);
         // Should be unreachable with rayon's fixed default pool, but if a
