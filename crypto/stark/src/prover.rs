@@ -687,9 +687,17 @@ fn run_admitted<T: Send>(
         .map(|_| std::sync::Mutex::new(None))
         .collect();
     let cursor = std::sync::atomic::AtomicUsize::new(0);
+    // Spans opened inside `task` run on these worker threads, and a fresh OS
+    // thread's span depth starts at 0 — which would record every per-table
+    // span as a root instead of a child of the phase that spawned it. Carry
+    // the spawning thread's depth across the scope boundary.
+    #[cfg(feature = "instruments")]
+    let parent_depth = crate::instruments::current_depth();
     std::thread::scope(|scope| {
         for _ in 0..workers.max(1).min(order.len().max(1)) {
             scope.spawn(|| {
+                #[cfg(feature = "instruments")]
+                let _depth = crate::instruments::enter_depth(parent_depth);
                 loop {
                     let pos = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if pos >= order.len() {

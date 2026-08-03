@@ -6,12 +6,20 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // Wall clock span timeline: the trustworthy per step latency breakdown.
 //
-// Spans open and close on the main thread at phase boundaries. They do not
-// overlap and sum to their parent, so the tree is a true latency breakdown
-// (unlike the accum_* thread local sub timers below, which sum per worker CPU
-// time across rayon threads and can exceed 100%). A parallel region is one span
-// around the blocking call; its internal split is reported separately as CPU
-// time, never mixed into the wall tree.
+// Top level phase spans open and close on the main thread at phase boundaries.
+// They do not overlap and sum to their parent, so that part of the tree is a
+// true latency breakdown (unlike the accum_* thread local sub timers below,
+// which sum per worker CPU time across rayon threads and can exceed 100%). A
+// parallel region is one span around the blocking call; its internal split is
+// reported separately as CPU time, never mixed into the wall tree.
+//
+// Per table spans are the exception. `multi_prove` runs one driver thread per
+// in flight table (`r1_aux_build`, `r1_aux_commit`, `rounds_2to4`), so up to
+// `table_parallelism()` of them are open at once: they DO overlap in wall time
+// and their sum exceeds their parent. They still nest correctly, because each
+// driver seeds its span depth from the spawning thread (`current_depth` /
+// `enter_depth`) instead of starting a fresh thread at depth 0 — but read them
+// as per table wall time, not as a share of the enclosing phase.
 //
 //     let _s = instruments::span("trace_build");   // RAII, stops on drop
 //
@@ -34,6 +42,32 @@ static SPAN_ORDER: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
     static SPAN_DEPTH: std::cell::Cell<u16> = const { std::cell::Cell::new(0) };
+}
+
+/// Depth the next span opened on this thread would be stamped with.
+///
+/// Read this on the thread that spawns workers and hand the value to
+/// [`enter_depth`] inside each worker: a freshly spawned OS thread starts at
+/// depth 0, so without it every span opened off the main thread is recorded as
+/// a root sibling of `prove_total` and the tree stops being a breakdown.
+pub fn current_depth() -> u16 {
+    SPAN_DEPTH.with(|d| d.get())
+}
+
+/// Restores the span depth this thread had before [`enter_depth`].
+#[must_use]
+pub struct DepthGuard(u16);
+
+/// Seed this thread's span depth from a parent thread, restoring the previous
+/// value when the returned guard drops.
+pub fn enter_depth(depth: u16) -> DepthGuard {
+    DepthGuard(SPAN_DEPTH.with(|d| d.replace(depth)))
+}
+
+impl Drop for DepthGuard {
+    fn drop(&mut self) {
+        SPAN_DEPTH.with(|d| d.set(self.0));
+    }
 }
 
 #[must_use]
