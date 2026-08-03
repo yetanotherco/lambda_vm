@@ -269,22 +269,43 @@ pub fn emit_group_authentication(
 /// The LDE-domain constants the point derivation multiplies together:
 /// `factors[i] = g^{2^{depth-1-i}}`, matching index bit `i`'s weight after the
 /// bit reversal.
-fn point_factors(shape: &SubProofShape) -> Vec<FE> {
-    let g =
-        <GoldilocksField as IsFFTField>::get_primitive_root_of_unity(shape.log2_lde_length as u64)
-            .expect("a power-of-two LDE length has a root of unity");
-    (0..shape.merkle_depth)
-        .map(|i| g.pow(1u64 << (shape.merkle_depth - 1 - i)))
-        .collect()
+fn point_factors(log2_lde_length: u32) -> Vec<FE> {
+    let g = <GoldilocksField as IsFFTField>::get_primitive_root_of_unity(log2_lde_length as u64)
+        .expect("a power-of-two LDE length has a root of unity");
+    let depth = log2_lde_length as usize - 1;
+    (0..depth).map(|i| g.pow(1u64 << (depth - 1 - i))).collect()
 }
 
-/// `(υ, −υ)` from the query index bits. Shape-only inputs: the factors and the
-/// coset offset are program constants.
-pub fn emit_query_points(b: &mut LfmBuilder, shape: &SubProofShape, bits: &[Bit]) -> (Felt, Felt) {
-    assert_eq!(bits.len(), shape.merkle_depth);
-    let point = edsl::pow_bits(b, bits, &point_factors(shape), shape.coset_offset);
+/// `(υ, −υ)` from the query index bits, for the LDE domain given by its size and
+/// coset offset. Shape-only inputs: the factors are program constants.
+///
+/// Keyed on the domain rather than on a [`SubProofShape`] because the FRI leg
+/// needs the same derivation and has no trace shape to hand — it holds a
+/// [`super::fri::FriShape`], which carries both of these fields. One derivation
+/// serves both, which is the point: `join_tests::the_join_premises_hold_on_a_real_proof`
+/// checks THIS function against production's
+/// `query_challenge_to_evaluation_point` at every index of a real proof, and a
+/// second copy would not be covered by that check.
+pub fn emit_points_from_bits(
+    b: &mut LfmBuilder,
+    log2_lde_length: u32,
+    coset_offset: FE,
+    bits: &[Bit],
+) -> (Felt, Felt) {
+    assert_eq!(
+        bits.len(),
+        log2_lde_length as usize - 1,
+        "a leaf is a row pair, so the index is one bit narrower than the domain"
+    );
+    let point = edsl::pow_bits(b, bits, &point_factors(log2_lde_length), coset_offset);
     let zero = b.felt_const(FE::zero());
     (point, b.sub(zero, point))
+}
+
+/// `(υ, −υ)` from the query index bits.
+pub fn emit_query_points(b: &mut LfmBuilder, shape: &SubProofShape, bits: &[Bit]) -> (Felt, Felt) {
+    assert_eq!(bits.len(), shape.merkle_depth);
+    emit_points_from_bits(b, shape.log2_lde_length, shape.coset_offset, bits)
 }
 
 /// Everything one query of one sub-proof contributes, emitted.
@@ -322,6 +343,24 @@ pub struct QueryOutput {
     /// no way to return a DIFFERENT decomposition from here: `bit_dec` is
     /// called once and its result feeds the walk, the points and this field.
     pub bits: Vec<Bit>,
+    /// `υ` — the cell the DEEP fold above evaluated at.
+    ///
+    /// Exposed for the same reason as [`Self::bits`], one step further along.
+    /// FRI needs `υ⁻¹` for its first fold and `υ^(2^total_folds)` for its
+    /// terminal check; both are functions of this cell, and a leg that
+    /// re-derived the point from `bits` would pay `merkle_depth` `Select`s and
+    /// `Mul`s per query for a value it was already holding. Handing the cell
+    /// over is not just cheaper, it removes the question: there is exactly one
+    /// `emit_query_points` call in this function and its outputs go to DEEP and
+    /// to these fields, so no second point EXISTS to disagree.
+    ///
+    /// The structural guard is a count, not a comparison — see
+    /// `fri_tests::the_fri_join_adds_no_second_point_derivation`.
+    pub point: Felt,
+    /// `−υ`, likewise. The zero-fold FRI shape checks the terminal polynomial
+    /// at both points (production's `zetas.is_empty()` branch tests
+    /// `terminal[2·iota]` AND `terminal[2·iota+1]`).
+    pub point_sym: Felt,
 }
 
 /// [`emit_query`], additionally returning the index bits — see [`QueryOutput`].
@@ -387,6 +426,8 @@ pub fn emit_query_with_bits(
             emit_deep_point(b, &shape.deep, gamma, inv, &symmetric),
         ),
         bits,
+        point,
+        point_sym,
     }
 }
 

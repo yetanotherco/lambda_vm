@@ -70,6 +70,8 @@ mod constraint_tests;
 #[cfg(test)]
 mod framework_probe;
 #[cfg(test)]
+mod fri_tests;
+#[cfg(test)]
 mod join_tests;
 #[cfg(test)]
 mod keccak_probe;
