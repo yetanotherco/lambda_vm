@@ -698,17 +698,9 @@ fn run_admitted<T: Send>(
         .map(|_| std::sync::Mutex::new(None))
         .collect();
     let cursor = std::sync::atomic::AtomicUsize::new(0);
-    // Spans opened inside `task` run on these worker threads, and a fresh OS
-    // thread's span depth starts at 0 — which would record every per-table
-    // span as a root instead of a child of the phase that spawned it. Carry
-    // the spawning thread's depth across the scope boundary.
-    #[cfg(feature = "instruments")]
-    let parent_depth = crate::instruments::current_depth();
     std::thread::scope(|scope| {
         for _ in 0..workers.max(1).min(order.len().max(1)) {
             scope.spawn(|| {
-                #[cfg(feature = "instruments")]
-                let _depth = crate::instruments::enter_depth(parent_depth);
                 loop {
                     let pos = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if pos >= order.len() {
@@ -3359,9 +3351,7 @@ pub trait IsStarkProver<
             let twiddles = &twiddle_caches[idx];
 
             #[cfg(feature = "instruments")]
-            let __sp = crate::instruments::span("r1_aux_build");
-            #[cfg(feature = "instruments")]
-            let t_aux_build = Instant::now();
+            let __sp = crate::instruments::span("r1_aux_build_table");
             let bus_public_inputs = if air.has_aux_trace() {
                 air.build_auxiliary_trace(*trace, &lookup_challenges)
             } else {
@@ -3385,14 +3375,10 @@ pub trait IsStarkProver<
                     .map_err(|e| ProvingError::DiskSpill(format!("aux trace: {e}")))?;
             }
             #[cfg(feature = "instruments")]
-            let aux_build_dur = t_aux_build.elapsed();
-            #[cfg(feature = "instruments")]
             drop(__sp);
 
             #[cfg(feature = "instruments")]
-            let __sp = crate::instruments::span("r1_aux_commit");
-            #[cfg(feature = "instruments")]
-            let t_aux_commit = Instant::now();
+            let __sp = crate::instruments::span("r1_aux_commit_table");
             let aux_full: AuxResult<FieldExtension> =
                 (|| -> Result<AuxResult<FieldExtension>, ProvingError> {
                     if air.has_aux_trace() {
@@ -3540,8 +3526,6 @@ pub trait IsStarkProver<
                 transcript_cells[idx].lock().unwrap().append_bytes(&c.root);
             }
             #[cfg(feature = "instruments")]
-            crate::instruments::accum_aux_phases(aux_build_dur, t_aux_commit.elapsed());
-            #[cfg(feature = "instruments")]
             drop(__sp);
 
             #[cfg(feature = "cuda")]
@@ -3593,7 +3577,7 @@ pub trait IsStarkProver<
             let domain = &domains[idx];
 
             #[cfg(feature = "instruments")]
-            let __sp = crate::instruments::span("rounds_2to4");
+            let __sp = crate::instruments::span("rounds_2to4_table");
             #[cfg(feature = "instruments")]
             let table_start = Instant::now();
 
@@ -3629,6 +3613,15 @@ pub trait IsStarkProver<
 
         #[cfg(feature = "instruments")]
         let phase_start = Instant::now();
+        // Phase-level span for the whole fused region, opened here on the
+        // calling thread. The per-table spans inside it (`*_table`) are one
+        // instance per table and `phase_table.py` sums same-label spans, so
+        // they cannot stand in for the phase wall: their sum runs up to `k`
+        // times over it. This is also the span `LAMBDA_VM_NSYS_CAPTURE_SPAN`
+        // brackets, which needs exactly one instance to start/stop the
+        // profiler around.
+        #[cfg(feature = "instruments")]
+        let __sp = crate::instruments::span("rounds_2to4");
 
         let peak_order = heaviest_first(&peak_estimates);
 
@@ -3680,20 +3673,16 @@ pub trait IsStarkProver<
             proofs.push(result.expect("run_admitted fills every slot")?);
         }
         #[cfg(feature = "instruments")]
+        drop(__sp);
+        #[cfg(feature = "instruments")]
         let table_timings = table_timings_mx.into_inner().unwrap();
         #[cfg(feature = "instruments")]
         {
-            // Aux build/commit are no longer phases of their own: each table's
-            // driver runs them inside the fused region, so these are sums over
-            // concurrent drivers and are a subset of `rounds_2_4`, not addends.
-            let (aux_build_elapsed, aux_commit_elapsed) = crate::instruments::take_aux_phases();
             // Store timing data for the top-level report in prove_with_options.
             // Uses a thread-local to avoid changing multi_prove's return type.
             crate::instruments::store(crate::instruments::MultiProveTiming {
                 prepass: prepass_elapsed,
                 main_commits: main_commits_elapsed,
-                aux_build: aux_build_elapsed,
-                aux_commit: aux_commit_elapsed,
                 rounds_2_4: phase_start.elapsed(),
                 round1_sub: crate::instruments::take_r1_sub(),
                 table_timings,
