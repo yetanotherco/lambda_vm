@@ -627,9 +627,11 @@ mod keccak_tests {
         // Spec emits one IS_BYTE template per byte; ops pair adjacent bytes
         // into ARE_BYTES (20 cxz_left + 200 rho per round, 4 addr per call).
         assert_eq!(are_bytes, 24 * 220 + 4, "AreBytes count");
-        assert_eq!(hwsl, 24 * 120, "Hwsl count");
+        // θ/ρ halfword shifts are enforced by inline μ-gated identities on the
+        // keccak_rnd chip, so no HWSL lookups are emitted (was 24 * 120).
+        assert_eq!(hwsl, 0, "Hwsl count");
         assert_eq!(is_half, 100, "IsHalf count");
-        assert_eq!(ops.len(), 105 + 24 * 1148, "Total bitwise ops");
+        assert_eq!(ops.len(), 105 + 24 * 1028, "Total bitwise ops");
     }
 
     #[test]
@@ -732,9 +734,10 @@ mod keccak_tests {
         );
         assert_eq!(
             keccak_rnd::bus_interactions().len(),
-            1151,
-            "KECCAK_RND: 3 IO + 440 theta + 300 rho + 400 chi + 8 iota \
-             (Cxz_right Byte→Bit drops 40 ARE_BYTES per spec d75944ee; \
+            1031,
+            "KECCAK_RND: 3 IO + 420 theta + 200 rho + 400 chi + 8 iota \
+             (θ/ρ HWSL sends replaced by inline μ-gated shift identities: −20 θ, −100 ρ; \
+             Cxz_right Byte→Bit drops 40 ARE_BYTES per spec d75944ee; \
              ARE_BYTES sends are paired per spec ARE_BYTES interaction signature)"
         );
         assert_eq!(
@@ -765,8 +768,8 @@ mod keccak_tests {
         );
         assert_eq!(
             keccak_rnd::KeccakRndConstraints.meta().len(),
-            20,
-            "KECCAK_RND: 20 IS_BIT(μ; Cxz_right_bit) per spec d75944ee"
+            140,
+            "KECCAK_RND: 20 IS_BIT(μ; Cxz_right_bit) + 20 θ + 100 ρ inline shift identities"
         );
     }
 }

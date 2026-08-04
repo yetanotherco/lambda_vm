@@ -845,6 +845,9 @@ fn verify_epoch(
         None => return Ok(false),
     };
 
+    stark::profile_markers::step_marker::<{ stark::profile_markers::STEP_AIRS_AND_BUS_BALANCE_DONE }>(
+    );
+
     if !Verifier::multi_verify_views(&refs, proof, &mut seed(), &expected) {
         return Ok(false);
     }
@@ -1003,6 +1006,9 @@ fn verify_global(
     for air in &gm_airs {
         refs.push(air as AirRef);
     }
+
+    stark::profile_markers::step_marker::<{ stark::profile_markers::STEP_AIRS_AND_BUS_BALANCE_DONE }>(
+    );
 
     Verifier::multi_verify_views(
         &refs,

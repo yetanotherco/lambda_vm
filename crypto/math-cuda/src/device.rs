@@ -186,6 +186,7 @@ pub struct Backend {
     // row-major NTT kernels
     pub bit_reverse_row_major: CudaFunction,
     pub ntt_dit_level_row_major: CudaFunction,
+    pub ntt_dit_8_levels_row_major: CudaFunction,
     pub pointwise_mul_row_major: CudaFunction,
     pub matrix_transpose_strided: CudaFunction,
 
@@ -198,6 +199,7 @@ pub struct Backend {
     pub keccak_comp_poly_leaves_ext3: CudaFunction,
     pub keccak_fri_leaves_ext3: CudaFunction,
     pub keccak_merkle_level: CudaFunction,
+    pub keccak_merkle_tail: CudaFunction,
     pub merkle_gather_paths: CudaFunction,
 
     // barycentric.cubin
@@ -214,6 +216,7 @@ pub struct Backend {
 
     // fri.cubin
     pub fri_fold_ext3: CudaFunction,
+    pub gather_ext3_at: CudaFunction,
     pub fri_update_twiddles: CudaFunction,
 
     // inverse.cubin
@@ -223,6 +226,7 @@ pub struct Backend {
     pub block_inclusive_scan_rev_ext3: CudaFunction,
     pub apply_block_offsets_rev_ext3: CudaFunction,
     pub batch_inverse_combine_ext3: CudaFunction,
+    pub invert_total_ext3: CudaFunction,
     pub logup_fingerprint_ext3: CudaFunction,
     pub logup_term_ext3: CudaFunction,
     pub logup_row_sum_ext3: CudaFunction,
@@ -412,6 +416,7 @@ impl Backend {
             scalar_mul_batched: ntt.load_function("scalar_mul_batched")?,
             bit_reverse_row_major: ntt.load_function("bit_reverse_row_major")?,
             ntt_dit_level_row_major: ntt.load_function("ntt_dit_level_row_major")?,
+            ntt_dit_8_levels_row_major: ntt.load_function("ntt_dit_8_levels_row_major")?,
             pointwise_mul_row_major: ntt.load_function("pointwise_mul_row_major")?,
             matrix_transpose_strided: ntt.load_function("matrix_transpose_strided")?,
             keccak256_leaves_base_row_major_row_pair: keccak
@@ -425,6 +430,7 @@ impl Backend {
             keccak_comp_poly_leaves_ext3: keccak.load_function("keccak_comp_poly_leaves_ext3")?,
             keccak_fri_leaves_ext3: keccak.load_function("keccak_fri_leaves_ext3")?,
             keccak_merkle_level: keccak.load_function("keccak_merkle_level")?,
+            keccak_merkle_tail: keccak.load_function("keccak_merkle_tail")?,
             merkle_gather_paths: keccak.load_function("merkle_gather_paths")?,
             barycentric_base_batched: bary.load_function("barycentric_base_batched")?,
             barycentric_ext3_batched: bary.load_function("barycentric_ext3_batched")?,
@@ -437,6 +443,7 @@ impl Backend {
             deep_composition_ext3_row: deep.load_function("deep_composition_ext3_row")?,
             bit_reverse_ext3_kernel: deep.load_function("bit_reverse_ext3_interleaved")?,
             fri_fold_ext3: fri.load_function("fri_fold_ext3")?,
+            gather_ext3_at: fri.load_function("gather_ext3_at")?,
             fri_update_twiddles: fri.load_function("fri_update_twiddles")?,
             compute_denoms_ext3: inverse.load_function("compute_denoms_ext3")?,
             block_inclusive_scan_fwd_ext3: inverse
@@ -446,6 +453,7 @@ impl Backend {
                 .load_function("block_inclusive_scan_rev_ext3")?,
             apply_block_offsets_rev_ext3: inverse.load_function("apply_block_offsets_rev_ext3")?,
             batch_inverse_combine_ext3: inverse.load_function("batch_inverse_combine_ext3")?,
+            invert_total_ext3: inverse.load_function("invert_total_ext3")?,
             logup_fingerprint_ext3: logup.load_function("logup_fingerprint_ext3")?,
             logup_term_ext3: logup.load_function("logup_term_ext3")?,
             logup_row_sum_ext3: logup.load_function("logup_row_sum_ext3")?,
@@ -501,6 +509,12 @@ impl Backend {
 
     /// Map `rayon::current_thread_index()` to a slot index, with a defensive
     /// clamp in case the rayon pool grew past the Vec we sized at init.
+    ///
+    /// The per-table scheduler's driver threads are not rayon workers: they
+    /// all resolve to slot 0 and deliberately share one slab. Spreading them
+    /// over per-driver slots costs more in repeated pinned allocation than
+    /// the shared mutex does — the staged transfers are already hidden by
+    /// cross-table overlap.
     fn worker_slot(&self, len: usize) -> usize {
         let idx = rayon::current_thread_index().unwrap_or(0);
         // Should be unreachable with rayon's fixed default pool, but if a
@@ -603,7 +617,9 @@ pub fn backend() -> Result<&'static Backend> {
 ///
 /// Holding this value keeps the staging slot's mutex locked, which is what
 /// makes the whole scheme safe: no other caller (and no capacity growth) can
-/// touch the slab while the DMA is in flight.
+/// touch the slab while the DMA is in flight. Corollary: never call
+/// `htod_via`/`async_dtoh_via` on the same slot from the thread holding a
+/// live `PendingD2H` — the non-reentrant slot mutex self-deadlocks.
 pub struct PendingD2H<'a> {
     staging: std::sync::MutexGuard<'a, PinnedStaging>,
     n_bytes: usize,
@@ -618,6 +634,108 @@ impl Drop for PendingD2H<'_> {
     fn drop(&mut self) {
         let _ = self.staging.sync_event();
     }
+}
+
+/// Chunk size for [`htod_via`]'s staged upload — the upper bound a single H2D
+/// puts on a staging slot's page-locked footprint. 64 MB is large enough to
+/// amortize the per-chunk DMA launch + event sync, small enough to keep the
+/// pinned slab independent of trace size.
+const HTOD_CHUNK_BYTES: usize = 64 << 20; // 64 MB
+
+/// Host→device copy staged through the pinned slot, in fixed-size chunks: each
+/// chunk is one host memcpy into pinned memory + one async DMA, instead of the
+/// driver's internal pageable staging (small chunks; 2-3x slower for
+/// multi-hundred-MB traces and it convoys under multi-thread load). Blocks
+/// until the last DMA lands, so the slot and `src_host` are both reusable on
+/// return.
+///
+/// Chunking caps the slot's page-locked footprint at [`HTOD_CHUNK_BYTES`]
+/// regardless of trace size. This matters on the device-only path
+/// (`retain_host_lde = false`): there is no [`async_dtoh_via`] drain to size
+/// the slot, so `htod_via` is its only writer — an uncapped copy would grow
+/// the per-worker slab to a whole trace and, being grow-only, never shrink it.
+/// The host-retaining path is unaffected: its later `async_dtoh_via` grows the
+/// same slot to the full LDE anyway, and we simply reuse the first chunk of it.
+pub fn htod_via<T: cudarc::driver::DeviceRepr>(
+    stream: &Arc<CudaStream>,
+    slot: &Mutex<PinnedStaging>,
+    ctx: &CudaContext,
+    src_host: &[T],
+    dst: &mut cudarc::driver::CudaViewMut<'_, T>,
+) -> Result<()> {
+    use cudarc::driver::DevicePtrMut;
+    assert!(
+        dst.len() >= src_host.len(),
+        "htod_via: destination shorter than source"
+    );
+    let n_bytes = std::mem::size_of_val(src_host);
+    if n_bytes == 0 {
+        return Ok(());
+    }
+    let elem_size = std::mem::size_of::<T>();
+    // Chunk in whole elements so a `T` never straddles a chunk boundary.
+    let chunk_elems = (HTOD_CHUNK_BYTES / elem_size.max(1)).max(1);
+
+    let mut staging = slot.lock().unwrap();
+    // Only ask for a chunk's worth of pinned memory (or the whole copy when
+    // smaller). If another path (`async_dtoh_via` on the host-retaining flow)
+    // already grew this slot larger, it stays larger — grow-only — and we just
+    // use the first chunk of it.
+    let want_u64 = (chunk_elems * elem_size)
+        .div_ceil(8)
+        .min(n_bytes.div_ceil(8));
+    staging.ensure_capacity(want_u64, ctx)?;
+    ctx.bind_to_thread()?;
+
+    // SAFETY: `device_ptr_mut` yields the destination base pointer and orders
+    // the device writes on `stream`; `dst.len() >= src_host.len()` (asserted),
+    // so every chunk's byte range stays within `dst`.
+    let (dst_base, _record) = dst.device_ptr_mut(stream);
+    // Declared after the slot's MutexGuard so it drops FIRST: once a chunk's
+    // DMA is in flight, any `?`-return below must drain the stream before the
+    // guard releases the slot, or the next locker's `ensure_capacity` could
+    // `cuMemFreeHost` the slab while the device is still reading it. Same
+    // hazard `async_dtoh_via` guards against on its record-event failure.
+    let mut drain = DrainOnErr {
+        stream,
+        armed: false,
+    };
+    let src = src_host.as_ptr() as *const u8;
+    let n_elems = src_host.len();
+    let mut elem_off = 0usize;
+    while elem_off < n_elems {
+        let this_elems = (n_elems - elem_off).min(chunk_elems);
+        let this_bytes = this_elems * elem_size;
+        let byte_off = elem_off * elem_size;
+        // SAFETY: the pinned slab holds at least `chunk_elems * elem_size`
+        // bytes (or the whole copy when smaller). The previous chunk's DMA is
+        // synced below before this memcpy overwrites the slab, so the slab is
+        // never read (by an in-flight DMA) and written at the same time.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.add(byte_off), staging.ptr as *mut u8, this_bytes);
+            let r = cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+                dst_base + byte_off as u64,
+                staging.ptr as *const core::ffi::c_void,
+                this_bytes,
+                stream.cu_stream(),
+            )
+            .result();
+            // Armed even on failure: the driver may have enqueued the copy
+            // before reporting the error.
+            drain.armed = true;
+            r?;
+        }
+        // Single-buffered: wait for this chunk's DMA before the next memcpy
+        // reuses the slab. Both calls can fail with the DMA still in flight,
+        // which is what `drain` covers.
+        staging.record_event(stream)?;
+        staging.sync_event()?;
+        // This chunk has landed; nothing is reading the slab until the next
+        // iteration re-arms.
+        drain.armed = false;
+        elem_off += this_elems;
+    }
+    Ok(())
 }
 
 /// Enqueue an async D2H of `n_elems` of `src` into the pinned slab of `slot`,

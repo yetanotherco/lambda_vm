@@ -7,17 +7,35 @@ use crate::vm::{
 
 const REGULAR_PC_UPDATE: u64 = 4;
 
-pub enum SyscallNumbers {
-    // Placeholder discriminant. The actual syscall value is KECCAK_SYSCALL_NUMBER.
+/// Declares `SyscallNumbers` and derives `ALL` from the same variant list, so a
+/// syscall added to the enum is enumerated by everything driven off `ALL` (the
+/// CLI's accelerator-parity test) without a second list to keep in sync.
+macro_rules! syscall_numbers {
+    ($($(#[$meta:meta])* $variant:ident = $discriminant:literal,)+) => {
+        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+        pub enum SyscallNumbers {
+            $($(#[$meta])* $variant = $discriminant,)+
+        }
+
+        impl SyscallNumbers {
+            /// Every variant, generated alongside the enum.
+            pub const ALL: &'static [SyscallNumbers] = &[$(SyscallNumbers::$variant,)+];
+        }
+    };
+}
+
+syscall_numbers! {
+    /// Placeholder discriminant. The actual syscall value is `KECCAK_SYSCALL_NUMBER`.
     KeccakPermute = 0,
     Print = 1,
     Panic = 2,
     Commit = 64,
     Halt = 93,
-    // Placeholder discriminant. The actual syscall value is ECSM_SYSCALL_NUMBER.
+    /// Placeholder discriminant. The actual syscall value is `ECSM_SYSCALL_NUMBER`.
     Ecsm = 94,
-    // Placeholder discriminant. The actual syscall value is DMA_MEMCPY_SYSCALL_NUMBER.
-    // DMA memcpy chunks are proven by the dedicated DMA table.
+    /// Placeholder discriminant. The actual syscall value is
+    /// `DMA_MEMCPY_SYSCALL_NUMBER`. DMA memcpy chunks are proven by the
+    /// dedicated DMA table.
     DmaMemcpy = 95,
     // Placeholder discriminant. The actual syscall value is DMA_MEMSET_SYSCALL_NUMBER.
     // DMA memset chunks are proven by the dedicated DMA_SET table.
@@ -77,9 +95,25 @@ impl TryFrom<u64> for SyscallNumbers {
 pub enum Accelerator {
     Keccak,
     Ecsm,
+    Dma,
 }
 
 impl SyscallNumbers {
+    /// The raw `a7` value this syscall is invoked with. The accelerator numbers
+    /// exceed `isize::MAX`, so they can't be enum discriminants.
+    pub fn raw(self) -> u64 {
+        match self {
+            SyscallNumbers::KeccakPermute => KECCAK_SYSCALL_NUMBER,
+            SyscallNumbers::Ecsm => ECSM_SYSCALL_NUMBER,
+            SyscallNumbers::DmaMemcpy => DMA_MEMCPY_SYSCALL_NUMBER,
+            SyscallNumbers::DmaMemset => DMA_MEMSET_SYSCALL_NUMBER,
+            SyscallNumbers::Print => SyscallNumbers::Print as u64,
+            SyscallNumbers::Panic => SyscallNumbers::Panic as u64,
+            SyscallNumbers::Commit => SyscallNumbers::Commit as u64,
+            SyscallNumbers::Halt => SyscallNumbers::Halt as u64,
+        }
+    }
+
     /// The accelerator this syscall drives, if any. Exhaustive `match self`:
     /// adding a `SyscallNumbers` variant is a compile error here, so a new
     /// accelerator can't be silently missed by counters that consume this.
@@ -87,12 +121,11 @@ impl SyscallNumbers {
         match self {
             SyscallNumbers::KeccakPermute => Some(Accelerator::Keccak),
             SyscallNumbers::Ecsm => Some(Accelerator::Ecsm),
+            SyscallNumbers::DmaMemcpy | SyscallNumbers::DmaMemset => Some(Accelerator::Dma),
             SyscallNumbers::Print
             | SyscallNumbers::Panic
             | SyscallNumbers::Commit
-            | SyscallNumbers::Halt
-            | SyscallNumbers::DmaMemcpy
-            | SyscallNumbers::DmaMemset => None,
+            | SyscallNumbers::Halt => None,
         }
     }
 }
