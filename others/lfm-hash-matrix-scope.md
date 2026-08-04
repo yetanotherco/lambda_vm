@@ -330,6 +330,65 @@ queries / grinding 20 (entry 10's rule).
 
 ---
 
+## 2.4 What already exists in-tree — searched structurally, and it changes §4's risks
+
+I ran this myself after the dispatched inventory leg failed to report. Method note
+worth recording because it nearly cost me a false claim: my first pass used
+`grep -r --include=*.rs` **unquoted**, which the shell tried to glob and failed with
+"no matches found" — indistinguishable from grep finding nothing. Two of my
+"nothing exists" readings were shell errors, not evidence. Re-run quoted.
+
+Searched: `find` over every `.rs`/`.toml` in the repo for
+`blake|poseidon|rescue|rpo|monolith|griffin|sha2|sha256|anemoi|reinforced`; then
+`grep -rn --include='*.rs'` (quoted) for the same terms plus `hades_permutation`,
+`PermutationParameters`; then read the files found.
+
+**FOUND — a Poseidon-original skeleton (VERIFIED):** `crypto/crypto/src/hash/poseidon/`
+(96 + 45 lines). A `Poseidon` trait over `PermutationParameters` whose
+`hades_permutation` is `N_FULL_ROUNDS/2` full rounds → `N_PARTIAL_ROUNDS` partial →
+`N_FULL_ROUNDS/2` full (`mod.rs:28-41`). **That is Poseidon-original's HADES
+structure, and it independently confirms the round SHAPE my §2.2 estimate assumed.**
+The trait carries `RATE`, `CAPACITY`, `ALPHA`, `N_FULL_ROUNDS`, `N_PARTIAL_ROUNDS`,
+`MDS_MATRIX`, `ROUND_CONSTANTS` (`parameters.rs:11-27`), with a default `mix`.
+
+**But it has NO concrete instance.** `grep` for `PermutationParameters for` /
+`impl PermutationParameters` across every `.rs` in the repo returns nothing, so
+there is no parameter set, no round constants, no MDS matrix and no field binding
+anywhere in-tree. The permutation is a generic skeleton, not a usable hash.
+
+**FOUND — Poseidon Merkle backends (VERIFIED):** `TreePoseidon<P: Poseidon>`
+(`crypto/crypto/src/merkle_tree/backends/field_element.rs:50-71`) and
+`BatchPoseidonTree<P>` (`field_element_vector.rs:206`) both implement
+`IsMerkleTreeBackend` with `Node = Data = FieldElement<P::F>` — i.e. a
+**field-element** tree, next to the byte-oriented `Digest`-generic backend in the
+same file. So the commitment layer is already a trait with a field-native Poseidon
+implementation behind it. UNVERIFIED, and important: whether the *prover* is generic
+over that trait or pins a concrete backend. I did not establish it.
+
+**FOUND — sha256 AIR SPECS (VERIFIED as files, not as an AIR):** `spec/src/sha256.toml`,
+`sha256round.toml`, `sha256msgsched.toml`, `sha256consts.toml` — 749 lines. I found
+no generated Rust AIR for them in `prover/src` or `crypto`. Relevance: sha256 is
+bit-oriented like blake, so this is the closest in-tree precedent for what a blake
+AIR's shape and effort look like — worth reading before costing blake.
+
+**ABSENT — blake, Rescue/RPO, Monolith, Griffin, Anemoi: no AIR and no software
+implementation, in any spelling.** One trap resolved: `monolith` matches 26 times
+across `prover/src` (`statement.rs`, `paged_mem.rs`, `page.rs`, `lib.rs`,
+`recursion.rs`), and every occurrence is the *monolithic proof* concept, nothing to
+do with the Monolith hash. A term-only search would have reported a Monolith
+implementation that does not exist.
+
+**Consequence for §4's worst risk — it shrinks but does not vanish.** The oracle
+problem is no longer "write a Poseidon from nothing and check it against itself".
+The HADES structure is in-tree and reviewed, and the remaining input is a
+**parameter set** (α, round counts, MDS, round constants for the chosen field and
+`t = 12`), which must come from a published reviewed source. Route that keeps it
+additive: implement `PermutationParameters` for a LOCAL type inside
+`prover/src/lfm/` — a foreign trait on a local type needs no `crypto/**` edit,
+where adding a parameter set WOULD be an always-stop change.
+
+---
+
 ## 3. Build inventory
 
 Split by the standing-decisions boundary. **Nothing on the critical path for a
@@ -349,9 +408,13 @@ CELLS measurement touches `crypto/**` or `prover/src/tables/**`.**
 
 - **An inner prover under the candidate hash.** To VERIFY a real proof committed
   under candidate `H`, the inner prover must commit under `H` — transcript, Merkle
-  backend, grinding. That is production `crypto/**`. INHERITED/UNRESOLVED: I
-  dispatched a leg to measure this blast radius and it had not reported when I
-  wrote this; §4 assumes it is invasive and routes around it.
+  backend, grinding. UNRESOLVED, and §2.4 partly overturns my first guess: the
+  commitment layer is a TRAIT (`IsMerkleTreeBackend`) that already has a
+  field-element Poseidon implementation, so the Merkle half may be additive rather
+  than invasive. What I did NOT establish is whether the prover is generic over that
+  trait or pins a concrete backend, nor anything about the transcript or grinding.
+  **Do not read "additive" into this — read "cheaper to find out than I assumed".**
+  §3.3's limit stands either way: the cells measurement does not need it.
 - **Widening `HASH_STATE_FELTS`** past 12 to cut the 2.125× rate penalty (§1.2).
   The contract is frozen and the bus tuples/opcodes are pinned; this is a team-lead
   decision, and it is the single cleanest lever on the candidate's `P`.
@@ -397,17 +460,31 @@ proof under `H` exists. That is a fair trade for the decision the matrix feeds
 
 **Risks, worst first:**
 
-- **The oracle problem for slice B.** A hash gadget must be differentialled against
-  a reference implementation, and there is none in-tree for any candidate
-  (UNRESOLVED — my inventory leg had not reported; treat as unconfirmed). Without
-  one, "my Poseidon" is checked only against itself, which rule 3 says looks exactly
-  like a wrong implementation. Options: vendor published test vectors, or add a
-  software reference and differential the chip against it (then rule 7 applies —
-  the moment the chip delegates to the reference, the differential dies and must be
-  replaced by an absolute property). **This is the risk most likely to cost real
-  time, and it should be resolved before slice B starts, not during.**
-- **My round-count estimates are unverified** (§2.2). They set `m`, hence the whole
-  candidate column. Cheap to fix: read the corpus first.
+- **The oracle problem for slice B — DOWNGRADED by §2.4, not eliminated.** A HADES
+  permutation with Poseidon-original's exact round structure is already in-tree
+  (`crypto/crypto/src/hash/poseidon/`), so the chip can be differentialled against
+  a reviewed software reference rather than against itself. What is missing is a
+  concrete `PermutationParameters` — and that is a *cryptographic* input, not an
+  engineering one (next risk). Rule 7 still applies at the end: once the chip and
+  the reference share a code path, the differential dies and must be replaced by an
+  absolute property of the output.
+- **Parameter selection is the real remaining risk, and it is not mine to make.**
+  α, round counts, the MDS matrix and the round constants for the chosen field at
+  `t = 12` must come from a published, reviewed source. Picking them ad hoc yields
+  a measured column for a hash nobody would ship — decision-irrelevant, exactly the
+  failure mode the Poseidon2 ban exists to avoid. Note the in-tree skeleton is
+  field-generic (`type F: IsPrimeField`), so **which field the candidate is over is
+  itself an open input** I did not resolve.
+- **My round-count estimates are partly corroborated, not verified** (§2.2, §2.4).
+  The HADES *structure* (R_F/2 · R_P · R_F/2) is confirmed from in-tree source; the
+  specific 8-full/22-partial counts are still my own domain knowledge and set `m`.
+  Cheap to fix: read the corpus, which I could not (below).
+- **Four research legs never reported.** I dispatched agents for the inner-prover
+  hash blast radius, the in-tree AIR inventory, the corpus's Part I.7 candidate
+  data, and a full socket spec; none had returned when I closed. I covered the
+  inventory myself (§2.4) and the socket myself (§0, §1.1) — the **corpus data and
+  the inner-prover blast radius are the two genuine gaps in this report**, and both
+  are cheap for wave 9 to close.
 - **Parameter selection is a cryptographic act.** Round counts, MDS matrix and round
   constants for Poseidon-original over Goldilocks at t=12 must come from a
   published, reviewed source, not from me. Picking them ad hoc would produce a
