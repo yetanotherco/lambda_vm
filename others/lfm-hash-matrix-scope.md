@@ -41,8 +41,17 @@ So a candidate column is **not** a variation on the keccak column. It is socket 
 carrying the epoch verifier's real workload for the first time, which is why the
 matrix's other columns "ARE the number" rather than a refinement of it.
 
-**Recommendation, in one line: build Poseidon-original first, and pin the
-permutation-count axis before building any permutation at all.** Reasons in §4.
+**★ THE RESULT THAT MATTERS MOST, and it is not the one I expected: every candidate
+fits the 124 GiB box.** Keccak's wrap needs 290–350 GiB; the predicted candidates
+span ~48 GiB (RPO) to ~79 GiB (Blake, the only one with a real in-AIR measurement).
+**The hash decision is therefore not cost-gated** — it is very nearly a purely
+cryptographic choice, which is a far better position than my first pass described.
+Matrix in §2.3, my reversal on blake in §2.5.
+
+**Recommendation, in one line: build Poseidon-original first — not because it is
+cheapest, but because it has a direct `poseidon1-air` donor in the vendored Plonky3
+tree, an in-tree HADES skeleton, and zero AIR data anywhere in the corpus, so its
+column is the one that adds information rather than confirming it.** Reasons in §4.
 
 ---
 
@@ -207,11 +216,66 @@ P_candidate ∈ [190,569 , 193,569]  =  1.614x – 1.639x keccak's 118,080
 
 ### 2.2 Cells per permutation
 
-⚠ **PROVENANCE, stated plainly: the round counts and S-box degrees below are my
-own domain knowledge, not read out of this repo and not (yet) confirmed against
-the corpus.** They are the weakest link in this report and wave 9 should check them
-against `recursion_architectures.md` before building. Everything about how a round
-count becomes a cell count IS verified (§1, §1.1).
+**REVISED after the corpus extraction landed.** My first pass estimated round counts
+from my own domain knowledge; the corpus supplies a MEASURED anchor that is better
+than my estimate and, critically, one that normalizes onto our socket exactly.
+
+**The normalization is free, and this is the single luckiest fact in the leg.** The
+corpus's primary hash artifact (Miden's BlakeG addendum) states: *"BlakeG keeps
+Poseidon2's exact sponge geometry (state 12, rate 8, digest 4), so invocation counts
+are hash-invariant and the whole price is per-invocation trace cost."* **State 12,
+rate 8, digest 4 is exactly our frozen `LFM_HASH` contract**
+(`HASH_STATE_FELTS = 12`, rate 2 cells = 8 felts, `HASH_DIGEST_FELTS = 4`). So the
+corpus's per-2-to-1 cell figures transfer to our socket directly, and every
+field-native candidate shares ONE permutation count — the `P ≈ 192,000` measured in
+§2.1.
+
+Measured anchors from the corpus, per 2-to-1 compression (Miden, **Goldilocks — our
+field**):
+
+| | main cells | aux (EF) | base-equiv `m+3a` | provenance |
+|---|---|---|---|---|
+| Poseidon2 (the dead baseline) | 256 | 16 | 304 | MEASURED, 16-col AIR × 16 rows/perm |
+| BlakeG 32-row | 4,096 | 768 | **6,400** | MEASURED — 13.9× main, 48× aux |
+| BlakeG 64-row (1st gen) | 5,120 | 768 | 7,424 | MEASURED |
+
+Plus, for any Blake-class candidate, an `And8Lookup` table AIR at a **fixed 2¹⁶ × 10
+= 655,360 cells in every proof regardless of workload** (the corpus notes our `RANGE`
+chip can absorb that role, so it need not add a chip).
+
+⚠ **My own estimate was 2× CONSERVATIVE, and I am keeping it as the pessimistic
+bound rather than discarding it.** I derived ~608 main cells for Poseidon-original
+in a one-row layout; Miden's measured Poseidon2 at t=12 over Goldilocks is 256 main.
+Their 16 columns × 16 rows beats my unrolled 608 because a row-per-round layout
+reuses the state columns instead of allocating fresh ones per round. Since the
+corpus rates Poseidon-original at **≈1× Poseidon2 in-AIR** ("AIR cost is
+S-box-dominated; round counts match"), 304 base-equivalent is the central case and
+617 is my conservative bound. Both are in the matrix.
+
+⚠ **PROVENANCE of each candidate's figure, per the corpus's own marking** — this is
+the part that decides how much weight each column carries:
+
+- **Blake: the ONLY candidate with a real in-AIR measurement.** 13.9× main / 48× aux
+  vs Poseidon2, read off Miden's BlakeG branches. Also the only one with a shipped
+  production existence proof (Airbender runs blake2s-7 as its only hash), **caveat:
+  at an 80-bit target; ours is 100/128-bit**, which raises query counts and the bill
+  proportionally.
+- **RPO: a ROW-COUNT ratio, not a benchmark.** 0.5× is `HASH_CYCLE_LEN` 8 vs 16 read
+  off Miden source at an *assumed-equal column count*. The corpus does not check
+  whether an RPO AIR needs the same 16 columns, and RPO's inverse S-box typically
+  needs its own witness per lane. **Read 0.5× as rows, with columns unverified.**
+- **Poseidon-original: reasoned, with ZERO AIR data anywhere in the corpus.** The
+  ≈1× is inferred from S-box dominance and matching round counts. What IS measured
+  is its *migration* bill: ZisK's upstream PR = 181 files, +49,324/−13,097.
+- **Monolith: the weakest-evidenced row** — "few×", priced by analogy to Miden's
+  `And8Lookup`, with the native claim coming from the designers' own design goal.
+  The corpus's own verdict: "Watch, don't bet the protocol yet."
+
+The layout constraint remains real and VERIFIED: `max_degree() = 3` for the
+`LFM_HASH` chip (`chips.rs:532-534`), and over-declaration is safe while
+under-declaration is not
+(`prover/src/tests/constraint_set_tests_a.rs:66-74`). An `x⁷` S-box at degree 3
+needs two intermediate columns (`x²`, `x³`, then `x⁷ = (x³)²·x`).
 
 The layout constraint is real and VERIFIED: `max_degree() = 3` for the `LFM_HASH`
 chip (`chips.rs:532-534`), and `max_degree` "is what the engine uses as the
@@ -222,106 +286,84 @@ cells — self-defeating for a memory play. **So every candidate must express it
 S-box in degree ≤ 3, which for `x^7` means two intermediate columns per S-box**
 (`x²`, `x³`, then `x⁷ = (x³)² · x`, degree 3 over columns).
 
-| candidate | S-box | rounds (est.) | S-boxes | `m` est. | `a` est. | base-equiv `m+3a` | vs keccak 77,992 |
-|---|---|---|---|---|---|---|---|
-| keccak (MEASURED) | — | 24 | — | 36,256 | 13,912 | **77,992** | 1.0× |
-| Poseidon-original t=12, **Layout B** | x⁷ | 8 full + 22 partial | 118 | ~608 | 3 | **~617** | **126× cheaper** |
-| Poseidon-original t=12, Layout A | x⁷ | 8 full + 22 partial | 118 | ~1,080 | 90 | ~1,350 | 58× cheaper |
-| RPO t=12 (Layout B) | x⁷ and x^(1/7) | 7 (both layers) | 168 | ~850–1,500 | 3 | ~860–1,510 | 52–91× cheaper |
-| Monolith t=12 | Bars (lookup) | 6 | — | low rows, + a lookup AIR | **>3** | not estimated | needs a lookup table |
-| Blake2s (reduced) | ARX on 32-bit words | 10 (or fewer) | — | **bit-oriented — see below** | **≫3** | not estimated | **NOT expected to be orders cheaper** |
+⚠ **Correction to my own first pass, kept because it decides layout.** I initially
+carried `a = 3` into every layout. Wrong: `aux_cells = rows × ceil(interactions/2)`
+scales with ROWS, so a 30-rows-per-permutation layout pays 90 aux cells (270
+base-equivalent), not 3. This is also why Miden's 16-row Poseidon2 shows 16 aux and
+not 1. Aux count triple, so row count is not free even for a lookup-free hash.
 
-Derivation for Poseidon-original, the one I recommend building (DERIVED from the
-estimated parameters above plus the VERIFIED census formula):
+For a purely algebraic candidate the aux bill is otherwise just the chip's existing
+6 `LfmMem` interactions (`aux_cols = 3` per row); row-to-row state wiring is
+transition constraints, not buses, so it adds none. **The collapse from keccak's
+13,912 aux per permutation is structural** — that number is `KECCAK_RND`'s BITWISE
+lookups, which ARE bus interactions, and an algebraic hash has none.
 
-- 8 full rounds × 12 S-boxes + 22 partial rounds × 1 S-box = 118 S-boxes.
-- **Layout B, fully unrolled, one row per permutation:** `m ≈ 12 + 8 × (12 + 24) +
-  22 × (12 + 2) = 608` value columns, 1 row. `a = 3`, so `m + 3a ≈ 617`.
-- **Layout A, one row per round:** width ≈ 12 state + 12 × 2 intermediates = 36
-  value columns × 30 rows → `m ≈ 1,080`.
+**A Blake-class candidate does NOT get that collapse**, and this is where I have to
+correct myself hardest (see §2.5): its 768 aux per compression is 48× Poseidon2's,
+for exactly the reason keccak's is large. What I got wrong was the conclusion I drew
+from it.
 
-⚠ **Correction to my own first pass, worth stating because it flips the layout
-choice from "either" to "clearly B".** I initially carried `a = 3` into both
-layouts. That is wrong: the census formula is `aux_cells = rows × ceil(interactions/2)`,
-so aux scales with ROWS, and Layout A pays `30 × 3 = 90` aux cells per permutation,
-not 3. Since aux count triple, Layout A's aux term alone is 270 base-equivalent
-cells — it more than doubles Layout A's disadvantage. **Layout B wins on both cell
-count (617 vs 1,350) and on padding** (§2.3's second caveat).
+### 2.3 The predicted matrix, assembled
 
-`a` is 3 in Layout B because Poseidon is purely algebraic: **no lookups, so no new
-bus interactions**, and the chip's existing 6 `LfmMem` interactions are the whole
-aux bill. Row-to-row state wiring, if any, is transition constraints and not buses,
-so it adds no aux.
+One `P` for every field-native candidate (they share the socket's rate-8 sponge, and
+the corpus confirms invocation counts are hash-invariant at this geometry), so the
+matrix is a single multiplication per row. Memory uses the **two-term model** wave 7
+established after falsifying the one-parameter 33.7 B/cell figure: **≈27 B/cell plus
+≈190 MB per sub-proof** (peak RSS carries a per-sub-proof term).
 
-**The aux collapse is the biggest single effect and it is structural, not an
-estimate.** Keccak's `a = 13,912` per permutation exists because `KECCAK_RND`
-lookups into `BITWISE` are bus interactions and `aux_cols = ceil(interactions/2)`.
-An algebraic hash has none. Aux cells are cubic-extension elements and so count
-**triple** in the base-field-equivalent metric — 3 × 13,912 = 41,736 of keccak's
-77,992 per-permutation cells, i.e. **53.5 % of the hash bill is aux alone**, and
-essentially all of it is the bitwise lookups.
+| candidate | base-equiv per perm | `P` | hash cells | **total cells** | vs keccak | projected RSS |
+|---|---|---|---|---|---|---|
+| **keccak — MEASURED, ours** | 77,992 | 118,080 | 9,381.6 M | **11.166 B** | 1.00× | 284 GiB (band 290–350) |
+| RPO (0.5× P2 rows, cols unverified) | 152 | 192,000 | 29.7 M | **1.814 B** | **6.16×** | **48 GiB** |
+| Poseidon-original (corpus ≈1× P2) | 304 | 192,000 | 59.5 M | **1.844 B** | **6.06×** | **49 GiB** |
+| Poseidon-original (MY conservative est.) | 617 | 192,000 | 120.7 M | 1.905 B | 5.86× | 50 GiB |
+| Monolith (few×, band — weakest evidence) | ~850 | 192,000 | 166.9 M | ~1.951 B | ~5.7× | ~52 GiB |
+| **BlakeG 32-row — MEASURED (Miden)** | 6,400 | 192,000 | 1,252.4 M | **3.037 B** | **3.68×** | **79 GiB** |
 
-**Why blake is not in the cheap column.** Blake2s is ARX over 32-bit words: XOR and
-32-bit rotation. In a Goldilocks prime field those are not field operations — they
-need bit decomposition or a lookup table, i.e. the same mechanism that makes
-keccak's aux bill 53.5 % of its cost. So blake's in-AIR character is keccak-like,
-not Poseidon-like. This matters because blake is (INHERITED, team lead) the most
-probable ship choice on cryptographic-trust grounds. **If that is right, the hash
-decision may not buy the 2.8× memory relief the wrap needs at all** — which is
-exactly the sort of finding the matrix exists to surface, and it is the reason
-blake's column is decision-critical even though Poseidon's is cheaper to build.
+Blake's row includes the fixed 655,360-cell `And8Lookup` table (negligible at this
+scale, and our `RANGE` chip can absorb the role rather than adding a chip).
 
-### 2.3 The predicted matrix column, assembled
+**★ THE HEADLINE, AND IT REVERSES WHAT I TOLD YOU FIRST: every candidate fits the
+124 GiB box, blake included.** The keccak wrap needs 290–350 GiB; the cheapest
+candidate needs ~48 GiB and the most expensive ~79 GiB. The hash choice is therefore
+**not** gated on cost — all four make the production wrap provable on hardware we
+have. That reframes the decision as almost purely cryptographic, which is a much
+better position than the one my first pass described.
 
-DERIVED, using conservative assumptions (§1's residue held fixed, which favours
-the candidate; `P` as an interval):
+Two robustness notes:
+- **The residue dominates every candidate row.** Once the hash is cheap, 1.784 B of
+  a ~1.85 B total is the already-measured non-hash verifier. So the algebraic rows
+  are insensitive to their (weakly-evidenced) cell estimates: RPO vs Poseidon vs
+  Monolith differ by 7 % in total cells while their per-permutation estimates differ
+  by 5.6×. **Choosing among the algebraic candidates on predicted wrap size is
+  choosing on noise.**
+- Blake is the one row where the hash still matters — 1.25 B of its 3.04 B — so it
+  is also the only row whose estimate is worth refining, and it is the row that is
+  already measured.
 
-```
-candidate total = P_cand × (m + 3a)_cand × 1.019   +   1,784,197,396
-```
+### 2.4 The 2-to-1 normalization, stated rather than assumed
 
-For Poseidon-original, with `P ≈ 192,000` MEASURED (§2.1) and the two free design
-choices — layout and whether the candidate's AIR gets a chunking sibling — taken at
-BOTH extremes, so the answer is a box rather than a point:
+The corpus's cross-system figures are per **2-to-1 compression**; ours are keccak
+**permutations** at a 136-byte rate. Comparing them directly would be wrong, so the
+split at the production shape (DERIVED from §2.1's measured decomposition):
 
-| layout | padding | hash cells | total | vs 11.17 B | projected RSS |
-|---|---|---|---|---|---|
-| **B** (1 row/perm, 617) | chunked, 1.9 % | 0.121 B | **1.905 B** | **5.86× smaller** | **59.8 GiB** |
-| **B** | unchunked, pads to 2¹⁸ (+36.5 %) | 0.162 B | 1.946 B | 5.74× smaller | 61.1 GiB |
-| A (30 rows/perm, 1,350) | chunked | 0.264 B | 2.048 B | 5.45× smaller | 64.3 GiB |
-| A | unchunked, pads to 2²³ | 0.378 B | 2.162 B | 5.17× smaller | 67.8 GiB |
+| | permutations | is it a 2-to-1 compression? |
+|---|---|---|
+| Merkle parents + FRI layer steps | 47,742 | **yes** — 64 bytes / 8 felts, one block either way |
+| wide trace-leaf absorbs | 67,671 | **no** — up to 3,456 felts, a sponge run |
+| spine (transcript) | 2,667 | no — absorption |
 
-**Every cell of that table is inside the 124 GiB box, and the spread across it is
-1.13× while the win is 5.2–5.9×.** That is the robustness claim, and it is what
-makes this prediction worth acting on despite resting on an estimated round count:
-the conclusion survives being wrong about layout, wrong about padding, and wrong
-about `m` by a factor of two.
+**So our apples-to-apples compression count is ≈47,742, i.e. 6.2× Airbender's 7,685
+— not the 15.4× a naive 118,080/7,685 gives, and nowhere near the 117× the corpus
+flagged for the old guest verifier at ~900,000.** The LFM has already retired most
+of the corpus's headline anomaly; that is worth recording, because §I.7's
+"recursion diverges at a Blake-class hash" conclusion was reasoned at ~900,000
+compressions and does not transfer to this machine at 47,742. It is the main reason
+blake lands at 3.68× rather than the corpus's ~220 %.
 
-**The headline that falls out: Poseidon-original plausibly brings the production
-wrap from 350.6 GiB to roughly 60–63 GiB, i.e. inside the 124 GiB box** — and with
-the `P` axis measured, the only estimated input left is the round count. Note what
-does the work — once the hash is cheap, the *residue* dominates (1.78 B of ~1.9 B),
-so the prediction is insensitive to the hash estimate and mostly sensitive to a
-number that is already measured. That is a robustness argument, and it also means
-further hash optimisation past Poseidon buys almost nothing at this shape.
-
-⚠ **Two caveats on the 1.019 padding factor, which I carried over from keccak and
-which does NOT transfer cleanly.** It is `KECCAK_RND`'s chunk padding at the
-production shape (ledger entry 10). A candidate on socket 2 has ONE row per
-permutation, so its trace height is `P` itself and its padding is however far
-`P ≈ 192,000` sits below a power of two — `2^18 = 262,144`, i.e. **a 36 % waste, not
-1.9 %**, unless the candidate's AIR is chunked the way `KECCAK_RND` is. That
-pushes the low end from 0.118 B to ~0.155 B of hash cells and the total from 1.90 B
-to ~1.94 B — still ~5.8× and still inside the box, so it changes no conclusion, but
-it means **the chunking work `chunking.rs` did for keccak will need a sibling for
-the candidate**, and a naive first measurement will read ~36 % high on the hash
-term. Flagging it because it is exactly the kind of thing that gets discovered after
-someone reports a number.
-
-Second: a multi-row layout (Layout A, 30 rows/permutation) makes the trace 30× taller
-and the padding question correspondingly different. `m` is roughly layout-invariant
-but PADDING is not, which is an argument for Layout B (unrolled, one row per
-permutation) beyond its lower cell count.
+⚠ Our leaf term is 59 % of the bill and has **no analogue** in the per-2-to-1
+figures. It is also the term the frozen rate-8 state penalises (§1.2). Any
+cross-system comparison that omits it understates us by 1.6×.
 
 All numbers name their epoch shape: fixture epoch, profile
 `[2 ×14, 3, 4 ×4, 5 ×3, 7, 20]`, 24 sub-proofs, fibonacci guest, 16-cycle
@@ -330,7 +372,41 @@ queries / grinding 20 (entry 10's rule).
 
 ---
 
-## 2.4 What already exists in-tree — searched structurally, and it changes §4's risks
+### 2.5 Where I was wrong about blake, and why
+
+My first pass said: *"Blake2s is ARX on 32-bit words, so it needs the same
+bit-decomposition mechanism that makes keccak's aux 53.5 % of its cost. So blake's
+in-AIR character is keccak-like, not Poseidon-like … the hash decision may not buy
+the 2.8× memory relief the wrap needs at all."*
+
+**The premise was right and the conclusion was wrong.** Blake IS bit-oriented, and it
+does pay a 48× aux penalty against Poseidon2 — that part survives contact with the
+corpus's measurement. What I inferred from it does not, for a reason I had no excuse
+to miss: **keccak-like in mechanism is not keccak-like in magnitude.** Our keccak
+costs 77,992 base-equivalent cells per permutation because `KECCAK_RND` is 1,480
+columns over 24 rows; BlakeG is 128 columns over 32 rows. Same mechanism, **12×
+apart**. Blake lands at 3.68× better than keccak and ~79 GiB — comfortably inside the
+box, not outside it.
+
+Two lessons I would keep:
+1. I reasoned from a *mechanism* to a *cost ratio* without ever multiplying the
+   widths, which the census formula in §1 was sitting right there to do. A ratio
+   claim needs the arithmetic even when the qualitative story is correct.
+2. The brief told me blake was the probable ship choice, and I built a narrative
+   ("the decision-critical column") that made my analysis load-bearing for it. The
+   corpus **renders no pick at all**. Being handed a leading hypothesis is a reason
+   for more falsification, not less.
+
+Also corrected: the brief's framing that blake is "the most probable final ship
+choice" is not what the review says. Ranked by *evidence strength* rather than
+preference: **Blake** (only real in-AIR measurement, plus a shipped 80-bit production
+system) > **RPO** (a rows-only ratio, columns unverified) > **Poseidon-original**
+(reasoned ≈1×, zero AIR data, but a measured 181-file migration bill) > **Monolith**
+("few×", priced by analogy). All four columns are scoped here; none is privileged.
+
+---
+
+## 2.6 What already exists in-tree — searched structurally, and it changes §4's risks
 
 I ran this myself after the dispatched inventory leg failed to report. Method note
 worth recording because it nearly cost me a false claim: my first pass used
@@ -378,6 +454,39 @@ across `prover/src` (`statement.rs`, `paged_mem.rs`, `page.rs`, `lib.rs`,
 do with the Monolith hash. A term-only search would have reported a Monolith
 implementation that does not exist.
 
+### 2.6.1 Donor AIRs — the vendored Plonky3 tree, which the corpus never analyzed
+
+VERIFIED by listing the tree myself: the main checkout's `others/Plonky3` (@ 4aed8fe4)
+carries **`poseidon1-air/`, `poseidon2-air/`, `blake3-air/`, `monolith-air/`,
+`keccak-air/`** as crates, alongside bare permutations in `poseidon1/`, `monolith/`,
+`rescue/`. The corpus explicitly lists Plonky3 as unscoped
+(`recursion_architectures.md:772`: "Candidates still unscoped: `others/leanVM-b`,
+`others/Plonky3`"), so none of this is in the review.
+
+This **materially changes the per-candidate build estimates**, and it reorders them:
+
+| candidate | donor AIR | build risk |
+|---|---|---|
+| **Poseidon-original** | **`poseidon1-air`** — a direct donor for exactly this hash | **lowest** |
+| Monolith | `monolith-air` (+ `monolith/` = Monolith-64 Goldilocks, width 8/16) | low, and un-analyzed by the corpus |
+| Blake | `blake3-air`, plus Miden's BlakeG branches (unmerged, 13→21 files / 3.8→5.1 k lines) | high — bit-oriented, needs the lookup table |
+| **RPO** | **NONE.** Only the permutation (`rescue/src/rpo/goldilocks.rs`, 394 lines); **no `rescue-air` crate exists**, and the corpus's only AIR pointer is Miden git history | **highest** |
+
+⚠ **That inverts the naive ranking.** RPO is the cheapest predicted column (~48 GiB,
+6.16×) and has the *worst* donor situation — its 0.5× is a rows-only ratio with
+unverified columns AND there is no AIR to copy. Poseidon-original is within 7 % of
+RPO on predicted total cells (§2.3's residue argument) and has a direct donor. **So
+the cheapest-looking column is the expensive one to build, and the difference it
+would buy is inside the noise.**
+
+⚠ **A donor warning that transfers, VERIFIED in the corpus**
+(`openvm-port-study-brief.md:214-221`): *"The hash is the wall, and it is worse than
+'swap constants.' `Poseidon2SubAir` is a single-variant enum locked to
+`BabyBearPoseidon2LinearLayers` … Round constants convert to any `F` by type but
+produce numerically meaningless values … A Goldilocks Poseidon2/RPO chip is a **new
+chip of the same shape**, not a parameter change."* Expect a donor to supply
+structure, not code.
+
 **Consequence for §4's worst risk — it shrinks but does not vanish.** The oracle
 problem is no longer "write a Poseidon from nothing and check it against itself".
 The HADES structure is in-tree and reviewed, and the remaining input is a
@@ -406,15 +515,25 @@ CELLS measurement touches `crypto/**` or `prover/src/tables/**`.**
 
 ### 3.2 Always-stop / out of scope for a cells measurement
 
-- **An inner prover under the candidate hash.** To VERIFY a real proof committed
-  under candidate `H`, the inner prover must commit under `H` — transcript, Merkle
-  backend, grinding. UNRESOLVED, and §2.4 partly overturns my first guess: the
-  commitment layer is a TRAIT (`IsMerkleTreeBackend`) that already has a
-  field-element Poseidon implementation, so the Merkle half may be additive rather
-  than invasive. What I did NOT establish is whether the prover is generic over that
-  trait or pins a concrete backend, nor anything about the transcript or grinding.
-  **Do not read "additive" into this — read "cheaper to find out than I assumed".**
-  §3.3's limit stands either way: the cells measurement does not need it.
+- **An inner prover under the candidate hash — ALWAYS-STOP, and it needs the USER,
+  not the team lead.** The inner-prover trace (INHERITED from the dispatched leg via
+  the team lead; I did not verify it myself) is: the transcript **hardcodes**
+  `PlatformKeccak256`; `config.rs` **pins three Merkle aliases**; `ProofOptions` has
+  **no hash field at all**; grinding is hardcoded. The cheapest seam ("Case A") is
+  about **4 files on the CPU path but is non-additive inside `crypto/**`**; the
+  general version ("Case B") additionally breaks a trait and the proof format.
+
+  **Scope it as a proposal, do not build it.** The proposal: a `config.rs`
+  feature-flag seam, a defaulted `D` type parameter on `DefaultTranscript`, and
+  `D`-generic grinding — with the CUDA path and the pinned static commitments
+  costed, since both are affected. That is a `crypto/**` decision and therefore the
+  user's call.
+
+  Note §2.6 found `TreePoseidon`/`BatchPoseidonTree` already implementing
+  `IsMerkleTreeBackend` over field elements, so the Merkle half has an
+  implementation waiting. **Do not read "additive" into that** — whether the prover
+  is generic over the trait or pins a concrete backend is exactly what `config.rs`
+  pinning three aliases suggests it is not.
 - **Widening `HASH_STATE_FELTS`** past 12 to cut the 2.125× rate penalty (§1.2).
   The contract is frozen and the bus tuples/opcodes are pinned; this is a team-lead
   decision, and it is the single cleanest lever on the candidate's `P`.
@@ -422,7 +541,32 @@ CELLS measurement touches `crypto/**` or `prover/src/tables/**`.**
   blowup 2; almost certainly a net loss, but it is a framework-ceiling question and
   rule "report a ceiling rather than working around it" applies.
 
-### 3.3 The measurement this buys, and what it does NOT buy
+### 3.3 TWO STAGES — and stage 1 must not block on stage 2's authorization
+
+This is the governance shape the matrix should be built in, so that no column waits
+on a `crypto/**` decision:
+
+**Stage 1 — UNGATED, entirely inside `prover/src/lfm/**` (mine to build).**
+A candidate's column factorises into two independently obtainable numbers:
+
+```
+column = permutations-per-verify  ×  cells-per-permutation
+         └─ GEOMETRY: derived from the wave-7 census once rate/digest is
+            normalized (§2.1 DONE, §2.4 normalization stated)
+         └─ MEASURABLE: host a candidate AIR behind the socket and
+            differential it against a reference implementation
+```
+
+Both halves are additive LFM work. **That yields measured-not-projected columns for
+the whole matrix without touching `crypto/**` at all** — which is the point, because
+it means the hash decision gets real numbers before anyone has to authorize anything.
+
+**Stage 2 — GATED on the user's `crypto/**` call.** A genuinely candidate-hashed
+inner proof, verified end to end. This validates stage 1's columns against reality
+and is the only thing that makes the column a cryptographic claim rather than a
+geometric one. It needs §3.2's proposal authorized first.
+
+### 3.4 The measurement this buys, and what it does NOT buy
 
 Slices A–E produce a **geometry** measurement: the true cell cost of an epoch
 verifier that hashes with the candidate, at the real production shape. It is the
@@ -449,14 +593,31 @@ proof under `H` exists. That is a fair trade for the decision the matrix feeds
    ~0.07 B cells of a ~1.9 B total (4 %), because the residue dominates once the
    hash is cheap. **That is a decision this measurement retires** rather than
    escalates.
-2. **Then Poseidon-original** (slices B, C, E) — algebraic, so `a` stays at 3 and
-   the aux collapse (53.5 % of the hash bill) is banked; fits degree 3 with two
-   intermediates per S-box; and it is where the ecosystem is going now that
-   Poseidon2 is broken. This validates socket 2 under real load for the first time.
-3. **Then blake**, because its column is the one most likely to CHANGE the
-   decision (§2.2). Expect it to need a lookup/bit-decomposition mechanism, so
-   budget it as a keccak-class build, not a Poseidon-class one.
-4. Monolith and RPO only if 2 and 3 leave the decision open.
+2. **Then Poseidon-original** (slices B, C, E) — **but for a different reason than
+   my first pass gave.** Not "cheapest column": §2.3 shows the algebraic candidates
+   are within 7 % of each other on total cells, so cheapness is not a
+   discriminator. The reasons that survive are: a **direct `poseidon1-air` donor**
+   (§2.6.1), an in-tree HADES skeleton whose round structure is already confirmed,
+   the **lowest build risk of any candidate**, and — decisively — the corpus has
+   **zero AIR data** for it, so measuring it *adds* information instead of
+   re-confirming a number Miden already published. It also validates socket 2 under
+   real load for the first time.
+3. **Then blake.** Its column is already measured externally (13.9×/48×), so
+   building it mainly **calibrates our cost model against an independent
+   measurement** — worth real money for trusting every other column. Budget it as
+   the expensive build: bit-oriented, needs the lookup table (our `RANGE` can absorb
+   the `And8Lookup` role), and Miden's own effort was 13→21 files / 3.8→5.1 k lines.
+4. **Then Monolith** — `monolith-air` is a Goldilocks donor and the corpus never
+   analyzed it, so this is the second-highest information-per-effort column.
+5. **RPO last, despite being the cheapest predicted column.** It has no `rescue-air`
+   donor anywhere (only Miden git history), its 0.5× is rows-only with unverified
+   columns, and what it would buy over Poseidon-original is ~1 GiB of a ~49 GiB wrap.
+   **Highest build risk for the smallest real difference.**
+
+**A cheap cross-check available before any of this:** blake's measured 13.9×/48×
+against Poseidon2 can be run through §1's census formula *today*, at our `P`. I did
+exactly that in §2.3 and it is what produced the reversal in §2.5. Any candidate the
+corpus has numbers for should get this treatment before it gets a build.
 
 **Risks, worst first:**
 
@@ -499,3 +660,52 @@ proof under `H` exists. That is a fair trade for the decision the matrix feeds
   could report a 2,108× win. Guard: the report and any test that prints it should
   carry the "NOT cryptographic" label the source does.
 
+
+---
+
+## 5. Corrections ledger — claims elsewhere that this document supersedes
+
+Recorded so they stop propagating.
+
+1. **The brief's "blake is the most probable final ship choice."** The review renders
+   NO pick (§2.5). Ranked by evidence strength: Blake > RPO > Poseidon-original >
+   Monolith. Scope all four; privilege none.
+
+2. **My own "the hash decision may not buy the 2.8× the wrap needs."** Wrong — every
+   candidate buys it, blake included (§2.3, §2.5). Right premise, unmultiplied
+   arithmetic.
+
+3. **The one-parameter 33.7 B/cell memory model — FALSIFIED** by wave 7's follow-up.
+   Use the two-term fit: **≈27 B/cell + ≈190 MB/sub-proof**, and the keccak wrap
+   ceiling is a **band, 290–350 GiB (2.3–2.8× the box)**, not a point. Every RSS
+   figure in this document uses the two-term model. My earlier 59.8–67.8 GiB
+   Poseidon figures were computed on the falsified coefficient and are superseded by
+   §2.3's ~49 GiB.
+
+4. **The RESUME's wave-7 line "one options change plus the hash swap."** Wrong on the
+   options half: `ProofOptions` has **no hash field at all** (§3.2), so there is no
+   options change to make — the swap is a `crypto/**` seam, always-stop, user's call.
+
+5. **My own status-log implication that `chunking.rs`'s commit 6dbc5795 was the live
+   agent's new work.** It is dated 2026-07-29 — the ORIGINAL chunking leg. At the
+   time I looked there were **zero commits past 891f534f** on `feat/lfm-assembly`;
+   the only new material was the uncommitted edit. The collision was real, my
+   inference about which artifacts evidenced it was not.
+
+6. **The KECCAK_RND chunk knob is TWO-SIDED and cannot buy the memory** (wave-7
+   follow-up, measured by proving): retuning cut min-preset RSS 15.1 → 10.1 GiB but
+   grew the proof +78 % (30.7 → 54.6 MB) and verify 2.4×; at the production shape
+   padding waste is already 1.7 %. **A cheaper hash is the only large memory lever**,
+   which is this document's motivation.
+
+7. **§I.7's "hash choice decides batching" is CONTESTED in-corpus** — the guest-model
+   version is falsified (the crossover constant is off ~5,500×, so unbatched wins on
+   both axes at any hash price) and the native version is unmeasured. Do not import
+   it. Relatedly, §I.7's "recursion diverges at a Blake-class hash" was reasoned at
+   ~900,000 compressions; **this machine does ≈47,742** (§2.4), so it does not
+   transfer.
+
+8. **Arity-4 Merkle and layer-0 4-fold FRI are measured dead ends** on our economics
+   (+7M net, and "DEEP doubling loses everywhere"). Arity trades permutations for
+   bytes and so wins only when permutations are expensive — which the candidates make
+   *less* true, not more.
