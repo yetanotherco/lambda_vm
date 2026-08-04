@@ -52,31 +52,31 @@ type Ext3 = GoldilocksExtension;
 /// Everything one real sub-proof supplies to the replay, plus the challenges
 /// production derived from it.
 #[derive(Clone)]
-struct HostTable {
-    shape: TableChallengeShape,
+pub(super) struct HostTable {
+    pub(super) shape: TableChallengeShape,
     /// The verifier's HARDCODED precomputed commitment, when the AIR is
     /// preprocessed. A program constant, not arena data: the verifier does not
     /// take this from the proof (`verifier.rs:1187`).
     precomputed_root: Option<Commitment>,
     main_root: Commitment,
     aux_root: Option<Commitment>,
-    contribution: Option<FEE>,
+    pub(super) contribution: Option<FEE>,
     composition_root: Commitment,
     /// Row-major, as `row_major_data` carries it.
-    ood_current: Vec<FEE>,
-    ood_next: Vec<FEE>,
-    parts: Vec<FEE>,
+    pub(super) ood_current: Vec<FEE>,
+    pub(super) ood_next: Vec<FEE>,
+    pub(super) parts: Vec<FEE>,
     fri_roots: Vec<Commitment>,
-    fri_coeffs: Vec<FEE>,
+    pub(super) fri_coeffs: Vec<FEE>,
     nonce: Option<u64>,
     needs_lookup_challenges: bool,
 
     // ---- the oracle ----
-    beta: FEE,
-    z: FEE,
-    gamma: FEE,
-    zetas: Vec<FEE>,
-    iotas: Vec<usize>,
+    pub(super) beta: FEE,
+    pub(super) z: FEE,
+    pub(super) gamma: FEE,
+    pub(super) zetas: Vec<FEE>,
+    pub(super) iotas: Vec<usize>,
 }
 
 /// Read a real single-table proof into [`HostTable`], taking the challenges
@@ -151,6 +151,10 @@ struct Arenas {
     fri_roots: ArenaId,
     fri_coeffs: ArenaId,
     nonce: Option<ArenaId>,
+    /// The verification legs' two arenas, present only in the ASSEMBLED
+    /// verifier — the trace openings and the FRI layer openings. `None` in the
+    /// spine-only program, which verifies nothing and so opens nothing.
+    legs: Option<super::epoch_verify::TableQueryArenas>,
 }
 
 /// A program that replays ONE table's challenges and publishes them.
@@ -173,6 +177,7 @@ fn challenge_program(h: &HostTable) -> LfmProgram {
         fri_roots: b.declare_arena(2 * shape.fri.num_committed() as u32),
         fri_coeffs: b.declare_arena(shape.fri.num_terminal_coeffs() as u32),
         nonce: (shape.grinding_factor > 0).then(|| b.declare_arena(1)),
+        legs: None,
     };
 
     let mut t = TranscriptReplay::new(&[]);
@@ -480,27 +485,32 @@ fn a_nonce_that_did_not_grind_is_rejected() {
 /// production ACCEPTS. Nothing here is synthetic: the statement is the real
 /// one, the forks carry the real domain separators, and the challenges come
 /// from `replay_rounds_after_round_1` on each fork.
-struct RealEpoch {
-    statement: super::statement_replay::EpochStatementShape,
+pub(super) struct RealEpoch {
+    pub(super) statement: super::statement_replay::EpochStatementShape,
     elf_digest: [u8; 32],
-    public_output: Vec<u8>,
+    pub(super) public_output: Vec<u8>,
     epoch_label: u64,
     /// Per table, in sub-proof order: the hardcoded precomputed commitment
     /// (when the AIR is preprocessed) and the proof's main trace root.
     phase_a: Vec<(Option<Commitment>, Commitment)>,
     /// Per table, everything the fork absorbs plus the oracle challenges.
-    tables: Vec<HostTable>,
+    pub(super) tables: Vec<HostTable>,
+    /// Per table, everything the VERIFICATION LEGS read — the shapes, the
+    /// constraint analysis and the per-query openings. Built in the same pass as
+    /// `tables` because it needs the AIRs and the proof view, which do not
+    /// outlive this function.
+    pub(super) legs: Vec<super::epoch_verify_tests::TableLegs>,
     /// The shared LogUp challenges Phase A ends on.
-    z_alpha: (FEE, FEE),
+    pub(super) z_alpha: (FEE, FEE),
     /// The carried commit index — `reg_init[X254_INDEX]` of this epoch, which
     /// is the PREVIOUS epoch's `reg_fini[64]`.
-    start_index: u64,
+    pub(super) start_index: u64,
     /// The COMMIT-bus target production computed, and therefore the value the
     /// closure must reach.
-    expected_bus_balance: FEE,
+    pub(super) expected_bus_balance: FEE,
 }
 
-fn real_epoch() -> RealEpoch {
+pub(super) fn real_epoch() -> RealEpoch {
     use crate::tables::trace_builder::{Traces, build_initial_image_paged};
     use crate::tables::{MaxRowsConfig, bitwise, local_to_global, register};
     use crypto::fiat_shamir::default_transcript::DefaultTranscript;
@@ -659,6 +669,18 @@ fn real_epoch() -> RealEpoch {
         })
         .collect();
 
+    // The legs' own reading of the same sub-proofs. Separate pass rather than
+    // part of `host_table_forked` because the challenge replay must run against
+    // a fork positioned exactly as production leaves it, and this reads nothing
+    // from the transcript at all.
+    let legs = refs
+        .iter()
+        .enumerate()
+        .map(|(idx, air)| {
+            super::epoch_verify_tests::build_table_legs(*air, view.get(idx), &lookup_challenges)
+        })
+        .collect();
+
     RealEpoch {
         statement: super::statement_replay::EpochStatementShape {
             public_output_len: public_output.len(),
@@ -690,6 +712,7 @@ fn real_epoch() -> RealEpoch {
         epoch_label: label,
         phase_a,
         tables,
+        legs,
         z_alpha,
         start_index,
         expected_bus_balance: expected,
@@ -796,10 +819,24 @@ fn host_table_forked(
 /// data. Baking it would make program identity proof-dependent. So each is a
 /// derivation the assembly still owes; see the ledger entry this leg added.
 fn epoch_challenge_program(e: &RealEpoch) -> LfmProgram {
+    epoch_program(e, false)
+}
+
+/// The epoch program, with or without the verification LEGS hung off the spine.
+///
+/// One emitter for both, deliberately. A second copy of the spine would be a
+/// place for the assembled verifier's Fiat-Shamir to drift from the one
+/// `the_epoch_challenge_spine_matches_production` checks against production —
+/// and drift is exactly what the leg wiring must not introduce, since every leg
+/// consumes the cells this spine bound. `with_legs = false` declares no leg
+/// arenas and emits no verification, so the spine test's own arena-word count is
+/// untouched.
+pub(super) fn epoch_program(e: &RealEpoch, with_legs: bool) -> LfmProgram {
     use super::statement_replay::{EpochStatementVars, PhaseATable, absorb_epoch_statement};
 
     let mut b = LfmBuilder::new();
     let n = e.tables.len();
+    assert_eq!(e.legs.len(), n, "one leg reading per sub-proof");
 
     // ---- arenas, in declaration order ----
     let stmt_halves = 8 + e.statement.public_output_len.div_ceil(4) + 2;
@@ -816,7 +853,8 @@ fn epoch_challenge_program(e: &RealEpoch) -> LfmProgram {
     let per_table: Vec<Arenas> = e
         .tables
         .iter()
-        .map(|h| Arenas {
+        .zip(&e.legs)
+        .map(|(h, leg)| Arenas {
             main_root: a_main_roots,
             aux_root: h.shape.has_aux_root.then(|| b.declare_arena(2)),
             contribution: h.shape.has_contribution.then(|| b.declare_arena(1)),
@@ -828,6 +866,8 @@ fn epoch_challenge_program(e: &RealEpoch) -> LfmProgram {
             fri_roots: b.declare_arena(2 * h.shape.fri.num_committed() as u32),
             fri_coeffs: b.declare_arena(h.shape.fri.num_terminal_coeffs() as u32),
             nonce: (h.shape.grinding_factor > 0).then(|| b.declare_arena(1)),
+            legs: with_legs
+                .then(|| super::epoch_verify::declare_table_arenas(&mut b, &leg.verify)),
         })
         .collect();
 
@@ -909,22 +949,50 @@ fn epoch_challenge_program(e: &RealEpoch) -> LfmProgram {
             contributions.push(c);
         }
         let mut fork = fork_table(&t, h.shape.index, h.shape.num_tables);
-        let ch = emit_table_challenges(
-            &mut b,
-            &mut fork,
-            &h.shape,
-            &TableAbsorbs {
-                aux_root: aux.as_ref(),
-                contribution,
-                composition_root: &composition,
-                ood_current: &ood_current,
-                ood_next: &ood_next,
-                parts: &parts,
-                fri_roots: &fri_roots,
-                fri_coeffs: &fri_coeffs,
-                nonce,
-            },
-        );
+        let absorbs = TableAbsorbs {
+            aux_root: aux.as_ref(),
+            contribution,
+            composition_root: &composition,
+            ood_current: &ood_current,
+            ood_next: &ood_next,
+            parts: &parts,
+            fri_roots: &fri_roots,
+            fri_coeffs: &fri_coeffs,
+            nonce,
+        };
+        let ch = emit_table_challenges(&mut b, &mut fork, &h.shape, &absorbs);
+
+        // ---- ★ THE SEAM: the verification legs, on the cells just absorbed and
+        // the challenges just derived. `absorbs` is passed on by REFERENCE rather
+        // than rebuilt, so there is no second reading of the proof for a leg to
+        // disagree with the transcript about.
+        if let Some(leg_arenas) = &a.legs {
+            let leg = &e.legs[i];
+            let out = super::epoch_verify::emit_table_verification(
+                &mut b,
+                &leg.verify,
+                &leg.analysis,
+                &ch,
+                &absorbs,
+                &super::epoch_verify::TableInputs {
+                    // The precomputed root Phase A absorbed — the SAME cells,
+                    // which is what makes production's explicit
+                    // proof-copy-equals-AIR-copy check the absence of a second
+                    // value here rather than a comparison.
+                    precomputed_root: e.phase_a[i]
+                        .0
+                        .is_some()
+                        .then(|| &prep_cells[e.phase_a[..i].iter().filter(|(p, _)| p.is_some()).count()]),
+                    main_root: &main_cells[i],
+                    rap_challenges: &[z, alpha],
+                },
+                leg_arenas,
+            );
+            b.public(out.composition.as_cell());
+            for v in &out.fri_terminal {
+                b.public(v.as_cell());
+            }
+        }
         b.public(ch.beta.as_cell());
         b.public(ch.z.as_cell());
         b.public(ch.gamma.as_cell());
@@ -960,6 +1028,11 @@ fn epoch_challenge_program(e: &RealEpoch) -> LfmProgram {
 
 /// The arenas [`epoch_challenge_program`] declares, in the same order.
 fn epoch_arenas(e: &RealEpoch) -> Vec<Vec<LfmWord>> {
+    epoch_arena_words(e, false)
+}
+
+/// The arenas [`epoch_program`] declares, in the same order.
+pub(super) fn epoch_arena_words(e: &RealEpoch, with_legs: bool) -> Vec<Vec<LfmWord>> {
     let mut stmt: Vec<FE> = Vec::new();
     let halves = |bytes: &[u8]| -> Vec<FE> {
         bytes
@@ -986,7 +1059,7 @@ fn epoch_arenas(e: &RealEpoch) -> Vec<Vec<LfmWord>> {
         super::proof_arena::commitments_to_arena(&main),
         reg_init,
     ];
-    for h in &e.tables {
+    for (h, leg) in e.tables.iter().zip(&e.legs) {
         if let Some(r) = h.aux_root {
             out.push(super::proof_arena::commitments_to_arena(&[r]));
         }
@@ -1003,6 +1076,10 @@ fn epoch_arenas(e: &RealEpoch) -> Vec<Vec<LfmWord>> {
         out.push(h.fri_coeffs.iter().map(ext_word).collect());
         if let Some(nc) = h.nonce {
             out.push(vec![base_word(FE::from(nc))]);
+        }
+        if with_legs {
+            out.push(leg.opening_arena());
+            out.push(leg.fri_arena());
         }
     }
     out

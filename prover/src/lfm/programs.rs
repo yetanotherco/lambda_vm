@@ -1022,6 +1022,47 @@ fn register_offsets() -> Vec<u64> {
 /// correct in isolation and binds nothing in isolation — the same standing
 /// caveat as the L2G binding leg.
 pub fn register_derivation_program_source(shape: RegisterDerivationShape) -> LfmProgramSource {
+    use crate::tables::register::NUM_REGISTER_ADDRESSES;
+
+    let supplied = NUM_REGISTER_ADDRESSES as u32;
+    let mut b = LfmBuilder::new();
+    let init_arena = b.declare_arena(supplied);
+    let fini_arena = b.declare_arena(supplied);
+    let init: Vec<_> = (0..supplied).map(|r| b.hint_felt(init_arena, r)).collect();
+    let fini: Vec<_> = (0..supplied).map(|r| b.hint_felt(fini_arena, r)).collect();
+
+    let root = emit_register_commitment(&mut b, shape, &init, &fini);
+    b.public(root[0]);
+    b.public(root[1]);
+    b.finish()
+}
+
+/// The REGISTER preprocessed commitment over INIT and FINI cells the caller
+/// already holds — [`register_derivation_program_source`] without the arenas.
+///
+/// This is the form the ASSEMBLED verifier needs, and the reason it exists is
+/// assembly ledger entries 7 and 2, which close together. The spine declares the
+/// register boundary vector as one arena and reads `start_index` out of slot 64
+/// for the COMMIT-bus target; passing those very cells here means the root Phase
+/// A absorbs is COMPUTED from them. That computation is the binding: production
+/// has no arithmetic `start + len` check anywhere, it rebuilds the commitment
+/// from the register vectors and rejects unless the absorbed root matches, so
+/// `start_index` is tied to the chain exactly when the machine does the same.
+///
+/// Hinting the root instead — which the spine did until this existed — leaves
+/// `start_index` a free arena word: a prover supplies whatever index makes the
+/// COMMIT bus close, and the unrelated hinted root satisfies Phase A.
+///
+/// `init` and `fini` are `NUM_REGISTER_ADDRESSES` cells each. Rows past that are
+/// the pooled ZERO constant, matching `zeroed_fe_vec`: production writes only the
+/// supplied prefix, and making the padding program text rather than arena data is
+/// the same discipline the OOD next-row pruning follows.
+pub fn emit_register_commitment(
+    b: &mut LfmBuilder,
+    shape: RegisterDerivationShape,
+    init: &[super::builder::Felt],
+    fini: &[super::builder::Felt],
+) -> super::edsl::KeccakDigest {
     use super::edsl;
     use super::lde::coset_lde;
     use crate::tables::register::{NUM_PREPROCESSED_COLS_WITH_FINI, NUM_REGISTER_ADDRESSES};
@@ -1033,13 +1074,18 @@ pub fn register_derivation_program_source(shape: RegisterDerivationShape) -> Lfm
         "the derivation commits OFFSET ‖ INIT ‖ FINI; a fourth preprocessed \
          column changes the leaf layout and the arena schema together"
     );
-    let supplied = NUM_REGISTER_ADDRESSES as u32;
+    assert_eq!(
+        init.len(),
+        NUM_REGISTER_ADDRESSES,
+        "one INIT cell per register word address"
+    );
+    assert_eq!(
+        fini.len(),
+        NUM_REGISTER_ADDRESSES,
+        "one FINI cell per register word address"
+    );
     let num_rows = shape.num_rows();
     let coset_offset = FE::from(shape.coset_offset);
-
-    let mut b = LfmBuilder::new();
-    let init_arena = b.declare_arena(supplied);
-    let fini_arena = b.declare_arena(supplied);
 
     // Padding rows are zero in all three columns, exactly as `zeroed_fe_vec`
     // leaves them: production writes only the first NUM_REGISTER_ADDRESSES.
@@ -1048,19 +1094,13 @@ pub fn register_derivation_program_source(shape: RegisterDerivationShape) -> Lfm
     let offset_col: Vec<FE> = (0..num_rows)
         .map(|r| offsets.get(r).map_or(FE::zero(), |&a| FE::from(a)))
         .collect();
-    let column = |b: &mut LfmBuilder, arena| {
-        (0..num_rows as u32)
-            .map(|r| {
-                if r < supplied {
-                    b.hint_felt(arena, r)
-                } else {
-                    zero
-                }
-            })
+    let column = |supplied: &[super::builder::Felt]| {
+        (0..num_rows)
+            .map(|r| supplied.get(r).copied().unwrap_or(zero))
             .collect::<Vec<_>>()
     };
-    let init_col = column(&mut b, init_arena);
-    let fini_col = column(&mut b, fini_arena);
+    let init_col = column(init);
+    let fini_col = column(fini);
 
     // OFFSET is fixed, so its extension is interned constants rather than an
     // emitted transform — and it is taken from PRODUCTION's own transform, not
@@ -1079,8 +1119,8 @@ pub fn register_derivation_program_source(shape: RegisterDerivationShape) -> Lfm
             .map(|v| b.felt_const(v))
             .collect()
     };
-    let init_lde = coset_lde(&mut b, &init_col, shape.blowup, coset_offset);
-    let fini_lde = coset_lde(&mut b, &fini_col, shape.blowup, coset_offset);
+    let init_lde = coset_lde(b, &init_col, shape.blowup, coset_offset);
+    let fini_lde = coset_lde(b, &fini_col, shape.blowup, coset_offset);
 
     // Leaf `i` hashes the bit-reversed rows `2i` and `2i+1`, each written
     // column by column in big-endian — `keccak_leaves_bit_reversed_grouped`.
@@ -1092,14 +1132,11 @@ pub fn register_derivation_program_source(shape: RegisterDerivationShape) -> Lfm
                 let row = reverse_index(ROWS_PER_LEAF * leaf + k, lde_rows as u64);
                 values.extend([offset_lde[row], init_lde[row], fini_lde[row]]);
             }
-            edsl::keccak_leaf_hash(&mut b, &values)
+            edsl::keccak_leaf_hash(b, &values)
         })
         .collect();
 
-    let root = edsl::keccak_merkle_tree_root(&mut b, &leaves);
-    b.public(root[0]);
-    b.public(root[1]);
-    b.finish()
+    edsl::keccak_merkle_tree_root(b, &leaves)
 }
 
 pub fn register_derivation_program(shape: RegisterDerivationShape) -> LfmProgram {

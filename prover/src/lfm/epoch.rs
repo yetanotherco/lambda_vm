@@ -476,6 +476,71 @@ pub fn emit_table_challenges(
     }
 }
 
+/// Rebuild the full OOD grid from the two pruned blocks the proof carries.
+///
+/// The in-machine analogue of `ood::reconstruct_ood_full`
+/// (`crypto/stark/src/ood.rs`), and the seam between the spine and the two legs
+/// that fold the grid: the same cells [`emit_table_challenges`] absorbed
+/// column-major come back here as `num_eval_points × num_total_cols` rows, which
+/// is the shape `constraints::emit_analyzed` reads `Op::Var{offset, col}` out of
+/// and the shape `deep::emit_deep_invariants` sums.
+///
+/// ## The zeros are program text, not arena data
+///
+/// A pruned next-row entry is reconstructed as ZERO by the real verifier — no
+/// transition constraint reads a pruned column at the next row, and DEEP pairs
+/// those positions with zero coefficients. Emitting the pooled zero constant
+/// makes the pruning part of the program rather than a property of the supplied
+/// arena, which is the standing decision ("next-row pruning likewise, because the
+/// verifier reconstructs an undeclared column as ZERO"). The permissive
+/// direction is the dangerous one: a machine that hinted a value into a pruned
+/// slot would fold a frame the real verifier cannot see.
+///
+/// This emits no instruction beyond interning that zero — it is cell plumbing,
+/// which is the point. The blocks are the transcript's own cells, so there is no
+/// second copy of the grid for a prover to disagree with.
+pub fn emit_reconstruct_ood(
+    b: &mut LfmBuilder,
+    deep: &super::deep::DeepShape,
+    current: &[Ext],
+    next: &[Ext],
+) -> Vec<Vec<Ext>> {
+    let width = deep.num_total_cols;
+    let mask_width = deep.next_row_cols.len();
+    let next_rows = deep
+        .num_eval_points
+        .checked_sub(deep.step_size)
+        .expect("the OOD grid is at least the current-row block");
+    assert_eq!(
+        current.len(),
+        deep.step_size * width,
+        "the current-row block is step_size × num_total_cols"
+    );
+    assert_eq!(
+        next.len(),
+        next_rows * mask_width,
+        "the next-row block is (num_eval_points − step_size) × |next_row_cols|"
+    );
+
+    let zero = b.felt_const(FE::zero()).as_ext();
+    let mut rows = Vec::with_capacity(deep.num_eval_points);
+    for r in 0..deep.step_size {
+        rows.push(current[r * width..(r + 1) * width].to_vec());
+    }
+    for r in 0..next_rows {
+        let mut row = vec![zero; width];
+        for (m, &col) in deep.next_row_cols.iter().enumerate() {
+            assert!(
+                col < width,
+                "a next-row column must index into the trace: {col} against {width}"
+            );
+            row[col] = next[r * mask_width + m];
+        }
+        rows.push(row);
+    }
+    rows
+}
+
 /// Absorb an extension cell the way `append_field_element` streams it: three
 /// coordinates, each eight big-endian bytes.
 fn append_ext_cell(b: &mut LfmBuilder, t: &mut TranscriptReplay, v: Ext) {

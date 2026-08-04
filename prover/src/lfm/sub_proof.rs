@@ -134,9 +134,19 @@ impl SubProofShape {
     /// Arena words one query's openings occupy — every group's values, plus
     /// the index and the sibling digests (two words per level per group).
     pub fn query_words(&self) -> usize {
+        1 + self.opening_words()
+    }
+
+    /// [`Self::query_words`] WITHOUT the index word.
+    ///
+    /// The assembled verifier's stride: its query index is not proof data at
+    /// all but the transcript's own bits, so the arena carries only the opened
+    /// values and the paths. An arena that still carried an index would be
+    /// offering the prover a second one.
+    pub fn opening_words(&self) -> usize {
         let values: usize = self.groups().iter().map(GroupShape::num_values).sum();
         let siblings = 2 * self.merkle_depth * self.groups().len();
-        1 + values + siblings
+        values + siblings
     }
 
     /// Checked invariants of a shape, so a caller cannot assemble one whose
@@ -186,6 +196,21 @@ impl GroupCommitment {
             root_lanes: [b.unpack(w0), b.unpack(w1)],
             shape,
         }
+    }
+
+    /// A commitment over lanes the caller already holds — the assembled
+    /// verifier's route, where a root reaches this leg as the SAME cells the
+    /// transcript absorbed rather than as a second hint.
+    ///
+    /// A root has two consumers (`epoch::RootCells`' doc comment names them):
+    /// the Fiat-Shamir absorb and this comparison. Hinting it twice is the
+    /// two-consumer hazard — a prover would absorb one root and authenticate
+    /// against another, and no differential over honest data could see it,
+    /// because the host packs the same bytes into both. This constructor is the
+    /// join, and it takes lanes rather than words precisely so there is nothing
+    /// left to hint.
+    pub fn from_lanes(root_lanes: [[Felt; 4]; 2], shape: GroupShape) -> Self {
+        GroupCommitment { root_lanes, shape }
     }
 }
 
@@ -364,6 +389,13 @@ pub struct QueryOutput {
 }
 
 /// [`emit_query`], additionally returning the index bits — see [`QueryOutput`].
+///
+/// The index arrives as a FELT here, which is the isolation drivers' route: the
+/// differential supplies production's own `iota` and the emitter decomposes it.
+/// The assembled verifier does not have a felt to supply — its index is
+/// `TranscriptReplay::sample_u64_pow2`'s bits — and takes
+/// [`emit_query_from_bits`] instead, which is the same emitter minus this one
+/// `bit_dec`.
 #[allow(clippy::too_many_arguments)]
 pub fn emit_query_with_bits(
     b: &mut LfmBuilder,
@@ -374,6 +406,30 @@ pub fn emit_query_with_bits(
     index: Felt,
     openings: &[GroupOpening],
 ) -> QueryOutput {
+    let bits = b.bit_dec(index, shape.merkle_depth);
+    emit_query_from_bits(b, shape, gamma, inv, commitments, bits, openings)
+}
+
+/// [`emit_query_with_bits`] over an index the caller already holds as BITS.
+///
+/// This is the entry point the assembled epoch verifier uses. Production's query
+/// index is `sample_u64(lde_length >> 1)`, whose output is `index_bits()` bits by
+/// construction (`verifier.rs:138-141`), and the machine's
+/// `TranscriptReplay::sample_u64_pow2` produces exactly those bits. Routing them
+/// straight in — rather than recomposing a felt and decomposing it again — is
+/// what makes the assembled machine's query index in-range by construction and
+/// closes ledger entry 5: with no felt in the program, `ι` and `ι + 2^(n−1)`
+/// cannot be the same query, because neither is ever a number.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_query_from_bits(
+    b: &mut LfmBuilder,
+    shape: &SubProofShape,
+    gamma: Ext,
+    inv: &DeepInvariants,
+    commitments: &[GroupCommitment],
+    bits: Vec<Bit>,
+    openings: &[GroupOpening],
+) -> QueryOutput {
     shape.check();
     let groups = shape.groups();
     assert_eq!(commitments.len(), groups.len(), "one commitment per group");
@@ -381,8 +437,12 @@ pub fn emit_query_with_bits(
     for (c, g) in commitments.iter().zip(&groups) {
         assert_eq!(c.shape, *g, "commitment shapes must match the sub-proof");
     }
+    assert_eq!(
+        bits.len(),
+        shape.merkle_depth,
+        "a query index is exactly the tree's depth in bits"
+    );
 
-    let bits = b.bit_dec(index, shape.merkle_depth);
     for (commitment, opening) in commitments.iter().zip(openings) {
         emit_group_authentication(b, commitment, opening, &bits);
     }

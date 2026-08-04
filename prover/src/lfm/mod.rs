@@ -25,6 +25,7 @@ pub mod constraints;
 pub mod deep;
 pub mod edsl;
 pub mod epoch;
+pub mod epoch_verify;
 pub mod executor;
 pub mod fixture;
 pub mod fri;
@@ -70,6 +71,8 @@ pub use word::{LfmWord, base_word, ext_word, pack_digest, unpack_digest};
 mod constraint_tests;
 #[cfg(test)]
 mod epoch_tests;
+#[cfg(test)]
+mod epoch_verify_tests;
 #[cfg(test)]
 mod framework_probe;
 #[cfg(test)]

@@ -273,6 +273,17 @@ impl LayerCommitment {
             root_lanes: [b.unpack(w0), b.unpack(w1)],
         }
     }
+
+    /// A layer commitment over lanes the caller already holds.
+    ///
+    /// The assembled verifier's route: a FRI layer root is absorbed by the
+    /// transcript in Round 4 (right after its own `ζ`) and compared against here,
+    /// and those two consumers must read one cell. See
+    /// [`super::sub_proof::GroupCommitment::from_lanes`] for the same argument at
+    /// the trace trees.
+    pub fn from_lanes(root_lanes: [[Felt; 4]; 2]) -> Self {
+        LayerCommitment { root_lanes }
+    }
 }
 
 /// A sub-proof's FRI data that does not depend on the query.
@@ -384,15 +395,30 @@ pub fn hint_layer_openings(
     arenas: &FriArenas,
     query: usize,
 ) -> Vec<LayerOpening> {
+    hint_layer_openings_from(b, shape, arenas.queries, query)
+}
+
+/// [`hint_layer_openings`] against a query arena the caller declared itself.
+///
+/// The assembled verifier declares one arena per sub-proof and takes the roots,
+/// the folding challenges and the terminal coefficients from the transcript
+/// replay rather than from [`declare_fri`]'s three other arenas — so it needs
+/// this one without the other three.
+pub fn hint_layer_openings_from(
+    b: &mut LfmBuilder,
+    shape: FriShape,
+    arena: ArenaId,
+    query: usize,
+) -> Vec<LayerOpening> {
     let mut cursor = (query * shape.query_words()) as u32;
     let openings: Vec<LayerOpening> = (0..shape.num_committed())
         .map(|layer| {
-            let sym = b.hint_word(arenas.queries, cursor).as_ext();
+            let sym = b.hint_word(arena, cursor).as_ext();
             cursor += 1;
             let siblings: Vec<KeccakDigest> = (0..shape.layer_path_len(layer))
                 .map(|_| {
-                    let lo = b.hint_word(arenas.queries, cursor);
-                    let hi = b.hint_word(arenas.queries, cursor + 1);
+                    let lo = b.hint_word(arena, cursor);
+                    let hi = b.hint_word(arena, cursor + 1);
                     cursor += 2;
                     [lo, hi]
                 })
