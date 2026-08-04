@@ -204,12 +204,17 @@ pub fn ecsm_mul(_xr: &mut [u8; 32], _xg: &[u8; 32], _k: &[u8; 32]) {
 // statically-sized tiny copies. Remaining out-of-line copies are split into
 // bounded DMA ecalls so a single guest instruction cannot create an unbounded
 // continuation trace.
+//
+// `.p2align 2` is load-bearing: a bare `.section` gives sh_addralign = 1, so the
+// linker is free to place `memcpy` at an address that is not a multiple of 4 and
+// the VM, which fetches one 4-byte instruction per pc, could not decode it.
 // ---------------------------------------------------------------------------
 
 #[cfg(target_arch = "riscv64")]
 global_asm!(
     r#"
     .section .text.memcpy,"ax",@progbits
+    .p2align 2
     .globl memcpy
     .type memcpy,@function
 memcpy:
