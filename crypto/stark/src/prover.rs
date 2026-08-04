@@ -19,6 +19,8 @@ use math::{
     polynomial::Polynomial,
 };
 
+#[cfg(all(feature = "parallel", not(feature = "cuda")))]
+use rayon::prelude::IntoParallelRefIterator;
 #[cfg(feature = "parallel")]
 use rayon::prelude::{IntoParallelIterator, ParallelIterator};
 
@@ -640,17 +642,20 @@ fn estimate_table_vram_bytes(main_cols: usize, aux_cols: usize, lde_size: usize)
 /// Only OS driver threads block here (see `run_admitted`) — never rayon
 /// workers, whose pool the admitted tables use internally and which a
 /// blocked worker would starve.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 struct VramGate {
     used: std::sync::Mutex<u64>,
     freed: std::sync::Condvar,
     budget: u64,
 }
 
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 struct VramPermit<'a> {
     gate: &'a VramGate,
     bytes: u64,
 }
 
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 impl VramGate {
     fn new(budget: u64) -> Self {
         Self {
@@ -686,12 +691,13 @@ impl Drop for VramPermit<'_> {
 /// start order (heaviest table first, so the long pole starts early and small
 /// tables fill around it — the fixed chunks this replaces made every table
 /// wait for the slowest of its chunk). Returns one slot per original index.
+#[cfg(feature = "cuda")]
 fn run_admitted<T: Send>(
     order: &[usize],
     estimates: &[u64],
     gate: &VramGate,
     workers: usize,
-    task: impl Fn(usize) -> T + Sync,
+    task: impl Fn(usize) -> T + Send + Sync,
 ) -> Vec<Option<T>> {
     let results: Vec<std::sync::Mutex<Option<T>>> = estimates
         .iter()
@@ -719,6 +725,55 @@ fn run_admitted<T: Send>(
         .into_iter()
         .map(|m| m.into_inner().unwrap())
         .collect()
+}
+
+/// CPU version of the table scheduler. There is no device admission to wait
+/// on here, and the work underneath each table already uses Rayon internally.
+/// Keep the outer scheduling inside the same Rayon pool instead of creating
+/// driver OS threads: otherwise every table task launches nested Rayon work
+/// from outside the pool and loses the work-stealing behavior of the original
+/// phase scheduler.
+#[cfg(all(not(feature = "cuda"), feature = "parallel"))]
+fn run_admitted<T: Send>(
+    order: &[usize],
+    _estimates: &[u64],
+    _gate: &VramGate,
+    workers: usize,
+    task: impl Fn(usize) -> T + Send + Sync,
+) -> Vec<Option<T>> {
+    let results: Vec<std::sync::Mutex<Option<T>>> = (0..order.len())
+        .map(|_| std::sync::Mutex::new(None))
+        .collect();
+
+    for chunk in order.chunks(workers.max(1)) {
+        let chunk_results: Vec<(usize, T)> =
+            chunk.par_iter().map(|&idx| (idx, task(idx))).collect();
+        for (idx, result) in chunk_results {
+            *results[idx].lock().unwrap() = Some(result);
+        }
+    }
+
+    results
+        .into_iter()
+        .map(|m| m.into_inner().unwrap())
+        .collect()
+}
+
+/// Sequential fallback when the prover is built without its default
+/// `parallel` feature.
+#[cfg(all(not(feature = "cuda"), not(feature = "parallel")))]
+fn run_admitted<T: Send>(
+    order: &[usize],
+    _estimates: &[u64],
+    _gate: &VramGate,
+    _workers: usize,
+    task: impl Fn(usize) -> T + Send + Sync,
+) -> Vec<Option<T>> {
+    let mut results: Vec<Option<T>> = (0..order.len()).map(|_| None).collect();
+    for &idx in order {
+        results[idx] = Some(task(idx));
+    }
+    results
 }
 
 /// Table indices sorted heaviest-first by estimate.
@@ -3624,11 +3679,36 @@ pub trait IsStarkProver<
         // host-bound stretch, the others' GPU stages fill the device. The
         // shared transcript is untouched past this point (each fork is
         // per-table), so any order is sound; proofs are drained in index order.
-        #[cfg(not(feature = "debug-checks"))]
+        #[cfg(all(feature = "cuda", not(feature = "debug-checks")))]
         let table_results = run_admitted(&peak_order, &peak_estimates, &vram_gate, k, |idx| {
             let (commitment, lde) = aux_stage(idx)?;
             rounds_stage(idx, commitment, lde)
         });
+
+        // CPU has no device wait to hide. Keep a phase barrier between the
+        // aux/commit work and rounds 2-4 so Rayon can finish one homogeneous
+        // region before starting the next one, as it did before the GPU
+        // scheduler was introduced. The fused path above is intentionally
+        // CUDA-only; interleaving these CPU-heavy regions regresses the host
+        // prover through cache and memory-bandwidth contention.
+        #[cfg(all(not(feature = "cuda"), not(feature = "debug-checks")))]
+        let table_results = {
+            let aux_outs = run_admitted(&peak_order, &peak_estimates, &vram_gate, k, aux_stage);
+            let mut staged = Vec::with_capacity(num_airs);
+            for out in aux_outs {
+                staged.push(std::sync::Mutex::new(Some(
+                    out.expect("run_admitted fills every slot")?,
+                )));
+            }
+            run_admitted(&peak_order, &peak_estimates, &vram_gate, k, |idx| {
+                let (commitment, lde) = staged[idx]
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("aux result consumed once per table");
+                rounds_stage(idx, commitment, lde)
+            })
+        };
 
         // debug-checks needs every table's commitments and traces between the
         // aux and rounds stages (cross-table bus balance), so it splits the
