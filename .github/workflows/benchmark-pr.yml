@@ -273,7 +273,8 @@ jobs:
 
           # Optional table parallelism for the HEADLINE benchmark only (the memory
           # growth sweep always runs at default parallelism). `/bench k=N` overrides;
-          # otherwise default (cores/3). /bench-growth no longer forces k=1.
+          # otherwise the build's default (num_airs on cuda, cores/3 on CPU).
+          # /bench-growth no longer forces k=1.
           TABLE_K=""
           if [ "$EVENT_NAME" = "issue_comment" ]; then
             TABLE_K=$(echo "$COMMENT_BODY" | grep -o 'k=[0-9]*' | head -1 | cut -d= -f2)
