@@ -541,12 +541,16 @@ impl Instruction {
                         if !matches!(hint_id, HINT_FIELD_INV | HINT_SCALAR_INV | HINT_FIELD_SQRT) {
                             return Err(ExecutionError::HintUnknownSelector(hint_id));
                         }
-                        // The HINT table sends the output writes as `[out_addr_lo + 8i,
-                        // out_addr_hi]`, so an `out_addr` whose 32-byte range crosses the
-                        // limb boundary would unbalance the memory bus. `in_addr` is not on
-                        // the bus (the input read is not modeled) but is bounded too, so the
-                        // ecall's operand contract is uniform and `load_u256_le` cannot
-                        // overflow its address arithmetic.
+                        // Both operands are bounded so their 32-byte ranges cannot cross the
+                        // 2^32 limb boundary, and the HINT table range-checks both low limbs
+                        // against the same bound (`HINT_ADDR_LIMB_BOUND`) so the AIR accepts
+                        // exactly what this rejects. The memory bus does not do that job on
+                        // its own: it bounds `out_addr` only to 2^32 - 25, because the write
+                        // bases are `out_addr_lo + 8i` and MEMW's carry columns resolve the
+                        // bytes past the largest base. `in_addr` is not on the bus at all
+                        // (the input read is not modeled). Bounding both also keeps
+                        // `load_u256_le`/`store_u256_le` from overflowing their address
+                        // arithmetic.
                         if !addr_limb_ok(in_addr, 31) || !addr_limb_ok(out_addr, 31) {
                             return Err(ExecutionError::HintAddressOverflow);
                         }

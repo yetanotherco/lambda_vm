@@ -3175,17 +3175,14 @@ fn build_traces<I: ImageSource + Sync>(
     // =====================================================================
     lt_ops.extend(collect_lt_from_memw(&memw_ops));
     lt_ops.extend(collect_lt_from_memw_aligned(&memw_aligned_ops));
-    // HINT range-checks: selector < 3 and in_addr's low limb < 2^32 - 31 (matching the
-    // executor's HintUnknownSelector / HintAddressOverflow rejections). Two LT ops per
-    // hint call; the HINT table sends the matching ALU LT interactions.
+    // HINT range-checks: selector < 3 and both address low limbs < 2^32 - 31 (matching
+    // the executor's HintUnknownSelector / HintAddressOverflow rejections). Three LT ops
+    // per hint call; the HINT table sends the matching ALU LT interactions.
     lt_ops.extend(hint_ops.iter().flat_map(|op| {
         [
             LtOperation::new(op.hint_id, hint::HINT_SELECTOR_BOUND, false),
-            LtOperation::new(
-                op.in_addr & 0xFFFF_FFFF,
-                hint::HINT_IN_ADDR_LIMB_BOUND,
-                false,
-            ),
+            LtOperation::new(op.in_addr & 0xFFFF_FFFF, hint::HINT_ADDR_LIMB_BOUND, false),
+            LtOperation::new(op.out_addr & 0xFFFF_FFFF, hint::HINT_ADDR_LIMB_BOUND, false),
         ]
     }));
 
@@ -3907,9 +3904,10 @@ pub fn count_table_lengths(
 
         if cpu_op.ecall_hint {
             // Mirror `collect_hint_ops`: three register reads (a0/a1/a2) and four
-            // 8-byte output writes go through the memory argument, plus the two LT
-            // range-checks (selector < 3, in_addr low limb). Replaying it here keeps
-            // memory/register state in sync with generation, exactly like commit above.
+            // 8-byte output writes go through the memory argument, plus the three LT
+            // range-checks (selector < 3, in_addr and out_addr low limbs). Replaying it
+            // here keeps memory/register state in sync with generation, exactly like
+            // commit above.
             let (hint_memw, _hint_op) =
                 collect_hint_ops(&cpu_op, &mut memory_state, &mut register_state);
             for memw_op in &hint_memw {
@@ -3920,7 +3918,7 @@ pub fn count_table_lengths(
                     &mut memw_register_count,
                 );
             }
-            lt_count += 2;
+            lt_count += 3;
         }
 
         // CPU-side per-instruction-kind counters (non-word; word → CPU32, B5b)
