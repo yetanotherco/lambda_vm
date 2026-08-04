@@ -411,6 +411,15 @@ jobs:
           name: prover-tests
 
       - name: Run prover tests (shard ${{ matrix.partition }}/4)
+        # Shard 1 only: force k > 1 so the per-table admission scheduler really
+        # runs several table closures concurrently. ubuntu-latest has 2-4 vCPU
+        # and table_parallelism() defaults to (cores / 3).max(1), so every
+        # other shard proves with a single driver thread and never exercises
+        # the concurrent path or VramGate's blocking path on a PR. The other
+        # three shards keep the default-k coverage. An empty value on those
+        # fails to parse and falls back to the default, so this is inert there.
+        env:
+          TABLE_PARALLELISM: ${{ matrix.partition == 1 && '6' || '' }}
         run: |
           cargo nextest run \
             --archive-file prover-tests.tar.zst \
