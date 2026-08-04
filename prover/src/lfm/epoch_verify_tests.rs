@@ -675,14 +675,14 @@ fn the_assembled_epoch_verifier_runs() {
 /// without an aux root or without grinding shifts every arena behind it — which
 /// is precisely the failure mode the per-field arena packing exists to prevent
 /// and a hardcoded index would reintroduce in the TEST.
-struct ArenaIndex {
-    openings: usize,
+pub(super) struct ArenaIndex {
+    pub(super) openings: usize,
     fri: usize,
     parts: usize,
     ood_current: usize,
 }
 
-fn arena_index(e: &super::epoch_tests::RealEpoch, table: usize) -> ArenaIndex {
+pub(super) fn arena_index(e: &super::epoch_tests::RealEpoch, table: usize) -> ArenaIndex {
     // The epoch-wide arenas come first, and their COUNT comes from the emitter's
     // own side rather than from a literal here: wiring ledger entry 7 added the
     // second register vector, `pc_start` and (when non-empty) the page roots, and a

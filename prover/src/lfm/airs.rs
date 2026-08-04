@@ -101,13 +101,40 @@ pub fn keccak_rnd_chunk_rows(program: &super::compiler::LfmProgram) -> Vec<usize
         .collect()
 }
 
-/// Trace-cell counts for a compiled program, the LFM analogue of the VM's
-/// `total_field_elements` / `total_auxiliary_field_elements` (same
-/// semantics: main counts base-field value cells excluding preprocessed
-/// columns; aux counts extension-field elements, one per aux column per
-/// row). This is the kill-risk-3 instrument: machine cells per verification
-/// vs the verified proof's own cells.
-pub fn lfm_cell_counts(program: &super::compiler::LfmProgram) -> (u64, u64) {
+/// One chip instance's trace geometry, as the cell instrument sees it.
+///
+/// The per-chip decomposition of [`lfm_cell_counts`] — that function sums
+/// exactly these rows, so a census and a total can never disagree. `name` is not
+/// unique: every `KECCAK_RND` chunk reports under the same chip name, which is
+/// the point (they are the same AIR at different heights).
+#[derive(Clone, Copy, Debug)]
+pub struct LfmChipCells {
+    pub name: &'static str,
+    /// Padded trace rows — the height the prover commits.
+    pub rows: u64,
+    /// Value columns: the AIR's width less its preprocessed prefix.
+    pub main_cols: usize,
+    /// Aux (LogUp) columns, one per pair of bus interactions.
+    pub aux_cols: usize,
+}
+
+impl LfmChipCells {
+    pub fn main_cells(&self) -> u64 {
+        self.rows * self.main_cols as u64
+    }
+
+    pub fn aux_cells(&self) -> u64 {
+        self.rows * self.aux_cols as u64
+    }
+}
+
+/// Per-chip trace geometry for a compiled program, in the frozen AIR order
+/// (`KECCAK_RND`'s chunks expanded, so the vector has one entry per sub-proof).
+///
+/// Extracted from [`lfm_cell_counts`] rather than written beside it: a second
+/// copy of this table is how a census would come to describe a different machine
+/// than the one the totals describe.
+pub fn lfm_chip_census(program: &super::compiler::LfmProgram) -> Vec<LfmChipCells> {
     let range_rows = layout::range::NUM_ROWS as u64;
     let g = &program.groups;
     // Every chip class except `KECCAK_RND`, which is counted per chunk below.
@@ -192,18 +219,52 @@ pub fn lfm_cell_counts(program: &super::compiler::LfmProgram) -> (u64, u64) {
             bitwise::bus_interactions().len(),
         ),
     ];
-    let mut main = 0u64;
-    let mut aux = 0u64;
-    for (rows, num_cols, prep, interactions) in per_chip {
-        main += rows * (num_cols - prep) as u64;
-        aux += rows * interactions.div_ceil(2) as u64;
-    }
+    // The frozen AIR order is `air_refs`': chip classes 0..=10, then every
+    // `KECCAK_RND` chunk, then `KECCAK_RC` and `BITWISE`. `per_chip` above lists
+    // the classes with the last two at the end, so the chunks are spliced in
+    // before them rather than appended.
     let rnd_interactions = keccak_rnd::bus_interactions().len();
-    for rows in keccak_rnd_chunk_rows(program) {
-        main += rows as u64 * keccak_rnd::cols::NUM_COLUMNS as u64;
-        aux += rows as u64 * rnd_interactions.div_ceil(2) as u64;
+    let mut census = Vec::with_capacity(per_chip.len() + 1);
+    for (slot, (rows, num_cols, prep, interactions)) in per_chip.into_iter().enumerate() {
+        if slot == KECCAK_RND_SLOT {
+            for rows in keccak_rnd_chunk_rows(program) {
+                census.push(LfmChipCells {
+                    name: LFM_CHIP_NAMES[KECCAK_RND_SLOT],
+                    rows: rows as u64,
+                    main_cols: keccak_rnd::cols::NUM_COLUMNS,
+                    aux_cols: rnd_interactions.div_ceil(2),
+                });
+            }
+        }
+        census.push(LfmChipCells {
+            // `per_chip`'s last two entries are chip classes 12 and 13, which sit
+            // at indices 11 and 12 of that array — hence the shift past the
+            // `KECCAK_RND` slot rather than a plain index.
+            name: LFM_CHIP_NAMES[if slot >= KECCAK_RND_SLOT {
+                slot + 1
+            } else {
+                slot
+            }],
+            rows,
+            main_cols: num_cols - prep,
+            aux_cols: interactions.div_ceil(2),
+        });
     }
-    (main, aux)
+    census
+}
+
+/// Trace-cell counts for a compiled program, the LFM analogue of the VM's
+/// `total_field_elements` / `total_auxiliary_field_elements` (same
+/// semantics: main counts base-field value cells excluding preprocessed
+/// columns; aux counts extension-field elements, one per aux column per
+/// row). This is the kill-risk-3 instrument: machine cells per verification
+/// vs the verified proof's own cells.
+pub fn lfm_cell_counts(program: &super::compiler::LfmProgram) -> (u64, u64) {
+    lfm_chip_census(program)
+        .iter()
+        .fold((0u64, 0u64), |(main, aux), c| {
+            (main + c.main_cells(), aux + c.aux_cells())
+        })
 }
 
 pub struct LfmAirs {
