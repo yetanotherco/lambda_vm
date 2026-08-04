@@ -52,7 +52,7 @@ use crate::tables::trace_builder::count_table_lengths;
 use crate::tables::types::BusId;
 use crate::test_utils::{
     E, F, VmAir, create_bitwise_air, create_branch_air, create_bytewise_air, create_commit_air,
-    create_cpu_air, create_cpu32_air, create_decode_air, create_dma_air, create_dvrm_air,
+    create_cpu_air, create_cpu32_air, create_decode_air, create_dma_air, create_dma_set_air, create_dvrm_air,
     create_ecdas_air, create_ecsm_air, create_eq_air, create_halt_air, create_keccak_air,
     create_keccak_rc_air, create_keccak_rnd_air, create_load_air, create_lt_air, create_memw_air,
     create_memw_aligned_air, create_memw_register_air, create_mul_air, create_page_air,
@@ -82,8 +82,8 @@ pub struct RuntimePageRange {
 
 /// Number of tables that always contribute exactly one sub-proof, regardless
 /// of `TableCounts`: bitwise, decode, halt, commit, keccak, keccak_rnd,
-/// keccak_rc, register, ecsm, ecdas, dma.
-pub const FIXED_TABLE_COUNT: usize = 11;
+/// keccak_rc, register, ecsm, ecdas, dma, dma_set.
+pub const FIXED_TABLE_COUNT: usize = 12;
 
 /// Number of chunks for each split table.
 /// The verifier needs this to reconstruct matching AIRs.
@@ -518,6 +518,7 @@ pub(crate) struct VmAirs {
     pub ecsm: VmAir,
     pub ecdas: VmAir,
     pub dma: VmAir,
+    pub dma_set: VmAir,
     pub register: VmAir,
     pub pages: Vec<VmAir>,
     pub memw_registers: Vec<VmAir>,
@@ -544,6 +545,7 @@ impl VmAirs {
             (self.ecsm.as_ref(), &mut traces.ecsm, &()),
             (self.ecdas.as_ref(), &mut traces.ecdas, &()),
             (self.dma.as_ref(), &mut traces.dma, &()),
+            (self.dma_set.as_ref(), &mut traces.dma_set, &()),
             (self.register.as_ref(), &mut traces.register, &()),
         ];
         if self.include_halt {
@@ -619,6 +621,7 @@ impl VmAirs {
             self.ecsm.as_ref(),
             self.ecdas.as_ref(),
             self.dma.as_ref(),
+            self.dma_set.as_ref(),
             self.register.as_ref(),
         ];
         if self.include_halt {
@@ -777,6 +780,7 @@ impl VmAirs {
         let ecsm: VmAir = Box::new(create_ecsm_air(proof_options));
         let ecdas: VmAir = Box::new(create_ecdas_air(proof_options));
         let dma: VmAir = Box::new(create_dma_air(proof_options));
+        let dma_set: VmAir = Box::new(create_dma_set_air(proof_options));
         let register: VmAir =
             if let Some((commitment, num_preprocessed_cols)) = register_preprocessed {
                 Box::new(
@@ -884,6 +888,7 @@ impl VmAirs {
             ecsm,
             ecdas,
             dma,
+            dma_set,
             register,
             pages,
             memw_registers,

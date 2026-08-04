@@ -41,6 +41,10 @@ const DMA_MEMCPY_SYSCALL_NUMBER: usize = usize::MAX - 2;
 #[cfg(target_arch = "riscv64")]
 const DMA_MEMCPY_MAX_BYTES: usize = 256;
 
+/// DMA memset syscall number. Must match the executor.
+#[cfg(target_arch = "riscv64")]
+const DMA_MEMSET_SYSCALL_NUMBER: usize = usize::MAX - 3;
+
 /// No-op. The `Print` ecall (a7=1) has no receiver on the Ecall bus, so emitting
 /// it makes the LogUp bus unbalance and the proof fail to verify. Printing isn't
 /// needed in provable programs, so `print_string` does nothing on every target.
@@ -233,6 +237,46 @@ memcpy:
     .size memcpy, .-memcpy
 "#,
     syscall = const DMA_MEMCPY_SYSCALL_NUMBER,
+    max_bytes = const DMA_MEMCPY_MAX_BYTES,
+);
+
+// ---------------------------------------------------------------------------
+// DMA memset symbol override
+//
+// Same shape as `memcpy` above: a strong assembly symbol that splits the fill
+// into bounded DMA ecalls. `a1` carries the fill byte rather than a source
+// address, so it is NOT advanced across chunks. The `andi` keeps only the low
+// byte — C's `memset` takes an `int` but writes `(unsigned char)c`, and the
+// executor rejects a wider value so the AIR can prove the byte bound.
+// ---------------------------------------------------------------------------
+
+#[cfg(target_arch = "riscv64")]
+global_asm!(
+    r#"
+    .section .text.memset,"ax",@progbits
+    .globl memset
+    .type memset,@function
+memset:
+    mv t0, a0
+    andi a1, a1, 255
+    mv t1, a2
+    beqz t1, .Ldma_memset_done
+.Ldma_memset_loop:
+    li a2, {max_bytes}
+    bgeu t1, a2, .Ldma_memset_call
+    mv a2, t1
+.Ldma_memset_call:
+    li a7, {syscall}
+    ecall
+    sub t1, t1, a2
+    add a0, a0, a2
+    bnez t1, .Ldma_memset_loop
+.Ldma_memset_done:
+    mv a0, t0
+    ret
+    .size memset, .-memset
+"#,
+    syscall = const DMA_MEMSET_SYSCALL_NUMBER,
     max_bytes = const DMA_MEMCPY_MAX_BYTES,
 );
 

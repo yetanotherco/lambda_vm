@@ -1,7 +1,10 @@
 use executor::{
     elf::Elf,
     vm::execution::{Executor, ReturnValues},
-    vm::instruction::{decoding::Instruction, execution::DMA_MEMCPY_SYSCALL_NUMBER},
+    vm::instruction::{
+        decoding::Instruction,
+        execution::{DMA_MEMCPY_SYSCALL_NUMBER, DMA_MEMSET_SYSCALL_NUMBER},
+    },
 };
 
 // NOTE: These tests require 64-bit RISC-V ELF files (RV64IM).
@@ -146,6 +149,25 @@ fn test_dma_memcpy_cases() {
         "./program_artifacts/rust/dma_memcpy_cases.elf",
         b"dma-cases-ok".to_vec(),
         vec![],
+    );
+}
+
+#[test]
+fn test_dma_memset_cases() {
+    let elf_data = std::fs::read("./program_artifacts/rust/dma_memset_cases.elf").unwrap();
+    let program = Elf::load(&elf_data).unwrap();
+    let result = Executor::new(&program, vec![]).unwrap().run().unwrap();
+
+    assert_eq!(result.return_values.memory_values, b"dma-memset-ok");
+    assert!(
+        result.logs.iter().any(|log| {
+            log.src1_val == DMA_MEMSET_SYSCALL_NUMBER
+                && matches!(
+                    result.instructions.get(&log.current_pc),
+                    Some(Instruction::EcallEbreak)
+                )
+        }),
+        "the strong memset symbol must execute at least one DMA ecall"
     );
 }
 

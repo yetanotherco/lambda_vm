@@ -1231,6 +1231,28 @@ fn test_prove_dma_memcpy_rust_guest() {
     );
 }
 
+/// End-to-end memset: the guest exercises every row-schedule boundary (empty,
+/// sub-tail, exact widths, the per-ecall cap, multi-chunk, a masked wide fill,
+/// and an unaligned page-crossing destination), so a passing proof covers the
+/// DMA_SET trace, its bus balance, and the fill-byte bound together.
+#[test]
+fn test_prove_dma_memset_cases_rust_guest() {
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .to_path_buf();
+    let elf_bytes =
+        std::fs::read(workspace_root.join("executor/program_artifacts/rust/dma_memset_cases.elf"))
+            .expect("dma_memset_cases.elf not found — build its make target");
+
+    let proof = prove_vm_minimal(&elf_bytes, &[], &Default::default());
+    assert!(
+        verify_vm_minimal(&proof, &elf_bytes),
+        "DMA memset guest should verify"
+    );
+    assert_eq!(proof.public_output, b"dma-memset-ok");
+}
+
 #[test]
 fn test_prove_dma_memcpy_cases_rust_guest() {
     let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))

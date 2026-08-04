@@ -58,6 +58,9 @@ use crate::tables::decode::{bus_interactions as decode_bus_interactions, cols as
 use crate::tables::dma::{
     DmaConstraints, bus_interactions as dma_bus_interactions, cols as dma_cols,
 };
+use crate::tables::dma_set::{
+    DmaSetConstraints, bus_interactions as dma_set_bus_interactions, cols as dma_set_cols,
+};
 use crate::tables::dvrm::{
     DvrmConstraints, bus_interactions as dvrm_bus_interactions, cols as dvrm_cols,
 };
@@ -906,6 +909,18 @@ pub fn create_dma_air(proof_options: &ProofOptions) -> ConcreteVmAir<DmaConstrai
         1,
         DmaConstraints,
         "DMA",
+    )
+}
+
+/// Create DMA memset AIR with streaming arithmetic constraints and bus interactions.
+pub fn create_dma_set_air(proof_options: &ProofOptions) -> ConcreteVmAir<DmaSetConstraints> {
+    build_air(
+        dma_set_cols::NUM_COLUMNS,
+        dma_set_bus_interactions(),
+        proof_options,
+        1,
+        DmaSetConstraints,
+        "DMA_SET",
     )
 }
 
