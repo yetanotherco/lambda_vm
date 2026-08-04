@@ -238,9 +238,12 @@ pub fn emit_table_verification(
     // The constraint program indexes FRAME STEPS; DEEP folds every grid row.
     // Both views are of the one grid above, which is what makes the two legs
     // agree by construction rather than by the host filling two arenas alike.
-    let steps: Vec<Vec<Ext>> = (0..shape.num_frame_steps())
-        .map(|o| grid[o * shape.sub.deep.step_size].clone())
-        .collect();
+    let steps = frame_step_view(&grid, shape.sub.deep.step_size);
+    assert_eq!(
+        steps.len(),
+        shape.num_frame_steps(),
+        "the strided view must have one entry per frame step"
+    );
     let ood = OodOperands {
         steps,
         main_width: shape.main_width,
@@ -367,6 +370,35 @@ pub fn emit_table_verification(
         fri_terminal,
         deep: inv,
     }
+}
+
+/// The constraint frame's view of the reconstructed OOD grid: row 0 of each
+/// evaluation STEP, which is every `step_size`-th grid row.
+///
+/// This is assembly ledger entry 9, extracted so it can be differentialled. The
+/// rule is production's, not ours: the verifier builds its frame with
+/// `StarkTableView::into_frame(main_cols, step_size)`
+/// (`verifier.rs:320-321`), which groups the `num_eval_points`-row grid into
+/// `step_size`-row steps, and `Op::Var{offset, row}` resolves to
+/// `frame.get_evaluation_step(offset).get_main_evaluation_element(0, col)` with
+/// `row == 0` asserted (`constraint_ir/interp.rs:240-242`). So step `o`'s value is
+/// grid row `o · step_size`, and the rows between are read by DEEP alone.
+///
+/// A generic function rather than the two lines it replaces, because those two
+/// lines had no witness: at `step_size = 1` the strided view and the whole grid
+/// are the same vector, so an emitter that passed the whole grid to the
+/// constraint fold — which is what the wave-5 sketch did — was indistinguishable.
+/// `step_size_tests::the_frame_step_view_matches_productions_own_frame_assembly`
+/// compares THIS function against `into_frame` at `step_size = 2`, where they
+/// differ.
+pub fn frame_step_view<T: Clone>(grid: &[Vec<T>], step_size: usize) -> Vec<Vec<T>> {
+    assert!(step_size > 0, "a frame step is at least one row");
+    assert!(
+        grid.len().is_multiple_of(step_size),
+        "the OOD grid is a whole number of frame steps: {} rows at step_size {step_size}",
+        grid.len()
+    );
+    grid.iter().step_by(step_size).cloned().collect()
 }
 
 /// Keccak permutations one sub-proof's committed leaves cost, per query.

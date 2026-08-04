@@ -86,4 +86,6 @@ mod logup_tests;
 #[cfg(test)]
 mod machine_tests;
 #[cfg(test)]
+mod step_size_tests;
+#[cfg(test)]
 mod tests;
