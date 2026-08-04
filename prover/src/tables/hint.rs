@@ -65,10 +65,11 @@ use crate::constraints::templates::emit_is_bit;
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable, alu_op};
 
-/// One past the largest valid hint selector (`a0 ∈ {0, 1, 2}` = FIELD_INV /
-/// SCALAR_INV / FIELD_SQRT). The executor rejects anything else up front, so the
-/// AIR range-checks `selector < 3` to accept exactly the same set.
-pub const HINT_SELECTOR_BOUND: u64 = 3;
+/// One past the largest valid hint selector (`a0 ∈ {0, 1, 2}` = FIELD_INV / SCALAR_INV /
+/// FIELD_SQRT). Re-exported from the executor, which const-asserts that the bound and its
+/// `is_valid_hint_selector` set coincide — so the AIR's range-check cannot drift from the
+/// set the executor accepts.
+pub use executor::vm::instruction::execution::HINT_SELECTOR_BOUND;
 
 /// Bound the low 32-bit limb of `in_addr` and `out_addr` must stay under so the
 /// ecall's 32-byte range (`+0..+31`) cannot straddle the 2^32 limb boundary. Mirrors

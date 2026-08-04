@@ -48,6 +48,32 @@ pub const HINT_FIELD_INV: u64 = 0; // secp256k1 base-field inverse (mod p)
 pub const HINT_SCALAR_INV: u64 = 1; // secp256k1 scalar-field inverse (mod n)
 pub const HINT_FIELD_SQRT: u64 = 2; // secp256k1 base-field square root
 
+/// One past the largest valid hint selector. The prover's HINT table range-checks
+/// `a0 < HINT_SELECTOR_BOUND` on the ALU bus to accept exactly the set
+/// [`is_valid_hint_selector`] accepts, so both live here rather than being restated
+/// independently in the AIR.
+pub const HINT_SELECTOR_BOUND: u64 = 3;
+
+/// Whether `hint_id` names a hint [`compute_hint`] can produce. The ecall rejects
+/// anything else up front with [`ExecutionError::HintUnknownSelector`].
+pub const fn is_valid_hint_selector(hint_id: u64) -> bool {
+    matches!(hint_id, HINT_FIELD_INV | HINT_SCALAR_INV | HINT_FIELD_SQRT)
+}
+
+// The AIR's range-check and the executor's accepted set must denote the same set: every
+// selector below the bound is valid, and the bound itself is not. Appending a selector
+// without moving the bound (or vice versa) fails to compile here, instead of making the
+// HINT table assert `LT(selector, bound) = 1` against an LT row the builder emits as 0 —
+// an unbalanced ALU bus with no algebraic pointer to the cause.
+const _: () = {
+    let mut id = 0;
+    while id < HINT_SELECTOR_BOUND {
+        assert!(is_valid_hint_selector(id));
+        id += 1;
+    }
+    assert!(!is_valid_hint_selector(HINT_SELECTOR_BOUND));
+};
+
 /// `2^32`. ECSM memory operands must not overflow their lower 32-bit address limb when the
 /// largest per-access offset is added: the 32-byte operands reach offset +31 (last byte).
 const LOW_LIMB: u64 = 1 << 32;
@@ -538,7 +564,7 @@ impl Instruction {
                         // would otherwise silently produce a zero output (see
                         // `compute_hint`), indistinguishable from a legitimate numeric
                         // failure. Fail loudly instead so a guest bug surfaces here.
-                        if !matches!(hint_id, HINT_FIELD_INV | HINT_SCALAR_INV | HINT_FIELD_SQRT) {
+                        if !is_valid_hint_selector(hint_id) {
                             return Err(ExecutionError::HintUnknownSelector(hint_id));
                         }
                         // Both operands are bounded so their 32-byte ranges cannot cross the
