@@ -476,7 +476,7 @@ production call sites, and DECODE's binding rests on it.
     - **The production-shaped wrap does not fit on any box we have**, and this is
       measured rather than argued: 11,165,806,868 base-field-equivalent cells at
       the measured 33.7 bytes/cell is a projected 350.6 GiB of peak RSS, 2.8x the
-      124 GiB measurement box. The coefficient has two measured points (16.2 GiB
+      124 GiB measurement box. The coefficient has two measured points (15.1 GiB
       at 481.3M cells, 15.5 GiB at 507.7M cells against a 15.9 GiB projection), so
       it is an extrapolation of a validated ratio, not a guess — but it IS a 22x
       extrapolation and the report says so.
@@ -484,7 +484,28 @@ production call sites, and DECODE's binding rests on it.
       4,364,173,312 main + 1,672,478,720 aux ext of the total; one permutation
       costs 36,256 main + 13,912 aux cells. That is the number the hash matrix
       exists to move, and it means the matrix's other columns decide the machine's
-      size, not its structure.
+      size, not its structure. (At blowup 8 / ONE query the same split reads 83.6%
+      permutation chips + 5.2% their fixed tables: the fixed-height tables shrink
+      as a share when the workload grows, the permutation itself does not.)
+    - **The SPINE also grows with the query count, so per-query cost may only be
+      taken from the DIFFERENCE.** Spine permutations: 1,467 at blowup 2 / 1 query,
+      2,235 at blowup 8 / 1 query, 2,667 at blowup 8 / 73 queries. The legs' own
+      per-query cost is then **1,581.0 at one query and 1,581.0 at 73** (115,413 /
+      73) — measured at both ends rather than assumed linear, which is what lets
+      slice 1a's geometry run stand in for the geometry of the 73-query shape.
+      (The +768 the spine gains from blowup 2 to 8 at one query is unexplained
+      here; the plausible cause — the tiny tables' FRI final-poly coefficient
+      count rises when their LDE does — is an INFERENCE, not a measurement.)
+    - **The wrap costs 12.7x the epoch's own trace cells at the min preset**
+      (inner epoch 22,036,988 main + 5,248,588 aux ext = 37,782,752
+      base-field-equivalents), 13.4x at blowup 8 / 1 query, and 295x at blowup 8 /
+      73 queries. ⚠ This ratio is NOT a machine constant and must not be quoted as
+      one: the denominator is a 16-guest-cycle epoch, the smallest an epoch gets,
+      while the numerator is a verifier whose cost is set by query count and tree
+      depth. A production-sized epoch moves the denominator by orders of magnitude
+      and the numerator hardly at all. The number to carry forward is cells per
+      verify; the ratio is here only to stop anyone computing it from these two
+      tables and believing it.
 
     (Original text kept below.) The phase's composed predictions were computed at a UNIFORM
     `log2_trace = 20` across all sub-proofs (`join_tests::join_leg_cost`'s stated

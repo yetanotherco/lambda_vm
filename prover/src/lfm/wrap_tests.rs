@@ -190,6 +190,44 @@ pub(super) fn report_program(label: &str, profile: &str, program: &LfmProgram) {
     );
 }
 
+/// The INNER epoch's own committed trace cells — `(main, aux ext)` — summed over
+/// its sub-proofs.
+///
+/// The denominator of the recursion ratio, and the only honest one available from
+/// shapes alone: `rows x main_width` and `rows x aux_width` per sub-proof, which is
+/// the same accounting [`lfm_chip_census`] applies to the machine (value columns
+/// plus aux, one ext element per aux column per row).
+///
+/// What it CANNOT see, on both sides equally: preprocessed columns, the
+/// composition polynomial's own commitment, the LDE, and the Merkle trees. So the
+/// ratio it feeds is "trace cells to verify one epoch's trace cells", not "total
+/// prover work", and it is quoted that way.
+fn inner_epoch_cells(e: &super::epoch_tests::RealEpoch) -> (u64, u64) {
+    e.legs
+        .iter()
+        .map(|l| {
+            let rows = 1u64 << l.verify.sub.deep.log2_trace_length;
+            let aux_width = l.verify.sub.deep.num_total_cols - l.verify.main_width;
+            (rows * l.verify.main_width as u64, rows * aux_width as u64)
+        })
+        .fold((0, 0), |(m, a), (dm, da)| (m + dm, a + da))
+}
+
+/// Prints the recursion ratio: machine cells per verify against the verified
+/// epoch's own cells. The kill-risk-3 question, asked of a real epoch at last.
+fn report_ratio(e: &super::epoch_tests::RealEpoch, main: u64, aux: u64) {
+    let (inner_main, inner_aux) = inner_epoch_cells(e);
+    let inner = inner_main + 3 * inner_aux;
+    let outer = main + 3 * aux;
+    println!(
+        "   the epoch VERIFIED carries {inner_main} main + {inner_aux} aux ext = {inner} \
+         base-field-equivalent trace cells\n   \
+         so verifying it costs {:.1}x its own trace cells (trace-to-trace; neither \
+         side counts preprocessed columns, LDEs or trees)",
+        outer as f64 / inner as f64,
+    );
+}
+
 /// The epoch's trace-length profile as ledger entry 10 wants it printed.
 pub(super) fn epoch_profile(e: &super::epoch_tests::RealEpoch) -> String {
     let mut lengths: Vec<u32> = e
@@ -316,6 +354,44 @@ fn wrap_run(inner: ProofOptions) {
         &format!("assembled epoch verifier, epoch {profile}"),
         &program,
     );
+
+    // ---- the spine/legs split, and the legs' permutations against a CLOSED FORM.
+    //
+    // Both halves matter and for different reasons. The split is what makes two
+    // runs at different query counts comparable at all: the SPINE also grows with
+    // the query count (it samples an index per query, and every sample is
+    // transcript work), so "permutations per query" taken from the total is wrong
+    // and taken from the difference is right. The closed form is the absolute
+    // check rule 7's refinement demands — `query_permutations` is arithmetic over
+    // byte widths and tree depths, not a second pass of this emitter, so a leg
+    // that quietly stopped hashing a group fails here rather than printing a
+    // smaller number.
+    let spine = super::epoch_tests::epoch_program(&e, false);
+    let leg_perms = permutations(&program) - permutations(&spine);
+    let predicted: usize = e
+        .legs
+        .iter()
+        .map(|l| super::epoch_verify::query_permutations(&l.verify))
+        .sum();
+    assert_eq!(
+        leg_perms, predicted,
+        "the emitted leg permutations must equal the closed form over the shapes"
+    );
+    let queries = e.legs[0].verify.num_queries;
+    println!(
+        "   spine {} instr / {} perms / {} words   legs {} / {} / {}   \
+         per query: {:.1} perms ({} queries, closed form checked)",
+        spine.instrs.len(),
+        permutations(&spine),
+        arena_words(&spine),
+        program.instrs.len() - spine.instrs.len(),
+        leg_perms,
+        arena_words(&program) - arena_words(&spine),
+        leg_perms as f64 / queries as f64,
+        queries,
+    );
+
+    report_ratio(&e, main, aux);
 
     let opts = wrap_options();
     let artifacts = build_artifacts(&program, &opts);
@@ -489,7 +565,7 @@ fn the_wrap_census() {
 /// Peak prover memory the census implies, in bytes, from a MEASURED coefficient.
 ///
 /// The measured point is slice 0: 481,327,124 base-field-equivalent cells peaked
-/// at 16,228,499,456 bytes of RSS, i.e. 33.7 bytes per cell — a trace word, its
+/// at 16,228,499,456 bytes of RSS (15.1 GiB), i.e. 33.7 bytes per cell — a trace word, its
 /// blowup-2 LDE, and the Merkle/quotient working set on top. Stated as a
 /// coefficient rather than derived from first principles because the derivation
 /// would be a guess about the prover's allocation pattern and this is an
@@ -541,6 +617,7 @@ fn the_wrap_census_at_blowup_8() {
         &format!("assembled, epoch {profile}, inner blowup 8"),
         &program,
     );
+    report_ratio(&e, main, aux);
 
     // ---- MEASURED against the phase's pinned predictions, number by number.
     let openings: usize = e
@@ -579,7 +656,7 @@ fn the_wrap_census_at_blowup_8() {
     println!(
         "\n  PROVING THIS: {} main + {} aux ext = {} base-field-equivalent cells\n\
          \x20 projected peak RSS {:.1} GiB at the measured {:.1} bytes/cell \
-         (slice 0's 16.2 GiB / 481.3M cells)\n\
+         (slice 0's 15.1 GiB / 481.3M cells)\n\
          \x20 the measurement box has 124 GiB, so this is {:.1}x what fits",
         main,
         aux,

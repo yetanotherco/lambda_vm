@@ -161,7 +161,7 @@ The machine proves and verifies, end to end, through the registry:
    `[2 x14, 3, 4 x4, 5 x3, 7, 20]`; the full table is in
    `lfm-assembly-obligations.md` entry 10, now SATISFIED.
    - **Slice 0** (min preset): the assembled verifier proves in 19.5 s and
-     verifies in 0.09 s, 30,707,816-byte proof, 14 sub-proofs, 16.2 GiB peak.
+     verifies in 0.09 s, 30,707,816-byte proof, 14 sub-proofs, 15.1 GiB peak.
      220,107,920 main + 87,073,068 aux ext cells.
    - **Slice 1a** (inner blowup 8, 1 query — the GEOMETRY, 2^23 LDE, 22 Merkle
      levels, 12 committed FRI layers): proves in 23.3 s, verifies in 0.09 s,
