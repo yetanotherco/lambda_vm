@@ -9,7 +9,8 @@ thiserror = "1.0.68"
 rustc-demangle = "0.1"
 ecsm = { path = "../crypto/ecsm" }
 # Host-side computation of non-constraining hints (modular inverse / sqrt) for the
-# `Hint` ecall — same k256 arithmetic the guest verifies against. BENCH ONLY.
+# `Hint` ecall — same k256 arithmetic the guest verifies against. Production code:
+# `compute_hint` runs in every proving execution of a hint-using guest.
 k256 = { version = "0.13", default-features = false, features = ["arithmetic", "expose-field"] }
 
 [dev-dependencies]

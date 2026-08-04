@@ -5,9 +5,10 @@
 //! deliberately not modelled) so we can get prove→verify to balance before scaling
 //! to ethrex.
 //!
-//! Buffers are 8-byte aligned so the writes land in the aligned MEMW table, which is
-//! a preference rather than a requirement — `classify_memw` routes unaligned accesses
-//! to the general MEMW table, and the ethrex call site is in fact unaligned.
+//! Buffers are 8-byte aligned so the writes land in the aligned MEMW table — the same
+//! choice the ethrex call site makes (`get_hint` in `crypto/ethrex-crypto` wraps its
+//! output in an `align(8)` buffer). Alignment is a preference rather than a
+//! requirement — `classify_memw` routes unaligned accesses to the general MEMW table.
 
 use lambda_vm_syscalls as syscalls;
 
