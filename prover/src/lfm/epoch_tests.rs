@@ -866,8 +866,7 @@ pub(super) fn epoch_program(e: &RealEpoch, with_legs: bool) -> LfmProgram {
             fri_roots: b.declare_arena(2 * h.shape.fri.num_committed() as u32),
             fri_coeffs: b.declare_arena(h.shape.fri.num_terminal_coeffs() as u32),
             nonce: (h.shape.grinding_factor > 0).then(|| b.declare_arena(1)),
-            legs: with_legs
-                .then(|| super::epoch_verify::declare_table_arenas(&mut b, &leg.verify)),
+            legs: with_legs.then(|| super::epoch_verify::declare_table_arenas(&mut b, &leg.verify)),
         })
         .collect();
 
@@ -979,10 +978,9 @@ pub(super) fn epoch_program(e: &RealEpoch, with_legs: bool) -> LfmProgram {
                     // which is what makes production's explicit
                     // proof-copy-equals-AIR-copy check the absence of a second
                     // value here rather than a comparison.
-                    precomputed_root: e.phase_a[i]
-                        .0
-                        .is_some()
-                        .then(|| &prep_cells[e.phase_a[..i].iter().filter(|(p, _)| p.is_some()).count()]),
+                    precomputed_root: e.phase_a[i].0.is_some().then(|| {
+                        &prep_cells[e.phase_a[..i].iter().filter(|(p, _)| p.is_some()).count()]
+                    }),
                     main_root: &main_cells[i],
                     rap_challenges: &[z, alpha],
                 },

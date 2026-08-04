@@ -101,8 +101,9 @@ The machine proves and verifies, end to end, through the registry:
    table-set-LENGTH gap (closure run over a real epoch's 24
    contributions) and found that three of the five have NON-blank traces
    with every multiplicity column zero: "unused" ≠ "blank".
-5. **Assembly** into one epoch-verifier program — **SPINE DONE, LEGS NOT
-   WIRED** (assembly, wave 4, branch `feat/lfm-assembly`).
+5. **Assembly** into one epoch-verifier program — **SPINE + LEGS DONE; the
+   whole verifier runs on a real epoch** (assembly waves 4 and 5, branch
+   `feat/lfm-assembly`).
    - **DONE**: the Fiat-Shamir spine RUNS on a real 24-sub-proof continuation
      epoch that production accepts. `prover/src/lfm/epoch.rs` replays the
      fork, Phase C, and rounds 2-4 in production's order;
@@ -113,16 +114,45 @@ The machine proves and verifies, end to end, through the registry:
      entries 4, 5 and 6 DISCHARGED; 2 half (the cell is right, the derivation
      is not built); 3 partially (one cell + two views is now a construction,
      but the second consumers are not wired).
-   - **NOT DONE**: the verification legs do not hang off the spine yet. The
-     constraint/quotient evaluation, the opening authentication, the DEEP
-     fold and the FRI walk are all still driven by their own isolation
-     programs with hinted challenges. Wiring them onto `TableAbsorbs` is what
-     closes entry 3 and what turns the composed per-epoch predictions into
-     measurements — they remain PREDICTIONS.
-   - **NEW ledger entries** 7 (the preprocessed commitments are hinted, and
-     PAGE's cannot become a program constant because it is a function of the
-     inner ELF) and 8 (the OOD absorb ORDER has no production witness: every
-     OOD block of all 24 sub-proofs is one row tall).
+   - **LEGS DONE** (assembly-w5, `feat/lfm-assembly` @ a1f32859): the whole
+     verifier RUNS. `prover/src/lfm/epoch_verify.rs` is the seam — per sub-proof
+     it rebuilds the OOD grid from the two pruned blocks the transcript
+     absorbed, runs the constraint evaluation and quotient check at the spine's
+     own `z`/`beta`, and takes each query's `iota_bits` straight into the Merkle
+     walk, the DEEP fold and the FRI chain. `epoch_challenge_program` became
+     `epoch_program(e, with_legs)` so ONE spine emitter serves both programs and
+     the leg program cannot drift from the one the 111-challenge differential
+     covers. Ledger entry 3 DISCHARGED (the absolute hinted-once count now runs
+     over a program that HAS both consumers of every value, with a positive
+     control that it declares strictly more arena words than the spine); 21
+     tamper vectors rejected.
+     * MEASURED, min preset (blowup 2, 1 query/table, grinding 1, 24
+       sub-proofs): **spine 1,095,553 instructions / 1,211 permutations / 5,716
+       arena words -> ASSEMBLED 2,184,360 / 2,616 / 16,478.** Legs alone
+       1,088,807 / 1,405 / 10,762, so the verifier is ~50/50 Fiat-Shamir and
+       verification at this preset.
+     * Leg permutations match a closed form over the shapes EXACTLY (927 leaves
+       + 304 Merkle levels + 174 FRI = 1,405). Constraint lowering reproduces
+       the design's 54,358 ALU rows to the digit (63,393 unfused likewise);
+       recombination 2,431 against 2,894, the gap being zerofier squarings at
+       this epoch's real trace lengths. FRI at blowup 8 lands on the pinned
+       14,454 exactly.
+     * WARNING: the composed OPENING predictions assumed a UNIFORM 2^20 per
+       sub-proof. A real intermediate epoch is `[2 x14, 3, 4 x4, 5 x3, 7, 20]` —
+       one big table and 23 tiny ones — so its openings are 1.88x cheaper than
+       the uniform model (100,959 against 189,727 at blowup 8). 213,744 stands
+       as a model of a PRODUCTION-sized epoch, not of this one; ledger entry 10.
+   - **NEW ledger entries** 7 (the preprocessed commitments are hinted — and
+     wave 5 CORRECTED its taxonomy: DECODE is ELF-dependent like PAGE, so the
+     split is 2 constants + 2 ELF-dependent + 1 derived, with a proposed
+     resolution awaiting a ruling), 8 (the OOD absorb ORDER has no production
+     witness: every OOD block of all 24 sub-proofs is one row tall), 9 (the
+     constraint leg's frame-STEP view of the grid is invisible at
+     `step_size = 1` — same witness as 8) and 10 (per-epoch numbers must name
+     their epoch shape).
+   - **STILL NOT DONE**: entry 7's wiring (intern BITWISE + KECCAK_RC, call
+     `programs::emit_register_commitment` from Phase A, rule on DECODE/PAGE) and
+     therefore entry 2's derivation; entry 8's synthetic AIR.
 6. **The wrap run** on the box (see `[[scaleway-box-idp]]` in memory:
    195.154.218.198, 124 GB, warm-built).
 
@@ -211,8 +241,24 @@ replaced it (post-wave-4) with the research agent's final report extracted
 verbatim from that transcript. The raw session survives in git history at
 e105dea2 if ever needed; findings are also summarised in ledger entry 2.
 
-Ready to start next (wave 5):
-- **Assembly, part 2 — hang the legs off the spine.** The seam already
+Ready to start next (wave 6):
+- **Ledger entry 7's wiring, and entry 2 with it.** `programs::emit_register_
+  commitment` now exists (extracted in wave 5); Phase A must call it on the
+  register-boundary arena the spine already declares, so REGISTER's root is
+  COMPUTED and `start_index` is bound. BITWISE and KECCAK_RC intern as program
+  constants. DECODE and PAGE need a RULING — wave 5 found DECODE is
+  ELF-dependent, so the entry's own taxonomy was wrong; the proposal is in
+  ledger entry 7 and it touches program identity, which is an always-stop item.
+- **Ledger entries 8 and 9 together** — one synthetic AIR, proved by the
+  PRODUCTION prover, with three transition offsets AND `step_size > 1`. Entry 8
+  is the OOD absorb ORDER (column- vs row-major), entry 9 is the constraint
+  leg's frame-STEP view of the grid; a witness built for one does not close the
+  other unless it exercises both.
+- **Then the wrap run**, whose numbers must state their epoch's trace-length
+  profile (ledger entry 10).
+
+DONE in wave 5 (kept for the record):
+- ~~**Assembly, part 2 — hang the legs off the spine.**~~ The seam already
   exists: `epoch::TableAbsorbs` carries every proof-carried cell and
   `epoch::TableChallenges` every derived challenge, per table. What is
   needed is, per sub-proof: reconstruct the full OOD grid from the two

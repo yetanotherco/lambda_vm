@@ -434,7 +434,10 @@ fn the_assembled_epoch_verifier_runs() {
         words(&program) - words(&spine),
         exec.public_words.len() - (program.instrs.len() - program.instrs.len()),
         exec.public_words.len(),
-        e.legs.iter().map(|l| 1 + l.verify.num_queries).sum::<usize>(),
+        e.legs
+            .iter()
+            .map(|l| 1 + l.verify.num_queries)
+            .sum::<usize>(),
     );
 
     // ---- the constraint leg's share, from the analyses themselves.
@@ -446,11 +449,7 @@ fn the_assembled_epoch_verifier_runs() {
     // without a second emitter pass. `alu_rows` excludes constants because the
     // builder interns them program-wide, so the sum is a lower bound on the
     // constraint leg's instructions and not the whole of it.
-    let constraint_alu: usize = e
-        .legs
-        .iter()
-        .map(|l| l.analysis.report().alu_rows())
-        .sum();
+    let constraint_alu: usize = e.legs.iter().map(|l| l.analysis.report().alu_rows()).sum();
     let constraint_unfused: usize = e
         .legs
         .iter()
@@ -466,7 +465,8 @@ fn the_assembled_epoch_verifier_runs() {
         .iter()
         .map(|l| {
             let plumb = |b: &mut super::builder::LfmBuilder| {
-                let n = 2 + l.verify.sub.deep.num_composition_parts
+                let n = 2
+                    + l.verify.sub.deep.num_composition_parts
                     + l.verify.num_frame_steps() * l.verify.sub.deep.num_total_cols
                     + l.analysis.report().nodes;
                 let a = b.declare_arena(n as u32);
@@ -544,7 +544,8 @@ fn the_assembled_epoch_verifier_runs() {
     for leg in &e.legs {
         let groups = leg.verify.sub.groups().len();
         fri_perms += leg.verify.num_queries * leg.verify.fri.permutations_per_query();
-        leaf_perms += leg.verify.num_queries * super::epoch_verify::leaf_permutations(&leg.verify.sub);
+        leaf_perms +=
+            leg.verify.num_queries * super::epoch_verify::leaf_permutations(&leg.verify.sub);
         walk_perms += leg.verify.num_queries * groups * leg.verify.sub.merkle_depth;
     }
     let predicted: usize = e
@@ -612,13 +613,8 @@ fn the_assembled_epoch_verifier_runs() {
                 + s.sub.groups().len() * s.sub.merkle_depth)
     };
 
-    let real_lengths: Vec<TableVerifyShape> =
-        e.legs.iter().map(|l| at_blowup_8(l, None)).collect();
-    let uniform: Vec<TableVerifyShape> = e
-        .legs
-        .iter()
-        .map(|l| at_blowup_8(l, Some(20)))
-        .collect();
+    let real_lengths: Vec<TableVerifyShape> = e.legs.iter().map(|l| at_blowup_8(l, None)).collect();
+    let uniform: Vec<TableVerifyShape> = e.legs.iter().map(|l| at_blowup_8(l, Some(20))).collect();
     let sum = |v: &[TableVerifyShape], f: &dyn Fn(&TableVerifyShape) -> usize| -> usize {
         v.iter().map(f).sum()
     };
@@ -634,7 +630,9 @@ fn the_assembled_epoch_verifier_runs() {
          sub-proof at blowup 8, i.e. for a 2^20 table]",
         sum(&uniform, &openings_only),
         sum(&real_lengths, &openings_only),
-        sum(&real_lengths, &|s| super::epoch_verify::query_permutations(s)),
+        sum(&real_lengths, &|s| super::epoch_verify::query_permutations(
+            s
+        )),
         sum(&real_lengths, &|s: &TableVerifyShape| s.num_queries
             * s.fri.permutations_per_query()),
     );
@@ -654,18 +652,15 @@ fn the_assembled_epoch_verifier_runs() {
         big8.fri.num_committed(),
         openings_only(&big8),
     );
-    println!(
-        "\x20 trace lengths in this epoch (log2): {:?}",
-        {
-            let mut v: Vec<u32> = e
-                .legs
-                .iter()
-                .map(|l| l.verify.sub.deep.log2_trace_length)
-                .collect();
-            v.sort_unstable();
-            v
-        }
-    );
+    println!("\x20 trace lengths in this epoch (log2): {:?}", {
+        let mut v: Vec<u32> = e
+            .legs
+            .iter()
+            .map(|l| l.verify.sub.deep.log2_trace_length)
+            .collect();
+        v.sort_unstable();
+        v
+    });
 }
 
 /// Where each per-table arena sits in the declaration order
@@ -901,7 +896,13 @@ fn the_assembled_verifier_hints_each_proof_value_once() {
     // just as happily over the spine alone.
     let spine = super::epoch_tests::epoch_program(&e, false);
     assert!(
-        declared > spine.arena_schema.lens.iter().map(|l| *l as usize).sum::<usize>(),
+        declared
+            > spine
+                .arena_schema
+                .lens
+                .iter()
+                .map(|l| *l as usize)
+                .sum::<usize>(),
         "the assembled program must declare more arena words than the spine, or \
          the legs are not wired and this guard is vacuous"
     );
@@ -942,10 +943,9 @@ fn the_preprocessed_commitments_of_a_real_epoch() {
     );
     // The REGISTER slot, checked by its column count rather than assumed from its
     // index: the derivation commits OFFSET ‖ INIT ‖ FINI.
-    let register = e
-        .legs
-        .iter()
-        .position(|l| l.num_precomputed_cols == crate::tables::register::NUM_PREPROCESSED_COLS_WITH_FINI);
+    let register = e.legs.iter().position(|l| {
+        l.num_precomputed_cols == crate::tables::register::NUM_PREPROCESSED_COLS_WITH_FINI
+    });
     println!(
         "  the sub-proof whose preprocessed width is NUM_PREPROCESSED_COLS_WITH_FINI \
          ({}): index {:?}",
@@ -963,5 +963,104 @@ fn the_preprocessed_commitments_of_a_real_epoch() {
     assert!(
         !preprocessed.is_empty(),
         "an epoch with no preprocessed sub-proof cannot witness entry 7 at all"
+    );
+}
+
+/// ★ The composition and FRI-terminal CHECKS are in the program, counted.
+///
+/// This guard exists because falsification found the hole it closes. Deleting
+/// `assert_eq_ext(q.claimed, q.composition)` from the emitter fails NOTHING in
+/// this suite: with honest data the two values ARE equal, so no differential and
+/// no arena tamper can see the assert's absence. And no arena tamper ever will —
+/// every input to the quotient identity (the OOD grid, the claimed parts, `z`,
+/// `β`) is absorbed by the transcript, so moving any of them moves the challenges
+/// and the run fails at the Merkle walk instead, for the wrong reason.
+///
+/// What DOES witness the check is a mutation that makes the identity false while
+/// leaving the transcript alone — emptying the boundary-term list does exactly
+/// that, and three tests catch it. But "a mutation elsewhere catches it" is not
+/// the same as "the check is present", so this counts the checks directly.
+///
+/// `assert_eq_ext(a, b)` lowers to `esub` then `ediv(diff, ZERO)`
+/// (`builder.rs:243-247`): division by the interned zero has a witness only when
+/// the numerator vanishes, since `OUT · 0 = A` forces `A = 0`. So an extension
+/// division whose DIVISOR is the pooled zero constant is an equality assertion,
+/// and nothing else in the machine produces one — every other `ediv` here
+/// inverts against the interned ONE.
+///
+/// The expected count is arithmetic over the shapes, not a second emitter pass:
+/// one composition check per sub-proof, plus per query one FRI terminal check
+/// when the codeword folds and TWO when it does not (the zero-fold shape checks
+/// `P` at both `υ` and `−υ`).
+#[test]
+fn the_assembled_verifier_contains_every_composition_and_terminal_check() {
+    use super::instr::{ExtOp, Instr};
+
+    let e = super::epoch_tests::real_epoch();
+    let program = super::epoch_tests::epoch_program(&e, true);
+    let spine = super::epoch_tests::epoch_program(&e, false);
+
+    let asserts = |p: &super::compiler::LfmProgram| -> usize {
+        // The interned all-zero word. `felt_const(0)` and `ext_const(0)` are the
+        // same word, and the builder interns program-wide, so there is one.
+        let zeros: Vec<_> = p
+            .instrs
+            .iter()
+            .filter_map(|i| match i {
+                Instr::Const { out, value, .. } if value.iter().all(|v| *v == FE::zero()) => {
+                    Some(*out)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            zeros.len(),
+            1,
+            "the zero word must be interned exactly once, or this count is \
+             ambiguous"
+        );
+        let zero = zeros[0];
+        p.instrs
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    Instr::ExtAlu {
+                        op: ExtOp::Div,
+                        b,
+                        ..
+                    } if *b == zero
+                )
+            })
+            .count()
+    };
+
+    let expected: usize = e
+        .legs
+        .iter()
+        .map(|l| {
+            let terminal = if l.verify.fri.total_folds() > 0 { 1 } else { 2 };
+            1 + l.verify.num_queries * terminal
+        })
+        .sum();
+    assert_eq!(
+        asserts(&program) - asserts(&spine),
+        expected,
+        "the legs must add exactly one composition check per sub-proof plus the \
+         FRI terminal checks the shapes call for"
+    );
+    // Positive control: the count must be nonzero and the shapes must actually
+    // include both FRI branches, or the formula's second case is untested.
+    assert!(expected > 0);
+    assert!(
+        e.legs.iter().any(|l| l.verify.fri.total_folds() > 0)
+            && e.legs.iter().any(|l| l.verify.fri.total_folds() == 0),
+        "this epoch must exercise BOTH the folding and the zero-fold terminal \
+         shapes, or the expected count is only half checked"
+    );
+    println!(
+        "  {} equality assertions added by the legs (24 composition + FRI \
+         terminals)",
+        expected
     );
 }

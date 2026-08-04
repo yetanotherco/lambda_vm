@@ -42,8 +42,31 @@ entry only with the verifying evidence named in it.
      (reg-tree's emitter) instead of hinted — which is entry 7's work, and
      the two now close together.
 
-3. **Assembly must unify the five remaining two-consumer values** (deep-join
-   audit, 5e93fe6d). **PARTIALLY DISCHARGED** (assembly, slice 1+2): the
+3. ~~**Assembly must unify the five remaining two-consumer values**~~ —
+   **DISCHARGED** (assembly-w5, slice 1, a1f32859). The legs now hang off the
+   spine, so all four staged values have both consumers inside one program and
+   there is finally something that could disagree — and nothing does, by
+   construction rather than by agreement:
+   - the OOD frame values: `epoch_verify::emit_table_verification` rebuilds ONE
+     grid with `epoch::emit_reconstruct_ood` and hands the constraint fold and
+     the DEEP fold two VIEWS of it (see the new degenerate-parameter note below
+     about why they are different views);
+   - the claimed parts: the same `absorbs.parts` slice reaches `emit_quotient`'s
+     Horner and `emit_deep_invariants`' `h_sum_zpow`;
+   - `ζ`: already discharged — it is the `z` the transcript samples, and the
+     zerofier, the row points and `z^P` all take that cell;
+   - the trace roots: `GroupCommitment::from_lanes(root.lanes, …)` takes the
+     lanes Phase A absorbed, so the Merkle compare and the absorb read one
+     unpack;
+   - the public output bytes: discharged in wave 4 by `emit_output_bytes`.
+   The guard is `epoch_verify_tests::the_assembled_verifier_hints_each_proof_
+   value_once` — the same ABSOLUTE count as the spine's, but over the program
+   that HAS both consumers, plus a positive control that the assembled program
+   declares strictly more arena words than the spine (without it the guard would
+   pass just as happily over the spine alone, which is what made the wave-4
+   version unable to close this entry). 21 tamper vectors over the assembled
+   program are all rejected. (Original text kept below.)
+   Original: **PARTIALLY DISCHARGED** (assembly, slice 1+2): the
    assembled spine gives each value ONE cell and hands both views out of one
    struct, so the unification is now a construction rather than a rule —
    `epoch::RootCells` holds a root's two words AND the eight halves the
@@ -127,8 +150,51 @@ entry only with the verifying evidence named in it.
    assembled verifier, and the assembled path has no `Instr::Hint` for any
    challenge because nothing hints one.
 
-7. **The preprocessed commitments are hinted in the assembled spine, and four
-   of the five have no in-machine derivation** (assembly, slice 2). Production
+7. **The preprocessed commitments are hinted in the assembled spine.**
+   ⚠ **THE ENTRY'S OWN TAXONOMY WAS WRONG AND IS CORRECTED HERE** (assembly-w5,
+   slice 1, by reading `lib.rs`). The split is **2 constants + 2 ELF-dependent +
+   1 derived**, not 3 + 1 + 1:
+   - **BITWISE and KECCAK_RC are genuinely compile-time constants** —
+     `bitwise::preprocessed_commitment(proof_options)` and
+     `tables::keccak_rc::preprocessed_commitment(proof_options)` take the proof
+     options and nothing else (`lib.rs:707-713`, `lib.rs:771-774`). Intern them.
+   - **DECODE is ELF-DEPENDENT, not a constant.** `VmAirs::new` builds it as
+     `create_decode_air(opts).with_preprocessed(decode::commitment_from_elf(elf,
+     opts), …)` (`lib.rs:743-750`). Interning it would make program identity
+     ELF-dependent — the same always-stop item the entry raised for PAGE alone.
+     DECODE is in PAGE's family.
+   - **REGISTER is derived** (reg-tree). `programs::emit_register_commitment`
+     now exists, extracted from the isolation program so the spine can call it
+     on the register-boundary cells it already declares (a1f32859). Wiring it
+     into Phase A is the remaining work and closes entry 2 with it.
+   - The corroborating evidence was in plain sight and nobody had connected it:
+     `recursion::program_id_from_digest` folds `elf_digest`, `pc_start`,
+     `decode_commitment` and every `(page_base, page_commitment)` — precisely
+     the ELF-dependent roots and none of the options-only ones.
+   **PROPOSED RESOLUTION (needs the team lead's ruling, because the alternative
+   touches program identity):** DECODE and PAGE stay ARENA CELLS and are bound
+   not by program text but by the attestation — the same cell Phase A absorbs is
+   the cell the `program_id` fold consumes, which is the two-consumer join one
+   level up and which the machine already has an emitter for
+   (`machine_tests::program_id_folds_pages_in_the_production_layout`). That keeps
+   one LFM program per epoch SHAPE rather than one per guest ELF. ⚠ The residual
+   risk is named honestly: `program_id`'s binding is only as strong as the
+   consumer-side `check_attestation` compare, which the RESUME already records as
+   having ZERO production call sites. So this proposal makes PAGE/DECODE exactly
+   as bound as the existing chain is, and no more. The alternative — deriving
+   both in-machine from the ELF bytes, REGISTER-style — costs a full in-machine
+   LDE+tree per page and needs the ELF itself bound, which is the full-ELF keccak
+   pass sim/8 deliberately removed.
+   **MEASURED (`epoch_verify_tests::the_preprocessed_commitments_of_a_real_
+   epoch`):** only 4 of this epoch's 24 sub-proofs are preprocessed — index 0
+   (11 precomputed columns) BITWISE, 1 (5) DECODE, 5 (9) KECCAK_RC, 8 (3)
+   REGISTER, per `VmAirs::air_refs`' fixed order (`lib.rs:610-625`). ★ There is
+   **no PAGE sub-proof in this epoch at all** (`num_private_input_pages = 0`), so
+   the fixture cannot witness PAGE's half — and per the RESUME's premise rule
+   this is a claim about the FIXTURE, not about production, so the witness is a
+   differently-configured real epoch (a guest with private input pages), not a
+   synthetic AIR.
+   (Original text below.) Production
    takes each preprocessed root from the AIR and REJECTS a proof whose copy
    disagrees (`verifier.rs:1184-1209`); the root it absorbs is the verifier's,
    never the prover's. `epoch_tests::epoch_challenge_program` hints all of
@@ -156,6 +222,38 @@ entry only with the verifying evidence named in it.
    PRODUCTION, not about fixtures on hand. Closing it needs a synthetic AIR
    with three transition offsets (or `step_size > 1`), proved by the
    production prover so the oracle stays real.
+
+9. **The constraint leg's FRAME-STEP view of the OOD grid has no production
+   witness** (assembly-w5, slice 1 — found while writing the seam, and the sketch
+   had it wrong). `Op::Var{offset, row}` indexes the frame's evaluation STEP, and
+   production's own interpreter asserts `row == 0`
+   (`constraint_ir/interp.rs:240-242`) while taking
+   `frame.get_evaluation_step(offset)`. A frame step is `step_size` grid rows, so
+   the constraint leg must read every `step_size`-th row of the reconstructed OOD
+   grid where DEEP reads all of them. `TableVerifyShape::num_frame_steps` now
+   carries that, and the emitter builds the strided view.
+   At `step_size = 1` the strided view and the whole grid are the SAME vector, so
+   nothing in the suite can tell a correct emitter from one that passes the full
+   grid to both legs — which is what the wave-5 sketch did. Same family as entry
+   8 and closed by the same witness: an AIR with `step_size > 1` proved by the
+   production prover. Recording it separately because it is a different SITE
+   (entry 8 is the absorb ORDER, this is the constraint leg's frame indexing) and
+   a synthetic AIR built for entry 8 must exercise both or it closes only one.
+
+10. **Every per-epoch cost number must name the epoch SHAPE it describes**
+    (assembly-w5, slice 1 — measured, and it retracts nothing but reframes
+    everything). The phase's composed predictions were computed at a UNIFORM
+    `log2_trace = 20` across all sub-proofs (`join_tests::join_leg_cost`'s stated
+    constants). A real INTERMEDIATE epoch is not shaped like that: the fixture
+    epoch's measured trace lengths (log2) are `[2 x14, 3, 4 x4, 5 x3, 7, 20]` —
+    ONE large table and 23 tiny ones. Openings fall 1.88x against the uniform
+    model on this epoch (100,959 against 189,727 at blowup 8 / 73 queries), and
+    FRI collapses to a single sub-proof's bill because the other 23 have their LDE
+    already terminal at blowup 8, so zero committed layers. This does NOT falsify
+    213,744 as a model of a production-sized (2^24-step) epoch, where most tables
+    are large — it says the number is a claim about a WORKLOAD, and the two
+    workloads must never be compared without saying so. Assembly owes: the wrap
+    run's numbers must state their epoch's trace-length profile alongside them.
 
 ## STATED DEFERRALS (safety argument given and accepted — not open debts)
 
