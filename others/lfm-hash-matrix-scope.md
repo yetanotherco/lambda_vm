@@ -784,7 +784,92 @@ measured Poseidon2 at the same width is 256 main + 16 aux = 304 base-equivalent,
 moves the TOTAL by ~3 %, because the residue dominates (§2.3). So the column is
 worth measuring at 612 and not worth optimising.
 
-### 6.4 What slice 1 still owes (handoff)
+### 6.4 Slice 1b — the chip, specified to be executable (NOT built)
+
+**Why this is a spec and not code:** my context ran thin, and
+`lfm-standing-decisions.md`'s coordination rule is explicit — "checkpoint and write
+a handoff file rather than delivering a half-built slice. Quality over completion."
+A 612-column constraint set that compiles but is unfalsified would be worse than
+this document. Everything below is derived, not guessed; the arithmetic is checked
+against §6.3.
+
+#### Column layout (value section, after `PREP_WIDTH = 11`)
+
+| block | columns | offset |
+|---|---|---|
+| `IN0..IN11` | 12 | 0 |
+| `S8..S11` (capacity materialization) | 4 | 12 |
+| per FULL round (×8): `x2[0..12]`, `x3[0..12]`, `out[0..12]` | 36 each | 16 + … |
+| per PARTIAL round (×22): `x2`, `x3` (lane 0 only), `out[0..12]` | 14 each | … |
+| **total value columns** | **612** | = 16 + 8·36 + 22·14 |
+
+#### Constraints (601 total: 4 + 1 + 8·36 + 22·14)
+
+Let `m = MODE_C + MODE_P` (the existing mode-sum column pair), and per round `r`
+let `a_i = state_i + rc[r][i] · m` — an EXPRESSION, degree 1, where `state` is
+`IN`/`S` on round 0 and the previous round's `out` afterwards.
+
+1. **Capacity copy** (4): `S_i − MODE_P · IN_{8+i} = 0`. Degree 2. Note Poseidon's
+   `compress_iv` is ZERO, so the `MODE_C · IV_i` term of the `TestPermutation`
+   version vanishes — do not carry it over.
+2. **Mode boolean** (1): `m · (1 − m) = 0`, unchanged from today.
+3. **Per active lane**: `x2_i − a_i · a_i = 0` (degree 2) and
+   `x3_i − x2_i · a_i = 0` (degree 2, since `x2_i` is a column).
+4. **Per round output** (12 each): `out_j − Σ_i M[j][i] · f_i = 0` where
+   `f_i = (x3_i)² · a_i` for S-boxed lanes (degree 3) and `f_i = a_i` otherwise
+   (degree 1). `M[j][i] = MDS_CIRC_ROW[(i − j) mod 12]`, matching
+   `poseidon::PoseidonGoldilocks::mds`.
+
+**Degree is exactly 3**, so `max_degree()` stays 3 and the wrap's blowup 2 is
+unaffected — the whole reason the S-box is decomposed rather than written `a^7`.
+
+**Padding obligation, and it is already solved by the existing trick:** scaling the
+round constant by `m` (as `chips.rs:548-553` does today) makes an all-zero row
+satisfy everything — `m = 0 ⇒ a = 0 ⇒ x2 = x3 = out = 0` — WITHOUT a degree-4 gate.
+Keep it; it is load-bearing, not decoration.
+
+#### Trace generator contract
+
+Mirror `poseidon::PoseidonGoldilocks::permute` but RECORD `x2`, `x3` and the
+post-MDS state per round. It must use the **same association** —
+`x2 = a·a`, `x3 = x2·a`, `x⁷ = (x3)²·a` — which is why `poseidon.rs::sbox` is
+already written that way. Any other association gives the same field element and a
+different trace, and the constraints would reject it.
+
+#### Test plan (all five needed before the number is real)
+
+1. `max_degree` measured ≤ declared, via the `CaptureBuilder` route
+   `prover/src/tests/constraint_set_tests_a.rs:75-94` uses.
+2. **Satisfaction**: a real Poseidon row (from the generator) makes every one of
+   the 601 constraints evaluate to zero.
+3. **Rejection**: perturb ONE column — one `x2`, one `x3`, one `out`, and one
+   capacity cell, separately — and assert a constraint fires each time. Rule 1.
+4. **Padding**: an all-zero row satisfies everything.
+5. **Prove+verify** — rule 2: execute-only tests prove nothing about a chip, so the
+   column is not MEASURED until the production prover runs this AIR. This is the
+   step that makes §6.3's prediction a measurement.
+
+#### Registration — much smaller than a new chip
+
+`LFM_HASH` is **already** slot-registered (`airs.rs` `LFM_CHIP_NAMES`), so the
+8-site checklist for ADDING a chip does not apply. What changes: `cols::NUM_COLUMNS`
+(28 → 612 value columns), the constraint set body, the trace filler, and the census
+picks the new width up automatically because it reads `hash::cols::NUM_COLUMNS`.
+`PREP_WIDTH` stays 11 and the preprocessed group is untouched, so **the registry
+root for this chip should NOT move** — verify that rather than assume it, and
+regenerate `LFM_REGISTRY` if any digest shifts (pre-authorized).
+
+⚠ **The one genuine hazard, and it is why this is not a small change:** the chips
+bake the hasher's constants into their constraints, so `proof.rs:52-54` requires
+execution to use the SAME hasher. Swapping `HashConstraints` to Poseidon therefore
+breaks every existing call site that executes with `TestPermutation` (~30 across
+`epoch_tests`, `constraint_tests`, `epoch_verify_tests`, `machine_tests`, and
+`fixture::HostSponge`). **Do not do that swap to get a cells number.** The cells
+number needs only the AIR's declared width plus tests 1-5 above; the global hasher
+swap is a separate, larger decision about what the machine's default hash IS, and it
+should be taken deliberately rather than as a side effect of a measurement.
+
+### 6.5 What slice 1 still owes (superseded by 6.4 — kept for the index)
 
 Not built: the chip's constraint block (replace `chips::hash::HashConstraints`'
 `TestPermutation` round with the 30-round chain), `cols::NUM_COLUMNS` 28 → 612, the
