@@ -176,10 +176,34 @@ Only the leaf and spine terms move; parent steps and FRI leaves are 1:1 (§1.2).
 P_candidate = 2.125 × (absorption-bound part of P) + 1.0 × (path-bound part of P)
 ```
 
-and the split is exactly what the closed form computes. I have NOT computed it —
-that needs the epoch's per-table widths, which is slice 1. I therefore quote `P` as
-a **bounded interval**, 1.0× (all path) to 2.125× (all absorption), and refuse to
-pick a point inside it.
+and the split is exactly what the closed form computes.
+
+**UPDATE — slice A ran, so this axis is now MEASURED, not bounded.** I built the
+rate-parameterised closed form and the numbers below come out of the suite
+(`epoch_verify_tests::the_assembled_epoch_verifier_runs`, blowup 8 / 73 queries,
+real trace lengths):
+
+```
+keccak   rate 17 felts/perm:  115,413 permutations  (67,671 leaves + 47,742 paths/FRI)
+LFM_HASH rate  8 felts/perm:  187,902 permutations  (140,160 leaves + 47,742 paths/FRI)
+candidate/keccak = 1.6281x    (leaf term alone 2.0712x)
+absorption-bound share of the keccak bill: 58.6%     widest leaf: 3,456 felts
+```
+
+**The keccak side reproduces the ledger exactly: 115,413 is entry 10's own legs
+figure** (118,080 = 2,667 spine + 115,413 legs). That is the corroboration that
+makes the candidate side trustworthy — the same function, at a different rate.
+
+So the interval collapses to a point: the candidate pays **1.63×** the permutations,
+not the 2.125× ceiling, because 41.4 % of the keccak bill is path/FRI work that is
+1:1 at any rate. Adding the spine (2,667, absorption-bound, so bounded between 1.0×
+and 2.125×) gives
+
+```
+P_candidate ∈ [190,569 , 193,569]  =  1.614x – 1.639x keccak's 118,080
+```
+
+— a ±0.8 % spread, so the spine's uncertainty is immaterial and I use ~192,000.
 
 ### 2.2 Cells per permutation
 
@@ -201,8 +225,9 @@ S-box in degree ≤ 3, which for `x^7` means two intermediate columns per S-box*
 | candidate | S-box | rounds (est.) | S-boxes | `m` est. | `a` est. | base-equiv `m+3a` | vs keccak 77,992 |
 |---|---|---|---|---|---|---|---|
 | keccak (MEASURED) | — | 24 | — | 36,256 | 13,912 | **77,992** | 1.0× |
-| Poseidon-original t=12 | x⁷ | 8 full + 22 partial | 118 | 600–1,100 | 3 | **~610–1,110** | **70–128× cheaper** |
-| RPO t=12 | x⁷ and x^(1/7) | 7 (both layers) | 168 | 850–1,500 | 3 | ~860–1,510 | 52–91× cheaper |
+| Poseidon-original t=12, **Layout B** | x⁷ | 8 full + 22 partial | 118 | ~608 | 3 | **~617** | **126× cheaper** |
+| Poseidon-original t=12, Layout A | x⁷ | 8 full + 22 partial | 118 | ~1,080 | 90 | ~1,350 | 58× cheaper |
+| RPO t=12 (Layout B) | x⁷ and x^(1/7) | 7 (both layers) | 168 | ~850–1,500 | 3 | ~860–1,510 | 52–91× cheaper |
 | Monolith t=12 | Bars (lookup) | 6 | — | low rows, + a lookup AIR | **>3** | not estimated | needs a lookup table |
 | Blake2s (reduced) | ARX on 32-bit words | 10 (or fewer) | — | **bit-oriented — see below** | **≫3** | not estimated | **NOT expected to be orders cheaper** |
 
@@ -210,12 +235,23 @@ Derivation for Poseidon-original, the one I recommend building (DERIVED from the
 estimated parameters above plus the VERIFIED census formula):
 
 - 8 full rounds × 12 S-boxes + 22 partial rounds × 1 S-box = 118 S-boxes.
-- Layout A, one row per round: width ≈ 12 state + 12 × 2 intermediates = 36 value
-  columns; 30 rows → `m ≈ 1,080`.
-- Layout B, fully unrolled, one row per permutation: `m ≈ 12 + 8 × (12 + 24) +
-  22 × (12 + 2) = 608`.
-- `a = 3` unchanged, because Poseidon is purely algebraic: **no lookups, so no new
-  bus interactions**, and the chip's 6 `LfmMem` interactions are the whole aux bill.
+- **Layout B, fully unrolled, one row per permutation:** `m ≈ 12 + 8 × (12 + 24) +
+  22 × (12 + 2) = 608` value columns, 1 row. `a = 3`, so `m + 3a ≈ 617`.
+- **Layout A, one row per round:** width ≈ 12 state + 12 × 2 intermediates = 36
+  value columns × 30 rows → `m ≈ 1,080`.
+
+⚠ **Correction to my own first pass, worth stating because it flips the layout
+choice from "either" to "clearly B".** I initially carried `a = 3` into both
+layouts. That is wrong: the census formula is `aux_cells = rows × ceil(interactions/2)`,
+so aux scales with ROWS, and Layout A pays `30 × 3 = 90` aux cells per permutation,
+not 3. Since aux count triple, Layout A's aux term alone is 270 base-equivalent
+cells — it more than doubles Layout A's disadvantage. **Layout B wins on both cell
+count (617 vs 1,350) and on padding** (§2.3's second caveat).
+
+`a` is 3 in Layout B because Poseidon is purely algebraic: **no lookups, so no new
+bus interactions**, and the chip's existing 6 `LfmMem` interactions are the whole
+aux bill. Row-to-row state wiring, if any, is transition constraints and not buses,
+so it adds no aux.
 
 **The aux collapse is the biggest single effect and it is structural, not an
 estimate.** Keccak's `a = 13,912` per permutation exists because `KECCAK_RND`
@@ -244,22 +280,48 @@ the candidate; `P` as an interval):
 candidate total = P_cand × (m + 3a)_cand × 1.019   +   1,784,197,396
 ```
 
-For Poseidon-original, `m + 3a ≈ 610–1,110`, `P ∈ [118,080 , 250,920]`:
+For Poseidon-original, with `P ≈ 192,000` MEASURED (§2.1) and the two free design
+choices — layout and whether the candidate's AIR gets a chunking sibling — taken at
+BOTH extremes, so the answer is a box rather than a point:
 
-| | low end | high end |
-|---|---|---|
-| hash cells | 118,080 × 610 × 1.019 = **0.073 B** | 250,920 × 1,110 × 1.019 = **0.284 B** |
-| + fixed residue | 1.784 B | 1.784 B |
-| **total per epoch verify** | **≈ 1.86 B** | **≈ 2.07 B** |
-| vs keccak's 11.17 B | **6.0× smaller** | **5.4× smaller** |
-| projected RSS at 33.7 B/cell | ≈ 58 GiB | ≈ 65 GiB |
+| layout | padding | hash cells | total | vs 11.17 B | projected RSS |
+|---|---|---|---|---|---|
+| **B** (1 row/perm, 617) | chunked, 1.9 % | 0.121 B | **1.905 B** | **5.86× smaller** | **59.8 GiB** |
+| **B** | unchunked, pads to 2¹⁸ (+36.5 %) | 0.162 B | 1.946 B | 5.74× smaller | 61.1 GiB |
+| A (30 rows/perm, 1,350) | chunked | 0.264 B | 2.048 B | 5.45× smaller | 64.3 GiB |
+| A | unchunked, pads to 2²³ | 0.378 B | 2.162 B | 5.17× smaller | 67.8 GiB |
+
+**Every cell of that table is inside the 124 GiB box, and the spread across it is
+1.13× while the win is 5.2–5.9×.** That is the robustness claim, and it is what
+makes this prediction worth acting on despite resting on an estimated round count:
+the conclusion survives being wrong about layout, wrong about padding, and wrong
+about `m` by a factor of two.
 
 **The headline that falls out: Poseidon-original plausibly brings the production
-wrap from 350.6 GiB to roughly 58–65 GiB, i.e. inside the 124 GiB box.** Note what
+wrap from 350.6 GiB to roughly 60–63 GiB, i.e. inside the 124 GiB box** — and with
+the `P` axis measured, the only estimated input left is the round count. Note what
 does the work — once the hash is cheap, the *residue* dominates (1.78 B of ~1.9 B),
 so the prediction is insensitive to the hash estimate and mostly sensitive to a
 number that is already measured. That is a robustness argument, and it also means
 further hash optimisation past Poseidon buys almost nothing at this shape.
+
+⚠ **Two caveats on the 1.019 padding factor, which I carried over from keccak and
+which does NOT transfer cleanly.** It is `KECCAK_RND`'s chunk padding at the
+production shape (ledger entry 10). A candidate on socket 2 has ONE row per
+permutation, so its trace height is `P` itself and its padding is however far
+`P ≈ 192,000` sits below a power of two — `2^18 = 262,144`, i.e. **a 36 % waste, not
+1.9 %**, unless the candidate's AIR is chunked the way `KECCAK_RND` is. That
+pushes the low end from 0.118 B to ~0.155 B of hash cells and the total from 1.90 B
+to ~1.94 B — still ~5.8× and still inside the box, so it changes no conclusion, but
+it means **the chunking work `chunking.rs` did for keccak will need a sibling for
+the candidate**, and a naive first measurement will read ~36 % high on the hash
+term. Flagging it because it is exactly the kind of thing that gets discovered after
+someone reports a number.
+
+Second: a multi-row layout (Layout A, 30 rows/permutation) makes the trace 30× taller
+and the padding question correspondingly different. `m` is roughly layout-invariant
+but PADDING is not, which is an argument for Layout B (unrolled, one row per
+permutation) beyond its lower cell count.
 
 All numbers name their epoch shape: fixture epoch, profile
 `[2 ×14, 3, 4 ×4, 5 ×3, 7, 20]`, 24 sub-proofs, fibonacci guest, 16-cycle
@@ -277,7 +339,7 @@ CELLS measurement touches `crypto/**` or `prover/src/tables/**`.**
 
 | piece | what | oracle for differential testing |
 |---|---|---|
-| A. candidate-`P` closed form | `ceil(felts/rate)` sibling of `leaf_permutations`/`query_permutations`, plus the rate as a parameter | the EXISTING keccak closed form at rate 17 must reproduce `query_permutations` exactly — an absolute check, since one side is shape arithmetic and the other the emitter (rule 7-safe) |
+| ~~A. candidate-`P` closed form~~ **DONE** | `blocks_at_rate`/`leaf_permutations_at_rate`/`query_permutations_at_rate` in `epoch_verify.rs`, rate as a parameter | **the rate-17 case reproduces `query_permutations` exactly** — a real differential, because the new function is written through FELTS and the old through BYTES and `keccak_host::num_blocks`, and NEITHER delegates to the other (rule 7's trap avoided deliberately; making one delegate would have made the test vacuous). The existing assert ties `query_permutations` to the EMITTED count, so the chain reaches the emitter |
 | B. `LfmHasher` impl for the candidate | `permute([FE;12]) -> [FE;12]` + `compress_iv` | a reference Poseidon implementation over Goldilocks with the same round constants / MDS; test vectors. **This is the piece with a real oracle problem — see §4 risks** |
 | C. the chip's constraint block | replace `chips::hash::HashConstraints`' `t_i` block with the candidate round function at degree ≤ 3 | `constraint_set_tests_a`-style degree check (`measured <= max_degree`), plus prove+verify: rule 2 says execute-only tests prove nothing about chips |
 | D. gadgets on socket 2 | a candidate `merkle_walk` / sponge already exist (`edsl::merkle_walk`, `SpongeVar`) and are hash-agnostic by construction | they are already exercised against `fixture::HostSponge`, which mirrors the trait — so B's correctness carries them |
@@ -316,12 +378,14 @@ proof under `H` exists. That is a fair trade for the decision the matrix feeds
 
 **Recommended order:**
 
-1. **Slice A first — the `P` predictor.** Cheapest, purely additive, no hash
-   needed, and it collapses the largest uncertainty in §2 (the 1.0–2.125× interval)
-   to a number. It also answers a question that could change the whole
-   recommendation: if the epoch's `P` turns out absorption-dominated, the frozen
-   12-felt state is costing 2.125× and widening it (§3.2) outranks building any
-   permutation.
+1. ~~**Slice A first — the `P` predictor.**~~ **DONE, in this session** (§2.1).
+   Measured 1.63×, and it answered the question it was built to answer: the epoch
+   is 58.6 % absorption-bound, so the frozen 12-felt state IS costing real
+   permutations — but 1.63×, not the 2.125× ceiling. Widening the state is worth
+   raising (§3.2) and is NOT urgent: it would recover at most 1.63 → 1.0, i.e.
+   ~0.07 B cells of a ~1.9 B total (4 %), because the residue dominates once the
+   hash is cheap. **That is a decision this measurement retires** rather than
+   escalates.
 2. **Then Poseidon-original** (slices B, C, E) — algebraic, so `a` stays at 3 and
    the aux collapse (53.5 % of the hash bill) is banked; fits degree 3 with two
    intermediates per S-box; and it is where the ecosystem is going now that

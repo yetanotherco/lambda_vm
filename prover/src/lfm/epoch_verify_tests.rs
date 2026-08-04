@@ -623,6 +623,89 @@ fn the_assembled_epoch_verifier_runs() {
     let sum = |v: &[TableVerifyShape], f: &dyn Fn(&TableVerifyShape) -> usize| -> usize {
         v.iter().map(f).sum()
     };
+
+    // ---- THE HASH MATRIX'S PERMUTATION AXIS, at the production shape.
+    //
+    // A candidate hash moves two independent things: cells per permutation (its
+    // AIR's shape, which needs the AIR) and permutations per verify (the sponge's
+    // rate, which needs only arithmetic over these shapes). This block pins the
+    // second WITHOUT any candidate permutation existing, so the remaining unknown
+    // in a candidate's predicted column is one factor and not two.
+    //
+    // The differential: `query_permutations_at_rate` is written through felts and a
+    // rate, `query_permutations` through bytes and `keccak_host::num_blocks`.
+    // Neither delegates to the other, so their agreement at rate 17 is a real check
+    // on the felt-side reformulation — and the existing assert above already ties
+    // `query_permutations` to the EMITTED count, so the chain reaches the emitter.
+    use super::epoch_verify::{
+        KECCAK_RATE_FELTS, LFM_HASH_RATE_FELTS, group_leaf_felts, query_permutations_at_rate,
+    };
+    for s in &real_lengths {
+        assert_eq!(
+            query_permutations_at_rate(s, KECCAK_RATE_FELTS),
+            super::epoch_verify::query_permutations(s),
+            "the felt-side closed form must reproduce the byte-side one at keccak's rate"
+        );
+        // The FRI-leaf term is rate-invariant only because a 48-byte pair is six
+        // felts. Assert the premise instead of trusting the comment that states it.
+        assert!(
+            s.fri.num_committed() == 0 || 6 <= LFM_HASH_RATE_FELTS,
+            "a FRI layer leaf must fit one block at the candidate's rate"
+        );
+    }
+    let keccak_p = sum(&real_lengths, &|s| {
+        query_permutations_at_rate(s, KECCAK_RATE_FELTS)
+    });
+    let cand_p = sum(&real_lengths, &|s| {
+        query_permutations_at_rate(s, LFM_HASH_RATE_FELTS)
+    });
+    // Decompose so the penalty is attributed rather than asserted in aggregate.
+    let leaf_k = sum(&real_lengths, &|s| {
+        s.num_queries * super::epoch_verify::leaf_permutations_at_rate(&s.sub, KECCAK_RATE_FELTS)
+    });
+    let leaf_c = sum(&real_lengths, &|s| {
+        s.num_queries * super::epoch_verify::leaf_permutations_at_rate(&s.sub, LFM_HASH_RATE_FELTS)
+    });
+    let path_and_fri = keccak_p - leaf_k;
+    assert_eq!(
+        cand_p,
+        leaf_c + path_and_fri,
+        "only the leaf term may move with the rate"
+    );
+    assert!(
+        cand_p > keccak_p,
+        "the candidate's smaller rate must COST permutations — if this ever fails, \
+         the rate penalty reasoning in others/lfm-hash-matrix-scope.md is wrong"
+    );
+    let widest = real_lengths
+        .iter()
+        .map(|s| {
+            s.sub
+                .groups()
+                .iter()
+                .map(group_leaf_felts)
+                .max()
+                .unwrap_or(0)
+        })
+        .max()
+        .expect("the epoch has groups");
+    println!(
+        "\n  ★ HASH MATRIX — the PERMUTATION axis at blowup 8 / 73 queries, real \
+         trace lengths (no candidate permutation exists yet; this is shape \
+         arithmetic only):\n\
+         \x20 keccak   rate {KECCAK_RATE_FELTS:>2} felts/perm: {keccak_p:>9} permutations \
+         ({leaf_k} leaves + {path_and_fri} paths/FRI)\n\
+         \x20 LFM_HASH rate {LFM_HASH_RATE_FELTS:>2} felts/perm: {cand_p:>9} permutations \
+         ({leaf_c} leaves + {path_and_fri} paths/FRI)\n\
+         \x20 candidate/keccak = {:.4}x   (leaf term alone {:.4}x; the ceiling is \
+         17/8 = 2.125x and only absorption pays it)\n\
+         \x20 absorption-bound share of the keccak bill: {:.1}%   widest leaf: \
+         {widest} felts",
+        cand_p as f64 / keccak_p as f64,
+        leaf_c as f64 / leaf_k as f64,
+        100.0 * leaf_k as f64 / keccak_p as f64,
+    );
+
     println!(
         "\n  RECONCILIATION against the pinned blowup-8 predictions (projections \
          from shapes — this run is at the min preset and measures none of them):\n\

@@ -418,6 +418,78 @@ pub fn leaf_permutations(shape: &SubProofShape) -> usize {
         .sum()
 }
 
+/// Felts a keccak permutation absorbs — the 136-byte rate at 8 bytes per felt.
+///
+/// `⌊bytes/136⌋` and `⌊felts/17⌋` are the same function because every element the
+/// leaf hasher streams is 8 bytes wide (a base felt) or 24 (an extension element,
+/// three felts), so `bytes = 8 · felts` with no remainder either way.
+pub const KECCAK_RATE_FELTS: usize = 17;
+
+/// Felts an `LFM_HASH` permutation absorbs — the sponge's rate is 2 of its 3
+/// state cells (`edsl::SpongeVar`: "state = 3 cells (rate 2, capacity 1)") and a
+/// cell is [`super::hash::HASH_DIGEST_FELTS`] felts.
+///
+/// **This is 2.125× WORSE than keccak's 17**, and it is the one axis on which a
+/// field-native candidate loses: it pays more permutations, each far cheaper. It
+/// follows from the frozen `HASH_STATE_FELTS = 12`, so widening the state is the
+/// only lever on it.
+pub const LFM_HASH_RATE_FELTS: usize = 8;
+
+/// Felts one query's opening of a group covers, the felt-side counterpart of
+/// [`super::sub_proof::GroupShape::leaf_bytes`].
+pub fn group_leaf_felts(g: &super::sub_proof::GroupShape) -> usize {
+    g.num_values() * if g.is_ext { 3 } else { 1 }
+}
+
+/// Permutations a sponge of `rate_felts` spends absorbing `felts`, under keccak's
+/// own padding convention — `⌊n/rate⌋ + 1`, i.e. always at least one block and
+/// always a padding block even when the length divides the rate.
+///
+/// Carrying keccak's convention over to a candidate is deliberately
+/// CONSERVATIVE: a field-native sponge normally domain-separates in the capacity
+/// and needs no trailing block, so the candidate's true count lies between
+/// `felts.div_ceil(rate)` and this. Using the same convention on both sides is
+/// what makes the rate-17 case reproduce [`leaf_permutations`] exactly, which is
+/// the check that this felt-side reformulation is right at all.
+pub fn blocks_at_rate(felts: usize, rate_felts: usize) -> usize {
+    felts / rate_felts + 1
+}
+
+/// [`leaf_permutations`] at an arbitrary sponge rate.
+///
+/// Computed independently of [`leaf_permutations`] — through felts and a rate
+/// rather than through bytes and `keccak_host::num_blocks` — precisely so that
+/// asserting the two agree at [`KECCAK_RATE_FELTS`] is a real differential and
+/// not two spellings of one function. Making either delegate to the other would
+/// kill that test silently (standing-decisions rule 7).
+pub fn leaf_permutations_at_rate(shape: &SubProofShape, rate_felts: usize) -> usize {
+    shape
+        .groups()
+        .iter()
+        .map(|g| blocks_at_rate(group_leaf_felts(g), rate_felts))
+        .sum()
+}
+
+/// [`query_permutations`] at an arbitrary sponge rate.
+///
+/// Only the LEAF term is rate-sensitive. The other two are not, and neither is an
+/// approximation:
+///
+/// - A **Merkle parent** is one permutation at any rate, because a candidate
+///   compresses rather than absorbs: `LfmHasher::compress` is "a single
+///   permutation of `[a ‖ b ‖ IV]` truncated to the first cell"
+///   (`hash.rs:23-26`), and keccak's 64-byte parent likewise sits inside one
+///   136-byte block (`edsl.rs:151-155`).
+/// - A **FRI layer leaf** is a 48-byte pair, i.e. six felts, which fits any rate
+///   at or above six — asserted in the tests rather than assumed.
+pub fn query_permutations_at_rate(shape: &TableVerifyShape, rate_felts: usize) -> usize {
+    let groups = shape.sub.groups().len();
+    let per_query = leaf_permutations_at_rate(&shape.sub, rate_felts)
+        + groups * shape.sub.merkle_depth
+        + shape.fri.permutations_per_query();
+    shape.num_queries * per_query
+}
+
 /// Keccak permutations one sub-proof's whole query verification costs, from
 /// shape alone.
 ///
