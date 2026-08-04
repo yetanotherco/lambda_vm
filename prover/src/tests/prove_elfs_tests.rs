@@ -1253,6 +1253,27 @@ fn test_prove_dma_memset_cases_rust_guest() {
     assert_eq!(proof.public_output, b"dma-memset-ok");
 }
 
+/// memmove rides the memcpy ecall unchanged. The interesting case is a forward
+/// overlap longer than one 256-byte chunk: the stub must walk chunks backwards,
+/// or an earlier chunk clobbers source bytes a later one still needs.
+#[test]
+fn test_prove_dma_memmove_cases_rust_guest() {
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .to_path_buf();
+    let elf_bytes =
+        std::fs::read(workspace_root.join("executor/program_artifacts/rust/dma_memmove_cases.elf"))
+            .expect("dma_memmove_cases.elf not found — build its make target");
+
+    let proof = prove_vm_minimal(&elf_bytes, &[], &Default::default());
+    assert!(
+        verify_vm_minimal(&proof, &elf_bytes),
+        "DMA memmove guest should verify"
+    );
+    assert_eq!(proof.public_output, b"dma-memmove-ok");
+}
+
 #[test]
 fn test_prove_dma_memcpy_cases_rust_guest() {
     let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))

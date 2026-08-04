@@ -241,6 +241,70 @@ memcpy:
 );
 
 // ---------------------------------------------------------------------------
+// DMA memmove symbol override
+//
+// Reuses the memcpy ecall unchanged — no new table, no new syscall. Each ecall
+// already snapshots its whole source range before writing (all reads at T+1,
+// all writes at T+2), so a single chunk has memmove semantics for free.
+//
+// Chunking is what breaks it: copying [0,256) -> [4,260) clobbers source bytes
+// that a later forward chunk still needs. So when the destination starts inside
+// the source range (src < dst < src+n) the chunks are walked from the END
+// backwards; every chunk then reads bytes no earlier chunk has written yet.
+// Otherwise (disjoint, or dst below src) forward chunking is already safe.
+// ---------------------------------------------------------------------------
+
+#[cfg(target_arch = "riscv64")]
+global_asm!(
+    r#"
+    .section .text.memmove,"ax",@progbits
+    .globl memmove
+    .type memmove,@function
+memmove:
+    mv t0, a0
+    beqz a2, .Ldma_memmove_done
+    bgeu a1, a0, .Ldma_memmove_fwd      // src >= dst: forward is safe
+    add t2, a1, a2
+    bgeu a0, t2, .Ldma_memmove_fwd      // dst >= src+n: disjoint
+    // Overlapping with dst inside [src, src+n): walk chunks from the end.
+    add a0, a0, a2
+    add a1, a1, a2
+    mv t1, a2
+.Ldma_memmove_back_loop:
+    li a2, {max_bytes}
+    bgeu t1, a2, .Ldma_memmove_back_call
+    mv a2, t1
+.Ldma_memmove_back_call:
+    sub a0, a0, a2
+    sub a1, a1, a2
+    li a7, {syscall}
+    ecall
+    sub t1, t1, a2
+    bnez t1, .Ldma_memmove_back_loop
+    j .Ldma_memmove_done
+.Ldma_memmove_fwd:
+    mv t1, a2
+.Ldma_memmove_fwd_loop:
+    li a2, {max_bytes}
+    bgeu t1, a2, .Ldma_memmove_fwd_call
+    mv a2, t1
+.Ldma_memmove_fwd_call:
+    li a7, {syscall}
+    ecall
+    sub t1, t1, a2
+    add a0, a0, a2
+    add a1, a1, a2
+    bnez t1, .Ldma_memmove_fwd_loop
+.Ldma_memmove_done:
+    mv a0, t0
+    ret
+    .size memmove, .-memmove
+"#,
+    syscall = const DMA_MEMCPY_SYSCALL_NUMBER,
+    max_bytes = const DMA_MEMCPY_MAX_BYTES,
+);
+
+// ---------------------------------------------------------------------------
 // DMA memset symbol override
 //
 // Same shape as `memcpy` above: a strong assembly symbol that splits the fill
