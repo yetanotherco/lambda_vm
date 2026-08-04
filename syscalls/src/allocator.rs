@@ -6,27 +6,44 @@ const WORD_SIZE: usize = 4;
 // Guest global allocator, selectable at build time. The default was chosen on a measured
 // three-way A/B against embedded-alloc's TLSF heap (the previous default, now removed) over
 // ethrex blocks of 1..1500 transfers plus a real Hoodi block, monolithic and with
-// continuations, on cycles, trace elements, proving time, proof size and peak RSS:
+// continuations, on cycles, trace elements, proving time, proof size and peak RSS. The
+// figures below are post-#861: thin LTO inlines the per-allocation free-list bookkeeping
+// dlmalloc and TLSF pay and bump avoids by construction, closing ~2/3 of the gap the same
+// comparison showed before it -- expect smaller numbers than any pre-LTO run reports.
 //
 //   - default: a monotonic bump allocator. No free lists and no coalescing -- `alloc` moves
 //     a cursor, `dealloc` is empty -- so it spends the fewest guest instructions per
-//     allocation. It never came out behind on any deterministic metric on any workload:
-//     ~9% fewer guest cycles than dlmalloc on transfer blocks, ~3% on the real Hoodi block
-//     (where keccak and trie work dominate and the allocator's share dilutes), ~11% faster
-//     than TLSF to prove. It never reuses a freed region, so its footprint grows
-//     monotonically -- see the ceiling note below.
+//     allocation. Against dlmalloc: ~7% fewer guest cycles on a 20-transfer block, ~6% on
+//     150 transfers, ~3% on a real Hoodi block (where keccak and trie work dominate and the
+//     allocator's share dilutes); ~2.6% faster to prove monolithic at ~4% lower peak RSS,
+//     and ~1.2% with continuations at epochs 2^21 and 2^22. It never reuses a freed region,
+//     so its footprint grows monotonically -- see the ceiling note below.
+//
+//     Non-reuse costs it two things. The proof bundle is 0.6..1.0% larger at every epoch
+//     (deterministic: memory that is never reused spans more pages, and every page touched
+//     pays PAGE rows), and at epoch 2^20 dlmalloc proves ~2.3% faster, where eight epochs
+//     amplify that page cost. Larger epochs are ~26% cheaper in absolute terms, so the
+//     configuration worth running is the one bump wins.
 //   - `dlmalloc-alloc` feature: Doug Lea's malloc on a bump "system" provider that hands it
-//     page-aligned segments. Slower than bump everywhere measured, but its footprint is
-//     bounded by live bytes rather than total bytes ever allocated, so it is the allocator
-//     to select for an execution whose churn has no per-block bound.
+//     page-aligned segments. Slower to prove at the epochs worth running, but its footprint
+//     is bounded by live bytes rather than total bytes ever allocated, and it overrides
+//     `realloc`, so a grow can extend a block in place. Select it for an execution whose
+//     churn has no per-block bound, and when proof size or epoch 2^20 is what counts.
 //
 // Bump's ceiling is cumulative allocation, measured at ~3 GiB -- the size of
 // [_end, MAX_MEMORY_SIZE). A single block cannot reach it: allocation is bounded by gas, and
 // a gas-full block of the cheapest transactions (1500 transfers, 31.5M gas, 523M cycles)
-// executes with room to spare. A guest program that processes many blocks in one execution
-// has no such bound, which is what `dlmalloc-alloc` is for. Note that exhausting the heap
-// does not abort cleanly today -- execution spins rather than failing -- so the fallback
-// matters.
+// executes with room to spare. Two things spend that budget faster than live bytes suggest:
+// nothing is ever reclaimed, and bump does not override `realloc`, so `GlobalAlloc`'s default
+// grows a block by allocating a fresh one, copying, and `dealloc`ing the old -- a no-op here,
+// which abandons it. Geometric growth (`Vec`, `String`) pays a bounded ~2x for that; growing
+// by a constant makes it quadratic. A guest program that processes many blocks in one
+// execution has no per-block bound at all, which is what `dlmalloc-alloc` is for.
+//
+// Exhausting the heap does not fail cleanly today: `alloc` returns null, which reaches
+// `handle_alloc_error`, which panics into the guest's `#[panic_handler]` -- `loop {}` in every
+// guest here -- so execution spins instead of aborting, and nothing on the proving path
+// bounds cycles (`--cycle-budget` is opt-in and only on `execute`). So the fallback matters.
 //
 // Only the guest installs a #[global_allocator]; on host (e.g. `cargo test` for the
 // sponge's differential tests) the attribute would hijack the test harness's
@@ -66,7 +83,8 @@ mod imp {
                     HEAP_POS.store(new_pos, Ordering::Relaxed);
                     aligned as *mut u8
                 }
-                // Out of heap -> null makes the caller's `handle_alloc_error` abort.
+                // Out of heap -> null, which the caller turns into `handle_alloc_error`.
+                // See the module note on why that spins rather than aborting.
                 _ => core::ptr::null_mut(),
             }
         }
