@@ -9,7 +9,9 @@ const WORD_SIZE: usize = 4;
 // continuations, on cycles, trace elements, proving time, proof size and peak RSS. The
 // figures below are post-#861: thin LTO inlines the per-allocation free-list bookkeeping
 // dlmalloc and TLSF pay and bump avoids by construction, closing ~2/3 of the gap the same
-// comparison showed before it -- expect smaller numbers than any pre-LTO run reports.
+// comparison showed before it -- expect smaller numbers than any pre-LTO run reports. They
+// also predate the in-place `realloc` below, which takes a further 0.6..1.3% off guest cycles
+// across the ethrex fixtures but has not been re-run against dlmalloc.
 //
 //   - default: a monotonic bump allocator. No free lists and no coalescing -- `alloc` moves
 //     a cursor, `dealloc` is empty -- so it spends the fewest guest instructions per
@@ -26,19 +28,18 @@ const WORD_SIZE: usize = 4;
 //     configuration worth running is the one bump wins.
 //   - `dlmalloc-alloc` feature: Doug Lea's malloc on a bump "system" provider that hands it
 //     page-aligned segments. Slower to prove at the epochs worth running, but its footprint
-//     is bounded by live bytes rather than total bytes ever allocated, and it overrides
-//     `realloc`, so a grow can extend a block in place. Select it for an execution whose
-//     churn has no per-block bound, and when proof size or epoch 2^20 is what counts.
+//     is bounded by live bytes rather than total bytes ever allocated, and it can grow a
+//     buried block in place, which bump cannot. Select it for an execution whose churn has
+//     no per-block bound, and when proof size or epoch 2^20 is what counts.
 //
 // Bump's ceiling is cumulative allocation, measured at ~3 GiB -- the size of
 // [_end, MAX_MEMORY_SIZE). A single block cannot reach it: allocation is bounded by gas, and
 // a gas-full block of the cheapest transactions (1500 transfers, 31.5M gas, 523M cycles)
-// executes with room to spare. Two things spend that budget faster than live bytes suggest:
-// nothing is ever reclaimed, and bump does not override `realloc`, so `GlobalAlloc`'s default
-// grows a block by allocating a fresh one, copying, and `dealloc`ing the old -- a no-op here,
-// which abandons it. Geometric growth (`Vec`, `String`) pays a bounded ~2x for that; growing
-// by a constant makes it quadratic. A guest program that processes many blocks in one
-// execution has no per-block bound at all, which is what `dlmalloc-alloc` is for.
+// executes with room to spare. What spends that budget faster than live bytes suggest is that
+// nothing is ever reclaimed: `dealloc` is a no-op, and a grow that cannot extend in place --
+// the block is not the one the cursor sits on -- abandons the old block on top of that. A
+// guest program that processes many blocks in one execution has no per-block bound at all,
+// which is what `dlmalloc-alloc` is for.
 //
 // Exhausting the heap does not fail cleanly today: `alloc` returns null, which reaches
 // `handle_alloc_error`, which panics into the guest's `#[panic_handler]` -- `loop {}` in every
@@ -97,6 +98,42 @@ mod imp {
             // Guest memory is zero-initialized and bump never reuses a freed region,
             // so freshly bumped memory already reads as zero -- skip the memset.
             unsafe { self.alloc(layout) }
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            // `GlobalAlloc`'s default allocates a fresh block, copies, and `dealloc`s the old
+            // one -- a no-op here, so every grow would abandon its previous buffer. When the
+            // block is the one the cursor sits on, extend it in place instead: no copy and
+            // nothing abandoned, which makes growing by a constant cost the final size rather
+            // than the sum of every intermediate one.
+            if (ptr as usize).wrapping_add(layout.size()) == HEAP_POS.load(Ordering::Relaxed) {
+                // Shrinking gives the tail up rather than rewinding the cursor: `alloc_zeroed`
+                // skips its memset because a region is never served twice, which holds only
+                // while the cursor is monotonic.
+                if new_size <= layout.size() {
+                    return ptr;
+                }
+                return match (ptr as usize).checked_add(new_size) {
+                    Some(end) if end <= HEAP_END.load(Ordering::Relaxed) => {
+                        HEAP_POS.store(end, Ordering::Relaxed);
+                        ptr
+                    }
+                    // A fresh block would start at or past `ptr`, so it cannot fit either --
+                    // decline without copying.
+                    _ => core::ptr::null_mut(),
+                };
+            }
+
+            // SAFETY: `realloc`'s contract puts `new_size` within the bounds a `Layout` with
+            // this align accepts, which is what the default implementation relies on too.
+            let new_layout = unsafe { Layout::from_size_align_unchecked(new_size, layout.align()) };
+            let new_ptr = unsafe { self.alloc(new_layout) };
+            if !new_ptr.is_null() {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(ptr, new_ptr, layout.size().min(new_size))
+                };
+            }
+            new_ptr
         }
     }
 
@@ -158,6 +195,98 @@ mod imp {
                 first as usize + 4096,
                 "the cursor must not rewind over a freed block"
             );
+        }
+
+        /// What the in-place path buys, and the reason it exists: growing one buffer by a
+        /// constant 1024 times consumes the final size. Under `GlobalAlloc`'s default
+        /// `realloc` it would consume the sum of every step -- ~33 MiB here, so this heap
+        /// would run out.
+        #[test]
+        fn incremental_growth_costs_only_the_final_size() {
+            let _guard = with_heap(1024 * 1024);
+            let base = unsafe { BumpAlloc.alloc(layout(64, 8)) };
+            assert!(!base.is_null());
+            let mut size = 64usize;
+            for _ in 0..1024 {
+                let grown = unsafe { BumpAlloc.realloc(base, layout(size, 8), size + 64) };
+                assert_eq!(
+                    grown, base,
+                    "grow past {size} bytes did not extend in place"
+                );
+                size += 64;
+            }
+            assert_eq!(
+                HEAP_POS.load(Ordering::Relaxed),
+                base as usize + size,
+                "growth consumed more heap than the final buffer"
+            );
+        }
+
+        #[test]
+        fn growing_the_top_block_keeps_its_contents() {
+            let _guard = with_heap(1024 * 1024);
+            let base = unsafe { BumpAlloc.alloc(layout(64, 8)) };
+            unsafe { core::ptr::write_bytes(base, 0x5A, 64) };
+
+            let grown = unsafe { BumpAlloc.realloc(base, layout(64, 8), 4096) };
+            assert_eq!(grown, base);
+            let kept = unsafe { core::slice::from_raw_parts(grown, 64) };
+            assert!(kept.iter().all(|&b| b == 0x5A), "in-place grow lost bytes");
+        }
+
+        /// A block with something allocated after it cannot be extended, so it falls back
+        /// to the allocate-and-copy the default `realloc` does.
+        #[test]
+        fn growing_a_buried_block_copies_it() {
+            let _guard = with_heap(1024 * 1024);
+            let buried = unsafe { BumpAlloc.alloc(layout(64, 8)) };
+            unsafe { core::ptr::write_bytes(buried, 0x5A, 64) };
+            let top = unsafe { BumpAlloc.alloc(layout(64, 8)) };
+            assert!(!top.is_null());
+
+            let grown = unsafe { BumpAlloc.realloc(buried, layout(64, 8), 128) };
+            assert!(!grown.is_null());
+            assert_ne!(grown, buried, "a buried block cannot grow in place");
+            let kept = unsafe { core::slice::from_raw_parts(grown, 64) };
+            assert!(
+                kept.iter().all(|&b| b == 0x5A),
+                "realloc lost the old bytes"
+            );
+        }
+
+        /// Shrinking must not rewind the cursor: that would re-serve bytes the guest already
+        /// wrote, and `alloc_zeroed` skips its memset on the promise that never happens.
+        #[test]
+        fn shrinking_does_not_rewind_the_cursor_onto_dirty_bytes() {
+            let _guard = with_heap(1024 * 1024);
+            let l = layout(4096, 8);
+            let block = unsafe { BumpAlloc.alloc(l) };
+            unsafe { core::ptr::write_bytes(block, 0xAA, 4096) };
+            let cursor = HEAP_POS.load(Ordering::Relaxed);
+
+            let shrunk = unsafe { BumpAlloc.realloc(block, l, 64) };
+            assert_eq!(shrunk, block, "a shrink should keep the block where it is");
+            assert_eq!(
+                HEAP_POS.load(Ordering::Relaxed),
+                cursor,
+                "the cursor must not rewind over bytes the guest wrote"
+            );
+
+            let fresh = unsafe { BumpAlloc.alloc_zeroed(l) };
+            assert!(!fresh.is_null());
+            let bytes = unsafe { core::slice::from_raw_parts(fresh, 4096) };
+            assert!(bytes.iter().all(|&b| b == 0), "alloc_zeroed returned dirt");
+        }
+
+        /// Exhaustion on the in-place path declines rather than handing out memory past
+        /// `HEAP_END`.
+        #[test]
+        fn growing_past_the_heap_end_returns_null() {
+            let _guard = with_heap(8192);
+            let l = layout(4096, 8);
+            let block = unsafe { BumpAlloc.alloc(l) };
+            assert!(!block.is_null());
+            assert!(unsafe { BumpAlloc.realloc(block, l, 16384) }.is_null());
         }
 
         #[test]
