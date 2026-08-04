@@ -282,7 +282,8 @@ test-rust: compile-programs-rust
 #
 #   the fixture   the rkyv ProgramInput the benchmarks prove (~1 MB)
 #   the cache     the ethrex-replay JSON it was converted from (~2 MB), read only
-#                 by the converter's tests and by `regen-real-block-fixture`
+#                 by `regen-real-block-fixture`. The converter's TESTS read a
+#                 different, upstream-pinned cache — see below.
 #
 # Fetching a verified binary is the same contract as prepare-sysroot above, and it
 # keeps the converter, the ~335-package ethrex host dependency tree and an
@@ -296,7 +297,7 @@ test-rust: compile-programs-rust
 # below. It is a regeneration tool for ethrex rev bumps, not a build step.
 #
 # ---- Repointing to a different block ----
-# These FIVE lines and nothing else. Every path below derives from them, the
+# These SIX lines and nothing else. Every path below derives from them, the
 # benchmark scripts and CI resolve the fixture through
 # `make -s print-real-block-fixture`, and no workflow, script or env var anywhere
 # names a block. Outside this file the repoint touches only REAL_BLOCK_FIXTURE in
@@ -377,9 +378,10 @@ ethrex-real-block-cache:
 	$(call ensure_verified,$(ETHREX_REAL_BLOCK_CACHE_URL),$(ETHREX_REAL_BLOCK_CACHE_SHA256),$(ETHREX_REAL_BLOCK_CACHE),cache,ETHREX_REAL_BLOCK_CACHE_URL)
 
 # Single source of truth for the benchmark tooling. scripts/bench_verify.sh,
-# scripts/perf_diff.sh and .github/workflows/benchmark-pr.yml read the fixture
-# path from here instead of hardcoding it, so repointing the block above moves
-# every benchmark at once. `-s` on the caller's side keeps the output clean.
+# scripts/bench_abba.sh, scripts/perf_diff.sh and
+# .github/workflows/benchmark-pr.yml read the fixture path from here instead of
+# hardcoding it, so repointing the block above moves every benchmark at once.
+# `-s` on the caller's side keeps the output clean.
 print-real-block-fixture:
 	@echo $(ETHREX_REAL_BLOCK_FIXTURE)
 
@@ -443,8 +445,11 @@ regen-real-block-fixture: ethrex-real-block-cache
 
 # ethrex host-reference tests live in the detached `tooling/ethrex-tests`
 # workspace (ethrex pins rkyv's `unaligned` feature; isolated Cargo.lock).
-# Needs the real-block fixture, so it needs the fixture URL to be set; CI runs the
-# `-offline` variant below in the PR gate and this one only in ethrex-block-converter.yml.
+# Needs the real-block fixture, so it needs the fixture URL to be set. This is a
+# local convenience target: no workflow invokes it. The PR gate spells out the
+# `-offline` variant below inline (pr_main.yaml), and ethrex-block-converter.yml's
+# block-usability job fetches the fixture and runs
+# `test_ethrex_real_block_native` on its own.
 test-ethrex: compile-programs-rust ethrex-real-block-fixture
 	cd tooling/ethrex-tests && cargo test --release -- --include-ignored --skip test_ethrex_real_block_vm
 

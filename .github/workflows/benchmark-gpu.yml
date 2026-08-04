@@ -33,7 +33,16 @@ permissions:
   issues: write
 
 concurrency:
-  group: benchmark-gpu-${{ github.event.issue.number || github.run_id }}
+  # See bench-verify.yml: this workflow fires on EVERY issue_comment, and GitHub
+  # claims the concurrency group when the run is CREATED — before the job-level
+  # `if` skips it. With the old plain per-issue group, any comment on the PR
+  # evicted a running GPU ABBA mid-rental (2026-08-03: a `/bench 5` comment
+  # killed the run started 20 minutes earlier, ~40 min of paid box). Real
+  # /bench-gpu comments share the per-issue group, so a deliberate re-fire still
+  # replaces a stale run (cancel-in-progress stays true for that case — one
+  # rental per PR, newest request wins); every other comment and
+  # workflow_dispatch falls to a throwaway group and cannot evict anything.
+  group: ${{ startsWith(github.event.comment.body, '/bench-gpu') && format('benchmark-gpu-{0}', github.event.issue.number) || format('benchmark-gpu-ignore-{0}', github.run_id) }}
   cancel-in-progress: true
 
 env:
@@ -60,9 +69,11 @@ env:
   #
   # GPU PATH ONLY, and deliberately so. It is NOT pushed into bench_abba.sh's default
   # (2^20, which the CPU /bench-abba uses) nor into the CLI's
-  # DEFAULT_CONTINUATION_EPOCH_SIZE_LOG2 (also 20): 2^22 needs ~28 GiB of HOST memory on
-  # a CPU build, which would break laptops. VRAM is the binding constraint here and host
-  # RAM is the binding constraint there, so the two defaults are not the same question.
+  # DEFAULT_CONTINUATION_EPOCH_SIZE_LOG2 (also 20): 2^22 needs ~32 GiB of HOST memory on
+  # a CPU build (measured peak RSS on the 124 GiB calibration box; the CUDA path's host
+  # peak is a different number, ~36 GB — see the cpu_ram floor below), which would break
+  # laptops. VRAM is the binding constraint here and host RAM is the binding constraint
+  # there, so the two defaults are not the same question.
   GPU_REAL_EPOCH_LOG2: "22"
   # Unique per-run label set on the instance, for easy identification in the Vast console.
   RUN_LABEL: "gpu-bench-${{ github.run_id }}-${{ github.run_attempt }}"
@@ -157,11 +168,12 @@ jobs:
             // Post the "started" notice under the SAME marker the result step uses, so the
             // result updates this comment in place (and re-runs reuse it rather than stacking).
             const marker = 'GPU Benchmark (ABBA)';
-            // Reference: 4 pairs measured ~20 min end-to-end (rental + dual build +
-            // 8 proves). Per-prove wall varies with the rented host's CPU (the prover
-            // is partly host-CPU-bound), so scale expectations from pair count, not
-            // from a fixed per-run figure.
-            const mins = 12 + Number(process.env.PAIRS) * 2;
+            // Reference: 4 pairs measured 20 min 11 s end-to-end — 3 min 56 s of rental,
+            // checkout and dual cuda build, then 4.06 min per pair, since a pair is TWO
+            // proves at ~2 min each. Per-prove wall varies with the rented host's CPU
+            // (the prover is partly host-CPU-bound), so the slope is the measured one
+            // and the intercept carries slack for a colder box.
+            const mins = 12 + Number(process.env.PAIRS) * 4;
             const body = `## GPU Benchmark (ABBA) — running…\n\n⏳ Renting an RTX 5090 on Vast.ai and running ${process.env.PAIRS} interleaved pairs (PR vs main) of ${process.env.WORKLOAD} on the CUDA prover path. Rough ETA ~${mins} min. The result will replace this comment.`;
             const comments = await github.paginate(github.rest.issues.listComments, {
               owner: context.repo.owner, repo: context.repo.repo,
@@ -422,6 +434,20 @@ jobs:
             WORKLOAD=real CONTINUATIONS=1 EPOCH_SIZE_LOG2=$GPU_REAL_EPOCH_LOG2 \
             scripts/bench_abba.sh $REF_A origin/main $PAIRS"
 
+          # Absolute seconds don't transfer between hosts (same-price 5090 rentals
+          # span ~2x per prove with the host CPU; the paired Δ% cancels it), so every
+          # number this run prints arrives with its host attached. Captured before
+          # the bench so a failed run still records the host it failed on.
+          $SSH "lscpu" || true
+          CPU_MODEL=$($SSH "lscpu 2>/dev/null | sed -n 's/^Model name:[[:space:]]*//p' | head -1" 2>/dev/null || true)
+          [ -n "$CPU_MODEL" ] || CPU_MODEL=$($SSH "sed -n 's/^model name[[:space:]]*: //p' /proc/cpuinfo | head -1" 2>/dev/null || true)
+          CPU_THREADS=$($SSH "nproc" 2>/dev/null || true)
+          echo "Host CPU: ${CPU_MODEL:-unknown} (${CPU_THREADS:-?} threads)"
+          {
+            echo "cpu_model=${CPU_MODEL}"
+            echo "cpu_threads=${CPU_THREADS}"
+          } >> "$GITHUB_OUTPUT"
+
           # pipefail so a failed remote bench (e.g. a prove that dies) propagates through the
           # tee pipe and fails this step, instead of being masked by tee's exit 0.
           set -o pipefail
@@ -436,9 +462,12 @@ jobs:
         env:
           OUTCOME: ${{ steps.bench.outcome }}
           WORKLOAD: ${{ steps.config.outputs.workload }}
+          CPU_MODEL: ${{ steps.bench.outputs.cpu_model }}
+          CPU_THREADS: ${{ steps.bench.outputs.cpu_threads }}
         run: |
           {
             echo "## GPU ABBA — ${WORKLOAD:-ethrex} (vs main)"
+            [ -n "$CPU_MODEL" ] && echo "Host: $CPU_MODEL (${CPU_THREADS:-?} threads)"
             if [ "$OUTCOME" = "success" ] && [ -s "$RUNNER_TEMP/abba_result.txt" ]; then
               echo '```'
               cat "$RUNNER_TEMP/abba_result.txt"
@@ -461,6 +490,8 @@ jobs:
           GPU_NAME: ${{ env.GPU_NAME }}
           OFFER_PRICE: ${{ steps.offer.outputs.price }}
           WORKLOAD: ${{ steps.config.outputs.workload }}
+          CPU_MODEL: ${{ steps.bench.outputs.cpu_model }}
+          CPU_THREADS: ${{ steps.bench.outputs.cpu_threads }}
         with:
           script: |
             const fs = require('fs');
@@ -471,9 +502,14 @@ jobs:
             const gpu = (process.env.GPU_NAME || '').replace('_', ' ');
             const price = process.env.OFFER_PRICE;
             const workload = process.env.WORKLOAD || 'ethrex';
+            // Absolute seconds vary ~2x with the rented host's CPU — name the host
+            // they belong to (on failure too, so failures correlate with hosts).
+            const cpuModel = process.env.CPU_MODEL;
+            const cpuThreads = process.env.CPU_THREADS;
+            const host = cpuModel ? ` · ${cpuModel}${cpuThreads ? ` (${cpuThreads} threads)` : ''}` : '';
 
             let body = `## GPU Benchmark (ABBA) — \`${head}\` vs \`main\` (${pairs} pairs)\n\n`;
-            body += `<sub>${gpu} · Vast.ai datacenter${price ? ` @ \$${price}/hr` : ''} · \`prover/cuda\` · ${workload} · drift-free A/B/B/A</sub>\n\n`;
+            body += `<sub>${gpu}${host} · Vast.ai datacenter${price ? ` @ \$${price}/hr` : ''} · \`prover/cuda\` · ${workload} · drift-free A/B/B/A</sub>\n\n`;
             if (process.env.OUTCOME === 'success') {
               const res = read(`${tmp}/abba_result.txt`) || read(`${tmp}/abba_out.txt`);
               body += '```\n' + res + '\n```\n';

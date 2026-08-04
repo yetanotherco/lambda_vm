@@ -40,6 +40,14 @@ jobs:
       - name: Check ethrex fixture checksums
         run: make check-ethrex-fixture-checksums
 
+      # The benchmark comment harness: verifies every steps.X.outputs.Y consumed in
+      # benchmark-pr.yml has a producer (the orphaned-wiring class that once broke
+      # /bench-growth silently), then renders the full comment scenario suite.
+      # Pure node, no dependencies, ~10 s. Lives in Lint so it runs on every PR —
+      # a path filter would have to enumerate every file that can break the wiring.
+      - name: Check benchmark comment wiring
+        run: node scripts/render_bench_comment.js
+
   test-executor:
     name: Executor tests
     runs-on: ubuntu-latest
@@ -401,6 +409,15 @@ jobs:
           name: prover-tests
 
       - name: Run prover tests (shard ${{ matrix.partition }}/4)
+        # Shard 1 only: force k > 1 so the per-table admission scheduler really
+        # runs several table closures concurrently. ubuntu-latest has 2-4 vCPU
+        # and table_parallelism() defaults to (cores / 3).max(1), so every
+        # other shard proves with a single driver thread and never exercises
+        # the concurrent path or VramGate's blocking path on a PR. The other
+        # three shards keep the default-k coverage. An empty value on those
+        # fails to parse and falls back to the default, so this is inert there.
+        env:
+          TABLE_PARALLELISM: ${{ matrix.partition == 1 && '6' || '' }}
         run: |
           cargo nextest run \
             --archive-file prover-tests.tar.zst \
