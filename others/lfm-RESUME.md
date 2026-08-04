@@ -153,8 +153,37 @@ The machine proves and verifies, end to end, through the registry:
    - **STILL NOT DONE**: entry 7's wiring (intern BITWISE + KECCAK_RC, call
      `programs::emit_register_commitment` from Phase A, rule on DECODE/PAGE) and
      therefore entry 2's derivation; entry 8's synthetic AIR.
-6. **The wrap run** on the box (see `[[scaleway-box-idp]]` in memory:
-   195.154.218.198, 124 GB, warm-built).
+6. ~~**The wrap run**~~ — **DONE, and the machine PROVES its own epoch verifier**
+   (assembly-w7, `feat/lfm-assembly`). Run LOCALLY, not on the box: the box was
+   occupied by an ethrex continuation campaign at both check points (18:43 and
+   18:52 UTC+2, load 22-29 on 32 cores, two different `cli prove` invocations), so
+   per the brief nothing was started on it. Every number names the epoch profile
+   `[2 x14, 3, 4 x4, 5 x3, 7, 20]`; the full table is in
+   `lfm-assembly-obligations.md` entry 10, now SATISFIED.
+   - **Slice 0** (min preset): the assembled verifier proves in 19.5 s and
+     verifies in 0.09 s, 30,707,816-byte proof, 14 sub-proofs, 16.2 GiB peak.
+     220,107,920 main + 87,073,068 aux ext cells.
+   - **Slice 1a** (inner blowup 8, 1 query — the GEOMETRY, 2^23 LDE, 22 Merkle
+     levels, 12 committed FRI layers): proves in 23.3 s, verifies in 0.09 s,
+     31,147,664-byte proof, 15.5 GiB peak.
+   - **Slice 1b** (inner blowup 8, 73 queries — the PRODUCTION SHAPE, emitted and
+     censused, not proved): 76,501,118 instructions / 118,080 permutations /
+     817,101 arena words / 6 KECCAK_RND chunks and **5,077,422,224 main +
+     2,029,461,548 aux ext = 11,165,806,868 base-field-equivalent cells per epoch
+     verify**. Openings **100,959** and FRI **14,454** — both pinned predictions
+     hit exactly.
+   - ★ **84.0% of the cells are the keccak family**, 36,256 main + 13,912 aux per
+     permutation. The hash matrix's other columns therefore decide the machine's
+     SIZE; its structure is already settled.
+   - ⚠ **The production-shaped wrap is not provable at 124 GiB**: 350.6 GiB
+     projected peak from a coefficient measured twice (33.7 bytes per
+     base-field-equivalent cell; a 15.9 GiB projection came in at 15.5 GiB). The
+     three ways out are a cheaper hash, disk spill, or splitting the wrap — a
+     decision, not a debt.
+   - Falsified both directions, end to end: a tampered inner proof makes the wrap
+     **unbuildable** (execution dies at `DivByZero` in the root compare — a false
+     assert has no witness), while a moved claimed public word or a moved program
+     digest makes an honest proof **unverifiable**.
 
 ## Decisions already made — do not relitigate
 
@@ -282,8 +311,25 @@ which is the wrap run's own reporting rule and not a debt.
    for a witness epoch that cannot exist; the obligation migrates to a
    global-proof verifier.
 
-Ready to start next (wave 7): **the wrap run**, whose numbers must state their
-epoch's trace-length profile (entry 10).
+Wave 7 CLOSED 2026-08-04 (`feat/lfm-assembly`; suite 209 green / 5 ignored,
+`make lint` exit 0). **The wrap run happened: the LFM prover proves the assembled
+epoch verifier and the LFM verifier accepts it.** Item 6 above has the numbers and
+entry 10 has the table. The three things wave 8 inherits:
+
+1. **The hash matrix, which is now the whole remaining question.** Keccak is 84.0%
+   of cells per verify, so blake and Poseidon behind the same socket are not a
+   refinement of the number — they ARE the number. The e2e that measures them
+   exists and is one function call parameterised by options
+   (`lfm::wrap_tests::wrap_run`).
+2. **A resource ceiling, measured**: the production-shaped wrap (inner blowup 8,
+   73 queries) is 11.17 billion cells and needs a projected 350.6 GiB. Nothing
+   about the machine blocks it; a box or a cheaper hash does.
+3. **The box was never used.** It was busy both times it was checked. A run there
+   buys a bigger provable RUNG (4 queries ≈ 70 GiB projected), not the headline.
+
+Superseded — the wave-6 hand-off line, kept for the record: "Ready to start next
+(wave 7): the wrap run, whose numbers must state their epoch's trace-length
+profile (entry 10)."
 
 Superseded — the wave-6 order of work, kept for the record:
 - **Ledger entry 7's wiring, and entry 2 with it.** `programs::emit_register_

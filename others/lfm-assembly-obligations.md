@@ -5,12 +5,22 @@ owed (standing-decisions method rule 5). Assembly (RESUME item 5) may not be
 called done while any entry is OPEN. Add entries as legs flag them; close an
 entry only with the verifying evidence named in it.
 
-## STATUS AT WAVE 6 (2026-08-04)
+## STATUS AT WAVE 7 (2026-08-04)
 
-Entries 1 through 9 are all DISCHARGED. **Entry 10 is the only one left open**,
-and it is not a debt but a standing rule for the wrap run: every per-epoch cost
-number must name the epoch shape it describes. Two things wave 6 could not close
-and that belong to the USER rather than to a leg:
+**The ledger is CLOSED.** Entries 1 through 9 were discharged in waves 5 and 6;
+entry 10, the wrap run's own reporting rule, is SATISFIED by the wrap run and
+carries its table of numbers (each naming its epoch profile). One NEW item the
+wrap run surfaced, which is a resource fact rather than a debt:
+
+- **The production-shaped wrap cannot be PROVED on 124 GiB.** The verifier of an
+  inner epoch at blowup 8 / 73 queries is 11.17 billion base-field-equivalent
+  trace cells, i.e. a projected 350.6 GiB of peak prover RSS from a coefficient
+  measured twice. Whatever makes it provable — a cheaper hash (84% of the cells),
+  disk spill, or splitting the wrap — is a decision, not an obligation, so it is
+  recorded in entry 10 rather than opened as entry 11.
+
+Two things wave 6 could not close and that belong to the USER rather than to a
+leg:
 
 - **A framework ceiling.** The production prover cannot prove any AIR with
   `step_size > 1` (entry 9's note). Lifting it looks like a one-line relaxation
@@ -437,9 +447,46 @@ production call sites, and DECODE's binding rests on it.
    (entry 8 is the absorb ORDER, this is the constraint leg's frame indexing) and
    a synthetic AIR built for entry 8 must exercise both or it closes only one.
 
-10. **Every per-epoch cost number must name the epoch SHAPE it describes**
-    (assembly-w5, slice 1 — measured, and it retracts nothing but reframes
-    everything). The phase's composed predictions were computed at a UNIFORM
+10. ~~**Every per-epoch cost number must name the epoch SHAPE it describes**~~ —
+    **SATISFIED by the wrap run** (assembly-w7, 2026-08-04). Every number below
+    carries its epoch profile, and the entry's own prediction is now MEASURED
+    rather than projected. The wrap run's table, all on the fixture epoch's
+    profile `[2 x14, 3, 4 x4, 5 x3, 7, 20]` (24 sub-proofs, fibonacci guest, a
+    16-cycle INTERMEDIATE epoch):
+
+    | inner proof | instructions | keccak perms | arena words | main cells | aux ext cells | wrap prove | wrap verify | wrap proof |
+    |---|---|---|---|---|---|---|---|---|
+    | min preset (blowup 2, 1 query) | 2,248,650 | 2,872 | 16,541 | 220,107,920 | 87,073,068 | 19.5 s | 0.09 s | 30,707,816 B |
+    | blowup 8, 1 query (geometry) | 2,425,718 | 3,816 | 16,893 | 230,661,264 | 92,350,764 | 23.3 s | 0.09 s | 31,147,664 B |
+    | blowup 8, 73 queries (production shape) | 76,501,118 | 118,080 | 817,101 | 5,077,422,224 | 2,029,461,548 | not provable — see below | — | — |
+
+    The wrap's OWN options are blowup 2 / 219 queries / grinding 20 in every row;
+    prove figures are one 11-core laptop and are observations of a box, not
+    machine invariants.
+
+    - **The entry's prediction landed exactly.** At blowup 8 / 73 queries the
+      emitted program's opening permutations are **100,959** — the number wave 6
+      projected for THIS epoch — and FRI is **14,454**, the pinned per-2^20
+      sub-proof figure. The closed form is asserted in the test, so the emitted
+      program and the shape arithmetic agree by check and not by eye.
+    - **The 460,000 design target is a different workload, exactly as the entry
+      says.** This epoch's whole bill is 118,080 permutations (2,667 spine +
+      115,413 legs), 3.9x under the target, because 23 of its 24 tables are tiny.
+      Nothing here revises 460,000 as a model of a production-SIZED epoch.
+    - **The production-shaped wrap does not fit on any box we have**, and this is
+      measured rather than argued: 11,165,806,868 base-field-equivalent cells at
+      the measured 33.7 bytes/cell is a projected 350.6 GiB of peak RSS, 2.8x the
+      124 GiB measurement box. The coefficient has two measured points (16.2 GiB
+      at 481.3M cells, 15.5 GiB at 507.7M cells against a 15.9 GiB projection), so
+      it is an extrapolation of a validated ratio, not a guess — but it IS a 22x
+      extrapolation and the report says so.
+    - **84.0% of the cells are the hash.** `LFM_KECCAK` + `KECCAK_RND` are
+      4,364,173,312 main + 1,672,478,720 aux ext of the total; one permutation
+      costs 36,256 main + 13,912 aux cells. That is the number the hash matrix
+      exists to move, and it means the matrix's other columns decide the machine's
+      size, not its structure.
+
+    (Original text kept below.) The phase's composed predictions were computed at a UNIFORM
     `log2_trace = 20` across all sub-proofs (`join_tests::join_leg_cost`'s stated
     constants). A real INTERMEDIATE epoch is not shaped like that: the fixture
     epoch's measured trace lengths (log2) are `[2 x14, 3, 4 x4, 5 x3, 7, 20]` —

@@ -622,6 +622,18 @@ pub(super) struct RealEpoch {
 }
 
 pub(super) fn real_epoch() -> RealEpoch {
+    real_epoch_with(super::proof_fixture::fixture_options())
+}
+
+/// [`real_epoch`] under supplied proof options — the wrap run's blowup axis.
+///
+/// The options are the INNER proof's, so they change what the verifier has to do:
+/// the query count, the LDE depth every Merkle walk climbs, and how many FRI
+/// layers commit. Everything else about the epoch is fixed (same guest, same
+/// 16-cycle epoch, therefore the same trace-length profile), which is what makes
+/// two runs at different options comparable — assembly ledger entry 10 is about
+/// exactly this: the profile has to travel with the number.
+pub(super) fn real_epoch_with(opts: crate::ProofOptions) -> RealEpoch {
     use crate::tables::trace_builder::{Traces, build_initial_image_paged};
     use crate::tables::{MaxRowsConfig, bitwise, local_to_global, register};
     use crypto::fiat_shamir::default_transcript::DefaultTranscript;
@@ -631,7 +643,6 @@ pub(super) fn real_epoch() -> RealEpoch {
     use stark::proof::view::MultiProofView;
     use stark::verifier::IsStarkVerifier;
 
-    let opts = super::proof_fixture::fixture_options();
     let elf_bytes = super::proof_fixture::read_inner_elf();
     let elf = Elf::load(&elf_bytes).expect("the fixture ELF must load");
     let epoch_size = 1usize << super::proof_fixture::FIXTURE_EPOCH_LOG2;

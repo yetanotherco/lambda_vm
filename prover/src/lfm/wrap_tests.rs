@@ -140,6 +140,37 @@ pub(super) fn report_census(label: &str, program: &LfmProgram) -> (u64, u64) {
          (an ext element is 3 base felts)",
         main + 3 * aux
     );
+
+    // ★ THE HASH SHARE — what the matrix is about.
+    //
+    // The whole reason to count cells is to price the hash, so the census says
+    // outright how much of the machine IS the hash. `LFM_KECCAK` (the adapter row
+    // that requests a permutation) and `KECCAK_RND` (its 24 rounds) are the
+    // permutation itself; `KECCAK_RC` and `BITWISE` are the lookup tables it reads,
+    // and they are reported separately because they are FIXED-height — a different
+    // hash would delete the first pair and shrink but not necessarily remove the
+    // second.
+    let share = |names: &[&str]| -> (u64, u64) {
+        census
+            .iter()
+            .filter(|c| names.contains(&c.name))
+            .fold((0u64, 0u64), |(m, a), c| {
+                (m + c.main_cells(), a + c.aux_cells())
+            })
+    };
+    let (perm_main, perm_aux) = share(&["LFM_KECCAK", "KECCAK_RND"]);
+    let (tab_main, tab_aux) = share(&["KECCAK_RC", "BITWISE"]);
+    let total = (main + 3 * aux) as f64;
+    println!(
+        "   keccak permutation chips (LFM_KECCAK + KECCAK_RND): {perm_main} main + \
+         {perm_aux} aux = {:.1}% of cells\n   \
+         its lookup tables (KECCAK_RC + BITWISE, fixed height): {tab_main} main + \
+         {tab_aux} aux = {:.1}%\n   \
+         everything else (the verifier's own arithmetic): {:.1}%",
+        100.0 * (perm_main + 3 * perm_aux) as f64 / total,
+        100.0 * (tab_main + 3 * tab_aux) as f64 / total,
+        100.0 * (main + 3 * aux - perm_main - 3 * perm_aux - tab_main - 3 * tab_aux) as f64 / total,
+    );
     println!("   instruction mix: {}", instruction_mix(program));
     (main, aux)
 }
@@ -194,8 +225,48 @@ pub(super) fn epoch_profile(e: &super::epoch_tests::RealEpoch) -> String {
 #[test]
 #[ignore]
 fn the_wrap_proves_and_verifies() {
+    wrap_run(super::proof_fixture::fixture_options());
+}
+
+/// ★ SLICE 1 (local rung) — the wrap at the inner proof's BLOWUP-8 GEOMETRY.
+///
+/// The standing decision is that the inner proof is at blowup 8, and blowup is
+/// not a rescaling of blowup 2: the LDE is four times deeper, so every Merkle walk
+/// climbs two more levels, the FRI chain commits more layers, and the terminal
+/// polynomial is reached from further away. None of that is exercised by slice 0.
+///
+/// The QUERY count is the one thing reduced, and reduced for a stated reason: at
+/// the real 73 queries the wrap's own trace does not fit in any box we have (see
+/// [`the_wrap_census_at_blowup_8`], which measures the program and prints what
+/// proving it would need). ONE query is what a 36 GiB local box holds, and it is
+/// enough to make every blowup-8 structure real — the deeper walk, the longer fold
+/// chain, the terminal polynomial reached from further away — since what falls out
+/// at one query is only the REPETITION of that structure. An honest partial: the
+/// GEOMETRY is proved, the query COUNT is not, and the two are separable because
+/// per-query cost is a closed form over the shapes that
+/// [`the_wrap_census_at_blowup_8`] asserts the emitted program against.
+#[test]
+#[ignore]
+fn the_wrap_proves_at_blowup_8_geometry() {
+    wrap_run(inner_blowup_8_with_queries(1));
+}
+
+/// The inner proof's blowup-8 options with the query count overridden.
+///
+/// NOT a security parameter set at anything below 73 queries, and never used as
+/// one: the query count is what this reduces and every measurement taken under it
+/// says so in its label.
+fn inner_blowup_8_with_queries(queries: usize) -> ProofOptions {
+    let mut o = crate::recursion::Preset::Blowup8.options();
+    o.fri_number_of_queries = queries;
+    o
+}
+
+/// The wrap, end to end, under supplied INNER proof options: build the epoch,
+/// emit the verifier, prove it, verify it, and run the three falsifications.
+fn wrap_run(inner: ProofOptions) {
     let t_epoch = Instant::now();
-    let e = super::epoch_tests::real_epoch();
+    let e = super::epoch_tests::real_epoch_with(inner.clone());
     let profile = epoch_profile(&e);
     println!(
         "inner epoch: {} sub-proofs, blowup {}, {} quer{} per table, grinding {} — built in {:.1}s",
@@ -211,10 +282,37 @@ fn the_wrap_proves_and_verifies() {
         t_epoch.elapsed().as_secs_f64()
     );
 
+    // The GEOMETRY the blowup fixes, stated per run: what the walks climb and what
+    // the FRI chain folds. This is what separates a blowup-8 run from a blowup-2 one
+    // at the same query count, so it is printed rather than left to the label.
+    let big = e
+        .legs
+        .iter()
+        .max_by_key(|l| l.verify.sub.deep.log2_trace_length)
+        .expect("the epoch has sub-proofs");
+    println!(
+        "   geometry: widest sub-proof 2^{} trace -> 2^{} LDE, {} Merkle levels per group, \
+         {} committed FRI layers ({} across the epoch); widest leaf {} bytes",
+        big.verify.sub.deep.log2_trace_length,
+        big.verify.sub.log2_lde_length,
+        big.verify.sub.merkle_depth,
+        big.verify.fri.num_committed(),
+        e.legs
+            .iter()
+            .map(|l| l.verify.fri.num_committed())
+            .sum::<usize>(),
+        e.legs
+            .iter()
+            .flat_map(|l| l.verify.sub.groups())
+            .map(|g| g.leaf_bytes())
+            .max()
+            .expect("the epoch has groups"),
+    );
+
     let program = super::epoch_tests::epoch_program(&e, true);
     let arenas = super::epoch_tests::epoch_arena_words(&e, true);
     report_program("THE WRAPPED PROGRAM", &profile, &program);
-    report_census(
+    let (main, aux) = report_census(
         &format!("assembled epoch verifier, epoch {profile}"),
         &program,
     );
@@ -250,11 +348,22 @@ fn the_wrap_proves_and_verifies() {
     );
     let verify_secs = t.elapsed().as_secs_f64();
     println!(
-        "\n★ WRAP PROVED AND VERIFIED (inner epoch {profile})\n   \
+        "\n★ WRAP PROVED AND VERIFIED (inner epoch {profile}, blowup {}, {} quer{})\n   \
          prove {prove_secs:.1}s / verify {verify_secs:.2}s / proof {size} bytes / \
-         {} published words / {} sub-proofs",
+         {} published words / {} sub-proofs\n   \
+         cells {main} main + {aux} aux ext; the projection for this run was \
+         {:.1} GiB of peak RSS — compare against what the harness measured around \
+         the process",
+        inner.blowup_factor,
+        inner.fri_number_of_queries,
+        if inner.fri_number_of_queries == 1 {
+            "y"
+        } else {
+            "ies"
+        },
         proved.public_words.len(),
         proved.proof.proofs.len(),
+        projected_peak_bytes(main, aux) / (1u64 << 30) as f64,
     );
 
     // ---- the published words are the ones the execution produced, so the
@@ -374,6 +483,110 @@ fn the_wrap_census() {
     assert!(
         main > floor_main,
         "the verifier must cost more than the floor"
+    );
+}
+
+/// Peak prover memory the census implies, in bytes, from a MEASURED coefficient.
+///
+/// The measured point is slice 0: 481,327,124 base-field-equivalent cells peaked
+/// at 16,228,499,456 bytes of RSS, i.e. 33.7 bytes per cell — a trace word, its
+/// blowup-2 LDE, and the Merkle/quotient working set on top. Stated as a
+/// coefficient rather than derived from first principles because the derivation
+/// would be a guess about the prover's allocation pattern and this is an
+/// observation of it. What it CANNOT see: whether the coefficient holds at ten
+/// times the size (allocator behaviour, and the fact that a bigger program is
+/// bigger in different chips), so it is a projection and is labelled as one
+/// wherever it is printed.
+const MEASURED_BYTES_PER_CELL: f64 = 16_228_499_456.0 / 481_327_124.0;
+
+fn projected_peak_bytes(main: u64, aux: u64) -> f64 {
+    (main + 3 * aux) as f64 * MEASURED_BYTES_PER_CELL
+}
+
+/// ★ SLICE 1 — the PRODUCTION-SHAPED census: the inner epoch at blowup 8 with its
+/// real 73-query count, which is the standing decision for the inner proof.
+///
+/// This is the cells-per-verify number the hash matrix wants, and it is a
+/// MEASUREMENT of the emitted program rather than a projection from a per-leg
+/// cost: the same emitter, the same real epoch, the same 24 sub-proofs, with only
+/// the inner proof's options moved. Whether the resulting program can be PROVED is
+/// a separate question and the test answers it with the projection above rather
+/// than by pretending to have run it.
+#[test]
+#[ignore]
+fn the_wrap_census_at_blowup_8() {
+    let inner = crate::recursion::Preset::Blowup8.options();
+    let t = Instant::now();
+    let e = super::epoch_tests::real_epoch_with(inner.clone());
+    let profile = epoch_profile(&e);
+    println!(
+        "inner epoch: {} sub-proofs, blowup {}, {} queries per table, grinding {}, \
+         fri final poly log degree {} — proved and accepted in {:.1}s",
+        e.legs.len(),
+        inner.blowup_factor,
+        inner.fri_number_of_queries,
+        inner.grinding_factor,
+        inner.fri_final_poly_log_degree,
+        t.elapsed().as_secs_f64()
+    );
+
+    let t = Instant::now();
+    let program = super::epoch_tests::epoch_program(&e, true);
+    println!(
+        "   emitted the assembled verifier in {:.1}s",
+        t.elapsed().as_secs_f64()
+    );
+    report_program("ASSEMBLED VERIFIER @ inner blowup 8", &profile, &program);
+    let (main, aux) = report_census(
+        &format!("assembled, epoch {profile}, inner blowup 8"),
+        &program,
+    );
+
+    // ---- MEASURED against the phase's pinned predictions, number by number.
+    let openings: usize = e
+        .legs
+        .iter()
+        .map(|l| {
+            l.verify.num_queries
+                * (super::epoch_verify::leaf_permutations(&l.verify.sub)
+                    + l.verify.sub.groups().len() * l.verify.sub.merkle_depth)
+        })
+        .sum();
+    let fri: usize = e
+        .legs
+        .iter()
+        .map(|l| l.verify.num_queries * l.verify.fri.permutations_per_query())
+        .sum();
+    let spine = super::epoch_tests::epoch_program(&e, false);
+    println!(
+        "\n  MEASURED vs PREDICTED (epoch {profile}, inner blowup 8, {} queries):\n\
+         \x20 openings   {openings:>9}   [predicted 100,959 — wave 6's projection of THIS epoch]\n\
+         \x20 FRI        {fri:>9}   [pinned 14,454 per 2^20 sub-proof at blowup 8]\n\
+         \x20 legs total {:>9}   = emitted assembled - spine\n\
+         \x20 epoch bill {:>9}   [design target ~460,000 for a PRODUCTION-sized epoch]",
+        e.legs[0].verify.num_queries,
+        permutations(&program) - permutations(&spine),
+        permutations(&program),
+    );
+    assert_eq!(
+        permutations(&program) - permutations(&spine),
+        openings + fri,
+        "the emitted leg permutations must be the closed form over the shapes"
+    );
+
+    // ---- can it be proved? The projection, with its coefficient named.
+    let bytes = projected_peak_bytes(main, aux);
+    println!(
+        "\n  PROVING THIS: {} main + {} aux ext = {} base-field-equivalent cells\n\
+         \x20 projected peak RSS {:.1} GiB at the measured {:.1} bytes/cell \
+         (slice 0's 16.2 GiB / 481.3M cells)\n\
+         \x20 the measurement box has 124 GiB, so this is {:.1}x what fits",
+        main,
+        aux,
+        main + 3 * aux,
+        bytes / (1 << 30) as f64,
+        MEASURED_BYTES_PER_CELL,
+        bytes / (124.0 * (1u64 << 30) as f64),
     );
 }
 
