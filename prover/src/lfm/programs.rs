@@ -467,7 +467,10 @@ pub fn statement_replay_program_source() -> LfmProgramSource {
         let (main, r) = roots.split_at(ROOT_HALVES as usize);
         roots = r;
         tables.push(PhaseATable {
-            preprocessed_root: prep,
+            // This driver supplies every root as arena cells on purpose: it is the
+            // statement/Phase-A differential, and where a root COMES FROM is the
+            // assembled verifier's decision (ledger entry 7), not this program's.
+            preprocessed_root: prep.map(super::statement_replay::PhaseAPreprocessed::Cells),
             main_root: main,
         });
     }
@@ -873,8 +876,6 @@ impl ProgramIdShape {
 /// stated rather than assumed.
 pub fn program_id_program_source(shape: ProgramIdShape) -> LfmProgramSource {
     use super::builder::Felt;
-    use super::transcript_replay::ByteString;
-    use crate::recursion::PROGRAM_ID_TAG;
 
     let root_halves = ROOT_HALVES;
     let per_page = U64_HALVES + root_halves;
@@ -888,25 +889,93 @@ pub fn program_id_program_source(shape: ProgramIdShape) -> LfmProgramSource {
     let (pc_start, rest) = rest.split_at(U64_HALVES as usize);
     let (decode, mut pages) = rest.split_at(root_halves as usize);
 
+    let page_cells: Vec<(&[Felt], &[Felt])> = (0..shape.num_pages)
+        .map(|_| {
+            let (base, r) = pages.split_at(U64_HALVES as usize);
+            let (commitment, r) = r.split_at(root_halves as usize);
+            pages = r;
+            (base, commitment)
+        })
+        .collect();
+
+    let id = emit_program_id(&mut b, shape, elf_digest, pc_start, decode, &page_cells);
+    b.public(id[0]);
+    b.public(id[1]);
+    b.finish()
+}
+
+/// The `program_id` fold over cells the caller already holds — the form the
+/// ASSEMBLED verifier needs.
+///
+/// This exists for assembly ledger entry 7's DECODE half. DECODE's preprocessed
+/// commitment is a function of the inner ELF, so it can be neither interned (that
+/// would make LFM program identity ELF-dependent) nor left unbound. The
+/// resolution ruled on 2026-08-04 is the **attestation join**: the same arena cell
+/// Phase A absorbs is the cell this fold consumes, so a prover who substitutes a
+/// DECODE root changes the published `program_id` and the consumer's own recompute
+/// rejects it. That makes DECODE exactly as bound as `elf_digest` and `pc_start`
+/// already are — and the join is only real if it is STRUCTURAL, one cell with two
+/// consumers, which is why this takes cells rather than an arena.
+///
+/// `elf_digest` is the same eight halves the epoch STATEMENT absorbs, so that
+/// value's join comes free.
+///
+/// ⚠ The join's strength is the consumer-side compare
+/// (`recursion::check_attestation`), which has zero production call sites. Folding
+/// the roots does not bind them by itself; it makes a substitution DETECTABLE by a
+/// consumer who performs the ritual.
+pub fn emit_program_id(
+    b: &mut LfmBuilder,
+    shape: ProgramIdShape,
+    elf_digest: &[super::builder::Felt],
+    pc_start: &[super::builder::Felt],
+    decode: &[super::builder::Felt],
+    pages: &[(&[super::builder::Felt], &[super::builder::Felt])],
+) -> super::edsl::KeccakDigest {
+    use super::transcript_replay::ByteString;
+    use crate::recursion::PROGRAM_ID_TAG;
+
+    assert_eq!(
+        elf_digest.len(),
+        ROOT_HALVES as usize,
+        "the ELF digest is 32 bytes"
+    );
+    assert_eq!(
+        pc_start.len(),
+        U64_HALVES as usize,
+        "the entry point is one u64"
+    );
+    assert_eq!(
+        decode.len(),
+        ROOT_HALVES as usize,
+        "the DECODE commitment is 32 bytes"
+    );
+    assert_eq!(
+        pages.len(),
+        shape.num_pages,
+        "the page count is SHAPE: it fixes the hashed length and every padding \
+         position"
+    );
+
     let mut s = ByteString::new();
     s.push_const(PROGRAM_ID_TAG);
     s.push_halves(elf_digest);
     s.push_halves(pc_start);
     s.push_halves(decode);
     s.push_const(&(shape.num_pages as u64).to_le_bytes());
-    for _ in 0..shape.num_pages {
-        let (base, r) = pages.split_at(U64_HALVES as usize);
-        let (commitment, r) = r.split_at(root_halves as usize);
-        pages = r;
+    for (base, commitment) in pages {
+        assert_eq!(base.len(), U64_HALVES as usize, "a page base is one u64");
+        assert_eq!(
+            commitment.len(),
+            ROOT_HALVES as usize,
+            "a page commitment is 32 bytes"
+        );
         s.push_halves(base);
         s.push_halves(commitment);
     }
     assert_eq!(s.len(), shape.byte_len(), "byte accounting must agree");
 
-    let id = s.keccak256(&mut b);
-    b.public(id[0]);
-    b.public(id[1]);
-    b.finish()
+    s.keccak256(b)
 }
 
 pub fn program_id_program(shape: ProgramIdShape) -> LfmProgram {

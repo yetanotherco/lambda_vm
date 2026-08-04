@@ -57,15 +57,20 @@ use super::transcript_replay::{ByteString, TranscriptReplay};
 /// The grinding prefix, `crypto/stark/src/grinding.rs`'s `PREFIX`.
 const GRINDING_PREFIX: [u8; 8] = 0x0123_4567_89ab_cded_u64.to_be_bytes();
 
-/// A commitment root as the machine holds it: two words, unpacked ONCE.
+/// A commitment root as the machine holds it: eight `u32` lanes, produced ONCE.
 ///
 /// Both consumers of a root — the transcript absorb and the Merkle comparison —
 /// want a different view of the same 32 bytes, and a root that was hinted twice
-/// (or unpacked twice) would let those views drift. The words are the cells the
-/// walk compares against; the lanes are the halves the transcript absorbs.
+/// (or unpacked twice) would let those views drift. So there is one unpack per
+/// root and every consumer reads its lanes.
+///
+/// The three constructors are the three SOURCES a root can have, which is
+/// assembly ledger entry 7's whole content: program text ([`Self::constant`]),
+/// an in-machine derivation ([`Self::from_digest`]) or the proof's arena
+/// ([`Self::hint`]). Which one a given commitment may use is a property of what
+/// the commitment is a function of, not a convenience.
 #[derive(Clone)]
 pub struct RootCells {
-    pub words: [Cell; DIGEST_WORDS],
     pub lanes: [[Felt; 4]; DIGEST_WORDS],
 }
 
@@ -73,8 +78,55 @@ impl RootCells {
     /// Read a root out of an arena at `base` (two words) and hoist its unpack.
     pub fn hint(b: &mut LfmBuilder, arena: super::instr::ArenaId, base: u32) -> Self {
         let words = [b.hint_word(arena, base), b.hint_word(arena, base + 1)];
-        let lanes = [b.unpack(words[0]), b.unpack(words[1])];
-        RootCells { words, lanes }
+        RootCells {
+            lanes: [b.unpack(words[0]), b.unpack(words[1])],
+        }
+    }
+
+    /// A root that is PROGRAM TEXT — its eight halves interned as constants.
+    ///
+    /// Admissible only for a commitment that is a function of the proof OPTIONS
+    /// and nothing else, because a program constant is part of program identity:
+    /// interning a root derived from per-proof data (an ELF, a register file)
+    /// would give the machine one program per proof instead of one per epoch
+    /// SHAPE. The two that qualify are BITWISE and KECCAK_RC
+    /// (`bitwise::preprocessed_commitment(options)`,
+    /// `tables::keccak_rc::preprocessed_commitment(options)`), plus PAGE's
+    /// zero-init root, which every zero-initialised page shares.
+    ///
+    /// Half `h` is bytes `4h..4h+4` little-endian —
+    /// `proof_arena::commitment_words`' layout, which is how a keccak digest
+    /// reaches the chip.
+    pub fn constant(b: &mut LfmBuilder, root: &[u8; 4 * 4 * DIGEST_WORDS]) -> Self {
+        let halves: Vec<Felt> = root
+            .chunks(4)
+            .map(|c| {
+                let mut bytes = [0u8; 4];
+                bytes.copy_from_slice(c);
+                b.felt_const(FE::from(u64::from(u32::from_le_bytes(bytes))))
+            })
+            .collect();
+        let mut lanes = [[halves[0]; 4]; DIGEST_WORDS];
+        for (w, word) in lanes.iter_mut().enumerate() {
+            for (j, lane) in word.iter_mut().enumerate() {
+                *lane = halves[4 * w + j];
+            }
+        }
+        RootCells { lanes }
+    }
+
+    /// A root the machine COMPUTED — the derivation's two digest words, unpacked
+    /// once so every consumer reads the same lanes.
+    ///
+    /// This is REGISTER's source: the commitment is a function of the previous
+    /// epoch's `reg_fini`, and computing it from those cells is what binds them
+    /// (`programs::emit_register_commitment`). A hinted REGISTER root would leave
+    /// the register boundary — the carried commit index among it — a free arena
+    /// word.
+    pub fn from_digest(b: &mut LfmBuilder, digest: super::edsl::KeccakDigest) -> Self {
+        RootCells {
+            lanes: [b.unpack(digest[0]), b.unpack(digest[1])],
+        }
     }
 
     /// The 32 bytes as the eight `u32` halves the transcript absorbs, in order.

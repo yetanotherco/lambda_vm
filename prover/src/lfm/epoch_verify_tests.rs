@@ -362,7 +362,12 @@ fn the_assembled_epoch_verifier_runs() {
     assert_eq!(pub_ext(0), e.z_alpha.0, "the shared LogUp challenge z");
     assert_eq!(pub_ext(1), e.z_alpha.1, "the shared LogUp challenge alpha");
 
-    let mut cursor = 2usize;
+    // The attestation fold is published right after Phase A (two digest words),
+    // and its DECODE input is the cell Phase A absorbed — the join ledger entry 7
+    // rests on. Its value is differentialled in the spine test; here it only has to
+    // be skipped, and skipped by NAME rather than by a literal.
+    let program_id_words = 2usize;
+    let mut cursor = 2 + program_id_words;
     let mut checked = 2usize;
     for (i, (h, leg)) in e.tables.iter().zip(&e.legs).enumerate() {
         // The legs publish first: the recomputed composition, then a terminal
@@ -413,6 +418,7 @@ fn the_assembled_epoch_verifier_runs() {
 
     let queries = e.legs[0].verify.num_queries;
     let opening_perms = perms(&program) - perms(&spine);
+    let legs_published: usize = e.legs.iter().map(|l| 1 + l.verify.num_queries).sum();
     println!(
         "\n★ ASSEMBLED EPOCH VERIFIER (min preset: blowup 2, {queries} quer\
          {}/table, grinding {}):\n\
@@ -432,12 +438,11 @@ fn the_assembled_epoch_verifier_runs() {
         words(&spine),
         words(&program),
         words(&program) - words(&spine),
-        exec.public_words.len() - (program.instrs.len() - program.instrs.len()),
+        // The spine's own published count. Was `len - (x - x)` — a leftover that
+        // printed the assembled figure in the spine column.
+        exec.public_words.len() - legs_published,
         exec.public_words.len(),
-        e.legs
-            .iter()
-            .map(|l| 1 + l.verify.num_queries)
-            .sum::<usize>(),
+        legs_published,
     );
 
     // ---- the constraint leg's share, from the analyses themselves.
@@ -678,9 +683,11 @@ struct ArenaIndex {
 }
 
 fn arena_index(e: &super::epoch_tests::RealEpoch, table: usize) -> ArenaIndex {
-    // The four epoch-wide arenas come first: statement, preprocessed roots, main
-    // roots, register boundary.
-    let mut at = 4usize;
+    // The epoch-wide arenas come first, and their COUNT comes from the emitter's
+    // own side rather than from a literal here: wiring ledger entry 7 added the
+    // second register vector, `pc_start` and (when non-empty) the page roots, and a
+    // literal `4` would have left every vector below tampering the wrong arena.
+    let mut at = super::epoch_tests::num_epoch_wide_arenas(e);
     for (i, h) in e.tables.iter().enumerate() {
         let aux = usize::from(h.shape.has_aux_root);
         let contribution = usize::from(h.shape.has_contribution);
@@ -885,12 +892,10 @@ fn the_assembled_verifier_hints_each_proof_value_once() {
     );
 
     let declared: usize = program.arena_schema.lens.iter().map(|l| *l as usize).sum();
-    let reg_init = crate::tables::register::NUM_REGISTER_ADDRESSES;
     assert_eq!(
         hints.len(),
-        declared - reg_init + 1,
-        "every declared arena word must be read exactly once, bar the register \
-         boundary vector of which only the commit index is read yet"
+        declared,
+        "every declared arena word must be read exactly once"
     );
     // The legs are actually IN this program — without this the guard would pass
     // just as happily over the spine alone.
@@ -963,6 +968,56 @@ fn the_preprocessed_commitments_of_a_real_epoch() {
     assert!(
         !preprocessed.is_empty(),
         "an epoch with no preprocessed sub-proof cannot witness entry 7 at all"
+    );
+
+    // ---- ★ the PROVENANCE census, which is what entry 7 actually turns on.
+    //
+    // `epoch_tests::prep_source` decided each root's source by recomputing every
+    // candidate production has; reaching this line means every preprocessed root of
+    // a real epoch matched one, so nothing is hinted without a binding. What is
+    // asserted here is the SHAPE of the taxonomy — that the epoch is not all
+    // constants (which would make the derivation and the fold untested) and not all
+    // ELF-dependent (which would mean interning bought nothing).
+    let sources = super::epoch_tests::prep_source_census(&e);
+    println!(
+        "  provenance: {} options-only (interned as program text), {} derived \
+         in-machine (REGISTER), {} ELF-dependent (arena cell + attestation join)",
+        sources.0, sources.1, sources.2
+    );
+    assert_eq!(
+        sources.0 + sources.1 + sources.2,
+        preprocessed.len(),
+        "every preprocessed sub-proof must have exactly one classified source"
+    );
+    assert!(
+        sources.0 > 0,
+        "no options-only root: the interning path is unexercised"
+    );
+    assert_eq!(
+        sources.1, 1,
+        "exactly one derived root — the REGISTER commitment, from the epoch's own \
+         register boundary"
+    );
+    assert_eq!(
+        sources.2, 1,
+        "exactly one ELF-dependent root in a continuation epoch — DECODE. A second \
+         would mean the attestation fold's input is ambiguous"
+    );
+
+    // ★ AND THE PAGE HALF OF ENTRY 7 IS NOT A FIXTURE ARTEFACT. `prove_epoch`
+    // rejects any epoch carrying a PAGE config ("continuation epoch must have no
+    // PAGE configs (L2G bookend replaces PAGE)", `continuation.rs:695-702`) and both
+    // `build_epoch_airs` call sites pass `&[]`. So no continuation epoch of any
+    // guest has a PAGE sub-proof, and the ELF-data page genesis roots the
+    // attestation folds are the GLOBAL proof's GlobalMemory AIRs' preprocessed
+    // commitments. Asserted rather than remembered: if an epoch ever grows a PAGE
+    // sub-proof, the count above stops being 1 and this test says so.
+    assert!(
+        e.legs
+            .iter()
+            .all(|l| l.num_precomputed_cols != crate::tables::page::NUM_PREPROCESSED_COLS),
+        "a sub-proof with PAGE's preprocessed width appeared: continuation epochs \
+         are supposed to carry none, and the entry-7 taxonomy changes if they do"
     );
 }
 

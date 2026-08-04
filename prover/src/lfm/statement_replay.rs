@@ -134,11 +134,27 @@ pub fn absorb_epoch_statement(
     t.append_halves_misaligned(vars.epoch_label);
 }
 
+/// A preprocessed commitment as Phase A absorbs it — and the distinction is
+/// which SOURCE the root has, not how it is encoded.
+///
+/// Production reads every one of these from the AIR and never from the proof
+/// (`verifier.rs:1187`), so what the machine must reproduce is the root's
+/// provenance: a commitment that is a function of the proof options alone is
+/// program text and absorbs as literal bytes; one that is a function of per-proof
+/// data (an ELF, a register boundary) is cells, and something else in the program
+/// owes their binding (assembly ledger entry 7).
+pub enum PhaseAPreprocessed<'a> {
+    /// Program text — 32 literal bytes, absorbed with no arithmetic at all.
+    Constant(&'a [u8; 32]),
+    /// Cells: eight `u32` halves, derived in-machine or read from the arena.
+    Cells(&'a [Felt]),
+}
+
 /// One sub-proof's Phase-A commitments, as arena halves (8 per 32-byte root).
 pub struct PhaseATable<'a> {
     /// Present exactly when the air is preprocessed — the verifier absorbs the
     /// precomputed commitment only then.
-    pub preprocessed_root: Option<&'a [Felt]>,
+    pub preprocessed_root: Option<PhaseAPreprocessed<'a>>,
     pub main_root: &'a [Felt],
 }
 
@@ -157,9 +173,13 @@ pub fn replay_phase_a(
     tables: &[PhaseATable],
 ) -> (Ext, Ext) {
     for table in tables {
-        if let Some(prep) = table.preprocessed_root {
-            assert_eq!(prep.len(), 8, "a commitment is 32 bytes");
-            t.append_halves_misaligned(prep);
+        match &table.preprocessed_root {
+            Some(PhaseAPreprocessed::Constant(bytes)) => t.append_const_bytes(&bytes[..]),
+            Some(PhaseAPreprocessed::Cells(prep)) => {
+                assert_eq!(prep.len(), 8, "a commitment is 32 bytes");
+                t.append_halves_misaligned(prep);
+            }
+            None => {}
         }
         assert_eq!(table.main_root.len(), 8, "a commitment is 32 bytes");
         t.append_halves_misaligned(table.main_root);

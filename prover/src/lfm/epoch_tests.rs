@@ -485,14 +485,125 @@ fn a_nonce_that_did_not_grind_is_rejected() {
 /// production ACCEPTS. Nothing here is synthetic: the statement is the real
 /// one, the forks carry the real domain separators, and the challenges come
 /// from `replay_rounds_after_round_1` on each fork.
+/// ★ Where a preprocessed commitment COMES FROM — assembly ledger entry 7,
+/// as a type.
+///
+/// Production absorbs every preprocessed root from the AIR and never from the
+/// proof, so the machine owes each one a provenance of the same strength. The
+/// three variants are the three that exist, and which one a commitment gets is
+/// decided by what the commitment is a function of:
+///
+/// - options only ⇒ [`Self::Constant`], interned as program text. Safe because
+///   the proof options are already program SHAPE.
+/// - the previous epoch's register boundary ⇒ [`Self::Register`], DERIVED
+///   in-machine. Interning it would pin one LFM program per register file;
+///   hinting it would leave the boundary — the carried commit index among it — a
+///   free arena word (ledger entry 2).
+/// - the inner ELF ⇒ [`Self::ElfDependent`], an arena cell bound one level up by
+///   the attestation's `program_id` fold. Interning it would make LFM program
+///   identity a function of the guest ELF, which is an always-stop item.
+///
+/// [`prep_source`] decides the variant by MATCHING the AIR's own commitment
+/// against production's candidate functions, so an epoch that grew a preprocessed
+/// table with no known provenance panics instead of quietly hinting an unbound
+/// root.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PrepSource {
+    /// A function of `ProofOptions` alone: BITWISE, KECCAK_RC, or PAGE's
+    /// shared zero-init root.
+    Constant(Commitment),
+    /// REGISTER: `compute_precomputed_commitment_with_fini(options, INIT, FINI)`.
+    Register(Commitment),
+    /// A function of the inner ELF: DECODE, or an ELF-data page's root.
+    ElfDependent(Commitment),
+}
+
+impl PrepSource {
+    /// Whether this root occupies arena words — true for exactly the
+    /// ELF-dependent family.
+    fn is_arena(self) -> bool {
+        matches!(self, PrepSource::ElfDependent(_))
+    }
+}
+
+/// How many of an epoch's preprocessed roots come from each source —
+/// `(options-only, derived, ELF-dependent)`.
+pub(super) fn prep_source_census(e: &RealEpoch) -> (usize, usize, usize) {
+    let mut census = (0, 0, 0);
+    for source in e.phase_a.iter().filter_map(|(p, _)| *p) {
+        match source {
+            PrepSource::Constant(_) => census.0 += 1,
+            PrepSource::Register(_) => census.1 += 1,
+            PrepSource::ElfDependent(_) => census.2 += 1,
+        }
+    }
+    census
+}
+
+/// Classify one preprocessed commitment by recomputing every candidate
+/// production has and seeing which one it IS.
+///
+/// A match is not a heuristic: these are keccak Merkle roots over different
+/// tables, so two candidates agreeing would be a collision. What the function
+/// really buys is the failure mode — a preprocessed AIR whose root matches
+/// nothing known is a root the machine has no binding for, and this panics
+/// rather than hinting it.
+fn prep_source(
+    root: Commitment,
+    opts: &crate::ProofOptions,
+    elf: &executor::elf::Elf,
+    register_init: &[u32],
+    reg_fini: &[u32],
+) -> PrepSource {
+    use crate::tables::{bitwise, decode, keccak_rc, page, register};
+
+    if root == bitwise::preprocessed_commitment(opts)
+        || root == keccak_rc::preprocessed_commitment(opts)
+        || root == page::zero_init_preprocessed_commitment(opts)
+    {
+        return PrepSource::Constant(root);
+    }
+    if root == register::compute_precomputed_commitment_with_fini(opts, register_init, reg_fini) {
+        return PrepSource::Register(root);
+    }
+    if root == decode::commitment_from_elf(elf, opts).expect("the DECODE commitment must compute") {
+        return PrepSource::ElfDependent(root);
+    }
+    panic!(
+        "a preprocessed sub-proof carries a root matching none of production's \
+         candidate sources (BITWISE, KECCAK_RC, PAGE zero-init, REGISTER-with-FINI, \
+         DECODE-from-ELF). The machine has no binding for it, so it must not be \
+         hinted: extend the taxonomy (assembly ledger entry 7) rather than this list"
+    );
+}
+
 pub(super) struct RealEpoch {
     pub(super) statement: super::statement_replay::EpochStatementShape,
     elf_digest: [u8; 32],
     pub(super) public_output: Vec<u8>,
     epoch_label: u64,
-    /// Per table, in sub-proof order: the hardcoded precomputed commitment
-    /// (when the AIR is preprocessed) and the proof's main trace root.
-    phase_a: Vec<(Option<Commitment>, Commitment)>,
+    /// Per table, in sub-proof order: the preprocessed commitment and WHERE IT
+    /// COMES FROM (when the AIR is preprocessed), and the proof's main trace root.
+    phase_a: Vec<(Option<PrepSource>, Commitment)>,
+    /// The epoch's INIT register file — production's `register_init`. The whole
+    /// vector, not just the carried commit index: the REGISTER preprocessed
+    /// commitment is derived from it.
+    register_init: Vec<u32>,
+    /// The epoch's FINAL register file, the other half of that derivation.
+    reg_fini: Vec<u32>,
+    /// The inner ELF's entry point — `program_id`'s `pc_start`.
+    pc_start: u64,
+    /// The ELF-data page genesis roots the attestation folds. EMPTY for a
+    /// continuation epoch's own verification: continuation epochs carry no PAGE
+    /// sub-proof at all (`continuation.rs:695-702`), so these belong to the
+    /// GLOBAL proof and reach the fold from outside.
+    page_commitments: Vec<(u64, Commitment)>,
+    /// The inner proof's LDE domain, for the REGISTER derivation. Both fields are
+    /// proof OPTIONS, hence program shape.
+    reg_shape: super::programs::RegisterDerivationShape,
+    /// `recursion::program_id_from_digest` over this epoch's own inputs — the
+    /// oracle for the attestation fold.
+    pub(super) expected_program_id: [u8; 32],
     /// Per table, everything the fork absorbs plus the oracle challenges.
     pub(super) tables: Vec<HostTable>,
     /// Per table, everything the VERIFICATION LEGS read — the shapes, the
@@ -580,6 +691,11 @@ pub(super) fn real_epoch() -> RealEpoch {
             register::NUM_PREPROCESSED_COLS_WITH_FINI,
         )),
     );
+    // The attestation fold's DECODE input, from PRODUCTION's own function — the
+    // same value `VmAirs::new` puts on the DECODE AIR, and the same one
+    // `recursion::check_attestation` recomputes from a trusted ELF.
+    let decode_root = crate::tables::decode::commitment_from_elf(&elf, &opts)
+        .expect("the DECODE commitment must compute");
     let l2g_air = crate::continuation::l2g_memory_air(&opts, label);
     let mut l2g_trace = local_to_global::generate_local_to_global_trace(&boundary);
 
@@ -635,7 +751,10 @@ pub(super) fn real_epoch() -> RealEpoch {
             let prep = air.precomputed_commitment();
             transcript.append_bytes(&prep);
             transcript.append_bytes(v.lde_trace_main_merkle_root());
-            phase_a.push((Some(prep), *v.lde_trace_main_merkle_root()));
+            phase_a.push((
+                Some(prep_source(prep, &opts, &elf, &register_init, &reg_fini)),
+                *v.lde_trace_main_merkle_root(),
+            ));
         } else {
             transcript.append_bytes(v.lde_trace_main_merkle_root());
             phase_a.push((None, *v.lde_trace_main_merkle_root()));
@@ -711,6 +830,27 @@ pub(super) fn real_epoch() -> RealEpoch {
         public_output,
         epoch_label: label,
         phase_a,
+        register_init,
+        reg_fini,
+        pc_start: elf.entry_point,
+        // ★ EMPTY, and it is a claim about PRODUCTION rather than about this
+        // fixture: `prove_epoch` REJECTS an epoch with any PAGE config
+        // ("continuation epoch must have no PAGE configs (L2G bookend replaces
+        // PAGE)", `continuation.rs:695-702`) and both `build_epoch_airs` call
+        // sites pass `&[]`. The ELF-data page genesis roots the attestation folds
+        // are the GLOBAL proof's GlobalMemory AIRs' preprocessed commitments
+        // (`continuation.rs:997-1010`), never an epoch's.
+        page_commitments: Vec::new(),
+        reg_shape: super::programs::RegisterDerivationShape {
+            blowup: opts.blowup_factor as usize,
+            coset_offset: opts.coset_offset,
+        },
+        expected_program_id: crate::recursion::program_id_from_digest(
+            &crate::statement::elf_digest(&elf_bytes),
+            elf.entry_point,
+            &decode_root,
+            &[],
+        ),
         tables,
         legs,
         z_alpha,
@@ -832,6 +972,24 @@ fn epoch_challenge_program(e: &RealEpoch) -> LfmProgram {
 /// arenas and emits no verification, so the spine test's own arena-word count is
 /// untouched.
 pub(super) fn epoch_program(e: &RealEpoch, with_legs: bool) -> LfmProgram {
+    epoch_program_with(e, with_legs, false)
+}
+
+/// The epoch program, optionally with the DECODE cell SPLIT — a deliberately
+/// broken control, and the falsification the entry-7 ruling asked for.
+///
+/// `split_decode = true` gives the attestation fold its own arena copy of the
+/// DECODE root instead of the cell Phase A absorbed. Nothing about the program
+/// then looks wrong: every assert still passes, the challenges are still
+/// production's, and an honest host that fills both copies with the same 32 bytes
+/// gets the same published `program_id`. That is exactly why the join has to be
+/// denied STRUCTURALLY rather than by a differential —
+/// [`a_split_decode_cell_forges_the_attestation`] runs the coherent forgery this
+/// admits, and
+/// [`the_assembled_verifier_declares_exactly_the_shape_words`] is what refuses it.
+///
+/// The extra arena is declared LAST so no existing arena index moves.
+fn epoch_program_with(e: &RealEpoch, with_legs: bool, split_decode: bool) -> LfmProgram {
     use super::statement_replay::{EpochStatementVars, PhaseATable, absorb_epoch_statement};
 
     let mut b = LfmBuilder::new();
@@ -841,15 +999,31 @@ pub(super) fn epoch_program(e: &RealEpoch, with_legs: bool) -> LfmProgram {
     // ---- arenas, in declaration order ----
     let stmt_halves = 8 + e.statement.public_output_len.div_ceil(4) + 2;
     let a_stmt = b.declare_arena(stmt_halves as u32);
-    let num_prep = e.phase_a.iter().filter(|(p, _)| p.is_some()).count();
-    let a_prep_roots = b.declare_arena(2 * num_prep as u32);
+    // ★ Only the ELF-DEPENDENT preprocessed roots are arena data (ledger entry
+    // 7). The options-only ones are interned as program text and the REGISTER one
+    // is derived in-machine, so neither takes a word here.
+    let num_arena_prep = e
+        .phase_a
+        .iter()
+        .filter(|(p, _)| p.is_some_and(PrepSource::is_arena))
+        .count();
+    let a_prep_roots = b.declare_arena(2 * num_arena_prep as u32);
     let a_main_roots = b.declare_arena(2 * n as u32);
-    // The register boundary vector, declared at production's width. Only the
-    // carried commit index is READ today; the rest is the arena the REGISTER
-    // preprocessed derivation will consume, and declaring it here is what makes
-    // `start_index` the same cell that derivation binds rather than a word of
-    // its own.
-    let a_reg_init = b.declare_arena(crate::tables::register::NUM_REGISTER_ADDRESSES as u32);
+    // The register boundary vectors, at production's width. `start_index` is slot
+    // 64 of INIT, and the REGISTER preprocessed root is COMPUTED from both — which
+    // is what ties the index to the chain (ledger entry 2): production has no
+    // arithmetic `start + len` check anywhere, it rebuilds the commitment from
+    // these vectors and rejects unless the absorbed root matches.
+    let num_reg = crate::tables::register::NUM_REGISTER_ADDRESSES as u32;
+    let a_reg_init = b.declare_arena(num_reg);
+    let a_reg_fini = b.declare_arena(num_reg);
+    // The attestation fold's own inputs. `elf_digest` is NOT here — it is the
+    // statement's, which is the join. `pc_start` has one consumer in an epoch
+    // verifier, and the page roots have none at all (a continuation epoch carries
+    // no PAGE sub-proof), so both are plain proof data the fold hashes.
+    let a_pc_start = b.declare_arena(2);
+    let a_page_roots = (!e.page_commitments.is_empty())
+        .then(|| b.declare_arena(10 * e.page_commitments.len() as u32));
     let per_table: Vec<Arenas> = e
         .tables
         .iter()
@@ -869,6 +1043,8 @@ pub(super) fn epoch_program(e: &RealEpoch, with_legs: bool) -> LfmProgram {
             legs: with_legs.then(|| super::epoch_verify::declare_table_arenas(&mut b, &leg.verify)),
         })
         .collect();
+    // Last in declaration order, so turning the control on shifts no other arena.
+    let a_split_decode = split_decode.then(|| b.declare_arena(2));
 
     // ---- the statement ----
     let stmt: Vec<_> = (0..stmt_halves as u32)
@@ -889,35 +1065,159 @@ pub(super) fn epoch_program(e: &RealEpoch, with_legs: bool) -> LfmProgram {
         },
     );
 
-    // ---- Phase A ----
-    let prep_cells: Vec<RootCells> = (0..num_prep)
-        .map(|i| RootCells::hint(&mut b, a_prep_roots, 2 * i as u32))
+    // ---- ★ the preprocessed roots, each from the source its provenance admits
+    //
+    // Ledger entry 7, and entry 2 closes with it. `PrepSource` was decided
+    // host-side by recomputing production's candidate functions, so the split here
+    // is not a hardcoded sub-proof index: a preprocessed table with an unknown
+    // provenance would already have panicked.
+    let reg_init: Vec<_> = (0..num_reg).map(|r| b.hint_felt(a_reg_init, r)).collect();
+    let reg_fini: Vec<_> = (0..num_reg).map(|r| b.hint_felt(a_reg_fini, r)).collect();
+    let reg_shape = e.reg_shape;
+
+    let mut next_arena_prep = 0usize;
+    let mut decode_cells: Option<RootCells> = None;
+    let prep_cells: Vec<Option<RootCells>> = e
+        .phase_a
+        .iter()
+        .map(|(prep, _)| match prep {
+            None => None,
+            Some(PrepSource::Constant(c)) => Some(RootCells::constant(&mut b, c)),
+            Some(PrepSource::Register(_)) => {
+                let digest = super::programs::emit_register_commitment(
+                    &mut b, reg_shape, &reg_init, &reg_fini,
+                );
+                Some(RootCells::from_digest(&mut b, digest))
+            }
+            Some(PrepSource::ElfDependent(_)) => {
+                let cells = RootCells::hint(&mut b, a_prep_roots, 2 * next_arena_prep as u32);
+                next_arena_prep += 1;
+                // Every ELF-dependent root of a continuation EPOCH is DECODE (the
+                // page family lives in the global proof), and the attestation
+                // folds exactly one DECODE root — so a second one here would mean
+                // the fold's input is ambiguous, not that the fold needs a loop.
+                assert!(
+                    decode_cells.is_none(),
+                    "a continuation epoch has one ELF-dependent preprocessed root \
+                     (DECODE); a second one has no place in the program_id fold"
+                );
+                decode_cells = Some(cells.clone());
+                Some(cells)
+            }
+        })
         .collect();
+    assert_eq!(
+        next_arena_prep, num_arena_prep,
+        "every declared preprocessed arena word must be read"
+    );
+
+    // ---- Phase A ----
     let main_cells: Vec<RootCells> = (0..n)
         .map(|i| RootCells::hint(&mut b, a_main_roots, 2 * i as u32))
         .collect();
-    let prep_halves: Vec<Vec<_>> = prep_cells.iter().map(RootCells::halves).collect();
+    let prep_halves: Vec<Option<Vec<_>>> = prep_cells
+        .iter()
+        .map(|c| c.as_ref().map(RootCells::halves))
+        .collect();
     let main_halves: Vec<Vec<_>> = main_cells.iter().map(RootCells::halves).collect();
-    let mut next_prep = 0usize;
-    let tables: Vec<PhaseATable> = e
+    // The interned bytes, hoisted so Phase A can borrow them for the whole replay.
+    let prep_constants: Vec<Option<Commitment>> = e
         .phase_a
         .iter()
-        .enumerate()
-        .map(|(i, (prep, _))| {
-            let preprocessed_root = prep.map(|_| {
-                let h = &prep_halves[next_prep][..];
-                next_prep += 1;
-                h
-            });
-            PhaseATable {
-                preprocessed_root,
-                main_root: &main_halves[i][..],
-            }
+        .map(|(p, _)| match p {
+            Some(PrepSource::Constant(c)) => Some(*c),
+            _ => None,
+        })
+        .collect();
+    let tables: Vec<PhaseATable> = (0..n)
+        .map(|i| PhaseATable {
+            // A program-text root absorbs as literal BYTES — no splice arithmetic
+            // at all, which is the whole economy of interning it. A derived or
+            // supplied one absorbs as the cells its consumers share.
+            preprocessed_root: match (&prep_constants[i], &prep_halves[i]) {
+                (Some(bytes), _) => {
+                    Some(super::statement_replay::PhaseAPreprocessed::Constant(bytes))
+                }
+                (None, Some(halves)) => Some(super::statement_replay::PhaseAPreprocessed::Cells(
+                    &halves[..],
+                )),
+                (None, None) => None,
+            },
+            main_root: &main_halves[i][..],
         })
         .collect();
     let (z, alpha) = super::statement_replay::replay_phase_a(&mut t, &mut b, &tables);
     b.public(z.as_cell());
     b.public(alpha.as_cell());
+
+    // ---- ★ the attestation join: the DECODE cell Phase A absorbed, folded
+    //
+    // One cell, two consumers. Without this the DECODE root would be a free arena
+    // word — the machine would absorb whatever the prover offered and publish
+    // nothing that depended on it.
+    {
+        let pc_start: Vec<_> = (0..2).map(|i| b.hint_felt(a_pc_start, i)).collect();
+        let page_cells: Vec<(Vec<_>, RootCells)> = e
+            .page_commitments
+            .iter()
+            .enumerate()
+            .map(|(k, _)| {
+                let base = 10 * k as u32;
+                let arena = a_page_roots.expect("a page arena exists when pages do");
+                let base_halves: Vec<_> = (0..2).map(|j| b.hint_felt(arena, base + j)).collect();
+                let root_halves: Vec<_> =
+                    (0..8).map(|j| b.hint_felt(arena, base + 2 + j)).collect();
+                (
+                    base_halves,
+                    RootCells {
+                        lanes: [
+                            [
+                                root_halves[0],
+                                root_halves[1],
+                                root_halves[2],
+                                root_halves[3],
+                            ],
+                            [
+                                root_halves[4],
+                                root_halves[5],
+                                root_halves[6],
+                                root_halves[7],
+                            ],
+                        ],
+                    },
+                )
+            })
+            .collect();
+        let page_halves: Vec<(Vec<_>, Vec<_>)> = page_cells
+            .iter()
+            .map(|(base, root)| (base.clone(), root.halves()))
+            .collect();
+        let page_refs: Vec<(&[_], &[_])> = page_halves
+            .iter()
+            .map(|(base, root)| (&base[..], &root[..]))
+            .collect();
+        let decode = match a_split_decode {
+            // ★ THE BROKEN CONTROL: a second, independent reading of the DECODE
+            // root. The fold now attests to a value Phase A never absorbed.
+            Some(arena) => RootCells::hint(&mut b, arena, 0).halves(),
+            None => decode_cells
+                .as_ref()
+                .expect("a continuation epoch has a DECODE sub-proof")
+                .halves(),
+        };
+        let id = super::programs::emit_program_id(
+            &mut b,
+            super::programs::ProgramIdShape {
+                num_pages: e.page_commitments.len(),
+            },
+            elf_digest,
+            &pc_start,
+            &decode,
+            &page_refs,
+        );
+        b.public(id[0]);
+        b.public(id[1]);
+    }
 
     // ---- one fork per table ----
     let mut contributions: Vec<super::builder::Ext> = Vec::new();
@@ -978,9 +1278,7 @@ pub(super) fn epoch_program(e: &RealEpoch, with_legs: bool) -> LfmProgram {
                     // which is what makes production's explicit
                     // proof-copy-equals-AIR-copy check the absence of a second
                     // value here rather than a comparison.
-                    precomputed_root: e.phase_a[i].0.is_some().then(|| {
-                        &prep_cells[e.phase_a[..i].iter().filter(|(p, _)| p.is_some()).count()]
-                    }),
+                    precomputed_root: prep_cells[i].as_ref(),
                     main_root: &main_cells[i],
                     rap_challenges: &[z, alpha],
                 },
@@ -1013,7 +1311,14 @@ pub(super) fn epoch_program(e: &RealEpoch, with_legs: bool) -> LfmProgram {
         num_contributing_tables: contributions.len(),
         num_output_bytes: e.statement.public_output_len,
     };
-    let start = b.hint_felt(a_reg_init, crate::tables::register::X254_INDEX as u32);
+    // ★ LEDGER ENTRY 2 CLOSES HERE. The carried commit index is not a word of its
+    // own and not even a second READ of one: it is the very cell the REGISTER
+    // preprocessed derivation consumed as INIT slot 64, so the COMMIT-bus target
+    // and the root Phase A absorbed are functions of one value. Production binds
+    // `start_index` exactly this way — it has no arithmetic `start + len` check
+    // anywhere, it rebuilds the commitment from the boundary vectors and rejects
+    // unless the absorbed root matches.
+    let start = reg_init[crate::tables::register::X254_INDEX];
     let bytes = super::epoch::emit_output_bytes(&mut b, public_output, shape.num_output_bytes);
     let target = super::logup::emit_commit_bus_target(&mut b, &shape, z, alpha, start, &bytes);
     let total = super::logup::emit_bus_closure(&mut b, &shape, &contributions, target);
@@ -1027,6 +1332,17 @@ pub(super) fn epoch_program(e: &RealEpoch, with_legs: bool) -> LfmProgram {
 /// The arenas [`epoch_challenge_program`] declares, in the same order.
 fn epoch_arenas(e: &RealEpoch) -> Vec<Vec<LfmWord>> {
     epoch_arena_words(e, false)
+}
+
+/// How many EPOCH-WIDE arenas [`epoch_program`] declares before the first
+/// table's — statement, ELF-dependent preprocessed roots, main roots, the two
+/// register boundary vectors, `pc_start`, and the page roots when there are any.
+///
+/// Exposed rather than hardcoded because a test that walks to a per-table arena
+/// by index silently tampers the WRONG arena when this changes, and reports a
+/// pass: wiring ledger entry 7 moved it from 4 to 6.
+pub(super) fn num_epoch_wide_arenas(e: &RealEpoch) -> usize {
+    6 + usize::from(!e.page_commitments.is_empty())
 }
 
 /// The arenas [`epoch_program`] declares, in the same order.
@@ -1046,17 +1362,64 @@ pub(super) fn epoch_arena_words(e: &RealEpoch, with_legs: bool) -> Vec<Vec<LfmWo
     stmt.extend(halves(&e.public_output));
     stmt.extend(halves(&e.epoch_label.to_le_bytes()));
 
-    let prep: Vec<Commitment> = e.phase_a.iter().filter_map(|(p, _)| *p).collect();
+    // Only the ELF-DEPENDENT roots take arena words; the rest are program text or
+    // derived in-machine.
+    let prep: Vec<Commitment> = e
+        .phase_a
+        .iter()
+        .filter_map(|(p, _)| match p {
+            Some(PrepSource::ElfDependent(c)) => Some(*c),
+            _ => None,
+        })
+        .collect();
     let main: Vec<Commitment> = e.phase_a.iter().map(|(_, m)| *m).collect();
 
-    let mut reg_init = vec![base_word(FE::zero()); crate::tables::register::NUM_REGISTER_ADDRESSES];
-    reg_init[crate::tables::register::X254_INDEX] = base_word(FE::from(e.start_index));
+    // The register boundary, at production's width. The carried commit index sits
+    // in slot 64 of INIT, and the REGISTER preprocessed root is derived from both
+    // vectors — so this arena is not padding around one word any more.
+    let reg = |v: &[u32]| -> Vec<LfmWord> {
+        assert_eq!(
+            v.len(),
+            crate::tables::register::NUM_REGISTER_ADDRESSES,
+            "a register boundary vector is one word per register word address"
+        );
+        v.iter()
+            .map(|w| base_word(FE::from(u64::from(*w))))
+            .collect()
+    };
+    assert_eq!(
+        e.register_init[crate::tables::register::X254_INDEX] as u64,
+        e.start_index,
+        "the carried commit index must BE slot 64 of the INIT vector, or the \
+         COMMIT-bus target and the REGISTER derivation are reading two values"
+    );
     let mut out = vec![
         stmt.iter().map(|h| base_word(*h)).collect(),
         super::proof_arena::commitments_to_arena(&prep),
         super::proof_arena::commitments_to_arena(&main),
-        reg_init,
+        reg(&e.register_init),
+        reg(&e.reg_fini),
+        super::keccak_host::pack_stream(&e.pc_start.to_le_bytes())
+            .into_iter()
+            .map(base_word)
+            .collect(),
     ];
+    if !e.page_commitments.is_empty() {
+        let mut pages: Vec<LfmWord> = Vec::new();
+        for (base, c) in &e.page_commitments {
+            pages.extend(
+                super::keccak_host::pack_stream(&base.to_le_bytes())
+                    .into_iter()
+                    .map(base_word),
+            );
+            pages.extend(
+                super::keccak_host::pack_stream(c)
+                    .into_iter()
+                    .map(base_word),
+            );
+        }
+        out.push(pages);
+    }
     for (h, leg) in e.tables.iter().zip(&e.legs) {
         if let Some(r) = h.aux_root {
             out.push(super::proof_arena::commitments_to_arena(&[r]));
@@ -1083,6 +1446,19 @@ pub(super) fn epoch_arena_words(e: &RealEpoch, with_legs: bool) -> Vec<Vec<LfmWo
     out
 }
 
+/// A keccak digest published as two words starting at `at` — eight `u32` halves,
+/// four per word, each four bytes little-endian.
+fn published_digest(public: &[(u32, LfmWord)], at: usize) -> [u8; 32] {
+    use math::field::traits::IsPrimeField;
+    let mut out = [0u8; 32];
+    for h in 0..8 {
+        let lane = public[at + h / 4].1[h % 4];
+        let half = GoldilocksField::canonical(lane.value()) as u32;
+        out[4 * h..4 * h + 4].copy_from_slice(&half.to_le_bytes());
+    }
+    out
+}
+
 /// ★ THE RUN: the assembled verifier's Fiat-Shamir spine, executed against a
 /// real continuation epoch proof that production accepts.
 ///
@@ -1102,7 +1478,20 @@ fn the_epoch_challenge_spine_matches_production() {
     assert_eq!(pub_ext(0), e.z_alpha.0, "the shared LogUp challenge z");
     assert_eq!(pub_ext(1), e.z_alpha.1, "the shared LogUp challenge alpha");
 
-    let mut cursor = 2usize;
+    // ★ The attestation fold, published right after Phase A. Its DECODE input is
+    // the very cell Phase A absorbed, so this differential is simultaneously a
+    // check of the fold and of the join: had the fold read a second copy, this
+    // would still pass — which is why the split is denied STRUCTURALLY by
+    // `the_assembled_verifier_declares_exactly_the_shape_words` and demonstrated
+    // by `a_split_decode_cell_forges_the_attestation`.
+    assert_eq!(
+        published_digest(&exec.public_words, 2),
+        e.expected_program_id,
+        "the attestation program_id must equal production's \
+         `program_id_from_digest` over the same inputs"
+    );
+
+    let mut cursor = 4usize;
     let mut multi_row_ood = 0;
     for (i, h) in e.tables.iter().enumerate() {
         assert_eq!(pub_ext(cursor), h.beta, "beta of table {i}");
@@ -1246,9 +1635,11 @@ fn the_epoch_challenge_spine_matches_production() {
 /// one `Hint`, and the arenas whose values have two consumers (the roots, the
 /// contributions, the statement's public output) are read exactly once.
 ///
-/// The register-boundary arena is the deliberate exception: only the carried
-/// commit index is read today, and the rest is the space the REGISTER
-/// derivation will consume.
+/// The exception this test used to carry is GONE: the register-boundary arena
+/// had only its commit index read while the REGISTER derivation was unbuilt, and
+/// wiring the derivation (ledger entries 7 and 2) makes every declared word live.
+/// So the positive control is now exact — `declared` words, `declared` reads —
+/// which is a strictly stronger statement than the one it replaces.
 #[test]
 fn the_spine_hints_each_proof_value_once() {
     use std::collections::HashMap;
@@ -1272,13 +1663,223 @@ fn the_spine_hints_each_proof_value_once() {
     // Positive control: the count is nonzero and covers the whole proof, so a
     // guard that simply found no hints would not pass for the wrong reason.
     let declared: usize = program.arena_schema.lens.iter().map(|l| *l as usize).sum();
-    let reg_init = crate::tables::register::NUM_REGISTER_ADDRESSES;
     assert_eq!(
         hints.len(),
-        declared - reg_init + 1,
-        "every declared arena word must be read exactly once, bar the register \
-         boundary vector of which only the commit index is read yet"
+        declared,
+        "every declared arena word must be read exactly once"
     );
+}
+
+/// Arena words the epoch program MUST declare, as arithmetic over the epoch's
+/// shapes.
+///
+/// Deliberately not derived from the emitter (standing-decisions rule 7's
+/// refinement: a count taken from our own emitter is still a relative test). Every
+/// term here comes from the production proof view `real_epoch` read, so the
+/// comparison against the compiled program is absolute.
+fn expected_arena_words(e: &RealEpoch, with_legs: bool) -> usize {
+    let num_reg = crate::tables::register::NUM_REGISTER_ADDRESSES;
+    let mut total = 8 + e.statement.public_output_len.div_ceil(4) + 2;
+    // ★ Two words per ELF-DEPENDENT preprocessed root and NOT ONE MORE. The
+    // options-only roots are program text and the REGISTER root is derived, so a
+    // program that hinted any of them — or that kept a second copy of DECODE for
+    // the attestation fold — declares more words than this.
+    total += 2 * e
+        .phase_a
+        .iter()
+        .filter(|(p, _)| p.is_some_and(PrepSource::is_arena))
+        .count();
+    total += 2 * e.tables.len();
+    total += 2 * num_reg;
+    total += 2;
+    total += 10 * e.page_commitments.len();
+    for (h, leg) in e.tables.iter().zip(&e.legs) {
+        let s = &h.shape;
+        total += 2 * usize::from(s.has_aux_root);
+        total += usize::from(s.has_contribution);
+        total += 2;
+        total += s.ood_current_dims.0 * s.ood_current_dims.1;
+        total += s.ood_next_dims.0 * s.ood_next_dims.1;
+        total += s.num_parts;
+        total += 2 * s.fri.num_committed();
+        total += s.fri.num_terminal_coeffs();
+        total += usize::from(s.grinding_factor > 0);
+        if with_legs {
+            total += leg.verify.opening_words() + leg.verify.fri_words();
+        }
+    }
+    total
+}
+
+/// ★ An ABSOLUTE guard on the arena SCHEMA — the structural half of the
+/// attestation join (entry-7 ruling, condition (a)).
+///
+/// The hinted-once guard denies a value being read twice from ONE word. It cannot
+/// deny a value being supplied twice in TWO words, which is the whole two-consumer
+/// hazard: an honest host fills both copies alike, every differential passes, and a
+/// real prover supplies two different roots. What denies that is the schema itself
+/// — the program declares exactly the words the epoch's shapes prescribe, so there
+/// is nowhere for a second copy to live.
+///
+/// Together the two guards are complete for this class: a second copy must either
+/// re-read an existing word (hinted-once fails) or add one (this fails). A fold
+/// that instead read some OTHER existing value would publish a `program_id` that is
+/// not production's, which the spine differential catches.
+#[test]
+fn the_assembled_verifier_declares_exactly_the_shape_words() {
+    let e = real_epoch();
+    for with_legs in [false, true] {
+        let program = epoch_program(&e, with_legs);
+        let declared: usize = program.arena_schema.lens.iter().map(|l| *l as usize).sum();
+        assert_eq!(
+            declared,
+            expected_arena_words(&e, with_legs),
+            "with_legs = {with_legs}: the arena schema must be exactly the epoch's \
+             shapes and nothing more — a surplus word is where a second copy of a \
+             joined value hides"
+        );
+    }
+
+    // Positive control on the guard itself: the split-cell control program DOES
+    // declare a surplus word, and this is the comparison that sees it.
+    let split = epoch_program_with(&e, false, true);
+    let split_declared: usize = split.arena_schema.lens.iter().map(|l| *l as usize).sum();
+    assert_eq!(
+        split_declared,
+        expected_arena_words(&e, false) + 2,
+        "the split-cell control must declare exactly two surplus words, or it is \
+         not the forgery this guard claims to deny"
+    );
+}
+
+/// ★ FALSIFICATION of the attestation join, as a COHERENT FORGERY rather than a
+/// count (standing-decisions method rule 4).
+///
+/// The attack: verify a real epoch proof of ELF X while attesting to the
+/// `program_id` of a different ELF Y. A consumer who trusts Y's id accepts the
+/// proof, and X is whatever the prover likes.
+///
+/// On the SPLIT program this succeeds completely — every assert passes, the run
+/// finishes, and the published id is the one computed from the substituted root,
+/// not from the root the proof was made against. On the JOINED program the attack
+/// is not merely rejected, it cannot be EXPRESSED: there is one cell, so changing
+/// the fold's input changes what Phase A absorbed, which moves every challenge and
+/// the run dies. Both halves are asserted, because "the joined program rejects it"
+/// alone would be satisfied by a program that rejects everything.
+#[test]
+fn a_split_decode_cell_forges_the_attestation() {
+    let e = real_epoch();
+    let honest = epoch_arena_words(&e, false);
+
+    // A DECODE root for some other program. Any 32 bytes the honest arena does not
+    // carry will do; what matters is the id it produces.
+    let real_decode = e
+        .phase_a
+        .iter()
+        .find_map(|(p, _)| match p {
+            Some(PrepSource::ElfDependent(c)) => Some(*c),
+            _ => None,
+        })
+        .expect("the epoch has a DECODE sub-proof");
+    let mut substituted = real_decode;
+    substituted[0] ^= 0xa5;
+    substituted[31] ^= 0x5a;
+    let forged_id =
+        crate::recursion::program_id_from_digest(&e.elf_digest, e.pc_start, &substituted, &[]);
+    assert_ne!(
+        forged_id, e.expected_program_id,
+        "the substituted root must produce a different id, or this proves nothing"
+    );
+
+    // ---- (a) the SPLIT program: the forgery runs and publishes the forged id.
+    let split = epoch_program_with(&e, false, true);
+    let mut split_arenas = honest.clone();
+    split_arenas.push(super::proof_arena::commitments_to_arena(&[substituted]));
+    let exec = execute(&split, &split_arenas, &TestPermutation).expect(
+        "the split-cell program must RUN on the forgery — that is the hazard, and \
+         a rejection here would mean this control does not demonstrate it",
+    );
+    assert_eq!(
+        published_digest(&exec.public_words, 2),
+        forged_id,
+        "the split program must attest to the SUBSTITUTED root while verifying a \
+         proof made against the real one"
+    );
+    // And it is genuinely a proof of the real epoch: the same program, given the
+    // honest root in the surplus arena, publishes the honest id.
+    let mut split_honest = honest.clone();
+    split_honest.push(super::proof_arena::commitments_to_arena(&[real_decode]));
+    let exec_honest = execute(&split, &split_honest, &TestPermutation)
+        .expect("the split program must also run honestly");
+    assert_eq!(
+        published_digest(&exec_honest.public_words, 2),
+        e.expected_program_id,
+        "the split program's two runs differ only in the surplus arena, so the \
+         forgery is a free choice and not a broken proof"
+    );
+
+    // ---- (b) the JOINED program: the same substitution is inexpressible.
+    //
+    // There is no surplus arena to put it in, so the only way to move the fold's
+    // input is to move the cell Phase A absorbed — which moves every challenge
+    // derived after it.
+    let joined = epoch_program(&e, false);
+    let mut joined_arenas = honest.clone();
+    joined_arenas[1] = super::proof_arena::commitments_to_arena(&[substituted]);
+    assert!(
+        execute(&joined, &joined_arenas, &TestPermutation).is_err(),
+        "with one cell, substituting the DECODE root must break the run: the \
+         transcript absorbed it, so the challenges cannot survive it"
+    );
+}
+
+/// ★ LEDGER ENTRY 2, closed and falsified: the whole register boundary is bound,
+/// not just the commit index.
+///
+/// Production ties epoch N's carried commit index to the chain by REBUILDING the
+/// REGISTER preprocessed commitment from epoch N−1's FINI vector and rejecting
+/// unless the absorbed root matches — there is no arithmetic `start + len` check
+/// anywhere (`lfm-team-lead-start-index-research.md`). So the machine's binding is
+/// the derivation, and what must be true is that moving ANY word of either vector
+/// makes the epoch unverifiable.
+///
+/// Before the derivation was wired, 66 of the 67 INIT words were declared and never
+/// read: moving them changed nothing at all. The positive control for that is
+/// structural rather than historical — `the_spine_hints_each_proof_value_once` now
+/// requires every declared word to be read, and it did not before.
+///
+/// Slot 64 is the commit index and is tested separately by
+/// [`the_closure_rejects_a_moved_index_or_output`]; the slots here are deliberately
+/// elsewhere, including the first and last of each vector, because a derivation that
+/// only really consumed a prefix would pass a test that only moved slot 64.
+#[test]
+fn the_derivation_binds_every_register_boundary_word() {
+    let e = real_epoch();
+    let program = epoch_challenge_program(&e);
+    let good = epoch_arenas(&e);
+    assert!(
+        execute(&program, &good, &TestPermutation).is_ok(),
+        "the untampered epoch must run"
+    );
+
+    let last = crate::tables::register::NUM_REGISTER_ADDRESSES - 1;
+    let x254 = crate::tables::register::X254_INDEX;
+    let mut moved = 0;
+    for (arena, what) in [(3usize, "INIT"), (4, "FINI")] {
+        for slot in [0usize, 1, 33, x254 + 1, last] {
+            let mut arenas = good.clone();
+            let bumped = arenas[arena][slot][0] + FE::one();
+            arenas[arena][slot] = base_word(bumped);
+            assert!(
+                execute(&program, &arenas, &TestPermutation).is_err(),
+                "{what} slot {slot} moved by one must not verify: the REGISTER \
+                 preprocessed root is derived from it, and the transcript absorbed \
+                 that root"
+            );
+            moved += 1;
+        }
+    }
+    assert_eq!(moved, 10, "every planned vector must have been run");
 }
 
 /// ★ The closure's two joins, falsified by tampering.
