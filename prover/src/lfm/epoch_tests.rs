@@ -1073,6 +1073,14 @@ fn epoch_program_with(e: &RealEpoch, with_legs: bool, split_decode: bool) -> Lfm
     // provenance would already have panicked.
     let reg_init: Vec<_> = (0..num_reg).map(|r| b.hint_felt(a_reg_init, r)).collect();
     let reg_fini: Vec<_> = (0..num_reg).map(|r| b.hint_felt(a_reg_fini, r)).collect();
+    // ★ LEDGER ENTRY 1. Production's boundary vectors are `Vec<u32>` and the TYPE
+    // is the whole enforcement; an arena is untyped felts, so without this the
+    // machine would derive a commitment over a value no production epoch can hold.
+    // The entry's stated default was "emit the check if the no->u32 argument is
+    // still unverified when assembly arrives" — it is, and assembly has arrived.
+    for cell in reg_init.iter().chain(&reg_fini) {
+        super::epoch::assert_u32(&mut b, *cell);
+    }
     let reg_shape = e.reg_shape;
 
     let mut next_arena_prep = 0usize;
@@ -1880,6 +1888,109 @@ fn the_derivation_binds_every_register_boundary_word() {
         }
     }
     assert_eq!(moved, 10, "every planned vector must have been run");
+}
+
+/// ★ LEDGER ENTRY 1, in two halves — and the obvious formulation of this test is
+/// VACUOUS, which is worth stating because I wrote it first.
+///
+/// The tempting test is "set a boundary word to `2^32` and watch the assembled
+/// epoch fail". It does fail — and it fails with the check REMOVED too, because a
+/// wide value moves the derived REGISTER root, which moves every challenge drawn
+/// after Phase A absorbs it. So that test says nothing about the width check at
+/// all; it is the same rejection
+/// `the_derivation_binds_every_register_boundary_word` already gets from moving a
+/// word by one.
+///
+/// What is not vacuous is the pair below, and together they are complete:
+///
+/// 1. **What [`super::epoch::assert_u32`] does**, in isolation: the whole `u32`
+///    range runs and everything at or above `2^32` is unprovable. Absolute — it is
+///    a property of the check's own output, with no epoch involved.
+/// 2. **That it is applied to every one of the 134 boundary cells**, structurally:
+///    each register-arena `Hint` output is the INPUT of a 32-bit `BitDec`. A check
+///    emitted over a prefix — the failure mode a value-tamper test cannot see,
+///    since any single moved word rejects anyway — fails this.
+#[test]
+fn the_register_boundary_is_width_checked() {
+    // ---- (1) the check itself.
+    let drive = |v: u64| {
+        let mut b = LfmBuilder::new();
+        let arena = b.declare_arena(1);
+        let cell = b.hint_felt(arena, 0);
+        super::epoch::assert_u32(&mut b, cell);
+        let program = compile(b.finish());
+        validate(&program).expect("the width check must be admissible");
+        execute(&program, &[vec![base_word(FE::from(v))]], &TestPermutation).is_ok()
+    };
+    // ⚠ The bad values are CANONICAL felts, and that is not pedantry — it is the
+    // exact size of the gap. An arena word is a field element, so `FE::from(v)`
+    // reduces: `u64::MAX − 1` is the felt `2^32 − 3`, a perfectly good `u32`, and a
+    // test that used it would report the check broken when it is not (it did). The
+    // widening entry 1 names is therefore the interval `[2^32, p)` and nothing
+    // beyond — there is no felt at or above `p` to worry about.
+    const P_MINUS_1: u64 = 0xFFFF_FFFF_0000_0000; // Goldilocks p − 1 = 2^64 − 2^32
+    for ok in [0u64, 1, 255, 1 << 31, (1u64 << 32) - 1] {
+        assert!(drive(ok), "{ok} is a u32 and must be admitted");
+    }
+    for bad in [1u64 << 32, (1u64 << 32) + 1, 1 << 40, P_MINUS_1] {
+        assert!(
+            !drive(bad),
+            "{bad} is not a u32 and must be unprovable: production's boundary \
+             vectors are Vec<u32> and the TYPE is their only enforcement"
+        );
+    }
+
+    // ---- (2) every boundary cell reaches it, in the assembled program.
+    use std::collections::HashSet;
+    let e = real_epoch();
+    let program = epoch_challenge_program(&e);
+    let num_reg = crate::tables::register::NUM_REGISTER_ADDRESSES;
+
+    // The two register arenas are the ones whose declared length is
+    // NUM_REGISTER_ADDRESSES; identified by length rather than by index so that
+    // adding an epoch-wide arena cannot silently point this test at the wrong one.
+    let reg_arenas: Vec<super::instr::ArenaId> = program
+        .arena_schema
+        .lens
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| **l as usize == num_reg)
+        .map(|(i, _)| i as super::instr::ArenaId)
+        .collect();
+    assert_eq!(
+        reg_arenas.len(),
+        2,
+        "expected exactly the INIT and FINI arenas to have the register width"
+    );
+
+    let mut boundary_cells: HashSet<super::instr::Addr> = HashSet::new();
+    for instr in &program.instrs {
+        if let super::instr::Instr::Hint { arena, out, .. } = instr
+            && reg_arenas.contains(arena)
+        {
+            boundary_cells.insert(*out);
+        }
+    }
+    assert_eq!(
+        boundary_cells.len(),
+        2 * num_reg,
+        "every declared boundary word must be read exactly once"
+    );
+
+    let decomposed: HashSet<super::instr::Addr> = program
+        .instrs
+        .iter()
+        .filter_map(|i| match i {
+            super::instr::Instr::BitDec { input, bits } if bits.len() == 32 => Some(*input),
+            _ => None,
+        })
+        .collect();
+    let unchecked: Vec<_> = boundary_cells.difference(&decomposed).collect();
+    assert!(
+        unchecked.is_empty(),
+        "these register-boundary cells are never bit-decomposed, so their width \
+         is unconstrained: {unchecked:?}"
+    );
 }
 
 /// ★ The closure's two joins, falsified by tampering.

@@ -600,6 +600,36 @@ fn append_ext_cell(b: &mut LfmBuilder, t: &mut TranscriptReplay, v: Ext) {
     t.append_ext(b, [coords[0], coords[1], coords[2]]);
 }
 
+/// Constrain `v < 2^32` — the felt-width guard assembly ledger entry 1 owes.
+///
+/// An LFM arena is untyped felts; production's `reg_fini` and `register_init` are
+/// `Vec<u32>`, and that TYPE is the whole enforcement on their side. So without
+/// this the machine's accepted set is strictly wider than production's: a prover
+/// could derive the REGISTER preprocessed commitment over a boundary value no
+/// production epoch can hold.
+///
+/// One `BitDec` plus one recomposition: `bit_dec` exposes the low 32 bits, and
+/// asserting `v` equals their weighted sum has no witness above `2^32 − 1`. The
+/// same idiom `emit_output_bytes` uses on the public-output halves, and for the
+/// same reason.
+///
+/// Deliberately at the ASSEMBLY call site rather than inside
+/// `programs::emit_register_commitment`: the isolated derivation's width gap is
+/// pinned by a guard test that asserts the hazard still exists
+/// (`machine_tests::the_derivation_extends_a_non_u32_register_value_demonstrating_
+/// hazard`), which is correct — an isolated derivation binds nothing, and closing
+/// the gap is what assembly is for.
+pub fn assert_u32(b: &mut LfmBuilder, v: Felt) {
+    let bits = b.bit_dec(v, 32);
+    let two = b.felt_const(FE::from(2u64));
+    let mut acc = Felt(bits[31].addr());
+    for k in (0..31).rev() {
+        let bit = Felt(bits[k].addr());
+        acc = b.mul_add(acc, two, bit);
+    }
+    b.assert_eq(v, acc);
+}
+
 /// `β⁰ .. β^{n−1}` — production's `compute_alpha_powers(&beta, n)`, which the
 /// quotient fold consumes as transition coefficients then boundary ones.
 ///

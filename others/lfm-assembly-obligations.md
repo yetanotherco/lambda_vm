@@ -5,9 +5,59 @@ owed (standing-decisions method rule 5). Assembly (RESUME item 5) may not be
 called done while any entry is OPEN. Add entries as legs flag them; close an
 entry only with the verifying evidence named in it.
 
+## STATUS AT WAVE 6 (2026-08-04)
+
+Entries 1 through 9 are all DISCHARGED. **Entry 10 is the only one left open**,
+and it is not a debt but a standing rule for the wrap run: every per-epoch cost
+number must name the epoch shape it describes. Two things wave 6 could not close
+and that belong to the USER rather than to a leg:
+
+- **A framework ceiling.** The production prover cannot prove any AIR with
+  `step_size > 1` (entry 9's note). Lifting it looks like a one-line relaxation
+  in `crypto/**` — an always-stop item. Until then no end-to-end run of the
+  assembled verifier at `step_size > 1` is possible.
+- **PAGE's preprocessed roots MIGRATED rather than closed** (entry 7's note).
+  They are the GLOBAL proof's GlobalMemory AIRs' commitments, not an epoch's; no
+  continuation epoch of any guest carries a PAGE sub-proof. The taxonomy is
+  worked out and the classifier already handles the zero-init (constant) half;
+  the ELF-data half would hit its panic, which is the intended handover.
+
+Also unchanged and now more load-bearing than ever: `check_attestation` has ZERO
+production call sites, and DECODE's binding rests on it.
+
 ## OPEN
 
-1. **`reg_fini` felt-width gap** (flagged by reg-tree, slice 1).
+1. ~~**`reg_fini` felt-width gap**~~ — **DISCHARGED** (assembly-w6, slice 3) by
+   the entry's own stated default. The entry said "if assembly arrives and the
+   `no >u32 register column` argument is still unverified, emit the check"; it is
+   still unverified, and slice 1's derivation is what made the boundary vectors
+   live arena data in the assembled verifier, so the check is now emitted:
+   `epoch::assert_u32` on all 134 cells (one `BitDec` plus one recomposition
+   each).
+   - Placed at the ASSEMBLY call site, deliberately, NOT inside
+     `programs::emit_register_commitment`. The isolated derivation's width gap is
+     pinned by a guard test that asserts the hazard still exists
+     (`the_derivation_extends_a_non_u32_register_value_demonstrating_hazard`) and
+     that test is right: an isolated derivation binds nothing. Assembly is where
+     the width becomes enforceable, so assembly is where it is enforced, and the
+     guard stays green.
+   - ⚠ **THE OBVIOUS TEST FOR THIS IS VACUOUS, and it was written before it was
+     caught.** "Set a boundary word to `2^32` and watch the epoch fail" fails with
+     the check REMOVED too, because a wide value moves the derived root and
+     therefore every challenge after Phase A. What is non-vacuous is the pair
+     `the_register_boundary_is_width_checked` runs: (a) `assert_u32` in isolation
+     admits the whole `u32` range and rejects everything above it, and (b) a
+     STRUCTURAL check that every register-arena `Hint` output is the input of a
+     32-bit `BitDec`. FALSIFIED: applying the check to a 3-cell prefix — precisely
+     the defect a value tamper cannot see — fails (b) and nothing else
+     (16 passed / 1 failed).
+   - ★ A subtlety the test found, which sizes the gap exactly: an arena word is a
+     FIELD ELEMENT, so `FE::from(u64::MAX − 1)` is the felt `2^32 − 3`, a perfectly
+     good `u32`. The widening this entry names is therefore the interval
+     `[2^32, p)` and nothing beyond; a first draft of the test used
+     `u64::MAX − 1` as an out-of-range value and reported the check broken when it
+     was not.
+   (Original text kept below.) (flagged by reg-tree, slice 1).
    Production's `reg_fini` is `Vec<u32>` — the TYPE is the entire
    enforcement. An LFM arena is untyped felts, so the machine's accepted set
    is wider than production's. Guard test
@@ -21,8 +71,25 @@ entry only with the verifying evidence named in it.
    Default is the range check: if assembly arrives and the argument is
    still unverified, emit the check.
 
-2. **`start_index` is unbound to the chain** (flagged by deep-join, LogUp
-   closure slice 1). **HALF DISCHARGED** (assembly, slice 3): the reading is
+2. ~~**`start_index` is unbound to the chain**~~ — **DISCHARGED**
+   (assembly-w6, slice 1, 2c810857). Phase A now CALLS
+   `programs::emit_register_commitment` on the register-boundary arena the spine
+   declares plus a new `reg_fini` arena, so the REGISTER preprocessed root the
+   transcript absorbs is COMPUTED from those cells. That computation is the
+   binding, and it is the binding production itself uses.
+   - `start_index` is no longer even a second READ of slot 64: it IS
+     `reg_init[X254_INDEX]`, the cell the derivation consumed. Before this slice
+     the epoch declared 67 INIT words and read exactly one; now every word of
+     both vectors is read, which is why
+     `the_spine_hints_each_proof_value_once`' positive control tightened from
+     `declared − 67 + 1` to `declared` exactly.
+   - The differential is free and total: a wrong derivation moves the absorbed
+     root, which moves all 111 challenges, so
+     `the_epoch_challenge_spine_matches_production` covers it.
+   - FALSIFIED: `the_derivation_binds_every_register_boundary_word` moves ten
+     words — first and last of INIT and of FINI, and slots away from 64 — and
+     every one makes the epoch unverifiable.
+   (Original text kept below.) **HALF DISCHARGED** (assembly, slice 3): the reading is
    settled and the CELL is now the right one; the derivation that closes it is
    not built.
    - Settled by research (`lfm-team-lead-start-index-research.md`): production
@@ -150,7 +217,75 @@ entry only with the verifying evidence named in it.
    assembled verifier, and the assembled path has no `Instr::Hint` for any
    challenge because nothing hints one.
 
-7. **The preprocessed commitments are hinted in the assembled spine.**
+7. ~~**The preprocessed commitments are hinted in the assembled spine.**~~ —
+   **DISCHARGED** (assembly-w6, slice 1, 2c810857), and the RULING'S OWN
+   TAXONOMY IS AMENDED for the second time. Each root now comes from the source
+   its provenance admits, and which source that is comes from a CLASSIFIER
+   (`epoch_tests::prep_source`) that recomputes production's candidate functions
+   and matches — never from a sub-proof index. A preprocessed table whose root
+   matches nothing known PANICS rather than being hinted unbound, which is the
+   failure mode the entry needed most.
+   - **options-only ⇒ interned as program text**, absorbed as literal bytes with
+     no splice arithmetic (`RootCells::constant`,
+     `statement_replay::PhaseAPreprocessed::Constant`).
+   - **REGISTER ⇒ derived in-machine**, which closes entry 2 with it.
+   - **DECODE ⇒ arena cell + the attestation join**: the same cell Phase A
+     absorbs is the cell `programs::emit_program_id` folds, differentialled
+     against production's `recursion::program_id_from_digest`.
+   - The join is denied STRUCTURALLY by a pair of absolute guards, which are
+     complete for the class together and neither of which suffices alone: a
+     second READ of a word fails `the_assembled_verifier_hints_each_proof_value_
+     once`, and a second WORD fails
+     `the_assembled_verifier_declares_exactly_the_shape_words` (a closed form
+     over the epoch's shapes, not an emitter pass). A fold reading some OTHER
+     existing value publishes an id that is not production's, which the spine
+     differential catches.
+   - FALSIFIED as a COHERENT FORGERY, not a count:
+     `epoch_program_with(split_decode = true)` gives the fold its own arena copy,
+     and `a_split_decode_cell_forges_the_attestation` shows that program RUNS the
+     substitution and attests to a DIFFERENT program's id — while publishing the
+     honest id when the same surplus arena holds the honest root, so the forgery
+     is a free choice and not a broken proof. On the joined program the
+     substitution is inexpressible.
+   - ★ **THE RULING'S CONDITION (b) IS UNSATISFIABLE AND UNNECESSARY, and the
+     PAGE obligation MIGRATES rather than closing.** The ruling asks for a real
+     epoch from a guest with private input pages, on the premise that
+     `num_private_input_pages = 0` is a fixture property. Three readings
+     overturn it:
+     * private-input pages are built NON-preprocessed (`lib.rs:800-828`), so they
+       could never witness a PAGE preprocessed root at all;
+     * **no continuation epoch of any guest has a PAGE sub-proof.**
+       `prove_epoch` REJECTS one outright — "continuation epoch must have no PAGE
+       configs (L2G bookend replaces PAGE)" (`continuation.rs:695-702`) — and
+       both `build_epoch_airs` call sites pass `page_configs = &[]`
+       (`continuation.rs:711-714`, `815-818`). The fixture matches PRODUCTION
+       here; it is not stripped down;
+     * the ELF-data page genesis roots the attestation folds are the GLOBAL
+       proof's GlobalMemory AIRs' preprocessed commitments
+       (`continuation.rs:997-1010`) — a different proof, out of an epoch
+       verifier's scope. `recursion::program_id_from_digest`'s own doc says
+       exactly this ("the supplied DECODE / ELF-data-page roots").
+     So the epoch taxonomy is **2 constants + 1 derived + 1 ELF-dependent**,
+     asserted by `the_preprocessed_commitments_of_a_real_epoch` (census 2/1/1,
+     plus a guard that no sub-proof carries PAGE's preprocessed width). PAGE's
+     half becomes the GLOBAL-proof verifier's obligation, whose taxonomy is
+     already worked out and already in the classifier: zero-init pages share
+     `page::zero_init_preprocessed_commitment(options)` and are therefore
+     CONSTANTS (a third finding — the ruling put all of PAGE in the ELF-dependent
+     family), while ELF-data pages are ELF-dependent and would hit the
+     classifier's panic, since their `PageConfig`-shaped provenance is not in its
+     candidate list. That panic is the correct behaviour and the handover note.
+   - The residual risk the ruling named is unchanged and now carries more weight:
+     `program_id`'s binding is only as strong as the consumer-side
+     `check_attestation` compare, which has ZERO production call sites.
+   - MEASURED cost of the whole wiring, min preset: +59,743 instructions
+     (2.7% of the assembled verifier), +256 permutations and +63 arena words.
+     The permutation figure is exactly the prediction — 255 for the REGISTER tree
+     at blowup 2 (`128·blowup − 1`, reg-tree's pinned closed form) plus 1 for the
+     `program_id` fold's single rate block. The arena figure is exactly
+     +67 (`reg_fini`) + 2 (`pc_start`) − 6 (three roots that stopped being arena
+     data).
+   (Original text kept below for the record.)
    ⚠ **THE ENTRY'S OWN TAXONOMY WAS WRONG AND IS CORRECTED HERE** (assembly-w5,
    slice 1, by reading `lib.rs`). The split is **2 constants + 2 ELF-dependent +
    1 derived**, not 3 + 1 + 1:
@@ -208,8 +343,30 @@ entry only with the verifying evidence named in it.
    constants, wire REGISTER's derivation into Phase A, and either build PAGE's
    or state why the ELF-digest binding already covers it.
 
-8. **The OOD absorb ORDER has no production witness** (assembly, slice 2 —
-   measured, not argued). Production absorbs each pruned OOD block
+8. ~~**The OOD absorb ORDER has no production witness**~~ — **DISCHARGED**
+   (assembly-w6, slice 2, 36bfd727), and it needed no synthetic AIR at all.
+   `stark::examples::fibonacci_multi_column::FibonacciMultiColumnAIR<Gl, Ext3>`
+   already carries `transition_offsets: vec![0, 1, 2]` and is generic over the
+   extension field, so at three columns its next-row block is **3 columns × 2
+   ROWS** — `num_eval_points − step_size = 2`. That is the phase's first OOD block
+   where a column-major and a row-major absorb differ.
+   - The proof is production's (`multi_prove_ram`, accepted by
+     `multi_verify_views`) and so is the oracle: the machine's
+     `emit_table_challenges` replay is differentialled against
+     `replay_rounds_after_round_1` on every challenge.
+   - FALSIFIED, and the falsification re-proves this entry's own claim as a
+     by-product: swapping the absorb loop to ROW-major leaves the 24-sub-proof
+     epoch spine differential, the assembled-verifier run and the single-table
+     replay ALL GREEN (206 passed) and fails only the new fixture. The failure
+     MODE is worth recording — the mutation trips the in-program GRINDING check
+     first (a moved transcript state invalidates the nonce), so the clean
+     statement of the property is the test's own row-major CONTROL program, which
+     stops at `γ` and shows it moves against production's `γ`.
+   - Unexercised and named rather than chased: an OOD grid with more than TWO
+     blocks. Three offsets at `step_size = 1` still yields two, and nothing in the
+     machine is shaped by the block count (`emit_reconstruct_ood` takes two
+     because the proof carries two), so that is a framework property.
+   (Original text kept below.) Production absorbs each pruned OOD block
    column-major (`verifier.rs:1425-1429`). Injecting a ROW-major absorb leaves
    BOTH the single-table differential and the 24-sub-proof epoch spine green,
    because every OOD block in either is ONE ROW TALL: the current block's
@@ -223,9 +380,49 @@ entry only with the verifying evidence named in it.
    with three transition offsets (or `step_size > 1`), proved by the
    production prover so the oracle stays real.
 
-9. **The constraint leg's FRAME-STEP view of the OOD grid has no production
-   witness** (assembly-w5, slice 1 — found while writing the seam, and the sketch
-   had it wrong). `Op::Var{offset, row}` indexes the frame's evaluation STEP, and
+9. ~~**The constraint leg's FRAME-STEP view of the OOD grid has no production
+   witness**~~ — **DISCHARGED** (assembly-w6, slice 2, 36bfd727) by an oracle
+   rather than a proof, because a proof turned out to be impossible (see the
+   ceiling below). The defect is the machine's grid→frame-step MAPPING, and
+   production has a pure function for exactly that mapping:
+   `StarkTableView::into_frame(main_cols, step_size)`
+   (`proof/view.rs:269-294`), which the real verifier calls at
+   `verifier.rs:320-321`. It takes a grid and a `step_size` and needs no prover.
+   - The rule is extracted out of the emitter as
+     `epoch_verify::frame_step_view` precisely so it can be differentialled, and
+     `the_frame_step_view_matches_productions_own_frame_assembly` compares it
+     against `into_frame` at `(offsets, step_size)` of `(2,1) (3,1) (2,2) (3,2)
+     (2,4)`, over main AND aux columns, on grids of distinct values.
+   - FALSIFIED: making `frame_step_view` return the whole grid — wave-5's M2
+     defect verbatim — fails this test and NOTHING ELSE (206 passed / 1 failed).
+   - ⚠ **A FRAMEWORK CEILING, and it is why this entry has no end-to-end
+     witness.** The production prover cannot prove ANY AIR with `step_size > 1`:
+     its CPU transition evaluator borrows one row per transition offset
+     (`RowFrame::from_lde`, called at `evaluator.rs:72`) and asserts the shape
+     outright — `debug_assert_eq!(lde_step_size, blowup_factor, "RowFrame requires
+     single-row steps (step_size 1)")` — and `lde_step_size = step_size ·
+     blowup_factor`, so the equality IS `step_size == 1`. MEASURED, not read:
+     `step_size_tests::the_prover_cannot_prove_a_step_size_two_air` is a
+     `#[should_panic]` on that message, so the ceiling is recorded and
+     self-updating. Nothing here runs the ASSEMBLED verifier at `step_size > 1`,
+     and nothing can until it lifts.
+   - What lifting it would take, FROM READING and not verified by running: the
+     assert looks over-strict for the access pattern that exists.
+     `ConstraintBuilder::main(offset, col)` resolves to row 0 of a step
+     (`builder.rs:719-724`), `RowFrame::from_lde`'s index for step `k` is
+     `row + offset · lde_step_size` — the same row the general, multi-row-capable
+     `Frame::read_from_lde` calls `initial_step_row` — and that general path
+     already handles `step_size > 1` correctly. So it is plausibly a one-line
+     relaxation in `crypto/**`, which is an always-stop item and therefore the
+     USER's call, not a leg's.
+   - The brief's single-AIR plan ("three transition offsets AND `step_size > 1`")
+     is unbuildable for two independent reasons: `AirWithBuses::new` HARDCODES
+     `transition_offsets: vec![0, 1]` (`lookup.rs:922`), so three offsets means an
+     `AIR` impl and every one outside `crypto/**`'s example tree is IN that tree;
+     and `step_size > 1` is unprovable per the ceiling. Entries 8 and 9 therefore
+     get two witnesses, each with a production oracle, and neither is a witness of
+     the other's defect.
+   (Original text kept below.) `Op::Var{offset, row}` indexes the frame's evaluation STEP, and
    production's own interpreter asserts `row == 0`
    (`constraint_ir/interp.rs:240-242`) while taking
    `frame.get_evaluation_step(offset)`. A frame step is `step_size` grid rows, so

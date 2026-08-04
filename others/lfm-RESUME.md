@@ -241,7 +241,51 @@ replaced it (post-wave-4) with the research agent's final report extracted
 verbatim from that transcript. The raw session survives in git history at
 e105dea2 if ever needed; findings are also summarised in ledger entry 2.
 
-Ready to start next (wave 6):
+Wave 6 CLOSED 2026-08-04 (`feat/lfm-assembly`, 3 commits off 3766214a; suite
+208 green / 1 ignored, `make lint` exit 0). **The assembly ledger is now empty
+of debts**: entries 1, 2, 7, 8 and 9 all discharged, leaving only entry 10,
+which is the wrap run's own reporting rule and not a debt.
+
+- **Entry 7 + 2**: every preprocessed root now comes from the source its
+  provenance admits, chosen by a classifier that recomputes production's
+  candidate functions (so an unknown provenance PANICS instead of being hinted
+  unbound). Options-only roots intern as program text; REGISTER is derived in
+  Phase A from the register boundary, which is what binds `start_index`; DECODE
+  stays an arena cell bound by the attestation join, with the `program_id` fold
+  emitted on the same cell and differentialled against production. The join is
+  denied structurally by a hinted-once guard PLUS an exact arena schema, and
+  falsified with a coherent forgery — a split-cell control program runs the
+  substitution and attests to another program's id.
+- **Entries 8 + 9**: witnessed by TWO fixtures, not one. The brief's single AIR
+  is unbuildable — `AirWithBuses` hardcodes two transition offsets, and
+  `step_size > 1` is unprovable (a framework ceiling, measured). Entry 8 needed
+  no synthetic AIR at all: `FibonacciMultiColumnAIR` already has three offsets,
+  giving a 3×2 next-row block. Entry 9 needed no proof: production's own
+  `into_frame` is the oracle for the grid→frame-step mapping.
+- **Entry 1** discharged by its own stated default (emit the range check), which
+  slice 1 triggered by making the boundary vectors live arena data.
+- **Cost**: assembled verifier 2,184,360 → 2,244,094 instructions, 2,616 →
+  2,872 permutations at the min preset. The +256 is exactly 255 (REGISTER tree at
+  blowup 2) + 1 (the `program_id` fold).
+
+⚠ TWO THINGS FOR THE USER, both always-stop items:
+1. **The `step_size > 1` framework ceiling.** `RowFrame::from_lde` asserts
+   single-row steps (`frame.rs:38`, reached from `evaluator.rs:72`). From reading
+   only, the assert looks over-strict for the access pattern that exists — the
+   general `Frame::read_from_lde` already handles multi-row steps and constraint
+   bodies only ever read row 0 of a step — so it is plausibly a one-line
+   relaxation in `crypto/**`. Lifting it would let entry 9 have an end-to-end
+   witness.
+2. **PAGE's preprocessed roots are the GLOBAL proof's, not an epoch's.** No
+   continuation epoch of any guest carries a PAGE sub-proof (`prove_epoch`
+   rejects one). This overturns the entry-7 ruling's condition (b), which asked
+   for a witness epoch that cannot exist; the obligation migrates to a
+   global-proof verifier.
+
+Ready to start next (wave 7): **the wrap run**, whose numbers must state their
+epoch's trace-length profile (entry 10).
+
+Superseded — the wave-6 order of work, kept for the record:
 - **Ledger entry 7's wiring, and entry 2 with it.** `programs::emit_register_
   commitment` now exists (extracted in wave 5); Phase A must call it on the
   register-boundary arena the spine already declares, so REGISTER's root is

@@ -1010,8 +1010,20 @@ fn the_preprocessed_commitments_of_a_real_epoch() {
     // `build_epoch_airs` call sites pass `&[]`. So no continuation epoch of any
     // guest has a PAGE sub-proof, and the ELF-data page genesis roots the
     // attestation folds are the GLOBAL proof's GlobalMemory AIRs' preprocessed
-    // commitments. Asserted rather than remembered: if an epoch ever grows a PAGE
-    // sub-proof, the count above stops being 1 and this test says so.
+    // commitments (`continuation.rs:997-1010`) — a different proof, out of an epoch
+    // verifier's scope.
+    //
+    // Asserted rather than remembered. The width test is unambiguous only because
+    // a continuation epoch's REGISTER always uses the WITH_FINI layout
+    // (`build_epoch_airs` always supplies `register_preprocessed`), and PAGE's
+    // width coincides with the non-FINI REGISTER one — so that premise is checked
+    // first. An ELF-data page root would in any case make `prep_source` panic,
+    // since its provenance is not in the classifier's candidate list.
+    assert!(
+        register.is_some(),
+        "a continuation epoch's REGISTER is preprocessed WITH FINI; without that \
+         the width check below cannot tell a PAGE table from a REGISTER one"
+    );
     assert!(
         e.legs
             .iter()
