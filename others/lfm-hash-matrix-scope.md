@@ -709,3 +709,87 @@ Recorded so they stop propagating.
    (+7M net, and "DEEP doubling loses everywhere"). Arity trades permutations for
    bytes and so wins only when permutations are expensive — which the candidates make
    *less* true, not more.
+
+---
+
+## 6. Slice 1a DONE — the permutation, and the pinned prediction for the chip
+
+**Landed:** `prover/src/lfm/poseidon.rs` — `PoseidonGoldilocks` implementing
+`LfmHasher`, with parameters and an external oracle.
+
+### 6.1 Parameter provenance (condition (b), discharged)
+
+From the vendored `others/Plonky3/goldilocks/src/poseidon1.rs` @ 4aed8fe4, which
+documents them as Grain-LFSR generated per the Poseidon paper Appendix E with
+`field_type=1, alpha=7 (exp_flag=0), n=64, t=12, R_F=8, R_P=22`, via
+`poseidon/generate_constants.py --field goldilocks --width 12`. MDS is CIRCULANT
+with first row `[1,1,2,1,8,9,10,7,5,9,4,10]` (`goldilocks/src/mds.rs:92`).
+
+**This independently confirms my slice-0 estimate of 8 full + 22 partial**, which
+was my own domain knowledge and is now cited. The corpus corroborates from a second
+direction: ZisK's shipped PLONKish Poseidon is width-16, 8 full + 22 partial.
+
+⚠ **Ship-grade parameter selection remains a separate cryptographic decision for the
+ecosystem, NOT settled by this measurement.** Cells depend on round counts and S-box
+degree, not on the constants' numeric values, so the measurement is valid; what to
+ship is not ours. Likewise `compress_iv` is ZERO capacity — plain sponge
+compression — and domain separation is deliberately not invented here.
+
+### 6.2 The oracle (condition (d), discharged — but NOT as specified)
+
+⚠ **The brief's first oracle is unusable and this is a real finding.** Condition (d)
+asked for "the in-tree HADES skeleton instantiated with the same parameters". That
+skeleton (`crypto/crypto/src/hash/poseidon/mod.rs`) hardcodes an `x^3` S-box, and
+**`x^3` is not a permutation over Goldilocks**: `p - 1 = 2^32 · 3 · 5 · 17 · 257 ·
+65537`, so 3 is not coprime to the group order. Differentialling against it would
+have validated my implementation against a non-permutation.
+
+Used instead: **Plonky3's own known-answer vector** for width 12 (input `0..11`),
+which nothing in this repository produced. `the_permutation_matches_the_plonky3_
+known_answer_vector` matched **on the first run**, with a Python cross-check of the
+same convention beforehand.
+
+**Falsified three ways (rule 1), each restored** — the KAT pins every convention it
+needs to:
+| mutation | result |
+|---|---|
+| `x^7 → x^6` (wrong exponent) | FAILED, correctly |
+| circulant MDS transposed (`(j−i)` → `(i−j)`) | FAILED, correctly |
+| partial-round S-box lane 0 → lane 11 | FAILED, correctly |
+
+A second test asserts `gcd(α, p−1) = 1` and that 3 and 5 fail it — the skeleton's
+bug, encoded as a guard.
+
+### 6.3 PINNED PREDICTION for the chip — falsify this next
+
+My degree-3 layout, one row per permutation (`x⁷ = (x³)²·x` needs `x²`,`x³` as
+columns; the MDS is linear so it costs no columns):
+
+```
+IN0..11 + S8..11                      =  16
+8 full rounds  × (12·x² + 12·x³ + 12 out) = 288
+22 partial     × (x² + x³ + 12 out)       = 308
+                                  m = 612 value columns, 1 row
+                                  a = 3   (the chip's 6 LfmMem interactions)
+base-equiv per permutation = 612 + 3·3    = 621
+```
+
+At the measured `P ≈ 192,000`: hash cells **121.5 M** with a chunking sibling
+(1.019 padding) or **162.8 M** unchunked (pads to 2¹⁸, 1.365) — so the epoch verify
+totals **1.906–1.947 B cells = 5.73–5.86× smaller than keccak**, RSS **≈50–51 GiB**.
+
+⚠ **612 is an UPPER BOUND, and knowingly 2× off a known-achievable layout.** Miden's
+measured Poseidon2 at the same width is 256 main + 16 aux = 304 base-equivalent, via
+16 columns × 16 rows. A smarter layout could roughly halve my hash term — which
+moves the TOTAL by ~3 %, because the residue dominates (§2.3). So the column is
+worth measuring at 612 and not worth optimising.
+
+### 6.4 What slice 1 still owes (handoff)
+
+Not built: the chip's constraint block (replace `chips::hash::HashConstraints`'
+`TestPermutation` round with the 30-round chain), `cols::NUM_COLUMNS` 28 → 612, the
+census array, `LFM_REGISTRY` regeneration if any digest moves, and the prove+verify
+measurement (rule 2: execute-only tests prove nothing about a chip). The padding
+trap (condition (c)) must be handled as a chunking sibling OR an explicit
+padding-corrected line beside the raw one — both numbers are pinned above so the
+first measurement cannot silently read 36 % high.

@@ -103,6 +103,37 @@ Last updated 2026-08-03 by team-lead (rule-7 refinement from the FRI leg).
    block) — check the instrument against a known breakage before believing
    "my mutation changed nothing".
 
+8. **A search that ERRORS looks exactly like a search that found nothing**
+   (`[hash-w8]`, 2026-08-04). `grep -r --include=*.rs pattern .` with the glob
+   UNQUOTED makes the shell try to expand `*.rs` in the cwd and fail with
+   "no matches found" — printing nothing, exiting non-zero, and reading
+   identically to "the pattern is absent". Two of my absence readings this wave
+   were shell errors, not evidence. **Quote the glob** (`--include='*.rs'`), and
+   treat an empty search result as a claim needing a positive control: run the
+   same search for a term you KNOW is present and confirm it prints.
+
+   Corollary, same wave: **term collisions manufacture false positives in the
+   other direction.** "monolith" matches 26 times across `prover/src` and every
+   occurrence is the *monolithic proof* concept, nothing to do with the Monolith
+   hash — a term-only search would have reported an implementation that does not
+   exist. An existence claim needs the match READ, not counted.
+
+9. **A donor's parameters are not a donor's correctness** (`[hash-w8]`,
+   2026-08-04). Copying published constants gives you a shape, not a working
+   primitive: the round order, the MDS orientation, the S-box exponent and which
+   lane a partial round touches are all independent ways to be wrong while every
+   constant is right. Pin the whole primitive against an EXTERNAL known-answer
+   vector that nothing in this repository produced, then falsify that vector's
+   test by breaking each convention separately — if flipping the MDS
+   orientation still passes, the vector is not pinning what you think.
+   Demonstrated: three falsifications (wrong exponent, transposed circulant,
+   partial S-box on lane 11) each fail the one KAT.
+
+   ⚠ And a concrete trap this found: `crypto/crypto/src/hash/poseidon/`'s HADES
+   skeleton hardcodes `x^3`, which is **not a permutation over Goldilocks**
+   (`3 | p-1`). An in-tree implementation is not automatically an oracle — check
+   that it is CORRECT before differentialling against it.
+
 ## Coordination
 
 - Append one line to `others/lfm-agent-status.log` at every slice boundary.

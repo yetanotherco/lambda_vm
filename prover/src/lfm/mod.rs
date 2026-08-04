@@ -36,6 +36,7 @@ pub mod keccak_host;
 pub mod layout;
 pub mod lde;
 pub mod logup;
+pub mod poseidon;
 pub mod programs;
 pub mod proof;
 pub mod proof_arena;
