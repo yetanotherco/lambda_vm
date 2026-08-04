@@ -309,3 +309,38 @@ extern "C" __global__ void batch_inverse_combine_ext3(
     out_base[1] = res.b;
     out_base[2] = res.c;
 }
+
+// ---------------------------------------------------------------------------
+// 7. invert_total_ext3
+//
+// One-thread Fermat inversion of the scan total: out = src[n-1]^(p^3 - 2).
+// Replaces the host round-trip (D2H + host Fermat + H2D + stream sync) so the
+// whole batch inverse stays stream-ordered. The 192-bit exponent arrives as
+// three little-endian u64 limbs.
+// ---------------------------------------------------------------------------
+extern "C" __global__ void invert_total_ext3(
+    const uint64_t *src,   // 3 * n u64 (reads element n-1)
+    uint64_t n,
+    uint64_t e0,           // exponent limbs, little-endian
+    uint64_t e1,
+    uint64_t e2,
+    uint64_t *out          // 3 u64
+) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    const uint64_t *base = src + (n - 1) * 3;
+    ext3::Fe3 a = {base[0], base[1], base[2]};
+    ext3::Fe3 r = ext3::one();
+    uint64_t limbs[3] = {e0, e1, e2};
+    for (int li = 2; li >= 0; --li) {
+        uint64_t bits = limbs[li];
+        for (int b = 63; b >= 0; --b) {
+            r = ext3::mul(r, r);
+            if ((bits >> b) & 1) {
+                r = ext3::mul(r, a);
+            }
+        }
+    }
+    out[0] = r.a;
+    out[1] = r.b;
+    out[2] = r.c;
+}
