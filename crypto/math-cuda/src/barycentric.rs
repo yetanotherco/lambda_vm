@@ -381,7 +381,7 @@ pub fn barycentric_base_multi_on_device(
     k_points: usize,
 ) -> Result<Vec<u64>> {
     main_handle.wait_ready_on(stream)?;
-    assert!(k_points >= 1 && k_points <= BARY_MAX_EVAL_POINTS);
+    assert!((1..=BARY_MAX_EVAL_POINTS).contains(&k_points));
     assert!(coset_points_dev.len() >= n);
     assert!(inv_denoms_dev.len() >= k_points * 3 * n);
     let num_cols = main_handle.m;
@@ -451,7 +451,7 @@ pub fn barycentric_ext3_multi_on_device(
     k_points: usize,
 ) -> Result<Vec<u64>> {
     aux_handle.wait_ready_on(stream)?;
-    assert!(k_points >= 1 && k_points <= BARY_MAX_EVAL_POINTS);
+    assert!((1..=BARY_MAX_EVAL_POINTS).contains(&k_points));
     assert!(coset_points_dev.len() >= n);
     assert!(inv_denoms_dev.len() >= k_points * 3 * n);
     let num_cols = aux_handle.m;
