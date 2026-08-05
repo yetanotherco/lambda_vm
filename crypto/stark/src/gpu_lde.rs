@@ -780,6 +780,7 @@ where
 /// D2H is skipped and the returned Vec is empty (device-only tables: every
 /// consumer reads the handle).
 #[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn try_expand_split_trees_row_major_keep<F, E, B>(
     row_major: &[FieldElement<E>],
     predev: Option<&math_cuda::CudaSlice<u64>>,
