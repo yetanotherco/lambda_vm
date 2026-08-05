@@ -801,10 +801,24 @@ impl VmAirs {
             .map(|config| -> VmAir {
                 let air = create_page_air(proof_options, config.page_base);
                 if config.is_private_input {
-                    // Private-input pages: all columns are main trace (not preprocessed).
-                    // The verifier doesn't see the init values; correctness is enforced
-                    // by the memory bus constraints.
-                    Box::new(air)
+                    // Private-input pages: INIT holds the private input, so it stays a
+                    // main-trace column the verifier never recomputes. OFFSET does NOT
+                    // get that treatment — it is the row's address
+                    // (`address_lo = page_base_lo + OFFSET`), and nothing else in the
+                    // system constrains it: PAGE has `EmptyConstraints` and no
+                    // constraint references the column. Left uncommitted, a witness can
+                    // point a row at any address sharing the page's high limb and mint a
+                    // second, forged memory history for it — the init/final sets stop
+                    // holding exactly one entry per address, which is the property the
+                    // offline memory-checking argument rests on.
+                    //
+                    // Committing OFFSET alone publishes nothing: it is the dense
+                    // `0..page_size-1` enumeration, byte-identical for every page
+                    // regardless of program or input.
+                    Box::new(air.with_preprocessed(
+                        page::private_page_preprocessed_commitment(proof_options),
+                        page::NUM_PREPROCESSED_COLS_PRIVATE,
+                    ))
                 } else if config.init_values.is_none() {
                     // Zero-init pages: the shared commitment computed once above.
                     Box::new(
