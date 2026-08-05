@@ -56,6 +56,26 @@ fn gpu_lde_threshold() -> usize {
     })
 }
 
+/// Minimum LDE size for the device-only envelope, decoupled from the commit
+/// threshold above. Committing on GPU and keeping the handle resident pays
+/// from small sizes (it kills the per-round re-uploads); dropping the HOST
+/// copy is a much stronger contract — every downstream dispatch must take its
+/// GPU path or the prove hard-aborts, and the gate cannot mirror kernel-side
+/// eligibility (the LOCKSTEP note below). Keep device-only to the large-table
+/// envelope where those paths are exercised; mid tables keep a host copy so a
+/// dispatch decline degrades to CPU instead of aborting.
+const DEFAULT_DEVICE_ONLY_MIN_LDE: usize = 1 << 19;
+
+fn gpu_device_only_threshold() -> usize {
+    static CACHED: OnceLock<usize> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("LAMBDA_VM_GPU_DEVICE_ONLY_THRESHOLD")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_DEVICE_ONLY_MIN_LDE)
+    })
+}
+
 /// Incremented by the `try_expand_*` functions per base-field column handed to
 /// the GPU dispatch (an ext3 column counts as 3, one per base component),
 /// before the GPU call. A failed call returns without decrementing it, so it
@@ -206,7 +226,7 @@ where
         && !device_only_disabled()
         && !gpu_composition_disabled()
         && lde_size.is_power_of_two()
-        && lde_size >= gpu_lde_threshold()
+        && lde_size >= gpu_device_only_threshold()
         && n >= gpu_bary_threshold()
         && offsets_contiguous
         && zerofier_uniform
