@@ -1562,6 +1562,16 @@ pub fn gpu_fri_calls() -> u64 {
 /// are counted here, so a single failed dispatch does not necessarily lower
 /// the total; R3's fallbacks are CPU-only, so a failure there does.
 pub(crate) static GPU_BATCH_INVERT_CALLS: AtomicU64 = AtomicU64::new(0);
+/// The device's VRAM admission budget in bytes, if a CUDA backend is up.
+/// Lets callers outside this crate (the epoch builder's trace pre-upload)
+/// size their riding-ahead allocations relative to the same budget the
+/// per-table scheduler admits against.
+pub fn device_vram_budget_bytes() -> Option<u64> {
+    math_cuda::device::backend()
+        .ok()
+        .map(|be| be.vram_budget_bytes())
+}
+
 pub fn gpu_batch_invert_calls() -> u64 {
     GPU_BATCH_INVERT_CALLS.load(Ordering::Relaxed)
 }
@@ -2175,6 +2185,24 @@ fn coset_points_device_handle(
     let key = (coset_u64.len(), coset_u64[0], coset_u64[1]);
     if let Some(h) = coset_points_device_cache().lock().unwrap().get(&key) {
         return Some(h.clone());
+    }
+    // The key only determines the full contents for a geometric sequence
+    // `p_i = p_0·w^i`: verify it at sampled indices so a non-coset caller
+    // trips here instead of silently aliasing another entry. Insert-only —
+    // a handful of times per process.
+    {
+        type Fp = FieldElement<GoldilocksField>;
+        let p0 = Fp::from_raw(coset_u64[0]);
+        let w = Fp::from_raw(coset_u64[1])
+            * p0.inv()
+                .expect("coset_points_device_handle: coset offset must be nonzero");
+        for i in [2usize, coset_u64.len() / 2, coset_u64.len() - 1] {
+            assert_eq!(
+                Fp::from_raw(coset_u64[i]),
+                &p0 * &w.pow(i as u64),
+                "coset_points_device_handle: input is not a geometric coset"
+            );
+        }
     }
     let buf = stream.clone_htod(coset_u64).ok()?;
     // Settle the copy before publishing: consumers run on other streams.

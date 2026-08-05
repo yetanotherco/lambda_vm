@@ -3841,11 +3841,19 @@ impl Traces {
         const MIN_BYTES: usize = 8 << 20;
         static BUDGET_BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         let budget = *BUDGET_BYTES.get_or_init(|| {
-            std::env::var("LAMBDA_VM_TRACE_PREUPLOAD_MB")
+            let env_cap = std::env::var("LAMBDA_VM_TRACE_PREUPLOAD_MB")
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(4096)
-                << 20
+                << 20;
+            // These buffers ride ahead of the prover's own VRAM admission
+            // gate (they exist before their table is admitted), so cap them
+            // to a slice of the device budget rather than competing with the
+            // prove peak on small cards.
+            match stark::gpu_lde::device_vram_budget_bytes() {
+                Some(dev) => env_cap.min((dev / 4) as usize),
+                None => env_cap,
+            }
         });
         if budget == 0 {
             return;
