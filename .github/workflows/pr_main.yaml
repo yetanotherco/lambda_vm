@@ -117,6 +117,15 @@ jobs:
         run: |
           cargo test --release -p executor --test flamegraph
 
+      # The unit tests under `executor/src/tests/` are a *lib* target (`pub mod tests;`
+      # in lib.rs), which none of the `--test <name>` steps above select — and the
+      # `test_ckzg` step below filters by name, so it doesn't run them either. Without
+      # this step they never run in CI. It shares the lib test binary with that step,
+      # so it costs a test run, not an extra compile.
+      - name: Run executor lib unit tests
+        run: |
+          cargo test --release -p executor --lib
+
       - name: Run ignored executor tests
         run: |
           cargo test --release -p executor test_ckzg -- --ignored
