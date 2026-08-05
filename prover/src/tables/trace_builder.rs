@@ -4141,17 +4141,74 @@ impl Traces {
     /// - Deterministic ELF pages (preprocessed, init from binary)
     /// - Runtime pages from prover hints (preprocessed, zero-init)
     /// - Private-input pages (NOT preprocessed, verifier doesn't see init values)
+    ///
+    /// `max_pages` caps how many configs may be materialised. `runtime_page_ranges`
+    /// is a prover-chosen field of `VmProof` with a free `u64` count, and this
+    /// function is what turns it into allocations — so the cap must be enforced
+    /// *before* the loop, not by the `expected_proof_count` check downstream, which
+    /// only runs once the `Vec` already exists. The verifier passes the sub-proof
+    /// count: a layout needing more pages than the proof has sub-proofs can never
+    /// verify, so this rejects nothing an honest prover could produce.
     pub fn page_configs_from_elf_and_runtime(
         elf: &Elf,
         runtime_page_ranges: &[crate::RuntimePageRange],
         num_private_input_pages: usize,
-    ) -> Vec<PageConfig> {
+        max_pages: usize,
+    ) -> Result<Vec<PageConfig>, Error> {
         let mut configs = Self::page_configs_from_elf(elf);
         let page_size = page::DEFAULT_PAGE_SIZE;
 
-        // Add zero-init runtime pages (stack, heap)
+        let too_many = |have: usize| {
+            Error::MalformedPageLayout(format!(
+                "page layout needs more than {max_pages} pages (at least {have}); \
+                 the proof cannot contain that many sub-proofs",
+            ))
+        };
+        if configs.len() > max_pages {
+            return Err(too_many(configs.len()));
+        }
+
+        // Add zero-init runtime pages (stack, heap).
         for r in runtime_page_ranges {
             let (base, count) = (r.base, r.count);
+            if count == 0 {
+                return Err(Error::MalformedPageLayout(format!(
+                    "runtime page range at 0x{base:x} has count 0; the honest \
+                     run-length encoding never emits an empty range",
+                )));
+            }
+            // Alignment is what makes the duplicate-base check below a complete
+            // overlap check: page-aligned pages of one size either share a base or
+            // are disjoint, so there is no partial-overlap case to consider.
+            if base % page_size as u64 != 0 {
+                return Err(Error::MalformedPageLayout(format!(
+                    "runtime page base 0x{base:x} is not {page_size}-byte aligned",
+                )));
+            }
+            // Reject before allocating: `count` is untrusted, so both the running
+            // total and the address arithmetic have to be checked up front.
+            let projected = configs
+                .len()
+                .saturating_add(usize::try_from(count).unwrap_or(usize::MAX));
+            if projected > max_pages {
+                return Err(too_many(projected));
+            }
+            // Guards the `base + i * page_size` below for every `i < count`.
+            //
+            // Bound the range's LAST BYTE, not its exclusive end: the stack's top page
+            // legitimately sits at the very top of the address space, where the
+            // exclusive end is exactly 2^64 and only the last byte is representable.
+            // Checking the end instead rejects every honest proof (`count >= 1` is
+            // already established above, so `span - 1` cannot underflow).
+            count
+                .checked_mul(page_size as u64)
+                .and_then(|span| base.checked_add(span - 1))
+                .ok_or_else(|| {
+                    Error::MalformedPageLayout(format!(
+                        "runtime page range at 0x{base:x} with count {count} overflows \
+                         the address space",
+                    ))
+                })?;
             for i in 0..count {
                 configs.push(PageConfig::zero_init(base + i * page_size as u64));
             }
@@ -4165,9 +4222,13 @@ impl Traces {
                 is_private_input: true,
             });
         }
+        if configs.len() > max_pages {
+            return Err(too_many(configs.len()));
+        }
 
         configs.sort_by_key(|c| c.page_base);
-        configs
+
+        Ok(configs)
     }
 
     /// Extracts runtime page ranges from the generated page configs.

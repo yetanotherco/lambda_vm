@@ -455,6 +455,10 @@ pub enum Error {
     /// Recursion host-side helper failed (guest-input encoding or
     /// commitment recompute — see the `recursion` module).
     Recursion(String),
+    /// The proof's `runtime_page_ranges` do not describe a well-formed page
+    /// layout: unaligned or overflowing base, zero count, more pages than the
+    /// proof can hold, or two pages covering the same address.
+    MalformedPageLayout(String),
 }
 
 impl fmt::Display for Error {
@@ -484,6 +488,7 @@ impl fmt::Display for Error {
                 )
             }
             Error::Recursion(msg) => write!(f, "recursion helper error: {msg}"),
+            Error::MalformedPageLayout(msg) => write!(f, "malformed page layout: {msg}"),
         }
     }
 }
@@ -1352,11 +1357,17 @@ fn verify_proof_parts(
         }
     }
 
+    // `proofs.len()` is the cap: every page config needs its own sub-proof, so a
+    // layout wanting more pages than the proof carries can never verify. Passing it
+    // here makes the rejection happen before the configs are allocated — the
+    // `expected_proof_count` check below runs too late to stop a `count: u64::MAX`
+    // range from exhausting memory first.
     let page_configs = Traces::page_configs_from_elf_and_runtime(
         program,
         runtime_page_ranges,
         num_private_input_pages,
-    );
+        proofs.len(),
+    )?;
 
     // Cross-check: table_counts must match the number of sub-proofs.
     // FIXED_TABLE_COUNT always-present tables, plus page tables.

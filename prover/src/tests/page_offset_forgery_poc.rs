@@ -97,7 +97,7 @@ fn craft_proof(
     run_elf: &[u8],
     private_inputs: &[u8],
     forge: Option<Forge>,
-) -> VmProof {
+) -> Result<VmProof, stark::prover::ProvingError> {
     let options = opts();
 
     // Identity + all preprocessed roots come from the HONEST ELF.
@@ -162,16 +162,15 @@ fn craft_proof(
         &mut transcript,
         #[cfg(feature = "disk-spill")]
         stark::storage_mode::StorageMode::Ram,
-    )
-    .expect("multi_prove");
+    )?;
 
-    VmProof {
+    Ok(VmProof {
         proof,
         runtime_page_ranges,
         table_counts,
         public_output: traces.public_output_bytes.clone(),
         num_private_input_pages,
-    }
+    })
 }
 
 /// Repoint one unused private-input PAGE row at `f.target_addr` so that it
@@ -238,7 +237,7 @@ fn apply_forge(traces: &mut Traces, f: &Forge) {
 #[test]
 fn poc_control_honest_harness_verifies() {
     let elf = asm_elf_bytes("poc_rodata_commit");
-    let proof = craft_proof(&elf, &elf, &[0u8], None);
+    let proof = craft_proof(&elf, &elf, &[0u8], None).expect("honest proving must succeed");
     assert_eq!(
         proof.public_output,
         SECRET.to_vec(),
@@ -264,7 +263,8 @@ fn poc_negative_control_forged_run_without_repointed_row_fails() {
     let mut patched = honest.clone();
     patched[file_off] = FORGED_BYTE;
 
-    let proof = craft_proof(&honest, &patched, &[0u8], None);
+    let proof = craft_proof(&honest, &patched, &[0u8], None)
+        .expect("the patched run still proves; it is the verifier that must reject it");
     assert_eq!(
         proof.public_output[0], FORGED_BYTE,
         "the patched run must commit the forged byte"
@@ -287,6 +287,15 @@ fn poc_negative_control_forged_run_without_repointed_row_fails() {
 ///
 /// Read together with `poc_control_honest_harness_verifies` — a fix that broke
 /// honest proving would also make this test pass, and that one would catch it.
+///
+/// The forgery can now die at either of two layers, and which one fires depends
+/// on process state, so the test accepts both. `commit_main_trace` caches
+/// precomputed Merkle trees keyed by *the expected root*, and skips the rebuild
+/// check on a hit (`prover.rs:1161-1170`). So with a cold cache the prover itself
+/// refuses — it rebuilds the tree from the repointed column and finds the wrong
+/// root — while with a warm cache it substitutes the correct cached tree and the
+/// proof is built, leaving the verifier to reject it. Asserting only one of those
+/// would make this test pass or fail on test ordering.
 #[test]
 fn forged_private_page_offset_is_rejected() {
     let honest = asm_elf_bytes("poc_rodata_commit");
@@ -294,7 +303,7 @@ fn forged_private_page_offset_is_rejected() {
     let mut patched = honest.clone();
     patched[file_off] = FORGED_BYTE;
 
-    let proof = craft_proof(
+    let crafted = craft_proof(
         &honest,
         &patched,
         &[0u8],
@@ -305,8 +314,25 @@ fn forged_private_page_offset_is_rejected() {
         }),
     );
 
-    // The forged proof genuinely claims the forged byte: the test would be
-    // vacuous if the crafted proof were honest after all.
+    let proof = match crafted {
+        // Stopped at prove time: the repointed OFFSET column no longer rebuilds
+        // to the commitment the AIR carries.
+        Err(e) => {
+            assert!(
+                matches!(
+                    e,
+                    stark::prover::ProvingError::PrecomputedCommitmentMismatch
+                ),
+                "the forged trace must be refused for the OFFSET commitment, not for \
+                 some unrelated proving error: {e:?}"
+            );
+            return;
+        }
+        Ok(proof) => proof,
+    };
+
+    // Otherwise it must reach — and fail — verification. First confirm the proof
+    // genuinely claims the forged byte, or the test would be vacuous.
     assert_eq!(
         proof.public_output[0], FORGED_BYTE,
         "forged proof must claim the forged byte"
