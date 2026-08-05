@@ -263,6 +263,7 @@ memcpy:
 global_asm!(
     r#"
     .section .text.memmove,"ax",@progbits
+    .p2align 2
     .globl memmove
     .type memmove,@function
 memmove:
@@ -323,6 +324,7 @@ memmove:
 global_asm!(
     r#"
     .section .text.memset,"ax",@progbits
+    .p2align 2
     .globl memset
     .type memset,@function
 memset:
