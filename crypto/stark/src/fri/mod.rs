@@ -73,6 +73,9 @@ where
     }
 
     debug_assert_eq!(evals.len(), domain_size);
+    // Caller-enforced twiddle sizing (Domain::fri_inv_twiddles): the folding
+    // loop below indexes `inv_twiddles[..len/2]` per layer.
+    debug_assert_eq!(inv_twiddles.len(), evals.len() / 2);
     // Fold layout, shared with the GPU prover and the verifier — see `FriFoldLayout`.
     let layout = crate::fri::terminal::FriFoldLayout::new(
         evals.len().trailing_zeros(),

@@ -25,10 +25,6 @@ use crate::ntt::{twiddles_forward, twiddles_inverse};
 pub struct PinnedStaging {
     ptr: *mut u64,
     capacity_elems: usize,
-    /// Pool-wide first-allocation size hint (u64 elems), shared by every slot
-    /// of the pool this staging belongs to. Published by the prover once table
-    /// sizes are known (see [`Backend::set_staging_size_hints`]); zero = none.
-    hint_u64s: Arc<AtomicUsize>,
     /// Reusable completion event for [`async_dtoh_via`] copies through this
     /// slot. Created once on first use and re-recorded per drain — per-call
     /// cuEventCreate/Destroy measurably convoys the driver lock under load.
@@ -44,11 +40,10 @@ unsafe impl Send for PinnedStaging {}
 unsafe impl Sync for PinnedStaging {}
 
 impl PinnedStaging {
-    fn empty(hint_u64s: Arc<AtomicUsize>) -> Self {
+    fn empty() -> Self {
         Self {
             ptr: std::ptr::null_mut(),
             capacity_elems: 0,
-            hint_u64s,
             event: None,
         }
     }
@@ -67,12 +62,7 @@ impl PinnedStaging {
             self.ptr = std::ptr::null_mut();
             self.capacity_elems = 0;
         }
-        // First allocation of this slot jumps straight to the prove-wide size
-        // hint (when the prover published one), so a slot pays cuMemHostAlloc
-        // once instead of climbing a realloc ladder (pinned alloc/free is
-        // ~50ms+ per step — see docs/gpu_baseline_ethrex_5090.md).
-        let target = min_elems.max(self.hint_u64s.load(Ordering::Relaxed));
-        let new_cap = target.next_power_of_two().max(1 << 20); // at least 8 MB
+        let new_cap = min_elems.next_power_of_two().max(1 << 20); // at least 8 MB
         let bytes = new_cap * std::mem::size_of::<u64>();
         let ptr = unsafe {
             cudarc::driver::result::malloc_host(bytes, 0 /* flags: non-WC */)?
@@ -164,10 +154,6 @@ pub struct Backend {
     /// `pinned_staging`; sized `num_rows * 32` bytes per slot. Lives
     /// alongside the LDE staging so the GPU→host D2H runs at PCIe line-rate.
     pinned_hashes: Vec<Mutex<PinnedStaging>>,
-    /// First-allocation size hints for the two staging pools (u64 elems),
-    /// shared with every slot. See [`Backend::set_staging_size_hints`].
-    staging_hint_u64s: Arc<AtomicUsize>,
-    hashes_hint_u64s: Arc<AtomicUsize>,
     util_stream: Arc<CudaStream>,
     /// Free-list of pre-created events for [`Backend::take_event`].
     event_pool: Mutex<Vec<cudarc::driver::CudaEvent>>,
@@ -377,22 +363,20 @@ impl Backend {
         // when no custom pool is in use. Stable across the backend's lifetime
         // since rayon's pool is fixed at first use.
         let n_slots = rayon::current_num_threads().max(1);
-        let staging_hint = Arc::new(AtomicUsize::new(0));
-        let hashes_hint = Arc::new(AtomicUsize::new(0));
         // Pre-create each slot's reusable event here, off the prove's critical
         // path — a mid-prove cuEventCreate convoys the driver lock (~30 ms
         // measured under load vs ~µs at init).
-        let make_pool = |hint: &Arc<AtomicUsize>| -> Result<Vec<Mutex<PinnedStaging>>> {
+        let make_pool = || -> Result<Vec<Mutex<PinnedStaging>>> {
             let mut pool = Vec::with_capacity(n_slots);
             for _ in 0..n_slots {
-                let mut slot = PinnedStaging::empty(Arc::clone(hint));
+                let mut slot = PinnedStaging::empty();
                 slot.event = Some(ctx.new_event(None)?);
                 pool.push(Mutex::new(slot));
             }
             Ok(pool)
         };
-        let pinned_staging = make_pool(&staging_hint)?;
-        let pinned_hashes = make_pool(&hashes_hint)?;
+        let pinned_staging = make_pool()?;
+        let pinned_hashes = make_pool()?;
         // Pre-create the handle-readiness event pool (see `take_event`): one
         // event per device-resident handle a prove can have alive; creation
         // here is ~µs each, mid-prove it convoys the driver lock.
@@ -495,8 +479,6 @@ impl Backend {
             pinned_staging,
             pinned_hashes,
             event_pool,
-            staging_hint_u64s: staging_hint,
-            hashes_hint_u64s: hashes_hint,
             util_stream,
             next: AtomicUsize::new(0),
             vram_budget_bytes,
@@ -507,19 +489,6 @@ impl Backend {
     /// when budgeting is disabled (query failed). See the field docs.
     pub fn vram_budget_bytes(&self) -> u64 {
         self.vram_budget_bytes
-    }
-
-    /// Publish first-allocation size hints (u64 elems) for the pinned staging
-    /// pools, so each worker slot allocates its slab once at final size
-    /// instead of climbing a realloc ladder (each pinned alloc/free step costs
-    /// ~50ms+). Call once per prove, as soon as table sizes are known; only
-    /// raises (never shrinks) the current hints, and only affects slots that
-    /// have not allocated yet.
-    pub fn set_staging_size_hints(&self, lde_u64s: usize, hashes_u64s: usize) {
-        self.staging_hint_u64s
-            .fetch_max(lde_u64s, Ordering::Relaxed);
-        self.hashes_hint_u64s
-            .fetch_max(hashes_u64s, Ordering::Relaxed);
     }
 
     /// Round-robin over the stream pool. Concurrent callers get different
@@ -546,6 +515,12 @@ impl Backend {
 
     /// Map `rayon::current_thread_index()` to a slot index, with a defensive
     /// clamp in case the rayon pool grew past the Vec we sized at init.
+    ///
+    /// The per-table scheduler's driver threads are not rayon workers: they
+    /// all resolve to slot 0 and deliberately share one slab. Spreading them
+    /// over per-driver slots costs more in repeated pinned allocation than
+    /// the shared mutex does — the staged transfers are already hidden by
+    /// cross-table overlap.
     fn worker_slot(&self, len: usize) -> usize {
         let idx = rayon::current_thread_index().unwrap_or(0);
         // Should be unreachable with rayon's fixed default pool, but if a
@@ -667,11 +642,26 @@ impl Drop for PendingD2H<'_> {
     }
 }
 
-/// Host→device copy staged through the pinned slot: one host memcpy into
-/// pinned memory + one async DMA, instead of the driver's internal pageable
-/// staging (small chunks; 2-3x slower for multi-hundred-MB traces and it
-/// convoys under multi-thread load). Blocks until the DMA lands, so the slot
-/// and `src_host` are both reusable on return.
+/// Chunk size for [`htod_via`]'s staged upload — the upper bound a single H2D
+/// puts on a staging slot's page-locked footprint. 64 MB is large enough to
+/// amortize the per-chunk DMA launch + event sync, small enough to keep the
+/// pinned slab independent of trace size.
+const HTOD_CHUNK_BYTES: usize = 64 << 20; // 64 MB
+
+/// Host→device copy staged through the pinned slot, in fixed-size chunks: each
+/// chunk is one host memcpy into pinned memory + one async DMA, instead of the
+/// driver's internal pageable staging (small chunks; 2-3x slower for
+/// multi-hundred-MB traces and it convoys under multi-thread load). Blocks
+/// until the last DMA lands, so the slot and `src_host` are both reusable on
+/// return.
+///
+/// Chunking caps the slot's page-locked footprint at [`HTOD_CHUNK_BYTES`]
+/// regardless of trace size. This matters on the device-only path
+/// (`retain_host_lde = false`): there is no [`async_dtoh_via`] drain to size
+/// the slot, so `htod_via` is its only writer — an uncapped copy would grow
+/// the per-worker slab to a whole trace and, being grow-only, never shrink it.
+/// The host-retaining path is unaffected: its later `async_dtoh_via` grows the
+/// same slot to the full LDE anyway, and we simply reuse the first chunk of it.
 pub fn htod_via<T: cudarc::driver::DeviceRepr>(
     stream: &Arc<CudaStream>,
     slot: &Mutex<PinnedStaging>,
@@ -688,31 +678,70 @@ pub fn htod_via<T: cudarc::driver::DeviceRepr>(
     if n_bytes == 0 {
         return Ok(());
     }
-    let u64_len = n_bytes.div_ceil(8);
+    let elem_size = std::mem::size_of::<T>();
+    // Chunk in whole elements so a `T` never straddles a chunk boundary.
+    let chunk_elems = (HTOD_CHUNK_BYTES / elem_size.max(1)).max(1);
+
     let mut staging = slot.lock().unwrap();
-    staging.ensure_capacity(u64_len, ctx)?;
+    // Only ask for a chunk's worth of pinned memory (or the whole copy when
+    // smaller). If another path (`async_dtoh_via` on the host-retaining flow)
+    // already grew this slot larger, it stays larger — grow-only — and we just
+    // use the first chunk of it.
+    let want_u64 = (chunk_elems * elem_size)
+        .div_ceil(8)
+        .min(n_bytes.div_ceil(8));
+    staging.ensure_capacity(want_u64, ctx)?;
     ctx.bind_to_thread()?;
-    // SAFETY: the pinned allocation is stable while the lock is held and at
-    // least `n_bytes` long (`ensure_capacity`). The DMA reads it after the
-    // host memcpy (program order); `device_ptr_mut` orders the device write
-    // on `stream`.
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            src_host.as_ptr() as *const u8,
-            staging.ptr as *mut u8,
-            n_bytes,
-        );
-        let (dst_ptr, _record) = dst.device_ptr_mut(stream);
-        cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
-            dst_ptr,
-            staging.ptr as *const core::ffi::c_void,
-            n_bytes,
-            stream.cu_stream(),
-        )
-        .result()?;
+
+    // SAFETY: `device_ptr_mut` yields the destination base pointer and orders
+    // the device writes on `stream`; `dst.len() >= src_host.len()` (asserted),
+    // so every chunk's byte range stays within `dst`.
+    let (dst_base, _record) = dst.device_ptr_mut(stream);
+    // Declared after the slot's MutexGuard so it drops FIRST: once a chunk's
+    // DMA is in flight, any `?`-return below must drain the stream before the
+    // guard releases the slot, or the next locker's `ensure_capacity` could
+    // `cuMemFreeHost` the slab while the device is still reading it. Same
+    // hazard `async_dtoh_via` guards against on its record-event failure.
+    let mut drain = DrainOnErr {
+        stream,
+        armed: false,
+    };
+    let src = src_host.as_ptr() as *const u8;
+    let n_elems = src_host.len();
+    let mut elem_off = 0usize;
+    while elem_off < n_elems {
+        let this_elems = (n_elems - elem_off).min(chunk_elems);
+        let this_bytes = this_elems * elem_size;
+        let byte_off = elem_off * elem_size;
+        // SAFETY: the pinned slab holds at least `chunk_elems * elem_size`
+        // bytes (or the whole copy when smaller). The previous chunk's DMA is
+        // synced below before this memcpy overwrites the slab, so the slab is
+        // never read (by an in-flight DMA) and written at the same time.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.add(byte_off), staging.ptr as *mut u8, this_bytes);
+            let r = cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+                dst_base + byte_off as u64,
+                staging.ptr as *const core::ffi::c_void,
+                this_bytes,
+                stream.cu_stream(),
+            )
+            .result();
+            // Armed even on failure: the driver may have enqueued the copy
+            // before reporting the error.
+            drain.armed = true;
+            r?;
+        }
+        // Single-buffered: wait for this chunk's DMA before the next memcpy
+        // reuses the slab. Both calls can fail with the DMA still in flight,
+        // which is what `drain` covers.
+        staging.record_event(stream)?;
+        staging.sync_event()?;
+        // This chunk has landed; nothing is reading the slab until the next
+        // iteration re-arms.
+        drain.armed = false;
+        elem_off += this_elems;
     }
-    staging.record_event(stream)?;
-    staging.sync_event()
+    Ok(())
 }
 
 /// Enqueue an async D2H of `n_elems` of `src` into the pinned slab of `slot`,
@@ -755,9 +784,32 @@ pub fn async_dtoh_via<'a, T: cudarc::driver::DeviceRepr>(
         .result()?;
     }
     // Re-record the slot's reusable event (created once — per-call
-    // cuEventCreate/Destroy convoys the driver lock under load).
-    staging.record_event(stream)?;
+    // cuEventCreate/Destroy convoys the driver lock under load). The DMA is
+    // already in flight: if the record fails, drain the stream before the
+    // guard drops, or the next locker could free the slab mid-copy.
+    if let Err(e) = staging.record_event(stream) {
+        let _ = stream.synchronize();
+        return Err(e);
+    }
     Ok(PendingD2H { staging, n_bytes })
+}
+
+/// Best-effort stream drain on error paths: while `armed`, dropping this guard
+/// synchronizes the stream. Arm after the first enqueue that reads a
+/// pinned-staging slab; defuse once the slab is safe to release. Declared
+/// AFTER the slot's `MutexGuard`, it drops first, so an `?`-return can never
+/// release the slot with a DMA still reading it.
+pub(crate) struct DrainOnErr<'a> {
+    pub stream: &'a CudaStream,
+    pub armed: bool,
+}
+
+impl Drop for DrainOnErr<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.stream.synchronize();
+        }
+    }
 }
 
 impl PendingD2H<'_> {

@@ -41,8 +41,10 @@ fn check_fault_injection() -> Result<()> {
 }
 
 /// Device-side state across FRI commit iterations. Owns the current fold
-/// input (the previous layer's evals, Arc-shared with that layer's retained
-/// `gpu_evals`) and the inv_twiddles buffer. Freed when dropped.
+/// input (the previous layer's evals) and the inv_twiddles buffer. The input
+/// is an `Arc` because the caller may also retain it as that layer's
+/// `gpu_evals` — it does so only on the device-only path, where no host copy
+/// of the evals exists. Freed when the last holder drops.
 pub struct FriCommitState {
     pub stream: Arc<CudaStream>,
     /// Current fold input. Each fold allocates a fresh output buffer that is
@@ -264,6 +266,14 @@ pub fn gather_ext3_at(
     if q == 0 {
         return Ok(Vec::new());
     }
+    // Guard the kernel's device reads: a position past the evals buffer would
+    // be a silent out-of-bounds read. Positions are valid by construction;
+    // this catches a caller bug host-side before it becomes device garbage
+    // (matching `gather_merkle_paths_dev`).
+    assert!(
+        positions.iter().all(|&p| (p as usize) < evals.len() / 3),
+        "gather_ext3_at: position >= evals length"
+    );
     let be = backend()?;
     let pos_dev = stream.clone_htod(positions)?;
     // SAFETY: the gather kernel writes all 3 * q slots.

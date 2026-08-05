@@ -40,6 +40,14 @@ jobs:
       - name: Check ethrex fixture checksums
         run: make check-ethrex-fixture-checksums
 
+      # The benchmark comment harness: verifies every steps.X.outputs.Y consumed in
+      # benchmark-pr.yml has a producer (the orphaned-wiring class that once broke
+      # /bench-growth silently), then renders the full comment scenario suite.
+      # Pure node, no dependencies, ~10 s. Lives in Lint so it runs on every PR —
+      # a path filter would have to enumerate every file that can break the wiring.
+      - name: Check benchmark comment wiring
+        run: node scripts/render_bench_comment.js
+
   test-executor:
     name: Executor tests
     runs-on: ubuntu-latest
@@ -56,6 +64,18 @@ jobs:
         with:
           shared-key: "lambda-vm-test"
           cache-all-crates: "true"
+          # ethrex-tests is a detached workspace (own Cargo.lock, own target dir), so
+          # the default `. -> target` misses it and its release tree would rebuild
+          # from scratch every run. `cache-all-crates` only covers the registry, not
+          # compiled artifacts.
+          #
+          # ethrex-block-converter is deliberately NOT here: this job no longer builds it.
+          # That workspace is the expensive one (~335 packages, including the blst,
+          # c-kzg and secp256k1-sys C builds, malachite and ark-ff/asm) and it now
+          # builds only in ethrex-block-converter.yml, which carries its own cache entry.
+          workspaces: |
+            . -> target
+            tooling/ethrex-tests -> target
 
       - name: Cache compiled ASM ELF artifacts
         id: cache-asm-elfs
@@ -107,9 +127,24 @@ jobs:
       # them from that directory to use its isolated Cargo.lock. The guest ELF
       # and committed fixtures are already present from the steps above.
       # --include-ignored also runs the heavier synthetic-block test.
+      #
+      # `--skip test_ethrex_real_block` is a substring match, so it drops BOTH
+      # real-block tests (the `_vm` and `_native` ones) and with them this job's need
+      # for the real-block fixture. That fixture is a benchmark input: it has to be
+      # right once, not on every PR, and fetching plus screening it here put a network
+      # download and a ~335-package build in the required gate for an artifact with no
+      # bearing on correctness. Both moved to ethrex-block-converter.yml, which runs when
+      # the converter or the block pin actually changes. `no_kzg_backend_linked` still
+      # runs here — it is a pure unit test, and it is the property the real-block
+      # screen over there depends on.
+      #
+      # This is `make test-ethrex-offline` spelled out, matching the other test steps
+      # in this job: they all bypass make so its dependency check cannot decide the
+      # cache-restored ELFs are stale and trigger a rebuild.
       - name: Run ethrex host-reference tests (detached workspace)
         run: |
-          cd tooling/ethrex-tests && cargo test --release -- --include-ignored
+          cd tooling/ethrex-tests && \
+            cargo test --release -- --include-ignored --skip test_ethrex_real_block
 
   test-cli:
     name: CLI tests
@@ -371,6 +406,15 @@ jobs:
           name: prover-tests
 
       - name: Run prover tests (shard ${{ matrix.partition }}/4)
+        # Shard 1 only: force k > 1 so the per-table admission scheduler really
+        # runs several table closures concurrently. ubuntu-latest has 2-4 vCPU
+        # and table_parallelism() defaults to (cores / 3).max(1), so every
+        # other shard proves with a single driver thread and never exercises
+        # the concurrent path or VramGate's blocking path on a PR. The other
+        # three shards keep the default-k coverage. An empty value on those
+        # fails to parse and falls back to the default, so this is inert there.
+        env:
+          TABLE_PARALLELISM: ${{ matrix.partition == 1 && '6' || '' }}
         run: |
           cargo nextest run \
             --archive-file prover-tests.tar.zst \

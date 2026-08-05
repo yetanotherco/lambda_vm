@@ -5,8 +5,13 @@ use lambda_vm_ethrex_crypto::LambdaVmEcsmCrypto;
 use rkyv::rancor::Error;
 
 pub fn main() {
-    let input = lambda_vm_syscalls::syscalls::get_private_input();
-    let input = rkyv::from_bytes::<ProgramInput, Error>(&input).unwrap();
+    // Zero-copy private input: borrow the memory-mapped input region in place
+    // (the host pre-loads it before execution) so rkyv deserializes straight
+    // out of it. `get_private_input()` is this same slice plus a `to_vec()` —
+    // a full extra copy and one large allocation (~50k cycles on a 20-tx
+    // block).
+    let input = lambda_vm_syscalls::syscalls::get_private_input_slice();
+    let input = rkyv::from_bytes::<ProgramInput, Error>(input).unwrap();
     // LambdaVM crypto provider, defined in the lambda_vm repo and injected here
     // (so crypto changes don't require an ethrex PR — see `crypto/ethrex-crypto`).
     // It accelerates trait-routed `keccak256` (via the keccak_permute precompile)

@@ -4,14 +4,26 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-// Wall clock span timeline: the trustworthy per step latency breakdown.
+// Wall clock span timeline: the per step latency breakdown.
 //
-// Spans open and close on the main thread at phase boundaries. They do not
-// overlap and sum to their parent, so the tree is a true latency breakdown
-// (unlike the accum_* thread local sub timers below, which sum per worker CPU
-// time across rayon threads and can exceed 100%). A parallel region is one span
-// around the blocking call; its internal split is reported separately as CPU
-// time, never mixed into the wall tree.
+// Phase spans open and close on the thread that drives the phase, at phase
+// boundaries. Those are a true latency breakdown: they do not overlap and they
+// sum to their parent, unlike the accum_* thread local sub timers below, which
+// sum per worker CPU time across rayon threads and can exceed 100%. A parallel
+// region is one span around the blocking call; its internal split is reported
+// separately as CPU time, never mixed into the wall tree.
+//
+// Two properties of the recorded data are easy to misread:
+//
+//  - Spans are ALSO opened on worker threads, not only on the main thread —
+//    the per table drivers in `multi_prove` (`*_table` labels) and the
+//    per stage workers in `continuation.rs`. `SPAN_DEPTH` is thread local and
+//    a fresh thread starts at 0, so those records carry depth 0 and their
+//    siblings overlap in wall time. Read them as per instance wall time.
+//  - `scripts/profiling/phase_table.py` SUMS spans that share a label, so a
+//    label used once per table reports the sum over all tables, which can
+//    exceed the enclosing phase's wall clock by up to `table_parallelism()`.
+//    Give a per instance span its own label; never reuse a phase label for it.
 //
 //     let _s = instruments::span("trace_build");   // RAII, stops on drop
 //
@@ -50,7 +62,7 @@ pub struct SpanGuard {
 
 /// Label of the span that brackets an `nsys --capture-range=cudaProfilerApi`
 /// session, from `LAMBDA_VM_NSYS_CAPTURE_SPAN` (e.g. `rounds_2to4`, or
-/// `proving` to capture one epoch of a continuations run). None = never.
+/// `epoch_prove` to capture one epoch of a continuations run). None = never.
 #[cfg(feature = "nvtx")]
 fn capture_span_label() -> Option<&'static str> {
     static LABEL: OnceLock<Option<String>> = OnceLock::new();
@@ -262,9 +274,13 @@ pub struct Round1SubOps {
 /// Timing data collected inside `multi_prove`.
 pub struct MultiProveTiming {
     pub prepass: Duration,
+    /// Round 1 main trace commits. The last phase-wide barrier — every main
+    /// root must be absorbed before the shared LogUp challenges are sampled.
     pub main_commits: Duration,
-    pub aux_build: Duration,
-    pub aux_commit: Duration,
+    /// Wall clock of the fused per-table region: aux build, aux commit and
+    /// rounds 2-4, which run as one task per table across `table_parallelism()`
+    /// drivers. There is no phase-level wall for the aux stages on their own
+    /// any more; their CPU time shows up in `round1_sub`.
     pub rounds_2_4: Duration,
     /// Sub-op breakdown for Round 1 (main + aux LDE vs Merkle).
     pub round1_sub: Round1SubOps,

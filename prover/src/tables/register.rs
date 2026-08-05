@@ -174,8 +174,9 @@ pub(crate) fn register_init_from_entry_point(entry_point: u64) -> Vec<u32> {
 ///
 /// Used by tests that build a single epoch from a boundary snapshot. The
 /// continuation prover no longer uses this for chaining: epoch i+1's register
-/// init comes from epoch i's *bound* fini (`fini_from_trace`, carried as the next
-/// epoch's preprocessed INIT), not a trusted executor snapshot.
+/// init comes from epoch i's *bound* fini (`fini_from_final_state`, the same
+/// value the trace binds — pinned by `fini_from_final_state_matches_trace` —
+/// carried as the next epoch's preprocessed INIT), not a trusted snapshot.
 #[cfg(test)]
 pub(crate) fn register_init_from_snapshot(registers: &Registers, pc: u64) -> Vec<u32> {
     let mut init = vec![0u32; NUM_REGISTER_ADDRESSES];

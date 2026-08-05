@@ -23,6 +23,7 @@ crashes.
 
 import argparse
 import bisect
+import re
 import sqlite3
 import sys
 from collections import defaultdict
@@ -328,44 +329,59 @@ def main():
     print()
 
     # --- per-epoch view (continuations) ----------------------------------------
-    # `epoch[i=N]` ranges come from prove_continuation. Two numbers per epoch
-    # matter for parallelization: GPU busy% inside the epoch window (host-bound
-    # vs GPU-bound epochs) and GPU busy inside the gap to the next epoch
-    # (≈0 means the GPU sits idle between epochs — the pipelining headroom).
-    epoch_wins = sorted(
-        (start, end, name)
-        for start, end, name, _tid in nvtx
-        if name.startswith("epoch[")
-    )
-    if epoch_wins:
+    # prove_continuation emits one dynamic NVTX range per epoch and stage:
+    # `epoch_collect[i=N]` (producer), `epoch_trace_build[i=N]` (builder pool)
+    # and `epoch_prove[i=N]` (the prover — the critical path). Two numbers per
+    # instance matter: GPU busy% inside the window (host-bound vs GPU-bound)
+    # and GPU busy inside the gap to the next instance of the SAME stage.
+    # On `epoch_prove`, a gap ≈0 means the pipeline keeps the prover fed; a
+    # growing gap means trace collect/build stopped hiding behind the proves.
+    epoch_re = re.compile(r"^(epoch_(?:prove|trace_build|collect))\[i=\d+\]$")
+    stage_wins = defaultdict(list)  # stage -> [(start, end, name)]
+    for start, end, name, _tid in nvtx:
+        m = epoch_re.match(name)
+        if m:
+            stage_wins[m.group(1)].append((start, end, name))
+    if stage_wins:
         print("## Epochs (continuations)")
         print()
-        print("| epoch | wall ms | gpu-busy ms | busy% | gap→next ms | gpu-busy in gap ms |")
-        print("|---|---|---|---|---|---|")
-        total_gap = total_gap_busy = 0
-        for i, (w0, w1, name) in enumerate(epoch_wins):
-            busy = clipped_union(kern_sorted, [(w0, w1)])
-            if i + 1 < len(epoch_wins):
-                g0, g1 = w1, epoch_wins[i + 1][0]
-                gap = max(g1 - g0, 0)
-                gap_busy = clipped_union(kern_sorted, [(g0, g1)]) if gap else 0
-                total_gap += gap
-                total_gap_busy += gap_busy
-                gap_s, gap_busy_s = fmt_ms(gap), fmt_ms(gap_busy)
-            else:
-                gap_s = gap_busy_s = "-"
+        for stage in ("epoch_prove", "epoch_trace_build", "epoch_collect"):
+            epoch_wins = sorted(stage_wins.get(stage, []))
+            if not epoch_wins:
+                continue
+            print(f"### {stage}")
+            print()
             print(
-                f"| {name} | {fmt_ms(w1 - w0)} | {fmt_ms(busy)} "
-                f"| {100 * busy / (w1 - w0):.0f}% | {gap_s} | {gap_busy_s} |"
+                "| instance | wall ms | gpu-busy ms | busy% "
+                "| gap→next ms | gpu-busy in gap ms |"
             )
-        print()
-        print(
-            f"total inter-epoch gap: {fmt_ms(total_gap)} ms with only "
-            f"{fmt_ms(total_gap_busy)} ms of GPU work inside it — GPU-idle gap time "
-            f"is the upper bound on what epoch pipelining (overlap execute/trace-build "
-            f"of epoch N+1 with GPU proving of epoch N) can recover."
-        )
-        print()
+            print("|---|---|---|---|---|---|")
+            total_gap = total_gap_busy = 0
+            for i, (w0, w1, name) in enumerate(epoch_wins):
+                busy = clipped_union(kern_sorted, [(w0, w1)])
+                if i + 1 < len(epoch_wins):
+                    g0, g1 = w1, epoch_wins[i + 1][0]
+                    gap = max(g1 - g0, 0)
+                    gap_busy = clipped_union(kern_sorted, [(g0, g1)]) if gap else 0
+                    total_gap += gap
+                    total_gap_busy += gap_busy
+                    gap_s, gap_busy_s = fmt_ms(gap), fmt_ms(gap_busy)
+                else:
+                    gap_s = gap_busy_s = "-"
+                print(
+                    f"| {name} | {fmt_ms(w1 - w0)} | {fmt_ms(busy)} "
+                    f"| {100 * busy / (w1 - w0):.0f}% | {gap_s} | {gap_busy_s} |"
+                )
+            print()
+            if stage == "epoch_prove":
+                print(
+                    f"total inter-prove gap: {fmt_ms(total_gap)} ms with only "
+                    f"{fmt_ms(total_gap_busy)} ms of GPU work inside it — GPU-idle "
+                    f"gap between proves means the prover is starving (the epoch "
+                    f"pipeline's collect/build stopped keeping up); ≈0 means the "
+                    f"prove chain itself is the critical path."
+                )
+                print()
 
     # --- top kernels overall ---------------------------------------------------
     total_ns = sum(ns for _, ns in kernel_totals.values())

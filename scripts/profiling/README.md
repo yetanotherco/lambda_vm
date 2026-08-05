@@ -1,8 +1,8 @@
 # GPU profiling toolkit
 
-Tooling for profiling the CUDA prover on the dedicated RTX 5090 box. The full
-methodology (what to measure, in what order, and how to read it) lives in
-`thoughts/gpu-profiling/plan.md`; this directory is the executable part.
+Tooling for profiling the CUDA prover on the dedicated RTX 5090 box: this
+directory is the executable part of the profiling methodology (measure with
+`run_profile.sh`, rank phases by `phase_busy.md`, then drill into kernels).
 
 ## One-time machine setup
 
@@ -27,6 +27,13 @@ not comparable across sessions.
 
 ## The main entry point
 
+The ethrex transfer fixtures are generated, not checked in — build one first:
+
+```bash
+( cd tooling/ethrex-fixtures && cargo build --release )
+tooling/ethrex-fixtures/target/release/ethrex-fixtures 5 executor/tests/ethrex_5_transfers.bin distinct
+```
+
 ```bash
 # 3 instrumented runs + phase table with GPU util per phase:
 scripts/profiling/run_profile.sh executor/program_artifacts/rust/ethrex.elf \
@@ -37,7 +44,7 @@ scripts/profiling/run_profile.sh --nsys \
   executor/program_artifacts/rust/ethrex.elf \
   --private-input executor/tests/ethrex_5_transfers.bin
 
-# big continuation run, nsys capture limited to one `proving` span (one epoch):
+# big continuation run, nsys capture limited to one `epoch_prove` span (one epoch):
 LAMBDA_VM_NSYS_CAPTURE_SPAN=epoch_prove scripts/profiling/run_profile.sh --nsys --continuations \
   executor/program_artifacts/rust/ethrex.elf \
   --private-input executor/tests/ethrex_10_transfers.bin
@@ -119,10 +126,11 @@ Useful prover knobs for A/B experiments (pre-existing, see plan §11):
 
 `prove_continuation` is instrumented independently of the monolithic path
 (`prover/src/continuation.rs`): a `prove_continuation_total` root, per-epoch
-`epoch` → `epoch_execute` / `epoch_trace_build` / `epoch_prove` spans, a
-`prove_global` span, and a dynamic `epoch[i=N]` NVTX range per epoch — and it
-writes `LAMBDA_VM_TIMELINE_JSON` at the end (before this instrumentation,
-continuation runs produced no timeline at all).
+`epoch_execute` / `epoch_collect` / `epoch_trace_build` / `epoch_prove` spans,
+a `prove_global` span, and dynamic `epoch_collect[i=N]` /
+`epoch_trace_build[i=N]` / `epoch_prove[i=N]` NVTX ranges per epoch and
+pipeline stage — and it writes `LAMBDA_VM_TIMELINE_JSON` at the end (before
+this instrumentation, continuation runs produced no timeline at all).
 
 With `run_profile.sh --continuations` the reports gain the epoch-level view
 that drives parallelization decisions:
@@ -132,11 +140,14 @@ that drives parallelization decisions:
   span vs inside the gap**. `epoch_execute`/`epoch_trace_build` rows with ~0
   GPU% while `epoch_prove` is high = the fraction of wall recoverable by
   overlapping epoch N+1's CPU work with epoch N's GPU proving.
-- `phase_busy.md` — "Epochs (continuations)" section from the `epoch[i=N]`
-  ranges: per-epoch GPU busy%, inter-epoch gaps and GPU work inside them
-  (≈0 → idle gap = pipelining headroom, quantified in ms).
-- In the Nsight GUI, epochs appear as named `epoch[i=N]` ranges, so
-  cross-epoch overlap (or the lack of it) is visible at a glance; combine with
+- `phase_busy.md` — "Epochs (continuations)" section from the
+  `epoch_{prove,trace_build,collect}[i=N]` ranges, grouped per stage:
+  per-instance GPU busy%, gaps to the next instance of the same stage and GPU
+  work inside them (a gap ≈0 on `epoch_prove` = the pipeline keeps the prover
+  fed; a growing one = collect/build stopped hiding behind the proves).
+- In the Nsight GUI, epochs appear as named `epoch_prove[i=N]` (and
+  `epoch_trace_build[i=N]` / `epoch_collect[i=N]`) ranges, so cross-epoch
+  overlap (or the lack of it) is visible at a glance; combine with
   `LAMBDA_VM_NSYS_CAPTURE_SPAN=epoch_prove` to capture a single epoch's prove.
 
 ## The `nvtx` cargo feature
