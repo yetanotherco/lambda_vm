@@ -356,6 +356,34 @@ mod imp {
             init(0, 0);
             assert!(unsafe { BumpAlloc.alloc(layout(1, 1)) }.is_null());
         }
+
+        /// A second `init` would rewind the cursor over live allocations, which
+        /// `alloc_zeroed`'s missing memset turns into silently dirty memory. In debug
+        /// builds the `debug_assert!` is what catches that.
+        #[test]
+        #[cfg(debug_assertions)]
+        #[should_panic(expected = "init called twice")]
+        fn a_second_init_is_loud_in_debug() {
+            let _guard = with_heap(1024 * 1024);
+            init(0, 0);
+        }
+
+        /// Guests are built in release, where the `debug_assert!` is compiled out and the
+        /// early return is the only thing holding the invariant up.
+        #[test]
+        #[cfg(not(debug_assertions))]
+        fn a_second_init_leaves_the_cursor_alone() {
+            let _guard = with_heap(1024 * 1024);
+            let first = unsafe { BumpAlloc.alloc(layout(4096, 8)) };
+            assert!(!first.is_null());
+            init(first as usize, first as usize + 4096);
+            let second = unsafe { BumpAlloc.alloc(layout(4096, 8)) };
+            assert_eq!(
+                second as usize,
+                first as usize + 4096,
+                "init rewound the cursor over a live allocation"
+            );
+        }
     }
 }
 
@@ -677,6 +705,33 @@ mod imp {
             reset();
             init(0, 0);
             assert!(BumpSystem.alloc(1).0.is_null());
+        }
+
+        /// A second `init` would rewind the segment cursor and hand dlmalloc segments that
+        /// overlap ones it is already using. Debug builds catch it on the `debug_assert!`.
+        #[test]
+        #[cfg(debug_assertions)]
+        #[should_panic(expected = "init called twice")]
+        fn a_second_init_is_loud_in_debug() {
+            let (_guard, _dl) = with_heap(1024 * 1024);
+            init(0, 0);
+        }
+
+        /// The release path, which is what the guest runs: the early return is the whole
+        /// protection.
+        #[test]
+        #[cfg(not(debug_assertions))]
+        fn a_second_init_leaves_the_segment_cursor_alone() {
+            let (_guard, _dl) = with_heap(1024 * 1024);
+            let (first, size, _) = BumpSystem.alloc(PAGE_SIZE);
+            assert!(!first.is_null());
+            init(first as usize, first as usize + size);
+            let (second, _, _) = BumpSystem.alloc(PAGE_SIZE);
+            assert_eq!(
+                second as usize,
+                first as usize + size,
+                "init rewound the segment cursor over a live segment"
+            );
         }
 
         #[test]

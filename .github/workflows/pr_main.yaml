@@ -172,7 +172,10 @@ jobs:
       # The dlmalloc fallback is feature-selected, so nothing else in CI compiles it and it
       # can rot silently. Its tests run here too.
       - name: Test the dlmalloc guest allocator fallback
-        run: cd syscalls && cargo test --features dlmalloc-alloc
+        run: |
+          cd syscalls
+          cargo test --features dlmalloc-alloc
+          cargo test --release --features dlmalloc-alloc
 
   # "Test" is a required check — keep this name to avoid branch protection changes.
   # This gate job passes only when CLI, executor, disk-spill, and prover tests succeed.

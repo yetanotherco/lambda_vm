@@ -514,8 +514,12 @@ check-ethrex-fixture-checksums:
 # differential tests (the keccak sponge vs sha3 reference). Run them explicitly
 # in the crate dir; wired into `test` below and run as a dedicated step
 # in CI's cli-test job (pr_main.yaml).
+# Release too: the allocator's `init` guard degrades to an early return once
+# `debug_assert!` is compiled out, which is the configuration guests are built in,
+# and the test for that path is `#[cfg(not(debug_assertions))]`.
 test-syscalls:
 	cd syscalls && cargo test
+	cd syscalls && cargo test --release
 
 test: compile-programs test-syscalls
 	cargo test
