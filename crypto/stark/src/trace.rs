@@ -537,6 +537,21 @@ where
     /// `main_data.len()` — the caller supplies it from the device handle's
     /// `lde_size` instead.
     #[cfg(feature = "cuda")]
+    /// Install downloaded host buffers on a device-only table and clear the
+    /// flag: from here every host read is valid again. Only meaningful from
+    /// [`crate::gpu_lde::materialize_lde_trace_host`], which guarantees the
+    /// buffers match the device handles' layout.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn set_host_data(
+        &mut self,
+        main_data: Vec<FieldElement<F>>,
+        aux_data: Vec<FieldElement<E>>,
+    ) {
+        self.main_data = main_data;
+        self.aux_data = aux_data;
+        self.host_trace_empty = false;
+    }
+
     pub fn set_num_rows(&mut self, num_rows: usize) {
         self.num_rows = num_rows;
     }

@@ -1633,11 +1633,25 @@ pub trait IsStarkProver<
         // failed. Abort with the device-only contract's message rather than a
         // bare index-out-of-bounds from somewhere inside the evaluator.
         #[cfg(feature = "cuda")]
-        if precomputed_parts.is_none() {
+        if precomputed_parts.is_none() && round_1_result.lde_trace.host_trace_empty() {
+            // The device R2 path missed on a device-only table. The gate is a
+            // static predicate and cannot mirror every dynamic decline, so
+            // recover instead of aborting: download the resident LDEs from
+            // the device handles and continue on the host path — slower for
+            // this table, never wrong. The abort remains only for the case
+            // where the handles themselves cannot serve the data.
+            let recovered =
+                crate::gpu_lde::materialize_lde_trace_host(&mut round_1_result.lde_trace);
             assert!(
-                !round_1_result.lde_trace.host_trace_empty(),
-                "R2 composition fell back to the host evaluator, but the trace \
-                 is device-only (empty)"
+                recovered,
+                "R2 composition fell back to the host evaluator on a device-only \
+                 trace and the resident handles could not be downloaded: \
+                 table={} n={} num_parts={} main_cols={} aux_cols={}",
+                air.name(),
+                trace_length,
+                number_of_parts,
+                round_1_result.lde_trace.num_main_cols(),
+                round_1_result.lde_trace.num_aux_cols(),
             );
         }
 
