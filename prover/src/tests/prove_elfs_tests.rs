@@ -3581,7 +3581,10 @@ fn poc_ecsm_limb_gap_31() {
     let (rejects, ok) = ecsm_limb_poc("test_ecsm_limb_31");
     println!("RESULT off=31 executor_rejects={rejects} proof_verifies={ok}");
     assert!(rejects, "executor should reject 0xFFFF_FFE1");
-    assert!(ok, "SOUNDNESS GAP: proof verified for an execution the executor halts on");
+    assert!(
+        ok,
+        "SOUNDNESS GAP: proof verified for an execution the executor halts on"
+    );
 }
 
 #[test]
@@ -3650,5 +3653,8 @@ fn poc_ecsm_limb_gap_31_shows_pages_above_2p32() {
         .iter()
         .any(|r| (0..r.count).any(|i| r.base + i * (1u64 << 18) >= (1u64 << 32)));
     println!("RESULT has_page_at_or_above_2^32={above}");
-    assert!(above, "the xR write must have spilled past the 2^32 limb boundary");
+    assert!(
+        above,
+        "the xR write must have spilled past the 2^32 limb boundary"
+    );
 }
