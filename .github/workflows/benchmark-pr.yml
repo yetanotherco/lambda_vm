@@ -35,6 +35,7 @@ on:
   #     - 'crypto/**'
   #     - 'executor/**'
   #     - 'bin/cli/**'
+  #     - 'syscalls/**'
 
 permissions:
   contents: read
