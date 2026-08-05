@@ -520,7 +520,7 @@ impl Instruction {
                         let src = registers.read(11)?;
                         let n = registers.read(12)?;
                         if n > DMA_MEMCPY_MAX_BYTES {
-                            return Err(ExecutionError::DmaMemcpyChunkTooLarge(n));
+                            return Err(ExecutionError::DmaChunkTooLarge(n));
                         }
                         dst.checked_add(n).ok_or(MemoryError::AddressOverflow)?;
                         src.checked_add(n).ok_or(MemoryError::AddressOverflow)?;
@@ -546,7 +546,7 @@ impl Instruction {
                         let fill = registers.read(11)?;
                         let n = registers.read(12)?;
                         if n > DMA_MEMCPY_MAX_BYTES {
-                            return Err(ExecutionError::DmaMemcpyChunkTooLarge(n));
+                            return Err(ExecutionError::DmaChunkTooLarge(n));
                         }
                         if fill > DMA_MEMSET_MAX_FILL {
                             return Err(ExecutionError::DmaMemsetFillTooLarge(fill));
@@ -740,8 +740,8 @@ pub enum ExecutionError {
     EcsmAddressOverflow,
     #[error("ECSM xG and k operand ranges overlap")]
     EcsmOperandOverlap,
-    #[error("DMA memcpy chunk has {0} bytes; maximum per ecall is {DMA_MEMCPY_MAX_BYTES}")]
-    DmaMemcpyChunkTooLarge(u64),
+    #[error("DMA chunk has {0} bytes; maximum per ecall is {DMA_MEMCPY_MAX_BYTES}")]
+    DmaChunkTooLarge(u64),
     #[error("DMA memset fill is {0}; maximum is {DMA_MEMSET_MAX_FILL}")]
     DmaMemsetFillTooLarge(u64),
     #[error("ECSM scalar multiplication error: {0}")]

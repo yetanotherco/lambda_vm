@@ -66,7 +66,7 @@ fn dma_memcpy_rejects_oversized_direct_ecall() {
             0x1000,
             DMA_MEMCPY_MAX_BYTES + 1
         ),
-        Err(ExecutionError::DmaMemcpyChunkTooLarge(n))
+        Err(ExecutionError::DmaChunkTooLarge(n))
             if n == DMA_MEMCPY_MAX_BYTES + 1
     ));
 }
@@ -159,7 +159,7 @@ fn dma_memset_rejects_oversized_chunk() {
     let mut memory = Memory::default();
     assert!(matches!(
         run_memset(&mut memory, 0x2000, 0x11, DMA_MEMCPY_MAX_BYTES + 1),
-        Err(ExecutionError::DmaMemcpyChunkTooLarge(n)) if n == DMA_MEMCPY_MAX_BYTES + 1
+        Err(ExecutionError::DmaChunkTooLarge(n)) if n == DMA_MEMCPY_MAX_BYTES + 1
     ));
 }
 
