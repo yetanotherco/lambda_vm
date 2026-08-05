@@ -3841,10 +3841,15 @@ impl Traces {
         const MIN_BYTES: usize = 8 << 20;
         static BUDGET_BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         let budget = *BUDGET_BYTES.get_or_init(|| {
+            // Default OFF: pre-uploading was wall-neutral on the 5090 (the
+            // scheduler already hides the H2D) and its riding-ahead buffers
+            // sit outside the VRAM admission gate — at epoch 2^22 they pushed
+            // the prove past the card's headroom. Opt in for PCIe-bound
+            // setups via the env var.
             let env_cap = std::env::var("LAMBDA_VM_TRACE_PREUPLOAD_MB")
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(4096)
+                .unwrap_or(0)
                 << 20;
             // These buffers ride ahead of the prover's own VRAM admission
             // gate (they exist before their table is admitted), so cap them
