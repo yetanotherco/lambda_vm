@@ -48,7 +48,8 @@ pub const SAFETY_FRACTION_DEN: u64 = 10;
 /// `(rows, main_cols, aux_cols, num_main_merkle_trees)` for a single table.
 type TableSpec = (u64, u64, u64, u64);
 
-/// Bytes alive for the duration of phase D (LDE columns + main/aux Merkle).
+/// Bytes counted as alive for the whole proof (LDE columns + main/aux Merkle).
+/// Deliberately an over-estimate for the aux half — see `peak_bytes`.
 fn persistent_per_table(spec: TableSpec, blowup: u64) -> u64 {
     let (rows, main_cols, aux_cols, main_trees) = spec;
     let main_lde = rows
@@ -228,19 +229,31 @@ pub fn decide(lengths: &TableLengths, blowup_factor: u8) -> StorageMode {
 }
 
 /// Peak RAM estimate in bytes for a proof whose trace shape matches `lengths`.
+///
+/// `table_parallelism` is the prover's `k` (`stark::prover::table_parallelism`),
+/// and it is not only a prover knob: `decide` feeds it in here, so the `cuda`
+/// arm's `cores * 2 / 3` doubles the transient term below versus the CPU arm's
+/// `cores / 3` and makes `Disk` more likely. That direction is safe (it
+/// over-estimates), but it means a change to `k` changes the storage decision.
 pub fn peak_bytes(lengths: &TableLengths, blowup_factor: u8, table_parallelism: usize) -> u64 {
     let blowup = blowup_factor as u64;
     let k = table_parallelism.max(1);
     let specs = table_specs(lengths);
 
-    // Persistent: every table's LDE + main/aux Merkle is alive across phase D.
+    // Persistent: every table's main LDE + Merkle really is alive at once (the
+    // Round 1 main commit is a phase-wide barrier). The aux LDE no longer is —
+    // it is produced and consumed inside one table's fused task, so at most k
+    // coexist — but it is still counted for every table here, which keeps this
+    // an over-estimate rather than making the bound unsound.
     let persistent_total: u64 = specs
         .iter()
         .map(|s| persistent_per_table(*s, blowup))
         .fold(0u64, u64::saturating_add);
 
-    // Transient: only k tables run round 2-4 in parallel. Conservative bound is
-    // the top-k tables by transient bytes (worst possible chunk assignment).
+    // Transient: only k tables run the fused aux+rounds task at a time. The
+    // top-k tables by transient bytes bound it; with the scheduler's
+    // heaviest-first admission that top-k is also the set actually admitted
+    // first, so this is the realistic peak, not a worst case.
     let mut transient_per: Vec<u64> = specs
         .iter()
         .map(|s| transient_per_table(*s, blowup))

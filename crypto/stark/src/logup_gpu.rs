@@ -415,9 +415,10 @@ where
 /// straight to the aux LDE, no host round-trip) + the table contribution `L`.
 /// Returns `None` to fall back (non Goldilocks, below threshold, no GPU, GPU
 /// error). This is the residency path that avoids the term-column download.
-pub fn try_build_aux_resident_gpu<F, E>(
+pub fn try_build_aux_resident_gpu<'a, F, E>(
     interactions: &[BusInteraction],
-    main_cols: &[Vec<FieldElement<F>>],
+    num_cols: usize,
+    main_cols: impl FnOnce() -> &'a [Vec<FieldElement<F>>],
     main_dev: Option<(&math_cuda::CudaSlice<u64>, usize)>,
     trace_len: usize,
     challenges: &[FieldElement<E>],
@@ -431,7 +432,7 @@ where
     {
         return None;
     }
-    if trace_len < GPU_LOGUP_MIN_ROWS || main_cols.is_empty() || interactions.is_empty() {
+    if trace_len < GPU_LOGUP_MIN_ROWS || num_cols == 0 || interactions.is_empty() {
         return None;
     }
     if std::env::var_os("LAMBDA_VM_NO_GPU_LOGUP").is_some() {
@@ -442,18 +443,18 @@ where
         return None;
     }
 
-    let num_cols = main_cols.len();
     desc.assert_columns_in_bounds(num_cols);
     // Reuse the resident main trace from the R1 main LDE (column-major
-    // `[col*trace_len + row]`, same column order as `main_cols`) when it matches
-    // this table exactly; otherwise flatten + upload the host columns. The
-    // resident buffer skips the ~3 GB main re-upload.
+    // `[col*trace_len + row]`, same column order as the host columns) when it
+    // matches this table exactly; otherwise materialize + flatten + upload the
+    // host columns. The resident buffer skips both the host transpose and the
+    // ~3 GB main re-upload.
     let resident_main =
         main_dev.filter(|&(buf, rows)| rows == trace_len && buf.len() == num_cols * trace_len);
     let mut main_flat = Vec::new();
     if resident_main.is_none() {
         main_flat = vec![0u64; num_cols * trace_len];
-        for (c, col) in main_cols.iter().enumerate() {
+        for (c, col) in main_cols().iter().enumerate() {
             for (r, e) in col.iter().enumerate() {
                 main_flat[c * trace_len + r] = unsafe { *(e.value() as *const _ as *const u64) };
             }

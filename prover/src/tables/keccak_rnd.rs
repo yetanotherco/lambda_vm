@@ -29,8 +29,8 @@
 //!
 //! Note: spec [[variables.constant]] `rnc` and `rbc` are inlined as compile-time
 //! constants derived from `KECCAK_RHO[x][y]`, not materialized as columns.
-//! `Cxz_right` is typed `[Bit, 4]` per spec d75944ee — HWSL with shift=1
-//! produces a single-bit carry, range-checked via IS_BIT polynomial constraints.
+//! `Cxz_right` is typed `[Bit, 4]` per spec d75944ee — a halfword rotate-by-1
+//! carries out a single bit, range-checked via IS_BIT polynomial constraints.
 
 use executor::vm::instruction::execution::{KECCAK_RC, KECCAK_RHO};
 use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
