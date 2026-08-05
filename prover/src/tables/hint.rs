@@ -356,12 +356,12 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 /// The HINT table's single transition constraint: `mu·(1−mu) = 0`.
 ///
 /// `mu` is the multiplicity gating every one of this table's bus interactions
-/// (the `Ecall` receive, the `x12` register read, the four output writes, the
-/// 16 byte range-checks). It must be boolean, or a witness could put a non-`{0,1}`
-/// value on the `AreBytes`/MEMW sends. The LogUp argument already fixes `mu`'s value
-/// via the timestamp-unique `Ecall` tuple, but every other multiplicity-column table
-/// bit-constrains its column in-circuit; HINT does the same rather than being the
-/// lone exception that relies solely on bus balance.
+/// (the `Ecall` receive, the three register reads, the three `LT` range-checks, the
+/// four output writes, the 16 byte range-checks). It must be boolean, or a witness
+/// could put a non-`{0,1}` value on the `AreBytes`/MEMW sends. This is load-bearing,
+/// not a redundant restatement of a bus check: the `Ecall` bus pins only the *sum*
+/// of `mu` over the rows sharing a tuple — see the module-level docs for the
+/// spread-multiplicity witness it rules out.
 #[derive(Clone, Copy)]
 pub struct HintConstraints;
 
