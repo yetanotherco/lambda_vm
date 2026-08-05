@@ -50,9 +50,28 @@ mod imp {
     #[cfg_attr(target_arch = "riscv64", global_allocator)]
     static ALLOC: BumpAlloc = BumpAlloc;
 
+    /// Idempotent: a later call must not rewind the cursor over live allocations. See
+    /// `init_allocator` for why that would be silent corruption and why nothing calls
+    /// this twice today. `HEAP_END` doubles as the initialized flag -- `init_allocator`
+    /// always passes the nonzero `MAX_MEMORY_SIZE`.
     pub fn init(heap_start: usize, heap_end: usize) {
+        let initialized = HEAP_END.load(Ordering::Relaxed) != 0;
+        debug_assert!(
+            !initialized,
+            "allocator init called twice; the cursor would rewind over live allocations"
+        );
+        if initialized {
+            return;
+        }
         HEAP_POS.store(heap_start, Ordering::Relaxed);
         HEAP_END.store(heap_end, Ordering::Relaxed);
+    }
+
+    // Test-only: `init` is idempotent, so the tests must clear the flag to re-point the
+    // global cursor at their own heap.
+    #[cfg(test)]
+    fn reset() {
+        HEAP_END.store(0, Ordering::Relaxed);
     }
 
     unsafe impl GlobalAlloc for BumpAlloc {
@@ -99,6 +118,7 @@ mod imp {
             // Zeroed, like guest memory: reads of never-written heap return 0 there.
             let base = unsafe { std::alloc::alloc_zeroed(l) };
             assert!(!base.is_null());
+            reset();
             init(base as usize, base as usize + bytes);
             guard
         }
@@ -166,10 +186,16 @@ mod imp {
                 unsafe { BumpAlloc.alloc(l) }.is_null(),
                 "handed out memory past HEAP_END"
             );
-            // An absurd size declines too. It declines on the bounds check rather than
-            // on the `checked_add`: `Layout` requires size rounded up to align to fit in
-            // `isize::MAX`, so a size that would overflow the cursor arithmetic can't be
-            // constructed in the first place.
+            // An absurd size declines too, and on the bounds check rather than on the
+            // `checked_add`. The `Layout` invariant alone does not get you there: it
+            // gives `size <= isize::MAX - (align - 1)`, and with
+            // `aligned <= pos + align - 1` that bounds
+            // `aligned + size <= pos + isize::MAX` -- which is `< 2^64` only if
+            // `pos < 2^63`. The second half comes from the cursor being heap-bounded:
+            // `alloc` stores `new_pos` only when `new_pos <= HEAP_END`, so
+            // `pos <= HEAP_END`, and on the guest that is `MAX_MEMORY_SIZE` =
+            // 0xC000_0000. The `checked_add` stays: it keeps the no-overflow argument
+            // local to `alloc` instead of resting on both of those.
             let huge = layout(isize::MAX as usize - 7, 8);
             assert!(unsafe { BumpAlloc.alloc(huge) }.is_null());
         }
@@ -179,6 +205,7 @@ mod imp {
         #[test]
         fn uninitialized_allocator_hands_out_nothing() {
             let _guard = HEAP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            reset();
             init(0, 0);
             assert!(unsafe { BumpAlloc.alloc(layout(1, 1)) }.is_null());
         }
@@ -253,14 +280,28 @@ mod imp {
 
         fn allocates_zeros(&self) -> bool {
             // Guest memory is zero-initialized and this provider never reuses a segment,
-            // so system-fresh bytes read as 0. dlmalloc consults this only in
-            // `calloc_must_clear` = `!allocates_zeros() || !mmapped(chunk)`, i.e. it may
-            // skip calloc's memset only for a chunk it marked mmapped. Two independent
-            // reasons that is safe here: the Rust port has no mmap path at all (nothing
-            // ever sets the mmapped marker, so calloc always zeroes), and even if it
-            // grew one, freeing an mmapped chunk whose system `free` declines drops the
-            // chunk instead of re-binning it — so a recycled block is never mmapped.
-            // Locked by `calloc_zeroes_recycled_dirty_blocks` below.
+            // so system-fresh bytes read as 0.
+            //
+            // This setting is INERT, not a performance win. dlmalloc consults it only
+            // through `calloc_must_clear(ptr)` =
+            // `!allocates_zeros() || !mmapped(Chunk::from_mem(ptr))`, and `mmapped` is
+            // not a marker bit anyone sets — it is `(*p).head & INUSE == 0`, the absence
+            // of both in-use bits (dlmalloc 0.2.14 `src/dlmalloc.rs:1805`). Every path
+            // that returns a pointer to a caller goes through `set_inuse` /
+            // `set_inuse_and_pinuse` / `set_size_and_pinuse_of_inuse_chunk`, all of which
+            // set `CINUSE`, and `calloc_must_clear` is only ever evaluated on a user
+            // pointer. So no *user* chunk is ever `mmapped`, `calloc_must_clear` is
+            // always true, `calloc` always memsets, and flipping this to `false` would
+            // change nothing.
+            //
+            // Flagless heads do exist, so don't reason from "nothing is ever mmapped":
+            // `init_top` (dlmalloc.rs:789) writes a segment-end sentinel with
+            // `head = top_foot_size()` = 80 on 64-bit, and `80 & INUSE == 0`, so that
+            // sentinel *is* `mmapped()`-true. Harmless — it is never returned to a
+            // caller, so it never reaches `calloc_must_clear`.
+            //
+            // Kept `true` for correctness-by-construction if upstream ever grows an mmap
+            // path. Locked by `calloc_zeroes_recycled_dirty_blocks` below.
             true
         }
 
@@ -272,6 +313,12 @@ mod imp {
     // Dlmalloc is Send but !Sync, so it can't sit in a static directly. A single-hart
     // critical section serializes access and supplies the Sync a #[global_allocator]
     // static requires. Its single-hart implementation comes from the `riscv` crate.
+    //
+    // An initialized `Dlmalloc` is address-sensitive and must never be moved:
+    // `smallbin_at` returns a pointer into `self.smallbins` and `init_bins` writes
+    // self-pointers into that array, so relocating it after first use — into a `Box`, a
+    // `OnceCell`, or a local — silently corrupts the bins. Safe as a `static`; the note
+    // is for whoever refactors this.
     static DLMALLOC: Mutex<RefCell<Dlmalloc<BumpSystem>>> =
         Mutex::new(RefCell::new(Dlmalloc::new_with_allocator(BumpSystem)));
 
@@ -280,9 +327,29 @@ mod imp {
     #[cfg_attr(target_arch = "riscv64", global_allocator)]
     static ALLOC: DlGlobal = DlGlobal;
 
+    /// Idempotent: a later call must not rewind the segment cursor, which would hand
+    /// dlmalloc segments overlapping ones it is already using. See `init_allocator` for
+    /// the full argument and for why nothing calls this twice today. `HEAP_END` doubles
+    /// as the initialized flag -- `init_allocator` always passes the nonzero
+    /// `MAX_MEMORY_SIZE`.
     pub fn init(heap_start: usize, heap_end: usize) {
+        let initialized = HEAP_END.load(Ordering::Relaxed) != 0;
+        debug_assert!(
+            !initialized,
+            "allocator init called twice; the segment cursor would rewind over live segments"
+        );
+        if initialized {
+            return;
+        }
         HEAP_POS.store(heap_start, Ordering::Relaxed);
         HEAP_END.store(heap_end, Ordering::Relaxed);
+    }
+
+    // Test-only: `init` is idempotent, so the tests must clear the flag to re-point the
+    // global segment cursor at their own heap.
+    #[cfg(test)]
+    fn reset() {
+        HEAP_END.store(0, Ordering::Relaxed);
     }
 
     unsafe impl GlobalAlloc for DlGlobal {
@@ -346,7 +413,12 @@ mod imp {
             // Zeroed, like guest memory: reads of never-written heap return 0 there.
             let base = unsafe { std::alloc::alloc_zeroed(layout) };
             assert!(!base.is_null());
+            reset();
             init(base as usize, base as usize + bytes);
+            // Moved out by value, which is only sound because it is untouched: an
+            // initialized `Dlmalloc` is address-sensitive (see the `DLMALLOC` static).
+            // `new_with_allocator` is const and `init_bins` runs on first malloc, which
+            // has not happened yet.
             (guard, Dlmalloc::new_with_allocator(BumpSystem))
         }
 
@@ -455,6 +527,7 @@ mod imp {
         #[test]
         fn uninitialized_provider_hands_out_nothing() {
             let _guard = HEAP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            reset();
             init(0, 0);
             assert!(BumpSystem.alloc(1).0.is_null());
         }
@@ -490,6 +563,23 @@ mod imp {
     }
 }
 
+/// Points the guest allocator at `[_end, MAX_MEMORY_SIZE)`.
+///
+/// Must run exactly once per execution, and `imp::init` enforces that by ignoring any
+/// later call rather than trusting its callers. A second call rewinds the cursor back
+/// over live allocations, and because the bump arm's `alloc_zeroed` skips the memset --
+/// sound only because bump never re-serves a region -- the next `alloc_zeroed` would
+/// then hand back dirty bytes. The guest would compute on garbage and the prover would
+/// produce a perfectly valid proof of that wrong execution: no crash, no diagnostic,
+/// which is why this is guarded rather than merely documented.
+///
+/// What makes it once today is an entry-point flag, not the call sites. The six guests
+/// that call this explicitly all also override the ELF entry with
+/// `-C link-arg=-e -C link-arg=main` in their `.cargo/config.toml`, so `_start` -- the
+/// only other caller, in `src/entrypoint.rs` -- never runs for them; guests that do
+/// enter through `_start` never call it explicitly. A guest that dropped `-e main` while
+/// keeping its explicit call would therefore call this twice, which is why the guard
+/// lives in `imp::init` rather than in a comment here.
 pub fn init_allocator() {
     unsafe extern "C" {
         static _end: u8;
