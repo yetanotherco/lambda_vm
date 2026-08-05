@@ -203,7 +203,9 @@ extern "C" __global__ void barycentric_ext3_batched_strided(
 // evaluation point — the layout `compute_and_invert_denoms_ext3_dev` already
 // produces. Partials layout: `[(k*num_cols + col)*num_chunks + chunk]` ext3
 // interleaved, so the combine pass reads each (k, col)'s chunks contiguously.
-#define BARY_MAX_K 8
+#ifndef BARY_MAX_K
+#error "BARY_MAX_K must be passed by build.rs (-DBARY_MAX_K=...) — single-sourced there"
+#endif
 
 extern "C" __global__ void barycentric_base_strided_multi(
     const uint64_t *columns,

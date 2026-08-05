@@ -350,10 +350,7 @@ pub fn barycentric_ext3_on_device_with_dev_inv_denoms(
     Ok(out)
 }
 
-/// Compile-time cap of the multi kernels' per-thread accumulator array
-/// (`BARY_MAX_K` in barycentric.cu). Callers with more evaluation points fall
-/// back to the per-point kernels.
-pub const BARY_MAX_EVAL_POINTS: usize = 8;
+include!(concat!(env!("OUT_DIR"), "/bary_consts.rs"));
 
 /// Row-chunk count for the multi kernels: enough `cols * chunks` blocks to
 /// occupy the device, without shrinking a chunk's row range below the point
