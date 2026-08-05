@@ -1,20 +1,26 @@
-//! PoC: a private-input PAGE's `OFFSET` column is a free, unconstrained
-//! main-trace column, so a malicious prover can point one of its rows at an
-//! arbitrary address and forge that address's initial memory contents.
+//! Regression tests for the private-input PAGE `OFFSET` forgery.
 //!
-//! `create_page_air` builds PAGE with `EmptyConstraints`, and `VmAirs::new`
-//! skips `with_preprocessed` for `is_private_input` pages — so for those pages
-//! nothing pins `OFFSET` to the row index. The Memory-bus address is
-//! `address_lo = page_base_lo + OFFSET`, hence any `address_lo` is reachable.
+//! On `origin/main` (b082f9f6) a private-input PAGE's `OFFSET` was a free,
+//! unconstrained main-trace column: `create_page_air` builds PAGE with
+//! `EmptyConstraints`, no constraint references `cols::OFFSET`, and `VmAirs::new`
+//! skipped `with_preprocessed` for `is_private_input` pages, so nothing pinned
+//! `OFFSET` to the row index. Since the Memory-bus address is
+//! `address_lo = page_base_lo + OFFSET`, a malicious prover could point a row at
+//! any address sharing the page's high limb and forge that address's memory
+//! history. These tests were written as a PoC and demonstrated exactly that.
 //!
-//! The guest here loads 8 bytes out of its own ELF `.data`, spills them to the
-//! stack and commits them, so the proof's `public_output` is a direct function
-//! of the ELF image — which the verifier binds via that data page's
-//! preprocessed commitment. The forged proof still verifies against the
-//! *unmodified* ELF while claiming a different output.
+//! `VmAirs::new` now preprocesses `OFFSET` (only — `INIT` is the private input
+//! and stays main-trace), so the forgery is rejected. The tests remain as the
+//! guard: `forged_private_page_offset_is_rejected` fails if the binding is ever
+//! removed again.
+//!
+//! The guest loads 8 bytes out of its own ELF `.data`, spills them to the stack
+//! and commits them, so the proof's `public_output` is a direct function of the
+//! ELF image — which the verifier binds via that data page's preprocessed
+//! commitment. The forgery's claim is that the proof verifies against the
+//! *unmodified* ELF while reporting a different output.
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
-use math::field::element::FieldElement;
 use stark::proof::options::ProofOptions;
 use stark::prover::{IsStarkProver, Prover};
 
@@ -28,7 +34,6 @@ use crate::{MaxRowsConfig, VmAirs, VmProof};
 
 use executor::elf::Elf;
 use executor::vm::execution::Executor;
-use executor::vm::memory::PRIVATE_INPUT_START_INDEX;
 
 /// The 8 bytes the PoC guest keeps in `.data` (little-endian `.dword`).
 const SECRET: [u8; 8] = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
@@ -201,7 +206,11 @@ fn apply_forge(traces: &mut Traces, f: &Forge) {
 
     let page = &mut traces.pages[page_idx].main_table;
     // address_lo = page_base_lo + OFFSET  ⇒  OFFSET = target - page_base (in F_p).
-    page.set(row, page_cols::OFFSET, FE::from(f.target_addr) - FE::from(page_base));
+    page.set(
+        row,
+        page_cols::OFFSET,
+        FE::from(f.target_addr) - FE::from(page_base),
+    );
     page.set_byte(row, page_cols::INIT, f.forged);
     page.set_byte(row, page_cols::FINI, f.real);
     // TIMESTAMP stays 0: PAGE-C4 then consumes the honest genesis token, which
@@ -266,11 +275,20 @@ fn poc_negative_control_forged_run_without_repointed_row_fails() {
     );
 }
 
-/// THE BREAK: same forged execution, plus one repointed private-input PAGE
-/// row. Verification against the UNMODIFIED ELF accepts a proof whose public
-/// output the program cannot produce.
+/// REGRESSION: the attack this file was written to demonstrate must stay dead.
+///
+/// A forged execution plus one private-input PAGE row repointed through its
+/// `OFFSET` column at an address the guest actually reads. On `origin/main`
+/// (b082f9f6) this proof was **ACCEPTED** against the unmodified ELF while
+/// carrying a `public_output` the program cannot produce — `OFFSET` was a free
+/// main-trace column, so `address_lo = page_base_lo + OFFSET` was
+/// prover-chosen. Preprocessing `OFFSET` closes it: the repointed column no
+/// longer matches the commitment the verifier holds.
+///
+/// Read together with `poc_control_honest_harness_verifies` — a fix that broke
+/// honest proving would also make this test pass, and that one would catch it.
 #[test]
-fn poc_private_page_offset_forges_memory_contents() {
+fn forged_private_page_offset_is_rejected() {
     let honest = asm_elf_bytes("poc_rodata_commit");
     let (file_off, addr) = locate_secret(&honest);
     let mut patched = honest.clone();
@@ -287,6 +305,8 @@ fn poc_private_page_offset_forges_memory_contents() {
         }),
     );
 
+    // The forged proof genuinely claims the forged byte: the test would be
+    // vacuous if the crafted proof were honest after all.
     assert_eq!(
         proof.public_output[0], FORGED_BYTE,
         "forged proof must claim the forged byte"
@@ -296,7 +316,9 @@ fn poc_private_page_offset_forges_memory_contents() {
     let accepted =
         crate::verify_with_options(&proof, &honest, &opts(), None, None).expect("verify");
     assert!(
-        accepted,
-        "SOUNDNESS HOLE NOT REPRODUCED: verifier rejected the forged proof"
+        !accepted,
+        "SOUNDNESS REGRESSION: the verifier accepted a proof whose public output \
+         the program cannot produce — a private-input PAGE row was repointed via \
+         its OFFSET column. OFFSET must stay preprocessed (see `VmAirs::new`)."
     );
 }
