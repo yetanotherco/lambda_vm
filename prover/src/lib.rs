@@ -709,6 +709,20 @@ impl VmAirs {
             })
             .collect();
         let bitwise: VmAir = if minimal_bitwise {
+            // TEST-ONLY BRANCH — must never be reached in production.
+            //
+            // This BITWISE AIR carries NO preprocessed commitment, so its lookup
+            // table's contents are prover-chosen main trace. BITWISE backs
+            // `AreBytes` and the byte ALU, so an unpinned table lets a witness
+            // "prove" that an arbitrary field element is a byte — the same class of
+            // hole as the private-page `OFFSET` one, and a broader one. It is safe
+            // today only because every production caller passes `false`
+            // (`lib.rs` verify/prove paths and `continuation.rs`); the minimal
+            // BITWISE trace exists for unit tests that build the table by hand.
+            //
+            // A fourth call site passing `true` would reintroduce the hole silently,
+            // so if this branch ever needs to be live, give the minimal table its
+            // own preprocessed commitment first.
             Box::new(create_bitwise_air(proof_options))
         } else {
             Box::new(create_bitwise_air(proof_options).with_preprocessed(
