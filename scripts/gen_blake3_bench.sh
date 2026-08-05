@@ -3,15 +3,22 @@
 # gen_blake3_bench.sh — generate + compile a blake3-saturated guest.
 #
 # The guest seeds a 176-byte BLAKE3 state region (layout: h[4 dwords] | m[8] |
-# t[1] | len,flags[1] | out[8]), then N times: fires the BLAKE3 6-round
-# compression ecall and copies out over m, so every compression consumes the
-# previous one's output — a strictly dependent chain that nothing can fold.
-# Finally it commits the 64-byte output and halts.
+# t[1] | len,flags[1] | out[8]), fires the BLAKE3 6-round compression ecall N
+# times IN PLACE on that region, commits the 64-byte output and halts.
+#
+# The calls are deliberately NOT chained (out is not copied over m): chaining
+# costs an 8-dword copy loop = ~82 of ~87 cycles per compression, and those
+# copy cycles become CPU/MEMW rows that dilute the very table being measured.
+# The prover's cost per ecall is identical either way — the executor runs every
+# call, and no layer dedupes rows (timestamps differ per call) — so dropping
+# the chain buys a ~5-cycle loop body and a >90% blake3-saturated trace, the
+# same shape as gen_keccak_bench.sh. (The e2e correctness test, which is about
+# values rather than cost, does chain: prover/src/tests test_prove_elfs_blake3.)
 #
 # The BLAKE3 table commits ONE row per compression (fully unrolled layout), so
-# padding-flush sweep points are simply powers of two: N = 2^k. Guest cost is
-# ~21 cycles per compression (ecall + 8-dword copy + loop), so a 2^17-row table
-# costs ~2.8M cycles — well inside a 2^22 epoch.
+# padding-flush sweep points are simply powers of two: N = 2^k. At ~5
+# cycles/compression a 2^17-row table costs ~0.7M cycles — inside one 2^20
+# epoch; use --epoch-size-log2 21 from N = 2^18 up.
 #
 # ABI (executor/src/vm/instruction/execution.rs BLAKE3_SYSCALL_NUMBER):
 #   a7 = u64::MAX - 2, written as the sign-extended -3
@@ -62,27 +69,15 @@ main:
 
 	li	s0, $N
 .Lperm_loop:
-	# BLAKE3 6-round compression on the region.
+	# BLAKE3 6-round compression, in place. See the header for why the
+	# calls are independent rather than chained.
 	mv	a0, sp
 	li	a7, -3
 	ecall
-	# Chain: m <- out (8 dwords), so the next compression depends on this one.
-	li	t1, 0
-.Lcopy_loop:
-	slli	t2, t1, 3
-	addi	t3, sp, 112
-	add	t3, t3, t2
-	ld	t4, 0(t3)
-	addi	t3, sp, 32
-	add	t3, t3, t2
-	sd	t4, 0(t3)
-	addi	t1, t1, 1
-	li	t2, 8
-	bne	t1, t2, .Lcopy_loop
 	addi	s0, s0, -1
 	bnez	s0, .Lperm_loop
 
-	# Commit the final 64-byte output so the chain is load-bearing.
+	# Commit the final 64-byte output so the work is load-bearing.
 	li	a0, 1
 	addi	a1, sp, 112
 	li	a2, 64
