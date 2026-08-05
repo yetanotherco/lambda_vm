@@ -1037,13 +1037,20 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 // Single-source constraint set
 // =========================================================================
 
-/// The BLAKE3 table's transition constraints:
-/// - idx 0..44: 22 pointer `ADD` carry pairs (`ptr[k] = addr + 8k`, μ-gated);
-/// - idx 44:    μ·carry_1 = 0 — top-dword no-overflow (`addr + 168 = ptr[21]`);
-/// - idx 45...: per G (16 each): two add3 groups (sum identity + 2 carry
-///   booleanities), two add2 expression-carry booleanities, two rotations
-///   (2 shift identities + 2 recombine identities each). All μ-gated, max
-///   degree 3 (the booleanities; identities are degree 2).
+/// The BLAKE3 table's transition constraints (814 total):
+/// - idx 0..44:    22 pointer `ADD` carry pairs (`ptr[k] = addr + 8k`, μ-gated);
+/// - idx 44:       μ·carry_1 = 0 — top-dword no-overflow (`addr + 168 = ptr[21]`);
+/// - idx 45..333:  all 96 add3 groups (sum identity + 2 carry booleanities);
+/// - idx 333..429: all 96 add2 expression-carry booleanities;
+/// - idx 429..813: all 96 rotations (2 shift identities + 2 recombine each).
+///   NOTE the grouping is by op type across the whole row, NOT per G — G #g's
+///   16 constraints are scattered across the three bands.
+/// - idx 813:      `IS_BIT(MU)` — μ·(1−μ) = 0, ungated. The bus argument pins
+///   μ to {0,1} indirectly (the Ecall receive anchors μ>0 rows to a CPU ecall
+///   whose ECALL flag is IS_BIT; MEMW's width flags are boolean), but that is
+///   an inter-table argument — this makes it local, matching ecsm/commit.
+///
+/// All μ-gated, max degree 3 (the booleanities; identities are degree 2).
 #[derive(Clone, Copy)]
 pub struct Blake3Constraints;
 
@@ -1196,6 +1203,11 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for Blake3Constraints {
             b.emit_base(idx, m * (yhi - sll_lo - sllc_hi));
             idx += 1;
         }
+
+        // idx 813: IS_BIT(MU) — ungated booleanity, degree 2. See the struct
+        // doc for why this is emitted even though the bus argument already
+        // pins μ indirectly.
+        crate::constraints::templates::emit_is_bit(b, idx, cols::MU, None);
     }
 }
 
