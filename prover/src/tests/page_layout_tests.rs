@@ -2,16 +2,29 @@
 //!
 //! `runtime_page_ranges` is a prover-chosen field of `VmProof` carrying a free
 //! `u64` base and a free `u64` count, and the verifier turns it into PAGE tables
-//! with `Traces::page_configs_from_elf_and_runtime`. These tests pin what that
-//! reconstruction must enforce on untrusted input.
+//! with `Traces::page_configs_from_elf_and_runtime`. These tests pin the two
+//! properties that reconstruction must enforce on untrusted input.
+//!
+//! **One page per address.** Two PAGE tables covering the same base each provide
+//! a genesis token for every address in that page. The memory argument's
+//! soundness rests on the init set holding exactly one entry per address: with
+//! two, a witness can have the real page's row consume the duplicate's token and
+//! the duplicate's row consume the real one, injecting a value the program never
+//! wrote while the bus still balances. A prover reaches this with no private
+//! input at all, by declaring a runtime range aliasing a real ELF data page —
+//! and *both* pages then carry correct, verifier-recomputed preprocessed
+//! commitments, so nothing is forged at the commitment layer. This is the
+//! companion to `page_offset_forgery_poc`: pinning `OFFSET` restores one row per
+//! address *within* a page, and this restores one page per address.
 //!
 //! **Bounded before allocation.** The `expected_proof_count` cross-check would
 //! reject a wrong page count, but it runs after the configs are materialised, so
 //! a `count: u64::MAX` range exhausts memory first — a verifier DoS on untrusted
 //! input.
 //!
-//! These exercise the verifier's own reconstruction path — the same function
-//! `verify_proof_parts` calls.
+//! These exercise the verifier's own reconstruction path (the same function
+//! `verify_proof_parts` calls). They do not build a forged proof end to end; the
+//! full attack demonstration for the duplication route lives with the PoC work.
 
 use crate::tables::page::DEFAULT_PAGE_SIZE;
 use crate::tables::trace_builder::Traces;
@@ -22,6 +35,15 @@ use executor::elf::Elf;
 
 fn test_elf() -> Elf {
     Elf::load(&asm_elf_bytes("poc_rodata_commit")).expect("ELF load")
+}
+
+/// Base of some page the ELF itself already defines — the address a duplicate
+/// range would alias.
+fn an_elf_page_base(elf: &Elf) -> u64 {
+    Traces::page_configs_from_elf(elf)
+        .first()
+        .expect("the ELF must define at least one page")
+        .page_base
 }
 
 fn layout(
@@ -43,6 +65,72 @@ fn honest_page_layout_is_accepted() {
     let configs = layout(&elf, &[RuntimePageRange { base, count: 3 }], usize::MAX)
         .expect("an honest, non-overlapping layout must be accepted");
     assert_eq!(configs.len(), elf_pages + 3);
+
+    // And the result stays sorted with no repeats — what the checks below defend.
+    assert!(configs.windows(2).all(|w| w[0].page_base < w[1].page_base));
+}
+
+/// A runtime range aliasing a real ELF page must be rejected: that is the exact
+/// shape of the duplication attack, and the one a prover can mount with no
+/// private input.
+#[test]
+fn runtime_range_aliasing_an_elf_page_is_rejected() {
+    let elf = test_elf();
+    let base = an_elf_page_base(&elf);
+
+    let err = layout(&elf, &[RuntimePageRange { base, count: 1 }], usize::MAX)
+        .expect_err("a runtime page aliasing an ELF page must be rejected");
+    assert!(
+        matches!(&err, Error::MalformedPageLayout(m) if m.contains("exactly")),
+        "expected a duplicate-page rejection, got: {err}"
+    );
+}
+
+/// Two identical runtime ranges are the same violation without involving the ELF.
+#[test]
+fn duplicate_runtime_ranges_are_rejected() {
+    let elf = test_elf();
+    let base = 0x8000_0000u64;
+
+    let err = layout(
+        &elf,
+        &[
+            RuntimePageRange { base, count: 1 },
+            RuntimePageRange { base, count: 1 },
+        ],
+        usize::MAX,
+    )
+    .expect_err("two runtime ranges covering the same base must be rejected");
+    assert!(
+        matches!(&err, Error::MalformedPageLayout(m) if m.contains("exactly")),
+        "expected a duplicate-page rejection, got: {err}"
+    );
+}
+
+/// Overlapping (not merely identical) ranges are caught by the same check,
+/// because alignment makes same-size pages either equal or disjoint.
+#[test]
+fn overlapping_runtime_ranges_are_rejected() {
+    let elf = test_elf();
+    let base = 0x8000_0000u64;
+    let page = DEFAULT_PAGE_SIZE as u64;
+
+    let err = layout(
+        &elf,
+        &[
+            RuntimePageRange { base, count: 4 },
+            RuntimePageRange {
+                base: base + 2 * page,
+                count: 4,
+            },
+        ],
+        usize::MAX,
+    )
+    .expect_err("overlapping runtime ranges must be rejected");
+    assert!(
+        matches!(&err, Error::MalformedPageLayout(m) if m.contains("exactly")),
+        "expected a duplicate-page rejection, got: {err}"
+    );
 }
 
 /// Unaligned bases are rejected. Beyond being malformed, this is what keeps "same

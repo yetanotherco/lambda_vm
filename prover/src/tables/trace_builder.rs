@@ -4228,6 +4228,25 @@ impl Traces {
 
         configs.sort_by_key(|c| c.page_base);
 
+        // Exactly one page per address. Two PAGE tables covering the same base each
+        // provide a genesis token for every address in it, and the memory argument's
+        // soundness rests on the init set holding exactly one entry per address: with
+        // two, a witness can have the real page's row consume the duplicate's token
+        // and vice versa, injecting a value the program never wrote. A duplicate is
+        // never legitimate — the honest builder derives ELF pages from a `BTreeSet`
+        // and run-length-encodes the rest — so reject rather than dedupe silently,
+        // which would mask a prover bug instead of surfacing it.
+        if let Some(w) = configs
+            .windows(2)
+            .find(|w| w[0].page_base == w[1].page_base)
+        {
+            return Err(Error::MalformedPageLayout(format!(
+                "two page tables cover base 0x{:x}; each address must have exactly \
+                 one genesis token",
+                w[0].page_base,
+            )));
+        }
+
         Ok(configs)
     }
 
