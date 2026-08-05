@@ -19,7 +19,7 @@
 //!   eight-byte rows and zero on one-byte tail rows, which is what lets the same
 //!   write tuple serve both widths without per-lane constraints.
 //!
-//! The result is 20 columns against memcpy's 32, and 18 bus interactions against
+//! The result is 20 columns against memcpy's 32, and 19 bus interactions against
 //! 23. `fill <= 255` is proven on the first row, mirroring how `dma.rs` proves
 //! the per-ecall byte bound: the executor rejects a wider value, so an honest
 //! guest (whose stub masks `a1`) never trips it.
@@ -195,7 +195,7 @@ fn halfword(column: usize) -> BusInteraction {
     )
 }
 
-/// DMA memset bus interactions (18 total).
+/// DMA memset bus interactions (19 total).
 pub fn bus_interactions() -> Vec<BusInteraction> {
     let mu_minus_end = Multiplicity::Diff(cols::MU, cols::END);
     let mu_minus_first = Multiplicity::Diff(cols::MU, cols::FIRST);

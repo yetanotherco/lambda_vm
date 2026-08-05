@@ -56,6 +56,10 @@ fn assert_count_table_lengths_matches(elf: &Elf, logs: &[Log]) {
         "dma"
     );
     assert_eq!(
+        predicted.dma_set_padded_rows, traces.dma_set.main_table.height as u64,
+        "dma_set"
+    );
+    assert_eq!(
         predicted.decode_rows, traces.decode.main_table.height as u64,
         "decode"
     );
@@ -105,11 +109,12 @@ fn count_table_lengths_matches_traces() {
 }
 
 /// Runs one Rust DMA guest and asserts the sizing pass matches the built traces.
-/// The two replays of a DMA ecall (`collect_dma_memcpy_ops` for generation and
-/// `replay_dma_memcpy_for_sizing` for counting) must agree, so the fixtures cover
-/// both a single chunk and the multi-chunk / overlapping / near-`MAX_DATA_ROWS`
-/// cases of `dma_memcpy_cases`.
-fn assert_dma_fixture_counts(elf_name: &str) {
+/// Each ecall has two hand-maintained replays — `collect_dma_*_ops` for
+/// generation and `replay_dma_*_for_sizing` for counting — and they must agree,
+/// so the fixtures cover a single chunk plus the multi-chunk / overlapping /
+/// near-`MAX_DATA_ROWS` cases of `dma_memcpy_cases`, and the same schedule
+/// driven through the memset table.
+fn assert_dma_fixture_counts(elf_name: &str, syscall_number: u64) {
     let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("workspace root")
@@ -125,7 +130,7 @@ fn assert_dma_fixture_counts(elf_name: &str) {
 
     assert!(
         result.logs.iter().any(|log| {
-            log.src1_val == executor::vm::instruction::execution::DMA_MEMCPY_SYSCALL_NUMBER
+            log.src1_val == syscall_number
                 && matches!(
                     result.instructions.get(&log.current_pc),
                     Some(Instruction::EcallEbreak)
@@ -138,6 +143,12 @@ fn assert_dma_fixture_counts(elf_name: &str) {
 
 #[test]
 fn count_table_lengths_matches_nonempty_dma_trace() {
-    assert_dma_fixture_counts("dma_memcpy_min.elf");
-    assert_dma_fixture_counts("dma_memcpy_cases.elf");
+    use executor::vm::instruction::execution::{
+        DMA_MEMCPY_SYSCALL_NUMBER, DMA_MEMSET_SYSCALL_NUMBER,
+    };
+
+    assert_dma_fixture_counts("dma_memcpy_min.elf", DMA_MEMCPY_SYSCALL_NUMBER);
+    assert_dma_fixture_counts("dma_memcpy_cases.elf", DMA_MEMCPY_SYSCALL_NUMBER);
+    assert_dma_fixture_counts("dma_memset_min.elf", DMA_MEMSET_SYSCALL_NUMBER);
+    assert_dma_fixture_counts("dma_memset_cases.elf", DMA_MEMSET_SYSCALL_NUMBER);
 }
