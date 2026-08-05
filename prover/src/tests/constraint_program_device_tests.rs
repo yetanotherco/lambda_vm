@@ -158,6 +158,7 @@ fn all_table_programs_lower_and_match_folders() {
 
     check_air_device(&create_cpu_air(&opts), "CPU");
     check_air_device(&create_dma_air(&opts), "DMA");
+    check_air_device(&create_dma_set_air(&opts), "DMA_SET");
     check_air_device(&create_bitwise_air(&opts), "BITWISE");
     check_air_device(&create_lt_air(&opts), "LT");
     check_air_device(&create_shift_air(&opts), "SHIFT");
