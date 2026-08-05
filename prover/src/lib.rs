@@ -52,11 +52,11 @@ use crate::tables::trace_builder::count_table_lengths;
 use crate::tables::types::BusId;
 use crate::test_utils::{
     E, F, VmAir, create_bitwise_air, create_branch_air, create_bytewise_air, create_commit_air,
-    create_cpu_air, create_cpu32_air, create_decode_air, create_dma_air, create_dma_set_air, create_dvrm_air,
-    create_ecdas_air, create_ecsm_air, create_eq_air, create_halt_air, create_keccak_air,
-    create_keccak_rc_air, create_keccak_rnd_air, create_load_air, create_lt_air, create_memw_air,
-    create_memw_aligned_air, create_memw_register_air, create_mul_air, create_page_air,
-    create_register_air, create_shift_air, create_store_air,
+    create_cpu_air, create_cpu32_air, create_decode_air, create_dma_air, create_dma_set_air,
+    create_dvrm_air, create_ecdas_air, create_ecsm_air, create_eq_air, create_halt_air,
+    create_keccak_air, create_keccak_rc_air, create_keccak_rnd_air, create_load_air, create_lt_air,
+    create_memw_air, create_memw_aligned_air, create_memw_register_air, create_mul_air,
+    create_page_air, create_register_air, create_shift_air, create_store_air,
 };
 
 // Re-exported for downstream hosts and verifier guests (e.g. the in-VM
