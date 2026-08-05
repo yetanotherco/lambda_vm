@@ -3194,7 +3194,17 @@ pub trait IsStarkProver<
             #[cfg(not(feature = "cuda"))]
             let (commit, cached_main) = result?;
             if let Some(ref pre_root) = commit.precomputed_root {
-                transcript.append_bytes(pre_root);
+                // Attacker simulation, tests only: a hostile prover skips this
+                // absorb, which is what makes a re-split opening exploitable
+                // (see `tests::opening_width_tests`). Always true otherwise.
+                #[cfg(test)]
+                let absorb = !crate::tests::opening_width_tests::TEST_ONLY_SKIP_PRECOMPUTED_ROOT_ABSORB
+                    .load(std::sync::atomic::Ordering::SeqCst);
+                #[cfg(not(test))]
+                let absorb = true;
+                if absorb {
+                    transcript.append_bytes(pre_root);
+                }
             }
             transcript.append_bytes(&commit.root);
             main_commits.push(commit);
