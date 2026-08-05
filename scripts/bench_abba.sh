@@ -37,9 +37,26 @@
 #        TX_COUNT=<n> ethrex transfer fixture to prove (default 5; use 20 for a
 #          large continuation trace where GPU-residency wins are visible).
 #          Ignored when WORKLOAD=real.
-#        WORKLOAD=real|synthetic (default real) which block to prove. `real`
+#        WORKLOAD=real|synthetic|keccak (default real) what to prove. `real`
 #          fetches the real-block fixture (block identity lives in the Makefile) and
 #          forces --continuations; TX_COUNT and CONTINUATIONS do not apply to it.
+#        KECCAK_PERMS=<n> permutations for WORKLOAD=keccak (default 5461).
+#
+#   WORKLOAD=keccak proves a guest that does nothing but N keccak-f[1600] ecalls
+#   (scripts/gen_keccak_bench.sh), so KECCAK_RND is ~86% of committed cells and a
+#   keccak-table change shows up close to undiluted — where the same change on a real
+#   block is scaled down by keccak's share of that trace. Use it to size a keccak
+#   change, then a `real` run to see what it is worth in production. It needs far
+#   fewer pairs than `real`: 5461 permutations prove in ~13 s on a 32-core box, so 6
+#   pairs is ~3 minutes, and both sides run an identical generated ELF with no fixture.
+#
+#   ON GPU: pass BENCH_FEATURES="jemalloc-stats,prover/cuda". Mind the LDE threshold —
+#   the GPU path only engages once padded_rows * blowup clears 2^19, and KECCAK_RND
+#   commits 24 rows per permutation, so at blowup 2 the default KECCAK_PERMS=5461
+#   stays on the CPU. Use KECCAK_PERMS=21845 (or >=10922) for a GPU run, or the two
+#   sides will be compared on a path neither of them took.
+#
+#   scripts/bench_abba.sh 6a280121 6a280121^ 6         # WORKLOAD=keccak: isolate #889
 #
 #   On WORKLOAD: a real block is keccak- and trie-bound, while the synthetic option is
 #   N plain transfers — ecrecover-heavy over a near-empty state — so a prover change can
@@ -83,20 +100,31 @@ BENCH_FEATURES="${BENCH_FEATURES:-jemalloc-stats}"
 # OOM monolithically, and the only way to bench a per-epoch GPU-residency change
 # at a realistic trace size. When on, both binaries prove with
 # `--continuations --epoch-size-log2 $EPOCH_SIZE_LOG2`.
+CONTINUATIONS_EXPLICIT="${CONTINUATIONS+1}"
 CONTINUATIONS="${CONTINUATIONS:-0}"
 EPOCH_SIZE_LOG2="${EPOCH_SIZE_LOG2:-20}"
 # ethrex transfer-count fixture to prove (executor/tests/ethrex_${TX_COUNT}_transfers.bin).
 TX_COUNT="${TX_COUNT:-5}"
 WORKLOAD="${WORKLOAD:-real}"
 case "$WORKLOAD" in
-  synthetic|real) ;;
-  *) echo "ERROR: WORKLOAD must be 'synthetic' or 'real' (got '$WORKLOAD')." >&2; exit 2 ;;
+  synthetic|real|keccak) ;;
+  *) echo "ERROR: WORKLOAD must be 'synthetic', 'real' or 'keccak' (got '$WORKLOAD')." >&2; exit 2 ;;
 esac
+# WORKLOAD=keccak: permutation count for the saturated keccak guest. 5461 puts
+# 131,064 KECCAK_RND rows just under 2^17, so almost nothing is lost to padding
+# and the measured delta is not diluted by padded rows that both sides carry.
+KECCAK_PERMS="${KECCAK_PERMS:-5461}"
 # A real block sits far past the monolithic memory ceiling (~4.9 GB of peak heap per
 # million cycles puts it in the hundreds of GB), so continuations are forced rather
 # than offered: CONTINUATIONS=0 here could only produce an OOM.
 if [ "$WORKLOAD" = "real" ] && [ "$CONTINUATIONS" != "1" ]; then
   echo "   NOTE: WORKLOAD=real always proves with continuations (monolithic would OOM)."
+  CONTINUATIONS=1
+fi
+# The keccak figures on record were taken as single-epoch continuation proofs;
+# default to that so a new reading is comparable to them. The trace is small
+# enough that monolithic also works — set CONTINUATIONS=0 for it.
+if [ "$WORKLOAD" = "keccak" ] && [ -z "$CONTINUATIONS_EXPLICIT" ]; then
   CONTINUATIONS=1
 fi
 if [ "$CONTINUATIONS" = "1" ]; then
@@ -134,6 +162,8 @@ echo "   pairs=$N_PAIRS  (=$((N_PAIRS * 2)) prove runs)"
 if [ "$WORKLOAD" = "real" ]; then
   INPUT_REL="$(make -s print-real-block-fixture)"
   echo "   workload=real  $INPUT_REL  (continuations, epoch 2^$EPOCH_SIZE_LOG2)"
+elif [ "$WORKLOAD" = "keccak" ]; then
+  echo "   workload=keccak  $KECCAK_PERMS permutations  ($((KECCAK_PERMS * 24)) KECCAK_RND rows)"
 else
   INPUT_REL="executor/tests/ethrex_${TX_COUNT}_transfers.bin"
   echo "   workload=synthetic  ${TX_COUNT}tx  $INPUT_REL"
@@ -142,12 +172,22 @@ fi
 mkdir -p "$WORK"
 
 # --- 1. Guest ELF + fixture (identical for both sides; build once if missing) ---
-if [ ! -f "$ELF_REL" ]; then
+if [ "$WORKLOAD" = "keccak" ]; then
+  # Generated, not checked in: the permutation count is a parameter. Costs
+  # milliseconds, so it is regenerated unconditionally rather than cached — a
+  # stale ELF from an earlier run at a different KECCAK_PERMS would silently
+  # measure the wrong workload.
+  ELF_REL="$WORK/keccak_${KECCAK_PERMS}.elf"
+  echo "==> Generating keccak guest ($KECCAK_PERMS permutations)"
+  scripts/gen_keccak_bench.sh "$KECCAK_PERMS" "$ELF_REL"
+elif [ ! -f "$ELF_REL" ]; then
   echo "==> Building ethrex guest ELF (missing)"
   export SYSROOT_DIR="${SYSROOT_DIR:-$HOME/.lambda-vm-sysroot}"
   make "$ELF_REL"
 fi
-if [ "$WORKLOAD" = "real" ]; then
+if [ "$WORKLOAD" = "keccak" ]; then
+  : # no fixture; the guest is self-contained
+elif [ "$WORKLOAD" = "real" ]; then
   # ~1 MB, gitignored, never in a fresh checkout — and a rented GPU box is always a
   # fresh checkout. Fetched by URL + sha256, not built: no converter, no ethrex host
   # dependency tree, so this costs seconds on the box. Unconditional on purpose: the
@@ -161,7 +201,12 @@ elif [ ! -f "$INPUT_REL" ]; then
   tooling/ethrex-fixtures/target/release/ethrex-fixtures "$TX_COUNT" "$INPUT_REL" distinct
 fi
 ELF="$(cd "$(dirname "$ELF_REL")" && pwd)/$(basename "$ELF_REL")"
-INPUT="$(cd "$(dirname "$INPUT_REL")" && pwd)/$(basename "$INPUT_REL")"
+if [ -n "$INPUT_REL" ]; then
+  INPUT="$(cd "$(dirname "$INPUT_REL")" && pwd)/$(basename "$INPUT_REL")"
+  INPUT_ARGS=(--private-input "$INPUT")
+else
+  INPUT_ARGS=()
+fi
 
 # --- 2. Build (or reuse) both prover binaries ---
 need_build=0
@@ -212,11 +257,30 @@ else
   echo "     cli_A=${SHA_A:0:10}  cli_B=${SHA_B:0:10}  features=$BENCH_FEATURES"
 fi
 
+# --- 2b. keccak gate: both sides must see the same permutation count ---
+# The whole point of this workload is that the permutations dominate, so the
+# count is checked against BOTH binaries rather than assumed: if a ref changed
+# the accelerator's ecall ABI, the guest would fall back to something else on
+# one side and the "speedup" would be an artefact.
+if [ "$WORKLOAD" = "keccak" ]; then
+  for side in A B; do
+    calls="$("$WORK/cli_$side" execute "$ELF" --cycles 2>/dev/null | awk '/^Keccak calls:/ {print $3}')"
+    if [ "$calls" != "$KECCAK_PERMS" ]; then
+      echo "ERROR: cli_$side counted '${calls:-none}' keccak permutations, expected $KECCAK_PERMS." >&2
+      exit 1
+    fi
+  done
+  echo "==> Gate: both binaries execute exactly $KECCAK_PERMS keccak permutations"
+fi
+
 # --- 3. Interleaved A/B/B/A measurement (fresh CSV -- pre-committed batch) ---
 run_prove() {  # $1=binary -> echoes proving time (s)
   local out t
   # shellcheck disable=SC2086  # CONT_ARGS is intentionally word-split (0 or 2 args)
-  out="$("$1" prove "$ELF" --private-input "$INPUT" -o "$PROOF" --time $CONT_ARGS 2>&1)"
+  # ${a[@]+"${a[@]}"} rather than "${a[@]}": under `set -u`, bash < 4.4 treats an
+  # empty array expansion as an unbound variable, and WORKLOAD=keccak has no
+  # --private-input to pass.
+  out="$("$1" prove "$ELF" ${INPUT_ARGS[@]+"${INPUT_ARGS[@]}"} -o "$PROOF" --time $CONT_ARGS 2>&1)"
   rm -f "$PROOF"
   t="$(printf '%s\n' "$out" | grep -o 'Proving time: [0-9.]*' | awk '{print $3}')"
   if [ -z "$t" ]; then
