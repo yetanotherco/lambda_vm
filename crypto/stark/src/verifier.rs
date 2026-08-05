@@ -1208,7 +1208,17 @@ pub trait IsStarkVerifier<
                 transcript.append_bytes(&expected_precomputed);
                 transcript.append_bytes(proof.lde_trace_main_merkle_root());
             } else {
-                // Normal table: use commitment from proof
+                // Normal table: use commitment from proof. A non-preprocessed
+                // AIR has no precomputed trace, so the proof must not carry a
+                // precomputed commitment: it is never absorbed into the
+                // transcript here, yet `verify_trace_openings` and the DEEP
+                // reconstruction would authenticate and use its openings,
+                // letting a malicious prover choose those columns after
+                // learning the Fiat-Shamir challenges. Reject instead.
+                if proof.lde_trace_precomputed_merkle_root().is_some() {
+                    error!("Normal table {idx} proof carries an unexpected precomputed commitment");
+                    return false;
+                }
                 transcript.append_bytes(proof.lde_trace_main_merkle_root());
             }
         }

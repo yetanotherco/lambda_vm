@@ -58,6 +58,45 @@ fn test_prove_fib() {
     ));
 }
 
+/// Soundness regression: a proof for a normal (non-preprocessed) AIR must be
+/// rejected if it carries a precomputed trace commitment. That root is never
+/// absorbed into the Fiat-Shamir transcript for normal tables, yet its
+/// openings would later be authenticated and used — letting a malicious
+/// prover choose those columns after learning the challenges.
+#[test_log::test]
+fn test_reject_unexpected_precomputed_commitment() {
+    let mut trace = simple_fibonacci::fibonacci_trace([Felt::from(1), Felt::from(1)], 8);
+
+    let proof_options = ProofOptions::default_test_options();
+
+    let pub_inputs = FibonacciPublicInputs {
+        a0: Felt::one(),
+        a1: Felt::one(),
+    };
+
+    let air = FibonacciAIR::<GoldilocksField>::new(&proof_options);
+    assert!(!air.is_preprocessed());
+
+    let mut proof = Prover::prove(
+        &air,
+        &mut trace,
+        &pub_inputs,
+        &mut DefaultTranscript::<F>::new(&[]),
+    )
+    .unwrap();
+    // An honest proof for a normal AIR carries no precomputed commitment.
+    assert!(proof.lde_trace_precomputed_merkle_root.is_none());
+
+    // A malicious prover attaches an unbound precomputed commitment.
+    proof.lde_trace_precomputed_merkle_root = Some([0x42; 32]);
+
+    assert!(!Verifier::verify(
+        &proof,
+        &air,
+        &mut DefaultTranscript::<F>::new(&[]),
+    ));
+}
+
 #[test_log::test]
 fn test_prove_fib_2_cols() {
     let mut trace = fibonacci_2_columns::compute_trace([Felt::from(1), Felt::from(1)], 16);
