@@ -46,6 +46,50 @@
 # HWSL-inline bench (#889) was recorded at — it wastes ~8% of the table to
 # padding, so expect it to read slightly slower than 5461 despite being smaller.
 #
+# WHY BIGGER TABLES HELP — AND WHERE THAT STOPS PAYING
+# ----------------------------------------------------
+# Measured with `count-elements` at N = 10 / 1365 / 5461 (no proving needed),
+# total cell-equiv = main + 3*aux fits a straight line almost exactly:
+#
+#     cells(N) ~= 31.05M + ~73,000 * N          (post-#889 marginal)
+#
+# The 31.05M intercept is the FIXED floor — the ~2^20-row shared BITWISE table
+# and the other preprocessed tables — and it is proved on every run regardless
+# of how many permutations ride along. The slope is one permutation, and it
+# lands within 0.5% of the hand-derived 72,672 + ~750, which independently
+# confirms the per-permutation cell count.
+#
+# So the floor's share of the work, i.e. the fraction of the proof that is not
+# keccak at all:
+#
+#     N        rows    floor share
+#     1,365    2^15       23.8%
+#     5,461    2^17        7.2%     <- where every keccak figure on record was taken
+#     10,922   2^18        3.7%
+#     21,845   2^19        1.9%
+#     43,690   2^20        1.0%
+#     87,381   2^21        0.5%
+#
+# That is the case for bigger tables, and it is quantitative: moving 2^17 ->
+# 2^20 stops wasting ~6% of the proof, which is the same size as the entire
+# #889 win. It also confirms 2^17 is too small. But note the curve is nearly
+# flat past 2^19 — going 2^19 -> 2^20 recovers under 1% more.
+#
+# The counterforce is not measured and pushes the other way: LDE is O(n log n),
+# so per-cell FFT work grows with log2(n). From 2^17 to 2^20 rows that is
+# 21/18 = +17% on the FFT's share of the time. Amortisation gain (~6%) and FFT
+# growth (+17% of some fraction) are the same order of magnitude, so the net
+# optimum is NOT derivable from this data — it is why --ladder exists. Expect a
+# broad optimum somewhere in 2^18..2^20 rather than a sharp peak.
+#
+# CONSEQUENCE FOR A/B RUNS: at 2^17 about 7% of the trace is floor that a
+# keccak-table change cannot touch, so the measured delta is diluted by roughly
+# that much. #889's recorded -6.8% was taken there (its README notes keccak_rnd
+# was 86.6% of committed cells, floor plus padding). Re-running the same
+# comparison at 2^18 or 2^19 should show a LARGER delta, closer to the ~7.9%
+# the table itself moved — not because anything changed, but because less of
+# the proof is inert.
+#
 # WHAT THIS SWEEP DOES AND DOES NOT ESTABLISH
 # -------------------------------------------
 # The default points step by 4x in trace size, which shows the TREND — whether
@@ -62,19 +106,33 @@
 # guest costs exactly 5.0 cycles per permutation (measured: (5114-164)/990), so
 # a default 2^20-cycle epoch would want ~209,700 permutations = 5.03M rows,
 # padding to 2^23 — about 203 GB of committed keccak_rnd trace before any LDE.
-# Nothing proves that. Committed trace is ~3,028 base cells/row x rows x 8 B:
+# Nothing proves that, which is why N and not the epoch size is the knob here.
 #
-#     N        rows(padded)   committed trace
-#     5,461    2^17           3.2 GB
-#     21,845   2^19          12.7 GB
-#     43,690   2^20          25.4 GB     <- near the practical CPU ceiling
+# What is DERIVED (KECCAK_RND rows x 3,028 base cells/row x 8 B — the committed
+# trace only, before LDE, Merkle or the composition polynomial):
 #
-# Peak heap is several times that (LDE + Merkle), so 43690 is the top of the
-# ladder and is left out of the default GPU sweep. Every point here is a SINGLE
-# epoch: continuations are matching the historical methodology, not normalising
-# the size. To measure the production regime — steady-state per-epoch
-# throughput across many epochs — you would need a much smaller
-# --epoch-size-log2 so the run spans epochs at a provable trace size.
+#     N        rows(padded)   committed keccak_rnd trace
+#     5,461    2^17            3.2 GB
+#     21,845   2^19           12.7 GB
+#     43,690   2^20           25.4 GB
+#     87,381   2^21           50.8 GB
+#     174,762  2^22          101.6 GB   <- past a 128 GiB box on the trace alone
+#
+# What is NOT derived: the multiplier from committed trace to PEAK HEAP. It is
+# certainly >1 (the blowup-2 LDE alone doubles the committed part, plus Merkle
+# trees), but the actual figure has not been measured for this workload, and
+# guessing it is how you either leave a box idle or waste a rental on an OOM.
+# So the script does not pick a ceiling: it MEASURES one. Peak heap is recorded
+# per point from jemalloc, the ladder runs ascending, and the report renders
+# whatever completed even if a later point dies — so an OOM at the top costs
+# that point and nothing else. On a 128 GiB box 2^21 rows is the first point
+# where the answer is genuinely in doubt; start there and read the peak-heap
+# column.
+#
+# Every point here is a SINGLE epoch: continuations are matching the historical
+# methodology, not normalising the size. To measure the production regime —
+# steady-state per-epoch throughput across many epochs — you would need a much
+# smaller --epoch-size-log2 so the run spans epochs at a provable trace size.
 #
 # Usage:
 #   scripts/bench_keccak_throughput.sh [options]
@@ -158,11 +216,13 @@ done
 # default sweep therefore starts where the GPU actually engages.
 GPU_LDE_THRESHOLD="${LAMBDA_VM_GPU_LDE_THRESHOLD:-524288}"
 if [ "$LADDER" = true ]; then
-    # Every padding-flush point from 2^16 to 2^20 KECCAK_RND rows: N = 2^k/24.
+    # Every padding-flush point from 2^16 to 2^21 KECCAK_RND rows: N = 2^k/24.
     # Steps of 2x instead of the default's 4x, for locating the throughput
-    # optimum rather than just establishing the trend.
-    N_LIST="2730 5461 10922 21845 43690"
-    [ "$CUDA" = true ] && N_LIST="10922 21845 43690"
+    # optimum rather than just establishing the trend. Ascending, so a point
+    # that exhausts memory costs only itself — everything below it is already
+    # recorded and still gets reported.
+    N_LIST="2730 5461 10922 21845 43690 87381"
+    [ "$CUDA" = true ] && N_LIST="10922 21845 43690 87381"
 elif [ -z "$N_LIST" ]; then
     if [ "$CUDA" = true ]; then
         N_LIST="10922 21845"
