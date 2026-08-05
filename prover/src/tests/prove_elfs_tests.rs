@@ -1426,7 +1426,10 @@ fn test_prove_dma_memset_forged_intermediate_fill_rejected() {
     use crate::tables::dma_set::cols as dma_set_cols;
 
     let (elf, mut traces) = dma_memset_fixture();
-    let forged_row = dma_set_row_matching(&traces, |first, end, _tail| !first && !end);
+    // `!tail` matters: on a one-byte row `fill_wide` must stay zero, so shifting
+    // both lanes there would trip constraint 9 locally and the test would prove
+    // something else.
+    let forged_row = dma_set_row_matching(&traces, |first, end, tail| !first && !end && !tail);
     // Shift both lanes so the row stays internally consistent (constraint 10
     // still holds); only the chain token and the MEMW write disagree.
     for column in [dma_set_cols::FILL, dma_set_cols::FILL_WIDE] {
@@ -1459,6 +1462,10 @@ fn test_prove_dma_memset_forged_early_end_rejected() {
     assert_dma_forgery_rejected(&elf, &mut traces, "END must be equivalent to count == 0");
 }
 
+/// Flipping `tail` rewrites `step` from 8 to 1, so the row's own address and
+/// count arithmetic stop holding. Note this is rejected locally by the ADD
+/// carries, NOT by the ALU LT that pins `tail = (count < 8)` — that bus has no
+/// negative coverage here, the same gap the memcpy sibling has.
 #[test]
 fn test_prove_dma_memset_forged_wide_tail_rejected() {
     use crate::tables::dma_set::cols as dma_set_cols;
@@ -1470,7 +1477,60 @@ fn test_prove_dma_memset_forged_wide_tail_rejected() {
         .main_table
         .set(forged_row, dma_set_cols::TAIL, FieldElement::one());
 
-    assert_dma_forgery_rejected(&elf, &mut traces, "TAIL must equal count < 8");
+    assert_dma_forgery_rejected(&elf, &mut traces, "a row's width must match its step");
+}
+
+/// Soundness: a one-byte row must not broadcast its fill into lanes 1..7. This
+/// is the direction that matters — it is an eight-byte write where a single byte
+/// was authorised. The wide-row test above covers the opposite, harmless case.
+#[test]
+fn test_prove_dma_memset_forged_tail_fill_wide_rejected() {
+    use crate::tables::dma_set::cols as dma_set_cols;
+
+    let (elf, mut traces) = dma_memset_fixture();
+    let forged_row = dma_set_row_matching(&traces, |_first, end, tail| !end && tail);
+    let fill = *traces
+        .dma_set
+        .main_table
+        .get(forged_row, dma_set_cols::FILL);
+    traces
+        .dma_set
+        .main_table
+        .set(forged_row, dma_set_cols::FILL_WIDE, fill);
+
+    assert_dma_forgery_rejected(
+        &elf,
+        &mut traces,
+        "a one-byte row must not widen its write to eight lanes",
+    );
+}
+
+/// Soundness: the destination chain. The memcpy suite tampers `src`/`src_incr`
+/// together; this is the memset analogue, and without it no test moves an
+/// address at all.
+#[test]
+fn test_prove_dma_memset_forged_intermediate_destination_rejected() {
+    use crate::tables::dma_set::cols as dma_set_cols;
+
+    let (elf, mut traces) = dma_memset_fixture();
+    let forged_row = dma_set_row_matching(&traces, |first, end, tail| !first && !end && !tail);
+
+    // Shift both the current destination and its locally-consistent successor.
+    // The row's ADD stays valid; the predecessor's DmaSetNext tuple and the
+    // memory write no longer match.
+    for column in [dma_set_cols::DST_0, dma_set_cols::DST_INCR_0] {
+        let original = *traces.dma_set.main_table.get(forged_row, column);
+        traces
+            .dma_set
+            .main_table
+            .set(forged_row, column, original + FieldElement::from(8u64));
+    }
+
+    assert_dma_forgery_rejected(
+        &elf,
+        &mut traces,
+        "an intermediate row must stay chained to its predecessor's address",
+    );
 }
 
 fn dma_memset_fixture() -> (Elf, Traces) {
