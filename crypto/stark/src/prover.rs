@@ -3436,11 +3436,15 @@ pub trait IsStarkProver<
                     if air.has_aux_trace() {
                         let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
 
-                        // Same gate as the Round 1 main commit: skip the aux
-                        // host D2H when device-only, so both buffers are left
-                        // empty together for this table.
+                        // Same gate as the Round 1 main commit — but only if
+                        // that commit actually produced a device handle. If
+                        // the GPU main commit declined and fell back to CPU,
+                        // skipping the aux D2H here would mark the trace
+                        // device-only with no main handle to serve it, turning
+                        // a recoverable fallback into a hard abort downstream.
                         #[cfg(feature = "cuda")]
-                        let device_only = Self::device_only_for(*air, domain);
+                        let device_only = Self::device_only_for(*air, domain)
+                            && gpu_main_cells[idx].lock().unwrap().is_some();
 
                         // Resident GPU path: aux columns already on device (from
                         // the resident LogUp aux build) — LDE straight from device
