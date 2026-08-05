@@ -2,7 +2,7 @@
 
 use crate::vm::instruction::decoding::Instruction;
 use crate::vm::instruction::execution::{ECSM_SYSCALL_NUMBER, ExecutionError};
-use crate::vm::memory::Memory;
+use crate::vm::memory::{Memory, MemoryError};
 use crate::vm::registers::Registers;
 
 /// secp256k1 generator x-coordinate, little-endian.
@@ -139,8 +139,9 @@ fn run_ecsm_at(addr_xr: u64, addr_xg: u64, addr_k: u64) -> Result<(), ExecutionE
 
 #[test]
 fn ecsm_syscall_rejects_overlapping_xg_k() {
-    // xG and k are read at the same proof timestamp, so overlapping ranges
-    // would make the trace unprovable — the executor must reject them upfront.
+    // A conservative precondition, not a provability requirement: xG is read at T and k
+    // at T+1, so an overlapping cell chains through MEMW like any other pair of accesses
+    // at increasing timestamps. No caller needs it — two live 32-byte objects are disjoint.
     for addr_k in [0x2000u64, 0x2008, 0x2018, 0x1FE8] {
         let err = run_ecsm_at(0x1000, 0x2000, addr_k).unwrap_err();
         assert!(
@@ -158,14 +159,15 @@ fn ecsm_syscall_rejects_overlapping_xg_k() {
 
 #[test]
 fn ecsm_syscall_rejects_address_overflow() {
-    // Every operand's last accessed byte must stay in the limb (+31); the 0xFFFF_FFE1
-    // cases are the off-by-7 window the old +24 bound for xR/xG let through.
+    // The bound is the last doubleword BASE (+24), for every operand: at 0xFFFF_FFE8 that
+    // base is exactly 2^32, so the AIR emits a non-canonical low limb and cannot prove it.
     for (addr_xr, addr_xg, addr_k) in [
         (0xFFFF_FFE8, 0x2000, 0x3000),
         (0x1000, 0xFFFF_FFE8, 0x3000),
-        (0x1000, 0x2000, 0xFFFF_FFF0),
-        (0xFFFF_FFE1, 0x1000, 0x2000),
-        (0x1000, 0xFFFF_FFE1, 0x2000),
+        (0x1000, 0x2000, 0xFFFF_FFE8),
+        (0xFFFF_FFF0, 0x1000, 0x2000),
+        (0x1000, 0xFFFF_FFF8, 0x2000),
+        (0x1000, 0x2000, 0xFFFF_FFFF),
     ] {
         let err = run_ecsm_at(addr_xr, addr_xg, addr_k).unwrap_err();
         assert!(
@@ -173,4 +175,46 @@ fn ecsm_syscall_rejects_address_overflow() {
             "expected address overflow for xR={addr_xr:#x}, xG={addr_xg:#x}, k={addr_k:#x}"
         );
     }
+}
+
+#[test]
+fn ecsm_syscall_accepts_operands_crossing_the_limb() {
+    // The seven low limbs 0xFFFF_FFE1..=0xFFFF_FFE7 keep every doubleword base inside the
+    // limb while the last doubleword's trailing bytes cross 2^32, which MEMW's carry columns
+    // handle. The AIR proves these (see the prover-side
+    // `test_prove_ecsm_operand_crossing_limb_boundary`), so the executor must not reject
+    // them: a +31 bound here would accept a different set than the circuit.
+    for lo32 in 0xFFFF_FFE1u64..=0xFFFF_FFE7 {
+        run_ecsm_at(lo32, 0x1000, 0x2000)
+            .unwrap_or_else(|e| panic!("xR at {lo32:#x} must run, got {e:?}"));
+        run_ecsm_at(0x1000, lo32, 0x2000)
+            .unwrap_or_else(|e| panic!("xG at {lo32:#x} must run, got {e:?}"));
+        run_ecsm_at(0x1000, 0x2000, lo32)
+            .unwrap_or_else(|e| panic!("k at {lo32:#x} must run, got {e:?}"));
+    }
+    // The largest low limb with no crossing at all is still fine.
+    run_ecsm_at(0xFFFF_FFE0, 0x1000, 0x2000).expect("xR at 0xFFFF_FFE0 must run");
+}
+
+#[test]
+fn ecsm_syscall_leaves_the_top_of_the_address_space_to_the_memory_path() {
+    // With high limb 0xFFFF_FFFF a carry out of the low limb would need hi + 1 = 2^32, which
+    // no page can hold, so the AIR cannot prove it. `ecsm_addr_ok` does not look at the high
+    // limb; the general memory path rejects these because the byte address passes u64::MAX.
+    // This test pins that reliance: if `Memory::store_doubleword` ever stopped checking,
+    // the ECSM guard would have to grow a high-limb condition of its own.
+    for lo32 in [0xFFFF_FFE1u64, 0xFFFF_FFE7] {
+        let addr = 0xFFFF_FFFF_0000_0000 | lo32;
+        let err = run_ecsm_at(addr, 0x1000, 0x2000).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ExecutionError::MemoryError(MemoryError::AddressOverflow)
+            ),
+            "xR at {addr:#x} must be rejected by the memory path, got {err:?}"
+        );
+    }
+    // An 8-aligned base can never carry, so the same high limb is fine there.
+    run_ecsm_at(0xFFFF_FFFF_FFFF_FFE0, 0x1000, 0x2000)
+        .expect("aligned operand at the top of the address space must run");
 }

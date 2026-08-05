@@ -31,9 +31,11 @@ const KECCAK_STATE_BYTES: u64 = 25 * 8;
 /// bus as `[lo32, hi32] = [2^32 - 11, 2^32 - 1]`.
 pub const ECSM_SYSCALL_NUMBER: u64 = u64::MAX - 10;
 
-/// `2^32`. ECSM memory operands must not overflow their lower 32-bit address limb when the
-/// largest per-access offset is added: the 32-byte operands reach offset +31 (last byte).
+/// `2^32`, the size of an address limb. See [`ecsm_addr_ok`].
 const LOW_LIMB: u64 = 1 << 32;
+
+/// Size of an ECSM memory operand: `xG`, `k` and `xR` are 256-bit little-endian values.
+const ECSM_OPERAND_BYTES: u64 = 32;
 
 impl TryFrom<u64> for SyscallNumbers {
     type Error = ();
@@ -93,9 +95,33 @@ fn store_u256_le(memory: &mut Memory, addr: u64, bytes: &[u8; 32]) -> Result<(),
     Ok(())
 }
 
-/// Checks the ECSM address-alignment assumption: `(addr mod 2^32) + max_offset < 2^32`.
-fn ecsm_addr_ok(addr: u64, max_offset: u64) -> bool {
-    (addr % LOW_LIMB) + max_offset < LOW_LIMB
+/// Whether every doubleword base the AIR derives from `addr` for an `operand_bytes`-sized
+/// operand stays inside the low address limb.
+///
+/// An accelerator operand is accessed as `operand_bytes / 8` doublewords whose bases the
+/// table builds as `ADDR_*_0 + 8i` (`prover/src/tables/ecsm.rs`) — a bare field addition on
+/// the low limb, with the high limb passed through. The last base is `operand_bytes - 8`, and
+/// *that* is the value that has to stay canonical; a non-canonical low limb has no matching
+/// PAGE token, so the Memory bus does not balance. The trailing bytes of that last doubleword
+/// may cross `2^32` freely, because `MEMW` derives bytes 1..7 with real carry columns
+/// (`lo = base_0 + i - 2^32*carry[i]`, `hi = base_1 + carry[i]`, `prover/src/tables/memw.rs`)
+/// and so places them at the arithmetically correct 64-bit address.
+///
+/// The bound must not be raised to `operand_bytes - 1`. That does not make anything safer — it
+/// makes the executor reject seven low-limb values per operand that the AIR proves, so the
+/// prover and the reference semantics accept different sets. #657 did exactly that late in its
+/// review, going from `+24` to `+31`; see `ecsm_syscall_accepts_operands_crossing_the_limb` and
+/// `test_prove_ecsm_operand_crossing_limb_boundary`, which pin the two sets together. Anything
+/// that adds an accelerator operand of a different size gets the right bound by passing its
+/// size — a 64-byte operand read as eight doublewords needs `+56`, not `+63`.
+///
+/// One case is deliberately left to the general memory path: an operand whose *high* limb is
+/// `0xFFFF_FFFF` and whose trailing bytes carry would need `hi + 1 = 2^32`, which no page can
+/// hold. `Memory::{load,store}_doubleword` already reject it — a carry out of the low limb at
+/// `hi = 0xFFFF_FFFF` means the byte address passes `u64::MAX`, which their `checked_add`
+/// catches (and an 8-aligned base can never carry, since the largest one is `0xFFFF_FFF8`).
+fn ecsm_addr_ok(addr: u64, operand_bytes: u64) -> bool {
+    (addr % LOW_LIMB) + (operand_bytes - 8) < LOW_LIMB
 }
 
 impl Instruction {
@@ -429,19 +455,19 @@ impl Instruction {
                         let addr_xr = registers.read(10)?;
                         let addr_xg = registers.read(11)?;
                         let addr_k = registers.read(12)?;
-                        if !ecsm_addr_ok(addr_xg, 31)
-                            || !ecsm_addr_ok(addr_xr, 31)
-                            || !ecsm_addr_ok(addr_k, 31)
+                        if !ecsm_addr_ok(addr_xg, ECSM_OPERAND_BYTES)
+                            || !ecsm_addr_ok(addr_xr, ECSM_OPERAND_BYTES)
+                            || !ecsm_addr_ok(addr_k, ECSM_OPERAND_BYTES)
                         {
                             return Err(ExecutionError::EcsmAddressOverflow);
                         }
-                        // xG and k must occupy disjoint 32-byte regions. The trace builder
-                        // reads each operand as unaligned doubleword MEMW accesses (xG at T,
-                        // k at T+1); if the regions overlap, the same address is touched at
-                        // both timestamps and the MEMW consistency argument can't prove the
-                        // access chain. The loaded values would still be well-defined — this
-                        // guard is about trace provability, not correctness of the multiply.
-                        // xR may alias either: its accesses are at a later timestamp.
+                        // xG and k must occupy disjoint 32-byte regions. This is a conservative
+                        // precondition, not a provability requirement: xG is read at T and k at
+                        // T+1, so an overlapping cell chains through MEMW like any other pair of
+                        // accesses at increasing timestamps, and such a trace does verify. The
+                        // guard stays because the AIR does not enforce disjointness either way,
+                        // and no caller needs it: two live 32-byte objects are already disjoint.
+                        // xR may alias either — its accesses are at a later timestamp.
                         if addr_xg.abs_diff(addr_k) < 32 {
                             return Err(ExecutionError::EcsmOperandOverlap);
                         }
