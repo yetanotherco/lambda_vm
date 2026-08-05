@@ -1636,11 +1636,8 @@ pub trait IsStarkVerifier<
         // query phase will actually use, which is exactly what the adjacent
         // `query_list_len` guard counts (`sample_query_indexes` draws
         // `fri_number_of_queries` iotas).
-        if !Self::trace_opening_widths_well_formed(
-            air,
-            proof,
-            air.options().fri_number_of_queries,
-        ) {
+        if !Self::trace_opening_widths_well_formed(air, proof, air.options().fri_number_of_queries)
+        {
             #[cfg(not(feature = "test_fiat_shamir"))]
             error!("Trace opening column split does not match the AIR");
             return false;

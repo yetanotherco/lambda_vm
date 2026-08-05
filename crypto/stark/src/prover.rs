@@ -3198,8 +3198,9 @@ pub trait IsStarkProver<
                 // absorb, which is what makes a re-split opening exploitable
                 // (see `tests::opening_width_tests`). Always true otherwise.
                 #[cfg(test)]
-                let absorb = !crate::tests::opening_width_tests::TEST_ONLY_SKIP_PRECOMPUTED_ROOT_ABSORB
-                    .load(std::sync::atomic::Ordering::SeqCst);
+                let absorb =
+                    !crate::tests::opening_width_tests::TEST_ONLY_SKIP_PRECOMPUTED_ROOT_ABSORB
+                        .load(std::sync::atomic::Ordering::SeqCst);
                 #[cfg(not(test))]
                 let absorb = true;
                 if absorb {

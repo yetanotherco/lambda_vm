@@ -282,7 +282,7 @@ fn attacker_b_column(a1: Felt, out: Option<Felt>) -> Vec<Felt> {
     let mut x = Felt::from(987654321u64);
     for _ in 0..free {
         x = &x * Felt::from(1442695040u64) + Felt::from(1013904223u64);
-        b.push(x.clone());
+        b.push(x);
     }
     b.extend(out);
     b
@@ -297,7 +297,7 @@ fn prove_with_split_declaration(
     out: Option<Felt>,
 ) -> FibProof {
     set_hostile_prover(true);
-    let reference = FibonacciSplitAIR::<F>::honest(proof_options, out.clone());
+    let reference = FibonacciSplitAIR::<F>::honest(proof_options, out);
     let commitment = Prover::compute_precomputed_commitment_for_testing(trace, &reference, 1)
         .expect("precomputed commitment");
     let split_air = FibonacciSplitAIR::<F>::split(proof_options, out, commitment);
@@ -314,10 +314,10 @@ fn prove_with_split_declaration(
 /// The adaptive forgery: learn the round-2 challenge from a probe run (round 1
 /// binds only column 1), then solve for column 0.
 fn forge_under_split_declaration(proof_options: &ProofOptions, out: Option<Felt>) -> FibProof {
-    let b_col = attacker_b_column(pub_inputs().a1, out.clone());
+    let b_col = attacker_b_column(pub_inputs().a1, out);
     let probe_trace =
         TraceTable::from_columns_main(vec![vec![Felt::zero(); TRACE_LEN], b_col.clone()], 1);
-    let probe = prove_with_split_declaration(proof_options, &probe_trace, out.clone());
+    let probe = prove_with_split_declaration(proof_options, &probe_trace, out);
     let beta = challenge_from_main_root(&probe.lde_trace_main_merkle_root);
 
     let forged = forge_trace(&b_col, pub_inputs().a0, &beta);
@@ -385,14 +385,14 @@ fn false_statement_under_split_declaration_is_rejected() {
     let _prover_mode = lock_prover_mode();
     let proof_options = ProofOptions::default_test_options();
     let honest_trace = compute_trace([Felt::one(), Felt::one()], TRACE_LEN);
-    let true_out = honest_trace.columns_main()[1][TRACE_LEN - 1].clone();
+    let true_out = honest_trace.columns_main()[1][TRACE_LEN - 1];
     let claimed_out = Felt::from(999u64);
     assert_ne!(
         true_out, claimed_out,
         "test precondition: the claimed output must be unreachable, else the statement is true",
     );
 
-    let honest_air = FibonacciSplitAIR::<F>::honest(&proof_options, Some(claimed_out.clone()));
+    let honest_air = FibonacciSplitAIR::<F>::honest(&proof_options, Some(claimed_out));
     let proof = forge_under_split_declaration(&proof_options, Some(claimed_out));
 
     assert!(
@@ -410,7 +410,11 @@ fn precomputed_openings_without_root_are_rejected() {
     let proof_options = ProofOptions::default_test_options();
     let mut proof = forge_under_split_declaration(&proof_options, None);
     proof.lde_trace_precomputed_merkle_root = None;
-    assert!(proof.deep_poly_openings[0].precomputed_trace_polys.is_some());
+    assert!(
+        proof.deep_poly_openings[0]
+            .precomputed_trace_polys
+            .is_some()
+    );
 
     let honest_air = FibonacciSplitAIR::<F>::honest(&proof_options, None);
     assert!(
@@ -455,7 +459,7 @@ fn honest_non_preprocessed_proof_still_verifies() {
     set_hostile_prover(false);
     let proof_options = ProofOptions::default_test_options();
     let mut trace = compute_trace([Felt::one(), Felt::one()], TRACE_LEN);
-    let out = trace.columns_main()[1][TRACE_LEN - 1].clone();
+    let out = trace.columns_main()[1][TRACE_LEN - 1];
     let air = FibonacciSplitAIR::<F>::honest(&proof_options, Some(out));
 
     let proof = Prover::prove(
@@ -537,7 +541,7 @@ fn opening_widths_reject_every_mismatched_term() {
     tampered.deep_poly_openings[0]
         .main_trace_polys
         .evaluations
-        .push(extra.clone());
+        .push(extra);
     assert!(
         !widths_well_formed(&air, &tampered),
         "an over-wide main opening must be rejected",
@@ -557,7 +561,7 @@ fn opening_widths_reject_every_mismatched_term() {
     tampered.deep_poly_openings[0]
         .main_trace_polys
         .evaluations_sym
-        .push(extra.clone());
+        .push(extra);
     assert!(
         !widths_well_formed(&air, &tampered),
         "an over-wide symmetric main opening must be rejected",
@@ -569,7 +573,7 @@ fn opening_widths_reject_every_mismatched_term() {
         .as_mut()
         .expect("the RAP AIR has an aux trace")
         .evaluations
-        .push(extra.clone());
+        .push(extra);
     assert!(
         !widths_well_formed(&air, &tampered),
         "an over-wide aux opening must be rejected",
@@ -581,7 +585,7 @@ fn opening_widths_reject_every_mismatched_term() {
         .as_mut()
         .expect("the RAP AIR has an aux trace")
         .evaluations_sym
-        .push(extra.clone());
+        .push(extra);
     assert!(
         !widths_well_formed(&air, &tampered),
         "an over-wide symmetric aux opening must be rejected",
