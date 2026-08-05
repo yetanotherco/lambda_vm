@@ -39,6 +39,9 @@ use crate::tables::bitwise::{
     BitwiseOperation, BitwiseOperationType, bus_interactions as bitwise_bus_interactions,
     cols as bitwise_cols,
 };
+use crate::tables::blake3::{
+    Blake3Constraints, bus_interactions as blake3_bus_interactions, cols as blake3_cols,
+};
 use crate::tables::branch::{
     BranchConstraints, bus_interactions as branch_bus_interactions, cols as branch_cols,
 };
@@ -951,6 +954,18 @@ pub fn create_keccak_air(proof_options: &ProofOptions) -> ConcreteVmAir<KeccakCo
         1,
         KeccakConstraints,
         "KECCAK",
+    )
+}
+
+/// Create the BLAKE3 6-round compression AIR (syscall variant, one row per call).
+pub fn create_blake3_air(proof_options: &ProofOptions) -> ConcreteVmAir<Blake3Constraints> {
+    build_air(
+        blake3_cols::NUM_COLUMNS,
+        blake3_bus_interactions(),
+        proof_options,
+        1,
+        Blake3Constraints,
+        "BLAKE3",
     )
 }
 

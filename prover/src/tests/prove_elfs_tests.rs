@@ -1103,6 +1103,55 @@ fn test_prove_elfs_keccak_multi_call() {
 }
 
 #[test]
+fn test_prove_elfs_blake3() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_blake3");
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
+    let result = executor.run().expect("Failed to run program");
+
+    // The guest seeds the 14 input dwords with k+1, compresses, copies out over
+    // m and compresses again. Cross-check the committed output against a direct
+    // replay of the executor's compression function.
+    use executor::vm::instruction::execution::blake3_compress_6round;
+    let words: [u32; 28] = core::array::from_fn(|i| {
+        let dw = (i / 2 + 1) as u64;
+        if i % 2 == 0 {
+            dw as u32
+        } else {
+            (dw >> 32) as u32
+        }
+    });
+    let h: [u32; 8] = words[0..8].try_into().unwrap();
+    let m: [u32; 16] = words[8..24].try_into().unwrap();
+    let t = (words[24] as u64) | ((words[25] as u64) << 32);
+    let (block_len, flags) = (words[26], words[27]);
+    let out1 = blake3_compress_6round(&h, &m, t, block_len, flags);
+    let out2 = blake3_compress_6round(&h, &out1, t, block_len, flags);
+    let expected_bytes: Vec<u8> = out2.iter().flat_map(|w| w.to_le_bytes()).collect();
+
+    assert_eq!(
+        result.return_values.memory_values, expected_bytes,
+        "committed output must match two chained 6-round compressions"
+    );
+
+    // Must use from_elf_and_logs (stack RAM needs PAGE tables, like keccak).
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
+    assert_eq!(
+        traces.public_output_bytes,
+        result.return_values.memory_values
+    );
+
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "blake3 prove/verify failed"
+    );
+}
+
+#[test]
 fn test_prove_elfs_ecsm() {
     let _ = env_logger::builder().is_test(true).try_init();
 

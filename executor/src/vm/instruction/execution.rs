@@ -12,6 +12,8 @@ pub enum SyscallNumbers {
     KeccakPermute = 0,
     Print = 1,
     Panic = 2,
+    // Placeholder discriminant. The actual syscall value is BLAKE3_SYSCALL_NUMBER.
+    Blake3Compress = 3,
     Commit = 64,
     Halt = 93,
     // Placeholder discriminant. The actual syscall value is ECSM_SYSCALL_NUMBER.
@@ -23,6 +25,30 @@ pub enum SyscallNumbers {
 /// Cannot be an enum discriminant because it exceeds isize::MAX.
 pub const KECCAK_SYSCALL_NUMBER: u64 = u64::MAX - 1;
 const KECCAK_STATE_BYTES: u64 = 25 * 8;
+
+/// Syscall number for the BLAKE3 6-round compression accelerator
+/// (u64::MAX - 2 = 0xFFFF_FFFF_FFFF_FFFD).
+///
+/// This is the **6-round internal variant** of the BLAKE3 compression function
+/// (`thoughts/blake3/blake3-chip/DESIGN.md`), intended for in-house Merkle /
+/// Fiat–Shamir use — it is NOT standard 7-round BLAKE3 and its security rests
+/// on the named 6-round assumption recorded in the design.
+///
+/// ABI: `x10` = 8-byte-aligned pointer to a 176-byte state region laid out as
+/// consecutive little-endian dwords at `addr + 8k`:
+///
+/// | dword k | contents                                   |
+/// |---------|--------------------------------------------|
+/// | 0..=3   | `h[0..8]` chaining value (2 u32 words/dword) |
+/// | 4..=11  | `m[0..16]` message block                     |
+/// | 12      | `t` counter (`t_lo = low u32 → v[12]`, `t_hi = high u32 → v[13]`) |
+/// | 13      | `block_len` (low u32) \| `flags` (high u32)  |
+/// | 14..=21 | `out[0..16]` — written by the syscall        |
+pub const BLAKE3_SYSCALL_NUMBER: u64 = u64::MAX - 2;
+/// Bytes of the BLAKE3 state region: 112 input + 64 output.
+const BLAKE3_STATE_BYTES: u64 = 22 * 8;
+/// Dword offset of `out[0..16]` inside the BLAKE3 state region.
+const BLAKE3_OUT_DWORDS: u64 = 14;
 
 /// Syscall number for the ECSM (elliptic-curve scalar multiply) accelerator.
 ///
@@ -44,6 +70,7 @@ impl TryFrom<u64> for SyscallNumbers {
             64 => Ok(SyscallNumbers::Commit),
             93 => Ok(SyscallNumbers::Halt),
             v if v == KECCAK_SYSCALL_NUMBER => Ok(SyscallNumbers::KeccakPermute),
+            v if v == BLAKE3_SYSCALL_NUMBER => Ok(SyscallNumbers::Blake3Compress),
             v if v == ECSM_SYSCALL_NUMBER => Ok(SyscallNumbers::Ecsm),
             _ => Err(()),
         }
@@ -54,6 +81,7 @@ impl TryFrom<u64> for SyscallNumbers {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Accelerator {
     Keccak,
+    Blake3,
     Ecsm,
 }
 
@@ -64,6 +92,7 @@ impl SyscallNumbers {
     pub fn accelerator(self) -> Option<Accelerator> {
         match self {
             SyscallNumbers::KeccakPermute => Some(Accelerator::Keccak),
+            SyscallNumbers::Blake3Compress => Some(Accelerator::Blake3),
             SyscallNumbers::Ecsm => Some(Accelerator::Ecsm),
             SyscallNumbers::Print
             | SyscallNumbers::Panic
@@ -421,6 +450,41 @@ impl Instruction {
                         }
                         src2_val = state_addr;
                     }
+                    SyscallNumbers::Blake3Compress => {
+                        // BLAKE3 6-round compression on a 176-byte region at the
+                        // address in x10 (layout: see BLAKE3_SYSCALL_NUMBER docs).
+                        let state_addr = registers.read(10)?;
+                        if !state_addr.is_multiple_of(8) {
+                            return Err(ExecutionError::UnalignedBlake3StateAddress(state_addr));
+                        }
+                        state_addr
+                            .checked_add(BLAKE3_STATE_BYTES - 1)
+                            .ok_or(ExecutionError::Blake3StateAddressOverflow(state_addr))?;
+
+                        // Input: 14 dwords = h[8] | m[16] | t | (block_len, flags),
+                        // each dword two little-endian u32 words.
+                        let mut words = [0u32; 28];
+                        for k in 0..14 {
+                            let dw = memory.load_doubleword(state_addr + (k as u64) * 8)?;
+                            words[2 * k] = dw as u32;
+                            words[2 * k + 1] = (dw >> 32) as u32;
+                        }
+                        let h: [u32; 8] = words[0..8].try_into().unwrap();
+                        let m: [u32; 16] = words[8..24].try_into().unwrap();
+                        let t = (words[24] as u64) | ((words[25] as u64) << 32);
+                        let block_len = words[26];
+                        let flags = words[27];
+
+                        let out = blake3_compress_6round(&h, &m, t, block_len, flags);
+                        for k in 0..8 {
+                            let dw = (out[2 * k] as u64) | ((out[2 * k + 1] as u64) << 32);
+                            memory.store_doubleword(
+                                state_addr + (BLAKE3_OUT_DWORDS + k as u64) * 8,
+                                dw,
+                            )?;
+                        }
+                        src2_val = state_addr;
+                    }
                     SyscallNumbers::Ecsm => {
                         // ECSM(-11): k×G on secp256k1.
                         // x10 = addr to write xR, x11 = addr of xG, x12 = addr of k.
@@ -630,6 +694,10 @@ pub enum ExecutionError {
     UnalignedKeccakStateAddress(u64),
     #[error("Keccak state address range overflows: {0:#018x}")]
     KeccakStateAddressOverflow(u64),
+    #[error("Unaligned BLAKE3 state address: {0:#018x}")]
+    UnalignedBlake3StateAddress(u64),
+    #[error("BLAKE3 state address range overflows: {0:#018x}")]
+    Blake3StateAddressOverflow(u64),
     #[error("ECSM address range overflows the lower 32-bit limb")]
     EcsmAddressOverflow,
     #[error("ECSM xG and k operand ranges overlap")]
@@ -718,4 +786,107 @@ pub fn keccak_f1600(state: &mut [u64; 25]) {
         // ι (iota)
         state[0] ^= rc;
     }
+}
+
+// =============================================================================
+// BLAKE3 6-round compression (internal variant)
+// =============================================================================
+//
+// A Rust port of the validated oracle `thoughts/blake3/blake3-oracle/blake3_ref.py`
+// with `rounds = 6` fixed. This is the **6-round internal variant** — NOT
+// standard BLAKE3 (7 rounds); its security rests on the named 6-round
+// assumption recorded in `thoughts/blake3/blake3-chip/DESIGN.md`. Differentially
+// tested against the oracle's canonical 6-round vectors (pinned in
+// `thoughts/blake3/blake3-oracle/canonical_6round_vectors.json`, themselves
+// validated against the official `blake3` crate).
+
+/// The BLAKE3 IV (identical to SHA-256's initial state). `IV[0..4]` seeds
+/// `v[8..12]` of the compression working state.
+pub const BLAKE3_IV: [u32; 8] = [
+    0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19,
+];
+
+/// The BLAKE3 message-schedule permutation, applied between rounds
+/// (`m'[i] = m[MSG_PERMUTATION[i]]`).
+pub const BLAKE3_MSG_PERMUTATION: [usize; 16] =
+    [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8];
+
+/// Rounds of the internal variant. 6, per the design; standard BLAKE3 is 7.
+pub const BLAKE3_ROUNDS: usize = 6;
+
+/// The BLAKE3 quarter-round G (spec §2.1).
+#[inline]
+fn blake3_g(v: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize, mx: u32, my: u32) {
+    v[a] = v[a].wrapping_add(v[b]).wrapping_add(mx);
+    v[d] = (v[d] ^ v[a]).rotate_right(16);
+    v[c] = v[c].wrapping_add(v[d]);
+    v[b] = (v[b] ^ v[c]).rotate_right(12);
+    v[a] = v[a].wrapping_add(v[b]).wrapping_add(my);
+    v[d] = (v[d] ^ v[a]).rotate_right(8);
+    v[c] = v[c].wrapping_add(v[d]);
+    v[b] = (v[b] ^ v[c]).rotate_right(7);
+}
+
+/// The BLAKE3 compression function `f` at 6 rounds (spec §2.2, oracle §2.4).
+///
+/// State init: `v[0..8] = h`, `v[8..12] = IV[0..4]`, `v[12] = t as u32`,
+/// `v[13] = (t >> 32) as u32`, `v[14] = block_len`, `v[15] = flags`. Six
+/// rounds of 8 G-calls (4 columns then 4 diagonals), permuting the message
+/// schedule between rounds (`r < rounds - 1`, i.e. 5 permutes — the trailing
+/// permute is never consumed). Feed-forward: `out[i] = v[i] ^ v[i+8]`,
+/// `out[i+8] = v[i+8] ^ h[i]`. The truncated chaining value is `out[0..8]`.
+pub fn blake3_compress_6round(
+    h: &[u32; 8],
+    m: &[u32; 16],
+    t: u64,
+    block_len: u32,
+    flags: u32,
+) -> [u32; 16] {
+    let mut v: [u32; 16] = [
+        h[0],
+        h[1],
+        h[2],
+        h[3],
+        h[4],
+        h[5],
+        h[6],
+        h[7],
+        BLAKE3_IV[0],
+        BLAKE3_IV[1],
+        BLAKE3_IV[2],
+        BLAKE3_IV[3],
+        t as u32,
+        (t >> 32) as u32,
+        block_len,
+        flags,
+    ];
+
+    let mut m = *m;
+    for r in 0..BLAKE3_ROUNDS {
+        // Mix the columns.
+        blake3_g(&mut v, 0, 4, 8, 12, m[0], m[1]);
+        blake3_g(&mut v, 1, 5, 9, 13, m[2], m[3]);
+        blake3_g(&mut v, 2, 6, 10, 14, m[4], m[5]);
+        blake3_g(&mut v, 3, 7, 11, 15, m[6], m[7]);
+        // Mix the diagonals.
+        blake3_g(&mut v, 0, 5, 10, 15, m[8], m[9]);
+        blake3_g(&mut v, 1, 6, 11, 12, m[10], m[11]);
+        blake3_g(&mut v, 2, 7, 8, 13, m[12], m[13]);
+        blake3_g(&mut v, 3, 4, 9, 14, m[14], m[15]);
+        // Permute between rounds; the permute after the last round is never
+        // consumed (oracle: `r < rounds - 1`).
+        if r < BLAKE3_ROUNDS - 1 {
+            let prev = m;
+            for (i, &p) in BLAKE3_MSG_PERMUTATION.iter().enumerate() {
+                m[i] = prev[p];
+            }
+        }
+    }
+
+    let mut out = [0u32; 16];
+    for i in 0..8 {
+        out[i] = v[i] ^ v[i + 8];
+        out[i + 8] = v[i + 8] ^ h[i];
+    }
+    out
 }

@@ -22,6 +22,7 @@
 pub mod types;
 
 pub mod bitwise;
+pub mod blake3;
 pub mod branch;
 pub mod bytewise;
 pub mod commit;
