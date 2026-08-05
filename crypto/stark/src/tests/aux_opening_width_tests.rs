@@ -53,6 +53,7 @@ use crate::examples::read_only_memory_logup::{
     LogReadOnlyPublicInputs, LogReadOnlyRAP, read_only_logup_trace,
 };
 use crate::proof::options::ProofOptions;
+use crate::proof::view::StarkProofView;
 use crate::prover::{IsStarkProver, Prover};
 use crate::trace::TraceTable;
 use crate::traits::{AIR, TransitionEvaluationContext};
@@ -455,6 +456,18 @@ fn mis_split_aux_opening_is_rejected() {
         !accepted,
         "the verifier must reject an aux opening wider than the AIR declares",
     );
+
+    // Attribution: the rejection is the width pin's, not an incidental failure
+    // elsewhere in verification. A "rejected" verdict is only evidence if it
+    // comes from the guard under test.
+    assert!(
+        !Verifier::trace_opening_widths_well_formed(
+            &h,
+            StarkProofView::Owned(&proof),
+            h.options().fri_number_of_queries,
+        ),
+        "the rejection above must come from the opening-width guard",
+    );
 }
 
 // =============================================================================
@@ -544,6 +557,18 @@ fn false_memory_read_under_aux_split_is_rejected() {
     assert!(
         !accepted,
         "the verifier must reject a false statement carried by an aux mis-split",
+    );
+
+    // Attribution: the rejection is the width pin's, not an incidental failure
+    // elsewhere in verification. A "rejected" verdict is only evidence if it
+    // comes from the guard under test.
+    assert!(
+        !Verifier::trace_opening_widths_well_formed(
+            &honest_air(),
+            StarkProofView::Owned(&proof),
+            honest_air().options().fri_number_of_queries,
+        ),
+        "the rejection above must come from the opening-width guard",
     );
 
     // -------- the same forgery over the WIRE: rkyv-serialize and verify

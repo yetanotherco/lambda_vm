@@ -9,22 +9,25 @@
 //! evaluations_sym` with no length prefix and no separator.
 //!
 //! That mattered because the three trees are transcript-bound at different
-//! times. In particular, for a **non-preprocessed** AIR the verifier never
-//! absorbs the precomputed root at all, so any column a prover declares
-//! "precomputed" is bound by nothing and can be chosen *after* the round-2
-//! challenges — enough to accept a demonstrably false statement, which
-//! `false_statement_under_split_declaration_is_rejected` exercises end to end.
+//! times. This file covers the **precomputed↔main** term; the main↔aux term —
+//! the LogUp break, and the instance with an executed false statement — lives in
+//! `tests::aux_opening_width_tests`.
 //!
-//! The end-to-end tests here need a hostile prover, simulated by
-//! [`TEST_ONLY_SKIP_PRECOMPUTED_ROOT_ABSORB`]: without it the same proof is
-//! rejected for transcript divergence instead of for its split, which would
-//! prove nothing. The `opening_widths_*` unit tests at the bottom need no such
-//! switch — they call the guard directly on surgically re-split openings, and
-//! cover the `evaluations_sym` slot, which is an independent attack surface.
+//! Two layers, both free of any prover modification:
+//!
+//! * `precomputed_opening_narrower_than_the_air_declares_is_rejected` — end to
+//!   end through `Verifier::verify`, accepted on stock `main`. The prover and
+//!   the verifier's AIR disagree about how many columns the precomputed
+//!   commitment pins, while both absorb the same constant, so the transcripts
+//!   agree and the honest in-repo prover builds the proof.
+//! * `opening_widths_*` — the guard called directly on surgically re-split
+//!   openings. These reach what no end-to-end test can: the `evaluations_sym`
+//!   slot (a separate prover-supplied vector the leaf hash does not pin apart
+//!   from `evaluations`) and the "a non-preprocessed AIR must declare zero
+//!   precomputed columns" direction, whose end-to-end form is masked by
+//!   transcript divergence and so proves nothing on its own.
 
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, MutexGuard};
 
 use crate::config::Commitment;
 use crate::constraints::{
@@ -42,11 +45,9 @@ use crate::proof::options::ProofOptions;
 use crate::proof::stark::StarkProof;
 use crate::proof::view::StarkProofView;
 use crate::prover::{IsStarkProver, Prover};
-use crate::trace::TraceTable;
 use crate::traits::{AIR, TransitionEvaluationContext};
 use crate::verifier::{IsStarkVerifier, Verifier};
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
-use crypto::fiat_shamir::is_transcript::IsTranscript;
 use math::field::element::FieldElement;
 use math::field::goldilocks::GoldilocksField;
 use math::field::traits::IsFFTField;
@@ -56,40 +57,19 @@ type Felt = FieldElement<GoldilocksField>;
 
 const TRACE_LEN: usize = 16;
 
-/// Attacker simulation, read only by the prover's round-1 commit loop under
-/// `#[cfg(test)]`: skip absorbing the precomputed Merkle root. Nothing in the
-/// protocol forces a hostile prover to absorb a root the verifier never reads —
-/// a real attacker simply runs their own prover — but the in-repo prover is
-/// honest, so the tests need this switch to build the proof an attacker would.
-pub static TEST_ONLY_SKIP_PRECOMPUTED_ROOT_ABSORB: AtomicBool = AtomicBool::new(false);
-
-/// The switch is process-global while the test harness runs tests in parallel,
-/// so every test that proves anything takes this lock for its whole body.
-static PROVER_MODE: Mutex<()> = Mutex::new(());
-
-/// A failing test would otherwise poison the mutex and cascade into the rest.
-fn lock_prover_mode() -> MutexGuard<'static, ()> {
-    PROVER_MODE.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-fn set_hostile_prover(hostile: bool) {
-    TEST_ONLY_SKIP_PRECOMPUTED_ROOT_ABSORB.store(hostile, Ordering::SeqCst);
-}
-
-/// `Fibonacci2ColsAIR` with two knobs, both attacker-side:
+/// `Fibonacci2ColsAIR` with two declaration knobs:
 ///
-/// * `split` declares trace column 0 as *precomputed*, so the prover commits it
-///   in a separate Merkle tree. The verifier is handed the `split == false`
-///   instance, whose `is_preprocessed()` branch never absorbs that root.
+/// * `precomputed_columns` — how many leading columns the AIR claims live in the
+///   precomputed tree (0 = not preprocessed). Prover and verifier are handed
+///   instances that disagree about this, which is the whole point.
 /// * `out`, when set, adds a public-output boundary on the last row of column 1.
-///   Since `(a0, a1)` determine the whole trace, a wrong `out` makes the claimed
-///   statement FALSE — that is what turns "an invalid witness is accepted" into
-///   "a false statement is accepted".
+///   Since `(a0, a1)` determine the whole trace, a wrong `out` would make the
+///   claimed statement FALSE.
 pub struct FibonacciSplitAIR<F: IsFFTField> {
     context: AirContext,
     meta: Vec<ConstraintMeta>,
     out: Option<FieldElement<F>>,
-    split: bool,
+    precomputed_columns: usize,
     precomputed_commitment: Commitment,
     phantom: PhantomData<F>,
 }
@@ -109,8 +89,21 @@ impl<F: IsFFTField + Send + Sync + 'static> FibonacciSplitAIR<F> {
         out: Option<FieldElement<F>>,
         commitment: Commitment,
     ) -> Self {
+        Self::preprocessed_declaring(proof_options, out, 1, commitment)
+    }
+
+    /// A preprocessed declaration with an explicit precomputed-column count.
+    /// Handing the verifier a different count than the prover used is how the
+    /// hook-free test below reaches the precomputed term of the guard: both
+    /// sides still absorb the same commitment, so the transcripts agree.
+    fn preprocessed_declaring(
+        proof_options: &ProofOptions,
+        out: Option<FieldElement<F>>,
+        precomputed_columns: usize,
+        commitment: Commitment,
+    ) -> Self {
         let mut air = Self::honest(proof_options, out);
-        air.split = true;
+        air.precomputed_columns = precomputed_columns;
         air.precomputed_commitment = commitment;
         air
     }
@@ -140,7 +133,7 @@ where
             context,
             meta,
             out: None,
-            split: false,
+            precomputed_columns: 0,
             precomputed_commitment: [0u8; 32],
             phantom: PhantomData,
         }
@@ -210,19 +203,17 @@ where
     }
 
     fn is_preprocessed(&self) -> bool {
-        self.split
+        self.precomputed_columns > 0
     }
 
     fn num_precomputed_columns(&self) -> usize {
-        usize::from(self.split)
+        self.precomputed_columns
     }
 
     fn precomputed_commitment(&self) -> Commitment {
         self.precomputed_commitment
     }
 }
-
-type FibProof = StarkProof<F, F, FibonacciPublicInputs<F>>;
 
 fn pub_inputs() -> FibonacciPublicInputs<F> {
     FibonacciPublicInputs {
@@ -231,195 +222,97 @@ fn pub_inputs() -> FibonacciPublicInputs<F> {
     }
 }
 
-/// The transcript state the verifier reaches right before sampling the round-2
-/// challenge, for a single non-preprocessed table with no aux trace: absorb the
-/// main root, then sample. Column 0 lives in the precomputed tree, so it does
-/// not enter here — which is exactly the hole.
-fn challenge_from_main_root(main_root: &Commitment) -> Felt {
-    let mut transcript = DefaultTranscript::<F>::new(&[]);
-    transcript.append_bytes(main_root);
-    transcript.sample_field_element()
-}
-
-/// Build a trace that is NOT a valid 2-column Fibonacci trace but whose
-/// beta-combined transition constraint `c0 + beta*c1` vanishes on every row.
+/// Tripwire. Every break test in this file and in
+/// `tests::aux_opening_width_tests` asserts a *rejection*, and a rejection is
+/// only evidence if it comes from the width pin — a verifier that rejected
+/// everything, or that rejected these proofs for some incidental reason, would
+/// satisfy them just as well. A sibling PoC was once misread exactly that way,
+/// off a worktree whose verifier was not the one being claimed about.
 ///
-/// `c0_i = A_{i+1} - A_i - B_i`, `c1_i = B_{i+1} - B_i - A_{i+1}`, so demanding
-/// `c0_i + beta*c1_i = 0` gives
-/// `A_{i+1} = [A_i + B_i(1 + beta) - beta*B_{i+1}] / (1 - beta)`.
-fn forge_trace(b_col: &[Felt], a0: Felt, beta: &Felt) -> TraceTable<F, F> {
-    let denom = (Felt::one() - beta).inv().expect("beta != 1");
-    let mut a_col = vec![Felt::zero(); b_col.len()];
-    a_col[0] = a0;
-    for i in 0..b_col.len() - 1 {
-        a_col[i + 1] =
-            (&a_col[i] + &b_col[i] * (Felt::one() + beta) - beta * &b_col[i + 1]) * &denom;
-    }
-    TraceTable::from_columns_main(vec![a_col, b_col.to_vec()], 1)
+/// So: the guard must be *defined and called*, not merely present. Deleting the
+/// call site while keeping the function — the plausible bad refactor — fails
+/// here rather than silently turning the whole file green for the wrong reason.
+/// The break tests additionally assert attribution behaviourally, by calling the
+/// guard on the very proof they reject.
+///
+/// (The prosecution PoC pinned a hash of the whole verifier source. That is
+/// right for a throwaway branch and wrong in-repo, where it would break on every
+/// unrelated verifier edit.)
+#[test_log::test]
+fn precheck_the_width_pin_is_compiled_in() {
+    let src = include_str!("../verifier.rs");
+    assert!(
+        src.contains("fn trace_opening_widths_well_formed("),
+        "the opening-width guard is gone from the verifier compiled into this binary",
+    );
+    assert!(
+        src.contains("Self::trace_opening_widths_well_formed("),
+        "the opening-width guard is defined but never called: every rejection \
+         asserted in this file would then be proving something else",
+    );
 }
 
-/// How many rows of the trace violate the real Fibonacci constraints.
-fn violations(trace: &TraceTable<F, F>) -> usize {
-    let cols = trace.columns_main();
-    let (a, b) = (&cols[0], &cols[1]);
-    (0..a.len() - 1)
-        .map(|i| {
-            usize::from(&a[i + 1] - &a[i] - &b[i] != Felt::zero())
-                + usize::from(&b[i + 1] - &b[i] - &a[i + 1] != Felt::zero())
-        })
-        .sum()
-}
-
-/// Attacker-chosen column 1. `b[0]` is pinned by the `a1` boundary; `b[last]` by
-/// the public-output boundary when there is one; everything between is free.
-fn attacker_b_column(a1: Felt, out: Option<Felt>) -> Vec<Felt> {
-    let free = if out.is_some() {
-        TRACE_LEN - 2
-    } else {
-        TRACE_LEN - 1
-    };
-    let mut b = vec![a1];
-    let mut x = Felt::from(987654321u64);
-    for _ in 0..free {
-        x = &x * Felt::from(1442695040u64) + Felt::from(1013904223u64);
-        b.push(x);
-    }
-    b.extend(out);
-    b
-}
-
-/// Prove `trace` against the split declaration, with the hostile prover
-/// (precomputed root never absorbed). Returns the proof a real attacker could
-/// produce for the non-preprocessed AIR.
-fn prove_with_split_declaration(
-    proof_options: &ProofOptions,
-    trace: &TraceTable<F, F>,
-    out: Option<Felt>,
-) -> FibProof {
-    set_hostile_prover(true);
-    let reference = FibonacciSplitAIR::<F>::honest(proof_options, out);
-    let commitment = Prover::compute_precomputed_commitment_for_testing(trace, &reference, 1)
+/// The precomputed term, end to end and **hook-free**: the prover commits ONE
+/// column in the precomputed tree; the verifier's AIR declares TWO. Both sides
+/// absorb the same commitment (the AIR's constant is the tree the prover built),
+/// so the transcripts agree and the honest in-repo prover produces the proof —
+/// no attacker-side prover switch involved.
+///
+/// Stock `main` accepts it: the widths sum to the OOD width and the DEEP
+/// reconstruction reads the same concatenated row either way. What the verifier
+/// is wrong about is *which* columns the hardcoded commitment pins — it believes
+/// two, and only one is in that tree. For a real preprocessed table (bitwise,
+/// decode, keccak_rc) that is the lookup table's own content becoming
+/// prover-supplied. The round-1 root equality is a second line of defence here
+/// only because an honest constant happens to be a root over exactly
+/// `num_precomputed_columns()` columns — nothing states that, and nothing checks
+/// it. This test pins the width directly.
+#[test_log::test]
+fn precomputed_opening_narrower_than_the_air_declares_is_rejected() {
+    let proof_options = ProofOptions::default_test_options();
+    let mut trace = compute_trace([Felt::one(), Felt::one()], TRACE_LEN);
+    let reference = FibonacciSplitAIR::<F>::honest(&proof_options, None);
+    let commitment = Prover::compute_precomputed_commitment_for_testing(&trace, &reference, 1)
         .expect("precomputed commitment");
-    let split_air = FibonacciSplitAIR::<F>::split(proof_options, out, commitment);
-    let mut trace = trace.clone();
-    Prover::prove(
-        &split_air,
+
+    // Prover: one precomputed column, one main column.
+    let prover_air =
+        FibonacciSplitAIR::<F>::preprocessed_declaring(&proof_options, None, 1, commitment);
+    let proof = Prover::prove(
+        &prover_air,
         &mut trace,
         &pub_inputs(),
         &mut DefaultTranscript::<F>::new(&[]),
     )
-    .expect("prove under split declaration")
-}
-
-/// The adaptive forgery: learn the round-2 challenge from a probe run (round 1
-/// binds only column 1), then solve for column 0.
-fn forge_under_split_declaration(proof_options: &ProofOptions, out: Option<Felt>) -> FibProof {
-    let b_col = attacker_b_column(pub_inputs().a1, out);
-    let probe_trace =
-        TraceTable::from_columns_main(vec![vec![Felt::zero(); TRACE_LEN], b_col.clone()], 1);
-    let probe = prove_with_split_declaration(proof_options, &probe_trace, out);
-    let beta = challenge_from_main_root(&probe.lde_trace_main_merkle_root);
-
-    let forged = forge_trace(&b_col, pub_inputs().a0, &beta);
-    assert!(
-        violations(&forged) > 0,
-        "test precondition: the forged trace must violate the real constraints",
-    );
-    let proof = prove_with_split_declaration(proof_options, &forged, out);
-    assert_eq!(
-        proof.lde_trace_main_merkle_root, probe.lde_trace_main_merkle_root,
-        "test precondition: round 1 must not bind column 0, else the attack is not adaptive",
-    );
-    proof
-}
-
-/// The cheapest discriminating case, and not a forgery: an *honest* trace proven
-/// under the split declaration. `origin/main` accepts it against the plain
-/// non-preprocessed AIR, because nothing pins the precomputed/main split of the
-/// openings. Verification must not depend on a width the prover chose.
-#[test_log::test]
-fn honest_trace_under_split_declaration_is_rejected() {
-    let _prover_mode = lock_prover_mode();
-    let proof_options = ProofOptions::default_test_options();
-    let trace = compute_trace([Felt::one(), Felt::one()], TRACE_LEN);
-    let proof = prove_with_split_declaration(&proof_options, &trace, None);
-
-    let honest_air = FibonacciSplitAIR::<F>::honest(&proof_options, None);
-    assert!(!honest_air.is_preprocessed());
+    .expect("prove");
     assert_eq!(
         proof.deep_poly_openings[0]
             .precomputed_trace_polys
             .as_ref()
-            .expect("split proof opens a precomputed tree")
+            .expect("preprocessed proof opens a precomputed tree")
             .evaluations
             .len(),
         1,
-        "test precondition: the proof declares one precomputed column",
+        "test precondition: the proof serves one precomputed column",
     );
 
+    // Verifier: same commitment constant, but the AIR declares two precomputed
+    // columns — so the second is served from the main tree, not the pinned one.
+    let verifier_air =
+        FibonacciSplitAIR::<F>::preprocessed_declaring(&proof_options, None, 2, commitment);
     assert!(
-        !Verifier::verify(&proof, &honest_air, &mut DefaultTranscript::<F>::new(&[])),
-        "Verifier must reject an opening split the AIR does not declare",
+        !Verifier::verify(&proof, &verifier_air, &mut DefaultTranscript::<F>::new(&[])),
+        "Verifier must reject a precomputed opening narrower than the AIR declares",
     );
-}
-
-/// The same split, now carrying an invalid witness chosen *after* the round-2
-/// challenge — the reason the split matters.
-#[test_log::test]
-fn forged_trace_under_split_declaration_is_rejected() {
-    let _prover_mode = lock_prover_mode();
-    let proof_options = ProofOptions::default_test_options();
-    let proof = forge_under_split_declaration(&proof_options, None);
-    let honest_air = FibonacciSplitAIR::<F>::honest(&proof_options, None);
-
+    // Attribution: the rejection is the width pin's, not an incidental failure
+    // elsewhere in verification.
     assert!(
-        !Verifier::verify(&proof, &honest_air, &mut DefaultTranscript::<F>::new(&[])),
-        "Verifier must reject a trace forged against the sampled challenge",
-    );
-}
-
-/// The strongest form: the claimed public output is unreachable from `(a0, a1)`,
-/// so the statement has NO witness at all, and `origin/main` accepts it.
-#[test_log::test]
-fn false_statement_under_split_declaration_is_rejected() {
-    let _prover_mode = lock_prover_mode();
-    let proof_options = ProofOptions::default_test_options();
-    let honest_trace = compute_trace([Felt::one(), Felt::one()], TRACE_LEN);
-    let true_out = honest_trace.columns_main()[1][TRACE_LEN - 1];
-    let claimed_out = Felt::from(999u64);
-    assert_ne!(
-        true_out, claimed_out,
-        "test precondition: the claimed output must be unreachable, else the statement is true",
-    );
-
-    let honest_air = FibonacciSplitAIR::<F>::honest(&proof_options, Some(claimed_out));
-    let proof = forge_under_split_declaration(&proof_options, Some(claimed_out));
-
-    assert!(
-        !Verifier::verify(&proof, &honest_air, &mut DefaultTranscript::<F>::new(&[])),
-        "Verifier must reject a proof of a false statement",
-    );
-}
-
-/// The mirror shape: keep the re-split openings but drop the precomputed root,
-/// so the presence guards see `None`. The reindexed columns still reach the DEEP
-/// reconstruction, so the width check — not the root check — has to reject it.
-#[test_log::test]
-fn precomputed_openings_without_root_are_rejected() {
-    let _prover_mode = lock_prover_mode();
-    let proof_options = ProofOptions::default_test_options();
-    let mut proof = forge_under_split_declaration(&proof_options, None);
-    proof.lde_trace_precomputed_merkle_root = None;
-    assert!(
-        proof.deep_poly_openings[0]
-            .precomputed_trace_polys
-            .is_some()
-    );
-
-    let honest_air = FibonacciSplitAIR::<F>::honest(&proof_options, None);
-    assert!(
-        !Verifier::verify(&proof, &honest_air, &mut DefaultTranscript::<F>::new(&[])),
-        "Verifier must reject precomputed openings the AIR does not declare, root or no root",
+        !Verifier::trace_opening_widths_well_formed(
+            &verifier_air,
+            StarkProofView::Owned(&proof),
+            verifier_air.options().fri_number_of_queries,
+        ),
+        "the rejection above must come from the opening-width guard",
     );
 }
 
@@ -429,8 +322,6 @@ fn precomputed_openings_without_root_are_rejected() {
 /// accepted. A guard that rejected every split would pass every test above.
 #[test_log::test]
 fn honest_preprocessed_proof_still_verifies() {
-    let _prover_mode = lock_prover_mode();
-    set_hostile_prover(false);
     let proof_options = ProofOptions::default_test_options();
     let mut trace = compute_trace([Felt::one(), Felt::one()], TRACE_LEN);
     let reference = FibonacciSplitAIR::<F>::honest(&proof_options, None);
@@ -455,8 +346,6 @@ fn honest_preprocessed_proof_still_verifies() {
 /// Non-vacuity for the plain path: the same AIR without any split declaration.
 #[test_log::test]
 fn honest_non_preprocessed_proof_still_verifies() {
-    let _prover_mode = lock_prover_mode();
-    set_hostile_prover(false);
     let proof_options = ProofOptions::default_test_options();
     let mut trace = compute_trace([Felt::one(), Felt::one()], TRACE_LEN);
     let out = trace.columns_main()[1][TRACE_LEN - 1];
@@ -489,8 +378,6 @@ fn honest_non_preprocessed_proof_still_verifies() {
 type RapProof = StarkProof<F, F, FibonacciRAPPublicInputs<F>>;
 
 fn make_valid_rap_proof() -> (FibonacciRAP<F>, RapProof) {
-    let _prover_mode = lock_prover_mode();
-    set_hostile_prover(false);
     let mut trace = fibonacci_rap_trace([Felt::one(), Felt::one()], TRACE_LEN);
     let proof_options = ProofOptions::default_test_options();
     let pub_inputs = FibonacciRAPPublicInputs {
