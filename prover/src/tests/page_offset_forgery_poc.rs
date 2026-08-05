@@ -105,6 +105,20 @@ struct Forge {
 }
 
 /// How the malicious prover deviates from an honest trace.
+///
+/// **Which of these can be refused at prove time.** `commit_main_trace` rebuilds a
+/// table's preprocessed Merkle tree and compares it to the AIR's commitment, so any
+/// tamper touching a PREPROCESSED column may be rejected before a proof exists —
+/// non-deterministically, because a warm tree cache skips that check (see
+/// `proof_or_prover_refusal`). Tampers touching only main-trace columns cannot be.
+///
+/// - `RepointPrivateRow` rewrites `OFFSET` — preprocessed since the fix. **At risk.**
+/// - `DirectInitOnHonestPage` rewrites `INIT` on an ELF-data page, where the
+///   preprocessed columns are `OFFSET` *and* `INIT`. **At risk.**
+/// - Injecting a duplicate zero page writes only `FINI`. Not at risk.
+/// - No tamper at all. Not at risk.
+///
+/// Anything at risk must go through `proof_or_prover_refusal`, never `.expect(..)`.
 enum Tamper {
     /// Repoint one private-input PAGE row (the hole under test).
     RepointPrivateRow(Forge),
@@ -302,6 +316,39 @@ fn apply_direct_init_tamper(traces: &mut Traces, target_addr: u64, forged: u8) {
     move_are_bytes_multiplicity(traces, (old_init, fini), (forged, fini));
 }
 
+/// Unwrap a crafted proof, or signal that the prover refused to build it.
+///
+/// `None` means `multi_prove` rejected the trace outright. That is a legitimate
+/// outcome for **any tamper that touches a PREPROCESSED column**, and which of the
+/// two layers fires is not deterministic: `commit_main_trace` caches precomputed
+/// Merkle trees keyed by *the expected root* and skips the rebuild check on a hit
+/// (`crypto/stark/src/prover.rs:1161-1170`). Cold cache — a fresh CI runner — the
+/// tree is rebuilt from the tampered column, the root disagrees, and the prover
+/// refuses. Warm cache — a local run that already proved something honest — the
+/// correct cached tree is substituted, the proof is built, and the verifier is left
+/// to reject it. CI failed on exactly this asymmetry.
+///
+/// So a rejection test must accept both. A caller may only `.expect(..)` success
+/// when its tamper touches main-trace columns alone; see `Tamper`.
+fn proof_or_prover_refusal(
+    crafted: Result<VmProof, stark::prover::ProvingError>,
+) -> Option<VmProof> {
+    match crafted {
+        Ok(proof) => Some(proof),
+        Err(e) => {
+            assert!(
+                matches!(
+                    e,
+                    stark::prover::ProvingError::PrecomputedCommitmentMismatch
+                ),
+                "the tampered trace must be refused for its preprocessed commitment, \
+                 not for some unrelated proving error: {e:?}"
+            );
+            None
+        }
+    }
+}
+
 /// Did the verifier accept this proof?
 ///
 /// A rejection now arrives in two shapes: `Ok(false)` when a check inside the
@@ -325,7 +372,8 @@ fn verifier_accepts(proof: &VmProof, elf: &[u8]) -> bool {
 #[test]
 fn poc_control_honest_harness_verifies() {
     let elf = asm_elf_bytes("poc_rodata_commit");
-    let proof = craft_proof(&elf, &elf, &[0u8], None).expect("honest proving must succeed");
+    let proof = craft_proof(&elf, &elf, &[0u8], None)
+        .expect("no tamper at all: every preprocessed column is honest, so proving cannot fail");
     assert_eq!(
         proof.public_output,
         SECRET.to_vec(),
@@ -351,6 +399,8 @@ fn poc_negative_control_forged_run_without_repointed_row_fails() {
     let mut patched = honest.clone();
     patched[file_off] = FORGED_BYTE;
 
+    // No tamper: the forged *run* changes FINI/TIMESTAMP (main trace) but the page's
+    // OFFSET/INIT still come from the honest ELF, so proving cannot fail here.
     let proof = craft_proof(&honest, &patched, &[0u8], None)
         .expect("the patched run still proves; the verifier must be the one to reject it");
     assert_eq!(
@@ -395,19 +445,10 @@ fn forged_private_page_offset_is_rejected() {
         })),
     );
 
-    let proof = match crafted {
-        Err(e) => {
-            assert!(
-                matches!(
-                    e,
-                    stark::prover::ProvingError::PrecomputedCommitmentMismatch
-                ),
-                "the repointed trace must be refused for the OFFSET commitment, not \
-                 for some unrelated proving error: {e:?}"
-            );
-            return;
-        }
-        Ok(proof) => proof,
+    // Repointing rewrites OFFSET, which is preprocessed after the fix, so the
+    // prover may refuse outright — that is a rejection too.
+    let Some(proof) = proof_or_prover_refusal(crafted) else {
+        return;
     };
 
     // Non-vacuity: the proof really does claim the forged byte.
@@ -434,8 +475,14 @@ fn forged_private_page_offset_is_rejected() {
 /// page's preprocessed commitment, which the verifier recomputes from the ELF.
 ///
 /// It is rejected — which is the point: the preprocessed commitment does its
-/// job on ELF-data pages. The private-input page is the sole bypass, precisely
-/// because `VmAirs::new` gives it no commitment at all.
+/// job on ELF-data pages. The private-input page was the sole bypass, precisely
+/// because `VmAirs::new` gave it no commitment at all.
+///
+/// `INIT` is itself a preprocessed column on an ELF-data page (`OFFSET` *and*
+/// `INIT`, `NUM_PREPROCESSED_COLS = 2`), so this tamper can be caught at either
+/// layer — see `proof_or_prover_refusal`. Prover-side refusal is if anything the
+/// cleaner outcome; what the test pins is that the commitment rejects the rewrite,
+/// not which stage notices.
 #[test]
 fn poc_negative_control_direct_init_tamper_on_preprocessed_page_fails() {
     let honest = asm_elf_bytes("poc_rodata_commit");
@@ -443,7 +490,7 @@ fn poc_negative_control_direct_init_tamper_on_preprocessed_page_fails() {
     let mut patched = honest.clone();
     patched[file_off] = FORGED_BYTE;
 
-    let proof = craft_proof(
+    let crafted = craft_proof(
         &honest,
         &patched,
         &[0u8],
@@ -451,8 +498,11 @@ fn poc_negative_control_direct_init_tamper_on_preprocessed_page_fails() {
             target_addr: addr,
             forged: FORGED_BYTE,
         }),
-    )
-    .expect("this tamper leaves OFFSET alone, so the prover still builds it");
+    );
+
+    let Some(proof) = proof_or_prover_refusal(crafted) else {
+        return;
+    };
     assert_eq!(proof.public_output[0], FORGED_BYTE);
 
     assert!(
@@ -663,7 +713,10 @@ fn craft_proof_with_duplicate_page(
         #[cfg(feature = "disk-spill")]
         stark::storage_mode::StorageMode::Ram,
     )
-    .expect("multi_prove");
+    // The injected duplicate page writes only FINI, a main-trace column, and every
+    // page's OFFSET/INIT stays honest — so the preprocessed check cannot fire and
+    // proving is guaranteed to succeed. The rejection is the verifier's to make.
+    .expect("duplicate-page injection touches no preprocessed column");
 
     VmProof {
         proof,
