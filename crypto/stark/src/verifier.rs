@@ -208,17 +208,23 @@ pub trait IsStarkVerifier<
     /// `hash_data_from_slices` streams `evaluations ‖ evaluations_sym` with no
     /// length prefix and no separator, so a leaf can be re-split freely.
     ///
-    /// Both splits are exploitable because each of the three trees is bound to the
-    /// transcript at a *different* time:
+    /// Both splits were exploitable — each demonstrated by a false statement the
+    /// unpinned verifier accepted — because each of the three trees is bound to
+    /// the transcript at a *different* time:
     ///
     /// * **precomputed↔main** — for a non-preprocessed AIR the precomputed root is
     ///   never absorbed at all (only the `is_preprocessed()` branch of round 1
     ///   absorbs it). A prover that moves real trace columns into the "precomputed"
     ///   vector leaves them bound by nothing, samples the round-2 challenges, and
-    ///   then solves for those columns — accepting a false statement.
+    ///   then solves for those columns (`tests::opening_width_tests`).
     /// * **main↔aux** — the aux root is absorbed only in round 1 phase C, *after*
-    ///   the shared LogUp challenges are sampled. A column moved from `main` to
-    ///   `aux` is likewise chosen after seeing challenges it should precede.
+    ///   the shared LogUp challenges. A column moved from `main` to `aux` is
+    ///   chosen after seeing `z`/`alpha`, which collapses LogUp's multiset
+    ///   equality into one scalar equation the prover solves — no fingerprint
+    ///   collision needed, and no prover modification either, since both sides
+    ///   absorb main-root-then-aux-root regardless
+    ///   (`tests::aux_opening_width_tests`). This one reaches the archived
+    ///   (recursion-guest) path too.
     ///
     /// So all three widths are pinned here, once per table, before any opening is
     /// read. `evaluations()` and `evaluations_sym()` are checked independently:
@@ -638,7 +644,13 @@ pub trait IsStarkVerifier<
             _ => false,
         };
 
-        // Auxiliary trace.
+        // Auxiliary trace. This authenticates the opening against the aux root;
+        // it does NOT constrain how many columns that opening has. Nothing here
+        // did, and that was a live break: the aux root is absorbed only after the
+        // shared LogUp challenges, so a prover that moved main columns into the
+        // aux tree got to choose them after seeing `z`/`alpha`
+        // (`tests::aux_opening_width_tests`). The width is pinned upstream by
+        // `trace_opening_widths_well_formed`; do not re-derive it from the proof.
         ok &= match (
             proof.lde_trace_aux_merkle_root(),
             deep_poly_openings.aux_trace_polys(),
