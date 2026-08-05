@@ -46,6 +46,36 @@
 # HWSL-inline bench (#889) was recorded at — it wastes ~8% of the table to
 # padding, so expect it to read slightly slower than 5461 despite being smaller.
 #
+# WHAT THIS SWEEP DOES AND DOES NOT ESTABLISH
+# -------------------------------------------
+# The default points step by 4x in trace size, which shows the TREND — whether
+# throughput is still climbing with size, has plateaued, or has fallen off a
+# memory cliff — but does not locate the optimum. Use --ladder for 2x steps
+# (2^16..2^20 rows) when the peak figure itself is the deliverable.
+#
+# A paired A/B (scripts/bench_abba.sh WORKLOAD=keccak) does NOT need any of
+# this: both sides prove an identical guest at an identical size, so the ratio
+# is valid at whatever N you pick. Only the absolute keccaks/sec headline is
+# size-dependent, and it should always be quoted as "at N=...".
+#
+# The feasible range is bounded above by MEMORY, not by the epoch budget. The
+# guest costs exactly 5.0 cycles per permutation (measured: (5114-164)/990), so
+# a default 2^20-cycle epoch would want ~209,700 permutations = 5.03M rows,
+# padding to 2^23 — about 203 GB of committed keccak_rnd trace before any LDE.
+# Nothing proves that. Committed trace is ~3,028 base cells/row x rows x 8 B:
+#
+#     N        rows(padded)   committed trace
+#     5,461    2^17           3.2 GB
+#     21,845   2^19          12.7 GB
+#     43,690   2^20          25.4 GB     <- near the practical CPU ceiling
+#
+# Peak heap is several times that (LDE + Merkle), so 43690 is the top of the
+# ladder and is left out of the default GPU sweep. Every point here is a SINGLE
+# epoch: continuations are matching the historical methodology, not normalising
+# the size. To measure the production regime — steady-state per-epoch
+# throughput across many epochs — you would need a much smaller
+# --epoch-size-log2 so the run spans epochs at a provable trace size.
+#
 # Usage:
 #   scripts/bench_keccak_throughput.sh [options]
 #
@@ -57,6 +87,8 @@
 #   --epoch-size-log2 K   continuation epoch size (default: CLI default, 20)
 #   --monolithic       prove without continuations (default: single-epoch continuation,
 #                      matching how the keccak numbers were historically recorded)
+#   --ladder           sweep every padding-flush point 2^16..2^20 rows (2x steps),
+#                      for locating the throughput optimum rather than the trend
 #   --cuda | --gpu     build and measure the CUDA prover path
 #   --features LIST    explicit cargo feature list (overrides --cuda's default)
 #   --cli PATH         reuse an already-built cli (e.g. bench_abba.sh's
@@ -96,6 +128,7 @@ SKIP_BUILD=false
 CUDA=false
 FEATURES=""
 CLI_OVERRIDE=""
+LADDER=false
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -107,6 +140,7 @@ while [ $# -gt 0 ]; do
         --csv) CSV="${2:?--csv needs a value}"; shift 2 ;;
         --skip-build) SKIP_BUILD=true; shift ;;
         --cuda|--gpu) CUDA=true; shift ;;
+        --ladder) LADDER=true; shift ;;
         --features) FEATURES="${2:?--features needs a value}"; shift 2 ;;
         --cli) CLI_OVERRIDE="${2:?--cli needs a value}"; shift 2 ;;
         -h|--help) sed -n '2,75p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -123,9 +157,15 @@ done
 # BELOW that and would silently measure the CPU path on a GPU box. The GPU
 # default sweep therefore starts where the GPU actually engages.
 GPU_LDE_THRESHOLD="${LAMBDA_VM_GPU_LDE_THRESHOLD:-524288}"
-if [ -z "$N_LIST" ]; then
+if [ "$LADDER" = true ]; then
+    # Every padding-flush point from 2^16 to 2^20 KECCAK_RND rows: N = 2^k/24.
+    # Steps of 2x instead of the default's 4x, for locating the throughput
+    # optimum rather than just establishing the trend.
+    N_LIST="2730 5461 10922 21845 43690"
+    [ "$CUDA" = true ] && N_LIST="10922 21845 43690"
+elif [ -z "$N_LIST" ]; then
     if [ "$CUDA" = true ]; then
-        N_LIST="10922 21845 43690"
+        N_LIST="10922 21845"
     else
         N_LIST="1365 5000 5461 21845"
     fi
