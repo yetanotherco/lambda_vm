@@ -54,6 +54,21 @@ fn gpu_lde_threshold() -> usize {
     })
 }
 
+/// Test hook: decline the device R2 path unconditionally so device-only
+/// tables exercise the [`materialize_lde_trace_host`] recovery end to end.
+pub(crate) fn gpu_force_downgrade() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var("LAMBDA_VM_GPU_FORCE_DOWNGRADE").is_ok_and(|v| v != "0"))
+}
+
+/// Diagnostic hook: recompute the R2 composition parts and the R3 OOD
+/// evaluations on host after each device dispatch and panic (naming the table
+/// and stage) on any mismatch. Localizes silent device-side corruption.
+pub(crate) fn gpu_xcheck() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var("LAMBDA_VM_GPU_XCHECK").is_ok_and(|v| v != "0"))
+}
+
 /// Incremented by the `try_expand_*` functions per base-field column handed to
 /// the GPU dispatch (an ext3 column counts as 3, one per base component),
 /// before the GPU call. A failed call returns without decrementing it, so it
@@ -1530,6 +1545,41 @@ where
     lde_trace.set_host_data(main_data, aux_data);
     GPU_DEVICE_ONLY_DOWNGRADES.fetch_add(1, Ordering::Relaxed);
     true
+}
+
+/// Diagnostic: download a resident ext3 handle (3-slab layout) as per-column
+/// host Vecs. Used by the xcheck post-mortem to compare the committed R2
+/// parts against a host recompute.
+pub(crate) fn download_ext3_columns<E>(
+    h: &math_cuda::lde::GpuLdeExt3,
+) -> Option<Vec<Vec<FieldElement<E>>>>
+where
+    E: IsField + 'static,
+{
+    if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
+        return None;
+    }
+    let be = math_cuda::device::backend().ok()?;
+    let stream = be.next_stream();
+    h.wait_ready_on(&stream).ok()?;
+    let slabs = stream.clone_dtoh(h.buf.as_ref()).ok()?;
+    stream.synchronize().ok()?;
+    let (m, lde) = (h.m, h.lde_size);
+    if slabs.len() != m * lde * 3 {
+        return None;
+    }
+    let mut cols = Vec::with_capacity(m);
+    for c in 0..m {
+        let mut interleaved = vec![0u64; lde * 3];
+        for k in 0..3 {
+            let slab = &slabs[(c * 3 + k) * lde..(c * 3 + k + 1) * lde];
+            for r in 0..lde {
+                interleaved[r * 3 + k] = slab[r];
+            }
+        }
+        cols.push(u64_to_ext3_vec::<E>(&interleaved));
+    }
+    Some(cols)
 }
 
 pub fn gpu_batch_invert_calls() -> u64 {
