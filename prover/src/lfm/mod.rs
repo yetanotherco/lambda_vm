@@ -16,6 +16,8 @@
 //! three being the production keccak family hosted unchanged (see `airs`).
 
 pub mod airs;
+pub mod blake3;
+pub mod blake3_chip;
 pub mod builder;
 pub mod chips;
 pub mod chunking;
@@ -68,6 +70,8 @@ pub use transcript_replay::{Candidate, TranscriptReplay};
 pub use validator::{LfmViolation, validate};
 pub use word::{LfmWord, base_word, ext_word, pack_digest, unpack_digest};
 
+#[cfg(test)]
+mod blake3_probe;
 #[cfg(test)]
 mod constraint_tests;
 #[cfg(test)]
