@@ -196,9 +196,12 @@ where
     let mut y: FieldElement = Option::from(FieldElement::from_bytes(&y_be.into()))?;
     let y2: FieldElement = y.square();
     // Verify the untrusted root: y² must equal x³+7. Negate `y2`, not `rhs`:
-    // `Neg` is `negate(1)` and only accepts magnitude 1, which `square()` always
-    // returns, whereas `rhs` is a sum and carries magnitude 2 — negating it would
-    // silently compute the wrong value in release, where the debug assert is gone.
+    // `Neg` is `negate(1)`, whose debug assert requires magnitude <= 1. `square()`
+    // always returns magnitude 1, whereas `rhs` is a sum carrying magnitude 2, so
+    // negating it would trip that assert and panic in debug builds. (The value would
+    // still come out right — `negate(m)` computes `2*(m+1)*P_limb - self`, which for a
+    // magnitude-2 operand stays non-negative — so this is a build-configuration
+    // hazard, not a wrong answer.)
     // (`ct_eq` is unusable here for the same reason as in `field_inv`.)
     if !bool::from((rhs + y2.negate(1)).normalizes_to_zero()) {
         return None;

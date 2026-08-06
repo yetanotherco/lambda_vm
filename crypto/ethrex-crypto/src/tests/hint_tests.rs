@@ -5,10 +5,12 @@
 //! inverse / square root, then verifies it in-circuit. These tests inject the
 //! oracle directly — an *honest* oracle (matching the executor's `compute_hint`)
 //! and a *lying* one — and assert the software fallback makes the result identical
-//! either way. That is the property C1 turns on: a bad hint can only make the guest
-//! do more work, never change its accept/reject outcome. On the guest this code is
-//! `cfg(target_arch = "riscv64")`; the `test` gate on `*_with_oracle` is what lets
-//! CI compile and exercise it on the host.
+//! either way. That is the property the whole hint design rests on: because the
+//! prover chooses the hinted bytes and the ecall adds no correctness constraint, a
+//! bad hint must only be able to make the guest do more work, never change its
+//! accept/reject outcome. On the guest this code is `cfg(target_arch = "riscv64")`;
+//! the `test` gate on `*_with_oracle` is what lets CI compile and exercise it on
+//! the host.
 
 use crate::*;
 
@@ -76,6 +78,26 @@ fn scalar_inv_lying_hint_falls_back_to_software() {
 }
 
 #[test]
+fn scalar_inv_canonical_but_wrong_hint_falls_back_to_software() {
+    // The `[0; 32]` / `[0xFF; 32]` lies above both die in `Scalar::from_repr` — they
+    // never reach the verify predicate. These two are perfectly canonical scalars that
+    // simply aren't the inverse, so they exercise the rejecting branch of
+    // `(x * inv) == 1` itself, which is the check that actually has to hold.
+    for k in [1u64, 2, 12345] {
+        let x = Scalar::from(k);
+        let sw = x.invert_vartime().unwrap();
+        for (name, lie) in [("inv + 1", sw + Scalar::ONE), ("-inv", -sw)] {
+            let lie_be: [u8; 32] = lie.to_bytes().into();
+            let got = scalar_inv_with_oracle(&x, |_| lie_be).expect("fallback recomputes");
+            assert_eq!(
+                got, sw,
+                "a canonical-but-wrong hint ({name}) must be rejected and recomputed (k={k})"
+            );
+        }
+    }
+}
+
+#[test]
 fn decompress_r_honest_hint_matches_software() {
     // x-coordinates of real points are guaranteed residues.
     for k in [1u64, 2, 5, 12345] {
@@ -110,6 +132,39 @@ fn decompress_r_lying_hint_falls_back_to_software() {
                 "lying hint must fall back to software (k={k})"
             );
         }
+    }
+}
+
+/// Sqrt oracle returning the *other* root (`−y`). Not a lie: `−y` is as valid a root
+/// of `x³+7` as `y`, so the in-guest verify accepts it and the software fallback
+/// never runs — fixing the sign is entirely on the parity-selection branch.
+fn negated_field_sqrt(rhs_be: &[u8; 32]) -> [u8; 32] {
+    let honest = honest_field_sqrt(rhs_be);
+    let y = Option::<FieldElement>::from(FieldElement::from_bytes(&honest.into()))
+        .expect("the honest root is canonical");
+    (-y).normalize().to_bytes().into()
+}
+
+#[test]
+fn decompress_r_negated_sqrt_hint_recovers_the_point() {
+    // The hinted root's parity is the host's choice — `compute_hint` returns whichever
+    // root k256's `sqrt()` picks, so the caller must not depend on it. With the honest
+    // oracle the parity branch fires only for the `k` values whose root happens to have
+    // the wrong parity; forcing the negation exercises the *other* half of the branch
+    // for every `k`. A `Some` here comes from the hinted path, not the fallback, so a
+    // broken parity fix would return `-P` and fail the comparison.
+    for k in [1u64, 2, 5, 12345] {
+        let p = (ProjectivePoint::GENERATOR * Scalar::from(k)).to_affine();
+        let (x, y) = affine_xy(&p).unwrap();
+        let rb = x.to_bytes();
+        let y_is_odd = (y.normalize().to_bytes()[31] & 1) == 1;
+        let got = decompress_r_with_oracle(&rb, y_is_odd, negated_field_sqrt)
+            .expect("the other root is still a root");
+        assert_eq!(
+            sec1(&got),
+            sec1(&p),
+            "a negated (but valid) root must still recover the point (k={k})"
+        );
     }
 }
 
@@ -183,6 +238,32 @@ fn field_inv_lying_hint_falls_back_to_software() {
                 got.normalize().to_bytes(),
                 sw.normalize().to_bytes(),
                 "lying hint must fall back to the software inverse (k={k})"
+            );
+        }
+    }
+}
+
+#[test]
+fn field_inv_canonical_but_wrong_hint_falls_back_to_software() {
+    // As in the scalar case: the `[0; 32]` / `[0xFF; 32]` lies die in
+    // `FieldElement::from_bytes`, so they never reach the verify predicate. These two
+    // parse cleanly and are simply not the inverse, exercising the rejecting branch of
+    // `x·inv − 1 == 0` — the check the fast path's soundness actually rests on.
+    for k in [1u64, 2, 12345] {
+        let x = fe_from_u64(k);
+        let sw = Option::<FieldElement>::from(x.invert())
+            .unwrap()
+            .normalize();
+        for (name, lie) in [
+            ("inv + 1", (sw + FieldElement::ONE).normalize()),
+            ("-inv", -sw),
+        ] {
+            let lie_be: [u8; 32] = lie.normalize().to_bytes().into();
+            let got = field_inv_with_oracle(&x, |_| lie_be).expect("fallback recomputes");
+            assert_eq!(
+                got.normalize().to_bytes(),
+                sw.to_bytes(),
+                "a canonical-but-wrong hint ({name}) must be rejected and recomputed (k={k})"
             );
         }
     }
