@@ -1378,3 +1378,88 @@ unratified. Nothing here ratifies it; this leg prices the AIR.
   byte-oriented family at ~71 GiB and an algebraic family at ~4–8 GiB — with the
   byte-oriented family holding the only real in-AIR measurements and a shipped
   production existence proof, and the algebraic family holding the size.
+
+### 8.11 ★ Reconciliation against `hash-delegation-eval.md` §3.1 / §4.1
+
+Requested by the team lead, who put the byteswap's CELL share near ~50% against
+the eval's instruction-derived 88–93%. **Both figures are right, about different
+quantities, and the whole gap is a padding term neither included.**
+
+```
+byteswap share of the residue, UNPADDED closed form   903,326,725 = 51.38%   <- the ~50% estimate
+byteswap share of the residue, PADDING-AWARE        1,684,910,080 = 95.84%   <- what the machine pays
+padding multiplier on the gadget                                    1.865x
+```
+
+The gadget is what DRIVES `LFM_BALU` to 2²⁷ (71,974,504 real rows) and
+`LFM_BITDEC` to 2²¹ (1,124,295 real rows), so removing it does not remove
+`rows × width` — it removes two padded power-of-two tables. The team lead's
+"`BALU` rows are cheap at 10 base-equiv" is correct and is exactly why the
+unpadded number is ~50 %; what it misses is (a) the gadget's other half,
+`LFM_BITDEC`, at **165** base-equiv per row — 20 % of the unpadded cost from 1.6 %
+of the rows — and (b) the padding. **The measurement is the padding-aware one: a
+machine that does not byteswap does not build those tables at all.**
+
+Item by item against the eval's own numbers:
+
+| eval claim | MEASURED | verdict |
+|---|---|---|
+| §3.1 byteswap = 88–93 % of residue | **95.84 %** (cells) | eval LOW by 3–8 pts, right conclusion |
+| §3.1 `R_native` = 0.024–0.20 B, central 0.059 B | **0.073 B** (73,072,788) | **inside the band**, 24 % above central |
+| §3.1 "residue collapses ~10–70×, central ~30×" | **24.1×** | inside the band |
+| §4.1 Poseidon in-trace + `R_native` = 0.145–0.32 B, c. **0.18 B** | **0.195 B** | **✅ SURVIVES**, 8 % above central |
+| §4.1 BLAKE3-6 in-trace + `R_native` = 1.06–1.24 B, c. **1.10 B** | **2.752 B** | **❌ DOES NOT SURVIVE as built — 2.5× out** |
+| §4.1 hosted chip "should land near ~5,150 (≈3 % lower)" | **4,946 (7.0 % lower)** | direction right, magnitude 2.3× understated |
+| §4.1 BLAKE3 hash cells 1,040,064,768 | **967,402,978** | −7.0 %, follows from the line above |
+| §3.1 open: "does an LFM-hosted BLAKE3 chip shed the byteswap? It should" | **NO** | ❌ **the unfavourable answer** |
+
+**Why blake does not shed it, and it is not an implementation choice I made.**
+The chip consumes machine words of four `u32` lanes — the `LFM_KECCAK` convention
+— and `u32` halves are precisely what `felt_be_halves` produces. The gadget is
+UPSTREAM of the chip's input format, so hosting the chip cannot delete it. Blake
+therefore pays the byte-oriented residue AND keeps `BITWISE`.
+
+**But the eval's 1.10 B is recoverable, and the convergence is exact.** A variant
+that receives full 64-bit felts and decomposes them to bytes inside its own
+constraints does shed the gadget. It needs one thing the eval's sketch omits: a
+**canonicity gate per absorbed felt**. `Σ byteₖ·256ᵏ = v` over the field does NOT
+pin the byte string — `v` and `v + p` both satisfy it — so without a `< p`
+argument the prover chooses what gets absorbed and Fiat–Shamir breaks. (That is
+why `felt_be_halves` routes through `bit_dec`, whose doc says outright: "`bit_dec`
+also enforces canonicity (`< p`) … production renders `canonical_u64()`" —
+VERIFIED, `transcript_replay.rs:735-736`.) A borrow-chain `< p` gate at degree 3
+is small against a 3,056-column chip; at my ESTIMATE of ~156 extra base-equiv per
+compression (8 absorbed felts × ~20):
+
+```
+felt-absorbing BLAKE3 (ESTIMATE, UNBUILT): 5,102/compression + R_native + BITWISE
+                                         = 1,097,202,674 = 1.097 B, 10.2x, ~30 GiB
+eval §4.1 central                        = 1.10 B
+```
+
+**So the 2.5× discrepancy is not an arithmetic disagreement — it is precisely the
+value of the unbuilt felt-absorbing variant, ≈1.65 B.** The eval priced a design;
+I measured the one that exists. Both numbers should be carried, labelled.
+
+⚠ **I did not build it, and the reason is a cryptographic decision, not effort.**
+The input side is engineering; the OUTPUT side is not. A blake output word is 32
+bits, so a felt built from 8 output bytes is a 64-bit value reduced mod `p` and
+the map is not injective. How a blake digest becomes felts — truncate to four
+`u32`s, reduce, domain-separate — changes the security argument, the digest
+width, and the token count. That is the ecosystem's call, the same boundary
+§6.1/§7.7 draw around Poseidon's parameters and `compress_iv`.
+
+**Net effect on the eval's verdict.** Its §4.1 conclusion strengthens rather than
+weakens: the field VM's fully-delegated floor is `R_native` + the stub, measured
+at **0.073 B + ~7.7 M ≈ 0.081 B** against its predicted 0.067 B central — and its
+"delegation's field-side win over a field-native algebraic hash is 0.113 B / 63 %"
+becomes **0.195 − 0.081 = 0.114 B / 58 %**, i.e. essentially unchanged. What
+changes is the in-trace blake row it is competing against, and only for the
+variant nobody has built.
+
+⚠ And one finding of mine that bears directly on the eval's scheme (§8.7):
+**delegation as a SEPARATE PROOF is a net loss of +66 % on this machine.** The LFM
+has no fixed-size main circuit to escape — every chip's height is program shape —
+so its multi-AIR proof already IS the delegation pattern, and a second proof only
+adds a verification whose leaf term is large precisely because a delegated hash
+chip is wide.
