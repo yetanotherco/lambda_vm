@@ -178,7 +178,7 @@ proptest! {
     #[test]
     fn dma_memset_matches_reference_fill(
         dst_offset in 0usize..64,
-        count in 0usize..200,
+        count in 0usize..=DMA_MEMCPY_MAX_BYTES as usize,
         fill in 0u8..=255,
     ) {
         const BASE: u64 = 0x9000;
