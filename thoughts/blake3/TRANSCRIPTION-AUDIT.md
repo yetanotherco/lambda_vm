@@ -124,7 +124,10 @@ UNSAT (pinned), dropped → SAT (forgeable mod p). Same class, now demonstrated 
   Correctly documented as gate-invisible (no bus layer).
 - **Finding 2 ("covers every G" is a model argument) — FIX REAL.** §7.11 records it;
   the positive controls do run the full 48-instance pipeline concretely, and this audit's
-  per-instance index mutant + the `--full` monolithic UNSATs (§6) back it.
+  per-instance index mutant backs it. (Superseded in part: this bullet originally also
+  cited the `--full` monolithic UNSATs as backing. They were run on 2026-08-06 and came
+  back `unknown` on all four queries — see §6 — so they support nothing either way. The
+  argument rests on the concrete positive controls and the index mutant.)
 - **Finding 3 (carry encoding ambiguity `(1,0)`/`(0,1)`) — correctly classified
   harmless.** The sum identity constrains only `c1+c2`; `s` is pinned regardless.
 - **Harness defect #1 (banner overstatement) — FIX REAL.** The banner now reads from
@@ -139,8 +142,38 @@ UNSAT (pinned), dropped → SAT (forgeable mod p). Same class, now demonstrated 
 
 - default (`z3_blake_verify.py`), z3 5.0.0: **OVERALL: PASS** (board identical to §9 of
   DESIGN.md).
-- `--full` (monolithic symbolic round / rounds=2 / 6-round / 7-round UNSATs):
-  **PENDING — fill in when the background run completes.**
+- `--full` (monolithic symbolic round / rounds=2 / 6-round / 7-round UNSATs), run
+  2026-08-06: **ATTEMPTED-INCONCLUSIVE — no pass, and no counterexample.** The run took
+  ~145 min and exited 1 (`OVERALL: FAIL`), but all four monolithic queries returned
+  `unknown`, not `sat`:
+
+  ```
+    round (clean) -> unknown   (want unsat)
+    compress rounds=2 -> unknown   (want unsat)
+    compress rounds=6 -> unknown   (want unsat)
+    compress rounds=7 -> unknown   (want unsat)
+  ```
+
+  `unknown` is z3's resource-limit return (`s.set("timeout", timeout_ms)` then
+  `s.check()`, `z3_blake_verify.py:320-321`/`:340-341`); the verdict tests `== unsat`
+  (line 553), so a timeout is scored `False` and pulls OVERALL to FAIL. The four
+  budgets sum to 140 min against ~145 min wall, i.e. every check burned its full
+  allowance. **Nothing was disproven; nothing was proven monolithically.** The fast
+  board is unchanged and green:
+
+  ```
+    G-function UNSAT (covers all G)   : True
+    init+feed-forward UNSAT (rounds=0): True
+    negative controls all SAT         : True
+    positive controls all SAT         : True   (full 6-/7-round pipeline, concrete)
+  ```
+
+  Consequence for §5's Finding 2 above: the "`--full` monolithic UNSATs (§6)" cited
+  there as backing the per-instance coverage argument did **not** land, so that
+  argument currently rests on the concrete positive controls and the per-instance
+  index mutant alone. Remediation: rerun with a much larger timeout budget on a
+  server (single-threaded, CPU-bound), and/or restructure the monolithic query as
+  round-by-round induction.
 
 ## §6b — Reconciliation with the second, independent audit (`audit_gate_transcription.py`)
 

@@ -60,6 +60,39 @@ vectors + the e2e bus-balance gate check.
 - the z3 gate (`z3_blake_verify.py`) proves the *design*; the transcription
   design → Rust is covered by the vectors + e2e, per the gate's own
   documentation of what it cannot see (§7 items 4, 5, 11).
+- **`--full` monolithic UNSATs, run 2026-08-06: ATTEMPTED-INCONCLUSIVE, not
+  satisfied.** `z3_blake_verify.py --full` ran ~145 min and exited 1
+  (`OVERALL: FAIL`). All four monolithic queries hit z3's resource limit:
+
+  ```
+    round (clean) -> unknown   (want unsat)
+    compress rounds=2 -> unknown   (want unsat)
+    compress rounds=6 -> unknown   (want unsat)
+    compress rounds=7 -> unknown   (want unsat)
+  ```
+
+  `unknown` is the timeout return — the checks `s.set("timeout", timeout_ms)`
+  then `return s.check()` (`z3_blake_verify.py:320-321`, `:340-341`), and the
+  verdict tests `== unsat` (line 553), so a timeout scores `False` and drags
+  OVERALL to FAIL. Timing corroborates a clean sweep of timeouts: the budgets
+  are 30+30+40+40 = 140 min against ~145 min wall. **No counterexample was
+  found — nothing was disproven — but no monolithic UNSAT was obtained
+  either.** The fast board is unchanged and fully green:
+
+  ```
+    G-function UNSAT (covers all G)   : True
+    init+feed-forward UNSAT (rounds=0): True
+    negative controls all SAT         : True
+    positive controls all SAT         : True   (full 6-/7-round pipeline, concrete)
+  ```
+
+  DESIGN.md §7 item 11's "run `--full`'s monolithic UNSAT before shipping
+  Rust" precondition is therefore **attempted but not satisfied**; the
+  coverage of the 48 unrolled G instances still rests on the concrete
+  positive controls plus the per-instance index mutant, which do pass.
+  Remediation: rerun with a much larger timeout budget on a server (the run
+  is single-threaded and CPU-bound), and/or restructure the monolithic query
+  as round-by-round induction instead of one flat bit-vector problem.
 
 ## Known costs and open items
 
