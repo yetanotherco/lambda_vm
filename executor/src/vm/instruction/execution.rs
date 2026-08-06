@@ -12,6 +12,8 @@ pub enum SyscallNumbers {
     KeccakPermute = 0,
     Print = 1,
     Panic = 2,
+    // Placeholder discriminant. The actual syscall value is KECCAK_ABSORB_SYSCALL_NUMBER.
+    KeccakAbsorbBlocks = 4,
     Commit = 64,
     Halt = 93,
     // Placeholder discriminant. The actual syscall value is ECSM_SYSCALL_NUMBER.
@@ -26,6 +28,35 @@ pub enum SyscallNumbers {
 /// Cannot be an enum discriminant because it exceeds isize::MAX.
 pub const KECCAK_SYSCALL_NUMBER: u64 = u64::MAX - 1;
 const KECCAK_STATE_BYTES: u64 = 25 * 8;
+
+/// Syscall number for the keccak sponge-absorb accelerator
+/// (spec ECALL `-4`; as unsigned that is `u64::MAX - 3 = 0xFFFF_FFFF_FFFF_FFFC`).
+///
+/// ABI:
+/// - `x10` (a0) = 8-byte-aligned pointer to the 200-byte keccak state, updated
+///   in place;
+/// - `x11` (a1) = 8-byte-aligned pointer to `n_blocks × 136` bytes of message
+///   data (whole rate blocks only — the guest keeps the final `10*1`-padded
+///   partial block on the classic per-permutation syscall);
+/// - `x12` (a2) = `n_blocks` (must be non-zero).
+///
+/// Semantics per block `k`: `state[0..17] ^= block_k` (lanewise little-endian
+/// dwords), then `keccak_f1600(state)`. Lanes 17..25 are untouched by the XOR.
+///
+/// Preconditions (rejected with an [`ExecutionError`] otherwise):
+/// - both pointers 8-aligned, `n_blocks > 0`;
+/// - neither region's LAST byte overflows `u64` **or** its lower 32-bit
+///   address limb (the prover models per-dword addresses as
+///   `base_lo + offset` without a carry into the high limb, exactly like the
+///   ECSM operands);
+/// - the state and data regions are disjoint (the trace builder issues all
+///   message reads and the state read at the ecall's timestamp; an overlap
+///   would put two MEMW ops on one `(address, timestamp)` pair, which the
+///   memory argument cannot order — same rationale as the ECSM operand
+///   overlap guard).
+pub const KECCAK_ABSORB_SYSCALL_NUMBER: u64 = u64::MAX - 3;
+/// Keccak rate in bytes for the absorb accelerator: 17 lanes × 8 bytes.
+pub const KECCAK_RATE_BYTES: u64 = 17 * 8;
 
 /// Syscall number for the ECSM (elliptic-curve scalar multiply) accelerator.
 ///
@@ -87,6 +118,7 @@ impl TryFrom<u64> for SyscallNumbers {
             64 => Ok(SyscallNumbers::Commit),
             93 => Ok(SyscallNumbers::Halt),
             v if v == KECCAK_SYSCALL_NUMBER => Ok(SyscallNumbers::KeccakPermute),
+            v if v == KECCAK_ABSORB_SYSCALL_NUMBER => Ok(SyscallNumbers::KeccakAbsorbBlocks),
             v if v == ECSM_SYSCALL_NUMBER => Ok(SyscallNumbers::Ecsm),
             v if v == HINT_SYSCALL_NUMBER => Ok(SyscallNumbers::Hint),
             _ => Err(()),
@@ -98,6 +130,7 @@ impl TryFrom<u64> for SyscallNumbers {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Accelerator {
     Keccak,
+    KeccakAbsorb,
     Ecsm,
 }
 
@@ -108,6 +141,7 @@ impl SyscallNumbers {
     pub fn accelerator(self) -> Option<Accelerator> {
         match self {
             SyscallNumbers::KeccakPermute => Some(Accelerator::Keccak),
+            SyscallNumbers::KeccakAbsorbBlocks => Some(Accelerator::KeccakAbsorb),
             SyscallNumbers::Ecsm => Some(Accelerator::Ecsm),
             SyscallNumbers::Print
             | SyscallNumbers::Panic
@@ -185,11 +219,14 @@ pub fn compute_hint(hint_id: u64, in_be: &[u8; 32]) -> [u8; 32] {
     }
 }
 
-/// Checks that a 32-byte operand does not overflow its lower 32-bit address limb:
-/// `(addr mod 2^32) + max_offset < 2^32`. Tables that send an address to the memory
-/// bus as a `[lo32, hi32]` pair with the per-access offset added to `lo32` alone
-/// cannot represent a carry into `hi32`, so an operand straddling the limb boundary
-/// makes the trace unprovable. Used by the ECSM and Hint ecalls.
+/// Checks an accelerator operand's low-limb room: `(addr mod 2^32) + max_offset < 2^32`.
+///
+/// Tables that send an address to the memory bus as a `[lo32, hi32]` pair model
+/// per-access addresses as `base_lo + offset` with `base_hi` unchanged — they
+/// cannot represent a carry into the high limb — so the whole operand must fit
+/// inside its low 32-bit limb, or the trace is unprovable. `max_offset` is the
+/// offset of the region's LAST byte. Used by the ECSM, Hint and keccak
+/// sponge-absorb ecalls.
 fn addr_limb_ok(addr: u64, max_offset: u64) -> bool {
     (addr % LOW_LIMB) + max_offset < LOW_LIMB
 }
@@ -517,6 +554,75 @@ impl Instruction {
                         }
                         src2_val = state_addr;
                     }
+                    SyscallNumbers::KeccakAbsorbBlocks => {
+                        // Keccak sponge absorb (see KECCAK_ABSORB_SYSCALL_NUMBER):
+                        // x10 = state (200 bytes, in place), x11 = message data
+                        // (n_blocks × 136 bytes), x12 = n_blocks.
+                        let state_addr = registers.read(10)?;
+                        let data_addr = registers.read(11)?;
+                        let n_blocks = registers.read(12)?;
+
+                        if !state_addr.is_multiple_of(8) {
+                            return Err(ExecutionError::UnalignedKeccakAbsorbStateAddress(
+                                state_addr,
+                            ));
+                        }
+                        if !data_addr.is_multiple_of(8) {
+                            return Err(ExecutionError::UnalignedKeccakAbsorbDataAddress(
+                                data_addr,
+                            ));
+                        }
+                        if n_blocks == 0 {
+                            return Err(ExecutionError::KeccakAbsorbZeroBlocks);
+                        }
+                        // Bound the LAST byte of each region (state: +199; data:
+                        // +n·136 − 1), both against u64 overflow and against the
+                        // low-limb room the chip's linear addressing needs.
+                        let state_end = state_addr
+                            .checked_add(KECCAK_STATE_BYTES - 1)
+                            .ok_or(ExecutionError::KeccakAbsorbStateAddressOverflow(state_addr))?;
+                        let data_len = n_blocks
+                            .checked_mul(KECCAK_RATE_BYTES)
+                            .ok_or(ExecutionError::KeccakAbsorbDataAddressOverflow(data_addr))?;
+                        let data_end = data_addr
+                            .checked_add(data_len - 1)
+                            .ok_or(ExecutionError::KeccakAbsorbDataAddressOverflow(data_addr))?;
+                        if !addr_limb_ok(state_addr, KECCAK_STATE_BYTES - 1)
+                            || !addr_limb_ok(data_addr, data_len - 1)
+                        {
+                            return Err(ExecutionError::KeccakAbsorbAddressOverflow);
+                        }
+                        // The regions must be disjoint: the trace builder reads
+                        // the state and every message dword at the ecall's
+                        // timestamp, so an overlap would put two MEMW ops on one
+                        // (address, timestamp) pair, which the memory-consistency
+                        // argument cannot order (same rationale as the ECSM
+                        // operand-overlap guard — provability, not correctness).
+                        // Compare via the (overflow-checked) inclusive end bytes.
+                        if state_addr <= data_end && data_addr <= state_end {
+                            return Err(ExecutionError::KeccakAbsorbOperandOverlap);
+                        }
+
+                        let mut state = [0u64; 25];
+                        for (i, lane) in state.iter_mut().enumerate() {
+                            *lane = memory.load_doubleword(state_addr + (i as u64) * 8)?;
+                        }
+                        for k in 0..n_blocks {
+                            let block_base = data_addr + k * KECCAK_RATE_BYTES;
+                            for (j, lane) in state.iter_mut().take(17).enumerate() {
+                                *lane ^= memory.load_doubleword(block_base + (j as u64) * 8)?;
+                            }
+                            keccak_f1600(&mut state);
+                        }
+                        for (i, &lane) in state.iter().enumerate() {
+                            memory.store_doubleword(state_addr + (i as u64) * 8, lane)?;
+                        }
+                        // Carry state_addr/data_addr in the CPU log; n_blocks is
+                        // recovered from x12 by the trace builder's register-read
+                        // path (like the ECSM operand addresses).
+                        src2_val = state_addr;
+                        dst_val = data_addr;
+                    }
                     SyscallNumbers::Ecsm => {
                         // ECSM(-11): k×G on secp256k1.
                         // x10 = addr to write xR, x11 = addr of xG, x12 = addr of k.
@@ -762,6 +868,20 @@ pub enum ExecutionError {
     UnalignedKeccakStateAddress(u64),
     #[error("Keccak state address range overflows: {0:#018x}")]
     KeccakStateAddressOverflow(u64),
+    #[error("Unaligned Keccak-absorb state address: {0:#018x}")]
+    UnalignedKeccakAbsorbStateAddress(u64),
+    #[error("Unaligned Keccak-absorb data address: {0:#018x}")]
+    UnalignedKeccakAbsorbDataAddress(u64),
+    #[error("Keccak-absorb called with n_blocks = 0")]
+    KeccakAbsorbZeroBlocks,
+    #[error("Keccak-absorb state address range overflows: {0:#018x}")]
+    KeccakAbsorbStateAddressOverflow(u64),
+    #[error("Keccak-absorb data address range overflows: {0:#018x}")]
+    KeccakAbsorbDataAddressOverflow(u64),
+    #[error("Keccak-absorb operand range overflows the lower 32-bit address limb")]
+    KeccakAbsorbAddressOverflow,
+    #[error("Keccak-absorb state and data regions overlap")]
+    KeccakAbsorbOperandOverlap,
     #[error("ECSM address range overflows the lower 32-bit limb")]
     EcsmAddressOverflow,
     #[error("ECSM xG and k operand ranges overlap")]
