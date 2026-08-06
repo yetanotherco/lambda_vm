@@ -1602,6 +1602,7 @@ pub trait IsStarkProver<
         let mut precomputed_parts: Option<Vec<Vec<FieldElement<FieldExtension>>>> = None;
         #[cfg(feature = "cuda")]
         if number_of_parts == 2
+            && !crate::gpu_lde::gpu_force_downgrade()
             && let Some(h_dev) = evaluator.evaluate_dev(
                 air,
                 &round_1_result.lde_trace,
@@ -1654,6 +1655,17 @@ pub trait IsStarkProver<
             // where the handles themselves cannot serve the data.
             let recovered =
                 crate::gpu_lde::materialize_lde_trace_host(&mut round_1_result.lde_trace);
+            if recovered {
+                // Rare by design; the name tells which condition the gate is
+                // missing so it can be mirrored as an optimization.
+                eprintln!(
+                    "[gpu] device-only downgrade: table={} n={} num_parts={} \
+                     (device R2 path declined; continuing on host)",
+                    air.name(),
+                    trace_length,
+                    number_of_parts,
+                );
+            }
             assert!(
                 recovered,
                 "R2 composition fell back to the host evaluator on a device-only \
@@ -1749,6 +1761,7 @@ pub trait IsStarkProver<
             #[cfg(not(feature = "cuda"))]
             cpu_eval()?
         };
+
         #[cfg(feature = "instruments")]
         let fft_dur = t_sub.elapsed();
 
@@ -3799,6 +3812,370 @@ pub trait IsStarkProver<
     // TODO: propagate errors instead of unwrap() in open_deep_composition_poly and FRI operations
     /// Executes rounds 2-4 and generates a STARK proof for the trace `main_trace` with public inputs `pub_inputs`.
     /// Warning: the transcript must be safely initialized before passing it to this method.
+    /// Diagnostic (see `gpu_lde::gpu_xcheck`): the verifier's step-2
+    /// composition consistency check run in-process on the freshly computed
+    /// R3 values — H(z) reconstructed from the trace OOD evaluations must
+    /// match the folded parts OOD. Near-zero cost (one constraint evaluation
+    /// at a single point), so it can run on every table without disturbing
+    /// the timing that provokes VRAM-pressure bugs. Mirrors
+    /// `step_2_verify_claimed_composition_polynomial` in `verifier.rs`.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    fn composition_ood_consistent(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        pub_inputs: &PI,
+        domain: &Domain<Field>,
+        rap_challenges: &[FieldElement<FieldExtension>],
+        bus_public_inputs: Option<&BusPublicInputs<FieldExtension>>,
+        transition_coefficients: &[FieldElement<FieldExtension>],
+        boundary_coefficients: &[FieldElement<FieldExtension>],
+        z: &FieldElement<FieldExtension>,
+        trace_ood: &Table<FieldExtension>,
+        parts_ood: &[FieldElement<FieldExtension>],
+    ) -> bool {
+        use crate::lookup::{LOGUP_CHALLENGE_ALPHA, compute_alpha_powers};
+        use crate::traits::TransitionEvaluationContext;
+
+        let trace_length = domain.interpolation_domain_size;
+        let boundary_constraints =
+            air.boundary_constraints(pub_inputs, rap_challenges, bus_public_inputs, trace_length);
+        let mut step_to_point: std::collections::HashMap<usize, FieldElement<Field>> =
+            std::collections::HashMap::new();
+        let boundary_points: Vec<FieldElement<Field>> = boundary_constraints
+            .constraints
+            .iter()
+            .map(|c| {
+                step_to_point
+                    .entry(c.step)
+                    .or_insert_with(|| domain.trace_primitive_root.pow(c.step as u64))
+                    .clone()
+            })
+            .collect();
+
+        let main_trace_width = air.trace_layout().0;
+        let ood_row = trace_ood.get_row(0);
+        let (nums, mut dens): (
+            Vec<FieldElement<FieldExtension>>,
+            Vec<FieldElement<FieldExtension>>,
+        ) = boundary_constraints
+            .constraints
+            .iter()
+            .zip(&boundary_points)
+            .map(|(c, point)| {
+                let column_idx = if c.is_aux {
+                    main_trace_width + c.col
+                } else {
+                    c.col
+                };
+                (-&c.value + &ood_row[column_idx], -point + z)
+            })
+            .unzip();
+        if FieldElement::inplace_batch_inverse(&mut dens).is_err() {
+            return false;
+        }
+        let boundary_sum: FieldElement<FieldExtension> = nums
+            .iter()
+            .zip(&dens)
+            .zip(boundary_coefficients)
+            .map(|((num, den), beta)| num * den * beta)
+            .fold(FieldElement::zero(), |acc, x| acc + x);
+
+        let Some(num_main_trace_columns) =
+            trace_ood.width.checked_sub(air.num_auxiliary_rap_columns())
+        else {
+            return false;
+        };
+        let logup_alpha_powers: Vec<FieldElement<FieldExtension>> =
+            if rap_challenges.len() > LOGUP_CHALLENGE_ALPHA {
+                compute_alpha_powers(
+                    &rap_challenges[LOGUP_CHALLENGE_ALPHA],
+                    air.max_bus_elements(),
+                )
+            } else {
+                Vec::new()
+            };
+        let logup_table_offset = match bus_public_inputs {
+            Some(bpi) => {
+                let n = FieldElement::<Field>::from(trace_length as u64);
+                match n.inv() {
+                    Ok(n_inv) => n_inv * &bpi.table_contribution,
+                    Err(_) => return false,
+                }
+            }
+            None => FieldElement::zero(),
+        };
+
+        // Frame over the OOD grid, mirroring `StarkTableView::into_frame`
+        // (that view carries rkyv bounds this generic context lacks).
+        let step_size = air.step_size();
+        debug_assert!(trace_ood.height.is_multiple_of(step_size));
+        let steps: Vec<crate::table::TableView<FieldExtension, FieldExtension>> = (0..trace_ood
+            .height)
+            .step_by(step_size)
+            .map(|initial| {
+                let mut main = Vec::new();
+                let mut aux = Vec::new();
+                for row_idx in initial..initial + step_size {
+                    let row = trace_ood.get_row(row_idx);
+                    main.push(row[..num_main_trace_columns].to_vec());
+                    aux.push(row[num_main_trace_columns..].to_vec());
+                }
+                crate::table::TableView::new(main, aux)
+            })
+            .collect();
+        let ood_frame = crate::frame::Frame::new(steps);
+        let ctx = TransitionEvaluationContext::new_verifier(
+            &ood_frame,
+            rap_challenges,
+            &logup_alpha_powers,
+            &logup_table_offset,
+        );
+        let transition_evals = air.compute_transition(&ctx);
+
+        let mut denominators =
+            vec![FieldElement::<FieldExtension>::zero(); air.num_transition_constraints()];
+        air.constraints_meta().iter().for_each(|m| {
+            denominators[m.constraint_idx] = crate::constraints::zerofier::evaluate_zerofier(
+                m,
+                z,
+                &domain.trace_primitive_root,
+                trace_length,
+            );
+        });
+        let transition_sum = transition_evals
+            .into_iter()
+            .zip(transition_coefficients)
+            .zip(denominators)
+            .fold(FieldElement::zero(), |acc, ((eval, beta), den)| {
+                acc + beta * eval * &den
+            });
+
+        let ood_evaluation = &boundary_sum + transition_sum;
+        let claimed = parts_ood
+            .iter()
+            .rev()
+            .fold(FieldElement::zero(), |acc, coeff| acc * z + coeff);
+        claimed == ood_evaluation
+    }
+
+    /// Diagnostic follow-up when [`Self::composition_ood_consistent`] fails:
+    /// recompute each device-derived stage on host for THIS table only and
+    /// report which one diverges, then panic (the proof would not verify).
+    /// Runs after the corruption already happened, so the expensive host
+    /// recomputes cannot mask the failure they are diagnosing.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    fn xcheck_post_mortem(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        pub_inputs: &PI,
+        domain: &Domain<Field>,
+        twiddles: &LdeTwiddles<Field>,
+        round_1_result: &mut Round1<Field, FieldExtension>,
+        transition_coefficients: &[FieldElement<FieldExtension>],
+        boundary_coefficients: &[FieldElement<FieldExtension>],
+        round_2_result: &Round2<FieldExtension>,
+        round_3_result: &Round3<FieldExtension>,
+        z: &FieldElement<FieldExtension>,
+    ) where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+    {
+        let name = air.name();
+        let trace_length = domain.interpolation_domain_size;
+        eprintln!("[xcheck] FAIL composition consistency: table={name} n={trace_length}");
+
+        if round_1_result.lde_trace.host_trace_empty()
+            && !crate::gpu_lde::materialize_lde_trace_host(&mut round_1_result.lde_trace)
+        {
+            panic!("[xcheck] table={name}: cannot materialize host trace for post-mortem");
+        }
+
+        // Stage 1: R2 parts (device H + decompose) vs full host recompute.
+        let evaluator = ConstraintEvaluator::new(
+            air,
+            pub_inputs,
+            &round_1_result.rap_challenges,
+            round_1_result.bus_public_inputs.as_ref(),
+            trace_length,
+        );
+        let host_h = evaluator.evaluate(
+            air,
+            &round_1_result.lde_trace,
+            domain,
+            transition_coefficients,
+            boundary_coefficients,
+            &round_1_result.rap_challenges,
+        );
+        let host_parts = Self::decompose_and_extend_d2(&host_h, domain, twiddles);
+        let device_parts: Option<Vec<Vec<FieldElement<FieldExtension>>>> = if round_2_result
+            .lde_composition_poly_evaluations
+            .first()
+            .is_some_and(|p| !p.is_empty())
+        {
+            Some(round_2_result.lde_composition_poly_evaluations.clone())
+        } else {
+            round_1_result
+                .lde_trace
+                .gpu_composition_parts()
+                .and_then(crate::gpu_lde::download_ext3_columns::<FieldExtension>)
+        };
+        let mut r2_verdict = "UNAVAILABLE (no device parts to compare)".to_string();
+        if let Some(dev) = &device_parts {
+            r2_verdict = "ok".to_string();
+            'outer: for (pi, (hp, dp)) in host_parts.iter().zip(dev).enumerate() {
+                if hp.len() != dp.len() {
+                    r2_verdict =
+                        format!("LEN MISMATCH part={pi} host={} dev={}", hp.len(), dp.len());
+                    break;
+                }
+                for (ri, (x, y)) in hp.iter().zip(dp.iter()).enumerate() {
+                    if x != y {
+                        r2_verdict = format!("MISMATCH part={pi} row={ri} host={x:?} device={y:?}");
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        eprintln!("[xcheck] table={name} R2 parts: {r2_verdict}");
+
+        // Corruption shape: how much of each part differs, and where. A whole
+        // buffer points at H itself; a contiguous chunk at one kernel pass; a
+        // strided pattern at slab/component confusion.
+        if let Some(dev) = &device_parts {
+            for (pi, (hp, dp)) in host_parts.iter().zip(dev).enumerate() {
+                if hp.len() != dp.len() {
+                    continue;
+                }
+                let mism: Vec<usize> = hp
+                    .iter()
+                    .zip(dp.iter())
+                    .enumerate()
+                    .filter(|(_, (x, y))| x != y)
+                    .map(|(i, _)| i)
+                    .collect();
+                if !mism.is_empty() {
+                    eprintln!(
+                        "[xcheck] table={name} part={pi}: {} of {} rows differ, first={} last={}",
+                        mism.len(),
+                        hp.len(),
+                        mism[0],
+                        mism[mism.len() - 1],
+                    );
+                }
+            }
+        }
+
+        // Rerun the device R2 chain for this table now that the storm has
+        // passed: a correct rerun means a transient race during the original
+        // run; the same wrong values mean a persistently corrupted device
+        // input (zerofiers, IR buffers, resident LDEs).
+        let rerun: Option<Vec<Vec<FieldElement<FieldExtension>>>> = evaluator
+            .evaluate_dev(
+                air,
+                &round_1_result.lde_trace,
+                domain,
+                transition_coefficients,
+                boundary_coefficients,
+                &round_1_result.rap_challenges,
+            )
+            .and_then(|h_dev| {
+                crate::gpu_lde::try_decompose_extend_d2_dev::<Field, FieldExtension>(
+                    &h_dev,
+                    twiddles.inv_2x(domain),
+                    &twiddles.composition(domain).weights,
+                    true,
+                )
+                .map(|(parts, _handle)| parts)
+            });
+        let rerun_verdict = match &rerun {
+            None => "device rerun declined".to_string(),
+            Some(p2) if *p2 == host_parts => {
+                "rerun matches HOST (transient race in the original run)".to_string()
+            }
+            Some(p2) if device_parts.as_ref().is_some_and(|dp| p2 == dp) => {
+                "rerun matches ORIGINAL DEVICE (persistent corrupted device input)".to_string()
+            }
+            Some(_) => "rerun matches NEITHER".to_string(),
+        };
+        eprintln!("[xcheck] table={name} R2 rerun: {rerun_verdict}");
+
+        // Stage 2: R3 trace OOD vs the host arms.
+        let dc = domain.ood_constants();
+        let host_ood = crate::trace::with_r3_force_host(|| {
+            crate::trace::get_trace_evaluations_from_lde(
+                &round_1_result.lde_trace,
+                domain,
+                z,
+                &air.context().transition_offsets,
+                air.step_size(),
+                dc,
+            )
+        });
+        let got = &round_3_result.trace_ood_evaluations;
+        let mut r3_trace_verdict = "ok".to_string();
+        if host_ood.width != got.width || host_ood.height != got.height {
+            r3_trace_verdict = "SHAPE MISMATCH".to_string();
+        } else {
+            'outer: for r in 0..host_ood.height {
+                for c in 0..host_ood.width {
+                    if host_ood.get(r, c) != got.get(r, c) {
+                        r3_trace_verdict = format!(
+                            "MISMATCH row={r} col={c} host={:?} device={:?}",
+                            host_ood.get(r, c),
+                            got.get(r, c)
+                        );
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        eprintln!("[xcheck] table={name} R3 trace_ood: {r3_trace_verdict}");
+
+        // Stage 3: R3 parts OOD vs the host arm over the HOST-recomputed parts
+        // (independent of the device H), and over the device parts when
+        // available (isolates barycentric vs upstream).
+        let num_parts = round_3_result.composition_poly_parts_ood_evaluation.len();
+        let z_power = z.pow(num_parts);
+        let comp_z_pow_n = z_power.pow(trace_length);
+        let comp_inv_denoms = math::polynomial::barycentric_inv_denoms(&z_power, &dc.points);
+        let ood_of =
+            |parts: &[Vec<FieldElement<FieldExtension>>]| -> Vec<FieldElement<FieldExtension>> {
+                parts
+                    .iter()
+                    .map(|lde_evals| {
+                        let evals: Vec<FieldElement<FieldExtension>> = (0..trace_length)
+                            .map(|i| lde_evals[i * domain.blowup_factor].clone())
+                            .collect();
+                        math::polynomial::interpolate_coset_eval_ext_with_g_n_inv(
+                            &comp_z_pow_n,
+                            &dc.offset_pow_n,
+                            &dc.size_inv,
+                            &dc.offset_pow_n_inv,
+                            &dc.points,
+                            &evals,
+                            &comp_inv_denoms,
+                        )
+                    })
+                    .collect()
+            };
+        let host_parts_ood = ood_of(&host_parts);
+        eprintln!(
+            "[xcheck] table={name} R3 parts_ood: claimed={:?} host_from_host_parts={:?} host_from_device_parts={:?}",
+            round_3_result.composition_poly_parts_ood_evaluation,
+            host_parts_ood,
+            device_parts.as_deref().map(ood_of),
+        );
+
+        eprintln!(
+            "[xcheck] table={name}: composition OOD inconsistency (R2 parts: {r2_verdict}; \
+             R2 rerun: {rerun_verdict}; R3 trace_ood: {r3_trace_verdict}); aborting"
+        );
+        // abort() and not panic!: a panicking prover thread deadlocks the
+        // epoch pipeline (producer stuck in a bounded send), which would turn
+        // every diagnostic catch into a hung process.
+        std::process::abort();
+    }
+
     fn prove_rounds_2_to_4(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         pub_inputs: &PI,
@@ -3876,6 +4253,38 @@ pub trait IsStarkProver<
         );
         #[cfg(feature = "instruments")]
         let round_3_dur = t_r3.elapsed();
+
+        // Diagnostic: verifier-equivalent composition consistency check, run
+        // per table at negligible cost; on failure, per-stage host recompute
+        // names where the corruption entered (then panics).
+        #[cfg(feature = "cuda")]
+        if crate::gpu_lde::gpu_xcheck()
+            && !Self::composition_ood_consistent(
+                air,
+                pub_inputs,
+                domain,
+                &round_1_result.rap_challenges,
+                round_1_result.bus_public_inputs.as_ref(),
+                &transition_coefficients,
+                &boundary_coefficients,
+                &z,
+                &round_3_result.trace_ood_evaluations,
+                &round_3_result.composition_poly_parts_ood_evaluation,
+            )
+        {
+            Self::xcheck_post_mortem(
+                air,
+                pub_inputs,
+                domain,
+                twiddles,
+                round_1_result,
+                &transition_coefficients,
+                &boundary_coefficients,
+                &round_2_result,
+                &round_3_result,
+                &z,
+            );
+        }
 
         // >>>> Send values: tⱼ(zgᵏ). g·z pruning: split the full OOD table into
         // the current-row block (all columns) and the pruned next-row block

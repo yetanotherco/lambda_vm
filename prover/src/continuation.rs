@@ -1774,6 +1774,101 @@ mod tests {
     use super::*;
     use crate::test_utils::asm_elf_bytes;
 
+    // Diagnostic (not a regression test): structurally diff two continuation
+    // proof bundles of the same input. The prover is deterministic, so the
+    // first differing field per table names the round where a corrupt run
+    // diverged. Run with:
+    //   PROOF_A=<good.bin> PROOF_B=<bad.bin> \
+    //   cargo test -p prover --release proof_diff -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn proof_diff() {
+        fn load(path: &str) -> ContinuationProof {
+            use std::os::unix::fs::FileExt;
+            let file = std::fs::File::open(path).unwrap();
+            let len = file.metadata().unwrap().len() as usize;
+            let mut aligned = rkyv::util::AlignedVec::<16>::with_capacity(len);
+            aligned.resize(len, 0);
+            file.read_exact_at(&mut aligned, 0).unwrap();
+            rkyv::from_bytes::<ContinuationProof, rkyv::rancor::Error>(&aligned).unwrap()
+        }
+        fn table_eq(a: &stark::table::Table<E>, b: &stark::table::Table<E>) -> bool {
+            if a.width != b.width || a.height != b.height {
+                return false;
+            }
+            (0..a.height).all(|r| (0..a.width).all(|c| a.get(r, c) == b.get(r, c)))
+        }
+        fn diff_multi(label: &str, a: &MultiProof<F, E, ()>, b: &MultiProof<F, E, ()>) {
+            assert_eq!(a.proofs.len(), b.proofs.len(), "{label}: table count");
+            for (t, (pa, pb)) in a.proofs.iter().zip(b.proofs.iter()).enumerate() {
+                let mut d = Vec::new();
+                if pa.lde_trace_main_merkle_root != pb.lde_trace_main_merkle_root {
+                    d.push("main_root");
+                }
+                if pa.lde_trace_aux_merkle_root != pb.lde_trace_aux_merkle_root {
+                    d.push("aux_root");
+                }
+                if pa.lde_trace_precomputed_merkle_root != pb.lde_trace_precomputed_merkle_root {
+                    d.push("preproc_root");
+                }
+                if pa.bus_public_inputs.as_ref().map(|x| &x.table_contribution)
+                    != pb.bus_public_inputs.as_ref().map(|x| &x.table_contribution)
+                {
+                    d.push("bus_pi");
+                }
+                if pa.composition_poly_root != pb.composition_poly_root {
+                    d.push("comp_root");
+                }
+                if !table_eq(&pa.trace_ood_evaluations, &pb.trace_ood_evaluations) {
+                    d.push("trace_ood");
+                }
+                if !table_eq(
+                    &pa.trace_ood_next_evaluations,
+                    &pb.trace_ood_next_evaluations,
+                ) {
+                    d.push("trace_ood_next");
+                }
+                if pa.composition_poly_parts_ood_evaluation
+                    != pb.composition_poly_parts_ood_evaluation
+                {
+                    d.push("parts_ood");
+                }
+                if pa.fri_layers_merkle_roots != pb.fri_layers_merkle_roots {
+                    d.push("fri_roots");
+                }
+                if pa.fri_final_poly_coeffs != pb.fri_final_poly_coeffs {
+                    d.push("fri_final");
+                }
+                if pa.nonce != pb.nonce {
+                    d.push("nonce");
+                }
+                if !d.is_empty() {
+                    println!(
+                        "{label} table {t} (cols={} len={}): {d:?}",
+                        pa.trace_ood_evaluations.width, pa.trace_length
+                    );
+                }
+            }
+        }
+        let a = load(&std::env::var("PROOF_A").unwrap());
+        let b = load(&std::env::var("PROOF_B").unwrap());
+        assert_eq!(a.epochs.len(), b.epochs.len(), "epoch count");
+        for (e, (ea, eb)) in a.epochs.iter().zip(b.epochs.iter()).enumerate() {
+            diff_multi(&format!("epoch {e}"), &ea.proof, &eb.proof);
+            if ea.public_output != eb.public_output {
+                println!("epoch {e}: public_output differs");
+            }
+            if ea.reg_fini != eb.reg_fini {
+                println!("epoch {e}: reg_fini differs");
+            }
+            if ea.l2g_root != eb.l2g_root {
+                println!("epoch {e}: l2g_root differs");
+            }
+        }
+        diff_multi("global", &a.global, &b.global);
+        println!("diff complete");
+    }
+
     // `test_commit_split` issues two Commit syscalls, one early and one late, so a
     // small epoch puts the second commit in a later epoch. That epoch starts with
     // x254 > 0 (the carried commit index), which exercises the cross-epoch commit

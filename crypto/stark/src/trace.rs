@@ -771,6 +771,23 @@ where
     }
 }
 
+// Diagnostic (see `gpu_lde::gpu_xcheck`): while set on the current thread,
+// `get_trace_evaluations_from_lde` skips every GPU dispatch and runs the
+// host arms, so a second call can cross-check the device results.
+#[cfg(feature = "cuda")]
+thread_local! {
+    static R3_FORCE_HOST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with the R3 GPU dispatches disabled on this thread.
+#[cfg(feature = "cuda")]
+pub(crate) fn with_r3_force_host<R>(f: impl FnOnce() -> R) -> R {
+    R3_FORCE_HOST.with(|c| c.set(true));
+    let out = f();
+    R3_FORCE_HOST.with(|c| c.set(false));
+    out
+}
+
 /// Evaluates trace polynomials at OOD points using barycentric interpolation
 /// on the LDE evaluations, without needing coefficient-form polynomials.
 ///
@@ -824,12 +841,17 @@ where
     // into a single device context. The barycentric kernels below read
     // both via offset, with no per-eval-point or per-{main,aux} H2D.
     #[cfg(feature = "cuda")]
-    let r3_ctx: Option<crate::gpu_lde::R3DevContext> =
+    let r3_force_host = R3_FORCE_HOST.with(|c| c.get());
+    #[cfg(feature = "cuda")]
+    let r3_ctx: Option<crate::gpu_lde::R3DevContext> = if r3_force_host {
+        None
+    } else {
         crate::gpu_lde::try_prep_r3_dev_context::<F, E>(
             &dc.points,
             &evaluation_points,
             lde_trace.bound_stream(),
-        );
+        )
+    };
     #[allow(unused_variables)]
     #[cfg(not(feature = "cuda"))]
     let r3_ctx: Option<()> = None;
@@ -912,22 +934,26 @@ where
         #[cfg(feature = "cuda")]
         let r3_arg = r3_ctx.as_ref().map(|ctx| (ctx, eval_point_idx * 3 * n));
         #[cfg(feature = "cuda")]
-        let main_gpu = main_multi
-            .as_ref()
-            .map(|per_point| per_point[eval_point_idx].clone())
-            .or_else(|| {
-                crate::gpu_lde::try_barycentric_base_on_handle::<F, E>(
-                    lde_trace,
-                    bf,
-                    &dc.points,
-                    &dc.offset_pow_n,
-                    &dc.size_inv,
-                    &dc.offset_pow_n_inv,
-                    &z_pow_n,
-                    inv_denoms.as_deref().unwrap_or(&[]),
-                    r3_arg,
-                )
-            });
+        let main_gpu = if r3_force_host {
+            None
+        } else {
+            main_multi
+                .as_ref()
+                .map(|per_point| per_point[eval_point_idx].clone())
+                .or_else(|| {
+                    crate::gpu_lde::try_barycentric_base_on_handle::<F, E>(
+                        lde_trace,
+                        bf,
+                        &dc.points,
+                        &dc.offset_pow_n,
+                        &dc.size_inv,
+                        &dc.offset_pow_n_inv,
+                        &z_pow_n,
+                        inv_denoms.as_deref().unwrap_or(&[]),
+                        r3_arg,
+                    )
+                })
+        };
         #[cfg(not(feature = "cuda"))]
         let main_gpu: Option<Vec<FieldElement<E>>> = None;
 
@@ -975,22 +1001,26 @@ where
         #[cfg(feature = "cuda")]
         let r3_arg_aux = r3_ctx.as_ref().map(|ctx| (ctx, eval_point_idx * 3 * n));
         #[cfg(feature = "cuda")]
-        let aux_gpu = aux_multi
-            .as_ref()
-            .map(|per_point| per_point[eval_point_idx].clone())
-            .or_else(|| {
-                crate::gpu_lde::try_barycentric_ext3_on_handle::<F, E>(
-                    lde_trace,
-                    bf,
-                    &dc.points,
-                    &dc.offset_pow_n,
-                    &dc.size_inv,
-                    &dc.offset_pow_n_inv,
-                    &z_pow_n,
-                    inv_denoms.as_deref().unwrap_or(&[]),
-                    r3_arg_aux,
-                )
-            });
+        let aux_gpu = if r3_force_host {
+            None
+        } else {
+            aux_multi
+                .as_ref()
+                .map(|per_point| per_point[eval_point_idx].clone())
+                .or_else(|| {
+                    crate::gpu_lde::try_barycentric_ext3_on_handle::<F, E>(
+                        lde_trace,
+                        bf,
+                        &dc.points,
+                        &dc.offset_pow_n,
+                        &dc.size_inv,
+                        &dc.offset_pow_n_inv,
+                        &z_pow_n,
+                        inv_denoms.as_deref().unwrap_or(&[]),
+                        r3_arg_aux,
+                    )
+                })
+        };
         #[cfg(not(feature = "cuda"))]
         let aux_gpu: Option<Vec<FieldElement<E>>> = None;
 
