@@ -1601,33 +1601,40 @@ pub trait IsStarkProver<
         #[cfg(feature = "cuda")]
         let mut precomputed_parts: Option<Vec<Vec<FieldElement<FieldExtension>>>> = None;
         #[cfg(feature = "cuda")]
-        if number_of_parts == 2
-            && !crate::gpu_lde::gpu_force_downgrade()
-            && let Some(h_dev) = evaluator.evaluate_dev(
-                air,
-                &round_1_result.lde_trace,
-                domain,
-                transition_coefficients,
-                boundary_coefficients,
-                &round_1_result.rap_challenges,
-            )
         {
-            match crate::gpu_lde::try_decompose_extend_d2_dev::<Field, FieldExtension>(
-                &h_dev,
-                twiddles.inv_2x(domain),
-                &twiddles.composition(domain).weights,
-                !round_1_result.lde_trace.host_trace_empty(),
-            ) {
-                Some((parts, handle)) => {
-                    gpu_composition_parts = Some(handle);
-                    precomputed_parts = Some(parts);
-                }
-                None => {
-                    if let Some(h) =
-                        crate::gpu_lde::download_comp_h_to_field::<FieldExtension>(&h_dev)
-                    {
-                        precomputed_parts =
-                            Some(Self::decompose_and_extend_d2(&h, domain, twiddles));
+            // Serializing this window across tables (device constraint eval +
+            // decompose, where H is born) eliminates a transient whole-buffer
+            // H corruption seen under concurrent R2 windows on VRAM pressure.
+            // The commit and every host arm run outside the lock.
+            let _r2_serial_guard = crate::gpu_lde::r2_serialize_guard();
+            if number_of_parts == 2
+                && !crate::gpu_lde::gpu_force_downgrade()
+                && let Some(h_dev) = evaluator.evaluate_dev(
+                    air,
+                    &round_1_result.lde_trace,
+                    domain,
+                    transition_coefficients,
+                    boundary_coefficients,
+                    &round_1_result.rap_challenges,
+                )
+            {
+                match crate::gpu_lde::try_decompose_extend_d2_dev::<Field, FieldExtension>(
+                    &h_dev,
+                    twiddles.inv_2x(domain),
+                    &twiddles.composition(domain).weights,
+                    !round_1_result.lde_trace.host_trace_empty(),
+                ) {
+                    Some((parts, handle)) => {
+                        gpu_composition_parts = Some(handle);
+                        precomputed_parts = Some(parts);
+                    }
+                    None => {
+                        if let Some(h) =
+                            crate::gpu_lde::download_comp_h_to_field::<FieldExtension>(&h_dev)
+                        {
+                            precomputed_parts =
+                                Some(Self::decompose_and_extend_d2(&h, domain, twiddles));
+                        }
                     }
                 }
             }
