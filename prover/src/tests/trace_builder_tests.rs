@@ -753,10 +753,16 @@ mod keccak_tests {
         assert_eq!(core_cols::NUM_COLUMNS, 511, "KECCAK core columns");
         assert_eq!(
             rnd_cols::NUM_COLUMNS,
-            1480,
-            "KECCAK_RND columns (rnc/rbc inlined; pi virtual; Cxz_right Bit-typed)"
+            1481,
+            "KECCAK_RND columns (rnc/rbc inlined; pi virtual; Cxz_right Bit-typed; \
+             + the seq permutation key carried for KECCAK_SPONGE)"
         );
         assert_eq!(keccak_rc::cols::NUM_COLUMNS, 10, "KECCAK_RC columns");
+        assert_eq!(
+            crate::tables::keccak_sponge::cols::NUM_COLUMNS,
+            690,
+            "KECCAK_SPONGE columns"
+        );
     }
 
     #[test]
