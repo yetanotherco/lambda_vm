@@ -110,7 +110,9 @@ fn test_absorb_matches_chained_permute_semantics() {
 
     let mut rng = SplitMix64(0xA11C_E000_0000_0200);
     let mut state: [u64; 25] = core::array::from_fn(|i| rng.next_u64() ^ (i as u64));
-    let blocks: Vec<[u64; 17]> = (0..4).map(|_| core::array::from_fn(|_| rng.next_u64())).collect();
+    let blocks: Vec<[u64; 17]> = (0..4)
+        .map(|_| core::array::from_fn(|_| rng.next_u64()))
+        .collect();
     for block in &blocks {
         for (lane, &m) in state.iter_mut().zip(block.iter()) {
             *lane ^= m;

@@ -319,6 +319,7 @@ fn s_hi() -> BusValue {
 
 /// `[old[8], is_register, base_lo, base_hi, value[8], ts_lo, ts_hi, w2, w4, w8]`
 /// — a 24-element MEMW **read** tuple (`old == value`), as in `ecsm.rs`.
+#[allow(clippy::too_many_arguments)]
 fn memw_read(
     value: [BusValue; 8],
     is_register: u64,

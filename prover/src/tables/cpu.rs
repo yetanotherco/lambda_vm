@@ -246,8 +246,7 @@ impl CpuOperation {
             f.ecall && log.src1_val == executor::vm::instruction::execution::KECCAK_SYSCALL_NUMBER;
         let keccak_state_addr = if ecall_keccak { log.src2_val } else { 0 };
         let ecall_keccak_absorb = f.ecall
-            && log.src1_val
-                == executor::vm::instruction::execution::KECCAK_ABSORB_SYSCALL_NUMBER;
+            && log.src1_val == executor::vm::instruction::execution::KECCAK_ABSORB_SYSCALL_NUMBER;
         let (keccak_absorb_state_addr, keccak_absorb_data_addr) = if ecall_keccak_absorb {
             (log.src2_val, log.dst_val)
         } else {

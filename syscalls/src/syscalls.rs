@@ -189,8 +189,14 @@ pub fn keccak_permute(_state: &mut [u64; 25]) {
 /// 8-byte aligned and hold exactly `n_blocks * 136` bytes, `n_blocks > 0`,
 /// and the data region must not overlap `state`.
 pub fn keccak_absorb_blocks(state: &mut [u64; 25], data: &[u8], n_blocks: usize) {
-    debug_assert!(data.len() == n_blocks * 136, "data must be n_blocks × 136 bytes");
-    debug_assert!(data.as_ptr().addr().is_multiple_of(8), "data must be 8-byte aligned");
+    debug_assert!(
+        data.len() == n_blocks * 136,
+        "data must be n_blocks × 136 bytes"
+    );
+    debug_assert!(
+        data.as_ptr().addr().is_multiple_of(8),
+        "data must be 8-byte aligned"
+    );
     unsafe {
         asm!(
             "ecall",

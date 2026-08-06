@@ -1568,8 +1568,9 @@ fn collect_keccak_sponge_ops(
         for (b, &v) in values.iter().enumerate() {
             dword |= (v as u64) << (b * 8);
         }
-        memw_ops
-            .push(MemwOperation::new(false, lane_addr, values, ts, 8, true).with_old(values, old_ts));
+        memw_ops.push(
+            MemwOperation::new(false, lane_addr, values, ts, 8, true).with_old(values, old_ts),
+        );
         memory_state.write_bytes(lane_addr, dword, 8, ts);
         *slot = dword;
     }
@@ -1590,8 +1591,7 @@ fn collect_keccak_sponge_ops(
                 block[(j as usize) * 8 + b] = v as u8;
             }
             memw_ops.push(
-                MemwOperation::new(false, dword_addr, values, ts, 8, true)
-                    .with_old(values, old_ts),
+                MemwOperation::new(false, dword_addr, values, ts, 8, true).with_old(values, old_ts),
             );
             memory_state.write_bytes(dword_addr, dword, 8, ts);
         }
@@ -1631,7 +1631,8 @@ fn collect_keccak_sponge_ops(
         let (old_vals, old_ts) = memory_state.read_bytes(lane_addr, 8);
         debug_assert_eq!(old_ts, [ts; 8], "state lanes were re-written at ts above");
         memw_ops.push(
-            MemwOperation::new(false, lane_addr, value, ts + 1, 8, false).with_old(old_vals, old_ts),
+            MemwOperation::new(false, lane_addr, value, ts + 1, 8, false)
+                .with_old(old_vals, old_ts),
         );
         memory_state.write_bytes(lane_addr, out, 8, ts + 1);
     }
@@ -3726,9 +3727,8 @@ fn build_traces<I: ImageSource + Sync>(
     // absorbed state — state_in XOR block over lanes 0..17 — is the round
     // chip's input, matching the sponge chip's round-0 Keccak-bus send).
     let gen_keccak_rnd = || {
-        let mut keccak_rnd_ops: Vec<KeccakRoundOperation> = Vec::with_capacity(
-            keccak_ops.len() + keccak_sponge_ops.len(),
-        );
+        let mut keccak_rnd_ops: Vec<KeccakRoundOperation> =
+            Vec::with_capacity(keccak_ops.len() + keccak_sponge_ops.len());
         keccak_rnd_ops.extend(keccak_ops.iter().map(|op| KeccakRoundOperation {
             timestamp: op.timestamp,
             seq: 0,

@@ -154,14 +154,12 @@ fn tally_lookup_sends(
 fn collected_key(op: &BitwiseOperation) -> LookupKey {
     let (x, y) = (op.x as u64, op.y as u64);
     match op.lookup_type {
-        BitwiseOperationType::ByteAluXor => (
-            BusId::ByteAlu as u64,
-            vec![alu_op::XOR as u64, x, y, x ^ y],
-        ),
-        BitwiseOperationType::ByteAluAnd => (
-            BusId::ByteAlu as u64,
-            vec![alu_op::AND as u64, x, y, x & y],
-        ),
+        BitwiseOperationType::ByteAluXor => {
+            (BusId::ByteAlu as u64, vec![alu_op::XOR as u64, x, y, x ^ y])
+        }
+        BitwiseOperationType::ByteAluAnd => {
+            (BusId::ByteAlu as u64, vec![alu_op::AND as u64, x, y, x & y])
+        }
         BitwiseOperationType::AreBytes => (BusId::AreBytes as u64, vec![x, y]),
         other => panic!("KECCAK_SPONGE collector emitted unexpected lookup type {other:?}"),
     }
@@ -203,7 +201,11 @@ fn sponge_bitwise_multiset_matches_chip_sends() {
     let rnd_trace = keccak_rnd::generate_keccak_rnd_trace(&rnd_ops);
 
     let mut sends: HashMap<LookupKey, i64> = HashMap::new();
-    tally_lookup_sends(&keccak_sponge::bus_interactions(), &sponge_trace, &mut sends);
+    tally_lookup_sends(
+        &keccak_sponge::bus_interactions(),
+        &sponge_trace,
+        &mut sends,
+    );
     tally_lookup_sends(&keccak_rnd::bus_interactions(), &rnd_trace, &mut sends);
 
     let mut collected: HashMap<LookupKey, i64> = HashMap::new();
