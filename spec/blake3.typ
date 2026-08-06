@@ -135,8 +135,11 @@ margin removed here is one round of seven.)
 *External review (2026-08).* The round-count choice was reviewed with
 external symmetric-cryptography experts consulted by the project: removing
 *one* round (7 → 6) was judged comfortable; removing *two* (7 → 5) was
-explicitly not. Accordingly, 6 rounds is the endorsed floor — variants
-below 6 rounds are out of scope and MUST NOT be instantiated.
+explicitly not. Accordingly, 6 rounds is the endorsed floor. Variants
+below 6 rounds are not formally ruled out, but they are not available on
+the project's own authority: adopting one would require the external
+experts to study the reduced-round margin specifically — a dedicated
+cryptanalytic review, not an engineering or configuration decision.
 
 Any use of #blake3 as a Merkle or transcript hash *invokes this
 assumption*. The z3 gate proves the chip computes 6-round BLAKE3
