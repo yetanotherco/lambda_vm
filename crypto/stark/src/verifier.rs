@@ -199,36 +199,21 @@ pub trait IsStarkVerifier<
     /// Soundness (I3, opening side): every query opening's column counts are a
     /// public function of the AIR, never of the (prover-controlled) proof.
     ///
-    /// Each query opening carries the trace row split into three vectors —
-    /// `precomputed ‖ main` (base field) and `aux` (extension field). Downstream
-    /// (`reconstruct_deep_composition_poly_evaluation_pair`) they are consumed as
-    /// one concatenated row `precomputed ‖ main ‖ aux`, so **only their sum** was
-    /// previously pinned (against the AIR-pinned OOD width). Nothing pinned the
-    /// individual terms, and neither Merkle leaf hash pins them either:
-    /// `hash_data_from_slices` streams `evaluations ‖ evaluations_sym` with no
-    /// length prefix and no separator, so a leaf can be re-split freely.
+    /// An opening splits the trace row into `precomputed ‖ main` (base) and `aux`
+    /// (extension), which the DEEP reconstruction consumes as one concatenated
+    /// row — so only their *sum* was pinned, against the AIR-pinned OOD width.
+    /// The leaf hash pins neither split either: `hash_data_from_slices` streams
+    /// `evaluations ‖ evaluations_sym` with no length prefix or separator.
     ///
-    /// Both splits were exploitable — each demonstrated by a false statement the
-    /// unpinned verifier accepted — because each of the three trees is bound to
-    /// the transcript at a *different* time:
+    /// That is exploitable because the three trees are absorbed at different
+    /// times: the precomputed root not at all for a non-preprocessed AIR, and the
+    /// aux root only after the LogUp challenges. An unpinned split therefore lets
+    /// a prover pick columns *after* challenges they must precede. Both variants
+    /// accepted a false statement before this check; see `tests::opening_width_tests`
+    /// and `tests::aux_opening_width_tests`.
     ///
-    /// * **precomputed↔main** — for a non-preprocessed AIR the precomputed root is
-    ///   never absorbed at all (only the `is_preprocessed()` branch of round 1
-    ///   absorbs it). A prover that moves real trace columns into the "precomputed"
-    ///   vector leaves them bound by nothing, samples the round-2 challenges, and
-    ///   then solves for those columns (`tests::opening_width_tests`).
-    /// * **main↔aux** — the aux root is absorbed only in round 1 phase C, *after*
-    ///   the shared LogUp challenges. A column moved from `main` to `aux` is
-    ///   chosen after seeing `z`/`alpha`, which collapses LogUp's multiset
-    ///   equality into one scalar equation the prover solves — no fingerprint
-    ///   collision needed, and no prover modification either, since both sides
-    ///   absorb main-root-then-aux-root regardless
-    ///   (`tests::aux_opening_width_tests`). This one reaches the archived
-    ///   (recursion-guest) path too.
-    ///
-    /// So all three widths are pinned here, once per table, before any opening is
-    /// read. `evaluations()` and `evaluations_sym()` are checked independently:
-    /// they are separate prover-supplied vectors and the leaf hash pins neither.
+    /// Runs once per table, before any opening is read. Both slots are checked:
+    /// they are separate prover-supplied vectors.
     fn trace_opening_widths_well_formed(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         proof: StarkProofView<'_, Field, FieldExtension, PI>,
