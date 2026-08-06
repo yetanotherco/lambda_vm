@@ -261,12 +261,17 @@ fn precheck_the_width_pin_is_compiled_in() {
 /// Stock `main` accepts it: the widths sum to the OOD width and the DEEP
 /// reconstruction reads the same concatenated row either way. What the verifier
 /// is wrong about is *which* columns the hardcoded commitment pins — it believes
-/// two, and only one is in that tree. For a real preprocessed table (bitwise,
-/// decode, keccak_rc) that is the lookup table's own content becoming
-/// prover-supplied. The round-1 root equality is a second line of defence here
-/// only because an honest constant happens to be a root over exactly
-/// `num_precomputed_columns()` columns — nothing states that, and nothing checks
-/// it. This test pins the width directly.
+/// two, and only one is in that tree, so the other is prover-supplied while the
+/// verifier treats it as fixed.
+///
+/// For a *real* preprocessed table (bitwise, decode, keccak_rc) the round-1 root
+/// equality would also catch this, since an honest constant is a root over
+/// exactly `num_precomputed_columns()` columns and a narrower tree hashes
+/// differently. That defence is incidental: nothing states the invariant and
+/// nothing checks it, and it does not exist at all for a non-preprocessed AIR,
+/// where the root is never absorbed and the same re-split lets a prover choose
+/// trace columns after the round-2 challenge. This test pins the width itself,
+/// which is the property the reconstruction actually depends on.
 #[test_log::test]
 fn precomputed_opening_narrower_than_the_air_declares_is_rejected() {
     let proof_options = ProofOptions::default_test_options();
