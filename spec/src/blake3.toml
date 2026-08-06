@@ -1,0 +1,345 @@
+# BLAKE3_6R — the 6-round internal-variant BLAKE3 compression accelerator.
+#
+# ⚠ NORMATIVE SOURCE NOTE. This spec documents the shipped chip
+# (`prover/src/tables/blake3.rs`); the chip's wiring is single-sourced in Rust
+# (`run_flow` interpreted as columns and as witness) and formally gated by the
+# z3 model in `thoughts/blake3/blake3-chip/z3_blake_verify.py`. Where this file
+# and those artifacts disagree, THEY are normative and this file has a bug.
+# Cross-checked totals at spec-writing time: 3,219 main columns, 1,397
+# interactions, 814 constraints, max degree 3 (incl. the ×μ gating factor).
+#
+# One row = one compression call: 6 rounds × 8 G-functions fully unrolled in
+# SSA form. Message schedule = the literal per-round index table `SCHED` below
+# (permute^r of the identity under MSG_PERMUTATION =
+# [2,6,3,10,7,0,4,13,1,11,12,5,9,14,15,8]); round r position i consumes
+# original message word SCHED[r][i].
+#
+# Security: this chip computes 6-round BLAKE3, NOT the standard 7-round
+# function. Its use as a Merkle / Fiat–Shamir hash rests on the named
+# assumption A6R (see blake3.typ). No external system will ever agree on
+# these digests.
+
+name = "BLAKE3"
+
+# -------------------------------------------------------------------------
+# Inputs (read from memory at addr .. addr+112; see the ECALL ABI)
+# -------------------------------------------------------------------------
+
+[[variables.input]]
+name = "timestamp"
+type = "DWordWL"
+desc = "timestamp at which the compression is performed"
+pad = 0
+
+[[variables.input]]
+name = "addr"
+type = "DWordBL"
+desc = "8-aligned base address of the 176-byte state region (h|m|t|len,flags|out)"
+pad = 0
+
+[[variables.input]]
+name = "h"
+type = [["Byte", 4], 8]
+desc = "input chaining value h[0..8], 8 little-endian u32 words"
+pad = 0
+
+[[variables.input]]
+name = "m"
+type = [["Byte", 4], 16]
+desc = "message block m[0..16] = left_cv ‖ right_cv for a 2-to-1 merge"
+pad = 0
+
+[[variables.input]]
+name = "t_lo"
+type = ["Byte", 4]
+desc = "low u32 of the 64-bit counter t → v[12]"
+pad = 0
+
+[[variables.input]]
+name = "t_hi"
+type = ["Byte", 4]
+desc = "high u32 of the 64-bit counter t → v[13] (split order is load-bearing)"
+pad = 0
+
+[[variables.input]]
+name = "block_len"
+type = ["Byte", 4]
+desc = "input byte count of this block → v[14]"
+pad = 0
+
+[[variables.input]]
+name = "flags"
+type = ["Byte", 4]
+desc = "domain-separation flags → v[15]"
+pad = 0
+
+# -------------------------------------------------------------------------
+# Outputs (written to memory at addr+112 .. addr+176)
+# -------------------------------------------------------------------------
+
+[[variables.output]]
+name = "out"
+type = [["Byte", 4], 16]
+desc = "full 16-word compression output; the truncated CV is out[0..8]"
+pad = 0
+
+# -------------------------------------------------------------------------
+# Auxiliary
+# -------------------------------------------------------------------------
+
+[[variables.auxiliary]]
+name = "state_ptr"
+type = ["DWordHL", 22]
+desc = "per-dword pointers state_ptr[k] = addr + 8k over the 22-dword region"
+pad = ["*", 8, ["arr", 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]]
+
+[[variables.auxiliary]]
+name = "old_out"
+type = [["Byte", 8], 8]
+desc = "previous memory content of the out region, dword o = bytes old_out[o]; the MEMW writes' old value"
+pad = 0
+
+# Per-G SSA cells, 48 instances (g = 8r + j, round r ∈ 0..6, call j ∈ 0..8).
+# Each G block: A1(4B) c1,c2(2 bits) X1(4B) C1(4B) X2(4B)
+#               R1: SLL_lo(2B) SLLC_lo(2B) SLL_hi(2B) SLLC_hi(2B) Y1(4B)
+#               A2(4B) c3,c4(2 bits) X3(4B) C2(4B) X4(4B)
+#               R2: same shape as R1
+# = 56 byte cells + 4 carry bits = 60 cells; column base = 210 + 60g
+# (see prover/src/tables/blake3.rs `cols` for the exact offsets).
+
+[[variables.auxiliary]]
+name = "g_add3_out"
+type = [[["Byte", 4], 2], 48]
+desc = "A1, A2 per G: the two 3-operand add outputs (v[a] after each half)"
+pad = 0
+
+[[variables.auxiliary]]
+name = "g_add3_carry"
+type = [[["Bit", 2], 2], 48]
+desc = "two summed carry bits per 3-operand add: carry = c1 + c2 ∈ {0,1,2}"
+pad = 0
+
+[[variables.auxiliary]]
+name = "g_xor_out"
+type = [[["Byte", 4], 4], 48]
+desc = "X1..X4 per G: the four 32-bit XOR outputs (rotr16/rotr8 are free byte relabels of X1/X3)"
+pad = 0
+
+[[variables.auxiliary]]
+name = "g_add2_out"
+type = [[["Byte", 4], 2], 48]
+desc = "C1, C2 per G: the two 2-operand add outputs (v[c]); carries are expressions, not cells"
+pad = 0
+
+[[variables.auxiliary]]
+name = "g_rot"
+type = [[["Byte", 12], 2], 48]
+desc = "per rotation (rotr12 then rotr7): SLL_lo, SLLC_lo, SLL_hi, SLLC_hi (2 B each) and the output word Y (4 B)"
+pad = 0
+
+[[variables.multiplicity]]
+name = "μ"
+type = "Bit"
+desc = "1 on real rows, 0 on padding; gates every constraint and interaction; pinned boolean by an ungated IS_BIT"
+pad = 0
+
+# -------------------------------------------------------------------------
+# Constants
+# -------------------------------------------------------------------------
+
+[[constants]]
+name = "IV"
+desc = "BLAKE3 IV[0..4] (SHA-256 IV words), inlined into round-0 arithmetic — not columns"
+value = ["arr", 0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A]
+
+[[constants]]
+name = "SCHED"
+desc = "per-round message-schedule index table: round r position i reads m[SCHED[r][i]]; SCHED[r] = permute^r(identity), MSG_PERMUTATION = [2,6,3,10,7,0,4,13,1,11,12,5,9,14,15,8]; the trailing permute after round 5 is never consumed"
+value = ["arr",
+        ["arr", 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+        ["arr", 2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8],
+        ["arr", 3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1],
+        ["arr", 10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6],
+        ["arr", 12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4],
+        ["arr", 9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7],
+]
+
+[[constants]]
+name = "G_INDICES"
+desc = "the (a,b,c,d) working-state slots of the 8 G-calls per round: 4 column mixes then 4 diagonal mixes"
+value = ["arr",
+        ["arr", 0, 4, 8, 12], ["arr", 1, 5, 9, 13], ["arr", 2, 6, 10, 14], ["arr", 3, 7, 11, 15],
+        ["arr", 0, 5, 10, 15], ["arr", 1, 6, 11, 12], ["arr", 2, 7, 8, 13], ["arr", 3, 4, 9, 14],
+]
+
+# -------------------------------------------------------------------------
+# Constraint groups. All eval constraints are μ-gated; padding rows are
+# all-zero (except the keccak-idiom state_ptr pad) with μ = 0.
+# -------------------------------------------------------------------------
+
+# -------------------------------------------------------------------------
+# Constraint groups.
+#
+# ⚠ SCOPE. This file machine-formalizes the chip's I/O AND RANGE surface —
+# the ECALL binding, the x10 register read, all 22 MEMW dword operations,
+# the pointer arithmetic, and every explicit ARE_BYTES/IS_HALF/IS_BIT — i.e.
+# exactly the surface the z3 gate does NOT model (DESIGN.md §1.1: "the gate
+# cannot check this", §7 items 4/5/10). The unrolled 6-round MIXING CORE
+# (96 add3 sum identities + carry booleanities, 96 add2 expression-carry
+# booleanities, 96 inline rotation identity groups, 832 BYTE_ALU[XOR]
+# lookups wired per the SSA dataflow) is NOT re-formalized here: its
+# normative sources are the single-source Rust dataflow
+# (prover/src/tables/blake3.rs `run_flow`, interpreted once as columns and
+# once as witness) and the z3 gate that proves that dataflow equal to the
+# reference function under free inputs. Totals for cross-checking: 814
+# constraints, 1,397 interactions, max degree 3 including ×μ.
+# -------------------------------------------------------------------------
+
+[[constraint_groups]]
+name = "io"
+
+# ECALL receive: [timestamp, -3 as u64 = 2^64 - 3]
+[[constraints.io]]
+kind = "interaction"
+tag = "ECALL"
+input = ["timestamp", ["cast", ["-", ["^", 2, 64], 3], "DWordWL"]]
+multiplicity = ["-", "μ"]
+
+# MEMW register read of x10 binding addr (keccak:c:read_addr idiom)
+[[constraints.io]]
+kind = "interaction"
+tag = "MEMW"
+input = [1, ["cast", ["*", 2, 10], "DWordWL"], "addr", "timestamp", 1, 0, 0]
+output = "addr"
+multiplicity = "μ"
+ref = "blake3:c:read_addr"
+
+# The 22 dword MEMW operations at `timestamp`, per region. Input dwords
+# (k < 14) are reads in the combined read+write encoding: old = value = the
+# input words, timestamps advance. Output dwords (k >= 14) write `out` over
+# `old_out`.
+
+[[constraints.io]]
+kind = "interaction"
+tag = "MEMW"
+input = [0, ["cast", ["idx", "state_ptr", "k"], "DWordWL"], ["idx", "h", ["*", 2, "k"]], ["idx", "h", ["+", ["*", 2, "k"], 1]], "timestamp", 0, 0, 1]
+output = ["arr", ["idx", "h", ["*", 2, "k"]], ["idx", "h", ["+", ["*", 2, "k"], 1]]]
+iters = [["k", 0, 3]]
+multiplicity = "μ"
+ref = "blake3:c:load_h"
+
+[[constraints.io]]
+kind = "interaction"
+tag = "MEMW"
+input = [0, ["cast", ["idx", "state_ptr", ["+", "k", 4]], "DWordWL"], ["idx", "m", ["*", 2, "k"]], ["idx", "m", ["+", ["*", 2, "k"], 1]], "timestamp", 0, 0, 1]
+output = ["arr", ["idx", "m", ["*", 2, "k"]], ["idx", "m", ["+", ["*", 2, "k"], 1]]]
+iters = [["k", 0, 7]]
+multiplicity = "μ"
+ref = "blake3:c:load_m"
+
+[[constraints.io]]
+kind = "interaction"
+tag = "MEMW"
+input = [0, ["cast", ["idx", "state_ptr", 12], "DWordWL"], "t_lo", "t_hi", "timestamp", 0, 0, 1]
+output = ["arr", "t_lo", "t_hi"]
+multiplicity = "μ"
+ref = "blake3:c:load_t"
+
+[[constraints.io]]
+kind = "interaction"
+tag = "MEMW"
+input = [0, ["cast", ["idx", "state_ptr", 13], "DWordWL"], "block_len", "flags", "timestamp", 0, 0, 1]
+output = ["arr", "block_len", "flags"]
+multiplicity = "μ"
+ref = "blake3:c:load_len_flags"
+
+[[constraints.io]]
+kind = "interaction"
+tag = "MEMW"
+input = [0, ["cast", ["idx", "state_ptr", ["+", "o", 14]], "DWordWL"], ["idx", "out", ["*", 2, "o"]], ["idx", "out", ["+", ["*", 2, "o"], 1]], "timestamp", 0, 0, 1]
+output = ["idx", "old_out", "o"]
+iters = [["o", 0, 7]]
+multiplicity = "μ"
+ref = "blake3:c:store_out"
+
+[[constraint_groups]]
+name = "addr"
+
+# state_ptr[k] = addr + 8k via the shared ADD template (μ-gated carry pair);
+# the top dword k = 21 additionally forbids wraparound (addr + 168 < 2^64).
+[[constraints.addr]]
+kind = "template"
+tag = "ADD"
+input = [["cast", "addr", "DWordWL"], ["cast", ["*", 8, "k"], "DWordWL"]]
+output = ["cast", ["idx", "state_ptr", "k"], "DWordWL"]
+iters = [["k", 0, 21]]
+ref = "blake3:c:state_ptr"
+
+# alignment: addr[0] & 7 = 0
+[[constraints.addr]]
+kind = "interaction"
+tag = "BYTE_ALU"
+input = [0, ["idx", "addr", 0], 7, 0]
+multiplicity = "μ"
+ref = "blake3:c:alignment"
+
+# addr byte range checks — without them the addr_lo/addr_hi linear
+# combinations alias non-byte encodings (keccak:c:range_addr rationale).
+[[constraints.addr]]
+kind = "interaction"
+tag = "ARE_BYTES"
+input = [["idx", "addr", ["*", 2, "i"]], ["idx", "addr", ["+", ["*", 2, "i"], 1]]]
+iters = [["i", 0, 3]]
+multiplicity = "μ"
+ref = "blake3:c:range_addr"
+
+[[constraints.addr]]
+kind = "interaction"
+tag = "IS_HALF"
+input = [["idx", ["cast", ["idx", "state_ptr", "k"], "DWordHL"], "hw"]]
+iters = [["k", 0, 21], ["hw", 0, 3]]
+multiplicity = "μ"
+ref = "blake3:c:range_state_ptr"
+
+[[constraint_groups]]
+name = "range"
+
+# m is never XOR-consumed — explicit byte checks (DESIGN §4.7 / §7.5).
+[[constraints.range]]
+kind = "interaction"
+tag = "ARE_BYTES"
+input = [["idx", ["idx", "m", "i"], ["*", 2, "p"]], ["idx", ["idx", "m", "i"], ["+", ["*", 2, "p"], 1]]]
+iters = [["i", 0, 15], ["p", 0, 1]]
+multiplicity = "μ"
+ref = "blake3:c:range_m"
+
+# old_out rides only the MEMW bus — same aliasing argument as the address.
+[[constraints.range]]
+kind = "interaction"
+tag = "ARE_BYTES"
+input = [["idx", ["idx", "old_out", "o"], ["*", 2, "p"]], ["idx", ["idx", "old_out", "o"], ["+", ["*", 2, "p"], 1]]]
+iters = [["o", 0, 7], ["p", 0, 3]]
+multiplicity = "μ"
+ref = "blake3:c:range_old_out"
+
+# The four shift halfwords of each inline rotation (SLL_lo, SLLC_lo,
+# SLL_hi, SLLC_hi — bytes 0..8 of each rotation block). The tight SLL
+# bounds are load-bearing for the rotation identities (DESIGN §4.2).
+[[constraints.range]]
+kind = "interaction"
+tag = "ARE_BYTES"
+input = [["idx", ["idx", ["idx", "g_rot", "g"], "half"], ["*", 2, "p"]], ["idx", ["idx", ["idx", "g_rot", "g"], "half"], ["+", ["*", 2, "p"], 1]]]
+iters = [["g", 0, 47], ["half", 0, 1], ["p", 0, 3]]
+multiplicity = "μ"
+ref = "blake3:c:range_rot"
+
+[[constraint_groups]]
+name = "mu"
+
+# μ boolean, ungated — the ECALL receive anchors μ>0 rows to a CPU ecall
+# whose ECALL flag is boolean; this constraint makes the argument local.
+[[constraints.mu]]
+kind = "template"
+tag = "IS_BIT"
+input = ["μ"]
+ref = "blake3:c:range_mu"
