@@ -519,8 +519,16 @@ test-syscalls:
 
 # ethrex-crypto is a detached workspace (excluded from the root members), so a
 # root `cargo test` never runs it. Run it explicitly, like test-syscalls.
+# Run BOTH profiles deliberately. k256 swaps its FieldElement implementation on
+# `debug_assertions` (k256 0.13.4 arithmetic/field.rs): debug uses the
+# magnitude-tracking `field_impl` wrapper, release uses the raw FieldElement5x52.
+# The guest ELF is built with --release, so a release run is the only one that
+# exercises the implementation that actually ships; the debug run is kept because
+# its magnitude debug_asserts turn a contract violation into a loud panic instead
+# of a silently wrong value.
 test-ethrex-crypto:
 	cd crypto/ethrex-crypto && cargo test
+	cd crypto/ethrex-crypto && cargo test --release
 
 test: compile-programs test-syscalls test-ethrex-crypto
 	cargo test
