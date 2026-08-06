@@ -4,47 +4,52 @@ const MAX_MEMORY_SIZE: usize = 0xC000_0000;
 const WORD_SIZE: usize = 4;
 
 // Guest global allocator, selectable at build time. The default was chosen on a measured
-// three-way A/B against embedded-alloc's TLSF heap (the previous default, now removed) over
-// ethrex blocks of 1..1500 transfers plus a real Hoodi block, monolithic and with
-// continuations, on cycles, trace elements, proving time, proof size and peak RSS. The
-// figures below are post-#861: thin LTO inlines the per-allocation free-list bookkeeping
-// dlmalloc and TLSF pay and bump avoids by construction, closing ~2/3 of the gap the same
-// comparison showed before it -- expect smaller numbers than any pre-LTO run reports. They
-// also predate the in-place `realloc` below, which takes a further 0.6..1.3% off guest cycles
-// across the ethrex fixtures but has not been re-run against dlmalloc.
+// three-way A/B against embedded-alloc's TLSF heap (the previous default, now removed) and
+// dlmalloc: bump spends the fewest guest cycles and proves fastest at the epochs worth
+// running, and it pays for that with a 0.6..1.0% larger proof bundle at every epoch and a
+// loss at epoch 2^20, where eight epochs amplify the pages its non-reuse touches. Numbers,
+// fixtures and method are in #869; the real block does not resolve the difference.
 //
 //   - default: a monotonic bump allocator. No free lists and no coalescing -- `alloc` moves
 //     a cursor, `dealloc` is empty -- so it spends the fewest guest instructions per
-//     allocation. Against dlmalloc: ~7% fewer guest cycles on a 20-transfer block, ~6% on
-//     150 transfers, ~3% on a real Hoodi block (where keccak and trie work dominate and the
-//     allocator's share dilutes); ~2.6% faster to prove monolithic at ~4% lower peak RSS,
-//     and ~1.2% with continuations at epochs 2^21 and 2^22. It never reuses a freed region,
-//     so its footprint grows monotonically -- see the ceiling note below.
-//
-//     Non-reuse costs it two things. The proof bundle is 0.6..1.0% larger at every epoch
-//     (deterministic: memory that is never reused spans more pages, and every page touched
-//     pays PAGE rows), and at epoch 2^20 dlmalloc proves ~2.3% faster, where eight epochs
-//     amplify that page cost. Larger epochs are ~26% cheaper in absolute terms, so the
-//     configuration worth running is the one bump wins.
+//     allocation. It never reuses a freed region, so its footprint grows monotonically and
+//     the proof pays PAGE rows for every page that footprint spans -- see the ceiling note
+//     below.
 //   - `dlmalloc-alloc` feature: Doug Lea's malloc on a bump "system" provider that hands it
 //     page-aligned segments. Slower to prove at the epochs worth running, but its footprint
 //     is bounded by live bytes rather than total bytes ever allocated, and it can grow a
 //     buried block in place, which bump cannot. Select it for an execution whose churn has
-//     no per-block bound, and when proof size or epoch 2^20 is what counts.
+//     no per-block bound, and when proof size or epoch 2^20 is what counts. Nothing selects
+//     it today: CI builds and tests the feature on host, but no guest manifest or Makefile
+//     rule turns it on, so the riscv64 `#[global_allocator]` below is a fallback with no
+//     consumer yet.
 //
 // Bump's ceiling is cumulative allocation, measured at ~3 GiB -- the size of
-// [_end, MAX_MEMORY_SIZE). A single block cannot reach it: allocation is bounded by gas, and
-// a gas-full block of the cheapest transactions (1500 transfers, 31.5M gas, 523M cycles)
-// executes with room to spare. What spends that budget faster than live bytes suggest is that
-// nothing is ever reclaimed: `dealloc` is a no-op, and a grow that cannot extend in place --
-// the block is not the one the cursor sits on -- abandons the old block on top of that. A
-// guest program that processes many blocks in one execution has no per-block bound at all,
-// which is what `dlmalloc-alloc` is for.
+// [_end, MAX_MEMORY_SIZE). Allocation is linear in gas, measured execute-only over eight
+// ethrex fixtures from 0.42M to 63M gas: 2.55 MB + 2.213 B/gas, with the marginal rate flat
+// (2.18..2.29) across that 150x range, so there is no superlinear term to reach the ceiling
+// with. 1500 transfers (31.5M gas) allocate 72.1 MB. What binds is bytes per gas, not
+// transactions per gas, and transfers roughly minimise it: the contract-heavy blocks measure
+// up to 3.87 B/gas, which puts a 60M-gas block at ~232 MB, a 13.9x margin, and needs ~832M
+// gas to exhaust. Both contract-heavy fixtures are small blocks (2.4M and 4.2M gas), so that
+// rate carries the ~2.5 MB constant in its average and no gas-full contract-heavy block has
+// been measured -- the margin is an extrapolation, and `dlmalloc-alloc` is the one-flag
+// fallback if a block ever exceeds it.
+//
+// What spends that budget faster than live bytes suggest is that nothing is ever reclaimed:
+// `dealloc` is a no-op, and a grow that cannot extend in place -- the block is not the one the
+// cursor sits on -- abandons the old block on top of that. A guest program that processes many
+// blocks in one execution has no per-block bound at all, which is what `dlmalloc-alloc` is for.
 //
 // Exhausting the heap does not fail cleanly today: `alloc` returns null, which reaches
 // `handle_alloc_error`, which panics into the guest's `#[panic_handler]` -- `loop {}` in every
 // guest here -- so execution spins instead of aborting, and nothing on the proving path
 // bounds cycles (`--cycle-budget` is opt-in and only on `execute`). So the fallback matters.
+// This predates the bump default -- TLSF returned null and hung through the same panic
+// handler -- and fixing it is not allocator-local: `HALT` constrains `exit_code = 0`, so a
+// nonzero exit cannot be proved at all, and a clean abort needs either a committed failure
+// marker or a non-provable abort ecall. The cheaper mitigation, a host-side cycle bound on
+// `prove`, needs neither.
 //
 // Only the guest installs a #[global_allocator]; on host (e.g. `cargo test` for the
 // sponge's differential tests) the attribute would hijack the test harness's
