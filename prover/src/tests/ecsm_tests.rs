@@ -19,6 +19,10 @@ const IDX_YG_CONV0: usize = 323; // ConvCarry(Yg, 0)
 const IDX_Q1_BIT32: usize = 388; // IS_BIT(q1[32])
 const IDX_XG_CARRY0: usize = 389; // CarryBit(XgLtP, 0)
 const IDX_XG_OVERFLOW: usize = 396; // OverflowRequired(XgLtP)
+const IDX_ADDR_XG_ADD: usize = 413; // AddCarryPair(addr_xG[1]), 2 per address, i = 1..=3
+const IDX_ADDR_XR_ADD: usize = 425; // AddCarryPair(addr_xR[1])
+const IDX_ADDR_XG_NOWRAP: usize = 431; // µ·carry_1 = 0 on addr_xG[3]
+const IDX_ADDR_XR_NOWRAP: usize = 433; // µ·carry_1 = 0 on addr_xR[3]
 
 fn gx_le() -> [u8; 32] {
     // secp256k1 Gx, little-endian.
@@ -94,7 +98,7 @@ fn constraints_hold_on_generated_trace() {
 
 #[test]
 fn constraint_set_count() {
-    assert_eq!(EcsmConstraints.meta().len(), 413);
+    assert_eq!(EcsmConstraints.meta().len(), 434);
 }
 
 /// The yG carry recurrence closes on all-zero padding because both the `µ·p²` offset and the
@@ -266,4 +270,75 @@ fn constraints_hold_for_k_eq_n_minus_one() {
             assert_eq!(*v, FE::zero(), "constraint {i} must hold at row {row}");
         }
     }
+}
+
+/// `ec:c:extrapolate_addr_*`: a per-access address that is not `addr[0] + 8i` breaks the
+/// addition. Without these constraints the twelve MEMW accesses could be sent at twelve
+/// unrelated addresses, which is the deviation #902 reports.
+#[test]
+fn extrapolate_addr_rejects_a_wrong_per_access_address() {
+    let trace = generate_ecsm_trace(&[op_for(5)]);
+    let clean = eval_row(&trace, 0);
+    for (i, v) in clean.iter().enumerate() {
+        assert_eq!(*v, FE::zero(), "constraint {i} must hold on the clean row");
+    }
+
+    // Move addr_xG[2] by one byte: 0x2010 -> 0x2011.
+    let mut main: Vec<FE> = (0..cols::NUM_COLUMNS)
+        .map(|c| *trace.main_table.get(0, c))
+        .collect();
+    main[cols::addr_xg_acc(2, 0)] = main[cols::addr_xg_acc(2, 0)] + FE::one();
+    let row = eval_main_row(main);
+    // Index 413 + 2 is the low-limb carry of the i = 2 addition.
+    assert_ne!(
+        row[IDX_ADDR_XG_ADD + 2],
+        FE::zero(),
+        "a per-access address that is not addr_xG[0] + 16 must break the ADD carry"
+    );
+}
+
+/// The `µ·carry_1 = 0` addition, which the spec's `ADD` template does not give us: without it
+/// `addr[3] = addr[0] + 24 − 2^64` satisfies the carry pair, so an operand could wrap the
+/// address space in-circuit while the executor refuses it.
+#[test]
+fn addr_wrapping_past_u64_is_rejected() {
+    let mut main = vec![FE::zero(); cols::NUM_COLUMNS];
+    main[cols::MU] = FE::one();
+    // addr_xR[0] = u64::MAX - 7, so addr_xR[3] = addr + 24 wraps to 0x10.
+    let base = u64::MAX - 7;
+    main[cols::ADDR_XR_0] = FE::from(base & 0xFFFF_FFFF);
+    main[cols::ADDR_XR_1] = FE::from(base >> 32);
+    for i in 1..4u64 {
+        let a = base.wrapping_add(8 * i);
+        for hw in 0..4 {
+            main[cols::addr_xr_acc(i as usize, hw)] = FE::from((a >> (16 * hw)) & 0xFFFF);
+        }
+    }
+    let row = eval_main_row(main);
+    // Both carry bits of each addition are satisfied by the wrapped witness...
+    for i in 0..6 {
+        assert_eq!(
+            row[IDX_ADDR_XR_ADD + i],
+            FE::zero(),
+            "the wrapped addition still satisfies its carry bits (i = {i})"
+        );
+    }
+    // ...which is exactly why the no-wrap constraint has to be there.
+    assert_ne!(
+        row[IDX_ADDR_XR_NOWRAP],
+        FE::zero(),
+        "an operand whose last address wraps u64 must be rejected"
+    );
+}
+
+/// Padding rows stay valid: every new constraint is µ-gated, so an all-zero row closes.
+#[test]
+fn addr_constraints_close_on_padding() {
+    let main = vec![FE::zero(); cols::NUM_COLUMNS];
+    let row = eval_main_row(main);
+    for (offset, v) in row[IDX_ADDR_XG_ADD..=IDX_ADDR_XR_NOWRAP].iter().enumerate() {
+        let idx = IDX_ADDR_XG_ADD + offset;
+        assert_eq!(*v, FE::zero(), "constraint {idx} must close at µ = 0");
+    }
+    assert_eq!(row[IDX_ADDR_XG_NOWRAP], FE::zero());
 }

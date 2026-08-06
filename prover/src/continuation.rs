@@ -2021,6 +2021,50 @@ mod tests {
         );
     }
 
+    // An ECSM operand whose last doubleword's trailing bytes cross `2^32` maps a runtime page
+    // at `0x1_0000_0000`, so the epoch machinery has to carry a page whose base sits exactly on
+    // the limb boundary through the per-epoch touched-cell pass and the L2G bookkeeping. The
+    // monolithic path is covered by `test_prove_ecsm_operand_crossing_limb_boundary`; this is
+    // the same guest split across epochs.
+    #[test]
+    fn test_ecsm_operand_crossing_limb_across_epochs() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let elf_bytes = asm_elf_bytes("test_ecsm_limb_cross");
+        let total = Executor::new(&Elf::load(&elf_bytes).unwrap(), vec![])
+            .unwrap()
+            .run()
+            .unwrap()
+            .logs
+            .len();
+        assert!(
+            total > 32,
+            "the guest must span more than one 32-cycle epoch"
+        );
+
+        let mut gx = [
+            0x79u8, 0xBE, 0x66, 0x7E, 0xF9, 0xDC, 0xBB, 0xAC, 0x55, 0xA0, 0x62, 0x95, 0xCE, 0x87,
+            0x0B, 0x07, 0x02, 0x9B, 0xFC, 0xDB, 0x2D, 0xCE, 0x28, 0xD9, 0x59, 0xF2, 0x81, 0x5B,
+            0x16, 0xF8, 0x17, 0x98,
+        ];
+        gx.reverse();
+        let mut k = [0u8; 32];
+        k[0] = 5;
+        let expected = ecsm::scalar_mul_x(&k, &gx).unwrap();
+
+        let out = prove_and_verify_continuation(
+            &elf_bytes,
+            &[],
+            5,
+            &ProofOptions::default_test_options(),
+        )
+        .unwrap();
+        assert_eq!(
+            out.as_deref(),
+            Some(&expected[..]),
+            "xR read back from across the 2^32 boundary must survive epoch splitting"
+        );
+    }
+
     // Guards that the continuation API takes `epoch_size_log2` directly. A log2 of
     // 4 produces 16-cycle epochs over the 33-cycle `test_commit_split`, putting its
     // two commits in different epochs and exercising the cross-epoch x254 carry.

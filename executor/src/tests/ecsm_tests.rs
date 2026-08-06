@@ -158,33 +158,14 @@ fn ecsm_syscall_rejects_overlapping_xg_k() {
 }
 
 #[test]
-fn ecsm_syscall_rejects_address_overflow() {
-    // The bound is the last doubleword BASE (+24), for every operand: at 0xFFFF_FFE8 that
-    // base is exactly 2^32, so the AIR emits a non-canonical low limb and cannot prove it.
-    for (addr_xr, addr_xg, addr_k) in [
-        (0xFFFF_FFE8, 0x2000, 0x3000),
-        (0x1000, 0xFFFF_FFE8, 0x3000),
-        (0x1000, 0x2000, 0xFFFF_FFE8),
-        (0xFFFF_FFF0, 0x1000, 0x2000),
-        (0x1000, 0xFFFF_FFF8, 0x2000),
-        (0x1000, 0x2000, 0xFFFF_FFFF),
-    ] {
-        let err = run_ecsm_at(addr_xr, addr_xg, addr_k).unwrap_err();
-        assert!(
-            matches!(err, ExecutionError::EcsmAddressOverflow),
-            "expected address overflow for xR={addr_xr:#x}, xG={addr_xg:#x}, k={addr_k:#x}"
-        );
-    }
-}
-
-#[test]
 fn ecsm_syscall_accepts_operands_crossing_the_limb() {
-    // The seven low limbs 0xFFFF_FFE1..=0xFFFF_FFE7 keep every doubleword base inside the
-    // limb while the last doubleword's trailing bytes cross 2^32, which MEMW's carry columns
-    // handle. The AIR proves these (see the prover-side
-    // `test_prove_ecsm_operand_crossing_limb_boundary`), so the executor must not reject
-    // them: a +31 bound here would accept a different set than the circuit.
-    for lo32 in 0xFFFF_FFE1u64..=0xFFFF_FFE7 {
+    // The ECSM table derives every one of its twelve doubleword addresses as its own
+    // range-checked column, with a real 64-bit addition, so an operand that straddles `2^32`
+    // is proved exactly and the executor must not reject it. That covers the whole top of a
+    // limb, including the seven values a `+31` precondition used to refuse while the AIR
+    // proved them. The prover counterpart is
+    // `test_prove_ecsm_operand_crossing_limb_boundary`.
+    for lo32 in 0xFFFF_FFE1u64..=0xFFFF_FFFF {
         run_ecsm_at(lo32, 0x1000, 0x2000)
             .unwrap_or_else(|e| panic!("xR at {lo32:#x} must run, got {e:?}"));
         run_ecsm_at(0x1000, lo32, 0x2000)
@@ -192,29 +173,49 @@ fn ecsm_syscall_accepts_operands_crossing_the_limb() {
         run_ecsm_at(0x1000, 0x2000, lo32)
             .unwrap_or_else(|e| panic!("k at {lo32:#x} must run, got {e:?}"));
     }
-    // The largest low limb with no crossing at all is still fine.
-    run_ecsm_at(0xFFFF_FFE0, 0x1000, 0x2000).expect("xR at 0xFFFF_FFE0 must run");
+    // Straddling a high limb boundary too: the carry lands in the high half of the address.
+    run_ecsm_at(0x0000_0001_FFFF_FFF9, 0x1000, 0x2000).expect("xR crossing into hi = 2 must run");
 }
 
 #[test]
-fn ecsm_syscall_leaves_the_top_of_the_address_space_to_the_memory_path() {
-    // With high limb 0xFFFF_FFFF a carry out of the low limb would need hi + 1 = 2^32, which
-    // no page can hold, so the AIR cannot prove it. `ecsm_addr_ok` does not look at the high
-    // limb; the general memory path rejects these because the byte address passes u64::MAX.
-    // This test pins that reliance: if `Memory::store_doubleword` ever stopped checking,
-    // the ECSM guard would have to grow a high-limb condition of its own.
-    for lo32 in [0xFFFF_FFE1u64, 0xFFFF_FFE7] {
-        let addr = 0xFFFF_FFFF_0000_0000 | lo32;
+fn ecsm_syscall_rejects_operands_past_the_address_space() {
+    // The one condition left. A 64-bit overflow is unprovable — the AIR's `µ·carry_1 = 0` on
+    // the last address forbids the wrapped addition, and a byte carry at high limb
+    // 0xFFFF_FFFF would need `hi + 1 = 2^32`, which no page can hold. The two coincide with
+    // what `checked_add` refuses here, which is why ECSM needs no precondition of its own:
+    // the AIR accepts an operand iff `addr + 31 < 2^64`, and so does this.
+    //
+    // `u64::MAX - 31` is the largest operand that fits; one byte further must fail, and so
+    // must a base that wraps outright.
+    run_ecsm_at(u64::MAX - 31, 0x1000, 0x2000).expect("the last operand that fits must run");
+    for addr in [u64::MAX - 30, u64::MAX - 24, u64::MAX - 7, u64::MAX] {
         let err = run_ecsm_at(addr, 0x1000, 0x2000).unwrap_err();
         assert!(
             matches!(
                 err,
                 ExecutionError::MemoryError(MemoryError::AddressOverflow)
             ),
-            "xR at {addr:#x} must be rejected by the memory path, got {err:?}"
+            "xR at {addr:#x} must be rejected, got {err:?}"
         );
     }
-    // An 8-aligned base can never carry, so the same high limb is fine there.
-    run_ecsm_at(0xFFFF_FFFF_FFFF_FFE0, 0x1000, 0x2000)
-        .expect("aligned operand at the top of the address space must run");
+    // Same on an input operand, where the rejection comes from the load rather than the store.
+    // Written out instead of going through `run_ecsm_at`, whose fixture would itself overflow
+    // trying to place `xG` there.
+    let mut pc = 0;
+    let mut registers = Registers::default();
+    let mut memory = Memory::default();
+    registers.write(17, ECSM_SYSCALL_NUMBER).unwrap();
+    registers.write(10, 0x1000).unwrap();
+    registers.write(11, u64::MAX - 30).unwrap();
+    registers.write(12, 0x2000).unwrap();
+    let err = Instruction::EcallEbreak
+        .run(&mut pc, &mut registers, &mut memory)
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ExecutionError::MemoryError(MemoryError::AddressOverflow)
+        ),
+        "an xG operand past the address space must be rejected by the load, got {err:?}"
+    );
 }
