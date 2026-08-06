@@ -710,6 +710,26 @@ Recorded so they stop propagating.
    bytes and so wins only when permutations are expensive — which the candidates make
    *less* true, not more.
 
+9. **§2.3's whole candidate table — SUPERSEDED by §8.6** (`[hash-w10]`, MEASURED).
+   Every candidate row held the 1,784,197,396 residue fixed, and that residue is
+   **95.8 % the `felt_be_halves` byteswap gadget**, which the field-native candidates
+   delete. §2.3's "48–79 GiB, so the choice is not cost-gated" splits into ~71 GiB
+   (blake, which keeps the gadget AND `BITWISE`) and ~4–8 GiB (algebraic). The
+   "every candidate fits the 124 GiB box" half survives; the "choosing on predicted
+   wrap size is choosing on noise" half does not, across families.
+
+10. **The two-term RSS model's sub-proof count is 19 at this shape, not 24** —
+    and it is candidate-dependent (§8.6). 24 is the INNER epoch's leg count; the
+    per-sub-proof term is about the WRAP being produced, which carries 13 chip
+    classes plus 6 `KECCAK_RND` chunks. Immaterial for keccak, but it is 27–41 % of
+    the projection for the field-native rows, where it becomes the dominant term.
+
+11. **"Delegation" is not an available lever for this machine** (§8.7, priced).
+    A separate blake circuit plus verifying its proof costs +66 % over hosting the
+    chip in the epoch verifier's own multi-proof. Airbender's delegation circuit
+    exists to move hash work out of a FIXED-SIZE main circuit; the LFM has none,
+    so its multi-AIR proof already is that pattern.
+
 ---
 
 ## 6. Slice 1a DONE — the permutation, and the pinned prediction for the chip
@@ -999,3 +1019,362 @@ AIR's *shape*; `compress_iv` is zero because domain separation is a
 cryptographic decision deliberately not invented here. Per §0c the decision is
 not cost-gated anyway — every candidate fits the box — so this column adds
 information (the corpus had zero Poseidon AIR data) without rendering a pick.
+
+---
+
+## 8. Slice 2 DONE — the blake column MEASURED, and the residue turns out to BE the byteswap
+
+Wave 10 (`[hash-w10]`), 2026-08-06. Donor: PR #903 `feat(prover,executor): BLAKE3
+6-round compression accelerator`, head **`89aeeb8c2b0389e9d21a861c9e3a10a7b1b5704e`**.
+
+**Landed:** `prover/src/lfm/blake3.rs` (the primitive + the 10 canonical 6-round
+vectors + negative controls), `prover/src/lfm/blake3_chip.rs` (the chip, hosted
+on `LfmMem`), `prover/src/lfm/blake3_probe.rs` (prove+verify, falsification, and
+two `#[ignore]`d measurement instruments). `lfm` suite **244 passed / 0 failed /
+5 ignored** (was 230/0/5), `make lint` exit 0 (make's own status).
+
+### 8.1 The headline, and it is not the column
+
+The blake column came out where §2.3 predicted (3.7–4.1× under keccak against a
+predicted 3.68×). **The finding that matters is the one the column was measured
+against: the 1,784,197,396-cell "non-hash residue" that every candidate row in
+§2.3 sits on is 95.8 % a single gadget** — `felt_be_halves`, the felt →
+big-endian-u32-halves serializer, at 1,684,910,080 cells.
+
+§1's warning was right and an order of magnitude too quiet. It said "part of that
+residue is byte-serialization work … a field-native hash deletes outright" and
+concluded the candidate predictions were therefore conservative. They were
+conservative by **~10×**, not by a few percent, and §2.3's robustness note —
+"choosing among the algebraic candidates on predicted wrap size is choosing on
+noise" — is now **false in the one comparison the decision turns on**: blake and
+the field-native candidates are ~11× apart, not 1.6×.
+
+### 8.2 The measurement: cells per compression, on our stack
+
+MEASURED, prove+verify (rule 2), `blake3_probe::the_hosted_chip_proves_and_verifies`:
+the chip is built with its real 1,259 interactions and its real 769 constraints,
+its preprocessed prefix is committed for real via `commit_columns`, and both its
+buses are closed — `ByteAlu`/`AreBytes` against the UNCHANGED production
+`BITWISE` table, `LfmMem` against a mirror AIR.
+
+| | #903, syscall variant | hosted here | basis |
+|---|---|---|---|
+| value columns | 3,219 | **3,056** | MEASURED |
+| bus interactions | 1,397 | **1,259** | MEASURED |
+| aux columns (`⌈i/2⌉`) | 699 | **630** | DERIVED |
+| **base-equiv `m + 3a`** | **5,316** | **4,946** | **MEASURED** |
+| constraints | 814 | **769** | MEASURED |
+| max degree | 3 | **3** declared, **3** measured | MEASURED |
+
+5,316 reproduces #903's own stated figure exactly, which is the corroboration
+that the two are being counted the same way.
+
+**The 370-cell (7.0 %) saving is entirely I/O.** Dropped: the `Ecall` receiver,
+the x10 register read, 22 `Memw` dword ops, the 32 `OLD_OUT` `AreBytes`, 4 addr
+`AreBytes` + the alignment `AND`, and 88 pointer `IsHalfword`s (149 interactions);
+and the `TIMESTAMP`/`ADDR`/`PTR`/`OLD_OUT` columns (162), plus `MU` moving into
+the preprocessed prefix. Added: 11 `LfmMem` word tokens (7 reads of the 28 input
+`u32`s, 4 writes of the 16 output `u32`s), the machine word being four `u32`
+lanes exactly as `LFM_KECCAK` defines it.
+
+⚠ **Dropping those range checks is sound, not merely cheaper, and the argument is
+worth keeping.** Each guarded something that no longer exists: `OLD_OUT` is the
+previous memory content in a `Memw` write's `old` field and an `LfmMem` write has
+none; the address checks guard a prover-witnessed pointer read out of x10, where
+here every address is a preprocessed column the admission validator vouches for.
+The byte-range coverage of the DATA columns is untouched — `m`'s 64 bytes keep
+their 32 explicit `AreBytes` (they are never XOR-consumed), `h` is an operand of
+the feed-forward XOR, `t_lo`/`t_hi`/`block_len`/`flags` are `v[12..16]` and hence
+`vd` operands of round-0 `G`s, and all 64 `OUT` bytes are XOR *results*. So every
+byte a token recomposes is range-checked before the recomposition, which is the
+same transitive argument `chips::keccak` records for its 400 state bytes.
+
+**Basis label: hosted-measured, not registered.** `LFM_BLAKE3` is not in the
+fixed AIR set — `airs.rs` still names 14 chips — so what is proved is the chip
+under our AIR framework with its buses closed by a synthetic memory, not an
+epoch verifier that hashes with blake. Registration would move every program
+digest and is a separate decision. What the probe therefore *cannot* see is
+listed in its module doc: whether an LFM program can drive the chip, whether the
+validator accepts the address assignment, and anything cryptographic about A6R.
+
+### 8.3 The geometry: blake's `P` is the rate-8 count, and no extra compressions
+
+VERIFIED against #903's ABI. A 2-to-1 Merkle compression is `compress(h = IV,
+m = left‖right)` — 64 bytes of message, ONE compression, 1:1 with keccak's
+64-bytes-inside-a-136-byte-rate parent. An absorb of `N` felts is `⌈N/8⌉`
+compressions at 8 bytes per felt. The counter `t`, `block_len` and `flags` live
+in `v[12..16]`, i.e. in the *state*, not in message space, so **the message-mode
+framing forces no extra compressions**. Blake therefore shares the field-native
+candidates' `P`, re-derived on this run rather than quoted:
+
+```
+legs @ rate 17 (keccak)          115,413   = the EMITTED count, exactly (assert)
+legs @ rate  8 (blake and field-native) 187,902
+spine                              2,667   absorption-bound, so 1.0x–2.125x
+P at rate 8 in [190,569 , 193,570]         — §2.1's interval, reproduced
+```
+
+⚠ One conservatism carried deliberately: `blocks_at_rate` uses keccak's
+`⌊n/rate⌋ + 1` padding convention, which always spends a trailing block. BLAKE3
+signals length in `block_len` and needs none, so blake's true count is between
+`⌈N/8⌉` and this. Using the same convention on both sides is what makes the
+rate-17 case reproduce the emitted count exactly, so it is kept and the
+direction recorded: **blake's `P` here is an upper bound.**
+
+### 8.4 The residue, split — MEASURED
+
+Instrument: `blake3_probe::the_blake_column_and_the_residue_split` (`#[ignore]`d;
+proves a real inner epoch at blowup 8 and emits ~2.25M instructions). Epoch
+`[2 ×14, 3, 4 ×4, 5 ×3, 7, 20]`, inner blowup 8 / 73 queries, **19 sub-proofs**.
+
+```
+LFM_BALU     134,217,728 rows ×  4 main /  2 aux   1,342,177,280   12.02%
+LFM_BITDEC     2,097,152 rows × 66 main / 33 aux     346,030,080    3.10%
+LFM_LANES      2,097,152 rows ×  4 main /  5 aux      39,845,888    0.36%
+KECCAK_RND     2,883,584 rows ×1480 main /576 aux   9,250,537,472   82.85%
+LFM_KECCAK       131,072 rows ×736 main / 88 aux     131,072,000    1.17%
+BITWISE        1,048,576 rows × 10 main /  5 aux      26,214,400    0.23%
+(+ 8 more chips, 0.63% between them)                ------------
+TOTAL                                              11,165,806,868
+```
+
+The keccak permutation chips come to **9,381,609,600**, which reconciles §1's
+9,381,609,472 to within `KECCAK_RC`'s 128 cells — so §1's residue of
+1,784,197,396 was `total − LFM_KECCAK − KECCAK_RND` and **included the `BITWISE`
+table**. Stated cleanly:
+
+| | cells | basis |
+|---|---|---|
+| keccak permutation chips (`LFM_KECCAK`+`KECCAK_RND`+`KECCAK_RC`) | 9,381,609,600 | MEASURED |
+| `BITWISE`, fixed 2²⁰ (blake keeps it, field-native deletes it) | 26,214,400 | MEASURED |
+| residue | 1,757,982,868 | MEASURED |
+| — of which the byteswap gadget | **1,684,910,080 (95.84 %)** | MEASURED |
+| **residue, byte-oriented** (blake: gadget + `BITWISE` kept) | **1,757,982,868** | MEASURED |
+| **residue, field-native** (both deleted) | **73,072,788** | DERIVED |
+
+**How the byteswap share is counted, and why it is exact rather than attributed.**
+`felt_be_halves` is one `BitDec(64)` plus 64 `BALU` rows per felt
+(`machine_tests::felt_be_halves_cost` pins that). Every other production
+`bit_dec` site passes 32 bits or a Merkle depth — `sample_u64_pow2` *asserts*
+`nbits ≤ 32` — so a 64-bit decomposition in this program IS the gadget. The
+instrument prints the whole width histogram so a future 64-bit caller shows up
+instead of being silently folded in:
+
+```
+BitDec widths: {4: 1022, 5: 73, 6: 292, 7: 219, 9: 73, 22: 73, 32: 398, 64: 1,122,145}
+```
+
+1,122,145 gadget calls ⇒ 71,817,280 `BALU` rows, **99.78 % of all `LFM_BALU`
+rows**. Padding-aware: the two chips cost 1,688,207,360 with the gadget and
+3,297,280 without, hence the 1,684,910,080.
+
+⚠ **The field-native line is DERIVED by subtraction from a keccak-shaped
+emission**, not measured on a re-emitted field-native verifier, and it is an
+**upper** bound: a field-native absorb also deletes Pack/Unpack traffic around
+the gadget, and `LFM_LANES` still costs 39,845,888 here (55 % of the whole
+field-native residue).
+
+⚠ **The gadget's cost is structural given the current ISA, not an endianness
+accident.** Big-endian order is what forces the 32-term weighted recombination,
+but *any* felt → two-`u32`-halves split needs a range-checked decomposition, and
+the LFM has no 32-bit range-check instruction (`LFM_RANGE` is a 2¹⁶ table that
+`chips::range`'s own comment calls "idle in v0"). Wiring one would be the lever;
+it is unbuilt and unmeasured and is NOT assumed anywhere above.
+
+### 8.5 ★ A cheap lever nobody has pulled: chunk `LFM_BALU`
+
+`LFM_BALU` has 71,974,504 real rows and pads to 2²⁷ = 134,217,728 — an **86 %
+overshoot**, 622 M cells of pure padding. `LFM_BITDEC` pads 1,124,295 → 2,097,152
+for another 161 M. Together **≈783 M cells, 7.0 % of the keccak total and 28 % of
+blake's**, recoverable by the chunking policy `KECCAK_RND` already has
+(`airs.rs`'s chunk machinery is generic; nothing about it is keccak-specific).
+DERIVED from this run's census; not attempted, and it does not move the
+field-native rows, whose `BALU` is tiny.
+
+### 8.6 The matrix, RE-DERIVED — and §2.3's rows are superseded
+
+`P = 192,000`; hash cells are `rows × cells-per-permutation` with rows either
+chunked (≈1.9 % waste, the `KECCAK_RND` policy) or padded to the next power of
+two (36 % waste); RSS is the two-term model with the **candidate's own sub-proof
+count** (see the correction below).
+
+| candidate | basis of cells/perm | hash cells | **total cells** | vs keccak | subs | **RSS GiB** |
+|---|---|---|---|---|---|---|
+| **keccak — MEASURED, ours** | 77,992 | 9,407,824,000 | **11,165,806,868** | 1.00× | 19 | **284.1** |
+| **BLAKE3-6r, chunked** | **4,946 MEASURED** | 967,402,978 | **2,751,600,246** | **4.06×** | 12 | **71.3** |
+| BLAKE3-6r, padded | 4,946 MEASURED | 1,296,564,224 | 3,080,761,492 | 3.62× | 12 | 79.6 |
+| **Poseidon-original, chunked** | **621 MEASURED (w9)** | 121,463,253 | **194,536,041** | **57.4×** | 10 | **6.7** |
+| Poseidon-original, padded | 621 MEASURED (w9) | 162,791,424 | 235,864,212 | 47.3× | 10 | 7.7 |
+| RPO, chunked | 152 INHERITED est. | 29,730,136 | 102,802,924 | 108.6× | 10 | 4.4 |
+| Monolith, chunked | ~850 INHERITED est. | 166,254,050 | 239,326,838 | 46.7× | 10 | 7.8 |
+
+**What changed and why.** §2.3 put every candidate in a 48–79 GiB band and
+concluded the choice was not cost-gated. The first half survives — **every
+candidate still fits the 124 GiB box** — but the band was an artefact of holding
+the byteswap gadget fixed across rows that delete it. The real spread is
+**4.4 GiB to 71 GiB, and blake is ~11× the field-native candidates**, so wrap
+size *is* a discriminator between the byte-oriented and the algebraic families
+(though still not among the algebraic ones, where §2.3's noise argument holds:
+RPO, Poseidon and Monolith differ by 2.4× on cells-per-permutation and land
+within 1.8× on total).
+
+⚠ **Correction to the sub-proof count, which wave 9 and §2.3 both got wrong.**
+The two-term model's per-sub-proof term is about the proof being *produced* — the
+wrap. At this shape the wrap has **19** sub-proofs (13 chip classes + 6
+`KECCAK_RND` chunks), not 24; 24 is the INNER epoch's leg count. It is also
+candidate-dependent: blake drops three keccak-family chips and adds one (≈12),
+field-native drops four including `BITWISE` (≈10). At keccak's scale this moves
+nothing, but for the field-native rows **the sub-proof term is 27–41 % of the
+projection** — it is the dominant term there, which makes those the weakest RSS
+numbers in the table.
+
+⚠ **Both RSS coefficients were calibrated on keccak-shaped runs** — a machine
+whose largest tables are a 1,480-column round chip and a 2²⁰-row lookup table.
+Nothing has checked that 27 B/cell survives a machine whose widest table is a
+3,056-column single-row chip, still less one with no lookup table at all. Every
+GiB figure above is a projection carrying that caveat.
+
+For the record, §2.3's own rows recomputed with BOTH terms in GiB at its stated
+24 sub-proofs (the wave-9 erratum discharged — the gap is the dropped sub-proof
+term against a GB-labelled-GiB cell term, which happened to cancel to ~2 %):
+
+| §2.3 row | its cells | cell term GiB | + sub-proof term | §2.3 printed |
+|---|---|---|---|---|
+| RPO | 1.814 B | 45.6 | **49.9** | 48 |
+| Poseidon-original | 1.844 B | 46.4 | **50.6** | 49 |
+| Poseidon (conservative) | 1.905 B | 47.9 | **52.1** | 50 |
+| Monolith | 1.951 B | 49.1 | **53.3** | ~52 |
+| BlakeG 32-row | 3.037 B | 76.4 | **80.6** | 79 |
+| keccak | 11.166 B | 280.8 | **285.0** | 284 |
+
+These are corrected in place but **superseded** by the table above: their cell
+totals all carry the byteswap gadget.
+
+### 8.7 The delegation topology — priced, and it is a net LOSS here
+
+User request: price blake3 in a SEPARATE specialized circuit (Airbender's
+pattern — their blake2s delegation circuit does ~19 proofs' Merkle work in one
+2²⁰ instance) against in-trace hosting. Instrument:
+`blake3_probe::the_delegation_topology_priced_against_in_machine_hosting`,
+arithmetic over the same closed form the epoch's own permutation count comes
+from. Inputs INHERITED from the epoch's 2²⁰ leg: 2 composition parts, 73 queries,
+198 FRI compressions per query, blowup 8.
+
+```
+IN-MACHINE   LFM_BLAKE3 as one more AIR of the epoch verifier's multi-proof:
+             192,000 rows x 4,946 = 967,402,978 cells. Nothing else changes.
+
+DELEGATED    (a) the delegation proof's own trace (LFM_BLAKE3 + its BITWISE)
+                                                        993,617,378 cells
+             (b) verifying that proof inside the epoch verifier:
+                 LFM_BLAKE3 AIR (2^18 rows, 3,056 main + 630 aux)
+                                        1,523/query x 73 = 111,179 compressions
+                 BITWISE AIR    (2^20 rows, 10 main + 5 aux)
+                                          298/query x 73 =  21,754 compressions
+                 = 132,933 compressions = 657,486,618 extra cells, ON TOP of (a)
+```
+
+**Verdict: delegation costs (a) + (b) where in-machine costs (a) alone — a net
+loss of 657 M cells, +66 %.** The reason is structural rather than a tuning
+accident. What Airbender's delegation circuit buys *them* is moving hash work out
+of a **fixed-size** main circuit (a 2²⁰-cycle RISC-V trace) whose cycles the
+hashing would otherwise consume. **The LFM has no fixed-size box**: every chip's
+height is program shape, and the proof is already a multi-AIR proof over
+independently-sized tables connected by a bus. Our architecture *is* the
+delegation pattern; a second proof only adds a verification.
+
+The term that makes (b) expensive is the leaf term, the same one §2.4 flagged as
+having no analogue in cross-system 2-to-1 figures: a 3,056-column AIR has a
+6,112-felt main leaf, which is 765 compressions to absorb, 73 times per query.
+**A delegation circuit is wide by construction, and wide traces have expensive
+leaves** — so the wider and more efficient you make the delegated chip, the worse
+its proof is to verify.
+
+Two variants considered and priced the same way. *Batching K epochs' compressions
+into one instance* (the literal Airbender shape) saves the fixed `BITWISE` table
+K−1 times — 26.2 M cells each, 468 M at K = 19 — but still pays (b) once, so it
+is a loss until K ≳ 25 and it gives up one-proof-per-epoch. *Padding
+amortisation* buys nothing: 192,000 pads to 2¹⁸ and 384,000 to 2¹⁹, the same
+36 % either way, and chunking already fixes it (§8.5).
+
+⚠ This prices CELLS only. It cannot see prover wall time, proof size on the
+wire, or the engineering cost of a second circuit and its glue — and those are
+where a delegation argument would have to be made if anyone wants to remake it.
+
+### 8.8 Falsification (rule 1) — chip-only mutations, control-validated
+
+Mutating the chip *and* the primitive together would prove nothing, so each
+mutation below changes only `blake3_chip.rs`, leaving `blake3.rs` — pinned by the
+canonical vectors — intact. That works because the probe's mirror AIR computes
+its `LfmMem` words from `blake3::blake3_compress_6round`, which is an
+INDEPENDENT implementation of the compression: the bus is a genuine differential
+between the primitive and the chip's own dataflow, and neither delegates to the
+other (rule 7's trap avoided deliberately).
+
+Failures read from the trailing summary block, and a green control was run first
+and again after restoring (rule 7's corollary).
+
+| mutation | result |
+|---|---|
+| CONTROL (unmutated) | 14 passed, 0 failed |
+| F1 `rotr8`'s free byte relabel transposed in the WIRE interpretation only | **exactly 2 failed**, both prove+verify |
+| F2 message schedule transposed in the chip's `run_flow` (`sched[p] = prev[i]`) | **exactly 2 failed**, both prove+verify |
+| F3 the `LfmMem` read multiplicity ungated (`Column(MU)` → `One`), so padding rows read | **exactly 2 failed**, both prove+verify |
+| CONTROL again (restored) | 14 passed, 0 failed |
+
+The *discrimination* is the useful part: in all three the only casualties are
+`the_hosted_chip_proves_and_verifies` and the control, while the six trace-tamper
+tests and the layout/degree tests stay green — so the mutations are isolated to
+what the proof sees, which is what a chip-only falsification is supposed to show.
+
+⚠ **A fourth mutation is recorded because it FAILED to be a falsification.**
+Changing `ROT_SHIFT_R` from `[4, 9]` to `[4, 10]` made 8 tests fail in 0.01 s —
+`ValueFlow::rot_shift`'s `debug_assert_eq!` panics before any proof is built. The
+mutation *is* caught, but by an assert, not by prove+verify, so it is evidence
+about the debug assert and not about the constraint set. Reported rather than
+quietly replaced: a falsification harness that counts a panic as a constraint
+rejection would be exactly the "my mutation changed nothing" instrument bug rule
+7's corollary warns about, inverted.
+
+Six trace-tamper tests back the chip-only set: a flipped OUT byte, a flipped
+message byte (the one that would go green if the 32 message `AreBytes` were ever
+dropped as redundant), a flipped add3 carry bit, a padding row turned real, a
+bumped read multiplicity, and the all-zero-padding assertion.
+
+### 8.9 Provenance of the primitive, and why rule 9 is discharged differently
+
+Rule 9 wants an EXTERNAL known-answer vector that nothing in this repository
+produced. **That is impossible in the usual form here**: the 6-round variant is
+not standard BLAKE3, so no published vector and no crate exposes it. The chain
+#903 supplies, recorded rather than waved at:
+
+1. a z3-proved model of the compression dataflow (`z3_blake_verify.py`);
+2. a Python oracle (`blake3_ref.py`) whose **7-round** instantiation is pinned
+   against the official `blake3` crate's published vectors — so the G-function,
+   message schedule, counter split and feed-forward are externally validated and
+   only the round count varies;
+3. that oracle at `rounds = 6` emitting the 10 canonical vectors this port is
+   pinned against.
+
+The external anchor is therefore one step removed. To check that the vectors
+nevertheless *discriminate* rather than merely being reachable,
+`breaking_one_convention_at_a_time_breaks_the_vectors` runs a parameterised
+control at four broken conventions — rotr12→rotr13, rotr16↔rotr8 (the cheapest
+possible error, since both are free byte relabels in the chip), the message
+schedule transposed, and 7 rounds instead of 6 — and each stops reproducing
+vector 0. A fifth test shows the counter's two halves are not interchangeable.
+
+⚠ Security assumption **A6R** (6-round collision resistance) is named and
+unratified. Nothing here ratifies it; this leg prices the AIR.
+
+### 8.10 What this leg does NOT settle
+
+- It does not register `LFM_BLAKE3`, so no epoch verifier has ever hashed with
+  blake. The column is "cells to verify an epoch of this shape if it hashed with
+  H", the same limit §3.4 states for every column in this matrix.
+- The field-native residue is a subtraction, not a re-emission (§8.4).
+- It does not choose a hash. It does sharpen the choice: the decision is no
+  longer between candidates that are all within 1.6× on size, but between a
+  byte-oriented family at ~71 GiB and an algebraic family at ~4–8 GiB — with the
+  byte-oriented family holding the only real in-AIR measurements and a shipped
+  production existence proof, and the algebraic family holding the size.

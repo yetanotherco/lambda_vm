@@ -517,17 +517,35 @@ fn a_tampered_add3_carry_bit_rejects() {
 // The column, at the production epoch shape
 // =========================================================================
 
-/// ★ The blake column and the residue split, on the real epoch verifier.
+/// Two-term peak-RSS model (wave 7, after the one-parameter 33.7 B/cell fit was
+/// falsified): `27 B` per base-field-equivalent cell plus `190 MB` per
+/// sub-proof.
+///
+/// ⚠ Both coefficients were calibrated on KECCAK-SHAPED runs — a machine whose
+/// biggest tables are a 1,480-column round chip and a 2^20-row lookup table.
+/// Nothing has checked that 27 B/cell survives a machine whose widest table is
+/// a 3,056-column single-row chip, let alone one with no lookup table at all,
+/// so every GiB below is a projection carrying that caveat and not a
+/// measurement.
+const BYTES_PER_CELL: f64 = 27.0;
+const BYTES_PER_SUB_PROOF: f64 = 190_000_000.0;
+const GIB: f64 = (1u64 << 30) as f64;
+
+fn projected_gib(cells: u64, sub_proofs: usize) -> f64 {
+    (cells as f64 * BYTES_PER_CELL + sub_proofs as f64 * BYTES_PER_SUB_PROOF) / GIB
+}
+
+/// ★ The blake column, the residue split and the re-derived matrix, on the real
+/// epoch verifier.
 ///
 /// `#[ignore]`d for the same reason `wrap_tests::the_wrap_census_at_blowup_8`
 /// is: it proves a real inner epoch at blowup 8 and then emits ~2.25M
 /// instructions. Run with
 /// `cargo test -p lambda-vm-prover --lib the_blake_column -- --ignored --nocapture`.
 ///
-/// Everything printed here is arithmetic over three inputs, each labelled:
-/// the per-compression cost MEASURED above, the permutation count from wave 8's
-/// rate-parameterised closed form (re-run here rather than quoted), and the
-/// residue read off this run's own census.
+/// Every line labels its basis. Three MEASURED inputs feed it — the 4,946
+/// cells per compression proved above, this run's own census, and this run's
+/// own permutation closed form — and everything else is arithmetic over them.
 #[test]
 #[ignore]
 fn the_blake_column_and_the_residue_split() {
@@ -545,30 +563,50 @@ fn the_blake_column_and_the_residue_split() {
     let census = lfm_chip_census(&program);
     let (main, aux) = lfm_cell_counts(&program);
     let total = main + 3 * aux;
-
-    let share = |names: &[&str]| -> u64 {
-        census
-            .iter()
-            .filter(|c| names.contains(&c.name))
-            .map(|c| c.main_cells() + 3 * c.aux_cells())
-            .sum()
-    };
-    let hash = share(&["LFM_KECCAK", "KECCAK_RND", "KECCAK_RC", "BITWISE"]);
-    let residue = total - hash;
+    let sub_proofs = census.len();
 
     println!(
-        "\n★ EPOCH {profile}, inner blowup {}, {} queries",
+        "\n★ EPOCH {profile}, inner blowup {}, {} queries, {sub_proofs} sub-proofs",
         inner.blowup_factor, inner.fri_number_of_queries
     );
-    println!("   total   {total:>16}  base-field-equivalent cells (MEASURED, this run)");
     println!(
-        "   keccak  {hash:>16}  ({:.2}%)",
-        100.0 * hash as f64 / total as f64
+        "   {:>12} {:>12} {:>7} {:>6} {:>16} {:>8}",
+        "chip", "rows", "main", "aux", "base-equiv", "% total"
     );
-    println!(
-        "   residue {residue:>16}  ({:.2}%)",
-        100.0 * residue as f64 / total as f64
-    );
+    // KECCAK_RND reports once per chunk; fold the chunks so the table reads as
+    // one line per chip class, which is what the matrix rows are about.
+    let mut folded: Vec<(&str, u64, usize, usize, u64)> = Vec::new();
+    for c in &census {
+        let cells = c.main_cells() + 3 * c.aux_cells();
+        match folded.iter_mut().find(|f| f.0 == c.name) {
+            Some(f) => {
+                f.1 += c.rows;
+                f.4 += cells;
+            }
+            None => folded.push((c.name, c.rows, c.main_cols, c.aux_cols, cells)),
+        }
+    }
+    for (name, rows, m, a, cells) in &folded {
+        println!(
+            "   {name:>12} {rows:>12} {m:>7} {a:>6} {cells:>16} {:>7.2}%",
+            100.0 * *cells as f64 / total as f64
+        );
+    }
+    println!("   {:>12} {:>50}", "TOTAL", total);
+
+    let cells_of = |names: &[&str]| -> u64 {
+        folded
+            .iter()
+            .filter(|f| names.contains(&f.0))
+            .map(|f| f.4)
+            .sum()
+    };
+    // The keccak permutation itself, and the 2^20-row lookup table it shares
+    // with anything byte-oriented. Split because a field-native hash deletes
+    // BOTH while blake deletes only the first.
+    let keccak_perm = cells_of(&["LFM_KECCAK", "KECCAK_RND", "KECCAK_RC"]);
+    let bitwise = cells_of(&["BITWISE"]);
+    let residue = total - keccak_perm - bitwise;
 
     // ---- permutations, at both rates, from the closed form over the shapes.
     let legs_17: usize = e.legs.iter().map(|l| query_permutations(&l.verify)).sum();
@@ -579,11 +617,6 @@ fn the_blake_column_and_the_residue_split() {
         .sum();
     let emitted = super::wrap_tests::permutations(&program);
     let spine_perms = super::wrap_tests::permutations(&spine);
-    println!(
-        "\n   permutations: emitted {emitted} = spine {spine_perms} + legs {}\n   \
-         closed form  legs @ rate 17 (keccak) {legs_17}, @ rate 8 (blake / field-native) {legs_8}",
-        emitted - spine_perms
-    );
     assert_eq!(
         emitted - spine_perms,
         legs_17,
@@ -594,15 +627,19 @@ fn the_blake_column_and_the_residue_split() {
     // spine count rather than quoted.
     let p_lo = legs_8 + spine_perms;
     let p_hi = legs_8 + (spine_perms as f64 * 17.0 / 8.0).ceil() as usize;
-    println!("   P at rate 8 in [{p_lo}, {p_hi}]  (spine bounded, legs exact)");
+    println!(
+        "\n   PERMUTATIONS  emitted {emitted} = spine {spine_perms} + legs {legs_17} (MEASURED)\n   \
+         closed form   legs @ rate 17 (keccak) {legs_17}, @ rate 8 (blake and field-native) {legs_8}\n   \
+         P at rate 8 in [{p_lo}, {p_hi}] — legs exact, spine bounded"
+    );
 
     // ---- the byteswap gadget: exactly the 64-bit decompositions.
     //
     // `sample_u64_pow2` asserts nbits <= 32 and every other production
-    // `bit_dec` site is 32 bits or a Merkle depth, so a 64-bit decomposition in
+    // `bit_dec` site passes 32 or a Merkle depth, so a 64-bit decomposition in
     // this program IS a `felt_be_halves` and nothing else. Counted rather than
-    // reasoned about, with the whole histogram printed so a new 64-bit caller
-    // would be visible instead of silently folded in.
+    // reasoned about, with the whole histogram printed so that a new 64-bit
+    // caller would show up instead of being silently folded in.
     let mut hist = std::collections::BTreeMap::<usize, usize>::new();
     for i in &program.instrs {
         if let Instr::BitDec { bits, .. } = i {
@@ -613,11 +650,8 @@ fn the_blake_column_and_the_residue_split() {
     let swaps = hist.get(&64).copied().unwrap_or(0);
 
     let width = |name: &str| -> (u64, u64) {
-        let c = census
-            .iter()
-            .find(|c| c.name == name)
-            .expect("chip in census");
-        (c.main_cols as u64, c.aux_cols as u64)
+        let f = folded.iter().find(|f| f.0 == name).expect("chip in census");
+        (f.2 as u64, f.3 as u64)
     };
     let (bitdec_m, bitdec_a) = width("LFM_BITDEC");
     let (balu_m, balu_a) = width("LFM_BALU");
@@ -631,22 +665,238 @@ fn the_blake_column_and_the_residue_split() {
         + cell_law(balu_m, balu_a, padded_rows(ba_rows - 64 * swaps) as u64);
     let unpadded =
         cell_law(bitdec_m, bitdec_a, swaps as u64) + cell_law(balu_m, balu_a, 64 * swaps as u64);
+    let byteswap = before - after;
 
     println!(
-        "\n   byteswap gadget: {swaps} felts x (1 BitDec + 64 BALU)\n   \
-         LFM_BITDEC {bd_rows} real rows ({} padded), width {bitdec_m} main / {bitdec_a} aux\n   \
-         LFM_BALU   {ba_rows} real rows ({} padded), width {balu_m} main / {balu_a} aux\n   \
-         gadget cells, unpadded closed form : {unpadded}\n   \
-         gadget cells, padding-aware delta  : {}  (the two chips' padded totals, before {before} after {after})",
+        "\n   BYTESWAP GADGET  {swaps} felts x (1 BitDec + 64 BALU)\n   \
+         LFM_BITDEC {bd_rows} real rows -> {} padded, {bitdec_m} main / {bitdec_a} aux\n   \
+         LFM_BALU   {ba_rows} real rows -> {} padded, {balu_m} main / {balu_a} aux \
+         ({:.2}% of all BALU rows)\n   \
+         unpadded closed form {unpadded}\n   \
+         padding-aware delta  {byteswap}  (the two chips together: before {before}, after {after})",
         padded_rows(bd_rows),
         padded_rows(ba_rows),
-        before - after,
+        100.0 * (64 * swaps) as f64 / ba_rows as f64,
     );
 
+    // ---- the three residues the matrix needs.
+    let residue_field_native = residue - byteswap;
     println!(
-        "\n   residue, byte-oriented (blake keeps the gadget) : {residue}\n   \
-         residue, field-native (gadget deleted)          : {}  (-{:.2}%)",
-        residue - (before - after),
-        100.0 * (before - after) as f64 / residue as f64,
+        "\n   RESIDUE (everything that is not the hash chip or its lookup table)\n   \
+         keccak permutation chips  {keccak_perm:>16}  {:>6.2}%\n   \
+         BITWISE (2^20 fixed)      {bitwise:>16}  {:>6.2}%\n   \
+         residue                   {residue:>16}  {:>6.2}%\n   \
+         \x20 of which byteswap       {byteswap:>16}  {:>6.2}% OF THE RESIDUE\n   \
+         residue, byte-oriented    {residue:>16}  (blake keeps the gadget AND BITWISE)\n   \
+         residue, field-native     {residue_field_native:>16}  (gadget deleted, BITWISE deleted)",
+        100.0 * keccak_perm as f64 / total as f64,
+        100.0 * bitwise as f64 / total as f64,
+        100.0 * residue as f64 / total as f64,
+        100.0 * byteswap as f64 / residue as f64,
+    );
+    println!(
+        "   ⚠ the field-native line is DERIVED by subtraction from a keccak-shaped\n   \
+         emission, not measured on a re-emitted field-native verifier. It is an\n   \
+         UPPER bound on that residue: a field-native absorb also deletes the\n   \
+         Pack/Unpack traffic around the gadget, and LFM_LANES still costs {} here.",
+        cells_of(&["LFM_LANES"])
+    );
+
+    // ---- the matrix, re-derived.
+    //
+    // Hash-chip cells at P permutations: `rows x (main + 3 x aux)`, with rows
+    // either padded to the next power of two (one AIR instance) or chunked the
+    // way KECCAK_RND is (several instances, ~1.9% waste). Both are printed
+    // because the choice is a policy, not a property of the hash.
+    let p = 192_000u64;
+    let chunked = |perms: u64| (perms as f64 * 1.01871).ceil() as u64;
+    let unchunked = |perms: u64| perms.next_power_of_two();
+    let row = |name: &str, cells_per_perm: u64, resid: u64, table: u64| {
+        for (how, rows) in [("chunked", chunked(p)), ("padded", unchunked(p))] {
+            let hash_cells = rows * cells_per_perm;
+            let t = resid + table + hash_cells;
+            println!(
+                "   {name:>28} {how:>8}  hash {hash_cells:>13}  total {t:>13}  \
+                 {:>6.2}x under keccak  ~{:.0} GiB",
+                total as f64 / t as f64,
+                projected_gib(t, sub_proofs),
+            );
+        }
+    };
+    println!(
+        "\n★ THE MATRIX, RE-DERIVED (P = {p}, {sub_proofs} sub-proofs, two-term RSS \
+         {BYTES_PER_CELL} B/cell + {} MB/sub-proof)",
+        BYTES_PER_SUB_PROOF / 1e6
+    );
+    println!(
+        "   {:>28} {:>8}  keccak {:>11}  total {:>13}  {:>6.2}x  ~{:.0} GiB",
+        "keccak (MEASURED, ours)",
+        "n/a",
+        keccak_perm + bitwise,
+        total,
+        1.0,
+        projected_gib(total, sub_proofs),
+    );
+    // Blake keeps the byte-oriented residue AND the BITWISE table it looks up in.
+    row("BLAKE3-6r (MEASURED chip)", 4_946, residue, bitwise);
+    // Field-native candidates delete both. Poseidon-original's 621 is wave 9's
+    // measured column; RPO's 152 and Monolith's ~850 stay INHERITED estimates.
+    row("Poseidon-orig (w9 MEASURED)", 621, residue_field_native, 0);
+    row("RPO (INHERITED estimate)", 152, residue_field_native, 0);
+    row("Monolith (INHERITED est.)", 850, residue_field_native, 0);
+}
+
+// =========================================================================
+// The delegation topology, priced
+// =========================================================================
+
+/// ★ In-machine hosting vs an Airbender-style delegation circuit.
+///
+/// The question (user request): instead of the epoch verifier carrying an
+/// `LFM_BLAKE3` AIR, put the compressions in a SEPARATE specialized circuit and
+/// verify that circuit's proof — Airbender's blake2s delegation circuit does
+/// ~19 proofs' Merkle work in one 2^20 instance.
+///
+/// The whole comparison is arithmetic over the same closed form the epoch's own
+/// permutation count comes from ([`super::epoch_verify::blocks_at_rate`] and
+/// the leaf/path/FRI decomposition), applied to the delegation proof's shape.
+/// Every substituted input is named in the printout.
+///
+/// ⚠ What this CANNOT see: prover wall time, proof size on the wire, and the
+/// engineering cost of a second circuit and its glue. It prices cells only.
+#[test]
+#[ignore]
+fn the_delegation_topology_priced_against_in_machine_hosting() {
+    use super::epoch_verify::{blocks_at_rate, group_leaf_felts};
+    use super::sub_proof::GroupShape;
+
+    let inner = crate::recursion::Preset::Blowup8.options();
+    let e = super::epoch_tests::real_epoch_with(inner.clone());
+
+    // The epoch's widest leg supplies the two shape inputs this calculation
+    // does not derive: how many composition parts a sub-proof carries, and what
+    // one query's FRI leg costs. Both are INHERITED from a real proof rather
+    // than assumed.
+    let widest = e
+        .legs
+        .iter()
+        .max_by_key(|l| l.verify.sub.deep.log2_trace_length)
+        .expect("the epoch has legs");
+    let parts = widest.verify.sub.deep.num_composition_parts;
+    let queries = widest.verify.num_queries;
+    let log2_blowup = inner.blowup_factor.trailing_zeros();
+
+    /// Compressions to verify ONE sub-proof of the given geometry, at rate 8.
+    ///
+    /// `Σ_groups blocks_at_rate(leaf felts) + groups × merkle_depth + FRI`, the
+    /// same three terms `query_permutations_at_rate` sums, per query.
+    fn verify_cost(
+        groups: &[GroupShape],
+        log2_trace: u32,
+        log2_blowup: u32,
+        fri_per_query: usize,
+        queries: usize,
+    ) -> (usize, usize) {
+        let merkle_depth = (log2_trace + log2_blowup) as usize - 1;
+        let leaves: usize = groups
+            .iter()
+            .map(|g| blocks_at_rate(group_leaf_felts(g), 8))
+            .sum();
+        let per_query = leaves + groups.len() * merkle_depth + fri_per_query;
+        (per_query, per_query * queries)
+    }
+
+    let fri_per_query = widest.verify.fri.permutations_per_query();
+
+    // --- the delegation circuit's two AIRs, at the epoch's own compression count.
+    let compressions = 192_000usize;
+    let log2_blake_trace = (compressions as u32).next_power_of_two().trailing_zeros(); // 18
+    let blake_groups = vec![
+        GroupShape {
+            num_columns: cols::PREP_WIDTH,
+            is_ext: false,
+        },
+        GroupShape {
+            num_columns: MAIN_COLUMNS,
+            is_ext: false,
+        },
+        GroupShape {
+            num_columns: 630,
+            is_ext: true,
+        },
+        GroupShape {
+            num_columns: parts,
+            is_ext: true,
+        },
+    ];
+    let bitwise_groups = vec![
+        GroupShape {
+            num_columns: crate::tables::bitwise::NUM_PRECOMPUTED_COLS,
+            is_ext: false,
+        },
+        GroupShape {
+            num_columns: 10,
+            is_ext: false,
+        },
+        GroupShape {
+            num_columns: 5,
+            is_ext: true,
+        },
+        GroupShape {
+            num_columns: parts,
+            is_ext: true,
+        },
+    ];
+    let (blake_pq, blake_total) = verify_cost(
+        &blake_groups,
+        log2_blake_trace,
+        log2_blowup,
+        fri_per_query,
+        queries,
+    );
+    let (bw_pq, bw_total) = verify_cost(&bitwise_groups, 20, log2_blowup, fri_per_query, queries);
+
+    let cells_per_compression = MAIN_COLUMNS as u64 + 3 * 630;
+    let delegation_trace =
+        (compressions as f64 * 1.01871).ceil() as u64 * cells_per_compression + 26_214_400; // its own BITWISE table
+
+    println!(
+        "\n★ DELEGATION TOPOLOGY, at the epoch's {compressions} compressions\n\
+         \x20 shared inputs (INHERITED from the epoch's 2^{} leg): {parts} composition parts, \
+         {queries} queries, {fri_per_query} FRI compressions per query, blowup {}\n\n\
+         \x20 IN-MACHINE   the epoch verifier carries LFM_BLAKE3 as one more AIR of its\n\
+         \x20              multi-proof, {compressions} rows x {cells_per_compression} cells = {} cells.\n\
+         \x20              Nothing else changes: chip heights ARE program shape here, so the\n\
+         \x20              hash competes with nothing for space.\n\n\
+         \x20 DELEGATED    (a) the delegation proof's own trace, LFM_BLAKE3 + BITWISE  {delegation_trace:>12} cells\n\
+         \x20              (b) verifying it inside the epoch verifier:\n\
+         \x20                  LFM_BLAKE3 AIR (2^{log2_blake_trace} rows, {MAIN_COLUMNS} main + 630 aux) \
+         {blake_pq:>6}/query x {queries} = {blake_total:>8} compressions\n\
+         \x20                  BITWISE AIR    (2^20 rows, 10 main + 5 aux)          \
+         {bw_pq:>6}/query x {queries} = {bw_total:>8} compressions\n\
+         \x20                  = {} extra compressions, i.e. {} extra cells in the\n\
+         \x20                    epoch verifier's OWN blake AIR, on top of (a).\n",
+        widest.verify.sub.deep.log2_trace_length,
+        inner.blowup_factor,
+        (compressions as f64 * 1.01871).ceil() as u64 * cells_per_compression,
+        blake_total + bw_total,
+        (blake_total + bw_total) as u64 * cells_per_compression,
+    );
+    println!(
+        "\x20 VERDICT  delegation costs (a) + (b) where in-machine costs (a) alone, so it is a\n\
+         \x20          net LOSS of {:.0}M cells ({:.0}% on top) at these shapes. The reason is\n\
+         \x20          structural, not a tuning accident: the thing Airbender's delegation\n\
+         \x20          circuit buys is moving hash work out of a FIXED-SIZE main circuit (a\n\
+         \x20          2^20-cycle RISC-V trace). The LFM has no fixed-size box — every chip's\n\
+         \x20          height is program shape — so its multi-AIR proof already IS the\n\
+         \x20          delegation pattern, and a second proof only adds a verification.\n\
+         \x20          The leaf term is what makes (b) large: a {MAIN_COLUMNS}-column AIR has a\n\
+         \x20          {}-felt main leaf, {} compressions to absorb, {} times per query.",
+        (blake_total + bw_total) as f64 * cells_per_compression as f64 / 1e6,
+        100.0 * (blake_total + bw_total) as f64 * cells_per_compression as f64
+            / delegation_trace as f64,
+        group_leaf_felts(&blake_groups[1]),
+        blocks_at_rate(group_leaf_felts(&blake_groups[1]), 8),
+        queries,
     );
 }
