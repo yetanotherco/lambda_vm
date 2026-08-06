@@ -18,6 +18,13 @@
 //! `ADDR_*_0 + 8i` instead, which is what this table used to do, made the AIR's accepted set
 //! depend on the executor's `ecsm_addr_ok` and the two drifted apart (#902).
 //!
+//! One band is worth naming because this table does not own it: for a base in
+//! `[u64::MAX-30, u64::MAX-24]` the additions here are all satisfied, and the trace fails only
+//! because MEMW's per-byte `hi = base_1 + carry` is never reduced mod `2^32`, so the last byte's
+//! token sits at `2^32` and no PAGE token supplies it. Sound, and in-circuit — but a cross-table
+//! argument rather than a constraint of ours, and not reachable through the executor, so no test
+//! covers it; forging it needs a hand-built trace.
+//!
 //! ## Padding
 //! Padding rows have `mu = 0`, all columns zero. The yG carry relation closes because both the
 //! `µ·p²` and `µ·b` terms vanish when `µ = 0`, leaving the trivial `0 = 0` recurrence. The x²
@@ -71,28 +78,46 @@ pub mod cols {
     ///
     /// `addr_*[0]` is the `ADDR_*_0` / `ADDR_*_1` pair above, which the spec allows to stay a
     /// `DWordWL` ("`addr_xG[0]`, `addr_k[0]` and `addr_xR[0]` could be `DWordWL`s rather than
-    /// `HL`s"). It needs no range check of its own: the MEMW register read binds it to the
-    /// register's value, and a non-canonical limb there has no matching REGISTER token.
+    /// `HL`s"). It carries no range check of its own, and the reason is NOT that the REGISTER
+    /// table range-checks register words — it does not; `register.rs` has no constraint set at
+    /// all and pushes `init`/`fini` raw. What binds it is the `i = 0` MEMW send: it puts the
+    /// pair straight onto the Memory bus, where the only tokens available come from PAGE and
+    /// REGISTER at canonical `(lo, hi)` addresses, so a non-canonical limb matches nothing and
+    /// the bus does not balance. Every other chip that takes an address from a register leans
+    /// on the same argument (see the note in `memw.rs` about `base_address_1`).
     pub const ADDR_XG_ACC: usize = 667; // DWordHL[3] (12)
     pub const ADDR_K_ACC: usize = 679; // DWordHL[3] (12)
     pub const ADDR_XR_ACC: usize = 691; // DWordHL[3] (12)
 
     pub const NUM_COLUMNS: usize = 703;
 
+    /// Halfword `hw` of the `i`-th per-access address in the block at `base`.
+    ///
+    /// The assert is load-bearing, not defensive: `i = 0` would underflow `i - 1` and, in
+    /// release, land on `xr_sub_p(13..15)` and `MU`. Access 0 is the `ADDR_*_0`/`ADDR_*_1`
+    /// pair, which has no halfword columns — the `0..4` loops over the MEMW sends sit right
+    /// next to the `1..4` loops over these, so the wrong bound is the natural typo here.
+    #[inline]
+    const fn acc_hw(base: usize, i: usize, hw: usize) -> usize {
+        assert!(matches!(i, 1..=3), "per-access address index must be 1..=3");
+        assert!(hw < 4, "a DWordHL has four halfwords");
+        base + (i - 1) * 4 + hw
+    }
+
     /// Halfword `hw` of `addr_xG[i]`, for `i = 1..=3`.
     #[inline]
     pub const fn addr_xg_acc(i: usize, hw: usize) -> usize {
-        ADDR_XG_ACC + (i - 1) * 4 + hw
+        acc_hw(ADDR_XG_ACC, i, hw)
     }
     /// Halfword `hw` of `addr_k[i]`, for `i = 1..=3`.
     #[inline]
     pub const fn addr_k_acc(i: usize, hw: usize) -> usize {
-        ADDR_K_ACC + (i - 1) * 4 + hw
+        acc_hw(ADDR_K_ACC, i, hw)
     }
     /// Halfword `hw` of `addr_xR[i]`, for `i = 1..=3`.
     #[inline]
     pub const fn addr_xr_acc(i: usize, hw: usize) -> usize {
-        ADDR_XR_ACC + (i - 1) * 4 + hw
+        acc_hw(ADDR_XR_ACC, i, hw)
     }
 
     #[inline]
@@ -513,8 +538,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     }
 
     // IS_HALF on every halfword of every per-access address (spec `ec:c:range_addr_*`).
-    // addr_*[0] is excluded: it is the register value the MEMW read binds, so a
-    // non-canonical limb there has no matching REGISTER token.
+    // addr_*[0] is excluded: its canonicality comes from the i = 0 MEMW send reaching the
+    // Memory bus, where only canonical PAGE/REGISTER tokens exist (see the `cols` note).
     for acc in [cols::addr_xg_acc, cols::addr_k_acc, cols::addr_xr_acc] {
         for i in 1..4 {
             for hw in 0..4 {

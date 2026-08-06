@@ -38,6 +38,27 @@ main:
 	li	a7, -11
 	ecall
 
+	# Padding so the continuation test's epoch boundary falls between the ECSM write and
+	# the read-back: at epoch_size_log2 = 5 the ecall sits at instruction 48 and without
+	# this the loads land at 49..55, i.e. the same epoch, and the crossing page is never
+	# carried into an epoch that reads it. Sixteen nops push the loads past cycle 64.
+	nop
+	nop
+	nop
+	nop
+	nop
+	nop
+	nop
+	nop
+	nop
+	nop
+	nop
+	nop
+	nop
+	nop
+	nop
+	nop
+
 	# Read xR back from the crossing address into the stack buffer. The last load
 	# spans 0xFFFF_FFF9..0x1_0000_0000.
 	ld	t2, 0(t1)

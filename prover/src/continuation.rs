@@ -2030,15 +2030,25 @@ mod tests {
     fn test_ecsm_operand_crossing_limb_across_epochs() {
         let _ = env_logger::builder().is_test(true).try_init();
         let elf_bytes = asm_elf_bytes("test_ecsm_limb_cross");
-        let total = Executor::new(&Elf::load(&elf_bytes).unwrap(), vec![])
+        // The guest pads 16 nops between the ECSM write and the read-back so a 32-cycle epoch
+        // boundary falls between them; without that the write, all four crossing reads and the
+        // commit sit in one epoch and the crossing page is never carried into an epoch that
+        // reads it. Assert the property, not a cycle count: the assembler expands each 64-bit
+        // `li` into eight instructions, so absolute indices move when a constant changes.
+        let logs = Executor::new(&Elf::load(&elf_bytes).unwrap(), vec![])
             .unwrap()
             .run()
             .unwrap()
-            .logs
-            .len();
+            .logs;
+        let ecall_idx = logs
+            .iter()
+            .position(|l| l.src1_val == executor::vm::instruction::execution::ECSM_SYSCALL_NUMBER)
+            .expect("the guest must issue the ECSM ecall");
+        let first_read_idx = ecall_idx + 17; // 16 nops, then the first `ld`
         assert!(
-            total > 32,
-            "the guest must span more than one 32-cycle epoch"
+            (ecall_idx >> 5) < (first_read_idx >> 5),
+            "the epoch boundary must fall between the ECSM write (cycle {ecall_idx}) and the \
+             read-back (cycle {first_read_idx}); adjust the nop padding in the .s"
         );
 
         let mut gx = [

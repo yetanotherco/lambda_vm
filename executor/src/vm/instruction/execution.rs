@@ -434,13 +434,16 @@ impl Instruction {
                         // which the AIR forbids with `µ·carry_1 = 0` on the last address and
                         // `load_u256_le` / `store_u256_le` reject with `checked_add` — the two
                         // conditions coincide, so neither side accepts what the other refuses.
-                        // xG and k must occupy disjoint 32-byte regions. This is a conservative
+                        // xG and k must occupy disjoint 32-byte regions. Conservative
                         // precondition, not a provability requirement: xG is read at T and k at
                         // T+1, so an overlapping cell chains through MEMW like any other pair of
-                        // accesses at increasing timestamps, and such a trace does verify. The
-                        // guard stays because the AIR does not enforce disjointness either way,
-                        // and no caller needs it: two live 32-byte objects are already disjoint.
-                        // xR may alias either — its accesses are at a later timestamp.
+                        // accesses at increasing timestamps. Bypassing this guard in a scratch
+                        // build produced a fully-aliased trace that verifies, so the older claim
+                        // that overlap makes the trace unprovable is wrong — but nothing here
+                        // pins that, because the guard is what stops such a trace being built.
+                        // The guard stays anyway: the AIR does not enforce disjointness either
+                        // way, and no caller needs it, since two live 32-byte objects are
+                        // disjoint by construction. xR may alias either — later timestamp.
                         if addr_xg.abs_diff(addr_k) < 32 {
                             return Err(ExecutionError::EcsmOperandOverlap);
                         }

@@ -179,11 +179,12 @@ fn ecsm_syscall_accepts_operands_crossing_the_limb() {
 
 #[test]
 fn ecsm_syscall_rejects_operands_past_the_address_space() {
-    // The one condition left. A 64-bit overflow is unprovable — the AIR's `µ·carry_1 = 0` on
-    // the last address forbids the wrapped addition, and a byte carry at high limb
-    // 0xFFFF_FFFF would need `hi + 1 = 2^32`, which no page can hold. The two coincide with
-    // what `checked_add` refuses here, which is why ECSM needs no precondition of its own:
-    // the AIR accepts an operand iff `addr + 31 < 2^64`, and so does this.
+    // The one condition left, and it is worth being precise about which table owns it. The
+    // ECSM chip's own `µ·carry_1 = 0` only bounds `addr + 24 < 2^64`; the last byte is bounded
+    // one table over, because MEMW's per-byte `hi = base_1 + carry` is never reduced mod 2^32,
+    // so at high limb 0xFFFF_FFFF it produces a token at 2^32 that no PAGE token supplies.
+    // Composed, the circuit accepts an operand iff `addr + 31 < 2^64` — exactly what
+    // `checked_add` refuses here, which is why ECSM needs no precondition of its own.
     //
     // `u64::MAX - 31` is the largest operand that fits; one byte further must fail, and so
     // must a base that wraps outright.

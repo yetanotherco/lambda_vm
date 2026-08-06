@@ -24,6 +24,9 @@ const IDX_ADDR_XR_ADD: usize = 425; // AddCarryPair(addr_xR[1])
 const IDX_ADDR_XG_NOWRAP: usize = 431; // µ·carry_1 = 0 on addr_xG[3]
 const IDX_ADDR_XR_NOWRAP: usize = 433; // µ·carry_1 = 0 on addr_xR[3]
 
+/// Halfword accessor for one operand's per-access address columns.
+type AccFn = fn(usize, usize) -> usize;
+
 fn gx_le() -> [u8; 32] {
     // secp256k1 Gx, little-endian.
     let mut be = [
@@ -275,6 +278,10 @@ fn constraints_hold_for_k_eq_n_minus_one() {
 /// `ec:c:extrapolate_addr_*`: a per-access address that is not `addr[0] + 8i` breaks the
 /// addition. Without these constraints the twelve MEMW accesses could be sent at twelve
 /// unrelated addresses, which is the deviation #902 reports.
+///
+/// Run over all three operands: the constraint block pairs each operand's base column with its
+/// own accessor, and a copy/paste slip there (xG's base against k's columns, say) would satisfy
+/// every test that only exercises xG.
 #[test]
 fn extrapolate_addr_rejects_a_wrong_per_access_address() {
     let trace = generate_ecsm_trace(&[op_for(5)]);
@@ -283,52 +290,90 @@ fn extrapolate_addr_rejects_a_wrong_per_access_address() {
         assert_eq!(*v, FE::zero(), "constraint {i} must hold on the clean row");
     }
 
-    // Move addr_xG[2] by one byte: 0x2010 -> 0x2011.
-    let mut main: Vec<FE> = (0..cols::NUM_COLUMNS)
-        .map(|c| *trace.main_table.get(0, c))
-        .collect();
-    main[cols::addr_xg_acc(2, 0)] = main[cols::addr_xg_acc(2, 0)] + FE::one();
-    let row = eval_main_row(main);
-    // Index 413 + 2 is the low-limb carry of the i = 2 addition.
-    assert_ne!(
-        row[IDX_ADDR_XG_ADD + 2],
-        FE::zero(),
-        "a per-access address that is not addr_xG[0] + 16 must break the ADD carry"
-    );
+    // (accessor, first ADD constraint of that operand's block). Blocks are operand-major with
+    // stride 6: xG 413..418, k 419..424, xR 425..430; within a block, i = 1,2,3 x (carry_0, carry_1).
+    let operands: [(AccFn, usize, &str); 3] = [
+        (cols::addr_xg_acc, IDX_ADDR_XG_ADD, "xG"),
+        (cols::addr_k_acc, IDX_ADDR_XG_ADD + 6, "k"),
+        (cols::addr_xr_acc, IDX_ADDR_XR_ADD, "xR"),
+    ];
+    for (acc, block, name) in operands {
+        for i in 1..4 {
+            let mut main: Vec<FE> = (0..cols::NUM_COLUMNS)
+                .map(|c| *trace.main_table.get(0, c))
+                .collect();
+            // Move addr_*[i] by one byte.
+            main[acc(i, 0)] = main[acc(i, 0)] + FE::one();
+            let row = eval_main_row(main);
+            let idx = block + (i - 1) * 2;
+            assert_ne!(
+                row[idx],
+                FE::zero(),
+                "{name}: a wrong addr[{i}] must break constraint {idx}"
+            );
+        }
+    }
 }
 
 /// The `µ·carry_1 = 0` addition, which the spec's `ADD` template does not give us: without it
 /// `addr[3] = addr[0] + 24 − 2^64` satisfies the carry pair, so an operand could wrap the
-/// address space in-circuit while the executor refuses it.
+/// address space in-circuit while the executor refuses it. The wrapped address is a small,
+/// matchable one (`0x10` here), so what this blocks is a collision with legitimate memory, not
+/// merely an unsatisfiable trace. Checked on all three operands.
 #[test]
 fn addr_wrapping_past_u64_is_rejected() {
-    let mut main = vec![FE::zero(); cols::NUM_COLUMNS];
-    main[cols::MU] = FE::one();
-    // addr_xR[0] = u64::MAX - 7, so addr_xR[3] = addr + 24 wraps to 0x10.
-    let base = u64::MAX - 7;
-    main[cols::ADDR_XR_0] = FE::from(base & 0xFFFF_FFFF);
-    main[cols::ADDR_XR_1] = FE::from(base >> 32);
-    for i in 1..4u64 {
-        let a = base.wrapping_add(8 * i);
-        for hw in 0..4 {
-            main[cols::addr_xr_acc(i as usize, hw)] = FE::from((a >> (16 * hw)) & 0xFFFF);
+    let operands: [(usize, AccFn, usize, usize, &str); 3] = [
+        (
+            cols::ADDR_XG_0,
+            cols::addr_xg_acc,
+            IDX_ADDR_XG_ADD,
+            IDX_ADDR_XG_NOWRAP,
+            "xG",
+        ),
+        (
+            cols::ADDR_K_0,
+            cols::addr_k_acc,
+            IDX_ADDR_XG_ADD + 6,
+            IDX_ADDR_XG_NOWRAP + 1,
+            "k",
+        ),
+        (
+            cols::ADDR_XR_0,
+            cols::addr_xr_acc,
+            IDX_ADDR_XR_ADD,
+            IDX_ADDR_XR_NOWRAP,
+            "xR",
+        ),
+    ];
+    for (base_col, acc, add_block, nowrap, name) in operands {
+        let mut main = vec![FE::zero(); cols::NUM_COLUMNS];
+        main[cols::MU] = FE::one();
+        // base = u64::MAX - 7, so addr[3] = base + 24 wraps to 0x10.
+        let base = u64::MAX - 7;
+        main[base_col] = FE::from(base & 0xFFFF_FFFF);
+        main[base_col + 1] = FE::from(base >> 32);
+        for i in 1..4u64 {
+            let a = base.wrapping_add(8 * i);
+            for hw in 0..4 {
+                main[acc(i as usize, hw)] = FE::from((a >> (16 * hw)) & 0xFFFF);
+            }
         }
-    }
-    let row = eval_main_row(main);
-    // Both carry bits of each addition are satisfied by the wrapped witness...
-    for i in 0..6 {
-        assert_eq!(
-            row[IDX_ADDR_XR_ADD + i],
+        let row = eval_main_row(main);
+        // Every carry bit of the three additions is satisfied by the wrapped witness...
+        for offset in 0..6 {
+            assert_eq!(
+                row[add_block + offset],
+                FE::zero(),
+                "{name}: the wrapped addition still satisfies carry bit {offset}"
+            );
+        }
+        // ...so only the no-wrap constraint catches it.
+        assert_ne!(
+            row[nowrap],
             FE::zero(),
-            "the wrapped addition still satisfies its carry bits (i = {i})"
+            "{name}: an operand whose last address wraps u64 must be rejected"
         );
     }
-    // ...which is exactly why the no-wrap constraint has to be there.
-    assert_ne!(
-        row[IDX_ADDR_XR_NOWRAP],
-        FE::zero(),
-        "an operand whose last address wraps u64 must be rejected"
-    );
 }
 
 /// Padding rows stay valid: every new constraint is µ-gated, so an all-zero row closes.
@@ -340,5 +385,35 @@ fn addr_constraints_close_on_padding() {
         let idx = IDX_ADDR_XG_ADD + offset;
         assert_eq!(*v, FE::zero(), "constraint {idx} must close at µ = 0");
     }
-    assert_eq!(row[IDX_ADDR_XG_NOWRAP], FE::zero());
+}
+
+/// The invariant the MSB16 bus bug broke, as a fast test instead of only end-to-end proving:
+/// every `IsHalfword` interaction the ECSM row sends must have exactly one matching lookup in
+/// `collect_bitwise_from_ecsm`, which is what feeds the receive multiplicity. The two live in
+/// different files and are written by hand, so nothing but a count keeps them in step.
+#[test]
+fn is_half_sends_match_the_collector() {
+    use crate::tables::bitwise::BitwiseOperationType;
+
+    let sends = crate::tables::ecsm::bus_interactions()
+        .iter()
+        .filter(|b| b.is_sender && b.bus_id == u64::from(crate::tables::types::BusId::IsHalfword))
+        .count();
+
+    let op = op_for(5);
+    let collected = crate::tables::trace_builder::collect_bitwise_from_ecsm(&[op])
+        .iter()
+        .filter(|o| o.lookup_type == BitwiseOperationType::IsHalf)
+        .count();
+
+    assert_eq!(
+        sends, collected,
+        "each IsHalfword send must have one collected lookup: {sends} sends vs {collected} lookups"
+    );
+    // The 36 address halfwords are part of that total; a regression that dropped them would
+    // still balance if the collector lost them too, so pin the address share explicitly.
+    assert!(
+        sends >= 36,
+        "the per-access address halfwords must be among the sends"
+    );
 }
