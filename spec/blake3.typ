@@ -132,17 +132,23 @@ function is believed to be. (Precedent: KangarooTwelve's reduced-round
 Keccak. Best public cryptanalysis of BLAKE3 reaches far fewer rounds; the
 margin removed here is one round of seven.)
 
+*External review (2026-08).* The round-count choice was reviewed with
+external symmetric-cryptography experts consulted by the project: removing
+*one* round (7 → 6) was judged comfortable; removing *two* (7 → 5) was
+explicitly not. Accordingly, 6 rounds is the endorsed floor — variants
+below 6 rounds are out of scope and MUST NOT be instantiated.
+
 Any use of #blake3 as a Merkle or transcript hash *invokes this
 assumption*. The z3 gate proves the chip computes 6-round BLAKE3
 correctly; it neither proves nor addresses whether 6 rounds are secure.
 
-*The assumption-free alternative it is priced against.* The chip design
-is round-parameterised; a 7-round instantiation (standard BLAKE3
-compression, bit-compatible with official parent-node merges) costs
-roughly 10–12% more per merge end-to-end and requires no novel
-assumption. If that margin is not needed, prefer the 7-round variant; if
-both are instantiated they are distinct chips with distinct ECALL
-numbers.
+*The assumption-free alternative.* The chip design is round-parameterised;
+a 7-round instantiation (standard BLAKE3 compression, bit-compatible with
+official parent-node merges) costs roughly 10–12% more per merge
+end-to-end and requires no assumption beyond standard BLAKE3. The 6-round
+variant is the primary internal target per the review above; the 7-round
+variant is the interoperability / zero-assumption fallback. If both are
+instantiated they are distinct chips with distinct ECALL numbers.
 
 = Cost
 

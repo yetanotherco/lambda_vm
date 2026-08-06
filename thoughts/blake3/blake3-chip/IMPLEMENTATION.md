@@ -92,4 +92,11 @@ assumption:
 > Keccak).
 
 Directed for implementation by the project owner, 2026-08-05 ("trust me"
-sign-off in session; to be ratified in the spec before production use).
+sign-off in session). Recorded in the spec (`spec/blake3.typ`, A6R section).
+
+**External review (2026-08-06, relayed by the project owner):** the round
+count was reviewed with external symmetric-cryptography experts — removing
+one round (7→6) judged comfortable, removing two (7→5) explicitly not.
+6 rounds is therefore the endorsed floor; sub-6-round variants are
+permanently out of scope. The 7-round instantiation remains available as
+the zero-assumption / interop fallback at ~10-12% more per merge.
