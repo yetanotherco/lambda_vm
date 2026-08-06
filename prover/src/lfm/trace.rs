@@ -12,7 +12,7 @@ use crate::tables::{bitwise, keccak_rc, keccak_rnd};
 use super::chips::{balu, bitdec, const_, hash, hint, keccak, lanes, public, select, xalu};
 use super::compiler::{ColumnGroup, LfmProgram};
 use super::executor::LfmRecords;
-use super::hash::{LfmHasher, TestPermutation};
+use super::hash::{HASH_STATE_FELTS, HasherKind, LfmHasher};
 use super::instr::{HashMode, Instr};
 use super::keccak_adapter::{self, KeccakAdapterOperation};
 use super::layout;
@@ -73,7 +73,59 @@ fn chip_trace(
     TraceTable::new_main(data, num_columns, 1)
 }
 
+/// Writes the Poseidon round witness into a hash row whose `IN`/`S`/`OUT`
+/// columns are already filled.
+///
+/// The permutation input is read back out of the row's own `IN`/`S` columns —
+/// the exact cells round 0's constraints read — rather than from the executor
+/// record, so the witness cannot describe a different input than the one the
+/// AIR constrains. `permutation_witness` supplies the intermediates in the
+/// association the degree-3 lowering needs (`x² = a·a`, `x³ = x²·a`,
+/// `a⁷ = (x³)²·a`); any other association is the same field element and a
+/// different trace, and the constraints would reject it.
+pub(super) fn fill_poseidon_witness(out: &mut [FE]) {
+    use super::chips::hash::poseidon_cols as pc;
+    use super::poseidon::{NUM_ROUNDS, permutation_witness, sboxed_lanes};
+
+    let state: [FE; HASH_STATE_FELTS] = core::array::from_fn(|i| {
+        if i < 8 {
+            out[hash::cols::IN0 + i]
+        } else {
+            out[hash::cols::S8 + (i - 8)]
+        }
+    });
+    let witness = permutation_witness(state);
+    for (r, round) in witness.iter().enumerate() {
+        for lane in 0..sboxed_lanes(r) {
+            out[pc::x2(r, lane)] = round.x2[lane];
+            out[pc::x3(r, lane)] = round.x3[lane];
+        }
+        for (j, v) in round.out.iter().enumerate() {
+            out[pc::out(r, j)] = *v;
+        }
+    }
+    debug_assert_eq!(
+        &out[hash::cols::OUT0..hash::cols::OUT0 + HASH_STATE_FELTS],
+        witness[NUM_ROUNDS - 1].out.as_slice(),
+        "the final round's output is the OUT columns the executor already wrote"
+    );
+}
+
 pub fn build_traces(program: &LfmProgram, records: &LfmRecords) -> LfmTraces {
+    build_traces_with_hasher(program, records, HasherKind::default())
+}
+
+/// [`build_traces`] for a proof under `hasher`.
+///
+/// `hasher` must be the one the executor ran (`proof::lfm_prove_with_hasher`
+/// passes the same value to both) and the one the AIR set was built with: the
+/// hash chip's width and witness columns are its layout's, and the constraints
+/// bake its round constants.
+pub fn build_traces_with_hasher(
+    program: &LfmProgram,
+    records: &LfmRecords,
+    hasher: HasherKind,
+) -> LfmTraces {
     let g = &program.groups;
 
     let hash_modes: Vec<HashMode> = program
@@ -84,7 +136,7 @@ pub fn build_traces(program: &LfmProgram, records: &LfmRecords) -> LfmTraces {
             _ => None,
         })
         .collect();
-    let iv = TestPermutation.compress_iv();
+    let iv = hasher.compress_iv();
 
     // The keccak family's traces are driven by the executor's records; the tag
     // is the row ordinal, exactly as the compiler emitted it into the
@@ -156,7 +208,7 @@ pub fn build_traces(program: &LfmProgram, records: &LfmRecords) -> LfmTraces {
             out[bitdec::cols::Z] = r.z;
             out[bitdec::cols::GINV] = r.ginv;
         }),
-        hash: chip_trace(&g.hash, hash::cols::NUM_COLUMNS, |row, out| {
+        hash: chip_trace(&g.hash, hash::num_columns(hasher), |row, out| {
             let r = &records.hash[row];
             out[hash::cols::IN0..hash::cols::IN0 + 12].copy_from_slice(&r.ins);
             for k in 0..4 {
@@ -167,6 +219,9 @@ pub fn build_traces(program: &LfmProgram, records: &LfmRecords) -> LfmTraces {
                 };
             }
             out[hash::cols::OUT0..hash::cols::OUT0 + 12].copy_from_slice(&r.outs);
+            if hasher == HasherKind::Poseidon {
+                fill_poseidon_witness(out);
+            }
         }),
         keccak: chip_trace(&g.keccak, keccak::cols::NUM_COLUMNS, |row, out| {
             let r = &records.keccak[row];

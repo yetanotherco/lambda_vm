@@ -22,10 +22,10 @@ use crate::tables::types::{BusId, GoldilocksExtension, GoldilocksField};
 use super::airs::{LfmAirs, NUM_LFM_CHIPS, num_lfm_airs};
 use super::compiler::LfmProgram;
 use super::executor::{LfmExecError, execute};
-use super::hash::TestPermutation;
+use super::hash::HasherKind;
 use super::registry::{LfmArtifacts, LfmProgramKind, LfmRegistryError, resolve};
 use super::statement::absorb_lfm_statement;
-use super::trace::{LfmTraces, build_traces};
+use super::trace::{LfmTraces, build_traces_with_hasher};
 use super::word::LfmWord;
 
 type F = GoldilocksField;
@@ -49,12 +49,27 @@ pub fn lfm_prove(
     arenas: &[Vec<LfmWord>],
     options: &ProofOptions,
 ) -> Result<LfmProof, LfmProveError> {
-    // The chips bake `TestPermutation`'s constants into their constraints,
-    // so execution must use the same hasher (the swap surface swaps both).
-    let exec = execute(program, arenas, &TestPermutation).map_err(LfmProveError::Exec)?;
-    let mut traces = build_traces(program, &exec.records);
-    let proof = prove_traces(artifacts, &mut traces, &exec.public_words, options)
-        .map_err(LfmProveError::Prover)?;
+    lfm_prove_with_hasher(program, artifacts, arenas, options, HasherKind::default())
+}
+
+/// [`lfm_prove`] under an explicitly chosen `LFM_HASH` permutation.
+///
+/// The chips bake their hasher's constants into their constraints, so execution
+/// must use the same hasher — this function is the single place that holds them
+/// together, passing one `hasher` to the executor, the trace filler and the AIR
+/// set. Verification needs the same value (`verify_against_with_hasher`).
+pub fn lfm_prove_with_hasher(
+    program: &LfmProgram,
+    artifacts: &LfmArtifacts,
+    arenas: &[Vec<LfmWord>],
+    options: &ProofOptions,
+    hasher: HasherKind,
+) -> Result<LfmProof, LfmProveError> {
+    let exec = execute(program, arenas, &hasher).map_err(LfmProveError::Exec)?;
+    let mut traces = build_traces_with_hasher(program, &exec.records, hasher);
+    let proof =
+        prove_traces_with_hasher(artifacts, &mut traces, &exec.public_words, options, hasher)
+            .map_err(LfmProveError::Prover)?;
 
     Ok(LfmProof {
         proof,
@@ -66,14 +81,40 @@ pub fn lfm_prove(
 ///
 /// Split out of [`lfm_prove`] so callers that need to inspect or corrupt a
 /// trace between generation and proving (the tamper tests) share this
-/// transcript setup instead of reimplementing it.
+/// transcript setup instead of reimplementing it. `lfm_prove` itself goes
+/// through [`prove_traces_with_hasher`], so this default-hasher form has only
+/// test callers.
+#[cfg(test)]
 pub(crate) fn prove_traces(
     artifacts: &LfmArtifacts,
     traces: &mut LfmTraces,
     public_words: &[(u32, LfmWord)],
     options: &ProofOptions,
 ) -> Result<MultiProof<F, E, ()>, ProvingError> {
-    let airs = LfmAirs::new(&artifacts.roots, options, artifacts.keccak_rnd_chunks);
+    prove_traces_with_hasher(
+        artifacts,
+        traces,
+        public_words,
+        options,
+        HasherKind::default(),
+    )
+}
+
+/// [`prove_traces`] against an AIR set built for `hasher`. The traces must have
+/// been built with the same one.
+pub(crate) fn prove_traces_with_hasher(
+    artifacts: &LfmArtifacts,
+    traces: &mut LfmTraces,
+    public_words: &[(u32, LfmWord)],
+    options: &ProofOptions,
+    hasher: HasherKind,
+) -> Result<MultiProof<F, E, ()>, ProvingError> {
+    let airs = LfmAirs::new_with_hasher(
+        &artifacts.roots,
+        options,
+        artifacts.keccak_rnd_chunks,
+        hasher,
+    );
     let mut transcript = DefaultTranscript::<E>::new(&[]);
     absorb_lfm_statement(
         &mut transcript,
@@ -128,6 +169,33 @@ pub fn verify_against(
     claimed_public: &[(u32, LfmWord)],
     options: &ProofOptions,
 ) -> bool {
+    verify_against_with_hasher(
+        roots,
+        program_id,
+        keccak_rnd_chunks,
+        proof,
+        claimed_public,
+        options,
+        HasherKind::default(),
+    )
+}
+
+/// [`verify_against`] with the `LFM_HASH` permutation chosen explicitly.
+///
+/// Which hasher a proof was produced under is program shape, exactly like the
+/// roots and the chunk count: it is supplied by the caller and never read off
+/// the proof. A verifier that builds the wrong hash AIR rejects — the widths and
+/// the constraint count differ.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_against_with_hasher(
+    roots: &[Commitment; NUM_LFM_CHIPS],
+    program_id: &Commitment,
+    keccak_rnd_chunks: usize,
+    proof: &MultiProof<F, E, ()>,
+    claimed_public: &[(u32, LfmWord)],
+    options: &ProofOptions,
+    hasher: HasherKind,
+) -> bool {
     // A zero chunk count would drop KECCAK_RND — and its constraints — from
     // the set entirely. Reject the shape rather than build it.
     if keccak_rnd_chunks == 0 {
@@ -138,7 +206,7 @@ pub fn verify_against(
         return false;
     }
 
-    let airs = LfmAirs::new(roots, options, keccak_rnd_chunks);
+    let airs = LfmAirs::new_with_hasher(roots, options, keccak_rnd_chunks, hasher);
     let refs = airs.air_refs();
 
     let mut transcript = DefaultTranscript::<E>::new(&[]);

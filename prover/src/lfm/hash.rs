@@ -84,3 +84,51 @@ impl LfmHasher for TestPermutation {
         Self::compress_iv_raw().map(FE::from)
     }
 }
+
+/// Which permutation the `LFM_HASH` chip proves — a **construction-time**
+/// choice, fixed before any trace exists.
+///
+/// The chips bake their hasher's round constants into their constraints, so
+/// execution, trace generation and the AIR set must all agree (`proof.rs`
+/// enforces that by construction: one kind reaches all three). This enum is
+/// what carries the agreement, and it is threaded rather than global so a
+/// single process can prove under both.
+///
+/// ⚠ **`Test` is the default and the machine's real hash is UNDECIDED.** The
+/// default exists so every pre-decision call site keeps proving what it always
+/// proved; it is not a statement that `TestPermutation` is the machine's hash.
+/// The ecosystem hash decision is what the candidate columns feed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum HasherKind {
+    /// [`TestPermutation`] — NOT cryptographic. One degree-3 round.
+    #[default]
+    Test,
+    /// [`super::poseidon::PoseidonGoldilocks`] — Poseidon-original, width 12,
+    /// `x^7`, 8 full + 22 partial rounds.
+    Poseidon,
+}
+
+impl LfmHasher for HasherKind {
+    fn permute(&self, state: [FE; HASH_STATE_FELTS]) -> [FE; HASH_STATE_FELTS] {
+        match self {
+            HasherKind::Test => TestPermutation.permute(state),
+            HasherKind::Poseidon => super::poseidon::PoseidonGoldilocks.permute(state),
+        }
+    }
+
+    fn compress_iv(&self) -> LfmWord {
+        match self {
+            HasherKind::Test => TestPermutation.compress_iv(),
+            HasherKind::Poseidon => super::poseidon::PoseidonGoldilocks.compress_iv(),
+        }
+    }
+
+    /// Delegated explicitly rather than left to the trait default: a candidate
+    /// that overrides `compress` must be honoured through this dispatch too.
+    fn compress(&self, a: &LfmWord, b: &LfmWord) -> LfmWord {
+        match self {
+            HasherKind::Test => TestPermutation.compress(a, b),
+            HasherKind::Poseidon => super::poseidon::PoseidonGoldilocks.compress(a, b),
+        }
+    }
+}

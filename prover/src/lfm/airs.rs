@@ -21,6 +21,7 @@ use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 use crate::tables::{bitwise, keccak_rc, keccak_rnd};
 
 use super::chips::{balu, bitdec, const_, hash, hint, keccak, lanes, public, range, select, xalu};
+use super::hash::HasherKind;
 use super::layout;
 use super::trace::LfmTraces;
 
@@ -135,6 +136,18 @@ impl LfmChipCells {
 /// copy of this table is how a census would come to describe a different machine
 /// than the one the totals describe.
 pub fn lfm_chip_census(program: &super::compiler::LfmProgram) -> Vec<LfmChipCells> {
+    lfm_chip_census_with_hasher(program, HasherKind::default())
+}
+
+/// [`lfm_chip_census`] for a program proved under `hasher`.
+///
+/// Only `LFM_HASH`'s width moves with the hasher; every other chip is
+/// hash-independent, and the preprocessed prefix (`PREP_WIDTH = 11`) is the
+/// same in every layout, so the row counts and the roots do not move either.
+pub fn lfm_chip_census_with_hasher(
+    program: &super::compiler::LfmProgram,
+    hasher: HasherKind,
+) -> Vec<LfmChipCells> {
     let range_rows = layout::range::NUM_ROWS as u64;
     let g = &program.groups;
     // Every chip class except `KECCAK_RND`, which is counted per chunk below.
@@ -171,7 +184,7 @@ pub fn lfm_chip_census(program: &super::compiler::LfmProgram) -> Vec<LfmChipCell
         ),
         (
             g.hash.padded_rows as u64,
-            hash::cols::NUM_COLUMNS,
+            hash::num_columns(hasher),
             layout::hash::PREP_WIDTH,
             hash::bus_interactions().len(),
         ),
@@ -260,7 +273,16 @@ pub fn lfm_chip_census(program: &super::compiler::LfmProgram) -> Vec<LfmChipCell
 /// row). This is the kill-risk-3 instrument: machine cells per verification
 /// vs the verified proof's own cells.
 pub fn lfm_cell_counts(program: &super::compiler::LfmProgram) -> (u64, u64) {
-    lfm_chip_census(program)
+    lfm_cell_counts_with_hasher(program, HasherKind::default())
+}
+
+/// [`lfm_cell_counts`] for a program proved under `hasher` — the hash matrix's
+/// instrument.
+pub fn lfm_cell_counts_with_hasher(
+    program: &super::compiler::LfmProgram,
+    hasher: HasherKind,
+) -> (u64, u64) {
+    lfm_chip_census_with_hasher(program, hasher)
         .iter()
         .fold((0u64, 0u64), |(main, aux), c| {
             (main + c.main_cells(), aux + c.aux_cells())
@@ -339,6 +361,23 @@ impl LfmAirs {
         options: &ProofOptions,
         keccak_rnd_chunks: usize,
     ) -> Self {
+        Self::new_with_hasher(roots, options, keccak_rnd_chunks, HasherKind::default())
+    }
+
+    /// [`LfmAirs::new`] with the `LFM_HASH` permutation chosen explicitly.
+    ///
+    /// The hasher is a construction-time property of the AIR set because the
+    /// chip bakes its round constants into its constraints: the same `hasher`
+    /// must reach execution and trace generation, which is what
+    /// `proof::lfm_prove_with_hasher` guarantees. Nothing else in the set moves
+    /// — `PREP_WIDTH` is 11 in every layout, so the preprocessed roots and the
+    /// program digest are hasher-independent.
+    pub fn new_with_hasher(
+        roots: &[Commitment; NUM_LFM_CHIPS],
+        options: &ProofOptions,
+        keccak_rnd_chunks: usize,
+        hasher: HasherKind,
+    ) -> Self {
         LfmAirs {
             const_: build_air(
                 const_::cols::NUM_COLUMNS,
@@ -386,10 +425,10 @@ impl LfmAirs {
                 layout::bitdec::PREP_WIDTH,
             ),
             hash: build_air(
-                hash::cols::NUM_COLUMNS,
+                hash::num_columns(hasher),
                 hash::bus_interactions(),
                 options,
-                hash::HashConstraints,
+                hash::HashConstraints { kind: hasher },
                 LFM_CHIP_NAMES[5],
                 roots[5],
                 layout::hash::PREP_WIDTH,

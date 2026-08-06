@@ -472,7 +472,7 @@ pub mod bitdec {
 
 pub mod hash {
     use super::*;
-    use crate::lfm::hash::TestPermutation;
+    use crate::lfm::hash::{HASH_STATE_FELTS, HasherKind, TestPermutation};
     use crate::tables::types::FE;
     use math::field::traits::IsPrimeField;
 
@@ -484,7 +484,107 @@ pub mod hash {
         /// permutation constraint stays at degree 3.
         pub const S8: usize = PREP_WIDTH + 12; // ..S11
         pub const OUT0: usize = PREP_WIDTH + 16; // ..OUT11
-        pub const NUM_COLUMNS: usize = PREP_WIDTH + 28;
+        /// Value columns every hasher's layout shares: `IN`, `S`, `OUT`. The
+        /// bus tuples read only these (`bus_interactions`), which is why they
+        /// keep their offsets in EVERY layout — a candidate appends its
+        /// witness columns after them rather than reflowing the prefix.
+        pub const SHARED_VALUE_COLUMNS: usize = 28;
+        /// Width of the [`HasherKind::Test`] layout. Use [`super::num_columns`]
+        /// unless you specifically mean `TestPermutation`.
+        pub const TEST_NUM_COLUMNS: usize = PREP_WIDTH + SHARED_VALUE_COLUMNS;
+    }
+
+    /// Column layout for the [`HasherKind::Poseidon`] configuration.
+    ///
+    /// The frozen prefix (`IN0..12`, `S8..12`, `OUT0..12`) keeps the offsets
+    /// `cols` gives it, so [`bus_interactions`] is hasher-INDEPENDENT and the
+    /// `LFM_HASH` tuple contract stays literally frozen. Everything Poseidon
+    /// additionally witnesses is appended from [`ROUNDS`] on: per round, the
+    /// `x²` and `x³` intermediates of its S-boxed lanes plus its post-MDS
+    /// output — except the LAST round, whose output IS `OUT0..12`.
+    ///
+    /// Width: `28 + 7·36 + 24 + 22·14 = 612` value columns, one row per
+    /// permutation.
+    ///
+    /// ⚠ This layout is a deliberate UPPER BOUND, roughly 2× a known-achievable
+    /// one (Miden's measured Poseidon2 at the same width is 256 main cells via
+    /// 16 columns × 16 rows, reusing state columns across rounds instead of
+    /// allocating fresh ones). It is not optimised because the epoch verifier's
+    /// already-measured non-hash residue dominates the total: halving the hash
+    /// term moves the epoch bill by ~3%. Measure here, optimise elsewhere.
+    pub mod poseidon_cols {
+        use crate::lfm::hash::HASH_STATE_FELTS;
+        use crate::lfm::poseidon::{NUM_ROUNDS, sboxed_lanes};
+
+        pub use super::cols::{IN0, MODE_C, MODE_P, OUT0, PREP_WIDTH, S8, SHARED_VALUE_COLUMNS};
+
+        /// First appended witness column.
+        pub const ROUNDS: usize = PREP_WIDTH + SHARED_VALUE_COLUMNS;
+
+        /// Width of round `r`'s appended block: `x²` and `x³` for each S-boxed
+        /// lane, plus 12 output columns — none for the last round, which writes
+        /// its output into `OUT`.
+        pub const fn block_width(r: usize) -> usize {
+            let out = if r + 1 == NUM_ROUNDS {
+                0
+            } else {
+                HASH_STATE_FELTS
+            };
+            2 * sboxed_lanes(r) + out
+        }
+
+        /// First column of round `r`'s appended block.
+        pub const fn block(r: usize) -> usize {
+            let mut off = ROUNDS;
+            let mut i = 0;
+            while i < r {
+                off += block_width(i);
+                i += 1;
+            }
+            off
+        }
+
+        /// `a_lane²` for round `r`. Only lanes `< sboxed_lanes(r)` exist.
+        pub const fn x2(r: usize, lane: usize) -> usize {
+            block(r) + lane
+        }
+
+        /// `a_lane³` for round `r`. Only lanes `< sboxed_lanes(r)` exist.
+        pub const fn x3(r: usize, lane: usize) -> usize {
+            block(r) + sboxed_lanes(r) + lane
+        }
+
+        /// Round `r`'s post-MDS output lane `j` — `OUT` for the final round.
+        pub const fn out(r: usize, j: usize) -> usize {
+            if r + 1 == NUM_ROUNDS {
+                OUT0 + j
+            } else {
+                block(r) + 2 * sboxed_lanes(r) + j
+            }
+        }
+
+        pub const NUM_COLUMNS: usize = block(NUM_ROUNDS);
+
+        /// 4 capacity copies + 1 mode-boolean + per round (`2·sboxed` S-box
+        /// steps and 12 MDS outputs).
+        pub const NUM_CONSTRAINTS: usize = {
+            let mut n = 5;
+            let mut r = 0;
+            while r < NUM_ROUNDS {
+                n += 2 * sboxed_lanes(r) + HASH_STATE_FELTS;
+                r += 1;
+            }
+            n
+        };
+    }
+
+    /// The chip's total width under `kind` — the number the AIR is built with,
+    /// the census reads, and the trace filler allocates.
+    pub const fn num_columns(kind: HasherKind) -> usize {
+        match kind {
+            HasherKind::Test => cols::TEST_NUM_COLUMNS,
+            HasherKind::Poseidon => poseidon_cols::NUM_COLUMNS,
+        }
     }
 
     pub fn bus_interactions() -> Vec<BusInteraction> {
@@ -526,7 +626,42 @@ pub mod hash {
         GoldilocksField::canonical(fe.value())
     }
 
-    pub struct HashConstraints;
+    /// The permutation the chip proves, chosen at construction.
+    ///
+    /// One struct with a runtime discriminant rather than one type per hasher:
+    /// `LfmAirs` holds `LfmAir<HashConstraints>` as a single field, so a
+    /// per-hasher type would force a trait object or an enum there instead.
+    pub struct HashConstraints {
+        pub kind: HasherKind,
+    }
+
+    impl HashConstraints {
+        /// The `TestPermutation` configuration — the machine's pre-decision
+        /// default. `HashConstraints::default()` is the same thing.
+        pub const TEST: Self = Self {
+            kind: HasherKind::Test,
+        };
+
+        /// The Poseidon-original configuration.
+        pub const POSEIDON: Self = Self {
+            kind: HasherKind::Poseidon,
+        };
+
+        /// Constraints emitted under `kind` — the count the framework's
+        /// dense-index invariant requires `eval` to fill exactly.
+        pub const fn num_constraints(kind: HasherKind) -> usize {
+            match kind {
+                HasherKind::Test => 17,
+                HasherKind::Poseidon => poseidon_cols::NUM_CONSTRAINTS,
+            }
+        }
+    }
+
+    impl Default for HashConstraints {
+        fn default() -> Self {
+            Self::TEST
+        }
+    }
 
     impl ConstraintSet<F, E> for HashConstraints {
         fn max_degree(&self) -> usize {
@@ -534,6 +669,15 @@ pub mod hash {
         }
 
         fn eval<B: ConstraintBuilder<F, E>>(&self, b: &mut B) {
+            match self.kind {
+                HasherKind::Test => Self::eval_test(b),
+                HasherKind::Poseidon => Self::eval_poseidon(b),
+            }
+        }
+    }
+
+    impl HashConstraints {
+        fn eval_test<B: ConstraintBuilder<F, E>>(b: &mut B) {
             let mode_c = b.main(0, cols::MODE_C);
             let mode_p = b.main(0, cols::MODE_P);
 
@@ -576,6 +720,123 @@ pub mod hash {
             let mode_sum = mode_c + mode_p;
             let one = b.one();
             b.emit_base(16, mode_sum.clone() * (one - mode_sum));
+        }
+
+        /// Poseidon-original at width 12: 30 rounds of `x ↦ x⁷` (all lanes on
+        /// the 8 full rounds, lane 0 only on the 22 partial ones) followed by
+        /// the circulant MDS.
+        ///
+        /// **Degree is exactly 3, by construction.** `x⁷` is lowered as
+        /// `(x³)²·x` over the witnessed `x²`/`x³` columns, so the MDS output
+        /// constraint — the highest-degree one — is `column² · (degree-1
+        /// expression)`. That keeps `max_degree() = 3` and leaves the wrap's
+        /// blowup 2 untouched, which is the whole reason the S-box is
+        /// decomposed instead of written `a⁷`.
+        ///
+        /// **The round constant is scaled by the mode sum, and that is
+        /// load-bearing.** With `m = MODE_C + MODE_P = 0` a zero-filled padding
+        /// row gives `a = 0`, hence `x² = x³ = 0` and `out = MDS·0 = 0`,
+        /// inductively through all 30 rounds — so padding satisfies every
+        /// constraint without a degree-4 `IS_REAL` gate anywhere. On a real row
+        /// `m = 1` and the permutation is unchanged.
+        fn eval_poseidon<B: ConstraintBuilder<F, E>>(b: &mut B) {
+            use crate::lfm::poseidon::{MDS_CIRC_ROW, ROUND_CONSTANTS, sboxed_lanes};
+            use poseidon_cols as pc;
+
+            let mode_c = b.main(0, pc::MODE_C);
+            let mode_p = b.main(0, pc::MODE_P);
+            let m = mode_c + mode_p.clone();
+
+            // idx 0–3: capacity-state copy — S_i = MODE_P·IN_i.
+            //
+            // Poseidon's `compress_iv` is ZERO (plain sponge compression, no
+            // domain separation invented here), so the `MODE_C·IV_i` term the
+            // TestPermutation version carries vanishes: on a compress row
+            // MODE_P = 0 forces S_i = 0, which IS the IV.
+            for k in 0..4 {
+                let s = b.main(0, pc::S8 + k);
+                let in_i = b.main(0, pc::IN0 + 8 + k);
+                b.emit_base(k, s - mode_p.clone() * in_i);
+            }
+
+            // idx 4: mode sum-boolean (exactly-one-of is the registrar's).
+            let one = b.one();
+            b.emit_base(4, m.clone() * (one - m.clone()));
+
+            let mut idx = 5;
+            for (r, rc_row) in ROUND_CONSTANTS.iter().enumerate() {
+                let sboxed = sboxed_lanes(r);
+
+                // a_i = state_i + rc[r][i]·m, degree 1. Round 0 reads IN/S;
+                // later rounds read the previous round's MDS output.
+                let a: Vec<B::Expr> = rc_row
+                    .iter()
+                    .enumerate()
+                    .map(|(i, rc_i)| {
+                        let state = if r == 0 {
+                            if i < 8 {
+                                b.main(0, pc::IN0 + i)
+                            } else {
+                                b.main(0, pc::S8 + (i - 8))
+                            }
+                        } else {
+                            b.main(0, pc::out(r - 1, i))
+                        };
+                        let rc = b.const_base(*rc_i);
+                        state + rc * m.clone()
+                    })
+                    .collect();
+
+                // The two S-box steps per S-boxed lane, both degree 2.
+                for (lane, a_lane) in a.iter().enumerate().take(sboxed) {
+                    let x2 = b.main(0, pc::x2(r, lane));
+                    let x3 = b.main(0, pc::x3(r, lane));
+                    b.emit_base(idx, x2.clone() - a_lane.clone() * a_lane.clone());
+                    b.emit_base(idx + 1, x3 - x2 * a_lane.clone());
+                    idx += 2;
+                }
+
+                // What enters the MDS: a^7 = (x³)²·a on S-boxed lanes
+                // (degree 3), the bare post-constant lane otherwise.
+                let f: Vec<B::Expr> = (0..HASH_STATE_FELTS)
+                    .map(|i| {
+                        if i < sboxed {
+                            let x3 = b.main(0, pc::x3(r, i));
+                            x3.clone() * x3 * a[i].clone()
+                        } else {
+                            a[i].clone()
+                        }
+                    })
+                    .collect();
+
+                // out_o = Σ_i MDS_CIRC_ROW[(i − o) mod 12] · f_i — the same
+                // orientation `poseidon::PoseidonGoldilocks::mds` uses, and one
+                // of the three conventions the external KAT pins.
+                for o in 0..HASH_STATE_FELTS {
+                    let acc = f
+                        .iter()
+                        .enumerate()
+                        .fold(None::<B::Expr>, |acc, (i, fi)| {
+                            let c = b.const_base(
+                                MDS_CIRC_ROW[(i + HASH_STATE_FELTS - o) % HASH_STATE_FELTS],
+                            );
+                            let term = c * fi.clone();
+                            Some(match acc {
+                                None => term,
+                                Some(x) => x + term,
+                            })
+                        })
+                        .expect("twelve lanes");
+                    let out = b.main(0, pc::out(r, o));
+                    b.emit_base(idx, out - acc);
+                    idx += 1;
+                }
+            }
+            debug_assert_eq!(
+                idx,
+                poseidon_cols::NUM_CONSTRAINTS,
+                "every declared constraint index must be emitted exactly once"
+            );
         }
     }
 }

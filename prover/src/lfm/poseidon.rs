@@ -482,6 +482,77 @@ pub const ROUND_CONSTANTS: [[u64; HASH_STATE_FELTS]; NUM_ROUNDS] = [
     ],
 ];
 
+/// Is round `r` a full round? Rounds run
+/// `[initial_full (4), partial (22), terminal_full (4)]`, matching
+/// [`ROUND_CONSTANTS`]' row order.
+pub const fn is_full_round(r: usize) -> bool {
+    r < HALF_FULL_ROUNDS || r >= HALF_FULL_ROUNDS + PARTIAL_ROUNDS
+}
+
+/// S-boxed lanes in round `r`: all 12 in a full round, lane 0 only in a partial
+/// one. This is the single rule the AIR's column count and the witness both read
+/// — the partial rounds' S-box lane is one of the conventions the KAT pins
+/// (`tests::the_permutation_matches_the_plonky3_known_answer_vector`).
+pub const fn sboxed_lanes(r: usize) -> usize {
+    if is_full_round(r) {
+        HASH_STATE_FELTS
+    } else {
+        1
+    }
+}
+
+/// One round's recorded intermediates, in the association the degree-3 AIR
+/// lowering needs: `x2 = a·a`, `x3 = x2·a`, and the S-box output `(x3)²·a`
+/// entering the MDS. `x2`/`x3` carry [`sboxed_lanes`] entries; the rest of the
+/// array is unused (and stays zero) on partial rounds.
+#[derive(Clone, Copy, Debug)]
+pub struct PoseidonRound {
+    /// `a_i = state_i + rc[r][i]` — the post-constant state. Recorded for
+    /// cross-checking only; the AIR recomputes it as a degree-1 expression.
+    pub a: [FE; HASH_STATE_FELTS],
+    /// `a_i²` for the S-boxed lanes.
+    pub x2: [FE; HASH_STATE_FELTS],
+    /// `a_i³` for the S-boxed lanes.
+    pub x3: [FE; HASH_STATE_FELTS],
+    /// The post-MDS state — this round's output, next round's input.
+    pub out: [FE; HASH_STATE_FELTS],
+}
+
+/// Every intermediate the AIR witnesses, one entry per round.
+pub type PoseidonWitness = [PoseidonRound; NUM_ROUNDS];
+
+/// Records the permutation's intermediates for the trace generator.
+///
+/// ⚠ **Written independently of [`PoseidonGoldilocks::permute`] rather than
+/// factored out of it, deliberately.** A recording wrapper that `permute`
+/// delegated to would make [`tests::the_witness_agrees_with_the_permutation`] a
+/// tautology at the moment of the refactor (standing-decisions rule 7). Both
+/// paths are pinned to the SAME external KAT instead, so a divergence between
+/// them fails a test that does not compare them to each other.
+pub fn permutation_witness(state: [FE; HASH_STATE_FELTS]) -> PoseidonWitness {
+    let zero = [FE::zero(); HASH_STATE_FELTS];
+    let mut rounds = [PoseidonRound {
+        a: zero,
+        x2: zero,
+        x3: zero,
+        out: zero,
+    }; NUM_ROUNDS];
+    let mut s = state;
+    for (r, round) in rounds.iter_mut().enumerate() {
+        round.a = core::array::from_fn(|i| &s[i] + FE::from(ROUND_CONSTANTS[r][i]));
+        let mut mixed = round.a;
+        for (lane, m) in mixed.iter_mut().enumerate().take(sboxed_lanes(r)) {
+            let a = &round.a[lane];
+            round.x2[lane] = a * a;
+            round.x3[lane] = &round.x2[lane] * a;
+            *m = &(&round.x3[lane] * &round.x3[lane]) * a;
+        }
+        round.out = PoseidonGoldilocks::mds(&mixed);
+        s = round.out;
+    }
+    rounds
+}
+
 /// Poseidon-original over Goldilocks, width 12 — a real cryptographic hash
 /// behind the `LFM_HASH` contract, replacing `TestPermutation`.
 pub struct PoseidonGoldilocks;
@@ -623,5 +694,75 @@ mod tests {
     fn the_round_constant_table_has_one_row_per_round() {
         assert_eq!(ROUND_CONSTANTS.len(), NUM_ROUNDS);
         assert_eq!(NUM_ROUNDS, 30, "8 full + 22 partial");
+    }
+
+    /// The witness's last round must reproduce the SAME external vector
+    /// `permute` is pinned to — not `permute`'s output, which would only say the
+    /// two agree. This is the absolute pin on the recording path.
+    #[test]
+    fn the_witness_final_round_matches_the_plonky3_known_answer_vector() {
+        let input: [FE; HASH_STATE_FELTS] = core::array::from_fn(|i| FE::from(i as u64));
+        let w = permutation_witness(input);
+        let want: [FE; HASH_STATE_FELTS] = core::array::from_fn(|i| FE::from(PLONKY3_KAT_OUT[i]));
+        assert_eq!(
+            w[NUM_ROUNDS - 1].out,
+            want,
+            "the witness's final post-MDS state must match Plonky3's KAT"
+        );
+    }
+
+    /// A genuine differential: two independently written round loops, neither
+    /// delegating to the other (rule 7). It runs on inputs the KAT does not
+    /// cover, so it catches a divergence the single vector would miss.
+    #[test]
+    fn the_witness_agrees_with_the_permutation() {
+        for seed in 0..8u64 {
+            let input: [FE; HASH_STATE_FELTS] =
+                core::array::from_fn(|i| FE::from(seed.wrapping_mul(0x9E37_79B9) + i as u64));
+            let w = permutation_witness(input);
+            assert_eq!(
+                w[NUM_ROUNDS - 1].out,
+                PoseidonGoldilocks.permute(input),
+                "witness and permute must agree at seed {seed}"
+            );
+        }
+    }
+
+    /// The intermediates must be the ones the AIR constrains: `x2 = a²`,
+    /// `x3 = a³`, and the S-box output `(x3)²·a = a^7` feeding the MDS. Asserted
+    /// against `sbox` for the S-boxed lanes and against `a` itself elsewhere, so
+    /// a partial round that quietly S-boxed twelve lanes would fail here.
+    #[test]
+    fn the_witness_records_the_degree_three_association() {
+        let input: [FE; HASH_STATE_FELTS] = core::array::from_fn(|i| FE::from(3 * i as u64 + 1));
+        let w = permutation_witness(input);
+        for (r, round) in w.iter().enumerate() {
+            let sboxed = sboxed_lanes(r);
+            assert_eq!(sboxed, if is_full_round(r) { 12 } else { 1 });
+            let mixed: [FE; HASH_STATE_FELTS] = core::array::from_fn(|i| {
+                if i < sboxed {
+                    assert_eq!(
+                        round.x2[i],
+                        &round.a[i] * &round.a[i],
+                        "round {r} lane {i} x2"
+                    );
+                    assert_eq!(
+                        round.x3[i],
+                        &round.x2[i] * &round.a[i],
+                        "round {r} lane {i} x3"
+                    );
+                    PoseidonGoldilocks::sbox(&round.a[i])
+                } else {
+                    assert_eq!(round.x2[i], FE::zero(), "round {r} lane {i} x2 unused");
+                    assert_eq!(round.x3[i], FE::zero(), "round {r} lane {i} x3 unused");
+                    round.a[i]
+                }
+            });
+            assert_eq!(
+                round.out,
+                PoseidonGoldilocks::mds(&mixed),
+                "round {r} output is the MDS of the S-boxed state"
+            );
+        }
     }
 }
