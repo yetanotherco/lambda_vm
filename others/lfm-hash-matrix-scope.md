@@ -878,3 +878,124 @@ measurement (rule 2: execute-only tests prove nothing about a chip). The padding
 trap (condition (c)) must be handled as a chunking sibling OR an explicit
 padding-corrected line beside the raw one — both numbers are pinned above so the
 first measurement cannot silently read 36 % high.
+
+---
+
+## 7. Slice 1b DONE — the chip is BUILT, PROVED, and the prediction CONFIRMED
+
+**Landed** (`[hash-w9]`): the Poseidon-original `LFM_HASH` chip behind a
+construction-time hasher choice, plus 15 tests. `lfm` suite **230 passed / 0
+failed / 5 ignored**, `make lint` exit 0 (make's own status).
+
+### 7.1 The measurement, number by number against §6.3
+
+Every figure below is measured through the SAME census instrument that produced
+entry 10's keccak column (`main + 3·aux`), so the two columns of the matrix are
+comparable by construction rather than by argument.
+
+| §6.3 pinned | measured | verdict |
+|---|---|---|
+| 612 value columns | **612** | CONFIRMED |
+| 601 constraints | **601** | CONFIRMED |
+| `max_degree` 3 | **3** declared, **3** measured max | CONFIRMED |
+| 621 base-equiv cells/permutation | **621** (612 + 3·3) | CONFIRMED |
+| hash cells 121.5 M chunked | **121,497,408** | CONFIRMED |
+| hash cells 162.8 M unchunked | **162,791,424** (2^18 pad = 1.365×) | CONFIRMED |
+| epoch total 1.906 B chunked | **1,905,694,804** = 5.86× under keccak | CONFIRMED |
+| epoch total 1.947 B unchunked | **1,946,988,820** = 5.74× under keccak | CONFIRMED |
+
+⚠ **Provenance, because only one of these inputs is new.** Wave 9 measured
+exactly one number: **621 cells per permutation**, off an AIR the production
+prover built and the production verifier accepted. `P` (wave 8's closed form)
+and the 1,784,197,396 residue (entry 10) are inherited measurements; the epoch
+lines are arithmetic over all three. Across wave 8's whole `P` interval
+[190,569, 193,569] the chunked total moves only 1,904.8 M → 1,906.7 M
+(5.856–5.862×), so the conclusion does not depend on `P` being exactly 192,000.
+
+### 7.2 ⚠ CORRECTION — the RSS figure, and it is a units error, not a cells error
+
+§6.3's "RSS ≈50–51 GiB" does **not** reproduce from the stated two-term model
+(27 B/cell + 190 MB/sub-proof) over this epoch's 24 sub-proofs:
+
+- cell term alone: 47.92 GiB chunked / 48.96 GiB unchunked — **but 51.5 / 52.6
+  GB**, which is almost certainly where "50–51" came from: the cell term
+  computed in GB and labelled GiB, with the sub-proof term dropped.
+- both terms, in GiB: **52.2 GiB chunked / 53.2 GiB unchunked**.
+
+Use **≈52–53 GiB**. Nothing downstream changes — every figure in the band is
+far inside the 124 GiB box, which is the only claim the number carries — but
+the ~4% understatement is recorded so the matrix's other rows (which were
+computed the same way in §2.3) get re-derived before anyone compares them at
+that precision.
+
+### 7.3 The prediction that was NOT confirmed, and it was never a cells claim
+
+§6.3 called 612 "an UPPER BOUND, knowingly 2× off Miden's measured 304". That
+is untouched by this measurement: 612 is what MY layout costs, and a row-per-
+round layout reusing state columns would still be roughly half. The instruction
+not to optimise it stands for the reason given — halving the hash term moves the
+epoch total from 1.906 B to 1.846 B, i.e. **3.2%**, because the residue
+dominates at 93.6% of the chunked total. The hash term is no longer the thing
+worth engineering.
+
+### 7.4 What the chip actually is
+
+- **Layout.** The frozen `IN`/`S`/`OUT` prefix keeps its offsets and the final
+  round's post-MDS output IS `OUT`, so `bus_interactions()` is
+  hasher-independent and the `LFM_HASH` tuple contract stays literally frozen:
+  `28 + 7·36 + 24 + 22·14 = 612`, the same 612 as §6.4's `16 + 8·36 + 22·14`
+  arranged differently. Both totals are asserted, against each other and against
+  the built width.
+- **Degree exactly 3**, via `x⁷ = (x³)²·x` over witnessed `x²`/`x³`. Asserted
+  both ways: nothing exceeds 3, and something reaches it — a decomposition that
+  quietly went quadratic would mean the S-box had stopped being computed.
+- **The padding trick is load-bearing, now demonstrated rather than asserted.**
+  See F4 below: removing the round constant's mode-sum scaling breaks the
+  padding row and NOTHING ELSE, because on a real row `m = 1` and the
+  permutation is unchanged. That is the cleanest possible evidence for §6.4's
+  "keep it; it is load-bearing, not decoration".
+
+### 7.5 Falsification (rule 1) — four mutations, each of the CHIP only
+
+Mutating chip *and* executor together proves nothing: they would move as one.
+Each mutation below changes only the constraint body, so the chip stops agreeing
+with the permutation the external Plonky3 KAT pins. Instrument checked against a
+known-green control first, and failures read from the trailing summary block
+(per rule 7's corollary, per-test lines do not name failures).
+
+| mutation | result |
+|---|---|
+| F1 `x⁷ → x⁵` in the chip | 5 failed, incl. prove+verify |
+| F2 circulant MDS transposed `(i−o) → (o−i)` | 5 failed, incl. prove+verify |
+| F3 partial-round S-box binds lane 1, not lane 0 | 5 failed, incl. prove+verify |
+| F4 round constant no longer scaled by the mode sum | **exactly 2 failed**: the padding row and prove+verify |
+| CONTROL (unmutated) | 21 passed, 0 failed |
+
+F4's *discrimination* is the interesting one — satisfaction, the KAT-output
+check and every rejection test stay green, so the padding trick is isolated to
+padding exactly as §6.4 claimed.
+
+### 7.6 The seam, and the two things asserted rather than assumed
+
+Per the team lead's ruling the hasher is a **construction-time** choice
+(`HasherKind`) threaded to the constraint body, the width, the trace filler and
+the executor. `Test` remains the default; every pre-existing call site keeps its
+signature and its behaviour. **Nothing was flipped** — the machine's real hash is
+the ecosystem decision this measurement feeds.
+
+1. **No program digest moves with the hasher.** `PREP_WIDTH` is 11 in both
+   layouts and the preprocessed group is untouched, so every root and every
+   program id is bit-identical, and the census's row counts and aux widths are
+   too — only `LFM_HASH`'s value width moves. `LFM_REGISTRY` did not need
+   regenerating. Asserted, because a hash experiment silently reassigning
+   program identity is exactly the failure that must not pass quietly.
+2. **A proof does not verify under the other hasher**, in both directions.
+
+### 7.7 What this leg does NOT settle
+
+It does not choose a hash, and it is not evidence that Poseidon-original should
+be the machine's default. Parameters are published ones adequate to measure an
+AIR's *shape*; `compress_iv` is zero because domain separation is a
+cryptographic decision deliberately not invented here. Per §0c the decision is
+not cost-gated anyway — every candidate fits the box — so this column adds
+information (the corpus had zero Poseidon AIR data) without rendering a pick.
