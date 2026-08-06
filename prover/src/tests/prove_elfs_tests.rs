@@ -1105,6 +1105,49 @@ fn test_prove_elfs_keccak_multi_call() {
 }
 
 #[test]
+fn test_prove_elfs_keccak_absorb() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_keccak_absorb");
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
+    let result = executor.run().expect("Failed to run program");
+
+    // The guest seeds lane[i] = i + 1, seeds 3 rate blocks with dword[k] =
+    // k + 100 and absorbs all three in ONE ecall. Cross-check the committed
+    // state against an independent sponge replay over tiny-keccak.
+    let mut expected_state: [u64; 25] = core::array::from_fn(|i| (i + 1) as u64);
+    for k in 0..3u64 {
+        for (j, lane) in expected_state.iter_mut().take(17).enumerate() {
+            *lane ^= 100 + k * 17 + j as u64;
+        }
+        tiny_keccak::keccakf(&mut expected_state);
+    }
+    let mut expected_bytes = Vec::with_capacity(200);
+    for lane in expected_state {
+        expected_bytes.extend_from_slice(&lane.to_le_bytes());
+    }
+    assert_eq!(
+        result.return_values.memory_values, expected_bytes,
+        "committed state must match a tiny-keccak sponge replay over 3 absorbed blocks"
+    );
+
+    // Must use from_elf_and_logs (stack RAM needs PAGE tables, like keccak).
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
+    assert_eq!(
+        traces.public_output_bytes,
+        result.return_values.memory_values
+    );
+
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "keccak absorb prove/verify failed"
+    );
+}
+
+#[test]
 fn test_prove_elfs_ecsm() {
     let _ = env_logger::builder().is_test(true).try_init();
 

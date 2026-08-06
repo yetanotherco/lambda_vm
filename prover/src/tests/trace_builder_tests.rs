@@ -589,6 +589,7 @@ mod keccak_tests {
         };
         let rop = KeccakRoundOperation {
             timestamp: 42,
+            seq: 0,
             input,
             output,
         };

@@ -78,6 +78,10 @@ use crate::tables::keccak_rc::{
 use crate::tables::keccak_rnd::{
     KeccakRndConstraints, bus_interactions as keccak_rnd_bus_interactions, cols as keccak_rnd_cols,
 };
+use crate::tables::keccak_sponge::{
+    KeccakSpongeConstraints, bus_interactions as keccak_sponge_bus_interactions,
+    cols as keccak_sponge_cols,
+};
 use crate::tables::load::{
     LoadConstraints, bus_interactions as load_bus_interactions, cols as load_cols,
 };
@@ -993,6 +997,20 @@ pub fn create_keccak_rc_air(proof_options: &ProofOptions) -> ConcreteVmAir<Empty
         1,
         EmptyConstraints,
         "KECCAK_RC",
+    )
+}
+
+/// Create KECCAK_SPONGE AIR (sponge-absorb accelerator, one row per block).
+pub fn create_keccak_sponge_air(
+    proof_options: &ProofOptions,
+) -> ConcreteVmAir<KeccakSpongeConstraints> {
+    build_air(
+        keccak_sponge_cols::NUM_COLUMNS,
+        keccak_sponge_bus_interactions(),
+        proof_options,
+        1,
+        KeccakSpongeConstraints,
+        "KECCAK_SPONGE",
     )
 }
 

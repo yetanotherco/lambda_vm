@@ -186,6 +186,15 @@ pub struct CpuOperation {
     /// For KeccakPermute ECALLs: state address from x10.
     pub keccak_state_addr: u64,
 
+    /// Whether this ECALL is a KeccakAbsorbBlocks syscall.
+    pub ecall_keccak_absorb: bool,
+    /// For KeccakAbsorbBlocks ECALLs: state address from x10.
+    pub keccak_absorb_state_addr: u64,
+    /// For KeccakAbsorbBlocks ECALLs: message data address from x11.
+    /// (`n_blocks` is recovered from the x12 register state in the trace
+    /// builder, like the ECSM operand addresses.)
+    pub keccak_absorb_data_addr: u64,
+
     /// Whether this ECALL is an ECSM (elliptic-curve scalar multiply) syscall
     pub ecall_ecsm: bool,
 
@@ -236,6 +245,14 @@ impl CpuOperation {
         let ecall_keccak =
             f.ecall && log.src1_val == executor::vm::instruction::execution::KECCAK_SYSCALL_NUMBER;
         let keccak_state_addr = if ecall_keccak { log.src2_val } else { 0 };
+        let ecall_keccak_absorb = f.ecall
+            && log.src1_val
+                == executor::vm::instruction::execution::KECCAK_ABSORB_SYSCALL_NUMBER;
+        let (keccak_absorb_state_addr, keccak_absorb_data_addr) = if ecall_keccak_absorb {
+            (log.src2_val, log.dst_val)
+        } else {
+            (0, 0)
+        };
         // The ECSM operand addresses (x10/x11/x12) are recovered from the register state
         // in the trace builder.
         let ecall_ecsm =
@@ -259,6 +276,9 @@ impl CpuOperation {
                 commit_count,
                 ecall_keccak,
                 keccak_state_addr,
+                ecall_keccak_absorb,
+                keccak_absorb_state_addr,
+                keccak_absorb_data_addr,
                 decode,
                 timestamp,
                 ..Default::default()
@@ -359,6 +379,9 @@ impl CpuOperation {
             commit_count,
             ecall_keccak,
             keccak_state_addr,
+            ecall_keccak_absorb,
+            keccak_absorb_state_addr,
+            keccak_absorb_data_addr,
             ecall_ecsm,
             ecall_hint,
         }

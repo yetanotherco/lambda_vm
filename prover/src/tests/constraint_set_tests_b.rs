@@ -270,6 +270,20 @@ mod keccak_rnd {
 }
 
 // =============================================================================
+// keccak_sponge.rs
+// =============================================================================
+
+mod keccak_sponge {
+    use super::*;
+    use crate::tables::keccak_sponge::{KeccakSpongeConstraints, cols};
+
+    #[test]
+    fn keccak_sponge_constraint_set_folder_capture_agree() {
+        check_table("keccak_sponge", &KeccakSpongeConstraints, cols::NUM_COLUMNS);
+    }
+}
+
+// =============================================================================
 // cpu32.rs
 // =============================================================================
 
