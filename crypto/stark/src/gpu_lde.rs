@@ -69,6 +69,24 @@ pub(crate) fn gpu_xcheck() -> bool {
     *CACHED.get_or_init(|| std::env::var("LAMBDA_VM_GPU_XCHECK").is_ok_and(|v| v != "0"))
 }
 
+/// Serialize the device R2 window (constraint eval + decompose) across
+/// tables. Concurrent R2 windows under VRAM pressure can transiently corrupt
+/// a whole H buffer (root mechanism unidentified; reruns on the same resident
+/// inputs come out correct), yielding a proof that fails verification.
+/// Serializing only this window eliminates it at negligible cost — the
+/// windows rarely overlap. `LAMBDA_VM_GPU_SERIALIZE_R2=0` disables the lock
+/// (e.g. to bisect or once the underlying race is fixed).
+pub(crate) fn r2_serialize_guard() -> Option<std::sync::MutexGuard<'static, ()>> {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    if *ENABLED.get_or_init(|| !std::env::var("LAMBDA_VM_GPU_SERIALIZE_R2").is_ok_and(|v| v == "0"))
+    {
+        Some(LOCK.lock().unwrap())
+    } else {
+        None
+    }
+}
+
 /// Incremented by the `try_expand_*` functions per base-field column handed to
 /// the GPU dispatch (an ext3 column counts as 3, one per base component),
 /// before the GPU call. A failed call returns without decrementing it, so it
