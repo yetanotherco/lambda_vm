@@ -3410,19 +3410,22 @@ pub trait IsStarkProver<
                         // host D2H when device-only, so both buffers are left
                         // empty together for this table.
                         #[cfg(feature = "cuda")]
-                        let device_only = Self::device_only_for(*air, domain);
+                        let mut device_only = Self::device_only_for(*air, domain)
+                            && gpu_main_cells[idx].lock().unwrap().is_some();
 
                         // Resident GPU path: aux columns already on device (from
                         // the resident LogUp aux build) — LDE straight from device
                         // memory, no upload, no host column extraction. When the
                         // resident build fired the host aux trace is empty, so a
-                        // device LDE failure is a hard abort, not a fall through to
-                        // the host path below (which would commit a zero aux trace).
+                        // device LDE failure downloads the resident aux trace and
+                        // continues on the host arms below (falling through as-is
+                        // would commit a zero aux trace).
                         #[cfg(feature = "cuda")]
-                        if let Some(ra) = trace.aux_resident() {
+                        if trace.aux_resident().is_some() {
                             #[cfg(feature = "instruments")]
                             let t_sub = Instant::now();
-                            let (tree, handle, aux_data) =
+                            let num_cols = trace.aux_resident().map_or(0, |ra| ra.num_aux_cols);
+                            let expand = |ra: &math_cuda::logup::ResidentAux| {
                                 crate::gpu_lde::try_expand_leaf_and_tree_ext3_row_major_keep_dev::<
                                     Field,
                                     FieldExtension,
@@ -3433,21 +3436,79 @@ pub trait IsStarkProver<
                                     &twiddles.coset_weights,
                                     !device_only,
                                 )
-                                .ok_or_else(|| {
-                                    ProvingError::Fft(
-                                        "resident aux LDE failed; host aux trace is empty"
-                                            .to_string(),
-                                    )
-                                })?;
-                            let num_cols = ra.num_aux_cols;
-                            #[cfg(feature = "instruments")]
-                            crate::instruments::accum_r1_aux(t_sub.elapsed(), Duration::ZERO);
-                            let root = tree.root;
-                            return Ok((
-                                Some(TableCommit::plain(tree, root)),
-                                (aux_data, num_cols),
-                                Some(handle),
-                            ));
+                            };
+                            let mut expanded = expand(trace.aux_resident().expect("checked above"));
+                            if expanded.is_none()
+                                && let Ok(be) = math_cuda::device::backend()
+                                && be.ctx.synchronize().is_ok()
+                            {
+                                // The decline is usually transient VRAM
+                                // pressure from concurrent tables; a device
+                                // drain releases those peaks, so one retry
+                                // tends to keep the table fully resident
+                                // instead of paying the host downgrade.
+                                eprintln!(
+                                    "[gpu] resident aux LDE declined: table={} \
+                                     (retrying after device drain)",
+                                    air.name(),
+                                );
+                                expanded = expand(trace.aux_resident().expect("checked above"));
+                            }
+                            if let Some((tree, handle, aux_data)) = expanded {
+                                #[cfg(feature = "instruments")]
+                                crate::instruments::accum_r1_aux(t_sub.elapsed(), Duration::ZERO);
+                                let root = tree.root;
+                                return Ok((
+                                    Some(TableCommit::plain(tree, root)),
+                                    (aux_data, num_cols),
+                                    Some(handle),
+                                ));
+                            }
+                            // The device aux LDE declined at runtime (transient
+                            // VRAM pressure, usually) and there is no host aux
+                            // trace to fall back to. Same class as the R2
+                            // downgrade: download the resident aux trace — and
+                            // the main LDE if this table was device-only — and
+                            // continue fully host-backed on the arms below.
+                            let mut recovered = crate::gpu_lde::materialize_aux_trace_host(*trace);
+                            if recovered && device_only {
+                                let mut cell = main_lde_cells[idx].lock().unwrap();
+                                if let Some((data, _)) = cell.as_mut()
+                                    && data.is_empty()
+                                    && trace.num_main_columns > 0
+                                {
+                                    recovered = match (
+                                        gpu_main_cells[idx].lock().unwrap().as_ref(),
+                                        math_cuda::device::backend(),
+                                    ) {
+                                        (Some(h), Ok(be)) => {
+                                            match crate::gpu_lde::download_main_lde_row_major::<Field>(
+                                                h,
+                                                &be.next_stream(),
+                                            ) {
+                                                Some(v) => {
+                                                    *data = v;
+                                                    true
+                                                }
+                                                None => false,
+                                            }
+                                        }
+                                        _ => false,
+                                    };
+                                }
+                            }
+                            if !recovered {
+                                return Err(ProvingError::Fft(
+                                    "resident aux LDE failed; host aux trace is empty".to_string(),
+                                ));
+                            }
+                            eprintln!(
+                                "[gpu] resident-aux downgrade: table={} rows={} \
+                                 (device aux LDE declined; continuing on host)",
+                                air.name(),
+                                trace.num_rows(),
+                            );
+                            device_only = false;
                         }
 
                         // Fused GPU path (cuda only): row-major ext3 NTT — single

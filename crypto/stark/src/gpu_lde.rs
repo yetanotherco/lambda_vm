@@ -1473,32 +1473,10 @@ where
         if h.m != lde_trace.num_main_cols() || h.lde_size != lde_trace.num_rows() {
             return false;
         }
-        if h.wait_ready_on(&stream).is_err() {
-            return false;
-        }
-        let Ok(col_major) = stream.clone_dtoh(h.buf.as_ref()) else {
+        let Some(data) = download_main_lde_row_major::<F>(h, &stream) else {
             return false;
         };
-        if stream.synchronize().is_err() {
-            return false;
-        }
-        let (m, lde) = (h.m, h.lde_size);
-        let mut row_major = vec![0u64; m * lde];
-        for c in 0..m {
-            for r in 0..lde {
-                row_major[r * m + c] = col_major[c * lde + r];
-            }
-        }
-        // SAFETY: F == Goldilocks per the tower check; FieldElement<Gl> is
-        // #[repr(transparent)] over u64.
-        unsafe {
-            let mut v = std::mem::ManuallyDrop::new(row_major);
-            Vec::from_raw_parts(
-                v.as_mut_ptr() as *mut FieldElement<F>,
-                v.len(),
-                v.capacity(),
-            )
-        }
+        data
     };
 
     // Aux: de-interleaved ext3 slabs -> row-major interleaved host Vec.
@@ -1543,6 +1521,86 @@ where
     };
 
     lde_trace.set_host_data(main_data, aux_data);
+    GPU_DEVICE_ONLY_DOWNGRADES.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+/// Download a resident main LDE (column-major device buf) into the row-major
+/// host Vec the CPU rounds read. Shared by the R1 and R2 downgrade paths.
+pub(crate) fn download_main_lde_row_major<F>(
+    h: &math_cuda::lde::GpuLdeBase,
+    stream: &std::sync::Arc<math_cuda::CudaStream>,
+) -> Option<Vec<FieldElement<F>>>
+where
+    F: IsField + 'static,
+{
+    if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
+        return None;
+    }
+    h.wait_ready_on(stream).ok()?;
+    let col_major = stream.clone_dtoh(h.buf.as_ref()).ok()?;
+    stream.synchronize().ok()?;
+    let (m, lde) = (h.m, h.lde_size);
+    if col_major.len() != m * lde {
+        return None;
+    }
+    let mut row_major = vec![0u64; m * lde];
+    for c in 0..m {
+        for r in 0..lde {
+            row_major[r * m + c] = col_major[c * lde + r];
+        }
+    }
+    // SAFETY: F == Goldilocks (gated above); FieldElement<Gl> is
+    // #[repr(transparent)] over u64.
+    Some(unsafe {
+        let mut v = std::mem::ManuallyDrop::new(row_major);
+        Vec::from_raw_parts(
+            v.as_mut_ptr() as *mut FieldElement<F>,
+            v.len(),
+            v.capacity(),
+        )
+    })
+}
+
+/// R1 counterpart of [`materialize_lde_trace_host`]: download the resident
+/// aux trace (already row-major ext3, matching the host layout) into the
+/// trace's aux table, so the aux commit continues on the host arms when the
+/// device aux LDE declines at runtime.
+pub(crate) fn materialize_aux_trace_host<F, E>(trace: &mut crate::trace::TraceTable<F, E>) -> bool
+where
+    F: IsField + IsSubFieldOf<E> + 'static,
+    E: IsField + 'static,
+{
+    if !is_goldilocks_ext3_tower::<F, E>() {
+        return false;
+    }
+    let (buf, rows, cols) = match trace.aux_resident.as_ref() {
+        Some(ra) => (ra.buf.clone(), ra.num_rows, ra.num_aux_cols),
+        None => return false,
+    };
+    let Ok(be) = math_cuda::device::backend() else {
+        return false;
+    };
+    let stream = be.next_stream();
+    let Ok(raw) = stream.clone_dtoh(buf.as_ref()) else {
+        return false;
+    };
+    if stream.synchronize().is_err() || raw.len() != rows * cols * 3 {
+        return false;
+    }
+    let data = u64_to_ext3_vec::<E>(&raw);
+    trace.aux_table = crate::table::Table::new(data, cols);
+    trace.num_aux_columns = cols;
+    // The declined device LDE attempt can leave kernels enqueued on another
+    // stream still reading this buffer; its owning stream is long idle, so
+    // dropping here would complete the stream-ordered free immediately and
+    // the pool could hand the memory to a concurrent table's allocation
+    // while those kernels run. Drain the device before the drop — this is a
+    // rare recovery path.
+    if be.ctx.synchronize().is_err() {
+        return false;
+    }
+    trace.aux_resident = None;
     GPU_DEVICE_ONLY_DOWNGRADES.fetch_add(1, Ordering::Relaxed);
     true
 }
