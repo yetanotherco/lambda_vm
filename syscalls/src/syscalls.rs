@@ -29,6 +29,10 @@ pub enum SyscallNumbers {
 #[cfg(target_arch = "riscv64")]
 const KECCAK_SYSCALL_NUMBER: usize = usize::MAX - 1;
 
+/// Syscall number for the keccak sponge-absorb accelerator (u64::MAX - 3, spec -4).
+#[cfg(target_arch = "riscv64")]
+const KECCAK_ABSORB_SYSCALL_NUMBER: usize = usize::MAX - 3;
+
 /// Syscall number for the ECSM secp256k1 scalar-multiply accelerator (-11 as usize).
 #[cfg(target_arch = "riscv64")]
 const ECSM_SYSCALL_NUMBER: usize = usize::MAX - 10;
@@ -172,6 +176,36 @@ pub fn keccak_permute(state: &mut [u64; 25]) {
 #[cfg(not(target_arch = "riscv64"))]
 /// Apply the Keccak-f[1600] permutation to a 25-element u64 state in-place.
 pub fn keccak_permute(_state: &mut [u64; 25]) {
+    unimplemented!("syscalls are only implemented for riscv64 targets");
+}
+
+#[cfg(target_arch = "riscv64")]
+/// Absorb `n_blocks` whole 136-byte keccak rate blocks from `data` into
+/// `state` in place: per block, `state[0..17] ^= block` (lanewise
+/// little-endian dwords) followed by keccak-f[1600]. Padding stays with the
+/// caller — hash the final `10*1`-padded partial block via [`keccak_permute`].
+///
+/// Requirements (executor-enforced, the call traps otherwise): `data` must be
+/// 8-byte aligned and hold exactly `n_blocks * 136` bytes, `n_blocks > 0`,
+/// and the data region must not overlap `state`.
+pub fn keccak_absorb_blocks(state: &mut [u64; 25], data: &[u8], n_blocks: usize) {
+    debug_assert!(data.len() == n_blocks * 136, "data must be n_blocks × 136 bytes");
+    debug_assert!(data.as_ptr().addr().is_multiple_of(8), "data must be 8-byte aligned");
+    unsafe {
+        asm!(
+            "ecall",
+            in("a0") state.as_mut_ptr(),
+            in("a1") data.as_ptr(),
+            in("a2") n_blocks,
+            in("a7") KECCAK_ABSORB_SYSCALL_NUMBER,
+        )
+    }
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+/// Absorb `n_blocks` whole 136-byte keccak rate blocks from `data` into
+/// `state` in place (XOR into lanes 0..17, then keccak-f[1600], per block).
+pub fn keccak_absorb_blocks(_state: &mut [u64; 25], _data: &[u8], _n_blocks: usize) {
     unimplemented!("syscalls are only implemented for riscv64 targets");
 }
 
