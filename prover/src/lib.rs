@@ -455,6 +455,10 @@ pub enum Error {
     /// Recursion host-side helper failed (guest-input encoding or
     /// commitment recompute — see the `recursion` module).
     Recursion(String),
+    /// The proof's `runtime_page_ranges` do not describe a well-formed page
+    /// layout: unaligned or overflowing base, zero count, more pages than the
+    /// proof can hold, or two pages covering the same address.
+    MalformedPageLayout(String),
 }
 
 impl fmt::Display for Error {
@@ -484,6 +488,7 @@ impl fmt::Display for Error {
                 )
             }
             Error::Recursion(msg) => write!(f, "recursion helper error: {msg}"),
+            Error::MalformedPageLayout(msg) => write!(f, "malformed page layout: {msg}"),
         }
     }
 }
@@ -704,6 +709,20 @@ impl VmAirs {
             })
             .collect();
         let bitwise: VmAir = if minimal_bitwise {
+            // TEST-ONLY BRANCH — must never be reached in production.
+            //
+            // This BITWISE AIR carries NO preprocessed commitment, so its lookup
+            // table's contents are prover-chosen main trace. BITWISE backs
+            // `AreBytes` and the byte ALU, so an unpinned table lets a witness
+            // "prove" that an arbitrary field element is a byte — the same class of
+            // hole as the private-page `OFFSET` one, and a broader one. It is safe
+            // today only because every production caller passes `false`
+            // (`lib.rs` verify/prove paths and `continuation.rs`); the minimal
+            // BITWISE trace exists for unit tests that build the table by hand.
+            //
+            // A fourth call site passing `true` would reintroduce the hole silently,
+            // so if this branch ever needs to be live, give the minimal table its
+            // own preprocessed commitment first.
             Box::new(create_bitwise_air(proof_options))
         } else {
             Box::new(create_bitwise_air(proof_options).with_preprocessed(
@@ -801,10 +820,24 @@ impl VmAirs {
             .map(|config| -> VmAir {
                 let air = create_page_air(proof_options, config.page_base);
                 if config.is_private_input {
-                    // Private-input pages: all columns are main trace (not preprocessed).
-                    // The verifier doesn't see the init values; correctness is enforced
-                    // by the memory bus constraints.
-                    Box::new(air)
+                    // Private-input pages: INIT holds the private input, so it stays a
+                    // main-trace column the verifier never recomputes. OFFSET does NOT
+                    // get that treatment — it is the row's address
+                    // (`address_lo = page_base_lo + OFFSET`), and nothing else in the
+                    // system constrains it: PAGE has `EmptyConstraints` and no
+                    // constraint references the column. Left uncommitted, a witness can
+                    // point a row at any address sharing the page's high limb and mint a
+                    // second, forged memory history for it — the init/final sets stop
+                    // holding exactly one entry per address, which is the property the
+                    // offline memory-checking argument rests on.
+                    //
+                    // Committing OFFSET alone publishes nothing: it is the dense
+                    // `0..page_size-1` enumeration, byte-identical for every page
+                    // regardless of program or input.
+                    Box::new(air.with_preprocessed(
+                        page::private_page_preprocessed_commitment(proof_options),
+                        page::NUM_PREPROCESSED_COLS_PRIVATE,
+                    ))
                 } else if config.init_values.is_none() {
                     // Zero-init pages: the shared commitment computed once above.
                     Box::new(
@@ -1338,11 +1371,17 @@ fn verify_proof_parts(
         }
     }
 
+    // `proofs.len()` is the cap: every page config needs its own sub-proof, so a
+    // layout wanting more pages than the proof carries can never verify. Passing it
+    // here makes the rejection happen before the configs are allocated — the
+    // `expected_proof_count` check below runs too late to stop a `count: u64::MAX`
+    // range from exhausting memory first.
     let page_configs = Traces::page_configs_from_elf_and_runtime(
         program,
         runtime_page_ranges,
         num_private_input_pages,
-    );
+        proofs.len(),
+    )?;
 
     // Cross-check: table_counts must match the number of sub-proofs.
     // FIXED_TABLE_COUNT always-present tables, plus page tables.
