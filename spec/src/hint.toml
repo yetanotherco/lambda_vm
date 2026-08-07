@@ -1,0 +1,143 @@
+name = "HINT"
+code = "HNT"
+
+# Variables
+
+[[variables.input]]
+name = "timestamp"
+type = "Word"
+desc = "timestamp at which the hint `ECALL` is executed"
+pad = 0
+
+[[variables.input]]
+name = "selector"
+type = "DWordWL"
+desc = "the requested hint operation, read from `x10` (`A0`)"
+pad = 0
+
+[[variables.input]]
+name = "addr_in"
+type = "DWordWL"
+desc = "address of the 32-byte input, read from `x11` (`A1`)"
+pad = 0
+
+[[variables.input]]
+name = "addr_out"
+type = "DWordWL"
+desc = "address of the 32-byte output buffer, read from `x12` (`A2`)"
+pad = 0
+
+[[variables.output]]
+name = "out"
+type = "U256BL"
+desc = "the hinted value, big-endian. *Unconstrained*: no constraint in this chip relates `out` to the value stored at `addr_in`."
+pad = 0
+
+[[variables.multiplicity]]
+name = "μ"
+type = "Bit"
+desc = ""
+pad = 0
+
+# Constraints
+
+[[constraint_groups]]
+name = "ecall"
+
+[[constraints.ecall]]
+kind = "interaction"
+tag = "ECALL"
+input = ["timestamp", ["arr", ["-", ["^", 2, 32], 31], ["-", ["^", 2, 32], 1]]]
+multiplicity = ["-", "μ"]
+ref = "hint:c:receive_ecall"
+
+[[constraints.ecall]]
+kind = "template"
+tag = "IS_BIT"
+input = ["μ"]
+ref = "hint:c:mu_isbit"
+
+[[constraint_groups]]
+name = "operands"
+
+[[constraints.operands]]
+kind = "template"
+tag = "REG"
+input = [10, "selector", "timestamp"]
+output = "selector"
+cond = "μ"
+ref = "hint:c:read_selector"
+
+[[constraints.operands]]
+kind = "template"
+tag = "REG"
+input = [11, "addr_in", "timestamp"]
+output = "addr_in"
+cond = "μ"
+ref = "hint:c:read_addr_in"
+
+[[constraints.operands]]
+kind = "template"
+tag = "REG"
+input = [12, "addr_out", "timestamp"]
+output = "addr_out"
+cond = "μ"
+ref = "hint:c:read_addr_out"
+
+[[constraints.operands]]
+kind = "interaction"
+tag = "ALU"
+input = ["selector", ["cast", 3, "DWordWL"], ["opsel", "LT"]]
+output = ["cast", 1, "DWordWL"]
+multiplicity = "μ"
+ref = "hint:c:range_selector"
+
+[[constraints.operands]]
+kind = "interaction"
+tag = "ALU"
+input = [["arr", ["idx", "addr_in", 0], 0], ["cast", ["-", ["^", 2, 32], 31], "DWordWL"], ["opsel", "LT"]]
+output = ["cast", 1, "DWordWL"]
+multiplicity = "μ"
+ref = "hint:c:range_addr_in"
+
+[[constraints.operands]]
+kind = "interaction"
+tag = "ALU"
+input = [["arr", ["idx", "addr_out", 0], 0], ["cast", ["-", ["^", 2, 32], 31], "DWordWL"], ["opsel", "LT"]]
+output = ["cast", 1, "DWordWL"]
+multiplicity = "μ"
+ref = "hint:c:range_addr_out"
+
+[[constraint_groups]]
+name = "write_out"
+
+[[constraints.write_out]]
+kind = "interaction"
+tag = "MEMW"
+input = [
+    0,
+    ["arr", ["+", ["idx", "addr_out", 0], ["*", 8, "i"]], ["idx", "addr_out", 1]],
+    ["arr",
+        ["idx", "out", ["+", ["*", 8, "i"], 0]],
+        ["idx", "out", ["+", ["*", 8, "i"], 1]],
+        ["idx", "out", ["+", ["*", 8, "i"], 2]],
+        ["idx", "out", ["+", ["*", 8, "i"], 3]],
+        ["idx", "out", ["+", ["*", 8, "i"], 4]],
+        ["idx", "out", ["+", ["*", 8, "i"], 5]],
+        ["idx", "out", ["+", ["*", 8, "i"], 6]],
+        ["idx", "out", ["+", ["*", 8, "i"], 7]],
+    ],
+    "timestamp",
+    0, 0, 1
+]
+iter = ["i", 0, 3]
+multiplicity = "μ"
+ref = "hint:c:write_out"
+
+[[constraints.write_out]]
+kind = "interaction"
+tag = "ARE_BYTES"
+input = [["idx", "out", ["*", 2, "i"]], ["idx", "out", ["+", ["*", 2, "i"], 1]]]
+iter = ["i", 0, 15]
+multiplicity = "μ"
+ref = "hint:c:range_out"
