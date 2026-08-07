@@ -18,3 +18,9 @@ The Lambda VM proves correct execution of a RISC-V (RV64IM) program against an i
 4. **Proof system** ([`crypto/stark/`](../crypto/stark/)) — commits to each table's trace via Merkle trees, samples challenges via Fiat-Shamir, and runs FRI for the low-degree test. Produces a `MultiProof`; the verifier replays the transcript and checks all AIR and lookup constraints.
 
 For a deeper dive into each component see the [proof system overview](./cryptography/proof_system.md).
+
+## Accelerated memory operations
+
+`memcpy` is accelerated: `lambda-vm-syscalls` exports it under its standard, unmangled C name, so both explicit calls and the copies the compiler emits implicitly (struct moves, slice copies, `Vec` growth) reach the DMA ecall with no guest source changes. Behaviour is identical to the C function for every input, including `n == 0` and any alignment of `dest`, `src` or `n`. `memmove`, `memset` and `memcmp` are not accelerated and fall back to the toolchain's `compiler-builtins` definitions.
+
+**Symbol resolution.** `compiler-builtins` defines `memcpy` *weakly*, and a linker extracts a static-archive member only to satisfy an *undefined* symbol — a weak definition already satisfies the reference, so a strong definition that lives in a member nothing else pulls in is dropped silently, with no duplicate-symbol diagnostic. Lambda VM therefore defines `memcpy` in [`syscalls/src/entrypoint.rs`](../syscalls/src/entrypoint.rs), the same object that defines `_start`, which every guest links unconditionally. That object is always extracted, so the strong definition is in the link graph from the start and overrides the weak one. No `--whole-archive` and no guest link flag is required, and resolution does not depend on archive order.

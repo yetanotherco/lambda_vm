@@ -1,5 +1,5 @@
 #[cfg(target_arch = "riscv64")]
-use core::arch::{asm, global_asm};
+use core::arch::asm;
 
 /// Memory-mapped private input region start address.
 /// Layout: 4-byte LE length prefix at this address, data at +4.
@@ -35,11 +35,11 @@ const ECSM_SYSCALL_NUMBER: usize = usize::MAX - 10;
 
 /// DMA memcpy syscall number. Must match the executor.
 #[cfg(target_arch = "riscv64")]
-const DMA_MEMCPY_SYSCALL_NUMBER: usize = usize::MAX - 2;
+pub(crate) const DMA_MEMCPY_SYSCALL_NUMBER: usize = usize::MAX - 2;
 /// Maximum bytes sent in one DMA ecall. Larger `memcpy` calls are split by the
 /// strong assembly stub so continuation table height remains bounded by cycles.
 #[cfg(target_arch = "riscv64")]
-const DMA_MEMCPY_MAX_BYTES: usize = 256;
+pub(crate) const DMA_MEMCPY_MAX_BYTES: usize = 256;
 
 /// No-op. The `Print` ecall (a7=1) has no receiver on the Ecall bus, so emitting
 /// it makes the LogUp bus unbalance and the proof fail to verify. Printing isn't
@@ -194,52 +194,6 @@ pub fn ecsm_mul(xr: &mut [u8; 32], xg: &[u8; 32], k: &[u8; 32]) {
 pub fn ecsm_mul(_xr: &mut [u8; 32], _xg: &[u8; 32], _k: &[u8; 32]) {
     unimplemented!("syscalls are only implemented for riscv64 targets");
 }
-
-// ---------------------------------------------------------------------------
-// DMA memcpy symbol override
-//
-// A Rust `#[no_mangle] fn memcpy` did not reliably override compiler-builtins in
-// optimized guests: the final ELF still jumped to compiler_builtins' implementation.
-// Match ZisK's approach and publish a strong assembly symbol. LLVM still inlines
-// statically-sized tiny copies. Remaining out-of-line copies are split into
-// bounded DMA ecalls so a single guest instruction cannot create an unbounded
-// continuation trace.
-//
-// `.p2align 2` is load-bearing: a bare `.section` gives sh_addralign = 1, so the
-// linker is free to place `memcpy` at an address that is not a multiple of 4 and
-// the VM, which fetches one 4-byte instruction per pc, could not decode it.
-// ---------------------------------------------------------------------------
-
-#[cfg(target_arch = "riscv64")]
-global_asm!(
-    r#"
-    .section .text.memcpy,"ax",@progbits
-    .p2align 2
-    .globl memcpy
-    .type memcpy,@function
-memcpy:
-    mv t0, a0
-    mv t1, a2
-    beqz t1, .Ldma_memcpy_done
-.Ldma_memcpy_loop:
-    li a2, {max_bytes}
-    bgeu t1, a2, .Ldma_memcpy_call
-    mv a2, t1
-.Ldma_memcpy_call:
-    li a7, {syscall}
-    ecall
-    sub t1, t1, a2
-    add a0, a0, a2
-    add a1, a1, a2
-    bnez t1, .Ldma_memcpy_loop
-.Ldma_memcpy_done:
-    mv a0, t0
-    ret
-    .size memcpy, .-memcpy
-"#,
-    syscall = const DMA_MEMCPY_SYSCALL_NUMBER,
-    max_bytes = const DMA_MEMCPY_MAX_BYTES,
-);
 
 // =============================================================================
 // Stub implementations for unsupported std functions
