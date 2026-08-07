@@ -637,7 +637,9 @@ where
     /// `lde_size` instead.
     #[cfg(feature = "cuda")]
     /// Install downloaded host buffers on a device-only table and clear the
-    /// flag: from here every host read is valid again. Only meaningful from
+    /// flag: from here every host read is valid again. An empty Vec keeps
+    /// that side's existing buffer (either the side has no columns or it
+    /// already held a host copy in a mixed state). Only meaningful from
     /// [`crate::gpu_lde::materialize_lde_trace_host`], which guarantees the
     /// buffers match the device handles' layout.
     #[cfg(feature = "cuda")]
@@ -646,8 +648,12 @@ where
         main_data: Vec<FieldElement<F>>,
         aux_data: Vec<FieldElement<E>>,
     ) {
-        self.main_data = main_data;
-        self.aux_data = aux_data;
+        if !main_data.is_empty() {
+            self.main_data = main_data;
+        }
+        if !aux_data.is_empty() {
+            self.aux_data = aux_data;
+        }
         self.host_trace_empty = false;
     }
 
@@ -961,10 +967,12 @@ where
             v
         } else {
             // Device-only tables have no host trace; a GPU fall-through here would
-            // read empty `main_data`. Hard-abort instead of a wrong OOD eval.
+            // read empty `main_data`. Hard-abort instead of a wrong OOD eval. The
+            // check is on the buffer itself, not the table-wide flag: a mixed
+            // state can leave a valid host copy on one side only.
             #[cfg(feature = "cuda")]
             assert!(
-                !lde_trace.host_trace_empty(),
+                lde_trace.num_main_cols() == 0 || !lde_trace.main_data.is_empty(),
                 "R3 barycentric (main) fell back to the host trace, but it is device-only (empty)"
             );
             let inv_denoms_v =
@@ -1028,10 +1036,11 @@ where
             v
         } else {
             // Device-only tables have no host trace; a GPU fall-through here would
-            // read empty `aux_data`. Hard-abort instead of a wrong OOD eval.
+            // read empty `aux_data`. Hard-abort instead of a wrong OOD eval. Same
+            // buffer-level check as the main arm: mixed states are valid here.
             #[cfg(feature = "cuda")]
             assert!(
-                !lde_trace.host_trace_empty(),
+                lde_trace.num_aux_cols() == 0 || !lde_trace.aux_data.is_empty(),
                 "R3 barycentric (aux) fell back to the host trace, but it is device-only (empty)"
             );
             let inv_denoms_v =

@@ -1627,12 +1627,15 @@ pub fn gpu_device_only_downgrades() -> u64 {
 
 /// Recover a device-only table for the host path: download the resident main
 /// and aux LDEs from their device handles into the host buffers and clear the
-/// device-only flag. The class-level safety net under the device-only gate —
-/// a static predicate can never mirror every reason a dynamic dispatch might
-/// decline (kernel eligibility, transient errors, shapes a new workload
-/// brings), so any miss lands here and degrades to a slower-but-correct CPU
-/// round instead of a hard abort. Returns false (→ the caller's abort) only
-/// when a handle is absent or a download fails.
+/// device-only flag. A side whose host buffer is already populated (a mixed
+/// state: one commit fell back to CPU while the other stayed device-only) is
+/// kept as is — only the missing side is downloaded. The class-level safety
+/// net under the device-only gate — a static predicate can never mirror every
+/// reason a dynamic dispatch might decline (kernel eligibility, transient
+/// errors, shapes a new workload brings), so any miss lands here and degrades
+/// to a slower-but-correct CPU round instead of a hard abort. Returns false
+/// (→ the caller's abort) only when a missing side has no handle or a
+/// download fails.
 pub(crate) fn materialize_lde_trace_host<F, E>(
     lde_trace: &mut crate::trace::LDETraceTable<F, E>,
 ) -> bool
@@ -1650,62 +1653,65 @@ where
         return false;
     };
 
-    // Main: column-major device buf -> row-major host Vec.
-    let main_data: Vec<FieldElement<F>> = if lde_trace.num_main_cols() == 0 {
-        Vec::new()
-    } else {
-        let Some(h) = lde_trace.gpu_main() else {
-            return false;
+    // Main: column-major device buf -> row-major host Vec. An empty Vec tells
+    // `set_host_data` to keep the buffer that is already there.
+    let main_data: Vec<FieldElement<F>> =
+        if lde_trace.num_main_cols() == 0 || !lde_trace.main_data.is_empty() {
+            Vec::new()
+        } else {
+            let Some(h) = lde_trace.gpu_main() else {
+                return false;
+            };
+            if h.m != lde_trace.num_main_cols() || h.lde_size != lde_trace.num_rows() {
+                return false;
+            }
+            let Some(data) = download_main_lde_row_major::<F>(h, &stream) else {
+                return false;
+            };
+            data
         };
-        if h.m != lde_trace.num_main_cols() || h.lde_size != lde_trace.num_rows() {
-            return false;
-        }
-        let Some(data) = download_main_lde_row_major::<F>(h, &stream) else {
-            return false;
-        };
-        data
-    };
 
     // Aux: de-interleaved ext3 slabs -> row-major interleaved host Vec.
-    let aux_data: Vec<FieldElement<E>> = if lde_trace.num_aux_cols() == 0 {
-        Vec::new()
-    } else {
-        let Some(h) = lde_trace.gpu_aux() else {
-            return false;
-        };
-        if h.m != lde_trace.num_aux_cols() || h.lde_size != lde_trace.num_rows() {
-            return false;
-        }
-        if h.wait_ready_on(&stream).is_err() {
-            return false;
-        }
-        let Ok(slabs) = stream.clone_dtoh(h.buf.as_ref()) else {
-            return false;
-        };
-        if stream.synchronize().is_err() {
-            return false;
-        }
-        let (m, lde) = (h.m, h.lde_size);
-        let mut interleaved = vec![0u64; m * lde * 3];
-        for c in 0..m {
-            for k in 0..3 {
-                let slab = &slabs[(c * 3 + k) * lde..(c * 3 + k + 1) * lde];
-                for r in 0..lde {
-                    interleaved[(r * m + c) * 3 + k] = slab[r];
+    let aux_data: Vec<FieldElement<E>> =
+        if lde_trace.num_aux_cols() == 0 || !lde_trace.aux_data.is_empty() {
+            Vec::new()
+        } else {
+            let Some(h) = lde_trace.gpu_aux() else {
+                return false;
+            };
+            if h.m != lde_trace.num_aux_cols() || h.lde_size != lde_trace.num_rows() {
+                return false;
+            }
+            if h.wait_ready_on(&stream).is_err() {
+                return false;
+            }
+            let Ok(slabs) = stream.clone_dtoh(h.buf.as_ref()) else {
+                return false;
+            };
+            if stream.synchronize().is_err() {
+                return false;
+            }
+            let (m, lde) = (h.m, h.lde_size);
+            let mut interleaved = vec![0u64; m * lde * 3];
+            for c in 0..m {
+                for k in 0..3 {
+                    let slab = &slabs[(c * 3 + k) * lde..(c * 3 + k + 1) * lde];
+                    for r in 0..lde {
+                        interleaved[(r * m + c) * 3 + k] = slab[r];
+                    }
                 }
             }
-        }
-        // SAFETY: E == Ext3 per the tower check; FieldElement<Ext3> backing
-        // is [u64; 3].
-        unsafe {
-            let mut v = std::mem::ManuallyDrop::new(interleaved);
-            Vec::from_raw_parts(
-                v.as_mut_ptr() as *mut FieldElement<E>,
-                v.len() / 3,
-                v.capacity() / 3,
-            )
-        }
-    };
+            // SAFETY: E == Ext3 per the tower check; FieldElement<Ext3> backing
+            // is [u64; 3].
+            unsafe {
+                let mut v = std::mem::ManuallyDrop::new(interleaved);
+                Vec::from_raw_parts(
+                    v.as_mut_ptr() as *mut FieldElement<E>,
+                    v.len() / 3,
+                    v.capacity() / 3,
+                )
+            }
+        };
 
     lde_trace.set_host_data(main_data, aux_data);
     GPU_DEVICE_ONLY_DOWNGRADES.fetch_add(1, Ordering::Relaxed);
