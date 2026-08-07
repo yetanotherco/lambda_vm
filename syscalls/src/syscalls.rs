@@ -41,6 +41,16 @@ const DMA_MEMCPY_SYSCALL_NUMBER: usize = usize::MAX - 2;
 #[cfg(target_arch = "riscv64")]
 const DMA_MEMCPY_MAX_BYTES: usize = 256;
 
+/// Syscall number for the non-constraining Hint ecall.
+/// Must match `executor::...::execution::HINT_SYSCALL_NUMBER` (u64::MAX - 30).
+#[cfg(target_arch = "riscv64")]
+const HINT_SYSCALL_NUMBER: usize = usize::MAX - 30;
+
+/// Hint selectors passed in `a0` (must match the executor's `HINT_*`).
+pub const HINT_FIELD_INV: usize = 0;
+pub const HINT_SCALAR_INV: usize = 1;
+pub const HINT_FIELD_SQRT: usize = 2;
+
 /// No-op. The `Print` ecall (a7=1) has no receiver on the Ecall bus, so emitting
 /// it makes the LogUp bus unbalance and the proof fail to verify. Printing isn't
 /// needed in provable programs, so `print_string` does nothing on every target.
@@ -240,6 +250,32 @@ memcpy:
     syscall = const DMA_MEMCPY_SYSCALL_NUMBER,
     max_bytes = const DMA_MEMCPY_MAX_BYTES,
 );
+
+/// Ask the host for a non-constraining hint (modular inverse/sqrt).
+/// `hint_id` selects the operation ([`HINT_FIELD_INV`]/[`HINT_SCALAR_INV`]/
+/// [`HINT_FIELD_SQRT`]); `input`/`out` are 32-byte **big-endian** field/scalar
+/// elements — k256's own serialization, so consumers pass `to_bytes()` straight
+/// through. Note this differs from [`ecsm_mul`], which is little-endian.
+/// The result is UNTRUSTED — the caller MUST verify it in-guest (e.g. `x·inv == 1`)
+/// AND recompute in software on failure, since this ecall adds no correctness
+/// constraint and the prover chooses the returned bytes.
+#[cfg(target_arch = "riscv64")]
+pub fn hint(hint_id: usize, out: &mut [u8; 32], input: &[u8; 32]) {
+    unsafe {
+        asm!(
+            "ecall",
+            in("a0") hint_id,           // x10 = hint selector
+            in("a1") input.as_ptr(),    // x11 = input address (32-byte BE)
+            in("a2") out.as_mut_ptr(),  // x12 = output address (32-byte BE)
+            in("a7") HINT_SYSCALL_NUMBER,
+        )
+    }
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+pub fn hint(_hint_id: usize, _out: &mut [u8; 32], _input: &[u8; 32]) {
+    unimplemented!("syscalls are only implemented for riscv64 targets");
+}
 
 // =============================================================================
 // Stub implementations for unsupported std functions

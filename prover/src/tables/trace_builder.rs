@@ -52,6 +52,7 @@ use super::ecdas;
 use super::ecsm;
 use super::eq;
 use super::halt;
+use super::hint;
 use super::keccak::{self, KeccakOperation};
 use super::keccak_rc;
 use super::keccak_rnd::{self, KeccakRoundOperation};
@@ -551,6 +552,7 @@ fn collect_ops_from_cpu(
     Vec<ecsm::EcsmOperation>,
     Vec<ecdas::EcdasOperation>,
     Vec<dma::DmaOperation>,
+    Vec<hint::HintOperation>,
 ) {
     let mut memw = MemwBuckets::with_register_capacity(cpu_ops.len() * 3);
     let mut load_ops = Vec::with_capacity(cpu_ops.len() / 8 + 1);
@@ -563,6 +565,7 @@ fn collect_ops_from_cpu(
     let mut ecsm_ops = Vec::new();
     let mut ecdas_ops = Vec::new();
     let mut dma_ops = Vec::new();
+    let mut hint_ops = Vec::new();
     // Seed from the carried x254 (0 for a monolithic run or the first epoch) so a
     // continuation epoch indexes its commits globally, matching the x254 the
     // register binding transports across epochs. Resetting to 0 here would drift
@@ -665,6 +668,13 @@ fn collect_ops_from_cpu(
             dma_ops.extend(rows);
         }
 
+        // Collect Hint ecall operations (the 32-byte output write).
+        if op.ecall_hint {
+            let (hint_memw, hint_op) = collect_hint_ops(op, memory_state, register_state);
+            memw.extend_ops(hint_memw);
+            hint_ops.push(hint_op);
+        }
+
         // --- ALU chip dispatch (no state tracking) ---
         // Word (`*W`) instructions are delegated to CPU32 (which itself drives
         // the ALU chips); the main CPU does not send the ALU bus for them, so we
@@ -721,6 +731,7 @@ fn collect_ops_from_cpu(
         ecsm_ops,
         ecdas_ops,
         dma_ops,
+        hint_ops,
     )
 }
 
@@ -1164,6 +1175,81 @@ fn replay_dma_memcpy_for_sizing(
     }
 
     snapshot_count + 1
+}
+
+/// Collects the memory operations for a `Hint` ecall.
+///
+/// The `hint` ecall writes a 32-byte value (a modular inverse / sqrt) to guest
+/// memory *directly* — bypassing the CPU load/store decode — so the trace builder
+/// must reproduce that write itself: the value is not carried in the CPU log. We
+/// re-derive the operand addresses from the register state (a0/a1/a2 = x10/x11/x12,
+/// like ECSM), read the input from the replayed memory, recompute the output with
+/// the executor's `compute_hint` (deterministic, same k256 arithmetic), then emit
+/// four 8-byte MEMW writes at `out_addr` +0/8/16/24 and advance `memory_state`.
+///
+/// The input read is intentionally not modeled (a read leaves the value unchanged;
+/// the guest supplied the input via ordinary stores). The value itself is
+/// unconstrained — soundness lives in the guest's in-circuit verify.
+fn collect_hint_ops(
+    op: &CpuOperation,
+    memory_state: &mut MemoryState,
+    register_state: &mut RegisterState,
+) -> (Vec<MemwOperation>, hint::HintOperation) {
+    let t = op.timestamp;
+    let hint_id = register_state.read(10).0;
+    let in_addr = register_state.read(11).0;
+    let out_addr = register_state.read(12).0;
+
+    let mut memw_ops = Vec::with_capacity(7);
+
+    // Bind a0/a1/a2 (x10/x11/x12) at ts through the memory argument. x12 ties the
+    // output-write base below to the ecall's a2; x10 (selector) and x11 (in_addr) pin
+    // the operands the HINT table range-checks against the executor's accepted set, so
+    // the AIR cannot prove a hint the executor would reject. All three are register
+    // reads (old == value; a read leaves the register unchanged). See `tables::hint`.
+    for (reg, value) in [(10u8, hint_id), (11, in_addr), (12, out_addr)] {
+        let reg_value = pack_register_value(value);
+        let (_old_val, old_ts) = register_state.read(reg);
+        memw_ops.push(
+            MemwOperation::new(true, 2 * reg as u64, reg_value, t, 2, true)
+                .with_old(reg_value, [old_ts, old_ts, 0, 0, 0, 0, 0, 0]),
+        );
+        register_state.write(reg, value, t);
+    }
+
+    // Read the 32-byte big-endian input from the replayed memory.
+    let mut input = [0u8; 32];
+    for (i, b) in input.iter_mut().enumerate() {
+        *b = memory_state.read_byte(in_addr.wrapping_add(i as u64)).0;
+    }
+
+    // Recompute the output exactly as the executor did (the value isn't in the log).
+    let out_bytes = executor::vm::instruction::execution::compute_hint(hint_id, &input);
+
+    // Emit the 32-byte output as four 8-byte MEMW writes at ts = T.
+    for i in 0..4 {
+        let addr = out_addr.wrapping_add((8 * i) as u64);
+        let mut value = [0u32; 8];
+        let mut dword = 0u64;
+        for j in 0..8 {
+            let byte = out_bytes[8 * i + j];
+            value[j] = byte as u32;
+            dword |= (byte as u64) << (8 * j);
+        }
+        let (old_vals, old_ts) = memory_state.read_bytes(addr, 8);
+        memw_ops
+            .push(MemwOperation::new(false, addr, value, t, 8, false).with_old(old_vals, old_ts));
+        memory_state.write_bytes(addr, dword, 8, t);
+    }
+
+    let hint_op = hint::HintOperation {
+        timestamp: t,
+        out_addr,
+        out_bytes,
+        hint_id,
+        in_addr,
+    };
+    (memw_ops, hint_op)
 }
 
 /// Collects register read/write operations (M1, M3, M5) from CpuOperation,
@@ -2497,6 +2583,23 @@ fn collect_bitwise_from_dma(dma_ops: &[dma::DmaOperation]) -> Vec<BitwiseOperati
     lookups
 }
 
+/// BITWISE lookups sent by the HINT table: `ARE_BYTES[out[2i], out[2i+1]]` for the
+/// 32 output cells, paired exactly as `hint::bus_interactions` pairs its senders, so
+/// the BITWISE receiver multiplicities account for them.
+fn collect_bitwise_from_hint(hint_ops: &[hint::HintOperation]) -> Vec<BitwiseOperation> {
+    let mut lookups = Vec::with_capacity(16 * hint_ops.len());
+    for op in hint_ops {
+        for i in 0..16 {
+            lookups.push(BitwiseOperation::byte_op(
+                BitwiseOperationType::AreBytes,
+                op.out_bytes[2 * i],
+                op.out_bytes[2 * i + 1],
+            ));
+        }
+    }
+    lookups
+}
+
 // =============================================================================
 // BITWISE lookup helpers
 // =============================================================================
@@ -3019,6 +3122,9 @@ pub struct Traces {
     /// DMA memcpy table (eight-byte body rows plus byte tail rows).
     pub dma: TraceTable<GoldilocksField, GoldilocksExtension>,
 
+    /// HINT table (one row per non-constraining hint ecall).
+    pub hint: TraceTable<GoldilocksField, GoldilocksExtension>,
+
     /// MEMW_R register-only fast-path traces (split into chunks of max_rows::MEMW_R)
     pub memw_registers: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
     /// Local-to-global boundary table for continuation epochs. Empty unless the
@@ -3063,6 +3169,8 @@ struct CollectedOps {
     ecdas_ops: Vec<ecdas::EcdasOperation>,
     // DMA memcpy rows (eight bytes per body row, byte tail, plus terminal rows).
     dma_ops: Vec<dma::DmaOperation>,
+    // Non-constraining hint ecall.
+    hint_ops: Vec<hint::HintOperation>,
 }
 
 /// Chunk raw ops and generate one trace table per chunk. When `storage_mode`
@@ -3118,6 +3226,7 @@ fn collect_all_ops(
     ecsm_ops: Vec<ecsm::EcsmOperation>,
     ecdas_ops: Vec<ecdas::EcdasOperation>,
     dma_ops: Vec<dma::DmaOperation>,
+    hint_ops: Vec<hint::HintOperation>,
     register_state: &mut RegisterState,
     is_final: bool,
 ) -> CollectedOps {
@@ -3260,6 +3369,7 @@ fn collect_all_ops(
         cpu32_ops,
         ecsm_ops,
         ecdas_ops,
+        hint_ops,
         dma_ops,
     }
 }
@@ -3305,6 +3415,7 @@ fn build_traces<I: ImageSource + Sync>(
         ecsm_ops,
         ecdas_ops,
         dma_ops,
+        hint_ops,
     } = ops;
 
     // =====================================================================
@@ -3323,6 +3434,16 @@ fn build_traces<I: ImageSource + Sync>(
             .filter(|op| op.first)
             .map(|op| LtOperation::new(op.count, dma::DMA_MEMCPY_MAX_BYTES + 1, false)),
     );
+    // HINT range-checks: selector < 3 and both address low limbs < 2^32 - 31 (matching
+    // the executor's HintUnknownSelector / HintAddressOverflow rejections). Three LT ops
+    // per hint call; the HINT table sends the matching ALU LT interactions.
+    lt_ops.extend(hint_ops.iter().flat_map(|op| {
+        [
+            LtOperation::new(op.hint_id, hint::HINT_SELECTOR_BOUND, false),
+            LtOperation::new(op.in_addr & 0xFFFF_FFFF, hint::HINT_ADDR_LIMB_BOUND, false),
+            LtOperation::new(op.out_addr & 0xFFFF_FFFF, hint::HINT_ADDR_LIMB_BOUND, false),
+        ]
+    }));
 
     // =====================================================================
     // PHASE 4: All → Bitwise lookups
@@ -3352,7 +3473,8 @@ fn build_traces<I: ImageSource + Sync>(
     // chunk size used to split them into instances so multiplicities match the per-instance
     // sends. MEMW_R sends IS_HALFWORD[timestamp_0 - old_timestamp_lo - 1]. PAGE does a
     // batched ARE_BYTES[init, fini] per row (skipped in continuation epochs, which the L2G
-    // table owns). COMMIT sends AreBytes+IsHalfword; KECCAK_RND sends XOR/AND/ARE_BYTES/HWSL.
+    // table owns). COMMIT sends AreBytes+IsHalfword; KECCAK_RND sends XOR/AND/ARE_BYTES/HWSL;
+    // HINT sends ARE_BYTES for its 32 output cells.
     // We never concatenate the lookups into one giant `Vec<BitwiseOperation>` (~140 M ops /
     // ~560 MB at 10-tx whose only consumer is the multiplicity count). Each collector bumps
     // the `BitwiseHistogram` it is handed: the heavy sources (MEMW_R one-per-row, PAGE
@@ -3392,6 +3514,7 @@ fn build_traces<I: ImageSource + Sync>(
         Box::new(|h| h.add_ops(&collect_bitwise_from_keccak(&keccak_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_ecsm(&ecsm_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_ecdas(&ecdas_ops))),
+        Box::new(|h| h.add_ops(&collect_bitwise_from_hint(&hint_ops))),
         Box::new(|h| add_padding_byte_checks(h, num_padding_rows)),
     ];
     if let Some(image) = initial_image
@@ -3679,6 +3802,8 @@ fn build_traces<I: ImageSource + Sync>(
     let gen_ecsm = || ecsm::generate_ecsm_trace(&ecsm_ops);
     let gen_ecdas = || ecdas::generate_ecdas_trace(&ecdas_ops);
     let gen_dma = || dma::generate_dma_trace(&dma_ops);
+    // HINT table (all-padding for programs that make no hint ecalls).
+    let gen_hint = || hint::generate_hint_trace(&hint_ops);
 
     let (mut cpus_slot, mut memws_slot, mut memw_aligneds_slot, mut memw_registers_slot) =
         (None, None, None, None);
@@ -3692,6 +3817,7 @@ fn build_traces<I: ImageSource + Sync>(
         (None, None, None, None);
     let (mut ecsm_slot, mut ecdas_slot) = (None, None);
     let mut dma_slot = None;
+    let mut hint_slot = None;
 
     #[cfg(feature = "disk-spill")]
     let sequential = storage_mode == StorageMode::Disk || cfg!(not(feature = "parallel"));
@@ -3734,6 +3860,7 @@ fn build_traces<I: ImageSource + Sync>(
             spawn_into!(ecsm_slot, gen_ecsm);
             spawn_into!(ecdas_slot, gen_ecdas);
             spawn_into!(dma_slot, gen_dma);
+            spawn_into!(hint_slot, gen_hint);
         });
     } else {
         cpus_slot = Some(gen_cpus());
@@ -3762,6 +3889,7 @@ fn build_traces<I: ImageSource + Sync>(
         ecsm_slot = Some(gen_ecsm());
         ecdas_slot = Some(gen_ecdas());
         dma_slot = Some(gen_dma());
+        hint_slot = Some(gen_hint());
     }
 
     const PHASE5_RAN: &str = "phase 5 generation ran in one of the branches above";
@@ -3798,6 +3926,7 @@ fn build_traces<I: ImageSource + Sync>(
     let ecdas_trace = ecdas_slot.expect(PHASE5_RAN);
     #[allow(unused_mut)]
     let mut dma_trace = dma_slot.expect(PHASE5_RAN);
+    let hint_trace = hint_slot.expect(PHASE5_RAN);
 
     // Fixed-size and per-page tables aren't built through `chunk_and_generate`,
     // so spill them here before returning.
@@ -3870,6 +3999,7 @@ fn build_traces<I: ImageSource + Sync>(
         ecsm: ecsm_trace,
         ecdas: ecdas_trace,
         dma: dma_trace,
+        hint: hint_trace,
         memw_registers,
         local_to_global,
         touched_memory_cells,
@@ -4065,6 +4195,25 @@ pub fn count_table_lengths(
             lt_count += dma_rows + 1;
         }
 
+        if cpu_op.ecall_hint {
+            // Mirror `collect_hint_ops`: three register reads (a0/a1/a2) and four
+            // 8-byte output writes go through the memory argument, plus the three LT
+            // range-checks (selector < 3, in_addr and out_addr low limbs). Replaying it
+            // here keeps memory/register state in sync with generation, exactly like
+            // commit above.
+            let (hint_memw, _hint_op) =
+                collect_hint_ops(&cpu_op, &mut memory_state, &mut register_state);
+            for memw_op in &hint_memw {
+                partition_memw(
+                    memw_op,
+                    &mut memw_by_width,
+                    &mut memw_aligned_count,
+                    &mut memw_register_count,
+                );
+            }
+            lt_count += 3;
+        }
+
         // CPU-side per-instruction-kind counters (non-word; word → CPU32, B5b)
         let f = &cpu_op.decode.fields;
         if !f.word_instr && f.is_lt() {
@@ -4159,6 +4308,7 @@ impl Traces {
         use super::ecsm::cols::NUM_COLUMNS as ECSM_COLS;
         use super::eq::cols::NUM_COLUMNS as EQ_COLS;
         use super::halt::cols::NUM_COLUMNS as HALT_COLS;
+        use super::hint::cols::NUM_COLUMNS as HINT_COLS;
         use super::keccak::cols::NUM_COLUMNS as KECCAK_COLS;
         use super::keccak_rc::NUM_PRECOMPUTED_COLS as KECCAK_RC_PRECOMPUTED;
         use super::keccak_rc::cols::NUM_COLUMNS as KECCAK_RC_COLS;
@@ -4197,6 +4347,7 @@ impl Traces {
             keccak_rc,
             ecsm,
             ecdas,
+            hint,
             dma,
             memw_registers,
             eqs,
@@ -4266,6 +4417,7 @@ impl Traces {
         total += (ecsm.num_rows() * ECSM_COLS) as u64;
         total += (ecdas.num_rows() * ECDAS_COLS) as u64;
         total += (dma.num_rows() * DMA_COLS) as u64;
+        total += (hint.num_rows() * HINT_COLS) as u64;
         total
     }
 
@@ -4308,6 +4460,7 @@ impl Traces {
         let n_ecsm = aux_cols(super::ecsm::bus_interactions().len());
         let n_ecdas = aux_cols(super::ecdas::bus_interactions().len());
         let n_dma = aux_cols(super::dma::bus_interactions().len());
+        let n_hint = aux_cols(super::hint::bus_interactions().len());
 
         let Traces {
             cpus,
@@ -4330,6 +4483,7 @@ impl Traces {
             keccak_rc,
             ecsm,
             ecdas,
+            hint,
             dma,
             memw_registers,
             eqs,
@@ -4399,6 +4553,7 @@ impl Traces {
         total += (ecsm.num_rows() * n_ecsm) as u64;
         total += (ecdas.num_rows() * n_ecdas) as u64;
         total += (dma.num_rows() * n_dma) as u64;
+        total += (hint.num_rows() * n_hint) as u64;
         total
     }
 
@@ -4453,17 +4608,74 @@ impl Traces {
     /// - Deterministic ELF pages (preprocessed, init from binary)
     /// - Runtime pages from prover hints (preprocessed, zero-init)
     /// - Private-input pages (NOT preprocessed, verifier doesn't see init values)
+    ///
+    /// `max_pages` caps how many configs may be materialised. `runtime_page_ranges`
+    /// is a prover-chosen field of `VmProof` with a free `u64` count, and this
+    /// function is what turns it into allocations — so the cap must be enforced
+    /// *before* the loop, not by the `expected_proof_count` check downstream, which
+    /// only runs once the `Vec` already exists. The verifier passes the sub-proof
+    /// count: a layout needing more pages than the proof has sub-proofs can never
+    /// verify, so this rejects nothing an honest prover could produce.
     pub fn page_configs_from_elf_and_runtime(
         elf: &Elf,
         runtime_page_ranges: &[crate::RuntimePageRange],
         num_private_input_pages: usize,
-    ) -> Vec<PageConfig> {
+        max_pages: usize,
+    ) -> Result<Vec<PageConfig>, Error> {
         let mut configs = Self::page_configs_from_elf(elf);
         let page_size = page::DEFAULT_PAGE_SIZE;
 
-        // Add zero-init runtime pages (stack, heap)
+        let too_many = |have: usize| {
+            Error::MalformedPageLayout(format!(
+                "page layout needs more than {max_pages} pages (at least {have}); \
+                 the proof cannot contain that many sub-proofs",
+            ))
+        };
+        if configs.len() > max_pages {
+            return Err(too_many(configs.len()));
+        }
+
+        // Add zero-init runtime pages (stack, heap).
         for r in runtime_page_ranges {
             let (base, count) = (r.base, r.count);
+            if count == 0 {
+                return Err(Error::MalformedPageLayout(format!(
+                    "runtime page range at 0x{base:x} has count 0; the honest \
+                     run-length encoding never emits an empty range",
+                )));
+            }
+            // Alignment is what makes the duplicate-base check below a complete
+            // overlap check: page-aligned pages of one size either share a base or
+            // are disjoint, so there is no partial-overlap case to consider.
+            if base % page_size as u64 != 0 {
+                return Err(Error::MalformedPageLayout(format!(
+                    "runtime page base 0x{base:x} is not {page_size}-byte aligned",
+                )));
+            }
+            // Reject before allocating: `count` is untrusted, so both the running
+            // total and the address arithmetic have to be checked up front.
+            let projected = configs
+                .len()
+                .saturating_add(usize::try_from(count).unwrap_or(usize::MAX));
+            if projected > max_pages {
+                return Err(too_many(projected));
+            }
+            // Guards the `base + i * page_size` below for every `i < count`.
+            //
+            // Bound the range's LAST BYTE, not its exclusive end: the stack's top page
+            // legitimately sits at the very top of the address space, where the
+            // exclusive end is exactly 2^64 and only the last byte is representable.
+            // Checking the end instead rejects every honest proof (`count >= 1` is
+            // already established above, so `span - 1` cannot underflow).
+            count
+                .checked_mul(page_size as u64)
+                .and_then(|span| base.checked_add(span - 1))
+                .ok_or_else(|| {
+                    Error::MalformedPageLayout(format!(
+                        "runtime page range at 0x{base:x} with count {count} overflows \
+                         the address space",
+                    ))
+                })?;
             for i in 0..count {
                 configs.push(PageConfig::zero_init(base + i * page_size as u64));
             }
@@ -4477,9 +4689,32 @@ impl Traces {
                 is_private_input: true,
             });
         }
+        if configs.len() > max_pages {
+            return Err(too_many(configs.len()));
+        }
 
         configs.sort_by_key(|c| c.page_base);
-        configs
+
+        // Exactly one page per address. Two PAGE tables covering the same base each
+        // provide a genesis token for every address in it, and the memory argument's
+        // soundness rests on the init set holding exactly one entry per address: with
+        // two, a witness can have the real page's row consume the duplicate's token
+        // and vice versa, injecting a value the program never wrote. A duplicate is
+        // never legitimate — the honest builder derives ELF pages from a `BTreeSet`
+        // and run-length-encodes the rest — so reject rather than dedupe silently,
+        // which would mask a prover bug instead of surfacing it.
+        if let Some(w) = configs
+            .windows(2)
+            .find(|w| w[0].page_base == w[1].page_base)
+        {
+            return Err(Error::MalformedPageLayout(format!(
+                "two page tables cover base 0x{:x}; each address must have exactly \
+                 one genesis token",
+                w[0].page_base,
+            )));
+        }
+
+        Ok(configs)
     }
 
     /// Extracts runtime page ranges from the generated page configs.
@@ -4672,6 +4907,7 @@ impl Traces {
             cpu32_ops,
             ecsm_ops,
             ecdas_ops,
+            hint_ops,
             dma_ops,
         ) = collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
         #[cfg(feature = "instruments")]
@@ -4691,6 +4927,7 @@ impl Traces {
             cpu32_ops,
             ecsm_ops,
             ecdas_ops,
+            hint_ops,
             dma_ops,
             &mut register_state,
             is_final,
@@ -4785,6 +5022,7 @@ impl Traces {
             cpu32_ops,
             ecsm_ops,
             ecdas_ops,
+            hint_ops,
             dma_ops,
         ) = collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
 
@@ -4800,6 +5038,7 @@ impl Traces {
             cpu32_ops,
             ecsm_ops,
             ecdas_ops,
+            hint_ops,
             dma_ops,
             &mut register_state,
             true,

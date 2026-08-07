@@ -313,3 +313,19 @@ mod cpu {
         check_table("cpu", &CpuConstraints, cols::NUM_COLUMNS);
     }
 }
+
+// =============================================================================
+// hint.rs
+// =============================================================================
+
+mod hint {
+    use super::*;
+    use crate::tables::hint::{HintConstraints, cols};
+
+    #[test]
+    fn hint_constraint_set_folder_capture_agree() {
+        // The one constraint is IS_BIT(mu): a single dense, idx-0, base-field root.
+        assert_eq!(HintConstraints.meta().len(), 1);
+        check_table("hint", &HintConstraints, cols::NUM_COLUMNS);
+    }
+}

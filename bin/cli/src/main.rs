@@ -1136,6 +1136,10 @@ mod tests {
         (SyscallNumbers::Panic, None),
         (SyscallNumbers::Commit, None),
         (SyscallNumbers::Halt, None),
+        // `hint` drives its own HINT table, but the executor maps it to no
+        // `Accelerator`: the ecall adds no correctness constraint, so there is no
+        // accelerated work to attribute. `execute --cycles` reports no hint line.
+        (SyscallNumbers::Hint, None),
     ];
 
     // `accelerator_of` must match the prover's `CpuOperation::from_log`: count an
