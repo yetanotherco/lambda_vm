@@ -712,8 +712,23 @@ Recorded so they stop propagating.
 
 9. **§2.3's whole candidate table — SUPERSEDED by §8.6** (`[hash-w10]`, MEASURED).
    Every candidate row held the 1,784,197,396 residue fixed, and that residue is
-   **95.8 % the `felt_be_halves` byteswap gadget**, which the field-native candidates
-   delete. §2.3's "48–79 GiB, so the choice is not cost-gated" splits into ~71 GiB
+   overwhelmingly the `felt_be_halves` byteswap gadget, which the field-native
+   candidates delete. ⚠ Base discipline (team-lead, post-eval catch; corrected by
+   `[hash-w10]` before it could propagate wrong): the measured **95.84 %** is
+   against the CHIP-HEIGHT CENSUS base of 1,757,982,868 (keccak permutation chips
+   AND their lookup tables excluded; byteswap + R_native sum to it exactly);
+   against the LEDGER base of 1,784,197,396 it is **94.44 %**. The 26,214,528
+   between the bases is NOT an open reconciliation gap — it is exactly
+   `BITWISE` (1,048,576 × (10 + 3×5) = 26,214,400) + `KECCAK_RC` (32 × 4 = 128),
+   keccak's own lookup tables, which the ledger base includes. This CLOSES the
+   gap `fma-vm-analysis.md:191` flagged. **R_native stays 73,072,788**: a
+   field-native machine has no chip sending to any BITWISE-served bus
+   (structurally checked — one hit in chips.rs, keccak's absorb XOR, LfmMem as
+   positive control), so folding keccak's tables into its residue is a category
+   error. Caveat: that costing assumes a CHIP-SET change; under the frozen-14-chip
+   principle a field-native hash in today's set still carries BITWISE as a dead
+   26.2 M table — a design decision, not a measurement. Do not quote
+   "95.8 % of 1.784 B"; pick a base and name it. §2.3's "48–79 GiB, so the choice is not cost-gated" splits into ~71 GiB
    (blake, which keeps the gadget AND `BITWISE`) and ~4–8 GiB (algebraic). The
    "every candidate fits the 124 GiB box" half survives; the "choosing on predicted
    wrap size is choosing on noise" half does not, across families.
