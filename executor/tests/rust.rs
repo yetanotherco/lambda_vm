@@ -1,6 +1,6 @@
 use executor::{
     elf::Elf,
-    vm::execution::{Executor, ReturnValues},
+    vm::execution::{ExecutionResult, Executor, ReturnValues},
     vm::instruction::{decoding::Instruction, execution::DMA_MEMCPY_SYSCALL_NUMBER},
 };
 
@@ -118,24 +118,38 @@ fn test_vector() {
     );
 }
 
+fn run_guest(path: &str) -> ExecutionResult {
+    let elf_data = std::fs::read(path).unwrap();
+    let program = Elf::load(&elf_data).unwrap();
+    Executor::new(&program, vec![]).unwrap().run().unwrap()
+}
+
+/// DMA ecalls the guest actually executed. Zero means the copies were served by
+/// `compiler_builtins` rather than by the accelerated `memcpy`.
+fn dma_ecall_count(result: &ExecutionResult) -> usize {
+    result
+        .logs
+        .iter()
+        .filter(|log| {
+            log.src1_val == DMA_MEMCPY_SYSCALL_NUMBER
+                && matches!(
+                    result.instructions.get(&log.current_pc),
+                    Some(Instruction::EcallEbreak)
+                )
+        })
+        .count()
+}
+
 #[test]
 fn test_dma_memcpy() {
-    let elf_data = std::fs::read("./program_artifacts/rust/dma_memcpy_min.elf").unwrap();
-    let program = Elf::load(&elf_data).unwrap();
-    let result = Executor::new(&program, vec![]).unwrap().run().unwrap();
+    let result = run_guest("./program_artifacts/rust/dma_memcpy_min.elf");
 
     assert_eq!(
         result.return_values.memory_values,
         b"DMA copies eight-byte rows and a short tail"
     );
     assert!(
-        result.logs.iter().any(|log| {
-            log.src1_val == DMA_MEMCPY_SYSCALL_NUMBER
-                && matches!(
-                    result.instructions.get(&log.current_pc),
-                    Some(Instruction::EcallEbreak)
-                )
-        }),
+        dma_ecall_count(&result) > 0,
         "the strong memcpy symbol must execute at least one DMA ecall"
     );
 }
@@ -146,6 +160,24 @@ fn test_dma_memcpy_cases() {
         "./program_artifacts/rust/dma_memcpy_cases.elf",
         b"dma-cases-ok".to_vec(),
         vec![],
+    );
+}
+
+/// The guests above declare `memcpy` themselves, which leaves the symbol
+/// undefined in their objects and forces the linker to resolve it. This guest
+/// never names `memcpy`: its copies are the ones the compiler emits, which is
+/// the case that silently degrades if the strong definition ever stops winning
+/// symbol resolution — the guest keeps producing the right output and only the
+/// ecall count drops to zero.
+#[test]
+fn test_dma_memcpy_compiler_emitted_copies() {
+    let result = run_guest("./program_artifacts/rust/dma_memcpy_implicit.elf");
+
+    assert_eq!(result.return_values.memory_values, b"dma-implicit-ok");
+    assert!(
+        dma_ecall_count(&result) > 0,
+        "compiler-emitted copies must reach the DMA ecall; a zero count means the \
+         guest fell back to the weak compiler_builtins memcpy"
     );
 }
 
