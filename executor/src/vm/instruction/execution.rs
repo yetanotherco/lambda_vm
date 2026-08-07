@@ -437,23 +437,22 @@ impl Instruction {
                         let addr_xr = registers.read(10)?;
                         let addr_xg = registers.read(11)?;
                         let addr_k = registers.read(12)?;
-                        // No address precondition here: the ECSM table gives every one of the
-                        // twelve doubleword accesses its own range-checked address column,
-                        // derived from the base with a real 64-bit addition (spec
-                        // `ec:c:range_addr_*` / `ec:c:extrapolate_addr_*`). Operands crossing
-                        // `2^32` are proved exactly. The only thing left is a 64-bit overflow,
-                        // which the AIR forbids with `µ·carry_1 = 0` on the last address and
-                        // `load_u256_le` / `store_u256_le` reject with `checked_add` — the two
-                        // conditions coincide, so neither side accepts what the other refuses.
-                        // xG and k must occupy disjoint 32-byte regions. Conservative
-                        // precondition, not a provability requirement: xG is read at T and k at
-                        // T+1, so an overlapping cell chains through MEMW like any other pair of
-                        // accesses at increasing timestamps. Bypassing this guard in a scratch
-                        // build produced a fully-aliased trace that verifies, so the older claim
-                        // that overlap makes the trace unprovable is wrong — but nothing here
-                        // pins that, because the guard is what stops such a trace being built.
-                        // The guard stays anyway: the AIR does not enforce disjointness either
-                        // way, and no caller needs it, since two live 32-byte objects are
+                        // No address precondition here: every one of the twelve doubleword
+                        // accesses carries its own range-checked address column, derived with a
+                        // real 64-bit addition (spec `ec:c:range_addr_*` /
+                        // `ec:c:extrapolate_addr_*`), so operands crossing `2^32` are proved
+                        // exactly. What is left is a 64-bit overflow: the AIR's `µ·carry_1 = 0`
+                        // and the `checked_add` in `load_u256_le` / `store_u256_le` reject
+                        // exactly `addr + 31 >= 2^64`, so neither side accepts what the other
+                        // refuses.
+                        //
+                        // xG and k must occupy disjoint 32-byte regions. Conservative only:
+                        // the AIR proves overlap fine — xG is read at T and k at T+1, so an
+                        // overlapping cell chains through MEMW like any other pair of accesses
+                        // at increasing timestamps (measured by bypassing this guard in a
+                        // scratch build; no test pins it, since the guard is what stops such a
+                        // trace being built). It stays because nothing enforces disjointness
+                        // in-circuit and no caller needs it: two live 32-byte objects are
                         // disjoint by construction. xR may alias either — later timestamp.
                         if addr_xg.abs_diff(addr_k) < 32 {
                             return Err(ExecutionError::EcsmOperandOverlap);

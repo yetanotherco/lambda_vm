@@ -47,6 +47,9 @@ pub(crate) const CARRY_OFFSET_YG: i64 = 16319;
 // Column indices (703 columns; keep in sync with NUM_COLUMNS below)
 // =========================================================================
 
+/// Halfword accessor for one operand's per-access address columns.
+type AccFn = fn(usize, usize) -> usize;
+
 pub mod cols {
     pub const TIMESTAMP_0: usize = 0;
     pub const TIMESTAMP_1: usize = 1;
@@ -1010,14 +1013,13 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for EcsmConstraints {
         // addr_*[i] = addr_*[0] + 8i for i = 1..=3, as real 64-bit additions with the carry
         // propagating into the high limb (spec `ec:c:extrapolate_addr_*`). Two carry-bit
         // constraints per addition, gated on µ so padding rows close at all-zero.
-        for (base, acc) in [
-            (
-                cols::ADDR_XG_0,
-                cols::addr_xg_acc as fn(usize, usize) -> usize,
-            ),
+        let operands: [(usize, AccFn); 3] = [
+            (cols::ADDR_XG_0, cols::addr_xg_acc),
             (cols::ADDR_K_0, cols::addr_k_acc),
             (cols::ADDR_XR_0, cols::addr_xr_acc),
-        ] {
+        ];
+
+        for (base, acc) in operands {
             for i in 1..4 {
                 emit_add_pair(
                     b,
@@ -1036,14 +1038,7 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for EcsmConstraints {
         // prover could take addr_*[3] = addr_*[0] + 24 − 2^64. Only i = 3 needs it: if
         // addr + 24 does not wrap, neither does addr + 8 or addr + 16. Mirrors the top-lane
         // constraint in `keccak.rs`.
-        for (base, acc) in [
-            (
-                cols::ADDR_XG_0,
-                cols::addr_xg_acc as fn(usize, usize) -> usize,
-            ),
-            (cols::ADDR_K_0, cols::addr_k_acc),
-            (cols::ADDR_XR_0, cols::addr_xr_acc),
-        ] {
+        for (base, acc) in operands {
             let c65536 = b.const_base(65536);
             let inv_2_32 = b.const_base(INV_SHIFT_32);
             let base_lo = b.main(0, base);
