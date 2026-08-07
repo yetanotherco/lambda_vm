@@ -228,22 +228,21 @@ pub fn generate_ecsm_trace(
         table.set_dword_wl(row_idx, cols::ADDR_XR_0, op.addr_xr);
 
         // addr_*[i] = addr_*[0] + 8i, as real 64-bit additions (spec
-        // `ec:c:extrapolate_addr_*`). The executor rejects the operand before the trace is
-        // built if any of these would pass u64::MAX, which is what the top-carry constraint
-        // enforces in-circuit.
+        // `ec:c:extrapolate_addr_*`). `expect` rather than a wrapping add, as `keccak.rs`
+        // does for its lane pointers: wrapping here would encode the wrap into the columns
+        // and `collect_bitwise_from_ecsm` would wrap the same way, so the trace stays
+        // self-consistent — the bus balances and the only symptom is constraint 431/432/433
+        // failing, with nothing pointing back at the operand. The executor refuses these,
+        // so a wrap means a caller built the op some other way.
         for i in 1..4 {
             let off = (8 * i) as u64;
-            table.set_dword_hl(
-                row_idx,
-                cols::addr_xg_acc(i, 0),
-                op.addr_xg.wrapping_add(off),
-            );
-            table.set_dword_hl(row_idx, cols::addr_k_acc(i, 0), op.addr_k.wrapping_add(off));
-            table.set_dword_hl(
-                row_idx,
-                cols::addr_xr_acc(i, 0),
-                op.addr_xr.wrapping_add(off),
-            );
+            let derived = |addr: u64| {
+                addr.checked_add(off)
+                    .expect("ECSM operand address range must be validated by the executor")
+            };
+            table.set_dword_hl(row_idx, cols::addr_xg_acc(i, 0), derived(op.addr_xg));
+            table.set_dword_hl(row_idx, cols::addr_k_acc(i, 0), derived(op.addr_k));
+            table.set_dword_hl(row_idx, cols::addr_xr_acc(i, 0), derived(op.addr_xr));
         }
 
         table.set_bytes(row_idx, cols::XR, &w.x_r);

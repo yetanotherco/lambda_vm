@@ -2306,7 +2306,11 @@ pub(crate) fn collect_bitwise_from_ecsm(ops: &[ecsm::EcsmOperation]) -> Vec<Bitw
         // ECSM row makes; addr_*[0] is not sent, it is bound by the MEMW register read.
         for addr in [op.addr_xg, op.addr_k, op.addr_xr] {
             for i in 1..4u64 {
-                let a = addr.wrapping_add(8 * i);
+                // Must match `generate_ecsm_trace`'s derivation exactly, wrap included:
+                // if both wrapped, the bus would still balance and hide the bad operand.
+                let a = addr
+                    .checked_add(8 * i)
+                    .expect("ECSM operand address range must be validated by the executor");
                 for hw in 0..4 {
                     out.push(is_half_op(((a >> (16 * hw)) & 0xFFFF) as u16));
                 }
