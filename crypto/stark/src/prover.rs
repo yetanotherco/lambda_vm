@@ -1031,8 +1031,14 @@ pub trait IsStarkProver<
         if !air.has_aux_trace() || air.constraints_meta().is_empty() {
             return false;
         }
-        let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
         let n = domain.interpolation_domain_size;
+        // The device-resident R2 path only exists for the d=2 quotient
+        // decomposition; any other part count skips it entirely and needs the
+        // host evaluator, which device-only leaves without data.
+        if air.composition_poly_degree_bound(n) / n != 2 {
+            return false;
+        }
+        let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
         let offsets_contiguous =
             crate::gpu_lde::offsets_are_contiguous(&air.context().transition_offsets);
         let zerofier_uniform = air.constraints_meta().iter().all(|m| m.end_exemptions == 0);
