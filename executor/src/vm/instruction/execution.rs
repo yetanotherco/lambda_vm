@@ -31,10 +31,6 @@ const KECCAK_STATE_BYTES: u64 = 25 * 8;
 /// bus as `[lo32, hi32] = [2^32 - 11, 2^32 - 1]`.
 pub const ECSM_SYSCALL_NUMBER: u64 = u64::MAX - 10;
 
-/// `2^32`. ECSM memory operands must not overflow their lower 32-bit address limb when the
-/// largest per-access offset is added: the 32-byte operands reach offset +31 (last byte).
-const LOW_LIMB: u64 = 1 << 32;
-
 impl TryFrom<u64> for SyscallNumbers {
     type Error = ();
     fn try_from(value: u64) -> Result<Self, Self::Error> {
@@ -74,28 +70,40 @@ impl SyscallNumbers {
 }
 
 /// Reads a 256-bit little-endian value as four doublewords at `addr + 8i`.
+///
+/// The span is validated up front, which is where the `addr + 31 < 2^64` contract lives: the
+/// per-access checks below would otherwise leave it emerging from `checked_add(8i)` plus
+/// `Memory::load_doubleword`'s aligned/unaligned split, and the aligned path bound-checks
+/// nothing (8-alignment already caps it at `u64::MAX - 7`).
 fn load_u256_le(memory: &Memory, addr: u64) -> Result<[u8; 32], MemoryError> {
+    addr.checked_add(31).ok_or(MemoryError::AddressOverflow)?;
     let mut out = [0u8; 32];
     for i in 0..4 {
-        let dw = memory.load_doubleword(addr + (i as u64) * 8)?;
+        let base = addr
+            .checked_add((i as u64) * 8)
+            .ok_or(MemoryError::AddressOverflow)?;
+        let dw = memory.load_doubleword(base)?;
         out[i * 8..i * 8 + 8].copy_from_slice(&dw.to_le_bytes());
     }
     Ok(out)
 }
 
 /// Writes a 256-bit little-endian value as four doublewords at `addr + 8i`.
+///
+/// The span is validated before the first store: checking per access would commit
+/// doublewords 0..2 and fail on the fourth, leaving 24 bytes of `xR` in a `Memory` the
+/// caller sees next to an `Err`. See [`load_u256_le`] on where the contract lives.
 fn store_u256_le(memory: &mut Memory, addr: u64, bytes: &[u8; 32]) -> Result<(), MemoryError> {
+    addr.checked_add(31).ok_or(MemoryError::AddressOverflow)?;
     for i in 0..4 {
         let mut dw = [0u8; 8];
         dw.copy_from_slice(&bytes[i * 8..i * 8 + 8]);
-        memory.store_doubleword(addr + (i as u64) * 8, u64::from_le_bytes(dw))?;
+        let base = addr
+            .checked_add((i as u64) * 8)
+            .ok_or(MemoryError::AddressOverflow)?;
+        memory.store_doubleword(base, u64::from_le_bytes(dw))?;
     }
     Ok(())
-}
-
-/// Checks the ECSM address-alignment assumption: `(addr mod 2^32) + max_offset < 2^32`.
-fn ecsm_addr_ok(addr: u64, max_offset: u64) -> bool {
-    (addr % LOW_LIMB) + max_offset < LOW_LIMB
 }
 
 impl Instruction {
@@ -429,19 +437,23 @@ impl Instruction {
                         let addr_xr = registers.read(10)?;
                         let addr_xg = registers.read(11)?;
                         let addr_k = registers.read(12)?;
-                        if !ecsm_addr_ok(addr_xg, 31)
-                            || !ecsm_addr_ok(addr_xr, 31)
-                            || !ecsm_addr_ok(addr_k, 31)
-                        {
-                            return Err(ExecutionError::EcsmAddressOverflow);
-                        }
-                        // xG and k must occupy disjoint 32-byte regions. The trace builder
-                        // reads each operand as unaligned doubleword MEMW accesses (xG at T,
-                        // k at T+1); if the regions overlap, the same address is touched at
-                        // both timestamps and the MEMW consistency argument can't prove the
-                        // access chain. The loaded values would still be well-defined — this
-                        // guard is about trace provability, not correctness of the multiply.
-                        // xR may alias either: its accesses are at a later timestamp.
+                        // No address precondition here: every one of the twelve doubleword
+                        // accesses carries its own range-checked address column, derived with a
+                        // real 64-bit addition (spec `ec:c:range_addr_*` /
+                        // `ec:c:extrapolate_addr_*`), so operands crossing `2^32` are proved
+                        // exactly. What is left is a 64-bit overflow: the AIR's `µ·carry_1 = 0`
+                        // and the `checked_add` in `load_u256_le` / `store_u256_le` reject
+                        // exactly `addr + 31 >= 2^64`, so neither side accepts what the other
+                        // refuses.
+                        //
+                        // xG and k must occupy disjoint 32-byte regions. Conservative only:
+                        // the AIR proves overlap fine — xG is read at T and k at T+1, so an
+                        // overlapping cell chains through MEMW like any other pair of accesses
+                        // at increasing timestamps (measured by bypassing this guard in a
+                        // scratch build; no test pins it, since the guard is what stops such a
+                        // trace being built). It stays because nothing enforces disjointness
+                        // in-circuit and no caller needs it: two live 32-byte objects are
+                        // disjoint by construction. xR may alias either — later timestamp.
                         if addr_xg.abs_diff(addr_k) < 32 {
                             return Err(ExecutionError::EcsmOperandOverlap);
                         }
@@ -630,8 +642,6 @@ pub enum ExecutionError {
     UnalignedKeccakStateAddress(u64),
     #[error("Keccak state address range overflows: {0:#018x}")]
     KeccakStateAddressOverflow(u64),
-    #[error("ECSM address range overflows the lower 32-bit limb")]
-    EcsmAddressOverflow,
     #[error("ECSM xG and k operand ranges overlap")]
     EcsmOperandOverlap,
     #[error("ECSM scalar multiplication error: {0}")]

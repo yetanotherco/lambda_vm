@@ -9,18 +9,34 @@
 //! See `spec/src/ecsm.toml`. All multi-limb arithmetic uses 8-bit limbs; the witness is built
 //! by `ecsm::compute_witness`, which reproduces these exact recurrences.
 //!
+//! ## Operand addresses
+//! Each of the twelve doubleword accesses carries its own address column, derived from the
+//! operand base by a real 64-bit addition and range-checked halfword by halfword — spec
+//! `ec:c:range_addr_*` and `ec:c:extrapolate_addr_*`. The table therefore needs no precondition
+//! from the caller: an operand whose bytes straddle `2^32` is expressed exactly, and one whose
+//! last address would wrap `2^64` is rejected by `µ·carry_1 = 0`. Deriving the bases inline as
+//! `ADDR_*_0 + 8i` instead, which is what this table used to do, made the AIR's accepted set
+//! depend on the executor's `ecsm_addr_ok` and the two drifted apart (#902).
+//!
+//! One band is worth naming because this table does not own it: for a base in
+//! `[u64::MAX-30, u64::MAX-24]` the additions here are all satisfied, and the trace fails only
+//! because MEMW's per-byte `hi = base_1 + carry` is never reduced mod `2^32`, so the last byte's
+//! token sits at `2^32` and no PAGE token supplies it. Sound, and in-circuit — but a cross-table
+//! argument rather than a constraint of ours, and not reachable through the executor, so no test
+//! covers it; forging it needs a hand-built trace.
+//!
 //! ## Padding
 //! Padding rows have `mu = 0`, all columns zero. The yG carry relation closes because both the
 //! `µ·p²` and `µ·b` terms vanish when `µ = 0`, leaving the trivial `0 = 0` recurrence. The x²
-//! relation has no standalone constant and also closes at all-zero. The range checks /
-//! virtual-carry checks remain µ-gated as before.
+//! relation has no standalone constant and also closes at all-zero. The range checks, the
+//! address additions and the virtual-carry checks are all µ-gated.
 
 use executor::vm::instruction::execution::ECSM_SYSCALL_NUMBER;
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable};
-use crate::constraints::templates::INV_SHIFT_32;
+use crate::constraints::templates::{AddOperand, INV_SHIFT_32, emit_add_pair};
 use ecsm::{B, EcsmWitness, N_BYTES, P_BYTES};
 
 // Bias signed convolution carries into IsHalfword [0, 2^16); see spec ecsm.typ "Carry offset" (@ecsm-limb_carry).
@@ -28,8 +44,11 @@ pub(crate) const CARRY_OFFSET_X2: i64 = 8160;
 pub(crate) const CARRY_OFFSET_YG: i64 = 16319;
 
 // =========================================================================
-// Column indices (667 columns; keep in sync with NUM_COLUMNS below)
+// Column indices (703 columns; keep in sync with NUM_COLUMNS below)
 // =========================================================================
+
+/// Halfword accessor for one operand's per-access address columns.
+type AccFn = fn(usize, usize) -> usize;
 
 pub mod cols {
     pub const TIMESTAMP_0: usize = 0;
@@ -57,7 +76,52 @@ pub mod cols {
     pub const XR_SUB_P: usize = 650; // U256HL (16 halfwords)
     pub const MU: usize = 666;
 
-    pub const NUM_COLUMNS: usize = 667;
+    /// Per-access operand addresses, `addr_*[i]` for `i = 1..=3`, each a `DWordHL`
+    /// (4 halfwords) — spec `ec:c:extrapolate_addr_{xG,k,xR}`.
+    ///
+    /// `addr_*[0]` is the `ADDR_*_0` / `ADDR_*_1` pair above, which the spec allows to stay a
+    /// `DWordWL` ("`addr_xG[0]`, `addr_k[0]` and `addr_xR[0]` could be `DWordWL`s rather than
+    /// `HL`s"). It carries no range check of its own, and the reason is NOT that the REGISTER
+    /// table range-checks register words — it does not; `register.rs` has no constraint set at
+    /// all and pushes `init`/`fini` raw. What binds it is the `i = 0` MEMW send: it puts the
+    /// pair straight onto the Memory bus, where the only tokens available come from PAGE and
+    /// REGISTER at canonical `(lo, hi)` addresses, so a non-canonical limb matches nothing and
+    /// the bus does not balance. Every other chip that takes an address from a register leans
+    /// on the same argument (see the note in `memw.rs` about `base_address_1`).
+    pub const ADDR_XG_ACC: usize = 667; // DWordHL[3] (12)
+    pub const ADDR_K_ACC: usize = 679; // DWordHL[3] (12)
+    pub const ADDR_XR_ACC: usize = 691; // DWordHL[3] (12)
+
+    pub const NUM_COLUMNS: usize = 703;
+
+    /// Halfword `hw` of the `i`-th per-access address in the block at `base`.
+    ///
+    /// The assert is load-bearing, not defensive: `i = 0` would underflow `i - 1` and, in
+    /// release, land on `xr_sub_p(13..15)` and `MU`. Access 0 is the `ADDR_*_0`/`ADDR_*_1`
+    /// pair, which has no halfword columns — the `0..4` loops over the MEMW sends sit right
+    /// next to the `1..4` loops over these, so the wrong bound is the natural typo here.
+    #[inline]
+    const fn acc_hw(base: usize, i: usize, hw: usize) -> usize {
+        assert!(matches!(i, 1..=3), "per-access address index must be 1..=3");
+        assert!(hw < 4, "a DWordHL has four halfwords");
+        base + (i - 1) * 4 + hw
+    }
+
+    /// Halfword `hw` of `addr_xG[i]`, for `i = 1..=3`.
+    #[inline]
+    pub const fn addr_xg_acc(i: usize, hw: usize) -> usize {
+        acc_hw(ADDR_XG_ACC, i, hw)
+    }
+    /// Halfword `hw` of `addr_k[i]`, for `i = 1..=3`.
+    #[inline]
+    pub const fn addr_k_acc(i: usize, hw: usize) -> usize {
+        acc_hw(ADDR_K_ACC, i, hw)
+    }
+    /// Halfword `hw` of `addr_xR[i]`, for `i = 1..=3`.
+    #[inline]
+    pub const fn addr_xr_acc(i: usize, hw: usize) -> usize {
+        acc_hw(ADDR_XR_ACC, i, hw)
+    }
 
     #[inline]
     pub const fn xr(i: usize) -> usize {
@@ -166,6 +230,24 @@ pub fn generate_ecsm_trace(
         table.set_dword_wl(row_idx, cols::ADDR_K_0, op.addr_k);
         table.set_dword_wl(row_idx, cols::ADDR_XR_0, op.addr_xr);
 
+        // addr_*[i] = addr_*[0] + 8i, as real 64-bit additions (spec
+        // `ec:c:extrapolate_addr_*`). `expect` rather than a wrapping add, as `keccak.rs`
+        // does for its lane pointers: wrapping here would encode the wrap into the columns
+        // and `collect_bitwise_from_ecsm` would wrap the same way, so the trace stays
+        // self-consistent — the bus balances and the only symptom is constraint 431/432/433
+        // failing, with nothing pointing back at the operand. The executor refuses these,
+        // so a wrap means a caller built the op some other way.
+        for i in 1..4 {
+            let off = (8 * i) as u64;
+            let derived = |addr: u64| {
+                addr.checked_add(off)
+                    .expect("ECSM operand address range must be validated by the executor")
+            };
+            table.set_dword_hl(row_idx, cols::addr_xg_acc(i, 0), derived(op.addr_xg));
+            table.set_dword_hl(row_idx, cols::addr_k_acc(i, 0), derived(op.addr_k));
+            table.set_dword_hl(row_idx, cols::addr_xr_acc(i, 0), derived(op.addr_xr));
+        }
+
         table.set_bytes(row_idx, cols::XR, &w.x_r);
         table.set_bytes(row_idx, cols::YR, &w.y_r);
         for b in 0..256 {
@@ -261,6 +343,36 @@ fn dword_bytes(col: usize, chunk: usize) -> [BusValue; 8] {
     std::array::from_fn(|b| packed(col + 8 * chunk + b))
 }
 
+/// The `(lo, hi)` words of `addr_*[i]`, the address of the operand's `i`-th doubleword.
+///
+/// `i = 0` is the `DWordWL` base bound to the register read; `i = 1..=3` are the per-access
+/// `DWordHL` columns that `ec:c:extrapolate_addr_*` derives from it, repacked into words.
+/// Nothing here adds an offset: the carry lives in the columns, so an address whose bytes
+/// cross `2^32` is expressed exactly.
+fn access_addr(
+    base_lo: usize,
+    base_hi: usize,
+    acc: fn(usize, usize) -> usize,
+    i: usize,
+) -> (BusValue, BusValue) {
+    if i == 0 {
+        return (packed(base_lo), packed(base_hi));
+    }
+    let word = |hw: usize| {
+        BusValue::linear(vec![
+            LinearTerm::Column {
+                coefficient: 1,
+                column: hw,
+            },
+            LinearTerm::Column {
+                coefficient: 1 << 16,
+                column: hw + 1,
+            },
+        ])
+    };
+    (word(acc(i, 0)), word(acc(i, 2)))
+}
+
 /// A register value `[lo, hi, 0, 0, 0, 0, 0, 0]` as MEMW value elements.
 fn register_value(lo_col: usize, hi_col: usize) -> [BusValue; 8] {
     let mut v: [BusValue; 8] = std::array::from_fn(|_| BusValue::constant(0));
@@ -330,15 +442,10 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             0,
         ),
     ));
-    // read xG: 4 doublewords at addr_xG + 8i (ts).
+    // read xG: 4 doublewords at addr_xG[i] (ts).
     for i in 0..4 {
-        let base_lo = BusValue::linear(vec![
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::ADDR_XG_0,
-            },
-            LinearTerm::Constant((8 * i) as i64),
-        ]);
+        let (base_lo, base_hi) =
+            access_addr(cols::ADDR_XG_0, cols::ADDR_XG_1, cols::addr_xg_acc, i);
         out.push(BusInteraction::sender(
             BusId::Memw,
             mu(),
@@ -346,7 +453,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 dword_bytes(cols::XG, i),
                 0,
                 base_lo,
-                packed(cols::ADDR_XG_1),
+                base_hi,
                 ts_lo(),
                 ts_hi(),
                 0,
@@ -380,15 +487,9 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             0,
         ),
     ));
-    // read k: 4 doublewords at addr_k + 8i (ts + 1).
+    // read k: 4 doublewords at addr_k[i] (ts + 1).
     for i in 0..4 {
-        let base_lo = BusValue::linear(vec![
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::ADDR_K_0,
-            },
-            LinearTerm::Constant((8 * i) as i64),
-        ]);
+        let (base_lo, base_hi) = access_addr(cols::ADDR_K_0, cols::ADDR_K_1, cols::addr_k_acc, i);
         out.push(BusInteraction::sender(
             BusId::Memw,
             mu(),
@@ -396,7 +497,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 k_dword_busvalues(i),
                 0,
                 base_lo,
-                packed(cols::ADDR_K_1),
+                base_hi,
                 ts_lo_plus(1),
                 ts_hi(),
                 0,
@@ -420,27 +521,37 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             0,
         ),
     ));
-    // write xR: 4 doublewords at addr_xR + 8i (ts + 2).
+    // write xR: 4 doublewords at addr_xR[i] (ts + 2).
     for i in 0..4 {
-        let base_lo = BusValue::linear(vec![
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::ADDR_XR_0,
-            },
-            LinearTerm::Constant((8 * i) as i64),
-        ]);
+        let (base_lo, base_hi) =
+            access_addr(cols::ADDR_XR_0, cols::ADDR_XR_1, cols::addr_xr_acc, i);
         out.push(BusInteraction::sender(
             BusId::Memw,
             mu(),
             memw_write(
                 dword_bytes(cols::XR, i),
                 base_lo,
-                packed(cols::ADDR_XR_1),
+                base_hi,
                 ts_lo_plus(2),
                 ts_hi(),
                 1,
             ),
         ));
+    }
+
+    // IS_HALF on every halfword of every per-access address (spec `ec:c:range_addr_*`).
+    // addr_*[0] is excluded: its canonicality comes from the i = 0 MEMW send reaching the
+    // Memory bus, where only canonical PAGE/REGISTER tokens exist (see the `cols` note).
+    for acc in [cols::addr_xg_acc, cols::addr_k_acc, cols::addr_xr_acc] {
+        for i in 1..4 {
+            for hw in 0..4 {
+                out.push(BusInteraction::sender(
+                    BusId::IsHalfword,
+                    mu(),
+                    vec![packed(acc(i, hw))],
+                ));
+            }
+        }
     }
 
     // IS_BYTE range checks (single byte → AreBytes[x, 0]).
@@ -671,7 +782,7 @@ impl OverflowKind {
 // =========================================================================
 //
 // One body against the generic `ConstraintBuilder` serves the compiled prover
-// folder, the verifier folder and IR capture. Constraint indices 0..413:
+// folder, the verifier folder and IR capture. Constraint indices 0..434:
 //   0        : IS_BIT(MU)
 //   1..257   : IS_BIT(k[i]) for the 256 scalar bits
 //   257      : KBitsZeroOnPadding — (Σ k_bit[i])·(1−µ)
@@ -686,10 +797,12 @@ impl OverflowKind {
 //   404      : OverflowRequired(KLtN)
 //   405..412 : CarryBit(XrLtP, 0..7)
 //   412      : OverflowRequired(XrLtP)
+//   413..431 : AddCarryPair(addr_*[i] = addr_*[0] + 8i), 3 operands x i in 1..=3
+//   431..434 : µ·carry_1 = 0 on addr_*[3] (the 64-bit addition must not wrap)
 
 use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
-/// ECSM transition constraints as a single-source [`ConstraintSet`] (413
+/// ECSM transition constraints as a single-source [`ConstraintSet`] (434
 /// total). No column configuration needed (the layout is fixed via `cols`).
 #[derive(Clone, Copy)]
 pub struct EcsmConstraints;
@@ -897,6 +1010,49 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for EcsmConstraints {
             idx += 1;
         }
 
-        debug_assert_eq!(idx, 413);
+        // addr_*[i] = addr_*[0] + 8i for i = 1..=3, as real 64-bit additions with the carry
+        // propagating into the high limb (spec `ec:c:extrapolate_addr_*`). Two carry-bit
+        // constraints per addition, gated on µ so padding rows close at all-zero.
+        let operands: [(usize, AccFn); 3] = [
+            (cols::ADDR_XG_0, cols::addr_xg_acc),
+            (cols::ADDR_K_0, cols::addr_k_acc),
+            (cols::ADDR_XR_0, cols::addr_xr_acc),
+        ];
+
+        for (base, acc) in operands {
+            for i in 1..4 {
+                emit_add_pair(
+                    b,
+                    idx,
+                    &[cols::MU],
+                    &AddOperand::dword(base),
+                    &AddOperand::constant((8 * i) as i64),
+                    &AddOperand::from_dword_hl(acc(i, 0)),
+                );
+                idx += 2;
+            }
+        }
+
+        // µ · carry_1 = 0 on the last address of each operand: the 64-bit addition must not
+        // wrap. `emit_add_pair` only constrains its carries to be bits, so without this a
+        // prover could take addr_*[3] = addr_*[0] + 24 − 2^64. Only i = 3 needs it: if
+        // addr + 24 does not wrap, neither does addr + 8 or addr + 16. Mirrors the top-lane
+        // constraint in `keccak.rs`.
+        for (base, acc) in operands {
+            let c65536 = b.const_base(65536);
+            let inv_2_32 = b.const_base(INV_SHIFT_32);
+            let base_lo = b.main(0, base);
+            let base_hi = b.main(0, base + 1);
+            let sum_lo = b.main(0, acc(3, 0)) + b.main(0, acc(3, 1)) * c65536.clone();
+            let sum_hi = b.main(0, acc(3, 2)) + b.main(0, acc(3, 3)) * c65536;
+            let c24 = b.const_base(24);
+            let carry_0 = (base_lo + c24 - sum_lo) * inv_2_32.clone();
+            let carry_1 = (base_hi + carry_0 - sum_hi) * inv_2_32;
+            let mu = b.main(0, cols::MU);
+            b.emit_base(idx, mu * carry_1);
+            idx += 1;
+        }
+
+        debug_assert_eq!(idx, 434);
     }
 }

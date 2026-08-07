@@ -1137,6 +1137,92 @@ fn test_prove_elfs_ecsm() {
     );
 }
 
+/// Byte carries: the operand's last doubleword starts inside the limb and its trailing bytes
+/// cross `2^32`, which MEMW's per-byte carry columns place at the arithmetically correct
+/// address. The guest reads the bytes back from across the boundary before committing, so the
+/// proof witnesses where they landed.
+///
+/// This is the case the executor used to refuse while the AIR proved it, so it pins the
+/// executor side; its counterpart is `ecsm_syscall_accepts_operands_crossing_the_limb`. It does
+/// NOT exercise the per-access address columns — here all four derived bases have `hi = 0` and
+/// the sends are identical to the old inline `ADDR_*_0 + 8i` derivation. For that see
+/// `test_prove_ecsm_derived_bases_cross_limb`.
+#[test]
+fn test_prove_ecsm_operand_crossing_limb_boundary() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_ecsm_limb_cross");
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
+    let result = executor
+        .run()
+        .expect("an operand whose last doubleword base is in-limb must execute");
+
+    // Gx little-endian, k = 5.
+    let mut gx = [
+        0x79u8, 0xBE, 0x66, 0x7E, 0xF9, 0xDC, 0xBB, 0xAC, 0x55, 0xA0, 0x62, 0x95, 0xCE, 0x87, 0x0B,
+        0x07, 0x02, 0x9B, 0xFC, 0xDB, 0x2D, 0xCE, 0x28, 0xD9, 0x59, 0xF2, 0x81, 0x5B, 0x16, 0xF8,
+        0x17, 0x98,
+    ];
+    gx.reverse();
+    let mut k = [0u8; 32];
+    k[0] = 5;
+    let expected_xr = ecsm::scalar_mul_x(&k, &gx).unwrap();
+    assert_eq!(
+        result.return_values.memory_values,
+        expected_xr.to_vec(),
+        "xR read back from across the 2^32 boundary must equal x(5G)"
+    );
+
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "ECSM with an operand crossing the 2^32 limb boundary must prove and verify"
+    );
+}
+
+/// The positive case for the per-access address columns: with `xR` at low limb `0xFFFF_FFFC`
+/// the DERIVED bases carry into the high limb (`addr[1] = 0x1_0000_0004`, and so on), which only
+/// `ec:c:extrapolate_addr_*`'s real 64-bit addition can express. Under the old derivation those
+/// sends would carry a non-canonical low limb and the Memory bus would not balance, so this
+/// program is unprovable on `main` — and its executor refuses it there too. Byte carries inside
+/// a doubleword are covered as well: bytes 4..7 of `addr[0]` land past `2^32`.
+#[test]
+fn test_prove_ecsm_derived_bases_cross_limb() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_ecsm_base_cross");
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
+    let result = executor
+        .run()
+        .expect("an operand whose derived bases carry must execute");
+
+    let mut gx = [
+        0x79u8, 0xBE, 0x66, 0x7E, 0xF9, 0xDC, 0xBB, 0xAC, 0x55, 0xA0, 0x62, 0x95, 0xCE, 0x87, 0x0B,
+        0x07, 0x02, 0x9B, 0xFC, 0xDB, 0x2D, 0xCE, 0x28, 0xD9, 0x59, 0xF2, 0x81, 0x5B, 0x16, 0xF8,
+        0x17, 0x98,
+    ];
+    gx.reverse();
+    let mut k = [0u8; 32];
+    k[0] = 5;
+    assert_eq!(
+        result.return_values.memory_values,
+        ecsm::scalar_mul_x(&k, &gx).unwrap().to_vec(),
+        "xR read back from addresses whose bases carry must equal x(5G)"
+    );
+
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "ECSM with derived bases crossing the limb must prove and verify"
+    );
+}
+
 #[test]
 fn test_prove_elfs_ecsm_multi() {
     let _ = env_logger::builder().is_test(true).try_init();

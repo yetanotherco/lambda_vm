@@ -2301,6 +2301,21 @@ pub(crate) fn collect_bitwise_from_ecsm(ops: &[ecsm::EcsmOperation]) -> Vec<Bitw
                 w.x_r_sub_p[2 * i] as u16 + ((w.x_r_sub_p[2 * i + 1] as u16) << 8),
             ));
         }
+        // IS_HALF on the per-access operand addresses addr_*[i], i = 1..=3 (spec
+        // `ec:c:range_addr_*`). One lookup per halfword, matching the 36 IsHalfword sends the
+        // ECSM row makes; addr_*[0] is not sent, it is bound by the MEMW register read.
+        for addr in [op.addr_xg, op.addr_k, op.addr_xr] {
+            for i in 1..4u64 {
+                // Must match `generate_ecsm_trace`'s derivation exactly, wrap included:
+                // if both wrapped, the bus would still balance and hide the bad operand.
+                let a = addr
+                    .checked_add(8 * i)
+                    .expect("ECSM operand address range must be validated by the executor");
+                for hw in 0..4 {
+                    out.push(is_half_op(((a >> (16 * hw)) & 0xFFFF) as u16));
+                }
+            }
+        }
         // ZERO: assert k != 0 (sum of k's bytes).
         let sum: u32 = w.k.iter().map(|&b| b as u32).sum();
         out.push(BitwiseOperation::zero(sum));

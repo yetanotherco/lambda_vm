@@ -254,14 +254,17 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     //   lo = base_address_0 + (i+1) - 2^32 * carry[i]
     //   hi = base_address_1 + carry[i]
     //
-    // Safety: `hi` is at most `base_address_1 + 1`. This never reaches 2^32
-    // because the CPU table splits addresses into (lo, hi) with both halves
-    // in [0, 2^32), and the Memw bus ties MEMW's base_address to the CPU's
-    // value. MEMW only receives accesses where base_address_1 <= 0xFFFF_FFFE
-    // (addresses near u64::MAX are rejected by the executor before proving).
-    // Consequently, `carry[i]` is implicitly correct: a wrong carry bit
-    // produces a memory token at a wrong address that has no matching
-    // PAGE/REGISTER token, causing multiset imbalance and an invalid proof.
+    // Safety: `hi` is at most `base_address_1 + 1`, and `base_address_1 == 0xFFFF_FFFF`
+    // IS receivable — an ECSM operand based at `u64::MAX - 31` is accepted, so do not
+    // assume the executor keeps such accesses out. `hi` reaching 2^32 is not a soundness
+    // problem, it is the mechanism: a non-canonical high limb has no matching PAGE or
+    // REGISTER token, so the multiset does not balance and the proof is invalid. Same
+    // argument makes `carry[i]` implicitly correct — a wrong carry bit produces a token
+    // at a wrong address, which nothing supplies.
+    //
+    // (Only an unaligned base can carry out of the low limb: a byte offset reaches 2^32
+    // only from `base_address_0 >= 2^32 - 7`, which is never a multiple of 8, so the
+    // aligned MEMW_A path and its own bound are not involved.)
 
     // CM8: memory[is_register, base_address, old_timestamp[0], old[0]] with +μ_sum
     interactions.push(BusInteraction::sender(

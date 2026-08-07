@@ -2021,6 +2021,60 @@ mod tests {
         );
     }
 
+    // An ECSM operand whose last doubleword's trailing bytes cross `2^32` maps a runtime page
+    // at `0x1_0000_0000`, so the epoch machinery has to carry a page whose base sits exactly on
+    // the limb boundary through the per-epoch touched-cell pass and the L2G bookkeeping. The
+    // monolithic path is covered by `test_prove_ecsm_operand_crossing_limb_boundary`; this is
+    // the same guest split across epochs.
+    #[test]
+    fn test_ecsm_operand_crossing_limb_across_epochs() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let elf_bytes = asm_elf_bytes("test_ecsm_limb_cross");
+        // The guest pads 16 nops between the ECSM write and the read-back so a 32-cycle epoch
+        // boundary falls between them; without that the write, all four crossing reads and the
+        // commit sit in one epoch and the crossing page is never carried into an epoch that
+        // reads it. Assert the property, not a cycle count: the assembler expands each 64-bit
+        // `li` into eight instructions, so absolute indices move when a constant changes.
+        let logs = Executor::new(&Elf::load(&elf_bytes).unwrap(), vec![])
+            .unwrap()
+            .run()
+            .unwrap()
+            .logs;
+        let ecall_idx = logs
+            .iter()
+            .position(|l| l.src1_val == executor::vm::instruction::execution::ECSM_SYSCALL_NUMBER)
+            .expect("the guest must issue the ECSM ecall");
+        let first_read_idx = ecall_idx + 17; // 16 nops, then the first `ld`
+        assert!(
+            (ecall_idx >> 5) < (first_read_idx >> 5),
+            "the epoch boundary must fall between the ECSM write (cycle {ecall_idx}) and the \
+             read-back (cycle {first_read_idx}); adjust the nop padding in the .s"
+        );
+
+        let mut gx = [
+            0x79u8, 0xBE, 0x66, 0x7E, 0xF9, 0xDC, 0xBB, 0xAC, 0x55, 0xA0, 0x62, 0x95, 0xCE, 0x87,
+            0x0B, 0x07, 0x02, 0x9B, 0xFC, 0xDB, 0x2D, 0xCE, 0x28, 0xD9, 0x59, 0xF2, 0x81, 0x5B,
+            0x16, 0xF8, 0x17, 0x98,
+        ];
+        gx.reverse();
+        let mut k = [0u8; 32];
+        k[0] = 5;
+        let expected = ecsm::scalar_mul_x(&k, &gx).unwrap();
+
+        let out = prove_and_verify_continuation(
+            &elf_bytes,
+            &[],
+            5,
+            &ProofOptions::default_test_options(),
+        )
+        .unwrap();
+        assert_eq!(
+            out.as_deref(),
+            Some(&expected[..]),
+            "xR read back from across the 2^32 boundary must survive epoch splitting"
+        );
+    }
+
     // Guards that the continuation API takes `epoch_size_log2` directly. A log2 of
     // 4 produces 16-cycle epochs over the 33-cycle `test_commit_split`, putting its
     // two commits in different epochs and exercising the cross-epoch x254 carry.
