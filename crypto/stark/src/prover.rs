@@ -591,6 +591,7 @@ pub fn table_parallelism() -> usize {
         std::env::var("TABLE_PARALLELISM")
             .ok()
             .and_then(|s| s.parse().ok())
+            .or(crate::runtime_overrides::get().table_parallelism)
             .unwrap_or_else(|| {
                 let cores = std::thread::available_parallelism()
                     .map(|n| n.get())

@@ -29,6 +29,7 @@ pub mod profile_markers;
 pub mod proof;
 pub mod prover;
 pub mod r4_denoms;
+pub mod runtime_overrides;
 #[cfg(feature = "disk-spill")]
 pub mod storage_mode;
 pub mod table;

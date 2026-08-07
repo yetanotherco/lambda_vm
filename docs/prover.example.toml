@@ -1,0 +1,53 @@
+# Prover configuration profile — pass with `cli prove --config <file>`.
+#
+# Every key is OPTIONAL: the file is a diff over the code defaults, never a
+# replacement. Anything not set here keeps the default noted in its comment
+# (several are computed per machine and have no fixed number). Precedence,
+# highest first:  explicit CLI flag > env var > this file > code default.
+#
+# Copy this file, uncomment only what you want to change.
+
+[prove]
+# blowup = 2                  # power of 2; must match at verification
+# epoch_size_log2 = 20        # continuation epoch cycles (log2); min 18.
+                              # Higher = fewer epochs and less fixed overhead,
+                              # more peak RAM/VRAM per epoch.
+
+[tables]
+# Per-table row caps, log2(rows). A table whose ops exceed its cap splits
+# into multiple instances. Defaults equalize memory per instance
+# (effective_width x rows ~ constant): wide tables cap low, narrow ones high.
+# Raising one cap alone makes that table's instances heavier than the rest.
+# cpu = 19
+# memw = 19
+# memw_aligned = 19
+# dvrm = 19
+# cpu32 = 19
+# mul = 20
+# lt = 20
+# shift = 20
+# load = 20
+# branch = 20
+# memw_register = 20
+# eq = 20
+# bytewise = 20
+# store = 20
+
+[scheduler]
+# table_parallelism = 5      # tables proven concurrently.
+                             # Default: computed from the machine's cores.
+                             # Env: TABLE_PARALLELISM
+# vram_budget_mb = 26000     # device admission budget.
+                             # Default: 80% of the detected VRAM.
+                             # Env: LAMBDA_VM_VRAM_BUDGET_MB
+
+[gpu]
+# lde_threshold_log2 = 19    # min LDE size for the GPU commit paths.
+                             # Env: LAMBDA_VM_GPU_LDE_THRESHOLD (in rows)
+# bary_threshold_log2 = 14   # min trace size for GPU barycentric.
+                             # Env: LAMBDA_VM_GPU_BARY_THRESHOLD (in rows)
+# mempool_release_mb = 0     # CUDA mempool release threshold; unset = retain.
+                             # Env: LAMBDA_VM_MEMPOOL_RELEASE_MB
+# disable_composition = false   # kill-switch (LAMBDA_VM_DISABLE_GPU_COMPOSITION)
+# disable_logup = false         # kill-switch (LAMBDA_VM_NO_GPU_LOGUP)
+# disable_device_only = false   # kill-switch (LAMBDA_VM_DISABLE_DEVICE_ONLY)

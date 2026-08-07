@@ -1053,6 +1053,24 @@ pub fn prove_continuation(
     epoch_size_log2: u32,
     opts: &ProofOptions,
 ) -> Result<ContinuationProof, Error> {
+    prove_continuation_with_max_rows(
+        elf_bytes,
+        private_inputs,
+        epoch_size_log2,
+        opts,
+        &MaxRowsConfig::default(),
+    )
+}
+
+/// [`prove_continuation`] with explicit per-table row caps (the config-file
+/// path); the plain entry point uses [`MaxRowsConfig::default`].
+pub fn prove_continuation_with_max_rows(
+    elf_bytes: &[u8],
+    private_inputs: &[u8],
+    epoch_size_log2: u32,
+    opts: &ProofOptions,
+    max_rows: &MaxRowsConfig,
+) -> Result<ContinuationProof, Error> {
     if epoch_size_log2 < 2 {
         return Err(Error::InvalidContinuationEpochSize(
             "epoch_size_log2 must be at least 2 (4 cycles)".to_string(),
@@ -1226,7 +1244,7 @@ pub fn prove_continuation(
                 // only image consumers in the build) are skipped.
                 None::<&std::collections::HashMap<u64, u8>>,
                 &job.register_init,
-                &MaxRowsConfig::default(),
+                max_rows,
                 private_inputs,
                 job.is_final,
                 true,

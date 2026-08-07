@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
+mod config;
+
 use clap::{Parser, Subcommand, ValueHint};
 
 #[global_allocator]
@@ -164,8 +166,15 @@ enum Commands {
         private_input: Option<PathBuf>,
 
         /// Blowup factor (power of 2). Higher = fewer queries, smaller proof, slower proving.
-        #[arg(long, default_value = "2")]
-        blowup: u8,
+        /// Default: 2, or the config file's [prove].blowup.
+        #[arg(long)]
+        blowup: Option<u8>,
+
+        /// TOML profile overriding the prover's tuning defaults (table row
+        /// caps, scheduler, GPU knobs). Explicit flags and env vars win over
+        /// the file; see docs/prover.example.toml.
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        config: Option<PathBuf>,
 
         /// Print proving time
         #[arg(long)]
@@ -205,9 +214,14 @@ enum Commands {
         #[arg(value_parser, value_hint = ValueHint::FilePath)]
         elf: PathBuf,
 
-        /// Blowup factor used during proving (must match)
-        #[arg(long, default_value = "2")]
-        blowup: u8,
+        /// Blowup factor used during proving (must match).
+        /// Default: 2, or the config file's [prove].blowup.
+        #[arg(long)]
+        blowup: Option<u8>,
+
+        /// TOML profile; only [prove].blowup applies to verification.
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        config: Option<PathBuf>,
 
         /// Print verification time
         #[arg(long)]
@@ -259,12 +273,40 @@ fn main() -> ExitCode {
             output,
             private_input,
             blowup,
+            config,
             time,
             cycles,
             elements,
             continuations,
             epoch_size_log2,
         } => {
+            // Precedence: explicit CLI flag > env var > config file > default.
+            // The file's runtime knobs are installed before any prover work;
+            // env vars keep priority at each read site.
+            let file_cfg = match load_file_config(config.as_deref()) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("{e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            file_cfg.warn_env_shadowing();
+            file_cfg.install_runtime_overrides();
+            let blowup = blowup.or(file_cfg.prove.blowup).unwrap_or(2);
+            let epoch_size_log2 = match epoch_size_log2 {
+                Some(v) => Some(v),
+                None => match file_cfg.prove.epoch_size_log2 {
+                    Some(v) => match parse_epoch_size_log2(&v.to_string()) {
+                        Ok(parsed) => Some(parsed),
+                        Err(e) => {
+                            eprintln!("config [prove].epoch_size_log2: {e}");
+                            return ExitCode::FAILURE;
+                        }
+                    },
+                    None => None,
+                },
+            };
+            let max_rows = file_cfg.max_rows();
             if continuations {
                 cmd_prove_continuation(
                     elf,
@@ -272,20 +314,39 @@ fn main() -> ExitCode {
                     private_input,
                     epoch_size_log2,
                     blowup,
+                    max_rows,
                     time,
                     cycles,
                 )
             } else {
-                cmd_prove(elf, output, private_input, blowup, time, cycles, elements)
+                cmd_prove(
+                    elf,
+                    output,
+                    private_input,
+                    blowup,
+                    max_rows,
+                    time,
+                    cycles,
+                    elements,
+                )
             }
         }
         Commands::Verify {
             proof,
             elf,
             blowup,
+            config,
             time,
             continuations,
         } => {
+            let file_cfg = match load_file_config(config.as_deref()) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("{e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let blowup = blowup.or(file_cfg.prove.blowup).unwrap_or(2);
             if continuations {
                 cmd_verify_continuation(proof, elf, blowup, time)
             } else {
@@ -293,6 +354,13 @@ fn main() -> ExitCode {
             }
         }
         Commands::CountElements { elf, private_input } => cmd_count_elements(elf, private_input),
+    }
+}
+
+fn load_file_config(path: Option<&std::path::Path>) -> Result<config::FileConfig, String> {
+    match path {
+        Some(p) => config::FileConfig::load(p),
+        None => Ok(config::FileConfig::default()),
     }
 }
 
@@ -542,11 +610,13 @@ fn cmd_execute(
     ExitCode::SUCCESS
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_prove(
     elf_path: PathBuf,
     output_path: PathBuf,
     private_input_path: Option<PathBuf>,
     blowup: u8,
+    max_rows: prover::tables::MaxRowsConfig,
     time: bool,
     cycles: bool,
     elements: bool,
@@ -617,12 +687,7 @@ fn cmd_prove(
         "Generating proof (blowup={blowup}, queries={})...",
         opts.fri_number_of_queries
     );
-    let proof = prover::prove_with_options_and_inputs(
-        &elf_data,
-        &private_inputs,
-        &opts,
-        &Default::default(),
-    );
+    let proof = prover::prove_with_options_and_inputs(&elf_data, &private_inputs, &opts, &max_rows);
     let prove_elapsed = start.elapsed();
     let proof = match proof {
         Ok(proof) => proof,
@@ -732,12 +797,14 @@ fn cmd_verify(proof_path: PathBuf, elf_path: PathBuf, blowup: u8, time: bool) ->
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_prove_continuation(
     elf_path: PathBuf,
     output_path: PathBuf,
     private_input_path: Option<PathBuf>,
     epoch_size_log2: Option<u32>,
     blowup: u8,
+    max_rows: prover::tables::MaxRowsConfig,
     time: bool,
     cycles: bool,
 ) -> ExitCode {
@@ -797,11 +864,12 @@ fn cmd_prove_continuation(
     #[cfg(feature = "jemalloc-stats")]
     let tracker = heap_tracker::HeapTracker::start();
     let start = Instant::now();
-    let bundle = match prover::continuation::prove_continuation(
+    let bundle = match prover::continuation::prove_continuation_with_max_rows(
         &elf_data,
         &private_inputs,
         epoch_size_log2,
         &opts,
+        &max_rows,
     ) {
         Ok(b) => b,
         Err(e) => {
