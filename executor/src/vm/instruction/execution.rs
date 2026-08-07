@@ -70,7 +70,13 @@ impl SyscallNumbers {
 }
 
 /// Reads a 256-bit little-endian value as four doublewords at `addr + 8i`.
+///
+/// The span is validated up front, which is where the `addr + 31 < 2^64` contract lives: the
+/// per-access checks below would otherwise leave it emerging from `checked_add(8i)` plus
+/// `Memory::load_doubleword`'s aligned/unaligned split, and the aligned path bound-checks
+/// nothing (8-alignment already caps it at `u64::MAX - 7`).
 fn load_u256_le(memory: &Memory, addr: u64) -> Result<[u8; 32], MemoryError> {
+    addr.checked_add(31).ok_or(MemoryError::AddressOverflow)?;
     let mut out = [0u8; 32];
     for i in 0..4 {
         let base = addr
@@ -83,7 +89,12 @@ fn load_u256_le(memory: &Memory, addr: u64) -> Result<[u8; 32], MemoryError> {
 }
 
 /// Writes a 256-bit little-endian value as four doublewords at `addr + 8i`.
+///
+/// The span is validated before the first store: checking per access would commit
+/// doublewords 0..2 and fail on the fourth, leaving 24 bytes of `xR` in a `Memory` the
+/// caller sees next to an `Err`. See [`load_u256_le`] on where the contract lives.
 fn store_u256_le(memory: &mut Memory, addr: u64, bytes: &[u8; 32]) -> Result<(), MemoryError> {
+    addr.checked_add(31).ok_or(MemoryError::AddressOverflow)?;
     for i in 0..4 {
         let mut dw = [0u8; 8];
         dw.copy_from_slice(&bytes[i * 8..i * 8 + 8]);
