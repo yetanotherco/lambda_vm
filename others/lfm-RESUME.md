@@ -155,9 +155,9 @@ The machine proves and verifies, end to end, through the registry:
      therefore entry 2's derivation; entry 8's synthetic AIR.
 6. ~~**The wrap run**~~ — **DONE, and the machine PROVES its own epoch verifier**
    (assembly-w7, `feat/lfm-assembly`). Run LOCALLY, not on the box: the box was
-   occupied by an ethrex continuation campaign at both check points (18:43 and
-   18:52 UTC+2, load 22-29 on 32 cores, two different `cli prove` invocations), so
-   per the brief nothing was started on it. Every number names the epoch profile
+   occupied by an ethrex continuation campaign at all three check points (18:43,
+   18:52 and 19:12 UTC, load 22-29 on 32 cores, three different `cli prove`
+   invocations), so per the brief nothing was started on it. Every number names the epoch profile
    `[2 x14, 3, 4 x4, 5 x3, 7, 20]`; the full table is in
    `lfm-assembly-obligations.md` entry 10, now SATISFIED.
    - **Slice 0** (min preset): the assembled verifier proves in 19.5 s and
