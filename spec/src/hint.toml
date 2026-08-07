@@ -30,7 +30,13 @@ pad = 0
 [[variables.output]]
 name = "out"
 type = "U256BL"
-desc = "the hinted value, big-endian. *Unconstrained*: no constraint in this chip relates `out` to the value stored at `addr_in`."
+desc = """\
+       the hinted value. *Unconstrained*: no constraint in this chip relates `out` to the value \\
+       stored at `addr_in`. Note the limb order is the reverse of the `U256BL` convention used \\
+       elsewhere: `out[0]` is written to the *lowest* address, and the buffer is big-endian, so \\
+       `out[0]` is the *most* significant byte. As a number this variable is therefore the \\
+       byte-reversal of the hint; it is never read as one.\
+       """
 pad = 0
 
 [[variables.multiplicity]]
@@ -38,6 +44,20 @@ name = "μ"
 type = "Bit"
 desc = ""
 pad = 0
+
+# Assumptions
+
+[[assumptions]]
+desc = "the calling program verifies `out` before use, and recomputes in software when the check fails; see @hint:s:guest."
+ref = "hint:a:guest_verifies"
+
+[[assumptions]]
+desc = "the VM rejects a `selector` outside $[0, 3)$ rather than executing the call."
+ref = "hint:a:selector_rejected"
+
+[[assumptions]]
+desc = "the VM rejects an operand address with $(#`addr` mod 2^32) + 31 >= 2^32$ rather than executing the call."
+ref = "hint:a:addr_rejected"
 
 # Constraints
 

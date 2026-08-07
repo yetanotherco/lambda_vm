@@ -6,6 +6,7 @@
   total_nr_instantiated_columns,
   compute_nr_interactions,
   render_constraint_table,
+  render_chip_assumptions,
   render_chip_padding_table,
 )
 
@@ -17,42 +18,41 @@
 
 = Overview
 
-The #hint chip serves an `ECALL` that hands the guest a value the host computed for it.
+The #hint chip serves an `ECALL` that hands the guest a value the prover computed for it.
 It is not an accelerator in the sense of @keccak or @ecsm: those chips _constrain_ the function they compute, so the guest may use their output directly.
 This one constrains nothing about the value it delivers.
-Its purpose is to move a computation that is expensive in the guest --- and cheap to _check_ in the guest --- out of the circuit entirely, leaving only the check behind.
+Its purpose is to move a computation that is expensive in the guest --- and cheap to _check_ in the guest --- out of the constraint system entirely, leaving only the check behind.
 The motivating example is modular inversion: a software inversion in the guest costs thousands of constrained instructions, while verifying a candidate inverse costs one multiplication.
 
 The value is chosen by the prover.
-The chip therefore constrains only _where_ it lands and _that it is 32 bytes_:
+The chip therefore constrains only the _frame_ of the call:
 
 + it receives the `ECALL`, so the interaction the `CPU` emits is taken off the bus (@hint:c:receive_ecall);
-+ it binds the three operands to the registers the `CPU` held at this timestamp, and range checks them to the set the VM accepts (@hint:c:read_selector through @hint:c:range_addr_out);
-+ it sends the four `MEMW` writes that place the value in memory (@hint:c:write_out), since the `ECALL` writes guest memory directly, bypassing the `STORE` path; and
++ it binds the three operands to the registers the `CPU` held at this timestamp, and range checks them against the set the VM accepts (@hint:c:read_selector through @hint:c:range_addr_out);
++ it sends the four `MEMW` writes that place the value in memory (@hint:c:write_out), since the `ECALL` writes guest memory directly, bypassing the @store path; and
 + it range checks the 32 written cells as bytes (@hint:c:range_out).
 
 #attention("The delivered value is unconstrained.")[
   No constraint in this chip relates `out` to the value stored at `addr_in`, and none can be added without paying for the computation the chip exists to avoid.
   A guest program that _uses_ a hinted value without verifying it is unsound, and the machine will not catch this: the trace of an honest execution and the trace of an execution fed a fabricated hint are both valid.
-  The obligation this places on the guest is stated in @hint:s:guest, and it is a property of the _program_, not of the VM.
+  The obligation this places on the calling program is @hint:a:guest_verifies, discussed in @hint:s:guest.
 ]
 
 = Interface
 
 The chip is triggered by executing `ECALL` with `ECALL` number $-31$.
-The `CPU` puts this on the `ECALL` bus as the pair $[2^32-31, 2^32-1]$; the chip takes it off again in @hint:c:receive_ecall.
 It expects
 - `x10` (`A0`) to contain the `selector`, naming the operation to perform,
 - `x11` (`A1`) to contain the address of the 32-byte input, and
 - `x12` (`A2`) to contain the address of the 32-byte output buffer.
-Both buffers are big-endian.
+Both buffers hold big-endian integers.
 #footnote[
   This is the opposite of @ecsm, whose operands are little-endian.
-  There, the byte order is dictated by the chip that consumes the limbs; here, both buffers are only ever read and written by guest software, so the order is the one the guest's own serialization uses.
+  There, the byte order is dictated by the chip that consumes the limbs; here, no chip ever interprets the bytes --- they are only copied --- so the order is free to match the serialization the guest already uses.
 ]
-Nothing is returned in `A0`.
+Unlike the general `ECALL` convention (@ecall), nothing is returned in `A0`.
 
-The following `selector` values are assigned, all three over `secp256k1`:
+We assign the following `selector` values, all three over `secp256k1`, writing $x$ for the 32-byte value at `addr_in`:
 #align(center)[#table(
   columns: (auto, auto, auto),
   table.header(`selector`, "operation", "check available to the guest"),
@@ -61,45 +61,58 @@ The following `selector` values are assigned, all three over `secp256k1`:
   "2",  [base-field square root $sqrt(x) mod p$], $#`out`^2 = x$,
 )]
 The set is deliberately small: a `selector` earns its place by naming an operation whose _result_ is cheaper to verify than to compute.
-Adding one requires raising the bound in @hint:c:range_selector in step, so that the AIR keeps accepting exactly the set the VM accepts.
+Adding one requires raising the bound in @hint:c:range_selector to match, so that the AIR
+#footnote[We use _AIR_ for the constraint system of a chip, i.e. for what its constraints accept, as in @memory.]
+keeps accepting exactly the set the VM accepts.
 
-== Host behaviour
+== VM behaviour
 
-Two malformed calls are rejected up front, and the VM halts with an error rather than executing them:
+Two kinds of malformed call are rejected up front, and the VM halts with an error rather than executing them (@hint:a:selector_rejected, @hint:a:addr_rejected):
 
-/ Unknown `selector`: any value outside the table above. It is important that this is an error and not a zero result --- see @hint:s:guest.
-/ Operand out of range: either operand address for which $(#`addr` mod 2^32) + 31 >= 2^32$. Such a buffer straddles the boundary between the two address limbs; @hint:s:limb explains why the chip cannot represent it.
+/ Unknown `selector`: any value outside the table above. It matters that this is an error and not a zero result --- see @hint:s:guest.
+/ Operand out of range: an operand address satisfying $(#`addr` mod 2^32) + 31 >= 2^32$. Such a buffer straddles the boundary between the two address limbs; @hint:s:limb explains what goes wrong.
 
 Everything else is executed.
-In particular, an input that is _numerically_ unusable --- a non-canonical field element, a zero to be inverted, a quadratic non-residue --- is not an error: the host writes 32 zero bytes and execution continues.
-This is a deliberate choice, and it is the only sound one.
-A hint is prover-chosen, so "the host reports failure" and "the host lies about failure" are the same event as far as the guest is concerned; if the guest branched on it, the prover would control the branch.
-Zeros are simply a value that will not pass the guest's check, and the guest treats them like any other value that does not pass.
+In particular, an input that is _numerically_ unusable --- a non-canonical field element, a zero to be inverted, a quadratic non-residue --- is not an error: the VM writes 32 zero bytes and execution continues.
+It must not signal the failure to the guest instead.
+A hint is prover-chosen, so "the prover reports failure" and "the prover lies about failure" are the same event as far as the guest is concerned; a guest that branched on the report would hand the prover control of the branch.
+Zeros are one convenient choice of value that will not pass the guest's check
+#footnote[
+  Zeros parse as a canonical field element, so they are rejected by the algebraic check rather than by the decoding step.
+  For the square root this relies on $x^3+7$ never being zero on `secp256k1`, which holds because the curve has odd order and therefore no affine point with $y = 0$.
+]
+--- nothing distinguishes them from any other value that fails, which is the point.
 
 = Guest obligation <hint:s:guest>
+
+This section states @hint:a:guest_verifies, an obligation on the calling _program_.
+It is not enforced by any constraint of this chip, and it cannot be: it is the price of leaving the value unconstrained.
+We state it here because the chip is not sound to use without it.
 
 A hinted value may only ever _save work_.
 It must never change the guest's answer.
 That rules out two distinct failure modes, and closing only the first leaves a hole.
 
 *Accepting a wrong value.*
-Every hint must be verified in-guest with ordinary constrained instructions before use: $x dot #`out` = 1$ for the inverses, $#`out`^2 = x^3 + 7$ together with the parity selection for the root.
-This is the obvious obligation, and the cheap one --- it is the whole point of the ecall.
+The guest must reject a non-canonical encoding of `out` --- @hint:c:range_out constrains it only to be 32 bytes, so it may exceed $p$ or $n$ --- and must then verify the value with ordinary constrained instructions: $x dot #`out` = 1$ for the two inverses, and $#`out`^2 = x$ for the root.
+Both are the checks tabulated above, in terms of the value the guest passed at `addr_in`.
+For a point recovery, that value is $x_P^3 + 7$, so the guest asks for $sqrt(x_P^3+7)$ and checks $#`out`^2 = x_P^3+7$; it must additionally select the root of the requested parity, using the canonical encoding it has just validated.
+That selection is a fix-up rather than a test: both roots are legitimate answers, so the guest corrects the sign itself instead of rejecting.
 
 *Steering a rejection.*
 A failed check must _not_ be read as "the input was invalid".
 It must trigger a software recomputation, whose result is authoritative.
-Without this, a prover that feeds garbage turns a verification failure into a rejection: for `ECRECOVER`, a valid signature that fails to recover, an empty return value, and a different state root --- with both the honest and the attacked execution provable.
+Without this, a prover that feeds garbage turns a verification failure into a rejection: for signature recovery, a valid signature then fails to recover, the returned value is empty, and the resulting state root differs --- with both the honest and the attacked execution provable.
 The guest cannot distinguish the two cases, so it must not try: it recomputes, and the software result decides.
 
-#aside("Why the fallback is not dead code.")[
-  For the inverses it is: the caller establishes $x eq.not 0$ before asking, so the inverse exists and a failed check can only mean the host lied.
-  For the square root it is not: a genuine non-residue has no root, and the software path must still return "no such point".
-  This is exactly why the fallback has to be a _recomputation_ and not a rejection --- the two cases are indistinguishable from inside the guest, and only one of them is allowed to produce a negative answer.
+#aside("When the fallback runs.")[
+  For the two inverses the fallback exists only for the dishonest case, so it never runs against an honest prover: the inverse of the input always exists, because the callers exclude $x = 0$
+  #footnote[Directly, for the scalar inverse. For the base-field inverse the argument is a product of factors the caller guards, together with a $y$-coordinate, which is non-zero because `secp256k1` has odd order and hence no affine point with $y = 0$.]
+  and a non-canonical input is rejected before the check.
+  It is nonetheless mandatory --- it is precisely what runs when the prover lies.
+  For the square root the fallback also runs on honest inputs: a genuine non-residue has no root, and the software path must still return "no such point".
+  That is why the fallback must be a _recomputation_ and not a rejection --- the two cases are indistinguishable from inside the guest, and only one of them is allowed to produce a negative answer.
 ]
-
-Both obligations sit outside this specification, in the program.
-This chapter states them because the chip is only usable in their presence.
 
 = Columns
 
@@ -111,6 +124,9 @@ The #hint chip is comprised of #nr_variables variables that are expressed using 
 One row serves one hint call.
 #render_chip_variable_table(chip, config)
 
+= Assumptions
+#render_chip_assumptions(chip, config)
+
 = Constraints
 
 == Receiving the `ECALL`
@@ -118,66 +134,81 @@ One row serves one hint call.
 #render_constraint_table(chip, config, groups: "ecall")
 
 @hint:c:mu_isbit is load-bearing, not a restatement of something the bus already gives.
-The `ECALL` tuple carries `timestamp`, which is a free column of this chip: `LogUp` therefore pins only the _sum_ of `μ` over the rows sharing a tuple with the `CPU`'s send.
-A witness may spread that sum --- a $+1$ row together with a $+1$/$-1$ pair, each row keeping its own `addr_out` --- and use the extra rows to write wherever it likes.
-The `MEMW` interactions do not catch it: `MEMW` only ever receives the legal $+1$, while the $-1$ cancels an honest `STORE` on the sender side.
+The LogUp argument pins only the _net_ multiplicity of each distinct tuple, and every interaction of this chip carries `μ` as its multiplicity.
+Without the bit constraint, take two rows agreeing in every column except `out`, one with $#`μ` = 1$ and one with $#`μ` = -1$.
+Every interaction whose tuple does not mention `out` cancels between them: the `ECALL` receive, the three register reads, and the three range checks.
+The pair is therefore invisible to the `CPU` --- it does not need an `ECALL` to have been issued at all --- and `timestamp` and `addr_out`, bound only through those cancelled interactions, end up pinned by nothing.
+What survives is @hint:c:write_out, whose tuple carries `out`.
+The $+1$ row's write is received by `MEMW` and lands in memory; the $-1$ row's cannot be, since `MEMW` receives at $-#`μ_read`$ and $-#`μ_write`$, both bits, so a receiver never contributes $+1$.
+The $-1$ must instead cancel a $+1$ from another _sender_ --- an honest @store's 8-byte write, whose `MEMW` tuple has exactly this shape.
+Choosing `timestamp` and `addr_out` to match that store, and the $-1$ row's `out` to match the value it stores, deletes the honest write and puts the $+1$ row's bytes at that address instead.
+@hint:c:range_out does not catch the difference: `ARE_BYTES` is received at a free multiplicity, which absorbs the $-1$.
 Constraining `μ` to a bit makes the argument local to this chip.
 
 == Binding and checking the operands
 
-The three operand registers are read at `timestamp`, which pins `selector`, `addr_in` and `addr_out` to the values the `CPU` held when it issued the `ECALL`.
+We read the three operand registers at `timestamp`, which pins `selector`, `addr_in` and `addr_out` to the values the `CPU` held when it issued the `ECALL`.
 For `addr_out` this is the difference between a chip that writes to an address the program chose and an arbitrary-memory-write gadget: the write bases in @hint:c:write_out are derived from `addr_out`, so were it not bound, the witness --- not the program --- would choose the destination.
-No in-guest check can repair that, since the adversary simply targets a different buffer than the one the guest verifies.
+No in-guest check can repair that, since the adversary simply targets a buffer other than the one the guest verifies.
 
 #render_constraint_table(chip, config, groups: "operands")
 
-@hint:c:range_selector holds the AIR to the set of operations the VM implements.
-It is the same bound the host applies, and the two must move together: a `selector` the AIR accepts but the host rejects lets a prover prove an execution that the VM halts on.
+@hint:c:range_selector holds the AIR to the set of operations the VM implements (@hint:a:selector_rejected).
+The two bounds must move together: a `selector` the AIR accepts but the VM rejects lets a prover prove an execution that halts.
 
 === The address bound <hint:s:limb>
 
-@hint:c:range_addr_in and @hint:c:range_addr_out both assert $#`addr`_0 < 2^32 - 31$, the low limb bounded so that the whole 32-byte buffer stays inside it.
-The reason is @hint:c:write_out: it offsets the _low_ limb of `addr_out` by $8i$ and passes the high limb through unchanged.
-A carry out of the low limb has no representation there, so an address within $31$ of the limb boundary describes a buffer the chip cannot address.
-Compare @ecsm, which materializes its four write addresses as columns of their own and derives them with `ADD`; that is the more expensive way to buy the same property, and it costs the columns and the range checks that come with them.
+@hint:c:range_addr_in and @hint:c:range_addr_out both assert $#`addr`_0 < 2^32 - 31$, i.e. the low limb is bounded so that the whole 32-byte buffer stays within the limb's range.
+The reason is @hint:c:write_out: it offsets the _low_ limb of `addr_out` by $8i$ and passes the high limb through unchanged, so a carry has no representation in the four write _bases_.
+The bytes _past_ a base are not a problem --- `MEMW` derives them from its own address columns, whose carry does reach the high limb (@memw) --- so representability breaks only when a base itself leaves the limb, at $#`addr_out`_0 = 2^32-24$, where the last base $#`addr_out`_0 + 24$ would be $2^32$ and match no memory token.
 
-Both operands need the check, for different reasons.
-`addr_in` is not on the memory bus at all (@hint:s:noread), so nothing else bounds it.
-`addr_out` _is_ on the bus, but the bus bounds it only to $2^32-25$: the largest write base is $#`addr_out`_0 + 24$, and `MEMW`'s carry handling resolves the bytes beyond it correctly.
-That leaves the seven values $2^32-31, ..., 2^32-25$, which the memory argument accepts and the host rejects --- again a provable execution that the VM halts on.
+The bound the chip asserts is stricter than representability requires, and deliberately so: it is the VM's bound (@hint:a:addr_rejected), and the two must agree.
+The memory argument alone would admit up to $2^32-25$, leaving the seven values $2^32-31, ..., 2^32-25$ that it accepts and the VM rejects --- again a provable execution that halts.
+`addr_in` needs its own check for a simpler reason: no memory access at `addr_in` is modelled (@hint:s:noread), so nothing on the memory side bounds it at all.
+Both checks satisfy @lt:a:range_lhs through the register binding above, in the same way @memw's `old_timestamp` is bounded by its presence in the memory argument rather than by a range check of its own.
+
+Compare @ecsm, which materializes its four write addresses as columns of their own and derives them with `ADD`.
+That buys the strictly stronger property that a base may cross the limb boundary, at the cost of the columns and the range checks that come with them.
+The bound here is the cheaper trade, but it is a real limitation: whether a 32-byte buffer lands within 31 bytes of a $2^32$ boundary is the allocator's choice, not the programmer's.
 
 The bound has a second use.
 It guarantees that the four write bases $#`addr_out`_0 + 8i$ do not wrap, hence that the four 8-byte ranges are pairwise disjoint.
-Together with the three registers being distinct, that is what allows all seven memory interactions of this chip to carry the same `timestamp`: no address is touched twice at one timestamp.
+Together with the three registers lying in a different memory domain (@memory) and at distinct addresses within it, that is what allows all seven memory interactions of this chip to carry the same `timestamp`: no address is touched twice at one timestamp.
 
 == Writing the output
 
 #render_constraint_table(chip, config, groups: "write_out")
 
-The `ECALL` writes guest memory directly rather than through the `STORE` path, so these writes appear in no `CPU` operation.
+The `ECALL` writes guest memory directly rather than through the @store path, so these writes appear in no `CPU` operation.
 Without @hint:c:write_out the initial-to-final chain for those 32 cells is unexplained and the memory argument does not balance (@memory).
 
-@hint:c:range_out is required because `MEMW` range checks nothing it receives, and `out` is a free column.
-Every chip that puts _fresh_ values into memory carries its own check for this reason --- `STORE` does, and in @keccak and @ecsm the written bytes are pinned by the chip's own arithmetic instead.
-Here there is no arithmetic to lean on.
-Without it, the witness can put field elements outside $[0, 256)$ into memory while keeping the linear combination on the bus consistent, and break the byte decomposition that `LOAD` and the ALU rely on.
+@hint:c:range_out is required because `MEMW` range checks nothing it receives, and `out` is 32 free columns.
+Every chip that puts _fresh_ values into memory has those cells pinned to bytes somewhere.
+@store and the `PAGE` chip check them locally; @keccak and @ecsm do not, and instead receive the cells over a bus that pins them on the far side --- `output_state` is a `BYTE_ALU` output of the keccak-round chip, and `xR` is range checked by the `ECDAS` chip of @ecsm.
+It is worth being precise about the second: @ecsm's own range check on `xR` is _not_ what pins its bytes, since it constrains only the eight 32-bit words, and a word does not determine how its four cells split.
+`out` arrives over no bus at all, so there is no far side, and the check has to be local.
+Without it, the witness can put field elements outside $[0, 256)$ into memory while keeping the linear combination on the bus consistent, and break the byte decomposition that @load and the ALU rely on.
 
 === The input read is not modelled <hint:s:noread>
 
 The `ECALL` reads 32 bytes at `addr_in`, and this chip emits no interaction for it.
-This is sound: a read leaves memory unchanged, so the memory argument has nothing to balance, and the guest placed the input there with ordinary `STORE`s that are already accounted for.
-It is also unobservable, precisely because the value is unconstrained --- there is no constraint that would relate what was read to what was written, so modelling the read would bind nothing.
+This is sound for one reason only: the value is unconstrained.
+No constraint relates what was read to what was written, so an interaction binding the read to memory would bind nothing that any other constraint depends on.
+It is _not_ sound merely because a read leaves memory contents unchanged.
+Omitting a read does leave the memory argument balanced --- the token survives at its old timestamp until finalization --- but that is exactly as true of @load and of @ecsm's read of $x_G$, whose reads are also value-preserving and which must nonetheless pay for the interaction, because there the read is what _binds_ the operand to memory.
+Here there is no operand to bind.
 
 = Padding
 
-Padding rows set $#`μ` = 0$, which disables every interaction of this chip.
 #render_chip_padding_table(chip, config)
 
 = Notes / optimizations
 
 - The chip could constrain the value after all, for the two inverses, by reading the input into columns of its own and asserting $x dot #`out` = 1$ over the appropriate modulus.
-  That would make the ecall self-sufficient and remove the guest obligation of @hint:s:guest, at the cost of the input columns, the read that binds them, and the modular-multiplication constraints --- which is very nearly the multiplication the guest performs anyway.
-  The trade is between paying once in the AIR for every hint call, or paying in the guest only where a hint is actually used.
-- `selector` and both addresses are `DWordWL`s, but only their low limbs carry information the chip uses: the high limbs are constrained by the register binding alone.
-  @hint:c:range_selector compares the full 64-bit `selector`, whereas the address checks compare the low limb against a literal zero high limb, matching the host.
+  That would make the `ECALL` self-sufficient and discharge @hint:a:guest_verifies, at the cost of the input columns, the read that binds them, and the modular-multiplication constraints --- which is very nearly the multiplication the guest performs anyway.
+  The trade is between paying once in the AIR for every hint call and paying in the guest only where a hint is actually used.
+  Note that such a constraint must not read `out` as a `U256BL` in the usual limb order: this chip stores it most-significant-byte-first, so that @hint:c:write_out lays the buffer out big-endian in memory.
+- `addr_in`'s high limb is the only part of the three operands that no constraint uses; it is bound by the register read alone.
+  `addr_out`'s high limb is passed through to the write bases, and `selector`'s is pinned to $0$ by @hint:c:range_selector, which compares the full 64-bit value.
+  The address checks instead pass the low limb with a literal zero high limb, so only the low 32 bits are compared --- matching the VM, which ignores the high limb.
 - Should the hint set grow beyond values that fit a single 32-byte input and output, the interface would need a length or a shape parameter; today both buffers are fixed at 32 bytes and the four `MEMW` writes are unrolled accordingly.
