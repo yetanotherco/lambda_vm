@@ -31,6 +31,7 @@ use std::collections::HashSet;
 
 use executor::elf::Elf;
 use executor::vm::instruction::decoding::Instruction;
+use executor::vm::instruction::execution::dma_memcpy_trace_rows;
 use executor::vm::logs::Log;
 use executor::vm::memory::U64HashMap;
 #[cfg(feature = "parallel")]
@@ -980,7 +981,7 @@ fn collect_dma_memcpy_ops(
         "successful DMA ecall must respect the per-call chunk bound"
     );
 
-    let data_rows = count / 8 + count % 8;
+    let data_rows = dma_memcpy_trace_rows(count) - 1;
     let capacity = usize::try_from(data_rows)
         .ok()
         .and_then(|n| n.checked_mul(2)?.checked_add(3))
