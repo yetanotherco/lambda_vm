@@ -560,6 +560,8 @@ name = "executor"
 version = "0.1.0"
 dependencies = [
  "ecsm",
+ "k256",
+ "lambda-vm-syscalls",
  "rustc-demangle",
  "serde",
  "serde_json",
