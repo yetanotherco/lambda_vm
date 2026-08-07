@@ -7,7 +7,10 @@
 //! - `write_output`: appends bytes to the public output. Multiple calls
 //!   concatenate.
 //! - `write_log`: diagnostic (`println`-style) UTF-8 text for the host. Not
-//!   part of the statement being proven.
+//!   part of the statement being proven. Specified by
+//!   <https://github.com/eth-act/zkvm-standards/pull/27>, which amends the
+//!   interface above from two functions to three; until it merges, the linked
+//!   README documents only the first two.
 //!
 //! On Lambda VM these map to:
 //! - `read_input` → memory-mapped private input region at `0xFF000000`
