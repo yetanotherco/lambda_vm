@@ -3534,3 +3534,135 @@ fn test_epoch_memory_bus_with_l2g_bookend() {
         "epoch Memory bus must balance with L2G bookend + PAGE excluding touched cells"
     );
 }
+
+// =============================================================================
+// PoC (adversarial adjudication): ECSM low-limb window
+// =============================================================================
+
+/// Shared body: `name` is an asm ELF whose ECSM output address (`a0`) has low
+/// limb `2^32 - off`. Returns `(executor_rejects_unpatched, prove_verify_ok)`.
+fn ecsm_limb_poc(name: &str) -> (bool, bool) {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let elf_bytes = crate::test_utils::asm_elf_bytes(name);
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+
+    // (1) Reference semantics: the unpatched executor must reject.
+    unsafe { std::env::remove_var("ECSM_NO_LIMB_GUARD") };
+    let ex = Executor::new(&elf, vec![]).expect("Failed to create executor");
+    let rejects = match ex.run() {
+        Err(e) => {
+            println!("[poc {name}] reference executor: {e:?}");
+            format!("{e:?}").contains("EcsmAddressOverflow")
+        }
+        Ok(_) => {
+            println!("[poc {name}] reference executor: COMPLETED (no guard hit)");
+            false
+        }
+    };
+
+    // (2) Same program, guard bypassed: does the resulting proof verify?
+    unsafe { std::env::set_var("ECSM_NO_LIMB_GUARD", "1") };
+    let opts = ProofOptions::default_test_options();
+    let ok = match crate::prove_with_options(&elf_bytes, &opts, &MaxRowsConfig::default()) {
+        Ok(proof) => match crate::verify_with_options(&proof, &elf_bytes, &opts, None, None) {
+            Ok(v) => {
+                println!("[poc {name}] prove OK, verify = {v}");
+                v
+            }
+            Err(e) => {
+                println!("[poc {name}] verify ERROR: {e:?}");
+                false
+            }
+        },
+        Err(e) => {
+            println!("[poc {name}] prove ERROR: {e:?}");
+            false
+        }
+    };
+    unsafe { std::env::remove_var("ECSM_NO_LIMB_GUARD") };
+    (rejects, ok)
+}
+
+#[test]
+fn poc_ecsm_limb_gap_31() {
+    // addr_xr low limb = 2^32 - 31 = 0xFFFF_FFE1. Executor: reject. AIR: ?
+    let (rejects, ok) = ecsm_limb_poc("test_ecsm_limb_31");
+    println!("RESULT off=31 executor_rejects={rejects} proof_verifies={ok}");
+    assert!(rejects, "executor should reject 0xFFFF_FFE1");
+    assert!(
+        ok,
+        "SOUNDNESS GAP: proof verified for an execution the executor halts on"
+    );
+}
+
+#[test]
+fn poc_ecsm_limb_gap_25() {
+    // addr_xr low limb = 2^32 - 25 = 0xFFFF_FFE7 — the last value in the window.
+    let (rejects, ok) = ecsm_limb_poc("test_ecsm_limb_25");
+    println!("RESULT off=25 executor_rejects={rejects} proof_verifies={ok}");
+    assert!(rejects);
+    assert!(ok);
+}
+
+#[test]
+fn poc_ecsm_limb_gap_24_negative_control() {
+    // addr_xr low limb = 2^32 - 24 = 0xFFFF_FFE8: dword base +24 leaves the limb,
+    // so the AIR's byte-0 token is non-canonical. Expect prove/verify to FAIL.
+    let (rejects, ok) = ecsm_limb_poc("test_ecsm_limb_24");
+    println!("RESULT off=24 executor_rejects={rejects} proof_verifies={ok}");
+    assert!(rejects);
+    assert!(!ok, "negative control: 0xFFFF_FFE8 should NOT be provable");
+}
+
+#[test]
+fn poc_ecsm_limb_gap_32_positive_control() {
+    // addr_xr low limb = 2^32 - 32 = 0xFFFF_FFE0: the largest value the EXECUTOR
+    // allows. Executor accepts AND the proof verifies — so the only thing that
+    // differs between this and off=31 is the guard, not the harness.
+    let (rejects, ok) = ecsm_limb_poc("test_ecsm_limb_32");
+    println!("RESULT off=32 executor_rejects={rejects} proof_verifies={ok}");
+    assert!(!rejects, "executor should ACCEPT 0xFFFF_FFE0");
+    assert!(ok);
+}
+
+#[test]
+fn poc_plain_sd_across_limb_boundary() {
+    // A plain 8-byte store at 0xFFFF_FFFC (spanning into high limb 1) is accepted
+    // by the executor AND provable: the VM's general MEMW path carries correctly
+    // across the 2^32 limb boundary. Only the ECSM ecall refuses it.
+    let _ = env_logger::builder().is_test(true).try_init();
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_limb_cross_sd");
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+    let ex = Executor::new(&elf, vec![]).expect("Failed to create executor");
+    let res = ex.run();
+    println!("[poc plain-sd] executor: {:?}", res.as_ref().err());
+    assert!(res.is_ok(), "plain limb-crossing sd must execute");
+    let opts = ProofOptions::default_test_options();
+    let proof = crate::prove_with_options(&elf_bytes, &opts, &MaxRowsConfig::default())
+        .expect("prove failed");
+    let ok = crate::verify_with_options(&proof, &elf_bytes, &opts, None, None).expect("verify err");
+    println!("RESULT plain-sd-across-limb proof_verifies={ok}");
+    assert!(ok, "limb-crossing plain store should be provable");
+}
+
+#[test]
+fn poc_ecsm_limb_gap_31_shows_pages_above_2p32() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_ecsm_limb_31");
+    unsafe { std::env::set_var("ECSM_NO_LIMB_GUARD", "1") };
+    let opts = ProofOptions::default_test_options();
+    let proof = crate::prove_with_options(&elf_bytes, &opts, &MaxRowsConfig::default()).unwrap();
+    unsafe { std::env::remove_var("ECSM_NO_LIMB_GUARD") };
+    for r in &proof.runtime_page_ranges {
+        println!("RUNTIME PAGE base=0x{:016X} count={}", r.base, r.count);
+    }
+    let above = proof
+        .runtime_page_ranges
+        .iter()
+        .any(|r| (0..r.count).any(|i| r.base + i * (1u64 << 18) >= (1u64 << 32)));
+    println!("RESULT has_page_at_or_above_2^32={above}");
+    assert!(
+        above,
+        "the xR write must have spilled past the 2^32 limb boundary"
+    );
+}

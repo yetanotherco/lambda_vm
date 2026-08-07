@@ -429,9 +429,13 @@ impl Instruction {
                         let addr_xr = registers.read(10)?;
                         let addr_xg = registers.read(11)?;
                         let addr_k = registers.read(12)?;
-                        if !ecsm_addr_ok(addr_xg, 31)
-                            || !ecsm_addr_ok(addr_xr, 31)
-                            || !ecsm_addr_ok(addr_k, 31)
+                        // PoC ONLY (adversarial adjudication): the env var lets a test
+                        // run the reference semantics WITHOUT this guard, to see whether
+                        // the resulting trace still satisfies the AIR.
+                        if std::env::var_os("ECSM_NO_LIMB_GUARD").is_none()
+                            && (!ecsm_addr_ok(addr_xg, 31)
+                                || !ecsm_addr_ok(addr_xr, 31)
+                                || !ecsm_addr_ok(addr_k, 31))
                         {
                             return Err(ExecutionError::EcsmAddressOverflow);
                         }
