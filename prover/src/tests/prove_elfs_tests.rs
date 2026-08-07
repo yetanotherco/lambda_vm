@@ -155,7 +155,9 @@ fn verify_vm_minimal(vm_proof: &VmProof, elf_bytes: &[u8]) -> bool {
         &elf,
         &vm_proof.runtime_page_ranges,
         vm_proof.num_private_input_pages,
-    );
+        usize::MAX,
+    )
+    .expect("honest page layout");
     let airs = VmAirs::new(
         &elf,
         &proof_options,
@@ -1704,7 +1706,8 @@ fn test_prove_elfs_test_commit_4_wrong_pages_rejected() {
     .expect("Prover failed");
 
     // Verifier uses EMPTY runtime pages → missing stack/public-output pages
-    let wrong_configs = Traces::page_configs_from_elf_and_runtime(&elf, &[], 0);
+    let wrong_configs = Traces::page_configs_from_elf_and_runtime(&elf, &[], 0, usize::MAX)
+        .expect("honest page layout");
     let verifier_airs = crate::VmAirs::new(
         &elf,
         &proof_options,
@@ -2461,7 +2464,9 @@ fn test_deep_stack_runtime_pages_roundtrip() {
     )
     .expect("Prover failed");
     // Verifier reconstructs from ELF + runtime_page_ranges hint
-    let verifier_configs = Traces::page_configs_from_elf_and_runtime(&elf, &runtime_page_ranges, 0);
+    let verifier_configs =
+        Traces::page_configs_from_elf_and_runtime(&elf, &runtime_page_ranges, 0, usize::MAX)
+            .expect("honest page layout");
     let verifier_airs = crate::VmAirs::new(
         &elf,
         &proof_options,
@@ -2536,7 +2541,8 @@ fn test_deep_stack_missing_pages_rejected() {
     )
     .expect("Prover failed");
     // Verifier uses EMPTY runtime_page_ranges → missing stack/heap pages
-    let wrong_configs = Traces::page_configs_from_elf_and_runtime(&elf, &[], 0);
+    let wrong_configs = Traces::page_configs_from_elf_and_runtime(&elf, &[], 0, usize::MAX)
+        .expect("honest page layout");
     let verifier_airs = crate::VmAirs::new(
         &elf,
         &proof_options,
@@ -2646,7 +2652,9 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
     )
     .expect("Prover failed");
     // Verifier reconstructs from ELF + runtime hint (ranges decoded to pages)
-    let verifier_configs = Traces::page_configs_from_elf_and_runtime(&elf, &runtime_page_ranges, 0);
+    let verifier_configs =
+        Traces::page_configs_from_elf_and_runtime(&elf, &runtime_page_ranges, 0, usize::MAX)
+            .expect("honest page layout");
     let verifier_airs = crate::VmAirs::new(
         &elf,
         &proof_options,
