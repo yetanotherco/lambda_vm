@@ -188,6 +188,11 @@ pub struct CpuOperation {
 
     /// Whether this ECALL is an ECSM (elliptic-curve scalar multiply) syscall
     pub ecall_ecsm: bool,
+
+    /// Whether this ECALL is a non-constraining Hint syscall. The hint operand
+    /// addresses (x10/x11/x12) are recovered from the register state in the trace
+    /// builder, exactly like ECSM.
+    pub ecall_hint: bool,
 }
 
 impl CpuOperation {
@@ -235,6 +240,8 @@ impl CpuOperation {
         // in the trace builder.
         let ecall_ecsm =
             f.ecall && log.src1_val == executor::vm::instruction::execution::ECSM_SYSCALL_NUMBER;
+        let ecall_hint =
+            f.ecall && log.src1_val == executor::vm::instruction::execution::HINT_SYSCALL_NUMBER;
 
         // Word instructions are fully handled by CPU32; the main CPU row is a
         // delegate that only advances the PC and sends the CPU32 lookup. We still
@@ -353,6 +360,7 @@ impl CpuOperation {
             ecall_keccak,
             keccak_state_addr,
             ecall_ecsm,
+            ecall_hint,
         }
     }
 
