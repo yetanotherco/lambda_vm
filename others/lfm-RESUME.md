@@ -205,11 +205,11 @@ range check).
 
 Wave 4 (assembly) RAN 2026-08-03 on `feat/lfm-assembly` (3 commits off
 35845e4c). Suite 195 green (188 + 7), `make lint` exit 0. See item 5 above for what
-landed. ⚠ `lfm-team-lead-start-index-research.md` is not a document — it is
-a raw 518 KB JSONL session transcript that was committed under a `.md`
-name. Its research is real and correct (extracted and acted on), but a
-reader must pull the last assistant message out of the JSONL; the
-findings are summarised in ledger entry 2 so nobody has to.
+landed. `lfm-team-lead-start-index-research.md` was originally committed as
+a raw 518 KB JSONL session transcript under a `.md` name; the team lead
+replaced it (post-wave-4) with the research agent's final report extracted
+verbatim from that transcript. The raw session survives in git history at
+e105dea2 if ever needed; findings are also summarised in ledger entry 2.
 
 Ready to start next (wave 5):
 - **Assembly, part 2 — hang the legs off the spine.** The seam already
