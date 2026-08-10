@@ -31,11 +31,12 @@ pad = 0
 name = "out"
 type = "U256BL"
 desc = """\
-       the hinted value. *Unconstrained*: no constraint in this chip relates `out` to the value \\
-       stored at `addr_in`. Note the limb order is the reverse of the `U256BL` convention used \\
-       elsewhere: `out[0]` is written to the *lowest* address, and the buffer is big-endian, so \\
-       `out[0]` is the *most* significant byte. As a number this variable is therefore the \\
-       byte-reversal of the hint; it is never read as one.\
+       the hinted value. *Unconstrained*: no constraint in this chip relates `out` to the value \
+       stored at `addr_in`. \\
+       Note the limb order is the reverse of the `U256BL` convention used elsewhere: `out[0]` is \
+       written to the *lowest* address, and the buffer is big-endian, so `out[0]` is the *most* \
+       significant byte. As a number this variable is therefore the byte-reversal of the hint; \
+       it is never read as a number.\
        """
 pad = 0
 
