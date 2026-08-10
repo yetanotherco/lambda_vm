@@ -12,7 +12,7 @@ use super::builder::{LfmBuilder, LfmProgramSource};
 use super::compiler::{LfmProgram, compile};
 use super::executor::{LfmExecError, LfmExecution, execute};
 use super::hash::{LfmHasher, TestPermutation};
-use super::instr::{Addr, Instr};
+use super::instr::{Addr, HashMode, Instr};
 use super::layout;
 use super::validator::{LfmViolation, validate};
 use super::word::{LfmWord, base_word};
@@ -425,6 +425,121 @@ fn validator_rejects_dirty_padding() {
             row
         }
     );
+}
+
+/// Check 9 at the level it operates: a multiplicity column of the COMMITTED
+/// group, with the instruction list left honest.
+///
+/// `p − 1` is what `−1` looks like as a canonical field element, and a
+/// negative send is the one stray multiplicity the LogUp count argument cannot
+/// catch: it cancels an honest write instead of adding an unmatched token.
+#[test]
+fn validator_rejects_negative_multiplicity() {
+    let mut program = small_valid_program();
+    // Honest-path control: the program is otherwise admissible, so the
+    // rejection below is about the multiplicity and nothing else.
+    validate(&program).expect("the untampered program must pass admission");
+
+    program
+        .groups
+        .const_
+        .set(0, layout::const_::MULT, fe(GOLDILOCKS_P - 1));
+    assert!(
+        matches!(
+            validate(&program).unwrap_err(),
+            LfmViolation::MultOutOfRange {
+                chip: "LFM_CONST",
+                row: 0,
+                col: layout::const_::MULT,
+                ..
+            }
+        ),
+        "a field-negative multiplicity must fail admission"
+    );
+}
+
+/// The bound is a bound, not merely a sign test: a multiplicity far above any
+/// read count the program can emit is rejected even though it is positive.
+#[test]
+fn validator_rejects_oversized_multiplicity() {
+    let mut program = small_valid_program();
+    validate(&program).expect("the untampered program must pass admission");
+
+    program.groups.balu.set(0, layout::balu::MULT, fe(1 << 40));
+    assert!(matches!(
+        validate(&program).unwrap_err(),
+        LfmViolation::MultOutOfRange {
+            chip: "LFM_BALU",
+            row: 0,
+            ..
+        }
+    ));
+}
+
+/// The forgery this pair of checks exists for: a `Compress` row whose two
+/// *spare* output slots carry a `−1` / `+1` pair aimed at one address.
+///
+/// `Instr::writes()` hides those slots for `Compress`, so checks 1 and 4 never
+/// look at them — yet `emit_column_groups` copies them into the committed
+/// group and `chips::hash` sends all three slots gated only by their own
+/// `MULT`, with no mode factor. The negative send cancels the victim cell's
+/// honest write and the positive one re-supplies it with the row's own
+/// permutation output, so the token count is preserved exactly and the reader
+/// observes a word nobody committed. This was executed end to end against the
+/// real prover and verifier, and accepted, before these checks existed.
+#[test]
+fn validator_rejects_compress_ghost_slot_forgery() {
+    let konst = |out: u64, v: u64| Instr::Const {
+        out: Addr(out),
+        value: [fe(v), FE::zero(), FE::zero(), FE::zero()],
+        mult: 0,
+    };
+    let source = LfmProgramSource {
+        instrs: vec![
+            konst(0, 1),
+            konst(1, 2),
+            konst(2, 3), // the victim: a program constant the ghost pair replaces
+            Instr::Hash {
+                mode: HashMode::Compress,
+                ins: [Addr(0), Addr(1), Addr(0)],
+                outs: [Addr(3), Addr(2), Addr(2)],
+                mults: [0, GOLDILOCKS_P - 1, 1],
+            },
+            Instr::Public {
+                addr: Addr(2),
+                index: 0,
+            },
+        ],
+        num_addrs: 4,
+        read_counts: HashMap::from([(Addr(0), 1), (Addr(1), 1), (Addr(2), 1)]),
+        arena_schema: Default::default(),
+        public_len: 1,
+    };
+    let mut program = compile(source);
+
+    // Leg 1: the point check on `instr.rs`'s placeholder convention.
+    assert_eq!(
+        validate(&program).unwrap_err(),
+        LfmViolation::CompressSlotNotPlaceholder { instr: 3 }
+    );
+
+    // Leg 2: and check 9 denies it on its own. Repair the INSTRUCTION list —
+    // the object checks 1–4 read — and leave the COMMITTED group hostile,
+    // which is precisely the divergence that made the forgery admissible.
+    let Instr::Hash { outs, mults, .. } = &mut program.instrs[3] else {
+        panic!("instruction 3 is the hash row");
+    };
+    *outs = [Addr(3), Addr(0), Addr(0)];
+    *mults = [0, 0, 0];
+    assert!(matches!(
+        validate(&program).unwrap_err(),
+        LfmViolation::MultOutOfRange {
+            chip: "LFM_HASH",
+            row: 0,
+            col: layout::hash::MULT1,
+            ..
+        }
+    ));
 }
 
 #[test]

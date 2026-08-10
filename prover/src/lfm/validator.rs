@@ -4,8 +4,16 @@
 //! AIR checks per-op algebra and bus balance; the *registrar* vouches for the
 //! structural well-formedness below, and this validator is what makes that
 //! vouching real (the reference machine checks less, and only in dev builds).
-//! Together: uniqueness + acyclicity + balance ⇒ every read observes the
-//! unique written value.
+//! Together: uniqueness + acyclicity + bounded multiplicities + balance ⇒
+//! every read observes the unique written value.
+//!
+//! "Bounded multiplicities" is load-bearing and easy to lose: balance is a
+//! *field* identity, so a send gated by `p − 1` subtracts a token, and a
+//! subtract-then-re-add pair over one address keeps the count while changing
+//! the value. Every check below that reads `program.instrs` is therefore
+//! backed by one that reads the committed `program.groups` directly — the
+//! groups are what the AIR sees, and the two are joined by nothing but the
+//! emitter.
 //!
 //! The compiler's invariant panics are tripwires; this validator is the gate;
 //! the registry is the record. There is no off-switch, and there must never
@@ -17,7 +25,7 @@ use math::field::traits::IsPrimeField;
 
 use crate::tables::types::{FE, GoldilocksField};
 
-use super::compiler::{ColumnGroup, LfmProgram};
+use super::compiler::{ColumnGroup, LfmColumnGroups, LfmProgram};
 use super::instr::{Addr, HashMode, Instr};
 use super::layout;
 
@@ -37,6 +45,16 @@ pub enum LfmViolation {
         expected: u64,
         found: u64,
     },
+    /// Check 4 — a `Compress` row whose spare output slots are not the
+    /// documented placeholders.
+    ///
+    /// `Instr::writes()` reports only `outs[0]` for `Compress` (`instr.rs`),
+    /// so checks 1 and 4 never see slots 1–2 — but `emit_column_groups` copies
+    /// them into the committed group unconditionally and `chips::hash` sends
+    /// all three slots. `instr.rs`'s field conventions call them "`Addr(0)`
+    /// placeholders with `mults` fixed to 0"; this is what makes that a rule
+    /// rather than a comment.
+    CompressSlotNotPlaceholder { instr: usize },
     /// Check 5 — opcode selectors not one-hot / flags not boolean on a real row.
     NonOneHotSelector { chip: &'static str, row: usize },
     /// Check 6 — nonzero data beyond the program length.
@@ -55,6 +73,24 @@ pub enum LfmViolation {
     /// Check 8 — a tag half at or above `2^32`, so it cannot equal the
     /// `DWordWL` timestamp any `KECCAK_RND` row carries.
     MalformedKeccakTag { row: usize },
+    /// Check 9 — a multiplicity column outside the legal range.
+    ///
+    /// A multiplicity is a static read count: a small non-negative integer.
+    /// The field is not ordered, so nothing about `Multiplicity::Column` stops
+    /// a preprocessed mult from holding `p − 1`, which the bus reads as `−1` —
+    /// a **negative** send. That is the one shape the LogUp count argument
+    /// cannot see: a negative ghost send cancels an honest write and a
+    /// positive one replaces it at the same address, leaving the token count
+    /// exactly balanced while the cell's value is prover-chosen. Surplus
+    /// *positive* sends are already denied by the count (they have no matching
+    /// receive); this check is what denies the negative half.
+    MultOutOfRange {
+        chip: &'static str,
+        row: usize,
+        col: usize,
+        mult: u64,
+        bound: u64,
+    },
     /// Cross-check — group shape does not match the instruction partition.
     GroupShapeMismatch { chip: &'static str },
 }
@@ -143,7 +179,7 @@ fn check_multiplicities(program: &LfmProgram) -> Result<(), LfmViolation> {
         }
         Ok(())
     };
-    for instr in &program.instrs {
+    for (idx, instr) in program.instrs.iter().enumerate() {
         match instr {
             Instr::Const { out, mult, .. }
             | Instr::BaseAlu { out, mult, .. }
@@ -179,6 +215,17 @@ fn check_multiplicities(program: &LfmProgram) -> Result<(), LfmViolation> {
                 };
                 for i in 0..num_outs {
                     check(outs[i], mults[i])?;
+                }
+                // A `Compress` row's spare slots are outside `writes()` and so
+                // outside checks 1 and 4 — but they are inside the committed
+                // group and inside the bus. Pin them to the placeholders
+                // `instr.rs` documents, so "slot 0 only" is a checked property
+                // of the program and not a convention the emitter happens to
+                // follow.
+                if *mode == HashMode::Compress
+                    && (mults[1] != 0 || mults[2] != 0 || outs[1] != Addr(0) || outs[2] != Addr(0))
+                {
+                    return Err(LfmViolation::CompressSlotNotPlaceholder { instr: idx });
                 }
             }
             Instr::KeccakF(k) => {
@@ -280,6 +327,129 @@ fn check_groups(program: &LfmProgram) -> Result<(), LfmViolation> {
             for col in 0..group.width {
                 if *group.at(row, col) != FE::zero() {
                     return Err(LfmViolation::DirtyPadding { chip, row });
+                }
+            }
+        }
+    }
+
+    check_mult_ranges(g)?;
+    Ok(())
+}
+
+/// The hard ceiling on any multiplicity, independent of the per-chip
+/// accounting below and of how that accounting might drift: `2^32`, the same
+/// canonical-range shape check 8 uses on the keccak tags. Under it no
+/// multiplicity can reach the half of the field the bus reads as negative, and
+/// no sum of them over a program of any buildable size can wrap the modulus —
+/// which is what the LogUp argument needs in order to mean what it says.
+const MULT_HARD_CAP: u64 = 1 << 32;
+
+/// The largest value a multiplicity may legally take.
+///
+/// A multiplicity is the number of times its cell is read, so it cannot exceed
+/// the number of reads the *whole program* emits — which is bounded by the
+/// committed row counts times the per-chip count of `LfmMem` receivers. Those
+/// counts mirror `chips::*::bus_interactions`; over-counting only widens an
+/// upper bound (safe), under-counting would reject honest programs, so where
+/// two receivers are mutually exclusive the count rounds up.
+fn mult_bound(g: &LfmColumnGroups) -> u64 {
+    let receives_per_row: [(&ColumnGroup, u64); 10] = [
+        (&g.const_, 0), // reads nothing
+        (&g.balu, 3),   // A, B, C
+        (&g.xalu, 3),   // A, B, C
+        (&g.select, 3), // BIT, IN_L, IN_R
+        (&g.bitdec, 1), // IN
+        (&g.hash, 3),   // IN0, IN1, IN2
+        (
+            &g.keccak,
+            (layout::keccak::NUM_WORDS + layout::keccak::BLOCK_WORDS) as u64,
+        ), // state + rate block
+        (&g.lanes, 5),  // the word (Unpack) or the four lanes (Pack)
+        (&g.hint, 0),   // reads nothing
+        (&g.public, 1), // the published cell
+    ];
+    let reads = receives_per_row.iter().fold(0u64, |acc, (group, per_row)| {
+        acc.saturating_add((group.real_rows as u64).saturating_mul(*per_row))
+    });
+    reads.min(MULT_HARD_CAP - 1)
+}
+
+/// Every preprocessed column that gates an `LfmMem` **send** — i.e. every
+/// write multiplicity — per chip, mirroring `chips::*::bus_interactions`.
+///
+/// `LFM_PUBLIC` contributes none: it only receives, gated by `IS_REAL`, which
+/// check 5 pins to 1. Every other receive gate is likewise a selector already
+/// pinned to `{0,1}` on real rows by check 5 and to 0 on padding rows by
+/// check 6 — the send gates listed here are the only unbounded ones.
+fn mult_columns(g: &LfmColumnGroups) -> Vec<(&'static str, &ColumnGroup, Vec<usize>)> {
+    use layout::{balu, bitdec, const_, hash, hint, keccak, lanes, select, xalu};
+    vec![
+        ("LFM_CONST", &g.const_, vec![const_::MULT]),
+        ("LFM_BALU", &g.balu, vec![balu::MULT]),
+        ("LFM_XALU", &g.xalu, vec![xalu::MULT]),
+        (
+            "LFM_SELECT",
+            &g.select,
+            vec![select::MULT_L, select::MULT_R],
+        ),
+        (
+            "LFM_BITDEC",
+            &g.bitdec,
+            (0..bitdec::NUM_BITS).map(bitdec::bit_mult).collect(),
+        ),
+        (
+            "LFM_HASH",
+            &g.hash,
+            vec![hash::MULT0, hash::MULT1, hash::MULT2],
+        ),
+        (
+            "LFM_KECCAK",
+            &g.keccak,
+            (0..keccak::NUM_WORDS)
+                .map(keccak::mult)
+                .chain((0..keccak::DIGEST_WORDS).map(keccak::rev_mult))
+                .collect(),
+        ),
+        (
+            "LFM_LANES",
+            &g.lanes,
+            (0..4)
+                .map(|i| lanes::LANE_MULT0 + i)
+                .chain([lanes::WORD_MULT])
+                .collect(),
+        ),
+        ("LFM_HINT", &g.hint, vec![hint::MULT]),
+    ]
+}
+
+/// Check 9: every multiplicity column of every group holds a canonically
+/// small non-negative integer.
+///
+/// This is the one check on this list that is deliberately
+/// **instrs-independent**. Checks 1–4 reach the committed columns only through
+/// `program.instrs`, so any slot the `Instr` accessors do not expose is
+/// invisible to them while still being emitted onto the bus, and the two
+/// objects are joined by nothing but the emitter. Reading the committed
+/// columns directly is what makes this hold whatever the instruction list
+/// claims — and a field-negative multiplicity, the shape the LogUp count
+/// argument cannot see (see [`LfmViolation::MultOutOfRange`]), is a canonical
+/// value near `p` and dies here.
+///
+/// Padding rows are skipped: check 6 already pins them to all-zero.
+fn check_mult_ranges(g: &LfmColumnGroups) -> Result<(), LfmViolation> {
+    let bound = mult_bound(g);
+    for (chip, group, cols) in mult_columns(g) {
+        for row in 0..group.real_rows {
+            for &col in &cols {
+                let mult = GoldilocksField::canonical(group.at(row, col).value());
+                if mult > bound {
+                    return Err(LfmViolation::MultOutOfRange {
+                        chip,
+                        row,
+                        col,
+                        mult,
+                        bound,
+                    });
                 }
             }
         }

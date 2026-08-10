@@ -4296,3 +4296,55 @@ fn the_derivation_extends_a_non_u32_register_value_demonstrating_hazard() {
          test documents nothing"
     );
 }
+
+/// The honest-path control for the admission gate as a whole: every kind in
+/// `LFM_REGISTRY` still passes, together, in one place.
+///
+/// Each program has its own `*_is_admissible` test; this one exists because a
+/// rejection rule is worth having only if it rejects nothing that ships, and
+/// the cheapest way for a new check to be wrong is to be right about the one
+/// program its author had in mind. It also fails loudly when a seventh kind is
+/// registered without being run past the registrar here.
+#[test]
+fn every_registered_program_passes_admission() {
+    let programs: [(&str, LfmProgram); 6] = [
+        ("TrivialV0", trivial_program()),
+        ("FriToyV0", fri_toy_program()),
+        ("KeccakChainV0", keccak_chain_program()),
+        ("KeccakSpongeV0", keccak_sponge_program(KECCAK_SPONGE_LEN)),
+        ("TranscriptReplayV0", transcript_replay_program()),
+        ("StatementReplayV0", statement_replay_program()),
+    ];
+    for (name, program) in &programs {
+        validate(program)
+            .unwrap_or_else(|e| panic!("registered program {name} must pass admission: {e:?}"));
+    }
+}
+
+/// Check 9 against a *registered* program's committed group — the object the
+/// AIR actually reads. The instruction list stays untouched, so checks 1–4 see
+/// a pristine program and nothing but check 9 stands between this group and
+/// the registry.
+#[test]
+fn negative_hash_multiplicity_in_a_registered_group_fails_admission() {
+    let mut program = trivial_program();
+    validate(&program).expect("honest control: the registered program is admissible");
+
+    let negative_one = FE::from(P - 1); // p − 1, i.e. −1 on the bus
+    program
+        .groups
+        .hash
+        .set(0, super::layout::hash::MULT1, negative_one);
+    assert!(
+        matches!(
+            validate(&program).unwrap_err(),
+            LfmViolation::MultOutOfRange {
+                chip: "LFM_HASH",
+                row: 0,
+                col,
+                ..
+            } if col == super::layout::hash::MULT1
+        ),
+        "a negative multiplicity in the committed group must fail admission"
+    );
+}
