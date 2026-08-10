@@ -602,27 +602,14 @@ fn host_cores() -> usize {
 ///
 /// # Why the `cuda` arm has no core term
 ///
-/// Measured over 881 runs on two RTX 5090 boxes
-/// (`scripts/profiling/table-parallelism-sweep/`). All eight core-count curves
-/// fit `T(k) = S + max(Tmax, W/k)` within run-to-run noise, and the divisible
-/// work `W ≈ 5.3–8.0 s` is invariant to host core count over an 8× range, to CPU
-/// model, and to rayon pool width: cutting `RAYON_NUM_THREADS` 32 → 4 moves `W`
-/// by ~0 and merely doubles `S` (the serial continuation producer), with the
-/// best `k` still `num_airs` at every pool width. `available_parallelism()`
-/// sizes precisely that rayon pool, so it is the wrong quantity to scale `k`
-/// by — `k` is not a thread count, it is a count of concurrent drivers whose
-/// per-table work all runs on the one global pool. Worst-case cost against the
-/// best measured `k`, over four core counts on both boxes: `cores/3` +30.2 %,
-/// `cores*2/3` +13.0 %, constant 12 +7.0 %, `num_airs` +1.6 % (both of the
-/// latter's non-zero cells inside noise, p = 0.88 / 0.80).
-///
-/// Taking the ceiling rather than computing an optimum is right in both
-/// regimes of the fit: if `W/num_airs > Tmax` more `k` strictly helps, and if
-/// `W/num_airs < Tmax` the extra drivers are floor-limited and cost nothing —
-/// measured, the one staging slab is held 56 % of wall at `k = 31` and wall
-/// time still improves. What is meant to bound concurrency here is memory
-/// admission rather than a count; that is `VramGate`'s job, and it never binds
-/// at the default budget.
+/// Measured over 881 runs on two RTX 5090 boxes (sweep record linked from
+/// PR #911): the work `k` divides is device- and workload-bound — invariant to
+/// host core count over an 8× range — so `available_parallelism()` is the
+/// wrong quantity to scale `k` by. `k` is not a thread count; it counts
+/// concurrent drivers whose per-table work all runs on the one global rayon
+/// pool. Worst case against the best measured `k`: `num_airs` +1.6 % (inside
+/// noise), the old `cores*2/3` +13.0 %. Bounding concurrency is memory
+/// admission's job (`VramGate`), not this count's.
 pub fn table_parallelism(num_airs: usize) -> usize {
     #[cfg(feature = "parallel")]
     {
