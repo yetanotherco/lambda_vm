@@ -207,6 +207,10 @@ pub mod cols {
 // Operation struct
 // =========================================================================
 
+/// Trace rows one [`KeccakRoundOperation`] expands into, one per keccak round.
+/// Chunking splits on whole operations, so a chunk limit in rows divides by this.
+pub const ROUNDS_PER_OP: usize = 24;
+
 /// One keccak permutation call's worth of data (produces 24 rows).
 #[derive(Debug, Clone)]
 pub struct KeccakRoundOperation {
@@ -246,7 +250,7 @@ fn hwsl(halfword: u16, shift: u8) -> (u16, u16) {
 pub fn generate_keccak_rnd_trace(
     ops: &[KeccakRoundOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    let n_rows = (ops.len() * 24).next_power_of_two().max(4);
+    let n_rows = (ops.len() * ROUNDS_PER_OP).next_power_of_two().max(4);
     let mut trace = TraceTable::new_main(
         crate::tables::types::zeroed_fe_vec(n_rows * cols::NUM_COLUMNS),
         cols::NUM_COLUMNS,

@@ -81,9 +81,9 @@ pub struct RuntimePageRange {
 }
 
 /// Number of tables that always contribute exactly one sub-proof, regardless
-/// of `TableCounts`: bitwise, decode, halt, commit, keccak, keccak_rnd,
-/// keccak_rc, register, ecsm, ecdas, hint.
-pub const FIXED_TABLE_COUNT: usize = 11;
+/// of `TableCounts`: bitwise, decode, halt, keccak_rc, register. Every other
+/// table's height grows with the execution, so it is chunked and counted.
+pub const FIXED_TABLE_COUNT: usize = 5;
 
 /// Number of chunks for each split table.
 /// The verifier needs this to reconstruct matching AIRs.
@@ -104,6 +104,13 @@ pub struct TableCounts {
     pub bytewise: usize,
     pub store: usize,
     pub cpu32: usize,
+    // Accelerator chips
+    pub keccak: usize,
+    pub keccak_rnd: usize,
+    pub ecsm: usize,
+    pub ecdas: usize,
+    pub hint: usize,
+    pub commit: usize,
 }
 
 impl TableCounts {
@@ -123,6 +130,12 @@ impl TableCounts {
             + self.bytewise
             + self.store
             + self.cpu32
+            + self.keccak
+            + self.keccak_rnd
+            + self.ecsm
+            + self.ecdas
+            + self.hint
+            + self.commit
     }
 
     /// Validate that all required tables have at least one chunk.
@@ -145,6 +158,12 @@ impl TableCounts {
             ("bytewise", self.bytewise),
             ("store", self.store),
             ("cpu32", self.cpu32),
+            ("keccak", self.keccak),
+            ("keccak_rnd", self.keccak_rnd),
+            ("ecsm", self.ecsm),
+            ("ecdas", self.ecdas),
+            ("hint", self.hint),
+            ("commit", self.commit),
         ];
         for (name, count) in checks {
             if count == 0 {
@@ -516,13 +535,13 @@ pub(crate) struct VmAirs {
     pub dvrms: Vec<VmAir>,
     pub branches: Vec<VmAir>,
     pub halt: VmAir,
-    pub commit: VmAir,
-    pub keccak: VmAir,
-    pub keccak_rnd: VmAir,
+    pub commits: Vec<VmAir>,
+    pub keccaks: Vec<VmAir>,
+    pub keccak_rnds: Vec<VmAir>,
     pub keccak_rc: VmAir,
-    pub ecsm: VmAir,
-    pub ecdas: VmAir,
-    pub hint: VmAir,
+    pub ecsms: Vec<VmAir>,
+    pub ecdases: Vec<VmAir>,
+    pub hints: Vec<VmAir>,
     pub register: VmAir,
     pub pages: Vec<VmAir>,
     pub memw_registers: Vec<VmAir>,
@@ -542,17 +561,29 @@ impl VmAirs {
         let mut pairs: Vec<AirTracePair<'a>> = vec![
             (self.bitwise.as_ref(), &mut traces.bitwise, &()),
             (self.decode.as_ref(), &mut traces.decode, &()),
-            (self.commit.as_ref(), &mut traces.commit, &()),
-            (self.keccak.as_ref(), &mut traces.keccak, &()),
-            (self.keccak_rnd.as_ref(), &mut traces.keccak_rnd, &()),
             (self.keccak_rc.as_ref(), &mut traces.keccak_rc, &()),
-            (self.ecsm.as_ref(), &mut traces.ecsm, &()),
-            (self.ecdas.as_ref(), &mut traces.ecdas, &()),
-            (self.hint.as_ref(), &mut traces.hint, &()),
             (self.register.as_ref(), &mut traces.register, &()),
         ];
         if self.include_halt {
             pairs.push((self.halt.as_ref(), &mut traces.halt, &()));
+        }
+        for (air, trace) in self.commits.iter().zip(traces.commits.iter_mut()) {
+            pairs.push((air.as_ref(), trace, &()));
+        }
+        for (air, trace) in self.keccaks.iter().zip(traces.keccaks.iter_mut()) {
+            pairs.push((air.as_ref(), trace, &()));
+        }
+        for (air, trace) in self.keccak_rnds.iter().zip(traces.keccak_rnds.iter_mut()) {
+            pairs.push((air.as_ref(), trace, &()));
+        }
+        for (air, trace) in self.ecsms.iter().zip(traces.ecsms.iter_mut()) {
+            pairs.push((air.as_ref(), trace, &()));
+        }
+        for (air, trace) in self.ecdases.iter().zip(traces.ecdases.iter_mut()) {
+            pairs.push((air.as_ref(), trace, &()));
+        }
+        for (air, trace) in self.hints.iter().zip(traces.hints.iter_mut()) {
+            pairs.push((air.as_ref(), trace, &()));
         }
 
         for (air, trace) in self.cpus.iter().zip(traces.cpus.iter_mut()) {
@@ -617,17 +648,29 @@ impl VmAirs {
         let mut refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = vec![
             self.bitwise.as_ref(),
             self.decode.as_ref(),
-            self.commit.as_ref(),
-            self.keccak.as_ref(),
-            self.keccak_rnd.as_ref(),
             self.keccak_rc.as_ref(),
-            self.ecsm.as_ref(),
-            self.ecdas.as_ref(),
-            self.hint.as_ref(),
             self.register.as_ref(),
         ];
         if self.include_halt {
             refs.push(self.halt.as_ref());
+        }
+        for air in &self.commits {
+            refs.push(air.as_ref());
+        }
+        for air in &self.keccaks {
+            refs.push(air.as_ref());
+        }
+        for air in &self.keccak_rnds {
+            refs.push(air.as_ref());
+        }
+        for air in &self.ecsms {
+            refs.push(air.as_ref());
+        }
+        for air in &self.ecdases {
+            refs.push(air.as_ref());
+        }
+        for air in &self.hints {
+            refs.push(air.as_ref());
         }
 
         for air in &self.cpus {
@@ -786,16 +829,45 @@ impl VmAirs {
             })
             .collect();
         let halt: VmAir = Box::new(create_halt_air(proof_options));
-        let commit: VmAir = Box::new(create_commit_air(proof_options));
-        let keccak: VmAir = Box::new(create_keccak_air(proof_options));
-        let keccak_rnd: VmAir = Box::new(create_keccak_rnd_air(proof_options));
+        let commits: Vec<_> = (0..table_counts.commit)
+            .map(|i| {
+                Box::new(create_commit_air(proof_options).with_name(&format!("COMMIT[{}]", i)))
+                    as VmAir
+            })
+            .collect();
+        let keccaks: Vec<_> = (0..table_counts.keccak)
+            .map(|i| {
+                Box::new(create_keccak_air(proof_options).with_name(&format!("KECCAK[{}]", i)))
+                    as VmAir
+            })
+            .collect();
+        let keccak_rnds: Vec<_> = (0..table_counts.keccak_rnd)
+            .map(|i| {
+                Box::new(
+                    create_keccak_rnd_air(proof_options).with_name(&format!("KECCAK_RND[{}]", i)),
+                ) as VmAir
+            })
+            .collect();
         let keccak_rc: VmAir = Box::new(create_keccak_rc_air(proof_options).with_preprocessed(
             tables::keccak_rc::preprocessed_commitment(proof_options),
             tables::keccak_rc::NUM_PRECOMPUTED_COLS,
         ));
-        let ecsm: VmAir = Box::new(create_ecsm_air(proof_options));
-        let ecdas: VmAir = Box::new(create_ecdas_air(proof_options));
-        let hint: VmAir = Box::new(create_hint_air(proof_options));
+        let ecsms: Vec<_> = (0..table_counts.ecsm)
+            .map(|i| {
+                Box::new(create_ecsm_air(proof_options).with_name(&format!("ECSM[{}]", i))) as VmAir
+            })
+            .collect();
+        let ecdases: Vec<_> = (0..table_counts.ecdas)
+            .map(|i| {
+                Box::new(create_ecdas_air(proof_options).with_name(&format!("ECDAS[{}]", i)))
+                    as VmAir
+            })
+            .collect();
+        let hints: Vec<_> = (0..table_counts.hint)
+            .map(|i| {
+                Box::new(create_hint_air(proof_options).with_name(&format!("HINT[{}]", i))) as VmAir
+            })
+            .collect();
         let register: VmAir =
             if let Some((commitment, num_preprocessed_cols)) = register_preprocessed {
                 Box::new(
@@ -910,13 +982,13 @@ impl VmAirs {
             dvrms,
             branches,
             halt,
-            commit,
-            keccak,
-            keccak_rnd,
+            commits,
+            keccaks,
+            keccak_rnds,
             keccak_rc,
-            ecsm,
-            ecdas,
-            hint,
+            ecsms,
+            ecdases,
+            hints,
             register,
             pages,
             memw_registers,

@@ -1327,9 +1327,9 @@ fn test_prove_hint_min_inconsistent_output_rejected() {
         Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
 
     // Forge the low byte of the output on the (single) real HINT row.
-    let orig = *traces.hint.main_table.get(0, hint_cols::out(0));
+    let orig = *traces.hints[0].main_table.get(0, hint_cols::out(0));
     let forged = orig + FieldElement::<GoldilocksField>::one();
-    traces.hint.main_table.set(0, hint_cols::out(0), forged);
+    traces.hints[0].main_table.set(0, hint_cols::out(0), forged);
 
     assert!(
         !prove_and_verify_vm_minimal(&elf, &mut traces),
@@ -1367,7 +1367,7 @@ fn hint_min_traces() -> (Elf, Traces) {
 fn test_prove_hint_min_forged_selector_rejected() {
     use crate::tables::hint::cols as hint_cols;
     let (elf, mut traces) = hint_min_traces();
-    traces.hint.main_table.set(
+    traces.hints[0].main_table.set(
         0,
         hint_cols::SEL_0,
         FieldElement::<GoldilocksField>::from(3u64),
@@ -1386,7 +1386,7 @@ fn test_prove_hint_min_forged_selector_rejected() {
 fn test_prove_hint_min_forged_input_address_rejected() {
     use crate::tables::hint::cols as hint_cols;
     let (elf, mut traces) = hint_min_traces();
-    traces.hint.main_table.set(
+    traces.hints[0].main_table.set(
         0,
         hint_cols::ADDR_IN_0,
         FieldElement::<GoldilocksField>::from(0xFFFF_FFFFu64),
@@ -1562,9 +1562,9 @@ fn test_prove_elfs_ecsm_forged_result_rejected() {
         Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
 
     // Forge the low byte of xR on the (single) real ECSM row.
-    let orig = *traces.ecsm.main_table.get(0, ecsm_cols::xr(0));
+    let orig = *traces.ecsms[0].main_table.get(0, ecsm_cols::xr(0));
     let forged = orig + FieldElement::<GoldilocksField>::one();
-    traces.ecsm.main_table.set(0, ecsm_cols::xr(0), forged);
+    traces.ecsms[0].main_table.set(0, ecsm_cols::xr(0), forged);
 
     assert!(
         !prove_and_verify_vm_minimal(&elf, &mut traces),
@@ -1590,7 +1590,7 @@ fn test_prove_elfs_ecsm_forged_ecdas_mu_rejected() {
         Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
 
     // Row 0 is a real ECDAS step (µ=1); forge µ to a non-boolean value.
-    traces.ecdas.main_table.set(
+    traces.ecdases[0].main_table.set(
         0,
         ecdas_cols::MU,
         FieldElement::<GoldilocksField>::from(2u64),
@@ -1629,7 +1629,7 @@ fn test_prove_elfs_keccak_unaligned_state_addr() {
     // value outside [0, 256). The new ARE_BYTES bus sender will emit this
     // value with multiplicity MU=1; the ARE_BYTES preprocessed table only
     // contains 0..256, so the bus cannot balance.
-    traces.keccak.main_table.set(
+    traces.keccaks[0].main_table.set(
         0,
         keccak_cols::addr(1),
         FieldElement::<GoldilocksField>::from(257u64),
@@ -2750,6 +2750,12 @@ fn test_verify_rejects_zero_table_counts() {
             bytewise: 0,
             store: 0,
             cpu32: 0,
+            keccak: 0,
+            keccak_rnd: 0,
+            ecsm: 0,
+            ecdas: 0,
+            hint: 0,
+            commit: 0,
         },
         ..vm_proof
     };
@@ -2825,6 +2831,12 @@ fn test_crafted_zero_count_proof_must_not_verify() {
         bytewise: 0,
         store: 0,
         cpu32: 0,
+        keccak: 0,
+        keccak_rnd: 0,
+        ecsm: 0,
+        ecdas: 0,
+        hint: 0,
+        commit: 0,
     };
     let airs = VmAirs::new(
         &elf,

@@ -47,8 +47,29 @@ fn assert_count_table_lengths_matches(elf: &Elf, logs: &[Log]) {
         "shift"
     );
     assert_eq!(
-        predicted.commit_padded_rows, traces.commit.main_table.height as u64,
+        predicted.commit_padded_rows,
+        sum_heights(&traces.commits),
         "commit"
+    );
+    assert_eq!(
+        predicted.keccak_padded_rows,
+        sum_heights(&traces.keccaks),
+        "keccak"
+    );
+    assert_eq!(
+        predicted.keccak_rnd_padded_rows,
+        sum_heights(&traces.keccak_rnds),
+        "keccak_rnd"
+    );
+    assert_eq!(
+        predicted.ecsm_padded_rows,
+        sum_heights(&traces.ecsms),
+        "ecsm"
+    );
+    assert_eq!(
+        predicted.hint_padded_rows,
+        sum_heights(&traces.hints),
+        "hint"
     );
     assert_eq!(
         predicted.decode_rows, traces.decode.main_table.height as u64,
@@ -79,6 +100,13 @@ fn assert_count_table_lengths_matches(elf: &Elf, logs: &[Log]) {
         "branch: predicted={} actual={}",
         predicted.branch_padded_rows,
         sum_heights(&traces.branches)
+    );
+    // ECDAS rows depend on the scalar, so the prediction uses the per-call ceiling.
+    assert!(
+        predicted.ecdas_padded_rows >= sum_heights(&traces.ecdases),
+        "ecdas: predicted={} actual={}",
+        predicted.ecdas_padded_rows,
+        sum_heights(&traces.ecdases)
     );
 
     // Auxiliary scalars.
