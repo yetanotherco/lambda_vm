@@ -613,20 +613,14 @@ fn host_cores() -> usize {
 pub fn table_parallelism(num_airs: usize) -> usize {
     #[cfg(feature = "parallel")]
     {
-        let k = parallelism_override().unwrap_or_else(|| {
-            // GPU builds: run every table. The work `k` divides is device- and
-            // workload-bound, not core-bound — see the doc comment.
-            #[cfg(feature = "cuda")]
-            {
-                num_airs
-            }
-            // CPU builds: every table is pure host work, so `k` competes for
-            // the same cores the rayon pool wants.
-            #[cfg(not(feature = "cuda"))]
-            {
-                (host_cores() / 3).max(1)
-            }
-        });
+        // GPU builds: run every table. The work `k` divides is device- and
+        // workload-bound, not core-bound — see the doc comment.
+        #[cfg(feature = "cuda")]
+        let k = parallelism_override().unwrap_or(num_airs);
+        // CPU builds: every table is pure host work, so `k` competes for
+        // the same cores the rayon pool wants.
+        #[cfg(not(feature = "cuda"))]
+        let k = parallelism_override().unwrap_or_else(|| (host_cores() / 3).max(1));
         k.clamp(1, num_airs.max(1))
     }
     #[cfg(not(feature = "parallel"))]
