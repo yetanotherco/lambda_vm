@@ -3478,6 +3478,11 @@ pub trait IsStarkProver<
                             // the main LDE if this table was device-only — and
                             // continue fully host-backed on the arms below.
                             let mut recovered = crate::gpu_lde::materialize_aux_trace_host(*trace);
+                            // Once the aux download lands, the host aux trace is
+                            // populated: a later failure is the main-LDE
+                            // download's, and the error has to name that step
+                            // instead of claiming an empty aux trace.
+                            let aux_recovered = recovered;
                             if recovered && device_only {
                                 let mut cell = main_lde_cells[idx].lock().unwrap();
                                 if let Some((data, _)) = cell.as_mut()
@@ -3506,7 +3511,14 @@ pub trait IsStarkProver<
                             }
                             if !recovered {
                                 return Err(ProvingError::Fft(
-                                    "resident aux LDE failed; host aux trace is empty".to_string(),
+                                    if aux_recovered {
+                                        "resident aux LDE declined; the aux trace was recovered \
+                                         but the main-LDE download failed"
+                                    } else {
+                                        "resident aux LDE declined and the aux-trace download \
+                                         recovery failed"
+                                    }
+                                    .to_string(),
                                 ));
                             }
                             eprintln!(
