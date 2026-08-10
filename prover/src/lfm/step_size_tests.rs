@@ -30,8 +30,10 @@
 //!    which has `step_size > 1`. Writing one means adding to `crypto/**`, which is
 //!    on the standing always-stop list.
 //! 2. **`step_size > 1` is not provable at all** — a framework ceiling, measured
-//!    by [`the_prover_cannot_prove_a_step_size_two_air`] rather than argued. So
-//!    entry 9 cannot be closed by a proof of any kind, from any AIR.
+//!    by [`the_prover_cannot_prove_a_step_size_two_air`] rather than argued (in
+//!    debug the prover panics on the `RowFrame` shape assert; in release, with
+//!    that assert compiled out, it emits a proof production's own verifier
+//!    rejects). So entry 9 cannot be closed by a proof of any kind, from any AIR.
 //!
 //! What closes entry 9 instead is that it does not need a proof. The defect is in
 //! how the machine maps a reconstructed grid onto frame steps, and production has
@@ -218,6 +220,8 @@ const STRIDED_ROWS: usize = 64;
 /// column set if it could be proved.
 struct StridedConstraints;
 
+type StridedAir = AirWithBuses<Gl, Ext3, NullBoundaryConstraintBuilder, (), StridedConstraints>;
+
 impl<F: IsField, E: IsField> ConstraintSet<F, E> for StridedConstraints {
     fn eval<B: ConstraintBuilder<F, E>>(&self, b: &mut B) {
         let here = b.main(0, 0);
@@ -226,41 +230,16 @@ impl<F: IsField, E: IsField> ConstraintSet<F, E> for StridedConstraints {
     }
 }
 
-/// ★ A FRAMEWORK CEILING, measured rather than asserted from reading, and
-/// reported as a finding (standing decisions: report ceilings, do not work around
-/// them silently).
+/// The `step_size = 2` fixture, shared by both halves of the ceiling test.
 ///
-/// The production prover cannot prove ANY AIR with `step_size > 1`. Its CPU
-/// transition evaluator borrows one row per transition offset
-/// (`RowFrame::from_lde`, `evaluator.rs:72`) and asserts the single-row shape
-/// outright: `debug_assert_eq!(lde_trace.lde_step_size, lde_trace.blowup_factor,
-/// "RowFrame requires single-row steps (step_size 1)")` — and `lde_step_size =
-/// trace_step_size · blowup_factor`, so the equality IS `step_size == 1`.
-///
-/// What this costs the ledger: entry 9 can have no end-to-end witness, from any
-/// AIR, until the ceiling lifts —
-/// [`the_frame_step_view_matches_productions_own_frame_assembly`] closes the
-/// emitter's half against production's own frame assembly instead.
-///
-/// What lifting it would take, from reading and NOT verified by running: the
-/// assert looks over-strict for the access pattern that exists.
-/// `ConstraintBuilder::main(offset, col)` resolves to row 0 of a step
-/// (`builder.rs:719-724`), and `RowFrame::from_lde`'s index for step `k` is
-/// `row + offset · lde_step_size`, which is the same row
-/// `Frame::read_from_lde` — the general, multi-row-capable gather — calls
-/// `initial_step_row`. So the borrowed row is the right one at any `step_size`,
-/// and the general `Frame` path already handles `step_size > 1` correctly. That
-/// makes this plausibly a one-line relaxation in `crypto/**`, which is an
-/// always-stop item and therefore the USER's call, not this leg's.
-///
-/// Written as `should_panic` so it is self-updating: if the ceiling is ever
-/// lifted, this test fails and says entry 9 became closeable end to end.
-#[test]
-#[should_panic(expected = "RowFrame requires single-row steps")]
-fn the_prover_cannot_prove_a_step_size_two_air() {
-    use crate::test_utils::multi_prove_ram;
-
-    let air = AirWithBuses::<Gl, Ext3, NullBoundaryConstraintBuilder, (), StridedConstraints>::new(
+/// Column 0 — the only column `StridedConstraints` reads — is CONSTANT, so
+/// `main(1, 0) − main(0, 0)` is zero under ANY choice of which rows the two
+/// transition offsets resolve to. That is what makes the release half below
+/// meaningful: the proof it produces is rejected for a structural
+/// prover/verifier disagreement, not because some other frame reading would
+/// violate the constraint.
+fn strided_fixture() -> (StridedAir, TraceTable<Gl, Ext3>) {
+    let air = StridedAir::new(
         STRIDED_COLS,
         AuxiliaryTraceBuildData {
             interactions: vec![],
@@ -277,7 +256,7 @@ fn the_prover_cannot_prove_a_step_size_two_air() {
         main.push(FE::from(1_000 + r));
         main.push(FE::from(2_000 + 3 * r));
     }
-    let mut trace = TraceTable::new_main(main, STRIDED_COLS, STEP_SIZE);
+    let trace = TraceTable::new_main(main, STRIDED_COLS, STEP_SIZE);
 
     assert_eq!(air.step_size(), STEP_SIZE, "the fixture's step size");
     assert_eq!(
@@ -287,12 +266,95 @@ fn the_prover_cannot_prove_a_step_size_two_air() {
          blocks and a stride of two — the shape both entries want"
     );
 
+    (air, trace)
+}
+
+/// ★ A FRAMEWORK CEILING, measured rather than asserted from reading, and
+/// reported as a finding (standing decisions: report ceilings, do not work around
+/// them silently).
+///
+/// The production prover cannot prove ANY AIR with `step_size > 1`, but it fails
+/// in two DIFFERENT ways depending on the build profile, so the ceiling is
+/// witnessed twice — once per profile — rather than in a single `should_panic`
+/// that only holds in one of them:
+///
+/// - **Debug (this body).** The CPU transition evaluator borrows one row per
+///   transition offset (`RowFrame::from_lde`, `evaluator.rs:72`) and asserts the
+///   single-row shape outright: `debug_assert_eq!(lde_trace.lde_step_size,
+///   lde_trace.blowup_factor, "RowFrame requires single-row steps (step_size 1)")`
+///   — and `lde_step_size = trace_step_size · blowup_factor`, so the equality IS
+///   `step_size == 1`. The prover panics before emitting anything.
+/// - **Release (the sibling body below, selected by `cfg(not(debug_assertions))`).**
+///   `debug_assert` is compiled out, so the prover runs to completion and returns
+///   `Ok(proof)` — and production's own verifier REJECTS that proof. Measured, not
+///   read: the ceiling is a completeness failure, not a soundness one, and it is
+///   NOT the one assert. Relaxing the assert alone would not lift it.
+///
+/// Nothing production-reachable is affected either way: every AIR in the tree
+/// reports `step_size = 1` — the VM tables and the LFM chips pass it through
+/// their `build_air` helpers, the continuation AIRs pass it to
+/// `AirWithBuses::new` directly, and every example AIR's `step_size` impl returns
+/// the literal `1` — so this shape exists only in this fixture.
+///
+/// What this costs the ledger: entry 9 can have no end-to-end witness, from any
+/// AIR, until the ceiling lifts —
+/// [`the_frame_step_view_matches_productions_own_frame_assembly`] closes the
+/// emitter's half against production's own frame assembly instead.
+///
+/// Both halves are self-updating: if the ceiling is ever lifted, the debug half
+/// stops panicking and the release half starts verifying, and each fails saying
+/// entry 9 became closeable end to end.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "RowFrame requires single-row steps")]
+fn the_prover_cannot_prove_a_step_size_two_air() {
+    use crate::test_utils::multi_prove_ram;
+
+    let (air, mut trace) = strided_fixture();
+
     let pairs: Vec<(
         &dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = ()>,
         _,
         _,
     )> = vec![(&air, &mut trace, &())];
     let _ = multi_prove_ram(pairs, &mut DefaultTranscript::<Ext3>::new(&[]));
+}
+
+/// ★ The same ceiling, as release actually reaches it — see the debug body above
+/// for the full finding.
+///
+/// With the `RowFrame` `debug_assert` compiled out the prover does NOT stop: it
+/// emits a proof. What still holds is the claim the test's name makes, one level
+/// out — that proof does not round-trip, because production's own verifier
+/// rejects it. Asserting the rejection (rather than skipping the test in release)
+/// is what keeps the required release CI gate covering this path.
+#[cfg(not(debug_assertions))]
+#[test]
+fn the_prover_cannot_prove_a_step_size_two_air() {
+    use crate::test_utils::multi_prove_ram;
+
+    let (air, mut trace) = strided_fixture();
+
+    let pairs: Vec<(
+        &dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = ()>,
+        _,
+        _,
+    )> = vec![(&air, &mut trace, &())];
+    let proof = multi_prove_ram(pairs, &mut DefaultTranscript::<Ext3>::new(&[]))
+        .expect("with the debug_assert compiled out the prover runs to completion");
+
+    let refs: Vec<&dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = ()>> = vec![&air];
+    assert!(
+        !Verifier::multi_verify_views(
+            &refs,
+            MultiProofView::Owned(&proof),
+            &mut DefaultTranscript::<Ext3>::new(&[]),
+            &FEE::zero(),
+        ),
+        "production accepted a step_size = 2 proof — the framework ceiling lifted, \
+         so entry 9 is now closeable end to end and this test should be replaced by \
+         the end-to-end witness"
+    );
 }
 
 // =============================================================================
