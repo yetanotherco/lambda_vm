@@ -25,6 +25,30 @@ challenges `z, α` (`E` = the degree-3 extension, `D` = total interaction count)
 > **(B) Balance.** The multiset of sent tokens with multiplicity equals the multiset of received
 > tokens with multiplicity.
 
+### 1.1 The framework premises the machine inherits
+
+(B) is not a fact about the LFM prover; it is an assumption about the *outer* verifier that checks
+the LFM proof (`lfm/proof.rs` → `Verifier::multi_verify_views`), which is ordinary, unmodified
+framework code. Four of its checks are load-bearing here and the machine defends none of them
+independently: **per-column opening-width pinning** (`trace_opening_widths_well_formed`), which
+pins each query opening's precomputed/main/aux split against the AIR rather than only their sum;
+**`ood_blocks_well_formed`**, which derives the OOD table's shape from the AIR; **the
+precomputed-root equality check** cited above, which is what delivers §2's registry premise; and
+**the composition part-count check**, which fixes `num_composition_parts` from the AIR's degree
+bound instead of reading it off the proof.
+
+The width pin is the one worth spelling out, because it is what makes (B) hold with error
+`O(D/|E|)` rather than not at all. Every LFM chip is `with_preprocessed` with a non-empty aux trace
+whose root is absorbed *after* the LogUp challenges `z, α`. If only the sum of the opening widths is
+pinned, a prover may declare one value column into the aux group and choose it with the challenges
+in hand; the bus check is a single aggregate scalar equality per proof, so one free extension
+element solves it for an arbitrary perturbation — and (B) is gone while §2's whole custody chain
+still passes, because that chain binds the *addressing* columns and the break is in the value
+columns' commitment timing. **The machine's soundness is therefore only as good as the base tree's
+version of these checks**: on a base predating one of them the theorem of §3 has no (B) to consume
+and a wrap proof certifies nothing, no matter how much of §2–§6 holds. Item 8 of §7 is the
+reviewer's version of this.
+
 ## 2. What is vouched, and by whom
 
 | obligation | enforced by | mechanism |
@@ -220,3 +244,6 @@ current transcript would be a second proof-breaking change for no other benefit.
 7. Does every `TranscriptReplay` challenge reach the program through machine keccak rows rather
    than an arena, and is the zero-rejection completeness bound (§6.3) acceptable at this
    program's actual draw count?
+8. Is the base tree at or past every framework verifier fix the inherited premises of §1.1 name —
+   currently per-column opening-width pinning (`trace_opening_widths_well_formed`, #909 /
+   `6949ceb9`)? On an older base (B) is not delivered, and nothing below §1.1 can recover it.
