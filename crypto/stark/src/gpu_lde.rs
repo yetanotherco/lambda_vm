@@ -26,6 +26,8 @@ use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
 use math::field::goldilocks::GoldilocksField;
 use math::field::traits::{IsFFTField, IsField, IsSubFieldOf};
 use math::traits::AsBytes;
+#[cfg(feature = "parallel")]
+use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
 
 use crate::config::{Commitment, FriLayerMerkleTreeBackend};
 use crate::domain::Domain;
@@ -1518,12 +1520,31 @@ where
             if slabs.len() != m * lde * 3 {
                 return false;
             }
+            // Parallel de-interleaved slabs → row-major interleaved: each row
+            // chunk gathers from the source slabs independently.
             let mut interleaved = vec![0u64; m * lde * 3];
-            for c in 0..m {
-                for k in 0..3 {
-                    let slab = &slabs[(c * 3 + k) * lde..(c * 3 + k + 1) * lde];
-                    for r in 0..lde {
-                        interleaved[(r * m + c) * 3 + k] = slab[r];
+            if m > 0 {
+                #[cfg(feature = "parallel")]
+                {
+                    interleaved
+                        .par_chunks_exact_mut(m * 3)
+                        .enumerate()
+                        .for_each(|(r, dst)| {
+                            for (c, dst_col) in dst.chunks_exact_mut(3).enumerate() {
+                                for (k, d) in dst_col.iter_mut().enumerate() {
+                                    *d = slabs[(c * 3 + k) * lde + r];
+                                }
+                            }
+                        });
+                }
+                #[cfg(not(feature = "parallel"))]
+                {
+                    for (r, dst) in interleaved.chunks_exact_mut(m * 3).enumerate() {
+                        for (c, dst_col) in dst.chunks_exact_mut(3).enumerate() {
+                            for (k, d) in dst_col.iter_mut().enumerate() {
+                                *d = slabs[(c * 3 + k) * lde + r];
+                            }
+                        }
                     }
                 }
             }
@@ -1567,10 +1588,28 @@ where
     if col_major.len() != m * lde {
         return None;
     }
+    // Parallel col-major → row-major transpose: each row chunk gathers from
+    // the source columns independently.
     let mut row_major = vec![0u64; m * lde];
-    for c in 0..m {
-        for r in 0..lde {
-            row_major[r * m + c] = col_major[c * lde + r];
+    if m > 0 {
+        #[cfg(feature = "parallel")]
+        {
+            row_major
+                .par_chunks_exact_mut(m)
+                .enumerate()
+                .for_each(|(r, dst)| {
+                    for (c, d) in dst.iter_mut().enumerate() {
+                        *d = col_major[c * lde + r];
+                    }
+                });
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            for (r, dst) in row_major.chunks_exact_mut(m).enumerate() {
+                for (c, d) in dst.iter_mut().enumerate() {
+                    *d = col_major[c * lde + r];
+                }
+            }
         }
     }
     // SAFETY: F == Goldilocks (gated above); FieldElement<Gl> is
