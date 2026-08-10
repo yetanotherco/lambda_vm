@@ -897,9 +897,10 @@ pub fn create_halt_air(proof_options: &ProofOptions) -> ConcreteVmAir<EmptyConst
     )
 }
 
-/// Create HINT AIR: a receiver for the `hint` ecall (Ecall receive, x12 register
-/// read, four output MEMW writes, output byte range-checks) with a single boolean
-/// constraint on the multiplicity column `mu`.
+/// Create HINT AIR: a receiver for the `hint` ecall (Ecall receive, the x10/x11/x12
+/// register reads, the three ALU `LT` operand range-checks, four output MEMW writes,
+/// output byte range-checks) with a single boolean constraint on the multiplicity
+/// column `mu`.
 pub fn create_hint_air(proof_options: &ProofOptions) -> ConcreteVmAir<HintConstraints> {
     build_air(
         hint_cols::NUM_COLUMNS,

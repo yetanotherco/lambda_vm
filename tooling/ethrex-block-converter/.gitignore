@@ -1,4 +1,6 @@
 /target
-# Downloaded ethrex-replay cache JSONs (~1.5 MB each), fetched on demand by
-# `make ethrex-real-block-fixture`.
+# Downloaded ethrex-replay cache JSONs (~1.5 MB each), plus the rev stamp that
+# invalidates them. Fetched on demand by `make ethrex-real-block-cache` (the
+# benchmark block, for `regen-real-block-fixture`) and by
+# `make test-ethrex-real-block-converter` (this crate's own pinned test block).
 /caches/

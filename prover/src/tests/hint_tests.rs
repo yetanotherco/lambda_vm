@@ -1,10 +1,14 @@
 //! HINT constraint tests.
 
-use crate::tables::hint::{HintConstraints, HintOperation, cols, generate_hint_trace};
-use crate::tables::types::{FE, GoldilocksExtension, GoldilocksField};
+use crate::tables::hint::{
+    HINT_ADDR_LIMB_BOUND, HintConstraints, HintOperation, bus_interactions, cols,
+    generate_hint_trace,
+};
+use crate::tables::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 use math::field::element::FieldElement;
 use stark::constraints::builder::{ConstraintSet, ProverEvalFolder};
 use stark::frame::Frame;
+use stark::lookup::{BusValue, LinearTerm};
 use stark::table::TableView;
 use stark::traits::TransitionEvaluationContext;
 
@@ -89,4 +93,79 @@ fn is_bit_mu_rejects_non_boolean_multiplicity() {
         FE::zero(),
         "IS_BIT(mu) must reject mu = 2"
     );
+}
+
+/// The lhs column of an ALU `LT` sender, and the constant it is compared against.
+fn alu_lt_senders() -> Vec<(usize, u64)> {
+    let id: u64 = BusId::Alu.into();
+    bus_interactions()
+        .iter()
+        .filter(|i| i.is_sender && i.bus_id == id)
+        .map(|i| {
+            let lhs = match &i.values[0] {
+                BusValue::Packed { start_column, .. } => *start_column,
+                BusValue::Linear(_) => panic!("LT lhs must be a column, not a constant"),
+            };
+            let bound = match &i.values[2] {
+                BusValue::Linear(terms) => match terms.as_slice() {
+                    [LinearTerm::Constant(c)] => *c as u64,
+                    _ => panic!("LT rhs must be a single constant"),
+                },
+                BusValue::Packed { .. } => panic!("LT rhs must be a constant"),
+            };
+            (lhs, bound)
+        })
+        .collect()
+}
+
+/// Both address low limbs are range-checked, not just `in_addr`.
+///
+/// `out_addr` is on the memory bus, which is why it originally had no LT sender — but the
+/// bus bounds it only to `2^32 - 25` (the largest write base is `out_addr_lo + 24`, and
+/// MEMW's carry columns resolve the bytes past it), while the executor rejects anything
+/// above `2^32 - 32`. Without this sender the AIR accepted the seven-value window in
+/// [`addr_limb_bound_rejects_every_operand_the_executor_rejects`].
+#[test]
+fn alu_lt_senders_range_check_selector_and_both_address_limbs() {
+    let senders = alu_lt_senders();
+    assert_eq!(senders.len(), 3, "selector + in_addr + out_addr");
+
+    for col in [cols::ADDR_IN_0, cols::ADDR_OUT_0] {
+        let bound = senders
+            .iter()
+            .find_map(|(lhs, bound)| (*lhs == col).then_some(*bound))
+            .unwrap_or_else(|| panic!("column {col} must have an ALU LT range-check"));
+        assert_eq!(
+            bound, HINT_ADDR_LIMB_BOUND,
+            "column {col} must be checked against the executor's bound"
+        );
+    }
+}
+
+/// The bound accepts exactly the operands `addr_limb_ok(addr, 31)` accepts.
+///
+/// The seven values in `2^32-31 ..= 2^32-25` are the regression: the executor rejects
+/// them with `HintAddressOverflow`, and before the `out_addr` sender existed the AIR
+/// accepted them for the output address — a provable hint call the VM halts on.
+#[test]
+fn addr_limb_bound_rejects_every_operand_the_executor_rejects() {
+    // `addr_limb_ok(addr, 31)`: the 32-byte range must fit under 2^32.
+    let executor_accepts = |limb: u64| limb + 31 < (1 << 32);
+    // The AIR accepts iff the LT range-check passes.
+    let air_accepts = |limb: u64| limb < HINT_ADDR_LIMB_BOUND;
+
+    for limb in (1u64 << 32) - 40..1u64 << 32 {
+        assert_eq!(
+            air_accepts(limb),
+            executor_accepts(limb),
+            "AIR and executor disagree on out_addr low limb {limb:#x}"
+        );
+    }
+
+    // The window that used to verify while the executor halted on it.
+    for limb in (1u64 << 32) - 31..=(1u64 << 32) - 25 {
+        assert!(!air_accepts(limb), "{limb:#x} must be rejected");
+    }
+    // And the largest operand that must still run.
+    assert!(air_accepts((1 << 32) - 32));
 }

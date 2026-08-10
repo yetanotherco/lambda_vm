@@ -165,3 +165,32 @@ fn hint_syscall_rejects_an_unknown_selector() {
         );
     }
 }
+
+/// The guest's `lambda-vm-syscalls` crate re-declares the selectors as `usize`,
+/// linked to the `u64` copies here only by a comment. A divergence is **silent**:
+/// the ecall would trap on an unknown selector, or — worse for the selectors that
+/// stay in range — hand back the wrong function's answer, which the guest's
+/// verify-then-fallback swallows as "the host lied" and quietly recomputes in
+/// software. Nothing fails; the guest just runs ~2000× slower for the right result.
+/// This test is the only thing that would notice.
+///
+/// `is_valid_hint_selector`'s const-assert pins the AIR's range-check to this crate's
+/// accepted set, but nothing ties the *guest's* copy of the selectors to it — that is
+/// a third declaration, in a crate the workspace excludes, and this is what binds it.
+///
+/// The syscall number itself is not asserted here: the guest's copy is
+/// `#[cfg(target_arch = "riscv64")]` and private, so it does not exist in a host
+/// build. It is covered indirectly — a wrong number makes every `hint` guest fail
+/// to prove, which `test_prove_hint_min_rust_guest` catches loudly.
+#[cfg(test)]
+mod guest_constant_sync {
+    use super::{HINT_FIELD_INV, HINT_FIELD_SQRT, HINT_SCALAR_INV};
+    use lambda_vm_syscalls::syscalls as guest;
+
+    #[test]
+    fn hint_selectors_match_the_guest() {
+        assert_eq!(guest::HINT_FIELD_INV as u64, HINT_FIELD_INV);
+        assert_eq!(guest::HINT_SCALAR_INV as u64, HINT_SCALAR_INV);
+        assert_eq!(guest::HINT_FIELD_SQRT as u64, HINT_FIELD_SQRT);
+    }
+}

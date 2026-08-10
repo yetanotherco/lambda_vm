@@ -155,7 +155,9 @@ fn verify_vm_minimal(vm_proof: &VmProof, elf_bytes: &[u8]) -> bool {
         &elf,
         &vm_proof.runtime_page_ranges,
         vm_proof.num_private_input_pages,
-    );
+        usize::MAX,
+    )
+    .expect("honest page layout");
     let airs = VmAirs::new(
         &elf,
         &proof_options,
@@ -1212,10 +1214,11 @@ fn test_prove_ecsm_rust_guest() {
 
 /// End-to-end prove→verify for the non-constraining `Hint` ecall: the minimal Rust
 /// guest does one `hint` call (secp256k1 base-field inverse of 3) and commits the result.
-/// This exercises exactly the HINT table's bus surface (Ecall receive + the four
-/// 8-byte output MEMW writes) end-to-end through prove→verify, de-risking the bus
-/// balance before scaling to real consumers. The committed output must equal the
-/// value the executor's `compute_hint` produced (= 3^{-1} mod p).
+/// This exercises the whole HINT table bus surface (Ecall receive, the x10/x11/x12
+/// register reads, the two ALU `LT` operand range-checks, the four 8-byte output MEMW
+/// writes and the output byte range-checks) end-to-end through prove→verify, de-risking
+/// the bus balance before scaling to real consumers. The committed output must equal
+/// the value the executor's `compute_hint` produced (= 3^{-1} mod p).
 #[test]
 fn test_prove_hint_min_rust_guest() {
     let _ = env_logger::builder().is_test(true).try_init();
@@ -1242,11 +1245,13 @@ fn test_prove_hint_min_rust_guest() {
     assert_eq!(proof.public_output, expected.to_vec());
 }
 
-/// Multi-hint: three `hint` ecalls, each result read back with
+/// Multi-hint: three `hint` ecalls, one per selector, each result read back with
 /// ordinary `LOAD`s. Complements `test_prove_hint_min_rust_guest` by proving the
 /// paths the ethrex consumer relies on that a single-call guest doesn't: **multiple
-/// real HINT rows** (padded) and **read-back via normal LOAD** (MEMW reads chaining
-/// to the HINT writes). Committed output = XOR of the three field inverses.
+/// real HINT rows** (padded), **all three selectors** (so the AIR's `selector < 3`
+/// range-check is exercised at every accepted value, not only at 0) and **read-back
+/// via normal LOAD** (MEMW reads chaining to the HINT writes). Committed output =
+/// XOR of the three hinted values.
 #[test]
 fn test_prove_hint_multi_rust_guest() {
     let _ = env_logger::builder().is_test(true).try_init();
@@ -1265,15 +1270,22 @@ fn test_prove_hint_multi_rust_guest() {
         "hint_multi rust guest should verify"
     );
 
-    // Expected = XOR of field-inverses of 3, 5, 7 (32-byte BE), matching the guest.
+    // Expected = XOR of inv(3) mod p, inv(5) mod n and sqrt(4) mod p (32-byte BE),
+    // matching the guest's one-call-per-selector loop.
+    use executor::vm::instruction::execution::{
+        HINT_FIELD_INV, HINT_FIELD_SQRT, HINT_SCALAR_INV, compute_hint,
+    };
     let mut expected = [0u8; 32];
-    for seed in [3u8, 5u8, 7u8] {
+    for (hint_id, seed) in [
+        (HINT_FIELD_INV, 3u8),
+        (HINT_SCALAR_INV, 5u8),
+        (HINT_FIELD_SQRT, 4u8),
+    ] {
         let mut input = [0u8; 32];
         input[31] = seed;
-        let inv =
-            executor::vm::instruction::execution::compute_hint(0 /* HINT_FIELD_INV */, &input);
+        let out = compute_hint(hint_id, &input);
         for i in 0..32 {
-            expected[i] ^= inv[i];
+            expected[i] ^= out[i];
         }
     }
     assert_eq!(proof.public_output, expected.to_vec());
@@ -1808,7 +1820,8 @@ fn test_prove_elfs_test_commit_4_wrong_pages_rejected() {
     .expect("Prover failed");
 
     // Verifier uses EMPTY runtime pages → missing stack/public-output pages
-    let wrong_configs = Traces::page_configs_from_elf_and_runtime(&elf, &[], 0);
+    let wrong_configs = Traces::page_configs_from_elf_and_runtime(&elf, &[], 0, usize::MAX)
+        .expect("honest page layout");
     let verifier_airs = crate::VmAirs::new(
         &elf,
         &proof_options,
@@ -2565,7 +2578,9 @@ fn test_deep_stack_runtime_pages_roundtrip() {
     )
     .expect("Prover failed");
     // Verifier reconstructs from ELF + runtime_page_ranges hint
-    let verifier_configs = Traces::page_configs_from_elf_and_runtime(&elf, &runtime_page_ranges, 0);
+    let verifier_configs =
+        Traces::page_configs_from_elf_and_runtime(&elf, &runtime_page_ranges, 0, usize::MAX)
+            .expect("honest page layout");
     let verifier_airs = crate::VmAirs::new(
         &elf,
         &proof_options,
@@ -2640,7 +2655,8 @@ fn test_deep_stack_missing_pages_rejected() {
     )
     .expect("Prover failed");
     // Verifier uses EMPTY runtime_page_ranges → missing stack/heap pages
-    let wrong_configs = Traces::page_configs_from_elf_and_runtime(&elf, &[], 0);
+    let wrong_configs = Traces::page_configs_from_elf_and_runtime(&elf, &[], 0, usize::MAX)
+        .expect("honest page layout");
     let verifier_airs = crate::VmAirs::new(
         &elf,
         &proof_options,
@@ -2750,7 +2766,9 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
     )
     .expect("Prover failed");
     // Verifier reconstructs from ELF + runtime hint (ranges decoded to pages)
-    let verifier_configs = Traces::page_configs_from_elf_and_runtime(&elf, &runtime_page_ranges, 0);
+    let verifier_configs =
+        Traces::page_configs_from_elf_and_runtime(&elf, &runtime_page_ranges, 0, usize::MAX)
+            .expect("honest page layout");
     let verifier_airs = crate::VmAirs::new(
         &elf,
         &proof_options,

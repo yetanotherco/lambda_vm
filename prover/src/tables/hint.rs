@@ -52,6 +52,9 @@
 //! - `selector[0..1]` (DWordWL): `a0`, bound to `x10` and range-checked `< 3`
 //! - `in_addr[0..1]` (DWordWL): `a1`, bound to `x11`; its low limb is range-checked
 //!   so the ecall's input range cannot straddle the 32-bit limb boundary
+//!
+//! Both address low limbs are range-checked against [`HINT_ADDR_LIMB_BOUND`]; see that
+//! constant for why the memory bus alone does not bound `out_addr` tightly enough.
 
 use executor::vm::instruction::execution::HINT_SYSCALL_NUMBER;
 use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
@@ -62,15 +65,25 @@ use crate::constraints::templates::emit_is_bit;
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable, alu_op};
 
-/// One past the largest valid hint selector (`a0 ∈ {0, 1, 2}` = FIELD_INV /
-/// SCALAR_INV / FIELD_SQRT). The executor rejects anything else up front, so the
-/// AIR range-checks `selector < 3` to accept exactly the same set.
-pub const HINT_SELECTOR_BOUND: u64 = 3;
+/// One past the largest valid hint selector (`a0 ∈ {0, 1, 2}` = FIELD_INV / SCALAR_INV /
+/// FIELD_SQRT). Re-exported from the executor, which const-asserts that the bound and its
+/// `is_valid_hint_selector` set coincide — so the AIR's range-check cannot drift from the
+/// set the executor accepts.
+pub use executor::vm::instruction::execution::HINT_SELECTOR_BOUND;
 
-/// Bound the low 32-bit limb of `in_addr` must stay under so the ecall's 32-byte
-/// input range (`+0..+31`) cannot straddle the 2^32 limb boundary. Mirrors the
-/// executor's `addr_limb_ok(in_addr, 31)`: `(in_addr % 2^32) + 31 < 2^32`.
-pub const HINT_IN_ADDR_LIMB_BOUND: u64 = (1 << 32) - 31;
+/// Bound the low 32-bit limb of `in_addr` and `out_addr` must stay under so the
+/// ecall's 32-byte range (`+0..+31`) cannot straddle the 2^32 limb boundary. Mirrors
+/// the executor's `addr_limb_ok(addr, 31)`: `(addr % 2^32) + 31 < 2^32`, i.e. the
+/// largest accepted limb is `2^32 - 32`.
+///
+/// Both operands need this explicitly. `in_addr` because it is not on the memory bus
+/// at all (the input read is not modelled). `out_addr` because the bus bounds it only
+/// to `2^32 - 25`: the write bases are `out_addr_lo + 8i`, so the largest one
+/// (`+24`) stops being a canonical limb at `2^32 - 24`, while MEMW's `carry`
+/// columns resolve the *bytes* past it correctly. That left a seven-value window
+/// (`2^32-31 ..= 2^32-25`) the AIR accepted and the executor rejected with
+/// `HintAddressOverflow` — a prover could prove a hint call the VM halts on.
+pub const HINT_ADDR_LIMB_BOUND: u64 = (1 << 32) - 31;
 
 pub mod cols {
     /// timestamp[0]: lower 32 bits of the ecall timestamp
@@ -215,15 +228,15 @@ fn memw_register_read(reg: u64, lo_col: usize, hi_col: usize) -> Vec<BusValue> {
 ///
 /// - **MEMW register-read senders** (mult `mu`, ×2): bind `a0` (`x10`, the selector)
 ///   and `a1` (`x11`, the input address) to their register columns.
-/// - **ALU `LT` senders** (mult `mu`, ×2): assert `selector < 3` and that `in_addr`'s
-///   low limb `< 2^32 − 31`, matching the executor's up-front rejections
-///   (`HintUnknownSelector`, `HintAddressOverflow`). Without them the AIR would accept
-///   hints the executor rejects — a malicious prover could prove an execution the VM
-///   would halt on. The value stays unconstrained (the guest verifies it); this only
-///   pins the *operands* to the executor's accepted set.
+/// - **ALU `LT` senders** (mult `mu`, ×3): assert `selector < 3` and that both
+///   `in_addr`'s and `out_addr`'s low limbs are `< 2^32 − 31`, matching the executor's
+///   up-front rejections (`HintUnknownSelector`, `HintAddressOverflow`). Without them
+///   the AIR would accept hints the executor rejects — a malicious prover could prove
+///   an execution the VM would halt on. The value stays unconstrained (the guest
+///   verifies it); this only pins the *operands* to the executor's accepted set.
 pub fn bus_interactions() -> Vec<BusInteraction> {
     let mu = || Multiplicity::Column(cols::MU);
-    let mut out = Vec::with_capacity(26);
+    let mut out = Vec::with_capacity(27);
 
     // ECALL receiver: [ts_lo, ts_hi, syscall_lo32, syscall_hi32].
     out.push(BusInteraction::receiver(
@@ -281,22 +294,26 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ],
     ));
 
-    // in_addr's low limb < 2^32 - 31, matching addr_limb_ok(in_addr, 31). The lhs high
-    // word is a literal 0, so only ADDR_IN_0 (the low limb) is compared — exactly the
-    // executor's check, which ignores the high limb.
-    out.push(BusInteraction::sender(
-        BusId::Alu,
-        mu(),
-        vec![
-            packed(cols::ADDR_IN_0),
-            BusValue::constant(0),
-            BusValue::constant(HINT_IN_ADDR_LIMB_BOUND),
-            BusValue::constant(0),
-            BusValue::constant(alu_op::LT as u64),
-            BusValue::constant(1),
-            BusValue::constant(0),
-        ],
-    ));
+    // in_addr's and out_addr's low limbs < 2^32 - 31, matching addr_limb_ok(addr, 31).
+    // The lhs high word is a literal 0, so only the low limb is compared — exactly the
+    // executor's check, which ignores the high limb. `out_addr` needs its own check even
+    // though it is on the memory bus: the bus only bounds it to 2^32 - 25 (see
+    // HINT_ADDR_LIMB_BOUND), leaving a window the executor rejects.
+    for addr_lo in [cols::ADDR_IN_0, cols::ADDR_OUT_0] {
+        out.push(BusInteraction::sender(
+            BusId::Alu,
+            mu(),
+            vec![
+                packed(addr_lo),
+                BusValue::constant(0),
+                BusValue::constant(HINT_ADDR_LIMB_BOUND),
+                BusValue::constant(0),
+                BusValue::constant(alu_op::LT as u64),
+                BusValue::constant(1),
+                BusValue::constant(0),
+            ],
+        ));
+    }
 
     // write output: 4 doublewords at out_addr + 8i (timestamp T).
     for i in 0..4 {
@@ -339,12 +356,12 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 /// The HINT table's single transition constraint: `mu·(1−mu) = 0`.
 ///
 /// `mu` is the multiplicity gating every one of this table's bus interactions
-/// (the `Ecall` receive, the `x12` register read, the four output writes, the
-/// 16 byte range-checks). It must be boolean, or a witness could put a non-`{0,1}`
-/// value on the `AreBytes`/MEMW sends. The LogUp argument already fixes `mu`'s value
-/// via the timestamp-unique `Ecall` tuple, but every other multiplicity-column table
-/// bit-constrains its column in-circuit; HINT does the same rather than being the
-/// lone exception that relies solely on bus balance.
+/// (the `Ecall` receive, the three register reads, the three `LT` range-checks, the
+/// four output writes, the 16 byte range-checks). It must be boolean, or a witness
+/// could put a non-`{0,1}` value on the `AreBytes`/MEMW sends. This is load-bearing,
+/// not a redundant restatement of a bus check: the `Ecall` bus pins only the *sum*
+/// of `mu` over the rows sharing a tuple — see the module-level docs for the
+/// spread-multiplicity witness it rules out.
 #[derive(Clone, Copy)]
 pub struct HintConstraints;
 
