@@ -273,4 +273,5 @@ fn all_table_programs_gpu_match_cpu_oracle() {
     check_air(&create_ecdas_air(&opts), "ECDAS");
     check_air(&create_dma_air(&opts), "DMA");
     check_air(&create_dma_set_air(&opts), "DMA_SET");
+    check_air(&create_hint_air(&opts), "HINT");
 }

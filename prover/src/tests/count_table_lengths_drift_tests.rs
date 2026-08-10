@@ -152,3 +152,31 @@ fn count_table_lengths_matches_nonempty_dma_trace() {
     assert_dma_fixture_counts("dma_memset_min.elf", DMA_MEMSET_SYSCALL_NUMBER);
     assert_dma_fixture_counts("dma_memset_cases.elf", DMA_MEMSET_SYSCALL_NUMBER);
 }
+
+/// The `hint` ecall routes three register reads (`a0`/`a1`/`a2`) and four output
+/// writes through the memory argument, plus two LT range-checks (selector, in_addr).
+/// `count_table_lengths` must replay all of that exactly, or `memw_register` (an
+/// exact-match table) drifts. Uses a real hint guest so the counts are non-trivial.
+#[test]
+fn count_table_lengths_matches_nonempty_hint_trace() {
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .to_path_buf();
+    let elf_bytes =
+        std::fs::read(workspace_root.join("executor/program_artifacts/rust/hint_min.elf"))
+            .expect("hint_min.elf not found — run `make compile-programs-rust`");
+    let elf = Elf::load(&elf_bytes).expect("valid hint guest ELF");
+    let result = Executor::new(&elf, vec![])
+        .expect("executor")
+        .run()
+        .expect("hint guest execution");
+
+    assert!(
+        result.logs.iter().any(|log| {
+            log.src1_val == executor::vm::instruction::execution::HINT_SYSCALL_NUMBER
+        }),
+        "fixture must contain a hint ecall"
+    );
+    assert_count_table_lengths_matches(&elf, &result.logs);
+}
