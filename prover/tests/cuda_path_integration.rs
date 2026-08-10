@@ -194,6 +194,12 @@ fn gpu_device_only_residency_fires_and_verifies() {
         gpu_device_only_calls() > 0,
         "device-only residency path did not fire (every table kept its host trace)"
     );
+    assert_eq!(
+        stark::gpu_lde::gpu_device_only_downgrades(),
+        0,
+        "a device-only table was downgraded back to host on the happy path \
+         (a device dispatch declined that the gate should mirror)"
+    );
     assert!(
         verify(&proof, &elf).expect("verify"),
         "GPU-produced proof (device-only residency) failed verification"

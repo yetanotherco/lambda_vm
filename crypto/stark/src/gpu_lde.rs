@@ -66,7 +66,10 @@ pub(crate) fn r2_serialize_guard() -> Option<std::sync::MutexGuard<'static, ()>>
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     if *ENABLED.get_or_init(|| !std::env::var("LAMBDA_VM_GPU_SERIALIZE_R2").is_ok_and(|v| v == "0"))
     {
-        Some(LOCK.lock().unwrap())
+        // The guarded state is (), so a panic while holding the lock carries
+        // no information — recover instead of burying the original panic
+        // under a cascade of PoisonErrors from every other table.
+        Some(LOCK.lock().unwrap_or_else(|e| e.into_inner()))
     } else {
         None
     }
@@ -100,6 +103,7 @@ pub fn reset_all_gpu_call_counters() {
     GPU_COMPOSITION_CALLS.store(0, Ordering::Relaxed);
     GPU_OPENING_GATHER_CALLS.store(0, Ordering::Relaxed);
     GPU_DEVICE_ONLY_CALLS.store(0, Ordering::Relaxed);
+    GPU_DEVICE_ONLY_DOWNGRADES.store(0, Ordering::Relaxed);
 }
 
 pub(crate) static GPU_EXTEND_HALVES_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -1787,8 +1791,8 @@ where
         retain_host_lde,
     )
     .inspect_err(|e| {
-        // This path has no CPU fallback (the host aux trace is empty), so the
-        // caller hard-aborts; surface the swallowed driver error (e.g. OOM).
+        // Surface the swallowed driver error (e.g. OOM): the caller drains
+        // the device and retries, then downgrades the table to the host path.
         eprintln!(
             "[gpu] resident aux LDE failed (rows={} cols={} blowup={}): {e:?}",
             ra.num_rows, ra.num_aux_cols, blowup_factor

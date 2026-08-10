@@ -537,6 +537,10 @@ where
     /// `main_data.len()` — the caller supplies it from the device handle's
     /// `lde_size` instead.
     #[cfg(feature = "cuda")]
+    pub fn set_num_rows(&mut self, num_rows: usize) {
+        self.num_rows = num_rows;
+    }
+
     /// Install downloaded host buffers on a device-only table and clear the
     /// flag: from here every host read is valid again. An empty Vec keeps
     /// that side's existing buffer (either the side has no columns or it
@@ -556,10 +560,6 @@ where
             self.aux_data = aux_data;
         }
         self.host_trace_empty = false;
-    }
-
-    pub fn set_num_rows(&mut self, num_rows: usize) {
-        self.num_rows = num_rows;
     }
 
     /// Whether the host LDE trace was intentionally left empty (see
