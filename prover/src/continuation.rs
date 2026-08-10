@@ -211,12 +211,14 @@ fn l2g_memory_air(
 /// zero-init pages (stack/heap) via the static zero-page commitment. The prover
 /// cannot choose those genesis values.
 ///
-/// Private-input pages are built NON-preprocessed (mirrors the monolithic PAGE in
+/// Private-input pages preprocess OFFSET **only** (mirrors the monolithic PAGE in
 /// `VmAirs::new`): INIT is a committed main-trace column the verifier never recomputes
 /// from the ELF, so the raw private input is neither bundled nor reconstructed by the
-/// verifier. Correctness is enforced by the GlobalMemory bus (the genesis token must
-/// telescope into the epochs' reads), not by ELF recomputation. (Not a ZK/hiding claim —
-/// the committed column is still opened at STARK query positions.)
+/// verifier. (Not a ZK/hiding claim — the committed column is still opened at STARK
+/// query positions.) OFFSET, by contrast, is preprocessed like everywhere else: it is
+/// program- and input-independent, and it is the row's address, so the GlobalMemory bus
+/// alone cannot police it. Leaving it free was a soundness hole — the genesis token
+/// could name any address in the page's high-limb space.
 /// `preprocessed`, when `Some`, is used directly instead of recomputing the
 /// genesis commitment from `config.init_values` — the recursion guest's
 /// supplied roots skip the in-VM FFT + Merkle build (see `verify_global`).
@@ -236,7 +238,15 @@ fn global_memory_air(
         EmptyConstraints,
     );
     if config.is_private_input {
-        return air;
+        // OFFSET only — see the matching branch in `VmAirs::new`. INIT stays a
+        // main-trace column (it is the private input); OFFSET must be committed or
+        // `address_lo = page_base_lo + OFFSET` is prover-chosen and the genesis
+        // token can name an arbitrary address. GLOBAL_MEMORY's OFFSET column is
+        // identical to PAGE's, so the same commitment serves both.
+        return air.with_preprocessed(
+            page::private_page_preprocessed_commitment(opts),
+            page::NUM_PREPROCESSED_COLS_PRIVATE,
+        );
     }
     let commitment = preprocessed.unwrap_or_else(|| {
         if config.init_values.is_some() {
