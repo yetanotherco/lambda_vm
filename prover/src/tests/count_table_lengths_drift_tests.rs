@@ -127,6 +127,15 @@ fn count_table_lengths_matches_traces() {
     assert_count_table_lengths_matches(&elf, &logs);
 }
 
+/// The accelerator predictions above are trivially satisfied at zero calls, and the
+/// only guests reaching the other cases make none. This one makes three keccak
+/// permutations, so KECCAK (one row per call) and KECCAK_RND (24) are non-empty.
+#[test]
+fn count_table_lengths_matches_keccak_trace() {
+    let (elf, logs, _) = run_asm_elf("test_keccak_multi");
+    assert_count_table_lengths_matches(&elf, &logs);
+}
+
 /// The `hint` ecall routes three register reads (`a0`/`a1`/`a2`) and four output
 /// writes through the memory argument, plus two LT range-checks (selector, in_addr).
 /// `count_table_lengths` must replay all of that exactly, or `memw_register` (an

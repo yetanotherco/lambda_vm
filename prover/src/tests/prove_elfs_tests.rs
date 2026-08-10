@@ -47,7 +47,7 @@ type E = GoldilocksExtension;
 /// Includes: CPU + Bitwise + LT + MEMW + LOAD + DECODE + MUL + BRANCH + HALT + REGISTER + PAGEs
 ///
 /// Uses minimal bitwise (no full 2^20 preprocessed table) but DECODE is always preprocessed.
-fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
+pub(crate) fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
     let _ = env_logger::builder().is_test(true).try_init();
     let proof_options = ProofOptions::default_test_options();
 

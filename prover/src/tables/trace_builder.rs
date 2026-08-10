@@ -942,7 +942,14 @@ fn collect_ecsm_ops(
         memory_state.write_bytes(addr, dword, 8, t + 2);
     }
 
-    debug_assert!(witness.steps.len() <= ecdas::MAX_STEPS_PER_ECSM);
+    // Not a debug_assert: `count_table_lengths` projects ECDAS from this bound, so a
+    // longer ladder must fail here rather than silently under-project storage.
+    assert!(
+        witness.steps.len() <= ecdas::MAX_STEPS_PER_ECSM,
+        "ECSM ladder emitted {} ECDAS rows, above the {} bound",
+        witness.steps.len(),
+        ecdas::MAX_STEPS_PER_ECSM
+    );
     let ecdas_ops = witness
         .steps
         .iter()

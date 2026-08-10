@@ -75,7 +75,7 @@ fn keccak_traces_split_into_bounded_chunks() {
         keccak_rnd: keccak_rnd::ROUNDS_PER_OP,
         ..Default::default()
     };
-    let traces = Traces::from_elf_and_logs_minimal(&elf, &logs, &limits, &[]).unwrap();
+    let mut traces = Traces::from_elf_and_logs_minimal(&elf, &logs, &limits, &[]).unwrap();
 
     assert!(
         traces.keccaks.len() > 1,
@@ -94,6 +94,14 @@ fn keccak_traces_split_into_bounded_chunks() {
             "a chunk holds exactly one permutation's rounds, padded"
         );
     }
+
+    // The split has to survive the buses too: KECCAK↔KECCAK_RND↔KECCAK_RC and the
+    // memory argument are multiset arguments, so they balance across chunks or not
+    // at all.
+    assert!(
+        crate::tests::prove_elfs_tests::prove_and_verify_vm_minimal(&elf, &mut traces),
+        "a multi-chunk keccak trace must prove and verify"
+    );
 }
 
 /// The default limits leave a small program in one chunk per accelerator, so the
