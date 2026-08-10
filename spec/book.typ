@@ -49,6 +49,10 @@
       ("commit.typ", [`COMMIT` chip], <commit>),
       ("sha256.typ", [`SHA256` accelerator], <sha256>),
       ("keccak.typ", [`KECCAK` accelerator], <keccak>),
+      // Tag deliberately `sponge` rather than `keccak_sponge`: cross-reference
+      // resolution matches a label against chapter tags by PREFIX, so any tag
+      // starting with `keccak` would be captured by the chapter above.
+      ("keccak_sponge.typ", [`KECCAK_SPONGE` accelerator], <sponge>),
     ))
   )
 )

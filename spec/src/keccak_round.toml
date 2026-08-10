@@ -12,6 +12,11 @@ type = "BaseField"
 desc = "index of the permutation round"
 
 [[variables.input]]
+name = "seq"
+type = "BaseField"
+desc = "index of the permutation within its `ECALL` (0 for the `KECCAK` core chip; the rate-block index for `KECCAK_SPONGE`), carried through untouched like `timestamp`"
+
+[[variables.input]]
 name = "start"
 type = [[["Byte", 8], 5], 5]
 desc = "state at the start of executing the permutation"
@@ -170,13 +175,13 @@ name = "io"
 [[constraints.io]]
 kind = "interaction"
 tag = "KECCAK"
-input = ["timestamp", "round", "start"]
+input = ["timestamp", "round", "seq", "start"]
 multiplicity = ["-", "μ"]
 
 [[constraints.io]]
 kind = "interaction"
 tag = "KECCAK"
-input = ["timestamp", ["+", "round", 1], "out"]
+input = ["timestamp", ["+", "round", 1], "seq", "out"]
 multiplicity = "μ"
 
 [[constraints.io]]

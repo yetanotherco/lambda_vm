@@ -32,4 +32,4 @@ Negative numbers (represented as 2s complement 64-bit numbers), are used for our
 / 93: `exit` (@halt)
 / -1: `SHA256` (@sha256)
 / -2: `KECCAK` (@keccak)
-/ -4: `KECCAK_ABSORB` — keccak sponge absorb: `a0` = 200-byte state (in place), `a1` = `a2` × 136-byte rate blocks; per block XOR into lanes 0..17 then keccak-f[1600]. Padding stays guest-side (final partial block goes through `KECCAK`).
+/ -4: `KECCAK_ABSORB` (@sponge)

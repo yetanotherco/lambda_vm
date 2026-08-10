@@ -1,0 +1,339 @@
+name = "KECCAK_SPONGE"
+
+# =============================================================================
+# Variables
+# =============================================================================
+
+[[variables.input]]
+name = "timestamp"
+type = "DWordWL"
+desc = "timestamp of the `ECALL` that started this absorb call; shared by every block of the call"
+pad = 0
+
+[[variables.input]]
+name = "seq"
+type = "BaseField"
+desc = "index of this block within the call, counting from 0"
+pad = 0
+
+[[variables.input]]
+name = "n"
+type = "DWordWL"
+desc = "number of rate blocks absorbed by this call (register `A2 = x12`)"
+pad = 0
+
+[[variables.input]]
+name = "s_addr"
+type = "DWordBL"
+desc = "address of the first byte of the 200-byte state (register `A0 = x10`)"
+pad = 0
+
+[[variables.input]]
+name = "d"
+type = "DWordWL"
+desc = "address of the first byte of *this* block: $#`data_ptr` + 136 dot #`seq`$"
+pad = 0
+
+[[variables.input]]
+name = "state_in"
+type = [[["Byte", 8], 5], 5]
+desc = "the running sponge state entering this block"
+pad = 0
+
+[[variables.input]]
+name = "block"
+type = [["Byte", 8], 17]
+desc = "the 136 message bytes of this block, as 17 little-endian lanes"
+pad = 0
+
+[[variables.output]]
+name = "state_out"
+type = [[["Byte", 8], 5], 5]
+desc = "the running sponge state leaving this block: $kappa(#`absorbed`)$"
+pad = 0
+
+[[variables.auxiliary]]
+name = "xored"
+type = [["Byte", 8], 17]
+desc = "$#`state_in` xor #`block`$ over the rate region"
+pad = 0
+
+[[variables.auxiliary]]
+name = "μ_first"
+type = "Bit"
+desc = "whether this is the first block of the call (the row that receives the `ECALL`)"
+pad = 0
+
+[[variables.auxiliary]]
+name = "μ_last"
+type = "Bit"
+desc = "whether this is the last block of the call (the row that writes the state back)"
+pad = 0
+
+[[variables.multiplicity]]
+name = "μ"
+type = "Bit"
+desc = ""
+pad = 0
+
+[[variables.virtual]]
+name = "s_lo"
+type = "Word"
+desc = "the low address word of `s_addr`"
+def = {poly = ["+",
+    ["idx", "s_addr", 0],
+    ["*", ["^", 2, 8], ["idx", "s_addr", 1]],
+    ["*", ["^", 2, 16], ["idx", "s_addr", 2]],
+    ["*", ["^", 2, 24], ["idx", "s_addr", 3]]]}
+
+[[variables.virtual]]
+name = "s_hi"
+type = "Word"
+desc = "the high address word of `s_addr`"
+def = {poly = ["+",
+    ["idx", "s_addr", 4],
+    ["*", ["^", 2, 8], ["idx", "s_addr", 5]],
+    ["*", ["^", 2, 16], ["idx", "s_addr", 6]],
+    ["*", ["^", 2, 24], ["idx", "s_addr", 7]]]}
+
+[[variables.virtual]]
+name = "absorbed"
+type = [[["Byte", 8], 5], 5]
+desc = "the state handed to the permutation: `xored` on the 17 rate lanes, `state_in` on the 8 capacity lanes"
+def = {polys = [
+    {iters = [["x", 0, 4], ["y", 0, 2], ["z", 0, 7]], poly = ["idx", ["idx", "xored", ["+", ["*", 5, "y"], "x"]], "z"]},
+    {iters = [["x", 0, 1], ["y", 3], ["z", 0, 7]], poly = ["idx", ["idx", "xored", ["+", ["*", 5, "y"], "x"]], "z"]},
+    {iters = [["x", 2, 4], ["y", 3], ["z", 0, 7]], poly = ["idx", ["idx", ["idx", "state_in", "x"], "y"], "z"]},
+    {iters = [["x", 0, 4], ["y", 4], ["z", 0, 7]], poly = ["idx", ["idx", ["idx", "state_in", "x"], "y"], "z"]},
+]}
+
+# =============================================================================
+# Assumptions
+#
+# These are guarantees the *executor* enforces before an absorb call is ever
+# logged; a program violating one of them traps instead of producing a trace.
+# The chip does not re-derive them, so they are part of its trusted boundary.
+# =============================================================================
+
+[[assumptions]]
+desc = "$#`n` > 0$: an absorb call has at least one rate block"
+
+[[assumptions]]
+desc = "$#`s_addr` mod 8 = 0$ and $#`d` mod 8 = 0$ on the first row: both pointers are lane-aligned"
+
+[[assumptions]]
+desc = "the *last* byte of each region --- $#`s_addr` + 199$ and $#`d` + 136#`n` - 1$ --- neither overflows $2^64$ nor its own low address word. The chip forms per-access addresses as $#`base`_0 + #`offset`$ with $#`base`_1$ untouched, which is only faithful when the low word has the room; a prover that lies here produces `MEMW` tokens no memory cell can match, so the failure is closed rather than silent"
+
+[[assumptions]]
+desc = "the state region and the message region are disjoint. Every read of this call happens at one timestamp, so an overlap would put two accesses on a single $(#`address`, #`timestamp`)$ pair, which the memory argument cannot order"
+
+[[assumptions]]
+desc = "the message consists of *whole* rate blocks: `pad10*1` is applied by the caller, which sends the final, partial block through the `KECCAK` accelerator instead (@keccak). Nothing in this chip depends on, or checks, the padding"
+
+# =============================================================================
+# Constraints
+# =============================================================================
+
+[[constraint_groups]]
+name = "output"
+
+# ECALL -4, i.e. 2^64 - 4 read as an unsigned 64-bit value.
+[[constraints.output]]
+kind = "interaction"
+tag = "ECALL"
+input = ["timestamp", ["cast", ["-", ["^", 2, 64], 4], "DWordWL"]]
+multiplicity = ["-", "μ_first"]
+ref = "sponge:c:receive_ecall"
+
+[[constraint_groups]]
+name = "registers"
+
+[[constraints.registers]]
+kind = "interaction"
+tag = "MEMW"
+input = [1, ["cast", ["*", 2, 10], "DWordWL"], ["arr", "s_lo", "s_hi", 0, 0, 0, 0, 0, 0], "timestamp", 1, 0, 0]
+output = ["arr", "s_lo", "s_hi", 0, 0, 0, 0, 0, 0]
+multiplicity = "μ_first"
+ref = "sponge:c:read_state_ptr"
+
+[[constraints.registers]]
+kind = "interaction"
+tag = "MEMW"
+input = [1, ["cast", ["*", 2, 11], "DWordWL"], ["arr", ["idx", "d", 0], ["idx", "d", 1], 0, 0, 0, 0, 0, 0], "timestamp", 1, 0, 0]
+output = ["arr", ["idx", "d", 0], ["idx", "d", 1], 0, 0, 0, 0, 0, 0]
+multiplicity = "μ_first"
+ref = "sponge:c:read_data_ptr"
+
+[[constraints.registers]]
+kind = "interaction"
+tag = "MEMW"
+input = [1, ["cast", ["*", 2, 12], "DWordWL"], ["arr", ["idx", "n", 0], ["idx", "n", 1], 0, 0, 0, 0, 0, 0], "timestamp", 1, 0, 0]
+output = ["arr", ["idx", "n", 0], ["idx", "n", 1], 0, 0, 0, 0, 0, 0]
+multiplicity = "μ_first"
+ref = "sponge:c:read_n_blocks"
+
+[[constraint_groups]]
+name = "mem"
+
+# Alignment of the state pointer: its low byte is a multiple of 8.
+[[constraints.mem]]
+kind = "interaction"
+tag = "BYTE_ALU"
+input = [["opsel", "AND"], ["idx", "s_addr", 0], 7]
+output = 0
+multiplicity = "μ"
+ref = "sponge:c:state_ptr_alignment"
+
+# `s_addr`'s bytes feed the linear address recombines `s_lo`/`s_hi`, so they
+# need explicit range checks: without them a prover could encode non-byte
+# values that leave `s_lo`/`s_hi` (and hence every MEMW tuple) intact while
+# dodging the alignment lookup above.
+[[constraints.mem]]
+kind = "interaction"
+tag = "ARE_BYTES"
+input = [["idx", "s_addr", ["*", 2, "i"]], ["idx", "s_addr", ["+", ["*", 2, "i"], 1]]]
+iter = ["i", 0, 3]
+multiplicity = "μ"
+ref = "sponge:c:range_s_addr"
+
+# The pre-call state is read lane by lane, at the ECALL's timestamp, on the
+# first row only. Pure reads: the value read is written back unchanged.
+[[constraints.mem]]
+kind = "interaction"
+tag = "MEMW"
+input = [0, ["arr", ["+", "s_lo", ["*", 8, ["+", ["*", 5, "y"], "x"]]], "s_hi"], ["idx", ["idx", "state_in", "x"], "y"], "timestamp", 0, 0, 1]
+output = ["idx", ["idx", "state_in", "x"], "y"]
+iters = [["x", 0, 4], ["y", 0, 4]]
+multiplicity = "μ_first"
+ref = "sponge:c:read_state"
+
+# Every row reads its own 17 message lanes, also at the ECALL's timestamp.
+[[constraints.mem]]
+kind = "interaction"
+tag = "MEMW"
+input = [0, ["arr", ["+", ["idx", "d", 0], ["*", 8, "j"]], ["idx", "d", 1]], ["idx", "block", "j"], "timestamp", 0, 0, 1]
+output = ["idx", "block", "j"]
+iter = ["j", 0, 16]
+multiplicity = "μ"
+ref = "sponge:c:read_block"
+
+# The final state is written back on the last row, one timestamp later, so
+# that no (address, timestamp) pair carries two accesses.
+[[constraints.mem]]
+kind = "interaction"
+tag = "MEMW"
+input = [0, ["arr", ["+", "s_lo", ["*", 8, ["+", ["*", 5, "y"], "x"]]], "s_hi"], ["idx", ["idx", "state_out", "x"], "y"], ["arr", ["+", ["idx", "timestamp", 0], 1], ["idx", "timestamp", 1]], 0, 0, 1]
+iters = [["x", 0, 4], ["y", 0, 4]]
+multiplicity = "μ_last"
+ref = "sponge:c:write_state"
+
+[[constraint_groups]]
+name = "absorb"
+
+# The message is XORed into the 17 rate lanes, lane `5y + x` of the state
+# against lane `5y + x` of the block. The lookup range-checks both operands
+# and pins the result, so `xored` needs no separate range check.
+[[constraints.absorb]]
+kind = "interaction"
+tag = "BYTE_ALU"
+input = [["opsel", "XOR"], ["idx", ["idx", ["idx", "state_in", "x"], "y"], "z"], ["idx", ["idx", "block", ["+", ["*", 5, "y"], "x"]], "z"]]
+output = ["idx", ["idx", "xored", ["+", ["*", 5, "y"], "x"]], "z"]
+iters = [["x", 0, 4], ["y", 0, 2], ["z", 0, 7]]
+multiplicity = "μ"
+ref = "sponge:c:absorb_xor"
+
+[[constraints.absorb]]
+kind = "interaction"
+tag = "BYTE_ALU"
+input = [["opsel", "XOR"], ["idx", ["idx", ["idx", "state_in", "x"], "y"], "z"], ["idx", ["idx", "block", ["+", ["*", 5, "y"], "x"]], "z"]]
+output = ["idx", ["idx", "xored", ["+", ["*", 5, "y"], "x"]], "z"]
+iters = [["x", 0, 1], ["y", 3, 3], ["z", 0, 7]]
+multiplicity = "μ"
+ref = "sponge:c:absorb_xor_tail"
+
+[[constraint_groups]]
+name = "round"
+
+# The permutation is delegated to KECCAK_RND. Both legs carry `seq`, so every
+# permutation of this call has a key of its own — see the chapter text.
+[[constraints.round]]
+kind = "interaction"
+tag = "KECCAK"
+input = ["timestamp", 0, "seq", "absorbed"]
+multiplicity = "μ"
+ref = "sponge:c:permute_in"
+
+[[constraints.round]]
+kind = "interaction"
+tag = "KECCAK"
+input = ["timestamp", 24, "seq", "state_out"]
+multiplicity = ["-", "μ"]
+ref = "sponge:c:permute_out"
+
+[[constraint_groups]]
+name = "chain"
+
+# Row `k` hands the permuted state, the call's registers and the next block
+# index to row `k + 1`.
+[[constraints.chain]]
+kind = "interaction"
+tag = "KSPONGE"
+input = ["timestamp", ["+", "seq", 1], "n", ["arr", "s_lo", "s_hi"], ["arr", ["+", ["idx", "d", 0], 136], ["idx", "d", 1]], "state_out"]
+multiplicity = ["-", "μ", "μ_last"]
+ref = "sponge:c:send_chain"
+
+[[constraints.chain]]
+kind = "interaction"
+tag = "KSPONGE"
+input = ["timestamp", "seq", "n", ["arr", "s_lo", "s_hi"], "d", "state_in"]
+multiplicity = ["-", ["-", "μ", "μ_first"]]
+ref = "sponge:c:receive_chain"
+
+[[constraint_groups]]
+name = "bits"
+
+[[constraints.bits]]
+kind = "template"
+tag = "IS_BIT"
+input = ["μ"]
+ref = "sponge:c:range_mu"
+
+[[constraints.bits]]
+kind = "template"
+tag = "IS_BIT"
+input = ["μ_first"]
+ref = "sponge:c:range_mu_first"
+
+[[constraints.bits]]
+kind = "template"
+tag = "IS_BIT"
+input = ["μ_last"]
+ref = "sponge:c:range_mu_last"
+
+[[constraints.bits]]
+kind = "arith"
+constraint = "$#`μ_first` + #`μ_last` => #`μ` = 1$"
+desc = "a bookend row is a real row; a single-block call is both bookends at once"
+poly = ["*", ["+", "μ_first", "μ_last"], ["not", "μ"]]
+ref = "sponge:c:bookends_imply_mu"
+
+[[constraints.bits]]
+kind = "arith"
+constraint = "$#`μ_first` => #`seq` = 0$"
+desc = "a call's chain is anchored at block 0; together with the chain increment this pins `seq` to $0, 1, ..., n-1$ and gives every permutation of the call a distinct key"
+poly = ["*", "μ_first", "seq"]
+ref = "sponge:c:first_seq_zero"
+
+[[constraints.bits]]
+kind = "arith"
+constraint = "$#`μ_last` => #`n`_0 = #`seq` + 1$"
+desc = "the call spans exactly `n` rows"
+poly = ["*", "μ_last", ["-", ["idx", "n", 0], "seq", 1]]
+ref = "sponge:c:last_seq_is_n"
+
+[[constraints.bits]]
+kind = "arith"
+constraint = "$#`μ_last` => #`n`_1 = 0$"
+desc = "pinning the *words* of `n`, rather than the recombined value, closes the alias $#`n` + p$: a register holding $#`n` + p$ has $#`n`_1 = 2^32 - 1 != 0$"
+poly = ["*", "μ_last", ["idx", "n", 1]]
+ref = "sponge:c:last_n_high_zero"
