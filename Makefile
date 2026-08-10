@@ -186,8 +186,11 @@ compile-prover-test-elfs: compile-programs-asm compile-recursion-elfs $(PROVER_T
 # Guards the list against drift: a new prover test that reads a Rust guest not in
 # $(PROVER_TEST_GUESTS) would pass in CI (which builds every guest) and panic with
 # "elf not found" on a clean checkout running `make test-prover`. Run from `lint`.
+# Rust guests only — the asm and recursion artifacts are built wholesale, so no
+# list can go stale for them. A prover test reading a bench guest (none do today)
+# would need its own entry here.
 check-prover-test-elfs:
-	@grep -rhoE 'program_artifacts/rust/[A-Za-z0-9_]+\.elf' prover/src prover/tests \
+	@grep -rhoE 'program_artifacts/rust/[A-Za-z0-9_-]+\.elf' prover/src prover/tests \
 		| sed -E 's#.*/##; s#\.elf$$##' | sort -u \
 		| awk -v known="$(PROVER_TEST_GUESTS)" 'BEGIN { n = split(known, a, " "); for (i = 1; i <= n; i++) k[a[i]] = 1 } !($$0 in k) { if (!missing++) print "check-prover-test-elfs: prover tests read Rust guests missing from PROVER_TEST_GUESTS:"; print "  " $$0 } END { if (missing) { print "Add them to PROVER_TEST_GUESTS in the Makefile."; exit 1 } }'
 
