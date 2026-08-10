@@ -54,6 +54,7 @@
       ("keccak.typ", [`KECCAK` accelerator], <keccak>),
       ("ecsm.typ", [`ECSM` accelerator], <ecsm>),
       ("fext.typ", [Extension field accelerator], <fext>),
+      ("hint.typ", [`HINT` chip], <hint>),
     )),
     ("MATHEMATICS", (
       ("limbs_and_carries.typ", [On limb decomposition and carries], <limbs>),
