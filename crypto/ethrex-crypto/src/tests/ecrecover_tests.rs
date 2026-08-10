@@ -57,36 +57,24 @@ fn make_ecdsa_fixture(d: Scalar, kk: Scalar, msg: [u8; 32]) -> ([u8; 64], u8, [u
 fn ecrecover_known_answer_three_tuples() {
     // Three distinct (d, kk, msg) tuples — deterministic, no RNG.
     let tuples: &[(u64, u64, [u8; 32])] = &[
-        (
-            0x0000_0000_0000_0001u64,
-            0x0000_0000_dead_beefu64,
-            {
-                let mut m = [0u8; 32];
-                m[31] = 0x42;
-                m
-            },
-        ),
-        (
-            0x00c0_ffee_dead_beef_u64,
-            0x0123_4567_89ab_cdef_u64,
-            {
-                let mut m = [0u8; 32];
-                m[0] = 0xff;
-                m[31] = 0x01;
-                m
-            },
-        ),
-        (
-            0x0bad_f00d_1337_cafe,
-            0xfeed_face_0000_0001,
-            {
-                let mut m = [0u8; 32];
-                for (i, b) in m.iter_mut().enumerate() {
-                    *b = i as u8;
-                }
-                m
-            },
-        ),
+        (0x0000_0000_0000_0001u64, 0x0000_0000_dead_beefu64, {
+            let mut m = [0u8; 32];
+            m[31] = 0x42;
+            m
+        }),
+        (0x00c0_ffee_dead_beef_u64, 0x0123_4567_89ab_cdef_u64, {
+            let mut m = [0u8; 32];
+            m[0] = 0xff;
+            m[31] = 0x01;
+            m
+        }),
+        (0x0bad_f00d_1337_cafe, 0xfeed_face_0000_0001, {
+            let mut m = [0u8; 32];
+            for (i, b) in m.iter_mut().enumerate() {
+                *b = i as u8;
+            }
+            m
+        }),
     ];
 
     for &(d_u64, kk_u64, msg) in tuples {

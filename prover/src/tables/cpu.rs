@@ -189,6 +189,11 @@ pub struct CpuOperation {
     /// Whether this ECALL is an ECSM (elliptic-curve scalar multiply) syscall
     pub ecall_ecsm: bool,
 
+    /// Whether this ECALL is a non-constraining Hint syscall. The hint operand
+    /// addresses (x10/x11/x12) are recovered from the register state in the trace
+    /// builder, exactly like ECSM.
+    pub ecall_hint: bool,
+
     /// Whether this ECALL is a DMA memcpy. Operands are recovered from x10/x11/x12.
     pub ecall_dma_memcpy: bool,
 }
@@ -238,6 +243,8 @@ impl CpuOperation {
         // in the trace builder.
         let ecall_ecsm =
             f.ecall && log.src1_val == executor::vm::instruction::execution::ECSM_SYSCALL_NUMBER;
+        let ecall_hint =
+            f.ecall && log.src1_val == executor::vm::instruction::execution::HINT_SYSCALL_NUMBER;
         let ecall_dma_memcpy = f.ecall
             && log.src1_val == executor::vm::instruction::execution::DMA_MEMCPY_SYSCALL_NUMBER;
 
@@ -358,6 +365,7 @@ impl CpuOperation {
             ecall_keccak,
             keccak_state_addr,
             ecall_ecsm,
+            ecall_hint,
             ecall_dma_memcpy,
         }
     }

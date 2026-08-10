@@ -164,7 +164,9 @@ fn elf_data_page_commitments(
         &elf,
         &vm_proof.runtime_page_ranges,
         vm_proof.num_private_input_pages,
-    );
+        usize::MAX,
+    )
+    .expect("honest page layout");
     page_configs
         .iter()
         .filter(|c| !c.is_private_input && c.init_values.is_some())

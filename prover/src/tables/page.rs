@@ -84,6 +84,16 @@ pub mod cols {
 /// For zero-init pages, INIT is also preprocessed (constant 0).
 pub const NUM_PREPROCESSED_COLS: usize = 2;
 
+/// Number of preprocessed columns for a **private-input** page: OFFSET only.
+///
+/// INIT holds the private input, so it stays a main-trace column the verifier
+/// never recomputes. OFFSET must still be preprocessed — it is the row's
+/// address (`address_lo = page_base_lo + OFFSET`), and leaving it prover-chosen
+/// lets a witness point a row at any address in the page's high-limb space and
+/// forge that address's memory history. Preprocessing covers columns `0..n`, and
+/// OFFSET is column 0, so `n = 1` isolates exactly the right one.
+pub const NUM_PREPROCESSED_COLS_PRIVATE: usize = 1;
+
 // =========================================================================
 // Types
 // =========================================================================
@@ -419,6 +429,32 @@ pub(crate) fn static_zero_page_commitment(blowup_factor: u8) -> Option<Commitmen
     }
 }
 
+/// Static OFFSET-only commitments for private-input pages, per `blowup_factor`.
+///
+/// Same provenance, regeneration rules and drift-test protection as
+/// [`static_zero_page_commitment`] — read its docs before touching these.
+/// Pinned by `private_page_static_matches_recompute_for_all_blowups`.
+pub(crate) fn static_private_page_commitment(blowup_factor: u8) -> Option<Commitment> {
+    match blowup_factor {
+        2 => Some([
+            0x4a, 0x36, 0x1a, 0x29, 0x02, 0xc8, 0x21, 0x8e, 0xc0, 0xfd, 0x6d, 0xbe, 0xb3, 0x5f,
+            0x70, 0x54, 0xcb, 0xa3, 0xa7, 0x8c, 0xa2, 0x37, 0xdc, 0xa3, 0x51, 0x29, 0xd8, 0xb8,
+            0x94, 0x2d, 0x91, 0x3d,
+        ]),
+        4 => Some([
+            0xa6, 0x53, 0x01, 0xd0, 0x2f, 0x47, 0xca, 0xe8, 0x7a, 0xbd, 0xb7, 0x14, 0x69, 0x28,
+            0xaf, 0x67, 0xc9, 0xe5, 0x2d, 0xd6, 0x41, 0x5f, 0x76, 0xd8, 0xc4, 0x59, 0xdd, 0xaa,
+            0xd2, 0x32, 0x1f, 0x6f,
+        ]),
+        8 => Some([
+            0xe7, 0x13, 0xe3, 0x59, 0xd6, 0xa5, 0xb9, 0xd5, 0xfa, 0xcb, 0x51, 0x8a, 0x42, 0x52,
+            0xaa, 0x25, 0xf9, 0x0d, 0x94, 0xf5, 0xdf, 0x93, 0x56, 0x63, 0x77, 0x2c, 0x08, 0x75,
+            0xb7, 0x68, 0xb0, 0x57,
+        ]),
+        _ => None,
+    }
+}
+
 /// Computes the Merkle root commitment over the LDE of PAGE precomputed columns.
 ///
 /// The commitment covers OFFSET (0..page_size-1) and INIT (from config).
@@ -454,8 +490,19 @@ pub fn compute_precomputed_commitment(config: &PageConfig, options: &ProofOption
         init_col[i] = FE::from(init_byte as u64);
     }
 
-    let columns = [offset_col, init_col];
+    commit_preprocessed_columns(&[offset_col, init_col], num_rows, options)
+}
 
+/// LDE + Merkle-commit a set of preprocessed PAGE columns. Shared by
+/// [`compute_precomputed_commitment`] (OFFSET+INIT) and
+/// [`compute_offset_only_commitment`] (OFFSET alone) so both go through an
+/// identical pipeline — the two commitments must be built the same way or the
+/// verifier's recomputation would not match the prover's tree.
+fn commit_preprocessed_columns(
+    columns: &[Vec<FE>],
+    num_rows: usize,
+    options: &ProofOptions,
+) -> Commitment {
     let polys: Vec<Polynomial<FE>> = columns
         .iter()
         .map(|col| {
@@ -477,6 +524,28 @@ pub fn compute_precomputed_commitment(config: &PageConfig, options: &ProofOption
     let (_, root) = commit_bit_reversed(&lde_columns, ROWS_PER_LEAF)
         .expect("Failed to build Merkle tree for page LDE");
     root
+}
+
+/// Commitment over the OFFSET column **alone** — the preprocessed anchor for
+/// private-input pages.
+///
+/// A private page's INIT holds the private input, which the verifier must not
+/// be able to recompute, so it cannot be preprocessed. OFFSET carries no such
+/// constraint: it is the dense enumeration `0..page_size-1`, byte-identical for
+/// every page of a given size regardless of program *or* input. Committing it
+/// on its own binds the one column that must not be prover-chosen while
+/// publishing nothing about the input.
+///
+/// This is what stops a malicious prover repointing a private page's rows: the
+/// Memory-bus address is `page_base_lo + OFFSET`, so a free OFFSET names an
+/// arbitrary address and forges that address's memory history.
+pub fn compute_offset_only_commitment(options: &ProofOptions) -> Commitment {
+    let num_rows = DEFAULT_PAGE_SIZE;
+    let mut offset_col = crate::tables::types::zeroed_fe_vec(num_rows);
+    for (i, cell) in offset_col.iter_mut().enumerate() {
+        *cell = FE::from(i as u64);
+    }
+    commit_preprocessed_columns(&[offset_col], num_rows, options)
 }
 
 /// Returns the zero-init PAGE preprocessed commitment.
@@ -502,6 +571,29 @@ pub fn zero_init_preprocessed_commitment(options: &ProofOptions) -> Commitment {
         options.coset_offset,
     );
     compute_precomputed_commitment(&PageConfig::zero_init(0), options)
+}
+
+/// Returns the private-input PAGE preprocessed commitment (OFFSET only).
+///
+/// Same static-then-recompute shape as [`zero_init_preprocessed_commitment`].
+/// Because OFFSET depends on neither the program nor the input, one value per
+/// `blowup_factor` covers every private page in the system — and the same value
+/// serves GLOBAL_MEMORY, whose OFFSET column is identical.
+pub fn private_page_preprocessed_commitment(options: &ProofOptions) -> Commitment {
+    if options.coset_offset == 3
+        && let Some(commitment) = static_private_page_commitment(options.blowup_factor)
+    {
+        return commitment;
+    }
+    log::warn!(
+        "private-input page preprocessed commitment not static for \
+         (blowup={}, coset={}); falling back to recompute. Add a match \
+         arm to `static_private_page_commitment` by running \
+         `cargo run --bin compute_static_commitments --release`.",
+        options.blowup_factor,
+        options.coset_offset,
+    );
+    compute_offset_only_commitment(options)
 }
 
 // =========================================================================
