@@ -1,5 +1,6 @@
 .PHONY: deps deps-linux deps-macos compile-programs-asm compile-programs-rust compile-bench \
-compile-programs compile-recursion-elfs clean-asm clean-rust clean-bench clean-shared \
+compile-programs compile-recursion-elfs compile-prover-test-elfs check-prover-test-elfs \
+clean-asm clean-rust clean-bench clean-shared \
 clean-recursion-elfs clean test test-asm \
 test-rust test-ethrex test-ethrex-offline test-executor test-syscalls test-flamegraph flamegraph-prover test-profile-recursion test-profile-recursion-single test-profile-recursion-multi \
 test-profile-recursion-block recursion-profile-block-input \
@@ -47,6 +48,13 @@ ASM_ARTIFACTS := $(patsubst $(ASM_PROGRAMS_DIR)/%.s,$(ASM_ARTIFACTS_DIR)/%.elf,$
 RUST_PROGRAM_DIRS := $(dir $(wildcard $(RUST_PROGRAMS_DIR)/*/Cargo.toml))
 RUST_PROGRAMS := $(notdir $(basename $(RUST_PROGRAM_DIRS:%/=%)))
 RUST_ARTIFACTS := $(addprefix $(RUST_ARTIFACTS_DIR)/, $(addsuffix .elf, $(RUST_PROGRAMS)))
+
+# The Rust guests the prover test suite reads as prebuilt artifacts. The prover
+# targets build these instead of all $(RUST_PROGRAMS), because the .elf rules are
+# FORCE (see below) and would re-enter cargo once per guest on every test run.
+# `check-prover-test-elfs` fails if a prover test reads one that is missing here.
+PROVER_TEST_GUESTS := allocator commit_sum ecsm ef_io_demo ethrex hint_min hint_multi pure_commit
+PROVER_TEST_ARTIFACTS := $(addprefix $(RUST_ARTIFACTS_DIR)/, $(addsuffix .elf, $(PROVER_TEST_GUESTS)))
 
 BENCH_PROGRAM_DIRS := $(dir $(wildcard $(BENCH_PROGRAMS_DIR)/*/Cargo.toml))
 BENCH_PROGRAMS := $(notdir $(basename $(BENCH_PROGRAM_DIRS:%/=%)))
@@ -170,6 +178,18 @@ compile-bench: prepare-sysroot $(BENCH_ARTIFACTS)
 compile-programs: compile-programs-asm compile-programs-rust compile-bench compile-recursion-elfs
 
 compile-recursion-elfs: prepare-sysroot $(RECURSION_ARTIFACTS) $(RECURSION_VERIFIER_ARTIFACTS)
+
+# Everything the prover suite reads off disk: the asm guests (via run_asm_elf),
+# the Rust guests listed above, and the recursion guests.
+compile-prover-test-elfs: compile-programs-asm compile-recursion-elfs $(PROVER_TEST_ARTIFACTS)
+
+# Guards the list against drift: a new prover test that reads a Rust guest not in
+# $(PROVER_TEST_GUESTS) would pass in CI (which builds every guest) and panic with
+# "elf not found" on a clean checkout running `make test-prover`. Run from `lint`.
+check-prover-test-elfs:
+	@grep -rhoE 'program_artifacts/rust/[A-Za-z0-9_]+\.elf' prover/src prover/tests \
+		| sed -E 's#.*/##; s#\.elf$$##' | sort -u \
+		| awk -v known="$(PROVER_TEST_GUESTS)" 'BEGIN { n = split(known, a, " "); for (i = 1; i <= n; i++) k[a[i]] = 1 } !($$0 in k) { if (!missing++) print "check-prover-test-elfs: prover tests read Rust guests missing from PROVER_TEST_GUESTS:"; print "  " $$0 } END { if (missing) { print "Add them to PROVER_TEST_GUESTS in the Makefile."; exit 1 } }'
 
 $(RECURSION_ARTIFACTS_DIR):
 	mkdir -p $@
@@ -535,29 +555,30 @@ test: compile-programs test-syscalls test-ethrex-crypto
 
 # === Quick test shortcuts ===
 
-# Fast prover tests (skips ignored slow tests). Recursion smoke/PoC tests read
-# prebuilt guest ELFs, so build them first.
-test-fast: compile-recursion-elfs
+# Fast prover tests (skips ignored slow tests). The executor leg reads most of
+# the Rust guests, so this one needs the full set rather than the prover subset.
+test-fast: compile-programs-asm compile-programs-rust compile-recursion-elfs
 	cargo test -p lambda-vm-prover -p stark -p executor -F stark/parallel
 
 # Prover tests only
-test-prover: compile-recursion-elfs
+test-prover: compile-prover-test-elfs
 	cargo test -p lambda-vm-prover
 
 # Prover tests including slow ones. The recursion smoke tests read prebuilt
 # guest ELFs from executor/program_artifacts/recursion/ — the fast ones on every
 # run, the slow ones (still #[ignore]d) only under --include-ignored — so build
 # them first.
-test-prover-all: compile-recursion-elfs
+test-prover-all: compile-prover-test-elfs
 	cargo test -p lambda-vm-prover -- --include-ignored
 
 # Prover tests with debug-checks (shows bus balance report). Also unfiltered, so
 # it runs the non-ignored recursion tests that read prebuilt guest ELFs.
-test-prover-debug: compile-recursion-elfs
+test-prover-debug: compile-prover-test-elfs
 	cargo test -p lambda-vm-prover --features debug-checks -- --nocapture
 
 # Disk-spill tests (stark + prover). FORCE_DISK_SPILL is required by the prover tests.
-test-disk-spill:
+# The count_table_lengths filter picks up the drift tests, which read hint_min.elf.
+test-disk-spill: compile-prover-test-elfs
 	cargo test --release -p stark --features disk-spill disk_spill
 	FORCE_DISK_SPILL=1 cargo test --release -p lambda-vm-prover --features disk-spill -- disk_spill count_table_lengths
 
@@ -583,9 +604,9 @@ test-cuda-fallback:
 # GPU + nvcc). The GPU CI counterpart of CPU CI's sharded prover tests. Single-threaded: the
 # GPU serializes proves and the dispatch counters are process-global. cuda on prover cascades
 # to stark; crypto/ecsm build without it (they have no GPU path).
-# compile-recursion-elfs: this unfiltered run executes the non-ignored recursion
-# smoke tests, which read prebuilt guest ELFs; scripts/gpu_test.sh otherwise never builds them.
-test-prover-cuda: compile-recursion-elfs
+# compile-prover-test-elfs: this unfiltered run executes the non-ignored tests that
+# read prebuilt guest ELFs; scripts/gpu_test.sh otherwise never builds them.
+test-prover-cuda: compile-prover-test-elfs
 	cargo test --release -p lambda-vm-prover -p stark -p crypto -p ecsm \
 	    --features lambda-vm-prover/cuda -- --test-threads=1
 
@@ -630,7 +651,7 @@ fmt:
 	cargo fmt --all
 
 # Run clippy + fmt check (used by CI)
-lint:
+lint: check-prover-test-elfs
 	cargo fmt --check --all
 	cargo clippy --workspace --all-targets -- -D warnings -A clippy::op_ref
 	cargo clippy --workspace --all-targets --no-default-features --features lambda-vm-prover/debug-checks -- -D warnings -A clippy::op_ref
