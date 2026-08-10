@@ -1614,41 +1614,6 @@ where
     true
 }
 
-/// Diagnostic: download a resident ext3 handle (3-slab layout) as per-column
-/// host Vecs. Used by the xcheck post-mortem to compare the committed R2
-/// parts against a host recompute.
-pub(crate) fn download_ext3_columns<E>(
-    h: &math_cuda::lde::GpuLdeExt3,
-) -> Option<Vec<Vec<FieldElement<E>>>>
-where
-    E: IsField + 'static,
-{
-    if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
-        return None;
-    }
-    let be = math_cuda::device::backend().ok()?;
-    let stream = be.next_stream();
-    h.wait_ready_on(&stream).ok()?;
-    let slabs = stream.clone_dtoh(h.buf.as_ref()).ok()?;
-    stream.synchronize().ok()?;
-    let (m, lde) = (h.m, h.lde_size);
-    if slabs.len() != m * lde * 3 {
-        return None;
-    }
-    let mut cols = Vec::with_capacity(m);
-    for c in 0..m {
-        let mut interleaved = vec![0u64; lde * 3];
-        for k in 0..3 {
-            let slab = &slabs[(c * 3 + k) * lde..(c * 3 + k + 1) * lde];
-            for r in 0..lde {
-                interleaved[r * 3 + k] = slab[r];
-            }
-        }
-        cols.push(u64_to_ext3_vec::<E>(&interleaved));
-    }
-    Some(cols)
-}
-
 pub fn gpu_batch_invert_calls() -> u64 {
     GPU_BATCH_INVERT_CALLS.load(Ordering::Relaxed)
 }
