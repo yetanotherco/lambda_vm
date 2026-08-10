@@ -5,7 +5,9 @@
 //! regressions (GPU path fired but produced output that fails verification).
 //!
 //! `#[ignore]`'d so the no-GPU CI path skips it. Run via `make test-cuda-integration`
-//! or `cargo test -p lambda-vm-prover --release --features cuda --test cuda_path_integration -- --ignored --nocapture`.
+//! or `cargo test -p lambda-vm-prover --release --features cuda --test cuda_path_integration -- --ignored --nocapture --test-threads=1`.
+//! The single test thread is not optional: the counters these tests assert on
+//! are process-global, so parallel proves in one process cross-contaminate them.
 #![cfg(feature = "cuda")]
 
 use lambda_vm_prover::test_utils::asm_elf_bytes;
@@ -183,7 +185,10 @@ fn gpu_opening_gather_fires_and_verifies() {
 /// the happy path (none may fire) plus the GPU-only R2/R3/R4 paths reading the
 /// device LDE with no host trace behind them. A regression that silently
 /// reverts to the host D2H drops the counter to 0 (while the proof would still
-/// verify), and a mis-gate that forces a host fallback panics one of the guards.
+/// verify). A mis-gate that forces a host fallback shows up one of two ways:
+/// at R3/R4 it panics one of the guards, while at R2 and the R1 resident-aux
+/// commit it recovers silently and is caught by the downgrade-counter
+/// assertion below.
 #[test]
 #[ignore = "requires GPU; run with --ignored --nocapture"]
 fn gpu_device_only_residency_fires_and_verifies() {
@@ -197,8 +202,10 @@ fn gpu_device_only_residency_fires_and_verifies() {
     assert_eq!(
         stark::gpu_lde::gpu_device_only_downgrades(),
         0,
-        "a device-only table was downgraded back to host on the happy path \
-         (a device dispatch declined that the gate should mirror)"
+        "a table was downgraded back to a host trace on the happy path \
+         (a device dispatch declined at runtime: on a device-only table the \
+          gate should mirror the missing condition; a resident-aux decline is \
+          usually VRAM pressure)"
     );
     assert!(
         verify(&proof, &elf).expect("verify"),

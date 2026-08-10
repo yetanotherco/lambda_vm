@@ -56,13 +56,24 @@ fn gpu_lde_threshold() -> usize {
     })
 }
 
-/// Serialize the device R2 window (constraint eval + decompose) across
-/// tables. Concurrent R2 windows under VRAM pressure can transiently corrupt
-/// a whole H buffer (root mechanism unidentified; reruns on the same resident
-/// inputs come out correct), yielding a proof that fails verification.
-/// Serializing only this window eliminates it at negligible cost — the
-/// windows rarely overlap. `LAMBDA_VM_GPU_SERIALIZE_R2=0` disables the lock
-/// (e.g. to bisect or once the underlying race is fixed).
+/// Serialize the SUBMISSION of the device R2 window (constraint eval +
+/// decompose) across tables. Concurrent R2 windows under VRAM pressure can
+/// transiently corrupt a whole H buffer (root mechanism unidentified; reruns
+/// on the same resident inputs come out correct), yielding a proof that fails
+/// verification. Holding this lock empirically suppresses that at negligible
+/// cost — the windows rarely overlap.
+///
+/// How much it enforces depends on the table. One that keeps its host trace
+/// ends the window in a blocking D2H (the `want_host` arm of
+/// [`try_decompose_extend_d2_dev`]), so the guard is held until that table's
+/// kernels have completed — a real execution barrier. A device-only table's
+/// window is enqueue-only, so two tables' R2 kernels can still overlap on
+/// device; what the lock orders there is submission and allocation, which is
+/// enough to suppress the corruption in practice but is not a guarantee that
+/// R2 kernels never run concurrently.
+///
+/// `LAMBDA_VM_GPU_SERIALIZE_R2=0` disables the lock (e.g. to bisect or once
+/// the underlying race is fixed).
 pub(crate) fn r2_serialize_guard() -> Option<std::sync::MutexGuard<'static, ()>> {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -195,12 +206,23 @@ pub(crate) fn device_only_disabled() -> bool {
 
 /// Stage-3 device-only gate: `true` when a table's round-1 LDE can be left
 /// device-resident (host D2H skipped) because every downstream round is
-/// guaranteed to take its GPU path. A strict AND of all preconditions that
-/// imply the R2 composition, R3 barycentric, R4 DEEP, and R4 opening GPU paths
-/// all fire and read the device LDE. The per-round `host_trace_empty`
-/// hard-abort guards are the safety net: if any precondition is nonetheless
-/// violated at runtime (mis-gate or transient GPU error), the prove aborts
-/// loudly rather than reading the empty host trace.
+/// guaranteed to take its GPU path. A strict AND of the numeric and shape
+/// preconditions that imply the R2 composition, R3 barycentric, R4 DEEP, and
+/// R4 opening GPU paths all fire and read the device LDE — but not the whole
+/// predicate on its own: the caller `IsStarkProver::device_only_for`
+/// (prover.rs) adds the AIR-level preconditions this signature does not
+/// carry, notably the d=2 quotient part count the device-resident R2 path
+/// requires.
+///
+/// If a precondition is nonetheless violated at runtime (mis-gate or
+/// transient GPU error), what happens depends on the round. R2 and the R1
+/// resident-aux commit recover: they download what the host arms need (the
+/// resident LDEs at R2, the resident aux trace plus the main LDE at R1), bump
+/// [`GPU_DEVICE_ONLY_DOWNGRADES`] and continue host-backed — slower, never
+/// wrong — aborting only when the resident handles cannot serve the data. R3
+/// and R4 have no such recovery: the R3 barycentric arms assert on the buffer
+/// they are about to read and the R4 guards on `host_trace_empty`, both
+/// failing loudly rather than reading an empty host trace.
 ///
 /// `zerofier_uniform` must be the R1-derived conservative form (all constraints
 /// share `end_exemptions == 0`), which implies `ZerofierEvaluations::is_uniform`
@@ -208,8 +230,11 @@ pub(crate) fn device_only_disabled() -> bool {
 ///
 /// LOCKSTEP: this gate must IMPLY the runtime dispatch checks in
 /// `ConstraintEvaluator::try_evaluate_composition_gpu` (plus the R3/R4 device
-/// arms). A fallback condition added to a dispatch without a mirror here turns
-/// every gate-true table into a hard-abort — loud, but an avoidable crash.
+/// arms). A fallback condition added to a dispatch without a mirror here
+/// costs every gate-true table either a hard-abort at R3/R4 — loud, but an
+/// avoidable crash — or, at R2 and the R1 resident-aux commit, a silent
+/// downgrade to the host path, which is what [`GPU_DEVICE_ONLY_DOWNGRADES`]
+/// exists to surface.
 pub(crate) fn device_only_gate<F, E>(
     lde_size: usize,
     n: usize,
@@ -1437,11 +1462,16 @@ pub fn gpu_fri_calls() -> u64 {
 /// are counted here, so a single failed dispatch does not necessarily lower
 /// the total; R3's fallbacks are CPU-only, so a failure there does.
 pub(crate) static GPU_BATCH_INVERT_CALLS: AtomicU64 = AtomicU64::new(0);
-/// Times a device-only table had to be downgraded back to a host trace
-/// because a downstream device path missed at runtime (see
-/// [`materialize_lde_trace_host`]). Nonzero values mean the device-only gate
-/// admitted a table some dispatch later declined — correct but slower, and
-/// worth mirroring the missing condition into the gate.
+/// Times a table had to fall back to a host trace whose data first had to be
+/// downloaded off the device, because a device path declined at runtime (see
+/// [`materialize_lde_trace_host`] and [`materialize_aux_trace_host`]).
+/// Nonzero means a device dispatch declined and the table continued
+/// host-backed — correct but slower. Not every one is a gate miss: the R1
+/// resident-aux site is entered whenever `aux_resident()` is set, whatever
+/// the device-only gate said, so it also counts declines on tables that were
+/// never device-only. Mirroring the missing condition into the gate is the
+/// fix for the device-only case; a resident-aux decline is usually transient
+/// VRAM pressure instead.
 pub(crate) static GPU_DEVICE_ONLY_DOWNGRADES: AtomicU64 = AtomicU64::new(0);
 pub fn gpu_device_only_downgrades() -> u64 {
     GPU_DEVICE_ONLY_DOWNGRADES.load(Ordering::Relaxed)
@@ -1456,8 +1486,9 @@ pub fn gpu_device_only_downgrades() -> u64 {
 /// reason a dynamic dispatch might decline (kernel eligibility, transient
 /// errors, shapes a new workload brings), so any miss lands here and degrades
 /// to a slower-but-correct CPU round instead of a hard abort. Returns false
-/// (→ the caller's abort) only when a missing side has no handle or a
-/// download fails.
+/// (→ the caller's abort) when the resident handles cannot serve the data: a
+/// missing handle or bound stream, a handle whose shape disagrees with the
+/// trace, a failed download or sync, or a field tower with no CUDA lowering.
 pub(crate) fn materialize_lde_trace_host<F, E>(
     lde_trace: &mut crate::trace::LDETraceTable<F, E>,
 ) -> bool
