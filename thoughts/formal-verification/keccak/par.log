@@ -1,0 +1,41 @@
+DONE pos True -> output uniquely pinned to reference
+DONE bug chi_swap -> sat
+DONE bug rho_swap -> sat
+DONE bug chi_no_not -> sat
+DONE bug theta_no_rot -> sat
+DONE bug iota_no_rc -> sat
+DONE round 3 -> unsat
+DONE round 2 -> unsat
+DONE round 5 -> unsat
+DONE round 0 -> unsat
+DONE round 1 -> unsat
+DONE round 9 -> unsat
+DONE round 7 -> unsat
+DONE round 8 -> unsat
+DONE round 4 -> unsat
+DONE round 6 -> unsat
+DONE round 10 -> unsat
+DONE round 12 -> unsat
+DONE round 16 -> unsat
+DONE round 17 -> unsat
+DONE round 11 -> unsat
+DONE round 13 -> unsat
+DONE round 14 -> unsat
+DONE round 18 -> unsat
+DONE round 15 -> unsat
+DONE round 19 -> unsat
+DONE round 21 -> unsat
+DONE round 22 -> unsat
+DONE round 20 -> unsat
+DONE round 23 -> unsat
+
+================ SUMMARY ================
+positive control (non-vacuity): PASS  (output uniquely pinned to reference)
+negative control theta_no_rot  : sat    OK
+negative control rho_swap      : sat    OK
+negative control chi_no_not    : sat    OK
+negative control chi_swap      : sat    OK
+negative control iota_no_rc    : sat    OK
+main check: ALL 24 UNSAT
+
+VERDICT: VERIFIED (given contracts)
