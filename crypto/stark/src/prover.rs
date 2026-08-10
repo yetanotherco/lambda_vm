@@ -310,8 +310,15 @@ where
         // safety property — if the `device_only` gate held but the GPU keep path
         // fell back to CPU, the buffer is populated and this stays false, so the
         // proof runs on the host trace as normal. A mixed state (one buffer
-        // empty, the other full) is treated as device-only so any host read
-        // hard-aborts rather than indexing an empty buffer.
+        // empty, the other full) still sets the flag, and is legal rather than
+        // an error: the aux commit may be more conservative than the main one
+        // (never less), so an aux side that kept its host copy can sit next to
+        // a device-only main. The R3 barycentric arms therefore guard on the
+        // individual buffer — the side that still holds host data stays
+        // readable — while the flag keeps the R4 and host-evaluator guards
+        // armed. Reading the real state also picks up an R1 resident-aux
+        // downgrade: it repopulates the host buffers before this point, so the
+        // flag simply comes out false.
         #[cfg(feature = "cuda")]
         let main_empty = num_main_cols > 0 && main_data.is_empty();
         #[cfg(feature = "cuda")]
@@ -1021,20 +1028,25 @@ pub trait IsStarkProver<
         domain: &Domain<Field>,
     ) -> bool {
         // Preconditions the downstream GPU paths require that the numeric gate
-        // below does not capture. A table missing either would pass the gate,
-        // skip its host D2H, then hard-abort in round 2:
+        // below does not capture. A table missing any of them would pass the
+        // gate and skip its host D2H, leaving round 2 to recover through
+        // `materialize_lde_trace_host` — correct, but a downgrade, and an
+        // abort if the resident handles cannot serve the data:
         //  - R2 composition unconditionally needs a device aux handle
         //    (`gpu_aux()?`), so the table must declare an aux trace.
         //  - The composition path needs a uniform zerofier with ≥1 group. An
         //    empty constraint set makes `all(end_exemptions == 0)` vacuously
         //    true here but `is_uniform()` false downstream (0 groups).
+        //  - The device-resident R2 path exists only for the d=2 quotient
+        //    decomposition, checked below once `n` is in hand.
         if !air.has_aux_trace() || air.constraints_meta().is_empty() {
             return false;
         }
         let n = domain.interpolation_domain_size;
         // The device-resident R2 path only exists for the d=2 quotient
         // decomposition; any other part count skips it entirely and needs the
-        // host evaluator, which device-only leaves without data.
+        // host evaluator, which device-only would leave without data until the
+        // R2 downgrade recovered it.
         if air.composition_poly_degree_bound(n) / n != 2 {
             return false;
         }
@@ -1602,10 +1614,13 @@ pub trait IsStarkProver<
         #[cfg(feature = "cuda")]
         if number_of_parts == 2 {
             // Serializing this window across tables (device constraint eval +
-            // decompose, where H is born) eliminates a transient whole-buffer
-            // H corruption seen under concurrent R2 windows on VRAM pressure.
-            // The commit, the host decompose of a downloaded `H` and every
-            // host arm run outside the lock.
+            // decompose, where H is born) empirically eliminates a transient
+            // whole-buffer H corruption seen under concurrent R2 windows on
+            // VRAM pressure. What the guard orders is submission: a
+            // device-only table's window is enqueue-only, so its kernels may
+            // still overlap another table's on device. The commit, the host
+            // decompose of a downloaded `H` and every host arm run outside
+            // the lock.
             let _r2_serial_guard = crate::gpu_lde::r2_serialize_guard();
             if let Some(h_dev) = evaluator.evaluate_dev(
                 air,
@@ -1647,16 +1662,16 @@ pub trait IsStarkProver<
         // Every arm below runs the HOST evaluator, which reads `get_main` /
         // `get_aux`. Under device-only those buffers are intentionally empty,
         // so landing here means the device decompose AND the `H` download both
-        // failed. Abort with the device-only contract's message rather than a
-        // bare index-out-of-bounds from somewhere inside the evaluator.
+        // failed. The gate is a static predicate and cannot mirror every
+        // dynamic decline, so recover rather than abort: download the resident
+        // LDEs into the host buffers (which also clears the device-only flag)
+        // and let the host arms run — slower for this table, never wrong. The
+        // assert is left for the case where the handles themselves cannot
+        // serve the data, so that failure carries the device-only contract's
+        // message rather than a bare index-out-of-bounds from somewhere inside
+        // the evaluator.
         #[cfg(feature = "cuda")]
         if precomputed_parts.is_none() && round_1_result.lde_trace.host_trace_empty() {
-            // The device R2 path missed on a device-only table. The gate is a
-            // static predicate and cannot mirror every dynamic decline, so
-            // recover instead of aborting: download the resident LDEs from
-            // the device handles and continue on the host path — slower for
-            // this table, never wrong. The abort remains only for the case
-            // where the handles themselves cannot serve the data.
             let recovered =
                 crate::gpu_lde::materialize_lde_trace_host(&mut round_1_result.lde_trace);
             assert!(

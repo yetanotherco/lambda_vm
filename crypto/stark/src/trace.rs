@@ -328,12 +328,18 @@ where
     pub(crate) lde_step_size: usize,
     pub(crate) blowup_factor: usize,
     /// Full-residency (Stage 3): when true the round-1 D2H was intentionally
-    /// skipped and `main_data`/`aux_data` are empty — every round reads the LDE
-    /// off the device instead. Any code path that would read the host trace must
-    /// hard-abort on this flag rather than index an empty buffer, so a mis-gate
-    /// or an unexpected GPU fallback fails loudly instead of producing a wrong
-    /// proof. Set by `build_round1` when the device-only gate kept this table's
-    /// round-1 LDE on the GPU.
+    /// skipped and at least one of `main_data`/`aux_data` is empty — those
+    /// columns are read off the device instead. Set by `build_round1` when the
+    /// device-only gate kept this table's round-1 LDE on the GPU, and cleared
+    /// again by `set_host_data` once a downgrade has downloaded the resident
+    /// LDEs back into the host buffers.
+    ///
+    /// The R4 and host-evaluator guards hard-abort on this flag rather than
+    /// index an empty buffer, so a mis-gate or an unexpected GPU fallback
+    /// fails loudly instead of producing a wrong proof. The R3 barycentric
+    /// arms instead check the individual buffer they are about to read: mixed
+    /// states (one side host-backed, the other device-only) are valid, and the
+    /// populated side stays readable.
     #[cfg(feature = "cuda")]
     pub(crate) host_trace_empty: bool,
     /// Per table GPU residency session: owns this table's device LDE buffers
@@ -525,8 +531,11 @@ where
     }
 
     /// Mark this table's host LDE trace as intentionally empty (Stage-3
-    /// device-only path): the round-1 D2H was skipped and every host-trace read
-    /// must hard-abort instead of indexing the empty buffers.
+    /// device-only path): the round-1 D2H was skipped, so the R4 and
+    /// host-evaluator reads hard-abort on the flag instead of indexing the
+    /// empty buffers, while the R3 arms consult the individual buffer. Cleared
+    /// by [`Self::set_host_data`] once a downgrade has downloaded the resident
+    /// LDEs back to the host.
     #[cfg(feature = "cuda")]
     pub fn set_host_trace_empty(&mut self, empty: bool) {
         self.host_trace_empty = empty;
@@ -563,8 +572,11 @@ where
     }
 
     /// Whether the host LDE trace was intentionally left empty (see
-    /// [`Self::set_host_trace_empty`]). Guards on every host-read fallback check
-    /// this before touching `main_data`/`aux_data`.
+    /// [`Self::set_host_trace_empty`]). The R4 and host-evaluator fallbacks
+    /// check this before touching `main_data`/`aux_data`; the R3 barycentric
+    /// arms check the individual buffer instead, since a mixed state leaves
+    /// one side readable. False again once a downgrade has repopulated the
+    /// buffers through [`Self::set_host_data`].
     #[cfg(feature = "cuda")]
     pub fn host_trace_empty(&self) -> bool {
         self.host_trace_empty
