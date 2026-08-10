@@ -3,12 +3,13 @@ use riscv as _;
 const MAX_MEMORY_SIZE: usize = 0xC000_0000;
 const WORD_SIZE: usize = 4;
 
-// Guest global allocator, selectable at build time. The default was chosen on a measured
-// three-way A/B against embedded-alloc's TLSF heap (the previous default, now removed) and
-// dlmalloc: bump spends the fewest guest cycles and proves fastest at the epochs worth
-// running, and it pays for that with a 0.6..1.0% larger proof bundle at every epoch and a
-// loss at epoch 2^20, where eight epochs amplify the pages its non-reuse touches. Numbers,
-// fixtures and method are in #869; the real block does not resolve the difference.
+// Guest global allocator, selectable at build time. The default was chosen on measured A/Bs
+// against embedded-alloc's TLSF heap (the previous default, now removed) on guest cycles, and
+// against dlmalloc on cycles, proving time, proof size and peak RSS: bump spends the fewest
+// guest cycles and proves fastest at the epochs worth running, and against dlmalloc it pays
+// for that with a 0.6..1.0% larger proof bundle at every epoch and a loss at epoch 2^20, where
+// eight epochs amplify the pages its non-reuse touches. Numbers, fixtures and method are in
+// #869, which reports the dlmalloc arm; the real block does not resolve the difference.
 //
 //   - default: a monotonic bump allocator. No free lists and no coalescing -- `alloc` moves
 //     a cursor, `dealloc` is empty -- so it spends the fewest guest instructions per
