@@ -31,7 +31,7 @@ use std::collections::HashSet;
 
 use executor::elf::Elf;
 use executor::vm::instruction::decoding::Instruction;
-use executor::vm::instruction::execution::dma_memcpy_trace_rows;
+use executor::vm::instruction::execution::dma_memcpy_data_rows;
 use executor::vm::logs::Log;
 use executor::vm::memory::U64HashMap;
 #[cfg(feature = "parallel")]
@@ -981,7 +981,7 @@ fn collect_dma_memcpy_ops(
         "successful DMA ecall must respect the per-call chunk bound"
     );
 
-    let data_rows = dma_memcpy_trace_rows(count) - 1;
+    let data_rows = dma_memcpy_data_rows(count);
     let capacity = usize::try_from(data_rows)
         .ok()
         .and_then(|n| n.checked_mul(2)?.checked_add(3))
@@ -1164,7 +1164,16 @@ fn replay_dma_memcpy_for_sizing(
         );
     }
 
-    snapshot_count + 1
+    let rows = snapshot_count + 1;
+    // This pass counts rows by replaying the chunk loop rather than by calling the
+    // shared formula, so pin the two together: a sizing pass that disagrees with
+    // the trace builder mis-sizes the spilled DMA trace.
+    debug_assert_eq!(
+        rows as u64,
+        executor::vm::instruction::execution::dma_memcpy_trace_rows(count),
+        "sizing-pass row count must match the shared DMA row formula"
+    );
+    rows
 }
 
 /// Collects register read/write operations (M1, M3, M5) from CpuOperation,

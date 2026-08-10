@@ -144,10 +144,10 @@ enum Commands {
         /// Print the dynamic instruction (cycle) count, plus `Keccak calls` /
         /// `Ecsm calls` / `Dma calls` (accelerator syscall invocations), and for
         /// DMA the `Dma bytes` copied and the `Dma rows` those copies add to the
-        /// trace. One `memcpy` is chunked into several DMA ecalls, so the byte
-        /// and row lines, not the call count, are what the copies cost. The
-        /// accelerator lines are omitted when combined with --flamegraph (that
-        /// path has no per-log data).
+        /// trace before its power-of-two padding. One `memcpy` is chunked into
+        /// several DMA ecalls, so the byte and row lines, not the call count, are
+        /// what the copies cost. The accelerator lines are omitted when combined
+        /// with --flamegraph (that path has no per-log data).
         #[arg(long)]
         cycles: bool,
     },

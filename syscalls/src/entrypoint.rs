@@ -33,6 +33,17 @@ pub unsafe extern "C" fn _start() -> ! {
 // "always-linked runtime" mechanism the accelerated-memory-operations standard
 // requires vendors to pick and document; see `docs/general_flow.md`.
 //
+// This placement is insurance, not a repair for an observed failure: in
+// `syscalls.rs` the symbol also won resolution, because rustc merged that module
+// into a codegen unit every guest already pulled in for `commit` and `sys_halt`.
+// What it buys is not depending on that — codegen-unit merging is an internal
+// rustc decision, and a guest that referenced nothing else from the module would
+// silently get the weak definition. Only same-module items are guaranteed to
+// share an object (partitioning places them together and merging never splits),
+// so `_start` is what makes the guarantee, and
+// `test_dma_memcpy_compiler_emitted_copies` is what detects a regression: a guest
+// that falls back still produces correct output, only its ecall count drops.
+//
 // A Rust `#[no_mangle] fn memcpy` did not reliably override compiler-builtins in
 // optimized guests: the final ELF still jumped to compiler_builtins'
 // implementation. LLVM still inlines statically-sized tiny copies. Remaining

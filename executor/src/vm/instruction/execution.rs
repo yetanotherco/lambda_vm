@@ -58,12 +58,19 @@ pub const DMA_MEMCPY_SYSCALL_NUMBER: u64 = u64::MAX - 2;
 /// larger copies, and the prover enforces this bound on every first DMA row.
 pub const DMA_MEMCPY_MAX_BYTES: u64 = 256;
 
-/// DMA table rows one ecall of `count` bytes produces: one row per eight-byte
-/// chunk, one per tail byte, plus the terminal row. The trace builder, the
-/// sizing pass and the CLI's accelerator report all derive their row counts from
-/// here, so none of them can drift from the trace the prover actually builds.
+/// DMA data rows one ecall of `count` bytes produces: one row per eight-byte
+/// chunk while at least eight bytes remain, then one per tail byte.
+pub fn dma_memcpy_data_rows(count: u64) -> u64 {
+    count / 8 + count % 8
+}
+
+/// Total DMA table rows one ecall of `count` bytes produces: its data rows plus
+/// the terminal row. Every consumer that needs a row count — the trace builder,
+/// the sizing pass and the CLI's accelerator report — goes through this function
+/// or [`dma_memcpy_data_rows`], so none of them can drift from the trace the
+/// prover actually builds.
 pub fn dma_memcpy_trace_rows(count: u64) -> u64 {
-    count / 8 + count % 8 + 1
+    dma_memcpy_data_rows(count) + 1
 }
 
 /// `2^32`. ECSM memory operands must not overflow their lower 32-bit address limb when the
