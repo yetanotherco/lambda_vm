@@ -61,8 +61,14 @@ fn edge_scalars_fall_back() {
     let p2 = g_times(5);
     let ok = Scalar::from(12345u64);
     for bad in [Scalar::ZERO, Scalar::ONE, -Scalar::ONE] {
-        assert!(lincomb2_with_oracle(&p1.to_affine(), &bad, &p2.to_affine(), &ok, soft_oracle).is_none());
-        assert!(lincomb2_with_oracle(&p1.to_affine(), &ok, &p2.to_affine(), &bad, soft_oracle).is_none());
+        assert!(
+            lincomb2_with_oracle(&p1.to_affine(), &bad, &p2.to_affine(), &ok, soft_oracle)
+                .is_none()
+        );
+        assert!(
+            lincomb2_with_oracle(&p1.to_affine(), &ok, &p2.to_affine(), &bad, soft_oracle)
+                .is_none()
+        );
     }
 }
 

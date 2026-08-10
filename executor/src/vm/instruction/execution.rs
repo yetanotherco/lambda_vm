@@ -16,6 +16,9 @@ pub enum SyscallNumbers {
     Halt = 93,
     // Placeholder discriminant. The actual syscall value is ECSM_SYSCALL_NUMBER.
     Ecsm = 94,
+    // Placeholder discriminant. The actual syscall value is HINT_SYSCALL_NUMBER.
+    // Non-constraining hint (host computes modular inverse/sqrt, guest verifies).
+    Hint = 95,
 }
 
 /// Syscall number for KeccakPermute (u64::MAX - 1 = 0xFFFF_FFFF_FFFF_FFFE).
@@ -31,6 +34,46 @@ const KECCAK_STATE_BYTES: u64 = 25 * 8;
 /// bus as `[lo32, hi32] = [2^32 - 11, 2^32 - 1]`.
 pub const ECSM_SYSCALL_NUMBER: u64 = u64::MAX - 10;
 
+/// Syscall number for the non-constraining `Hint` ecall.
+///
+/// The host computes a modular inverse or square root and writes it back to the
+/// guest, which MUST verify it (e.g. `x·inv == 1`) and recompute in software on a
+/// verification failure. The ecall adds no in-circuit correctness constraint of its
+/// own — it lets the guest replace an expensive computation with a cheap check,
+/// without letting the (prover-chosen) hinted value change the guest's result.
+pub const HINT_SYSCALL_NUMBER: u64 = u64::MAX - 30;
+
+/// Hint operation selector passed in `a0`.
+pub const HINT_FIELD_INV: u64 = 0; // secp256k1 base-field inverse (mod p)
+pub const HINT_SCALAR_INV: u64 = 1; // secp256k1 scalar-field inverse (mod n)
+pub const HINT_FIELD_SQRT: u64 = 2; // secp256k1 base-field square root
+
+/// One past the largest valid hint selector. The prover's HINT table range-checks
+/// `a0 < HINT_SELECTOR_BOUND` on the ALU bus to accept exactly the set
+/// [`is_valid_hint_selector`] accepts, so both live here rather than being restated
+/// independently in the AIR.
+pub const HINT_SELECTOR_BOUND: u64 = 3;
+
+/// Whether `hint_id` names a hint [`compute_hint`] can produce. The ecall rejects
+/// anything else up front with [`ExecutionError::HintUnknownSelector`].
+pub const fn is_valid_hint_selector(hint_id: u64) -> bool {
+    matches!(hint_id, HINT_FIELD_INV | HINT_SCALAR_INV | HINT_FIELD_SQRT)
+}
+
+// The AIR's range-check and the executor's accepted set must denote the same set: every
+// selector below the bound is valid, and the bound itself is not. Appending a selector
+// without moving the bound (or vice versa) fails to compile here, instead of making the
+// HINT table assert `LT(selector, bound) = 1` against an LT row the builder emits as 0 —
+// an unbalanced ALU bus with no algebraic pointer to the cause.
+const _: () = {
+    let mut id = 0;
+    while id < HINT_SELECTOR_BOUND {
+        assert!(is_valid_hint_selector(id));
+        id += 1;
+    }
+    assert!(!is_valid_hint_selector(HINT_SELECTOR_BOUND));
+};
+
 /// `2^32`. ECSM memory operands must not overflow their lower 32-bit address limb when the
 /// largest per-access offset is added: the 32-byte operands reach offset +31 (last byte).
 const LOW_LIMB: u64 = 1 << 32;
@@ -45,6 +88,7 @@ impl TryFrom<u64> for SyscallNumbers {
             93 => Ok(SyscallNumbers::Halt),
             v if v == KECCAK_SYSCALL_NUMBER => Ok(SyscallNumbers::KeccakPermute),
             v if v == ECSM_SYSCALL_NUMBER => Ok(SyscallNumbers::Ecsm),
+            v if v == HINT_SYSCALL_NUMBER => Ok(SyscallNumbers::Hint),
             _ => Err(()),
         }
     }
@@ -68,7 +112,8 @@ impl SyscallNumbers {
             SyscallNumbers::Print
             | SyscallNumbers::Panic
             | SyscallNumbers::Commit
-            | SyscallNumbers::Halt => None,
+            | SyscallNumbers::Halt
+            | SyscallNumbers::Hint => None,
         }
     }
 }
@@ -93,8 +138,59 @@ fn store_u256_le(memory: &mut Memory, addr: u64, bytes: &[u8; 32]) -> Result<(),
     Ok(())
 }
 
-/// Checks the ECSM address-alignment assumption: `(addr mod 2^32) + max_offset < 2^32`.
-fn ecsm_addr_ok(addr: u64, max_offset: u64) -> bool {
+/// Compute a non-constraining hint (modular inverse / sqrt) with the same k256
+/// arithmetic the guest verifies against. Input/output are 32-byte big-endian,
+/// k256's own serialization — unlike the ECSM ABI, which is little-endian because
+/// its chip consumes little-endian limbs. The HINT table only copies these bytes
+/// into memory writes, so the order is free to match the consumers.
+///
+/// On a numeric failure (non-canonical input, no inverse/sqrt) returns zeros. This
+/// is NOT a loud failure and must not be treated as one: the guest's in-circuit
+/// verify rejects the value and recomputes it in software (see the `ethrex-crypto`
+/// crate), so a zero/garbage hint only costs the guest extra work — it can never
+/// change the guest's result. An *unknown* `hint_id` never reaches here: the ecall
+/// dispatch rejects it up front with [`ExecutionError::HintUnknownSelector`], so the
+/// `_` arm below is defensive only.
+///
+/// `pub` so the prover's `collect_hint_ops` can reproduce the exact output value
+/// the executor wrote to guest memory (the value is not carried in the CPU log).
+pub fn compute_hint(hint_id: u64, in_be: &[u8; 32]) -> [u8; 32] {
+    use k256::elliptic_curve::PrimeField;
+    let mut fb = k256::FieldBytes::default();
+    fb.copy_from_slice(in_be);
+
+    match hint_id {
+        HINT_FIELD_INV => {
+            let x: Option<k256::FieldElement> = Option::from(k256::FieldElement::from_bytes(&fb));
+            match x.and_then(|x| Option::<k256::FieldElement>::from(x.invert())) {
+                Some(inv) => inv.to_bytes().into(),
+                None => [0u8; 32],
+            }
+        }
+        HINT_SCALAR_INV => {
+            let x: Option<k256::Scalar> = Option::from(k256::Scalar::from_repr(fb));
+            match x.and_then(|x| Option::<k256::Scalar>::from(x.invert())) {
+                Some(inv) => inv.to_bytes().into(),
+                None => [0u8; 32],
+            }
+        }
+        HINT_FIELD_SQRT => {
+            let x: Option<k256::FieldElement> = Option::from(k256::FieldElement::from_bytes(&fb));
+            match x.and_then(|x| Option::<k256::FieldElement>::from(x.sqrt())) {
+                Some(r) => r.to_bytes().into(),
+                None => [0u8; 32],
+            }
+        }
+        _ => [0u8; 32],
+    }
+}
+
+/// Checks that a 32-byte operand does not overflow its lower 32-bit address limb:
+/// `(addr mod 2^32) + max_offset < 2^32`. Tables that send an address to the memory
+/// bus as a `[lo32, hi32]` pair with the per-access offset added to `lo32` alone
+/// cannot represent a carry into `hi32`, so an operand straddling the limb boundary
+/// makes the trace unprovable. Used by the ECSM and Hint ecalls.
+fn addr_limb_ok(addr: u64, max_offset: u64) -> bool {
     (addr % LOW_LIMB) + max_offset < LOW_LIMB
 }
 
@@ -429,9 +525,9 @@ impl Instruction {
                         let addr_xr = registers.read(10)?;
                         let addr_xg = registers.read(11)?;
                         let addr_k = registers.read(12)?;
-                        if !ecsm_addr_ok(addr_xg, 31)
-                            || !ecsm_addr_ok(addr_xr, 31)
-                            || !ecsm_addr_ok(addr_k, 31)
+                        if !addr_limb_ok(addr_xg, 31)
+                            || !addr_limb_ok(addr_xr, 31)
+                            || !addr_limb_ok(addr_k, 31)
                         {
                             return Err(ExecutionError::EcsmAddressOverflow);
                         }
@@ -453,6 +549,42 @@ impl Instruction {
                         // by the ECSM register-read path in the trace builder.
                         src2_val = addr_xg;
                         dst_val = addr_k;
+                    }
+                    SyscallNumbers::Hint => {
+                        // Non-constraining hint: host computes a modular inverse/sqrt
+                        // and writes it to the guest, which verifies it (and falls back
+                        // to software on failure). a0 = hint_id, a1 = input addr
+                        // (32-byte BE), a2 = output addr. The `_le` helpers only move
+                        // bytes in address order, which is what a raw big-endian buffer
+                        // needs.
+                        let hint_id = registers.read(10)?;
+                        let in_addr = registers.read(11)?;
+                        let out_addr = registers.read(12)?;
+                        // Reject an unrecognized selector up front: an unknown `hint_id`
+                        // would otherwise silently produce a zero output (see
+                        // `compute_hint`), indistinguishable from a legitimate numeric
+                        // failure. Fail loudly instead so a guest bug surfaces here.
+                        if !is_valid_hint_selector(hint_id) {
+                            return Err(ExecutionError::HintUnknownSelector(hint_id));
+                        }
+                        // Both operands are bounded so their 32-byte ranges cannot cross the
+                        // 2^32 limb boundary, and the HINT table range-checks both low limbs
+                        // against the same bound (`HINT_ADDR_LIMB_BOUND`) so the AIR accepts
+                        // exactly what this rejects. The memory bus does not do that job on
+                        // its own: it bounds `out_addr` only to 2^32 - 25, because the write
+                        // bases are `out_addr_lo + 8i` and MEMW's carry columns resolve the
+                        // bytes past the largest base. `in_addr` is not on the bus at all
+                        // (the input read is not modeled). Bounding both also keeps
+                        // `load_u256_le`/`store_u256_le` from overflowing their address
+                        // arithmetic.
+                        if !addr_limb_ok(in_addr, 31) || !addr_limb_ok(out_addr, 31) {
+                            return Err(ExecutionError::HintAddressOverflow);
+                        }
+                        let input = load_u256_le(memory, in_addr)?;
+                        let output = compute_hint(hint_id, &input);
+                        store_u256_le(memory, out_addr, &output)?;
+                        src2_val = in_addr;
+                        dst_val = out_addr;
                     }
                     SyscallNumbers::Halt => {
                         // halt
@@ -634,6 +766,10 @@ pub enum ExecutionError {
     EcsmAddressOverflow,
     #[error("ECSM xG and k operand ranges overlap")]
     EcsmOperandOverlap,
+    #[error("Hint address range overflows the lower 32-bit limb")]
+    HintAddressOverflow,
+    #[error("Unknown hint selector: {0}")]
+    HintUnknownSelector(u64),
     #[error("ECSM scalar multiplication error: {0}")]
     Ecsm(#[from] ecsm::EcsmError),
 }

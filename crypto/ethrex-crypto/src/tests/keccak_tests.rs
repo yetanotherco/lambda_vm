@@ -8,7 +8,12 @@ use crate::*;
 fn check_keccak(input: &[u8]) {
     let got = keccak256_with_permute(input, keccak::f1600);
     let want = keccak_hash(input);
-    assert_eq!(got, want, "keccak256 mismatch for {}-byte input", input.len());
+    assert_eq!(
+        got,
+        want,
+        "keccak256 mismatch for {}-byte input",
+        input.len()
+    );
 }
 
 /// Cross-check our sponge against a hardcoded vector from the Ethereum spec.
