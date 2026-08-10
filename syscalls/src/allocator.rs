@@ -13,8 +13,10 @@ const WORD_SIZE: usize = 4;
 //   - default: a monotonic bump allocator. No free lists and no coalescing -- `alloc` moves
 //     a cursor, `dealloc` is empty -- so it spends the fewest guest instructions per
 //     allocation. It never reuses a freed region, so its footprint grows monotonically and
-//     the proof pays PAGE rows for every page that footprint spans -- see the ceiling note
-//     below.
+//     the proof pays PAGE rows for every page that footprint touches. Touches, not spans: a
+//     page the guest allocates but never loads or stores costs nothing, which is why the
+//     `alloc_zeroed` memset skip below can leave a large zeroed buffer cheaper here than
+//     under an allocator that writes it. See the ceiling note below.
 //   - `dlmalloc-alloc` feature: Doug Lea's malloc on a bump "system" provider that hands it
 //     page-aligned segments. Slower to prove at the epochs worth running, but its footprint
 //     is bounded by live bytes rather than total bytes ever allocated, and it can grow a
@@ -24,32 +26,55 @@ const WORD_SIZE: usize = 4;
 //     rule turns it on, so the riscv64 `#[global_allocator]` below is a fallback with no
 //     consumer yet.
 //
-// Bump's ceiling is cumulative allocation, measured at ~3 GiB -- the size of
-// [_end, MAX_MEMORY_SIZE). Allocation is linear in gas, measured execute-only over eight
-// ethrex fixtures from 0.42M to 63M gas: 2.55 MB + 2.213 B/gas, with the marginal rate flat
-// (2.18..2.29) across that 150x range, so there is no superlinear term to reach the ceiling
-// with. 1500 transfers (31.5M gas) allocate 72.1 MB. What binds is bytes per gas, not
-// transactions per gas, and transfers roughly minimise it: the contract-heavy blocks measure
-// up to 3.87 B/gas, which puts a 60M-gas block at ~232 MB, a 13.9x margin, and needs ~832M
-// gas to exhaust. Both contract-heavy fixtures are small blocks (2.4M and 4.2M gas), so that
-// rate carries the ~2.5 MB constant in its average and no gas-full contract-heavy block has
-// been measured -- the margin is an extrapolation, and `dlmalloc-alloc` is the one-flag
-// fallback if a block ever exceeds it.
+// Bump's footprint is cumulative allocation, and no gas rule bounds that, so the fit below
+// describes honest blocks and is not a safety margin. Measured execute-only over eight ethrex
+// fixtures from 0.42M to 63M gas, allocation is linear in gas: 2.55 MB + 2.213 B/gas, marginal
+// rate flat (2.18..2.29) across that 150x range, so an honest block has no superlinear term.
+// 1500 transfers (31.5M gas) allocate 72.1 MB. The two contract-heavy fixtures average up to
+// 3.87 B/gas, but both are small blocks (2.4M and 4.2M gas), so that average still carries the
+// ~2.5 MB constant, and no gas-full contract-heavy block has been measured.
+//
+// What the fit does not bound is an adversarial block, because bytes per gas is chosen by the
+// bytecode rather than by the schedule. Every CALL copies its argument region into a fresh heap
+// buffer -- levm's `get_calldata` -> `Memory::load_range` -> `Bytes::copy_from_slice` -- sized
+// by the caller, fully written, and never reclaimed here; memory expansion is charged once as
+// `max(args, retdata)`, so each further warm CALL costs ~100 gas whatever `args_len` is. That
+// reaches ~561 B/gas, ~145x the 3.87 above, and `modexp` allocates its operand buffers before
+// it charges for them, under a size cap that is fork-gated.
+//
+// So the operative limit is not the ~3 GiB of [_end, MAX_MEMORY_SIZE) but prover cost, which
+// climbs continuously well before it: every touched 256 KiB page adds a 2^18-row PAGE table,
+// and on the continuation path a GLOBAL_MEMORY table per page ever touched, which does not
+// reset per epoch. Peak prover RAM and bundle size are therefore what decide when to switch,
+// not a gas figure.
 //
 // What spends that budget faster than live bytes suggest is that nothing is ever reclaimed:
 // `dealloc` is a no-op, and a grow that cannot extend in place -- the block is not the one the
 // cursor sits on -- abandons the old block on top of that. A guest program that processes many
 // blocks in one execution has no per-block bound at all, which is what `dlmalloc-alloc` is for.
 //
-// Exhausting the heap does not fail cleanly today: `alloc` returns null, which reaches
-// `handle_alloc_error`, which panics into the guest's `#[panic_handler]` -- `loop {}` in every
-// guest here -- so execution spins instead of aborting, and nothing on the proving path
-// bounds cycles (`--cycle-budget` is opt-in and only on `execute`). So the fallback matters.
-// This predates the bump default -- TLSF returned null and hung through the same panic
-// handler -- and fixing it is not allocator-local: `HALT` constrains `exit_code = 0`, so a
-// nonzero exit cannot be proved at all, and a clean abort needs either a committed failure
-// marker or a non-provable abort ecall. The cheaper mitigation, a host-side cycle bound on
-// `prove`, needs neither.
+// Exhausting the heap does not fail cleanly today, and what it does instead depends on the
+// guest. `alloc` returns null, which reaches `handle_alloc_error`. Every guest that can exhaust
+// this heap is a std guest with no `#[panic_handler]` of its own -- ethrex included -- so it
+// does not reach a panic handler at all: it goes `__rust_alloc_error_handler` ->
+// `default_alloc_error_hook` -> `unimp`, and this VM decodes `unimp` as a write to the
+// read-only `cycle` CSR and executes it as a no-op. The hook's epilogue restores `ra` to that
+// `unimp` and returns onto it, so execution spins. The `loop {}` panic handlers are in the
+// `no_std` guests, none of which allocates.
+//
+// The sibling abort paths are worse than a spin. `abort()`, `panic_any` with a payload that is
+// neither `&str` nor `String`, an empty panic message, and a double panic all reach a bare
+// `unimp` that falls through into whatever the linker placed next, and control can reach
+// `pc == 0`, which the executor treats as ordinary completion -- a guest that aborted then
+// looks like a guest that finished. Nothing on the proving path bounds cycles either
+// (`--cycle-budget` is opt-in and only on `execute`). So the fallback matters.
+//
+// Returning null on exhaustion predates the bump default -- TLSF returned null and hung too --
+// and fixing it is not allocator-local: `HALT` constrains `exit_code = 0`, so a nonzero exit
+// cannot be proved at all, and a clean abort needs either a committed failure marker or a
+// non-provable abort ecall. A host-side cycle bound on `prove` needs neither and bounds the
+// spin, but only rejecting writes to read-only CSRs in the decoder turns the fall-through into
+// an error instead of a silent success.
 //
 // Only the guest installs a #[global_allocator]; on host (e.g. `cargo test` for the
 // sponge's differential tests) the attribute would hijack the test harness's
