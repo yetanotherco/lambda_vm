@@ -47,6 +47,18 @@ pub const ECSM_SYSCALL_NUMBER: u64 = u64::MAX - 10;
 /// the mode with an `IS_AFFINE` column pinned to this number via the `Ecall` bus.
 pub const ECSM_AFFINE_SYSCALL_NUMBER: u64 = u64::MAX - 11;
 
+// The ECSM table pins `IS_AFFINE` by putting `xonly + IS_AFFINE·(affine − xonly)` on the
+// `Ecall` bus for each 32-bit word, against the CPU's real `a7`. That only pins the
+// selector if the two numbers differ in the LOW word: they share a high word today, so the
+// high word's `IS_AFFINE` coefficient is zero and carries no mode information. Choosing a
+// future variant that differs only in the high word would silently leave `IS_AFFINE`
+// unconstrained — an under-constrained selector, not a compile error. Fail loudly here.
+const _: () = assert!(
+    ECSM_SYSCALL_NUMBER & 0xFFFF_FFFF != ECSM_AFFINE_SYSCALL_NUMBER & 0xFFFF_FFFF,
+    "ECSM syscall numbers must differ in their low 32-bit word, or the ECSM table's \
+     IS_AFFINE pinning degenerates"
+);
+
 /// Syscall number for the non-constraining `Hint` ecall.
 ///
 /// The host computes a modular inverse or square root and writes it back to the
@@ -592,7 +604,15 @@ impl Instruction {
                         // addr_xg`) is disjoint at a distance of 32. A `< 64` bound would reject
                         // it, making the ecall depend on which operand the guest's compiler
                         // happens to lay out first.
-                        if addr_k < addr_xg.wrapping_add(64) && addr_xg < addr_k.wrapping_add(32) {
+                        //
+                        // Widened to u128 so the `+ 64` / `+ 32` cannot wrap: `addr_limb_ok`
+                        // bounds only the low limb, so `addr_xg = u64::MAX - 63` passes it while
+                        // `addr_xg + 64` wraps to 0, which would make the first clause vacuously
+                        // false and skip the check entirely. Reachable — `STACK_TOP - 0x30` sits
+                        // in that range.
+                        if (addr_k as u128) < addr_xg as u128 + 64
+                            && (addr_xg as u128) < addr_k as u128 + 32
+                        {
                             return Err(ExecutionError::EcsmOperandOverlap);
                         }
                         let xg = load_u256_le(memory, addr_xg)?;

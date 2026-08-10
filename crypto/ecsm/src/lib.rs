@@ -1,12 +1,23 @@
 //! Reference secp256k1 scalar multiplication and ECSM-accelerator witness generation.
 //!
-//! This crate is shared by the executor (which needs `k·G`'s x-coordinate to write back
+//! This crate is shared by the executor (which needs `k·G`'s coordinates to write back
 //! to guest memory) and the prover (which replays the full double-and-add sequence to
 //! fill the ECSM / ECDAS trace witnesses). Both entry points compute the same
 //! `k·G` over the audited `k256` curve arithmetic — the executor via `k256`'s scalar
-//! multiplication, the prover via a projective double-and-add replay — so the x-coordinate
-//! they write/prove agrees. It is also independent of the `yG` root: both recover the same
-//! canonical `yG` in `prepare`, and `k·P` and `k·(-P)` share an x.
+//! multiplication, the prover via a projective double-and-add replay — so the coordinates
+//! they write/prove agree.
+//!
+//! There are two families of entry point, and they differ in exactly one respect — which
+//! `yG` they use:
+//! - **x-only** (`scalar_mul_x` / [`compute_witness`], via `prepare`): `yG` is recovered as
+//!   the canonical *even* lift of `xG`, so the result is independent of the root — only
+//!   `xR` is returned, and `k·P` and `k·(-P)` share an x.
+//! - **affine** (`scalar_mul_xy_with_y` / [`compute_witness_with_y`], via `prepare_with_y`):
+//!   `yG` is the caller's own value, validated on-curve but *not* canonicalized. The result
+//!   IS root-dependent — `yR` is the y of the caller's chosen lift — which is the whole
+//!   point, since the affine ecall returns `yR` to the guest. In the prover the witnessed
+//!   `yG` is pinned to the caller's input buffer by a memory read, so the root is not a
+//!   free choice.
 //!
 //! Curve point operations are delegated to the RustCrypto `k256` crate; witness generation
 //! replays the schedule in `k256` projective coordinates and batch-inverts the slope

@@ -247,6 +247,31 @@ fn ecsm_affine_syscall_rejects_overlapping_point_k() {
     run_ecsm_affine_at(0x3000, 0x2000, 0x3000).expect("xR aliasing k is allowed");
 }
 
+/// The overlap guard must not be defeated by 64-bit wraparound.
+///
+/// `addr_limb_ok` bounds only the LOW limb, so `u64::MAX - 63` passes it while
+/// `addr_xg + 64` wraps to 0. With a plain `u64` `wrapping_add` the first clause becomes
+/// `addr_k < 0` — always false — and the whole check is skipped, accepting exactly the
+/// overlap it exists to reject. Reachable: `STACK_TOP` is `0xFFFF_FFFF_FFFF_FFF0`, so
+/// these addresses sit inside `main`'s first frame.
+#[test]
+fn ecsm_affine_overlap_guard_survives_address_wraparound() {
+    // 0xFFFF_FFFF_FFFF_FFC0 — the largest address passing addr_limb_ok(_, 63), and the one
+    // for which addr_xg + 64 wraps to exactly 0.
+    let top_point = u64::MAX - 63;
+    // addr_k = top_point exercises the first clause (addr_xg + 64 wraps); top_point + 32
+    // additionally makes addr_k + 32 wrap, exercising the second. Both are genuine overlaps
+    // (k inside the point's 64 bytes) that the pre-u128 guard accepted.
+    for addr_k in [top_point, top_point + 32] {
+        let err = run_ecsm_affine_at(0x1000, top_point, addr_k).unwrap_err();
+        assert!(
+            matches!(err, ExecutionError::EcsmOperandOverlap),
+            "addr_k = {addr_k:#x} overlaps the point at {top_point:#x} and must be rejected \
+             even though the guard's + 64 / + 32 wrap"
+        );
+    }
+}
+
 #[test]
 fn ecsm_affine_syscall_rejects_address_overflow() {
     // Point and output span offset 63 (not 31), so their last accessed byte must stay in

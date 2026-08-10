@@ -2,7 +2,9 @@
 
 use num_bigint::BigUint;
 
-use crate::{B, EcsmError, n, p, recover_y_canonical, scalar_mul_x, to_le_32};
+use crate::{
+    B, EcsmError, n, p, recover_y_canonical, scalar_mul_x, scalar_mul_xy_with_y, to_le_32,
+};
 
 /// Parses a big-endian hex string into a `BigUint`.
 fn be_hex(s: &str) -> BigUint {
@@ -134,6 +136,57 @@ fn rejects_non_canonical_xg() {
     // (it is not on the curve, which is a different error).
     assert_eq!(
         scalar_mul_x(&k, &to_le_32(&(p() - BigUint::from(1u8)))),
+        Err(EcsmError::NotOnCurve)
+    );
+}
+
+/// The affine path must use the caller's `yG`, not the canonical even lift.
+///
+/// This is the one property that distinguishes `prepare_with_y` from `prepare`, and every
+/// other affine test in the tree feeds the generator's `Gy`, which *is* the even lift — so
+/// they cannot observe the difference. Negating the input point must negate the output:
+/// `k·(xG, p − yG) = −(k·(xG, yG))`, i.e. same `xR`, and `yR' = p − yR`.
+#[test]
+fn affine_uses_the_callers_y_not_the_canonical_lift() {
+    let gy = be_hex(GY_HEX);
+    assert_eq!(&gy % 2u8, BigUint::from(0u8), "Gy is the even lift");
+    let odd_gy = p() - &gy;
+    let xg = to_le_32(&gx());
+
+    for k_val in [1u32, 2, 5, 0xFFFF, 1_000_003] {
+        let k = to_le_32(&BigUint::from(k_val));
+        let (xr_even, yr_even) =
+            scalar_mul_xy_with_y(&k, &xg, &to_le_32(&gy)).expect("even lift is on the curve");
+        let (xr_odd, yr_odd) =
+            scalar_mul_xy_with_y(&k, &xg, &to_le_32(&odd_gy)).expect("odd lift is on the curve");
+
+        assert_eq!(xr_odd, xr_even, "k = {k_val}: x(k·(-P)) must equal x(k·P)");
+        let yr_even_big = BigUint::from_bytes_le(&yr_even);
+        let yr_odd_big = BigUint::from_bytes_le(&yr_odd);
+        assert_eq!(
+            yr_odd_big,
+            p() - &yr_even_big,
+            "k = {k_val}: y(k·(-P)) must be p - y(k·P) — the odd input lift was ignored"
+        );
+    }
+}
+
+/// `yG` must be rejected when it is not the y of the given `xG`, and when it is
+/// non-canonical. Complements the x-only `rejects_non_canonical_xg`.
+#[test]
+fn affine_rejects_bad_y() {
+    let k = to_le_32(&BigUint::from(5u8));
+    let xg = to_le_32(&gx());
+    let gy = be_hex(GY_HEX);
+
+    // yG = p is out of range (and p ≡ 0, which is not on the curve either).
+    assert_eq!(
+        scalar_mul_xy_with_y(&k, &xg, &to_le_32(&p())),
+        Err(EcsmError::CoordinateOutOfRange)
+    );
+    // A canonical but wrong y: on-curve check must reject.
+    assert_eq!(
+        scalar_mul_xy_with_y(&k, &xg, &to_le_32(&(&gy + BigUint::from(1u8)))),
         Err(EcsmError::NotOnCurve)
     );
 }

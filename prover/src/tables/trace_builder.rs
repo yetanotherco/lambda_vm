@@ -3234,6 +3234,22 @@ fn build_traces<I: ImageSource + Sync>(
             LtOperation::new(op.out_addr & 0xFFFF_FFFF, hint::HINT_ADDR_LIMB_BOUND, false),
         ]
     }));
+    // ECSM range-checks: each operand's low address limb < the executor's addr_limb_ok
+    // bound (32-byte operands 2^32-31, the affine variant's 64-byte xG‖yG / xR‖yR
+    // 2^32-63), matching EcsmAddressOverflow. Three LT ops per ECSM call; the ECSM table
+    // sends the matching ALU LT interactions with the bound linear in IS_AFFINE.
+    lt_ops.extend(ecsm_ops.iter().flat_map(|op| {
+        let operand_bound = if op.is_affine {
+            ecsm::ADDR_LIMB_BOUND_64B
+        } else {
+            ecsm::ADDR_LIMB_BOUND_32B
+        };
+        [
+            LtOperation::new(op.addr_xg & 0xFFFF_FFFF, operand_bound, false),
+            LtOperation::new(op.addr_xr & 0xFFFF_FFFF, operand_bound, false),
+            LtOperation::new(op.addr_k & 0xFFFF_FFFF, ecsm::ADDR_LIMB_BOUND_32B, false),
+        ]
+    }));
 
     // =====================================================================
     // PHASE 4: All → Bitwise lookups
@@ -3967,6 +3983,14 @@ pub fn count_table_lengths(
                     &mut memw_register_count,
                 );
             }
+            lt_count += 3;
+        }
+
+        if cpu_op.ecall_ecsm {
+            // Three ALU LT operand range-checks per ECSM call (addr_xG, addr_xR, addr_k
+            // low limbs). The count does not depend on the values or on the mode, so
+            // unlike the hint branch this needs no replay of `collect_ecsm_ops` — which
+            // would mean recomputing the whole EC witness just to count rows.
             lt_count += 3;
         }
 

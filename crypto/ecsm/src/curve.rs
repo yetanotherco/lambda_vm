@@ -18,8 +18,14 @@ pub struct AffinePoint {
 /// Recovers the canonical (even) `y` for a given `x` such that `y^2 = x^3 + b mod p`.
 ///
 /// Both `y` and `p - y` are valid; we pick the even one so the executor and prover agree
-/// deterministically. The chip never constrains the parity (it only writes back `xR`, and
-/// `k·P` and `k·(-P)` share an x-coordinate), so any consistent choice is sound.
+/// deterministically. Any consistent choice is sound **on the x-only path**, which is the
+/// only caller: it writes back just `xR`, and `k·P` and `k·(-P)` share an x-coordinate, so
+/// the parity never escapes the chip and the AIR need not constrain it.
+///
+/// The affine path does not use this function — it takes `yG` from the caller (see
+/// `prepare_with_y`), because there `yR` *is* returned and the parity is observable. There
+/// the AIR pins `yG` to the caller's input buffer with an `IS_AFFINE`-gated memory read
+/// rather than leaving the root to the witness.
 ///
 /// Returns `None` when `x` is not a valid curve x-coordinate (`x^3 + b` is not a quadratic
 /// residue, or `x` is not a canonical field element).

@@ -9,9 +9,10 @@
 //! - `keccak256`: a sponge over the `keccak_permute` precompile (riscv64; on
 //!   host it falls back to software keccak for tests).
 //! - `secp256k1_ecrecover`: the ECDSA recovery's 2-term linear combination is
-//!   evaluated through the ECSM `ecsm_mul` precompile (riscv64), reconstructing
-//!   the full point from x-only queries; on host / degenerate inputs it falls
-//!   back to the pure-Rust `ProjectivePoint::lincomb`.
+//!   evaluated through the affine ECSM `ecsm_mul_affine` precompile (riscv64),
+//!   which returns both coordinates of each `k·P` — so the two products cost one
+//!   query each and are combined with a single chord addition. On host /
+//!   degenerate inputs it falls back to the pure-Rust `ProjectivePoint::lincomb`.
 //!
 //! Every other `Crypto` method inherits the trait default (vetted pure-Rust
 //! crates: `ark-bn254`, `bls12_381`, `p256`, `sha2`, `ripemd`, …).
@@ -29,8 +30,8 @@ use k256::elliptic_curve::sec1::ToEncodedPoint;
 use k256::elliptic_curve::PrimeField;
 use k256::{AffinePoint, FieldBytes, ProjectivePoint, Scalar, U256};
 
-// Used only by the x-only point reconstruction (riscv accelerated path + the
-// host unit tests); unused on a non-test host build.
+// Used by the ECSM oracle plumbing and the affine point helpers (riscv accelerated
+// path + the host unit tests); unused on a non-test host build.
 #[cfg(any(target_arch = "riscv64", test))]
 use k256::elliptic_curve::sec1::FromEncodedPoint;
 #[cfg(any(target_arch = "riscv64", test))]
