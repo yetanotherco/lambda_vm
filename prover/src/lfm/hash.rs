@@ -98,14 +98,32 @@ impl LfmHasher for TestPermutation {
 /// default exists so every pre-decision call site keeps proving what it always
 /// proved; it is not a statement that `TestPermutation` is the machine's hash.
 /// The ecosystem hash decision is what the candidate columns feed.
+///
+/// The discriminants are written out and `#[repr(u8)]` because [`as_tag`] feeds
+/// `lfm_program_id`'s preimage: the wire value must never follow declaration
+/// order, or inserting a variant would silently move every program digest.
+///
+/// [`as_tag`]: HasherKind::as_tag
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[repr(u8)]
 pub enum HasherKind {
     /// [`TestPermutation`] — NOT cryptographic. One degree-3 round.
     #[default]
-    Test,
+    Test = 0,
     /// [`super::poseidon::PoseidonGoldilocks`] — Poseidon-original, width 12,
     /// `x^7`, 8 full + 22 partial rounds.
-    Poseidon,
+    Poseidon = 1,
+}
+
+impl HasherKind {
+    /// The stable one-byte tag bound into `lfm_program_id`.
+    ///
+    /// A new candidate takes the next unused value and never reuses a retired
+    /// one: a tag collision would give two different permutations one program
+    /// identity, which is the whole thing this binding exists to prevent.
+    pub const fn as_tag(self) -> u8 {
+        self as u8
+    }
 }
 
 impl LfmHasher for HasherKind {

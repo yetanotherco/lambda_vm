@@ -38,8 +38,8 @@ use super::chips::hash::{self, HashConstraints, poseidon_cols as pc};
 use super::hash::{HASH_STATE_FELTS, HasherKind, LfmHasher};
 use super::poseidon::{NUM_ROUNDS, PoseidonGoldilocks, sboxed_lanes};
 use super::programs::trivial_program;
-use super::proof::{lfm_prove_with_hasher, verify_against_with_hasher};
-use super::registry::build_artifacts;
+use super::proof::{lfm_prove_with_hasher, verify_against};
+use super::registry::{build_artifacts, build_artifacts_with_hasher};
 use super::trace::fill_poseidon_witness;
 use super::word::LfmWord;
 
@@ -464,25 +464,25 @@ fn a_padding_row_claiming_to_be_real_is_rejected() {
 /// `trivial_program` exercises both hash modes (two `compress`, one `permute`)
 /// plus padding rows, so the proof covers every path the chip has. Artifacts are
 /// built fresh rather than resolved from `LFM_REGISTRY`: this is a program SHAPE
-/// that is deliberately not registered, and `verify_against_with_hasher` is the
+/// that is deliberately not registered, and `verify_against` is the
 /// supplied-roots entry point that exists for exactly that.
 #[test]
 fn the_poseidon_chip_proves_and_verifies() {
     let opts = options();
     let program = trivial_program();
-    let artifacts = build_artifacts(&program, &opts);
+    let artifacts = build_artifacts_with_hasher(&program, &opts, HasherKind::Poseidon);
     let proved =
         lfm_prove_with_hasher(&program, &artifacts, &arenas(), &opts, HasherKind::Poseidon)
             .expect("proving under Poseidon must succeed");
     assert!(
-        verify_against_with_hasher(
+        verify_against(
             &artifacts.roots,
             &artifacts.program_id,
             artifacts.keccak_rnd_chunks,
             &proved.proof,
             &proved.public_words,
             &opts,
-            HasherKind::Poseidon,
+            artifacts.hasher,
         ),
         "an honest Poseidon-configured proof must verify"
     );
@@ -497,16 +497,18 @@ fn the_poseidon_chip_proves_and_verifies() {
 fn a_proof_does_not_verify_under_the_other_hasher() {
     let opts = options();
     let program = trivial_program();
-    let artifacts = build_artifacts(&program, &opts);
 
     for (proved_under, verified_under) in [
         (HasherKind::Poseidon, HasherKind::Test),
         (HasherKind::Test, HasherKind::Poseidon),
     ] {
+        let artifacts = build_artifacts_with_hasher(&program, &opts, proved_under);
         let proved = lfm_prove_with_hasher(&program, &artifacts, &arenas(), &opts, proved_under)
             .expect("prove");
+        // The digest stays the proved-under one: this isolates the AIR-set
+        // mismatch, rather than passing because the statement also moved.
         assert!(
-            !verify_against_with_hasher(
+            !verify_against(
                 &artifacts.roots,
                 &artifacts.program_id,
                 artifacts.keccak_rnd_chunks,
@@ -520,22 +522,48 @@ fn a_proof_does_not_verify_under_the_other_hasher() {
     }
 }
 
-/// Program identity does not move with the hasher.
+/// ★ **The binding.** No root moves with the hasher — but the program digest
+/// must.
 ///
-/// `build_artifacts` commits the preprocessed column groups, and `PREP_WIDTH` is
-/// 11 in both layouts with the preprocessed group untouched — so every root and
-/// the program digest must be bit-identical. Asserted rather than assumed,
-/// because "the registry should not move" was a prediction, and if it were wrong
-/// the consequence (a hash experiment silently reassigning program identities)
-/// is exactly the kind of thing that must not pass quietly.
+/// Both halves matter and they are in one test because the second exists only
+/// because of the first. `build_artifacts` commits the preprocessed column
+/// groups, and `PREP_WIDTH` is 11 in both layouts with the preprocessed group
+/// untouched, so every root really is bit-identical across hashers. That is
+/// what makes the commitments unable to carry the hasher, and it is why
+/// `lfm_program_id` folds the kind's tag in directly: without the tag, a
+/// Test-backed and a Poseidon-backed machine of the same program would share
+/// one identity, and the only thing left separating them would be a
+/// main-trace width coincidence that a third candidate could collide with.
+///
+/// Asserted rather than assumed, in both directions: a hash experiment silently
+/// reassigning program identities and a hash choice silently *sharing* one are
+/// the two failures this pins.
 #[test]
-fn the_hasher_choice_does_not_move_any_program_digest() {
+fn the_hasher_choice_moves_the_program_digest_and_no_root() {
     let opts = options();
     for program in [trivial_program(), super::programs::fri_toy_program()] {
-        let a = build_artifacts(&program, &opts);
-        let b = build_artifacts(&program, &opts);
-        assert_eq!(a.roots, b.roots, "build_artifacts must be deterministic");
-        assert_eq!(a.program_id, b.program_id);
+        let test = build_artifacts_with_hasher(&program, &opts, HasherKind::Test);
+        let pos = build_artifacts_with_hasher(&program, &opts, HasherKind::Poseidon);
+
+        assert_eq!(
+            build_artifacts(&program, &opts).program_id,
+            test.program_id,
+            "build_artifacts must be deterministic and default to Test"
+        );
+        assert_eq!(
+            test.roots, pos.roots,
+            "no preprocessed root may move with the hasher"
+        );
+        assert_eq!(test.log_heights, pos.log_heights);
+        assert_eq!(test.keccak_rnd_chunks, pos.keccak_rnd_chunks);
+        // The roots agree, so this inequality can only come from the tag.
+        assert_ne!(
+            test.program_id, pos.program_id,
+            "two hashers must be two program identities"
+        );
+        assert_eq!(test.hasher, HasherKind::Test);
+        assert_eq!(pos.hasher, HasherKind::Poseidon);
+
         // The census's row counts and preprocessed widths are hasher-independent
         // too — only LFM_HASH's value width moves.
         let test = lfm_chip_census_with_hasher(&program, HasherKind::Test);
@@ -558,6 +586,16 @@ fn the_hasher_choice_does_not_move_any_program_digest() {
             }
         }
     }
+}
+
+/// The tag is the mechanism, so pin it directly rather than only through a
+/// digest: a reordered enum must not silently re-map an existing kind's tag
+/// onto another's, which would give two permutations one program identity.
+#[test]
+fn the_hasher_tags_are_stable_and_distinct() {
+    assert_eq!(HasherKind::Test.as_tag(), 0);
+    assert_eq!(HasherKind::Poseidon.as_tag(), 1);
+    assert_eq!(HasherKind::default(), HasherKind::Test);
 }
 
 // =========================================================================

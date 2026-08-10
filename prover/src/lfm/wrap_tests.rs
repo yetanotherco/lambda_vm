@@ -419,6 +419,7 @@ fn wrap_run(inner: ProofOptions) {
             &proved.proof,
             &proved.public_words,
             &opts,
+            artifacts.hasher,
         ),
         "the wrap proof must verify"
     );
@@ -493,6 +494,7 @@ fn wrap_run(inner: ProofOptions) {
             &proved.proof,
             &moved,
             &opts,
+            artifacts.hasher,
         ),
         "a moved claimed public word must make the wrap proof UNVERIFIABLE"
     );
@@ -512,6 +514,7 @@ fn wrap_run(inner: ProofOptions) {
             &proved.proof,
             &proved.public_words,
             &opts,
+            artifacts.hasher,
         ),
         "a moved program digest must make the wrap proof UNVERIFIABLE"
     );

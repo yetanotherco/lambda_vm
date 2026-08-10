@@ -20,6 +20,7 @@ use stark::config::Commitment;
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 
 use super::airs::NUM_LFM_CHIPS;
+use super::hash::HasherKind;
 use super::word::LfmWord;
 
 type E = GoldilocksExtension;
@@ -37,15 +38,25 @@ const LFM_STATEMENT_TAG: &[u8] = b"LAMBDAVM_LFM_STATEMENT_V1";
 /// program shape too: it decides how many `KECCAK_RND` instances the verifier
 /// builds. Binding it here is what makes the registry entry — rather than the
 /// proof — the authority on that shape.
+///
+/// `hasher` is bound for the same reason and is the one piece of program shape
+/// the roots cannot carry: `LFM_HASH`'s preprocessed width is 11 under every
+/// candidate, so the commitments are hasher-independent by construction
+/// (`airs.rs`). Without this tag the only thing separating one permutation's
+/// machine from another's would be a main-trace width coincidence, which a
+/// third candidate could collide with. The tag is what makes two hashers two
+/// programs.
 pub fn lfm_program_id(
     roots: &[Commitment; NUM_LFM_CHIPS],
     log_heights: &[u8; NUM_LFM_CHIPS],
     keccak_rnd_chunks: usize,
+    hasher: HasherKind,
 ) -> Commitment {
     let mut h = Keccak256::new();
     h.update(LFM_PROGRAM_TAG);
     h.update(LFM_MACHINE_VERSION.to_le_bytes());
     h.update(LFM_PRESET_TAG.to_le_bytes());
+    h.update([hasher.as_tag()]);
     for i in 0..NUM_LFM_CHIPS {
         h.update([i as u8]);
         h.update(roots[i]);

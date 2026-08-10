@@ -1221,6 +1221,7 @@ fn the_fri_leg_proves_and_verifies() {
             &proved.proof,
             &proved.public_words,
             &opts,
+            artifacts.hasher,
         ),
         "the joined FRI run must verify"
     );

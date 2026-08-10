@@ -43,21 +43,36 @@ pub enum LfmProveError {
     Prover(ProvingError),
 }
 
+/// Proves under the permutation `artifacts` was built for.
+///
+/// The hasher comes from the artifacts rather than from a default, because
+/// `artifacts.program_id` is derived from it: taking it from anywhere else
+/// would let the statement claim one permutation while the AIRs prove another.
 pub fn lfm_prove(
     program: &LfmProgram,
     artifacts: &LfmArtifacts,
     arenas: &[Vec<LfmWord>],
     options: &ProofOptions,
 ) -> Result<LfmProof, LfmProveError> {
-    lfm_prove_with_hasher(program, artifacts, arenas, options, HasherKind::default())
+    lfm_prove_with_hasher(program, artifacts, arenas, options, artifacts.hasher)
 }
 
-/// [`lfm_prove`] under an explicitly chosen `LFM_HASH` permutation.
+/// [`lfm_prove`] with the `LFM_HASH` permutation named explicitly at the call
+/// site instead of read off `artifacts`.
 ///
 /// The chips bake their hasher's constants into their constraints, so execution
 /// must use the same hasher — this function is the single place that holds them
 /// together, passing one `hasher` to the executor, the trace filler and the AIR
-/// set. Verification needs the same value (`verify_against_with_hasher`).
+/// set. Verification needs the same value ([`verify_against`]).
+///
+/// # Panics
+///
+/// If `hasher` is not the one `artifacts` was built for. The two are not
+/// independent: `artifacts.program_id` binds the hasher, so a mismatch would
+/// produce a proof whose statement names a permutation the trace does not use —
+/// unverifiable everywhere, and confusing at exactly the point (registry
+/// regeneration) where it would be introduced. The agreement is a caller bug,
+/// not a proof outcome, so it is asserted rather than returned.
 pub fn lfm_prove_with_hasher(
     program: &LfmProgram,
     artifacts: &LfmArtifacts,
@@ -65,6 +80,12 @@ pub fn lfm_prove_with_hasher(
     options: &ProofOptions,
     hasher: HasherKind,
 ) -> Result<LfmProof, LfmProveError> {
+    assert_eq!(
+        artifacts.hasher, hasher,
+        "artifacts were built for {:?} but proving was asked for {hasher:?}; \
+         program_id binds the hasher, so the two must agree",
+        artifacts.hasher
+    );
     let exec = execute(program, arenas, &hasher).map_err(LfmProveError::Exec)?;
     let mut traces = build_traces_with_hasher(program, &exec.records, hasher);
     let proof =
@@ -82,7 +103,7 @@ pub fn lfm_prove_with_hasher(
 /// Split out of [`lfm_prove`] so callers that need to inspect or corrupt a
 /// trace between generation and proving (the tamper tests) share this
 /// transcript setup instead of reimplementing it. `lfm_prove` itself goes
-/// through [`prove_traces_with_hasher`], so this default-hasher form has only
+/// through [`prove_traces_with_hasher`], so this artifacts-hasher form has only
 /// test callers.
 #[cfg(test)]
 pub(crate) fn prove_traces(
@@ -91,13 +112,7 @@ pub(crate) fn prove_traces(
     public_words: &[(u32, LfmWord)],
     options: &ProofOptions,
 ) -> Result<MultiProof<F, E, ()>, ProvingError> {
-    prove_traces_with_hasher(
-        artifacts,
-        traces,
-        public_words,
-        options,
-        HasherKind::default(),
-    )
+    prove_traces_with_hasher(artifacts, traces, public_words, options, artifacts.hasher)
 }
 
 /// [`prove_traces`] against an AIR set built for `hasher`. The traces must have
@@ -146,11 +161,12 @@ pub fn lfm_verify(
         proof,
         claimed_public,
         options,
+        entry.hasher,
     ))
 }
 
-/// Verifies against a supplied root vector, program digest and `KECCAK_RND`
-/// chunk count instead of a registry entry.
+/// Verifies against a supplied root vector, program digest, `KECCAK_RND` chunk
+/// count and hasher instead of a registry entry.
 ///
 /// The registry lookup in [`lfm_verify`] is the soundness argument's first
 /// premise and has no off-switch; this is not one. It exists for callers that
@@ -158,36 +174,15 @@ pub fn lfm_verify(
 /// and tests covering program shapes that are not (and need not be) registered,
 /// such as the per-length keccak256 programs.
 ///
-/// The chunk count is supplied for the same reason the roots are: it is
-/// program shape the verifier must know to build the AIR set, and it is never
-/// read off the proof.
-pub fn verify_against(
-    roots: &[Commitment; NUM_LFM_CHIPS],
-    program_id: &Commitment,
-    keccak_rnd_chunks: usize,
-    proof: &MultiProof<F, E, ()>,
-    claimed_public: &[(u32, LfmWord)],
-    options: &ProofOptions,
-) -> bool {
-    verify_against_with_hasher(
-        roots,
-        program_id,
-        keccak_rnd_chunks,
-        proof,
-        claimed_public,
-        options,
-        HasherKind::default(),
-    )
-}
-
-/// [`verify_against`] with the `LFM_HASH` permutation chosen explicitly.
-///
-/// Which hasher a proof was produced under is program shape, exactly like the
-/// roots and the chunk count: it is supplied by the caller and never read off
-/// the proof. A verifier that builds the wrong hash AIR rejects — the widths and
-/// the constraint count differ.
+/// Every piece is supplied for the same reason: it is program shape the
+/// verifier must know to build the AIR set, and none of it is ever read off the
+/// proof. That includes the hasher — which a caller holding artifacts should
+/// pass as `artifacts.hasher`, since the digest it is paired with was derived
+/// from exactly that value. There is deliberately no defaulting form: a
+/// verifier that silently assumed a permutation would be assuming the one thing
+/// the roots cannot tell it.
 #[allow(clippy::too_many_arguments)]
-pub fn verify_against_with_hasher(
+pub fn verify_against(
     roots: &[Commitment; NUM_LFM_CHIPS],
     program_id: &Commitment,
     keccak_rnd_chunks: usize,

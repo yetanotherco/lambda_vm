@@ -1040,6 +1040,7 @@ fn the_join_proves_and_verifies() {
             &proved.proof,
             &proved.public_words,
             &opts,
+            artifacts.hasher,
         ),
         "the joined run must verify"
     );

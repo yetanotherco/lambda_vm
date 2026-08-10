@@ -58,12 +58,12 @@ pub use chunking::{KECCAK_RND_MAX_CHUNK_ROWS, KeccakChunking};
 pub use commit::{commit_columns, commit_group};
 pub use compiler::{ColumnGroup, LfmColumnGroups, LfmProgram, compile};
 pub use executor::{LfmExecError, LfmExecution, LfmRecords, execute};
-pub use hash::{LfmHasher, TestPermutation};
+pub use hash::{HasherKind, LfmHasher, TestPermutation};
 pub use instr::{Addr, ArenaId, BaseOp, ExtOp, HashMode, Instr};
 pub use proof::{LfmProof, LfmProveError, lfm_prove, lfm_verify};
 pub use registry::{
     LFM_REGISTRY, LfmArtifacts, LfmProgramKind, LfmRegistryEntry, LfmRegistryError,
-    build_artifacts, resolve,
+    build_artifacts, build_artifacts_with_hasher, resolve,
 };
 pub use statement::{LFM_MACHINE_VERSION, lfm_program_id};
 pub use transcript_replay::{Candidate, TranscriptReplay};

@@ -129,6 +129,7 @@ fn registry_drift_trivial_v0_blowup2() {
         entry.keccak_rnd_chunks, artifacts.keccak_rnd_chunks,
         "KECCAK_RND chunk count drifted"
     );
+    assert_eq!(entry.hasher, artifacts.hasher, "hasher drifted");
     assert_eq!(entry.program_id, artifacts.program_id, "program_id drifted");
 }
 
@@ -240,6 +241,7 @@ fn registry_drift_fri_toy_v0_blowup2() {
         entry.keccak_rnd_chunks, artifacts.keccak_rnd_chunks,
         "KECCAK_RND chunk count drifted"
     );
+    assert_eq!(entry.hasher, artifacts.hasher, "hasher drifted");
     assert_eq!(entry.program_id, artifacts.program_id, "program_id drifted");
 }
 
@@ -521,6 +523,7 @@ fn registry_drift_keccak_chain_v0_blowup2() {
         entry.keccak_rnd_chunks, artifacts.keccak_rnd_chunks,
         "KECCAK_RND chunk count drifted"
     );
+    assert_eq!(entry.hasher, artifacts.hasher, "hasher drifted");
     assert_eq!(entry.program_id, artifacts.program_id, "program_id drifted");
 }
 
@@ -637,6 +640,7 @@ fn keccak_sponge_reference_lengths_prove_and_verify() {
                 &proved.proof,
                 &proved.public_words,
                 &opts,
+                artifacts.hasher,
             ),
             "len {len}: the machine proof of keccak256 must verify"
         );
@@ -698,6 +702,7 @@ fn tampered_stream_half_rejects() {
             &forged.proof,
             &honest.public_words,
             &opts,
+            artifacts.hasher,
         ),
         "claiming the honest digest for a tampered stream must reject"
     );
@@ -739,6 +744,7 @@ fn tampered_absorb_xor_rejects() {
             &proof,
             &exec.public_words,
             &opts,
+            artifacts.hasher,
         ),
         "a broken absorb XOR must reject"
     );
@@ -760,6 +766,7 @@ fn registry_drift_keccak_sponge_v0_blowup2() {
         entry.keccak_rnd_chunks, artifacts.keccak_rnd_chunks,
         "KECCAK_RND chunk count drifted"
     );
+    assert_eq!(entry.hasher, artifacts.hasher, "hasher drifted");
     assert_eq!(entry.program_id, artifacts.program_id, "program_id drifted");
 }
 
@@ -827,6 +834,7 @@ fn permute_row_cannot_substitute_the_permuted_state() {
             &proof,
             &exec.public_words,
             &opts,
+            artifacts.hasher,
         ),
         "a permute row whose PERM_IN differs from the state it read must reject"
     );
@@ -933,6 +941,7 @@ fn machine_proves_the_sample_replay() {
                 &proved.proof,
                 &proved.public_words,
                 &opts,
+                artifacts.hasher,
             ),
             "len {len}: the machine proof of sample() must verify"
         );
@@ -1222,6 +1231,7 @@ fn canonicity_guard_rejects_an_out_of_range_candidate_in_the_proof() {
             &proof,
             &exec.public_words,
             &opts,
+            artifacts.hasher,
         ),
         "a candidate at p must fail the canonicity guard"
     );
@@ -1396,6 +1406,7 @@ fn tampered_transcript_absorb_half_rejects() {
                 &forged.proof,
                 &honest.public_words,
                 &opts,
+                artifacts.hasher,
             ),
             "{what}: claiming the honest challenges for a tampered absorb must reject"
         );
@@ -1418,6 +1429,7 @@ fn registry_drift_transcript_replay_v0_blowup2() {
         entry.keccak_rnd_chunks, artifacts.keccak_rnd_chunks,
         "KECCAK_RND chunk count drifted"
     );
+    assert_eq!(entry.hasher, artifacts.hasher, "hasher drifted");
     assert_eq!(entry.program_id, artifacts.program_id, "program_id drifted");
 }
 
@@ -1840,6 +1852,7 @@ fn append_ext_proves_and_verifies() {
             &proved.proof,
             &proved.public_words,
             &opts,
+            artifacts.hasher,
         ),
         "the big-endian absorb must verify"
     );
@@ -1971,6 +1984,7 @@ fn splice_proves_and_verifies() {
             &proved.proof,
             &proved.public_words,
             &opts,
+            artifacts.hasher,
         ),
         "the spliced absorb must verify"
     );
@@ -2256,6 +2270,7 @@ fn tampered_statement_or_root_rejects() {
                 &forged.proof,
                 &honest.public_words,
                 &opts,
+                artifacts.hasher,
             ),
             "{what}: claiming the honest challenges must reject"
         );
@@ -2277,6 +2292,7 @@ fn registry_drift_statement_replay_v0_blowup2() {
         entry.keccak_rnd_chunks, artifacts.keccak_rnd_chunks,
         "KECCAK_RND chunk count drifted"
     );
+    assert_eq!(entry.hasher, artifacts.hasher, "hasher drifted");
     assert_eq!(entry.program_id, artifacts.program_id, "program_id drifted");
 }
 
@@ -2391,6 +2407,104 @@ fn registered_programs_are_single_chunk() {
     }
 }
 
+/// Every `HasherKind` there is. Not derived — a new candidate must be added
+/// here by hand, which is the point: the two tests below are what say a new
+/// hasher gets its own program identity rather than sharing one.
+const ALL_HASHERS: [super::hash::HasherKind; 2] = [
+    super::hash::HasherKind::Test,
+    super::hash::HasherKind::Poseidon,
+];
+
+/// ★ Each registered entry's digest is bound to the hasher the entry names,
+/// and to no other.
+///
+/// The first assertion is the honest control: the stored `program_id` really is
+/// what the stored `(roots, heights, chunks, hasher)` derive, so the table is
+/// internally consistent. The second is the property — swapping *only* the
+/// hasher, with every root held fixed, must move the digest. Held together they
+/// say a Test-backed and a Poseidon-backed machine of the same program are two
+/// programs, which is what stops a verifier from pairing one hasher's digest
+/// with another hasher's AIR set.
+#[test]
+fn every_registry_entry_binds_its_hasher_into_its_digest() {
+    for entry in super::registry::LFM_REGISTRY {
+        assert_eq!(
+            super::statement::lfm_program_id(
+                &entry.roots,
+                &entry.log_heights,
+                entry.keccak_rnd_chunks,
+                entry.hasher,
+            ),
+            entry.program_id,
+            "{:?}: the stored digest must be what the stored shape derives",
+            entry.kind
+        );
+        for other in ALL_HASHERS {
+            if other == entry.hasher {
+                continue;
+            }
+            assert_ne!(
+                super::statement::lfm_program_id(
+                    &entry.roots,
+                    &entry.log_heights,
+                    entry.keccak_rnd_chunks,
+                    other,
+                ),
+                entry.program_id,
+                "{:?}: {other:?} must not share {:?}'s program identity",
+                entry.kind,
+                entry.hasher
+            );
+        }
+    }
+}
+
+/// The registry-path consequence: `lfm_verify` builds its AIR set from the
+/// entry's hasher, so an honest proof of a registered program verifies, and the
+/// same proof against the same entry's roots and digest under any *other*
+/// hasher does not.
+///
+/// The accept half is not decoration. A verifier that rejected everything would
+/// pass the reject half on its own, so the pair is what makes this a binding
+/// test rather than a "does it say no" test.
+#[test]
+fn the_registry_hasher_is_what_verify_builds() {
+    let opts = options();
+    let program = trivial_program();
+    let entry = resolve(LfmProgramKind::TrivialV0, opts.blowup_factor).expect("registered");
+    let artifacts = build_artifacts(&program, &opts);
+    let proved = lfm_prove(&program, &artifacts, &arenas(), &opts).expect("prove");
+
+    assert!(
+        lfm_verify(
+            LfmProgramKind::TrivialV0,
+            &proved.proof,
+            &proved.public_words,
+            &opts
+        )
+        .expect("registered"),
+        "the honest proof must verify under the hasher the entry names"
+    );
+
+    for other in ALL_HASHERS {
+        if other == entry.hasher {
+            continue;
+        }
+        assert!(
+            !verify_against(
+                &entry.roots,
+                &entry.program_id,
+                entry.keccak_rnd_chunks,
+                &proved.proof,
+                &proved.public_words,
+                &opts,
+                other,
+            ),
+            "the entry's own proof must not verify under {other:?}"
+        );
+    }
+}
+
 /// The split's shape: chunk count, per-chunk permutation counts, per-chunk
 /// trace heights, AIR count and trace count all agree.
 #[test]
@@ -2458,6 +2572,7 @@ fn chunked_sponge_proves_and_verifies() {
             &proved.proof,
             &proved.public_words,
             &opts,
+            artifacts.hasher,
         ),
         "a two-chunk KECCAK_RND proof must verify"
     );
@@ -2502,6 +2617,7 @@ fn chunking_does_not_change_what_is_proved() {
                 &proof.proof,
                 &proof.public_words,
                 &opts,
+                artifacts.hasher,
             ),
             "both chunkings must verify against their own artifacts"
         );
@@ -2544,6 +2660,7 @@ fn tampered_second_chunk_permutation_rejects() {
             &proof,
             &exec.public_words,
             &opts,
+            artifacts.hasher,
         ),
         "a corrupted permutation in the second chunk must reject"
     );
@@ -2581,6 +2698,7 @@ fn dropping_the_second_chunks_permutation_rejects() {
             &proof,
             &exec.public_words,
             &opts,
+            artifacts.hasher,
         ),
         "a chunk missing its permutation must reject"
     );
@@ -2623,6 +2741,7 @@ fn permutations_may_be_reassigned_across_chunk_boundaries() {
             &proof,
             &exec.public_words,
             &opts,
+            artifacts.hasher,
         ),
         "chunk assignment is free — a 1+2 split proves the same statement as 2+1"
     );
@@ -2655,6 +2774,7 @@ fn verify_rejects_a_chunk_count_that_does_not_match_the_proof() {
                 &proved.proof,
                 &proved.public_words,
                 &opts,
+                artifacts.hasher,
             ),
             "chunk count {wrong} must not verify a 2-chunk proof"
         );
@@ -2975,6 +3095,7 @@ fn keccak_merkle_walk_authenticates_a_real_opening() {
             &proved.proof,
             &proved.public_words,
             &opts,
+            artifacts.hasher,
         ),
         "the authenticated opening must verify"
     );
@@ -3100,6 +3221,7 @@ fn tampered_merkle_opening_rejects() {
                 &proved.proof,
                 &honest.public_words,
                 &opts,
+                artifacts.hasher,
             ),
             "{what}: claiming the real committed root for a forged walk must reject"
         );
@@ -3455,6 +3577,7 @@ fn l2g_binding_proves_and_verifies() {
             &proved.proof,
             &proved.public_words,
             &opts,
+            artifacts.hasher,
         ),
         "the L2G binding must verify"
     );
@@ -3529,6 +3652,7 @@ fn tampered_l2g_binding_rejects() {
             &proved.proof,
             &honest.public_words,
             &opts,
+            artifacts.hasher,
         ),
         "claiming the real per-epoch roots for a reordered binding must reject"
     );
@@ -3609,6 +3733,7 @@ fn program_id_matches_production_on_the_real_fixture() {
             &proved.proof,
             &proved.public_words,
             &opts,
+            artifacts.hasher,
         ),
         "the program-id fold must verify"
     );
@@ -3665,6 +3790,7 @@ fn program_id_folds_pages_in_the_production_layout() {
                 &proved.proof,
                 &proved.public_words,
                 &opts,
+                artifacts.hasher,
             ),
             "{num_pages} pages: the fold must verify"
         );
@@ -3744,6 +3870,7 @@ fn tampered_program_id_inputs_change_the_id() {
                 &forged.proof,
                 &honest.public_words,
                 &opts,
+                artifacts.hasher,
             ),
             "{what}: claiming the honest id must reject"
         );
@@ -4181,6 +4308,7 @@ fn the_register_derivation_proves_and_verifies() {
             &proved.proof,
             &proved.public_words,
             &opts,
+            artifacts.hasher,
         ),
         "the derivation must verify"
     );
@@ -4243,6 +4371,7 @@ fn tampering_the_register_files_moves_the_derived_root() {
                 &forged.proof,
                 &honest.public_words,
                 &opts,
+                artifacts.hasher,
             ),
             "{what}: claiming the honest root must reject"
         );
