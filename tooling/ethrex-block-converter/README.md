@@ -88,17 +88,16 @@ Artifacts live in the **[`bench-fixtures-v1`][release]** release on
 
 | asset | sha256 | read by |
 |---|---|---|
-| `ethrex_mainnet_25368371.bin` | `0a301731…` | every benchmark (**current default**) |
+| `ethrex_mainnet_25368371_4f658c2b.bin` | `0a301731…` | every benchmark (**current default**) |
 | `cache_mainnet_25368371.json` | `7aa88a5f…` | `regen-real-block-fixture` |
 | `ethrex_mainnet_25453112.bin` | `0298663d…` | alternate candidate |
 | `cache_mainnet_25453112.json` | `20ffbbc1…` | alternate candidate |
 
-> **Re-upload pending.** The `0a301731…` above is what the Makefile verifies against
-> after the ethrex `4f658c2b` bump, which moved the rkyv layout and so changed the
-> fixture bytes. The hosted asset still carries the pre-bump `61eba49b…` until it is
-> replaced in the release, so `make ethrex-real-block-fixture` fails its checksum on a
-> clean checkout in the meantime — loudly, which is the designed failure mode. Only the
-> `.bin` is stale; the caches are inputs and are unaffected.
+> The asset name carries the ethrex rev because the bytes are a function of it: the
+> archived `ProgramInput` rkyv layout moves with the pin, so one block has one
+> fixture per rev. The pre-bump bytes stay hosted under the original name
+> (`ethrex_mainnet_25368371.bin`, `61eba49b…`) so older `main`s — whose Makefile
+> pins that sha256 — keep fetching their own artifact.
 
 Each block has two assets: the fixture and the **cache** it was converted from
 (`make ethrex-real-block-cache`, ~2 MB, same verify-then-move contract). Only
@@ -364,10 +363,9 @@ These figures were measured on the pre-bump fixture (`61eba49b…`, 1,110,156 B)
 left as measured rather than restamped. The ethrex `4f658c2b` bump changed the fixture
 bytes, so they are a baseline for a workload that no longer exists byte-for-byte.
 
-Post-bump CPU counterparts, measured ABBA on `vm-benchmarks-1` at the same epoch 2^22
-(see `ETHREX_BUMP_CYCLE_RESULTS.md`): **45,074,552 cycles** (−11.24%), **142.37 s** CPU
-prove (−10.87%), **936.7 MB** proof (−12.22%), peak RSS flat at ~48 GB. The GPU column
-has no post-bump counterpart yet.
+Post-bump CPU counterparts, measured ABBA on `vm-benchmarks-1` at the same epoch 2^22:
+**45,074,552 cycles** (−11.24%), **142.37 s** CPU prove (−10.87%), **936.7 MB** proof
+(−12.22%), peak RSS flat at ~48 GB. The GPU column has no post-bump counterpart yet.
 
 | block | gas | cycles | GPU prove (RTX 5090) | CPU prove | proof | fixture |
 |---|---|---|---|---|---|---|

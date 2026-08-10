@@ -70,7 +70,7 @@ ethrex_bench_4.bin
 The blocks above are synthetic (N plain ETH transfers over a small genesis).
 For a representative workload — real contract execution, real trie depth, real
 bytecode — `make ethrex-real-block-fixture` downloads
-`ethrex_mainnet_25368371.bin` (1,110,165 B) from the `bench-fixtures-v1` release
+`ethrex_mainnet_25368371_4f658c2b.bin` (1,110,165 B) from the `bench-fixtures-v1` release
 and verifies it against `ETHREX_REAL_BLOCK_FIXTURE_SHA256` in the Makefile before
 moving it into place. It is gitignored rather than committed, so the checksum
 lives next to the URL in the Makefile rather than in the table above (the checksum
