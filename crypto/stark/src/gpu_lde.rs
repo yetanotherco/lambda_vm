@@ -1512,6 +1512,12 @@ where
                 return false;
             }
             let (m, lde) = (h.m, h.lde_size);
+            // Short download: degrade like the sibling paths
+            // (`download_main_lde_row_major`, `materialize_aux_trace_host`)
+            // rather than panic on the slab slicing below.
+            if slabs.len() != m * lde * 3 {
+                return false;
+            }
             let mut interleaved = vec![0u64; m * lde * 3];
             for c in 0..m {
                 for k in 0..3 {
@@ -1525,6 +1531,10 @@ where
             // is [u64; 3].
             unsafe {
                 let mut v = std::mem::ManuallyDrop::new(interleaved);
+                debug_assert!(
+                    v.len().is_multiple_of(3) && v.capacity().is_multiple_of(3),
+                    "interleaved len/capacity must be a multiple of 3 for Fp3 reinterpret"
+                );
                 Vec::from_raw_parts(
                     v.as_mut_ptr() as *mut FieldElement<E>,
                     v.len() / 3,
