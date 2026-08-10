@@ -3,6 +3,14 @@ name = "lambda-vm-syscalls"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+# Route whole 136-byte keccak rate blocks through the KECCAK_SPONGE absorb
+# accelerator (ECALL -4) instead of XOR-ing them into the state in guest
+# software. Off by default: both variants stay buildable so the prover A/B is
+# honest, and the digests are identical either way.
+keccak-sponge-accel = []
+
 [dependencies]
 embedded-alloc = "0.6"
 riscv = { version = "0.15", features = ["critical-section-single-hart"] }

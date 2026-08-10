@@ -217,6 +217,27 @@ endef
 $(RUST_ARTIFACTS_DIR)/%.elf: FORCE | prepare-sysroot $(RUST_ARTIFACTS_DIR)
 	$(call build_guest_elf,$(RUST_PROGRAMS_DIR)/$*,$*)
 
+# Plain-software-sponge ethrex guest, for a local A/B against the default one.
+#
+# The ethrex guest hashes on the KECCAK_SPONGE absorb accelerator BY DEFAULT
+# (see its Cargo.toml), because /bench builds the workload with a plain
+# `make .../ethrex.elf` and proves whatever that contains — an accelerator
+# behind a non-default feature would be invisible to it. This rule builds the
+# other side of the comparison.
+#
+# Unlike the recursion presets below, the variant cannot be selected with a
+# second `required-features`-gated [[bin]]: cargo gates a bin on a feature being
+# ON, never OFF, and this axis is `--no-default-features`. So both variants come
+# from the one `ethrex` bin and land on the same
+# shared_target/.../release/ethrex path — build them SEQUENTIALLY (each recipe
+# copies to its own $@ before the next cargo run can overwrite it), and expect
+# cargo to rebuild the crate when switching, since the feature set changes.
+#
+# An explicit rule beats the pattern rule above, which would otherwise go
+# looking for a crate directory named `ethrex-nosponge`.
+$(RUST_ARTIFACTS_DIR)/ethrex-nosponge.elf: FORCE | prepare-sysroot $(RUST_ARTIFACTS_DIR)
+	$(call build_guest_elf,$(RUST_PROGRAMS_DIR)/ethrex,ethrex,--no-default-features)
+
 # Compile rust benches (64-bit)
 $(BENCH_ARTIFACTS_DIR)/%.elf: FORCE | prepare-sysroot $(BENCH_ARTIFACTS_DIR)
 	$(call build_guest_elf,$(BENCH_PROGRAMS_DIR)/$*,$*)

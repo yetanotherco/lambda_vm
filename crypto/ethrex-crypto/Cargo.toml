@@ -14,6 +14,25 @@ license = "MIT OR Apache-2.0"
 # changes don't require an ethrex PR — the guest just constructs and injects
 # `LambdaVmEcsmCrypto`.
 
+[features]
+default = []
+# Route the whole 136-byte keccak rate blocks of `Crypto::keccak256` through
+# the KECCAK_SPONGE absorb accelerator (ECALL -4) instead of XOR-ing them into
+# the state in guest software; the padded tail stays on `keccak_permute`. The
+# digests are identical either way.
+#
+# Off at this level, ON by default at the guest crate, so `make ethrex.elf`
+# (which is what /bench builds) produces an accelerated ELF while
+# `--no-default-features` still builds the plain one for a local A/B.
+#
+# The forward to `lambda-vm-syscalls/keccak-sponge-accel` is a no-op for this
+# crate's own sponge (which calls `keccak_absorb_blocks` directly, no feature
+# needed); it is here so one flag means "accelerator on everywhere". The
+# dependency is target-gated to riscv64 and cargo applies the forward only when
+# the dependency is active, so host builds are unaffected — smoke-checked with
+# `cargo check --features keccak-sponge-accel` on the host.
+keccak-sponge-accel = ["lambda-vm-syscalls/keccak-sponge-accel"]
+
 [dependencies]
 # Defines the `Crypto` trait, `CryptoError`, and `keccak::keccak_hash`. Same rev
 # + `default-features = false` as the guest's ethrex-crypto, so feature
