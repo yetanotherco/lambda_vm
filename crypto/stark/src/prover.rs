@@ -1010,11 +1010,11 @@ pub trait IsStarkProver<
     }
 
     /// Stage-3 device-only gate for one table (see
-    /// [`crate::gpu_lde::device_only_gate`]). Derived purely from the AIR +
-    /// domain so the round-1 main-commit and aux-commit closures compute the
-    /// identical value and skip both host D2Hs consistently — the per-table
-    /// `host_trace_empty` flag covers both the main and aux buffers, so they
-    /// must be left empty together.
+    /// [`crate::gpu_lde::device_only_gate`]). Derived from the AIR + domain;
+    /// the main commit uses it as is, while the aux commit additionally
+    /// requires the main commit to have produced a device handle — the aux
+    /// side may be more conservative than the main side (never less), which
+    /// keeps a mixed GPU-aux/CPU-main state out.
     #[cfg(feature = "cuda")]
     fn device_only_for(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
@@ -1594,23 +1594,27 @@ pub trait IsStarkProver<
         // when the evaluation itself already ran on device).
         #[cfg(feature = "cuda")]
         let mut precomputed_parts: Option<Vec<Vec<FieldElement<FieldExtension>>>> = None;
+        // A downloaded `H` awaiting the host decompose: produced under the
+        // lock below, consumed after it — the host iFFT + LDEs are pure CPU
+        // work and must not serialize other tables' device windows.
         #[cfg(feature = "cuda")]
-        {
+        let mut downloaded_h: Option<Vec<FieldElement<FieldExtension>>> = None;
+        #[cfg(feature = "cuda")]
+        if number_of_parts == 2 {
             // Serializing this window across tables (device constraint eval +
             // decompose, where H is born) eliminates a transient whole-buffer
             // H corruption seen under concurrent R2 windows on VRAM pressure.
-            // The commit and every host arm run outside the lock.
+            // The commit, the host decompose of a downloaded `H` and every
+            // host arm run outside the lock.
             let _r2_serial_guard = crate::gpu_lde::r2_serialize_guard();
-            if number_of_parts == 2
-                && let Some(h_dev) = evaluator.evaluate_dev(
-                    air,
-                    &round_1_result.lde_trace,
-                    domain,
-                    transition_coefficients,
-                    boundary_coefficients,
-                    &round_1_result.rap_challenges,
-                )
-            {
+            if let Some(h_dev) = evaluator.evaluate_dev(
+                air,
+                &round_1_result.lde_trace,
+                domain,
+                transition_coefficients,
+                boundary_coefficients,
+                &round_1_result.rap_challenges,
+            ) {
                 match crate::gpu_lde::try_decompose_extend_d2_dev::<Field, FieldExtension>(
                     &h_dev,
                     twiddles.inv_2x(domain),
@@ -1622,15 +1626,15 @@ pub trait IsStarkProver<
                         precomputed_parts = Some(parts);
                     }
                     None => {
-                        if let Some(h) =
-                            crate::gpu_lde::download_comp_h_to_field::<FieldExtension>(&h_dev)
-                        {
-                            precomputed_parts =
-                                Some(Self::decompose_and_extend_d2(&h, domain, twiddles));
-                        }
+                        downloaded_h =
+                            crate::gpu_lde::download_comp_h_to_field::<FieldExtension>(&h_dev);
                     }
                 }
             }
+        }
+        #[cfg(feature = "cuda")]
+        if let Some(h) = downloaded_h.take() {
+            precomputed_parts = Some(Self::decompose_and_extend_d2(&h, domain, twiddles));
         }
         #[cfg(not(feature = "cuda"))]
         let precomputed_parts: Option<Vec<Vec<FieldElement<FieldExtension>>>> = None;
@@ -3406,9 +3410,12 @@ pub trait IsStarkProver<
                     if air.has_aux_trace() {
                         let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
 
-                        // Same gate as the Round 1 main commit: skip the aux
-                        // host D2H when device-only, so both buffers are left
-                        // empty together for this table.
+                        // Device-only for the aux commit: the main commit's
+                        // gate AND a produced main device handle. The aux side
+                        // may be MORE conservative than main (never less) — if
+                        // the GPU main commit declined and fell back to CPU,
+                        // skipping the aux D2H here would leave a device-only
+                        // trace with no main handle to serve it.
                         #[cfg(feature = "cuda")]
                         let mut device_only = Self::device_only_for(*air, domain)
                             && gpu_main_cells[idx].lock().unwrap().is_some();
