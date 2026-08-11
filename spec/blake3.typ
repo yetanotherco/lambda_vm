@@ -148,10 +148,22 @@ correctly; it neither proves nor addresses whether 6 rounds are secure.
 *The assumption-free alternative.* The chip design is round-parameterised;
 a 7-round instantiation (standard BLAKE3 compression, bit-compatible with
 official parent-node merges) costs roughly 10–12% more per merge
-end-to-end and requires no assumption beyond standard BLAKE3. The 6-round
-variant is the primary internal target per the review above; the 7-round
-variant is the interoperability / zero-assumption fallback. If both are
-instantiated they are distinct chips with distinct ECALL numbers.
+end-to-end and requires no assumption beyond standard BLAKE3.
+
+*Ordering, reversed 2026-08-10.* The 7-round variant is the primary
+target; the 6-round variant is the measured performance variant, kept
+behind the round parameter and adopted only if that 10–12% is judged worth
+signing A6R for. This reverses the ordering this section recorded before,
+and the argument is the reference chain rather than cryptanalysis: at 7
+rounds the official crate is a direct external test vector for both the
+primitive and its framing, and there is no assumption left to ratify or
+defend at audit. It retracts nothing from the external review above — 6
+rounds remains the endorsed floor — and it is not a signature on A6R,
+which falls due only if the default moves back to 6
+(`thoughts/shared/lfm-real-hash/A6R-signoff.md`). The chip specified on
+this page is still the 6-round instantiation, so the above is recorded
+intent and not a change that has landed here. If both are instantiated
+they are distinct chips with distinct ECALL numbers.
 
 = Cost
 
