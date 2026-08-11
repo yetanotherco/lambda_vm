@@ -24,7 +24,7 @@ Claims are ✓ VERIFIED / ✓ EXECUTED / ? INFERRED / ✗ OPEN.
 | non-canonical inputs rejected, not reduced | ✓ EXECUTED (L3) |
 | `LFML` / `LFMC` / `LFMT` pairwise distinct on the same lanes | ✓ EXECUTED (L5) |
 | `TAG_LFML` = `0x4C4D464C` round-trip | ✓ EXECUTED |
-| `FriToyV0` 91 compresses / 502,047 @7r | ✓ EXECUTED, matches the ratified pricing |
+| `FriToyV0` **93** compresses / **513,081** @7r | ✓ EXECUTED — corrected from the spec's 91 / 502,047; the `t0`/`t1` felt absorbs need `absorb_felts` (+2 `LFML` rows). See the correction below (§ near the cost table). |
 
 ---
 
