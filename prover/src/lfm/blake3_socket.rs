@@ -98,11 +98,17 @@
 //! direct KAT. A fixed-depth-only policy was rejected as an invariant no
 //! mechanism enforces.)
 //!
-//! Nothing implements `"LFML"` yet and nothing needs to: there is no
-//! leaf-hashing path (`merkle_walk` receives leaf digests as inputs) and every
-//! current tree is fixed-depth. The obligation binds review, not this code: a
-//! change adding leaf hashing or variable-depth trees without `"LFML"` is
-//! rejected on O5 (`gate-oracle/ORACLE.md` §7).
+//! Nothing implements `"LFML"` yet, and what makes that safe is **fixed depth
+//! alone** — not any absence of leaf hashing. Programs already form leaf
+//! digests by compressing raw data rows under the same `"LFMC"` tag
+//! (`programs.rs` FriToyV0: `leaf = compress(row_even, row_odd)` before each
+//! `merkle_walk`), so leaves and parents are NOT domain-separated today. That
+//! is sound only because every current tree is a fixed-depth static circuit:
+//! the eDSL builder fixes the program's shape at build time — hints supply
+//! values, never structure — so a node at one level cannot be replayed at
+//! another. The obligation binds review, not this code: a change adding
+//! variable-depth trees, or a leaf-hashing API meant to coexist with them,
+//! without `"LFML"` is rejected on O5 (`gate-oracle/ORACLE.md` §7).
 //!
 //! Equally on the record: the digest is 128 bits, so this socket offers
 //! **64-bit collision resistance** by the birthday bound. That follows from
