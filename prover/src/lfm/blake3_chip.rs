@@ -362,19 +362,64 @@ pub(crate) fn run_flow<T: Blake3Flow>(f: &mut T, cfg: FlowConfig) {
 // Wire interpretation (columns)
 // =========================================================================
 
-/// A 32-bit word as wiring: four byte columns (LSB first) or a constant.
+/// A 32-bit word as wiring: four byte columns (LSB first), a constant, or a
+/// constant selected by preprocessed mode columns.
 /// Constants only ever appear as the IV `v[c]` operands of round-0 add2s.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WordRef {
     Cols([usize; 4]),
     Const(u32),
+    /// `Σ_k col_k · tag_k` — a constant selected by PREPROCESSED mode columns.
+    ///
+    /// The socket's domain tag, for when one tag is no longer enough. It is a
+    /// linear form over columns the prover cannot choose, so it is as unchosen
+    /// as the plain `Const` it replaces, and it costs the same: zero witness
+    /// columns, zero range checks, degree 1 where the constant was degree 0.
+    /// `add3`'s body is degree 1 in its operands either way, so the arm's max
+    /// degree does not move.
+    ///
+    /// It is a WHOLE-WORD form only — see [`WordRef::byte`].
+    ModeSelected(&'static [(usize, u32)]),
 }
 
 impl WordRef {
+    /// This word's byte `b`, for a byte-granular consumer (`ByteAlu[XOR]`).
+    ///
+    /// # Panics
+    ///
+    /// On [`WordRef::ModeSelected`]. A mode-selected word has no byte
+    /// decomposition without witnessing one, and the whole reason the tag lives
+    /// in `m[8]` is that message words reach `add3` and nothing else. Panicking
+    /// says so out loud rather than letting a future byte consumer quietly
+    /// acquire four columns nobody committed.
     pub(crate) fn byte(self, b: usize) -> ByteRef {
         match self {
             WordRef::Cols(c) => ByteRef::Col(c[b]),
             WordRef::Const(w) => ByteRef::Const(((w >> (8 * b)) & 0xFF) as u8),
+            WordRef::ModeSelected(_) => unreachable!(
+                "a mode-selected word is a whole-word value: it reaches add3 and \
+                 nothing byte-granular, so it has no byte columns to name"
+            ),
+        }
+    }
+
+    /// This word rotated right by `bytes` bytes — free wiring, no columns and
+    /// no constraint: `Cols` permutes its byte columns and `Const` rotates its
+    /// value. It is BLAKE3's `rotr16`/`rotr8`, whose shifts are byte-aligned.
+    ///
+    /// # Panics
+    ///
+    /// On [`WordRef::ModeSelected`], for the reason [`WordRef::byte`] gives:
+    /// the rotation is a byte permutation, and a mode-selected word has no
+    /// bytes to permute.
+    pub(crate) fn rotr_bytes(self, bytes: usize) -> WordRef {
+        match self {
+            WordRef::Cols(c) => WordRef::Cols(core::array::from_fn(|j| c[(j + bytes) % 4])),
+            WordRef::Const(v) => WordRef::Const(v.rotate_right(8 * bytes as u32)),
+            WordRef::ModeSelected(_) => unreachable!(
+                "a mode-selected word is a whole-word value: it has no byte \
+                 columns to rotate"
+            ),
         }
     }
 }
@@ -505,16 +550,10 @@ impl Blake3Flow for WireFlow {
     }
 
     fn rotr16(&mut self, w: WordRef) -> WordRef {
-        match w {
-            WordRef::Cols([b0, b1, b2, b3]) => WordRef::Cols([b2, b3, b0, b1]),
-            WordRef::Const(v) => WordRef::Const(v.rotate_right(16)),
-        }
+        w.rotr_bytes(2)
     }
     fn rotr8(&mut self, w: WordRef) -> WordRef {
-        match w {
-            WordRef::Cols([b0, b1, b2, b3]) => WordRef::Cols([b1, b2, b3, b0]),
-            WordRef::Const(v) => WordRef::Const(v.rotate_right(8)),
-        }
+        w.rotr_bytes(1)
     }
 
     fn rot_shift(&mut self, g: usize, half: usize, w: WordRef) -> WordRef {
@@ -999,6 +1038,12 @@ pub(crate) fn word_expr<B: ConstraintBuilder<F, E>>(b: &B, w: &WordRef) -> B::Ex
                 + b.main(0, c[3]) * b.const_base(16777216)
         }
         WordRef::Const(v) => b.const_base(*v as u64),
+        WordRef::ModeSelected(terms) => {
+            let mut iter = terms.iter();
+            let term = |b: &B, (col, tag): (usize, u32)| b.main(0, col) * b.const_base(tag as u64);
+            let &first = iter.next().expect("a mode-selected word selects something");
+            iter.fold(term(b, first), |acc, &t| acc + term(b, t))
+        }
     }
 }
 
@@ -1072,7 +1117,9 @@ impl ConstraintSet<F, E> for Blake3LfmConstraints {
         for rw in &wires.rots {
             let (xlo, xhi) = match &rw.input {
                 WordRef::Cols(c) => (half_expr(b, &[c[0], c[1]]), half_expr(b, &[c[2], c[3]])),
-                WordRef::Const(_) => unreachable!("shift inputs are always committed XOR outputs"),
+                WordRef::Const(_) | WordRef::ModeSelected(_) => {
+                    unreachable!("shift inputs are always committed XOR outputs")
+                }
             };
             let sll_lo = half_expr(b, &rw.sll_lo);
             let sllc_lo = half_expr(b, &rw.sllc_lo);

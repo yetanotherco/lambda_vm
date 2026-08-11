@@ -2,34 +2,40 @@
 //!
 //! This is Route A of `thoughts/shared/lfm-real-hash/PLAN.md` §3: BLAKE3 hosted
 //! *behind* the frozen `LFM_HASH` socket, exactly the way Poseidon is. The chip
-//! count stays 14, `PREP_WIDTH` stays 11, the 28-column shared value prefix
-//! keeps its offsets, and everything BLAKE3 witnesses is appended after it — so
-//! no preprocessed root moves and no registered program's digest moves. Only a
-//! program that opts into [`HasherKind::Blake3`] gets a different identity, and
-//! it gets it deliberately, through the hasher tag `lfm_program_id` binds.
+//! count stays 14 and the 28-column shared value prefix keeps its offsets, so
+//! the `LFM_HASH` tuple contract is untouched and everything BLAKE3 witnesses is
+//! appended after the prefix. `PREP_WIDTH` is 12 — the transcript domain's mode
+//! selector (option B1) widened it from 11, which moved every preprocessed root
+//! and every registered program's digest once, in one re-bless.
 //!
 //! # What one row proves
 //!
-//! One row = one 2-to-1 compress, specified byte-level in
+//! One row = one 2-to-1 step, in one of TWO domains, specified byte-level in
 //! `thoughts/blake3/socket-kats/SOCKET.md` §2.1 and word-level in §2.2:
 //!
 //! ```text
-//! msg    = LE32(a0..a3) ‖ LE32(b0..b3) ‖ "LFMC"            (36 bytes)
-//! digest = BLAKE3(msg)[0..16]                              (128 bits, 1 cell)
+//! msg    = LE32(a0..a3) ‖ LE32(b0..b3) ‖ tag                (36 bytes)
+//! digest = BLAKE3(msg)[0..16]                               (128 bits, 1 cell)
 //! ```
 //!
-//! which, 36 bytes being one block, is exactly one compression with `h = IV`
-//! (all eight words), `m[0..4] = a`, `m[4..8] = b`, `m[8] = "LFMC"` as a
+//! with `tag = "LFMC"` on a Merkle/compress row and `"LFMT"` on a transcript
+//! row. 36 bytes being one block, that is exactly one compression with `h = IV`
+//! (all eight words), `m[0..4] = a`, `m[4..8] = b`, `m[8] = tag` as a
 //! little-endian `u32`, `m[9..16] = 0`, `t = 0`, `block_len = 36`,
 //! `flags = CHUNK_START|CHUNK_END|ROOT`, and the digest the LOW four output
 //! words.
 //!
-//! **At [`SOCKET_ROUNDS`] = 7 that is literally `blake3::hash(a ‖ b ‖ "LFMC")`,**
-//! so the socket has a direct external anchor and needs no oracle in the chain.
-//! That is the whole reason the domain tag lives in the *message* rather than in
-//! `flags`, `t` or `h`: a tag anywhere else would make even the 7-round socket a
-//! nonstandard invocation of `f` that no library computes, throwing the anchor
-//! away for nothing (SOCKET.md §2.3).
+//! **At [`SOCKET_ROUNDS`] = 7 that is literally `blake3::hash(a ‖ b ‖ tag)`,**
+//! so the socket has a direct external anchor and needs no oracle in the chain —
+//! and the transcript inherits that anchor unchanged, because the tag is the
+//! only thing that moved. That is the whole reason the domain tag lives in the
+//! *message* rather than in `flags`, `t` or `h`: a tag anywhere else would make
+//! even the 7-round socket a nonstandard invocation of `f` that no library
+//! computes, throwing the anchor away for nothing (SOCKET.md §2.3).
+//!
+//! `m[8]` is a linear form over the two PREPROCESSED mode columns rather than a
+//! compile-time constant, which keeps it prover-unchosen and free — see
+//! [`TAG_SELECTOR`].
 //!
 //! # Why the socket is so much cheaper than the standalone chip
 //!
@@ -115,16 +121,20 @@
 //! `HASH_DIGEST_FELTS = 4` and the machine's declared 128-bit target — it is
 //! not introduced by BLAKE3 or by the truncation window.
 //!
-//! # ✗ There is no `permute` socket
+//! # ✗ There is no `permute` socket, and there never will be
 //!
-//! `LFM_HASH` has two modes and this arm implements **one**. The `permute`
+//! `LFM_HASH` has three modes and this arm implements **two**. The `permute`
 //! socket — 12 felts in, 12 out — is unspecified: it has no mapping decision,
 //! no KATs, and its security argument is not the same argument as `compress`'s
 //! (SOCKET.md §7). Rather than invent one, the AIR forces `MODE_P = 0`, so a
 //! program containing a `permute` is *unprovable* under BLAKE3, and
 //! [`Blake3Permutation`] rejects one at execution with a message saying why.
-//! The practical consequence is that `edsl::merkle_walk` works under BLAKE3 and
-//! `edsl::SpongeVar` does not, so this retires half of the F3.4 disclosure.
+//!
+//! Option B1 (ratified 2026-08-11) made that permanent by removing the only
+//! reason to want one: the Fiat–Shamir sponge is a **compress chain**, not a
+//! permutation duplex, so `edsl::SpongeVar` runs on this socket like everything
+//! else and `MODE_P` stays pinned forever. The tag `"LFMP"` that was reserved
+//! for the permute socket is retired unused.
 
 use stark::constraints::builder::ConstraintBuilder;
 use stark::lookup::{BusInteraction, BusValue, Multiplicity};
@@ -175,9 +185,24 @@ pub const NUM_G: usize = SOCKET_ROUNDS * 8;
 /// The domain tag `"LFMC"`, read as one little-endian `u32` — `m[8]`.
 ///
 /// A tag is never reused for a second purpose, for the same reason
-/// `HasherKind::as_tag` never reuses a discriminant. `"LFMP"` is reserved for
-/// the (unspecified) permute socket and `"LFML"` for a leaf domain.
+/// `HasherKind::as_tag` never reuses a discriminant. `"LFMT"` is the transcript
+/// domain, `"LFML"` is reserved for a leaf domain, and `"LFMP"` is RETIRED
+/// UNUSED — it was reserved for a permute socket that option B1 decided never
+/// to build. Retired rather than deleted: freeing the value would let a later
+/// allocation reuse it and create a domain nobody analysed.
 pub const TAG_LFMC: u32 = u32::from_le_bytes(*b"LFMC");
+
+/// The domain tag `"LFMT"` — one step of the Fiat–Shamir transcript chain.
+///
+/// The transcript step is this socket in every respect except this word: same
+/// `h = IV`, same `m[0..4] = state`, `m[4..8] = operand`, same `t`,
+/// `block_len` and `flags`, same four-word truncation. So at
+/// [`SOCKET_ROUNDS`] = 7 a transcript step is literally
+/// `blake3::hash(state ‖ operand ‖ "LFMT")` truncated to 128 bits, and it
+/// inherits the compress socket's external anchor unchanged — which is the
+/// whole point of building the transcript out of this socket rather than out of
+/// a second one.
+pub const TAG_LFMT: u32 = u32::from_le_bytes(*b"LFMT");
 
 /// `CHUNK_START | CHUNK_END | ROOT` — the flags a one-block, one-chunk,
 /// root-position BLAKE3 hash uses. Matching the tree hasher exactly is what
@@ -202,24 +227,31 @@ pub(crate) const FLOW: FlowConfig = FlowConfig {
     full_output: false,
 };
 
-/// The 16 message words of the socket's 36-byte block.
-pub fn socket_message(a: &[u32; 4], b: &[u32; 4]) -> [u32; 16] {
+/// The 16 message words of the socket's 36-byte block, under domain `tag`.
+pub fn socket_message(a: &[u32; 4], b: &[u32; 4], tag: u32) -> [u32; 16] {
     let mut m = [0u32; 16];
     m[0..4].copy_from_slice(a);
     m[4..8].copy_from_slice(b);
-    m[8] = TAG_LFMC;
+    m[8] = tag;
     m
 }
 
-/// **The reference the chip is checked against**: the socket's 2-to-1 compress,
-/// word-level, at an explicit round count.
+/// **The reference the chip is checked against**: the socket's 2-to-1 step,
+/// word-level, at an explicit round count and in an explicit domain.
 ///
 /// `rounds` is an argument rather than [`SOCKET_ROUNDS`] so the KATs can pin
 /// both variants in one test run; the chip itself is compiled for exactly one.
-pub fn socket_digest_rounds(a: &[u32; 4], b: &[u32; 4], rounds: usize) -> [u32; 4] {
+/// `tag` is an argument for the same reason it is a column on the chip: two
+/// domains, one function.
+pub fn socket_digest_rounds_tagged(
+    a: &[u32; 4],
+    b: &[u32; 4],
+    rounds: usize,
+    tag: u32,
+) -> [u32; 4] {
     let out = blake3_compress_rounds(
         &BLAKE3_IV,
-        &socket_message(a, b),
+        &socket_message(a, b, tag),
         COUNTER_LFMC,
         BLOCK_LEN_LFMC,
         FLAGS_LFMC,
@@ -228,10 +260,42 @@ pub fn socket_digest_rounds(a: &[u32; 4], b: &[u32; 4], rounds: usize) -> [u32; 
     [out[0], out[1], out[2], out[3]]
 }
 
-/// [`socket_digest_rounds`] at the compiled-in round count — what the chip
-/// proves, and what [`Blake3Permutation::compress`] computes.
+/// [`socket_digest_rounds_tagged`] in the MERKLE domain.
+pub fn socket_digest_rounds(a: &[u32; 4], b: &[u32; 4], rounds: usize) -> [u32; 4] {
+    socket_digest_rounds_tagged(a, b, rounds, TAG_LFMC)
+}
+
+/// [`socket_digest_rounds`] at the compiled-in round count — what a `Compress`
+/// row proves, and what [`Blake3Permutation::compress`] computes.
 pub fn socket_digest(a: &[u32; 4], b: &[u32; 4]) -> [u32; 4] {
     socket_digest_rounds(a, b, SOCKET_ROUNDS)
+}
+
+/// One transcript step at an explicit round count — the `"LFMT"` domain.
+pub fn transcript_digest_rounds(state: &[u32; 4], operand: &[u32; 4], rounds: usize) -> [u32; 4] {
+    socket_digest_rounds_tagged(state, operand, rounds, TAG_LFMT)
+}
+
+/// [`transcript_digest_rounds`] at the compiled-in round count — what a
+/// `Transcript` row proves, and what [`Blake3Permutation::transcript`]
+/// computes.
+pub fn transcript_digest(state: &[u32; 4], operand: &[u32; 4]) -> [u32; 4] {
+    transcript_digest_rounds(state, operand, SOCKET_ROUNDS)
+}
+
+/// The domain tag a row in `mode` hashes under, or `None` for a mode this arm
+/// has no socket for.
+///
+/// One function, so the executor, the trace filler, the multiplicity histogram
+/// and the KATs cannot disagree about which tag a row carries. The AIR gets the
+/// same mapping through [`TAG_SELECTOR`], written the one other way it has to
+/// be written — as a linear form over the mode columns.
+pub const fn tag_for_mode(mode: HashMode) -> Option<u32> {
+    match mode {
+        HashMode::Compress => Some(TAG_LFMC),
+        HashMode::Transcript => Some(TAG_LFMT),
+        HashMode::Permute => None,
+    }
 }
 
 // =========================================================================
@@ -298,21 +362,25 @@ impl LfmHasher for Blake3Permutation {
     }
 
     fn compress(&self, a: &LfmWord, b: &LfmWord) -> LfmWord {
-        let (a, b) = (
-            lanes_of(a).expect("compress lane is not a u32 — admits() should have rejected it"),
-            lanes_of(b).expect("compress lane is not a u32 — admits() should have rejected it"),
-        );
-        word_of(&socket_digest(&a, &b))
+        self.step(a, b, TAG_LFMC)
     }
 
     /// The digest in lanes 0–3 and zeros above, which is exactly what the chip's
     /// `OUT` columns carry: `MULT1`/`MULT2` are zero on a Compress row, so the
     /// upper eight are sent nowhere, and the AIR pins them to zero.
     fn compress_out(&self, a: &LfmWord, b: &LfmWord) -> [FE; HASH_STATE_FELTS] {
-        let digest = self.compress(a, b);
-        let mut out = [FE::zero(); HASH_STATE_FELTS];
-        out[0..HASH_DIGEST_FELTS].clone_from_slice(&digest);
-        out
+        Self::widen(self.compress(a, b))
+    }
+
+    /// The same socket under the TRANSCRIPT tag — this is where BLAKE3 stops
+    /// inheriting the trait's single-domain default, and it is the only thing
+    /// that makes a transcript step un-replayable as a Merkle parent.
+    fn transcript(&self, a: &LfmWord, b: &LfmWord) -> LfmWord {
+        self.step(a, b, TAG_LFMT)
+    }
+
+    fn transcript_out(&self, a: &LfmWord, b: &LfmWord) -> [FE; HASH_STATE_FELTS] {
+        Self::widen(self.transcript(a, b))
     }
 
     fn admits(&self, mode: HashMode, state: &[FE; HASH_STATE_FELTS]) -> Result<(), &'static str> {
@@ -326,11 +394,31 @@ impl LfmHasher for Blake3Permutation {
             core::array::from_fn(|i| state[4 + i]),
         );
         if lanes_of(&a).is_none() || lanes_of(&b).is_none() {
-            // Obligation O1, host side. Rejecting rather than reducing is the
-            // point: reduction is the collision.
+            // Obligation O1, host side, and it binds both two-to-one modes:
+            // a transcript step is the same socket over the same lane columns,
+            // so it inherits the same domain restriction. Rejecting rather than
+            // reducing is the point: reduction is the collision.
             return Err("BLAKE3 compress input lane is not a u32 (SOCKET.md obligation O1)");
         }
         Ok(())
+    }
+}
+
+impl Blake3Permutation {
+    /// The socket, once, in the named domain — the one place the host computes
+    /// it, so `compress` and `transcript` cannot drift into different framings.
+    fn step(&self, a: &LfmWord, b: &LfmWord, tag: u32) -> LfmWord {
+        let (a, b) = (
+            lanes_of(a).expect("socket lane is not a u32 — admits() should have rejected it"),
+            lanes_of(b).expect("socket lane is not a u32 — admits() should have rejected it"),
+        );
+        word_of(&socket_digest_rounds_tagged(&a, &b, SOCKET_ROUNDS, tag))
+    }
+
+    fn widen(digest: LfmWord) -> [FE; HASH_STATE_FELTS] {
+        let mut out = [FE::zero(); HASH_STATE_FELTS];
+        out[0..HASH_DIGEST_FELTS].clone_from_slice(&digest);
+        out
     }
 }
 
@@ -350,17 +438,20 @@ impl LfmHasher for Blake3Permutation {
 /// output bytes.
 pub mod cols {
     pub use crate::lfm::chips::hash::cols::{
-        IN_ADDR0, IN_ADDR1, IN_ADDR2, IN0, MODE_C, MODE_P, MULT0, MULT1, MULT2, OUT_ADDR0,
+        IN_ADDR0, IN_ADDR1, IN_ADDR2, IN0, MODE_C, MODE_P, MODE_T, MULT0, MULT1, MULT2, OUT_ADDR0,
         OUT_ADDR1, OUT_ADDR2, OUT0, PREP_WIDTH, S8, SHARED_VALUE_COLUMNS,
     };
 
     use super::{NUM_G, OUT_WINDOW};
 
     /// The is-real flag every constraint is gated by and every send's
-    /// multiplicity: `MODE_C`, because this arm proves only Compress rows and
-    /// pins `MODE_P` to zero. It is a *preprocessed* column, so a prover cannot
-    /// choose it.
-    pub const MU: usize = MODE_C;
+    /// multiplicity: `MODE_C + MODE_T`, the two modes this arm has a socket
+    /// for. `MODE_P` is pinned to zero, so the sum is a bit on every row and
+    /// zero on padding.
+    ///
+    /// Both are *preprocessed* columns, so a prover chooses neither the gate
+    /// nor — through the same columns — the domain tag it selects.
+    pub const MU_COLUMNS: (usize, usize) = (MODE_C, MODE_T);
 
     /// First appended witness column: the byte decomposition of the 8 input
     /// lanes, 4 bytes each, little-endian (`lane_byte`).
@@ -411,15 +502,36 @@ pub const MAIN_COLUMNS: usize = cols::NUM_COLUMNS - cols::PREP_WIDTH;
 // Wire interpretation — the socket's framing over the shared dataflow
 // =========================================================================
 
+/// `m[8] = MODE_C·"LFMC" + MODE_T·"LFMT"` — the row's domain tag.
+///
+/// **Why this is not prover-chosen.** `MODE_C` and `MODE_T` are preprocessed
+/// columns: a row's mode is fixed by its position in the preprocessed trace,
+/// that trace is fixed by its commitment, and the commitment is folded into
+/// `lfm_program_id`. The prover chooses neither, which is the same argument
+/// that already makes the mu gate trustworthy. Two constraints make it bite —
+/// the mode-sum booleanity (idx 4) forces at most one tag to be selected, and
+/// `MODE_T` being preprocessed is what stops the selector itself being chosen.
+/// Controls M5 and M6 in `blake3_socket_tests` are what make each of those
+/// dependencies a checked claim rather than an assertion.
+const TAG_SELECTOR: &[(usize, u32)] = &[
+    (cols::MODE_C, TAG_LFMC),
+    (cols::MODE_T, TAG_LFMT),
+    // ✗ `MODE_P` is deliberately absent, not forgotten: there is no permute
+    // socket and idx 5 pins the column to zero, so a term for it would be
+    // identically zero and would suggest a domain that does not exist.
+];
+
 /// The message word at schedule index `i`, as wiring.
 ///
 /// `i < 8` are the input lanes' byte columns; `m[8]` is the domain tag and
-/// `m[9..16]` are zero — **constants, not columns**, which is what makes the
-/// domain separation free (no cells, no range checks, SOCKET.md §2.3).
+/// `m[9..16]` are zero. None of them is a witness column, which is what makes
+/// the domain separation free (no cells, no range checks, SOCKET.md §2.3) —
+/// the tag went from a constant to a linear form over preprocessed columns and
+/// kept that property, because a preprocessed column is not a witness.
 fn message_word_ref(i: usize) -> WordRef {
     match i {
         0..=7 => WordRef::Cols(word_cols(cols::lane_byte(i, 0))),
-        8 => WordRef::Const(TAG_LFMC),
+        8 => WordRef::ModeSelected(TAG_SELECTOR),
         _ => WordRef::Const(0),
     }
 }
@@ -492,17 +604,11 @@ impl Blake3Flow for SocketWire {
     }
 
     fn rotr16(&mut self, w: WordRef) -> WordRef {
-        match w {
-            WordRef::Cols([b0, b1, b2, b3]) => WordRef::Cols([b2, b3, b0, b1]),
-            WordRef::Const(v) => WordRef::Const(v.rotate_right(16)),
-        }
+        w.rotr_bytes(2)
     }
 
     fn rotr8(&mut self, w: WordRef) -> WordRef {
-        match w {
-            WordRef::Cols([b0, b1, b2, b3]) => WordRef::Cols([b1, b2, b3, b0]),
-            WordRef::Const(v) => WordRef::Const(v.rotate_right(8)),
-        }
+        w.rotr_bytes(1)
     }
 
     fn rot_shift(&mut self, g: usize, half: usize, w: WordRef) -> WordRef {
@@ -550,11 +656,16 @@ fn socket_wires() -> WireFlow {
     w.0
 }
 
-/// The value interpretation of the same dataflow, for one `(a, b)` pair.
-fn socket_values(a: &[u32; 4], b: &[u32; 4]) -> ValueFlow {
+/// The value interpretation of the same dataflow, for one `(a, b)` pair in one
+/// domain.
+///
+/// The tag is an input because it is `m[8]`: it enters the very first round's
+/// `add3` and every value downstream of it, so a row's witness and its BITWISE
+/// lookups both depend on which domain the row hashes in.
+fn socket_values(a: &[u32; 4], b: &[u32; 4], tag: u32) -> ValueFlow {
     ValueFlow::compute_with(
         &BLAKE3_IV,
-        &socket_message(a, b),
+        &socket_message(a, b, tag),
         COUNTER_LFMC,
         BLOCK_LEN_LFMC,
         FLAGS_LFMC,
@@ -597,12 +708,13 @@ pub fn bitwise_interactions() -> Vec<BusInteraction> {
     let wires = socket_wires();
     let mut interactions =
         Vec::with_capacity(4 * wires.xors.len() + 4 * wires.rots.len() + 2 * cols::NUM_LANES);
+    let mu = || Multiplicity::Sum(cols::MU_COLUMNS.0, cols::MU_COLUMNS.1);
 
     for xw in &wires.xors {
         for b in 0..4 {
             interactions.push(BusInteraction::sender(
                 BusId::ByteAlu,
-                Multiplicity::Column(cols::MU),
+                mu(),
                 vec![
                     BusValue::constant(alu_op::XOR as u64),
                     byte_bus_value(xw.a.byte(b)),
@@ -617,7 +729,7 @@ pub fn bitwise_interactions() -> Vec<BusInteraction> {
         for pair in [rw.sll_lo, rw.sllc_lo, rw.sll_hi, rw.sllc_hi] {
             interactions.push(BusInteraction::sender(
                 BusId::AreBytes,
-                Multiplicity::Column(cols::MU),
+                mu(),
                 vec![direct(pair[0]), direct(pair[1])],
             ));
         }
@@ -627,7 +739,7 @@ pub fn bitwise_interactions() -> Vec<BusInteraction> {
         for p in 0..2 {
             interactions.push(BusInteraction::sender(
                 BusId::AreBytes,
-                Multiplicity::Column(cols::MU),
+                mu(),
                 vec![
                     direct(cols::lane_byte(lane, 2 * p)),
                     direct(cols::lane_byte(lane, 2 * p + 1)),
@@ -642,12 +754,16 @@ pub fn bitwise_interactions() -> Vec<BusInteraction> {
 /// The BITWISE lookups [`bitwise_interactions`] sends, mirrored send for send,
 /// for the multiplicity histogram. Enumeration order is the senders' own, via
 /// the shared [`ValueFlow`].
-pub fn bitwise_ops_for(rows: &[([u32; 4], [u32; 4])]) -> Vec<BitwiseOperation> {
+///
+/// Each row is `(a, b, tag)`: the domain reaches the histogram because it
+/// reaches `m[8]`, and every XOR byte downstream of round 0 differs between the
+/// two domains. A histogram built with the wrong tag balances against nothing.
+pub fn bitwise_ops_for(rows: &[([u32; 4], [u32; 4], u32)]) -> Vec<BitwiseOperation> {
     let mut out =
         Vec::with_capacity(rows.len() * (4 * (NUM_G * 4 + OUT_WINDOW) + 4 * NUM_G * 2 + 16));
 
-    for (a, b) in rows {
-        let flow = socket_values(a, b);
+    for (a, b, tag) in rows {
+        let flow = socket_values(a, b, *tag);
         for &(x, y, _out) in &flow.xors {
             for byte in 0..4 {
                 out.push(BitwiseOperation::byte_op(
@@ -701,11 +817,51 @@ fn set_word_bytes(row: &mut [FE], col: usize, w: u32) {
 /// established and it matters more here, because the lane boundary is where the
 /// only new soundness surface lives.
 ///
+/// The DOMAIN is read back out of the row's own mode columns for the same
+/// reason, and it is the half that matters most: `m[8]` is a linear form over
+/// exactly those columns, so a witness built from them cannot describe a
+/// different domain than the one the AIR evaluates. Taking the tag as an
+/// argument — as this did at first — left a filler that could be handed the
+/// wrong domain for a row whose selectors said otherwise.
+///
 /// # Panics
 ///
-/// If a lane is not a `u32`. `LfmHasher::admits` rejects that at execution, so
-/// reaching here means the executor and the trace filler disagree.
+/// If a lane is not a `u32`, or if the row selects no domain this arm has a
+/// socket for. `LfmHasher::admits` rejects both at execution, so reaching here
+/// means the executor and the trace filler disagree.
 pub fn fill_socket_witness(row: &mut [FE]) {
+    let tag = tag_from_row(row);
+    fill_socket_witness_tagged(row, tag);
+}
+
+/// The row's domain tag, read off its preprocessed mode columns — the machine
+/// side of [`TAG_SELECTOR`], and the same value `m[8]` evaluates to.
+///
+/// # Panics
+///
+/// If the row selects neither two-to-one domain. A padding row never reaches
+/// the filler (`chip_trace` fills only real rows) and a permute row is
+/// unprovable here, so either is a caller bug rather than a case to handle.
+fn tag_from_row(row: &[FE]) -> u32 {
+    let one = FE::one();
+    match (row[cols::MODE_C] == one, row[cols::MODE_T] == one) {
+        (true, false) => TAG_LFMC,
+        (false, true) => TAG_LFMT,
+        _ => panic!(
+            "a BLAKE3 hash row must select exactly one two-to-one domain: \
+             MODE_C or MODE_T. Neither set means a permute or padding row \
+             reached the socket witness filler, which its AIR cannot prove."
+        ),
+    }
+}
+
+/// [`fill_socket_witness`] under an EXPLICIT domain.
+///
+/// Exists for the negative controls (M1/M2), which have to build a row whose
+/// witness and whose mode columns deliberately disagree — the forgery the
+/// domain separation is supposed to reject. Production goes through
+/// [`fill_socket_witness`], which cannot construct that.
+pub(crate) fn fill_socket_witness_tagged(row: &mut [FE], tag: u32) {
     let cell = |base: usize| -> LfmWord { core::array::from_fn(|i| row[base + i]) };
     let a = lanes_of(&cell(cols::IN0)).expect("compress lane is not a u32 (O1)");
     let b = lanes_of(&cell(cols::IN0 + 4)).expect("compress lane is not a u32 (O1)");
@@ -714,7 +870,7 @@ pub fn fill_socket_witness(row: &mut [FE]) {
         set_word_bytes(row, cols::lane_byte(lane, 0), v);
     }
 
-    let flow = socket_values(&a, &b);
+    let flow = socket_values(&a, &b, tag);
     let mut a3 = flow.add3s.iter();
     let mut a2 = flow.add2s.iter();
     let mut xo = flow.xors.iter();
@@ -793,36 +949,46 @@ const CORE_IDX: usize = 26;
 
 /// The BLAKE3 arm of `HashConstraints::eval`.
 ///
-/// Every constraint is mu-gated on `MU = MODE_C` and every bus send carries
-/// `Multiplicity::Column(MU)`, so an all-zero padding row satisfies the set
+/// Every constraint is mu-gated on `MU = MODE_C + MODE_T` and every bus send
+/// carries the same sum, so an all-zero padding row satisfies the set
 /// vacuously and emits nothing. Max degree is 3, reached by the mu-gated carry
 /// booleanities — the wrap's blowup 2 depends on that staying 3, which is why
 /// the 3-operand add uses two summed carry BITS rather than one ternary carry
 /// (`k(k−1)(k−2) = 0` is already degree 3, and mu-gating would push it to 4).
 pub fn eval<B: ConstraintBuilder<F, E>>(b: &mut B) {
-    let mu = |b: &B| b.main(0, cols::MU);
+    let mu = |b: &B| b.main(0, cols::MU_COLUMNS.0) + b.main(0, cols::MU_COLUMNS.1);
     let mode_c = b.main(0, cols::MODE_C);
+    let mode_t = b.main(0, cols::MODE_T);
     let mode_p = b.main(0, cols::MODE_P);
 
     // idx 0–3: capacity-state copy, in the same shape every other arm uses —
-    // `S_i = MODE_P·IN_i + MODE_C·IV_i`. With MODE_P pinned to zero below it
-    // reduces to `S_i = MODE_C·IV_i`; it is written in the general form so the
+    // `S_i = MODE_P·IN_i + (MODE_C + MODE_T)·IV_i`. A transcript row is still a
+    // compress, so its capacity prefix is still the IV; only the selector
+    // widens. With MODE_P pinned to zero below this reduces to
+    // `S_i = (MODE_C + MODE_T)·IV_i`; it is written in the general form so the
     // shared prefix means the same thing under every hasher.
     for (k, iv) in BLAKE3_IV.iter().take(4).enumerate() {
         let s = b.main(0, cols::S8 + k);
         let in_i = b.main(0, cols::IN0 + 8 + k);
         let iv_i = b.const_base(u64::from(*iv));
-        b.emit_base(k, s - (mode_p.clone() * in_i + mode_c.clone() * iv_i));
+        b.emit_base(
+            k,
+            s - (mode_p.clone() * in_i + (mode_c.clone() + mode_t.clone()) * iv_i),
+        );
     }
 
-    // idx 4: mode sum-boolean (exactly-one-of is the registrar's).
-    let mode_sum = mode_c + mode_p.clone();
+    // idx 4: mode sum-boolean (exactly-one-of is the registrar's). This is what
+    // excludes MODE_C = MODE_T = 1 — which would select BOTH domain tags and
+    // sum them into `m[8]` — since the sum would be 2 and 2·(1−2) ≠ 0.
+    let mode_sum = mode_c + mode_t + mode_p.clone();
     let one = b.one();
     b.emit_base(4, mode_sum.clone() * (one - mode_sum));
 
-    // idx 5: ✗ no permute socket. Pinning the preprocessed mode selector makes
-    // a program containing a `permute` unprovable under BLAKE3 rather than
-    // silently proved against a framing nobody specified.
+    // idx 5: ✗ no permute socket, PERMANENTLY. Pinning the preprocessed mode
+    // selector makes a program containing a `permute` unprovable under BLAKE3
+    // rather than silently proved against a framing nobody specified. Option B1
+    // decided no permute socket is ever built, so this pin is not a placeholder
+    // waiting to be deleted — it is the decision, written down as a constraint.
     b.emit_base(5, mode_p);
 
     // idx 6–13: THE LANE BOUNDARY (obligation O1). One mu-gated linear identity
@@ -911,7 +1077,9 @@ pub fn eval<B: ConstraintBuilder<F, E>>(b: &mut B) {
     for rw in &wires.rots {
         let (xlo, xhi) = match &rw.input {
             WordRef::Cols(c) => (half_expr(b, &[c[0], c[1]]), half_expr(b, &[c[2], c[3]])),
-            WordRef::Const(_) => unreachable!("shift inputs are always committed XOR outputs"),
+            WordRef::Const(_) | WordRef::ModeSelected(_) => {
+                unreachable!("shift inputs are always committed XOR outputs")
+            }
         };
         let sll_lo = half_expr(b, &rw.sll_lo);
         let sllc_lo = half_expr(b, &rw.sllc_lo);

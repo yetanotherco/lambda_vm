@@ -2,8 +2,9 @@
 //!
 //! The ecosystem hash decision is open (Poseidon2 is broken; candidates are
 //! Poseidon-original, RPO/XHash, Monolith and reduced-round Blake2s), so the
-//! machine freezes only the *contract*: `Compress` maps two digest cells to
-//! one, `Permute` maps the three-cell state to itself, and the `LFM_HASH`
+//! machine freezes only the *contract*: `Compress` and `Transcript` map two
+//! digest cells to one — in different hash domains — `Permute` maps the
+//! three-cell state to itself, and the `LFM_HASH`
 //! bus tuples and opcode numbers are fixed. Whatever sits behind the trait is
 //! the only thing a hash migration replaces.
 //!
@@ -58,6 +59,33 @@ pub trait LfmHasher {
     /// Two digest cells → one digest cell.
     fn compress(&self, a: &LfmWord, b: &LfmWord) -> LfmWord {
         let out = self.compress_out(a, b);
+        [out[0], out[1], out[2], out[3]]
+    }
+
+    /// One Fiat–Shamir transcript step: the same two-cells-in, one-cell-out
+    /// shape as [`LfmHasher::compress`], in the TRANSCRIPT hash domain.
+    ///
+    /// The default is `compress_out` — correct for a hasher with a single
+    /// domain, which is what `TestPermutation` and Poseidon are here. A hasher
+    /// that *has* domain separation overrides it, and BLAKE3 does: its socket
+    /// carries the domain tag in the message word `m[8]`, so a transcript step
+    /// and a Merkle parent over the same two cells are different digests.
+    ///
+    /// ⚠ The default is a real weakening for a single-domain hasher, and it is
+    /// deliberate rather than overlooked: under `Test` and `Poseidon` a
+    /// transcript step IS a Merkle parent, so those two hashers separate the
+    /// domains not at all. Neither is a production hash — `TestPermutation` is
+    /// explicitly non-cryptographic and Poseidon here is measurement-only — and
+    /// the machine's real hash is the one that separates them. A future
+    /// production candidate that reaches this default without overriding it is
+    /// shipping a transcript with no domain separation.
+    fn transcript_out(&self, a: &LfmWord, b: &LfmWord) -> [FE; HASH_STATE_FELTS] {
+        self.compress_out(a, b)
+    }
+
+    /// [`LfmHasher::transcript_out`] truncated to the digest cell.
+    fn transcript(&self, a: &LfmWord, b: &LfmWord) -> LfmWord {
+        let out = self.transcript_out(a, b);
         [out[0], out[1], out[2], out[3]]
     }
 
@@ -202,6 +230,27 @@ impl LfmHasher for HasherKind {
             HasherKind::Test => TestPermutation.compress_out(a, b),
             HasherKind::Poseidon => super::poseidon::PoseidonGoldilocks.compress_out(a, b),
             HasherKind::Blake3 => super::blake3_socket::Blake3Permutation.compress_out(a, b),
+        }
+    }
+
+    /// Delegated explicitly, third time for the same reason: BLAKE3 is the one
+    /// candidate whose transcript domain differs from its compress domain, and
+    /// a dispatch that fell through to the trait default would hash a
+    /// transcript step under the MERKLE tag while its AIR proved the transcript
+    /// one — a host/chip disagreement, not a wrong answer the chip catches.
+    fn transcript_out(&self, a: &LfmWord, b: &LfmWord) -> [FE; HASH_STATE_FELTS] {
+        match self {
+            HasherKind::Test => TestPermutation.transcript_out(a, b),
+            HasherKind::Poseidon => super::poseidon::PoseidonGoldilocks.transcript_out(a, b),
+            HasherKind::Blake3 => super::blake3_socket::Blake3Permutation.transcript_out(a, b),
+        }
+    }
+
+    fn transcript(&self, a: &LfmWord, b: &LfmWord) -> LfmWord {
+        match self {
+            HasherKind::Test => TestPermutation.transcript(a, b),
+            HasherKind::Poseidon => super::poseidon::PoseidonGoldilocks.transcript(a, b),
+            HasherKind::Blake3 => super::blake3_socket::Blake3Permutation.transcript(a, b),
         }
     }
 

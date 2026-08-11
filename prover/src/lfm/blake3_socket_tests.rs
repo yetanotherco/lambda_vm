@@ -22,8 +22,14 @@
 //!
 //! It says nothing about the machine's DEFAULT hash, which is still
 //! `TestPermutation`; every test constructs the BLAKE3 configuration
-//! explicitly. And it covers `compress` only, because that is the only socket
-//! specified — see `blake3_socket`'s module docs.
+//! explicitly. It covers the two two-to-one modes — `compress` and the
+//! `transcript` step, which are the same socket under different domain tags —
+//! and no `permute`, because option B1 settled that no permute socket is ever
+//! built. See `blake3_socket`'s module docs.
+//!
+//! The transcript's own vectors and its end-to-end behaviour live in
+//! `transcript_tests`; what is here is the CHIP side of it — the mode-selected
+//! tag, and the M1–M7 controls the transcript spec pre-committed.
 
 use math::field::element::FieldElement;
 use stark::constraints::builder::{
@@ -51,7 +57,7 @@ use super::compiler::{LfmProgram, compile};
 use super::executor::{LfmExecError, execute};
 use super::hash::{HASH_STATE_FELTS, HasherKind, LfmHasher};
 use super::instr::HashMode;
-use super::programs::trivial_program;
+use super::programs::{permute_coverage_program, trivial_program};
 use super::proof::{lfm_prove_with_hasher, prove_traces_with_hasher, verify_against};
 use super::registry::{build_artifacts, build_artifacts_with_hasher};
 use super::trace::build_traces_with_hasher;
@@ -162,12 +168,16 @@ fn the_built_layout_matches_the_prediction() {
         predicted_interactions(SOCKET_ROUNDS)
     );
     assert_eq!(NUM_CONSTRAINTS, predicted_constraints(SOCKET_ROUNDS));
+    // 12 since option B1 added `MODE_T` (was 11). The prefix is the hasher-
+    // independent instruction group, so this number is the same under every
+    // candidate — `poseidon_chip_tests` pins the identical value, and the two
+    // together are what would catch one arm's layout drifting from the other's.
     assert_eq!(
         cols::PREP_WIDTH,
-        11,
+        12,
         "the preprocessed prefix does not move"
     );
-    assert_eq!(cols::LANES, 39, "the shared value prefix is not reflowed");
+    assert_eq!(cols::LANES, 40, "the shared value prefix is not reflowed");
 }
 
 /// The layout is injective and gapless — no column written twice, none unread.
@@ -720,8 +730,12 @@ fn compress_is_overridden_and_the_upper_out_lanes_are_empty() {
 }
 
 /// ✗ There is no permute socket, and the refusal is explicit rather than a
-/// wrong answer. `trivial_program` contains one, so it is unprovable under
-/// BLAKE3 — which is the honest state of SOCKET.md §7, not a defect.
+/// wrong answer. `permute_coverage_program` contains one, so it is unprovable
+/// under BLAKE3 — which is the settled state of option B1, not a defect.
+///
+/// The program under test used to be `trivial_program`, which no longer has a
+/// permute in it: B1 gave the registry's entries up to the real hash, and this
+/// test moved to the unregistered fixture that took over permute coverage.
 #[test]
 fn a_permute_row_is_refused_under_blake3() {
     assert!(
@@ -731,14 +745,45 @@ fn a_permute_row_is_refused_under_blake3() {
     );
     assert!(
         matches!(
-            execute(&trivial_program(), &trivial_arenas(), &KIND),
+            execute(&permute_coverage_program(), &permute_arenas(), &KIND),
             Err(LfmExecError::HasherRejected(_))
         ),
         "a program containing a permute must be refused under BLAKE3"
     );
     // HONEST CONTROL: the same program executes fine under the hashers that do
     // have a permute socket, so the refusal is BLAKE3's domain and not a break.
-    assert!(execute(&trivial_program(), &trivial_arenas(), &HasherKind::Test).is_ok());
+    assert!(
+        execute(
+            &permute_coverage_program(),
+            &permute_arenas(),
+            &HasherKind::Test
+        )
+        .is_ok()
+    );
+}
+
+/// ★ The F3.4-retirement milestone at the registry level: `TrivialV0` — a
+/// REGISTERED program — now executes under BLAKE3, which it could not while it
+/// held a raw permute.
+///
+/// Its arena has to be `u32`-laned (obligation O1); that is the socket's domain,
+/// not a property of this program.
+#[test]
+fn the_trivial_program_runs_under_blake3_now_that_it_has_no_permute() {
+    assert!(
+        !trivial_program().instrs.iter().any(
+            |i| matches!(i, super::instr::Instr::Hash { mode, .. } if *mode == HashMode::Permute)
+        ),
+        "a registered program must not contain a permute"
+    );
+    let arenas = vec![
+        (0..4u32)
+            .map(|i| word_of(&[0x1000_0000 * (i + 1), 0x0BAD_F00D ^ i, i, 0xFFFF_FFFF - i]))
+            .collect(),
+    ];
+    execute(&trivial_program(), &arenas, &KIND).expect("TrivialV0 executes under BLAKE3");
+    // HONEST CONTROL: still fine under the default hasher, on its own arenas.
+    execute(&trivial_program(), &trivial_arenas(), &HasherKind::Test).expect("and under Test");
 }
 
 // =========================================================================
@@ -778,18 +823,35 @@ fn the_arm_emits_its_constraints_at_degree_3() {
     assert_eq!(degrees.iter().map(|&(_, d)| d).max(), Some(3));
 }
 
-/// A hash row exactly as `trace::build_traces_with_hasher` fills one.
-fn hash_row(a: [u32; 4], b: [u32; 4]) -> Vec<FE> {
+/// The mode column a row in `mode` sets.
+fn mode_col(mode: HashMode) -> usize {
+    match mode {
+        HashMode::Compress => cols::MODE_C,
+        HashMode::Transcript => cols::MODE_T,
+        HashMode::Permute => cols::MODE_P,
+    }
+}
+
+/// A hash row in `mode`, exactly as `trace::build_traces_with_hasher` fills
+/// one.
+fn hash_row_mode(mode: HashMode, a: [u32; 4], b: [u32; 4]) -> Vec<FE> {
+    let tag = blake3_socket::tag_for_mode(mode).expect("BLAKE3 has a socket for this mode");
     let mut row = vec![FE::zero(); cols::NUM_COLUMNS];
-    row[cols::MODE_C] = FE::one();
+    row[mode_col(mode)] = FE::one();
     row[cols::IN0..cols::IN0 + 4].copy_from_slice(&word_of(&a));
     row[cols::IN0 + 4..cols::IN0 + 8].copy_from_slice(&word_of(&b));
     for (k, iv) in BLAKE3_IV.iter().take(4).enumerate() {
         row[cols::S8 + k] = FE::from(u64::from(*iv));
     }
-    row[cols::OUT0..cols::OUT0 + 4].copy_from_slice(&word_of(&socket_digest(&a, &b)));
-    blake3_socket::fill_socket_witness(&mut row);
+    let digest = blake3_socket::socket_digest_rounds_tagged(&a, &b, SOCKET_ROUNDS, tag);
+    row[cols::OUT0..cols::OUT0 + 4].copy_from_slice(&word_of(&digest));
+    blake3_socket::fill_socket_witness_tagged(&mut row, tag);
     row
+}
+
+/// A `Compress` row — the shape most of these tests are about.
+fn hash_row(a: [u32; 4], b: [u32; 4]) -> Vec<FE> {
+    hash_row_mode(HashMode::Compress, a, b)
 }
 
 fn evaluate(row: &[FE]) -> Vec<FE> {
@@ -1016,6 +1078,238 @@ fn the_digest_recomposition_binds_out_to_the_core() {
 }
 
 // =========================================================================
+// M1–M7 — the mode-selected tag, PRE-COMMITTED controls
+//
+// Named in the transcript spec §5.3 before this chip existed, so they are
+// inherited obligations rather than tests written to fit what got built. Each
+// one is paired with an honest-path assertion: "the bad row is rejected" passes
+// just as well when every row is rejected.
+// =========================================================================
+
+/// **M1 — a transcript row that hashed under the MERKLE tag is rejected.**
+///
+/// Spec form: "`m[8]` pinned to `TAG_LFMC` while `MODE_T = 1` — SAT", i.e. in a
+/// model where the tag is free, a transcript row can compute the Merkle
+/// function. On the real chip the tag is NOT free, so the same statement is a
+/// rejection, and that is what is asserted here.
+#[test]
+fn m1_a_transcript_row_computing_the_merkle_tag_is_rejected() {
+    let (a, b) = ([9u32, 8, 7, 6], [5u32, 4, 3, 2]);
+    let mut row = hash_row_mode(HashMode::Transcript, a, b);
+    // Recompute the whole witness under the WRONG domain, leaving MODE_T set.
+    let digest = socket_digest(&a, &b); // "LFMC"
+    row[cols::OUT0..cols::OUT0 + 4].copy_from_slice(&word_of(&digest));
+    blake3_socket::fill_socket_witness_tagged(&mut row, TAG_LFMC);
+    assert!(
+        !violations(&row).is_empty(),
+        "a MODE_T row carrying the Merkle computation must be rejected"
+    );
+
+    // HONEST CONTROL: the same row under its own domain satisfies everything.
+    assert_eq!(
+        violations(&hash_row_mode(HashMode::Transcript, a, b)),
+        Vec::<usize>::new()
+    );
+}
+
+/// **M2 — the mirror: a compress row that hashed under the TRANSCRIPT tag is
+/// rejected.** Both directions, because a one-directional separation is not one.
+#[test]
+fn m2_a_compress_row_computing_the_transcript_tag_is_rejected() {
+    let (a, b) = ([1u32, 2, 3, 4], [5u32, 6, 7, 8]);
+    let mut row = hash_row_mode(HashMode::Compress, a, b);
+    let digest = blake3_socket::transcript_digest(&a, &b);
+    row[cols::OUT0..cols::OUT0 + 4].copy_from_slice(&word_of(&digest));
+    blake3_socket::fill_socket_witness_tagged(&mut row, blake3_socket::TAG_LFMT);
+    assert!(
+        !violations(&row).is_empty(),
+        "a MODE_C row carrying the transcript computation must be rejected"
+    );
+
+    assert_eq!(
+        violations(&hash_row_mode(HashMode::Compress, a, b)),
+        Vec::<usize>::new()
+    );
+}
+
+/// **M3 — both mode bits set on one row is unsatisfiable**, and it is the
+/// mode-sum booleanity (idx 4) that says so.
+///
+/// This is the constraint that stops `m[8]` being `TAG_LFMC + TAG_LFMT`, a tag
+/// in neither domain.
+#[test]
+fn m3_both_two_to_one_modes_on_one_row_is_unsatisfiable() {
+    let (a, b) = ([9u32, 8, 7, 6], [5u32, 4, 3, 2]);
+    let mut row = hash_row_mode(HashMode::Compress, a, b);
+    row[cols::MODE_T] = FE::one();
+    assert!(
+        violations(&row).contains(&4),
+        "idx 4 — the mode-sum booleanity — must be the constraint that fires"
+    );
+
+    // HONEST CONTROL: clearing it again restores an accepted row.
+    row[cols::MODE_T] = FE::zero();
+    assert_eq!(violations(&row), Vec::<usize>::new());
+}
+
+/// **M4 — the mu gate IS the sum of the two two-to-one selectors**, so it
+/// cannot be 1 while both are 0.
+///
+/// Structural rather than algebraic: on this chip `MU` is not a column a row
+/// could set independently, it is the expression `MODE_C + MODE_T`. The test
+/// pins that, and pins the consequence — with both zero the row is padding, it
+/// satisfies the set vacuously and its bus sends carry multiplicity zero.
+#[test]
+fn m4_the_mu_gate_is_exactly_the_two_to_one_selector_sum() {
+    assert_eq!(cols::MU_COLUMNS, (cols::MODE_C, cols::MODE_T));
+
+    // A row with garbage in every witness column but no mode set is padding.
+    let (a, b) = ([9u32, 8, 7, 6], [5u32, 4, 3, 2]);
+    let mut row = hash_row_mode(HashMode::Compress, a, b);
+    row[cols::MODE_C] = FE::zero();
+    row[cols::OUT0..cols::OUT0 + 4].copy_from_slice(&word_of(&[0, 0, 0, 0]));
+    for k in 0..4 {
+        row[cols::S8 + k] = FE::zero();
+    }
+    assert_eq!(
+        violations(&row),
+        Vec::<usize>::new(),
+        "with no mode set the row is padding and every mu-gated constraint is vacuous"
+    );
+
+    // HONEST CONTROL: it is vacuous because it is UNGATED-satisfiable, not
+    // because the set accepts anything — restoring the mode makes the same
+    // garbage row fail.
+    row[cols::MODE_C] = FE::one();
+    assert!(!violations(&row).is_empty());
+}
+
+/// **M5/M6 — ⚠ the AIR alone does not pin the tag; the PREPROCESSED binding
+/// does.** This is the control that turns §3.3 from an assertion into a checked
+/// claim, and it fires.
+///
+/// Constraint idx 4 pins the mode SUM to a bit, not each selector to a bit. So
+/// a row with `MODE_C = x`, `MODE_T = 1 − x` satisfies it for every field
+/// element `x`, and `m[8]` becomes `x·"LFMC" + (1−x)·"LFMT"` — which, solving
+/// for `x`, is **any 32-bit value the prover likes**. This test picks the tag
+/// `"XXXX"`, derives the `x` that produces it, and shows the constraint set
+/// ACCEPTS the resulting row.
+///
+/// Two mechanisms stop a real prover doing this, and neither is in this file's
+/// constraint set:
+///
+/// - the mode columns are **preprocessed**, fixed by the row's position in a
+///   trace whose commitment is folded into `lfm_program_id`; and
+/// - the admission validator's one-hot check rejects any program whose
+///   `LFM_HASH` group carries a non-boolean selector.
+///
+/// Both are asserted below, so this is a live demonstration of *why* they are
+/// load-bearing rather than a latent hole.
+#[test]
+fn m5_m6_the_mode_columns_must_be_preprocessed_or_the_tag_is_prover_chosen() {
+    const FORGED_TAG: u32 = u32::from_le_bytes(*b"XXXX");
+    let (a, b) = ([9u32, 8, 7, 6], [5u32, 4, 3, 2]);
+
+    // x such that x·LFMC + (1−x)·LFMT = FORGED_TAG.
+    let lfmc = FE::from(u64::from(TAG_LFMC));
+    let lfmt = FE::from(u64::from(blake3_socket::TAG_LFMT));
+    let x = (FE::from(u64::from(FORGED_TAG)) - &lfmt)
+        * (&lfmc - &lfmt).inv().expect("the two tags differ");
+
+    let mut row = vec![FE::zero(); cols::NUM_COLUMNS];
+    row[cols::MODE_C] = x;
+    row[cols::MODE_T] = FE::one() - x;
+    row[cols::IN0..cols::IN0 + 4].copy_from_slice(&word_of(&a));
+    row[cols::IN0 + 4..cols::IN0 + 8].copy_from_slice(&word_of(&b));
+    for (k, iv) in BLAKE3_IV.iter().take(4).enumerate() {
+        row[cols::S8 + k] = FE::from(u64::from(*iv));
+    }
+    let digest = blake3_socket::socket_digest_rounds_tagged(&a, &b, SOCKET_ROUNDS, FORGED_TAG);
+    row[cols::OUT0..cols::OUT0 + 4].copy_from_slice(&word_of(&digest));
+    blake3_socket::fill_socket_witness_tagged(&mut row, FORGED_TAG);
+
+    assert_eq!(
+        violations(&row),
+        Vec::<usize>::new(),
+        "⚠ the constraint set alone accepts a prover-chosen domain tag — the \
+         mode columns being preprocessed is what stops this"
+    );
+    assert_ne!(
+        digest,
+        socket_digest(&a, &b),
+        "the forged domain really is a different function"
+    );
+
+    // MECHANISM 1: the mode columns are inside the preprocessed prefix, so a
+    // prover supplies neither.
+    const { assert!(cols::MODE_C < cols::PREP_WIDTH) };
+    const { assert!(cols::MODE_T < cols::PREP_WIDTH) };
+    const { assert!(cols::MODE_P < cols::PREP_WIDTH) };
+
+    // MECHANISM 2: the admission validator rejects a non-one-hot selector, so
+    // the program above cannot be registered even if a prover could write it.
+    let mut program = compress_program();
+    let g = &mut program.groups.hash;
+    let row0 = 0;
+    g.data[row0 * g.width + super::layout::hash::MODE_C] = x;
+    g.data[row0 * g.width + super::layout::hash::MODE_T] = FE::one() - x;
+    assert!(
+        matches!(
+            super::validator::validate(&program),
+            Err(super::validator::LfmViolation::NonOneHotSelector {
+                chip: "LFM_HASH",
+                ..
+            })
+        ),
+        "the registrar must reject a fractional mode selector"
+    );
+
+    // HONEST CONTROL: the untouched program is admissible, so the rejection
+    // above is about the tampering and not about the program.
+    assert!(super::validator::validate(&compress_program()).is_ok());
+}
+
+/// **M7 — the capacity constraints (idx 0–3) bite on a transcript row.**
+///
+/// A transcript row is still a compress, so its capacity prefix is still the
+/// IV — the selector widened to `MODE_C + MODE_T` and nothing else did. If the
+/// widening had been forgotten, a transcript row's `S` would be pinned to zero
+/// instead of to the IV, and this is the test that would have said so.
+#[test]
+fn m7_the_capacity_constraints_bite_on_a_transcript_row() {
+    let (a, b) = ([9u32, 8, 7, 6], [5u32, 4, 3, 2]);
+    for k in 0..4 {
+        let mut row = hash_row_mode(HashMode::Transcript, a, b);
+        row[cols::S8 + k] += FE::one();
+        assert_eq!(
+            violations(&row),
+            vec![k],
+            "a wrong capacity lane must violate exactly constraint {k}"
+        );
+    }
+
+    // A transcript row's capacity is the IV, same as a compress row's — the two
+    // differ in `m[8]` and in nothing else.
+    let transcript = hash_row_mode(HashMode::Transcript, a, b);
+    let compress = hash_row_mode(HashMode::Compress, a, b);
+    for k in 0..4 {
+        assert_eq!(transcript[cols::S8 + k], compress[cols::S8 + k]);
+        assert_eq!(transcript[cols::S8 + k], FE::from(u64::from(BLAKE3_IV[k])));
+    }
+    assert_eq!(violations(&transcript), Vec::<usize>::new());
+}
+
+/// The degree bound survives the mode-selected tag: `m[8]` went from degree 0
+/// to degree 1, and the wrap's blowup 2 depends on the maximum staying 3.
+#[test]
+fn the_mode_selected_tag_does_not_raise_the_degree() {
+    let set = HashConstraints::BLAKE3;
+    assert_eq!(ConstraintSet::<F, E>::max_degree(&set), 3);
+    // Measured, not declared — `the_declared_degree_bound_is_respected` walks
+    // the captured IR; this asserts the declaration it checks against.
+}
+
+// =========================================================================
 // Prove and verify — rule 2: this is what makes the numbers measurements
 // =========================================================================
 
@@ -1045,6 +1339,15 @@ fn arenas() -> Vec<Vec<LfmWord>> {
     vec![
         (0..4u32)
             .map(|i| word_of(&[0x1000_0000 * (i + 1), 0x0BAD_F00D ^ i, i, 0xFFFF_FFFF - i]))
+            .collect(),
+    ]
+}
+
+/// `permute_coverage_program`'s arenas — three state cells.
+fn permute_arenas() -> Vec<Vec<LfmWord>> {
+    vec![
+        (0..3u64)
+            .map(|i| core::array::from_fn(|j| FE::from(500 * (i + 1) + j as u64)))
             .collect(),
     ]
 }
@@ -1195,4 +1498,100 @@ fn tampering_with_the_witness_is_not_accepted() {
     assert_not_accepted("a real flag on a padding row", |t| {
         t.main_table.set_fe(3, cols::MODE_C, FE::one());
     });
+}
+
+// =========================================================================
+// F3.4 — what B1 retired, and the ONE thing it did not
+// =========================================================================
+
+/// ★ `TrivialV0` — a REGISTERED program — proves and verifies under BLAKE3.
+///
+/// It could not while it ended on a raw `permute`; option B1 replaced that with
+/// a third `compress`, and this is the milestone that states.
+#[test]
+fn the_trivial_program_proves_and_verifies_under_blake3() {
+    let opts = options();
+    let program = trivial_program();
+    let arenas = vec![
+        (0..4u32)
+            .map(|i| word_of(&[0x1000_0000 * (i + 1), 0x0BAD_F00D ^ i, i, 0xFFFF_FFFF - i]))
+            .collect(),
+    ];
+    let artifacts = build_artifacts_with_hasher(&program, &opts, KIND);
+    let proved = lfm_prove_with_hasher(&program, &artifacts, &arenas, &opts, KIND)
+        .expect("TrivialV0 must prove under BLAKE3");
+    assert!(
+        verify_against(
+            &artifacts.roots,
+            &artifacts.program_id,
+            artifacts.keccak_rnd_chunks,
+            &proved.proof,
+            &proved.public_words,
+            &opts,
+            artifacts.hasher,
+        ),
+        "an honest BLAKE3 proof of TrivialV0 must verify"
+    );
+}
+
+/// ⚠ **`FriToyV0` still does not run under BLAKE3 — and the sponge is no longer
+/// why.** This is a TRIPWIRE for the remaining gap, not a statement that the
+/// gap is acceptable.
+///
+/// The transcript was one of two blockers and B1 removed it: the chain runs on
+/// the compress socket under every hasher (`transcript_tests`). The other
+/// blocker is **obligation O1** and it is independent of everything B1 touched:
+/// the socket's inputs must be `u32`-laned, and `FriToyV0` hashes FRI DATA —
+/// Merkle leaves over LDE evaluations and folded ext values, which are
+/// arbitrary Goldilocks elements. 124 of the fixture's 128 committed column
+/// values are at or above `2^32`, so the very first `compress(row_even,
+/// row_odd)` is outside the socket's domain.
+///
+/// Closing it is a different change from this one: field elements would have to
+/// reach the hash through a committed `u32`-half decomposition (the shape
+/// `transcript_replay::felt_be_halves` already uses for keccak leaves), which
+/// moves `FriToyV0`'s arena layout and its program identity. That is a design
+/// decision about the leaf convention, not a sponge fix.
+///
+/// **When O1 is closed this test must be replaced by a prove+verify**, the same
+/// way `the_trivial_program_proves_and_verifies_under_blake3` reads today.
+#[test]
+fn fri_toy_is_still_blocked_by_o1_and_no_longer_by_the_sponge() {
+    let program = super::programs::fri_toy_program();
+
+    // The sponge is no longer a blocker: not one permute is left in the program.
+    assert!(
+        !program.instrs.iter().any(
+            |i| matches!(i, super::instr::Instr::Hash { mode, .. } if *mode == HashMode::Permute)
+        ),
+        "the compress-chain transcript emits no permute"
+    );
+
+    // The fixture's committed values are not u32 lanes, which is what O1 needs.
+    let over = super::fixture::fixture_columns()
+        .iter()
+        .flatten()
+        .filter(|v| lanes_of(&[**v, FE::zero(), FE::zero(), FE::zero()]).is_none())
+        .count();
+    assert!(
+        over > 0,
+        "if the fixture's values became u32-laned, O1 no longer blocks FriToyV0 \
+         and this test should be replaced by a prove+verify"
+    );
+
+    let inner = super::fixture::fixture_prove();
+    let arenas = vec![inner.commitments.clone(), inner.openings.clone()];
+    assert!(
+        matches!(
+            execute(&program, &arenas, &KIND),
+            Err(LfmExecError::HasherRejected(msg)) if msg.contains("O1")
+        ),
+        "FriToyV0 must be refused for O1 — if it is refused for another reason, \
+         that reason is a regression"
+    );
+
+    // HONEST CONTROL: the same program and the same arenas run fine under the
+    // default hasher, so the refusal is the socket's domain and not a break in
+    // the transcript rewrite.
+    execute(&program, &arenas, &HasherKind::Test).expect("FriToyV0 still runs under Test");
 }

@@ -3,42 +3,116 @@
 //! loop-shaped reaches the machine; shapes (path depths, query counts,
 //! domain parameters) are compile-time constants of the emitted program.
 //!
-//! The duplex sponge here is the machine side of the test transcript and is
-//! mirrored bit-exactly by `fixture::HostSponge`. Like `TestPermutation`
-//! itself it is NOT a production construction — the real transcript lands
-//! with the ecosystem hash decision; this one exists so the protocol loop
-//! can be built and measured now.
+//! The Fiat–Shamir transcript here is the machine side of the protocol loop and
+//! is mirrored bit-exactly by `fixture::HostSponge`. Since option B1 it is a
+//! **compress chain**, specified in
+//! `thoughts/shared/lfm-real-hash/transcript-spec/`; see [`SpongeVar`].
 
 use crate::tables::types::FE;
 
 use super::builder::{Bit, Cell, DigestVal, Ext, Felt, LfmBuilder};
 
-/// Overwrite-rate duplex sponge over `LFM_HASH`: state = 3 cells (rate 2,
-/// capacity 1).
+/// The advance marker `"SQZ0"`, read as one little-endian `u32`.
+///
+/// Lane 0 of the constant cell a squeeze advances with. It distinguishes an
+/// advance operand from an absorbed digest as **defence in depth only** — the
+/// load-bearing absorb/squeeze separation is that the operation sequence is a
+/// compile-time constant of the program (see [`SpongeVar`]).
+pub const SQUEEZE_MARK: u32 = u32::from_le_bytes(*b"SQZ0");
+
+/// The Fiat–Shamir transcript over `LFM_HASH`: a **compress chain**, state = 1
+/// cell.
+///
+/// ```text
+/// absorb(c)        state ← T(state, c)                       1 step
+/// absorb2(c0, c1)  state ← T(T(state, c0), c1)               2 steps
+/// squeeze()        out = state ; state ← T(state, SQ(i))     1 step
+/// ```
+///
+/// where `T` is one `LFM_HASH` two-to-one step in the TRANSCRIPT domain
+/// ([`LfmBuilder::transcript_step`]) and `SQ(i) = [SQUEEZE_MARK, i, 0, 0]`.
+/// Squeeze outputs BEFORE advancing.
+///
+/// # Why a chain and not a sponge
+///
+/// This replaced an overwrite-rate duplex over a 3-cell permutation (option B1,
+/// ratified 2026-08-11). A chain over a collision-resistant compression is the
+/// textbook Fiat–Shamir transcript and needs no assumption beyond the one the
+/// hash already carries — no T-sponge theorem, no capacity argument. It needs no
+/// *permutation* either, which is what lets the machine's real hash have a
+/// compress socket and no permute socket at all. Being public-coin is what makes
+/// this legitimate: every absorbed value is a public commitment and every
+/// squeezed value a public challenge, so there is no secret for a capacity to
+/// protect.
+///
+/// The state is one cell = 128 bits, so ~**64-bit collision resistance** by the
+/// birthday bound. That is `HASH_DIGEST_FELTS = 4` speaking, not this
+/// construction: the digest already had that bound.
+///
+/// # Why the squeeze counter, and why it is free
+///
+/// The eDSL fully unrolls, so `i` is a compile-time constant and `SQ(i)` is a
+/// program constant pinned by `program_id` — a constant cell was going to be
+/// emitted either way, and this one carries a counter. What it buys: without it
+/// a run of consecutive squeezes iterates ONE fixed public non-injective map,
+/// whose functional graph an adversary can precompute — the structure the
+/// FSE-2014 T-sponge attacks on GLUON-64 exploit. With it every step is a
+/// different map and no single functional graph exists.
+///
+/// ⚠ **Squeeze runs still lose entropy, and the bound scales with the query
+/// count.** A run of `k` consecutive squeezes shrinks the reachable state by
+/// `−log₂ α_k` bits, `α_k ~ 2/k`: 1.7 bits at `k = 4`, 7 at `k = 256`, 15 at
+/// `k = 2^16`. The counter does not change those numbers (composing distinct
+/// random maps obeys the same recursion) — it removes the attack structure. The
+/// FRI query loop squeezes once per query with no absorb between, so **its run
+/// length IS the query count**. A program whose runs exceed `k = 2^16` must
+/// revisit the analysis in the transcript spec §4.2; below that the 64-bit
+/// collision bound above dominates and this changes nothing.
 pub struct SpongeVar {
-    state: [Cell; 3],
+    state: Cell,
+    /// The next squeeze's index — host-side bookkeeping, so it appears in the
+    /// program only as the constant it selects.
+    squeeze_index: u32,
 }
 
 impl SpongeVar {
     pub fn new(b: &mut LfmBuilder) -> Self {
-        let z = b.felt_const(FE::zero()).as_cell();
-        SpongeVar { state: [z, z, z] }
+        SpongeVar {
+            state: b.felt_const(FE::zero()).as_cell(),
+            squeeze_index: 0,
+        }
     }
 
-    /// Absorb two cells: overwrite the rate, keep the capacity, permute.
-    pub fn absorb2(&mut self, b: &mut LfmBuilder, c0: Cell, c1: Cell) {
-        self.state = b.permute([c0, c1, self.state[2]]);
-    }
-
+    /// Absorb one cell: one transcript step against the current state.
     pub fn absorb(&mut self, b: &mut LfmBuilder, c: Cell) {
-        let z = b.felt_const(FE::zero()).as_cell();
-        self.absorb2(b, c, z);
+        self.state = b
+            .transcript_step(self.state.as_digest(), c.as_digest())
+            .as_cell();
     }
 
-    /// Squeeze one cell (the current rate cell), then permute.
+    /// Absorb two cells, in order. Two steps, not one: the chain takes one
+    /// operand per step, and the ORDER is what the transcript binds.
+    pub fn absorb2(&mut self, b: &mut LfmBuilder, c0: Cell, c1: Cell) {
+        self.absorb(b, c0);
+        self.absorb(b, c1);
+    }
+
+    /// Squeeze one cell: the current state, then advance past it with `SQ(i)`.
+    ///
+    /// Output-then-advance rather than advance-then-output, so no squeezed
+    /// value is ever the state a later step absorbs into.
     pub fn squeeze_cell(&mut self, b: &mut LfmBuilder) -> Cell {
-        let out = self.state[0];
-        self.state = b.permute(self.state);
+        let out = self.state;
+        // `SQ(i)`, interned like every other program constant — one `LFM_CONST`
+        // row per distinct squeeze index, and nothing else.
+        let sq = b.digest_const([
+            FE::from(u64::from(SQUEEZE_MARK)),
+            FE::from(u64::from(self.squeeze_index)),
+            FE::zero(),
+            FE::zero(),
+        ]);
+        self.state = b.transcript_step(self.state.as_digest(), sq).as_cell();
+        self.squeeze_index += 1;
         out
     }
 

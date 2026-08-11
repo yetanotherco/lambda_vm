@@ -102,4 +102,8 @@ mod step_size_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod transcript_kats;
+#[cfg(test)]
+mod transcript_tests;
+#[cfg(test)]
 mod wrap_tests;

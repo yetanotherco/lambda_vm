@@ -68,7 +68,7 @@ compression. The chip proves this:
 | `h` (chaining value) | `BLAKE3_IV[0..8]` — all eight words |
 | `m[0..4]` | `a[0..4]` |
 | `m[4..8]` | `b[0..4]` |
-| `m[8]` | `0x434D464C` — the tag `"LFMC"` read as one little-endian u32 |
+| `m[8]` | **mode-selected on the built chip** — `MODE_C·TAG_LFMC + MODE_T·TAG_LFMT`; `0x434D464C` on a Merkle row (`MODE_C = 1`). See the note below. |
 | `m[9..16]` | `0` |
 | `t` (counter) | `0` |
 | `block_len` | `36` |
@@ -77,8 +77,24 @@ compression. The chip proves this:
 Output: `c_i = f(...)[i]` for `i in 0..4` — the **low four** words of the
 16-word output, i.e. the low half of the truncated chaining value.
 
-Everything in that table except `a` and `b` is a compile-time constant, so the
-socket costs the chip no extra columns beyond the compression it already proves.
+Everything in that table except `a` and `b` and `m[8]` is a compile-time
+constant, and the socket costs the chip no extra columns beyond the compression
+it already proves.
+
+> **⚠ UPDATED FOR B1 (2026-08-11) — the conclusion holds, the REASON changed.**
+> `m[8]` was a compile-time constant when this document was written, and
+> "constant" was why it was free. The built chip selects it from the row's
+> domain: `MODE_C·TAG_LFMC + MODE_T·TAG_LFMT`, a linear form over two
+> **preprocessed** columns (`WordRef::ModeSelected`, evaluated `Σ col·tag`),
+> because the Fiat–Shamir transcript now runs on this same socket under
+> `"LFMT"` (option B1 — see §2.4 and §7). It remains free (only ever an `add3`
+> operand, read as a whole word, never byte-decomposed) and remains
+> prover-unchosen — but now because the selectors are preprocessed, not because
+> the value is constant.
+>
+> **If you transcribe this table into a model, transcribe the linear form.** A
+> model carrying a constant where the chip has a linear form still reports PASS
+> while checking something the chip does not do.
 
 `gen_socket_kats.py` computes §2.1 and §2.2 by separate routes and asserts they
 agree, for every vector, at both round counts. That equality is the framing
@@ -100,16 +116,30 @@ distinct tags give distinct 36-byte messages.
 
 Cost of the choice: the message is 36 bytes rather than 32, which is still one
 block. Zero extra compressions, zero extra columns. ? INFERRED — `block_len` and
-`m[8]` are constants in the constraints, not columns; confirm when the chip arm
-is written.
+`m[8]` is not a column either — post-B1 it is a linear form over preprocessed
+mode columns, which is still zero columns and zero sends (✓ CONFIRMED against
+the built arm).
 
 ### 2.4 Tag allocation
 
 | tag | bytes | u32 (LE) | use |
 |---|---|---|---|
 | `"LFMC"` | `4C 46 4D 43` | `0x434D464C` | **this socket** — 2-to-1 compress / Merkle parent |
-| `"LFMP"` | `4C 46 4D 50` | `0x504D464C` | reserved — the `permute` socket (§7), **not specified** |
-| `"LFML"` | `4C 46 4D 4C` | `0x4C4D464C` | reserved — leaf domain, if leaves ever hash directly |
+| `"LFMT"` | `4C 46 4D 54` | `0x544D464C` | **transcript step** — the compress-chain Fiat–Shamir transcript (`thoughts/shared/lfm-real-hash/transcript-spec/TRANSCRIPT.md`) |
+| `"LFMP"` | `4C 46 4D 50` | `0x504D464C` | ~~`permute` socket (§7)~~ — **RETIRED UNUSED**, see below |
+| `"LFML"` | `4C 46 4D 4C` | `0x4C4D464C` | reserved — leaf domain; **O5 ratified**: any future leaf-hashing path MUST use it |
+
+⚠ **§7's `permute`-socket sketch is superseded and will never be built.** The
+user ratified option **B1** on 2026-08-11
+(`thoughts/shared/lfm-real-hash/permute-socket-options.md`): the Fiat–Shamir
+sponge becomes a **compress-based chain** over *this* socket under the new
+`"LFMT"` tag, for all hashers, and `MODE_P` stays pinned to 0 permanently. Read
+§7 as a record of a rejected direction, not as a plan.
+
+`"LFMP"` is **retired rather than deleted**, and the distinction is
+load-bearing: the value is now permanently unused, but removing the row would
+let a future allocation reuse `0x504D464C` and silently create a domain nobody
+analysed.
 
 A tag is never reused for a second purpose, for the same reason
 `HasherKind::as_tag` never reuses a discriminant. ⚠ `as_tag` is **not yet
@@ -233,7 +263,16 @@ three modes. It should still be written, as a one-line `blake3::hash` assertion,
 because it is the version of the check that survives this directory being
 deleted.
 
-## 7. ✗ OPEN: the `permute` socket is not specified here
+## 7. ~~✗ OPEN: the `permute` socket is not specified here~~
+## ⛔ SUPERSEDED — NO PERMUTE SOCKET WILL EVER BE BUILT (option B1, 2026-08-11)
+
+> The user ratified **option B1**: the Fiat–Shamir sponge becomes a
+> **compress-based chain** over the socket this document specifies, under the
+> new `"LFMT"` tag; `MODE_P` stays pinned to 0 permanently. Spec, reference,
+> KATs and gate extension:
+> `thoughts/shared/lfm-real-hash/transcript-spec/TRANSCRIPT.md`.
+> **Everything below is a record of the rejected direction.** It is kept because
+> the options paper's analysis cites it, not because anyone should build it.
 
 The brief asked for the 2-to-1 compress socket and that is what this document
 covers. Flagging the gap explicitly, because it changes what Phase 5's E1

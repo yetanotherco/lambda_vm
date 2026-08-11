@@ -689,6 +689,13 @@ fn the_blake_column_and_the_residue_split() {
         legs_17,
         "the rate-17 closed form must reproduce the emitted legs"
     );
+    // Rate 8 is BLAKE3's own: its socket absorbs two cells of message per
+    // compression, and option B1 did not change that. It is NOT the
+    // field-native chain's rate — that is `epoch_verify::LFM_HASH_RATE_FELTS`,
+    // which is 4 because the chain absorbs one cell per step. The two were the
+    // same number while the sponge was a three-cell duplex, and this line used
+    // to say "blake and field-native" on that basis; they have since diverged.
+    //
     // The spine is absorption-bound, so at rate 8 it lies between 1.0x and
     // 2.125x its rate-17 cost — wave 8's interval, restated on this run's own
     // spine count rather than quoted.
@@ -696,7 +703,7 @@ fn the_blake_column_and_the_residue_split() {
     let p_hi = legs_8 + (spine_perms as f64 * 17.0 / 8.0).ceil() as usize;
     println!(
         "\n   PERMUTATIONS  emitted {emitted} = spine {spine_perms} + legs {legs_17} (MEASURED)\n   \
-         closed form   legs @ rate 17 (keccak) {legs_17}, @ rate 8 (blake and field-native) {legs_8}\n   \
+         closed form   legs @ rate 17 (keccak) {legs_17}, @ rate 8 (BLAKE3's socket) {legs_8}\n   \
          P at rate 8 in [{p_lo}, {p_hi}] — legs exact, spine bounded"
     );
 
@@ -861,7 +868,9 @@ fn the_delegation_topology_priced_against_in_machine_hosting() {
     let queries = widest.verify.num_queries;
     let log2_blowup = inner.blowup_factor.trailing_zeros();
 
-    /// Compressions to verify ONE sub-proof of the given geometry, at rate 8.
+    /// Compressions to verify ONE sub-proof of the given geometry, at BLAKE3's
+    /// rate 8 (two cells of message per compression — not the field-native
+    /// chain's 4, see `epoch_verify::LFM_HASH_RATE_FELTS`).
     ///
     /// `Σ_groups blocks_at_rate(leaf felts) + groups × merkle_depth + FRI`, the
     /// same three terms `query_permutations_at_rate` sums, per query.

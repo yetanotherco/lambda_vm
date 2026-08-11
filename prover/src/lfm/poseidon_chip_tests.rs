@@ -160,7 +160,9 @@ fn the_poseidon_layout_is_612_value_columns() {
         28 + 7 * 36 + 24 + 22 * 14,
         "the two arrangements must agree on the total"
     );
-    assert_eq!(pc::PREP_WIDTH, 11, "the preprocessed prefix does not move");
+    // 12 since option B1 added `MODE_T` (was 11) — the same number the BLAKE3
+    // arm pins, because the prefix is the hasher-independent instruction group.
+    assert_eq!(pc::PREP_WIDTH, 12, "the preprocessed prefix does not move");
 }
 
 /// The layout is injective and gapless — no column is written twice, none is
@@ -541,8 +543,9 @@ fn a_proof_does_not_verify_under_the_other_hasher() {
 ///
 /// Both halves matter and they are in one test because the second exists only
 /// because of the first. `build_artifacts` commits the preprocessed column
-/// groups, and `PREP_WIDTH` is 11 in both layouts with the preprocessed group
-/// untouched, so every root really is bit-identical across hashers. That is
+/// groups, and `PREP_WIDTH` is the same in both layouts (12 since `MODE_T`)
+/// with the preprocessed group untouched, so every root really is bit-identical
+/// across hashers. That is
 /// what makes the commitments unable to carry the hasher, and it is why
 /// `lfm_program_id` folds the kind's tag in directly: without the tag, a
 /// Test-backed and a Poseidon-backed machine of the same program would share

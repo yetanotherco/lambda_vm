@@ -109,8 +109,8 @@ pub struct BitDecRow {
 
 #[derive(Debug, Clone)]
 pub struct HashRow {
-    /// The 12 input columns: full state for `Permute`; `[a ‖ b ‖ 0⁴]` for
-    /// `Compress` (lanes 8–11 are unconstrained on compress rows — the AIR
+    /// The 12 input columns: full state for `Permute`; `[a ‖ b ‖ 0⁴]` for the
+    /// two-to-one modes (lanes 8–11 are unconstrained on those rows — the AIR
     /// injects the IV there via the mode selector).
     pub ins: [FE; HASH_STATE_FELTS],
     /// The full permuted state.
@@ -372,23 +372,20 @@ pub fn execute(
             } => {
                 let mut state: [FE; HASH_STATE_FELTS] = core::array::from_fn(|_| FE::zero());
                 let mut in_cols: [FE; HASH_STATE_FELTS] = core::array::from_fn(|_| FE::zero());
-                match mode {
-                    HashMode::Compress => {
-                        let a = m.read_word(ins[0])?;
-                        let b = m.read_word(ins[1])?;
-                        state[0..4].clone_from_slice(&a);
-                        state[4..8].clone_from_slice(&b);
-                        state[8..12].clone_from_slice(&hasher.compress_iv());
-                        in_cols[0..4].clone_from_slice(&a);
-                        in_cols[4..8].clone_from_slice(&b);
-                        // lanes 8–11 of the IN columns stay zero on compress rows
+                if mode.is_two_to_one() {
+                    let a = m.read_word(ins[0])?;
+                    let b = m.read_word(ins[1])?;
+                    state[0..4].clone_from_slice(&a);
+                    state[4..8].clone_from_slice(&b);
+                    state[8..12].clone_from_slice(&hasher.compress_iv());
+                    in_cols[0..4].clone_from_slice(&a);
+                    in_cols[4..8].clone_from_slice(&b);
+                    // lanes 8–11 of the IN columns stay zero on two-to-one rows
+                } else {
+                    for (cell, chunk) in ins.iter().zip(state.chunks_exact_mut(4)) {
+                        chunk.clone_from_slice(&m.read_word(*cell)?);
                     }
-                    HashMode::Permute => {
-                        for (cell, chunk) in ins.iter().zip(state.chunks_exact_mut(4)) {
-                            chunk.clone_from_slice(&m.read_word(*cell)?);
-                        }
-                        in_cols = state;
-                    }
+                    in_cols = state;
                 }
                 // A hasher whose socket does not cover this row says so here,
                 // with a reason, rather than producing a witness no AIR accepts.
@@ -396,27 +393,30 @@ pub fn execute(
                     .admits(*mode, &state)
                     .map_err(LfmExecError::HasherRejected)?;
                 let out_state = match mode {
-                    // Through `compress_out`, NOT `permute`: a hasher that
-                    // overrides the compress construction — BLAKE3 does, its IV
-                    // entering through `h` rather than the capacity lanes — must
-                    // have that override reach the `OUT` columns.
-                    HashMode::Compress => {
+                    // Through `compress_out`/`transcript_out`, NOT `permute`: a
+                    // hasher that overrides the two-to-one construction —
+                    // BLAKE3 does, its IV entering through `h` rather than the
+                    // capacity lanes, and its transcript domain differing from
+                    // its Merkle one — must have both overrides reach the `OUT`
+                    // columns.
+                    HashMode::Compress | HashMode::Transcript => {
                         let a: LfmWord = core::array::from_fn(|i| state[i]);
                         let b: LfmWord = core::array::from_fn(|i| state[4 + i]);
-                        hasher.compress_out(&a, &b)
+                        if *mode == HashMode::Compress {
+                            hasher.compress_out(&a, &b)
+                        } else {
+                            hasher.transcript_out(&a, &b)
+                        }
                     }
                     HashMode::Permute => hasher.permute(state),
                 };
-                match mode {
-                    HashMode::Compress => {
-                        let digest: LfmWord = core::array::from_fn(|i| out_state[i]);
-                        m.write(outs[0], digest)?;
-                    }
-                    HashMode::Permute => {
-                        for (cell, chunk) in outs.iter().zip(out_state.chunks_exact(4)) {
-                            let w: LfmWord = core::array::from_fn(|i| chunk[i]);
-                            m.write(*cell, w)?;
-                        }
+                if mode.is_two_to_one() {
+                    let digest: LfmWord = core::array::from_fn(|i| out_state[i]);
+                    m.write(outs[0], digest)?;
+                } else {
+                    for (cell, chunk) in outs.iter().zip(out_state.chunks_exact(4)) {
+                        let w: LfmWord = core::array::from_fn(|i| chunk[i]);
+                        m.write(*cell, w)?;
                     }
                 }
                 records.hash.push(HashRow {

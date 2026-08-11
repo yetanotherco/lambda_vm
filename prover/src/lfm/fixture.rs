@@ -3,8 +3,8 @@
 //!
 //! Structurally real, deliberately small: coset LDE domains (offset 3, the
 //! production pin), row-pair Merkle leaves, per-layer commitments, the
-//! **unnormalized fold** convention (`(lo+hi) + inv_x·ζ·(lo−hi)`), a duplex
-//! sponge transcript over the machine's own hash, query indices sampled at a
+//! **unnormalized fold** convention (`(lo+hi) + inv_x·ζ·(lo−hi)`), a compress-chain
+//! transcript over the machine's own hash, query indices sampled at a
 //! power-of-two bound, and a terminal polynomial checked at the queried
 //! points. What it is NOT: the production 25-AIR proof format — that lands
 //! when the ecosystem hash decision unblocks the real machine-facing
@@ -19,7 +19,8 @@ use math::field::traits::{IsFFTField, IsPrimeField};
 
 use crate::tables::types::{FE, FEE, GoldilocksField};
 
-use super::hash::{HASH_STATE_FELTS, LfmHasher, TestPermutation};
+use super::edsl::SQUEEZE_MARK;
+use super::hash::{HasherKind, LfmHasher, TestPermutation};
 use super::word::{LfmWord, base_word, ext_word};
 
 /// The fixed shape — compile-time constants of the emitted program.
@@ -43,9 +44,23 @@ pub mod shape {
     pub const WORDS_PER_QUERY: usize = 17;
 }
 
-/// Host mirror of `edsl::SpongeVar` (overwrite-rate duplex, state 3 cells).
+/// Host mirror of [`super::edsl::SpongeVar`] — the compress chain, state 1
+/// cell.
+///
+/// Bit-exact by construction, not by coincidence: every operation here is the
+/// same sequence of [`LfmHasher::transcript`] calls the emitted program makes
+/// of `LFM_HASH`, in the same order, on the same operands. The two are rewritten
+/// together for exactly that reason; a divergence would show up as a fixture
+/// proof the machine rejects, which is a slow and confusing way to learn about
+/// it.
+///
+/// Parameterised by hasher because the transcript is: `Test` and `Poseidon`
+/// hash a transcript step with their single domain, BLAKE3 with the `"LFMT"`
+/// tag, and the host has to agree with whichever one the proof is under.
 pub struct HostSponge {
-    state: [FE; HASH_STATE_FELTS],
+    state: LfmWord,
+    squeeze_index: u32,
+    hasher: HasherKind,
 }
 
 impl Default for HostSponge {
@@ -55,27 +70,49 @@ impl Default for HostSponge {
 }
 
 impl HostSponge {
+    /// The chain under the machine's default hasher.
     pub fn new() -> Self {
+        Self::with_hasher(HasherKind::default())
+    }
+
+    pub fn with_hasher(hasher: HasherKind) -> Self {
         HostSponge {
-            state: core::array::from_fn(|_| FE::zero()),
+            state: [FE::zero(); 4],
+            squeeze_index: 0,
+            hasher,
         }
     }
 
-    pub fn absorb2(&mut self, c0: &LfmWord, c1: &LfmWord) {
-        let mut input = self.state;
-        input[0..4].copy_from_slice(c0);
-        input[4..8].copy_from_slice(c1);
-        self.state = TestPermutation.permute(input);
+    /// `SQ(i) = [SQUEEZE_MARK, i, 0, 0]` — the advance operand.
+    pub fn squeeze_operand(i: u32) -> LfmWord {
+        [
+            FE::from(u64::from(SQUEEZE_MARK)),
+            FE::from(u64::from(i)),
+            FE::zero(),
+            FE::zero(),
+        ]
+    }
+
+    /// The state as it stands — for the KATs, which pin it after every step.
+    pub fn state(&self) -> LfmWord {
+        self.state
     }
 
     pub fn absorb(&mut self, c: &LfmWord) {
-        let zero = [FE::zero(); 4];
-        self.absorb2(c, &zero);
+        self.state = self.hasher.transcript(&self.state, c);
     }
 
+    pub fn absorb2(&mut self, c0: &LfmWord, c1: &LfmWord) {
+        self.absorb(c0);
+        self.absorb(c1);
+    }
+
+    /// Output the current state, then advance past it with `SQ(i)`.
     pub fn squeeze_cell(&mut self) -> LfmWord {
-        let out: LfmWord = core::array::from_fn(|i| self.state[i]);
-        self.state = TestPermutation.permute(self.state);
+        let out = self.state;
+        let sq = Self::squeeze_operand(self.squeeze_index);
+        self.state = self.hasher.transcript(&self.state, &sq);
+        self.squeeze_index += 1;
         out
     }
 

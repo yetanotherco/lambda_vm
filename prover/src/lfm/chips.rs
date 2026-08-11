@@ -480,8 +480,9 @@ pub mod hash {
         pub use crate::lfm::layout::hash::*;
         pub const IN0: usize = PREP_WIDTH; // ..IN11
         /// Materialized capacity-state columns for lanes 8–11:
-        /// `S_i = MODE_P·IN_i + MODE_C·IV_i` (degree-2 copy), so the
-        /// permutation constraint stays at degree 3.
+        /// `S_i = MODE_P·IN_i + (MODE_C + MODE_T)·IV_i` (degree-2 copy), so the
+        /// permutation constraint stays at degree 3. A transcript row is a
+        /// compress in every structural respect, so it takes the IV too.
         pub const S8: usize = PREP_WIDTH + 12; // ..S11
         pub const OUT0: usize = PREP_WIDTH + 16; // ..OUT11
         /// Value columns every hasher's layout shares: `IN`, `S`, `OUT`. The
@@ -516,7 +517,9 @@ pub mod hash {
         use crate::lfm::hash::HASH_STATE_FELTS;
         use crate::lfm::poseidon::{NUM_ROUNDS, sboxed_lanes};
 
-        pub use super::cols::{IN0, MODE_C, MODE_P, OUT0, PREP_WIDTH, S8, SHARED_VALUE_COLUMNS};
+        pub use super::cols::{
+            IN0, MODE_C, MODE_P, MODE_T, OUT0, PREP_WIDTH, S8, SHARED_VALUE_COLUMNS,
+        };
 
         /// First appended witness column.
         pub const ROUNDS: usize = PREP_WIDTH + SHARED_VALUE_COLUMNS;
@@ -609,16 +612,21 @@ pub mod hash {
     }
 
     /// The frozen `LFM_HASH` tuple contract: 2 (or 3) cells in, 1 (or 3) out.
+    ///
+    /// The first two input cells are read in every mode, so their multiplicity
+    /// is the row's is-real flag: the sum of all three mode selectors, which the
+    /// AIR pins to a bit. The third is read only by a permutation.
     fn lfm_mem_interactions() -> Vec<BusInteraction> {
+        let is_real = || selector_sum(cols::MODE_C, cols::NUM_SELECTORS);
         vec![
             BusInteraction::receiver(
                 BusId::LfmMem,
-                Multiplicity::Sum(cols::MODE_C, cols::MODE_P),
+                is_real(),
                 word_token(cols::IN_ADDR0, cols::IN0),
             ),
             BusInteraction::receiver(
                 BusId::LfmMem,
-                Multiplicity::Sum(cols::MODE_C, cols::MODE_P),
+                is_real(),
                 word_token(cols::IN_ADDR1, cols::IN0 + 4),
             ),
             BusInteraction::receiver(
@@ -712,18 +720,27 @@ pub mod hash {
     impl HashConstraints {
         fn eval_test<B: ConstraintBuilder<F, E>>(b: &mut B) {
             let mode_c = b.main(0, cols::MODE_C);
+            let mode_t = b.main(0, cols::MODE_T);
             let mode_p = b.main(0, cols::MODE_P);
 
-            // idx 0–3: capacity-state copy — S_i = MODE_P·IN_i + MODE_C·IV_i.
+            // idx 0–3: capacity-state copy —
+            // S_i = MODE_P·IN_i + (MODE_C + MODE_T)·IV_i. A transcript row is a
+            // two-to-one step like a compress row, so it takes the same
+            // capacity; `TestPermutation` has one hash domain, so the two rows
+            // compute the same function (see `LfmHasher::transcript_out`).
             for (k, iv_raw) in TestPermutation::compress_iv_raw().into_iter().enumerate() {
                 let s = b.main(0, cols::S8 + k);
                 let in_i = b.main(0, cols::IN0 + 8 + k);
                 let iv_i = b.const_base(iv_raw);
-                b.emit_base(k, s - (mode_p.clone() * in_i + mode_c.clone() * iv_i));
+                b.emit_base(
+                    k,
+                    s - (mode_p.clone() * in_i + (mode_c.clone() + mode_t.clone()) * iv_i),
+                );
             }
 
             // idx 4–15: the TestPermutation round — t_i = (A_i + rc_i·m)³
-            // with A_i = IN_i (i < 8) or S_i (i ≥ 8) and m = MODE_C + MODE_P;
+            // with A_i = IN_i (i < 8) or S_i (i ≥ 8) and
+            // m = MODE_C + MODE_T + MODE_P;
             // OUT_j = t_j + Σ_i t_i (mixing matrix M = I + J). The round
             // constant is scaled by the mode sum so zero-filled padding rows
             // satisfy the constraint (0 = 0) without a degree-4 gate: on real
@@ -738,7 +755,8 @@ pub mod hash {
                         b.main(0, cols::S8 + (i - 8))
                     };
                     let rc = b.const_base(canonical_u64(&TestPermutation::round_constant(i)));
-                    let m = b.main(0, cols::MODE_C) + b.main(0, cols::MODE_P);
+                    let m =
+                        b.main(0, cols::MODE_C) + b.main(0, cols::MODE_T) + b.main(0, cols::MODE_P);
                     let x = a + rc * m;
                     x.clone() * x.clone() * x
                 })
@@ -750,7 +768,7 @@ pub mod hash {
             }
 
             // idx 16: mode sum-boolean (exactly-one-of is the registrar's).
-            let mode_sum = mode_c + mode_p;
+            let mode_sum = mode_c + mode_t + mode_p;
             let one = b.one();
             b.emit_base(16, mode_sum.clone() * (one - mode_sum));
         }
@@ -777,15 +795,18 @@ pub mod hash {
             use poseidon_cols as pc;
 
             let mode_c = b.main(0, pc::MODE_C);
+            let mode_t = b.main(0, pc::MODE_T);
             let mode_p = b.main(0, pc::MODE_P);
-            let m = mode_c + mode_p.clone();
+            let m = mode_c + mode_t + mode_p.clone();
 
             // idx 0–3: capacity-state copy — S_i = MODE_P·IN_i.
             //
             // Poseidon's `compress_iv` is ZERO (plain sponge compression, no
             // domain separation invented here), so the `MODE_C·IV_i` term the
             // TestPermutation version carries vanishes: on a compress row
-            // MODE_P = 0 forces S_i = 0, which IS the IV.
+            // MODE_P = 0 forces S_i = 0, which IS the IV. A transcript row is
+            // the same shape and takes the same zero capacity — Poseidon has
+            // one domain here, so it does not separate the two.
             for k in 0..4 {
                 let s = b.main(0, pc::S8 + k);
                 let in_i = b.main(0, pc::IN0 + 8 + k);

@@ -44,12 +44,36 @@ pub enum ExtOp {
     MulBase,
 }
 
-/// The two hash-chiplet modes. `Compress`: two digest cells → one digest
-/// cell. `Permute`: three state cells → three state cells.
+/// The three hash-chiplet modes. `Compress`: two digest cells → one digest
+/// cell. `Transcript`: the same shape in the Fiat–Shamir domain.
+/// `Permute`: three state cells → three state cells.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HashMode {
     Compress,
+    /// One step of the Fiat–Shamir transcript chain.
+    ///
+    /// Structurally identical to [`HashMode::Compress`] — two cells in, one
+    /// cell out, same socket, same columns — and DIFFERENT in exactly one
+    /// thing: the hash domain. Under BLAKE3 the row's domain tag is the
+    /// message word `m[8]`, selected by the preprocessed mode columns, so a
+    /// transcript step cannot be replayed as a Merkle parent or the reverse.
+    /// Hashers with a single domain (`Test`, `Poseidon`) compute the same
+    /// function in both modes; the separation is a property of the hasher, not
+    /// of the machine.
+    Transcript,
     Permute,
+}
+
+impl HashMode {
+    /// Whether this mode is the two-cells-in, one-cell-out shape — true for
+    /// `Compress` and `Transcript`, which differ only in hash domain.
+    ///
+    /// Every place that used to match `Compress` for a *shape* reason routes
+    /// through here, so adding a third domain later cannot silently take the
+    /// permute arm.
+    pub const fn is_two_to_one(self) -> bool {
+        matches!(self, HashMode::Compress | HashMode::Transcript)
+    }
 }
 
 /// Operands of a [`Instr::KeccakF`]: 13 words of `u32`-half keccak state in,
@@ -101,8 +125,9 @@ pub enum KeccakMode {
 /// - `c` on the ALU ops is meaningful iff the op is `MulAdd` (and is emitted
 ///   as address 0 otherwise — the corresponding bus receive is gated by the
 ///   `MulAdd` selector, so the placeholder is never read).
-/// - `Hash` in `Compress` mode uses `ins[0..2]` and `outs[0]` only; the
-///   remaining slots are `Addr(0)` placeholders with `mults` fixed to 0.
+/// - `Hash` in a two-to-one mode (`Compress`, `Transcript`) uses `ins[0..2]`
+///   and `outs[0]` only; the remaining slots are `Addr(0)` placeholders with
+///   `mults` fixed to 0.
 /// - `BitDec.bits` lists, low-to-high from bit 0, exactly the bit cells the
 ///   program consumes; bits beyond `bits.len()` exist as constrained witness
 ///   columns but get no memory cell.
@@ -201,10 +226,13 @@ impl Instr {
             }
             Instr::Select { out_l, out_r, .. } => vec![*out_l, *out_r],
             Instr::BitDec { bits, .. } => bits.iter().map(|(a, _)| *a).collect(),
-            Instr::Hash { mode, outs, .. } => match mode {
-                HashMode::Compress => vec![outs[0]],
-                HashMode::Permute => outs.to_vec(),
-            },
+            Instr::Hash { mode, outs, .. } => {
+                if mode.is_two_to_one() {
+                    vec![outs[0]]
+                } else {
+                    outs.to_vec()
+                }
+            }
             Instr::Public { .. } => vec![],
         }
     }
@@ -232,10 +260,13 @@ impl Instr {
                 bit, in_l, in_r, ..
             } => vec![*bit, *in_l, *in_r],
             Instr::BitDec { input, .. } => vec![*input],
-            Instr::Hash { mode, ins, .. } => match mode {
-                HashMode::Compress => vec![ins[0], ins[1]],
-                HashMode::Permute => ins.to_vec(),
-            },
+            Instr::Hash { mode, ins, .. } => {
+                if mode.is_two_to_one() {
+                    vec![ins[0], ins[1]]
+                } else {
+                    ins.to_vec()
+                }
+            }
             Instr::Pack { lanes, .. } => lanes.to_vec(),
             Instr::Unpack { input, .. } => vec![*input],
             Instr::KeccakF(k) => match k.mode {

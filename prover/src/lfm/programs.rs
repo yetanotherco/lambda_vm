@@ -12,8 +12,22 @@ use super::compiler::{LfmProgram, compile};
 
 /// The Milestone-B trivial program: a few hundred instructions exercising
 /// every chip — constants, base ALU (incl. the assert lowering), Fp3 ALU,
-/// bit decomposition, selects driven by decomposed bits, both hash modes,
-/// hints and public output.
+/// bit decomposition, selects driven by decomposed bits, a chain of hash
+/// compressions, hints and public output.
+///
+/// ## It contains no `permute`, deliberately
+///
+/// It used to end on a raw `b.permute`, which made it unprovable under the
+/// machine's real hash — a REGISTERED program whose cryptographic meaning
+/// depended on a placeholder permutation, which is the disclosure this whole
+/// effort exists to retire. The permutation is now a third `compress`: every
+/// registry entry is provable under every hasher, and the swap is marginally
+/// cheaper besides.
+///
+/// Permute mode did not disappear with it — `Test` and `Poseidon` still
+/// implement it, and it still needs coverage or the arms rot. But coverage does
+/// not need a registry ENTRY: [`permute_coverage_program_source`] exercises the
+/// arms without claiming a program identity.
 pub fn trivial_program_source() -> LfmProgramSource {
     let mut b = LfmBuilder::new();
 
@@ -40,14 +54,16 @@ pub fn trivial_program_source() -> LfmProgramSource {
     let (l, _r) = b.select(bits[4], h[0], h[1]); // bit 4 of 112 = 1 → swap
     let (l2, _r2) = b.select(bits[0], l, h[2]); // bit 0 = 0 → pass through
 
-    // Hash leg: both modes, chained through memory.
+    // Hash leg: three compressions chained through memory. Feeding `d1` back in
+    // is the point — a socket's own output must be a legal input to the next
+    // one, which is what a Merkle walk does at every level.
     let d0 = b.compress(h[0].as_digest(), h[1].as_digest());
     let d1 = b.compress(d0, l2.as_digest());
-    let st = b.permute([d1.as_cell(), h[3], d0.as_cell()]);
+    let d2 = b.compress(d1, h[3].as_digest());
 
-    // Public output: the chained digest, one permuted cell, one ALU result.
+    // Public output: two chained digests and one ALU result.
     b.public(d1.as_cell());
-    b.public(st[0]);
+    b.public(d2.as_cell());
     b.public(m.as_cell());
 
     b.finish()
@@ -55,6 +71,40 @@ pub fn trivial_program_source() -> LfmProgramSource {
 
 pub fn trivial_program() -> LfmProgram {
     compile(trivial_program_source())
+}
+
+/// A `permute`-mode fixture — **not a registry entry, and it must not become
+/// one.**
+///
+/// [`trivial_program_source`] gave up its raw `b.permute` so that every
+/// registered program runs under the machine's real hash. Permute mode is still
+/// live under `Test` and `Poseidon`, so it still needs a program that exercises
+/// the executor arm, the trace filler and the AIR's three-cell tuple contract —
+/// this is that program. It is deliberately unregistered: a registry entry is a
+/// claim about a program's identity, and this one exists only to keep two
+/// hashers' arms honest.
+///
+/// It is unprovable under BLAKE3 by design (`MODE_P = 0`), which is itself worth
+/// testing.
+#[cfg(test)]
+pub fn permute_coverage_program_source() -> LfmProgramSource {
+    let mut b = LfmBuilder::new();
+    let arena = b.declare_arena(3);
+    let h: Vec<Cell> = (0..3).map(|i| b.hint_word(arena, i)).collect();
+
+    // Two permutations chained, so an output cell is also an input cell.
+    let s0 = b.permute([h[0], h[1], h[2]]);
+    let s1 = b.permute([s0[2], s0[0], s0[1]]);
+
+    for c in s1 {
+        b.public(c);
+    }
+    b.finish()
+}
+
+#[cfg(test)]
+pub fn permute_coverage_program() -> LfmProgram {
+    compile(permute_coverage_program_source())
 }
 
 /// Number of arena words the keccak-chain program ingests: one full state.

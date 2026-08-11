@@ -283,11 +283,29 @@ impl LfmBuilder {
 
     /// Two digest cells → one digest cell.
     pub fn compress(&mut self, a: DigestVal, b: DigestVal) -> DigestVal {
+        self.two_to_one(HashMode::Compress, a, b)
+    }
+
+    /// One step of the Fiat–Shamir transcript chain: two cells → one cell, in
+    /// the TRANSCRIPT hash domain.
+    ///
+    /// The same socket and the same columns as [`LfmBuilder::compress`]; the
+    /// row's preprocessed mode selects the domain tag, so a transcript step and
+    /// a Merkle parent over the same two cells are different digests. Callers
+    /// go through [`super::edsl::SpongeVar`] rather than here — the chain's
+    /// operand sequence is what its security argument rests on, and a raw step
+    /// is an easy way to break it.
+    pub fn transcript_step(&mut self, a: DigestVal, b: DigestVal) -> DigestVal {
+        self.two_to_one(HashMode::Transcript, a, b)
+    }
+
+    fn two_to_one(&mut self, mode: HashMode, a: DigestVal, b: DigestVal) -> DigestVal {
+        debug_assert!(mode.is_two_to_one());
         self.read(a.0);
         self.read(b.0);
         let out = self.alloc();
         self.instrs.push(Instr::Hash {
-            mode: HashMode::Compress,
+            mode,
             ins: [a.0, b.0, Addr(0)],
             outs: [out, Addr(0), Addr(0)],
             mults: [0, 0, 0],

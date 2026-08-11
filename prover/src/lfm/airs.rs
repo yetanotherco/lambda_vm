@@ -142,8 +142,8 @@ pub fn lfm_chip_census(program: &super::compiler::LfmProgram) -> Vec<LfmChipCell
 /// [`lfm_chip_census`] for a program proved under `hasher`.
 ///
 /// Only `LFM_HASH`'s width moves with the hasher; every other chip is
-/// hash-independent, and the preprocessed prefix (`PREP_WIDTH = 11`) is the
-/// same in every layout, so the row counts and the roots do not move either.
+/// hash-independent, and the preprocessed prefix is the hasher-independent
+/// instruction group, so the row counts and the roots do not move either.
 pub fn lfm_chip_census_with_hasher(
     program: &super::compiler::LfmProgram,
     hasher: HasherKind,
@@ -370,8 +370,9 @@ impl LfmAirs {
     /// chip bakes its round constants into its constraints: the same `hasher`
     /// must reach execution and trace generation, which is what
     /// `proof::lfm_prove_with_hasher` guarantees. Nothing else in the set moves
-    /// — `PREP_WIDTH` is 11 in every layout, so the preprocessed roots and the
-    /// program digest are hasher-independent.
+    /// — the preprocessed prefix is the instruction column group, which no
+    /// hasher changes, so the preprocessed roots and the program digest are
+    /// hasher-independent.
     pub fn new_with_hasher(
         roots: &[Commitment; NUM_LFM_CHIPS],
         options: &ProofOptions,

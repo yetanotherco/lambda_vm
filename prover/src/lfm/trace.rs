@@ -180,15 +180,21 @@ pub fn build_traces_with_hasher(
     // lookups per compression. Every other hasher sends none, so this is the
     // one place the shared table's multiplicities depend on the hash choice.
     if hasher == HasherKind::Blake3 {
-        let rows: Vec<([u32; 4], [u32; 4])> = records
+        let rows: Vec<([u32; 4], [u32; 4], u32)> = records
             .hash
             .iter()
-            .map(|r| {
+            .zip(&hash_modes)
+            .map(|(r, mode)| {
                 let cell =
                     |k: usize| -> super::word::LfmWord { core::array::from_fn(|i| r.ins[k + i]) };
                 (
                     blake3_socket::lanes_of(&cell(0)).expect("compress lane is a u32 (O1)"),
                     blake3_socket::lanes_of(&cell(4)).expect("compress lane is a u32 (O1)"),
+                    // The row's DOMAIN, not a fixed tag: the lookups a row sends
+                    // are values downstream of `m[8]`, so a transcript row and a
+                    // compress row over the same cells send different bytes.
+                    blake3_socket::tag_for_mode(*mode)
+                        .expect("BLAKE3 admits no permute row (its AIR pins MODE_P = 0)"),
                 )
             })
             .collect();
@@ -231,16 +237,20 @@ pub fn build_traces_with_hasher(
             let r = &records.hash[row];
             out[hash::cols::IN0..hash::cols::IN0 + 12].copy_from_slice(&r.ins);
             for k in 0..4 {
-                // S_i = MODE_P·IN_i + MODE_C·IV_i, materialized.
-                out[hash::cols::S8 + k] = match hash_modes[row] {
-                    HashMode::Permute => r.ins[8 + k],
-                    HashMode::Compress => iv[k],
+                // S_i = MODE_P·IN_i + (MODE_C + MODE_T)·IV_i, materialized.
+                out[hash::cols::S8 + k] = if hash_modes[row].is_two_to_one() {
+                    iv[k]
+                } else {
+                    r.ins[8 + k]
                 };
             }
             out[hash::cols::OUT0..hash::cols::OUT0 + 12].copy_from_slice(&r.outs);
             match hasher {
                 HasherKind::Test => {}
                 HasherKind::Poseidon => fill_poseidon_witness(out),
+                // The domain is read off the row's own mode columns, which
+                // `chip_trace` populated before calling this — the same
+                // discipline `fill_poseidon_witness` follows for its input.
                 HasherKind::Blake3 => blake3_socket::fill_socket_witness(out),
             }
         }),

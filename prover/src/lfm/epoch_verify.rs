@@ -425,15 +425,43 @@ pub fn leaf_permutations(shape: &SubProofShape) -> usize {
 /// three felts), so `bytes = 8 · felts` with no remainder either way.
 pub const KECCAK_RATE_FELTS: usize = 17;
 
-/// Felts an `LFM_HASH` permutation absorbs — the sponge's rate is 2 of its 3
-/// state cells (`edsl::SpongeVar`: "state = 3 cells (rate 2, capacity 1)") and a
-/// cell is [`super::hash::HASH_DIGEST_FELTS`] felts.
+/// Felts an `LFM_HASH` invocation absorbs — **one digest cell**.
 ///
-/// **This is 2.125× WORSE than keccak's 17**, and it is the one axis on which a
-/// field-native candidate loses: it pays more permutations, each far cheaper. It
-/// follows from the frozen `HASH_STATE_FELTS = 12`, so widening the state is the
-/// only lever on it.
-pub const LFM_HASH_RATE_FELTS: usize = 8;
+/// ⚠ **This was 8 and is now 4, because the construction it was derived from no
+/// longer exists.** The old value was "2 of 3 state cells" — the rate of the
+/// overwrite-duplex `edsl::SpongeVar` used to be. Option B1 replaced that with a
+/// **compress chain** that absorbs exactly one cell per step, so the rate is
+/// [`super::hash::HASH_DIGEST_FELTS`]. It is written as that constant rather
+/// than as a literal so it cannot outlive its own derivation a second time.
+///
+/// **This is 4.25× worse than keccak's 17**, not the 2.125× the duplex gave,
+/// and it is the one axis on which a field-native candidate loses: it pays more
+/// permutations, each far cheaper.
+///
+/// **The lever moved with the construction, and it is now a worse one.** Under
+/// the duplex the rate followed from `HASH_STATE_FELTS = 12`, so widening the
+/// state bought throughput and nothing else. Under the chain it follows from
+/// `HASH_DIGEST_FELTS = 4` — the absorbed operand IS a digest — so the only way
+/// to raise it is to widen the digest, which is the same constant the socket's
+/// 64-bit collision bound rests on. Throughput and collision resistance are no
+/// longer independent knobs.
+///
+/// ✗ **What this models, and its remaining assumption.** A rate is the right
+/// shape for a CHAIN — `state ← T(state, cell)`, one fresh cell per invocation —
+/// which is what the machine now has. It is *not* the right shape for a 2-to-1
+/// tree over leaf data, where both inputs are fresh and the count is a tree size
+/// rather than `felts / rate`. Which of the two a candidate uses for LEAVES is
+/// the still-open O1 leaf-convention question, so a future answer there could
+/// move this model's FORMULA and not merely this constant.
+pub const LFM_HASH_RATE_FELTS: usize = super::hash::HASH_DIGEST_FELTS;
+
+/// Felts in one FRI-layer leaf: the symmetric evaluation PAIR, two extension
+/// elements of three felts each.
+///
+/// Named because it is the number that decides whether the FRI leaf term is
+/// rate-sensitive: six felts fit one keccak block (rate 17) and do NOT fit one
+/// block at the candidate's rate 4.
+pub const FRI_LEAF_FELTS: usize = 6;
 
 /// Felts one query's opening of a group covers, the felt-side counterpart of
 /// [`super::sub_proof::GroupShape::leaf_bytes`].
@@ -446,9 +474,11 @@ pub fn group_leaf_felts(g: &super::sub_proof::GroupShape) -> usize {
 /// always a padding block even when the length divides the rate.
 ///
 /// Carrying keccak's convention over to a candidate is deliberately
-/// CONSERVATIVE: a field-native sponge normally domain-separates in the capacity
-/// and needs no trailing block, so the candidate's true count lies between
-/// `felts.div_ceil(rate)` and this. Using the same convention on both sides is
+/// CONSERVATIVE: a candidate needs no trailing block, because it
+/// domain-separates outside the absorbed data — in the capacity for a sponge,
+/// and in the message tag for the B1 compress chain — so its true count lies
+/// between `felts.div_ceil(rate)` and this. Using the same convention on both
+/// sides is
 /// what makes the rate-17 case reproduce [`leaf_permutations`] exactly, which is
 /// the check that this felt-side reformulation is right at all.
 pub fn blocks_at_rate(felts: usize, rate_felts: usize) -> usize {
@@ -470,23 +500,44 @@ pub fn leaf_permutations_at_rate(shape: &SubProofShape, rate_felts: usize) -> us
         .sum()
 }
 
+/// FRI-layer LEAF permutations one query costs, at an arbitrary rate.
+///
+/// Split out of [`super::fri::FriShape::permutations_per_query`] because it is
+/// the half of that number which MOVES with the rate: a layer leaf is
+/// [`FRI_LEAF_FELTS`] felts, and how many blocks that takes depends on the rate
+/// like any other absorption. At keccak's 17 it is one block and this reduces to
+/// `num_committed()`, which is what keeps the felt-side and byte-side closed
+/// forms agreeing there.
+///
+/// ⚠ It used to be folded into the rate-INVARIANT remainder, on the premise
+/// that "a FRI layer leaf fits any rate at or above six". That premise was true
+/// while the candidate's rate was 8 and is false now that it is 4 — six felts
+/// take two blocks. The premise is gone rather than re-asserted; this function
+/// is what replaced it.
+pub fn fri_leaf_permutations_at_rate(fri: &FriShape, rate_felts: usize) -> usize {
+    fri.num_committed() * blocks_at_rate(FRI_LEAF_FELTS, rate_felts)
+}
+
 /// [`query_permutations`] at an arbitrary sponge rate.
 ///
-/// Only the LEAF term is rate-sensitive. The other two are not, and neither is an
-/// approximation:
+/// **ABSORPTION is rate-sensitive; COMPRESSION is not.** That is the whole
+/// decomposition, and it is a property of what each step does rather than of
+/// which leg it belongs to:
 ///
-/// - A **Merkle parent** is one permutation at any rate, because a candidate
-///   compresses rather than absorbs: `LfmHasher::compress` is "a single
-///   permutation of `[a ‖ b ‖ IV]` truncated to the first cell"
-///   (`hash.rs:23-26`), and keccak's 64-byte parent likewise sits inside one
-///   136-byte block (`edsl.rs:151-155`).
-/// - A **FRI layer leaf** is a 48-byte pair, i.e. six felts, which fits any rate
-///   at or above six — asserted in the tests rather than assumed.
+/// - **Leaves absorb**, so both kinds move with the rate — the trace groups'
+///   ([`leaf_permutations_at_rate`]) and the FRI layers'
+///   ([`fri_leaf_permutations_at_rate`]).
+/// - A **Merkle parent compresses**, so it is one permutation at any rate:
+///   `LfmHasher::compress` is "a single permutation of `[a ‖ b ‖ IV]` truncated
+///   to the first cell" (`hash.rs:23-26`), and keccak's 64-byte parent likewise
+///   sits inside one 136-byte block (`edsl.rs:151-155`). Both the trace trees'
+///   parents and the FRI layers' path steps are of this kind.
 pub fn query_permutations_at_rate(shape: &TableVerifyShape, rate_felts: usize) -> usize {
     let groups = shape.sub.groups().len();
     let per_query = leaf_permutations_at_rate(&shape.sub, rate_felts)
+        + fri_leaf_permutations_at_rate(&shape.fri, rate_felts)
         + groups * shape.sub.merkle_depth
-        + shape.fri.permutations_per_query();
+        + shape.fri.path_steps_per_query();
     shape.num_queries * per_query
 }
 

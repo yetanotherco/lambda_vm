@@ -78,6 +78,13 @@ pub mod bitdec {
 }
 
 /// `LFM_HASH` — the hash chiplet (frozen tuple contract).
+///
+/// Three mode selectors, all preprocessed, at most one of them set: `MODE_C`
+/// (Merkle/2-to-1 compress), `MODE_T` (a Fiat–Shamir transcript step — the same
+/// two-cells-in, one-cell-out shape in its own hash domain) and `MODE_P` (the
+/// three-cell permutation). Being preprocessed is what makes them trustworthy:
+/// a row's mode is fixed by its position in the committed instruction group, so
+/// a prover cannot choose which domain a row hashes in.
 pub mod hash {
     pub const IN_ADDR0: usize = 0;
     pub const IN_ADDR1: usize = 1;
@@ -87,10 +94,26 @@ pub mod hash {
     pub const OUT_ADDR2: usize = 5;
     pub const MODE_C: usize = 6;
     pub const MODE_P: usize = 7;
-    pub const MULT0: usize = 8;
-    pub const MULT1: usize = 9;
-    pub const MULT2: usize = 10;
-    pub const PREP_WIDTH: usize = 11;
+    /// The transcript-domain selector.
+    ///
+    /// A FRESH column, not a repurposed `MODE_P`: `MODE_P` is pinned to zero
+    /// under BLAKE3 but still carries its own meaning under `Test` and
+    /// `Poseidon`, and one preprocessed column meaning two things under two
+    /// hashers is worse than the column it saves.
+    ///
+    /// It sits INSIDE the selector run rather than after the multiplicities,
+    /// because the admission validator's one-hot check reads the selectors as a
+    /// contiguous span (`NUM_SELECTORS` from `MODE_C`). A selector parked past
+    /// the mults would be outside that span and silently unchecked, which is
+    /// the sort of gap that only shows up when someone forges a row.
+    pub const MODE_T: usize = 8;
+    /// Mode selectors, contiguous from [`MODE_C`]: exactly one is set on a real
+    /// row.
+    pub const NUM_SELECTORS: usize = 3;
+    pub const MULT0: usize = 9;
+    pub const MULT1: usize = 10;
+    pub const MULT2: usize = 11;
+    pub const PREP_WIDTH: usize = 12;
 }
 
 /// `LFM_KECCAK` — the keccak-f[1600] adapter: binds 13 machine words of state

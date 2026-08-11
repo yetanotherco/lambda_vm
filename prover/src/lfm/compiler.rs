@@ -196,10 +196,7 @@ pub fn compile(source: LfmProgramSource) -> LfmProgram {
             Instr::Hash {
                 mode, outs, mults, ..
             } => {
-                let num_outs = match mode {
-                    HashMode::Compress => 1,
-                    HashMode::Permute => 3,
-                };
+                let num_outs = if mode.is_two_to_one() { 1 } else { 3 };
                 for i in 0..num_outs {
                     mults[i] = take(outs[i], &mut written, &mut read_counts);
                 }
@@ -332,23 +329,25 @@ fn emit_column_groups(instrs: &[Instr], _public_len: u32) -> LfmColumnGroups {
                 outs,
                 mults,
             } => {
-                let (mode_c, mode_p) = match mode {
-                    HashMode::Compress => (FE::one(), FE::zero()),
-                    HashMode::Permute => (FE::zero(), FE::one()),
-                };
-                hash_rows.push(vec![
-                    fe(ins[0].0),
-                    fe(ins[1].0),
-                    fe(ins[2].0),
-                    fe(outs[0].0),
-                    fe(outs[1].0),
-                    fe(outs[2].0),
-                    mode_c,
-                    mode_p,
-                    fe(mults[0]),
-                    fe(mults[1]),
-                    fe(mults[2]),
-                ]);
+                // One-hot over the three modes. The AIR pins only the SUM to a
+                // bit; exactly-one-of is this emitter's job, re-checked by the
+                // admission validator.
+                let mut row = vec![FE::zero(); layout::hash::PREP_WIDTH];
+                row[layout::hash::IN_ADDR0] = fe(ins[0].0);
+                row[layout::hash::IN_ADDR1] = fe(ins[1].0);
+                row[layout::hash::IN_ADDR2] = fe(ins[2].0);
+                row[layout::hash::OUT_ADDR0] = fe(outs[0].0);
+                row[layout::hash::OUT_ADDR1] = fe(outs[1].0);
+                row[layout::hash::OUT_ADDR2] = fe(outs[2].0);
+                row[match mode {
+                    HashMode::Compress => layout::hash::MODE_C,
+                    HashMode::Transcript => layout::hash::MODE_T,
+                    HashMode::Permute => layout::hash::MODE_P,
+                }] = FE::one();
+                row[layout::hash::MULT0] = fe(mults[0]);
+                row[layout::hash::MULT1] = fe(mults[1]);
+                row[layout::hash::MULT2] = fe(mults[2]);
+                hash_rows.push(row);
             }
             Instr::KeccakF(op) => {
                 use layout::keccak as k;

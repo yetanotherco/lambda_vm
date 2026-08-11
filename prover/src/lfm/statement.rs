@@ -40,12 +40,13 @@ const LFM_STATEMENT_TAG: &[u8] = b"LAMBDAVM_LFM_STATEMENT_V1";
 /// proof — the authority on that shape.
 ///
 /// `hasher` is bound for the same reason and is the one piece of program shape
-/// the roots cannot carry: `LFM_HASH`'s preprocessed width is 11 under every
-/// candidate, so the commitments are hasher-independent by construction
-/// (`airs.rs`). Without this tag the only thing separating one permutation's
-/// machine from another's would be a main-trace width coincidence, which a
-/// third candidate could collide with. The tag is what makes two hashers two
-/// programs.
+/// the roots cannot carry: `LFM_HASH`'s preprocessed group is its INSTRUCTION
+/// group — addresses, mode selectors and multiplicities — which no candidate
+/// changes, so every hasher commits the same width (12 since `MODE_T`) and the
+/// commitments are hasher-independent by construction (`airs.rs`). Without this
+/// tag the only thing separating one permutation's machine from another's would
+/// be a main-trace width coincidence, which a third candidate could collide
+/// with. The tag is what makes two hashers two programs.
 pub fn lfm_program_id(
     roots: &[Commitment; NUM_LFM_CHIPS],
     log_heights: &[u8; NUM_LFM_CHIPS],

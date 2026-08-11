@@ -638,7 +638,8 @@ fn the_assembled_epoch_verifier_runs() {
     // on the felt-side reformulation — and the existing assert above already ties
     // `query_permutations` to the EMITTED count, so the chain reaches the emitter.
     use super::epoch_verify::{
-        KECCAK_RATE_FELTS, LFM_HASH_RATE_FELTS, group_leaf_felts, query_permutations_at_rate,
+        FRI_LEAF_FELTS, KECCAK_RATE_FELTS, LFM_HASH_RATE_FELTS, blocks_at_rate,
+        fri_leaf_permutations_at_rate, group_leaf_felts, query_permutations_at_rate,
     };
     for s in &real_lengths {
         assert_eq!(
@@ -646,13 +647,17 @@ fn the_assembled_epoch_verifier_runs() {
             super::epoch_verify::query_permutations(s),
             "the felt-side closed form must reproduce the byte-side one at keccak's rate"
         );
-        // The FRI-leaf term is rate-invariant only because a 48-byte pair is six
-        // felts. Assert the premise instead of trusting the comment that states it.
-        assert!(
-            s.fri.num_committed() == 0 || 6 <= LFM_HASH_RATE_FELTS,
-            "a FRI layer leaf must fit one block at the candidate's rate"
-        );
     }
+    // ⚠ A FRI layer leaf is six felts. It fits ONE keccak block and it does NOT
+    // fit one block at the candidate's rate — which was 8 under the deleted
+    // three-cell duplex and is 4 under the B1 compress chain. So the FRI leaf
+    // term is rate-SENSITIVE and is no longer part of the invariant remainder.
+    // The old premise assertion here (`6 <= LFM_HASH_RATE_FELTS`) is gone: it
+    // was true at 8, is false at 4, and re-asserting it would have pinned the
+    // model to a construction that no longer exists.
+    assert_eq!(blocks_at_rate(FRI_LEAF_FELTS, KECCAK_RATE_FELTS), 1);
+    assert_eq!(blocks_at_rate(FRI_LEAF_FELTS, LFM_HASH_RATE_FELTS), 2);
+
     let keccak_p = sum(&real_lengths, &|s| {
         query_permutations_at_rate(s, KECCAK_RATE_FELTS)
     });
@@ -660,17 +665,24 @@ fn the_assembled_epoch_verifier_runs() {
         query_permutations_at_rate(s, LFM_HASH_RATE_FELTS)
     });
     // Decompose so the penalty is attributed rather than asserted in aggregate.
-    let leaf_k = sum(&real_lengths, &|s| {
-        s.num_queries * super::epoch_verify::leaf_permutations_at_rate(&s.sub, KECCAK_RATE_FELTS)
-    });
-    let leaf_c = sum(&real_lengths, &|s| {
-        s.num_queries * super::epoch_verify::leaf_permutations_at_rate(&s.sub, LFM_HASH_RATE_FELTS)
-    });
-    let path_and_fri = keccak_p - leaf_k;
+    // The split is ABSORPTION vs COMPRESSION, not leaf vs rest: leaves of both
+    // kinds absorb and move with the rate, Merkle parents of both kinds
+    // compress and do not.
+    let absorb_at = |rate: usize| {
+        sum(&real_lengths, &|s| {
+            s.num_queries
+                * (super::epoch_verify::leaf_permutations_at_rate(&s.sub, rate)
+                    + fri_leaf_permutations_at_rate(&s.fri, rate))
+        })
+    };
+    let leaf_k = absorb_at(KECCAK_RATE_FELTS);
+    let leaf_c = absorb_at(LFM_HASH_RATE_FELTS);
+    let paths = keccak_p - leaf_k;
     assert_eq!(
         cand_p,
-        leaf_c + path_and_fri,
-        "only the leaf term may move with the rate"
+        leaf_c + paths,
+        "only ABSORPTION may move with the rate; compression (Merkle parents, \
+         trace trees and FRI path steps alike) must not"
     );
     assert!(
         cand_p > keccak_p,
@@ -694,15 +706,19 @@ fn the_assembled_epoch_verifier_runs() {
          trace lengths (no candidate permutation exists yet; this is shape \
          arithmetic only):\n\
          \x20 keccak   rate {KECCAK_RATE_FELTS:>2} felts/perm: {keccak_p:>9} permutations \
-         ({leaf_k} leaves + {path_and_fri} paths/FRI)\n\
+         ({leaf_k} absorbed + {paths} compressed)\n\
          \x20 LFM_HASH rate {LFM_HASH_RATE_FELTS:>2} felts/perm: {cand_p:>9} permutations \
-         ({leaf_c} leaves + {path_and_fri} paths/FRI)\n\
-         \x20 candidate/keccak = {:.4}x   (leaf term alone {:.4}x; the ceiling is \
-         17/8 = 2.125x and only absorption pays it)\n\
+         ({leaf_c} absorbed + {paths} compressed)\n\
+         \x20 candidate/keccak = {:.4}x   (absorption term alone {:.4}x; the \
+         ceiling is 17/{LFM_HASH_RATE_FELTS} = {:.3}x and only absorption pays it)\n\
          \x20 absorption-bound share of the keccak bill: {:.1}%   widest leaf: \
-         {widest} felts",
+         {widest} felts\n\
+         \x20 ⚠ the candidate rate is 4, not the 8 this model carried before \
+         option B1 — the compress chain absorbs ONE cell per step, so both the \
+         trace-group leaves and the 6-felt FRI-layer leaves take two blocks",
         cand_p as f64 / keccak_p as f64,
         leaf_c as f64 / leaf_k as f64,
+        KECCAK_RATE_FELTS as f64 / LFM_HASH_RATE_FELTS as f64,
         100.0 * leaf_k as f64 / keccak_p as f64,
     );
 
@@ -1213,4 +1229,70 @@ fn the_assembled_verifier_contains_every_composition_and_terminal_check() {
          terminals)",
         expected
     );
+}
+
+/// The rate model's corrected pieces, WITHOUT a real epoch.
+///
+/// The hash-matrix permutation-axis block that consumes these lives inside
+/// `the_assembled_epoch_verifier_runs`, which needs `fibonacci.elf`. That is
+/// exactly how `LFM_HASH_RATE_FELTS = 8` outlived the three-cell duplex it was
+/// derived from: nothing that ran in a bare checkout touched it. This test does,
+/// on shapes built by hand.
+///
+/// What it pins is the correction itself — the constant's derivation, and that
+/// the FRI-leaf term is rate-sensitive and still reduces to `num_committed()` at
+/// keccak's rate, which is the identity that keeps the felt-side and byte-side
+/// closed forms agreeing.
+#[test]
+fn the_candidate_rate_model_is_derived_not_remembered() {
+    use super::epoch_verify::{
+        FRI_LEAF_FELTS, KECCAK_RATE_FELTS, LFM_HASH_RATE_FELTS, blocks_at_rate,
+        fri_leaf_permutations_at_rate,
+    };
+    use super::fri::FriShape;
+    use super::hash::HASH_DIGEST_FELTS;
+
+    // The chain absorbs ONE cell per step, so the rate IS the digest width.
+    // Written as the derivation, not as a literal, because the literal is what
+    // went stale.
+    assert_eq!(LFM_HASH_RATE_FELTS, HASH_DIGEST_FELTS);
+    assert_eq!(LFM_HASH_RATE_FELTS, 4, "was 8 under the deleted duplex");
+
+    // ⚠ The premise the old model folded the FRI leaf into: "a layer leaf fits
+    // one block at the candidate's rate". True at 8, FALSE at 4.
+    assert_eq!(blocks_at_rate(FRI_LEAF_FELTS, KECCAK_RATE_FELTS), 1);
+    assert_eq!(blocks_at_rate(FRI_LEAF_FELTS, 8), 1, "the old rate did fit");
+    assert_eq!(blocks_at_rate(FRI_LEAF_FELTS, LFM_HASH_RATE_FELTS), 2);
+
+    let fri = FriShape {
+        log2_lde_length: 20,
+        blowup_log: 3,
+        final_poly_log_degree: 3,
+        coset_offset: 3,
+        num_queries: 73,
+    };
+    assert!(fri.num_committed() > 0, "the shape must exercise the term");
+
+    // At keccak's rate the new term reduces to the old `num_committed()`, which
+    // is why splitting it out did not move the rate-17 column.
+    assert_eq!(
+        fri_leaf_permutations_at_rate(&fri, KECCAK_RATE_FELTS),
+        fri.num_committed()
+    );
+    // At the candidate's rate it doubles — the cost the old model hid.
+    assert_eq!(
+        fri_leaf_permutations_at_rate(&fri, LFM_HASH_RATE_FELTS),
+        2 * fri.num_committed()
+    );
+
+    // A shape with nothing committed contributes nothing at any rate, so the
+    // correction cannot invent cost where there is no FRI leg.
+    let terminal = FriShape {
+        log2_lde_length: 6,
+        ..fri
+    };
+    assert_eq!(terminal.num_committed(), 0);
+    for rate in [KECCAK_RATE_FELTS, LFM_HASH_RATE_FELTS] {
+        assert_eq!(fri_leaf_permutations_at_rate(&terminal, rate), 0);
+    }
 }

@@ -26,7 +26,7 @@ use math::field::traits::IsPrimeField;
 use crate::tables::types::{FE, GoldilocksField};
 
 use super::compiler::{ColumnGroup, LfmColumnGroups, LfmProgram};
-use super::instr::{Addr, HashMode, Instr};
+use super::instr::{Addr, Instr};
 use super::layout;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -209,20 +209,17 @@ fn check_multiplicities(program: &LfmProgram) -> Result<(), LfmViolation> {
             Instr::Hash {
                 mode, outs, mults, ..
             } => {
-                let num_outs = match mode {
-                    HashMode::Compress => 1,
-                    HashMode::Permute => 3,
-                };
+                let num_outs = if mode.is_two_to_one() { 1 } else { 3 };
                 for i in 0..num_outs {
                     check(outs[i], mults[i])?;
                 }
-                // A `Compress` row's spare slots are outside `writes()` and so
+                // A two-to-one row's spare slots are outside `writes()` and so
                 // outside checks 1 and 4 — but they are inside the committed
                 // group and inside the bus. Pin them to the placeholders
                 // `instr.rs` documents, so "slot 0 only" is a checked property
                 // of the program and not a convention the emitter happens to
                 // follow.
-                if *mode == HashMode::Compress
+                if mode.is_two_to_one()
                     && (mults[1] != 0 || mults[2] != 0 || outs[1] != Addr(0) || outs[2] != Addr(0))
                 {
                     return Err(LfmViolation::CompressSlotNotPlaceholder { instr: idx });
@@ -303,7 +300,12 @@ fn check_groups(program: &LfmProgram) -> Result<(), LfmViolation> {
         layout::xalu::SEL_ADD,
         layout::xalu::NUM_SELECTORS,
     )?;
-    one_hot(&g.hash, "LFM_HASH", layout::hash::MODE_C, 2)?;
+    one_hot(
+        &g.hash,
+        "LFM_HASH",
+        layout::hash::MODE_C,
+        layout::hash::NUM_SELECTORS,
+    )?;
     one_hot(&g.lanes, "LFM_LANES", layout::lanes::MODE_PACK, 2)?;
     one_hot(&g.keccak, "LFM_KECCAK", layout::keccak::MODE_PERM, 2)?;
     flag_is_one(&g.select, "LFM_SELECT", layout::select::IS_REAL)?;
