@@ -11,7 +11,7 @@
 //! Standing-decisions rule 2 is why this exists: an execute-only test would
 //! prove nothing about the chip, because [`super::blake3::blake3_compress_6round`]
 //! and the chip's `ValueFlow` would simply agree with each other. Only a
-//! prove+verify makes the 769 constraints and the 1,259 interactions load
+//! prove+verify makes the chip's constraints and interactions load
 //! bearing, which is what turns the measured width into a *column*.
 //!
 //! # What this probe cannot see
@@ -48,9 +48,9 @@ use crate::tables::bitwise;
 use crate::tables::types::{BusId, FE, FEE, GoldilocksExtension, GoldilocksField, VmTable};
 use crate::test_utils::create_bitwise_air;
 
-use super::blake3::{CANONICAL_VECTORS, blake3_compress_6round};
+use super::blake3::{BLAKE3_ROUNDS, CANONICAL_VECTORS, canonical_expected_out};
 use super::blake3_chip::{
-    self, Blake3LfmConstraints, Blake3Operation, IN_WORDS, MAIN_COLUMNS, NUM_CONSTRAINTS,
+    self, Blake3LfmConstraints, Blake3Operation, IN_WORDS, MAIN_COLUMNS, NUM_CONSTRAINTS, NUM_G,
     OUT_WORDS, cols,
 };
 use super::commit::commit_columns;
@@ -319,50 +319,101 @@ fn assert_not_accepted(what: &str, mutate: impl FnOnce(&mut TraceTable<F, E>)) {
 // The measurement
 // =========================================================================
 
-/// The blake column's per-compression cell law, on our stack.
+/// The blake column's per-compression cell law, on our stack, at BOTH round
+/// counts.
 ///
 /// `main + 3·aux` with `aux = ceil(interactions / 2)` is `airs.rs`'s census
 /// formula — the same instrument that produced the keccak and Poseidon columns,
 /// so the three are comparable by construction rather than by argument.
+///
+/// The closed forms are written out as functions of the round count and the
+/// literals for both are pinned, so the A6R price stays visible whichever way
+/// the build is compiled; the built layout is then asserted to equal the
+/// prediction at the compiled count. Two statements that can disagree.
 #[test]
-fn the_hosted_chip_costs_4946_base_field_equivalent_cells_per_compression() {
+fn the_hosted_chip_cell_budget_at_both_round_counts() {
+    // 112 input bytes + `8·rounds` G-blocks of 60 + 64 feed-forward bytes.
+    const fn predicted_main(rounds: usize) -> usize {
+        112 + 60 * (8 * rounds) + 64
+    }
+    // 11 `LfmMem` tokens; `ByteAlu[XOR]` over `4·8·rounds` mixing words and 16
+    // feed-forward words; `AreBytes` over `2·8·rounds` rotations; 32 message.
+    const fn predicted_interactions(rounds: usize) -> usize {
+        11 + 4 * (4 * (8 * rounds) + 16) + 4 * (2 * (8 * rounds)) + 32
+    }
+    const fn predicted_cells(rounds: usize) -> usize {
+        predicted_main(rounds) + 3 * predicted_interactions(rounds).div_ceil(2)
+    }
+
+    // 6 rounds — the A6R variant. These four literals are #903's and were the
+    // measured figures before the round count became a knob.
+    assert_eq!(predicted_main(6), 3_056);
+    assert_eq!(predicted_interactions(6), 1_259);
+    assert_eq!(predicted_interactions(6).div_ceil(2), 630);
+    assert_eq!(predicted_cells(6), 4_946);
+    // Group by group at 6 rounds, so a layout change cannot move the total
+    // silently: 11 LfmMem + 832 ByteAlu + 384 shift AreBytes + 32 message.
+    assert_eq!(predicted_interactions(6), 11 + 832 + 384 + 32);
+
+    // 7 rounds — standard BLAKE3, the default. PLAN §7 predicted exactly these
+    // on paper; this is the same arithmetic against the built layout.
+    assert_eq!(predicted_main(7), 3_536);
+    assert_eq!(predicted_interactions(7), 1_451);
+    assert_eq!(predicted_interactions(7).div_ceil(2), 726);
+    assert_eq!(predicted_cells(7), 5_714);
+
+    // The built layout IS the prediction at the compiled round count.
     let interactions = blake3_chip::bus_interactions().len();
     let aux = interactions.div_ceil(2);
-
-    // Column budget, block by block, so a layout change cannot move the total
-    // silently.
     assert_eq!(cols::PREP_WIDTH, 16, "preprocessed prefix");
     assert_eq!(cols::G - cols::IN, 112, "input bytes");
-    assert_eq!(cols::OUT - cols::G, 2_880, "48 G-blocks × 60 cells");
+    assert_eq!(cols::OUT - cols::G, 60 * NUM_G, "G-blocks × 60 cells");
     assert_eq!(
         cols::NUM_COLUMNS - cols::OUT,
         64,
         "feed-forward output bytes"
     );
-    assert_eq!(cols::NUM_COLUMNS, 3_072);
-    assert_eq!(MAIN_COLUMNS, 3_056);
-
-    // Interaction budget, group by group.
+    assert_eq!(MAIN_COLUMNS, predicted_main(BLAKE3_ROUNDS));
+    assert_eq!(cols::NUM_COLUMNS, MAIN_COLUMNS + cols::PREP_WIDTH);
     assert_eq!(IN_WORDS + OUT_WORDS, 11, "LfmMem tokens");
-    assert_eq!(interactions, 11 + 832 + 384 + 32);
-    assert_eq!(interactions, 1_259);
-    assert_eq!(aux, 630);
+    assert_eq!(interactions, predicted_interactions(BLAKE3_ROUNDS));
+    assert_eq!(
+        MAIN_COLUMNS + 3 * aux,
+        predicted_cells(BLAKE3_ROUNDS),
+        "base-field-equivalent cells"
+    );
 
-    assert_eq!(MAIN_COLUMNS + 3 * aux, 4_946, "base-field-equivalent cells");
-
-    // #903's syscall variant, for the delta the hosting buys: 3,219 main and
-    // 1,397 interactions (699 aux) = 5,316. The difference is entirely I/O.
+    // #903's syscall variant at 6 rounds, for the delta the hosting buys: 3,219
+    // main and 1,397 interactions (699 aux) = 5,316. The difference is all I/O.
     assert_eq!(3_219 + 3 * 1_397usize.div_ceil(2), 5_316);
+
+    // For the comparison this chip exists to support: the `LFM_HASH` BLAKE3
+    // socket arm costs 4,741 at 6 rounds and 5,509 at 7 (pinned in
+    // `blake3_socket_tests`), so hosting behind the frozen socket is cheaper at
+    // both round counts — a constant initial state, a constant `m[8..16]`, and
+    // twelve of the sixteen output words never built.
 }
 
 /// Every constraint index is emitted exactly once, and the count is the one the
 /// module documents. #903 emits 814; the 45 address-derivation constraints have
 /// no counterpart here.
 #[test]
-fn the_chip_emits_769_constraints_at_degree_3() {
-    assert_eq!(NUM_CONSTRAINTS, 769);
-    assert_eq!(814 - 45, NUM_CONSTRAINTS, "vs #903's syscall variant");
-    assert_eq!(NUM_CONSTRAINTS, 3 * 96 + 96 + 4 * 96 + 1);
+fn the_chip_emits_its_constraints_at_degree_3() {
+    // 16 per G-instance — two add3s (a sum identity and two carry booleanities
+    // each), two add2 carry booleanities, two rotations of four — plus the
+    // ungated `IS_BIT(MU)`. 769 at 6 rounds, 897 at 7; both written out.
+    assert_eq!(16 * (8 * 6) + 1, 769);
+    assert_eq!(16 * (8 * 7) + 1, 897);
+    assert_eq!(NUM_CONSTRAINTS, 16 * NUM_G + 1);
+    assert_eq!(
+        NUM_CONSTRAINTS,
+        3 * (NUM_G * 2) + NUM_G * 2 + 4 * (NUM_G * 2) + 1
+    );
+    // #903's syscall variant emits 814 at 6 rounds; the 45 address-derivation
+    // constraints have no counterpart here.
+    if BLAKE3_ROUNDS == 6 {
+        assert_eq!(814 - 45, NUM_CONSTRAINTS, "vs #903's syscall variant");
+    }
 
     let set = Blake3LfmConstraints;
     let meta = ConstraintSet::<F, E>::meta(&set);
@@ -407,8 +458,12 @@ fn the_hosted_chip_proves_and_verifies() {
     // The chip's OUT columns are the real compression, byte for byte, against
     // the canonical vectors.
     for (row, op) in ops.iter().enumerate() {
-        let expected = blake3_compress_6round(&op.h, &op.m, op.t, op.block_len, op.flags);
-        assert_eq!(expected, CANONICAL_VECTORS[row].out, "op {row} is a vector");
+        let expected = canonical_expected_out(row);
+        assert_eq!(
+            expected,
+            blake3_chip::Blake3Operation::output_words(op),
+            "op {row}'s output must be the primitive's at the compiled round count"
+        );
         for (i, &word) in expected.iter().enumerate() {
             for b in 0..4 {
                 assert_eq!(
@@ -420,12 +475,24 @@ fn the_hosted_chip_proves_and_verifies() {
         }
     }
 
-    // The BITWISE feed is exactly the senders' count: 1,248 per compression,
-    // with no address-shaped lookups.
+    // The BITWISE feed is exactly the senders' count, with no address-shaped
+    // lookups: 1,248 per compression at 6 rounds and 1,440 at 7. Both literals
+    // are written out so the flip cannot quietly move the feed.
+    const fn predicted_bitwise(rounds: usize) -> usize {
+        4 * (4 * (8 * rounds) + 16) + 4 * (2 * (8 * rounds)) + 32
+    }
+    assert_eq!(predicted_bitwise(6), 1_248);
+    assert_eq!(predicted_bitwise(7), 1_440);
     assert_eq!(
         blake3_chip::bitwise_ops_for(&ops).len(),
-        ops.len() * 1_248,
+        ops.len() * predicted_bitwise(BLAKE3_ROUNDS),
         "per-compression BITWISE lookup count"
+    );
+    // And it is the interaction list less the 11 `LfmMem` tokens — the mirror
+    // property, which is what stops the feed and the senders from drifting.
+    assert_eq!(
+        predicted_bitwise(BLAKE3_ROUNDS) + 11,
+        blake3_chip::bus_interactions().len()
     );
 
     assert_eq!(round_trip(|_| {}), Ok(true), "honest proof must verify");
@@ -738,7 +805,15 @@ fn the_blake_column_and_the_residue_split() {
         projected_gib(total, sub_proofs),
     );
     // Blake keeps the byte-oriented residue AND the BITWISE table it looks up in.
-    row("BLAKE3-6r (MEASURED chip)", 4_946, residue, bitwise);
+    // The label and the figure follow the compiled round count, so a sweep
+    // cannot leave this row naming one variant and pricing another.
+    let blake_cells = (MAIN_COLUMNS + 3 * blake3_chip::bus_interactions().len().div_ceil(2)) as u64;
+    let blake_label = if BLAKE3_ROUNDS == 6 {
+        "BLAKE3-6r (MEASURED chip)"
+    } else {
+        "BLAKE3-7r (MEASURED chip)"
+    };
+    row(blake_label, blake_cells, residue, bitwise);
     // Field-native candidates delete both. Poseidon-original's 621 is wave 9's
     // measured column; RPO's 152 and Monolith's ~850 stay INHERITED estimates.
     row("Poseidon-orig (w9 MEASURED)", 621, residue_field_native, 0);
@@ -821,7 +896,7 @@ fn the_delegation_topology_priced_against_in_machine_hosting() {
             is_ext: false,
         },
         GroupShape {
-            num_columns: 630,
+            num_columns: blake3_chip::bus_interactions().len().div_ceil(2),
             is_ext: true,
         },
         GroupShape {
@@ -856,7 +931,8 @@ fn the_delegation_topology_priced_against_in_machine_hosting() {
     );
     let (bw_pq, bw_total) = verify_cost(&bitwise_groups, 20, log2_blowup, fri_per_query, queries);
 
-    let cells_per_compression = MAIN_COLUMNS as u64 + 3 * 630;
+    let blake_aux = blake3_chip::bus_interactions().len().div_ceil(2);
+    let cells_per_compression = MAIN_COLUMNS as u64 + 3 * blake_aux as u64;
     let delegation_trace =
         (compressions as f64 * 1.01871).ceil() as u64 * cells_per_compression + 26_214_400; // its own BITWISE table
 
@@ -870,7 +946,7 @@ fn the_delegation_topology_priced_against_in_machine_hosting() {
          \x20              hash competes with nothing for space.\n\n\
          \x20 DELEGATED    (a) the delegation proof's own trace, LFM_BLAKE3 + BITWISE  {delegation_trace:>12} cells\n\
          \x20              (b) verifying it inside the epoch verifier:\n\
-         \x20                  LFM_BLAKE3 AIR (2^{log2_blake_trace} rows, {MAIN_COLUMNS} main + 630 aux) \
+         \x20                  LFM_BLAKE3 AIR (2^{log2_blake_trace} rows, {MAIN_COLUMNS} main + {blake_aux} aux) \
          {blake_pq:>6}/query x {queries} = {blake_total:>8} compressions\n\
          \x20                  BITWISE AIR    (2^20 rows, 10 main + 5 aux)          \
          {bw_pq:>6}/query x {queries} = {bw_total:>8} compressions\n\

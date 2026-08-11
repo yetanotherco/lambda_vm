@@ -9,6 +9,7 @@ use crate::tables::types::{FE, GoldilocksExtension, GoldilocksField};
 
 use crate::tables::{bitwise, keccak_rc, keccak_rnd};
 
+use super::blake3_socket;
 use super::chips::{balu, bitdec, const_, hash, hint, keccak, lanes, public, select, xalu};
 use super::compiler::{ColumnGroup, LfmProgram};
 use super::executor::LfmRecords;
@@ -175,6 +176,24 @@ pub fn build_traces_with_hasher(
     histogram.add_ops(&keccak_adapter::bitwise_ops_for(&keccak_ops));
     // Absorb rows additionally send one BYTE_ALU[XOR] lookup per rate byte.
     histogram.add_ops(&keccak_adapter::absorb_bitwise_ops(&records.keccak));
+    // Under BLAKE3 the hash chip is a BITWISE consumer too — over a thousand
+    // lookups per compression. Every other hasher sends none, so this is the
+    // one place the shared table's multiplicities depend on the hash choice.
+    if hasher == HasherKind::Blake3 {
+        let rows: Vec<([u32; 4], [u32; 4])> = records
+            .hash
+            .iter()
+            .map(|r| {
+                let cell =
+                    |k: usize| -> super::word::LfmWord { core::array::from_fn(|i| r.ins[k + i]) };
+                (
+                    blake3_socket::lanes_of(&cell(0)).expect("compress lane is a u32 (O1)"),
+                    blake3_socket::lanes_of(&cell(4)).expect("compress lane is a u32 (O1)"),
+                )
+            })
+            .collect();
+        histogram.add_ops(&blake3_socket::bitwise_ops_for(&rows));
+    }
     let mut bitwise_trace = bitwise::generate_bitwise_trace();
     histogram.fill_multiplicities(&mut bitwise_trace);
 
@@ -219,8 +238,10 @@ pub fn build_traces_with_hasher(
                 };
             }
             out[hash::cols::OUT0..hash::cols::OUT0 + 12].copy_from_slice(&r.outs);
-            if hasher == HasherKind::Poseidon {
-                fill_poseidon_witness(out);
+            match hasher {
+                HasherKind::Test => {}
+                HasherKind::Poseidon => fill_poseidon_witness(out),
+                HasherKind::Blake3 => blake3_socket::fill_socket_witness(out),
             }
         }),
         keccak: chip_trace(&g.keccak, keccak::cols::NUM_COLUMNS, |row, out| {

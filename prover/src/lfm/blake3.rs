@@ -52,8 +52,37 @@ pub const BLAKE3_IV: [u32; 8] = [
 pub const BLAKE3_MSG_PERMUTATION: [usize; 16] =
     [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8];
 
-/// Rounds of the internal variant. 6, per #903's design; standard BLAKE3 is 7.
-pub const BLAKE3_ROUNDS: usize = 6;
+/// Rounds of *standard* BLAKE3. At this value [`blake3_compress_rounds`] is
+/// bit-for-bit the published compression function — the property the whole
+/// external-anchor argument rests on, pinned by
+/// `tests::seven_rounds_is_the_blake3_crate`.
+pub const BLAKE3_STANDARD_ROUNDS: usize = 7;
+
+/// Rounds of the 6-round internal variant. Reachable only through the
+/// `blake3-6round` feature; [`CANONICAL_VECTORS`] pin it unconditionally.
+pub const BLAKE3_SIX_ROUNDS: usize = 6;
+
+/// The round count every BLAKE3 chip in this tree is compiled for — the
+/// standalone `LFM_BLAKE3` probe and the `LFM_HASH` socket arm alike. They share
+/// one knob deliberately: two would let a sweep leave the two chips describing
+/// different hashes.
+///
+/// **7 by default**, i.e. standard BLAKE3, which is what the A6R sign-off
+/// instantiates. At 7 rounds the `blake3` crate is a direct known-answer test
+/// for the primitive *and* for the socket, and no unratified assumption is
+/// carried. `--features blake3-6round` selects the 6-round internal variant:
+/// the measured performance variant, resting on **A6R**.
+///
+/// It is a compile-time constant rather than a parameter because both chips'
+/// column layouts are `8 · rounds` G-blocks wide and their width functions are
+/// `const fn`. The round count is the ONLY thing it varies — the G function, the
+/// message schedule, the counter split and the feed-forward are fixed — which is
+/// what lets the 7-round anchor certify the whole code path rather than a
+/// separate 7-round copy of it.
+#[cfg(not(feature = "blake3-6round"))]
+pub const BLAKE3_ROUNDS: usize = BLAKE3_STANDARD_ROUNDS;
+#[cfg(feature = "blake3-6round")]
+pub const BLAKE3_ROUNDS: usize = BLAKE3_SIX_ROUNDS;
 
 /// The BLAKE3 quarter-round G (spec §2.1).
 #[inline]
@@ -83,6 +112,24 @@ pub fn blake3_compress_6round(
     block_len: u32,
     flags: u32,
 ) -> [u32; 16] {
+    blake3_compress_rounds(h, m, t, block_len, flags, BLAKE3_SIX_ROUNDS)
+}
+
+/// [`blake3_compress_6round`] with the round count as an argument.
+///
+/// The round count is the *only* parameter: everything else — the G function,
+/// the message schedule, the counter split, the feed-forward — is fixed. That
+/// is what makes `rounds = BLAKE3_STANDARD_ROUNDS` an external anchor for the
+/// whole code path rather than for a separate 7-round copy of it, and it is why
+/// this is one function with a loop bound instead of two functions.
+pub fn blake3_compress_rounds(
+    h: &[u32; 8],
+    m: &[u32; 16],
+    t: u64,
+    block_len: u32,
+    flags: u32,
+    rounds: usize,
+) -> [u32; 16] {
     let mut v: [u32; 16] = [
         h[0],
         h[1],
@@ -103,7 +150,7 @@ pub fn blake3_compress_6round(
     ];
 
     let mut m = *m;
-    for r in 0..BLAKE3_ROUNDS {
+    for r in 0..rounds {
         // Mix the columns.
         blake3_g(&mut v, 0, 4, 8, 12, m[0], m[1]);
         blake3_g(&mut v, 1, 5, 9, 13, m[2], m[3]);
@@ -116,7 +163,7 @@ pub fn blake3_compress_6round(
         blake3_g(&mut v, 3, 4, 9, 14, m[14], m[15]);
         // Permute between rounds; the permute after the last round is never
         // consumed (oracle: `r < rounds - 1`).
-        if r < BLAKE3_ROUNDS - 1 {
+        if r < rounds - 1 {
             let prev = m;
             for (i, &p) in BLAKE3_MSG_PERMUTATION.iter().enumerate() {
                 m[i] = prev[p];
@@ -341,6 +388,85 @@ pub const CANONICAL_VECTORS: [Vector; 10] = [
     },
 ];
 
+/// The same ten inputs as [`CANONICAL_VECTORS`], at **7 rounds** — that is,
+/// under standard BLAKE3's compression function.
+///
+/// Provenance, and it is a rung stronger than the 6-round table's: these were
+/// emitted by the gate-oracle's independently-written Python reference
+/// (`thoughts/shared/lfm-real-hash/gate-oracle/blake3_oracle.py`) at
+/// `rounds = 7` and cross-checked word-for-word against the second in-repo
+/// reference (`thoughts/blake3/blake3-oracle/blake3_ref.py`) — two
+/// implementations, agreeing on all ten. Both references' 7-round paths are
+/// themselves pinned by the OFFICIAL BLAKE3 test vectors, so unlike
+/// [`CANONICAL_VECTORS`] this table has an external anchor rather than one a
+/// step removed. The same generation run re-derived the 6-round table and
+/// reproduced it 10/10, which is what ties the two together.
+///
+/// Only the outputs are stored: the inputs are [`CANONICAL_VECTORS`]'s, and
+/// duplicating them would be a second place for them to drift.
+pub const CANONICAL_OUT_7ROUND: [[u32; 16]; 10] = [
+    [
+        0xEE79E5DC, 0xEA647B8C, 0x964C097E, 0xE2F3383A, 0xFE2E6D00, 0x78EE613A, 0xC33C8572,
+        0xCD444391, 0x0C890604, 0xC3209591, 0x45633FF8, 0xCB171C6A, 0x760247AE, 0xF6D0FC1E,
+        0xCD550F20, 0xCD54BF83,
+    ],
+    [
+        0xD68593D0, 0xDBC8157A, 0xF6E1687C, 0x52A60555, 0xB56D418A, 0x0CCBB863, 0xADBFB51E,
+        0x8BF7D125, 0x75C23432, 0xF484D7A6, 0x06E85F4A, 0x2771FE96, 0x00F6E24D, 0x48368A3E,
+        0x04EE7E88, 0x501D8539,
+    ],
+    [
+        0xBC92D7C4, 0x56542092, 0x3490E2CB, 0x2E3328CD, 0x13E3746F, 0xA5B88E66, 0x2B5FE530,
+        0x92C7AD52, 0xFF502AE5, 0x1F088FBF, 0x9163752F, 0x8A0C8B4D, 0xB557B0E8, 0xE76F23CB,
+        0xD054C959, 0x74813CFD,
+    ],
+    [
+        0xCF4FB929, 0x1DBADE2A, 0x70E63AAF, 0x2E0FFB48, 0x60123045, 0x798AEAE8, 0x5A911D30,
+        0x15977C61, 0x6F7C8334, 0x5EB0BCE2, 0xAB240F17, 0x66B7A3CD, 0xA9064E0B, 0x6AC4747B,
+        0x1206F62B, 0x9F3E91EC,
+    ],
+    [
+        0xFF525F0F, 0xD892E3D2, 0xFB566B40, 0x3BDF4ED0, 0x78B961CD, 0x9CB86B48, 0x6AB54F3D,
+        0x3EF5F695, 0xBD896ED8, 0x6265AC08, 0xF6695D78, 0x9F3795EA, 0x943E0342, 0xD1437B3B,
+        0x4F6BAF78, 0x85DFD2C9,
+    ],
+    [
+        0xD22912BB, 0x627F992C, 0xE883AF5D, 0x50E58A48, 0xF3D071C6, 0xB20D47A4, 0x29011151,
+        0xFE50E232, 0x594B76A3, 0x8706296B, 0x2C1D1E31, 0x6A478D0D, 0x64004E61, 0xA072DA1E,
+        0xAB3FCA42, 0x09BB269E,
+    ],
+    [
+        0xA101CEAB, 0x9232E0EC, 0x2FE4B24E, 0x35F7F4FE, 0x61A5AB42, 0xBE417503, 0xEB740D5E,
+        0x8BB2FE96, 0xC6863DA9, 0x1F31FF5D, 0x5763EA12, 0xDC862699, 0x1A60ADE2, 0x9E3E6745,
+        0xE3C8F87E, 0xD3EFB0EA,
+    ],
+    [
+        0x318604BE, 0x22A35843, 0x6CA63195, 0xA2E7E2F8, 0x48769A04, 0xC462F1E3, 0x5CF053C7,
+        0xFD1EE629, 0x69366332, 0x0ACC819B, 0xBBD2456A, 0xF1DA9DB6, 0x4A7B7D68, 0x6DD1A843,
+        0x61555466, 0xBDA36F28,
+    ],
+    [
+        0x87584719, 0x15C73090, 0x851C1A4A, 0x99D21014, 0x821A82A8, 0xC7307CD5, 0x6797EFE2,
+        0xCF38CEDF, 0x777C177D, 0x202BE3EA, 0x19421985, 0x3176132D, 0x7BB8BC22, 0x65C9804B,
+        0x22C68EA3, 0x92504162,
+    ],
+    [
+        0xDC60D189, 0xE6311F18, 0x9DC3E078, 0x304BB43E, 0x5C616E7D, 0xE168D00F, 0x2E197872,
+        0x175B9188, 0x5A99C462, 0xEF311A88, 0xC61836FD, 0x9FFD4DE3, 0x36AE4940, 0x4D813D81,
+        0x9B058DA9, 0x9017D38C,
+    ],
+];
+
+/// The 16-word output of `CANONICAL_VECTORS[i]` at the compiled-in
+/// [`BLAKE3_ROUNDS`] — what a chip built from this module must produce.
+pub const fn canonical_expected_out(i: usize) -> [u32; 16] {
+    if BLAKE3_ROUNDS == BLAKE3_STANDARD_ROUNDS {
+        CANONICAL_OUT_7ROUND[i]
+    } else {
+        CANONICAL_VECTORS[i].out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,10 +484,15 @@ mod tests {
         rounds: usize,
     }
 
+    /// The conventions [`CANONICAL_VECTORS`] were generated under. `rounds` is
+    /// [`BLAKE3_SIX_ROUNDS`], not [`BLAKE3_ROUNDS`]: that table pins the 6-round
+    /// variant whatever the build is compiled for, and reading the knob here
+    /// would make the "7 rounds" control below silently stop discriminating at
+    /// the default.
     const CANONICAL: Conventions = Conventions {
         rot: [16, 12, 8, 7],
         perm: BLAKE3_MSG_PERMUTATION,
-        rounds: BLAKE3_ROUNDS,
+        rounds: BLAKE3_SIX_ROUNDS,
     };
 
     /// A deliberately *parameterised* compression, used only to build negative
@@ -511,6 +642,137 @@ mod tests {
                 "{what} still reproduces the canonical vector — the vector does not pin it"
             );
         }
+    }
+
+    /// The port reproduces all ten canonical inputs at **7 rounds** too.
+    ///
+    /// [`CANONICAL_OUT_7ROUND`] came from two independently-written Python
+    /// references that agree on all ten, and whose 7-round paths are pinned by
+    /// the official BLAKE3 vectors. So this is the same shape of check as the
+    /// 6-round one above but with a stronger source, and together they are what
+    /// let `BLAKE3_ROUNDS` be flipped without the chip losing its vector pin.
+    #[test]
+    fn the_compression_matches_the_canonical_vectors_at_seven_rounds() {
+        for (i, v) in CANONICAL_VECTORS.iter().enumerate() {
+            assert_eq!(
+                blake3_compress_rounds(
+                    &v.h,
+                    &v.m,
+                    v.t,
+                    v.block_len,
+                    v.flags,
+                    BLAKE3_STANDARD_ROUNDS
+                ),
+                CANONICAL_OUT_7ROUND[i],
+                "7-round canonical vector {i}"
+            );
+        }
+    }
+
+    /// NEGATIVE CONTROL: the two tables really are different data. Without this,
+    /// a generation bug that emitted the 6-round outputs twice would leave the
+    /// test above passing and pinning nothing new.
+    #[test]
+    fn the_six_and_seven_round_vector_tables_differ_everywhere() {
+        for (i, v) in CANONICAL_VECTORS.iter().enumerate() {
+            assert_ne!(v.out, CANONICAL_OUT_7ROUND[i], "vector {i}");
+        }
+    }
+
+    /// `canonical_expected_out` selects the table matching the compiled knob.
+    /// This is the accessor `blake3_probe` asserts the chip's `OUT` columns
+    /// against, so a wrong branch here would silently unpin the chip.
+    #[test]
+    fn canonical_expected_out_follows_the_round_knob() {
+        for (i, v) in CANONICAL_VECTORS.iter().enumerate() {
+            let want = if BLAKE3_ROUNDS == BLAKE3_STANDARD_ROUNDS {
+                CANONICAL_OUT_7ROUND[i]
+            } else {
+                v.out
+            };
+            assert_eq!(canonical_expected_out(i), want, "vector {i}");
+            assert_eq!(
+                canonical_expected_out(i),
+                blake3_compress_rounds(&v.h, &v.m, v.t, v.block_len, v.flags, BLAKE3_ROUNDS),
+                "the accessor must agree with the primitive at the compiled round count"
+            );
+        }
+    }
+
+    /// ★ **The external anchor, direct.** At 7 rounds this module's compression
+    /// function IS standard BLAKE3, checked against the `blake3` crate with no
+    /// oracle, no JSON and no transcription in between.
+    ///
+    /// PLAN §2.2 step 4 asked for exactly this and Phase 1 deferred it for want
+    /// of a cargo dependency; this is that check, discharged. A message of at
+    /// most 64 bytes is one chunk and one block, so the whole tree hasher
+    /// collapses to a single `f` invocation: `h = IV`, the block zero-padded to
+    /// 64 bytes and read as 16 little-endian words, `t = 0`, `block_len` the
+    /// true length, `flags = CHUNK_START|CHUNK_END|ROOT`. The 32-byte digest is
+    /// `out[0..8]` in little-endian order.
+    ///
+    /// It runs over 65 lengths (0..=64) rather than one, because the length is
+    /// what `block_len` and the padding both key off, and a port that ignored
+    /// `block_len` would still pass at a single length.
+    #[test]
+    fn seven_rounds_is_the_blake3_crate() {
+        const CHUNK_START: u32 = 1;
+        const CHUNK_END: u32 = 2;
+        const ROOT: u32 = 8;
+
+        for len in 0..=64usize {
+            let msg: Vec<u8> = (0..len)
+                .map(|i| (i as u8).wrapping_mul(37).wrapping_add(11))
+                .collect();
+            let mut block = [0u8; 64];
+            block[..len].copy_from_slice(&msg);
+            let words: [u32; 16] = core::array::from_fn(|i| {
+                u32::from_le_bytes(block[4 * i..4 * i + 4].try_into().unwrap())
+            });
+
+            let out = blake3_compress_rounds(
+                &BLAKE3_IV,
+                &words,
+                0,
+                len as u32,
+                CHUNK_START | CHUNK_END | ROOT,
+                BLAKE3_STANDARD_ROUNDS,
+            );
+            let mut ours = [0u8; 32];
+            for i in 0..8 {
+                ours[4 * i..4 * i + 4].copy_from_slice(&out[i].to_le_bytes());
+            }
+
+            assert_eq!(
+                ours,
+                *blake3::hash(&msg).as_bytes(),
+                "7-round compression must equal the blake3 crate at length {len}"
+            );
+        }
+    }
+
+    /// NEGATIVE CONTROL for the anchor above: at 6 rounds it must NOT match.
+    ///
+    /// Without this, `seven_rounds_is_the_blake3_crate` would pass just as well
+    /// if `rounds` were being ignored — which is the one bug that would make the
+    /// whole external-anchor argument vacuous, since the 6-round variant's only
+    /// defence is "the same code path with the loop bound changed".
+    #[test]
+    fn six_rounds_is_not_the_blake3_crate() {
+        let msg: [u8; 36] = core::array::from_fn(|i| i as u8);
+        let mut block = [0u8; 64];
+        block[..36].copy_from_slice(&msg);
+        let words: [u32; 16] = core::array::from_fn(|i| {
+            u32::from_le_bytes(block[4 * i..4 * i + 4].try_into().unwrap())
+        });
+        // BLAKE3_SIX_ROUNDS, not BLAKE3_ROUNDS: the knob defaults to 7, and
+        // reading it here would turn this control into a copy of the anchor.
+        let out = blake3_compress_rounds(&BLAKE3_IV, &words, 0, 36, 1 | 2 | 8, BLAKE3_SIX_ROUNDS);
+        let mut ours = [0u8; 32];
+        for i in 0..8 {
+            ours[4 * i..4 * i + 4].copy_from_slice(&out[i].to_le_bytes());
+        }
+        assert_ne!(ours, *blake3::hash(&msg).as_bytes());
     }
 
     /// The counter split is load-bearing and full-width: `t` reaches the state

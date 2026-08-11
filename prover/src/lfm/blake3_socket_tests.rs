@@ -1,0 +1,1198 @@
+//! The BLAKE3 arm of `LFM_HASH`: its framing, its layout, its degree bound,
+//! what it accepts, what it rejects, and the prove+verify that turns a
+//! predicted cell count into a measured one.
+//!
+//! ## What pins what
+//!
+//! Three layers, and they are deliberately not the same evidence:
+//!
+//! 1. **The primitive** is pinned elsewhere, to the `blake3` crate:
+//!    `blake3::tests::seven_rounds_is_the_blake3_crate`. Nothing here re-checks
+//!    the G function or the message schedule.
+//! 2. **The framing** — the six choices between "a correct `f`" and "a correct
+//!    2-to-1 compress" — is pinned here by [`SOCKET_VECTORS`], which came from
+//!    two independent generators, plus one negative control per choice. A right
+//!    constant inside a wrong framing is the normal way this goes wrong, and
+//!    every primitive test stays green while it happens.
+//! 3. **The chip** is pinned here too: that `NUM_CONSTRAINTS` constraints over
+//!    `MAIN_COLUMNS` value columns say exactly what that framing says, and that
+//!    they say it inside a real proof produced by the production prover.
+//!
+//! ## What this suite cannot see
+//!
+//! It says nothing about the machine's DEFAULT hash, which is still
+//! `TestPermutation`; every test constructs the BLAKE3 configuration
+//! explicitly. And it covers `compress` only, because that is the only socket
+//! specified — see `blake3_socket`'s module docs.
+
+use math::field::element::FieldElement;
+use stark::constraints::builder::{
+    CaptureBuilder, ConstraintSet, ProverEvalFolder, RootKind, num_base_from_meta,
+};
+use stark::frame::Frame;
+use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};
+use stark::table::TableView;
+use stark::trace::TraceTable;
+use stark::traits::TransitionEvaluationContext;
+
+use crate::tables::types::{FE, GoldilocksExtension, GoldilocksField, VmTable};
+
+use super::airs::lfm_chip_census_with_hasher;
+use super::blake3::{BLAKE3_IV, BLAKE3_MSG_PERMUTATION};
+use super::blake3_socket::{
+    self, BLOCK_LEN_LFMC, Blake3Permutation, COUNTER_LFMC, FLAGS_LFMC, MAIN_COLUMNS,
+    NUM_CONSTRAINTS, NUM_G, SOCKET_ROUNDS, TAG_LFMC, cols, lanes_of, socket_digest,
+    socket_digest_rounds, word_of,
+};
+use super::blake3_socket_kats::SOCKET_VECTORS;
+use super::builder::{Cell, LfmBuilder, LfmProgramSource};
+use super::chips::hash::{self, HashConstraints};
+use super::compiler::{LfmProgram, compile};
+use super::executor::{LfmExecError, execute};
+use super::hash::{HASH_STATE_FELTS, HasherKind, LfmHasher};
+use super::instr::HashMode;
+use super::programs::trivial_program;
+use super::proof::{lfm_prove_with_hasher, prove_traces_with_hasher, verify_against};
+use super::registry::{build_artifacts, build_artifacts_with_hasher};
+use super::trace::build_traces_with_hasher;
+use super::word::LfmWord;
+
+type F = GoldilocksField;
+type E = GoldilocksExtension;
+
+const KIND: HasherKind = HasherKind::Blake3;
+
+fn options() -> ProofOptions {
+    GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is valid")
+}
+
+// =========================================================================
+// The closed-form budget, written out for BOTH round counts
+// =========================================================================
+
+/// Value columns per compression, as a function of the round count.
+///
+/// Written as a formula over named blocks rather than taken from the layout,
+/// because a closed form taken from the code under test would agree with any
+/// layout, including a wrong one. 28 shared prefix + 32 lane bytes +
+/// `8·rounds` G-blocks of 60 + 16 digest bytes.
+const fn predicted_main(rounds: usize) -> usize {
+    28 + 32 + 60 * (8 * rounds) + 16
+}
+
+/// Bus interactions per compression: the frozen six `LfmMem` tuples, four
+/// `ByteAlu[XOR]` per XOR word (`4·8·rounds` mixing words + 4 feed-forward),
+/// four `AreBytes` per rotation (`2·8·rounds` of them), and 16 lane `AreBytes`.
+const fn predicted_interactions(rounds: usize) -> usize {
+    6 + 4 * (4 * (8 * rounds) + 4) + 4 * (2 * (8 * rounds)) + 16
+}
+
+/// `main + 3·aux` with `aux = ceil(interactions / 2)` — `airs.rs`'s census
+/// formula, the same instrument that produced the keccak, Poseidon and
+/// standalone-blake columns, so all four are comparable by construction.
+const fn predicted_cells(rounds: usize) -> usize {
+    predicted_main(rounds) + 3 * predicted_interactions(rounds).div_ceil(2)
+}
+
+const fn predicted_constraints(rounds: usize) -> usize {
+    26 + 16 * (8 * rounds)
+}
+
+/// The whole budget, at both round counts, as literals.
+///
+/// These are the numbers the report carries and the A6R decision is priced
+/// against, so they are written out rather than left as an expression: the
+/// arithmetic and the layout are two statements, and a test is only worth
+/// having if they can disagree.
+#[test]
+fn the_socket_budget_is_the_predicted_one_at_both_round_counts() {
+    // 6 rounds — the A6R variant.
+    assert_eq!(predicted_main(6), 2_956);
+    assert_eq!(predicted_interactions(6), 1_190);
+    assert_eq!(predicted_interactions(6).div_ceil(2), 595);
+    assert_eq!(predicted_cells(6), 4_741);
+    assert_eq!(predicted_constraints(6), 794);
+
+    // 7 rounds — standard BLAKE3, the default.
+    assert_eq!(predicted_main(7), 3_436);
+    assert_eq!(predicted_interactions(7), 1_382);
+    assert_eq!(predicted_interactions(7).div_ceil(2), 691);
+    assert_eq!(predicted_cells(7), 5_509);
+    assert_eq!(predicted_constraints(7), 922);
+
+    // ★ The A6R price, on this socket: going 6 → 7 rounds costs +16.19% per
+    // compression. The plan's paper estimate for the syscall-shaped chip was
+    // +15.5%; the socket pays slightly more because its constant framing makes
+    // the round-INDEPENDENT part smaller, so the rounds are a larger share.
+    assert_eq!(
+        (predicted_cells(7) - predicted_cells(6)) * 10_000 / predicted_cells(6),
+        1_619,
+        "hundredths of a percent"
+    );
+
+    // Both are BELOW the standalone chip's measured 4,946, which is the point of
+    // hosting: constant `h`/`t`/`block_len`/`flags`, constant `m[8..16]`, and a
+    // truncation window that never builds twelve of the sixteen output words.
+    assert!(predicted_cells(6) < 4_946);
+}
+
+/// The compiled arm IS the prediction at the round count it was compiled for.
+#[test]
+fn the_built_layout_matches_the_prediction() {
+    // The single-knob invariant, asserted where it can actually fail: the
+    // socket and the standalone probe must be priced at the SAME round count.
+    // `NUM_G == 8 * SOCKET_ROUNDS` below is internally consistent either way,
+    // so it cannot see the two chips drifting apart; this can.
+    assert_eq!(SOCKET_ROUNDS, super::blake3::BLAKE3_ROUNDS);
+    assert_eq!(
+        NUM_G,
+        super::blake3_chip::NUM_G,
+        "the socket arm and the standalone LFM_BLAKE3 probe must be compiled \
+         for the same round count, or the probe prices a hash the machine does \
+         not use"
+    );
+    assert_eq!(NUM_G, 8 * SOCKET_ROUNDS);
+    assert_eq!(MAIN_COLUMNS, predicted_main(SOCKET_ROUNDS));
+    assert_eq!(
+        hash::num_columns(KIND) - cols::PREP_WIDTH,
+        predicted_main(SOCKET_ROUNDS)
+    );
+    assert_eq!(
+        hash::bus_interactions(KIND).len(),
+        predicted_interactions(SOCKET_ROUNDS)
+    );
+    assert_eq!(NUM_CONSTRAINTS, predicted_constraints(SOCKET_ROUNDS));
+    assert_eq!(
+        cols::PREP_WIDTH,
+        11,
+        "the preprocessed prefix does not move"
+    );
+    assert_eq!(cols::LANES, 39, "the shared value prefix is not reflowed");
+}
+
+/// The layout is injective and gapless — no column written twice, none unread.
+///
+/// The width alone cannot see an off-by-one inside `lane_byte`/`g_base`/
+/// `out_byte`: two blocks could overlap and the total still come out right.
+#[test]
+fn the_layout_assigns_every_column_exactly_once() {
+    let mut seen = vec![0usize; cols::NUM_COLUMNS];
+    let mut claim = |c: usize| seen[c] += 1;
+    for i in 0..HASH_STATE_FELTS {
+        claim(cols::IN0 + i);
+        claim(cols::OUT0 + i);
+    }
+    for k in 0..4 {
+        claim(cols::S8 + k);
+    }
+    for lane in 0..cols::NUM_LANES {
+        for b in 0..4 {
+            claim(cols::lane_byte(lane, b));
+        }
+    }
+    for g in 0..NUM_G {
+        for off in 0..cols::G_SIZE {
+            claim(cols::g_base(g) + off);
+        }
+    }
+    for i in 0..4 {
+        for b in 0..4 {
+            claim(cols::out_byte(i, b));
+        }
+    }
+    for (c, &n) in seen.iter().enumerate().skip(cols::PREP_WIDTH) {
+        assert_eq!(
+            n, 1,
+            "value column {c} is claimed {n} times, want exactly 1"
+        );
+    }
+    for (c, &n) in seen.iter().enumerate().take(cols::PREP_WIDTH) {
+        assert_eq!(n, 0, "preprocessed column {c} must not be claimed");
+    }
+}
+
+/// The census reports the arm at its real width and its real interaction count,
+/// so the hash-matrix instrument prices BLAKE3 rather than a stale Test column.
+#[test]
+fn the_census_prices_the_blake3_arm() {
+    let opts = options();
+    let program = compress_program();
+    let census = lfm_chip_census_with_hasher(&program, KIND);
+    let hash_chip = census
+        .iter()
+        .find(|c| c.name == "LFM_HASH")
+        .expect("LFM_HASH is in the census");
+    assert_eq!(hash_chip.main_cols, predicted_main(SOCKET_ROUNDS));
+    assert_eq!(
+        hash_chip.aux_cols,
+        predicted_interactions(SOCKET_ROUNDS).div_ceil(2)
+    );
+    assert_eq!(
+        hash_chip.main_cols + 3 * hash_chip.aux_cols,
+        predicted_cells(SOCKET_ROUNDS),
+        "base-field-equivalent cells per compression row"
+    );
+    let _ = opts;
+}
+
+// =========================================================================
+// The framing — SOCKET.md §2, and the controls that make it discriminating
+// =========================================================================
+
+/// Every framing degree of freedom, in one object, so a negative control can
+/// break exactly one at a time and nothing else.
+#[derive(Clone, Copy)]
+struct Framing {
+    rounds: usize,
+    cv: [u32; 8],
+    tag_word: u32,
+    counter: u64,
+    block_len: u32,
+    flags: u32,
+    a_slot: usize,
+    b_slot: usize,
+    tag_slot: usize,
+    out_window: usize,
+    lane_le: bool,
+    msg_permutation: [usize; 16],
+}
+
+const HONEST: Framing = Framing {
+    rounds: SOCKET_ROUNDS,
+    cv: BLAKE3_IV,
+    tag_word: TAG_LFMC,
+    counter: COUNTER_LFMC,
+    block_len: BLOCK_LEN_LFMC,
+    flags: FLAGS_LFMC,
+    a_slot: 0,
+    b_slot: 4,
+    tag_slot: 8,
+    out_window: 0,
+    lane_le: true,
+    msg_permutation: BLAKE3_MSG_PERMUTATION,
+};
+
+/// The message words under a framing. A big-endian lane serialisation changes
+/// the message WORDS, because a word is read little-endian from the bytes.
+fn framed_message(a: &[u32; 4], b: &[u32; 4], fr: Framing) -> [u32; 16] {
+    let lane = |v: u32| if fr.lane_le { v } else { v.swap_bytes() };
+    let mut m = [0u32; 16];
+    for i in 0..4 {
+        m[fr.a_slot + i] = lane(a[i]);
+        m[fr.b_slot + i] = lane(b[i]);
+    }
+    m[fr.tag_slot] = fr.tag_word;
+    m
+}
+
+/// A deliberately *parameterised* socket compress, used only to build negative
+/// controls: the same dataflow with [`Framing`] as an input.
+///
+/// It is NOT what `socket_digest_rounds` calls. Keeping the two apart costs a
+/// duplicated loop and buys the thing the controls are for — they compare
+/// against [`SOCKET_VECTORS`], constants that came from outside this file, so
+/// they stay meaningful no matter how the real function is later refactored.
+fn framed_digest(a: &[u32; 4], b: &[u32; 4], fr: Framing) -> [u32; 4] {
+    let g = |s: &mut [u32; 16], ia: usize, ib: usize, ic: usize, id: usize, mx: u32, my: u32| {
+        s[ia] = s[ia].wrapping_add(s[ib]).wrapping_add(mx);
+        s[id] = (s[id] ^ s[ia]).rotate_right(16);
+        s[ic] = s[ic].wrapping_add(s[id]);
+        s[ib] = (s[ib] ^ s[ic]).rotate_right(12);
+        s[ia] = s[ia].wrapping_add(s[ib]).wrapping_add(my);
+        s[id] = (s[id] ^ s[ia]).rotate_right(8);
+        s[ic] = s[ic].wrapping_add(s[id]);
+        s[ib] = (s[ib] ^ s[ic]).rotate_right(7);
+    };
+    let mut v: [u32; 16] = [
+        fr.cv[0],
+        fr.cv[1],
+        fr.cv[2],
+        fr.cv[3],
+        fr.cv[4],
+        fr.cv[5],
+        fr.cv[6],
+        fr.cv[7],
+        BLAKE3_IV[0],
+        BLAKE3_IV[1],
+        BLAKE3_IV[2],
+        BLAKE3_IV[3],
+        fr.counter as u32,
+        (fr.counter >> 32) as u32,
+        fr.block_len,
+        fr.flags,
+    ];
+    let mut m = framed_message(a, b, fr);
+    for r in 0..fr.rounds {
+        g(&mut v, 0, 4, 8, 12, m[0], m[1]);
+        g(&mut v, 1, 5, 9, 13, m[2], m[3]);
+        g(&mut v, 2, 6, 10, 14, m[4], m[5]);
+        g(&mut v, 3, 7, 11, 15, m[6], m[7]);
+        g(&mut v, 0, 5, 10, 15, m[8], m[9]);
+        g(&mut v, 1, 6, 11, 12, m[10], m[11]);
+        g(&mut v, 2, 7, 8, 13, m[12], m[13]);
+        g(&mut v, 3, 4, 9, 14, m[14], m[15]);
+        if r < fr.rounds - 1 {
+            let prev = m;
+            for (i, &p) in fr.msg_permutation.iter().enumerate() {
+                m[i] = prev[p];
+            }
+        }
+    }
+    let w = fr.out_window;
+    core::array::from_fn(|i| v[w + i] ^ v[w + i + 8])
+}
+
+/// Everything `f` actually sees under a framing: the initial state, the message
+/// schedule at *every* round, and the output window.
+///
+/// Two framings with equal traces compute equal digests *necessarily*, so a
+/// control whose trace equals the honest one on some input is genuinely
+/// INAPPLICABLE there rather than undetected — which is what lets the control
+/// suite assert "changes the digest" unconditionally everywhere else. Deriving
+/// applicability this way rather than hand-listing it is deliberate: a
+/// hand-list goes stale as controls are added, and a stale entry is a control
+/// that looks covered and is not.
+///
+/// The schedules, not the permutation, are what belong here. `a_one` is the
+/// case that proves it: its message has `m[2] = m[6] = 0`, so transposing the
+/// first two entries of the permutation produces the identical schedule and the
+/// control cannot possibly fire.
+fn effective_trace(
+    a: &[u32; 4],
+    b: &[u32; 4],
+    fr: Framing,
+) -> (usize, [u32; 8], u64, u32, u32, usize, Vec<[u32; 16]>) {
+    let mut sched = framed_message(a, b, fr);
+    let mut scheds = Vec::with_capacity(fr.rounds);
+    for r in 0..fr.rounds {
+        scheds.push(sched);
+        if r < fr.rounds - 1 {
+            let prev = sched;
+            for (i, &p) in fr.msg_permutation.iter().enumerate() {
+                sched[i] = prev[p];
+            }
+        }
+    }
+    (
+        fr.rounds,
+        fr.cv,
+        fr.counter,
+        fr.block_len,
+        fr.flags,
+        fr.out_window,
+        scheds,
+    )
+}
+
+/// ★ **The socket KATs.** The real function reproduces every vector at both
+/// round counts.
+#[test]
+fn the_socket_matches_the_vectors_at_both_round_counts() {
+    for v in SOCKET_VECTORS.iter() {
+        assert_eq!(
+            socket_digest_rounds(&v.a, &v.b, 6),
+            v.digest_6,
+            "6-round socket vector {}",
+            v.name
+        );
+        assert_eq!(
+            socket_digest_rounds(&v.a, &v.b, 7),
+            v.digest_7,
+            "7-round socket vector {}",
+            v.name
+        );
+    }
+    // And the compiled-in round count is one of the two, reaching the vectors
+    // through the entry point the chip and the host actually call.
+    for v in SOCKET_VECTORS.iter() {
+        let expected = if SOCKET_ROUNDS == 7 {
+            v.digest_7
+        } else {
+            v.digest_6
+        };
+        assert_eq!(socket_digest(&v.a, &v.b), expected, "vector {}", v.name);
+    }
+}
+
+/// ★ **The external anchor, direct.** At 7 rounds the socket is literally
+/// `blake3::hash(a ‖ b ‖ "LFMC")` truncated to 16 bytes — a library call, no
+/// oracle, no JSON.
+///
+/// This is what SOCKET.md §6 lists as ✗ DEFERRED ("the same equality against
+/// the Rust `blake3` crate — needs cargo"). It also re-derives the 36-byte
+/// message from the byte-level specification rather than from
+/// `socket_message`, so the word-level and byte-level forms are two statements
+/// that can disagree.
+#[test]
+fn seven_rounds_is_blake3_of_the_domain_separated_message() {
+    for v in SOCKET_VECTORS.iter() {
+        let mut msg = Vec::with_capacity(36);
+        for lane in v.a.iter().chain(v.b.iter()) {
+            msg.extend_from_slice(&lane.to_le_bytes());
+        }
+        msg.extend_from_slice(b"LFMC");
+        assert_eq!(msg.len(), 36, "the socket message is one 36-byte block");
+
+        let full = blake3::hash(&msg);
+        let want: [u32; 4] = core::array::from_fn(|i| {
+            u32::from_le_bytes(full.as_bytes()[4 * i..4 * i + 4].try_into().unwrap())
+        });
+        assert_eq!(
+            socket_digest_rounds(&v.a, &v.b, 7),
+            want,
+            "7-round socket vector {} must be blake3::hash of its message",
+            v.name
+        );
+        assert_eq!(want, v.digest_7, "the table itself agrees with the crate");
+    }
+}
+
+/// The parameterised control, at canonical parameters, IS the real function —
+/// so every control below differs in exactly the one choice it names.
+#[test]
+fn the_framing_variant_at_canonical_parameters_is_the_socket() {
+    for v in SOCKET_VECTORS.iter() {
+        assert_eq!(
+            framed_digest(&v.a, &v.b, HONEST),
+            socket_digest(&v.a, &v.b),
+            "control harness must reproduce the socket at canonical parameters"
+        );
+    }
+}
+
+/// NEGATIVE CONTROL, one per framing degree of freedom.
+///
+/// Without this, "the vectors pass" would be evidence only that the vectors are
+/// *reachable*, not that they discriminate — and framing is precisely where a
+/// correct `f` still gives a wrong hash. Each control must change the digest on
+/// every vector where its effective trace differs from the honest one, and must
+/// discriminate on at least one vector overall.
+#[test]
+fn breaking_one_framing_choice_at_a_time_breaks_the_digest() {
+    let mut transposed = [0usize; 16];
+    for (i, &p) in BLAKE3_MSG_PERMUTATION.iter().enumerate() {
+        transposed[p] = i;
+    }
+    let controls: [(&str, Framing); 14] = [
+        (
+            "swap_a_b",
+            Framing {
+                a_slot: 4,
+                b_slot: 0,
+                ..HONEST
+            },
+        ),
+        (
+            "tag_changed",
+            Framing {
+                tag_word: u32::from_le_bytes(*b"LFMP"),
+                ..HONEST
+            },
+        ),
+        (
+            "tag_omitted",
+            Framing {
+                tag_word: 0,
+                ..HONEST
+            },
+        ),
+        (
+            "tag_slot_moved",
+            Framing {
+                tag_slot: 9,
+                ..HONEST
+            },
+        ),
+        (
+            "truncate_high_half",
+            Framing {
+                out_window: 4,
+                ..HONEST
+            },
+        ),
+        ("flags_parent", Framing { flags: 4, ..HONEST }),
+        ("flags_no_root", Framing { flags: 3, ..HONEST }),
+        (
+            "block_len_64",
+            Framing {
+                block_len: 64,
+                ..HONEST
+            },
+        ),
+        (
+            "block_len_32",
+            Framing {
+                block_len: 32,
+                ..HONEST
+            },
+        ),
+        (
+            "counter_one",
+            Framing {
+                counter: 1,
+                ..HONEST
+            },
+        ),
+        (
+            "cv_zero",
+            Framing {
+                cv: [0; 8],
+                ..HONEST
+            },
+        ),
+        (
+            "lanes_big_endian",
+            Framing {
+                lane_le: false,
+                ..HONEST
+            },
+        ),
+        (
+            "msg_perm_swapped",
+            Framing {
+                msg_permutation: {
+                    let mut p = BLAKE3_MSG_PERMUTATION;
+                    p.swap(0, 1);
+                    p
+                },
+                ..HONEST
+            },
+        ),
+        (
+            "other_round_count",
+            Framing {
+                rounds: if SOCKET_ROUNDS == 7 { 6 } else { 7 },
+                ..HONEST
+            },
+        ),
+    ];
+
+    for (what, fr) in controls {
+        let mut discriminated = 0;
+        for v in SOCKET_VECTORS.iter() {
+            let honest = socket_digest(&v.a, &v.b);
+            if effective_trace(&v.a, &v.b, fr) == effective_trace(&v.a, &v.b, HONEST) {
+                // Provably inapplicable on this input — `swap_a_b` when a == b,
+                // `lanes_big_endian` when every lane is a byte-palindrome,
+                // `msg_perm_swapped` when the two transposed slots hold equal
+                // words. Asserted as an equality, not skipped: an inapplicable
+                // control must produce the SAME digest, which is a check in its
+                // own right on the applicability derivation.
+                assert_eq!(framed_digest(&v.a, &v.b, fr), honest);
+                continue;
+            }
+            assert_ne!(
+                framed_digest(&v.a, &v.b, fr),
+                honest,
+                "{what} still reproduces the digest on vector {} — the vectors do not pin it",
+                v.name
+            );
+            discriminated += 1;
+        }
+        assert!(
+            discriminated > 0,
+            "{what} is discriminated by no vector at all"
+        );
+    }
+}
+
+/// The transposed message permutation is a real permutation and a different
+/// one — otherwise `msg_perm_swapped` above would be testing nothing.
+#[test]
+fn the_message_permutation_control_is_a_different_permutation() {
+    let mut p = BLAKE3_MSG_PERMUTATION;
+    p.swap(0, 1);
+    assert_ne!(p, BLAKE3_MSG_PERMUTATION);
+    let mut sorted = p;
+    sorted.sort_unstable();
+    assert_eq!(sorted, core::array::from_fn::<usize, 16, _>(|i| i));
+}
+
+// =========================================================================
+// The lane boundary — obligation O1, host side
+// =========================================================================
+
+/// ★ **O1, host side.** An out-of-range lane is REJECTED, never reduced.
+///
+/// `edsl::merkle_walk` feeds `compress` arena-hinted — prover-chosen — sibling
+/// cells, and a lane is a Goldilocks felt over `[0, p)`. The chip can only
+/// commit a byte decomposition for a lane below `2^32`, so a host that reduced
+/// instead of rejecting would claim a digest no proof can produce.
+#[test]
+fn an_out_of_range_lane_is_rejected_rather_than_reduced() {
+    let ok: LfmWord = word_of(&[1, 2, 3, 4]);
+    assert_eq!(lanes_of(&ok), Some([1, 2, 3, 4]));
+
+    // The alias that would exist under silent reduction.
+    let aliased: LfmWord = [
+        FE::from(1u64 + (1u64 << 32)),
+        FE::from(2u64),
+        FE::from(3u64),
+        FE::from(4u64),
+    ];
+    assert_eq!(lanes_of(&aliased), None, "2^32 + 1 is not a u32 lane");
+
+    let mut state = [FE::zero(); HASH_STATE_FELTS];
+    state[0..4].copy_from_slice(&aliased);
+    state[4..8].copy_from_slice(&ok);
+    assert!(
+        Blake3Permutation
+            .admits(HashMode::Compress, &state)
+            .is_err(),
+        "a non-u32 lane must be refused by admits"
+    );
+
+    // HONEST CONTROL: the in-range pair is still accepted. Without it, this
+    // test would pass equally if `admits` rejected everything.
+    let mut good = [FE::zero(); HASH_STATE_FELTS];
+    good[0..4].copy_from_slice(&ok);
+    good[4..8].copy_from_slice(&ok);
+    assert!(Blake3Permutation.admits(HashMode::Compress, &good).is_ok());
+}
+
+/// The whole-machine version of the same thing: an arena word with a non-`u32`
+/// lane makes the program fail to execute, with a reason.
+#[test]
+fn a_non_u32_arena_word_fails_execution_under_blake3() {
+    let program = compress_program();
+    let mut bad = arenas();
+    bad[0][0][0] = FE::from(1u64 << 32);
+    assert!(
+        matches!(
+            execute(&program, &bad, &KIND),
+            Err(LfmExecError::HasherRejected(_))
+        ),
+        "a non-u32 hinted lane must be rejected at execution"
+    );
+    // HONEST CONTROL.
+    assert!(execute(&program, &arenas(), &KIND).is_ok());
+}
+
+/// Obligation O2: the socket is closed on its own output, so a digest fed back
+/// in as a sibling always satisfies O1. That is why only leaf digests and
+/// prover-hinted siblings need the input check.
+#[test]
+fn the_socket_output_is_always_a_valid_input() {
+    for v in SOCKET_VECTORS.iter() {
+        let d = socket_digest(&v.a, &v.b);
+        assert_eq!(
+            lanes_of(&word_of(&d)),
+            Some(d),
+            "a socket digest must round-trip as a u32-lane cell"
+        );
+    }
+}
+
+/// Obligation O3: the IV enters through `h`, not through the capacity lanes, so
+/// this arm overrides `compress` rather than inheriting permute-and-truncate.
+///
+/// Asserted through `HasherKind`'s dispatch, because that is the path the
+/// executor takes and a candidate whose override was not honoured there would
+/// prove one thing and record another.
+#[test]
+fn compress_is_overridden_and_the_upper_out_lanes_are_empty() {
+    let a = word_of(&[0x0102_0304, 0, 0, 0]);
+    let b = word_of(&[0, 0, 0, 0x0506_0708]);
+    let via_kind = LfmHasher::compress(&KIND, &a, &b);
+    assert_eq!(
+        via_kind,
+        word_of(&socket_digest(
+            &[0x0102_0304, 0, 0, 0],
+            &[0, 0, 0, 0x0506_0708]
+        ))
+    );
+
+    let out = LfmHasher::compress_out(&KIND, &a, &b);
+    assert_eq!(&out[0..4], &via_kind[..]);
+    for (j, felt) in out.iter().enumerate().skip(4) {
+        assert_eq!(
+            *felt,
+            FE::zero(),
+            "OUT lane {j} carries nothing on a compress row"
+        );
+    }
+
+    // `compress_iv` is meaningful if read, and is NOT what the framing uses.
+    assert_eq!(
+        LfmHasher::compress_iv(&KIND),
+        word_of(&[BLAKE3_IV[0], BLAKE3_IV[1], BLAKE3_IV[2], BLAKE3_IV[3]])
+    );
+}
+
+/// ✗ There is no permute socket, and the refusal is explicit rather than a
+/// wrong answer. `trivial_program` contains one, so it is unprovable under
+/// BLAKE3 — which is the honest state of SOCKET.md §7, not a defect.
+#[test]
+fn a_permute_row_is_refused_under_blake3() {
+    assert!(
+        Blake3Permutation
+            .admits(HashMode::Permute, &[FE::zero(); HASH_STATE_FELTS])
+            .is_err()
+    );
+    assert!(
+        matches!(
+            execute(&trivial_program(), &trivial_arenas(), &KIND),
+            Err(LfmExecError::HasherRejected(_))
+        ),
+        "a program containing a permute must be refused under BLAKE3"
+    );
+    // HONEST CONTROL: the same program executes fine under the hashers that do
+    // have a permute socket, so the refusal is BLAKE3's domain and not a break.
+    assert!(execute(&trivial_program(), &trivial_arenas(), &HasherKind::Test).is_ok());
+}
+
+// =========================================================================
+// The constraints
+// =========================================================================
+
+/// Every constraint index is emitted exactly once, the count is the one the
+/// module documents, and the degree really reaches — and does not exceed — 3.
+#[test]
+fn the_arm_emits_its_constraints_at_degree_3() {
+    let set = HashConstraints::BLAKE3;
+    assert_eq!(HashConstraints::num_constraints(KIND), NUM_CONSTRAINTS);
+
+    let meta = ConstraintSet::<F, E>::meta(&set);
+    assert_eq!(meta.len(), NUM_CONSTRAINTS, "constraints emitted");
+    for (i, m) in meta.iter().enumerate() {
+        assert_eq!(m.constraint_idx, i, "meta must be dense and idx-ordered");
+        assert_eq!(m.kind, RootKind::Base, "every hash constraint is base");
+    }
+
+    let mut cb = CaptureBuilder::<F, E>::new();
+    set.eval(&mut cb);
+    let (_prog, degrees) = cb.finish(num_base_from_meta(&meta));
+    assert_eq!(degrees.len(), NUM_CONSTRAINTS, "one emit per constraint");
+
+    let declared = ConstraintSet::<F, E>::max_degree(&set);
+    assert_eq!(declared, 3, "the wrap's blowup 2 depends on this staying 3");
+    for &(idx, measured) in &degrees {
+        assert!(
+            measured <= declared,
+            "constraint {idx}: measured degree {measured} EXCEEDS declared {declared}"
+        );
+    }
+    // Not merely `<=`: the mu-gated carry booleanities really are cubic, so a
+    // set that quietly topped out at 2 would mean the carries had stopped being
+    // constrained.
+    assert_eq!(degrees.iter().map(|&(_, d)| d).max(), Some(3));
+}
+
+/// A hash row exactly as `trace::build_traces_with_hasher` fills one.
+fn hash_row(a: [u32; 4], b: [u32; 4]) -> Vec<FE> {
+    let mut row = vec![FE::zero(); cols::NUM_COLUMNS];
+    row[cols::MODE_C] = FE::one();
+    row[cols::IN0..cols::IN0 + 4].copy_from_slice(&word_of(&a));
+    row[cols::IN0 + 4..cols::IN0 + 8].copy_from_slice(&word_of(&b));
+    for (k, iv) in BLAKE3_IV.iter().take(4).enumerate() {
+        row[cols::S8 + k] = FE::from(u64::from(*iv));
+    }
+    row[cols::OUT0..cols::OUT0 + 4].copy_from_slice(&word_of(&socket_digest(&a, &b)));
+    blake3_socket::fill_socket_witness(&mut row);
+    row
+}
+
+fn evaluate(row: &[FE]) -> Vec<FE> {
+    let set = HashConstraints::BLAKE3;
+    let n = ConstraintSet::<F, E>::meta(&set).len();
+    let no_ch: Vec<FieldElement<E>> = vec![];
+    let offset = FieldElement::<E>::zero();
+    let frame = Frame::<F, E>::new(vec![TableView::new(vec![row.to_vec()], vec![vec![]])]);
+    let ctx =
+        TransitionEvaluationContext::new_prover(frame.as_row_frame(), &no_ch, &no_ch, &offset);
+    let mut base_out = vec![FE::zero(); n];
+    let mut ext_out = vec![FieldElement::<E>::zero(); n];
+    let mut folder = ProverEvalFolder::new(&ctx, &mut base_out, &mut ext_out);
+    set.eval(&mut folder);
+    folder.assert_all_emitted();
+    base_out
+}
+
+fn violations(row: &[FE]) -> Vec<usize> {
+    evaluate(row)
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| **v != FE::zero())
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// An honest row satisfies every constraint, and the digest it carries is the
+/// KAT's — so the constraint set and the vectors agree about the same row.
+#[test]
+fn an_honest_row_satisfies_every_constraint() {
+    for v in SOCKET_VECTORS.iter() {
+        let row = hash_row(v.a, v.b);
+        assert_eq!(violations(&row), Vec::<usize>::new(), "vector {}", v.name);
+        let want = if SOCKET_ROUNDS == 7 {
+            v.digest_7
+        } else {
+            v.digest_6
+        };
+        for (i, lane) in want.iter().enumerate() {
+            assert_eq!(row[cols::OUT0 + i], FE::from(u64::from(*lane)));
+            for byte in 0..4 {
+                assert_eq!(
+                    row[cols::out_byte(i, byte)],
+                    FE::from(u64::from((lane >> (8 * byte)) as u8)),
+                    "digest byte ({i}, {byte}) of vector {}",
+                    v.name
+                );
+            }
+        }
+    }
+}
+
+/// An all-zero padding row satisfies the set, and a row claiming to be real
+/// with no witness does not.
+///
+/// The second half is what stops the first from being vacuous: a constraint set
+/// that accepted anything would pass the padding check just as well.
+#[test]
+fn padding_is_satisfied_and_a_real_marked_empty_row_is_not() {
+    assert_eq!(
+        violations(&vec![FE::zero(); cols::NUM_COLUMNS]),
+        Vec::<usize>::new(),
+        "an all-zero padding row must satisfy every constraint"
+    );
+
+    let mut row = vec![FE::zero(); cols::NUM_COLUMNS];
+    row[cols::MODE_C] = FE::one();
+    assert!(
+        !violations(&row).is_empty(),
+        "a real-marked row with an all-zero witness must be rejected"
+    );
+}
+
+/// The `MODE_P = 0` pin: a permute-marked row is rejected by the AIR itself,
+/// independently of the executor's refusal.
+#[test]
+fn a_permute_marked_row_violates_the_air() {
+    let mut row = vec![FE::zero(); cols::NUM_COLUMNS];
+    row[cols::MODE_P] = FE::one();
+    assert!(
+        !violations(&row).is_empty(),
+        "MODE_P = 1 must be unsatisfiable under the BLAKE3 arm"
+    );
+}
+
+/// ★ **The lane-decomposition constraint bites.** Retagging a lane's bytes to a
+/// different value, or the lane felt to `v + 2^32`, must violate the AIR.
+///
+/// The second case is the identity's own job: a lane moved without its bytes.
+/// See `the_lane_range_check_is_load_bearing_on_its_own` for the other half —
+/// the witness this identity cannot see, which is what the `AreBytes` sends
+/// are for.
+#[test]
+fn the_lane_decomposition_binds_the_felt_to_its_bytes() {
+    let base = hash_row([0x1234_5678, 1, 2, 3], [4, 5, 6, 7]);
+
+    let mut tampered = base.clone();
+    tampered[cols::lane_byte(0, 0)] += FE::one();
+    assert!(
+        !violations(&tampered).is_empty(),
+        "moving a lane byte must violate the decomposition"
+    );
+
+    let mut aliased = base.clone();
+    aliased[cols::IN0] += FE::from(1u64 << 32);
+    assert!(
+        !violations(&aliased).is_empty(),
+        "lane + 2^32 must violate the decomposition — this IS obligation O1"
+    );
+
+    // HONEST CONTROL.
+    assert_eq!(violations(&base), Vec::<usize>::new());
+}
+
+/// ★ **O1's OTHER half — the one the rest of this suite never exercises.**
+///
+/// The lane contract is an eval constraint AND two `AreBytes` sends, and the
+/// module comment says "NEITHER ALONE SUFFICES". Every other control here
+/// breaks the linear identity, which the identity alone catches — so until this
+/// test existed, the `AreBytes` half was asserted in prose and exercised
+/// nowhere.
+///
+/// The witness that separates them moves `2^8` from one byte column into the
+/// next (`MB[0] += 256`, `MB[1] -= 1`). The weighted sum is unchanged
+/// **exactly**, over the field, with no borrow — `256·(b1 − 1) + (b0 + 256) =
+/// 256·b1 + b0` — so the lane identity passes, the message word the mixing core
+/// reads is the same linear form and therefore also unchanged, and the honest
+/// digest still comes out. Nothing in the eval set is wrong with the row. The
+/// only defect is that `MB[0]` is no longer a byte, and only the range check
+/// can see that.
+///
+/// Recorded because it is not what I expected and it sharpens the argument:
+/// **a carry-absorbing witness cannot be silent, because the lane bytes ARE the
+/// message bytes.** Trying to alias a lane to `v + 2^32` and letting `MB[3]`
+/// absorb the carry does satisfy the lane identity — and then breaks the mixing
+/// core instead, because the word the core hashes moved by `2^32` too. So the
+/// alias is caught either way; what the range check uniquely buys is the case
+/// where the *sum* is preserved.
+///
+/// And that case is not a curiosity — it is the whole attack surface. The
+/// message words reach `add3` and nothing else (never an XOR), so these sends
+/// are their ONLY bound. A sum-preserving witness is exactly the door to an
+/// unbounded `m`, and `add3`'s exactness in round 0 — constant `a` and `b`, a
+/// byte-bounded `s` — is what an unbounded `m` breaks: the prover solves for
+/// any `s` it likes and owns the compression.
+#[test]
+fn the_lane_range_check_is_load_bearing_on_its_own() {
+    let base = hash_row([0x1234_5678, 1, 2, 3], [4, 5, 6, 7]);
+    /// Constraint index of input lane 0's decomposition (idx 6–13 are the eight
+    /// lanes); `CORE_IDX` is 26, so anything below it is framing.
+    const LANE0: usize = 6;
+
+    // (a) THE ONE ONLY `AreBytes` CATCHES. Identity preserved, core preserved,
+    // eval set entirely silent. If this half ever starts failing, the proof
+    // below has stopped testing the range check and has become a duplicate of
+    // `the_lane_decomposition_binds_the_felt_to_its_bytes`.
+    let mut shifted = base.clone();
+    shifted[cols::lane_byte(0, 0)] += FE::from(256u64);
+    shifted[cols::lane_byte(0, 1)] = shifted[cols::lane_byte(0, 1)] - FE::one();
+    assert_eq!(
+        violations(&shifted),
+        Vec::<usize>::new(),
+        "the linear identity alone cannot see a byte column carrying 2^8 — \
+         which is exactly why the AreBytes sends are not optional"
+    );
+
+    // (b) The naive alias: claim `v + 2^32` and leave the bytes alone. The
+    // IDENTITY catches this one, at lane 0's own index.
+    let mut naive = base.clone();
+    naive[cols::IN0] += FE::from(1u64 << 32);
+    assert!(
+        violations(&naive).contains(&LANE0),
+        "a lane moved without its bytes must violate its own decomposition"
+    );
+
+    // (c) The alias with the carry absorbed, which is the interesting one: the
+    // lane identity is satisfied — `LANE0` is NOT among the violations — and the
+    // MIXING CORE rejects instead, because `MB[3]` is a message byte and the
+    // word being hashed moved by 2^32 as well.
+    let mut absorbed = base.clone();
+    absorbed[cols::IN0] += FE::from(1u64 << 32);
+    absorbed[cols::lane_byte(0, 3)] += FE::from(256u64);
+    let v = violations(&absorbed);
+    assert!(
+        !v.contains(&LANE0),
+        "absorbing the carry must satisfy the lane identity — otherwise this \
+         case is not demonstrating what it claims"
+    );
+    assert!(
+        v.iter().all(|&i| i >= 26) && !v.is_empty(),
+        "and the mixing core must reject it instead, got {v:?}"
+    );
+
+    // (d) In a real proof, the `AreBytes` send catches (a). Only the byte
+    // shuffle is used: it leaves `IN0` untouched, so the `LfmMem` receive token
+    // is unchanged and the rejection can only come from the range check, not
+    // from a memory-bus mismatch.
+    assert_not_accepted("a byte column carrying 2^8, identity preserved", |t| {
+        let b0 = t.main_table.get_row(0)[cols::lane_byte(0, 0)];
+        let b1 = t.main_table.get_row(0)[cols::lane_byte(0, 1)];
+        t.main_table
+            .set_fe(0, cols::lane_byte(0, 0), b0 + FE::from(256u64));
+        t.main_table
+            .set_fe(0, cols::lane_byte(0, 1), b1 - FE::one());
+    });
+}
+
+/// The digest recomposition binds `OUT` to the mixing core's output bytes.
+#[test]
+fn the_digest_recomposition_binds_out_to_the_core() {
+    let base = hash_row([9, 8, 7, 6], [5, 4, 3, 2]);
+    let mut tampered = base.clone();
+    tampered[cols::OUT0] += FE::one();
+    assert!(!violations(&tampered).is_empty());
+
+    let mut upper = base.clone();
+    upper[cols::OUT0 + 4] = FE::one();
+    assert!(
+        !violations(&upper).is_empty(),
+        "the unused upper OUT lanes are pinned to zero"
+    );
+    assert_eq!(violations(&base), Vec::<usize>::new());
+}
+
+// =========================================================================
+// Prove and verify — rule 2: this is what makes the numbers measurements
+// =========================================================================
+
+/// A compress-only program: two leaf merges and a parent merge.
+///
+/// This is the shape the socket exists for — `edsl::merkle_walk`'s parent
+/// compression — and it exercises obligation O2 as well, since `d0` and `d1` are
+/// socket outputs fed straight back in as inputs. `trivial_program` cannot be
+/// used: it contains a `permute`, which BLAKE3 has no socket for.
+fn compress_program_source() -> LfmProgramSource {
+    let mut b = LfmBuilder::new();
+    let arena = b.declare_arena(4);
+    let h: Vec<Cell> = (0..4).map(|i| b.hint_word(arena, i)).collect();
+    let d0 = b.compress(h[0].as_digest(), h[1].as_digest());
+    let d1 = b.compress(h[2].as_digest(), h[3].as_digest());
+    let root = b.compress(d0, d1);
+    b.public(root.as_cell());
+    b.finish()
+}
+
+fn compress_program() -> LfmProgram {
+    compile(compress_program_source())
+}
+
+/// Four arena words whose lanes are `u32`s — the socket's domain (O1).
+fn arenas() -> Vec<Vec<LfmWord>> {
+    vec![
+        (0..4u32)
+            .map(|i| word_of(&[0x1000_0000 * (i + 1), 0x0BAD_F00D ^ i, i, 0xFFFF_FFFF - i]))
+            .collect(),
+    ]
+}
+
+/// `trivial_program`'s arenas — arbitrary felts, which is exactly why BLAKE3
+/// cannot take them.
+fn trivial_arenas() -> Vec<Vec<LfmWord>> {
+    vec![
+        (0..4u64)
+            .map(|i| core::array::from_fn(|j| FE::from(1_000 * (i + 1) + j as u64)))
+            .collect(),
+    ]
+}
+
+/// ★ The production prover builds this AIR, proves a program through it, and
+/// the production verifier accepts.
+#[test]
+fn the_blake3_socket_proves_and_verifies() {
+    let opts = options();
+    let program = compress_program();
+    let artifacts = build_artifacts_with_hasher(&program, &opts, KIND);
+    let proved = lfm_prove_with_hasher(&program, &artifacts, &arenas(), &opts, KIND)
+        .expect("proving under BLAKE3 must succeed");
+    assert!(
+        verify_against(
+            &artifacts.roots,
+            &artifacts.program_id,
+            artifacts.keccak_rnd_chunks,
+            &proved.proof,
+            &proved.public_words,
+            &opts,
+            artifacts.hasher,
+        ),
+        "an honest BLAKE3-configured proof must verify"
+    );
+
+    // The public output is the Merkle root the socket computed, recomputed here
+    // from the vectors' own reference function — so the proof's public words
+    // are checked against the specification, not against the executor.
+    let a = arenas();
+    let lanes = |i: usize| lanes_of(&a[0][i]).expect("u32 lanes");
+    let d0 = socket_digest(&lanes(0), &lanes(1));
+    let d1 = socket_digest(&lanes(2), &lanes(3));
+    let root = socket_digest(&d0, &d1);
+    assert_eq!(proved.public_words, vec![(0u32, word_of(&root))]);
+}
+
+/// A proof is bound to the hasher it was produced under, in both directions.
+#[test]
+fn a_blake3_proof_does_not_verify_under_another_hasher() {
+    let opts = options();
+    let program = compress_program();
+    let artifacts = build_artifacts_with_hasher(&program, &opts, KIND);
+    let proved =
+        lfm_prove_with_hasher(&program, &artifacts, &arenas(), &opts, KIND).expect("prove");
+
+    for other in [HasherKind::Test, HasherKind::Poseidon] {
+        // The digest stays the proved-under one: this isolates the AIR-set
+        // mismatch rather than passing because the statement also moved.
+        assert!(
+            !verify_against(
+                &artifacts.roots,
+                &artifacts.program_id,
+                artifacts.keccak_rnd_chunks,
+                &proved.proof,
+                &proved.public_words,
+                &opts,
+                other,
+            ),
+            "a BLAKE3 proof must not verify under {other:?}"
+        );
+    }
+}
+
+/// The hasher tag moves the program digest and no preprocessed root — the
+/// Phase-3 binding, now with a third candidate in it.
+///
+/// The third candidate is the point: with only two, a width coincidence was
+/// enough to separate them by accident. The tag is what separates them on
+/// purpose.
+#[test]
+fn the_blake3_choice_moves_the_program_digest_and_no_root() {
+    let opts = options();
+    let program = compress_program();
+    let test = build_artifacts_with_hasher(&program, &opts, HasherKind::Test);
+    let blake = build_artifacts_with_hasher(&program, &opts, KIND);
+    let pos = build_artifacts_with_hasher(&program, &opts, HasherKind::Poseidon);
+
+    assert_eq!(build_artifacts(&program, &opts).program_id, test.program_id);
+    assert_eq!(test.roots, blake.roots, "no root may move with the hasher");
+    assert_eq!(test.log_heights, blake.log_heights);
+    assert_eq!(test.keccak_rnd_chunks, blake.keccak_rnd_chunks);
+    assert_ne!(test.program_id, blake.program_id);
+    assert_ne!(pos.program_id, blake.program_id);
+    assert_eq!(KIND.as_tag(), 2, "the wire tag is written out, not derived");
+}
+
+/// Prove the program with `mutate` applied to the hash trace, and report
+/// whether the proof was ACCEPTED. A prover refusal and a verifier rejection
+/// are both real rejections and this chip produces both.
+fn round_trip(mutate: impl FnOnce(&mut TraceTable<F, E>)) -> Result<bool, String> {
+    let opts = options();
+    let program = compress_program();
+    let artifacts = build_artifacts_with_hasher(&program, &opts, KIND);
+    let exec = execute(&program, &arenas(), &KIND).expect("execute");
+    let mut traces = build_traces_with_hasher(&program, &exec.records, KIND);
+    mutate(&mut traces.hash);
+    match prove_traces_with_hasher(&artifacts, &mut traces, &exec.public_words, &opts, KIND) {
+        Ok(proof) => Ok(verify_against(
+            &artifacts.roots,
+            &artifacts.program_id,
+            artifacts.keccak_rnd_chunks,
+            &proof,
+            &exec.public_words,
+            &opts,
+            KIND,
+        )),
+        Err(e) => Err(format!("{e:?}")),
+    }
+}
+
+fn assert_not_accepted(what: &str, mutate: impl FnOnce(&mut TraceTable<F, E>)) {
+    if let Ok(true) = round_trip(mutate) {
+        panic!("{what} must not produce an accepted proof, but the proof verified");
+    }
+}
+
+/// Tamper rejection, one cell at a time, across the three column families the
+/// arm adds: a lane byte, a mixing-core carry, and a digest byte.
+///
+/// The honest control is `the_blake3_socket_proves_and_verifies` above: without
+/// it these would pass just as well if the AIR rejected everything.
+#[test]
+fn tampering_with_the_witness_is_not_accepted() {
+    assert_not_accepted("a moved input lane byte", |t| {
+        let v = t.main_table.get_row(0)[cols::lane_byte(0, 0)];
+        t.main_table.set_fe(0, cols::lane_byte(0, 0), v + FE::one());
+    });
+    assert_not_accepted("a flipped add3 carry bit", |t| {
+        let c = cols::g_base(0) + cols::G_A1_C;
+        let v = t.main_table.get_row(0)[c];
+        t.main_table.set_fe(0, c, v + FE::one());
+    });
+    assert_not_accepted("a moved digest byte", |t| {
+        let v = t.main_table.get_row(0)[cols::out_byte(0, 0)];
+        t.main_table.set_fe(0, cols::out_byte(0, 0), v + FE::one());
+    });
+    assert_not_accepted("a real flag on a padding row", |t| {
+        t.main_table.set_fe(3, cols::MODE_C, FE::one());
+    });
+}

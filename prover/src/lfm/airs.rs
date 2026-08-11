@@ -186,7 +186,7 @@ pub fn lfm_chip_census_with_hasher(
             g.hash.padded_rows as u64,
             hash::num_columns(hasher),
             layout::hash::PREP_WIDTH,
-            hash::bus_interactions().len(),
+            hash::bus_interactions(hasher).len(),
         ),
         (
             g.keccak.padded_rows as u64,
@@ -426,7 +426,7 @@ impl LfmAirs {
             ),
             hash: build_air(
                 hash::num_columns(hasher),
-                hash::bus_interactions(),
+                hash::bus_interactions(hasher),
                 options,
                 hash::HashConstraints { kind: hasher },
                 LFM_CHIP_NAMES[5],

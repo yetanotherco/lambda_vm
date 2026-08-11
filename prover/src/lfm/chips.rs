@@ -584,10 +584,32 @@ pub mod hash {
         match kind {
             HasherKind::Test => cols::TEST_NUM_COLUMNS,
             HasherKind::Poseidon => poseidon_cols::NUM_COLUMNS,
+            HasherKind::Blake3 => crate::lfm::blake3_socket::cols::NUM_COLUMNS,
         }
     }
 
-    pub fn bus_interactions() -> Vec<BusInteraction> {
+    /// The chip's bus interactions under `kind`.
+    ///
+    /// **Hasher-DEPENDENT, and BLAKE3 is why.** The six `LfmMem` tuples below
+    /// are the frozen `LFM_HASH` contract and are the same under every
+    /// candidate; they read and write only the shared value prefix, whose
+    /// offsets no layout moves. But a candidate built out of byte operations
+    /// needs a lookup table, and BLAKE3 needs one per XOR byte and one per
+    /// range-checked byte pair — over a thousand of them, none of which
+    /// `TestPermutation` or Poseidon has, both being pure field arithmetic.
+    ///
+    /// Callers must thread the same `kind` they build the AIR's width and
+    /// constraints with; `LfmAirs::new_with_hasher` is the one place that does.
+    pub fn bus_interactions(kind: HasherKind) -> Vec<BusInteraction> {
+        let mut interactions = lfm_mem_interactions();
+        if kind == HasherKind::Blake3 {
+            interactions.extend(crate::lfm::blake3_socket::bitwise_interactions());
+        }
+        interactions
+    }
+
+    /// The frozen `LFM_HASH` tuple contract: 2 (or 3) cells in, 1 (or 3) out.
+    fn lfm_mem_interactions() -> Vec<BusInteraction> {
         vec![
             BusInteraction::receiver(
                 BusId::LfmMem,
@@ -647,12 +669,18 @@ pub mod hash {
             kind: HasherKind::Poseidon,
         };
 
+        /// The BLAKE3 2-to-1 compress configuration.
+        pub const BLAKE3: Self = Self {
+            kind: HasherKind::Blake3,
+        };
+
         /// Constraints emitted under `kind` — the count the framework's
         /// dense-index invariant requires `eval` to fill exactly.
         pub const fn num_constraints(kind: HasherKind) -> usize {
             match kind {
                 HasherKind::Test => 17,
                 HasherKind::Poseidon => poseidon_cols::NUM_CONSTRAINTS,
+                HasherKind::Blake3 => crate::lfm::blake3_socket::NUM_CONSTRAINTS,
             }
         }
     }
@@ -672,6 +700,11 @@ pub mod hash {
             match self.kind {
                 HasherKind::Test => Self::eval_test(b),
                 HasherKind::Poseidon => Self::eval_poseidon(b),
+                // The BLAKE3 arm lives in its own module: it shares the mixing
+                // dataflow with `blake3_chip` rather than with anything here,
+                // and putting it beside its column layout, its senders and its
+                // trace filler is what keeps the four in step.
+                HasherKind::Blake3 => crate::lfm::blake3_socket::eval(b),
             }
         }
     }

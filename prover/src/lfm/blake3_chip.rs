@@ -1,4 +1,4 @@
-//! `LFM_BLAKE3` — the BLAKE3 6-round compression chip, hosted on the LFM bus.
+//! `LFM_BLAKE3` — the BLAKE3 compression chip, hosted on the LFM bus.
 //!
 //! Ported from PR #903's `prover/src/tables/blake3.rs` (`yetanotherco/lambda_vm`,
 //! head `89aeeb8c2b0389e9d21a861c9e3a10a7b1b5704e`), which is the syscall
@@ -76,8 +76,11 @@
 //! measured, which is what the hash matrix's blake column needs. Registration
 //! would move every program digest and is a separate decision.
 //!
-//! ⚠ 6-round internal variant; security assumption **A6R**, unratified. See
-//! [`super::blake3`].
+//! ⚠ Round count follows [`super::blake3::BLAKE3_ROUNDS`]: 7 (standard BLAKE3)
+//! by default, 6 under the `blake3-6round` feature. The 6-round instantiation
+//! rests on the unratified security assumption **A6R**; the 7-round one carries
+//! no assumption. Every column count in the table above is the 6-round one and
+//! is quoted for continuity with #903 — `blake3_probe` pins both.
 
 use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
@@ -89,12 +92,12 @@ use crate::tables::types::{
     BusId, FE, GoldilocksExtension, GoldilocksField, VmTable, alu_op, zeroed_fe_vec,
 };
 
-use super::blake3::{BLAKE3_IV, BLAKE3_MSG_PERMUTATION, BLAKE3_ROUNDS};
+use super::blake3::{BLAKE3_IV, BLAKE3_MSG_PERMUTATION, BLAKE3_ROUNDS, blake3_compress_rounds};
 
 type F = GoldilocksField;
 type E = GoldilocksExtension;
 
-/// G-instances per compression: 8 per round × 6 rounds.
+/// G-instances per compression: 8 per round, at the compiled round count.
 pub const NUM_G: usize = BLAKE3_ROUNDS * 8;
 
 /// `u32` words the chip reads: `h[8] | m[16] | t_lo | t_hi | block_len | flags`.
@@ -121,7 +124,7 @@ const G_INDICES: [(usize, usize, usize, usize); 8] = [
 
 /// Shift amounts of the two non-free rotations, as `rotl` inner shifts:
 /// rotr12 = rotl20 = rotl16∘rotl4 (r=4); rotr7 = rotl25 = rotl16∘rotl9 (r=9).
-const ROT_SHIFT_R: [u32; 2] = [4, 9];
+pub(crate) const ROT_SHIFT_R: [u32; 2] = [4, 9];
 
 // =========================================================================
 // Column layout
@@ -150,7 +153,7 @@ pub mod cols {
     // --- value columns ---
     /// Input bytes: `h[32] | m[64] | t_lo[4] | t_hi[4] | block_len[4] | flags[4]`.
     pub const IN: usize = PREP_WIDTH; // 16
-    /// 48 G-blocks × 60 cells (56 bytes + 4 carry bits).
+    /// `NUM_G` G-blocks × 60 cells (56 bytes + 4 carry bits).
     pub const G: usize = IN + 4 * super::IN_U32; // 128
     pub const G_SIZE: usize = 60;
     /// Feed-forward output bytes `out[0..16]` (64 bytes).
@@ -224,6 +227,40 @@ pub const MAIN_COLUMNS: usize = cols::NUM_COLUMNS - cols::PREP_WIDTH;
 // The single dataflow, interpreted twice (verbatim from #903)
 // =========================================================================
 
+/// The framing degrees of freedom [`run_flow`] itself decides, as opposed to
+/// the ones an interpretation decides.
+///
+/// These two live here, and not in each `Blake3Flow` impl, for one reason: they
+/// change *which calls happen*, so an impl that got them wrong would silently
+/// desynchronise the wire interpretation from the value interpretation and the
+/// bus sends would stop matching the multiplicities. Deciding them in the single
+/// dataflow is what keeps the single-dataflow rule true when there is more than
+/// one framing (`blake3_chip`'s syscall shape and `blake3_socket`'s 2-to-1
+/// compress).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FlowConfig {
+    /// Rounds of 8 G-calls. 6 for this chip; [`super::blake3_socket`] sweeps.
+    pub rounds: usize,
+    /// How many of the eight `out[i] = v[i] ^ v[i+8]` words to produce — the
+    /// truncation window. 8 here; 4 for the socket, whose digest is one cell.
+    pub out_window: usize,
+    /// Whether to produce `out[i+8] = v[i+8] ^ h[i]` as well. The socket does
+    /// not: those words are not part of a truncated 128-bit digest, and never
+    /// building them is where most of its saving over this chip comes from.
+    pub full_output: bool,
+}
+
+impl FlowConfig {
+    /// The syscall-shaped chip's framing: the full 16-word output.
+    pub(crate) const fn full(rounds: usize) -> Self {
+        Self {
+            rounds,
+            out_window: 8,
+            full_output: true,
+        }
+    }
+}
+
 /// The BLAKE3 compression dataflow, abstracted over its word representation.
 pub(crate) trait Blake3Flow {
     type Word: Copy;
@@ -254,14 +291,17 @@ pub(crate) trait Blake3Flow {
     fn rotr8(&mut self, w: Self::Word) -> Self::Word;
     /// rotr12 (half=0) / rotr7 (half=1) via the inline shift identity.
     fn rot_shift(&mut self, g: usize, half: usize, w: Self::Word) -> Self::Word;
-    /// Feed-forward XOR pair: `out[i] = v[i] ^ v[i+8]`, `out[i+8] = v[i+8] ^ h[i]`.
-    fn feed_forward(&mut self, i: usize, vi: Self::Word, vi8: Self::Word, hi: Self::Word);
+    /// Feed-forward, low half: `out[i] = v[i] ^ v[i+8]`.
+    fn feed_forward_low(&mut self, i: usize, vi: Self::Word, vi8: Self::Word);
+    /// Feed-forward, high half: `out[i+8] = v[i+8] ^ h[i]`. Called only under
+    /// [`FlowConfig::full_output`].
+    fn feed_forward_high(&mut self, i: usize, vi8: Self::Word, hi: Self::Word);
 }
 
-/// Drive the full 6-round compression through `f`. The message schedule is
-/// tracked as indices into the ORIGINAL m (permute^r composition), so both
-/// interpretations reference original message words — never copies.
-pub(crate) fn run_flow<T: Blake3Flow>(f: &mut T) {
+/// Drive the compression through `f`. The message schedule is tracked as
+/// indices into the ORIGINAL m (permute^r composition), so both interpretations
+/// reference original message words — never copies.
+pub(crate) fn run_flow<T: Blake3Flow>(f: &mut T, cfg: FlowConfig) {
     let h: [T::Word; 8] = core::array::from_fn(|i| f.input_h(i));
     let mut v: [T::Word; 16] = core::array::from_fn(|i| {
         if i < 8 {
@@ -277,7 +317,7 @@ pub(crate) fn run_flow<T: Blake3Flow>(f: &mut T) {
     // this round. permute: m'[i] = m[P[i]] ⇒ sched'[i] = sched[P[i]].
     let mut sched: [usize; 16] = core::array::from_fn(|i| i);
 
-    for r in 0..BLAKE3_ROUNDS {
+    for r in 0..cfg.rounds {
         for (j, &(ia, ib, ic, id)) in G_INDICES.iter().enumerate() {
             let g = r * 8 + j;
             let (va, vb, vc, vd) = (v[ia], v[ib], v[ic], v[id]);
@@ -302,7 +342,7 @@ pub(crate) fn run_flow<T: Blake3Flow>(f: &mut T) {
             v[ic] = c2;
             v[id] = vd2;
         }
-        if r < BLAKE3_ROUNDS - 1 {
+        if r < cfg.rounds - 1 {
             let prev = sched;
             for (i, &p) in BLAKE3_MSG_PERMUTATION.iter().enumerate() {
                 sched[i] = prev[p];
@@ -310,8 +350,11 @@ pub(crate) fn run_flow<T: Blake3Flow>(f: &mut T) {
         }
     }
 
-    for i in 0..8 {
-        f.feed_forward(i, v[i], v[i + 8], h[i]);
+    for i in 0..cfg.out_window {
+        f.feed_forward_low(i, v[i], v[i + 8]);
+        if cfg.full_output {
+            f.feed_forward_high(i, v[i + 8], h[i]);
+        }
     }
 }
 
@@ -328,7 +371,7 @@ pub(crate) enum WordRef {
 }
 
 impl WordRef {
-    fn byte(self, b: usize) -> ByteRef {
+    pub(crate) fn byte(self, b: usize) -> ByteRef {
         match self {
             WordRef::Cols(c) => ByteRef::Col(c[b]),
             WordRef::Const(w) => ByteRef::Const(((w >> (8 * b)) & 0xFF) as u8),
@@ -342,11 +385,16 @@ pub(crate) enum ByteRef {
     Const(u8),
 }
 
-/// One recorded 3-op add: operands (a, b, m columns), output columns, carries.
+/// One recorded 3-op add: operands (a, b, m), output columns, carries.
+///
+/// `m` is a [`WordRef`] rather than four columns because the socket framing
+/// makes `m[8..16]` compile-time constants — the domain tag and the zero
+/// padding of a 36-byte message. Constant message words cost no columns and no
+/// range checks, which is the whole reason the tag is free there.
 pub(crate) struct Add3Wire {
     pub a: WordRef,
     pub b: WordRef,
-    pub m: [usize; 4],
+    pub m: WordRef,
     pub s: [usize; 4],
     pub c1: usize,
     pub c2: usize,
@@ -394,13 +442,13 @@ impl WireFlow {
             xors: Vec::with_capacity(NUM_G * 4 + 16),
             rots: Vec::with_capacity(NUM_G * 2),
         };
-        run_flow(&mut w);
+        run_flow(&mut w, FlowConfig::full(BLAKE3_ROUNDS));
         w
     }
 }
 
 #[inline]
-fn word_cols(start: usize) -> [usize; 4] {
+pub(crate) fn word_cols(start: usize) -> [usize; 4] {
     [start, start + 1, start + 2, start + 3]
 }
 
@@ -429,7 +477,7 @@ impl Blake3Flow for WireFlow {
         self.add3s.push(Add3Wire {
             a,
             b,
-            m: word_cols(cols::in_word(8 + m_idx, 0)),
+            m: WordRef::Cols(word_cols(cols::in_word(8 + m_idx, 0))),
             s,
             c1: cbase,
             c2: cbase + 1,
@@ -484,18 +532,19 @@ impl Blake3Flow for WireFlow {
         WordRef::Cols(y)
     }
 
-    fn feed_forward(&mut self, i: usize, vi: WordRef, vi8: WordRef, hi: WordRef) {
-        let out_lo = word_cols(cols::out_word(i, 0));
-        let out_hi = word_cols(cols::out_word(i + 8, 0));
+    fn feed_forward_low(&mut self, i: usize, vi: WordRef, vi8: WordRef) {
         self.xors.push(XorWire {
             a: vi,
             b: vi8,
-            out: out_lo,
+            out: word_cols(cols::out_word(i, 0)),
         });
+    }
+
+    fn feed_forward_high(&mut self, i: usize, vi8: WordRef, hi: WordRef) {
         self.xors.push(XorWire {
             a: vi8,
             b: hi,
-            out: out_hi,
+            out: word_cols(cols::out_word(i + 8, 0)),
         });
     }
 }
@@ -516,7 +565,8 @@ pub struct ValueFlow {
     pub xors: Vec<(u32, u32, u32)>,
     /// (sll_lo, sllc_lo, sll_hi, sllc_hi, y) per shift rotation.
     pub rots: Vec<(u16, u16, u16, u16, u32)>,
-    /// The 16-word output.
+    /// The output words. Entries outside the framing's truncation window are
+    /// never computed and stay zero — reading one is a caller bug.
     pub out: [u32; 16],
 
     h: [u32; 8],
@@ -525,18 +575,32 @@ pub struct ValueFlow {
 }
 
 impl ValueFlow {
+    /// The syscall-shaped chip's full 16-word compression.
     pub fn compute(h: &[u32; 8], m: &[u32; 16], t: u64, block_len: u32, flags: u32) -> Self {
+        Self::compute_with(h, m, t, block_len, flags, FlowConfig::full(BLAKE3_ROUNDS))
+    }
+
+    /// [`ValueFlow::compute`] under an explicit framing.
+    pub(crate) fn compute_with(
+        h: &[u32; 8],
+        m: &[u32; 16],
+        t: u64,
+        block_len: u32,
+        flags: u32,
+        cfg: FlowConfig,
+    ) -> Self {
+        let g = cfg.rounds * 8;
         let mut f = ValueFlow {
-            add3s: Vec::with_capacity(NUM_G * 2),
-            add2s: Vec::with_capacity(NUM_G * 2),
-            xors: Vec::with_capacity(NUM_G * 4 + 16),
-            rots: Vec::with_capacity(NUM_G * 2),
+            add3s: Vec::with_capacity(g * 2),
+            add2s: Vec::with_capacity(g * 2),
+            xors: Vec::with_capacity(g * 4 + 16),
+            rots: Vec::with_capacity(g * 2),
             out: [0; 16],
             h: *h,
             m: *m,
             v12: [t as u32, (t >> 32) as u32, block_len, flags],
         };
-        run_flow(&mut f);
+        run_flow(&mut f, cfg);
         f
     }
 }
@@ -606,13 +670,16 @@ impl Blake3Flow for ValueFlow {
         y
     }
 
-    fn feed_forward(&mut self, i: usize, vi: u32, vi8: u32, hi: u32) {
+    fn feed_forward_low(&mut self, i: usize, vi: u32, vi8: u32) {
         let lo = vi ^ vi8;
-        let hi_w = vi8 ^ hi;
         self.xors.push((vi, vi8, lo));
-        self.xors.push((vi8, hi, hi_w));
         self.out[i] = lo;
-        self.out[i + 8] = hi_w;
+    }
+
+    fn feed_forward_high(&mut self, i: usize, vi8: u32, hi: u32) {
+        let w = vi8 ^ hi;
+        self.xors.push((vi8, hi, w));
+        self.out[i + 8] = w;
     }
 }
 
@@ -653,7 +720,14 @@ impl Blake3Operation {
 
     /// The compression output.
     pub fn output_words(&self) -> [u32; OUT_U32] {
-        super::blake3::blake3_compress_6round(&self.h, &self.m, self.t, self.block_len, self.flags)
+        blake3_compress_rounds(
+            &self.h,
+            &self.m,
+            self.t,
+            self.block_len,
+            self.flags,
+            BLAKE3_ROUNDS,
+        )
     }
 }
 
@@ -916,7 +990,7 @@ pub fn bitwise_ops_for(ops: &[Blake3Operation]) -> Vec<BitwiseOperation> {
 // =========================================================================
 
 /// Word expression from a [`WordRef`]: `b0 + 256·b1 + 2^16·b2 + 2^24·b3`.
-fn word_expr<B: ConstraintBuilder<F, E>>(b: &B, w: &WordRef) -> B::Expr {
+pub(crate) fn word_expr<B: ConstraintBuilder<F, E>>(b: &B, w: &WordRef) -> B::Expr {
     match w {
         WordRef::Cols(c) => {
             b.main(0, c[0])
@@ -929,7 +1003,7 @@ fn word_expr<B: ConstraintBuilder<F, E>>(b: &B, w: &WordRef) -> B::Expr {
 }
 
 /// Halfword expression from 2 byte columns: `b0 + 256·b1`.
-fn half_expr<B: ConstraintBuilder<F, E>>(b: &B, c: &[usize; 2]) -> B::Expr {
+pub(crate) fn half_expr<B: ConstraintBuilder<F, E>>(b: &B, c: &[usize; 2]) -> B::Expr {
     b.main(0, c[0]) + b.main(0, c[1]) * b.const_base(256)
 }
 
@@ -964,7 +1038,7 @@ impl ConstraintSet<F, E> for Blake3LfmConstraints {
         for aw in &wires.add3s {
             let a = word_expr(b, &aw.a);
             let bb = word_expr(b, &aw.b);
-            let m_w = word_expr(b, &WordRef::Cols(aw.m));
+            let m_w = word_expr(b, &aw.m);
             let s = word_expr(b, &WordRef::Cols(aw.s));
             let c1 = b.main(0, aw.c1);
             let c2 = b.main(0, aw.c2);

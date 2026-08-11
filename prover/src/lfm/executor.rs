@@ -60,6 +60,13 @@ pub enum LfmExecError {
         arena: u32,
         index: u32,
     },
+    /// An `Instr::Hash` outside the selected hasher's domain, with the reason
+    /// the hasher gave (`LfmHasher::admits`). BLAKE3 raises both of its: a
+    /// `Permute` row, for which it has no socket, and a `Compress` input lane
+    /// at or above `2^32`, which its chip cannot decompose into bytes. In both
+    /// cases the program is unprovable under that hasher, so failing here — with
+    /// a reason — beats failing later inside the prover.
+    HasherRejected(&'static str),
     Internal(&'static str),
 }
 
@@ -383,7 +390,23 @@ pub fn execute(
                         in_cols = state;
                     }
                 }
-                let out_state = hasher.permute(state);
+                // A hasher whose socket does not cover this row says so here,
+                // with a reason, rather than producing a witness no AIR accepts.
+                hasher
+                    .admits(*mode, &state)
+                    .map_err(LfmExecError::HasherRejected)?;
+                let out_state = match mode {
+                    // Through `compress_out`, NOT `permute`: a hasher that
+                    // overrides the compress construction — BLAKE3 does, its IV
+                    // entering through `h` rather than the capacity lanes — must
+                    // have that override reach the `OUT` columns.
+                    HashMode::Compress => {
+                        let a: LfmWord = core::array::from_fn(|i| state[i]);
+                        let b: LfmWord = core::array::from_fn(|i| state[4 + i]);
+                        hasher.compress_out(&a, &b)
+                    }
+                    HashMode::Permute => hasher.permute(state),
+                };
                 match mode {
                     HashMode::Compress => {
                         let digest: LfmWord = core::array::from_fn(|i| out_state[i]);

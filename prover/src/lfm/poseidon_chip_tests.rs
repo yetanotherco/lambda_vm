@@ -216,17 +216,31 @@ fn the_poseidon_layout_assigns_every_column_exactly_once() {
     }
 }
 
-/// The bus contract is hasher-INDEPENDENT: same six interactions, same tuples,
-/// reading the same frozen offsets under either configuration.
+/// The `LfmMem` tuple contract is hasher-INDEPENDENT: the same six
+/// interactions, the same tuples, reading the same frozen offsets under every
+/// configuration.
 ///
 /// This is what lets a candidate be swapped in without touching `LfmMem`, and it
-/// is why the census's `aux_cols` is 3 in both columns of the matrix.
+/// is why the census's `aux_cols` is 3 in both columns of the Test/Poseidon
+/// matrix.
+///
+/// What is NOT hasher-independent is the interaction list as a whole: a
+/// candidate built from byte operations brings its own lookups, and
+/// `HasherKind::Blake3` brings over a thousand `BITWISE` ones. That is asserted
+/// here as an inequality rather than left implicit, because "the bus contract
+/// does not move" is exactly the sentence a BLAKE3 arm makes half-true.
 #[test]
-fn the_bus_contract_does_not_move_with_the_hasher() {
-    assert_eq!(hash::bus_interactions().len(), 6);
+fn the_lfm_mem_tuple_contract_does_not_move_with_the_hasher() {
+    for kind in [HasherKind::Test, HasherKind::Poseidon] {
+        assert_eq!(hash::bus_interactions(kind).len(), 6, "{kind:?}");
+    }
+    assert!(
+        hash::bus_interactions(HasherKind::Blake3).len() > 6,
+        "BLAKE3 must add its BITWISE lookups to the frozen six"
+    );
     assert_eq!(hash::num_columns(HasherKind::Test), pc::PREP_WIDTH + 28);
     assert_eq!(hash::num_columns(HasherKind::Poseidon), pc::NUM_COLUMNS);
-    // The tuple columns the bus reads are the frozen prefix in both layouts.
+    // The tuple columns the bus reads are the frozen prefix in every layout.
     const { assert!(hash::cols::OUT0 + HASH_STATE_FELTS <= pc::PREP_WIDTH + 28) };
 }
 

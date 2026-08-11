@@ -18,6 +18,7 @@
 pub mod airs;
 pub mod blake3;
 pub mod blake3_chip;
+pub mod blake3_socket;
 pub mod builder;
 pub mod chips;
 pub mod chunking;
@@ -72,6 +73,10 @@ pub use word::{LfmWord, base_word, ext_word, pack_digest, unpack_digest};
 
 #[cfg(test)]
 mod blake3_probe;
+#[cfg(test)]
+mod blake3_socket_kats;
+#[cfg(test)]
+mod blake3_socket_tests;
 #[cfg(test)]
 mod constraint_tests;
 #[cfg(test)]
