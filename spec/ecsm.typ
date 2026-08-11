@@ -59,7 +59,8 @@ The accelerator serves two ECALL variants, selected by the `is_affine` column:
 / affine ($#`is_affine` = 1$): the guest supplies the full point $x_G ‖ y_G$ (64 bytes) and receives the full point $x_R ‖ y_R$ (64 bytes).
 
 A single chip instance serves both variants: `is_affine` selects the ECALL-number the chip answers to, and gates the two memory accesses the affine variant adds (@ec:c:read_yG, @ec:c:write_yR) together with the address derivations they need.
-Every other constraint is shared, and the $x$-only path is unchanged by the addition.
+Every other constraint is shared between the two.
+The one addition that is _not_ gated is the $y_R < p$ check (@ec:c:yR_addition_overflows): it applies on every active row, so the $x$-only path is now obliged to witness a canonical $y_R$ as well.
 Returning $y_R$ spares the guest a second scalar multiplication: without it, the only way to recover $y(k times G)$ is to query $x((k+1) times G)$ as well and apply the chord-addition law.
 
 #attention("Variable space.")[
@@ -144,7 +145,7 @@ Once triggered, it loads register `x11` to see where $x_G$ is stored in memory (
 On the affine variant, the input point comes with its $y$-coordinate.
 The four addresses at which it is stored are derived from `addr_xG[0]` rather than from a fourth register (@ec:c:extrapolate_addr_yG), since the guest passes $x_G ‖ y_G$ as one contiguous 64-byte buffer.
 The read itself (@ec:c:read_yG) carries multiplicity `is_affine`, so it is inert on $x$-only rows — where the guest has no $y_G$ in memory to read — and on padding rows.
-It shares its `timestamp` with the $x_G$-read (@ec:c:read_xG), which is sound because the two cover disjoint addresses.
+It shares its `timestamp` with the $x_G$-read (@ec:c:read_xG); the two cover disjoint addresses, which is exactly the condition under which @memory:aside:granularity permits a shared timestamp.
 #render_constraint_table(ecsm_chip, config, groups: "read_yG")
 
 === Range check `xG`
@@ -246,7 +247,7 @@ Note that the `timestamp` on both memory accesses is offset to allow `addr_xR` t
 
 === Write `yR`
 On the affine variant, $y_R$ is written directly after $x_R$, at addresses derived from `addr_xR[0]` (@ec:c:extrapolate_addr_yR); as on the input side, the output buffer is one contiguous 64-byte region and no extra register is read.
-The write carries multiplicity `is_affine` (@ec:c:write_yR) and uses $#`timestamp` + 3$, the fourth and last sub-timestamp of the instruction: $x_G$ and $y_G$ occupy `timestamp`, $k$ occupies $#`timestamp` + 1$ and $x_R$ occupies $#`timestamp` + 2$.
+The write carries multiplicity `is_affine` (@ec:c:write_yR) and uses $#`timestamp` + 3$, the fourth and last of the cycle's sub-timestamps (@memory:aside:granularity): $x_G$ and $y_G$ occupy `timestamp`, $k$ occupies $#`timestamp` + 1$ and $x_R$ occupies $#`timestamp` + 2$.
 Placing it last also keeps $x_R ‖ y_R$ overwriting $x_G ‖ y_G$ legal.
 #render_constraint_table(ecsm_chip, config, groups: "write_yR")
 
