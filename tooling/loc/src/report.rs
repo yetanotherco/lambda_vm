@@ -21,6 +21,8 @@ pub struct LinesOfCodeReport {
     pub crates: Vec<(String, usize)>,
     #[serde(default)]
     pub tools: Vec<(String, usize)>,
+    #[serde(default)]
+    pub formal_verification: Vec<(String, usize)>,
 }
 
 pub fn pr_message(
@@ -195,6 +197,32 @@ pub fn slack_message(old_report: LinesOfCodeReport, new_report: LinesOfCodeRepor
             )
         });
 
+    let formal_verification_mrkdwn =
+        new_report
+            .formal_verification
+            .iter()
+            .fold(String::new(), |acc, (gate_name, loc)| {
+                let old_loc = old_report
+                    .formal_verification
+                    .iter()
+                    .find(|(old_gate_name, _)| old_gate_name == gate_name)
+                    .map(|(_, old_loc)| old_loc)
+                    .unwrap_or(&0);
+
+                let loc_diff = loc.abs_diff(*old_loc);
+                format!(
+                    "{}*{}*: {} {}\\n",
+                    acc,
+                    gate_name,
+                    loc,
+                    match loc.cmp(old_loc) {
+                        std::cmp::Ordering::Greater => format!("(+{loc_diff})"),
+                        std::cmp::Ordering::Less => format!("(-{loc_diff})"),
+                        std::cmp::Ordering::Equal => "".to_string(),
+                    }
+                )
+            });
+
     let tools_block = if !new_report.tools.is_empty() {
         format!(
             r#",
@@ -213,6 +241,29 @@ pub fn slack_message(old_report: LinesOfCodeReport, new_report: LinesOfCodeRepor
             }}
         }}"#,
             tools_mrkdwn
+        )
+    } else {
+        String::new()
+    };
+
+    let formal_verification_block = if !new_report.formal_verification.is_empty() {
+        format!(
+            r#",
+        {{
+            "type": "header",
+            "text": {{
+                "type": "plain_text",
+                "text": "Formal Verification"
+            }}
+        }},
+        {{
+            "type": "section",
+            "text": {{
+                "type": "mrkdwn",
+                "text": "{}"
+            }}
+        }}"#,
+            formal_verification_mrkdwn
         )
     } else {
         String::new()
@@ -258,7 +309,7 @@ pub fn slack_message(old_report: LinesOfCodeReport, new_report: LinesOfCodeRepor
                 "type": "mrkdwn",
                 "text": "{}"
             }}
-        }}{}
+        }}{}{}
     ]
 }}"#,
         new_report.lambda_vm,
@@ -268,7 +319,8 @@ pub fn slack_message(old_report: LinesOfCodeReport, new_report: LinesOfCodeRepor
             std::cmp::Ordering::Equal => "".to_string(),
         },
         crates_mrkdwn,
-        tools_block
+        tools_block,
+        formal_verification_block
     )
 }
 
@@ -330,6 +382,40 @@ pub fn github_step_summary(old_report: LinesOfCodeReport, new_report: LinesOfCod
         String::new()
     };
 
+    let formal_verification_github = if !new_report.formal_verification.is_empty() {
+        let formal_verification_list =
+            new_report
+                .formal_verification
+                .iter()
+                .fold(String::new(), |acc, (gate_name, loc)| {
+                    let old_loc = old_report
+                        .formal_verification
+                        .iter()
+                        .find(|(old_gate_name, _)| old_gate_name == gate_name)
+                        .map(|(_, old_loc)| old_loc)
+                        .unwrap_or(&0);
+
+                    let loc_diff = loc.abs_diff(*old_loc);
+                    format!(
+                        "{}{}: {} {}\n",
+                        acc,
+                        gate_name,
+                        loc,
+                        match loc.cmp(old_loc) {
+                            std::cmp::Ordering::Greater => format!("(+{loc_diff})"),
+                            std::cmp::Ordering::Less => format!("(-{loc_diff})"),
+                            std::cmp::Ordering::Equal => "".to_string(),
+                        }
+                    )
+                });
+        format!(
+            "\nlambda_vm formal verification loc (standalone)\n=================\n{}",
+            formal_verification_list
+        )
+    } else {
+        String::new()
+    };
+
     format!(
         r#"```
 lambda_vm loc summary
@@ -338,7 +424,7 @@ lambda_vm (total): {} {}
 
 lambda_vm crates loc
 =================
-{}{}
+{}{}{}
 ```"#,
         new_report.lambda_vm,
         if new_report.lambda_vm > old_report.lambda_vm {
@@ -347,7 +433,8 @@ lambda_vm crates loc
             format!("(-{diff_total})")
         },
         crates_github,
-        tools_github
+        tools_github,
+        formal_verification_github
     )
 }
 
@@ -367,8 +454,23 @@ pub fn shell_summary(new_report: LinesOfCodeReport) -> String {
         String::new()
     };
 
+    let formal_verification_line = if !new_report.formal_verification.is_empty() {
+        format!(
+            "\n{} {}",
+            "formal verification:".bold(),
+            new_report
+                .formal_verification
+                .iter()
+                .map(|(name, loc)| format!("{}: {}", name, loc))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    } else {
+        String::new()
+    };
+
     format!(
-        "{}\n{}\n{} {}\n{} {}{}",
+        "{}\n{}\n{} {}\n{} {}{}{}",
         "Lines of Code".bold(),
         "=============".bold(),
         "lambda_vm (total):".bold(),
@@ -380,6 +482,7 @@ pub fn shell_summary(new_report: LinesOfCodeReport) -> String {
             .map(|(name, loc)| format!("{}: {}", name, loc))
             .collect::<Vec<_>>()
             .join(", "),
-        tools_line
+        tools_line,
+        formal_verification_line
     )
 }
