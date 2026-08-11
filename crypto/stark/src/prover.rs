@@ -3469,6 +3469,8 @@ pub trait IsStarkProver<
                                 // drain releases those peaks, so one retry
                                 // tends to keep the table fully resident
                                 // instead of paying the host downgrade.
+                                crate::gpu_lde::GPU_RESIDENT_AUX_RETRIES
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 eprintln!(
                                     "[gpu] resident aux LDE declined: table={} \
                                      (retrying after device drain)",

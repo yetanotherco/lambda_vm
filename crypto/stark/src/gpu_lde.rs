@@ -117,6 +117,7 @@ pub fn reset_all_gpu_call_counters() {
     GPU_OPENING_GATHER_CALLS.store(0, Ordering::Relaxed);
     GPU_DEVICE_ONLY_CALLS.store(0, Ordering::Relaxed);
     GPU_DEVICE_ONLY_DOWNGRADES.store(0, Ordering::Relaxed);
+    GPU_RESIDENT_AUX_RETRIES.store(0, Ordering::Relaxed);
 }
 
 pub(crate) static GPU_EXTEND_HALVES_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -1475,6 +1476,17 @@ pub(crate) static GPU_BATCH_INVERT_CALLS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static GPU_DEVICE_ONLY_DOWNGRADES: AtomicU64 = AtomicU64::new(0);
 pub fn gpu_device_only_downgrades() -> u64 {
     GPU_DEVICE_ONLY_DOWNGRADES.load(Ordering::Relaxed)
+}
+
+/// Times the R1 resident-aux LDE declined and the prover drained the device to
+/// retry it (prover.rs). Nonzero means the device hit transient VRAM pressure —
+/// the retry is what keeps a decline from becoming the host downgrade counted
+/// by [`GPU_DEVICE_ONLY_DOWNGRADES`], so a run with retries but no downgrades
+/// paid nothing but the drain. Counts declines, not outcomes: it is bumped
+/// before the retry, whether or not the retry then succeeds.
+pub(crate) static GPU_RESIDENT_AUX_RETRIES: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_resident_aux_retries() -> u64 {
+    GPU_RESIDENT_AUX_RETRIES.load(Ordering::Relaxed)
 }
 
 /// Recover a device-only table for the host path: download the resident main
