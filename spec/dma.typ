@@ -26,7 +26,7 @@ This accelerator replaces all of that with a single row per eight copied bytes.
 #let nr_columns = total_nr_instantiated_columns(chip, config)
 #let nr_interactions = compute_nr_interactions(chip)
 
-The #dma chip leverages #nr_variables variables, spanning #nr_columns columns and leverages #nr_interactions interactions:
+The #dma chip is comprised of #nr_variables variables that are expressed using #nr_columns columns and leverages #nr_interactions interactions:
 #render_chip_variable_table(chip, config)
 
 = Assumptions
@@ -71,7 +71,7 @@ The guest-side `memcpy` chunks larger copies into multiple `ECALL`s; the executo
 
 #aside("Why a one-byte tail")[
   Selecting between exactly two widths lets `tail` be a single bit, so $#`step` = 8 - 7 dot #`tail`$ stays linear and every constraint in this chip stays of degree 2.
-  Splitting the remainder into four-, two- and one-byte chunks instead would shave off at most three rows per sequence, at the cost of a two-bit width selector and a decoding of that selector into `MEMW`'s `write2`/`write4`/`write8` flags.
+  Splitting the remainder into four-, two- and one-byte chunks instead would shave off at most four rows per sequence, at the cost of a two-bit width selector and a decoding of that selector into `MEMW`'s `write2`/`write4`/`write8` flags.
 ]
 
 == Performing the copy
@@ -118,6 +118,7 @@ We use the `end` bit to indicate these circumstances.
   $
   Without those range checks the sum could reach $4 dot 65535$ for a `count_decr` other than $2^64 - 1$, and `end` would be claimable at a nonzero count.
   That matters more here than the shape of the constraint suggests: since both memory interactions carry multiplicity $#`μ` - #`end`$, a row that wrongly claims `end` emits no memory operations at all, which is a silently truncated copy with every bus balanced.
++ A copy of zero bytes is a single row with $#`first` = #`end` = 1$: it accepts the `ECALL` and reads the three registers, but emits no memory operations and starts no recursion.
 
 == Chaining the rows
 When this was not the last chunk of this sequence, we recursively copy the next chunk over the `DMA_NEXT` bus, specifying the timestamp, the addresses to continue reading and writing at, and the number of bytes that still have to be copied (@dma:c:send_copy_next_chunk).
@@ -141,8 +142,9 @@ To pad this chip, use the below data.
 #render_chip_padding_table(chip, config)
 
 Note that this padding row is not all-zero.
-@dma:c:count_decr is unconditional, so a padding row has to satisfy it: $#`tail` = 1$ makes $#`step` = 1$, which $#`count` = 1$ and $#`count_decr` = 0$ then satisfy.
-The same holds for the two address updates, whence $#`src_incr` = #`dst_incr` = 1$.
+@dma:c:count_decr is unconditional, so a padding row has to satisfy it too: $#`tail` = 1$ makes $#`step` = 1$, which $#`count` = 1$ and $#`count_decr` = 0$ then satisfy.
+The two address updates carry the condition $#`μ` - #`end`$ and hence impose nothing on a padding row.
+Assigning them $#`src_incr` = #`dst_incr` = 1$ anyway keeps a padding row a well-formed inactive one-byte step, rather than one that merely happens to be unconstrained.
 
 = Notes/optimizations
 - The copy is a `memmove` per `ECALL`, but _not_ per guest-level `memcpy`: a copy larger than 256 bytes is chunked into several `ECALL`s at distinct timestamps, and chunk $k+1$ reads what chunk $k$ has already written.
