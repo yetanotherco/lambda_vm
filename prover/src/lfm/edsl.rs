@@ -90,6 +90,24 @@ impl SpongeVar {
             .as_cell();
     }
 
+    /// Absorb a cell of four arbitrary FIELD ELEMENTS.
+    ///
+    /// Data enters the transcript the same way it enters a Merkle tree: through
+    /// the LEAF encoding. The cell is hashed to a digest in the `"LFML"` domain
+    /// and that digest is absorbed, so the chain binds the data up to the leaf
+    /// hash's collision resistance.
+    ///
+    /// ⚠ **Use this for DATA and [`SpongeVar::absorb`] for DIGESTS.** Absorbing
+    /// raw field elements would hand the socket lanes that are not `u32`, which
+    /// under the machine's real hash is not a preference but an unprovable row
+    /// (obligation O1). A transcript that absorbs commitments needs `absorb`; one
+    /// that absorbs polynomial coefficients, evaluations or any other field data
+    /// needs this.
+    pub fn absorb_felts(&mut self, b: &mut LfmBuilder, c: Cell) {
+        let d = b.leaf(c);
+        self.absorb(b, d.as_cell());
+    }
+
     /// Absorb two cells, in order. Two steps, not one: the chain takes one
     /// operand per step, and the ORDER is what the transcript binds.
     pub fn absorb2(&mut self, b: &mut LfmBuilder, c0: Cell, c1: Cell) {
@@ -131,6 +149,25 @@ impl SpongeVar {
         let [l0, _, _, _] = b.unpack(c);
         b.bit_dec(l0, nbits)
     }
+}
+
+/// The Merkle LEAF digest of a pair of data cells — eight field elements.
+///
+/// **Three compressions, and the shape is the point:** each cell is hashed as
+/// four felts in the `"LFML"` domain, then the two results are combined by an
+/// ordinary `"LFMC"` parent. So a leaf's *data* never enters a compress as a
+/// digest, and a parent never enters as data — which is what makes an internal
+/// node un-replayable as a leaf regardless of the tree's depth (obligation O5,
+/// now discharged by the tag rather than by fixed depth).
+///
+/// It replaced `compress(cell0, cell1)`, which was one compression and treated
+/// arbitrary field elements as if they were `u32` digest lanes. Under a hash
+/// whose lanes must BE `u32` that is not merely undesirable, it is unprovable —
+/// which is why FRI data could not be hashed at all before this mode existed.
+pub fn leaf_hash_pair(b: &mut LfmBuilder, c0: Cell, c1: Cell) -> DigestVal {
+    let d0 = b.leaf(c0);
+    let d1 = b.leaf(c1);
+    b.compress(d0, d1)
 }
 
 /// Walk one Merkle authentication path. `bits` are the leaf-index bits

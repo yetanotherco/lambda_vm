@@ -92,6 +92,10 @@ mod join_tests;
 #[cfg(test)]
 mod keccak_probe;
 #[cfg(test)]
+mod leaf_kats;
+#[cfg(test)]
+mod leaf_tests;
+#[cfg(test)]
 mod logup_tests;
 #[cfg(test)]
 mod machine_tests;

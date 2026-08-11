@@ -52,7 +52,12 @@ type Gl3 = GoldilocksExtension;
 /// from the code under test would agree with any layout, including a wrong one.
 const PINNED_VALUE_COLUMNS: usize = 612;
 /// §6.4's pinned constraint count, same reasoning.
-const PINNED_CONSTRAINTS: usize = 601;
+/// §6.4's pinned constraint count, plus the shared unread-input pins.
+///
+/// 601 was the figure §6.4 pinned; the +8 are `chips::hash`'s unread-`IN` pins,
+/// which every arm emits since the D1 fix (a leaf row's unread cells were free
+/// on this arm, and this arm's round 0 reads them).
+const PINNED_CONSTRAINTS: usize = 601 + super::chips::hash::NUM_UNREAD_INPUT_PINS;
 /// §6.3's pinned base-equivalent cells per permutation: `612 + 3·3`.
 const PINNED_CELLS_PER_PERMUTATION: u64 = 621;
 
@@ -160,9 +165,10 @@ fn the_poseidon_layout_is_612_value_columns() {
         28 + 7 * 36 + 24 + 22 * 14,
         "the two arrangements must agree on the total"
     );
-    // 12 since option B1 added `MODE_T` (was 11) — the same number the BLAKE3
-    // arm pins, because the prefix is the hasher-independent instruction group.
-    assert_eq!(pc::PREP_WIDTH, 12, "the preprocessed prefix does not move");
+    // 13: option B1's `MODE_T` took it from 11 to 12 and option C's `MODE_L`
+    // to 13 — the same number the BLAKE3 arm pins, because the prefix is the
+    // hasher-independent instruction group.
+    assert_eq!(pc::PREP_WIDTH, 13, "the preprocessed prefix does not move");
 }
 
 /// The layout is injective and gapless — no column is written twice, none is
@@ -263,7 +269,13 @@ fn every_poseidon_constraint_is_degree_three_or_less() {
         n, PINNED_CONSTRAINTS,
         "the built constraint set must be the size §6.4 pinned"
     );
-    assert_eq!(PINNED_CONSTRAINTS, 4 + 1 + 8 * 36 + 22 * 14);
+    // 4 capacity copies + the mode-sum booleanity + the rounds, plus the
+    // shared unread-input pins every arm emits (`chips::hash`'s single
+    // derivation — the D1 fix). §6.4 pinned the pre-pin figure of 601.
+    assert_eq!(
+        PINNED_CONSTRAINTS,
+        4 + 1 + 8 * 36 + 22 * 14 + super::chips::hash::NUM_UNREAD_INPUT_PINS
+    );
     for (i, m) in meta.iter().enumerate() {
         assert_eq!(m.constraint_idx, i, "meta must be dense and idx-ordered");
         assert_eq!(m.kind, RootKind::Base, "every hash constraint is base");
@@ -543,7 +555,7 @@ fn a_proof_does_not_verify_under_the_other_hasher() {
 ///
 /// Both halves matter and they are in one test because the second exists only
 /// because of the first. `build_artifacts` commits the preprocessed column
-/// groups, and `PREP_WIDTH` is the same in both layouts (12 since `MODE_T`)
+/// groups, and `PREP_WIDTH` is the same in both layouts (13 since `MODE_L`)
 /// with the preprocessed group untouched, so every root really is bit-identical
 /// across hashers. That is
 /// what makes the commitments unable to carry the hasher, and it is why

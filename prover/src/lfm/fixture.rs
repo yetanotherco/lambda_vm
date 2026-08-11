@@ -20,7 +20,7 @@ use math::field::traits::{IsFFTField, IsPrimeField};
 use crate::tables::types::{FE, FEE, GoldilocksField};
 
 use super::edsl::SQUEEZE_MARK;
-use super::hash::{HasherKind, LfmHasher, TestPermutation};
+use super::hash::{HasherKind, LfmHasher};
 use super::word::{LfmWord, base_word, ext_word};
 
 /// The fixed shape — compile-time constants of the emitted program.
@@ -107,6 +107,14 @@ impl HostSponge {
         self.absorb(c1);
     }
 
+    /// Absorb a cell of four arbitrary FIELD ELEMENTS — the host mirror of
+    /// [`super::edsl::SpongeVar::absorb_felts`]. Data enters the transcript
+    /// through the leaf encoding, exactly as it enters a tree.
+    pub fn absorb_felts(&mut self, c: &LfmWord) {
+        let d = self.hasher.leaf(c);
+        self.absorb(&d);
+    }
+
     /// Output the current state, then advance past it with `SQ(i)`.
     pub fn squeeze_cell(&mut self) -> LfmWord {
         let out = self.state;
@@ -127,21 +135,39 @@ impl HostSponge {
     }
 }
 
-/// A binary Merkle tree over word digests (TestPermutation compress).
+/// The host's Merkle LEAF over a pair of DATA cells — the mirror of
+/// [`super::edsl::leaf_hash_pair`].
+///
+/// Three hasher calls, in the machine's order: each cell as four felts in the
+/// leaf domain, then an ordinary parent. Written beside the tree rather than
+/// inside it because a tree's *leaves* are data and its *nodes* are digests, and
+/// this is the one place that distinction becomes two different hash domains.
+pub fn host_leaf_hash_pair(hasher: HasherKind, c0: &LfmWord, c1: &LfmWord) -> LfmWord {
+    hasher.compress(&hasher.leaf(c0), &hasher.leaf(c1))
+}
+
+/// A binary Merkle tree over word digests.
+///
+/// ⚠ Parameterised by hasher, and it has to be: the machine authenticates these
+/// openings with `edsl::merkle_walk`, which compresses under whichever hasher
+/// the proof is built with. A tree that hard-coded one hasher would produce
+/// roots the machine cannot reproduce the moment the proof is under another —
+/// the failure would surface as an authentication error deep in a query walk,
+/// which is a slow way to learn about a fixture bug.
 pub struct HostTree {
     /// levels[0] = leaves … levels.last() = [root].
     pub levels: Vec<Vec<LfmWord>>,
 }
 
 impl HostTree {
-    pub fn build(leaves: Vec<LfmWord>) -> Self {
+    pub fn build(hasher: HasherKind, leaves: Vec<LfmWord>) -> Self {
         assert!(leaves.len().is_power_of_two());
         let mut levels = vec![leaves];
         while levels.last().unwrap().len() > 1 {
             let prev = levels.last().unwrap();
             let next: Vec<LfmWord> = prev
                 .chunks_exact(2)
-                .map(|pair| TestPermutation.compress(&pair[0], &pair[1]))
+                .map(|pair| hasher.compress(&pair[0], &pair[1]))
                 .collect();
             levels.push(next);
         }
@@ -195,25 +221,44 @@ fn row_word(cols: &[Vec<FE>; shape::NUM_COLS], i: usize) -> LfmWord {
     core::array::from_fn(|k| cols[k][i])
 }
 
-/// Runs the fixture prover over the honest columns.
+/// Runs the fixture prover over the honest columns, under the machine's
+/// default hasher.
 pub fn fixture_prove() -> FriToyProof {
     fixture_prove_columns(&fixture_columns())
 }
 
+/// [`fixture_prove`] under an explicitly chosen hasher.
+pub fn fixture_prove_with_hasher(hasher: HasherKind) -> FriToyProof {
+    fixture_prove_columns_with_hasher(&fixture_columns(), hasher)
+}
+
 /// The prover proper, over arbitrary columns (tests tamper these).
 pub fn fixture_prove_columns(cols: &[Vec<FE>; shape::NUM_COLS]) -> FriToyProof {
+    fixture_prove_columns_with_hasher(cols, HasherKind::default())
+}
+
+/// [`fixture_prove_columns`] under an explicitly chosen hasher.
+///
+/// Every hash this performs — leaves, tree nodes and the transcript — goes
+/// through `hasher`, so the proof it produces is one the machine can
+/// authenticate when proved under the same choice, and only then.
+pub fn fixture_prove_columns_with_hasher(
+    cols: &[Vec<FE>; shape::NUM_COLS],
+    hasher: HasherKind,
+) -> FriToyProof {
     let omega = GoldilocksField::get_primitive_root_of_unity(shape::LOG_LDE as u64)
         .expect("32nd root of unity");
     let offset = FE::from(shape::COSET_OFFSET);
     let half = shape::LDE_SIZE / 2; // 16
 
-    // Main tree: row-pair leaves, leaf l = compress(row 2l, row 2l+1).
+    // Main tree: row-pair leaves. A leaf is DATA, so it hashes in the leaf
+    // domain — two LFML rows and an LFMC parent, mirroring the emitter.
     let leaves: Vec<LfmWord> = (0..shape::LDE_SIZE / 2)
-        .map(|l| TestPermutation.compress(&row_word(cols, 2 * l), &row_word(cols, 2 * l + 1)))
+        .map(|l| host_leaf_hash_pair(hasher, &row_word(cols, 2 * l), &row_word(cols, 2 * l + 1)))
         .collect();
-    let main_tree = HostTree::build(leaves);
+    let main_tree = HostTree::build(hasher, leaves);
 
-    let mut sponge = HostSponge::new();
+    let mut sponge = HostSponge::with_hasher(hasher);
     sponge.absorb(&main_tree.root());
     let alpha = sponge.squeeze_ext();
     let zeta0 = sponge.squeeze_ext();
@@ -238,12 +283,14 @@ pub fn fixture_prove_columns(cols: &[Vec<FE>; shape::NUM_COLS]) -> FriToyProof {
         })
         .collect();
 
-    // L1 tree co-locates fold partners: leaf j = compress(g1[j], g1[j+8]).
+    // L1 tree co-locates fold partners: leaf j covers g1[j] and g1[j+8]. These
+    // are folded EXTENSION elements — arbitrary field data — so they are leaves
+    // in exactly the same sense the trace rows are.
     let quarter = half / 2; // 8
     let l1_leaves: Vec<LfmWord> = (0..quarter)
-        .map(|j| TestPermutation.compress(&ext_word(&g1[j]), &ext_word(&g1[j + quarter])))
+        .map(|j| host_leaf_hash_pair(hasher, &ext_word(&g1[j]), &ext_word(&g1[j + quarter])))
         .collect();
-    let l1_tree = HostTree::build(l1_leaves);
+    let l1_tree = HostTree::build(hasher, l1_leaves);
 
     sponge.absorb(&l1_tree.root());
     let zeta1 = sponge.squeeze_ext();
@@ -270,7 +317,10 @@ pub fn fixture_prove_columns(cols: &[Vec<FE>; shape::NUM_COLS]) -> FriToyProof {
         debug_assert_eq!(*v, &t0 + &t1 * embed(&y), "terminal degree bound violated");
     }
 
-    sponge.absorb2(&ext_word(&t0), &ext_word(&t1));
+    // t0 and t1 are the terminal polynomial's COEFFICIENTS — field data, not
+    // digests — so they enter the transcript through the leaf encoding.
+    sponge.absorb_felts(&ext_word(&t0));
+    sponge.absorb_felts(&ext_word(&t1));
 
     // Queries.
     let mut openings = Vec::new();

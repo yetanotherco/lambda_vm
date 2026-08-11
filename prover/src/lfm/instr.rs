@@ -44,9 +44,10 @@ pub enum ExtOp {
     MulBase,
 }
 
-/// The three hash-chiplet modes. `Compress`: two digest cells → one digest
-/// cell. `Transcript`: the same shape in the Fiat–Shamir domain.
-/// `Permute`: three state cells → three state cells.
+/// The four hash-chiplet modes. `Compress`: two digest cells → one digest
+/// cell. `Transcript`: the same shape in the Fiat–Shamir domain. `Leaf`: one
+/// cell of four FIELD ELEMENTS → one digest cell. `Permute`: three state cells
+/// → three state cells.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HashMode {
     Compress,
@@ -61,6 +62,27 @@ pub enum HashMode {
     /// function in both modes; the separation is a property of the hasher, not
     /// of the machine.
     Transcript,
+    /// A Merkle LEAF over four arbitrary field elements.
+    ///
+    /// **This mode implies felt-input semantics**, by decision rather than by
+    /// inference. The other modes read their input cells as digests — four
+    /// `u32` lanes; this one reads ONE cell as four Goldilocks elements and
+    /// splits each into a checked `lo`/`hi` `u32` pair, so eight halves fill the
+    /// same eight message lanes a digest-mode row uses. That is what lets FRI
+    /// data — LDE evaluations and folded extension elements, none of them `u32`
+    /// — reach a hash whose inputs must be `u32`.
+    ///
+    /// It is also what retires obligation O5 — **under a hasher that separates
+    /// the domains.** BLAKE3 does: a leaf is `BLAKE3(…‖"LFML")` and a parent is
+    /// `BLAKE3(…‖"LFMC")`, so an internal node cannot be replayed as a leaf
+    /// whatever the tree's shape, where before that rested on every eDSL circuit
+    /// being fixed-depth — true, but enforced by nothing.
+    ///
+    /// ⚠ The mode is a machine-level shape, not a guarantee. A single-domain
+    /// hasher computes the same function in both modes, so under `Test` and
+    /// `Poseidon` O5 still rests on fixed depth exactly as it did before. The
+    /// separation is a property of the HASHER; see `LfmHasher::leaf_out`.
+    Leaf,
     Permute,
 }
 
@@ -69,10 +91,31 @@ impl HashMode {
     /// `Compress` and `Transcript`, which differ only in hash domain.
     ///
     /// Every place that used to match `Compress` for a *shape* reason routes
-    /// through here, so adding a third domain later cannot silently take the
-    /// permute arm.
+    /// through here, so adding a domain cannot silently take the permute arm.
     pub const fn is_two_to_one(self) -> bool {
         matches!(self, HashMode::Compress | HashMode::Transcript)
+    }
+
+    /// Input cells this mode reads from memory: 2, 1 or 3.
+    ///
+    /// The `LFM_HASH` bus receives are gated by exactly this, so a mode that
+    /// reads fewer cells must not receive the ones it does not read — a leaf row
+    /// receiving a second cell would be claiming a memory read it never makes.
+    pub const fn num_input_cells(self) -> usize {
+        match self {
+            HashMode::Compress | HashMode::Transcript => 2,
+            HashMode::Leaf => 1,
+            HashMode::Permute => 3,
+        }
+    }
+
+    /// Output cells this mode writes: 1 for every hashing mode, 3 for a
+    /// permutation.
+    pub const fn num_output_cells(self) -> usize {
+        match self {
+            HashMode::Permute => 3,
+            _ => 1,
+        }
     }
 }
 
@@ -125,9 +168,10 @@ pub enum KeccakMode {
 /// - `c` on the ALU ops is meaningful iff the op is `MulAdd` (and is emitted
 ///   as address 0 otherwise — the corresponding bus receive is gated by the
 ///   `MulAdd` selector, so the placeholder is never read).
-/// - `Hash` in a two-to-one mode (`Compress`, `Transcript`) uses `ins[0..2]`
-///   and `outs[0]` only; the remaining slots are `Addr(0)` placeholders with
-///   `mults` fixed to 0.
+/// - `Hash` uses `ins[..num_input_cells()]` and `outs[..num_output_cells()]`
+///   only — 2/1 for `Compress` and `Transcript`, 1/1 for `Leaf`, 3/3 for
+///   `Permute`; the remaining slots are `Addr(0)` placeholders with `mults`
+///   fixed to 0, and the validator checks both ends.
 /// - `BitDec.bits` lists, low-to-high from bit 0, exactly the bit cells the
 ///   program consumes; bits beyond `bits.len()` exist as constrained witness
 ///   columns but get no memory cell.
@@ -226,13 +270,7 @@ impl Instr {
             }
             Instr::Select { out_l, out_r, .. } => vec![*out_l, *out_r],
             Instr::BitDec { bits, .. } => bits.iter().map(|(a, _)| *a).collect(),
-            Instr::Hash { mode, outs, .. } => {
-                if mode.is_two_to_one() {
-                    vec![outs[0]]
-                } else {
-                    outs.to_vec()
-                }
-            }
+            Instr::Hash { mode, outs, .. } => outs[..mode.num_output_cells()].to_vec(),
             Instr::Public { .. } => vec![],
         }
     }
@@ -260,13 +298,7 @@ impl Instr {
                 bit, in_l, in_r, ..
             } => vec![*bit, *in_l, *in_r],
             Instr::BitDec { input, .. } => vec![*input],
-            Instr::Hash { mode, ins, .. } => {
-                if mode.is_two_to_one() {
-                    vec![ins[0], ins[1]]
-                } else {
-                    ins.to_vec()
-                }
-            }
+            Instr::Hash { mode, ins, .. } => ins[..mode.num_input_cells()].to_vec(),
             Instr::Pack { lanes, .. } => lanes.to_vec(),
             Instr::Unpack { input, .. } => vec![*input],
             Instr::KeccakF(k) => match k.mode {

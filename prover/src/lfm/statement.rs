@@ -42,7 +42,7 @@ const LFM_STATEMENT_TAG: &[u8] = b"LAMBDAVM_LFM_STATEMENT_V1";
 /// `hasher` is bound for the same reason and is the one piece of program shape
 /// the roots cannot carry: `LFM_HASH`'s preprocessed group is its INSTRUCTION
 /// group — addresses, mode selectors and multiplicities — which no candidate
-/// changes, so every hasher commits the same width (12 since `MODE_T`) and the
+/// changes, so every hasher commits the same width (13 since `MODE_L`) and the
 /// commitments are hasher-independent by construction (`airs.rs`). Without this
 /// tag the only thing separating one permutation's machine from another's would
 /// be a main-trace width coincidence, which a third candidate could collide

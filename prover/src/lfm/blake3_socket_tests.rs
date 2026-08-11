@@ -81,9 +81,10 @@ fn options() -> ProofOptions {
 /// Written as a formula over named blocks rather than taken from the layout,
 /// because a closed form taken from the code under test would agree with any
 /// layout, including a wrong one. 28 shared prefix + 32 lane bytes +
-/// `8·rounds` G-blocks of 60 + 16 digest bytes.
+/// `8·rounds` G-blocks of 60 + 16 digest bytes + 8 leaf-canonicity witnesses
+/// (`Z`/`GINV` per felt — present on EVERY row, since a chip has one width).
 const fn predicted_main(rounds: usize) -> usize {
-    28 + 32 + 60 * (8 * rounds) + 16
+    28 + 32 + 60 * (8 * rounds) + 16 + 8
 }
 
 /// Bus interactions per compression: the frozen six `LfmMem` tuples, four
@@ -101,7 +102,7 @@ const fn predicted_cells(rounds: usize) -> usize {
 }
 
 const fn predicted_constraints(rounds: usize) -> usize {
-    26 + 16 * (8 * rounds)
+    50 + 16 * (8 * rounds)
 }
 
 /// The whole budget, at both round counts, as literals.
@@ -113,18 +114,18 @@ const fn predicted_constraints(rounds: usize) -> usize {
 #[test]
 fn the_socket_budget_is_the_predicted_one_at_both_round_counts() {
     // 6 rounds — the A6R variant.
-    assert_eq!(predicted_main(6), 2_956);
+    assert_eq!(predicted_main(6), 2_964);
     assert_eq!(predicted_interactions(6), 1_190);
     assert_eq!(predicted_interactions(6).div_ceil(2), 595);
-    assert_eq!(predicted_cells(6), 4_741);
-    assert_eq!(predicted_constraints(6), 794);
+    assert_eq!(predicted_cells(6), 4_749);
+    assert_eq!(predicted_constraints(6), 818);
 
     // 7 rounds — standard BLAKE3, the default.
-    assert_eq!(predicted_main(7), 3_436);
+    assert_eq!(predicted_main(7), 3_444);
     assert_eq!(predicted_interactions(7), 1_382);
     assert_eq!(predicted_interactions(7).div_ceil(2), 691);
-    assert_eq!(predicted_cells(7), 5_509);
-    assert_eq!(predicted_constraints(7), 922);
+    assert_eq!(predicted_cells(7), 5_517);
+    assert_eq!(predicted_constraints(7), 946);
 
     // ★ The A6R price, on this socket: going 6 → 7 rounds costs +16.19% per
     // compression. The plan's paper estimate for the syscall-shaped chip was
@@ -132,7 +133,7 @@ fn the_socket_budget_is_the_predicted_one_at_both_round_counts() {
     // the round-INDEPENDENT part smaller, so the rounds are a larger share.
     assert_eq!(
         (predicted_cells(7) - predicted_cells(6)) * 10_000 / predicted_cells(6),
-        1_619,
+        1_617,
         "hundredths of a percent"
     );
 
@@ -174,10 +175,10 @@ fn the_built_layout_matches_the_prediction() {
     // together are what would catch one arm's layout drifting from the other's.
     assert_eq!(
         cols::PREP_WIDTH,
-        12,
+        13,
         "the preprocessed prefix does not move"
     );
-    assert_eq!(cols::LANES, 40, "the shared value prefix is not reflowed");
+    assert_eq!(cols::LANES, 41, "the shared value prefix is not reflowed");
 }
 
 /// The layout is injective and gapless — no column written twice, none unread.
@@ -209,6 +210,10 @@ fn the_layout_assigns_every_column_exactly_once() {
         for b in 0..4 {
             claim(cols::out_byte(i, b));
         }
+    }
+    for i in 0..blake3_socket::FELTS_PER_LEAF {
+        claim(cols::canon_z(i));
+        claim(cols::canon_ginv(i));
     }
     for (c, &n) in seen.iter().enumerate().skip(cols::PREP_WIDTH) {
         assert_eq!(
@@ -824,10 +829,11 @@ fn the_arm_emits_its_constraints_at_degree_3() {
 }
 
 /// The mode column a row in `mode` sets.
-fn mode_col(mode: HashMode) -> usize {
+pub(super) fn mode_col(mode: HashMode) -> usize {
     match mode {
         HashMode::Compress => cols::MODE_C,
         HashMode::Transcript => cols::MODE_T,
+        HashMode::Leaf => cols::MODE_L,
         HashMode::Permute => cols::MODE_P,
     }
 }
@@ -870,7 +876,7 @@ fn evaluate(row: &[FE]) -> Vec<FE> {
     base_out
 }
 
-fn violations(row: &[FE]) -> Vec<usize> {
+pub(super) fn violations(row: &[FE]) -> Vec<usize> {
     evaluate(row)
         .iter()
         .enumerate()
@@ -1161,7 +1167,7 @@ fn m3_both_two_to_one_modes_on_one_row_is_unsatisfiable() {
 /// satisfies the set vacuously and its bus sends carry multiplicity zero.
 #[test]
 fn m4_the_mu_gate_is_exactly_the_two_to_one_selector_sum() {
-    assert_eq!(cols::MU_COLUMNS, (cols::MODE_C, cols::MODE_T));
+    assert_eq!(cols::MU_COLUMNS, [cols::MODE_C, cols::MODE_T, cols::MODE_L]);
 
     // A row with garbage in every witness column but no mode set is padding.
     let (a, b) = ([9u32, 8, 7, 6], [5u32, 4, 3, 2]);
@@ -1534,64 +1540,10 @@ fn the_trivial_program_proves_and_verifies_under_blake3() {
     );
 }
 
-/// ⚠ **`FriToyV0` still does not run under BLAKE3 — and the sponge is no longer
-/// why.** This is a TRIPWIRE for the remaining gap, not a statement that the
-/// gap is acceptable.
-///
-/// The transcript was one of two blockers and B1 removed it: the chain runs on
-/// the compress socket under every hasher (`transcript_tests`). The other
-/// blocker is **obligation O1** and it is independent of everything B1 touched:
-/// the socket's inputs must be `u32`-laned, and `FriToyV0` hashes FRI DATA —
-/// Merkle leaves over LDE evaluations and folded ext values, which are
-/// arbitrary Goldilocks elements. 124 of the fixture's 128 committed column
-/// values are at or above `2^32`, so the very first `compress(row_even,
-/// row_odd)` is outside the socket's domain.
-///
-/// Closing it is a different change from this one: field elements would have to
-/// reach the hash through a committed `u32`-half decomposition (the shape
-/// `transcript_replay::felt_be_halves` already uses for keccak leaves), which
-/// moves `FriToyV0`'s arena layout and its program identity. That is a design
-/// decision about the leaf convention, not a sponge fix.
-///
-/// **When O1 is closed this test must be replaced by a prove+verify**, the same
-/// way `the_trivial_program_proves_and_verifies_under_blake3` reads today.
-#[test]
-fn fri_toy_is_still_blocked_by_o1_and_no_longer_by_the_sponge() {
-    let program = super::programs::fri_toy_program();
-
-    // The sponge is no longer a blocker: not one permute is left in the program.
-    assert!(
-        !program.instrs.iter().any(
-            |i| matches!(i, super::instr::Instr::Hash { mode, .. } if *mode == HashMode::Permute)
-        ),
-        "the compress-chain transcript emits no permute"
-    );
-
-    // The fixture's committed values are not u32 lanes, which is what O1 needs.
-    let over = super::fixture::fixture_columns()
-        .iter()
-        .flatten()
-        .filter(|v| lanes_of(&[**v, FE::zero(), FE::zero(), FE::zero()]).is_none())
-        .count();
-    assert!(
-        over > 0,
-        "if the fixture's values became u32-laned, O1 no longer blocks FriToyV0 \
-         and this test should be replaced by a prove+verify"
-    );
-
-    let inner = super::fixture::fixture_prove();
-    let arenas = vec![inner.commitments.clone(), inner.openings.clone()];
-    assert!(
-        matches!(
-            execute(&program, &arenas, &KIND),
-            Err(LfmExecError::HasherRejected(msg)) if msg.contains("O1")
-        ),
-        "FriToyV0 must be refused for O1 — if it is refused for another reason, \
-         that reason is a regression"
-    );
-
-    // HONEST CONTROL: the same program and the same arenas run fine under the
-    // default hasher, so the refusal is the socket's domain and not a break in
-    // the transcript rewrite.
-    execute(&program, &arenas, &HasherKind::Test).expect("FriToyV0 still runs under Test");
-}
+// The O1 tripwire that used to live here is GONE, and that is the deliverable.
+//
+// It asserted that `FriToyV0` was refused under BLAKE3 for obligation O1, and
+// its own doc said it must be replaced by a prove+verify when O1 closed. Option
+// C closed it: `leaf_tests::fri_toy_proves_and_verifies_under_blake3` is the
+// replacement, and it carries the negative leg the tripwire's criteria asked
+// for.

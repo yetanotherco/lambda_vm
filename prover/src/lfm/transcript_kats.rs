@@ -73,15 +73,21 @@ pub const STEP_VECTORS: [StepVector; 6] = [
 
 /// The END-TO-END vector: a `FriToyV0`-preamble-shaped transcript, op by op.
 ///
-/// The operation sequence is fixed and lives in the test that replays it
-/// (`absorb, squeeze, squeeze, absorb, squeeze, absorb2, 4× squeeze_bits`,
-/// ✓ VERIFIED against `programs::fri_toy_program_source`); what is pinned here
-/// is the STATE after every recorded op, so a divergence is located at the step
-/// it happened rather than at the end.
+/// The operation sequence is fixed and lives in the test that replays it —
+/// `absorb(main_root), squeeze, squeeze, absorb(l1_root), squeeze,
+/// absorb_felts(t0w), absorb_felts(t1w), 4× squeeze_bits`, ✓ VERIFIED against
+/// `programs::fri_toy_program_source`. What is pinned here is the STATE after
+/// every recorded op, so a divergence is located at the step it happened rather
+/// than at the end.
+///
+/// The last two absorbs are `absorb_felts`, not `absorb2`: the terminal
+/// coefficients are field DATA, so each is leaf-hashed under `"LFML"` and the
+/// DIGEST is absorbed. The transcript's step count is the same either way, which
+/// is why this vector had to be re-pointed deliberately when the program moved
+/// rather than caught by a red test.
 pub struct EndToEndVector {
-    /// State after each recorded op, in order. `absorb2` records once, after
-    /// BOTH of its steps — so this is 10 entries against 11 compressions.
-    pub states: [[u32; 4]; 10],
+    /// State after each recorded op, in order.
+    pub states: [[u32; 4]; 11],
     /// The three ext challenges (lanes 0–2 of a squeezed cell).
     pub alpha: [u32; 3],
     pub zeta0: [u32; 3],
@@ -99,8 +105,13 @@ pub const T0W: [u32; 4] = [0xDEADBEEF, 0xCAFEBABE, 0x8BADF00D, 0xFEEDFACE];
 
 pub const T1W: [u32; 4] = [0x0BADC0DE, 0xD15EA5E5, 0xC0FFEE00, 0xBAAAAAAD];
 
-/// Number of compressions the whole preamble costs — the spec's cost claim.
-pub const FRI_TOY_COMPRESSIONS: usize = 11;
+/// Compressions the whole preamble costs — the oracle's cost claim.
+///
+/// **13, not 11.** Eleven are TRANSCRIPT steps (5 absorbs, 6 squeezes); the
+/// other two are the LEAF rows `absorb_felts` adds, one per data cell. Counting
+/// them here is the oracle's convention and it is the one that closes the
+/// `FriToyV0` total: 4 queries × 20 + 13 = 93.
+pub const FRI_TOY_COMPRESSIONS: usize = 13;
 
 /// The end-to-end vector at 7 rounds (the default build).
 pub const FRI_TOY_7: EndToEndVector = EndToEndVector {
@@ -110,16 +121,17 @@ pub const FRI_TOY_7: EndToEndVector = EndToEndVector {
         [0x43FFB960, 0x3696C76D, 0x9D106062, 0xEAA3E925],
         [0x23D1D389, 0x3FE9FBB1, 0x7AF56AE7, 0xEC936F39],
         [0x94153DE2, 0xA6003377, 0xD028ED4B, 0xF3EB8582],
-        [0x65B1E51B, 0xDCD18A92, 0x24D32C14, 0x1EFBE59F],
-        [0xC525DA61, 0x8A04444E, 0xCA77107C, 0x8BC7E66B],
-        [0x167D01A2, 0x2B820B18, 0x8FBBFA18, 0x6EC49B31],
-        [0x0D4A94AF, 0xD2955BF4, 0xC0EA1E95, 0xA377BB63],
-        [0xAF926F64, 0x46B952E1, 0xBD5D2EC2, 0x790689A1],
+        [0xEC821701, 0xCD13E17E, 0x7EADC68F, 0x01E38C58],
+        [0x0E8226D7, 0x1E2E2338, 0x845CF387, 0xE33EBDEC],
+        [0xB654D354, 0x71EDED11, 0x8AFF36B2, 0xA6C750AF],
+        [0x06A07FAD, 0x8CA90A52, 0x7A48DF49, 0xC9C1AED8],
+        [0x8B5EA0EF, 0xF22C1FA1, 0xE1BA9F92, 0xD20CB729],
+        [0xA25C2860, 0xFECF62F7, 0x72A5F0EF, 0x0F2BE133],
     ],
     alpha: [0xD3FD9F50, 0x3ED183D9, 0xF60EE882],
     zeta0: [0x27023F83, 0xA1344FB0, 0x9EBDBBB2],
     zeta1: [0x23D1D389, 0x3FE9FBB1, 0x7AF56AE7],
-    query_bits: [[1, 1, 0, 1], [1, 0, 0, 0], [0, 1, 0, 0], [1, 1, 1, 1]],
+    query_bits: [[1, 1, 1, 0], [0, 0, 1, 0], [1, 0, 1, 1], [1, 1, 1, 1]],
 };
 
 /// The end-to-end vector at 6 rounds (`--features blake3-6round`).
@@ -130,14 +142,15 @@ pub const FRI_TOY_6: EndToEndVector = EndToEndVector {
         [0x0953D5A3, 0x4D25B331, 0x4B1A3E0A, 0x6D7D710E],
         [0x408B335E, 0xFB12033E, 0x4ED4D8F5, 0x6077EE28],
         [0xB8746B5E, 0x99C839BC, 0x74F64FED, 0x81FB37FF],
-        [0xBFF5D5A0, 0x62D80CF2, 0x5FE17C11, 0x83A51AE1],
-        [0x35B26F88, 0xB9E773E8, 0xE961F45F, 0xB5F22DFC],
-        [0x7A55B4E1, 0xDCD824FA, 0xC4D1A1F2, 0x0CA11EE6],
-        [0xFC575902, 0x63217DFB, 0x8427B22B, 0xD2204D3E],
-        [0x5FFCD1DF, 0x54741D85, 0xBAD2BB79, 0xFD46DAFC],
+        [0xBEA3BF5F, 0x44DA486A, 0x2876E758, 0xB22EA9D0],
+        [0x91239994, 0x05C16E77, 0x4DF175AF, 0xC74094E4],
+        [0x3997959E, 0x3EF54A2F, 0xD791B584, 0x6AC75C52],
+        [0x384A95CE, 0x6CB0B223, 0x6A50D4CB, 0xA38A6D79],
+        [0x5C4AC682, 0x9DEEE8F9, 0xB0752A41, 0xF87991A2],
+        [0xF71FF60F, 0xDB60DF57, 0x188420D7, 0xF2A6C54A],
     ],
     alpha: [0x8A9AE283, 0xC782CB0F, 0x257502C4],
     zeta0: [0x88D30EFA, 0xCE8D4E24, 0xA3049DB6],
     zeta1: [0x408B335E, 0xFB12033E, 0x4ED4D8F5],
-    query_bits: [[0, 0, 0, 0], [0, 0, 0, 1], [1, 0, 0, 0], [0, 1, 0, 0]],
+    query_bits: [[0, 0, 1, 0], [0, 1, 1, 1], [0, 1, 1, 1], [0, 1, 0, 0]],
 };

@@ -180,16 +180,26 @@ pub fn build_traces_with_hasher(
     // lookups per compression. Every other hasher sends none, so this is the
     // one place the shared table's multiplicities depend on the hash choice.
     if hasher == HasherKind::Blake3 {
-        let rows: Vec<([u32; 4], [u32; 4], u32)> = records
+        let rows: Vec<([u32; 8], u32)> = records
             .hash
             .iter()
             .zip(&hash_modes)
             .map(|(r, mode)| {
                 let cell =
                     |k: usize| -> super::word::LfmWord { core::array::from_fn(|i| r.ins[k + i]) };
+                // The eight message lanes, read the way this row's MODE reads
+                // them: two digest cells, or four felts split into halves. A
+                // leaf row sends lookups over its halves, so the histogram has
+                // to split them the same way the witness filler does.
+                let lanes: [u32; 8] = if *mode == HashMode::Leaf {
+                    blake3_socket::leaf_lanes(&cell(0)).expect("leaf felt is canonical")
+                } else {
+                    let a = blake3_socket::lanes_of(&cell(0)).expect("compress lane is a u32 (O1)");
+                    let b = blake3_socket::lanes_of(&cell(4)).expect("compress lane is a u32 (O1)");
+                    core::array::from_fn(|i| if i < 4 { a[i] } else { b[i - 4] })
+                };
                 (
-                    blake3_socket::lanes_of(&cell(0)).expect("compress lane is a u32 (O1)"),
-                    blake3_socket::lanes_of(&cell(4)).expect("compress lane is a u32 (O1)"),
+                    lanes,
                     // The row's DOMAIN, not a fixed tag: the lookups a row sends
                     // are values downstream of `m[8]`, so a transcript row and a
                     // compress row over the same cells send different bytes.
@@ -237,11 +247,12 @@ pub fn build_traces_with_hasher(
             let r = &records.hash[row];
             out[hash::cols::IN0..hash::cols::IN0 + 12].copy_from_slice(&r.ins);
             for k in 0..4 {
-                // S_i = MODE_P·IN_i + (MODE_C + MODE_T)·IV_i, materialized.
-                out[hash::cols::S8 + k] = if hash_modes[row].is_two_to_one() {
-                    iv[k]
-                } else {
+                // S_i = MODE_P·IN_i + (MODE_C + MODE_T + MODE_L)·IV_i,
+                // materialized. Every mode but the permutation takes the IV.
+                out[hash::cols::S8 + k] = if hash_modes[row] == HashMode::Permute {
                     r.ins[8 + k]
+                } else {
+                    iv[k]
                 };
             }
             out[hash::cols::OUT0..hash::cols::OUT0 + 12].copy_from_slice(&r.outs);

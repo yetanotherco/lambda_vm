@@ -57,6 +57,15 @@ pub fn trivial_program_source() -> LfmProgramSource {
     // Hash leg: three compressions chained through memory. Feeding `d1` back in
     // is the point — a socket's own output must be a legal input to the next
     // one, which is what a Merkle walk does at every level.
+    //
+    // ✓ SWEPT for the leaf-mode migration and deliberately LEFT as `compress`:
+    // these are the only place in any registered program where raw arena data
+    // enters a compress, and they form a CHAIN, not a tree. There is no leaf and
+    // no parent here, so there is no leaf/parent confusion for `MODE_L` to
+    // separate — what the mode buys elsewhere it would not buy here. The
+    // consequence to keep in mind is that this program's arena words must be
+    // `u32`-laned under BLAKE3 (obligation O1), which its tests supply; data
+    // that cannot be is what `leaf` exists for.
     let d0 = b.compress(h[0].as_digest(), h[1].as_digest());
     let d1 = b.compress(d0, l2.as_digest());
     let d2 = b.compress(d1, h[3].as_digest());
@@ -604,7 +613,10 @@ pub fn fri_toy_program_source() -> LfmProgramSource {
     let zeta1 = sponge.squeeze_ext(&mut b);
     let t0w = b.hint_word(commits, 2);
     let t1w = b.hint_word(commits, 3);
-    sponge.absorb2(&mut b, t0w, t1w);
+    // The terminal coefficients are field DATA, not digests, so they enter the
+    // transcript through the leaf encoding — the same rule the trees follow.
+    sponge.absorb_felts(&mut b, t0w);
+    sponge.absorb_felts(&mut b, t1w);
     let t0 = t0w.as_ext();
     let t1 = t1w.as_ext();
 
@@ -623,7 +635,7 @@ pub fn fri_toy_program_source() -> LfmProgramSource {
         // Main-tree opening A (rows 2·l_A, 2·l_A+1 with l_A = q0 >> 1).
         let row_a_even = b.hint_word(opens, off);
         let row_a_odd = b.hint_word(opens, off + 1);
-        let leaf_a = b.compress(row_a_even.as_digest(), row_a_odd.as_digest());
+        let leaf_a = edsl::leaf_hash_pair(&mut b, row_a_even, row_a_odd);
         let sibs_a: Vec<Cell> = (0..4).map(|i| b.hint_word(opens, off + 2 + i)).collect();
         let root_a = edsl::merkle_walk(&mut b, leaf_a, &path_a, &sibs_a);
         edsl::assert_word_eq_lanes(&mut b, root_a.as_cell(), &main_root_lanes);
@@ -631,7 +643,7 @@ pub fn fri_toy_program_source() -> LfmProgramSource {
         // Main-tree opening B (leaf l_A + 8, i.e. rows q0+16's pair).
         let row_b_even = b.hint_word(opens, off + 6);
         let row_b_odd = b.hint_word(opens, off + 7);
-        let leaf_b = b.compress(row_b_even.as_digest(), row_b_odd.as_digest());
+        let leaf_b = edsl::leaf_hash_pair(&mut b, row_b_even, row_b_odd);
         let sibs_b: Vec<Cell> = (0..4).map(|i| b.hint_word(opens, off + 8 + i)).collect();
         let root_b = edsl::merkle_walk(&mut b, leaf_b, &path_b, &sibs_b);
         edsl::assert_word_eq_lanes(&mut b, root_b.as_cell(), &main_root_lanes);
@@ -670,7 +682,7 @@ pub fn fri_toy_program_source() -> LfmProgramSource {
 
         let l1_lo = b.hint_word(opens, off + 12);
         let l1_hi = b.hint_word(opens, off + 13);
-        let l1_leaf = b.compress(l1_lo.as_digest(), l1_hi.as_digest());
+        let l1_leaf = edsl::leaf_hash_pair(&mut b, l1_lo, l1_hi);
         let l1_sibs: Vec<Cell> = (0..3).map(|i| b.hint_word(opens, off + 14 + i)).collect();
         let l1_path = [bits[0], bits[1], bits[2]];
         let l1_root_c = edsl::merkle_walk(&mut b, l1_leaf, &l1_path, &l1_sibs);

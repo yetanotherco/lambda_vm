@@ -196,7 +196,7 @@ pub fn compile(source: LfmProgramSource) -> LfmProgram {
             Instr::Hash {
                 mode, outs, mults, ..
             } => {
-                let num_outs = if mode.is_two_to_one() { 1 } else { 3 };
+                let num_outs = mode.num_output_cells();
                 for i in 0..num_outs {
                     mults[i] = take(outs[i], &mut written, &mut read_counts);
                 }
@@ -342,6 +342,7 @@ fn emit_column_groups(instrs: &[Instr], _public_len: u32) -> LfmColumnGroups {
                 row[match mode {
                     HashMode::Compress => layout::hash::MODE_C,
                     HashMode::Transcript => layout::hash::MODE_T,
+                    HashMode::Leaf => layout::hash::MODE_L,
                     HashMode::Permute => layout::hash::MODE_P,
                 }] = FE::one();
                 row[layout::hash::MULT0] = fe(mults[0]);

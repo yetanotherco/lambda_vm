@@ -127,7 +127,7 @@ the built arm).
 | `"LFMC"` | `4C 46 4D 43` | `0x434D464C` | **this socket** — 2-to-1 compress / Merkle parent |
 | `"LFMT"` | `4C 46 4D 54` | `0x544D464C` | **transcript step** — the compress-chain Fiat–Shamir transcript (`thoughts/shared/lfm-real-hash/transcript-spec/TRANSCRIPT.md`) |
 | `"LFMP"` | `4C 46 4D 50` | `0x504D464C` | ~~`permute` socket (§7)~~ — **RETIRED UNUSED**, see below |
-| `"LFML"` | `4C 46 4D 4C` | `0x4C4D464C` | reserved — leaf domain; **O5 ratified**: any future leaf-hashing path MUST use it |
+| `"LFML"` | `4C 46 4D 4C` | `0x4C4D464C` | **LIVE** — the felt-input leaf mode (`MODE_L`). O5 is now enforced by the tag rather than by review: a leaf row is one with `MODE_L` set, and `MODE_L` selects `LFML`. Spec: `thoughts/shared/lfm-real-hash/leaf-spec/LEAF.md` |
 
 ⚠ **§7's `permute`-socket sketch is superseded and will never be built.** The
 user ratified option **B1** on 2026-08-11

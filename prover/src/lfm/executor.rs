@@ -381,6 +381,15 @@ pub fn execute(
                     in_cols[0..4].clone_from_slice(&a);
                     in_cols[4..8].clone_from_slice(&b);
                     // lanes 8–11 of the IN columns stay zero on two-to-one rows
+                } else if *mode == HashMode::Leaf {
+                    // ONE cell, read as four field elements. Lanes 4–11 stay
+                    // zero: a leaf row's other message lanes are the felts' high
+                    // halves, which live in the chip's own columns rather than
+                    // in `IN`.
+                    let f = m.read_word(ins[0])?;
+                    state[0..4].clone_from_slice(&f);
+                    state[8..12].clone_from_slice(&hasher.compress_iv());
+                    in_cols[0..4].clone_from_slice(&f);
                 } else {
                     for (cell, chunk) in ins.iter().zip(state.chunks_exact_mut(4)) {
                         chunk.clone_from_slice(&m.read_word(*cell)?);
@@ -408,9 +417,13 @@ pub fn execute(
                             hasher.transcript_out(&a, &b)
                         }
                     }
+                    HashMode::Leaf => {
+                        let f: LfmWord = core::array::from_fn(|i| state[i]);
+                        hasher.leaf_out(&f)
+                    }
                     HashMode::Permute => hasher.permute(state),
                 };
-                if mode.is_two_to_one() {
+                if mode.num_output_cells() == 1 {
                     let digest: LfmWord = core::array::from_fn(|i| out_state[i]);
                     m.write(outs[0], digest)?;
                 } else {

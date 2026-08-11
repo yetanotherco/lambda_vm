@@ -473,6 +473,7 @@ pub mod bitdec {
 pub mod hash {
     use super::*;
     use crate::lfm::hash::{HASH_STATE_FELTS, HasherKind, TestPermutation};
+    use crate::lfm::instr::HashMode;
     use crate::tables::types::FE;
     use math::field::traits::IsPrimeField;
 
@@ -480,9 +481,10 @@ pub mod hash {
         pub use crate::lfm::layout::hash::*;
         pub const IN0: usize = PREP_WIDTH; // ..IN11
         /// Materialized capacity-state columns for lanes 8–11:
-        /// `S_i = MODE_P·IN_i + (MODE_C + MODE_T)·IV_i` (degree-2 copy), so the
-        /// permutation constraint stays at degree 3. A transcript row is a
-        /// compress in every structural respect, so it takes the IV too.
+        /// `S_i = MODE_P·IN_i + (MODE_C + MODE_T + MODE_L)·IV_i` (degree-2
+        /// copy), so the permutation constraint stays at degree 3. Transcript
+        /// and leaf rows are compresses in every structural respect, so they
+        /// take the IV too.
         pub const S8: usize = PREP_WIDTH + 12; // ..S11
         pub const OUT0: usize = PREP_WIDTH + 16; // ..OUT11
         /// Value columns every hasher's layout shares: `IN`, `S`, `OUT`. The
@@ -518,7 +520,7 @@ pub mod hash {
         use crate::lfm::poseidon::{NUM_ROUNDS, sboxed_lanes};
 
         pub use super::cols::{
-            IN0, MODE_C, MODE_P, MODE_T, OUT0, PREP_WIDTH, S8, SHARED_VALUE_COLUMNS,
+            IN0, MODE_C, MODE_L, MODE_P, MODE_T, OUT0, PREP_WIDTH, S8, SHARED_VALUE_COLUMNS,
         };
 
         /// First appended witness column.
@@ -571,7 +573,7 @@ pub mod hash {
         /// 4 capacity copies + 1 mode-boolean + per round (`2·sboxed` S-box
         /// steps and 12 MDS outputs).
         pub const NUM_CONSTRAINTS: usize = {
-            let mut n = 5;
+            let mut n = 5 + super::NUM_UNREAD_INPUT_PINS;
             let mut r = 0;
             while r < NUM_ROUNDS {
                 n += 2 * sboxed_lanes(r) + HASH_STATE_FELTS;
@@ -613,11 +615,15 @@ pub mod hash {
 
     /// The frozen `LFM_HASH` tuple contract: 2 (or 3) cells in, 1 (or 3) out.
     ///
-    /// The first two input cells are read in every mode, so their multiplicity
-    /// is the row's is-real flag: the sum of all three mode selectors, which the
-    /// AIR pins to a bit. The third is read only by a permutation.
+    /// The FIRST input cell is read in every mode, so its multiplicity is the
+    /// row's is-real flag: the sum of all four mode selectors, which the AIR
+    /// pins to a bit. The second is read by every mode EXCEPT `Leaf`, which
+    /// takes one cell of four felts — receiving a second cell there would claim
+    /// a memory read the row never makes. The third is read only by a
+    /// permutation.
     fn lfm_mem_interactions() -> Vec<BusInteraction> {
         let is_real = || selector_sum(cols::MODE_C, cols::NUM_SELECTORS);
+        let reads_two = || Multiplicity::Sum3(cols::MODE_C, cols::MODE_T, cols::MODE_P);
         vec![
             BusInteraction::receiver(
                 BusId::LfmMem,
@@ -626,7 +632,7 @@ pub mod hash {
             ),
             BusInteraction::receiver(
                 BusId::LfmMem,
-                is_real(),
+                reads_two(),
                 word_token(cols::IN_ADDR1, cols::IN0 + 4),
             ),
             BusInteraction::receiver(
@@ -654,6 +660,85 @@ pub mod hash {
 
     fn canonical_u64(fe: &FE) -> u64 {
         GoldilocksField::canonical(fe.value())
+    }
+
+    /// Every mode selector paired with the mode it selects.
+    ///
+    /// One table, so the input pins below and anything else that reasons per
+    /// mode read the same mapping rather than each carrying its own copy.
+    pub(crate) const MODE_SELECTORS: [(usize, HashMode); 4] = [
+        (cols::MODE_C, HashMode::Compress),
+        (cols::MODE_T, HashMode::Transcript),
+        (cols::MODE_L, HashMode::Leaf),
+        (cols::MODE_P, HashMode::Permute),
+    ];
+
+    /// Constraints [`emit_unread_input_pins`] emits: four per unread input cell,
+    /// for the two cells some mode does not read.
+    pub(crate) const NUM_UNREAD_INPUT_PINS: usize = 8;
+
+    /// The first constraint index each arm places the unread-`IN` pins at.
+    ///
+    /// Each arm chooses where in its own numbering they land, so the one place
+    /// that knows all three is here, next to the emitter. The controls read it
+    /// to assert that a forged row's violated set IS the pins.
+    #[cfg(test)]
+    pub(crate) const fn unread_input_pin_base(kind: HasherKind) -> usize {
+        match kind {
+            HasherKind::Test => 17,
+            HasherKind::Poseidon => poseidon_cols::NUM_CONSTRAINTS - NUM_UNREAD_INPUT_PINS,
+            HasherKind::Blake3 => crate::lfm::blake3_socket::UNREAD_IDX,
+        }
+    }
+
+    /// ★ **Pins the `IN` columns of every input cell a mode does not read.**
+    ///
+    /// **This is load-bearing on any arm whose constraints READ `IN`, and that
+    /// is not something to decide per arm.** A mode that reads fewer cells than
+    /// the layout provides leaves the rest receiving nothing from `LfmMem` —
+    /// their multiplicity excludes it — so if anything then reads those columns
+    /// they are four free felts of prover choice and the row's output stops
+    /// being a function of its input.
+    ///
+    /// That is not hypothetical: it shipped. `MODE_L` reads one cell, the bus
+    /// and the validator were both taught so, the BLAKE3 arm pinned the unread
+    /// columns — and the `Test` and `Poseidon` arms, whose round 0 reads
+    /// `A_i = IN_i` for `i < 8`, were not. Under those two a leaf row carried
+    /// four unconstrained felts that the permutation consumed, which is a
+    /// Fiat–Shamir break for any program that absorbs data. Deriving the pins
+    /// from [`HashMode::num_input_cells`] here, once, is what stops the next
+    /// mode repeating it: an arm cannot forget a pin it does not write.
+    ///
+    /// Degree 2 (a selector sum times a column), so no arm's bound moves.
+    ///
+    /// Returns the next free constraint index.
+    pub(crate) fn emit_unread_input_pins<B: ConstraintBuilder<F, E>>(
+        b: &mut B,
+        first_idx: usize,
+    ) -> usize {
+        let mut idx = first_idx;
+        // Cell 0 is read by every mode, so it is never pinned; cells 1 and 2 are
+        // each unread by some mode.
+        for slot in 1..3usize {
+            let sel = MODE_SELECTORS
+                .iter()
+                .filter(|(_, mode)| mode.num_input_cells() <= slot)
+                .fold(None::<B::Expr>, |acc, (col, _)| {
+                    let term = b.main(0, *col);
+                    Some(match acc {
+                        None => term,
+                        Some(a) => a + term,
+                    })
+                })
+                .expect("some mode reads fewer than three input cells");
+            for j in 0..4 {
+                let in_col = b.main(0, cols::IN0 + 4 * slot + j);
+                b.emit_base(idx, sel.clone() * in_col);
+                idx += 1;
+            }
+        }
+        debug_assert_eq!(idx - first_idx, NUM_UNREAD_INPUT_PINS);
+        idx
     }
 
     /// The permutation the chip proves, chosen at construction.
@@ -686,7 +771,7 @@ pub mod hash {
         /// dense-index invariant requires `eval` to fill exactly.
         pub const fn num_constraints(kind: HasherKind) -> usize {
             match kind {
-                HasherKind::Test => 17,
+                HasherKind::Test => 17 + NUM_UNREAD_INPUT_PINS,
                 HasherKind::Poseidon => poseidon_cols::NUM_CONSTRAINTS,
                 HasherKind::Blake3 => crate::lfm::blake3_socket::NUM_CONSTRAINTS,
             }
@@ -721,26 +806,26 @@ pub mod hash {
         fn eval_test<B: ConstraintBuilder<F, E>>(b: &mut B) {
             let mode_c = b.main(0, cols::MODE_C);
             let mode_t = b.main(0, cols::MODE_T);
+            let mode_l = b.main(0, cols::MODE_L);
             let mode_p = b.main(0, cols::MODE_P);
 
             // idx 0–3: capacity-state copy —
-            // S_i = MODE_P·IN_i + (MODE_C + MODE_T)·IV_i. A transcript row is a
-            // two-to-one step like a compress row, so it takes the same
-            // capacity; `TestPermutation` has one hash domain, so the two rows
-            // compute the same function (see `LfmHasher::transcript_out`).
+            // S_i = MODE_P·IN_i + (MODE_C + MODE_T + MODE_L)·IV_i. Transcript
+            // and leaf rows are one-cell-out steps like a compress row, so they
+            // take the same capacity; `TestPermutation` has one hash domain and
+            // is field-native, so all three compute the same function (see
+            // `LfmHasher::transcript_out` / `leaf_out` and their recorded
+            // weakening).
             for (k, iv_raw) in TestPermutation::compress_iv_raw().into_iter().enumerate() {
                 let s = b.main(0, cols::S8 + k);
                 let in_i = b.main(0, cols::IN0 + 8 + k);
                 let iv_i = b.const_base(iv_raw);
-                b.emit_base(
-                    k,
-                    s - (mode_p.clone() * in_i + (mode_c.clone() + mode_t.clone()) * iv_i),
-                );
+                let m = mode_c.clone() + mode_t.clone() + mode_l.clone();
+                b.emit_base(k, s - (mode_p.clone() * in_i + m * iv_i));
             }
 
             // idx 4–15: the TestPermutation round — t_i = (A_i + rc_i·m)³
-            // with A_i = IN_i (i < 8) or S_i (i ≥ 8) and
-            // m = MODE_C + MODE_T + MODE_P;
+            // with A_i = IN_i (i < 8) or S_i (i ≥ 8) and m the mode sum;
             // OUT_j = t_j + Σ_i t_i (mixing matrix M = I + J). The round
             // constant is scaled by the mode sum so zero-filled padding rows
             // satisfy the constraint (0 = 0) without a degree-4 gate: on real
@@ -755,8 +840,10 @@ pub mod hash {
                         b.main(0, cols::S8 + (i - 8))
                     };
                     let rc = b.const_base(canonical_u64(&TestPermutation::round_constant(i)));
-                    let m =
-                        b.main(0, cols::MODE_C) + b.main(0, cols::MODE_T) + b.main(0, cols::MODE_P);
+                    let m = b.main(0, cols::MODE_C)
+                        + b.main(0, cols::MODE_T)
+                        + b.main(0, cols::MODE_L)
+                        + b.main(0, cols::MODE_P);
                     let x = a + rc * m;
                     x.clone() * x.clone() * x
                 })
@@ -768,9 +855,14 @@ pub mod hash {
             }
 
             // idx 16: mode sum-boolean (exactly-one-of is the registrar's).
-            let mode_sum = mode_c + mode_t + mode_p;
+            let mode_sum = mode_c + mode_t + mode_l + mode_p;
             let one = b.one();
             b.emit_base(16, mode_sum.clone() * (one - mode_sum));
+
+            // idx 17–24: the unread input cells. ★ REQUIRED HERE, because the
+            // round above reads `IN_i` for every `i < 8` — including the four a
+            // leaf row does not read. See `emit_unread_input_pins`.
+            emit_unread_input_pins(b, 17);
         }
 
         /// Poseidon-original at width 12: 30 rounds of `x ↦ x⁷` (all lanes on
@@ -796,17 +888,18 @@ pub mod hash {
 
             let mode_c = b.main(0, pc::MODE_C);
             let mode_t = b.main(0, pc::MODE_T);
+            let mode_l = b.main(0, pc::MODE_L);
             let mode_p = b.main(0, pc::MODE_P);
-            let m = mode_c + mode_t + mode_p.clone();
+            let m = mode_c + mode_t + mode_l + mode_p.clone();
 
             // idx 0–3: capacity-state copy — S_i = MODE_P·IN_i.
             //
             // Poseidon's `compress_iv` is ZERO (plain sponge compression, no
             // domain separation invented here), so the `MODE_C·IV_i` term the
             // TestPermutation version carries vanishes: on a compress row
-            // MODE_P = 0 forces S_i = 0, which IS the IV. A transcript row is
-            // the same shape and takes the same zero capacity — Poseidon has
-            // one domain here, so it does not separate the two.
+            // MODE_P = 0 forces S_i = 0, which IS the IV. Transcript and leaf
+            // rows are the same shape and take the same zero capacity —
+            // Poseidon has one domain here, so it separates none of them.
             for k in 0..4 {
                 let s = b.main(0, pc::S8 + k);
                 let in_i = b.main(0, pc::IN0 + 8 + k);
@@ -886,6 +979,7 @@ pub mod hash {
                     idx += 1;
                 }
             }
+            idx = emit_unread_input_pins(b, idx);
             debug_assert_eq!(
                 idx,
                 poseidon_cols::NUM_CONSTRAINTS,

@@ -79,12 +79,22 @@ pub mod bitdec {
 
 /// `LFM_HASH` — the hash chiplet (frozen tuple contract).
 ///
-/// Three mode selectors, all preprocessed, at most one of them set: `MODE_C`
-/// (Merkle/2-to-1 compress), `MODE_T` (a Fiat–Shamir transcript step — the same
-/// two-cells-in, one-cell-out shape in its own hash domain) and `MODE_P` (the
-/// three-cell permutation). Being preprocessed is what makes them trustworthy:
-/// a row's mode is fixed by its position in the committed instruction group, so
-/// a prover cannot choose which domain a row hashes in.
+/// Four mode selectors, all preprocessed, at most one of them set:
+///
+/// | selector | shape | domain |
+/// |---|---|---|
+/// | `MODE_C` | 2 cells → 1 | Merkle parent / 2-to-1 compress |
+/// | `MODE_T` | 2 cells → 1 | a Fiat–Shamir transcript step |
+/// | `MODE_L` | **1 cell → 1** | a **leaf** over four arbitrary FIELD ELEMENTS† |
+/// | `MODE_P` | 3 cells → 3 | the full permutation |
+///
+/// Being preprocessed is what makes them trustworthy: a row's mode is fixed by
+/// its position in the committed instruction group, so a prover chooses neither
+/// which domain a row hashes in nor which input semantics it has.
+///
+/// † The mode is a shape the machine offers; whether a leaf and a parent are
+/// actually different FUNCTIONS is the hasher's business. BLAKE3 separates them
+/// by tag, and a single-domain hasher does not — see `LfmHasher::leaf_out`.
 pub mod hash {
     pub const IN_ADDR0: usize = 0;
     pub const IN_ADDR1: usize = 1;
@@ -107,13 +117,26 @@ pub mod hash {
     /// the mults would be outside that span and silently unchecked, which is
     /// the sort of gap that only shows up when someone forges a row.
     pub const MODE_T: usize = 8;
+    /// The LEAF-domain selector, and the machine's felt-input mode.
+    ///
+    /// **`MODE_L` implies felt-input semantics** — that is a decision, not an
+    /// inference. A leaf row reads ONE cell of four arbitrary Goldilocks
+    /// elements and hashes them as eight checked `u32` halves under the `"LFML"`
+    /// tag, which is what lets FRI data reach a hash whose inputs are `u32`
+    /// lanes. It is a constraint rather than a convention: a `MODE_L` row that
+    /// skipped the canonicity block would be unprovable.
+    ///
+    /// Placed inside the selector run for the reason [`MODE_T`] gives, which is
+    /// the same mistake caught once already and spec'd since so it is not made
+    /// a third time.
+    pub const MODE_L: usize = 9;
     /// Mode selectors, contiguous from [`MODE_C`]: exactly one is set on a real
     /// row.
-    pub const NUM_SELECTORS: usize = 3;
-    pub const MULT0: usize = 9;
-    pub const MULT1: usize = 10;
-    pub const MULT2: usize = 11;
-    pub const PREP_WIDTH: usize = 12;
+    pub const NUM_SELECTORS: usize = 4;
+    pub const MULT0: usize = 10;
+    pub const MULT1: usize = 11;
+    pub const MULT2: usize = 12;
+    pub const PREP_WIDTH: usize = 13;
 }
 
 /// `LFM_KECCAK` — the keccak-f[1600] adapter: binds 13 machine words of state

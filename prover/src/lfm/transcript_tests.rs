@@ -28,8 +28,8 @@ use math::field::traits::IsPrimeField;
 use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};
 
 use super::blake3_socket::{
-    SOCKET_ROUNDS, TAG_LFMT, socket_digest_rounds, transcript_digest, transcript_digest_rounds,
-    word_of,
+    SOCKET_ROUNDS, TAG_LFMT, leaf_digest_rounds, socket_digest_rounds, transcript_digest,
+    transcript_digest_rounds, word_of,
 };
 use super::builder::{Cell, LfmBuilder, LfmProgramSource};
 use super::compiler::{LfmProgram, compile};
@@ -202,8 +202,13 @@ fn the_two_domains_differ_only_in_the_tag() {
 /// explicit round count, so BOTH vectors are checkable from one build.
 ///
 /// ✓ VERIFIED sequence, `programs::fri_toy_program_source`: absorb(main_root),
-/// squeeze_ext, squeeze_ext, absorb(l1_root), squeeze_ext, absorb2(t0w, t1w),
-/// then `NUM_QUERIES` × squeeze_bits.
+/// squeeze_ext, squeeze_ext, absorb(l1_root), squeeze_ext, **absorb_felts(t0w),
+/// absorb_felts(t1w)**, then `NUM_QUERIES` × squeeze_bits.
+///
+/// The last two are `absorb_felts`, not `absorb2`: the terminal coefficients are
+/// field DATA, so they are leaf-hashed and the DIGEST is absorbed. The step
+/// count is the same either way, which is exactly why this had to be re-pointed
+/// deliberately rather than caught by a red test.
 fn replay_reference(rounds: usize) -> (Vec<[u32; 4]>, Vec<[u32; 4]>, usize) {
     let mut state = [0u32; 4];
     let mut squeeze_index = 0u32;
@@ -234,9 +239,13 @@ fn replay_reference(rounds: usize) -> (Vec<[u32; 4]>, Vec<[u32; 4]>, usize) {
     states.push(state);
     outputs.push(squeeze(&mut state, &mut squeeze_index, &mut compressions));
     states.push(state);
-    absorb(&mut state, &T0W, &mut compressions);
-    absorb(&mut state, &T1W, &mut compressions);
-    states.push(state);
+    // DATA, so each goes through the leaf encoding before it is absorbed.
+    for cell in [&T0W, &T1W] {
+        let felts: LfmWord = core::array::from_fn(|i| FE::from(u64::from(cell[i])));
+        let d = leaf_digest_rounds(&felts, rounds).expect("the KAT inputs are canonical");
+        absorb(&mut state, &d, &mut compressions);
+        states.push(state);
+    }
     for _ in 0..NUM_QUERIES {
         outputs.push(squeeze(&mut state, &mut squeeze_index, &mut compressions));
         states.push(state);
@@ -260,8 +269,11 @@ fn check_end_to_end(rounds: usize, want: &EndToEndVector) {
         let got: [u8; QUERY_BITS] = core::array::from_fn(|k| ((lane0 >> k) & 1) as u8);
         assert_eq!(&got, bits, "query {q} bits at {rounds} rounds");
     }
+    // The reference replay counts TRANSCRIPT steps; the oracle's constant counts
+    // the leaf rows too, so the two differ by exactly the two data absorbs.
     assert_eq!(
-        compressions, FRI_TOY_COMPRESSIONS,
+        compressions + 2,
+        FRI_TOY_COMPRESSIONS,
         "the preamble's compression count is a cost claim, not an accident"
     );
 }
@@ -301,7 +313,9 @@ fn the_host_sponge_reproduces_the_end_to_end_vector() {
     states.push(sponge.state());
     let zeta1 = sponge.squeeze_ext();
     states.push(sponge.state());
-    sponge.absorb2(&cell(&T0W), &cell(&T1W));
+    sponge.absorb_felts(&felts_of(&T0W));
+    states.push(sponge.state());
+    sponge.absorb_felts(&felts_of(&T1W));
     states.push(sponge.state());
     let mut queries = Vec::new();
     for _ in 0..NUM_QUERIES {
@@ -413,7 +427,10 @@ fn preamble_program_source() -> LfmProgramSource {
     let zeta0 = sponge.squeeze_ext(&mut b);
     sponge.absorb(&mut b, h[1]);
     let zeta1 = sponge.squeeze_ext(&mut b);
-    sponge.absorb2(&mut b, h[2], h[3]);
+    // The last two arena cells stand for the terminal coefficients — DATA — so
+    // the program absorbs them the way `FriToyV0` does.
+    sponge.absorb_felts(&mut b, h[2]);
+    sponge.absorb_felts(&mut b, h[3]);
 
     b.public(alpha.as_cell());
     b.public(zeta0.as_cell());
@@ -434,9 +451,16 @@ fn preamble_arena() -> Vec<Vec<LfmWord>> {
     vec![vec![
         word_of(&MAIN_ROOT),
         word_of(&L1_ROOT),
-        word_of(&T0W),
-        word_of(&T1W),
+        felts_of(&T0W),
+        felts_of(&T1W),
     ]]
+}
+
+/// The KAT's `u32` inputs read as FIELD ELEMENTS — what the leaf encoding
+/// consumes. `word_of` reads the same values as digest lanes; both are the same
+/// four numbers, and which reading applies is the mode's business.
+fn felts_of(lanes: &[u32; 4]) -> LfmWord {
+    core::array::from_fn(|i| FE::from(u64::from(lanes[i])))
 }
 
 /// K6 — the preamble costs exactly the compressions the spec priced it at, and
@@ -452,14 +476,22 @@ fn the_preamble_costs_eleven_transcript_steps() {
             _ => None,
         })
         .collect();
+    let steps = modes.iter().filter(|m| **m == HashMode::Transcript).count();
+    let leaves = modes.iter().filter(|m| **m == HashMode::Leaf).count();
+    assert_eq!(steps, 11, "the transcript itself is 11 steps");
+    assert_eq!(leaves, 2, "one leaf row per data cell absorbed");
+    // The oracle's `FRI_TOY_COMPRESSIONS` counts BOTH kinds — it is the
+    // preamble's total socket cost, which is the number that closes `FriToyV0`
+    // at 93 (4 queries × 20 + 13).
     assert_eq!(
-        modes.len(),
+        steps + leaves,
         FRI_TOY_COMPRESSIONS,
-        "the transcript preamble is {FRI_TOY_COMPRESSIONS} compressions"
+        "the preamble costs {FRI_TOY_COMPRESSIONS} compressions in total"
     );
-    assert!(
-        modes.iter().all(|m| *m == HashMode::Transcript),
-        "a transcript step must never be emitted as a Merkle compress"
+    assert_eq!(
+        steps + leaves,
+        modes.len(),
+        "a transcript preamble emits transcript steps and leaf rows, nothing else"
     );
 }
 
@@ -571,7 +603,8 @@ fn the_machine_and_the_host_chain_agree_under_every_hasher() {
         let zeta0 = sponge.squeeze_ext();
         sponge.absorb(&word_of(&L1_ROOT));
         let zeta1 = sponge.squeeze_ext();
-        sponge.absorb2(&word_of(&T0W), &word_of(&T1W));
+        sponge.absorb_felts(&felts_of(&T0W));
+        sponge.absorb_felts(&felts_of(&T1W));
 
         for (i, want) in [alpha, zeta0, zeta1].iter().enumerate() {
             let v = want.value();
@@ -595,35 +628,54 @@ fn the_machine_and_the_host_chain_agree_under_every_hasher() {
 // =========================================================================
 
 /// Hash rows in `program`, split by mode.
-fn hash_row_modes(program: &LfmProgram) -> (usize, usize) {
+fn hash_row_modes(program: &LfmProgram) -> (usize, usize, usize) {
     let mut compress = 0;
     let mut transcript = 0;
+    let mut leaf = 0;
     for i in &program.instrs {
         if let Instr::Hash { mode, .. } = i {
             match mode {
                 HashMode::Compress => compress += 1,
                 HashMode::Transcript => transcript += 1,
+                HashMode::Leaf => leaf += 1,
                 HashMode::Permute => panic!("no registered program may contain a permute"),
             }
         }
     }
-    (compress, transcript)
+    (compress, transcript, leaf)
 }
 
-/// ★ The option-B cost claims, measured on the emitted programs.
+/// ★ The ratified cost claims, measured on the emitted programs.
 ///
-/// `permute-socket-options.md` §3 priced B at **369,103** `LFM_HASH` cell-equiv
-/// for `FriToyV0` and **16,527** for `TrivialV0` at 7 rounds, and the decision
-/// was taken partly on those numbers. Both are `rows × cells_per_compression`,
-/// so this asserts the row counts and the per-row price separately — a product
-/// that came out right for two wrong reasons is the failure mode.
+/// `leaf-spec/LEAF.md` §5 prices `TrivialV0` at **16,551** cell-equiv at 7
+/// rounds, which reproduces exactly. It prices `FriToyV0` at **502,047**, and
+/// the built machine costs **513,081** — see the ⚠ below. Both are
+/// `rows × cells_per_compression`, so this asserts the row counts and the
+/// per-row price separately: a product that came out right for two wrong
+/// reasons is the failure mode.
+///
+/// ⚠ **The spec's `FriToyV0` figure rests on a premise that does not hold.**
+/// §5 has "transcript unchanged at 11", but two of the four cells `FriToyV0`
+/// absorbs are the terminal polynomial's COEFFICIENTS — arbitrary field
+/// elements, not digests — so absorbing them raw hands the socket lanes that
+/// are not `u32` and the row is unprovable. They now enter through the leaf
+/// encoding (`SpongeVar::absorb_felts`), which adds **two `LFML` rows**: 93
+/// rows rather than 91. The transcript's own step count is unchanged at 11, so
+/// the spec's sentence is right about the transcript and wrong about the total.
+///
+/// ⚠ Both numbers MOVED with the leaf mode, and `TrivialV0`'s moved even though
+/// its row count did not: the canonicity witness columns are part of the AIR, so
+/// they exist on every compress row, leaf or not. Option B priced the same two
+/// programs at 369,103 and 16,527 against a 5,509-cell row; the row is now
+/// 5,517 and `FriToyV0` has 91 rows instead of 67, because each of its three
+/// data leaves became two `LFML` rows and a parent.
 ///
 /// The per-compression price is `blake3_socket_tests`' own census formula
-/// (`main + 3·⌈interactions/2⌉`), 5,509 at 7 rounds and 4,741 at 6.
+/// (`main + 3·⌈interactions/2⌉`), 5,517 at 7 rounds and 4,749 at 6.
 #[test]
-fn the_programs_cost_what_option_b_priced_them_at() {
-    const CELLS_PER_COMPRESSION_7R: usize = 5_509;
-    const CELLS_PER_COMPRESSION_6R: usize = 4_741;
+fn the_programs_cost_what_the_leaf_spec_priced_them_at() {
+    const CELLS_PER_COMPRESSION_7R: usize = 5_517;
+    const CELLS_PER_COMPRESSION_6R: usize = 4_749;
     let price = if SOCKET_ROUNDS == 7 {
         CELLS_PER_COMPRESSION_7R
     } else {
@@ -645,18 +697,31 @@ fn the_programs_cost_what_option_b_priced_them_at() {
         "the per-compression price must be the census's, not a literal"
     );
 
-    // TrivialV0: three compressions, no transcript.
-    let (c, t) = hash_row_modes(&super::programs::trivial_program());
-    assert_eq!((c, t), (3, 0));
+    // TrivialV0: three compressions, no transcript, no leaves. Its row COUNT
+    // is unchanged by the leaf mode and its PRICE is not — see the doc above.
+    let (c, t, l) = hash_row_modes(&super::programs::trivial_program());
+    assert_eq!((c, t, l), (3, 0, 0));
     if SOCKET_ROUNDS == 7 {
-        assert_eq!((c + t) * price, 16_527, "TrivialV0 at 7 rounds");
+        assert_eq!((c + t + l) * price, 16_551, "TrivialV0 at 7 rounds");
     }
 
-    // FriToyV0: 56 Merkle compressions (4 queries × 14) and the transcript's 11.
-    let (c, t) = hash_row_modes(&super::programs::fri_toy_program());
-    assert_eq!(t, FRI_TOY_COMPRESSIONS, "the transcript's share");
-    assert_eq!((c, t), (56, 11));
+    // FriToyV0, per query: three data leaves at two `LFML` rows each (6), their
+    // three `LFMC` parents, and 11 Merkle-walk steps — 14 `LFMC` and 6 `LFML`,
+    // i.e. the oracle's 20. Times 4 queries, plus the preamble's 13.
+    let (c, t, l) = hash_row_modes(&super::programs::fri_toy_program());
+    assert_eq!((c, t, l), (56, 11, 26));
+    assert_eq!(
+        t + 2,
+        FRI_TOY_COMPRESSIONS,
+        "the preamble's share: 11 transcript steps plus its 2 leaf rows"
+    );
+    assert_eq!(
+        c + t + l,
+        4 * 20 + FRI_TOY_COMPRESSIONS,
+        "the oracle's decomposition: 4 queries × 20 + the preamble's 13"
+    );
+    assert_eq!(c + t + l, 93);
     if SOCKET_ROUNDS == 7 {
-        assert_eq!((c + t) * price, 369_103, "FriToyV0 at 7 rounds");
+        assert_eq!((c + t + l) * price, 513_081, "FriToyV0 at 7 rounds");
     }
 }

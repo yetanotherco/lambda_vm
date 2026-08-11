@@ -207,21 +207,31 @@ fn check_multiplicities(program: &LfmProgram) -> Result<(), LfmViolation> {
                 }
             }
             Instr::Hash {
-                mode, outs, mults, ..
+                mode,
+                ins,
+                outs,
+                mults,
             } => {
-                let num_outs = if mode.is_two_to_one() { 1 } else { 3 };
+                let num_outs = mode.num_output_cells();
                 for i in 0..num_outs {
                     check(outs[i], mults[i])?;
                 }
-                // A two-to-one row's spare slots are outside `writes()` and so
+                // A one-output row's spare slots are outside `writes()` and so
                 // outside checks 1 and 4 — but they are inside the committed
                 // group and inside the bus. Pin them to the placeholders
                 // `instr.rs` documents, so "slot 0 only" is a checked property
                 // of the program and not a convention the emitter happens to
                 // follow.
-                if mode.is_two_to_one()
+                if mode.num_output_cells() == 1
                     && (mults[1] != 0 || mults[2] != 0 || outs[1] != Addr(0) || outs[2] != Addr(0))
                 {
+                    return Err(LfmViolation::CompressSlotNotPlaceholder { instr: idx });
+                }
+                // The same for the INPUT slots a mode does not read. A leaf row
+                // reads one cell, so its second and third slots reach the bus as
+                // addresses nothing receives; pinning them keeps "reads exactly
+                // `num_input_cells`" a checked property too.
+                if ins[mode.num_input_cells()..].iter().any(|a| *a != Addr(0)) {
                     return Err(LfmViolation::CompressSlotNotPlaceholder { instr: idx });
                 }
             }

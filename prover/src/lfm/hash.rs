@@ -89,6 +89,33 @@ pub trait LfmHasher {
         [out[0], out[1], out[2], out[3]]
     }
 
+    /// A Merkle LEAF over one cell read as four arbitrary FIELD ELEMENTS.
+    ///
+    /// The default hashes the felts as the first input cell against a zero
+    /// second cell, which is the natural reading for a **field-native** hasher:
+    /// `TestPermutation` and Poseidon take arbitrary Goldilocks elements
+    /// directly, so a leaf needs no encoding from them and this is a compress
+    /// with an empty right operand.
+    ///
+    /// BLAKE3 overrides it, and the override is the point of the whole mode: its
+    /// lanes must be `u32`, so each felt becomes a checked `lo`/`hi` pair inside
+    /// the socket, under the `"LFML"` tag.
+    ///
+    /// ⚠ Same weakening as [`LfmHasher::transcript_out`], recorded for the same
+    /// reason: a single-domain hasher does not separate a leaf from a parent, so
+    /// under `Test` and `Poseidon` the O5 second-preimage split is carried by
+    /// fixed tree depth alone, exactly as it was before this mode existed.
+    /// Neither is a production hash; the machine's real one separates them.
+    fn leaf_out(&self, felts: &LfmWord) -> [FE; HASH_STATE_FELTS] {
+        self.compress_out(felts, &[FE::zero(); HASH_DIGEST_FELTS])
+    }
+
+    /// [`LfmHasher::leaf_out`] truncated to the digest cell.
+    fn leaf(&self, felts: &LfmWord) -> LfmWord {
+        let out = self.leaf_out(felts);
+        [out[0], out[1], out[2], out[3]]
+    }
+
     /// Rejects a hash instruction this hasher's chip cannot prove, naming why.
     ///
     /// Total for every candidate whose domain is the whole state under both
@@ -251,6 +278,26 @@ impl LfmHasher for HasherKind {
             HasherKind::Test => TestPermutation.transcript(a, b),
             HasherKind::Poseidon => super::poseidon::PoseidonGoldilocks.transcript(a, b),
             HasherKind::Blake3 => super::blake3_socket::Blake3Permutation.transcript(a, b),
+        }
+    }
+
+    /// Delegated explicitly, fourth time for the same reason: BLAKE3's leaf mode
+    /// is an ENCODING, not just a tag, so a dispatch that fell through to the
+    /// trait default would hash four felts as a digest cell — a host answer no
+    /// chip proves.
+    fn leaf_out(&self, felts: &LfmWord) -> [FE; HASH_STATE_FELTS] {
+        match self {
+            HasherKind::Test => TestPermutation.leaf_out(felts),
+            HasherKind::Poseidon => super::poseidon::PoseidonGoldilocks.leaf_out(felts),
+            HasherKind::Blake3 => super::blake3_socket::Blake3Permutation.leaf_out(felts),
+        }
+    }
+
+    fn leaf(&self, felts: &LfmWord) -> LfmWord {
+        match self {
+            HasherKind::Test => TestPermutation.leaf(felts),
+            HasherKind::Poseidon => super::poseidon::PoseidonGoldilocks.leaf(felts),
+            HasherKind::Blake3 => super::blake3_socket::Blake3Permutation.leaf(felts),
         }
     }
 
