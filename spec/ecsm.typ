@@ -51,8 +51,16 @@ When $x_P = x_Q$ and $y_P eq.not - y_Q$, one instead uses $lambda = frac(3x_P^2,
 The remaing case that $(x_P, y_P) = (x_Q, -y_Q)$ corresponds with $Q = -P$; the addition results in $#inf$.
 
 = Overview
-This accelerator provides a compact way to prove the $x$-coordinate of the product $k times G$ for scalar $k in [1, N)$ and point $G in E(a, b, p) without {#inf}$ with $p in [3, 2^256)$ that induce curves of odd order.
+This accelerator provides a compact way to prove the product $k times G$ for scalar $k in [1, N)$ and point $G in E(a, b, p) without {#inf}$ with $p in [3, 2^256)$ that induce curves of odd order.
 In particular, the accelerator supports the curves `secp256k1` and `secp256r1`.
+
+The accelerator serves two ECALL variants, selected by the `is_affine` column:
+/ $x$-only ($#`is_affine` = 0$): the guest supplies $x_G$ (32 bytes) and receives $x_R := (k times G)_x$ (32 bytes). The matching $y_G$ is never read from memory; the prover witnesses it and the chip merely proves it to be _a_ root of the curve equation.
+/ affine ($#`is_affine` = 1$): the guest supplies the full point $x_G ‖ y_G$ (64 bytes) and receives the full point $x_R ‖ y_R$ (64 bytes).
+
+A single chip instance serves both variants: `is_affine` selects the ECALL-number the chip answers to, and gates the two memory accesses the affine variant adds (@ec:c:read_yG, @ec:c:write_yR) together with the address derivations they need.
+Every other constraint is shared, and the $x$-only path is unchanged by the addition.
+Returning $y_R$ spares the guest a second scalar multiplication: without it, the only way to recover $y(k times G)$ is to query $x((k+1) times G)$ as well and apply the chord-addition law.
 
 #attention("Variable space.")[
     This accelerator is _variable-space_ in the value of $k$; different values of $k$ may result in different table sizes.
@@ -61,11 +69,11 @@ In particular, the accelerator supports the curves `secp256k1` and `secp256r1`.
 
 The accelerator comprises two chips:
 - *`ECSM` (Elliptic Curve Scalar Multiply)*.
-    This chip is responsible for 
+    This chip is responsible for
     - loading $k$ from memory and verifying that it is contained in $[1, N)$,
-    - loading inputs $x_G$, verifying $x_G < p$, and reconstructing $y_G$,
-    - verifying $(k times G)_x < p$, and
-    - writing $(k times G)_x$ to memory.
+    - loading input $x_G$, verifying $x_G < p$, and either reconstructing $y_G$ ($x$-only) or loading it from memory (affine),
+    - verifying $(k times G)_x < p$ and $(k times G)_y < p$, and
+    - writing $(k times G)_x$ to memory, together with $(k times G)_y$ on the affine variant.
     It interacts with the `ECDAS` chip, sending $k$ and $G$ as input, and receiving $k times G$ as result.
 - *`ECDAS` (Elliptic Curve Double/Add Sequence)*.
     This chip computes $k times G$ by recursively interacting with itself.
@@ -92,12 +100,26 @@ Here follows the present `id` mapping:
 )]
 Supporting other curves only requires assigning them a unique `id`.#footnote([Note that adding a curve does require `id`'s type to be updated as well, since its current type (`Bit`) is now saturated.])
 
-The chip is triggered by executing `ECALL`, with the ECALL-number set to $-11$ (`secp256k1`) or $-12$ (`secp256r1`).
-The chip expects 
-- `x10` to contain the address where $x_R := (k times G)_x$ is to be stored, 
+The chip is triggered by executing `ECALL`, with the ECALL-number set to $-11 - 2 dot #`id` - #`is_affine`$:
+#align(center)[#table(
+  columns: (auto, auto, auto),
+  table.header("ECALL number", "curve", "variant"),
+  "-11", `secp256k1`, [$x$-only],
+  "-12", `secp256k1`, "affine",
+  "-13", `secp256r1`, [$x$-only],
+  "-14", `secp256r1`, "affine",
+)]
+Since `id` is a per-instance constant, the ECALL-number is _linear_ in `is_affine`: the receiver (@ec:c:receive_ecall) reconstructs it as $(-11 - 2#`id`) - #`is_affine`$.
+The `CPU` chip sends the guest's actual `A7` on the same bus, so a row that claims the wrong variant leaves the `ECALL` LogUp unbalanced.
+This is what pins `is_affine`, and thereby the two memory accesses it gates, to the ECALL the guest really executed.
+
+The chip expects
+- `x10` to contain the address where $x_R := (k times G)_x$ is to be stored,
 - `x11` to contain the address at which the least significant byte of $x_G$ is to be found,
 - `x12` to contain the address at which the least significant byte of $k$ is to be found,
 where it is assumed that $x_G$ and $k$ are provided as little-endian integers; $x_R$ is written to memory in little-endian form.
+On the affine variant, the two point buffers are 64 bytes wide rather than 32: $y_G$ is read from $#`x11` + 32$ and $y_R$ is written to $#`x10` + 32$, both again little-endian.
+No additional registers are consumed.
 
 == Columns
 #let nr_variables = total_nr_variables(ecsm_chip)
@@ -110,12 +132,20 @@ The #ecsm chip is comprised of #nr_variables variables that are expressed using 
 == Constraints
 
 === Interactions
-This chip is triggered by an `ECALL` with the opcode indicating this chip:
+This chip is triggered by an `ECALL` with the opcode indicating this chip and the requested variant.
+Constraint @ec:c:is_affine_implies_mu forces $#`is_affine` = 0$ on padding rows, so the buses it gates cannot fire there.
 #render_constraint_table(ecsm_chip, config, groups: "ecall")
 
 === Read `xG`
 Once triggered, it loads register `x11` to see where $x_G$ is stored in memory (@ec:c:read_addr_xG) and subsequently loads $x_G$ into `xG` (@ec:c:read_xG).
 #render_constraint_table(ecsm_chip, config, groups: "read_xG")
+
+=== Read `yG`
+On the affine variant, the input point comes with its $y$-coordinate.
+The four addresses at which it is stored are derived from `addr_xG[0]` rather than from a fourth register (@ec:c:extrapolate_addr_yG), since the guest passes $x_G ‖ y_G$ as one contiguous 64-byte buffer.
+The read itself (@ec:c:read_yG) carries multiplicity `is_affine`, so it is inert on $x$-only rows — where the guest has no $y_G$ in memory to read — and on padding rows.
+It shares its `timestamp` with the $x_G$-read (@ec:c:read_xG), which is sound because the two cover disjoint addresses.
+#render_constraint_table(ecsm_chip, config, groups: "read_yG")
 
 === Range check `xG`
 Before continuing, it is verified that $x_G in [0, p)$.
@@ -126,8 +156,9 @@ The addition is constrained by requiring that `c2` are bits (@ec:c:range_c2); an
 
 === Constrain `yG`
 With $x_G$ read and range checked, we direct our attention to $y_G$.
-Rather than reading it from memory, the prover provides it as a witness and proves it to be correct.
-In particular, the chip enforces the relations 
+On the $x$-only variant it is never read from memory; the prover provides it as a witness and proves it to be correct.
+On the affine variant the same witness is additionally pinned to the caller's buffer by @ec:c:read_yG, but the relations below are enforced in both cases.
+In particular, the chip enforces the relations
 $
   x_G^2 - #`x2` - q_0 dot p &= 0,\
   y_G^2 - x_G dot #`x2` - a dot x_G - b + (2p - q_1)p &= 0\
@@ -150,7 +181,15 @@ We must therefore support quotients $q_0 in [0, 2^256)$ and $q_1 in [0, 2^258)$.
 #aside("Two options for " + $y_G$)[
   In most cases, $y_G^2$ has _two_ roots $mod p$.
   This means that enforcing the above relation does not fully constrain the prover: it can choose which of the two to provide as hint.
-  However, in this setting, this is not a problem: the `ECSM`-chip only outputs the $x$-coordinate of $k times G$, which is the same, irrespective of the chosen root.
+  On the $x$-only variant this is not a problem: the chip only outputs the $x$-coordinate of $k times G$, and $x(k times G) = x(k times (-G))$, so both choices yield the same output.
+]
+
+#attention("The affine variant must pin the sign of " + $y_G$)[
+  As soon as $y_R$ is published, the freedom described above becomes exploitable.
+  A prover that answers with $-y_G$ computes $k times (-G)$: a correct multiple of a _different_ point.
+  The curve equation cannot tell the two apart, and neither can the guest, which delegated the multiplication precisely because it cannot perform it.
+  Constraint @ec:c:read_yG is what closes this: it pins the `yG` witness to the bytes the caller placed at $#`addr_xG` + 32$.
+  This is also why the read fires with multiplicity `is_affine` rather than `μ` — the $x$-only path has nothing to pin it to, and does not need it.
 ]
 
 Below, we enforce the first of the two sub-relations.
@@ -184,10 +223,32 @@ The addition is constrained by requiring that `c4` are bits (@ec:c:range_c4); an
 
 #render_constraint_table(ecsm_chip, config, groups: "range_xR")
 
+=== Range check `yR`
+The same treatment is given to $y_R$: witness $#`yR_sub_p` := #`yR` - p mod 2^256$ is added to `p`, and the addition is required to overflow (@ec:c:yR_addition_overflows), which holds if and only if $#`yR` < p$.
+
+Unlike the $y_G$-read, this check fires on _every_ active row rather than only on affine ones.
+It is cheap, `yR` is witnessed in both variants anyway, and gating it on `is_affine` would buy nothing.
+
+#aside("Why " + $y_R$ + " needs a canonicality check at all")[
+  The `ECDAS` relations that produce $y_R$ absorb a multiple of $p$ into their quotient columns, and the byte range checks only bound $y_R$ below $2^256$.
+  A prover could therefore publish $y_R + p$ whenever $y_R < 2^256 - p$ and still satisfy every other constraint.
+  For `secp256k1` that band has width $2^256 - p approx 2^32$, and it is populated: the curve has points with very small $y$.
+  Constraint @ec:c:yR_addition_overflows is what rules the non-canonical representative out.
+  $x_R$ was already covered by @ec:c:xR_addition_overflows; publishing $y_R$ is what makes _its_ representation observable too.
+]
+
+#render_constraint_table(ecsm_chip, config, groups: "range_yR")
+
 === Write `xR`
 We read `addr_xR` from register `x10` (@ec:c:load_addr_xR), and subsequently write `xR` to this address (@ec:c:write_xR).
 Note that the `timestamp` on both memory accesses is offset to allow `addr_xR` to equal `addr_xG` and thus for $x_R$ to overwrite $x_G$ in memory.
 #render_constraint_table(ecsm_chip, config, groups: "write_xR")
+
+=== Write `yR`
+On the affine variant, $y_R$ is written directly after $x_R$, at addresses derived from `addr_xR[0]` (@ec:c:extrapolate_addr_yR); as on the input side, the output buffer is one contiguous 64-byte region and no extra register is read.
+The write carries multiplicity `is_affine` (@ec:c:write_yR) and uses $#`timestamp` + 3$, the fourth and last sub-timestamp of the instruction: $x_G$ and $y_G$ occupy `timestamp`, $k$ occupies $#`timestamp` + 1$ and $x_R$ occupies $#`timestamp` + 2$.
+Placing it last also keeps $x_R ‖ y_R$ overwriting $x_G ‖ y_G$ legal.
+#render_constraint_table(ecsm_chip, config, groups: "write_yR")
 
 == Carry offsets
 We close by deriving the values of `offsets`.
