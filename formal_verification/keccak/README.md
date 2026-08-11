@@ -179,7 +179,7 @@ z3's Python bindings are the only dependency (no cargo, no repo build):
 
 ```
 pip install z3-solver            # if not already importable
-cd thoughts/formal-verification/keccak
+cd formal_verification/keccak
 python3 test_ref.py              # reference constants + SHA3 vs hashlib
 python3 test_dataflow.py         # concrete mirror vs reference (+ bug sanity)
 python3 z3_parallel.py           # the gate: 24 rounds + controls (see par.log)
