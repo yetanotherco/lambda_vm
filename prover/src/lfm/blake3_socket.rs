@@ -84,21 +84,25 @@
 //!   overrides `compress` (and [`LfmHasher::compress_out`]) rather than
 //!   inheriting the trait's permute-and-truncate default.
 //!
-//! # ✗ OPEN — O5: leaf/parent domain separation is NOT decided
+//! # ✓ DECIDED — O5: leaves get the `"LFML"` tag
 //!
 //! This socket has **one** tag, so it separates LFM compressions from other
 //! BLAKE3 uses but **not leaves from parents within a tree**. If leaves ever
 //! enter a tree as raw cells rather than through a distinct domain, a
 //! variable-depth tree admits the classic Merkle second-preimage confusion: an
-//! internal node replayed as a leaf. Two ways out, and it needs an explicit
-//! answer rather than a default — fix the tree depth (then there is no
-//! ambiguity), or give leaves the reserved `"LFML"` tag. BLAKE3 itself solves
-//! this with its `PARENT` flag, which cannot be reused here without leaving the
-//! standard-hash framing that makes `blake3::hash` a direct KAT.
+//! internal node replayed as a leaf. Decided 2026-08-10: any future
+//! leaf-hashing path MUST use the reserved `"LFML"` tag — the RFC 6962
+//! leaf/parent split expressed in the tag scheme, keeping both domains direct
+//! `blake3::hash` KATs. (BLAKE3's own `PARENT` flag was rejected: it cannot be
+//! reused without leaving the standard-hash framing that makes the crate a
+//! direct KAT. A fixed-depth-only policy was rejected as an invariant no
+//! mechanism enforces.)
 //!
-//! Recorded here because it is an obligation on *this* socket
-//! (`gate-oracle/ORACLE.md` §7, O5) and it is invisible at the call site.
-//! Nothing below depends on the answer.
+//! Nothing implements `"LFML"` yet and nothing needs to: there is no
+//! leaf-hashing path (`merkle_walk` receives leaf digests as inputs) and every
+//! current tree is fixed-depth. The obligation binds review, not this code: a
+//! change adding leaf hashing or variable-depth trees without `"LFML"` is
+//! rejected on O5 (`gate-oracle/ORACLE.md` §7).
 //!
 //! Equally on the record: the digest is 128 bits, so this socket offers
 //! **64-bit collision resistance** by the birthday bound. That follows from
