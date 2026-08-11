@@ -1,0 +1,22 @@
+[READ      ] P1 column layout [A1/A2]  {'MU': 666, 'IS_AFFINE': 667, 'YR_SUB_P': 668, 'NUM_COLUMNS': 684}; YR_SUB_P + 16 halfwords = 684 == NUM_COLUMNS 684
+[READ      ] P2 constraint count + index map [A1]  idx closes at 423 == 423; header map lists 413..422
+[READ      ] P3 address-limb bounds [A4]  2^32−31 / 2^32−63 match the model's constants
+[READ      ] P4 syscall numbers [A1c]  u64::MAX−10 / u64::MAX−11
+[READ      ] P5 low-word compile-time assert [A1c]  the low-32-bit-word inequality is a compile-time assert
+[READ      ] P6 syscall word is linear in IS_AFFINE [A1c]  both received words are the IS_AFFINE interpolation of the two numbers
+[READ      ] P7 affine-gated bus layout [A1/A3]  2 affine-gated bus blocks (4 dwords each), offsets +32+8i, yG via memw_read at ts and yR via memw_write at ts+3
+[READ      ] P8 YrLtP wiring [A2]  YrLtP → (P_BYTES, YR_SUB_P, YR), byte-stored sum (not bits)
+[READ      ] P9 YrLtP is µ-gated, not IS_AFFINE-gated [A2d]  all four chains share one µ-gated loop; IS_AFFINE does not appear in it ⇒ YrLtP binds x-only rows too (strictly stronger; A2d)
+[READ      ] P10 YR_SUB_P halfword checks [A2]  16 µ-gated IsHalfword sends on yr_sub_p(i)
+[READ      ] P11 Alu LT senders [A4]  3 senders: xG/xR vs addr_bound_by_mode(), k vs the flat 32-byte bound, LT/1
+[READ      ] P12 executor ABI arm [A4]  spans 63/63/31, u128 overlap guard, yG at +32 in, yR at +32 out
+[READ      ] P13 honest y_r_sub_p [A2e]  y_r_sub_p = (2^256 + yR − p), computed in the shared inner fn used by both paths
+[READ      ] P14 carry offsets [A3]  X2 8160 / YG 16319
+[READ      ] P15 INV_SHIFT_32 [A2a]  INV_SHIFT_32 = 18446744065119617026 = 2^-32 mod p_g
+[READ(neg) ] P16 nothing constrains yG's parity [A3]  7 uses of cols::YG, all parity-blind (AreBytes range check (parity-blind), Ecdas seed/drain bus tuples (parity-blind), the Yg relation's yG² term — satisfied by BOTH roots, the affine yG MEMW read (the fix itself), trace fill)
+[READ(neg) ] P17 YR is not byte-checked in ecsm.rs [A2d]  ecsm.rs byte-checks ['Q0', 'Q1', 'X2', 'YG']; YR (and XR) are NOT among them ⇒ C4-YR is a contract, not a local emission
+[READ      ] P18 instruction timestamp stride [A4f]  builder stride parsed as [4] (model says 4); ECSM uses ts offsets {0} ∪ [1, 2, 3], max 3 == stride−1 ⇒ ts+3 is free and nothing spills
+
+[PROVED    ] mutation testing  18 mutations applied; every premise's check fails on its mutant
+
+TRANSCRIPTION AUDIT: 18/18 premises read from source, 18 mutation controls, 0 failures

@@ -1,0 +1,10 @@
+# Local venv for z3/sympy/ecdsa — recreate with:
+#   python3 -m venv .venv && ./.venv/bin/pip install z3-solver sympy ecdsa
+.venv/
+
+# Rust harness build output
+harness/target/
+harness/Cargo.lock
+
+__pycache__/
+*.pyc

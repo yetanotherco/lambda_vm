@@ -1,0 +1,11 @@
+[PASS ] A0 repo constants  4 constants parsed from crypto/ecsm/src/lib.rs match
+[PASS ] A1 curve/group  G on curve, N·G = O, 5 published multiples, 40 negation + 20 additivity checks
+[PASS ] A2 x-only agreement  216 (k, xG) pairs: affine_mul(...).x == x_only_mul(...), incl. k = 1, 2, N−1, N−2, 2^255
+[PASS ] A3 root dependence  200 instances: x invariant under yG → p−yG, y negated in ALL 200 of them ⇒ publishing yR makes the input parity observable
+[PASS ] A4 validation set  8 rejections match the executor's error kinds; k ∈ {1, 2, N−2, N−1} all accepted and ordinary
+[PASS ] A5 ABI predicates  limb bound exact at both spans (31/63), overlap guard == interval disjointness over 193 offsets; u64-wrap control: addr 2^64−64 passes addr_limb_ok (=True) yet the pre-fix guard misses a total overlap
+[PASS ] A6 ecrecover equivalence  60 instances: y recovered from x(k·P) + x((k+1)·P) + the chord law equals the y the affine ecall returns ⇒ dropping `solve_y` is semantics-preserving
+[PASS ] A7 third-party cross-check  25 random k·P against the `ecdsa` package
+[PASS ] A8 LE32 codec  round-trip + endianness
+
+ORACLE STATUS: VALIDATED  (9 pass, 0 skip, 0 fail)

@@ -1,0 +1,16 @@
+[package]
+name = "ecsm-affine-harness"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Standalone workspace: this crate lives under `docs/` and must not be adopted as a
+# member of the repo workspace (which lists its members explicitly).
+[workspace]
+
+[dependencies]
+ecsm = { path = "../../../../crypto/ecsm" }
+num-bigint = "0.4.6"
+
+[profile.release]
+opt-level = 3
