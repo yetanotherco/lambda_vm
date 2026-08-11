@@ -1,0 +1,40 @@
+==========================================================================
+SQUEEZE-RUN ANALYSIS — entropy loss vs run length
+==========================================================================
+  state = 128 bits (one cell)
+
+   run k | reachable fraction | loss (bits) | state left
+  -------+--------------------+-------------+-----------
+       1 |           0.632121 |        0.66 |    127.34
+       2 |           0.468536 |        1.09 |    126.91
+       4 |           0.312080 |        1.68 |    126.32
+       8 |           0.189050 |        2.40 |    125.60
+      16 |           0.106537 |        3.23 |    124.77
+      64 |           0.029762 |        5.07 |    122.93
+     256 |           0.007703 |        7.02 |    120.98
+    1024 |           0.001945 |        9.01 |    118.99
+    4096 |           0.000488 |       11.00 |    117.00
+   65536 |           0.000031 |       15.00 |    113.00
+
+  asymptotic check, alpha_k ~ 2/k:
+    k=  1024: alpha=1.945e-03  2/k=1.953e-03
+    k= 65536: alpha=3.052e-05  2/k=3.052e-05
+
+--------------------------------------------------------------------------
+(b) RUN LENGTHS IN THE PROGRAMS AS THEY EXIST  ✓ VERIFIED
+  FriToyV0 runs: [2, 1, 4]  -> MAX RUN = 4
+     loss at k=4: 1.68 bits of 128
+  TrivialV0: no sponge (raw permute; see spec)
+  NOTE: the max run IS NUM_QUERIES — it scales with the query count,
+        so a production FRI (100-200 queries) would have a run that
+        long. That is the regime worth stating a bound for.
+     hypothetical production run k=128: 6.04 bits
+     hypothetical production run k=256: 7.02 bits
+
+--------------------------------------------------------------------------
+(c) GUIDANCE BOUND
+  loss stays under 1 bit(s) for runs up to k ~ 1
+  loss stays under 4 bit(s) for runs up to k ~ 16
+  loss stays under 8 bit(s) for runs up to k ~ 256
+  The birthday bound on a 128-bit state (2^64) dominates long
+  before image shrinkage matters: even k = 2^16 costs under 16 bits.
