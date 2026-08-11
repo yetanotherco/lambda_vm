@@ -52,6 +52,7 @@
       ("commit.typ", [`COMMIT` chip], <commit>),
       ("sha256.typ", [`SHA256` accelerator], <sha256>),
       ("keccak.typ", [`KECCAK` accelerator], <keccak>),
+      ("dma.typ", [`DMA` accelerator], <dma>),
       ("ecsm.typ", [`ECSM` accelerator], <ecsm>),
       ("fext.typ", [Extension field accelerator], <fext>),
     )),

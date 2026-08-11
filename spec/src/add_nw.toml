@@ -1,0 +1,68 @@
+name = "ADDNW"
+
+# Variables
+
+[[variables.condition]]
+name = "cond"
+type = "BaseField"
+desc = "Whether the relation should be enforced ($eq.not 0$) or not ($0$)."
+
+[[variables.input]]
+name = "lhs"
+type = "DWordWL"
+desc = "left-hand operator"
+
+[[variables.input]]
+name = "rhs"
+type = "DWordWL"
+desc = "right-hand operator"
+
+[[variables.output]]
+name = "sum"
+type = "DWordWL"
+desc = "$#`lhs` + #`rhs`$"
+
+[[variables.virtual]]
+name = "carry"
+type = ["Bit", 2]
+desc = "Carry values used to constrain the addition"
+def = {idx="i", polys=[
+    {iter=0, poly=["*", ["^", 2, -32], ["-", ["+", ["idx", "lhs", 0], ["idx", "rhs", 0]], ["idx", "sum", 0]]]},
+    {iter=1, poly=["*", ["^", 2, -32], ["-", ["+", ["idx", "lhs", 1], ["idx", "rhs", 1], ["idx", "carry", 0]], ["idx", "sum", 1]]]},
+]}
+
+# Assumptions
+
+[[assumptions]]
+desc = "`IS_WORD[lhs[i]]`"
+iter = ["i", 0, 1]
+ref = "addnw:a:lhs"
+
+[[assumptions]]
+desc = "`IS_WORD[rhs[i]]`"
+iter = ["i", 0, 1]
+ref = "addnw:a:rhs"
+
+[[assumptions]]
+desc = "`IS_WORD[sum[i]]`"
+iter = ["i", 0, 1]
+ref = "addnw:a:sum"
+
+# Constraints
+
+[[constraint_groups]]
+name = "all"
+
+[[constraints.all]]
+kind = "template"
+tag = "ADD"
+input = ["lhs", "rhs"]
+output = "sum"
+cond = "cond"
+ref = "addnw:c:add"
+
+[[constraints.all]]
+kind = "arith"
+constraint = "$#`cond` => #`carry`_1 = 0$"
+poly = ["*", "cond", ["idx", "carry", 1]]
+ref = "addnw:c:no_wraparound"
