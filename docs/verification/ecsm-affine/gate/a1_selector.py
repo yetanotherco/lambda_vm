@@ -14,6 +14,9 @@ whole board reduces to is whether a prover can choose it freely.
                                                       CPU's real `a7`.
   A1d  degree bookkeeping                           — both new constraints are degree 2, so
                                                       `max_degree() == 3` still holds.
+  A1f  IS_BIT(IS_AFFINE) is load-bearing      — and not for the reason its comment gives:
+                                                    without it the row can impersonate a
+                                                    DIFFERENT accelerator's ecall.
   A1e  µ-gating is NOT vacuous                      — with idx 422 dropped, a padding row
                                                       can set `IS_AFFINE = 1` and satisfy all
                                                       422 remaining constraints, and then
@@ -47,6 +50,7 @@ from affine_common import (  # noqa: E402
     ECSM_AFFINE_SYSCALL_NUMBER,
     ECSM_SYSCALL_NUMBER,
     PG,
+    SYSCALL_NUMBERS,
     certify_pg_prime,
     field_roots,
     s_ecsm_x2,
@@ -293,6 +297,93 @@ def a1e_padding_control():
     return ok
 
 
+# ── A1f: is IS_BIT(IS_AFFINE) itself load-bearing? ─────────────────────────
+
+def a1f_cross_syscall_control():
+    """NEGATIVE CONTROL for idx 421, and the one this board originally MISSED.
+
+    A1a proves `IS_BIT(IS_AFFINE)` does what it says. That is not the same as showing it is
+    NECESSARY — and the necessity argument turns out to be the most interesting thing on this
+    board, because it is not local to the ECSM pair at all.
+
+    The receiver's syscall words are `xonly + a·(affine − xonly)` per 32-bit word. For the
+    repo's numbers the coefficients are:
+
+        low word :  affine_lo − xonly_lo = −1
+        high word:  affine_hi − xonly_hi =  0        (both share 0xFFFF_FFFF)
+
+    So as `a` ranges over the field, the received HIGH word is CONSTANT and the received LOW
+    word ranges over the whole field. Every syscall that shares the high word — which is all
+    of them, since they are all `u64::MAX − k` for small `k` — is therefore reachable at some
+    `a`, and the offset is just the difference of the low words:
+
+        a = xonly_lo − target_lo   (mod p_g)
+
+    Drop idx 421 and `a` is free on a `µ=1` row (idx 422 only binds when `µ=0`). Then:
+
+        a = 20                 ⇒ the row's Ecall tuple IS a HINT ecall's
+        a = p_g − 9            ⇒ the row's Ecall tuple IS a KECCAK ecall's
+
+    i.e. an ECSM row can consume the `Ecall` send of a *different* accelerator's ecall, and
+    the guest's HINT (or keccak) call gets proven as a scalar multiplication that writes 32 or
+    64 bytes at whatever addresses the ECSM row's register columns claim. `IS_BIT(IS_AFFINE)`
+    is the only thing confining `a` to `{0, 1}`.
+
+    Note what does NOT close this: `execution.rs`'s `const _: () = assert!` compares only the
+    two ECSM numbers' low words. It cannot see that a THIRD syscall's low word sits an integer
+    offset away, which is exactly the reachable case here.
+
+    Paired, both directions:
+      * idx 421 KEPT    — only `a ∈ {0,1}` is admissible ⇒ only ECSM/ECSM_AFFINE reachable;
+      * idx 421 DROPPED — at least one other real syscall is reachable."""
+    lo_x = ECSM_SYSCALL_NUMBER & 0xFFFF_FFFF
+    hi_x = ECSM_SYSCALL_NUMBER >> 32
+    coeff_lo = (ECSM_AFFINE_SYSCALL_NUMBER & 0xFFFF_FFFF) - lo_x
+    coeff_hi = (ECSM_AFFINE_SYSCALL_NUMBER >> 32) - hi_x
+
+    def reached(a):
+        return (syscall_word_lo(a) % PG, syscall_word_hi(a) % PG)
+
+    impersonated = {}
+    for name, v in SYSCALL_NUMBERS.items():
+        target = (v & 0xFFFF_FFFF, v >> 32)
+        if coeff_lo == 0:
+            continue
+        # Solve lo_x + a·coeff_lo ≡ target_lo (mod p_g)  ⇒  a = (target_lo − lo_x)/coeff_lo.
+        # The `reached(a) == target` re-check below is not decoration: it caught this line
+        # with its sign inverted, via half 1 failing (only ECSM matched, because it is the
+        # fixed point where both signs agree). An unpaired control would have reported
+        # "no foreign syscalls reachable ⇒ idx 421 REDUNDANT" — the exact false negative the
+        # pairing rule exists to prevent.
+        a = ((target[0] - lo_x) * pow(coeff_lo, -1, PG)) % PG
+        if reached(a) == target:
+            impersonated[name] = a
+
+    # Half 1: with idx 421 KEPT, a ∈ {0,1}, so only the two ECSM variants are reachable.
+    reachable_as_bit = {n for n, a in impersonated.items() if a in (0, 1)}
+    kept_ok = reachable_as_bit == {"ECSM", "ECSM_AFFINE"}
+    # Half 2: with idx 421 DROPPED, at least one OTHER syscall is reachable.
+    foreign = {n: a for n, a in impersonated.items() if a not in (0, 1)}
+    forges = len(foreign) > 0
+    # And the mechanism: the high word carries no information, so it never objects.
+    hi_blind = coeff_hi == 0
+
+    ok = kept_ok and forges and hi_blind
+    report("A1f control [drop idx 421] cross-syscall impersonation",
+           "SAT — FORGES" if ok else "FAIL",
+           f"high-word coefficient is {coeff_hi} (blind), low-word is {coeff_lo}, so the "
+           f"received tuple sweeps the whole field. Reachable syscalls: "
+           + ", ".join(f"{n}@IS_AFFINE={a}" for n, a in sorted(impersonated.items(),
+                                                               key=lambda kv: kv[1]))
+           + f". With idx 421 kept only {sorted(reachable_as_bit)} are admissible; dropped, "
+             f"{sorted(foreign)} become reachable ⇒ idx 421 is LOAD-BEARING, and NOT for the "
+             "reason its comment gives."
+           if ok else
+           f"kept_ok={kept_ok} reachable_as_bit={sorted(reachable_as_bit)} "
+           f"foreign={foreign} hi_blind={hi_blind}")
+    return ok
+
+
 def main():
     a1_prime()
     a1a_is_bit()
@@ -302,6 +393,7 @@ def main():
     a1c_assert_is_load_bearing()
     a1d_degrees()
     a1e_padding_control()
+    a1f_cross_syscall_control()
 
     print("\nSummary:")
     for n, v, _ in results:

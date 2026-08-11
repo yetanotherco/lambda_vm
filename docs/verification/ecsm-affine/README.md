@@ -38,18 +38,19 @@ form of #903's own argument anyway, since these are runnable gates with exit cod
 soundness theorem.
 
 ```
-audit:   18/18 premises read from source, 18/18 mutation controls bite, 0 failures
+audit:   19/19 premises read from source, 19/19 mutation controls bite, 0 failures
 oracle:  ORACLE STATUS: VALIDATED   (9 pass, 0 skip, 0 fail)
 anchor:  32 real witnesses from ecsm::compute_witness{,_with_y}, every field re-derived
-A1 selector    : IS_BIT + µ-gating PROVED, Ecall pinning PROVED, 2 forgery controls
+A1 selector    : IS_BIT + µ-gating PROVED, Ecall pinning PROVED, 3 forgery controls
 A2 YrLtP       : lift + strict chain PROVED, forgery instantiated on a real y = 1 point
 A3 parity      : forgery instantiated (2 full witnesses), the yG read PROVED to close it
 A4 addressing   : LT bound == executor's predicate PROVED, u64-wrap control FORGES
 ```
 
-Six genuine forgeries/catches. **Every new check in PR #879 is confirmed load-bearing** — the
-`yG` read, `YrLtP`, `IS_AFFINE`'s µ-gate, the `Alu` LT senders and the `u128` widening each
-admit a concrete attack when removed.
+Seven distinct attacks (11 `SAT` results; several are exhibited from more than one
+angle). **Every new check in PR #879 has a control showing it is
+load-bearing** — the `yG` read, `YrLtP`, `IS_AFFINE`'s bit constraint and its µ-gate, the
+`Alu` LT senders and the `u128` widening each admit a concrete attack when removed.
 
 ## What is being verified, and what is imported
 
@@ -111,7 +112,7 @@ in-table constraint set on each, and shows both are valid with the same `xR` and
 | `gate/a3_parity_binding.py` | A3 — the parity forgery and the read that closes it |
 | `gate/a4_addressing.py` | A4 — address bounds, the `+32…+63` span, the overlap guard |
 | `gate/a6_real_witness.py` | the real-witness (column) anchor |
-| `gate/audit_transcription.py` | A5 — 18 premises read from source + mutation controls |
+| `gate/audit_transcription.py` | A5 — 19 premises read from source + mutation controls |
 | `gate/RESULTS.md` | lemma board, soundness theorem, contracts, findings, method notes |
 | `gate/TRANSCRIPTION-AUDIT.md` | the audit's prose half: premise table and what it cannot see |
 | `gate/logs/` | run logs, and the real-witness dump |

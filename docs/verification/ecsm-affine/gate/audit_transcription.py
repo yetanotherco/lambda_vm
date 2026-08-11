@@ -41,6 +41,7 @@ from affine_common import (  # noqa: E402
     ECSM_AFFINE_SYSCALL_NUMBER,
     ECSM_SYSCALL_NUMBER,
     INSTRUCTION_TS_STRIDE,
+    SYSCALL_NUMBERS,
 )
 
 
@@ -329,6 +330,24 @@ def p_ts_stride(s):
                 f"max {max(offsets)} == stride−1 ⇒ ts+3 is free and nothing spills")
 
 
+def p_all_syscall_numbers(s):
+    """A1f's premise: the model knows EVERY syscall number the CPU can put on the `Ecall`
+    bus, not just the ECSM pair.
+
+    A1f's conclusion is about which foreign syscalls the linear syscall word can reach as
+    `IS_AFFINE` sweeps the field. Add a fifth syscall and the reachable set changes — so the
+    set has to be read from the source, not remembered. Parsed as `u64::MAX - k` declarations,
+    and the parsed set must equal the model's exactly (both directions: a new syscall fails
+    this, and so does a stale entry)."""
+    src = _src(s, EXEC_RS)
+    found = {name: 2**64 - 1 - int(k) for name, k in re.findall(
+        r"pub const (\w+)_SYSCALL_NUMBER: u64 = u64::MAX - (\d+);", src)}
+    ok = found == SYSCALL_NUMBERS
+    return ok, (f"{len(found)} syscalls parsed: "
+                + ", ".join(f"{n}=MAX-{2**64 - 1 - v}" for n, v in sorted(found.items()))
+                + ("" if ok else f"  MISMATCH vs model {sorted(SYSCALL_NUMBERS)}"))
+
+
 PREMISES = [
     Premise("P1 column layout", "A1/A2", "IS_AFFINE=667, YR_SUB_P=668..684, NUM_COLUMNS=684",
             p_columns,
@@ -400,6 +419,11 @@ PREMISES = [
             mutations=[(ECSM_RS, r"is_byte\(cols::Q1, 33, &mut out\);",
                         "is_byte(cols::Q1, 33, &mut out);\n    is_byte(cols::YR, 32, &mut out);",
                         "YR gains a local byte check")]),
+    Premise("P19 the complete syscall set", "A1f",
+            "every u64::MAX-k syscall the Ecall bus can carry", p_all_syscall_numbers,
+            mutations=[(EXEC_RS, r"pub const HINT_SYSCALL_NUMBER: u64 = u64::MAX - 30;",
+                        "pub const HINT_SYSCALL_NUMBER: u64 = u64::MAX - 40;",
+                        "a syscall number changes ⇒ A1f's reachable set is stale")]),
     Premise("P18 instruction timestamp stride", "A4f", "4 sub-timestamps per instruction",
             p_ts_stride,
             mutations=[(TRACE_BUILDER_RS, r"let timestamp = \(i as u64\) \* 4 \+ 4;",

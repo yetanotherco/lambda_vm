@@ -8,6 +8,7 @@
 [PROVED  ] A1c assert load-bearing  low word separates modes: True; high word separates modes: False ⇒ execution.rs's low-word assert carries the entire pinning
 [PROVED  ] A1d degree bound  max over new constraints = 3 == declared max_degree 3
 [SAT — FORGES] A1e control [drop idx 422] padding row with IS_AFFINE=1  all 423 constraints walked: idx 422 is the ONLY one violated when kept, and all 422 remaining are satisfied when dropped; honest padding (IS_AFFINE=0) satisfies all 423. The dropped row then fires 8 IS_AFFINE-gated MEMW interactions. idx 422 is LOAD-BEARING.
+[SAT — FORGES] A1f control [drop idx 421] cross-syscall impersonation  high-word coefficient is 0 (blind), low-word is -1, so the received tuple sweeps the whole field. Reachable syscalls: ECSM@IS_AFFINE=0, ECSM_AFFINE@IS_AFFINE=1, HINT@IS_AFFINE=20, KECCAK@IS_AFFINE=18446744069414584312. With idx 421 kept only ['ECSM', 'ECSM_AFFINE'] are admissible; dropped, ['HINT', 'KECCAK'] become reachable ⇒ idx 421 is LOAD-BEARING, and NOT for the reason its comment gives.
 
 Summary:
   CERTIFIED    A1-PRIME p_g = 2^64 − 2^32 + 1 is prime
@@ -20,3 +21,4 @@ Summary:
   PROVED       A1c assert load-bearing
   PROVED       A1d degree bound
   SAT — FORGES A1e control [drop idx 422] padding row with IS_AFFINE=1
+  SAT — FORGES A1f control [drop idx 421] cross-syscall impersonation

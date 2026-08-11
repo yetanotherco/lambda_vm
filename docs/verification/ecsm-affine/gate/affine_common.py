@@ -58,6 +58,19 @@ N_BYTES = list(N.to_bytes(32, "little"))
 ECSM_SYSCALL_NUMBER = 2**64 - 1 - 10          # u64::MAX - 10, x-only
 ECSM_AFFINE_SYSCALL_NUMBER = 2**64 - 1 - 11   # u64::MAX - 11, affine
 
+# EVERY syscall number the CPU can put on the `Ecall` bus (execution.rs:29, 40, 48, 69).
+# A1f needs the whole set, not just the ECSM pair: the receiver's syscall word is LINEAR in
+# IS_AFFINE with low-word coefficient −1 and high-word coefficient 0, so as `IS_AFFINE` ranges
+# over the field the received low word ranges over the WHOLE field while the high word stays
+# fixed — which means every other syscall's tuple is reachable at some value of `IS_AFFINE`.
+# `IS_BIT(IS_AFFINE)` is what confines it to {0, 1}. Audit premise P19 keeps this set in sync.
+SYSCALL_NUMBERS = {
+    "KECCAK": 2**64 - 1 - 1,
+    "ECSM": ECSM_SYSCALL_NUMBER,
+    "ECSM_AFFINE": ECSM_AFFINE_SYSCALL_NUMBER,
+    "HINT": 2**64 - 1 - 30,
+}
+
 # ── address-limb bounds (prover/src/tables/ecsm.rs:43, 47) ──────────────────
 
 ADDR_LIMB_BOUND_32B = (1 << 32) - 31

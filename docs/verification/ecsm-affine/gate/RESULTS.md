@@ -42,11 +42,12 @@ reference = `../oracle/ecsm_affine_ref.py`, a from-scratch secp256k1 implementat
 | **A1c-ctl** | the degenerate syscall pair un-pins the selector; the repo pair does not | PROVED + 1 SAT | identical numbers ⇒ constant tuple ⇒ `IS_AFFINE` free |
 | **A1c-assert** | today's pinning rests **entirely** on the LOW word | PROVED | high word separates nothing (shared `0xFFFF_FFFF`) ⇒ `execution.rs`'s `const _:` assert is load-bearing, not decorative |
 | **A1d** | both new constraints are degree 2; `max_degree() == 3` still holds | PROVED | `YrLtP` reuses the existing degree-3 shape |
+| **A1f** | **drop idx 421** | **SAT — FORGES** | the row's `Ecall` tuple can be made **another accelerator's**: `IS_AFFINE = 20` → HINT, `IS_AFFINE = p_g − 9` → KECCAK. `IS_BIT` is the only thing confining it to `{0,1}`. **LOAD-BEARING — and not for the reason its comment gives** |
 | **A1e** | **drop idx 422** | **SAT — FORGES** | all 423 constraints walked: idx 422 is the ONLY one violated when kept, all 422 remaining are satisfied when dropped, honest padding satisfies all 423 — and the dropped row then fires 8 `IS_AFFINE`-gated MEMW ops. **LOAD-BEARING** |
-| **A2a** | `YrLtP` word-carry lift: field recurrence ⇒ integer equation | PROVED (z3 UNSAT) | `|A_i| < 2^33 ≪ p_g`, so no `p_g` wrap |
+| **A2a** | `YrLtP` word-carry lift: field recurrence ⇒ integer equation | PROVED (z3 UNSAT) | `\|A_i\| < 2^33 ≪ p_g`, so no `p_g` wrap |
 | **A2b** | `OverflowRequired(YrLtP)` ⇒ `yR < p` | PROVED (z3 UNSAT) | `p` pinned as a numeral, not a free constant — so the conclusion is `yR < p`, not `yR < const` |
 | **A2b-nv** | the same system without the denial is SAT | SAT (expected) | non-vacuity: `yR = p−1` is reachable |
-| **A2c** | every `YrLtP` LHS integer value ≪ p_g under the contracts | PROVED (exact corners) | `max|A_i| = 2^33 − 1 = 4.7·10⁻¹⁰·p_g` |
+| **A2c** | every `YrLtP` LHS integer value ≪ p_g under the contracts | PROVED (exact corners) | `max \|A_i\| = 2^33 − 1 = 4.7·10⁻¹⁰·p_g` |
 | **A2c-ctl** | wrong constant `p → p+2` / `p → N` | **SAT — CATCHES** | with the witness held FIXED, the honest columns stop satisfying the chain ⇒ it binds `p` itself (keccak wrong-RC analogue) |
 | **A2d** | contract **C4-YR**: where `YR`'s byte bound comes from | CONTRACT | `ecsm.rs` byte-checks `{X2, Q0, YG, Q1}` — **not** `YR`. Inherited via two exhaustive cases on `len_k`; bus-level, so outside this gate (C5 + imported L6) |
 | **A2d-obs** | `YrLtP` is **µ**-gated, not `IS_AFFINE`-gated | NOTED | binds x-only rows too: strictly stronger, and completeness holds because `witness.rs` fills `y_r_sub_p` on both paths |
@@ -68,11 +69,16 @@ reference = `../oracle/ecsm_affine_ref.py`, a from-scratch secp256k1 implementat
 | **A4e-ctl** | **the `u64` wrap** | **SAT — FORGES** | `addr_xg = 2^64 − 64` passes `addr_limb_ok(·, 63)` and wraps the pre-fix `+64`, slipping a **total** operand overlap past the guard. The `u128` widening is **LOAD-BEARING** |
 | **A4f** | timestamp layout is collision-free | PROVED | `{xG, yG}@ts`, `k@ts+1`, `xR@ts+2`, `yR@ts+3`, stride 4 (parsed from the builder). `xG`/`yG` share `ts` but are address-disjoint |
 | **A4g** | the mode-dependent bound is necessary in **both** directions | PROVED | a flat 64-byte bound rejects 32 legal x-only addresses (completeness); a flat 32-byte bound admits 32 illegal affine ones (soundness) |
-| **A5** | transcription audit | 18/18 premises READ, 18/18 mutations bite | `TRANSCRIPTION-AUDIT.md` |
+| **A5** | transcription audit | 19/19 premises READ, 19/19 mutations bite | `TRANSCRIPTION-AUDIT.md` |
 | **A6** | real-witness anchor | PROVED (+1 forgery exhibit) | 32 witnesses from `crypto/ecsm` itself; 9 ±yG pairs reproduce A3b outside the model |
 
-Non-vacuity: **six** genuine forgeries/catches (A1c-ctl, A1e, A2c-ctl, A2f/A2g, A3b/A3d,
-A4e-ctl). Every new check in the PR is confirmed load-bearing; none is dead weight.
+Non-vacuity: **seven distinct attacks** — A1c-ctl, A1e, A1f, A2c-ctl, A2f/A2g, A3b/A3d,
+A4e-ctl. They surface as **11 `SAT` results** across the lemma files, because several are
+exhibited from more than one angle (the parity attack appears as A3b's instance, A3b's
+12-instance sweep, A3d's counterfactual, and again as A6c straight out of `crypto/ecsm`). Every new check in the PR now has a control showing it is load-bearing;
+none is dead weight. A1f was **missing from the first version of this board** — idx 421 was
+proved *correct* (A1a) but never shown *necessary*, and "every new check is load-bearing" was
+asserted on five of the six. See Finding 7.
 
 ---
 
@@ -233,6 +239,12 @@ Concretely, each control here states both halves:
 | A3d | A3c: the read's tuples differ between the two | `check_all_constraints` clean on both |
 | A4e-ctl | the `u128` form rejects the overlap | `addr_limb_ok` passes *and* the `u64` form accepts |
 | A1c-ctl | the repo pair is injective | the degenerate pair collides |
+| A1f | idx 421 kept ⇒ only ECSM/ECSM_AFFINE reachable | dropped ⇒ HINT and KECCAK reachable |
+
+**The rule paid for itself twice.** A1f's first implementation had an inverted sign in its
+modular solve, so it found no foreign syscalls. Half 2 alone would have reported
+"idx 421 REDUNDANT" — a confident, wrong conclusion. Half 1 (`idx 421 kept ⇒ exactly
+`{ECSM, ECSM_AFFINE}` reachable`) failed instead, which is what surfaced the bug.
 
 A1e originally listed "the constraint families I believe remain" rather than walking the index
 map. That is the mirror-image hazard — an over-permissive control reports a false FORGES by
@@ -240,6 +252,34 @@ forgetting a constraint that would have blocked the state — so it now enumerat
 asserts the count.
 
 ---
+
+7. **[the board's own gap, now closed] `IS_BIT(IS_AFFINE)` is load-bearing for a reason
+   nobody had written down.** The first version of this board proved idx 421 *correct* (A1a)
+   and never asked whether it was *necessary*. It is, and the argument is not local to the
+   ECSM pair at all.
+
+   The receiver's syscall words are `xonly + a·(affine − xonly)` per 32-bit word, and for the
+   repo's numbers the coefficients are `−1` (low) and **`0`** (high, since both share
+   `0xFFFF_FFFF`). So as `a` sweeps the field the high word is CONSTANT and the low word
+   sweeps everything — and every syscall is `u64::MAX − k`, so they all share that high word.
+   Each is therefore reachable at `a = (target_lo − xonly_lo)/(−1)`:
+
+   | reached tuple | `IS_AFFINE` |
+   |---|---|
+   | `ECSM` | 0 (honest) |
+   | `ECSM_AFFINE` | 1 (honest) |
+   | **`HINT`** | **20** |
+   | **`KECCAK`** | **p_g − 9** |
+
+   Drop idx 421 and `a` is free on a `µ=1` row (idx 422 only binds at `µ=0`), so an ECSM row
+   can consume the `Ecall` send of a *different* accelerator: the guest's HINT call gets
+   proven as a scalar multiplication that writes 32 or 64 bytes wherever the ECSM row's
+   register columns point.
+
+   **What does not close this:** `execution.rs`'s `const _: () = assert!` compares only the
+   two ECSM numbers' low words. It cannot see a *third* syscall sitting an integer offset
+   away — which is the reachable case. That is a documentation gap in #879, not a bug: idx 421
+   is present and does the job. Recorded as a review note below.
 
 ## Method notes
 

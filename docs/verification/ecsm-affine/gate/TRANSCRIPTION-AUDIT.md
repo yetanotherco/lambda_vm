@@ -68,7 +68,7 @@ was checking documentation, not behaviour. It now parses the stride out of
 `let timestamp = (i as u64) * 4 + 4;` and compares the **parsed** value, and the mutant is
 caught.
 
-Current state: **18/18 premises read from source, 18/18 mutations bite, 0 failures.**
+Current state: **19/19 premises read from source, 19/19 mutations bite, 0 failures.**
 
 ## The premise table
 
@@ -91,6 +91,7 @@ Current state: **18/18 premises read from source, 18/18 mutations bite, 0 failur
 | P15 | A2a | `INV_SHIFT_32 = 18446744065119617026 = 2^{−32} mod p_g` | `templates.rs:26` | last digit perturbed |
 | **P16** | **A3** | **negative space:** every `cols::YG` use is parity-blind | `ecsm.rs`, all 7 sites | an unrecognised `cols::YG` use appears |
 | **P17** | **A2d** | **negative space:** `YR` is not in `ecsm.rs`'s `is_byte` list ⇒ C4-YR is inherited | `ecsm.rs` | `YR` gains a local byte check |
+| **P19** | **A1f** | **the COMPLETE syscall set** — every `u64::MAX − k` the `Ecall` bus can carry, parsed from source. A1f's conclusion is about which foreign syscalls the linear syscall word reaches, so a fifth syscall changes the answer | `execution.rs` | `HINT` renumbered `MAX-30 → MAX-40` |
 | P18 | A4f | one instruction consumes 4 sub-timestamps; ECSM uses offsets `{0,1,2,3}`, max `== stride−1` | `trace_builder.rs:348`, `ecsm.rs` `ts_lo_plus` | stride `4 → 3` |
 
 ## What the audit does NOT cover
