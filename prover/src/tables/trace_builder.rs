@@ -2368,6 +2368,36 @@ pub(crate) fn build_initial_image_paged(elf: &Elf, private_input: &[u8]) -> Page
     image
 }
 
+/// Test helper exposing the DMA row decomposition to `prover/src/tests`.
+///
+/// [`collect_dma_memcpy_ops`] is private and its `MemoryState`/`RegisterState`
+/// operands are module-private, so a unit test cannot reach the decomposition
+/// otherwise — and testing `generate_dma_trace` instead proves nothing about it,
+/// since that function only formats an already-decomposed op list into columns.
+/// `source` seeds the source region so the emitted `value` lanes are meaningful.
+#[cfg(test)]
+pub(crate) fn dma_ops_for_test(
+    timestamp: u64,
+    dst: u64,
+    src: u64,
+    count: u64,
+    source: &[u8],
+) -> (Vec<MemwOperation>, Vec<dma::DmaOperation>) {
+    let mut memory_state = MemoryState::new();
+    for (i, &byte) in source.iter().enumerate() {
+        memory_state.write_byte(src + i as u64, byte, 1);
+    }
+    let mut register_state = RegisterState::new(0);
+    register_state.write(10, dst, 1);
+    register_state.write(11, src, 1);
+    register_state.write(12, count, 1);
+    let op = CpuOperation {
+        timestamp,
+        ..Default::default()
+    };
+    collect_dma_memcpy_ops(&op, &mut memory_state, &mut register_state)
+}
+
 /// Test helper for computing one epoch's local-to-global touched cells without
 /// building every trace table.
 #[cfg(test)]

@@ -630,6 +630,15 @@ fmt:
 	cargo fmt --all
 
 # Run clippy + fmt check (used by CI)
+.PHONY: verify-dma
+verify-dma: ## Run the DMA memcpy verification campaign (docs/verification/dma)
+	@# Oracle anchors + vector emission, the z3 soundness gate, and the
+	@# transcription audit. Needs `pip install z3-solver` (validated on 5.0.0);
+	@# the audit alone needs no solver. Each exits nonzero on failure.
+	python3 docs/verification/dma/dma-oracle/test_oracle.py
+	python3 docs/verification/dma/audit_gate_transcription.py
+	python3 docs/verification/dma/dma-chip/z3_dma_verify.py
+
 lint:
 	cargo fmt --check --all
 	cargo clippy --workspace --all-targets -- -D warnings -A clippy::op_ref

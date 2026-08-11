@@ -41,8 +41,12 @@ campaign hid a working forgery):
 
   IsHalfword[h]        h in [0, 2^16). Preprocessed, so the contract IS the
                        range.
-  Zero[v] -> z         `bitwise.rs`: v = x + 256y + 65536z with x,y bytes and
-                       z in [0,16), and z = 1 iff x = y = z = 0. NOTE THE
+  Zero[v] -> is_zero   `bitwise.rs`: the argument decomposes as
+                       v = X + 256*Y + 65536*Z with X,Y bytes and Z in [0,16),
+                       and the OUTPUT column is 1 iff X = Y = Z = 0. (X/Y/Z are
+                       the table's own digit columns; the output is a separate
+                       column, `cols::ZERO`. Do not reuse the name `z` for both,
+                       as an earlier draft of this docstring did.) NOTE THE
                        DOMAIN -- the table only has rows for v < 2^20, so a send
                        outside it has no partner at all.
   Alu[a,b,LT] -> o     `lt.rs`'s own columns: a free `lhs_sub_rhs` of four
@@ -69,9 +73,9 @@ WHAT THE GATE CANNOT SEE (same disclaimer shape as the BLAKE3 gate):
     overlapping copy. That is a timestamp-ordering property of the memory
     table; the oracle's `write_before_read` mutant covers the model side.
   * LogUp soundness. Bus balance is assumed to mean multiset equality.
-  * trace length. Where a conclusion rests on "a chain that long does not fit
-    in a trace", the gate says so instead of pretending otherwise -- see
-    RESIDUAL R1 in the verdict.
+  * the multi-call case. Layer 2 proves the tiling among groups containing
+    exactly ONE head row; `ChainRow` carries no timestamp, and the `ts` in both
+    `DmaNext` tuples is what separates two ecalls' rows.
 
     python3 z3_dma_verify.py             # the full board
     python3 z3_dma_verify.py --quick     # shorter completeness sweep and chains
@@ -81,8 +85,18 @@ import os
 import sys
 
 from z3 import (
-    And, Distinct, If, Implies, Int, IntVal, Not, Or, Solver, Sum, sat, unsat,
+    And, Distinct, If, Implies, Int, IntVal, Not, Or, Solver, Sum, get_version,
+    get_version_string, sat, unknown, unsat,
 )
+
+#: Solver version this board is known green on. NOT a hard pin -- the queries are
+#: version-independent in meaning -- but older solvers are dramatically slower on
+#: the field-exact chain (`CHAIN-F 2` measured 0.45 s on 5.0.0 vs 7.60 s on
+#: 4.12.2, 17x), so they blow the per-query budgets and report `unknown`.
+#: `unknown` is scored as FAILURE everywhere, never as success, so an old solver
+#: gives a false alarm and never a false proof -- but the operator deserves to be
+#: told which it is looking at.
+VALIDATED_Z3 = (5, 0, 0)
 
 # ---------------------------------------------------------------------------
 # Constants -- transcribed from the Rust; ../audit_gate_transcription.py
@@ -124,6 +138,12 @@ class Premises:
             setattr(self, name, value)
 
 
+#: Default per-query solver budget. Never leave a query unbounded: an unlucky
+#: solver version or platform then HANGS a CI job instead of failing it, and a
+#: hang is far harder to diagnose than a timeout (measured: the whole board takes
+#: ~96 s on z3 5.0.0 but ~1210 s on 4.12.2, where two queries blew their budgets).
+DEFAULT_TIMEOUT_MS = 120_000
+
 _EQ_COUNTER = [0]
 
 
@@ -138,7 +158,47 @@ def eq_mod(lhs, rhs, modulus):
     return lhs - rhs == k * modulus
 
 
-def solve(assertions, timeout_ms=0):
+def dmanext_link(sender, receiver):
+    """The `DmaNext` bus binding, ELEMENT BY ELEMENT.
+
+    THIS IS THE FACT AN EARLIER VERSION OF THIS GATE GOT WRONG, and the error
+    produced a phantom soundness finding that was published as the campaign's
+    headline result. It is worth stating precisely.
+
+    `Packing::num_bus_elements()` (`crypto/stark/src/lookup.rs:227-241`) returns
+    **2** for both `DWordWL` ("2x Direct") and `DWordHL` ("2x Word2L"), and
+    `accumulate_fingerprint_with` (`:305-340`) gives each element its own alpha
+    power. No `Packing` variant contains a `2^32` shift at all, so **a 64-bit
+    value is never a single bus element anywhere in this codebase.**
+
+    Both DmaNext tuples are therefore 8 elements (`1+1+2+2+2`) and align
+    pairwise, so bus balance imposes TWO independent equations per 64-bit value:
+
+        receiver.src0 == sender.si0 + 2^16*si1      (low word)
+        receiver.src1 == sender.si2 + 2^16*si3      (high word)
+
+    Modelling it as one equation on the fully packed value is strictly WEAKER
+    than the AIR: it lets the receiver re-split the limbs freely, which
+    manufactures an alias (`cnt1 = 2^32-1`, `cnt0 = V+1`) that the real bus
+    rejects. Since the sender's halfwords are IsHalfword-bounded, the limb-wise
+    form gives the receiver 32-bit limbs *for free* — no extra range check
+    needed, which is why the "fix" that earlier version recommended (receive
+    `count` as `DWordHL`) was a no-op, and why a no-op fix should have been
+    read as evidence that the gap wasn't there.
+    """
+    return [
+        eq_mod(sender.ts0, receiver.ts0, P),
+        eq_mod(sender.ts1, receiver.ts1, P),
+        eq_mod(sender.hl_lo(sender.si), receiver.src0, P),
+        eq_mod(sender.hl_hi(sender.si), receiver.src1, P),
+        eq_mod(sender.hl_lo(sender.di), receiver.dst0, P),
+        eq_mod(sender.hl_hi(sender.di), receiver.dst1, P),
+        eq_mod(sender.hl_lo(sender.cd), receiver.cnt0, P),
+        eq_mod(sender.hl_hi(sender.cd), receiver.cnt1, P),
+    ]
+
+
+def solve(assertions, timeout_ms=DEFAULT_TIMEOUT_MS):
     s = Solver()
     if timeout_ms:
         s.set("timeout", timeout_ms)
@@ -487,6 +547,13 @@ def check_wrap_only_terminal(prem=None, timeout_ms=180_000):
 def check_tail_lanes(prem=None, timeout_ms=180_000):
     """MAIN 2b -- a one-byte row carries seven zero lanes.
 
+    LABELLED HONESTLY: this is a TRANSCRIPTION check, not a composed solver
+    result. It is UNSAT from `Implies(tail == 1, lane == 0)` alone, with no other
+    AIR fact participating, and its negative control is `sat` for the same
+    trivial reason. Kept because the property matters and the pair documents it,
+    but it earns no credit as evidence about the constraint system -- the textual
+    equivalent in `../audit_gate_transcription.py` is the real guard.
+
     `value[1..8]` ride the MEMW tuple of a `w8 = 1 - tail` operation, so on a
     tail row the memory table must see the canonical one-byte encoding. Nothing
     else pins those lanes: they are not XOR-consumed and not range-checked, so
@@ -516,62 +583,30 @@ def check_row_budget(prem=None, timeout_ms=180_000):
 
 
 def check_invariant_propagates(prem=None, timeout_ms=600_000):
-    """MAIN 3 -- what survives a `DmaNext` hop, and what does not.
+    """MAIN 3 -- well-formedness and the exact count cross a `DmaNext` hop.
 
-    `DmaNext` carries PACKED values: the receiver equates
-    `src0 + 2^32*src1` with the sender's `si0 + 2^16*si1 + 2^32*si2 + 2^48*si3`,
-    ONE field element. It does not say the successor split its limbs the same
-    way, and `count`'s limbs are range-checked only on `first` rows (REG-32) --
-    `lt.rs` bounds `lhs[1]`/`lhs[2]`, hence `cnt1`, but not the bare `LHS_0`,
-    hence not `cnt0`.
+    `DmaNext` binds each 64-bit value as TWO 32-bit elements, not one packed
+    field element (see `dmanext_link`, which documents the error an earlier
+    version of this gate made here). So the successor cannot re-split its limbs:
+    with the sender's halfwords IsHalfword-bounded, the receiver's `count0` and
+    `count1` are each pinned to a genuine 32-bit word.
 
-    So the honest claim is a DISJUNCTION, and it is what this check proves:
+    The claim is therefore unconditional -- no disjunctive escape branch:
 
-        successor.count == predecessor.count - width   OR   successor.count > MAX
+        successor.count == predecessor.count - width   AND   successor well formed
 
-    The second branch is real and reachable: with `cnt1 = 2^32 - 1` and
-    `cnt0 = V + 1` the packed value is still `V` modulo p, so the row passes
-    `DmaNext`, while `lt.rs` sees an integer near 2^64 and returns `tail = 0`.
-    Such a row claims an eight-byte width where one byte remained. It is not
-    exploitable, because a count that large cannot descend to zero inside any
-    real trace -- but that obstacle is TRACE LENGTH, not a constraint. Recorded
-    as RESIDUAL R1; the belt-and-braces fix is one extra range check per row on
-    `COUNT_0`/`COUNT_1`.
+    Proving it once on the head row (where the register read supplies
+    well-formedness) proves it for the whole chain, which is what licenses
+    Layer 2's integer abstraction.
     """
     prem = prem or Premises()
     a, b = FieldRow("inv_a", prem), FieldRow("inv_b", prem)
     link = [
         a.mu == 1, a.end == 0, a.well_formed(), a.count <= MAX_BYTES,
         b.mu == 1, b.first == 0,
-        eq_mod(a.ts0, b.ts0, P), eq_mod(a.ts1, b.ts1, P),
-        eq_mod(a.src_incr, b.src, P),
-        eq_mod(a.dst_incr, b.dst, P),
-        eq_mod(a.count_decr, b.count, P),
-    ]
-    holds = Or(b.count == a.count - a.width, b.count > MAX_BYTES)
+    ] + dmanext_link(a, b)
+    holds = And(b.count == a.count - a.width, b.well_formed())
     return solve(a.C + b.C + link + [Not(holds)], timeout_ms)
-
-
-def check_alias_is_reachable(prem=None, timeout_ms=600_000):
-    """MAIN 3b -- and the second branch really is reachable (RESIDUAL R1, SAT).
-
-    The counterpart to MAIN 3: pin the alias and confirm the constraint system
-    admits it. A gate that only reported the disjunction would leave the reader
-    unable to tell whether the second branch is a modelling artefact or a real
-    hole in the range checks. It is real.
-    """
-    prem = prem or Premises()
-    a, b = FieldRow("al_a", prem), FieldRow("al_b", prem)
-    link = [
-        a.mu == 1, a.end == 0, a.well_formed(), a.count == 4,   # one tail byte left
-        b.mu == 1, b.first == 0,
-        eq_mod(a.count_decr, b.count, P),
-        eq_mod(a.src_incr, b.src, P),
-        eq_mod(a.dst_incr, b.dst, P),
-        b.tail == 0,          # eight-byte width where three bytes remained
-        b.end == 0,
-    ]
-    return solve(a.C + b.C + link, timeout_ms)
 
 
 def completeness_sweep(prem=None, quick=False):
@@ -669,7 +704,8 @@ class ChainRow:
                        And(self.src_incr < B64, self.dst_incr < B64))
 
 
-def check_chain(n_rows, prem=None, timeout_ms=300_000):
+def check_chain(n_rows, prem=None, timeout_ms=300_000, premises_only=False,
+                drop_link=None):
     """CHAIN -- the only bus-balanced structure is the oracle's decomposition.
 
     `n_rows` active rows. `DmaNext` is NOT assumed to be a chain: every row with
@@ -679,11 +715,22 @@ def check_chain(n_rows, prem=None, timeout_ms=300_000):
     duplicated one would be just as balanced a priori. The Ecall bus supplies
     "exactly one row may be `first`" (the CPU sends its tuple once).
 
-    Then assert the group is NOT the reference tiling: data-row widths summing
-    to the head count, every data interval inside `[src, src + count)`, the
-    intervals pairwise disjoint, the greedy width rule, and `dst - src` constant.
-    Those four facts together say the copy moves byte `j` of the source to byte
-    `j` of the destination, for every `j < count`, exactly once.
+    SCOPE, stated precisely: the `Ecall` bus supplies at most one `first` row
+    **per timestamp**, not one per trace -- a real trace with k DMA calls has k
+    head rows. `ChainRow` carries no timestamp field, so this check cannot
+    express the property that separates two calls' rows (the `ts` in both
+    DmaNext tuples, which `../audit_gate_transcription.py` pins textually).
+    What is proved is therefore: *among a group of active rows containing
+    exactly one head row*, the only bus-balanced structure is the reference
+    tiling. Dropping the single-head premise makes this `sat`, so the
+    multi-call case is genuinely out of model rather than covered.
+
+    The tiling predicate asserts four facts: data-row widths summing to the head
+    count, every data interval inside `[src, src + count)`, the intervals
+    pairwise disjoint, and `dst - src` constant. Together they say the copy moves
+    byte `j` of the source to byte `j` of the destination, for every
+    `j < count`, exactly once. (The greedy width rule is not concluded here --
+    it is baked into `ChainRow.width` as a definition, discharged by MAIN 0.)
     """
     prem = prem or Premises()
     rows = [ChainRow(f"c{n_rows}_{i}") for i in range(n_rows)]
@@ -704,11 +751,17 @@ def check_chain(n_rows, prem=None, timeout_ms=300_000):
         C.append(Implies(row.first == 1, sigma[j] == -1 - j))
         C.append(Implies(row.first == 0, And(sigma[j] >= 0, sigma[j] < n_rows)))
         for k, sender in enumerate(rows):
-            C.append(Implies(And(row.first == 0, sigma[j] == k),
-                             And(sender.end == 0,
-                                 sender.src_incr == row.src,
-                                 sender.dst_incr == row.dst,
-                                 sender.count_decr == row.count)))
+            # `drop_link` omits one field of the DmaNext tuple -- the Layer 2
+            # negative control, showing the bijection's contents are what force
+            # the tiling and not the bijection's mere existence.
+            tuple_eqs = [sender.end == 0]
+            if drop_link != "src":
+                tuple_eqs.append(sender.src_incr == row.src)
+            if drop_link != "dst":
+                tuple_eqs.append(sender.dst_incr == row.dst)
+            if drop_link != "count":
+                tuple_eqs.append(sender.count_decr == row.count)
+            C.append(Implies(And(row.first == 0, sigma[j] == k), And(*tuple_eqs)))
     C.append(Distinct(*sigma))
 
     head_count = Sum([If(r.first == 1, r.count, IntVal(0)) for r in rows])
@@ -716,6 +769,9 @@ def check_chain(n_rows, prem=None, timeout_ms=300_000):
     head_skew = Sum([If(r.first == 1, r.dst - r.src, IntVal(0)) for r in rows])
     if prem.lt_bound:
         C.append(head_count <= MAX_BYTES)
+
+    if premises_only:
+        return solve(C, timeout_ms)
 
     data = lambda r: r.end == 0                                       # noqa: E731
     tiling = And(
@@ -732,7 +788,7 @@ def check_chain(n_rows, prem=None, timeout_ms=300_000):
     return solve(C + [Not(tiling)], timeout_ms)
 
 
-def check_chain_field(n_rows, prem=None, timeout_ms=900_000):
+def check_chain_field(n_rows, prem=None, timeout_ms=900_000, premises_only=False):
     """CHAIN-F -- the same question, field-exact, at small depth.
 
     The integer chain takes the row abstraction on trust. This one does not: it
@@ -757,21 +813,24 @@ def check_chain_field(n_rows, prem=None, timeout_ms=900_000):
         C.append(Implies(row.first == 0, And(sigma[j] >= 0, sigma[j] < n_rows)))
         for k, sender in enumerate(rows):
             C.append(Implies(And(row.first == 0, sigma[j] == k),
-                             And(sender.end == 0,
-                                 eq_mod(sender.src_incr, row.src, P),
-                                 eq_mod(sender.dst_incr, row.dst, P),
-                                 eq_mod(sender.count_decr, row.count, P))))
+                             And(*([sender.end == 0] + dmanext_link(sender, row)))))
     C.append(Distinct(*sigma))
-    # Head anchor: the register read makes the head well formed, the bound
-    # lookup caps its count. RESIDUAL R1 is excluded here by requiring every
-    # row to stay within the per-call bound; without that the query is the
-    # `check_alias_is_reachable` SAT witness again.
+    # Head anchor, and NOTHING MORE. Only the head row gets well-formedness (the
+    # register read) and a count bound (the `Alu` lookup at multiplicity
+    # `first`); every other row's limbs and count are *derived* through the
+    # limb-wise link, per MAIN 3. An earlier version asserted
+    # `r.count <= MAX_BYTES` for EVERY row in order to sidestep a phantom
+    # residual -- which was the one genuinely over-strong assertion in this gate,
+    # and over-strong assertions are the direction that yields a bogus UNSAT.
     for r in rows:
         C.append(Implies(r.first == 1, r.well_formed()))
-        C.append(r.count <= MAX_BYTES)
 
     head_count = Sum([If(r.first == 1, r.count, IntVal(0)) for r in rows])
     covered = Sum([If(r.end == 0, r.width, IntVal(0)) for r in rows])
+    if premises_only:
+        # Positive control: is the premise set satisfiable at all? `Not(tiling)`
+        # returning UNSAT is worthless if `C` is itself contradictory.
+        return solve(C, timeout_ms)
     return solve(C + [covered != head_count], timeout_ms)
 
 
@@ -852,42 +911,74 @@ def audit_tail_pin(drop_pin: bool):
 
 # ===========================================================================
 
+def check_solver_version():
+    """Warn loudly if the solver is older than the one this board was green on."""
+    current = get_version()[:3]
+    if current < VALIDATED_Z3:
+        print(f"  !! z3 {get_version_string()} is older than the validated "
+              f"{'.'.join(map(str, VALIDATED_Z3))}.", flush=True)
+        print("  !! The queries mean the same thing, but older solvers are much "
+              "slower on the", flush=True)
+        print("  !! field-exact chain and may report `unknown` (= TIMED OUT, "
+              "scored as failure).", flush=True)
+        print("  !! An `unknown` is a budget problem, NOT a soundness problem.",
+              flush=True)
+        return False
+    return True
+
+
 def main():
     quick = "--quick" in sys.argv
-    print("=" * 76)
-    print("DMA memcpy chip -- z3 gate" + ("  (--quick)" if quick else ""))
-    print("=" * 76)
+    print("=" * 76, flush=True)
+    print("DMA memcpy chip -- z3 gate" + ("  (--quick)" if quick else ""), flush=True)
+    print("=" * 76, flush=True)
+    print(f"  solver: z3 {get_version_string()}", flush=True)
+    check_solver_version()
+    print("  legend: unsat = proved | sat = counterexample found | "
+          "unknown = TIMED OUT (failure)", flush=True)
 
-    print("\n=== LAYER 1: field-exact rows ===")
+    print("\n=== LAYER 1: field-exact rows ===", flush=True)
     row = check_row()
-    print(f"  MAIN 0  row == oracle row                 -> {row}   (want unsat)")
+    print(f"  MAIN 0  row == oracle row                 -> {row}   (want unsat)", flush=True)
     endd = check_end_detection()
-    print(f"  MAIN 1  end <=> count == 0                -> {endd}   (want unsat)")
+    print(f"  MAIN 1  end <=> count == 0                -> {endd}   (want unsat)", flush=True)
     wrap = check_wrap_only_terminal()
-    print(f"  MAIN 2  count wraps only on terminal row  -> {wrap}   (want unsat)")
+    print(f"  MAIN 2  count wraps only on terminal row  -> {wrap}   (want unsat)", flush=True)
     lanes = check_tail_lanes()
-    print(f"  MAIN 2b one-byte row has zero lanes 1..7  -> {lanes}   (want unsat)")
+    print(f"  MAIN 2b one-byte row has zero lanes 1..7  -> {lanes}   (want unsat)", flush=True)
     budget = check_row_budget()
-    print(f"  MAIN 2c one ecall asks for <= {MAX_BYTES} bytes  -> {budget}   (want unsat)")
+    print(f"  MAIN 2c one ecall asks for <= {MAX_BYTES} bytes  -> {budget}   (want unsat)", flush=True)
     inv = check_invariant_propagates()
-    print(f"  MAIN 3  successor honest OR count > MAX   -> {inv}   (want unsat)")
-    alias = check_alias_is_reachable()
-    print(f"  MAIN 3b R1 alias is reachable             -> {alias}   (want sat)")
-    layer1_ok = (all(x == unsat for x in (row, endd, wrap, lanes, budget, inv))
-                 and alias == sat)
+    print(f"  MAIN 3  successor exact + well formed     -> {inv}   (want unsat)", flush=True)
+    layer1_ok = all(x == unsat for x in (row, endd, wrap, lanes, budget, inv))
 
-    print("\n=== LAYER 2: chain structure, DmaNext as a free bijection ===")
+    print("\n=== LAYER 2: chain structure, DmaNext as a free bijection ===", flush=True)
     chain = {}
     for n_rows in ((2, 3, 4) if quick else (2, 3, 4, 5)):
         chain[n_rows] = check_chain(n_rows)
-        print(f"  CHAIN   {n_rows} rows, any balanced structure   -> {chain[n_rows]}   (want unsat)")
+        print(f"  CHAIN   {n_rows} rows, any balanced structure   -> {chain[n_rows]}   (want unsat)", flush=True)
     field_chain = {}
     for n_rows in ((2,) if quick else (2, 3)):
         field_chain[n_rows] = check_chain_field(n_rows)
-        print(f"  CHAIN-F {n_rows} rows, field-exact              -> {field_chain[n_rows]}   (want unsat)")
+        print(f"  CHAIN-F {n_rows} rows, field-exact              -> {field_chain[n_rows]}   (want unsat)", flush=True)
     layer2_ok = all(x == unsat for x in list(chain.values()) + list(field_chain.values()))
 
-    print("\n=== NEGATIVE CONTROLS -- drop one premise, expect a forgery ===")
+    # Layer 2 needs its own controls. `Not(tiling)` returning unsat proves
+    # nothing if the premise set is itself unsatisfiable, and an earlier version
+    # of this board had neither a positive nor a negative control here.
+    print("\n  -- Layer 2 controls --", flush=True)
+    l2_pos = {n: check_chain(n, premises_only=True) for n in (2, 3, 4)}
+    l2_posf = check_chain_field(2, premises_only=True)
+    for n, res in l2_pos.items():
+        print(f"  positive: {n}-row premise set satisfiable  -> {res}   (want sat)", flush=True)
+    print(f"  positive: 2-row field-exact premise set   -> {l2_posf}   (want sat)", flush=True)
+    l2_neg = {f: check_chain(3, drop_link=f) for f in ("count", "src", "dst")}
+    for field, res in l2_neg.items():
+        print(f"  negative: drop `{field}` from the tuple{'':<7}-> {res}   (want sat)", flush=True)
+    layer2_controls_ok = (all(r == sat for r in l2_pos.values()) and l2_posf == sat
+                          and all(r == sat for r in l2_neg.values()))
+
+    print("\n=== NEGATIVE CONTROLS -- drop one premise, expect a forgery ===", flush=True)
     # Each control drops ONE premise and re-runs the check that premise is
     # load-bearing for. Pairing matters: dropping `tail_lane_zero` and re-running
     # MAIN 0 would report unsat, because MAIN 0's reference says nothing about
@@ -901,12 +992,17 @@ def main():
         "drop_tail_lane_zero": check_tail_lanes(Premises(tail_lane_zero=False)),
         "drop_lt_bound": check_row_budget(Premises(lt_bound=False)),
         "drop_reg32": check_row_budget(Premises(reg32=False)),
+        # Previously undropped premises. `halfword_dst_incr` and `no_overflow_dst`
+        # are the dst-side mirrors of checks only ever demonstrated on src, and
+        # `DESIGN.md`'s "all twelve halfwords, each one" needs all three families.
+        "drop_halfword_dst_incr": check_row(Premises(halfword_dst_incr=False)),
+        "drop_no_overflow_dst": check_row(Premises(no_overflow_dst=False)),
     }
     for name, res in controls.items():
-        print(f"  {name:28s} -> {res}   (want sat)")
+        print(f"  {name:28s} -> {res}   (want sat)", flush=True)
     controls_ok = all(res == sat for res in controls.values())
 
-    print("\n=== WIDTH AUDIT -- bound necessity at the boundary (field level) ===")
+    print("\n=== WIDTH AUDIT -- bound necessity at the boundary (field level) ===", flush=True)
     audit = {
         "Zero sum identity, bounds present": (audit_end_detection_bound(False), "unsat"),
         "Zero sum identity, bounds DROPPED": (audit_end_detection_bound(True), "sat"),
@@ -916,31 +1012,32 @@ def main():
         "truncation at count=7, LT pin DROPPED": (audit_tail_pin(True), "sat"),
     }
     for name, (got, want) in audit.items():
-        print(f"  {name:40s} -> {got:6s} (want {want})")
+        print(f"  {name:40s} -> {got:6s} (want {want})", flush=True)
     audit_ok = all(got == want for got, want in audit.values())
 
-    print("\n=== POSITIVE CONTROLS -- oracle-pinned completeness sweep ===")
+    print("\n=== POSITIVE CONTROLS -- oracle-pinned completeness sweep ===", flush=True)
     sweep_ok, sweep_detail = completeness_sweep(quick=quick)
-    print(f"  {'PASS' if sweep_ok else 'FAIL'}  {sweep_detail}")
+    print(f"  {'PASS' if sweep_ok else 'FAIL'}  {sweep_detail}", flush=True)
 
-    print("\n" + "=" * 76)
-    print("VERDICT")
-    print("=" * 76)
-    print(f"  layer 1 (row semantics)              : {layer1_ok}")
-    print(f"  layer 2 (chain structure)            : {layer2_ok}")
+    print("\n" + "=" * 76, flush=True)
+    print("VERDICT", flush=True)
+    print("=" * 76, flush=True)
+    print(f"  layer 1 (row semantics)              : {layer1_ok}", flush=True)
+    print(f"  layer 2 (chain structure)            : {layer2_ok}", flush=True)
+    print(f"  layer 2 controls (pos + neg)         : {layer2_controls_ok}", flush=True)
     print(f"  negative controls all SAT            : {controls_ok}   "
           f"({sum(1 for r in controls.values() if r == sat)}/{len(controls)})")
-    print(f"  width audit (bound necessity)        : {audit_ok}")
-    print(f"  completeness sweep SAT               : {sweep_ok}")
-    print("\n  RESIDUAL R1 (not closed by this gate): `count`'s limb split is")
-    print("  unconstrained on non-`first` rows, so an aliased successor can hold")
-    print("  a count near 2^64 and claim an eight-byte width where one byte")
-    print("  remained. Blocked only by the chain being unable to descend to zero")
-    print("  inside a real trace. See MAIN 3 / MAIN 3b and ../TRANSCRIPTION-AUDIT.md.")
-    ok = layer1_ok and layer2_ok and controls_ok and audit_ok and sweep_ok
+    print(f"  width audit (bound necessity)        : {audit_ok}", flush=True)
+    print(f"  completeness sweep SAT               : {sweep_ok}", flush=True)
+    print("\n  Scope: Layer 2 proves the tiling among groups with exactly ONE head", flush=True)
+    print("  row. Two DMA calls are separated by the `ts` in both DmaNext tuples,", flush=True)
+    print("  which `ChainRow` does not model -- see `check_chain`'s docstring and", flush=True)
+    print("  the textual guard in ../audit_gate_transcription.py.", flush=True)
+    ok = (layer1_ok and layer2_ok and layer2_controls_ok and controls_ok
+          and audit_ok and sweep_ok)
     if quick:
-        print("\n  NOTE: --quick shortened the completeness sweep and the chain depths.")
-    print(f"\n  OVERALL: {'PASS' if ok else 'FAIL -- investigate above'}")
+        print("\n  NOTE: --quick shortened the completeness sweep and the chain depths.", flush=True)
+    print(f"\n  OVERALL: {'PASS' if ok else 'FAIL -- investigate above'}", flush=True)
     sys.exit(0 if ok else 1)
 
 

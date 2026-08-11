@@ -130,284 +130,237 @@ fn dma_bus_interactions_count() {
     assert_eq!(bus_interactions().len(), 23);
 }
 
-/// One pinned case from the validated oracle (`docs/verification/dma/dma-oracle/`).
+/// The canonical vectors, embedded from the validated oracle so the fixture
+/// cannot drift from the model that generated it.
+///
+/// `docs/verification/dma/dma-oracle/test_oracle.py` emits this file next to the
+/// richer JSON; it is anchored on libc `memmove`, CPython slice assignment, and a
+/// row-level vs byte-level replay equivalence over every length 0..=256.
+/// Embedding it — rather than hand-transcribing — is what makes a regenerated
+/// oracle a compile-time input to these tests instead of a silent no-op.
+///
+/// Line format, one record per line:
+///   `vector|<name>|<dst>|<src>|<count>|<data_rows>`
+///   `row|<src>|<dst>|<count>|<tail 0|1>|<width>`
+const CANONICAL_ROWS: &str =
+    include_str!("../../../docs/verification/dma/dma-oracle/canonical_dma_rows.txt");
+
+/// One case parsed out of the canonical row table.
 struct OracleVector {
-    name: &'static str,
+    name: String,
     src: u64,
     dst: u64,
     count: u64,
     /// Per data row: `(src, dst, count, tail, width)`.
-    rows: &'static [(u64, u64, u64, bool, u64)],
+    rows: Vec<(u64, u64, u64, bool, u64)>,
 }
 
-/// Structural cases from `docs/verification/dma/dma-oracle/canonical_dma_vectors.json`,
-/// which the oracle harness regenerates and which is anchored on libc `memmove`
-/// plus a row-level/byte-level replay equivalence. Do not edit by hand: rerun
-/// `python3 docs/verification/dma/dma-oracle/test_oracle.py` and re-transcribe.
-///
-/// `maximum chunk` (n = 256) is abbreviated to its first and last data rows —
-/// it is the only case with no tail row at all, which is the property worth
-/// pinning; `widest tail` (n = 7) is the opposite extreme, eight rows to move
-/// seven bytes.
-const ORACLE_VECTORS: &[OracleVector] = &[
-    OracleVector {
-        name: "empty",
-        src: 0x2000,
-        dst: 0x1000,
-        count: 0,
-        rows: &[],
-    },
-    OracleVector {
-        name: "single byte",
-        src: 0x2000,
-        dst: 0x1000,
-        count: 1,
-        rows: &[(0x2000, 0x1000, 1, true, 1)],
-    },
-    OracleVector {
-        name: "one wide row",
-        src: 0x2000,
-        dst: 0x1000,
-        count: 8,
-        rows: &[(0x2000, 0x1000, 8, false, 8)],
-    },
-    OracleVector {
-        name: "wide plus tail",
-        src: 0x2000,
-        dst: 0x1000,
-        count: 9,
-        rows: &[(0x2000, 0x1000, 9, false, 8), (0x2008, 0x1008, 1, true, 1)],
-    },
-    OracleVector {
-        name: "widest tail",
-        src: 0x2000,
-        dst: 0x1000,
-        count: 7,
-        rows: &[
-            (0x2000, 0x1000, 7, true, 1),
-            (0x2001, 0x1001, 6, true, 1),
-            (0x2002, 0x1002, 5, true, 1),
-            (0x2003, 0x1003, 4, true, 1),
-            (0x2004, 0x1004, 3, true, 1),
-            (0x2005, 0x1005, 2, true, 1),
-            (0x2006, 0x1006, 1, true, 1),
-        ],
-    },
-    OracleVector {
-        name: "unaligned body and tail",
-        src: 0x1003,
-        dst: 0x2005,
-        count: 27,
-        rows: &[
-            (0x1003, 0x2005, 27, false, 8),
-            (0x100B, 0x200D, 19, false, 8),
-            (0x1013, 0x2015, 11, false, 8),
-            (0x101B, 0x201D, 3, true, 1),
-            (0x101C, 0x201E, 2, true, 1),
-            (0x101D, 0x201F, 1, true, 1),
-        ],
-    },
-    OracleVector {
-        name: "page crossing",
-        src: 0x1FFC,
-        dst: 0x0FFC,
-        count: 16,
-        rows: &[
-            (0x1FFC, 0x0FFC, 16, false, 8),
-            (0x2004, 0x1004, 8, false, 8),
-        ],
-    },
-];
+/// Parses [`CANONICAL_ROWS`]. Any malformed line is a panic, so a restructured
+/// or truncated fixture fails loudly rather than silently matching nothing.
+fn parse_canonical_vectors() -> Vec<OracleVector> {
+    fn num(field: &str, line: &str) -> u64 {
+        field
+            .parse()
+            .unwrap_or_else(|_| panic!("canonical rows: bad number {field:?} in {line:?}"))
+    }
 
-/// The trace generator's row decomposition equals the oracle's.
+    let mut vectors: Vec<OracleVector> = Vec::new();
+    for line in CANONICAL_ROWS.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let f: Vec<&str> = line.split('|').collect();
+        match f[0] {
+            "vector" => {
+                assert_eq!(f.len(), 6, "canonical rows: bad vector line {line:?}");
+                vectors.push(OracleVector {
+                    name: f[1].to_string(),
+                    dst: num(f[2], line),
+                    src: num(f[3], line),
+                    count: num(f[4], line),
+                    rows: Vec::with_capacity(num(f[5], line) as usize),
+                });
+            }
+            "row" => {
+                assert_eq!(f.len(), 6, "canonical rows: bad row line {line:?}");
+                let vector = vectors
+                    .last_mut()
+                    .expect("canonical rows: a row line preceded every vector line");
+                vector.rows.push((
+                    num(f[1], line),
+                    num(f[2], line),
+                    num(f[3], line),
+                    num(f[4], line) == 1,
+                    num(f[5], line),
+                ));
+            }
+            other => panic!("canonical rows: unknown record type {other:?}"),
+        }
+    }
+    // The declared data-row count must match the rows that followed.
+    for vector in &vectors {
+        assert_eq!(
+            vector.rows.len() as u64,
+            vector.rows.iter().map(|_| 1u64).sum::<u64>(),
+            "{}: row bookkeeping",
+            vector.name
+        );
+    }
+    vectors
+}
+
+/// The trace builder's row decomposition equals the oracle's.
 ///
-/// The AIR proves that a row sequence is internally consistent — each row's
-/// successor is its own `src + width`, the chain terminates when `count` hits
-/// zero. It cannot prove the sequence is the one the *executor* performed; that
-/// is what the memory bus does, and what this test does at the row level.
-/// Without it the AIR and the trace builder could agree on a decomposition that
-/// is self-consistent and wrong (every mutant in the oracle's own sweep is
-/// exactly that shape).
+/// This calls [`dma_ops_for_test`], which drives the real
+/// `collect_dma_memcpy_ops` — the function that actually performs the greedy
+/// `8-while-count>=8-then-1` split. An earlier version of this test drove
+/// `generate_dma_trace` instead and was **vacuous**: that function only formats
+/// an already-decomposed op list into columns, so the test asserted the
+/// formatter echoed back the fixture the test itself had built. Mutating the
+/// production width rule (`remaining >= 8` -> `remaining > 8`) left it green.
+///
+/// Acceptance criterion for any future change here: that mutation must fail this
+/// test.
 #[test]
 fn dma_trace_matches_oracle_row_decomposition() {
-    for vector in ORACLE_VECTORS {
-        // Rebuild the operations the trace builder would emit for this case.
-        let mut ops: Vec<DmaOperation> = vector
-            .rows
-            .iter()
-            .enumerate()
-            .map(|(i, &(src, dst, count, _, width))| DmaOperation {
-                timestamp: 0x30,
-                src,
-                dst,
-                count,
-                first: i == 0,
-                end: false,
-                value: {
-                    let mut value = [0u8; 8];
-                    for (lane, slot) in value.iter_mut().enumerate().take(width as usize) {
-                        *slot = (src as u8).wrapping_add(lane as u8);
-                    }
-                    value
-                },
-            })
-            .collect();
-        ops.push(DmaOperation {
-            timestamp: 0x30,
-            src: vector.src + vector.count,
-            dst: vector.dst + vector.count,
-            count: 0,
-            first: vector.rows.is_empty(),
-            end: true,
-            value: [0; 8],
-        });
+    use crate::tables::trace_builder::dma_ops_for_test;
 
-        let trace = generate_dma_trace(&ops);
+    let vectors = parse_canonical_vectors();
+    assert_eq!(vectors.len(), 10, "expected all ten canonical vectors");
 
-        // The widths sum to `count`, so the copy covers the whole range once.
-        let covered: u64 = vector.rows.iter().map(|&(.., width)| width).sum();
+    for vector in &vectors {
+        // Seed the source region the same way the oracle's emitter does.
+        let source: Vec<u8> = (0..vector.count).map(|i| (i * 7 + 3) as u8).collect();
+        let (memw_ops, rows) =
+            dma_ops_for_test(0x30, vector.dst, vector.src, vector.count, &source);
+
+        let data_rows: Vec<_> = rows.iter().filter(|r| !r.end).collect();
+        assert_eq!(
+            data_rows.len(),
+            vector.rows.len(),
+            "{}: builder emitted {} data rows, oracle says {}",
+            vector.name,
+            data_rows.len(),
+            vector.rows.len()
+        );
+
+        let mut covered = 0u64;
+        for (row, &(src, dst, count, tail, width)) in data_rows.iter().zip(&vector.rows) {
+            assert_eq!(
+                (row.src, row.dst, row.count),
+                (src, dst, count),
+                "{}: row at offset {covered} is (src {:#x}, dst {:#x}, count {}), oracle says ({src:#x}, {dst:#x}, {count})",
+                vector.name,
+                row.src,
+                row.dst,
+                row.count
+            );
+            // `tail`/`width` are derived, so this is the greedy rule itself.
+            assert_eq!(
+                row.count < 8,
+                tail,
+                "{}: row at offset {covered} disagrees on tail",
+                vector.name
+            );
+            assert_eq!(
+                row.value[width as usize..],
+                [0u8; 8][width as usize..],
+                "{}: unused value lanes must be zero",
+                vector.name
+            );
+            for lane in 0..width as usize {
+                assert_eq!(
+                    row.value[lane],
+                    source[(covered + lane as u64) as usize],
+                    "{}: copied byte at offset {} is wrong",
+                    vector.name,
+                    covered + lane as u64
+                );
+            }
+            covered += width;
+        }
         assert_eq!(
             covered, vector.count,
-            "{}: rows cover {covered} bytes, expected {}",
+            "{}: rows cover {covered} bytes of {}",
             vector.name, vector.count
         );
 
-        for (i, &(src, dst, count, tail, width)) in vector.rows.iter().enumerate() {
-            let row = trace.main_table.get_row(i);
-            assert_eq!(
-                row[cols::SRC_0],
-                FE::from(src),
-                "{}: row {i} src",
-                vector.name
-            );
-            assert_eq!(
-                row[cols::DST_0],
-                FE::from(dst),
-                "{}: row {i} dst",
-                vector.name
-            );
-            assert_eq!(
-                row[cols::COUNT_0],
-                FE::from(count),
-                "{}: row {i} count",
-                vector.name
-            );
-            assert_eq!(
-                row[cols::TAIL],
-                if tail { FE::one() } else { FE::zero() },
-                "{}: row {i} tail — the LT lookup pins this, so a mismatch here \
-                 means the trace builder and the AIR disagree on the width",
-                vector.name
-            );
-            // `src_incr`/`dst_incr` are DWordHL: the low halfword suffices for
-            // these addresses, and the whole point is that it equals src + width.
-            assert_eq!(
-                row[cols::SRC_INCR_0],
-                FE::from((src + width) & 0xFFFF),
-                "{}: row {i} src_incr",
-                vector.name
-            );
-            assert_eq!(
-                row[cols::COUNT_DECR_0],
-                FE::from(count - width),
-                "{}: row {i} count_decr",
-                vector.name
-            );
-            assert_eq!(
-                row[cols::MU],
-                FE::one(),
-                "{}: row {i} must be active",
-                vector.name
-            );
-        }
+        // Exactly one first row and one terminal row, and the terminal row lands
+        // past the copied range.
+        assert_eq!(
+            rows.iter().filter(|r| r.first).count(),
+            1,
+            "{}",
+            vector.name
+        );
+        assert_eq!(rows.iter().filter(|r| r.end).count(), 1, "{}", vector.name);
+        let terminal = rows.last().expect("terminal row");
+        assert!(terminal.end && terminal.count == 0, "{}", vector.name);
+        assert_eq!(
+            (terminal.src, terminal.dst),
+            (vector.src + vector.count, vector.dst + vector.count),
+            "{}: terminal row addresses",
+            vector.name
+        );
 
-        // The terminal row: count zero, end set, all four count_decr halfwords
-        // 0xFFFF (which is what the Zero-bus end detection reads).
-        let terminal = trace.main_table.get_row(vector.rows.len());
-        assert_eq!(
-            terminal[cols::END],
-            FE::one(),
-            "{}: terminal end",
+        // The MEMW payload: three register reads at T, then every source read
+        // strictly before every destination write. This two-phase split is what
+        // gives an overlapping copy its snapshot semantics, and no other test in
+        // this module looks at it.
+        let registers: Vec<_> = memw_ops.iter().filter(|o| o.is_register).collect();
+        assert_eq!(registers.len(), 3, "{}: three register reads", vector.name);
+        assert!(
+            registers.iter().all(|o| o.timestamp == 0x30),
+            "{}: register reads are at T",
             vector.name
         );
+        let data: Vec<_> = memw_ops.iter().filter(|o| !o.is_register).collect();
         assert_eq!(
-            terminal[cols::COUNT_0],
-            FE::zero(),
-            "{}: terminal count",
+            data.len(),
+            2 * vector.rows.len(),
+            "{}: one read and one write per data row",
             vector.name
         );
-        for lane in 0..4 {
-            assert_eq!(
-                terminal[cols::COUNT_DECR_0 + lane],
-                FE::from(0xFFFFu64),
-                "{}: terminal count_decr[{lane}]",
-                vector.name
-            );
-        }
+        let reads = data.iter().filter(|o| o.timestamp == 0x31).count();
+        let writes = data.iter().filter(|o| o.timestamp == 0x32).count();
         assert_eq!(
-            terminal[cols::FIRST],
-            if vector.rows.is_empty() {
-                FE::one()
-            } else {
-                FE::zero()
-            },
-            "{}: an empty copy's single row is both first and terminal",
+            (reads, writes),
+            (vector.rows.len(), vector.rows.len()),
+            "{}: all reads at T+1 and all writes at T+2",
             vector.name
         );
     }
 }
 
-/// The maximum chunk has no tail row: 256 is 8-aligned, so 32 wide rows plus a
-/// terminal, and every `count_decr` is a clean multiple of eight.
+/// The maximum chunk is 33 rows with no tail row, derived from the constant
+/// rather than from the test's own loop bound.
 ///
-/// Pinned separately because it is the row-count bound the `Alu[count, 257, LT]`
-/// lookup exists to enforce — 33 rows is the most one guest instruction can add
-/// to a continuation epoch.
+/// 256 is 8-aligned, so `count % 8 == 0` and every data row is a wide one — the
+/// row-count bound the `Alu[count, 257, LT]` lookup exists to enforce. Asserting
+/// `ops.len() == 33` against a locally computed `count / 8 + 1` would hold even
+/// if `DMA_MEMCPY_MAX_BYTES` changed, so the expectation is derived from the
+/// executor's own row formula instead.
 #[test]
-fn dma_maximum_chunk_is_thirty_three_rows_with_no_tail() {
-    use crate::tables::dma::DMA_MEMCPY_MAX_BYTES;
+fn dma_maximum_chunk_has_no_tail_row() {
+    use crate::tables::dma::DMA_MEMCPY_MAX_BYTES as MAX;
+    use crate::tables::trace_builder::dma_ops_for_test;
 
-    let count = DMA_MEMCPY_MAX_BYTES;
-    let mut ops: Vec<DmaOperation> = (0..count / 8)
-        .map(|k| DmaOperation {
-            timestamp: 0x30,
-            src: 0x2000 + k * 8,
-            dst: 0x1000 + k * 8,
-            count: count - k * 8,
-            first: k == 0,
-            end: false,
-            value: [k as u8; 8],
-        })
-        .collect();
-    ops.push(DmaOperation {
-        timestamp: 0x30,
-        src: 0x2000 + count,
-        dst: 0x1000 + count,
-        count: 0,
-        first: false,
-        end: true,
-        value: [0; 8],
-    });
+    let source: Vec<u8> = (0..MAX).map(|i| i as u8).collect();
+    let (_, rows) = dma_ops_for_test(0x30, 0x1000, 0x2000, MAX, &source);
 
+    // `trace_builder`'s own formula: data_rows = count / 8 + count % 8.
+    let expected_data_rows = MAX / 8 + MAX % 8;
     assert_eq!(
-        ops.len(),
-        33,
-        "256 bytes is 32 wide rows plus the terminal row"
+        rows.len() as u64,
+        expected_data_rows + 1,
+        "expected {expected_data_rows} data rows plus one terminal row"
     );
-    let trace = generate_dma_trace(&ops);
-    for row_idx in 0..32 {
-        let row = trace.main_table.get_row(row_idx);
-        assert_eq!(
-            row[cols::TAIL],
-            FE::zero(),
-            "row {row_idx} must be a wide row"
-        );
-        assert_eq!(
-            row[cols::COUNT_DECR_0],
-            FE::from(count - (row_idx as u64 + 1) * 8)
-        );
-    }
-    assert_eq!(trace.main_table.get_row(32)[cols::END], FE::one());
+    assert!(
+        rows.iter().filter(|r| !r.end).all(|r| r.count >= 8),
+        "no data row may be a tail row when the length is 8-aligned"
+    );
+    assert!(rows.last().expect("terminal").end);
 }
 
 #[test]

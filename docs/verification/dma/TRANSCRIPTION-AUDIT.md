@@ -16,14 +16,18 @@ reading the source against the model, not by running the model.
 
 ## Verdict
 
-**No drift.** 83 textual and structural claims, 0 findings
-(`python3 audit_gate_transcription.py`, run against the working tree at
-`ef9e7526` + the changes in this branch).
+**No drift.** 100 textual and structural claims, 0 findings
+(`python3 audit_gate_transcription.py`, against the working tree at `ef9e7526`
+plus this branch). Per-section counts are printed by the script; §1 quotes that
+output rather than restating it.
 
-**One residual, R1**, which is a property of the AIR and not a transcription
-error: `count`'s limb split is unconstrained on non-`first` rows. The gate
-reports it rather than assuming it away; details in `dma-chip/DESIGN.md` §7 R1
-and §6 below.
+**No residual.** An earlier version of this audit carried one — "R1", that
+`count`'s limb split was unconstrained on non-head rows — and it was **wrong**:
+`DmaNext` binds each 64-bit value as two 32-bit bus elements, not one packed
+field element, so the limbs are pinned. §6 below is now the account of that error
+rather than a finding, and §1 records the audit gap that let it through: the
+audit checked that the packing *names* appeared and never that the element counts
+aligned. Section **G** now does.
 
 **One structural asymmetry worth naming.** Unlike BLAKE3, this campaign's
 `DESIGN.md` was written *after* the Rust, so it cannot independently disagree
@@ -40,33 +44,65 @@ source — rather than a Rust test. The point is to catch a change in `dma.rs` t
 nobody reflected in this directory, and a Rust test would be edited in the same
 commit as the code it guards.
 
-| section | claims | what it pins |
-|---|---|---|
-| A. constants | 11 | every number the oracle and gate hard-code |
-| B. columns | 28 | the full `dma::cols` layout, `NUM_COLUMNS`, layout density |
-| C. constraints | 9 | each index, its template, its operands, the degree bound, and that no index exists the gate does not model |
-| D. buses | 21 | 23 interactions, bus mix, every multiplicity, and the five wiring facts the gate explicitly cannot see |
-| E. executor | 6 | the ecall validates what the oracle validates, in that order |
-| F. generator | 8 | the padding row is the row the oracle describes |
+Counts below are the script's own output, not prose. An earlier version stated
+them by hand and got **five of six wrong** — apportioned to sum to the real total
+of 83 rather than measured, which is exactly the "declared, not derived" defect
+this file exists to catch. The script now prints them.
+
+```
+  A. constants          10 claims   every number the oracle and gate hard-code
+  B. columns            28 claims   the full dma::cols layout, NUM_COLUMNS, density
+  C. constraints        10 claims   each index, template, operands, the degree bound,
+                                    and that no index exists the gate does not model
+  D. buses              23 claims   23 interactions, bus mix, every multiplicity, and
+                                    the four wiring facts the gate cannot see
+  E. executor            5 claims   the ecall validates what the oracle validates,
+                                    in that order
+  F. generator           7 claims   the padding row is the row the oracle describes
+  G. bus packing        14 claims   element counts per Packing and DmaNext tuple
+                                    alignment -- the section whose absence hid R1
+  H. fixture pinning     3 claims   the Rust test consumes the oracle's output
+```
 
 ### Sensitivity — the audit was mutation-tested
 
 An audit that cannot fail is not an audit. Five mutants were applied to copies of
 the source and the script re-run; all five are caught:
 
-| mutant | findings |
-|---|---|
-| `timestamp_with_offset(2)` → `(1)` on the write tuple | 1 |
-| the write tuple's `value_columns()` → eight zero constants | 1 |
-| one `halfword(cols::COUNT_DECR_0)` send deleted | 3 |
-| `DMA_MEMCPY_MAX_BYTES + 1` → `+ 2` in the bound lookup | 1 |
-| the executor's `if n > DMA_MEMCPY_MAX_BYTES` guard → `if false` | 1 |
+| mutant | findings | notes |
+|---|---|---|
+| `timestamp_with_offset(2)` → `(1)` on the write tuple | 1 | |
+| the write tuple's `value_columns()` → eight zero constants | 1 | |
+| one `halfword(cols::COUNT_DECR_0)` send deleted | 3 | |
+| `DMA_MEMCPY_MAX_BYTES + 1` → `+ 2` in the bound lookup | 1 | |
+| the executor's `if n > DMA_MEMCPY_MAX_BYTES` guard → `if false` | 1 | needed a strengthened check |
+| **`num_bus_elements(DWordHL)` `2 → 1`** | 1 | **the mutant that was not caught at all** |
+| a `rustfmt`-style reflow of `if tail { 1 } else { 8 }` | **0** | must NOT fire — see below |
 
-The fifth needed a strengthened check to catch: the original version asserted
-only that the `DmaMemcpyChunkTooLarge` error variant appeared before the
-`checked_add` calls, which a guard rewritten to `if false` satisfies. It now
-requires the literal predicate. **That is the class of defect this whole file
-exists to find, and the audit found one in itself.**
+Two of these are the point of the section.
+
+**The `num_bus_elements` mutant was not caught before**, because §D checked only
+that the strings `DWordWL`/`DWordHL` appeared in the two tuples and never that
+their element counts aligned. That is the gap the retracted R1 came through, and
+it is a textbook instance of the failure this file is written to prevent: the gate
+asserted a premise about the bus that nothing ever read from the source. §G now
+asserts the element count of every `Packing` variant, that no variant folds a
+64-bit value into one element, that `DWordHL` accumulates two halves at
+consecutive alpha powers, and that both `DmaNext` tuples carry 8 elements.
+
+**The reflow mutant must produce zero findings, and used to produce two.** The
+literal checks match fragments like `if tail { 1 } else { 8 }`, and `rustfmt`
+breaks those across lines the moment one grows past `max_width`. The original
+guard, `src.replace("\n", " ")`, collapsed the newline but left the indentation,
+so it could never match a reflowed form — dead code. `read()` now
+whitespace-normalises. This matters because the script is meant to run
+unattended: a spurious red is how a check gets deleted rather than fixed.
+
+The executor mutant also needed strengthening: the original asserted only that the
+`DmaMemcpyChunkTooLarge` variant appeared before the `checked_add` calls, which a
+guard rewritten to `if false` satisfies. It now requires the literal predicate.
+**Three of the seven mutants were initially missed, in a file whose entire job is
+catching exactly this.**
 
 ## §2 — Per-premise table (gate ↔ design ↔ Rust)
 
@@ -76,9 +112,11 @@ exists to find, and the audit found one in itself.**
 | `Zero[v] → z` | `v = x + 256y + 65536z`, x,y bytes, z<16, `z = (v == 0)` | `bitwise.rs` `generate_bitwise_row` | audit A (domain), D (the send's shape, the four `-1` coefficients) |
 | Zero **domain** `v < 2^20` | asserted at gate import | halfword bounds put the argument in `[0, 262140]` | gate module assert; audit A |
 | `Alu[a,b,LT] → o` | `lt.rs`'s own columns and carries, **not** `o = (a<b)` | `lt.rs` constraints 0–2 | audit D (both lookups, their constants, their multiplicities) |
-| MEMW-ADDR32 | address limbs `< 2^32` when `mu − end == 1` | the `Memw` table's address decomposition | **not verified here** — see §5 |
-| REG-32 | all three argument limbs `< 2^32` when `first == 1` | the register file / `memw_register.rs` | **not verified here** — see §5 |
+| **DmaNext per-limb binding** | 2 bus elements per 64-bit value, aligned pairwise | `lookup.rs` `num_bus_elements` + `accumulate_fingerprint_with` | audit **§G** (14 claims). Was assumed and unverified; that is how R1 happened |
+| A1 (was "MEMW-ADDR32") | the **head row's** address limbs are 32-bit | `spec/src/memw.toml` `[[assumptions]] IS_WORD[base_address[i]]` — a **caller obligation**, not a receiver check | **not discharged** — see §5 |
+| A2 (was "REG-32") | the **head row's** count limbs are 32-bit | `spec/src/memw_register.toml` `[[assumptions]] IS_WORD[val[i]]` | **not discharged** — see §5 |
 | constraint set = 18, degree 2 | 18 modelled constraints, all quadratic | `DmaConstraints` | audit C + the Rust test `dma_constraints_count_and_indices` |
+| the Rust fixture is the oracle's output | `include_str!` of the emitted row table | the emitter in `test_oracle.py` | audit **§H** |
 | bus balance = multiset equality | assumed | LogUp | out of scope, stated in the gate docstring |
 
 ## §3 — Reference independence
@@ -134,8 +172,8 @@ they only observe that verification fails:
 
 | shipped Rust forgery test | what it perturbs | the mechanism that rejects it | gate check |
 |---|---|---|---|
-| `forged_early_end_rejected` | `END := 1` on a data row | the `Zero` lookup: the sum no longer reads zero, so the `Zero` bus unbalances | MAIN 1, and its `drop_zero_end` / `drop_halfword_count_decr` controls |
-| `forged_wide_tail_rejected` | `TAIL := 1` on a wide row | the `Alu` width pin: `tail` must equal `count < 8` | MAIN 0, and the width audit's `count = 7` case (which is the *opposite* direction — `tail := 0` on a narrow row) |
+| `forged_early_end_rejected` | `END := 1` on a data row | the `Zero` lookup (the sum no longer reads zero) **and** the three sends gated on `mu − end`, which vanish — so `DmaNext` and both `Memw` buses unbalance too. Not the `Zero` bus alone, as an earlier version of this table said | MAIN 1, and its `drop_zero_end` / `drop_halfword_count_decr` controls |
+| `forged_wide_tail_rejected` | `TAIL := 1` on a wide row | **three degree-2 constraints, row-locally** — `step = 8 − 7·tail` breaks the *ungated* idx-9 `emit_add_pair` on `count` (`count_decr + 1 ≠ count` when the trace holds `count − 8`), and idx 5-6 / 7-8 fail identically. **Not the `Alu` width pin**, which an earlier version of this table credited; the lookup is what stops the *opposite* direction (`tail := 0` on a narrow row, the width audit's `count = 7` case) | MAIN 0 |
 | `forged_intermediate_source_rejected` | `SRC_0` **and** `SRC_INCR_0` shifted together | **nothing row-local** — the row's own ADD stays satisfied. The predecessor's `DmaNext` tuple no longer matches, and the source read no longer matches memory | CHAIN / CHAIN-F, which is exactly the check that treats `DmaNext` as a free bijection rather than an assumed chain |
 | `forged_value_rejected` | `VALUE[0]` | **not the copy relation** — read and write still agree with each other, because they are one set of columns. What rejects it is the `Memw` read no longer matching memory | none; audit §D pins the one-set-of-columns wiring |
 
@@ -149,65 +187,83 @@ and the audit script are separate artifacts.
 
 ## §5 — Premises NOT discharged here (and where they should be)
 
-**MEMW-ADDR32** and **REG-32** are asserted by the gate and verified by nothing
-in this directory. Both are "the receiving table range-checks what it receives",
-which is the exact shape of BLAKE3's F1 ("the free range check is declared, not
-derived"), so they deserve naming rather than assuming:
+**A1** and **A2** (`dma-chip/DESIGN.md` §Assumptions) are asserted by the gate and
+verified by nothing in this directory. Both are **obligations on the caller** that
+the spec states as such — `spec/src/memw.toml` and `spec/src/memw_register.toml`
+carry them as `[[assumptions]] IS_WORD[...]`, and `memw_register.rs`'s only
+range-check interaction is on the timestamp delta.
 
-* **MEMW-ADDR32** — `src0`/`src1`/`dst0`/`dst1` cross the bus as
-  `base_address` lo/hi on the two data `Memw` sends, and `memw.rs` decomposes the
-  address into range-checked pieces. Chased far enough to be confident, not far
-  enough to be a claim. If it were false, `src`'s limb split would be as
-  unpinned as `count`'s is in R1.
-* **REG-32** — the three register reads bind the limbs to `memw_register.rs`'s
-  `VAL_0`/`VAL_1`, which are `Word` columns whose range comes from the memory-bus
-  tokens chaining back to the register file. Not a local fact. Note the gate's
-  `drop_reg32` control shows what it buys: without it, the `count < 257` bound
-  lookup does not cap `count`, because a bound lookup on a residue class caps
-  only the residue.
+An earlier version of this campaign had the **direction backwards**, presenting
+them in `DESIGN.md`'s column table as what `src`/`dst`/`count` are "range-checked
+by", under invented labels "MEMW-ADDR32" and "REG-32". `memw.rs:257-262` is
+explicit that its own bound holds because *the CPU table* splits addresses with
+both halves in `[0, 2^32)` — and DMA is a non-CPU sender, so that argument does
+not extend to it.
 
-Neither is DMA-specific — every table sending an address or a register value
-depends on them — which is an argument for verifying them once, centrally, not
-an argument for not verifying them.
+They bind the **head row only.** Every other row's limbs are derived through the
+`DmaNext` per-limb binding (§2, audit §G). Worth recording as a lesson in where to
+look: the retracted R1 reported a gap on non-head rows, where the bus in fact pins
+the limbs, while the genuine obligation sits on the head row — the one row with no
+`DmaNext` receive at all. The phantom and the real premise were exact mirror
+images, and the phantom is the one that got written up.
 
-## §6 — R1, in the form a reviewer should act on
+Neither is DMA-specific, and the underlying problem is the spec's:
 
-`DmaNext` equates **packed** field elements. The receiver's
-`COUNT_0 + 2^32·COUNT_1` is matched against the sender's four `count_decr`
-halfwords as one value; nothing says the successor split its limbs the same way.
-`count`'s limbs are bounded only on `first` rows, and `lt.rs` bounds `lhs[1]` and
-`lhs[2]` (hence `COUNT_1`) but not the bare `LHS_0` word (hence not `COUNT_0`).
+> **`IS_WORD` has no discharger.** It appears across ~10 chip TOMLs
+> **exclusively** inside `[[assumptions]]` blocks — never as `kind = "interaction"`
+> or `kind = "template"` — and `spec/bitwise.typ` offers only MSB8/MSB16/ZERO/
+> ARE_BYTES/IS_HALF/IS_B20, a 2^32 table being infeasible. So the spec asserts a
+> range obligation for essentially every address, register value and timestamp in
+> the VM without saying how it is met or which chip owns it per sender. **That
+> vacuum is what this campaign filled by inventing two label names, and the next
+> chip author will fill it the same way.** It wants either a
+> `= Range-check provenance` chapter or a per-sender naming requirement.
 
-The gate exhibits the alias (MAIN 3b, SAT). Concrete witness, for a row whose
-honest count is 3:
+Related and equally ownerless: `spec/memw.typ:42-45` concedes that `value` range
+checks "are necessary for the consistency of the system as a whole" and documents
+the types "as a reading help". DMA is a concrete sender for which no chip
+discharges it. An obligation owned by everyone is owned by nobody.
 
-```
-COUNT_1 = 0xFFFF_FFFF        COUNT_0 = 4
-packed  = 4 + 2^32·(2^32−1) = 2^64 − 2^32 + 4  ≡  3   (mod p)   <- passes DmaNext
-lt.rs sees the integer 18446744069414584324, which is not < 8   <- tail = 0
-```
+## §6 — The retracted finding, and what it cost
 
-So the row claims an **eight-byte width where three bytes remained**: up to five
-bytes written past the destination end, with every bus balanced. What stops it is
-that the row's own `count_decr` is then near `2^64`, and a chain must descend to
-`count = 0` to terminate — roughly 2^61 rows. **The obstacle is trace length,
-not a constraint.**
+This section used to be a finding. It is now the account of an error, kept because
+the error is more instructive than the finding would have been.
 
-Recommended fix, either one:
+**What was claimed.** That `DmaNext` "equates packed field elements", so `count`'s
+limb split was unconstrained on non-head rows, and a Goldilocks alias
+(`COUNT_1 = 2^32−1`, `COUNT_0 = V+1`, packed ≡ V mod p) would pass the chain while
+`lt.rs` saw an integer near `2^64` and returned `tail = 0` — a row claiming an
+eight-byte width where fewer than eight bytes remained, blocked only by trace
+length. Two fixes were recommended.
 
-1. add `IsHalfword` sends on `COUNT_0`/`COUNT_1` at multiplicity `mu` (they are
-   `Word` columns, so this needs the same treatment `count_decr` already gets:
-   receive `count` as `DWordHL`); or
-2. simply receive `count` as `DWordHL` on the `DmaNext` tuple, reusing the
-   existing halfword sends.
+**Why it was wrong.** `Packing::num_bus_elements()` returns **2** for both
+`DWordWL` ("2× Direct") and `DWordHL` ("2× Word2L"), and
+`accumulate_fingerprint_with` gives each element its own alpha power. No `Packing`
+variant contains a `2^32` shift, so a 64-bit value is never one bus element
+anywhere in this codebase. Both `DmaNext` tuples are `1+1+2+2+2 = 8` elements and
+align pairwise, so balance forces `COUNT_0 = cd₀ + 2^16·cd₁` **and**
+`COUNT_1 = cd₂ + 2^16·cd₃`. With the sender's four halfwords `IsHalfword`-checked,
+the receiver's limbs are 32-bit for free. Under the corrected link the alias is
+UNSAT and the successor's count is pinned exactly.
 
-Either collapses MAIN 3's disjunction to its first branch and makes
-`count ≤ 256` an invariant of every row rather than of the head row.
+**Four things to take from it.**
 
-Severity, stated honestly: **not exploitable as the code stands**, and not a
-reason to block the PR on its own. It is a soundness argument resting on a
-resource bound, which is the category that quietly breaks when someone raises a
-trace-length parameter.
+1. **Classify the direction of every modelling gap.** A model *weaker* than the
+   AIR yields false alarms but never false proofs — every UNSAT on the board
+   survived the correction, having been proven under weaker hypotheses than
+   reality supplies. A model *stronger* than the AIR is the one that yields a
+   false proof no positive anchor can catch.
+2. **A phantom finding causes real damage.** Working around R1 led to asserting
+   `count ≤ 256` on *every* row of the field-exact chain check when the AIR bounds
+   only the head — the one genuinely over-strong assertion in the gate, i.e. the
+   dangerous direction, introduced to accommodate something that did not exist.
+3. **A proposed fix that is a no-op means the gap is not there.** R1's second fix
+   was "receive `count` as `DWordHL`", which changes nothing under the real
+   semantics. That should have stopped the write-up.
+4. **The audit's coverage gap is the root cause, not the gate's model.** §D pinned
+   the tuples' column names and multiplicities and never their packing semantics,
+   so "83 claims, 0 findings" never tested the one fact R1 rested on. §G exists
+   now, and the `num_bus_elements(DWordHL) 2 → 1` mutant is in the regression set.
 
 ## §7 — Still open (report-only, outside this audit's scope)
 
@@ -220,12 +276,16 @@ trace-length parameter.
    misaligned DMA copy generates on nearly every row.
 2. **`count_table_lengths`** — the disk-spill sizing pass. The PR's own
    `count_table_lengths_drift_tests.rs` covers DMA; not re-derived here.
-3. **The `n = 0` ecall.** One row, both `first` and `end`, no `DmaNext` traffic,
+3. **The multi-call case.** Layer 2 proves the tiling among groups containing
+   exactly one head row. `ChainRow` carries no timestamp, so two DMA calls in one
+   trace are out of model; the `ts` carried in both `DmaNext` tuples is what
+   separates them, and it is guarded only textually (audit §D).
+4. **The `n = 0` ecall.** One row, both `first` and `end`, no `DmaNext` traffic,
    no memory operations. Pinned by the completeness sweep and by
    `empty_dma_call_is_a_single_first_and_terminal_row`, but it is the row shape
    most likely to be broken by a future multiplicity change, because every
    multiplicity on it is zero.
-4. **Two ecalls at one timestamp.** Ruled out by CPU timestamps being strictly
+5. **Two ecalls at one timestamp.** Ruled out by CPU timestamps being strictly
    increasing per instruction. Asserted, not verified here, and it is what the
    `DmaNext` timestamp binding relies on.
 
@@ -238,7 +298,10 @@ python3 docs/verification/dma/audit_gate_transcription.py      # this audit
 cargo test -p lambda-vm-prover --lib dma              # the Rust side, incl. the vector test
 ```
 
-`z3-solver` is the only dependency (`pip install z3-solver`; validated on 5.0.0).
-All three scripts exit nonzero on failure and are safe to wire into CI; the gate
-takes about three minutes for the full board, dominated by the 5410-row
-completeness sweep.
+`make verify-dma` runs all three. `z3-solver` is the only dependency
+(`pip install z3-solver`; validated on 5.0.0 — the audit alone needs no solver).
+The gate takes ~96 s for the full board on 5.0.0, dominated by the completeness
+sweep; on 4.12.2 it takes ~1210 s and two queries blow their budgets and report
+`unknown`, which is scored as **failure** everywhere. The oracle exits 2 when it
+ran but an anchor skipped, so a degraded run is distinguishable from a clean one.
+No CI workflow schedules any of this yet.

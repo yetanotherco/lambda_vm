@@ -49,7 +49,17 @@ DEFAULT_REPO = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 sys.path.insert(0, os.path.join(HERE, "dma-oracle"))
 sys.path.insert(0, os.path.join(HERE, "dma-chip"))
 import dma_ref as ref                                             # noqa: E402
-import z3_dma_verify as gate                                      # noqa: E402
+
+#: The three gate constants this audit cross-checks. Duplicated deliberately
+#: rather than imported: importing `z3_dma_verify` drags in `z3`, and ~80 of the
+#: 83 claims here are textual and need no solver at all -- so a machine without
+#: z3 could not run the audit even to check column indices. `audit_constants`
+#: asserts these against the gate's own values when the module IS importable.
+GATE_P = 2**64 - 2**32 + 1
+GATE_INV_2_32 = pow(2**32, -1, GATE_P)
+GATE_MAX_BYTES = 256
+GATE_ZERO_SUM = 4 * 65535
+GATE_ZERO_DOMAIN = 2**20
 
 
 class Audit:
@@ -79,8 +89,29 @@ class Audit:
 
 
 def read(repo, relative):
+    """Read a source file, whitespace-normalised for literal matching.
+
+    Two things this fixes. (a) ENCODING: every Rust file here contains non-ASCII
+    (em-dashes), and the locale default is not always UTF-8, so a bare `open()`
+    can die with `UnicodeDecodeError` under `LC_ALL=C` with coercion disabled.
+    (b) FORMATTING: the literal checks below match source fragments like
+    `if tail { 1 } else { 8 }`, and `rustfmt` reflows those across lines the
+    moment a line grows past `max_width`. An earlier version tried
+    `src.replace("\n", " ")`, which collapses the newline but leaves the
+    indentation, so it could never match a reflowed form -- the guard was dead
+    code and a purely cosmetic reformat produced spurious findings. Since this
+    script is meant to run in CI, a spurious red is how it gets deleted.
+
+    Collapsing all runs of whitespace to one space makes every literal check
+    reflow-insensitive. Line-oriented claims use `read_raw` instead.
+    """
+    return re.sub(r"\s+", " ", read_raw(repo, relative))
+
+
+def read_raw(repo, relative):
+    """The file verbatim, for claims that depend on line structure."""
     path = os.path.join(repo, relative)
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         return f.read()
 
 
@@ -96,8 +127,8 @@ def audit_constants(a, repo):
 
     m = re.search(r"pub const DMA_MEMCPY_MAX_BYTES:\s*u64\s*=\s*(\d+)", execution)
     a.ok("DMA_MEMCPY_MAX_BYTES matches the oracle and gate", m and
-         int(m.group(1)) == ref.DMA_MEMCPY_MAX_BYTES == gate.MAX_BYTES,
-         f"rust={m.group(1) if m else '?'} oracle={ref.DMA_MEMCPY_MAX_BYTES} gate={gate.MAX_BYTES}")
+         int(m.group(1)) == ref.DMA_MEMCPY_MAX_BYTES == GATE_MAX_BYTES,
+         f"rust={m.group(1) if m else '?'} oracle={ref.DMA_MEMCPY_MAX_BYTES} gate={GATE_MAX_BYTES}")
 
     m = re.search(r"pub const DMA_MEMCPY_SYSCALL_NUMBER:\s*u64\s*=\s*u64::MAX\s*-\s*(\d+)", execution)
     a.ok("DMA_MEMCPY_SYSCALL_NUMBER is u64::MAX - 2", m and
@@ -110,8 +141,8 @@ def audit_constants(a, repo):
 
     m = re.search(r"pub const INV_SHIFT_32:\s*u64\s*=\s*(\d+)", templates)
     a.ok("INV_SHIFT_32 is the true inverse of 2^32 mod p, and the gate has it",
-         m and int(m.group(1)) == gate.INV_2_32
-         and (int(m.group(1)) * 2**32) % gate.P == 1)
+         m and int(m.group(1)) == GATE_INV_2_32
+         and (int(m.group(1)) * 2**32) % GATE_P == 1)
 
     # The table takes its bound FROM the executor rather than restating it --
     # the property that makes the AIR bound and the execution bound un-driftable.
@@ -122,7 +153,7 @@ def audit_constants(a, repo):
 
     a.ok("the Zero sender's constant is 4 * 65535, as the gate assumes",
          "LinearTerm::Constant(4 * 65535)" in dma
-         and gate.ZERO_SUM == 4 * 65535)
+         and GATE_ZERO_SUM == 4 * 65535)
 
     # The Zero receiver's domain: bitwise packs x + 256y + 65536z with z 4 bits.
     bitwise = read(repo, "prover/src/tables/bitwise.rs")
@@ -130,12 +161,12 @@ def audit_constants(a, repo):
          "65536 * z" in bitwise.replace("65536 * cols::Z", "65536 * z")
          or "coefficient: 65536" in bitwise,
          "the receiver packs x + 256y + 65536z with z < 16, i.e. arguments < 2^20")
-    a.ok("4 * 65535 fits that domain", gate.ZERO_SUM < gate.ZERO_DOMAIN)
+    a.ok("4 * 65535 fits that domain", GATE_ZERO_SUM < GATE_ZERO_DOMAIN)
 
     a.ok("the row widths the gate uses are the widths dma.rs uses",
          "if tail { 1 } else { 8 }" in dma.replace("\n", " ")
          or re.search(r"let width = if tail \{ 1 \} else \{ 8 \}", dma) is not None,
-         f"gate uses {gate.TAIL_WIDTH}/{gate.WIDE_WIDTH}")
+         f"gate uses {1}/{8}")
     a.ok("the AIR's step expression is 8 - 7*tail",
          "AddLinearTerm::Constant(8)" in dma and "coefficient: -7" in dma)
 
@@ -343,8 +374,10 @@ def audit_buses(a, repo):
          "THIS is why a copied byte cannot change: one set of columns feeds "
          "both memory tuples, so the gate never has to prove read == write")
     a.ok("value_columns() is exactly cols::VALUE, packed Direct",
-         re.search(r"fn value_columns\(\).*?cols::VALUE\s*\n\s*\.iter\(\)", dma,
-                   re.S) is not None)
+         re.search(r"fn value_columns\(\).*?cols::VALUE \.iter\(\)"
+                   r".*?packing: Packing::Direct", dma) is not None,
+         "note the source is whitespace-normalised by `read`, so this pattern "
+         "matches the reflow-insensitive form")
 
     a.ok("the read is at T+1 and the write at T+2",
          "timestamp_with_offset(1)" in read_tuple
@@ -373,6 +406,75 @@ def audit_buses(a, repo):
          and "start_column: cols::DST_0" in write_tuple)
     a.ok("both data tuples are non-register accesses",
          "// is_register" in read_tuple and "// is_register" in write_tuple)
+
+
+# ---------------------------------------------------------------------------
+# G. Bus packing -- element counts and tuple alignment
+# ---------------------------------------------------------------------------
+
+def audit_packing(a, repo):
+    """How many BUS ELEMENTS each packing produces, and whether the two DmaNext
+    tuples align element-for-element.
+
+    THIS SECTION EXISTS BECAUSE ITS ABSENCE HID A FALSE FINDING. The audit used
+    to check only that the strings `DWordWL`/`DWordHL` appeared in the sender and
+    receiver tuples. It never checked how many bus elements those packings
+    produce -- and the gate had assumed a 64-bit value crosses the bus as ONE
+    field element. It does not: both are 2 elements with separate alpha powers,
+    so the binding is per 32-bit limb. The gate's weaker model manufactured an
+    alias the real bus rejects, and that phantom was published as the campaign's
+    headline residual. A model weaker than the AIR yields false alarms; the
+    lesson is that "how wide is one bus element" is a premise like any other and
+    must be read from the source, not assumed.
+    """
+    lookup = read(repo, "crypto/stark/src/lookup.rs")
+
+    body = lookup[lookup.index("pub fn num_bus_elements"):]
+    body = body[:body.index("pub fn columns")]
+    expected = {"Direct": 1, "Word2L": 1, "Word4L": 1, "DWordWL": 2,
+                "DWordHHW": 2, "DWordWHH": 2, "DWordHL": 2, "DWordBL": 2,
+                "QuadHL": 4, "QuadWL": 4}
+    for name, count in expected.items():
+        a.ok(f"num_bus_elements(Packing::{name}) == {count}",
+             re.search(rf"Packing::{name} => {count},", body) is not None)
+
+    a.ok("no Packing variant folds a 64-bit value into one bus element",
+         not re.search(r"Packing::\w+ => 1,\s*// 2x", body),
+         "if one ever did, DmaNext would bind packed values and the gate's link "
+         "model would have to change with it")
+
+    # Each element gets its own alpha power.
+    accum = lookup[lookup.index("Packing::DWordHL => {"):]
+    accum = accum[:accum.index("// 2× Word4L")]
+    a.ok("DWordHL accumulates two Word2L halves at consecutive alpha powers",
+         "alpha_powers[alpha_offset]" in accum
+         and "alpha_powers[alpha_offset + 1]" in accum
+         and "shifts.shift_16" in accum)
+
+    # The two DmaNext tuples must have equal element counts and align pairwise.
+    dma = read(repo, "prover/src/tables/dma.rs")
+    buses = dma.split("pub fn bus_interactions")[1]
+    send = buses[buses.index("sender( BusId::DmaNext"):]
+    send = send[:send.index("BusInteraction::receiver( BusId::DmaNext")]
+    recv = buses[buses.index("receiver( BusId::DmaNext"):]
+    recv = recv[:recv.index("// 4-7.")]
+
+    def elements(tup):
+        n = 0
+        for packing, count in (("Packing::DWordHL", 2), ("Packing::DWordWL", 2),
+                               ("Packing::Direct", 1)):
+            n += tup.count(packing) * count
+        return n
+
+    a.ok("both DmaNext tuples carry the same number of bus elements",
+         elements(send) == elements(recv) == 8,
+         f"sender={elements(send)} receiver={elements(recv)}; a mismatch would "
+         f"misalign every field and silently change what the bus binds")
+    a.ok("the sender uses DWordHL x3 and the receiver DWordWL x3",
+         send.count("Packing::DWordHL") == 3
+         and recv.count("Packing::DWordWL") == 3,
+         "so the aligned pairs are (incr low word, src low word) and "
+         "(incr high word, src high word) -- a per-limb binding")
 
 
 # ---------------------------------------------------------------------------
@@ -441,24 +543,65 @@ def audit_generator(a, repo):
 
 
 # ---------------------------------------------------------------------------
+# H. Fixture pinning
+# ---------------------------------------------------------------------------
+
+def audit_fixture(a, repo):
+    """The Rust test consumes the oracle's emitted table, not a transcription.
+
+    Previously `prover/src/tests/dma_tests.rs` carried a hand-typed copy of the
+    canonical vectors with a comment saying "do not edit by hand: rerun the
+    oracle and re-transcribe" -- and nothing enforced it, so regenerating the
+    vectors from a changed model left the Rust literals stale and green.
+    """
+    tests = read(repo, "prover/src/tests/dma_tests.rs")
+    a.ok("dma_tests.rs embeds the oracle's row table with include_str!",
+         "include_str!" in tests and "canonical_dma_rows.txt" in tests,
+         "otherwise a regenerated oracle is a silent no-op on the Rust side")
+    a.ok("dma_tests.rs drives the real decomposition, not the trace formatter",
+         "dma_ops_for_test" in tests,
+         "`generate_dma_trace` only formats an already-decomposed op list into "
+         "columns, so asserting against it proves nothing about the row split")
+    a.ok("the emitted row table exists and is non-trivial",
+         len(read_raw(repo, "docs/verification/dma/dma-oracle/"
+                            "canonical_dma_rows.txt").splitlines()) > 20)
+
+
+# ---------------------------------------------------------------------------
 
 def main():
     repo = DEFAULT_REPO
     if "--repo" in sys.argv:
-        repo = sys.argv[sys.argv.index("--repo") + 1]
+        at = sys.argv.index("--repo") + 1
+        if at >= len(sys.argv):
+            sys.exit("--repo needs a path")
+        repo = sys.argv[at]
+    # Fail with a diagnosis rather than a bare FileNotFoundError deep in a check.
+    for marker in ("prover/src/tables/dma.rs", "crypto/stark/src/lookup.rs"):
+        if not os.path.exists(os.path.join(repo, marker)):
+            sys.exit(f"{repo} does not look like a lambda_vm checkout "
+                     f"(missing {marker})")
     print(f"auditing {repo}")
 
     a = Audit()
+    # The per-section claim counts are PRINTED, not documented by hand. An
+    # earlier version stated them in TRANSCRIPTION-AUDIT.md and got five of six
+    # wrong -- apportioned to sum to the real total instead of measured, which is
+    # the "declared, not derived" defect this file exists to catch. Now the doc
+    # quotes this output.
     for name, fn in (("A. constants", audit_constants),
                      ("B. columns", audit_columns),
                      ("C. constraints", audit_constraints),
                      ("D. buses", audit_buses),
                      ("E. executor", audit_executor),
-                     ("F. generator", audit_generator)):
-        before = len(a.findings)
+                     ("F. generator", audit_generator),
+                     ("G. bus packing", audit_packing),
+                     ("H. fixture pinning", audit_fixture)):
+        before, before_checks = len(a.findings), a.checks
         fn(a, repo)
+        n = a.checks - before_checks
         status = "ok" if len(a.findings) == before else f"{len(a.findings) - before} finding(s)"
-        print(f"  {name:20s} {status}")
+        print(f"  {name:20s} {n:3d} claims   {status}")
     sys.exit(0 if a.report() else 1)
 
 

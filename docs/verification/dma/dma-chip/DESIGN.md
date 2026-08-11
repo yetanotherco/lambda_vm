@@ -1,8 +1,8 @@
 # DMA memcpy chip — constraint-system & bus design
 
-> **Provenance, read this first.** Unlike the BLAKE3 campaign, where `DESIGN.md`
-> was written *before* the Rust and the gate proved the design, this document is
-> written *after* `prover/src/tables/dma.rs` (PR #874). It is the specification
+> **Provenance, read this first.** This document is written *after*
+> `prover/src/tables/dma.rs` (PR #874) — unlike a design-first campaign, where the
+> spec precedes the code and the gate proves the design. It is the specification
 > **recovered from the implementation**, and it is what `z3_dma_verify.py`
 > checks. That ordering has one consequence worth stating plainly: a design
 > document derived from the code cannot find a disagreement between them by
@@ -38,7 +38,8 @@ A row copies **eight bytes while `count ≥ 8`, otherwise one byte**. The design
 is cloned from `commit.rs`: recursive/streaming, one row per chunk, rows chained
 by a bus rather than by a transition constraint.
 
-Why not one row per byte: 256 rows per maximal ecall instead of 33.
+Why not one row per byte: 257 rows per maximal ecall (256 data + 1 terminal)
+instead of 33.
 Why not one row per whole copy: the row would need `n` value columns for an
 unbounded `n`, and 8-byte-wide memory operations are the widest the `Memw`
 table serves.
@@ -46,20 +47,27 @@ table serves.
 Why the 1-byte tail rather than 4/2/1 halving: a `tail` **bit** selects between
 exactly two widths, so `step = 8 − 7·tail` stays linear and every constraint
 stays degree 2. Halving would need a two-bit width selector and a
-width-to-`w2/w4/w8` decode. The cost is at most 7 extra rows per ecall
-(`n % 8` ones), against 33 rows for a maximal copy — the tail is ≤ 17% of rows
-in the worst case and 0% for the 8-aligned lengths that dominate.
+width-to-`w2/w4/w8` decode.
+
+The cost, stated precisely (an earlier draft had this wrong in both directions):
+a copy of `n` bytes takes `n/8` wide rows, `n % 8` tail rows and one terminal row.
+So tail rows are `0%` for the 8-aligned lengths that dominate, `7/39 = 17.9%` at
+the maximal `n = 255`, and **`7/8 = 87.5%` at the genuine worst case `n = 7`**,
+where every data row is a tail row. Against 4/2/1 halving the delta is at most
+4 rows (halving needs `popcount(n % 8) ≤ 3`), not the 7 an earlier draft claimed
+by comparing against a zero-tail design instead of against the alternative it was
+arguing with.
 
 ## 3. Column layout (32 columns)
 
-| columns | name | packing | range-checked by |
+| columns | name | packing | range provenance |
 |---|---|---|---|
 | 0–1 | `timestamp` | DWordWL | the `Ecall` receiver (the CPU's own timestamp) |
-| 2–3 | `src` | DWordWL | `Memw` base-address limbs (**MEMW-ADDR32**) on data rows; the register read (**REG-32**) on the head |
+| 2–3 | `src` | DWordWL | head row: **assumption A1** (see §Assumptions). Non-head rows: *derived* — the `DmaNext` link binds each 32-bit limb against the predecessor's `IsHalfword`-checked halfwords (§5.1) |
 | 4–7 | `src_incr` | DWordHL | `IsHalfword` ×4, multiplicity `mu` |
 | 8–9 | `dst` | DWordWL | as `src` |
 | 10–13 | `dst_incr` | DWordHL | `IsHalfword` ×4 |
-| 14–15 | `count` | DWordWL | **REG-32 on the head row only** — see §7 R1 |
+| 14–15 | `count` | DWordWL | head row: **assumption A2**. Non-head rows: *derived*, same mechanism as `src` |
 | 16–19 | `count_decr` | DWordHL | `IsHalfword` ×4 |
 | 20 | `first` | Bit | constraint 0 |
 | 21 | `end` | Bit | constraint 1 |
@@ -73,13 +81,23 @@ one available. Their halves are what makes `emit_add_pair_no_overflow`'s
 `carry_1 = 0` mean "no wrap" instead of "the high word happens to be `2^32`" —
 proved necessary by the width audit (§8.1).
 
-`value[0..8]` carry no range check of their own. The argument is `keccak.rs`'s
-for its address bytes: a column that is only ever *consumed by a bus tuple* is
-pinned by the receiving table, and the `Memw` table decomposes and checks the
-value bytes it receives. What is **not** free is the tail case: on a one-byte
-row the memory tuple must be the canonical `w8 = 0` encoding, so lanes 1–7 must
-be zero, hence constraints 11–17 (gate MAIN 2b, and its control shows nothing
-else pins them).
+`value[0..8]` carry no range check of their own, and the reason is **not** that
+the receiving table checks them — `spec/memw.typ` says the opposite in as many
+words: *"Our assumptions do not explicitly cover any range checks for the `value`
+column."* (An earlier draft cited `keccak.rs` here as authority for relying on
+the receiver. That was backwards: `keccak.rs:355-378` emits four `AreBytes`
+senders for its address bytes **precisely because** the receiver does not pin
+them, and its comment spells out the forgery — keeping a linear combination's
+field value correct while encoding non-byte values in the individual cells.)
+
+The actual argument is narrower and specific to this chip: the `T+1` read tuple
+carries `old == value` **against real memory** (§5, bus 22), so each lane is
+pinned to the byte the memory argument says is at that address. Lanes are not
+free field elements; they are whatever memory already held.
+
+What that does **not** cover is the tail case: on a one-byte row the memory tuple
+must be the canonical `w8 = 0` encoding, so lanes 1–7 must be zero, hence
+constraints 11–17.
 
 ## 4. Constraints (18, all degree 2)
 
@@ -216,42 +234,95 @@ must not be repeated at the C level.
 9. **The single-`end` obligation is implicit**, not a constraint: a chain with
    no terminal row has one more `DmaNext` send than receive, so the bus does not
    balance. It is worth knowing this is where termination comes from.
-10. **R1 — `count`'s limb split is unconstrained on non-`first` rows.** The one
-    live gap, below.
+10. **The `DmaNext` tuples' element alignment** (§5.1). Both tuples are 8 bus
+    elements and align pairwise; that is what makes the link a per-limb binding
+    and hence what supplies the range provenance in §3 for every non-head row.
+    A packing change on either side silently changes what the bus binds.
 
-### R1 (residual): `count`'s limb split on non-head rows
+### The limb binding, and the finding that turned out not to exist
 
-`DmaNext` equates **packed** values: the receiver's `count0 + 2^32·count1` is
-matched against the sender's `cd₀ + 2^16·cd₁ + 2^32·cd₂ + 2^48·cd₃` as **one
-field element**. It does not say the successor split its limbs the same way.
-`count`'s limbs are bounded only on `first` rows (the register read, REG-32);
-`lt.rs` range-checks `lhs[1]` and `lhs[2]` — hence `count1` — but not the bare
-`LHS_0` word, hence not `count0`.
+`DmaNext` does **not** compare packed 64-bit values. `Packing::num_bus_elements()`
+(`crypto/stark/src/lookup.rs:227-241`) returns **2** for both `DWordWL` ("2× Direct")
+and `DWordHL` ("2× Word2L"), and each element gets its own alpha power. No
+`Packing` variant contains a `2³²` shift, so a 64-bit value is never one bus
+element anywhere in this codebase. Both tuples are `1+1+2+2+2 = 8` elements and
+align pairwise, so balance imposes two equations per value:
 
-So the honest statement, and what the gate proves (MAIN 3), is a disjunction:
+```
+receiver.COUNT_0 == sender.cd₀ + 2¹⁶·cd₁        (low word)
+receiver.COUNT_1 == sender.cd₂ + 2¹⁶·cd₃        (high word)
+```
 
-> `successor.count == predecessor.count − width`  **or**  `successor.count > 256`
+Since the sender's four `count_decr` halfwords are `IsHalfword`-checked at
+multiplicity `mu`, **the receiver's limbs are 32-bit for free** — no extra range
+check needed. Same for `src` and `dst`. This is what §3's "derived" entries mean,
+and it is why MAIN 3 is an unconditional claim rather than a disjunction.
 
-The second branch is real and reachable, and the gate exhibits it (MAIN 3b,
-expected SAT): with `count1 = 2^32 − 1` and `count0 = V + 1` the packed value is
-still `V` mod `p`, so the row passes `DmaNext`, while `lt.rs` sees an integer
-near `2^64` and returns `tail = 0`. That row claims an **eight-byte width where
-one byte remained** — up to seven bytes written past the destination end.
+**Recorded because the campaign got this wrong first.** An earlier version of the
+gate modelled the hop as one equation on the fully packed value, which is
+strictly *weaker* than the AIR: it let the receiver re-split its limbs and so
+manufactured an alias (`COUNT_1 = 2³²−1`, `COUNT_0 = V+1`, packed ≡ V mod p)
+that the real bus rejects. That phantom was published here as "RESIDUAL R1 — the
+one live gap", with two recommended fixes. It has been struck. Two things worth
+keeping from the episode:
 
-It is not exploitable as it stands: such a row's own `count_decr` is then near
-`2^64`, and a chain must descend to `count = 0` to terminate, so it would need
-~2^61 rows. But **the obstacle is trace length, not a constraint**, which is a
-fragile place for soundness to live — the same shape as any "too expensive to
-reach" argument that a later parameter change quietly invalidates.
+* **The direction of a modelling error decides what it costs.** A model weaker
+  than the AIR yields false alarms but never false proofs — every UNSAT the gate
+  reported survived the correction, having been proven under weaker hypotheses
+  than reality supplies. A model *stronger* than the AIR is the dangerous one.
+* **A proposed fix that is a no-op is evidence the gap is not there.** R1's
+  second fix was "receive `count` as `DWordHL`", which under the real semantics
+  changes nothing. That should have been caught at authoring time.
 
-Two cheap fixes, either sufficient:
-* send `IsHalfword` (or an `IsWord`-equivalent) on `COUNT_0`/`COUNT_1` at
-  multiplicity `mu`, so every row's count limbs are bounded, not just the head's;
-* or receive `count` as `DWordHL` like `count_decr`, reusing the existing
-  halfword sends.
+`../audit_gate_transcription.py` §G now asserts the element counts and the tuple
+alignment directly; its absence is what let the phantom through, since the audit
+previously checked only that the packing *names* appeared.
 
-Either makes `count ≤ 256` an invariant of every row and collapses MAIN 3's
-disjunction to its first branch.
+## Assumptions
+
+Obligations on the **caller**, not checks this chip performs. Real spec chapters
+render this section (`render_chip_assumptions`); its absence from an earlier draft
+is why two caller obligations got mislabelled as receiver checks in §3.
+
+| id | assumption | discharged by | status |
+|---|---|---|---|
+| **A1** | the head row's `src`/`dst` limbs are 32-bit words | `spec/src/memw.toml`: `[[assumptions]] IS_WORD[base_address[i]]`. `memw.rs:257-262` justifies its own bound via *the CPU table*; DMA is a non-CPU sender, so that argument does not extend here | **not discharged locally.** Non-DMA-specific — every table sending an address depends on it |
+| **A2** | the head row's `count` limbs are 32-bit words | `spec/src/memw_register.toml`: `[[assumptions]] IS_WORD[val[i]]`. MEMW_R's only range-check interaction is on the timestamp delta | **not discharged locally.** The gate's `drop_reg32` control shows what it buys: without it the `count < 257` lookup caps only a residue class |
+| **A3** | `IS_WORD` on the timestamp, so `ts₀ + 2` does not carry into the high limb | `spec/src/memw.toml` timestamp assumption. In practice the CPU stride is 4 and `T = 4i+4`, so the `+1`/`+2` cannot carry — but nothing in the DMA AIR constrains it | not discharged locally; benign at the current stride |
+| **A4** | two DMA ecalls never share a timestamp | CPU timestamps strictly increase per instruction | holds by construction; it is what the `DmaNext` timestamp binding relies on |
+
+A1/A2 are the **head row only**. Every other row's limbs are derived (§7 above).
+Note the irony worth recording: the phantom R1 reported a gap on non-head rows,
+where the bus in fact pins the limbs, while the real obligation sits on the head
+row, which has no `DmaNext` receive at all.
+
+`spec/` has a broader problem here, flagged for the spec rather than this chip:
+`IS_WORD` appears across ~10 chapters **exclusively** inside `[[assumptions]]`,
+never as an interaction or template, and `spec/bitwise.typ` offers no 2³² table.
+So the spec asserts a range obligation for nearly every address, register value
+and timestamp in the VM without naming a discharger. That vacuum is what an
+earlier draft of this document filled by inventing the labels "MEMW-ADDR32" and
+"REG-32", and the next chip author will fill it the same way.
+
+## Padding
+
+Real spec chapters render this too (`render_chip_padding_table`), and the DMA
+padding row is not all-zero, so it is worth writing down.
+
+`generate_dma_trace` pads to the next power of two, minimum 4, with:
+
+| column | value | why |
+|---|---|---|
+| `mu` | 0 | kills all 23 bus interactions |
+| `first`, `end` | 0 | forced by constraint 4 once `mu = 0` |
+| `count` | 1 | constraints 9–10 are **unconditional**, so padding must satisfy them |
+| `tail` | 1 | so `step = 1` and `count_decr = count − 1 = 0` |
+| `src_incr`, `dst_incr` | 1 | so the low carry is 0 rather than −1 |
+| everything else | 0 | |
+
+The gate's completeness sweep pins exactly this row (`dma_ref.padding_columns`),
+and `dma_padding_row_cannot_claim_first_or_end` covers the one constraint that
+stops a padding row masquerading as a copy's head or terminal row.
 
 ## 8. Gate
 
@@ -260,11 +331,13 @@ field-exact multi-row chains with `DmaNext` as a free bijection rather than an
 assumed chain), eight negative controls, a field-level width audit, and an
 oracle-pinned completeness sweep over every length `0..256`.
 
-What it cannot see, stated in its own docstring: bus **wiring**, the memory
-consistency argument (hence overlap ordering), LogUp soundness, and trace
-length. The first is covered by `../audit_gate_transcription.py`, the second by
-the oracle's `write_before_read` mutant, the fourth by R1 above being reported
-rather than assumed away.
+What it cannot see, stated in its own docstring: bus **wiring** (covered by
+`../audit_gate_transcription.py`, whose §G now includes the packing/element-count
+claims whose absence let a phantom finding through), the memory consistency
+argument and hence overlap ordering (covered on the model side by the oracle's
+`write_before_read` mutant), and LogUp soundness (assumed). Layer 2's scope is
+also bounded: it proves the tiling among groups containing exactly **one head
+row**, because `ChainRow` does not model the timestamp that separates two calls.
 
 ### 8.1 The width audit — three bound-necessity results
 
@@ -285,44 +358,100 @@ the forgery at `count = 3` and was wrong — it is not reachable there.
 
 ## 9. Gate results
 
-Run 2026-08-11, z3 5.0.0, full board (no `--quick`):
+Verbatim from `python3 z3_dma_verify.py` (full board, no `--quick`), 2026-08-11,
+z3 5.0.0 — **pasted, not retyped**. An earlier draft hand-condensed this block
+while the document argued that a gate nobody can rerun is a claim rather than
+evidence; a retyped transcript is the wrong shape for that argument.
 
 ```
-LAYER 1
-  MAIN 0  row == oracle row                 -> unsat
-  MAIN 1  end <=> count == 0                -> unsat
-  MAIN 2  count wraps only on terminal row  -> unsat
-  MAIN 2b one-byte row has zero lanes 1..7  -> unsat
-  MAIN 2c one ecall asks for <= 256 bytes   -> unsat
-  MAIN 3  successor honest OR count > MAX   -> unsat
-  MAIN 3b R1 alias is reachable             -> sat     (the residual, exhibited)
-LAYER 2
-  CHAIN   2/3/4/5 rows, any balanced structure -> unsat
-  CHAIN-F 2/3 rows, field-exact                -> unsat
-NEGATIVE CONTROLS (all sat, 8/8)
-  drop_halfword_count_decr, drop_halfword_src_incr, drop_zero_end,
-  drop_lt_tail, drop_no_overflow_src, drop_tail_lane_zero,
-  drop_lt_bound, drop_reg32
-WIDTH AUDIT
-  Zero sum identity       bounds present -> unsat   DROPPED -> sat
-  no-overflow             bounds present -> unsat   DROPPED -> sat
-  truncation at count=7   LT pin present -> unsat   DROPPED -> sat
-COMPLETENESS
-  5410 honest rows over 257 lengths, all accepted
-OVERALL: PASS
+============================================================================
+DMA memcpy chip -- z3 gate
+============================================================================
+  legend: unsat = proved | sat = counterexample found | unknown = TIMED OUT (failure)
+
+=== LAYER 1: field-exact rows ===
+  MAIN 0  row == oracle row                 -> unsat   (want unsat)
+  MAIN 1  end <=> count == 0                -> unsat   (want unsat)
+  MAIN 2  count wraps only on terminal row  -> unsat   (want unsat)
+  MAIN 2b one-byte row has zero lanes 1..7  -> unsat   (want unsat)
+  MAIN 2c one ecall asks for <= 256 bytes  -> unsat   (want unsat)
+  MAIN 3  successor exact + well formed     -> unsat   (want unsat)
+
+=== LAYER 2: chain structure, DmaNext as a free bijection ===
+  CHAIN   2 rows, any balanced structure   -> unsat   (want unsat)
+  CHAIN   3 rows, any balanced structure   -> unsat   (want unsat)
+  CHAIN   4 rows, any balanced structure   -> unsat   (want unsat)
+  CHAIN   5 rows, any balanced structure   -> unsat   (want unsat)
+  CHAIN-F 2 rows, field-exact              -> unsat   (want unsat)
+  CHAIN-F 3 rows, field-exact              -> unsat   (want unsat)
+
+  -- Layer 2 controls --
+  positive: 2-row premise set satisfiable  -> sat   (want sat)
+  positive: 3-row premise set satisfiable  -> sat   (want sat)
+  positive: 4-row premise set satisfiable  -> sat   (want sat)
+  positive: 2-row field-exact premise set   -> sat   (want sat)
+  negative: drop `count` from the tuple       -> sat   (want sat)
+  negative: drop `src` from the tuple       -> sat   (want sat)
+  negative: drop `dst` from the tuple       -> sat   (want sat)
+
+=== NEGATIVE CONTROLS -- drop one premise, expect a forgery ===
+  drop_halfword_count_decr     -> sat   (want sat)
+  drop_halfword_src_incr       -> sat   (want sat)
+  drop_zero_end                -> sat   (want sat)
+  drop_lt_tail                 -> sat   (want sat)
+  drop_no_overflow_src         -> sat   (want sat)
+  drop_tail_lane_zero          -> sat   (want sat)
+  drop_lt_bound                -> sat   (want sat)
+  drop_reg32                   -> sat   (want sat)
+  drop_halfword_dst_incr       -> sat   (want sat)
+  drop_no_overflow_dst         -> sat   (want sat)
+
+=== WIDTH AUDIT -- bound necessity at the boundary (field level) ===
+  Zero sum identity, bounds present        -> unsat  (want unsat)
+  Zero sum identity, bounds DROPPED        -> sat    (want sat)
+  no-overflow, halfword bounds present     -> unsat  (want unsat)
+  no-overflow, halfword bounds DROPPED     -> sat    (want sat)
+  truncation at count=7, LT pin present    -> unsat  (want unsat)
+  truncation at count=7, LT pin DROPPED    -> sat    (want sat)
+
+=== POSITIVE CONTROLS -- oracle-pinned completeness sweep ===
+  PASS  5410 honest rows over 257 lengths, all accepted
+
+============================================================================
+VERDICT
+============================================================================
+  layer 1 (row semantics)              : True
+  layer 2 (chain structure)            : True
+  layer 2 controls (pos + neg)         : True
+  negative controls all SAT            : True   (10/10)
+  width audit (bound necessity)        : True
+  completeness sweep SAT               : True
+
+  Scope: Layer 2 proves the tiling among groups with exactly ONE head
+  row. Two DMA calls are separated by the `ts` in both DmaNext tuples,
+  which `ChainRow` does not model -- see `check_chain`'s docstring and
+  the textual guard in ../audit_gate_transcription.py.
+
+  OVERALL: PASS
 ```
 
 ### What is and isn't proven
 
 **Proven.** Given the modelled contracts (`IsHalfword`, `Zero` including its
-domain, `Alu[LT]` as `lt.rs`'s own constraints, MEMW-ADDR32, REG-32) and given
-that bus balance means multiset equality: every satisfying assignment of one
-DMA row does what the oracle says; the only bus-balanced multi-row structure at
+domain, `Alu[LT]` as `lt.rs`'s own constraints, the `DmaNext` per-limb binding of
+§7) and assumptions A1–A4, and given that bus balance means multiset equality:
+every satisfying assignment of one DMA row does what the oracle says; among
+groups with exactly one head row, the only bus-balanced multi-row structure at
 depth ≤ 5 is a single chain tiling `[src, src+n)` exactly once with the greedy
-widths; every one of the eight range checks and lookups involved is individually
-necessary; and the AIR accepts every honest trace for every length `0..256`.
+widths; every one of the **ten** range checks and lookups involved is individually
+necessary, each with a named forgery; Layer 2's own premise set is satisfiable and
+sensitive to each field of the bus tuple; and the AIR accepts every honest trace
+for every length `0..256`.
 
-**Not proven.** R1 (§7). The memory consistency argument and therefore overlap
-ordering. LogUp soundness. That the *Rust* implements this design — that is
-`../audit_gate_transcription.py`'s 83 textual claims plus the PR's own
-end-to-end prove/verify and forgery tests.
+**Not proven.** Assumptions A1–A4 (§Assumptions) — the head row's limb
+canonicality and the timestamp bound, all of which are caller obligations the
+spec states and no chip discharges locally. The memory consistency argument and
+therefore overlap ordering for unaligned 8-byte accesses. LogUp soundness. The
+multi-call case (Layer 2 models one head row). And that the *Rust* implements this
+design — that is `../audit_gate_transcription.py`'s 100 textual claims plus the
+PR's own end-to-end prove/verify and forgery tests.
