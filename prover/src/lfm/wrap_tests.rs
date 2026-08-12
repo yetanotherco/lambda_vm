@@ -266,6 +266,67 @@ fn the_wrap_proves_and_verifies() {
     wrap_run(super::proof_fixture::fixture_options());
 }
 
+/// ★ SLICE 0's GPU-dispatch census (`thoughts/shared/gpu-recursion/EXPLORATION.md`,
+/// Stage 0). The min-preset wrap proved once, with the process-global GPU call
+/// counters reset right before `lfm_prove` — after the inner epoch is built,
+/// because building it proves an RV64 continuation whose own GPU traffic (the
+/// VM's preprocessed tables clear the size gate even for a 16-cycle epoch) would
+/// otherwise pollute the machine's numbers. Prints every counter rather than
+/// asserting floors: this is the falsification harness for the GPU map, and the
+/// predictions are the document's to state, not the test's to freeze. Needs
+/// `--test-threads=1` (the counters are process-global) and, like the rest of
+/// the cuda suite, `--ignored` so the no-GPU CI path keeps skipping it.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore]
+fn the_wrap_reports_gpu_counters() {
+    use stark::gpu_lde as g;
+
+    let e = super::epoch_tests::real_epoch_with(super::proof_fixture::fixture_options());
+    let program = super::epoch_tests::epoch_program(&e, true);
+    let arenas = super::epoch_tests::epoch_arena_words(&e, true);
+    let opts = wrap_options();
+    let artifacts = build_artifacts(&program, &opts);
+    println!("   chip log-heights: {:?}", artifacts.log_heights);
+
+    g::reset_all_gpu_call_counters();
+    let t = Instant::now();
+    let proved = lfm_prove(&program, &artifacts, &arenas, &opts).expect("the wrap must prove");
+    let prove_secs = t.elapsed().as_secs_f64();
+    println!(
+        "\n★ GPU DISPATCH COUNTERS (min-preset wrap, lfm_prove only, {prove_secs:.1}s):\n   \
+         lde {} / leaf_hash {} / merkle_tree {} / extend_halves {} / logup {}\n   \
+         composition {} / comp_poly_tree {} / parts_lde {} / bary {} / deep {}\n   \
+         batch_invert {} / fri {} / opening_gather {} / device_only {}",
+        g::gpu_lde_calls(),
+        g::gpu_leaf_hash_calls(),
+        g::gpu_merkle_tree_calls(),
+        g::gpu_extend_halves_calls(),
+        g::gpu_logup_calls(),
+        g::gpu_composition_calls(),
+        g::gpu_comp_poly_tree_calls(),
+        g::gpu_parts_lde_calls(),
+        g::gpu_bary_calls(),
+        g::gpu_deep_calls(),
+        g::gpu_batch_invert_calls(),
+        g::gpu_fri_calls(),
+        g::gpu_opening_gather_calls(),
+        g::gpu_device_only_calls(),
+    );
+    assert!(
+        verify_against(
+            &artifacts.roots,
+            &artifacts.program_id,
+            artifacts.keccak_rnd_chunks,
+            &proved.proof,
+            &proved.public_words,
+            &opts,
+            artifacts.hasher,
+        ),
+        "the wrap proof must verify"
+    );
+}
+
 /// ★ SLICE 1 (local rung) — the wrap at the inner proof's BLOWUP-8 GEOMETRY.
 ///
 /// The standing decision is that the inner proof is at blowup 8, and blowup is
