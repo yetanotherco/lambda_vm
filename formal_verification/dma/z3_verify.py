@@ -1,7 +1,7 @@
 """
 Formal (z3) assume-guarantee gate for the DMA memcpy chip (PR #874).
 
-Method (mirrors blake3-chip/z3_blake_verify.py from PR #903, branch feat/blake3-accelerator):
+Method (mirrors the keccak gate in `formal_verification/keccak/z3_verify.py` (PR #923)):
   * every committed column of the table is a FREE variable;
   * every eval constraint and every bus lookup becomes an equation over those
     free variables;
@@ -60,7 +60,7 @@ campaign hid a working forgery):
   Memw register read   the three argument registers' limbs are 32-bit and equal
                        the register file's value                  (REG-32)
 
-The last two are PREMISES THIS GATE DOES NOT PROVE. ../TRANSCRIPTION-AUDIT.md
+The last two are PREMISES THIS GATE DOES NOT PROVE. README.md
 records where each is discharged. Their control coverage is asymmetric, and
 saying so is the point:
 
@@ -79,7 +79,7 @@ WHAT THE GATE CANNOT SEE (same disclaimer shape as the BLAKE3 gate):
   * bus WIRING -- that the read tuple and the write tuple really reference the
     same `value` columns, that the timestamp offsets really are +1 and +2, that
     the multiplicities really are `mu - end` / `first` / `mu`. Those are textual
-    facts about `dma.rs`, checked by ../audit_gate_transcription.py.
+    facts about `dma.rs`, checked by audit_transcription.py.
   * the MEMW consistency argument, hence the snapshot semantics of an
     overlapping copy. That is a timestamp-ordering property of the memory
     table; the oracle's `write_before_read` mutant covers the model side.
@@ -88,8 +88,8 @@ WHAT THE GATE CANNOT SEE (same disclaimer shape as the BLAKE3 gate):
     exactly ONE head row; `ChainRow` carries no timestamp, and the `ts` in both
     `DmaNext` tuples is what separates two ecalls' rows.
 
-    python3 z3_dma_verify.py             # the full board
-    python3 z3_dma_verify.py --quick     # shorter completeness sweep and chains
+    python3 z3_verify.py             # the full board
+    python3 z3_verify.py --quick     # shorter completeness sweep and chains
 """
 
 import os
@@ -110,7 +110,7 @@ from z3 import (
 VALIDATED_Z3 = (5, 0, 0)
 
 # ---------------------------------------------------------------------------
-# Constants -- transcribed from the Rust; ../audit_gate_transcription.py
+# Constants -- transcribed from the Rust; audit_transcription.py
 # asserts each one against the source.
 # ---------------------------------------------------------------------------
 
@@ -563,7 +563,7 @@ def check_tail_lanes(prem=None, timeout_ms=180_000):
     AIR fact participating, and its negative control is `sat` for the same
     trivial reason. Kept because the property matters and the pair documents it,
     but it earns no credit as evidence about the constraint system -- the textual
-    equivalent in `../audit_gate_transcription.py` is the real guard.
+    equivalent in `audit_transcription.py` is the real guard.
 
     `value[1..8]` ride the MEMW tuple of a `w8 = 1 - tail` operation, so on a
     tail row the memory table must see the canonical one-byte encoding. Nothing
@@ -629,8 +629,7 @@ def completeness_sweep(prem=None, quick=False):
     the executor performs. This is also the gate's non-vacuity check -- if the
     constraint set were contradictory, every UNSAT above would be worthless.
     """
-    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                    "..", "dma-oracle"))
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import dma_ref as ref
 
     prem = prem or Premises()
@@ -742,7 +741,7 @@ def check_chain(n_rows, prem=None, timeout_ms=300_000, premises_only=False,
     **per timestamp**, not one per trace -- a real trace with k DMA calls has k
     head rows. `ChainRow` carries no timestamp field, so this check cannot
     express the property that separates two calls' rows (the `ts` in both
-    DmaNext tuples, which `../audit_gate_transcription.py` pins textually).
+    DmaNext tuples, which `audit_transcription.py` pins textually).
     What is proved is therefore: *among a group of active rows containing
     exactly one head row*, the only bus-balanced structure is the reference
     tiling. Dropping the single-head premise makes this `sat`, so the
@@ -1058,7 +1057,7 @@ def main():
     print("\n  Scope: Layer 2 proves the tiling among groups with exactly ONE head", flush=True)
     print("  row. Two DMA calls are separated by the `ts` in both DmaNext tuples,", flush=True)
     print("  which `ChainRow` does not model -- see `check_chain`'s docstring and", flush=True)
-    print("  the textual guard in ../audit_gate_transcription.py.", flush=True)
+    print("  the textual guard in audit_transcription.py.", flush=True)
     ok = (layer1_ok and layer2_ok and layer2_controls_ok and controls_ok
           and audit_ok and sweep_ok is True)
     if quick:

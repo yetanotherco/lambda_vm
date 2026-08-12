@@ -4,7 +4,7 @@ Validation harness for `dma_ref.py`, and the emitter for the canonical vectors.
 Five independent anchors. Each one SKIPs on its own if its dependency is
 missing; a missing anchor never cascades into the others and never lets the
 banner claim more than actually ran (the two harness defects the BLAKE3
-campaign had to fix after the fact -- see ../README.md).
+campaign had to fix after the fact -- see README.md).
 
   [1] libc `memmove`         -- an implementation nobody here wrote
   [2] CPython slice assign   -- a second such implementation
@@ -16,8 +16,8 @@ Anchors 1 and 2 pin the *semantics*. Anchor 3 is the one the chip depends on:
 it is the only check that the row sequence the AIR proves is the byte copy the
 guest asked for. Anchor 5 is what makes 1-4 worth running.
 
-    python3 test_oracle.py           # run everything, emit the vectors
-    python3 test_oracle.py --quick   # skip the exhaustive length sweeps
+    python3 test_ref.py           # run everything, emit the vectors
+    python3 test_ref.py --quick   # skip the exhaustive length sweeps
 """
 
 import ctypes
@@ -238,130 +238,6 @@ def anchor_chunking(quick: bool, chunk=None):
 
 
 # ---------------------------------------------------------------------------
-# [5] mutation sweep -- are the anchors above sensitive?
-# ---------------------------------------------------------------------------
-
-def _mutant_all_ones(n):
-    return [1] * n
-
-
-def _mutant_always_wide(n):
-    return [8] * ((n + 7) // 8)
-
-
-def _mutant_off_by_one_tail(n):
-    widths, remaining = [], n
-    while remaining != 0:
-        width = 8 if remaining > 8 else 1      # `>` instead of `>=`
-        widths.append(min(width, remaining))
-        remaining -= widths[-1]
-    return widths
-
-
-def _mutant_write_before_read(timestamp, dst, src, n, memory):
-    """Reads at T+2, writes at T+1: the copy stops being a snapshot."""
-    ops = ref.memw_ops(timestamp, dst, src, n, memory)
-    return [
-        op if op.is_register else
-        type(op)(op.is_register, op.address,
-                 timestamp + (1 if op.is_write else 2),
-                 op.width, op.value, op.is_write)
-        for op in ops
-    ]
-
-
-def _mutant_interleaved(timestamp, dst, src, n, memory):
-    """Each chunk written immediately after it is read (per-chunk timestamps)."""
-    out = [op for op in ref.memw_ops(timestamp, dst, src, n, memory) if op.is_register]
-    offset = 0
-    for i, width in enumerate(ref.row_widths(n)):
-        chunk = tuple(memory.get(src + offset + j, 0) for j in range(width))
-        out.append(ref.MemwOp(False, src + offset, timestamp + 1 + 2 * i, width, chunk, False))
-        out.append(ref.MemwOp(False, dst + offset, timestamp + 2 + 2 * i, width, chunk, True))
-        offset += width
-    return out
-
-
-def _mutant_no_snapshot(memory, dst, src, n):
-    """Copy byte-by-byte with no snapshot: correct for disjoint ranges, wrong for
-    a backward overlap. The control for anchors 1 and 2, which had none --
-    every other mutant targets `row_widths`/`memw_ops`/`chunk_ecalls`, i.e.
-    anchors 3 and 4, so nothing demonstrated the two external differentials can
-    fail at all."""
-    ref.validate(dst, src, n)
-    out = dict(memory)
-    for i in range(n):
-        out[dst + i] = out.get(src + i, 0)
-    return out
-
-
-def _mutant_chunk_257(dst, src, n):
-    calls, offset, remaining = [], 0, n
-    while remaining != 0:
-        c = min(remaining, MAX + 1)            # one byte over the executor's bound
-        calls.append((dst + offset, src + offset, c))
-        offset += c
-        remaining -= c
-    return calls
-
-
-def _with_memcpy_ref(replacement, run):
-    """Temporarily swap `dma_ref.memcpy_ref`, so anchors 1/2 can be mutated too.
-
-    Those two anchors call it through the module rather than via an injection
-    point, so unlike `row_widths`/`memw_ops` they cannot be parameterised.
-    """
-    original = ref.memcpy_ref
-    ref.memcpy_ref = replacement
-    try:
-        return run()
-    finally:
-        ref.memcpy_ref = original
-
-
-def anchor_mutations(quick: bool):
-    """Every mutant must be caught by the anchor it targets."""
-    mutants = [
-        ("memcpy_ref without snapshot", lambda: _with_memcpy_ref(
-            _mutant_no_snapshot, lambda: anchor_libc(quick))),
-        ("memcpy_ref without snapshot (slice)", lambda: _with_memcpy_ref(
-            _mutant_no_snapshot, lambda: anchor_slice_assign(quick))),
-        ("row_widths = all ones", lambda: anchor_row_level(quick, widths=_mutant_all_ones)),
-        ("row_widths = always wide", lambda: anchor_row_level(quick, widths=_mutant_always_wide)),
-        ("row_widths tail off by one", lambda: anchor_row_level(quick, widths=_mutant_off_by_one_tail)),
-        ("memw write before read", lambda: anchor_row_level(quick, ops=_mutant_write_before_read)),
-        ("memw read/write interleaved", lambda: anchor_row_level(quick, ops=_mutant_interleaved)),
-        ("chunk_ecalls at MAX+1", lambda: anchor_chunking(quick, chunk=_mutant_chunk_257)),
-    ]
-    survivors, not_run = [], []
-    for name, run in mutants:
-        try:
-            ok, _ = run()
-        except (AssertionError, ref.DmaRejected):
-            ok = False              # replay_memw or the executor bound caught it
-        # THREE states, not two. An anchor that SKIPped returns `ok is None`, and
-        # `if ok:` would score that as "caught" -- a mutant credited to a check
-        # that never ran. That is exactly the cascade this module's docstring
-        # promises cannot happen, and it bit the two `memcpy_ref` mutants, whose
-        # anchors (libc, CPython) are the ones that can be unavailable.
-        if ok is None:
-            not_run.append(name)
-            verdict = "NOT RUN (anchor skipped)"
-        elif ok:
-            survivors.append(name)
-            verdict = "SURVIVED (bad)"
-        else:
-            verdict = "caught"
-        print(f"      mutant {name:32s} -> {verdict}")
-    if survivors:
-        return False, f"{len(survivors)} mutant(s) survived: {', '.join(survivors)}"
-    if not_run:
-        return None, (f"{len(mutants) - len(not_run)}/{len(mutants)} caught; "
-                      f"{len(not_run)} not run: {', '.join(not_run)}")
-    return True, f"all {len(mutants)} mutants caught"
-
-
-# ---------------------------------------------------------------------------
 # Canonical vectors
 # ---------------------------------------------------------------------------
 
@@ -441,7 +317,7 @@ def emit_row_table(vectors):
         row|<src>|<dst>|<count>|<tail 0|1>|<width>
     """
     lines = [
-        "# Generated by test_oracle.py — do not edit by hand.",
+        "# Generated by test_ref.py — do not edit by hand.",
         "# Consumed by prover/src/tests/dma_tests.rs via include_str!.",
         "# vector|name|dst|src|count|data_rows      row|src|dst|count|tail|width",
     ]
@@ -460,6 +336,12 @@ def emit_row_table(vectors):
 
 # ---------------------------------------------------------------------------
 
+def _anchor_mutations(quick: bool):
+    """Delegates to `tamper_test.py`, imported late to avoid a circular import."""
+    from tamper_test import anchor_mutations
+    return anchor_mutations(quick)
+
+
 def main():
     quick = "--quick" in sys.argv
     print("=" * 72)
@@ -471,7 +353,7 @@ def main():
         ("[2] CPython slice assignment", anchor_slice_assign),
         ("[3] row/bus level <-> byte level", anchor_row_level),
         ("[4] guest stub chunking", anchor_chunking),
-        ("[5] mutation sweep", anchor_mutations),
+        ("[5] tamper tests (tamper_test.py)", _anchor_mutations),
     ]
     results = {}
     for name, run in anchors:

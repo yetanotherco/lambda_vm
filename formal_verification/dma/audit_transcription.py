@@ -2,7 +2,7 @@
 Executable half of the transcription audit: does the gate model the Rust that
 was actually written?
 
-The gate (`dma-chip/z3_dma_verify.py`) proves things about a MODEL. Everything
+The gate (`z3_verify.py`) proves things about a MODEL. Everything
 it proves is worthless if the model and `prover/src/tables/dma.rs` have drifted,
 and the dangerous drift direction is a model STRONGER than the object it
 models -- it yields UNSAT where the real table is forgeable, and no positive
@@ -35,7 +35,7 @@ It is deliberately textual (regex over the source) rather than a Rust test: the
 point is to catch a change in `dma.rs` that nobody reflected here, and a Rust
 test would be edited in the same commit as the code it guards.
 
-    python3 audit_gate_transcription.py [--repo /path/to/lambda_vm]
+    python3 audit_transcription.py [--repo /path/to/lambda_vm]
 """
 
 import os
@@ -43,15 +43,14 @@ import re
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-#: This script lives at `docs/verification/dma/`, so the repo root is three up.
-DEFAULT_REPO = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
+#: This script lives at `formal_verification/dma/`, so the repo root is two up.
+DEFAULT_REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
 
-sys.path.insert(0, os.path.join(HERE, "dma-oracle"))
-sys.path.insert(0, os.path.join(HERE, "dma-chip"))
+sys.path.insert(0, HERE)
 import dma_ref as ref                                             # noqa: E402
 
 #: Gate constants this audit cross-checks, duplicated rather than imported:
-#: importing `z3_dma_verify` drags in `z3`, and EVERY claim here is textual and
+#: importing `z3_verify` drags in `z3`, and EVERY claim here is textual and
 #: needs no solver -- so a machine without z3 can still run the whole audit.
 #: The duplication is the cost of that, and it is a real one: nothing detects
 #: drift between these values and the gate's. They are all derived constants
@@ -597,18 +596,17 @@ def audit_fixture(a, repo):
          "`generate_dma_trace` only formats an already-decomposed op list into "
          "columns, so asserting against it proves nothing about the row split")
     a.ok("the emitted row table exists and is non-trivial",
-         len(read_raw(repo, "docs/verification/dma/dma-oracle/"
-                            "canonical_dma_rows.txt").splitlines()) > 20)
+         len(read_raw(repo, "formal_verification/dma/canonical_dma_rows.txt").splitlines()) > 20)
 
     # FRESHNESS, not just presence. Greping for `include_str!` proves the Rust
     # reads a fixture; it does not prove the fixture is what the current oracle
-    # emits. And `test_oracle.py` regenerates it only on a fully-green run, so an
+    # emits. And `test_ref.py` regenerates it only on a fully-green run, so an
     # oracle regression leaves a stale fixture behind with the Rust test still
     # green. Re-derive the table here and compare.
-    sys.path.insert(0, os.path.join(repo, "docs/verification/dma/dma-oracle"))
-    committed = read_raw(repo, "docs/verification/dma/dma-oracle/canonical_dma_rows.txt")
+    sys.path.insert(0, os.path.join(repo, "formal_verification/dma"))
+    committed = read_raw(repo, "formal_verification/dma/canonical_dma_rows.txt")
     try:
-        import test_oracle as harness
+        import test_ref as harness
         rows = []
         for name, dst, src, n in harness.CANONICAL_CASES:
             memory = {src + i: (i * 7 + 3) & 0xFF for i in range(n)}
@@ -620,10 +618,10 @@ def audit_fixture(a, repo):
                             f"{1 if r.tail else 0}|{r.width}")
         a.ok("the checked-in row table matches what the oracle emits today",
              [line for line in committed.splitlines() if not line.startswith("#")] == rows,
-             "regenerate with `python3 dma-oracle/test_oracle.py`")
+             "regenerate with `python3 test_ref.py`")
     except ImportError as exc:
         a.ok("the oracle harness is importable so the fixture can be re-derived",
-             False, f"could not import test_oracle: {exc}")
+             False, f"could not import test_ref: {exc}")
 
 
 # ---------------------------------------------------------------------------

@@ -17,7 +17,7 @@ checked against each other rather than sharing a helper:
 `replay_memw` runs level 3 back down to level 1, which is what makes the row
 decomposition falsifiable: `replay_memw(memw_ops(...)) == memcpy_ref(...)` must
 hold for every length and every overlap configuration, and the mutants in
-`test_oracle.py` must break it.
+`test_ref.py` must break it.
 
 `chunk_ecalls` is the fourth level above all of these: the guest's strong
 `memcpy` symbol (`syscalls/src/syscalls.rs`) is a loop that issues one ecall per
@@ -197,7 +197,7 @@ def memw_ops(timestamp: int, dst: int, src: int, n: int, memory: dict) -> list:
 
     Order matters only through the timestamps: registers at T, *all* source
     reads at T+1, *all* destination writes at T+2. The two-phase split is what
-    makes overlap well defined -- see `test_oracle.py`'s `write_before_read`
+    makes overlap well defined -- see `test_ref.py`'s `write_before_read`
     mutant, which is caught only by the overlapping cases.
     """
     validate(dst, src, n)

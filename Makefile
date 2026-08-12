@@ -631,16 +631,16 @@ fmt:
 
 # Run clippy + fmt check (used by CI)
 .PHONY: verify-dma
-verify-dma: ## Run the DMA memcpy verification campaign (docs/verification/dma)
+verify-dma: ## Run the DMA memcpy formal-verification gate (formal_verification/dma)
 	@# Oracle anchors + vector emission, the z3 soundness gate, and the
 	@# transcription audit. Needs `pip install z3-solver` (validated on 5.0.0);
 	@# the audit alone needs no solver.
 	@# Exit codes: 1 = failure (abort), 2 = ran but degraded (an external anchor
 	@# was unavailable). Only 1 should stop the run -- otherwise a machine without
 	@# a loadable libc would skip the audit and the gate, neither of which needs it.
-	python3 docs/verification/dma/dma-oracle/test_oracle.py || [ $$? -eq 2 ]
-	python3 docs/verification/dma/audit_gate_transcription.py
-	python3 docs/verification/dma/dma-chip/z3_dma_verify.py
+	python3 formal_verification/dma/test_ref.py || [ $$? -eq 2 ]
+	python3 formal_verification/dma/audit_transcription.py
+	python3 formal_verification/dma/z3_verify.py
 
 lint:
 	cargo fmt --check --all

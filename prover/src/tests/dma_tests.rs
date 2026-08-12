@@ -133,7 +133,7 @@ fn dma_bus_interactions_count() {
 /// The canonical vectors, embedded from the validated oracle so the fixture
 /// cannot drift from the model that generated it.
 ///
-/// `docs/verification/dma/dma-oracle/test_oracle.py` emits this file next to the
+/// `formal_verification/dma/test_ref.py` emits this file next to the
 /// richer JSON; it is anchored on libc `memmove`, CPython slice assignment, and a
 /// row-level vs byte-level replay equivalence over every length 0..=256.
 /// Embedding it — rather than hand-transcribing — is what makes a regenerated
@@ -143,7 +143,7 @@ fn dma_bus_interactions_count() {
 ///   `vector|<name>|<dst>|<src>|<count>|<data_rows>`
 ///   `row|<src>|<dst>|<count>|<tail 0|1>|<width>`
 const CANONICAL_ROWS: &str =
-    include_str!("../../../docs/verification/dma/dma-oracle/canonical_dma_rows.txt");
+    include_str!("../../../formal_verification/dma/canonical_dma_rows.txt");
 
 /// One case parsed out of the canonical row table.
 struct OracleVector {
