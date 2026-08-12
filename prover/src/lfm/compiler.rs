@@ -14,8 +14,6 @@
 //! at registry-build time (Milestone B) through the same pipeline the static
 //! tables use.
 
-use std::collections::HashMap;
-
 use crate::tables::types::FE;
 
 use super::builder::{ArenaSchema, LfmProgramSource};
@@ -34,23 +32,70 @@ pub struct ColumnGroup {
     pub data: Vec<FE>,
 }
 
-impl ColumnGroup {
-    fn from_rows(width: usize, rows: Vec<Vec<FE>>) -> Self {
-        let real_rows = rows.len();
-        let padded = padded_rows(real_rows);
-        let mut data = vec![FE::zero(); padded * width];
-        for (r, row) in rows.into_iter().enumerate() {
-            debug_assert_eq!(row.len(), width);
-            data[r * width..(r + 1) * width].clone_from_slice(&row);
-        }
-        ColumnGroup {
+/// Accumulates one chip's rows directly into the flat row-major buffer the
+/// finished [`ColumnGroup`] holds.
+///
+/// The emitter used to collect `Vec<Vec<FE>>` and copy it row by row. That kept
+/// two full materializations of every group alive at once and paid a heap
+/// allocation per instruction — and the per-row `Vec`s over-allocate badly,
+/// because they are grown by `extend`/`push` rather than sized: a 10-wide BALU
+/// row lands at capacity 18. Appending into one buffer removes the second
+/// materialization, the headers, the rounding waste and the ~271M malloc/free
+/// pairs.
+///
+/// Rows come out bit-identical: the same values are written at the same
+/// row-major offsets, and the tail is zero-padded to the same height.
+struct ColumnGroupBuilder {
+    width: usize,
+    real_rows: usize,
+    data: Vec<FE>,
+}
+
+impl ColumnGroupBuilder {
+    fn new(width: usize) -> Self {
+        ColumnGroupBuilder {
             width,
-            real_rows,
-            padded_rows: padded,
-            data,
+            real_rows: 0,
+            data: Vec::new(),
         }
     }
 
+    /// The ordinal the next row will take. `LFM_KECCAK` binds it into the row
+    /// as a structural tag, so it has to be read before [`Self::open_row`].
+    fn next_row(&self) -> usize {
+        self.real_rows
+    }
+
+    /// Append a zero-filled row, returning its base offset for [`Self::set`].
+    fn open_row(&mut self) -> usize {
+        let base = self.data.len();
+        self.data.resize(base + self.width, FE::zero());
+        self.real_rows += 1;
+        base
+    }
+
+    fn set(&mut self, base: usize, col: usize, v: FE) {
+        debug_assert!(
+            col < self.width,
+            "column {col} outside width {}",
+            self.width
+        );
+        self.data[base + col] = v;
+    }
+
+    fn finish(mut self) -> ColumnGroup {
+        let padded = padded_rows(self.real_rows);
+        self.data.resize(padded * self.width, FE::zero());
+        ColumnGroup {
+            width: self.width,
+            real_rows: self.real_rows,
+            padded_rows: padded,
+            data: self.data,
+        }
+    }
+}
+
+impl ColumnGroup {
     pub fn at(&self, row: usize, col: usize) -> &FE {
         &self.data[row * self.width + col]
     }
@@ -144,7 +189,7 @@ pub fn compile(source: LfmProgramSource) -> LfmProgram {
 
     // Pass 1: occupancy + multiplicity backfill.
     let mut written = vec![false; num_addrs as usize];
-    let take = |addr: Addr, written: &mut Vec<bool>, counts: &mut HashMap<Addr, u64>| -> u64 {
+    let take = |addr: Addr, written: &mut Vec<bool>, counts: &mut [u64]| -> u64 {
         let slot = written
             .get_mut(addr.0 as usize)
             .unwrap_or_else(|| panic!("LFM compiler invariant: address {} out of range", addr.0));
@@ -152,7 +197,9 @@ pub fn compile(source: LfmProgramSource) -> LfmProgram {
             panic!("LFM compiler invariant: address {} written twice", addr.0);
         }
         *slot = true;
-        counts.remove(&addr).unwrap_or(0)
+        // Taking (not reading) is what drains the counter, so the emptiness
+        // check below still means "every read had a writer".
+        core::mem::take(&mut counts[addr.0 as usize])
     };
     for instr in &mut instrs {
         match instr {
@@ -205,10 +252,21 @@ pub fn compile(source: LfmProgramSource) -> LfmProgram {
         }
     }
     assert!(
-        read_counts.is_empty(),
+        read_counts.iter().all(|&c| c == 0),
         "LFM compiler invariant: read-count map not drained after backfill — reads of never-written addresses: {:?}",
-        read_counts.keys().collect::<Vec<_>>()
+        read_counts
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| **c != 0)
+            .map(|(a, _)| Addr(a as u64))
+            .collect::<Vec<_>>()
     );
+
+    // Both are dead from here on and together outweigh the groups being built.
+    // Dropping them explicitly keeps the emitter's peak off the sum of the two
+    // materializations — the scope would otherwise hold them to the end.
+    drop(read_counts);
+    drop(written);
 
     let groups = emit_column_groups(&instrs, public_len);
 
@@ -229,24 +287,27 @@ fn fe(v: u64) -> FE {
 /// Pass 2: partition instructions per chip (program order preserved) and lay
 /// out each chip's instruction fields per [`super::layout`].
 fn emit_column_groups(instrs: &[Instr], _public_len: u32) -> LfmColumnGroups {
-    let mut const_rows = Vec::new();
-    let mut balu_rows = Vec::new();
-    let mut xalu_rows = Vec::new();
-    let mut select_rows = Vec::new();
-    let mut bitdec_rows = Vec::new();
-    let mut hash_rows = Vec::new();
-    let mut keccak_rows: Vec<Vec<FE>> = Vec::new();
-    let mut lanes_rows = Vec::new();
-    let mut hint_rows = Vec::new();
-    let mut public_rows = Vec::new();
+    let mut const_ = ColumnGroupBuilder::new(layout::const_::PREP_WIDTH);
+    let mut balu = ColumnGroupBuilder::new(layout::balu::PREP_WIDTH);
+    let mut xalu = ColumnGroupBuilder::new(layout::xalu::PREP_WIDTH);
+    let mut select = ColumnGroupBuilder::new(layout::select::PREP_WIDTH);
+    let mut bitdec = ColumnGroupBuilder::new(layout::bitdec::PREP_WIDTH);
+    let mut hash = ColumnGroupBuilder::new(layout::hash::PREP_WIDTH);
+    let mut keccak = ColumnGroupBuilder::new(layout::keccak::PREP_WIDTH);
+    let mut lanes = ColumnGroupBuilder::new(layout::lanes::PREP_WIDTH);
+    let mut hint = ColumnGroupBuilder::new(layout::hint::PREP_WIDTH);
+    let mut public = ColumnGroupBuilder::new(layout::public::PREP_WIDTH);
 
     for instr in instrs {
         match instr {
             Instr::Const { out, value, mult } => {
-                let mut row = vec![fe(out.0)];
-                row.extend(value.iter().cloned());
-                row.push(fe(*mult));
-                const_rows.push(row);
+                use layout::const_ as c;
+                let r = const_.open_row();
+                const_.set(r, c::ADDR, fe(out.0));
+                for (i, v) in value.iter().enumerate() {
+                    const_.set(r, c::V0 + i, *v);
+                }
+                const_.set(r, c::MULT, fe(*mult));
             }
             Instr::BaseAlu {
                 op,
@@ -256,19 +317,21 @@ fn emit_column_groups(instrs: &[Instr], _public_len: u32) -> LfmColumnGroups {
                 c,
                 mult,
             } => {
-                let mut row = vec![fe(a.0), fe(b.0), fe(c.0), fe(out.0)];
-                let mut sels = [FE::zero(), FE::zero(), FE::zero(), FE::zero(), FE::zero()];
-                let idx = match op {
-                    BaseOp::Add => 0,
-                    BaseOp::Sub => 1,
-                    BaseOp::Mul => 2,
-                    BaseOp::Div => 3,
-                    BaseOp::MulAdd => 4,
+                use layout::balu as l;
+                let r = balu.open_row();
+                balu.set(r, l::A_ADDR, fe(a.0));
+                balu.set(r, l::B_ADDR, fe(b.0));
+                balu.set(r, l::C_ADDR, fe(c.0));
+                balu.set(r, l::OUT_ADDR, fe(out.0));
+                let sel = match op {
+                    BaseOp::Add => l::SEL_ADD,
+                    BaseOp::Sub => l::SEL_SUB,
+                    BaseOp::Mul => l::SEL_MUL,
+                    BaseOp::Div => l::SEL_DIV,
+                    BaseOp::MulAdd => l::SEL_MULADD,
                 };
-                sels[idx] = FE::one();
-                row.extend(sels);
-                row.push(fe(*mult));
-                balu_rows.push(row);
+                balu.set(r, sel, FE::one());
+                balu.set(r, l::MULT, fe(*mult));
             }
             Instr::ExtAlu {
                 op,
@@ -278,20 +341,22 @@ fn emit_column_groups(instrs: &[Instr], _public_len: u32) -> LfmColumnGroups {
                 c,
                 mult,
             } => {
-                let mut row = vec![fe(a.0), fe(b.0), fe(c.0), fe(out.0)];
-                let mut sels = vec![FE::zero(); layout::xalu::NUM_SELECTORS];
-                let idx = match op {
-                    ExtOp::Add => 0,
-                    ExtOp::Sub => 1,
-                    ExtOp::Mul => 2,
-                    ExtOp::Div => 3,
-                    ExtOp::MulAdd => 4,
-                    ExtOp::MulBase => 5,
+                use layout::xalu as l;
+                let r = xalu.open_row();
+                xalu.set(r, l::A_ADDR, fe(a.0));
+                xalu.set(r, l::B_ADDR, fe(b.0));
+                xalu.set(r, l::C_ADDR, fe(c.0));
+                xalu.set(r, l::OUT_ADDR, fe(out.0));
+                let sel = match op {
+                    ExtOp::Add => l::SEL_ADD,
+                    ExtOp::Sub => l::SEL_SUB,
+                    ExtOp::Mul => l::SEL_MUL,
+                    ExtOp::Div => l::SEL_DIV,
+                    ExtOp::MulAdd => l::SEL_MULADD,
+                    ExtOp::MulBase => l::SEL_MULBASE,
                 };
-                sels[idx] = FE::one();
-                row.extend(sels);
-                row.push(fe(*mult));
-                xalu_rows.push(row);
+                xalu.set(r, sel, FE::one());
+                xalu.set(r, l::MULT, fe(*mult));
             }
             Instr::Select {
                 bit,
@@ -302,26 +367,26 @@ fn emit_column_groups(instrs: &[Instr], _public_len: u32) -> LfmColumnGroups {
                 mult_l,
                 mult_r,
             } => {
-                select_rows.push(vec![
-                    fe(bit.0),
-                    fe(in_l.0),
-                    fe(in_r.0),
-                    fe(out_l.0),
-                    fe(out_r.0),
-                    fe(*mult_l),
-                    fe(*mult_r),
-                    FE::one(),
-                ]);
+                use layout::select as l;
+                let r = select.open_row();
+                select.set(r, l::BIT_ADDR, fe(bit.0));
+                select.set(r, l::INL_ADDR, fe(in_l.0));
+                select.set(r, l::INR_ADDR, fe(in_r.0));
+                select.set(r, l::OUTL_ADDR, fe(out_l.0));
+                select.set(r, l::OUTR_ADDR, fe(out_r.0));
+                select.set(r, l::MULT_L, fe(*mult_l));
+                select.set(r, l::MULT_R, fe(*mult_r));
+                select.set(r, l::IS_REAL, FE::one());
             }
             Instr::BitDec { input, bits } => {
-                let mut row = vec![FE::zero(); layout::bitdec::PREP_WIDTH];
-                row[layout::bitdec::IN_ADDR] = fe(input.0);
-                row[layout::bitdec::IS_REAL] = FE::one();
+                use layout::bitdec as l;
+                let r = bitdec.open_row();
+                bitdec.set(r, l::IN_ADDR, fe(input.0));
+                bitdec.set(r, l::IS_REAL, FE::one());
                 for (i, (addr, mult)) in bits.iter().enumerate() {
-                    row[layout::bitdec::bit_addr(i)] = fe(addr.0);
-                    row[layout::bitdec::bit_mult(i)] = fe(*mult);
+                    bitdec.set(r, l::bit_addr(i), fe(addr.0));
+                    bitdec.set(r, l::bit_mult(i), fe(*mult));
                 }
-                bitdec_rows.push(row);
             }
             Instr::Hash {
                 mode,
@@ -332,94 +397,105 @@ fn emit_column_groups(instrs: &[Instr], _public_len: u32) -> LfmColumnGroups {
                 // One-hot over the three modes. The AIR pins only the SUM to a
                 // bit; exactly-one-of is this emitter's job, re-checked by the
                 // admission validator.
-                let mut row = vec![FE::zero(); layout::hash::PREP_WIDTH];
-                row[layout::hash::IN_ADDR0] = fe(ins[0].0);
-                row[layout::hash::IN_ADDR1] = fe(ins[1].0);
-                row[layout::hash::IN_ADDR2] = fe(ins[2].0);
-                row[layout::hash::OUT_ADDR0] = fe(outs[0].0);
-                row[layout::hash::OUT_ADDR1] = fe(outs[1].0);
-                row[layout::hash::OUT_ADDR2] = fe(outs[2].0);
-                row[match mode {
-                    HashMode::Compress => layout::hash::MODE_C,
-                    HashMode::Transcript => layout::hash::MODE_T,
-                    HashMode::Leaf => layout::hash::MODE_L,
-                    HashMode::Permute => layout::hash::MODE_P,
-                }] = FE::one();
-                row[layout::hash::MULT0] = fe(mults[0]);
-                row[layout::hash::MULT1] = fe(mults[1]);
-                row[layout::hash::MULT2] = fe(mults[2]);
-                hash_rows.push(row);
+                use layout::hash as l;
+                let r = hash.open_row();
+                hash.set(r, l::IN_ADDR0, fe(ins[0].0));
+                hash.set(r, l::IN_ADDR1, fe(ins[1].0));
+                hash.set(r, l::IN_ADDR2, fe(ins[2].0));
+                hash.set(r, l::OUT_ADDR0, fe(outs[0].0));
+                hash.set(r, l::OUT_ADDR1, fe(outs[1].0));
+                hash.set(r, l::OUT_ADDR2, fe(outs[2].0));
+                let mode_col = match mode {
+                    HashMode::Compress => l::MODE_C,
+                    HashMode::Transcript => l::MODE_T,
+                    HashMode::Leaf => l::MODE_L,
+                    HashMode::Permute => l::MODE_P,
+                };
+                hash.set(r, mode_col, FE::one());
+                hash.set(r, l::MULT0, fe(mults[0]));
+                hash.set(r, l::MULT1, fe(mults[1]));
+                hash.set(r, l::MULT2, fe(mults[2]));
             }
             Instr::KeccakF(op) => {
                 use layout::keccak as k;
-                let mut row = vec![FE::zero(); k::PREP_WIDTH];
                 // The tag is the row ordinal, so uniqueness is structural and
                 // the prover has no say (it is preprocessed data). See
                 // `layout::keccak::tag_for_row`.
-                let tag = k::tag_for_row(keccak_rows.len());
-                row[k::TAG_LO] = fe(tag & 0xFFFF_FFFF);
-                row[k::TAG_HI] = fe(tag >> 32);
+                let tag = k::tag_for_row(keccak.next_row());
+                let r = keccak.open_row();
+                keccak.set(r, k::TAG_LO, fe(tag & 0xFFFF_FFFF));
+                keccak.set(r, k::TAG_HI, fe(tag >> 32));
                 for j in 0..k::NUM_WORDS {
-                    row[k::in_addr(j)] = fe(op.ins[j].0);
-                    row[k::out_addr(j)] = fe(op.outs[j].0);
-                    row[k::mult(j)] = fe(op.mults[j]);
+                    keccak.set(r, k::in_addr(j), fe(op.ins[j].0));
+                    keccak.set(r, k::out_addr(j), fe(op.outs[j].0));
+                    keccak.set(r, k::mult(j), fe(op.mults[j]));
                 }
                 if let Some(rev) = &op.rev {
                     for w in 0..k::DIGEST_WORDS {
-                        row[k::rev_addr(w)] = fe(rev.outs[w].0);
-                        row[k::rev_mult(w)] = fe(rev.mults[w]);
+                        keccak.set(r, k::rev_addr(w), fe(rev.outs[w].0));
+                        keccak.set(r, k::rev_mult(w), fe(rev.mults[w]));
                     }
                 }
                 match op.mode {
-                    KeccakMode::Permute => row[k::MODE_PERM] = FE::one(),
+                    KeccakMode::Permute => keccak.set(r, k::MODE_PERM, FE::one()),
                     KeccakMode::Absorb => {
-                        row[k::MODE_ABSORB] = FE::one();
+                        keccak.set(r, k::MODE_ABSORB, FE::one());
                         for j in 0..k::BLOCK_WORDS {
-                            row[k::block_addr(j)] = fe(op.block[j].0);
+                            keccak.set(r, k::block_addr(j), fe(op.block[j].0));
                         }
                     }
                 }
-                keccak_rows.push(row);
             }
             Instr::Hint { out, mult, .. } => {
-                hint_rows.push(vec![fe(out.0), fe(*mult)]);
+                use layout::hint as l;
+                let r = hint.open_row();
+                hint.set(r, l::OUT_ADDR, fe(out.0));
+                hint.set(r, l::MULT, fe(*mult));
             }
-            Instr::Pack { lanes, out, mult } => {
-                let mut row = vec![FE::zero(); layout::lanes::PREP_WIDTH];
-                row[layout::lanes::WORD_ADDR] = fe(out.0);
-                for (i, lane) in lanes.iter().enumerate() {
-                    row[layout::lanes::LANE_ADDR0 + i] = fe(lane.0);
+            Instr::Pack {
+                lanes: ls,
+                out,
+                mult,
+            } => {
+                use layout::lanes as l;
+                let r = lanes.open_row();
+                lanes.set(r, l::WORD_ADDR, fe(out.0));
+                for (i, lane) in ls.iter().enumerate() {
+                    lanes.set(r, l::LANE_ADDR0 + i, fe(lane.0));
                 }
-                row[layout::lanes::MODE_PACK] = FE::one();
-                row[layout::lanes::WORD_MULT] = fe(*mult);
-                lanes_rows.push(row);
+                lanes.set(r, l::MODE_PACK, FE::one());
+                lanes.set(r, l::WORD_MULT, fe(*mult));
             }
             Instr::Unpack { input, outs, mults } => {
-                let mut row = vec![FE::zero(); layout::lanes::PREP_WIDTH];
-                row[layout::lanes::WORD_ADDR] = fe(input.0);
+                use layout::lanes as l;
+                let r = lanes.open_row();
+                lanes.set(r, l::WORD_ADDR, fe(input.0));
                 for i in 0..4 {
-                    row[layout::lanes::LANE_ADDR0 + i] = fe(outs[i].0);
-                    row[layout::lanes::LANE_MULT0 + i] = fe(mults[i]);
+                    lanes.set(r, l::LANE_ADDR0 + i, fe(outs[i].0));
+                    lanes.set(r, l::LANE_MULT0 + i, fe(mults[i]));
                 }
-                row[layout::lanes::MODE_UNPACK] = FE::one();
-                lanes_rows.push(row);
+                lanes.set(r, l::MODE_UNPACK, FE::one());
             }
             Instr::Public { addr, index } => {
-                public_rows.push(vec![fe(addr.0), fe(*index as u64), FE::one()]);
+                use layout::public as l;
+                let r = public.open_row();
+                public.set(r, l::IN_ADDR, fe(addr.0));
+                public.set(r, l::INDEX, fe(*index as u64));
+                public.set(r, l::IS_REAL, FE::one());
             }
         }
     }
 
     LfmColumnGroups {
-        const_: ColumnGroup::from_rows(layout::const_::PREP_WIDTH, const_rows),
-        balu: ColumnGroup::from_rows(layout::balu::PREP_WIDTH, balu_rows),
-        xalu: ColumnGroup::from_rows(layout::xalu::PREP_WIDTH, xalu_rows),
-        select: ColumnGroup::from_rows(layout::select::PREP_WIDTH, select_rows),
-        bitdec: ColumnGroup::from_rows(layout::bitdec::PREP_WIDTH, bitdec_rows),
-        hash: ColumnGroup::from_rows(layout::hash::PREP_WIDTH, hash_rows),
-        keccak: ColumnGroup::from_rows(layout::keccak::PREP_WIDTH, keccak_rows),
-        lanes: ColumnGroup::from_rows(layout::lanes::PREP_WIDTH, lanes_rows),
-        hint: ColumnGroup::from_rows(layout::hint::PREP_WIDTH, hint_rows),
-        public: ColumnGroup::from_rows(layout::public::PREP_WIDTH, public_rows),
+        const_: const_.finish(),
+        balu: balu.finish(),
+        xalu: xalu.finish(),
+        select: select.finish(),
+        bitdec: bitdec.finish(),
+        hash: hash.finish(),
+        keccak: keccak.finish(),
+        lanes: lanes.finish(),
+        hint: hint.finish(),
+        public: public.finish(),
     }
 }

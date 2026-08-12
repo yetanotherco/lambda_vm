@@ -2,8 +2,6 @@
 //! validate → execute — plus the negative paths (validator rejections,
 //! executor runtime checks, compiler invariant panics).
 
-use std::collections::HashMap;
-
 use math::field::traits::IsPrimeField;
 
 use crate::tables::types::{FE, FEE, GoldilocksField};
@@ -511,7 +509,7 @@ fn validator_rejects_compress_ghost_slot_forgery() {
             },
         ],
         num_addrs: 4,
-        read_counts: HashMap::from([(Addr(0), 1), (Addr(1), 1), (Addr(2), 1)]),
+        read_counts: vec![1, 1, 1, 0],
         arena_schema: Default::default(),
         public_len: 1,
     };
@@ -584,7 +582,7 @@ fn compiler_panics_on_double_assignment() {
             },
         ],
         num_addrs: 1,
-        read_counts: HashMap::new(),
+        read_counts: vec![0],
         arena_schema: Default::default(),
         public_len: 0,
     };
@@ -594,8 +592,8 @@ fn compiler_panics_on_double_assignment() {
 
 #[test]
 fn compiler_panics_on_undrained_read_counts() {
-    let mut read_counts = HashMap::new();
-    read_counts.insert(Addr(7), 1); // a read of an address nothing writes
+    let mut read_counts = vec![0u64; 8];
+    read_counts[7] = 1; // a read of an address nothing writes
     let source = LfmProgramSource {
         instrs: vec![Instr::Const {
             out: Addr(0),

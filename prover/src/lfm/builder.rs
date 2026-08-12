@@ -88,7 +88,14 @@ pub struct ArenaSchema {
 pub struct LfmProgramSource {
     pub instrs: Vec<Instr>,
     pub num_addrs: u64,
-    pub read_counts: HashMap<Addr, u64>,
+    /// Reads per address, indexed BY address.
+    ///
+    /// Dense rather than a map because [`LfmBuilder::alloc`] hands out
+    /// addresses sequentially from zero, so the key space is exactly
+    /// `0..num_addrs` with no holes — a `HashMap` was paying ~16 bytes plus
+    /// control per entry, and its bucket array is the emitter's second-largest
+    /// allocation at production query counts.
+    pub read_counts: Vec<u64>,
     pub arena_schema: ArenaSchema,
     pub public_len: u32,
 }
@@ -98,7 +105,8 @@ pub struct LfmBuilder {
     instrs: Vec<Instr>,
     next_addr: u64,
     const_pool: HashMap<[u64; 4], Addr>,
-    read_counts: HashMap<Addr, u64>,
+    /// Parallel to the address space; see [`LfmProgramSource::read_counts`].
+    read_counts: Vec<u64>,
     arena_schema: ArenaSchema,
     public_len: u32,
 }
@@ -111,11 +119,14 @@ impl LfmBuilder {
     fn alloc(&mut self) -> Addr {
         let addr = Addr(self.next_addr);
         self.next_addr += 1;
+        // Keeps `read_counts` exactly as long as the address space, which is
+        // what lets `read` index instead of hash.
+        self.read_counts.push(0);
         addr
     }
 
     fn read(&mut self, addr: Addr) {
-        *self.read_counts.entry(addr).or_insert(0) += 1;
+        self.read_counts[addr.0 as usize] += 1;
     }
 
     // ---- constants (interned; one LFM_CONST row per distinct word) ----
