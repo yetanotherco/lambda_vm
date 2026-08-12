@@ -1434,9 +1434,15 @@ fn preprocessed_fixture() -> (
     };
 
     let trace = make_trace();
-    let commitment = <stark::prover::Prover<Gl, Ext3, ()> as IsStarkProver<Gl, Ext3, ()>>::
-        compute_precomputed_commitment_for_testing(&trace, &build(None), NUM_PRECOMPUTED)
-        .expect("the precomputed columns commit");
+    let commitment = <stark::prover::Prover<Gl, Ext3, ()> as IsStarkProver<
+        Gl,
+        Ext3,
+        (),
+        stark::config::KeccakStarkHash,
+    >>::compute_precomputed_commitment_for_testing(
+        &trace, &build(None), NUM_PRECOMPUTED
+    )
+    .expect("the precomputed columns commit");
 
     let air = build(Some(commitment));
     let mut trace = make_trace();

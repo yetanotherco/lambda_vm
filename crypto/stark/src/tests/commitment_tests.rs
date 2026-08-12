@@ -94,3 +94,59 @@ fn empty_and_zero_row_inputs_short_circuit() {
     assert!(keccak_leaves_bit_reversed_grouped(&zero_rows, ROWS_PER_LEAF).is_empty());
     assert!(commit_bit_reversed(&zero_rows, ROWS_PER_LEAF).is_none());
 }
+
+/// ★ The [`StarkHash`] two-element-leaf invariant, for the keccak configuration.
+///
+/// The prover commits FRI layers with `Pair` and the verifier authenticates
+/// those openings with `Batched` (`verify_fri_layer_openings` builds a
+/// two-element `Vec`). Nothing in the type system makes those agree — this is
+/// what says they do, so a second configuration that breaks it fails here
+/// rather than by rejecting every honest proof at its first FRI query.
+#[test]
+fn batched_and_pair_agree_on_a_two_element_leaf() {
+    use crate::config::{KeccakStarkHash, StarkHash};
+    use crypto::merkle_tree::traits::IsMerkleTreeBackend;
+
+    type Batched = <KeccakStarkHash as StarkHash>::Batched<F>;
+    type Pair = <KeccakStarkHash as StarkHash>::Pair<F>;
+
+    for (a, b) in [(0u64, 1u64), (7, 7), (u64::MAX - 1, 12345)] {
+        let (x, y) = (Felt::from(a), Felt::from(b));
+        assert_eq!(
+            <Batched as IsMerkleTreeBackend>::hash_data(&vec![x, y]),
+            <Pair as IsMerkleTreeBackend>::hash_data(&[x, y]),
+            "Batched and Pair must hash the pair ({a}, {b}) identically"
+        );
+    }
+}
+
+/// The streaming routes and the owned-`Data` route are the same leaf.
+#[test]
+fn streaming_leaf_routes_match_hash_data() {
+    use crate::config::{KeccakStarkHash, StarkHash};
+    use crypto::merkle_tree::traits::{IsMerkleTreeBackend, IsStreamingLeafBackend};
+
+    type Batched = <KeccakStarkHash as StarkHash>::Batched<F>;
+
+    let row: Vec<Felt> = (0..5u64).map(Felt::from).collect();
+    let (left, right) = row.split_at(2);
+
+    let owned = <Batched as IsMerkleTreeBackend>::hash_data(&row);
+    assert_eq!(
+        owned,
+        <Batched as IsStreamingLeafBackend<F>>::hash_data_from_slices(left, right),
+        "hash_data_from_slices must equal hash_data on the concatenation"
+    );
+
+    let mut buf = Vec::new();
+    for e in &row {
+        let mut b = [0u8; 8];
+        e.write_bytes_be(&mut b);
+        buf.extend_from_slice(&b);
+    }
+    assert_eq!(
+        owned,
+        <Batched as IsStreamingLeafBackend<F>>::hash_bytes(&buf),
+        "hash_bytes must equal hash_data on the elements those bytes encode"
+    );
+}

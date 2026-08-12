@@ -1,5 +1,5 @@
 use super::{
-    config::BatchedMerkleTreeBackend,
+    config::{KeccakStarkHash, StarkHash},
     domain::VerifierDomain,
     grinding,
     proof::stark::StarkProof,
@@ -19,6 +19,7 @@ use crate::{
 };
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
 use crypto::merkle_tree::proof::{verify_merkle_path, verify_merkle_path_from_leaf_hash};
+use crypto::merkle_tree::traits::IsStreamingLeafBackend;
 #[cfg(not(feature = "test_fiat_shamir"))]
 use log::error;
 #[cfg(feature = "debug-checks")]
@@ -36,20 +37,29 @@ use std::marker::PhantomData;
 #[cfg(feature = "instruments")]
 use std::time::Instant;
 
-/// A default STARK verifier implementing `IsStarkVerifier`.
-pub struct Verifier<
+/// A default STARK verifier implementing `IsStarkVerifier`, generic over the
+/// commitment configuration `H`. Mirrors `GenericProver`: `H` rides on the
+/// concrete type so [`Verifier`] pins it and existing call sites resolve
+/// unchanged.
+pub struct GenericVerifier<
     Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
     FieldExtension: Send + Sync + IsField,
     PI,
+    H,
 > {
-    phantom: PhantomData<(Field, FieldExtension, PI)>,
+    phantom: PhantomData<(Field, FieldExtension, PI, H)>,
 }
 
+/// The production verifier: [`GenericVerifier`] at the keccak configuration.
+pub type Verifier<Field, FieldExtension, PI> =
+    GenericVerifier<Field, FieldExtension, PI, KeccakStarkHash>;
+
 impl<
-    Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
-    FieldExtension: IsField + Send + Sync,
+    Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync + 'static,
+    FieldExtension: IsField + Send + Sync + 'static,
     PI,
-> IsStarkVerifier<Field, FieldExtension, PI> for Verifier<Field, FieldExtension, PI>
+    H: StarkHash,
+> IsStarkVerifier<Field, FieldExtension, PI, H> for GenericVerifier<Field, FieldExtension, PI, H>
 where
     Field::BaseType: math::field::element::NativeArchived,
     FieldExtension::BaseType: math::field::element::NativeArchived,
@@ -121,9 +131,10 @@ compile_error!("the zero-copy STARK verifier requires a little-endian target");
 /// are thin entry points that build the matching view and share every
 /// downstream check — no serialization, no duplicated logic.
 pub trait IsStarkVerifier<
-    Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
-    FieldExtension: Send + Sync + IsField,
+    Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync + 'static,
+    FieldExtension: Send + Sync + IsField + 'static,
     PI,
+    H: StarkHash,
 > where
     Field::BaseType: math::field::element::NativeArchived,
     FieldExtension::BaseType: math::field::element::NativeArchived,
@@ -574,17 +585,17 @@ pub trait IsStarkVerifier<
     where
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<E>: AsBytes + Sync + Send,
-        E: IsField,
+        E: IsField + 'static,
         E::BaseType: math::field::element::NativeArchived,
         Field: IsSubFieldOf<E>,
     {
         // Two-slice leaf hash: the committed leaf is `evaluations ‖ evaluations_sym`,
         // hashed without allocating the concatenation (see `hash_data_from_slices`).
-        let leaf_hash = BatchedMerkleTreeBackend::<E>::hash_data_from_slices(
+        let leaf_hash = <H::Batched<E> as IsStreamingLeafBackend<E>>::hash_data_from_slices(
             opening.evaluations(),
             opening.evaluations_sym(),
         );
-        verify_merkle_path_from_leaf_hash::<BatchedMerkleTreeBackend<E>>(
+        verify_merkle_path_from_leaf_hash::<H::Batched<E>>(
             opening.merkle_path(),
             root,
             iota,
@@ -663,12 +674,14 @@ pub trait IsStarkVerifier<
     {
         let composition_poly = deep_poly_openings.composition_poly();
         // Two-slice leaf hash of `evaluations ‖ evaluations_sym`, no concat alloc.
-        let leaf_hash = BatchedMerkleTreeBackend::<FieldExtension>::hash_data_from_slices(
+        let leaf_hash = <H::Batched<FieldExtension> as IsStreamingLeafBackend<
+            FieldExtension,
+        >>::hash_data_from_slices(
             composition_poly.evaluations(),
             composition_poly.evaluations_sym(),
         );
 
-        verify_merkle_path_from_leaf_hash::<BatchedMerkleTreeBackend<FieldExtension>>(
+        verify_merkle_path_from_leaf_hash::<H::Batched<FieldExtension>>(
             composition_poly.merkle_path(),
             composition_poly_merkle_root,
             *iota,
@@ -720,7 +733,7 @@ pub trait IsStarkVerifier<
             vec![evaluation.clone(), evaluation_sym.clone()]
         };
 
-        verify_merkle_path::<BatchedMerkleTreeBackend<FieldExtension>>(
+        verify_merkle_path::<H::Batched<FieldExtension>>(
             auth_path_sym,
             merkle_root,
             iota >> 1,

@@ -32,7 +32,7 @@ use crate::storage_mode::StorageMode;
 use crate::table::Table;
 use crate::trace::LDETraceTable;
 
-use super::config::{BatchedMerkleTree, BatchedMerkleTreeBackend, Commitment};
+use super::config::{Commitment, KeccakStarkHash, StarkHash};
 use super::constraints::evaluator::ConstraintEvaluator;
 use super::domain::Domain;
 use super::fri::fri_decommit::FriDecommitment;
@@ -41,8 +41,10 @@ use super::lookup::BusPublicInputs;
 use super::proof::stark::{DeepPolynomialOpening, MultiProof, StarkProof};
 use super::trace::TraceTable;
 use super::traits::AIR;
+use crypto::merkle_tree::merkle::MerkleTree;
 #[cfg(feature = "cuda")]
 use crypto::merkle_tree::proof::Proof;
+use crypto::merkle_tree::traits::{IsMerkleTreeBackend, IsStreamingLeafBackend};
 
 pub use crate::commitment::{keccak_leaves_bit_reversed, keccak_leaves_row_pair_bit_reversed};
 
@@ -53,20 +55,32 @@ type AirTracePair<'a, Field, FieldExtension, PI> = (
     &'a PI,
 );
 
-/// A default STARK prover implementing `IsStarkProver`.
-pub struct Prover<
+/// A default STARK prover implementing `IsStarkProver`, generic over the
+/// commitment configuration `H`.
+///
+/// `H` rides on the concrete type rather than defaulting on the trait: a
+/// defaulted trait parameter would be uninferable at a bare
+/// `Prover::multi_prove(..)` call, whereas an alias pins it. That is what keeps
+/// every existing call site resolving unchanged — see [`Prover`].
+pub struct GenericProver<
     Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
     FieldExtension: Send + Sync + IsField,
     PI,
+    H,
 > {
-    p: PhantomData<(Field, FieldExtension, PI)>,
+    p: PhantomData<(Field, FieldExtension, PI, H)>,
 }
+
+/// The production prover: [`GenericProver`] at the keccak configuration.
+pub type Prover<Field, FieldExtension, PI> =
+    GenericProver<Field, FieldExtension, PI, KeccakStarkHash>;
 
 impl<
     Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync + 'static,
     FieldExtension: Send + Sync + IsField + 'static,
     PI,
-> IsStarkProver<Field, FieldExtension, PI> for Prover<Field, FieldExtension, PI>
+    H: StarkHash,
+> IsStarkProver<Field, FieldExtension, PI, H> for GenericProver<Field, FieldExtension, PI, H>
 where
     FieldElement<Field>: math::traits::ByteConversion,
     FieldElement<FieldExtension>: math::traits::ByteConversion,
@@ -106,28 +120,28 @@ impl From<FFTError> for ProvingError {
 /// separate Merkle tree over their precomputed columns, hence the optional
 /// `precomputed_tree`/`precomputed_root` pair and the `num_precomputed_cols`
 /// index used when opening positions.
-pub(crate) struct TableCommit<F: IsField>
+pub(crate) struct TableCommit<F: IsField + 'static, H: StarkHash>
 where
-    FieldElement<F>: AsBytes,
+    FieldElement<F>: AsBytes + Sync + Send,
 {
     /// Merkle tree over the trace columns (multiplicities only for preprocessed tables).
-    pub(crate) tree: Arc<BatchedMerkleTree<F>>,
+    pub(crate) tree: Arc<MerkleTree<H::Batched<F>>>,
     /// Root of `tree`.
     pub(crate) root: Commitment,
     /// Preprocessed tables only: Merkle tree over precomputed columns.
-    pub(crate) precomputed_tree: Option<Arc<BatchedMerkleTree<F>>>,
+    pub(crate) precomputed_tree: Option<Arc<MerkleTree<H::Batched<F>>>>,
     /// Preprocessed tables only: root of `precomputed_tree`.
     pub(crate) precomputed_root: Option<Commitment>,
     /// Preprocessed tables only: number of precomputed columns. Zero otherwise.
     pub(crate) num_precomputed_cols: usize,
 }
 
-impl<F: IsField> TableCommit<F>
+impl<F: IsField + 'static, H: StarkHash> TableCommit<F, H>
 where
-    FieldElement<F>: AsBytes,
+    FieldElement<F>: AsBytes + Sync + Send,
 {
     /// Build a `TableCommit` for a plain (non-preprocessed) table.
-    fn plain(tree: BatchedMerkleTree<F>, root: Commitment) -> Self {
+    fn plain(tree: MerkleTree<H::Batched<F>>, root: Commitment) -> Self {
         Self {
             tree: Arc::new(tree),
             root,
@@ -141,9 +155,9 @@ where
     /// arrives as an `Arc` because it may be shared from the process-wide
     /// cache (see [`precomputed_tree_cache_get`]).
     fn preprocessed(
-        tree: BatchedMerkleTree<F>,
+        tree: MerkleTree<H::Batched<F>>,
         root: Commitment,
-        precomputed_tree: Arc<BatchedMerkleTree<F>>,
+        precomputed_tree: Arc<MerkleTree<H::Batched<F>>>,
         precomputed_root: Commitment,
         num_precomputed_cols: usize,
     ) -> Self {
@@ -188,25 +202,20 @@ fn precomputed_tree_cache()
     CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
 
-fn precomputed_tree_cache_get<F: IsField + 'static>(
+fn precomputed_tree_cache_get<B: IsMerkleTreeBackend + 'static>(
     root: &Commitment,
-) -> Option<Arc<BatchedMerkleTree<F>>>
-where
-    FieldElement<F>: AsBytes,
-{
+) -> Option<Arc<MerkleTree<B>>> {
     let cache = precomputed_tree_cache().lock().unwrap();
     cache
         .get(root)
         .cloned()
-        .and_then(|any| any.downcast::<BatchedMerkleTree<F>>().ok())
+        .and_then(|any| any.downcast::<MerkleTree<B>>().ok())
 }
 
-fn precomputed_tree_cache_put<F: IsField + 'static>(
+fn precomputed_tree_cache_put<B: IsMerkleTreeBackend + 'static>(
     root: Commitment,
-    tree: Arc<BatchedMerkleTree<F>>,
-) where
-    FieldElement<F>: AsBytes,
-{
+    tree: Arc<MerkleTree<B>>,
+) {
     precomputed_tree_cache()
         .lock()
         .unwrap()
@@ -214,19 +223,20 @@ fn precomputed_tree_cache_put<F: IsField + 'static>(
 }
 
 /// A container for the results of the first round of the STARK Prove protocol.
-pub(crate) struct Round1<Field, FieldExtension>
+pub(crate) struct Round1<Field, FieldExtension, H>
 where
-    Field: IsSubFieldOf<FieldExtension> + IsFFTField,
-    FieldExtension: IsField,
-    FieldElement<Field>: AsBytes,
-    FieldElement<FieldExtension>: AsBytes,
+    Field: IsSubFieldOf<FieldExtension> + IsFFTField + 'static,
+    FieldExtension: IsField + 'static,
+    FieldElement<Field>: AsBytes + Sync + Send,
+    FieldElement<FieldExtension>: AsBytes + Sync + Send,
+    H: StarkHash,
 {
     /// The table of evaluations over the LDE of the main and auxiliary trace tables.
     pub(crate) lde_trace: LDETraceTable<Field, FieldExtension>,
     /// Commitment to the main trace.
-    pub(crate) main: TableCommit<Field>,
+    pub(crate) main: TableCommit<Field, H>,
     /// Commitment to the auxiliary (RAP) trace, if any.
-    pub(crate) aux: Option<TableCommit<FieldExtension>>,
+    pub(crate) aux: Option<TableCommit<FieldExtension, H>>,
     /// The challenges of the RAP round.
     pub(crate) rap_challenges: Vec<FieldElement<FieldExtension>>,
     /// Bus interaction public inputs (initial and final aux column values).
@@ -237,25 +247,26 @@ where
 /// and (under cuda) the optional device LDE buffer kept alive for downstream
 /// rounds when the R1 fused GPU pipeline ran.
 #[cfg(feature = "cuda")]
-type MainCommitTuple<F> = (
-    TableCommit<F>,
+type MainCommitTuple<F, H> = (
+    TableCommit<F, H>,
     (Vec<FieldElement<F>>, usize),
     Option<math_cuda::lde::GpuLdeBase>,
 );
 #[cfg(not(feature = "cuda"))]
-type MainCommitTuple<F> = (TableCommit<F>, (Vec<FieldElement<F>>, usize));
+type MainCommitTuple<F, H> = (TableCommit<F, H>, (Vec<FieldElement<F>>, usize));
 
 /// Round 1 commitment artifacts — Merkle trees, roots, challenges, and bus inputs.
 /// Borrowed (not consumed) when building `Round1`.
-pub(crate) struct Round1Commitments<Field, FieldExtension>
+pub(crate) struct Round1Commitments<Field, FieldExtension, H>
 where
-    Field: IsFFTField + IsSubFieldOf<FieldExtension>,
-    FieldExtension: IsField,
-    FieldElement<Field>: AsBytes,
-    FieldElement<FieldExtension>: AsBytes,
+    Field: IsFFTField + IsSubFieldOf<FieldExtension> + 'static,
+    FieldExtension: IsField + 'static,
+    FieldElement<Field>: AsBytes + Sync + Send,
+    FieldElement<FieldExtension>: AsBytes + Sync + Send,
+    H: StarkHash,
 {
-    main: TableCommit<Field>,
-    aux: Option<TableCommit<FieldExtension>>,
+    main: TableCommit<Field, H>,
+    aux: Option<TableCommit<FieldExtension, H>>,
     rap_challenges: Vec<FieldElement<FieldExtension>>,
     bus_public_inputs: Option<BusPublicInputs<FieldExtension>>,
 }
@@ -286,12 +297,13 @@ struct Lde<Field: IsFFTField, FieldExtension: IsField> {
     gpu_aux: Option<math_cuda::lde::GpuLdeExt3>,
 }
 
-impl<Field, FieldExtension> Round1Commitments<Field, FieldExtension>
+impl<Field, FieldExtension, H> Round1Commitments<Field, FieldExtension, H>
 where
-    Field: IsFFTField + IsSubFieldOf<FieldExtension> + Send + Sync,
-    FieldExtension: IsField + Send + Sync,
-    FieldElement<Field>: AsBytes,
-    FieldElement<FieldExtension>: AsBytes,
+    Field: IsFFTField + IsSubFieldOf<FieldExtension> + Send + Sync + 'static,
+    FieldExtension: IsField + Send + Sync + 'static,
+    FieldElement<Field>: AsBytes + Sync + Send,
+    FieldElement<FieldExtension>: AsBytes + Sync + Send,
+    H: StarkHash,
 {
     /// Build a `Round1` by consuming a `Lde` and borrowing commitment data.
     /// The `TableCommit::share` calls are cheap — only bump Arc refcounts.
@@ -300,7 +312,7 @@ where
         lde: Lde<Field, FieldExtension>,
         step_size: usize,
         blowup_factor: usize,
-    ) -> Round1<Field, FieldExtension> {
+    ) -> Round1<Field, FieldExtension, H> {
         let (main_data, num_main_cols) = lde.main;
         let (aux_data, num_aux_cols) = lde.aux;
 
@@ -729,15 +741,16 @@ fn heaviest_first(estimates: &[u64]) -> Vec<usize> {
 }
 
 /// A container for the results of the second round of the STARK Prove protocol.
-pub(crate) struct Round2<F>
+pub(crate) struct Round2<F, H>
 where
-    F: IsField,
-    FieldElement<F>: AsBytes,
+    F: IsField + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    H: StarkHash,
 {
     /// Evaluations of the composition polynomial parts over the LDE domain.
     pub(crate) lde_composition_poly_evaluations: Vec<Vec<FieldElement<F>>>,
     /// The Merkle tree built to compute the commitment to the composition polynomial parts.
-    pub(crate) composition_poly_merkle_tree: BatchedMerkleTree<F>,
+    pub(crate) composition_poly_merkle_tree: MerkleTree<H::Batched<F>>,
     /// The commitment to the composition polynomial parts.
     pub(crate) composition_poly_root: Commitment,
     /// The composition Merkle tree kept resident on device (when the R2 GPU tree
@@ -808,6 +821,7 @@ pub trait IsStarkProver<
     Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync + 'static,
     FieldExtension: Send + Sync + IsField + 'static,
     PI,
+    H: StarkHash,
 > where
     FieldElement<Field>: math::traits::ByteConversion,
     FieldElement<FieldExtension>: math::traits::ByteConversion,
@@ -820,7 +834,7 @@ pub trait IsStarkProver<
     fn commit_rows_bit_reversed<E>(
         data: &[FieldElement<E>],
         num_cols: usize,
-    ) -> Option<(BatchedMerkleTree<E>, Commitment)>
+    ) -> Option<(MerkleTree<H::Batched<E>>, Commitment)>
     where
         FieldElement<E>: AsBytes + Sync + Send + math::traits::ByteConversion,
         E: IsField,
@@ -837,7 +851,7 @@ pub trait IsStarkProver<
         num_cols: usize,
         col_start: usize,
         col_end: usize,
-    ) -> Option<(BatchedMerkleTree<E>, Commitment)>
+    ) -> Option<(MerkleTree<H::Batched<E>>, Commitment)>
     where
         FieldElement<E>: AsBytes + Sync + Send + math::traits::ByteConversion,
         E: IsField,
@@ -876,7 +890,7 @@ pub trait IsStarkProver<
                     offset += byte_len;
                 }
             }
-            BatchedMerkleTreeBackend::<E>::hash_bytes(buf)
+            <H::Batched<E> as IsStreamingLeafBackend<E>>::hash_bytes(buf)
         };
 
         #[cfg(feature = "parallel")]
@@ -895,7 +909,7 @@ pub trait IsStarkProver<
                 .collect()
         };
 
-        let tree = BatchedMerkleTree::<E>::build_from_hashed_leaves(hashed_leaves)?;
+        let tree = MerkleTree::<H::Batched<E>>::build_from_hashed_leaves(hashed_leaves)?;
         let root = tree.root;
         Some((tree, root))
     }
@@ -922,8 +936,10 @@ pub trait IsStarkProver<
         let twiddles = LdeTwiddles::new(&domain);
         let evals =
             Self::compute_lde_from_columns_cached::<Field>(&precomputed, &domain, &twiddles);
-        let (_, commitment) =
-            crate::commitment::commit_bit_reversed(&evals, crate::commitment::ROWS_PER_LEAF)?;
+        let (_, commitment) = crate::commitment::commit_bit_reversed_with::<
+            Field,
+            H::Batched<Field>,
+        >(&evals, crate::commitment::ROWS_PER_LEAF)?;
         Some(commitment)
     }
 
@@ -1061,7 +1077,7 @@ pub trait IsStarkProver<
         precomputed: Option<(Commitment, usize)>,
         #[cfg(feature = "cuda")] device_only: bool,
         #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
-    ) -> Result<MainCommitTuple<Field>, ProvingError>
+    ) -> Result<MainCommitTuple<Field, H>, ProvingError>
     where
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
@@ -1085,7 +1101,7 @@ pub trait IsStarkProver<
                 crate::gpu_lde::try_expand_leaf_and_tree_row_major_keep::<
                     Field,
                     Field,
-                    BatchedMerkleTreeBackend<Field>,
+                    H::Batched<Field>,
                 >(
                     trace_slice,
                     n,
@@ -1137,7 +1153,9 @@ pub trait IsStarkProver<
             #[cfg(not(feature = "disk-spill"))]
             let cache_ok = true;
             let cached_pre = cache_ok
-                .then(|| precomputed_tree_cache_get::<Field>(&expected_precomputed_root))
+                .then(|| {
+                    precomputed_tree_cache_get::<H::Batched<Field>>(&expected_precomputed_root)
+                })
                 .flatten();
             #[cfg(feature = "instruments")]
             let t_sub = Instant::now();
@@ -1145,7 +1163,7 @@ pub trait IsStarkProver<
                 crate::gpu_lde::try_expand_split_trees_row_major_keep::<
                     Field,
                     Field,
-                    BatchedMerkleTreeBackend<Field>,
+                    H::Batched<Field>,
                 >(
                     trace_slice,
                     n,
@@ -1172,7 +1190,7 @@ pub trait IsStarkProver<
                         Self::spill_tree(&mut tree, storage_mode, "precomputed Merkle tree")?;
                         let tree = Arc::new(tree);
                         if cache_ok {
-                            precomputed_tree_cache_put::<Field>(
+                            precomputed_tree_cache_put::<H::Batched<Field>>(
                                 expected_precomputed_root,
                                 Arc::clone(&tree),
                             );
@@ -1251,7 +1269,9 @@ pub trait IsStarkProver<
                 #[cfg(not(feature = "disk-spill"))]
                 let cache_ok = true;
                 let precomputed_tree = match cache_ok
-                    .then(|| precomputed_tree_cache_get::<Field>(&expected_precomputed_root))
+                    .then(|| {
+                        precomputed_tree_cache_get::<H::Batched<Field>>(&expected_precomputed_root)
+                    })
                     .flatten()
                 {
                     // Cache key == the root a rebuild would be verified
@@ -1273,7 +1293,7 @@ pub trait IsStarkProver<
                         Self::spill_tree(&mut tree, storage_mode, "precomputed Merkle tree")?;
                         let tree = Arc::new(tree);
                         if cache_ok {
-                            precomputed_tree_cache_put::<Field>(
+                            precomputed_tree_cache_put::<H::Batched<Field>>(
                                 expected_precomputed_root,
                                 Arc::clone(&tree),
                             );
@@ -1315,7 +1335,7 @@ pub trait IsStarkProver<
     /// site (main / preprocessed split / aux).
     #[cfg(feature = "disk-spill")]
     fn spill_tree<C>(
-        tree: &mut BatchedMerkleTree<C>,
+        tree: &mut MerkleTree<H::Batched<C>>,
         storage_mode: StorageMode,
         label: &str,
     ) -> Result<(), ProvingError>
@@ -1339,9 +1359,9 @@ pub trait IsStarkProver<
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         trace: &TraceTable<Field, FieldExtension>,
         domain: &Domain<Field>,
-        commitment: &Round1Commitments<Field, FieldExtension>,
+        commitment: &Round1Commitments<Field, FieldExtension, H>,
         twiddles: &LdeTwiddles<Field>,
-    ) -> Result<Round1<Field, FieldExtension>, ProvingError>
+    ) -> Result<Round1<Field, FieldExtension, H>, ProvingError>
     where
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
@@ -1415,7 +1435,7 @@ pub trait IsStarkProver<
     #[cfg(feature = "debug-checks")]
     fn run_debug_checks(
         pair_cells: &[std::sync::Mutex<AirTracePair<'_, Field, FieldExtension, PI>>],
-        commitments: &[Round1Commitments<Field, FieldExtension>],
+        commitments: &[Round1Commitments<Field, FieldExtension, H>],
         domains: &[Arc<Domain<Field>>],
         twiddle_caches: &[Arc<LdeTwiddles<Field>>],
     ) where
@@ -1423,7 +1443,7 @@ pub trait IsStarkProver<
         FieldElement<FieldExtension>: AsBytes,
         PI: Send + Sync + Clone,
     {
-        let mut temp_results: Vec<Round1<Field, FieldExtension>> =
+        let mut temp_results: Vec<Round1<Field, FieldExtension, H>> =
             Vec::with_capacity(pair_cells.len());
         for ((cell, commitment), (domain, twiddles)) in pair_cells
             .iter()
@@ -1555,10 +1575,10 @@ pub trait IsStarkProver<
         pub_inputs: &PI,
         domain: &Domain<Field>,
         twiddles: &LdeTwiddles<Field>,
-        round_1_result: &mut Round1<Field, FieldExtension>,
+        round_1_result: &mut Round1<Field, FieldExtension, H>,
         transition_coefficients: &[FieldElement<FieldExtension>],
         boundary_coefficients: &[FieldElement<FieldExtension>],
-    ) -> Result<Round2<FieldExtension>, ProvingError>
+    ) -> Result<Round2<FieldExtension, H>, ProvingError>
     where
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
@@ -1741,13 +1761,13 @@ pub trait IsStarkProver<
                 .and_then(|h| {
                     crate::gpu_lde::try_build_comp_poly_tree_gpu_from_dev::<
                         FieldExtension,
-                        BatchedMerkleTreeBackend<FieldExtension>,
+                        H::Batched<FieldExtension>,
                     >(h)
                 })
                 .or_else(|| {
                     crate::gpu_lde::try_build_comp_poly_tree_gpu::<
                         FieldExtension,
-                        BatchedMerkleTreeBackend<FieldExtension>,
+                        H::Batched<FieldExtension>,
                     >(&lde_composition_poly_parts_evaluations)
                 }) {
                 Some((host_tree, dev_tree)) => {
@@ -1770,7 +1790,10 @@ pub trait IsStarkProver<
                         "R2 composition commit fell back to the host part evals, \
                          but they are device-only (empty)"
                     );
-                    let (tree, root) = crate::commitment::commit_bit_reversed(
+                    let (tree, root) = crate::commitment::commit_bit_reversed_with::<
+                        FieldExtension,
+                        H::Batched<FieldExtension>,
+                    >(
                         &lde_composition_poly_parts_evaluations,
                         crate::commitment::ROWS_PER_LEAF,
                     )
@@ -1780,7 +1803,7 @@ pub trait IsStarkProver<
             };
         #[cfg(not(feature = "cuda"))]
         let (composition_poly_merkle_tree, composition_poly_root) =
-            crate::commitment::commit_bit_reversed(
+            crate::commitment::commit_bit_reversed_with::<FieldExtension, H::Batched<FieldExtension>>(
                 &lde_composition_poly_parts_evaluations,
                 crate::commitment::ROWS_PER_LEAF,
             )
@@ -1811,8 +1834,8 @@ pub trait IsStarkProver<
     fn round_3_evaluate_polynomials_in_out_of_domain_element(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         domain: &Domain<Field>,
-        round_1_result: &Round1<Field, FieldExtension>,
-        round_2_result: &Round2<FieldExtension>,
+        round_1_result: &Round1<Field, FieldExtension, H>,
+        round_2_result: &Round2<FieldExtension, H>,
         z: &FieldElement<FieldExtension>,
     ) -> Round3<FieldExtension>
     where
@@ -1947,8 +1970,8 @@ pub trait IsStarkProver<
     fn round_4_compute_and_run_fri_on_the_deep_composition_polynomial(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         domain: &Domain<Field>,
-        round_1_result: &Round1<Field, FieldExtension>,
-        round_2_result: &Round2<FieldExtension>,
+        round_1_result: &Round1<Field, FieldExtension, H>,
+        round_2_result: &Round2<FieldExtension, H>,
         round_3_result: &Round3<FieldExtension>,
         z: &FieldElement<FieldExtension>,
         transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
@@ -2152,7 +2175,7 @@ pub trait IsStarkProver<
     #[allow(clippy::too_many_arguments)]
     fn try_compute_deep_dev(
         lde_trace: &LDETraceTable<Field, FieldExtension>,
-        round_2_result: &Round2<FieldExtension>,
+        round_2_result: &Round2<FieldExtension, H>,
         round_3_result: &Round3<FieldExtension>,
         z: &FieldElement<FieldExtension>,
         domain: &Domain<Field>,
@@ -2202,7 +2225,7 @@ pub trait IsStarkProver<
     #[allow(clippy::too_many_arguments)]
     fn compute_deep_composition_poly_evaluations(
         lde_trace: &LDETraceTable<Field, FieldExtension>,
-        round_2_result: &Round2<FieldExtension>,
+        round_2_result: &Round2<FieldExtension, H>,
         round_3_result: &Round3<FieldExtension>,
         z: &FieldElement<FieldExtension>,
         domain: &Domain<Field>,
@@ -2392,7 +2415,7 @@ pub trait IsStarkProver<
     /// at the domain value corresponding to the FRI query challenge `index` and its symmetric
     /// element.
     fn open_composition_poly(
-        composition_poly_merkle_tree: &BatchedMerkleTree<FieldExtension>,
+        composition_poly_merkle_tree: &MerkleTree<H::Batched<FieldExtension>>,
         lde_composition_poly_evaluations: &[Vec<FieldElement<FieldExtension>>],
         index: usize,
     ) -> PolynomialOpenings<FieldExtension>
@@ -2474,7 +2497,7 @@ pub trait IsStarkProver<
     /// storage (full main row, ranged main row, or aux row).
     fn open_polys_with<C, G>(
         domain: &Domain<Field>,
-        tree: &BatchedMerkleTree<C>,
+        tree: &MerkleTree<H::Batched<C>>,
         challenge: usize,
         gather: G,
     ) -> PolynomialOpenings<C>
@@ -2601,7 +2624,7 @@ pub trait IsStarkProver<
         lde_trace: &LDETraceTable<Field, FieldExtension>,
         dev_proofs: Option<&Vec<Proof<Commitment>>>,
         dev_values: Option<&Vec<FieldElement<C>>>,
-        tree: &BatchedMerkleTree<C>,
+        tree: &MerkleTree<H::Batched<C>>,
         qi: usize,
         challenge: usize,
         ncols: usize,
@@ -2658,8 +2681,8 @@ pub trait IsStarkProver<
     /// Open the deep composition polynomial on a list of indexes and their symmetric elements.
     fn open_deep_composition_poly(
         domain: &Domain<Field>,
-        round_1_result: &Round1<Field, FieldExtension>,
-        round_2_result: &Round2<FieldExtension>,
+        round_1_result: &Round1<Field, FieldExtension, H>,
+        round_2_result: &Round2<FieldExtension, H>,
         indexes_to_open: &[usize],
     ) -> DeepPolynomialOpenings<Field, FieldExtension>
     where
@@ -3141,7 +3164,7 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         let __sp = crate::instruments::span("r1_main_commit");
 
-        let mut main_commits: Vec<TableCommit<Field>> = Vec::with_capacity(num_airs);
+        let mut main_commits: Vec<TableCommit<Field, H>> = Vec::with_capacity(num_airs);
         let mut main_ldes: Vec<(Vec<FieldElement<Field>>, usize)> = Vec::with_capacity(num_airs);
         // Optional device-side LDE handle per table, populated only when the
         // R1 fused GPU pipeline produced one. Pairing is by index: this vector
@@ -3275,13 +3298,13 @@ pub trait IsStarkProver<
         // so the handle stays inside its own table's task and never needs a
         // separate handle vector.
         #[cfg(feature = "cuda")]
-        type AuxResult<FE> = (
-            Option<TableCommit<FE>>,
+        type AuxResult<FE, H> = (
+            Option<TableCommit<FE, H>>,
             (Vec<FieldElement<FE>>, usize),
             Option<math_cuda::lde::GpuLdeExt3>,
         );
         #[cfg(not(feature = "cuda"))]
-        type AuxResult<FE> = (Option<TableCommit<FE>>, (Vec<FieldElement<FE>>, usize));
+        type AuxResult<FE, H> = (Option<TableCommit<FE, H>>, (Vec<FieldElement<FE>>, usize));
         // R1 aux commit and rounds 2 to 4 share the peak working set: the main
         // and aux LDEs are co-resident, plus the composition and Merkle
         // transients (in the scratch factor). The aux width comes from the AIR
@@ -3303,7 +3326,7 @@ pub trait IsStarkProver<
                 .into_iter()
                 .map(std::sync::Mutex::new)
                 .collect();
-        let main_commit_cells: Vec<std::sync::Mutex<Option<TableCommit<Field>>>> = main_commits
+        let main_commit_cells: Vec<std::sync::Mutex<Option<TableCommit<Field, H>>>> = main_commits
             .into_iter()
             .map(|c| std::sync::Mutex::new(Some(c)))
             .collect();
@@ -3335,7 +3358,7 @@ pub trait IsStarkProver<
         #[allow(clippy::type_complexity)]
         let aux_stage = |idx: usize| -> Result<
             (
-                Round1Commitments<Field, FieldExtension>,
+                Round1Commitments<Field, FieldExtension, H>,
                 Lde<Field, FieldExtension>,
             ),
             ProvingError,
@@ -3374,8 +3397,8 @@ pub trait IsStarkProver<
 
             #[cfg(feature = "instruments")]
             let __sp = crate::instruments::span("r1_aux_commit_table");
-            let aux_full: AuxResult<FieldExtension> =
-                (|| -> Result<AuxResult<FieldExtension>, ProvingError> {
+            let aux_full: AuxResult<FieldExtension, H> =
+                (|| -> Result<AuxResult<FieldExtension, H>, ProvingError> {
                     if air.has_aux_trace() {
                         let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
 
@@ -3399,7 +3422,7 @@ pub trait IsStarkProver<
                                 crate::gpu_lde::try_expand_leaf_and_tree_ext3_row_major_keep_dev::<
                                     Field,
                                     FieldExtension,
-                                    BatchedMerkleTreeBackend<FieldExtension>,
+                                    H::Batched<FieldExtension>,
                                 >(
                                     ra,
                                     domain.blowup_factor,
@@ -3439,7 +3462,7 @@ pub trait IsStarkProver<
                                 crate::gpu_lde::try_expand_leaf_and_tree_ext3_row_major_keep::<
                                     Field,
                                     FieldExtension,
-                                    BatchedMerkleTreeBackend<FieldExtension>,
+                                    H::Batched<FieldExtension>,
                                 >(
                                     trace_slice,
                                     n,
@@ -3563,7 +3586,7 @@ pub trait IsStarkProver<
         // Fused chain, stage 2: Round1 from the cached LDE (consumed by value,
         // no recomputation) → rounds 2-4 against the table's transcript fork.
         let rounds_stage = |idx: usize,
-                            commitment: Round1Commitments<Field, FieldExtension>,
+                            commitment: Round1Commitments<Field, FieldExtension, H>,
                             lde: Lde<Field, FieldExtension>|
          -> Result<StarkProof<Field, FieldExtension, PI>, ProvingError> {
             let pair = pair_cells[idx].lock().unwrap();
@@ -3648,7 +3671,7 @@ pub trait IsStarkProver<
             let staged: Vec<
                 std::sync::Mutex<
                     Option<(
-                        Round1Commitments<Field, FieldExtension>,
+                        Round1Commitments<Field, FieldExtension, H>,
                         Lde<Field, FieldExtension>,
                     )>,
                 >,
@@ -3721,7 +3744,7 @@ pub trait IsStarkProver<
     fn prove_rounds_2_to_4(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         pub_inputs: &PI,
-        round_1_result: &mut Round1<Field, FieldExtension>,
+        round_1_result: &mut Round1<Field, FieldExtension, H>,
         transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
         domain: &Domain<Field>,
         twiddles: &LdeTwiddles<Field>,
