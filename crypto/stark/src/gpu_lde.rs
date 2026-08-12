@@ -26,6 +26,8 @@ use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
 use math::field::goldilocks::GoldilocksField;
 use math::field::traits::{IsFFTField, IsField, IsSubFieldOf};
 use math::traits::AsBytes;
+#[cfg(feature = "parallel")]
+use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
 
 use crate::config::{Commitment, FriLayerMerkleTreeBackend};
 use crate::domain::Domain;
@@ -52,6 +54,36 @@ fn gpu_lde_threshold() -> usize {
             .and_then(|s| s.parse().ok())
             .unwrap_or(DEFAULT_GPU_LDE_THRESHOLD)
     })
+}
+
+/// Serialize the SUBMISSION of the device R2 window (constraint eval +
+/// decompose) across tables. Concurrent R2 windows under VRAM pressure can
+/// transiently corrupt a whole H buffer (root mechanism unidentified; reruns
+/// on the same resident inputs come out correct), yielding a proof that fails
+/// verification. Holding this lock empirically suppresses that at negligible
+/// cost — the windows rarely overlap.
+///
+/// How much it enforces depends on the table. One that keeps its host trace
+/// ends the window in a blocking D2H (the `want_host` arm of
+/// [`try_decompose_extend_d2_dev`]), so the guard is held until that table's
+/// kernels have completed — a real execution barrier. A device-only table's
+/// window is enqueue-only, so two tables' R2 kernels can still overlap on
+/// device; what the lock orders there is submission and allocation, which is
+/// enough to suppress the corruption in practice but is not a guarantee that
+/// R2 kernels never run concurrently.
+///
+/// `LAMBDA_VM_GPU_SERIALIZE_R2=0` disables the lock (e.g. to bisect or once
+/// the underlying race is fixed).
+pub(crate) fn r2_serialize_guard() -> Option<std::sync::MutexGuard<'static, ()>> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    if std::env::var("LAMBDA_VM_GPU_SERIALIZE_R2").as_deref() != Ok("0") {
+        // The guarded state is (), so a panic while holding the lock carries
+        // no information — recover instead of burying the original panic
+        // under a cascade of PoisonErrors from every other table.
+        Some(LOCK.lock().unwrap_or_else(|e| e.into_inner()))
+    } else {
+        None
+    }
 }
 
 /// Incremented by the `try_expand_*` functions per base-field column handed to
@@ -82,6 +114,9 @@ pub fn reset_all_gpu_call_counters() {
     GPU_COMPOSITION_CALLS.store(0, Ordering::Relaxed);
     GPU_OPENING_GATHER_CALLS.store(0, Ordering::Relaxed);
     GPU_DEVICE_ONLY_CALLS.store(0, Ordering::Relaxed);
+    GPU_DEVICE_ONLY_DOWNGRADES.store(0, Ordering::Relaxed);
+    GPU_RESIDENT_AUX_RETRIES.store(0, Ordering::Relaxed);
+    GPU_RESIDENT_AUX_DOWNGRADES.store(0, Ordering::Relaxed);
 }
 
 pub(crate) static GPU_EXTEND_HALVES_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -171,12 +206,24 @@ pub(crate) fn device_only_disabled() -> bool {
 
 /// Stage-3 device-only gate: `true` when a table's round-1 LDE can be left
 /// device-resident (host D2H skipped) because every downstream round is
-/// guaranteed to take its GPU path. A strict AND of all preconditions that
-/// imply the R2 composition, R3 barycentric, R4 DEEP, and R4 opening GPU paths
-/// all fire and read the device LDE. The per-round `host_trace_empty`
-/// hard-abort guards are the safety net: if any precondition is nonetheless
-/// violated at runtime (mis-gate or transient GPU error), the prove aborts
-/// loudly rather than reading the empty host trace.
+/// guaranteed to take its GPU path. A strict AND of the numeric and shape
+/// preconditions that imply the R2 composition, R3 barycentric, R4 DEEP, and
+/// R4 opening GPU paths all fire and read the device LDE — but not the whole
+/// predicate on its own: the caller `IsStarkProver::device_only_for`
+/// (prover.rs) adds the AIR-level preconditions this signature does not
+/// carry, notably the d=2 quotient part count the device-resident R2 path
+/// requires.
+///
+/// If a precondition is nonetheless violated at runtime (mis-gate or
+/// transient GPU error), what happens depends on the round. R2 and the R1
+/// resident-aux commit recover: they download what the host arms need (the
+/// resident LDEs at R2, the resident aux trace plus the main LDE at R1), bump
+/// their site's counter ([`GPU_DEVICE_ONLY_DOWNGRADES`] at R2,
+/// [`GPU_RESIDENT_AUX_DOWNGRADES`] at R1) and continue host-backed — slower,
+/// never wrong — aborting only when the resident handles cannot serve the
+/// data. R3 and R4 have no such recovery: the R3 barycentric arms assert on
+/// the buffer they are about to read and the R4 guards on `host_trace_empty`,
+/// both failing loudly rather than reading an empty host trace.
 ///
 /// `zerofier_uniform` must be the R1-derived conservative form (all constraints
 /// share `end_exemptions == 0`), which implies `ZerofierEvaluations::is_uniform`
@@ -184,8 +231,12 @@ pub(crate) fn device_only_disabled() -> bool {
 ///
 /// LOCKSTEP: this gate must IMPLY the runtime dispatch checks in
 /// `ConstraintEvaluator::try_evaluate_composition_gpu` (plus the R3/R4 device
-/// arms). A fallback condition added to a dispatch without a mirror here turns
-/// every gate-true table into a hard-abort — loud, but an avoidable crash.
+/// arms). A fallback condition added to a dispatch without a mirror here
+/// costs every gate-true table either a hard-abort at R3/R4 — loud, but an
+/// avoidable crash — or, at R2 and the R1 resident-aux commit, a silent
+/// downgrade to the host path, which is what [`GPU_DEVICE_ONLY_DOWNGRADES`]
+/// exists to surface (an R1 decline lands in [`GPU_RESIDENT_AUX_DOWNGRADES`],
+/// which the gate does not govern).
 pub(crate) fn device_only_gate<F, E>(
     lde_size: usize,
     n: usize,
@@ -1413,6 +1464,267 @@ pub fn gpu_fri_calls() -> u64 {
 /// are counted here, so a single failed dispatch does not necessarily lower
 /// the total; R3's fallbacks are CPU-only, so a failure there does.
 pub(crate) static GPU_BATCH_INVERT_CALLS: AtomicU64 = AtomicU64::new(0);
+/// R2 downgrades, and only those: times a device-only table fell back to the
+/// host evaluator and had its resident LDEs downloaded into the host buffers
+/// first ([`materialize_lde_trace_host`], the sole site that bumps this).
+/// Nonzero means the device-only gate cleared a table whose R2 dispatch then
+/// declined at runtime — the table continued host-backed, correct but slower —
+/// so every count is a gate miss, and the fix is to mirror the missing
+/// condition into the gate. The R1 resident-aux downgrade is counted by
+/// [`GPU_RESIDENT_AUX_DOWNGRADES`] instead: it fires on tables the gate never
+/// marked device-only, so summing the two would blame the gate for declines it
+/// never made.
+pub(crate) static GPU_DEVICE_ONLY_DOWNGRADES: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_device_only_downgrades() -> u64 {
+    GPU_DEVICE_ONLY_DOWNGRADES.load(Ordering::Relaxed)
+}
+
+/// R1 downgrades, and only those: times the resident aux trace was downloaded
+/// so the aux commit could continue on the host arms, after the device aux LDE
+/// declined and the drain-and-retry either did not run or declined again
+/// ([`materialize_aux_trace_host`], the sole site that bumps this). Independent
+/// of the device-only gate — the site is entered whenever `aux_resident()` is
+/// set, whatever the gate said — so a table that was never device-only can land
+/// here, and a nonzero value points at sustained VRAM pressure rather than a
+/// gate miss. Read it against [`GPU_RESIDENT_AUX_RETRIES`]: retries alone mean
+/// the drain absorbed the pressure, retries plus downgrades mean it did not.
+pub(crate) static GPU_RESIDENT_AUX_DOWNGRADES: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_resident_aux_downgrades() -> u64 {
+    GPU_RESIDENT_AUX_DOWNGRADES.load(Ordering::Relaxed)
+}
+
+/// Times the R1 resident-aux LDE declined and the prover drained the device to
+/// retry it (prover.rs). Nonzero means the device hit transient VRAM pressure —
+/// the retry is what keeps a decline from becoming a
+/// [`GPU_RESIDENT_AUX_DOWNGRADES`] host downgrade, so a run with retries but no
+/// downgrades paid nothing but the drain. Counts declines, not outcomes: it is
+/// bumped before the retry, whether or not the retry then succeeds.
+pub(crate) static GPU_RESIDENT_AUX_RETRIES: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_resident_aux_retries() -> u64 {
+    GPU_RESIDENT_AUX_RETRIES.load(Ordering::Relaxed)
+}
+
+/// Recover a device-only table for the host path: download the resident main
+/// and aux LDEs from their device handles into the host buffers and clear the
+/// device-only flag. A side whose host buffer is already populated (a mixed
+/// state: one commit fell back to CPU while the other stayed device-only) is
+/// kept as is — only the missing side is downloaded. The class-level safety
+/// net under the device-only gate — a static predicate can never mirror every
+/// reason a dynamic dispatch might decline (kernel eligibility, transient
+/// errors, shapes a new workload brings), so any miss lands here and degrades
+/// to a slower-but-correct CPU round instead of a hard abort. Returns false
+/// (→ the caller's abort) when the resident handles cannot serve the data: a
+/// missing handle or bound stream, a handle whose shape disagrees with the
+/// trace, a failed download or sync, or a field tower with no CUDA lowering.
+pub(crate) fn materialize_lde_trace_host<F, E>(
+    lde_trace: &mut crate::trace::LDETraceTable<F, E>,
+) -> bool
+where
+    F: IsField + IsSubFieldOf<E> + 'static,
+    E: IsField + 'static,
+{
+    if !lde_trace.host_trace_empty() {
+        return true;
+    }
+    if !is_goldilocks_ext3_tower::<F, E>() {
+        return false;
+    }
+    let Some(stream) = lde_trace.bound_stream() else {
+        return false;
+    };
+
+    // Main: column-major device buf -> row-major host Vec. An empty Vec tells
+    // `set_host_data` to keep the buffer that is already there.
+    let main_data: Vec<FieldElement<F>> =
+        if lde_trace.num_main_cols() == 0 || !lde_trace.main_data.is_empty() {
+            Vec::new()
+        } else {
+            let Some(h) = lde_trace.gpu_main() else {
+                return false;
+            };
+            if h.m != lde_trace.num_main_cols() || h.lde_size != lde_trace.num_rows() {
+                return false;
+            }
+            let Some(data) = download_main_lde_row_major::<F>(h, &stream) else {
+                return false;
+            };
+            data
+        };
+
+    // Aux: de-interleaved ext3 slabs -> row-major interleaved host Vec.
+    let aux_data: Vec<FieldElement<E>> =
+        if lde_trace.num_aux_cols() == 0 || !lde_trace.aux_data.is_empty() {
+            Vec::new()
+        } else {
+            let Some(h) = lde_trace.gpu_aux() else {
+                return false;
+            };
+            if h.m != lde_trace.num_aux_cols() || h.lde_size != lde_trace.num_rows() {
+                return false;
+            }
+            if h.wait_ready_on(&stream).is_err() {
+                return false;
+            }
+            let Ok(slabs) = stream.clone_dtoh(h.buf.as_ref()) else {
+                return false;
+            };
+            if stream.synchronize().is_err() {
+                return false;
+            }
+            let (m, lde) = (h.m, h.lde_size);
+            // Short download: degrade like the sibling paths
+            // (`download_main_lde_row_major`, `materialize_aux_trace_host`)
+            // rather than panic on the slab slicing below.
+            if slabs.len() != m * lde * 3 {
+                return false;
+            }
+            // Parallel de-interleaved slabs → row-major interleaved: each row
+            // chunk gathers from the source slabs independently.
+            let mut interleaved = vec![0u64; m * lde * 3];
+            if m > 0 {
+                #[cfg(feature = "parallel")]
+                {
+                    interleaved
+                        .par_chunks_exact_mut(m * 3)
+                        .enumerate()
+                        .for_each(|(r, dst)| {
+                            for (c, dst_col) in dst.chunks_exact_mut(3).enumerate() {
+                                for (k, d) in dst_col.iter_mut().enumerate() {
+                                    *d = slabs[(c * 3 + k) * lde + r];
+                                }
+                            }
+                        });
+                }
+                #[cfg(not(feature = "parallel"))]
+                {
+                    for (r, dst) in interleaved.chunks_exact_mut(m * 3).enumerate() {
+                        for (c, dst_col) in dst.chunks_exact_mut(3).enumerate() {
+                            for (k, d) in dst_col.iter_mut().enumerate() {
+                                *d = slabs[(c * 3 + k) * lde + r];
+                            }
+                        }
+                    }
+                }
+            }
+            // SAFETY: E == Ext3 per the tower check; FieldElement<Ext3> backing
+            // is [u64; 3].
+            unsafe {
+                let mut v = std::mem::ManuallyDrop::new(interleaved);
+                debug_assert!(
+                    v.len().is_multiple_of(3) && v.capacity().is_multiple_of(3),
+                    "interleaved len/capacity must be a multiple of 3 for Fp3 reinterpret"
+                );
+                Vec::from_raw_parts(
+                    v.as_mut_ptr() as *mut FieldElement<E>,
+                    v.len() / 3,
+                    v.capacity() / 3,
+                )
+            }
+        };
+
+    lde_trace.set_host_data(main_data, aux_data);
+    GPU_DEVICE_ONLY_DOWNGRADES.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+/// Download a resident main LDE (column-major device buf) into the row-major
+/// host Vec the CPU rounds read. Shared by the R1 and R2 downgrade paths.
+pub(crate) fn download_main_lde_row_major<F>(
+    h: &math_cuda::lde::GpuLdeBase,
+    stream: &std::sync::Arc<math_cuda::CudaStream>,
+) -> Option<Vec<FieldElement<F>>>
+where
+    F: IsField + 'static,
+{
+    if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
+        return None;
+    }
+    h.wait_ready_on(stream).ok()?;
+    let col_major = stream.clone_dtoh(h.buf.as_ref()).ok()?;
+    stream.synchronize().ok()?;
+    let (m, lde) = (h.m, h.lde_size);
+    if col_major.len() != m * lde {
+        return None;
+    }
+    // Parallel col-major → row-major transpose: each row chunk gathers from
+    // the source columns independently.
+    let mut row_major = vec![0u64; m * lde];
+    if m > 0 {
+        #[cfg(feature = "parallel")]
+        {
+            row_major
+                .par_chunks_exact_mut(m)
+                .enumerate()
+                .for_each(|(r, dst)| {
+                    for (c, d) in dst.iter_mut().enumerate() {
+                        *d = col_major[c * lde + r];
+                    }
+                });
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            for (r, dst) in row_major.chunks_exact_mut(m).enumerate() {
+                for (c, d) in dst.iter_mut().enumerate() {
+                    *d = col_major[c * lde + r];
+                }
+            }
+        }
+    }
+    // SAFETY: F == Goldilocks (gated above); FieldElement<Gl> is
+    // #[repr(transparent)] over u64.
+    Some(unsafe {
+        let mut v = std::mem::ManuallyDrop::new(row_major);
+        Vec::from_raw_parts(
+            v.as_mut_ptr() as *mut FieldElement<F>,
+            v.len(),
+            v.capacity(),
+        )
+    })
+}
+
+/// R1 counterpart of [`materialize_lde_trace_host`]: download the resident
+/// aux trace (already row-major ext3, matching the host layout) into the
+/// trace's aux table, so the aux commit continues on the host arms when the
+/// device aux LDE declines at runtime.
+pub(crate) fn materialize_aux_trace_host<F, E>(trace: &mut crate::trace::TraceTable<F, E>) -> bool
+where
+    F: IsField + IsSubFieldOf<E> + 'static,
+    E: IsField + 'static,
+{
+    if !is_goldilocks_ext3_tower::<F, E>() {
+        return false;
+    }
+    let (buf, rows, cols) = match trace.aux_resident.as_ref() {
+        Some(ra) => (ra.buf.clone(), ra.num_rows, ra.num_aux_cols),
+        None => return false,
+    };
+    let Ok(be) = math_cuda::device::backend() else {
+        return false;
+    };
+    let stream = be.next_stream();
+    let Ok(raw) = stream.clone_dtoh(buf.as_ref()) else {
+        return false;
+    };
+    if stream.synchronize().is_err() || raw.len() != rows * cols * 3 {
+        return false;
+    }
+    let data = u64_to_ext3_vec::<E>(&raw);
+    trace.aux_table = crate::table::Table::new(data, cols);
+    trace.num_aux_columns = cols;
+    // The declined device LDE attempt can leave kernels enqueued on another
+    // stream still reading this buffer; its owning stream is long idle, so
+    // dropping here would complete the stream-ordered free immediately and
+    // the pool could hand the memory to a concurrent table's allocation
+    // while those kernels run. Drain the device before the drop — this is a
+    // rare recovery path.
+    if be.ctx.synchronize().is_err() {
+        return false;
+    }
+    trace.aux_resident = None;
+    GPU_RESIDENT_AUX_DOWNGRADES.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
 pub fn gpu_batch_invert_calls() -> u64 {
     GPU_BATCH_INVERT_CALLS.load(Ordering::Relaxed)
 }
@@ -1586,8 +1898,8 @@ where
         retain_host_lde,
     )
     .inspect_err(|e| {
-        // This path has no CPU fallback (the host aux trace is empty), so the
-        // caller hard-aborts; surface the swallowed driver error (e.g. OOM).
+        // Surface the swallowed driver error (e.g. OOM): the caller drains
+        // the device and retries, then downgrades the table to the host path.
         eprintln!(
             "[gpu] resident aux LDE failed (rows={} cols={} blowup={}): {e:?}",
             ra.num_rows, ra.num_aux_cols, blowup_factor
