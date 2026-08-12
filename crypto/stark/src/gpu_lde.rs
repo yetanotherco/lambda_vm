@@ -115,6 +115,8 @@ pub fn reset_all_gpu_call_counters() {
     GPU_OPENING_GATHER_CALLS.store(0, Ordering::Relaxed);
     GPU_DEVICE_ONLY_CALLS.store(0, Ordering::Relaxed);
     GPU_DEVICE_ONLY_DOWNGRADES.store(0, Ordering::Relaxed);
+    GPU_RESIDENT_AUX_RETRIES.store(0, Ordering::Relaxed);
+    GPU_RESIDENT_AUX_DOWNGRADES.store(0, Ordering::Relaxed);
 }
 
 pub(crate) static GPU_EXTEND_HALVES_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -216,11 +218,12 @@ pub(crate) fn device_only_disabled() -> bool {
 /// transient GPU error), what happens depends on the round. R2 and the R1
 /// resident-aux commit recover: they download what the host arms need (the
 /// resident LDEs at R2, the resident aux trace plus the main LDE at R1), bump
-/// [`GPU_DEVICE_ONLY_DOWNGRADES`] and continue host-backed — slower, never
-/// wrong — aborting only when the resident handles cannot serve the data. R3
-/// and R4 have no such recovery: the R3 barycentric arms assert on the buffer
-/// they are about to read and the R4 guards on `host_trace_empty`, both
-/// failing loudly rather than reading an empty host trace.
+/// their site's counter ([`GPU_DEVICE_ONLY_DOWNGRADES`] at R2,
+/// [`GPU_RESIDENT_AUX_DOWNGRADES`] at R1) and continue host-backed — slower,
+/// never wrong — aborting only when the resident handles cannot serve the
+/// data. R3 and R4 have no such recovery: the R3 barycentric arms assert on
+/// the buffer they are about to read and the R4 guards on `host_trace_empty`,
+/// both failing loudly rather than reading an empty host trace.
 ///
 /// `zerofier_uniform` must be the R1-derived conservative form (all constraints
 /// share `end_exemptions == 0`), which implies `ZerofierEvaluations::is_uniform`
@@ -232,7 +235,8 @@ pub(crate) fn device_only_disabled() -> bool {
 /// costs every gate-true table either a hard-abort at R3/R4 — loud, but an
 /// avoidable crash — or, at R2 and the R1 resident-aux commit, a silent
 /// downgrade to the host path, which is what [`GPU_DEVICE_ONLY_DOWNGRADES`]
-/// exists to surface.
+/// exists to surface (an R1 decline lands in [`GPU_RESIDENT_AUX_DOWNGRADES`],
+/// which the gate does not govern).
 pub(crate) fn device_only_gate<F, E>(
     lde_size: usize,
     n: usize,
@@ -1460,19 +1464,44 @@ pub fn gpu_fri_calls() -> u64 {
 /// are counted here, so a single failed dispatch does not necessarily lower
 /// the total; R3's fallbacks are CPU-only, so a failure there does.
 pub(crate) static GPU_BATCH_INVERT_CALLS: AtomicU64 = AtomicU64::new(0);
-/// Times a table had to fall back to a host trace whose data first had to be
-/// downloaded off the device, because a device path declined at runtime (see
-/// [`materialize_lde_trace_host`] and [`materialize_aux_trace_host`]).
-/// Nonzero means a device dispatch declined and the table continued
-/// host-backed — correct but slower. Not every one is a gate miss: the R1
-/// resident-aux site is entered whenever `aux_resident()` is set, whatever
-/// the device-only gate said, so it also counts declines on tables that were
-/// never device-only. Mirroring the missing condition into the gate is the
-/// fix for the device-only case; a resident-aux decline is usually transient
-/// VRAM pressure instead.
+/// R2 downgrades, and only those: times a device-only table fell back to the
+/// host evaluator and had its resident LDEs downloaded into the host buffers
+/// first ([`materialize_lde_trace_host`], the sole site that bumps this).
+/// Nonzero means the device-only gate cleared a table whose R2 dispatch then
+/// declined at runtime — the table continued host-backed, correct but slower —
+/// so every count is a gate miss, and the fix is to mirror the missing
+/// condition into the gate. The R1 resident-aux downgrade is counted by
+/// [`GPU_RESIDENT_AUX_DOWNGRADES`] instead: it fires on tables the gate never
+/// marked device-only, so summing the two would blame the gate for declines it
+/// never made.
 pub(crate) static GPU_DEVICE_ONLY_DOWNGRADES: AtomicU64 = AtomicU64::new(0);
 pub fn gpu_device_only_downgrades() -> u64 {
     GPU_DEVICE_ONLY_DOWNGRADES.load(Ordering::Relaxed)
+}
+
+/// R1 downgrades, and only those: times the resident aux trace was downloaded
+/// so the aux commit could continue on the host arms, after the device aux LDE
+/// declined and the drain-and-retry either did not run or declined again
+/// ([`materialize_aux_trace_host`], the sole site that bumps this). Independent
+/// of the device-only gate — the site is entered whenever `aux_resident()` is
+/// set, whatever the gate said — so a table that was never device-only can land
+/// here, and a nonzero value points at sustained VRAM pressure rather than a
+/// gate miss. Read it against [`GPU_RESIDENT_AUX_RETRIES`]: retries alone mean
+/// the drain absorbed the pressure, retries plus downgrades mean it did not.
+pub(crate) static GPU_RESIDENT_AUX_DOWNGRADES: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_resident_aux_downgrades() -> u64 {
+    GPU_RESIDENT_AUX_DOWNGRADES.load(Ordering::Relaxed)
+}
+
+/// Times the R1 resident-aux LDE declined and the prover drained the device to
+/// retry it (prover.rs). Nonzero means the device hit transient VRAM pressure —
+/// the retry is what keeps a decline from becoming a
+/// [`GPU_RESIDENT_AUX_DOWNGRADES`] host downgrade, so a run with retries but no
+/// downgrades paid nothing but the drain. Counts declines, not outcomes: it is
+/// bumped before the retry, whether or not the retry then succeeds.
+pub(crate) static GPU_RESIDENT_AUX_RETRIES: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_resident_aux_retries() -> u64 {
+    GPU_RESIDENT_AUX_RETRIES.load(Ordering::Relaxed)
 }
 
 /// Recover a device-only table for the host path: download the resident main
@@ -1692,7 +1721,7 @@ where
         return false;
     }
     trace.aux_resident = None;
-    GPU_DEVICE_ONLY_DOWNGRADES.fetch_add(1, Ordering::Relaxed);
+    GPU_RESIDENT_AUX_DOWNGRADES.fetch_add(1, Ordering::Relaxed);
     true
 }
 

@@ -188,7 +188,8 @@ fn gpu_opening_gather_fires_and_verifies() {
 /// verify). A mis-gate that forces a host fallback shows up one of two ways:
 /// at R3/R4 it panics one of the guards, while at R2 and the R1 resident-aux
 /// commit it recovers silently and is caught by the downgrade-counter
-/// assertion below.
+/// assertions below — one per site, since the R1 counter also covers tables the
+/// device-only gate never cleared.
 #[test]
 #[ignore = "requires GPU; run with --ignored --nocapture"]
 fn gpu_device_only_residency_fires_and_verifies() {
@@ -202,10 +203,17 @@ fn gpu_device_only_residency_fires_and_verifies() {
     assert_eq!(
         stark::gpu_lde::gpu_device_only_downgrades(),
         0,
-        "a table was downgraded back to a host trace on the happy path \
-         (a device dispatch declined at runtime: on a device-only table the \
-          gate should mirror the missing condition; a resident-aux decline is \
-          usually VRAM pressure)"
+        "a device-only table was downgraded back to a host trace on the happy \
+         path (its R2 dispatch declined at runtime: the gate should mirror the \
+          missing condition)"
+    );
+    assert_eq!(
+        stark::gpu_lde::gpu_resident_aux_downgrades(),
+        0,
+        "a table's resident aux trace was downloaded back to the host on the \
+         happy path (the device aux LDE declined and the drain-and-retry did \
+          not recover it — usually VRAM pressure, and not gated on device-only, \
+          so this can fire for a table that was never device-only)"
     );
     assert!(
         verify(&proof, &elf).expect("verify"),
