@@ -42,7 +42,7 @@ mod artifact_tests;
 #[cfg(test)]
 mod tests;
 
-pub use artifact::{AirShape, ArtifactError, ArtifactMeta, ConstraintArtifact};
+pub use artifact::{AirShape, ArtifactError, ArtifactMeta, ArtifactNode, ConstraintArtifact};
 pub use builder::{Expr, IrBuilder};
 pub use device::{DeviceNode, DeviceProgram, eval_device_program};
 pub use interp::{eval_program, eval_program_base, eval_program_verifier};

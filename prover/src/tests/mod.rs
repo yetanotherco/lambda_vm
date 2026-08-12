@@ -49,6 +49,10 @@ pub mod ecsm_tests;
 #[cfg(test)]
 pub mod eq_tests;
 #[cfg(test)]
+pub mod hint_tests;
+#[cfg(test)]
+pub mod ir_stats_dump;
+#[cfg(test)]
 pub mod keccak_rnd_tests;
 #[cfg(test)]
 pub mod load_tests;
@@ -68,6 +72,10 @@ pub mod memw_tests;
 pub mod mul_tests;
 #[cfg(test)]
 pub mod ood_window_ir_tests;
+#[cfg(test)]
+pub mod page_layout_tests;
+#[cfg(test)]
+pub mod page_offset_forgery_poc;
 #[cfg(test)]
 pub mod page_tests;
 #[cfg(test)]

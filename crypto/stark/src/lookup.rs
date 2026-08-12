@@ -834,7 +834,10 @@ pub struct AirWithBuses<
     num_base: usize,
     /// Lazily captured flat IR of every transition constraint, built once on
     /// first request (prover/GPU/tests only — the verify path never forces it).
-    constraint_program: std::sync::OnceLock<crate::constraint_ir::ConstraintProgram<F, E>>,
+    /// Behind `Arc` so clones share the allocation instead of deep-copying the
+    /// program (16-25K nodes on the big tables) per epoch/shard instance.
+    constraint_program:
+        std::sync::OnceLock<std::sync::Arc<crate::constraint_ir::ConstraintProgram<F, E>>>,
     /// A build-time program supplied via [`Self::with_precaptured`], if any.
     ///
     /// Kept separate from `constraint_program` rather than pre-filling that
@@ -854,6 +857,40 @@ pub struct AirWithBuses<
     /// Maximum number of bus elements across all interactions.
     /// Used to compute the correct number of alpha powers.
     max_bus_elements: usize,
+}
+
+/// Cloning an `AirWithBuses` copies its derived artifacts — the MetaBuilder-run
+/// constraint metadata, the LogUp layout, and (if already forced) the captured
+/// constraint IR, shared via `Arc` — so a pre-built, pre-captured prototype
+/// clones into per-shard/per-epoch instances without re-running the constraint
+/// bodies. `B`/`PI` ride in `PhantomData` and need no bounds.
+impl<
+    F: IsFFTField + IsSubFieldOf<E> + IsPrimeField + Send + Sync,
+    E: IsField + Send + Sync,
+    B: BoundaryConstraintBuilder<F, E, PI>,
+    PI,
+    CS: ConstraintSet<F, E> + Clone,
+> Clone for AirWithBuses<F, E, B, PI, CS>
+{
+    fn clone(&self) -> Self {
+        Self {
+            context: self.context.clone(),
+            step_size: self.step_size,
+            trace_layout: self.trace_layout,
+            constraint_set: self.constraint_set.clone(),
+            logup: self.logup.clone(),
+            meta: self.meta.clone(),
+            num_base: self.num_base,
+            constraint_program: self.constraint_program.clone(),
+            precaptured_program: self.precaptured_program.clone(),
+            auxiliary_trace_build_data: self.auxiliary_trace_build_data.clone(),
+            boundary_constraint_builder: PhantomData,
+            preprocessed_commitment: self.preprocessed_commitment,
+            num_precomputed_cols: self.num_precomputed_cols,
+            name: self.name.clone(),
+            max_bus_elements: self.max_bus_elements,
+        }
+    }
 }
 
 impl<
@@ -1143,13 +1180,15 @@ where
         // path never calls this). Runs the table set AND the LogUp emission
         // through one CaptureBuilder, matching the folder emission
         // order/indexing exactly.
-        self.constraint_program.get_or_init(|| {
-            let mut cb = crate::constraints::builder::CaptureBuilder::<F, E>::new();
-            self.constraint_set.eval(&mut cb);
-            emit_logup_constraints(&mut cb, &self.logup, self.num_base);
-            let (prog, _degrees) = cb.finish(self.num_base);
-            prog
-        })
+        self.constraint_program
+            .get_or_init(|| {
+                let mut cb = crate::constraints::builder::CaptureBuilder::<F, E>::new();
+                self.constraint_set.eval(&mut cb);
+                emit_logup_constraints(&mut cb, &self.logup, self.num_base);
+                let (prog, _degrees) = cb.finish(self.num_base);
+                std::sync::Arc::new(prog)
+            })
+            .as_ref()
     }
 
     fn precaptured_constraint_program(
@@ -1177,8 +1216,10 @@ where
             return None;
         }
 
-        // Clone main columns once (shared across all interactions)
-        let main_segment_cols = trace.columns_main();
+        // Host main columns, materialized lazily: the resident GPU aux path
+        // reads the device main in place and must not pay this transpose.
+        let main_cols_cell: std::cell::OnceCell<Vec<Vec<FieldElement<F>>>> =
+            std::cell::OnceCell::new();
         let trace_len = trace.num_rows();
         let _table_name = self.name.as_deref().unwrap_or("UNKNOWN");
 
@@ -1210,7 +1251,12 @@ where
         if trace.resident_aux_ok()
             && let Some(ra) = crate::logup_gpu::try_build_aux_resident_gpu::<F, E>(
                 interactions,
-                &main_segment_cols,
+                trace.num_main_columns,
+                || {
+                    main_cols_cell
+                        .get_or_init(|| trace.columns_main())
+                        .as_slice()
+                },
                 resident_main.as_ref().map(|r| (r.buf.as_ref(), r.rows)),
                 trace_len,
                 challenges,
@@ -1223,12 +1269,14 @@ where
             return Some(BusPublicInputs { table_contribution });
         }
 
+        let main_segment_cols = main_cols_cell.get_or_init(|| trace.columns_main());
+
         // GPU aux build (Goldilocks + ext3 + above threshold) computes all term
         // columns on device, byte identical, and falls back to the CPU build.
         #[cfg(feature = "cuda")]
         let gpu_term_cols = crate::logup_gpu::try_build_term_columns_gpu::<F, E>(
             interactions,
-            &main_segment_cols,
+            main_segment_cols,
             trace_len,
             challenges,
         );
@@ -1242,7 +1290,7 @@ where
                 let build_pair = |i: usize| {
                     compute_logup_term_column(
                         &[&interactions[i * 2], &interactions[i * 2 + 1]],
-                        &main_segment_cols,
+                        main_segment_cols,
                         trace_len,
                         challenges,
                         _table_name,
@@ -1270,7 +1318,7 @@ where
                             &interactions[num_interactions - 2],
                             &interactions[num_interactions - 1],
                         ],
-                        &main_segment_cols,
+                        main_segment_cols,
                         trace_len,
                         challenges,
                         _table_name,
@@ -1278,7 +1326,7 @@ where
                 } else {
                     compute_logup_term_column(
                         &[&interactions[num_interactions - 1]],
-                        &main_segment_cols,
+                        main_segment_cols,
                         trace_len,
                         challenges,
                         _table_name,
@@ -1299,7 +1347,7 @@ where
         let (per_bus_sums, per_bus_sender_sums, per_bus_receiver_sums) =
             compute_debug_bus_sums_batched(
                 &self.auxiliary_trace_build_data.interactions,
-                &main_segment_cols,
+                main_segment_cols,
                 trace_len,
                 challenges,
                 _table_name,
@@ -1372,6 +1420,7 @@ where
 
 /// Struct representing how each lookup air should build its auxiliary trace
 /// Contains a list of all lookup interactions
+#[derive(Clone)]
 pub struct AuxiliaryTraceBuildData {
     pub interactions: Vec<BusInteraction>,
 }

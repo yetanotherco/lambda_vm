@@ -1,6 +1,14 @@
 /target
 /program_artifacts/rust
-/tests/ethrex_hoodi.bin
+# Real-block fixtures (~1 MB): fetched by `make ethrex-real-block-fixture` from a
+# release asset and verified against a sha256 pinned in the Makefile, never
+# committed. See tooling/ethrex-block-converter.
+# One pattern per network the converter accepts (mainnet/hoodi/sepolia — it
+# rejects anything else), so repointing ETHREX_REAL_BLOCK_NETWORK in the Makefile
+# cannot silently make a ~1 MB fixture committable.
+/tests/ethrex_mainnet_*.bin
+/tests/ethrex_hoodi*.bin
+/tests/ethrex_sepolia_*.bin
 /tests/ethrex_bench_*.bin
 # _4 is committed (~17 KB): used by `make recursion-profile-block-input` and
 # scripts/bench_recursion_scaling.sh. Other sizes stay ignored — scaling.sh

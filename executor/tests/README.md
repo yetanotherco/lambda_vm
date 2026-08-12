@@ -52,3 +52,16 @@ ethrex_10_transfers.bin
   sha256: 38901ee4d40b99cf0aa7f642a92f0fc8db76d974bf43033a1673839020c3c28e
   contents: stateless ethrex block with ten plain ETH transfer transactions
 ```
+
+## Real-block fixtures
+
+The blocks above are synthetic (N plain ETH transfers over a small genesis).
+For a representative workload — real contract execution, real trie depth, real
+bytecode — `make ethrex-real-block-fixture` downloads
+`ethrex_mainnet_25368371.bin` (1,110,156 B) from the `bench-fixtures-v1` release
+and verifies it against `ETHREX_REAL_BLOCK_FIXTURE_SHA256` in the Makefile before
+moving it into place. It is gitignored rather than committed, so the checksum
+lives next to the URL in the Makefile rather than in the table above (the checksum
+script only covers committed fixtures). See
+`tooling/ethrex-block-converter/README.md` for how the fixture is produced and
+repointed.

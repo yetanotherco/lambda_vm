@@ -11,6 +11,8 @@ cuda = ["stark/cuda"]
 test-cuda-faults = ["cuda", "stark/test-cuda-faults"]
 debug-checks = ["stark/debug-checks"]
 instruments = ["stark/instruments"]
+# GPU profiling build (Nsight): implies cuda — the toolkit always traces the GPU prover.
+nvtx = ["cuda", "instruments", "stark/nvtx"]
 profile-markers = ["stark/profile-markers"]
 disk-spill = ["stark/disk-spill"]
 # The `LFM_HASH` BLAKE3 arm's round count. Off = 7 rounds (standard BLAKE3,

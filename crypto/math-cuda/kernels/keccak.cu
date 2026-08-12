@@ -366,13 +366,11 @@ extern "C" __global__ void keccak_fri_leaves_ext3(
 // concatenation of two 32-byte siblings, identical to
 // `FieldElementVectorBackend::hash_new_parent` on host.
 // ---------------------------------------------------------------------------
-extern "C" __global__ void keccak_merkle_level(
+__device__ __forceinline__ void hash_merkle_parent(
     uint8_t *nodes,
     uint64_t parent_begin,     // node index (counted in 32-byte nodes)
-    uint64_t n_pairs) {
-    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= n_pairs) return;
-
+    uint64_t n_pairs,
+    uint64_t tid) {
     uint64_t st[25];
     #pragma unroll
     for (int i = 0; i < 25; ++i) st[i] = 0;
@@ -391,6 +389,35 @@ extern "C" __global__ void keccak_merkle_level(
     for (int i = 0; i < 4; ++i) absorb_lane(st, rate_pos, right[i]);
 
     finalize_keccak256(st, rate_pos, nodes + (parent_begin + tid) * 32);
+}
+
+extern "C" __global__ void keccak_merkle_level(
+    uint8_t *nodes,
+    uint64_t parent_begin,     // node index (counted in 32-byte nodes)
+    uint64_t n_pairs) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n_pairs) return;
+    hash_merkle_parent(nodes, parent_begin, n_pairs, tid);
+}
+
+// Build every remaining level (from `level_begin` up to the root) in ONE
+// single-block launch: each level's pairs are grid-strided over the block,
+// with a __syncthreads() barrier between levels. Replaces log2 launches of
+// `keccak_merkle_level` for the small top levels of the tree, whose per-level
+// work is dwarfed by launch overhead.
+extern "C" __global__ void keccak_merkle_tail(
+    uint8_t *nodes,
+    uint64_t level_begin) {
+    uint64_t lb = level_begin;
+    while (lb != 0) {
+        uint64_t nb = lb / 2;
+        uint64_t n_pairs = lb - nb;
+        for (uint64_t tid = threadIdx.x; tid < n_pairs; tid += blockDim.x) {
+            hash_merkle_parent(nodes, nb, n_pairs, tid);
+        }
+        __syncthreads();
+        lb = nb;
+    }
 }
 
 // Gather Merkle authentication paths for a batch of leaf positions, reading the
@@ -470,6 +497,44 @@ extern "C" __global__ void keccak256_leaves_base_row_major_row_pair(
     }
     // Second row (br_1): cols 0..m-1.
     for (uint64_t c = 0; c < m; ++c) {
+        absorb_lane(st, rate_pos, bswap64(goldilocks::canonical(row_1[c])));
+    }
+    finalize_keccak256(st, rate_pos, hashed_leaves_out + tid * 32);
+}
+
+// Column-range variant of `keccak256_leaves_base_row_major_row_pair`: each leaf
+// hashes only columns `[col_start, col_end)` of the two bit-reversed rows,
+// while `m` remains the full row stride. Byte layout equals the CPU
+// `commit_rows_bit_reversed_subset(data, m, col_start, col_end)` — used for
+// preprocessed tables, whose precomputed and multiplicity column ranges commit
+// to separate Merkle trees over the same row-major LDE.
+extern "C" __global__ void keccak256_leaves_base_row_major_row_pair_range(
+    const uint64_t *data,
+    uint64_t m,
+    uint64_t col_start,
+    uint64_t col_end,
+    uint64_t num_rows,
+    uint64_t log_num_rows,
+    uint8_t *hashed_leaves_out)
+{
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t num_leaves = num_rows >> 1;
+    if (tid >= num_leaves) return;
+
+    uint64_t br_0 = __brevll(2 * tid) >> (64 - log_num_rows);
+    uint64_t br_1 = __brevll(2 * tid + 1) >> (64 - log_num_rows);
+    const uint64_t *row_0 = data + br_0 * m;
+    const uint64_t *row_1 = data + br_1 * m;
+
+    uint64_t st[25];
+    #pragma unroll
+    for (int i = 0; i < 25; ++i) st[i] = 0;
+
+    uint32_t rate_pos = 0;
+    for (uint64_t c = col_start; c < col_end; ++c) {
+        absorb_lane(st, rate_pos, bswap64(goldilocks::canonical(row_0[c])));
+    }
+    for (uint64_t c = col_start; c < col_end; ++c) {
         absorb_lane(st, rate_pos, bswap64(goldilocks::canonical(row_1[c])));
     }
     finalize_keccak256(st, rate_pos, hashed_leaves_out + tid * 32);

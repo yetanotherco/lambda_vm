@@ -354,10 +354,15 @@ const DESIGN_INSTR: &[(&str, usize)] = &[
     ("PAGE", 41),
     ("REGISTER", 29),
     ("KECCAK", 3_146),
-    ("KECCAK_RND", 14_016),
+    // 14_016 → 12_998: main replaced the θ/ρ HWSL lookups with inline μ-gated
+    // linear identities in `KeccakRndConstraints`, which nets −1018 constraint
+    // arithmetic rows (the same change whose receiver-side multiplicity drop is
+    // reconciled in `keccak_adapter::bitwise_ops_for`).
+    ("KECCAK_RND", 12_998),
     ("KECCAK_RC", 26),
     ("ECSM", 19_264),
     ("ECDAS", 22_718),
+    ("HINT", 418), // main's new receiver AIR for the `hint` ecall.
     ("L2G_GLOBAL", 27),
     ("L2G_MEMORY", 65),
     ("GLOBAL_MEMORY", 25),
@@ -635,7 +640,7 @@ fn neg_lowers_to_a_subtract_from_zero() {
 /// is legal — merely wasteful — and the differential would not notice.
 #[test]
 fn dead_nodes_are_eliminated() {
-    use stark::constraint_ir::DeviceNode;
+    use stark::constraint_ir::ArtifactNode;
 
     let opts = options();
     let airs = production_airs(&opts);
@@ -655,11 +660,11 @@ fn dead_nodes_are_eliminated() {
     // strictly earlier, so `validate_self` still accepts it.
     let mut injected = clean.clone();
     let n = injected.nodes.len() as u32;
-    injected.nodes.push(DeviceNode {
+    injected.nodes.push(ArtifactNode {
         op: stark::constraint_ir::device::OP_MUL,
         a: n - 2,
         b: n - 1,
-        dim: stark::constraint_ir::device::DIM_EXT,
+        dim: stark::constraint_ir::artifact::DIM_EXT,
     });
     injected
         .validate_self()
@@ -1563,8 +1568,14 @@ fn continuation_epoch_constraint_leg_cost() {
     // The design's §8.2.2 arithmetic, reproduced from the emitter's own unfused
     // counts. A mismatch means the epoch composition changed, which is a finding
     // about the epoch, not about this pass.
+    //
+    // 63_393 → 62_375 (−1018): attributed in full to KECCAK_RND, which is in
+    // `FIXED`. Main replaced its θ/ρ HWSL lookups with inline μ-gated linear
+    // identities in `KeccakRndConstraints`, netting −1018 constraint arithmetic
+    // rows — the exact same delta the per-AIR census records for KECCAK_RND
+    // (14_016 → 12_998). No other table moved; this is not a blind re-bless.
     assert_eq!(
-        design_intermediate, 63_393,
+        design_intermediate, 62_375,
         "the design's intermediate-epoch budget no longer reproduces"
     );
     assert!(

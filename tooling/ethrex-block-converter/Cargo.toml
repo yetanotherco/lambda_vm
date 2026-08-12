@@ -1,0 +1,61 @@
+[package]
+name = "ethrex-block-converter"
+version = "0.1.0"
+edition = "2024"
+
+# Detached workspace: keeps the heavy ethrex host deps out of the main build.
+[workspace]
+
+[dependencies]
+# Pinned to the SAME ethrex rev as the guest (open LambdaVM-backend PR branch)
+# so the generated ProgramInput rkyv layout matches what the guest deserializes.
+ethrex-common = { git = "https://github.com/lambdaclass/ethrex.git", rev = "156cb8d6a3974f411d71622eecd1b249ee37ff1c", package = "ethrex-common", default-features = false }
+ethrex-config = { git = "https://github.com/lambdaclass/ethrex.git", rev = "156cb8d6a3974f411d71622eecd1b249ee37ff1c", package = "ethrex-config", default-features = false }
+# Matches the guest's own declaration (executor/programs/rust/ethrex/Cargo.toml).
+#
+# CAVEAT: this line alone does NOT reproduce the guest's precompile surface. The
+# `ethrex-config` dep above pulls `ethrex-p2p`, whose `default = ["c-kzg"]`
+# propagates to `ethrex-crypto/c-kzg` — and `default-features = false` cannot
+# switch it off, because ethrex's own workspace declares `ethrex-p2p` with its
+# defaults on. So this graph links a working c-kzg (and malachite modexp, and
+# `ark-ff/asm` BN254) that the guest does not have; verify with
+# `cargo tree -e features -i ethrex-crypto`. Closing that gap means dropping
+# `ethrex-config` and sourcing `ChainConfig` another way — see the README.
+ethrex-guest-program = { git = "https://github.com/lambdaclass/ethrex.git", rev = "156cb8d6a3974f411d71622eecd1b249ee37ff1c", package = "ethrex-guest-program", default-features = false, features = ["lambdavm"] }
+
+# Exact pin: the fixture writer and the guest/executor readers must agree on the
+# rkyv layout. Keep this in sync with the guest
+# (executor/programs/rust/ethrex/Cargo.toml) and the other two detached ethrex
+# tool workspaces (tooling/ethrex-fixtures, tooling/ethrex-tests). The `executor`
+# crate itself declares no rkyv — the guest is what deserializes ProgramInput.
+rkyv = { version = "=0.8.16", features = ["std", "unaligned"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Not used by this crate's code directly — declared to pin k256's feature set.
+# `lambda-vm-ethrex-crypto` (a dev-dependency) is otherwise the only thing asking
+# for `expose-field`, and under resolver 3 dev-dependency features are not unified
+# into builds that exclude dev-dependencies. This crate is built both ways against
+# one target dir: `cargo run` for `make regen-real-block-fixture`, `cargo test` for
+# `make test-ethrex-real-block-converter`. Without this line the two resolve
+# different k256 feature sets, so alternating between them recompiles k256 and every
+# ethrex crate above it. Declaring the features here puts them in both resolutions.
+# Keep in sync with crypto/ethrex-crypto's k256 line; verify:
+#   cargo tree -e features,no-dev -i k256   # must list expose-field
+#   cargo tree -e features -i k256          # must match the above
+k256 = { version = "=0.13.4", default-features = false, features = ["arithmetic", "expose-field"] }
+
+[dev-dependencies]
+# The `Crypto` impl the guest injects. Off riscv64 its keccak and ECSM paths both
+# fall back to software, so this exercises the guest's *fallback* crypto semantics
+# — not the accelerators themselves. (Its k256 feature needs are mirrored in
+# [dependencies] above — see the comment there.)
+lambda-vm-ethrex-crypto = { path = "../../crypto/ethrex-crypto" }
+# No feature delta against the rest of the graph (sha2/std is already on), so this
+# one can stay a dev-dependency without forcing the rebuild described above.
+sha2 = "0.10"
+
+# `ethrex-guest-program`'s `lambdavm` feature pins `lambda-vm-syscalls` to an
+# older commit; override it with our working-tree copy, as the guest does.
+[patch."https://github.com/yetanotherco/lambda_vm.git"]
+lambda-vm-syscalls = { path = "../../syscalls" }

@@ -40,8 +40,8 @@ const ELF_PATH: &str = "../../executor/program_artifacts/rust/ethrex.elf";
 const FIXTURES_DIR: &str = "../../executor/tests";
 
 /// Larger-block smoke test: a synthetic ethrex block with 10 ETH transfers.
-/// (Replaces the old `ethrex_hoodi.bin` real-block fixture, which was in the
-/// pre-Crypto-trait ethrex format and no longer deserializes.)
+/// (The old `ethrex_hoodi.bin` real-block fixture predated the `Crypto` trait
+/// and no longer deserializes; the current real-block fixture is separate.)
 #[ignore = "heavier synthetic block (10 txs); run in the dedicated --ignored CI step"]
 #[test]
 fn test_ethrex() {
@@ -82,6 +82,89 @@ fn test_ethrex_empty_block() {
     use rkyv::rancor::Error;
     use std::sync::Arc;
     let inputs = std::fs::read(format!("{FIXTURES_DIR}/ethrex_empty_block.bin")).unwrap();
+    let input = rkyv::from_bytes::<ProgramInput, Error>(&inputs).unwrap();
+    let output = execution_program(input, Arc::new(NativeCrypto)).unwrap();
+    run_program_and_check_public_output(ELF_PATH, output.encode(), inputs);
+}
+
+const REAL_BLOCK_FIXTURE: &str = "ethrex_mainnet_25368371.bin";
+
+/// Host-only acceptance gate for the real-block fixture that
+/// `make ethrex-real-block-fixture` fetches and checksums (produced offline by
+/// `tooling/ethrex-block-converter`): the block is
+/// re-executed statelessly against its own witness, so a successful run means
+/// the recovered tries, codes and headers reproduce the header's post-state
+/// root. Needs no guest ELF, which is what keeps it runnable where the RV64
+/// toolchain isn't available.
+///
+/// Checks the *serialized artifact* specifically — that the published rkyv
+/// bytes deserialize and execute — which is why it reads the `.bin` rather
+/// than converting the cache itself.
+///
+/// It is also, in practice, the check that the block needs no KZG: this crate's
+/// dependency graph links no KZG backend, so a block calling point evaluation
+/// (0x0a) diverges from consensus here and fails. That property is incidental to
+/// the dep graph rather than declared, so `no_kzg_backend_linked` below pins it.
+/// (`tooling/ethrex-block-converter`'s parity test does NOT cover 0x0a — it links
+/// `c-kzg` transitively via `ethrex-config`.)
+#[test]
+fn test_ethrex_real_block_native() {
+    use ethrex_guest_program::crypto::NativeCrypto;
+    use ethrex_guest_program::l1::{ProgramInput, execution_program};
+    use rkyv::rancor::Error;
+    use std::sync::Arc;
+    let inputs = std::fs::read(format!("{FIXTURES_DIR}/{REAL_BLOCK_FIXTURE}")).unwrap();
+    let input = rkyv::from_bytes::<ProgramInput, Error>(&inputs).unwrap();
+    execution_program(input, Arc::new(NativeCrypto)).unwrap();
+}
+
+/// Pins the property the test above leans on: this crate's dependency graph must
+/// link no KZG backend, so a block calling point evaluation (0x0a) diverges from
+/// consensus and fails rather than passing on a surface the guest doesn't have.
+/// If a future dependency pulls `c-kzg` or `kzg-rs` in, this goes red instead of
+/// the screen silently disappearing.
+/// Detection is by error *text*, deliberately: zero input fails under a linked
+/// backend too (invalid G1 encoding), and both paths surface as
+/// `CryptoError::Other`, so the variant can't tell them apart. The string comes
+/// from `ethrex-crypto`'s `KzgError::Unimplemented`; if upstream rewords it this
+/// test goes red, which is the safe direction.
+///
+/// Worth knowing why this can regress: `ethrex-crypto`'s own default feature set
+/// is `["std", "kzg-rs", "secp256k1"]`, so any future dependency pulling it in
+/// with defaults on restores a backend and silently removes the screen.
+#[test]
+fn no_kzg_backend_linked() {
+    use ethrex_guest_program::crypto::{Crypto, NativeCrypto};
+    let result = NativeCrypto.verify_kzg_proof(&[0u8; 32], &[0u8; 32], &[0u8; 48], &[0u8; 48]);
+    let message = match result {
+        Ok(()) => "verify_kzg_proof accepted zero input".to_string(),
+        Err(err) => format!("{err:?}"),
+    };
+    assert!(
+        message.contains("One of features c-kzg, openvm-kzg or kzg-rs should be active"),
+        "a KZG backend is linked into ethrex-tests, so test_ethrex_real_block_native no \
+         longer screens precompile 0x0a: {message}"
+    );
+}
+
+/// The same real block through the guest ELF, checking the VM's committed
+/// output matches the native reference. Split from the native gate above
+/// because this one needs the ethrex ELF and is far heavier than the synthetic
+/// fixtures (a ~1 MB witness, real contract execution).
+///
+/// Deliberately excluded from the PR CI step, which otherwise runs everything
+/// via `--include-ignored`: the cycle cost of a real block in the VM has not
+/// been measured yet, so it is opt-in until we know what it does to job time.
+/// Run it explicitly with:
+///   cd tooling/ethrex-tests && cargo test --release test_ethrex_real_block_vm -- --ignored
+#[ignore = "real block through the VM; unmeasured runtime, run explicitly on a build server"]
+#[test]
+fn test_ethrex_real_block_vm() {
+    use ethrex_guest_program::crypto::NativeCrypto;
+    use ethrex_guest_program::l1::{ProgramInput, execution_program};
+    use rkyv::rancor::Error;
+    use std::sync::Arc;
+    let inputs = std::fs::read(format!("{FIXTURES_DIR}/{REAL_BLOCK_FIXTURE}")).unwrap();
     let input = rkyv::from_bytes::<ProgramInput, Error>(&inputs).unwrap();
     let output = execution_program(input, Arc::new(NativeCrypto)).unwrap();
     run_program_and_check_public_output(ELF_PATH, output.encode(), inputs);

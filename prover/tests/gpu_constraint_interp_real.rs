@@ -30,7 +30,8 @@ use math_cuda::device::backend;
 use math_cuda::lde::{GpuLdeBase, GpuLdeExt3};
 
 use stark::constraint_ir::device::{
-    DeviceProgram, OP_ALPHA_POW, OP_RAP_CHALLENGE, OP_VAR, eval_device_program, unpack_var,
+    DeviceProgram, OP_ADD, OP_ALPHA_POW, OP_EMBED, OP_MUL, OP_NEG, OP_RAP_CHALLENGE, OP_SUB,
+    OP_VAR, OPK_ALPHA, OPK_PAYLOAD_MASK, OPK_RAP, OPK_SHIFT, eval_device_program, unpack_var,
 };
 use stark::constraint_ir::gpu_interp::try_eval_program_gpu;
 use stark::proof::options::GoldilocksCubicProofOptions;
@@ -68,6 +69,17 @@ fn enc(x: &Fp3) -> [u64; 3] {
 /// program actually references.
 fn program_footprint(dev: &DeviceProgram) -> (usize, usize, usize, usize, usize) {
     let (mut main_cols, mut aux_cols, mut rap_len, mut alpha_len, mut max_off) = (0, 0, 0, 0, 0);
+    // Uniform leaves are propagated into operand encodings, so the RAP/alpha
+    // footprint must be read from the operands of arithmetic nodes (the
+    // root-pinned leaf-node forms are kept for completeness).
+    let scan_operand = |enc: u32, rap_len: &mut usize, alpha_len: &mut usize| {
+        let payload = (enc & OPK_PAYLOAD_MASK) as usize;
+        match enc >> OPK_SHIFT {
+            OPK_RAP => *rap_len = (*rap_len).max(payload + 1),
+            OPK_ALPHA => *alpha_len = (*alpha_len).max(payload + 1),
+            _ => {}
+        }
+    };
     for n in &dev.nodes {
         match n.op {
             OP_VAR => {
@@ -82,6 +94,11 @@ fn program_footprint(dev: &DeviceProgram) -> (usize, usize, usize, usize, usize)
             }
             OP_RAP_CHALLENGE => rap_len = rap_len.max(n.a as usize + 1),
             OP_ALPHA_POW => alpha_len = alpha_len.max(n.a as usize + 1),
+            OP_ADD | OP_SUB | OP_MUL => {
+                scan_operand(n.a, &mut rap_len, &mut alpha_len);
+                scan_operand(n.b, &mut rap_len, &mut alpha_len);
+            }
+            OP_NEG | OP_EMBED => scan_operand(n.a, &mut rap_len, &mut alpha_len),
             _ => {}
         }
     }
@@ -145,6 +162,7 @@ fn check_air(air: &dyn AIR<Field = Gl, FieldExtension = Ext, PublicInputs = ()>,
         stream.synchronize().expect("sync uploads");
 
         let main = GpuLdeBase {
+            ready: None,
             buf: Arc::new(base_dev),
             m: main_cols,
             lde_size,
@@ -153,6 +171,7 @@ fn check_air(air: &dyn AIR<Field = Gl, FieldExtension = Ext, PublicInputs = ()>,
             trace_rows: 0,
         };
         let aux = GpuLdeExt3 {
+            ready: None,
             buf: Arc::new(aux_dev),
             m: aux_cols,
             lde_size,
@@ -252,4 +271,5 @@ fn all_table_programs_gpu_match_cpu_oracle() {
     check_air(&create_keccak_rc_air(&opts), "KECCAK_RC");
     check_air(&create_ecsm_air(&opts), "ECSM");
     check_air(&create_ecdas_air(&opts), "ECDAS");
+    check_air(&create_hint_air(&opts), "HINT");
 }

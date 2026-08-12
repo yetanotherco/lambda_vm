@@ -10,6 +10,7 @@
 //! - Minimal trace generation for testing
 //! - AIR creation helpers
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
@@ -65,6 +66,9 @@ use crate::tables::ecsm::{
 };
 use crate::tables::eq::{EqConstraints, bus_interactions as eq_bus_interactions, cols as eq_cols};
 use crate::tables::halt::{bus_interactions as halt_bus_interactions, cols as halt_cols};
+use crate::tables::hint::{
+    HintConstraints, bus_interactions as hint_bus_interactions, cols as hint_cols,
+};
 use crate::tables::keccak::{
     KeccakConstraints, bus_interactions as keccak_bus_interactions, cols as keccak_cols,
 };
@@ -604,7 +608,44 @@ pub fn generate_minimal_bitwise_trace(ops: &[BitwiseOperation]) -> TraceTable<F,
 /// LogUp constraints from the interactions; `constraint_set` supplies the
 /// base-field (table) constraints (or [`EmptyConstraints`] for pure-lookup
 /// tables).
-fn build_air<CS: ConstraintSet<F, E> + 'static>(
+/// Process-wide cache of pre-built, pre-captured AIR prototypes, keyed by
+/// `(table name, proof options)`. Constructing an [`AirWithBuses`] runs every
+/// constraint body through a MetaBuilder, and its first `constraint_program()`
+/// runs them again for the IR capture — for the big tables (ECDAS/ECSM/
+/// KECCAK_RND, 16-25K IR nodes) that is by far the dominant cost of building
+/// an AIR. Continuation epochs rebuild the full table set per epoch and shard
+/// tables build one instance per shard, so without this cache the same walks
+/// re-run dozens of times per prove. A prototype is built (and captured) once;
+/// every later request clones it — the clone copies the derived metadata and
+/// the already-captured IR, never re-running the bodies.
+///
+/// Key correctness: for a given name the constraint set and bus interactions
+/// are a pure function of the table module (PAGE embeds its page base in the
+/// name), and `ProofOptions` covers everything else `AirWithBuses::new` reads.
+/// The cached prototype is pristine — `with_name` / `with_preprocessed` apply
+/// to the caller's clone only.
+fn air_prototype_cache()
+-> &'static std::sync::Mutex<HashMap<AirProtoKey, Box<dyn std::any::Any + Send + Sync>>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<AirProtoKey, Box<dyn std::any::Any + Send + Sync>>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+type AirProtoKey = (String, u8, usize, u64, u8, u8);
+
+fn air_proto_key(name: &str, o: &ProofOptions) -> AirProtoKey {
+    (
+        name.to_string(),
+        o.blowup_factor,
+        o.fri_number_of_queries,
+        o.coset_offset,
+        o.grinding_factor,
+        o.fri_final_poly_log_degree,
+    )
+}
+
+fn build_air<CS: ConstraintSet<F, E> + Clone + Send + Sync + 'static>(
     num_columns: usize,
     interactions: Vec<BusInteraction>,
     proof_options: &ProofOptions,
@@ -612,14 +653,30 @@ fn build_air<CS: ConstraintSet<F, E> + 'static>(
     constraint_set: CS,
     name: &str,
 ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), CS> {
-    AirWithBuses::new(
+    type Proto<CS> = AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), CS>;
+    let key = air_proto_key(name, proof_options);
+    {
+        let cache = air_prototype_cache().lock().unwrap();
+        if let Some(proto) = cache.get(&key).and_then(|p| p.downcast_ref::<Proto<CS>>()) {
+            return proto.clone();
+        }
+    }
+    let air = Proto::<CS>::new(
         num_columns,
         AuxiliaryTraceBuildData { interactions },
         proof_options,
         step_size,
         constraint_set,
     )
-    .with_name(name)
+    .with_name(name);
+    // Pre-capture the constraint IR so every clone carries it (the prover's
+    // GPU lowering and interpreter paths force it per instance otherwise).
+    let _ = air.constraint_program();
+    air_prototype_cache()
+        .lock()
+        .unwrap()
+        .insert(key, Box::new(air.clone()));
+    air
 }
 
 /// Create CPU AIR with all constraints and bus interactions.
@@ -840,6 +897,21 @@ pub fn create_halt_air(proof_options: &ProofOptions) -> ConcreteVmAir<EmptyConst
     )
 }
 
+/// Create HINT AIR: a receiver for the `hint` ecall (Ecall receive, the x10/x11/x12
+/// register reads, the three ALU `LT` operand range-checks, four output MEMW writes,
+/// output byte range-checks) with a single boolean constraint on the multiplicity
+/// column `mu`.
+pub fn create_hint_air(proof_options: &ProofOptions) -> ConcreteVmAir<HintConstraints> {
+    build_air(
+        hint_cols::NUM_COLUMNS,
+        hint_bus_interactions(),
+        proof_options,
+        1,
+        HintConstraints,
+        "HINT",
+    )
+}
+
 /// Create COMMIT AIR with constraints and bus interactions.
 pub fn create_commit_air(proof_options: &ProofOptions) -> ConcreteVmAir<CommitConstraints> {
     build_air(
@@ -1024,6 +1096,7 @@ pub fn production_airs(proof_options: &ProofOptions) -> Vec<LabeledAir> {
         ("KECCAK_RC", Box::new(create_keccak_rc_air(proof_options))),
         ("ECSM", Box::new(create_ecsm_air(proof_options))),
         ("ECDAS", Box::new(create_ecdas_air(proof_options))),
+        ("HINT", Box::new(create_hint_air(proof_options))),
         // ---- continuation-only tables (no monolithic proof contains these) ----
         (
             "L2G_GLOBAL",
@@ -1061,7 +1134,7 @@ pub fn create_global_memory_air(
     crate::continuation::global_memory_air(proof_options, &config, Some([0u8; 32]))
 }
 
-/// The number of production table AIRs [`production_airs`] yields: 25 monolithic
+/// The number of production table AIRs [`production_airs`] yields: 26 monolithic
 /// plus 3 continuation-only.
 ///
 /// Every suite that iterates the list asserts against this. That assert is the
@@ -1070,4 +1143,4 @@ pub fn create_global_memory_air(
 /// per-table suite at once and silently — which is exactly what happened to the
 /// three continuation tables. Bump it deliberately when a table is genuinely
 /// added or removed.
-pub const NUM_PRODUCTION_AIRS: usize = 28;
+pub const NUM_PRODUCTION_AIRS: usize = 29;

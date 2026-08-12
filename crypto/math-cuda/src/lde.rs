@@ -167,25 +167,10 @@ fn d2h_bytes_via_pinned_hashes(
     dev_bytes: &CudaSlice<u8>,
     dst: &mut [u8],
 ) -> Result<()> {
-    let n_bytes = dst.len();
-    let u64_len = n_bytes.div_ceil(8);
-    let staging_slot = be.pinned_hashes();
-    let mut staging = staging_slot.lock().unwrap();
-    staging.ensure_capacity(u64_len, &be.ctx)?;
-    let pinned = unsafe { staging.as_mut_slice(u64_len) };
-    // Reinterpret the u64 pinned buffer as bytes — same allocation, just
-    // typed differently. SAFETY: u64 has stricter alignment than u8 and the
-    // byte length fits in the `u64_len` capacity (rounded up to u64).
-    let pinned_bytes: &mut [u8] =
-        unsafe { std::slice::from_raw_parts_mut(pinned.as_mut_ptr() as *mut u8, n_bytes) };
-    stream.memcpy_dtoh(dev_bytes, pinned_bytes)?;
-    stream.synchronize()?;
-
-    // Runs under the pinned_hashes lock, where rayon can deadlock. See
-    // `Backend::pinned_staging`.
-    dst.copy_from_slice(pinned_bytes);
-    drop(staging);
-    Ok(())
+    let pending =
+        crate::device::async_dtoh_via(stream, be.pinned_hashes(), &be.ctx, dev_bytes, dst.len())?;
+    // Waits only for work queued up to the copy (event), not the whole stream.
+    pending.wait_into_bytes(dst)
 }
 
 /// Run `pointwise_mul_batched`: `buf[c*col_stride + i] *= weights[i]` for
@@ -277,9 +262,32 @@ fn run_row_major_ntt_body(
     log_n: u64,
     m: u64,
 ) -> Result<()> {
+    // Levels 0..8 fused in shmem (one DRAM pass instead of eight); the
+    // remaining high-stride levels keep one kernel per level.
+    let mut first_level = 0u64;
+    if n >= 256 {
+        let t: u32 = 8.min(m as u32).max(1);
+        let cfg = LaunchConfig {
+            grid_dim: ((m as u32).div_ceil(t), ((n / 256) as u32).min(65535), 1),
+            block_dim: (t, 128, 1),
+            shared_mem_bytes: 256 * (t + 1) * 8,
+        };
+        unsafe {
+            stream
+                .launch_builder(&be.ntt_dit_8_levels_row_major)
+                .arg(&mut *buf)
+                .arg(tw)
+                .arg(&n)
+                .arg(&log_n)
+                .arg(&m)
+                .launch(cfg)?;
+        }
+        first_level = 8.min(log_n);
+    }
+
     let col_tile: u32 = 32.min(m as u32);
     let row_tile: u32 = (256 / col_tile).max(1);
-    for level in 0..log_n {
+    for level in first_level..log_n {
         let cfg = LaunchConfig {
             grid_dim: (
                 (m as u32).div_ceil(col_tile),
@@ -343,6 +351,46 @@ fn launch_keccak_base_row_major_row_pair(
     Ok(())
 }
 
+/// Column-range variant of [`launch_keccak_base_row_major_row_pair`]: leaves
+/// hash only columns `[col_start, col_end)` of each bit-reversed row pair
+/// (`m` stays the full row stride). Matches the CPU
+/// `commit_rows_bit_reversed_subset`.
+#[allow(clippy::too_many_arguments)]
+fn launch_keccak_base_row_major_row_pair_range(
+    stream: &CudaStream,
+    be: &Backend,
+    buf: &CudaSlice<u64>,
+    m: u64,
+    col_start: u64,
+    col_end: u64,
+    num_rows: u64,
+    log_num_rows: u64,
+    leaves_out: &mut cudarc::driver::CudaViewMut<'_, u8>,
+) -> Result<()> {
+    debug_assert!(
+        num_rows >= 2,
+        "row-major row-pair keccak requires num_rows >= 2"
+    );
+    debug_assert!(
+        col_start < col_end && col_end <= m,
+        "column range in bounds"
+    );
+    let cfg = keccak_launch_cfg(num_rows >> 1);
+    unsafe {
+        stream
+            .launch_builder(&be.keccak256_leaves_base_row_major_row_pair_range)
+            .arg(buf)
+            .arg(&m)
+            .arg(&col_start)
+            .arg(&col_end)
+            .arg(&num_rows)
+            .arg(&log_num_rows)
+            .arg(leaves_out)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
 /// Transpose row-major `lde_size × cols` → column-major with stride `lde_size`,
 /// returning the new device buffer. Used to convert the row-major LDE output to
 /// the column-major layout expected by downstream GPU kernels (DEEP, barycentric).
@@ -386,67 +434,41 @@ enum InnerInput<'a> {
     Dev(&'a CudaSlice<u64>),
 }
 
-/// Shared row-major LDE + Keccak + Merkle pipeline for the base and ext3 paths.
-///
-/// `total_cols` is the number of base-field columns in the row-major layout:
-/// `m` for base, `m * 3` for ext3. Because `Fp3 = [u64; 3]`, the three ext3
-/// components are just three adjacent base-field columns, so the same row-major
-/// NTT and Keccak kernels process all of them simultaneously — no de-interleave.
-///
-/// Single H2D (or D2D), row-major NTT, single D2H — no CPU-side extract or
-/// transpose. Returns (merkle_nodes, column-major device buffer, row-major LDE
-/// Vec, optional trace-domain column-major snapshot — `Some` iff
-/// `retain_trace_col_major`). The buffer is transposed to column-major (as
-/// required by the downstream GPU kernels DEEP/barycentric); callers wrap it in
-/// the appropriate LDE handle.
-#[allow(clippy::type_complexity)]
+/// The expansion stage shared by the row-major commit pipelines: upload (or
+/// D2D-copy) the row-major trace into a zero-padded `lde_size × total_cols`
+/// buffer, optionally snapshot the trace-domain input column-major (for the
+/// LogUp fingerprint kernel), then iNTT → coset weights → forward NTT in
+/// place. Returns the row-major LDE buffer and the optional snapshot.
 #[allow(clippy::too_many_arguments)]
-fn coset_lde_row_major_inner(
+fn expand_row_major_on_stream(
+    stream: &Arc<CudaStream>,
+    be: &Backend,
     input: InnerInput,
     n: usize,
     total_cols: usize,
     blowup_factor: usize,
     weights: &[u64],
-    what: &str,
     retain_trace_col_major: bool,
-    retain_host_lde: bool,
-) -> Result<(
-    GpuMerkleTree,
-    CudaSlice<u64>,
-    Vec<u64>,
-    Option<CudaSlice<u64>>,
-)> {
-    let input_len = match &input {
-        InnerInput::Host(h) => h.len(),
-        InnerInput::Dev(d) => d.len(),
-    };
-    assert_eq!(input_len, n * total_cols);
-    assert!(n.is_power_of_two());
-    assert_eq!(weights.len(), n);
-    assert!(blowup_factor.is_power_of_two());
+) -> Result<(CudaSlice<u64>, Option<CudaSlice<u64>>)> {
     let lde_size = n * blowup_factor;
-    assert_u32_domain(lde_size, what);
-
-    // Row-pair trace commit: one Merkle leaf per bit-reversed row pair (rows 2i,
-    // 2i+1), matching the CPU `commit_bit_reversed(.., ROWS_PER_LEAF=2)` and the
-    // verifier's `verify_opening_pair`. `lde_size` is a power of two >= 2, so it
-    // is always even.
-    let num_leaves = lde_size / 2;
-    let nodes_bytes = KeccakCommit::FullTree.total_nodes_bytes(num_leaves);
     let log_n = n.trailing_zeros() as u64;
     let log_lde = lde_size.trailing_zeros() as u64;
     let n_u64 = n as u64;
     let lde_u64 = lde_size as u64;
     let cols_u64 = total_cols as u64;
 
-    let be = backend()?;
-    let stream = be.next_stream();
-
     // Fill a zeroed lde_size*total_cols buffer; only the first n*total_cols rows
     // carry data, the remainder are already zero (zero-padding for LDE). Host
     // input uploads (H2D); device input copies in place (D2D, no PCIe upload).
+    // Big host traces go through the pinned staging slot: the driver's
+    // internal pageable staging is 2-3x slower and convoys across threads.
+    const PINNED_H2D_MIN_U64: usize = 1 << 20;
     let mut buf = stream.alloc_zeros::<u64>(lde_size * total_cols)?;
     match input {
+        InnerInput::Host(h) if h.len() >= PINNED_H2D_MIN_U64 => {
+            let mut dst = buf.slice_mut(0..n * total_cols);
+            crate::device::htod_via(stream, be.pinned_staging(), &be.ctx, h, &mut dst)?;
+        }
         InnerInput::Host(h) => stream.memcpy_htod(h, &mut buf.slice_mut(0..n * total_cols))?,
         InnerInput::Dev(d) => stream.memcpy_dtod(d, &mut buf.slice_mut(0..n * total_cols))?,
     }
@@ -458,7 +480,7 @@ fn coset_lde_row_major_inner(
     // bit-reversed): dst[col*n + row] = buf[row*total_cols + col].
     let trace_col_major = if retain_trace_col_major {
         Some(launch_row_to_col_major(
-            &stream, be, &buf, n, total_cols, n as u64,
+            stream, be, &buf, n, total_cols, n as u64,
         )?)
     } else {
         None
@@ -495,6 +517,75 @@ fn coset_lde_row_major_inner(
         cols_u64,
     )?;
 
+    Ok((buf, trace_col_major))
+}
+
+/// Shared row-major LDE + Keccak + Merkle pipeline for the base and ext3 paths.
+///
+/// `total_cols` is the number of base-field columns in the row-major layout:
+/// `m` for base, `m * 3` for ext3. Because `Fp3 = [u64; 3]`, the three ext3
+/// components are just three adjacent base-field columns, so the same row-major
+/// NTT and Keccak kernels process all of them simultaneously — no de-interleave.
+///
+/// Single H2D (or D2D), row-major NTT, single D2H — no CPU-side extract or
+/// transpose. Returns (merkle_nodes, column-major device buffer, row-major LDE
+/// Vec, optional trace-domain column-major snapshot — `Some` iff
+/// `retain_trace_col_major`). The buffer is transposed to column-major (as
+/// required by the downstream GPU kernels DEEP/barycentric); callers wrap it in
+/// the appropriate LDE handle.
+#[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
+fn coset_lde_row_major_inner(
+    input: InnerInput,
+    n: usize,
+    total_cols: usize,
+    blowup_factor: usize,
+    weights: &[u64],
+    what: &str,
+    retain_trace_col_major: bool,
+    retain_host_lde: bool,
+) -> Result<(
+    GpuMerkleTree,
+    CudaSlice<u64>,
+    Vec<u64>,
+    Option<CudaSlice<u64>>,
+    Arc<crate::device::PooledEvent>,
+)> {
+    let input_len = match &input {
+        InnerInput::Host(h) => h.len(),
+        InnerInput::Dev(d) => d.len(),
+    };
+    assert_eq!(input_len, n * total_cols);
+    assert!(n.is_power_of_two());
+    assert_eq!(weights.len(), n);
+    assert!(blowup_factor.is_power_of_two());
+    let lde_size = n * blowup_factor;
+    assert_u32_domain(lde_size, what);
+
+    // Row-pair trace commit: one Merkle leaf per bit-reversed row pair (rows 2i,
+    // 2i+1), matching the CPU `commit_bit_reversed(.., ROWS_PER_LEAF=2)` and the
+    // verifier's `verify_opening_pair`. `lde_size` is a power of two >= 2, so it
+    // is always even.
+    let num_leaves = lde_size / 2;
+    let nodes_bytes = KeccakCommit::FullTree.total_nodes_bytes(num_leaves);
+    let log_lde = lde_size.trailing_zeros() as u64;
+    let lde_u64 = lde_size as u64;
+    let cols_u64 = total_cols as u64;
+
+    let be = backend()?;
+    let stream = be.next_stream();
+
+    let (buf, trace_col_major) = expand_row_major_on_stream(
+        &stream,
+        be,
+        input,
+        n,
+        total_cols,
+        blowup_factor,
+        weights,
+        retain_trace_col_major,
+    )?;
+
     // Keccak + Merkle on-device. Each row-pair leaf reads two bit-reversed rows
     // of `total_cols` consecutive u64s (`lde_u64` is the bit-reverse modulus; the
     // kernel emits `lde_size / 2` leaves).
@@ -514,45 +605,60 @@ fn coset_lde_row_major_inner(
     }
     crate::merkle::build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
 
-    // D2H the row-major LDE first (before the handle transpose). Release the
-    // staging lock before the Merkle nodes transfer to minimise lock contention.
-    // Skipped entirely when `retain_host_lde` is false (the caller keeps the LDE
-    // device-only): this is the round-1 trace D2H the full-residency path
-    // eliminates — the big transfer/alloc win — so we return an empty host Vec.
-    let lde_out = if retain_host_lde {
-        let staging_slot = be.pinned_staging();
-        let mut staging = staging_slot.lock().unwrap();
-        staging.ensure_capacity(lde_size * total_cols, &be.ctx)?;
-        let pinned = unsafe { staging.as_mut_slice(lde_size * total_cols) };
-        stream.memcpy_dtoh(&buf, pinned)?;
-        stream.synchronize()?;
-        let out = pinned[..lde_size * total_cols].to_vec();
-        drop(staging);
-        out
-    } else {
-        Vec::new()
-    };
-
-    // Keep the Merkle tree resident on device; copy only the 32 byte root so the
-    // commitment is available without copying the whole tree. Query openings
-    // gather paths from the device tree (see merkle::gather_merkle_paths_dev).
+    // Copy the 32-byte root BEFORE queueing the big drain/transpose: this
+    // pageable copy host-blocks until everything queued so far lands, so
+    // keeping it early means it waits for the tree kernels only (the root is
+    // needed now regardless — Fiat-Shamir absorbs it before anything else).
+    // The Merkle tree stays resident on device; query openings gather paths
+    // from it (see merkle::gather_merkle_paths_dev).
     let mut root = [0u8; 32];
     stream.memcpy_dtoh(&nodes_dev.slice(0..32), &mut root)?;
+
+    // D2H the row-major LDE (skipped when `retain_host_lde` is false — the
+    // full-residency path keeps the LDE device-only; that skip is the big
+    // transfer/alloc win, and we return an empty host Vec).
+    let lde_pending = if retain_host_lde {
+        Some(crate::device::async_dtoh_via(
+            &stream,
+            be.pinned_staging(),
+            &be.ctx,
+            &buf,
+            lde_size * total_cols,
+        )?)
+    } else {
+        None
+    };
 
     // Transpose row-major buf into column-major for the handle. Downstream
     // kernels (DEEP, barycentric) expect buf[c * lde_size + r] (column-major).
     let col_major_dev = launch_row_to_col_major(&stream, be, &buf, lde_size, total_cols, lde_u64)?;
-    // Synchronize before returning: the handle crosses stream boundaries.
-    // Downstream consumers call be.next_stream() and read handle.buf on a
-    // different stream, and the root copy above must have landed.
-    stream.synchronize()?;
+    // No host synchronize here: the handle carries a `ready` event instead,
+    // and consumers on other streams wait on it device-side
+    // (`wait_ready_on`). On the device-only path this makes the whole
+    // commit's tail (transpose) run behind the host's next work.
+    let ready = be.take_event()?;
+    ready.event().record(&stream)?;
+    let lde_out = match lde_pending {
+        Some(p) => {
+            let mut out = vec![0u64; lde_size * total_cols];
+            p.wait_into_u64(&mut out)?;
+            out
+        }
+        None => Vec::new(),
+    };
 
     let tree = GpuMerkleTree {
         nodes: Arc::new(nodes_dev),
         leaves_len: num_leaves,
         root,
     };
-    Ok((tree, col_major_dev, lde_out, trace_col_major))
+    Ok((
+        tree,
+        col_major_dev,
+        lde_out,
+        trace_col_major,
+        Arc::new(ready),
+    ))
 }
 
 /// Row-major LDE + Keccak + Merkle, all on-device, keeping the Merkle tree
@@ -571,7 +677,7 @@ pub fn coset_lde_row_major_with_merkle_tree_keep(
     weights: &[u64],
     retain_host_lde: bool,
 ) -> Result<(GpuLdeBase, Vec<u64>)> {
-    let (tree, col_major_dev, lde_out, trace_col_major) = coset_lde_row_major_inner(
+    let (tree, col_major_dev, lde_out, trace_col_major, ready) = coset_lde_row_major_inner(
         InnerInput::Host(row_major),
         n,
         m,
@@ -586,10 +692,142 @@ pub fn coset_lde_row_major_with_merkle_tree_keep(
         m,
         lde_size: n * blowup_factor,
         tree: Some(tree),
+        ready: Some(ready),
         trace_dev: trace_col_major.map(Arc::new),
         trace_rows: n,
     };
     Ok((handle, lde_out))
+}
+
+/// Row-major LDE + TWO subset Merkle trees for preprocessed tables: the
+/// precomputed columns `[0, split_col)` and the multiplicity columns
+/// `[split_col, m)` commit to separate trees over the same row-major LDE,
+/// mirroring the CPU `commit_rows_bit_reversed_subset` pair.
+///
+/// The precomputed tree's complete node buffer is downloaded to host
+/// (`(2*num_leaves - 1) * 32` bytes, inner nodes first, root at offset 0,
+/// leaves at the tail — the exact `MerkleTree::from_precomputed_nodes`
+/// layout) because it feeds the process-wide host tree cache; it is only
+/// built when `build_precomputed` is true (the caller skips it on a cache
+/// hit). The multiplicity tree stays resident in `handle.tree` — openings
+/// gather its paths on device.
+///
+/// Returns `(precomputed_nodes, handle, row_major_lde)`. The handle also
+/// carries the column-major LDE + trace snapshot for downstream GPU rounds.
+#[allow(clippy::type_complexity)]
+pub fn coset_lde_row_major_split_trees(
+    row_major: &[u64],
+    n: usize,
+    m: usize,
+    blowup_factor: usize,
+    weights: &[u64],
+    split_col: usize,
+    build_precomputed: bool,
+) -> Result<(Option<Vec<u8>>, GpuLdeBase, Vec<u64>)> {
+    assert!(split_col > 0 && split_col < m, "split inside the row");
+    assert!(n.is_power_of_two(), "n must be a power of two");
+    assert_eq!(weights.len(), n, "weights length must match n");
+    assert!(
+        blowup_factor.is_power_of_two(),
+        "blowup must be power of two"
+    );
+    assert_eq!(row_major.len(), n * m, "row-major input shape");
+    let lde_size = n * blowup_factor;
+    assert_u32_domain(lde_size, "coset_lde_row_major_split lde_size");
+    let num_leaves = lde_size / 2;
+    let nodes_bytes = KeccakCommit::FullTree.total_nodes_bytes(num_leaves);
+    let leaves_offset = KeccakCommit::FullTree.leaves_offset_bytes(num_leaves);
+    let log_lde = lde_size.trailing_zeros() as u64;
+    let lde_u64 = lde_size as u64;
+    let cols_u64 = m as u64;
+
+    let be = backend()?;
+    let stream = be.next_stream();
+
+    let (buf, trace_col_major) = expand_row_major_on_stream(
+        &stream,
+        be,
+        InnerInput::Host(row_major),
+        n,
+        m,
+        blowup_factor,
+        weights,
+        true,
+    )?;
+
+    // One subset tree per column range, built sequentially on the stream.
+    let build_subset_tree_dev = |col_start: u64, col_end: u64| -> Result<CudaSlice<u8>> {
+        let mut nodes_dev = unsafe { stream.alloc::<u8>(nodes_bytes) }?;
+        {
+            let mut leaves_view =
+                nodes_dev.slice_mut(leaves_offset..leaves_offset + num_leaves * 32);
+            launch_keccak_base_row_major_row_pair_range(
+                stream.as_ref(),
+                be,
+                &buf,
+                cols_u64,
+                col_start,
+                col_end,
+                lde_u64,
+                log_lde,
+                &mut leaves_view,
+            )?;
+        }
+        crate::merkle::build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
+        Ok(nodes_dev)
+    };
+
+    // Precomputed subset tree: full nodes to host (feeds the process-wide
+    // host tree cache keyed by root; built once per prove on cache miss).
+    let precomputed_nodes = if build_precomputed {
+        let nodes_dev = build_subset_tree_dev(0, split_col as u64)?;
+        let mut nodes_host = vec![0u8; nodes_bytes];
+        stream.memcpy_dtoh(&nodes_dev, &mut nodes_host)?;
+        Some(nodes_host)
+    } else {
+        None
+    };
+    // Multiplicity subset tree: resident (per-epoch; the ~2x-leaves node
+    // download and host rebuild it used to pay are dropped — R4 openings
+    // gather paths on device).
+    let mult_tree = {
+        let nodes_dev = build_subset_tree_dev(split_col as u64, cols_u64)?;
+        let mut root = [0u8; 32];
+        stream.memcpy_dtoh(&nodes_dev.slice(0..32), &mut root)?;
+        GpuMerkleTree {
+            nodes: Arc::new(nodes_dev),
+            leaves_len: num_leaves,
+            root,
+        }
+    };
+
+    // D2H the row-major LDE (preprocessed tables always keep the host copy —
+    // they are excluded from the device-only gate).
+    let lde_pending =
+        crate::device::async_dtoh_via(&stream, be.pinned_staging(), &be.ctx, &buf, lde_size * m)?;
+
+    // Column-major handle for downstream GPU rounds (DEEP, barycentric,
+    // constraint composition).
+    let col_major_dev = launch_row_to_col_major(&stream, be, &buf, lde_size, m, lde_u64)?;
+    let ready = be.take_event()?;
+    ready.event().record(&stream)?;
+
+    let lde_out = {
+        let mut out = vec![0u64; lde_size * m];
+        lde_pending.wait_into_u64(&mut out)?;
+        out
+    };
+
+    let handle = GpuLdeBase {
+        buf: Arc::new(col_major_dev),
+        m,
+        lde_size,
+        tree: Some(mult_tree),
+        ready: Some(Arc::new(ready)),
+        trace_dev: trace_col_major.map(Arc::new),
+        trace_rows: n,
+    };
+    Ok((precomputed_nodes, handle, lde_out))
 }
 
 /// Row-major ext3 LDE + Keccak + Merkle, all on-device.
@@ -610,7 +848,7 @@ pub fn coset_lde_ext3_row_major_with_merkle_tree_keep(
     weights: &[u64],
     retain_host_lde: bool,
 ) -> Result<(GpuLdeExt3, Vec<u64>)> {
-    let (tree, col_major_dev, lde_out, _) = coset_lde_row_major_inner(
+    let (tree, col_major_dev, lde_out, _, ready) = coset_lde_row_major_inner(
         InnerInput::Host(row_major),
         n,
         m * 3,
@@ -625,6 +863,7 @@ pub fn coset_lde_ext3_row_major_with_merkle_tree_keep(
         m,
         lde_size: n * blowup_factor,
         tree: Some(tree),
+        ready: Some(ready),
     };
     Ok((handle, lde_out))
 }
@@ -641,7 +880,7 @@ pub fn coset_lde_ext3_row_major_with_merkle_tree_keep_dev(
     weights: &[u64],
     retain_host_lde: bool,
 ) -> Result<(GpuLdeExt3, Vec<u64>)> {
-    let (tree, col_major_dev, lde_out, _) = coset_lde_row_major_inner(
+    let (tree, col_major_dev, lde_out, _, ready) = coset_lde_row_major_inner(
         InnerInput::Dev(input_dev),
         n,
         m * 3,
@@ -656,6 +895,7 @@ pub fn coset_lde_ext3_row_major_with_merkle_tree_keep_dev(
         m,
         lde_size: n * blowup_factor,
         tree: Some(tree),
+        ready: Some(ready),
     };
     Ok((handle, lde_out))
 }
@@ -679,6 +919,20 @@ pub struct GpuLdeBase {
     pub trace_dev: Option<Arc<CudaSlice<u64>>>,
     /// Row count (n) of `trace_dev`; 0 when `trace_dev` is None.
     pub trace_rows: usize,
+    /// Fires once `buf` is fully written (recorded after the producer's last
+    /// kernel). `None` means the producer synchronized before returning.
+    /// Consumers on other streams call [`GpuLdeBase::wait_ready_on`].
+    pub ready: Option<Arc<crate::device::PooledEvent>>,
+}
+
+impl GpuLdeBase {
+    /// Make `stream` wait (device-side, no host block) until `buf` is ready.
+    pub fn wait_ready_on(&self, stream: &CudaStream) -> Result<()> {
+        match &self.ready {
+            Some(ev) => stream.wait(ev.event()),
+            None => Ok(()),
+        }
+    }
 }
 
 /// Handle to an ext3 LDE kept live on device, de-interleaved into 3 base
@@ -692,6 +946,19 @@ pub struct GpuLdeExt3 {
     /// Optionally the aux or composition Merkle tree kept resident on device
     /// (the keep path), so R4 openings gather paths on device. None otherwise.
     pub tree: Option<GpuMerkleTree>,
+    /// Fires once `buf` is fully written. `None` = producer synchronized.
+    /// Consumers on other streams call [`GpuLdeExt3::wait_ready_on`].
+    pub ready: Option<Arc<crate::device::PooledEvent>>,
+}
+
+impl GpuLdeExt3 {
+    /// Make `stream` wait (device-side, no host block) until `buf` is ready.
+    pub fn wait_ready_on(&self, stream: &CudaStream) -> Result<()> {
+        match &self.ready {
+            Some(ev) => stream.wait(ev.event()),
+            None => Ok(()),
+        }
+    }
 }
 
 /// Merkle tree kept resident on device after a commit, so query openings gather
@@ -824,9 +1091,9 @@ pub fn coset_lde_batch_base(
     let staging_slot = be.pinned_staging();
 
     // Pinned staging. Lock and grow to max(m*n for upload, m*lde_size for
-    // download). Holding the guard across the whole call serialises concurrent
-    // batched calls that happened to hash to the same stream slot, but that's
-    // exactly what we want — one stream can only do one sequence at a time.
+    // download). The guard is held from the pack until the async uploads have
+    // landed (the H2D DMA reads the slab directly); the D2H drain at the end
+    // re-acquires the slot via `async_dtoh_via`.
     let mut staging = staging_slot.lock().unwrap();
     staging.ensure_capacity(m * lde_size, &be.ctx)?;
     // SAFETY: staging is locked, the slice alias ends before we unlock.
@@ -842,12 +1109,24 @@ pub fn coset_lde_batch_base(
     // Column layout: `buf[c * lde_size + r]`. Zeroed so the [n, lde_size)
     // tail of each column is already the zero-pad the CPU path does.
     let mut buf = stream.alloc_zeros::<u64>(m * lde_size)?;
+    // Any `?` between the first upload below and `sync_event` would release
+    // the slot with async H2D reads of the slab still in flight; this guard
+    // (declared after `staging`, so it drops first) drains the stream on
+    // those error paths.
+    let mut drain_on_err = crate::device::DrainOnErr {
+        stream: &stream,
+        armed: true,
+    };
     // One memcpy per column from the pinned buffer into the strided slots.
     // The pinned source hits PCIe line-rate.
     for c in 0..m {
         let mut dst = buf.slice_mut(c * lde_size..c * lde_size + n);
         stream.memcpy_htod(&pinned[c * n..c * n + n], &mut dst)?;
     }
+    // The uploads above are truly asynchronous (pinned source), so the
+    // staging slot must stay locked until they land; the slot's reusable event marks that
+    // point. It is waited just before the D2H drain re-acquires the slot.
+    staging.record_event(&stream)?;
 
     let inv_tw = be.inv_twiddles_for(log_n)?;
     let fwd_tw = be.fwd_twiddles_for(log_lde)?;
@@ -913,29 +1192,43 @@ pub fn coset_lde_batch_base(
         m_u32,
     )?;
 
+    // Release the staging slot before the drain: the uploads have landed once
+    // the slot event fires (the NTT kernels above are queued behind them, so the
+    // GPU stays busy while the host waits here).
+    staging.sync_event()?;
+    drain_on_err.armed = false;
+    drop(staging);
+
     // Single big D2H into the reusable pinned staging buffer — pinned, one
-    // call to the driver, saturates PCIe.
-    stream.memcpy_dtoh(&buf, &mut pinned[..m * lde_size])?;
-    stream.synchronize()?;
+    // call to the driver, saturates PCIe. Enqueued without blocking; the host
+    // blocks once, in `wait_and_read` below.
+    let pending =
+        crate::device::async_dtoh_via(&stream, staging_slot, &be.ctx, &buf, m * lde_size)?;
 
     // Split pinned into per-column Vec<u64>s. Runs under the pinned-staging
-    // lock, where rayon can deadlock. See `Backend::pinned_staging`.
-    let out: Vec<Vec<u64>> = (0..m)
-        .map(|c| {
-            // set_len skips the O(N) zero-init that vec![0; n] would do.
-            // copy_from_slice below writes every slot before any reader
-            // sees the Vec.
-            #[allow(clippy::uninit_vec)]
-            let mut v = {
-                let mut v = Vec::<u64>::with_capacity(lde_size);
-                unsafe { v.set_len(lde_size) };
+    // lock (held by `pending`), where rayon can deadlock. See
+    // `Backend::pinned_staging`.
+    let out: Vec<Vec<u64>> = pending.wait_and_read(|bytes| {
+        // SAFETY: the pinned slab is u64-aligned by construction and the
+        // copy deposited exactly `m * lde_size` u64s.
+        let pinned =
+            unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const u64, m * lde_size) };
+        (0..m)
+            .map(|c| {
+                // set_len skips the O(N) zero-init that vec![0; n] would
+                // do. copy_from_slice below writes every slot before any
+                // reader sees the Vec.
+                #[allow(clippy::uninit_vec)]
+                let mut v = {
+                    let mut v = Vec::<u64>::with_capacity(lde_size);
+                    unsafe { v.set_len(lde_size) };
+                    v
+                };
+                v.copy_from_slice(&pinned[c * lde_size..c * lde_size + lde_size]);
                 v
-            };
-            v.copy_from_slice(&pinned[c * lde_size..c * lde_size + lde_size]);
-            v
-        })
-        .collect();
-    drop(staging);
+            })
+            .collect()
+    })?;
     Ok(out)
 }
 
@@ -995,6 +1288,9 @@ pub fn coset_lde_batch_base_into(
         let mut dst = buf.slice_mut(c * lde_size..c * lde_size + n);
         stream.memcpy_htod(&pinned[c * n..c * n + n], &mut dst)?;
     }
+    // The uploads above are truly asynchronous (pinned source); the staging
+    // slot stays locked until this event fires (waited before the drain).
+    staging.record_event(&stream)?;
 
     let inv_tw = be.inv_twiddles_for(log_n)?;
     let fwd_tw = be.fwd_twiddles_for(log_lde)?;
@@ -1052,15 +1348,28 @@ pub fn coset_lde_batch_base_into(
         m_u32,
     )?;
 
-    stream.memcpy_dtoh(&buf, &mut pinned[..m * lde_size])?;
-    stream.synchronize()?;
-
-    // Copy pinned into caller outputs. Runs under the pinned-staging lock,
-    // where rayon can deadlock. See `Backend::pinned_staging`.
-    for (c, dst) in outputs.iter_mut().enumerate() {
-        dst.copy_from_slice(&pinned[c * lde_size..c * lde_size + lde_size]);
-    }
+    // Release the staging slot before the drain: the uploads have landed once
+    // the slot event fires (the kernels above are queued behind them).
+    staging.sync_event()?;
     drop(staging);
+
+    // Big D2H enqueued without blocking; the host blocks once, in
+    // `wait_and_read` below.
+    let pending =
+        crate::device::async_dtoh_via(&stream, staging_slot, &be.ctx, &buf, m * lde_size)?;
+
+    // Copy pinned into caller outputs. Runs under the pinned-staging lock
+    // (held by `pending`), where rayon can deadlock. See
+    // `Backend::pinned_staging`.
+    pending.wait_and_read(|bytes| {
+        // SAFETY: the pinned slab is u64-aligned by construction and the
+        // copy deposited exactly `m * lde_size` u64s.
+        let pinned =
+            unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const u64, m * lde_size) };
+        for (c, dst) in outputs.iter_mut().enumerate() {
+            dst.copy_from_slice(&pinned[c * lde_size..c * lde_size + lde_size]);
+        }
+    })?;
     Ok(())
 }
 
@@ -1155,6 +1464,9 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
         let mut dst = buf.slice_mut(c * lde_size..c * lde_size + n);
         stream.memcpy_htod(&pinned[c * n..c * n + n], &mut dst)?;
     }
+    // The uploads above are truly asynchronous (pinned source); the staging
+    // slot stays locked until this event fires (waited before the drain).
+    staging.record_event(&stream)?;
 
     let inv_tw = be.inv_twiddles_for(log_n)?;
     let fwd_tw = be.fwd_twiddles_for(log_lde)?;
@@ -1249,16 +1561,31 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
         crate::merkle::build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
     }
 
-    // D2H the LDE and the tree/leaves nodes via pinned staging.
-    stream.memcpy_dtoh(&buf, &mut pinned[..m * lde_size])?;
+    // Release the staging slot before the drain: the uploads have landed once
+    // the slot event fires (the kernels above are queued behind them).
+    staging.sync_event()?;
+    drop(staging);
+
+    // D2H the LDE (async, via pinned staging, enqueued without blocking) and
+    // the tree/leaves nodes (via the separate pinned-hashes slot; that helper
+    // waits internally, and its event is recorded after the LDE copy, so the
+    // `wait_and_read` below is nearly instant).
+    let lde_pending =
+        crate::device::async_dtoh_via(&stream, staging_slot, &be.ctx, &buf, m * lde_size)?;
     d2h_bytes_via_pinned_hashes(&stream, be, &nodes_dev, nodes_out)?;
 
-    // Copy pinned into caller outputs. Runs under the pinned-staging lock,
-    // where rayon can deadlock. See `Backend::pinned_staging`.
-    for (c, dst) in outputs.iter_mut().enumerate() {
-        dst.copy_from_slice(&pinned[c * lde_size..c * lde_size + lde_size]);
-    }
-    drop(staging);
+    // Copy pinned into caller outputs. Runs under the pinned-staging lock
+    // (held by `lde_pending`), where rayon can deadlock. See
+    // `Backend::pinned_staging`.
+    lde_pending.wait_and_read(|bytes| {
+        // SAFETY: the pinned slab is u64-aligned by construction and the
+        // copy deposited exactly `m * lde_size` u64s.
+        let pinned =
+            unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const u64, m * lde_size) };
+        for (c, dst) in outputs.iter_mut().enumerate() {
+            dst.copy_from_slice(&pinned[c * lde_size..c * lde_size + lde_size]);
+        }
+    })?;
 
     if keep_device_buf {
         Ok(Some(GpuLdeBase {
@@ -1268,6 +1595,9 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
             tree: None,
             trace_dev: None,
             trace_rows: 0,
+            // The pending wait above drained the stream past the last write
+            // to `buf`, so the handle is complete at return.
+            ready: None,
         }))
     } else {
         drop(buf);
@@ -1377,6 +1707,9 @@ fn evaluate_poly_coset_batch_ext3_into_inner(
         let mut dst = buf.slice_mut(s * lde_size..s * lde_size + n);
         stream.memcpy_htod(&pinned[s * n..s * n + n], &mut dst)?;
     }
+    // The uploads above are truly asynchronous (pinned source); the staging
+    // slot stays locked until this event fires (waited before the drain).
+    staging.record_event(&stream)?;
 
     let fwd_tw = be.fwd_twiddles_for(log_lde)?;
     let weights_dev = stream.clone_htod(weights)?;
@@ -1417,8 +1750,9 @@ fn evaluate_poly_coset_batch_ext3_into_inner(
         mb_u32,
     )?;
 
-    // Optional R2-style row-pair Merkle tree build on the LDE buffer.
-    if let Some(nodes_out) = merkle_nodes_out {
+    // Optional R2-style row-pair Merkle tree build on the LDE buffer, queued
+    // ahead of the drains below.
+    let nodes = if let Some(nodes_out) = merkle_nodes_out {
         let num_leaves = lde_size / 2;
         let tight_total_nodes = 2 * num_leaves - 1;
         assert_eq!(nodes_out.len(), tight_total_nodes * 32);
@@ -1443,22 +1777,42 @@ fn evaluate_poly_coset_batch_ext3_into_inner(
             }
         }
         crate::merkle::build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
-
-        stream.memcpy_dtoh(&buf, &mut pinned[..mb * lde_size])?;
-        d2h_bytes_via_pinned_hashes(&stream, be, &nodes_dev, nodes_out)?;
+        Some((nodes_dev, nodes_out))
     } else {
-        stream.memcpy_dtoh(&buf, &mut pinned[..mb * lde_size])?;
-        stream.synchronize()?;
+        None
+    };
+
+    // Release the staging slot before the drain: the uploads have landed once
+    // the slot event fires (the kernels above are queued behind them).
+    staging.sync_event()?;
+    drop(staging);
+
+    // LDE drain enqueued without blocking. When a tree was built, its nodes
+    // drain via the separate pinned-hashes slot; that helper waits internally,
+    // and its event is recorded after the LDE copy, so the `wait_and_read`
+    // below is nearly instant.
+    let lde_pending =
+        crate::device::async_dtoh_via(&stream, staging_slot, &be.ctx, &buf, mb * lde_size)?;
+    if let Some((nodes_dev, nodes_out)) = nodes {
+        d2h_bytes_via_pinned_hashes(&stream, be, &nodes_dev, nodes_out)?;
     }
 
-    unpack_pinned_slabs_to_ext3(pinned, outputs, lde_size);
-    drop(staging);
+    lde_pending.wait_and_read(|bytes| {
+        // SAFETY: the pinned slab is u64-aligned by construction and the
+        // copy deposited exactly `mb * lde_size` u64s.
+        let pinned =
+            unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const u64, mb * lde_size) };
+        unpack_pinned_slabs_to_ext3(pinned, outputs, lde_size);
+    })?;
     if keep_device_buf {
         Ok(Some(GpuLdeExt3 {
             buf: std::sync::Arc::new(buf),
             m,
             lde_size,
             tree: None,
+            // The pending wait above drained the stream past the last write
+            // to `buf`, so the handle is complete at return.
+            ready: None,
         }))
     } else {
         drop(buf);
@@ -1566,6 +1920,9 @@ pub fn coset_lde_batch_ext3_into(
         let mut dst = buf.slice_mut(s * lde_size..s * lde_size + n);
         stream.memcpy_htod(&pinned[s * n..s * n + n], &mut dst)?;
     }
+    // The uploads above are truly asynchronous (pinned source); the staging
+    // slot stays locked until this event fires (waited before the drain).
+    staging.record_event(&stream)?;
 
     let inv_tw = be.inv_twiddles_for(log_n)?;
     let fwd_tw = be.fwd_twiddles_for(log_lde)?;
@@ -1624,14 +1981,154 @@ pub fn coset_lde_batch_ext3_into(
         mb_u32,
     )?;
 
-    stream.memcpy_dtoh(&buf, &mut pinned[..mb * lde_size])?;
-    stream.synchronize()?;
+    // Release the staging slot before the drain: the uploads have landed once
+    // the slot event fires (the kernels above are queued behind them).
+    staging.sync_event()?;
+    drop(staging);
+
+    // Big D2H enqueued without blocking; the host blocks once, in
+    // `wait_and_read` below.
+    let pending =
+        crate::device::async_dtoh_via(&stream, staging_slot, &be.ctx, &buf, mb * lde_size)?;
 
     // Unpack: for each output column, re-interleave 3 slabs back into the
-    // ext3-per-element layout.
-    unpack_pinned_slabs_to_ext3(pinned, outputs, lde_size);
-    drop(staging);
+    // ext3-per-element layout. Runs under the pinned-staging lock (held by
+    // `pending`), where rayon can deadlock. See `Backend::pinned_staging`.
+    pending.wait_and_read(|bytes| {
+        // SAFETY: the pinned slab is u64-aligned by construction and the
+        // copy deposited exactly `mb * lde_size` u64s.
+        let pinned =
+            unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const u64, mb * lde_size) };
+        unpack_pinned_slabs_to_ext3(pinned, outputs, lde_size);
+    })?;
     Ok(())
+}
+
+/// Batched ext3 coset LDE over columns ALREADY resident on device in slab
+/// layout (`3m` slabs of `lde_size` u64, first `n` of each filled, rest
+/// zero-padded), e.g. from the on-device degree-2 decomposition. Runs the
+/// same butterfly pipeline as [`coset_lde_batch_ext3_into`] and keeps the
+/// device buffer as a [`GpuLdeExt3`] handle. With `outputs = Some(..)` the
+/// evaluations are also drained to host (interleaved ext3, `3*lde_size` u64
+/// each; the drain synchronizes, so `ready: None`). With `None` nothing
+/// leaves the device and the handle carries a `ready` event instead.
+pub fn coset_lde_batch_ext3_slabs_keep(
+    stream: &Arc<CudaStream>,
+    mut buf: CudaSlice<u64>,
+    m: usize,
+    n: usize,
+    blowup_factor: usize,
+    weights: &[u64],
+    outputs: Option<&mut [&mut [u64]]>,
+) -> Result<GpuLdeExt3> {
+    assert!(m > 0 && n.is_power_of_two(), "slab LDE shape");
+    assert_eq!(weights.len(), n, "weights length must match n");
+    assert!(
+        blowup_factor.is_power_of_two(),
+        "blowup must be power of two"
+    );
+    let lde_size = n * blowup_factor;
+    let mb = 3 * m;
+    assert_eq!(buf.len(), mb * lde_size, "slab buffer shape");
+    if let Some(outputs) = outputs.as_ref() {
+        assert_eq!(outputs.len(), m, "outputs must match column count");
+        for o in outputs.iter() {
+            assert_eq!(o.len(), 3 * lde_size, "each output must be 3*lde_size u64s");
+        }
+    }
+    assert_u32_domain(lde_size, "coset_lde_batch_ext3_slabs_keep lde_size");
+    let log_n = n.trailing_zeros() as u64;
+    let log_lde = lde_size.trailing_zeros() as u64;
+
+    let be = backend()?;
+    let inv_tw = be.inv_twiddles_for(log_n)?;
+    let fwd_tw = be.fwd_twiddles_for(log_lde)?;
+    let weights_dev = stream.clone_htod(weights)?;
+
+    let n_u64 = n as u64;
+    let lde_u64 = lde_size as u64;
+    let col_stride_u64 = lde_size as u64;
+    let mb_u32 = mb as u32;
+
+    launch_bit_reverse_batched(
+        stream.as_ref(),
+        be,
+        &mut buf,
+        n_u64,
+        log_n,
+        col_stride_u64,
+        mb_u32,
+    )?;
+    run_batched_ntt_body(
+        stream.as_ref(),
+        &mut buf,
+        inv_tw.as_ref(),
+        n_u64,
+        log_n,
+        col_stride_u64,
+        mb_u32,
+    )?;
+    launch_pointwise_mul_batched(
+        stream.as_ref(),
+        be,
+        &mut buf,
+        &weights_dev,
+        n_u64,
+        col_stride_u64,
+        mb_u32,
+    )?;
+    launch_bit_reverse_batched(
+        stream.as_ref(),
+        be,
+        &mut buf,
+        lde_u64,
+        log_lde,
+        col_stride_u64,
+        mb_u32,
+    )?;
+    run_batched_ntt_body(
+        stream.as_ref(),
+        &mut buf,
+        fwd_tw.as_ref(),
+        lde_u64,
+        log_lde,
+        col_stride_u64,
+        mb_u32,
+    )?;
+
+    let ready = match outputs {
+        Some(outputs) => {
+            let pending = crate::device::async_dtoh_via(
+                stream,
+                be.pinned_staging(),
+                &be.ctx,
+                &buf,
+                mb * lde_size,
+            )?;
+            pending.wait_and_read(|bytes| {
+                // SAFETY: the pinned slab is u64-aligned by construction and the
+                // copy deposited exactly `mb * lde_size` u64s.
+                let pinned = unsafe {
+                    std::slice::from_raw_parts(bytes.as_ptr() as *const u64, mb * lde_size)
+                };
+                unpack_pinned_slabs_to_ext3(pinned, outputs, lde_size);
+            })?;
+            None
+        }
+        None => {
+            let ready = be.take_event()?;
+            ready.event().record(stream)?;
+            Some(Arc::new(ready))
+        }
+    };
+
+    Ok(GpuLdeExt3 {
+        buf: Arc::new(buf),
+        m,
+        lde_size,
+        tree: None,
+        ready,
+    })
 }
 
 /// Run the DIT butterfly body of a bit-reversed-input NTT over `m` batched

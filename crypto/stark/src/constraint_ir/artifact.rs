@@ -14,8 +14,10 @@
 //! trait surface:
 //!
 //! 1. **The program** — `nodes` / `base_consts` / `ext_consts` / `roots` /
-//!    `num_base`, exactly [`DeviceProgram`]'s flat form. Replaces
-//!    `AIR::compute_transition`.
+//!    `num_base`, as a flat POD projection of the captured [`ConstraintProgram`]
+//!    ([`ArtifactNode`], node-id operands). Replaces `AIR::compute_transition`.
+//!    Note this is NOT [`DeviceProgram`]'s form — see [`ArtifactNode`] for why
+//!    the artifact keeps the liftable node-id form and re-lowers on demand.
 //! 2. **Per-constraint metadata** — `{kind, end_exemptions}` per constraint.
 //!    Capture DISCARDS this: [`ConstraintProgram`] records each constraint's
 //!    root but not the row domain it applies to, and `end_exemptions` is what
@@ -86,7 +88,7 @@ use math::field::element::FieldElement;
 use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as GoldilocksExtension;
 use math::field::goldilocks::GoldilocksField;
 
-use super::device::{DeviceNode, DeviceProgram};
+use super::device::DeviceProgram;
 use super::ir::{ConstraintProgram, Dim, Op};
 use crate::constraints::builder::{ConstraintMeta, RootKind};
 use crate::traits::AIR;
@@ -99,6 +101,52 @@ type Ext3 = GoldilocksExtension;
 /// in the trace length rather than assuming it.
 const DEGREE_PROBE_LEN: usize = 1 << 10;
 const DEGREE_PROBE_LEN_2: usize = 1 << 11;
+
+// =============================================================================
+// The wire node
+// =============================================================================
+
+/// Node result is a base-field value.
+pub const DIM_BASE: u32 = 0;
+/// Node result is an extension-field value.
+pub const DIM_EXT: u32 = 1;
+
+/// One serialized IR instruction: 16 bytes, `#[repr(C)]`.
+///
+/// This is a POD projection of [`Op`] + its [`Dim`], NOT of
+/// [`DeviceNode`](super::device::DeviceNode). The distinction is the whole
+/// reason this type exists and is worth stating plainly.
+///
+/// `DeviceNode` is the *lowered* form: its `a`/`b` are slot-encoded operand
+/// words, uniform leaves and dead nodes have been eliminated, and it carries a
+/// result slot instead of a dim. That lowering is LOSSY — there is no map back
+/// to the [`ConstraintProgram`] it came from. An artifact that stored it could
+/// not implement [`ConstraintArtifact::program`], which is the method every
+/// consumer of this artifact actually uses.
+///
+/// So the artifact stores the high-level form instead: `a`/`b` are **node ids**
+/// (id `i` references only `< i`, the same invariant [`ConstraintProgram`]
+/// carries), `dim` is [`DIM_BASE`] / [`DIM_EXT`], and the node list is dense —
+/// one entry per `ConstraintProgram` node, in the same order. `program()` is its
+/// exact inverse; the device blob is re-derived on demand by running main's own
+/// [`DeviceProgram::lower`] over that lifted program, so the slot encoding is
+/// never duplicated here and cannot drift from the prover's.
+///
+/// The `OP_*` tags are shared with `device.rs` — those are stable and mean the
+/// same thing in both forms; only the operand encoding differs.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct ArtifactNode {
+    /// `OP_*` tag (shared with [`super::device`]).
+    pub op: u32,
+    /// Operand word 0: a node id for arithmetic ops, a table index for
+    /// constants/uniforms, packed [`Op::Var`] fields for `OP_VAR`.
+    pub a: u32,
+    /// Operand word 1: as `a`, where the op takes two operands.
+    pub b: u32,
+    /// [`DIM_BASE`] or [`DIM_EXT`] — this node's result dim.
+    pub dim: u32,
+}
 
 // =============================================================================
 // Metadata
@@ -226,8 +274,8 @@ pub struct AirShape {
 #[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct ConstraintArtifact {
     /// Topologically ordered flat instruction list (id `i` references only
-    /// `< i`) — [`DeviceProgram::nodes`].
-    pub nodes: Vec<DeviceNode>,
+    /// `< i`) — see [`ArtifactNode`].
+    pub nodes: Vec<ArtifactNode>,
     /// Base-field constant table, raw canonical limbs.
     pub base_consts: Vec<u64>,
     /// Extension-field constant table, raw canonical limbs.
@@ -298,8 +346,60 @@ impl ConstraintArtifact {
     where
         A: AIR<Field = Gl, FieldExtension = Ext3> + ?Sized,
     {
+        use super::device::{
+            OP_ADD, OP_ALPHA_POW, OP_CONST_BASE, OP_CONST_EXT, OP_EMBED, OP_MUL, OP_NEG,
+            OP_RAP_CHALLENGE, OP_SUB, OP_TABLE_OFFSET, OP_VAR, pack_var,
+        };
+
         let prog = air.constraint_program();
-        let dev = DeviceProgram::lower(prog);
+
+        // A 1:1 projection of the captured program — same node count, same
+        // order, operands left as node ids. Deliberately NOT
+        // `DeviceProgram::lower`: that is the slot-allocating lowering, and its
+        // output cannot be lifted back (see `ArtifactNode`).
+        let nodes: Vec<ArtifactNode> = prog
+            .nodes
+            .iter()
+            .zip(prog.dims.iter())
+            .map(|(op, dim)| {
+                let dim = match dim {
+                    Dim::Base => DIM_BASE,
+                    Dim::Ext => DIM_EXT,
+                };
+                let (op, a, b) = match *op {
+                    Op::ConstBase(idx) => (OP_CONST_BASE, idx, 0),
+                    Op::ConstExt(idx) => (OP_CONST_EXT, idx, 0),
+                    Op::Var {
+                        main,
+                        offset,
+                        row,
+                        col,
+                    } => {
+                        let (a, b) = pack_var(main, offset, row, col);
+                        (OP_VAR, a, b)
+                    }
+                    Op::RapChallenge { idx } => (OP_RAP_CHALLENGE, idx as u32, 0),
+                    Op::AlphaPow { idx } => (OP_ALPHA_POW, idx as u32, 0),
+                    Op::TableOffset => (OP_TABLE_OFFSET, 0, 0),
+                    Op::Add(a, b) => (OP_ADD, a, b),
+                    Op::Sub(a, b) => (OP_SUB, a, b),
+                    Op::Mul(a, b) => (OP_MUL, a, b),
+                    Op::Neg(a) => (OP_NEG, a, 0),
+                    Op::Embed(a) => (OP_EMBED, a, 0),
+                };
+                ArtifactNode { op, a, b, dim }
+            })
+            .collect();
+
+        let base_consts: Vec<u64> = prog.base_consts.iter().map(|c| *c.value()).collect();
+        let ext_consts: Vec<[u64; 3]> = prog
+            .ext_consts
+            .iter()
+            .map(|x| {
+                let limbs = x.value();
+                [*limbs[0].value(), *limbs[1].value(), *limbs[2].value()]
+            })
+            .collect();
 
         let (main_width, aux_width) = air.trace_layout();
 
@@ -331,11 +431,11 @@ impl ConstraintArtifact {
         );
 
         Self {
-            nodes: dev.nodes,
-            base_consts: dev.base_consts,
-            ext_consts: dev.ext_consts,
-            roots: dev.roots,
-            num_base: dev.num_base,
+            nodes,
+            base_consts,
+            ext_consts,
+            roots: prog.roots.clone(),
+            num_base: prog.num_base as u32,
             meta: air
                 .constraints_meta()
                 .iter()
@@ -361,16 +461,18 @@ impl ConstraintArtifact {
         }
     }
 
-    /// The flat device form — the inverse direction of the arrays this artifact
-    /// stores, at zero cost.
+    /// The flat device form, produced by re-running the prover's own
+    /// [`DeviceProgram::lower`] over [`Self::program`].
+    ///
+    /// Not a field copy: the artifact stores node ids, the device form stores
+    /// slots (see [`ArtifactNode`]). Re-lowering rather than storing the lowered
+    /// arrays is what keeps this blob identical to the one the prover and the
+    /// GPU path build from the same AIR — there is one lowering, not two.
+    ///
+    /// Guest-safe: `program()` is a POD walk and `lower()` is a liveness scan;
+    /// neither captures nor hashes.
     pub fn device_program(&self) -> DeviceProgram {
-        DeviceProgram {
-            nodes: self.nodes.clone(),
-            base_consts: self.base_consts.clone(),
-            ext_consts: self.ext_consts.clone(),
-            roots: self.roots.clone(),
-            num_base: self.num_base,
-        }
+        DeviceProgram::lower(&self.program())
     }
 
     /// Lift back to a [`ConstraintProgram`] — the exact inverse of
@@ -387,8 +489,8 @@ impl ConstraintArtifact {
     /// something plausible.
     pub fn program(&self) -> ConstraintProgram<Gl, Ext3> {
         use super::device::{
-            DIM_BASE, DIM_EXT, OP_ADD, OP_ALPHA_POW, OP_CONST_BASE, OP_CONST_EXT, OP_EMBED, OP_MUL,
-            OP_NEG, OP_RAP_CHALLENGE, OP_SUB, OP_TABLE_OFFSET, OP_VAR, unpack_var,
+            OP_ADD, OP_ALPHA_POW, OP_CONST_BASE, OP_CONST_EXT, OP_EMBED, OP_MUL, OP_NEG,
+            OP_RAP_CHALLENGE, OP_SUB, OP_TABLE_OFFSET, OP_VAR, unpack_var,
         };
 
         let mut nodes = Vec::with_capacity(self.nodes.len());
@@ -462,8 +564,8 @@ impl ConstraintArtifact {
     /// idx-ordered and has its `Base` entries as a prefix of length `num_base`.
     pub fn validate_self(&self) -> Result<(), ArtifactError> {
         use super::device::{
-            DIM_BASE, DIM_EXT, OP_ADD, OP_ALPHA_POW, OP_CONST_BASE, OP_CONST_EXT, OP_EMBED, OP_MUL,
-            OP_NEG, OP_RAP_CHALLENGE, OP_SUB, OP_TABLE_OFFSET, OP_VAR,
+            OP_ADD, OP_ALPHA_POW, OP_CONST_BASE, OP_CONST_EXT, OP_EMBED, OP_MUL, OP_NEG,
+            OP_RAP_CHALLENGE, OP_SUB, OP_TABLE_OFFSET, OP_VAR,
         };
         let bad = |m: String| Err(ArtifactError::Malformed(m));
 

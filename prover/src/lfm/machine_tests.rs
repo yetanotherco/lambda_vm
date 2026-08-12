@@ -443,20 +443,34 @@ fn preprocessed_tags_close_the_output_swap_hazard() {
         "with distinct tags the swapped outputs must no longer balance"
     );
 
-    // Leg 3: colliding the tags is not available to the prover. Copying row 0's
-    // tag over row 1's makes the trace's leading columns disagree with the
-    // committed group, and the prover refuses before producing anything.
-    let err = prove_keccak_chain_with_tamper(&program, &artifacts, 7, |t| {
+    // Leg 3: colliding the tags is not available to the prover. The TAG columns
+    // are PREPROCESSED — pinned by the group's precomputed commitment — so a
+    // prover cannot obtain a VERIFYING proof with the tags rewritten. Copying
+    // row 0's tag over row 1's makes the trace's leading columns disagree with
+    // the committed group.
+    //
+    // Where the failure lands is precomputed-tree-cache-dependent (the cache is
+    // keyed by the expected root): on a cache MISS the prover recomputes the
+    // preprocessed tree from the tampered columns and refuses with
+    // `PrecomputedCommitmentMismatch`; on a warm cache HIT it commits the pinned
+    // tree without re-checking (so it does NOT refuse at prove time) and the
+    // tampered proof is caught at VERIFY instead. Either way the forgery fails —
+    // which is the obligation this leg exists to pin.
+    match prove_keccak_chain_with_tamper(&program, &artifacts, 7, |t| {
         let lo = t.keccak.main_table.get_row(0)[klayout::TAG_LO];
         let hi = t.keccak.main_table.get_row(0)[klayout::TAG_HI];
         t.keccak.main_table.set_fe(1, klayout::TAG_LO, lo);
         t.keccak.main_table.set_fe(1, klayout::TAG_HI, hi);
-    })
-    .expect_err("preprocessed tags cannot be rewritten");
-    assert!(
-        matches!(err, ProvingError::PrecomputedCommitmentMismatch),
-        "expected a preprocessed recommit failure, got {err:?}"
-    );
+    }) {
+        Err(err) => assert!(
+            matches!(err, ProvingError::PrecomputedCommitmentMismatch),
+            "expected a preprocessed recommit failure, got {err:?}"
+        ),
+        Ok((proof, public)) => assert!(
+            !lfm_verify(LfmProgramKind::KeccakChainV0, &proof, &public, &opts).expect("registered"),
+            "a tag-rewrite tamper must not yield a verifying proof"
+        ),
+    }
 }
 
 /// The registrar's independent gate on the same obligation: even if a future

@@ -410,6 +410,7 @@ fn carry_1_expr<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
 /// - idx 2: `JALR·carry_0·(1 − carry_0)` on the register path (degree 3);
 /// - idx 3: `JALR·carry_1·(1 − carry_1)` on the register path (degree 3);
 /// - idx 4: `JALR·(1 − JALR)` (degree 2).
+#[derive(Clone, Copy)]
 pub struct BranchConstraints;
 
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for BranchConstraints {

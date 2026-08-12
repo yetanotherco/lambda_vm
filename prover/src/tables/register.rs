@@ -113,7 +113,7 @@ pub type FinalRegisterStateMap = HashMap<u64, FinalRegisterWordState>;
 /// Returns the Word addresses for all register table rows.
 ///
 /// x0-x31 use addresses 0..63, x254 uses address 508, x255 uses 510..511.
-fn register_word_address_list() -> [u64; NUM_REGISTER_ADDRESSES] {
+pub(crate) fn register_word_address_list() -> [u64; NUM_REGISTER_ADDRESSES] {
     let mut addrs = [0u64; NUM_REGISTER_ADDRESSES];
     // x0-x31: addresses 0..63
     for (i, addr) in addrs.iter_mut().enumerate().take(64) {
@@ -174,8 +174,9 @@ pub(crate) fn register_init_from_entry_point(entry_point: u64) -> Vec<u32> {
 ///
 /// Used by tests that build a single epoch from a boundary snapshot. The
 /// continuation prover no longer uses this for chaining: epoch i+1's register
-/// init comes from epoch i's *bound* fini (`fini_from_trace`, carried as the next
-/// epoch's preprocessed INIT), not a trusted executor snapshot.
+/// init comes from epoch i's *bound* fini (`fini_from_final_state`, the same
+/// value the trace binds — pinned by `fini_from_final_state_matches_trace` —
+/// carried as the next epoch's preprocessed INIT), not a trusted snapshot.
 #[cfg(test)]
 pub(crate) fn register_init_from_snapshot(registers: &Registers, pc: u64) -> Vec<u32> {
     let mut init = vec![0u32; NUM_REGISTER_ADDRESSES];
@@ -265,6 +266,27 @@ pub fn generate_register_trace(
 pub fn fini_from_trace(trace: &TraceTable<GoldilocksField, GoldilocksExtension>) -> Vec<u32> {
     (0..NUM_REGISTER_ADDRESSES)
         .map(|row| trace.main_table.get(row, cols::FINI).to_raw() as u32)
+        .collect()
+}
+
+/// [`fini_from_trace`] without the trace: derives the same final register file
+/// directly from the collected final state, mirroring exactly how
+/// [`generate_register_trace`] fills the `FINI` column (accessed registers take
+/// their final value; never-accessed registers keep their init). Lets the
+/// continuation producer chain epochs before this epoch's REGISTER trace is
+/// generated. Pinned to the trace-derived values by
+/// `fini_from_final_state_matches_trace`.
+pub fn fini_from_final_state(final_state: &FinalRegisterStateMap, init: &[u32]) -> Vec<u32> {
+    register_word_address_list()
+        .iter()
+        .take(NUM_REGISTER_ADDRESSES)
+        .enumerate()
+        .map(|(row, word_addr)| {
+            final_state
+                .get(word_addr)
+                .map(|state| state.value)
+                .unwrap_or_else(|| init.get(row).copied().unwrap_or(0))
+        })
         .collect()
 }
 

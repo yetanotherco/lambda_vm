@@ -12,9 +12,7 @@ use crate::config::{FriLayerMerkleTree, FriLayerMerkleTreeBackend};
 
 use self::fri_commitment::FriLayer;
 use self::fri_decommit::FriDecommitment;
-use self::fri_functions::{
-    compute_coset_twiddles_inv, fold_evaluations_in_place, update_twiddles_in_place,
-};
+use self::fri_functions::{fold_evaluations_in_place, update_twiddles_in_place};
 
 /// FRI commit phase from pre-computed bit-reversed evaluations, skipping the
 /// initial FFT. Stops folding when the remaining codeword encodes a polynomial
@@ -37,6 +35,7 @@ pub fn commit_phase_from_evaluations<
     domain_size: usize,
     blowup_log: u32,
     final_poly_log_degree: u32,
+    inv_twiddles: &[FieldElement<F>],
 ) -> (
     Vec<FieldElement<E>>,
     Vec<FriLayer<E, FriLayerMerkleTreeBackend<E>>>,
@@ -67,11 +66,16 @@ where
             domain_size,
             blowup_log,
             final_poly_log_degree,
+            inv_twiddles,
         ) {
             return result;
         }
     }
 
+    debug_assert_eq!(evals.len(), domain_size);
+    // Caller-enforced twiddle sizing (Domain::fri_inv_twiddles): the folding
+    // loop below indexes `inv_twiddles[..len/2]` per layer.
+    debug_assert_eq!(inv_twiddles.len(), evals.len() / 2);
     // Fold layout, shared with the GPU prover and the verifier — see `FriFoldLayout`.
     let layout = crate::fri::terminal::FriFoldLayout::new(
         evals.len().trailing_zeros(),
@@ -80,8 +84,9 @@ where
     );
     let num_committed = layout.num_committed;
 
-    // Inverse twiddle factors for evaluation-form folding.
-    let mut inv_twiddles = compute_coset_twiddles_inv(coset_offset, domain_size);
+    // Inverse twiddle factors for evaluation-form folding: per-layer working
+    // copy of the per-domain cached set (`Domain::fri_inv_twiddles`).
+    let mut inv_twiddles = inv_twiddles.to_vec();
     let mut fri_layer_list = Vec::with_capacity(num_committed);
 
     // Commit `num_committed` folded layers to the transcript.
@@ -145,7 +150,7 @@ where
     (final_poly_coeffs, fri_layer_list)
 }
 
-pub fn query_phase<F: IsField>(
+pub fn query_phase<F: IsField + 'static>(
     fri_layers: &[FriLayer<F, FriLayerMerkleTreeBackend<F>>],
     iotas: &[usize],
 ) -> Vec<FriDecommitment<F>>

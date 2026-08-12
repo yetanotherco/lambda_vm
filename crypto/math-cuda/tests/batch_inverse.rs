@@ -72,6 +72,31 @@ fn batch_inverse_n1() {
     run(1, 1);
 }
 
+/// `batch_inverse_ext3_dev`'s own `n == 1` branch, which the host entry point
+/// above never reaches: `batch_inverse_ext3` short-circuits n==1 to
+/// `invert_ext3_host`, so only a direct device call exercises the single
+/// `invert_total_ext3` launch that serves this case.
+#[test]
+fn batch_inverse_dev_n1() {
+    let mut rng = ChaCha8Rng::seed_from_u64(7);
+    let x = rand_fp3_nonzero(&mut rng);
+    let expected = x.inv().expect("nonzero is invertible");
+
+    let be = math_cuda::device::backend().expect("cuda backend");
+    let stream = be.next_stream();
+    let input = stream.clone_htod(&ext3_to_u64s(&[x])).unwrap();
+
+    let out_dev = math_cuda::inverse::batch_inverse_ext3_dev(&input, 1, &stream).unwrap();
+    let got = stream.clone_dtoh(&out_dev).unwrap();
+    stream.synchronize().unwrap();
+
+    assert_eq!(
+        canon3(&got),
+        canon3(&ext3_to_u64s(&[expected])),
+        "device n==1 inverse"
+    );
+}
+
 #[test]
 fn batch_inverse_single_block() {
     // All single-block sizes (no recursion).

@@ -393,8 +393,9 @@ fn report_sizes(sizes: &[ArtifactSize]) {
 /// Use those two for anything per-proof. Use this one for per-AIR facts only.
 #[test]
 fn constraint_op_census() {
+    use stark::constraint_ir::artifact::DIM_BASE;
     use stark::constraint_ir::device::{
-        DIM_BASE, OP_ADD, OP_ALPHA_POW, OP_CONST_BASE, OP_CONST_EXT, OP_EMBED, OP_MUL, OP_NEG,
+        OP_ADD, OP_ALPHA_POW, OP_CONST_BASE, OP_CONST_EXT, OP_EMBED, OP_MUL, OP_NEG,
         OP_RAP_CHALLENGE, OP_SUB, OP_TABLE_OFFSET, OP_VAR,
     };
 
@@ -923,8 +924,9 @@ fn continuation_epoch_chunk_counts_measured() {
 /// multiplies. Shared by `constraint_op_census` and `epoch_chunk_multiplier` so
 /// the two cannot drift apart.
 fn leg_instructions(air: &dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = ()>) -> usize {
+    use stark::constraint_ir::artifact::DIM_BASE;
     use stark::constraint_ir::device::{
-        DIM_BASE, OP_ADD, OP_ALPHA_POW, OP_CONST_BASE, OP_CONST_EXT, OP_EMBED, OP_MUL, OP_NEG,
+        OP_ADD, OP_ALPHA_POW, OP_CONST_BASE, OP_CONST_EXT, OP_EMBED, OP_MUL, OP_NEG,
         OP_RAP_CHALLENGE, OP_SUB, OP_TABLE_OFFSET, OP_VAR,
     };
     let artifact = ConstraintArtifact::capture(air);
@@ -1137,8 +1139,8 @@ fn parameterized_airs_vary_per_parameter_value() {
     println!();
 }
 
-/// GLOBAL_MEMORY has a second, ENUMERABLE axis: private-input pages are built
-/// non-preprocessed, which changes the artifact's SHAPE rather than a constant.
+/// GLOBAL_MEMORY has a second, ENUMERABLE axis: private-input pages preprocess
+/// OFFSET only, which changes the artifact's SHAPE rather than a constant.
 ///
 /// Worth separating from the parameter axis above because the two have very
 /// different consequences. A page base is an arbitrary address, so its artifact
@@ -1172,18 +1174,29 @@ fn global_memory_private_input_is_a_second_shape_not_a_second_program() {
     assert_eq!(elf.roots, private.roots);
     assert_eq!(elf.meta, private.meta);
 
-    // The shape does vary, in exactly the preprocessed fields.
+    // The shape does vary, in exactly the preprocessed fields. Both variants are
+    // preprocessed; they differ in HOW MANY columns. An ELF page commits OFFSET
+    // and INIT, so the verifier recomputes the genesis values from the ELF. A
+    // private-input page commits OFFSET alone — INIT is the private input and
+    // stays a main-trace column, but OFFSET is the row's address and leaving it
+    // prover-chosen would let a genesis token name an arbitrary address.
     assert!(elf.shape.is_preprocessed, "an ELF page is preprocessed");
     assert!(
-        !private.shape.is_preprocessed,
-        "a private-input page is not preprocessed — the verifier never recomputes its genesis \
-         column from the ELF"
+        private.shape.is_preprocessed,
+        "a private-input page still preprocesses OFFSET"
     );
-    assert!(elf.shape.num_precomputed_columns > 0);
-    assert_eq!(private.shape.num_precomputed_columns, 0);
+    assert_eq!(
+        elf.shape.num_precomputed_columns,
+        crate::tables::global_memory::NUM_PREPROCESSED_COLS as u32,
+        "an ELF page commits OFFSET and INIT"
+    );
+    assert_eq!(
+        private.shape.num_precomputed_columns,
+        crate::tables::page::NUM_PREPROCESSED_COLS_PRIVATE as u32,
+        "a private-input page commits OFFSET only"
+    );
 
     let mut normalized = private.shape.clone();
-    normalized.is_preprocessed = elf.shape.is_preprocessed;
     normalized.num_precomputed_columns = elf.shape.num_precomputed_columns;
     assert_eq!(
         normalized, elf.shape,

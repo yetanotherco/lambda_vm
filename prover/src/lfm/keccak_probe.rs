@@ -198,10 +198,11 @@ fn adapter_probe_proves_real_permutations() {
     );
 
     // The BITWISE feed is exactly the per-round half of the production
-    // collector: 1148 lookups per round, no address-shaped lookups.
+    // collector: 1028 lookups per round, no address-shaped lookups and no HWSL
+    // (the θ/ρ shifts are inline μ-gated identities on the round chip).
     assert_eq!(
         keccak_adapter::bitwise_ops_for(&ops).len(),
-        ops.len() * 24 * 1148,
+        ops.len() * 24 * 1028,
         "per-permutation BITWISE lookup count"
     );
 

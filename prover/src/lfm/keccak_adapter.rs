@@ -303,7 +303,7 @@ pub fn round_operations(ops: &[KeccakAdapterOperation]) -> Vec<KeccakRoundOperat
         .collect()
 }
 
-/// BITWISE lookups the `KECCAK_RND` rows of `ops` send: exactly `24 * 1148` per
+/// BITWISE lookups the `KECCAK_RND` rows of `ops` send: exactly `24 * 1028` per
 /// permutation.
 ///
 /// This is the per-round half of `trace_builder::collect_bitwise_from_keccak`,
@@ -312,11 +312,17 @@ pub fn round_operations(ops: &[KeccakAdapterOperation]) -> Vec<KeccakRoundOperat
 /// bytes, 100 `IS_HALF` on the lane pointers) that belong to the dropped core
 /// chip. Calling it with a synthetic address and subtracting would depend on
 /// those counts staying fixed; forking the loop keeps the coupling explicit.
+///
+/// The θ/ρ halfword shifts no longer emit HWSL lookups (120 sends/round removed:
+/// 20 in θ, 100 in ρ) — they are enforced by inline μ-gated linear identities on
+/// the round chip, matching main's `keccak_rnd::bus_interactions` /
+/// `KeccakRndConstraints` and `trace_builder::collect_bitwise_from_keccak`. Per
+/// round: 1148 − 120 = 1028.
 #[allow(clippy::needless_range_loop)]
 pub fn bitwise_ops_for(ops: &[KeccakAdapterOperation]) -> Vec<BitwiseOperation> {
     use executor::vm::instruction::execution::{KECCAK_RC, KECCAK_RHO};
 
-    let mut out = Vec::with_capacity(ops.len() * 24 * 1148);
+    let mut out = Vec::with_capacity(ops.len() * 24 * 1028);
 
     for op in ops {
         let mut state = op.input;
@@ -349,21 +355,18 @@ pub fn bitwise_ops_for(ops: &[KeccakAdapterOperation]) -> Vec<BitwiseOperation> 
                 }
             }
 
-            // theta: HWSL for rotated C (20) + ARE_BYTES on Cxz_left (20 pairs).
-            // Cxz_right is range-checked by IS_BIT polynomial constraints on the
-            // round chip, not via lookups (spec d75944ee).
+            // theta: ARE_BYTES on Cxz_left (20 pairs). The rotate-C-by-1 halfword
+            // shift no longer emits an HWSL lookup — it is enforced by an inline
+            // μ-gated linear identity on the round chip (matching main's
+            // `KeccakRndConstraints`; the HWSL sends were dropped from
+            // `keccak_rnd::bus_interactions`). Cxz_right is range-checked by
+            // IS_BIT polynomial constraints on the round chip (spec d75944ee).
             let mut rotated_c = [[0u8; 8]; 5];
             for x in 0..5 {
                 let c = cxz[x][3];
                 for hw in 0..4 {
                     let halfword = (c[hw * 2] as u16) | ((c[hw * 2 + 1] as u16) << 8);
                     let shifted = halfword << 1; // u16 wraps
-                    out.push(BitwiseOperation::new(
-                        BitwiseOperationType::Hwsl,
-                        (halfword & 0xFF) as u8,
-                        ((halfword >> 8) & 0xFF) as u8,
-                        1,
-                    ));
                     out.push(BitwiseOperation::byte_op(
                         BitwiseOperationType::AreBytes,
                         (shifted & 0xFF) as u8,
@@ -425,7 +428,9 @@ pub fn bitwise_ops_for(ops: &[KeccakAdapterOperation]) -> Vec<BitwiseOperation> 
                 }
             }
 
-            // rho: HWSL (100) + ARE_BYTES (200 pairs)
+            // rho: ARE_BYTES (200 pairs). The ρ halfword shifts no longer emit
+            // HWSL lookups — enforced by inline μ-gated identities on the round
+            // chip (matching main's `KeccakRndConstraints`).
             for x in 0..5 {
                 for y in 0..5 {
                     let rho_offset = KECCAK_RHO[x][y] as usize;
@@ -438,12 +443,6 @@ pub fn bitwise_ops_for(ops: &[KeccakAdapterOperation]) -> Vec<BitwiseOperation> 
                         } else {
                             (halfword << rnc_val, halfword >> (16 - rnc_val))
                         };
-                        out.push(BitwiseOperation::new(
-                            BitwiseOperationType::Hwsl,
-                            (halfword & 0xFF) as u8,
-                            ((halfword >> 8) & 0xFF) as u8,
-                            rnc_val,
-                        ));
                         out.push(BitwiseOperation::byte_op(
                             BitwiseOperationType::AreBytes,
                             (shifted & 0xFF) as u8,

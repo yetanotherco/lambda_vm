@@ -597,6 +597,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 /// - idx 25,26: `read_register2·imm[i]` (arg2 exclusivity);
 /// - idx 27-31: `(1 − μ)·flag` for `read_register1/2`, `write_register`,
 ///   `signed`, `res_sign`.
+#[derive(Clone, Copy)]
 pub struct Cpu32Constraints;
 
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for Cpu32Constraints {

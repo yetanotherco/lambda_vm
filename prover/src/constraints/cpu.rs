@@ -273,6 +273,7 @@ pub fn emit_next_pc_add_pair<B: ConstraintBuilder<GoldilocksField, GoldilocksExt
 /// - idx 35:     `MEMORY · BRANCH = 0`;
 /// - idx 36,37:  `arg2` exclusivity (`imm_0`, `imm_1`);
 /// - idx 38:     `IS_BIT(mem_flags)` on non-MEMORY rows.
+#[derive(Clone, Copy)]
 pub struct CpuConstraints;
 
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for CpuConstraints {

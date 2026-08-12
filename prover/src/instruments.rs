@@ -71,11 +71,14 @@ pub fn print_report(
     row_top("AIR construction", air_construction, total);
 
     if let Some(ref mp) = mp {
-        let round1 = mp.main_commits + mp.aux_build + mp.aux_commit;
-
+        // Only two wall-clock phases are left. Round 1's main commits are the
+        // last phase-wide barrier (every main root must be absorbed before the
+        // shared LogUp challenges are sampled); everything after it — aux
+        // build, aux commit, rounds 2-4 — runs as one fused task per table, so
+        // those three have no wall-clock phase of their own to report. Their
+        // CPU time is listed under the fused phase instead.
         row_top("Pre-pass (domains/twiddles)", mp.prepass, total);
-        row_top("Round 1", round1, total);
-        row_sub("  Main trace commits", mp.main_commits, total);
+        row_top("Round 1 (main trace commits)", mp.main_commits, total);
         row_sub(
             "    Main LDE (fused GPU: LDE+Keccak+Merkle / CPU: LDE only)",
             mp.round1_sub.main_lde,
@@ -86,7 +89,12 @@ pub fn print_report(
             mp.round1_sub.main_merkle,
             total,
         );
-        row_sub("  Aux trace build (parallel)", mp.aux_build, total);
+        row_top(
+            "Rounds 2\u{2013}4 (aux build+commit fused in)",
+            mp.rounds_2_4,
+            total,
+        );
+        eprintln!("      \u{2500}\u{2500} aux build (CPU, summed over tables) \u{2500}\u{2500}");
         row_sub(
             "    LogUp fingerprint (CPU)",
             mp.round1_sub.aux_fingerprint,
@@ -107,7 +115,7 @@ pub fn print_report(
             mp.round1_sub.aux_accumulate,
             total,
         );
-        row_sub("  Aux trace commit", mp.aux_commit, total);
+        eprintln!("      \u{2500}\u{2500} aux commit (CPU, summed over tables) \u{2500}\u{2500}");
         row_sub(
             "    Aux LDE (fused GPU: LDE+Keccak+Merkle / CPU: LDE only)",
             mp.round1_sub.aux_lde,
@@ -118,7 +126,7 @@ pub fn print_report(
             mp.round1_sub.aux_merkle,
             total,
         );
-        row_top("Rounds 2\u{2013}4", mp.rounds_2_4, total);
+        eprintln!("      \u{2500}\u{2500} per table (R2\u{2013}4 wall) \u{2500}\u{2500}");
 
         // Merge split tables: MEMW[0..4] → MEMW x5
         let mut merged: BTreeMap<String, MergedTable> = BTreeMap::new();
@@ -209,10 +217,7 @@ pub fn print_report(
                 ("R4  queries & openings", total_queries),
             ];
             sub_ops.sort_by(|a, b| b.1.cmp(&a.1));
-            eprintln!(
-                "  {}",
-                "    \u{2500}\u{2500} sub-operation totals (all tables) \u{2500}\u{2500}",
-            );
+            eprintln!("      \u{2500}\u{2500} sub-operation totals (all tables) \u{2500}\u{2500}");
             for (label, dur) in &sub_ops {
                 row_sub(&format!("    {label}"), *dur, total);
             }

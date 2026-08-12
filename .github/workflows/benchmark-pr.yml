@@ -12,6 +12,14 @@ on:
       - 'executor/**'
       - 'bin/cli/**'
       - 'tooling/ethrex-fixtures/**'
+      # A baseline is only valid for the workload it measured, and the Makefile is
+      # what defines that workload: it names the block and pins the URL and sha256
+      # of the .bin this job fetches. Without it a repointed block would leave
+      # main's baseline stale until some prover file happened to change — and the
+      # comparison guard would suppress the table until then. The converter is not
+      # listed: CI never runs it, so changing it cannot change the bytes proven
+      # here.
+      - 'Makefile'
   # Uncomment to auto-run on PRs:
   # pull_request:
   #   branches: [main]
@@ -32,18 +40,83 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # Headline program: the ethrex guest ELF proven against a 20-transfer block
-  # (distinct sender -> distinct recipient per tx). One ELF; the workload is the
-  # private input (rkyv ProgramInput), generated in-job and gitignored (see the
-  # "Generate ethrex bench fixtures" step).
+  # `/bench` proves ONE workload: a real Ethereum block. The synthetic N-transfer
+  # screen that used to run alongside it was removed deliberately — if you are about
+  # to add it back, these are the two reasons it went:
+  #
+  #   1. Its only unique coverage was the MONOLITHIC prove path, which is vestigial
+  #      (reportedly slower than a 1-epoch continuation). Coverage of a path we intend
+  #      to delete is not a reason to spend runner time.
+  #   2. Its crypto mix is one no real block has: 9.16 ECSM per Mcycle against a real
+  #      block's 2.28. Screening against it tunes the prover for a worst case that
+  #      cannot occur.
+  #
+  # The synthetic fixtures themselves are NOT gone — /bench-growth still sweeps them to
+  # get a heap-vs-block-size slope, which needs a family of blocks and so cannot come
+  # from one real one. Only the headline screen was dropped.
+  #
+  # Cycle counts below are for the ELF THIS JOB BUILDS (see "Build ethrex guest ELF"),
+  # as of main @ 9ccdaf2 with clang 21. They move with guest optimisation (#861 gave the
+  # guest thin LTO) and ~2% with the clang major on PATH, so a count quoted against a
+  # different ELF reads as a regression — always pin the ELF when repeating one.
   ELF: executor/program_artifacts/rust/ethrex.elf
-  INPUT: executor/tests/ethrex_bench_20.bin
-  BENCH_RUNS_PR: 3
-  # Cheap-tier screen: catches regressions down to ~1.5% on its own and leaves
-  # smaller/ambiguous deltas to the manual drift-free ABBA tiebreaker. Pushing either
-  # side past 5 buys little here (the cached comparison can't beat the ~1% drift wall),
-  # so the per-PR run count is also capped at 5 (clamp below).
-  BENCH_RUNS_BASELINE: 5
+  # The workload: a real Ethereum block. WHICH block lives in
+  # the Makefile and nowhere else — nothing in this file names one, so a repoint
+  # moves this job without editing it. At the current default that is 50.78M cycles,
+  # 10,478 keccak calls and 116 ecsm calls: ~5.8x the work of the synthetic block with a
+  # ~18x different keccak:ecrecover mix. That is the whole point — a prover change
+  # can move the synthetic number and the real one in opposite directions.
+  #
+  # The path is resolved from the Makefile (`make -s print-real-block-fixture`) into
+  # REAL_INPUT at run time. The ~1 MB .bin is gitignored and FETCHED by URL + sha256
+  # (see "Fetch ethrex real-block fixture"); while that URL is unset the whole
+  # section degrades to a warning rather than failing the job.
+  #
+  # Continuations are mandatory here, not a preference: a monolithic prove costs
+  # ~4.9 GB of peak heap per million cycles on this workload family (from the
+  # measured growth fit, 10,728 MB + 2,007 MB/transfer at R^2 = 0.998), so the
+  # current default would need ~240 GB and a heavier candidate far more.
+  # `--continuations` makes peak heap a function of the epoch size instead of the
+  # trace length. Costs move with the block; the per-candidate table is in
+  # tooling/ethrex-block-converter/README.md.
+  #
+  # Budget ~1.2 GB of disk for the bundle each run — hence the `rm -f` after every
+  # prove. A heavier block pushes it past 2 GiB, which needs rkyv `pointer_width_64`;
+  # a PR branch predating that fix fails at write time rather than mismeasuring.
+  #
+  # Epoch 2^22, from the CPU sweep on 2026-07-31 (124 GiB / 32-core box, real block,
+  # branch vintage; full table in tooling/ethrex-block-converter/README.md):
+  #
+  #   2^21   464.26 s   18.43 GiB RSS   26 epochs   1.72 GB proof
+  #   2^22   397.88 s   32.21 GiB RSS   13 epochs   1.15 GB proof
+  #   2^23   356.47 s   60.01 GiB RSS    7 epochs   0.90 GB proof
+  #
+  # Those RSS figures are the CALIBRATION BOX's, and memory does not transfer between
+  # machines any better than seconds do: this runner measured ~52 GB of peak heap for
+  # the same block at 2^22 — over 1.5x the calibration box's 32.21 GiB, and close
+  # enough to its >=64 GiB floor that 2^23 (60 GiB on the roomier box, so more here)
+  # is out of the question. Memory, not speed, is what picks 2^22. Moving off 2^21 is
+  # worth ~14% wall on the calibration box; treat that ratio as transferable and
+  # neither the absolute seconds nor the RSS column as such. This runner's own
+  # measured time at 2^22 is 158.8 s (median of 3, 2.8% spread, 13 epochs).
+  #
+  # Deliberately NOT the CLI's DEFAULT_CONTINUATION_EPOCH_SIZE_LOG2, which stays 20 so
+  # a laptop can still prove; and not the GPU path's 2^22, which happens to coincide
+  # but is chosen by VRAM rather than host RAM (see benchmark-gpu.yml).
+  REAL_BLOCK_EPOCH_LOG2: "22"
+  # Sampled 3 times and reported as median + spread. Three rather than five because
+  # each run is minutes rather than seconds; enough that one slow run shows up as
+  # spread instead of moving the median.
+  #
+  # THIS IS THE DIAL. A run measures 158.8 s on this runner (median of 3, 2.8% spread,
+  # at the epoch above), so 3 runs is ~8 min of proving and the right count. Should a
+  # future block or prover change take a run past ~6 min, /bench becomes a ~25 min
+  # occupancy of a runner every other bench queues behind, and this count is what to
+  # turn down (2, or 1) before reaching for anything else.
+  # `/bench N` overrides this, clamped to [1,5]. Past 5 the cached comparison can't
+  # beat the ~1% session-drift wall anyway — that is what /bench-abba is for, and it
+  # proves this same block at this same epoch, so escalating keeps the question fixed.
+  BENCH_RUNS_REAL: 3
   # Memory-scaling sweep: same ELF, different N-transfer inputs. GROWTH_PROGRAMS
   # are the generated (gitignored) fixture basenames in executor/tests/; GROWTH_STEPS
   # the matching transfer counts (x-axis; slope is MB per transfer).
@@ -53,7 +126,11 @@ env:
 jobs:
   benchmark:
     runs-on: [self-hosted, bench]
-    # Skip unless: push to main, workflow_dispatch, or "/bench" comment on a PR
+    # Skip unless: push to main, workflow_dispatch, or "/bench" comment on a PR.
+    # "/bench-growth" is handled by THIS job (it is prefixed by "/bench" and
+    # deliberately absent from the exclusion list below); it only switches whether the
+    # growth sweep runs, in the "Determine run count" step. The real block needs no
+    # token — it runs on every invocation.
     if: >-
       github.event_name == 'push' ||
       github.event_name == 'workflow_dispatch' ||
@@ -135,20 +212,61 @@ jobs:
             echo "run_growth=false" >> "$GITHUB_OUTPUT"
           fi
 
+          # The real block runs on EVERY invocation — plain `/bench`, push to main, and
+          # workflow_dispatch alike. It is the number that means something, so it should
+          # not need a second command to ask for, and it is the only workload /bench
+          # proves.
+          #
+          # The cost is real and lands on a shared runner: 158.8 s per run x
+          # BENCH_RUNS_REAL is ~8 min of proving, so every /bench and every push to main
+          # occupies the bench server for roughly 15 min once checkout, the two-sided
+          # build, the fixture fetch and the guest ELF are counted, and /bench-abba and
+          # /bench-verify queue behind it. That trade was made deliberately — see
+          # BENCH_RUNS_REAL above for the dial if it proves too expensive.
+          RUN_REAL=true
+
+          # The fixture is FETCHED from a pinned URL + sha256, not built (see the
+          # Makefile). The guard covers the window after a repoint but before the new
+          # artifact is uploaded: warn instead of failing, so a push to main cannot go
+          # red over an upload nobody in CI can perform. On push and workflow_dispatch
+          # the growth sweep still runs and feeds the baseline artifact (no comment is
+          # posted on those events — the Comment step is gated to comment triggers);
+          # on a plain /bench nothing is left to measure, and the footer says so.
+          if [ "$RUN_REAL" = "true" ] && [ -z "$(make -s print-real-block-fixture-url)" ]; then
+            echo "::warning::Real-block benchmark skipped: ETHREX_REAL_BLOCK_FIXTURE_URL is unset in the Makefile."
+            RUN_REAL=false
+          fi
+          echo "run_real=$RUN_REAL" >> "$GITHUB_OUTPUT"
+
+          # Resolve the real-block fixture path from its single source of truth (the
+          # Makefile) and pin it in the job env. Captured HERE, before the baseline
+          # step's `git checkout origin/main`, so the PR and main sides agree on the
+          # workload even when main's Makefile names a different block.
+          echo "REAL_INPUT=$(make -s print-real-block-fixture)" >> "$GITHUB_ENV"
+
+          # Every metrics writer appends, and no step creates this file. Truncate here
+          # (this step always runs) so a previous run's values can't survive on the
+          # persistent self-hosted runner.
+          : > /tmp/metrics.txt
+
+          # `/bench N` sets the real-block sample count. Both sides use the same count
+          # (push-to-main publishes the baseline), so there is no PR-vs-baseline split
+          # any more — an asymmetric count would put the two sides' noise on different
+          # footings, which is what sampling is for.
+          RUNS=$BENCH_RUNS_REAL
           if [ "$EVENT_NAME" = "issue_comment" ]; then
             CUSTOM_N=$(echo "$COMMENT_BODY" | sed -n 's|^/bench[[:space:]]*\([0-9]\+\).*|\1|p')
-            RUNS=${CUSTOM_N:-$BENCH_RUNS_PR}
-          elif [ "$EVENT_NAME" = "push" ] || [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            RUNS=$BENCH_RUNS_BASELINE
-          else
-            RUNS=$BENCH_RUNS_PR
+            RUNS=${CUSTOM_N:-$BENCH_RUNS_REAL}
           fi
 
           # Clamp to 1-5. Beyond 5 the single-session cached comparison barely improves
-          # (it can't beat the ~1% drift wall); use the ABBA tiebreaker for finer deltas.
+          # (it can't beat the ~1% drift wall); use /bench-abba for finer deltas — it
+          # resolves ~1% over the same block in ~72 min at its default 12 pairs.
+          # At 158.8 s a run this is also the difference between a ~10 min and a ~20 min
+          # occupancy of the one bench runner.
           if [ "$RUNS" -lt 1 ] 2>/dev/null || [ "$RUNS" -gt 5 ] 2>/dev/null; then
-            echo "::warning::Run count $RUNS out of range [1,5], defaulting to $BENCH_RUNS_PR"
-            RUNS=$BENCH_RUNS_PR
+            echo "::warning::Run count $RUNS out of range [1,5], defaulting to $BENCH_RUNS_REAL"
+            RUNS=$BENCH_RUNS_REAL
           fi
 
           echo "runs=$RUNS" >> "$GITHUB_OUTPUT"
@@ -169,74 +287,19 @@ jobs:
             echo "Using $RUNS iterations, TABLE_PARALLELISM=default"
           fi
 
-      - name: Benchmark PR
-        id: pr
-        env:
-          RUNS: ${{ steps.config.outputs.runs }}
-          TABLE_PARALLELISM: ${{ steps.config.outputs.table_parallelism }}
+      - name: Fetch ethrex real-block fixture
+        if: steps.config.outputs.run_real == 'true'
         run: |
-          if [ -n "$TABLE_PARALLELISM" ]; then
-            export TABLE_PARALLELISM
-            echo "TABLE_PARALLELISM=$TABLE_PARALLELISM"
-          fi
-          TIMES=""
-          HEAPS=""
-          for i in $(seq 1 $RUNS); do
-            echo "--- Run $i/$RUNS ---"
-            ./target/release/cli prove "$ELF" --private-input "$INPUT" -o /tmp/proof.bin --time \
-              | tee /tmp/cli_output_$i.txt
-            rm -f /tmp/proof.bin
-
-            T=$(grep -o 'Proving time: [0-9.]*' /tmp/cli_output_$i.txt | awk '{print $3}')
-            H=$(grep -o 'Peak heap: [0-9]*' /tmp/cli_output_$i.txt | awk '{print $3}')
-
-            if [ -z "$T" ] || [ -z "$H" ]; then
-              echo "::error::Failed to parse metrics from run $i"
-              cat /tmp/cli_output_$i.txt
-              exit 1
-            fi
-
-            TIMES="$TIMES $T"
-            HEAPS="$HEAPS $H"
-          done
-
-          # Median position (works for odd N; for even N picks lower-middle)
-          MEDIAN_POS=$(( (RUNS + 1) / 2 ))
-          TIME_MEDIAN=$(echo $TIMES | tr ' ' '\n' | sort -n | awk "NR==$MEDIAN_POS")
-          HEAP_MEDIAN=$(echo $HEAPS | tr ' ' '\n' | sort -n | awk "NR==$MEDIAN_POS")
-
-          if [ -z "$HEAP_MEDIAN" ] || [ -z "$TIME_MEDIAN" ]; then
-            echo "::error::Failed to compute median metrics"
-            exit 1
-          fi
-
-          # Spread: (max - min) / median * 100
-          TIME_MIN=$(echo $TIMES | tr ' ' '\n' | sort -n | head -1)
-          TIME_MAX=$(echo $TIMES | tr ' ' '\n' | sort -n | tail -1)
-          TIME_SPREAD=$(awk "BEGIN { if ($TIME_MEDIAN > 0) printf \"%.1f\", (($TIME_MAX - $TIME_MIN) / $TIME_MEDIAN) * 100; else print \"0.0\" }")
-
-          HEAP_MIN=$(echo $HEAPS | tr ' ' '\n' | sort -n | head -1)
-          HEAP_MAX=$(echo $HEAPS | tr ' ' '\n' | sort -n | tail -1)
-          HEAP_SPREAD=$(awk "BEGIN { if ($HEAP_MEDIAN > 0) printf \"%.1f\", (($HEAP_MAX - $HEAP_MIN) / $HEAP_MEDIAN) * 100; else print \"0.0\" }")
-
-          ALL_TIMES=$(echo $TIMES | tr ' ' '\n' | paste -sd '/' -)
-          ALL_HEAPS=$(echo $HEAPS | tr ' ' '\n' | paste -sd '/' -)
-
-          echo "peak_mb=$HEAP_MEDIAN" >> "$GITHUB_OUTPUT"
-          echo "time_s=$TIME_MEDIAN" >> "$GITHUB_OUTPUT"
-          echo "time_spread=$TIME_SPREAD" >> "$GITHUB_OUTPUT"
-          echo "heap_spread=$HEAP_SPREAD" >> "$GITHUB_OUTPUT"
-          echo "all_times=$ALL_TIMES" >> "$GITHUB_OUTPUT"
-          echo "all_heaps=$ALL_HEAPS" >> "$GITHUB_OUTPUT"
-          echo "runs=$RUNS" >> "$GITHUB_OUTPUT"
-
-          echo "peak_mb=$HEAP_MEDIAN" > /tmp/metrics.txt
-          echo "time_s=$TIME_MEDIAN" >> /tmp/metrics.txt
-          echo "time_spread=$TIME_SPREAD" >> /tmp/metrics.txt
-          echo "heap_spread=$HEAP_SPREAD" >> /tmp/metrics.txt
-          echo "all_times=$ALL_TIMES" >> /tmp/metrics.txt
-          echo "all_heaps=$ALL_HEAPS" >> /tmp/metrics.txt
-          echo "runs=$RUNS" >> /tmp/metrics.txt
+          # ~1 MB, gitignored, and never in the checkout: fetch it rather than failing
+          # on a missing file, the same way the synthetic fixtures are generated above.
+          # This is a URL + sha256 download, not a build — no converter, no ethrex host
+          # dependency tree, no ethrex-replay cache. The step is already gated on the
+          # URL being set (see "Determine run count").
+          #
+          # Untracked, so like the ELF it survives `git checkout origin/main` and both
+          # sides prove the identical block.
+          make ethrex-real-block-fixture
+          ls -l "$REAL_INPUT"
 
       - name: Memory growth (PR)
         id: pr-growth
@@ -299,18 +362,95 @@ jobs:
             printf "%.0f %.4f\n", slope, r2
           }')
 
-          echo "growth_steps=$STEPS_SLASH" >> "$GITHUB_OUTPUT"
+          # Only what Compare reads is a step output. growth_steps and growth_times had
+          # no consumer, so they live in the metrics artifact below instead.
           echo "growth_heaps=$GROWTH_HEAPS" >> "$GITHUB_OUTPUT"
-          echo "growth_times=$GROWTH_TIMES" >> "$GITHUB_OUTPUT"
           echo "growth_slope_mb=$SLOPE" >> "$GITHUB_OUTPUT"
           echo "growth_r2=$R2" >> "$GITHUB_OUTPUT"
 
-          # Append to metrics artifact
+          # The metrics artifact is the durable record, so it keeps the per-point times
+          # and the x-axis this sweep used even though the comment renders neither —
+          # a stored baseline's heaps cannot be read back without them.
           echo "growth_steps=$STEPS_SLASH" >> /tmp/metrics.txt
           echo "growth_heaps=$GROWTH_HEAPS" >> /tmp/metrics.txt
           echo "growth_times=$GROWTH_TIMES" >> /tmp/metrics.txt
           echo "growth_slope_mb=$SLOPE" >> /tmp/metrics.txt
           echo "growth_r2=$R2" >> /tmp/metrics.txt
+
+      - name: Real block (PR)
+        id: pr-real
+        if: steps.config.outputs.run_real == 'true'
+        env:
+          RUNS: ${{ steps.config.outputs.runs }}
+          TABLE_PARALLELISM: ${{ steps.config.outputs.table_parallelism }}
+        run: |
+          if [ -n "$TABLE_PARALLELISM" ]; then
+            export TABLE_PARALLELISM
+            echo "TABLE_PARALLELISM=$TABLE_PARALLELISM"
+          fi
+          TIMES=""
+          HEAPS=""
+          EPOCHS=""
+          for i in $(seq 1 "$RUNS"); do
+            echo "--- Real block run $i/$RUNS (continuations, epoch 2^$REAL_BLOCK_EPOCH_LOG2) ---"
+            ./target/release/cli prove "$ELF" --private-input "$REAL_INPUT" \
+              --continuations --epoch-size-log2 "$REAL_BLOCK_EPOCH_LOG2" \
+              -o /tmp/real_proof.bin --time | tee /tmp/real_output_$i.txt
+            rm -f /tmp/real_proof.bin
+
+            T=$(grep -o 'Proving time: [0-9.]*' /tmp/real_output_$i.txt | awk '{print $3}')
+            # Peak heap is optional here, unlike the monolithic step: the continuation
+            # prove path only learned to report it alongside this benchmark, so a
+            # baseline built from an older main prints no such line. Missing heap
+            # degrades one table cell; a missing time makes the run meaningless.
+            H=$(grep -o 'Peak heap: [0-9]*' /tmp/real_output_$i.txt | awk '{print $3}')
+            E=$(grep -o 'Epochs: [0-9]*' /tmp/real_output_$i.txt | awk '{print $2}')
+
+            if [ -z "$T" ]; then
+              echo "::error::Failed to parse real-block proving time from run $i"
+              cat /tmp/real_output_$i.txt
+              exit 1
+            fi
+            if [ -z "$H" ]; then
+              echo "::warning::No 'Peak heap' line on the real-block run (CLI predates continuation heap reporting)"
+            fi
+
+            TIMES="$TIMES $T"
+            if [ -n "$H" ]; then HEAPS="$HEAPS $H"; fi
+            EPOCHS="$E"
+          done
+
+          # Median for the headline, spread so a single slow run is visible rather than
+          # silently shifting the verdict, and every raw value so a reader can judge for
+          # themselves.
+          MEDIAN_POS=$(( (RUNS + 1) / 2 ))
+          TIME_MEDIAN=$(echo $TIMES | tr ' ' '\n' | sort -n | awk "NR==$MEDIAN_POS")
+          HEAP_MEDIAN=$(echo $HEAPS | tr ' ' '\n' | sort -n | awk "NR==$MEDIAN_POS")
+          TIME_MIN=$(echo $TIMES | tr ' ' '\n' | sort -n | head -1)
+          TIME_MAX=$(echo $TIMES | tr ' ' '\n' | sort -n | tail -1)
+          TIME_SPREAD=$(awk "BEGIN { if ($TIME_MEDIAN > 0) printf \"%.1f\", (($TIME_MAX - $TIME_MIN) / $TIME_MEDIAN) * 100; else print \"0.0\" }")
+          ALL_TIMES=$(echo $TIMES | tr ' ' '\n' | paste -sd '/' -)
+
+          # Say it at record time, not only at consume time: on push/dispatch these
+          # numbers become the cached baseline, and a noisy one mis-verdicts every
+          # /bench until the next refresh (2026-08-03: a 65.8%-spread baseline made
+          # healthy PRs read as ±20-35% for half an hour).
+          # 3%: the comment's verdict bands treat >=3% as a reportable delta, so a
+          # spread that could manufacture one is by definition too noisy. Keep in
+          # sync with the two 3.0 thresholds in the Comment step's renderer.
+          if awk "BEGIN { exit !($TIME_SPREAD > 3.0) }"; then
+            echo "::warning::Real-block prove-time spread ${TIME_SPREAD}% ($ALL_TIMES) — if this run publishes a baseline, /bench will flag comparisons against it as unreliable."
+          fi
+
+          {
+            echo "real_time_s=$TIME_MEDIAN"
+            echo "real_peak_mb=$HEAP_MEDIAN"
+            echo "real_epochs=$EPOCHS"
+            echo "real_runs=$RUNS"
+            echo "real_time_spread=$TIME_SPREAD"
+            echo "real_all_times=$ALL_TIMES"
+            echo "real_input=$(basename "$REAL_INPUT")"
+          } | tee -a /tmp/metrics.txt >> "$GITHUB_OUTPUT"
 
       - name: Upload metrics artifact
         uses: actions/upload-artifact@v4
@@ -338,17 +478,15 @@ jobs:
               BASELINE_FILE=$(ls -t baseline/*/metrics.txt 2>/dev/null | head -1)
               if [ -n "$BASELINE_FILE" ]; then
                 echo "found=true" >> "$GITHUB_OUTPUT"
-                echo "peak_mb=$(grep 'peak_mb=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
-                echo "time_s=$(grep 'time_s=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
-                echo "time_spread=$(grep 'time_spread=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
-                echo "heap_spread=$(grep 'heap_spread=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
-                echo "all_times=$(grep 'all_times=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
-                echo "all_heaps=$(grep 'all_heaps=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
-                echo "runs=$(grep 'runs=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
-                echo "growth_heaps=$(grep 'growth_heaps=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
-                echo "growth_times=$(grep 'growth_times=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
-                echo "growth_slope_mb=$(grep 'growth_slope_mb=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
-                echo "growth_r2=$(grep 'growth_r2=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+                # Anchored (`^key=`): `real_time_s` contains `time_s`, so an unanchored
+                # grep could match two lines and write a multi-line step output.
+                get() { grep "^$1=" "$BASELINE_FILE" | head -1 | cut -d= -f2; }
+                for key in growth_heaps growth_slope_mb growth_r2 \
+                           real_time_s real_peak_mb real_time_spread real_input; do
+                  # A baseline predating the real block simply has no real_* keys; empty
+                  # values hide the table rather than producing a bogus comparison.
+                  echo "$key=$(get "$key")" >> "$GITHUB_OUTPUT"
+                done
                 exit 0
               fi
             fi
@@ -363,6 +501,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RUNS: ${{ steps.config.outputs.runs }}
           RUN_GROWTH: ${{ steps.config.outputs.run_growth }}
+          RUN_REAL: ${{ steps.config.outputs.run_real }}
           TABLE_PARALLELISM: ${{ steps.config.outputs.table_parallelism }}
         run: |
           if [ -n "$TABLE_PARALLELISM" ]; then
@@ -380,56 +519,6 @@ jobs:
 
           cargo build --release -p cli --features jemalloc-stats
 
-          # --- Primary benchmark (ethrex 20 transfers) ---
-          TIMES=""
-          HEAPS=""
-          for i in $(seq 1 $RUNS); do
-            echo "--- Baseline run $i/$RUNS ---"
-            ./target/release/cli prove "$ELF" --private-input "$INPUT" -o /tmp/proof.bin --time \
-              | tee /tmp/baseline_output_$i.txt
-            rm -f /tmp/proof.bin
-
-            T=$(grep -o 'Proving time: [0-9.]*' /tmp/baseline_output_$i.txt | awk '{print $3}')
-            H=$(grep -o 'Peak heap: [0-9]*' /tmp/baseline_output_$i.txt | awk '{print $3}')
-
-            if [ -z "$T" ] || [ -z "$H" ]; then
-              echo "::error::Failed to parse baseline metrics from run $i"
-              cat /tmp/baseline_output_$i.txt
-              exit 1
-            fi
-
-            TIMES="$TIMES $T"
-            HEAPS="$HEAPS $H"
-          done
-
-          MEDIAN_POS=$(( (RUNS + 1) / 2 ))
-          TIME_MEDIAN=$(echo $TIMES | tr ' ' '\n' | sort -n | awk "NR==$MEDIAN_POS")
-          HEAP_MEDIAN=$(echo $HEAPS | tr ' ' '\n' | sort -n | awk "NR==$MEDIAN_POS")
-
-          if [ -z "$HEAP_MEDIAN" ] || [ -z "$TIME_MEDIAN" ]; then
-            echo "::error::Failed to compute baseline median metrics"
-            exit 1
-          fi
-
-          TIME_MIN=$(echo $TIMES | tr ' ' '\n' | sort -n | head -1)
-          TIME_MAX=$(echo $TIMES | tr ' ' '\n' | sort -n | tail -1)
-          TIME_SPREAD=$(awk "BEGIN { if ($TIME_MEDIAN > 0) printf \"%.1f\", (($TIME_MAX - $TIME_MIN) / $TIME_MEDIAN) * 100; else print \"0.0\" }")
-
-          HEAP_MIN=$(echo $HEAPS | tr ' ' '\n' | sort -n | head -1)
-          HEAP_MAX=$(echo $HEAPS | tr ' ' '\n' | sort -n | tail -1)
-          HEAP_SPREAD=$(awk "BEGIN { if ($HEAP_MEDIAN > 0) printf \"%.1f\", (($HEAP_MAX - $HEAP_MIN) / $HEAP_MEDIAN) * 100; else print \"0.0\" }")
-
-          ALL_TIMES=$(echo $TIMES | tr ' ' '\n' | paste -sd '/' -)
-          ALL_HEAPS=$(echo $HEAPS | tr ' ' '\n' | paste -sd '/' -)
-
-          echo "peak_mb=$HEAP_MEDIAN" >> "$GITHUB_OUTPUT"
-          echo "time_s=$TIME_MEDIAN" >> "$GITHUB_OUTPUT"
-          echo "time_spread=$TIME_SPREAD" >> "$GITHUB_OUTPUT"
-          echo "heap_spread=$HEAP_SPREAD" >> "$GITHUB_OUTPUT"
-          echo "all_times=$ALL_TIMES" >> "$GITHUB_OUTPUT"
-          echo "all_heaps=$ALL_HEAPS" >> "$GITHUB_OUTPUT"
-          echo "runs=$RUNS" >> "$GITHUB_OUTPUT"
-
           # --- Growth benchmarks (default parallelism, 1 sample each) ---
           # Only run if /bench-growth, push, or workflow_dispatch
           if [ "$RUN_GROWTH" != "true" ]; then
@@ -438,14 +527,12 @@ jobs:
           PROGRAMS=($GROWTH_PROGRAMS)
           STEPS_ARR=($GROWTH_STEPS)
           GROWTH_HEAPS=""
-          GROWTH_TIMES=""
           SAMPLES=1
 
           for idx in "${!PROGRAMS[@]}"; do
             prog="${PROGRAMS[$idx]}"
             INPUT_PATH="executor/tests/${prog}.bin"
             SAMPLE_HEAPS=""
-            SAMPLE_TIMES=""
             for s in $(seq 1 $SAMPLES); do
               echo "--- Baseline growth: $prog (sample $s/$SAMPLES, default parallelism) ---"
               ./target/release/cli prove "$ELF" --private-input "$INPUT_PATH" -o /tmp/proof.bin --time \
@@ -453,17 +540,16 @@ jobs:
               rm -f /tmp/proof.bin
               T=$(grep -o 'Proving time: [0-9.]*' /tmp/baseline_growth_${prog}_${s}.txt | awk '{print $3}')
               H=$(grep -o 'Peak heap: [0-9]*' /tmp/baseline_growth_${prog}_${s}.txt | awk '{print $3}')
+              # T is parsed only to catch a prove that emitted no timing line; the
+              # baseline side compares heap alone.
               if [ -z "$T" ] || [ -z "$H" ]; then
                 echo "::error::Failed to parse baseline growth metrics for $prog sample $s"
                 exit 1
               fi
               SAMPLE_HEAPS="$SAMPLE_HEAPS $H"
-              SAMPLE_TIMES="$SAMPLE_TIMES $T"
             done
             H=$(echo $SAMPLE_HEAPS | tr ' ' '\n' | sort -n | head -1)
-            T=$(echo $SAMPLE_TIMES | tr ' ' '\n' | sort -n | head -1)
             GROWTH_HEAPS="${GROWTH_HEAPS:+$GROWTH_HEAPS/}$H"
-            GROWTH_TIMES="${GROWTH_TIMES:+$GROWTH_TIMES/}$T"
           done
 
           STEPS_SLASH=$(echo "${STEPS_ARR[@]}" | tr ' ' '/')
@@ -490,10 +576,44 @@ jobs:
           }')
 
           echo "growth_heaps=$GROWTH_HEAPS" >> "$GITHUB_OUTPUT"
-          echo "growth_times=$GROWTH_TIMES" >> "$GITHUB_OUTPUT"
           echo "growth_slope_mb=$SLOPE" >> "$GITHUB_OUTPUT"
           echo "growth_r2=$R2" >> "$GITHUB_OUTPUT"
           fi  # end run_growth check
+
+          # --- Real block (continuations, sampled to the PR side's count) ---
+          # Only reached when no cached baseline exists, which is the expensive case:
+          # push-to-main normally publishes the real-block numbers, so a /bench comment
+          # pays for the PR side alone. $REAL_INPUT was resolved before this
+          # checkout and the fixture is untracked, so main proves the identical block.
+          if [ "$RUN_REAL" != "true" ]; then
+            echo "Skipping real-block baseline (fixture URL unset)"
+          else
+            # Sampled to the same count as the PR side. A 3-vs-1 comparison would put
+            # the two sides' noise on different footings, which is precisely the error
+            # sampling exists to avoid.
+            RTIMES=""; RHEAPS=""
+            for i in $(seq 1 "$RUNS"); do
+              echo "--- Baseline real block run $i/$RUNS (epoch 2^$REAL_BLOCK_EPOCH_LOG2) ---"
+              ./target/release/cli prove "$ELF" --private-input "$REAL_INPUT" \
+                --continuations --epoch-size-log2 "$REAL_BLOCK_EPOCH_LOG2" \
+                -o /tmp/real_proof.bin --time | tee /tmp/baseline_real_$i.txt
+              rm -f /tmp/real_proof.bin
+              T=$(grep -o 'Proving time: [0-9.]*' /tmp/baseline_real_$i.txt | awk '{print $3}')
+              # Optional, as on the PR side: a main that predates continuation heap
+              # reporting prints no such line, and that must not fail the comparison.
+              H=$(grep -o 'Peak heap: [0-9]*' /tmp/baseline_real_$i.txt | awk '{print $3}')
+              if [ -z "$T" ]; then
+                echo "::error::Failed to parse baseline real-block proving time from run $i"
+                cat /tmp/baseline_real_$i.txt
+                exit 1
+              fi
+              RTIMES="$RTIMES $T"
+              if [ -n "$H" ]; then RHEAPS="$RHEAPS $H"; fi
+            done
+            RMED_POS=$(( (RUNS + 1) / 2 ))
+            echo "real_time_s=$(echo $RTIMES | tr ' ' '\n' | sort -n | awk "NR==$RMED_POS")" >> "$GITHUB_OUTPUT"
+            echo "real_peak_mb=$(echo $RHEAPS | tr ' ' '\n' | sort -n | awk "NR==$RMED_POS")" >> "$GITHUB_OUTPUT"
+          fi
 
           # Restore PR checkout
           git checkout "$PR_SHA"
@@ -506,110 +626,112 @@ jobs:
         env:
           # Baseline artifact outputs
           BASELINE_FOUND: ${{ steps.baseline-artifact.outputs.found }}
-          BA_PEAK_MB: ${{ steps.baseline-artifact.outputs.peak_mb }}
-          BA_TIME_S: ${{ steps.baseline-artifact.outputs.time_s }}
-          BA_TIME_SPREAD: ${{ steps.baseline-artifact.outputs.time_spread }}
-          BA_HEAP_SPREAD: ${{ steps.baseline-artifact.outputs.heap_spread }}
-          BA_ALL_TIMES: ${{ steps.baseline-artifact.outputs.all_times }}
-          BA_ALL_HEAPS: ${{ steps.baseline-artifact.outputs.all_heaps }}
-          BA_RUNS: ${{ steps.baseline-artifact.outputs.runs }}
           BA_GROWTH_HEAPS: ${{ steps.baseline-artifact.outputs.growth_heaps }}
-          BA_GROWTH_TIMES: ${{ steps.baseline-artifact.outputs.growth_times }}
           BA_GROWTH_SLOPE: ${{ steps.baseline-artifact.outputs.growth_slope_mb }}
           BA_GROWTH_R2: ${{ steps.baseline-artifact.outputs.growth_r2 }}
+          BA_REAL_TIME: ${{ steps.baseline-artifact.outputs.real_time_s }}
+          BA_REAL_PEAK: ${{ steps.baseline-artifact.outputs.real_peak_mb }}
+          BA_REAL_SPREAD: ${{ steps.baseline-artifact.outputs.real_time_spread }}
+          BA_REAL_INPUT: ${{ steps.baseline-artifact.outputs.real_input }}
           # Baseline run outputs
-          BR_PEAK_MB: ${{ steps.baseline-run.outputs.peak_mb }}
-          BR_TIME_S: ${{ steps.baseline-run.outputs.time_s }}
-          BR_TIME_SPREAD: ${{ steps.baseline-run.outputs.time_spread }}
-          BR_HEAP_SPREAD: ${{ steps.baseline-run.outputs.heap_spread }}
-          BR_ALL_TIMES: ${{ steps.baseline-run.outputs.all_times }}
-          BR_ALL_HEAPS: ${{ steps.baseline-run.outputs.all_heaps }}
-          BR_RUNS: ${{ steps.baseline-run.outputs.runs }}
           BR_GROWTH_HEAPS: ${{ steps.baseline-run.outputs.growth_heaps }}
-          BR_GROWTH_TIMES: ${{ steps.baseline-run.outputs.growth_times }}
           BR_GROWTH_SLOPE: ${{ steps.baseline-run.outputs.growth_slope_mb }}
           BR_GROWTH_R2: ${{ steps.baseline-run.outputs.growth_r2 }}
-          # PR outputs
-          CURRENT_PEAK: ${{ steps.pr.outputs.peak_mb }}
-          CURRENT_TIME: ${{ steps.pr.outputs.time_s }}
-          PR_TIME_SPREAD: ${{ steps.pr.outputs.time_spread }}
-          PR_HEAP_SPREAD: ${{ steps.pr.outputs.heap_spread }}
-          PR_ALL_TIMES: ${{ steps.pr.outputs.all_times }}
-          PR_ALL_HEAPS: ${{ steps.pr.outputs.all_heaps }}
-          PR_RUNS: ${{ steps.pr.outputs.runs }}
+          BR_REAL_TIME: ${{ steps.baseline-run.outputs.real_time_s }}
+          BR_REAL_PEAK: ${{ steps.baseline-run.outputs.real_peak_mb }}
           # PR growth outputs
           PR_GROWTH_HEAPS: ${{ steps.pr-growth.outputs.growth_heaps }}
-          PR_GROWTH_TIMES: ${{ steps.pr-growth.outputs.growth_times }}
           PR_GROWTH_SLOPE: ${{ steps.pr-growth.outputs.growth_slope_mb }}
           PR_GROWTH_R2: ${{ steps.pr-growth.outputs.growth_r2 }}
+          # PR real-block outputs
+          PR_REAL_TIME: ${{ steps.pr-real.outputs.real_time_s }}
+          PR_REAL_PEAK: ${{ steps.pr-real.outputs.real_peak_mb }}
+          PR_REAL_EPOCHS: ${{ steps.pr-real.outputs.real_epochs }}
+          PR_REAL_INPUT: ${{ steps.pr-real.outputs.real_input }}
+          PR_REAL_RUNS: ${{ steps.pr-real.outputs.real_runs }}
+          PR_REAL_TIME_SPREAD: ${{ steps.pr-real.outputs.real_time_spread }}
+          PR_REAL_ALL_TIMES: ${{ steps.pr-real.outputs.real_all_times }}
         run: |
           # Pick baseline source
           if [ "$BASELINE_FOUND" = "true" ]; then
-            BASELINE_PEAK="$BA_PEAK_MB"
-            BASELINE_TIME="$BA_TIME_S"
             BASELINE_SRC="cached"
-            BASELINE_TIME_SPREAD="$BA_TIME_SPREAD"
-            BASELINE_HEAP_SPREAD="$BA_HEAP_SPREAD"
-            BASELINE_ALL_TIMES="$BA_ALL_TIMES"
-            BASELINE_ALL_HEAPS="$BA_ALL_HEAPS"
-            BASELINE_RUNS="$BA_RUNS"
             BASELINE_GROWTH_HEAPS="$BA_GROWTH_HEAPS"
-            BASELINE_GROWTH_TIMES="$BA_GROWTH_TIMES"
             BASELINE_GROWTH_SLOPE="$BA_GROWTH_SLOPE"
             BASELINE_GROWTH_R2="$BA_GROWTH_R2"
+            BASELINE_REAL_TIME="$BA_REAL_TIME"
+            BASELINE_REAL_PEAK="$BA_REAL_PEAK"
+            BASELINE_REAL_SPREAD="$BA_REAL_SPREAD"
+            BASELINE_REAL_INPUT="$BA_REAL_INPUT"
           else
-            BASELINE_PEAK="$BR_PEAK_MB"
-            BASELINE_TIME="$BR_TIME_S"
             BASELINE_SRC="built from main"
-            BASELINE_TIME_SPREAD="$BR_TIME_SPREAD"
-            BASELINE_HEAP_SPREAD="$BR_HEAP_SPREAD"
-            BASELINE_ALL_TIMES="$BR_ALL_TIMES"
-            BASELINE_ALL_HEAPS="$BR_ALL_HEAPS"
-            BASELINE_RUNS="$BR_RUNS"
             BASELINE_GROWTH_HEAPS="$BR_GROWTH_HEAPS"
-            BASELINE_GROWTH_TIMES="$BR_GROWTH_TIMES"
             BASELINE_GROWTH_SLOPE="$BR_GROWTH_SLOPE"
             BASELINE_GROWTH_R2="$BR_GROWTH_R2"
+            BASELINE_REAL_TIME="$BR_REAL_TIME"
+            BASELINE_REAL_PEAK="$BR_REAL_PEAK"
+            # A freshly-built baseline runs in this same session, so there is no
+            # recorded-earlier spread to distrust; empty suppresses the noise warning.
+            BASELINE_REAL_SPREAD=""
+            # Freshly proven on this runner from $REAL_INPUT, so by construction the
+            # same block the PR side used; the cached path carries its own label.
+            BASELINE_REAL_INPUT="$PR_REAL_INPUT"
           fi
 
-          if [ -z "$BASELINE_PEAK" ] || [ "$BASELINE_PEAK" -eq 0 ] 2>/dev/null ||
-             [ -z "$BASELINE_TIME" ]; then
-            echo "::error::Invalid baseline values: peak=$BASELINE_PEAK time=$BASELINE_TIME"
-            exit 1
-          fi
-
-          PEAK_DIFF=$((CURRENT_PEAK - BASELINE_PEAK))
-          PEAK_PCT=$(awk "BEGIN { printf \"%.1f\", ($PEAK_DIFF * 100) / $BASELINE_PEAK }")
-          TIME_DIFF=$(awk "BEGIN { printf \"%.3f\", $CURRENT_TIME - $BASELINE_TIME }")
-          TIME_PCT=$(awk "BEGIN { printf \"%.1f\", (($CURRENT_TIME - $BASELINE_TIME) * 100) / $BASELINE_TIME }")
-
-          echo "baseline_peak=$BASELINE_PEAK" >> "$GITHUB_OUTPUT"
-          echo "baseline_time=$BASELINE_TIME" >> "$GITHUB_OUTPUT"
           echo "baseline_src=$BASELINE_SRC" >> "$GITHUB_OUTPUT"
-          echo "peak_diff=$PEAK_DIFF" >> "$GITHUB_OUTPUT"
-          echo "peak_pct=$PEAK_PCT" >> "$GITHUB_OUTPUT"
-          echo "time_diff=$TIME_DIFF" >> "$GITHUB_OUTPUT"
-          echo "time_pct=$TIME_PCT" >> "$GITHUB_OUTPUT"
-          echo "pr_time_spread=$PR_TIME_SPREAD" >> "$GITHUB_OUTPUT"
-          echo "pr_heap_spread=$PR_HEAP_SPREAD" >> "$GITHUB_OUTPUT"
-          echo "pr_all_times=$PR_ALL_TIMES" >> "$GITHUB_OUTPUT"
-          echo "pr_all_heaps=$PR_ALL_HEAPS" >> "$GITHUB_OUTPUT"
-          echo "pr_runs=$PR_RUNS" >> "$GITHUB_OUTPUT"
-          echo "baseline_time_spread=$BASELINE_TIME_SPREAD" >> "$GITHUB_OUTPUT"
-          echo "baseline_heap_spread=$BASELINE_HEAP_SPREAD" >> "$GITHUB_OUTPUT"
-          echo "baseline_all_times=$BASELINE_ALL_TIMES" >> "$GITHUB_OUTPUT"
-          echo "baseline_all_heaps=$BASELINE_ALL_HEAPS" >> "$GITHUB_OUTPUT"
-          echo "baseline_runs=$BASELINE_RUNS" >> "$GITHUB_OUTPUT"
 
-          # Growth comparison
-          echo "pr_growth_heaps=$PR_GROWTH_HEAPS" >> "$GITHUB_OUTPUT"
-          echo "pr_growth_times=$PR_GROWTH_TIMES" >> "$GITHUB_OUTPUT"
-          echo "pr_growth_slope=$PR_GROWTH_SLOPE" >> "$GITHUB_OUTPUT"
-          echo "pr_growth_r2=$PR_GROWTH_R2" >> "$GITHUB_OUTPUT"
-          echo "baseline_growth_heaps=$BASELINE_GROWTH_HEAPS" >> "$GITHUB_OUTPUT"
-          echo "baseline_growth_times=$BASELINE_GROWTH_TIMES" >> "$GITHUB_OUTPUT"
-          echo "baseline_growth_slope=$BASELINE_GROWTH_SLOPE" >> "$GITHUB_OUTPUT"
-          echo "baseline_growth_r2=$BASELINE_GROWTH_R2" >> "$GITHUB_OUTPUT"
+          # A missing real-block baseline is NOT an error: it is what a PR sees before
+          # main has published one, and the comment renders the PR side alone. Only a
+          # missing PR-side number means the run failed to measure anything, and the
+          # real-block step already exits non-zero in that case.
+          if [ -z "$BASELINE_REAL_TIME" ]; then
+            echo "::notice::No real-block baseline available; reporting the PR side only."
+          fi
+
+          # Real-block comparison. Rendered only when BOTH sides have a number AND
+          # they are the same block: a baseline captured before the Makefile was
+          # repointed measures a different workload, and showing that as a delta
+          # would invent a regression out of a fixture swap.
+          echo "pr_real_time=$PR_REAL_TIME" >> "$GITHUB_OUTPUT"
+          echo "pr_real_peak=$PR_REAL_PEAK" >> "$GITHUB_OUTPUT"
+          echo "pr_real_epochs=$PR_REAL_EPOCHS" >> "$GITHUB_OUTPUT"
+          echo "pr_real_input=$PR_REAL_INPUT" >> "$GITHUB_OUTPUT"
+          echo "pr_real_runs=$PR_REAL_RUNS" >> "$GITHUB_OUTPUT"
+          echo "pr_real_time_spread=$PR_REAL_TIME_SPREAD" >> "$GITHUB_OUTPUT"
+          echo "pr_real_all_times=$PR_REAL_ALL_TIMES" >> "$GITHUB_OUTPUT"
+          echo "baseline_real_time=$BASELINE_REAL_TIME" >> "$GITHUB_OUTPUT"
+          echo "baseline_real_peak=$BASELINE_REAL_PEAK" >> "$GITHUB_OUTPUT"
+          echo "baseline_real_spread=$BASELINE_REAL_SPREAD" >> "$GITHUB_OUTPUT"
+          # No baseline_real_input output: the comment never names the baseline's block
+          # except on a mismatch, which real_mismatch below already carries.
+
+          if [ -n "$PR_REAL_TIME" ] && [ -n "$BASELINE_REAL_TIME" ]; then
+            if [ -n "$BASELINE_REAL_INPUT" ] && [ "$BASELINE_REAL_INPUT" != "$PR_REAL_INPUT" ]; then
+              echo "::warning::Baseline real block ($BASELINE_REAL_INPUT) differs from the PR's ($PR_REAL_INPUT); not comparing."
+              echo "real_mismatch=$BASELINE_REAL_INPUT" >> "$GITHUB_OUTPUT"
+            else
+              REAL_TIME_DIFF=$(awk "BEGIN { printf \"%.3f\", $PR_REAL_TIME - $BASELINE_REAL_TIME }")
+              REAL_TIME_PCT=$(awk "BEGIN { printf \"%.1f\", (($PR_REAL_TIME - $BASELINE_REAL_TIME) * 100) / $BASELINE_REAL_TIME }")
+              echo "real_time_diff=$REAL_TIME_DIFF" >> "$GITHUB_OUTPUT"
+              echo "real_time_pct=$REAL_TIME_PCT" >> "$GITHUB_OUTPUT"
+              if [ -n "$PR_REAL_PEAK" ] && [ -n "$BASELINE_REAL_PEAK" ]; then
+                REAL_PEAK_DIFF=$((PR_REAL_PEAK - BASELINE_REAL_PEAK))
+                REAL_PEAK_PCT=$(awk "BEGIN { printf \"%.1f\", ($REAL_PEAK_DIFF * 100) / $BASELINE_REAL_PEAK }")
+                echo "real_peak_diff=$REAL_PEAK_DIFF" >> "$GITHUB_OUTPUT"
+                echo "real_peak_pct=$REAL_PEAK_PCT" >> "$GITHUB_OUTPUT"
+              fi
+            fi
+          fi
+
+          # Growth comparison. The renderer keys the whole growth section off
+          # pr_growth_heaps, so these pass through even when only one side ran.
+          {
+            echo "pr_growth_heaps=$PR_GROWTH_HEAPS"
+            echo "pr_growth_slope=$PR_GROWTH_SLOPE"
+            echo "pr_growth_r2=$PR_GROWTH_R2"
+            echo "baseline_growth_heaps=$BASELINE_GROWTH_HEAPS"
+            echo "baseline_growth_slope=$BASELINE_GROWTH_SLOPE"
+            echo "baseline_growth_r2=$BASELINE_GROWTH_R2"
+          } >> "$GITHUB_OUTPUT"
 
           # Growth slope comparison
           if [ -n "$BASELINE_GROWTH_SLOPE" ] && [ -n "$PR_GROWTH_SLOPE" ]; then
@@ -623,64 +745,50 @@ jobs:
         if: github.event_name != 'push' && github.event_name != 'workflow_dispatch'
         uses: actions/github-script@v7
         env:
-          PR_PEAK: ${{ steps.pr.outputs.peak_mb }}
-          PR_TIME: ${{ steps.pr.outputs.time_s }}
-          BASELINE_PEAK: ${{ steps.compare.outputs.baseline_peak }}
-          BASELINE_TIME: ${{ steps.compare.outputs.baseline_time }}
           BASELINE_SRC: ${{ steps.compare.outputs.baseline_src }}
-          PEAK_PCT: ${{ steps.compare.outputs.peak_pct }}
-          TIME_PCT: ${{ steps.compare.outputs.time_pct }}
-          PEAK_DIFF: ${{ steps.compare.outputs.peak_diff }}
-          TIME_DIFF: ${{ steps.compare.outputs.time_diff }}
-          PR_RUNS: ${{ steps.compare.outputs.pr_runs }}
-          PR_TIME_SPREAD: ${{ steps.compare.outputs.pr_time_spread }}
-          PR_HEAP_SPREAD: ${{ steps.compare.outputs.pr_heap_spread }}
-          PR_ALL_TIMES: ${{ steps.compare.outputs.pr_all_times }}
-          PR_ALL_HEAPS: ${{ steps.compare.outputs.pr_all_heaps }}
-          BASE_TIME_SPREAD: ${{ steps.compare.outputs.baseline_time_spread }}
-          BASE_HEAP_SPREAD: ${{ steps.compare.outputs.baseline_heap_spread }}
-          BASE_ALL_TIMES: ${{ steps.compare.outputs.baseline_all_times }}
-          BASE_ALL_HEAPS: ${{ steps.compare.outputs.baseline_all_heaps }}
+          # The growth table's x-axis, straight from the env the sweep itself iterates,
+          # so the labels cannot drift from the points they label.
+          GROWTH_STEPS: ${{ env.GROWTH_STEPS }}
           PR_GROWTH_HEAPS: ${{ steps.compare.outputs.pr_growth_heaps }}
-          PR_GROWTH_TIMES: ${{ steps.compare.outputs.pr_growth_times }}
           PR_GROWTH_SLOPE: ${{ steps.compare.outputs.pr_growth_slope }}
           PR_GROWTH_R2: ${{ steps.compare.outputs.pr_growth_r2 }}
           BASE_GROWTH_HEAPS: ${{ steps.compare.outputs.baseline_growth_heaps }}
-          BASE_GROWTH_TIMES: ${{ steps.compare.outputs.baseline_growth_times }}
           BASE_GROWTH_SLOPE: ${{ steps.compare.outputs.baseline_growth_slope }}
           BASE_GROWTH_R2: ${{ steps.compare.outputs.baseline_growth_r2 }}
           GROWTH_SLOPE_DIFF: ${{ steps.compare.outputs.growth_slope_diff }}
           GROWTH_SLOPE_PCT: ${{ steps.compare.outputs.growth_slope_pct }}
+          PR_REAL_TIME: ${{ steps.compare.outputs.pr_real_time }}
+          PR_REAL_PEAK: ${{ steps.compare.outputs.pr_real_peak }}
+          PR_REAL_EPOCHS: ${{ steps.compare.outputs.pr_real_epochs }}
+          PR_REAL_INPUT: ${{ steps.compare.outputs.pr_real_input }}
+          BASE_REAL_TIME: ${{ steps.compare.outputs.baseline_real_time }}
+          BASE_REAL_PEAK: ${{ steps.compare.outputs.baseline_real_peak }}
+          BASE_REAL_SPREAD: ${{ steps.compare.outputs.baseline_real_spread }}
+          REAL_TIME_DIFF: ${{ steps.compare.outputs.real_time_diff }}
+          REAL_TIME_PCT: ${{ steps.compare.outputs.real_time_pct }}
+          REAL_PEAK_DIFF: ${{ steps.compare.outputs.real_peak_diff }}
+          REAL_PEAK_PCT: ${{ steps.compare.outputs.real_peak_pct }}
+          REAL_MISMATCH: ${{ steps.compare.outputs.real_mismatch }}
+          REAL_EPOCH_LOG2: ${{ env.REAL_BLOCK_EPOCH_LOG2 }}
+          REAL_RUNS: ${{ steps.compare.outputs.pr_real_runs }}
+          REAL_TIME_SPREAD: ${{ steps.compare.outputs.pr_real_time_spread }}
+          REAL_ALL_TIMES: ${{ steps.compare.outputs.pr_real_all_times }}
           COMMIT_SHA: ${{ steps.pr-ref.outputs.sha || github.sha }}
           TABLE_PARALLELISM: ${{ steps.config.outputs.table_parallelism }}
         with:
+          # Renderable offline: `node scripts/render_bench_comment.js` extracts this block
+          # and prints the markdown for a set of scenarios, so wording and formatting can
+          # be checked without occupying the bench server for ~15 min. Add a scenario
+          # there when you add a branch here.
           script: |
-            const peak = process.env.PR_PEAK;
-            const time = process.env.PR_TIME;
-            const basePeak = process.env.BASELINE_PEAK;
-            const baseTime = process.env.BASELINE_TIME;
             const baseSrc = process.env.BASELINE_SRC;
-            const peakPct = process.env.PEAK_PCT;
-            const timePct = process.env.TIME_PCT;
-            const peakDiff = process.env.PEAK_DIFF;
-            const timeDiff = process.env.TIME_DIFF;
-            const runs = process.env.PR_RUNS || '1';
-            const prTimeSpread = process.env.PR_TIME_SPREAD;
-            const prHeapSpread = process.env.PR_HEAP_SPREAD;
-            const prAllTimes = process.env.PR_ALL_TIMES;
-            const prAllHeaps = process.env.PR_ALL_HEAPS;
-            const baseTimeSpread = process.env.BASE_TIME_SPREAD;
-            const baseHeapSpread = process.env.BASE_HEAP_SPREAD;
-            const baseAllTimes = process.env.BASE_ALL_TIMES;
-            const baseAllHeaps = process.env.BASE_ALL_HEAPS;
 
             // Growth data
+            const growthSteps = process.env.GROWTH_STEPS;
             const prGrowthHeaps = process.env.PR_GROWTH_HEAPS;
-            const prGrowthTimes = process.env.PR_GROWTH_TIMES;
             const prGrowthSlope = process.env.PR_GROWTH_SLOPE;
             const prGrowthR2 = process.env.PR_GROWTH_R2;
             const baseGrowthHeaps = process.env.BASE_GROWTH_HEAPS;
-            const baseGrowthTimes = process.env.BASE_GROWTH_TIMES;
             const baseGrowthSlope = process.env.BASE_GROWTH_SLOPE;
             const baseGrowthR2 = process.env.BASE_GROWTH_R2;
             const growthSlopeDiff = process.env.GROWTH_SLOPE_DIFF;
@@ -688,81 +796,107 @@ jobs:
 
             const fmt = (v) => parseFloat(v) >= 0 ? `+${v}` : v;
             const icon = (pct) => parseFloat(pct) > 5 ? '🔴' : parseFloat(pct) < -5 ? '🟢' : '⚪';
-            const SPREAD_THRESHOLD = 5.0;
 
-            // --- Section 1: Primary benchmark ---
-            const nLabel = parseInt(runs) > 1 ? ` (median of ${runs})` : '';
-            const tableParallelism = process.env.TABLE_PARALLELISM;
-            const tpLabel = tableParallelism ? tableParallelism : 'auto (cores / 3)';
-            let body = `## Benchmark — ethrex 20 transfers${nLabel}\n\n`;
-            body += `<sub>Table parallelism: ${tpLabel}</sub>\n\n`;
-            body += `| Metric | main | PR | Δ |\n`;
-            body += `|--------|------|----|---|\n`;
-            body += `| **Peak heap** | ${basePeak} MB | ${peak} MB | ${fmt(peakDiff)} MB (${fmt(peakPct)}%) ${icon(peakPct)} |\n`;
-            body += `| **Prove time** | ${baseTime}s | ${time}s | ${fmt(timeDiff)}s (${fmt(timePct)}%) ${icon(timePct)} |\n\n`;
+            // Real-block data
+            const realTime = process.env.PR_REAL_TIME;
+            const realPeak = process.env.PR_REAL_PEAK;
+            const realEpochs = process.env.PR_REAL_EPOCHS;
+            const realInput = process.env.PR_REAL_INPUT;
+            const baseRealTime = process.env.BASE_REAL_TIME;
+            const baseRealPeak = process.env.BASE_REAL_PEAK;
+            const baseRealSpread = process.env.BASE_REAL_SPREAD;
+            const realTimeDiff = process.env.REAL_TIME_DIFF;
+            const realTimePct = process.env.REAL_TIME_PCT;
+            const realPeakDiff = process.env.REAL_PEAK_DIFF;
+            const realPeakPct = process.env.REAL_PEAK_PCT;
+            const realMismatch = process.env.REAL_MISMATCH;
+            const realEpochLog2 = process.env.REAL_EPOCH_LOG2;
+            const realRuns = process.env.REAL_RUNS || '1';
+            const realTimeSpread = process.env.REAL_TIME_SPREAD;
+            const realAllTimes = process.env.REAL_ALL_TIMES;
 
-            const regression = parseFloat(peakPct) > 5 || parseFloat(timePct) > 5;
-            const improvement = parseFloat(peakPct) < -5 || parseFloat(timePct) < -5;
-            if (regression) {
-              body += `> ⚠️ **Regression detected** — heap or time increased by more than 5%.\n`;
-            } else if (improvement) {
-              body += `> 🎉 **Improvement detected** — heap or time decreased by more than 5%.\n`;
-            } else {
-              body += `> ✅ No significant change.\n`;
-            }
+            // Stable marker: the "find and update the existing comment" lookup at the
+            // bottom keys off it, so section headings can change without orphaning
+            // every comment already posted. Legacy title matches stay as a fallback.
+            let body = `<!-- lambda-vm-benchmark -->\n`;
 
-            // Tier-1 -> Tier-2 escalation: a small time speedup the cheap 3-5 run CI
-            // can't confirm (it catches >=~1.5% on its own). Point at the drift-free
-            // ABBA tiebreaker, which the user runs on demand via `/bench-abba`.
-            const tp = parseFloat(timePct);
-            if (tp < 0 && tp > -1.5) {
-              body += `>\n`;
-              body += `> 🔬 **Looks like a small speedup (${fmt(timePct)}%) — below what ${runs} runs can confirm.** `;
-              body += `Comment \`/bench-abba\` to run the drift-free ABBA tiebreaker (paired-t CI + exact Wilcoxon). `;
-              body += `Note: it occupies the bench server for ~30–40 min.\n`;
-              body += `> Optional pair count: \`/bench-abba 32\` (20 resolves ~1%, 32 for ~0.6%).\n`;
-            }
+            // --- Section 1: Real block (headline; present whenever the fixture is fetchable) ---
+            if (realTime) {
+              body += `## Benchmark — real block${realInput ? ` (\`${realInput}\`)` : ''}${parseInt(realRuns) > 1 ? ` (median of ${realRuns})` : ''}\n\n`;
+              // Run count lives in the heading ("median of N"); the subheading carries
+              // only the prove configuration.
+              body += `<sub>continuations · epoch 2^${realEpochLog2}`;
+              if (realEpochs) body += ` · ${realEpochs} epochs`;
+              body += `</sub>\n\n`;
 
-            // Spread warnings
-            const prWarnings = [];
-            const baseWarnings = [];
+              if (realMismatch) {
+                body += `> ⚠️ Baseline measured a different block (\`${realMismatch}\`) — showing the PR side only.\n\n`;
+              }
 
-            if (prTimeSpread && parseFloat(prTimeSpread) > SPREAD_THRESHOLD) {
-              const vals = prAllTimes ? prAllTimes.split('/').map(t => `${t}s`).join(' / ') : '';
-              prWarnings.push(`Prove time spread: ${prTimeSpread}% (${vals})`);
-            }
-            if (prHeapSpread && parseFloat(prHeapSpread) > SPREAD_THRESHOLD) {
-              const vals = prAllHeaps ? prAllHeaps.split('/').map(h => `${h} MB`).join(' / ') : '';
-              prWarnings.push(`Heap spread: ${prHeapSpread}% (${vals})`);
-            }
-            if (baseTimeSpread && parseFloat(baseTimeSpread) > SPREAD_THRESHOLD) {
-              const vals = baseAllTimes ? baseAllTimes.split('/').map(t => `${t}s`).join(' / ') : '';
-              baseWarnings.push(`Baseline time spread: ${baseTimeSpread}% (${vals}) — comparison may be less reliable`);
-            }
-            if (baseHeapSpread && parseFloat(baseHeapSpread) > SPREAD_THRESHOLD) {
-              const vals = baseAllHeaps ? baseAllHeaps.split('/').map(h => `${h} MB`).join(' / ') : '';
-              baseWarnings.push(`Baseline heap spread: ${baseHeapSpread}% (${vals}) — comparison may be less reliable`);
-            }
+              const haveRealCmp = !!(baseRealTime && realTimePct && !realMismatch);
+              if (haveRealCmp) {
+                // A noisy baseline invalidates every Δ in the table, so the row icons
+                // go neutral too — a 🟢 beside a number the warning below calls
+                // unreliable reads as a verdict anyway.
+                // 3%, matching the verdict band below: a delta >=3% is reportable, so
+                // a spread that could manufacture one makes the baseline unusable.
+                const baseNoisy = !!(baseRealSpread && parseFloat(baseRealSpread) > 3.0);
+                const rowIcon = (pct) => baseNoisy ? '❔' : icon(pct);
+                body += `| Metric | main | PR | Δ |\n`;
+                body += `|--------|------|----|---|\n`;
+                if (realPeak && baseRealPeak && realPeakPct) {
+                  body += `| **Peak heap** | ${baseRealPeak} MB | ${realPeak} MB | ${fmt(realPeakDiff)} MB (${fmt(realPeakPct)}%) ${rowIcon(realPeakPct)} |\n`;
+                }
+                body += `| **Prove time** | ${baseRealTime}s | ${realTime}s | ${fmt(realTimeDiff)}s (${fmt(realTimePct)}%) ${rowIcon(realTimePct)} |\n\n`;
 
-            const allWarnings = [...prWarnings, ...baseWarnings];
-            if (allWarnings.length > 0) {
+                // Bands of 10%/3%, wider than a fast workload would need: 3 runs of a
+                // minutes-long prove resolve coarsely, so the middle is reported as
+                // unresolved rather than as "fine".
+                const rp = parseFloat(realTimePct);
+                // A noisy baseline invalidates the verdict, not just softens it: on
+                // 2026-08-03 a 65.8%-spread baseline verdicted healthy PRs at ±20-35%.
+                // Same 3% threshold as the PR-side spread note below.
+                if (baseNoisy) {
+                  body += `> ⚠️ **The cached baseline was noisy when it was recorded** (prove-time spread ${baseRealSpread}%), so the Δ column compares against an unreliable number and no verdict is drawn. Refresh it (Actions → "Benchmark (PR)" → Run workflow on main), then re-run \`/bench\` — or use \`/bench-abba\`, which measures both sides itself.\n`;
+                } else if (rp > 10) {
+                  body += `> ⚠️ **Regression on the real block** — prove time up ${Math.abs(rp).toFixed(1)}%.\n`;
+                } else if (rp < -10) {
+                  body += `> 🎉 **Improvement on the real block** — prove time down ${Math.abs(rp).toFixed(1)}%.\n`;
+                } else if (Math.abs(rp) >= 3) {
+                  // /bench-abba proves this same block at this same epoch, so the
+                  // escalation resolves the reading rather than changing the question.
+                  body += `> ❓ **${fmt(realTimePct)}% — beyond what ${realRuns} runs resolve.** Use \`/bench-abba\` for a paired test of the same block (default 12 pairs, ~72 min, resolves ~1%).\n`;
+                } else {
+                  body += `> ✅ No significant change.\n`;
+                }
+                if (realTimeSpread && parseFloat(realTimeSpread) > 3.0) {
+                  const vals = realAllTimes ? realAllTimes.split('/').map(t => `${t}s`).join(' / ') : '';
+                  body += `>\n> ⚠️ Real-block prove-time spread: ${realTimeSpread}% (${vals}) — the median above is less trustworthy than usual.\n`;
+                } else if (realTimeSpread && parseInt(realRuns) > 1) {
+                  body += `>\n> <sub>Prove-time spread ${realTimeSpread}%${realAllTimes ? ` (${realAllTimes.split('/').map(t => `${t}s`).join(' / ')})` : ''}</sub>\n`;
+                }
+              } else {
+                body += `| Metric | PR |\n`;
+                body += `|--------|----|\n`;
+                if (realPeak) body += `| **Peak heap** | ${realPeak} MB |\n`;
+                body += `| **Prove time** | ${realTime}s |\n\n`;
+                if (!realMismatch) {
+                  body += `> ℹ️ No real-block baseline yet — main publishes one on its next push.\n`;
+                }
+              }
               body += `\n`;
-              for (const w of allWarnings) {
-                body += `> ⚠️ ${w}\n`;
-              }
-              if (prWarnings.length > 0) {
-                body += `> Consider re-running \`/bench\`\n`;
-              }
-            } else if (parseInt(runs) > 1) {
-              body += `\n> ✅ Low variance (time: ${prTimeSpread || '0.0'}%, heap: ${prHeapSpread || '0.0'}%)\n`;
             }
 
-            // --- Section 2: Memory growth ---
+            // --- Section 2: Memory growth (only when the growth sweep ran) ---
+            // Synthetic on purpose: this plots heap against BLOCK SIZE, which needs a
+            // family of blocks that differ only in transaction count. A real block is
+            // one point and cannot produce a slope.
             if (prGrowthHeaps) {
               const prHeaps = prGrowthHeaps.split('/');
               const baseHeaps = baseGrowthHeaps ? baseGrowthHeaps.split('/') : null;
-              // Transfer counts (x-axis); keep in sync with GROWTH_STEPS in the env block.
-              const labels = ['4', '8', '12', '16', '20'];
+              // Transfer counts (x-axis) from GROWTH_STEPS — the same list the sweep
+              // iterates, so the labels cannot drift from the heaps beside them.
+              const labels = (growthSteps || '').trim().split(/\s+/).filter(Boolean);
               const n = prHeaps.length;
 
               body += `\n## Memory Growth\n\n`;
@@ -816,6 +950,14 @@ jobs:
             }
 
             // --- Footer ---
+            // The real block runs on every invocation, so its absence means the fixture
+            // could not be fetched — say that plainly rather than offering a command to
+            // re-request it, which no longer exists.
+            if (!realTime) {
+              body += `\n> 🧱 **No prover measurement — the real-block fixture was not available.** `;
+              body += `\`/bench\` proves only the real block, so nothing was measured this run. `;
+              body += `Check that \`ETHREX_REAL_BLOCK_FIXTURE_URL\` is set in the Makefile and that the artifact is reachable; the run log carries the warning.\n`;
+            }
             const sha = process.env.COMMIT_SHA.substring(0, 8);
             body += `\n<sub>Commit: ${sha} · Baseline: ${baseSrc} · Runner: self-hosted bench</sub>\n`;
 
@@ -825,9 +967,11 @@ jobs:
               issue_number: context.issue.number,
             });
 
-            // Find existing comment (check both old and new markers for transition)
+            // Find existing comment. The HTML marker is the durable key; the title
+            // matches below are the transition path for comments posted before it.
             const existing = comments.find(c =>
               c.user.type === 'Bot' && (
+                c.body.includes('<!-- lambda-vm-benchmark -->') ||
                 c.body.includes('Benchmark — ethrex') ||
                 c.body.includes('Benchmark — fib_iterative_8M') ||
                 c.body.includes('Benchmark — fib_iterative_2M') ||
