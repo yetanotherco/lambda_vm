@@ -58,10 +58,10 @@ The accelerator serves two ECALL variants, selected by the `is_affine` column:
 / $x$-only ($#`is_affine` = 0$): the guest supplies $x_G$ (32 bytes) and receives $x_R := (k times G)_x$ (32 bytes). The matching $y_G$ is never read from memory; the prover witnesses it and the chip merely proves it to be _a_ root of the curve equation.
 / affine ($#`is_affine` = 1$): the guest supplies the full point $x_G ‖ y_G$ (64 bytes) and receives the full point $x_R ‖ y_R$ (64 bytes).
 
-A single chip instance serves both variants: `is_affine` selects the ECALL-number the chip answers to, and gates the two memory accesses the affine variant adds (@ec:c:read_yG, @ec:c:write_yR) together with the address derivations they need.
+A single chip instance serves both variants: `is_affine` selects the ECALL-number the chip answers to, and gates the two memory accesses the affine variant adds (@ec:c:read_yG, @ec:c:write_yR) together with the address derivations (@ec:c:extrapolate_addr_yG, @ec:c:extrapolate_addr_yR) and address range checks (@ec:c:range_addr_yG, @ec:c:range_addr_yR) they need.
 Every other constraint is shared between the two.
-The one addition that is _not_ gated is the $y_R < p$ check (@ec:c:yR_addition_overflows): it applies on every active row, so the $x$-only path is now obliged to witness a canonical $y_R$ as well.
-Returning $y_R$ spares the guest a second scalar multiplication: without it, the only way to recover $y(k times G)$ is to query $x((k+1) times G)$ as well and apply the chord-addition law.
+Of the constraints this variant adds, the ones _not_ gated on `is_affine` are the three of the $y_R < p$ check (@ec:c:range_yR_sub_p, @ec:c:range_c5, @ec:c:yR_addition_overflows), which are gated on `μ` and so apply on every active row — obliging the $x$-only path to witness a canonical $y_R$ as well — and @ec:c:is_affine_isbit, which carries no condition at all.
+Returning $y_R$ spares the guest a second scalar multiplication: without it, recovering $y(k times G)$ means either a second query $x((k+1) times G)$ plus the chord-addition law, or a modular square root of $x_R^3 + a x_R + b$, which leaves the sign undetermined.
 
 #attention("Variable space.")[
     This accelerator is _variable-space_ in the value of $k$; different values of $k$ may result in different table sizes.
@@ -99,7 +99,14 @@ Here follows the present `id` mapping:
   "0",  `secp256k1`,
   "1",  `secp256r1`,
 )]
-Supporting other curves only requires assigning them a unique `id`.#footnote([Note that adding a curve does require `id`'s type to be updated as well, since its current type (`Bit`) is now saturated.])
+Supporting other curves only requires assigning them a unique `id`.#footnote([Note that adding a curve does require `id`'s type to be updated as well, since its current type (`Bit`) is now saturated. Since each curve now claims _two_ ECALL-numbers (see below), it also consumes the reserved range twice as fast: $#`id` = 4$ would collide with `FEXT_LOAD` at $-20$.])
+
+#attention("Only " + `secp256k1` + " is instantiated.")[
+  The constraints below are written generically in $a$, $b$, $p$ and $N$, but only $#`id` = 0$ has ever been instantiated, and that curve has $a = 0$.
+  The $y_G$ relation carries a single $p^2$ offset (@ec:c:c1_0, @ec:c:c1_i), which is enough to keep $q_1$ non-negative only while $a dot x_G$ is small.
+  For a curve with large $a$ --- `secp256r1` has $a = p - 3$ --- the offset is insufficient, and the more so on the affine variant, where @ec:c:read_yG pins $y_G$ and so removes the prover's freedom to pick whichever root gives a representable quotient.
+  Instantiating $#`id` = 1$ therefore requires widening the offset _and_ `q1`'s top limb; the ECALL-numbers $-13$ and $-14$ are reserved, not usable.
+]
 
 The chip is triggered by executing `ECALL`, with the ECALL-number set to $-11 - 2 dot #`id` - #`is_affine`$:
 #align(center)[#table(
@@ -119,8 +126,13 @@ The chip expects
 - `x11` to contain the address at which the least significant byte of $x_G$ is to be found,
 - `x12` to contain the address at which the least significant byte of $k$ is to be found,
 where it is assumed that $x_G$ and $k$ are provided as little-endian integers; $x_R$ is written to memory in little-endian form.
-On the affine variant, the two point buffers are 64 bytes wide rather than 32: $y_G$ is read from $#`x11` + 32$ and $y_R$ is written to $#`x10` + 32$, both again little-endian.
+On the affine variant, the two point buffers are 64 bytes wide rather than 32: $y_G$ is read from 32 bytes above the address held in `x11`, and $y_R$ is written 32 bytes above the address held in `x10`, both again little-endian.
 No additional registers are consumed.
+
+Widening the buffers widens the caller's obligations, and neither is enforced by this chip.
+The buffers must not overlap the scalar, since $x_G ‖ y_G$ is read at `timestamp` and $k$ at $#`timestamp` + 1$, and the memory argument cannot serve one address twice in one cycle.
+An operand's address must also stay clear of a $2^32$ boundary --- by 64 bytes for the two point buffers and 32 for $k$ --- because the implementation adds each per-access offset to the low half of the address alone and cannot carry into the high half.
+The constraints below abstract over that: they derive every address with a full 64-bit `ADD` (@ec:c:extrapolate_addr_yG, @ec:c:extrapolate_addr_yR), which carries correctly and so admits addresses the `ECALL` itself rejects.
 
 == Columns
 #let nr_variables = total_nr_variables(ecsm_chip)
@@ -228,14 +240,19 @@ The addition is constrained by requiring that `c4` are bits (@ec:c:range_c4); an
 The same treatment is given to $y_R$: witness $#`yR_sub_p` := #`yR` - p mod 2^256$ is added to `p`, and the addition is required to overflow (@ec:c:yR_addition_overflows), which holds if and only if $#`yR` < p$.
 
 Unlike the $y_G$-read, this check fires on _every_ active row rather than only on affine ones.
-It is cheap, `yR` is witnessed in both variants anyway, and gating it on `is_affine` would buy nothing.
+`yR` is witnessed in both variants anyway, so gating it would save no columns; it would drop the 16 `IS_HALF` lookups of @ec:c:range_yR_sub_p and the 7 `IS_BIT` terms of @ec:c:range_c5 on $x$-only rows, which we judge not worth a second selector.
 
 #aside("Why " + $y_R$ + " needs a canonicality check at all")[
-  The `ECDAS` relations that produce $y_R$ absorb a multiple of $p$ into their quotient columns, and the byte range checks only bound $y_R$ below $2^256$.
+  The relations that produce $y_R$ absorb a multiple of $p$ into their quotient columns, and $y_R$ is bounded only below $2^256$.
   A prover could therefore publish $y_R + p$ whenever $y_R < 2^256 - p$ and still satisfy every other constraint.
   For `secp256k1` that band has width $2^256 - p approx 2^32$, and it is populated: the curve has points with very small $y$.
-  Constraint @ec:c:yR_addition_overflows is what rules the non-canonical representative out.
+  Constraint @ec:c:yR_addition_overflows is what rules the non-canonical representative out, given that `c5` are bits (@ec:c:range_c5).
   $x_R$ was already covered by @ec:c:xR_addition_overflows; publishing $y_R$ is what makes _its_ representation observable too.
+
+  The $2^256$ bound the argument rests on is worth locating precisely, because it is not local to this group.
+  On a row that delegates, it comes from the `ECDAS` chip, which range-checks its own $y_R$ bytes before sending them.
+  But when $#`k` = 1$ the delegation collapses: @ec:c:start_double_add and @ec:c:receive_double_add carry identical tuples and cancel on the bus, so no `ECDAS` row exists at all, and the bound then comes from @ec:c:range_yG via $y_R = y_G$.
+  Either way $y_R$ is byte-bounded, but this chip nowhere range-checks `yR` itself.
 ]
 
 #render_constraint_table(ecsm_chip, config, groups: "range_yR")
@@ -248,7 +265,7 @@ Note that the `timestamp` on both memory accesses is offset to allow `addr_xR` t
 === Write `yR`
 On the affine variant, $y_R$ is written directly after $x_R$, at addresses derived from `addr_xR[0]` (@ec:c:extrapolate_addr_yR); as on the input side, the output buffer is one contiguous 64-byte region and no extra register is read.
 The write carries multiplicity `is_affine` (@ec:c:write_yR) and uses $#`timestamp` + 3$, the fourth and last of the cycle's sub-timestamps (@memory:aside:granularity): $x_G$ and $y_G$ occupy `timestamp`, $k$ occupies $#`timestamp` + 1$ and $x_R$ occupies $#`timestamp` + 2$.
-Placing it last also keeps $x_R ‖ y_R$ overwriting $x_G ‖ y_G$ legal.
+The two halves of the output cover disjoint addresses, so they could legally share a sub-timestamp; $#`timestamp` + 3$ is simply the slot left over, and taking it leaves this chip with no further headroom in the cycle.
 #render_constraint_table(ecsm_chip, config, groups: "write_yR")
 
 == Carry offsets
@@ -424,7 +441,7 @@ $
 = Notes / optimizations
 - To utilize the #ecsm / #ecdas chips for different curves, consider introducing a lookup table for the
   curve-constants $a$, $b$, $p$, $r$ and $N$, and look them up when a scalar multiplication selects them.
-  The selection procedure could be done through the `ECALL` number; the #ecsm chip would accept multiple numbers, setting an internal "curve-selector" field accordingly.
+  The selection procedure could be done through the `ECALL` number, in the same way `is_affine` already selects the variant: the #ecsm chip accepts several numbers and sets an internal selector column accordingly, pinned by the `ECALL` bus (@ec:c:receive_ecall).
 - Transitioning from `U256BL`s to `U256HL`s would roughly halve the number of columns in both the #ecsm and #ecdas chips.
   This would likely require increasing the sizes of the carries from 16 to 24 bits.
   Since the carries need to be range checked, one would have to investigate whether
