@@ -27,8 +27,8 @@ deletions in the squash `d83b4d9e` (at least four files across the two).
 scratch does not belong in the repo. They were right.
 
 These files are not scratch, and the distinction is testable rather than
-rhetorical: all three scripts run unattended, exit nonzero on failure, need one
-`pip install`, and the oracle's emitted row table is `include_str!`-ed by a Rust
+rhetorical: all three scripts run unattended, exit nonzero on real failure (the
+oracle reserves exit 2 for "ran but degraded"), need one `pip install`, and the oracle's emitted row table is `include_str!`-ed by a Rust
 test that drives the real trace-builder decomposition — so a regenerated oracle is
 a compile-time input, not a note. `make verify-dma` runs all three. So they live in
 `docs/`, which is tracked on purpose, under a name that says what they are.
@@ -56,7 +56,7 @@ claim, not evidence.** Everything here runs from a clean checkout.
 | `dma-chip/IMPLEMENTATION.md` | what ships, what was verified, what is still open |
 | `dma-chip/z3_dma_verify.py` | the soundness gate |
 | `TRANSCRIPTION-AUDIT.md` | does the gate assert what the Rust says? |
-| `audit_gate_transcription.py` | the executable half of that audit (100 claims) |
+| `audit_gate_transcription.py` | the executable half of that audit (104 claims) |
 
 ## Results, 2026-08-11
 
@@ -76,9 +76,11 @@ gate:    layer 1 (row semantics)            PASS  6/6 UNSAT
          completeness sweep                 PASS  5153 honest + 257 padding rows
          OVERALL: PASS                            (~96 s on z3 5.0.0)
 
-audit:   100 claims, 0 findings; mutation-tested against 6 source mutants, 6 caught
+audit:   104 claims, 0 findings; mutation-tested against 8 source mutants, 8 caught
 
-rust:    cargo test -p lambda-vm-prover --lib dma   18 passed
+rust:    cargo test -p lambda-vm-prover --lib tests::dma_tests   10 passed
+         (the wider `--lib dma` filter is 18 tests, but 7 need guest ELFs —
+          run `make compile-programs-rust` first, or they fail on a missing .elf)
 ```
 
 `make verify-dma` runs all three. Full gate transcript in `dma-chip/DESIGN.md` §9.
@@ -91,19 +93,29 @@ equality: every satisfying assignment of one DMA row does what the oracle says
 wrapping `2^64`, `count_decr = count − width` wrapping only on the terminal row);
 among groups containing exactly one head row, the only bus-balanced multi-row
 structure at depth ≤ 5 is a single chain whose data rows tile `[src, src+n)`
-exactly once with the greedy widths; each of the **ten** range checks and lookups
-involved is individually necessary, each with a named forgery; and the AIR accepts
+exactly once with the greedy widths; ten of the eleven modelled premises are
+individually necessary, each with a named forgery (the eleventh, `memw_addr32`,
+is inert for every claim on the board and is documented as such rather than given
+a control that cannot fail); and the AIR accepts
 every honest trace for every length `0..256`.
 
 The gate is honest about four things it cannot see — bus wiring, the memory
-consistency argument (hence overlap ordering), LogUp soundness, and trace length.
-The first is what `audit_gate_transcription.py` exists for.
+consistency argument (hence overlap ordering), LogUp soundness, and the
+multi-call case (Layer 2 proves the tiling among groups with exactly one head
+row). The first is what `audit_gate_transcription.py` exists for. "Trace length"
+was on this list only while R1 was; with R1 retracted it is gone.
 
 ## No open soundness gap — and a retracted finding worth reading about
 
-The board is clean: no residual, no known hole in the chip. An independent
-security scan, deliberately blinded to these artifacts, reached the same
-conclusion and independently re-derived all ten items of `DESIGN.md` §7.
+The board is clean: no residual, no known hole in the chip.
+
+Two cross-checks support that, and it is worth being precise about their status.
+The **reproducible** one is in this directory: `make verify-dma`. The other was a
+blinded independent security scan that reached the same conclusion and re-derived
+the items of `DESIGN.md` §7 — but **it left no artifact in this tree**, so treat it
+as an unreproduced cross-check rather than as evidence you can inspect. The spec
+chapter for this chip (`spec/dma.typ`, PR #931), written separately, does
+corroborate the retraction below and *is* inspectable.
 
 An earlier version of this campaign reported one — "RESIDUAL R1", that `count`'s
 limb split was unconstrained on non-head rows — and published it as the headline
@@ -155,12 +167,14 @@ modular equalities carry explicit quotients, and `x·(1−x) = 0` becomes
 "is a range check missing?" question at all, since it bounds the unconstrained
 column for free — but the naive `%p` encoding is nonlinear and the first version
 of this gate timed out on its own main check. The rewrite is what made the
-5410-row completeness sweep affordable.
+5410-row completeness sweep (5153 honest + 257 padding) affordable.
 
-**Mutation-test the audit, not just the model.** Five source mutants; one was
-initially missed, because the check asserted an error variant was *mentioned*
-rather than that the guard existed — a `if false` guard passed. That is precisely
-the defect class the audit exists to catch, found in the audit itself.
+**Mutation-test the audit, not just the model.** Eight source mutants; **four were
+initially missed** — one because a check asserted an error variant was *mentioned*
+rather than that the guard existed (an `if false` guard passed), one because a
+regex searched for ASCII `2x` where the source writes `2×`, and two because the
+tuple *order* was never pinned. That is precisely the defect class the audit
+exists to catch, found four times in the audit itself.
 
 ## Where to send the next reviewer
 

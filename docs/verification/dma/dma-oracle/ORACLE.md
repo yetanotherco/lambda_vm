@@ -31,8 +31,16 @@ The harness reports what actually ran, in three ways: a missing dependency SKIPs
 only its own anchor and never cascades; the banner names the anchors it is *not*
 anchored on; and **the status token itself carries any reduction**
 (`PARTIALLY VALIDATED (1 anchor(s) skipped)`, `VALIDATED (--quick, reduced
-sweeps)`) with a distinct **exit code 2**, because a CI job or a human greps for
-the word "VALIDATED" and a degraded run must not print it bare.
+sweeps)`), because a CI job or a human greps for the word "VALIDATED" and a
+degraded run must not print it bare. **Exit code 2** signals specifically that an
+anchor was *skipped*; a `--quick` run that passed everything it ran exits 0.
+
+A mutant whose target anchor skipped is reported `NOT RUN`, never `caught`.
+Scoring a skip as a catch credits a mutant to a check that never executed — the
+cascade this section promises cannot happen, and which did happen until it was
+fixed: the two `memcpy_ref` mutants target the two anchors that can be
+unavailable, so an unloadable libc printed `PASS all 8 mutants caught` while
+running six.
 
 The cascade guard is not just the `None` case: `find_library` returning a path does
 not mean it loads — it can hand back a GNU ld linker script, an arch-mismatched
@@ -163,12 +171,12 @@ compile-time input to `cargo test`, not a note; an earlier version hand-transcri
 
 ## 5. Mutation sweep (anchor 5)
 
-Every mutant must be caught by the anchor it targets. All six are:
+Every mutant must be caught by the anchor it targets. All eight are:
 
 | mutant | caught by |
 |---|---|
-| `memcpy_ref` without snapshot | **anchor 1** (libc), at `n=7 delta=1` |
-| `memcpy_ref` without snapshot | **anchor 2** (CPython), at `n=8 delta=1` |
+| `memcpy_ref` without snapshot | **anchor 1** (libc), at `n=2 delta=1` |
+| `memcpy_ref` without snapshot | **anchor 2** (CPython), at `n=2 delta=1` |
 | `row_widths` = all ones | anchor 3(d): disagrees with the closed form |
 | `row_widths` = always wide | anchor 3: widths do not sum to `n` |
 | `row_widths` tail off by one (`>` for `>=`) | anchor 3(d) |

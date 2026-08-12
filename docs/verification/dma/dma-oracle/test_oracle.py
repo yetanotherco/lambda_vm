@@ -333,17 +333,31 @@ def anchor_mutations(quick: bool):
         ("memw read/write interleaved", lambda: anchor_row_level(quick, ops=_mutant_interleaved)),
         ("chunk_ecalls at MAX+1", lambda: anchor_chunking(quick, chunk=_mutant_chunk_257)),
     ]
-    survivors = []
+    survivors, not_run = [], []
     for name, run in mutants:
         try:
             ok, _ = run()
         except (AssertionError, ref.DmaRejected):
             ok = False              # replay_memw or the executor bound caught it
-        if ok:
+        # THREE states, not two. An anchor that SKIPped returns `ok is None`, and
+        # `if ok:` would score that as "caught" -- a mutant credited to a check
+        # that never ran. That is exactly the cascade this module's docstring
+        # promises cannot happen, and it bit the two `memcpy_ref` mutants, whose
+        # anchors (libc, CPython) are the ones that can be unavailable.
+        if ok is None:
+            not_run.append(name)
+            verdict = "NOT RUN (anchor skipped)"
+        elif ok:
             survivors.append(name)
-        print(f"      mutant {name:32s} -> {'SURVIVED (bad)' if ok else 'caught'}")
+            verdict = "SURVIVED (bad)"
+        else:
+            verdict = "caught"
+        print(f"      mutant {name:32s} -> {verdict}")
     if survivors:
         return False, f"{len(survivors)} mutant(s) survived: {', '.join(survivors)}"
+    if not_run:
+        return None, (f"{len(mutants) - len(not_run)}/{len(mutants)} caught; "
+                      f"{len(not_run)} not run: {', '.join(not_run)}")
     return True, f"all {len(mutants)} mutants caught"
 
 

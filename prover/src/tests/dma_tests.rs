@@ -165,6 +165,7 @@ fn parse_canonical_vectors() -> Vec<OracleVector> {
     }
 
     let mut vectors: Vec<OracleVector> = Vec::new();
+    let mut declared_rows: Vec<u64> = Vec::new();
     for line in CANONICAL_ROWS.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -181,12 +182,13 @@ fn parse_canonical_vectors() -> Vec<OracleVector> {
                     count: num(f[4], line),
                     rows: Vec::with_capacity(num(f[5], line) as usize),
                 });
+                declared_rows.push(num(f[5], line));
             }
             "row" => {
                 assert_eq!(f.len(), 6, "canonical rows: bad row line {line:?}");
                 let vector = vectors
                     .last_mut()
-                    .expect("canonical rows: a row line preceded every vector line");
+                    .expect("canonical rows: a row line appeared before any vector line");
                 vector.rows.push((
                     num(f[1], line),
                     num(f[2], line),
@@ -198,13 +200,17 @@ fn parse_canonical_vectors() -> Vec<OracleVector> {
             other => panic!("canonical rows: unknown record type {other:?}"),
         }
     }
-    // The declared data-row count must match the rows that followed.
-    for vector in &vectors {
+    // The declared data-row count must match the rows that followed. An earlier
+    // version compared `rows.len()` against a sum of ones — always true — so the
+    // emitter's declared count was dead data and a fixture claiming 99 rows for a
+    // 2-row vector stayed green.
+    for (vector, declared) in vectors.iter().zip(&declared_rows) {
         assert_eq!(
             vector.rows.len() as u64,
-            vector.rows.iter().map(|_| 1u64).sum::<u64>(),
-            "{}: row bookkeeping",
-            vector.name
+            *declared,
+            "{}: fixture declares {declared} data rows but {} followed",
+            vector.name,
+            vector.rows.len()
         );
     }
     vectors
@@ -228,6 +234,25 @@ fn dma_trace_matches_oracle_row_decomposition() {
 
     let vectors = parse_canonical_vectors();
     assert_eq!(vectors.len(), 10, "expected all ten canonical vectors");
+    // Pin the CONTENT too, not just the count: a fixture that degenerated every
+    // vector to `count = 0` would still have ten entries, and every assertion in
+    // the loop below would then be a no-op on zero data rows.
+    let mut lengths: Vec<u64> = vectors.iter().map(|v| v.count).collect();
+    lengths.sort_unstable();
+    assert_eq!(
+        lengths,
+        vec![0, 1, 7, 8, 9, 16, 24, 24, 27, 256],
+        "canonical vector lengths changed — regenerate the fixture and re-read this test"
+    );
+    // Derived from the lengths by the greedy rule, not hardcoded — a hand-typed
+    // total is the same "declared, not derived" defect this campaign exists to
+    // catch, and my first attempt at it was wrong (55 for an actual 57).
+    let expected_rows: usize = lengths.iter().map(|n| (n / 8 + n % 8) as usize).sum();
+    assert_eq!(
+        vectors.iter().map(|v| v.rows.len()).sum::<usize>(),
+        expected_rows,
+        "total data rows across the fixture"
+    );
 
     for vector in &vectors {
         // Seed the source region the same way the oracle's emitter does.
@@ -295,6 +320,24 @@ fn dma_trace_matches_oracle_row_decomposition() {
             vector.name
         );
         assert_eq!(rows.iter().filter(|r| r.end).count(), 1, "{}", vector.name);
+        // Position, not just count: `first` carries the Ecall receive, the three
+        // register reads and the `count < MAX + 1` bound, so moving it off the head
+        // row matters. Counting alone let that mutation through.
+        assert!(
+            rows[0].first,
+            "{}: the head row must be `first`",
+            vector.name
+        );
+        assert!(
+            !rows[1..].iter().any(|r| r.first),
+            "{}: no row after the head may claim `first`",
+            vector.name
+        );
+        assert!(
+            rows.iter().all(|r| r.timestamp == 0x30),
+            "{}: every row of one ecall shares its timestamp",
+            vector.name
+        );
         let terminal = rows.last().expect("terminal row");
         assert!(terminal.end && terminal.count == 0, "{}", vector.name);
         assert_eq!(
@@ -304,17 +347,25 @@ fn dma_trace_matches_oracle_row_decomposition() {
             vector.name
         );
 
-        // The MEMW payload: three register reads at T, then every source read
-        // strictly before every destination write. This two-phase split is what
-        // gives an overlapping copy its snapshot semantics, and no other test in
-        // this module looks at it.
+        // The MEMW payload. Asserting COUNTS here is not enough: the two phases
+        // emit equal numbers of operations, so counting alone is satisfied by
+        // swapping the two timestamps, by flipping `is_read`, or by a wrong
+        // address or value. Each of those mutations previously survived. Assert
+        // the fields, and assert the ORDERING as an ordering.
         let registers: Vec<_> = memw_ops.iter().filter(|o| o.is_register).collect();
         assert_eq!(registers.len(), 3, "{}: three register reads", vector.name);
         assert!(
-            registers.iter().all(|o| o.timestamp == 0x30),
-            "{}: register reads are at T",
+            registers.iter().all(|o| o.timestamp == 0x30 && o.is_read),
+            "{}: register operands are read at T",
             vector.name
         );
+        assert_eq!(
+            registers.iter().map(|o| o.base_address).collect::<Vec<_>>(),
+            vec![20, 22, 24],
+            "{}: registers are x10/x11/x12 at base 2*reg",
+            vector.name
+        );
+
         let data: Vec<_> = memw_ops.iter().filter(|o| !o.is_register).collect();
         assert_eq!(
             data.len(),
@@ -322,14 +373,67 @@ fn dma_trace_matches_oracle_row_decomposition() {
             "{}: one read and one write per data row",
             vector.name
         );
-        let reads = data.iter().filter(|o| o.timestamp == 0x31).count();
-        let writes = data.iter().filter(|o| o.timestamp == 0x32).count();
+        let reads: Vec<_> = data.iter().filter(|o| o.is_read).collect();
+        let writes: Vec<_> = data.iter().filter(|o| !o.is_read).collect();
         assert_eq!(
-            (reads, writes),
+            (reads.len(), writes.len()),
             (vector.rows.len(), vector.rows.len()),
-            "{}: all reads at T+1 and all writes at T+2",
+            "{}: is_read splits the data ops evenly",
             vector.name
         );
+
+        // Every read strictly before every write — the property that gives an
+        // overlapping copy its snapshot semantics. Stated as max(read) < min(write)
+        // so swapping the two timestamps cannot satisfy it.
+        if !vector.rows.is_empty() {
+            let last_read = reads.iter().map(|o| o.timestamp).max().expect("reads");
+            let first_write = writes.iter().map(|o| o.timestamp).min().expect("writes");
+            assert!(
+                last_read < first_write,
+                "{}: every source read must precede every destination write \
+                 (last read {last_read}, first write {first_write})",
+                vector.name
+            );
+            assert_eq!(
+                (last_read, first_write),
+                (0x31, 0x32),
+                "{}: reads at T+1, writes at T+2",
+                vector.name
+            );
+        }
+
+        // Addresses, widths and values, per phase and in offset order.
+        let mut offset = 0u64;
+        for (i, &(src, dst, _, _, width)) in vector.rows.iter().enumerate() {
+            let read = reads[i];
+            let write = writes[i];
+            assert_eq!(
+                (read.base_address, u64::from(read.width)),
+                (src, width),
+                "{}: read {i} addresses src with the row's width",
+                vector.name
+            );
+            assert_eq!(
+                (write.base_address, u64::from(write.width)),
+                (dst, width),
+                "{}: write {i} addresses dst with the row's width",
+                vector.name
+            );
+            for lane in 0..width as usize {
+                let expected = u32::from(source[(offset + lane as u64) as usize]);
+                assert_eq!(
+                    read.value[lane], expected,
+                    "{}: read {i} lane {lane} is not the source byte",
+                    vector.name
+                );
+                assert_eq!(
+                    write.value[lane], expected,
+                    "{}: write {i} lane {lane} does not carry the copied byte",
+                    vector.name
+                );
+            }
+            offset += width;
+        }
     }
 }
 
@@ -338,9 +442,12 @@ fn dma_trace_matches_oracle_row_decomposition() {
 ///
 /// 256 is 8-aligned, so `count % 8 == 0` and every data row is a wide one — the
 /// row-count bound the `Alu[count, 257, LT]` lookup exists to enforce. Asserting
-/// `ops.len() == 33` against a locally computed `count / 8 + 1` would hold even
-/// if `DMA_MEMCPY_MAX_BYTES` changed, so the expectation is derived from the
-/// executor's own row formula instead.
+/// The expectation below is still computed locally from `DMA_MEMCPY_MAX_BYTES`
+/// rather than read out of production code: `trace_builder`'s own
+/// `count / 8 + count % 8` feeds only a `Vec::with_capacity` hint and does not
+/// drive the loop, so asserting against it would prove nothing. What makes this
+/// test non-vacuous is that `rows` comes from the real decomposition, so the
+/// greedy width rule and the terminal row are both exercised.
 #[test]
 fn dma_maximum_chunk_has_no_tail_row() {
     use crate::tables::dma::DMA_MEMCPY_MAX_BYTES as MAX;

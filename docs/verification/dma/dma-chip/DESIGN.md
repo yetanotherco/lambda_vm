@@ -52,7 +52,7 @@ width-to-`w2/w4/w8` decode.
 The cost, stated precisely (an earlier draft had this wrong in both directions):
 a copy of `n` bytes takes `n/8` wide rows, `n % 8` tail rows and one terminal row.
 So tail rows are `0%` for the 8-aligned lengths that dominate, `7/39 = 17.9%` at
-the maximal `n = 255`, and **`7/8 = 87.5%` at the genuine worst case `n = 7`**,
+`n = 255`, the longest length that *has* a tail (the maximal `n` is 256, which has none), and **`7/8 = 87.5%` at the genuine worst case `n = 7`**,
 where every data row is a tail row. Against 4/2/1 halving the delta is at most
 4 rows (halving needs `popcount(n % 8) ≤ 3`), not the 7 an earlier draft claimed
 by comparing against a zero-tail design instead of against the alternative it was
@@ -82,9 +82,12 @@ one available. Their halves are what makes `emit_add_pair_no_overflow`'s
 proved necessary by the width audit (§8.1).
 
 `value[0..8]` carry no range check of their own, and the reason is **not** that
-the receiving table checks them — `spec/memw.typ` says the opposite in as many
-words: *"Our assumptions do not explicitly cover any range checks for the `value`
-column."* (An earlier draft cited `keccak.rs` here as authority for relying on
+the receiving table checks them. `spec/memw.typ:42-45` is explicit, and the whole
+sentence matters: *"Our assumptions do not explicitly cover any range checks for
+the `is_register` and `value` columns, as these are not necessary for the
+correctness of this chip in isolation. Still, these properties are necessary for
+the consistency of the system as a whole."* So the spec does not merely decline to
+check them — it says somebody must. That obligation is recorded as **A5** below. (An earlier draft cited `keccak.rs` here as authority for relying on
 the receiver. That was backwards: `keccak.rs:355-378` emits four `AreBytes`
 senders for its address bytes **precisely because** the receiver does not pin
 them, and its comment spells out the forgery — keeping a linear combination's
@@ -286,10 +289,11 @@ is why two caller obligations got mislabelled as receiver checks in §3.
 
 | id | assumption | discharged by | status |
 |---|---|---|---|
-| **A1** | the head row's `src`/`dst` limbs are 32-bit words | `spec/src/memw.toml`: `[[assumptions]] IS_WORD[base_address[i]]`. `memw.rs:257-262` justifies its own bound via *the CPU table*; DMA is a non-CPU sender, so that argument does not extend here | **not discharged locally.** Non-DMA-specific — every table sending an address depends on it |
+| **A1** | `src`/`dst` limbs are 32-bit words wherever a `Memw` data op fires (`mu − end == 1`) — what the gate asserts. Load-bearing only on the head row: elsewhere the `DmaNext` link derives it, which is why the gate's `memw_addr32` toggle is inert and carries no control | `spec/src/memw.toml`: `[[assumptions]] IS_WORD[base_address[i]]`. `memw.rs:257-262` justifies its own bound via *the CPU table*; DMA is a non-CPU sender, so that argument does not extend here | **not discharged locally.** Non-DMA-specific — every table sending an address depends on it |
 | **A2** | the head row's `count` limbs are 32-bit words | `spec/src/memw_register.toml`: `[[assumptions]] IS_WORD[val[i]]`. MEMW_R's only range-check interaction is on the timestamp delta | **not discharged locally.** The gate's `drop_reg32` control shows what it buys: without it the `count < 257` lookup caps only a residue class |
 | **A3** | `IS_WORD` on the timestamp, so `ts₀ + 2` does not carry into the high limb | `spec/src/memw.toml` timestamp assumption. In practice the CPU stride is 4 and `T = 4i+4`, so the `+1`/`+2` cannot carry — but nothing in the DMA AIR constrains it | not discharged locally; benign at the current stride |
 | **A4** | two DMA ecalls never share a timestamp | CPU timestamps strictly increase per instruction | holds by construction; it is what the `DmaNext` timestamp binding relies on |
+| **A5** | domain-0 memory cells hold bytes | nothing in this chip, and nothing in `memw.rs` — `spec/memw.typ:42-45` assigns it to "the consistency of the system as a whole" | **not discharged, and not DMA's to discharge.** This chip *propagates* byte-ness (§3: each lane is pinned to whatever memory held) rather than establishing it. Recorded because an obligation owned by everyone is owned by nobody, and this repo has a history of byte-decomposition range checks going missing |
 
 A1/A2 are the **head row only**. Every other row's limbs are derived (§7 above).
 Note the irony worth recording: the phantom R1 reported a gap on non-head rows,
@@ -297,8 +301,11 @@ where the bus in fact pins the limbs, while the real obligation sits on the head
 row, which has no `DmaNext` receive at all.
 
 `spec/` has a broader problem here, flagged for the spec rather than this chip:
-`IS_WORD` appears across ~10 chapters **exclusively** inside `[[assumptions]]`,
-never as an interaction or template, and `spec/bitwise.typ` offers no 2³² table.
+`IS_WORD` appears across **12** chapters (`add`, `branch`, `cpu32`, `eq`, `halt`,
+`load`, `lt`, `memw`, `memw_aligned`, `memw_register`, `sha256msgsched`, `store`)
+**exclusively** inside `[[assumptions]]`, never as an interaction or template, and
+`spec/bitwise.typ` offers no 2³² table — it exposes MSB8/MSB16/ZERO/ARE_BYTES/
+IS_BYTE/IS_HALF/IS_B20/HWSL, none of which spans a word.
 So the spec asserts a range obligation for nearly every address, register value
 and timestamp in the VM without naming a discharger. That vacuum is what an
 earlier draft of this document filled by inventing the labels "MEMW-ADDR32" and
@@ -328,7 +335,7 @@ stops a padding row masquerading as a copy's head or terminal row.
 
 `z3_dma_verify.py`. Two layers (field-exact single/paired rows; integer and
 field-exact multi-row chains with `DmaNext` as a free bijection rather than an
-assumed chain), eight negative controls, a field-level width audit, and an
+assumed chain), ten negative controls, a field-level width audit, and an
 oracle-pinned completeness sweep over every length `0..256`.
 
 What it cannot see, stated in its own docstring: bus **wiring** (covered by
@@ -358,15 +365,16 @@ the forgery at `count = 3` and was wrong — it is not reachable there.
 
 ## 9. Gate results
 
-Verbatim from `python3 z3_dma_verify.py` (full board, no `--quick`), 2026-08-11,
-z3 5.0.0 — **pasted, not retyped**. An earlier draft hand-condensed this block
-while the document argued that a gate nobody can rerun is a claim rather than
-evidence; a retyped transcript is the wrong shape for that argument.
+Verbatim from `python3 z3_dma_verify.py` (full board, no `--quick`), 2026-08-12,
+z3 5.0.0 — **pasted, not retyped**, including the `solver:` line, which an earlier
+version silently dropped while the surrounding sentence claimed the block was
+verbatim. If you regenerate this, paste the whole thing.
 
 ```
 ============================================================================
 DMA memcpy chip -- z3 gate
 ============================================================================
+  solver: z3 5.0.0
   legend: unsat = proved | sat = counterexample found | unknown = TIMED OUT (failure)
 
 === LAYER 1: field-exact rows ===
@@ -415,7 +423,7 @@ DMA memcpy chip -- z3 gate
   truncation at count=7, LT pin DROPPED    -> sat    (want sat)
 
 === POSITIVE CONTROLS -- oracle-pinned completeness sweep ===
-  PASS  5410 honest rows over 257 lengths, all accepted
+  PASS  5153 honest rows + 257 padding rows over 257 lengths, all accepted
 
 ============================================================================
 VERDICT

@@ -60,9 +60,20 @@ campaign hid a working forgery):
   Memw register read   the three argument registers' limbs are 32-bit and equal
                        the register file's value                  (REG-32)
 
-The last two are PREMISES THIS GATE DOES NOT PROVE. They are toggles, every
-negative control shows what breaks without them, and ../TRANSCRIPTION-AUDIT.md
-records where each is discharged.
+The last two are PREMISES THIS GATE DOES NOT PROVE. ../TRANSCRIPTION-AUDIT.md
+records where each is discharged. Their control coverage is asymmetric, and
+saying so is the point:
+
+  REG-32 (A2) IS load-bearing -- `drop_reg32` flips `check_row_budget` to sat,
+      because a bound lookup on a residue class caps only the residue.
+  MEMW-ADDR32 (A1) is INERT for every claim this board makes: dropping it leaves
+      MAIN 0/1/2/2b/2c/3, both chain layers and the sweep unchanged. It is
+      modelled because the AIR really does carry those sends, but nothing here
+      leans on it -- the limb-wise `DmaNext` link derives well-formedness from
+      the sender's IsHalfword checks instead. It therefore has NO negative
+      control, deliberately: a control that cannot fail is worse than none, and
+      an earlier version of this docstring claimed "every negative control shows
+      what breaks without them", which was false for exactly this premise.
 
 WHAT THE GATE CANNOT SEE (same disclaimer shape as the BLAKE3 gate):
   * bus WIRING -- that the read tuple and the write tuple really reference the
@@ -630,14 +641,26 @@ def completeness_sweep(prem=None, quick=False):
         rows = ref.row_decomposition(0x30, 0x1000, 0x2000, n, memory)
         for index, row in enumerate(rows):
             r = FieldRow(f"cs{n}_{index}", prem)
-            if solve(r.C + _pins(r, ref.row_columns(row))) != sat:
+            verdict = solve(r.C + _pins(r, ref.row_columns(row)))
+            # `unknown` is a TIMEOUT, not a rejection. Scoring `!= sat` would print
+            # "the AIR REJECTS an honest row" for a slow solver -- a false
+            # accusation against the chip, and exactly the confusion the board's
+            # legend exists to prevent. Distinguish the two.
+            if verdict == unknown:
+                return None, (f"n={n} row {index}: solver TIMED OUT "
+                              f"(not a rejection -- raise the budget or use a newer z3)")
+            if verdict != sat:
                 return False, f"n={n} row {index}: the AIR REJECTS an honest row"
             checked += 1
         r = FieldRow(f"pad{n}", prem)
-        if solve(r.C + _pins(r, ref.padding_columns())) != sat:
+        verdict = solve(r.C + _pins(r, ref.padding_columns()))
+        if verdict == unknown:
+            return None, f"n={n}: solver TIMED OUT on the padding row (not a rejection)"
+        if verdict != sat:
             return False, f"n={n}: the AIR REJECTS the padding row"
         checked += 1
-    return True, f"{checked} honest rows over {len(lengths)} lengths, all accepted"
+    return True, (f"{checked - len(lengths)} honest rows + {len(lengths)} padding rows "
+                  f"over {len(lengths)} lengths, all accepted")
 
 
 def _pins(r: FieldRow, cols: dict):
@@ -848,6 +871,7 @@ def audit_end_detection_bound(drop_bound: bool):
     `end` row emits no memory operations. 'unsat' means the identity holds.
     """
     s = Solver()
+    s.set("timeout", DEFAULT_TIMEOUT_MS)   # never leave a query unbounded (see above)
     cd = [Int(f"ae_cd{i}") for i in range(4)]
     for h in cd:
         s.add(h >= 0, h < P)
@@ -874,6 +898,7 @@ def audit_no_overflow_bound(drop_bound: bool):
     `checked_add` would have rejected. 'unsat' means the bound pins it.
     """
     s = Solver()
+    s.set("timeout", DEFAULT_TIMEOUT_MS)   # never leave a query unbounded (see above)
     src0, src1, c0 = Int("an_src0"), Int("an_src1"), Int("an_c0")
     si = [Int(f"an_si{i}") for i in range(4)]
     step = WIDE_WIDTH
@@ -1017,7 +1042,8 @@ def main():
 
     print("\n=== POSITIVE CONTROLS -- oracle-pinned completeness sweep ===", flush=True)
     sweep_ok, sweep_detail = completeness_sweep(quick=quick)
-    print(f"  {'PASS' if sweep_ok else 'FAIL'}  {sweep_detail}", flush=True)
+    label = {True: "PASS", False: "FAIL", None: "TIMEOUT"}[sweep_ok]
+    print(f"  {label}  {sweep_detail}", flush=True)
 
     print("\n" + "=" * 76, flush=True)
     print("VERDICT", flush=True)
@@ -1034,7 +1060,7 @@ def main():
     print("  which `ChainRow` does not model -- see `check_chain`'s docstring and", flush=True)
     print("  the textual guard in ../audit_gate_transcription.py.", flush=True)
     ok = (layer1_ok and layer2_ok and layer2_controls_ok and controls_ok
-          and audit_ok and sweep_ok)
+          and audit_ok and sweep_ok is True)
     if quick:
         print("\n  NOTE: --quick shortened the completeness sweep and the chain depths.", flush=True)
     print(f"\n  OVERALL: {'PASS' if ok else 'FAIL -- investigate above'}", flush=True)

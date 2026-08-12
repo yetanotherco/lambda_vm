@@ -66,8 +66,8 @@ this file exists to catch. The script now prints them.
 
 ### Sensitivity — the audit was mutation-tested
 
-An audit that cannot fail is not an audit. Five mutants were applied to copies of
-the source and the script re-run; all five are caught:
+An audit that cannot fail is not an audit. Six semantic mutants and one
+must-not-fire control were applied to copies of the source and the script re-run:
 
 | mutant | findings | notes |
 |---|---|---|
@@ -101,8 +101,11 @@ unattended: a spurious red is how a check gets deleted rather than fixed.
 The executor mutant also needed strengthening: the original asserted only that the
 `DmaMemcpyChunkTooLarge` variant appeared before the `checked_add` calls, which a
 guard rewritten to `if false` satisfies. It now requires the literal predicate.
-**Three of the seven mutants were initially missed, in a file whose entire job is
-catching exactly this.**
+**Three of the seven were initially missed, in a file whose entire job is catching
+exactly this** — and a fourth was found later still: §G's "no variant folds a
+64-bit value into one element" searched for an ASCII `2x` where the source writes
+`2×` (U+00D7), so the regex could never match and the claim was dead code. The
+`2 → 1` mutation now produces two findings rather than one.
 
 ## §2 — Per-premise table (gate ↔ design ↔ Rust)
 
@@ -113,7 +116,7 @@ catching exactly this.**
 | Zero **domain** `v < 2^20` | asserted at gate import | halfword bounds put the argument in `[0, 262140]` | gate module assert; audit A |
 | `Alu[a,b,LT] → o` | `lt.rs`'s own columns and carries, **not** `o = (a<b)` | `lt.rs` constraints 0–2 | audit D (both lookups, their constants, their multiplicities) |
 | **DmaNext per-limb binding** | 2 bus elements per 64-bit value, aligned pairwise | `lookup.rs` `num_bus_elements` + `accumulate_fingerprint_with` | audit **§G** (14 claims). Was assumed and unverified; that is how R1 happened |
-| A1 (was "MEMW-ADDR32") | the **head row's** address limbs are 32-bit | `spec/src/memw.toml` `[[assumptions]] IS_WORD[base_address[i]]` — a **caller obligation**, not a receiver check | **not discharged** — see §5 |
+| A1 (was "MEMW-ADDR32") | address limbs `< 2^32` wherever a `Memw` data op fires (`mu − end == 1`) — this is what the *gate* asserts; the head row is where it is load-bearing, since non-head limbs are also derived through the link | `spec/src/memw.toml` `[[assumptions]] IS_WORD[base_address[i]]` — a **caller obligation**, not a receiver check | **not discharged** — see §5 |
 | A2 (was "REG-32") | the **head row's** count limbs are 32-bit | `spec/src/memw_register.toml` `[[assumptions]] IS_WORD[val[i]]` | **not discharged** — see §5 |
 | constraint set = 18, degree 2 | 18 modelled constraints, all quadratic | `DmaConstraints` | audit C + the Rust test `dma_constraints_count_and_indices` |
 | the Rust fixture is the oracle's output | `include_str!` of the emitted row table | the emitter in `test_oracle.py` | audit **§H** |
@@ -143,12 +146,13 @@ recomputation.
 
 ## §4 — Gate sensitivity: the shipped controls
 
-Eight negative controls, each dropping exactly one premise and re-running the
-check that premise is load-bearing for. All eight are SAT.
+Ten negative controls, each dropping exactly one premise and re-running the check
+that premise is load-bearing for. All ten are SAT. (`Premises.NAMES` has eleven
+entries; `memw_addr32` has no control **deliberately** — see §5.)
 
-**Pairing matters, and getting it wrong is silent.** Three of the eight were
-initially paired with the wrong check and reported UNSAT — a control that cannot
-fail:
+**Pairing matters, and getting it wrong is silent.** Three of the original eight
+were initially paired with the wrong check and reported UNSAT — a control that
+cannot fail:
 
 * `drop_tail_lane_zero` was re-running MAIN 0, whose reference says nothing about
   the value lanes. Now paired with `check_tail_lanes`.
@@ -173,11 +177,22 @@ they only observe that verification fails:
 | shipped Rust forgery test | what it perturbs | the mechanism that rejects it | gate check |
 |---|---|---|---|
 | `forged_early_end_rejected` | `END := 1` on a data row | the `Zero` lookup (the sum no longer reads zero) **and** the three sends gated on `mu − end`, which vanish — so `DmaNext` and both `Memw` buses unbalance too. Not the `Zero` bus alone, as an earlier version of this table said | MAIN 1, and its `drop_zero_end` / `drop_halfword_count_decr` controls |
-| `forged_wide_tail_rejected` | `TAIL := 1` on a wide row | **three degree-2 constraints, row-locally** — `step = 8 − 7·tail` breaks the *ungated* idx-9 `emit_add_pair` on `count` (`count_decr + 1 ≠ count` when the trace holds `count − 8`), and idx 5-6 / 7-8 fail identically. **Not the `Alu` width pin**, which an earlier version of this table credited; the lookup is what stops the *opposite* direction (`tail := 0` on a narrow row, the width audit's `count = 7` case) | MAIN 0 |
+| `forged_wide_tail_rejected` | `TAIL := 1` on a wide row | **overdetermined — at least five independent mechanisms reject it.** Row-locally: `step = 8 − 7·tail` breaks the *ungated* idx-9 `emit_add_pair` on `count` (`count_decr + 1 ≠ count` when the trace holds `count − 8`), idx 5-6 and 7-8 fail identically, and idx 11-17 (`tail·value[i] = 0`) fail whenever the eight copied bytes are not all zero. On the buses: the `Alu` width pin (bus 20, multiplicity `mu`) sends `[count, 8, 0, LT, TAIL, 0]`, so with `TAIL = 1` on a `count ≥ 8` row it asks `lt.rs` for output 1 where that table holds 0 — no matching row, `Alu` unbalances; and `w8 = 1 − tail` changes the `Memw` width. | MAIN 0 |
 | `forged_intermediate_source_rejected` | `SRC_0` **and** `SRC_INCR_0` shifted together | **nothing row-local** — the row's own ADD stays satisfied. The predecessor's `DmaNext` tuple no longer matches, and the source read no longer matches memory | CHAIN / CHAIN-F, which is exactly the check that treats `DmaNext` as a free bijection rather than an assumed chain |
 | `forged_value_rejected` | `VALUE[0]` | **not the copy relation** — read and write still agree with each other, because they are one set of columns. What rejects it is the `Memw` read no longer matching memory | none; audit §D pins the one-set-of-columns wiring |
 
-Two of these are worth dwelling on. `forged_intermediate_source_rejected` is the
+**A correction worth keeping, because it is instructive.** An earlier version of
+this table credited the `Alu` width pin alone; a review called that incomplete,
+and the replacement over-corrected into *"**Not** the `Alu` width pin"* — which is
+false. The pin does reject it, by the argument now in the cell. The chain was:
+a finder wrote "the Alu lookup is not what blocks it", that was accepted without
+checking, and it was then sharpened into an explicit negation. **An overstatement
+became a falsehood by being propagated.** The lesson generalises past this cell:
+when a mechanism is overdetermined, "X rejects it" and "Y rejects it" are both
+true, and the tempting edit — replacing one with the other — is the one that
+introduces an error. Prefer "at least these", never "not that".
+
+Two rows are worth dwelling on. `forged_intermediate_source_rejected` is the
 case where per-row soundness is genuinely insufficient and the chain argument is
 doing the work — which is why the gate builds the bijection model rather than
 assuming rows are chained. And `forged_value_rejected` passes for a reason no
@@ -188,7 +203,14 @@ and the audit script are separate artifacts.
 ## §5 — Premises NOT discharged here (and where they should be)
 
 **A1** and **A2** (`dma-chip/DESIGN.md` §Assumptions) are asserted by the gate and
-verified by nothing in this directory. Both are **obligations on the caller** that
+verified by nothing in this directory. Their control coverage is **asymmetric**, and
+saying so matters: `drop_reg32` flips `check_row_budget` to SAT, so A2 is
+demonstrably load-bearing, but **A1 has no control on purpose** — dropping
+`memw_addr32` leaves every check on the board unchanged, because the limb-wise
+`DmaNext` link derives well-formedness from the sender's `IsHalfword` checks
+instead. A control that cannot fail is worse than no control, so none was added;
+the gate's docstring previously claimed "every negative control shows what breaks
+without them", which was false for exactly this premise. Both are **obligations on the caller** that
 the spec states as such — `spec/src/memw.toml` and `spec/src/memw_register.toml`
 carry them as `[[assumptions]] IS_WORD[...]`, and `memw_register.rs`'s only
 range-check interaction is on the timestamp delta.
@@ -298,7 +320,8 @@ python3 docs/verification/dma/audit_gate_transcription.py      # this audit
 cargo test -p lambda-vm-prover --lib dma              # the Rust side, incl. the vector test
 ```
 
-`make verify-dma` runs all three. `z3-solver` is the only dependency
+`make verify-dma` runs all three (it tolerates the oracle's exit 2, which means
+"ran but degraded", and aborts only on exit 1). `z3-solver` is the only dependency
 (`pip install z3-solver`; validated on 5.0.0 — the audit alone needs no solver).
 The gate takes ~96 s for the full board on 5.0.0, dominated by the completeness
 sweep; on 4.12.2 it takes ~1210 s and two queries blow their budgets and report

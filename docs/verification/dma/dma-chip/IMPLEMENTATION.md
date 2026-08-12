@@ -29,8 +29,8 @@ Syscall number `u64::MAX - 2`; ABI `memcpy(dst = x10, src = x11, n = x12)` with
 | 10 pinned vectors with full column expansions | `../dma-oracle/canonical_dma_vectors.json` |
 | the recovered specification + soundness ledger | `DESIGN.md` |
 | the z3 gate | `z3_dma_verify.py` |
-| the transcription audit (100 claims) | `../audit_gate_transcription.py` |
-| the audit's findings and residuals | `../TRANSCRIPTION-AUDIT.md` |
+| the transcription audit (104 claims) | `../audit_gate_transcription.py` |
+| the audit's findings, and the errors it corrected | `../TRANSCRIPTION-AUDIT.md` |
 | two Rust tests driving the real decomposition | `prover/src/tests/dma_tests.rs` |
 | a `#[cfg(test)]` accessor for that decomposition | `prover/src/tables/trace_builder.rs` |
 | a `verify-dma` target | `Makefile` |
@@ -48,7 +48,7 @@ The file already used this pattern for `epoch_touched_cells`.
 **Oracle → external anchors.** `python3 ../dma-oracle/test_oracle.py`, full:
 3855 cases against libc `memmove`, 3855 against CPython slice assignment, the
 row-level/byte-level replay equivalence over all 257 lengths × 15 overlap
-configurations, chunking over 1100 lengths, and a 6-mutant sensitivity sweep.
+configurations, chunking over 1100 lengths, and an 8-mutant sensitivity sweep.
 `VALIDATED`.
 
 **Gate → the design.** `python3 z3_dma_verify.py`, full board, z3 5.0.0, ~96 s:
@@ -68,20 +68,25 @@ and the gate now prints its solver version, warns when it is older than the
 validated one, and prints a legend saying `unknown` means a timeout rather than a
 soundness problem.
 
-**Audit → the Rust.** `python3 ../audit_gate_transcription.py`: **100 claims, 0
+**Audit → the Rust.** `python3 ../audit_gate_transcription.py`: **104 claims, 0
 findings**, per-section counts printed by the script rather than documented by
-hand. Mutation-tested against six source mutants, all six caught — including the
-one that matters most, `num_bus_elements(DWordHL) 2 → 1`, whose absence from the
-audit is what let the retracted R1 through. Two of the six needed the check
-strengthened before they were caught (`../TRANSCRIPTION-AUDIT.md` §1). Source is
+hand. Mutation-tested against eight source mutants, all eight caught — including the
+three that matter most: `num_bus_elements(DWordHL) 2 → 1`, a swap of `SRC_0`/`DST_0`
+in the `DmaNext` receiver tuple, and a stale fixture. **Four of the eight needed the
+check strengthened or added before they were caught** (`../TRANSCRIPTION-AUDIT.md` §1). Source is
 whitespace-normalised before literal matching, so a `rustfmt` reflow no longer
 produces a spurious finding, and the audit no longer imports the solver (~80 of
 its claims need no z3).
 
-**Rust → the oracle.** `cargo test -p lambda-vm-prover --lib dma`: 18 tests
-pass, including the two new ones
-(`dma_trace_matches_oracle_row_decomposition` over seven pinned structural cases,
-and `dma_maximum_chunk_is_thirty_three_rows_with_no_tail`).
+**Rust → the oracle.** `cargo test -p lambda-vm-prover --lib tests::dma_tests`:
+10 tests pass, including the two new ones —
+`dma_trace_matches_oracle_row_decomposition` over all ten pinned vectors, and
+`dma_maximum_chunk_has_no_tail_row`.
+
+The wider filter `--lib dma` is 18 tests, but **7 of them need guest ELFs** and
+fail on a clean checkout with `dma_memcpy_min.elf not found`. Build them first
+with `make compile-programs-rust` (needs the RISC-V target), or use the narrower
+filter above. `make verify-dma` runs no cargo at all.
 
 ## The retracted finding
 
@@ -141,10 +146,12 @@ spec. That argues for settling it once, centrally.
 pip install z3-solver                                   # validated on 5.0.0
 python3 docs/verification/dma/dma-oracle/test_oracle.py          # anchors, emits the vectors
 python3 docs/verification/dma/dma-chip/z3_dma_verify.py          # the gate  (--quick to shorten)
-python3 docs/verification/dma/audit_gate_transcription.py        # 83 transcription claims
-cargo test -p lambda-vm-prover --lib dma                # the Rust side
+python3 docs/verification/dma/audit_gate_transcription.py        # 104 claims, no solver needed
+cargo test -p lambda-vm-prover --lib tests::dma_tests   # the Rust side (see above
+                                                        # for the --lib dma caveat)
 ```
 
-`make verify-dma` runs all three. Each exits nonzero on failure; the oracle exits
-**2** when it ran but an anchor skipped, so a degraded run is distinguishable from
-a clean one. No CI workflow schedules them yet — that is a separate call.
+`make verify-dma` runs all three. Exit 1 is a real failure and aborts the recipe;
+the oracle exits **2** when it ran but an anchor skipped, which the recipe
+tolerates — otherwise a machine without a loadable libc would skip the audit and
+the gate, neither of which needs one. No CI workflow schedules them yet — that is a separate call.

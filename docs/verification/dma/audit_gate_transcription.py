@@ -50,11 +50,14 @@ sys.path.insert(0, os.path.join(HERE, "dma-oracle"))
 sys.path.insert(0, os.path.join(HERE, "dma-chip"))
 import dma_ref as ref                                             # noqa: E402
 
-#: The three gate constants this audit cross-checks. Duplicated deliberately
-#: rather than imported: importing `z3_dma_verify` drags in `z3`, and ~80 of the
-#: 83 claims here are textual and need no solver at all -- so a machine without
-#: z3 could not run the audit even to check column indices. `audit_constants`
-#: asserts these against the gate's own values when the module IS importable.
+#: Gate constants this audit cross-checks, duplicated rather than imported:
+#: importing `z3_dma_verify` drags in `z3`, and EVERY claim here is textual and
+#: needs no solver -- so a machine without z3 can still run the whole audit.
+#: The duplication is the cost of that, and it is a real one: nothing detects
+#: drift between these values and the gate's. They are all derived constants
+#: (Goldilocks, its 2^32 inverse, the executor's chunk bound), so drift would
+#: mean one of the two is simply wrong, and `audit_constants` checks each against
+#: the Rust independently -- which is the property that matters.
 GATE_P = 2**64 - 2**32 + 1
 GATE_INV_2_32 = pow(2**32, -1, GATE_P)
 GATE_MAX_BYTES = 256
@@ -438,8 +441,13 @@ def audit_packing(a, repo):
         a.ok(f"num_bus_elements(Packing::{name}) == {count}",
              re.search(rf"Packing::{name} => {count},", body) is not None)
 
+    # NOTE the multiplication sign: the source comments use U+00D7 ("2× Direct"),
+    # not ASCII "2x". An earlier version of this claim searched for the ASCII form,
+    # so the regex could never match and the predicate was tautologically true --
+    # a dead guard inside the very section added to close the packing-assumption
+    # gap. `2 → 1` on any compound arm now produces TWO findings, not one.
     a.ok("no Packing variant folds a 64-bit value into one bus element",
-         not re.search(r"Packing::\w+ => 1,\s*// 2x", body),
+         not re.search(r"Packing::\w+ => 1, // 2×", body),
          "if one ever did, DmaNext would bind packed values and the gate's link "
          "model would have to change with it")
 
@@ -470,6 +478,32 @@ def audit_packing(a, repo):
          elements(send) == elements(recv) == 8,
          f"sender={elements(send)} receiver={elements(recv)}; a mismatch would "
          f"misalign every field and silently change what the bus binds")
+    # ORDER, not just membership. §D checks that the right column names appear in
+    # each tuple and the block above checks the element counts -- neither pins the
+    # PAIRING, while the gate's `dmanext_link()` hard-codes it (sender low word <->
+    # receiver low word, src<->src, dst<->dst, count<->count). Swapping SRC_0 and
+    # DST_0 in the receiver used to leave this audit at "0 findings" while the gate
+    # kept asserting src_incr<->src about a table that now binds src_incr<->dst.
+    # That is the same class as the assumption that produced the retracted R1: a
+    # premise about the bus taken on faith rather than read from the source.
+    def ordinal(tup, names):
+        """The order in which `names` first appear in a tuple's source text."""
+        seen = [(tup.index(n), n) for n in names if n in tup]
+        return [n for _, n in sorted(seen)]
+
+    a.ok("the DmaNext sender orders its values ts, src_incr, dst_incr, count_decr",
+         ordinal(send, ("cols::SRC_INCR_0", "cols::DST_INCR_0", "cols::COUNT_DECR_0"))
+         == ["cols::SRC_INCR_0", "cols::DST_INCR_0", "cols::COUNT_DECR_0"],
+         "the gate pairs these positionally with the receiver's src/dst/count")
+    a.ok("the DmaNext receiver orders its values ts, src, dst, count",
+         ordinal(recv, ("cols::SRC_0", "cols::DST_0", "cols::COUNT_0"))
+         == ["cols::SRC_0", "cols::DST_0", "cols::COUNT_0"],
+         "a swap here silently re-pairs every field the gate models")
+    a.ok("both DmaNext tuples put the timestamp first, in the same order",
+         ordinal(send, ("cols::TIMESTAMP_0", "cols::TIMESTAMP_1"))
+         == ordinal(recv, ("cols::TIMESTAMP_0", "cols::TIMESTAMP_1"))
+         == ["cols::TIMESTAMP_0", "cols::TIMESTAMP_1"])
+
     a.ok("the sender uses DWordHL x3 and the receiver DWordWL x3",
          send.count("Packing::DWordHL") == 3
          and recv.count("Packing::DWordWL") == 3,
@@ -565,6 +599,31 @@ def audit_fixture(a, repo):
     a.ok("the emitted row table exists and is non-trivial",
          len(read_raw(repo, "docs/verification/dma/dma-oracle/"
                             "canonical_dma_rows.txt").splitlines()) > 20)
+
+    # FRESHNESS, not just presence. Greping for `include_str!` proves the Rust
+    # reads a fixture; it does not prove the fixture is what the current oracle
+    # emits. And `test_oracle.py` regenerates it only on a fully-green run, so an
+    # oracle regression leaves a stale fixture behind with the Rust test still
+    # green. Re-derive the table here and compare.
+    sys.path.insert(0, os.path.join(repo, "docs/verification/dma/dma-oracle"))
+    committed = read_raw(repo, "docs/verification/dma/dma-oracle/canonical_dma_rows.txt")
+    try:
+        import test_oracle as harness
+        rows = []
+        for name, dst, src, n in harness.CANONICAL_CASES:
+            memory = {src + i: (i * 7 + 3) & 0xFF for i in range(n)}
+            decomposed = ref.row_decomposition(0x30, dst, src, n, memory)
+            data = [r for r in decomposed if not r.end]
+            rows.append(f"vector|{name}|{dst}|{src}|{n}|{len(data)}")
+            for r in data:
+                rows.append(f"row|{r.src}|{r.dst}|{r.count}|"
+                            f"{1 if r.tail else 0}|{r.width}")
+        a.ok("the checked-in row table matches what the oracle emits today",
+             [line for line in committed.splitlines() if not line.startswith("#")] == rows,
+             "regenerate with `python3 dma-oracle/test_oracle.py`")
+    except ImportError as exc:
+        a.ok("the oracle harness is importable so the fixture can be re-derived",
+             False, f"could not import test_oracle: {exc}")
 
 
 # ---------------------------------------------------------------------------

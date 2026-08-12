@@ -634,8 +634,11 @@ fmt:
 verify-dma: ## Run the DMA memcpy verification campaign (docs/verification/dma)
 	@# Oracle anchors + vector emission, the z3 soundness gate, and the
 	@# transcription audit. Needs `pip install z3-solver` (validated on 5.0.0);
-	@# the audit alone needs no solver. Each exits nonzero on failure.
-	python3 docs/verification/dma/dma-oracle/test_oracle.py
+	@# the audit alone needs no solver.
+	@# Exit codes: 1 = failure (abort), 2 = ran but degraded (an external anchor
+	@# was unavailable). Only 1 should stop the run -- otherwise a machine without
+	@# a loadable libc would skip the audit and the gate, neither of which needs it.
+	python3 docs/verification/dma/dma-oracle/test_oracle.py || [ $$? -eq 2 ]
 	python3 docs/verification/dma/audit_gate_transcription.py
 	python3 docs/verification/dma/dma-chip/z3_dma_verify.py
 
