@@ -157,8 +157,8 @@ To pad this chip, use the below data.
 
 Note that this padding row is not all-zero.
 @dma:c:count_decr is unconditional, so a padding row has to satisfy it too: $#`tail` = 1$ makes $#`step` = 1$, which $#`count` = 1$ and $#`count_decr` = 0$ then satisfy.
-The two address updates are conditioned on $#`μ` - #`end`$ and so do not forbid a wraparound here, but their low-limb carry is constrained on every row (@addnw:c:carry), which forces $#`src_incr` = #`dst_incr` = 1$.
-A padding row is therefore an inactive one-byte step rather than an arbitrary row.
+The two address updates are conditioned on $#`μ` - #`end`$ and so do not forbid a wraparound here, but their low-limb carry is constrained on every row (@addnw:c:carry), so a padding row must satisfy that relation too; $#`src_incr` = #`dst_incr` = 1$ is the assignment that does so with a zero carry.
+It is not the only one --- @dma:c:range_src_incr and @dma:c:range_dst_incr, which would pin the limbs, carry multiplicity $#`μ`$ and are inert here --- but a padding row feeds no interaction either way.
 
 = Notes/optimizations
 - The copy is a `memmove` per `ECALL`, but _not_ per guest-level `memcpy`: a copy larger than 256 bytes is chunked into several `ECALL`s at distinct timestamps, and chunk $k+1$ reads what chunk $k$ has already written.
