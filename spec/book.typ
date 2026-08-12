@@ -22,7 +22,7 @@
       ("is_bit.typ", [`IS_BIT` template], <isbit>),
       ("is_byte.typ", [`IS_BYTE` template], <isbyte>),
       ("sign.typ", [`SIGN` template], <sign>),
-      ("add.typ", [`ADD`/`SUB` template], <add>),
+      ("add.typ", [`ADD`/`SUB`/`ADDNW` templates], <add>),
       ("neg.typ", [`NEG` template], <neg>),
       ("reg.typ", [`REG`/`REGW` template], <reg>),
     )),

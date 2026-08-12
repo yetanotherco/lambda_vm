@@ -1,5 +1,4 @@
 name = "DMA"
-code = "DMA"
 
 # Input
 
@@ -68,7 +67,7 @@ pad = 1
 [[variables.auxiliary]]
 name = "value"
 type = "DWordBL"
-desc = "The bytes copied by this row; only $#`value`_0$ is copied when $#`tail` = 1$."
+desc = "The bytes copied by this row; only $#`value`_0$ is copied when $#`tail` = 1$. Unconstrained on rows that copy nothing."
 pad = 0
 
 # Virtual
@@ -76,7 +75,7 @@ pad = 0
 [[variables.virtual]]
 name = "step"
 type = "Byte"
-desc = "The number of bytes copied by this row: eight, or one when `tail` is set."
+desc = "The stride this row advances by: eight, or one when `tail` is set. No bytes are copied on the terminal row."
 def = ["-", 8, ["*", 7, "tail"]]
 
 # Multiplicity
@@ -116,7 +115,7 @@ name = "incoming"
 [[constraints.incoming]]
 kind = "interaction"
 tag = "ECALL"
-input = ["timestamp", ["cast", ["-", ["^", 2, 64], 3], "DWordWL"]]
+input = ["timestamp", ["arr", ["-", ["^", 2, 32], 3], ["-", ["^", 2, 32], 1]]]
 multiplicity = ["-", "first"]
 ref = "dma:c:receive_ecall"
 

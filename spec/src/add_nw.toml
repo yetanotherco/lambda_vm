@@ -55,11 +55,9 @@ name = "all"
 
 [[constraints.all]]
 kind = "template"
-tag = "ADD"
-input = ["lhs", "rhs"]
-output = "sum"
-cond = "cond"
-ref = "addnw:c:add"
+tag = "IS_BIT"
+input = [["idx", "carry", 0]]
+ref = "addnw:c:carry"
 
 [[constraints.all]]
 kind = "arith"
