@@ -4,6 +4,7 @@ pub mod aux_opening_width_tests;
 pub mod bus_debug_tests;
 pub mod bus_tests;
 pub mod commitment_tests;
+pub mod constraint_index_tests;
 pub mod domain_cache_stats;
 pub mod fri_tests;
 pub mod grinding_tests;

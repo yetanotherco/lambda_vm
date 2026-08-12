@@ -33,7 +33,8 @@
 
 use math::field::element::FieldElement;
 use stark::constraints::builder::{
-    CaptureBuilder, ConstraintSet, ProverEvalFolder, RootKind, num_base_from_meta,
+    CaptureBuilder, ConstraintSet, ProverEvalFolder, RootKind, check_dense_index_set,
+    num_base_from_meta,
 };
 use stark::frame::Frame;
 use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};
@@ -1547,3 +1548,37 @@ fn the_trivial_program_proves_and_verifies_under_blake3() {
 // C closed it: `leaf_tests::fri_toy_proves_and_verifies_under_blake3` is the
 // replacement, and it carries the negative leg the tripwire's criteria asked
 // for.
+
+/// ★ H1 guard — every `LFM_HASH` candidate emits each constraint index exactly
+/// once, checked in RELEASE.
+///
+/// `EmitTracker`'s duplicate assert is `#[cfg(debug_assertions)]` and this
+/// workspace declares no `[profile.release]` override, so under the house
+/// convention `cargo test --release` it is a no-op: a second
+/// `emit_base(idx, ..)` silently overwrites the first. Nothing else notices,
+/// because a body that emits one index twice and another never still fills the
+/// declared number of slots — `num_constraints`, `predicted_constraints` and
+/// `assert_complete` all still pass while a constraint has been deleted.
+///
+/// This runs the real body through `ConstraintSet::meta` (no `cfg`) and demands
+/// the emitted index multiset be exactly `0..num_constraints`. The checker's own
+/// ability to fail — on this exact shape, a widened lane block overrunning the
+/// pins after it — is established in
+/// `stark::tests::constraint_index_tests::the_widened_lane_block_collides_and_the_checker_says_so`.
+///
+/// Required by COMMIT.md §1.4.4 H1. It guards the chip as it stands today, and
+/// it is what would catch the `NUM_LANES` widening if that lands before the
+/// framing indices stop being written as literals.
+#[test]
+fn every_hash_candidate_emits_each_constraint_index_exactly_once() {
+    for (set, kind) in [
+        (HashConstraints::TEST, HasherKind::Test),
+        (HashConstraints::POSEIDON, HasherKind::Poseidon),
+        (HashConstraints::BLAKE3, HasherKind::Blake3),
+    ] {
+        let declared = HashConstraints::num_constraints(kind);
+        let meta = <HashConstraints as ConstraintSet<F, E>>::meta(&set);
+        check_dense_index_set(&meta, declared)
+            .unwrap_or_else(|e| panic!("{kind:?} LFM_HASH constraint body: {e}"));
+    }
+}
