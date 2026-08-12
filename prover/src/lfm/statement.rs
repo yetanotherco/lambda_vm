@@ -10,7 +10,6 @@
 //! `statement.rs`: any divergence in the absorbed bytes changes every derived
 //! challenge and verification rejects.
 
-use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use crypto::fiat_shamir::is_transcript::IsTranscript;
 use crypto::hash::platform_keccak::PlatformKeccak256 as Keccak256;
 use digest::Digest;
@@ -70,8 +69,15 @@ pub fn lfm_program_id(
 /// Binds the LFM statement: program identity, machine version, the claimed
 /// public words and the FRI terminal degree. Exhaustive by construction —
 /// extending the statement means extending this function, in one place.
+///
+/// Generic over the transcript because the statement bind is hash-agnostic: it
+/// only absorbs, so it is the same sequence of `append_bytes` calls whichever
+/// sponge the proof runs on. Pinning it to `DefaultTranscript` would have made
+/// the machine's own transcript a fork of this function rather than a caller of
+/// it, and two copies of a statement encoding is exactly the drift the
+/// "exhaustive by construction" note above exists to prevent.
 pub fn absorb_lfm_statement(
-    transcript: &mut DefaultTranscript<E>,
+    transcript: &mut impl IsTranscript<E>,
     program_id: &Commitment,
     public_words: &[(u32, LfmWord)],
     fri_final_poly_log_degree: u8,

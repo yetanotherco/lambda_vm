@@ -986,10 +986,14 @@ pub(crate) fn compute_commit_bus_offset(
 /// Replay the prover's Phase A (main trace commitments) to recover the shared
 /// LogUp challenges (z, alpha), over a proof view (owned or archived-in-place)
 /// — no `MultiProof` deserialization required either way.
+///
+/// Generic over the transcript for the same reason as `absorb_lfm_statement`:
+/// the replay is `append_bytes` plus `sample_field_element`, both on
+/// `IsTranscript`, so it is the same replay under any sponge.
 pub(crate) fn replay_transcript_phase_a_view<'p>(
     airs: &[&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>],
     proofs: impl ProofViewSource<'p, F, E, ()>,
-    transcript: &mut DefaultTranscript<E>,
+    transcript: &mut impl IsTranscript<E>,
 ) -> (FieldElement<E>, FieldElement<E>) {
     for (air, proof) in airs.iter().zip(proofs.view_iter()) {
         if air.is_preprocessed() {
