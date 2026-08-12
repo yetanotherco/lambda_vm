@@ -2424,9 +2424,10 @@ fn registered_programs_are_single_chunk() {
 /// Every `HasherKind` there is. Not derived — a new candidate must be added
 /// here by hand, which is the point: the two tests below are what say a new
 /// hasher gets its own program identity rather than sharing one.
-const ALL_HASHERS: [super::hash::HasherKind; 2] = [
+const ALL_HASHERS: [super::hash::HasherKind; 3] = [
     super::hash::HasherKind::Test,
     super::hash::HasherKind::Poseidon,
+    super::hash::HasherKind::Blake3,
 ];
 
 /// ★ Each registered entry's digest is bound to the hasher the entry names,

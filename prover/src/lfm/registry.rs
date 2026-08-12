@@ -12,7 +12,7 @@
 //! fallback that recomputes or skips. The registry check is the soundness
 //! argument's first premise (see `SOUNDNESS.md`).
 
-use stark::config::Commitment;
+use stark::config::{Commitment, CommitmentHash};
 use stark::proof::options::ProofOptions;
 
 use crate::tables::{bitwise, keccak_rc};
@@ -109,11 +109,19 @@ pub struct LfmArtifacts {
 ///   it here keeps the verifier's AIR set derivable from the registry alone,
 ///   with nothing about proof shape read off the proof.
 ///
-/// The `LFM_HASH` permutation is bound too, but not through a root: its
-/// preprocessed width is the same under every candidate (the instruction group
-/// is hasher-independent), so no commitment moves with it.
-/// [`build_artifacts_with_hasher`] folds the kind's tag into the digest
-/// instead.
+/// The `LFM_HASH` permutation is bound too, but not through a root: it selects
+/// which chip fills the `LFM_HASH` slot, and every candidate's preprocessed
+/// width is the same (the instruction group is hasher-independent), so no root
+/// moves with the choice. [`build_artifacts_with_hasher`] folds the kind's tag
+/// into the digest instead — measured by
+/// `the_blake3_choice_moves_the_program_digest_and_no_root`.
+///
+/// That is a statement about the machine's *own* hash, not about the hash these
+/// roots are built with. The two are separate axes today and the second one is
+/// not chosen here; see [`build_artifacts_with_hasher`]'s guard for what keeps
+/// them separate. If the machine's hash ever also selects the commitment scheme
+/// the roots are committed under, every root above moves with it and the tag on
+/// its own stops being the whole binding.
 pub fn build_artifacts(program: &LfmProgram, options: &ProofOptions) -> LfmArtifacts {
     build_artifacts_with_hasher(program, options, HasherKind::default())
 }
@@ -125,11 +133,32 @@ pub fn build_artifacts(program: &LfmProgram, options: &ProofOptions) -> LfmArtif
 /// so the same program under two hashers is two program identities, and the
 /// prove/verify paths that read `LfmArtifacts` cannot pair one hasher's digest
 /// with another hasher's AIR set.
+///
+/// # What `hasher` does not say
+///
+/// `hasher` names the `LFM_HASH` chip the machine runs. It says nothing about
+/// the hash the roots below are built with: `commit_group` and the two
+/// `preprocessed_commitment` helpers all commit through `stark`'s Merkle layer,
+/// which is pinned to [`CommitmentHash::Keccak256`]. So under
+/// `HasherKind::Blake3` this returns keccak-built roots inside artifacts that
+/// name Blake3 — honest only because the name makes no claim about them.
+///
+/// The `match` below is what keeps it honest. It is exhaustive over
+/// [`CommitmentHash`], so the change that gives `stark` a second commitment
+/// hash cannot compile until someone decides here what the artifacts should say
+/// — rather than inheriting a digest that names one hash over roots built with
+/// another, which nothing downstream would catch.
 pub fn build_artifacts_with_hasher(
     program: &LfmProgram,
     options: &ProofOptions,
     hasher: HasherKind,
 ) -> LfmArtifacts {
+    // Exhaustive on purpose — see the doc above. Not a runtime check: today
+    // every arm of `hasher` is legitimately paired with keccak roots.
+    const _: () = match stark::config::COMMITMENT_HASH {
+        CommitmentHash::Keccak256 => (),
+    };
+
     let range = range_group();
     let groups = [
         &program.groups.const_,

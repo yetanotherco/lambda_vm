@@ -4,6 +4,13 @@
 //! back to CPU for extension-field columns and small columns where kernel
 //! launch overhead dominates. Produces the same natural-order, non-canonical
 //! LDE evaluations as the CPU path.
+//!
+//! The tree-building entries here are generic over a Merkle backend `B` that
+//! they never call: the leaf and parent hashing happens in the `math-cuda`
+//! keccak kernels, and `B` only types the host `MerkleTree` the root is wrapped
+//! in. `B` is therefore bound to [`KeccakTreeBackend`] rather than
+//! `IsMerkleTreeBackend`, so the label cannot disagree with the kernel that
+//! produced the bytes.
 
 use core::mem::transmute_copy;
 use std::any::TypeId;
@@ -20,14 +27,13 @@ use math_cuda::{CudaSlice, CudaStream};
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
 use crypto::merkle_tree::merkle::MerkleTree;
 use crypto::merkle_tree::proof::Proof;
-use crypto::merkle_tree::traits::IsMerkleTreeBackend;
 use math::field::element::FieldElement;
 use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
 use math::field::goldilocks::GoldilocksField;
 use math::field::traits::{IsFFTField, IsField, IsSubFieldOf};
 use math::traits::AsBytes;
 
-use crate::config::{Commitment, FriLayerMerkleTreeBackend};
+use crate::config::{Commitment, FriLayerMerkleTreeBackend, KeccakTreeBackend};
 use crate::domain::Domain;
 use crate::fri::fri_commitment::FriLayer;
 use crate::fri::fri_decommit::FriDecommitment;
@@ -692,7 +698,7 @@ pub(crate) fn try_expand_leaf_and_tree_row_major_keep<F, E, B>(
 where
     F: IsField + 'static,
     E: IsField + 'static,
-    B: IsMerkleTreeBackend<Node = [u8; 32]>,
+    B: KeccakTreeBackend,
 {
     let lde_size = n.saturating_mul(blowup_factor);
     if lde_size < gpu_lde_threshold() {
@@ -749,7 +755,7 @@ where
 /// [`MerkleTree`], the exact layout `from_precomputed_nodes` expects.
 fn tree_from_node_bytes<B>(nodes: Vec<u8>) -> Option<MerkleTree<B>>
 where
-    B: IsMerkleTreeBackend<Node = [u8; 32]>,
+    B: KeccakTreeBackend,
 {
     debug_assert_eq!(nodes.len() % 32, 0);
     let nodes: Vec<[u8; 32]> = nodes
@@ -793,7 +799,7 @@ pub(crate) fn try_expand_split_trees_row_major_keep<F, E, B>(
 where
     F: IsField + 'static,
     E: IsField + 'static,
-    B: IsMerkleTreeBackend<Node = [u8; 32]>,
+    B: KeccakTreeBackend,
 {
     let lde_size = n.saturating_mul(blowup_factor);
     if lde_size < gpu_lde_threshold() {
@@ -875,7 +881,7 @@ pub(crate) fn try_expand_leaf_and_tree_ext3_row_major_keep<F, E, B>(
 where
     F: IsField + 'static,
     E: IsField + 'static,
-    B: IsMerkleTreeBackend<Node = [u8; 32]>,
+    B: KeccakTreeBackend,
 {
     let lde_size = n.saturating_mul(blowup_factor);
     if lde_size < gpu_lde_threshold() {
@@ -1111,7 +1117,7 @@ pub(crate) fn try_build_comp_poly_tree_gpu<E, B>(
 ) -> Option<(MerkleTree<B>, math_cuda::lde::GpuMerkleTree)>
 where
     E: IsField + 'static,
-    B: IsMerkleTreeBackend<Node = [u8; 32]>,
+    B: KeccakTreeBackend,
 {
     if lde_parts.is_empty() {
         return None;
@@ -1162,7 +1168,7 @@ pub(crate) fn try_build_comp_poly_tree_gpu_from_dev<E, B>(
 ) -> Option<(MerkleTree<B>, math_cuda::lde::GpuMerkleTree)>
 where
     E: IsField + 'static,
-    B: IsMerkleTreeBackend<Node = [u8; 32]>,
+    B: KeccakTreeBackend,
 {
     if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
         return None;
@@ -1564,7 +1570,7 @@ pub(crate) fn try_expand_leaf_and_tree_ext3_row_major_keep_dev<F, E, B>(
 where
     F: IsField + 'static,
     E: IsField + 'static,
-    B: IsMerkleTreeBackend<Node = [u8; 32]>,
+    B: KeccakTreeBackend,
 {
     if TypeId::of::<F>() != TypeId::of::<GoldilocksField>()
         || TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>()
