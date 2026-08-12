@@ -4,12 +4,12 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
-# Standalone workspace: this crate lives under `docs/` and must not be adopted as a
+# Standalone workspace: this crate lives under `formal_verification/` and must not be adopted as a
 # member of the repo workspace (which lists its members explicitly).
 [workspace]
 
 [dependencies]
-ecsm = { path = "../../../../crypto/ecsm" }
+ecsm = { path = "../../../crypto/ecsm" }
 num-bigint = "0.4.6"
 
 [profile.release]

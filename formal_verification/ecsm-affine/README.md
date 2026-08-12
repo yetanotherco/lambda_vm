@@ -17,20 +17,28 @@ Neither of those paths exists on `main`: `thoughts/` is gitignored, and both cam
 only on their own unmerged branches. Citations to them name the branch and commit for that
 reason.
 
-### Why this lives in `docs/verification/`, not `thoughts/`
+### Why this lives in `formal_verification/`, not `thoughts/` or `docs/`
 
-`thoughts/` is gitignored deliberately. `d83b4d9e` (PR #863, 2026-07-31) added it to
-`.gitignore` under the comment *"Profiling outputs … and working notes"* and in the same
-commit **deleted** the two files that had leaked in
-(`thoughts/gpu-constraint-eval/{impl-plan-single-source-constraints,survey-constraint-frontends}.md`);
-its sub-commit subjects are "chore: keep working notes out of the tree" and "…gitignore
-reports/, and untrack the working notes". Nothing under `thoughts/` is tracked on `main`
-today — verify with `git ls-tree -r --name-only origin/main -- thoughts/` (0 files).
+`formal_verification/<chip>/` is the layout PR **#923** establishes as "the canonical, reusable
+template" for machine-checked chip verification, and `tooling/loc` (extended in that PR) does
+`read_dir("formal_verification")` and reports **every subdirectory** as one verified gate. So
+placing a campaign here gets it counted automatically; nothing else has to be wired up, and
+this PR touches no shared file.
 
-PR #903 force-adds back into `thoughts/` and argues the case in its own README, but #903 is
-still open, so that is one unmerged PR relitigating a merged decision rather than precedent.
-`docs/` is tracked, and the directory name says what these files are — which is the stronger
-form of #903's own argument anyway, since these are runnable gates with exit codes, not notes.
+`thoughts/` was the other candidate and is wrong: `d83b4d9e` (PR #863, 2026-07-31) added it to
+`.gitignore` under the comment *"Profiling outputs … and working notes"* and in the same commit
+**deleted** the two files that had leaked in. Nothing under `thoughts/` is tracked on `main`
+today — `git ls-tree -r --name-only origin/main -- thoughts/` returns 0 files. PR #903
+force-adds back into it and argues the case in its own README, but #903 is unmerged, so that is
+one PR relitigating a merged decision rather than precedent.
+
+The file layout here is nested (`oracle/`, `gate/`, `harness/`) where #923's keccak instance is
+flat. #923's own instruction is to clone the **method**, not the filenames, and its "Mandatory
+discipline" — negative controls of two kinds, *changed* and *removed* constraints, because an
+over-constrained model hides a missing one — is satisfied here by the mutation-tested audit
+premises and the drop-the-constraint controls (A1e, A1f, A2g, A3d). At 28 files against
+keccak's 9, subdirectories earn their keep, and the LOC tooling counts the whole tree either
+way.
 
 ## Status
 
@@ -132,7 +140,7 @@ A few seconds plus one `cargo build`. The harness depends only on `crypto/ecsm`,
 a harness that needs the whole prover does not get run. Without a `.venv` the runner falls
 back to `python3` from `PATH`.
 
-Committing is a plain `git add docs/verification/ecsm-affine` — no `-f`, no pathspecs. That
+Committing is a plain `git add formal_verification/ecsm-affine` — no `-f`, no pathspecs. That
 is the practical reason this directory is not under `thoughts/`: `-f` would be required
 there, and **`-f` overrides the nested `.gitignore` too**, so it stages `.venv/` and
 `harness/target/` as well (5108 files instead of 28). Outside an ignored parent, the nested
@@ -140,14 +148,14 @@ there, and **`-f` overrides the nested `.gitignore` too**, so it stages `.venv/`
 
 ```
 $ git add -nf thoughts/camp    ->  .gitignore, .venv/junk, gate.py, harness/target/junk.o
-$ git add -n  docs/camp        ->  .gitignore, gate.py
+$ git add -n  formal_verification/camp  ->  .gitignore, gate.py
 ```
 
 So **keep `.gitignore`** — it is what excludes the venv and the build output. Sanity-check
 before committing:
 
 ```bash
-git add -n docs/verification/ecsm-affine | wc -l    # ~28, not 5108
+git add -n formal_verification/ecsm-affine | wc -l    # ~28, not 5108
 ```
 
 `ecdsa` is optional — without it the oracle reports `PARTIALLY VALIDATED` and **names the

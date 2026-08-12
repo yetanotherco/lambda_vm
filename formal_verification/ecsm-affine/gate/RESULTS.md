@@ -11,7 +11,8 @@ campaigns in this tree:
   pattern, and its postmortem on which pass is worth doing (the transcription audit).
 
 Both paths are under the gitignored `thoughts/` and exist only on those unmerged branches, not
-on `main`; this campaign lives in `docs/verification/` instead (rationale in `../README.md`).
+on `main`; this campaign lives in `formal_verification/` instead, following PR #923's
+template (rationale in `../README.md`).
 
 Model transcribed from the Rust with `file:line` citations inline in the scripts; independent
 reference = `../oracle/ecsm_affine_ref.py`, a from-scratch secp256k1 implementation (no
@@ -344,7 +345,7 @@ asserts the count.
 
 ## Reproduction
 
-From `docs/verification/ecsm-affine/`:
+From `formal_verification/ecsm-affine/`:
 
 ```bash
 python3 -m venv .venv && ./.venv/bin/pip install z3-solver sympy ecdsa
@@ -353,7 +354,7 @@ python3 -m venv .venv && ./.venv/bin/pip install z3-solver sympy ecdsa
 ```
 
 `run_gate.sh` cds to its own directory, so it also works from the repo root as
-`docs/verification/ecsm-affine/run_gate.sh`. The two scripts that read repo source locate the
+`formal_verification/ecsm-affine/run_gate.sh`. The two scripts that read repo source locate the
 root by marker (a workspace `Cargo.toml` next to `prover/`), not by a hard-coded `parents[N]`
 — see the note under "Where to send the next reviewer".
 
