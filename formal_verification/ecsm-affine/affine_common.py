@@ -38,7 +38,6 @@ shows up in the concrete evaluation before any UNSAT is trusted.
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "oracle"))
 
 from ecsm_affine_ref import N, P  # noqa: E402  (the oracle is the reference, not the repo)
 

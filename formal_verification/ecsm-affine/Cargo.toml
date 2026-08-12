@@ -8,8 +8,12 @@ publish = false
 # member of the repo workspace (which lists its members explicitly).
 [workspace]
 
+[[bin]]
+name = "ecsm-affine-harness"
+path = "harness_dump.rs"
+
 [dependencies]
-ecsm = { path = "../../../crypto/ecsm" }
+ecsm = { path = "../../crypto/ecsm" }
 num-bigint = "0.4.6"
 
 [profile.release]

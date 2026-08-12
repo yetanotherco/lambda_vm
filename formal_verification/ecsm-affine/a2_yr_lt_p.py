@@ -42,7 +42,6 @@ from pathlib import Path
 import z3
 
 sys.path.insert(0, str(Path(__file__).parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "oracle"))
 from affine_common import (  # noqa: E402
     P,
     PG,
@@ -277,8 +276,7 @@ def a2e_honest_anchor():
     for k in [1, 2, N - 1, 0x1234_5678]:
         cases.append(("x-only", k, affine_mul(k, G[0], G[1])))
     # and the y = 1 point, whose yR sits at the very bottom of the non-canonical band
-    small = json.loads((Path(__file__).resolve().parents[1] / "oracle"
-                        / "small_y_point.json").read_text())
+    small = json.loads((Path(__file__).parent / "small_y_point.json").read_text())
     inst = small["ecsm_instance"]
     cases.append(("affine/small-y", inst["k"],
                   affine_mul(inst["k"], int(inst["x_g"], 16), int(inst["y_g"], 16))))
@@ -358,8 +356,7 @@ def a2f_forgery():
     the chip's own generic path produces it. Honest output `yR = 1`. The forged witness
     publishes `yR' = yR + p` and compensates with `q2' = q2 − 1`; the relation's residual is
     `−p·1 + p·1 = 0`, so it still holds EXACTLY, all 64 carries included."""
-    small = json.loads((Path(__file__).resolve().parents[1] / "oracle"
-                        / "small_y_point.json").read_text())
+    small = json.loads((Path(__file__).parent / "small_y_point.json").read_text())
     inst = small["ecsm_instance"]
     k, xg, yg = inst["k"], int(inst["x_g"], 16), int(inst["y_g"], 16)
     assert k == 2 and is_on_curve((xg, yg))
@@ -416,8 +413,7 @@ def a2g_load_bearing():
     The x-only path did not need this check because it never wrote `yR`. `XR_SUB_P` is the
     exact analogue on the x side, and the earlier board's N6 found it load-bearing for the
     same reason (RESULTS.md Finding 5). `YrLtP` closes the other half of the output."""
-    small = json.loads((Path(__file__).resolve().parents[1] / "oracle"
-                        / "small_y_point.json").read_text())
+    small = json.loads((Path(__file__).parent / "small_y_point.json").read_text())
     yr = int(small["expected"]["y_r"], 16)
     forged = int(small["forged_y_r"], 16)
     ok = forged == yr + P and forged < 2**256 and forged >= P
@@ -430,8 +426,7 @@ def a2g_load_bearing():
 def a2h_band():
     """The band `YrLtP` excludes is exactly `[p, 2^256)`, of width `2^256 − p = 2^32 + 977`,
     and it is populated by real curve points — the PR's constructibility claim, checked."""
-    small = json.loads((Path(__file__).resolve().parents[1] / "oracle"
-                        / "small_y_point.json").read_text())
+    small = json.loads((Path(__file__).parent / "small_y_point.json").read_text())
     y = int(small["small_y_point"]["y"], 16)
     x = int(small["small_y_point"]["x"], 16)
     ok = (NONCANONICAL_BAND == 2**32 + 977 and y < NONCANONICAL_BAND

@@ -15,18 +15,18 @@ on `main`; this campaign lives in `formal_verification/` instead, following PR #
 template (rationale in `../README.md`).
 
 Model transcribed from the Rust with `file:line` citations inline in the scripts; independent
-reference = `../oracle/ecsm_affine_ref.py`, a from-scratch secp256k1 implementation (no
+reference = `ecsm_affine_ref.py`, a from-scratch secp256k1 implementation (no
 `k256`, no `num_bigint`, no repo code).
 
 **Faithfulness anchors, both green, both run before any UNSAT was read:**
 
-1. **Function** — `../oracle/test_oracle.py`: 9/9 anchors, `ORACLE STATUS: VALIDATED`.
+1. **Function** — `test_oracle.py`: 9/9 anchors, `ORACLE STATUS: VALIDATED`.
    Repo constants parsed and matched, 5 published multiples of `G`, 216 x-only-agreement
    pairs, 200 root-dependence instances, the executor's 8 rejections, the ABI predicates over
    193 offsets, 60 ecrecover-equivalence instances, 25 vectors against the PyPI `ecdsa`
    package.
 2. **Columns** — `a6_real_witness.py` over 32 witnesses emitted by the repo's own
-   `ecsm::compute_witness{,_with_y}` (`../harness/`): every field the model reads is
+   `ecsm::compute_witness{,_with_y}` (`harness_dump.rs`): every field the model reads is
    re-derived, including all four overflow chains, both convolution relations and their carry
    windows.
 
@@ -88,7 +88,7 @@ asserted on five of the six. See Finding 7.
 
 The PR's soundness section claims the excluded band is populated: "such points are
 constructible: `3 | p−1` makes cubing 3-to-1, so a small target `y` has a cube-root preimage
-about a third of the time". `../oracle/small_y_point.py` builds the point, and the claim is
+about a third of the time". `small_y_point.py` builds the point, and the claim is
 not just true but extreme — **the first candidate, `y = 1`, works**:
 
 ```
@@ -349,7 +349,7 @@ From `formal_verification/ecsm-affine/`:
 
 ```bash
 python3 -m venv .venv && ./.venv/bin/pip install z3-solver sympy ecdsa
-./run_gate.sh                 # everything, logs to gate/logs/
+./run_gate.sh                 # everything, transcript to gate.log
 ./run_gate.sh --quick         # reuse the existing witness dump (skip the cargo build)
 ```
 
@@ -361,15 +361,15 @@ root by marker (a workspace `Cargo.toml` next to `prover/`), not by a hard-coded
 Individual stages, in the order the board depends on them:
 
 ```bash
-cd gate   && python audit_transcription.py   # A5 — premises still true of the code?
-cd oracle && python test_oracle.py           # the function anchor
-cd oracle && python small_y_point.py         # builds the y = 1 attack instance
-cd harness && cargo run --release -- > ../gate/logs/real_witnesses.jsonl
-cd gate   && python a6_real_witness.py       # the column anchor
-cd gate   && python a1_selector.py           # A1
-cd gate   && python a2_yr_lt_p.py            # A2
-cd gate   && python a3_parity_binding.py     # A3
-cd gate   && python a4_addressing.py         # A4
+python audit_transcription.py                # A5 — premises still true of the code?
+python test_oracle.py                        # the function anchor
+python small_y_point.py                      # builds the y = 1 attack instance
+cargo run --release -- > real_witnesses.jsonl
+python a6_real_witness.py                    # the column anchor
+python a1_selector.py                        # A1
+python a2_yr_lt_p.py                         # A2
+python a3_parity_binding.py                  # A3
+python a4_addressing.py                      # A4
 ```
 
 Total runtime is a few seconds plus the `cargo build` (the harness depends only on

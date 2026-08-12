@@ -3,8 +3,8 @@
 .venv/
 
 # Rust harness build output
-harness/target/
-harness/Cargo.lock
+target/
+Cargo.lock
 
 __pycache__/
 *.pyc

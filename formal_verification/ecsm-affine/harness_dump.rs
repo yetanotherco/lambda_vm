@@ -2,7 +2,7 @@
 //! z3 gate's transcribed model can be evaluated on them.
 //!
 //! This is the cross-language half of the faithfulness anchor. The Python oracle
-//! (`../oracle/ecsm_affine_ref.py`) is an independent reimplementation, which establishes
+//! (`ecsm_affine_ref.py`) is an independent reimplementation, which establishes
 //! that the gate is reasoning about the right FUNCTION. This harness establishes that it is
 //! reasoning about the right COLUMNS: every witness field the model reads is emitted here by
 //! `ecsm::compute_witness_with_y` / `compute_witness`, so a column the model mis-transcribed
@@ -13,9 +13,9 @@
 //!
 //! Build and run (from this directory):
 //!
-//!     cargo run --release -- > ../gate/logs/real_witnesses.jsonl
+//!     cargo run --release -- > real_witnesses.jsonl
 //!
-//! Then: `python ../gate/a6_real_witness.py`
+//! Then: `python a6_real_witness.py`
 
 use ecsm::{compute_witness, compute_witness_with_y};
 use num_bigint::BigUint;
@@ -125,7 +125,7 @@ fn main() {
         emit(&label, "affine/-y", &k, &gx, Some(&gy_neg));
     }
 
-    // The y = 1 point from ../oracle/small_y_point.py, reached as 2·(2^-1·Q), so the honest
+    // The y = 1 point from small_y_point.py, reached as 2·(2^-1·Q), so the honest
     // y_r sits at the very bottom of the non-canonical band and y_r_sub_p is at its extreme.
     let small_xg =
         le32_from_be_hex("F2E13FD883D5F5138E1658A6022391495DF397ACB9A83E861F6BF5181D6C4DBC");

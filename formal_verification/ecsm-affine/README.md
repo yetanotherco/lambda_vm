@@ -32,17 +32,15 @@ today — `git ls-tree -r --name-only origin/main -- thoughts/` returns 0 files.
 force-adds back into it and argues the case in its own README, but #903 is unmerged, so that is
 one PR relitigating a merged decision rather than precedent.
 
-The file layout here is nested (`oracle/`, `gate/`, `harness/`) where #923's keccak instance is
-flat. #923's own instruction is to clone the **method**, not the filenames, and its "Mandatory
-discipline" — negative controls of two kinds, *changed* and *removed* constraints, because an
-over-constrained model hides a missing one — is satisfied here by the mutation-tested audit
-premises and the drop-the-constraint controls (A1e, A1f, A2g, A3d). At 28 files against
-keccak's 9, subdirectories earn their keep, and the LOC tooling counts the whole tree either
-way.
+The file layout is flat, matching #923's keccak instance file-for-file in shape: one reference
+implementation, one anchor harness, the checker scripts, the prose, and one run transcript. Its
+"Mandatory discipline" — negative controls of two kinds, *changed* and *removed* constraints,
+because an over-constrained model hides a missing one — is satisfied here by the mutation-tested
+audit premises (changed) and the drop-the-constraint controls A1e, A1f, A2g, A3d (removed).
 
 ## Status
 
-**Board fully green.** See [`gate/RESULTS.md`](gate/RESULTS.md) for the lemma table and the
+**Board fully green.** See [`RESULTS.md`](RESULTS.md) for the lemma table and the
 soundness theorem.
 
 ```
@@ -97,42 +95,43 @@ x = 0x1fe1e5ef3fceb5c135ab7741333ce5a6e80d68167653f6b2b24bcbcfaaaff507,  y = 1
 ```
 
 so the attack instance sits at the very bottom of a `2^32 + 977`-wide band, and `crypto/ecsm`
-itself returns `y_r = 1` for it. `gate/a2_yr_lt_p.py` carries the `yR + p` / `q2 − 1` forgery
+itself returns `y_r = 1` for it. `a2_yr_lt_p.py` carries the `yR + p` / `q2 − 1` forgery
 all the way through the ECDAS `Yr` relation *and its carry window* — a forgery its windows
 reject is not a forgery.
 
-**The parity gap is instantiated, not argued.** `gate/a3_parity_binding.py` builds two
+**The parity gap is instantiated, not argued.** `a3_parity_binding.py` builds two
 complete witnesses over the same `(xG, k)` — one per root of `xG³ + b` — evaluates the entire
 in-table constraint set on each, and shows both are valid with the same `xR` and different
-`yR`. `gate/a6_real_witness.py` then reproduces the same pair 9 times straight out of
+`yR`. `a6_real_witness.py` then reproduces the same pair 9 times straight out of
 `ecsm::compute_witness_with_y`, so the gap does not depend on the model being right.
 
 ## Contents
 
-| path | what it is |
+| file | what it is |
 |---|---|
-| `oracle/ecsm_affine_ref.py` | independent secp256k1 + the two ecall semantics + the ABI predicates. No `k256`, no repo code |
-| `oracle/test_oracle.py` | 9 independent anchors; a missing fixture SKIPs only itself |
-| `oracle/small_y_point.py` | constructs the `y = 1` attack instance via cube roots mod `p` |
-| `oracle/small_y_point.json` | the instance, consumed by A2 |
-| `gate/affine_common.py` | the transcribed model of the new AIR surface, with citations |
-| `gate/a1_selector.py` | A1 — `IS_AFFINE` is a bit, dead on padding, and pinned |
-| `gate/a2_yr_lt_p.py` | A2 — `YrLtP`: lift, strict chain, width, C4-YR, the forgery |
-| `gate/a3_parity_binding.py` | A3 — the parity forgery and the read that closes it |
-| `gate/a4_addressing.py` | A4 — address bounds, the `+32…+63` span, the overlap guard |
-| `gate/a6_real_witness.py` | the real-witness (column) anchor |
-| `gate/audit_transcription.py` | A5 — 20 premises read from source + mutation controls |
-| `gate/RESULTS.md` | lemma board, soundness theorem, contracts, findings, method notes |
-| `gate/TRANSCRIPTION-AUDIT.md` | the audit's prose half: premise table and what it cannot see |
-| `gate/logs/` | run logs, and the real-witness dump |
-| `harness/` | tiny Rust binary dumping real `EcsmWitness` values as JSON |
+| `ecsm_affine_ref.py` | independent secp256k1 + the two ecall semantics + the ABI predicates. No `k256`, no repo code |
+| `test_oracle.py` | 9 independent anchors; a missing fixture SKIPs only itself |
+| `small_y_point.py` | constructs the `y = 1` attack instance via cube roots mod `p` |
+| `small_y_point.json` | the instance, consumed by A2 |
+| `affine_common.py` | the transcribed model of the new AIR surface, with citations |
+| `a1_selector.py` | A1 — `IS_AFFINE` is a bit, dead on padding, pinned, and load-bearing |
+| `a2_yr_lt_p.py` | A2 — `YrLtP`: lift, strict chain, width, C4-YR, the forgery |
+| `a3_parity_binding.py` | A3 — the parity forgery, the read that closes it, and the `yG` canonicality gap |
+| `a4_addressing.py` | A4 — address bounds, the `+32…+63` span, the overlap guard |
+| `a6_real_witness.py` | the real-witness (column) anchor |
+| `audit_transcription.py` | A5 — 20 premises read from source + mutation controls |
+| `RESULTS.md` | lemma board, soundness theorem, contracts, findings, method notes |
+| `TRANSCRIPTION-AUDIT.md` | the audit's prose half: premise table and what it cannot see |
+| `harness_dump.rs` + `Cargo.toml` | tiny standalone Rust bin dumping real `EcsmWitness` values as JSON |
+| `real_witnesses.jsonl` | its output, consumed by A6 |
+| `gate.log` | the full run transcript |
 | `run_gate.sh` | runs everything in dependency order |
 
 ## Running it
 
 ```bash
 python3 -m venv .venv && ./.venv/bin/pip install z3-solver sympy ecdsa
-./run_gate.sh                 # everything, logs to gate/logs/
+./run_gate.sh                 # everything, transcript to gate.log
 ./run_gate.sh --quick         # reuse the witness dump, skip the cargo build
 ```
 
@@ -143,7 +142,7 @@ back to `python3` from `PATH`.
 Committing is a plain `git add formal_verification/ecsm-affine` — no `-f`, no pathspecs. That
 is the practical reason this directory is not under `thoughts/`: `-f` would be required
 there, and **`-f` overrides the nested `.gitignore` too**, so it stages `.venv/` and
-`harness/target/` as well (5108 files instead of 28). Outside an ignored parent, the nested
+`target/` as well (5108 files instead of 28). Outside an ignored parent, the nested
 `.gitignore` below does its job:
 
 ```

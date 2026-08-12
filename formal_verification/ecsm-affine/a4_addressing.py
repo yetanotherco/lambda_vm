@@ -32,7 +32,6 @@ from pathlib import Path
 import z3
 
 sys.path.insert(0, str(Path(__file__).parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "oracle"))
 from affine_common import (  # noqa: E402
     ADDR_LIMB_BOUND_32B,
     ADDR_LIMB_BOUND_64B,

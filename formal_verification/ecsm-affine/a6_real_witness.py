@@ -20,9 +20,9 @@ the same `x_r` and different `y_r`. Nothing in `crypto/ecsm` objects, and nothin
 arithmetic objects either (A3b) — which is exactly why the `IS_AFFINE`-gated `yG` read has to
 exist.
 
-Input: `logs/real_witnesses.jsonl`, produced by
+Input: `real_witnesses.jsonl`, produced by
 
-    cd ../harness && cargo run --release -- > ../gate/logs/real_witnesses.jsonl
+    cargo run --release -- > real_witnesses.jsonl
 
 Run: `python a6_real_witness.py`
 """
@@ -32,7 +32,6 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "oracle"))
 from affine_common import (  # noqa: E402
     CARRY_OFFSET_X2,
     CARRY_OFFSET_YG,
@@ -47,7 +46,7 @@ from affine_common import (  # noqa: E402
 )
 from ecsm_affine_ref import affine_mul, is_on_curve, recover_y_canonical, x_only_mul  # noqa: E402
 
-WITNESSES = Path(__file__).parent / "logs" / "real_witnesses.jsonl"
+WITNESSES = Path(__file__).parent / "real_witnesses.jsonl"
 results = []
 
 
@@ -257,7 +256,7 @@ def main():
     if rows is None:
         report("A6 real-witness anchor", "SKIP",
                f"{WITNESSES.relative_to(Path(__file__).parent)} not found — run "
-               "`cd ../harness && cargo run --release -- > ../gate/logs/real_witnesses.jsonl`")
+               "`cargo run --release -- > real_witnesses.jsonl`")
         print("\nA6 SKIPPED: the anchor is NOT established without the harness dump.")
         return 0
 

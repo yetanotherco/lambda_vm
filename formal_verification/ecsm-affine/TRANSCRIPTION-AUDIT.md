@@ -1,7 +1,7 @@
 # Transcription audit — does the gate's model match the code it models?
 
-Executable half: [`audit_transcription.py`](audit_transcription.py). Log:
-[`logs/audit_transcription.log`](logs/audit_transcription.log).
+Executable half: [`audit_transcription.py`](audit_transcription.py). Output is in the run
+transcript [`gate.log`](gate.log).
 
 ## Why this file exists
 

@@ -41,7 +41,6 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "oracle"))
 from affine_common import (  # noqa: E402
     AFFINE_YG_READ_OFFSETS,
     CARRY_OFFSET_X2,
@@ -372,8 +371,7 @@ def a3g_yg_canonicality():
     Paired, both directions:
       * the gap is REAL — no constraint bounds `yG` below `p`;
       * the consequence is BENIGN — the reduced point, hence the output, is unchanged."""
-    small = json.loads((Path(__file__).resolve().parents[1] / "oracle"
-                        / "small_y_point.json").read_text())
+    small = json.loads((Path(__file__).parent / "small_y_point.json").read_text())
     x = int(small["small_y_point"]["x"], 16)
     y = int(small["small_y_point"]["y"], 16)
 
