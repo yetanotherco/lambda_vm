@@ -75,10 +75,8 @@ fn gpu_lde_threshold() -> usize {
 /// `LAMBDA_VM_GPU_SERIALIZE_R2=0` disables the lock (e.g. to bisect or once
 /// the underlying race is fixed).
 pub(crate) fn r2_serialize_guard() -> Option<std::sync::MutexGuard<'static, ()>> {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    if *ENABLED.get_or_init(|| !std::env::var("LAMBDA_VM_GPU_SERIALIZE_R2").is_ok_and(|v| v == "0"))
-    {
+    if std::env::var("LAMBDA_VM_GPU_SERIALIZE_R2").as_deref() != Ok("0") {
         // The guarded state is (), so a panic while holding the lock carries
         // no information — recover instead of burying the original panic
         // under a cascade of PoisonErrors from every other table.
