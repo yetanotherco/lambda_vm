@@ -103,7 +103,9 @@ Supporting other curves only requires assigning them a unique `id`.#footnote([No
 
 #attention("Only " + `secp256k1` + " is instantiated.")[
   The constraints below are written generically in $a$, $b$, $p$ and $N$, but only $#`id` = 0$ has ever been instantiated, and that curve has $a = 0$.
-  The $y_G$ relation carries a single $p^2$ offset (@ec:c:c1_0, @ec:c:c1_i), which is enough to keep $q_1$ non-negative only while $a dot x_G$ is small.
+  The $y_G$ relation as constrained carries a single $p^2$ offset (@ec:c:c1_0, @ec:c:c1_i), which is enough to keep $q_1$ non-negative only while $a dot x_G$ is small.
+  Note that this disagrees with how the relation is written below, which states an offset of $2p^2$ and a bound $q_1 in [0, 3p)$: the constraints are authoritative, and their single $p^2$ is what makes `q1`'s declared width sufficient, since $q_1 < 2p < 2^257 < 3p$.
+  Reconciling the two --- either by correcting the exposition or by widening the constraint to $2p^2$ and `q1` with it --- is left as separate work, since only the latter changes the chip.
   For a curve with large $a$ --- `secp256r1` has $a = p - 3$ --- the offset is insufficient, and the more so on the affine variant, where @ec:c:read_yG pins $y_G$ and so removes the prover's freedom to pick whichever root gives a representable quotient.
   Instantiating $#`id` = 1$ therefore requires widening the offset _and_ `q1`'s top limb; the ECALL-numbers $-13$ and $-14$ are reserved, not usable.
 ]
