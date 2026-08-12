@@ -117,6 +117,7 @@ pub fn reset_all_gpu_call_counters() {
     GPU_DEVICE_ONLY_DOWNGRADES.store(0, Ordering::Relaxed);
     GPU_RESIDENT_AUX_RETRIES.store(0, Ordering::Relaxed);
     GPU_RESIDENT_AUX_DOWNGRADES.store(0, Ordering::Relaxed);
+    GPU_COMPOSITION_PARTS_DOWNLOADS.store(0, Ordering::Relaxed);
 }
 
 pub(crate) static GPU_EXTEND_HALVES_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -1464,16 +1465,17 @@ pub fn gpu_fri_calls() -> u64 {
 /// are counted here, so a single failed dispatch does not necessarily lower
 /// the total; R3's fallbacks are CPU-only, so a failure there does.
 pub(crate) static GPU_BATCH_INVERT_CALLS: AtomicU64 = AtomicU64::new(0);
-/// R2 downgrades, and only those: times a device-only table fell back to the
-/// host evaluator and had its resident LDEs downloaded into the host buffers
-/// first ([`materialize_lde_trace_host`], the sole site that bumps this).
-/// Nonzero means the device-only gate cleared a table whose R2 dispatch then
-/// declined at runtime — the table continued host-backed, correct but slower —
-/// so every count is a gate miss, and the fix is to mirror the missing
-/// condition into the gate. The R1 resident-aux downgrade is counted by
-/// [`GPU_RESIDENT_AUX_DOWNGRADES`] instead: it fires on tables the gate never
-/// marked device-only, so summing the two would blame the gate for declines it
-/// never made.
+/// Device-only trace downgrades: times a device-only table fell back to a
+/// host arm and had its resident LDEs downloaded into the host buffers first
+/// ([`materialize_lde_trace_host`], the sole function that bumps this —
+/// entered from the R2 host evaluator, the R3 barycentric arms and the R4
+/// DEEP host loop). Nonzero means the device-only gate cleared a table whose
+/// downstream dispatch then declined at runtime — the table continued
+/// host-backed, correct but slower — so every count is a gate miss, and the
+/// fix is to mirror the missing condition into the gate. The R1 resident-aux
+/// downgrade is counted by [`GPU_RESIDENT_AUX_DOWNGRADES`] instead: it fires
+/// on tables the gate never marked device-only, so summing the two would
+/// blame the gate for declines it never made.
 pub(crate) static GPU_DEVICE_ONLY_DOWNGRADES: AtomicU64 = AtomicU64::new(0);
 pub fn gpu_device_only_downgrades() -> u64 {
     GPU_DEVICE_ONLY_DOWNGRADES.load(Ordering::Relaxed)
@@ -1491,6 +1493,18 @@ pub fn gpu_device_only_downgrades() -> u64 {
 pub(crate) static GPU_RESIDENT_AUX_DOWNGRADES: AtomicU64 = AtomicU64::new(0);
 pub fn gpu_resident_aux_downgrades() -> u64 {
     GPU_RESIDENT_AUX_DOWNGRADES.load(Ordering::Relaxed)
+}
+
+/// Times the composition-poly parts of a device-only table were downloaded
+/// from the resident R2 handle so a host consumer could run
+/// ([`download_composition_parts_host`], the sole site that bumps this). The
+/// parts-side counterpart of [`GPU_DEVICE_ONLY_DOWNGRADES`]: that one covers
+/// the trace LDEs, this one the H part evaluations whose R2 host drain was
+/// skipped, when the R2 commit, the R3 parts OOD or the R4 DEEP H terms later
+/// fall back to the host path.
+pub(crate) static GPU_COMPOSITION_PARTS_DOWNLOADS: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_composition_parts_downloads() -> u64 {
+    GPU_COMPOSITION_PARTS_DOWNLOADS.load(Ordering::Relaxed)
 }
 
 /// Times the R1 resident-aux LDE declined and the prover drained the device to
@@ -1725,6 +1739,82 @@ where
     true
 }
 
+/// Parts counterpart of [`materialize_lde_trace_host`]: download the resident
+/// composition-poly parts (de-interleaved ext3 slabs, natural evaluation
+/// order) into per-part host Vecs. Serves the host consumers of the part
+/// evaluations — the R2 Merkle commit, the R3 parts OOD and the R4 DEEP H
+/// terms — when a device dispatch declines on a table whose R2 host drain was
+/// skipped (device-only). Returns `None` when the handle cannot serve the
+/// data: a non-ext3 field, a failed download or sync.
+pub(crate) fn download_composition_parts_host<E>(
+    h: &math_cuda::lde::GpuLdeExt3,
+    stream: &Arc<math_cuda::CudaStream>,
+) -> Option<Vec<Vec<FieldElement<E>>>>
+where
+    E: IsField + 'static,
+{
+    if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
+        return None;
+    }
+    h.wait_ready_on(stream).ok()?;
+    let slabs = stream.clone_dtoh(h.buf.as_ref()).ok()?;
+    stream.synchronize().ok()?;
+    let (m, lde) = (h.m, h.lde_size);
+    if slabs.len() != m * lde * 3 {
+        return None;
+    }
+    let parts = (0..m)
+        .map(|p| {
+            let mut interleaved = vec![0u64; lde * 3];
+            for k in 0..3 {
+                let slab = &slabs[(p * 3 + k) * lde..(p * 3 + k + 1) * lde];
+                for (r, v) in slab.iter().enumerate() {
+                    interleaved[r * 3 + k] = *v;
+                }
+            }
+            u64_to_ext3_vec::<E>(&interleaved)
+        })
+        .collect();
+    GPU_COMPOSITION_PARTS_DOWNLOADS.fetch_add(1, Ordering::Relaxed);
+    Some(parts)
+}
+
+/// Repopulate empty host part evaluations from the resident R2 parts handle
+/// held by `lde_trace`. Already-populated evaluations are left untouched (the
+/// R2 host drain ran, nothing is missing). Returns false only when the parts
+/// are empty and the handle cannot serve them — a missing handle or bound
+/// stream, a handle whose part count disagrees with the evaluations, or a
+/// failed download — so the caller's abort carries the device-only contract's
+/// message.
+pub(crate) fn materialize_composition_parts_host<F, E>(
+    lde_trace: &crate::trace::LDETraceTable<F, E>,
+    evals: &mut [Vec<FieldElement<E>>],
+) -> bool
+where
+    F: IsField + IsSubFieldOf<E> + 'static,
+    E: IsField + 'static,
+{
+    if evals.first().is_none_or(|p| !p.is_empty()) {
+        return true;
+    }
+    let Some(h) = lde_trace.gpu_composition_parts() else {
+        return false;
+    };
+    let Some(stream) = lde_trace.bound_stream() else {
+        return false;
+    };
+    if h.m != evals.len() {
+        return false;
+    }
+    let Some(parts) = download_composition_parts_host::<E>(h, &stream) else {
+        return false;
+    };
+    for (dst, src) in evals.iter_mut().zip(parts) {
+        *dst = src;
+    }
+    true
+}
+
 pub fn gpu_batch_invert_calls() -> u64 {
     GPU_BATCH_INVERT_CALLS.load(Ordering::Relaxed)
 }
@@ -1762,6 +1852,49 @@ pub fn fri_fold_fault_fired() -> bool {
 #[cfg(feature = "test-cuda-faults")]
 pub fn inverse_fault_fired() -> bool {
     math_cuda::inverse::FAULT_INVERSE_REMAINING_UNTIL_ERR.load(Ordering::Relaxed) < 0
+}
+
+/// Test-only: make the Nth upcoming math-cuda barycentric dispatch — and
+/// every one after it — return Err. Sticky, unlike the one-shot hooks above:
+/// the retry arms would absorb a single-shot fault before the fall-through
+/// could reach a device-only cliff site. Pass -1 to disarm (the production
+/// state). Only available with the `test-cuda-faults` feature.
+#[cfg(feature = "test-cuda-faults")]
+pub fn schedule_barycentric_fault_sticky(n_calls_until_err: i64) {
+    math_cuda::faults::FAULT_BARYCENTRIC_STICKY.store(n_calls_until_err, Ordering::Relaxed);
+}
+
+/// Test-only: whether the sticky barycentric fault reached its firing point
+/// (the countdown parks at 0 once it fires and stays there until disarmed).
+#[cfg(feature = "test-cuda-faults")]
+pub fn barycentric_fault_fired() -> bool {
+    math_cuda::faults::FAULT_BARYCENTRIC_STICKY.load(Ordering::Relaxed) == 0
+}
+
+/// Sticky counterpart of [`schedule_barycentric_fault_sticky`] for the R4
+/// DEEP composition dispatches (`deep_composition_ext3*`).
+#[cfg(feature = "test-cuda-faults")]
+pub fn schedule_deep_fault_sticky(n_calls_until_err: i64) {
+    math_cuda::faults::FAULT_DEEP_STICKY.store(n_calls_until_err, Ordering::Relaxed);
+}
+
+/// Test-only counterpart of [`barycentric_fault_fired`] for the DEEP hook.
+#[cfg(feature = "test-cuda-faults")]
+pub fn deep_fault_fired() -> bool {
+    math_cuda::faults::FAULT_DEEP_STICKY.load(Ordering::Relaxed) == 0
+}
+
+/// Sticky counterpart of [`schedule_barycentric_fault_sticky`] for the R2
+/// comp-poly tree builds (`build_comp_poly_tree_from_*`).
+#[cfg(feature = "test-cuda-faults")]
+pub fn schedule_comp_tree_fault_sticky(n_calls_until_err: i64) {
+    math_cuda::faults::FAULT_COMP_TREE_STICKY.store(n_calls_until_err, Ordering::Relaxed);
+}
+
+/// Test-only counterpart of [`barycentric_fault_fired`] for the comp-tree hook.
+#[cfg(feature = "test-cuda-faults")]
+pub fn comp_tree_fault_fired() -> bool {
+    math_cuda::faults::FAULT_COMP_TREE_STICKY.load(Ordering::Relaxed) == 0
 }
 
 /// R2 GPU dispatch: batched ext3 LDE over `parts_coefs` (composition-poly
