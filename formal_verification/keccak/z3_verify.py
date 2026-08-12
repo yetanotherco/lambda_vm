@@ -26,7 +26,7 @@ Contracts assumed (assume-guarantee):
 """
 import sys
 from z3 import (
-    BitVec, BitVecVal, Concat, Extract, LShR, RotateLeft, ZeroExt, Or, And,
+    BitVec, BitVecVal, Concat, Extract, LShR, RotateLeft, ULE, ZeroExt, Or, And,
     Solver, sat, unsat,
 )
 from keccak_ref import RHO, RC
@@ -51,9 +51,9 @@ def pi_src(X, Y, z):                   # rs:161-174
 # --------------------------------------------------------------------------
 # Independent z3-native reference round (FIPS-202, 64-bit lanes)
 # --------------------------------------------------------------------------
-def zref_round(lanes, rc_val, bug=None):
-    # lanes[x][y] : 64-bit BV.  Reference is ALWAYS correct (bug only perturbs
-    # the circuit model, never this).
+def zref_round(lanes, rc_val):
+    # lanes[x][y] : 64-bit BV.  The reference is ALWAYS correct — the `bug=`
+    # injections in build_circuit perturb the circuit model only, never this.
     C = [lanes[x][0] ^ lanes[x][1] ^ lanes[x][2] ^ lanes[x][3] ^ lanes[x][4]
          for x in range(5)]
     D = [C[(x + 4) % 5] ^ RotateLeft(C[(x + 1) % 5], 1) for x in range(5)]
@@ -100,7 +100,14 @@ def build_circuit(round_idx, tag, bug=None):
 
     def byte_op_operand(field_expr16):
         # ByteAlu operand contract: field value must be a byte.
-        C.append(field_expr16 <= BitVecVal(255, 16))
+        # MUST be ULE, not `<=`: z3py's comparison operators on bitvectors are
+        # SIGNED (SLE), so `expr <= 255` would also admit every value with the
+        # sign bit set (e.g. 0xFFFF passes at width 16). That is the fail-open
+        # direction — an out-of-range operand accepted as a byte turns a real
+        # SAT into a bogus UNSAT. Harmless at the widths used here (the operands
+        # are sums of two zero-extended bytes, ≤ 510), which is exactly why it
+        # must be written correctly for the next chip that copies this contract.
+        C.append(ULE(field_expr16, BitVecVal(255, 16)))
         return Extract(7, 0, field_expr16)
 
     # === theta: Cxz XOR chain === rs:539-588
@@ -242,11 +249,8 @@ def positive_control(round_idx, seed):
     if s.check() != sat:
         return False, "constraint system UNSAT for a concrete input (VACUOUS!)"
     m = s.model()
-    # reference from concrete input
+    # reference from concrete input, indexed x + 5y
     from keccak_ref import keccak_round
-    in_lanes = [sum(concrete[(x, y, b)] << (8 * b) for b in range(8))
-                for y in range(5) for x in range(5)]
-    # in_lanes indexed x+5y:
     in_lanes = [0] * 25
     for x in range(5):
         for y in range(5):

@@ -2,7 +2,6 @@
 positive control concurrently, print each result as it lands."""
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from z3 import sat, unsat
 from z3_verify import check_round, positive_control
 
 BUGS = ["theta_no_rot", "rho_swap", "chi_no_not", "chi_swap", "iota_no_rc"]
@@ -22,7 +21,6 @@ def w_pos():
 
 
 def main():
-    tasks = []
     with ProcessPoolExecutor(max_workers=10) as ex:
         futs = []
         futs.append(ex.submit(w_pos))
@@ -38,7 +36,6 @@ def main():
             print(f"DONE {kind} {key} -> {val}", flush=True)
 
     print("\n================ SUMMARY ================", flush=True)
-    pos = results[("pos", True)] if ("pos", True) in results else results.get(("pos", False))
     # positive control stored under actual ok value; find it
     pos_ok = ("pos", True) in results
     pos_msg = results.get(("pos", True)) or results.get(("pos", False))

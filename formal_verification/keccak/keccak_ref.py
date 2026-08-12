@@ -44,8 +44,7 @@ def _rc_bit(t):
     t %= 255
     if t == 0:
         return 1
-    R = 0b10000000  # register holding r0..r7, r0 = MSB per our shifting below
-    # Use the standard byte-register formulation.
+    # Standard byte-register formulation: r0 in the low bit.
     R = 0x01
     for _ in range(t):
         R <<= 1
