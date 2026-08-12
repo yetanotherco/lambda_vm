@@ -99,7 +99,7 @@ Here follows the present `id` mapping:
   "0",  `secp256k1`,
   "1",  `secp256r1`,
 )]
-Supporting other curves only requires assigning them a unique `id`.#footnote([Note that adding a curve does require `id`'s type to be updated as well, since its current type (`Bit`) is now saturated. Since each curve now claims _two_ ECALL-numbers (see below), it also consumes the reserved range twice as fast: $#`id` = 4$ would collide with `FEXT_LOAD` at $-20$.])
+Supporting other curves only requires assigning them a unique `id`.#footnote([Note that adding a curve does require `id`'s type to be updated as well, since its current type (`Bit`) is now saturated. Since each curve now claims _two_ ECALL-numbers (see below), it also consumes the reserved range twice as fast: the affine variant of $#`id` = 4$ would land on $-20$, which is `FEXT_LOAD`.])
 
 #attention("Only " + `secp256k1` + " is instantiated.")[
   The constraints below are written generically in $a$, $b$, $p$ and $N$, but only $#`id` = 0$ has ever been instantiated, and that curve has $a = 0$.
@@ -132,7 +132,8 @@ On the affine variant, the two point buffers are 64 bytes wide rather than 32: $
 No additional registers are consumed.
 
 Widening the buffers widens the caller's obligations, and neither is enforced by this chip.
-The buffers must not overlap the scalar, since $x_G ‖ y_G$ is read at `timestamp` and $k$ at $#`timestamp` + 1$, and the memory argument cannot serve one address twice in one cycle.
+The point buffers must not overlap the scalar.
+This is a provability requirement rather than a soundness one: each operand is decomposed into doublewords at fixed offsets from its own base, so an overlap simply has no representation in the trace, and the `ECALL` rejects it by testing the two byte ranges directly.
 An operand's address must also stay clear of a $2^32$ boundary --- by 64 bytes for the two point buffers and 32 for $k$ --- because the implementation adds each per-access offset to the low half of the address alone and cannot carry into the high half.
 The constraints below abstract over that: they derive every address with a full 64-bit `ADD` (@ec:c:extrapolate_addr_yG, @ec:c:extrapolate_addr_yR), which carries correctly and so admits addresses the `ECALL` itself rejects.
 
