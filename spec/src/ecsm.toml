@@ -24,16 +24,34 @@ type = ["DWordHL", 4]
 desc = "address to which the `x`-coordinate of result point `R` is to be written"
 pad = 0
 
+[[variables.input]]
+name = "is_affine"
+type = "Bit"
+desc = "whether the _affine_ (1) or the _`x`-only_ (0) variant of the ECALL is served"
+pad = 0
+
 [[variables.output]]
 name = "xR"
 type = "U256BL"
 desc = "$(#`k` times #`G`)_x$"
 pad = 0
 
-[[variables.auxiliary]]
+[[variables.output]]
 name = "yR"
 type = "U256BL"
-desc = "$(#`k` times #`G`)_y$"
+desc = "$(#`k` times #`G`)_y$; only written to memory when $#`is_affine` = 1$"
+pad = 0
+
+[[variables.auxiliary]]
+name = "addr_yG"
+type = ["DWordHL", 4]
+desc = "address at which the `y`-coordinate of start point `G` is stored"
+pad = 0
+
+[[variables.auxiliary]]
+name = "addr_yR"
+type = ["DWordHL", 4]
+desc = "address to which the `y`-coordinate of result point `R` is to be written"
 pad = 0
 
 [[variables.auxiliary]]
@@ -57,7 +75,7 @@ pad = 0
 [[variables.auxiliary]]
 name = "yG"
 type = "U256BL"
-desc = "$y_G$"
+desc = "$y_G$; read from memory when $#`is_affine` = 1$, a free witness otherwise"
 pad = 0
 
 [[variables.auxiliary]]
@@ -108,6 +126,12 @@ type = "U256HL"
 desc = "$x_R - #`p` mod 2^256$"
 pad = 0
 
+[[variables.auxiliary]]
+name = "yR_sub_p"
+type = "U256HL"
+desc = "$y_R - #`p` mod 2^256$"
+pad = 0
+
 [[variables.virtual]]
 name = "byte_k"
 type = "U256BL"
@@ -141,6 +165,15 @@ desc = "carries for computing $#`p` + #`xR_sub_p`$"
 def = {polys=[
     {iter=["i", 0], poly=["*", ["^", 2, -32], ["-", ["+", ["idx", ["cast", "p", "U256WL"], "i"], ["idx", ["cast", "xR_sub_p", "U256WL"], "i"]], ["idx", ["cast", "xR", "U256WL"], "i"]]]},
     {iter=["i", 1, 7], poly=["*", ["^", 2, -32], ["-", ["+", ["idx", ["cast", "p", "U256WL"], "i"], ["idx", ["cast", "xR_sub_p", "U256WL"], "i"], ["idx", "c4", ["-", "i", 1]]], ["idx", ["cast", "xR", "U256WL"], "i"]]]},
+]}
+
+[[variables.virtual]]
+name = "c5"
+type = ["Bit", 8]
+desc = "carries for computing $#`p` + #`yR_sub_p`$"
+def = {polys=[
+    {iter=["i", 0], poly=["*", ["^", 2, -32], ["-", ["+", ["idx", ["cast", "p", "U256WL"], "i"], ["idx", ["cast", "yR_sub_p", "U256WL"], "i"]], ["idx", ["cast", "yR", "U256WL"], "i"]]]},
+    {iter=["i", 1, 7], poly=["*", ["^", 2, -32], ["-", ["+", ["idx", ["cast", "p", "U256WL"], "i"], ["idx", ["cast", "yR_sub_p", "U256WL"], "i"], ["idx", "c5", ["-", "i", 1]]], ["idx", ["cast", "yR", "U256WL"], "i"]]]},
 ]}
 
 [[variables.virtual]]
@@ -313,6 +346,61 @@ output = ["arr",
 iter = ["i", 0, 3]
 multiplicity = "μ"
 ref = "ec:c:read_xG"
+
+# Load yG from memory (affine variant only)
+
+[[constraint_groups]]
+name = "read_yG"
+
+[[constraints.read_yG]]
+kind = "template"
+tag = "ADD"
+input = [["cast", ["idx", "addr_xG", 0], "DWordWL"], ["cast", ["+", 32, ["*", 8, "i"]], "DWordWL"]]
+output = ["cast", ["idx", "addr_yG", "i"], "DWordWL"]
+iter = ["i", 0, 3]
+cond = "is_affine"
+ref = "ec:c:extrapolate_addr_yG"
+
+[[constraints.read_yG]]
+kind = "interaction"
+tag = "IS_HALF"
+input = [["idx", ["idx", "addr_yG", "i"], "j"]]
+iters = [["i", 0, 3], ["j", 0, 3]]
+multiplicity = "is_affine"
+ref = "ec:c:range_addr_yG"
+
+[[constraints.read_yG]]
+kind = "interaction"
+tag = "MEMW"
+input = [
+    0,
+    ["cast", ["idx", "addr_yG", "i"], "DWordWL"],
+    ["arr",
+        ["idx", "yG", ["+", ["*", 8, "i"], 0]],
+        ["idx", "yG", ["+", ["*", 8, "i"], 1]],
+        ["idx", "yG", ["+", ["*", 8, "i"], 2]],
+        ["idx", "yG", ["+", ["*", 8, "i"], 3]],
+        ["idx", "yG", ["+", ["*", 8, "i"], 4]],
+        ["idx", "yG", ["+", ["*", 8, "i"], 5]],
+        ["idx", "yG", ["+", ["*", 8, "i"], 6]],
+        ["idx", "yG", ["+", ["*", 8, "i"], 7]],
+    ],
+    "timestamp",
+    0, 0, 1
+]
+output = ["arr",
+    ["idx", "yG", ["+", ["*", 8, "i"], 0]],
+    ["idx", "yG", ["+", ["*", 8, "i"], 1]],
+    ["idx", "yG", ["+", ["*", 8, "i"], 2]],
+    ["idx", "yG", ["+", ["*", 8, "i"], 3]],
+    ["idx", "yG", ["+", ["*", 8, "i"], 4]],
+    ["idx", "yG", ["+", ["*", 8, "i"], 5]],
+    ["idx", "yG", ["+", ["*", 8, "i"], 6]],
+    ["idx", "yG", ["+", ["*", 8, "i"], 7]],
+]
+iter = ["i", 0, 3]
+multiplicity = "is_affine"
+ref = "ec:c:read_yG"
 
 # Range check xG
 
@@ -632,6 +720,33 @@ constraint = "$#`μ` => #`c4`_7 = 1$"
 poly = ["*", "μ", ["not", ["idx", "c4", 7]]]
 ref = "ec:c:xR_addition_overflows"
 
+# Range check yR
+
+[[constraint_groups]]
+name = "range_yR"
+
+[[constraints.range_yR]]
+kind = "interaction"
+tag = "IS_HALF"
+input = [["idx", "yR_sub_p", "i"]]
+iter = ["i", 0, 15]
+multiplicity = "μ"
+ref = "ec:c:range_yR_sub_p"
+
+[[constraints.range_yR]]
+kind = "template"
+tag = "IS_BIT"
+input = [["idx", "c5", "i"]]
+iter = ["i", 0, 6]
+cond = "μ"
+ref = "ec:c:range_c5"
+
+[[constraints.range_yR]]
+kind = "arith"
+constraint = "$#`μ` => #`c5`_7 = 1$"
+poly = ["*", "μ", ["not", ["idx", "c5", 7]]]
+ref = "ec:c:yR_addition_overflows"
+
 
 # Write R to memory
 
@@ -686,6 +801,51 @@ iter = ["i", 0, 3]
 multiplicity = "μ"
 ref = "ec:c:write_xR"
 
+# Write yR to memory (affine variant only)
+
+[[constraint_groups]]
+name = "write_yR"
+
+[[constraints.write_yR]]
+kind = "template"
+tag = "ADD"
+input = [["cast", ["idx", "addr_xR", 0], "DWordWL"], ["cast", ["+", 32, ["*", 8, "i"]], "DWordWL"]]
+output = ["cast", ["idx", "addr_yR", "i"], "DWordWL"]
+iter = ["i", 0, 3]
+cond = "is_affine"
+ref = "ec:c:extrapolate_addr_yR"
+
+[[constraints.write_yR]]
+kind = "interaction"
+tag = "IS_HALF"
+input = [["idx", ["idx", "addr_yR", "i"], "j"]]
+iters = [["i", 0, 3], ["j", 0, 3]]
+multiplicity = "is_affine"
+ref = "ec:c:range_addr_yR"
+
+[[constraints.write_yR]]
+kind = "interaction"
+tag = "MEMW"
+input = [
+    0,
+    ["cast", ["idx", "addr_yR", "i"], "DWordWL"],
+    ["arr",
+        ["idx", "yR", ["+", ["*", 8, "i"], 0]],
+        ["idx", "yR", ["+", ["*", 8, "i"], 1]],
+        ["idx", "yR", ["+", ["*", 8, "i"], 2]],
+        ["idx", "yR", ["+", ["*", 8, "i"], 3]],
+        ["idx", "yR", ["+", ["*", 8, "i"], 4]],
+        ["idx", "yR", ["+", ["*", 8, "i"], 5]],
+        ["idx", "yR", ["+", ["*", 8, "i"], 6]],
+        ["idx", "yR", ["+", ["*", 8, "i"], 7]],
+    ],
+    ["+", "timestamp", 3],
+    0, 0, 1
+]
+iter = ["i", 0, 3]
+multiplicity = "is_affine"
+ref = "ec:c:write_yR"
+
 
 [[constraint_groups]]
 name = "ecall"
@@ -697,10 +857,23 @@ input = ["μ"]
 ref = "ec:c:mu_isbit"
 
 [[constraints.ecall]]
+kind = "template"
+tag = "IS_BIT"
+input = ["is_affine"]
+ref = "ec:c:is_affine_isbit"
+
+[[constraints.ecall]]
+kind = "arith"
+constraint = "$#`is_affine` != 0 => #`μ` != 0$"
+poly = ["*", "is_affine", ["not", "μ"]]
+ref = "ec:c:is_affine_implies_mu"
+
+[[constraints.ecall]]
 kind = "interaction"
 tag = "ECALL"
-input = ["timestamp", ["arr", ["-", ["^", 2, 32], 11, "id"], ["-", ["^", 2, 32], 1]]]
+input = ["timestamp", ["arr", ["-", ["^", 2, 32], 11, ["*", 2, "id"], "is_affine"], ["-", ["^", 2, 32], 1]]]
 multiplicity = ["-", "μ"]
+ref = "ec:c:receive_ecall"
 
 [[constraint_groups]]
 name = "delegate"
