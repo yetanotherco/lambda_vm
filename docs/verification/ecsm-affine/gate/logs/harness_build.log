@@ -1,1 +1,3 @@
-    Finished `release` profile [optimized] target(s) in 0.07s
+   Compiling ecsm v0.1.0 (/Users/nicole/Documents/lambda_vm_3/crypto/ecsm)
+   Compiling ecsm-affine-harness v0.1.0 (/Users/nicole/Documents/lambda_vm_3/docs/verification/ecsm-affine/harness)
+    Finished `release` profile [optimized] target(s) in 1.82s

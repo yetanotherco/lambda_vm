@@ -15,9 +15,10 @@
 [READ      ] P15 INV_SHIFT_32 [A2a]  INV_SHIFT_32 = 18446744065119617026 = 2^-32 mod p_g
 [READ(neg) ] P16 nothing constrains yG's parity [A3]  7 uses of cols::YG, all parity-blind (AreBytes range check (parity-blind), Ecdas seed/drain bus tuples (parity-blind), the Yg relation's yG² term — satisfied by BOTH roots, the affine yG MEMW read (the fix itself), trace fill)
 [READ(neg) ] P17 YR is not byte-checked in ecsm.rs [A2d]  ecsm.rs byte-checks ['Q0', 'Q1', 'X2', 'YG']; YR (and XR) are NOT among them ⇒ C4-YR is a contract, not a local emission
+[READ(neg) ] P20 no yG canonicality chain exists [A3g]  OverflowKind = ['XgLtP', 'KLtN', 'XrLtP', 'YrLtP']; no YgLtP ⇒ yG has no canonicality chain (A3g's subject). xG/xR/yR each do.
 [READ      ] P19 the complete syscall set [A1f]  4 syscalls parsed: ECSM=MAX-10, ECSM_AFFINE=MAX-11, HINT=MAX-30, KECCAK=MAX-1
 [READ      ] P18 instruction timestamp stride [A4f]  builder stride parsed as [4] (model says 4); ECSM uses ts offsets {0} ∪ [1, 2, 3], max 3 == stride−1 ⇒ ts+3 is free and nothing spills
 
-[PROVED    ] mutation testing  19 mutations applied; every premise's check fails on its mutant
+[PROVED    ] mutation testing  20 mutations applied; every premise's check fails on its mutant
 
-TRANSCRIPTION AUDIT: 19/19 premises read from source, 19 mutation controls, 0 failures
+TRANSCRIPTION AUDIT: 20/20 premises read from source, 20 mutation controls, 0 failures

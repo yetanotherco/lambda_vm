@@ -60,6 +60,7 @@ reference = `../oracle/ecsm_affine_ref.py`, a from-scratch secp256k1 implementat
 | **A3c** | the `yG` read pins `YG` bit-for-bit | PROVED | 4 dwords × 8 bytes ↔ `addr_xG + [32, 64)`, order-preserving, each column covered exactly once |
 | **A3d** | **drop the `yG` read** | **SAT — FORGES** | the two A3b witnesses become indistinguishable. The read is the **only** thing pinning input parity. **LOAD-BEARING** |
 | **A3e** | the imported **L7** conclusion survives verbatim | PROVED | `x(k·P) = x(k·(−P))` over 20 instances ⇒ x-only rows may still leave parity free |
+| **A3g** | `yG` canonicality is **UNCHECKED** | **SAT — FORGES** | no `YgLtP` in `OverflowKind`; `yG = p + 1` is a byte-representable non-canonical encoding of a real curve point (the `y = 1` instance), accepted by the AIR and rejected by the executor. Consequence BENIGN (same reduced point) ⇒ VM-parity gap, same class as A4c. **Medium** |
 | **A3f** | `YrLtP` is **not** a parity defence | PROVED | both `±yR` are canonical ⇒ two orthogonal gaps, two fixes; do not conflate them |
 | **A4a** | the `Alu` LT bound **==** the executor's `addr_limb_ok`, both modes | PROVED (z3 UNSAT ×2) | same accept set ⇒ no provable-but-halting execution, no legal execution made unprovable |
 | **A4b** | the affine `+32 + 8i` span cannot cross `2^32` | PROVED (z3 UNSAT) | 128 touched byte offsets, max `+63`, all `< 2^32` under the bound ⇒ reusing the high limb is safe |
@@ -69,7 +70,7 @@ reference = `../oracle/ecsm_affine_ref.py`, a from-scratch secp256k1 implementat
 | **A4e-ctl** | **the `u64` wrap** | **SAT — FORGES** | `addr_xg = 2^64 − 64` passes `addr_limb_ok(·, 63)` and wraps the pre-fix `+64`, slipping a **total** operand overlap past the guard. The `u128` widening is **LOAD-BEARING** |
 | **A4f** | timestamp layout is collision-free | PROVED | `{xG, yG}@ts`, `k@ts+1`, `xR@ts+2`, `yR@ts+3`, stride 4 (parsed from the builder). `xG`/`yG` share `ts` but are address-disjoint |
 | **A4g** | the mode-dependent bound is necessary in **both** directions | PROVED | a flat 64-byte bound rejects 32 legal x-only addresses (completeness); a flat 32-byte bound admits 32 illegal affine ones (soundness) |
-| **A5** | transcription audit | 19/19 premises READ, 19/19 mutations bite | `TRANSCRIPTION-AUDIT.md` |
+| **A5** | transcription audit | 20/20 premises READ, 20/20 mutations bite | `TRANSCRIPTION-AUDIT.md` |
 | **A6** | real-witness anchor | PROVED (+1 forgery exhibit) | 32 witnesses from `crypto/ecsm` itself; 9 ±yG pairs reproduce A3b outside the model |
 
 Non-vacuity: **seven distinct attacks** — A1c-ctl, A1e, A1f, A2c-ctl, A2f/A2g, A3b/A3d,
@@ -147,9 +148,15 @@ accepted trace satisfies, for every ECSM row with `µ = 1` and ecall timestamp `
 > `IS_AFFINE` equals the mode of the ecall the CPU actually executed. When it is 0, the row's
 > behaviour is **bit-identical** to the pre-PR chip and the imported conclusion stands
 > unchanged: `xR = x(k·P)` for either lift of `xG`. When it is 1, the witnessed `yG` is the
-> 32 bytes the caller placed at `addr_xG + 32`, so `(xG, yG)` is the caller's own point; the
-> published `(xR, yR)` are the canonical affine coordinates of `k·(xG, yG)`, both `< p`; and
-> the operand addresses are exactly those the executor accepts.
+> 32 bytes the caller placed at `addr_xG + 32`, so `(xG, yG) mod p` is the caller's own point;
+> the published `(xR, yR)` are the canonical affine coordinates of `k·(xG, yG)`, both `< p`;
+> and the operand addresses are exactly those the executor accepts.
+
+**The `mod p` is load-bearing and was missing from the first version of this theorem.** Nothing
+constrains `yG < p` — see A3g. The reduction is harmless (every relation is a congruence, so
+the multiple is of the reduced point and the output is identical) but the AIR accepts a `yG`
+the executor rejects, so the theorem cannot claim the witnessed bytes *are* a canonical field
+element. `xG` carries no such caveat: `XgLtP` pins it.
 
 Chain of proof: `IS_AFFINE` is a bit (A1a), dead on padding (A1b) and pinned to the executed
 ecall (A1c) → the affine buses fire exactly on affine rows → the `yG` read pins the input
@@ -218,6 +225,23 @@ New, and the one this board had to look up rather than assume:
    that is what the control must model. Both this and Finding 5 are the same lesson: a green
    control is worth nothing until you have seen it go red.
 
+8. **[the board's second gap, now closed] `yG` canonicality was never checked.** A3c proved
+   the read *pins* `yG` to the caller's buffer and stopped there; nobody asked whether those
+   bytes are canonical. They need not be — `OverflowKind` is `{XgLtP, KLtN, XrLtP, YrLtP}` and
+   there is no `YgLtP`, while the executor rejects `yG ≥ p` outright. So #879's treatment is
+   asymmetric: it closed the address band (`1a994313`) and left the `yG` band open, though
+   `xG`'s sibling check has existed all along.
+
+   The gap is reachable using this board's own artifact — the `y = 1` point makes `yG = p + 1`
+   a valid non-canonical encoding — and the consequence is benign, because every relation is a
+   congruence mod `p`, so the computed point and the published output are unchanged. What is
+   lost is VM-parity: a proof can attest to an ecall the executor would have halted on. That is
+   exactly the class A4c measures for addresses, where the same PR judged it worth fixing.
+   Recorded as **Medium**, and the soundness theorem above is corrected accordingly.
+
+   Audit premise **P20** parses `OverflowKind` and fails if a `YgLtP` ever appears, so this
+   finding cannot go stale silently.
+
 ## The rule those two findings generalise to
 
 > **Every negative control must be PAIRED with the specific check that the dropped premise is
@@ -240,6 +264,7 @@ Concretely, each control here states both halves:
 | A4e-ctl | the `u128` form rejects the overlap | `addr_limb_ok` passes *and* the `u64` form accepts |
 | A1c-ctl | the repo pair is injective | the degenerate pair collides |
 | A1f | idx 421 kept ⇒ only ECSM/ECSM_AFFINE reachable | dropped ⇒ HINT and KECCAK reachable |
+| A3g | the gap is real (no constraint bounds `yG < p`) | the consequence is benign (same reduced point, same output) |
 
 **The rule paid for itself twice.** A1f's first implementation had an inverted sign in its
 modular solve, so it found no foreign syscalls. Half 2 alone would have reported
@@ -367,28 +392,40 @@ Total runtime is a few seconds plus the `cargo build` (the harness depends only 
   ECDAS chain or the `Ecdas`/`Bit` buses, the imported board is the one to re-run, not this
   one.
 
-## Spec gap — a review note on #879, deliberately NOT fixed here
+## Where the spec lives — and a correction
 
-`spec/` carries one `.typ` chapter per table (34 of them: add, bitwise, commit, keccak, lt,
-memw, mul, page, sha256, shift, store, …). **There is no ECSM chapter, under any name.** No
-`ecsm`/`ecdas` file, no `spec/src/ecsm.toml`, and
-`grep -rlin "ecsm|scalar mul|secp256" spec/*.typ spec/src/*.toml` returns nothing.
-(`spec/signatures.typ` is a meta-chapter that renders bus/template signatures — unrelated to
-ECDSA.)
+The ECSM spec **exists**: `spec/ecsm.typ`, `spec/src/ecsm.toml` and `spec/src/ecdas.toml`, on
+the long-lived **`spec/main`** branch. `prover/src/tables/ecsm.rs:19`'s "See
+`spec/src/ecsm.toml`" is a correct reference.
 
-Worse, `prover/src/tables/ecsm.rs:19` says **"See `spec/src/ecsm.toml`"** — a file that does
-not exist and never has. That is a dangling reference in the very file #879 modifies.
+> **Corrected 2026-08-12.** An earlier version of this section claimed there was no ECSM
+> chapter "under any name" and that `spec/src/ecsm.toml` "does not exist and never has". Both
+> were wrong. The mistake was checking `spec/` on `main`, where the directory is a stale
+> snapshot — the spec is maintained on `spec/main`, which is *not* an ancestor of `main` (102
+> commits behind) and reaches it only via occasional batch sync PRs. Recorded rather than
+> quietly deleted, because the same error had already been made and corrected once before on
+> this codebase: any claim about the spec must be checked against the newest `spec/*` branch,
+> never against `main`.
 
-Both are **pre-existing** and not #879's to create: PR #903 added `spec/blake3.typ` because it
-introduced a *new* table, whereas #879 extends an existing one whose chapter was never written.
-Writing the missing chapter inside a verification PR would also mean a `spec/book.typ` edit —
-a shared merge-conflict surface — for a gap that predates the branch. Raise it as a separate
-review note on #879 and a follow-up issue instead. (The parallel DMA campaign found the same
-class of gap on #874, which *does* add a new fixed table — `FIXED_TABLE_COUNT` 10 → 11 — with
-no `spec/dma.typ`; that one is arguably blocking, this one is not.)
+PR **#932** (`spec/ecsm-affine-selector`) specs the affine variant reviewed here, and its
+constraints correspond to this board's subjects one-for-one — `is_affine` with its `IS_BIT`
+and `is_affine·(1−µ)` padding constraint, the `is_affine`-gated `yG` read at `addr_xG + 32`
+and `yR` write at `addr_xR + 32` on `ts + 3`, and the `µ`-gated `yR < p` chain. The `Ecall`
+number is specified as `2^32 − 11 − 2·id − is_affine`, which at `id = 0` is the same degree-1
+polynomial in `is_affine` that A1c models.
 
-For the same reason nothing is added to `docs/SUMMARY.md`: there is no `book.toml` anywhere in
-the repo, no workflow or Makefile target references mdbook, and `SUMMARY.md` already omits 7
-existing `docs/` files (`ai-review.md` plus 6 under `cryptography/`). So an unindexed file
-breaks nothing, while a new top-level heading would put an internal verification campaign into
-a user-facing TOC and widen the diff into a shared conflict surface.
+Two divergences from this board's subject are deliberate and documented in #932:
+
+- **The address-limb bound (A4) is not spec'd.** The spec derives `addr_yG`/`addr_yR` with a
+  full 64-bit `ADD` template into dedicated columns, so a carry out of the low limb propagates
+  correctly and no bound is needed; the implementation instead adds the offset to the low limb
+  only, reuses the high limb, and compensates with the `Alu` LT senders A4 verifies. Both are
+  sound, by different mechanisms.
+- **The spec spends 32 columns on `addr_yG`/`addr_yR`** that the implementation never
+  materialises (spec 708 → 757, implementation 667 → 684).
+
+Nothing is added to `docs/SUMMARY.md`: there is no `book.toml` anywhere in the repo, no
+workflow or Makefile target references mdbook, and `SUMMARY.md` already omits 7 existing
+`docs/` files (`ai-review.md` plus 6 under `cryptography/`). So an unindexed file breaks
+nothing, while a new top-level heading would put an internal verification campaign into a
+user-facing TOC and widen the diff into a shared conflict surface.

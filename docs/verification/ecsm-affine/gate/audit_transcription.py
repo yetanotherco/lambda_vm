@@ -348,6 +348,21 @@ def p_all_syscall_numbers(s):
                 + ("" if ok else f"  MISMATCH vs model {sorted(SYSCALL_NUMBERS)}"))
 
 
+def p_no_yg_canonicality(s):
+    """A3g's premise, and pure negative space: there is NO `YgLtP` variant.
+
+    `OverflowKind` must be exactly `{XgLtP, KLtN, XrLtP, YrLtP}`. If a future commit adds a
+    `yG < p` chain, the gap A3g reports is closed and A3g's verdict becomes stale — so the
+    audit fails and forces the board to be re-read. Parsed from the enum rather than grepped
+    for the absent name, so a rename cannot slip past."""
+    src = _src(s, ECSM_RS)
+    m = re.search(r"pub enum OverflowKind \{(.*?)\}", src, re.S)
+    variants = re.findall(r"(\w+),", m.group(1)) if m else []
+    ok = variants == ["XgLtP", "KLtN", "XrLtP", "YrLtP"]
+    return ok, (f"OverflowKind = {variants}; no YgLtP ⇒ yG has no canonicality chain "
+                "(A3g's subject). xG/xR/yR each do.")
+
+
 PREMISES = [
     Premise("P1 column layout", "A1/A2", "IS_AFFINE=667, YR_SUB_P=668..684, NUM_COLUMNS=684",
             p_columns,
@@ -419,6 +434,12 @@ PREMISES = [
             mutations=[(ECSM_RS, r"is_byte\(cols::Q1, 33, &mut out\);",
                         "is_byte(cols::Q1, 33, &mut out);\n    is_byte(cols::YR, 32, &mut out);",
                         "YR gains a local byte check")]),
+    Premise("P20 no yG canonicality chain exists", "A3g",
+            "OverflowKind is exactly {XgLtP, KLtN, XrLtP, YrLtP}", p_no_yg_canonicality,
+            kind="negative-space",
+            mutations=[(ECSM_RS, r"pub enum OverflowKind \{\n    XgLtP,",
+                        "pub enum OverflowKind {\n    XgLtP,\n    YgLtP,",
+                        "a yG canonicality chain appears ⇒ A3g is stale")]),
     Premise("P19 the complete syscall set", "A1f",
             "every u64::MAX-k syscall the Ecall bus can carry", p_all_syscall_numbers,
             mutations=[(EXEC_RS, r"pub const HINT_SYSCALL_NUMBER: u64 = u64::MAX - 30;",

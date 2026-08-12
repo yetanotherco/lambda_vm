@@ -6,6 +6,7 @@
 [SAT — FORGES] A3d control [drop the yG read]  both witnesses verify and are indistinguishable without the read ⇒ the IS_AFFINE-gated yG MEMW read is LOAD-BEARING; it is the ONLY thing pinning the input parity, and the affine ABI is what made the parity observable
 [PROVED      ] A3e imported L7 survives  20 instances: x(k·P) = x(k·(−P)) ⇒ the x-only path's conclusion is unaffected by the affine variant, and x-only rows may still leave parity free
 [PROVED      ] A3f YrLtP accepts both parities  both ±yR are canonical ⇒ YrLtP admits either ⇒ it addresses output REPRESENTATION (A2), never input parity. Two orthogonal gaps, two fixes.
+[SAT — FORGES] A3g yG canonicality is UNCHECKED  no YgLtP exists; yG = p + 1 = 0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc30 is a byte-representable non-canonical encoding of a real curve point, accepted by the AIR and rejected by the executor. All 6 facts hold. Consequence is BENIGN (same reduced point, same output) ⇒ VM-parity gap, not a forgery. Same class as A4c.
 
 Summary:
   PROVED         A3a yG parity arithmetically free
@@ -16,3 +17,4 @@ Summary:
   SAT — FORGES   A3d control [drop the yG read]
   PROVED         A3e imported L7 survives
   PROVED         A3f YrLtP accepts both parities
+  SAT — FORGES   A3g yG canonicality is UNCHECKED

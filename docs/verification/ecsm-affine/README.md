@@ -38,12 +38,13 @@ form of #903's own argument anyway, since these are runnable gates with exit cod
 soundness theorem.
 
 ```
-audit:   19/19 premises read from source, 19/19 mutation controls bite, 0 failures
+audit:   20/20 premises read from source, 20/20 mutation controls bite, 0 failures
 oracle:  ORACLE STATUS: VALIDATED   (9 pass, 0 skip, 0 fail)
 anchor:  32 real witnesses from ecsm::compute_witness{,_with_y}, every field re-derived
 A1 selector    : IS_BIT + µ-gating PROVED, Ecall pinning PROVED, 3 forgery controls
 A2 YrLtP       : lift + strict chain PROVED, forgery instantiated on a real y = 1 point
 A3 parity      : forgery instantiated (2 full witnesses), the yG read PROVED to close it
+A3g            : yG canonicality is UNCHECKED in spec AND impl — Medium, VM-parity gap
 A4 addressing   : LT bound == executor's predicate PROVED, u64-wrap control FORGES
 ```
 
@@ -112,7 +113,7 @@ in-table constraint set on each, and shows both are valid with the same `xR` and
 | `gate/a3_parity_binding.py` | A3 — the parity forgery and the read that closes it |
 | `gate/a4_addressing.py` | A4 — address bounds, the `+32…+63` span, the overlap guard |
 | `gate/a6_real_witness.py` | the real-witness (column) anchor |
-| `gate/audit_transcription.py` | A5 — 19 premises read from source + mutation controls |
+| `gate/audit_transcription.py` | A5 — 20 premises read from source + mutation controls |
 | `gate/RESULTS.md` | lemma board, soundness theorem, contracts, findings, method notes |
 | `gate/TRANSCRIPTION-AUDIT.md` | the audit's prose half: premise table and what it cannot see |
 | `gate/logs/` | run logs, and the real-witness dump |

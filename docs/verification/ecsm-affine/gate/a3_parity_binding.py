@@ -36,6 +36,7 @@ checks and all.
 Run: `python a3_parity_binding.py`
 """
 
+import json
 import sys
 from pathlib import Path
 
@@ -345,6 +346,65 @@ def a3f_yrltp_is_not_parity_defence():
     return ok
 
 
+# ── A3g: is yG CANONICAL? (the gap this board originally missed) ───────────
+
+def a3g_yg_canonicality():
+    """A3c proves the `yG` read pins the witnessed column to the caller's bytes. It does NOT
+    prove those bytes are a canonical field element, and nothing else does either.
+
+    `xG` has `OverflowKind::XgLtP`. `xR` has `XrLtP`. `yR` gained `YrLtP` in this PR. **`yG`
+    has nothing** — the enum is `{XgLtP, KLtN, XrLtP, YrLtP}`. The executor *does* reject a
+    non-canonical `yG` (`crypto/ecsm/src/lib.rs`, `CoordinateOutOfRange`), so the AIR is
+    strictly more permissive than the VM on this input — the same *provable-but-not-executable*
+    divergence class that A4c measures for addresses and that PR #879 deliberately closed
+    there with the `Alu` LT senders. The treatment is therefore asymmetric: address band
+    closed, `yG` band left open.
+
+    Reachability is not hypothetical, and this board already owns the witness: the `y = 1`
+    point built by `oracle/small_y_point.py` makes `yG = p + 1 < 2^256` a byte-representable
+    non-canonical encoding of a real curve point.
+
+    Why it is Medium and not High: the Yg relation and the whole ECDAS chain are congruences
+    mod `p`, and the quotient columns absorb the difference, so a non-canonical `yG` yields the
+    SAME reduced point and the same published `(xR, yR)`. Nothing is forged. What is lost is
+    VM-parity — a proof can attest to an ecall the executor would have halted on.
+
+    Paired, both directions:
+      * the gap is REAL — no constraint bounds `yG` below `p`;
+      * the consequence is BENIGN — the reduced point, hence the output, is unchanged."""
+    small = json.loads((Path(__file__).resolve().parents[1] / "oracle"
+                        / "small_y_point.json").read_text())
+    x = int(small["small_y_point"]["x"], 16)
+    y = int(small["small_y_point"]["y"], 16)
+
+    # The gap: a non-canonical encoding of a real point is byte-representable.
+    yg_noncanon = y + P
+    facts = {
+        "the point is real": is_on_curve((x, y)),
+        "yG = y + p is 32-byte representable": yg_noncanon < 2**256,
+        "yG = y + p is NOT canonical": yg_noncanon >= P,
+        "it reduces to the same y": yg_noncanon % P == y,
+    }
+    # The consequence is benign: every relation is a congruence mod p, so the multiple is the
+    # same point. Checked on the honest scalar, both encodings.
+    k = 2
+    a = affine_mul(k, x, y)
+    b = affine_mul(k, x, yg_noncanon % P)   # what the chip actually computes with
+    facts["output unchanged under the non-canonical encoding"] = a == b
+    # And the sibling coordinate IS checked, which is what makes it asymmetric.
+    _, xg_ok = eval_overflow_chain_concrete(P, x)
+    facts["xG has a canonicality chain (XgLtP) and passes it"] = xg_ok
+
+    bad = [k_ for k_, v in facts.items() if not v]
+    report("A3g yG canonicality is UNCHECKED", "SAT — FORGES" if not bad else "FAIL",
+           f"no YgLtP exists; yG = p + {y} = 0x{yg_noncanon:x} is a byte-representable "
+           f"non-canonical encoding of a real curve point, accepted by the AIR and rejected "
+           f"by the executor. All {len(facts)} facts hold. Consequence is BENIGN (same reduced "
+           "point, same output) ⇒ VM-parity gap, not a forgery. Same class as A4c."
+           if not bad else f"failed: {bad}")
+    return not bad
+
+
 def main():
     a3a_parity_free()
     ok, honest, forged = a3b_forgery()
@@ -354,6 +414,7 @@ def main():
     a3d_load_bearing(honest, forged)
     a3e_xonly_unchanged()
     a3f_yrltp_is_not_parity_defence()
+    a3g_yg_canonicality()
 
     print("\nSummary:")
     for n, v, _ in results:
