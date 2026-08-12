@@ -1,12 +1,6 @@
 use crate::hash::platform_keccak::PlatformKeccak256 as Keccak256;
 
-use super::{
-    field_element::FieldElementBackend,
-    field_element_vector::{FieldElementPairBackend, FieldElementVectorBackend},
-};
-
-// Field element backend definitions
-pub type Keccak256Backend<F> = FieldElementBackend<F, Keccak256, 32>;
+use super::field_element_vector::{FieldElementPairBackend, FieldElementVectorBackend};
 
 // Vector of field elements backend definitions
 pub type BatchKeccak256Backend<F> = FieldElementVectorBackend<F, Keccak256, 32>;

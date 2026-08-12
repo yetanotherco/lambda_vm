@@ -1,5 +1,5 @@
 use crypto::merkle_tree::{
-    backends::types::{BatchKeccak256Backend, Keccak256Backend, PairKeccak256Backend},
+    backends::types::{BatchKeccak256Backend, PairKeccak256Backend},
     merkle::MerkleTree,
     traits::{IsMerkleTreeBackend, IsStreamingLeafBackend},
 };
@@ -11,9 +11,6 @@ use math::traits::AsBytes;
 // Merkle Trees configuration
 
 // Security of both hashes should match
-
-pub type FriMerkleTreeBackend<F> = Keccak256Backend<F>;
-pub type FriMerkleTree<F> = MerkleTree<FriMerkleTreeBackend<F>>;
 
 // If using hashes with 256-bit security, commitment size should be 32
 // If using hashes with 512-bit security, commitment size should be 64
@@ -44,7 +41,6 @@ pub type FriLayerMerkleTree<F> = MerkleTree<FriLayerMerkleTreeBackend<F>>;
 /// false statement rather than an omission nobody had to make.
 pub trait KeccakTreeBackend: IsMerkleTreeBackend<Node = Commitment> {}
 
-impl<F> KeccakTreeBackend for Keccak256Backend<F> where Self: IsMerkleTreeBackend<Node = Commitment> {}
 impl<F> KeccakTreeBackend for BatchKeccak256Backend<F> where
     Self: IsMerkleTreeBackend<Node = Commitment>
 {
@@ -70,7 +66,7 @@ pub enum CommitmentHash {
     Keccak256,
 }
 
-/// The hash behind [`Commitment`], [`BatchedMerkleTree`], [`FriMerkleTree`] and
+/// The hash behind [`Commitment`], [`BatchedMerkleTree`] and
 /// [`FriLayerMerkleTree`]. Pinned to the aliases by the assertion below.
 pub const COMMITMENT_HASH: CommitmentHash = CommitmentHash::Keccak256;
 
@@ -176,7 +172,6 @@ const _: fn() = || {
     fn assert_keccak_backend<B: KeccakTreeBackend>() {}
     fn assert_same<T>(_: core::marker::PhantomData<(T, T)>) {}
 
-    assert_keccak_backend::<FriMerkleTreeBackend<GoldilocksField>>();
     assert_keccak_backend::<BatchedMerkleTreeBackend<GoldilocksField>>();
     assert_keccak_backend::<FriLayerMerkleTreeBackend<GoldilocksField>>();
 
