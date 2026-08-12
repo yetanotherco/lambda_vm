@@ -68,9 +68,11 @@ Two earlier campaigns supply the playbook, both on unmerged branches under the g
 | **A5** | transcription audit | 20/20 premises READ, 20/20 mutations bite | `TRANSCRIPTION-AUDIT.md` |
 | **A6** | real-witness anchor | PROVED (+1 forgery exhibit) | 32 witnesses from `crypto/ecsm` itself; 9 ±yG pairs reproduce A3b outside the model |
 
-Non-vacuity: **seven distinct attacks** (A1c-ctl, A1e, A1f, A2c-ctl, A2f/A2g, A3b/A3d,
-A4e-ctl), surfacing as **11 `SAT` results** because several are exhibited from more than one
-angle. Every new check in the PR has a control showing it is load-bearing; none is dead weight.
+Non-vacuity: **eight distinct attacks** (A1c-ctl, A1e, A1f, A2c-ctl, A2f/A2g, A3b/A3d, A3g,
+A4e-ctl), surfacing as **12 `SAT` lines** in `gate.log` because several are exhibited from more
+than one angle — plus one `SAT (expected)` non-vacuity check (A2b-nv), which is a sanity probe
+rather than an attack. Every new check in the PR has a control showing it is load-bearing; none
+is dead weight.
 
 **The two headline exhibits.** The PR argues the `YrLtP` band is populated because `3 | p−1`
 makes cubing 3-to-1; `small_y_point.py` builds the point and the *first* candidate works —
