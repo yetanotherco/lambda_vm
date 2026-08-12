@@ -440,13 +440,25 @@ def audit_packing(a, repo):
         a.ok(f"num_bus_elements(Packing::{name}) == {count}",
              re.search(rf"Packing::{name} => {count},", body) is not None)
 
-    # NOTE the multiplication sign: the source comments use U+00D7 ("2× Direct"),
-    # not ASCII "2x". An earlier version of this claim searched for the ASCII form,
-    # so the regex could never match and the predicate was tautologically true --
-    # a dead guard inside the very section added to close the packing-assumption
-    # gap. `2 → 1` on any compound arm now produces TWO findings, not one.
+    # This guard is deliberately independent of the `expected` dict above: that
+    # dict pins the variants that exist TODAY, while this one must also reject a
+    # newly added compound that folds its inputs into a single element. So it
+    # keys off the source's own `// Compounds` section marker rather than off a
+    # per-variant comment.
+    #
+    # Two earlier versions were dead. The first searched for ASCII "2x" where the
+    # source writes "2×" (U+00D7), so it could never match. The second searched
+    # `Packing::\w+ => 1, // 2×`, which only covers arms whose comment begins
+    # "2×" -- it stayed dark for DWordHHW ("Direct + Word2L") and DWordWHH, both
+    # equally 64-bit. A dead guard inside the very section added to close the
+    # packing-assumption gap, twice over.
+    #
+    # Mutating any of the seven compound arms `2 → 1` (or `4 → 1`) now produces
+    # TWO findings: the per-variant claim above and this one.
+    compounds = body[body.index("// Compounds"):]
+    compounds = compounds[:compounds.index("}")]
     a.ok("no Packing variant folds a 64-bit value into one bus element",
-         not re.search(r"Packing::\w+ => 1, // 2×", body),
+         not re.search(r"Packing::\w+ => 1,", compounds),
          "if one ever did, DmaNext would bind packed values and the gate's link "
          "model would have to change with it")
 
@@ -600,9 +612,15 @@ def audit_fixture(a, repo):
 
     # FRESHNESS, not just presence. Greping for `include_str!` proves the Rust
     # reads a fixture; it does not prove the fixture is what the current oracle
-    # emits. And `test_ref.py` regenerates it only on a fully-green run, so an
-    # oracle regression leaves a stale fixture behind with the Rust test still
-    # green. Re-derive the table here and compare.
+    # emits. `test_ref.py`'s regeneration gate is `if not failed`, so a run that
+    # only *skipped* an anchor (PARTIALLY VALIDATED, exit 2) or ran `--quick`
+    # still rewrites the fixture, while a run with a real failure leaves a stale
+    # one behind with the Rust test still green. Re-derive the table and compare.
+    #
+    # Caveat: this hand-duplicates `emit_row_table`'s line format and memory
+    # seeding. That is the price of not importing the emitter (which would make
+    # the check circular), but it means a deliberate format change to the emitter
+    # produces a finding here until this block is updated to match.
     sys.path.insert(0, os.path.join(repo, "formal_verification/dma"))
     committed = read_raw(repo, "formal_verification/dma/canonical_dma_rows.txt")
     try:

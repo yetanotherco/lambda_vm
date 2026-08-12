@@ -382,6 +382,21 @@ fn dma_trace_matches_oracle_row_decomposition() {
             vector.name
         );
 
+        // Bind `is_read` to the phase DIRECTLY. Without this, flipping both flags
+        // is caught only indirectly: it relabels the phases, so the ordering and
+        // address assertions below fail instead — and the address one degenerates
+        // when src == dst. Pin each flag to the timestamp that defines its phase.
+        assert!(
+            reads.iter().all(|o| o.timestamp == 0x31),
+            "{}: every op flagged is_read must be a T+1 source read",
+            vector.name
+        );
+        assert!(
+            writes.iter().all(|o| o.timestamp == 0x32),
+            "{}: every op not flagged is_read must be a T+2 destination write",
+            vector.name
+        );
+
         // Every read strictly before every write — the property that gives an
         // overlapping copy its snapshot semantics. Stated as max(read) < min(write)
         // so swapping the two timestamps cannot satisfy it.

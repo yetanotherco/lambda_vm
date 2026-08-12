@@ -640,7 +640,25 @@ verify-dma: ## Run the DMA memcpy formal-verification gate (formal_verification/
 	@# a loadable libc would skip the audit and the gate, neither of which needs it.
 	python3 formal_verification/dma/test_ref.py || [ $$? -eq 2 ]
 	python3 formal_verification/dma/audit_transcription.py
-	python3 formal_verification/dma/z3_verify.py
+	@# The gate, then a freshness check on its committed transcript. Without the
+	@# diff, `verify.log` is a claim about a run nobody repeats -- it could drift
+	@# from the gate silently, which is the same "declared, not derived" defect the
+	@# audit script exists to catch. The `solver:` line is excluded because it names
+	@# the local z3 build: pinning it would turn any version bump into a spurious
+	@# red, and a spurious red is how a check gets deleted rather than fixed.
+	@out=$$(mktemp); st=$$(mktemp); \
+	{ python3 formal_verification/dma/z3_verify.py 2>&1; echo $$? > $$st; } | tee $$out; \
+	if [ "$$(cat $$st)" != "0" ]; then rm -f $$out $$st; exit 1; fi; \
+	grep -v '^  solver:' formal_verification/dma/verify.log > $$out.committed; \
+	grep -v '^  solver:' $$out > $$out.fresh; \
+	if diff -u $$out.committed $$out.fresh; then \
+		echo "  verify.log matches this run."; \
+	else \
+		echo "  FAIL: verify.log no longer matches the gate. Regenerate with:"; \
+		echo "        python3 formal_verification/dma/z3_verify.py > formal_verification/dma/verify.log"; \
+		rm -f $$out $$st $$out.committed $$out.fresh; exit 1; \
+	fi; \
+	rm -f $$out $$st $$out.committed $$out.fresh
 
 lint:
 	cargo fmt --check --all

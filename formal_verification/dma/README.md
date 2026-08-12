@@ -14,6 +14,27 @@ make verify-dma          # all three, from the repo root
 pip install z3-solver    # the only dependency; validated on 5.0.0
 ```
 
+**The degraded-run contract**, because a CI job or a human greps for the word
+`VALIDATED` and a partial run must not print it bare:
+
+| exit | meaning |
+|---|---|
+| 0 | full board green, or `--quick` green (status token says `VALIDATED (--quick, reduced sweeps)`) |
+| 1 | a real failure — a mutant survived, an anchor disagreed, or a solver returned `unknown` |
+| 2 | **ran but degraded**: an external anchor was unavailable. Status token says `PARTIALLY VALIDATED (n anchor(s) skipped)` |
+
+A missing dependency SKIPs only its own anchor and never cascades, the banner
+names the anchors it is *not* anchored on, and **a mutant whose target anchor
+skipped is reported `NOT RUN`, never `caught`** — scoring a skip as a catch
+credits a mutant to a check that never ran, which is exactly what happened until
+it was fixed: an unloadable libc printed `PASS all 8 mutants caught` while
+running six. `make verify-dma` tolerates exit 2 and aborts on exit 1.
+
+The gate scores `unknown` as **failure** everywhere. On z3 5.0.0 the full board
+is ~92 s; on 4.12.2 it takes ~1210 s and two queries blow their budgets, so a
+solver timeout is reported as `TIMEOUT` and distinguished from a rejection — an
+earlier version would have printed "the AIR REJECTS an honest row" on a slow box.
+
 | file | what it is |
 |---|---|
 | `dma_ref.py` | the oracle: four levels of reference model, no repo code |
@@ -43,13 +64,19 @@ gate:    layer 1 (row semantics)            PASS  6/6 UNSAT
          completeness sweep                 PASS  5153 honest + 257 padding rows
          OVERALL: PASS                            (~92 s on z3 5.0.0)
 
-audit:   104 claims, 0 findings; mutation-tested against 8 source mutants
+audit:   104 claims, 0 findings; mutation-tested against 9 source mutants
 rust:    cargo test -p lambda-vm-prover --lib tests::dma_tests   10 passed
 ```
 
-Full gate transcript in `verify.log`. **`--lib dma` is 18 tests, but 7 need guest
-ELFs** — run `make compile-programs-rust` first (RISC-V target) or use the
-narrower filter above. `make verify-dma` runs no cargo.
+Full gate transcript in `verify.log`, which is the gate's own stdout, **pasted not
+retyped** — including the `solver:` line, which an earlier version silently
+dropped while the surrounding sentence claimed the block was verbatim. The
+`## Results` block above is hand-copied from it and nothing enforces that; if you
+regenerate, replace both.
+
+**`--lib dma` is 18 tests, but 7 need guest ELFs** — run
+`make compile-programs-rust` first (RISC-V target) or use the narrower filter
+above. `make verify-dma` runs no cargo.
 
 ## The method
 
@@ -83,10 +110,97 @@ between senders and receivers rather than an assumed chain — which is where
 "a source row skipped forward", "the copy ended early" and "a disjoint cycle also
 balances the bus" get answered.
 
+## The oracle's independence, and its limits
+
+Anchors 1 and 2 are genuinely non-circular: the platform C library and CPython's
+`bytearray` slice assignment are two `memmove` implementations sharing no code with
+`dma_ref.py` or with each other. libc in particular is the definition the guest's
+`compiler_builtins` `memcpy` was replacing, which makes it the right anchor rather
+than a convenient one. Anchor 3 is the one the chip depends on and has no external
+counterpart — it is the only check that the row sequence the AIR proves is the byte
+copy the guest asked for. Anchor 5 (the tamper sweep) is what makes 1–4 worth running.
+
+**The one thing the reference is not independent of: the row decomposition itself.**
+The greedy `8-while-≥8-then-1` rule is a design decision, and the oracle transcribes
+it from the same place the AIR gets it. What the oracle proves is that this
+decomposition *implements the byte copy*; it cannot tell you the decomposition is
+the right one, and it would not catch a design where both the AIR and the oracle
+chunked differently but consistently. That is why the Rust test
+`dma_trace_matches_oracle_row_decomposition` exists — it pins the trace builder's
+decomposition against the emitted vectors rather than against a recomputation.
+
+Known limitations, carried forward verbatim in intent:
+
+- **O1 — the model does not model the memory table.** `replay_memw` enforces read
+  faithfulness at its own timestamp; it does not model per-address ordering of
+  *multi-byte* accesses, unaligned 8-byte operations, or the `Memw` width decode.
+- **O2 — the per-ecall snapshot is not a `memcpy`-level `memmove`.** Chunk *k+1*
+  reads what chunk *k* wrote. Agrees with `memmove` for `dst < src` and for
+  disjoint ranges; disagrees for `dst > src` with an overlap wider than 256 bytes.
+  In contract for `memcpy` — anchor 4 deliberately excludes overlap for this
+  reason — but the claim "the DMA ecall has memmove semantics" must not be repeated
+  at the C level.
+- **O3 — `value` bytes are modelled as integers, not range-checked bytes.** The
+  oracle emits `0..255` because it reads them out of a byte memory; the AIR gets its
+  byte range from the `Memw` receiver, outside both oracle and gate.
+- **O4 — the anchors test the semantics, not the executor.** `dma_ref` is a model of
+  `execution.rs` checked against libc; that `execution.rs` matches it is covered by
+  the PR's own 256-case proptest and `executor/src/tests/dma_tests.rs`, not by
+  anything here.
+- **O5 — register reads are modelled as three ops at `T` and nothing more.** The
+  old-value/old-timestamp fields, and the fact that the DMA table *writes back* the
+  same value it read, are not modelled. Not part of the copy semantics, but part of
+  the trace — the audit script is the only thing looking at them.
+
+### The canonical vectors
+
+Ten cases, chosen so every structural case appears exactly once. Regenerated by the
+harness into `canonical_dma_vectors.json` (full per-row column expansion, the gate's
+input) and `canonical_dma_rows.txt` (line-oriented, the Rust test's input).
+
+| name | dst | src | n | rows | MEMW ops |
+|---|---|---|---|---|---|
+| empty | 0x1000 | 0x2000 | 0 | 1 | 3 |
+| single byte | 0x1000 | 0x2000 | 1 | 2 | 5 |
+| one wide row | 0x1000 | 0x2000 | 8 | 2 | 5 |
+| wide plus tail | 0x1000 | 0x2000 | 9 | 3 | 7 |
+| widest tail | 0x1000 | 0x2000 | 7 | 8 | 17 |
+| unaligned body and tail | 0x2005 | 0x1003 | 27 | 7 | 15 |
+| forward overlap | 0x3004 | 0x3000 | 24 | 4 | 9 |
+| backward overlap | 0x3000 | 0x3004 | 24 | 4 | 9 |
+| page crossing | 0x0FFC | 0x1FFC | 16 | 3 | 7 |
+| maximum chunk | 0x1000 | 0x2000 | 256 | 33 | 67 |
+
+"widest tail" is the expensive shape: eight rows to move seven bytes. "maximum
+chunk" is the only case with **no tail row at all** — 256 is 8-aligned — which is
+why it is pinned. The two files exist separately because the prover crate has no
+JSON parser, and a hand-rolled scanner over nested JSON is the fragile coupling that
+goes stale silently: the first attempt broke on `rows[i].columns` repeating the
+`src`/`dst`/`count` keys. An earlier version hand-transcribed 7 of the 10 vectors
+into Rust literals with nothing enforcing the transcription.
+
 ## The chip, as recovered from the implementation
 
 `spec/dma.typ` (PR #931) is the normative chapter; this section is what the gate
 checks and agrees with it except where noted.
+
+**Row layout.** A row copies eight bytes while `count ≥ 8`, otherwise one byte;
+the design is cloned from `commit.rs` — one row per chunk, rows chained by a bus
+rather than by a transition constraint. Not one row per byte: 257 rows per
+maximal ecall instead of 33. Not one row per copy: the row would need `n` value
+columns for unbounded `n`, and 8 bytes is the widest operation `Memw` serves. The
+1-byte tail rather than 4/2/1 halving because a `tail` **bit** selects between
+exactly two widths, so `step = 8 − 7·tail` stays linear and every constraint stays
+degree 2; halving would need a two-bit selector and a width-to-`w2/w4/w8` decode.
+
+The cost, stated precisely (an earlier draft had this wrong in both directions):
+`n` bytes takes `n/8` wide rows, `n % 8` tail rows and one terminal row. So tail
+rows are 0% for the 8-aligned lengths that dominate, `7/39 = 17.9%` at `n = 255`
+(the longest length that *has* a tail — the maximal `n = 256` has none), and
+**`7/8 = 87.5%` at the genuine worst case `n = 7`**, where every data row is a
+tail row. Against 4/2/1 halving the delta is at most 4 rows, not the 7 an earlier
+draft claimed by comparing against a zero-tail design instead of against the
+alternative it was arguing with.
 
 **32 columns.** `timestamp` (DWordWL), `src`/`dst` (DWordWL), `src_incr`/`dst_incr`/
 `count_decr` (DWordHL — the halfword split exists *because* they need
@@ -110,7 +224,42 @@ expression against `max_degree()`.
 `mu−first` receive), 12 `IsHalfword` (`mu`), 1 `Zero` (`mu`), 3 `Memw` register
 reads (`first`), 2 `Alu` LT, 2 `Memw` data ops (`mu−end`).
 
-Three asymmetries are load-bearing and must not be "tidied":
+### Soundness ledger — ten spots a change must not touch
+
+1. **`DmaNext` carries the timestamp in both tuples.** Removing it splices two
+   calls' rows into each other's chains with the multiset still balancing — the
+   failure the BLAKE3 design review found the hard way.
+2. **`IsHalfword` on all twelve halfwords.** Each one is either an end-detection
+   forgery or a wrapped address.
+3. **`emit_add_pair` (plain) on `count`, `emit_add_pair_no_overflow` on
+   `src`/`dst`.** Swapping either direction breaks the terminal row or admits an
+   address wrap. Detail below.
+4. **`mu − end` on both data `Memw` sends.** Detail below.
+5. **The `Alu` width pin.** Gone, the prover partitions at will and
+   `count = 7, tail = 0` truncates seven bytes.
+6. **`tail · value[i] = 0`.** Gone, a one-byte row carries seven unconstrained
+   field elements into the `Memw` bus.
+7. **The bound constant is taken from the executor.** `dma.rs` imports
+   `DMA_MEMCPY_MAX_BYTES as EXECUTOR_DMA_MEMCPY_MAX_BYTES` rather than restating
+   `257`, so the bound the AIR proves cannot drift from the bound execution
+   enforces. Restating it invites exactly that drift; the audit checks it stays
+   imported.
+8. **One `first` per timestamp**, supplied by the `Ecall` receiver against the
+   CPU's single send — two heads at one timestamp would unbalance `Ecall`. This is
+   what makes Layer 2's "exactly one head row" a real scope restriction rather
+   than an arbitrary one: the bus is what enforces it, outside the gate's model.
+9. **The single-`end` obligation is implicit**, not a constraint: a chain with no
+   terminal row has one more `DmaNext` send than receive, so the bus does not
+   balance. Worth knowing that this is where termination comes from — and that
+   bus counting alone rules out only an *open* chain, never a closed cycle. That
+   is item 3's second job.
+10. **The `DmaNext` tuples' element alignment.** Both are 8 bus elements and align
+    pairwise; that is what makes the link a per-limb binding and hence what
+    supplies the range provenance for every non-head row. A packing change on
+    either side silently changes what the bus binds. Audit §G, and see
+    "The retracted finding".
+
+Three of these are asymmetries that will look like untidiness to the next reader:
 
 - **Constraint 9-10 is the plain add pair on purpose.** The terminal row holds
   `count = 0`, `count_decr = 0 − 1 = 2^64−1`; a no-overflow form would reject it.
@@ -143,6 +292,25 @@ there is one set of columns. On a one-byte row lanes 1-7 must be zero
 note this is *canonicalisation*, not a forgery closed: `memw.toml` gates the
 per-lane memory tokens on `w2`/`w4`/`write8`, so on a tail row those lanes never
 reach the memory argument at all.
+
+**Why the value lanes carry no range check of their own**, since this is the kind
+of gap that is usually a bug. The reason is **not** that the receiving table
+checks them. `spec/memw.typ:42-45` declines to: *"these properties are necessary
+for the consistency of the system as a whole"* — i.e. somebody must, and it says
+who only in the negative. That obligation is **A5** below.
+
+The actual argument is narrower and specific to this chip: the `T+1` read tuple
+carries `old == value` **against real memory**, so each lane is pinned to whatever
+byte the memory argument says is at that address. The lanes are not free field
+elements; they are whatever memory already held. This chip *propagates* byte-ness
+rather than establishing it.
+
+> **Do not cite `keccak.rs` as authority for relying on the receiver here.** An
+> earlier draft did, and it is backwards: `keccak.rs:355-378` emits four
+> `AreBytes` senders for its address bytes **precisely because** the receiver does
+> not pin them, and its comment spells out the forgery — keeping a linear
+> combination's field value correct while encoding non-byte values in the
+> individual cells. That file is evidence for the opposite conclusion.
 
 **Overlap.** All reads at `T+1`, all writes at `T+2`, both AIR constants, giving
 snapshot (`memmove`) semantics per ecall. **Not** per guest `memcpy`: chunk *k+1*
@@ -182,9 +350,24 @@ sweep pins exactly this row.
 equality: every satisfying assignment of one row does what the oracle says; among
 groups with exactly one head row, the only bus-balanced multi-row structure at
 depth ≤ 5 is a single chain tiling `[src, src+n)` exactly once with the greedy
-widths; ten of the eleven modelled premises are individually necessary, each with a
-named forgery; Layer 2's premise set is satisfiable and sensitive to each field of
-the bus tuple; and the AIR accepts every honest trace for every length `0..256`.
+widths; ten of the eleven modelled premises are individually necessary — each has a
+negative control (`drop_*`) that returns SAT, i.e. exhibits a concrete forgery, when
+that premise alone is removed, and three of the ten are spelled out in full below;
+Layer 2's premise set is satisfiable and sensitive to each field of the bus tuple;
+and the AIR accepts every honest trace for every length `0..256`.
+
+The eleventh, `memw_addr32` (assumption A1), has **no control on purpose**: dropping
+it leaves every check on the board unchanged, because the limb-wise `DmaNext` link
+derives well-formedness from the sender's `IsHalfword` checks instead. A control that
+cannot fail is worse than no control. The gate's docstring previously claimed "every
+negative control shows what breaks without them", which was false for exactly this
+premise.
+
+**On the depth bound.** The chain checks run at depth ≤ 5 (integer) and ≤ 3
+(field-exact). The general depth case is not machine-checked; it rests on MAIN 2's
+wrap lemma plus the strict decrease of `count`, which together bound the chain
+length. Treat depth ≤ 5 as the checked case and that argument as the reason to
+believe it generalises — not as a proof that it does.
 
 **Does not prove**: assumptions A1–A5. The memory-consistency argument, hence
 overlap ordering for unaligned 8-byte accesses — the largest remaining gap around
@@ -193,6 +376,53 @@ this feature, and not DMA's to close. LogUp soundness. The multi-call case
 tuples carry, which the integer abstraction does not model). And that the *Rust*
 implements this — that is `audit_transcription.py`'s 104 textual claims plus the
 end-to-end prove/verify and forgery tests.
+
+### The named forgeries — what each bound actually buys
+
+Each is run twice, with the bound and without, so "the bound is necessary" is a
+measured claim rather than an assertion.
+
+| result | with the bound | without |
+|---|---|---|
+| `Σ count_decr = 4·65535 ⟺ count_decr = 2^64−1` | unsat (the identity holds) | **sat** — `(0xFFFF+d, 0xFFFF−d, 0xFFFF, 0xFFFF)` reaches the same sum with a different `count_decr`, so `end` is claimable at a nonzero count. An `end` row's two `Memw` sends have multiplicity `mu − end = 0`, so **it emits no memory operations at all**: a silently truncated copy with every bus balanced |
+| `carry_1 = 0 ⟹ src + width < 2^64` | unsat (pinned) | **sat** — at `src1 = 2^32−1` the high half can be exactly `2^32`, which the `IsHalfword` pair forbids and an unbounded pair does not. The row hands on a *wrapped* address that the executor's `checked_add` rejects |
+| the `LT` width pin blocks `count = 7, end = 1` | unsat | **sat** — a free `tail` takes `tail = 0`, so `step = 8`, so `count_decr = 7 − 8 = 0xFFFF…`, so `end = 1`. **Seven requested bytes silently not copied** |
+
+The last one is worth reading twice. `end` requires `count = step − 1`, so a free
+`tail` buys exactly `count = 7` and no other value — the two constraints compose to
+leave precisely one hole. That is also why an earlier draft wrote this forgery at
+`count = 3` and was wrong: it is not reachable there.
+
+### Which mechanism rejects each shipped forgery
+
+The four forgery tests in `prover/src/tests/prove_elfs_tests.rs` only observe that
+verification fails. The gate says *which mechanism* blocks each — the more useful
+fact, and the one that tells you what a future refactor would break.
+
+| shipped Rust forgery test | what it perturbs | the mechanism that rejects it | gate check |
+|---|---|---|---|
+| `forged_early_end_rejected` | `END := 1` on a data row | the `Zero` lookup (the sum no longer reads zero) **and** the three sends gated on `mu − end`, which vanish — so `DmaNext` and both `Memw` buses unbalance too. Not the `Zero` bus alone, as an earlier version of this table said | MAIN 1, and its `drop_zero_end` / `drop_halfword_count_decr` controls |
+| `forged_wide_tail_rejected` | `TAIL := 1` on a wide row | **overdetermined — at least five independent mechanisms reject it.** Row-locally: `step = 8 − 7·tail` breaks the *ungated* idx-9 `emit_add_pair` on `count`; idx 5-6 and 7-8 fail identically; idx 11-17 (`tail·value[i] = 0`) fail whenever the eight copied bytes are not all zero. On the buses: the `Alu` width pin (bus 20, multiplicity `mu`) sends `[count, 8, 0, LT, TAIL, 0]`, so with `TAIL = 1` on a `count ≥ 8` row it asks `lt.rs` for output 1 where that table holds 0 — no matching row, `Alu` unbalances; and `w8 = 1 − tail` changes the `Memw` width | MAIN 0 |
+| `forged_intermediate_source_rejected` | `SRC_0` **and** `SRC_INCR_0` shifted together | **nothing row-local** — the row's own ADD stays satisfied. The predecessor's `DmaNext` tuple no longer matches, and the source read no longer matches memory | CHAIN / CHAIN-F, exactly the check that treats `DmaNext` as a free bijection rather than an assumed chain |
+| `forged_value_rejected` | `VALUE[0]` | **not the copy relation** — read and write still agree with each other, because they are one set of columns. What rejects it is the `Memw` read no longer matching memory | **none.** Audit §D pins the one-set-of-columns wiring; no solver query establishes this one |
+
+Two rows repay attention. `forged_intermediate_source_rejected` is the case where
+per-row soundness is genuinely insufficient and the chain argument does the work —
+which is why the gate builds the bijection model instead of assuming rows are
+chained. And `forged_value_rejected` passes for a reason **no solver query
+establishes**: the only thing behind it is a textual fact about how two bus tuples
+are constructed. That asymmetry is why the gate and the audit are separate artifacts.
+
+> **How the `forged_wide_tail` cell got written, kept because it is instructive.**
+> An earlier version credited the `Alu` width pin alone. A review called that
+> incomplete, and the replacement over-corrected into *"**Not** the `Alu` width
+> pin"* — which is false; the pin does reject it, by the argument in the cell. The
+> chain was: a finder wrote "the Alu lookup is not what blocks it", that was
+> accepted without checking, and it was then sharpened into an explicit negation.
+> **An overstatement became a falsehood by being propagated.** When a mechanism is
+> overdetermined, "X rejects it" and "Y rejects it" are both true, and the tempting
+> edit — replacing one with the other — is the one that introduces the error.
+> Prefer "at least these", never "not that".
 
 ## The transcription audit
 
@@ -228,12 +458,52 @@ commit as the code it guards. Source is whitespace-normalised before literal
 matching, so a `rustfmt` reflow does not produce a spurious red — which matters,
 because a spurious red is how a check gets deleted rather than fixed.
 
-**Mutation-tested, and it needed it.** Eight source mutants; **four were initially
-missed**: an `if false` guard passed because a check asserted an error variant was
-*mentioned* rather than that the guard existed; §G's "no variant folds 64 bits into
-one element" searched for ASCII `2x` where the source writes `2×`, so the regex
-could never match; and the `DmaNext` tuple *order* was unpinned in two directions.
-An audit that cannot fail is not an audit.
+**Mutation-tested, and it needed it.** An audit that cannot fail is not an audit.
+Nine semantic mutants plus one must-not-fire control, applied to copies of the
+**Rust** source with the script re-run. (Distinct from `tamper_test.py`'s eight
+mutants, which perturb the **Python oracle** to test the anchors — two separate
+regression sets, and both happen to be about the same size.)
+
+| mutant | findings | notes |
+|---|---|---|
+| `timestamp_with_offset(2)` → `(1)` on the write tuple | 1 | |
+| the write tuple's `value_columns()` → eight zero constants | 1 | |
+| one `halfword(cols::COUNT_DECR_0)` send deleted | 3 | |
+| `DMA_MEMCPY_MAX_BYTES + 1` → `+ 2` in the bound lookup | 1 | |
+| the executor's `if n > DMA_MEMCPY_MAX_BYTES` guard → `if false` | 1 | **initially missed** — needed a strengthened check |
+| `num_bus_elements(DWordHL)` `2 → 1` | 2 | **initially missed entirely** — this is the gap R1 came through |
+| `num_bus_elements(DWordHHW)` `2 → 1` | 2 | added later: the first §G guard was **dark for this arm** (see below) |
+| `DmaNext` receiver tuple reordered (`SRC_0`↔`DST_0`) | 1 | **initially missed** — §D pinned membership, not order |
+| `DmaNext` sender tuple reordered (`SRC_INCR_0`↔`DST_INCR_0`) | 1 | **initially missed**, same cause |
+| a `rustfmt`-style reflow of `if tail { 1 } else { 8 }` | **0** | must NOT fire |
+
+**Four of the nine were initially missed, in a file whose entire job is catching
+exactly this.** The causes are worth naming because they are all the same species —
+a check that cannot fail:
+
+- The executor mutant: the check asserted the `DmaMemcpyChunkTooLarge` variant
+  appeared *before* the `checked_add` calls, which a guard rewritten to `if false`
+  satisfies. It now requires the literal predicate.
+- The packing mutants: §D checked only that the strings `DWordWL`/`DWordHL`
+  *appeared* in the two tuples, never that their element counts aligned. §G exists
+  now, and **it took three tries to make live** — which is the most on-thesis fact in
+  this file. The first searched ASCII `2x` where the source writes `2×` (U+00D7), so
+  it could never match. The second searched `Packing::\w+ => 1, // 2×`, matching only
+  arms whose comment *begins* `2×` — dark for `DWordHHW` ("Direct + Word2L") and
+  `DWordWHH`, both equally 64-bit, which is why the `DWordHHW` mutant is in the table
+  above. The third keys off the source's own `// Compounds` section marker, so all
+  seven compound arms are covered and a newly added variant is covered by default.
+  A guard written to close a gap was itself dark, twice, in a row.
+- The two ordering mutants: bus tuples were pinned by membership and not by ordinal
+  position, so a swap silently re-paired every field the gate models.
+
+**The reflow mutant must produce zero findings, and used to produce two.** The
+literal checks match fragments like `if tail { 1 } else { 8 }`, and `rustfmt` breaks
+those across lines the moment one grows past `max_width`. The original guard,
+`src.replace("\n", " ")`, collapsed the newline but left the indentation, so it
+could never match a reflowed form. `read()` now whitespace-normalises. This matters
+because the script is meant to run unattended: **a spurious red is how a check gets
+deleted rather than fixed.**
 
 ## Lessons worth carrying to the next gate
 
@@ -315,4 +585,34 @@ same conclusion by a different route.
    `Alu` bus (defence in depth — the pin is sound today), and DMA is the only
    high-volume table with no `max_rows`/chunking.
 
+### Still open, report-only
+
+Recorded rather than closed, so the next reviewer does not have to rediscover them.
+
+1. **`replay_dma_memcpy_for_sizing`** (`trace_builder.rs:1090`) is a
+   `#[cfg(feature = "disk-spill")]` duplicate of the payload logic in
+   `collect_dma_memcpy_ops` — lines 1117, 1140 and 1160-1168 mirror 1006, 1033 and
+   1060. `dma_ops_for_test` calls the primary directly, so **none of this
+   directory's mutation coverage reaches the mirror**; the five payload mutations
+   the Rust tests catch would all survive there. `count_table_lengths_drift_tests`
+   is the only thing touching it and it compares row counts, not payload fields.
+   Deduplicating is a change to shipped code and therefore out of scope for a
+   verification-only branch.
+2. **`count_table_lengths`** — the disk-spill sizing pass. Covered by the PR's own
+   `count_table_lengths_drift_tests.rs`; not re-derived here.
+3. **The `n = 0` ecall.** One row, both `first` and `end`, no `DmaNext` traffic, no
+   memory operations. Pinned by the completeness sweep and by
+   `empty_dma_call_is_a_single_first_and_terminal_row`, but it is the row shape most
+   likely to be broken by a future multiplicity change, because **every
+   multiplicity on it is zero** — nothing about it is load-bearing until it is.
+4. **Two ecalls at one timestamp.** Ruled out by CPU timestamps strictly increasing
+   per instruction (A4). Asserted, not verified here, and it is what the `DmaNext`
+   timestamp binding rests on.
+5. **The `## Results` block is still hand-copied.** `verify.log` is no longer on
+   this list — `make verify-dma` now diffs the gate's live output against the
+   committed transcript and fails if they disagree, so that file cannot go stale
+   silently. The `## Results` block above aggregates four sources by hand and can.
+
 No CI workflow runs any of this yet; `make verify-dma` is the entry point.
+Two cross-references point at siblings that are **not merged**:
+`formal_verification/keccak/` (PR #923) and `spec/dma.typ` (PR #931).
