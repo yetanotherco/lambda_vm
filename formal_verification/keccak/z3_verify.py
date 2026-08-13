@@ -102,9 +102,10 @@ def build_circuit(round_idx, tag, bug=None):
         # ByteAlu operand contract: field value must be a byte.
         # MUST be ULE, not `<=`: z3py's comparison operators on bitvectors are
         # SIGNED (SLE), so `expr <= 255` would also admit every value with the
-        # sign bit set (e.g. 0xFFFF passes at width 16). That is the fail-open
-        # direction — an out-of-range operand accepted as a byte turns a real
-        # SAT into a bogus UNSAT. Harmless at the widths used here (the operands
+        # sign bit set (e.g. 0xFFFF passes at width 16). That models the
+        # contract too weakly: the solver may exhibit an operand the real lookup
+        # can never supply, reporting a spurious counterexample against an
+        # honest chip. Harmless at the widths used here (the operands
         # are sums of two zero-extended bytes, ≤ 510), which is exactly why it
         # must be written correctly for the next chip that copies this contract.
         C.append(ULE(field_expr16, BitVecVal(255, 16)))
