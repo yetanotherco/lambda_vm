@@ -58,11 +58,11 @@ Each helper lookup is modeled by its contract, not its implementation:
 
 | Contract | Guarantee modeled |
 |---|---|
-| `ByteAlu(op, a, b, c)` | `a,b,c` are bytes and `c = a op b`, `op ∈ {XOR, AND, ADD}`. Operands passed as linear combinations must themselves be bytes — the lookup table only has byte rows — modeled as `Σ ≤ 255` on the field value with the low 8 bits used. |
+| `ByteAlu(op, a, b, c)` | `a,b,c` are bytes and `c = a op b`, `op ∈ {XOR, AND, OR}` (the three `BitwiseOperationType::ByteAlu*` rows; keccak_rnd uses only XOR and AND). Operands passed as linear combinations must themselves be bytes — the lookup table only has byte rows — modeled as `ULE(Σ, 255)` on the field value with the low 8 bits used. |
 | `AreBytes(a, b)` | both `a` and `b` lie in `0..256` (a range check). In QF-BV this is supplied structurally by declaring the column an 8-bit vector and packing pairs into 16 bits. |
 | `Hwsl(in16, s, left16, right16)` (halfword shift) | `left16 = (in16 << s) mod 2¹⁶`, `right16 = in16 >> (16 − s)` (with `right16 = 0` at `s = 0`). Keccak's θ/ρ shifts no longer *call* this lookup — they are inline linear identities (see "Which round variant") — but the QF-BV encoding of the decomposition is identical, so the same contract row models both. |
 | 32-bit / word recomposition lookups | a wide value equals the range-checked recomposition of its limbs (`word = Σ limb_i · 2^{8i}`), each limb a byte. Not exercised by keccak_rnd; listed because the template's next targets (e.g. 32-bit-lane hashes) need it. |
-| `KeccakRc(round, rc[8])` | `rc` = little-endian bytes of `KECCAK_RC[round]`. |
+| `KeccakRc(round, rc[8])` | `rc` = little-endian bytes of `KECCAK_RC[round]`, for `round ∈ [0, 24)`. The committed table also carries padding rows `24..31` with `rc = 0`, which this contract does **not** cover: the gate assumes they are unreachable, which holds by the bus topology (`keccak.rs` supplies the round endpoints as constants and chains `ROUND+1`) but is a cross-row property outside what QF-BV checks here. Pinning those rows to row 0 instead of zero would remove the assumption. |
 
 ## Mandatory discipline (do not skip any of these)
 
@@ -73,6 +73,20 @@ Each helper lookup is modeled by its contract, not its implementation:
    controls of two kinds — **changed** constraints and **removed** constraints —
    because an over-constrained model can hide a missing constraint. See
    `tamper_test.py` and the `bug=` cases in `z3_verify.py`.
+
+   **A constraint encoded as a variable's *sort* is outside the falsifiable set.**
+   Check for this explicitly — it is the one gap a full board of green controls
+   cannot reveal. Here, `AreBytes` on `Cxz_left`/`rot_left`/`rot_right` is carried by
+   declaring those variables 8-bit bitvectors, and the θ carry `Cxz_right` is pinned
+   directly to `ZeroExt(7, Extract(15, 15, in))`, with the separate `IS_BIT` disjunct
+   redundant *in the model*. Both are `load-bearing` in the circuit
+   (`keccak_rnd.rs:7-8`, `:840-842`: the 20 μ-gated `IS_BIT`s make the θ shift
+   decomposition unique). Because neither can be removed from the model's constraint
+   list, **deleting them from the Rust leaves this gate printing `VERIFIED`** while
+   the θ `left` halfwords go free — `2¹⁶` is invertible mod `p`, so the forged
+   assignment exists. The model's pin is a sound *consequence* of the shipped
+   constraints today, which is why the current board is meaningful; what it is not is
+   a test that those constraints are still there.
 
 2. **Positive control (non-vacuity).** Pin the input to a concrete value, drop the
    diff assertion, and confirm the constraint system is **SAT** *and* uniquely pins
@@ -123,11 +137,26 @@ encodes each shift as the *unique* decomposition those identities force —
 `left = (in << rnc) mod 2¹⁶`, `right = in >> (16 − rnc)`, the byte-pair widths
 supplying the `[0, 2¹⁶)` bound — so the gate is faithful to the inlined round even
 though the module comments describe it as the pre-inline "HWSL" circuit; the two are
-constraint-identical in QF-BV. Verified: main's `keccak_rnd.rs` is byte-identical to
-the branch this model was authored against, so the wiring the model transcribes is
-the shipped wiring. (The `rs:NNN` line citations in the code comments predate the
-inline change and have drifted by a few dozen lines; the referenced constructs are
-unchanged.)
+constraint-identical in QF-BV. Verified: `keccak_rnd.rs` is byte-identical across
+`main`, this branch, and `6a280121` (same git blob `51b7759f`), so the wiring the
+model transcribes is the shipped wiring.
+
+The `rs:NNN` line citations in the code comments are nevertheless **stale**. They were
+written against the pre-#889 revision (`d83b4d9e`, blob `1b121a8b`, 926 lines), where
+each lands exactly on the construct it names; **#889 — the change that inlined the
+HWSL shifts — invalidated them all.** Most now point at a neighbouring construct:
+`rs:539-588` ("theta: Cxz XOR chain") is the KeccakRc sender, the chain being at
+`546-597`; `rs:796-870` ("chi: AND then XOR") is Iota, Chi's AND/XOR being at
+`716-759` and `761-794`.
+
+Two cannot be repointed at all: `rs:593-631` (θ HWSL) and `rs:723-766` (ρ HWSL) cite
+`BusInteraction::sender(BusId::Hwsl, …)` blocks that #889 **deleted outright** — the
+file now contains zero `BusId::Hwsl` sends, and that content lives in the inline
+identities at `:882-894` and `:896-920`. So it is not the case that every referenced
+construct still exists.
+
+Locate a construct by its `// --- Step: … ---` banner rather than by these line
+numbers.
 
 **Known scope gap carried as the first follow-up:** QF-BV cannot test that the
 `AreBytes`/`IS_BIT` bounds are *sufficient* mod `p` for the inline identities (bit
@@ -154,9 +183,11 @@ first extension of this template.
 
 ## Sibling verifications following this method
 
-- The **BLAKE3 chip gate** and the **keccak-sponge** verification already use this
-  oracle+QF-BV+controls structure. This directory is the canonical write-up; new
-  chip gates should mirror its file layout and its Mandatory-discipline checklist.
+- The **BLAKE3 chip gate** (`thoughts/blake3/` on `feat/blake3-accelerator`, PR #903)
+  uses the same oracle+QF-BV+controls structure, under an older layout. It is not
+  merged, so it is cited by branch rather than by path.
+- This directory is the canonical write-up; new chip gates should mirror its file
+  layout and its Mandatory-discipline checklist.
 
 ## Files
 
@@ -181,10 +212,14 @@ pip install z3-solver            # if not already importable
 cd formal_verification/keccak
 python3 test_ref.py              # reference constants + SHA3 vs hashlib
 python3 test_dataflow.py         # concrete mirror vs reference (+ bug sanity)
-python3 z3_parallel.py           # the gate: 24 rounds + controls
+python3 z3_parallel.py           # the gate: 24 rounds + changed-constraint controls
 # or, single-process with inline printout:
 python3 z3_verify.py
+python3 tamper_test.py           # the removed-constraint controls (see discipline 1)
 ```
+
+`tamper_test.py` is not optional: `z3_parallel.py` runs only the *changed*-constraint
+controls, so a run that skips it exercises no **removed**-constraint control at all.
 
 Expected board: positive control PASS, all negative controls **SAT** (caught), all
 24 rounds **UNSAT**. Anything else is a real signal — investigate before trusting.
