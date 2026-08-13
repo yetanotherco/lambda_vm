@@ -756,10 +756,21 @@ fn the_wrap_commitments_match_across_residency_modes() {
 ///   lfm::wrap_tests::the_real_block_epoch_wraps -- --ignored --nocapture
 /// ```
 ///
-/// `LFM_CENSUS_EPOCH_LOG2` is the size knob and the reason this is a test rather
-/// than a fixed point: the largest epoch that fits is a property of the box, so
-/// a run climbs it until emission or proving runs out of memory. Every size that
-/// completes is a real artifact; the largest one that completes is the result.
+/// ## The two knobs, and which one actually binds
+///
+/// `LFM_CENSUS_EPOCH_LOG2` sets the epoch size and `LFM_WRAP_QUERIES` overrides
+/// the inner query count (default: the preset's 110, which is the secure one —
+/// anything lower is NOT a security parameter set and every number taken under
+/// it carries the count, exactly as
+/// [`the_wrap_proves_at_blowup_8_geometry`] does).
+///
+/// Measured on a 60 GiB box: the epoch size is the *weak* knob and the query
+/// count is the strong one. What decides whether a run fits is the number of
+/// `KECCAK_RND` chunks the wrap's own trace needs, and that is
+/// `(spine + per_query x queries) / 21,845` permutations. Per-query cost is
+/// dominated by leaf absorption, which is set by table WIDTH and so barely
+/// moves with epoch size — shrinking the epoch does not meaningfully shrink the
+/// chunk count, and shrinking the query count does, linearly.
 #[test]
 #[ignore]
 fn the_real_block_epoch_wraps() {
@@ -772,13 +783,25 @@ fn the_real_block_epoch_wraps() {
         );
     }
     let inputs = EpochInputs::from_env();
+    let mut inner = crate::recursion::Preset::Blowup4.options();
+    if let Ok(v) = std::env::var("LFM_WRAP_QUERIES") {
+        inner.fri_number_of_queries = v.parse().expect("LFM_WRAP_QUERIES must be an integer");
+    }
     println!(
-        "★ REAL-BLOCK WRAP: guest {}, {} bytes of private input, 2^{} cycles/epoch",
+        "★ REAL-BLOCK WRAP: guest {}, {} bytes of private input, 2^{} cycles/epoch, \
+         inner blowup {} / {} queries{}",
         inputs.label,
         inputs.private_input.len(),
         inputs.epoch_log2,
+        inner.blowup_factor,
+        inner.fri_number_of_queries,
+        if inner.fri_number_of_queries < 110 {
+            "  (REDUCED — not a security parameter set)"
+        } else {
+            "  (the secure preset)"
+        },
     );
-    wrap_run_from(crate::recursion::Preset::Blowup4.options(), inputs);
+    wrap_run_from(inner, inputs);
 }
 
 /// The census and shape of the assembled verifier WITHOUT proving it — the cheap
