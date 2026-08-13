@@ -203,9 +203,13 @@ pub struct Backend {
     pub keccak_merkle_tail: CudaFunction,
     pub merkle_gather_paths: CudaFunction,
 
-    // blake3.cubin — the parity-harness probes, which are the only host-visible
-    // handle on the device compression function and byte serialization (see
-    // `kernels/blake3.cu`).
+    // blake3.cubin — the Merkle level/tail compressors, plus the parity-harness
+    // probes that are the only host-visible handle on the device compression
+    // function and byte serialization (see `kernels/blake3.cu`). The multi-block
+    // leaf kernels are not here yet: they need the chaining construction decided
+    // (PA-PLAN §1.6).
+    pub blake3_merkle_level: CudaFunction,
+    pub blake3_merkle_tail: CudaFunction,
     pub blake3_compress_probe_6r: CudaFunction,
     pub blake3_compress_probe_7r: CudaFunction,
     pub blake3_compress_probe_default: CudaFunction,
@@ -444,6 +448,8 @@ impl Backend {
             keccak_merkle_level: keccak.load_function("keccak_merkle_level")?,
             keccak_merkle_tail: keccak.load_function("keccak_merkle_tail")?,
             merkle_gather_paths: keccak.load_function("merkle_gather_paths")?,
+            blake3_merkle_level: blake3.load_function("blake3_merkle_level")?,
+            blake3_merkle_tail: blake3.load_function("blake3_merkle_tail")?,
             blake3_compress_probe_6r: blake3.load_function("blake3_compress_probe_6r")?,
             blake3_compress_probe_7r: blake3.load_function("blake3_compress_probe_7r")?,
             blake3_compress_probe_default: blake3.load_function("blake3_compress_probe_default")?,

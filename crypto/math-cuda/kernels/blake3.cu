@@ -1,6 +1,6 @@
-// BLAKE3 compression on device, round-count parameterized, plus the
-// field-element byte serialization the leaf kernels share with the CPU commit
-// path.
+// BLAKE3 compression on device, round-count parameterized, plus the Merkle
+// parent compressors and the field-element byte serialization the leaf kernels
+// share with the CPU commit path.
 //
 // THE PARITY REFERENCE is the host `blake3_compress_rounds(h, m, t, block_len,
 // flags, rounds)` in `prover/src/lfm/blake3.rs:125` — one function whose ONLY
@@ -38,6 +38,16 @@ __device__ __constant__ uint32_t BLAKE3_IV[8] = {
     0x6A09E667u, 0xBB67AE85u, 0x3C6EF372u, 0xA54FF53Au,
     0x510E527Fu, 0x9B05688Cu, 0x1F83D9ABu, 0x5BE0CD19u,
 };
+
+// CHUNK_START | CHUNK_END | ROOT: the flags of a BLAKE3 hash whose whole message
+// is one block of one chunk. At 7 rounds a compression under these flags with
+// `h = IV` and `t = 0` IS `blake3::hash(message)`, which is what makes the crate
+// an anchor for the framing and not just for the round function. Same framing
+// the live LFM socket uses (`blake3_socket.rs:258` `FLAGS_LFMC = 0x0B`).
+#define BLAKE3_FLAGS_ONE_BLOCK 0x0Bu
+
+// A Merkle parent's message is two 32-byte child digests = exactly 64 bytes.
+#define BLAKE3_PARENT_BLOCK_LEN 64u
 
 __device__ __forceinline__ uint32_t rotr32(uint32_t x, uint32_t n) {
     // Every call site passes 16, 12, 8 or 7, so the 32-n shift is never a
@@ -186,6 +196,82 @@ struct Blake3Block {
 };
 
 // ---------------------------------------------------------------------------
+// Merkle parent / level compressors.
+//
+// A parent is ONE compression over the 64 bytes of its two child digests:
+// `h = IV`, `t = 0`, `block_len = 64`, `flags = CHUNK_START|CHUNK_END|ROOT`,
+// digest = `out[0..8]` little-endian. That is `hash_bytes(left ‖ right)`, which
+// is what `hash_new_parent` is on host for every existing backend
+// (`hash_new_parent_bytes`, `field_element_vector.rs:74`) — so a parent needs no
+// chaining and is construction-independent: with a single-block message the
+// chunk tree and a bare cv-chain agree bit-for-bit.
+//
+// The u32 casts are byte-order-free in both directions and that is not an
+// accident: a digest's 32 bytes ARE its 8 output words little-endian, and BLAKE3
+// reads message bytes as little-endian words, so on a little-endian device
+// (every NVIDIA GPU) reading a child digest as `uint32_t[8]` yields exactly the
+// message words, and storing `out[0..8]` as u32 yields exactly the digest bytes.
+// No byte swapping anywhere on this path — contrast the leaf path above, whose
+// input is big-endian field bytes.
+//
+// Node buffer layout mirrors `keccak.cu`'s and the CPU
+// `crypto/crypto/src/merkle_tree/merkle.rs`: children at
+// `nodes[parent_begin + n_pairs .. parent_begin + 3*n_pairs]`, parents at
+// `nodes[parent_begin .. parent_begin + n_pairs]`, 32 bytes per node.
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ void blake3_hash_merkle_parent(uint8_t *nodes, uint64_t parent_begin,
+                                                          uint64_t n_pairs, uint64_t tid) {
+    // `nodes` comes from cuMemAlloc (256-byte aligned) and every 32-byte node
+    // sits at a 32-byte-aligned offset, so the u32 casts are safe.
+    const uint32_t *left = reinterpret_cast<const uint32_t *>(
+        nodes + (parent_begin + n_pairs + 2 * tid) * 32);
+    const uint32_t *right = reinterpret_cast<const uint32_t *>(
+        nodes + (parent_begin + n_pairs + 2 * tid + 1) * 32);
+
+    uint32_t m[16];
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        m[i] = left[i];
+        m[i + 8] = right[i];
+    }
+
+    uint32_t out[16];
+    blake3_compress<BLAKE3_ROUNDS>(BLAKE3_IV, m, 0, BLAKE3_PARENT_BLOCK_LEN,
+                                   BLAKE3_FLAGS_ONE_BLOCK, out);
+
+    uint32_t *dst = reinterpret_cast<uint32_t *>(nodes + (parent_begin + tid) * 32);
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) dst[i] = out[i];
+}
+
+// One level of the inner Merkle tree: each thread hashes one child pair.
+extern "C" __global__ void blake3_merkle_level(uint8_t *nodes,
+                                               uint64_t parent_begin,  // in 32-byte nodes
+                                               uint64_t n_pairs) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n_pairs) return;
+    blake3_hash_merkle_parent(nodes, parent_begin, n_pairs, tid);
+}
+
+// Build every remaining level (from `level_begin` up to the root) in ONE
+// single-block launch: each level's pairs are grid-strided over the block, with
+// a __syncthreads() barrier between levels. Replaces log2 launches of
+// `blake3_merkle_level` for the small top levels, whose per-level work is
+// dwarfed by launch overhead. Twin of `keccak_merkle_tail`.
+extern "C" __global__ void blake3_merkle_tail(uint8_t *nodes, uint64_t level_begin) {
+    uint64_t lb = level_begin;
+    while (lb != 0) {
+        uint64_t nb = lb / 2;
+        uint64_t n_pairs = lb - nb;
+        for (uint64_t tid = threadIdx.x; tid < n_pairs; tid += blockDim.x) {
+            blake3_hash_merkle_parent(nodes, nb, n_pairs, tid);
+        }
+        __syncthreads();
+        lb = nb;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Parity-harness entry points.
 //
 // The device compression function is not otherwise reachable from host code, so
@@ -222,7 +308,7 @@ extern "C" __global__ void blake3_compress_probe_7r(const uint32_t *h, const uin
 
 // The same probe at the round count this cubin's PRODUCTION kernels are built
 // for. Not redundant with the two above: it is the only way to observe from host
-// code which of them the production kernels use.
+// code which of them `blake3_merkle_level` actually uses.
 extern "C" __global__ void blake3_compress_probe_default(const uint32_t *h, const uint32_t *m,
                                                          const uint64_t *t,
                                                          const uint32_t *block_len,
