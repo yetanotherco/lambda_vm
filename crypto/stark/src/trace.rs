@@ -213,6 +213,22 @@ where
         self.main_trace_dev = None;
     }
 
+    /// Free the auxiliary columns, keeping the declared aux width.
+    ///
+    /// Called by `multi_prove` under `ResidencyMode::RecomputeLde` once a
+    /// table's proof exists: `allocate_aux_table` writes the LogUp columns into
+    /// this caller-owned trace and nothing reads them afterwards, so under that
+    /// mode they are released rather than carried to the end of the prove.
+    /// Callers that do read a trace's aux columns after proving must use
+    /// `ResidencyMode::Retain`.
+    pub fn release_aux_columns(&mut self) {
+        self.aux_table = Table::new(Vec::new(), self.aux_table.width);
+        #[cfg(feature = "cuda")]
+        {
+            self.aux_resident = None;
+        }
+    }
+
     pub fn num_steps(&self) -> usize {
         debug_assert!(self.main_table.height.is_multiple_of(self.step_size));
         self.main_table.height / self.step_size

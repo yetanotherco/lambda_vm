@@ -27,6 +27,7 @@ use crate::debug::validate_trace;
 use crate::fri;
 use crate::lookup::LOGUP_NUM_CHALLENGES;
 use crate::proof::stark::{DeepPolynomialOpenings, PolynomialOpenings};
+use crate::residency_mode::ResidencyMode;
 #[cfg(feature = "disk-spill")]
 use crate::storage_mode::StorageMode;
 use crate::table::Table;
@@ -295,6 +296,19 @@ struct Lde<Field: IsFFTField, FieldExtension: IsField> {
     gpu_main: Option<math_cuda::lde::GpuLdeBase>,
     #[cfg(feature = "cuda")]
     gpu_aux: Option<math_cuda::lde::GpuLdeExt3>,
+}
+
+/// A table's Round-1 main LDE, held between the main commit and the table's
+/// fused task.
+///
+/// `Dropped` is the `ResidencyMode::RecomputeLde` state. It carries no buffer
+/// at all, so a consumer added between Round 1 and the fused task cannot read
+/// empty data believing it is an LDE — it has to handle the recompute arm or
+/// fail to compile. That is the loud guard for the one real risk in dropping
+/// the buffer: a retention point the audit missed.
+enum MainLdeSlot<Field: IsField> {
+    Retained((Vec<FieldElement<Field>>, usize)),
+    Dropped { num_cols: usize },
 }
 
 impl<Field, FieldExtension, H> Round1Commitments<Field, FieldExtension, H>
@@ -1077,18 +1091,22 @@ pub trait IsStarkProver<
         precomputed: Option<(Commitment, usize)>,
         #[cfg(feature = "cuda")] device_only: bool,
         #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
+        #[cfg_attr(not(feature = "cuda"), allow(unused_variables))] residency: ResidencyMode,
     ) -> Result<MainCommitTuple<Field, H>, ProvingError>
     where
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
     {
-        let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
-
         // Fused GPU path (cuda only): row-major NTT — single H2D from the
         // already-row-major trace, no column extraction, no transpose.
         // Falls back to CPU if GPU path returns None.
+        //
+        // `RecomputeLde` skips both device paths: the LDE it drops after this
+        // commit is recomputed on the host, so the buffer the tree was built
+        // from must be the host one. Same posture as disk-spill — the mode is
+        // for CPU proving and forces the host path per table.
         #[cfg(feature = "cuda")]
-        if precomputed.is_none() {
+        if precomputed.is_none() && !residency.recomputes_main_lde() {
             let (trace_slice, num_cols) = trace.main_data_row_major();
             let n = if num_cols > 0 {
                 trace_slice.len() / num_cols
@@ -1141,7 +1159,9 @@ pub trait IsStarkProver<
         // are gathered on device. The handle keeps the LDE device-resident for
         // the downstream GPU rounds.
         #[cfg(feature = "cuda")]
-        if let Some((expected_precomputed_root, num_precomputed)) = precomputed {
+        if let Some((expected_precomputed_root, num_precomputed)) = precomputed
+            && !residency.recomputes_main_lde()
+        {
             let (trace_slice, num_cols) = trace.main_data_row_major();
             let n = if num_cols > 0 {
                 trace_slice.len() / num_cols
@@ -1219,28 +1239,16 @@ pub trait IsStarkProver<
         // (one memcpy — no transpose) and expand in place with the cache-blocked
         // batched two-half FFT. Row-major end-to-end: no LDE-size transpose,
         // contiguous Merkle leaves.
-        let (trace_data, total_cols) = trace.main_data_row_major();
-
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
 
-        let mut main_data: Vec<FieldElement<Field>> = Vec::with_capacity(lde_size * total_cols);
-        main_data.extend_from_slice(trace_data);
-
-        #[cfg(feature = "disk-spill")]
-        if storage_mode == StorageMode::Disk {
-            trace.main_table.advise_drop_cache();
-        }
-
-        Polynomial::<FieldElement<Field>>::coset_lde_full_expand_row_major::<Field>(
-            &mut main_data,
-            total_cols,
-            domain.blowup_factor,
-            &twiddles.coset_weights,
-            &twiddles.two_half_inv,
-            &twiddles.two_half_fwd,
-        )
-        .expect("row-major coset LDE expansion");
+        let (main_data, total_cols) = Self::expand_main_lde_row_major(
+            trace,
+            domain,
+            twiddles,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        );
 
         #[cfg(feature = "instruments")]
         let main_lde_dur = t_sub.elapsed();
@@ -1328,6 +1336,44 @@ pub trait IsStarkProver<
         return Ok((commit, (main_data, total_cols), None));
         #[cfg(not(feature = "cuda"))]
         Ok((commit, (main_data, total_cols)))
+    }
+
+    /// Expand a table's main trace to its coset LDE, row-major, without
+    /// building any Merkle tree.
+    ///
+    /// The Round-1 CPU commit and the `ResidencyMode::RecomputeLde` recompute
+    /// both go through here, which is what makes the recomputed buffer
+    /// bit-identical to the one the tree was built from — identical by
+    /// construction rather than by argument. The twiddles are process-cached,
+    /// so the second call re-runs the NTT over the same inputs.
+    fn expand_main_lde_row_major(
+        trace: &TraceTable<Field, FieldExtension>,
+        domain: &Domain<Field>,
+        twiddles: &LdeTwiddles<Field>,
+        #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
+    ) -> (Vec<FieldElement<Field>>, usize) {
+        let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
+        let (trace_data, total_cols) = trace.main_data_row_major();
+
+        let mut main_data: Vec<FieldElement<Field>> = Vec::with_capacity(lde_size * total_cols);
+        main_data.extend_from_slice(trace_data);
+
+        #[cfg(feature = "disk-spill")]
+        if storage_mode == StorageMode::Disk {
+            trace.main_table.advise_drop_cache();
+        }
+
+        Polynomial::<FieldElement<Field>>::coset_lde_full_expand_row_major::<Field>(
+            &mut main_data,
+            total_cols,
+            domain.blowup_factor,
+            &twiddles.coset_weights,
+            &twiddles.two_half_inv,
+            &twiddles.two_half_fwd,
+        )
+        .expect("row-major coset LDE expansion");
+
+        (main_data, total_cols)
     }
 
     /// Spill a committed Merkle tree to disk when `storage_mode` is `Disk`,
@@ -3056,6 +3102,7 @@ pub trait IsStarkProver<
         #[allow(unused_mut)] mut air_trace_pairs: Vec<AirTracePair<'_, Field, FieldExtension, PI>>,
         transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone + Send),
         #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
+        residency: ResidencyMode,
     ) -> Result<MultiProof<Field, FieldExtension, PI>, ProvingError>
     where
         FieldElement<Field>: AsBytes,
@@ -3067,6 +3114,16 @@ pub trait IsStarkProver<
         <FieldExtension as IsField>::BaseType: SpillSafe,
     {
         info!("Started proof generation...");
+
+        // `debug-checks` reconstructs every table's Round 1 from retained state
+        // between the aux and rounds stages, so the recompute mode's dropped
+        // buffers have no meaning there. Forcing `Retain` keeps the debug build
+        // checking what it always checked.
+        #[cfg(feature = "debug-checks")]
+        let residency = {
+            let _ = residency;
+            ResidencyMode::Retain
+        };
 
         #[cfg(feature = "instruments")]
         crate::instruments::reset_all();
@@ -3165,7 +3222,7 @@ pub trait IsStarkProver<
         let __sp = crate::instruments::span("r1_main_commit");
 
         let mut main_commits: Vec<TableCommit<Field, H>> = Vec::with_capacity(num_airs);
-        let mut main_ldes: Vec<(Vec<FieldElement<Field>>, usize)> = Vec::with_capacity(num_airs);
+        let mut main_ldes: Vec<MainLdeSlot<Field>> = Vec::with_capacity(num_airs);
         // Optional device-side LDE handle per table, populated only when the
         // R1 fused GPU pipeline produced one. Pairing is by index: this vector
         // is moved into the per-table `gpu_main_cells` mutex slots below, and
@@ -3207,6 +3264,7 @@ pub trait IsStarkProver<
                     device_only,
                     #[cfg(feature = "disk-spill")]
                     storage_mode,
+                    residency,
                 )
             },
         );
@@ -3221,7 +3279,15 @@ pub trait IsStarkProver<
             }
             transcript.append_bytes(&commit.root);
             main_commits.push(commit);
-            main_ldes.push(cached_main);
+            // The root is in the transcript; that is all Fiat-Shamir asks of
+            // this phase. Under `RecomputeLde` the buffer it was built from
+            // dies here and the table's fused task rebuilds it from the trace.
+            main_ldes.push(match residency {
+                ResidencyMode::Retain => MainLdeSlot::Retained(cached_main),
+                ResidencyMode::RecomputeLde => MainLdeSlot::Dropped {
+                    num_cols: cached_main.1,
+                },
+            });
             #[cfg(feature = "cuda")]
             main_gpu_handles.push(gpu_main);
         }
@@ -3263,6 +3329,16 @@ pub trait IsStarkProver<
         // disable the GPU-resident aux build (it would keep them device-only).
         #[cfg(all(feature = "cuda", feature = "disk-spill"))]
         if storage_mode == StorageMode::Disk {
+            for (_, trace, _) in air_trace_pairs.iter_mut() {
+                trace.set_resident_aux_ok(false);
+            }
+        }
+
+        // `RecomputeLde` already forced the main commit onto the host path;
+        // keeping the aux build there too makes the mode wholly host-side, which
+        // is what its aux release at the end of each fused task acts on.
+        #[cfg(feature = "cuda")]
+        if residency.recomputes_main_lde() {
             for (_, trace, _) in air_trace_pairs.iter_mut() {
                 trace.set_resident_aux_ok(false);
             }
@@ -3330,10 +3406,7 @@ pub trait IsStarkProver<
             .into_iter()
             .map(|c| std::sync::Mutex::new(Some(c)))
             .collect();
-        #[allow(clippy::type_complexity)]
-        let main_lde_cells: Vec<
-            std::sync::Mutex<Option<(Vec<FieldElement<Field>>, usize)>>,
-        > = main_ldes
+        let main_lde_cells: Vec<std::sync::Mutex<Option<MainLdeSlot<Field>>>> = main_ldes
             .into_iter()
             .map(|l| std::sync::Mutex::new(Some(l)))
             .collect();
@@ -3555,11 +3628,33 @@ pub trait IsStarkProver<
                 .unwrap()
                 .take()
                 .expect("main commit consumed once per table");
-            let main_lde = main_lde_cells[idx]
+            let main_lde = match main_lde_cells[idx]
                 .lock()
                 .unwrap()
                 .take()
-                .expect("main lde consumed once per table");
+                .expect("main lde consumed once per table")
+            {
+                MainLdeSlot::Retained(lde) => lde,
+                // The Merkle tree was kept, so this is one forward NTT and no
+                // re-hashing: the root openings are checked against is still
+                // the root Round 1 absorbed. The buffer dies with this task.
+                MainLdeSlot::Dropped { num_cols } => {
+                    #[cfg(feature = "instruments")]
+                    let __sp_recompute = crate::instruments::span("r1_main_lde_recompute_table");
+                    let recomputed = Self::expand_main_lde_row_major(
+                        &**trace,
+                        domain,
+                        twiddles,
+                        #[cfg(feature = "disk-spill")]
+                        storage_mode,
+                    );
+                    assert_eq!(
+                        recomputed.1, num_cols,
+                        "recomputed main LDE width must match the committed one"
+                    );
+                    recomputed
+                }
+            };
             #[cfg(feature = "cuda")]
             let gpu_main = gpu_main_cells[idx].lock().unwrap().take();
             let commitment = Round1Commitments {
@@ -3589,7 +3684,7 @@ pub trait IsStarkProver<
                             commitment: Round1Commitments<Field, FieldExtension, H>,
                             lde: Lde<Field, FieldExtension>|
          -> Result<StarkProof<Field, FieldExtension, PI>, ProvingError> {
-            let pair = pair_cells[idx].lock().unwrap();
+            let mut pair = pair_cells[idx].lock().unwrap();
             let (air, trace, pub_inputs) = &*pair;
             let _ = trace; // used by instruments
             let domain = &domains[idx];
@@ -3625,6 +3720,15 @@ pub trait IsStarkProver<
                     table_start.elapsed(),
                     sub_ops,
                 ));
+            }
+
+            // Phase B of the recompute contract: this table's proof exists, so
+            // its aux columns are dead weight for the rest of the prove. They
+            // live in the caller's trace and would otherwise survive to the end
+            // of `multi_prove` — the second-largest per-table retention after
+            // the main LDE.
+            if residency.recomputes_main_lde() {
+                pair.1.release_aux_columns();
             }
             Ok(proof)
         };
@@ -3734,6 +3838,7 @@ pub trait IsStarkProver<
             transcript,
             #[cfg(feature = "disk-spill")]
             StorageMode::Ram,
+            ResidencyMode::Retain,
         )
         .map(|mut multi_proof| multi_proof.proofs.remove(0))
     }

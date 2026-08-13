@@ -266,6 +266,7 @@ fn prove_traces(
         &mut t,
         #[cfg(feature = "disk-spill")]
         Default::default(),
+        stark::residency_mode::ResidencyMode::Retain,
     )
 }
 

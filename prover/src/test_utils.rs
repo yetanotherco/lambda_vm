@@ -143,6 +143,7 @@ where
         transcript,
         #[cfg(feature = "disk-spill")]
         StorageMode::Ram,
+        stark::residency_mode::ResidencyMode::Retain,
     )
 }
 

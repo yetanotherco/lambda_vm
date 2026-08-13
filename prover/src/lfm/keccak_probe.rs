@@ -120,6 +120,7 @@ fn prove_traces(
         &mut t,
         #[cfg(feature = "disk-spill")]
         Default::default(),
+        Default::default(),
     )
 }
 

@@ -793,6 +793,7 @@ fn prove_epoch(
         &mut seed(),
         #[cfg(feature = "disk-spill")]
         stark::storage_mode::StorageMode::Ram,
+        stark::residency_mode::ResidencyMode::Retain,
     )
     .map_err(|e| Error::Prover(format!("{e:?}")))?;
 
@@ -990,6 +991,7 @@ fn prove_global(
         ),
         #[cfg(feature = "disk-spill")]
         stark::storage_mode::StorageMode::Ram,
+        stark::residency_mode::ResidencyMode::Retain,
     )
     .map_err(|e| Error::Prover(format!("{e:?}")))
 }

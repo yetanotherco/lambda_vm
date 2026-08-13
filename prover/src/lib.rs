@@ -1227,6 +1227,7 @@ pub fn prove_with_options_and_inputs(
         &mut transcript,
         #[cfg(feature = "disk-spill")]
         storage_mode,
+        stark::residency_mode::ResidencyMode::Retain,
     )
     .map_err(|e| Error::Prover(format!("{e:?}")))?;
     #[cfg(feature = "instruments")]

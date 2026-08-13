@@ -208,6 +208,7 @@ fn craft_proof(
         &mut transcript,
         #[cfg(feature = "disk-spill")]
         stark::storage_mode::StorageMode::Ram,
+        stark::residency_mode::ResidencyMode::Retain,
     )?;
 
     Ok(VmProof {
@@ -712,6 +713,7 @@ fn craft_proof_with_duplicate_page(
         &mut transcript,
         #[cfg(feature = "disk-spill")]
         stark::storage_mode::StorageMode::Ram,
+        stark::residency_mode::ResidencyMode::Retain,
     )
     // The injected duplicate page writes only FINI, a main-trace column, and every
     // page's OFFSET/INIT stays honest — so the preprocessed check cannot fire and

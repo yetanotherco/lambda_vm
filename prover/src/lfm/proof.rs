@@ -15,6 +15,7 @@ use stark::proof::options::ProofOptions;
 use stark::proof::stark::MultiProof;
 use stark::proof::view::MultiProofView;
 use stark::prover::{IsStarkProver, Prover, ProvingError};
+use stark::residency_mode::ResidencyMode;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
 use crate::tables::types::{BusId, GoldilocksExtension, GoldilocksField};
@@ -148,6 +149,7 @@ pub(crate) fn prove_traces_with_hasher(
         &mut transcript,
         #[cfg(feature = "disk-spill")]
         crate::auto_storage::decide_lfm(),
+        ResidencyMode::Retain,
     )
 }
 
