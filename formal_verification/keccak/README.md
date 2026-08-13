@@ -162,8 +162,7 @@ first extension of this template.
 
 - `z3_verify.py` — the gate: free-var QF-BV model of the round, the typed contracts,
   the 24-round UNSAT check, the positive control, and the `bug=` negative controls.
-- `z3_parallel.py`, `par.log` — parallel driver + captured board (all-UNSAT ×24 +
-  controls).
+- `z3_parallel.py` — parallel driver for the gate (all-UNSAT ×24 + controls).
 - `tamper_test.py` — changed-constraint **and** removed-constraint controls, with the
   forged witnesses exhibited for the removed-constraint cases.
 - `keccak_ref.py`, `test_ref.py` — independent FIPS-202 reference (RC/RHO generated
@@ -182,7 +181,7 @@ pip install z3-solver            # if not already importable
 cd formal_verification/keccak
 python3 test_ref.py              # reference constants + SHA3 vs hashlib
 python3 test_dataflow.py         # concrete mirror vs reference (+ bug sanity)
-python3 z3_parallel.py           # the gate: 24 rounds + controls (see par.log)
+python3 z3_parallel.py           # the gate: 24 rounds + controls
 # or, single-process with inline printout:
 python3 z3_verify.py
 ```
