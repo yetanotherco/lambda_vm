@@ -12,6 +12,13 @@ on:
       - 'executor/**'
       - 'bin/cli/**'
       - 'tooling/ethrex-fixtures/**'
+      # syscalls is linked into the guest ELF this job builds, so a change confined to
+      # it changes the bytes proven — a guest allocator swap moves cycles on every
+      # workload. Without it main's baseline would stay stale until some prover file
+      # happened to change, and the comparison guard would suppress the table until
+      # then. pr_main.yaml:99 already hashes 'syscalls/**' into the guest-ELF cache
+      # key; the two lists must agree on what rebuilds the guest.
+      - 'syscalls/**'
       # A baseline is only valid for the workload it measured, and the Makefile is
       # what defines that workload: it names the block and pins the URL and sha256
       # of the .bin this job fetches. Without it a repointed block would leave
@@ -28,6 +35,7 @@ on:
   #     - 'crypto/**'
   #     - 'executor/**'
   #     - 'bin/cli/**'
+  #     - 'syscalls/**'
 
 permissions:
   contents: read
