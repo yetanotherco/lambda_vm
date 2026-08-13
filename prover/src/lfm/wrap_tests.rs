@@ -37,6 +37,7 @@ use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};
 
 use super::airs::{LfmChipCells, lfm_cell_counts, lfm_chip_census};
 use super::compiler::LfmProgram;
+use super::epoch_tests::EpochInputs;
 use super::executor::execute;
 use super::hash::TestPermutation;
 use super::instr::Instr;
@@ -369,11 +370,18 @@ fn inner_blowup_8_with_queries(queries: usize) -> ProofOptions {
     o
 }
 
-/// The wrap, end to end, under supplied INNER proof options: build the epoch,
-/// emit the verifier, prove it, verify it, and run the three falsifications.
+/// The wrap, end to end, under supplied INNER proof options, over whatever epoch
+/// [`EpochInputs::from_env`] names — the fibonacci fixture unless a measurement
+/// run overrode it.
 fn wrap_run(inner: ProofOptions) {
+    wrap_run_from(inner, EpochInputs::from_env());
+}
+
+/// [`wrap_run`] over an explicitly supplied epoch: build it, emit the verifier,
+/// prove it, verify it, and run the three falsifications.
+fn wrap_run_from(inner: ProofOptions, inputs: EpochInputs) {
     let t_epoch = Instant::now();
-    let e = super::epoch_tests::real_epoch_with(inner.clone());
+    let e = super::epoch_tests::real_epoch_from(inner.clone(), inputs);
     let profile = epoch_profile(&e);
     println!(
         "inner epoch: {} sub-proofs, blowup {}, {} quer{} per table, grinding {} — built in {:.1}s",
@@ -591,28 +599,48 @@ fn wrap_run(inner: ProofOptions) {
 }
 
 /// ★ THE RESIDENCY ORACLE — `ResidencyMode::RecomputeLde` produces the same wrap
-/// proof, byte for byte, as `Retain`.
+/// commitments as `Retain`.
 ///
 /// [`crate::tests::residency_mode_tests`] in the stark crate pins the mechanism
-/// on a three-table toy. This pins it on the workload the mode exists for: the
-/// wrap has preprocessed tables (whose main LDE carries the precomputed columns
-/// the split trees were built from), `KECCAK_RND` chunks (the family whose
-/// retention the mode drops), and the real transcript. If a recomputed LDE
-/// disagreed with the tree Round 1 committed anywhere in that set, the openings
-/// it answers would not match and this comparison would move.
+/// on a three-table toy, byte for byte. This pins it on the workload the mode
+/// exists for: the wrap has preprocessed tables (whose main LDE carries the
+/// precomputed columns the split trees were built from), `KECCAK_RND` chunks
+/// (the family whose retention the mode drops), and the real transcript.
 ///
-/// Both runs execute and build traces from scratch, so a byte match also says
-/// the LFM trace build is deterministic across runs in one process — the
-/// precondition the whole oracle rests on.
+/// ## Why this compares commitments and not proof bytes
 ///
-/// `#[ignore]`d for the same reason as [`the_wrap_proves_and_verifies`], twice
-/// over: it proves the wrap two times.
+/// Proving is **not** reproducible run to run, and it is worth being exact
+/// about why, because the fixture-blob note in
+/// [`super::proof_fixture`] attributes it to sub-proofs committing to different
+/// roots — which is not what happens here. Measured on this test: two runs
+/// build byte-identical LFM traces, produce identical roots at every stage, and
+/// still serialize to different proof bytes. The cause is the grinding search,
+/// `grinding::generate_nonce`, which under the `parallel` feature is
+/// `into_par_iter().find_any(..)` — *any* valid nonce, so which one comes back
+/// depends on thread scheduling. The nonce is absorbed before the query indices
+/// are sampled, so a different nonce opens different leaves. Both proofs are
+/// valid; grinding is a proof of work and any witness satisfies it.
+///
+/// So everything the nonce cannot reach is compared, which is everything the
+/// recomputed LDE feeds: the main, aux, precomputed, composition and FRI-layer
+/// roots, the out-of-domain evaluations, the final polynomial, and the bus
+/// public inputs. A recomputed LDE that disagreed with the tree Round 1
+/// committed would move the composition root and the OOD evaluations — the two
+/// values in that set derived from the LDE rather than from the trace.
+///
+/// The run is its own control: `Retain` is proved twice, and the first
+/// comparison is `Retain` against `Retain`. If that one ever fails, the
+/// nondeterminism has reached the commitments and this oracle — not the
+/// residency mode — is what needs fixing.
+///
+/// `#[ignore]`d for the same reason as [`the_wrap_proves_and_verifies`], three
+/// times over: it proves the wrap three times.
 ///
 /// Run with:
-/// `cargo test --release -p lambda-vm-prover --lib lfm::wrap_tests::the_wrap_is_byte_identical_across_residency_modes -- --ignored --nocapture`
+/// `cargo test --release -p lambda-vm-prover --lib lfm::wrap_tests::the_wrap_commitments_match_across_residency_modes -- --ignored --nocapture`
 #[test]
 #[ignore]
-fn the_wrap_is_byte_identical_across_residency_modes() {
+fn the_wrap_commitments_match_across_residency_modes() {
     use stark::residency_mode::ResidencyMode;
 
     let e = super::epoch_tests::real_epoch_with(super::proof_fixture::fixture_options());
@@ -621,7 +649,7 @@ fn the_wrap_is_byte_identical_across_residency_modes() {
     let opts = wrap_options();
     let artifacts = build_artifacts(&program, &opts);
 
-    let bytes_under = |residency: ResidencyMode| {
+    let prove_under = |residency: ResidencyMode| {
         let t = Instant::now();
         let proved = lfm_prove_with_residency(
             &program,
@@ -645,27 +673,112 @@ fn the_wrap_is_byte_identical_across_residency_modes() {
             ),
             "the wrap proof must verify under {residency:?}"
         );
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&proved.proof)
-            .expect("the wrap proof must serialize")
-            .to_vec();
-        println!(
-            "   {residency:?}: proved in {secs:.1}s, verified, {} bytes",
-            bytes.len()
-        );
-        bytes
+        println!("   {residency:?}: proved in {secs:.1}s, verified");
+        proved
     };
 
-    let retained = bytes_under(ResidencyMode::Retain);
-    let recomputed = bytes_under(ResidencyMode::RecomputeLde);
+    // Everything the grinding nonce cannot reach.
+    let commitments = |p: &super::proof::LfmProof| {
+        p.proof
+            .proofs
+            .iter()
+            .map(|q| {
+                (
+                    q.trace_length,
+                    q.lde_trace_main_merkle_root,
+                    q.lde_trace_aux_merkle_root,
+                    q.lde_trace_precomputed_merkle_root,
+                    q.composition_poly_root,
+                    q.composition_poly_parts_ood_evaluation.clone(),
+                    q.trace_ood_evaluations.row_major_data().to_vec(),
+                    q.trace_ood_next_evaluations.row_major_data().to_vec(),
+                    q.fri_layers_merkle_roots.clone(),
+                    q.fri_final_poly_coeffs.clone(),
+                    q.bus_public_inputs.as_ref().map(|b| b.table_contribution),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let retained = prove_under(ResidencyMode::Retain);
+    let control = prove_under(ResidencyMode::Retain);
     assert!(
-        retained == recomputed,
-        "the wrap proof moved between residency modes ({} vs {} bytes)",
-        retained.len(),
-        recomputed.len()
+        commitments(&retained) == commitments(&control),
+        "CONTROL FAILED: two Retain runs disagree on their commitments, so this \
+         oracle cannot say anything about the residency mode"
     );
+    println!("   control: two Retain runs agree on every commitment");
+
+    let recomputed = prove_under(ResidencyMode::RecomputeLde);
+    assert!(
+        commitments(&retained) == commitments(&recomputed),
+        "the wrap commitments moved between residency modes"
+    );
+    assert_eq!(
+        retained.public_words, recomputed.public_words,
+        "the published words moved between residency modes"
+    );
+
+    // Not asserted — recorded. The nonces are expected to differ; printing them
+    // keeps the reason this test compares commitments visible in its own output
+    // rather than only in its doc comment.
+    let nonces = |p: &super::proof::LfmProof| {
+        p.proof
+            .proofs
+            .iter()
+            .filter_map(|q| q.nonce)
+            .collect::<Vec<_>>()
+    };
     println!(
-        "\n★ RESIDENCY ORACLE: the wrap proof is byte-identical under Retain and RecomputeLde"
+        "   grinding nonces equal across the two Retain runs: {} (expected false under `parallel`)",
+        nonces(&retained) == nonces(&control)
     );
+    println!("\n★ RESIDENCY ORACLE: the wrap commits identically under Retain and RecomputeLde");
+}
+
+/// ★ GATE B — a REAL Ethereum-block epoch, wrapped.
+///
+/// Everything else in this module wraps the 16-cycle fibonacci fixture, which
+/// exercises every structure but at a size no production workload has. This
+/// wraps one epoch of a real mainnet block at a SECURE inner preset
+/// (blowup 4 / 110 queries, grinding as the preset sets it): one real block
+/// epoch proof, compressed into one LFM proof.
+///
+/// The guest and the block input are multi-megabyte binaries that cannot be
+/// checked in, so the test requires them by path and says so rather than
+/// quietly proving the fixture and reporting it as a block:
+///
+/// ```text
+/// LFM_CENSUS_ELF=/path/to/ethrex.elf \
+/// LFM_CENSUS_INPUT=/path/to/ethrex_mainnet_25368371.bin \
+/// LFM_CENSUS_EPOCH_LOG2=16 \
+/// cargo test --release -p lambda-vm-prover --lib \
+///   lfm::wrap_tests::the_real_block_epoch_wraps -- --ignored --nocapture
+/// ```
+///
+/// `LFM_CENSUS_EPOCH_LOG2` is the size knob and the reason this is a test rather
+/// than a fixed point: the largest epoch that fits is a property of the box, so
+/// a run climbs it until emission or proving runs out of memory. Every size that
+/// completes is a real artifact; the largest one that completes is the result.
+#[test]
+#[ignore]
+fn the_real_block_epoch_wraps() {
+    for var in ["LFM_CENSUS_ELF", "LFM_CENSUS_INPUT"] {
+        assert!(
+            std::env::var(var).is_ok(),
+            "{var} must name a file: this test wraps a REAL block epoch, and \
+             without it the harness would build the fibonacci fixture and report \
+             it under this test's name"
+        );
+    }
+    let inputs = EpochInputs::from_env();
+    println!(
+        "★ REAL-BLOCK WRAP: guest {}, {} bytes of private input, 2^{} cycles/epoch",
+        inputs.label,
+        inputs.private_input.len(),
+        inputs.epoch_log2,
+    );
+    wrap_run_from(crate::recursion::Preset::Blowup4.options(), inputs);
 }
 
 /// The census and shape of the assembled verifier WITHOUT proving it — the cheap

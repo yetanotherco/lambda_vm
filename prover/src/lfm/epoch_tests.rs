@@ -625,15 +625,90 @@ pub(super) fn real_epoch() -> RealEpoch {
     real_epoch_with(super::proof_fixture::fixture_options())
 }
 
+/// What an epoch is built FROM: the inner guest, its private input, and the
+/// epoch size. Separated from the proof options because the two axes are
+/// independent — options change what verifying the epoch costs, these change
+/// what the epoch IS.
+///
+/// [`EpochInputs::fixture`] is the 16-cycle fibonacci fixture every existing
+/// test builds; [`EpochInputs::from_env`] is that with the three overrides a
+/// measurement run needs, and it is what [`real_epoch_with`] uses, so with
+/// nothing set every caller keeps the exact path it had.
+pub(super) struct EpochInputs {
+    pub(super) elf_bytes: Vec<u8>,
+    pub(super) private_input: Vec<u8>,
+    pub(super) epoch_log2: u32,
+    /// Names the guest in printed measurements, since a real-block run and the
+    /// fixture otherwise report identically shaped numbers.
+    pub(super) label: String,
+}
+
+impl EpochInputs {
+    /// The fibonacci fixture: the ELF the recursion suite builds, no private
+    /// input, [`FIXTURE_EPOCH_LOG2`](super::proof_fixture::FIXTURE_EPOCH_LOG2).
+    pub(super) fn fixture() -> Self {
+        Self {
+            elf_bytes: super::proof_fixture::read_inner_elf(),
+            private_input: Vec::new(),
+            epoch_log2: super::proof_fixture::FIXTURE_EPOCH_LOG2,
+            label: "fibonacci fixture".to_string(),
+        }
+    }
+
+    /// [`EpochInputs::fixture`] with the measurement overrides applied:
+    ///
+    /// - `LFM_CENSUS_ELF` — path to the inner guest ELF.
+    /// - `LFM_CENSUS_INPUT` — path to a file holding its private input.
+    /// - `LFM_CENSUS_EPOCH_LOG2` — epoch size, log2.
+    ///
+    /// The input override exists because a guest's epoch count is a property of
+    /// its INPUT, not just its ELF: the fibonacci guest reads its iteration
+    /// count from private input, so a run that needs a multi-epoch execution has
+    /// to be able to ask for one without a recompile. The ELF and epoch-size
+    /// overrides are what let the same harness build a real Ethereum-block
+    /// epoch, which is far too large to be a checked-in fixture.
+    ///
+    /// With none set this is byte-for-byte [`EpochInputs::fixture`].
+    pub(super) fn from_env() -> Self {
+        let mut inputs = Self::fixture();
+        if let Ok(p) = std::env::var("LFM_CENSUS_ELF") {
+            inputs.elf_bytes =
+                std::fs::read(&p).unwrap_or_else(|e| panic!("LFM_CENSUS_ELF {p}: {e}"));
+            inputs.label = p;
+        }
+        if let Ok(p) = std::env::var("LFM_CENSUS_INPUT") {
+            inputs.private_input =
+                std::fs::read(&p).unwrap_or_else(|e| panic!("LFM_CENSUS_INPUT {p}: {e}"));
+        }
+        if let Ok(v) = std::env::var("LFM_CENSUS_EPOCH_LOG2") {
+            inputs.epoch_log2 = v
+                .parse()
+                .unwrap_or_else(|e| panic!("LFM_CENSUS_EPOCH_LOG2 {v}: {e}"));
+        }
+        inputs
+    }
+}
+
 /// [`real_epoch`] under supplied proof options — the wrap run's blowup axis.
 ///
 /// The options are the INNER proof's, so they change what the verifier has to do:
 /// the query count, the LDE depth every Merkle walk climbs, and how many FRI
-/// layers commit. Everything else about the epoch is fixed (same guest, same
-/// 16-cycle epoch, therefore the same trace-length profile), which is what makes
-/// two runs at different options comparable — assembly ledger entry 10 is about
-/// exactly this: the profile has to travel with the number.
+/// layers commit. What the epoch IS comes from [`EpochInputs::from_env`], which
+/// is the fibonacci fixture unless a measurement run overrode it — so two runs
+/// at different options stay comparable, and assembly ledger entry 10 still
+/// holds: the trace-length profile travels with every number.
 pub(super) fn real_epoch_with(opts: crate::ProofOptions) -> RealEpoch {
+    real_epoch_from(opts, EpochInputs::from_env())
+}
+
+/// [`real_epoch_with`] with the guest, its input and the epoch size supplied
+/// rather than read from the environment.
+///
+/// Only epoch 0 is built: the boundary starts from genesis provenance and the
+/// label is `epoch_label(0)`, so a later epoch would need the previous one's
+/// provenance carried in. That is a real limit of this harness and not an
+/// oversight — the first epoch is what the compression work needs.
+pub(super) fn real_epoch_from(opts: crate::ProofOptions, inputs: EpochInputs) -> RealEpoch {
     use crate::tables::trace_builder::{Traces, build_initial_image_paged};
     use crate::tables::{MaxRowsConfig, bitwise, local_to_global, register};
     use crypto::fiat_shamir::default_transcript::DefaultTranscript;
@@ -643,21 +718,14 @@ pub(super) fn real_epoch_with(opts: crate::ProofOptions) -> RealEpoch {
     use stark::proof::view::MultiProofView;
     use stark::verifier::IsStarkVerifier;
 
-    let elf_bytes = super::proof_fixture::read_inner_elf();
-    let elf = Elf::load(&elf_bytes).expect("the fixture ELF must load");
-    let epoch_size = 1usize << super::proof_fixture::FIXTURE_EPOCH_LOG2;
-
-    // `LFM_CENSUS_INPUT` names a file holding the inner guest's private input.
-    // Unset — every CI and local run — this is the empty input the fixture has
-    // always used. It exists because the fibonacci guest reads its iteration
-    // count from private input, so the epoch it produces (and whether that
-    // epoch is intermediate at all) is a property of the input, not just the
-    // ELF: a measurement that needs a multi-epoch execution has to be able to
-    // ask for one without a recompile.
-    let private_input: Vec<u8> = match std::env::var("LFM_CENSUS_INPUT") {
-        Ok(p) => std::fs::read(&p).unwrap_or_else(|e| panic!("LFM_CENSUS_INPUT {p}: {e}")),
-        Err(_) => Vec::new(),
-    };
+    let EpochInputs {
+        elf_bytes,
+        private_input,
+        epoch_log2,
+        label: guest_label,
+    } = inputs;
+    let elf = Elf::load(&elf_bytes).expect("the inner ELF must load");
+    let epoch_size = 1usize << epoch_log2;
 
     let mut executor = Executor::new(&elf, private_input.clone()).expect("executor");
     let image = build_initial_image_paged(&elf, &private_input);
@@ -740,7 +808,21 @@ pub(super) fn real_epoch_with(opts: crate::ProofOptions) -> RealEpoch {
     let proof = {
         let mut pairs = airs.air_trace_pairs(&mut traces);
         pairs.push((&l2g_air, &mut l2g_trace, &()));
-        crate::test_utils::multi_prove_ram(pairs, &mut seed()).expect("the epoch must prove")
+        let t = std::time::Instant::now();
+        let proof =
+            crate::test_utils::multi_prove_ram(pairs, &mut seed()).expect("the epoch must prove");
+        // The inner prove is the expensive half of a real-block run and is
+        // otherwise invisible inside the wrap's own timings, so it reports
+        // itself — with the guest and epoch size, since a number without them
+        // does not identify a workload.
+        eprintln!(
+            "inner epoch: {guest_label}, 2^{epoch_log2} cycles, {} cycles executed, \
+             {} sub-proofs, proved in {:.1}s",
+            logs.len(),
+            proof.proofs.len(),
+            t.elapsed().as_secs_f64()
+        );
+        proof
     };
     let refs = {
         let mut r = airs.air_refs();
