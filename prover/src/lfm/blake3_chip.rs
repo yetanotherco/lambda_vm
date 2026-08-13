@@ -389,7 +389,7 @@ impl WordRef {
     ///
     /// On [`WordRef::ModeSelected`]. A mode-selected word has no byte
     /// decomposition without witnessing one, and the whole reason the tag lives
-    /// in `m[8]` is that message words reach `add3` and nothing else. Panicking
+    /// in a message word is that message words reach `add3` and nothing else. Panicking
     /// says so out loud rather than letting a future byte consumer quietly
     /// acquire four columns nobody committed.
     pub(crate) fn byte(self, b: usize) -> ByteRef {
@@ -433,8 +433,9 @@ pub(crate) enum ByteRef {
 /// One recorded 3-op add: operands (a, b, m), output columns, carries.
 ///
 /// `m` is a [`WordRef`] rather than four columns because the socket framing
-/// makes `m[8..16]` compile-time constants — the domain tag and the zero
-/// padding of a 36-byte message. Constant message words cost no columns and no
+/// makes every message word above the input lanes a compile-time constant — the
+/// domain tag and the zero padding of a 52-byte message. Constant message words
+/// cost no columns and no
 /// range checks, which is the whole reason the tag is free there.
 pub(crate) struct Add3Wire {
     pub a: WordRef,

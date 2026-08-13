@@ -68,7 +68,7 @@ pub trait LfmHasher {
     /// The default is `compress_out` — correct for a hasher with a single
     /// domain, which is what `TestPermutation` and Poseidon are here. A hasher
     /// that *has* domain separation overrides it, and BLAKE3 does: its socket
-    /// carries the domain tag in the message word `m[8]`, so a transcript step
+    /// carries the domain tag in a message word, so a transcript step
     /// and a Merkle parent over the same two cells are different digests.
     ///
     /// ⚠ The default is a real weakening for a single-domain hasher, and it is

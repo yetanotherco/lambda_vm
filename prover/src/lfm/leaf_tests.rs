@@ -285,6 +285,93 @@ fn an_eight_felt_leaf_is_one_chain_of_two_rows() {
 }
 
 // =========================================================================
+// H6 — the lane-identity gate, both directions
+// =========================================================================
+//
+// The gate is per LANE RANGE, not per mode, and COMMIT.md §1.4.2 asks for a
+// control in the WA1/WA2 style because one direction is a soundness break: gate
+// lanes 0–3 on `digest_mu` and a leaf row's accumulator carries no identity at
+// all, so the prover picks the chain's message words freely and the whole leaf
+// chain unbinds. Two tests, one per direction, because a gate that is wrong
+// EITHER way passes the other test.
+
+/// ★★ **H6, the soundness direction: a leaf row's ACCUMULATOR lanes are
+/// constrained.**
+///
+/// Shaped like WA9 — not "the tampered row is rejected", which would pass for a
+/// set that rejected it incidentally, but "the violated set IS the accumulator
+/// lane's own identity". That carries both legs: with the identity the row is
+/// rejected, and without it every other constraint still evaluates to zero on
+/// this row, so it would be accepted. If the gate were `digest_mu` here, this
+/// row would satisfy everything.
+#[test]
+fn h6_a_leaf_rows_accumulator_lanes_carry_the_identity() {
+    let acc = word_of(&LEAF_VECTORS[3].acc);
+    let felts = felts_of(&LEAF_VECTORS[3].felts);
+    let base = leaf_row(&acc, &felts);
+    assert_eq!(
+        super::blake3_socket_tests::violations(&base),
+        Vec::<usize>::new(),
+        "HONEST CONTROL: a leaf row must satisfy every constraint"
+    );
+
+    for lane in 0..cols::NUM_ACC_LANES {
+        // Move the accumulator FELT and leave its byte columns honest. The
+        // message the row hashes is the bytes, so this is the forgery that
+        // matters: a prover claiming one accumulator in `IN` while the mixing
+        // core consumes another. Only the identity ties the two together.
+        let mut forged = base.clone();
+        forged[cols::IN0 + lane] += FE::one();
+        assert_eq!(
+            super::blake3_socket_tests::violations(&forged),
+            vec![blake3_socket::LANE_IDX + lane],
+            "lane {lane} of the accumulator must be pinned to its bytes, and by \
+             ITS identity — anything else and the dropped-leg claim fails"
+        );
+    }
+}
+
+/// ★ **H6, the other direction: the identity must NOT hold on a leaf row's FELT
+/// lanes.**
+///
+/// Lanes 4–11 are the felts' `lo`/`hi` halves, so `IN` and the message word are
+/// deliberately different field elements there; the halves binding is what
+/// relates them. Gating those on the full `mu` would make every leaf row
+/// unprovable — the failure the original eight-lane comment warned about, which
+/// survives the widening in exactly this narrowed form.
+///
+/// Asserted as arithmetic on an honest row rather than by building a broken
+/// chip: if `IN(felt i) == lo_i` for every felt, the claim is vacuous and this
+/// test says so.
+#[test]
+fn h6_the_felt_lanes_do_not_satisfy_the_lane_identity() {
+    let acc = word_of(&LEAF_VECTORS[3].acc);
+    let felts = felts_of(&LEAF_VECTORS[3].felts);
+    let row = leaf_row(&acc, &felts);
+
+    let mut discriminated = 0;
+    for i in 0..FELTS_PER_LEAF {
+        let lo_lane = cols::leaf_lo_lane(i);
+        let bytes: u64 = (0..4)
+            .map(|b| {
+                GoldilocksField::canonical(row[cols::lane_byte(lo_lane, b)].value()) << (8 * b)
+            })
+            .sum();
+        let felt = GoldilocksField::canonical(row[cols::leaf_felt(i)].value());
+        // The felt is `lo + 2^32·hi`, so it equals its low half only when the
+        // high half is zero. The vector is chosen so that is not always true.
+        if felt != bytes {
+            discriminated += 1;
+        }
+    }
+    assert!(
+        discriminated > 0,
+        "the vector must contain a felt wider than 32 bits, or this test is \
+         vacuous and the gate could be `mu` without anyone noticing"
+    );
+}
+
+// =========================================================================
 // M9 / M10 — the chip-level controls the leaf spec pre-committed
 // =========================================================================
 

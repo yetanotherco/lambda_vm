@@ -168,7 +168,7 @@ fn the_socket_budget_is_the_predicted_one_at_both_round_counts() {
     );
 
     // Both are BELOW the standalone chip's measured 4,946, which is the point of
-    // hosting: constant `h`/`t`/`block_len`/`flags`, constant `m[8..16]`, and a
+    // hosting: constant `h`/`t`/`block_len`/`flags`, a constant message tail, and a
     // truncation window that never builds twelve of the sixteen output words.
     assert!(predicted_cells(6) < 4_946);
 }

@@ -59,7 +59,7 @@
 //! even the 7-round socket a nonstandard invocation of `f` that no library
 //! computes, throwing the anchor away for nothing (SOCKET.md §2.3).
 //!
-//! `m[8]` is a linear form over the three PREPROCESSED mode columns rather than
+//! The tag word is a linear form over the three PREPROCESSED mode columns rather than
 //! a compile-time constant, which keeps it prover-unchosen and free — see
 //! [`TAG_SELECTOR`].
 //!
@@ -94,7 +94,8 @@
 //!
 //! [`super::blake3_chip`] is the syscall-shaped chip: 28 input `u32` words and
 //! all 16 output words are committed columns. Here `h`, `t`, `block_len`,
-//! `flags` and `m[8..16]` are **compile-time constants**, and the truncation
+//! `flags` and every message word above the lanes are **compile-time
+//! constants**, and the truncation
 //! window means only 4 of the 16 output words are ever built. What is left as
 //! witness is 8 input lanes, the mixing core, and 4 output words.
 //!
@@ -235,7 +236,8 @@ const _: () = assert!(SOCKET_ROUNDS == BLAKE3_ROUNDS);
 /// G-instances per compression: 8 per round.
 pub const NUM_G: usize = SOCKET_ROUNDS * 8;
 
-/// The domain tag `"LFMC"`, read as one little-endian `u32` — `m[8]`.
+/// The domain tag `"LFMC"`, read as one little-endian `u32` — the message word
+/// straight after the lanes, `m[NUM_LANES]`.
 ///
 /// A tag is never reused for a second purpose, for the same reason
 /// `HasherKind::as_tag` never reuses a discriminant. `"LFMT"` is the transcript
@@ -436,7 +438,8 @@ pub fn felt_halves(v: u64) -> Option<(u32, u32)> {
     is_canonical(lo, hi).then_some((lo, hi))
 }
 
-/// Four felts → the eight message lanes, `[lo0, hi0, …, lo3, hi3]`.
+/// Four felts → the eight message lanes ABOVE the accumulator,
+/// `[lo0, hi0, …, lo3, hi3]` — the row's lanes 4–11.
 ///
 /// A felt's halves are ADJACENT, which is load-bearing: it lets the canonicity
 /// gate read one pair of neighbouring lanes instead of reaching across the row.
@@ -1074,7 +1077,7 @@ pub fn bitwise_interactions() -> Vec<BusInteraction> {
 /// the shared [`ValueFlow`].
 ///
 /// Each row is `(lanes, tag)`: the domain reaches the histogram because it
-/// reaches `m[8]`, and every XOR byte downstream of round 0 differs between the
+/// reaches the tag word, and every XOR byte downstream of round 0 differs between the
 /// domains. A histogram built with the wrong tag balances against nothing.
 pub fn bitwise_ops_for(rows: &[([u32; cols::NUM_LANES], u32)]) -> Vec<BitwiseOperation> {
     let mut out = Vec::with_capacity(
@@ -1137,7 +1140,7 @@ fn set_word_bytes(row: &mut [FE], col: usize, w: u32) {
 /// only new soundness surface lives.
 ///
 /// The DOMAIN is read back out of the row's own mode columns for the same
-/// reason, and it is the half that matters most: `m[8]` is a linear form over
+/// reason, and it is the half that matters most: the tag word is a linear form over
 /// exactly those columns, so a witness built from them cannot describe a
 /// different domain than the one the AIR evaluates. Taking the tag as an
 /// argument — as this did at first — left a filler that could be handed the
@@ -1154,7 +1157,7 @@ pub fn fill_socket_witness(row: &mut [FE]) {
 }
 
 /// The row's domain tag, read off its preprocessed mode columns — the machine
-/// side of [`TAG_SELECTOR`], and the same value `m[8]` evaluates to.
+/// side of [`TAG_SELECTOR`], and the same value the tag word evaluates to.
 ///
 /// # Panics
 ///
@@ -1354,7 +1357,11 @@ const CORE_IDX: usize = LEAF_IDX + LEAF_CONSTRAINTS_PER_FELT * FELTS_PER_LEAF;
 
 /// First lane-decomposition index: after the capacity copies, the mode-sum
 /// booleanity and the `MODE_P` pin.
-const LANE_IDX: usize = 6;
+///
+/// Public so the gate suite can name the identity for a specific lane rather
+/// than locate it by a literal — the point of the H6 controls is that the
+/// violated constraint IS the lane's own identity.
+pub const LANE_IDX: usize = 6;
 
 /// First unused-output pin index.
 ///
@@ -1428,7 +1435,7 @@ pub fn eval<B: ConstraintBuilder<F, E>>(b: &mut B) {
 
     // idx 4: mode sum-boolean (exactly-one-of is the registrar's). This is what
     // excludes two selectors both being 1 — which would sum BOTH domain tags
-    // into `m[8]` — since the sum would be 2 and 2·(1−2) ≠ 0. ⚠ It does NOT
+    // into the tag word — since the sum would be 2 and 2·(1−2) ≠ 0. ⚠ It does NOT
     // force each selector to a bit: a fractional split still satisfies it and
     // blends the tags, which is what control M5/M6 demonstrates and what the
     // registrar's one-hot check is the actual answer to.

@@ -200,7 +200,7 @@ pub fn build_traces_with_hasher(
                 (
                     lanes,
                     // The row's DOMAIN, not a fixed tag: the lookups a row sends
-                    // are values downstream of `m[8]`, so a transcript row and a
+                    // are values downstream of the tag word, so a transcript row and a
                     // compress row over the same cells send different bytes.
                     blake3_socket::tag_for_mode(*mode)
                         .expect("BLAKE3 admits no permute row (its AIR pins MODE_P = 0)"),
