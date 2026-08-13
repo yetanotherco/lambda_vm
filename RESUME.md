@@ -10,6 +10,8 @@ complete milestone, not a checkpoint of half-done work.
 | `cbf834ff` | registry re-bless |
 | `85473426` | KAT re-pin + the generator |
 | `240a308c` | rider: derive the socket-vs-standalone cost figures |
+| `6669c997` | this note |
+| `8312bf58` | the H6 gate controls, and the `m[8]` doc corrections |
 
 ## H-register — all nine done and verified
 
@@ -42,10 +44,38 @@ No tenth hazard found.
 
 ## State
 
-* `lfm::` suite **308 passed / 19 failed**; the 19 are byte-identical to the
-  `blake3-real-hash` baseline (measured: 307/19). Zero new failures.
+* `lfm::` suite **310 passed / 19 failed**; the 19 are byte-identical to the
+  `blake3-real-hash` baseline (measured in that worktree: 307/19). **Zero new
+  failures**; the +3 are the tests this branch adds.
+* Whole prover crate: **861 passed / 34 failed** = the 19 above plus 15 in
+  `tests::prove_elfs_tests` / `tests::recursion_*`, every one of which panics
+  with "run `make compile-programs-rust`" or "run `make compile-recursion-elfs`".
+  Nothing outside `prover/src/lfm/` references the changed code — the only
+  consumer is `bin/compute_lfm_registry.rs`.
 * `FriToyV0` proves and verifies under BLAKE3 and under every hasher.
-* Fresh worktrees need `make compile-programs-asm` before the full prover suite.
+* `make lint` and `make fmt`: exit 0.
+* Fresh worktrees need `make compile-programs-asm` (and the two above for the
+  full crate) before the suite means anything.
+
+## Projection (calibrated model, `lfm_census_2026-08-12/tower.py`)
+
+Gate D1 node — fixture wrap, 1 proof, 110 queries: **124 → 78 GiB**, against the
+~93 GiB budget, so it **FITS**. §1.4.1 predicted ≈81. Priced at the socket's real
+width rather than the standalone chip's (§1.4.3), 119 → 75 GiB.
+
+⚠ Two honesty caveats, both of which make the headline *less* good than it looks:
+
+1. **The realized factor is 1.60–1.65×, not 2.0×.** The 2.0× is on leaf
+   absorption alone (~75% of this node); Merkle parents and the FRI legs do not
+   move. §1.4.1's ≈81 GiB already accounts for this — its "2.0× cut in ~70% of
+   the cost" needs the reader to do the Amdahl step, and several downstream notes
+   quote the 2.0× as if it were the node factor.
+2. **78 GiB is a one-proof-VERIFY node, not the smallest aggregating one.** The
+   arity-2 node is 155 GiB (fixture) / 232 GiB (real 2^21) and does not fit. The
+   campaign notes already flag the aggregating node as the binding memory
+   constraint, and that `tower.py`'s flat 6.5% non-hash residue is optimistic at
+   higher rates — the residue tracks felts absorbed, so it does not fall with the
+   compression count.
 
 ## Regenerating
 
