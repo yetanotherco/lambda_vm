@@ -9,7 +9,7 @@
 //! footprint is ~98% two big *contiguous* blocks — i.e. dense. For dense data a
 //! flat array indexed by offset is far cheaper: no keys, no hashing, no slack,
 //! and cache-friendly. This stores one dense `[T; PAGE_SIZE]` array per touched
-//! 256 KB page, in a small `Vec` sorted by page base (few entries — binary-search
+//! 32 KB page, in a small `Vec` sorted by page base (few entries — binary-search
 //! lookup + sorted insert, no hashing at all; the bulk lives in the arrays).
 //!
 //! Unset cells read back as `fill` (the genesis/default value) — pages are

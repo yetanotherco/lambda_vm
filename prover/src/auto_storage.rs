@@ -202,7 +202,7 @@ fn table_specs(lengths: &TableLengths) -> Vec<TableSpec> {
             2,
         ),
     ];
-    // Each unique 256 KB page → its own PAGE table at PAGE_SIZE rows.
+    // Each unique 32 KB page → its own PAGE table at PAGE_SIZE rows.
     for _ in 0..lengths.unique_page_count {
         specs.push((
             page_rows,

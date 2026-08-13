@@ -2373,9 +2373,9 @@ mod tests {
         let page_size = page::DEFAULT_PAGE_SIZE;
         let max = page::max_private_input_pages();
 
-        // (512 MiB + 4-byte prefix) / 256 KiB page = 2049 pages (2048 full data pages plus
+        // (512 MiB + 4-byte prefix) / 32 KiB page = 16385 pages (16384 full data pages plus
         // the one page the length prefix spills into). Pinned so a size/page change is caught.
-        assert_eq!(max, 2049);
+        assert_eq!(max, 16385);
 
         // No slack: an honest MAX-size input needs the whole last page (the bound is not
         // padded), and never overflows into an extra one.
@@ -2436,7 +2436,7 @@ mod tests {
         let _ = env_logger::builder().is_test(true).try_init();
         let elf_bytes = asm_elf_bytes("test_private_input_multipage");
 
-        // Page 1 starts at memory address START + page_size = 0xFF040000, which is data
+        // Page 1 starts at memory address START + page_size = 0xFF008000, which is data
         // index `page_size - 4` (the 4-byte length prefix sits at START). The program
         // commits the 8 bytes there, so the input must extend through that.
         let page_size = page::DEFAULT_PAGE_SIZE;
