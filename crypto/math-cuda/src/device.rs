@@ -135,6 +135,7 @@ const INVERSE_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/inverse.c
 const LOGUP_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/logup.cubin"));
 const CONSTRAINT_INTERP_CUBIN: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/constraint_interp.cubin"));
+const BLAKE3_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/blake3.cubin"));
 
 /// Number of CUDA streams in the pool. Larger pools let many rayon-parallel
 /// callers overlap on the GPU without serializing on stream ownership. The
@@ -201,6 +202,13 @@ pub struct Backend {
     pub keccak_merkle_level: CudaFunction,
     pub keccak_merkle_tail: CudaFunction,
     pub merkle_gather_paths: CudaFunction,
+
+    // blake3.cubin — the parity-harness probes, which are the only host-visible
+    // handle on the device compression function (see `kernels/blake3.cu`).
+    pub blake3_compress_probe_6r: CudaFunction,
+    pub blake3_compress_probe_7r: CudaFunction,
+    pub blake3_compress_probe_default: CudaFunction,
+    pub blake3_rounds_probe: CudaFunction,
 
     // barycentric.cubin
     pub barycentric_base_batched: CudaFunction,
@@ -347,6 +355,7 @@ impl Backend {
         let logup = ctx.load_module(Ptx::from_binary(LOGUP_CUBIN.to_vec()))?;
         let constraint_interp =
             ctx.load_module(Ptx::from_binary(CONSTRAINT_INTERP_CUBIN.to_vec()))?;
+        let blake3 = ctx.load_module(Ptx::from_binary(BLAKE3_CUBIN.to_vec()))?;
 
         let mut streams = Vec::with_capacity(STREAM_POOL_SIZE);
         for _ in 0..STREAM_POOL_SIZE {
@@ -432,6 +441,10 @@ impl Backend {
             keccak_merkle_level: keccak.load_function("keccak_merkle_level")?,
             keccak_merkle_tail: keccak.load_function("keccak_merkle_tail")?,
             merkle_gather_paths: keccak.load_function("merkle_gather_paths")?,
+            blake3_compress_probe_6r: blake3.load_function("blake3_compress_probe_6r")?,
+            blake3_compress_probe_7r: blake3.load_function("blake3_compress_probe_7r")?,
+            blake3_compress_probe_default: blake3.load_function("blake3_compress_probe_default")?,
+            blake3_rounds_probe: blake3.load_function("blake3_rounds_probe")?,
             barycentric_base_batched: bary.load_function("barycentric_base_batched")?,
             barycentric_ext3_batched: bary.load_function("barycentric_ext3_batched")?,
             barycentric_base_batched_strided: bary

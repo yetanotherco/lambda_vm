@@ -979,6 +979,7 @@ dependencies = [
 name = "math-cuda"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "crypto",
  "cudarc",
  "libloading 0.8.9",

@@ -72,7 +72,7 @@ fn to_real_arch(arch: &str) -> String {
     }
 }
 
-fn compile_kernel(src: &str, out_name: &str, have_nvcc: bool) {
+fn compile_kernel(src: &str, out_name: &str, have_nvcc: bool, defines: &[&str]) {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let src_path = manifest_dir.join("kernels").join(src);
@@ -118,6 +118,7 @@ fn compile_kernel(src: &str, out_name: &str, have_nvcc: bool) {
 
     let mut cmd = Command::new(nvcc_path());
     cmd.args(["--cubin", "-O3", "-std=c++17", "-arch", &arch]);
+    cmd.args(defines);
     // SASS→source line mapping for Nsight Compute. Unlike -G this does not
     // change codegen, but keep it opt-in so production cubins stay byte-stable.
     if env::var("LAMBDA_VM_NVCC_LINEINFO").is_ok_and(|v| v != "0" && !v.is_empty()) {
@@ -157,13 +158,31 @@ fn main() {
         );
     }
 
-    compile_kernel("arith.cu", "arith.cubin", have_nvcc);
-    compile_kernel("ntt.cu", "ntt.cubin", have_nvcc);
-    compile_kernel("keccak.cu", "keccak.cubin", have_nvcc);
-    compile_kernel("barycentric.cu", "barycentric.cubin", have_nvcc);
-    compile_kernel("deep.cu", "deep.cubin", have_nvcc);
-    compile_kernel("fri.cu", "fri.cubin", have_nvcc);
-    compile_kernel("inverse.cu", "inverse.cubin", have_nvcc);
-    compile_kernel("logup.cu", "logup.cubin", have_nvcc);
-    compile_kernel("constraint_interp.cu", "constraint_interp.cubin", have_nvcc);
+    compile_kernel("arith.cu", "arith.cubin", have_nvcc, &[]);
+    compile_kernel("ntt.cu", "ntt.cubin", have_nvcc, &[]);
+    compile_kernel("keccak.cu", "keccak.cubin", have_nvcc, &[]);
+    compile_kernel("barycentric.cu", "barycentric.cubin", have_nvcc, &[]);
+    compile_kernel("deep.cu", "deep.cubin", have_nvcc, &[]);
+    compile_kernel("fri.cu", "fri.cubin", have_nvcc, &[]);
+    compile_kernel("inverse.cu", "inverse.cubin", have_nvcc, &[]);
+    compile_kernel("logup.cu", "logup.cubin", have_nvcc, &[]);
+    compile_kernel(
+        "constraint_interp.cu",
+        "constraint_interp.cubin",
+        have_nvcc,
+        &[],
+    );
+    // The BLAKE3 kernels' round count is a compile-time knob with the same
+    // polarity as the host tree's `blake3-6round` feature: 7 rounds (standard
+    // BLAKE3) unless the feature selects the 6-round variant. The `.cu` defaults
+    // to 7 on its own, so a stale `-D` can never silently pick 6.
+    // `CARGO_FEATURE_*`, not `cfg!(feature = ..)`: cargo passes a build script
+    // the active features as environment variables and does NOT cfg them into
+    // its compilation, so the `cfg!` form here would silently always be false.
+    let blake3_defines: &[&str] = if env::var_os("CARGO_FEATURE_BLAKE3_6ROUND").is_some() {
+        &["-DBLAKE3_ROUNDS=6"]
+    } else {
+        &[]
+    };
+    compile_kernel("blake3.cu", "blake3.cubin", have_nvcc, blake3_defines);
 }
