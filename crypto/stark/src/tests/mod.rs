@@ -12,6 +12,7 @@ pub mod opening_width_tests;
 pub mod proof_options_tests;
 pub mod prove_verify_roundtrip_tests;
 pub mod prover_tests;
+pub mod residency_mode_tests;
 pub mod row_pair_opening_tests;
 pub mod small_trace_tests;
 #[cfg(feature = "disk-spill")]
