@@ -204,11 +204,14 @@ pub struct Backend {
     pub merkle_gather_paths: CudaFunction,
 
     // blake3.cubin — the parity-harness probes, which are the only host-visible
-    // handle on the device compression function (see `kernels/blake3.cu`).
+    // handle on the device compression function and byte serialization (see
+    // `kernels/blake3.cu`).
     pub blake3_compress_probe_6r: CudaFunction,
     pub blake3_compress_probe_7r: CudaFunction,
     pub blake3_compress_probe_default: CudaFunction,
     pub blake3_rounds_probe: CudaFunction,
+    pub blake3_serialize_felts_probe: CudaFunction,
+    pub blake3_blocks_of_felts_probe: CudaFunction,
 
     // barycentric.cubin
     pub barycentric_base_batched: CudaFunction,
@@ -445,6 +448,8 @@ impl Backend {
             blake3_compress_probe_7r: blake3.load_function("blake3_compress_probe_7r")?,
             blake3_compress_probe_default: blake3.load_function("blake3_compress_probe_default")?,
             blake3_rounds_probe: blake3.load_function("blake3_rounds_probe")?,
+            blake3_serialize_felts_probe: blake3.load_function("blake3_serialize_felts_probe")?,
+            blake3_blocks_of_felts_probe: blake3.load_function("blake3_blocks_of_felts_probe")?,
             barycentric_base_batched: bary.load_function("barycentric_base_batched")?,
             barycentric_ext3_batched: bary.load_function("barycentric_ext3_batched")?,
             barycentric_base_batched_strided: bary

@@ -1,4 +1,6 @@
-// BLAKE3 compression on device, round-count parameterized.
+// BLAKE3 compression on device, round-count parameterized, plus the
+// field-element byte serialization the leaf kernels share with the CPU commit
+// path.
 //
 // THE PARITY REFERENCE is the host `blake3_compress_rounds(h, m, t, block_len,
 // flags, rounds)` in `prover/src/lfm/blake3.rs:125` — one function whose ONLY
@@ -14,8 +16,16 @@
 // are separate crates' features and nothing forces them equal — see
 // `blake3_rounds_probe`, which exports this cubin's round count so a caller can
 // assert the match rather than discover it as a wrong commitment.
+//
+// WHAT IS NOT HERE YET: the multi-block leaf kernels. A leaf spans many 64-byte
+// blocks, so hashing one needs a *chaining construction* — bare cv-chain vs
+// standard BLAKE3 chunk tree — and that decision is open (PA-PLAN §1.6). The
+// compression function, the byte serialization and the block framing are
+// identical either way and are all here; `Blake3Block` exposes the sink so the
+// chaining loop drops in without touching any of it.
 
 #include <cstdint>
+#include "goldilocks.cuh"
 
 // 7 = standard BLAKE3. Overridden to 6 by build.rs; see the header comment.
 #ifndef BLAKE3_ROUNDS
@@ -34,6 +44,11 @@ __device__ __forceinline__ uint32_t rotr32(uint32_t x, uint32_t n) {
     // shift-by-32. Kept as an explicit expression rather than __funnelshift_r
     // so the transcription against the host `rotate_right` is readable.
     return (x >> n) | (x << (32 - n));
+}
+
+// Reverse the four bytes of a 32-bit word. nvcc lowers this to a single PRMT.
+__device__ __forceinline__ uint32_t bswap32(uint32_t x) {
+    return (x >> 24) | ((x >> 8) & 0x0000FF00u) | ((x << 8) & 0x00FF0000u) | (x << 24);
 }
 
 // The BLAKE3 quarter-round G (spec §2.1). Mirror of `blake3_g`
@@ -113,6 +128,64 @@ __device__ __forceinline__ void blake3_compress(const uint32_t *h, const uint32_
 }
 
 // ---------------------------------------------------------------------------
+// Byte serialization — shared with the leaf kernels and with the CPU commit.
+//
+// The leaf byte encoding does NOT move under P-a: `leaves_bit_reversed_grouped`
+// (`crypto/stark/src/commitment.rs:55`) serializes each field element in
+// canonical BIG-endian form and concatenates. BLAKE3 reads a 64-byte block as
+// 16 LITTLE-endian u32 words, so one 8-byte element is two words: the
+// byte-reverse of its high half, then of its low half. That transposition is
+// the whole of the serialization difference from keccak, which absorbs the same
+// bytes as one byte-swapped u64 lane.
+// ---------------------------------------------------------------------------
+
+// The two BLAKE3 message words covered by one Goldilocks element's canonical
+// big-endian bytes. `raw` may be non-canonical; canonicalising here matches
+// `canonical_u64().to_be_bytes()` on host.
+__device__ __forceinline__ void blake3_words_of_felt(uint64_t raw, uint32_t &w0, uint32_t &w1) {
+    uint64_t canon = goldilocks::canonical(raw);
+    w0 = bswap32((uint32_t)(canon >> 32));
+    w1 = bswap32((uint32_t)canon);
+}
+
+// A 64-byte BLAKE3 message block under construction.
+//
+// The SINK is deliberately the caller's: a leaf kernel compresses each full
+// block into a chaining value, and which chaining construction that is (bare
+// cv-chain vs standard chunk tree, PA-PLAN §1.6) is still open. Everything this
+// struct does — word packing, block boundaries, zero-padding the tail, the byte
+// count the final `block_len` comes from — is the same under either.
+//
+// Usage: `push_word` returns true when the block just filled, at which point the
+// caller consumes `m` and calls `reset()`; pushing into a full block is the one
+// way to misuse it. Field elements go in two words at a time (via
+// `blake3_words_of_felt`) and straddle a block boundary whenever the element
+// count is not a multiple of 8 — ext3 elements, at three felts, straddle
+// routinely — which is why this works at word granularity and not element
+// granularity.
+struct Blake3Block {
+    uint32_t m[16];
+    uint32_t nwords;  // words filled in the current block, 0..15 between pushes
+
+    __device__ __forceinline__ void init() {
+        nwords = 0;
+        #pragma unroll
+        for (int i = 0; i < 16; ++i) m[i] = 0;
+    }
+
+    __device__ __forceinline__ bool push_word(uint32_t w) {
+        m[nwords++] = w;
+        return nwords == 16;
+    }
+
+    __device__ __forceinline__ void reset() { init(); }
+
+    // Bytes occupied in the pending (partial) block — the `block_len` a final
+    // compression over it takes. Zero exactly when no partial block is pending.
+    __device__ __forceinline__ uint32_t pending_bytes() const { return nwords * 4u; }
+};
+
+// ---------------------------------------------------------------------------
 // Parity-harness entry points.
 //
 // The device compression function is not otherwise reachable from host code, so
@@ -162,4 +235,53 @@ extern "C" __global__ void blake3_compress_probe_default(const uint32_t *h, cons
 // host's `BLAKE3_ROUNDS` instead of discovering a mismatch as a wrong root.
 extern "C" __global__ void blake3_rounds_probe(uint32_t *out) {
     if (threadIdx.x == 0 && blockIdx.x == 0) *out = (uint32_t)BLAKE3_ROUNDS;
+}
+
+// The two message words of each of `n` field elements, in order — the
+// serialization contract on its own (canonicalisation, big-endian element bytes,
+// little-endian word packing), with no hashing over it.
+extern "C" __global__ void blake3_serialize_felts_probe(const uint64_t *vals, uint64_t n,
+                                                        uint32_t *out_words) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) return;
+    uint32_t w0, w1;
+    blake3_words_of_felt(vals[tid], w0, w1);
+    out_words[tid * 2] = w0;
+    out_words[tid * 2 + 1] = w1;
+}
+
+// `n` field elements streamed through `Blake3Block`, with the completed blocks
+// written out instead of compressed. Single-threaded on purpose: that is the
+// shape a leaf kernel has (one thread hashes one whole leaf, sequentially), so
+// this exercises the block framing on the code path the chaining loop will use.
+// Writes `ceil(2n/16)` blocks of 16 words; the tail block is zero-padded.
+extern "C" __global__ void blake3_blocks_of_felts_probe(const uint64_t *vals, uint64_t n,
+                                                        uint32_t *out_blocks) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+
+    Blake3Block b;
+    b.init();
+    uint64_t nblocks = 0;
+    for (uint64_t i = 0; i < n; ++i) {
+        uint32_t w0, w1;
+        blake3_words_of_felt(vals[i], w0, w1);
+        if (b.push_word(w0)) {
+            #pragma unroll
+            for (int k = 0; k < 16; ++k) out_blocks[nblocks * 16 + k] = b.m[k];
+            ++nblocks;
+            b.reset();
+        }
+        if (b.push_word(w1)) {
+            #pragma unroll
+            for (int k = 0; k < 16; ++k) out_blocks[nblocks * 16 + k] = b.m[k];
+            ++nblocks;
+            b.reset();
+        }
+    }
+    // Flush the partial tail block, zero-padded (`init` zeroed it, and
+    // `pending_bytes` is what a real final compression would pass as block_len).
+    if (b.pending_bytes() != 0) {
+        #pragma unroll
+        for (int k = 0; k < 16; ++k) out_blocks[nblocks * 16 + k] = b.m[k];
+    }
 }

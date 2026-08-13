@@ -4,15 +4,17 @@
 //! against each other. Keccak stays the prover's default hash: nothing in the
 //! production dispatch reaches this module yet.
 //!
-//! What is here so far is the compression function and the oracle that checks
-//! it. The device compression is not otherwise reachable from host code, so
-//! without [`compress_probe`] there would be nothing to check it against the
-//! host reference with.
+//! What is here so far is the compression function and the field-element byte
+//! serialization, plus the oracles that check them. Neither is reachable from
+//! host code otherwise, so without [`compress_probe`] and [`serialize_felts`] /
+//! [`blocks_of_felts`] there would be nothing to check them against the host
+//! reference and the CPU commit path with.
 
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 
 use crate::Result;
 use crate::device::backend;
+
 /// Threads per block for the BLAKE3 kernels.
 ///
 /// Wider than [`crate::merkle`]'s 128 because the register footprint is a third
@@ -145,4 +147,70 @@ pub fn device_rounds() -> Result<u32> {
     let out = stream.clone_dtoh(&out_dev)?;
     stream.synchronize()?;
     Ok(out[0])
+}
+
+/// Parity harness: the BLAKE3 message words each of `vals` serializes to — two
+/// per element, the byte-reverse of its canonical value's high then low half.
+///
+/// This is the serialization the leaf kernels share with the CPU commit path
+/// (`leaves_bit_reversed_grouped`, `crypto/stark/src/commitment.rs:55`), isolated
+/// from any hashing: canonicalisation, big-endian element bytes, little-endian
+/// word packing.
+pub fn serialize_felts(vals: &[u64]) -> Result<Vec<u32>> {
+    if vals.is_empty() {
+        return Ok(Vec::new());
+    }
+    let be = backend()?;
+    let stream = be.next_stream();
+    let vals_dev = stream.clone_htod(vals)?;
+    let mut out_dev = stream.alloc_zeros::<u32>(vals.len() * 2)?;
+    let n_u64 = vals.len() as u64;
+    let cfg = blake3_launch_cfg(n_u64);
+    unsafe {
+        stream
+            .launch_builder(&be.blake3_serialize_felts_probe)
+            .arg(&vals_dev)
+            .arg(&n_u64)
+            .arg(&mut out_dev)
+            .launch(cfg)?;
+    }
+    let out = stream.clone_dtoh(&out_dev)?;
+    stream.synchronize()?;
+    Ok(out)
+}
+
+/// Parity harness: `vals` streamed through the device block builder, returning
+/// the `ceil(2*len/16)` completed 64-byte blocks as 16 words each, tail block
+/// zero-padded.
+///
+/// Exercises the block framing on the code path a leaf kernel will use — one
+/// thread streaming a whole leaf — with the compression sink replaced by a copy
+/// out. Small inputs only; it is single-threaded by design.
+pub fn blocks_of_felts(vals: &[u64]) -> Result<Vec<u32>> {
+    if vals.is_empty() {
+        return Ok(Vec::new());
+    }
+    let n_words = vals.len() * 2;
+    let n_blocks = n_words.div_ceil(16);
+    let be = backend()?;
+    let stream = be.next_stream();
+    let vals_dev = stream.clone_htod(vals)?;
+    let mut out_dev = stream.alloc_zeros::<u32>(n_blocks * 16)?;
+    let n_u64 = vals.len() as u64;
+    let cfg = LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (1, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        stream
+            .launch_builder(&be.blake3_blocks_of_felts_probe)
+            .arg(&vals_dev)
+            .arg(&n_u64)
+            .arg(&mut out_dev)
+            .launch(cfg)?;
+    }
+    let out = stream.clone_dtoh(&out_dev)?;
+    stream.synchronize()?;
+    Ok(out)
 }
