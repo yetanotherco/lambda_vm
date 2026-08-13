@@ -1462,7 +1462,14 @@ fn round_trip(mutate: impl FnOnce(&mut TraceTable<F, E>)) -> Result<bool, String
     let exec = execute(&program, &arenas(), &KIND).expect("execute");
     let mut traces = build_traces_with_hasher(&program, &exec.records, KIND);
     mutate(&mut traces.hash);
-    match prove_traces_with_hasher(&artifacts, &mut traces, &exec.public_words, &opts, KIND) {
+    match prove_traces_with_hasher(
+        &artifacts,
+        &mut traces,
+        &exec.public_words,
+        &opts,
+        KIND,
+        stark::residency_mode::ResidencyMode::Retain,
+    ) {
         Ok(proof) => Ok(verify_against(
             &artifacts.roots,
             &artifacts.program_id,

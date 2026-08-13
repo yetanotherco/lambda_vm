@@ -40,7 +40,7 @@ use super::compiler::LfmProgram;
 use super::executor::execute;
 use super::hash::TestPermutation;
 use super::instr::Instr;
-use super::proof::{LfmProveError, lfm_prove, verify_against};
+use super::proof::{LfmProveError, lfm_prove, lfm_prove_with_residency, verify_against};
 use super::registry::build_artifacts;
 
 use crate::tables::types::FE;
@@ -588,6 +588,84 @@ fn wrap_run(inner: ProofOptions) {
         "a moved program digest must make the wrap proof UNVERIFIABLE"
     );
     println!("   MOVED program digest: the wrap proof is UNVERIFIABLE");
+}
+
+/// ★ THE RESIDENCY ORACLE — `ResidencyMode::RecomputeLde` produces the same wrap
+/// proof, byte for byte, as `Retain`.
+///
+/// [`crate::tests::residency_mode_tests`] in the stark crate pins the mechanism
+/// on a three-table toy. This pins it on the workload the mode exists for: the
+/// wrap has preprocessed tables (whose main LDE carries the precomputed columns
+/// the split trees were built from), `KECCAK_RND` chunks (the family whose
+/// retention the mode drops), and the real transcript. If a recomputed LDE
+/// disagreed with the tree Round 1 committed anywhere in that set, the openings
+/// it answers would not match and this comparison would move.
+///
+/// Both runs execute and build traces from scratch, so a byte match also says
+/// the LFM trace build is deterministic across runs in one process — the
+/// precondition the whole oracle rests on.
+///
+/// `#[ignore]`d for the same reason as [`the_wrap_proves_and_verifies`], twice
+/// over: it proves the wrap two times.
+///
+/// Run with:
+/// `cargo test --release -p lambda-vm-prover --lib lfm::wrap_tests::the_wrap_is_byte_identical_across_residency_modes -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn the_wrap_is_byte_identical_across_residency_modes() {
+    use stark::residency_mode::ResidencyMode;
+
+    let e = super::epoch_tests::real_epoch_with(super::proof_fixture::fixture_options());
+    let program = super::epoch_tests::epoch_program(&e, true);
+    let arenas = super::epoch_tests::epoch_arena_words(&e, true);
+    let opts = wrap_options();
+    let artifacts = build_artifacts(&program, &opts);
+
+    let bytes_under = |residency: ResidencyMode| {
+        let t = Instant::now();
+        let proved = lfm_prove_with_residency(
+            &program,
+            &artifacts,
+            &arenas,
+            &opts,
+            artifacts.hasher,
+            residency,
+        )
+        .expect("the wrap must prove");
+        let secs = t.elapsed().as_secs_f64();
+        assert!(
+            verify_against(
+                &artifacts.roots,
+                &artifacts.program_id,
+                artifacts.keccak_rnd_chunks,
+                &proved.proof,
+                &proved.public_words,
+                &opts,
+                artifacts.hasher,
+            ),
+            "the wrap proof must verify under {residency:?}"
+        );
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&proved.proof)
+            .expect("the wrap proof must serialize")
+            .to_vec();
+        println!(
+            "   {residency:?}: proved in {secs:.1}s, verified, {} bytes",
+            bytes.len()
+        );
+        bytes
+    };
+
+    let retained = bytes_under(ResidencyMode::Retain);
+    let recomputed = bytes_under(ResidencyMode::RecomputeLde);
+    assert!(
+        retained == recomputed,
+        "the wrap proof moved between residency modes ({} vs {} bytes)",
+        retained.len(),
+        recomputed.len()
+    );
+    println!(
+        "\n★ RESIDENCY ORACLE: the wrap proof is byte-identical under Retain and RecomputeLde"
+    );
 }
 
 /// The census and shape of the assembled verifier WITHOUT proving it — the cheap

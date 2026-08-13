@@ -87,11 +87,38 @@ pub fn lfm_prove_with_hasher(
          program_id binds the hasher, so the two must agree",
         artifacts.hasher
     );
+    lfm_prove_with_residency(
+        program,
+        artifacts,
+        arenas,
+        options,
+        hasher,
+        decide_lfm_residency(),
+    )
+}
+
+/// [`lfm_prove_with_hasher`] with the residency mode supplied instead of read
+/// from the environment, so a test can prove the same program under both modes
+/// in one process without touching global state.
+pub(crate) fn lfm_prove_with_residency(
+    program: &LfmProgram,
+    artifacts: &LfmArtifacts,
+    arenas: &[Vec<LfmWord>],
+    options: &ProofOptions,
+    hasher: HasherKind,
+    residency: ResidencyMode,
+) -> Result<LfmProof, LfmProveError> {
     let exec = execute(program, arenas, &hasher).map_err(LfmProveError::Exec)?;
     let mut traces = build_traces_with_hasher(program, &exec.records, hasher);
-    let proof =
-        prove_traces_with_hasher(artifacts, &mut traces, &exec.public_words, options, hasher)
-            .map_err(LfmProveError::Prover)?;
+    let proof = prove_traces_with_hasher(
+        artifacts,
+        &mut traces,
+        &exec.public_words,
+        options,
+        hasher,
+        residency,
+    )
+    .map_err(LfmProveError::Prover)?;
 
     Ok(LfmProof {
         proof,
@@ -113,16 +140,24 @@ pub(crate) fn prove_traces(
     public_words: &[(u32, LfmWord)],
     options: &ProofOptions,
 ) -> Result<MultiProof<F, E, ()>, ProvingError> {
-    prove_traces_with_hasher(artifacts, traces, public_words, options, artifacts.hasher)
+    prove_traces_with_hasher(
+        artifacts,
+        traces,
+        public_words,
+        options,
+        artifacts.hasher,
+        decide_lfm_residency(),
+    )
 }
 
 /// [`prove_traces`] against an AIR set built for `hasher`. The traces must have
 /// been built with the same one.
 ///
-/// Storage mode comes from [`crate::auto_storage::decide_lfm`] rather than a
-/// parameter: it is a resource decision, invisible to the proof — spilling
-/// changes where a trace lives, never a byte the transcript absorbs — so
-/// threading it through the prove signature would put a knob with no wire
+/// Storage mode comes from [`crate::auto_storage::decide_lfm`] and residency
+/// mode from [`decide_lfm_residency`] rather than parameters: both are resource
+/// decisions, invisible to the proof — spilling changes where a trace lives and
+/// recompute changes how long an LDE lives, never a byte the transcript absorbs
+/// — so threading them through the prove signature would put knobs with no wire
 /// meaning in front of every caller.
 pub(crate) fn prove_traces_with_hasher(
     artifacts: &LfmArtifacts,
@@ -130,6 +165,7 @@ pub(crate) fn prove_traces_with_hasher(
     public_words: &[(u32, LfmWord)],
     options: &ProofOptions,
     hasher: HasherKind,
+    residency: ResidencyMode,
 ) -> Result<MultiProof<F, E, ()>, ProvingError> {
     let airs = LfmAirs::new_with_hasher(
         &artifacts.roots,
@@ -149,8 +185,30 @@ pub(crate) fn prove_traces_with_hasher(
         &mut transcript,
         #[cfg(feature = "disk-spill")]
         crate::auto_storage::decide_lfm(),
-        ResidencyMode::Retain,
+        residency,
     )
+}
+
+/// The LFM wrap's [`ResidencyMode`]: `RecomputeLde` when `LAMBDA_VM_RESIDENCY`
+/// is set to `recompute`, else `Retain`.
+///
+/// An explicit knob for the same reason the storage mode is one: the wrap has
+/// no calibrated peak estimate to decide from, and the trade this mode makes —
+/// one extra forward NTT per table against dropping the `O(N)` main-LDE
+/// retention — is only worth taking when `N` is large. The fixture wrap has one
+/// or two `KECCAK_RND` chunks and would just pay the NTT.
+///
+/// `RecomputeLde` also releases each table's aux columns once its proof exists,
+/// so callers that read the traces after proving must leave this unset. Nothing
+/// on the wrap path does.
+pub(crate) fn decide_lfm_residency() -> ResidencyMode {
+    match std::env::var("LAMBDA_VM_RESIDENCY").as_deref() {
+        Ok("recompute") => {
+            log::info!("lfm residency_mode: RecomputeLde (LAMBDA_VM_RESIDENCY=recompute)");
+            ResidencyMode::RecomputeLde
+        }
+        _ => ResidencyMode::Retain,
+    }
 }
 
 /// `Err` = registry miss (the hard, no-fallback path). `Ok(false)` = invalid
