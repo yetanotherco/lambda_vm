@@ -647,8 +647,20 @@ pub(super) fn real_epoch_with(opts: crate::ProofOptions) -> RealEpoch {
     let elf = Elf::load(&elf_bytes).expect("the fixture ELF must load");
     let epoch_size = 1usize << super::proof_fixture::FIXTURE_EPOCH_LOG2;
 
-    let mut executor = Executor::new(&elf, vec![]).expect("executor");
-    let image = build_initial_image_paged(&elf, &[]);
+    // `LFM_CENSUS_INPUT` names a file holding the inner guest's private input.
+    // Unset — every CI and local run — this is the empty input the fixture has
+    // always used. It exists because the fibonacci guest reads its iteration
+    // count from private input, so the epoch it produces (and whether that
+    // epoch is intermediate at all) is a property of the input, not just the
+    // ELF: a measurement that needs a multi-epoch execution has to be able to
+    // ask for one without a recompile.
+    let private_input: Vec<u8> = match std::env::var("LFM_CENSUS_INPUT") {
+        Ok(p) => std::fs::read(&p).unwrap_or_else(|e| panic!("LFM_CENSUS_INPUT {p}: {e}")),
+        Err(_) => Vec::new(),
+    };
+
+    let mut executor = Executor::new(&elf, private_input.clone()).expect("executor");
+    let image = build_initial_image_paged(&elf, &private_input);
     let register_init = register::register_init_from_entry_point(elf.entry_point);
     let logs = executor
         .resume_with_limit(epoch_size)
@@ -664,7 +676,7 @@ pub(super) fn real_epoch_with(opts: crate::ProofOptions) -> RealEpoch {
         &register_init,
         &logs,
         &MaxRowsConfig::default(),
-        &[],
+        &private_input,
         is_final,
         true,
         #[cfg(feature = "disk-spill")]

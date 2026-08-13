@@ -117,6 +117,12 @@ pub(crate) fn prove_traces(
 
 /// [`prove_traces`] against an AIR set built for `hasher`. The traces must have
 /// been built with the same one.
+///
+/// Storage mode comes from [`crate::auto_storage::decide_lfm`] rather than a
+/// parameter: it is a resource decision, invisible to the proof — spilling
+/// changes where a trace lives, never a byte the transcript absorbs — so
+/// threading it through the prove signature would put a knob with no wire
+/// meaning in front of every caller.
 pub(crate) fn prove_traces_with_hasher(
     artifacts: &LfmArtifacts,
     traces: &mut LfmTraces,
@@ -141,7 +147,7 @@ pub(crate) fn prove_traces_with_hasher(
         airs.air_trace_pairs(traces),
         &mut transcript,
         #[cfg(feature = "disk-spill")]
-        Default::default(),
+        crate::auto_storage::decide_lfm(),
     )
 }
 

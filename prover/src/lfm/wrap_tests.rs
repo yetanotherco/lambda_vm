@@ -344,10 +344,18 @@ fn the_wrap_reports_gpu_counters() {
 /// GEOMETRY is proved, the query COUNT is not, and the two are separable because
 /// per-query cost is a closed form over the shapes that
 /// [`the_wrap_census_at_blowup_8`] asserts the emitted program against.
+/// `LFM_WRAP_QUERIES` raises the inner query count above the 1 this asserts at,
+/// which is how the residency ladder walks the wrap up until a box refuses it.
+/// Unset — every CI and local run — it is exactly the one-query test described
+/// above.
 #[test]
 #[ignore]
 fn the_wrap_proves_at_blowup_8_geometry() {
-    wrap_run(inner_blowup_8_with_queries(1));
+    let queries = match std::env::var("LFM_WRAP_QUERIES") {
+        Ok(v) => v.parse().expect("LFM_WRAP_QUERIES must be an integer"),
+        Err(_) => 1,
+    };
+    wrap_run(inner_blowup_8_with_queries(queries));
 }
 
 /// The inner proof's blowup-8 options with the query count overridden.
