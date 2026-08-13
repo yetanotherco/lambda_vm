@@ -388,11 +388,27 @@ fn the_hosted_chip_cell_budget_at_both_round_counts() {
     // main and 1,397 interactions (699 aux) = 5,316. The difference is all I/O.
     assert_eq!(3_219 + 3 * 1_397usize.div_ceil(2), 5_316);
 
-    // For the comparison this chip exists to support: the `LFM_HASH` BLAKE3
-    // socket arm costs 4,741 at 6 rounds and 5,509 at 7 (pinned in
-    // `blake3_socket_tests`), so hosting behind the frozen socket is cheaper at
-    // both round counts — a constant initial state, a constant `m[8..16]`, and
-    // twelve of the sixteen output words never built.
+    // ★ For the comparison this chip exists to support: the `LFM_HASH` BLAKE3
+    // socket arm is cheaper at BOTH round counts — a constant initial state, a
+    // constant message tail, and twelve of the sixteen output words never built.
+    //
+    // Asserted against `blake3_socket_tests`' own census formula rather than
+    // against a transcription of its output. What stood here was "4,741 at 6
+    // rounds and 5,509 at 7": those predated the leaf mode's canonicity block,
+    // nothing recomputed them, and they were wrong by 8 for as long as they
+    // stood — then wrong by 36 once the leaf RATE widened the socket. A cost
+    // figure no test derives is a comment, not a claim.
+    for rounds in [6, 7] {
+        let socket = super::blake3_socket_tests::predicted_cells(rounds);
+        assert!(
+            socket < predicted_cells(rounds),
+            "hosting must stay cheaper than the standalone chip at {rounds} \
+             rounds: socket {socket}, standalone {}",
+            predicted_cells(rounds)
+        );
+    }
+    assert_eq!(super::blake3_socket_tests::predicted_cells(6), 4_777);
+    assert_eq!(super::blake3_socket_tests::predicted_cells(7), 5_545);
 }
 
 /// Every constraint index is emitted exactly once, and the count is the one the

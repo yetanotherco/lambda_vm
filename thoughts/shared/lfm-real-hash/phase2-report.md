@@ -32,6 +32,33 @@ and `the_census_prices_the_blake3_arm` confirm the *built* layout equals the pre
 the whole suite was run once per round count (`--features blake3-6round`), so both columns
 are measured rather than one measured and one projected.
 
+> ### ⚠ CORRECTION BOX — this table is a 2026-08-10 snapshot, overtaken TWICE since
+>
+> **The figures above are what the socket cost on the date of this report.** They are left
+> as measured rather than edited, because a dated report that quietly acquires today's
+> numbers stops being evidence of anything. What has moved, in order:
+>
+> | main columns | 6r | 7r | when |
+> |---|---:|---:|---|
+> | as reported here | 2,956 | 3,436 | 2026-08-10 |
+> | + the LEAF mode's canonicity block (`Z`/`GINV` per felt, present on every row) | 2,964 | 3,444 | option C |
+> | + the leaf RATE's four extra lanes (COMMIT.md §1.2) | **2,980** | **3,460** | 2026-08-13 |
+>
+> | cells (`main + 3·aux`) | 6r | 7r | when |
+> |---|---:|---:|---|
+> | as reported here | 4,741 | 5,509 | 2026-08-10 |
+> | + canonicity block | 4,749 | 5,517 | option C |
+> | + leaf RATE (which also adds 8 bus interactions) | **4,777** | **5,545** | 2026-08-13 |
+>
+> ⚠ **So the +16.19% A6R price quoted just below reads +16.07% today**, and the −4.1% / −3.6%
+> hosting saving further down reads −3.4% / −3.0%. Neither conclusion moves: A6R is still the
+> cheaper round count and hosting is still cheaper than the standalone chip at both.
+>
+> The current figures are deliberately not restated here as literals to be copied — copying
+> is what let the first correction sit unnoticed for two months. They are derived by
+> `blake3_socket_tests::predicted_cells`, and `blake3_probe.rs`'s socket-vs-standalone
+> comparison now calls that function instead of quoting its output.
+
 **The A6R price on this socket is +16.19% per compression** (4,741 → 5,509). PLAN §7's paper
 estimate for the syscall-shaped chip was +15.5%; the socket pays slightly more because its
 constant framing shrinks the round-*independent* part, so the rounds are a larger share.

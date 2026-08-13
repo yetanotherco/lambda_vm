@@ -108,7 +108,13 @@ const fn predicted_interactions(rounds: usize) -> usize {
 /// `main + 3·aux` with `aux = ceil(interactions / 2)` — `airs.rs`'s census
 /// formula, the same instrument that produced the keccak, Poseidon and
 /// standalone-blake columns, so all four are comparable by construction.
-const fn predicted_cells(rounds: usize) -> usize {
+///
+/// `pub(super)` so [`super::blake3_probe`] can state the socket-vs-standalone
+/// comparison against THIS number instead of a transcription of it. The copy it
+/// carried had drifted by 8 — it predated the leaf mode's canonicity block — and
+/// a hand-copied cost figure is exactly the kind that rots in silence, because
+/// nothing recomputes it.
+pub(super) const fn predicted_cells(rounds: usize) -> usize {
     predicted_main(rounds) + 3 * predicted_interactions(rounds).div_ceil(2)
 }
 
