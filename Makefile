@@ -3,7 +3,7 @@ compile-programs compile-recursion-elfs clean-asm clean-rust clean-bench clean-s
 clean-recursion-elfs clean test test-asm \
 test-rust test-ethrex test-ethrex-offline test-executor test-syscalls test-flamegraph flamegraph-prover test-profile-recursion test-profile-recursion-single test-profile-recursion-multi \
 test-profile-recursion-block recursion-profile-block-input \
-test-fast test-prover test-prover-all test-prover-debug test-disk-spill test-math-cuda test-cuda-integration test-cuda-fallback \
+test-fast test-prover test-prover-all test-prover-debug test-disk-spill test-math-cuda test-blake3-host-kat test-cuda-integration test-cuda-fallback \
 test-prover-cuda test-prover-comprehensive-cuda \
 bench-math-cuda bench-prover bench-prover-cuda build check clippy fmt lint regen-ethrex-fixtures \
 update-ethrex-fixture-checksums check-ethrex-fixture-checksums ethrex-real-block-fixture \
@@ -564,6 +564,29 @@ test-disk-spill:
 # math-cuda parity tests (requires NVIDIA GPU + nvcc)
 test-math-cuda:
 	cargo test -p math-cuda --release
+
+# Known-answer tests for the BLAKE3 device kernels, run on the HOST. No GPU, no
+# nvcc, no cargo — a couple of seconds.
+#
+# This exists because `test-math-cuda` above, which is the authority on these
+# kernels, runs only where a GPU does, and the per-PR CI runners have none (GPU
+# jobs are merge_group-only). Without this the kernels have no per-PR gate: an
+# edit to blake3.cu that broke the hash would reach the merge queue before
+# anything caught it. `crypto/math-cuda/tests/host_kat/` compiles the real kernel
+# source as host C++ through a shim and runs the official BLAKE3 vectors plus the
+# canonical 6-round table through it.
+#
+# It checks arithmetic ONLY. Whether nvcc accepts the file, and everything about
+# execution rather than arithmetic — grid indexing, the Merkle tail's barriers,
+# device alignment, register pressure — stays with `test-math-cuda`. Necessary,
+# never sufficient.
+HOST_KAT_DIR := crypto/math-cuda/tests/host_kat
+test-blake3-host-kat:
+	@mkdir -p target/host_kat
+	$(CXX) -std=c++17 -O2 -Wall -Wno-unknown-pragmas \
+	    -I$(HOST_KAT_DIR) -Icrypto/math-cuda/kernels \
+	    -o target/host_kat/blake3_host_kat $(HOST_KAT_DIR)/blake3_host_kat.cpp
+	./target/host_kat/blake3_host_kat
 
 # End-to-end cuda dispatch coverage (requires NVIDIA GPU + nvcc).
 # Asserts the R1-R4 GPU dispatch counters fired on a real prove.
