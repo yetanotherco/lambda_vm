@@ -111,7 +111,7 @@ impl HostSponge {
     /// [`super::edsl::SpongeVar::absorb_felts`]. Data enters the transcript
     /// through the leaf encoding, exactly as it enters a tree.
     pub fn absorb_felts(&mut self, c: &LfmWord) {
-        let d = self.hasher.leaf(c);
+        let d = self.hasher.leaf(&leaf_chain_start(), c);
         self.absorb(&d);
     }
 
@@ -135,15 +135,24 @@ impl HostSponge {
     }
 }
 
+/// Where a leaf chain starts — the host mirror of
+/// [`super::edsl::leaf_chain_start`], and a chain START rather than a shape
+/// HEADER for the reason stated there.
+pub fn leaf_chain_start() -> LfmWord {
+    [FE::zero(); 4]
+}
+
 /// The host's Merkle LEAF over a pair of DATA cells — the mirror of
 /// [`super::edsl::leaf_hash_pair`].
 ///
-/// Three hasher calls, in the machine's order: each cell as four felts in the
-/// leaf domain, then an ordinary parent. Written beside the tree rather than
-/// inside it because a tree's *leaves* are data and its *nodes* are digests, and
-/// this is the one place that distinction becomes two different hash domains.
+/// Two hasher calls, in the machine's order: one `"LFML"` chain absorbing the
+/// cells in sequence, four felts and one chaining step per call. Written beside
+/// the tree rather than inside it because a tree's *leaves* are data and its
+/// *nodes* are digests, and this is the one place that distinction becomes two
+/// different hash domains.
 pub fn host_leaf_hash_pair(hasher: HasherKind, c0: &LfmWord, c1: &LfmWord) -> LfmWord {
-    hasher.compress(&hasher.leaf(c0), &hasher.leaf(c1))
+    let acc = hasher.leaf(&leaf_chain_start(), c0);
+    hasher.leaf(&acc, c1)
 }
 
 /// A binary Merkle tree over word digests.

@@ -89,13 +89,21 @@ pub trait LfmHasher {
         [out[0], out[1], out[2], out[3]]
     }
 
-    /// A Merkle LEAF over one cell read as four arbitrary FIELD ELEMENTS.
+    /// A Merkle LEAF: a chaining accumulator and one cell read as four arbitrary
+    /// FIELD ELEMENTS.
     ///
-    /// The default hashes the felts as the first input cell against a zero
-    /// second cell, which is the natural reading for a **field-native** hasher:
-    /// `TestPermutation` and Poseidon take arbitrary Goldilocks elements
-    /// directly, so a leaf needs no encoding from them and this is a compress
-    /// with an empty right operand.
+    /// **The accumulator is what makes the leaf a chain rather than a tree.** A
+    /// wide leaf is an arbitrary-width row pair, so its felts arrive four at a
+    /// time; carrying the running digest as this call's first operand absorbs
+    /// four felts AND chains in ONE hash, where folding a felts-only leaf digest
+    /// into the chain with a separate parent cost two (COMMIT.md §1.2). Leaf
+    /// absorption is the dominant term of a recursion tower node, which is why
+    /// the shape of this signature is worth the ripple.
+    ///
+    /// The default is a compress of the accumulator against the felts, which is
+    /// the natural reading for a **field-native** hasher: `TestPermutation` and
+    /// Poseidon take arbitrary Goldilocks elements directly, so a leaf needs no
+    /// encoding from them.
     ///
     /// BLAKE3 overrides it, and the override is the point of the whole mode: its
     /// lanes must be `u32`, so each felt becomes a checked `lo`/`hi` pair inside
@@ -106,13 +114,13 @@ pub trait LfmHasher {
     /// under `Test` and `Poseidon` the O5 second-preimage split is carried by
     /// fixed tree depth alone, exactly as it was before this mode existed.
     /// Neither is a production hash; the machine's real one separates them.
-    fn leaf_out(&self, felts: &LfmWord) -> [FE; HASH_STATE_FELTS] {
-        self.compress_out(felts, &[FE::zero(); HASH_DIGEST_FELTS])
+    fn leaf_out(&self, acc: &LfmWord, felts: &LfmWord) -> [FE; HASH_STATE_FELTS] {
+        self.compress_out(acc, felts)
     }
 
     /// [`LfmHasher::leaf_out`] truncated to the digest cell.
-    fn leaf(&self, felts: &LfmWord) -> LfmWord {
-        let out = self.leaf_out(felts);
+    fn leaf(&self, acc: &LfmWord, felts: &LfmWord) -> LfmWord {
+        let out = self.leaf_out(acc, felts);
         [out[0], out[1], out[2], out[3]]
     }
 
@@ -285,19 +293,19 @@ impl LfmHasher for HasherKind {
     /// is an ENCODING, not just a tag, so a dispatch that fell through to the
     /// trait default would hash four felts as a digest cell — a host answer no
     /// chip proves.
-    fn leaf_out(&self, felts: &LfmWord) -> [FE; HASH_STATE_FELTS] {
+    fn leaf_out(&self, acc: &LfmWord, felts: &LfmWord) -> [FE; HASH_STATE_FELTS] {
         match self {
-            HasherKind::Test => TestPermutation.leaf_out(felts),
-            HasherKind::Poseidon => super::poseidon::PoseidonGoldilocks.leaf_out(felts),
-            HasherKind::Blake3 => super::blake3_socket::Blake3Permutation.leaf_out(felts),
+            HasherKind::Test => TestPermutation.leaf_out(acc, felts),
+            HasherKind::Poseidon => super::poseidon::PoseidonGoldilocks.leaf_out(acc, felts),
+            HasherKind::Blake3 => super::blake3_socket::Blake3Permutation.leaf_out(acc, felts),
         }
     }
 
-    fn leaf(&self, felts: &LfmWord) -> LfmWord {
+    fn leaf(&self, acc: &LfmWord, felts: &LfmWord) -> LfmWord {
         match self {
-            HasherKind::Test => TestPermutation.leaf(felts),
-            HasherKind::Poseidon => super::poseidon::PoseidonGoldilocks.leaf(felts),
-            HasherKind::Blake3 => super::blake3_socket::Blake3Permutation.leaf(felts),
+            HasherKind::Test => TestPermutation.leaf(acc, felts),
+            HasherKind::Poseidon => super::poseidon::PoseidonGoldilocks.leaf(acc, felts),
+            HasherKind::Blake3 => super::blake3_socket::Blake3Permutation.leaf(acc, felts),
         }
     }
 

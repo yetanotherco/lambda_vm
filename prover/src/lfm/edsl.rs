@@ -104,7 +104,8 @@ impl SpongeVar {
     /// that absorbs polynomial coefficients, evaluations or any other field data
     /// needs this.
     pub fn absorb_felts(&mut self, b: &mut LfmBuilder, c: Cell) {
-        let d = b.leaf(c);
+        let acc = leaf_chain_start(b);
+        let d = b.leaf(acc, c);
         self.absorb(b, d.as_cell());
     }
 
@@ -151,23 +152,47 @@ impl SpongeVar {
     }
 }
 
+/// Where a leaf chain starts: the zero cell.
+///
+/// ⚠ **This is a chain START, not a shape HEADER.** COMMIT.md §1.3 opens the
+/// chain at `[LEAF_MARK, num_cols, kind, rows_per_leaf]` so that the leaf's
+/// width and element kind are bound *inside* the hash — the whole point of that
+/// construction. Nothing here has a width to bind: these leaves are fixed-shape
+/// by the program that builds them, exactly as they were before the chain
+/// existed. The commitment layer that hashes arbitrary-width openings supplies
+/// the header instead of this, and it must, or its leaves bind no shape.
+///
+/// Interned like every other program constant, so a program's whole leaf traffic
+/// costs one `LFM_CONST` row for this.
+pub fn leaf_chain_start(b: &mut LfmBuilder) -> DigestVal {
+    b.digest_const([FE::zero(); 4])
+}
+
 /// The Merkle LEAF digest of a pair of data cells — eight field elements.
 ///
-/// **Three compressions, and the shape is the point:** each cell is hashed as
-/// four felts in the `"LFML"` domain, then the two results are combined by an
-/// ordinary `"LFMC"` parent. So a leaf's *data* never enters a compress as a
-/// digest, and a parent never enters as data — which is what makes an internal
-/// node un-replayable as a leaf regardless of the tree's depth (obligation O5,
-/// now discharged by the tag rather than by fixed depth).
+/// **Two compressions, and the shape is the point:** the cells are absorbed in
+/// order into one `"LFML"` chain, four felts per hash, each step chaining the
+/// last. So a leaf's *data* never enters a compress as a digest, and a parent
+/// never enters as data — which is what makes an internal node un-replayable as
+/// a leaf regardless of the tree's depth (obligation O5, discharged by the tag
+/// rather than by fixed depth).
 ///
-/// It replaced `compress(cell0, cell1)`, which was one compression and treated
-/// arbitrary field elements as if they were `u32` digest lanes. Under a hash
-/// whose lanes must BE `u32` that is not merely undesirable, it is unprovable —
-/// which is why FRI data could not be hashed at all before this mode existed.
+/// It cost THREE while the accumulator was not in the message: each cell hashed
+/// to its own leaf digest and an `"LFMC"` parent folded the two. Absorbing and
+/// chaining in the same compression is what took leaf absorption from 2 felts
+/// per hash to 4 (COMMIT.md §1.4.1), and leaf absorption is ~70% of a recursion
+/// tower node's bill. The chain binds the cells' ORDER for free, where the fold
+/// bound it through the parent's operand order.
+///
+/// Before either, this was `compress(cell0, cell1)` — one compression that
+/// treated arbitrary field elements as if they were `u32` digest lanes. Under a
+/// hash whose lanes must BE `u32` that is not merely undesirable, it is
+/// unprovable, which is why FRI data could not be hashed at all before the leaf
+/// mode existed.
 pub fn leaf_hash_pair(b: &mut LfmBuilder, c0: Cell, c1: Cell) -> DigestVal {
-    let d0 = b.leaf(c0);
-    let d1 = b.leaf(c1);
-    b.compress(d0, d1)
+    let acc = leaf_chain_start(b);
+    let d0 = b.leaf(acc, c0);
+    b.leaf(d0, c1)
 }
 
 /// Walk one Merkle authentication path. `bits` are the leaf-index bits

@@ -372,7 +372,13 @@ pub fn execute(
             } => {
                 let mut state: [FE; HASH_STATE_FELTS] = core::array::from_fn(|_| FE::zero());
                 let mut in_cols: [FE; HASH_STATE_FELTS] = core::array::from_fn(|_| FE::zero());
-                if mode.is_two_to_one() {
+                if mode.num_input_cells() == 2 {
+                    // Two cells, whatever they MEAN: two digests under Compress
+                    // and Transcript, a chaining accumulator and four field
+                    // elements under Leaf. What each cell is read AS belongs to
+                    // the hasher and to the chip's lane split; what the executor
+                    // owes is the memory reads the `LfmMem` receives claim, and
+                    // those are the same two under all three.
                     let a = m.read_word(ins[0])?;
                     let b = m.read_word(ins[1])?;
                     state[0..4].clone_from_slice(&a);
@@ -380,16 +386,7 @@ pub fn execute(
                     state[8..12].clone_from_slice(&hasher.compress_iv());
                     in_cols[0..4].clone_from_slice(&a);
                     in_cols[4..8].clone_from_slice(&b);
-                    // lanes 8–11 of the IN columns stay zero on two-to-one rows
-                } else if *mode == HashMode::Leaf {
-                    // ONE cell, read as four field elements. Lanes 4–11 stay
-                    // zero: a leaf row's other message lanes are the felts' high
-                    // halves, which live in the chip's own columns rather than
-                    // in `IN`.
-                    let f = m.read_word(ins[0])?;
-                    state[0..4].clone_from_slice(&f);
-                    state[8..12].clone_from_slice(&hasher.compress_iv());
-                    in_cols[0..4].clone_from_slice(&f);
+                    // lanes 8–11 of the IN columns stay zero on two-cell rows
                 } else {
                     for (cell, chunk) in ins.iter().zip(state.chunks_exact_mut(4)) {
                         chunk.clone_from_slice(&m.read_word(*cell)?);
@@ -418,8 +415,9 @@ pub fn execute(
                         }
                     }
                     HashMode::Leaf => {
-                        let f: LfmWord = core::array::from_fn(|i| state[i]);
-                        hasher.leaf_out(&f)
+                        let acc: LfmWord = core::array::from_fn(|i| state[i]);
+                        let f: LfmWord = core::array::from_fn(|i| state[4 + i]);
+                        hasher.leaf_out(&acc, &f)
                     }
                     HashMode::Permute => hasher.permute(state),
                 };

@@ -180,24 +180,23 @@ pub fn build_traces_with_hasher(
     // lookups per compression. Every other hasher sends none, so this is the
     // one place the shared table's multiplicities depend on the hash choice.
     if hasher == HasherKind::Blake3 {
-        let rows: Vec<([u32; 8], u32)> = records
+        let rows: Vec<([u32; blake3_socket::cols::NUM_LANES], u32)> = records
             .hash
             .iter()
             .zip(&hash_modes)
             .map(|(r, mode)| {
                 let cell =
                     |k: usize| -> super::word::LfmWord { core::array::from_fn(|i| r.ins[k + i]) };
-                // The eight message lanes, read the way this row's MODE reads
-                // them: two digest cells, or four felts split into halves. A
-                // leaf row sends lookups over its halves, so the histogram has
-                // to split them the same way the witness filler does.
-                let lanes: [u32; 8] = if *mode == HashMode::Leaf {
-                    blake3_socket::leaf_lanes(&cell(0)).expect("leaf felt is canonical")
-                } else {
-                    let a = blake3_socket::lanes_of(&cell(0)).expect("compress lane is a u32 (O1)");
-                    let b = blake3_socket::lanes_of(&cell(4)).expect("compress lane is a u32 (O1)");
-                    core::array::from_fn(|i| if i < 4 { a[i] } else { b[i - 4] })
-                };
+                // The message lanes, read the way this row's MODE reads them:
+                // digest cells throughout, or an accumulator cell followed by
+                // four felts split into halves. A leaf row sends lookups over
+                // its halves, so the histogram has to split the row exactly the
+                // way the witness filler does — which is why both come through
+                // `lanes_from_cells` instead of each carrying its own split.
+                let lanes = blake3_socket::lanes_from_cells(
+                    *mode == HashMode::Leaf,
+                    &[cell(0), cell(4), cell(8)],
+                );
                 (
                     lanes,
                     // The row's DOMAIN, not a fixed tag: the lookups a row sends

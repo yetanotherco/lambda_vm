@@ -297,18 +297,27 @@ impl LfmBuilder {
         self.two_to_one(HashMode::Compress, a, b)
     }
 
-    /// A Merkle LEAF over one cell read as four FIELD ELEMENTS.
+    /// One step of a Merkle LEAF chain: absorb one cell, read as four FIELD
+    /// ELEMENTS, into the running accumulator `acc`.
     ///
-    /// The only mode whose input is not a digest: each felt is split into a
-    /// checked `lo`/`hi` `u32` pair inside the chip, so arbitrary Goldilocks
+    /// The only mode whose second input is not a digest: each felt is split into
+    /// a checked `lo`/`hi` `u32` pair inside the chip, so arbitrary Goldilocks
     /// data can be hashed by a socket whose lanes must be `u32`. The `"LFML"`
     /// domain keeps a leaf un-replayable as a parent whatever the tree's shape.
-    pub fn leaf(&mut self, felts: Cell) -> DigestVal {
+    ///
+    /// **One call absorbs four felts AND chains**, because the accumulator rides
+    /// in the message rather than being folded in afterwards: a wide leaf over
+    /// `k` cells costs `k` hashes against the `2k − 1` a felts-only leaf plus a
+    /// fold of the results costs (COMMIT.md §1.2). The chain binds cell ORDER
+    /// for free; what it does not bind is the leaf's SHAPE, which is the header
+    /// cell's job in the commitment layer above this.
+    pub fn leaf(&mut self, acc: DigestVal, felts: Cell) -> DigestVal {
+        self.read(acc.0);
         self.read(felts.0);
         let out = self.alloc();
         self.instrs.push(Instr::Hash {
             mode: HashMode::Leaf,
-            ins: [felts.0, Addr(0), Addr(0)],
+            ins: [acc.0, felts.0, Addr(0)],
             outs: [out, Addr(0), Addr(0)],
             mults: [0, 0, 0],
         });

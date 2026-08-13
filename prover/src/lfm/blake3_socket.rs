@@ -12,25 +12,44 @@
 //! # What one row proves
 //!
 //! One row = one compression, in one of THREE domains, specified byte-level in
-//! `thoughts/blake3/socket-kats/SOCKET.md` §2.1 and word-level in §2.2:
+//! `thoughts/blake3/socket-kats/SOCKET.md` §2.1 and word-level in §2.2, at the
+//! leaf RATE of `block-compression/commit-spec/COMMIT.md` §1.2:
 //!
 //! ```text
-//! msg    = LE32(lane0..lane7) ‖ tag                         (36 bytes)
+//! msg    = LE32(lane0..lane11) ‖ tag                        (52 bytes)
 //! digest = BLAKE3(msg)[0..16]                               (128 bits, 1 cell)
 //! ```
 //!
-//! | tag | row | the eight lanes are |
+//! | tag | row | the twelve lanes are |
 //! |---|---|---|
-//! | `"LFMC"` | Merkle parent / 2-to-1 compress | two digest cells |
-//! | `"LFMT"` | a Fiat–Shamir transcript step | state ‖ operand |
-//! | `"LFML"` | a **leaf** over four field elements | the felts' `lo`/`hi` halves |
+//! | `"LFMC"` | Merkle parent / 2-to-1 compress | two digest cells, then four zeros |
+//! | `"LFMT"` | a Fiat–Shamir transcript step | state ‖ operand ‖ four zeros |
+//! | `"LFML"` | a **leaf** over four field elements | the chaining accumulator, then the felts' `lo`/`hi` halves |
 //!
-//! 36 bytes being one block, that is exactly one compression with `h = IV` (all
-//! eight words), `m[0..8] = the lanes`, `m[8] = tag` as a little-endian `u32`,
-//! `m[9..16] = 0`, `t = 0`, `block_len = 36`,
+//! 52 bytes being one block, that is exactly one compression with `h = IV` (all
+//! eight words), `m[0..12] = the lanes`, `m[12] = tag` as a little-endian `u32`,
+//! `m[13..16] = 0`, `t = 0`, `block_len = 52`,
 //! `flags = CHUNK_START|CHUNK_END|ROOT`, and the digest the LOW four output
-//! words. **The three domains differ in `m[8]` and in nothing else**, so one
+//! words. **The three domains differ in `m[12]` and in nothing else**, so one
 //! mixing core and one column layout serve all three.
+//!
+//! # The leaf RATE — why twelve lanes and not eight
+//!
+//! A leaf row absorbs **four felts and chains an accumulator in ONE
+//! compression** (COMMIT.md §1.2): the accumulator cell rides in the message
+//! rather than in `h`, so there is no separate fold. That is 4 felts per
+//! compression against the 2 the accumulator-free row reached once its digest
+//! had to be folded into a chain by an `"LFMC"` parent, and leaf absorption is
+//! ~70% of a recursion tower node's bill.
+//!
+//! The lanes it costs are free of witness columns on the digest modes: lanes
+//! 8–11 read `IN8..IN12`, the THIRD input cell, which
+//! `chips::hash::emit_unread_input_pins` already pins to zero on every row that
+//! does not read it. So a compress row's four new message words are forced to
+//! zero by constraints that were already there — see the lane block in
+//! [`eval`], and note that twelve is the last lane count for which this holds
+//! (at thirteen, `IN0 + 12` is `S8` and the identity would start reading the
+//! capacity state as an input felt).
 //!
 //! **At [`SOCKET_ROUNDS`] = 7 that is literally `blake3::hash(lanes ‖ tag)`,**
 //! so the socket has a direct external anchor and needs no oracle in the chain —
@@ -46,10 +65,10 @@
 //!
 //! # The LEAF mode, and the one thing not to conclude from it
 //!
-//! A leaf row reads ONE cell as four arbitrary Goldilocks elements and splits
-//! each into a `lo`/`hi` `u32` pair, so eight halves fill the same eight message
-//! lanes. `p − 1 = 0xFFFFFFFF_00000000`, so for halves already known to be
-//! `u32`:
+//! A leaf row reads TWO cells: a chaining accumulator, which is an ordinary
+//! digest cell and fills lanes 0–3, and four arbitrary Goldilocks elements, each
+//! split into a `lo`/`hi` `u32` pair so that eight halves fill lanes 4–11.
+//! `p − 1 = 0xFFFFFFFF_00000000`, so for halves already known to be `u32`:
 //!
 //! ```text
 //! v < p   <==>   NOT( hi = 2^32−1  AND  lo >= 1 )
@@ -257,8 +276,18 @@ pub const TAG_LFMT: u32 = u32::from_le_bytes(*b"LFMT");
 /// keeps §2.1's byte-level form a plain library call.
 pub const FLAGS_LFMC: u32 = 0x0B;
 
-/// The message length in bytes: 16 (`a`) + 16 (`b`) + 4 (tag).
-pub const BLOCK_LEN_LFMC: u32 = 36;
+/// The message length in bytes: one 4-byte word per lane, plus the tag.
+///
+/// 52 at [`cols::NUM_LANES`] = 12. **Derived, never written as a literal**: it
+/// is `v[14]`, hence the `vd` operand of round-0 G #2 and from there an XOR
+/// operand, so it cannot be mode-dependent (`WordRef::byte` panics on a
+/// `ModeSelected`) — all three domains move together and a hand-written 52 that
+/// disagreed with the lane count would desynchronise the wire interpretation
+/// from the host reference (COMMIT.md §1.4.4 **H9**).
+///
+/// 52 < 64 keeps a row ONE BLAKE3 block, which is what keeps the crate-KAT
+/// anchor: at [`SOCKET_ROUNDS`] = 7 a row is still a plain `blake3::hash` call.
+pub const BLOCK_LEN_LFMC: u32 = 4 * (cols::NUM_LANES as u32 + 1);
 
 /// The counter. Zero: one block, one chunk, chunk index 0.
 pub const COUNTER_LFMC: u64 = 0;
@@ -275,12 +304,15 @@ pub(crate) const FLOW: FlowConfig = FlowConfig {
     full_output: false,
 };
 
-/// The 16 message words of the socket's 36-byte block, under domain `tag`.
-pub fn socket_message(a: &[u32; 4], b: &[u32; 4], tag: u32) -> [u32; 16] {
+/// The 16 message words of the socket's 52-byte block, under domain `tag`.
+///
+/// The lanes first, the tag straight after them, zeros above — so the byte
+/// string is `LE32(lanes) ‖ tag` whatever the mode, and the tag stays LAST as
+/// COMMIT.md §1.2 specifies it.
+pub fn socket_message(lanes: &[u32; cols::NUM_LANES], tag: u32) -> [u32; 16] {
     let mut m = [0u32; 16];
-    m[0..4].copy_from_slice(a);
-    m[4..8].copy_from_slice(b);
-    m[8] = tag;
+    m[..cols::NUM_LANES].copy_from_slice(lanes);
+    m[cols::NUM_LANES] = tag;
     m
 }
 
@@ -297,9 +329,26 @@ pub fn socket_digest_rounds_tagged(
     rounds: usize,
     tag: u32,
 ) -> [u32; 4] {
+    socket_digest_lanes(&digest_row_lanes(a, b), rounds, tag)
+}
+
+/// A digest row's twelve lanes: the two cells it reads, then the four zeros the
+/// third input cell's pins force.
+///
+/// Written once, so the host reference cannot disagree with the AIR about what a
+/// compress row's new lanes hold.
+pub fn digest_row_lanes(a: &[u32; 4], b: &[u32; 4]) -> [u32; cols::NUM_LANES] {
+    let mut lanes = [0u32; cols::NUM_LANES];
+    lanes[0..4].copy_from_slice(a);
+    lanes[4..8].copy_from_slice(b);
+    lanes
+}
+
+/// The socket over twelve explicit lanes — the one place the framing is applied.
+pub fn socket_digest_lanes(lanes: &[u32; cols::NUM_LANES], rounds: usize, tag: u32) -> [u32; 4] {
     let out = blake3_compress_rounds(
         &BLAKE3_IV,
-        &socket_message(a, b, tag),
+        &socket_message(lanes, tag),
         COUNTER_LFMC,
         BLOCK_LEN_LFMC,
         FLAGS_LFMC,
@@ -351,8 +400,12 @@ pub const fn tag_for_mode(mode: HashMode) -> Option<u32> {
 // The felt boundary (the LEAF mode) — host side
 // =========================================================================
 
-/// Field elements one leaf row hashes. Four felts = eight halves = exactly the
-/// socket's eight message lanes, so a leaf costs one compress and no new layout.
+/// Field elements one leaf row hashes — the leaf **RATE** (COMMIT.md §1.4.1).
+///
+/// Four felts = eight halves, which with the four accumulator lanes fill the
+/// socket's twelve message lanes. It is one whole machine cell, which is the
+/// property the rate was chosen for: the leaf program reads its felt stream in
+/// the natural 4-per-cell layout with no re-packing pass.
 pub const FELTS_PER_LEAF: usize = 4;
 
 /// Goldilocks `p = 2^64 − 2^32 + 1`, as the halves see it: `p − 1` is
@@ -398,21 +451,39 @@ pub fn leaf_lanes(felts: &LfmWord) -> Option<[u32; 2 * FELTS_PER_LEAF]> {
     Some(lanes)
 }
 
+/// A leaf row's twelve lanes: the accumulator cell, then the felts' halves.
+///
+/// `None` if the accumulator is not four `u32` lanes (it is a previous digest,
+/// so it is by construction) or if a felt is not canonical.
+///
+/// The split is what makes the row a HYBRID and it is the reason this exists as
+/// one function: the accumulator is read as digest lanes and the felts as
+/// halves, on the same row, and the trace filler, the BITWISE histogram and the
+/// host reference must all split it identically (COMMIT.md §1.4.4 **H5**).
+pub fn leaf_row_lanes(acc: &LfmWord, felts: &LfmWord) -> Option<[u32; cols::NUM_LANES]> {
+    let mut lanes = [0u32; cols::NUM_LANES];
+    lanes[..cols::NUM_ACC_LANES].copy_from_slice(&lanes_of(acc)?);
+    lanes[cols::NUM_ACC_LANES..].copy_from_slice(&leaf_lanes(felts)?);
+    Some(lanes)
+}
+
 /// One leaf row at an explicit round count — the `"LFML"` domain over the
-/// felts' halves.
-pub fn leaf_digest_rounds(felts: &LfmWord, rounds: usize) -> Option<[u32; 4]> {
-    let lanes = leaf_lanes(felts)?;
-    let (a, b) = (
-        [lanes[0], lanes[1], lanes[2], lanes[3]],
-        [lanes[4], lanes[5], lanes[6], lanes[7]],
-    );
-    Some(socket_digest_rounds_tagged(&a, &b, rounds, TAG_LFML))
+/// accumulator and the felts' halves.
+///
+/// **The accumulator rides in the message, so there is no separate fold**: this
+/// one compression both absorbs `felts` and chains `acc` (COMMIT.md §1.2).
+pub fn leaf_digest_rounds(acc: &LfmWord, felts: &LfmWord, rounds: usize) -> Option<[u32; 4]> {
+    Some(socket_digest_lanes(
+        &leaf_row_lanes(acc, felts)?,
+        rounds,
+        TAG_LFML,
+    ))
 }
 
 /// [`leaf_digest_rounds`] at the compiled-in round count — what a `Leaf` row
 /// proves, and what [`Blake3Permutation::leaf`] computes.
-pub fn leaf_digest(felts: &LfmWord) -> Option<[u32; 4]> {
-    leaf_digest_rounds(felts, SOCKET_ROUNDS)
+pub fn leaf_digest(acc: &LfmWord, felts: &LfmWord) -> Option<[u32; 4]> {
+    leaf_digest_rounds(acc, felts, SOCKET_ROUNDS)
 }
 
 // =========================================================================
@@ -505,14 +576,15 @@ impl LfmHasher for Blake3Permutation {
     /// the socket. This is what lets arbitrary Goldilocks data be hashed at all
     /// — obligation O1 restricts the *lanes*, and a leaf row satisfies it by
     /// construction rather than by luck.
-    fn leaf(&self, felts: &LfmWord) -> LfmWord {
-        word_of(&leaf_digest(felts).expect(
-            "leaf felt is not canonical — admits() should have rejected it (reject, never reduce)",
+    fn leaf(&self, acc: &LfmWord, felts: &LfmWord) -> LfmWord {
+        word_of(&leaf_digest(acc, felts).expect(
+            "leaf accumulator lane is not a u32, or a leaf felt is not canonical — admits() \
+             should have rejected it (reject, never reduce)",
         ))
     }
 
-    fn leaf_out(&self, felts: &LfmWord) -> [FE; HASH_STATE_FELTS] {
-        Self::widen(self.leaf(felts))
+    fn leaf_out(&self, acc: &LfmWord, felts: &LfmWord) -> [FE; HASH_STATE_FELTS] {
+        Self::widen(self.leaf(acc, felts))
     }
 
     fn admits(&self, mode: HashMode, state: &[FE; HASH_STATE_FELTS]) -> Result<(), &'static str> {
@@ -520,14 +592,26 @@ impl LfmHasher for Blake3Permutation {
             HashMode::Permute => Err(
                 "BLAKE3 has no LFM_HASH permute socket (SOCKET.md §7); its AIR forces MODE_P = 0",
             ),
-            // ★ A leaf row has NO `u32` restriction — that is the entire point
-            // of the mode. Its felts are split into checked halves inside the
-            // socket, so O1 is satisfied by the encoding rather than by the
-            // caller. What it does require is canonicity, which every `FE` has
-            // by construction; the check is here so that a future value arriving
-            // by some other route is rejected rather than wrapped.
+            // ★ A leaf row is a HYBRID and both halves have to be checked, in
+            // the cells the AIR actually reads them from: the ACCUMULATOR in
+            // cell 0 is an ordinary digest and carries the full O1 `u32`
+            // restriction, while the FELTS in cell 1 have none — that is the
+            // entire point of the mode, since they are split into checked halves
+            // inside the socket.
+            //
+            // ⚠ Checking the wrong cell is a prover PANIC rather than a clean
+            // rejection: a non-canonical felt would pass here and blow up later
+            // in the witness filler (COMMIT.md §1.4.4 **H7**). The house rule is
+            // reject, never reduce — and never panic where a rejection is
+            // available.
             HashMode::Leaf => {
-                let felts: LfmWord = core::array::from_fn(|i| state[i]);
+                let acc: LfmWord = core::array::from_fn(|i| state[i]);
+                let felts: LfmWord = core::array::from_fn(|i| state[4 + i]);
+                if lanes_of(&acc).is_none() {
+                    return Err(
+                        "BLAKE3 leaf accumulator lane is not a u32 (SOCKET.md obligation O1)",
+                    );
+                }
                 if leaf_lanes(&felts).is_none() {
                     return Err(
                         "BLAKE3 leaf felt is not a canonical Goldilocks element (LEAF.md §1.1)",
@@ -595,7 +679,7 @@ pub mod cols {
         OUT_ADDR0, OUT_ADDR1, OUT_ADDR2, OUT0, PREP_WIDTH, S8, SHARED_VALUE_COLUMNS,
     };
 
-    use super::{FELTS_PER_LEAF, NUM_G, OUT_WINDOW};
+    use super::{FELTS_PER_LEAF, HASH_DIGEST_FELTS, NUM_G, OUT_WINDOW};
 
     /// The is-real flag every constraint is gated by and every send's
     /// multiplicity: `MODE_C + MODE_T + MODE_L`, the three modes this arm has a
@@ -606,16 +690,29 @@ pub mod cols {
     /// gate nor — through the same columns — the domain tag it selects.
     pub const MU_COLUMNS: [usize; 3] = [MODE_C, MODE_T, MODE_L];
 
-    /// The modes whose eight message lanes ARE the eight `IN` lanes — the digest
-    /// modes. A leaf row's lanes are its felts' halves instead, so the lane
-    /// identity is gated on this rather than on the full mu.
+    /// The modes whose message lanes above the accumulator ARE the `IN` lanes —
+    /// the digest modes. A leaf row's lanes 4–11 are its felts' halves instead,
+    /// so the lane identity is gated on this above [`NUM_ACC_LANES`] rather than
+    /// on the full mu. Lanes 0–3 are a digest cell in EVERY mode and take the
+    /// full mu; see [`super::eval`] and COMMIT.md §1.4.4 **H6**.
     pub const DIGEST_MODE_COLUMNS: [usize; 2] = [MODE_C, MODE_T];
 
-    /// First appended witness column: the byte decomposition of the 8 input
-    /// lanes, 4 bytes each, little-endian (`lane_byte`).
+    /// First appended witness column: the byte decomposition of the input lanes,
+    /// 4 bytes each, little-endian (`lane_byte`).
     pub const LANES: usize = PREP_WIDTH + SHARED_VALUE_COLUMNS;
-    /// Input lanes that carry message words: `a[0..4] ‖ b[0..4]`.
-    pub const NUM_LANES: usize = 8;
+
+    /// Lanes carrying a cell that is a DIGEST under every mode: `a` on a digest
+    /// row, the chaining accumulator on a leaf row. One identity serves both
+    /// readings, which is why they can share a gate.
+    pub const NUM_ACC_LANES: usize = HASH_DIGEST_FELTS;
+
+    /// Input lanes that carry message words.
+    ///
+    /// The accumulator cell plus one felt cell's halves — the leaf RATE decides
+    /// this number, and the digest modes inherit it: `a ‖ b` fills the first
+    /// eight and the last four are the third input cell, which the unread-`IN`
+    /// pins force to zero (COMMIT.md §1.4.1).
+    pub const NUM_LANES: usize = NUM_ACC_LANES + 2 * FELTS_PER_LEAF;
 
     /// The mixing core: one 60-cell block per G-instance, laid out exactly as
     /// `blake3_chip::cols` lays one out (56 byte cells + 4 carry bits).
@@ -644,7 +741,7 @@ pub mod cols {
         G_A1, G_A1_C, G_A2, G_A2_C, G_C1, G_C2, G_R1, G_R2, G_X1, G_X2, G_X3, G_X4,
     };
 
-    /// Byte `b` of input lane `lane` (0..8).
+    /// Byte `b` of input lane `lane` (0..[`NUM_LANES`]).
     #[inline]
     pub const fn lane_byte(lane: usize, b: usize) -> usize {
         LANES + 4 * lane + b
@@ -674,17 +771,27 @@ pub mod cols {
         CANON + 2 * i + 1
     }
 
+    /// The `IN` column of leaf felt `i` — the SECOND input cell.
+    ///
+    /// The felts sit above the accumulator, which is what the halves binding and
+    /// [`super::lanes_from_cells`] must both read (COMMIT.md §1.4.4 **H4**).
+    #[inline]
+    pub const fn leaf_felt(i: usize) -> usize {
+        IN0 + NUM_ACC_LANES + i
+    }
+
     /// Message lane carrying felt `i`'s LOW half. Halves are adjacent, so the
-    /// canonicity gate reads neighbours rather than reaching across the row.
+    /// canonicity gate reads neighbours rather than reaching across the row;
+    /// they start above the accumulator lanes.
     #[inline]
     pub const fn leaf_lo_lane(i: usize) -> usize {
-        2 * i
+        NUM_ACC_LANES + 2 * i
     }
 
     /// Message lane carrying felt `i`'s HIGH half.
     #[inline]
     pub const fn leaf_hi_lane(i: usize) -> usize {
-        2 * i + 1
+        NUM_ACC_LANES + 2 * i + 1
     }
 }
 
@@ -717,15 +824,22 @@ const TAG_SELECTOR: &[(usize, u32)] = &[
 
 /// The message word at schedule index `i`, as wiring.
 ///
-/// `i < 8` are the input lanes' byte columns; `m[8]` is the domain tag and
-/// `m[9..16]` are zero. None of them is a witness column, which is what makes
-/// the domain separation free (no cells, no range checks, SOCKET.md §2.3) —
-/// the tag went from a constant to a linear form over preprocessed columns and
-/// kept that property, because a preprocessed column is not a witness.
+/// `i < NUM_LANES` are the input lanes' byte columns; `m[NUM_LANES]` is the
+/// domain tag and everything above it is zero. None of them is a witness column,
+/// which is what makes the domain separation free (no cells, no range checks,
+/// SOCKET.md §2.3) — the tag went from a constant to a linear form over
+/// preprocessed columns and kept that property, because a preprocessed column is
+/// not a witness.
+///
+/// **The tag sits immediately after the lanes, not at a fixed `m[8]`.** That is
+/// what makes the message the byte string `LE32(lanes) ‖ tag` at any lane count,
+/// which is the form COMMIT.md §1.2 specifies and the form the KATs pin. A
+/// `ModeSelected` word is legal at any index for the same reason a `Const` one
+/// is: message words reach `add3` and nothing else.
 fn message_word_ref(i: usize) -> WordRef {
     match i {
-        0..=7 => WordRef::Cols(word_cols(cols::lane_byte(i, 0))),
-        8 => WordRef::ModeSelected(TAG_SELECTOR),
+        i if i < cols::NUM_LANES => WordRef::Cols(word_cols(cols::lane_byte(i, 0))),
+        i if i == cols::NUM_LANES => WordRef::ModeSelected(TAG_SELECTOR),
         _ => WordRef::Const(0),
     }
 }
@@ -850,25 +964,21 @@ fn socket_wires() -> WireFlow {
     w.0
 }
 
-/// The value interpretation of the same dataflow, for one row's eight message
+/// The value interpretation of the same dataflow, for one row's twelve message
 /// lanes in one domain.
 ///
-/// Lanes rather than `(a, b)` because a LEAF row's lanes are not two cells —
-/// they are four felts' halves. The mixing core does not care which; it sees
-/// eight `u32`s either way, and that is exactly why the leaf mode needs no new
-/// layout.
+/// Lanes rather than cells because a LEAF row's lanes are not cells throughout —
+/// lanes 0–3 are its accumulator and lanes 4–11 are four felts' halves. The
+/// mixing core does not care which; it sees twelve `u32`s either way, and that is
+/// exactly why the leaf mode needs no new layout.
 ///
-/// The tag is an input because it is `m[8]`: it enters the very first round's
-/// `add3` and every value downstream of it, so a row's witness and its BITWISE
-/// lookups both depend on which domain the row hashes in.
-fn socket_values(lanes: &[u32; 8], tag: u32) -> ValueFlow {
-    let (a, b) = (
-        [lanes[0], lanes[1], lanes[2], lanes[3]],
-        [lanes[4], lanes[5], lanes[6], lanes[7]],
-    );
+/// The tag is an input because it is a message word: it enters the very first
+/// round's `add3` and every value downstream of it, so a row's witness and its
+/// BITWISE lookups both depend on which domain the row hashes in.
+fn socket_values(lanes: &[u32; cols::NUM_LANES], tag: u32) -> ValueFlow {
     ValueFlow::compute_with(
         &BLAKE3_IV,
-        &socket_message(&a, &b, tag),
+        &socket_message(lanes, tag),
         COUNTER_LFMC,
         BLOCK_LEN_LFMC,
         FLAGS_LFMC,
@@ -904,9 +1014,8 @@ fn byte_bus_value(b: ByteRef) -> BusValue {
 /// 2. `AreBytes` on the four shift halfwords of each rotation. The `SLL` bound
 ///    is tight and load-bearing: with `2^16` invertible mod `p` it is what pins
 ///    `SLL = (x · 2^r) mod 2^16` uniquely.
-/// 3. `AreBytes` on the 8 input lanes' 32 bytes — obligation O1. These are the
-///    only bytes with no XOR consumer, exactly as `m`'s are in
-///    `blake3_chip`.
+/// 3. `AreBytes` on the input lanes' bytes — obligation O1. These are the only
+///    bytes with no XOR consumer, exactly as `m`'s are in `blake3_chip`.
 pub fn bitwise_interactions() -> Vec<BusInteraction> {
     let wires = socket_wires();
     let mut interactions =
@@ -967,9 +1076,10 @@ pub fn bitwise_interactions() -> Vec<BusInteraction> {
 /// Each row is `(lanes, tag)`: the domain reaches the histogram because it
 /// reaches `m[8]`, and every XOR byte downstream of round 0 differs between the
 /// domains. A histogram built with the wrong tag balances against nothing.
-pub fn bitwise_ops_for(rows: &[([u32; 8], u32)]) -> Vec<BitwiseOperation> {
-    let mut out =
-        Vec::with_capacity(rows.len() * (4 * (NUM_G * 4 + OUT_WINDOW) + 4 * NUM_G * 2 + 16));
+pub fn bitwise_ops_for(rows: &[([u32; cols::NUM_LANES], u32)]) -> Vec<BitwiseOperation> {
+    let mut out = Vec::with_capacity(
+        rows.len() * (4 * (NUM_G * 4 + OUT_WINDOW) + 4 * NUM_G * 2 + 2 * cols::NUM_LANES),
+    );
 
     for (lanes, tag) in rows {
         let flow = socket_values(lanes, *tag);
@@ -1070,26 +1180,51 @@ fn tag_from_row(row: &[FE]) -> u32 {
     }
 }
 
-/// The row's eight message lanes, read off the row itself.
+/// The twelve message lanes of a row that reads `cells`, split the way its mode
+/// reads them.
 ///
-/// The two readings the mode selects between, and the only place the machine
-/// decides which one a row gets:
+/// ★ **The row is a HYBRID and this is the only place the split lives.** Lanes
+/// 0–3 are `cells[0]` read as digest lanes under EVERY mode — `a` on a digest
+/// row, the chaining accumulator on a leaf row. Above that the readings differ:
 ///
-/// - **digest modes** — the lanes ARE `IN0..8`, two cells of four `u32` lanes;
-/// - **leaf mode** — the lanes are `IN0..4` read as four FELTS and split into
-///   `lo`/`hi` halves. `IN4..8` are unused and the AIR pins them to zero.
+/// - **digest modes** — lanes 4–11 are `cells[1]` and `cells[2]`, two more cells
+///   of four `u32` lanes. The third is unread by these modes and the AIR pins it
+///   to zero, so those four lanes are zero on every honest digest row.
+/// - **leaf mode** — lanes 4–11 are `cells[1]` read as four FELTS and split into
+///   `lo`/`hi` halves.
+///
+/// The trace filler and the BITWISE histogram both come through here, so a
+/// witness and the multiplicities it must balance against cannot split a row
+/// differently (COMMIT.md §1.4.4 **H5**).
+pub fn lanes_from_cells(is_leaf: bool, cells: &[LfmWord; 3]) -> [u32; cols::NUM_LANES] {
+    let mut lanes = [0u32; cols::NUM_LANES];
+    lanes[..cols::NUM_ACC_LANES]
+        .copy_from_slice(&lanes_of(&cells[0]).expect("socket lane is not a u32 (O1)"));
+    if is_leaf {
+        lanes[cols::NUM_ACC_LANES..].copy_from_slice(
+            &leaf_lanes(&cells[1]).expect("leaf felt is not canonical (LEAF.md §1.1)"),
+        );
+    } else {
+        for (k, cell) in cells[1..].iter().enumerate() {
+            let base = cols::NUM_ACC_LANES + 4 * k;
+            lanes[base..base + 4]
+                .copy_from_slice(&lanes_of(cell).expect("compress lane is not a u32 (O1)"));
+        }
+    }
+    lanes
+}
+
+/// [`lanes_from_cells`] for a trace row, reading the input cells and the mode
+/// off the row itself.
 ///
 /// Keyed on `MODE_L` rather than on a tag, so it is total for any row a control
 /// can build — including one whose mode columns are fractional.
-fn lanes_from_row(row: &[FE]) -> [u32; 8] {
+fn lanes_from_row(row: &[FE]) -> [u32; cols::NUM_LANES] {
     let cell = |base: usize| -> LfmWord { core::array::from_fn(|i| row[base + i]) };
-    if row[cols::MODE_L] == FE::one() {
-        leaf_lanes(&cell(cols::IN0)).expect("leaf felt is not canonical (LEAF.md §1.1)")
-    } else {
-        let a = lanes_of(&cell(cols::IN0)).expect("compress lane is not a u32 (O1)");
-        let b = lanes_of(&cell(cols::IN0 + 4)).expect("compress lane is not a u32 (O1)");
-        core::array::from_fn(|i| if i < 4 { a[i] } else { b[i - 4] })
-    }
+    lanes_from_cells(
+        row[cols::MODE_L] == FE::one(),
+        &[cell(cols::IN0), cell(cols::IN0 + 4), cell(cols::IN0 + 8)],
+    )
 }
 
 /// The canonicity witnesses for one leaf row's four felts.
@@ -1097,7 +1232,7 @@ fn lanes_from_row(row: &[FE]) -> [u32; 8] {
 /// `Z_i = 1` exactly when felt `i`'s high half is maximal; `GINV_i` inverts
 /// `G_i = (2^32 − 1) − hi_i` when that is nonzero and is zero when it is not.
 /// The same `Z`/`GINV` pair `LFM_BITDEC` uses for its own canonicity check.
-fn fill_canonicity_witness(row: &mut [FE], lanes: &[u32; 8]) {
+fn fill_canonicity_witness(row: &mut [FE], lanes: &[u32; cols::NUM_LANES]) {
     for i in 0..FELTS_PER_LEAF {
         let hi = lanes[cols::leaf_hi_lane(i)];
         let g = u64::from(MAX_HALF - hi);
@@ -1205,22 +1340,44 @@ pub(crate) fn fill_socket_witness_tagged(row: &mut [FE], tag: u32) {
 
 /// Constraints the BLAKE3 arm emits.
 ///
-/// `50` framing constraints — 4 capacity copies, the mode-sum booleanity, the
-/// `MODE_P = 0` pin, 8 lane decompositions, 8 unused-output pins, 4 digest
-/// recompositions, [`NUM_UNREAD_INPUT_PINS`] unread-`IN` pins and 16 leaf
-/// felt/canonicity constraints — plus 16 per G-instance: per G, two add3s (a sum
-/// identity and two carry booleanities each), two add2 carry booleanities, and
-/// two rotations (two shift identities and two recombines each).
-pub const NUM_CONSTRAINTS: usize = UNREAD_IDX + NUM_UNREAD_INPUT_PINS + 16 + 16 * NUM_G;
+/// The framing block — 4 capacity copies, the mode-sum booleanity, the
+/// `MODE_P = 0` pin, [`cols::NUM_LANES`] lane decompositions, 8 unused-output
+/// pins, 4 digest recompositions, [`NUM_UNREAD_INPUT_PINS`] unread-`IN` pins and
+/// 16 leaf felt/canonicity constraints — plus 16 per G-instance: per G, two
+/// add3s (a sum identity and two carry booleanities each), two add2 carry
+/// booleanities, and two rotations (two shift identities and two recombines
+/// each).
+pub const NUM_CONSTRAINTS: usize = CORE_IDX + 16 * NUM_G;
 
 /// First mixing-core constraint index — everything below it is framing.
-const CORE_IDX: usize = UNREAD_IDX + NUM_UNREAD_INPUT_PINS + 16;
+const CORE_IDX: usize = LEAF_IDX + LEAF_CONSTRAINTS_PER_FELT * FELTS_PER_LEAF;
+
+/// First lane-decomposition index: after the capacity copies, the mode-sum
+/// booleanity and the `MODE_P` pin.
+const LANE_IDX: usize = 6;
+
+/// First unused-output pin index.
+///
+/// ★ **DERIVED FROM [`cols::NUM_LANES`], never written as a literal.** The lane
+/// block grew from 8 to 12 with the leaf RATE, and the constraint COUNT did not
+/// move — the unread-`IN` pins lost exactly the four the lanes gained — so a
+/// hardcoded `14` here would have silently overwritten the first four output
+/// pins with lane identities, leaving lanes 8–11 with no identity at all.
+/// `EmitTracker`'s duplicate assert is `#[cfg(debug_assertions)]` and the house
+/// convention runs the suite in release, so nothing would have failed
+/// (COMMIT.md §1.4.4 **H1**). `blake3_socket_tests::
+/// every_hash_candidate_emits_each_constraint_index_exactly_once` is the
+/// release-visible guard that would catch it if these ever go back to literals.
+const OUT_PIN_IDX: usize = LANE_IDX + cols::NUM_LANES;
+
+/// First digest-recomposition index.
+const DIGEST_IDX: usize = OUT_PIN_IDX + 8;
 
 /// First unread-`IN` pin index.
 ///
 /// Public so the controls can name the pins rather than locate them by a
 /// literal — the point of those tests is that the violated set IS the pins.
-pub const UNREAD_IDX: usize = 26;
+pub const UNREAD_IDX: usize = DIGEST_IDX + OUT_WINDOW;
 
 /// First LEAF constraint index: four per felt (the halves binding and the three
 /// canonicity constraints), after the shared unread-`IN` pins.
@@ -1286,50 +1443,71 @@ pub fn eval<B: ConstraintBuilder<F, E>>(b: &mut B) {
     // waiting to be deleted — it is the decision, written down as a constraint.
     b.emit_base(5, mode_p);
 
-    // idx 6–13: THE LANE BOUNDARY (obligation O1). One mu-gated linear identity
-    // per input lane; the matching `AreBytes` sends are in
-    // `bitwise_interactions`. NEITHER ALONE SUFFICES, and the two buy DIFFERENT
-    // things — see the module docs. This identity makes `IN_lane` and `m[lane]`
-    // the same field element, because the core reads the same linear form; the
-    // sends bound the bytes, and are the message words' ONLY range check, which
-    // is what `add3`'s exactness needs. With both, the sum of four bytes
-    // weighted by 2^{8k} is < 2^32 ≪ p, so it cannot wrap and the lane is
-    // forced below 2^32.
+    // THE LANE BOUNDARY (obligation O1). One linear identity per input lane; the
+    // matching `AreBytes` sends are in `bitwise_interactions`. NEITHER ALONE
+    // SUFFICES, and the two buy DIFFERENT things — see the module docs. This
+    // identity makes `IN_lane` and `m[lane]` the same field element, because the
+    // core reads the same linear form; the sends bound the bytes, and are the
+    // message words' ONLY range check, which is what `add3`'s exactness needs.
+    // With both, the sum of four bytes weighted by 2^{8k} is < 2^32 ≪ p, so it
+    // cannot wrap and the lane is forced below 2^32.
     //
-    // ⚠ GATED ON THE DIGEST MODES, not on the full mu. On a LEAF row the eight
-    // message lanes are four felts' halves, so `IN_lane` and `m[lane]` are
-    // deliberately NOT the same field element — the leaf block below states the
-    // relation those rows do satisfy. Gating this on mu instead would make every
-    // leaf row unprovable.
+    // ★ THE GATE IS PER LANE RANGE, and getting it wrong in the permissive
+    // direction is a soundness break (COMMIT.md §1.4.4 **H6**):
+    //
+    // - **lanes 0–3 → the full mu.** They are `a` on a digest row and the
+    //   chaining ACCUMULATOR on a leaf row, and the same identity is correct for
+    //   both readings, so one gate serves. This is also the only thing that
+    //   range-checks the accumulator: identity + `AreBytes` is what makes "the
+    //   accumulator is a previous digest, hence `u32`" a constraint rather than
+    //   a hope. Gate these on `digest_mu` and a leaf row's accumulator carries
+    //   no identity at all — the prover picks the chain's message words freely
+    //   and the whole leaf chain unbinds.
+    // - **lanes 4–11 → the digest modes only.** On a LEAF row they are four
+    //   felts' halves, so `IN_lane` and `m[lane]` are deliberately NOT the same
+    //   field element — the leaf block below states the relation those rows do
+    //   satisfy. Gating these on mu instead would make every leaf row
+    //   unprovable.
+    //
+    // ★ On a digest row lanes 8–11 read the THIRD input cell, which the unread-
+    // `IN` pins force to zero, so the identity reads `0 = Σ bytes·2^{8k}` and
+    // with the `AreBytes` bound in hand forces all sixteen bytes to zero. That
+    // is what keeps the four message words the leaf RATE added out of the
+    // prover's hands on a Merkle parent — free, but only because these
+    // identities exist.
     for lane in 0..cols::NUM_LANES {
         let felt = b.main(0, cols::IN0 + lane);
         let bytes = word_expr(b, &WordRef::Cols(word_cols(cols::lane_byte(lane, 0))));
-        let m = digest_mu(b);
-        b.emit_base(6 + lane, m * (felt - bytes));
+        let m = if lane < cols::NUM_ACC_LANES {
+            mu(b)
+        } else {
+            digest_mu(b)
+        };
+        b.emit_base(LANE_IDX + lane, m * (felt - bytes));
     }
 
-    // idx 14–21: the digest is ONE cell, so the upper eight `OUT` lanes carry
-    // nothing. `MULT1`/`MULT2` are zero on a Compress row so they reach no bus,
-    // but pinning them costs eight degree-1 constraints and removes the
-    // question entirely. Ungated: they are zero on padding rows too.
+    // The digest is ONE cell, so the upper eight `OUT` lanes carry nothing.
+    // `MULT1`/`MULT2` are zero on a Compress row so they reach no bus, but
+    // pinning them costs eight degree-1 constraints and removes the question
+    // entirely. Ungated: they are zero on padding rows too.
     for j in 0..8 {
         let out = b.main(0, cols::OUT0 + HASH_DIGEST_FELTS + j);
-        b.emit_base(14 + j, out);
+        b.emit_base(OUT_PIN_IDX + j, out);
     }
 
-    // idx 22–25: the digest lanes. No range check is needed on `OUTW`'s bytes —
-    // they are `ByteAlu[XOR]` outputs, hence already bytes — and the sum is
-    // < 2^32 ≪ p, so `OUT_i` is forced to the honest u32. That is why the
-    // socket's OUTPUT always satisfies O1 (obligation O2) and only leaf digests
-    // and prover-hinted siblings need the input check.
+    // The digest lanes. No range check is needed on `OUTW`'s bytes — they are
+    // `ByteAlu[XOR]` outputs, hence already bytes — and the sum is < 2^32 ≪ p,
+    // so `OUT_i` is forced to the honest u32. That is why the socket's OUTPUT
+    // always satisfies O1 (obligation O2) and only leaf digests and
+    // prover-hinted siblings need the input check.
     for i in 0..OUT_WINDOW {
         let felt = b.main(0, cols::OUT0 + i);
         let bytes = word_expr(b, &WordRef::Cols(word_cols(cols::out_byte(i, 0))));
         let m = mu(b);
-        b.emit_base(22 + i, m * (felt - bytes));
+        b.emit_base(DIGEST_IDX + i, m * (felt - bytes));
     }
 
-    // idx 26–33: the input cells this row's mode does not read.
+    // The input cells this row's mode does not read.
     //
     // ⚠ **LOAD-BEARING, and not only here.** On THIS arm the unread columns
     // reach no constraint, so the pin is what keeps them from being an open
@@ -1342,8 +1520,9 @@ pub fn eval<B: ConstraintBuilder<F, E>>(b: &mut B) {
     let next = crate::lfm::chips::hash::emit_unread_input_pins(b, UNREAD_IDX);
     debug_assert_eq!(next, LEAF_IDX);
 
-    // idx 34–49: ★ THE LEAF MODE. Per felt: the halves binding, then the three
-    // canonicity constraints.
+    // ★ THE LEAF MODE. Per felt: the halves binding, then the three canonicity
+    // constraints. The felts are the SECOND input cell — the first is the
+    // chaining accumulator, whose lanes the identity block above binds.
     //
     // `v = lo + 2^32·hi` with `lo, hi < 2^32` is a decomposition, not yet a
     // canonical one: `p − 1 = 0xFFFFFFFF_00000000`, so the pairs with `hi`
@@ -1366,7 +1545,7 @@ pub fn eval<B: ConstraintBuilder<F, E>>(b: &mut B) {
             b,
             &WordRef::Cols(word_cols(cols::lane_byte(cols::leaf_hi_lane(i), 0))),
         );
-        let v = b.main(0, cols::IN0 + i);
+        let v = b.main(0, cols::leaf_felt(i));
         let z = b.main(0, cols::canon_z(i));
         let ginv = b.main(0, cols::canon_ginv(i));
         let g = max_half.clone() - hi.clone();

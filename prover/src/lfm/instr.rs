@@ -65,12 +65,14 @@ pub enum HashMode {
     /// A Merkle LEAF over four arbitrary field elements.
     ///
     /// **This mode implies felt-input semantics**, by decision rather than by
-    /// inference. The other modes read their input cells as digests — four
-    /// `u32` lanes; this one reads ONE cell as four Goldilocks elements and
-    /// splits each into a checked `lo`/`hi` `u32` pair, so eight halves fill the
-    /// same eight message lanes a digest-mode row uses. That is what lets FRI
-    /// data — LDE evaluations and folded extension elements, none of them `u32`
-    /// — reach a hash whose inputs must be `u32`.
+    /// inference. The other modes read both their input cells as digests — four
+    /// `u32` lanes each; this one reads its FIRST cell that way, as a chaining
+    /// accumulator, and its SECOND as four Goldilocks elements, splitting each
+    /// into a checked `lo`/`hi` `u32` pair so eight halves fill the message
+    /// lanes above the accumulator. That is what lets FRI data — LDE evaluations
+    /// and folded extension elements, none of them `u32` — reach a hash whose
+    /// inputs must be `u32`, and it absorbs four felts per compression because
+    /// the chaining rides in the message rather than in a separate fold.
     ///
     /// It is also what retires obligation O5 — **under a hasher that separates
     /// the domains.** BLAKE3 does: a leaf is `BLAKE3(…‖"LFML")` and a parent is
@@ -96,15 +98,19 @@ impl HashMode {
         matches!(self, HashMode::Compress | HashMode::Transcript)
     }
 
-    /// Input cells this mode reads from memory: 2, 1 or 3.
+    /// Input cells this mode reads from memory: 2 or 3.
     ///
     /// The `LFM_HASH` bus receives are gated by exactly this, so a mode that
-    /// reads fewer cells must not receive the ones it does not read — a leaf row
-    /// receiving a second cell would be claiming a memory read it never makes.
+    /// reads fewer cells must not receive the ones it does not read — a row
+    /// receiving a cell it never reads would claim a memory read it never makes.
+    ///
+    /// A `Leaf` reads TWO: its chaining accumulator, then the four felts it
+    /// absorbs. It read one until the leaf RATE put the accumulator in the
+    /// message rather than in a separate `"LFMC"` fold (COMMIT.md §1.2), which
+    /// is what took leaf absorption from 2 felts per compression to 4.
     pub const fn num_input_cells(self) -> usize {
         match self {
-            HashMode::Compress | HashMode::Transcript => 2,
-            HashMode::Leaf => 1,
+            HashMode::Compress | HashMode::Transcript | HashMode::Leaf => 2,
             HashMode::Permute => 3,
         }
     }

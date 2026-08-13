@@ -615,15 +615,19 @@ pub mod hash {
 
     /// The frozen `LFM_HASH` tuple contract: 2 (or 3) cells in, 1 (or 3) out.
     ///
-    /// The FIRST input cell is read in every mode, so its multiplicity is the
-    /// row's is-real flag: the sum of all four mode selectors, which the AIR
-    /// pins to a bit. The second is read by every mode EXCEPT `Leaf`, which
-    /// takes one cell of four felts — receiving a second cell there would claim
-    /// a memory read the row never makes. The third is read only by a
-    /// permutation.
+    /// The FIRST TWO input cells are read in every mode, so their multiplicity
+    /// is the row's is-real flag: the sum of all four mode selectors, which the
+    /// AIR pins to a bit. The third is read only by a permutation.
+    ///
+    /// ⚠ The second cell's multiplicity used to EXCLUDE `MODE_L`, because a leaf
+    /// row read one cell of four felts and receiving a second would have claimed
+    /// a memory read it never made. Under the leaf RATE a leaf row reads two —
+    /// a chaining accumulator and a felt cell — so that exclusion became the
+    /// opposite bug: the felts would never be read from memory at all (COMMIT.md
+    /// §1.4.4 **H3**). The bus ARITY does not move; this multiplicity is the one
+    /// part of the frozen contract that the RATE does.
     fn lfm_mem_interactions() -> Vec<BusInteraction> {
         let is_real = || selector_sum(cols::MODE_C, cols::NUM_SELECTORS);
-        let reads_two = || Multiplicity::Sum3(cols::MODE_C, cols::MODE_T, cols::MODE_P);
         vec![
             BusInteraction::receiver(
                 BusId::LfmMem,
@@ -632,7 +636,7 @@ pub mod hash {
             ),
             BusInteraction::receiver(
                 BusId::LfmMem,
-                reads_two(),
+                is_real(),
                 word_token(cols::IN_ADDR1, cols::IN0 + 4),
             ),
             BusInteraction::receiver(
@@ -673,9 +677,34 @@ pub mod hash {
         (cols::MODE_P, HashMode::Permute),
     ];
 
-    /// Constraints [`emit_unread_input_pins`] emits: four per unread input cell,
-    /// for the two cells some mode does not read.
-    pub(crate) const NUM_UNREAD_INPUT_PINS: usize = 8;
+    /// Input cell slots that SOME mode does not read, and which therefore need
+    /// pinning. Cell 0 is read by every mode and is never a candidate.
+    ///
+    /// Derived rather than written down: the leaf RATE took `Leaf` from one
+    /// input cell to two, which emptied slot 1's set. Left as a literal, the
+    /// emitter's `.expect("some mode reads fewer than three input cells")` would
+    /// have fired and AIR construction would have panicked (COMMIT.md §1.4.4
+    /// **H2**).
+    const fn unread_input_slots() -> usize {
+        let mut slots = 0;
+        let mut slot = 1;
+        while slot < 3 {
+            let mut i = 0;
+            while i < MODE_SELECTORS.len() {
+                if MODE_SELECTORS[i].1.num_input_cells() <= slot {
+                    slots += 1;
+                    break;
+                }
+                i += 1;
+            }
+            slot += 1;
+        }
+        slots
+    }
+
+    /// Constraints [`emit_unread_input_pins`] emits: four per input cell that
+    /// some mode does not read.
+    pub(crate) const NUM_UNREAD_INPUT_PINS: usize = 4 * unread_input_slots();
 
     /// The first constraint index each arm places the unread-`IN` pins at.
     ///
@@ -717,10 +746,11 @@ pub mod hash {
         first_idx: usize,
     ) -> usize {
         let mut idx = first_idx;
-        // Cell 0 is read by every mode, so it is never pinned; cells 1 and 2 are
-        // each unread by some mode.
+        // Cell 0 is read by every mode, so it is never pinned. A slot EVERY mode
+        // reads is skipped rather than pinned to nothing — which is the shape
+        // slot 1 took when the leaf RATE gave `Leaf` a second input cell.
         for slot in 1..3usize {
-            let sel = MODE_SELECTORS
+            let Some(sel) = MODE_SELECTORS
                 .iter()
                 .filter(|(_, mode)| mode.num_input_cells() <= slot)
                 .fold(None::<B::Expr>, |acc, (col, _)| {
@@ -730,7 +760,9 @@ pub mod hash {
                         Some(a) => a + term,
                     })
                 })
-                .expect("some mode reads fewer than three input cells");
+            else {
+                continue;
+            };
             for j in 0..4 {
                 let in_col = b.main(0, cols::IN0 + 4 * slot + j);
                 b.emit_base(idx, sel.clone() * in_col);
