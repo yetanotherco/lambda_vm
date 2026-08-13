@@ -1,51 +1,57 @@
 //! LEAF-mode KATs for the LFM `"LFML"` domain, at 6 and 7 rounds.
 //!
-//! GENERATED — do not hand-edit. Rendered from
-//! `thoughts/shared/lfm-real-hash/leaf-spec/leaf_kats.json`, which the oracle
-//! produced from a Python reference written **before any Rust existed**. These
-//! vectors are a specification the implementation is checked against, not a
-//! recording of what the implementation happened to do.
+//! GENERATED — do not hand-edit. Rendered by
+//! `thoughts/shared/lfm-real-hash/leaf-spec/rate4_kat_gen.py` from
+//! `gate-oracle/blake3_oracle.py`, a Python BLAKE3 written **before any Rust
+//! existed**. These vectors are a specification the implementation is checked
+//! against, not a recording of what the implementation happened to do.
 //!
-//! A leaf row hashes FOUR arbitrary Goldilocks elements. Each felt occupies two
-//! lanes as checked `u32` halves, `[lo0, hi0, …, lo3, hi3]`, so the message
-//! layout is byte-identical to a digest-mode compress and the crate-KAT anchor
-//! survives untouched.
+//! A leaf row hashes FOUR arbitrary Goldilocks elements AND chains an
+//! accumulator, in ONE compression (COMMIT.md §1.2). The accumulator is a digest
+//! cell and fills lanes 0–3; each felt occupies two lanes above it as checked
+//! `u32` halves, `[lo0, hi0, …, lo3, hi3]`. So the message is
+//! `LE32(acc ‖ halves) ‖ "LFML"` — 52 bytes, still one BLAKE3 block, so the
+//! crate-KAT anchor survives the widening.
 
-/// One leaf row: four felts, the eight lanes they become, and the digest at
-/// each round count.
+/// One leaf row: the chaining accumulator, four felts, the twelve lanes they
+/// become, and the digest at each round count.
 pub struct LeafVector {
     pub name: &'static str,
+    pub acc: [u32; 4],
     pub felts: [u64; 4],
-    pub lanes: [u32; 8],
+    pub lanes: [u32; 12],
     /// Digest at 6 rounds (the A6R variant; no library computes it).
     pub digest_6: [u32; 4],
     /// Digest at 7 rounds — `blake3::hash(LE32(lanes) ‖ "LFML")[..16]`.
     pub digest_7: [u32; 4],
 }
 
-pub const LEAF_VECTORS: [LeafVector; 5] = [
+pub const LEAF_VECTORS: [LeafVector; 6] = [
     LeafVector {
         name: "zeros",
+        acc: [0x00000000, 0x00000000, 0x00000000, 0x00000000],
         felts: [0u64, 0u64, 0u64, 0u64],
         lanes: [
             0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
-            0x00000000,
+            0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
         ],
-        digest_6: [0x987496E2, 0x674930D6, 0xD6F9F709, 0xBDFC162E],
-        digest_7: [0x3CA2C373, 0x79140765, 0x3E706CB0, 0xE4A11D3A],
+        digest_6: [0x9D79DC29, 0xFC6E166E, 0x30387614, 0xF6B51296],
+        digest_7: [0xB30DB92A, 0xC648E66E, 0x85368146, 0x30A98B38],
     },
     LeafVector {
         name: "boundary_mix",
+        acc: [0x00000000, 0x00000001, 0xFFFFFFFE, 0xFFFFFFFF],
         felts: [0u64, 1u64, 18446744069414584320u64, 4294967296u64],
         lanes: [
-            0x00000000, 0x00000000, 0x00000001, 0x00000000, 0x00000000, 0xFFFFFFFF, 0x00000000,
-            0x00000001,
+            0x00000000, 0x00000001, 0xFFFFFFFE, 0xFFFFFFFF, 0x00000000, 0x00000000, 0x00000001,
+            0x00000000, 0x00000000, 0xFFFFFFFF, 0x00000000, 0x00000001,
         ],
-        digest_6: [0x01A070C2, 0x7758BF44, 0xCED65D68, 0x54FF7227],
-        digest_7: [0x43FA6E44, 0xEB0A55F1, 0xAB80535C, 0xB013D578],
+        digest_6: [0xA101443C, 0xA70F5A93, 0xAD973E8C, 0x17C8F7BA],
+        digest_7: [0x0E214E2C, 0x5D16CE5C, 0xA4DE74CF, 0x9FA39D59],
     },
     LeafVector {
         name: "all_p_minus_1",
+        acc: [0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF],
         felts: [
             18446744069414584320u64,
             18446744069414584320u64,
@@ -53,14 +59,15 @@ pub const LEAF_VECTORS: [LeafVector; 5] = [
             18446744069414584320u64,
         ],
         lanes: [
-            0x00000000, 0xFFFFFFFF, 0x00000000, 0xFFFFFFFF, 0x00000000, 0xFFFFFFFF, 0x00000000,
-            0xFFFFFFFF,
+            0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0x00000000, 0xFFFFFFFF, 0x00000000,
+            0xFFFFFFFF, 0x00000000, 0xFFFFFFFF, 0x00000000, 0xFFFFFFFF,
         ],
-        digest_6: [0x96B22DF5, 0x8F8FFB10, 0x9F7A0569, 0x8A86F904],
-        digest_7: [0x16CAF28B, 0x9434478C, 0xC9C723D8, 0x734E72FD],
+        digest_6: [0x5FDFAEF4, 0x0F63DEEE, 0xCC4EC296, 0x675289C3],
+        digest_7: [0xAE3CB971, 0x6F0EDEE7, 0x75BBD078, 0xC07D12D6],
     },
     LeafVector {
         name: "ramp",
+        acc: [0x01020304, 0x05060708, 0x090A0B0C, 0x0D0E0F10],
         felts: [
             72623859790382856u64,
             1230066625199609624u64,
@@ -68,21 +75,33 @@ pub const LEAF_VECTORS: [LeafVector; 5] = [
             3544952156018063160u64,
         ],
         lanes: [
-            0x05060708, 0x01020304, 0x15161718, 0x11121314, 0x25262728, 0x21222324, 0x35363738,
-            0x31323334,
+            0x01020304, 0x05060708, 0x090A0B0C, 0x0D0E0F10, 0x05060708, 0x01020304, 0x15161718,
+            0x11121314, 0x25262728, 0x21222324, 0x35363738, 0x31323334,
         ],
-        digest_6: [0x72EB82EF, 0xC66B9255, 0x270356DE, 0xA5A6F3F3],
-        digest_7: [0x7588177A, 0x779592F1, 0x96EA4AC5, 0x378E2D2A],
+        digest_6: [0x7E8EC742, 0x478136B7, 0xDC4010C2, 0xA7B85A1F],
+        digest_7: [0x6F6562C3, 0x6755528E, 0xBD65A6F0, 0xA9B1551D],
     },
     LeafVector {
         name: "u32_edges",
+        acc: [0x80000000, 0x7FFFFFFF, 0x00010000, 0x0000FFFF],
         felts: [4294967295u64, 4294967296u64, 18446744065119617025u64, 1u64],
         lanes: [
-            0xFFFFFFFF, 0x00000000, 0x00000000, 0x00000001, 0x00000001, 0xFFFFFFFE, 0x00000001,
-            0x00000000,
+            0x80000000, 0x7FFFFFFF, 0x00010000, 0x0000FFFF, 0xFFFFFFFF, 0x00000000, 0x00000000,
+            0x00000001, 0x00000001, 0xFFFFFFFE, 0x00000001, 0x00000000,
         ],
-        digest_6: [0x78F2D23E, 0x5E3949A0, 0x3CC550CA, 0xF3A35DEF],
-        digest_7: [0x15587203, 0x427A6C0C, 0x99ABD637, 0xD198DFE5],
+        digest_6: [0x0E17BDDF, 0x1E0CA3B6, 0x7F8B414F, 0xDDF551B2],
+        digest_7: [0x77E4CDFD, 0x92CC8E05, 0x1BBC4BD0, 0x64B4D8D2],
+    },
+    LeafVector {
+        name: "acc_ignored_control",
+        acc: [0x11121314, 0x15161718, 0x191A1B1C, 0x1D1E1F20],
+        felts: [0u64, 0u64, 0u64, 0u64],
+        lanes: [
+            0x11121314, 0x15161718, 0x191A1B1C, 0x1D1E1F20, 0x00000000, 0x00000000, 0x00000000,
+            0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+        ],
+        digest_6: [0xE4AE2501, 0x1FCF9DAB, 0x85643F4E, 0xE24B3793],
+        digest_7: [0xB8094093, 0xA7EBC1A4, 0xB7955183, 0x0BA8929B],
     },
 ];
 
@@ -165,12 +184,13 @@ pub const NON_CANONICAL: [NonCanonical; 3] = [
     },
 ];
 
-/// The eight-felt `FriToyV0` leaf: two `LFML` rows and one `LFMC` parent.
+/// The eight-felt `FriToyV0` leaf: ONE `LFML` chain, two rows, no fold.
 pub struct FriLeafVector {
     pub felts: [u64; 8],
     pub digest_6: [u32; 4],
     pub digest_7: [u32; 4],
-    /// Compressions the whole leaf costs — the ratified 1 → 3.
+    /// Compressions the whole leaf costs — 3 before the accumulator moved into
+    /// the message, 2 after (COMMIT.md §1.4.1: the RATE, measured).
     pub compresses: usize,
 }
 
@@ -185,7 +205,7 @@ pub const FRI_LEAF: FriLeafVector = FriLeafVector {
         18446744065119617025u64,
         999u64,
     ],
-    digest_6: [0xBF4978E9, 0x6E7668FE, 0xCB785244, 0x587400B8],
-    digest_7: [0x625237B7, 0x806A7F80, 0xB7D0ABBE, 0x32C418E0],
-    compresses: 3,
+    digest_6: [0x8578A6BC, 0x9160F074, 0x3F4C82B9, 0x98C5C775],
+    digest_7: [0x9C36DE23, 0xCD397230, 0x2013BF3D, 0xD72A0346],
+    compresses: 2,
 };

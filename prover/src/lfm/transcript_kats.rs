@@ -1,18 +1,26 @@
 //! Transcript KATs for the LFM compress-chain Fiat–Shamir transcript, at 6 and
 //! 7 rounds.
 //!
-//! GENERATED — do not hand-edit. Rendered from
+//! GENERATED — do not hand-edit. The INPUTS come from
 //! `thoughts/shared/lfm-real-hash/transcript-spec/transcript_kats.json`, which
 //! the oracle produced from a Python reference written **before any Rust
 //! existed**. That ordering is the point: these vectors are a specification the
 //! implementation is checked against, not a recording of what the
 //! implementation happened to do.
 //!
-//! Framing (transcript spec §1.2): identical to the Merkle socket in every
-//! respect except `m[8]`, which is `"LFMT"` instead of `"LFMC"`. So h =
-//! BLAKE3_IV, m[0..4] = state, m[4..8] = operand, m[9..16] = 0, t = 0,
-//! block_len = 36, flags = 0x0B, digest = out[0..4] — and at 7 rounds a step is
-//! literally `blake3::hash(state ‖ operand ‖ "LFMT")[..16]`.
+//! ⚠ **The results were re-pinned when the socket widened to twelve lanes**, by
+//! `leaf-spec/rate4_kat_gen.py` out of the same oracle. All 12 moved and no
+//! input did: `block_len` is `v[14]` and cannot be made mode-dependent, so the
+//! transcript domain re-blesses alongside the leaf domain that needed the width
+//! (COMMIT.md §1.4.4 H9).
+//!
+//! Framing (transcript spec §1.2 at the COMMIT.md §1.2 width): identical to the
+//! Merkle socket in every respect except the tag word, which is `"LFMT"`
+//! instead of `"LFMC"`. So h = BLAKE3_IV, m[0..4] = state, m[4..8] = operand,
+//! m[8..12] = 0 — the third input cell, which the unread-`IN` pins force to
+//! zero — m[12] = "LFMT", m[13..16] = 0, t = 0, block_len = 52, flags = 0x0B,
+//! digest = out[0..4]. At 7 rounds a step is still literally
+//! `blake3::hash(state ‖ operand ‖ 0^16 ‖ "LFMT")[..16]`.
 
 /// One transcript step: state, operand, and the resulting state at each round
 /// count.
@@ -31,43 +39,43 @@ pub const STEP_VECTORS: [StepVector; 6] = [
         name: "zero_state_zero_operand",
         state: [0x00000000, 0x00000000, 0x00000000, 0x00000000],
         operand: [0x00000000, 0x00000000, 0x00000000, 0x00000000],
-        result_6: [0xC072FE26, 0x3B4C920F, 0x64BD29A0, 0x0213E6E4],
-        result_7: [0xE1DDB56C, 0x1454CCCA, 0xB008D630, 0x4537F7A3],
+        result_6: [0x58A784C6, 0xCA20122A, 0x574D1385, 0x4C7F61AC],
+        result_7: [0xBB5DF0AD, 0xBB660FC6, 0x401C1FAD, 0x651C297C],
     },
     StepVector {
         name: "zero_state_main_root",
         state: [0x00000000, 0x00000000, 0x00000000, 0x00000000],
         operand: [0x01020304, 0x05060708, 0x090A0B0C, 0x0D0E0F10],
-        result_6: [0x8A9AE283, 0xC782CB0F, 0x257502C4, 0x713479FF],
-        result_7: [0xD3FD9F50, 0x3ED183D9, 0xF60EE882, 0xE3C34674],
+        result_6: [0xBFD9E2ED, 0x726EDE27, 0x91805DE1, 0xC11F0DA8],
+        result_7: [0x503FDDF4, 0x48633531, 0x8EEA401C, 0x213213C8],
     },
     StepVector {
         name: "ramp_state_ramp_operand",
         state: [0x01020304, 0x05060708, 0x090A0B0C, 0x0D0E0F10],
         operand: [0x11121314, 0x15161718, 0x191A1B1C, 0x1D1E1F20],
-        result_6: [0x233B6A30, 0xC0988F42, 0x12354C22, 0x589508FB],
-        result_7: [0x6D6995B4, 0xFA62C580, 0x17872A49, 0x2C4E04D1],
+        result_6: [0x00A8B31B, 0x0C48A09A, 0x1D06A9A8, 0x6C27BD61],
+        result_7: [0x29D95598, 0x69E4FD73, 0x243BFCE9, 0x14598F96],
     },
     StepVector {
         name: "max_state",
         state: [0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF],
         operand: [0xDEADBEEF, 0xCAFEBABE, 0x8BADF00D, 0xFEEDFACE],
-        result_6: [0xCC7D56B3, 0xCCCA9F29, 0x0239B3EC, 0x3EE001E6],
-        result_7: [0x6B2F25BB, 0x1D0F16EC, 0x1F75DC73, 0xB96320BF],
+        result_6: [0xA710A43E, 0x62E96839, 0xE00D7CA2, 0x1E054FEF],
+        result_7: [0xBA98C5EF, 0xAFDC8C3E, 0xFA425A12, 0xF35C1B47],
     },
     StepVector {
         name: "squeeze_operand_0",
         state: [0x01020304, 0x05060708, 0x090A0B0C, 0x0D0E0F10],
         operand: [0x305A5153, 0x00000000, 0x00000000, 0x00000000],
-        result_6: [0x37371DD1, 0x75B3F42F, 0xFA61B49C, 0xECA8FBF8],
-        result_7: [0x257B36C1, 0x52274AF7, 0xA650F1CF, 0xDAC13C51],
+        result_6: [0xE1F1E0DF, 0x9B1491E4, 0x26F46CE4, 0x644BA9F0],
+        result_7: [0x2EBCFDA8, 0x2F7C4E72, 0xAE841641, 0x6751FE80],
     },
     StepVector {
         name: "squeeze_operand_255",
         state: [0x11121314, 0x15161718, 0x191A1B1C, 0x1D1E1F20],
         operand: [0x305A5153, 0x000000FF, 0x00000000, 0x00000000],
-        result_6: [0x634D0599, 0xFAAD44C3, 0x9298BDC4, 0x157B8CCB],
-        result_7: [0x1AFC8DC4, 0x04B3C139, 0xEB73F81F, 0x48083394],
+        result_6: [0xDD47DC57, 0x9AC95714, 0xE774A0DA, 0xD4703C0B],
+        result_7: [0x33396F61, 0x832BA04F, 0x2BB788AB, 0xE9FE006B],
     },
 ];
 
@@ -116,41 +124,41 @@ pub const FRI_TOY_COMPRESSIONS: usize = 13;
 /// The end-to-end vector at 7 rounds (the default build).
 pub const FRI_TOY_7: EndToEndVector = EndToEndVector {
     states: [
-        [0xD3FD9F50, 0x3ED183D9, 0xF60EE882, 0xE3C34674],
-        [0x27023F83, 0xA1344FB0, 0x9EBDBBB2, 0x00158D9B],
-        [0x43FFB960, 0x3696C76D, 0x9D106062, 0xEAA3E925],
-        [0x23D1D389, 0x3FE9FBB1, 0x7AF56AE7, 0xEC936F39],
-        [0x94153DE2, 0xA6003377, 0xD028ED4B, 0xF3EB8582],
-        [0xEC821701, 0xCD13E17E, 0x7EADC68F, 0x01E38C58],
-        [0x0E8226D7, 0x1E2E2338, 0x845CF387, 0xE33EBDEC],
-        [0xB654D354, 0x71EDED11, 0x8AFF36B2, 0xA6C750AF],
-        [0x06A07FAD, 0x8CA90A52, 0x7A48DF49, 0xC9C1AED8],
-        [0x8B5EA0EF, 0xF22C1FA1, 0xE1BA9F92, 0xD20CB729],
-        [0xA25C2860, 0xFECF62F7, 0x72A5F0EF, 0x0F2BE133],
+        [0x503FDDF4, 0x48633531, 0x8EEA401C, 0x213213C8],
+        [0x02FEA9A6, 0xE6BF885C, 0xF174E65F, 0x4EC9AB10],
+        [0xF91F56DE, 0x62F37956, 0xE67D5421, 0xD82727D0],
+        [0x7A31B840, 0xAD7F2625, 0xE27D1C56, 0xCDB0E9A7],
+        [0xA6790B7B, 0x00695D49, 0xA663DC33, 0x2E849F0C],
+        [0xFC40465E, 0x0092B147, 0x2FA48645, 0x9755608B],
+        [0x6BD6F0B0, 0x634CF1C6, 0x3CBD9D2D, 0x349F278B],
+        [0xD86E1D3F, 0xDD1CFBC3, 0x1C8E8F14, 0x22D35494],
+        [0x5B449138, 0x3435B7D5, 0x7CFE4C06, 0x1C022FCF],
+        [0xE8D9848C, 0x0429B6F7, 0xDD5CBA1A, 0xBD465F16],
+        [0xD1E3472D, 0xD945386A, 0xC746A9B3, 0x8FD73C31],
     ],
-    alpha: [0xD3FD9F50, 0x3ED183D9, 0xF60EE882],
-    zeta0: [0x27023F83, 0xA1344FB0, 0x9EBDBBB2],
-    zeta1: [0x23D1D389, 0x3FE9FBB1, 0x7AF56AE7],
-    query_bits: [[1, 1, 1, 0], [0, 0, 1, 0], [1, 0, 1, 1], [1, 1, 1, 1]],
+    alpha: [0x503FDDF4, 0x48633531, 0x8EEA401C],
+    zeta0: [0x02FEA9A6, 0xE6BF885C, 0xF174E65F],
+    zeta1: [0x7A31B840, 0xAD7F2625, 0xE27D1C56],
+    query_bits: [[0, 0, 0, 0], [1, 1, 1, 1], [0, 0, 0, 1], [0, 0, 1, 1]],
 };
 
 /// The end-to-end vector at 6 rounds (`--features blake3-6round`).
 pub const FRI_TOY_6: EndToEndVector = EndToEndVector {
     states: [
-        [0x8A9AE283, 0xC782CB0F, 0x257502C4, 0x713479FF],
-        [0x88D30EFA, 0xCE8D4E24, 0xA3049DB6, 0x93341D6F],
-        [0x0953D5A3, 0x4D25B331, 0x4B1A3E0A, 0x6D7D710E],
-        [0x408B335E, 0xFB12033E, 0x4ED4D8F5, 0x6077EE28],
-        [0xB8746B5E, 0x99C839BC, 0x74F64FED, 0x81FB37FF],
-        [0xBEA3BF5F, 0x44DA486A, 0x2876E758, 0xB22EA9D0],
-        [0x91239994, 0x05C16E77, 0x4DF175AF, 0xC74094E4],
-        [0x3997959E, 0x3EF54A2F, 0xD791B584, 0x6AC75C52],
-        [0x384A95CE, 0x6CB0B223, 0x6A50D4CB, 0xA38A6D79],
-        [0x5C4AC682, 0x9DEEE8F9, 0xB0752A41, 0xF87991A2],
-        [0xF71FF60F, 0xDB60DF57, 0x188420D7, 0xF2A6C54A],
+        [0xBFD9E2ED, 0x726EDE27, 0x91805DE1, 0xC11F0DA8],
+        [0x9DDE5E52, 0xD7018142, 0x978528FF, 0xA01782B7],
+        [0x189BAD31, 0x364E3C30, 0x6B4D5516, 0x78D7FE7B],
+        [0x8E3E80BB, 0xFCA1AF96, 0xA59E0F41, 0x18C9AB19],
+        [0x4DF9BD75, 0x2E131E7D, 0x2DEB348E, 0x62BC30F3],
+        [0x202DB868, 0x8FF72AC4, 0x452D536A, 0x78DECD7B],
+        [0xA3D1E95E, 0x8C68ECF6, 0x91D7DF5E, 0x28D8CBB2],
+        [0xFA4222A2, 0x18DA7862, 0x3BBDA144, 0xAB453013],
+        [0x525CE059, 0x0E9B9EAB, 0xFB57633B, 0xE43490A7],
+        [0x261309AA, 0x84C675B7, 0xD5BBF0EB, 0x4AF40850],
+        [0x4D62F602, 0x2CC5D660, 0x99C44AF7, 0xEB502D8A],
     ],
-    alpha: [0x8A9AE283, 0xC782CB0F, 0x257502C4],
-    zeta0: [0x88D30EFA, 0xCE8D4E24, 0xA3049DB6],
-    zeta1: [0x408B335E, 0xFB12033E, 0x4ED4D8F5],
-    query_bits: [[0, 0, 1, 0], [0, 1, 1, 1], [0, 1, 1, 1], [0, 1, 0, 0]],
+    alpha: [0xBFD9E2ED, 0x726EDE27, 0x91805DE1],
+    zeta0: [0x9DDE5E52, 0xD7018142, 0x978528FF],
+    zeta1: [0x8E3E80BB, 0xFCA1AF96, 0xA59E0F41],
+    query_bits: [[0, 1, 1, 1], [0, 1, 0, 0], [1, 0, 0, 1], [0, 1, 0, 1]],
 };

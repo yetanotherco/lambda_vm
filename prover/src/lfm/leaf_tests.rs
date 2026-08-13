@@ -25,7 +25,7 @@ use crate::tables::types::{FE, GoldilocksField};
 
 use super::blake3_socket::{
     self, FELTS_PER_LEAF, SOCKET_ROUNDS, TAG_LFMC, TAG_LFML, TAG_LFMT, cols, felt_halves,
-    is_canonical, leaf_digest_rounds, leaf_lanes, socket_digest_rounds_tagged, word_of,
+    is_canonical, leaf_digest_rounds, leaf_lanes, word_of,
 };
 use super::hash::HasherKind;
 use super::instr::{HashMode, Instr};
@@ -138,21 +138,27 @@ fn the_canonicity_predicate_is_exactly_less_than_p() {
 #[test]
 fn every_leaf_vector_reproduces_at_both_round_counts() {
     for v in LEAF_VECTORS.iter() {
-        let felts = felts_of(&v.felts);
+        let (acc, felts) = (word_of(&v.acc), felts_of(&v.felts));
         assert_eq!(
-            leaf_lanes(&felts).expect("canonical"),
+            blake3_socket::leaf_row_lanes(&acc, &felts).expect("canonical"),
             v.lanes,
             "lanes of {}",
             v.name
         );
         assert_eq!(
-            leaf_digest_rounds(&felts, 6).expect("canonical"),
+            leaf_lanes(&felts).expect("canonical"),
+            v.lanes[4..],
+            "the halves of {} sit ABOVE the accumulator",
+            v.name
+        );
+        assert_eq!(
+            leaf_digest_rounds(&acc, &felts, 6).expect("canonical"),
             v.digest_6,
             "6-round leaf {}",
             v.name
         );
         assert_eq!(
-            leaf_digest_rounds(&felts, 7).expect("canonical"),
+            leaf_digest_rounds(&acc, &felts, 7).expect("canonical"),
             v.digest_7,
             "7-round leaf {}",
             v.name
@@ -160,23 +166,54 @@ fn every_leaf_vector_reproduces_at_both_round_counts() {
     }
 }
 
+/// ★ The accumulator REACHES the digest — the property the whole RATE rests on.
+///
+/// A row that absorbed its felts and dropped the chaining value would still
+/// satisfy every canonicity and halves constraint, and would still be a
+/// perfectly good hash of the felts; what it would not be is a CHAIN, and a wide
+/// leaf built out of it would bind only its last four felts. The table carries
+/// `acc_ignored_control` for exactly this: same felts as `zeros`, different
+/// accumulator.
+#[test]
+fn the_accumulator_changes_the_leaf_digest() {
+    let find = |name: &str| {
+        LEAF_VECTORS
+            .iter()
+            .find(|v| v.name == name)
+            .expect("vector present")
+    };
+    let (zeros, control) = (find("zeros"), find("acc_ignored_control"));
+    assert_eq!(
+        zeros.felts, control.felts,
+        "the control varies ONLY the acc"
+    );
+    assert_ne!(zeros.acc, control.acc);
+    assert_ne!(zeros.digest_6, control.digest_6);
+    assert_ne!(zeros.digest_7, control.digest_7);
+}
+
 /// ★ **The external anchor, direct.** At 7 rounds a leaf is literally
-/// `blake3::hash(LE32(lo0)‖LE32(hi0)‖…‖LE32(hi3)‖"LFML")` truncated to 16 bytes.
+/// `blake3::hash(LE32(acc)‖LE32(lo0)‖LE32(hi0)‖…‖LE32(hi3)‖"LFML")` truncated to
+/// 16 bytes.
 ///
 /// The message is rebuilt from the byte-level specification rather than from
 /// `socket_message`, so the word-level and byte-level forms can disagree. This
-/// is the property option C was chosen to preserve: putting the felt encoding
-/// INSIDE the socket keeps the message layout byte-identical to a digest-mode
-/// compress, so the crate stays a direct KAT for the leaf domain too.
+/// is the property option C was chosen to preserve and the RATE had to keep:
+/// putting the felt encoding INSIDE the socket keeps the message layout
+/// byte-identical to a digest-mode compress, and 52 bytes is still ONE block, so
+/// the crate stays a direct KAT for the leaf domain. Carrying the accumulator in
+/// the chaining value `h` instead would have made the row a chunk continuation
+/// and thrown this away for the same rate.
 #[test]
 fn seven_rounds_is_blake3_of_the_leaf_message() {
     for v in LEAF_VECTORS.iter() {
-        let mut msg = Vec::with_capacity(36);
+        let mut msg = Vec::with_capacity(52);
         for lane in v.lanes.iter() {
             msg.extend_from_slice(&lane.to_le_bytes());
         }
         msg.extend_from_slice(b"LFML");
-        assert_eq!(msg.len(), 36, "a leaf row is one 36-byte block");
+        assert_eq!(msg.len(), 52, "a leaf row is one 52-byte block");
+        assert!(msg.len() < 64, "and one block is what the anchor needs");
 
         let full = blake3::hash(&msg);
         let want: [u32; 4] = core::array::from_fn(|i| {
@@ -197,19 +234,15 @@ fn the_leaf_tag_is_lfml_and_the_three_domains_are_distinct() {
     assert_ne!(TAG_LFMC, TAG_LFMT);
 }
 
-/// L5 — the three domains produce three different digests from the SAME eight
+/// L5 — the three domains produce three different digests from the SAME twelve
 /// lanes. Distinct tag values are necessary; distinct digests are the property.
 #[test]
 fn the_three_domains_differ_on_the_same_lanes() {
     for v in LEAF_VECTORS.iter() {
-        let (a, b) = (
-            [v.lanes[0], v.lanes[1], v.lanes[2], v.lanes[3]],
-            [v.lanes[4], v.lanes[5], v.lanes[6], v.lanes[7]],
-        );
         for rounds in [6, 7] {
             let d: Vec<[u32; 4]> = [TAG_LFMC, TAG_LFMT, TAG_LFML]
                 .iter()
-                .map(|t| socket_digest_rounds_tagged(&a, &b, rounds, *t))
+                .map(|t| blake3_socket::socket_digest_lanes(&v.lanes, rounds, *t))
                 .collect();
             assert_ne!(d[0], d[1], "{} @{rounds}: LFMC == LFMT", v.name);
             assert_ne!(d[0], d[2], "{} @{rounds}: LFMC == LFML", v.name);
@@ -218,19 +251,26 @@ fn the_three_domains_differ_on_the_same_lanes() {
     }
 }
 
-/// L6 — an eight-felt leaf is exactly three compressions: two `LFML` rows and
-/// one ordinary `LFMC` parent, in that association.
+/// L6 — an eight-felt leaf is exactly TWO compressions: one `LFML` chain of two
+/// rows, absorbing four felts and chaining in each.
+///
+/// ★ **This is the RATE, measured rather than asserted.** It was three — two
+/// felts-only leaf rows and an `LFMC` parent folding them — which is 2 felts per
+/// compression. Moving the accumulator into the message makes the fold
+/// unnecessary and takes it to 4, and leaf absorption is ~70% of a recursion
+/// tower node's bill (COMMIT.md §1.4.1). The count is pinned in the vector table
+/// so the saving cannot quietly regress.
 #[test]
-fn an_eight_felt_leaf_is_two_leaf_rows_and_one_parent() {
+fn an_eight_felt_leaf_is_one_chain_of_two_rows() {
     let lo: LfmWord = core::array::from_fn(|i| FE::from(FRI_LEAF.felts[i]));
     let hi: LfmWord = core::array::from_fn(|i| FE::from(FRI_LEAF.felts[4 + i]));
+    let start = super::fixture::leaf_chain_start();
     for (rounds, want) in [(6, FRI_LEAF.digest_6), (7, FRI_LEAF.digest_7)] {
-        let d0 = leaf_digest_rounds(&lo, rounds).expect("canonical");
-        let d1 = leaf_digest_rounds(&hi, rounds).expect("canonical");
-        let parent = socket_digest_rounds_tagged(&d0, &d1, rounds, TAG_LFMC);
-        assert_eq!(parent, want, "the 8-felt leaf at {rounds} rounds");
+        let d0 = word_of(&leaf_digest_rounds(&start, &lo, rounds).expect("canonical"));
+        let chained = leaf_digest_rounds(&d0, &hi, rounds).expect("canonical");
+        assert_eq!(chained, want, "the 8-felt leaf at {rounds} rounds");
     }
-    assert_eq!(FRI_LEAF.compresses, 3);
+    assert_eq!(FRI_LEAF.compresses, 2, "8 felts / RATE 4 = 2 compressions");
 
     // The HOST path agrees with the reference — `host_leaf_hash_pair` is what
     // the fixture builds its trees with, so a divergence here is a fixture that
@@ -250,14 +290,15 @@ fn an_eight_felt_leaf_is_two_leaf_rows_and_one_parent() {
 
 /// A hash row in `mode` over `felts`/`lanes`, exactly as the trace filler builds
 /// one — for the controls, which need to force a mismatch the filler cannot.
-fn leaf_row(felts: &LfmWord) -> Vec<FE> {
+fn leaf_row(acc: &LfmWord, felts: &LfmWord) -> Vec<FE> {
     let mut row = vec![FE::zero(); cols::NUM_COLUMNS];
     row[cols::MODE_L] = FE::one();
-    row[cols::IN0..cols::IN0 + FELTS_PER_LEAF].copy_from_slice(felts);
+    row[cols::IN0..cols::IN0 + 4].copy_from_slice(acc);
+    row[cols::leaf_felt(0)..cols::leaf_felt(0) + FELTS_PER_LEAF].copy_from_slice(felts);
     for (k, iv) in super::blake3::BLAKE3_IV.iter().take(4).enumerate() {
         row[cols::S8 + k] = FE::from(u64::from(*iv));
     }
-    let digest = leaf_digest_rounds(felts, SOCKET_ROUNDS).expect("canonical");
+    let digest = leaf_digest_rounds(acc, felts, SOCKET_ROUNDS).expect("canonical");
     row[cols::OUT0..cols::OUT0 + 4].copy_from_slice(&word_of(&digest));
     blake3_socket::fill_socket_witness(&mut row);
     row
@@ -271,11 +312,18 @@ fn leaf_row(felts: &LfmWord) -> Vec<FE> {
 /// notices, which is a different claim.
 #[test]
 fn m9_no_domain_can_compute_another_domains_digest() {
+    let acc = word_of(&LEAF_VECTORS[3].acc);
     let felts = felts_of(&LEAF_VECTORS[3].felts);
-    let lanes = leaf_lanes(&felts).expect("canonical");
+    let halves = leaf_lanes(&felts).expect("canonical");
+    // Two digest cells for the two-to-one modes. A leaf row's lanes are its own
+    // (accumulator ‖ halves) and cannot be shared with a digest row's: lanes
+    // 8–11 read the third input cell, which the unread-`IN` pins hold at zero on
+    // every digest row. So each mode is built with the lanes it actually has,
+    // and the digest is taken over THOSE — the confusion under test is the
+    // TAG's, not the lanes'.
     let (a, b) = (
-        [lanes[0], lanes[1], lanes[2], lanes[3]],
-        [lanes[4], lanes[5], lanes[6], lanes[7]],
+        blake3_socket::lanes_of(&acc).expect("a digest cell is u32 lanes"),
+        [halves[0], halves[1], halves[2], halves[3]],
     );
 
     for (mode, own) in [
@@ -286,16 +334,20 @@ fn m9_no_domain_can_compute_another_domains_digest() {
         for other in [TAG_LFMC, TAG_LFMT, TAG_LFML] {
             let mut row = vec![FE::zero(); cols::NUM_COLUMNS];
             row[super::blake3_socket_tests::mode_col(mode)] = FE::one();
-            if mode == HashMode::Leaf {
-                row[cols::IN0..cols::IN0 + 4].copy_from_slice(&felts);
+            let lanes = if mode == HashMode::Leaf {
+                row[cols::IN0..cols::IN0 + 4].copy_from_slice(&acc);
+                row[cols::leaf_felt(0)..cols::leaf_felt(0) + FELTS_PER_LEAF]
+                    .copy_from_slice(&felts);
+                blake3_socket::leaf_row_lanes(&acc, &felts).expect("canonical")
             } else {
                 row[cols::IN0..cols::IN0 + 4].copy_from_slice(&word_of(&a));
                 row[cols::IN0 + 4..cols::IN0 + 8].copy_from_slice(&word_of(&b));
-            }
+                blake3_socket::digest_row_lanes(&a, &b)
+            };
             for (k, iv) in super::blake3::BLAKE3_IV.iter().take(4).enumerate() {
                 row[cols::S8 + k] = FE::from(u64::from(*iv));
             }
-            let digest = socket_digest_rounds_tagged(&a, &b, SOCKET_ROUNDS, other);
+            let digest = blake3_socket::socket_digest_lanes(&lanes, SOCKET_ROUNDS, other);
             row[cols::OUT0..cols::OUT0 + 4].copy_from_slice(&word_of(&digest));
             blake3_socket::fill_socket_witness_tagged(&mut row, other);
 
@@ -324,8 +376,9 @@ fn m9_no_domain_can_compute_another_domains_digest() {
 /// canonicity block does not impose.
 #[test]
 fn m10_a_leaf_row_cannot_skip_canonicity() {
+    let acc = word_of(&LEAF_VECTORS[1].acc);
     let felts = felts_of(&LEAF_VECTORS[1].felts);
-    let base = leaf_row(&felts);
+    let base = leaf_row(&acc, &felts);
     assert_eq!(
         super::blake3_socket_tests::violations(&base),
         Vec::<usize>::new(),
@@ -350,9 +403,15 @@ fn m10_a_leaf_row_cannot_skip_canonicity() {
     // witness be otherwise consistent. Only canonicity can catch this, and the
     // test asserts it is `canon-c` that does.
     let target = felts_of(&[0, 0, 0, 0]);
-    let mut alias = leaf_row(&target);
-    // lane 0 = lo0 becomes 1, lane 1 = hi0 becomes 2^32 − 1.
-    for (lane, v) in [(0usize, 1u32), (1, u32::MAX)] {
+    let mut alias = leaf_row(&acc, &target);
+    // felt 0's lo half becomes 1 and its hi half 2^32 − 1. ⚠ Located through
+    // `leaf_lo_lane`/`leaf_hi_lane` rather than as lanes 0 and 1: the felts sit
+    // ABOVE the accumulator now, and a literal 0/1 here would silently corrupt
+    // the accumulator instead and test nothing (COMMIT.md §1.4.4 H4).
+    for (lane, v) in [
+        (cols::leaf_lo_lane(0), 1u32),
+        (cols::leaf_hi_lane(0), u32::MAX),
+    ] {
         for byte in 0..4 {
             alias[cols::lane_byte(lane, byte)] = FE::from(u64::from((v >> (8 * byte)) as u8));
         }
@@ -545,39 +604,46 @@ fn violations_under(kind: HasherKind, row: &[FE]) -> Vec<usize> {
         .collect()
 }
 
-/// A `MODE_L` row for `kind` whose SECOND input cell carries `extra`.
+/// A `MODE_L` row for `kind` whose THIRD input cell carries `extra`.
 ///
-/// Everything downstream is derived from the two cells, by each arm's own rule,
-/// so the row is internally consistent whatever `extra` is: `extra = 0` is the
-/// honest row a trace filler would write, and any other `extra` is the forgery a
-/// prover controlling the whole trace would actually submit. Building both the
-/// same way is what makes "only the pins fire" a meaningful assertion — a
-/// half-built forgery would trip the round constraints instead and prove
+/// Everything downstream is derived from the cells the mode reads, by each arm's
+/// own rule, so the row is internally consistent whatever `extra` is: `extra = 0`
+/// is the honest row a trace filler would write, and any other `extra` is the
+/// forgery a prover controlling the whole trace would actually submit. Building
+/// both the same way is what makes "only the pins fire" a meaningful assertion —
+/// a half-built forgery would trip the round constraints instead and prove
 /// nothing about the pins.
-fn leaf_row_with_second_cell(kind: HasherKind, felts: &LfmWord, extra: &LfmWord) -> Vec<FE> {
+fn leaf_row_with_third_cell(
+    kind: HasherKind,
+    acc: &LfmWord,
+    felts: &LfmWord,
+    extra: &LfmWord,
+) -> Vec<FE> {
     use super::hash::{HASH_STATE_FELTS, LfmHasher};
 
     let mut row = vec![FE::zero(); super::chips::hash::num_columns(kind)];
     row[cols::MODE_L] = FE::one();
-    row[cols::IN0..cols::IN0 + 4].copy_from_slice(felts);
-    row[cols::IN0 + 4..cols::IN0 + 8].copy_from_slice(extra);
+    row[cols::IN0..cols::IN0 + 4].copy_from_slice(acc);
+    row[cols::IN0 + 4..cols::IN0 + 8].copy_from_slice(felts);
+    row[cols::IN0 + 8..cols::IN0 + 12].copy_from_slice(extra);
     let iv = kind.compress_iv();
     row[cols::S8..cols::S8 + iv.len()].copy_from_slice(&iv);
 
     match kind {
-        // BLAKE3 reads four felts and nothing else, so its output does not
-        // depend on the second cell at all — which is exactly why only a pin
-        // can notice junk there.
+        // BLAKE3 reads an accumulator and four felts and nothing else, so its
+        // output does not depend on the third cell at all — which is exactly why
+        // only a pin can notice junk there.
         HasherKind::Blake3 => {
-            let out = kind.leaf_out(felts);
+            let out = kind.leaf_out(acc, felts);
             row[cols::OUT0..cols::OUT0 + out.len()].copy_from_slice(&out);
             blake3_socket::fill_socket_witness(&mut row);
         }
-        // The field-native arms permute the whole state, second cell included.
+        // The field-native arms permute the state — which is the two cells the
+        // mode reads and the IV, never the third cell.
         HasherKind::Test => {
             let mut state = [FE::zero(); HASH_STATE_FELTS];
-            state[0..4].copy_from_slice(felts);
-            state[4..8].copy_from_slice(extra);
+            state[0..4].copy_from_slice(acc);
+            state[4..8].copy_from_slice(felts);
             state[8..12].copy_from_slice(&iv);
             let out = kind.permute(state);
             row[cols::OUT0..cols::OUT0 + out.len()].copy_from_slice(&out);
@@ -592,19 +658,26 @@ fn leaf_row_with_second_cell(kind: HasherKind, felts: &LfmWord, extra: &LfmWord)
     row
 }
 
-/// ★★ **D1 — a leaf row's UNREAD input cells are pinned on every arm.**
+/// ★★ **D1 — a leaf row's UNREAD input cell is pinned on every arm.**
 ///
-/// `MODE_L` reads one cell. The other two receive nothing from `LfmMem`, so
-/// unless a constraint pins them they are free — and `Test`'s and `Poseidon`'s
-/// round 0 reads `A_i = IN_i` for `i < 8`, so on those arms the four free felts
-/// were consumed by the permutation the AIR proves. `leaf(c)` stopped being a
-/// function of `c`, which is a Fiat–Shamir break for any program that absorbs
-/// data through `absorb_felts`.
+/// `MODE_L` reads two cells; the third receives nothing from `LfmMem`, so unless
+/// a constraint pins it, it is four free felts.
 ///
+/// ⚠ **The break this regression-tests was on the SECOND cell**, back when a
+/// leaf read one: `Test`'s and `Poseidon`'s round 0 reads `A_i = IN_i` for
+/// `i < 8`, so on those arms the four free felts were consumed by the
+/// permutation the AIR proves and `leaf(c)` stopped being a function of `c` — a
+/// Fiat–Shamir break for any program that absorbs data through `absorb_felts`.
 /// It shipped that way and an adversarial review executed it: Poseidon proved
-/// AND verified with attacker junk in those columns. This is the regression
-/// test, and it runs on all three arms because the defect was that one arm had
-/// the pin and two did not.
+/// AND verified with attacker junk in those columns. The leaf RATE closed that
+/// hole structurally by making the second cell a cell the mode READS (it carries
+/// the felts now, with the accumulator in the first), which is why this test
+/// moved up to the third cell rather than being deleted: what it guards is the
+/// derivation, and the derivation is what stops the NEXT mode repeating the
+/// defect.
+///
+/// It runs on all three arms because the defect was that one arm had the pin and
+/// two did not.
 ///
 /// **Shaped like WA9**: it does not merely show the junk row is rejected, it
 /// shows the pins are what rejects it — the violated set is exactly those four
@@ -612,14 +685,15 @@ fn leaf_row_with_second_cell(kind: HasherKind, felts: &LfmWord, extra: &LfmWord)
 /// present.
 #[test]
 fn d1_the_unread_input_pins_are_load_bearing_under_every_hasher() {
+    let acc = word_of(&LEAF_VECTORS[3].acc);
     let felts = felts_of(&LEAF_VECTORS[3].felts);
     let zero: LfmWord = [FE::zero(); 4];
 
     for kind in [HasherKind::Test, HasherKind::Poseidon, HasherKind::Blake3] {
         // HONEST CONTROL FIRST: the pin must not reject honest rows. It cannot —
-        // every arm's `leaf_out` leaves the unread cells zero — but a fix that
+        // every arm's `leaf_out` leaves the unread cell zero — but a fix that
         // rejected everything would pass the negative leg on its own.
-        let honest = leaf_row_with_second_cell(kind, &felts, &zero);
+        let honest = leaf_row_with_third_cell(kind, &acc, &felts, &zero);
         assert_eq!(
             violations_under(kind, &honest),
             Vec::<usize>::new(),
@@ -634,17 +708,19 @@ fn d1_the_unread_input_pins_are_load_bearing_under_every_hasher() {
         // constraints that can fire, so `== 4` says the PIN caught it rather
         // than something downstream noticing the junk by accident.
         let junk: LfmWord = core::array::from_fn(|j| FE::from(0x9E37_79B9_u64 + j as u64));
-        let forged = leaf_row_with_second_cell(kind, &felts, &junk);
+        let forged = leaf_row_with_third_cell(kind, &acc, &felts, &junk);
 
-        // The forgery really is a different hash — otherwise the pin would be
-        // guarding nothing on this arm.
-        if kind != HasherKind::Blake3 {
-            assert_ne!(
-                forged[cols::OUT0],
-                honest[cols::OUT0],
-                "{kind:?}: the junk must actually move the digest"
-            );
-        }
+        // ⚠ The third cell reaches NO arm's output: `S_i = MODE_P·IN_i + …`
+        // gates it on the permute selector, and no hashing mode's state includes
+        // it. So on a leaf row this junk is inert on all three arms and the pin
+        // is hygiene rather than a live soundness fix — which was NOT true of
+        // the second cell before the RATE made it a read cell, and is why the
+        // assertion below is about the pins being the only thing that fires.
+        assert_eq!(
+            forged[cols::OUT0],
+            honest[cols::OUT0],
+            "{kind:?}: the third cell must not reach the digest"
+        );
 
         // ★ THE WA9 SHAPE. Not "the row is rejected" — that would pass for a
         // constraint set that rejected it for some incidental reason, and would
@@ -702,8 +778,15 @@ fn d1_the_pins_come_from_one_derivation() {
         .count();
     assert_eq!(NUM_UNREAD_INPUT_PINS, 4 * unread);
 
-    // And the mode that motivated them really does read one cell.
-    assert_eq!(HashMode::Leaf.num_input_cells(), 1);
+    // ⚠ And the counts the derivation runs over. `Leaf` reads TWO cells under
+    // the RATE — accumulator and felts — which is what empties slot 1's set and
+    // takes the pins from 8 to 4. An emitter that assumed some mode always
+    // under-reads slot 1 panicked on exactly this (COMMIT.md §1.4.4 H2), so the
+    // count is asserted rather than assumed.
+    assert_eq!(HashMode::Leaf.num_input_cells(), 2);
     assert_eq!(HashMode::Compress.num_input_cells(), 2);
+    assert_eq!(HashMode::Transcript.num_input_cells(), 2);
     assert_eq!(HashMode::Permute.num_input_cells(), 3);
+    assert_eq!(unread, 1, "only the third cell is under-read now");
+    assert_eq!(NUM_UNREAD_INPUT_PINS, 4);
 }

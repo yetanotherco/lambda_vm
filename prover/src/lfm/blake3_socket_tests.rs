@@ -81,18 +81,28 @@ fn options() -> ProofOptions {
 ///
 /// Written as a formula over named blocks rather than taken from the layout,
 /// because a closed form taken from the code under test would agree with any
-/// layout, including a wrong one. 28 shared prefix + 32 lane bytes +
+/// layout, including a wrong one. 28 shared prefix + `4·12` lane bytes +
 /// `8·rounds` G-blocks of 60 + 16 digest bytes + 8 leaf-canonicity witnesses
 /// (`Z`/`GINV` per felt — present on EVERY row, since a chip has one width).
+///
+/// ★ The lane count is spelled `4 + 2·4` — the accumulator cell plus one felt
+/// cell's halves — rather than read from `cols::NUM_LANES`, for exactly the
+/// reason the rest is spelled out: taking it from the layout would make this
+/// agree with ANY widening instead of with the one the RATE specifies. Note
+/// what does NOT move with it: the canonicity witnesses stay at 8, because the
+/// accumulator is a previous digest and needs byte decomposition but no
+/// canonicity gate. That is the claim that made the RATE cost +16 columns
+/// rather than +24.
 const fn predicted_main(rounds: usize) -> usize {
-    28 + 32 + 60 * (8 * rounds) + 16 + 8
+    28 + 4 * (4 + 2 * 4) + 60 * (8 * rounds) + 16 + 8
 }
 
 /// Bus interactions per compression: the frozen six `LfmMem` tuples, four
 /// `ByteAlu[XOR]` per XOR word (`4·8·rounds` mixing words + 4 feed-forward),
-/// four `AreBytes` per rotation (`2·8·rounds` of them), and 16 lane `AreBytes`.
+/// four `AreBytes` per rotation (`2·8·rounds` of them), and two lane `AreBytes`
+/// per lane.
 const fn predicted_interactions(rounds: usize) -> usize {
-    6 + 4 * (4 * (8 * rounds) + 4) + 4 * (2 * (8 * rounds)) + 16
+    6 + 4 * (4 * (8 * rounds) + 4) + 4 * (2 * (8 * rounds)) + 2 * (4 + 2 * 4)
 }
 
 /// `main + 3·aux` with `aux = ceil(interactions / 2)` — `airs.rs`'s census
@@ -115,26 +125,39 @@ const fn predicted_constraints(rounds: usize) -> usize {
 #[test]
 fn the_socket_budget_is_the_predicted_one_at_both_round_counts() {
     // 6 rounds — the A6R variant.
-    assert_eq!(predicted_main(6), 2_964);
-    assert_eq!(predicted_interactions(6), 1_190);
-    assert_eq!(predicted_interactions(6).div_ceil(2), 595);
-    assert_eq!(predicted_cells(6), 4_749);
+    assert_eq!(predicted_main(6), 2_980);
+    assert_eq!(predicted_interactions(6), 1_198);
+    assert_eq!(predicted_interactions(6).div_ceil(2), 599);
+    assert_eq!(predicted_cells(6), 4_777);
     assert_eq!(predicted_constraints(6), 818);
 
     // 7 rounds — standard BLAKE3, the default.
-    assert_eq!(predicted_main(7), 3_444);
-    assert_eq!(predicted_interactions(7), 1_382);
-    assert_eq!(predicted_interactions(7).div_ceil(2), 691);
-    assert_eq!(predicted_cells(7), 5_517);
+    assert_eq!(predicted_main(7), 3_460);
+    assert_eq!(predicted_interactions(7), 1_390);
+    assert_eq!(predicted_interactions(7).div_ceil(2), 695);
+    assert_eq!(predicted_cells(7), 5_545);
     assert_eq!(predicted_constraints(7), 946);
 
-    // ★ The A6R price, on this socket: going 6 → 7 rounds costs +16.19% per
+    // ★★ WHAT THE LEAF RATE COST, priced here rather than asserted anywhere
+    // else: +16 main columns (four lanes × four bytes), +8 bus interactions
+    // (two `AreBytes` per new lane) and +28 census cells at 7 rounds, against a
+    // 2.0× cut in leaf absorption — which is ~70% of a recursion tower node's
+    // bill (COMMIT.md §1.4.1). The pre-RATE figures were 3,444 / 1,382 / 5,517.
+    // The CONSTRAINT count did not move at all, and that is not luck: the lane
+    // identities gained four while the unread-`IN` pins lost four, which is
+    // precisely why a hand-numbered framing block could have overwritten the
+    // pins in silence (§1.4.4 H1).
+    assert_eq!(predicted_main(7) - (28 + 32 + 60 * 56 + 16 + 8), 16);
+    assert_eq!(predicted_cells(7) - 5_517, 28);
+    assert_eq!(predicted_constraints(7), 946, "unchanged by the widening");
+
+    // ★ The A6R price, on this socket: going 6 → 7 rounds costs +16.07% per
     // compression. The plan's paper estimate for the syscall-shaped chip was
     // +15.5%; the socket pays slightly more because its constant framing makes
     // the round-INDEPENDENT part smaller, so the rounds are a larger share.
     assert_eq!(
         (predicted_cells(7) - predicted_cells(6)) * 10_000 / predicted_cells(6),
-        1_617,
+        1_607,
         "hundredths of a percent"
     );
 
@@ -282,7 +305,10 @@ const HONEST: Framing = Framing {
     flags: FLAGS_LFMC,
     a_slot: 0,
     b_slot: 4,
-    tag_slot: 8,
+    // Straight after the twelve lanes, not at a fixed 8: the tag is the last
+    // word of the message under every lane count, which is what keeps the byte
+    // string `LE32(lanes) ‖ tag` (COMMIT.md §1.2).
+    tag_slot: 12,
     out_window: 0,
     lane_le: true,
     msg_permutation: BLAKE3_MSG_PERMUTATION,
@@ -435,19 +461,29 @@ fn the_socket_matches_the_vectors_at_both_round_counts() {
 /// oracle, no JSON.
 ///
 /// This is what SOCKET.md §6 lists as ✗ DEFERRED ("the same equality against
-/// the Rust `blake3` crate — needs cargo"). It also re-derives the 36-byte
+/// the Rust `blake3` crate — needs cargo"). It also re-derives the 52-byte
 /// message from the byte-level specification rather than from
 /// `socket_message`, so the word-level and byte-level forms are two statements
 /// that can disagree.
+///
+/// ★ **The anchor is what the leaf RATE had to keep.** The message grew by the
+/// third input cell's four zero lanes — 36 bytes to 52 — and 52 is still under
+/// 64, so a row is still ONE block and still a plain library call. Carrying the
+/// leaf's accumulator in the chaining value `h` instead would have made the row
+/// a chunk CONTINUATION and thrown this test away for the same rate.
 #[test]
 fn seven_rounds_is_blake3_of_the_domain_separated_message() {
     for v in SOCKET_VECTORS.iter() {
-        let mut msg = Vec::with_capacity(36);
+        let mut msg = Vec::with_capacity(52);
         for lane in v.a.iter().chain(v.b.iter()) {
             msg.extend_from_slice(&lane.to_le_bytes());
         }
+        // The third input cell: unread by a digest mode, and pinned to zero by
+        // the unread-`IN` pins, so its four lanes are zero on every honest row.
+        msg.extend_from_slice(&[0u8; 16]);
         msg.extend_from_slice(b"LFMC");
-        assert_eq!(msg.len(), 36, "the socket message is one 36-byte block");
+        assert_eq!(msg.len(), 52, "the socket message is one 52-byte block");
+        assert!(msg.len() < 64, "and one block is what the anchor needs");
 
         let full = blake3::hash(&msg);
         let want: [u32; 4] = core::array::from_fn(|i| {
@@ -513,9 +549,13 @@ fn breaking_one_framing_choice_at_a_time_breaks_the_digest() {
             },
         ),
         (
+            // 8 — where the tag sat before the socket widened to twelve lanes,
+            // so this control is also the discrimination between the two
+            // framings: a chip that widened the lanes and left the tag behind
+            // would compute this, and it is a different hash.
             "tag_slot_moved",
             Framing {
-                tag_slot: 9,
+                tag_slot: 8,
                 ..HONEST
             },
         ),

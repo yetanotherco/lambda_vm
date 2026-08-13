@@ -115,22 +115,27 @@ fn the_compiled_step_matches_its_round_counts_vectors() {
 }
 
 /// ★ **The external anchor, direct.** At 7 rounds a transcript step is
-/// literally `blake3::hash(state ‖ operand ‖ "LFMT")` truncated to 16 bytes.
+/// literally `blake3::hash(state ‖ operand ‖ 0^16 ‖ "LFMT")` truncated to 16
+/// bytes.
 ///
 /// The message is re-derived from the byte-level framing rather than from
 /// `socket_message`, so the word-level and byte-level forms are two statements
 /// that can disagree. This is the property option B was chosen for: the
 /// transcript inherits the compress socket's anchor because the tag is the only
-/// thing that moved.
+/// thing that moved — and it kept it through the leaf RATE's widening, because
+/// 52 bytes is still one block.
 #[test]
 fn seven_rounds_is_blake3_of_the_transcript_message() {
     for v in STEP_VECTORS.iter() {
-        let mut msg = Vec::with_capacity(36);
+        let mut msg = Vec::with_capacity(52);
         for lane in v.state.iter().chain(v.operand.iter()) {
             msg.extend_from_slice(&lane.to_le_bytes());
         }
+        // The third input cell, pinned to zero on every row that does not read
+        // it — a transcript step reads two.
+        msg.extend_from_slice(&[0u8; 16]);
         msg.extend_from_slice(b"LFMT");
-        assert_eq!(msg.len(), 36, "a transcript step is one 36-byte block");
+        assert_eq!(msg.len(), 52, "a transcript step is one 52-byte block");
 
         let full = blake3::hash(&msg);
         let want: [u32; 4] = core::array::from_fn(|i| {
@@ -242,7 +247,10 @@ fn replay_reference(rounds: usize) -> (Vec<[u32; 4]>, Vec<[u32; 4]>, usize) {
     // DATA, so each goes through the leaf encoding before it is absorbed.
     for cell in [&T0W, &T1W] {
         let felts: LfmWord = core::array::from_fn(|i| FE::from(u64::from(cell[i])));
-        let d = leaf_digest_rounds(&felts, rounds).expect("the KAT inputs are canonical");
+        // From the chain start, exactly as `absorb_felts` does: one leaf row per
+        // data cell, absorbing four felts and chaining in the same compression.
+        let d = leaf_digest_rounds(&super::fixture::leaf_chain_start(), &felts, rounds)
+            .expect("the KAT inputs are canonical");
         absorb(&mut state, &d, &mut compressions);
         states.push(state);
     }
@@ -666,16 +674,28 @@ fn hash_row_modes(program: &LfmProgram) -> (usize, usize, usize) {
 /// ⚠ Both numbers MOVED with the leaf mode, and `TrivialV0`'s moved even though
 /// its row count did not: the canonicity witness columns are part of the AIR, so
 /// they exist on every compress row, leaf or not. Option B priced the same two
-/// programs at 369,103 and 16,527 against a 5,509-cell row; the row is now
-/// 5,517 and `FriToyV0` has 91 rows instead of 67, because each of its three
-/// data leaves became two `LFML` rows and a parent.
+/// programs at 369,103 and 16,527 against a 5,509-cell row; the row went to
+/// 5,517 and `FriToyV0` to 91 rows from 67, because each of its three data
+/// leaves became two `LFML` rows and a parent.
+///
+/// ★★ **And both moved again with the leaf RATE, in opposite directions — which
+/// is the whole trade, priced.** The row grew by 16 columns / 28 census cells
+/// (5,517 → 5,545) to carry four more lanes, and `FriToyV0` LOST twelve rows
+/// (93 → 81): a data leaf is now one two-row `LFML` chain instead of two `LFML`
+/// rows plus an `LFMC` fold, so each of the three leaves per query drops its
+/// parent. −12.9% on the program against +0.5% on the row.
+///
+/// ⚠ Do not read −12.9% as the tower's number. `FriToyV0` is Merkle-walk-heavy
+/// at a toy width — 11 of its 17 per-query hashes are path steps the RATE does
+/// not touch. What the RATE halves is leaf ABSORPTION, which is ~70% of a
+/// recursion tower node's bill (COMMIT.md §1.4.1) and a rounding error here.
 ///
 /// The per-compression price is `blake3_socket_tests`' own census formula
-/// (`main + 3·⌈interactions/2⌉`), 5,517 at 7 rounds and 4,749 at 6.
+/// (`main + 3·⌈interactions/2⌉`), 5,545 at 7 rounds and 4,777 at 6.
 #[test]
 fn the_programs_cost_what_the_leaf_spec_priced_them_at() {
-    const CELLS_PER_COMPRESSION_7R: usize = 5_517;
-    const CELLS_PER_COMPRESSION_6R: usize = 4_749;
+    const CELLS_PER_COMPRESSION_7R: usize = 5_545;
+    const CELLS_PER_COMPRESSION_6R: usize = 4_777;
     let price = if SOCKET_ROUNDS == 7 {
         CELLS_PER_COMPRESSION_7R
     } else {
@@ -702,14 +722,16 @@ fn the_programs_cost_what_the_leaf_spec_priced_them_at() {
     let (c, t, l) = hash_row_modes(&super::programs::trivial_program());
     assert_eq!((c, t, l), (3, 0, 0));
     if SOCKET_ROUNDS == 7 {
-        assert_eq!((c + t + l) * price, 16_551, "TrivialV0 at 7 rounds");
+        assert_eq!((c + t + l) * price, 16_635, "TrivialV0 at 7 rounds");
     }
 
-    // FriToyV0, per query: three data leaves at two `LFML` rows each (6), their
-    // three `LFMC` parents, and 11 Merkle-walk steps — 14 `LFMC` and 6 `LFML`,
-    // i.e. the oracle's 20. Times 4 queries, plus the preamble's 13.
+    // FriToyV0, per query: three data leaves at two chained `LFML` rows each
+    // (6) and 11 Merkle-walk steps — 11 `LFMC` and 6 `LFML`, i.e. 17. Times 4
+    // queries, plus the preamble's 13. The three `LFMC` folds that used to
+    // combine each leaf's two halves are gone: the chain does that work inside
+    // the rows it was already paying for.
     let (c, t, l) = hash_row_modes(&super::programs::fri_toy_program());
-    assert_eq!((c, t, l), (56, 11, 26));
+    assert_eq!((c, t, l), (44, 11, 26));
     assert_eq!(
         t + 2,
         FRI_TOY_COMPRESSIONS,
@@ -717,11 +739,16 @@ fn the_programs_cost_what_the_leaf_spec_priced_them_at() {
     );
     assert_eq!(
         c + t + l,
-        4 * 20 + FRI_TOY_COMPRESSIONS,
-        "the oracle's decomposition: 4 queries × 20 + the preamble's 13"
+        4 * 17 + FRI_TOY_COMPRESSIONS,
+        "the decomposition: 4 queries × 17 + the preamble's 13"
     );
-    assert_eq!(c + t + l, 93);
+    assert_eq!(c + t + l, 81, "was 93 before the leaf RATE");
+    // ★ The LEAF ROW count is unchanged — 26 either way — which is the point:
+    // the same felts are absorbed by the same number of `LFML` rows, and what
+    // disappeared is the FOLD. A change that had merely moved work from the
+    // parents into more leaf rows would show up right here.
+    assert_eq!(l, 26, "the RATE removes folds, it does not add leaf rows");
     if SOCKET_ROUNDS == 7 {
-        assert_eq!((c + t + l) * price, 513_081, "FriToyV0 at 7 rounds");
+        assert_eq!((c + t + l) * price, 449_145, "FriToyV0 at 7 rounds");
     }
 }
