@@ -1,5 +1,6 @@
 pub mod air_tests;
 pub mod aux_opening_width_tests;
+pub mod batched_mmcs_soundness_tests;
 #[cfg(feature = "debug-checks")]
 pub mod bus_debug_tests;
 pub mod bus_tests;
