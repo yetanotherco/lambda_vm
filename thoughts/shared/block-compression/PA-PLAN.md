@@ -293,6 +293,112 @@ and emitter work. **This is a question for Mauro and it should be answered befor
 Stage 1 commits an API**, because §6.1's kernel agent needs to know which
 structure it is building.
 
+### 1.7 ★ DRAFT SPEC — the RV64 byte hash (`Blake3Chain`)
+
+**Status: DRAFT.** Implemented at Stage 1 as the working default, per Mauro's
+standing decision to proceed on the cv-chain; **formally pending ratification**.
+This subsection is what §1.6 said had to exist before Stage 1 committed an API,
+and it is the reference track G's chaining loop and Stage 5's emitter build to.
+
+**Scope.** This is the *host, byte-oriented* hash the RV64 prover's Merkle
+leaves, Merkle parents, FRI-layer leaves, transcript and grinding are built
+from. It is **not** the LFM-native cell-oriented layer specified in
+`commit-spec/COMMIT.md`, which chains `LFML_row` over cells inside the machine.
+The two are different domains that happen to share a compression function.
+
+#### 1.7.1 The construction
+
+`Blake3Chain(M)` for a byte string `M`, at the crate-global round count
+`BLAKE3_ROUNDS`:
+
+```
+n      = max(1, ceil(|M| / 64))                 # blocks; the empty message is ONE block
+m_i    = bytes [64i, 64i+64) of M, zero-padded to 64, read as 16 LE u32 words
+L      = |M| - 64·(n-1)                         # 0 when |M| = 0; 1..=64 otherwise
+F_i    = (CHUNK_START if i = 0 else 0) | (CHUNK_END | ROOT if i = n-1 else 0)
+         # CHUNK_START = 1, CHUNK_END = 2, ROOT = 8
+
+cv_0     = BLAKE3_IV
+cv_{i+1} = compress(cv_i, m_i, t = 0, block_len = 64, flags = F_i)[0..8]   for i < n-1
+digest   = compress(cv_{n-1}, m_{n-1}, t = 0, block_len = L, flags = F_{n-1})[0..8]
+```
+
+The digest is those low 8 output words written **little-endian** = 32 bytes.
+`t = 0` on every block; the chaining value is never reset.
+
+In one sentence: **standard BLAKE3 restricted to a single chunk that never
+ends.**
+
+#### 1.7.2 The five properties it was designed for
+
+- **P1 — the crate anchor is maximal.** For `|M| ≤ 1024` at 7 rounds this is
+  bit-for-bit `blake3::hash(M)`. Standard BLAKE3's first chunk *is* this chain
+  (t = 0, that flag schedule), and a message of at most one chunk has the
+  chunk's output as the root, so `ROOT` lands on the same compression. The
+  entire 0..=1024-byte range is therefore a known-answer test against the
+  official crate with **no oracle, no JSON and no transcription in between** —
+  the strongest external anchor available to any construction at this layer, and
+  strictly stronger than the compression-only anchor §1.6 assumed.
+- **P2 — a 64-byte message degenerates to exactly the parent form.** One block,
+  first and last, so `flags = 0x0B`, `block_len = 64`, `h = IV`, `t = 0`. That is
+  precisely `blake3_hash_merkle_parent` (`kernels/blake3.cu:222`) and
+  `merkle_parent` (`tests/blake3_reference/mod.rs`). The two-element invariant of
+  `config.rs:93-106` therefore holds **by construction**, not by agreement:
+  `Pair::hash_data(&[a,b])` and `Batched::hash_data(&vec![a,b])` are the same 64
+  bytes through the same function.
+- **P3 — the divergence is stated, not discovered.** Above 1024 bytes this is
+  **not** standard BLAKE3: the standard would start chunk 1 (`t = 1`, `cv = IV`)
+  and build a chunk tree over chunk CVs. We keep one unbounded chunk. This buys
+  the ~6% of extra parent compressions §1.6 priced, and keeps the emitter and the
+  nine CUDA kernels free of a chunk-tree state machine. The 7r arm remains a
+  *compression-level* anchor, not a tree-compatible BLAKE3 — the cost §1.6
+  already named and recommended accepting.
+- **P4 — the framing is injective.** `(n, L)` determines `|M|`, and the blocks
+  are `M` zero-padded, so distinct messages give distinct compression-input
+  sequences. Two messages of different length never share a chain: they differ in
+  `L`, or in `n` (hence in which block carries `CHUNK_END|ROOT`), or in block
+  content. Padding introduces no cross-length collision.
+- **P5 — parents are construction-independent.** A parent's message is one block,
+  so bare cv-chain and chunk tree agree on it bit-for-bit. Whatever §1.6 is
+  eventually ratified as, every parent hash in the tree is unchanged.
+
+#### 1.7.3 Design forks, and how each is resolved
+
+| # | fork | resolution | status |
+|---|---|---|---|
+| **F1** | `t` = block counter, or 0 throughout? | **0 throughout.** A block counter diverges from the crate at the second block and would cost P1 — the ≤1KiB anchor — for nothing: `t` carries no security here, it is the chunk index of a construction that has one chunk. | ✗ OPEN for ratification |
+| **F2** | keep the `CHUNK_START`/`CHUNK_END`/`ROOT` schedule, or drop it for one constant? | **Keep.** Dropping it saves one selector in the emitter and breaks both P1 and P2 — and P2 is the invariant `config.rs` requires. The emitter cost is three constants selected by first/last, not a state machine. | ✗ OPEN for ratification |
+| **F3** | domain-separate leaves from parents? | **No — inherit keccak's posture exactly.** ✓ VERIFIED the live keccak configuration does not separate them either: `hash_new_parent_bytes` (`field_element_vector.rs:74-92`) is the digest of the two concatenated 32-byte nodes, and an 8-element leaf is the digest of the same 64 bytes (`:217-227`). P-a therefore *inherits* this property rather than introducing it, and the argument that covers keccak's tree covers this one unchanged. Changing it is a change to both hashes, not to blake3. | ✗ OPEN — carried, not new |
+| **F4** | 128-bit socket-style digest, or 256-bit? | **256-bit** (Mauro, decided). §0's finding 2 is why: 128 bits is a 64-bit collision bound, and it also keeps `Commitment = [u8; 32]` and the rkyv wire format byte-identical. | ✓ DECIDED |
+
+#### 1.7.4 The KAT schedule
+
+What the vectors have to discriminate, and the length at which each becomes
+visible. Both round counts, every row.
+
+| # | input | what it pins |
+|---|---|---|
+| K1 | `|M| = 0` | the empty message is ONE block with `block_len = 0`, not zero blocks |
+| K2 | `|M| ∈ 1..=63` | `block_len` is the true length; the tail is zero-padded |
+| K3 | `|M| = 64` | **P2** — one block, `0x0B`, and equality with the parent form |
+| K4 | `|M| = 65` | the first chain step: block 0 loses `CHUNK_END\|ROOT`, block 1 gains it |
+| K5 | `|M| = 128` | an exact multiple of 64 does not emit a spurious empty final block |
+| K6 | `|M| ∈ {192, 256, 1024}` | the interior blocks carry `flags = 0` |
+| K7 | `|M| = 1088` | **P3** — the first length past one chunk, where we leave the standard |
+
+At **7 rounds**, K1–K6 are all specified by reference to an external artifact:
+each equals `blake3::hash(M)` from the official crate (P1). They are checked that
+way in the tests rather than transcribed, so there is nothing to mistype. K7 is
+specified as `≠ blake3::hash(M)` — the negative control for P3, without which
+"we implement the single-chunk chain" would be unfalsifiable.
+
+At **6 rounds** no external artifact exists (§1.6), so the vectors are generated
+from this construction and committed as a table. Their provenance is the chain
+#903 established and `prover/src/lfm/blake3.rs:15-38` records: the *conventions*
+(G, message schedule, counter split, feed-forward, framing) are pinned from
+outside by the 7-round arm above, and the round count is the single remaining
+degree of freedom. That is weaker than a direct KAT and is recorded as such.
+
 ---
 
 ## 2. Transcript

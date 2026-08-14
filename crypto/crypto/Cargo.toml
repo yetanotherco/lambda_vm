@@ -35,6 +35,15 @@ lambda-vm-syscalls = { path = "../../syscalls" }
 math = { path = "../math", features = ["test-utils"] }
 sha2 = { version = "0.10", default-features = false }
 bincode = "1"
+# The external anchor for `hash::blake3`: at 7 rounds the compression function
+# and `Blake3Chain` up to 1024 bytes are both bit-for-bit this crate. Test-only
+# on purpose, and 7-round-only, so it CANNOT become the implementation — the
+# variant behind `blake3-6round` is computed by nothing else in the world. Same
+# dev-only role it has in `prover` and `math-cuda`.
+blake3 = { version = "1.8.5", default-features = false, features = [
+    "std",
+    "pure",
+] }
 
 [features]
 default = ["asm", "std"]
@@ -45,3 +54,16 @@ parallel = ["dep:rayon"]
 disk-spill = ["std", "dep:memmap2", "dep:tempfile", "dep:libc"]
 alloc = []
 rkyv = ["dep:rkyv", "math/rkyv"]
+# `hash::blake3` at the 6-round internal variant instead of the 7-round standard
+# one. Off = 7 rounds: standard BLAKE3, externally anchored, carrying no
+# unratified assumption. DO NOT INVERT THE POLARITY — every existing measurement
+# and the A6R sign-off read "7-round instantiated baseline, 6 behind the feature".
+#
+# This is the host tree's single round-count knob: `lambda-vm-prover`'s feature
+# of the same name forwards to it, so the `LFM_BLAKE3` chip, the `LFM_HASH`
+# socket and the commitment backends move together and one build cannot produce
+# two hashes. `math-cuda`'s is necessarily separate (it compiles a cubin) and has
+# to be set in lockstep with this one; `make lint` has a combined pass that
+# exercises both, and `math_cuda::blake3::device_rounds` makes the match
+# assertable rather than discoverable as a wrong root.
+blake3-6round = []
