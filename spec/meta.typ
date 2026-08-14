@@ -52,6 +52,11 @@
       ("ecsm", [`ECSM` accelerator], <ecsm>),
       ("fext", [Extension field accelerator], <fext>),
     )),
+    ("RECURSION", (
+      ("recursion", [Recursive verification], <recursion>),
+      ("field", [`Field` VM], <field-VM>),
+      ("field_decode", [`Field` `DECODE` table], <field-decode>),
+    )),
     ("MATHEMATICS", (
       ("limbs_and_carries", [On limb decomposition and carries], <limbs>),
     ))
