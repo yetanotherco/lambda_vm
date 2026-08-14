@@ -219,34 +219,40 @@ Applying these observations and design requirements to this VM, we present the f
 #let expanded_proof = $proof^*$
 #let fs = $#`FiatShamir`$
 
-Proof contents:
-- #table_commitments: the commitments to all AIR-tables, 
-- #logup_commitments: the commitments to the #LogUp columns, 
-- #DEEP_commitments: the #DEEP commitments, 
-- #DEEP_openings: the #DEEP openings, 
-- #FRI_folding_commitments: the #FRI folding commitments, and 
-- #FRI_query_openings: the #FRI query openings.
+#grid(
+  columns: (1fr, auto),
+  column-gutter: 1em,
+  [
+    Proof contents:
+    - #table_commitments: the commitments to all AIR-tables, 
+    - #logup_commitments: the commitments to the #LogUp columns, 
+    - #DEEP_commitments: the #DEEP commitments, 
+    - #DEEP_openings: the #DEEP openings, 
+    - #FRI_folding_commitments: the #FRI folding commitments, and 
+    - #FRI_query_openings: the #FRI query openings.
 
-#figure(image("figures/DEEP-FRI_verification.svg", height: 75%))
+    On communcation record:
+    - all the challenges: lincomb, segment, DEEP coordinate, LogUp, folding & query
 
-On communcation record:
-- all the challenges: lincomb, segment, DEEP coordinate, LogUp, folding & query
+    Native verification steps:
+    - binaryVM:
+      - [B] Derive lincomb challenges from table commitments + public input
+      - [B] Derive segment challenges from quotient commitments + table commitments + public input
+      - [B] Derive DEEP point from segment + quotient + table commitments + public input
+      - [B] Derive LogUp challenges from table commitments + public input
+      - [B] verify LogUp opening proofs
+      - [B] derive folding challenges from (everything before)
+      - [B] derive FRI-query challenges
+      - [B] verify query proofs
+    - fieldVM:
+      - [F] verify opened LogUp sums
+      - [F] verify low-degreeness of FRI output
+      - [F] verify query opening validity.
+      - [F] verify DEEP quotient/segmenting using DEEP-point
+  ],
+  figure(image("figures/DEEP-FRI_verification.svg", height: 90%))
+)
 
-Native verification steps:
-- binaryVM:
-  - [B] Derive lincomb challenges from table commitments + public input
-  - [B] Derive segment challenges from quotient commitments + table commitments + public input
-  - [B] Derive DEEP point from segment + quotient + table commitments + public input
-  - [B] Derive LogUp challenges from table commitments + public input
-  - [B] verify LogUp opening proofs
-  - [B] derive folding challenges from (everything before)
-  - [B] derive FRI-query challenges
-  - [B] verify query proofs
-- fieldVM:
-  - [F] verify opened LogUp sums
-  - [F] verify low-degreeness of FRI output
-  - [F] verify query opening validity.
-  - [F] verify DEEP quotient/segmenting using DEEP-point
 
 == Verification of verification-proof
 TODO
