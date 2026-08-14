@@ -186,11 +186,16 @@ impl StarkHash for KeccakStarkHash {
 ///
 /// Sharing those backends is what makes the two-element invariant above hold by
 /// construction: `Batched::hash_data(&vec![a, b])` and `Pair::hash_data(&[a, b])`
-/// are the same 64 bytes through the same digest, and a 64-byte message is a
-/// single BLAKE3 compression in the parent framing
-/// (`crypto::hash::blake3::chain`). `blake3_batched_and_pair_agree_on_a_two_element_leaf`
-/// pins it anyway, because "holds by construction" is a claim about today's code
-/// and the invariant has to survive tomorrow's.
+/// serialize the same 16 bytes and hand them to the same digest, so there are
+/// not two encodings to be shown equal.
+/// `blake3_batched_and_pair_agree_on_a_two_element_leaf` pins it anyway, because
+/// "holds by construction" is a claim about today's code and the invariant has
+/// to survive tomorrow's.
+///
+/// Separately, and for the parent layer rather than the leaf: a parent's message
+/// is the two 32-byte children, and at 64 bytes `Blake3Chain` is a single BLAKE3
+/// compression in the framing the device kernels implement
+/// (`crypto::hash::blake3::chain`, PA-PLAN §1.7 P2).
 ///
 /// # What this is not wired to yet
 ///
