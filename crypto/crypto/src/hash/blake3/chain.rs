@@ -270,18 +270,37 @@ pub const CHAIN_KAT_LENS: [usize; 12] = [0, 1, 31, 63, 64, 65, 127, 128, 192, 25
 /// [`blake3_chain`] at **6 rounds** over `kat_message_byte` messages of each
 /// [`CHAIN_KAT_LENS`] length.
 ///
-/// # What this table is and is not
+/// # What this table is, and how strong its provenance actually is
 ///
-/// It is a **regression pin**, generated from this implementation and committed,
-/// so that a later refactor cannot change the construction silently. It is not
-/// an external known-answer test and must not be described as one: at 6 rounds
-/// no external artifact exists to compare against (PA-PLAN §1.6). What pins the
-/// conventions from outside is the 7-round arm — `blake3_chain_rounds(m, 7)` is
-/// the `blake3` crate for every one of these lengths except 1088, checked
-/// directly and with no table in between — and the round count is the single
-/// remaining degree of freedom. That is the same provenance argument the
-/// compression-level [`CANONICAL_VECTORS`](super::CANONICAL_VECTORS) rest on,
-/// recorded here with the same caveat.
+/// It is a regression pin — generated from this implementation and committed, so
+/// a later refactor cannot change the construction silently. But it is more than
+/// that, and the difference is worth stating precisely because the compression
+/// vectors it sits next to are weaker.
+///
+/// Every entry from length 0 to 1024 was **independently reproduced** by #903's
+/// Python oracle (`thoughts/blake3/blake3-oracle/blake3_ref.py`) evaluated at
+/// `rounds = 6`, on 2026-08-14. That oracle is a full standard-BLAKE3
+/// implementation with the round count as a parameter, written by another author
+/// for a different purpose, and at `rounds = 7` it reproduces the official
+/// `blake3` package bit-for-bit at every length checked — including the
+/// multi-chunk ones. So for the whole ≤1-chunk range these digests are not a
+/// self-consistency check: two implementations that share no code agree, and
+/// the conventions they agree on are pinned to the published hash from outside.
+///
+/// Length 1088 is where they part, and that is the point of including it: the
+/// oracle stays standard past one chunk and this construction does not (P3).
+/// Being able to say the divergence is *the chunking* rather than the round
+/// count needs a reference that is standard at 6 rounds too, which is exactly
+/// what the oracle is.
+///
+/// ⚠ The oracle survives only as `__pycache__` bytecode in an untracked
+/// directory; its `.py` source is gone. The cross-check is recorded in PA-PLAN
+/// §1.7.5 with the digests, so the result outlives the artifact even though
+/// re-running it may not be possible.
+///
+/// The 7-round arm remains the primary anchor and needs none of this:
+/// `blake3_chain_rounds(m, 7)` is checked directly against the `blake3` crate
+/// over all 1025 lengths, with no table in between.
 pub const CHAIN_KAT_6ROUND: [[u8; 32]; 12] = [
     // len 0
     [

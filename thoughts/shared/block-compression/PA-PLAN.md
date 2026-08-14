@@ -392,12 +392,84 @@ way in the tests rather than transcribed, so there is nothing to mistype. K7 is
 specified as `≠ blake3::hash(M)` — the negative control for P3, without which
 "we implement the single-chunk chain" would be unfalsifiable.
 
-At **6 rounds** no external artifact exists (§1.6), so the vectors are generated
-from this construction and committed as a table. Their provenance is the chain
-#903 established and `prover/src/lfm/blake3.rs:15-38` records: the *conventions*
-(G, message schedule, counter split, feed-forward, framing) are pinned from
-outside by the 7-round arm above, and the round count is the single remaining
-degree of freedom. That is weaker than a direct KAT and is recorded as such.
+At **6 rounds** the vectors are generated from this construction and committed as
+a table. §1.6 said no external artifact exists at 6 rounds; **that turns out to
+be too pessimistic**, and the correction matters because it is the campaign's
+weakest provenance link.
+
+✓ **Cross-checked, 2026-08-14.** #903's Python oracle
+(`thoughts/blake3/blake3-oracle/blake3_ref.py`) is a full standard-BLAKE3
+implementation with the round count as a parameter — `blake3_hash(data, out_len,
+rounds)`. Two facts make it usable as an independent reference here:
+
+1. At `rounds = 7` it reproduces the official `blake3` package (1.0.9)
+   bit-for-bit at every length checked, **including multi-chunk lengths** (1088,
+   2048). So the oracle is standard BLAKE3, pinned from outside, not just at the
+   compression level but at the tree level.
+2. Standard BLAKE3 over a message of at most one chunk *is* this construction
+   (P1) — at any round count, since P1's argument is structural and does not
+   mention the round function.
+
+So `blake3_hash(m, 32, 6)` is an independent computation of `Blake3Chain` at 6
+rounds for every `|m| ≤ 1024`. It was run over all twelve KAT messages: **the
+eleven at `|m| ≤ 1024` all match**, and **1088 differs** — which is P3 confirmed
+from the other side, and is strictly more than the 7-round negative control
+gives. The 7r control says "we are not the standard at 7 rounds"; this says the
+divergence is *the chunking*, because a reference that is standard at 6 rounds
+too still parts from us at exactly the chunk boundary.
+
+That leaves the 6-round table cross-checked by two implementations sharing no
+code, over the whole range the prover actually hashes in. It is still not a
+*published* vector — nothing published computes this — but "regression pin only"
+would now understate it.
+
+⚠ **Fragility to record.** The oracle survives only as `__pycache__` bytecode
+(`blake3_ref.cpython-314.pyc`) in an untracked directory; the `.py` source is
+gone, as is `canonical_6round_vectors.json`. The cross-check was run by loading
+the bytecode directly. The digests below are therefore the durable record of the
+result — re-running it depends on an artifact one `git clean` removes.
+
+#### 1.7.5 The committed 6-round vectors
+
+Message of length `n` is bytes `37i + 11 (mod 256)`, `i` in `0..n` — the same
+generator the existing compression-level anchor uses. Digests are
+`Blake3Chain` at **6 rounds**, hex, in the byte order the digest has on the
+wire. Live copy: `CHAIN_KAT_6ROUND` in
+`crypto/crypto/src/hash/blake3/chain.rs`, asserted by
+`six_round_chain_matches_the_committed_table`. The `oracle` column is the
+independent cross-check described above.
+
+| len | digest | oracle @6r |
+|---|---|---|
+| 0 | `3C3BBB1F335A31EA86464B651C0206FC81D33262AE00EA1A65F3D1D04AFAEFC9` | agrees |
+| 1 | `2A50E45B8921F9EFA008D9F39F7165600CF48A7F0E859C2122E3CCB6B9677EE5` | agrees |
+| 31 | `C38BF62F506040B2600273778D281B8943621E2B8A9F59E2379F8FD7E5C85125` | agrees |
+| 63 | `C373F51A5EB8B27EA05BB1F6F4E62E924FF4D8A279F0D05AFA5CD519391D6389` | agrees |
+| 64 | `5900A1E398BB2BF6D3BA7F1A29197B79C86B71AD2C2631F4AC736C82DB043CB5` | agrees |
+| 65 | `53953FCADC39B8623901AF7B534F2F6933E312F50299331334E6C0A7C9DBC2BE` | agrees |
+| 127 | `9E0DD8168D199A04590C2CBA439B270776E42715D518F68655E56692483E505E` | agrees |
+| 128 | `5CAFFC8784E817BBBA991B2108C26A3DFDF804245EF63AE1040A3C34F1B362FF` | agrees |
+| 192 | `399D6B9ADEB2F88450775F773E9DEC08836C135713C2C5DD09F4CECEB0ED3888` | agrees |
+| 256 | `FBCAB3699A4959FA37190E98CA5142DDBC88330F2E7D12335DB9C6C8881A0B87` | agrees |
+| 1024 | `F395E7E2150363B6D200487515425B0204EEA424072183B701176ECCBE0FFE1B` | agrees |
+| 1088 | `B4738EDE77A6EC166EE97667118D4793CBF2B08B45AAC7C6D52943B5D298C688` | **differs** — P3, as designed |
+
+#### 1.7.6 What Stage 1 built against this spec
+
+- `crypto::hash::blake3::chain::Blake3Chain` — the construction as a `digest`
+  hasher, so it drops into the Merkle backends and (at Stage 3) the transcript.
+- `BatchBlake3Backend` / `PairBlake3Backend` — the *same* two generic backends
+  the keccak aliases are, with the digest swapped. P2 is therefore structural:
+  the two families are one function, not two encodings shown to agree.
+- `stark::config::Blake3StarkHash` + `CommitmentHash::Blake3`, non-`cuda` only.
+- Oracles: the 7-round anchor over all 1025 lengths; the P3 divergence control;
+  the parent-form check at both round counts; streaming-split agreement; the
+  committed table and its distinctness control; the two-element invariant with a
+  blake3 arm; a commit→open→verify round trip with a negative control.
+
+**Not** built, and why: a full prove→verify under `Blake3StarkHash`. `fri/` is
+not parameterized over the configuration (§4.1), so the prover would build
+keccak FRI trees and the verifier check them with blake3. That is Stage 2.
 
 ---
 
