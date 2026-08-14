@@ -342,10 +342,14 @@ ends.**
 - **P2 — a 64-byte message degenerates to exactly the parent form.** One block,
   first and last, so `flags = 0x0B`, `block_len = 64`, `h = IV`, `t = 0`. That is
   precisely `blake3_hash_merkle_parent` (`kernels/blake3.cu:222`) and
-  `merkle_parent` (`tests/blake3_reference/mod.rs`). The two-element invariant of
-  `config.rs:93-106` therefore holds **by construction**, not by agreement:
-  `Pair::hash_data(&[a,b])` and `Batched::hash_data(&vec![a,b])` are the same 64
-  bytes through the same function.
+  `merkle_parent` (`tests/blake3_reference/mod.rs`). Note that is the *parent*
+  claim. The two-element **leaf** invariant of `config.rs:93-106` is separate and
+  easier — two Goldilocks elements are 16 bytes — and it holds **by
+  construction** for a different reason: `Pair` and `Batched` are the same
+  generic backend over the same digest, so `Pair::hash_data(&[a,b])` and
+  `Batched::hash_data(&vec![a,b])` are the same 16 bytes through the same
+  function. What P2 adds is that the parent layer needs no separate definition:
+  it is this same hash at a 64-byte message.
 - **P3 — the divergence is stated, not discovered.** Above 1024 bytes this is
   **not** standard BLAKE3: the standard would start chunk 1 (`t = 1`, `cv = IV`)
   and build a chunk tree over chunk CVs. We keep one unbounded chunk. This buys
