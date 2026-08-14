@@ -1,17 +1,18 @@
 //! The host BLAKE3 compression reference the device kernels are checked against.
 //!
-//! ⚠ **This is a duplicate.** The reference lives at
-//! `prover/src/lfm/blake3.rs:125` (`blake3_compress_rounds`), which `math-cuda`
-//! must not depend on — `prover` depends on this crate, not the other way round.
-//! P-a Stage 1 sinks the real one into `crypto/crypto` (`hash/blake3/`);
-//! **TODO: when it lands, delete the body below and re-export
-//! `crypto::hash::blake3::blake3_compress_rounds` here instead**, so the device,
-//! the host backend and the in-circuit chip are all checked against one function
-//! rather than three copies of it.
+//! **Not a copy any more.** The compression function, the IV, the permutation
+//! and the round-count constants are re-exported from `crypto::hash::blake3`,
+//! which P-a Stage 1 made their single home — so the device kernels, the host
+//! commitment backends and the in-circuit chip are now all checked against one
+//! function rather than three transcriptions of it. `crypto` is a dev-dependency
+//! of this crate, which is what makes the re-export legal: `prover` (the old
+//! home) depends on this crate, so it could never have been imported here.
 //!
-//! Until then the copy is checked from outside: at 7 rounds
-//! `blake3_compress_parity.rs` anchors it against the `blake3` crate, and the
-//! only difference between the two round counts is the loop bound.
+//! What stays local is [`merkle_parent`] — the *framing* a device Merkle parent
+//! uses, which is a property of the kernel, not of the primitive. It is checked
+//! two ways: against the `blake3` crate at 7 rounds, and against the production
+//! host backend at the build's round count, so the reference cannot drift from
+//! either the standard or the thing the CPU prover actually commits with.
 //!
 //! Lives in a subdirectory of `tests/`, so cargo treats it as a shared module
 //! the parity tests `mod blake3_reference;` rather than as a test binary of its
@@ -19,90 +20,10 @@
 
 #![allow(dead_code)]
 
-/// The BLAKE3 IV (= SHA-256's initial state). Mirror of `blake3.rs:46`.
-pub const BLAKE3_IV: [u32; 8] = [
-    0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19,
-];
-
-/// The message-schedule permutation. Mirror of `blake3.rs:52`.
-pub const BLAKE3_MSG_PERMUTATION: [usize; 16] =
-    [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8];
-
-/// Rounds of standard BLAKE3 — the arm the `blake3` crate anchors.
-pub const BLAKE3_STANDARD_ROUNDS: usize = 7;
-
-/// Rounds of the internal variant P-a ships (PA-PLAN §1.5).
-pub const BLAKE3_SIX_ROUNDS: usize = 6;
-
-/// `CHUNK_START | CHUNK_END | ROOT` — the flags of a hash whose whole message is
-/// one block of one chunk, and the framing a Merkle parent uses.
-pub const FLAGS_ONE_BLOCK: u32 = 0x0B;
-
-fn blake3_g(v: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize, mx: u32, my: u32) {
-    v[a] = v[a].wrapping_add(v[b]).wrapping_add(mx);
-    v[d] = (v[d] ^ v[a]).rotate_right(16);
-    v[c] = v[c].wrapping_add(v[d]);
-    v[b] = (v[b] ^ v[c]).rotate_right(12);
-    v[a] = v[a].wrapping_add(v[b]).wrapping_add(my);
-    v[d] = (v[d] ^ v[a]).rotate_right(8);
-    v[c] = v[c].wrapping_add(v[d]);
-    v[b] = (v[b] ^ v[c]).rotate_right(7);
-}
-
-/// The BLAKE3 compression function at an explicit round count, full 16-word
-/// output. Transcription of `prover/src/lfm/blake3.rs:125`.
-pub fn blake3_compress_rounds(
-    h: &[u32; 8],
-    m: &[u32; 16],
-    t: u64,
-    block_len: u32,
-    flags: u32,
-    rounds: usize,
-) -> [u32; 16] {
-    let mut v: [u32; 16] = [
-        h[0],
-        h[1],
-        h[2],
-        h[3],
-        h[4],
-        h[5],
-        h[6],
-        h[7],
-        BLAKE3_IV[0],
-        BLAKE3_IV[1],
-        BLAKE3_IV[2],
-        BLAKE3_IV[3],
-        t as u32,
-        (t >> 32) as u32,
-        block_len,
-        flags,
-    ];
-
-    let mut m = *m;
-    for r in 0..rounds {
-        blake3_g(&mut v, 0, 4, 8, 12, m[0], m[1]);
-        blake3_g(&mut v, 1, 5, 9, 13, m[2], m[3]);
-        blake3_g(&mut v, 2, 6, 10, 14, m[4], m[5]);
-        blake3_g(&mut v, 3, 7, 11, 15, m[6], m[7]);
-        blake3_g(&mut v, 0, 5, 10, 15, m[8], m[9]);
-        blake3_g(&mut v, 1, 6, 11, 12, m[10], m[11]);
-        blake3_g(&mut v, 2, 7, 8, 13, m[12], m[13]);
-        blake3_g(&mut v, 3, 4, 9, 14, m[14], m[15]);
-        if r < rounds - 1 {
-            let prev = m;
-            for (i, &p) in BLAKE3_MSG_PERMUTATION.iter().enumerate() {
-                m[i] = prev[p];
-            }
-        }
-    }
-
-    let mut out = [0u32; 16];
-    for i in 0..8 {
-        out[i] = v[i] ^ v[i + 8];
-        out[i + 8] = v[i + 8] ^ h[i];
-    }
-    out
-}
+pub use crypto::hash::blake3::chain::FLAGS_ONE_BLOCK;
+pub use crypto::hash::blake3::{
+    BLAKE3_IV, BLAKE3_SIX_ROUNDS, BLAKE3_STANDARD_ROUNDS, blake3_compress_rounds,
+};
 
 /// A Merkle parent: one compression over the 64 bytes of two child digests, with
 /// the digest read back out little-endian. The host `hash_new_parent` for a
@@ -132,9 +53,10 @@ pub const fn expected_device_rounds() -> usize {
     }
 }
 
-/// This module is a transcription, so it gets its own check that it did not
-/// drift — otherwise a device-vs-host parity failure would be ambiguous between
-/// "the kernel is wrong" and "the copy is wrong".
+/// The compression function is shared now, but [`merkle_parent`]'s framing is
+/// still written here, so it gets its own checks that it did not drift —
+/// otherwise a device-vs-host parity failure would be ambiguous between "the
+/// kernel is wrong" and "the reference is wrong".
 ///
 /// Host-only: no GPU, so these run wherever the suite compiles, including the
 /// laptops where the kernels are stubbed out.
@@ -189,6 +111,44 @@ mod tests {
         assert_eq!(
             merkle_parent(&left, &right, BLAKE3_STANDARD_ROUNDS),
             *blake3::hash(&msg).as_bytes()
+        );
+    }
+
+    /// ★ The reference parent is what the **host commitment backend** computes.
+    ///
+    /// The two checks above anchor the framing against the standard; this one
+    /// anchors it against the thing the CPU prover actually commits with, so a
+    /// GPU tree and a CPU tree over the same leaves are the same tree. Without
+    /// it, the device could be faithful to `blake3::hash(a ‖ b)` and still
+    /// disagree with the backend the proof is verified against.
+    ///
+    /// It runs at [`expected_device_rounds`], and so it doubles as the LOCKSTEP
+    /// alarm for the two crates' `blake3-6round` features: they are separate
+    /// features and nothing forces them equal, and a mismatch means a GPU tree
+    /// committing under a different hash than the CPU one. If this fails with
+    /// the round counts differing, set both features or neither — `make lint`
+    /// has a combined pass that compiles them together for the same reason.
+    #[test]
+    fn the_reference_parent_is_the_host_commitment_backend() {
+        use crypto::hash::blake3::BLAKE3_ROUNDS;
+        use crypto::merkle_tree::backends::types::BatchBlake3Backend;
+        use crypto::merkle_tree::traits::IsMerkleTreeBackend;
+        use math::field::goldilocks::GoldilocksField;
+
+        assert_eq!(
+            BLAKE3_ROUNDS,
+            expected_device_rounds(),
+            "crypto's blake3-6round and math-cuda's are out of lockstep: the GPU \
+             kernels would commit under a different hash than the CPU backend"
+        );
+
+        let left: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(11).wrapping_add(5));
+        let right: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(23));
+        assert_eq!(
+            merkle_parent(&left, &right, expected_device_rounds()),
+            <BatchBlake3Backend<GoldilocksField> as IsMerkleTreeBackend>::hash_new_parent(
+                &left, &right
+            ),
         );
     }
 

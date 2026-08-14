@@ -648,6 +648,14 @@ clippy:
 	cargo clippy --workspace --all-targets -- -D warnings -A clippy::op_ref
 	cargo clippy --workspace --all-targets --no-default-features --features lambda-vm-prover/debug-checks -- -D warnings -A clippy::op_ref
 	cargo clippy --workspace --all-targets --features lambda-vm-prover/disk-spill -- -D warnings -A clippy::op_ref
+	# BLAKE3 at 6 rounds. ONE pass, with BOTH crates' features set, because they
+	# are separate features that must be set in lockstep: crypto's moves the host
+	# primitive (the LFM chip, the socket and the commitment backends all read its
+	# BLAKE3_ROUNDS) and math-cuda's recompiles the cubin. Setting one alone means
+	# a GPU tree committing under a different hash than the CPU one, so linting
+	# them apart would certify a combination nothing should ever build. The
+	# prover's feature forwards to crypto's, so naming it covers both host halves.
+	cargo clippy --workspace --all-targets --features lambda-vm-prover/blake3-6round,math-cuda/blake3-6round -- -D warnings -A clippy::op_ref
 
 fmt:
 	cargo fmt --all
@@ -658,6 +666,14 @@ lint:
 	cargo clippy --workspace --all-targets -- -D warnings -A clippy::op_ref
 	cargo clippy --workspace --all-targets --no-default-features --features lambda-vm-prover/debug-checks -- -D warnings -A clippy::op_ref
 	cargo clippy --workspace --all-targets --features lambda-vm-prover/disk-spill -- -D warnings -A clippy::op_ref
+	# BLAKE3 at 6 rounds. ONE pass, with BOTH crates' features set, because they
+	# are separate features that must be set in lockstep: crypto's moves the host
+	# primitive (the LFM chip, the socket and the commitment backends all read its
+	# BLAKE3_ROUNDS) and math-cuda's recompiles the cubin. Setting one alone means
+	# a GPU tree committing under a different hash than the CPU one, so linting
+	# them apart would certify a combination nothing should ever build. The
+	# prover's feature forwards to crypto's, so naming it covers both host halves.
+	cargo clippy --workspace --all-targets --features lambda-vm-prover/blake3-6round,math-cuda/blake3-6round -- -D warnings -A clippy::op_ref
 	# The cuda feature gates whole modules + cuda-only integration tests. build.rs emits empty
 	# cubin stubs when nvcc is absent, so this checks on a GPU-less host (CI lint runner, dev laptop)
 	# too — no GPU required. Catches cuda-gated breakage that the non-cuda passes above miss.

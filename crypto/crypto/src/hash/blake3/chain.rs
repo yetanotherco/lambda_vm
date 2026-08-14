@@ -507,12 +507,9 @@ mod tests {
     /// above passing and pinning nothing.
     #[test]
     fn the_committed_table_entries_are_distinct() {
-        for i in 0..CHAIN_KAT_6ROUND.len() {
-            for j in (i + 1)..CHAIN_KAT_6ROUND.len() {
-                assert_ne!(
-                    CHAIN_KAT_6ROUND[i], CHAIN_KAT_6ROUND[j],
-                    "KAT entries {i} and {j} are the same digest"
-                );
+        for (i, a) in CHAIN_KAT_6ROUND.iter().enumerate() {
+            for (j, b) in CHAIN_KAT_6ROUND.iter().enumerate().skip(i + 1) {
+                assert_ne!(a, b, "KAT entries {i} and {j} are the same digest");
             }
         }
     }

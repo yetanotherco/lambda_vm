@@ -2,8 +2,9 @@
 //! bit-for-bit, at both round counts.
 //!
 //! The reference is one function whose only parameter is the round count
-//! (`blake3_reference::blake3_compress_rounds`, a copy of
-//! `prover/src/lfm/blake3.rs:125`). So the 7-round arm, where the `blake3` crate
+//! (`crypto::hash::blake3::blake3_compress_rounds`, re-exported through
+//! `blake3_reference` — the same function the host commitment backends and the
+//! in-circuit chip use, not a copy of it). So the 7-round arm, where the `blake3` crate
 //! is an external known-answer test, certifies the whole device code path — the
 //! G function, the message schedule, the counter split, the feed-forward — and
 //! the 6-round arm differs from it by a loop bound alone. That is why the
