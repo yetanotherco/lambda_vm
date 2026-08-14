@@ -1,3 +1,5 @@
+#[cfg(not(feature = "cuda"))]
+use crypto::merkle_tree::backends::types::{BatchBlake3Backend, PairBlake3Backend};
 use crypto::merkle_tree::{
     backends::types::{BatchKeccak256Backend, PairKeccak256Backend},
     merkle::MerkleTree,
@@ -52,22 +54,41 @@ impl<F> KeccakTreeBackend for PairKeccak256Backend<F> where
 
 /// The hash every commitment this crate produces is built with.
 ///
-/// One variant, deliberately. It is the machine-readable form of what the three
-/// aliases above already say in types, and it exists so that code reasoning
-/// about *which hash is inside a root* can match on it exhaustively rather than
-/// assert it in prose — see `build_artifacts_with_hasher` in
-/// `prover/src/lfm/registry.rs`, whose artifacts name a hash. Adding a second
-/// variant here breaks every such match, which is the point: it is the list of
-/// places that have to be revisited before this crate can commit under two
-/// hashes.
+/// It is the machine-readable form of what the aliases above say in types, and
+/// it exists so that code reasoning about *which hash is inside a root* can
+/// match on it exhaustively rather than assert it in prose — see
+/// `build_artifacts_with_hasher` in `prover/src/lfm/registry.rs`, whose
+/// artifacts name a hash. Every such match is a place that has to be revisited
+/// before this crate commits under a second hash; adding [`Self::Blake3`] broke
+/// them, which is what that mechanism is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommitmentHash {
     /// Keccak-256 at both the leaf and the parent layer.
     Keccak256,
+    /// `Blake3Chain` at both the leaf and the parent layer — the single-chunk
+    /// BLAKE3 chain of PA-PLAN §1.7, at the round count `crypto`'s
+    /// `blake3-6round` feature selects.
+    ///
+    /// The round count is deliberately **not** a second variant. It is a
+    /// crate-global compile-time constant precisely so one build cannot produce
+    /// two hashes, so within a build there is nothing here to distinguish: a
+    /// proof's roots are named by this variant plus the build's feature set,
+    /// exactly as the `LFM_BLAKE3` chip's round count is.
+    Blake3,
 }
 
 /// The hash behind [`Commitment`], [`BatchedMerkleTree`] and
 /// [`FriLayerMerkleTree`]. Pinned to the aliases by the assertion below.
+///
+/// ⚠ **This describes the DEFAULT configuration — the aliases — and nothing
+/// else.** Now that [`Blake3StarkHash`] exists, a prover can run under a
+/// configuration whose [`StarkHash::COMMITMENT_HASH`] differs from this const
+/// and this const will not know: it is a global, the configuration is per-type.
+/// Code that names the hash inside a *particular* proof's roots must read
+/// `H::COMMITMENT_HASH` at the call site; only code that names the hash of the
+/// aliases may read this. `prover::lfm::registry`'s guard reads this one because
+/// its commit helpers are hard-wired to the aliases — when they become generic
+/// over `H`, that guard moves with them (PA-PLAN §4.2).
 pub const COMMITMENT_HASH: CommitmentHash = CommitmentHash::Keccak256;
 
 /// One STARK commitment configuration: the Merkle backend families the
@@ -160,14 +181,105 @@ impl StarkHash for KeccakStarkHash {
     const COMMITMENT_HASH: CommitmentHash = CommitmentHash::Keccak256;
 }
 
+/// The BLAKE3 configuration — `Blake3Chain` at both the leaf and the parent
+/// layer, over the *same* two generic backends the keccak instance uses.
+///
+/// Sharing those backends is what makes the two-element invariant above hold by
+/// construction: `Batched::hash_data(&vec![a, b])` and `Pair::hash_data(&[a, b])`
+/// are the same 64 bytes through the same digest, and a 64-byte message is a
+/// single BLAKE3 compression in the parent framing
+/// (`crypto::hash::blake3::chain`). `blake3_batched_and_pair_agree_on_a_two_element_leaf`
+/// pins it anyway, because "holds by construction" is a claim about today's code
+/// and the invariant has to survive tomorrow's.
+///
+/// # What this is not wired to yet
+///
+/// Nothing selects it: every `Prover` and `Verifier` alias still resolves to
+/// [`KeccakStarkHash`], and [`COMMITMENT_HASH`] still describes the aliases. It
+/// is reachable by naming it, which is what the commitment-layer tests do.
+///
+/// A full prove→verify under it does **not** work yet, for a specific reason
+/// rather than a general one: `fri/` is not parameterized over the
+/// configuration. `commit_phase_from_evaluations` builds FRI-layer trees with
+/// the concrete `FriLayerMerkleTreeBackend` alias (`fri/mod.rs:11, 41, 105,
+/// 154`) while the verifier authenticates those openings through `H::Batched`,
+/// so a blake3 `H` would have the prover build keccak FRI trees and the verifier
+/// check them with blake3 — every honest proof rejecting at its first FRI query.
+/// Loud rather than silent, which is the good outcome, but threading the
+/// configuration through `fri/` is required work and is not done here (PA-PLAN
+/// §4.1, Stage 2).
+#[cfg(not(feature = "cuda"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Blake3StarkHash;
+
+// Under `cuda` there is deliberately no BLAKE3 configuration to name.
+//
+// [`StarkHash::Batched`] additionally requires [`KeccakTreeBackend`] there,
+// because `gpu_lde`'s tree entry points hash on the device with the keccak
+// kernels and only *label* the result with the backend type — so a cuda build
+// has no way to honour any other configuration, and the bound says so at compile
+// time instead of letting the label be wrong. Implementing `KeccakTreeBackend`
+// for a BLAKE3 backend to get past it would be precisely the deliberate false
+// statement that marker exists to require, so the configuration does not exist
+// under `cuda` at all.
+//
+// This comes off when the device leaf kernels land. Track G has already built
+// the device parent layer against the same framing this host backend uses
+// (`math-cuda/kernels/blake3.cu`: `blake3_merkle_level`, `blake3_merkle_tail`,
+// checked by `tests/blake3_merkle_tree.rs`); what is missing is the multi-block
+// leaf kernel, which needs the chaining construction PA-PLAN §1.7 specifies.
+#[cfg(not(feature = "cuda"))]
+impl StarkHash for Blake3StarkHash {
+    type Batched<F>
+        = BatchBlake3Backend<F>
+    where
+        F: IsField + 'static,
+        FieldElement<F>: AsBytes + Sync + Send;
+
+    type Pair<F>
+        = PairBlake3Backend<F>
+    where
+        F: IsField + 'static,
+        FieldElement<F>: AsBytes + Sync + Send;
+
+    const COMMITMENT_HASH: CommitmentHash = CommitmentHash::Blake3;
+}
+
+/// [`Blake3StarkHash`]'s members are the BLAKE3 backends, not a mix.
+///
+/// The two families exist because they hash different leaf *shapes*, not because
+/// they are different hashes — that is the whole content of
+/// [`StarkHash::COMMITMENT_HASH`] being one constant. Asserting it here means a
+/// configuration assembled from one hash's batched backend and another's pair
+/// backend fails to compile, rather than producing proofs whose roots no single
+/// name describes.
+#[cfg(not(feature = "cuda"))]
+const _: fn() = || {
+    fn assert_same<T>(_: core::marker::PhantomData<(T, T)>) {}
+
+    assert_same::<BatchBlake3Backend<GoldilocksField>>(
+        core::marker::PhantomData::<(
+            BatchBlake3Backend<GoldilocksField>,
+            <Blake3StarkHash as StarkHash>::Batched<GoldilocksField>,
+        )>,
+    );
+    assert_same::<PairBlake3Backend<GoldilocksField>>(
+        core::marker::PhantomData::<(
+            PairBlake3Backend<GoldilocksField>,
+            <Blake3StarkHash as StarkHash>::Pair<GoldilocksField>,
+        )>,
+    );
+};
+
 /// Ties the aliases, [`COMMITMENT_HASH`] and [`KeccakStarkHash`]'s members
 /// to each other, so they cannot drift apart silently.
 ///
 /// The `KeccakTreeBackend` assertions are the H3 marker's tie-in: it is not a
 /// parallel ladder to [`StarkHash`] but a consequence of this instance, since
 /// the GPU kernels are keccak-only regardless of which configuration the host
-/// prover runs. When a second configuration exists, `gpu_lde` still demands
-/// keccak and this is where you find out.
+/// prover runs. [`Blake3StarkHash`] is that second configuration and it does
+/// **not** satisfy the marker — deliberately, which is why it does not exist at
+/// all under `cuda`. Point the aliases at it and this is where you find out.
 const _: fn() = || {
     fn assert_keccak_backend<B: KeccakTreeBackend>() {}
     fn assert_same<T>(_: core::marker::PhantomData<(T, T)>) {}

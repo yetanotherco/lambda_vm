@@ -155,8 +155,38 @@ pub fn build_artifacts_with_hasher(
 ) -> LfmArtifacts {
     // Exhaustive on purpose — see the doc above. Not a runtime check: today
     // every arm of `hasher` is legitimately paired with keccak roots.
+    //
+    // `CommitmentHash::Blake3` now exists (P-a Stage 1), and this is the
+    // decision the doc above says has to be taken here rather than inherited.
+    //
+    // The decision: the guard stays pointed at the ALIASES, and the Blake3 arm
+    // is a hard stop rather than an accepted case. `COMMITMENT_HASH` describes
+    // the default configuration, and the three helpers below — `commit_group`
+    // and the two `preprocessed_commitment`s — are hard-wired to the aliases, so
+    // while the aliases are keccak this function's roots are keccak and the doc
+    // above is true as written. If the aliases ever move, those roots change
+    // hash and `program_id`'s meaning changes with them: the digest folds in the
+    // `hasher` tag but says nothing about the commitment hash, so two builds
+    // committing under different hashes would give the same program the same
+    // `program_id`. That has to be decided, not defaulted.
+    //
+    // It is not claimed this arm is the FIRST thing to fail when the aliases
+    // move — `stark::config`'s own `assert_keccak_backend` and the
+    // `COMMITMENT_HASH`-to-`KeccakStarkHash` pin sit in front of it and were
+    // observed to fire first. It is the one that fails for THIS crate's reason,
+    // and it is what makes the decision unskippable once those are dealt with.
+    //
+    // What this still does not catch, unchanged: a prover running under an
+    // explicit `Blake3StarkHash` while the aliases stay keccak. The const is
+    // global, the configuration is per-type. Closing that means making this
+    // function generic over `H` and reading `H::COMMITMENT_HASH` — Stage 5 work,
+    // recorded in PA-PLAN §4.2 and in `stark::config::COMMITMENT_HASH`'s doc.
     const _: () = match stark::config::COMMITMENT_HASH {
         CommitmentHash::Keccak256 => (),
+        CommitmentHash::Blake3 => panic!(
+            "the commitment aliases moved to BLAKE3: decide what LfmArtifacts \
+             should say about program_id before letting this build through"
+        ),
     };
 
     let range = range_group();
