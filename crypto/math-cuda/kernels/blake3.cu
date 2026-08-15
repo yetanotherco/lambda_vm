@@ -17,12 +17,20 @@
 // `blake3_rounds_probe`, which exports this cubin's round count so a caller can
 // assert the match rather than discover it as a wrong commitment.
 //
-// WHAT IS NOT HERE YET: the multi-block leaf kernels. A leaf spans many 64-byte
-// blocks, so hashing one needs a *chaining construction* — bare cv-chain vs
-// standard BLAKE3 chunk tree — and that decision is open (PA-PLAN §1.6). The
-// compression function, the byte serialization and the block framing are
-// identical either way and are all here; `Blake3Block` exposes the sink so the
-// chaining loop drops in without touching any of it.
+// THE CHAINING CONSTRUCTION is `Blake3Chain`, specified in PA-PLAN §1.7 and
+// implemented on host at `crypto/crypto/src/hash/blake3/chain.rs`: standard
+// BLAKE3 restricted to a single chunk that never ends. `t = 0` on every block,
+// CHUNK_START on the first, CHUNK_END|ROOT and the true byte count as
+// `block_len` on the last, digest = the low 8 output words little-endian. The
+// device `Blake3Chain` below is a transcription of that host type, and every
+// leaf kernel here streams its message through one.
+//
+// ⚠ The construction is a DRAFT pending ratification of forks F1-F3
+// (PA-PLAN §1.7.3): `t = 0` throughout rather than a block counter, the
+// three-flag schedule rather than one constant, and no leaf/parent domain
+// separation. It is implemented as the working default by standing decision. If
+// a fork is ratified the other way, the change lands in `Blake3Chain::finalize`
+// and `compress_pending` — the leaf kernels themselves do not move.
 
 #include <cstdint>
 #include "goldilocks.cuh"
@@ -39,12 +47,21 @@ __device__ __constant__ uint32_t BLAKE3_IV[8] = {
     0x510E527Fu, 0x9B05688Cu, 0x1F83D9ABu, 0x5BE0CD19u,
 };
 
+// The three BLAKE3 domain flags this construction uses. Mirrors of `CHUNK_START`
+// / `CHUNK_END` / `ROOT` in `crypto/crypto/src/hash/blake3/chain.rs:53-58`.
+// `Blake3Chain` sets CHUNK_START on the first block only and CHUNK_END|ROOT on
+// the last only; interior blocks carry no flags at all.
+#define BLAKE3_FLAG_CHUNK_START 1u
+#define BLAKE3_FLAG_CHUNK_END 2u
+#define BLAKE3_FLAG_ROOT 8u
+
 // CHUNK_START | CHUNK_END | ROOT: the flags of a BLAKE3 hash whose whole message
 // is one block of one chunk. At 7 rounds a compression under these flags with
 // `h = IV` and `t = 0` IS `blake3::hash(message)`, which is what makes the crate
 // an anchor for the framing and not just for the round function. Same framing
 // the live LFM socket uses (`blake3_socket.rs:258` `FLAGS_LFMC = 0x0B`).
-#define BLAKE3_FLAGS_ONE_BLOCK 0x0Bu
+#define BLAKE3_FLAGS_ONE_BLOCK \
+    (BLAKE3_FLAG_CHUNK_START | BLAKE3_FLAG_CHUNK_END | BLAKE3_FLAG_ROOT)
 
 // A Merkle parent's message is two 32-byte child digests = exactly 64 bytes.
 #define BLAKE3_PARENT_BLOCK_LEN 64u
@@ -196,6 +213,331 @@ struct Blake3Block {
 };
 
 // ---------------------------------------------------------------------------
+// `Blake3Chain` — the byte hash every leaf kernel commits with.
+//
+// Transcription of the host `Blake3Chain` (`crypto/crypto/src/hash/blake3/
+// chain.rs:98`), and the two are checked against each other by the leaf parity
+// tests at the build's round count. The construction is PA-PLAN §1.7:
+//
+//     n      = max(1, ceil(|M| / 64))          blocks; the empty message is ONE
+//     L      = |M| - 64*(n-1)                  0 when |M| = 0, else 1..=64
+//     F_i    = (CHUNK_START if i = 0) | (CHUNK_END|ROOT if i = n-1)
+//     cv_0   = IV
+//     cv_i+1 = compress(cv_i, m_i, 0, 64, F_i)[0..8]     for i < n-1
+//     digest = compress(cv_n-1, m_n-1, 0, L, F_n-1)[0..8]  little-endian
+//
+// ★ THE ONE SUBTLETY, and the reason this is a state machine rather than a
+// loop: a FULL block is *held*, not compressed. The last block's flags and
+// `block_len` differ from every other block's, and whether a block is the last
+// is not known until the message ends — so a block is only folded into the
+// chaining value once a further word proves it was not the last. `push_word`
+// therefore compresses on the *next* push, never on filling. This mirrors the
+// host `update`, which tests `block_len == BLOCK_LEN` at the top of the loop
+// body and so only compresses when there is more input (`chain.rs:186-195`).
+//
+// Compressing eagerly on fill is the bug this shape exists to prevent: it would
+// hash a 64-byte message as two blocks (one flagged CHUNK_START, one empty
+// final) instead of one, breaking P2 — the property that a 64-byte message is
+// exactly a Merkle parent — and with it the `StarkHash` two-element invariant.
+//
+// Word granularity, not byte: every message these kernels hash is a whole
+// number of 8-byte field elements, so `block_len` is always a multiple of 4 and
+// a partial word can never occur. `Blake3Block` is reused for the pending block
+// so that the framing (packing, boundaries, zero-padding, the byte count) has
+// exactly one implementation shared with `blake3_blocks_of_felts_probe`.
+// ---------------------------------------------------------------------------
+struct Blake3Chain {
+    uint32_t cv[8];
+    Blake3Block block;
+    // Whether any block has been compressed — i.e. whether the pending block
+    // still carries CHUNK_START. Host counterpart: `started` (`chain.rs:109`).
+    bool started;
+
+    __device__ __forceinline__ void init() {
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) cv[i] = BLAKE3_IV[i];
+        block.init();
+        started = false;
+    }
+
+    // The pending block's flags. CHUNK_START while nothing has been compressed
+    // yet; CHUNK_END|ROOT when this is the message's last block. Mirror of the
+    // host `flags(is_final)` (`chain.rs:160`).
+    __device__ __forceinline__ uint32_t flags(bool is_final) const {
+        uint32_t start = started ? 0u : BLAKE3_FLAG_CHUNK_START;
+        uint32_t end = is_final ? (BLAKE3_FLAG_CHUNK_END | BLAKE3_FLAG_ROOT) : 0u;
+        return start | end;
+    }
+
+    // Fold the pending block — known NOT to be the last — into the chaining
+    // value, and clear it so the next block starts zero-padded.
+    __device__ __forceinline__ void compress_pending() {
+        uint32_t out[16];
+        blake3_compress<BLAKE3_ROUNDS>(cv, block.m, 0, 64u, flags(false), out);
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) cv[i] = out[i];
+        block.reset();
+        started = true;
+    }
+
+    // Absorb one message word. The full-block test comes FIRST: reaching here
+    // with a full block is what proves that block was not the last.
+    __device__ __forceinline__ void push_word(uint32_t w) {
+        if (block.nwords == 16) compress_pending();
+        block.push_word(w);
+    }
+
+    // Absorb one Goldilocks field element as its two message words — the
+    // canonical big-endian element bytes read back as little-endian words.
+    __device__ __forceinline__ void push_felt(uint64_t raw) {
+        uint32_t w0, w1;
+        blake3_words_of_felt(raw, w0, w1);
+        push_word(w0);
+        push_word(w1);
+    }
+
+    // The 32-byte digest: one final compression over the pending block with the
+    // true byte count as `block_len` and CHUNK_END|ROOT set. The empty message
+    // takes this path with an all-zero block and `block_len = 0`, which is ONE
+    // compression, not zero.
+    //
+    // `dst` is 32-byte aligned at every call site (node buffers come from
+    // cuMemAlloc, 256-byte aligned, and every leaf sits at a multiple of 32), so
+    // the u32 store is safe. A digest's 32 bytes ARE its 8 output words
+    // little-endian and the device is little-endian, so this is a plain copy
+    // with no byte swapping — contrast the leaf INPUT path, whose field bytes
+    // are big-endian.
+    __device__ __forceinline__ void finalize(uint8_t *dst) {
+        uint32_t out[16];
+        blake3_compress<BLAKE3_ROUNDS>(cv, block.m, 0, block.pending_bytes(), flags(true), out);
+        uint32_t *w = reinterpret_cast<uint32_t *>(dst);
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) w[i] = out[i];
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Leaf kernels.
+//
+// Twins of the seven keccak leaf kernels, one for one, with the sponge replaced
+// by a `Blake3Chain` and the lane byte-swap replaced by the two-word field
+// serialization. THE READ PATTERN IS IDENTICAL IN EVERY CASE — same bit
+// reversal, same column/component order, same row-pair ordering — because the
+// leaf byte layout does not move under P-a: `leaves_bit_reversed_grouped`
+// (`crypto/stark/src/commitment.rs:55`) serializes each element in canonical
+// big-endian and concatenates, and only the hash over those bytes changes.
+//
+// So the correctness argument for each kernel below is two independent halves:
+// the byte stream (identical to the keccak twin's, and checked against the CPU
+// leaf helpers by the parity tests) and the hash over it (`Blake3Chain`, checked
+// against the host chain by the same tests).
+// ---------------------------------------------------------------------------
+
+// Goldilocks BASE-FIELD leaf hashing, one leaf per bit-reversed row.
+// Twin of `keccak256_leaves_base_batched` (`keccak.cu:152`).
+extern "C" __global__ void blake3_leaves_base_batched(
+    const uint64_t *columns_base_ptr,
+    uint64_t col_stride,
+    uint64_t num_cols,
+    uint64_t num_rows,
+    uint64_t log_num_rows,
+    uint8_t *hashed_leaves_out) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_rows) return;
+
+    // Read columns at the bit-reversed row, write the leaf at `tid` — matching
+    // the CPU per-row `commit_bit_reversed(.., 1)`.
+    uint64_t br = __brevll(tid) >> (64 - log_num_rows);
+
+    Blake3Chain h;
+    h.init();
+    for (uint64_t c = 0; c < num_cols; ++c) {
+        h.push_felt(columns_base_ptr[c * col_stride + br]);
+    }
+    h.finalize(hashed_leaves_out + tid * 32);
+}
+
+// Goldilocks BASE-FIELD row-pair leaf hashing: leaf `tid` hashes bit-reversed
+// rows `2*tid` and `2*tid+1`, each written column-by-column, first row then
+// second. `num_leaves = num_rows / 2`.
+// Twin of `keccak256_leaves_base_row_pair_batched` (`keccak.cu:196`).
+extern "C" __global__ void blake3_leaves_base_row_pair_batched(
+    const uint64_t *columns_base_ptr,
+    uint64_t col_stride,
+    uint64_t num_cols,
+    uint64_t num_rows,
+    uint64_t log_num_rows,
+    uint8_t *hashed_leaves_out) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t num_leaves = num_rows >> 1;
+    if (tid >= num_leaves) return;
+
+    uint64_t br_0 = __brevll(2 * tid) >> (64 - log_num_rows);
+    uint64_t br_1 = __brevll(2 * tid + 1) >> (64 - log_num_rows);
+
+    Blake3Chain h;
+    h.init();
+    for (uint64_t c = 0; c < num_cols; ++c) {
+        h.push_felt(columns_base_ptr[c * col_stride + br_0]);
+    }
+    for (uint64_t c = 0; c < num_cols; ++c) {
+        h.push_felt(columns_base_ptr[c * col_stride + br_1]);
+    }
+    h.finalize(hashed_leaves_out + tid * 32);
+}
+
+// Goldilocks EXT3 leaf hashing, one leaf per bit-reversed row. Components live
+// in three separate base-field slabs: column `c` component `k` is at
+// `columns_base_ptr[(c*3 + k)*col_stride + br]`, and per-element bytes are
+// `[comp0, comp1, comp2]` each 8 big-endian bytes (matching
+// `FieldElement::<Ext3>::write_bytes_be`).
+// Twin of `keccak256_leaves_ext3_batched` (`keccak.cu:237`).
+extern "C" __global__ void blake3_leaves_ext3_batched(
+    const uint64_t *columns_base_ptr,
+    uint64_t col_stride,
+    uint64_t num_cols,          // number of ext3 columns (NOT slabs)
+    uint64_t num_rows,
+    uint64_t log_num_rows,
+    uint8_t *hashed_leaves_out) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_rows) return;
+    uint64_t br = __brevll(tid) >> (64 - log_num_rows);
+
+    Blake3Chain h;
+    h.init();
+    for (uint64_t c = 0; c < num_cols; ++c) {
+        #pragma unroll
+        for (int k = 0; k < 3; ++k) {
+            h.push_felt(columns_base_ptr[(c * 3 + (uint64_t)k) * col_stride + br]);
+        }
+    }
+    h.finalize(hashed_leaves_out + tid * 32);
+}
+
+// R2 composition-polynomial leaf hashing: each leaf hashes `2 * num_parts` ext3
+// values from bit-reversed rows `2*tid` and `2*tid+1`, in (row 0: parts) then
+// (row 1: parts) order, three base components per value.
+// Twin of `keccak_comp_poly_leaves_ext3` (`keccak.cu:277`).
+extern "C" __global__ void blake3_comp_poly_leaves_ext3(
+    const uint64_t *parts_base_ptr,
+    uint64_t col_stride,
+    uint64_t num_parts,
+    uint64_t num_rows,
+    uint64_t log_num_rows,
+    uint8_t *leaves_out) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t num_leaves = num_rows >> 1;
+    if (tid >= num_leaves) return;
+
+    uint64_t br_0 = __brevll(2 * tid) >> (64 - log_num_rows);
+    uint64_t br_1 = __brevll(2 * tid + 1) >> (64 - log_num_rows);
+
+    Blake3Chain h;
+    h.init();
+    for (uint64_t p = 0; p < num_parts; ++p) {
+        #pragma unroll
+        for (int k = 0; k < 3; ++k) {
+            h.push_felt(parts_base_ptr[(p * 3 + (uint64_t)k) * col_stride + br_0]);
+        }
+    }
+    for (uint64_t p = 0; p < num_parts; ++p) {
+        #pragma unroll
+        for (int k = 0; k < 3; ++k) {
+            h.push_felt(parts_base_ptr[(p * 3 + (uint64_t)k) * col_stride + br_1]);
+        }
+    }
+    h.finalize(leaves_out + tid * 32);
+}
+
+// FRI layer leaf hashing: each leaf hashes two consecutive ext3 values from an
+// interleaved eval vector `[a0,a1,a2,b0,b1,b2,...]` = 48 bytes. No bit reversal
+// and no slab layout.
+//
+// Note 48 bytes is under one block, so a FRI leaf is a SINGLE compression with
+// `flags = 0x0B` and `block_len = 48` — the chain's degenerate one-block case,
+// same shape as a Merkle parent but at a different length.
+// Twin of `keccak_fri_leaves_ext3` (`keccak.cu:326`).
+extern "C" __global__ void blake3_fri_leaves_ext3(
+    const uint64_t *evals_interleaved,  // 3 * num_evals u64s (ext3 interleaved)
+    uint64_t num_leaves,                 // = num_evals / 2
+    uint8_t *leaves_out) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_leaves) return;
+
+    const uint64_t *left = evals_interleaved + 2 * tid * 3;  // 3 u64s
+    const uint64_t *right = left + 3;
+
+    Blake3Chain h;
+    h.init();
+    #pragma unroll
+    for (int i = 0; i < 3; ++i) h.push_felt(left[i]);
+    #pragma unroll
+    for (int i = 0; i < 3; ++i) h.push_felt(right[i]);
+    h.finalize(leaves_out + tid * 32);
+}
+
+// Row-major ROW-PAIR leaf hashing: the row-major analog of
+// `blake3_leaves_base_row_pair_batched`. Leaf `tid` hashes row
+// `reverse_index(2*tid)` then row `reverse_index(2*tid+1)`, each `m` lanes read
+// contiguously from `data + br * m`. `m` is the row stride in u64s: base trace =
+// column count, ext3 trace = 3 * column count (an ext3 element's components are
+// consecutive, matching `write_bytes_be`).
+// Twin of `keccak256_leaves_base_row_major_row_pair` (`keccak.cu:473`).
+extern "C" __global__ void blake3_leaves_base_row_major_row_pair(
+    const uint64_t *data,
+    uint64_t m,
+    uint64_t num_rows,
+    uint64_t log_num_rows,
+    uint8_t *hashed_leaves_out)
+{
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t num_leaves = num_rows >> 1;
+    if (tid >= num_leaves) return;
+
+    uint64_t br_0 = __brevll(2 * tid) >> (64 - log_num_rows);
+    uint64_t br_1 = __brevll(2 * tid + 1) >> (64 - log_num_rows);
+    const uint64_t *row_0 = data + br_0 * m;
+    const uint64_t *row_1 = data + br_1 * m;
+
+    Blake3Chain h;
+    h.init();
+    for (uint64_t c = 0; c < m; ++c) h.push_felt(row_0[c]);
+    for (uint64_t c = 0; c < m; ++c) h.push_felt(row_1[c]);
+    h.finalize(hashed_leaves_out + tid * 32);
+}
+
+// Column-range variant: each leaf hashes only columns `[col_start, col_end)` of
+// the two bit-reversed rows, while `m` stays the full row stride. Byte layout
+// equals the CPU `commit_rows_bit_reversed_subset` — used for preprocessed
+// tables, whose precomputed and multiplicity column ranges commit to separate
+// Merkle trees over the same row-major LDE.
+// Twin of `keccak256_leaves_base_row_major_row_pair_range` (`keccak.cu:511`).
+extern "C" __global__ void blake3_leaves_base_row_major_row_pair_range(
+    const uint64_t *data,
+    uint64_t m,
+    uint64_t col_start,
+    uint64_t col_end,
+    uint64_t num_rows,
+    uint64_t log_num_rows,
+    uint8_t *hashed_leaves_out)
+{
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t num_leaves = num_rows >> 1;
+    if (tid >= num_leaves) return;
+
+    uint64_t br_0 = __brevll(2 * tid) >> (64 - log_num_rows);
+    uint64_t br_1 = __brevll(2 * tid + 1) >> (64 - log_num_rows);
+    const uint64_t *row_0 = data + br_0 * m;
+    const uint64_t *row_1 = data + br_1 * m;
+
+    Blake3Chain h;
+    h.init();
+    for (uint64_t c = col_start; c < col_end; ++c) h.push_felt(row_0[c]);
+    for (uint64_t c = col_start; c < col_end; ++c) h.push_felt(row_1[c]);
+    h.finalize(hashed_leaves_out + tid * 32);
+}
+
+// ---------------------------------------------------------------------------
 // Merkle parent / level compressors.
 //
 // A parent is ONE compression over the 64 bytes of its two child digests:
@@ -315,6 +657,31 @@ extern "C" __global__ void blake3_compress_probe_default(const uint32_t *h, cons
                                                          const uint32_t *flags, uint64_t n,
                                                          uint32_t *out) {
     compress_probe_body<BLAKE3_ROUNDS>(h, m, t, block_len, flags, n, out);
+}
+
+// `n_words` message words streamed through the device `Blake3Chain`, digest out.
+//
+// ★ This is the harness that lets the device be checked against the COMMITTED
+// KAT TABLE (`CHAIN_KAT_6ROUND`, `chain.rs:304`) rather than only against the
+// host implementation. That distinction is the whole of risk R13: a device port
+// checked solely against the Rust it was transcribed from is checked against
+// nothing. The KAT digests came from a Python oracle, so asserting the device
+// against them closes the loop with an artifact this tree did not produce.
+//
+// Word-granular, because that is all the device ever hashes: every production
+// message is a whole number of 8-byte field elements. The KAT lengths that are
+// not multiples of 4 are therefore unreachable from device code by construction,
+// and the host tests cover them instead.
+//
+// Single-threaded on purpose — same shape as a leaf kernel, one thread hashing
+// one whole message sequentially.
+extern "C" __global__ void blake3_chain_probe(const uint32_t *words, uint64_t n_words,
+                                              uint8_t *out32) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    Blake3Chain h;
+    h.init();
+    for (uint64_t i = 0; i < n_words; ++i) h.push_word(words[i]);
+    h.finalize(out32);
 }
 
 // This cubin's compiled-in round count, so a caller can assert it against the

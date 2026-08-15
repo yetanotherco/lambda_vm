@@ -3,7 +3,7 @@ compile-programs compile-recursion-elfs clean-asm clean-rust clean-bench clean-s
 clean-recursion-elfs clean test test-asm \
 test-rust test-ethrex test-ethrex-offline test-executor test-syscalls test-flamegraph flamegraph-prover test-profile-recursion test-profile-recursion-single test-profile-recursion-multi \
 test-profile-recursion-block recursion-profile-block-input \
-test-fast test-prover test-prover-all test-prover-debug test-disk-spill test-math-cuda test-blake3-host-kat test-cuda-integration test-cuda-fallback \
+test-fast test-prover test-prover-all test-prover-debug test-disk-spill test-math-cuda test-blake3-host-kat test-blake3-second-source test-cuda-integration test-cuda-fallback \
 test-prover-cuda test-prover-comprehensive-cuda \
 bench-math-cuda bench-prover bench-prover-cuda build check clippy fmt lint regen-ethrex-fixtures \
 update-ethrex-fixture-checksums check-ethrex-fixture-checksums ethrex-real-block-fixture \
@@ -573,20 +573,56 @@ test-math-cuda:
 # jobs are merge_group-only). Without this the kernels have no per-PR gate: an
 # edit to blake3.cu that broke the hash would reach the merge queue before
 # anything caught it. `crypto/math-cuda/tests/host_kat/` compiles the real kernel
-# source as host C++ through a shim and runs the official BLAKE3 vectors plus the
-# canonical 6-round table through it.
+# source as host C++ through a shim and runs the official BLAKE3 vectors, the
+# canonical 6-round table, the official multi-block vectors against the
+# `Blake3Chain` construction, and every leaf kernel's byte stream through it.
+#
+# BOTH ROUND COUNTS are built and run. The 6-round arm is the one the campaign
+# ships and the one no other CI job compiles (risk R10), and the round count is a
+# compile-time knob, so a single-arm run would leave the shipping configuration
+# ungated. The two arms differ only in `-DBLAKE3_ROUNDS`, exactly as build.rs
+# drives the cubin from the `blake3-6round` feature.
 #
 # It checks arithmetic ONLY. Whether nvcc accepts the file, and everything about
 # execution rather than arithmetic — grid indexing, the Merkle tail's barriers,
 # device alignment, register pressure — stays with `test-math-cuda`. Necessary,
 # never sufficient.
 HOST_KAT_DIR := crypto/math-cuda/tests/host_kat
+HOST_KAT_CXXFLAGS := -std=c++17 -O2 -Wall -Wno-unknown-pragmas \
+    -I$(HOST_KAT_DIR) -Icrypto/math-cuda/kernels
 test-blake3-host-kat:
 	@mkdir -p target/host_kat
-	$(CXX) -std=c++17 -O2 -Wall -Wno-unknown-pragmas \
-	    -I$(HOST_KAT_DIR) -Icrypto/math-cuda/kernels \
+	$(CXX) $(HOST_KAT_CXXFLAGS) \
 	    -o target/host_kat/blake3_host_kat $(HOST_KAT_DIR)/blake3_host_kat.cpp
 	./target/host_kat/blake3_host_kat
+	@echo
+	@echo "=== rebuilding for the 6-round arm (BLAKE3_ROUNDS=6) ==="
+	$(CXX) $(HOST_KAT_CXXFLAGS) -DBLAKE3_ROUNDS=6 \
+	    -o target/host_kat/blake3_host_kat_6r $(HOST_KAT_DIR)/blake3_host_kat.cpp
+	./target/host_kat/blake3_host_kat_6r
+
+# SECOND-SOURCE validation of the 6-round vectors the KAT above trusts.
+#
+# `test-blake3-host-kat` checks the KERNEL against the committed tables. This
+# checks the TABLES, against upstream BLAKE3's own portable C with its round loop
+# parameterised (`thoughts/blake3/reference-impl/`, a 2 KB reviewable diff in
+# PARAMETERISATION.diff). That reference is a different language and author and —
+# the part that matters — a different message-schedule CONSTRUCTION: it indexes a
+# precomputed MSG_SCHEDULE table where our Rust and CUDA compose one permutation
+# between rounds. A bug in the iterative composition is exactly what a single
+# source cannot catch, and check [C] compares the two constructions directly.
+#
+# It exists because 6-round BLAKE3 is computed by nothing else in the world
+# (assumption A6R), so the 6-round column of every table here rests on oracle
+# agreement rather than on a published vector.
+#
+# ⚠ Checks [D] and [E] were SILENTLY DEAD from P-a Stage 1 — which moved
+# CANONICAL_VECTORS out of `prover/src/lfm/blake3.rs` into `crypto` — until
+# 2026-08-15, because nothing ever ran this: it had no target. That is why it has
+# one now. A ~1 second C compile plus a few seconds of Python; no cargo, no GPU.
+test-blake3-second-source:
+	thoughts/blake3/reference-impl/build.sh
+	python3 thoughts/blake3/reference-impl/check.py
 
 # End-to-end cuda dispatch coverage (requires NVIDIA GPU + nvcc).
 # Asserts the R1-R4 GPU dispatch counters fired on a real prove.

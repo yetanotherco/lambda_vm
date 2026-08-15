@@ -422,16 +422,46 @@ gives. The 7r control says "we are not the standard at 7 rounds"; this says the
 divergence is *the chunking*, because a reference that is standard at 6 rounds
 too still parts from us at exactly the chunk boundary.
 
-That leaves the 6-round table cross-checked by two implementations sharing no
-code, over the whole range the prover actually hashes in. It is still not a
-*published* vector — nothing published computes this — but "regression pin only"
-would now understate it.
+That leaves the 6-round table cross-checked by implementations sharing no code,
+over the whole range the prover actually hashes in. It is still not a *published*
+vector — nothing published computes this — but "regression pin only" would now
+understate it.
 
-⚠ **Fragility to record.** The oracle survives only as `__pycache__` bytecode
-(`blake3_ref.cpython-314.pyc`) in an untracked directory; the `.py` source is
-gone, as is `canonical_6round_vectors.json`. The cross-check was run by loading
-the bytecode directly. The digests below are therefore the durable record of the
-result — re-running it depends on an artifact one `git clean` removes.
+✓ **Reproducible, not merely recorded.** Everything the cross-check needs is
+tracked. `thoughts/blake3/blake3-oracle/` holds `blake3_ref.py` (vendored at
+commit `65025095`), which exposes raw compression entry points — `compress`,
+`compress_cv`, `compress_6round` — as well as `blake3_hash`, alongside
+`canonical_6round_vectors.json`, `official_test_vectors.json` and
+`test_oracle.py`. The cross-check is therefore runnable at compression level, not
+only at full-hash level.
+
+★ **A second source, and it is the stronger one.**
+`thoughts/blake3/reference-impl/` is upstream BLAKE3 1.8.5's own portable C with
+its round loop parameterized; the entire edit is `PARAMETERISATION.diff`, which
+replaces seven unrolled `round_fn` calls with a loop bounded by
+`BLAKE3_ROUNDS_PARAM`. It reproduces `CANONICAL_VECTORS` at both round counts
+(10/10, all 16 words) and the §1.7.5 chain digests at 6 rounds over every length
+up to one chunk, and it diverges past one chunk — P3 confirmed from upstream's
+side. Crucially it encodes the message schedule as an indexed `MSG_SCHEDULE[r]`
+table where the Rust and CUDA compose a single permutation between rounds:
+structurally different expressions of one convention, so agreement
+cross-validates the schedule rather than restating it — a bug in the iterative
+composition is exactly what a single source cannot catch.
+`make test-blake3-second-source` runs it: a ~1 second C compile plus a 5000-case
+randomised differential, no cargo and no GPU.
+
+⚠ **What these vectors do NOT pin, and it is not obvious.** Every message in this
+subsection is hashed with `t = 0`, so nothing here constrains the counter split. A
+compression with `v[12]` and `v[13]` transposed reproduces the official vectors at
+all 65 single-block lengths *and* the multi-block chain vectors, and is caught
+only by `CANONICAL_VECTORS`, whose ten vectors all carry `t ≥ 2^32`: 320 failing
+words against 0 from either official table. Measured, not argued. The chain table
+and the compression table cover different axes and neither is redundant with the
+other — "the standard already covers it" is the reasoning that would retire the
+only check on the counter split. Separately, the `r < rounds - 1` permutation
+guard is **unobservable**: always permuting gives identical output at both round
+counts, because the schedule permuted after the final round is never read. It is
+an optimization, not a convention any known-answer test can validate.
 
 #### 1.7.5 The committed 6-round vectors
 

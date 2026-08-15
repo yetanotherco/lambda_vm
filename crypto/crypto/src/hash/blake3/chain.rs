@@ -396,8 +396,14 @@ pub const CHAIN_KAT_LENS: [usize; 12] = [0, 1, 31, 63, 64, 65, 127, 128, 192, 25
 ///
 /// It is a regression pin — generated from this implementation and committed, so
 /// a later refactor cannot change the construction silently. But it is more than
-/// that, and the difference is worth stating precisely because the compression
-/// vectors it sits next to are weaker.
+/// that, and the difference is worth stating precisely.
+///
+/// It is not "stronger than the compression vectors next door" either: the two
+/// cover different axes. This table pins the FRAMING across blocks — the flag
+/// schedule, the chaining value, the final block's `block_len`. It cannot pin the
+/// counter split, because every message here is hashed with `t = 0`; only
+/// [`CANONICAL_VECTORS`](super::CANONICAL_VECTORS), whose ten vectors all carry
+/// `t >= 2^32`, does that. Neither table is redundant with the other.
 ///
 /// Every entry from length 0 to 1024 was **independently reproduced** by #903's
 /// Python oracle (`thoughts/blake3/blake3-oracle/blake3_ref.py`) evaluated at
@@ -415,10 +421,26 @@ pub const CHAIN_KAT_LENS: [usize; 12] = [0, 1, 31, 63, 64, 65, 127, 128, 192, 25
 /// count needs a reference that is standard at 6 rounds too, which is exactly
 /// what the oracle is.
 ///
-/// ⚠ The oracle survives only as `__pycache__` bytecode in an untracked
-/// directory; its `.py` source is gone. The cross-check is recorded in PA-PLAN
-/// §1.7.5 with the digests, so the result outlives the artifact even though
-/// re-running it may not be possible.
+/// Everything that cross-check needs is tracked, so it is reproducible rather
+/// than merely recorded. `thoughts/blake3/blake3-oracle/` holds the
+/// round-parameterized reference (`blake3_ref.py`, vendored at commit
+/// `65025095`), which exposes raw compression entry points — `compress`,
+/// `compress_cv`, `compress_6round` — as well as `blake3_hash`, alongside
+/// `canonical_6round_vectors.json`, `official_test_vectors.json` and
+/// `test_oracle.py`.
+///
+/// A **second source** sits beside it, and it is the stronger of the two:
+/// `thoughts/blake3/reference-impl/` is upstream BLAKE3 1.8.5's own portable C
+/// with its round loop parameterized, the whole edit being
+/// `PARAMETERISATION.diff`. It reproduces this table at 6 rounds over every
+/// length up to one chunk, and it encodes the message schedule as an indexed
+/// `MSG_SCHEDULE[r]` table where this crate composes a single permutation
+/// between rounds. Those are structurally different expressions of the same
+/// convention, so its agreement cross-validates the schedule instead of
+/// restating it — a bug in the iterative composition is precisely what one
+/// source cannot catch. `make test-blake3-second-source` runs both against these
+/// digests: a ~1 second C compile plus a randomised differential, no cargo and
+/// no GPU.
 ///
 /// The 7-round arm remains the primary anchor and needs none of this:
 /// `blake3_chain_rounds(m, 7)` is checked directly against the `blake3` crate
