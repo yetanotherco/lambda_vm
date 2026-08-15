@@ -40,13 +40,23 @@ pub const FIXTURE_INNER_ELF: &str = "fibonacci";
 
 /// Epoch size, as `log2(cycles)`.
 ///
-/// Measured, not guessed: this guest yields ONE epoch at `log2` 6, 8 and 10, and
-/// two at 4 — so it runs somewhere between 17 and 64 cycles and only a 16-cycle
-/// epoch splits it. A single-epoch fixture would defeat the point, since the
-/// whole target is a CONTINUATION.
+/// Measured, not guessed: this guest runs **15 cycles** — the fixture passes no
+/// private input, so `n` reads as 0 and the loop body never executes — which an
+/// 8-cycle epoch splits into two and a 16-cycle one does not. A single-epoch
+/// fixture would defeat the point, since the whole target is a CONTINUATION,
+/// and `continuation_fixture_generates_two_epochs` is the canary for it.
 ///
-/// Blob sizes for the record: 310,212 bytes at one epoch, 587,188 at two.
-pub const FIXTURE_EPOCH_LOG2: u32 = 4;
+/// ⚠ **The cycle count is a property of the compiled ELF, not of the guest
+/// source.** `bench_vs/lambda/fibonacci` has no dependencies, so nothing in this
+/// workspace moves it — but the pinned nightly and the sysroot do, and a
+/// codegen change of two instructions is enough to cross an epoch boundary at
+/// this size. If the canary reports one epoch, re-measure rather than guess:
+/// run the ELF to completion under `Executor::resume_with_limit` and count the
+/// logs, one per cycle, then set this to a `log2` strictly below the count.
+///
+/// Blob sizes for the record: 947,340 bytes at the two epochs this selects,
+/// against 309,084 for the single epoch a 16-cycle one collapses to.
+pub const FIXTURE_EPOCH_LOG2: u32 = 3;
 
 /// Proof options the fixture is proved under: the `min` preset, which is the
 /// cheapest to generate. It is explicitly NOT a secure parameter set — this
