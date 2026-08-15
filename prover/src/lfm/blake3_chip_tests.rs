@@ -82,7 +82,18 @@ fn digest_bytes(public: &[(u32, LfmWord)]) -> [u8; 32] {
 /// tail is zero-padded (1, 31, 63); 64 bytes is the parent form; 65 moves
 /// `CHUNK_END | ROOT` off block 0; an exact multiple emits no spurious final
 /// block (128); interior blocks carry no flags at all (192, 256).
-const FRAMING_LENS: [usize; 10] = [0, 1, 31, 63, 64, 65, 127, 128, 192, 256];
+///
+/// ★ **Through the chunk boundary, deliberately.** The list stopped at 256,
+/// which left the construction's most consequential seam untested by any digest
+/// comparison: at 1024 this chain is still standard BLAKE3, and past it the
+/// construction knowingly leaves the standard (the standard would start chunk 1
+/// with `t = 1` and a reset chaining value; this keeps one unbounded chunk).
+/// 1023/1024/1025 and 1087/1088 bracket that seam from both sides, 511/512/513
+/// bracket an interior multiple, and 2048 is two chunks past it. A framing bug
+/// that only bites after the first chunk would have passed the old list.
+const FRAMING_LENS: [usize; 19] = [
+    0, 1, 31, 63, 64, 65, 127, 128, 192, 256, 511, 512, 513, 1023, 1024, 1025, 1087, 1088, 2048,
+];
 
 // =========================================================================
 // The framing, against the host hash
@@ -865,4 +876,283 @@ fn the_layout_assigns_every_column_exactly_once() {
         "columns assigned to nothing: {unassigned:?}"
     );
     assert!(doubled.is_empty(), "columns assigned twice: {doubled:?}");
+}
+
+// =========================================================================
+// ★ The transcript replay, against the REAL host transcript
+// =========================================================================
+//
+// ## Why the single-coordinate tests above are not enough
+//
+// `the_configurations_draw_different_numbers_of_candidates` checks that ONE
+// base coordinate consumes 16 bytes under BLAKE3 and 8 under keccak, and
+// `the_in_range_predicate_is_canonicity_as_a_bit` checks the select's predicate
+// at its corners. Both are structurally blind to the bug that matters, and the
+// blindness is demonstrable rather than suspected: mutate the replay's schedule
+// from n = 2 back to n = 1 and the FIRST challenge is still correct — candidate
+// 0 is in range with probability 1 − 2⁻³², so it is the answer either way. The
+// divergence appears at the SECOND challenge, because a schedule that consumed
+// 8 bytes instead of 16 reads it from the wrong buffer offset and refills at
+// the wrong point.
+//
+// ✓ EXECUTED, not argued: forcing `candidates_per_coordinate` to 1 for the
+// BLAKE3 arm leaves `the_in_range_predicate_is_canonicity_as_a_bit` PASSING and
+// fails the oracle below on `blake3: second base challenge` — the first is
+// still right. That is the whole case for this test existing.
+//
+// So a consumption-schedule bug is invisible to any test that draws once. What
+// sees it is a SCRIPT — several draws of different kinds, an absorb in the
+// middle to invalidate the buffer, a raw `sample()` whose reversed digest is
+// re-absorbed — with every published value compared against the real
+// `DefaultTranscript` under the same configuration. That is what follows, and
+// it is the BLAKE3 counterpart of the keccak oracle in
+// `machine_tests::transcript_replay_matches_the_host`.
+
+/// The script's seed and absorb shapes. `ABSORB_A` is a digest-sized absorb and
+/// `ABSORB_B` a rate-sized one, so the segment crosses a block boundary between
+/// the two draw runs under both hashes.
+const ORACLE_SEED: &[u8] = b"lfm-transcript-replay-v0";
+const ORACLE_ABSORB_A: usize = 32;
+const ORACLE_ABSORB_B: usize = 136;
+const ORACLE_QUERY_BITS: usize = 20;
+
+fn oracle_absorbs() -> (Vec<u8>, Vec<u8>) {
+    let a = (0..ORACLE_ABSORB_A)
+        .map(|i| (i as u8).wrapping_mul(31).wrapping_add(7))
+        .collect();
+    let b = (0..ORACLE_ABSORB_B)
+        .map(|i| (i as u8).wrapping_mul(17).wrapping_add(3))
+        .collect();
+    (a, b)
+}
+
+fn oracle_arenas() -> Vec<Vec<LfmWord>> {
+    let (a, b) = oracle_absorbs();
+    let mut bytes = a;
+    bytes.extend_from_slice(&b);
+    vec![pack_stream(&bytes).into_iter().map(base_word).collect()]
+}
+
+/// The script, emitted under a chosen wrap hash.
+///
+/// Deliberately mixed: two base draws, an extension draw (three coordinates, so
+/// the schedule is exercised across a refill), an absorb that invalidates the
+/// output buffer, a `sample_u64` draw (which takes the RAW candidate stream in
+/// both configurations and must therefore NOT change), a further base draw, a
+/// raw `sample()` whose reversed digest becomes the next segment, and one last
+/// base draw on the far side of it.
+fn oracle_replay_program(hash: WrapHash) -> super::compiler::LfmProgram {
+    use super::builder::Felt;
+    use super::edsl::bits_to_felt;
+    use super::keccak_host::BYTES_PER_HALF;
+    use super::transcript_replay::TranscriptReplay;
+
+    let total_halves = ((ORACLE_ABSORB_A + ORACLE_ABSORB_B) / BYTES_PER_HALF) as u32;
+    let halves_a = ORACLE_ABSORB_A / BYTES_PER_HALF;
+
+    let mut b = LfmBuilder::new().with_wrap_hash(hash);
+    let arena = b.declare_arena(total_halves);
+    let halves: Vec<Felt> = (0..total_halves).map(|i| b.hint_felt(arena, i)).collect();
+    let (absorb_a, absorb_b) = halves.split_at(halves_a);
+
+    let mut t = TranscriptReplay::new(ORACLE_SEED);
+    t.append_halves(absorb_a);
+    let f0 = t.sample_felt(&mut b);
+    let f1 = t.sample_felt(&mut b);
+    let e = t.sample_ext(&mut b);
+    t.append_halves(absorb_b);
+    let q = t.sample_u64_pow2(&mut b, ORACLE_QUERY_BITS);
+    let qf = bits_to_felt(&mut b, &q);
+    let f2 = t.sample_felt(&mut b);
+    let s = t.sample(&mut b);
+    let f3 = t.sample_felt(&mut b);
+
+    b.public(f0.as_cell());
+    b.public(f1.as_cell());
+    b.public(e.as_cell());
+    b.public(qf.as_cell());
+    b.public(f2.as_cell());
+    b.public(s[0]);
+    b.public(s[1]);
+    b.public(f3.as_cell());
+    compile(b.finish())
+}
+
+struct OracleExpectation {
+    f0: FE,
+    f1: FE,
+    e: [FE; 3],
+    q: u64,
+    f2: FE,
+    s: [u8; 32],
+    f3: FE,
+}
+
+/// The oracle: the REAL `DefaultTranscript` under configuration `T`, driven
+/// through the same script.
+///
+/// Instantiated over the BASE field so `sample_field_element` is one coordinate,
+/// matching the machine's `sample_felt`; the extension draw in the middle is
+/// three consecutive base draws, which is what the host's ext sampler does
+/// (`core::array::from_fn` evaluates in index order).
+fn oracle_expectation<T: crypto::fiat_shamir::transcript_hash::TranscriptHash>() -> OracleExpectation
+{
+    use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+    use crypto::fiat_shamir::is_transcript::IsTranscript;
+
+    let (a, b) = oracle_absorbs();
+    let mut h = DefaultTranscript::<GoldilocksField, T>::new(ORACLE_SEED);
+    h.append_bytes(&a);
+    let f0 = h.sample_field_element();
+    let f1 = h.sample_field_element();
+    let e: [FE; 3] = core::array::from_fn(|_| h.sample_field_element());
+    h.append_bytes(&b);
+    let q = h.sample_u64(1 << ORACLE_QUERY_BITS);
+    let f2 = h.sample_field_element();
+    let s = h.sample();
+    let f3 = h.sample_field_element();
+    OracleExpectation {
+        f0,
+        f1,
+        e,
+        q,
+        f2,
+        s,
+        f3,
+    }
+}
+
+fn check_against_oracle(public: &[(u32, LfmWord)], x: &OracleExpectation, what: &str) {
+    assert_eq!(public.len(), 8, "{what}: published word count");
+    assert_eq!(public[0].1[0], x.f0, "{what}: first base challenge");
+    assert_eq!(public[1].1[0], x.f1, "{what}: second base challenge");
+    for i in 0..3 {
+        assert_eq!(public[2].1[i], x.e[i], "{what}: ext coordinate {i}");
+    }
+    assert_eq!(public[3].1[0], FE::from(x.q), "{what}: sample_u64 draw");
+    assert_eq!(public[4].1[0], x.f2, "{what}: post-absorb challenge");
+    assert_eq!(digest_bytes(&public[5..7]), x.s, "{what}: raw sample()");
+    assert_eq!(public[7].1[0], x.f3, "{what}: post-sample challenge");
+}
+
+/// HONEST CONTROL: the keccak arm of the same harness reproduces the host.
+///
+/// Without it a BLAKE3 failure below says nothing — it could be the harness,
+/// the script, or the comparison. This is also the statement that threading the
+/// wrap hash through `TranscriptReplay` did not move the default configuration.
+#[test]
+fn the_keccak_replay_matches_the_host_transcript() {
+    use crypto::fiat_shamir::transcript_hash::KeccakTranscriptHash;
+    let exec = execute(
+        &oracle_replay_program(WrapHash::Keccak),
+        &oracle_arenas(),
+        &TestPermutation,
+    )
+    .expect("the keccak replay must execute");
+    check_against_oracle(
+        &exec.public_words,
+        &oracle_expectation::<KeccakTranscriptHash>(),
+        "keccak",
+    );
+}
+
+/// ★ THE ORACLE: the BLAKE3 configuration's in-machine replay reproduces the
+/// host `Blake3TranscriptHash`, value for value.
+///
+/// This is the one test that exercises the three Stage-5 transcript changes
+/// TOGETHER — the n = 2 consumption schedule across refill boundaries, the
+/// select chain that picks the first in-range candidate, and the BLAKE3 squeeze
+/// with its reversed digest re-absorbed as the next segment. Any one of them
+/// wrong by a byte moves a published challenge, and the module note above says
+/// why no single-coordinate test can see it.
+#[test]
+fn the_blake3_replay_matches_the_host_transcript() {
+    use crypto::fiat_shamir::transcript_hash::Blake3TranscriptHash;
+    let exec = execute(
+        &oracle_replay_program(WrapHash::Blake3),
+        &oracle_arenas(),
+        &TestPermutation,
+    )
+    .expect("the blake3 replay must execute");
+    check_against_oracle(
+        &exec.public_words,
+        &oracle_expectation::<Blake3TranscriptHash>(),
+        "blake3",
+    );
+}
+
+/// NON-VACUITY for the pair above: the two configurations must publish
+/// DIFFERENT values, or both tests would pass against one oracle.
+#[test]
+fn the_two_replays_publish_different_challenges() {
+    let keccak = execute(
+        &oracle_replay_program(WrapHash::Keccak),
+        &oracle_arenas(),
+        &TestPermutation,
+    )
+    .expect("keccak replay");
+    let blake3 = execute(
+        &oracle_replay_program(WrapHash::Blake3),
+        &oracle_arenas(),
+        &TestPermutation,
+    )
+    .expect("blake3 replay");
+    assert_ne!(
+        keccak.public_words, blake3.public_words,
+        "the two transcript configurations must not agree on this script"
+    );
+}
+
+/// The select chain's RULE is the host's fallback rule, at every pattern of two
+/// candidates including both-miss.
+///
+/// ⚠ What this pins and what it does not. It compares the host's
+/// `candidate_under_fixed_schedule` against a transcription of the rule
+/// `sample_felt` emits — it is a statement about the SPEC the emitter follows,
+/// not about the instructions it emits. That the emitted instructions really
+/// implement this rule is the oracle test above, end to end. Both are needed:
+/// the oracle cannot reach the both-miss corner (probability ≈ 2⁻⁶⁴), and this
+/// cannot see an emitter that computes the right rule over the wrong operands.
+#[test]
+fn the_select_chain_rule_is_the_hosts_fallback() {
+    use math::field::traits::HasDefaultTranscript;
+    const P: u64 = 0xFFFF_FFFF_0000_0001;
+
+    // Verbatim from `default_transcript::candidate_under_fixed_schedule`, which
+    // is `pub(crate)` in `crypto` and so cannot be called from here.
+    fn candidate_under_fixed_schedule<Fld: HasDefaultTranscript>(
+        n: usize,
+        mut next: impl FnMut() -> u64,
+    ) -> u64 {
+        let mut chosen: Option<u64> = None;
+        let mut last = 0u64;
+        for _ in 0..n {
+            let candidate = next();
+            last = candidate;
+            if chosen.is_none() && Fld::candidate_in_range(candidate) {
+                chosen = Some(candidate);
+            }
+        }
+        chosen.unwrap_or(last)
+    }
+
+    let vectors: [(u64, u64, &str); 4] = [
+        (7, 9, "both in range -> the first"),
+        (P + 5, 9, "the first misses -> the second"),
+        (7, P + 5, "the second misses -> still the first"),
+        (
+            P + 5,
+            P + 11,
+            "both miss -> the LAST, which is then rejected",
+        ),
+    ];
+    for (c0, c1, what) in vectors {
+        let mut it = [c0, c1].into_iter();
+        let host = candidate_under_fixed_schedule::<GoldilocksField>(2, || {
+            it.next().expect("two candidates")
+        });
+        // `sample_felt`'s rule, transcribed: the first in range, else the last.
+        let machine = if c0 < P { c0 } else { c1 };
+        assert_eq!(host, machine, "{what}: c0={c0:#x} c1={c1:#x}");
+    }
 }
