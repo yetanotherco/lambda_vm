@@ -19,11 +19,12 @@
 //! running word. So the early stop is `min(blowup_log + k, h_min)`.
 
 use crypto::fiat_shamir::is_transcript::{IsStarkTranscript, IsTranscript};
+use crypto::merkle_tree::merkle::MerkleTree;
 use math::field::element::FieldElement;
 use math::field::traits::{IsFFTField, IsField, IsSubFieldOf};
 use math::traits::AsBytes;
 
-use crate::config::{FriLayerMerkleTree, FriLayerMerkleTreeBackend};
+use crate::config::StarkHash;
 use crate::fri::fri_commitment::FriLayer;
 use crate::fri::fri_functions::{
     compute_coset_twiddles_inv, fold_evaluations_in_place, update_twiddles_in_place,
@@ -188,21 +189,25 @@ impl BatchedFriLayout {
 /// appended to the transcript, exactly as
 /// [`crate::fri::commit_phase_from_evaluations`] does — not folded down to a
 /// single scalar.
+///
+/// Layer trees are built with `H::Pair`, the same commitment configuration the
+/// unbatched [`crate::fri::commit_phase_from_evaluations`] uses — so a batched
+/// prover and the verifier that authenticates its openings through `H::Batched`
+/// agree on the hash by naming one configuration, not by two call sites
+/// coinciding.
 #[allow(clippy::type_complexity)]
-pub fn batched_commit_phase<F, E, T>(
+pub fn batched_commit_phase<F, E, T, H>(
     mut combined: Vec<Option<Vec<FieldElement<E>>>>,
     transcript: &mut T,
     coset_offset: &FieldElement<F>,
     blowup_log: u32,
     final_poly_log_degree: u32,
-) -> (
-    Vec<FieldElement<E>>,
-    Vec<FriLayer<E, FriLayerMerkleTreeBackend<E>>>,
-)
+) -> (Vec<FieldElement<E>>, Vec<FriLayer<E, H::Pair<E>>>)
 where
     F: IsFFTField + IsSubFieldOf<E> + 'static,
     E: IsField + 'static + Send + Sync,
     T: IsStarkTranscript<E, F> + Clone,
+    H: StarkHash,
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
 {
@@ -241,7 +246,7 @@ where
             .chunks_exact(2)
             .map(|chunk| [chunk[0].clone(), chunk[1].clone()])
             .collect();
-        let merkle_tree = FriLayerMerkleTree::build(&leaves)
+        let merkle_tree = MerkleTree::<H::Pair<E>>::build(&leaves)
             .expect("FRI batched commit: Merkle tree construction must succeed");
         let root = merkle_tree.root;
         fri_layer_list.push(FriLayer::new(&running, merkle_tree));
@@ -460,6 +465,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::KeccakStarkHash;
     use crate::fri::commit_phase_from_evaluations;
     use crate::fri::fri_functions::{compute_coset_twiddles_inv, fold_evaluations_in_place};
     use crypto::fiat_shamir::default_transcript::DefaultTranscript;
@@ -573,8 +579,13 @@ mod tests {
         let mut transcript = Transcript::new(b"batched_fri_test");
         let mut transcript_check = transcript.clone();
 
-        let (_coeffs, layers) =
-            batched_commit_phase(combined, &mut transcript, &coset_offset, blowup_log, k);
+        let (_coeffs, layers) = batched_commit_phase::<_, _, _, KeccakStarkHash>(
+            combined,
+            &mut transcript,
+            &coset_offset,
+            blowup_log,
+            k,
+        );
 
         // Terminal at min(blowup_log + k, h_min) = min(2, 3) = 2, so folds run
         // 4 -> 2: two folds, one committed layer.
@@ -621,22 +632,31 @@ mod tests {
         let inv_twiddles = compute_coset_twiddles_inv::<GoldilocksField>(&coset_offset, 1 << h);
 
         let mut t_unbatched = Transcript::new(b"terminal_parity");
-        let (unbatched_coeffs, unbatched_layers) =
-            commit_phase_from_evaluations::<GoldilocksField, GoldilocksField, Transcript>(
-                evals.clone(),
-                &mut t_unbatched,
-                &coset_offset,
-                1 << h,
-                blowup_log,
-                k,
-                &inv_twiddles,
-            );
+        let (unbatched_coeffs, unbatched_layers) = commit_phase_from_evaluations::<
+            GoldilocksField,
+            GoldilocksField,
+            Transcript,
+            KeccakStarkHash,
+        >(
+            evals.clone(),
+            &mut t_unbatched,
+            &coset_offset,
+            1 << h,
+            blowup_log,
+            k,
+            &inv_twiddles,
+        );
 
         let mut combined: Vec<Option<Vec<FE>>> = vec![None; h + 1];
         combined[h] = Some(evals);
         let mut t_batched = Transcript::new(b"terminal_parity");
-        let (batched_coeffs, batched_layers) =
-            batched_commit_phase(combined, &mut t_batched, &coset_offset, blowup_log, k);
+        let (batched_coeffs, batched_layers) = batched_commit_phase::<_, _, _, KeccakStarkHash>(
+            combined,
+            &mut t_batched,
+            &coset_offset,
+            blowup_log,
+            k,
+        );
 
         // total_folds = 10 - (1 + 5) = 4, so 3 committed layers — not h_max-1 = 9.
         assert_eq!(unbatched_layers.len(), 3);
@@ -688,8 +708,13 @@ mod tests {
         combined[7] = Some((0..128u64).map(|i| FE::from(i + 1)).collect());
         combined[4] = Some((0..16u64).map(|i| FE::from(i * 3 + 5)).collect());
         let mut transcript = Transcript::new(b"floor_test");
-        let (coeffs, layers) =
-            batched_commit_phase(combined, &mut transcript, &coset_offset, blowup_log, k);
+        let (coeffs, layers) = batched_commit_phase::<_, _, _, KeccakStarkHash>(
+            combined,
+            &mut transcript,
+            &coset_offset,
+            blowup_log,
+            k,
+        );
         let layout = BatchedFriLayout::new(7, 4, blowup_log, k);
         assert_eq!(layers.len(), layout.num_committed);
         assert_eq!(coeffs.len(), 1usize << layout.effective_k);

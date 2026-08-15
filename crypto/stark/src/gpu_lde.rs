@@ -33,7 +33,7 @@ use math::field::goldilocks::GoldilocksField;
 use math::field::traits::{IsFFTField, IsField, IsSubFieldOf};
 use math::traits::AsBytes;
 
-use crate::config::{Commitment, FriLayerMerkleTreeBackend, KeccakTreeBackend};
+use crate::config::{Commitment, KeccakTreeBackend};
 use crate::domain::Domain;
 use crate::fri::fri_commitment::FriLayer;
 use crate::fri::fri_decommit::FriDecommitment;
@@ -2171,7 +2171,7 @@ where
 /// it would have produced had the GPU never been tried. This requires the
 /// concrete transcript type to support snapshot semantics via `Clone`.
 #[allow(clippy::type_complexity)]
-pub(crate) fn try_fri_commit_gpu<F, E, T>(
+pub(crate) fn try_fri_commit_gpu<F, E, T, B>(
     evals: &[FieldElement<E>],
     transcript: &mut T,
     coset_offset: &FieldElement<F>,
@@ -2179,16 +2179,14 @@ pub(crate) fn try_fri_commit_gpu<F, E, T>(
     blowup_log: u32,
     final_poly_log_degree: u32,
     inv_twiddles: &[FieldElement<F>],
-) -> Option<(
-    Vec<FieldElement<E>>,
-    Vec<FriLayer<E, FriLayerMerkleTreeBackend<E>>>,
-)>
+) -> Option<(Vec<FieldElement<E>>, Vec<FriLayer<E, B>>)>
 where
     F: IsFFTField + IsField + IsSubFieldOf<E> + 'static,
     E: IsField + 'static + Send + Sync,
     FieldElement<F>: AsBytes,
     FieldElement<E>: AsBytes,
     T: IsStarkTranscript<E, F> + Clone,
+    B: KeccakTreeBackend,
 {
     // GPU drives the early-termination FRI commit phase, mirroring
     // `commit_phase_from_evaluations`: for each committed layer (sample zeta,
@@ -2233,7 +2231,7 @@ where
         Err(_) => return None,
     };
     // Host-evals entry: the caller works with host copies, keep draining them.
-    fri_commit_gpu_drive(
+    fri_commit_gpu_drive::<F, E, T, B>(
         state,
         transcript,
         coset_offset,
@@ -2247,7 +2245,7 @@ where
 /// [`try_fri_commit_gpu`] entered from a device-resident DEEP codeword
 /// (already in FRI order): no evals H2D at all.
 #[allow(clippy::type_complexity)]
-pub(crate) fn try_fri_commit_gpu_from_dev<F, E, T>(
+pub(crate) fn try_fri_commit_gpu_from_dev<F, E, T, B>(
     codeword: math_cuda::deep::GpuDeepCodeword,
     transcript: &mut T,
     coset_offset: &FieldElement<F>,
@@ -2255,16 +2253,14 @@ pub(crate) fn try_fri_commit_gpu_from_dev<F, E, T>(
     final_poly_log_degree: u32,
     inv_twiddles: &[FieldElement<F>],
     want_host: bool,
-) -> Option<(
-    Vec<FieldElement<E>>,
-    Vec<FriLayer<E, FriLayerMerkleTreeBackend<E>>>,
-)>
+) -> Option<(Vec<FieldElement<E>>, Vec<FriLayer<E, B>>)>
 where
     F: IsFFTField + IsField + IsSubFieldOf<E> + 'static,
     E: IsField + 'static + Send + Sync,
     FieldElement<F>: AsBytes,
     FieldElement<E>: AsBytes,
     T: IsStarkTranscript<E, F> + Clone,
+    B: KeccakTreeBackend,
 {
     if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
         return None;
@@ -2291,7 +2287,7 @@ where
         Ok(s) => s,
         Err(_) => return None,
     };
-    fri_commit_gpu_drive(
+    fri_commit_gpu_drive::<F, E, T, B>(
         state,
         transcript,
         coset_offset,
@@ -2307,7 +2303,7 @@ where
 /// fold and CPU coefficient extraction. Restores the transcript and returns
 /// `None` on any mid-loop cudarc failure so the CPU path reruns cleanly.
 #[allow(clippy::type_complexity)]
-fn fri_commit_gpu_drive<F, E, T>(
+fn fri_commit_gpu_drive<F, E, T, B>(
     mut state: math_cuda::fri::FriCommitState,
     transcript: &mut T,
     coset_offset: &FieldElement<F>,
@@ -2315,16 +2311,14 @@ fn fri_commit_gpu_drive<F, E, T>(
     blowup_log: u32,
     final_poly_log_degree: u32,
     want_host: bool,
-) -> Option<(
-    Vec<FieldElement<E>>,
-    Vec<FriLayer<E, FriLayerMerkleTreeBackend<E>>>,
-)>
+) -> Option<(Vec<FieldElement<E>>, Vec<FriLayer<E, B>>)>
 where
     F: IsFFTField + IsField + IsSubFieldOf<E> + 'static,
     E: IsField + 'static + Send + Sync,
     FieldElement<F>: AsBytes,
     FieldElement<E>: AsBytes,
     T: IsStarkTranscript<E, F> + Clone,
+    B: KeccakTreeBackend,
 {
     // The unsafe zeta reads below reinterpret `FieldElement<E>` as 3 u64:
     // every caller gates the tower, but assert here so a future caller with
@@ -2356,8 +2350,7 @@ where
         return None;
     }
     let num_committed = layout.num_committed;
-    let mut fri_layer_list: Vec<FriLayer<E, FriLayerMerkleTreeBackend<E>>> =
-        Vec::with_capacity(num_committed);
+    let mut fri_layer_list: Vec<FriLayer<E, B>> = Vec::with_capacity(num_committed);
 
     for _layer_idx in 0..num_committed {
         // <<<< Receive challenge zeta_k
@@ -2382,7 +2375,7 @@ where
             .map(|v| u64_to_ext3_vec::<E>(&v))
             .unwrap_or_default();
         let root = dev_tree.root;
-        let merkle_tree = MerkleTree::<FriLayerMerkleTreeBackend<E>>::from_root(root);
+        let merkle_tree = MerkleTree::<B>::from_root(root);
         // Retain the device evals only when no host copy exists (device-only):
         // with a host copy the query phase reads it, and the retained buffer
         // would be ~24 bytes/LDE-row of dead VRAM per table.
@@ -2442,13 +2435,14 @@ where
 ///
 /// Returns None when there are no layers or the layers are host trees (CPU
 /// commit), so the caller falls back to the host walk.
-pub(crate) fn try_fri_query_phase_gpu<E>(
-    fri_layers: &[FriLayer<E, FriLayerMerkleTreeBackend<E>>],
+pub(crate) fn try_fri_query_phase_gpu<E, B>(
+    fri_layers: &[FriLayer<E, B>],
     iotas: &[usize],
 ) -> Option<Vec<FriDecommitment<E>>>
 where
     E: IsField + 'static,
     FieldElement<E>: AsBytes + Sync + Send,
+    B: KeccakTreeBackend,
 {
     if fri_layers.is_empty() {
         return None;

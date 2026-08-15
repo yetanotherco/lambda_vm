@@ -151,6 +151,23 @@ pub trait StarkHash: Send + Sync + 'static {
         FieldElement<F>: AsBytes + Sync + Send;
 
     /// The FRI-layer backend: one leaf per fixed pair, no `Vec` per leaf.
+    ///
+    /// Under `cuda` this carries the same [`KeccakTreeBackend`] obligation
+    /// [`Self::Batched`] does, and for the same reason: `gpu_lde`'s FRI commit
+    /// drives the whole commit phase on device, hashing every layer tree with
+    /// the keccak kernels and only *labelling* the result with this type. A cuda
+    /// build cannot honour any other configuration for FRI layers either, so the
+    /// bound says so at compile time rather than letting the label be wrong.
+    #[cfg(feature = "cuda")]
+    type Pair<F>: IsMerkleTreeBackend<Node = Commitment, Data = [FieldElement<F>; 2]>
+        + KeccakTreeBackend
+        + 'static
+    where
+        F: IsField + 'static,
+        FieldElement<F>: AsBytes + Sync + Send;
+
+    /// The FRI-layer backend: one leaf per fixed pair, no `Vec` per leaf.
+    #[cfg(not(feature = "cuda"))]
     type Pair<F>: IsMerkleTreeBackend<Node = Commitment, Data = [FieldElement<F>; 2]> + 'static
     where
         F: IsField + 'static,
@@ -197,22 +214,17 @@ impl StarkHash for KeccakStarkHash {
 /// compression in the framing the device kernels implement
 /// (`crypto::hash::blake3::chain`, PA-PLAN §1.7 P2).
 ///
-/// # What this is not wired to yet
+/// # What selects it
 ///
-/// Nothing selects it: every `Prover` and `Verifier` alias still resolves to
-/// [`KeccakStarkHash`], and [`COMMITMENT_HASH`] still describes the aliases. It
-/// is reachable by naming it, which is what the commitment-layer tests do.
+/// Nothing, by default: every `Prover` and `Verifier` alias resolves to
+/// [`KeccakStarkHash`], and [`COMMITMENT_HASH`] describes those aliases. It is
+/// reachable by naming it — `GenericProver` and `GenericVerifier` at this
+/// configuration prove and verify a full STARK, FRI layer trees included.
 ///
-/// A full prove→verify under it does **not** work yet, for a specific reason
-/// rather than a general one: `fri/` is not parameterized over the
-/// configuration. `commit_phase_from_evaluations` builds FRI-layer trees with
-/// the concrete `FriLayerMerkleTreeBackend` alias (`fri/mod.rs:11, 41, 105,
-/// 154`) while the verifier authenticates those openings through `H::Batched`,
-/// so a blake3 `H` would have the prover build keccak FRI trees and the verifier
-/// check them with blake3 — every honest proof rejecting at its first FRI query.
-/// Loud rather than silent, which is the good outcome, but threading the
-/// configuration through `fri/` is required work and is not done here (PA-PLAN
-/// §4.1, Stage 2).
+/// What it does **not** cover yet is the rest of the stack: the transcript and
+/// grinding are keccak under both configurations (PA-PLAN Stage 3), and the
+/// RV64 guest has no BLAKE3 precompile (Stage 4), so a guest verifying a
+/// BLAKE3-committed proof hashes in software.
 #[cfg(not(feature = "cuda"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Blake3StarkHash;

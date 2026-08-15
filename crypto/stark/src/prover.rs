@@ -2074,7 +2074,12 @@ pub trait IsStarkProver<
             &trace_term_coeffs,
         )
         .and_then(|dw| {
-            crate::gpu_lde::try_fri_commit_gpu_from_dev(
+            crate::gpu_lde::try_fri_commit_gpu_from_dev::<
+                Field,
+                FieldExtension,
+                _,
+                H::Pair<FieldExtension>,
+            >(
                 dw,
                 transcript,
                 &coset_offset,
@@ -2088,12 +2093,7 @@ pub trait IsStarkProver<
         #[allow(clippy::type_complexity)]
         let precomputed_fri: Option<(
             Vec<FieldElement<FieldExtension>>,
-            Vec<
-                crate::fri::fri_commitment::FriLayer<
-                    FieldExtension,
-                    crate::config::FriLayerMerkleTreeBackend<FieldExtension>,
-                >,
-            >,
+            Vec<crate::fri::fri_commitment::FriLayer<FieldExtension, H::Pair<FieldExtension>>>,
         )> = None;
         #[cfg(feature = "instruments")]
         let mut other_dur_1 = t_sub.elapsed();
@@ -2137,7 +2137,7 @@ pub trait IsStarkProver<
             // FRI commit phase from pre-computed evaluations
             #[cfg(feature = "instruments")]
             let t_sub = Instant::now();
-            let res = fri::commit_phase_from_evaluations(
+            let res = fri::commit_phase_from_evaluations::<Field, FieldExtension, _, H>(
                 lde_evals,
                 transcript,
                 &coset_offset,
@@ -2168,7 +2168,7 @@ pub trait IsStarkProver<
         let number_of_queries = air.options().fri_number_of_queries;
         let iotas = Self::sample_query_indexes(number_of_queries, domain, transcript);
 
-        let query_list = fri::query_phase(&fri_layers, &iotas);
+        let query_list = fri::query_phase::<FieldExtension, H>(&fri_layers, &iotas);
 
         let fri_layers_merkle_roots: Vec<_> = fri_layers
             .iter()
