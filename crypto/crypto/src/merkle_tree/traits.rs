@@ -56,4 +56,45 @@ where
     /// Hash `a ‖ b` without materializing the concatenation. Equals
     /// `hash_data(&[a, b].concat())`.
     fn hash_data_from_slices(a: &[FieldElement<F>], b: &[FieldElement<F>]) -> Self::Node;
+
+    /// The incremental form of the same leaf hash. See [`IsLeafHasher`].
+    ///
+    /// `Send` because there is one of these per leaf and the base layer of a real
+    /// epoch has millions: absorbing them is parallel across leaves, exactly as
+    /// the one-shot leaf hashing is.
+    type LeafHasher: IsLeafHasher<F, Node = Self::Node> + Send;
+
+    /// A leaf hasher that has absorbed nothing yet.
+    fn leaf_hasher() -> Self::LeafHasher;
+}
+
+/// One leaf's hash, absorbed in an arbitrary number of updates.
+///
+/// [`IsStreamingLeafBackend::hash_data_from_slices`] covers the two-slice case,
+/// which is every leaf the per-table trees hash. A mixed-height MMCS leaf is
+/// different: it concatenates one row pair per matrix at that height, and a
+/// prover that wants to produce those matrices ONE AT A TIME — absorbing each
+/// into the leaves and dropping its buffer — cannot hand over all the slices at
+/// once. This is the API that lets it, and the memory it costs is one hasher
+/// state per leaf rather than one LDE per matrix.
+///
+/// # Contract
+///
+/// Splitting is free: for any partition of a leaf's elements into consecutive
+/// chunks, updating with each chunk in order and finalizing must equal
+/// [`IsMerkleTreeBackend::hash_data`] over the whole. A backend whose framing
+/// depended on where the updates fell would produce leaves no verifier could
+/// re-derive, since the verifier only ever sees the concatenation.
+pub trait IsLeafHasher<F>
+where
+    F: IsField,
+    FieldElement<F>: AsBytes,
+{
+    type Node;
+
+    /// Absorb the next consecutive run of the leaf's elements.
+    fn update(&mut self, data: &[FieldElement<F>]);
+
+    /// Finish the leaf.
+    fn finalize(self) -> Self::Node;
 }

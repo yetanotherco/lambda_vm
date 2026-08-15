@@ -92,3 +92,26 @@ pub(crate) fn par_try_for_each_mut<T: Send, E: Send>(
         slice.iter_mut().try_for_each(f)
     }
 }
+
+/// Run `f(i, &mut item)` for each element of `slice` with its index. Parallel
+/// when `feature = "parallel"`, sequential otherwise.
+pub(crate) fn par_for_each_mut_indexed<T: Send>(
+    slice: &mut [T],
+    f: impl Fn(usize, &mut T) + Sync + Send,
+) {
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        slice
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(i, item)| f(i, item));
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        slice
+            .iter_mut()
+            .enumerate()
+            .for_each(|(i, item)| f(i, item));
+    }
+}

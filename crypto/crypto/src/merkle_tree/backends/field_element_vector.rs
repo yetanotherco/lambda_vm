@@ -1,7 +1,7 @@
 use core::marker::PhantomData;
 
 use crate::hash::poseidon::Poseidon;
-use crate::merkle_tree::traits::{IsMerkleTreeBackend, IsStreamingLeafBackend};
+use crate::merkle_tree::traits::{IsLeafHasher, IsMerkleTreeBackend, IsStreamingLeafBackend};
 use alloc::vec::Vec;
 use digest::{Digest, Output};
 use math::{
@@ -206,7 +206,7 @@ where
 /// a commitment configuration rather than by name. Both bodies go through
 /// [`hash_streamed`], which is where the absorbed byte layout is defined, so
 /// they agree with `hash_data` by construction.
-impl<F, D: Digest + 'static, const NUM_BYTES: usize> IsStreamingLeafBackend<F>
+impl<F, D: Digest + Send + 'static, const NUM_BYTES: usize> IsStreamingLeafBackend<F>
     for FieldElementVectorBackend<F, D, NUM_BYTES>
 where
     F: IsField,
@@ -224,6 +224,57 @@ where
                 element.stream_bytes(sink);
             }
         })
+    }
+
+    type LeafHasher = DigestLeafHasher<F, D, NUM_BYTES>;
+
+    fn leaf_hasher() -> Self::LeafHasher {
+        DigestLeafHasher {
+            hasher: D::new(),
+            phantom: PhantomData,
+        }
+    }
+}
+
+/// [`IsLeafHasher`] over the same digest the one-shot routes use.
+///
+/// The split-invariance the trait demands is inherited rather than argued:
+/// `hash_streamed` opens a fresh `D`, feeds it every element's `stream_bytes`
+/// and finalizes, with no length prefix, padding or framing of its own — so
+/// absorbing the same elements across several `update` calls presents `D` with
+/// the identical byte stream. There is no place for a split to show.
+///
+/// This is a PROVER-side construct: the guest verifier authenticates leaves it
+/// receives whole, through `hash_data_from_slices`. That is why this does not
+/// carry `hash_streamed`'s riscv64 syscall-sponge fast path — it would be dead
+/// code on the only target that has it.
+pub struct DigestLeafHasher<F, D: Digest, const NUM_BYTES: usize> {
+    hasher: D,
+    /// `fn() -> F` rather than `F`: the field is a type-level label here, never a
+    /// value, and the function-pointer form is unconditionally `Send`/`Sync`. The
+    /// bare `PhantomData<F>` would make every leaf hasher's thread-safety hinge on
+    /// a marker type nobody ever moves.
+    phantom: PhantomData<fn() -> F>,
+}
+
+impl<F, D: Digest, const NUM_BYTES: usize> IsLeafHasher<F> for DigestLeafHasher<F, D, NUM_BYTES>
+where
+    F: IsField,
+    FieldElement<F>: AsBytes,
+    [u8; NUM_BYTES]: From<Output<D>>,
+{
+    type Node = [u8; NUM_BYTES];
+
+    fn update(&mut self, data: &[FieldElement<F>]) {
+        for element in data {
+            element.stream_bytes(&mut |bytes| self.hasher.update(bytes));
+        }
+    }
+
+    fn finalize(self) -> [u8; NUM_BYTES] {
+        let mut result = [0u8; NUM_BYTES];
+        result.copy_from_slice(&self.hasher.finalize());
+        result
     }
 }
 
