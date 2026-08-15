@@ -814,15 +814,36 @@ fn the_blake_column_and_the_residue_split() {
     // either padded to the next power of two (one AIR instance) or chunked the
     // way KECCAK_RND is (several instances, ~1.9% waste). Both are printed
     // because the choice is a policy, not a property of the hash.
-    let p = 192_000u64;
+    // ★ P is the instrument's OWN measured interval, not a constant.
+    //
+    // This line was a hardcoded `192_000` while the same function computed
+    // `[p_lo, p_hi]` two dozen lines above and only PRINTED it — and on this
+    // run that interval is roughly [287k, 291k], so every ratio below was
+    // being taken at a hash count about a third under what the run measured,
+    // in the direction that flatters every non-keccak column. Reading the
+    // measurement is the whole fix; the assertion is what stops it drifting
+    // back to a literal.
+    //
+    // Both ends are priced. The spine is absorption-bound and only bounded, so
+    // a single number would be a choice about which end to quote — and the two
+    // ends bracket the answer rather than approximating it.
+    assert!(
+        p_lo <= p_hi && p_lo > 0,
+        "the permutation interval must be non-degenerate, got [{p_lo}, {p_hi}]"
+    );
     let chunked = |perms: u64| (perms as f64 * 1.01871).ceil() as u64;
     let unchunked = |perms: u64| perms.next_power_of_two();
     let row = |name: &str, cells_per_perm: u64, resid: u64, table: u64| {
-        for (how, rows) in [("chunked", chunked(p)), ("padded", unchunked(p))] {
+        for (how, rows) in [
+            ("chunked@lo", chunked(p_lo as u64)),
+            ("chunked@hi", chunked(p_hi as u64)),
+            ("padded@lo", unchunked(p_lo as u64)),
+            ("padded@hi", unchunked(p_hi as u64)),
+        ] {
             let hash_cells = rows * cells_per_perm;
             let t = resid + table + hash_cells;
             println!(
-                "   {name:>28} {how:>8}  hash {hash_cells:>13}  total {t:>13}  \
+                "   {name:>28} {how:>10}  hash {hash_cells:>13}  total {t:>13}  \
                  {:>6.2}x under keccak  ~{:.0} GiB",
                 total as f64 / t as f64,
                 projected_gib(t, sub_proofs),
@@ -830,12 +851,12 @@ fn the_blake_column_and_the_residue_split() {
         }
     };
     println!(
-        "\n★ THE MATRIX, RE-DERIVED (P = {p}, {sub_proofs} sub-proofs, two-term RSS \
-         {BYTES_PER_CELL} B/cell + {} MB/sub-proof)",
+        "\n★ THE MATRIX, RE-DERIVED (P in [{p_lo}, {p_hi}] MEASURED, {sub_proofs} \
+         sub-proofs, two-term RSS {BYTES_PER_CELL} B/cell + {} MB/sub-proof)",
         BYTES_PER_SUB_PROOF / 1e6
     );
     println!(
-        "   {:>28} {:>8}  keccak {:>11}  total {:>13}  {:>6.2}x  ~{:.0} GiB",
+        "   {:>28} {:>10}  keccak {:>11}  total {:>13}  {:>6.2}x  ~{:.0} GiB",
         "keccak (MEASURED, ours)",
         "n/a",
         keccak_perm + bitwise,
@@ -881,7 +902,7 @@ fn the_blake_column_and_the_residue_split() {
 #[test]
 #[ignore]
 fn the_delegation_topology_priced_against_in_machine_hosting() {
-    use super::epoch_verify::{blocks_at_rate, group_leaf_felts};
+    use super::epoch_verify::{blocks_at_rate, group_leaf_felts, query_permutations_at_rate};
     use super::sub_proof::GroupShape;
 
     let inner = crate::recursion::Preset::Blowup8.options();
@@ -925,7 +946,21 @@ fn the_delegation_topology_priced_against_in_machine_hosting() {
     let fri_per_query = widest.verify.fri.permutations_per_query();
 
     // --- the delegation circuit's two AIRs, at the epoch's own compression count.
-    let compressions = 192_000usize;
+    // The same quantity the matrix instrument brackets, and it was the same
+    // hardcoded `192_000` here — independently unasserted, so the two could
+    // have drifted apart as well as away from the truth. Derived from the
+    // epoch's own shapes at BLAKE3's rate, which is what the closed form is
+    // for.
+    // The LEGS' term only — exact, where the spine's is merely bounded (it is
+    // absorption-bound, so its rate-8 cost sits between 1.0x and 2.125x its
+    // rate-17 one). Excluding the spine understates the compression count, so
+    // every "extra cost of delegating" figure below is a LOWER bound and the
+    // verdict is if anything understated.
+    let compressions: usize = e
+        .legs
+        .iter()
+        .map(|l| query_permutations_at_rate(&l.verify, 8))
+        .sum();
     let log2_blake_trace = (compressions as u32).next_power_of_two().trailing_zeros(); // 18
     let blake_groups = vec![
         GroupShape {
