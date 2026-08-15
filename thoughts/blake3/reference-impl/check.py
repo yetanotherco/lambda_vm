@@ -40,7 +40,42 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 ORACLE_DIR = os.path.join(HERE, "..", "blake3-oracle")
 REPO_ROOT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
-RUST_PRIMITIVE = os.path.join(REPO_ROOT, "prover", "src", "lfm", "blake3.rs")
+# Where the canonical vectors live. This was `prover/src/lfm/blake3.rs` until
+# P-a Stage 1 sank the primitive into `crypto`, so that the CUDA kernels, the
+# commitment backends and the LFM chip could all be checked against ONE
+# definition; `prover::lfm::blake3` is now a re-export and no longer holds the
+# table. Checks [D] and [E] were silently dead between that move and 2026-08-15,
+# because `parse_rust_vectors` failed with a bare `ValueError` from `str.index`
+# rather than saying what had happened — see `read_rust_primitive`.
+RUST_PRIMITIVE = os.path.join(
+    REPO_ROOT, "crypto", "crypto", "src", "hash", "blake3", "vectors.rs"
+)
+
+
+def read_rust_primitive():
+    """The vectors file, or a diagnosis of where it went.
+
+    A harness that dies on `ValueError: substring not found` when the code it
+    validates is refactored is a harness that gets deleted instead of fixed. If
+    this ever fires again, grep for `CANONICAL_VECTORS` and update the path
+    above — the parser itself is layout-independent and needs no change.
+    """
+    if not os.path.exists(RUST_PRIMITIVE):
+        sys.exit(
+            f"check.py: {RUST_PRIMITIVE} does not exist.\n"
+            "The canonical vectors have moved again. Find them with\n"
+            "  grep -rn 'pub const CANONICAL_VECTORS' --include='*.rs' .\n"
+            "and update RUST_PRIMITIVE at the top of this file."
+        )
+    src = open(RUST_PRIMITIVE).read()
+    if "pub const CANONICAL_VECTORS" not in src:
+        sys.exit(
+            f"check.py: {RUST_PRIMITIVE} exists but no longer defines "
+            "CANONICAL_VECTORS.\nFind them with\n"
+            "  grep -rn 'pub const CANONICAL_VECTORS' --include='*.rs' .\n"
+            "and update RUST_PRIMITIVE at the top of this file."
+        )
+    return src
 
 sys.path.insert(0, ORACLE_DIR)
 import blake3_ref as ref  # noqa: E402
@@ -143,7 +178,7 @@ def check_schedule_equivalence():
 # ---------------------------------------------------------------------------
 
 def parse_rust_vectors():
-    src = open(RUST_PRIMITIVE).read()
+    src = read_rust_primitive()
     start = src.index("pub const CANONICAL_VECTORS")
     blob = src[start:src.index("\n];", start)]
     out = []
@@ -186,7 +221,8 @@ def check_canonical_vectors():
           not bad_json, f"vectors {bad_json}")
 
     bad_rust = [i for i in range(10) if c_out[i] != rust[i]["out"]]
-    check("[D] C @ rounds=6 == Rust CANONICAL_VECTORS in prover/src/lfm/blake3.rs",
+    check("[D] C @ rounds=6 == Rust CANONICAL_VECTORS in "
+          "crypto/crypto/src/hash/blake3/vectors.rs",
           not bad_rust, f"vectors {bad_rust}")
 
     # Inputs must match too, or the output agreement is about different things.

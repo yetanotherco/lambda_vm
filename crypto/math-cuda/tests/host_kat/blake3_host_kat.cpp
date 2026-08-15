@@ -21,8 +21,7 @@
 //
 // HOW THE ANCHORING LAYERS. Nothing here is checked against itself:
 //   1. The compression function is anchored by the OFFICIAL BLAKE3 vectors at 7
-//      rounds (Table 1) and by the oracle-derived canonical vectors at 6
-//      (Table 2).
+//      rounds (Table 1) and by the canonical vectors at 6 (Table 2).
 //   2. `HostChain` below — a byte-level transcription of the construction — is
 //      anchored by the OFFICIAL multi-block vectors at 7 rounds (Table 3) and
 //      the committed 6-round chain KAT (Table 4). It is built ON the device
@@ -32,6 +31,22 @@
 //   4. Each leaf kernel is replayed on host and checked against `HostChain` over
 //      the byte stream `leaves_bit_reversed_grouped` specifies — so the read
 //      pattern and the hash are anchored separately rather than together.
+//
+// ★ TABLES 1 AND 2 ARE COMPLEMENTARY, NOT REDUNDANT, and the difference is not
+// obvious enough to leave unwritten. The official-vector path hashes whole
+// messages, so it only ever exercises `t = 0`. A build with `v[12]` and `v[13]`
+// transposed — the counter split inverted — reproduces the official vectors at
+// ALL 65 single-block lengths, and is caught only by Table 2, whose ten vectors
+// all carry `t >= 2^32`. That was measured, not assumed. Do not retire Table 2
+// as "covered by the standard", and do not describe Table 1 as subsuming it.
+//
+// ⚠ CONVERSELY, one thing here pins LESS than it appears to. The compression
+// loop's `if (r < ROUNDS - 1)` permutation guard is UNOBSERVABLE: always
+// permuting produces identical output at both round counts, because the schedule
+// permuted after the final round is never read. It is an optimization, not a
+// convention any known-answer test can validate — upstream expresses the same
+// schedule as an indexed table with no guard at all. Do not cite these vectors
+// as evidence the guard is correct; they cannot be.
 //
 // Build and run with `make test-blake3-host-kat`.
 

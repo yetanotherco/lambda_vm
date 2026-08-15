@@ -47,14 +47,33 @@ inline constexpr OfficialVector OFFICIAL_VECTORS[NUM_OFFICIAL_VECTORS] = {
 // Table 2 — the ten canonical vectors, at BOTH round counts.
 //
 // Inputs and `out6` are transcribed from `CANONICAL_VECTORS`
-// (`prover/src/lfm/blake3.rs`), whose 6-round outputs came from #903's Python
-// oracle rather than from any Rust code. `out7` is `CANONICAL_OUT_7ROUND` from
-// the same file, itself pinned by the official crate.
+// (now `crypto/crypto/src/hash/blake3/vectors.rs`), whose 6-round outputs came
+// from #903's Python oracle rather than from any Rust code. `out7` is
+// `CANONICAL_OUT_7ROUND` from the same file, itself pinned by the official crate.
 //
 // This is the point of the table: it gives the SIX-round arm a known-answer
-// test whose expected values no implementation in this tree produced. Table 1
-// cannot do that job, because nothing outside this repository computes a
-// 6-round BLAKE3.
+// test whose expected values no implementation in this tree produced.
+//
+// ★ It ALSO does a job Table 1 structurally CANNOT, and the reason is not
+// obvious enough to leave unwritten: the official-vector path hashes whole
+// messages, so it only ever exercises `t = 0`. A compression with the counter
+// split inverted (`v[12]` and `v[13]` transposed) reproduces the official
+// vectors at every single-block length, and is caught only here — all ten of
+// these vectors carry `t >= 2^32`. Measured, not assumed. This table is not
+// redundant with Table 1 and must not be retired as "covered by the standard".
+//
+// ★ PROVENANCE, strengthened 2026-08-15 — the 6-round column is no longer
+// pinned by Python alone. `thoughts/blake3/reference-impl/` holds UPSTREAM
+// BLAKE3 1.8.5 with a 2 KB reviewable diff (`PARAMETERISATION.diff`) whose only
+// functional edit replaces seven unrolled `round_fn` calls with a loop bounded
+// by `BLAKE3_ROUNDS_PARAM`. Built at both round counts and run over these ten
+// inputs, it reproduces `out6` AND `out7` 10/10, all 16 words. It is C rather
+// than Python, upstream's own code rather than a transcription, and it encodes
+// the message schedule as an INDEXED TABLE (`MSG_SCHEDULE[r]`) rather than as an
+// in-place permutation between rounds — a structurally different expression of
+// the same convention, so its agreement cross-validates the schedule instead of
+// restating it. Rebuild with `thoughts/blake3/reference-impl/build.sh`: a ~1
+// second C compile, no cargo, no GPU.
 // ---------------------------------------------------------------------------
 struct CanonicalVector {
     uint32_t h[8];
@@ -267,6 +286,18 @@ inline constexpr CanonicalVector CANONICAL_VECTORS[NUM_CANONICAL_VECTORS] = {
 // deliberately does not. Without them "we implement the single-chunk chain"
 // would be unfalsifiable — the matching rows alone would pass identically if the
 // whole chunk tree had been implemented instead.
+//
+// ★ THE BOUNDARY IS LOCATED, not sampled. All 35 official cases were swept
+// (2026-08-15): agreement holds for every length up to and including 1024, and
+// fails for every one of the 18 lengths >= 1025. Max agreeing 1024, min
+// differing 1025 — the divergence sits exactly on the one-chunk edge, which is
+// what P3 predicts. The 1024/1025 pair below is that boundary; the other rows
+// cover the multi-block cases in between.
+//
+// The input generator `i % 251` was itself verified empirically rather than
+// taken from the file's prose: it reproduces the `hash` field for 35/35 cases.
+// Note it differs from the `(37i + 11) mod 256` generator Table 4 uses — the two
+// tables come from different sources and do NOT share a message.
 // ---------------------------------------------------------------------------
 struct ChainVector {
     uint32_t input_len;
