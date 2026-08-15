@@ -141,15 +141,22 @@ pub mod cols {
     use super::NUM_G;
 
     // --- value columns ---
+    //
+    // ⚠ The trailing literals are ROUND-DEPENDENT: everything from `OUT` on is a
+    // function of `NUM_G = 8 · BLAKE3_ROUNDS`, so each is given at both counts
+    // rather than at whichever one the reader's build happens to compile.
+    // `the_registry_blessing_is_round_count_invariant` pins both, and pins that
+    // the PREPROCESSED prefix — which is what the registry commits — moves with
+    // neither.
     /// Input bytes: `h[32] | m[64] | t_lo[4] | t_hi[4] | block_len[4] | flags[4]`.
     pub const IN: usize = PREP_WIDTH; // 20
     /// `NUM_G` G-blocks × 60 cells (56 bytes + 4 carry bits).
     pub const G: usize = IN + 4 * IN_U32; // 132
     pub const G_SIZE: usize = 60;
     /// Feed-forward output bytes `out[0..16]` (64 bytes).
-    pub const OUT: usize = G + NUM_G * G_SIZE; // 3012
+    pub const OUT: usize = G + NUM_G * G_SIZE; // 3012 at 6 rounds, 3492 at 7
 
-    pub const NUM_COLUMNS: usize = OUT + 4 * OUT_U32; // 3076
+    pub const NUM_COLUMNS: usize = OUT + 4 * OUT_U32; // 3076 at 6 rounds, 3556 at 7
 
     /// Input word `i` (0..28: `h[0..8]`, `m[8..24]`, `t_lo=24`, `t_hi=25`,
     /// `block_len=26`, `flags=27`), byte `b`.

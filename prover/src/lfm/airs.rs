@@ -247,10 +247,10 @@ pub fn lfm_chip_census_with_hasher(
             bitwise::bus_interactions().len(),
         ),
     ];
-    // The frozen AIR order is `air_refs`': chip classes 0..=10, then every
-    // `KECCAK_RND` chunk, then `KECCAK_RC` and `BITWISE`. `per_chip` above lists
-    // the classes with the last two at the end, so the chunks are spliced in
-    // before them rather than appended.
+    // The frozen AIR order is `air_refs`': chip classes 0..=11 (`LFM_BLAKE3` is
+    // the last of them), then every `KECCAK_RND` chunk, then `KECCAK_RC` and
+    // `BITWISE`. `per_chip` above lists the classes with the last two at the
+    // end, so the chunks are spliced in before them rather than appended.
     let rnd_interactions = keccak_rnd::bus_interactions().len();
     let mut census = Vec::with_capacity(per_chip.len() + 1);
     for (slot, (rows, num_cols, prep, interactions)) in per_chip.into_iter().enumerate() {

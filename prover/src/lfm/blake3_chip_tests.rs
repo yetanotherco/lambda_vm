@@ -1156,3 +1156,287 @@ fn the_select_chain_rule_is_the_hosts_fallback() {
         assert_eq!(host, machine, "{what}: c0={c0:#x} c1={c1:#x}");
     }
 }
+
+/// ★ THE FLIP INVENTORY, pinned — which registered programs the Stage-6 flip
+/// moves, and which it must NOT.
+///
+/// Review finding rev-emit E3: every `LfmProgramSource` constructor in
+/// `programs.rs` builds its own `LfmBuilder`, and only two of the twenty pass a
+/// hash. At the flip each production constructor is edited individually and
+/// nothing catches one left on the default — which composes with the
+/// undischarged `CommitmentHash` guard into the residual R-3 risk (a valid
+/// proof of the wrong digest). The full site list and the flip procedure live
+/// in PA-PLAN's Stage-6 section; this is the half that can go stale silently,
+/// so it is executable.
+///
+/// The classification is MEASURED, not asserted: a program that emits no hash
+/// instruction at all is flip-inert whatever its constructor says, and a
+/// program that emits `KeccakF` either must flip or is deliberately pinned. The
+/// two categories are named per entry so adding a registered program forces the
+/// question rather than inheriting an answer.
+#[test]
+fn the_flip_inventory_of_registered_programs_is_pinned() {
+    use super::instr::Instr;
+    use super::programs::{
+        KECCAK_SPONGE_LEN, fri_toy_program, keccak_chain_program, keccak_sponge_program,
+        statement_replay_program, transcript_replay_program, trivial_program,
+    };
+
+    /// What the Stage-6 flip owes each registered program.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Fate {
+        /// Emits no hash at all — the flip cannot move it.
+        Inert,
+        /// Emits the wrap hash. Its constructor MUST take the flip.
+        MustFlip,
+        /// Emits keccak deliberately: an instrument that is ABOUT keccak, whose
+        /// identity is pinned in `LFM_REGISTRY`. A BLAKE3 twin would be a new
+        /// program and a new row, never a re-blessing of this one.
+        PinnedKeccak,
+    }
+
+    let cases: [(&str, super::compiler::LfmProgram, Fate, usize); 6] = [
+        ("TrivialV0", trivial_program(), Fate::Inert, 0),
+        ("FriToyV0", fri_toy_program(), Fate::Inert, 0),
+        (
+            "KeccakChainV0",
+            keccak_chain_program(),
+            Fate::PinnedKeccak,
+            2,
+        ),
+        (
+            "KeccakSpongeV0",
+            keccak_sponge_program(KECCAK_SPONGE_LEN),
+            Fate::PinnedKeccak,
+            2,
+        ),
+        (
+            "TranscriptReplayV0",
+            transcript_replay_program(),
+            Fate::MustFlip,
+            6,
+        ),
+        (
+            "StatementReplayV0",
+            statement_replay_program(),
+            Fate::MustFlip,
+            5,
+        ),
+    ];
+
+    assert_eq!(
+        cases.len(),
+        super::registry::LFM_REGISTRY.len(),
+        "every registered program must have a stated fate — a new row without \
+         one is a program the flip would move or miss by accident"
+    );
+
+    for (name, program, fate, keccak_rows) in &cases {
+        let keccak = program
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, Instr::KeccakF(_)))
+            .count();
+        let blake3 = program
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, Instr::Blake3(_)))
+            .count();
+        assert_eq!(
+            keccak, *keccak_rows,
+            "{name}: the emitted keccak count is what the fate below is a \
+             judgement about"
+        );
+        assert_eq!(blake3, 0, "{name}: nothing selects BLAKE3 before the flip");
+        match fate {
+            Fate::Inert => assert_eq!(
+                keccak, 0,
+                "{name} is classified flip-inert but emits {keccak} hash rows"
+            ),
+            Fate::MustFlip | Fate::PinnedKeccak => assert!(
+                keccak > 0,
+                "{name} is classified as hashing but emits none — the fate is \
+                 wrong, or the program is"
+            ),
+        }
+    }
+
+    // NON-VACUITY: the classification must actually split the set, or "every
+    // program has a fate" is satisfied by giving them all the same one.
+    assert!(cases.iter().any(|c| c.2 == Fate::Inert));
+    assert!(cases.iter().any(|c| c.2 == Fate::MustFlip));
+    assert!(cases.iter().any(|c| c.2 == Fate::PinnedKeccak));
+}
+
+/// ★ The REVERSED-DIGEST send, PROVED — the chip's last surface that execution
+/// alone does not reach.
+///
+/// `the_reversed_digest_is_the_digest_backwards` executes the send and checks
+/// its value; `the_blake3_chip_proves_and_verifies` proves the chip but through
+/// `blake3_256`, which sets no reversed-digest multiplicity, so the two extra
+/// `LfmMem` sends are inert in every proof either of them builds. That leaves
+/// the flipped-coefficient `Linear` — the one piece of column arithmetic
+/// transcribed from `chips::keccak` onto a different chip's OUT block —
+/// exercised by the executor's mirror and by nothing on the AIR side.
+///
+/// This proves it, at several lengths so the digest being reversed is a
+/// different 32 bytes each time. A transcription error in
+/// `reversed_lane_value`'s `OUT + 31 − 4l − k` would leave the executor and the
+/// bus disagreeing about what was written, which is an unbalanced `LfmMem`
+/// multiset: the proof fails to build, or fails to verify.
+#[test]
+fn the_reversed_digest_send_proves_and_verifies() {
+    let opts = options();
+    // 0 exercises the single-block case, 65 the chain, 200 an interior block.
+    for len in [0usize, 65, 200] {
+        let msg = message(len);
+
+        let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::Blake3);
+        let num_halves = num_stream_halves(len) as u32;
+        let arena = b.declare_arena(num_halves);
+        let stream: Vec<_> = (0..num_halves).map(|i| b.hint_felt(arena, i)).collect();
+        let (plain, rev) = edsl::blake3_256_with_rev(&mut b, &stream, len);
+        b.public(plain[0]);
+        b.public(plain[1]);
+        b.public(rev[0]);
+        b.public(rev[1]);
+        let program = compile(b.finish());
+
+        // The multiplicities really are nonzero, or the send under test is the
+        // inert one again and this proves nothing new.
+        let group = &program.groups.blake3;
+        let last = group.real_rows - 1;
+        assert!(
+            (0..cols::DIGEST_WORDS).any(|w| *group.at(last, cols::rev_mult(w)) != FE::zero()),
+            "len {len}: the reversed digest must be READ, or its send is inert"
+        );
+
+        let artifacts = build_artifacts(&program, &opts);
+        let proved = lfm_prove(&program, &artifacts, &sponge_arenas(&msg), &opts)
+            .unwrap_or_else(|e| panic!("len {len}: prove failed: {e:?}"));
+
+        let plain_bytes = digest_bytes(&proved.public_words[..2]);
+        let rev_bytes = digest_bytes(&proved.public_words[2..]);
+        assert_eq!(plain_bytes, blake3_chain(&msg), "len {len}: plain digest");
+        let mut expected = plain_bytes;
+        expected.reverse();
+        assert_eq!(rev_bytes, expected, "len {len}: reversed digest");
+        assert!(
+            verify_against(
+                &artifacts.roots,
+                &artifacts.program_id,
+                artifacts.keccak_rnd_chunks,
+                &proved.proof,
+                &proved.public_words,
+                &opts,
+                artifacts.hasher,
+            ),
+            "len {len}: a proof carrying the reversed-digest send must verify"
+        );
+    }
+}
+
+/// ★ R-8: BOTH BLAKE3 surfaces active in one machine, and the shared BITWISE
+/// table balances for the right reason.
+///
+/// Registering `LFM_BLAKE3` while D0 keeps the socket arm means one program can
+/// carry two BLAKE3 AIRs — the socket (`LFM_HASH` under `HasherKind::Blake3`,
+/// a 52-byte fixed message, 128-bit digest) and the chip (a raw compression,
+/// 256-bit) — and both feed lookups into the SAME 2^20-row BITWISE table. They
+/// run the same `run_flow` under different `FlowConfig`s, which is exactly the
+/// shape where two producers could balance the shared table between them rather
+/// than each against the table: a socket row's missing lookup absorbed by a chip
+/// row's spare one would leave the bus balanced and one of the two computations
+/// unconstrained.
+///
+/// The control is the honest-path one done twice over: each surface alone
+/// proves and verifies, and the two TOGETHER prove and verify. A cross-balance
+/// would show up as the combined program proving while one of the singles does
+/// not, or as the combined proof failing to verify — the histogram is built from
+/// the senders' own enumeration, so a mismatch is an unbalanced multiset either
+/// way.
+#[test]
+fn both_blake3_surfaces_in_one_machine_balance_bitwise() {
+    use super::hash::HasherKind;
+    use super::proof::lfm_prove_with_hasher;
+
+    // Three programs: socket only, chip only, and both — the same builder
+    // shapes, so what differs between them is which surface is present.
+    let socket_only = |with_chip: bool, with_socket: bool| {
+        let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::Blake3);
+        let zero = b
+            .digest_const([FE::zero(), FE::zero(), FE::zero(), FE::zero()])
+            .as_cell();
+        if with_socket {
+            // The socket: an `LFM_HASH` compress, whose lanes must be u32.
+            let a = b
+                .digest_const(core::array::from_fn(|i| FE::from(1_000u64 + i as u64)))
+                .as_cell();
+            let d = b.compress(a.as_digest(), zero.as_digest());
+            b.public(d.as_cell());
+        }
+        if with_chip {
+            // The chip: one raw compression at the parent framing.
+            let m: [Cell; 4] = core::array::from_fn(|w| {
+                b.digest_const(core::array::from_fn(|l| {
+                    FE::from(7_000u64 + (4 * w + l) as u64)
+                }))
+                .as_cell()
+            });
+            let h = [
+                b.digest_const(core::array::from_fn(|i| FE::from(u64::from(BLAKE3_IV[i]))))
+                    .as_cell(),
+                b.digest_const(core::array::from_fn(|i| {
+                    FE::from(u64::from(BLAKE3_IV[4 + i]))
+                }))
+                .as_cell(),
+            ];
+            let params = b
+                .digest_const([
+                    FE::zero(),
+                    FE::zero(),
+                    FE::from(BLOCK_LEN as u64),
+                    FE::from(u64::from(block_flags(0, 1))),
+                ])
+                .as_cell();
+            let out = b.blake3_compress(h, m, params);
+            b.public(out[0]);
+        }
+        compile(b.finish())
+    };
+
+    let opts = options();
+    for (what, program, socket_rows, chip_rows) in [
+        ("socket alone", socket_only(false, true), 1, 0),
+        ("chip alone", socket_only(true, false), 0, 1),
+        ("★ both surfaces", socket_only(true, true), 1, 1),
+    ] {
+        // NON-VACUITY: the three programs must really differ in which surface
+        // they carry, or "both together verify" is one surface tested thrice.
+        assert_eq!(
+            program.groups.hash.real_rows, socket_rows,
+            "{what}: LFM_HASH (socket) rows"
+        );
+        assert_eq!(
+            program.groups.blake3.real_rows, chip_rows,
+            "{what}: LFM_BLAKE3 (chip) rows"
+        );
+        let artifacts =
+            super::registry::build_artifacts_with_hasher(&program, &opts, HasherKind::Blake3);
+        let proved = lfm_prove_with_hasher(&program, &artifacts, &[], &opts, HasherKind::Blake3)
+            .unwrap_or_else(|e| panic!("{what}: must prove: {e:?}"));
+        assert!(
+            verify_against(
+                &artifacts.roots,
+                &artifacts.program_id,
+                artifacts.keccak_rnd_chunks,
+                &proved.proof,
+                &proved.public_words,
+                &opts,
+                HasherKind::Blake3,
+            ),
+            "{what}: must verify — a shared-BITWISE cross-balance between the \
+             socket and the chip would show up here"
+        );
+    }
+}
