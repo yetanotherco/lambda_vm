@@ -539,3 +539,238 @@ extern "C" __global__ void keccak256_leaves_base_row_major_row_pair_range(
     }
     finalize_keccak256(st, rate_pos, hashed_leaves_out + tid * 32);
 }
+
+// ---------------------------------------------------------------------------
+// Mixed-height MMCS (batched commitments).
+//
+// One tree over ALL of an epoch's matrices — see `crypto/stark/src/fri/mmcs.rs`
+// for the layout that is the single source of truth. The device build mirrors
+// the HOST STREAMING BUILDER (`StreamingMmcsBuilder`), not `MixedMmcs::commit`,
+// and that choice is the whole point: a height group's leaf is one Keccak over
+// every matrix's concatenated row pair, so hashing it in one pass needs every
+// matrix of that height resident at once. On a real epoch the tallest group is
+// most of the tables, which is the memory the batching exists to remove.
+//
+// So the sponge state lives in device memory, one per leaf, and matrices are
+// absorbed into it ONE AT A TIME:
+//
+//   mmcs_states_init(states, rate_pos, num_leaves)
+//   for each matrix m of this height, in INPUT order:
+//       <produce m's LDE on device>
+//       mmcs_absorb_row_pair_row_major(...)   // or the ext3 slab variant
+//       <free m's LDE>
+//   mmcs_states_finalize(states, rate_pos, num_leaves, digests_out)
+//
+// Retained state is 204 bytes per leaf (25 lanes + the rate cursor), i.e.
+// ~214 MB at 2^20 leaves, against one full LDE per matrix in the group.
+//
+// The absorbed byte stream is identical to the host's: each matrix contributes
+// row `2k` then row `2k+1`, both bit-reversed, canonical big-endian, in column
+// order. `keccak256_leaves_base_row_major_row_pair` is the single-matrix case
+// of exactly this loop, which is why a one-matrix MMCS is byte-identical to the
+// existing per-table tree on device as well as on the host.
+//
+// Node layout is the STANDARD heap array (`nodes[0..leaves_len-1]` inner, root
+// at 0, leaves at `[leaves_len-1..]`), not one array per MMCS layer. That is
+// deliberate: in that layout the sibling at level L of a query is the node
+// `merkle_gather_paths` already walks to, so the batched path gather is the
+// existing hash-agnostic kernel unchanged, with no second index convention to
+// keep in step.
+// ---------------------------------------------------------------------------
+
+// Per-leaf sponge state, zeroed. `states` is `num_leaves * 25` u64s and
+// `rate_pos` is `num_leaves` u32s.
+extern "C" __global__ void mmcs_states_init(
+    uint64_t *states,
+    uint32_t *rate_pos,
+    uint64_t num_leaves)
+{
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_leaves) return;
+    uint64_t *st = states + tid * 25;
+    #pragma unroll
+    for (int i = 0; i < 25; ++i) st[i] = 0;
+    rate_pos[tid] = 0;
+}
+
+// Absorb one ROW-MAJOR matrix's row pair into every leaf's running sponge.
+//
+// `data` is the matrix's row-major LDE (`num_rows` rows of `m` u64s). Columns
+// `[col_start, col_end)` are absorbed while `m` stays the full row stride, so
+// a preprocessed table's precomputed and multiplicity ranges over one buffer
+// are two absorptions rather than two buffers.
+//
+// Base field: `m` = column count, `col_start`/`col_end` in columns. Ext3: an
+// element's three components are consecutive, so `m` = 3 * column count and
+// the range is in components — the same convention
+// `keccak256_leaves_base_row_major_row_pair` documents.
+//
+// `num_leaves` is the TREE's leaf count, which for a matrix shorter than the
+// tallest is its own `2^(log_height-1)` — this kernel is launched per height
+// group, so `num_rows` and `num_leaves` always belong to the same matrix.
+extern "C" __global__ void mmcs_absorb_row_pair_row_major(
+    uint64_t *states,
+    uint32_t *rate_pos,
+    const uint64_t *data,
+    uint64_t m,
+    uint64_t col_start,
+    uint64_t col_end,
+    uint64_t num_rows,
+    uint64_t log_num_rows,
+    uint64_t num_leaves)
+{
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_leaves) return;
+
+    uint64_t br_0 = __brevll(2 * tid) >> (64 - log_num_rows);
+    uint64_t br_1 = __brevll(2 * tid + 1) >> (64 - log_num_rows);
+    const uint64_t *row_0 = data + br_0 * m;
+    const uint64_t *row_1 = data + br_1 * m;
+
+    // Load the running state into registers: the absorb loop touches it once
+    // per column and a global round-trip per lane would dominate the hash.
+    uint64_t st[25];
+    uint64_t *st_g = states + tid * 25;
+    #pragma unroll
+    for (int i = 0; i < 25; ++i) st[i] = st_g[i];
+    uint32_t rp = rate_pos[tid];
+
+    for (uint64_t c = col_start; c < col_end; ++c) {
+        absorb_lane(st, rp, bswap64(goldilocks::canonical(row_0[c])));
+    }
+    for (uint64_t c = col_start; c < col_end; ++c) {
+        absorb_lane(st, rp, bswap64(goldilocks::canonical(row_1[c])));
+    }
+
+    #pragma unroll
+    for (int i = 0; i < 25; ++i) st_g[i] = st[i];
+    rate_pos[tid] = rp;
+}
+
+// Absorb one COLUMN-MAJOR ext3 slab matrix's row pair — the composition-poly
+// LDE layout (`GpuLdeExt3`): component `k` of column `c` at
+// `(c*3 + k) * col_stride`. Same absorbed byte order as
+// `keccak_comp_poly_leaves_ext3`, which is this kernel's single-matrix case.
+extern "C" __global__ void mmcs_absorb_row_pair_ext3_slabs(
+    uint64_t *states,
+    uint32_t *rate_pos,
+    const uint64_t *parts_base_ptr,
+    uint64_t col_stride,
+    uint64_t num_parts,
+    uint64_t num_rows,
+    uint64_t log_num_rows,
+    uint64_t num_leaves)
+{
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_leaves) return;
+
+    uint64_t br_0 = __brevll(2 * tid) >> (64 - log_num_rows);
+    uint64_t br_1 = __brevll(2 * tid + 1) >> (64 - log_num_rows);
+
+    uint64_t st[25];
+    uint64_t *st_g = states + tid * 25;
+    #pragma unroll
+    for (int i = 0; i < 25; ++i) st[i] = st_g[i];
+    uint32_t rp = rate_pos[tid];
+
+    for (uint64_t p = 0; p < num_parts; ++p) {
+        #pragma unroll
+        for (int k = 0; k < 3; ++k) {
+            uint64_t v = parts_base_ptr[(p * 3 + (uint64_t)k) * col_stride + br_0];
+            absorb_lane(st, rp, bswap64(goldilocks::canonical(v)));
+        }
+    }
+    for (uint64_t p = 0; p < num_parts; ++p) {
+        #pragma unroll
+        for (int k = 0; k < 3; ++k) {
+            uint64_t v = parts_base_ptr[(p * 3 + (uint64_t)k) * col_stride + br_1];
+            absorb_lane(st, rp, bswap64(goldilocks::canonical(v)));
+        }
+    }
+
+    #pragma unroll
+    for (int i = 0; i < 25; ++i) st_g[i] = st[i];
+    rate_pos[tid] = rp;
+}
+
+// Pad and squeeze every leaf's sponge into a 32-byte digest.
+extern "C" __global__ void mmcs_states_finalize(
+    const uint64_t *states,
+    const uint32_t *rate_pos,
+    uint64_t num_leaves,
+    uint8_t *digests_out)
+{
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_leaves) return;
+
+    uint64_t st[25];
+    const uint64_t *st_g = states + tid * 25;
+    #pragma unroll
+    for (int i = 0; i < 25; ++i) st[i] = st_g[i];
+
+    finalize_keccak256(st, rate_pos[tid], digests_out + tid * 32);
+}
+
+// One climb level of the mixed-height tree.
+//
+// `parent = C(left, right)`, and where a shorter height group injects at this
+// level, `parent = C(parent, inject[j])`. `inject` is that group's `n_pairs`
+// finalized leaf digests, or `nullptr` when no matrix has the level's height —
+// the two arms are `keccak_merkle_level` and its injecting counterpart, kept in
+// one kernel so the node layout has one writer.
+//
+// Node indexing matches `hash_merkle_parent`: children of parent `parent_begin
+// + tid` are at `parent_begin + n_pairs + 2*tid` and `+ 1`.
+extern "C" __global__ void keccak_mmcs_level(
+    uint8_t *nodes,
+    uint64_t parent_begin,
+    uint64_t n_pairs,
+    const uint8_t *inject,
+    uint32_t has_inject)
+{
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n_pairs) return;
+
+    // Children of parent `parent_begin + tid`, same indexing as
+    // `hash_merkle_parent`. Nodes sit at 32-byte-aligned offsets (cuMemAlloc is
+    // 256-aligned), so the u64 view is safe.
+    const uint64_t *left = reinterpret_cast<const uint64_t *>(
+        nodes + (parent_begin + n_pairs + 2 * tid) * 32);
+    const uint64_t *right = reinterpret_cast<const uint64_t *>(
+        nodes + (parent_begin + n_pairs + 2 * tid + 1) * 32);
+
+    uint8_t parent[32];
+    {
+        uint64_t st[25];
+        #pragma unroll
+        for (int i = 0; i < 25; ++i) st[i] = 0;
+        uint32_t rate_pos = 0;
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) absorb_lane(st, rate_pos, left[i]);
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) absorb_lane(st, rate_pos, right[i]);
+        finalize_keccak256(st, rate_pos, parent);
+    }
+
+    uint8_t *out = nodes + (parent_begin + tid) * 32;
+    if (!has_inject) {
+        #pragma unroll
+        for (int i = 0; i < 32; ++i) out[i] = parent[i];
+        return;
+    }
+
+    // One more fixed-shape 64-byte compression against this level's injected
+    // group digest, so an injected level costs exactly one extra permutation
+    // per node.
+    uint64_t st[25];
+    #pragma unroll
+    for (int i = 0; i < 25; ++i) st[i] = 0;
+    uint32_t rate_pos = 0;
+    const uint64_t *p = reinterpret_cast<const uint64_t *>(parent);
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) absorb_lane(st, rate_pos, p[i]);
+    const uint64_t *inj = reinterpret_cast<const uint64_t *>(inject + tid * 32);
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) absorb_lane(st, rate_pos, inj[i]);
+    finalize_keccak256(st, rate_pos, out);
+}
