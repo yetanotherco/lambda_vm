@@ -97,7 +97,10 @@ fn test_is_valid_nonce_grinding_factor_33() {
 // happened and that the two configurations do not accept each other's work.
 // =========================================================================
 
-/// The digest the BLAKE3 configuration grinds over.
+/// The digest the BLAKE3 configuration grinds over. Gated with the tests below
+/// because `Blake3StarkHash` does not exist under `cuda` — the device kernels
+/// are keccak-only, so there is no second configuration to name there.
+#[cfg(not(feature = "cuda"))]
 type Blake3 = GrindingDigest<crate::config::Blake3StarkHash>;
 
 /// ★ Honest path: a nonce ground under BLAKE3 satisfies the BLAKE3 check.
