@@ -160,7 +160,10 @@ impl EpochShape {
         for (table, (air, &trace_length)) in airs.iter().zip(trace_lengths).enumerate() {
             let options = air.options();
             for (field, same) in [
-                ("blowup_factor", options.blowup_factor == first.blowup_factor),
+                (
+                    "blowup_factor",
+                    options.blowup_factor == first.blowup_factor,
+                ),
                 ("coset_offset", options.coset_offset == first.coset_offset),
                 (
                     "grinding_factor",

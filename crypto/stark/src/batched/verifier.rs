@@ -60,7 +60,7 @@ use crate::fri::mmcs::{MixedMmcs, MixedOpening};
 use crate::lookup::LOGUP_NUM_CHALLENGES;
 use crate::traits::AIR;
 
-use crypto::fiat_shamir::is_transcript::{IsStarkTranscript, IsTranscript};
+use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
 
 /// Every challenge a batched epoch derives, in the order the transcript
 /// produces them.
@@ -170,7 +170,10 @@ where
         if !ood_blocks_well_formed(*air, table) {
             return None;
         }
-        for block in [&table.trace_ood_evaluations, &table.trace_ood_next_evaluations] {
+        for block in [
+            &table.trace_ood_evaluations,
+            &table.trace_ood_next_evaluations,
+        ] {
             for col in block.columns().iter() {
                 for elem in col.iter() {
                     transcript.append_field_element(elem);
@@ -266,8 +269,7 @@ where
 {
     // The query count is not implied by anything the transcript already
     // checked: a prover that sent fewer openings would simply be checked less.
-    if proof.queries.len() != params.num_queries
-        || challenges.fri.iotas.len() != params.num_queries
+    if proof.queries.len() != params.num_queries || challenges.fri.iotas.len() != params.num_queries
     {
         return false;
     }
@@ -310,8 +312,13 @@ where
     let h_max = shape.h_max();
     for (query, iota) in challenges.fri.iotas.iter().copied().enumerate() {
         let opening = &proof.queries[query];
-        if !round_authenticates::<Field, H>(&proof.main_root, &opening.main, &shape.main, iota, h_max)
-        {
+        if !round_authenticates::<Field, H>(
+            &proof.main_root,
+            &opening.main,
+            &shape.main,
+            iota,
+            h_max,
+        ) {
             return false;
         }
         if !round_authenticates::<FieldExtension, H>(

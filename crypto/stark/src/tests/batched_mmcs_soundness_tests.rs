@@ -946,7 +946,10 @@ mod epoch {
     #[test_log::test]
     fn a_short_query_list_is_rejected() {
         let (airs, mut proof) = honest();
-        assert!(proof.queries.len() > 1, "the fixture must have queries to drop");
+        assert!(
+            proof.queries.len() > 1,
+            "the fixture must have queries to drop"
+        );
         proof.queries.pop();
         assert_eq!(
             replay_and_check(&airs, &proof),
@@ -989,15 +992,12 @@ mod epoch {
     fn a_tampered_ood_value_is_rejected() {
         let (airs, honest_proof) = honest();
         let refs = air_refs(&airs);
-        let honest_iotas = replay_epoch_transcript(
-            &refs,
-            &honest_proof,
-            &mut DefaultTranscript::<E>::new(&[]),
-        )
-        .expect("honest replay")
-        .2
-        .fri
-        .iotas;
+        let honest_iotas =
+            replay_epoch_transcript(&refs, &honest_proof, &mut DefaultTranscript::<E>::new(&[]))
+                .expect("honest replay")
+                .2
+                .fri
+                .iotas;
 
         let mut proof = honest_proof.clone();
         proof.tables[0].composition_poly_parts_ood_evaluation[0] += FieldElement::<E>::one();
@@ -1022,7 +1022,7 @@ mod epoch {
     fn a_tampered_trace_ood_value_is_rejected() {
         let (airs, mut proof) = honest();
         let table = &mut proof.tables[0];
-        let value = table.trace_ood_evaluations.get(0, 0).clone();
+        let value = *table.trace_ood_evaluations.get(0, 0);
         table
             .trace_ood_evaluations
             .set(0, 0, value + FieldElement::<E>::one());
@@ -1084,7 +1084,10 @@ mod epoch {
     #[test_log::test]
     fn an_invented_round_root_is_rejected() {
         let (airs, mut proof) = honest();
-        assert!(proof.prep_root.is_none(), "the fixture has no preprocessed table");
+        assert!(
+            proof.prep_root.is_none(),
+            "the fixture has no preprocessed table"
+        );
         proof.prep_root = Some(proof.main_root);
         assert_eq!(
             replay_and_check(&airs, &proof),

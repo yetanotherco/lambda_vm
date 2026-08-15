@@ -100,6 +100,12 @@ pub type BatchedAirTracePair<'a, Field, FieldExtension, PI> = (
     &'a PI,
 );
 
+/// A retention slot for one table's main LDE: `Some` while the buffer is being
+/// held between phases, `None` while it is out on loan or was dropped.
+type MainSlots<'a, Field> = &'a mut [Option<(Vec<FieldElement<Field>>, usize)>];
+/// The same for the auxiliary LDE.
+type AuxSlots<'a, FieldExtension> = &'a mut [Option<(Vec<FieldElement<FieldExtension>>, usize)>];
+
 /// A table's LDE buffers, alive only for as long as the current phase needs
 /// them, and accounted for while they are.
 struct LdePair<Field: IsField, FieldExtension: IsField> {
@@ -137,6 +143,11 @@ where
     PI: Send + Sync + Clone,
     H: StarkHash,
     P: IsStarkProver<Field, FieldExtension, PI, H> + ?Sized,
+    // The same two bounds `multi_prove` carries: under `disk-spill` the aux
+    // trace is spilled through an mmap backing, which only a field whose
+    // `BaseType` is plain data can be laid out in.
+    <Field as IsField>::BaseType: math::spill_safe::SpillSafe,
+    <FieldExtension as IsField>::BaseType: math::spill_safe::SpillSafe,
 {
     let num_tables = air_trace_pairs.len();
     let mut stats = BatchedProveStats::default();
@@ -158,7 +169,10 @@ where
 
     let airs: Vec<&dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>> =
         air_trace_pairs.iter().map(|(air, _, _)| *air).collect();
-    let trace_lengths: Vec<usize> = domains.iter().map(|d| d.interpolation_domain_size).collect();
+    let trace_lengths: Vec<usize> = domains
+        .iter()
+        .map(|d| d.interpolation_domain_size)
+        .collect();
     let (shape, params) = EpochShape::derive(&airs, &trace_lengths)?;
     let h_max = shape.h_max();
     let coset_offset = FieldElement::<Field>::from(params.coset_offset);
@@ -181,8 +195,8 @@ where
     // Both builders are fed from the SAME expansion: a preprocessed table's
     // precomputed columns and its multiplicity columns are two column ranges of
     // one row-major main LDE, exactly as `commit_main_trace` splits them.
-    let mut prep_builder = (!shape.prep.is_empty())
-        .then(|| StreamingMmcsBuilder::<Field, H>::new(&shape.prep.dims));
+    let mut prep_builder =
+        (!shape.prep.is_empty()).then(|| StreamingMmcsBuilder::<Field, H>::new(&shape.prep.dims));
     let mut main_builder = StreamingMmcsBuilder::<Field, H>::new(&shape.main.dims);
     let mut retained_main: Vec<Option<(Vec<FieldElement<Field>>, usize)>> =
         (0..num_tables).map(|_| None).collect();
@@ -263,8 +277,8 @@ where
 
     let mut bus_public_inputs: Vec<Option<BusPublicInputs<FieldExtension>>> =
         (0..num_tables).map(|_| None).collect();
-    let mut aux_builder =
-        (!shape.aux.is_empty()).then(|| StreamingMmcsBuilder::<FieldExtension, H>::new(&shape.aux.dims));
+    let mut aux_builder = (!shape.aux.is_empty())
+        .then(|| StreamingMmcsBuilder::<FieldExtension, H>::new(&shape.aux.dims));
     let mut retained_aux: Vec<Option<(Vec<FieldElement<FieldExtension>>, usize)>> =
         (0..num_tables).map(|_| None).collect();
 
@@ -395,7 +409,14 @@ where
 
         // Parts are RETAINED: rebuilding them is a second constraint evaluation.
         retained_parts[table] = parts;
-        release_ldes(ldes, &mut retained_main, &mut retained_aux, table, &mut ledger, residency);
+        release_ldes(
+            ldes,
+            &mut retained_main,
+            &mut retained_aux,
+            table,
+            &mut ledger,
+            residency,
+        );
         drop(lde_trace);
     }
 
@@ -445,7 +466,14 @@ where
             &retained_parts[table],
             &z,
         );
-        release_ldes(ldes, &mut retained_main, &mut retained_aux, table, &mut ledger, residency);
+        release_ldes(
+            ldes,
+            &mut retained_main,
+            &mut retained_aux,
+            table,
+            &mut ledger,
+            residency,
+        );
         drop(lde_trace);
 
         let (block0, block1) = P::ood_layout(*air).split_full(&round3.trace_ood_evaluations);
@@ -496,7 +524,7 @@ where
             &shape.heights,
             &shape.total_widths(),
             move |alpha, plan| {
-                let mut combiner = HeightCombiner::new(alpha.clone());
+                let mut combiner = HeightCombiner::new(*alpha);
                 // Ascending table order, which is also `plan.batched`'s order —
                 // absorption order is what defines the alpha powers, so the two
                 // must not be allowed to drift apart.
@@ -567,6 +595,21 @@ where
     let mut aux_openings = empty_openings::<FieldExtension>(&iotas, shape.aux.tables.len());
     let mut parts_openings = empty_openings::<FieldExtension>(&iotas, shape.parts.tables.len());
 
+    // ★ Each round is read in ITS OWN index space, and the reduction happens
+    // exactly once, here. Doing it inside the read would be wrong twice over: a
+    // round shorter than the FRI would be asked for a leaf it does not have
+    // (the prep round's `h_max` is below the FRI's whenever the tallest
+    // preprocessed table is not the tallest table), and a round that reduced
+    // again on the way out would land somewhere else entirely.
+    let prep_iotas = prep_mmcs
+        .as_ref()
+        .map(|mmcs| reduced_iotas(&iotas, h_max, mmcs.h_max()));
+    let main_iotas = reduced_iotas(&iotas, h_max, main_mmcs.h_max());
+    let aux_iotas = aux_mmcs
+        .as_ref()
+        .map(|mmcs| reduced_iotas(&iotas, h_max, mmcs.h_max()));
+    let parts_iotas = reduced_iotas(&iotas, h_max, parts_mmcs.h_max());
+
     for table in 0..num_tables {
         let (air, _, _) = &air_trace_pairs[table];
         let ldes = materialize_ldes::<Field, FieldExtension, PI, H, P>(
@@ -596,7 +639,8 @@ where
                 width: num_precomputed,
                 log_height: height,
             }];
-            fill_openings(mmcs, m, &src, &iotas, &mut prep_openings);
+            let indices = prep_iotas.as_ref().expect("the prep MMCS exists here");
+            fill_openings(mmcs, m, &src, indices, &mut prep_openings);
         }
         if let Some(m) = matrix_index(&shape.main, table) {
             let src = vec![BorrowedMatrix::RowMajorNatural {
@@ -606,7 +650,7 @@ where
                 width: total_cols - num_precomputed,
                 log_height: height,
             }];
-            fill_openings(&main_mmcs, m, &src, &iotas, &mut main_openings);
+            fill_openings(&main_mmcs, m, &src, &main_iotas, &mut main_openings);
         }
         if let (Some(mmcs), Some(m)) = (aux_mmcs.as_ref(), matrix_index(&shape.aux, table)) {
             let (aux_data, aux_cols) = &ldes.aux;
@@ -617,33 +661,43 @@ where
                 width: *aux_cols,
                 log_height: height,
             }];
-            fill_openings(mmcs, m, &src, &iotas, &mut aux_openings);
+            let indices = aux_iotas.as_ref().expect("the aux MMCS exists here");
+            fill_openings(mmcs, m, &src, indices, &mut aux_openings);
         }
         if let Some(m) = matrix_index(&shape.parts, table) {
             let src = vec![BorrowedMatrix::ColMajorNatural {
                 cols: &retained_parts[table],
                 log_height: height,
             }];
-            fill_openings(&parts_mmcs, m, &src, &iotas, &mut parts_openings);
+            fill_openings(&parts_mmcs, m, &src, &parts_iotas, &mut parts_openings);
         }
 
-        release_ldes(ldes, &mut retained_main, &mut retained_aux, table, &mut ledger, residency);
+        release_ldes(
+            ldes,
+            &mut retained_main,
+            &mut retained_aux,
+            table,
+            &mut ledger,
+            residency,
+        );
     }
 
-    let queries = iotas
-        .iter()
-        .enumerate()
-        .map(|(q, &iota)| BatchedQueryOpening {
-            prep: prep_mmcs
-                .as_ref()
-                .and_then(|mmcs| assemble(mmcs, iota, h_max, &mut prep_openings, q)),
-            main: assemble(&main_mmcs, iota, h_max, &mut main_openings, q)
-                .expect("the main round's h_max is the epoch's, so every iota is in range"),
-            aux: aux_mmcs
-                .as_ref()
-                .and_then(|mmcs| assemble(mmcs, iota, h_max, &mut aux_openings, q)),
-            parts: assemble(&parts_mmcs, iota, h_max, &mut parts_openings, q)
-                .expect("the parts round's h_max is the epoch's, so every iota is in range"),
+    let queries = (0..iotas.len())
+        .map(|q| BatchedQueryOpening {
+            prep: prep_mmcs.as_ref().map(|mmcs| {
+                let indices = prep_iotas.as_ref().expect("the prep MMCS exists here");
+                assemble(mmcs, indices[q], &mut prep_openings, q)
+                    .expect("the prep round was opened at these very indices")
+            }),
+            main: assemble(&main_mmcs, main_iotas[q], &mut main_openings, q)
+                .expect("the main round was opened at these very indices"),
+            aux: aux_mmcs.as_ref().map(|mmcs| {
+                let indices = aux_iotas.as_ref().expect("the aux MMCS exists here");
+                assemble(mmcs, indices[q], &mut aux_openings, q)
+                    .expect("the aux round was opened at these very indices")
+            }),
+            parts: assemble(&parts_mmcs, parts_iotas[q], &mut parts_openings, q)
+                .expect("the parts round was opened at these very indices"),
             fri: fri_decommitments[q].clone(),
         })
         .collect();
@@ -721,11 +775,12 @@ fn fill_openings<E, H, S>(
     S: LeafSource<E>,
     FieldElement<E>: AsBytes + Sync + Send,
 {
+    // `iotas` are in THIS round's index space already (see `reduced_iotas`).
+    // Passing the FRI's raw indices here does not corrupt anything quietly: a
+    // shorter round rejects them as out of range and produces no opening at
+    // all, which is what `the_preprocessed_round_is_committed_and_authenticates`
+    // caught the first time this was written the other way round.
     for (q, &iota) in iotas.iter().enumerate() {
-        // The round's own index space: a round whose tallest matrix sits below
-        // the FRI's must be reduced before it is read (`fri/mmcs.rs`'s
-        // index-convention section). `reduce_iota_to_round` is applied by the
-        // caller through `assemble`; here the index is already this tree's.
         let Some(leaf) = mmcs.row_pair_leaf(iota, matrix) else {
             continue;
         };
@@ -743,12 +798,30 @@ fn fill_openings<E, H, S>(
     }
 }
 
+/// Reduce every FRI query index into one round's index space.
+///
+/// `h_max_round <= h_max_fri` always holds for a round of this epoch — a round
+/// commits a subset of the epoch's tables, so its tallest matrix cannot exceed
+/// the epoch's — which is why this is infallible here and
+/// `reduce_iota_to_round` returns an `Option` on the verifier's path, where the
+/// heights are proof-supplied.
+fn reduced_iotas(iotas: &[usize], h_max_fri: usize, h_max_round: usize) -> Vec<usize> {
+    iotas
+        .iter()
+        .map(|&iota| {
+            crate::batched::round4::reduce_iota_to_round(iota, h_max_fri, h_max_round)
+                .expect("a round of this epoch is never taller than the epoch")
+        })
+        .collect()
+}
+
 /// Turn one query's per-matrix rows into a [`MixedOpening`] by attaching the
 /// round's shared authentication path.
+///
+/// `iota` is already in this round's index space — see [`reduced_iotas`].
 fn assemble<E, H>(
     mmcs: &MixedMmcs<E, H>,
-    iota_fri: usize,
-    h_max_fri: usize,
+    iota: usize,
     openings: &mut [Vec<Option<PolynomialOpenings<E>>>],
     query: usize,
 ) -> Option<MixedOpening<E>>
@@ -757,7 +830,6 @@ where
     H: StarkHash,
     FieldElement<E>: AsBytes + Sync + Send,
 {
-    let iota = crate::batched::round4::reduce_iota_to_round(iota_fri, h_max_fri, mmcs.h_max())?;
     let proof = mmcs.auth_path(iota)?;
     let per_matrix = openings[query]
         .iter_mut()
@@ -775,8 +847,8 @@ fn materialize_ldes<Field, FieldExtension, PI, H, P>(
     domains: &[std::sync::Arc<Domain<Field>>],
     twiddles: &[std::sync::Arc<crate::prover::LdeTwiddles<Field>>],
     shape: &EpochShape,
-    retained_main: &mut [Option<(Vec<FieldElement<Field>>, usize)>],
-    retained_aux: &mut [Option<(Vec<FieldElement<FieldExtension>>, usize)>],
+    retained_main: MainSlots<'_, Field>,
+    retained_aux: AuxSlots<'_, FieldExtension>,
     stats: &mut BatchedProveStats,
     ledger: &mut ResidencyLedger,
     residency: ResidencyMode,
@@ -840,8 +912,8 @@ where
 /// Give a table's LDEs back to the retention slots, or drop them.
 fn release_ldes<Field: IsField, FieldExtension: IsField>(
     ldes: LdePair<Field, FieldExtension>,
-    retained_main: &mut [Option<(Vec<FieldElement<Field>>, usize)>],
-    retained_aux: &mut [Option<(Vec<FieldElement<FieldExtension>>, usize)>],
+    retained_main: MainSlots<'_, Field>,
+    retained_aux: AuxSlots<'_, FieldExtension>,
     table: usize,
     ledger: &mut ResidencyLedger,
     residency: ResidencyMode,
@@ -861,13 +933,14 @@ fn release_ldes<Field: IsField, FieldExtension: IsField>(
     }
 }
 
-fn lde_trace_of<Field: IsFFTField, FieldExtension: IsField>(
+fn lde_trace_of<Field, FieldExtension>(
     ldes: &LdePair<Field, FieldExtension>,
     step_size: usize,
     blowup_factor: usize,
 ) -> LDETraceTable<Field, FieldExtension>
 where
-    Field: IsSubFieldOf<FieldExtension>,
+    Field: IsFFTField + IsSubFieldOf<FieldExtension>,
+    FieldExtension: IsField,
 {
     LDETraceTable::from_row_major(
         ldes.main.0.clone(),

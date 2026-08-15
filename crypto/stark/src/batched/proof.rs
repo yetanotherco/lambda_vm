@@ -152,7 +152,6 @@ impl ResidencyLedger {
     pub(crate) fn peak(&self) -> usize {
         self.peak
     }
-
 }
 
 /// Bytes a row-major LDE buffer of `len` field elements occupies.

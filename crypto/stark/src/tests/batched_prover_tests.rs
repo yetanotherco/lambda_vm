@@ -177,15 +177,16 @@ pub(crate) fn prove_repeated_with(
         .collect();
 
     let trace_lengths: Vec<usize> = (0..repeats).flat_map(|_| [8usize, 4, 4]).collect();
-    let (proof, stats) = multi_prove_batched::<F, E, (), KeccakStarkHash, GenericProver<F, E, (), KeccakStarkHash>>(
-        pairs,
-        transcript,
-        None,
-        #[cfg(feature = "disk-spill")]
-        crate::storage_mode::StorageMode::Ram,
-        residency,
-    )
-    .expect("the fixture is a well-shaped epoch");
+    let (proof, stats) =
+        multi_prove_batched::<F, E, (), KeccakStarkHash, GenericProver<F, E, (), KeccakStarkHash>>(
+            pairs,
+            transcript,
+            None,
+            #[cfg(feature = "disk-spill")]
+            crate::storage_mode::StorageMode::Ram,
+            residency,
+        )
+        .expect("the fixture is a well-shaped epoch");
 
     (airs, proof, stats, trace_lengths)
 }
@@ -246,7 +247,13 @@ fn batched_prove_openings_authenticate() {
                 "query {q}: main round must authenticate"
             );
             assert!(
-                round_verifies(&proof.parts_root, &query.parts, &shape.parts, iotas[q], h_max),
+                round_verifies(
+                    &proof.parts_root,
+                    &query.parts,
+                    &shape.parts,
+                    iotas[q],
+                    h_max
+                ),
                 "query {q}: parts round must authenticate"
             );
             let (Some(root), Some(opening)) = (proof.aux_root, query.aux.as_ref()) else {
@@ -388,7 +395,10 @@ fn residency_mode_does_not_move_any_batched_root() {
     assert_eq!(retained.aux_root, recomputed.aux_root);
     assert_eq!(retained.parts_root, recomputed.parts_root);
     assert_eq!(retained.fri_layer_roots, recomputed.fri_layer_roots);
-    assert_eq!(retained.fri_final_poly_coeffs, recomputed.fri_final_poly_coeffs);
+    assert_eq!(
+        retained.fri_final_poly_coeffs,
+        recomputed.fri_final_poly_coeffs
+    );
     assert_eq!(retained.nonce, recomputed.nonce);
 }
 
@@ -454,5 +464,191 @@ fn a_width_the_epoch_did_not_commit_is_rejected() {
             h_max
         ),
         "a main matrix width the epoch did not commit must be rejected"
+    );
+}
+
+// ===========================================================================
+// The PREPROCESSED round (M-6's prover half)
+// ===========================================================================
+//
+// Worth its own fixture because it is the only round whose `h_max` can sit
+// BELOW the FRI's, and therefore the only place `reduce_iota_to_round` does
+// real work. `fri/mmcs.rs` warns that getting that wrong is not a loud error —
+// prover and verifier share the routine, so a wrong convention is
+// self-consistent and honest proofs still verify while the short matrices are
+// authenticated at positions the FRI join never checks. An honest-path test
+// alone therefore proves nothing here; the un-reduced control below is what
+// makes the reduction load-bearing.
+
+/// The ADD table, declared preprocessed over its first two columns. The
+/// commitment value is never read on the batched path — that is the point of
+/// M-6: the epoch's single `prep_root` REPLACES the per-table
+/// `precomputed_commitment()` comparison.
+fn preprocessed_epoch(options: &ProofOptions) -> (Vec<Air>, Vec<TraceTable<F, E>>) {
+    let (cpu, add, mul) = traces();
+    let airs = vec![
+        new_cpu_air_with_lookup(options),
+        new_add_air_with_lookup(options).with_preprocessed([7u8; 32], 2),
+        new_mul_air_with_lookup(options),
+    ];
+    (airs, vec![cpu, add, mul])
+}
+
+/// What a preprocessed-epoch prove hands back: the AIRs (borrowed by the shape
+/// derivation), the proof, and the trace lengths the verifier would read off it.
+type PreprocessedProve = (Vec<Air>, BatchedMultiProof<F, E, ()>, Vec<usize>);
+
+fn prove_preprocessed(
+    expected_prep_root: Option<crate::config::Commitment>,
+) -> Result<PreprocessedProve, crate::prover::ProvingError> {
+    let options = folding_options();
+    let (airs, mut all_traces) = preprocessed_epoch(&options);
+    let unit = ();
+    let pairs: Vec<_> = airs
+        .iter()
+        .zip(all_traces.iter_mut())
+        .map(|(air, trace)| {
+            (
+                air as &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+                trace,
+                &unit,
+            )
+        })
+        .collect();
+    let (proof, _) =
+        multi_prove_batched::<F, E, (), KeccakStarkHash, GenericProver<F, E, (), KeccakStarkHash>>(
+            pairs,
+            &mut DefaultTranscript::<E>::new(&[]),
+            expected_prep_root,
+            #[cfg(feature = "disk-spill")]
+            crate::storage_mode::StorageMode::Ram,
+            ResidencyMode::Retain,
+        )?;
+    Ok((airs, proof, vec![8, 4, 4]))
+}
+
+/// Honest path, plus the two facts that make the rest of this section
+/// meaningful: the round exists, and its `h_max` really is below the FRI's.
+#[test_log::test]
+fn the_preprocessed_round_is_committed_and_authenticates() {
+    let (airs, proof, lengths) = prove_preprocessed(None).expect("an honest preprocessed epoch");
+    let shape = shape_of(&airs, &lengths);
+    let h_max = shape.h_max();
+
+    assert!(
+        proof.prep_root.is_some(),
+        "the epoch has a preprocessed table"
+    );
+    let prep_h_max = shape.prep.h_max().expect("the prep round is non-empty");
+    assert!(
+        prep_h_max < h_max,
+        "this fixture exists to put the prep round BELOW the FRI's h_max \
+         (prep {prep_h_max}, fri {h_max}); without that the reduction is inert \
+         and the controls below prove nothing"
+    );
+
+    let root = proof.prep_root.expect("just checked");
+    for (q, iota) in recover_iotas(&proof, &shape, h_max).into_iter().enumerate() {
+        let opening = proof.queries[q].prep.as_ref().expect("prep opening");
+        assert!(
+            round_verifies(&root, opening, &shape.prep, iota, h_max),
+            "query {q}: the preprocessed round must authenticate under the reduction"
+        );
+    }
+}
+
+/// ★ The control the index convention needs. Reading the prep round at the
+/// UN-reduced FRI index must fail — otherwise the reduction is decoration and a
+/// prover free to pick either convention would be believed under both.
+#[test_log::test]
+fn the_un_reduced_index_does_not_authenticate_the_preprocessed_round() {
+    let (airs, proof, lengths) = prove_preprocessed(None).expect("an honest preprocessed epoch");
+    let shape = shape_of(&airs, &lengths);
+    let h_max = shape.h_max();
+    let root = proof.prep_root.expect("the epoch has a preprocessed table");
+    let prep_h_max = shape.prep.h_max().expect("non-empty");
+
+    let mut any_differed = false;
+    for (q, iota) in recover_iotas(&proof, &shape, h_max).into_iter().enumerate() {
+        let opening = proof.queries[q].prep.as_ref().expect("prep opening");
+        let reduced = crate::batched::round4::reduce_iota_to_round(iota, h_max, prep_h_max)
+            .expect("the prep round is shorter");
+        if reduced == iota {
+            continue;
+        }
+        any_differed = true;
+        assert!(
+            !MixedMmcs::<F, KeccakStarkHash>::verify_batch(
+                &root,
+                iota,
+                opening,
+                &shape.prep.heights(),
+                &shape.prep.widths(),
+            ),
+            "query {q}: the un-reduced FRI index must not authenticate the prep round"
+        );
+    }
+    assert!(
+        any_differed,
+        "at least one query must have a reduced index different from the raw one, \
+         or this test never exercised the convention it exists for"
+    );
+}
+
+/// Per-matrix tamper control on the preprocessed round. MMCS-PLAN §3.3's closing
+/// warning is that consolidating a per-table soundness check into one comparison
+/// is where coverage quietly goes missing: the batched comparison must fail if
+/// ANY single table's preprocessed matrix is wrong.
+#[test_log::test]
+fn a_tampered_precomputed_row_is_rejected_per_matrix() {
+    let (airs, proof, lengths) = prove_preprocessed(None).expect("an honest preprocessed epoch");
+    let shape = shape_of(&airs, &lengths);
+    let h_max = shape.h_max();
+    let root = proof.prep_root.expect("the epoch has a preprocessed table");
+    let iota_0 = recover_iotas(&proof, &shape, h_max)[0];
+    let honest = proof.queries[0].prep.clone().expect("prep opening");
+
+    assert!(
+        round_verifies(&root, &honest, &shape.prep, iota_0, h_max),
+        "honest-path control: the untampered opening must authenticate"
+    );
+    for matrix in 0..shape.prep.tables.len() {
+        for column in 0..shape.prep.dims[matrix].1 {
+            let mut tampered = honest.clone();
+            tampered.per_matrix[matrix].evaluations[column] += FE::one();
+            assert!(
+                !round_verifies(&root, &tampered, &shape.prep, iota_0, h_max),
+                "prep matrix {matrix}, column {column}: a tampered precomputed value \
+                 must be rejected"
+            );
+        }
+    }
+}
+
+/// The registry's committed `prep_root` (M-6) is checked on the PROVER side, so
+/// a stale preprocessed constant fails fast here instead of at every future
+/// verifier — the property the per-table path gets from
+/// `commit_main_trace`'s `PrecomputedCommitmentMismatch`.
+#[test_log::test]
+fn a_registry_prep_root_mismatch_fails_the_prove() {
+    let honest_root = prove_preprocessed(None)
+        .expect("an honest preprocessed epoch")
+        .1
+        .prep_root
+        .expect("the epoch has a preprocessed table");
+
+    assert!(
+        prove_preprocessed(Some(honest_root)).is_ok(),
+        "honest-path control: the registry's own root must be accepted"
+    );
+
+    let mut wrong = honest_root;
+    wrong[0] ^= 0xff;
+    assert!(
+        matches!(
+            prove_preprocessed(Some(wrong)),
+            Err(crate::prover::ProvingError::PrecomputedCommitmentMismatch)
+        ),
+        "a prep root the registry did not commit must fail the prove"
     );
 }

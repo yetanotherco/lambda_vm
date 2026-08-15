@@ -1686,6 +1686,7 @@ pub trait IsStarkProver<
     /// the arm selection (`number_of_parts` 1 / 2 / d>2, the device paths and
     /// their fallbacks) is intricate enough that a second copy would drift — so
     /// there is one function, and the commitment is what differs.
+    #[allow(clippy::too_many_arguments)]
     fn compute_composition_parts(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         pub_inputs: &PI,
@@ -1703,8 +1704,13 @@ pub trait IsStarkProver<
     {
         // Compute the evaluations of the composition polynomial on the LDE domain.
         let trace_length = domain.interpolation_domain_size;
-        let evaluator =
-            ConstraintEvaluator::new(air, pub_inputs, rap_challenges, bus_public_inputs, trace_length);
+        let evaluator = ConstraintEvaluator::new(
+            air,
+            pub_inputs,
+            rap_challenges,
+            bus_public_inputs,
+            trace_length,
+        );
         let number_of_parts = air.composition_poly_degree_bound(trace_length) / trace_length;
 
         #[cfg(feature = "instruments")]
@@ -2444,7 +2450,7 @@ pub trait IsStarkProver<
                     crate::gpu_lde::try_deep_composition_gpu::<Field, FieldExtension>(
                         lde_trace,
                         lde_trace.gpu_composition_parts(),
-                        &composition_parts,
+                        composition_parts,
                         h_ood,
                         &trace_ood_columns,
                         composition_poly_gammas,
@@ -2480,7 +2486,7 @@ pub trait IsStarkProver<
                 crate::gpu_lde::try_deep_composition_gpu::<Field, FieldExtension>(
                     lde_trace,
                     lde_trace.gpu_composition_parts(),
-                    &composition_parts,
+                    composition_parts,
                     h_ood,
                     &trace_ood_columns,
                     composition_poly_gammas,
@@ -3106,7 +3112,7 @@ pub trait IsStarkProver<
                             {
                                 let expected = Self::open_composition_poly_with_proof(
                                     proofs[qi].clone(),
-                                    &composition_parts,
+                                    composition_parts,
                                     *index,
                                 );
                                 assert_eq!(
@@ -3135,13 +3141,13 @@ pub trait IsStarkProver<
                             );
                             Self::open_composition_poly_with_proof(
                                 proofs[qi].clone(),
-                                &composition_parts,
+                                composition_parts,
                                 *index,
                             )
                         }
                         _ => Self::open_composition_poly(
                             &round_2_result.composition_poly_merkle_tree,
-                            &composition_parts,
+                            composition_parts,
                             *index,
                         ),
                     }
@@ -3150,7 +3156,7 @@ pub trait IsStarkProver<
                 {
                     Self::open_composition_poly(
                         &round_2_result.composition_poly_merkle_tree,
-                        &composition_parts,
+                        composition_parts,
                         *index,
                     )
                 }
