@@ -6,6 +6,20 @@ external anchors). Cost model = the verified one in `../keccak-verify/tier2_cost
 (a committed cell is expensive; each bus send ≈ 1.5 base cells of aux; **hard**
 max constraint degree 3 *including* the ×μ gating factor).
 
+> **⚠ Every `../keccak-verify/` citation in this document is DEAD.** That
+> directory lived in the same 2026-07-23 session scratchpad this design was
+> recovered from and was never committed — it exists on no branch. Two
+> conclusions were deferred to it, and both have since been re-established
+> independently, so nothing here rests on the missing files:
+> * the **cost model** above (1.5 aux cells/send, degree ≤ 3 incl. ×μ) — the
+>   per-G and per-compression arithmetic in §2/§3/§6 was recomputed from
+>   scratch and checks out;
+> * the **shift-identity bound necessity** cited at §4.2 and §9 — re-derived
+>   symbolically over all 2^32 inputs by the 2026-07-29 transcription audits,
+>   which is stronger than the single-point check the lost file made.
+>
+> Do not go looking for them; read the citations as historical.
+
 **Verdict (numbers derived below, gate in `z3_blake_verify.py`):**
 * **Layout: B — one row per compression, fully unrolled.** Chosen by arithmetic
   (≈5,030 cell-equiv vs ≈5,510 for one-row-per-round), and it deletes the
@@ -45,6 +59,23 @@ child chaining values as the message and reads back the truncated CV.
 **Send** (multiplicity μ) — the output `out[0..16]` (16 words = 64 B). CV-only
 call sites read `out[0:8]`; the chip always produces all 16 (the XOF root needs
 them, oracle §2.4).
+
+**Both tuples MUST lead with `TIMESTAMP_0, TIMESTAMP_1` — this is mandatory,
+not optional.** The receive and the send are two separate interactions, so
+without a key present in *both* nothing ties a row's inputs to its own outputs.
+With two compressions in a trace a prover could then have row A receive
+`inputs_A` and send `out_B` while row B does the reverse: every tuple still
+appears exactly once on each side, **so the bus balances**, and both callers
+read a result that is not the compression of their own input.
+
+This is not a hypothetical hardening: `keccak.rs` — the chip this design copies
+its I/O idiom from (§1.2) — carries `TIMESTAMP_0, TIMESTAMP_1` in *both* halves
+of its internal `Keccak` bus (send at `round = 0`, receive at `round = 24`)
+for exactly this reason. Do not deviate from it.
+
+**The gate cannot check this.** `z3_blake_verify.py` models arithmetic only and
+has no bus-interaction layer at all, so a missing binding leaves every UNSAT on
+the board unchanged. It has to be got right by construction.
 
 `IV[0..4]` (v[8..11]) are **compile-time constants inlined** into the round-0
 arithmetic — not columns, not on the bus.
@@ -108,7 +139,7 @@ One row = one compression call. Names group by role; counts are for `ROUNDS=6`.
 
 | block | columns | count | notes |
 |---|---|---:|---|
-| `TIMESTAMP_0/1` | 2 | 2 | bus binding (internal variant may omit) |
+| `TIMESTAMP_0/1` | 2 | 2 | bus binding — **mandatory in both the receive and the send** (§1.1); omitting it lets two rows swap outputs with the bus still balancing |
 | `MU` | 1 | 1 | multiplicity / gate flag |
 | `H[0..8]` | 8 words | 32 | input CV bytes |
 | `M[0..16]` | 16 words | 64 | input message bytes |
@@ -177,13 +208,32 @@ read in-place. Eval constraints: none (pure lookup). Degree: n/a.
   SLLC_hi` = 4 sends/rotation (`bitwise.rs:783`). `Y` is range-checked *free* by
   the downstream XOR that consumes it.
 
-  Soundness (proven in `../keccak-verify/hwsl_inline_test.py` Part 2, and by the
-  width audit in the gate): given `SLL_* ∈ [0,2^16)` (the tight remainder bound
+  Soundness (originally deferred to `../keccak-verify/hwsl_inline_test.py`
+  Part 2 — **that file is lost, see the banner at the top; the result was
+  re-derived independently and more strongly by the 2026-07-29 audits** — and by
+  the width audit in the gate): given `SLL_* ∈ [0,2^16)` (the tight remainder bound
   from AreBytes) and `2^16` invertible mod p, the identity **uniquely** pins
   `SLL = (xlo·2^r) mod 2^16` and `SLLC = (xlo·2^r) >> 16`; the loose 16-bit bound
   on `SLLC` suffices because it is the quotient, not the remainder. The two
   recombination sums are over non-overlapping bit ranges, so `+` = `OR` and each
   is an exact 16-bit halfword.
+
+  **Refined by the transcription audits (2026-07-29), symbolically over all
+  2^32 inputs — the earlier wording was coarser than the truth:**
+  * The load-bearing bound set is **at least one of `{SLL_lo, SLL_hi}`**. Every
+    configuration with neither is forgeable; every configuration with either is
+    pinned. **The two `SLLC` bounds are not load-bearing at all** — so of the 4
+    `AreBytes` sends per rotation, only the `SLL` pair carries soundness weight.
+    Read the sentence above as "a tight bound on at least one `SLL` halfword",
+    not "the tight `SLL` bound".
+  * The *composed* forgery (both `SLL` bounds dropped) exists for exactly **one**
+    input, `X = 0xFFFFFFFF` → forged `Y = 0`, exhaustively confirmed for both
+    `r = 4` and `r = 9`. The gate's isolated control makes it look reachable for
+    arbitrary inputs; it is not. Narrow, but a forgery is a forgery.
+  * The rotation **output** needs no range check of its own: the two recombine
+    identities pin its value even with free field cells. So the §4.7 "free range
+    check" argument is load-bearing for the **add** outputs and one `SLL`
+    halfword per rotation — not for the rotation output.
 
   **HWSL alternative, priced:** replace each shift identity with an `Hwsl` send
   (`bitwise.rs:831`). Cost/rotation: +2 Hwsl sends, same AreBytes, same columns.
@@ -265,7 +315,7 @@ output feeds a downstream XOR ⇒ free.
 | 3-op add sum identity | 1 | 2 | ✅ |
 | 3-op add carry booleanity ×2 | 2 | 3 | ✅ |
 | shift identity (×2) | 1 | 2 | ✅ |
-| recombine identity (×2) | 2 | 3 | ✅ |
+| recombine identity (×2) | 1 (was stated as 2) | 2 | ✅ |
 | (rejected) ternary carry | 3 | **4** | ❌ |
 
 Worst legal constraint = 3. **No constraint exceeds 3.**
@@ -318,14 +368,31 @@ oracle's prose "¼–⅓ of a keccak permutation" is inconsistent with its own
 2. **3-op add = two summed carry bits with the explicit sum identity** — not a
    single ternary carry (degree 4 after gating), and the sum identity must be
    present (without it, `s` is only constrained mod nothing). (§4.4)
-3. **Shift identity needs the tight `SLL ∈ [0,2^16)` AreBytes bound**; dropping it
+3. **Shift identity needs a tight `∈ [0,2^16)` AreBytes bound on at least one of
+   `SLL_lo`/`SLL_hi`** (the `SLLC` bounds are *not* load-bearing — audited
+   2026-07-29, §4.2); dropping it
    makes the rotation forgeable (a wrong `SLL` admits a large field `SLLC`).
    Soundness relies on `2^16` invertible mod p — a BV model cannot see this;
    verify in the field (gate width audit + `hwsl_inline_test.py`). (§4.2)
-4. **Every add/shift output must actually feed a downstream XOR** (its only range
+4. **Every add output must actually feed a downstream XOR** (its only range
    check). If a future refactor reorders so an add output is *last* with no XOR
    consumer, add an explicit AreBytes or the carry argument is unsound. (§5)
+
+   ⚠ **THE GATE CANNOT CHECK THIS, and both 2026-07-29 audits confirmed it with
+   explicit forgeries.** `build_g` returns each add output as `fresh_word()` =
+   4×`BitVec(...,8)`, so byte range is **declared by construction, never derived
+   from a modelled lookup**. The gate therefore proves the identical UNSAT for a
+   chip that has the downstream XOR and for one that does not. Drop it and the
+   sum is forgeable — witness `a = b = 0x80000000`, honest `s = 0`, forged
+   `s = 2^32` with `carry = 0`, satisfying every modelled constraint. This
+   invariant rests entirely on the implementer, and a green board is not
+   evidence for it.
 5. **Message `m` needs explicit AreBytes** — it is never XORed. (§4.7)
+   ⚠ Same blind spot: the gate declares `m` as 16×4 `BitVec(...,8)`, so it proves
+   the same UNSAT with or without those 32 `AreBytes` sends. Without them a
+   message word has many cell representations of one value over `F_p` (e.g.
+   `[0x9A,0,0x13,0x7F]` and `[0x19A,p−1,0x13,0x7F]`), because the chip binds
+   `Σ m_i·2^(8i)`, not the 64 bytes.
 6. **rotr16/rotr8 byte order** exactly `[b2,b3,b0,b1]` / `[b1,b2,b3,b0]`
    (little-endian). A wrong relabel silently corrupts. (§4.2)
 7. **Message permutation `permute^r`** wired per round from the *original* 16
@@ -340,6 +407,17 @@ oracle's prose "¼–⅓ of a keccak permutation" is inconsistent with its own
    expressions stay `< 2^35 ≪ p`, so `≡0 mod p` ⇒ `=0` as integers; the whole
    soundness argument depends on operands being genuine ≤32-bit (byte columns)
    and carries being genuine bits.
+10. **`TIMESTAMP_0/1` in BOTH the `Blake3` receive and send** (§1.1). Without a
+    key in both tuples nothing binds a row's inputs to its own outputs, and two
+    compressions can swap results while the bus still balances. `keccak.rs` does
+    this correctly and is the pattern to copy. **The gate cannot catch a
+    violation** — it models arithmetic only, with no bus layer — so this one is
+    on the implementer, not on a green board.
+11. **Every G instance must be wired as MAIN 0 models it.** MAIN 0 proves *one*
+    G under free inputs; the 48 unrolled instances are emitted separately, so a
+    wrong column or message index in a single instance is invisible to it. The
+    concrete positive controls are what cover that — keep them runnable, and run
+    `--full`'s monolithic UNSAT before shipping Rust.
 
 ---
 
