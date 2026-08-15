@@ -208,7 +208,13 @@ fn fri_layer_trees_are_built_with_the_configurations_pair_backend() {
     use crate::fri::commit_phase_from_evaluations;
     use crate::fri::fri_functions::compute_coset_twiddles_inv;
 
-    fn check<H: StarkHash>(offset: &FE, len: usize, blowup_log: u32, k: u32) -> Vec<[u8; 32]> {
+    /// Returns each committed layer's root, and layer 0's folded codeword.
+    fn check<H: StarkHash>(
+        offset: &FE,
+        len: usize,
+        blowup_log: u32,
+        k: u32,
+    ) -> (Vec<[u8; 32]>, Vec<FE>) {
         let codeword: Vec<FE> = (0..len as u64).map(|i| FE::from(i * 7 + 1)).collect();
         let inv_twiddles = compute_coset_twiddles_inv::<F>(offset, len);
         let mut transcript = DefaultTranscript::<F>::new(&[]);
@@ -235,21 +241,29 @@ fn fri_layer_trees_are_built_with_the_configurations_pair_backend() {
                 "layer {i}'s committed root must be the H::Pair tree over its own evaluations"
             );
         }
-        layers.iter().map(|l| l.merkle_tree.root).collect()
+        (
+            layers.iter().map(|l| l.merkle_tree.root).collect(),
+            layers[0].evaluation.clone(),
+        )
     }
 
     let offset = FE::from(3u64);
     let (len, blowup_log, k) = (1usize << 10, 1u32, 5u32);
 
-    let keccak_roots = check::<KeccakStarkHash>(&offset, len, blowup_log, k);
-    let blake3_roots = check::<Blake3StarkHash>(&offset, len, blowup_log, k);
+    let (keccak_roots, keccak_layer0) = check::<KeccakStarkHash>(&offset, len, blowup_log, k);
+    let (blake3_roots, blake3_layer0) = check::<Blake3StarkHash>(&offset, len, blowup_log, k);
 
-    // The first layer's codeword is identical under both configurations — the
-    // transcript is the same up to that point, so ζ₀ and the fold are too — and
-    // the roots still differ. That isolates the difference to the hash.
+    // ζ₀ is drawn before anything is appended, so both configurations fold the
+    // same input with the same challenge and layer 0's codeword is identical.
+    // Checked rather than argued, because it is what makes the root comparison
+    // below mean "the hash differs" instead of "the input differs".
+    assert_eq!(
+        keccak_layer0, blake3_layer0,
+        "layer 0 must fold identically under both configurations"
+    );
     assert_ne!(
         keccak_roots[0], blake3_roots[0],
-        "layer 0 folds identically under both configurations, so its root must \
-         differ only because the hash does"
+        "over one identical codeword, the layer root must differ only because \
+         the hash does"
     );
 }
