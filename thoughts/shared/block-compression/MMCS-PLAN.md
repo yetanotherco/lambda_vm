@@ -1363,122 +1363,178 @@ Two smaller notes for the same pass:
 
 ## ADDENDUM B — the `eps_C` delta from batching
 
-Written on `mmcs-integration`. Required before the batched path may ship: the
-2026-08-15 security audit (SECURITY-LEVELS §1.3) found the proximity-gaps
-batching term to be the system's soundness FLOOR at ~92 proven bits, carrying
-Haböck 2022/1216 Thm 2's `(L − 1/2)` factor, and batching changes exactly the
-two inputs that term depends on.
+Required before the batched path may ship: the 2026-08-15 security audit
+(SECURITY-LEVELS §1.3) found the proximity-gaps batching term to be the system's
+soundness FLOOR, and batching moves the two inputs it depends on. Grounded in
+the REAL census — `bench_cache/lfm_census_2026-08-12/census_logs/ethrex_e20_blowup2_skip.log`,
+block 25368371, epoch 2^20, 28 sub-proofs with measured per-leg
+`log2_trace_length`, LDE, main and aux widths.
 
 ### B.0 Answer
 
-**Batching can only make the floor worse, never better, and the loss is
-`2 bits per level of L-weighted height spread` — not per level of raw spread.**
-The exact figure is a property of the epoch's `(height, L)` profile and nothing
-else; the closed form is B.2 and it is two lines.
+**Batching costs 6.87 bits (union framing) / 8.43 bits (RBR-max framing) at epoch
+2^20, at BOTH blowups.** Robust to ±0.2 bits across epochs 2^20/2^21/2^22, both
+blowups, a keccak-heavy synthetic profile, and all six `L`-model variants.
 
-At a profile where 90% of the batch weight sits at `h_max` the cost is **0.15
-bits**. At 50/50 across three levels it is **~1.0 bit**. The hard ceiling is
-`2·(h_max − h_min)` bits, reached only if the entire batch weight sat on the
-shortest table, which no real epoch does.
+| | blowup 2 | blowup 4 |
+|---|---|---|
+| today, worst single instance | 97.08 | 97.06 |
+| today, union over 28 instances | 95.52 | 95.50 |
+| **batched, conservative `(L − 1/2)`** | **88.65** | **88.62** |
+| delta (union framing) | **−6.87** | **−6.88** |
 
-**Verdict: this does not block the batched path** at any plausible profile, but
-it is not free either, and §1.1's projection does not price it. ⚠ The number
-that must be produced before the default is ever flipped is B.4's — the real
-epoch's `(h_t, L_t)` list, which the census logs hold and this addendum does not.
+With the two design adjustments in B.5 the batched floor is **94.19** — a
+conservative cost of ~1.3 bits against today's union — and after the `eta`/`m`
+retune (Mauro-gated, SECURITY-LEVELS §2.3) the residual is **−1.93 bits at
+worst**. That package is the ruling; §B.5 is what the integration implements.
 
-### B.1 Why the two inputs move, and in opposite directions
+### B.1 The cause, and the framing that gets it backwards
 
-SECURITY-LEVELS §1.3 (✓ VERIFIED there, reproduced structurally here):
+**100% of the penalty is the `|D0|²` lift of short tables. 0% is the batch
+size.** ✓ VERIFIED by construction: 28 separate instances all at 2^22 give
+88.653 bits; one batched instance carrying `Sum L_t` at 2^22 gives 88.649. For an
+epoch whose tables are all the same height, batching is soundness-neutral to
+within 0.004 bits.
 
-```
-eps_C = (L − 1/2) · [ (m + 1/2)^7 / (3·sqrt(rho^3)) · |D0|^2/|F|  +  (second term) ]
-```
-
-with the second term ~55 bits below the first, so `eps_C ≈ (L − 1/2)·C·|D0|²/|F|`
-where `C` depends only on `m` and `rho` — the blowup and `eta`, both of which are
-per-proof, not per-table. So `C` is COMMON to every instance and cancels out of
-any comparison. That is what makes the delta computable without redoing the
-theorem.
-
-- **`L` grows.** Today each table runs its own instance with
-  `L_t = num_terms_composition_poly + num_surviving_trace_openings_t`
-  (✓ VERIFIED `ood.rs`, and `prover.rs`'s `deep_composition_coefficients` is
-  powers of a single `gamma`, which is what earns the full `(L − 1/2)` rather
-  than Remark 3's affine `3/2`). Batched, one instance carries `Sum_t L_t`.
-- **`|D0|` grows for the short tables.** Every instance now runs over the
-  TALLEST domain; a table at `h_t < h_max` is lifted. Since `eps_C` goes as
-  `|D0|²`, that is `2 bits per level` for that table's contribution.
-
-The naive framing — "thirty instances become one, so the union bound over thirty
-goes away" — is wrong, and this is the trap. The union bound does not go away:
-it is absorbed into `L`. `Sum_t (L_t − 1/2)` and `(Sum_t L_t) − 1/2` differ by
-`(n−1)/2`, which is nothing. **All the movement is in `|D0|`.**
-
-### B.2 The closed form
-
-System error today (union over the instances the verifier must ALL accept):
+The reason is worth stating because the natural framing has it exactly wrong.
+"Thirty instances collapse to one, so the union bound over thirty goes away" is
+FALSE — **the union bound over per-table instances already sums the `L_t`**, so
+the batch-size factor is identical on both sides:
 
 ```
-eps_today  = (C/|F|) · Sum_t (L_t − 1/2) · |D0_t|²
-eps_batch  = (C/|F|) · (Sum_t L_t − 1/2) · |D0_max|²
+eps_today = (C/|F|) · Sum_t (L_t − 1/2) · |D0_t|²
+eps_batch = (C/|F|) · (Sum_t L_t − 1/2) · |D0_max|²
 ```
 
-Dropping the `1/2` (every `L_t` is in the hundreds), with `w_t = L_t / Sum L`
-and `|D0_t| = 2^h_t`:
+`C` depends only on `m` and `rho` — per-proof, not per-table — so it cancels and
+no part of Haböck Thm 2 has to be re-derived to compare them. Dropping the `1/2`
+(every `L_t` is in the hundreds), with `w_t = L_t / Sum L`:
 
 ```
 R = eps_batch / eps_today = 1 / Sum_t ( w_t · 4^-(h_max − h_t) )
-
-bits lost = log2(R) ≥ 0, with equality iff every table sits at h_max
+bits lost = log2(R) >= 0,  equality iff every table sits at h_max
 ```
 
-**`R ≥ 1` always**, by Jensen on a convex weighting — batching is never a
-soundness improvement. The ceiling is `4^(h_max − h_min)`, i.e. `2·(h_max −
-h_min)` bits, attained only when all the weight is at `h_min`.
+`R >= 1` always: **batching is never a soundness improvement.**
 
-### B.3 Sensitivity — what the answer looks like as a function of the profile
+### B.2 Why the real epoch is the bad case
 
-Computed from B.2; ? INFERRED profiles, not census data.
+The loss is governed by how much of the batch's WIDTH sits below the tallest
+table, and it is insensitive to how many short tables there are. The measured
+profile is close to the worst arrangement of that quantity:
 
-| L-weighted profile | bits lost |
-|---|---|
-| every table at `h_max` | 0.00 |
-| 90% of `L` at `h_max`, 10% three levels down | 0.15 |
-| 50% at `h_max`, 50% three levels down | 0.98 |
-| uniform `L` over `h_max`, −1, −2, −3 | 1.59 |
-| 10% at `h_max`, 90% three levels down | 3.13 |
+- `Sum L_t = 5018` over 28 legs; `h_max` = 2^22 (blowup 2) / 2^23 (blowup 4).
+- **The 13 legs at `log2_trace_length <= 7` carry `Sum L = 4601` — 92% of the
+  batch — and each is lifted 28-38 bits.**
+- `KECCAK_RND` alone is `L = 1999` at 2^3 rows: 127.98 bits on its own domain,
+  **89.98 lifted to 2^22**.
+- The table that sets `h_max` is `LOCAL_TO_GLOBAL`, which is 9 main + 3 aux
+  columns — `L ~ 15`, about 0.3% of the batch weight.
 
-The shape of that column is the useful part: **the loss is governed by how much
-of the batch's WIDTH sits below the tallest table, and it is insensitive to how
-many short tables there are.** Thirty narrow short tables cost almost nothing;
-one very wide short table costs real bits.
+So nearly all the width sits at the bottom and nearly all the height at the top.
+`L` and `h` are close to anti-correlated across this table set, which is the
+configuration `R` punishes hardest.
 
-⚠ **This is where the answer could turn unpleasant, and it is worth checking
-rather than assuming.** CENSUS.md §3 records that at the real 2^21 point the
-widest object by far is `KECCAK_RND` (1480 main + 516 aux columns), and in the
-wrap's leg dump it sits at **2^2 rows against a deepest leg of 2^22** — the
-exact adversarial shape for this term: nearly all the width, nowhere near the
-height. If that shape carries to the layer being batched, B.3's last row is the
-relevant one and the cost is ~3 bits, not ~0.2. ? INFERRED — the leg dump is the
-wrap's census, not the RV64 epoch's, and which one applies depends on which
-application (a) or (b) is being batched.
+### B.3 Corrections to §1.3's inputs, found while grounding this
 
-### B.4 What must be measured before the default is flipped
+Four, all ✓ VERIFIED against the census and the code, and all of which make
+TODAY's floor better than §1.3 reports rather than worse:
 
-The `(h_t, L_t)` list for the epoch actually being batched, from the census logs
-(`ethrex_e2*_skip.log` carries the leg shapes: `log2_trace_length`, main and aux
-width per leg). Feed it through B.2. That is a five-minute computation once the
-list is in hand, and it is the only remaining input.
+1. **§1.3's 92.0 is a single worst-instance figure (its own §5 item 2 says so)
+   and the instance is HYPOTHETICAL.** It pairs the widest table's `L`
+   (1480 + 516) with the deepest table's `|D0|` (2^21). No real table has both:
+   the 1996-column table is `KECCAK_RND` at 4 ROWS; the 2^21-row table has 12
+   columns. Today's real floor is **95.52** (union) / 97.08 (worst instance).
+2. **"trace <= 2^20" is false.** Measured epochs contain 2^21 and 2^22-row
+   tables.
+3. **`LOCAL_TO_GLOBAL` has NO `max_rows` entry** — ✓ VERIFIED,
+   `prover/src/tables/mod.rs:83-99` lists 14 tables and it is not among them. It
+   is therefore the table that sets `h_max` at every epoch size.
+4. **The union costs only 1.0-1.6 bits, not `log2(28) = 4.8`**, because one tall
+   table dominates the sum.
+5. `L_t = 2 (parts) + (mainW + auxW) + 1 (next row)`. ✓ VERIFIED `step_size = 1`
+   and `transition_offsets = [0,1]` for every production AIR, and
+   `trace_ood_next_row_columns()` returns exactly ONE column (the LogUp
+   accumulator) — not the conservative full-width default.
 
-Two decision rules for whoever runs it:
+### B.4 The affine `3/2` is NOT available — do not ship claiming it
 
-- **Under ~1 bit:** ship. The floor moves from ~92.0 to ~91 and stays far above
-  the 80-bit line §4's draft statement claims.
-- **Over ~3 bits:** stop and raise it. §1.3's falsification pass 3 is the reason
-  this cannot be bought back — grinding and queries attach to the QUERY term, not
-  to `eps_C`, so no query-count change repairs it. The levers that do work are
-  (i) shorter traces, (ii) a smaller batch, or (iii) claiming affine batching:
-  independent per-table challenges instead of powers of one `gamma` replaces
-  `(L − 1/2)` with `3/2` and is worth **~10 bits** on its own (§1.3's table:
-  92.0 → 102.4). That last one is a prover change, not a parameter change, and it
-  would make this addendum moot — worth costing if B.4 comes back bad.
+✓ VERIFIED `HeightCombiner::absorb` scales by `next_power` and then does
+`next_power *= alpha` (`fri/batched.rs:74-85`): powers of ONE challenge, so the
+outer level is a degree-`(T-1)` curve carrying `(T - 1/2)`, not `3/2`.
+
+Two further reasons it does not become available cheaply:
+
+- Even if the outer level WERE affine, the composite coefficient is
+  `c_t · gamma_t^i` — the inner per-table `gamma` ladders survive, so
+  `Sum_t (L_t − 1/2)` stays. Outer-affine buys `log2(27.5/1.5) = 4.2` bits on a
+  term already 8 bits below the dominant one: **net ~0.00**.
+- ✓ VERIFIED `inject_bucket` adds `beta² · bucket` using the SAME `beta` as that
+  layer's fold (`fri/batched.rs:308-326`), so each fold-and-inject step is a
+  degree-2 curve in `beta`. The affine reading is not available even for the fold
+  steps.
+
+The `3/2` is only reachable by making the INNER per-table DEEP batching affine —
+SECURITY-LEVELS R2, roughly 5000 extra transcript squeezes in the recursion
+guest. That is a prover change with a real cycle cost, not a parameter change.
+
+### B.5 The remedies, and the ruling
+
+Epoch 2^20, blowup 2, union framing. Full batch = 88.65.
+
+| remedy | floor | recovered |
+|---|---|---|
+| exclude the `friL == 0` tables (13 legs, `log2tr <= 7`) | 92.24 | **+3.59** |
+| cap `LOCAL_TO_GLOBAL` at `max_rows` 2^20 | 90.64 | **+2.00** |
+| **both** | **94.19** | **+5.54** (81% of the loss) |
+| two batched instances split at 2^19-2^20 | ~92.6 | +4.0 |
+| affine INNER batching (R2) | ~100 | +11, real guest cycles |
+| `eta`/`m` retune (R1) | see below | the answer |
+
+**Excluding the `friL == 0` tables is not a compromise, it is a correction.**
+Those 13 legs have ZERO committed FRI layers per the census, so batching them
+buys no FRI-layer saving whatsoever while paying the full `|D0|²` lift — pure
+loss for zero gain. They keep their own trivial per-table instances. This also
+REDUCES integration work.
+
+**R1 is the answer to the residual.** Batched + R1 = 112.42 bits (`m = 9`);
+today + R1 = 114.35 (`m = 16`). So after the retune the batching penalty is only
+**−1.93 bits** (blowup 4: 116.43 → 114.87, −1.56). Zero queries, zero prover
+cost, one expression in `with_params`. ⚠ The constant is **Mauro's ratification
+item** (SECURITY-LEVELS §2.3) and is not implemented here.
+
+**Queries cannot buy any of this back.** ✓ VERIFIED: at `m = 106`, blowup 2,
+`s = 219` gives floor 88.65; `s = 10,000` gives floor 88.65 (the query term
+reaches 4952 bits and the floor does not move). This reproduces §1.3's
+falsification pass 3. The query term actually IMPROVES under batching
+(123.21 union → 128.01 single instance) but sits 39 bits above the floor and is
+inert. More blowup does not help either: `eps_C` is blowup-independent —
+`m^7·rho^-1.5·|D0|²` with `m ~ sqrt(rho)` and `|D0| ~ 1/rho` gives `rho^0`.
+
+### B.6 ✗ UNCERTAIN — the gate item, carried verbatim
+
+**No theorem in the campaign's cited literature (BCIKS20, Haböck 2022/1216,
+Block et al. 2024/1161) covers STAGED, HEIGHT-INJECTED, MIXED-DOMAIN batched
+FRI.** All three treat `L` codewords on a COMMON `D0`. The conservative
+`L = Sum L_t` figure above is defensible as a two-level hierarchical union with
+BOTH levels instantiated at `|D_max|` — **that derivation is ours, not a
+citation.**
+
+A third reading that is plausibly physically right — "staged", where each table's
+`(L_t − 1/2)` attaches to its own injection-layer domain and only the ~22
+fold/inject steps and ~13 bucket-`alpha` curves are paid at the taller domains —
+gives **94.57 bits, delta only −0.95**. If a citable analysis for
+mixed-degree/staged FRI turns up (Plonky3-style, or STIR/WHIR degree
+correction), the penalty likely collapses from −6.9 to −1.0.
+
+**Until then: the claim that ships is the conservative two-level hierarchical
+union at `|D_max|`, NOT the affine `3/2`.**
+
+### B.7 One soundness positive, verified in passing
+
+`absorb_shape_histogram` binds heights and widths BEFORE `alpha` is sampled
+(`fri/batched.rs:445-447`), so an adversary cannot choose the height profile
+after seeing `alpha`. That binding is load-bearing for everything above — the
+whole analysis assumes the height profile is fixed. Keep it. (Addendum A's
+recommendation to absorb it once more before the FIRST batched root strengthens
+the same property for rounds 1-3.)
