@@ -468,6 +468,37 @@ where
         &self.dims
     }
 
+    /// The leaf of matrix `m` that query `iota` opens: `iota >> (h_max - h_m)`.
+    /// `None` when `m` is not a committed matrix or `iota` is out of this tree's
+    /// index space.
+    ///
+    /// Exposed alongside [`Self::auth_path`] so a prover can assemble a
+    /// [`MixedOpening`] ONE MATRIX AT A TIME. [`Self::open_batch`] wants a
+    /// `LeafSource` describing the whole round, which means every matrix's rows
+    /// readable at once — the same `O(N)` residency [`StreamingMmcsBuilder`]
+    /// exists to keep out of the commit. Query indices are only known after the
+    /// FRI, so without these two the win would be given back at opening time.
+    pub fn row_pair_leaf(&self, iota: usize, m: usize) -> Option<usize> {
+        if iota >= 1usize << (self.h_max - 1) {
+            return None;
+        }
+        let (log_height, _) = *self.dims.get(m)?;
+        Some(iota >> (self.h_max - log_height))
+    }
+
+    /// The shared authentication path for `iota`, reading no matrix rows at all.
+    /// `None` when `iota` is outside this tree's index space.
+    pub fn auth_path(&self, iota: usize) -> Option<Proof<Commitment>> {
+        if iota >= 1usize << (self.h_max - 1) {
+            return None;
+        }
+        let mut merkle_path = Vec::with_capacity(self.h_max - 1);
+        for level in 0..(self.h_max - 1) {
+            merkle_path.push(self.layers[level][(iota >> level) ^ 1]);
+        }
+        Some(Proof { merkle_path })
+    }
+
     /// Open all matrices at query `iota in [0, 2^(h_max-1))`, returning each
     /// matrix's row pair plus one shared authentication path. Row data is served
     /// by `source`, which MUST describe the same matrices (same order and

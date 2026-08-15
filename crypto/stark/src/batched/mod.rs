@@ -11,5 +11,14 @@
 //! phase, and the shared challenge derivation). This module is the wiring: it
 //! fixes the transcript sequence, the query-index convention and the per-query
 //! fold-with-injection recursion that the prover and the verifier must agree on.
+//!
+//! - [`shape`] — which table contributes which matrix to which round, derived
+//!   from the AIR set on both sides and never read from a proof.
+//! - [`round4`] — the round-4 transcript sequence and the per-query FRI check.
+//! - [`proof`] — what a batched epoch proof carries.
+//! - [`prover`] — the phase architecture the barriers force.
 
+pub mod proof;
+pub mod prover;
 pub mod round4;
+pub mod shape;
