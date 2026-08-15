@@ -176,11 +176,11 @@ fn the_blake3_and_keccak_configurations_commit_differently() {
 /// # What this does and does not establish
 ///
 /// It is a **same-reference** check: this build's prover and this build's
-/// verifier agree, over the commitment layer. It makes no cross-version claim,
-/// and it is deliberately not a full prove→verify, which cannot work under
-/// `Blake3StarkHash` yet — `fri/` still builds layer trees with the concrete
-/// keccak alias while the verifier authenticates them through `H::Batched`
-/// (PA-PLAN §4.1). Threading the configuration through `fri/` is Stage 2.
+/// verifier agree, over the commitment layer. It makes no cross-version claim.
+/// It is also deliberately narrow — the commitment layer alone, isolated from
+/// FRI, the transcript and the AIR. The full prove→verify under this
+/// configuration lives in `tests::blake3_stark_roundtrip_tests`; when both fail
+/// together the fault is here, and this test says where.
 #[cfg(not(feature = "cuda"))]
 #[test]
 fn blake3_commitments_open_and_verify() {
