@@ -178,6 +178,30 @@ pub fn keccak_sponge_program(len_bytes: usize) -> LfmProgram {
     compile(keccak_sponge_program_source(len_bytes))
 }
 
+/// `Blake3Chain` over a hint-supplied byte stream of exactly `len_bytes`, with
+/// the 32-byte digest as public output — the BLAKE3 twin of
+/// [`keccak_sponge_program_source`], and the smallest program that exercises
+/// `LFM_BLAKE3` end to end.
+///
+/// The one place in this module that SELECTS the configured hash rather than
+/// inheriting the default. Deliberately **not registered**: it is an
+/// instrument, and adding registry rows is its own decision — `resolve` keys on
+/// `(kind, blowup_factor)` alone, so rows are not a free-form extension point.
+pub fn blake3_sponge_program_source(len_bytes: usize) -> LfmProgramSource {
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::Blake3);
+    let num_halves = super::keccak_host::num_stream_halves(len_bytes) as u32;
+    let arena = b.declare_arena(num_halves);
+    let stream: Vec<_> = (0..num_halves).map(|i| b.hint_felt(arena, i)).collect();
+    let digest = super::edsl::wrap_hash_bytes(&mut b, &stream, len_bytes);
+    b.public(digest[0]);
+    b.public(digest[1]);
+    b.finish()
+}
+
+pub fn blake3_sponge_program(len_bytes: usize) -> LfmProgram {
+    compile(blake3_sponge_program_source(len_bytes))
+}
+
 /// `DefaultTranscript::sample()` over a hint-supplied stream: keccak256 of the
 /// absorbed bytes, then the 32 digest bytes REVERSED — which is both the
 /// challenge the transcript returns and the prefix it re-absorbs.
@@ -766,6 +790,21 @@ impl MerkleOpeningShape {
 /// authentication half of that pair, built and measured before the sampler is
 /// wired to it.
 pub fn keccak_merkle_opening_program_source(shape: MerkleOpeningShape) -> LfmProgramSource {
+    // Keccak by ARGUMENT, not by omission. This is the R1f instrument and a
+    // registry fixture: its identity is pinned in `LFM_REGISTRY`, so it stays
+    // keccak whatever the wrap's configured hash becomes. A BLAKE3 twin is a
+    // second program (`merkle_opening_program_source_with_hash`) and would be a
+    // second registry row, never a re-blessing of this one.
+    merkle_opening_program_source_with_hash(shape, super::edsl::WrapHash::Keccak)
+}
+
+/// [`keccak_merkle_opening_program_source`] under an explicitly chosen wrap
+/// hash — the shared body, so the two hashes exercise one emitter rather than
+/// two that have to be shown to coincide.
+pub fn merkle_opening_program_source_with_hash(
+    shape: MerkleOpeningShape,
+    wrap_hash: super::edsl::WrapHash,
+) -> LfmProgramSource {
     use super::edsl;
 
     assert!(shape.leaf_values > 0, "a leaf covers at least one column");
@@ -779,7 +818,7 @@ pub fn keccak_merkle_opening_program_source(shape: MerkleOpeningShape) -> LfmPro
          would outrun a single transcript candidate half"
     );
 
-    let mut b = LfmBuilder::new();
+    let mut b = LfmBuilder::new().with_wrap_hash(wrap_hash);
     let leaf_arena = b.declare_arena(shape.leaf_values as u32);
     let sibling_arena = b.declare_arena(2 * shape.depth as u32);
     let index_arena = b.declare_arena(1);
@@ -788,7 +827,7 @@ pub fn keccak_merkle_opening_program_source(shape: MerkleOpeningShape) -> LfmPro
     let values: Vec<_> = (0..shape.leaf_values as u32)
         .map(|i| b.hint_felt(leaf_arena, i))
         .collect();
-    let leaf = edsl::keccak_leaf_hash(&mut b, &values);
+    let leaf = edsl::wrap_leaf_hash(&mut b, &values);
 
     let index = b.hint_felt(index_arena, 0);
     let bits = b.bit_dec(index, shape.depth);
@@ -802,7 +841,7 @@ pub fn keccak_merkle_opening_program_source(shape: MerkleOpeningShape) -> LfmPro
         })
         .collect();
 
-    let root = edsl::keccak_merkle_walk(&mut b, leaf, &bits, &siblings);
+    let root = edsl::wrap_merkle_walk(&mut b, leaf, &bits, &siblings);
 
     let expected = [b.hint_word(root_arena, 0), b.hint_word(root_arena, 1)];
     edsl::assert_word_eq(&mut b, root[0], expected[0]);
@@ -815,6 +854,13 @@ pub fn keccak_merkle_opening_program_source(shape: MerkleOpeningShape) -> LfmPro
 
 pub fn keccak_merkle_opening_program(shape: MerkleOpeningShape) -> LfmProgram {
     compile(keccak_merkle_opening_program_source(shape))
+}
+
+pub fn merkle_opening_program_with_hash(
+    shape: MerkleOpeningShape,
+    wrap_hash: super::edsl::WrapHash,
+) -> LfmProgram {
+    compile(merkle_opening_program_source_with_hash(shape, wrap_hash))
 }
 
 // ============ R1g(ii): the cross-epoch L2G commitment binding ============
@@ -993,7 +1039,7 @@ pub fn emit_program_id(
     pc_start: &[super::builder::Felt],
     decode: &[super::builder::Felt],
     pages: &[(&[super::builder::Felt], &[super::builder::Felt])],
-) -> super::edsl::KeccakDigest {
+) -> super::edsl::WrapDigest {
     use super::transcript_replay::ByteString;
     use crate::recursion::PROGRAM_ID_TAG;
 
@@ -1037,6 +1083,21 @@ pub fn emit_program_id(
     }
     assert_eq!(s.len(), shape.byte_len(), "byte accounting must agree");
 
+    // ⛔ **PINNED KECCAK — does not follow the configured wrap hash, and must
+    // not.** The host counterpart `recursion::program_id_from_digest` names
+    // `PlatformKeccak256` explicitly rather than the configuration's hash, in
+    // the same sense `statement::elf_digest` does: this is an INDEPENDENT
+    // keccak that identifies a program to consumers, not part of the proof
+    // system's commitment layer. Switching it would make the attestation join
+    // disagree with every host consumer of a `program_id`, and the disagreement
+    // would surface as a consumer-side compare failing, not as an unprovable
+    // program.
+    //
+    // `ByteString` therefore has two hashing methods and this call selects the
+    // pinned one deliberately. The naive sweep — "replace every
+    // `edsl::keccak256`" — produces a wrong proof exactly here, because
+    // grinding (`epoch::emit_grinding_check`) shares this type and DOES follow
+    // the configuration.
     s.keccak256(b)
 }
 
@@ -1193,7 +1254,7 @@ pub fn emit_register_commitment(
     shape: RegisterDerivationShape,
     init: &[super::builder::Felt],
     fini: &[super::builder::Felt],
-) -> super::edsl::KeccakDigest {
+) -> super::edsl::WrapDigest {
     use super::edsl;
     use super::lde::coset_lde;
     use crate::tables::register::{NUM_PREPROCESSED_COLS_WITH_FINI, NUM_REGISTER_ADDRESSES};
@@ -1263,11 +1324,11 @@ pub fn emit_register_commitment(
                 let row = reverse_index(ROWS_PER_LEAF * leaf + k, lde_rows as u64);
                 values.extend([offset_lde[row], init_lde[row], fini_lde[row]]);
             }
-            edsl::keccak_leaf_hash(b, &values)
+            edsl::wrap_leaf_hash(b, &values)
         })
         .collect();
 
-    edsl::keccak_merkle_tree_root(b, &leaves)
+    edsl::wrap_merkle_tree_root(b, &leaves)
 }
 
 pub fn register_derivation_program(shape: RegisterDerivationShape) -> LfmProgram {

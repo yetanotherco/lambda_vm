@@ -13,6 +13,7 @@ use math::field::traits::IsPrimeField;
 
 use crate::tables::types::{FE, FEE, GoldilocksField};
 
+use super::edsl::WrapHash;
 use super::instr::{Addr, ArenaId, BaseOp, ExtOp, HashMode, Instr, KeccakMode};
 use super::layout;
 use super::word::{LfmWord, base_word, ext_word};
@@ -109,11 +110,45 @@ pub struct LfmBuilder {
     read_counts: Vec<u64>,
     arena_schema: ArenaSchema,
     public_len: u32,
+    /// The byte hash this program's commitment layer runs.
+    ///
+    /// ★ A property of the PROGRAM, held here rather than threaded through
+    /// every construction, and that placement is the safety argument. The
+    /// campaign's standing risk is that a missed emitter site keeps hashing
+    /// keccak after the flip and produces a valid proof of the wrong digest;
+    /// with the choice on the builder there is no site to miss, because every
+    /// `edsl::wrap_*` construction reads this one value. What remains visible
+    /// is the opposite and much smaller list: the emitters that must NOT follow
+    /// it still name `keccak256` explicitly (`programs::emit_program_id`, the
+    /// R1c instruments), so a grep for the pinned hash in `lfm/` returns
+    /// exactly the deliberate exceptions.
+    wrap_hash: WrapHash,
 }
 
 impl LfmBuilder {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Build under an explicitly chosen wrap hash.
+    ///
+    /// Program-level and set once, before anything is emitted: the hash decides
+    /// what the program's Merkle and transcript constructions compute, so a
+    /// program half-emitted under one and half under the other is not a
+    /// program. It is taken by value for that reason — there is no setter that
+    /// can run mid-emission.
+    pub fn with_wrap_hash(mut self, wrap_hash: WrapHash) -> Self {
+        assert!(
+            self.instrs.is_empty(),
+            "the wrap hash is program shape and must be chosen before emission"
+        );
+        self.wrap_hash = wrap_hash;
+        self
+    }
+
+    /// The byte hash this program's commitment layer runs.
+    pub fn wrap_hash(&self) -> WrapHash {
+        self.wrap_hash
     }
 
     fn alloc(&mut self) -> Addr {

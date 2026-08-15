@@ -103,7 +103,7 @@ pub fn commitment_words(c: &Commitment) -> [LfmWord; 2] {
 
 /// One FRI query's MAIN-trace opening, in the form the machine consumes it.
 ///
-/// This is the input to [`crate::lfm::edsl::keccak_merkle_walk`] and the thing
+/// This is the input to [`crate::lfm::edsl::wrap_merkle_walk`] and the thing
 /// R1f authenticates: a real row pair from a real continuation-epoch proof,
 /// against that proof's own committed root.
 ///
