@@ -229,6 +229,85 @@ pub mod keccak {
     }
 }
 
+/// `LFM_BLAKE3` — the BLAKE3 compression chip: seven machine words of
+/// `h[8] ‖ m[16] ‖ (t_lo, t_hi, block_len, flags)` in, four words of
+/// `out[0..16]` out.
+///
+/// Every input `u32` travels as one felt lane, four lanes to a machine word,
+/// and 28 divides by 4 exactly — so unlike [`keccak`] there are **no spare half
+/// slots** to pin as tuple constants and no `KeccakSpareLaneNonZero` analogue.
+/// A lane at or above `2^32` is still rejected: the chip recomposes each `u32`
+/// from four BITWISE-constrained byte columns, so no such value exists on the
+/// AIR side.
+///
+/// This module holds the *instruction column group* — addresses,
+/// multiplicities, the is-real flag — the same split [`keccak`] uses. The
+/// mixing core's value columns stay with the chip, in `blake3_chip::cols`,
+/// which re-exports everything here so there is one set of constants.
+pub mod blake3 {
+    /// `u32` words the chip reads: `h[8] | m[16] | t_lo | t_hi | block_len | flags`.
+    pub const IN_U32: usize = 28;
+    /// `u32` words the chip writes: the full 16-word compression output.
+    pub const OUT_U32: usize = 16;
+    /// Machine words read (four `u32` lanes each). 28 / 4 divides exactly.
+    pub const IN_WORDS: usize = IN_U32 / 4; // 7
+    /// Machine words written. 16 / 4 divides exactly.
+    pub const OUT_WORDS: usize = OUT_U32 / 4; // 4
+
+    /// Machine words in a 32-byte BLAKE3 digest.
+    ///
+    /// `Blake3Chain`'s digest is `out[0..8]` little-endian, i.e. output `u32`
+    /// words 0..8, i.e. output machine words 0 and 1 — so the digest is a
+    /// PREFIX of what the chip already writes, and reading it costs nothing.
+    /// The byte convention is keccak's exactly (digest byte `j` is byte `j % 4`
+    /// of half `j / 4`), which is what lets the whole construction layer be a
+    /// 1:1 port rather than a re-derivation.
+    pub const DIGEST_WORDS: usize = 2;
+
+    pub const IN_ADDR0: usize = 0; // ..IN_ADDR6 = 6
+    pub const OUT_ADDR0: usize = IN_ADDR0 + IN_WORDS; // 7 ..10
+    /// Read count of each output word (its LogUp send multiplicity).
+    pub const MULT0: usize = OUT_ADDR0 + OUT_WORDS; // 11 ..14
+    /// The byte-REVERSED digest, as two more written words.
+    ///
+    /// `DefaultTranscript::sample()` finalizes, reverses the 32 digest bytes,
+    /// absorbs the reversed bytes and returns them — hash-agnostically, so the
+    /// BLAKE3 configuration squeezes exactly the same way the keccak one does
+    /// (`crypto/crypto/src/fiat_shamir/default_transcript.rs`). Reversal is
+    /// free at the recomposition boundary for the same reason it is free for
+    /// [`keccak`]: the bus already rebuilds each `u32` lane as a linear
+    /// combination of four byte columns, so flipping the coefficient order and
+    /// the lane order is a different `Linear` over the SAME columns. Two
+    /// interactions and four preprocessed columns, and **no value columns**.
+    ///
+    /// Without it every in-machine squeeze would pay eight explicit byteswaps —
+    /// a `LFM_BITDEC` row and 64 `LFM_BALU` rows each — for a digest the chip is
+    /// already holding byte by byte. Rows that need no reversed digest leave
+    /// `REV_MULT` at zero and the two sends are inert.
+    pub const REV_ADDR0: usize = MULT0 + OUT_WORDS; // 15, 16
+    pub const REV_MULT0: usize = REV_ADDR0 + DIGEST_WORDS; // 17, 18
+    /// Is-real flag: gates every constraint, every read and every write.
+    pub const MU: usize = REV_MULT0 + DIGEST_WORDS; // 19
+    pub const PREP_WIDTH: usize = MU + 1; // 20
+
+    pub const fn in_addr(word: usize) -> usize {
+        IN_ADDR0 + word
+    }
+    pub const fn out_addr(word: usize) -> usize {
+        OUT_ADDR0 + word
+    }
+    /// Write-multiplicity of output word `word`.
+    pub const fn mult(word: usize) -> usize {
+        MULT0 + word
+    }
+    pub const fn rev_addr(word: usize) -> usize {
+        REV_ADDR0 + word
+    }
+    pub const fn rev_mult(word: usize) -> usize {
+        REV_MULT0 + word
+    }
+}
+
 /// `LFM_LANES` — word ↔ lane conversion (Pack / Unpack). Pack rows receive
 /// four lane cells and send the assembled word; Unpack rows receive a word
 /// and send its four lanes as base cells. The shared value columns appear in

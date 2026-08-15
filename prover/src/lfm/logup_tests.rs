@@ -998,7 +998,7 @@ enum RowWitness {
 /// tables is a column, checked by reading their `bus_interactions()` — but such a
 /// table would carry a nonzero `L` with no real rows, and this test would report
 /// the changed contribution without explaining it. It measures an INTERMEDIATE
-/// epoch, so HALT is out of scope, and one workload, so it says nothing about
+/// epoch, so HALT is out of scope (`VmAirs` omits it unless the epoch is final), and one workload, so it says nothing about
 /// which tables are unused in general — only what a table with no rows carries.
 #[test]
 fn a_zero_row_fixed_table_carries_some_zero_not_none() {
@@ -1027,7 +1027,7 @@ fn a_zero_row_fixed_table_carries_some_zero_not_none() {
     let is_final = executor.pc() == 0;
     assert!(
         !is_final,
-        "wanted an INTERMEDIATE epoch (nine fixed tables, no HALT), but the \
+        "wanted an INTERMEDIATE epoch (every fixed table but HALT), but the \
          guest finished inside one epoch of {epoch_size} cycles"
     );
 
@@ -1070,14 +1070,24 @@ fn a_zero_row_fixed_table_carries_some_zero_not_none() {
     // `(name, rows, has_no_bus_rows)`.
     //
     // ONE list, name and trace and witness together, deliberately: a version
-    // that kept the nine names in a separate constant and zipped them onto the
+    // that kept the names in a separate constant and zipped them onto the
     // traces passed with two names swapped — the swap moved only the label, so
     // the row-count cross-check below still compared the right trace against the
     // right sub-proof and saw nothing wrong. Merged, a reordering moves the
     // TRACE too, which that cross-check does catch.
+    //
+    // ★ The list is every always-on table an INTERMEDIATE epoch carries —
+    // `FIXED_TABLE_COUNT` less HALT, which `VmAirs::air_refs` includes only on a
+    // final epoch — **in `air_refs`' own order**, which the position-by-position
+    // trace-length check below depends on. It carried NINE entries while the
+    // constant was 11 and then 12: HINT and #903's BLAKE3 were never added, and
+    // the shortfall was invisible because a fixture bug stopped this test
+    // reaching its own assertion. A hand-written census that does not pin its
+    // own length against the constant it is a census OF goes stale exactly that
+    // way again, so the length is now asserted below.
     let census: Vec<(&str, usize, bool)> = {
-        use crate::tables::{ecdas, keccak, keccak_rc};
-        let fixed: [(&str, &TraceTable<Gl, Ext3>, RowWitness); 9] = [
+        use crate::tables::{blake3, ecdas, hint, keccak, keccak_rc};
+        let fixed: [(&str, &TraceTable<Gl, Ext3>, RowWitness); crate::FIXED_TABLE_COUNT - 1] = [
             ("BITWISE", &traces.bitwise, RowWitness::Populated),
             ("DECODE", &traces.decode, RowWitness::Populated),
             ("COMMIT", &traces.commit, RowWitness::Populated),
@@ -1092,11 +1102,23 @@ fn a_zero_row_fixed_table_carries_some_zero_not_none() {
                 &traces.keccak_rc,
                 RowWitness::GatedOff(&[keccak_rc::cols::MU]),
             ),
+            // #903's table pads with a nonzero `ptr[k] = 8k` identity, so "no
+            // rows" here is the gate being off, not the trace being empty.
+            (
+                "BLAKE3",
+                &traces.blake3,
+                RowWitness::GatedOff(&[blake3::cols::MU]),
+            ),
             ("ECSM", &traces.ecsm, RowWitness::Blank),
             (
                 "ECDAS",
                 &traces.ecdas,
                 RowWitness::GatedOff(&[ecdas::cols::MU, ecdas::cols::NEXT_OP]),
+            ),
+            (
+                "HINT",
+                &traces.hint,
+                RowWitness::GatedOff(&[hint::cols::MU]),
             ),
             ("REGISTER", &traces.register, RowWitness::Populated),
         ];
@@ -1190,10 +1212,18 @@ fn a_zero_row_fixed_table_carries_some_zero_not_none() {
     };
     let view = MultiProofView::Owned(&proof);
     assert_eq!(
+        census.len(),
+        crate::FIXED_TABLE_COUNT - 1,
+        "the census must name every always-on table an intermediate epoch \
+         carries (all but HALT), or the sub-proof identity below is satisfied \
+         by an undercount on both sides"
+    );
+    assert_eq!(
         view.len(),
         census.len() + table_counts.total() + 1,
-        "an intermediate epoch is nine fixed tables, the chunked families, and \
-         one L2G_MEMORY"
+        "an intermediate epoch is {} fixed tables, the chunked families, and \
+         one L2G_MEMORY",
+        crate::FIXED_TABLE_COUNT - 1
     );
     assert_eq!(refs.len(), view.len(), "one AIR per sub-proof");
 
@@ -1325,7 +1355,7 @@ fn a_zero_row_fixed_table_carries_some_zero_not_none() {
     // None would make every real epoch unverifiable. That is now a run: strip
     // the bus public inputs off a zero-row sub-proof and watch this very proof
     // stop verifying. Only the `is_some` direction can be tested on an epoch —
-    // all 24 sub-proofs declare interactions, so :1244's converse has no
+    // all 26 sub-proofs declare interactions, so :1244's converse has no
     // subject here.
     for (i, (name, _, no_rows)) in census.iter().enumerate() {
         if !no_rows {

@@ -9,6 +9,7 @@ use crate::tables::types::{FE, GoldilocksExtension, GoldilocksField};
 
 use crate::tables::{bitwise, keccak_rc, keccak_rnd};
 
+use super::blake3_chip;
 use super::blake3_socket;
 use super::chips::{balu, bitdec, const_, hash, hint, keccak, lanes, public, select, xalu};
 use super::compiler::{ColumnGroup, LfmProgram};
@@ -29,6 +30,7 @@ pub struct LfmTraces {
     pub bitdec: TraceTable<F, E>,
     pub hash: TraceTable<F, E>,
     pub keccak: TraceTable<F, E>,
+    pub blake3: TraceTable<F, E>,
     pub lanes: TraceTable<F, E>,
     pub hint: TraceTable<F, E>,
     pub public: TraceTable<F, E>,
@@ -174,6 +176,11 @@ pub fn build_traces_with_hasher(
 
     let mut histogram = bitwise::BitwiseHistogram::new();
     histogram.add_ops(&keccak_adapter::bitwise_ops_for(&keccak_ops));
+    // `LFM_BLAKE3` is a BITWISE consumer on every row — ~1,248 lookups per
+    // compression. Unconditional, unlike the socket's below: the chip is a
+    // member of the fixed set, so its lookups are a property of the program,
+    // not of the hash choice.
+    histogram.add_ops(&blake3_chip::bitwise_ops_for(&records.blake3));
     // Absorb rows additionally send one BYTE_ALU[XOR] lookup per rate byte.
     histogram.add_ops(&keccak_adapter::absorb_bitwise_ops(&records.keccak));
     // Under BLAKE3 the hash chip is a BITWISE consumer too — over a thousand
@@ -277,6 +284,9 @@ pub fn build_traces_with_hasher(
             for (k, &v) in r.block.iter().enumerate() {
                 out[keccak::cols::BLOCK + k] = FE::from(u64::from(v));
             }
+        }),
+        blake3: chip_trace(&g.blake3, blake3_chip::cols::NUM_COLUMNS, |row, out| {
+            blake3_chip::fill_blake3_witness(out, &records.blake3[row]);
         }),
         lanes: chip_trace(&g.lanes, lanes::cols::NUM_COLUMNS, |row, out| {
             out[lanes::cols::V0..lanes::cols::V0 + 4].copy_from_slice(&records.lanes[row]);

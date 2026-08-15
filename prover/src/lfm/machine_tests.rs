@@ -2421,6 +2421,52 @@ fn registered_programs_are_single_chunk() {
     }
 }
 
+/// ★ The registry is six rows and every `(kind, blowup_factor)` is unique.
+///
+/// `resolve` keys on that pair alone, so a seventh row for a pair that already
+/// exists would be unreachable data — and `compute_lfm_registry`'s doc promises
+/// exactly that shape ("a second hasher becomes additional rows"). `resolve`
+/// now rejects the ambiguity rather than taking the first match; this is the
+/// half that makes ADDING a row a deliberate act instead of a silent widening,
+/// since nothing else in the crate pinned the table's length.
+#[test]
+fn the_registry_is_six_unambiguous_rows() {
+    use super::registry::{LFM_REGISTRY, LfmRegistryError, resolve};
+
+    assert_eq!(
+        LFM_REGISTRY.len(),
+        6,
+        "one entry per LfmProgramKind at the single registered blowup; adding \
+         rows is a re-blessing decision, not a regeneration side effect"
+    );
+
+    for (i, entry) in LFM_REGISTRY.iter().enumerate() {
+        for other in LFM_REGISTRY.iter().skip(i + 1) {
+            assert!(
+                entry.kind != other.kind || entry.blowup_factor != other.blowup_factor,
+                "{:?} at blowup {} appears twice — `resolve` keys on this pair",
+                entry.kind,
+                entry.blowup_factor
+            );
+        }
+        // The honest control: every row is reachable through the real lookup.
+        assert!(
+            resolve(entry.kind, entry.blowup_factor).is_ok(),
+            "{:?} must resolve",
+            entry.kind
+        );
+    }
+
+    // And the miss is still a hard error, not a fallback.
+    assert!(matches!(
+        resolve(super::registry::LfmProgramKind::TrivialV0, 8),
+        Err(LfmRegistryError::UnknownProgram {
+            blowup_factor: 8,
+            ..
+        })
+    ));
+}
+
 /// Every `HasherKind` there is. Not derived — a new candidate must be added
 /// here by hand, which is the point: the two tests below are what say a new
 /// hasher gets its own program identity rather than sharing one.
@@ -2876,8 +2922,20 @@ use super::proof_fixture;
 /// Cache path for the fixture blob. Outside the repository on purpose: a
 /// checked-in binary can drift from the encoder silently, so the generation path
 /// is what a cold run exercises.
+///
+/// ★ **Keyed on the configuration, not only on the name.** `load_or_generate`
+/// hands back whatever sits at this path if the file exists, so a fixed name
+/// meant the first run after any fixture change read the PREVIOUS
+/// configuration's proof — four tests below failing on epoch count and passing
+/// on a second run, which reads as flakiness rather than as a stale blob. Both
+/// inputs that decide the blob's shape are in the name, so a change to either
+/// simply misses the cache.
 fn fixture_cache() -> std::path::PathBuf {
-    std::env::temp_dir().join("lfm-r1f-continuation-fixture.bin")
+    let elf = proof_fixture::FIXTURE_INNER_ELF.replace(['/', '\\', '.'], "_");
+    std::env::temp_dir().join(format!(
+        "lfm-r1f-continuation-fixture-{elf}-log2_{}.bin",
+        proof_fixture::FIXTURE_EPOCH_LOG2
+    ))
 }
 
 /// R1f(b): the machine's fixture is a REAL two-epoch continuation proof, encoded

@@ -17,15 +17,19 @@
 //! | `Ecall` receiver | 1 | — |
 //! | `Memw` x10 register read | 1 | — |
 //! | `Memw` per state dword | 22 | — |
-//! | `LfmMem` word tokens | — | 7 reads + 4 writes = 11 |
+//! | `LfmMem` word tokens | — | 7 reads + 4 writes + 2 reversed-digest = 13 |
 //! | `ByteAlu[XOR]` mixing + feed-forward | 832 | 832 |
 //! | `AreBytes` shift halfwords | 384 | 384 |
 //! | `AreBytes` message bytes | 32 | 32 |
 //! | `AreBytes` OLD_OUT bytes | 32 | — |
 //! | `AreBytes` addr bytes + alignment `AND` | 5 | — |
 //! | `IsHalfword` pointer halfwords | 88 | — |
-//! | **total interactions** | **1,397** | **1,259** |
+//! | **total interactions** | **1,397** | **1,261** |
 //! | value columns | 3,219 | 3,056 |
+//!
+//! (The two reversed-digest sends arrived with registration; the standalone
+//! chip measured 1,259. They cost no value column — see
+//! `layout::blake3::REV_ADDR0`.)
 //!
 //! The dropped columns are `TIMESTAMP` (2), `ADDR` (8), `PTR` (88) and
 //! `OLD_OUT` (64) — 162 — and `MU` moves into the preprocessed prefix, which
@@ -71,10 +75,11 @@
 //!
 //! # Status
 //!
-//! This chip is **not registered** in the LFM fixed AIR set (`airs.rs` still
-//! names 14 chips). It exists to be proved standalone by `blake3_probe` and
-//! measured, which is what the hash matrix's blake column needs. Registration
-//! would move every program digest and is a separate decision.
+//! This chip is **registered**: it is slot 11 of the fixed AIR set
+//! (`airs::LFM_CHIP_NAMES`), reached from the eDSL through
+//! [`super::builder::LfmBuilder::blake3_compress`]. `blake3_probe` still proves
+//! it standalone against a synthetic `LfmMem` mirror, which is what prices the
+//! chip on its own; `blake3_chip_tests` covers it as a member of the machine.
 //!
 //! ⚠ Round count follows [`super::blake3::BLAKE3_ROUNDS`]: 7 (standard BLAKE3)
 //! by default, 6 under the `blake3-6round` feature. The 6-round instantiation
@@ -89,7 +94,7 @@ use stark::trace::TraceTable;
 use crate::constraints::templates::{INV_SHIFT_32, emit_is_bit};
 use crate::tables::bitwise::{BitwiseOperation, BitwiseOperationType};
 use crate::tables::types::{
-    BusId, FE, GoldilocksExtension, GoldilocksField, VmTable, alu_op, zeroed_fe_vec,
+    BusId, FE, GoldilocksExtension, GoldilocksField, alu_op, zeroed_fe_vec,
 };
 
 use super::blake3::{BLAKE3_IV, BLAKE3_MSG_PERMUTATION, BLAKE3_ROUNDS, blake3_compress_rounds};
@@ -100,14 +105,7 @@ type E = GoldilocksExtension;
 /// G-instances per compression: 8 per round, at the compiled round count.
 pub const NUM_G: usize = BLAKE3_ROUNDS * 8;
 
-/// `u32` words the chip reads: `h[8] | m[16] | t_lo | t_hi | block_len | flags`.
-pub const IN_U32: usize = 28;
-/// `u32` words the chip writes: the full 16-word compression output.
-pub const OUT_U32: usize = 16;
-/// Machine words read (four `u32` lanes each). 28 / 4 divides exactly.
-pub const IN_WORDS: usize = IN_U32 / 4; // 7
-/// Machine words written. 16 / 4 divides exactly.
-pub const OUT_WORDS: usize = OUT_U32 / 4; // 4
+pub use super::layout::blake3::{IN_U32, IN_WORDS, OUT_U32, OUT_WORDS};
 
 /// The (a, b, c, d) state indices of the 8 G-calls of one round:
 /// 4 column mixes then 4 diagonal mixes (BLAKE3 spec §2.1).
@@ -132,47 +130,26 @@ pub(crate) const ROT_SHIFT_R: [u32; 2] = [4, 9];
 
 /// The chip's columns: a preprocessed instruction group, then value columns.
 ///
-/// The prefix mirrors `layout::keccak`'s discipline (addresses, per-output-word
-/// read multiplicities, an is-real flag) and lives here rather than in
-/// `layout.rs` because the chip is not registered in the machine — nothing else
-/// shares these constants yet.
+/// The prefix is [`crate::lfm::layout::blake3`], re-exported rather than
+/// restated — it is the chip's *instruction* column group and belongs beside
+/// every other chip's, which is what the compiler and the admission validator
+/// read. What stays here is the mixing core's value layout, which nothing
+/// outside this chip and `blake3_socket`'s shared G-block offsets shares.
 pub mod cols {
-    use super::{IN_WORDS, NUM_G, OUT_U32, OUT_WORDS};
+    pub use crate::lfm::layout::blake3::*;
 
-    // --- preprocessed (instruction column group) ---
-    /// Addresses of the 7 input machine words.
-    pub const IN_ADDR0: usize = 0;
-    /// Addresses of the 4 output machine words.
-    pub const OUT_ADDR0: usize = IN_ADDR0 + IN_WORDS; // 7
-    /// Read count of each output word (its LogUp send multiplicity).
-    pub const MULT0: usize = OUT_ADDR0 + OUT_WORDS; // 11
-    /// Is-real flag: gates every constraint and every read.
-    pub const MU: usize = MULT0 + OUT_WORDS; // 15
-    pub const PREP_WIDTH: usize = MU + 1; // 16
+    use super::NUM_G;
 
     // --- value columns ---
     /// Input bytes: `h[32] | m[64] | t_lo[4] | t_hi[4] | block_len[4] | flags[4]`.
-    pub const IN: usize = PREP_WIDTH; // 16
+    pub const IN: usize = PREP_WIDTH; // 20
     /// `NUM_G` G-blocks × 60 cells (56 bytes + 4 carry bits).
-    pub const G: usize = IN + 4 * super::IN_U32; // 128
+    pub const G: usize = IN + 4 * IN_U32; // 132
     pub const G_SIZE: usize = 60;
     /// Feed-forward output bytes `out[0..16]` (64 bytes).
-    pub const OUT: usize = G + NUM_G * G_SIZE; // 3008
+    pub const OUT: usize = G + NUM_G * G_SIZE; // 3012
 
-    pub const NUM_COLUMNS: usize = OUT + 4 * OUT_U32; // 3072
-
-    #[inline]
-    pub const fn in_addr(word: usize) -> usize {
-        IN_ADDR0 + word
-    }
-    #[inline]
-    pub const fn out_addr(word: usize) -> usize {
-        OUT_ADDR0 + word
-    }
-    #[inline]
-    pub const fn mult(word: usize) -> usize {
-        MULT0 + word
-    }
+    pub const NUM_COLUMNS: usize = OUT + 4 * OUT_U32; // 3076
 
     /// Input word `i` (0..28: `h[0..8]`, `m[8..24]`, `t_lo=24`, `t_hi=25`,
     /// `block_len=26`, `flags=27`), byte `b`.
@@ -727,17 +704,16 @@ impl Blake3Flow for ValueFlow {
 // Operation struct + trace generation
 // =========================================================================
 
-/// One compression, as the machine issues it.
+/// The VALUE half of one compression — everything the mixing core, the trace's
+/// value columns and the BITWISE multiplicities depend on, and nothing else.
 ///
-/// Addresses are program data, not witness: `in_addr`/`out_addr` land in the
-/// preprocessed prefix. `read_counts` is the number of later reads of each
-/// output word — the LogUp send multiplicity, which for a real machine comes
-/// from the program's dataflow.
-#[derive(Debug, Clone)]
-pub struct Blake3Operation {
-    pub in_addr: [u64; IN_WORDS],
-    pub out_addr: [u64; OUT_WORDS],
-    pub read_counts: [u64; OUT_WORDS],
+/// This is what the machine's executor records, because the other half —
+/// addresses and multiplicities — is *program* data living in the preprocessed
+/// instruction group, exactly as for every other LFM chip. Keeping the split in
+/// the type is what stops a witness from describing a compression at addresses
+/// the committed program does not name.
+#[derive(Debug, Clone, Copy)]
+pub struct Blake3Values {
     pub h: [u32; 8],
     pub m: [u32; 16],
     pub t: u64,
@@ -745,7 +721,7 @@ pub struct Blake3Operation {
     pub flags: u32,
 }
 
-impl Blake3Operation {
+impl Blake3Values {
     /// The 28 input `u32` words in machine order: `h | m | t_lo | t_hi | len | flags`.
     pub fn input_words(&self) -> [u32; IN_U32] {
         let mut w = [0u32; IN_U32];
@@ -771,11 +747,101 @@ impl Blake3Operation {
     }
 }
 
-/// Write a 32-bit word as 4 byte cells at `col..col+4`.
+/// One compression, as the standalone probe issues it: [`Blake3Values`] plus
+/// the addresses and multiplicities a program would have supplied.
+///
+/// The machine does not use this — it reads the prefix out of the committed
+/// column group. It exists so `blake3_probe` can drive the chip against a
+/// synthetic `LfmMem` mirror with no program behind it.
+#[derive(Debug, Clone)]
+pub struct Blake3Operation {
+    pub in_addr: [u64; IN_WORDS],
+    pub out_addr: [u64; OUT_WORDS],
+    pub read_counts: [u64; OUT_WORDS],
+    pub values: Blake3Values,
+}
+
+/// Write a 32-bit word as 4 byte cells at `row[col..col+4]`.
 #[inline]
-fn set_word_bytes<T: VmTable>(table: &mut T, row: usize, col: usize, w: u32) {
+fn set_word_bytes(row: &mut [FE], col: usize, w: u32) {
     for b in 0..4 {
-        table.set_u64(row, col + b, ((w >> (8 * b)) & 0xFF) as u64);
+        row[col + b] = FE::from(u64::from((w >> (8 * b)) & 0xFF));
+    }
+}
+
+/// ★ The chip's value columns for one compression, written into a row slice.
+///
+/// The single definition, shared by the standalone probe's trace and by the
+/// machine's ([`super::trace::build_traces_with_hasher`]). Registration made two
+/// callers out of one, and a second transcription of this — 3,056 columns laid
+/// out in a fixed order — is exactly the drift the single-dataflow rule above
+/// exists to prevent: the constraints and the senders are generated from
+/// [`WireFlow`], so a filler that disagreed with them would fail only as an
+/// unbalanced bus at prove time, with no signature saying why.
+///
+/// Writes nothing before `cols::IN`: the preprocessed prefix is the caller's,
+/// and in the machine it is copied verbatim from the committed group.
+pub fn fill_blake3_witness(row: &mut [FE], v: &Blake3Values) {
+    for (i, &w) in v.input_words().iter().enumerate() {
+        set_word_bytes(row, cols::in_word(i, 0), w);
+    }
+
+    // The mixing core, cell-exactly in canonical order.
+    let flow = ValueFlow::compute(&v.h, &v.m, v.t, v.block_len, v.flags);
+    let mut a3 = flow.add3s.iter();
+    let mut a2 = flow.add2s.iter();
+    let mut xo = flow.xors.iter();
+    let mut ro = flow.rots.iter();
+    for g in 0..NUM_G {
+        let base = cols::g_base(g);
+        for half in 0..2 {
+            let (s_off, c_off, x_off, c2_off, x2_off, r_off) = if half == 0 {
+                (
+                    cols::G_A1,
+                    cols::G_A1_C,
+                    cols::G_X1,
+                    cols::G_C1,
+                    cols::G_X2,
+                    cols::G_R1,
+                )
+            } else {
+                (
+                    cols::G_A2,
+                    cols::G_A2_C,
+                    cols::G_X3,
+                    cols::G_C2,
+                    cols::G_X4,
+                    cols::G_R2,
+                )
+            };
+            let &(s, c1, c2) = a3.next().expect("add3 count");
+            set_word_bytes(row, base + s_off, s);
+            row[base + c_off] = FE::from(u64::from(c1));
+            row[base + c_off + 1] = FE::from(u64::from(c2));
+
+            let &(_, _, x) = xo.next().expect("xor count");
+            set_word_bytes(row, base + x_off, x);
+
+            let &c = a2.next().expect("add2 count");
+            set_word_bytes(row, base + c2_off, c);
+
+            let &(_, _, x2) = xo.next().expect("xor count");
+            set_word_bytes(row, base + x2_off, x2);
+
+            let &(sll_lo, sllc_lo, sll_hi, sllc_hi, y) = ro.next().expect("rot count");
+            row[base + r_off] = FE::from(u64::from(sll_lo & 0xFF));
+            row[base + r_off + 1] = FE::from(u64::from(sll_lo >> 8));
+            row[base + r_off + 2] = FE::from(u64::from(sllc_lo & 0xFF));
+            row[base + r_off + 3] = FE::from(u64::from(sllc_lo >> 8));
+            row[base + r_off + 4] = FE::from(u64::from(sll_hi & 0xFF));
+            row[base + r_off + 5] = FE::from(u64::from(sll_hi >> 8));
+            row[base + r_off + 6] = FE::from(u64::from(sllc_hi & 0xFF));
+            row[base + r_off + 7] = FE::from(u64::from(sllc_hi >> 8));
+            set_word_bytes(row, base + r_off + 8, y);
+        }
+    }
+    for i in 0..OUT_U32 {
+        set_word_bytes(row, cols::out_word(i, 0), flow.out[i]);
     }
 }
 
@@ -786,89 +852,28 @@ fn set_word_bytes<T: VmTable>(table: &mut T, row: usize, col: usize, w: u32) {
 /// which a zero row satisfies, so the pad is genuinely empty — and
 /// `padding_rows_are_all_zero` in `blake3_probe` pins that rather than assuming
 /// it.
+///
+/// The probe's trace only: the machine builds the same rows through
+/// `trace::chip_trace`, which copies the preprocessed prefix out of the
+/// committed group instead of re-deriving it from an op.
 pub fn generate_blake3_trace(ops: &[Blake3Operation]) -> TraceTable<F, E> {
     let num_rows = ops.len().next_power_of_two().max(4);
-    let mut trace = TraceTable::new_main(
-        zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
-        cols::NUM_COLUMNS,
-        1,
-    );
-    let table = &mut trace.main_table;
+    let mut data = zeroed_fe_vec(num_rows * cols::NUM_COLUMNS);
 
     for (row, op) in ops.iter().enumerate() {
+        let r = &mut data[row * cols::NUM_COLUMNS..(row + 1) * cols::NUM_COLUMNS];
         for j in 0..IN_WORDS {
-            table.set_u64(row, cols::in_addr(j), op.in_addr[j]);
+            r[cols::in_addr(j)] = FE::from(op.in_addr[j]);
         }
         for j in 0..OUT_WORDS {
-            table.set_u64(row, cols::out_addr(j), op.out_addr[j]);
-            table.set_u64(row, cols::mult(j), op.read_counts[j]);
+            r[cols::out_addr(j)] = FE::from(op.out_addr[j]);
+            r[cols::mult(j)] = FE::from(op.read_counts[j]);
         }
-        table.set_fe(row, cols::MU, FE::one());
-
-        for (i, &w) in op.input_words().iter().enumerate() {
-            set_word_bytes(table, row, cols::in_word(i, 0), w);
-        }
-
-        // The mixing core, cell-exactly in canonical order.
-        let flow = ValueFlow::compute(&op.h, &op.m, op.t, op.block_len, op.flags);
-        let mut a3 = flow.add3s.iter();
-        let mut a2 = flow.add2s.iter();
-        let mut xo = flow.xors.iter();
-        let mut ro = flow.rots.iter();
-        for g in 0..NUM_G {
-            let base = cols::g_base(g);
-            for half in 0..2 {
-                let (s_off, c_off, x_off, c2_off, x2_off, r_off) = if half == 0 {
-                    (
-                        cols::G_A1,
-                        cols::G_A1_C,
-                        cols::G_X1,
-                        cols::G_C1,
-                        cols::G_X2,
-                        cols::G_R1,
-                    )
-                } else {
-                    (
-                        cols::G_A2,
-                        cols::G_A2_C,
-                        cols::G_X3,
-                        cols::G_C2,
-                        cols::G_X4,
-                        cols::G_R2,
-                    )
-                };
-                let &(s, c1, c2) = a3.next().expect("add3 count");
-                set_word_bytes(table, row, base + s_off, s);
-                table.set_u64(row, base + c_off, c1 as u64);
-                table.set_u64(row, base + c_off + 1, c2 as u64);
-
-                let &(_, _, x) = xo.next().expect("xor count");
-                set_word_bytes(table, row, base + x_off, x);
-
-                let &c = a2.next().expect("add2 count");
-                set_word_bytes(table, row, base + c2_off, c);
-
-                let &(_, _, x2) = xo.next().expect("xor count");
-                set_word_bytes(table, row, base + x2_off, x2);
-
-                let &(sll_lo, sllc_lo, sll_hi, sllc_hi, y) = ro.next().expect("rot count");
-                table.set_u64(row, base + r_off, (sll_lo & 0xFF) as u64);
-                table.set_u64(row, base + r_off + 1, (sll_lo >> 8) as u64);
-                table.set_u64(row, base + r_off + 2, (sllc_lo & 0xFF) as u64);
-                table.set_u64(row, base + r_off + 3, (sllc_lo >> 8) as u64);
-                table.set_u64(row, base + r_off + 4, (sll_hi & 0xFF) as u64);
-                table.set_u64(row, base + r_off + 5, (sll_hi >> 8) as u64);
-                table.set_u64(row, base + r_off + 6, (sllc_hi & 0xFF) as u64);
-                table.set_u64(row, base + r_off + 7, (sllc_hi >> 8) as u64);
-                set_word_bytes(table, row, base + r_off + 8, y);
-            }
-        }
-        for i in 0..OUT_U32 {
-            set_word_bytes(table, row, cols::out_word(i, 0), flow.out[i]);
-        }
+        r[cols::MU] = FE::one();
+        fill_blake3_witness(r, &op.values);
     }
 
-    trace
+    TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
 }
 
 // =========================================================================
@@ -906,12 +911,39 @@ fn word_token(addr_col: usize, bytes_start: usize, word: usize) -> Vec<BusValue>
     v
 }
 
+/// Lane `l` of the byte-REVERSED digest: reversed byte `j` is digest byte
+/// `31 − j`, so this lane's bytes are `OUT[31 − 4l − k]` for `k = 0..3` with the
+/// usual little-endian coefficients.
+///
+/// The digest is `out[0..8]` little-endian, so digest byte `j` is column
+/// `cols::OUT + j` — the same identity `chips::keccak::reversed_half_value`
+/// relies on, over a different chip's OUT block. Both the byte order WITHIN a
+/// lane and the order OF the lanes come out reversed, which is exactly what
+/// reversing all 32 bytes means.
+fn reversed_lane_value(lane: usize) -> BusValue {
+    BusValue::Linear(
+        (0..4)
+            .map(|k| LinearTerm::ColumnUnsigned {
+                coefficient: 1u64 << (8 * k),
+                column: cols::OUT + 31 - 4 * lane - k,
+            })
+            .collect(),
+    )
+}
+
+/// An `LfmMem` token for word `w` of the reversed digest.
+fn reversed_digest_token(addr_col: usize, w: usize) -> Vec<BusValue> {
+    let mut v = vec![direct(addr_col)];
+    v.extend((0..4).map(|l| reversed_lane_value(4 * w + l)));
+    v
+}
+
 /// Order groups: the `LfmMem` reads and writes, then the mixing core's ByteAlu
 /// XORs (canonical `WireFlow` order), the shift `AreBytes`, and the message
 /// `AreBytes`.
 pub fn bus_interactions() -> Vec<BusInteraction> {
     let wires = WireFlow::build();
-    let mut interactions = Vec::with_capacity(1_259);
+    let mut interactions = Vec::with_capacity(1_261);
 
     let byte_bus_value = |b: ByteRef| -> BusValue {
         match b {
@@ -934,6 +966,16 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             BusId::LfmMem,
             Multiplicity::Column(cols::mult(j)),
             word_token(cols::out_addr(j), cols::OUT, j),
+        ));
+    }
+    // 2b. The reversed digest: the 32 digest bytes read back-to-front, as two
+    // more words. Free — a different `Linear` over the OUT columns already
+    // present. See `layout::blake3::REV_ADDR0` for why the transcript needs it.
+    for w in 0..cols::DIGEST_WORDS {
+        interactions.push(BusInteraction::sender(
+            BusId::LfmMem,
+            Multiplicity::Column(cols::rev_mult(w)),
+            reversed_digest_token(cols::rev_addr(w), w),
         ));
     }
 
@@ -988,7 +1030,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 /// lookups (the alignment `AND`, 4 addr `AreBytes`, 88 pointer `IsHalf`) and
 /// the 32 `OLD_OUT` `AreBytes` dropped — the columns they guarded do not exist
 /// here. Enumeration order is the senders' own, via the shared `ValueFlow`.
-pub fn bitwise_ops_for(ops: &[Blake3Operation]) -> Vec<BitwiseOperation> {
+pub fn bitwise_ops_for(ops: &[Blake3Values]) -> Vec<BitwiseOperation> {
     let mut out = Vec::with_capacity(ops.len() * 1_248);
 
     for op in ops {

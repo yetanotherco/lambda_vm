@@ -473,6 +473,84 @@ impl LfmBuilder {
         (outs.map(Cell), rev_outs.map(|r| r.map(Cell)))
     }
 
+    // ---- BLAKE3 compression (LFM_BLAKE3) ----
+
+    /// One BLAKE3 compression: `compress(h, m, t, block_len, flags)`, returning
+    /// the full 16-word output as four machine words.
+    ///
+    /// `h` is the chaining value as two words of four `u32` lanes; `m` is the
+    /// 64-byte message block as four; `params` is one word carrying
+    /// `(t_lo, t_hi, block_len, flags)`. Every lane of every input must be a
+    /// canonical value below `2^32` — the chip decomposes each into four
+    /// BITWISE-range-checked byte columns, so no larger value exists on the AIR
+    /// side and the executor errors rather than producing an unprovable witness.
+    ///
+    /// The digest of the compression is output words 0 and 1 (`out[0..8]`
+    /// little-endian), so callers wanting a `Blake3Digest` take the first two of
+    /// the four. The chaining value of the *next* block is the same two words,
+    /// which is what makes [`super::edsl::blake3`]'s multi-block framing free of
+    /// any repacking between blocks.
+    ///
+    /// Callers should go through [`super::edsl`]'s framing rather than here: the
+    /// flag schedule and `block_len` convention are what `Blake3Chain` is, and a
+    /// raw compression is an easy way to emit a different hash.
+    pub fn blake3_compress(
+        &mut self,
+        h: [Cell; 2],
+        m: [Cell; 4],
+        params: Cell,
+    ) -> [Cell; layout::blake3::OUT_WORDS] {
+        self.emit_blake3(h, m, params, false).0
+    }
+
+    /// [`LfmBuilder::blake3_compress`], additionally materializing the
+    /// byte-REVERSED digest as two more words — the production transcript's
+    /// `sample()`, which both returns those bytes and re-absorbs them as the
+    /// next segment's prefix. Free on the bus (see `layout::blake3::REV_ADDR0`).
+    pub fn blake3_compress_rev(
+        &mut self,
+        h: [Cell; 2],
+        m: [Cell; 4],
+        params: Cell,
+    ) -> ([Cell; layout::blake3::OUT_WORDS], [Cell; 2]) {
+        let (outs, rev) = self.emit_blake3(h, m, params, true);
+        (outs, rev.expect("requested"))
+    }
+
+    fn emit_blake3(
+        &mut self,
+        h: [Cell; 2],
+        m: [Cell; 4],
+        params: Cell,
+        want_rev: bool,
+    ) -> (
+        [Cell; layout::blake3::OUT_WORDS],
+        Option<[Cell; layout::blake3::DIGEST_WORDS]>,
+    ) {
+        // Machine order: `h` is `u32` words 0..8, `m` is 8..24, and `params` is
+        // 24..28 — the layout `Blake3Operands` documents and `blake3_chip`'s
+        // `input_words` builds.
+        let ins: [Addr; layout::blake3::IN_WORDS] =
+            [h[0].0, h[1].0, m[0].0, m[1].0, m[2].0, m[3].0, params.0];
+        for a in &ins {
+            self.read(*a);
+        }
+        let outs: [Addr; layout::blake3::OUT_WORDS] = core::array::from_fn(|_| self.alloc());
+        let rev_outs: Option<[Addr; layout::blake3::DIGEST_WORDS]> =
+            want_rev.then(|| core::array::from_fn(|_| self.alloc()));
+        self.instrs
+            .push(Instr::Blake3(Box::new(super::instr::Blake3Operands {
+                ins,
+                outs,
+                mults: [0; layout::blake3::OUT_WORDS],
+                rev: rev_outs.map(|outs| super::instr::Blake3ReversedDigest {
+                    outs,
+                    mults: [0; layout::blake3::DIGEST_WORDS],
+                }),
+            })));
+        (outs.map(Cell), rev_outs.map(|r| r.map(Cell)))
+    }
+
     // ---- hints / public ----
 
     pub fn declare_arena(&mut self, len: u32) -> ArenaId {
