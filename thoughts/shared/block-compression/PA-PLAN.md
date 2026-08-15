@@ -635,31 +635,34 @@ seeded by `transcript.state()`.
 
 ## 4. Blast radius
 
-### 4.1 `crypto/stark` — the parameterization is NOT finished
+### 4.1 `crypto/stark` — the parameterization
 
-Step 2 (`879bdc0f`) parameterized the main commit path and the verifier. ✓
-VERIFIED it did **not** reach FRI:
+The whole host commitment path takes the configuration. The main trace commits
+through `<H::Batched<E> as IsStreamingLeafBackend<E>>::hash_bytes`
+(`prover.rs:893`) and the verifier checks it through `H::Batched` (`verifier.rs:594,
+598, 677, 684`). FRI commits its layer trees with `H::Pair`
+(`fri/mod.rs:commit_phase_from_evaluations`, `fri/batched.rs:batched_commit_phase`)
+and opens them through `query_phase`, also on `H`.
 
-| site | current state |
-|---|---|
-| `fri/mod.rs:11` | `use crate::config::{FriLayerMerkleTree, FriLayerMerkleTreeBackend};` |
-| `fri/mod.rs:41` | commit phase returns `Vec<FriLayer<E, FriLayerMerkleTreeBackend<E>>>` |
-| `fri/mod.rs:105` | `FriLayerMerkleTree::build(&leaves)` — concrete keccak |
-| `fri/mod.rs:154` | `query_phase(fri_layers: &[FriLayer<F, FriLayerMerkleTreeBackend<F>>], ..)` |
-| `prover.rs:2048` | names `crate::config::FriLayerMerkleTreeBackend<FieldExtension>` |
-| `gpu_lde.rs` | 8 further sites (`:2184, 2260, 2320, 2359, 2385, 2446, 2547, 2584`) |
+The join between those two families is what makes a proof verifiable: the
+prover builds FRI layer trees with `H::Pair` and the verifier re-hashes each
+opened pair with `H::Batched` (`verifier.rs:736`), so the `StarkHash`
+two-element invariant — `Batched::hash_data(&vec![a, b]) ==
+Pair::hash_data(&[a, b])` — is load-bearing rather than decorative. Naming one
+`H` is what makes the two sides agree; a configuration that broke the invariant
+would reject every honest proof at its first FRI query, loudly.
 
-Meanwhile the verifier authenticates FRI openings with `H::Batched`
-(`verifier.rs:736`). **Under a blake3 `H` the prover would build keccak FRI
-trees and the verifier would check them with blake3 — every honest proof
-rejects at its first FRI query.** It fails loudly rather than silently, which is
-the good outcome, but threading `H` (or a `B`) through `fri/` is required P-a
-work, not optional cleanup. `FriLayer<F, B>` is already backend-generic, so this
-is parameter threading, ~13 sites. Effort **M**.
+⚠ **The `cuda` fork covers FRI as well.** `StarkHash::Pair` carries the same
+`KeccakTreeBackend` bound `Batched` does under `cuda`, because `gpu_lde`'s FRI
+commit drives the whole commit phase on device and hashes every layer with the
+keccak kernels, labelling the result with the backend type it was handed. So a
+cuda build has no BLAKE3 configuration for FRI layers either, which is
+consistent with `Blake3StarkHash` not existing under `cuda` at all (§4.5, R4).
 
-By contrast the main-trace path is done: `commit_rows_bit_reversed_subset`
-already hashes through `<H::Batched<E> as IsStreamingLeafBackend<E>>::hash_bytes`
-(`prover.rs:893`), and the verifier through `H::Batched` at `:594, 598, 677, 684`.
+The `FriLayerMerkleTree` / `FriLayerMerkleTreeBackend` aliases survive as the
+*default* configuration's names — the `const _` assertions in `config.rs` pin
+them to `KeccakStarkHash`'s members, and `math-cuda`'s parity tests build
+reference trees with them.
 
 ### 4.2 The `CommitmentHash` tripwire
 
@@ -762,9 +765,36 @@ an unratified round-count assumption.
     an obstacle — it turns the GPU fork into a compile error a reviewer sees.
   GPU execution lives in the separate `gpu-tests.yml` workflow (consistent with
   the standing note that it runs on `merge_group` against the rented box).
-- ✗ UNVERIFIED: whether continuation chaining binds any commitment-hash-derived
-  value across epochs. This matters (a chained root is a format surface) and I
-  did not close it. **Open item for Stage 2.**
+- ✓ VERIFIED **continuation chaining binds NO commitment-hash-derived value
+  across epochs.** The epoch N→N+1 carry is `reg_fini: Vec<u32>`, a plain
+  register file (`continuation.rs:438-456`, consumed at `:1703` as the next
+  epoch's `register_init`); the rest of the carry is the GlobalMemory LogUp bus,
+  which is field elements. No Fiat-Shamir state crosses either — every epoch
+  builds a fresh `DefaultTranscript` seeded from the statement alone, and the
+  `elf_digest` in that statement is an *independent* `PlatformKeccak256` over raw
+  ELF bytes that does not move when the commitment hash does. `EpochProof`'s one
+  `Commitment` field, `l2g_root`, binds an epoch to the **global** proof inside
+  the same bundle — both sides move together under a flip, so it is inert.
+
+  ⚠ **The format surface is a pinned constant, not a chained root.**
+  `static_zero_page_commitment` (`prover/src/tables/page.rs:411-430`) is a
+  hardcoded per-blowup commitment sitting directly on `verify_global`'s
+  continuation path, and it is deliberately never supplied via private input
+  ("zero-init pages use a compile-time constant and are never listed",
+  `recursion.rs:113-115`) — so it is compiled into the host verifier *and* baked
+  into the recursion guest ELFs. It moves on the flip. Regenerate with
+  `cargo run --bin compute_static_commitments --release`, under the standing
+  policy that a drift failure is investigated, never re-blessed to silence a
+  test — which that function's own doc states.
+
+  ✓ VERIFIED, upgrading the `? INFERRED` above: no checked-in proof blobs exist.
+  The LFM `FixtureArchive` is a regenerable `/tmp` cache, untracked.
+
+  ✓ The rkyv wire format does **not** move. `Commitment` is `[u8; 32]` and
+  `StarkHash::Node` is deliberately not an associated type precisely so a
+  configuration change leaves `StarkProof`'s derives byte-identical
+  (`stark/src/config.rs:20-21, 109-112`), so #845's in-place verify path is
+  untouched by a flip.
 
 ### 4.5 GPU
 
@@ -799,7 +829,7 @@ it.
 
 ### 4.6 The LFM wrap's hosted-verify emitters — where the 4× materializes
 
-✓ VERIFIED the four emission sites, all keccak today:
+✓ VERIFIED the five emission sites, all keccak today:
 
 | domain | emitter | site |
 |---|---|---|
@@ -807,6 +837,18 @@ it.
 | trace Merkle paths | `edsl::keccak_merkle_walk(b, leaf, bits, &opening.siblings)` | `sub_proof.rs:289` |
 | FRI-layer paths | `edsl::keccak_merkle_walk(..)` | `fri.rs:564` |
 | transcript | `keccak_absorb` / `keccak_absorb_rev` | `builder.rs:414, 426` |
+| ★ register commitment | `edsl::keccak_leaf_hash` + `edsl::keccak_merkle_tree_root` | `programs.rs:1266, 1270` |
+
+★ The fifth is different in kind from the other four: `emit_register_commitment`
+**builds a whole Merkle tree in eDSL**, over the cross-epoch register carry,
+rather than walking or absorbing one. `keccak_merkle_tree_root` has exactly one
+caller, so a grep for `merkle_walk` misses it. Note the interaction with §4.4:
+the carry itself is hash-free on the host path, but the LFM wrap feeds it
+through the commitment hash *in-machine* — deliberately, per `RootCells::from_digest`
+(`lfm/epoch.rs:118-125`): "computing it from those cells is what binds them."
+A BLAKE3 twin of this emitter is therefore part of Stage 5, not optional.
+⚠ Scope check: the emitter ships, but the assembled epoch verifier is
+`#[cfg(test)]` and no `LfmProgramKind` reaches it yet (`programs.rs:1149-1154`).
 
 and the LFM-native counterparts that exist today — `edsl::leaf_hash_pair` and
 `edsl::merkle_walk` over **one-cell** digests, used by the fixture programs
