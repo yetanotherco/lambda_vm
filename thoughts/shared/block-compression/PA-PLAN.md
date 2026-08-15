@@ -570,30 +570,71 @@ unbounded `loop` at `goldilocks.rs:548-555`. A byte-oriented `Blake3Transcript`
 inherits it unchanged. So P-a either adopts the rider or ships a blake3 RV64
 transcript that carries the same standing unprovability restriction into every
 future wrap — having just paid the proof-breaking cost that would have removed
-it. **Fold into Stage 3; it is the cheapest item in the whole plan.**
+it. **Adopted, for the BLAKE3 configuration only** (`TranscriptHash::
+CANDIDATES_PER_COORDINATE`); keccak keeps the unbounded schedule so existing
+proofs do not move.
 
-**Rider 2 — one-byte statement pad (`:20-61`). Rideable, but its arithmetic must
-be re-derived first.** The continuation-epoch statement encodes to `207 + L`
-bytes (`L = |public_output|`, one byte per COMMIT); the inherited cursor shift is
+⚠ **"The cheapest item in the whole plan" understates the cost.** A coordinate
+draws `n = 2` candidates where the unbounded schedule draws ~1, so **challenge
+sampling consumes twice the squeeze bytes** — a cubic-extension element goes
+from ~3 candidates (0.75 squeezes) to exactly 6 (1.5). The transcript is 2.3% of
+the hash bill, so it is small in the prover, but it lands in the recursion guest,
+which replays every challenge and is exactly what the recursion campaign has been
+optimizing. `n = 1` would be free — it is today's modal cost — but leaves a
+≈ 2⁻³² per-coordinate tail, one proof in a few hundred thousand, which is not
+negligible enough to call the schedule fixed. `n = 2` puts the tail at ≈ 2⁻⁶⁴.
+
+⚠ **The fallback may NOT be a modular reduction.** Reducing an out-of-range
+candidate mod `p` is free and total, but biases challenges by ≈ 2⁻³² per draw;
+over ~10⁴ draws that is ~2⁻¹⁹ of statistical distance, which would *dominate*
+the ~92 proven bits SECURITY-LEVELS establishes. The implementation draws on
+instead, keeping the distribution exactly uniform. Failing instead would make
+challenge sampling fallible on the verifier's replay path — an `Option` return
+through every caller, and a panic risk where the no-prod-panic policy forbids one.
+
+**Rider 2 — statement pad (`:20-61`). ✓ RE-DERIVED, and the premise below was
+wrong: the arithmetic does NOT move, so P-a is not this rider's forcing
+function.** The continuation-epoch statement encodes to `207 + L` bytes
+(`L = |public_output|`, one byte per COMMIT); the inherited cursor shift is
 `(3 + L) mod 4`, so Phase-A root absorbs land misaligned and need splicing —
 "2 roots × 8 halves × T tables … at T = 24 that is 384 `BitDec` + ~13k `BALU`
 rows per proof", ~0.2% of instructions but "low single-digit percent of the
 machine's fixed trace floor" (`:51-57`). Zero for the ~1-in-4 workloads whose
-`L` lands on a boundary. The encoding is already versioned by its domain tag
-`LAMBDAVM_CONTINUATION_EPOCH_V2`, so a pad is a tag bump — "exactly the kind of
-change a migration absorbs for free" (`:59-61`).
+`L` lands on a boundary.
 
-⚠ **But the shift arithmetic is absorb-granularity-specific, and P-a moves the
-granularity** — keccak's 136-byte rate versus blake3's 64-byte block. The
-`(3 + L) mod 4` figure and the splice cost are derived against the current
-construction; under blake3 they must be recomputed before the pad's size is
-chosen. Two riders, two different verdicts: **rider 1 is a decision, rider 2 is a
-measurement then a decision.**
+✓ VERIFIED **the `mod 4` is the machine's half width, not the sponge's rate.**
+`epoch_statement_cursor_is_three_plus_output_len` (`machine_tests.rs:2200`)
+asserts the shift modulo `keccak_host::BYTES_PER_HALF`, and that constant is
+**4** (`keccak_host.rs:15`) — the eDSL packs absorbed bytes into 4-byte halves.
+The rate appears only in `padded_len` / `num_blocks`, i.e. in how many
+compressions an absorb costs, never in where a root lands. Since 4 divides both
+136 and 64 and the message bytes are identical either way, **the shift and the
+splice cost are invariant under keccak → blake3**. The earlier claim that "the
+shift arithmetic is absorb-granularity-specific and P-a moves the granularity"
+conflated the sponge rate with the half width.
 
-Note the file itself carries three self-corrections on rider 2 (`:33-49`),
-including that the `16R` term is dead because `runtime_page_ranges` is always
-empty for continuation epochs. Do not re-import `16R` when redoing the
-arithmetic.
+What *does* move is the compression count for the same absorb: keccak takes
+`floor(n/136) + 1` permutations (2 for `n = 207`), `Blake3Chain` takes
+`ceil(n/64)` compressions (4). More compressions, each ≈ 1/13.7 the cell cost, so
+≈ 6.9× cheaper for the statement absorb — but that is the §5 census, not this
+rider.
+
+⚠ **"One-byte pad" is a misnomer.** `L` is workload-determined, so a fixed byte
+cannot align anything; the pad has to be the 0–3 bytes that take `207 + L` to
+the next multiple of 4. The file's own second correction implies this, but its
+title does not.
+
+**✗ OPEN — for Mauro, not forced by P-a.** Under the riders file's own admission
+rule an entry belongs there only if "the migration has to touch that code
+anyway" (`:63-67`), and Stage 3 does not: the statement encoder is hash-agnostic
+and its arithmetic is unchanged. The natural host is **Stage 5**, which does
+rewrite these emitters, or Stage 6, which is the proof-breaking moment the tag
+bump wants. The numbers to decide on are above; the cost of waiting is that
+~3-in-4 workloads keep paying ~0.2% of epoch-verify instructions.
+
+Note the file carries three self-corrections on rider 2 (`:33-49`), including
+that the `16R` term is dead because `runtime_page_ranges` is always empty for
+continuation epochs. It is not re-imported above.
 
 ## 3. Grinding
 
@@ -625,11 +666,27 @@ seeded by `transcript.state()`.
   (`prover/src/recursion.rs:39-45`, cited in D0-DESIGN.md §3), and grinding is
   part of the RV64 proof's claimed security budget. Port the PoW; do not delete
   it.
-- The wrap must emit the two compressions. ✗ UNVERIFIED whether the epoch-verify
-  emitter re-checks the nonce today — I did not find a grinding site in
-  `epoch_verify.rs`. **Check this before Stage 5**: if the wrap does not
-  currently verify the inner PoW, that is a pre-existing gap in the hosted
-  verify, independent of P-a, and it should be filed rather than folded in.
+- The wrap must emit the two compressions. ✓ VERIFIED **it already does — there
+  is no gap.** The search above looked in `epoch_verify.rs` and the check is not
+  there; it lives in the challenge spine, `prover/src/lfm/epoch.rs`, which is
+  where the transcript absorbs are and therefore the right place.
+  `emit_grinding_check` (`:350-406`, called at `:514` exactly when a nonce is
+  present) builds the inner keccak over `PREFIX ‖ state ‖ factor` and the outer
+  over `inner ‖ nonce_be`, then bit-decomposes the digest's first lanes and
+  asserts the top `factor` bits are zero — `is_valid_nonce`'s predicate, done as
+  a bit decomposition plus zero assertions rather than a comparison, because the
+  bound is a power of two. Its own doc states the stake: "the nonce is absorbed,
+  so the query indices depend on it, and an unchecked nonce is a free re-roll of
+  every query index at zero cost."
+
+  ⚠ **Consequence for Stage 5, and it is a site §4.6 does not list.** The check
+  reaches keccak through `edsl::keccak256` (`edsl.rs:439`) →
+  `keccak256_absorb_all` (`:483`), which is a **sponge-framing** emitter: it
+  loops over `num_blocks`/`BLOCK_HALVES` and splices `pad_half`, all of which
+  encode keccak's 136-byte rate and `pad10*1`. A BLAKE3 port needs the framing
+  rewritten to 64-byte blocks and the chain's length-in-final-block convention,
+  not just a compression swap. Two compressions per proof, so the *cost* is
+  irrelevant — the work is in the framing.
 
 ---
 
