@@ -1538,3 +1538,50 @@ after seeing `alpha`. That binding is load-bearing for everything above — the
 whole analysis assumes the height profile is fixed. Keep it. (Addendum A's
 recommendation to absorb it once more before the FIRST batched root strengthens
 the same property for rounds 1-3.)
+
+### B.8 ⛔ Capping `LOCAL_TO_GLOBAL` is NOT a small isolated commit — NOT DONE
+
+B.5 costs the cap at +2.00 bits and it is the second half of the remedy package.
+It was scoped as "a small, separate commit, isolated so it can be cherry-picked
+or dropped at review". **The code contradicts that scoping, so it is not
+implemented here.** What it actually touches, ✓ VERIFIED:
+
+1. **`EpochProof::l2g_root` is ONE `Commitment`, not a vector**
+   (`prover/src/continuation.rs:455`), and it is an **rkyv-archived field** read
+   in place by the #845 zero-copy view layer (`:618-621`). Chunking L2G makes it
+   `Vec<Commitment>` — a wire-format change to the continuation bundle, on
+   exactly the surface MMCS-PLAN §2.1 flags as a silent-deletion hazard.
+2. **The cross-proof binding is index-aligned and one-per-epoch.**
+   `verify_l2g_commitment_binding_view` (`prover/src/lib.rs:1035-1044`) rests on
+   "the final proof commits one local-to-global sub-table per epoch as its FIRST
+   `N` tables, so `final_proof.get(i)` is epoch `i`'s L2G commitment". Chunking
+   breaks that alignment, and this is the check that stops the global proof
+   committing different boundary claims than the epochs did — a soundness
+   binding, not bookkeeping.
+3. **The epoch prover rebuilds the same table to match roots**
+   (`continuation.rs:785-789`: "identical to the one the global proof commits —
+   the commitment binding compares their roots"). Both sides would have to chunk
+   identically, so the chunk policy becomes part of the protocol.
+4. `l2g_global_air(opts, epoch_label(i))` is one AIR per epoch carrying that
+   epoch's label constant; a per-chunk variant has to keep every boundary firing
+   its interactions exactly once, or the bus stops balancing.
+
+**Two ways forward, for whoever picks this up — the choice is a design call, not
+an implementation detail:**
+
+- **(a) Chunk the L2G table.** Costs the wire change in (1) and the rewrite in
+  (2). Buys the +2.00 bits and a smaller batched domain at every epoch size.
+- **(b) Cap the EPOCH instead.** Cut epochs so an epoch's touched-cell count
+  stays under 2^20. One L2G table per epoch, one root, binding untouched — but
+  it changes the continuation schedule, so it trades a wire change for a
+  policy change. This is probably what "changes epoch chunking for L2G" meant,
+  and it is the cheaper of the two on the soundness surface.
+
+Either way the honest-path control is the same and is not optional: an
+end-to-end continuation prove/verify across an epoch boundary that straddles the
+cap, asserting `verify_l2g_commitment_binding_view` still accepts.
+
+Without the cap the remedy package delivers **+3.59 bits** (the class split
+alone, B.5 row 1), not +5.54, so the conservative batched floor is **92.24
+rather than 94.19** — a ~3.3-bit conservative cost against today's 95.52 union,
+which the `eta` retune still absorbs.
