@@ -1276,3 +1276,77 @@ mod tests {
         assert_eq!(seen.len(), NUM_G * cols::G_SIZE + 64);
     }
 }
+
+/// ★ The executor's compression and `crypto`'s shared primitive are the same
+/// function.
+///
+/// #903 landed a second host transcription of the BLAKE3 compression:
+/// `executor::vm::instruction::execution::blake3_compress_6round`, with its own
+/// `blake3_g`, its own `BLAKE3_IV` and its own `BLAKE3_ROUNDS = 6`. `crypto`'s
+/// `blake3_compress_rounds` is the one P-a Stage 1 hoisted precisely so there
+/// would be a single definition — the same treatment the CUDA reference got.
+///
+/// Two independently written encodings of one function is what PA-PLAN §1.4
+/// forbids ("do not prove that two … coincide; make them one function"), and
+/// merging #903 reintroduced it. Until they are unified, this is the gate: the
+/// executor is what the guest's syscall actually runs, so a divergence here is
+/// a guest that hashes differently from the host prover — R5's invisible
+/// failure, which surfaces only as in-guest proof rejection.
+///
+/// Checked over the message schedule's structural edge cases plus a pseudo-random
+/// sweep, at every `(t, block_len, flags)` shape the chain framing produces.
+#[cfg(test)]
+mod executor_primitive_parity {
+    use crypto::hash::blake3::{BLAKE3_SIX_ROUNDS, blake3_compress_rounds};
+    use executor::vm::instruction::execution::blake3_compress_6round;
+
+    #[test]
+    fn the_executor_compression_is_the_shared_primitive() {
+        // A cheap deterministic stream; no rand dependency in this crate.
+        let mut z = 0x243f_6a88_85a3_08d3u64;
+        let mut next = move || {
+            z ^= z << 13;
+            z ^= z >> 7;
+            z ^= z << 17;
+            z as u32
+        };
+
+        // The flag/counter shapes `Blake3Chain` actually emits: first block
+        // (CHUNK_START), interior, and last (CHUNK_END|ROOT with the true byte
+        // count as block_len). t is 0 throughout for the chain, but the syscall
+        // takes a full 64-bit counter, so both halves are exercised.
+        let shapes: [(u64, u32, u32); 5] = [
+            (0, 64, 1),                // CHUNK_START
+            (0, 64, 0),                // interior
+            (0, 7, 2 | 8),             // CHUNK_END | ROOT, partial final block
+            (u64::MAX, 64, 0),         // both counter halves set
+            (1 << 32, 0, 0xffff_ffff), // high half only; degenerate len/flags
+        ];
+
+        for (t, block_len, flags) in shapes {
+            for _ in 0..64 {
+                let h: [u32; 8] = core::array::from_fn(|_| next());
+                let m: [u32; 16] = core::array::from_fn(|_| next());
+
+                assert_eq!(
+                    blake3_compress_6round(&h, &m, t, block_len, flags),
+                    blake3_compress_rounds(&h, &m, t, block_len, flags, BLAKE3_SIX_ROUNDS),
+                    "executor and crypto disagree at t={t}, block_len={block_len}, flags={flags}"
+                );
+            }
+        }
+    }
+
+    /// CONTROL: the two would NOT agree at a different round count, so the test
+    /// above is comparing round counts as well as wiring.
+    #[test]
+    fn the_parity_is_round_count_sensitive() {
+        let h = [1u32, 2, 3, 4, 5, 6, 7, 8];
+        let m: [u32; 16] = core::array::from_fn(|i| (i as u32) * 7 + 1);
+        assert_ne!(
+            blake3_compress_6round(&h, &m, 0, 64, 1),
+            blake3_compress_rounds(&h, &m, 0, 64, 1, BLAKE3_SIX_ROUNDS + 1),
+            "a 7-round reference must not match the 6-round executor"
+        );
+    }
+}
