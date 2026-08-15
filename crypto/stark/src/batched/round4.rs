@@ -484,7 +484,7 @@ pub(crate) mod tests {
             &heights,
             &widths,
             |alpha| {
-                let mut combiner = HeightCombiner::new(alpha.clone());
+                let mut combiner = HeightCombiner::new(*alpha);
                 for table in tables {
                     combiner.absorb(&table.codeword, table.height);
                 }
@@ -525,14 +525,14 @@ pub(crate) mod tests {
         let combined = combine_by_height(&inputs, alpha);
 
         let tallest = combined[h_max].as_ref().expect("tallest bucket exists");
-        let p0 = (tallest[iota * 2].clone(), tallest[iota * 2 + 1].clone());
+        let p0 = (tallest[iota * 2], tallest[iota * 2 + 1]);
 
         let buckets = (0..h_max)
             .map(|h| {
                 combined
                     .get(h)
                     .and_then(|slot| slot.as_ref())
-                    .map(|codeword| codeword[injection_position(iota, h_max, h)].clone())
+                    .map(|codeword| codeword[injection_position(iota, h_max, h)])
             })
             .collect();
         (p0, buckets)

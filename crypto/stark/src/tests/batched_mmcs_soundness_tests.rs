@@ -491,7 +491,7 @@ fn a_mis_sized_fri_decommitment_is_rejected() {
     assert!(
         !f.check_query_with(0, |d, _, _, _| {
             let path = d.layers_auth_paths[0].clone();
-            let evaluation = d.layers_evaluations_sym[0].clone();
+            let evaluation = d.layers_evaluations_sym[0];
             d.layers_auth_paths.push(path);
             d.layers_evaluations_sym.push(evaluation);
         }),
@@ -604,7 +604,7 @@ fn an_injection_read_at_the_sibling_row_is_rejected() {
                 continue;
             }
             exercised += 1;
-            let sibling_value = bucket[sibling].clone();
+            let sibling_value = bucket[sibling];
             assert!(
                 !f.check_query_with(q, |_, _, buckets, _| {
                     buckets[h] = Some(sibling_value);

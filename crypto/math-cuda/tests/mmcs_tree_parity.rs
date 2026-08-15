@@ -85,7 +85,7 @@ fn device_tree(mats: &Matrices) -> ([u8; 32], Vec<u8>) {
     let mut group_digests: Vec<Option<cudarc::driver::CudaSlice<u8>>> =
         (0..=h_max).map(|_| None).collect();
 
-    for h in 1..=h_max {
+    for (h, slot) in group_digests.iter_mut().enumerate().skip(1) {
         let group: Vec<usize> = (0..mats.num_matrices())
             .filter(|&m| mats.log_height(m) == h)
             .collect();
@@ -103,13 +103,13 @@ fn device_tree(mats: &Matrices) -> ([u8; 32], Vec<u8>) {
             // The point of the streaming build: this matrix is done with.
             drop(dev);
         }
-        group_digests[h] = Some(hasher.finalize(&stream).expect("finalize"));
+        *slot = Some(hasher.finalize(&stream).expect("finalize"));
     }
 
     let nodes = math_cuda::mmcs::build_mmcs_tree_on_device(&stream, &group_digests)
         .expect("device tree build");
     let root = math_cuda::mmcs::read_mmcs_root(&stream, &nodes).expect("root readback");
-    let all = stream.memcpy_dtov(&nodes).expect("node readback");
+    let all = stream.clone_dtoh(&nodes).expect("node readback");
     (root, all)
 }
 

@@ -1638,11 +1638,9 @@ mod tests {
              {} — this is the batched commit's whole memory claim",
             specs.len()
         );
-        for m in 0..specs.len() {
-            let (first, last) = streamed_windows[m];
+        for (m, &(first, last)) in streamed_windows.iter().enumerate() {
             assert!(first <= last, "matrix {m} was never read");
-            for n in (m + 1)..specs.len() {
-                let (fn_, ln) = streamed_windows[n];
+            for (n, &(fn_, ln)) in streamed_windows.iter().enumerate().skip(m + 1) {
                 assert!(
                     last < fn_ || ln < first,
                     "matrices {m} and {n} were read in overlapping windows \

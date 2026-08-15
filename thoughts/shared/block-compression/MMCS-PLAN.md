@@ -1226,3 +1226,135 @@ inv,_ = node_cost(REAL21_WRAP, REAL21_RND, 219, 'blake3')
 print(inv*BLAKE3_CELLS_PER_COMPRESSION/0.935*BYTES_PER_CELL/GIB)   # 559, not 452
 "
 ```
+
+---
+
+## ADDENDUM A — M-13b: are any rounds-1-3 challenges shape-exploitable?
+
+Written on `mmcs-integration` alongside M-3 / M-4. §M-10.4 split M-13 into (a)
+add widths to the round-4 histogram (done on `mmcs-primitives`) and (b) this
+question, which gates §3.4's addendum ratification.
+
+### A.0 Answer
+
+**No round-1-3 challenge is shape-exploitable — but the argument that makes it
+so is NOT a transcript-ordering argument, and that is worth knowing before
+ratifying §3.4.** Every round-1-3 challenge is drawn strictly before the shape
+histogram is absorbed, so the only thing standing between a prover and a
+post-hoc shape choice is that each round's *root* implicitly binds its own
+shape through the tree structure. That holds, and the primitive's tests pin the
+two ways it could fail. It is a collision-resistance argument, one link longer
+than the ordering argument §3.4 uses for round 4.
+
+**Recommendation (S, and it removes the extra link): absorb the shape histogram
+ONCE more, at the very start of round 1, before the first batched root.** Cost
+is two field-sized absorptions per table per proof — the same encoding
+`absorb_shape_histogram` already defines, and for the LFM machine the vectors
+are registry constants that are already in `program_id`. With it, every
+challenge in every round is drawn after the shape is explicitly bound, and the
+answer above becomes true for the same reason round 4's is.
+
+### A.1 What "the shape" is, and which parts the prover picks
+
+| component | who supplies it | ✓/? |
+|---|---|---|
+| per-table `width` | the AIR set, never the proof | ✓ VERIFIED — `verifier.rs:639` states the rule for aux widths and `trace_opening_widths_well_formed` enforces it; `MixedMmcs::verify_batch` takes `widths` from the caller |
+| table count and order | the AIR set (`airs` argument) | ✓ VERIFIED `verifier.rs:1232-1252` — `multi_verify_views` rejects `airs.len() != proofs.view_len()` |
+| per-table `log_height` | **the PROOF** (`trace_length`) | ✓ VERIFIED `verifier.rs:1269`, `:1484` — read from the proof and used to build the domain |
+
+✓ VERIFIED **`trace_length` is never absorbed into the transcript.** Grepping
+`verifier.rs` for `trace_length` returns only domain construction and the
+part-count check at `:1270-1273`. So heights are the prover-chosen half of the
+shape, today as well as under batching.
+
+### A.2 The challenge order, verified
+
+| round | challenge | drawn after | site |
+|---|---|---|---|
+| 1 | LogUp challenges | every main root | ✓ `prover.rs:3271-3314`, `verifier.rs:1263-1330` |
+| 2 | `beta` (constraint coefficients) | the aux root | ✓ `prover.rs:3617` then `:3869` |
+| 2 | — | composition-parts root absorbed | ✓ `prover.rs:3903` |
+| 3 | `z` (OOD) | the parts root | ✓ `prover.rs:3909-3913` |
+| 4 | `gamma` (DEEP) | the OOD evaluations | ✓ `prover.rs:2032` |
+| 4 | shape histogram → `alpha` | — | the batched path, `batched/round4.rs` |
+
+Under batching the histogram lands in round 4, so **(1), (2) and (3) are all
+drawn before the shape is explicitly bound.** That is the whole question.
+
+### A.3 The four exploits considered, and why each fails
+
+**E1 — move columns between matrices inside one round (the aux-width break,
+one level up).** `verifier.rs:633-649` records the live break: the aux root was
+absorbed after the shared challenges, so a prover that moved main columns into
+the aux tree chose them after seeing `z`/`alpha`. The batched analogue is
+shifting a boundary inside a height group's concatenated leaf — lengthen one
+matrix's `evaluations` by one, shorten its `evaluations_sym` by one, and the
+flat bytes are unchanged. ✗ **Blocked, and by the same remedy: the width, not
+the ordering.** `MixedMmcs::verify_batch` length-checks every matrix's opening
+against verifier-derived widths. ✓ VERIFIED, `boundary_shift_forgery_rejected`
+asserts the flat concatenation is byte-identical first, so the rejection
+provably comes from the width binding and not from a differing hash.
+
+**E2 — relabel a matrix's height after seeing a challenge.** The injection
+level is `h_max - h`, so a relabelled height changes where the matrix enters the
+climb. ✗ **Blocked by the committed tree**: the root was absorbed before the
+challenge, and a relabelled schedule no longer reproduces it. ✓ VERIFIED,
+`rejects_a_relabelled_injection_height`.
+
+**E3 — claim a different `h_max`.** ✗ Blocked: `verify_batch` requires
+`merkle_path.len() == h_max - 1` and rejects `iota >= 2^(h_max-1)`, and the M-14
+guard makes an index from a taller domain a rejection rather than a silent
+mis-binding. ✓ VERIFIED, `verify_batch_rejects_malformed_shapes_without_panicking`
+and `short_round_low_bit_convention_is_exercised`.
+
+**E4 — commit ONE root that opens validly under TWO shapes, then pick the shape
+after seeing the round-1-3 challenges.** This is the residual, and it is the
+one that is not closed by a check. ✗ Blocked only because producing such a root
+is a collision on the leaf/parent hash. **? INFERRED** — no reduction is written
+down, and none is attempted here; it is the standard Merkle binding assumption
+the rest of the system already rests on. What is new under batching is that
+MORE of the epoch's structure (the injection schedule, the group boundaries)
+now hangs off that same assumption, where per-table commitments carried one
+root per table and bound the count structurally.
+
+E4 is exactly what the A.0 recommendation removes: absorb the histogram before
+the first root and the shape is pinned by the transcript, so no root has to be
+binding for the shape to be.
+
+### A.4 Consequence for §3.4's ratification
+
+§3.4's addendum ("the transcript must bind the SHAPE, not only the leaf") is
+**confirmed and should be ratified**, with one amendment:
+
+> Absorb the `(height, width)` histogram before the FIRST batched root of the
+> proof, not only before the batched root of round 4.
+
+Two smaller notes for the same pass:
+
+1. **§3.4's recommended option (b) — one header cell per matrix, at its
+   injection level — is NOT what the primitive implements.** `hash_group_leaf`
+   concatenates rows with no per-matrix header; the boundary is pinned by the
+   verifier-supplied `widths` length check instead (E1 above). That is sound for
+   the boundary question, and it is free where option (b) costs 0.9-6.9% per
+   query (§3.4's table). What it does NOT bind is `kind`: two matrices of equal
+   width at the same height are distinguished only by their position in the
+   input order. Since the verifier fixes that order from the AIR set, position
+   is as good as a label — but the argument is now "the order is fixed
+   externally" rather than "the leaf says which matrix this is", and M1 should be
+   ratified in those terms or the header added.
+2. **M2 is moot as posed.** It asks whether `matrix_index` replacing
+   `ROWS_PER_LEAF` in the header closes the reordering surface. With no header
+   at all, reordering is closed by `rejects_swapped_openings_within_a_height_group`
+   — the concatenation binds input order, so two same-shape matrices' openings
+   swapped is a different leaf. ✓ VERIFIED.
+
+### A.5 What this does NOT answer
+
+- Whether the *AIR set itself* is program shape in the RV64 epoch proof, as it
+  is in the LFM machine (where `num_lfm_airs(keccak_rnd_chunks)` comes from the
+  registry). A.1's table assumes it is, on the strength of `multi_verify_views`
+  taking `airs` from the caller. If an epoch's table set is ever derived from
+  the proof, the whole of A.3 has to be revisited — every "the AIR set supplies
+  it" row becomes a prover choice.
+- The eps_C consequence of batching, which is a separate question with its own
+  addendum below.

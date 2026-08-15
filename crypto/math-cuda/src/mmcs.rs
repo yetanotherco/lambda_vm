@@ -267,7 +267,7 @@ pub fn build_mmcs_tree_on_device(
 /// The MMCS root — node 0 of the heap array.
 pub fn read_mmcs_root(stream: &Arc<CudaStream>, nodes: &CudaSlice<u8>) -> Result<[u8; 32]> {
     let head = nodes.slice(0..32);
-    let bytes = stream.memcpy_dtov(&head)?;
+    let bytes = stream.clone_dtoh(&head)?;
     let mut root = [0u8; 32];
     root.copy_from_slice(&bytes);
     Ok(root)
