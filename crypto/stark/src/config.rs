@@ -1,3 +1,4 @@
+use crypto::fiat_shamir::transcript_hash::{KeccakTranscriptHash, TranscriptHash};
 #[cfg(not(feature = "cuda"))]
 use crypto::merkle_tree::backends::types::{BatchBlake3Backend, PairBlake3Backend};
 use crypto::merkle_tree::{
@@ -173,9 +174,26 @@ pub trait StarkHash: Send + Sync + 'static {
         F: IsField + 'static,
         FieldElement<F>: AsBytes + Sync + Send;
 
-    /// What both hash with. The name a proof's roots may be called by.
+    /// The Fiat-Shamir configuration this commitment configuration is paired
+    /// with — the hash the transcript sponges on, and the one grinding's
+    /// proof-of-work computes over.
+    ///
+    /// Naming it here is what keeps a proof describable by one configuration.
+    /// The transcript object is still built by the caller and handed to
+    /// `multi_prove` / `multi_verify`, so this does not *force* the caller's
+    /// transcript to match; what it forces is that everything the prover and
+    /// verifier derive internally from the configuration — grinding — follows
+    /// this hash instead of a hard-wired one.
+    type Transcript: TranscriptHash;
+
+    /// What both Merkle families hash with. The name a proof's roots may be
+    /// called by.
     const COMMITMENT_HASH: CommitmentHash;
 }
+
+/// The digest a configuration grinds over: its transcript's hash, because the
+/// grinding seed is `transcript.state()`.
+pub type GrindingDigest<H> = <<H as StarkHash>::Transcript as TranscriptHash>::Digest;
 
 /// The keccak-256 configuration — the only one, and the one every `Prover` and
 /// `Verifier` alias resolves to.
@@ -194,6 +212,8 @@ impl StarkHash for KeccakStarkHash {
     where
         F: IsField + 'static,
         FieldElement<F>: AsBytes + Sync + Send;
+
+    type Transcript = KeccakTranscriptHash;
 
     const COMMITMENT_HASH: CommitmentHash = CommitmentHash::Keccak256;
 }
@@ -258,6 +278,8 @@ impl StarkHash for Blake3StarkHash {
     where
         F: IsField + 'static,
         FieldElement<F>: AsBytes + Sync + Send;
+
+    type Transcript = crypto::fiat_shamir::transcript_hash::Blake3TranscriptHash;
 
     const COMMITMENT_HASH: CommitmentHash = CommitmentHash::Blake3;
 }

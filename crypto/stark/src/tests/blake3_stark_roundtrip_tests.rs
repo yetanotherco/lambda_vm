@@ -267,3 +267,56 @@ fn fri_layer_trees_are_built_with_the_configurations_pair_backend() {
          the hash does"
     );
 }
+
+/// ★ The whole BLAKE3 configuration at once: BLAKE3 commitments, a BLAKE3
+/// Fiat-Shamir transcript, and BLAKE3 grinding, proving and verifying.
+///
+/// The tests above run the BLAKE3 commitment configuration against a *keccak*
+/// transcript, which is a legitimate configuration but not the destination.
+/// This is the destination minus the guest leg: nothing keccak is left on
+/// either side except what the AIR itself does.
+///
+/// `default_test_options` sets `grinding_factor: 1`, so the proof carries a
+/// nonce and the verifier re-checks it — through `GrindingDigest<H>`, which for
+/// this configuration is `Blake3Chain`. A grinding port that had been left
+/// hard-wired to keccak would fail here, because prover and verifier would
+/// disagree about which work the nonce satisfies.
+#[test]
+fn the_full_blake3_configuration_proves_and_verifies_with_grinding() {
+    use crypto::fiat_shamir::default_transcript::Blake3Transcript;
+
+    let (air, pub_inputs) = air_and_inputs();
+    assert_eq!(
+        air.options().grinding_factor,
+        1,
+        "this test is about the grinding path; it must be on"
+    );
+
+    let mut trace = simple_addition_trace::<F>(TRACE_ROWS);
+    let proof = Prove::<Blake3StarkHash>::prove(
+        &air,
+        &mut trace,
+        &pub_inputs,
+        &mut Blake3Transcript::<F>::new(&[]),
+    )
+    .expect("proving under the full BLAKE3 configuration must succeed");
+
+    assert!(
+        proof.nonce.is_some(),
+        "grinding is on, so the proof must carry a nonce"
+    );
+    assert!(!proof.fri_layers_merkle_roots.is_empty());
+
+    assert!(
+        Verify::<Blake3StarkHash>::verify(&proof, &air, &mut Blake3Transcript::<F>::new(&[])),
+        "an honest all-BLAKE3 proof must verify"
+    );
+
+    // FALSIFICATION: the transcript is part of the configuration. A keccak
+    // transcript replaying a BLAKE3-transcripted proof derives different
+    // challenges and must reject.
+    assert!(
+        !Verify::<Blake3StarkHash>::verify(&proof, &air, &mut DefaultTranscript::<F>::new(&[])),
+        "verifying with the wrong transcript hash must reject"
+    );
+}

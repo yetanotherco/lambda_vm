@@ -868,7 +868,11 @@ mod tests {
         let grinding_seed_a = transcript_a.state();
         // Test-only: derive a real PoW nonce so the grinding step is exercised
         // identically by both sides (the nonce search itself is not under test).
-        let nonce = crate::grinding::generate_nonce(&grinding_seed_a, grinding_factor)
+        let nonce =
+            crate::grinding::generate_nonce::<crate::config::GrindingDigest<KeccakStarkHash>>(
+                &grinding_seed_a,
+                grinding_factor,
+            )
             .expect("a valid grinding nonce exists for this small grinding_factor");
         transcript_a.append_bytes(&nonce.to_be_bytes());
 

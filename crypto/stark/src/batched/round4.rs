@@ -153,9 +153,17 @@ where
     );
     let layer_roots: Vec<Commitment> = layers.iter().map(|layer| layer.merkle_tree.root).collect();
 
+    // Grinding runs on the CONFIGURATION's transcript hash, not a hard-wired
+    // one — the same rule the unbatched `prover.rs` follows. `H` names both the
+    // commitment family and the Fiat-Shamir hash, so a batched proof committed
+    // with BLAKE3 grinds with BLAKE3 and one committed with keccak grinds with
+    // keccak, without either side being told twice.
     let nonce = (grinding_factor > 0).then(|| {
-        let value = grinding::generate_nonce(&transcript.state(), grinding_factor)
-            .expect("nonce not found");
+        let value = grinding::generate_nonce::<crate::config::GrindingDigest<H>>(
+            &transcript.state(),
+            grinding_factor,
+        )
+        .expect("nonce not found");
         transcript.append_bytes(&value.to_be_bytes());
         value
     });
@@ -680,7 +688,7 @@ pub(crate) mod tests {
             "one β per committed layer plus the final fold"
         );
         assert!(
-            crate::grinding::is_valid_nonce(
+            crate::grinding::is_valid_nonce::<crate::config::GrindingDigest<KeccakStarkHash>>(
                 &replay.grinding_seed,
                 commit.nonce.expect("grinding was requested"),
                 4
