@@ -1350,3 +1350,127 @@ mod executor_primitive_parity {
         );
     }
 }
+
+/// ★ The state the guest hands the accelerator is the layout the executor
+/// reads back.
+///
+/// `Blake3Chain`'s riscv64 arm marshals a compression into
+/// `crypto::hash::blake3::chain::pack_syscall_state`'s 22 dwords and reads the
+/// result out of `unpack_syscall_out`. That marshaling is the last unchecked
+/// link between the host prover's hash and the guest's: `executor_primitive_parity`
+/// above gates the *compression*, and `crypto` gates the chain framing, but a
+/// transposed dword or a swapped counter half would leave both of those green
+/// and still make the guest hash differently — R5's invisible failure, visible
+/// only as in-guest proof rejection.
+///
+/// It needs no guest to check. The executor's syscall handler is ordinary host
+/// code driven by a real `EcallEbreak`, so this lays the packed dwords into a VM
+/// `Memory` exactly as the guest's `&mut [u64; 22]` presents them, runs the
+/// instruction, and unpacks the result — closing the loop through the same two
+/// functions the guest calls.
+#[cfg(test)]
+mod executor_syscall_packing {
+    use crypto::hash::blake3::chain::{SYSCALL_OUT_DWORD, pack_syscall_state, unpack_syscall_out};
+    use crypto::hash::blake3::{BLAKE3_SIX_ROUNDS, blake3_compress_rounds};
+    use executor::vm::instruction::decoding::Instruction;
+    use executor::vm::instruction::execution::BLAKE3_SYSCALL_NUMBER;
+    use executor::vm::memory::Memory;
+    use executor::vm::registers::Registers;
+
+    /// Pre-filled into the output dwords, so a packing that pointed the
+    /// accelerator at the wrong part of the region cannot pass on stale data.
+    const SENTINEL: u64 = 0xDEAD_BEEF_DEAD_BEEF;
+
+    /// One compression the way a guest performs it: pack, ecall, unpack.
+    fn through_the_accelerator(
+        h: &[u32; 8],
+        m: &[u32; 16],
+        t: u64,
+        block_len: u32,
+        flags: u32,
+    ) -> [u32; 16] {
+        let addr = 0x1000u64;
+        let mut memory = Memory::default();
+        let mut registers = Registers::default();
+
+        let mut state = pack_syscall_state(h, m, t, block_len, flags);
+        for dword in &mut state[SYSCALL_OUT_DWORD..] {
+            *dword = SENTINEL;
+        }
+        for (k, dword) in state.iter().enumerate() {
+            memory
+                .store_doubleword(addr + (k as u64) * 8, *dword)
+                .unwrap();
+        }
+
+        let mut pc = 0;
+        registers.write(17, BLAKE3_SYSCALL_NUMBER).unwrap();
+        registers.write(10, addr).unwrap();
+        Instruction::EcallEbreak
+            .run(&mut pc, &mut registers, &mut memory)
+            .unwrap();
+
+        for (k, dword) in state.iter_mut().enumerate() {
+            *dword = memory.load_doubleword(addr + (k as u64) * 8).unwrap();
+        }
+        for (k, dword) in state.iter().enumerate().skip(SYSCALL_OUT_DWORD) {
+            assert_ne!(*dword, SENTINEL, "output dword {k} was never written");
+        }
+        unpack_syscall_out(&state)
+    }
+
+    #[test]
+    fn the_packed_state_is_what_the_executor_reads() {
+        // A cheap deterministic stream; no rand dependency in this crate.
+        let mut z = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            z ^= z << 13;
+            z ^= z >> 7;
+            z ^= z << 17;
+            z as u32
+        };
+
+        // The flag shapes `Blake3Chain` emits — first block, interior, and last
+        // with a partial `block_len` — plus two counters setting exactly one
+        // half. The chain always sends `t = 0`, so only these pin the split
+        // order the packing chose.
+        let shapes: [(u64, u32, u32); 5] = [
+            (0, 64, 1),                        // CHUNK_START
+            (0, 64, 0),                        // interior
+            (0, 7, 2 | 8),                     // CHUNK_END | ROOT, partial block
+            (0x0000_0000_FFFF_FFFF, 64, 0),    // low counter half only
+            (0xFFFF_FFFF_0000_0000, 0, !0u32), // high half; degenerate len/flags
+        ];
+
+        for (t, block_len, flags) in shapes {
+            for _ in 0..16 {
+                let h: [u32; 8] = core::array::from_fn(|_| next());
+                let m: [u32; 16] = core::array::from_fn(|_| next());
+                assert_eq!(
+                    through_the_accelerator(&h, &m, t, block_len, flags),
+                    blake3_compress_rounds(&h, &m, t, block_len, flags, BLAKE3_SIX_ROUNDS),
+                    "packed state mismatch at t={t}, block_len={block_len}, flags={flags}"
+                );
+            }
+        }
+    }
+
+    /// CONTROL: the check above discriminates the *layout*, not merely the
+    /// compression. The counter's two halves share one dword and are the
+    /// likeliest thing to transpose — and the chain, which only ever sends
+    /// `t = 0`, would never notice. They must be distinguishable, or agreement
+    /// above would survive the swap.
+    #[test]
+    fn the_packing_check_is_layout_sensitive() {
+        let h: [u32; 8] = core::array::from_fn(|i| (i as u32).wrapping_mul(2_654_435_761));
+        let m: [u32; 16] =
+            core::array::from_fn(|i| (i as u32).wrapping_mul(40_503).wrapping_add(7));
+        let t = 0x0000_0001_0000_0000u64;
+
+        assert_ne!(
+            through_the_accelerator(&h, &m, t, 64, 1),
+            blake3_compress_rounds(&h, &m, t.rotate_left(32), 64, 1, BLAKE3_SIX_ROUNDS),
+            "the counter halves must be distinguishable"
+        );
+    }
+}

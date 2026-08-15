@@ -49,6 +49,17 @@ use super::{BLAKE3_IV, BLAKE3_ROUNDS, blake3_compress_rounds};
 /// Bytes in one BLAKE3 message block.
 pub const BLOCK_LEN: usize = 64;
 
+/// Dwords in the accelerator's state region: `h[8] | m[16] | t |
+/// (block_len, flags) | out[16]`, two little-endian `u32` words per dword.
+/// Mirrors `BLAKE3_STATE_BYTES / 8` in
+/// `executor::vm::instruction::execution`.
+pub const SYSCALL_STATE_DWORDS: usize = 22;
+
+/// First dword of the output region — the accelerator reads dwords `0..14` and
+/// writes `out[0..16]` into `14..22`. Mirrors the executor's
+/// `BLAKE3_OUT_DWORDS`.
+pub const SYSCALL_OUT_DWORD: usize = 14;
+
 /// This block begins the chunk. Set on the first block only.
 const CHUNK_START: u32 = 1;
 /// This block ends the chunk. Set on the last block only.
@@ -82,6 +93,119 @@ pub fn blake3_chain_rounds(data: &[u8], rounds: usize) -> [u8; 32] {
     chain.update(data);
     chain.finalize_digest()
 }
+
+/// Lay a compression's inputs out as the accelerator's 22-dword state region.
+///
+/// The guest side of the syscall ABI, and the *only* place this crate encodes
+/// it. The output dwords are left zero; the accelerator fills `14..22`.
+///
+/// Compiled on every target although only the riscv64 arm of [`compress_block`]
+/// calls it, so the packing can be checked on the host against the executor's
+/// handler — which is ordinary host code — rather than only inside a guest. The
+/// executor's unpacking is the mirror of this, and
+/// `prover::tables::blake3::executor_syscall_packing` drives the two against
+/// each other through a real `EcallEbreak`.
+pub fn pack_syscall_state(
+    h: &[u32; 8],
+    m: &[u32; 16],
+    t: u64,
+    block_len: u32,
+    flags: u32,
+) -> [u64; SYSCALL_STATE_DWORDS] {
+    let mut words = [0u32; 2 * SYSCALL_OUT_DWORD];
+    words[0..8].copy_from_slice(h);
+    words[8..24].copy_from_slice(m);
+    words[24] = t as u32;
+    words[25] = (t >> 32) as u32;
+    words[26] = block_len;
+    words[27] = flags;
+
+    let mut state = [0u64; SYSCALL_STATE_DWORDS];
+    for (k, dword) in state[..SYSCALL_OUT_DWORD].iter_mut().enumerate() {
+        *dword = (words[2 * k] as u64) | ((words[2 * k + 1] as u64) << 32);
+    }
+    state
+}
+
+/// Read the 16 output words the accelerator wrote into [`pack_syscall_state`]'s
+/// region. The inverse of the low half of that layout, over dwords `14..22`.
+pub fn unpack_syscall_out(state: &[u64; SYSCALL_STATE_DWORDS]) -> [u32; 16] {
+    core::array::from_fn(|i| {
+        let dword = state[SYSCALL_OUT_DWORD + i / 2];
+        if i.is_multiple_of(2) {
+            dword as u32
+        } else {
+            (dword >> 32) as u32
+        }
+    })
+}
+
+/// ★ The chain's single entry into the compression function.
+///
+/// Both the interior step and the finalization go through here, so there is one
+/// place where a guest reaches the accelerator and one framing above it. Adding
+/// a second call to [`blake3_compress_rounds`] in this file would put a
+/// compression outside the accelerator's reach on the guest and split the two
+/// paths silently — the trap PA-PLAN §1.4 names.
+///
+/// `t` is not a parameter: the construction is a single chunk that never ends,
+/// so the counter is 0 at every block (§1.7). The syscall ABI still carries a
+/// full 64-bit counter, and this is where it is pinned to zero.
+#[cfg(all(target_arch = "riscv64", feature = "blake3-6round"))]
+fn compress_block(
+    cv: &[u32; 8],
+    block: &[u32; 16],
+    block_len: u32,
+    flags: u32,
+    rounds: usize,
+) -> [u32; 16] {
+    // `with_rounds` can hand this any count — it exists so the 7-round anchor
+    // is reachable from one build — while the accelerator implements six and
+    // nothing else. Anything but the crate-global count takes the software
+    // path, so the anchor constructor cannot be answered at the wrong round
+    // count by a machine that has the precompile.
+    if rounds != BLAKE3_ROUNDS {
+        return blake3_compress_rounds(cv, block, 0, block_len, flags, rounds);
+    }
+    let mut state = pack_syscall_state(cv, block, 0, block_len, flags);
+    lambda_vm_syscalls::syscalls::blake3_compress_6round(&mut state);
+    unpack_syscall_out(&state)
+}
+
+/// The chain's single entry into the compression function, in software.
+///
+/// See the riscv64 arm above for what this is one of two of. Every host build
+/// takes this path, and so does a guest built without `blake3-6round`: the
+/// accelerator is 6-round only, so at 7 rounds there is nothing to dispatch to.
+#[cfg(not(all(target_arch = "riscv64", feature = "blake3-6round")))]
+fn compress_block(
+    cv: &[u32; 8],
+    block: &[u32; 16],
+    block_len: u32,
+    flags: u32,
+    rounds: usize,
+) -> [u32; 16] {
+    blake3_compress_rounds(cv, block, 0, block_len, flags, rounds)
+}
+
+/// The accelerator is **six rounds, hard-coded**: `BLAKE3_ROUNDS` in
+/// `executor::vm::instruction::execution` is a plain `6` with no feature behind
+/// it, and the chip's columns are laid out for that width. So the syscall arm
+/// above computes the host prover's hash only while this crate is at six rounds
+/// too, and the coupling is compile-time rather than a comment: inverting
+/// `blake3-6round`'s polarity must fail the build, not surface later as a root
+/// the verifier rejects.
+///
+/// Gated on the feature alone, not on the target, although only the riscv64 arm
+/// dispatches to the accelerator: a `target_arch` gate would put it out of reach
+/// of every host build, including `make lint`'s `blake3-6round` pass, which is
+/// the one place CI compiles this feature at all.
+#[cfg(feature = "blake3-6round")]
+const _: () = assert!(
+    BLAKE3_ROUNDS == super::BLAKE3_SIX_ROUNDS,
+    "the BLAKE3 accelerator implements 6 rounds only, but `blake3-6round` did \
+     not select 6 — the guest would hash differently from the host prover"
+);
 
 /// The single-chunk BLAKE3 chain as an incremental hasher.
 ///
@@ -166,10 +290,9 @@ impl Blake3Chain {
     /// Fold the pending block — known not to be the last — into the chaining
     /// value, and clear the block so the next one is zero-padded.
     fn compress_pending(&mut self) {
-        let out = blake3_compress_rounds(
+        let out = compress_block(
             &self.cv,
             &self.block_words(),
-            0,
             BLOCK_LEN as u32,
             self.flags(false),
             self.rounds,
@@ -202,10 +325,9 @@ impl Blake3Chain {
     /// `block_len = 0`, which is one compression, not zero — and is what
     /// `blake3::hash(b"")` is at 7 rounds.
     pub fn finalize_digest(&self) -> [u8; 32] {
-        let out = blake3_compress_rounds(
+        let out = compress_block(
             &self.cv,
             &self.block_words(),
-            0,
             self.block_len as u32,
             self.flags(true),
             self.rounds,
