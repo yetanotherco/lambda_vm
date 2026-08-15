@@ -227,7 +227,7 @@ fn fri_layer_trees_are_built_with_the_configurations_pair_backend() {
             let leaves: Vec<[FE; 2]> = layer
                 .evaluation
                 .chunks_exact(2)
-                .map(|c| [c[0].clone(), c[1].clone()])
+                .map(|c| [c[0], c[1]])
                 .collect();
             let rebuilt = MerkleTree::<H::Pair<F>>::build(&leaves).expect("rebuild layer tree");
             assert_eq!(
