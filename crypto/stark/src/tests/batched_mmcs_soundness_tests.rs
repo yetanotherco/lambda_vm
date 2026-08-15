@@ -7,10 +7,12 @@
 //! re-asserted in every test, so a false-reject regression cannot make the
 //! negatives pass vacuously.
 //!
-//! Scope: these reach only what the primitives decide. The forgeries that a
-//! batched *proof* must also resist — a tampered per-query FRI layer evaluation,
-//! an OOD value, the bus balance, the query count, the grinding nonce — need the
-//! prover/verifier integration and belong with it.
+//! Scope grows with the integration. The first section reaches only what the
+//! primitives decide; the per-query batched-FRI section below arrived with the
+//! round-4 wiring ([`crate::batched::round4`]), which is what made a tampered
+//! layer evaluation, a mis-sized decommitment and a wrong injection expressible.
+//! The forgeries that still need the full prover/verifier integration — an OOD
+//! value, the bus balance, the query count, the grinding nonce — belong with it.
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use crypto::fiat_shamir::is_transcript::IsTranscript;
@@ -18,10 +20,13 @@ use math::fft::bit_reversing::reverse_index;
 use math::field::element::FieldElement;
 use math::field::goldilocks::GoldilocksField;
 
+use crate::batched::round4::BatchedFriCommit;
+use crate::batched::round4::tests as round4_tests;
 use crate::config::KeccakStarkHash;
 use crate::fri::batched::{
     BatchedFriLayout, absorb_shape_histogram, derive_batched_fri_challenges,
 };
+use crate::fri::fri_decommit::FriDecommitment;
 use crate::fri::mmcs::{LeafSource, MixedMmcs, MixedOpening};
 
 type F = GoldilocksField;
@@ -336,4 +341,388 @@ fn the_shape_encoding_separates_distinct_epochs() {
 
     // Swapping height and width within a table is a different epoch.
     assert_ne!(absorbed(&[3, 4], &[4, 3]), absorbed(&[4, 3], &[3, 4]));
+}
+
+// ---------------------------------------------------------------------------
+// Per-query batched FRI (M-3). These need the round-4 wiring, not only the
+// primitives, so they were deferred when the primitives landed.
+// ---------------------------------------------------------------------------
+
+/// One honest batched round 4 plus everything a verifier needs to check a query.
+struct Round4Fixture {
+    tables: Vec<round4_tests::FakeTable>,
+    commit: BatchedFriCommit<F, KeccakStarkHash>,
+    betas: Vec<FE>,
+    decommitments: Vec<FriDecommitment<F>>,
+    alpha: FE,
+    h_max: usize,
+}
+
+impl Round4Fixture {
+    fn build() -> Self {
+        let tables = round4_tests::fixture();
+        let h_max = tables.iter().map(|t| t.height).max().expect("non-empty");
+        let mut transcript = round4_tests::Transcript::new(b"batched_soundness_r4");
+        let commit = round4_tests::commit_fixture(&tables, &mut transcript, 0, 6);
+        let decommitments =
+            crate::fri::query_phase::<F, KeccakStarkHash>(&commit.layers, &commit.iotas);
+
+        let mut verifier_transcript = round4_tests::Transcript::new(b"batched_soundness_r4");
+        let replay = crate::batched::round4::replay_batched_fri::<F, round4_tests::Transcript>(
+            &mut verifier_transcript,
+            &round4_tests::heights_of(&tables),
+            &round4_tests::widths_of(&tables),
+            &commit.layer_roots,
+            &commit.final_poly_coeffs,
+            round4_tests::BLOWUP_LOG,
+            round4_tests::FINAL_POLY_LOG_DEGREE,
+            0,
+            None,
+            6,
+        )
+        .expect("an honest shape must derive");
+
+        Self {
+            tables,
+            betas: replay.betas,
+            alpha: replay.alpha,
+            decommitments,
+            commit,
+            h_max,
+        }
+    }
+
+    /// Verify query `q` with every input honest except what `mutate` changes.
+    fn check_query_with<M>(&self, q: usize, mutate: M) -> bool
+    where
+        M: FnOnce(&mut FriDecommitment<F>, &mut (FE, FE), &mut Vec<Option<FE>>, &mut Vec<FE>),
+    {
+        let iota = self.commit.iotas[q];
+        let (mut p0, mut buckets) = round4_tests::query_inputs(&self.tables, &self.alpha, iota);
+        let mut decommitment = self.decommitments[q].clone();
+        let mut coeffs = self.commit.final_poly_coeffs.clone();
+        mutate(&mut decommitment, &mut p0, &mut buckets, &mut coeffs);
+        round4_tests::verify_one_query(
+            &self.commit,
+            &self.betas,
+            self.h_max,
+            iota,
+            &decommitment,
+            (&p0.0, &p0.1),
+            &buckets,
+            &self.commit.layer_roots,
+            &coeffs,
+        )
+    }
+
+    fn check_query(&self, q: usize) -> bool {
+        self.check_query_with(q, |_, _, _, _| {})
+    }
+}
+
+/// The honest-path control for every negative below. Also pins that the fixture
+/// is not degenerate: it must actually commit layers, or the fold loop the
+/// negatives target would never run.
+#[test]
+fn honest_batched_fri_queries_verify() {
+    let f = Round4Fixture::build();
+    assert!(
+        f.commit.layout.num_committed >= 1,
+        "the fixture must commit at least one FRI layer"
+    );
+    assert!(
+        f.commit.layout.total_folds as usize > f.commit.layout.num_committed,
+        "the fixture must exercise the final fold"
+    );
+    for q in 0..f.commit.iotas.len() {
+        assert!(f.check_query(q), "honest query {q} must verify");
+    }
+}
+
+/// A per-query FRI layer evaluation is prover-supplied and NOT in the
+/// transcript; only the layer's Merkle root binds it.
+#[test]
+fn a_tampered_fri_layer_evaluation_is_rejected() {
+    let f = Round4Fixture::build();
+    for q in 0..f.commit.iotas.len() {
+        assert!(f.check_query(q), "honest control for query {q}");
+        for layer in 0..f.commit.layout.num_committed {
+            assert!(
+                !f.check_query_with(q, |d, _, _, _| {
+                    d.layers_evaluations_sym[layer] =
+                        &d.layers_evaluations_sym[layer] + &FE::from(1u64);
+                }),
+                "query {q}: a tampered evaluation at layer {layer} must be rejected"
+            );
+        }
+    }
+}
+
+/// The authentication path is what carries the layer opening to the root.
+#[test]
+fn a_tampered_fri_layer_auth_path_is_rejected() {
+    let f = Round4Fixture::build();
+    for layer in 0..f.commit.layout.num_committed {
+        assert!(f.check_query(0), "honest control");
+        assert!(
+            !f.check_query_with(0, |d, _, _, _| {
+                d.layers_auth_paths[layer].merkle_path[0][0] ^= 1;
+            }),
+            "a tampered sibling at layer {layer} must be rejected"
+        );
+    }
+}
+
+/// The decommitment vectors are not bound by Fiat-Shamir, so their lengths have
+/// to be pinned before anything iterates them: a short one would end the fold
+/// early and accept without reaching the terminal, a long one would run past it.
+#[test]
+fn a_mis_sized_fri_decommitment_is_rejected() {
+    let f = Round4Fixture::build();
+    assert!(f.check_query(0), "honest control");
+
+    assert!(
+        !f.check_query_with(0, |d, _, _, _| {
+            d.layers_auth_paths.pop();
+            d.layers_evaluations_sym.pop();
+        }),
+        "a truncated decommitment must be rejected"
+    );
+    assert!(
+        !f.check_query_with(0, |d, _, _, _| {
+            let path = d.layers_auth_paths[0].clone();
+            let evaluation = d.layers_evaluations_sym[0].clone();
+            d.layers_auth_paths.push(path);
+            d.layers_evaluations_sym.push(evaluation);
+        }),
+        "a padded decommitment must be rejected"
+    );
+    assert!(
+        !f.check_query_with(0, |d, _, _, _| {
+            d.layers_auth_paths.clear();
+            d.layers_evaluations_sym.clear();
+        }),
+        "an empty decommitment must be rejected, not accepted vacuously"
+    );
+}
+
+/// The terminal polynomial is where FRI's low-degree claim is finally cashed in.
+#[test]
+fn a_tampered_terminal_coefficient_is_rejected() {
+    let f = Round4Fixture::build();
+    assert!(f.check_query(0), "honest control");
+    for i in 0..f.commit.final_poly_coeffs.len() {
+        assert!(
+            !f.check_query_with(0, |_, _, _, coeffs| {
+                coeffs[i] = &coeffs[i] + &FE::from(1u64);
+            }),
+            "a tampered terminal coefficient {i} must be rejected"
+        );
+    }
+}
+
+/// The tallest tables enter FRI as layer 0, which is never committed — the only
+/// thing binding them is that the fold has to land on the terminal.
+#[test]
+fn a_tampered_layer_zero_value_is_rejected() {
+    let f = Round4Fixture::build();
+    assert!(f.check_query(0), "honest control");
+    assert!(
+        !f.check_query_with(0, |_, p0, _, _| { p0.0 = &p0.0 + &FE::from(1u64) }),
+        "a tampered p0 must be rejected"
+    );
+    assert!(
+        !f.check_query_with(0, |_, p0, _, _| { p0.1 = &p0.1 + &FE::from(1u64) }),
+        "a tampered p0 symmetric value must be rejected"
+    );
+    assert!(
+        !f.check_query_with(0, |_, p0, _, _| { core::mem::swap(&mut p0.0, &mut p0.1) }),
+        "swapping the layer-0 pair must be rejected — the two are not interchangeable"
+    );
+}
+
+/// The injected buckets are the whole point of a mixed-height batch: a short
+/// table is bound ONLY by the value it contributes at its injection layer. Three
+/// ways to get that wrong, all of which leave the tall tables untouched and so
+/// would pass a control that only tampered the base group.
+#[test]
+fn a_wrong_injection_is_rejected() {
+    let f = Round4Fixture::build();
+    let injected_heights: Vec<usize> = f
+        .tables
+        .iter()
+        .map(|t| t.height)
+        .filter(|h| *h < f.h_max)
+        .collect();
+    assert!(
+        !injected_heights.is_empty(),
+        "the fixture must have at least one injected height"
+    );
+
+    for q in 0..f.commit.iotas.len() {
+        assert!(f.check_query(q), "honest control for query {q}");
+        for &h in &injected_heights {
+            assert!(
+                !f.check_query_with(q, |_, _, buckets, _| {
+                    let value = buckets[h].take().expect("the height is occupied");
+                    buckets[h] = Some(&value + &FE::from(1u64));
+                }),
+                "query {q}: a tampered injection at height {h} must be rejected"
+            );
+            assert!(
+                !f.check_query_with(q, |_, _, buckets, _| { buckets[h] = None }),
+                "query {q}: dropping the injection at height {h} must be rejected"
+            );
+        }
+    }
+}
+
+/// The injection position is derived, not sent, and prover and verifier derive it
+/// separately — so a control that only tampers the VALUE would pass under a wrong
+/// derivation. Reading the other row of the same opened pair is the mistake a
+/// off-by-one in `injection_position` would make, so it is the one to pin.
+#[test]
+fn an_injection_read_at_the_sibling_row_is_rejected() {
+    let f = Round4Fixture::build();
+    let mut exercised = 0usize;
+    for (q, &iota) in f.commit.iotas.iter().enumerate() {
+        assert!(f.check_query(q), "honest control for query {q}");
+        for table in f.tables.iter().filter(|t| t.height < f.h_max) {
+            let h = table.height;
+            let position = crate::batched::round4::injection_position(iota, f.h_max, h);
+            let sibling = position ^ 1;
+            let inputs: Vec<(Vec<FE>, usize)> = f
+                .tables
+                .iter()
+                .map(|t| (t.codeword.clone(), t.height))
+                .collect();
+            let combined = crate::fri::batched::combine_by_height(&inputs, &f.alpha);
+            let bucket = combined[h].as_ref().expect("the height is occupied");
+            // A degenerate codeword whose two rows coincide would make this
+            // vacuous; skip rather than assert a rejection that means nothing.
+            if bucket[position] == bucket[sibling] {
+                continue;
+            }
+            exercised += 1;
+            let sibling_value = bucket[sibling].clone();
+            assert!(
+                !f.check_query_with(q, |_, _, buckets, _| {
+                    buckets[h] = Some(sibling_value);
+                }),
+                "query {q}: reading height {h}'s injection at the sibling row must be rejected"
+            );
+        }
+    }
+    assert!(
+        exercised > 0,
+        "no non-degenerate sibling pair was exercised — the test proved nothing"
+    );
+}
+
+/// Everything on the verifier's path is prover-supplied, so it must fail closed
+/// on shapes that cannot occur honestly rather than panic on them.
+#[test]
+fn malformed_batched_fri_inputs_are_rejected_without_panicking() {
+    let f = Round4Fixture::build();
+    let iota = f.commit.iotas[0];
+    let (p0, buckets) = round4_tests::query_inputs(&f.tables, &f.alpha, iota);
+    let terminal_offset =
+        FE::from(round4_tests::COSET_OFFSET).pow(1u64 << f.commit.layout.total_folds);
+    let terminal = crate::fri::terminal::terminal_codeword_from_coeffs::<F, F>(
+        &f.commit.final_poly_coeffs,
+        &terminal_offset,
+        f.commit.layout.terminal_len,
+    );
+    let point_inv = round4_tests::evaluation_point_inv(iota, f.h_max);
+
+    let run = |layer_roots: &[[u8; 32]],
+               betas: &[FE],
+               h_max: usize,
+               iota: usize,
+               buckets: &[Option<FE>],
+               terminal: &[FE]| {
+        crate::batched::round4::verify_batched_fri_query::<F, F, KeccakStarkHash>(
+            layer_roots,
+            betas,
+            &f.commit.layout,
+            h_max,
+            iota,
+            &f.decommitments[0],
+            &point_inv,
+            (&p0.0, &p0.1),
+            buckets,
+            terminal,
+        )
+    };
+
+    assert!(
+        run(
+            &f.commit.layer_roots,
+            &f.betas,
+            f.h_max,
+            iota,
+            &buckets,
+            &terminal
+        ),
+        "honest control"
+    );
+    assert!(
+        !run(&[], &f.betas, f.h_max, iota, &buckets, &terminal),
+        "a missing layer-root vector must be rejected"
+    );
+    assert!(
+        !run(
+            &f.commit.layer_roots,
+            &[],
+            f.h_max,
+            iota,
+            &buckets,
+            &terminal
+        ),
+        "a missing beta vector must be rejected"
+    );
+    assert!(
+        !run(
+            &f.commit.layer_roots,
+            &f.betas,
+            0,
+            iota,
+            &buckets,
+            &terminal
+        ),
+        "h_max = 0 must be rejected, not shifted by"
+    );
+    assert!(
+        !run(
+            &f.commit.layer_roots,
+            &f.betas,
+            f.h_max,
+            1usize << (f.h_max - 1),
+            &buckets,
+            &terminal
+        ),
+        "an iota from a taller domain must be rejected"
+    );
+    assert!(
+        !run(
+            &f.commit.layer_roots,
+            &f.betas,
+            f.h_max,
+            iota,
+            &buckets[..1],
+            &terminal
+        ),
+        "a bucket vector too short to cover every height must be rejected"
+    );
+    assert!(
+        !run(
+            &f.commit.layer_roots,
+            &f.betas,
+            f.h_max,
+            iota,
+            &buckets,
+            &[]
+        ),
+        "an empty terminal codeword must be rejected"
+    );
 }
