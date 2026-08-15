@@ -28,10 +28,10 @@ use crate::residency_mode::ResidencyMode;
 use crate::trace::TraceTable;
 use crate::traits::AIR;
 
-type F = GoldilocksField;
-type E = Degree3GoldilocksExtensionField;
+pub(crate) type F = GoldilocksField;
+pub(crate) type E = Degree3GoldilocksExtensionField;
 type FE = FieldElement<F>;
-type Air = crate::lookup::AirWithBuses<
+pub(crate) type Air = crate::lookup::AirWithBuses<
     F,
     E,
     crate::lookup::NullBoundaryConstraintBuilder,
@@ -44,7 +44,7 @@ type Air = crate::lookup::AirWithBuses<
 /// the batched FRI degenerates to one terminal polynomial — a real case, and
 /// covered by `batched_prove_openings_authenticate` under the default options,
 /// but not the one that exercises the injection recursion.
-fn folding_options() -> ProofOptions {
+pub(crate) fn folding_options() -> ProofOptions {
     ProofOptions {
         blowup_factor: 2,
         fri_number_of_queries: 4,
@@ -120,10 +120,31 @@ fn traces() -> (TraceTable<F, E>, TraceTable<F, E>, TraceTable<F, E>) {
 /// Prove `repeats` copies of the fixture as one epoch. `repeats == 1` is the
 /// three-table epoch; higher values are how the residency claim is put on a
 /// curve instead of a threshold.
-fn prove_repeated(
+pub(crate) fn prove_repeated(
     repeats: usize,
     options: &ProofOptions,
     residency: ResidencyMode,
+) -> (
+    Vec<Air>,
+    BatchedMultiProof<F, E, ()>,
+    BatchedProveStats,
+    Vec<usize>,
+) {
+    prove_repeated_with(
+        repeats,
+        options,
+        residency,
+        &mut DefaultTranscript::<E>::new(&[]),
+    )
+}
+
+/// As [`prove_repeated`], but against a caller-owned transcript — so a test can
+/// read the state the PROVER ended in and compare it with the verifier's.
+pub(crate) fn prove_repeated_with(
+    repeats: usize,
+    options: &ProofOptions,
+    residency: ResidencyMode,
+    transcript: &mut DefaultTranscript<E>,
 ) -> (
     Vec<Air>,
     BatchedMultiProof<F, E, ()>,
@@ -158,7 +179,7 @@ fn prove_repeated(
     let trace_lengths: Vec<usize> = (0..repeats).flat_map(|_| [8usize, 4, 4]).collect();
     let (proof, stats) = multi_prove_batched::<F, E, (), KeccakStarkHash, GenericProver<F, E, (), KeccakStarkHash>>(
         pairs,
-        &mut DefaultTranscript::<E>::new(&[]),
+        transcript,
         None,
         #[cfg(feature = "disk-spill")]
         crate::storage_mode::StorageMode::Ram,
@@ -169,7 +190,7 @@ fn prove_repeated(
     (airs, proof, stats, trace_lengths)
 }
 
-fn shape_of(airs: &[Air], trace_lengths: &[usize]) -> EpochShape {
+pub(crate) fn shape_of(airs: &[Air], trace_lengths: &[usize]) -> EpochShape {
     let refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = airs
         .iter()
         .map(|a| a as &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>)
@@ -242,11 +263,15 @@ fn batched_prove_openings_authenticate() {
 /// The query indices, recovered from the proof rather than read off the
 /// prover's own state.
 ///
-/// Replaying the whole epoch transcript is the verifier's job (M-5). Until that
-/// exists, recover each index the only other way that trusts nothing: an
-/// opening authenticates at exactly one leaf, so scan the (tiny) index space
-/// for the one that verifies. A prover that answered at the wrong index would
-/// have no candidate at all, which is the property the callers are testing.
+/// Deliberately NOT via `replay_epoch_transcript`, even though that exists: an
+/// opening authenticates at exactly one leaf, so scanning the (tiny) index
+/// space for the one that verifies is a derivation INDEPENDENT of the
+/// transcript. These tests are then not circular — they do not check the
+/// openings against indices produced by the same code path that has to be
+/// right for the openings to mean anything. The epoch-level tests in
+/// `batched_mmcs_soundness_tests::epoch` use the replay, so both derivations
+/// are exercised and are pinned to each other by the honest path passing under
+/// each.
 fn recover_iotas(
     proof: &BatchedMultiProof<F, E, ()>,
     shape: &EpochShape,

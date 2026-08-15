@@ -845,3 +845,305 @@ fn a_standalone_table_contributes_no_injection() {
         }
     }
 }
+
+// ===========================================================================
+// EPOCH-LEVEL NEGATIVES — the items M-2 deferred "with the integration"
+// ===========================================================================
+//
+// Everything above decides what the PRIMITIVES can decide: a tampered row, a
+// mis-sized path, a replayed index, a swapped opening. These need a whole
+// epoch, so they arrive with `multi_prove_batched` and
+// `batched::verifier::replay_epoch_transcript`.
+//
+// ⚠ What is covered and what is not. Query count, the grinding nonce, the OOD
+// values and the bus-contribution BINDING are covered. Bus BALANCE — that the
+// per-table contributions sum to the expected value across the epoch — is NOT,
+// and cannot be until the batched verifier grows the constraint half; see
+// `batched/verifier.rs`'s header for why that is blocked and on what.
+//
+// Every negative below has an honest-path control beside it. Without one, a
+// rejection proves only that the checker rejects, not that it discriminates.
+mod epoch {
+    use super::*;
+    use crate::batched::verifier::{replay_epoch_transcript, verify_epoch_commitments};
+    use crate::config::KeccakStarkHash;
+    use crate::residency_mode::ResidencyMode;
+    use crate::tests::batched_prover_tests::{Air, E, F, folding_options, prove_repeated};
+    use crate::traits::AIR;
+    use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+    use math::field::element::FieldElement;
+
+    type Proof = crate::batched::proof::BatchedMultiProof<F, E, ()>;
+
+    fn air_refs(airs: &[Air]) -> Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> {
+        airs.iter()
+            .map(|a| a as &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>)
+            .collect()
+    }
+
+    /// Replay `proof` and run the commitment checks. `None` when the replay
+    /// itself rejects, so a test can tell "rejected structurally" from
+    /// "rejected on the openings".
+    fn replay_and_check(airs: &[Air], proof: &Proof) -> Option<bool> {
+        let refs = air_refs(airs);
+        let (shape, params, challenges) =
+            replay_epoch_transcript(&refs, proof, &mut DefaultTranscript::<E>::new(&[]))?;
+        Some(verify_epoch_commitments::<F, E, (), KeccakStarkHash>(
+            proof,
+            &shape,
+            &params,
+            &challenges,
+        ))
+    }
+
+    fn honest() -> (Vec<Air>, Proof) {
+        let (airs, proof, _, _) = prove_repeated(1, &folding_options(), ResidencyMode::Retain);
+        (airs, proof)
+    }
+
+    /// ★ The strongest oracle available for "the prover and the verifier are one
+    /// protocol": not that some challenge agrees, but that the two transcripts
+    /// END in the same state. A divergence anywhere in the sequence — a root
+    /// absorbed in the wrong order, a challenge sampled that the other side does
+    /// not sample, an OOD block walked differently — lands here, where comparing
+    /// individual challenges would only catch it if you happened to compare the
+    /// right one.
+    #[test_log::test]
+    fn replay_matches_the_provers_ending_state() {
+        let mut prover_transcript = DefaultTranscript::<E>::new(&[]);
+        let (airs, proof, _, _) = crate::tests::batched_prover_tests::prove_repeated_with(
+            1,
+            &folding_options(),
+            ResidencyMode::Retain,
+            &mut prover_transcript,
+        );
+
+        let mut verifier_transcript = DefaultTranscript::<E>::new(&[]);
+        let refs = air_refs(&airs);
+        replay_epoch_transcript(&refs, &proof, &mut verifier_transcript)
+            .expect("an honest epoch must replay");
+
+        assert_eq!(
+            prover_transcript.state(),
+            verifier_transcript.state(),
+            "prover and verifier must end the epoch in the same transcript state"
+        );
+    }
+
+    /// The honest-path control every negative below leans on.
+    #[test_log::test]
+    fn an_honest_epoch_passes_the_commitment_checks() {
+        let (airs, proof) = honest();
+        assert_eq!(
+            replay_and_check(&airs, &proof),
+            Some(true),
+            "an honest epoch must replay and authenticate"
+        );
+    }
+
+    /// Query count. Nothing the transcript has already checked implies it: a
+    /// prover that sent fewer openings would simply be checked less often.
+    #[test_log::test]
+    fn a_short_query_list_is_rejected() {
+        let (airs, mut proof) = honest();
+        assert!(proof.queries.len() > 1, "the fixture must have queries to drop");
+        proof.queries.pop();
+        assert_eq!(
+            replay_and_check(&airs, &proof),
+            Some(false),
+            "dropping a query must be rejected"
+        );
+    }
+
+    /// Grinding. The nonce is absorbed, so a forged one moves every later
+    /// challenge AND fails its own proof-of-work check; either rejection is
+    /// correct and the test asserts the outcome, not the route.
+    #[test_log::test]
+    fn a_forged_grinding_nonce_is_rejected() {
+        let (airs, mut proof) = honest();
+        let nonce = proof.nonce.expect("the fixture grinds");
+        proof.nonce = Some(nonce.wrapping_add(1));
+        assert_ne!(
+            replay_and_check(&airs, &proof),
+            Some(true),
+            "a nonce the prover did not grind must be rejected"
+        );
+    }
+
+    /// A missing nonce where the epoch's grinding factor demands one.
+    #[test_log::test]
+    fn an_absent_grinding_nonce_is_rejected() {
+        let (airs, mut proof) = honest();
+        proof.nonce = None;
+        assert_ne!(
+            replay_and_check(&airs, &proof),
+            Some(true),
+            "an epoch with a positive grinding factor must carry a nonce"
+        );
+    }
+
+    /// OOD values. They are absorbed before alpha, so tampering one must move
+    /// the query indices — which is what makes the openings, honestly produced
+    /// at the honest indices, stop authenticating.
+    #[test_log::test]
+    fn a_tampered_ood_value_is_rejected() {
+        let (airs, honest_proof) = honest();
+        let refs = air_refs(&airs);
+        let honest_iotas = replay_epoch_transcript(
+            &refs,
+            &honest_proof,
+            &mut DefaultTranscript::<E>::new(&[]),
+        )
+        .expect("honest replay")
+        .2
+        .fri
+        .iotas;
+
+        let mut proof = honest_proof.clone();
+        proof.tables[0].composition_poly_parts_ood_evaluation[0] += FieldElement::<E>::one();
+        let (_, _, tampered) =
+            replay_epoch_transcript(&refs, &proof, &mut DefaultTranscript::<E>::new(&[]))
+                .expect("the shape is still structurally consistent");
+        assert_ne!(
+            tampered.fri.iotas, honest_iotas,
+            "an OOD value the prover did not commit must move the query indices"
+        );
+        assert_eq!(
+            replay_and_check(&airs, &proof),
+            Some(false),
+            "and the openings must then fail to authenticate"
+        );
+    }
+
+    /// A trace OOD value, tampered in the other block, must behave the same —
+    /// the two blocks are absorbed separately and a control on only one would
+    /// miss a verifier that walked just that one.
+    #[test_log::test]
+    fn a_tampered_trace_ood_value_is_rejected() {
+        let (airs, mut proof) = honest();
+        let table = &mut proof.tables[0];
+        let value = table.trace_ood_evaluations.get(0, 0).clone();
+        table
+            .trace_ood_evaluations
+            .set(0, 0, value + FieldElement::<E>::one());
+        assert_eq!(
+            replay_and_check(&airs, &proof),
+            Some(false),
+            "a trace OOD value the prover did not commit must be rejected"
+        );
+    }
+
+    /// Bus-contribution BINDING (not balance): which tables carry one is a fact
+    /// about the AIR set, so dropping one must be a structural rejection rather
+    /// than a transcript that quietly absorbs one element fewer.
+    #[test_log::test]
+    fn a_dropped_bus_contribution_is_rejected() {
+        let (airs, mut proof) = honest();
+        assert!(
+            proof.tables[0].bus_public_inputs.is_some(),
+            "the fixture's tables all have a RAP"
+        );
+        proof.tables[0].bus_public_inputs = None;
+        assert_eq!(
+            replay_and_check(&airs, &proof),
+            None,
+            "a table whose AIR has a RAP must carry a bus contribution"
+        );
+    }
+
+    /// A tampered bus contribution is absorbed, so it moves the challenges.
+    #[test_log::test]
+    fn a_tampered_bus_contribution_is_rejected() {
+        let (airs, mut proof) = honest();
+        if let Some(bpi) = proof.tables[0].bus_public_inputs.as_mut() {
+            bpi.table_contribution += FieldElement::<E>::one();
+        }
+        assert_eq!(
+            replay_and_check(&airs, &proof),
+            Some(false),
+            "a bus contribution the prover did not commit must be rejected"
+        );
+    }
+
+    /// A whole round's root, dropped. The AIR set says the aux round exists, so
+    /// its absence is a structural rejection — without this a prover could
+    /// remove a round's binding entirely.
+    #[test_log::test]
+    fn a_dropped_round_root_is_rejected() {
+        let (airs, mut proof) = honest();
+        proof.aux_root = None;
+        assert_eq!(
+            replay_and_check(&airs, &proof),
+            None,
+            "the aux round exists in this epoch, so its root cannot be absent"
+        );
+    }
+
+    /// A root the epoch does not have. The preprocessed round is empty for this
+    /// fixture, so inventing a root must reject rather than be absorbed.
+    #[test_log::test]
+    fn an_invented_round_root_is_rejected() {
+        let (airs, mut proof) = honest();
+        assert!(proof.prep_root.is_none(), "the fixture has no preprocessed table");
+        proof.prep_root = Some(proof.main_root);
+        assert_eq!(
+            replay_and_check(&airs, &proof),
+            None,
+            "an epoch with no preprocessed table must not carry a preprocessed root"
+        );
+    }
+
+    /// The instance-class partition is derived from the shape and never sent, so
+    /// a terminal polynomial present for a batched table — or of the wrong
+    /// length for a standalone one — must be rejected.
+    #[test_log::test]
+    fn a_misplaced_standalone_terminal_polynomial_is_rejected() {
+        let (airs, honest_proof) = honest();
+
+        let mut invented = honest_proof.clone();
+        let batched_table = invented
+            .tables
+            .iter()
+            .position(|t| t.standalone_final_poly_coeffs.is_none())
+            .expect("the tallest table is always batched");
+        invented.tables[batched_table].standalone_final_poly_coeffs =
+            Some(vec![FieldElement::<E>::one(); 2]);
+        assert_eq!(
+            replay_and_check(&airs, &invented),
+            Some(false),
+            "a batched table must not carry a terminal-only polynomial"
+        );
+
+        if let Some(standalone_table) = honest_proof
+            .tables
+            .iter()
+            .position(|t| t.standalone_final_poly_coeffs.is_some())
+        {
+            let mut truncated = honest_proof.clone();
+            let coeffs = truncated.tables[standalone_table]
+                .standalone_final_poly_coeffs
+                .as_mut()
+                .expect("just checked");
+            coeffs.pop();
+            assert_eq!(
+                replay_and_check(&airs, &truncated),
+                Some(false),
+                "a standalone terminal polynomial of the wrong degree bound must be rejected"
+            );
+        }
+    }
+
+    /// The width the openings are authenticated under is the verifier's, and a
+    /// table whose declared trace length disagrees with the epoch it was proved
+    /// for moves the whole shape — heights, histogram, every challenge.
+    #[test_log::test]
+    fn a_tampered_trace_length_is_rejected() {
+        let (airs, mut proof) = honest();
+        proof.tables[1].trace_length *= 2;
+        assert_ne!(
+            replay_and_check(&airs, &proof),
+            Some(true),
+            "a trace length the prover did not commit must be rejected"
+        );
+    }
+}

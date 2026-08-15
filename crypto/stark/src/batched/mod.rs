@@ -17,8 +17,11 @@
 //! - [`round4`] — the round-4 transcript sequence and the per-query FRI check.
 //! - [`proof`] — what a batched epoch proof carries.
 //! - [`prover`] — the phase architecture the barriers force.
+//! - [`verifier`] — the transcript replay, and ⛔ only the commitment half of a
+//!   verification. Read its header before assuming otherwise.
 
 pub mod proof;
 pub mod prover;
 pub mod round4;
 pub mod shape;
+pub mod verifier;

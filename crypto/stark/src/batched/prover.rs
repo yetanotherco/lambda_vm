@@ -413,7 +413,15 @@ where
     for table in 0..num_tables {
         let (air, _, _) = &air_trace_pairs[table];
         let domain = &domains[table];
-        let z = transcript.sample_z_ood(&domain.lde_roots_of_unity_coset, &domain.trace_roots_of_unity);
+        // `sample_z_ood_with_domain_params` rather than `sample_z_ood`: the
+        // verifier has the trace length and the blowup but not the domain
+        // vectors, so naming the routine both sides can reach is what makes the
+        // two agree by construction instead of by two call sites coinciding.
+        let z = transcript.sample_z_ood_with_domain_params(
+            domain.interpolation_domain_size,
+            domain.interpolation_domain_size * domain.blowup_factor,
+            &coset_offset,
+        );
 
         let ldes = materialize_ldes::<Field, FieldExtension, PI, H, P>(
             table,
