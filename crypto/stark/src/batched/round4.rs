@@ -17,6 +17,23 @@
 //! closure is where a caller streams table by table (see
 //! [`crate::fri::batched::HeightCombiner`]).
 //!
+//! # ★ TWO instance classes, and the index rule between them
+//!
+//! Not every table belongs in the batch. A table whose own FRI commits ZERO
+//! layers gains nothing from being batched — there is no layer for the batch to
+//! share — while it pays the full lift to the tallest domain, which is where the
+//! proximity-gaps term's `|D0|^2` lives. At the measured epoch that is 13 of 28
+//! legs carrying 92% of the batch's width. [`FriInstancePlan`] partitions them,
+//! and the excluded tables keep a terminal-only instance
+//! ([`verify_standalone_fri_query`]) that costs one polynomial and no layers.
+//!
+//! The MMCS is untouched by this split — it still commits every table, so the
+//! one-shared-authentication-path win survives whole. What differs is the index
+//! SPACE: the batched class reads `iota` directly, a standalone table at height
+//! `h` reads `iota >> (h_max - h)`. Both classes need a tamper control, since a
+//! control that only touched the batched one would pass under any convention for
+//! the other.
+//!
 //! # Query indices and the injection convention
 //!
 //! One `iota` per query, drawn from `[0, 2^(h_max-1))` — a row-PAIR index in the
@@ -52,7 +69,8 @@ use math::traits::AsBytes;
 
 use crate::config::{Commitment, StarkHash};
 use crate::fri::batched::{
-    BatchedFriLayout, absorb_shape_histogram, batched_commit_phase, derive_batched_fri_challenges,
+    BatchedFriLayout, FriInstancePlan, absorb_shape_histogram, batched_commit_phase,
+    derive_batched_fri_challenges,
 };
 use crate::fri::fri_commitment::FriLayer;
 use crate::fri::fri_decommit::FriDecommitment;
@@ -76,6 +94,9 @@ where
     /// The mixing challenge the codewords were combined with. Kept because the
     /// query phase needs it to rebuild each table's contribution.
     pub alpha: FieldElement<E>,
+    /// Which tables this instance carries, and which keep a terminal-only
+    /// instance of their own. See [`FriInstancePlan`].
+    pub plan: FriInstancePlan,
 }
 
 /// Prover side of the batched round-4 sequence.
@@ -107,19 +128,22 @@ where
     E: IsField + 'static + Send + Sync,
     T: IsStarkTranscript<E, F> + Clone,
     H: StarkHash,
-    C: FnOnce(&FieldElement<E>) -> Vec<Option<Vec<FieldElement<E>>>>,
+    C: FnOnce(&FieldElement<E>, &FriInstancePlan) -> Vec<Option<Vec<FieldElement<E>>>>,
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
 {
-    let h_max = *heights
-        .iter()
-        .max()
-        .expect("commit_batched_fri: the epoch has at least one table");
+    // Derived from the shape, exactly as the verifier derives it — the partition
+    // is never sent. The tables whose own FRI commits no layer are left out of the
+    // batch: they gain nothing from it and pay the full lift to the tallest
+    // domain, which is where the proximity-gaps term's `|D0|^2` lives.
+    let plan = FriInstancePlan::new(heights, blowup_log, final_poly_log_degree)
+        .expect("commit_batched_fri: the epoch's shape is the prover's own");
+    let h_max = plan.h_max;
 
     absorb_shape_histogram::<E, T>(transcript, heights, widths);
     let alpha = transcript.sample_field_element();
 
-    let combined = combine(&alpha);
+    let combined = combine(&alpha, &plan);
     let (final_poly_coeffs, layers) = batched_commit_phase::<F, E, T, H>(
         combined,
         transcript,
@@ -140,16 +164,50 @@ where
         .map(|_| transcript.sample_u64(1u64 << (h_max - 1)) as usize)
         .collect();
 
-    let h_min = *heights.iter().min().expect("heights is non-empty");
     BatchedFriCommit {
         layers,
         layer_roots,
         final_poly_coeffs,
-        layout: BatchedFriLayout::new(h_max, h_min, blowup_log, final_poly_log_degree),
+        layout: BatchedFriLayout::new(plan.h_max, plan.h_min, blowup_log, final_poly_log_degree),
         nonce,
         iotas,
         alpha,
+        plan,
     }
+}
+
+/// Verify one query against a STANDALONE table's terminal-only instance.
+///
+/// A table whose own FRI commits no layer has a terminal codeword that IS its
+/// deep-composition codeword, so there is nothing to fold and nothing to
+/// authenticate: the check is that the value the query opened is the value the
+/// sent terminal polynomial encodes at that position.
+///
+/// ★ `iota` is the SHARED batched query index and is reduced here — the two
+/// instance classes read the same index in different spaces (see
+/// [`FriInstancePlan`]). `deep` is the table's own deep-composition pair at its
+/// reduced row pair, which the caller reconstructs from authenticated openings.
+///
+/// Returns `false` on every malformed input; it never panics.
+pub fn verify_standalone_fri_query<E>(
+    iota: usize,
+    h_max_fri: usize,
+    h_table: usize,
+    deep: (&FieldElement<E>, &FieldElement<E>),
+    terminal_codeword: &[FieldElement<E>],
+) -> bool
+where
+    E: IsField + 'static,
+{
+    let Some(reduced) = reduce_iota_to_round(iota, h_max_fri, h_table) else {
+        return false;
+    };
+    terminal_codeword
+        .get(reduced * 2)
+        .is_some_and(|t| deep.0 == t)
+        && terminal_codeword
+            .get(reduced * 2 + 1)
+            .is_some_and(|t| deep.1 == t)
 }
 
 /// Position, inside the codeword of height `h`, that query `iota` reads.
@@ -491,10 +549,14 @@ pub(crate) mod tests {
             transcript,
             &heights,
             &widths,
-            |alpha| {
+            |alpha, plan| {
+                // Only the batched class is mixed in, and in the plan's order —
+                // absorption order is what defines the alpha powers, so a caller
+                // that absorbed the standalone tables too would shift every
+                // power and agree with no verifier.
                 let mut combiner = HeightCombiner::new(*alpha);
-                for table in tables {
-                    combiner.absorb(&table.codeword, table.height);
+                for &t in &plan.batched {
+                    combiner.absorb(&tables[t].codeword, tables[t].height);
                 }
                 combiner.finish()
             },
@@ -525,10 +587,13 @@ pub(crate) mod tests {
         alpha: &FE,
         iota: usize,
     ) -> ((FE, FE), Vec<Option<FE>>) {
-        let h_max = tables.iter().map(|t| t.height).max().expect("non-empty");
-        let inputs: Vec<(Vec<FE>, usize)> = tables
+        let plan = FriInstancePlan::new(&heights_of(tables), BLOWUP_LOG, FINAL_POLY_LOG_DEGREE)
+            .expect("the fixture's shape partitions");
+        let h_max = plan.h_max;
+        let inputs: Vec<(Vec<FE>, usize)> = plan
+            .batched
             .iter()
-            .map(|t| (t.codeword.clone(), t.height))
+            .map(|&t| (tables[t].codeword.clone(), tables[t].height))
             .collect();
         let combined = combine_by_height(&inputs, alpha);
 

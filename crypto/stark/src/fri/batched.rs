@@ -175,6 +175,107 @@ impl BatchedFriLayout {
     }
 }
 
+/// Which of an epoch's tables enter the ONE batched FRI instance, and which keep
+/// a terminal-only instance of their own.
+///
+/// # Why there are two classes
+///
+/// A table whose own FRI would commit ZERO layers gains nothing from being
+/// batched — there is no layer for the batch to share — while it pays the full
+/// cost of being lifted to the tallest domain, which is where the proximity-gaps
+/// term's `|D0|²` lives. At the measured epoch that is 13 of 28 legs carrying 92%
+/// of the batch's width, so excluding them is a correction rather than a
+/// compromise: it recovers ~3.6 bits of soundness AND removes work.
+///
+/// A zero-layer table's FRI is degenerate in the useful sense — its terminal
+/// codeword IS its deep-composition codeword — so its "own instance" is one
+/// terminal polynomial and no layers at all.
+///
+/// # ★ The index rule BETWEEN the classes — a hard precondition
+///
+/// Both classes are opened at the SAME query indices, because the mixed-height
+/// MMCS is unaffected by this split: it still commits every table, and the point
+/// of one shared authentication path survives whole. What differs is the index
+/// SPACE each class reads them in:
+///
+/// ```text
+/// batched class:    iota, used directly (it is an index in the tallest domain)
+/// standalone table: iota >> (h_max - h_t)
+/// ```
+///
+/// This is the same reduction [`crate::fri::mmcs`]'s index-convention section
+/// documents for a short round, and it fails the same silent way: prover and
+/// verifier derive it from the shape, so a wrong shift is self-consistent —
+/// honest proofs still verify while the short tables end up checked at positions
+/// the FRI join never reaches. `each_instance_class_is_tamper_checked` is the
+/// control, and it tampers a table of EACH class, because a control that only
+/// touched the batched class would pass under any convention for the other.
+///
+/// # Determinism
+///
+/// The plan is a pure function of `(heights, blowup_log, final_poly_log_degree)`,
+/// all of which the transcript has bound before any challenge that depends on it.
+/// Prover and verifier therefore derive the SAME partition without it being sent,
+/// which is why the split adds nothing to the wire and nothing to the shape
+/// binding.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FriInstancePlan {
+    /// Table indices whose codewords are mixed into the batched instance, in
+    /// input order — the order that defines the `alpha` powers.
+    pub batched: Vec<usize>,
+    /// Table indices that keep a terminal-only instance, in input order.
+    pub standalone: Vec<usize>,
+    /// Tallest and shortest height WITHIN the batched class — the layout is
+    /// derived from these, not from the whole epoch.
+    pub h_max: usize,
+    pub h_min: usize,
+}
+
+impl FriInstancePlan {
+    /// Partition an epoch's tables. `None` when `heights` is empty or carries a
+    /// height that cannot be a codeword length — both are proof-supplied, so both
+    /// are rejections rather than panics.
+    ///
+    /// The TALLEST table is always batched, even if it would classify as
+    /// standalone on its own. That keeps the batched class non-empty, so the
+    /// layout is always well defined; an epoch whose tallest table folds nothing
+    /// degenerates to a single terminal-only instance, which is what it should be.
+    pub fn new(heights: &[usize], blowup_log: u32, final_poly_log_degree: u32) -> Option<Self> {
+        if heights.is_empty() {
+            return None;
+        }
+        let &h_max_epoch = heights.iter().max()?;
+        if h_max_epoch == 0 || h_max_epoch >= u32::BITS as usize {
+            return None;
+        }
+        let tallest = heights.iter().position(|h| *h == h_max_epoch)?;
+
+        let mut batched = Vec::with_capacity(heights.len());
+        let mut standalone = Vec::new();
+        for (t, &h) in heights.iter().enumerate() {
+            if h < blowup_log as usize {
+                return None;
+            }
+            let folds_a_layer =
+                FriFoldLayout::new(h as u32, blowup_log, final_poly_log_degree).num_committed > 0;
+            if folds_a_layer || t == tallest {
+                batched.push(t);
+            } else {
+                standalone.push(t);
+            }
+        }
+
+        let h_max = batched.iter().map(|&t| heights[t]).max()?;
+        let h_min = batched.iter().map(|&t| heights[t]).min()?;
+        Some(Self {
+            batched,
+            standalone,
+            h_max,
+            h_min,
+        })
+    }
+}
+
 /// FRI commit phase over the bucketed output of [`combine_by_height`] /
 /// [`HeightCombiner::finish`].
 ///
@@ -381,6 +482,9 @@ pub struct BatchedFriChallenges<E: IsField> {
     /// tallest domain. A round whose own `h_max` is lower must reduce these; see
     /// [`crate::fri::mmcs`]'s index-convention section.
     pub iotas: Vec<usize>,
+    /// Which tables the batched instance carries and which keep a terminal-only
+    /// instance of their own. Derived from the shape, never sent.
+    pub plan: FriInstancePlan,
 }
 
 /// Replays the shared batched round-4 transcript sequence (shape histogram,
@@ -408,14 +512,13 @@ where
     E: IsField,
     T: IsTranscript<E>,
 {
-    let &h_max = heights.iter().max()?;
-    let &h_min = heights.iter().min()?;
-    // `heights` is derived from proof-supplied trace lengths, so bound it before
-    // it reaches a shift or `BatchedFriLayout`'s asserts: a bogus height is a
-    // rejection, never a panic on the verifier's path.
-    if h_max == 0 || h_max >= u32::BITS as usize || h_min < blowup_log as usize {
-        return None;
-    }
+    // The partition is derived, not sent: it is a pure function of the shape the
+    // histogram below binds, so both sides reach the same one. `None` on any
+    // height that cannot be a codeword length — heights come from proof-supplied
+    // trace lengths, so a bogus one is a rejection, never a panic on the
+    // verifier's path.
+    let plan = FriInstancePlan::new(heights, blowup_log, final_poly_log_degree)?;
+    let (h_max, h_min) = (plan.h_max, plan.h_min);
     let layout = BatchedFriLayout::new(h_max, h_min, blowup_log, final_poly_log_degree);
     if layer_roots.len() != layout.num_committed
         || final_poly_coeffs.len() != 1usize << layout.effective_k
@@ -459,6 +562,7 @@ where
         layout,
         grinding_seed,
         iotas,
+        plan,
     })
 }
 

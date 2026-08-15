@@ -356,12 +356,12 @@ struct Round4Fixture {
     decommitments: Vec<FriDecommitment<F>>,
     alpha: FE,
     h_max: usize,
+    plan: crate::fri::batched::FriInstancePlan,
 }
 
 impl Round4Fixture {
     fn build() -> Self {
         let tables = round4_tests::fixture();
-        let h_max = tables.iter().map(|t| t.height).max().expect("non-empty");
         let mut transcript = round4_tests::Transcript::new(b"batched_soundness_r4");
         let commit = round4_tests::commit_fixture(&tables, &mut transcript, 0, 6);
         let decommitments =
@@ -386,9 +386,10 @@ impl Round4Fixture {
             tables,
             betas: replay.betas,
             alpha: replay.alpha,
+            h_max: replay.plan.h_max,
+            plan: replay.plan,
             decommitments,
             commit,
-            h_max,
         }
     }
 
@@ -548,10 +549,14 @@ fn a_tampered_layer_zero_value_is_rejected() {
 #[test]
 fn a_wrong_injection_is_rejected() {
     let f = Round4Fixture::build();
+    // The BATCHED class's short heights — the standalone class is not injected at
+    // all, and asking for its bucket would be asking about a codeword that is not
+    // in this instance.
     let injected_heights: Vec<usize> = f
-        .tables
+        .plan
+        .batched
         .iter()
-        .map(|t| t.height)
+        .map(|&t| f.tables[t].height)
         .filter(|h| *h < f.h_max)
         .collect();
     assert!(
@@ -587,14 +592,18 @@ fn an_injection_read_at_the_sibling_row_is_rejected() {
     let mut exercised = 0usize;
     for (q, &iota) in f.commit.iotas.iter().enumerate() {
         assert!(f.check_query(q), "honest control for query {q}");
-        for table in f.tables.iter().filter(|t| t.height < f.h_max) {
-            let h = table.height;
+        for &t in f.plan.batched.iter() {
+            let h = f.tables[t].height;
+            if h == f.h_max {
+                continue;
+            }
             let position = crate::batched::round4::injection_position(iota, f.h_max, h);
             let sibling = position ^ 1;
             let inputs: Vec<(Vec<FE>, usize)> = f
-                .tables
+                .plan
+                .batched
                 .iter()
-                .map(|t| (t.codeword.clone(), t.height))
+                .map(|&b| (f.tables[b].codeword.clone(), f.tables[b].height))
                 .collect();
             let combined = crate::fri::batched::combine_by_height(&inputs, &f.alpha);
             let bucket = combined[h].as_ref().expect("the height is occupied");
@@ -725,4 +734,114 @@ fn malformed_batched_fri_inputs_are_rejected_without_panicking() {
         ),
         "an empty terminal codeword must be rejected"
     );
+}
+
+/// ★ The control the two-class split requires: a table of EACH class must be
+/// tamper-checked.
+///
+/// The classes read the same query index in different spaces — the batched class
+/// uses `iota` directly, a standalone table uses `iota >> (h_max - h)`. Prover
+/// and verifier both derive that shift from the shape, so a wrong convention is
+/// self-consistent and honest proofs keep verifying; the failure is that the
+/// standalone tables end up checked at positions nothing else reaches. A control
+/// that only tampered the batched class would pass under ANY convention for the
+/// other, which is exactly how consolidating a per-table check loses coverage.
+#[test]
+fn each_instance_class_is_tamper_checked() {
+    let f = Round4Fixture::build();
+    assert!(
+        !f.plan.standalone.is_empty(),
+        "the fixture must exercise BOTH classes, or this control proves nothing \
+         about the split"
+    );
+    assert!(
+        f.plan.batched.len() > 1,
+        "the batched class must carry more than the tallest table"
+    );
+
+    // --- Batched class: covered by the fold recursion. ---
+    assert!(f.check_query(0), "honest control");
+    assert!(
+        !f.check_query_with(0, |_, p0, _, _| { p0.0 = &p0.0 + &FE::from(1u64) }),
+        "a tampered batched-class value must be rejected"
+    );
+
+    // --- Standalone class: its own terminal-only instance. ---
+    for &t in &f.plan.standalone {
+        let table = &f.tables[t];
+        // A zero-layer table's terminal codeword IS its deep-composition
+        // codeword — nothing folds — so the honest terminal is the codeword.
+        let terminal = &table.codeword;
+        for (q, &iota) in f.commit.iotas.iter().enumerate() {
+            let reduced = crate::batched::round4::reduce_iota_to_round(iota, f.h_max, table.height)
+                .expect("a standalone table is never taller than the FRI");
+            let honest = (terminal[reduced * 2], terminal[reduced * 2 + 1]);
+            assert!(
+                crate::batched::round4::verify_standalone_fri_query::<F>(
+                    iota,
+                    f.h_max,
+                    table.height,
+                    (&honest.0, &honest.1),
+                    terminal,
+                ),
+                "query {q}: the honest standalone opening must verify"
+            );
+            let tampered = &honest.0 + &FE::from(1u64);
+            assert!(
+                !crate::batched::round4::verify_standalone_fri_query::<F>(
+                    iota,
+                    f.h_max,
+                    table.height,
+                    (&tampered, &honest.1),
+                    terminal,
+                ),
+                "query {q}: a tampered standalone value must be rejected"
+            );
+            // The index rule itself: reading the table at the UNREDUCED batched
+            // index is the mistake the two-class split makes possible, and it is
+            // silent unless something rejects it.
+            if iota != reduced && iota * 2 + 1 < terminal.len() {
+                assert!(
+                    !crate::batched::round4::verify_standalone_fri_query::<F>(
+                        iota,
+                        f.h_max,
+                        table.height,
+                        (&terminal[iota * 2], &terminal[iota * 2 + 1]),
+                        terminal,
+                    ),
+                    "query {q}: the un-reduced index must not authenticate a \
+                     standalone table"
+                );
+            }
+        }
+    }
+}
+
+/// A standalone table must not be reachable through the batched instance's
+/// injection path: it contributes no bucket, so a prover that manufactured one
+/// is claiming a codeword this instance never mixed.
+#[test]
+fn a_standalone_table_contributes_no_injection() {
+    let f = Round4Fixture::build();
+    assert!(
+        !f.plan.standalone.is_empty(),
+        "the fixture needs both classes"
+    );
+    for &t in &f.plan.standalone {
+        let h = f.tables[t].height;
+        assert!(
+            !f.plan.batched.iter().any(|&b| f.tables[b].height == h),
+            "the fixture's standalone height must be unique to that class"
+        );
+        for q in 0..f.commit.iotas.len() {
+            assert!(f.check_query(q), "honest control for query {q}");
+            assert!(
+                !f.check_query_with(q, |_, _, buckets, _| {
+                    buckets[h] = Some(FE::from(7u64));
+                }),
+                "query {q}: a bucket manufactured at a standalone height must be \
+                 rejected"
+            );
+        }
+    }
 }
