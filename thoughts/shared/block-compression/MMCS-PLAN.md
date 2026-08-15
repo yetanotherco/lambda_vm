@@ -1358,3 +1358,127 @@ Two smaller notes for the same pass:
   it" row becomes a prover choice.
 - The eps_C consequence of batching, which is a separate question with its own
   addendum below.
+
+---
+
+## ADDENDUM B — the `eps_C` delta from batching
+
+Written on `mmcs-integration`. Required before the batched path may ship: the
+2026-08-15 security audit (SECURITY-LEVELS §1.3) found the proximity-gaps
+batching term to be the system's soundness FLOOR at ~92 proven bits, carrying
+Haböck 2022/1216 Thm 2's `(L − 1/2)` factor, and batching changes exactly the
+two inputs that term depends on.
+
+### B.0 Answer
+
+**Batching can only make the floor worse, never better, and the loss is
+`2 bits per level of L-weighted height spread` — not per level of raw spread.**
+The exact figure is a property of the epoch's `(height, L)` profile and nothing
+else; the closed form is B.2 and it is two lines.
+
+At a profile where 90% of the batch weight sits at `h_max` the cost is **0.15
+bits**. At 50/50 across three levels it is **~1.0 bit**. The hard ceiling is
+`2·(h_max − h_min)` bits, reached only if the entire batch weight sat on the
+shortest table, which no real epoch does.
+
+**Verdict: this does not block the batched path** at any plausible profile, but
+it is not free either, and §1.1's projection does not price it. ⚠ The number
+that must be produced before the default is ever flipped is B.4's — the real
+epoch's `(h_t, L_t)` list, which the census logs hold and this addendum does not.
+
+### B.1 Why the two inputs move, and in opposite directions
+
+SECURITY-LEVELS §1.3 (✓ VERIFIED there, reproduced structurally here):
+
+```
+eps_C = (L − 1/2) · [ (m + 1/2)^7 / (3·sqrt(rho^3)) · |D0|^2/|F|  +  (second term) ]
+```
+
+with the second term ~55 bits below the first, so `eps_C ≈ (L − 1/2)·C·|D0|²/|F|`
+where `C` depends only on `m` and `rho` — the blowup and `eta`, both of which are
+per-proof, not per-table. So `C` is COMMON to every instance and cancels out of
+any comparison. That is what makes the delta computable without redoing the
+theorem.
+
+- **`L` grows.** Today each table runs its own instance with
+  `L_t = num_terms_composition_poly + num_surviving_trace_openings_t`
+  (✓ VERIFIED `ood.rs`, and `prover.rs`'s `deep_composition_coefficients` is
+  powers of a single `gamma`, which is what earns the full `(L − 1/2)` rather
+  than Remark 3's affine `3/2`). Batched, one instance carries `Sum_t L_t`.
+- **`|D0|` grows for the short tables.** Every instance now runs over the
+  TALLEST domain; a table at `h_t < h_max` is lifted. Since `eps_C` goes as
+  `|D0|²`, that is `2 bits per level` for that table's contribution.
+
+The naive framing — "thirty instances become one, so the union bound over thirty
+goes away" — is wrong, and this is the trap. The union bound does not go away:
+it is absorbed into `L`. `Sum_t (L_t − 1/2)` and `(Sum_t L_t) − 1/2` differ by
+`(n−1)/2`, which is nothing. **All the movement is in `|D0|`.**
+
+### B.2 The closed form
+
+System error today (union over the instances the verifier must ALL accept):
+
+```
+eps_today  = (C/|F|) · Sum_t (L_t − 1/2) · |D0_t|²
+eps_batch  = (C/|F|) · (Sum_t L_t − 1/2) · |D0_max|²
+```
+
+Dropping the `1/2` (every `L_t` is in the hundreds), with `w_t = L_t / Sum L`
+and `|D0_t| = 2^h_t`:
+
+```
+R = eps_batch / eps_today = 1 / Sum_t ( w_t · 4^-(h_max − h_t) )
+
+bits lost = log2(R) ≥ 0, with equality iff every table sits at h_max
+```
+
+**`R ≥ 1` always**, by Jensen on a convex weighting — batching is never a
+soundness improvement. The ceiling is `4^(h_max − h_min)`, i.e. `2·(h_max −
+h_min)` bits, attained only when all the weight is at `h_min`.
+
+### B.3 Sensitivity — what the answer looks like as a function of the profile
+
+Computed from B.2; ? INFERRED profiles, not census data.
+
+| L-weighted profile | bits lost |
+|---|---|
+| every table at `h_max` | 0.00 |
+| 90% of `L` at `h_max`, 10% three levels down | 0.15 |
+| 50% at `h_max`, 50% three levels down | 0.98 |
+| uniform `L` over `h_max`, −1, −2, −3 | 1.59 |
+| 10% at `h_max`, 90% three levels down | 3.13 |
+
+The shape of that column is the useful part: **the loss is governed by how much
+of the batch's WIDTH sits below the tallest table, and it is insensitive to how
+many short tables there are.** Thirty narrow short tables cost almost nothing;
+one very wide short table costs real bits.
+
+⚠ **This is where the answer could turn unpleasant, and it is worth checking
+rather than assuming.** CENSUS.md §3 records that at the real 2^21 point the
+widest object by far is `KECCAK_RND` (1480 main + 516 aux columns), and in the
+wrap's leg dump it sits at **2^2 rows against a deepest leg of 2^22** — the
+exact adversarial shape for this term: nearly all the width, nowhere near the
+height. If that shape carries to the layer being batched, B.3's last row is the
+relevant one and the cost is ~3 bits, not ~0.2. ? INFERRED — the leg dump is the
+wrap's census, not the RV64 epoch's, and which one applies depends on which
+application (a) or (b) is being batched.
+
+### B.4 What must be measured before the default is flipped
+
+The `(h_t, L_t)` list for the epoch actually being batched, from the census logs
+(`ethrex_e2*_skip.log` carries the leg shapes: `log2_trace_length`, main and aux
+width per leg). Feed it through B.2. That is a five-minute computation once the
+list is in hand, and it is the only remaining input.
+
+Two decision rules for whoever runs it:
+
+- **Under ~1 bit:** ship. The floor moves from ~92.0 to ~91 and stays far above
+  the 80-bit line §4's draft statement claims.
+- **Over ~3 bits:** stop and raise it. §1.3's falsification pass 3 is the reason
+  this cannot be bought back — grinding and queries attach to the QUERY term, not
+  to `eps_C`, so no query-count change repairs it. The levers that do work are
+  (i) shorter traces, (ii) a smaller batch, or (iii) claiming affine batching:
+  independent per-table challenges instead of powers of one `gamma` replaces
+  `(L − 1/2)` with `3/2` and is worth **~10 bits** on its own (§1.3's table:
+  92.0 → 102.4). That last one is a prover change, not a parameter change, and it
+  would make this addendum moot — worth costing if B.4 comes back bad.
