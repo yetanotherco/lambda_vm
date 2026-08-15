@@ -324,6 +324,68 @@ fn the_chip_occupies_its_registered_slot() {
     }
 }
 
+/// ★ The registry blessing is INVARIANT under `BLAKE3_ROUNDS`, and the chip's
+/// witness is NOT — the two halves of one claim.
+///
+/// Without this, one registry entry describes two machines: `blake3-6round`
+/// moves `NUM_COLUMNS` 3556 → 3076, `NUM_CONSTRAINTS` 897 → 769 and the
+/// interaction count 1453 → 1261. A proof built under one round count and
+/// verified under the other fails CLOSED — the OOD width check rejects it
+/// before a constraint is evaluated — but it fails on a width mismatch rather
+/// than on the axis being NAMED, and named is exactly what `hasher` gets a
+/// `program_id` fold for and what `CommitmentHash` gets a compile-time guard
+/// for. The round count is the third such axis and has neither.
+///
+/// What makes blessing once nonetheless correct is that the round count lives
+/// **entirely in the value columns**: the preprocessed instruction group is
+/// addresses, multiplicities, the reversed-digest pair and `MU`, and no term of
+/// it mentions `NUM_G`. So no root and no log-height can move with the feature,
+/// and the one table is readable under either build.
+///
+/// Both directions are asserted, because the prefix not moving means nothing
+/// unless something else does. Confirmed empirically as well: regenerating
+/// `LFM_REGISTRY` under `--features blake3-6round` reproduces the committed
+/// table exactly — all 3,072 root and digest bytes, all six `log_heights`, all
+/// six `program_id`s.
+#[test]
+fn the_registry_blessing_is_round_count_invariant() {
+    // ---- the prefix is a function of the I/O shape alone.
+    assert_eq!(
+        cols::PREP_WIDTH,
+        blake3_chip::IN_WORDS + 2 * blake3_chip::OUT_WORDS + 2 * cols::DIGEST_WORDS + 1,
+        "the instruction group is 7 input addresses, 4 output addresses and their \
+         multiplicities, 2 reversed-digest addresses and theirs, and MU — not one \
+         term of it is a function of the round count"
+    );
+    // And the committed group IS that prefix, so no root can move with it.
+    let program = blake3_sponge_program(65);
+    assert_eq!(
+        program.groups.blake3.width,
+        cols::PREP_WIDTH,
+        "the committed group is the preprocessed prefix and nothing else"
+    );
+
+    // ---- NON-VACUITY: the witness DOES move, so the separation is real.
+    assert_eq!(blake3_chip::NUM_G, BLAKE3_ROUNDS * 8);
+    let (value_columns, constraints, interactions, other_value_columns) = if BLAKE3_ROUNDS == 6 {
+        (3_056usize, 769usize, 1_261usize, 3_536usize)
+    } else {
+        (3_536, 897, 1_453, 3_056)
+    };
+    assert_eq!(
+        cols::NUM_COLUMNS - cols::PREP_WIDTH,
+        value_columns,
+        "the value columns are round-dependent"
+    );
+    assert_eq!(NUM_CONSTRAINTS, constraints);
+    assert_eq!(blake3_chip::bus_interactions().len(), interactions);
+    assert_ne!(
+        value_columns, other_value_columns,
+        "the two round counts must be two different machines, or this test \
+         asserts an invariance with nothing to be invariant under"
+    );
+}
+
 /// An input lane at or above `2^32` is REJECTED, not reduced.
 ///
 /// The chip recomposes each `u32` from four BITWISE-range-checked byte columns,

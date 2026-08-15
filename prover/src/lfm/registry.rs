@@ -287,6 +287,32 @@ pub fn resolve(
 // GENERATED — do not edit by hand. Regenerate with:
 //   cargo run --bin compute_lfm_registry --release
 // and paste the output below. Drift tests recompute and compare on every PR.
+//
+// ★ WHICH CONFIGURATION THIS TABLE ASSUMES, and what would move it.
+//
+// Two axes are BOUND into every digest below and a third deliberately is not:
+//
+//   * `hasher` (the `LFM_HASH` socket permutation) is folded into `program_id`,
+//     so two hashers are two program identities. Blessed under
+//     `HasherKind::Test`; a second hasher becomes additional ROWS, and `resolve`
+//     rejects a duplicate `(kind, blowup_factor)` rather than shadowing one.
+//   * `blowup_factor` is a column of the table and half of `resolve`'s key.
+//     Blessed at 2, the only registered preset.
+//   * ⚠ `BLAKE3_ROUNDS` (the `blake3-6round` feature) is NOT bound, and does not
+//     need to be. It moves `LFM_BLAKE3`'s VALUE columns only — width
+//     3556 → 3076, constraints 897 → 769, interactions 1453 → 1261 — while what
+//     this table commits for that slot is the preprocessed instruction group:
+//     addresses, multiplicities and `MU`, none of which mention the round count.
+//     Regenerating under `--features blake3-6round` reproduces this table
+//     exactly, and `blake3_chip_tests::the_registry_blessing_is_round_count_invariant`
+//     pins the mechanism in both directions.
+//
+//     What that buys is one table for two builds. What it does NOT buy is a
+//     NAMED axis: a proof built at one round count and verified at the other is
+//     rejected on an OOD width mismatch — closed, but silent about why. If the
+//     round count ever becomes a per-deployment choice rather than a
+//     compile-time one, it needs the treatment `hasher` has (a fold into
+//     `program_id`) and this table needs blessing under each.
 // =========================================================================
 pub static LFM_REGISTRY: &[LfmRegistryEntry] = &[
     LfmRegistryEntry {
