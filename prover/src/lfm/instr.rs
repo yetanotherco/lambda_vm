@@ -58,7 +58,8 @@ pub enum HashMode {
     /// Structurally identical to [`HashMode::Compress`] — two cells in, one
     /// cell out, same socket, same columns — and DIFFERENT in exactly one
     /// thing: the hash domain. Under BLAKE3 the row's domain tag is the
-    /// message word `m[8]`, selected by the preprocessed mode columns, so a
+    /// message word immediately after the lanes (`m[12]` at the RATE-4 lane
+    /// count), selected by the preprocessed mode columns, so a
     /// transcript step cannot be replayed as a Merkle parent or the reverse.
     /// Hashers with a single domain (`Test`, `Poseidon`) compute the same
     /// function in both modes; the separation is a property of the hasher, not
