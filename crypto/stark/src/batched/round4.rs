@@ -292,7 +292,15 @@ where
         point_inv = point_inv.square();
         v = (&v + evaluation_sym) + &point_inv * &betas[i + 1] * (&v - evaluation_sym);
         index >>= 1;
-        inject(&mut v, &betas[i + 1], bucket_at_height, h_max - 2 - i);
+        // The injection height descends with the running codeword. `checked_sub`
+        // rather than `h_max - 2 - i`: `layout`'s fields are only consistent with
+        // `h_max` when the layout was DERIVED from the same heights, and this
+        // function is on the verifier's path, where an overflow panic is not a
+        // rejection. An inconsistent layout simply injects nothing and fails at
+        // the terminal.
+        if let Some(height) = (h_max - 1).checked_sub(i + 1) {
+            inject(&mut v, &betas[i + 1], bucket_at_height, height);
+        }
     }
 
     // `v` is now the query's value in the terminal codeword and `index` its
