@@ -239,3 +239,91 @@ inline constexpr CanonicalVector CANONICAL_VECTORS[NUM_CANONICAL_VECTORS] = {
           0x36AE4940u, 0x4D813D81u, 0x9B058DA9u, 0x9017D38Cu},
     },
 };
+
+// ---------------------------------------------------------------------------
+// Table 3 — MULTI-BLOCK official BLAKE3 vectors, for the `Blake3Chain`
+// construction rather than the bare compression function.
+//
+// Table 1 above stops at 64 bytes because a single compression is all it can
+// check. The chain spans many blocks, and its flag schedule, its `block_len`
+// handling and its chaining value are only exercised past the first block — so
+// it needs vectors Table 1 cannot supply.
+//
+// ★ These are still the OFFICIAL vectors, not an oracle's. `Blake3Chain` over a
+// message of at most one chunk (1024 bytes) IS `blake3::hash` — standard
+// BLAKE3's first chunk is exactly this chain, and a one-chunk message has that
+// chunk's output as its root (PA-PLAN §1.7.2, P1). So for every length here up
+// to 1024 the published hash is a direct known-answer test for the device
+// chain, with no oracle and no transcription of anything computed in this repo.
+//
+// Transcribed from `thoughts/blake3/blake3-oracle/official_test_vectors.json`
+// (tracked), first 32 bytes of each case's `hash`. Input for length N is the
+// first N bytes of the repeating 251-byte sequence 0, 1, ..., 250 — the same
+// generator Table 1 uses.
+//
+// `agrees` marks whether the chain must MATCH the published hash. The 1025 and
+// 2048 rows are the P3 negative control: past one chunk standard BLAKE3 starts
+// chunk 1 with a reset chaining value and builds a tree, and this construction
+// deliberately does not. Without them "we implement the single-chunk chain"
+// would be unfalsifiable — the matching rows alone would pass identically if the
+// whole chunk tree had been implemented instead.
+// ---------------------------------------------------------------------------
+struct ChainVector {
+    uint32_t input_len;
+    const char *hash_hex;
+    bool agrees;  // false = must DIFFER (past one chunk)
+};
+
+inline constexpr int NUM_CHAIN_VECTORS = 8;
+inline constexpr ChainVector CHAIN_VECTORS[NUM_CHAIN_VECTORS] = {
+    {   65, "de1e5fa0be70df6d2be8fffd0e99ceaa8eb6e8c93a63f2d8d1c30ecb6b263dee", true},
+    {  127, "d81293fda863f008c09e92fc382a81f5a0b4a1251cba1634016a0f86a6bd640d", true},
+    {  128, "f17e570564b26578c33bb7f44643f539624b05df1a76c81f30acd548c44b45ef", true},
+    {  129, "683aaae9f3c5ba37eaaf072aed0f9e30bac0865137bae68b1fde4ca2aebdcb12", true},
+    { 1023, "10108970eeda3eb932baac1428c7a2163b0e924c9a9e25b35bba72b28f70bd11", true},
+    { 1024, "42214739f095a406f3fc83deb889744ac00df831c10daa55189b5d121c855af7", true},
+    { 1025, "d00278ae47eb27b34faecf67b4fe263f82d5412916c1ffd97c8cb7fb814b8444", false},
+    { 2048, "e776b6028c7cd22a4d0ba182a8bf62205d2ef576467e838ed6f2529b85fba24a", false},
+};
+
+// ---------------------------------------------------------------------------
+// Table 4 — the committed 6-ROUND chain KAT.
+//
+// A byte-for-byte transcription of `CHAIN_KAT_6ROUND`
+// (`crypto/crypto/src/hash/blake3/chain.rs:304`), which is the same table
+// PA-PLAN §1.7.5 records. Message of length N is byte `i = 37i + 11 (mod 256)`.
+//
+// Provenance, and why it is worth more than a self-comparison: those digests
+// were produced by #903's Python oracle
+// (`thoughts/blake3/blake3-oracle/blake3_ref.py`, tracked), a full
+// standard-BLAKE3 implementation with the round count as a parameter, whose
+// 7-round arm reproduces the official package bit-for-bit. So at the round count
+// the campaign actually ships, this pins the device chain against numbers no
+// Rust and no CUDA in this tree computed.
+//
+// Duplicating the table here rather than sharing one copy is deliberate: this
+// harness compiles as standalone C++ with no cargo and no Rust in the build, so
+// there is nothing to share it with. A drift between the two copies is caught by
+// the Rust-side `device_chain_matches_the_committed_table_at_six_rounds`, which
+// reads the Rust constant directly.
+// ---------------------------------------------------------------------------
+struct ChainKat6Round {
+    uint32_t input_len;
+    const char *hash_hex;
+};
+
+inline constexpr int NUM_CHAIN_KAT_6ROUND = 12;
+inline constexpr ChainKat6Round CHAIN_KAT_6ROUND[NUM_CHAIN_KAT_6ROUND] = {
+    {    0, "3c3bbb1f335a31ea86464b651c0206fc81d33262ae00ea1a65f3d1d04afaefc9"},
+    {    1, "2a50e45b8921f9efa008d9f39f7165600cf48a7f0e859c2122e3ccb6b9677ee5"},
+    {   31, "c38bf62f506040b2600273778d281b8943621e2b8a9f59e2379f8fd7e5c85125"},
+    {   63, "c373f51a5eb8b27ea05bb1f6f4e62e924ff4d8a279f0d05afa5cd519391d6389"},
+    {   64, "5900a1e398bb2bf6d3ba7f1a29197b79c86b71ad2c2631f4ac736c82db043cb5"},
+    {   65, "53953fcadc39b8623901af7b534f2f6933e312f50299331334e6c0a7c9dbc2be"},
+    {  127, "9e0dd8168d199a04590c2cba439b270776e42715d518f68655e56692483e505e"},
+    {  128, "5caffc8784e817bbba991b2108c26a3dfdf804245ef63ae1040a3c34f1b362ff"},
+    {  192, "399d6b9adeb2f88450775f773e9dec08836c135713c2c5dd09f4ceceb0ed3888"},
+    {  256, "fbcab3699a4959fa37190e98ca5142ddbc88330f2e7d12335db9c6c8881a0b87"},
+    { 1024, "f395e7e2150363b6d200487515425b0204eea424072183b701176eccbe0ffe1b"},
+    { 1088, "b4738ede77a6ec166ee97667118d4793cbf2b08b45aac7c6d52943b5d298c688"},
+};

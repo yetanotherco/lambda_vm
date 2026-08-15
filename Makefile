@@ -573,20 +573,33 @@ test-math-cuda:
 # jobs are merge_group-only). Without this the kernels have no per-PR gate: an
 # edit to blake3.cu that broke the hash would reach the merge queue before
 # anything caught it. `crypto/math-cuda/tests/host_kat/` compiles the real kernel
-# source as host C++ through a shim and runs the official BLAKE3 vectors plus the
-# canonical 6-round table through it.
+# source as host C++ through a shim and runs the official BLAKE3 vectors, the
+# canonical 6-round table, the official multi-block vectors against the
+# `Blake3Chain` construction, and every leaf kernel's byte stream through it.
+#
+# BOTH ROUND COUNTS are built and run. The 6-round arm is the one the campaign
+# ships and the one no other CI job compiles (risk R10), and the round count is a
+# compile-time knob, so a single-arm run would leave the shipping configuration
+# ungated. The two arms differ only in `-DBLAKE3_ROUNDS`, exactly as build.rs
+# drives the cubin from the `blake3-6round` feature.
 #
 # It checks arithmetic ONLY. Whether nvcc accepts the file, and everything about
 # execution rather than arithmetic — grid indexing, the Merkle tail's barriers,
 # device alignment, register pressure — stays with `test-math-cuda`. Necessary,
 # never sufficient.
 HOST_KAT_DIR := crypto/math-cuda/tests/host_kat
+HOST_KAT_CXXFLAGS := -std=c++17 -O2 -Wall -Wno-unknown-pragmas \
+    -I$(HOST_KAT_DIR) -Icrypto/math-cuda/kernels
 test-blake3-host-kat:
 	@mkdir -p target/host_kat
-	$(CXX) -std=c++17 -O2 -Wall -Wno-unknown-pragmas \
-	    -I$(HOST_KAT_DIR) -Icrypto/math-cuda/kernels \
+	$(CXX) $(HOST_KAT_CXXFLAGS) \
 	    -o target/host_kat/blake3_host_kat $(HOST_KAT_DIR)/blake3_host_kat.cpp
 	./target/host_kat/blake3_host_kat
+	@echo
+	@echo "=== rebuilding for the 6-round arm (BLAKE3_ROUNDS=6) ==="
+	$(CXX) $(HOST_KAT_CXXFLAGS) -DBLAKE3_ROUNDS=6 \
+	    -o target/host_kat/blake3_host_kat_6r $(HOST_KAT_DIR)/blake3_host_kat.cpp
+	./target/host_kat/blake3_host_kat_6r
 
 # End-to-end cuda dispatch coverage (requires NVIDIA GPU + nvcc).
 # Asserts the R1-R4 GPU dispatch counters fired on a real prove.
