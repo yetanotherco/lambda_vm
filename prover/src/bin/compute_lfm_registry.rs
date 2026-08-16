@@ -72,6 +72,14 @@ fn main() {
                 artifacts.keccak_rnd_chunks
             );
             println!("        hasher: HasherKind::{:?},", artifacts.hasher);
+            println!("        prep_root: {},", fmt_bytes(&artifacts.prep_root));
+            let widths = artifacts
+                .prep_widths
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!("        prep_widths: [{widths}],");
             println!("        program_id: {},", fmt_bytes(&artifacts.program_id));
             println!("    }},");
         }

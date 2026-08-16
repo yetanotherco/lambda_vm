@@ -17,8 +17,10 @@ use stark::proof::options::ProofOptions;
 
 use crate::tables::{bitwise, keccak_rc};
 
-use super::airs::NUM_LFM_CHIPS;
-use super::commit::commit_group;
+use stark::batched::shape::RoundShape;
+
+use super::airs::{KECCAK_RND_SLOT, NUM_LFM_CHIPS};
+use super::commit::{PrepRoundBuilder, commit_lde_columns, group_columns, lde_columns};
 use super::compiler::LfmProgram;
 use super::hash::HasherKind;
 use super::statement::lfm_program_id;
@@ -77,6 +79,15 @@ pub struct LfmRegistryEntry {
     /// computed together and cannot be paired up wrongly at verify time.
     pub hasher: HasherKind,
     pub program_id: Commitment,
+    /// The batched preprocessed round's root — ONE mixed-height MMCS over the
+    /// participating slots' matrices. See [`PREP_ROUND_SLOTS`] for which, and
+    /// `LfmArtifacts::prep_root` for what it does and does not replace.
+    pub prep_root: Commitment,
+    /// Committed column count per slot, `0` for a slot outside the round. This
+    /// is the `widths` a batched verifier must pass to
+    /// `MixedMmcs::verify_batch`, and it is program shape — derived here, never
+    /// read off a proof.
+    pub prep_widths: [u16; NUM_LFM_CHIPS],
 }
 
 /// A program's committed artifacts (what a registry entry pins).
@@ -88,6 +99,177 @@ pub struct LfmArtifacts {
     /// both take it from here rather than defaulting.
     pub hasher: HasherKind,
     pub program_id: Commitment,
+    /// The batched preprocessed round's root: ONE mixed-height MMCS over the
+    /// [`PREP_ROUND_SLOTS`] matrices, committing the SAME evaluations `roots`
+    /// commits individually.
+    ///
+    /// ⚠ **It replaces nothing yet.** The LFM machine proves and verifies
+    /// through `multi_prove` / `multi_verify_views`, which read `roots`. This is
+    /// the value a batched verifier would compare against once that switch is
+    /// made; until then it is pinned and drift-tested, and nothing consumes it.
+    ///
+    /// ⚠ **It does not cover every slot.** See [`PREP_ROUND_SLOTS`]: slots
+    /// outside it keep their individual `roots` entry as the only thing binding
+    /// them, and a batched verifier must go on checking those separately.
+    /// Consolidating a per-table check into one comparison is exactly where
+    /// coverage goes missing (MMCS-PLAN §3.3).
+    ///
+    /// ⚠ **It is NOT folded into `program_id`.** Doing so would move all six
+    /// blessed digests, which this change is required not to do. The
+    /// consequence is that the recursion statement does not yet attest to it;
+    /// folding it in belongs to the next deliberate re-bless.
+    pub prep_root: Commitment,
+    /// Committed column count per slot, `0` outside the round.
+    pub prep_widths: [u16; NUM_LFM_CHIPS],
+}
+
+/// The slots the batched preprocessed round covers: the twelve
+/// program-dependent column groups (0–11).
+///
+/// # Why not all fifteen
+///
+/// - **Slot 12 (`KECCAK_RND`)** has no preprocessed columns at all — there is
+///   nothing to commit, and a mixed-height MMCS has no leaf for a height-0
+///   matrix.
+/// - **Slots 13–14 (`KECCAK_RC`, `BITWISE`)** are owned by `tables/`, and their
+///   commitments are STATICALLY PINNED precisely so nothing recomputes them:
+///   `bitwise` is 2^20 rows by 11 columns, so putting it in this round would
+///   make every `build_artifacts` call — including the king gate's and a dozen
+///   tests' — expand a ~2^21 x 11 LDE it currently gets for free from a
+///   constant. The round therefore covers exactly the groups `build_artifacts`
+///   already materializes, and costs nothing extra.
+///
+/// This is a scope decision, not a law: a round covering all fourteen
+/// committing slots is implementable, and what it costs is one full expansion
+/// of the two production tables per call. `the_prep_round_covers_exactly_the_program_groups`
+/// pins the current set so widening it is a deliberate act.
+///
+/// ⚠ **Consequence, and it is the reason [`pinned_prep_widths`] exists.** The
+/// BATCHED path derives its preprocessed round from the AIR SET, and there
+/// `KECCAK_RC` and `BITWISE` are preprocessed AIRs (9 and 11 precomputed
+/// columns), so an LFM epoch's prep round has FOURTEEN contributing matrices
+/// while this round covers twelve. [`prep_root`](LfmArtifacts::prep_root) is
+/// therefore NOT the epoch's batched preprocessed root and must not be handed to
+/// `stark::batched::shape::PinnedPrep` as one. Widening this range to cover the
+/// two production tables is the prerequisite for that, and it is M-8's, not
+/// M-6's.
+pub const PREP_ROUND_SLOTS: core::ops::Range<usize> = 0..12;
+
+/// The batched preprocessed round's `(log_height, width)` per participating
+/// slot, in slot order — the shape both the builder and a verifier need.
+///
+/// ★ **The heights are LDE heights, `log_heights + log2(blowup)`.** The
+/// registry's `log_heights` are TRACE heights, and a mixed-height MMCS is
+/// indexed by the committed matrix's height, which is the LDE's. Getting this
+/// wrong is not loud: every height would be uniformly too small, the tree would
+/// still build, and openings would authenticate at leaves the FRI join never
+/// checks. One derivation — used by `build_artifacts_with_hasher` to declare the
+/// round and by [`LfmArtifacts::prep_round_shape`] to describe it — is what
+/// stops the two from disagreeing.
+pub fn prep_round_dims(
+    log_heights: &[u8; NUM_LFM_CHIPS],
+    prep_widths: &[u16; NUM_LFM_CHIPS],
+    blowup_factor: u8,
+) -> Vec<(usize, usize)> {
+    let blowup_log = (blowup_factor as usize).trailing_zeros() as usize;
+    PREP_ROUND_SLOTS
+        .filter(|&i| prep_widths[i] > 0)
+        .map(|i| {
+            (
+                log_heights[i] as usize + blowup_log,
+                prep_widths[i] as usize,
+            )
+        })
+        .collect()
+}
+
+/// The registry slot an epoch TABLE index belongs to, in
+/// [`LfmAirs::air_refs`](crate::lfm::airs::LfmAirs::air_refs) order.
+///
+/// The two orders coincide only up to slot 11. `air_refs` emits slots 0–11,
+/// then `keccak_rnd_chunks` copies of `KECCAK_RND`, then `KECCAK_RC` and
+/// `BITWISE` — so `KECCAK_RC` sits at table `12 + chunks`, not at table 13.
+///
+/// ★ Every registered program today has `keccak_rnd_chunks == 1`, which makes
+/// slot and table indices identical across the whole table. That is exactly why
+/// the off-by-one is easy to write and impossible to notice, and why
+/// `the_slot_to_table_map_is_not_the_identity_beyond_one_chunk` drives it at a
+/// chunk count above one.
+///
+/// `None` for a table index past the end of the set.
+pub fn slot_of_table(table: usize, keccak_rnd_chunks: usize) -> Option<usize> {
+    let first_rnd = KECCAK_RND_SLOT;
+    if table < first_rnd {
+        return Some(table);
+    }
+    let after_rnd = first_rnd + keccak_rnd_chunks;
+    if table < after_rnd {
+        return Some(KECCAK_RND_SLOT);
+    }
+    match table - after_rnd {
+        0 => Some(13),
+        1 => Some(14),
+        _ => None,
+    }
+}
+
+/// Compact a registry entry's per-slot widths into the contributing-matrix slice
+/// `stark::batched::shape::PinnedPrep` takes.
+///
+/// # One derivation, not two
+///
+/// The slice is built by INDEXING `prep.tables` — the round's own list of
+/// contributing table indices — and never by filtering the per-slot array for
+/// non-zero entries. Those are two independent derivations of the same fact, and
+/// if they ever disagreed (a genuinely zero-width group, or a non-member slot
+/// carrying a width) a prover and a verifier would both compact the same wrong
+/// way and honest proofs would keep verifying with nothing failing. That is the
+/// failure shape MMCS-PLAN §3.3's closing warning describes, one level up from
+/// the root comparison itself.
+///
+/// # `None` is the loud half
+///
+/// Returns `None` when the epoch's preprocessed round contains a matrix
+/// [`PREP_ROUND_SLOTS`] does not cover. **Today that is every real LFM epoch**,
+/// because `KECCAK_RC` and `BITWISE` are preprocessed AIRs and the round is not
+/// widened yet. A rejection is the correct answer: the alternative is handing a
+/// verifier a width slice that describes a different round than the root does.
+pub fn pinned_prep_widths(
+    prep: &RoundShape,
+    prep_widths: &[u16; NUM_LFM_CHIPS],
+    keccak_rnd_chunks: usize,
+) -> Option<Vec<usize>> {
+    prep.tables
+        .iter()
+        .map(|&table| {
+            let slot = slot_of_table(table, keccak_rnd_chunks)?;
+            if !PREP_ROUND_SLOTS.contains(&slot) {
+                return None;
+            }
+            match prep_widths[slot] {
+                0 => None,
+                w => Some(w as usize),
+            }
+        })
+        .collect()
+}
+
+impl LfmArtifacts {
+    /// The batched preprocessed round's shape, as
+    /// `stark::fri::mmcs::MixedMmcs::verify_batch` wants it: `(heights, widths)`
+    /// over the participating slots, in slot order.
+    ///
+    /// `blowup_factor` is taken rather than stored because it is a property of
+    /// the proof options the artifacts were built under;
+    /// `the_prep_round_shape_matches_what_was_committed` pins that passing the
+    /// options a caller committed with reproduces the declared shape.
+    pub fn prep_round_shape(&self, blowup_factor: u8) -> (Vec<usize>, Vec<usize>) {
+        let dims = prep_round_dims(&self.log_heights, &self.prep_widths, blowup_factor);
+        (
+            dims.iter().map(|(h, _)| *h).collect(),
+            dims.iter().map(|(_, w)| *w).collect(),
+        )
+    }
 }
 
 /// Commits every instruction column group (plus the fixed tables) at the given
@@ -221,10 +403,35 @@ pub fn build_artifacts_with_hasher(
     ];
     let mut roots = [[0u8; 32]; NUM_LFM_CHIPS];
     let mut log_heights = [0u8; NUM_LFM_CHIPS];
+    let mut prep_widths = [0u16; NUM_LFM_CHIPS];
+
+    // Metadata first, so the round's shape comes from the SAME derivation a
+    // verifier will use (`prep_round_dims`) rather than from a second walk of
+    // the groups that could drift from it.
     for (i, g) in groups.iter().enumerate() {
-        roots[i] = commit_group(g, options);
         log_heights[i] = g.padded_rows.trailing_zeros() as u8;
+        if PREP_ROUND_SLOTS.contains(&i) {
+            prep_widths[i] =
+                u16::try_from(g.width).expect("a chip group is far under 65535 columns");
+        }
     }
+    let prep_dims = prep_round_dims(&log_heights, &prep_widths, options.blowup_factor);
+    let mut prep = PrepRoundBuilder::new(&prep_dims);
+
+    for (i, g) in groups.iter().enumerate() {
+        // One expansion per group, consumed twice: by the per-slot root and by
+        // the batched round. `commit_group` used to do its own expansion and
+        // throw it away; going through `lde_columns` keeps the batched root a
+        // commitment to the SAME evaluations rather than to a second copy.
+        let lde = lde_columns(&group_columns(g), options);
+        roots[i] = commit_lde_columns(&lde);
+        if PREP_ROUND_SLOTS.contains(&i) {
+            prep.absorb(&lde);
+        }
+        // Dropped here — peak residency is one group's LDE, exactly as before.
+        drop(lde);
+    }
+    let prep_root = prep.finish();
     // Slot 12 (KECCAK_RND) keeps the all-zero sentinel installed above.
     roots[13] = keccak_rc::preprocessed_commitment(options);
     log_heights[13] = keccak_rc::NUM_ROWS.trailing_zeros() as u8;
@@ -235,6 +442,9 @@ pub fn build_artifacts_with_hasher(
         .chunking
         .chunk_count(program.groups.keccak.real_rows);
 
+    // `prep_root` and `prep_widths` are deliberately NOT arguments here: folding
+    // them in would move all six blessed digests, and this change is required to
+    // be additive. See `LfmArtifacts::prep_root`.
     let program_id = lfm_program_id(&roots, &log_heights, keccak_rnd_chunks, hasher);
     LfmArtifacts {
         roots,
@@ -242,6 +452,8 @@ pub fn build_artifacts_with_hasher(
         keccak_rnd_chunks,
         hasher,
         program_id,
+        prep_root,
+        prep_widths,
     }
 }
 
@@ -398,6 +610,12 @@ pub static LFM_REGISTRY: &[LfmRegistryEntry] = &[
         log_heights: [3, 3, 2, 2, 2, 2, 2, 2, 2, 2, 16, 2, 0, 5, 20],
         keccak_rnd_chunks: 1,
         hasher: HasherKind::Test,
+        prep_root: [
+            0x7e, 0x85, 0xb4, 0x8a, 0x92, 0xdd, 0xd0, 0x69, 0x5f, 0x9d, 0xc5, 0xe6, 0xcd, 0x16,
+            0x53, 0x5d, 0xdc, 0x7c, 0xf2, 0x74, 0xf4, 0xb1, 0xaa, 0xdc, 0xb4, 0x16, 0x65, 0x4e,
+            0x86, 0x03, 0xc5, 0x1c,
+        ],
+        prep_widths: [6, 10, 11, 8, 130, 13, 56, 12, 2, 3, 1, 20, 0, 0, 0],
         program_id: [
             0xd7, 0x60, 0xa9, 0x45, 0xb4, 0xca, 0x37, 0xdc, 0x7b, 0x4d, 0xf7, 0x86, 0x75, 0x3b,
             0x0d, 0xf7, 0xbb, 0x55, 0xc1, 0xab, 0x62, 0x78, 0x57, 0x47, 0x8d, 0xfa, 0x57, 0xc5,
@@ -487,6 +705,12 @@ pub static LFM_REGISTRY: &[LfmRegistryEntry] = &[
         log_heights: [5, 8, 7, 7, 2, 7, 2, 5, 7, 2, 16, 2, 0, 5, 20],
         keccak_rnd_chunks: 1,
         hasher: HasherKind::Test,
+        prep_root: [
+            0x49, 0x11, 0x9e, 0x91, 0x2f, 0x90, 0x79, 0x5d, 0x6e, 0x34, 0xf8, 0xf5, 0x25, 0xb3,
+            0x38, 0x94, 0xf1, 0x10, 0x86, 0x0d, 0xc5, 0x0c, 0x00, 0x21, 0x07, 0x87, 0xd8, 0x6d,
+            0xe8, 0x87, 0x6e, 0x12,
+        ],
+        prep_widths: [6, 10, 11, 8, 130, 13, 56, 12, 2, 3, 1, 20, 0, 0, 0],
         program_id: [
             0x08, 0x7e, 0x22, 0x2e, 0xa7, 0x76, 0x9c, 0xf3, 0x7a, 0x3e, 0xfe, 0x63, 0xfd, 0x5d,
             0x6d, 0xa7, 0xba, 0x28, 0x04, 0x58, 0xf4, 0x52, 0x35, 0x49, 0x62, 0x2d, 0x99, 0x02,
@@ -576,6 +800,12 @@ pub static LFM_REGISTRY: &[LfmRegistryEntry] = &[
         log_heights: [2, 2, 2, 2, 2, 2, 2, 2, 4, 2, 16, 2, 0, 5, 20],
         keccak_rnd_chunks: 1,
         hasher: HasherKind::Test,
+        prep_root: [
+            0x47, 0x80, 0x04, 0xab, 0x4e, 0x69, 0x21, 0x1c, 0x1a, 0xd8, 0xad, 0x2c, 0xc6, 0x16,
+            0x68, 0x60, 0xff, 0x00, 0x04, 0xd2, 0x97, 0xe7, 0x24, 0xbc, 0x12, 0x06, 0x8e, 0xaa,
+            0xd6, 0x06, 0x21, 0xa4,
+        ],
+        prep_widths: [6, 10, 11, 8, 130, 13, 56, 12, 2, 3, 1, 20, 0, 0, 0],
         program_id: [
             0xa7, 0xe2, 0xe7, 0x7a, 0xde, 0xf8, 0xe2, 0x5a, 0xfd, 0xc8, 0x16, 0xb7, 0x67, 0xab,
             0x61, 0x80, 0x6f, 0x6f, 0xba, 0x77, 0x59, 0xec, 0x38, 0x69, 0x96, 0x28, 0x4c, 0xa8,
@@ -665,6 +895,12 @@ pub static LFM_REGISTRY: &[LfmRegistryEntry] = &[
         log_heights: [2, 2, 2, 2, 2, 2, 2, 5, 6, 2, 16, 2, 0, 5, 20],
         keccak_rnd_chunks: 1,
         hasher: HasherKind::Test,
+        prep_root: [
+            0x57, 0x22, 0xd6, 0xfc, 0x4e, 0xf1, 0xbf, 0x83, 0xf2, 0x58, 0x0f, 0xbe, 0x07, 0x96,
+            0x4d, 0x07, 0x5a, 0x40, 0x7a, 0x01, 0xec, 0x42, 0xdc, 0xa5, 0x5f, 0x7d, 0x7c, 0xf5,
+            0x03, 0x54, 0x14, 0x2c,
+        ],
+        prep_widths: [6, 10, 11, 8, 130, 13, 56, 12, 2, 3, 1, 20, 0, 0, 0],
         program_id: [
             0x83, 0x9d, 0xf6, 0xfb, 0x45, 0x5b, 0xea, 0xdd, 0x39, 0x9f, 0x41, 0x06, 0x50, 0x86,
             0x9e, 0xda, 0x42, 0x51, 0xcc, 0x0b, 0x87, 0x19, 0xf1, 0x96, 0x3a, 0x64, 0x61, 0xef,
@@ -754,6 +990,12 @@ pub static LFM_REGISTRY: &[LfmRegistryEntry] = &[
         log_heights: [4, 6, 2, 2, 2, 2, 3, 7, 6, 3, 16, 2, 0, 5, 20],
         keccak_rnd_chunks: 1,
         hasher: HasherKind::Test,
+        prep_root: [
+            0x1f, 0x43, 0x17, 0x29, 0xd2, 0xe2, 0xb2, 0xa1, 0xf3, 0x97, 0xb4, 0x41, 0x63, 0x0a,
+            0x1f, 0x31, 0x9e, 0x1e, 0xbe, 0x9f, 0xd7, 0x0f, 0xdd, 0xa8, 0xae, 0xb0, 0x55, 0xe9,
+            0x46, 0x06, 0x71, 0x23,
+        ],
+        prep_widths: [6, 10, 11, 8, 130, 13, 56, 12, 2, 3, 1, 20, 0, 0, 0],
         program_id: [
             0xf5, 0x3b, 0xe4, 0xc9, 0x7c, 0x90, 0x6c, 0x89, 0xd7, 0x05, 0x2f, 0x38, 0xbc, 0x14,
             0xa8, 0xd3, 0x0f, 0x64, 0x4b, 0x7e, 0x20, 0x47, 0xf6, 0x1c, 0xe8, 0x4b, 0xfc, 0x40,
@@ -843,6 +1085,12 @@ pub static LFM_REGISTRY: &[LfmRegistryEntry] = &[
         log_heights: [5, 11, 2, 2, 6, 2, 3, 6, 6, 2, 16, 2, 0, 5, 20],
         keccak_rnd_chunks: 1,
         hasher: HasherKind::Test,
+        prep_root: [
+            0xa3, 0xb6, 0x6c, 0x0b, 0x35, 0x27, 0x54, 0xd1, 0x56, 0x6f, 0xb1, 0x9d, 0xd5, 0xaf,
+            0x69, 0x8a, 0x69, 0x01, 0x4e, 0xef, 0x6c, 0x71, 0x4c, 0xd4, 0x02, 0x99, 0x9f, 0xec,
+            0xce, 0x67, 0x58, 0xe5,
+        ],
+        prep_widths: [6, 10, 11, 8, 130, 13, 56, 12, 2, 3, 1, 20, 0, 0, 0],
         program_id: [
             0x0a, 0x58, 0xcc, 0xd3, 0x93, 0x3a, 0xc3, 0xa3, 0xb2, 0xa3, 0x32, 0x71, 0x2e, 0x9a,
             0x62, 0x67, 0x54, 0x86, 0x16, 0x6f, 0x93, 0x81, 0x53, 0xa5, 0x7b, 0xe3, 0xd7, 0xa2,
