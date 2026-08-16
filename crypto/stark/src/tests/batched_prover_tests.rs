@@ -726,3 +726,73 @@ fn a_registry_prep_width_mismatch_fails_the_prove() {
         "a width list shorter than the prep round must fail the prove"
     );
 }
+
+/// ★ The preprocessed round can NEVER be taller than the FRI, so
+/// `reduce_iota_to_round`'s shift is never negative and no supplementary index
+/// derivation is needed for it.
+///
+/// This is a structural invariant of `EpochShape::derive`, not a property of any
+/// fixture: a table's preprocessed matrix is pushed with the SAME `h` that goes
+/// into `heights`, in the same loop iteration, so `prep.dims`'s heights are a
+/// SUBSET of `heights` — and `EpochShape::h_max` is the max over all of
+/// `heights`. A prep matrix at height H therefore implies a TABLE at height H,
+/// which puts the FRI's `h_max` at H or above.
+///
+/// Worth pinning because the obvious worry is wrong in an expensive direction.
+/// A preprocessed table can be enormous — the LFM machine's BITWISE is 2^20 rows
+/// in every registry entry — and it looks as though widening a preprocessed
+/// round to include it could push the round above a small epoch's FRI. It cannot:
+/// a preprocessed matrix only ever enters through a table that is itself in the
+/// epoch at that height. `reduce_iota_to_round` fails closed on the inverted
+/// case, so had this invariant not held, batched mode would have died on every
+/// affected epoch rather than gone wrong quietly.
+#[test_log::test]
+fn the_preprocessed_round_is_never_taller_than_the_fri() {
+    let options = folding_options();
+
+    // The preprocessed fixture, where the round is strictly SHORTER.
+    let (airs, _proof, lengths) = prove_preprocessed(None).expect("an honest preprocessed epoch");
+    let shape = shape_of(&airs, &lengths);
+    let prep_h = shape.prep.h_max().expect("non-empty");
+    assert!(
+        prep_h < shape.h_max(),
+        "this fixture is the strictly-shorter case (prep {prep_h}, fri {})",
+        shape.h_max()
+    );
+    assert!(
+        crate::batched::round4::reduce_iota_to_round(0, shape.h_max(), prep_h).is_some(),
+        "the reduction must be defined"
+    );
+
+    // ★ The equal case, which is the one a widened round produces: make the
+    // TALLEST table preprocessed. The round then reaches the FRI's own h_max and
+    // the shift is exactly zero — never negative.
+    let (cpu, add, mul) = traces();
+    let tall_airs = vec![
+        new_cpu_air_with_lookup(&options).with_preprocessed([5u8; 32], 2),
+        new_add_air_with_lookup(&options),
+        new_mul_air_with_lookup(&options),
+    ];
+    let _ = (cpu, add, mul);
+    let tall = shape_of(&tall_airs, &[8, 4, 4]);
+    let tall_prep_h = tall.prep.h_max().expect("CPU is preprocessed");
+    assert_eq!(
+        tall_prep_h,
+        tall.h_max(),
+        "a preprocessed tallest table puts the round AT the FRI's h_max"
+    );
+    assert_eq!(
+        crate::batched::round4::reduce_iota_to_round(7, tall.h_max(), tall_prep_h),
+        Some(7),
+        "and the reduction is then the identity, not a negative shift"
+    );
+
+    // The invariant itself, over both shapes.
+    for s in [&shape, &tall] {
+        assert!(
+            s.prep.h_max().is_none_or(|h| h <= s.h_max()),
+            "prep heights are a subset of table heights, so the round can never \
+             exceed the FRI"
+        );
+    }
+}
