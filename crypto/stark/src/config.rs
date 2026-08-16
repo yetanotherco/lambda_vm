@@ -246,6 +246,24 @@ pub trait StarkHash: Send + Sync + 'static {
 /// grinding seed is `transcript.state()`.
 pub type GrindingDigest<H> = <<H as StarkHash>::Transcript as TranscriptHash>::Digest;
 
+/// ★ The Fiat-Shamir transcript of the default configuration — the one the
+/// production prove and verify entry points must build.
+///
+/// `DefaultTranscript<F>`'s own type default is [`KeccakTranscriptHash`], and
+/// that default is NOT the configuration's. The two coincided while keccak was
+/// the only configuration, and a caller writing `DefaultTranscript::<E>::new(..)`
+/// after the flip gets a keccak sponge over BLAKE3 commitments — self-consistent
+/// between prover and verifier, and therefore silent, but a half-flip: the
+/// Fiat-Shamir hash would not have moved with the commitment hash.
+///
+/// `multi_prove` / `multi_verify` take `impl IsStarkTranscript`, so the type
+/// system cannot force this; naming the alias is what makes the production path
+/// follow [`DefaultStarkHash`] instead of a `derive`'s default.
+pub type DefaultStarkTranscript<F> = crypto::fiat_shamir::default_transcript::DefaultTranscript<
+    F,
+    <DefaultStarkHash as StarkHash>::Transcript,
+>;
+
 /// The keccak-256 configuration.
 ///
 /// Since the flip it is the default only under `cuda` (see [`DefaultStarkHash`]);

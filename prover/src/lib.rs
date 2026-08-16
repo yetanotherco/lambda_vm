@@ -30,7 +30,7 @@ pub mod tests;
 
 use std::fmt;
 
-use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+use stark::config::DefaultStarkTranscript;
 use crypto::fiat_shamir::is_transcript::IsTranscript;
 use executor::elf::Elf;
 use executor::vm::execution::Executor;
@@ -1023,7 +1023,7 @@ pub(crate) fn compute_expected_commit_bus_balance_view<'p>(
     proofs: impl ProofViewSource<'p, F, E, ()>,
     public_output_bytes: &[u8],
     start_index: u64,
-    transcript: &mut DefaultTranscript<E>,
+    transcript: &mut DefaultStarkTranscript<E>,
 ) -> Option<FieldElement<E>> {
     let (z, alpha) = replay_transcript_phase_a_view(airs, proofs, transcript);
     compute_commit_bus_offset(public_output_bytes, start_index, &z, &alpha)
@@ -1217,7 +1217,7 @@ pub fn prove_with_options_and_inputs(
 
     // Bind the full statement (program, public output, table layout) into the
     // Fiat-Shamir transcript so every challenge depends on it.
-    let mut transcript = DefaultTranscript::<E>::new(&[]);
+    let mut transcript = DefaultStarkTranscript::<E>::new(&[]);
     absorb_statement(
         &mut transcript,
         StatementKind::Monolithic,
@@ -1438,7 +1438,7 @@ fn verify_proof_parts(
     // Bind the statement into the verifier's transcript. A tampered statement
     // field makes this diverge from the prover's transcript state, so every
     // derived challenge differs and verification rejects.
-    let mut transcript = DefaultTranscript::<E>::new(&[]);
+    let mut transcript = DefaultStarkTranscript::<E>::new(&[]);
     absorb_statement_with_digest(
         &mut transcript,
         StatementKind::Monolithic,
