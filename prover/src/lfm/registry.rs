@@ -123,6 +123,28 @@ pub struct LfmArtifacts {
     pub prep_widths: [u16; NUM_LFM_CHIPS],
 }
 
+impl LfmArtifacts {
+    /// The widths a batched verifier needs for `prep`, or `None` when this
+    /// program's round does not cover it.
+    ///
+    /// This is the whole bridge between the registry's per-slot storage and the
+    /// contributing-matrix slice `stark::batched::shape::PinnedPrep` takes. The
+    /// slice is returned owned rather than as a `PinnedPrep`, because that type
+    /// borrows its widths and the caller has to own them for the duration of the
+    /// verify:
+    ///
+    /// ```ignore
+    /// let widths = artifacts.pinned_prep_widths(&shape.prep)?;
+    /// let pin = PinnedPrep { root: &artifacts.prep_root, widths: &widths };
+    /// ```
+    ///
+    /// ⚠ Today this returns `None` for every real LFM epoch — see
+    /// [`PREP_ROUND_SLOTS`]. That is the honest answer, not a stub.
+    pub fn pinned_prep_widths(&self, prep: &RoundShape) -> Option<Vec<usize>> {
+        pinned_prep_widths(prep, &self.prep_widths, self.keccak_rnd_chunks)
+    }
+}
+
 /// The slots the batched preprocessed round covers: the twelve
 /// program-dependent column groups (0–11).
 ///

@@ -4840,3 +4840,64 @@ fn the_width_compaction_follows_table_order_not_slot_order() {
          cannot tell the two orders apart"
     );
 }
+
+/// ★ M-7 end to end: a batched LFM epoch PROVES, and is then REFUSED, and the
+/// refusal is the round-coverage gap rather than anything else.
+///
+/// Splitting cause from symptom is the whole point. `verify_against_batched`
+/// returning `false` is compatible with a dozen unrelated bugs, so the cause is
+/// asserted independently: the epoch's preprocessed round contains matrices
+/// `PREP_ROUND_SLOTS` does not cover, so `pinned_prep_widths` refuses, and
+/// `multi_verify_batched` fails closed rather than trusting the proof's own root.
+///
+/// When the round is widened (M-8's prerequisite), THIS test is the one that
+/// must flip — and it should be flipped deliberately, not deleted.
+#[test]
+fn a_batched_lfm_epoch_is_refused_for_the_round_coverage_gap() {
+    use crate::lfm::airs::LfmAirs;
+    use crate::lfm::proof::{lfm_prove_batched, verify_against_batched};
+    use crate::lfm::registry::PREP_ROUND_SLOTS;
+    use stark::batched::shape::EpochShape;
+
+    let opts = options();
+    let program = trivial_program();
+    let artifacts = build_artifacts(&program, &opts);
+
+    // It PROVES. The prover's disposition of an unpinned round is permissive,
+    // which is what makes the verifier's refusal below a statement about the
+    // verifier and not about a prove that never happened.
+    let proved = lfm_prove_batched(&program, &artifacts, &arenas(), &opts, None)
+        .expect("a batched LFM epoch must prove");
+
+    // THE CAUSE: the epoch's prep round reaches past the round's slots.
+    let airs = LfmAirs::new_with_hasher(
+        &artifacts.roots,
+        &opts,
+        artifacts.keccak_rnd_chunks,
+        artifacts.hasher,
+    );
+    let refs = airs.air_refs();
+    let lengths: Vec<usize> = proved.proof.tables.iter().map(|t| t.trace_length).collect();
+    let (shape, _) = EpochShape::derive(&refs, &lengths).expect("a well-shaped epoch");
+
+    assert!(
+        shape.prep.tables.len() > PREP_ROUND_SLOTS.len(),
+        "the epoch's preprocessed round ({} matrices) must reach past the round's \
+         {} slots — KECCAK_RC and BITWISE are preprocessed AIRs; if this ever \
+         stops holding, the round was widened and this whole test should flip",
+        shape.prep.tables.len(),
+        PREP_ROUND_SLOTS.len()
+    );
+    assert_eq!(
+        artifacts.pinned_prep_widths(&shape.prep),
+        None,
+        "so the compaction must refuse"
+    );
+
+    // THE SYMPTOM.
+    assert!(
+        !verify_against_batched(&artifacts, &proved.proof, &proved.public_words, &opts),
+        "and the verifier must fail closed rather than trust the proof's own \
+         preprocessed root"
+    );
+}

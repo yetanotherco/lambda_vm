@@ -10,6 +10,10 @@
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use math::field::element::FieldElement;
 use math::field::traits::IsPrimeField;
+use stark::batched::proof::BatchedMultiProof;
+use stark::batched::prover::multi_prove_batched;
+use stark::batched::shape::{EpochShape, PinnedPrep};
+use stark::batched::verifier::{multi_verify_batched, replay_epoch_transcript};
 use stark::config::Commitment;
 use stark::proof::options::ProofOptions;
 use stark::proof::stark::MultiProof;
@@ -320,5 +324,182 @@ fn expected_public_balance(
         fingerprints
             .iter()
             .fold(FieldElement::<E>::zero(), |acc, t| acc + t),
+    )
+}
+
+// ===========================================================================
+// The batched path (M-7)
+// ===========================================================================
+//
+// The per-table entry points above stay the default everywhere: `lfm_prove` /
+// `lfm_verify` go through `multi_prove` / `multi_verify_views` under keccak, and
+// nothing below changes that. These are siblings, not a mode switch, because a
+// batched epoch proof is a DIFFERENT wire type (`BatchedMultiProof`) rather than
+// the same proof verified differently — an `Option` on the existing signatures
+// would have been a lie about what varies.
+
+/// Proves an LFM program as ONE batched epoch.
+///
+/// `expected_prep` is the registry's preprocessed pin, threaded straight to
+/// `multi_prove_batched`. `None` is permitted here and is how a root is
+/// generated in the first place; see `stark::batched::shape::PinnedPrep` for why
+/// the verifier's disposition of `None` is the opposite.
+pub fn lfm_prove_batched(
+    program: &LfmProgram,
+    artifacts: &LfmArtifacts,
+    arenas: &[Vec<LfmWord>],
+    options: &ProofOptions,
+    expected_prep: Option<PinnedPrep<'_>>,
+) -> Result<BatchedLfmProof, LfmProveError> {
+    let hasher = artifacts.hasher;
+    let exec = execute(program, arenas, &hasher).map_err(LfmProveError::Exec)?;
+    let mut traces = build_traces_with_hasher(program, &exec.records, hasher);
+
+    let airs = LfmAirs::new_with_hasher(
+        &artifacts.roots,
+        options,
+        artifacts.keccak_rnd_chunks,
+        hasher,
+    );
+    let mut transcript = DefaultTranscript::<E>::new(&[]);
+    absorb_lfm_statement(
+        &mut transcript,
+        &artifacts.program_id,
+        &exec.public_words,
+        options.fri_final_poly_log_degree,
+    );
+
+    let (proof, _stats) =
+        multi_prove_batched::<F, E, (), stark::config::KeccakStarkHash, Prover<F, E, ()>>(
+            airs.air_trace_pairs(&mut traces),
+            &mut transcript,
+            expected_prep,
+            #[cfg(feature = "disk-spill")]
+            crate::auto_storage::decide_lfm(),
+            decide_lfm_residency(),
+        )
+        .map_err(LfmProveError::Prover)?;
+
+    Ok(BatchedLfmProof {
+        proof,
+        public_words: exec.public_words,
+    })
+}
+
+/// An LFM epoch proved through the batched commitment path.
+pub struct BatchedLfmProof {
+    pub proof: BatchedMultiProof<F, E, ()>,
+    pub public_words: Vec<(u32, LfmWord)>,
+}
+
+/// [`lfm_verify`] for a batched epoch proof.
+///
+/// `Err` = registry miss (the hard, no-fallback path, same as `lfm_verify`).
+/// `Ok(false)` = invalid proof, claimed-public mismatch, **or a preprocessed
+/// round this program's pin does not cover** — see [`verify_against_batched`],
+/// which is where that last case is decided and why it is currently the
+/// answer for every real LFM epoch.
+pub fn lfm_verify_batched(
+    kind: LfmProgramKind,
+    proof: &BatchedMultiProof<F, E, ()>,
+    claimed_public: &[(u32, LfmWord)],
+    options: &ProofOptions,
+) -> Result<bool, LfmRegistryError> {
+    let entry = resolve(kind, options.blowup_factor)?;
+    Ok(verify_against_batched(
+        &LfmArtifacts {
+            roots: entry.roots,
+            log_heights: entry.log_heights,
+            keccak_rnd_chunks: entry.keccak_rnd_chunks,
+            hasher: entry.hasher,
+            program_id: entry.program_id,
+            prep_root: entry.prep_root,
+            prep_widths: entry.prep_widths,
+        },
+        proof,
+        claimed_public,
+        options,
+    ))
+}
+
+/// Verifies a batched epoch against supplied artifacts.
+///
+/// # The preprocessed pin, and why this refuses today
+///
+/// `multi_verify_batched` FAILS CLOSED on an unpinned preprocessed round: an
+/// epoch whose AIR set has preprocessed tables and no pinned root is rejected,
+/// because the only root left to compare against would be the prover's own.
+/// The LFM AIR set has fourteen preprocessed matrices — the twelve program
+/// groups plus `KECCAK_RC` and `BITWISE` — while `PREP_ROUND_SLOTS` covers
+/// twelve, so `pinned_prep_widths` returns `None` and this returns `false`.
+///
+/// That is deliberate and it is the correct answer. Passing `None` through would
+/// mean verifying the preprocessed content against the prover's claim, and
+/// passing a twelve-entry slice would describe a different round than
+/// `prep_root` commits. Widening the round is M-8's prerequisite; until then a
+/// batched LFM epoch is provable but not verifiable, and
+/// `a_batched_lfm_epoch_is_refused_for_the_round_coverage_gap` pins exactly that
+/// with the cause separated from the symptom.
+pub fn verify_against_batched(
+    artifacts: &LfmArtifacts,
+    proof: &BatchedMultiProof<F, E, ()>,
+    claimed_public: &[(u32, LfmWord)],
+    options: &ProofOptions,
+) -> bool {
+    if artifacts.keccak_rnd_chunks == 0 {
+        return false;
+    }
+    let airs = LfmAirs::new_with_hasher(
+        &artifacts.roots,
+        options,
+        artifacts.keccak_rnd_chunks,
+        artifacts.hasher,
+    );
+    let refs = airs.air_refs();
+    if refs.len() != num_lfm_airs(artifacts.keccak_rnd_chunks) {
+        return false;
+    }
+
+    let trace_lengths: Vec<usize> = proof.tables.iter().map(|t| t.trace_length).collect();
+    let Ok((shape, _params)) = EpochShape::derive(&refs, &trace_lengths) else {
+        return false;
+    };
+    let Some(widths) = artifacts.pinned_prep_widths(&shape.prep) else {
+        return false;
+    };
+    let pin = PinnedPrep {
+        root: &artifacts.prep_root,
+        widths: &widths,
+    };
+
+    let mut transcript = DefaultTranscript::<E>::new(&[]);
+    absorb_lfm_statement(
+        &mut transcript,
+        &artifacts.program_id,
+        claimed_public,
+        options.fri_final_poly_log_degree,
+    );
+    // The batched transcript draws the shared LogUp challenges itself, after the
+    // shape histogram and the prep/main roots, so they are recovered by
+    // replaying the EPOCH on a fork — not by the per-table Phase A walk, which
+    // absorbs per-table roots this path never sends. `LOGUP_NUM_CHALLENGES == 2`
+    // and they are `(z, alpha)`, the same pair the per-table path samples.
+    let mut replay = transcript.clone();
+    let Some((_, _, challenges)) = replay_epoch_transcript(&refs, proof, &mut replay) else {
+        return false;
+    };
+    let [z, alpha] = challenges.lookup.as_slice() else {
+        return false;
+    };
+    let Some(expected) = expected_public_balance(claimed_public, z, alpha) else {
+        return false;
+    };
+
+    multi_verify_batched::<F, E, (), stark::config::KeccakStarkHash, Verifier<F, E, ()>, _>(
+        &refs,
+        proof,
+        &mut transcript,
+        &expected,
+        Some(pin),
     )
 }
