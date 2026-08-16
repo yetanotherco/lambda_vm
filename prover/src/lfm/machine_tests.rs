@@ -4901,3 +4901,103 @@ fn a_batched_lfm_epoch_is_refused_for_the_round_coverage_gap() {
          preprocessed root"
     );
 }
+
+/// The shape a batched verifier reads back must be the shape the round was
+/// built with. Two derivations of the same thing are how the LDE-vs-trace
+/// height distinction gets lost: `prep_round_dims` is one function with two
+/// callers precisely so this can be asserted rather than hoped for.
+#[test]
+fn the_prep_round_shape_matches_what_was_committed() {
+    use crate::lfm::commit::PrepRoundBuilder;
+    use crate::lfm::commit::{group_columns, lde_columns};
+    use crate::lfm::registry::PREP_ROUND_SLOTS;
+
+    let opts = options();
+    let program = trivial_program();
+    let artifacts = build_artifacts(&program, &opts);
+    let (heights, widths) = artifacts.prep_round_shape(opts.blowup_factor);
+
+    assert_eq!(heights.len(), widths.len());
+    assert_eq!(
+        heights.len(),
+        PREP_ROUND_SLOTS.len(),
+        "every program group participates in this fixture"
+    );
+
+    // Heights are LDE heights, not trace heights — the distinction this shape
+    // exists to get right.
+    let blowup_log = (opts.blowup_factor as usize).trailing_zeros() as usize;
+    for (i, slot) in PREP_ROUND_SLOTS.enumerate() {
+        assert_eq!(
+            heights[i],
+            artifacts.log_heights[slot] as usize + blowup_log,
+            "slot {slot}: the round's height must be the LDE height"
+        );
+    }
+
+    // And rebuilding the round from that shape reproduces the pinned root.
+    let groups = [
+        &program.groups.const_,
+        &program.groups.balu,
+        &program.groups.xalu,
+        &program.groups.select,
+        &program.groups.bitdec,
+        &program.groups.hash,
+        &program.groups.keccak,
+        &program.groups.lanes,
+        &program.groups.hint,
+        &program.groups.public,
+        &crate::lfm::trace::range_group(),
+        &program.groups.blake3,
+    ];
+    let dims: Vec<(usize, usize)> = heights
+        .iter()
+        .copied()
+        .zip(widths.iter().copied())
+        .collect();
+    let mut round = PrepRoundBuilder::new(&dims);
+    for g in groups.iter() {
+        round.absorb(&lde_columns(&group_columns(g), &opts));
+    }
+    assert_eq!(
+        round.finish(),
+        artifacts.prep_root,
+        "the shape a verifier reads back must rebuild the pinned root"
+    );
+}
+
+/// M-7's entry point must agree with the seven-argument form it delegates to —
+/// on an honest proof, and on a tampered digest. Without the negative this
+/// would pass for a function that returned `true` unconditionally.
+#[test]
+fn verify_against_artifacts_agrees_with_the_registry_path() {
+    use crate::lfm::verify_against_artifacts;
+
+    let opts = options();
+    let program = trivial_program();
+    let artifacts = build_artifacts(&program, &opts);
+    let proved = lfm_prove(&program, &artifacts, &arenas(), &opts)
+        .expect("the trivial program must prove");
+
+    assert!(
+        verify_against_artifacts(&artifacts, &proved.proof, &proved.public_words, &opts),
+        "honest-path control: artifacts built from the program must verify its proof"
+    );
+    assert!(
+        lfm_verify(
+            LfmProgramKind::TrivialV0,
+            &proved.proof,
+            &proved.public_words,
+            &opts
+        )
+        .expect("TrivialV0@2 is registered"),
+        "and the registry path must agree"
+    );
+
+    let mut wrong = artifacts;
+    wrong.program_id[0] ^= 0xff;
+    assert!(
+        !verify_against_artifacts(&wrong, &proved.proof, &proved.public_words, &opts),
+        "a program digest the proof was not bound to must be rejected"
+    );
+}

@@ -235,6 +235,45 @@ pub fn lfm_verify(
     ))
 }
 
+/// [`verify_against`] driven by a whole [`LfmArtifacts`].
+///
+/// # Why this exists
+///
+/// `verify_against` takes seven separate pieces of program shape, so every new
+/// thing the registry pins would change its signature and every call site with
+/// it. Taking the struct means a field added to `LfmArtifacts` reaches the
+/// verifier without moving anyone — `prep_root` and `prep_widths` (M-6) were the
+/// first, and `prover/tests/d0_king_gate.rs` compiles unchanged across their
+/// arrival because of it.
+///
+/// # ⚠ What it does NOT do yet
+///
+/// It does not check `prep_root`. The LFM machine proves and verifies a
+/// per-table [`MultiProof`], whose openings are authenticated against the
+/// per-slot `roots`; the batched preprocessed round is a commitment to the same
+/// matrices that only a verifier reading a `BatchedMultiProof` can use
+/// (`stark::batched::verifier`). Until the machine switches paths, this is
+/// plumbing ahead of its consumer, and saying otherwise would overstate what a
+/// passing verification means.
+///
+/// The shape that consumer will need is [`LfmArtifacts::prep_round_shape`].
+pub fn verify_against_artifacts(
+    artifacts: &LfmArtifacts,
+    proof: &MultiProof<F, E, ()>,
+    claimed_public: &[(u32, LfmWord)],
+    options: &ProofOptions,
+) -> bool {
+    verify_against(
+        &artifacts.roots,
+        &artifacts.program_id,
+        artifacts.keccak_rnd_chunks,
+        proof,
+        claimed_public,
+        options,
+        artifacts.hasher,
+    )
+}
+
 /// Verifies against a supplied root vector, program digest, `KECCAK_RND` chunk
 /// count and hasher instead of a registry entry.
 ///

@@ -195,8 +195,20 @@ pub fn prep_round_dims(
 ) -> Vec<(usize, usize)> {
     let blowup_log = (blowup_factor as usize).trailing_zeros() as usize;
     PREP_ROUND_SLOTS
-        .filter(|&i| prep_widths[i] > 0)
         .map(|i| {
+            // Membership is PREP_ROUND_SLOTS and nothing else. An earlier draft
+            // wrote `.filter(|&i| prep_widths[i] > 0)` here, which is a SECOND
+            // derivation of the round's membership competing with the slot range
+            // above and with `pinned_prep_widths`'s indexing of
+            // `RoundShape::tables`. A member with no columns is a broken registry
+            // entry, not a slot to skip quietly: skipping it would shorten the
+            // declared round, shift every later matrix's position in the tree,
+            // and still build — the failure mode MMCS-PLAN §3.3 warns about,
+            // where prover and verifier agree on the same wrong shape.
+            assert!(
+                prep_widths[i] > 0,
+                "slot {i} is in PREP_ROUND_SLOTS but carries no committed columns"
+            );
             (
                 log_heights[i] as usize + blowup_log,
                 prep_widths[i] as usize,

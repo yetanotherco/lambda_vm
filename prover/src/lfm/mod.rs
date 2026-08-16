@@ -56,12 +56,12 @@ pub mod word;
 pub use airs::{LfmAirs, NUM_LFM_CHIPS, num_lfm_airs};
 pub use builder::{ArenaSchema, LfmBuilder, LfmProgramSource};
 pub use chunking::{KECCAK_RND_MAX_CHUNK_ROWS, KeccakChunking};
-pub use commit::{commit_columns, commit_group};
+pub use commit::{PrepRoundBuilder, commit_columns, commit_group, commit_lde_columns, lde_columns};
 pub use compiler::{ColumnGroup, LfmColumnGroups, LfmProgram, compile};
 pub use executor::{LfmExecError, LfmExecution, LfmRecords, execute};
 pub use hash::{HasherKind, LfmHasher, TestPermutation};
 pub use instr::{Addr, ArenaId, BaseOp, ExtOp, HashMode, Instr};
-pub use proof::{LfmProof, LfmProveError, lfm_prove, lfm_verify};
+pub use proof::{LfmProof, LfmProveError, lfm_prove, lfm_verify, verify_against_artifacts};
 pub use registry::{
     LFM_REGISTRY, LfmArtifacts, LfmProgramKind, LfmRegistryEntry, LfmRegistryError,
     build_artifacts, build_artifacts_with_hasher, resolve,
