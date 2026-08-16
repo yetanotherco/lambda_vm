@@ -684,14 +684,25 @@ clippy:
 	cargo clippy --workspace --all-targets -- -D warnings -A clippy::op_ref
 	cargo clippy --workspace --all-targets --no-default-features --features lambda-vm-prover/debug-checks -- -D warnings -A clippy::op_ref
 	cargo clippy --workspace --all-targets --features lambda-vm-prover/disk-spill -- -D warnings -A clippy::op_ref
-	# BLAKE3 at 6 rounds. ONE pass, with BOTH crates' features set, because they
-	# are separate features that must be set in lockstep: crypto's moves the host
-	# primitive (the LFM chip, the socket and the commitment backends all read its
-	# BLAKE3_ROUNDS) and math-cuda's recompiles the cubin. Setting one alone means
-	# a GPU tree committing under a different hash than the CPU one, so linting
-	# them apart would certify a combination nothing should ever build. The
-	# prover's feature forwards to crypto's, so naming it covers both host halves.
-	cargo clippy --workspace --all-targets --features lambda-vm-prover/blake3-6round,math-cuda/blake3-6round -- -D warnings -A clippy::op_ref
+	# BLAKE3 at SEVEN rounds — the standard, externally anchored arm.
+	#
+	# This pass used to be the six-round one. Six is the default now (P-a Stage 6
+	# put the commitment aliases on BLAKE3, and every blessed constant is six), so
+	# the pass that needs writing down is the other one: without this, nothing in
+	# the matrix compiles `hash::blake3` at seven and the arm the KATs anchor
+	# against could rot unnoticed.
+	#
+	# Scoped to `crypto`, and it has to be. A workspace-level
+	# `--no-default-features` does NOT turn six off: `lambda-vm-prover` depends on
+	# `crypto` with default features, and feature unification takes the union, so
+	# the flag applies to the packages and the dependency edge puts it back. Only
+	# building `crypto` alone leaves the edge out of the graph.
+	#
+	# The lockstep between `crypto`'s knob and `math-cuda`'s (host primitive vs
+	# compiled cubin) still holds and is now expressed as both defaulting to six,
+	# which `math_cuda::blake3::device_rounds` makes assertable rather than
+	# discoverable as a wrong root.
+	cargo clippy -p crypto --all-targets --no-default-features --features std,asm -- -D warnings -A clippy::op_ref
 
 fmt:
 	cargo fmt --all
@@ -702,14 +713,25 @@ lint:
 	cargo clippy --workspace --all-targets -- -D warnings -A clippy::op_ref
 	cargo clippy --workspace --all-targets --no-default-features --features lambda-vm-prover/debug-checks -- -D warnings -A clippy::op_ref
 	cargo clippy --workspace --all-targets --features lambda-vm-prover/disk-spill -- -D warnings -A clippy::op_ref
-	# BLAKE3 at 6 rounds. ONE pass, with BOTH crates' features set, because they
-	# are separate features that must be set in lockstep: crypto's moves the host
-	# primitive (the LFM chip, the socket and the commitment backends all read its
-	# BLAKE3_ROUNDS) and math-cuda's recompiles the cubin. Setting one alone means
-	# a GPU tree committing under a different hash than the CPU one, so linting
-	# them apart would certify a combination nothing should ever build. The
-	# prover's feature forwards to crypto's, so naming it covers both host halves.
-	cargo clippy --workspace --all-targets --features lambda-vm-prover/blake3-6round,math-cuda/blake3-6round -- -D warnings -A clippy::op_ref
+	# BLAKE3 at SEVEN rounds — the standard, externally anchored arm.
+	#
+	# This pass used to be the six-round one. Six is the default now (P-a Stage 6
+	# put the commitment aliases on BLAKE3, and every blessed constant is six), so
+	# the pass that needs writing down is the other one: without this, nothing in
+	# the matrix compiles `hash::blake3` at seven and the arm the KATs anchor
+	# against could rot unnoticed.
+	#
+	# Scoped to `crypto`, and it has to be. A workspace-level
+	# `--no-default-features` does NOT turn six off: `lambda-vm-prover` depends on
+	# `crypto` with default features, and feature unification takes the union, so
+	# the flag applies to the packages and the dependency edge puts it back. Only
+	# building `crypto` alone leaves the edge out of the graph.
+	#
+	# The lockstep between `crypto`'s knob and `math-cuda`'s (host primitive vs
+	# compiled cubin) still holds and is now expressed as both defaulting to six,
+	# which `math_cuda::blake3::device_rounds` makes assertable rather than
+	# discoverable as a wrong root.
+	cargo clippy -p crypto --all-targets --no-default-features --features std,asm -- -D warnings -A clippy::op_ref
 	# The cuda feature gates whole modules + cuda-only integration tests. build.rs emits empty
 	# cubin stubs when nvcc is absent, so this checks on a GPU-less host (CI lint runner, dev laptop)
 	# too — no GPU required. Catches cuda-gated breakage that the non-cuda passes above miss.
