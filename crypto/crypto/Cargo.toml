@@ -46,7 +46,7 @@ blake3 = { version = "1.8.5", default-features = false, features = [
 ] }
 
 [features]
-default = ["asm", "std"]
+default = ["asm", "std", "blake3-6round"]
 asm = ["sha3/asm"]
 std = ["math/std", "sha3/std", "serde?/std"]
 serde = ["dep:serde"]
@@ -58,6 +58,19 @@ rkyv = ["dep:rkyv", "math/rkyv"]
 # one. Off = 7 rounds: standard BLAKE3, externally anchored, carrying no
 # unratified assumption. DO NOT INVERT THE POLARITY — every existing measurement
 # and the A6R sign-off read "7-round instantiated baseline, 6 behind the feature".
+#
+# ★ IT IS NOW ON BY DEFAULT, and the polarity above is unchanged by that: the
+# feature still means "6 rounds", it is simply what the default build selects.
+# The reason is P-a Stage 6 — the commitment aliases moved to BLAKE3, and the
+# shipping round count is 6 (PA-PLAN §1.5), so a default build that did not
+# carry this would commit seven-round roots that no blessed constant matches.
+# `stark::config`'s round-count assertion turns that into a compile error rather
+# than a drift failure, so the two cannot come apart quietly.
+#
+# What this costs: a dependent using `default-features = false` on THIS crate
+# silently drops to 7 rounds. That is the standard additive-features hazard and
+# the assertion is what catches it; nothing in this workspace does it (the
+# recursion guest disables `lambda-vm-prover`'s defaults, not this crate's).
 #
 # This is the host tree's single round-count knob: `lambda-vm-prover`'s feature
 # of the same name forwards to it, so the `LFM_BLAKE3` chip, the `LFM_HASH`

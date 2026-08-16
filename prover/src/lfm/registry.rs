@@ -12,7 +12,7 @@
 //! fallback that recomputes or skips. The registry check is the soundness
 //! argument's first premise (see `SOUNDNESS.md`).
 
-use stark::config::{Commitment, CommitmentHash};
+use stark::config::Commitment;
 use stark::proof::options::ProofOptions;
 
 use crate::tables::{bitwise, keccak_rc};
@@ -132,11 +132,11 @@ pub struct LfmArtifacts {
 /// `the_blake3_choice_moves_the_program_digest_and_no_root`.
 ///
 /// That is a statement about the machine's *own* hash, not about the hash these
-/// roots are built with. The two are separate axes today and the second one is
-/// not chosen here; see [`build_artifacts_with_hasher`]'s guard for what keeps
-/// them separate. If the machine's hash ever also selects the commitment scheme
-/// the roots are committed under, every root above moves with it and the tag on
-/// its own stops being the whole binding.
+/// roots are built with. The two are separate axes and both are now named in
+/// `program_id` — see [`build_artifacts_with_hasher`]. If the machine's hash
+/// ever also selects the commitment scheme the roots are committed under, every
+/// root above moves with it and the tag on its own stops being the whole
+/// binding.
 pub fn build_artifacts(program: &LfmProgram, options: &ProofOptions) -> LfmArtifacts {
     build_artifacts_with_hasher(program, options, HasherKind::default())
 }
@@ -149,61 +149,35 @@ pub fn build_artifacts(program: &LfmProgram, options: &ProofOptions) -> LfmArtif
 /// prove/verify paths that read `LfmArtifacts` cannot pair one hasher's digest
 /// with another hasher's AIR set.
 ///
-/// # What `hasher` does not say
+/// # `hasher` and the commitment hash are two axes, and both are named
 ///
-/// `hasher` names the `LFM_HASH` chip the machine runs. It says nothing about
-/// the hash the roots below are built with: `commit_group` and the two
+/// `hasher` names the `LFM_HASH` chip the machine RUNS. The hash the roots below
+/// are BUILT with is a different question: `commit_group` and the two
 /// `preprocessed_commitment` helpers all commit through `stark`'s Merkle layer,
-/// which is pinned to [`CommitmentHash::Keccak256`]. So under
-/// `HasherKind::Blake3` this returns keccak-built roots inside artifacts that
-/// name Blake3 — honest only because the name makes no claim about them.
+/// i.e. under whatever [`stark::config::COMMITMENT_HASH`] names — BLAKE3 since
+/// the P-a flip, keccak on a `cuda` build.
 ///
-/// The `match` below is what keeps it honest. It is exhaustive over
-/// [`CommitmentHash`], so the change that gives `stark` a second commitment
-/// hash cannot compile until someone decides here what the artifacts should say
-/// — rather than inheriting a digest that names one hash over roots built with
-/// another, which nothing downstream would catch.
+/// Both are folded into `program_id` (see [`lfm_program_id`]), which is what
+/// discharges the compile-time guard this function used to carry. That guard
+/// refused to compile once `stark` gained a second commitment hash, on the
+/// grounds that artifacts naming one hash over roots built with another is a
+/// claim nothing downstream would check. Naming the second axis is the decision
+/// it was holding out for: the artifacts now say which hash built the roots, so
+/// there is no unstated claim left to be wrong about.
+///
+/// What is deliberately NOT done: making this function generic over `H` and
+/// reading `H::COMMITMENT_HASH`. That was PA-PLAN §6.0's suggested mechanism,
+/// and the mechanism is what changed, not the decision. The three commit helpers
+/// are hard-wired to the default aliases by design — they commit *production*
+/// tables — so the global const is the truthful name for their output, while an
+/// `H` parameter would introduce exactly one new way to be wrong: artifacts
+/// naming an `H` the helpers did not use. If those helpers are ever threaded,
+/// this read moves with them and the parameter becomes worth its cost.
 pub fn build_artifacts_with_hasher(
     program: &LfmProgram,
     options: &ProofOptions,
     hasher: HasherKind,
 ) -> LfmArtifacts {
-    // Exhaustive on purpose — see the doc above. Not a runtime check: today
-    // every arm of `hasher` is legitimately paired with keccak roots.
-    //
-    // `CommitmentHash::Blake3` now exists (P-a Stage 1), and this is the
-    // decision the doc above says has to be taken here rather than inherited.
-    //
-    // The decision: the guard stays pointed at the ALIASES, and the Blake3 arm
-    // is a hard stop rather than an accepted case. `COMMITMENT_HASH` describes
-    // the default configuration, and the three helpers below — `commit_group`
-    // and the two `preprocessed_commitment`s — are hard-wired to the aliases, so
-    // while the aliases are keccak this function's roots are keccak and the doc
-    // above is true as written. If the aliases ever move, those roots change
-    // hash and `program_id`'s meaning changes with them: the digest folds in the
-    // `hasher` tag but says nothing about the commitment hash, so two builds
-    // committing under different hashes would give the same program the same
-    // `program_id`. That has to be decided, not defaulted.
-    //
-    // It is not claimed this arm is the FIRST thing to fail when the aliases
-    // move — `stark::config`'s own `assert_keccak_backend` and the
-    // `COMMITMENT_HASH`-to-`KeccakStarkHash` pin sit in front of it and were
-    // observed to fire first. It is the one that fails for THIS crate's reason,
-    // and it is what makes the decision unskippable once those are dealt with.
-    //
-    // What this still does not catch, unchanged: a prover running under an
-    // explicit `Blake3StarkHash` while the aliases stay keccak. The const is
-    // global, the configuration is per-type. Closing that means making this
-    // function generic over `H` and reading `H::COMMITMENT_HASH` — Stage 5 work,
-    // recorded in PA-PLAN §4.2 and in `stark::config::COMMITMENT_HASH`'s doc.
-    const _: () = match stark::config::COMMITMENT_HASH {
-        CommitmentHash::Keccak256 => (),
-        CommitmentHash::Blake3 => panic!(
-            "the commitment aliases moved to BLAKE3: decide what LfmArtifacts \
-             should say about program_id before letting this build through"
-        ),
-    };
-
     let range = range_group();
     let groups = [
         &program.groups.const_,

@@ -4,11 +4,36 @@
 //! instructions, same column groups, same digest — which is what lets the
 //! registry pin it and the drift tests recompute it on every PR. Arena
 //! *values* vary per proof; the program (and its identity) never does.
+//!
+//! # The wrap hash is named at every constructor that has one
+//!
+//! `WrapHash::default()` is `Keccak` and stays that way: it is the *unset*
+//! value, not the production one. Letting production be inherited from a
+//! `derive` three files away is the shape that made the P-a flip a twenty-site
+//! audit (PA-PLAN §6.0, finding rev-emit E3), so every constructor here that
+//! emits a hash says which one, and the exceptions read as exceptions rather
+//! than as omissions:
+//!
+//! - [`keccak_chain_program_source`], [`keccak_sponge_program_source`] and
+//!   [`keccak_sample_program_source`] are instruments ABOUT keccak (R1b/R1c/R1d).
+//!   A BLAKE3 twin would be a new program and a new registry row, never a
+//!   re-blessing of one of these.
+//! - ★ [`program_id_program_source`] mirrors `recursion::program_id_from_digest`,
+//!   which names `PlatformKeccak256`. It is the attestation join: it must
+//!   compute what the host computes, and the host's program-identity digest is
+//!   keccak whatever the commitment hash is. Staying keccak is the binding, not
+//!   an oversight to be tidied later.
+//!
+//! Constructors that emit no hash name nothing, because a hash they never
+//! compute is not a property they have: `trivial`, `fri_toy`, `lde_probe`,
+//! `l2g_binding` (word equality only), and `permute_coverage` (which drives the
+//! `LFM_HASH` socket — a different axis entirely).
 
 use crate::tables::types::{FE, FEE};
 
 use super::builder::{Cell, LfmBuilder, LfmProgramSource};
 use super::compiler::{LfmProgram, compile};
+use super::edsl::WrapHash;
 
 /// The Milestone-B trivial program: a few hundred instructions exercising
 /// every chip — constants, base ALU (incl. the assert lowering), Fp3 ALU,
@@ -128,7 +153,7 @@ pub const KECCAK_CHAIN_ARENA_WORDS: u32 = super::layout::keccak::NUM_WORDS as u3
 /// the halves it produces are canonical `u32`s and the state's two unused top
 /// lanes come back zero — no repacking instruction in between.
 pub fn keccak_chain_program_source() -> LfmProgramSource {
-    let mut b = LfmBuilder::new();
+    let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::Keccak);
 
     let arena = b.declare_arena(KECCAK_CHAIN_ARENA_WORDS);
     let state: [Cell; 13] = core::array::from_fn(|i| b.hint_word(arena, i as u32));
@@ -164,7 +189,7 @@ pub const KECCAK_SPONGE_LEN: usize = 202;
 /// Length is program shape, not data: a straight-line machine has no loops, so
 /// each length compiles to its own program and its own identity.
 pub fn keccak_sponge_program_source(len_bytes: usize) -> LfmProgramSource {
-    let mut b = LfmBuilder::new();
+    let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::Keccak);
     let num_halves = super::keccak_host::num_stream_halves(len_bytes) as u32;
     let arena = b.declare_arena(num_halves);
     let stream: Vec<_> = (0..num_halves).map(|i| b.hint_felt(arena, i)).collect();
@@ -188,7 +213,7 @@ pub fn keccak_sponge_program(len_bytes: usize) -> LfmProgram {
 /// instrument, and adding registry rows is its own decision — `resolve` keys on
 /// `(kind, blowup_factor)` alone, so rows are not a free-form extension point.
 pub fn blake3_sponge_program_source(len_bytes: usize) -> LfmProgramSource {
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::Blake3);
+    let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::Blake3);
     let num_halves = super::keccak_host::num_stream_halves(len_bytes) as u32;
     let arena = b.declare_arena(num_halves);
     let stream: Vec<_> = (0..num_halves).map(|i| b.hint_felt(arena, i)).collect();
@@ -209,7 +234,7 @@ pub fn blake3_sponge_program(len_bytes: usize) -> LfmProgram {
 /// This is the R1d groundwork that is independent of the #841 revision:
 /// `sample()` itself is unchanged between them.
 pub fn keccak_sample_program_source(len_bytes: usize) -> LfmProgramSource {
-    let mut b = LfmBuilder::new();
+    let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::Keccak);
     let num_halves = super::keccak_host::num_stream_halves(len_bytes) as u32;
     let arena = b.declare_arena(num_halves);
     let stream: Vec<_> = (0..num_halves).map(|i| b.hint_felt(arena, i)).collect();
@@ -275,7 +300,7 @@ pub fn transcript_replay_program_source() -> LfmProgramSource {
 
     let halves_a = TRANSCRIPT_ABSORB_A / super::keccak_host::BYTES_PER_HALF;
 
-    let mut b = LfmBuilder::new();
+    let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::Blake3);
     let arena = b.declare_arena(TRANSCRIPT_ARENA_HALVES);
     let halves: Vec<Felt> = (0..TRANSCRIPT_ARENA_HALVES)
         .map(|i| b.hint_felt(arena, i))
@@ -320,7 +345,7 @@ pub fn transcript_absorb_digest_program_source(len_bytes: usize) -> LfmProgramSo
     use super::builder::Felt;
     use super::transcript_replay::TranscriptReplay;
 
-    let mut b = LfmBuilder::new();
+    let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::Blake3);
     let num_halves = super::keccak_host::num_stream_halves(len_bytes) as u32;
     let arena = b.declare_arena(num_halves);
     let stream: Vec<Felt> = (0..num_halves).map(|i| b.hint_felt(arena, i)).collect();
@@ -349,7 +374,7 @@ pub fn transcript_absorb_digest_program(len_bytes: usize) -> LfmProgram {
 pub fn append_felt_program_source() -> LfmProgramSource {
     use super::transcript_replay::TranscriptReplay;
 
-    let mut b = LfmBuilder::new();
+    let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::Blake3);
     let arena = b.declare_arena(1);
     let v = b.hint_felt(arena, 0);
     let mut t = TranscriptReplay::new(TRANSCRIPT_SEED);
@@ -370,7 +395,7 @@ pub fn append_ext_program_source() -> LfmProgramSource {
     use super::builder::Felt;
     use super::transcript_replay::TranscriptReplay;
 
-    let mut b = LfmBuilder::new();
+    let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::Blake3);
     let arena = b.declare_arena(3);
     let coords: [Felt; 3] = core::array::from_fn(|i| b.hint_felt(arena, i as u32));
     let mut t = TranscriptReplay::new(TRANSCRIPT_SEED);
@@ -409,7 +434,7 @@ pub fn splice_program_source(prefix_len: usize, num_halves: u32) -> LfmProgramSo
     use super::builder::Felt;
     use super::transcript_replay::TranscriptReplay;
 
-    let mut b = LfmBuilder::new();
+    let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::Blake3);
     let arena = b.declare_arena(num_halves);
     let halves: Vec<Felt> = (0..num_halves).map(|i| b.hint_felt(arena, i)).collect();
     let mut t = TranscriptReplay::new(&splice_prefix(prefix_len));
@@ -443,7 +468,7 @@ pub fn splice_alternating_program_source() -> LfmProgramSource {
     use super::transcript_replay::TranscriptReplay;
 
     let total = SPLICE_ALT_DIGEST_HALVES + 2 * SPLICE_ALT_FIELD_HALVES;
-    let mut b = LfmBuilder::new();
+    let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::Blake3);
     let arena = b.declare_arena(total);
     let h: Vec<Felt> = (0..total).map(|i| b.hint_felt(arena, i)).collect();
     let d = SPLICE_ALT_DIGEST_HALVES as usize;
@@ -517,7 +542,7 @@ pub fn statement_replay_program_source() -> LfmProgramSource {
 
     let shape = epoch_statement_shape();
     let total = stmt_arena_halves();
-    let mut b = LfmBuilder::new();
+    let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::Blake3);
     let arena = b.declare_arena(total);
     let h: Vec<Felt> = (0..total).map(|i| b.hint_felt(arena, i)).collect();
 
@@ -582,7 +607,7 @@ pub fn statement_replay_program() -> LfmProgram {
 pub fn canonicity_guard_program_source() -> LfmProgramSource {
     use super::transcript_replay::{Candidate, assert_canonical, candidate_to_felt};
 
-    let mut b = LfmBuilder::new();
+    let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::Blake3);
     let arena = b.declare_arena(2);
     let c = Candidate {
         lo: b.hint_felt(arena, 0),
@@ -989,7 +1014,12 @@ pub fn program_id_program_source(shape: ProgramIdShape) -> LfmProgramSource {
     let per_page = U64_HALVES + root_halves;
     let total = root_halves + U64_HALVES + root_halves + per_page * shape.num_pages as u32;
 
-    let mut b = LfmBuilder::new();
+    // ★ Keccak, and it must stay keccak: this mirrors
+    // `recursion::program_id_from_digest`, which names `PlatformKeccak256`. The
+    // program-identity digest is a host-side artifact that does not move when
+    // the commitment hash does, so following the flip here would break the
+    // attestation join rather than complete it.
+    let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::Keccak);
     let arena = b.declare_arena(total);
     let h: Vec<Felt> = (0..total).map(|i| b.hint_felt(arena, i)).collect();
 
@@ -1217,7 +1247,7 @@ pub fn register_derivation_program_source(shape: RegisterDerivationShape) -> Lfm
     use crate::tables::register::NUM_REGISTER_ADDRESSES;
 
     let supplied = NUM_REGISTER_ADDRESSES as u32;
-    let mut b = LfmBuilder::new();
+    let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::Blake3);
     let init_arena = b.declare_arena(supplied);
     let fini_arena = b.declare_arena(supplied);
     let init: Vec<_> = (0..supplied).map(|r| b.hint_felt(init_arena, r)).collect();

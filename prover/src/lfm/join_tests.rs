@@ -1434,11 +1434,13 @@ fn preprocessed_fixture() -> (
     };
 
     let trace = make_trace();
+    // `DefaultStarkHash`, not a named hash: this commitment has to be the one
+    // `multi_prove_ram` below recomputes, and that follows the alias.
     let commitment = <stark::prover::Prover<Gl, Ext3, ()> as IsStarkProver<
         Gl,
         Ext3,
         (),
-        stark::config::KeccakStarkHash,
+        stark::config::DefaultStarkHash,
     >>::compute_precomputed_commitment_for_testing(
         &trace, &build(None), NUM_PRECOMPUTED
     )

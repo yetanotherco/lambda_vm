@@ -33,7 +33,7 @@ use crate::storage_mode::StorageMode;
 use crate::table::Table;
 use crate::trace::LDETraceTable;
 
-use super::config::{Commitment, KeccakStarkHash, StarkHash};
+use super::config::{Commitment, DefaultStarkHash, StarkHash};
 use super::constraints::evaluator::ConstraintEvaluator;
 use super::domain::Domain;
 use super::fri::fri_decommit::FriDecommitment;
@@ -72,9 +72,11 @@ pub struct GenericProver<
     p: PhantomData<(Field, FieldExtension, PI, H)>,
 }
 
-/// The production prover: [`GenericProver`] at the keccak configuration.
+/// The production prover: [`GenericProver`] at the default commitment
+/// configuration — BLAKE3 off `cuda`, keccak under it. See
+/// [`DefaultStarkHash`](crate::config::DefaultStarkHash).
 pub type Prover<Field, FieldExtension, PI> =
-    GenericProver<Field, FieldExtension, PI, KeccakStarkHash>;
+    GenericProver<Field, FieldExtension, PI, DefaultStarkHash>;
 
 impl<
     Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync + 'static,
