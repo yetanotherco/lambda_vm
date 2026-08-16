@@ -4976,8 +4976,8 @@ fn verify_against_artifacts_agrees_with_the_registry_path() {
     let opts = options();
     let program = trivial_program();
     let artifacts = build_artifacts(&program, &opts);
-    let proved = lfm_prove(&program, &artifacts, &arenas(), &opts)
-        .expect("the trivial program must prove");
+    let proved =
+        lfm_prove(&program, &artifacts, &arenas(), &opts).expect("the trivial program must prove");
 
     assert!(
         verify_against_artifacts(&artifacts, &proved.proof, &proved.public_words, &opts),
