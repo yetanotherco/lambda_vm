@@ -50,11 +50,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use stark::config::DefaultStarkTranscript;
 use executor::elf::Elf;
 use executor::vm::execution::Executor;
 use math::field::element::FieldElement;
 use stark::config::Commitment;
+use stark::config::DefaultStarkTranscript;
 use stark::constraints::builder::{ConstraintBuilder, ConstraintSet, EmptyConstraints};
 use stark::lookup::{AirWithBuses, AuxiliaryTraceBuildData, NullBoundaryConstraintBuilder};
 use stark::proof::options::ProofOptions;

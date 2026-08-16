@@ -1185,7 +1185,7 @@ fn a_zero_row_fixed_table_carries_some_zero_not_none() {
     // The real epoch statement, so the challenges are the ones a production
     // epoch proof is bound to.
     let seed = || {
-        let mut t = DefaultTranscript::<Ext3>::new(&[]);
+        let mut t = stark::config::DefaultStarkTranscript::<Ext3>::new(&[]);
         crate::statement::absorb_statement(
             &mut t,
             crate::statement::StatementKind::ContinuationEpoch { epoch_label: label },

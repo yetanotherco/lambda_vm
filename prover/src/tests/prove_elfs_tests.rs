@@ -81,7 +81,7 @@ fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
         .iter()
         .map(StarkProofView::Owned)
         .collect();
-    let mut replay_transcript = DefaultTranscript::<E>::new(&[]);
+    let mut replay_transcript = stark::config::DefaultStarkTranscript::<E>::new(&[]);
     let expected_bus_balance = crate::compute_expected_commit_bus_balance_view(
         &airs.air_refs(),
         &views,
@@ -177,7 +177,7 @@ fn verify_vm_minimal(vm_proof: &VmProof, elf_bytes: &[u8]) -> bool {
         .iter()
         .map(StarkProofView::Owned)
         .collect();
-    let mut replay_transcript = DefaultTranscript::<E>::new(&[]);
+    let mut replay_transcript = stark::config::DefaultStarkTranscript::<E>::new(&[]);
     let expected_bus_balance = crate::compute_expected_commit_bus_balance_view(
         &air_refs,
         &views,
@@ -1772,7 +1772,7 @@ fn test_prove_elfs_test_commit_4_wrong_pages_rejected() {
     let verifier_air_refs = verifier_airs.air_refs();
     let views: Vec<StarkProofView<F, E, ()>> =
         proof.proofs.iter().map(StarkProofView::Owned).collect();
-    let mut replay_transcript = DefaultTranscript::<E>::new(&[]);
+    let mut replay_transcript = stark::config::DefaultStarkTranscript::<E>::new(&[]);
     let expected_bus_balance = crate::compute_expected_commit_bus_balance_view(
         &verifier_air_refs,
         &views,
@@ -2531,7 +2531,7 @@ fn test_deep_stack_runtime_pages_roundtrip() {
     let verifier_air_refs = verifier_airs.air_refs();
     let views: Vec<StarkProofView<F, E, ()>> =
         proof.proofs.iter().map(StarkProofView::Owned).collect();
-    let mut replay_transcript = DefaultTranscript::<E>::new(&[]);
+    let mut replay_transcript = stark::config::DefaultStarkTranscript::<E>::new(&[]);
     let expected_bus_balance = crate::compute_expected_commit_bus_balance_view(
         &verifier_air_refs,
         &views,
@@ -2607,7 +2607,7 @@ fn test_deep_stack_missing_pages_rejected() {
     let verifier_air_refs = verifier_airs.air_refs();
     let views: Vec<StarkProofView<F, E, ()>> =
         proof.proofs.iter().map(StarkProofView::Owned).collect();
-    let mut replay_transcript = DefaultTranscript::<E>::new(&[]);
+    let mut replay_transcript = stark::config::DefaultStarkTranscript::<E>::new(&[]);
     let expected_bus_balance = crate::compute_expected_commit_bus_balance_view(
         &verifier_air_refs,
         &views,
@@ -2719,7 +2719,7 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
     let verifier_air_refs = verifier_airs.air_refs();
     let views: Vec<StarkProofView<F, E, ()>> =
         proof.proofs.iter().map(StarkProofView::Owned).collect();
-    let mut replay_transcript = DefaultTranscript::<E>::new(&[]);
+    let mut replay_transcript = stark::config::DefaultStarkTranscript::<E>::new(&[]);
     let expected_bus_balance = crate::compute_expected_commit_bus_balance_view(
         &verifier_air_refs,
         &views,
@@ -3382,7 +3382,7 @@ fn test_prove_first_epoch_without_halt() {
         .iter()
         .map(StarkProofView::Owned)
         .collect();
-    let mut replay = DefaultTranscript::<E>::new(&[]);
+    let mut replay = stark::config::DefaultStarkTranscript::<E>::new(&[]);
     let expected_bus_balance = compute_expected_commit_bus_balance_view(
         &airs.air_refs(),
         &views,
@@ -3471,7 +3471,7 @@ fn test_prove_second_epoch_from_snapshot() {
         .iter()
         .map(StarkProofView::Owned)
         .collect();
-    let mut replay = DefaultTranscript::<E>::new(&[]);
+    let mut replay = stark::config::DefaultStarkTranscript::<E>::new(&[]);
     let expected_bus_balance = compute_expected_commit_bus_balance_view(
         &airs.air_refs(),
         &views,
@@ -3587,7 +3587,7 @@ fn test_epoch_proof_commits_l2g() {
         .iter()
         .map(StarkProofView::Owned)
         .collect();
-    let mut replay = DefaultTranscript::<E>::new(&[]);
+    let mut replay = stark::config::DefaultStarkTranscript::<E>::new(&[]);
     let expected_bus_balance = compute_expected_commit_bus_balance_view(
         &refs,
         &views,
@@ -3748,7 +3748,7 @@ fn test_continuation_pipeline_end_to_end() {
             .iter()
             .map(StarkProofView::Owned)
             .collect();
-        let mut replay = DefaultTranscript::<E>::new(&[]);
+        let mut replay = stark::config::DefaultStarkTranscript::<E>::new(&[]);
         let expected_bus_balance = compute_expected_commit_bus_balance_view(
             &refs,
             &views,
@@ -3891,7 +3891,7 @@ fn test_epoch_memory_bus_with_l2g_bookend() {
         .iter()
         .map(StarkProofView::Owned)
         .collect();
-    let mut replay = DefaultTranscript::<E>::new(&[]);
+    let mut replay = stark::config::DefaultStarkTranscript::<E>::new(&[]);
     let expected_bus_balance = compute_expected_commit_bus_balance_view(
         &refs,
         &views,

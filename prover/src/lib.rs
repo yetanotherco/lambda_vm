@@ -30,11 +30,11 @@ pub mod tests;
 
 use std::fmt;
 
-use stark::config::DefaultStarkTranscript;
 use crypto::fiat_shamir::is_transcript::IsTranscript;
 use executor::elf::Elf;
 use executor::vm::execution::Executor;
 use math::field::element::FieldElement;
+use stark::config::DefaultStarkTranscript;
 use stark::prover::{IsStarkProver, Prover};
 #[cfg(feature = "disk-spill")]
 use stark::storage_mode::StorageMode;

@@ -7,10 +7,10 @@
 //! compute the expected `LfmPublic` balance from the *claimed* public words
 //! (the COMMIT-bus pattern), and run `multi_verify_views`.
 
-use stark::config::DefaultStarkTranscript;
 use math::field::element::FieldElement;
 use math::field::traits::IsPrimeField;
 use stark::config::Commitment;
+use stark::config::DefaultStarkTranscript;
 use stark::proof::options::ProofOptions;
 use stark::proof::stark::MultiProof;
 use stark::proof::view::MultiProofView;

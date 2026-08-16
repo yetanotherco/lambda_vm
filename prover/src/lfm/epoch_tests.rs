@@ -711,7 +711,6 @@ pub(super) fn real_epoch_with(opts: crate::ProofOptions) -> RealEpoch {
 pub(super) fn real_epoch_from(opts: crate::ProofOptions, inputs: EpochInputs) -> RealEpoch {
     use crate::tables::trace_builder::{Traces, build_initial_image_paged};
     use crate::tables::{MaxRowsConfig, bitwise, local_to_global, register};
-    use crypto::fiat_shamir::default_transcript::DefaultTranscript;
     use crypto::fiat_shamir::is_transcript::IsTranscript;
     use executor::elf::Elf;
     use executor::vm::execution::Executor;
@@ -791,7 +790,7 @@ pub(super) fn real_epoch_from(opts: crate::ProofOptions, inputs: EpochInputs) ->
     let mut l2g_trace = local_to_global::generate_local_to_global_trace(&boundary);
 
     let seed = || {
-        let mut t = DefaultTranscript::<Ext3>::new(&[]);
+        let mut t = stark::config::DefaultStarkTranscript::<Ext3>::new(&[]);
         crate::statement::absorb_statement(
             &mut t,
             crate::statement::StatementKind::ContinuationEpoch { epoch_label: label },
@@ -972,7 +971,7 @@ fn host_table_forked(
     view: StarkProofView<'_, Gl, Ext3, ()>,
     index: usize,
     num_tables: usize,
-    fork: &mut crypto::fiat_shamir::default_transcript::DefaultTranscript<Ext3>,
+    fork: &mut stark::config::DefaultStarkTranscript<Ext3>,
     lookup_challenges: &[FEE],
 ) -> HostTable {
     use stark::domain::new_verifier_domain;
