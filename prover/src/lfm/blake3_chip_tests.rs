@@ -315,6 +315,7 @@ fn every_constraint_index_is_emitted_exactly_once() {
 #[test]
 fn the_chip_occupies_its_registered_slot() {
     use super::airs::{KECCAK_RND_SLOT, LFM_CHIP_NAMES, NUM_LFM_CHIPS};
+    use super::registry::LfmProgramKind;
     assert_eq!(NUM_LFM_CHIPS, 15, "the promotion is 14 -> 15");
     assert_eq!(LFM_CHIP_NAMES[11], "LFM_BLAKE3");
     assert_eq!(
@@ -324,12 +325,23 @@ fn the_chip_occupies_its_registered_slot() {
     assert_eq!(LFM_CHIP_NAMES[KECCAK_RND_SLOT], "KECCAK_RND");
     assert_eq!(LFM_CHIP_NAMES[13], "KECCAK_RC");
     assert_eq!(LFM_CHIP_NAMES[14], "BITWISE");
-    // Every registry entry carries a root and a height for the new slot.
+    // Every registry entry carries a root and a height for the new slot, and
+    // since the flip the heights SPLIT — which is the fixed-machine principle
+    // seen from both sides.
+    //
+    // A program that never compresses still commits the chip's empty group,
+    // padded to the 4-row minimum: the slot is machine shape, not program
+    // shape. A program that does compress is above that minimum, and the two
+    // that are above it are exactly the two the flip moved.
     for entry in super::registry::LFM_REGISTRY {
+        let expected = match entry.kind {
+            LfmProgramKind::TranscriptReplayV0 => 3,
+            LfmProgramKind::StatementReplayV0 => 4,
+            _ => 2,
+        };
         assert_eq!(
-            entry.log_heights[11], 2,
-            "{:?}: a program with no compression still commits the chip's empty \
-             group, padded to the 4-row minimum — the fixed-machine principle",
+            entry.log_heights[11], expected,
+            "{:?}: LFM_BLAKE3 slot height",
             entry.kind
         );
     }
@@ -1190,8 +1202,8 @@ fn the_flip_inventory_of_registered_programs_is_pinned() {
     /// takes a 64-byte block where the keccak sponge takes a 136-byte rate, so
     /// the same message divides into more compressions — which is the in-machine
     /// half of the cost the campaign priced, visible here as a row count.
-    const TRANSCRIPT_REPLAY_BLAKE3_ROWS: usize = 12;
-    const STATEMENT_REPLAY_BLAKE3_ROWS: usize = 10;
+    const TRANSCRIPT_REPLAY_BLAKE3_ROWS: usize = 8;
+    const STATEMENT_REPLAY_BLAKE3_ROWS: usize = 9;
 
     use super::instr::Instr;
     use super::programs::{
