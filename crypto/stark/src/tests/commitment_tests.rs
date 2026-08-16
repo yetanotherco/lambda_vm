@@ -6,8 +6,11 @@
 use crate::commitment::{
     ROWS_PER_LEAF, commit_bit_reversed, keccak_leaves_bit_reversed,
     keccak_leaves_bit_reversed_grouped, keccak_leaves_row_pair_bit_reversed,
+    leaves_bit_reversed_grouped,
 };
-use crate::config::{BatchedMerkleTree, BatchedMerkleTreeBackend, Commitment};
+use crate::config::{
+    BatchedMerkleTree, BatchedMerkleTreeBackend, Commitment, KeccakStarkHash, StarkHash,
+};
 use math::fft::bit_reversing::reverse_index;
 use math::field::{element::FieldElement, goldilocks::GoldilocksField};
 use math::traits::ByteConversion;
@@ -27,7 +30,10 @@ fn sample_columns() -> Vec<Vec<Felt>> {
 /// each row, big-endian), hashed once with the same backend the prover uses.
 /// Structurally separate from the production `map_init` loop, so a transposed
 /// row/column order or a wrong bit-reversal in production fails this check.
-fn expected_leaf(columns: &[Vec<Felt>], rows_per_leaf: usize, leaf_idx: usize) -> Commitment {
+fn expected_leaf<B>(columns: &[Vec<Felt>], rows_per_leaf: usize, leaf_idx: usize) -> Commitment
+where
+    B: crypto::merkle_tree::traits::IsStreamingLeafBackend<F, Node = Commitment>,
+{
     let num_rows = columns[0].len();
     let byte_len = <Felt as ByteConversion>::BYTE_LEN;
     let mut buf = vec![0u8; rows_per_leaf * columns.len() * byte_len];
@@ -39,24 +45,40 @@ fn expected_leaf(columns: &[Vec<Felt>], rows_per_leaf: usize, leaf_idx: usize) -
             offset += byte_len;
         }
     }
-    BatchedMerkleTreeBackend::<F>::hash_bytes(&buf)
+    B::hash_bytes(&buf)
 }
+
+/// The keccak batched backend, named. `keccak_leaves_*` is the CUDA parity
+/// reference and computes keccak whatever the default is (P-a Stage 6), so a
+/// test of THOSE helpers must say keccak on both sides.
+type KeccakBatched = <KeccakStarkHash as StarkHash>::Batched<F>;
 
 #[test]
 fn grouped_leaves_match_documented_layout_for_r1_and_r2() {
     let columns = sample_columns();
     let num_rows = columns[0].len();
     for &rows_per_leaf in &[1usize, 2usize] {
-        let leaves = keccak_leaves_bit_reversed_grouped(&columns, rows_per_leaf);
+        // Both configurations, because the layout is what is being pinned and
+        // the layout is hash-independent: the production one is what the
+        // verifier must match, the keccak one is what the CUDA kernels mirror.
+        let leaves =
+            leaves_bit_reversed_grouped::<F, BatchedMerkleTreeBackend<F>>(&columns, rows_per_leaf);
+        let keccak_leaves = keccak_leaves_bit_reversed_grouped(&columns, rows_per_leaf);
         assert_eq!(
             leaves.len(),
             num_rows / rows_per_leaf,
             "leaf count for rows_per_leaf={rows_per_leaf}"
         );
+        assert_eq!(keccak_leaves.len(), leaves.len());
         for (i, leaf) in leaves.iter().enumerate() {
             assert_eq!(
+                keccak_leaves[i],
+                expected_leaf::<KeccakBatched>(&columns, rows_per_leaf, i),
+                "keccak leaf {i} for rows_per_leaf={rows_per_leaf}"
+            );
+            assert_eq!(
                 *leaf,
-                expected_leaf(&columns, rows_per_leaf, i),
+                expected_leaf::<BatchedMerkleTreeBackend<F>>(&columns, rows_per_leaf, i),
                 "leaf {i} for rows_per_leaf={rows_per_leaf}"
             );
         }
@@ -79,7 +101,10 @@ fn wrappers_agree_with_grouped() {
 #[test]
 fn commit_root_matches_tree_built_over_leaves() {
     let columns = sample_columns();
-    let leaves = keccak_leaves_bit_reversed_grouped(&columns, ROWS_PER_LEAF);
+    // The production leaves, not the keccak ones: `commit_bit_reversed` follows
+    // the aliases, so both sides have to.
+    let leaves =
+        leaves_bit_reversed_grouped::<F, BatchedMerkleTreeBackend<F>>(&columns, ROWS_PER_LEAF);
     let tree = BatchedMerkleTree::<F>::build_from_hashed_leaves(leaves).unwrap();
     let (_, root) = commit_bit_reversed(&columns, ROWS_PER_LEAF).unwrap();
     assert_eq!(root, tree.root);
