@@ -17,7 +17,44 @@
 //! authenticated at the wrong leaf rather than as a compile error. [`RoundShape`]
 //! keeps the mapping in one place so both sides read it from the same code.
 
+use crate::config::Commitment;
 use crate::traits::AIR;
+
+/// The preprocessed round's pinned shape: the root a program's registry entry
+/// commits, and the widths the leaf parse depends on.
+///
+/// # Why the widths travel with the root
+///
+/// Under the per-table scheme a group's width is implied by its own root plus
+/// its AIR. Under one batched tree the widths decide how each leaf is *parsed*,
+/// so a comparison of roots alone is only equivalent to the per-table
+/// comparisons it replaces if the parse is pinned too (MMCS-PLAN §3.1 item 3,
+/// §3.3's closing warning). They are carried here rather than derived at the
+/// comparison site so that a caller holding entry A but an AIR set built for
+/// entry B is rejected as a width disagreement rather than as an unexplained
+/// root mismatch.
+///
+/// # The two sides dispose of `None` differently, on purpose
+///
+/// Both [`crate::batched::prover::multi_prove_batched`] and
+/// [`crate::batched::verifier::multi_verify_batched`] take this as an `Option`,
+/// and they do NOT mean the same thing by the absence:
+///
+/// - **Prover — permissive.** `None` is how the root is generated in the first
+///   place (registry regeneration has nothing to compare against yet). Supplying
+///   it buys a fail-fast: a stale preprocessed constant is caught at prove time
+///   rather than by every future verifier.
+/// - **Verifier — fails closed.** `None` is accepted only for an epoch whose AIR
+///   set has no preprocessed table at all. An epoch that HAS a preprocessed
+///   round and no pinned root is rejected, because the only root left to check
+///   against would be the proof's own — which the prover chose along with the
+///   matrices it commits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PinnedPrep<'a> {
+    pub root: &'a Commitment,
+    /// One width per contributing matrix, in [`RoundShape::tables`] order.
+    pub widths: &'a [usize],
+}
 
 /// Which tables contribute a matrix to one batched round, and with what shape.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]

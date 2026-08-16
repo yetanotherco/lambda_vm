@@ -78,7 +78,12 @@ pub struct BatchedMultiProof<F: IsField, E: IsField, PI> {
     /// ⚠ This root REPLACES the per-table `air.precomputed_commitment()`
     /// comparison, which is the per-table path's critical soundness check. A
     /// single comparison here is only equivalent if the shape pins the parse —
-    /// see `verify_prep_round` and the per-matrix tamper control beside it.
+    /// see [`crate::batched::verifier::verify_prep_round`] and the per-matrix
+    /// tamper control beside it.
+    ///
+    /// ⚠ Reading this field is not checking it. What decides whether the epoch
+    /// used the preprocessed matrices the program pins is the comparison
+    /// against `PinnedPrep::root`; this is the prover's claim.
     pub prep_root: Option<Commitment>,
     pub main_root: Commitment,
     pub aux_root: Option<Commitment>,

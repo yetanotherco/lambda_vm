@@ -888,11 +888,15 @@ mod epoch {
         let refs = air_refs(airs);
         let (shape, params, challenges) =
             replay_epoch_transcript(&refs, proof, &mut DefaultTranscript::<E>::new(&[]))?;
+        // `None`: this fixture has no preprocessed table, which is the only
+        // shape an unpinned caller may verify (`verify_prep_round`). The pinned
+        // arm is covered in `batched_prover_tests`, where the fixture does.
         Some(verify_epoch_commitments::<F, E, (), KeccakStarkHash>(
             proof,
             &shape,
             &params,
             &challenges,
+            None,
         ))
     }
 
@@ -1329,11 +1333,14 @@ mod full_verify {
             .iter()
             .map(|a| a as &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>)
             .collect();
+        // Unpinned, which `verify_prep_round` allows only because this fixture
+        // has no preprocessed table.
         multi_verify_batched::<F, E, (), KeccakStarkHash, V, _>(
             &refs,
             proof,
             &mut DefaultTranscript::<E>::new(&[]),
             &FieldElement::zero(),
+            None,
         )
     }
 
@@ -1398,6 +1405,7 @@ mod full_verify {
                 &proof,
                 &mut DefaultTranscript::<E>::new(&[]),
                 &FieldElement::zero(),
+                None,
             ),
             "honest-path control: the epoch balances at zero"
         );
@@ -1407,6 +1415,7 @@ mod full_verify {
                 &proof,
                 &mut DefaultTranscript::<E>::new(&[]),
                 &FieldElement::one(),
+                None,
             ),
             "an expected balance the epoch does not have must be rejected"
         );
@@ -1452,5 +1461,204 @@ mod full_verify {
         let mut no_aux_root = honest_proof.clone();
         no_aux_root.aux_root = None;
         assert!(!verifies(&airs, &no_aux_root), "dropped aux root");
+    }
+}
+
+// ===========================================================================
+// The pinned preprocessed round (M-6) — through the WHOLE verifier
+// ===========================================================================
+//
+// `batched_prover_tests` covers the prover's fail-fast and the per-matrix
+// tamper control at the MMCS level. What it cannot show is that
+// `multi_verify_batched` actually reaches the comparison: MMCS-PLAN §3.3 warns
+// that consolidating a per-table soundness check into one comparison is where
+// coverage quietly goes missing, and a comparison the top-level verifier never
+// calls is exactly that failure.
+mod prep_binding {
+    use crate::batched::shape::PinnedPrep;
+    use crate::batched::verifier::multi_verify_batched;
+    use crate::config::KeccakStarkHash;
+    use crate::tests::batched_prover_tests::{
+        Air, E, F, PREP_WIDTHS, honest_prep_root, prove_preprocessed,
+    };
+    use crate::traits::AIR;
+    use crate::verifier::GenericVerifier;
+    use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+    use math::field::element::FieldElement;
+
+    type Proof = crate::batched::proof::BatchedMultiProof<F, E, ()>;
+    type V = GenericVerifier<F, E, (), KeccakStarkHash>;
+
+    fn verifies(airs: &[Air], proof: &Proof, expected_prep: Option<PinnedPrep<'_>>) -> bool {
+        let refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = airs
+            .iter()
+            .map(|a| a as &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>)
+            .collect();
+        multi_verify_batched::<F, E, (), KeccakStarkHash, V, _>(
+            &refs,
+            proof,
+            &mut DefaultTranscript::<E>::new(&[]),
+            &FieldElement::zero(),
+            expected_prep,
+        )
+    }
+
+    fn honest() -> (Vec<Air>, Proof, crate::config::Commitment) {
+        let root = honest_prep_root();
+        let (airs, proof, _) = prove_preprocessed(Some(PinnedPrep {
+            root: &root,
+            widths: &PREP_WIDTHS,
+        }))
+        .expect("an honest preprocessed epoch");
+        (airs, proof, root)
+    }
+
+    /// ★★ The honest path. A preprocessed epoch proved against a pinned root
+    /// verifies end to end against that same root — every other test in this
+    /// module is a rejection, and without this one they would all be satisfied
+    /// by a verifier that rejected everything.
+    #[test_log::test]
+    fn an_honest_preprocessed_epoch_verifies_against_its_pinned_root() {
+        let (airs, proof, root) = honest();
+        assert!(
+            verifies(
+                &airs,
+                &proof,
+                Some(PinnedPrep {
+                    root: &root,
+                    widths: &PREP_WIDTHS,
+                })
+            ),
+            "an honest preprocessed epoch must verify against its pinned root"
+        );
+    }
+
+    /// ★ The check M-6 exists for. Everything else in the batched verifier
+    /// authenticates openings against roots the PROOF carries; a prover who
+    /// chose the preprocessed matrices chose those roots too, so without this
+    /// comparison a proof over ANY preprocessed content would be self-consistent
+    /// and accepted.
+    #[test_log::test]
+    fn a_prep_root_the_program_does_not_pin_is_rejected() {
+        let (airs, proof, root) = honest();
+        let mut wrong = root;
+        wrong[0] ^= 0xff;
+        assert!(
+            !verifies(
+                &airs,
+                &proof,
+                Some(PinnedPrep {
+                    root: &wrong,
+                    widths: &PREP_WIDTHS,
+                })
+            ),
+            "a proof whose prep root is not the pinned one must be rejected"
+        );
+    }
+
+    /// The pinned widths are compared, and positionally. Swapping them keeps the
+    /// multiset and the total width identical, so only a positional comparison
+    /// rejects it — and it must reject even under the honest root, or the widths
+    /// are decoration the root comparison happens to cover.
+    #[test_log::test]
+    fn the_pinned_widths_are_compared() {
+        let (airs, proof, root) = honest();
+        let swapped = [PREP_WIDTHS[1], PREP_WIDTHS[0]];
+        assert_ne!(
+            swapped, PREP_WIDTHS,
+            "the fixture's two preprocessed matrices must have different widths, \
+             or this test passes vacuously"
+        );
+        assert!(
+            !verifies(
+                &airs,
+                &proof,
+                Some(PinnedPrep {
+                    root: &root,
+                    widths: &swapped,
+                })
+            ),
+            "pinned widths in the wrong order must be rejected under the honest root"
+        );
+    }
+
+    /// ★ `None` fails closed. An epoch WITH a preprocessed round and no pinned
+    /// root must be rejected rather than fall back to the proof's own root —
+    /// that fallback is precisely the hole the per-table path does not have.
+    #[test_log::test]
+    fn an_unpinned_caller_cannot_verify_a_preprocessed_epoch() {
+        let (airs, proof, _) = honest();
+        assert!(
+            !verifies(&airs, &proof, None),
+            "a preprocessed epoch must not verify without a pinned root"
+        );
+    }
+
+    /// The mirror: a pinned root supplied for an epoch whose AIR set has no
+    /// preprocessed table is a caller/AIR-set disagreement, not something to
+    /// wave through.
+    #[test_log::test]
+    fn a_pinned_root_on_an_unpreprocessed_epoch_is_rejected() {
+        use crate::residency_mode::ResidencyMode;
+        use crate::tests::batched_prover_tests::{folding_options, prove_repeated};
+
+        let (airs, proof, _, _) = prove_repeated(1, &folding_options(), ResidencyMode::Retain);
+        let root = honest_prep_root();
+        assert!(
+            !verifies(
+                &airs,
+                &proof,
+                Some(PinnedPrep {
+                    root: &root,
+                    widths: &PREP_WIDTHS,
+                })
+            ),
+            "a pinned prep root for an epoch with no preprocessed round must be rejected"
+        );
+    }
+
+    /// ★ The per-matrix quantifier, reached through the WHOLE verifier rather
+    /// than through `MixedMmcs::verify_batch` alone. MMCS-PLAN §3.3: the single
+    /// comparison must fail if ANY one table's preprocessed matrix is wrong.
+    #[test_log::test]
+    fn a_tampered_prep_matrix_is_rejected_per_matrix_end_to_end() {
+        let (airs, honest_proof, root) = honest();
+        let pinned = || {
+            Some(PinnedPrep {
+                root: &root,
+                widths: &PREP_WIDTHS,
+            })
+        };
+        assert!(
+            verifies(&airs, &honest_proof, pinned()),
+            "honest-path control"
+        );
+
+        let matrices = honest_proof.queries[0]
+            .prep
+            .as_ref()
+            .expect("prep opening")
+            .per_matrix
+            .len();
+        assert_eq!(
+            matrices,
+            PREP_WIDTHS.len(),
+            "the fixture must contribute one opening per preprocessed matrix"
+        );
+
+        for matrix in 0..matrices {
+            let mut tampered = honest_proof.clone();
+            tampered.queries[0]
+                .prep
+                .as_mut()
+                .expect("prep opening")
+                .per_matrix[matrix]
+                .evaluations[0] += FieldElement::<F>::one();
+            assert!(
+                !verifies(&airs, &tampered, pinned()),
+                "prep matrix {matrix}: a tampered precomputed value must be rejected \
+                 by the whole verifier"
+            );
+        }
     }
 }

@@ -70,8 +70,8 @@ use crate::batched::proof::{
     lde_bytes,
 };
 use crate::batched::round4::commit_batched_fri;
-use crate::batched::shape::{EpochShape, RoundShape, ShapeError};
-use crate::config::{Commitment, StarkHash};
+use crate::batched::shape::{EpochShape, PinnedPrep, RoundShape, ShapeError};
+use crate::config::StarkHash;
 use crate::domain::Domain;
 use crate::fri::batched::HeightCombiner;
 use crate::fri::mmcs::{BorrowedMatrix, LeafSource, MixedMmcs, MixedOpening, StreamingMmcsBuilder};
@@ -116,16 +116,20 @@ struct LdePair<Field: IsField, FieldExtension: IsField> {
 
 /// Prove one epoch with batched commitments.
 ///
-/// `expected_prep_root`, when supplied, is the registry's committed
-/// preprocessed root (M-6). The prover compares its own against it and fails
-/// fast, preserving the property the per-table path gets from
-/// `air.precomputed_commitment()`: a stale preprocessed constant is caught here
-/// rather than by every future verifier.
+/// `expected_prep`, when supplied, is the registry's committed preprocessed root
+/// and the widths it was committed over (M-6). The prover compares its own
+/// against them and fails fast, preserving the property the per-table path gets
+/// from `air.precomputed_commitment()`: a stale preprocessed constant is caught
+/// here rather than by every future verifier.
+///
+/// `None` is permissive here — it is how the root is generated in the first
+/// place. That is the opposite of the verifier's disposition; see
+/// [`PinnedPrep`].
 #[allow(clippy::too_many_arguments)]
 pub fn multi_prove_batched<Field, FieldExtension, PI, H, P>(
     mut air_trace_pairs: Vec<BatchedAirTracePair<'_, Field, FieldExtension, PI>>,
     transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone + Send),
-    expected_prep_root: Option<Commitment>,
+    expected_prep: Option<PinnedPrep<'_>>,
     #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
     residency: ResidencyMode,
 ) -> Result<
@@ -252,10 +256,17 @@ where
     let prep_mmcs = prep_builder.map(StreamingMmcsBuilder::finish);
     let main_mmcs = main_builder.finish();
     let prep_root = prep_mmcs.as_ref().map(MixedMmcs::root);
-    if let (Some(expected), Some(actual)) = (expected_prep_root, prep_root)
-        && expected != actual
-    {
-        return Err(ProvingError::PrecomputedCommitmentMismatch);
+    // The widths are compared first because they are the more legible failure:
+    // a registry whose entry predates a change to some AIR's precomputed column
+    // count disagrees here in a way that names the cause, instead of surfacing
+    // as a root mismatch that could equally be a stale constant.
+    if let Some(expected) = expected_prep {
+        if expected.widths != shape.prep.widths().as_slice() {
+            return Err(ProvingError::PrecomputedCommitmentMismatch);
+        }
+        if prep_root.as_ref() != Some(expected.root) {
+            return Err(ProvingError::PrecomputedCommitmentMismatch);
+        }
     }
     if let Some(root) = prep_root {
         transcript.append_bytes(&root);

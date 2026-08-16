@@ -16,7 +16,7 @@ use math::field::{
 
 use crate::batched::proof::{BatchedMultiProof, BatchedProveStats};
 use crate::batched::prover::multi_prove_batched;
-use crate::batched::shape::{EpochShape, RoundShape};
+use crate::batched::shape::{EpochShape, PinnedPrep, RoundShape};
 use crate::config::KeccakStarkHash;
 use crate::examples::multi_table_lookup::{
     new_add_air_with_lookup, new_cpu_air_with_lookup, new_mul_air_with_lookup,
@@ -480,26 +480,39 @@ fn a_width_the_epoch_did_not_commit_is_rejected() {
 // alone therefore proves nothing here; the un-reduced control below is what
 // makes the reduction load-bearing.
 
-/// The ADD table, declared preprocessed over its first two columns. The
-/// commitment value is never read on the batched path — that is the point of
-/// M-6: the epoch's single `prep_root` REPLACES the per-table
-/// `precomputed_commitment()` comparison.
+/// ADD and MUL, both declared preprocessed, at the SAME height but DIFFERENT
+/// widths (2 and 3 precomputed columns). Each of those three facts is doing a
+/// job:
+///
+/// - **two matrices**, so "per matrix" in the tamper control below is a real
+///   quantifier rather than a loop that runs once;
+/// - **different widths**, so the width half of [`PinnedPrep`] is falsifiable —
+///   with equal widths a swapped parse would be indistinguishable from the
+///   honest one, and `the_pinned_widths_are_compared` would pass vacuously;
+/// - **both below CPU's height**, so the prep round's `h_max` stays under the
+///   FRI's and `reduce_iota_to_round` keeps doing real work.
+///
+/// The per-AIR `precomputed_commitment()` values are never read on the batched
+/// path — that is the point of M-6: the epoch's single `prep_root`, compared
+/// against the registry's, REPLACES those per-table comparisons.
+pub(crate) const PREP_WIDTHS: [usize; 2] = [2, 3];
+
 fn preprocessed_epoch(options: &ProofOptions) -> (Vec<Air>, Vec<TraceTable<F, E>>) {
     let (cpu, add, mul) = traces();
     let airs = vec![
         new_cpu_air_with_lookup(options),
-        new_add_air_with_lookup(options).with_preprocessed([7u8; 32], 2),
-        new_mul_air_with_lookup(options),
+        new_add_air_with_lookup(options).with_preprocessed([7u8; 32], PREP_WIDTHS[0]),
+        new_mul_air_with_lookup(options).with_preprocessed([9u8; 32], PREP_WIDTHS[1]),
     ];
     (airs, vec![cpu, add, mul])
 }
 
 /// What a preprocessed-epoch prove hands back: the AIRs (borrowed by the shape
 /// derivation), the proof, and the trace lengths the verifier would read off it.
-type PreprocessedProve = (Vec<Air>, BatchedMultiProof<F, E, ()>, Vec<usize>);
+pub(crate) type PreprocessedProve = (Vec<Air>, BatchedMultiProof<F, E, ()>, Vec<usize>);
 
-fn prove_preprocessed(
-    expected_prep_root: Option<crate::config::Commitment>,
+pub(crate) fn prove_preprocessed(
+    expected_prep: Option<PinnedPrep<'_>>,
 ) -> Result<PreprocessedProve, crate::prover::ProvingError> {
     let options = folding_options();
     let (airs, mut all_traces) = preprocessed_epoch(&options);
@@ -519,12 +532,23 @@ fn prove_preprocessed(
         multi_prove_batched::<F, E, (), KeccakStarkHash, GenericProver<F, E, (), KeccakStarkHash>>(
             pairs,
             &mut DefaultTranscript::<E>::new(&[]),
-            expected_prep_root,
+            expected_prep,
             #[cfg(feature = "disk-spill")]
             crate::storage_mode::StorageMode::Ram,
             ResidencyMode::Retain,
         )?;
     Ok((airs, proof, vec![8, 4, 4]))
+}
+
+/// The honest epoch's own `prep_root` — what a registry entry for this fixture
+/// would hold, obtained the way registry regeneration obtains it: by proving
+/// once with nothing pinned.
+pub(crate) fn honest_prep_root() -> crate::config::Commitment {
+    prove_preprocessed(None)
+        .expect("an honest preprocessed epoch")
+        .1
+        .prep_root
+        .expect("the fixture has preprocessed tables")
 }
 
 /// Honest path, plus the two facts that make the rest of this section
@@ -545,6 +569,16 @@ fn the_preprocessed_round_is_committed_and_authenticates() {
         "this fixture exists to put the prep round BELOW the FRI's h_max \
          (prep {prep_h_max}, fri {h_max}); without that the reduction is inert \
          and the controls below prove nothing"
+    );
+    // The other two properties the section's controls rest on. Asserted here
+    // rather than trusted from `preprocessed_epoch`, because a later edit that
+    // dropped a preprocessed table or equalised the widths would silently turn
+    // the per-matrix and width controls below into single-iteration loops and
+    // vacuous comparisons.
+    assert_eq!(
+        shape.prep.widths(),
+        PREP_WIDTHS,
+        "two preprocessed matrices at different widths"
     );
 
     let root = proof.prep_root.expect("just checked");
@@ -631,14 +665,14 @@ fn a_tampered_precomputed_row_is_rejected_per_matrix() {
 /// `commit_main_trace`'s `PrecomputedCommitmentMismatch`.
 #[test_log::test]
 fn a_registry_prep_root_mismatch_fails_the_prove() {
-    let honest_root = prove_preprocessed(None)
-        .expect("an honest preprocessed epoch")
-        .1
-        .prep_root
-        .expect("the epoch has a preprocessed table");
+    let honest_root = honest_prep_root();
 
     assert!(
-        prove_preprocessed(Some(honest_root)).is_ok(),
+        prove_preprocessed(Some(PinnedPrep {
+            root: &honest_root,
+            widths: &PREP_WIDTHS,
+        }))
+        .is_ok(),
         "honest-path control: the registry's own root must be accepted"
     );
 
@@ -646,9 +680,49 @@ fn a_registry_prep_root_mismatch_fails_the_prove() {
     wrong[0] ^= 0xff;
     assert!(
         matches!(
-            prove_preprocessed(Some(wrong)),
+            prove_preprocessed(Some(PinnedPrep {
+                root: &wrong,
+                widths: &PREP_WIDTHS,
+            })),
             Err(crate::prover::ProvingError::PrecomputedCommitmentMismatch)
         ),
         "a prep root the registry did not commit must fail the prove"
+    );
+}
+
+/// The width half of [`PinnedPrep`], on the prover side. A registry entry whose
+/// widths predate a change to some AIR's precomputed column count must stop the
+/// prove, and it must stop it EVEN WHEN the pinned root is the honest one —
+/// otherwise the widths are decoration that the root comparison happens to
+/// cover.
+#[test_log::test]
+fn a_registry_prep_width_mismatch_fails_the_prove() {
+    let honest_root = honest_prep_root();
+
+    // Swapping the two widths keeps the multiset and the total, so nothing but
+    // a positional comparison can catch it.
+    let swapped = [PREP_WIDTHS[1], PREP_WIDTHS[0]];
+    assert!(
+        matches!(
+            prove_preprocessed(Some(PinnedPrep {
+                root: &honest_root,
+                widths: &swapped,
+            })),
+            Err(crate::prover::ProvingError::PrecomputedCommitmentMismatch)
+        ),
+        "widths in the wrong order must fail the prove even under the honest root"
+    );
+
+    // A short list is the other shape a stale entry takes: one fewer table than
+    // the AIR set contributes.
+    assert!(
+        matches!(
+            prove_preprocessed(Some(PinnedPrep {
+                root: &honest_root,
+                widths: &PREP_WIDTHS[..1],
+            })),
+            Err(crate::prover::ProvingError::PrecomputedCommitmentMismatch)
+        ),
+        "a width list shorter than the prep round must fail the prove"
     );
 }
