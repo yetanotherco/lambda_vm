@@ -278,6 +278,16 @@ pub fn resolve(
 //     too, since the flip. Blessed under `CommitmentHash::Blake3`, which is the
 //     non-`cuda` default. Every root below moves with it, and now so does the
 //     name.
+//
+//     ⚠ **This table therefore describes ONE arm of the `cuda` fork.** A `cuda`
+//     build's default is keccak (`stark::config::DefaultStarkHash`), so it
+//     commits different roots and folds a different tag, and the six
+//     `machine_tests::registry_drift_*` tests fail there — correctly, because a
+//     `cuda` build really is a different machine with different program
+//     identities. The tests are NOT cfg'd off: the incompatibility is the point,
+//     and hiding it would leave a build silently claiming identities it does not
+//     produce. It resolves when the fork retires (see `DefaultStarkHash`), not
+//     before, and blessing a second table is a decision nobody has taken.
 //   * ⚠ `BLAKE3_ROUNDS` (the `blake3-6round` feature) — **the previous note here
 //     said this table is round-count-invariant, and the flip ENDED that.** It
 //     was true while the roots were keccak: the round count moves `LFM_BLAKE3`'s

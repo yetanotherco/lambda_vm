@@ -58,6 +58,17 @@ pub type BatchedMerkleTreeBackend<F> = BatchBlake3Backend<F>;
 pub type BatchedMerkleTreeBackend<F> = BatchKeccak256Backend<F>;
 pub type BatchedMerkleTree<F> = MerkleTree<BatchedMerkleTreeBackend<F>>;
 
+/// The keccak tree families, named rather than reached through the aliases.
+///
+/// The CUDA keccak kernels compute keccak whatever the host default is, so
+/// their parity tests need a CPU reference that says keccak rather than one
+/// that says "whatever is default". While keccak WAS the default the aliases
+/// served both purposes; the flip separated them, and a parity test left on an
+/// alias would report a hash change as a kernel bug.
+pub type KeccakBatchedMerkleTreeBackend<F> = BatchKeccak256Backend<F>;
+pub type KeccakFriLayerMerkleTreeBackend<F> = PairKeccak256Backend<F>;
+pub type KeccakFriLayerMerkleTree<F> = MerkleTree<KeccakFriLayerMerkleTreeBackend<F>>;
+
 // FRI layer uses fixed-size pairs for efficiency (avoids Vec allocation per pair)
 #[cfg(not(feature = "cuda"))]
 pub type FriLayerMerkleTreeBackend<F> = PairBlake3Backend<F>;
