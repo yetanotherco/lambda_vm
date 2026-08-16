@@ -275,8 +275,10 @@ where
 struct Lde<Field: IsFFTField, FieldExtension: IsField> {
     /// Row-major main LDE buffer + its column count.
     main: (Vec<FieldElement<Field>>, usize),
-    /// Row-major aux LDE buffer + its column count (`(vec![], 0)` if no aux).
-    aux: (Vec<FieldElement<FieldExtension>>, usize),
+    /// Row-major aux LDE, as a `Table` whose `width` is the column count (an
+    /// empty, zero-width table if no aux). `Table` rather than a bare `Vec` so
+    /// the buffer can be disk-spilled for the whole rounds 2-4 window.
+    aux: Table<FieldExtension>,
     /// Device-side main LDE buffer, populated only when the R1 GPU fused
     /// pipeline ran for this table. Kept so R2/R3/R4 GPU paths can read
     /// the LDE without re-H2D.
@@ -302,7 +304,9 @@ where
         blowup_factor: usize,
     ) -> Round1<Field, FieldExtension> {
         let (main_data, num_main_cols) = lde.main;
-        let (aux_data, num_aux_cols) = lde.aux;
+        let aux_data = lde.aux;
+        #[cfg(feature = "cuda")]
+        let num_aux_cols = aux_data.width;
 
         // Stage-3 device-only detection, inferred from the ACTUAL buffer state
         // (not the gate's intent): a table whose round-1 D2H was skipped has an
@@ -322,8 +326,8 @@ where
         #[cfg(feature = "cuda")]
         let main_empty = num_main_cols > 0 && main_data.is_empty();
         #[cfg(feature = "cuda")]
-        let host_trace_empty =
-            main_empty || (num_aux_cols > 0 && aux_data.is_empty() && lde.gpu_aux.is_some());
+        let host_trace_empty = main_empty
+            || (num_aux_cols > 0 && aux_data.row_major_data().is_empty() && lde.gpu_aux.is_some());
         #[cfg(feature = "cuda")]
         let device_num_rows = lde
             .gpu_main
@@ -336,7 +340,6 @@ where
             main_data,
             num_main_cols,
             aux_data,
-            num_aux_cols,
             step_size,
             blowup_factor,
         );
@@ -1407,9 +1410,9 @@ pub trait IsStarkProver<
                     }
                 }
             }
-            (aux_data, num_aux_cols)
+            Table::from_row_major(aux_data, num_aux_cols)
         } else {
-            (Vec::new(), 0)
+            Table::new(Vec::new(), 0)
         };
 
         Ok(commitment.build_round1(
@@ -3323,11 +3326,11 @@ pub trait IsStarkProver<
         #[cfg(feature = "cuda")]
         type AuxResult<FE> = (
             Option<TableCommit<FE>>,
-            (Vec<FieldElement<FE>>, usize),
+            Table<FE>,
             Option<math_cuda::lde::GpuLdeExt3>,
         );
         #[cfg(not(feature = "cuda"))]
-        type AuxResult<FE> = (Option<TableCommit<FE>>, (Vec<FieldElement<FE>>, usize));
+        type AuxResult<FE> = (Option<TableCommit<FE>>, Table<FE>);
         // R1 aux commit and rounds 2 to 4 share the peak working set: the main
         // and aux LDEs are co-resident, plus the composition and Merkle
         // transients (in the scratch factor). The aux width comes from the AIR
@@ -3484,7 +3487,7 @@ pub trait IsStarkProver<
                                 let root = tree.root;
                                 return Ok((
                                     Some(TableCommit::plain(tree, root)),
-                                    (aux_data, num_cols),
+                                    Table::from_row_major(aux_data, num_cols),
                                     Some(handle),
                                 ));
                             }
@@ -3580,7 +3583,7 @@ pub trait IsStarkProver<
                                 crate::instruments::accum_r1_aux(aux_lde_dur, Duration::ZERO);
                                 return Ok((
                                     Some(TableCommit::plain(tree, root)),
-                                    (aux_data, num_cols),
+                                    Table::from_row_major(aux_data, num_cols),
                                     Some(handle),
                                 ));
                             }
@@ -3627,15 +3630,30 @@ pub trait IsStarkProver<
                         #[cfg(feature = "instruments")]
                         crate::instruments::accum_r1_aux(aux_lde_dur, t_sub.elapsed());
 
+                        // Spill the aux LDE itself (`lde_size × aux_cols` ext3
+                        // elements, 24 B each — the dominant survivor of this
+                        // stage). It is write-once here and read-only from
+                        // rounds 2-4, so mmap-backing it frees the heap buffer
+                        // for the whole window and lets the OS evict the pages
+                        // under pressure.
+                        #[allow(unused_mut)]
+                        let mut aux_lde = Table::from_row_major(aux_data, total_cols);
+                        #[cfg(feature = "disk-spill")]
+                        if storage_mode == StorageMode::Disk {
+                            aux_lde
+                                .spill_to_disk()
+                                .map_err(|e| ProvingError::DiskSpill(format!("aux LDE: {e}")))?;
+                        }
+
                         #[cfg(feature = "cuda")]
-                        return Ok((Some(commit), (aux_data, total_cols), None));
+                        return Ok((Some(commit), aux_lde, None));
                         #[cfg(not(feature = "cuda"))]
-                        Ok((Some(commit), (aux_data, total_cols)))
+                        Ok((Some(commit), aux_lde))
                     } else {
                         #[cfg(feature = "cuda")]
-                        return Ok((None, (Vec::new(), 0), None));
+                        return Ok((None, Table::new(Vec::new(), 0), None));
                         #[cfg(not(feature = "cuda"))]
-                        Ok((None, (Vec::new(), 0)))
+                        Ok((None, Table::new(Vec::new(), 0)))
                     }
                 })()?;
             // Tuple shape is cfg-gated; `.0` is the optional TableCommit in

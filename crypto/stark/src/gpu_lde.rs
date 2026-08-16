@@ -1553,7 +1553,7 @@ where
 
     // Aux: de-interleaved ext3 slabs -> row-major interleaved host Vec.
     let aux_data: Vec<FieldElement<E>> =
-        if lde_trace.num_aux_cols() == 0 || !lde_trace.aux_data.is_empty() {
+        if lde_trace.num_aux_cols() == 0 || !lde_trace.aux_data.row_major_data().is_empty() {
             Vec::new()
         } else {
             let Some(h) = lde_trace.gpu_aux() else {

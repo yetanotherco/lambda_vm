@@ -313,6 +313,23 @@ impl<F: IsField> Table<F> {
         }
     }
 
+    /// Wrap a buffer the caller already produced in row-major order, skipping
+    /// `new`'s 2-D revalidation — that `debug_assert` clones the whole buffer,
+    /// which is prohibitive for LDE-sized data.
+    pub(crate) fn from_row_major(data: Vec<FieldElement<F>>, width: usize) -> Self {
+        if width == 0 {
+            return Self::new(Vec::new(), 0);
+        }
+        let height = data.len() / width;
+        Self {
+            data,
+            width,
+            height,
+            #[cfg(feature = "disk-spill")]
+            mmap_backing: None,
+        }
+    }
+
     /// Creates a Table instance from a vector of the intended columns.
     pub fn from_columns(columns: Vec<Vec<FieldElement<F>>>) -> Self {
         if columns.is_empty() {
@@ -336,6 +353,7 @@ impl<F: IsField> Table<F> {
     }
 
     /// Given a row index, returns a reference to that row as a slice of field elements.
+    #[inline]
     pub fn get_row(&self, row_idx: usize) -> &[FieldElement<F>] {
         #[cfg(feature = "disk-spill")]
         if let Some(ref backing) = self.mmap_backing {
@@ -424,6 +442,7 @@ impl<F: IsField> Table<F> {
     }
 
     /// Given row and column indexes, returns the stored field element in that position of the table.
+    #[inline]
     pub fn get(&self, row: usize, col: usize) -> &FieldElement<F> {
         #[cfg(feature = "disk-spill")]
         if let Some(ref backing) = self.mmap_backing {

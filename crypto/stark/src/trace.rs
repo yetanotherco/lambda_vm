@@ -321,7 +321,9 @@ where
     /// Row-major main-trace buffer of length `num_rows * num_main_cols`.
     pub(crate) main_data: Vec<FieldElement<F>>,
     /// Row-major auxiliary-trace buffer of length `num_rows * num_aux_cols`.
-    pub(crate) aux_data: Vec<FieldElement<E>>,
+    /// A `Table` rather than a bare `Vec` so it can carry a disk-spilled
+    /// (mmap-backed) buffer — see the aux-LDE spill in the prover's aux stage.
+    pub(crate) aux_data: Table<E>,
     pub(crate) num_main_cols: usize,
     pub(crate) num_aux_cols: usize,
     pub(crate) num_rows: usize,
@@ -467,7 +469,7 @@ where
 
         Self {
             main_data,
-            aux_data,
+            aux_data: Table::from_row_major(aux_data, num_aux_cols),
             num_main_cols,
             num_aux_cols,
             num_rows,
@@ -483,21 +485,24 @@ where
     /// Build an LDETraceTable directly from row-major flat buffers. Skips the
     /// O(N·M) col→row transpose that `from_columns` pays — the caller produces
     /// the buffers row-major already (e.g. via `coset_lde_full_expand_row_major`).
+    ///
+    /// `aux_data` arrives as a `Table` so an already disk-spilled aux LDE keeps
+    /// its mmap backing instead of being pulled back onto the heap; its `width`
+    /// is the aux column count.
     pub fn from_row_major(
         main_data: Vec<FieldElement<F>>,
         num_main_cols: usize,
-        aux_data: Vec<FieldElement<E>>,
-        num_aux_cols: usize,
+        aux_data: Table<E>,
         trace_step_size: usize,
         blowup_factor: usize,
     ) -> Self {
         let lde_step_size = trace_step_size * blowup_factor;
+        let num_aux_cols = aux_data.width;
         let num_rows = if num_main_cols > 0 {
             debug_assert_eq!(main_data.len() % num_main_cols, 0);
             main_data.len() / num_main_cols
         } else if num_aux_cols > 0 {
-            debug_assert_eq!(aux_data.len() % num_aux_cols, 0);
-            aux_data.len() / num_aux_cols
+            aux_data.height
         } else {
             0
         };
@@ -566,7 +571,7 @@ where
             self.main_data = main_data;
         }
         if !aux_data.is_empty() {
-            self.aux_data = aux_data;
+            self.aux_data = Table::from_row_major(aux_data, self.num_aux_cols);
         }
         self.host_trace_empty = false;
     }
@@ -636,7 +641,7 @@ where
     /// Get a single aux-trace element by (row, col).
     #[inline]
     pub fn get_aux(&self, row: usize, col: usize) -> &FieldElement<E> {
-        &self.aux_data[row * self.num_aux_cols + col]
+        self.aux_data.get(row, col)
     }
 
     /// Borrow a full main-trace row as a contiguous slice (row-major buffer).
@@ -648,7 +653,7 @@ where
     /// Borrow a full aux-trace row as a contiguous slice (row-major buffer).
     #[inline]
     pub fn aux_row(&self, row: usize) -> &[FieldElement<E>] {
-        &self.aux_data[row * self.num_aux_cols..(row + 1) * self.num_aux_cols]
+        self.aux_data.get_row(row)
     }
 
     /// Gather a full main-trace row into an owned Vec.
@@ -878,7 +883,7 @@ where
             // buffer-level check as the main arm: mixed states are valid here.
             #[cfg(feature = "cuda")]
             assert!(
-                lde_trace.num_aux_cols() == 0 || !lde_trace.aux_data.is_empty(),
+                lde_trace.num_aux_cols() == 0 || !lde_trace.aux_data.row_major_data().is_empty(),
                 "R3 barycentric (aux) fell back to the host trace, but it is device-only (empty)"
             );
             let inv_denoms_v =
