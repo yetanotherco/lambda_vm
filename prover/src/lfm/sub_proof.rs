@@ -2,7 +2,7 @@
 //! cells the Merkle authentication authenticates.
 //!
 //! The [constraint](super::constraints) and [DEEP](super::deep) legs consume
-//! opened values; the [Merkle walk](super::edsl::keccak_merkle_walk)
+//! opened values; the [Merkle walk](super::edsl::wrap_merkle_walk)
 //! authenticates them. Built separately the two are each correct and neither
 //! says anything about the other — a program could fold one set of values and
 //! authenticate a different set, and every test that fed both halves the same
@@ -57,7 +57,7 @@ use crate::tables::types::{FE, GoldilocksField};
 
 use super::builder::{Bit, Cell, Ext, Felt, LfmBuilder};
 use super::deep::{DeepInvariants, DeepOpening, DeepShape, emit_deep_point};
-use super::edsl::{self, KeccakDigest};
+use super::edsl::{self, WrapDigest};
 
 /// Rows a Merkle leaf covers — `crypto/stark`'s `ROWS_PER_LEAF`, mirrored here
 /// because it fixes program shape: a leaf holds a row PAIR, which is why one
@@ -225,12 +225,12 @@ pub struct GroupOpening {
     pub values: Vec<Cell>,
     /// Sibling digests, LEAF LEVEL FIRST — the order
     /// `verify_merkle_path_from_leaf_hash` consumes them in.
-    pub siblings: Vec<KeccakDigest>,
+    pub siblings: Vec<WrapDigest>,
 }
 
 /// The leaf hash of one group's row pair, in the production commitment layout.
 ///
-/// Base groups go through [`edsl::keccak_leaf_hash`] unchanged. Extension
+/// Base groups go through [`edsl::wrap_leaf_hash`] unchanged. Extension
 /// groups render each element as its three components, each big-endian —
 /// `write_bytes_be` writes components 0, 1, 2 in that order, so the machine
 /// unpacks the word and byteswaps lanes 0, 1, 2.
@@ -242,7 +242,7 @@ pub struct GroupOpening {
 /// fold, and an ext read of a word with a nonzero lane 3 is unprovable. A
 /// caller that authenticated an extension group WITHOUT folding it would owe
 /// that check itself.
-pub fn emit_leaf_hash(b: &mut LfmBuilder, shape: GroupShape, values: &[Cell]) -> KeccakDigest {
+pub fn emit_leaf_hash(b: &mut LfmBuilder, shape: GroupShape, values: &[Cell]) -> WrapDigest {
     use super::keccak_host::BYTES_PER_HALF;
     use super::transcript_replay::felt_be_halves;
 
@@ -253,7 +253,7 @@ pub fn emit_leaf_hash(b: &mut LfmBuilder, shape: GroupShape, values: &[Cell]) ->
     );
     if !shape.is_ext {
         let felts: Vec<Felt> = values.iter().map(|c| Felt(c.addr())).collect();
-        return edsl::keccak_leaf_hash(b, &felts);
+        return edsl::wrap_leaf_hash(b, &felts);
     }
 
     let mut stream = Vec::with_capacity(6 * values.len());
@@ -265,7 +265,7 @@ pub fn emit_leaf_hash(b: &mut LfmBuilder, shape: GroupShape, values: &[Cell]) ->
     }
     let len_bytes = BYTES_PER_HALF * stream.len();
     debug_assert_eq!(len_bytes, shape.leaf_bytes());
-    edsl::keccak256(b, &stream, len_bytes)
+    edsl::wrap_hash_bytes(b, &stream, len_bytes)
 }
 
 /// Authenticate one group's opened values against its committed root.
@@ -286,7 +286,7 @@ pub fn emit_group_authentication(
         "one sibling per level, and every group walks the same index"
     );
     let leaf = emit_leaf_hash(b, commitment.shape, &opening.values);
-    let root = edsl::keccak_merkle_walk(b, leaf, bits, &opening.siblings);
+    let root = edsl::wrap_merkle_walk(b, leaf, bits, &opening.siblings);
     edsl::assert_word_eq_lanes(b, root[0], &commitment.root_lanes[0]);
     edsl::assert_word_eq_lanes(b, root[1], &commitment.root_lanes[1]);
 }
@@ -597,7 +597,7 @@ pub fn emit_sub_proof_with_bits(
                         c
                     })
                     .collect();
-                let siblings: Vec<KeccakDigest> = (0..shape.merkle_depth)
+                let siblings: Vec<WrapDigest> = (0..shape.merkle_depth)
                     .map(|_| {
                         let lo = b.hint_word(queries, cursor);
                         let hi = b.hint_word(queries, cursor + 1);

@@ -805,15 +805,25 @@ pub const MAIN_COLUMNS: usize = cols::NUM_COLUMNS - cols::PREP_WIDTH;
 // Wire interpretation — the socket's framing over the shared dataflow
 // =========================================================================
 
-/// `m[8] = MODE_C·"LFMC" + MODE_T·"LFMT"` — the row's domain tag.
+/// `m[NUM_LANES] = MODE_C·"LFMC" + MODE_T·"LFMT" + MODE_L·"LFML"` — the row's
+/// domain tag.
 ///
-/// **Why this is not prover-chosen.** `MODE_C` and `MODE_T` are preprocessed
-/// columns: a row's mode is fixed by its position in the preprocessed trace,
+/// Two corrections this comment used to get wrong, both of them things a reader
+/// would act on. The tag sits at `m[NUM_LANES]`, i.e. **`m[12]` at the RATE-4
+/// lane count**, not at a fixed `m[8]` — see [`message_word_ref`], which is the
+/// point of use and says so. And the selector is **three** terms, not two:
+/// `MODE_L` joined it when the leaf mode got its own domain, which is what
+/// makes an internal node un-replayable as a leaf whatever the tree's depth
+/// (obligation O5).
+///
+/// **Why this is not prover-chosen.** The mode columns are preprocessed:
+/// a row's mode is fixed by its position in the preprocessed trace,
 /// that trace is fixed by its commitment, and the commitment is folded into
 /// `lfm_program_id`. The prover chooses neither, which is the same argument
 /// that already makes the mu gate trustworthy. Two constraints make it bite —
 /// the mode-sum booleanity (idx 4) forces at most one tag to be selected, and
-/// `MODE_T` being preprocessed is what stops the selector itself being chosen.
+/// the mode columns being preprocessed is what stops the selector itself being
+/// chosen.
 /// Controls M5 and M6 in `blake3_socket_tests` are what make each of those
 /// dependencies a checked claim rather than an assertion.
 const TAG_SELECTOR: &[(usize, u32)] = &[

@@ -1,4 +1,4 @@
-//! `LfmAirs` — the machine's fixed 14-chip AIR set, a sibling of `VmAirs`.
+//! `LfmAirs` — the machine's fixed 15-chip AIR set, a sibling of `VmAirs`.
 //!
 //! The chip set never varies; only heights do (per program). Programs are
 //! supplied preprocessed roots (resolved from `LFM_REGISTRY` at verify time),
@@ -20,6 +20,7 @@ use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 
 use crate::tables::{bitwise, keccak_rc, keccak_rnd};
 
+use super::blake3_chip;
 use super::chips::{balu, bitdec, const_, hash, hint, keccak, lanes, public, range, select, xalu};
 use super::hash::HasherKind;
 use super::layout;
@@ -33,7 +34,7 @@ pub type DynLfmAir<'a> = &'a dyn AIR<Field = F, FieldExtension = E, PublicInputs
 
 /// The frozen chip order — everywhere: roots, digests, traces, proofs.
 ///
-/// Slots 11–13 are the production keccak family, hosted unchanged. They belong
+/// Slots 12–14 are the production keccak family, hosted unchanged. They belong
 /// to the *fixed* machine, so **every** LFM proof carries them — including the
 /// 2^20-row BITWISE table, which costs a few seconds of prove time even for a
 /// program containing no keccak at all. That is the deliberate price of the
@@ -43,11 +44,11 @@ pub type DynLfmAir<'a> = &'a dyn AIR<Field = F, FieldExtension = E, PublicInputs
 /// negotiation onto the verify path, which this design refuses.
 ///
 /// This is the count of chip *classes*, and the width of the roots and
-/// log-heights arrays. `KECCAK_RND` (slot 11) may be instantiated more than
+/// log-heights arrays. `KECCAK_RND` (slot 12) may be instantiated more than
 /// once — see [`num_lfm_airs`] — but its chunk count is program shape read
 /// from the registry, not shape negotiated on the verify path, so the
 /// principle above holds.
-pub const NUM_LFM_CHIPS: usize = 14;
+pub const NUM_LFM_CHIPS: usize = 15;
 pub const LFM_CHIP_NAMES: [&str; NUM_LFM_CHIPS] = [
     "LFM_CONST",
     "LFM_BALU",
@@ -60,6 +61,7 @@ pub const LFM_CHIP_NAMES: [&str; NUM_LFM_CHIPS] = [
     "LFM_HINT",
     "LFM_PUBLIC",
     "LFM_RANGE",
+    "LFM_BLAKE3",
     "KECCAK_RND",
     "KECCAK_RC",
     "BITWISE",
@@ -68,10 +70,17 @@ pub const LFM_CHIP_NAMES: [&str; NUM_LFM_CHIPS] = [
 /// Slot of `KECCAK_RND`, the one AIR in the set with **no** preprocessed
 /// columns — it has no root to supply, pin, or bind into the program digest.
 /// It is also the one slot that expands into several AIR instances; the
-/// chunks sit contiguously at 11.., so `KECCAK_RC` and `BITWISE` follow them
-/// in the AIR list while keeping chip-class indices 12 and 13 in the roots
+/// chunks sit contiguously at 12.., so `KECCAK_RC` and `BITWISE` follow them
+/// in the AIR list while keeping chip-class indices 13 and 14 in the roots
 /// and log-heights arrays.
-pub const KECCAK_RND_SLOT: usize = 11;
+///
+/// `LFM_BLAKE3` was placed at 11 — last of the LFM chips, before the hosted
+/// family — rather than appended at 14, so this constant stays the boundary
+/// between "chips this machine owns" and "tables it hosts". Appending would
+/// have left the count arithmetic below untouched at the cost of putting a
+/// program-dependent group after two fixed tables, which is the shape every
+/// index expression here is written against.
+pub const KECCAK_RND_SLOT: usize = 12;
 
 /// AIR instances (and sub-proofs) in a proof whose `KECCAK_RND` is split into
 /// `keccak_rnd_chunks` instances.
@@ -218,6 +227,12 @@ pub fn lfm_chip_census_with_hasher(
             layout::range::PREP_WIDTH,
             range::bus_interactions().len(),
         ),
+        (
+            g.blake3.padded_rows as u64,
+            blake3_chip::cols::NUM_COLUMNS,
+            layout::blake3::PREP_WIDTH,
+            blake3_chip::bus_interactions().len(),
+        ),
         // The keccak family's two fixed tables. `KECCAK_RND`'s chunks follow.
         (
             keccak_rc::NUM_ROWS as u64,
@@ -232,10 +247,10 @@ pub fn lfm_chip_census_with_hasher(
             bitwise::bus_interactions().len(),
         ),
     ];
-    // The frozen AIR order is `air_refs`': chip classes 0..=10, then every
-    // `KECCAK_RND` chunk, then `KECCAK_RC` and `BITWISE`. `per_chip` above lists
-    // the classes with the last two at the end, so the chunks are spliced in
-    // before them rather than appended.
+    // The frozen AIR order is `air_refs`': chip classes 0..=11 (`LFM_BLAKE3` is
+    // the last of them), then every `KECCAK_RND` chunk, then `KECCAK_RC` and
+    // `BITWISE`. `per_chip` above lists the classes with the last two at the
+    // end, so the chunks are spliced in before them rather than appended.
     let rnd_interactions = keccak_rnd::bus_interactions().len();
     let mut census = Vec::with_capacity(per_chip.len() + 1);
     for (slot, (rows, num_cols, prep, interactions)) in per_chip.into_iter().enumerate() {
@@ -250,8 +265,8 @@ pub fn lfm_chip_census_with_hasher(
             }
         }
         census.push(LfmChipCells {
-            // `per_chip`'s last two entries are chip classes 12 and 13, which sit
-            // at indices 11 and 12 of that array — hence the shift past the
+            // `per_chip`'s last two entries are chip classes 13 and 14, which sit
+            // at indices 12 and 13 of that array — hence the shift past the
             // `KECCAK_RND` slot rather than a plain index.
             name: LFM_CHIP_NAMES[if slot >= KECCAK_RND_SLOT {
                 slot + 1
@@ -301,6 +316,12 @@ pub struct LfmAirs {
     hint: LfmAir<EmptyConstraints>,
     public: LfmAir<EmptyConstraints>,
     range: LfmAir<EmptyConstraints>,
+    /// The BLAKE3 compression chip — a real constrained chip, unlike
+    /// `LFM_KECCAK`, which is an adapter that delegates its permutation to the
+    /// hosted family. Its AIR and its trace filler live in
+    /// [`super::blake3_chip`] rather than in `chips.rs` for that reason: there
+    /// is nothing here to adapt, only a chip to name.
+    blake3: LfmAir<blake3_chip::Blake3LfmConstraints>,
     /// One instance per `KECCAK_RND` chunk. Every instance is the identical
     /// AIR — chunking changes only how many rows each one carries — so they
     /// are built in a loop rather than named individually.
@@ -479,6 +500,15 @@ impl LfmAirs {
                 roots[10],
                 layout::range::PREP_WIDTH,
             ),
+            blake3: build_air(
+                blake3_chip::cols::NUM_COLUMNS,
+                blake3_chip::bus_interactions(),
+                options,
+                blake3_chip::Blake3LfmConstraints,
+                LFM_CHIP_NAMES[11],
+                roots[11],
+                layout::blake3::PREP_WIDTH,
+            ),
             // KECCAK_RND has no preprocessed columns: `roots[KECCAK_RND_SLOT]`
             // is the all-zero sentinel and is never consulted. Its correctness
             // is entirely its own constraints plus bus balance, both
@@ -492,7 +522,7 @@ impl LfmAirs {
                         keccak_rnd::bus_interactions(),
                         options,
                         keccak_rnd::KeccakRndConstraints,
-                        LFM_CHIP_NAMES[11],
+                        LFM_CHIP_NAMES[KECCAK_RND_SLOT],
                     )
                 })
                 .collect(),
@@ -501,8 +531,8 @@ impl LfmAirs {
                 keccak_rc::bus_interactions(),
                 options,
                 EmptyConstraints,
-                LFM_CHIP_NAMES[12],
-                roots[12],
+                LFM_CHIP_NAMES[13],
+                roots[13],
                 keccak_rc::NUM_PRECOMPUTED_COLS,
             ),
             bitwise: build_air(
@@ -510,8 +540,8 @@ impl LfmAirs {
                 bitwise::bus_interactions(),
                 options,
                 EmptyConstraints,
-                LFM_CHIP_NAMES[13],
-                roots[13],
+                LFM_CHIP_NAMES[14],
+                roots[14],
                 bitwise::NUM_PRECOMPUTED_COLS,
             ),
         }
@@ -536,6 +566,7 @@ impl LfmAirs {
             &self.hint,
             &self.public,
             &self.range,
+            &self.blake3,
         ];
         refs.extend(self.keccak_rnd.iter().map(|a| a as DynLfmAir<'_>));
         refs.push(&self.keccak_rc);
@@ -570,6 +601,7 @@ impl LfmAirs {
             (&self.hint, &mut traces.hint, &()),
             (&self.public, &mut traces.public, &()),
             (&self.range, &mut traces.range, &()),
+            (&self.blake3, &mut traces.blake3, &()),
         ];
         pairs.extend(
             self.keccak_rnd

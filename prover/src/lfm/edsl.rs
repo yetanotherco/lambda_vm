@@ -216,16 +216,33 @@ pub fn merkle_walk(
 
 // ===================== production keccak Merkle =====================
 
-/// A 32-byte keccak digest as it lives in the machine: two words of four `u32`
-/// halves each, half `h` carrying digest bytes `4h..4h+4`.
-pub type KeccakDigest = [Cell; 2];
+/// A 32-byte digest as it lives in the machine: two words of four `u32` halves
+/// each, half `h` carrying digest bytes `4h..4h+4`.
+///
+/// ★ **One type for both production hashes, and that is load-bearing rather
+/// than a coincidence.** `keccak256`'s digest is the state's first 32 bytes and
+/// `Blake3Chain`'s is `out[0..8]` little-endian, so under both hashes digest
+/// byte `j` is byte `j % 4` of half `j / 4`. Every arena stride, every
+/// `siblings: Vec<...>` width and every proof shape is therefore identical
+/// across the two, which is what lets the constructions below be parameterized
+/// on the hash rather than duplicated per hash. The `LFM_HASH` socket would
+/// NOT have this property — its digest is 128 bits, one cell.
+pub type WrapDigest = [Cell; 2];
+
+/// A 32-byte keccak digest. See [`WrapDigest`].
+pub type KeccakDigest = WrapDigest;
+
+/// A 32-byte BLAKE3 digest. See [`WrapDigest`].
+pub type Blake3Digest = WrapDigest;
 
 /// Halves in a 32-byte digest.
 pub const DIGEST_HALVES: usize = 8;
 
-/// The eight halves of a keccak digest, ready to be streamed into another
-/// `keccak256`.
-pub fn keccak_digest_halves(b: &mut LfmBuilder, d: KeccakDigest) -> [Felt; DIGEST_HALVES] {
+/// The eight halves of a digest, ready to be streamed into another hash.
+///
+/// Hash-agnostic: it is two `Unpack`s, and both production digests use the same
+/// half convention ([`WrapDigest`]).
+pub fn digest_halves(b: &mut LfmBuilder, d: WrapDigest) -> [Felt; DIGEST_HALVES] {
     let lo = b.unpack(d[0]);
     let hi = b.unpack(d[1]);
     core::array::from_fn(|h| if h < 4 { lo[h] } else { hi[h - 4] })
@@ -258,6 +275,22 @@ pub fn keccak_digest_halves(b: &mut LfmBuilder, d: KeccakDigest) -> [Felt; DIGES
 /// algebra and as BYTES by this hash, so something has to connect the two
 /// representations, and only the machine can do it in a way the proof binds.
 pub fn keccak_leaf_hash(b: &mut LfmBuilder, values: &[Felt]) -> KeccakDigest {
+    WrapHash::Keccak.leaf_hash(b, values)
+}
+
+/// The byte stream a Merkle LEAF hashes, and the shape it covers.
+///
+/// Split out of [`WrapHash::leaf_hash`] so the group's boundary is explicit
+/// data rather than a length the hash call happens to receive: the batched
+/// (mixed-height, per-matrix) leaf the MMCS lane needs adds a header to
+/// exactly this, and can do so without re-cutting the emitter.
+///
+/// Every element is a base field element rendered as its canonical `u64` in
+/// BIG-endian bytes (`FieldElement<GoldilocksField>::stream_bytes`), so each
+/// costs one [`super::transcript_replay::felt_be_halves`]: one `LFM_BITDEC` row
+/// and 64 `LFM_BALU` rows. The byte content is the hash's input and is
+/// identical under both wrap hashes — only the framing above it differs.
+pub fn leaf_stream(b: &mut LfmBuilder, values: &[Felt]) -> (Vec<Felt>, usize) {
     use super::keccak_host::BYTES_PER_HALF;
     use super::transcript_replay::felt_be_halves;
 
@@ -267,7 +300,7 @@ pub fn keccak_leaf_hash(b: &mut LfmBuilder, values: &[Felt]) -> KeccakDigest {
         stream.extend(felt_be_halves(b, *v));
     }
     let len_bytes = BYTES_PER_HALF * stream.len();
-    keccak256(b, &stream, len_bytes)
+    (stream, len_bytes)
 }
 
 /// Walk one Merkle authentication path under the PRODUCTION hash.
@@ -295,15 +328,7 @@ pub fn keccak_merkle_walk(
     bits: &[Bit],
     siblings: &[KeccakDigest],
 ) -> KeccakDigest {
-    assert_eq!(bits.len(), siblings.len(), "one sibling per level");
-    let mut current = leaf;
-    for (bit, sibling) in bits.iter().zip(siblings) {
-        // Both halves of the digest must swap on the SAME bit.
-        let (l0, r0) = b.select(*bit, current[0], sibling[0]);
-        let (l1, r1) = b.select(*bit, current[1], sibling[1]);
-        current = keccak_hash_pair(b, [l0, l1], [r0, r1]);
-    }
-    current
+    WrapHash::Keccak.merkle_walk(b, leaf, bits, siblings)
 }
 
 /// The production Merkle PARENT hash: `keccak(left ‖ right)`.
@@ -323,12 +348,24 @@ pub fn keccak_hash_pair(
     left: KeccakDigest,
     right: KeccakDigest,
 ) -> KeccakDigest {
-    let left_halves = keccak_digest_halves(b, left);
-    let right_halves = keccak_digest_halves(b, right);
+    WrapHash::Keccak.hash_pair(b, left, right)
+}
+
+/// The 16 halves a Merkle PARENT hashes: `left ‖ right`, 64 bytes.
+///
+/// Hash-agnostic — `hash_new_parent` streams the two 32-byte nodes with no
+/// domain separation and no ordering flag under either hash. What differs is
+/// what 64 bytes COSTS: one keccak permutation (inside the 136-byte rate) and
+/// one BLAKE3 compression (exactly one 64-byte block). Both are one invocation,
+/// which is why the parent layer is 1:1 across the switch and the whole win
+/// there is per-compression cost.
+fn parent_stream(b: &mut LfmBuilder, left: WrapDigest, right: WrapDigest) -> Vec<Felt> {
+    let left_halves = digest_halves(b, left);
+    let right_halves = digest_halves(b, right);
     let mut stream = Vec::with_capacity(2 * DIGEST_HALVES);
     stream.extend(left_halves);
     stream.extend(right_halves);
-    keccak256(b, &stream, 2 * COMMITMENT_BYTES)
+    stream
 }
 
 /// Build a whole Merkle TREE bottom-up and return its root.
@@ -350,20 +387,158 @@ pub fn keccak_hash_pair(
 /// than a case to handle, and emitting duplicate-leaf padding no production
 /// commitment can reach would be dead program text.
 pub fn keccak_merkle_tree_root(b: &mut LfmBuilder, leaves: &[KeccakDigest]) -> KeccakDigest {
-    assert!(!leaves.is_empty(), "a tree has at least one leaf");
-    assert!(
-        leaves.len().is_power_of_two(),
-        "leaf counts are shape and must be a power of two; production would \
-         pad by repeating the last leaf and no caller here needs that"
-    );
-    let mut level = leaves.to_vec();
-    while level.len() > 1 {
-        level = level
-            .chunks_exact(2)
-            .map(|pair| keccak_hash_pair(b, pair[0], pair[1]))
-            .collect();
+    WrapHash::Keccak.merkle_tree_root(b, leaves)
+}
+
+// ===================== the wrap's commitment hash =====================
+
+/// Which byte hash the wrap's commitment layer runs.
+///
+/// ★ **A parameter, not a switch.** The whole construction layer below —
+/// leaves, parents, path walks, whole-tree builds — is written ONCE and
+/// dispatches only at the two places a hash actually appears: hashing a byte
+/// stream, and hashing a 64-byte parent. That is possible because
+/// [`WrapDigest`] is the same shape under both, so no call site's types move.
+///
+/// Two consequences worth stating because they are the reason for the shape:
+///
+/// - A batched (mixed-height, per-matrix) leaf adds ONE construction, not one
+///   per hash — which is what the MMCS lane's emitter step needs.
+/// - Switching the wrap's hash is a value flowing through the emitters, so an
+///   honest-path control (keccak still proves and verifies through the same
+///   code) is a real control rather than a different code path.
+///
+/// [`Keccak`](WrapHash::Keccak) is the default and nothing selects
+/// [`Blake3`](WrapHash::Blake3) yet: the flip is a separate, announced step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WrapHash {
+    #[default]
+    Keccak,
+    Blake3,
+}
+
+impl WrapHash {
+    /// The hash of a byte stream supplied as `u32`-half felts.
+    ///
+    /// Both hashes take the SAME packing — four bytes per felt, little-endian
+    /// ([`super::keccak_host::pack_stream`]) — because a BLAKE3 message word is
+    /// itself a little-endian `u32` of four consecutive message bytes. So a
+    /// stream built for one is a stream for the other, and only the framing
+    /// above it changes: 136-byte rate blocks with `pad10*1` against 64-byte
+    /// blocks with zero padding and an explicit `block_len`.
+    pub fn hash_bytes(self, b: &mut LfmBuilder, stream: &[Felt], len_bytes: usize) -> WrapDigest {
+        match self {
+            WrapHash::Keccak => keccak256(b, stream, len_bytes),
+            WrapHash::Blake3 => blake3_256(b, stream, len_bytes),
+        }
     }
-    level[0]
+
+    /// [`WrapHash::hash_bytes`] returning BOTH the digest and its byte-REVERSED
+    /// form — what `DefaultTranscript::sample()` returns and re-absorbs.
+    ///
+    /// Free under both hashes, for the same reason: the bus recomposes each
+    /// `u32` lane from four byte columns, so the reversal is a second `Linear`
+    /// over the same columns (`layout::keccak::REV_ADDR0`,
+    /// `layout::blake3::REV_ADDR0`).
+    pub fn hash_bytes_with_rev(
+        self,
+        b: &mut LfmBuilder,
+        stream: &[Felt],
+        len_bytes: usize,
+    ) -> (WrapDigest, [Cell; 2]) {
+        match self {
+            WrapHash::Keccak => keccak256_with_rev(b, stream, len_bytes),
+            WrapHash::Blake3 => blake3_256_with_rev(b, stream, len_bytes),
+        }
+    }
+
+    /// The Merkle LEAF hash of a row pair, in the production commitment layout.
+    ///
+    /// See [`leaf_stream`] for what the bytes are and what they cost; this adds
+    /// only the hash. The rate penalty the campaign prices lands here and
+    /// nowhere else: a leaf absorbs 136 bytes per keccak permutation against 64
+    /// per BLAKE3 compression.
+    pub fn leaf_hash(self, b: &mut LfmBuilder, values: &[Felt]) -> WrapDigest {
+        let (stream, len_bytes) = leaf_stream(b, values);
+        self.hash_bytes(b, &stream, len_bytes)
+    }
+
+    /// The production Merkle PARENT hash: `hash(left ‖ right)`.
+    ///
+    /// One invocation under either hash — 64 bytes fits inside keccak's 136-byte
+    /// rate and IS exactly one BLAKE3 block. This is the step
+    /// [`WrapHash::merkle_walk`] performs once per level after its `Select`, and
+    /// the step a whole-tree build performs once per internal node with no
+    /// `Select` at all: a tree's child ORDER is known when the program is
+    /// emitted. Keeping the two callers on one primitive is what makes "the walk
+    /// and the build hash the same way" a property of the code.
+    pub fn hash_pair(self, b: &mut LfmBuilder, left: WrapDigest, right: WrapDigest) -> WrapDigest {
+        let stream = parent_stream(b, left, right);
+        self.hash_bytes(b, &stream, 2 * COMMITMENT_BYTES)
+    }
+
+    /// Walk one Merkle authentication path under the production hash.
+    ///
+    /// `bits` are the leaf index low-to-high, level 0 first; `bit = 0` means the
+    /// current node is the LEFT child, matching
+    /// `verify_merkle_path_from_leaf_hash` (`index % 2 == 0 ⇒ hash(current,
+    /// sibling)`). Per level: two `Select`s (a digest is two words and both must
+    /// swap on the same bit), four `Unpack`s and one hash invocation.
+    ///
+    /// A loop over the siblings it is given, with no arity or height assumption
+    /// beyond the one-sibling-per-level assert — deliberately, so a batched path
+    /// that injects at mixed heights extends this rather than replacing it.
+    ///
+    /// Not interchangeable with [`merkle_walk`], which compresses with
+    /// `LFM_HASH`/`TestPermutation`, the deliberately non-cryptographic
+    /// Milestone-C placeholder.
+    pub fn merkle_walk(
+        self,
+        b: &mut LfmBuilder,
+        leaf: WrapDigest,
+        bits: &[Bit],
+        siblings: &[WrapDigest],
+    ) -> WrapDigest {
+        assert_eq!(bits.len(), siblings.len(), "one sibling per level");
+        let mut current = leaf;
+        for (bit, sibling) in bits.iter().zip(siblings) {
+            // Both halves of the digest must swap on the SAME bit.
+            let (l0, r0) = b.select(*bit, current[0], sibling[0]);
+            let (l1, r1) = b.select(*bit, current[1], sibling[1]);
+            current = self.hash_pair(b, [l0, l1], [r0, r1]);
+        }
+        current
+    }
+
+    /// Build a whole Merkle TREE bottom-up and return its root.
+    ///
+    /// The counterpart of [`WrapHash::merkle_walk`]: the walk authenticates ONE
+    /// leaf against a root it is given, this CONSTRUCTS the root from every
+    /// leaf. A derivation needs the second — there is no root to authenticate
+    /// against, producing it is the point. Cost is `leaves − 1` parent hashes.
+    ///
+    /// `MerkleTree::build_from_hashed_leaves` runs `complete_until_power_of_two`
+    /// first, which pads by REPEATING the last leaf. This asserts a power of two
+    /// instead of emitting that padding: leaf counts here are shape (an LDE row
+    /// count over `ROWS_PER_LEAF`), so a non-power-of-two is a caller bug, and
+    /// emitting duplicate-leaf padding no production commitment can reach would
+    /// be dead program text.
+    pub fn merkle_tree_root(self, b: &mut LfmBuilder, leaves: &[WrapDigest]) -> WrapDigest {
+        assert!(!leaves.is_empty(), "a tree has at least one leaf");
+        assert!(
+            leaves.len().is_power_of_two(),
+            "leaf counts are shape and must be a power of two; production would \
+             pad by repeating the last leaf and no caller here needs that"
+        );
+        let mut level = leaves.to_vec();
+        while level.len() > 1 {
+            level = level
+                .chunks_exact(2)
+                .map(|pair| self.hash_pair(b, pair[0], pair[1]))
+                .collect();
+        }
+        level[0]
+    }
 }
 
 /// Bytes in a commitment / Merkle node.
@@ -419,6 +594,98 @@ pub fn fri_fold(b: &mut LfmBuilder, lo: Ext, hi: Ext, zeta: Ext, inv_x: Felt) ->
     let zd = b.emul(zeta, diff);
     let scaled = b.emul_base(zd, inv_x);
     b.eadd(sum, scaled)
+}
+
+// ============ the configured hash, as free functions ============
+//
+// Every construction below reads `b.wrap_hash()`. Call sites take no hash
+// parameter, so there is no site to forget at the flip — and the emitters that
+// must NOT follow the configuration (`programs::emit_program_id`, the R1c
+// instruments) keep naming `keccak256` and friends directly, which makes a grep
+// for the pinned hash in `lfm/` return exactly the deliberate exceptions.
+
+/// [`WrapHash::hash_bytes`] under the builder's configured hash.
+pub fn wrap_hash_bytes(b: &mut LfmBuilder, stream: &[Felt], len_bytes: usize) -> WrapDigest {
+    let h = b.wrap_hash();
+    h.hash_bytes(b, stream, len_bytes)
+}
+
+/// [`WrapHash::hash_bytes_with_rev`] under the builder's configured hash.
+pub fn wrap_hash_bytes_with_rev(
+    b: &mut LfmBuilder,
+    stream: &[Felt],
+    len_bytes: usize,
+) -> (WrapDigest, [Cell; 2]) {
+    let h = b.wrap_hash();
+    h.hash_bytes_with_rev(b, stream, len_bytes)
+}
+
+/// [`WrapHash::leaf_hash`] under the builder's configured hash.
+pub fn wrap_leaf_hash(b: &mut LfmBuilder, values: &[Felt]) -> WrapDigest {
+    let h = b.wrap_hash();
+    h.leaf_hash(b, values)
+}
+
+/// [`WrapHash::hash_pair`] under the builder's configured hash.
+pub fn wrap_hash_pair(b: &mut LfmBuilder, left: WrapDigest, right: WrapDigest) -> WrapDigest {
+    let h = b.wrap_hash();
+    h.hash_pair(b, left, right)
+}
+
+/// [`WrapHash::merkle_walk`] under the builder's configured hash.
+pub fn wrap_merkle_walk(
+    b: &mut LfmBuilder,
+    leaf: WrapDigest,
+    bits: &[Bit],
+    siblings: &[WrapDigest],
+) -> WrapDigest {
+    let h = b.wrap_hash();
+    h.merkle_walk(b, leaf, bits, siblings)
+}
+
+/// [`WrapHash::merkle_tree_root`] under the builder's configured hash.
+pub fn wrap_merkle_tree_root(b: &mut LfmBuilder, leaves: &[WrapDigest]) -> WrapDigest {
+    let h = b.wrap_hash();
+    h.merkle_tree_root(b, leaves)
+}
+
+// ===================== small arithmetic predicates =====================
+
+/// `1` if `x == 0`, else `0`, for an `x` the caller knows is below `2^nbits`.
+///
+/// Hint-free by necessity. The textbook `1 − x·x⁻¹` needs an inverse witness,
+/// and the only witness channel this machine has is an arena — whose standing
+/// rule is that everything hinted is transitively hash-authenticated, which an
+/// inverse is not. So the DECOMPOSITION is the witness: `LFM_BITDEC` proves the
+/// bits really are `x`'s, and `Π (1 − bᵢ)` is one exactly when every bit is
+/// zero. The result is a product of booleans, so it is boolean by construction
+/// and legal as a `Select` bit.
+///
+/// Cost: one `LFM_BITDEC` row plus `2·nbits − 1` `LFM_BALU` rows. The caller's
+/// bound is load-bearing — bits above `nbits` are not decomposed into cells, so
+/// a larger `x` would be reported zero on its low bits alone.
+pub fn is_zero_bounded(b: &mut LfmBuilder, x: Felt, nbits: usize) -> Bit {
+    let bits = b.bit_dec(x, nbits);
+    let one = b.felt_const(FE::one());
+    let mut acc = one;
+    for bit in bits {
+        let complement = b.sub(one, bit.as_felt());
+        acc = b.mul(acc, complement);
+    }
+    Bit(acc.0)
+}
+
+/// `1` if `x == 2^nbits − 1`, else `0`, for an `x` below `2^nbits`.
+///
+/// The dual of [`is_zero_bounded`] and cheaper by the complements: `Π bᵢ`.
+pub fn is_all_ones_bounded(b: &mut LfmBuilder, x: Felt, nbits: usize) -> Bit {
+    let bits = b.bit_dec(x, nbits);
+    let one = b.felt_const(FE::one());
+    let mut acc = one;
+    for bit in bits {
+        acc = b.mul(acc, bit.as_felt());
+    }
+    Bit(acc.0)
 }
 
 // ============================== keccak256 ==============================
@@ -478,6 +745,143 @@ pub fn bits_to_felt(b: &mut LfmBuilder, bits: &[Bit]) -> Felt {
         acc = b.mul_add(acc, two, bit.as_felt());
     }
     acc
+}
+
+// ============================== Blake3Chain ==============================
+
+/// `Blake3Chain` over a byte stream supplied as `u32`-half felts — the same
+/// packing [`keccak256`] takes, because a BLAKE3 message word IS a
+/// little-endian `u32` of four consecutive message bytes.
+///
+/// Returns the 32-byte digest as two machine words. The digest is the
+/// compression's output words 0 and 1 (`out[0..8]` little-endian), so reading it
+/// costs nothing — and the CHAINING VALUE of the next block is those same two
+/// words, which is why multi-block messages need no repacking between blocks.
+///
+/// Shapes are compile-time, as everywhere in this machine: `len_bytes` fixes the
+/// block count, the `block_len` of the final block and the whole flag schedule,
+/// all of which are emitted as interned program CONSTANTS. The schedule itself
+/// is read from [`crypto::hash::blake3::chain`] rather than restated here — see
+/// [`blake3_absorb_all`].
+pub fn blake3_256(b: &mut LfmBuilder, stream: &[Felt], len_bytes: usize) -> Blake3Digest {
+    blake3_absorb_all(b, stream, len_bytes, false).0
+}
+
+/// [`blake3_256`], returning the byte-REVERSED digest instead — the value the
+/// production `DefaultTranscript::sample()` both returns as the challenge and
+/// re-absorbs as the next segment's prefix.
+pub fn blake3_256_rev(b: &mut LfmBuilder, stream: &[Felt], len_bytes: usize) -> [Cell; 2] {
+    blake3_absorb_all(b, stream, len_bytes, true)
+        .1
+        .expect("requested")
+}
+
+/// [`blake3_256`] returning BOTH digests — plain and byte-reversed — off the one
+/// compression that produces them.
+pub fn blake3_256_with_rev(
+    b: &mut LfmBuilder,
+    stream: &[Felt],
+    len_bytes: usize,
+) -> (Blake3Digest, [Cell; 2]) {
+    let (digest, rev) = blake3_absorb_all(b, stream, len_bytes, true);
+    (digest, rev.expect("requested"))
+}
+
+/// The `Blake3Chain` framing, emitted.
+///
+/// Three differences from [`keccak256_absorb_all`], each a place a port goes
+/// wrong silently, so each is named:
+///
+/// - **No padding constants.** BLAKE3 zero-pads. There is no `pad10*1`, no
+///   `pad_half`, and nothing analogous to keccak's `stream[g] + pad` merge —
+///   a half past the message is the shared zero cell, full stop.
+/// - **`block_len` is data, not shape-implied.** The final block carries the
+///   true byte count where keccak encoded the same information positionally in
+///   its pad. Compile-time known, so it is an interned constant — but it must be
+///   *emitted*.
+/// - **Flags are a three-value schedule, not a constant.** First / interior /
+///   last, with a single-block message carrying both ends at once
+///   (`CHUNK_START | CHUNK_END | ROOT`), which is exactly the parent form.
+///
+/// ★ The schedule is [`chain::block_flags`] / [`chain::block_len_of`] /
+/// [`chain::num_blocks`] — the host hasher's own, hoisted into `crypto` for
+/// this caller. A second statement of "which block carries `CHUNK_START`" is the
+/// single most likely way for an in-machine hash to differ from the host's by
+/// one compression's flags, and that difference is a valid proof of the wrong
+/// digest.
+fn blake3_absorb_all(
+    b: &mut LfmBuilder,
+    stream: &[Felt],
+    len_bytes: usize,
+    want_rev: bool,
+) -> (Blake3Digest, Option<[Cell; 2]>) {
+    use super::blake3::BLAKE3_IV;
+    use super::blake3::chain::{BLOCK_LEN, block_flags, block_len_of, num_blocks};
+    use super::keccak_host::{BYTES_PER_HALF, num_stream_halves};
+
+    assert_eq!(
+        stream.len(),
+        num_stream_halves(len_bytes),
+        "stream must hold exactly ceil(len_bytes / 4) halves"
+    );
+
+    /// `u32` halves in one 64-byte BLAKE3 block: the message words `m[0..16]`.
+    const HALVES_PER_BLOCK: usize = BLOCK_LEN / BYTES_PER_HALF; // 16
+    /// Machine words the message occupies, four `u32` lanes each.
+    const MESSAGE_WORDS: usize = HALVES_PER_BLOCK / 4; // 4
+
+    let zero = b.felt_const(FE::zero());
+    let blocks = num_blocks(len_bytes);
+
+    // The initial chaining value: `BLAKE3_IV` as two interned constants. `h` is
+    // `u32` words 0..8, so word 0 is `IV[0..4]` and word 1 is `IV[4..8]`.
+    let iv_word = |b: &mut LfmBuilder, w: usize| -> Cell {
+        b.digest_const(core::array::from_fn(|l| {
+            FE::from(u64::from(BLAKE3_IV[4 * w + l]))
+        }))
+        .as_cell()
+    };
+    let mut h: [Cell; 2] = [iv_word(b, 0), iv_word(b, 1)];
+    let mut rev: Option<[Cell; 2]> = None;
+
+    for block in 0..blocks {
+        // Half `h` of this block is half `block * 16 + h` of the message; both a
+        // block (64 bytes) and a half (4 bytes) divide evenly, so the two
+        // indexings line up with no straddling. Halves past the message are the
+        // zero cell — the zero padding, with nothing to splice.
+        let message: [Cell; MESSAGE_WORDS] = core::array::from_fn(|w| {
+            let lane = |l: usize| {
+                let g = block * HALVES_PER_BLOCK + 4 * w + l;
+                if g < stream.len() { stream[g] } else { zero }
+            };
+            b.pack_word([lane(0), lane(1), lane(2), lane(3)])
+        });
+
+        // `(t_lo, t_hi, block_len, flags)`. `t = 0` at every block: the
+        // construction is a single chunk that never ends (PA-PLAN §1.7, F1).
+        let params = b
+            .digest_const([
+                FE::zero(),
+                FE::zero(),
+                FE::from(u64::from(block_len_of(block, len_bytes))),
+                FE::from(u64::from(block_flags(block, blocks))),
+            ])
+            .as_cell();
+
+        let out = if block + 1 == blocks && want_rev {
+            let (out, rev_words) = b.blake3_compress_rev(h, message, params);
+            rev = Some(rev_words);
+            out
+        } else {
+            b.blake3_compress(h, message, params)
+        };
+        // The next block's chaining value is `out[0..8]` — output words 0 and 1
+        // — and so is the digest when this was the last block. One and the same,
+        // which is what the truncation to `[out[0], out[1]]` says.
+        h = [out[0], out[1]];
+    }
+
+    (h, rev)
 }
 
 fn keccak256_absorb_all(

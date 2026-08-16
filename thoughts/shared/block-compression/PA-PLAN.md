@@ -422,16 +422,46 @@ gives. The 7r control says "we are not the standard at 7 rounds"; this says the
 divergence is *the chunking*, because a reference that is standard at 6 rounds
 too still parts from us at exactly the chunk boundary.
 
-That leaves the 6-round table cross-checked by two implementations sharing no
-code, over the whole range the prover actually hashes in. It is still not a
-*published* vector — nothing published computes this — but "regression pin only"
-would now understate it.
+That leaves the 6-round table cross-checked by implementations sharing no code,
+over the whole range the prover actually hashes in. It is still not a *published*
+vector — nothing published computes this — but "regression pin only" would now
+understate it.
 
-⚠ **Fragility to record.** The oracle survives only as `__pycache__` bytecode
-(`blake3_ref.cpython-314.pyc`) in an untracked directory; the `.py` source is
-gone, as is `canonical_6round_vectors.json`. The cross-check was run by loading
-the bytecode directly. The digests below are therefore the durable record of the
-result — re-running it depends on an artifact one `git clean` removes.
+✓ **Reproducible, not merely recorded.** Everything the cross-check needs is
+tracked. `thoughts/blake3/blake3-oracle/` holds `blake3_ref.py` (vendored at
+commit `65025095`), which exposes raw compression entry points — `compress`,
+`compress_cv`, `compress_6round` — as well as `blake3_hash`, alongside
+`canonical_6round_vectors.json`, `official_test_vectors.json` and
+`test_oracle.py`. The cross-check is therefore runnable at compression level, not
+only at full-hash level.
+
+★ **A second source, and it is the stronger one.**
+`thoughts/blake3/reference-impl/` is upstream BLAKE3 1.8.5's own portable C with
+its round loop parameterized; the entire edit is `PARAMETERISATION.diff`, which
+replaces seven unrolled `round_fn` calls with a loop bounded by
+`BLAKE3_ROUNDS_PARAM`. It reproduces `CANONICAL_VECTORS` at both round counts
+(10/10, all 16 words) and the §1.7.5 chain digests at 6 rounds over every length
+up to one chunk, and it diverges past one chunk — P3 confirmed from upstream's
+side. Crucially it encodes the message schedule as an indexed `MSG_SCHEDULE[r]`
+table where the Rust and CUDA compose a single permutation between rounds:
+structurally different expressions of one convention, so agreement
+cross-validates the schedule rather than restating it — a bug in the iterative
+composition is exactly what a single source cannot catch.
+`make test-blake3-second-source` runs it: a ~1 second C compile plus a 5000-case
+randomised differential, no cargo and no GPU.
+
+⚠ **What these vectors do NOT pin, and it is not obvious.** Every message in this
+subsection is hashed with `t = 0`, so nothing here constrains the counter split. A
+compression with `v[12]` and `v[13]` transposed reproduces the official vectors at
+all 65 single-block lengths *and* the multi-block chain vectors, and is caught
+only by `CANONICAL_VECTORS`, whose ten vectors all carry `t ≥ 2^32`: 320 failing
+words against 0 from either official table. Measured, not argued. The chain table
+and the compression table cover different axes and neither is redundant with the
+other — "the standard already covers it" is the reasoning that would retire the
+only check on the counter split. Separately, the `r < rounds - 1` permutation
+guard is **unobservable**: always permuting gives identical output at both round
+counts, because the schedule permuted after the final round is never read. It is
+an optimization, not a convention any known-answer test can validate.
 
 #### 1.7.5 The committed 6-round vectors
 
@@ -1023,6 +1053,87 @@ Its polarity inverts at the flip, and that is the point:
 - Stage 6 (flip): cross-verify must **FAIL** both directions, and a same-ref
   blake3 round trip must pass. A passing cross-verify after the flip would mean
   the hash did not actually move.
+
+### 6.0 ★ THE FLIP CHECKLIST — what Stage 6 must edit, and what catches a miss
+
+Written after Stage 5 landed and its adversarial review ran; finding rev-emit E3
+is what this section exists for.
+
+**The hazard.** Stage 5 put the wrap's hash on the builder
+(`LfmBuilder::with_wrap_hash`), so no *emitter* site can be missed — every
+`edsl::wrap_*` construction reads one value. What that moves rather than removes
+is the miss: it relocates from ~9 emitter sites to the **constructor** sites,
+because each `LfmProgramSource` builder is created independently. There are
+**twenty `LfmBuilder::new()` sites in `prover/src/lfm/programs.rs`** and only two
+pass a hash today. Nothing in the type system, and nothing in any test that runs
+before the re-bless, catches a constructor left on the default. Composed with
+the still-undischarged `CommitmentHash` guard (§4.2), that is precisely R-3: a
+program that hashes keccak inside a machine everything else believes is BLAKE3,
+which is a valid proof of the wrong digest rather than a failure.
+
+**The twenty sites**, by line, on `pa-stage5-chip`:
+
+| line | constructor | fate at the flip |
+|---|---|---|
+| 32 | `trivial_program_source` | inert (emits no hash) |
+| 100 | `permute_coverage_program_source` | inert — `LFM_HASH` socket, not the wrap hash |
+| 131 | `keccak_chain_program_source` | ⛔ pinned keccak (R1b instrument) |
+| 167 | `keccak_sponge_program_source` | ⛔ pinned keccak (R1c instrument) |
+| 191 | `blake3_sponge_program_source` | already BLAKE3 |
+| 212 | `keccak_sample_program_source` | ⛔ pinned keccak (R1d instrument) |
+| 278 | `transcript_replay_program_source` | ★ **MUST FLIP** (registered) |
+| 323 | `transcript_absorb_digest_program_source` | must flip |
+| 352 | `append_felt_program_source` | must flip |
+| 373 | `append_ext_program_source` | must flip |
+| 412 | `splice_program_source` | must flip |
+| 446 | `splice_alternating_program_source` | must flip |
+| 520 | `statement_replay_program_source` | ★ **MUST FLIP** (registered) |
+| 585 | `canonicity_guard_program_source` | must flip |
+| 626 | `fri_toy_program_source` | inert (emits no hash) |
+| 821 | `merkle_opening_program_source_with_hash` | already parameterized |
+| 904 | `l2g_binding_program_source` | must flip if it hashes |
+| 992 | `program_id_program_source` | ⛔ **MUST STAY KECCAK** — mirrors `recursion::program_id_from_digest`, which names `PlatformKeccak256` |
+| 1220 | `register_derivation_program_source` | must flip |
+| 1347 | `lde_probe_program_source` | inert (no hash) |
+
+MEASURED for the six registered programs, by counting emitted hash
+instructions rather than by reading: `TrivialV0` 0, `FriToyV0` 0,
+`KeccakChainV0` 2, `KeccakSpongeV0` 2, `TranscriptReplayV0` 6,
+`StatementReplayV0` 5. So the production surface the flip moves is exactly
+`TranscriptReplayV0` and `StatementReplayV0`; the two keccak instruments stay;
+two are inert. `blake3_chip_tests::the_flip_inventory_of_registered_programs_is_pinned`
+pins that classification and fails if a registered program is added without one.
+
+**The procedure**, in order, because the middle step is what makes the last one
+an oracle rather than a formality:
+
+1. Edit every constructor above marked "must flip" to
+   `LfmBuilder::new().with_wrap_hash(WrapHash::Blake3)`. Leave the four ⛔ rows
+   alone — and note that `program_id_program_source` staying keccak is not an
+   oversight to be tidied later, it is the attestation join.
+2. **Discharge the `CommitmentHash` guard** (`registry.rs`, the `const _: ()`
+   match): make `build_artifacts_with_hasher` generic over `H` and read
+   `H::COMMITMENT_HASH`. Until this is done the artifacts name one hash while
+   the roots are built with another, and step 4 cannot distinguish "flipped" from
+   "half-flipped".
+3. Re-bless `LFM_REGISTRY` — all six entries, every root and `program_id`. Ride
+   it on the `LAMBDAVM_CONTINUATION_EPOCH_V2` tag together with the two format
+   breaks already outstanding (RV64 `FIXED_TABLE_COUNT` 11 → 12 from #903, LFM
+   `NUM_LFM_CHIPS` 14 → 15 from Stage 5).
+4. **Run the catcher.** `blake3_chip_tests::the_blake3_replay_matches_the_host_transcript`
+   and its keccak control are the tests that see a left-behind default: a
+   constructor still on keccak inside a BLAKE3 machine publishes challenges the
+   host `Blake3TranscriptHash` did not draw, and the oracle compares all eight
+   published values. The single-coordinate tests do NOT see it — a schedule
+   difference first appears at the SECOND challenge (executed, not argued).
+5. King gate polarity inverts, as §6 states: `cross_verify_vm.sh` must now FAIL
+   both directions, and a same-ref BLAKE3 round trip must pass. A PASSING
+   cross-verify after the flip means the hash did not move.
+
+⚠ The cheapest structural improvement, if Stage 6 wants one: give `programs.rs`
+a single `fn wrap_builder() -> LfmBuilder` that every production constructor
+calls, so the flip is one edit and the twenty sites stop being twenty decisions.
+Not done in Stage 5 because it would have mixed a refactor into a format break.
 
 ### 6.1 ★ PARALLEL TRACK — the blake3 CUDA kernels
 

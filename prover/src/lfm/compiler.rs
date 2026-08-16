@@ -105,9 +105,9 @@ impl ColumnGroup {
     }
 }
 
-/// The eight program-dependent instruction column groups, in the frozen chip
-/// order. (`LFM_RANGE`'s group is program-independent and materialized at
-/// commitment time.)
+/// The program-dependent instruction column groups, in the frozen chip order.
+/// (`LFM_RANGE`'s group is program-independent and materialized at commitment
+/// time; the three hosted keccak-family tables carry no LFM group at all.)
 #[derive(Debug, Clone)]
 pub struct LfmColumnGroups {
     pub const_: ColumnGroup,
@@ -117,6 +117,7 @@ pub struct LfmColumnGroups {
     pub bitdec: ColumnGroup,
     pub hash: ColumnGroup,
     pub keccak: ColumnGroup,
+    pub blake3: ColumnGroup,
     pub lanes: ColumnGroup,
     pub hint: ColumnGroup,
     pub public: ColumnGroup,
@@ -225,6 +226,16 @@ pub fn compile(source: LfmProgramSource) -> LfmProgram {
                     }
                 }
             }
+            Instr::Blake3(k) => {
+                for i in 0..layout::blake3::OUT_WORDS {
+                    k.mults[i] = take(k.outs[i], &mut written, &mut read_counts);
+                }
+                if let Some(rev) = &mut k.rev {
+                    for i in 0..layout::blake3::DIGEST_WORDS {
+                        rev.mults[i] = take(rev.outs[i], &mut written, &mut read_counts);
+                    }
+                }
+            }
             Instr::Select {
                 out_l,
                 out_r,
@@ -294,6 +305,7 @@ fn emit_column_groups(instrs: &[Instr], _public_len: u32) -> LfmColumnGroups {
     let mut bitdec = ColumnGroupBuilder::new(layout::bitdec::PREP_WIDTH);
     let mut hash = ColumnGroupBuilder::new(layout::hash::PREP_WIDTH);
     let mut keccak = ColumnGroupBuilder::new(layout::keccak::PREP_WIDTH);
+    let mut blake3 = ColumnGroupBuilder::new(layout::blake3::PREP_WIDTH);
     let mut lanes = ColumnGroupBuilder::new(layout::lanes::PREP_WIDTH);
     let mut hint = ColumnGroupBuilder::new(layout::hint::PREP_WIDTH);
     let mut public = ColumnGroupBuilder::new(layout::public::PREP_WIDTH);
@@ -446,6 +458,24 @@ fn emit_column_groups(instrs: &[Instr], _public_len: u32) -> LfmColumnGroups {
                     }
                 }
             }
+            Instr::Blake3(op) => {
+                use layout::blake3 as l;
+                let r = blake3.open_row();
+                for j in 0..l::IN_WORDS {
+                    blake3.set(r, l::in_addr(j), fe(op.ins[j].0));
+                }
+                for j in 0..l::OUT_WORDS {
+                    blake3.set(r, l::out_addr(j), fe(op.outs[j].0));
+                    blake3.set(r, l::mult(j), fe(op.mults[j]));
+                }
+                if let Some(rev) = &op.rev {
+                    for w in 0..l::DIGEST_WORDS {
+                        blake3.set(r, l::rev_addr(w), fe(rev.outs[w].0));
+                        blake3.set(r, l::rev_mult(w), fe(rev.mults[w]));
+                    }
+                }
+                blake3.set(r, l::MU, FE::one());
+            }
             Instr::Hint { out, mult, .. } => {
                 use layout::hint as l;
                 let r = hint.open_row();
@@ -494,6 +524,7 @@ fn emit_column_groups(instrs: &[Instr], _public_len: u32) -> LfmColumnGroups {
         bitdec: bitdec.finish(),
         hash: hash.finish(),
         keccak: keccak.finish(),
+        blake3: blake3.finish(),
         lanes: lanes.finish(),
         hint: hint.finish(),
         public: public.finish(),

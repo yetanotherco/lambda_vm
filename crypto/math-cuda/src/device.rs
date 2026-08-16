@@ -211,11 +211,22 @@ pub struct Backend {
     pub mmcs_states_finalize: CudaFunction,
     pub keccak_mmcs_level: CudaFunction,
 
-    // blake3.cubin — the Merkle level/tail compressors, plus the parity-harness
-    // probes that are the only host-visible handle on the device compression
-    // function and byte serialization (see `kernels/blake3.cu`). The multi-block
-    // leaf kernels are not here yet: they need the chaining construction decided
-    // (PA-PLAN §1.6).
+    // blake3.cubin — the leaf kernels, the Merkle level/tail compressors, and
+    // the parity-harness probes that are the only host-visible handle on the
+    // device compression function, byte serialization and chain construction
+    // (see `kernels/blake3.cu`). Twin for twin with the keccak set above, and in
+    // the same order. `merkle_gather_paths` has no twin: path gathering copies
+    // nodes and never hashes, so it is hash-agnostic and both trees share it.
+    //
+    // Keccak stays the prover's default, so no production dispatch reaches these
+    // yet — they exist so the GPU can follow the CPU's hash switch (PA-PLAN §6.1).
+    pub blake3_leaves_base_row_major_row_pair: CudaFunction,
+    pub blake3_leaves_base_row_major_row_pair_range: CudaFunction,
+    pub blake3_leaves_base_batched: CudaFunction,
+    pub blake3_leaves_base_row_pair_batched: CudaFunction,
+    pub blake3_leaves_ext3_batched: CudaFunction,
+    pub blake3_comp_poly_leaves_ext3: CudaFunction,
+    pub blake3_fri_leaves_ext3: CudaFunction,
     pub blake3_merkle_level: CudaFunction,
     pub blake3_merkle_tail: CudaFunction,
     pub blake3_compress_probe_6r: CudaFunction,
@@ -224,6 +235,7 @@ pub struct Backend {
     pub blake3_rounds_probe: CudaFunction,
     pub blake3_serialize_felts_probe: CudaFunction,
     pub blake3_blocks_of_felts_probe: CudaFunction,
+    pub blake3_chain_probe: CudaFunction,
 
     // barycentric.cubin
     pub barycentric_base_batched: CudaFunction,
@@ -463,6 +475,16 @@ impl Backend {
                 .load_function("mmcs_absorb_row_pair_ext3_slabs")?,
             mmcs_states_finalize: keccak.load_function("mmcs_states_finalize")?,
             keccak_mmcs_level: keccak.load_function("keccak_mmcs_level")?,
+            blake3_leaves_base_row_major_row_pair: blake3
+                .load_function("blake3_leaves_base_row_major_row_pair")?,
+            blake3_leaves_base_row_major_row_pair_range: blake3
+                .load_function("blake3_leaves_base_row_major_row_pair_range")?,
+            blake3_leaves_base_batched: blake3.load_function("blake3_leaves_base_batched")?,
+            blake3_leaves_base_row_pair_batched: blake3
+                .load_function("blake3_leaves_base_row_pair_batched")?,
+            blake3_leaves_ext3_batched: blake3.load_function("blake3_leaves_ext3_batched")?,
+            blake3_comp_poly_leaves_ext3: blake3.load_function("blake3_comp_poly_leaves_ext3")?,
+            blake3_fri_leaves_ext3: blake3.load_function("blake3_fri_leaves_ext3")?,
             blake3_merkle_level: blake3.load_function("blake3_merkle_level")?,
             blake3_merkle_tail: blake3.load_function("blake3_merkle_tail")?,
             blake3_compress_probe_6r: blake3.load_function("blake3_compress_probe_6r")?,
@@ -471,6 +493,7 @@ impl Backend {
             blake3_rounds_probe: blake3.load_function("blake3_rounds_probe")?,
             blake3_serialize_felts_probe: blake3.load_function("blake3_serialize_felts_probe")?,
             blake3_blocks_of_felts_probe: blake3.load_function("blake3_blocks_of_felts_probe")?,
+            blake3_chain_probe: blake3.load_function("blake3_chain_probe")?,
             barycentric_base_batched: bary.load_function("barycentric_base_batched")?,
             barycentric_ext3_batched: bary.load_function("barycentric_ext3_batched")?,
             barycentric_base_batched_strided: bary

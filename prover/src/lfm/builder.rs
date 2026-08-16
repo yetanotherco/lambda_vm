@@ -13,6 +13,7 @@ use math::field::traits::IsPrimeField;
 
 use crate::tables::types::{FE, FEE, GoldilocksField};
 
+use super::edsl::WrapHash;
 use super::instr::{Addr, ArenaId, BaseOp, ExtOp, HashMode, Instr, KeccakMode};
 use super::layout;
 use super::word::{LfmWord, base_word, ext_word};
@@ -109,11 +110,45 @@ pub struct LfmBuilder {
     read_counts: Vec<u64>,
     arena_schema: ArenaSchema,
     public_len: u32,
+    /// The byte hash this program's commitment layer runs.
+    ///
+    /// ★ A property of the PROGRAM, held here rather than threaded through
+    /// every construction, and that placement is the safety argument. The
+    /// campaign's standing risk is that a missed emitter site keeps hashing
+    /// keccak after the flip and produces a valid proof of the wrong digest;
+    /// with the choice on the builder there is no site to miss, because every
+    /// `edsl::wrap_*` construction reads this one value. What remains visible
+    /// is the opposite and much smaller list: the emitters that must NOT follow
+    /// it still name `keccak256` explicitly (`programs::emit_program_id`, the
+    /// R1c instruments), so a grep for the pinned hash in `lfm/` returns
+    /// exactly the deliberate exceptions.
+    wrap_hash: WrapHash,
 }
 
 impl LfmBuilder {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Build under an explicitly chosen wrap hash.
+    ///
+    /// Program-level and set once, before anything is emitted: the hash decides
+    /// what the program's Merkle and transcript constructions compute, so a
+    /// program half-emitted under one and half under the other is not a
+    /// program. It is taken by value for that reason — there is no setter that
+    /// can run mid-emission.
+    pub fn with_wrap_hash(mut self, wrap_hash: WrapHash) -> Self {
+        assert!(
+            self.instrs.is_empty(),
+            "the wrap hash is program shape and must be chosen before emission"
+        );
+        self.wrap_hash = wrap_hash;
+        self
+    }
+
+    /// The byte hash this program's commitment layer runs.
+    pub fn wrap_hash(&self) -> WrapHash {
+        self.wrap_hash
     }
 
     fn alloc(&mut self) -> Addr {
@@ -468,6 +503,84 @@ impl LfmBuilder {
                 rev: rev_outs.map(|outs| super::instr::KeccakReversedDigest {
                     outs,
                     mults: [0; 2],
+                }),
+            })));
+        (outs.map(Cell), rev_outs.map(|r| r.map(Cell)))
+    }
+
+    // ---- BLAKE3 compression (LFM_BLAKE3) ----
+
+    /// One BLAKE3 compression: `compress(h, m, t, block_len, flags)`, returning
+    /// the full 16-word output as four machine words.
+    ///
+    /// `h` is the chaining value as two words of four `u32` lanes; `m` is the
+    /// 64-byte message block as four; `params` is one word carrying
+    /// `(t_lo, t_hi, block_len, flags)`. Every lane of every input must be a
+    /// canonical value below `2^32` — the chip decomposes each into four
+    /// BITWISE-range-checked byte columns, so no larger value exists on the AIR
+    /// side and the executor errors rather than producing an unprovable witness.
+    ///
+    /// The digest of the compression is output words 0 and 1 (`out[0..8]`
+    /// little-endian), so callers wanting a `Blake3Digest` take the first two of
+    /// the four. The chaining value of the *next* block is the same two words,
+    /// which is what makes [`super::edsl::blake3`]'s multi-block framing free of
+    /// any repacking between blocks.
+    ///
+    /// Callers should go through [`super::edsl`]'s framing rather than here: the
+    /// flag schedule and `block_len` convention are what `Blake3Chain` is, and a
+    /// raw compression is an easy way to emit a different hash.
+    pub fn blake3_compress(
+        &mut self,
+        h: [Cell; 2],
+        m: [Cell; 4],
+        params: Cell,
+    ) -> [Cell; layout::blake3::OUT_WORDS] {
+        self.emit_blake3(h, m, params, false).0
+    }
+
+    /// [`LfmBuilder::blake3_compress`], additionally materializing the
+    /// byte-REVERSED digest as two more words — the production transcript's
+    /// `sample()`, which both returns those bytes and re-absorbs them as the
+    /// next segment's prefix. Free on the bus (see `layout::blake3::REV_ADDR0`).
+    pub fn blake3_compress_rev(
+        &mut self,
+        h: [Cell; 2],
+        m: [Cell; 4],
+        params: Cell,
+    ) -> ([Cell; layout::blake3::OUT_WORDS], [Cell; 2]) {
+        let (outs, rev) = self.emit_blake3(h, m, params, true);
+        (outs, rev.expect("requested"))
+    }
+
+    fn emit_blake3(
+        &mut self,
+        h: [Cell; 2],
+        m: [Cell; 4],
+        params: Cell,
+        want_rev: bool,
+    ) -> (
+        [Cell; layout::blake3::OUT_WORDS],
+        Option<[Cell; layout::blake3::DIGEST_WORDS]>,
+    ) {
+        // Machine order: `h` is `u32` words 0..8, `m` is 8..24, and `params` is
+        // 24..28 — the layout `Blake3Operands` documents and `blake3_chip`'s
+        // `input_words` builds.
+        let ins: [Addr; layout::blake3::IN_WORDS] =
+            [h[0].0, h[1].0, m[0].0, m[1].0, m[2].0, m[3].0, params.0];
+        for a in &ins {
+            self.read(*a);
+        }
+        let outs: [Addr; layout::blake3::OUT_WORDS] = core::array::from_fn(|_| self.alloc());
+        let rev_outs: Option<[Addr; layout::blake3::DIGEST_WORDS]> =
+            want_rev.then(|| core::array::from_fn(|_| self.alloc()));
+        self.instrs
+            .push(Instr::Blake3(Box::new(super::instr::Blake3Operands {
+                ins,
+                outs,
+                mults: [0; layout::blake3::OUT_WORDS],
+                rev: rev_outs.map(|outs| super::instr::Blake3ReversedDigest {
+                    outs,
+                    mults: [0; layout::blake3::DIGEST_WORDS],
                 }),
             })));
         (outs.map(Cell), rev_outs.map(|r| r.map(Cell)))

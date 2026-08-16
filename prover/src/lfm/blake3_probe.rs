@@ -50,8 +50,8 @@ use crate::test_utils::create_bitwise_air;
 
 use super::blake3::{BLAKE3_ROUNDS, CANONICAL_VECTORS, canonical_expected_out};
 use super::blake3_chip::{
-    self, Blake3LfmConstraints, Blake3Operation, IN_WORDS, MAIN_COLUMNS, NUM_CONSTRAINTS, NUM_G,
-    OUT_WORDS, cols,
+    self, Blake3LfmConstraints, Blake3Operation, Blake3Values, IN_WORDS, MAIN_COLUMNS,
+    NUM_CONSTRAINTS, NUM_G, OUT_WORDS, cols,
 };
 use super::commit::commit_columns;
 
@@ -97,14 +97,21 @@ fn probe_ops() -> Vec<Blake3Operation> {
                 // Distinct nonzero read counts: a uniform 1 would not notice a
                 // multiplicity mixed up between output words.
                 read_counts: core::array::from_fn(|j| 1 + j as u64),
-                h: v.h,
-                m: v.m,
-                t: v.t,
-                block_len: v.block_len,
-                flags: v.flags,
+                values: Blake3Values {
+                    h: v.h,
+                    m: v.m,
+                    t: v.t,
+                    block_len: v.block_len,
+                    flags: v.flags,
+                },
             }
         })
         .collect()
+}
+
+/// The value halves of a probe op list — what the BITWISE feed is computed from.
+fn probe_values(ops: &[Blake3Operation]) -> Vec<Blake3Values> {
+    ops.iter().map(|op| op.values).collect()
 }
 
 // =========================================================================
@@ -208,7 +215,7 @@ fn mirror_trace(ops: &[Blake3Operation]) -> TraceTable<F, E> {
     let table = &mut trace.main_table;
     let mut row = 0usize;
     for op in ops {
-        let inputs = op.input_words();
+        let inputs = op.values.input_words();
         for j in 0..IN_WORDS {
             table.set_u64(row, mirror::ADDR, op.in_addr[j]);
             for (l, v) in lanes(&inputs, j).into_iter().enumerate() {
@@ -217,7 +224,7 @@ fn mirror_trace(ops: &[Blake3Operation]) -> TraceTable<F, E> {
             table.set_fe(row, mirror::SEND_MULT, FE::one());
             row += 1;
         }
-        let outputs = op.output_words();
+        let outputs = op.values.output_words();
         for j in 0..OUT_WORDS {
             table.set_u64(row, mirror::ADDR, op.out_addr[j]);
             for (l, v) in lanes(&outputs, j).into_iter().enumerate() {
@@ -232,7 +239,7 @@ fn mirror_trace(ops: &[Blake3Operation]) -> TraceTable<F, E> {
 
 fn bitwise_trace(ops: &[Blake3Operation]) -> TraceTable<F, E> {
     let mut hist = bitwise::BitwiseHistogram::new();
-    hist.add_ops(&blake3_chip::bitwise_ops_for(ops));
+    hist.add_ops(&blake3_chip::bitwise_ops_for(&probe_values(ops)));
     let mut bw = bitwise::generate_bitwise_trace();
     hist.fill_multiplicities(&mut bw);
     bw
@@ -337,10 +344,11 @@ fn the_hosted_chip_cell_budget_at_both_round_counts() {
     const fn predicted_main(rounds: usize) -> usize {
         112 + 60 * (8 * rounds) + 64
     }
-    // 11 `LfmMem` tokens; `ByteAlu[XOR]` over `4·8·rounds` mixing words and 16
-    // feed-forward words; `AreBytes` over `2·8·rounds` rotations; 32 message.
+    // 13 `LfmMem` tokens (7 read + 4 written + 2 reversed-digest);
+    // `ByteAlu[XOR]` over `4·8·rounds` mixing words and 16 feed-forward words;
+    // `AreBytes` over `2·8·rounds` rotations; 32 message.
     const fn predicted_interactions(rounds: usize) -> usize {
-        11 + 4 * (4 * (8 * rounds) + 16) + 4 * (2 * (8 * rounds)) + 32
+        13 + 4 * (4 * (8 * rounds) + 16) + 4 * (2 * (8 * rounds)) + 32
     }
     const fn predicted_cells(rounds: usize) -> usize {
         predicted_main(rounds) + 3 * predicted_interactions(rounds).div_ceil(2)
@@ -349,24 +357,24 @@ fn the_hosted_chip_cell_budget_at_both_round_counts() {
     // 6 rounds — the A6R variant. These four literals are #903's and were the
     // measured figures before the round count became a knob.
     assert_eq!(predicted_main(6), 3_056);
-    assert_eq!(predicted_interactions(6), 1_259);
-    assert_eq!(predicted_interactions(6).div_ceil(2), 630);
-    assert_eq!(predicted_cells(6), 4_946);
+    assert_eq!(predicted_interactions(6), 1_261);
+    assert_eq!(predicted_interactions(6).div_ceil(2), 631);
+    assert_eq!(predicted_cells(6), 4_949);
     // Group by group at 6 rounds, so a layout change cannot move the total
-    // silently: 11 LfmMem + 832 ByteAlu + 384 shift AreBytes + 32 message.
-    assert_eq!(predicted_interactions(6), 11 + 832 + 384 + 32);
+    // silently: 13 LfmMem + 832 ByteAlu + 384 shift AreBytes + 32 message.
+    assert_eq!(predicted_interactions(6), 13 + 832 + 384 + 32);
 
     // 7 rounds — standard BLAKE3, the default. PLAN §7 predicted exactly these
     // on paper; this is the same arithmetic against the built layout.
     assert_eq!(predicted_main(7), 3_536);
-    assert_eq!(predicted_interactions(7), 1_451);
-    assert_eq!(predicted_interactions(7).div_ceil(2), 726);
-    assert_eq!(predicted_cells(7), 5_714);
+    assert_eq!(predicted_interactions(7), 1_453);
+    assert_eq!(predicted_interactions(7).div_ceil(2), 727);
+    assert_eq!(predicted_cells(7), 5_717);
 
     // The built layout IS the prediction at the compiled round count.
     let interactions = blake3_chip::bus_interactions().len();
     let aux = interactions.div_ceil(2);
-    assert_eq!(cols::PREP_WIDTH, 16, "preprocessed prefix");
+    assert_eq!(cols::PREP_WIDTH, 20, "preprocessed prefix");
     assert_eq!(cols::G - cols::IN, 112, "input bytes");
     assert_eq!(cols::OUT - cols::G, 60 * NUM_G, "G-blocks × 60 cells");
     assert_eq!(
@@ -376,7 +384,11 @@ fn the_hosted_chip_cell_budget_at_both_round_counts() {
     );
     assert_eq!(MAIN_COLUMNS, predicted_main(BLAKE3_ROUNDS));
     assert_eq!(cols::NUM_COLUMNS, MAIN_COLUMNS + cols::PREP_WIDTH);
-    assert_eq!(IN_WORDS + OUT_WORDS, 11, "LfmMem tokens");
+    assert_eq!(
+        IN_WORDS + OUT_WORDS + cols::DIGEST_WORDS,
+        13,
+        "LfmMem tokens"
+    );
     assert_eq!(interactions, predicted_interactions(BLAKE3_ROUNDS));
     assert_eq!(
         MAIN_COLUMNS + 3 * aux,
@@ -478,7 +490,7 @@ fn the_hosted_chip_proves_and_verifies() {
         let expected = canonical_expected_out(row);
         assert_eq!(
             expected,
-            blake3_chip::Blake3Operation::output_words(op),
+            op.values.output_words(),
             "op {row}'s output must be the primitive's at the compiled round count"
         );
         for (i, &word) in expected.iter().enumerate() {
@@ -501,14 +513,17 @@ fn the_hosted_chip_proves_and_verifies() {
     assert_eq!(predicted_bitwise(6), 1_248);
     assert_eq!(predicted_bitwise(7), 1_440);
     assert_eq!(
-        blake3_chip::bitwise_ops_for(&ops).len(),
+        blake3_chip::bitwise_ops_for(&probe_values(&ops)).len(),
         ops.len() * predicted_bitwise(BLAKE3_ROUNDS),
         "per-compression BITWISE lookup count"
     );
-    // And it is the interaction list less the 11 `LfmMem` tokens — the mirror
+    // And it is the interaction list less the 13 `LfmMem` tokens — the mirror
     // property, which is what stops the feed and the senders from drifting.
+    // 13, not 11: registration added the two reversed-digest sends, which carry
+    // no BITWISE lookup because they are a second `Linear` over columns the
+    // plain digest send already covers.
     assert_eq!(
-        predicted_bitwise(BLAKE3_ROUNDS) + 11,
+        predicted_bitwise(BLAKE3_ROUNDS) + IN_WORDS + OUT_WORDS + cols::DIGEST_WORDS,
         blake3_chip::bus_interactions().len()
     );
 
@@ -799,15 +814,36 @@ fn the_blake_column_and_the_residue_split() {
     // either padded to the next power of two (one AIR instance) or chunked the
     // way KECCAK_RND is (several instances, ~1.9% waste). Both are printed
     // because the choice is a policy, not a property of the hash.
-    let p = 192_000u64;
+    // ★ P is the instrument's OWN measured interval, not a constant.
+    //
+    // This line was a hardcoded `192_000` while the same function computed
+    // `[p_lo, p_hi]` two dozen lines above and only PRINTED it — and on this
+    // run that interval is roughly [287k, 291k], so every ratio below was
+    // being taken at a hash count about a third under what the run measured,
+    // in the direction that flatters every non-keccak column. Reading the
+    // measurement is the whole fix; the assertion is what stops it drifting
+    // back to a literal.
+    //
+    // Both ends are priced. The spine is absorption-bound and only bounded, so
+    // a single number would be a choice about which end to quote — and the two
+    // ends bracket the answer rather than approximating it.
+    assert!(
+        p_lo <= p_hi && p_lo > 0,
+        "the permutation interval must be non-degenerate, got [{p_lo}, {p_hi}]"
+    );
     let chunked = |perms: u64| (perms as f64 * 1.01871).ceil() as u64;
     let unchunked = |perms: u64| perms.next_power_of_two();
     let row = |name: &str, cells_per_perm: u64, resid: u64, table: u64| {
-        for (how, rows) in [("chunked", chunked(p)), ("padded", unchunked(p))] {
+        for (how, rows) in [
+            ("chunked@lo", chunked(p_lo as u64)),
+            ("chunked@hi", chunked(p_hi as u64)),
+            ("padded@lo", unchunked(p_lo as u64)),
+            ("padded@hi", unchunked(p_hi as u64)),
+        ] {
             let hash_cells = rows * cells_per_perm;
             let t = resid + table + hash_cells;
             println!(
-                "   {name:>28} {how:>8}  hash {hash_cells:>13}  total {t:>13}  \
+                "   {name:>28} {how:>10}  hash {hash_cells:>13}  total {t:>13}  \
                  {:>6.2}x under keccak  ~{:.0} GiB",
                 total as f64 / t as f64,
                 projected_gib(t, sub_proofs),
@@ -815,12 +851,12 @@ fn the_blake_column_and_the_residue_split() {
         }
     };
     println!(
-        "\n★ THE MATRIX, RE-DERIVED (P = {p}, {sub_proofs} sub-proofs, two-term RSS \
-         {BYTES_PER_CELL} B/cell + {} MB/sub-proof)",
+        "\n★ THE MATRIX, RE-DERIVED (P in [{p_lo}, {p_hi}] MEASURED, {sub_proofs} \
+         sub-proofs, two-term RSS {BYTES_PER_CELL} B/cell + {} MB/sub-proof)",
         BYTES_PER_SUB_PROOF / 1e6
     );
     println!(
-        "   {:>28} {:>8}  keccak {:>11}  total {:>13}  {:>6.2}x  ~{:.0} GiB",
+        "   {:>28} {:>10}  keccak {:>11}  total {:>13}  {:>6.2}x  ~{:.0} GiB",
         "keccak (MEASURED, ours)",
         "n/a",
         keccak_perm + bitwise,
@@ -866,7 +902,7 @@ fn the_blake_column_and_the_residue_split() {
 #[test]
 #[ignore]
 fn the_delegation_topology_priced_against_in_machine_hosting() {
-    use super::epoch_verify::{blocks_at_rate, group_leaf_felts};
+    use super::epoch_verify::{blocks_at_rate, group_leaf_felts, query_permutations_at_rate};
     use super::sub_proof::GroupShape;
 
     let inner = crate::recursion::Preset::Blowup8.options();
@@ -910,7 +946,21 @@ fn the_delegation_topology_priced_against_in_machine_hosting() {
     let fri_per_query = widest.verify.fri.permutations_per_query();
 
     // --- the delegation circuit's two AIRs, at the epoch's own compression count.
-    let compressions = 192_000usize;
+    // The same quantity the matrix instrument brackets, and it was the same
+    // hardcoded `192_000` here — independently unasserted, so the two could
+    // have drifted apart as well as away from the truth. Derived from the
+    // epoch's own shapes at BLAKE3's rate, which is what the closed form is
+    // for.
+    // The LEGS' term only — exact, where the spine's is merely bounded (it is
+    // absorption-bound, so its rate-8 cost sits between 1.0x and 2.125x its
+    // rate-17 one). Excluding the spine understates the compression count, so
+    // every "extra cost of delegating" figure below is a LOWER bound and the
+    // verdict is if anything understated.
+    let compressions: usize = e
+        .legs
+        .iter()
+        .map(|l| query_permutations_at_rate(&l.verify, 8))
+        .sum();
     let log2_blake_trace = (compressions as u32).next_power_of_two().trailing_zeros(); // 18
     let blake_groups = vec![
         GroupShape {

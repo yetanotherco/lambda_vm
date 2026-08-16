@@ -14,6 +14,7 @@ use math::field::traits::IsPrimeField;
 
 use crate::tables::types::{FE, FEE, GoldilocksField};
 
+use super::blake3_chip::Blake3Values;
 use super::compiler::LfmProgram;
 use super::hash::{HASH_STATE_FELTS, LfmHasher};
 use super::instr::{Addr, BaseOp, ExtOp, HashMode, Instr, KeccakMode};
@@ -33,10 +34,11 @@ pub enum LfmExecError {
     NotBaseWord(u64),
     /// An ext-typed read found a nonzero lane 3.
     NotExtWord(u64),
-    /// A `KeccakF` input word lane held a value at or above `2^32`, so it is
-    /// not a `u32` half of a keccak lane. The chip recomposes each half from
-    /// four BITWISE-constrained byte columns, so no such value exists on the
-    /// AIR side — the program would be unprovable.
+    /// A `KeccakF` or `Blake3` input word lane held a value at or above `2^32`,
+    /// so it is not a `u32` half of a keccak lane (respectively a BLAKE3 input
+    /// word). Both chips recompose each `u32` from four BITWISE-constrained byte
+    /// columns, so no such value exists on the AIR side — the program would be
+    /// unprovable.
     NotU32Half {
         addr: u64,
         lane: usize,
@@ -143,6 +145,9 @@ pub struct LfmRecords {
     pub bitdec: Vec<BitDecRow>,
     pub hash: Vec<HashRow>,
     pub keccak: Vec<KeccakRow>,
+    /// One `LFM_BLAKE3` row. Values only, like every other record: the chip's
+    /// addresses and multiplicities are preprocessed program data.
+    pub blake3: Vec<Blake3Values>,
     /// One word per Pack/Unpack row (the shared value columns).
     pub lanes: Vec<LfmWord>,
     pub hint: Vec<LfmWord>,
@@ -524,6 +529,57 @@ pub fn execute(
                     perm_in,
                     output,
                 });
+            }
+            Instr::Blake3(op) => {
+                use super::layout::blake3 as l;
+                // 7 words × 4 lanes → the 28 input `u32` words, with no spare
+                // slots: 28 divides by 4 exactly, so unlike `KeccakF` there is
+                // no must-be-zero tail lane to police.
+                let mut words = [0u32; l::IN_U32];
+                for (j, cell) in op.ins.iter().enumerate() {
+                    let w = m.read_word(*cell)?;
+                    for (lane, value) in w.iter().enumerate() {
+                        let v = GoldilocksField::canonical(value.value());
+                        if v >= 1u64 << 32 {
+                            return Err(LfmExecError::NotU32Half { addr: cell.0, lane });
+                        }
+                        words[4 * j + lane] = v as u32;
+                    }
+                }
+                let values = Blake3Values {
+                    h: core::array::from_fn(|i| words[i]),
+                    m: core::array::from_fn(|i| words[8 + i]),
+                    t: u64::from(words[24]) | (u64::from(words[25]) << 32),
+                    block_len: words[26],
+                    flags: words[27],
+                };
+
+                let out = values.output_words();
+                for (j, cell) in op.outs.iter().enumerate() {
+                    let word: LfmWord =
+                        core::array::from_fn(|lane| FE::from(u64::from(out[4 * j + lane])));
+                    m.write(*cell, word)?;
+                }
+                if let Some(rev) = &op.rev {
+                    // The 32-byte digest is `out[0..8]` little-endian; reversing
+                    // it is reading those bytes back-to-front, which is what the
+                    // chip's flipped-coefficient send computes on the AIR side.
+                    let mut digest = [0u8; 32];
+                    for i in 0..8 {
+                        digest[4 * i..4 * i + 4].copy_from_slice(&out[i].to_le_bytes());
+                    }
+                    digest.reverse();
+                    for (w, cell) in rev.outs.iter().enumerate() {
+                        let word: LfmWord = core::array::from_fn(|lane| {
+                            let h = 4 * w + lane;
+                            let mut b = [0u8; 4];
+                            b.copy_from_slice(&digest[4 * h..4 * h + 4]);
+                            FE::from(u64::from(u32::from_le_bytes(b)))
+                        });
+                        m.write(*cell, word)?;
+                    }
+                }
+                records.blake3.push(values);
             }
             Instr::Hint {
                 arena, index, out, ..

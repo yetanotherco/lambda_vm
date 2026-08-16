@@ -37,7 +37,7 @@ use stark::proof::options::ProofOptions;
 use crate::tables::types::FE;
 
 use super::builder::{Bit, Ext, Felt, LfmBuilder};
-use super::edsl::{self, KeccakDigest};
+use super::edsl::{self, WrapDigest};
 use super::instr::ArenaId;
 use super::sub_proof::{self, GroupShape};
 
@@ -311,7 +311,7 @@ pub struct LayerOpening {
     /// not two.
     pub sym: Ext,
     /// Sibling digests, LEAF LEVEL FIRST.
-    pub siblings: Vec<KeccakDigest>,
+    pub siblings: Vec<WrapDigest>,
 }
 
 /// What the FRI leg needs from a query the trace legs already verified.
@@ -415,7 +415,7 @@ pub fn hint_layer_openings_from(
         .map(|layer| {
             let sym = b.hint_word(arena, cursor).as_ext();
             cursor += 1;
-            let siblings: Vec<KeccakDigest> = (0..shape.layer_path_len(layer))
+            let siblings: Vec<WrapDigest> = (0..shape.layer_path_len(layer))
                 .map(|_| {
                     let lo = b.hint_word(arena, cursor);
                     let hi = b.hint_word(arena, cursor + 1);
@@ -561,7 +561,7 @@ pub fn emit_query_fri(
         // at 0 and `(r, l)` at 1, so this IS that conditional.
         let (first, second) = b.select(q.bits[i], v.as_cell(), opening.sym.as_cell());
         let leaf = sub_proof::emit_leaf_hash(b, FRI_LEAF_GROUP, &[first, second]);
-        let root = edsl::keccak_merkle_walk(b, leaf, &q.bits[i + 1..], &opening.siblings);
+        let root = edsl::wrap_merkle_walk(b, leaf, &q.bits[i + 1..], &opening.siblings);
         edsl::assert_word_eq_lanes(b, root[0], &fri.layers[i].root_lanes[0]);
         edsl::assert_word_eq_lanes(b, root[1], &fri.layers[i].root_lanes[1]);
 

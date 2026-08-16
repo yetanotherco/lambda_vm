@@ -49,6 +49,17 @@ use super::{BLAKE3_IV, BLAKE3_ROUNDS, blake3_compress_rounds};
 /// Bytes in one BLAKE3 message block.
 pub const BLOCK_LEN: usize = 64;
 
+/// Dwords in the accelerator's state region: `h[8] | m[16] | t |
+/// (block_len, flags) | out[16]`, two little-endian `u32` words per dword.
+/// Mirrors `BLAKE3_STATE_BYTES / 8` in
+/// `executor::vm::instruction::execution`.
+pub const SYSCALL_STATE_DWORDS: usize = 22;
+
+/// First dword of the output region — the accelerator reads dwords `0..14` and
+/// writes `out[0..16]` into `14..22`. Mirrors the executor's
+/// `BLAKE3_OUT_DWORDS`.
+pub const SYSCALL_OUT_DWORD: usize = 14;
+
 /// This block begins the chunk. Set on the first block only.
 const CHUNK_START: u32 = 1;
 /// This block ends the chunk. Set on the last block only.
@@ -60,6 +71,65 @@ const ROOT: u32 = 8;
 /// The flags of a message that is one block long: first and last at once. Equal
 /// to `CHUNK_START | CHUNK_END | ROOT`, and the framing every Merkle parent uses.
 pub const FLAGS_ONE_BLOCK: u32 = CHUNK_START | CHUNK_END | ROOT;
+
+// -------------------------------------------------------------------------
+// The framing, in closed form
+// -------------------------------------------------------------------------
+//
+// [`Blake3Chain`] below expresses the same schedule against its streaming state
+// (`started`, `is_final`), which is the right shape for a hasher fed one byte at
+// a time and the wrong shape for anything that knows the whole length up front.
+// The Lambda VM's straight-line eDSL emitter is exactly that: shapes are
+// compile-time, so it emits block `i` of `n` with the flags and `block_len`
+// already decided.
+//
+// These three functions are hoisted so the emitter READS the schedule rather
+// than restating it. A second statement of "which block carries CHUNK_START" is
+// the single most likely way for an in-machine hash to differ from the host's by
+// one compression's flags — a difference that produces a perfectly valid proof
+// of the wrong digest. `the_streaming_chain_follows_the_closed_form_schedule`
+// drives the streaming hasher against these and is what keeps them one
+// definition rather than two that happen to agree.
+
+/// Blocks a message of `len_bytes` compresses into.
+///
+/// The empty message is **one** block, not zero: `finalize_digest` always
+/// compresses, so `blake3_chain(b"")` is one compression over an all-zero block
+/// with `block_len = 0`.
+pub const fn num_blocks(len_bytes: usize) -> usize {
+    if len_bytes == 0 {
+        1
+    } else {
+        len_bytes.div_ceil(BLOCK_LEN)
+    }
+}
+
+/// The flags of block `index` of an `n`-block message.
+///
+/// `CHUNK_START` on the first, `CHUNK_END | ROOT` on the last, both on a
+/// single-block message — which is why a 64-byte Merkle parent carries
+/// [`FLAGS_ONE_BLOCK`] and an interior block carries nothing at all.
+pub const fn block_flags(index: usize, num_blocks: usize) -> u32 {
+    let start = if index == 0 { CHUNK_START } else { 0 };
+    let end = if index + 1 == num_blocks {
+        CHUNK_END | ROOT
+    } else {
+        0
+    };
+    start | end
+}
+
+/// The `block_len` of block `index` of a `len_bytes` message: a full block
+/// except on the last, which carries the true remaining byte count.
+///
+/// Zero only for the empty message, whose single block is entirely padding.
+pub const fn block_len_of(index: usize, len_bytes: usize) -> u32 {
+    if index + 1 == num_blocks(len_bytes) {
+        (len_bytes - BLOCK_LEN * index) as u32
+    } else {
+        BLOCK_LEN as u32
+    }
+}
 
 /// [`Blake3Chain`] as a one-shot over a byte slice.
 ///
@@ -82,6 +152,119 @@ pub fn blake3_chain_rounds(data: &[u8], rounds: usize) -> [u8; 32] {
     chain.update(data);
     chain.finalize_digest()
 }
+
+/// Lay a compression's inputs out as the accelerator's 22-dword state region.
+///
+/// The guest side of the syscall ABI, and the *only* place this crate encodes
+/// it. The output dwords are left zero; the accelerator fills `14..22`.
+///
+/// Compiled on every target although only the riscv64 arm of [`compress_block`]
+/// calls it, so the packing can be checked on the host against the executor's
+/// handler — which is ordinary host code — rather than only inside a guest. The
+/// executor's unpacking is the mirror of this, and
+/// `prover::tables::blake3::executor_syscall_packing` drives the two against
+/// each other through a real `EcallEbreak`.
+pub fn pack_syscall_state(
+    h: &[u32; 8],
+    m: &[u32; 16],
+    t: u64,
+    block_len: u32,
+    flags: u32,
+) -> [u64; SYSCALL_STATE_DWORDS] {
+    let mut words = [0u32; 2 * SYSCALL_OUT_DWORD];
+    words[0..8].copy_from_slice(h);
+    words[8..24].copy_from_slice(m);
+    words[24] = t as u32;
+    words[25] = (t >> 32) as u32;
+    words[26] = block_len;
+    words[27] = flags;
+
+    let mut state = [0u64; SYSCALL_STATE_DWORDS];
+    for (k, dword) in state[..SYSCALL_OUT_DWORD].iter_mut().enumerate() {
+        *dword = (words[2 * k] as u64) | ((words[2 * k + 1] as u64) << 32);
+    }
+    state
+}
+
+/// Read the 16 output words the accelerator wrote into [`pack_syscall_state`]'s
+/// region. The inverse of the low half of that layout, over dwords `14..22`.
+pub fn unpack_syscall_out(state: &[u64; SYSCALL_STATE_DWORDS]) -> [u32; 16] {
+    core::array::from_fn(|i| {
+        let dword = state[SYSCALL_OUT_DWORD + i / 2];
+        if i.is_multiple_of(2) {
+            dword as u32
+        } else {
+            (dword >> 32) as u32
+        }
+    })
+}
+
+/// ★ The chain's single entry into the compression function.
+///
+/// Both the interior step and the finalization go through here, so there is one
+/// place where a guest reaches the accelerator and one framing above it. Adding
+/// a second call to [`blake3_compress_rounds`] in this file would put a
+/// compression outside the accelerator's reach on the guest and split the two
+/// paths silently — the trap PA-PLAN §1.4 names.
+///
+/// `t` is not a parameter: the construction is a single chunk that never ends,
+/// so the counter is 0 at every block (§1.7). The syscall ABI still carries a
+/// full 64-bit counter, and this is where it is pinned to zero.
+#[cfg(all(target_arch = "riscv64", feature = "blake3-6round"))]
+fn compress_block(
+    cv: &[u32; 8],
+    block: &[u32; 16],
+    block_len: u32,
+    flags: u32,
+    rounds: usize,
+) -> [u32; 16] {
+    // `with_rounds` can hand this any count — it exists so the 7-round anchor
+    // is reachable from one build — while the accelerator implements six and
+    // nothing else. Anything but the crate-global count takes the software
+    // path, so the anchor constructor cannot be answered at the wrong round
+    // count by a machine that has the precompile.
+    if rounds != BLAKE3_ROUNDS {
+        return blake3_compress_rounds(cv, block, 0, block_len, flags, rounds);
+    }
+    let mut state = pack_syscall_state(cv, block, 0, block_len, flags);
+    lambda_vm_syscalls::syscalls::blake3_compress_6round(&mut state);
+    unpack_syscall_out(&state)
+}
+
+/// The chain's single entry into the compression function, in software.
+///
+/// See the riscv64 arm above for what this is one of two of. Every host build
+/// takes this path, and so does a guest built without `blake3-6round`: the
+/// accelerator is 6-round only, so at 7 rounds there is nothing to dispatch to.
+#[cfg(not(all(target_arch = "riscv64", feature = "blake3-6round")))]
+fn compress_block(
+    cv: &[u32; 8],
+    block: &[u32; 16],
+    block_len: u32,
+    flags: u32,
+    rounds: usize,
+) -> [u32; 16] {
+    blake3_compress_rounds(cv, block, 0, block_len, flags, rounds)
+}
+
+/// The accelerator is **six rounds, hard-coded**: `BLAKE3_ROUNDS` in
+/// `executor::vm::instruction::execution` is a plain `6` with no feature behind
+/// it, and the chip's columns are laid out for that width. So the syscall arm
+/// above computes the host prover's hash only while this crate is at six rounds
+/// too, and the coupling is compile-time rather than a comment: inverting
+/// `blake3-6round`'s polarity must fail the build, not surface later as a root
+/// the verifier rejects.
+///
+/// Gated on the feature alone, not on the target, although only the riscv64 arm
+/// dispatches to the accelerator: a `target_arch` gate would put it out of reach
+/// of every host build, including `make lint`'s `blake3-6round` pass, which is
+/// the one place CI compiles this feature at all.
+#[cfg(feature = "blake3-6round")]
+const _: () = assert!(
+    BLAKE3_ROUNDS == super::BLAKE3_SIX_ROUNDS,
+    "the BLAKE3 accelerator implements 6 rounds only, but `blake3-6round` did \
+     not select 6 — the guest would hash differently from the host prover"
+);
 
 /// The single-chunk BLAKE3 chain as an incremental hasher.
 ///
@@ -157,19 +340,23 @@ impl Blake3Chain {
 
     /// The pending block's flags. `CHUNK_START` while nothing has been
     /// compressed yet; `CHUNK_END | ROOT` when this is the message's last block.
+    ///
+    /// The streaming form of [`block_flags`] — `started` is "index > 0" and
+    /// `is_final` is "index + 1 == n" — reached through it rather than beside
+    /// it, so the closed form the eDSL emitter reads cannot drift from the one
+    /// this hasher runs.
     fn flags(&self, is_final: bool) -> u32 {
-        let start = if self.started { 0 } else { CHUNK_START };
-        let end = if is_final { CHUNK_END | ROOT } else { 0 };
-        start | end
+        let index = usize::from(self.started);
+        let num_blocks = if is_final { index + 1 } else { index + 2 };
+        block_flags(index, num_blocks)
     }
 
     /// Fold the pending block — known not to be the last — into the chaining
     /// value, and clear the block so the next one is zero-padded.
     fn compress_pending(&mut self) {
-        let out = blake3_compress_rounds(
+        let out = compress_block(
             &self.cv,
             &self.block_words(),
-            0,
             BLOCK_LEN as u32,
             self.flags(false),
             self.rounds,
@@ -202,10 +389,9 @@ impl Blake3Chain {
     /// `block_len = 0`, which is one compression, not zero — and is what
     /// `blake3::hash(b"")` is at 7 rounds.
     pub fn finalize_digest(&self) -> [u8; 32] {
-        let out = blake3_compress_rounds(
+        let out = compress_block(
             &self.cv,
             &self.block_words(),
-            0,
             self.block_len as u32,
             self.flags(true),
             self.rounds,
@@ -274,8 +460,14 @@ pub const CHAIN_KAT_LENS: [usize; 12] = [0, 1, 31, 63, 64, 65, 127, 128, 192, 25
 ///
 /// It is a regression pin — generated from this implementation and committed, so
 /// a later refactor cannot change the construction silently. But it is more than
-/// that, and the difference is worth stating precisely because the compression
-/// vectors it sits next to are weaker.
+/// that, and the difference is worth stating precisely.
+///
+/// It is not "stronger than the compression vectors next door" either: the two
+/// cover different axes. This table pins the FRAMING across blocks — the flag
+/// schedule, the chaining value, the final block's `block_len`. It cannot pin the
+/// counter split, because every message here is hashed with `t = 0`; only
+/// [`CANONICAL_VECTORS`](super::CANONICAL_VECTORS), whose ten vectors all carry
+/// `t >= 2^32`, does that. Neither table is redundant with the other.
 ///
 /// Every entry from length 0 to 1024 was **independently reproduced** by #903's
 /// Python oracle (`thoughts/blake3/blake3-oracle/blake3_ref.py`) evaluated at
@@ -293,10 +485,26 @@ pub const CHAIN_KAT_LENS: [usize; 12] = [0, 1, 31, 63, 64, 65, 127, 128, 192, 25
 /// count needs a reference that is standard at 6 rounds too, which is exactly
 /// what the oracle is.
 ///
-/// ⚠ The oracle survives only as `__pycache__` bytecode in an untracked
-/// directory; its `.py` source is gone. The cross-check is recorded in PA-PLAN
-/// §1.7.5 with the digests, so the result outlives the artifact even though
-/// re-running it may not be possible.
+/// Everything that cross-check needs is tracked, so it is reproducible rather
+/// than merely recorded. `thoughts/blake3/blake3-oracle/` holds the
+/// round-parameterized reference (`blake3_ref.py`, vendored at commit
+/// `65025095`), which exposes raw compression entry points — `compress`,
+/// `compress_cv`, `compress_6round` — as well as `blake3_hash`, alongside
+/// `canonical_6round_vectors.json`, `official_test_vectors.json` and
+/// `test_oracle.py`.
+///
+/// A **second source** sits beside it, and it is the stronger of the two:
+/// `thoughts/blake3/reference-impl/` is upstream BLAKE3 1.8.5's own portable C
+/// with its round loop parameterized, the whole edit being
+/// `PARAMETERISATION.diff`. It reproduces this table at 6 rounds over every
+/// length up to one chunk, and it encodes the message schedule as an indexed
+/// `MSG_SCHEDULE[r]` table where this crate composes a single permutation
+/// between rounds. Those are structurally different expressions of the same
+/// convention, so its agreement cross-validates the schedule instead of
+/// restating it — a bug in the iterative composition is precisely what one
+/// source cannot catch. `make test-blake3-second-source` runs both against these
+/// digests: a ~1 second C compile plus a randomised differential, no cargo and
+/// no GPU.
 ///
 /// The 7-round arm remains the primary anchor and needs none of this:
 /// `blake3_chain_rounds(m, 7)` is checked directly against the `blake3` crate
@@ -505,6 +713,90 @@ mod tests {
                 chain.update(&[*b]);
             }
             assert_eq!(chain.finalize_digest(), want, "length {len} byte at a time");
+        }
+    }
+
+    /// The closed form of the framing, evaluated block by block — what an
+    /// emitter that knows the length up front produces.
+    fn closed_form_digest(msg: &[u8], flag_schedule: fn(usize, usize) -> u32) -> [u8; 32] {
+        let len = msg.len();
+        let n = num_blocks(len);
+        let mut cv = BLAKE3_IV;
+        let mut out = [0u32; 16];
+        for i in 0..n {
+            let mut block = [0u8; BLOCK_LEN];
+            let start = i * BLOCK_LEN;
+            let take = len.saturating_sub(start).min(BLOCK_LEN);
+            block[..take].copy_from_slice(&msg[start..start + take]);
+            let words: [u32; 16] = core::array::from_fn(|k| {
+                u32::from_le_bytes(block[4 * k..4 * k + 4].try_into().unwrap())
+            });
+            out = blake3_compress_rounds(
+                &cv,
+                &words,
+                0,
+                block_len_of(i, len),
+                flag_schedule(i, n),
+                BLAKE3_ROUNDS,
+            );
+            cv.copy_from_slice(&out[..8]);
+        }
+        let mut digest = [0u8; 32];
+        for i in 0..8 {
+            digest[4 * i..4 * i + 4].copy_from_slice(&out[i].to_le_bytes());
+        }
+        digest
+    }
+
+    /// ★ The closed-form schedule IS the streaming hasher's, at every length a
+    /// block boundary can be wrong at.
+    ///
+    /// The Lambda VM's eDSL emitter cannot use [`Blake3Chain`] — it has no
+    /// runtime, only a compile-time length — so it emits [`num_blocks`]
+    /// compressions parameterized by [`block_flags`] and [`block_len_of`]. This
+    /// is the statement that doing so is this hash and not a neighbour of it.
+    #[test]
+    fn the_streaming_chain_follows_the_closed_form_schedule() {
+        for len in [
+            0usize, 1, 4, 31, 32, 63, 64, 65, 100, 127, 128, 129, 192, 200, 256, 1024, 1088,
+        ] {
+            let msg = message(len);
+            assert_eq!(
+                closed_form_digest(&msg, block_flags),
+                blake3_chain(&msg),
+                "the closed-form framing must be the chain's, at length {len}"
+            );
+        }
+    }
+
+    /// NEGATIVE CONTROL for the closed form: a schedule that puts
+    /// `CHUNK_START` on every block, or `CHUNK_END | ROOT` on the first, must
+    /// disagree — otherwise the test above would pass for a construction that
+    /// ignores the flags entirely, which is the failure it exists to catch.
+    #[test]
+    fn a_different_flag_schedule_is_a_different_hash() {
+        const fn start_on_every_block(_index: usize, num_blocks: usize) -> u32 {
+            block_flags(0, num_blocks + 1) | block_flags(num_blocks - 1, num_blocks)
+        }
+        const fn end_on_the_first_block(index: usize, num_blocks: usize) -> u32 {
+            block_flags(num_blocks - 1 - index, num_blocks)
+        }
+        // At one block every schedule here coincides, so the controls start at
+        // two — which is also the first length where a schedule exists at all.
+        for len in [65usize, 128, 200, 1024] {
+            let msg = message(len);
+            let honest = blake3_chain(&msg);
+            assert_eq!(closed_form_digest(&msg, block_flags), honest);
+            assert_ne!(
+                closed_form_digest(&msg, start_on_every_block),
+                honest,
+                "CHUNK_START on every block must not be this hash, at length {len}"
+            );
+            assert_ne!(
+                closed_form_digest(&msg, end_on_the_first_block),
+                honest,
+                "a reversed flag schedule must not be this hash, at length {len}"
+            );
         }
     }
 

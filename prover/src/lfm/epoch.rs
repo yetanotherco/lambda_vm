@@ -123,7 +123,7 @@ impl RootCells {
     /// (`programs::emit_register_commitment`). A hinted REGISTER root would leave
     /// the register boundary — the carried commit index among it — a free arena
     /// word.
-    pub fn from_digest(b: &mut LfmBuilder, digest: super::edsl::KeccakDigest) -> Self {
+    pub fn from_digest(b: &mut LfmBuilder, digest: super::edsl::WrapDigest) -> Self {
         RootCells {
             lanes: [b.unpack(digest[0]), b.unpack(digest[1])],
         }
@@ -366,7 +366,7 @@ fn emit_grinding_check(
     }
     inner.push_halves(&seed_halves);
     inner.push_const(&[factor]);
-    let inner_hash = inner.keccak256(b);
+    let inner_hash = inner.wrap_hash(b);
 
     let mut outer = ByteString::new();
     let mut inner_halves = Vec::with_capacity(8);
@@ -375,7 +375,7 @@ fn emit_grinding_check(
     }
     outer.push_halves(&inner_halves);
     outer.push_halves(&nonce_halves);
-    let digest = outer.keccak256(b);
+    let digest = outer.wrap_hash(b);
 
     // The zero bits, as `(byte, bit-within-byte)` pairs of the big-endian run:
     // `factor / 8` whole leading bytes, then the top `factor % 8` bits of the

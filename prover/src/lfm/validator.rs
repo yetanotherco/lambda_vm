@@ -245,6 +245,16 @@ fn check_multiplicities(program: &LfmProgram) -> Result<(), LfmViolation> {
                     }
                 }
             }
+            Instr::Blake3(k) => {
+                for i in 0..layout::blake3::OUT_WORDS {
+                    check(k.outs[i], k.mults[i])?;
+                }
+                if let Some(rev) = &k.rev {
+                    for i in 0..layout::blake3::DIGEST_WORDS {
+                        check(rev.outs[i], rev.mults[i])?;
+                    }
+                }
+            }
             Instr::Public { .. } => {}
         }
     }
@@ -293,6 +303,7 @@ fn check_groups(program: &LfmProgram) -> Result<(), LfmViolation> {
     chip_real("LFM_BITDEC", &g.bitdec, counts.bitdec)?;
     chip_real("LFM_HASH", &g.hash, counts.hash)?;
     chip_real("LFM_KECCAK", &g.keccak, counts.keccak)?;
+    chip_real("LFM_BLAKE3", &g.blake3, counts.blake3)?;
     chip_real("LFM_LANES", &g.lanes, counts.lanes)?;
     chip_real("LFM_HINT", &g.hint, counts.hint)?;
     chip_real("LFM_PUBLIC", &g.public, counts.public)?;
@@ -318,6 +329,11 @@ fn check_groups(program: &LfmProgram) -> Result<(), LfmViolation> {
     )?;
     one_hot(&g.lanes, "LFM_LANES", layout::lanes::MODE_PACK, 2)?;
     one_hot(&g.keccak, "LFM_KECCAK", layout::keccak::MODE_PERM, 2)?;
+    // `LFM_BLAKE3` has ONE mode, so its is-real flag is a flag rather than a
+    // one-hot run — the same shape `LFM_SELECT` and `LFM_BITDEC` have. The AIR
+    // keeps its own ungated `IS_BIT(MU)` belt-over-suspenders; this is what
+    // makes MU = 1 on every real row a checked property of the program.
+    flag_is_one(&g.blake3, "LFM_BLAKE3", layout::blake3::MU)?;
     flag_is_one(&g.select, "LFM_SELECT", layout::select::IS_REAL)?;
     flag_is_one(&g.bitdec, "LFM_BITDEC", layout::bitdec::IS_REAL)?;
     flag_is_one(&g.public, "LFM_PUBLIC", layout::public::IS_REAL)?;
@@ -331,6 +347,7 @@ fn check_groups(program: &LfmProgram) -> Result<(), LfmViolation> {
         ("LFM_BITDEC", &g.bitdec),
         ("LFM_HASH", &g.hash),
         ("LFM_KECCAK", &g.keccak),
+        ("LFM_BLAKE3", &g.blake3),
         ("LFM_LANES", &g.lanes),
         ("LFM_HINT", &g.hint),
         ("LFM_PUBLIC", &g.public),
@@ -365,7 +382,7 @@ const MULT_HARD_CAP: u64 = 1 << 32;
 /// upper bound (safe), under-counting would reject honest programs, so where
 /// two receivers are mutually exclusive the count rounds up.
 fn mult_bound(g: &LfmColumnGroups) -> u64 {
-    let receives_per_row: [(&ColumnGroup, u64); 10] = [
+    let receives_per_row: [(&ColumnGroup, u64); 11] = [
         (&g.const_, 0), // reads nothing
         (&g.balu, 3),   // A, B, C
         (&g.xalu, 3),   // A, B, C
@@ -376,6 +393,7 @@ fn mult_bound(g: &LfmColumnGroups) -> u64 {
             &g.keccak,
             (layout::keccak::NUM_WORDS + layout::keccak::BLOCK_WORDS) as u64,
         ), // state + rate block
+        (&g.blake3, layout::blake3::IN_WORDS as u64), // h | m | params
         (&g.lanes, 5),  // the word (Unpack) or the four lanes (Pack)
         (&g.hint, 0),   // reads nothing
         (&g.public, 1), // the published cell
@@ -394,7 +412,7 @@ fn mult_bound(g: &LfmColumnGroups) -> u64 {
 /// pinned to `{0,1}` on real rows by check 5 and to 0 on padding rows by
 /// check 6 — the send gates listed here are the only unbounded ones.
 fn mult_columns(g: &LfmColumnGroups) -> Vec<(&'static str, &ColumnGroup, Vec<usize>)> {
-    use layout::{balu, bitdec, const_, hash, hint, keccak, lanes, select, xalu};
+    use layout::{balu, bitdec, blake3, const_, hash, hint, keccak, lanes, select, xalu};
     vec![
         ("LFM_CONST", &g.const_, vec![const_::MULT]),
         ("LFM_BALU", &g.balu, vec![balu::MULT]),
@@ -420,6 +438,14 @@ fn mult_columns(g: &LfmColumnGroups) -> Vec<(&'static str, &ColumnGroup, Vec<usi
             (0..keccak::NUM_WORDS)
                 .map(keccak::mult)
                 .chain((0..keccak::DIGEST_WORDS).map(keccak::rev_mult))
+                .collect(),
+        ),
+        (
+            "LFM_BLAKE3",
+            &g.blake3,
+            (0..blake3::OUT_WORDS)
+                .map(blake3::mult)
+                .chain((0..blake3::DIGEST_WORDS).map(blake3::rev_mult))
                 .collect(),
         ),
         (
@@ -510,6 +536,7 @@ struct PartitionCounts {
     bitdec: usize,
     hash: usize,
     keccak: usize,
+    blake3: usize,
     lanes: usize,
     hint: usize,
     public: usize,
@@ -524,6 +551,7 @@ fn partition_counts(instrs: &[Instr]) -> PartitionCounts {
         bitdec: 0,
         hash: 0,
         keccak: 0,
+        blake3: 0,
         lanes: 0,
         hint: 0,
         public: 0,
@@ -537,6 +565,7 @@ fn partition_counts(instrs: &[Instr]) -> PartitionCounts {
             Instr::BitDec { .. } => c.bitdec += 1,
             Instr::Hash { .. } => c.hash += 1,
             Instr::KeccakF(_) => c.keccak += 1,
+            Instr::Blake3(_) => c.blake3 += 1,
             Instr::Pack { .. } | Instr::Unpack { .. } => c.lanes += 1,
             Instr::Hint { .. } => c.hint += 1,
             Instr::Public { .. } => c.public += 1,

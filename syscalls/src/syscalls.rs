@@ -29,6 +29,10 @@ pub enum SyscallNumbers {
 #[cfg(target_arch = "riscv64")]
 const KECCAK_SYSCALL_NUMBER: usize = usize::MAX - 1;
 
+/// Syscall number for the BLAKE3 6-round compression accelerator (u64::MAX - 2).
+#[cfg(target_arch = "riscv64")]
+const BLAKE3_SYSCALL_NUMBER: usize = usize::MAX - 2;
+
 /// Syscall number for the ECSM secp256k1 scalar-multiply accelerator (-11 as usize).
 #[cfg(target_arch = "riscv64")]
 const ECSM_SYSCALL_NUMBER: usize = usize::MAX - 10;
@@ -172,6 +176,30 @@ pub fn keccak_permute(state: &mut [u64; 25]) {
 #[cfg(not(target_arch = "riscv64"))]
 /// Apply the Keccak-f[1600] permutation to a 25-element u64 state in-place.
 pub fn keccak_permute(_state: &mut [u64; 25]) {
+    unimplemented!("syscalls are only implemented for riscv64 targets");
+}
+
+#[cfg(target_arch = "riscv64")]
+/// BLAKE3 **6-round** compression via the accelerator (internal variant — NOT
+/// standard 7-round BLAKE3; see `thoughts/blake3/blake3-chip/DESIGN.md`).
+///
+/// `state` is the 176-byte region as 22 dwords: `h[8 words] | m[16 words] |
+/// t | (block_len, flags) | out[16 words]`, all words little-endian, two per
+/// dword. The accelerator reads dwords 0..14 and writes `out` to dwords 14..22.
+/// Using `[u64; 22]` guarantees the 8-byte alignment the ecall requires.
+pub fn blake3_compress_6round(state: &mut [u64; 22]) {
+    unsafe {
+        asm!(
+            "ecall",
+            in("a0") state.as_mut_ptr(),
+            in("a7") BLAKE3_SYSCALL_NUMBER,
+        )
+    }
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+/// BLAKE3 6-round compression via the accelerator (internal variant).
+pub fn blake3_compress_6round(_state: &mut [u64; 22]) {
     unimplemented!("syscalls are only implemented for riscv64 targets");
 }
 

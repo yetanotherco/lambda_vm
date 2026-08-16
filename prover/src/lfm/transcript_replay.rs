@@ -55,7 +55,7 @@
 use crate::tables::types::FE;
 
 use super::builder::{Bit, Cell, Ext, Felt, LfmBuilder};
-use super::edsl;
+use super::edsl::{self, WrapHash};
 use super::keccak_host::{BYTES_PER_HALF, SQUEEZE_LEN};
 use super::layout::keccak::DIGEST_WORDS;
 
@@ -348,7 +348,7 @@ impl TranscriptReplay {
     /// what `sample()` returns.
     fn squeeze(&mut self, b: &mut LfmBuilder) -> ([Cell; DIGEST_WORDS], [Cell; DIGEST_WORDS]) {
         let packed = self.pack_segment(b);
-        let (plain, rev) = edsl::keccak256_with_rev(b, &packed, self.segment_len);
+        let (plain, rev) = edsl::wrap_hash_bytes_with_rev(b, &packed, self.segment_len);
         // The transcript absorbs the reversed bytes into a freshly reset hasher,
         // so they are the WHOLE of the next segment, not a suffix of this one.
         let mut halves = Vec::with_capacity(SQUEEZE_HALVES);
@@ -415,12 +415,63 @@ impl TranscriptReplay {
         lanes[l]
     }
 
-    /// One base-field challenge: `GoldilocksField::sample_field_element_from`
-    /// with the rejection branch replaced by a constraint (see the module docs).
+    /// One base-field challenge, under the configuration's **draw schedule**.
+    ///
+    /// ★ This is not a hash swap with a different sponge underneath; the two
+    /// configurations consume different numbers of candidates per coordinate,
+    /// which moves every refill boundary and therefore the squeeze count. The
+    /// schedule is read from `crypto`'s own `TranscriptHash` impls
+    /// ([`candidates_per_coordinate`]), never restated here.
+    ///
+    /// - **n = 1** (keccak, whose schedule is the unbounded rejection loop and
+    ///   whose modal cost is one candidate): draw one, ASSERT it canonical, use
+    ///   it. A straight-line machine cannot emit an unbounded loop, so it emits
+    ///   the modal schedule and constrains the draw to have landed — the
+    ///   standing unprovability restriction of `SOUNDNESS.md` §6.3, at ≈ 2⁻³²
+    ///   per coordinate.
+    /// - **n ≥ 2** (BLAKE3, rider 1): draw all `n`, SELECT the first in range,
+    ///   assert only the selection. Asserting candidate 0 instead would
+    ///   reinstate exactly the restriction the rider was adopted to remove.
+    ///
+    /// **The claim the review should check** (stated, not self-certified): the
+    /// emitted program is complete except when EVERY one of the `n` candidates
+    /// misses — ≈ 2⁻³²ⁿ per coordinate, so ≈ 2⁻⁶⁴ at n = 2 — and on that event
+    /// the host draws another `n` while the machine has no program to run. The
+    /// restriction shrinks by a factor of 2³² and does not vanish. Consumption
+    /// is exactly `n` per coordinate on every path, which is the property the
+    /// replay's refill bookkeeping depends on.
+    ///
+    /// `sample_u64_pow2` is unaffected in both configurations: production's
+    /// `sample_u64` reaches the raw candidate stream, not the fixed schedule,
+    /// and at a power-of-two bound it accepts its first candidate.
     pub fn sample_felt(&mut self, b: &mut LfmBuilder) -> Felt {
-        let c = self.next_candidate(b);
-        assert_canonical(b, c);
-        candidate_to_felt(b, c)
+        let n = candidates_per_coordinate(b.wrap_hash());
+        let candidates: Vec<Candidate> = (0..n).map(|_| self.next_candidate(b)).collect();
+
+        // The fallback is the LAST candidate, matching the host's
+        // `chosen.unwrap_or(last)`: when everything missed it hands back an
+        // out-of-range value, its field rejects it, and the draw continues.
+        // Here "the field rejects it" is `assert_canonical` below, i.e. the
+        // program is unprovable — see the claim above.
+        let mut chosen = *candidates.last().expect("at least one candidate");
+        for candidate in candidates[..n - 1].iter().rev() {
+            let in_range = candidate_in_range(b, *candidate);
+            // `select(bit, l, r)` yields `l` first when the bit is 0 and `r`
+            // first when it is 1, so `l = chosen`, `r = candidate` gives
+            // "this candidate if it is in range, else what we had".
+            let (lo, _) = b.select(in_range, chosen.lo.as_cell(), candidate.lo.as_cell());
+            let (hi, _) = b.select(in_range, chosen.hi.as_cell(), candidate.hi.as_cell());
+            // Both halves are `Select` outputs of `u32` cells, so they are the
+            // `u32`s the hash chip range-checked — which is what
+            // `assert_canonical`'s derivation needs.
+            chosen = Candidate {
+                lo: Felt(lo.addr()),
+                hi: Felt(hi.addr()),
+            };
+        }
+
+        assert_canonical(b, chosen);
+        candidate_to_felt(b, chosen)
     }
 
     /// One cubic-extension challenge: three independent base draws in
@@ -476,7 +527,7 @@ impl TranscriptReplay {
     /// splice would only be redundant work, never a different value.
     pub fn state(&mut self, b: &mut LfmBuilder) -> [Cell; DIGEST_WORDS] {
         let packed = self.pack_segment(b);
-        edsl::keccak256(b, &packed, self.segment_len)
+        edsl::wrap_hash_bytes(b, &packed, self.segment_len)
     }
 
     /// Emit-time buffer position, for tests that pin the consumption schedule.
@@ -513,8 +564,11 @@ impl TranscriptReplay {
 /// `LfmBuilder::assert_eq` is built from.
 ///
 /// Both halves must be canonical `u32`s for the derivation to hold. They are:
-/// they come from `Unpack` of a `LFM_KECCAK` output word, whose halves the
-/// keccak adapter range-checks (`keccak_rejects_non_u32_half`).
+/// they come from `Unpack` of a hash chip's output word, and both chips
+/// recompose each `u32` from four BITWISE-range-checked byte columns —
+/// `LFM_KECCAK` (`keccak_rejects_non_u32_half`) and `LFM_BLAKE3` alike. A
+/// half that reached here through a `Select` is one of those values by the
+/// select chip's own semantics.
 pub fn assert_canonical(b: &mut LfmBuilder, c: Candidate) {
     let hi_max = b.felt_const(FE::from(HI_MAX));
     let g = b.sub(hi_max, c.hi);
@@ -871,9 +925,76 @@ impl ByteString {
         self.len == 0
     }
 
-    /// `keccak256` over the assembled bytes.
+    /// ⛔ `keccak256` over the assembled bytes, **pinned** — it does not follow
+    /// the configured wrap hash.
+    ///
+    /// For folds whose host counterpart names `PlatformKeccak256` explicitly
+    /// rather than the configuration's hash. There is exactly one such caller,
+    /// `programs::emit_program_id`, mirroring
+    /// `recursion::program_id_from_digest`; switching it would make the
+    /// attestation join disagree with every host consumer of a `program_id`.
+    ///
+    /// ★ This method and [`ByteString::wrap_hash`] are the reason `ByteString`
+    /// needed a SECOND hashing method rather than a substitution. The naive
+    /// sweep — "replace every `edsl::keccak256` call" — produces a wrong proof
+    /// exactly here, because grinding and `program_id` share this type and have
+    /// opposite fates.
     pub fn keccak256(&self, b: &mut LfmBuilder) -> [Cell; DIGEST_WORDS] {
         let packed = pack_pieces(&self.pieces, b);
         edsl::keccak256(b, &packed, self.len)
     }
+
+    /// The CONFIGURED wrap hash over the assembled bytes.
+    ///
+    /// For folds that follow the configuration — grinding, whose host side
+    /// reaches the digest through `GrindingDigest<H>` (P-a Stage 3,
+    /// `crypto/stark/src/config.rs`) and therefore moves with `H`.
+    pub fn wrap_hash(&self, b: &mut LfmBuilder) -> [Cell; DIGEST_WORDS] {
+        let packed = pack_pieces(&self.pieces, b);
+        edsl::wrap_hash_bytes(b, &packed, self.len)
+    }
+}
+
+/// Candidates one base coordinate draws, under the configuration `hash` names.
+///
+/// Read from `crypto`'s own `TranscriptHash` impls rather than restated: the
+/// schedule is half of what a transcript configuration IS, and a machine that
+/// replayed a different one would produce challenges the host never drew.
+///
+/// `None` is the host's UNBOUNDED rejection loop. Its modal cost is one
+/// candidate and a straight-line machine cannot emit an unbounded loop, so the
+/// emission is one draw plus a canonicity constraint — see
+/// [`TranscriptReplay::sample_felt`] for exactly what that costs.
+fn candidates_per_coordinate(hash: WrapHash) -> usize {
+    use crypto::fiat_shamir::transcript_hash::{
+        Blake3TranscriptHash, KeccakTranscriptHash, TranscriptHash,
+    };
+    let schedule = match hash {
+        WrapHash::Keccak => KeccakTranscriptHash::CANDIDATES_PER_COORDINATE,
+        WrapHash::Blake3 => Blake3TranscriptHash::CANDIDATES_PER_COORDINATE,
+    };
+    schedule.map_or(1, core::num::NonZeroUsize::get)
+}
+
+/// Whether a candidate is a canonical field element, as a BIT.
+///
+/// The predicate form of [`assert_canonical`], and strictly more work: that one
+/// is a single division whose provability IS the answer, which is enough when
+/// the answer must be yes and useless when the answer has to be selected on.
+///
+/// `candidate ≥ p ⟺ hi = 2^32 − 1 ∧ lo ≠ 0` (the derivation is in
+/// [`assert_canonical`]). So with `a = [hi = 2^32 − 1]`, the product `a · lo` is
+/// zero exactly when the candidate is in range — one `is_zero` rather than two,
+/// because `a` collapses the conjunction. `a · lo < 2^32` since `a` is boolean
+/// and `lo` is a `u32` half, which is the bound
+/// [`edsl::is_zero_bounded`] needs.
+///
+/// Cost: two `LFM_BITDEC` rows and ~95 `LFM_BALU` rows per coordinate, against
+/// the two rows [`assert_canonical`] costs. Small next to the squeeze that
+/// produced the candidate (a keccak permutation is 24 `KECCAK_RND` rows of
+/// 1,480 columns), but it is not nothing and it is paid per coordinate.
+pub fn candidate_in_range(b: &mut LfmBuilder, c: Candidate) -> Bit {
+    let hi_is_max = edsl::is_all_ones_bounded(b, c.hi, 32);
+    let witness = b.mul(hi_is_max.as_felt(), c.lo);
+    edsl::is_zero_bounded(b, witness, 32)
 }

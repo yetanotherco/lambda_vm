@@ -15,6 +15,8 @@
 
 use crate::tables::types::FE;
 
+use super::layout;
+
 /// A write-once memory cell address (dense index into the address space).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Addr(pub u64);
@@ -56,7 +58,8 @@ pub enum HashMode {
     /// Structurally identical to [`HashMode::Compress`] — two cells in, one
     /// cell out, same socket, same columns — and DIFFERENT in exactly one
     /// thing: the hash domain. Under BLAKE3 the row's domain tag is the
-    /// message word `m[8]`, selected by the preprocessed mode columns, so a
+    /// message word immediately after the lanes (`m[12]` at the RATE-4 lane
+    /// count), selected by the preprocessed mode columns, so a
     /// transcript step cannot be replayed as a Merkle parent or the reverse.
     /// Hashers with a single domain (`Test`, `Poseidon`) compute the same
     /// function in both modes; the separation is a property of the hasher, not
@@ -169,6 +172,37 @@ pub enum KeccakMode {
     Absorb,
 }
 
+/// Operands of an [`Instr::Blake3`]: 7 words of `u32` input in, 4 words of
+/// compression output out, plus each output's static read count.
+///
+/// The 28 input `u32` words are `h[8] ‖ m[16] ‖ t_lo ‖ t_hi ‖ block_len ‖
+/// flags`, four to a machine word — so word 0–1 carry `h`, words 2–5 carry `m`,
+/// and word 6 is `(t_lo, t_hi, block_len, flags)`. 28 divides by 4 exactly,
+/// so unlike [`KeccakOperands`] there are no unused lane slots. Every lane of
+/// every input word must be a canonical value below `2^32`.
+///
+/// Unlike `KeccakF`, the compression is proved **here** — `LFM_BLAKE3` carries
+/// its own AIR — rather than delegated to a hosted family, so there is no tag
+/// binding a request token to a reply token and nothing for the admission
+/// validator to check for uniqueness.
+#[derive(Debug, Clone)]
+pub struct Blake3Operands {
+    pub ins: [Addr; layout::blake3::IN_WORDS],
+    pub outs: [Addr; layout::blake3::OUT_WORDS],
+    pub mults: [u64; layout::blake3::OUT_WORDS],
+    /// When set, the row ALSO writes the byte-reversed 32-byte digest as two
+    /// words — the production transcript's `sample()`. Free on the bus (see
+    /// `layout::blake3::REV_ADDR0`).
+    pub rev: Option<Blake3ReversedDigest>,
+}
+
+/// The reversed-digest outputs of a BLAKE3 row (see `layout::blake3::REV_ADDR0`).
+#[derive(Debug, Clone)]
+pub struct Blake3ReversedDigest {
+    pub outs: [Addr; layout::blake3::DIGEST_WORDS],
+    pub mults: [u64; layout::blake3::DIGEST_WORDS],
+}
+
 /// One LFM instruction. Operand-field conventions:
 ///
 /// - `c` on the ALU ops is meaningful iff the op is `MulAdd` (and is emitted
@@ -251,6 +285,12 @@ pub enum Instr {
     /// largest variant, and inlining them would quadruple every instruction in
     /// the program vector.
     KeccakF(Box<KeccakOperands>),
+    /// One BLAKE3 compression over 7 input words, writing 4 output words.
+    ///
+    /// Boxed for the reason `KeccakF` is: the operand arrays are ~150 bytes,
+    /// twice the next largest variant, and inlining them would grow every
+    /// instruction in the program vector.
+    Blake3(Box<Blake3Operands>),
     Public {
         addr: Addr,
         index: u32,
@@ -268,6 +308,13 @@ impl Instr {
             | Instr::Pack { out, .. } => vec![*out],
             Instr::Unpack { outs, .. } => outs.to_vec(),
             Instr::KeccakF(k) => {
+                let mut v = k.outs.to_vec();
+                if let Some(rev) = &k.rev {
+                    v.extend_from_slice(&rev.outs);
+                }
+                v
+            }
+            Instr::Blake3(k) => {
                 let mut v = k.outs.to_vec();
                 if let Some(rev) = &k.rev {
                     v.extend_from_slice(&rev.outs);
@@ -315,6 +362,9 @@ impl Instr {
                     v
                 }
             },
+            // Every input word is read on every row: the chip has one mode, so
+            // there is no gated operand and no placeholder to exclude.
+            Instr::Blake3(k) => k.ins.to_vec(),
             Instr::Public { addr, .. } => vec![*addr],
         }
     }

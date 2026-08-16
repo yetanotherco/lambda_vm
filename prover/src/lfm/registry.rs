@@ -48,6 +48,18 @@ pub enum LfmRegistryError {
         kind: LfmProgramKind,
         blowup_factor: u8,
     },
+    /// Two or more rows claim the same `(kind, blowup_factor)`.
+    ///
+    /// The table's key is that pair and nothing else — not the hasher, not the
+    /// chunk count — so a second row for a pair that already exists is not an
+    /// alternative a caller can select. It is unreachable data, and the
+    /// reachable row is whichever the generator happened to print first. See
+    /// [`resolve`].
+    AmbiguousProgram {
+        kind: LfmProgramKind,
+        blowup_factor: u8,
+        rows: usize,
+    },
 }
 
 pub struct LfmRegistryEntry {
@@ -89,13 +101,16 @@ pub struct LfmArtifacts {
 /// - **slot 10 (`LFM_RANGE`)** — a fixed table whose group is
 ///   program-independent but still committed and bound, so a change to the
 ///   table or to the commit pipeline moves every program digest.
-/// - **slots 12–13 (`KECCAK_RC`, `BITWISE`)** — same treatment as `LFM_RANGE`,
+/// - **slot 11 (`LFM_BLAKE3`)** — a program-dependent instruction column group
+///   like slots 0–9, placed after `LFM_RANGE` so the hosted keccak family stays
+///   contiguous at the end (`airs::KECCAK_RND_SLOT`).
+/// - **slots 13–14 (`KECCAK_RC`, `BITWISE`)** — same treatment as `LFM_RANGE`,
 ///   except their preprocessed columns are owned by `tables/`, so the roots come
 ///   from those modules' own `preprocessed_commitment` — which is both what the
 ///   AIRs are built with and what the prover recommits against. Binding them
 ///   means a change to either production table moves every LFM program digest;
 ///   that is deliberate, since those tables are now part of the machine.
-/// - **slot 11 (`KECCAK_RND`)** — has no preprocessed columns at all, so there
+/// - **slot 12 (`KECCAK_RND`)** — has no preprocessed columns at all, so there
 ///   is nothing to commit. Its entry stays the all-zero sentinel at height 0 and
 ///   binds nothing. Sound because the chip is program-independent in both
 ///   directions: its constraints are fixed, and its trace height is free (extra
@@ -202,6 +217,7 @@ pub fn build_artifacts_with_hasher(
         &program.groups.hint,
         &program.groups.public,
         &range,
+        &program.groups.blake3,
     ];
     let mut roots = [[0u8; 32]; NUM_LFM_CHIPS];
     let mut log_heights = [0u8; NUM_LFM_CHIPS];
@@ -209,11 +225,11 @@ pub fn build_artifacts_with_hasher(
         roots[i] = commit_group(g, options);
         log_heights[i] = g.padded_rows.trailing_zeros() as u8;
     }
-    // Slot 11 (KECCAK_RND) keeps the all-zero sentinel installed above.
-    roots[12] = keccak_rc::preprocessed_commitment(options);
-    log_heights[12] = keccak_rc::NUM_ROWS.trailing_zeros() as u8;
-    roots[13] = bitwise::preprocessed_commitment(options);
-    log_heights[13] = bitwise::NUM_ROWS.trailing_zeros() as u8;
+    // Slot 12 (KECCAK_RND) keeps the all-zero sentinel installed above.
+    roots[13] = keccak_rc::preprocessed_commitment(options);
+    log_heights[13] = keccak_rc::NUM_ROWS.trailing_zeros() as u8;
+    roots[14] = bitwise::preprocessed_commitment(options);
+    log_heights[14] = bitwise::NUM_ROWS.trailing_zeros() as u8;
 
     let keccak_rnd_chunks = program
         .chunking
@@ -231,23 +247,72 @@ pub fn build_artifacts_with_hasher(
 
 /// Resolves a registry entry or fails hard. No fallback path exists or may
 /// ever be added.
+/// ★ **A duplicate `(kind, blowup_factor)` is an error, not a first-match win.**
+///
+/// `compute_lfm_registry`'s own doc promises that a second `LFM_HASH` hasher
+/// "becomes additional rows, never a silent replacement of these" — but the key
+/// here carries no hasher, so `.find()` returned whichever row the generator
+/// printed first and the other was unreachable, unnoticed. Since this function
+/// is the soundness argument's first premise, the failure mode it left open was
+/// a verifier checking a proof against a *different* program's roots than the
+/// one whose entry an operator believes is live.
+///
+/// Rejecting the shape is the cheap half of the fix; the other half is that
+/// adding rows stays a deliberate act, which `the_registry_is_six_unambiguous_rows`
+/// pins. It returns an `Err` rather than panicking because this runs on the
+/// verify path, where an unusable input is a rejected proof.
 pub fn resolve(
     kind: LfmProgramKind,
     blowup_factor: u8,
 ) -> Result<&'static LfmRegistryEntry, LfmRegistryError> {
-    LFM_REGISTRY
+    let mut matches = LFM_REGISTRY
         .iter()
-        .find(|e| e.kind == kind && e.blowup_factor == blowup_factor)
-        .ok_or(LfmRegistryError::UnknownProgram {
+        .filter(|e| e.kind == kind && e.blowup_factor == blowup_factor);
+    let first = matches.next().ok_or(LfmRegistryError::UnknownProgram {
+        kind,
+        blowup_factor,
+    })?;
+    let extra = matches.count();
+    if extra > 0 {
+        return Err(LfmRegistryError::AmbiguousProgram {
             kind,
             blowup_factor,
-        })
+            rows: extra + 1,
+        });
+    }
+    Ok(first)
 }
 
 // =========================================================================
 // GENERATED — do not edit by hand. Regenerate with:
 //   cargo run --bin compute_lfm_registry --release
 // and paste the output below. Drift tests recompute and compare on every PR.
+//
+// ★ WHICH CONFIGURATION THIS TABLE ASSUMES, and what would move it.
+//
+// Two axes are BOUND into every digest below and a third deliberately is not:
+//
+//   * `hasher` (the `LFM_HASH` socket permutation) is folded into `program_id`,
+//     so two hashers are two program identities. Blessed under
+//     `HasherKind::Test`; a second hasher becomes additional ROWS, and `resolve`
+//     rejects a duplicate `(kind, blowup_factor)` rather than shadowing one.
+//   * `blowup_factor` is a column of the table and half of `resolve`'s key.
+//     Blessed at 2, the only registered preset.
+//   * ⚠ `BLAKE3_ROUNDS` (the `blake3-6round` feature) is NOT bound, and does not
+//     need to be. It moves `LFM_BLAKE3`'s VALUE columns only — width
+//     3556 → 3076, constraints 897 → 769, interactions 1453 → 1261 — while what
+//     this table commits for that slot is the preprocessed instruction group:
+//     addresses, multiplicities and `MU`, none of which mention the round count.
+//     Regenerating under `--features blake3-6round` reproduces this table
+//     exactly, and `blake3_chip_tests::the_registry_blessing_is_round_count_invariant`
+//     pins the mechanism in both directions.
+//
+//     What that buys is one table for two builds. What it does NOT buy is a
+//     NAMED axis: a proof built at one round count and verified at the other is
+//     rejected on an OOD width mismatch — closed, but silent about why. If the
+//     round count ever becomes a per-deployment choice rather than a
+//     compile-time one, it needs the treatment `hasher` has (a fold into
+//     `program_id`) and this table needs blessing under each.
 // =========================================================================
 pub static LFM_REGISTRY: &[LfmRegistryEntry] = &[
     LfmRegistryEntry {
@@ -310,6 +375,11 @@ pub static LFM_REGISTRY: &[LfmRegistryEntry] = &[
                 0xf6, 0x27, 0x05, 0x41,
             ],
             [
+                0xa9, 0x51, 0xd0, 0x25, 0x21, 0x16, 0x44, 0x24, 0x5f, 0xb2, 0x81, 0x03, 0x54, 0x8b,
+                0x93, 0xb1, 0x74, 0xe6, 0x7a, 0x0f, 0xbc, 0x12, 0xe2, 0xba, 0x12, 0x3d, 0x31, 0xc6,
+                0x3b, 0xfb, 0x81, 0x89,
+            ],
+            [
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                 0x00, 0x00, 0x00, 0x00,
@@ -325,13 +395,13 @@ pub static LFM_REGISTRY: &[LfmRegistryEntry] = &[
                 0x0c, 0x6d, 0xc4, 0xcf,
             ],
         ],
-        log_heights: [3, 3, 2, 2, 2, 2, 2, 2, 2, 2, 16, 0, 5, 20],
+        log_heights: [3, 3, 2, 2, 2, 2, 2, 2, 2, 2, 16, 2, 0, 5, 20],
         keccak_rnd_chunks: 1,
         hasher: HasherKind::Test,
         program_id: [
-            0x70, 0x87, 0xe2, 0x83, 0x8d, 0xae, 0x11, 0x71, 0x74, 0x1f, 0x49, 0xa3, 0x2c, 0x47,
-            0x00, 0x9a, 0x79, 0x49, 0x4e, 0x82, 0x24, 0x9c, 0x8c, 0xee, 0x8c, 0x9e, 0x86, 0x74,
-            0x3b, 0xaf, 0x9f, 0x4b,
+            0xd7, 0x60, 0xa9, 0x45, 0xb4, 0xca, 0x37, 0xdc, 0x7b, 0x4d, 0xf7, 0x86, 0x75, 0x3b,
+            0x0d, 0xf7, 0xbb, 0x55, 0xc1, 0xab, 0x62, 0x78, 0x57, 0x47, 0x8d, 0xfa, 0x57, 0xc5,
+            0xa3, 0x1e, 0x97, 0xb3,
         ],
     },
     LfmRegistryEntry {
@@ -394,6 +464,11 @@ pub static LFM_REGISTRY: &[LfmRegistryEntry] = &[
                 0xf6, 0x27, 0x05, 0x41,
             ],
             [
+                0xa9, 0x51, 0xd0, 0x25, 0x21, 0x16, 0x44, 0x24, 0x5f, 0xb2, 0x81, 0x03, 0x54, 0x8b,
+                0x93, 0xb1, 0x74, 0xe6, 0x7a, 0x0f, 0xbc, 0x12, 0xe2, 0xba, 0x12, 0x3d, 0x31, 0xc6,
+                0x3b, 0xfb, 0x81, 0x89,
+            ],
+            [
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                 0x00, 0x00, 0x00, 0x00,
@@ -409,13 +484,13 @@ pub static LFM_REGISTRY: &[LfmRegistryEntry] = &[
                 0x0c, 0x6d, 0xc4, 0xcf,
             ],
         ],
-        log_heights: [5, 8, 7, 7, 2, 7, 2, 5, 7, 2, 16, 0, 5, 20],
+        log_heights: [5, 8, 7, 7, 2, 7, 2, 5, 7, 2, 16, 2, 0, 5, 20],
         keccak_rnd_chunks: 1,
         hasher: HasherKind::Test,
         program_id: [
-            0xb1, 0x40, 0xc0, 0x43, 0xb6, 0xc0, 0x60, 0x87, 0x11, 0x29, 0xc0, 0xd3, 0xb7, 0xb0,
-            0x7c, 0x49, 0x30, 0x75, 0x4d, 0x89, 0xe6, 0x91, 0x67, 0xf7, 0x65, 0xe0, 0xe3, 0x8f,
-            0xb4, 0x33, 0xd7, 0x99,
+            0x08, 0x7e, 0x22, 0x2e, 0xa7, 0x76, 0x9c, 0xf3, 0x7a, 0x3e, 0xfe, 0x63, 0xfd, 0x5d,
+            0x6d, 0xa7, 0xba, 0x28, 0x04, 0x58, 0xf4, 0x52, 0x35, 0x49, 0x62, 0x2d, 0x99, 0x02,
+            0xf1, 0x86, 0x83, 0x42,
         ],
     },
     LfmRegistryEntry {
@@ -478,6 +553,11 @@ pub static LFM_REGISTRY: &[LfmRegistryEntry] = &[
                 0xf6, 0x27, 0x05, 0x41,
             ],
             [
+                0xa9, 0x51, 0xd0, 0x25, 0x21, 0x16, 0x44, 0x24, 0x5f, 0xb2, 0x81, 0x03, 0x54, 0x8b,
+                0x93, 0xb1, 0x74, 0xe6, 0x7a, 0x0f, 0xbc, 0x12, 0xe2, 0xba, 0x12, 0x3d, 0x31, 0xc6,
+                0x3b, 0xfb, 0x81, 0x89,
+            ],
+            [
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                 0x00, 0x00, 0x00, 0x00,
@@ -493,13 +573,13 @@ pub static LFM_REGISTRY: &[LfmRegistryEntry] = &[
                 0x0c, 0x6d, 0xc4, 0xcf,
             ],
         ],
-        log_heights: [2, 2, 2, 2, 2, 2, 2, 2, 4, 2, 16, 0, 5, 20],
+        log_heights: [2, 2, 2, 2, 2, 2, 2, 2, 4, 2, 16, 2, 0, 5, 20],
         keccak_rnd_chunks: 1,
         hasher: HasherKind::Test,
         program_id: [
-            0xe8, 0x30, 0xe1, 0xf5, 0xf9, 0xf1, 0xeb, 0xaf, 0x62, 0x33, 0xc1, 0x9a, 0x9a, 0x76,
-            0x5e, 0x0d, 0x2d, 0x0f, 0xbd, 0x14, 0x10, 0xe4, 0x59, 0x89, 0x6b, 0x70, 0x51, 0x4d,
-            0x95, 0xb6, 0xf4, 0x72,
+            0xa7, 0xe2, 0xe7, 0x7a, 0xde, 0xf8, 0xe2, 0x5a, 0xfd, 0xc8, 0x16, 0xb7, 0x67, 0xab,
+            0x61, 0x80, 0x6f, 0x6f, 0xba, 0x77, 0x59, 0xec, 0x38, 0x69, 0x96, 0x28, 0x4c, 0xa8,
+            0x4d, 0xd0, 0x1a, 0x47,
         ],
     },
     LfmRegistryEntry {
@@ -562,6 +642,11 @@ pub static LFM_REGISTRY: &[LfmRegistryEntry] = &[
                 0xf6, 0x27, 0x05, 0x41,
             ],
             [
+                0xa9, 0x51, 0xd0, 0x25, 0x21, 0x16, 0x44, 0x24, 0x5f, 0xb2, 0x81, 0x03, 0x54, 0x8b,
+                0x93, 0xb1, 0x74, 0xe6, 0x7a, 0x0f, 0xbc, 0x12, 0xe2, 0xba, 0x12, 0x3d, 0x31, 0xc6,
+                0x3b, 0xfb, 0x81, 0x89,
+            ],
+            [
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                 0x00, 0x00, 0x00, 0x00,
@@ -577,13 +662,13 @@ pub static LFM_REGISTRY: &[LfmRegistryEntry] = &[
                 0x0c, 0x6d, 0xc4, 0xcf,
             ],
         ],
-        log_heights: [2, 2, 2, 2, 2, 2, 2, 5, 6, 2, 16, 0, 5, 20],
+        log_heights: [2, 2, 2, 2, 2, 2, 2, 5, 6, 2, 16, 2, 0, 5, 20],
         keccak_rnd_chunks: 1,
         hasher: HasherKind::Test,
         program_id: [
-            0xd4, 0xf9, 0x49, 0x44, 0x58, 0x0b, 0x18, 0xeb, 0x88, 0xd0, 0xe8, 0xe0, 0xc1, 0x1c,
-            0x7f, 0x04, 0xdc, 0x69, 0xc3, 0x2a, 0xff, 0x42, 0x89, 0xc9, 0xc7, 0x10, 0x18, 0x1c,
-            0x6f, 0x85, 0x40, 0xc0,
+            0x83, 0x9d, 0xf6, 0xfb, 0x45, 0x5b, 0xea, 0xdd, 0x39, 0x9f, 0x41, 0x06, 0x50, 0x86,
+            0x9e, 0xda, 0x42, 0x51, 0xcc, 0x0b, 0x87, 0x19, 0xf1, 0x96, 0x3a, 0x64, 0x61, 0xef,
+            0xbe, 0xe0, 0x27, 0x69,
         ],
     },
     LfmRegistryEntry {
@@ -646,6 +731,11 @@ pub static LFM_REGISTRY: &[LfmRegistryEntry] = &[
                 0xf6, 0x27, 0x05, 0x41,
             ],
             [
+                0xa9, 0x51, 0xd0, 0x25, 0x21, 0x16, 0x44, 0x24, 0x5f, 0xb2, 0x81, 0x03, 0x54, 0x8b,
+                0x93, 0xb1, 0x74, 0xe6, 0x7a, 0x0f, 0xbc, 0x12, 0xe2, 0xba, 0x12, 0x3d, 0x31, 0xc6,
+                0x3b, 0xfb, 0x81, 0x89,
+            ],
+            [
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                 0x00, 0x00, 0x00, 0x00,
@@ -661,13 +751,13 @@ pub static LFM_REGISTRY: &[LfmRegistryEntry] = &[
                 0x0c, 0x6d, 0xc4, 0xcf,
             ],
         ],
-        log_heights: [4, 6, 2, 2, 2, 2, 3, 7, 6, 3, 16, 0, 5, 20],
+        log_heights: [4, 6, 2, 2, 2, 2, 3, 7, 6, 3, 16, 2, 0, 5, 20],
         keccak_rnd_chunks: 1,
         hasher: HasherKind::Test,
         program_id: [
-            0x99, 0x82, 0x73, 0xf0, 0x96, 0xab, 0x6b, 0x57, 0xe5, 0x9e, 0x1b, 0x95, 0x3e, 0xef,
-            0x76, 0x15, 0x7f, 0x6d, 0x01, 0x1b, 0x6a, 0x3f, 0xa2, 0x07, 0x74, 0x10, 0x66, 0xb5,
-            0x14, 0xd9, 0xbe, 0x3a,
+            0xf5, 0x3b, 0xe4, 0xc9, 0x7c, 0x90, 0x6c, 0x89, 0xd7, 0x05, 0x2f, 0x38, 0xbc, 0x14,
+            0xa8, 0xd3, 0x0f, 0x64, 0x4b, 0x7e, 0x20, 0x47, 0xf6, 0x1c, 0xe8, 0x4b, 0xfc, 0x40,
+            0xe1, 0xa1, 0x08, 0xa4,
         ],
     },
     LfmRegistryEntry {
@@ -730,6 +820,11 @@ pub static LFM_REGISTRY: &[LfmRegistryEntry] = &[
                 0xf6, 0x27, 0x05, 0x41,
             ],
             [
+                0xa9, 0x51, 0xd0, 0x25, 0x21, 0x16, 0x44, 0x24, 0x5f, 0xb2, 0x81, 0x03, 0x54, 0x8b,
+                0x93, 0xb1, 0x74, 0xe6, 0x7a, 0x0f, 0xbc, 0x12, 0xe2, 0xba, 0x12, 0x3d, 0x31, 0xc6,
+                0x3b, 0xfb, 0x81, 0x89,
+            ],
+            [
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                 0x00, 0x00, 0x00, 0x00,
@@ -745,13 +840,13 @@ pub static LFM_REGISTRY: &[LfmRegistryEntry] = &[
                 0x0c, 0x6d, 0xc4, 0xcf,
             ],
         ],
-        log_heights: [5, 11, 2, 2, 6, 2, 3, 6, 6, 2, 16, 0, 5, 20],
+        log_heights: [5, 11, 2, 2, 6, 2, 3, 6, 6, 2, 16, 2, 0, 5, 20],
         keccak_rnd_chunks: 1,
         hasher: HasherKind::Test,
         program_id: [
-            0x78, 0x81, 0x29, 0x77, 0x5d, 0xb2, 0x48, 0xd2, 0xb6, 0x77, 0xe7, 0x94, 0xd6, 0x68,
-            0x52, 0x45, 0xfe, 0x00, 0x2f, 0xf2, 0x54, 0x06, 0xff, 0x16, 0xa1, 0x38, 0x04, 0x38,
-            0x57, 0x71, 0x6b, 0xae,
+            0x0a, 0x58, 0xcc, 0xd3, 0x93, 0x3a, 0xc3, 0xa3, 0xb2, 0xa3, 0x32, 0x71, 0x2e, 0x9a,
+            0x62, 0x67, 0x54, 0x86, 0x16, 0x6f, 0x93, 0x81, 0x53, 0xa5, 0x7b, 0xe3, 0xd7, 0xa2,
+            0x49, 0xbb, 0xb3, 0xb8,
         ],
     },
 ];

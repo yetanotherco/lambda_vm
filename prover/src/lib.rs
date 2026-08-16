@@ -52,12 +52,12 @@ use crate::tables::trace_builder::Traces;
 use crate::tables::trace_builder::count_table_lengths;
 use crate::tables::types::BusId;
 use crate::test_utils::{
-    E, F, VmAir, create_bitwise_air, create_branch_air, create_bytewise_air, create_commit_air,
-    create_cpu_air, create_cpu32_air, create_decode_air, create_dvrm_air, create_ecdas_air,
-    create_ecsm_air, create_eq_air, create_halt_air, create_hint_air, create_keccak_air,
-    create_keccak_rc_air, create_keccak_rnd_air, create_load_air, create_lt_air, create_memw_air,
-    create_memw_aligned_air, create_memw_register_air, create_mul_air, create_page_air,
-    create_register_air, create_shift_air, create_store_air,
+    E, F, VmAir, create_bitwise_air, create_blake3_air, create_branch_air, create_bytewise_air,
+    create_commit_air, create_cpu_air, create_cpu32_air, create_decode_air, create_dvrm_air,
+    create_ecdas_air, create_ecsm_air, create_eq_air, create_halt_air, create_hint_air,
+    create_keccak_air, create_keccak_rc_air, create_keccak_rnd_air, create_load_air, create_lt_air,
+    create_memw_air, create_memw_aligned_air, create_memw_register_air, create_mul_air,
+    create_page_air, create_register_air, create_shift_air, create_store_air,
 };
 
 // Re-exported for downstream hosts and verifier guests (e.g. the in-VM
@@ -83,8 +83,13 @@ pub struct RuntimePageRange {
 
 /// Number of tables that always contribute exactly one sub-proof, regardless
 /// of `TableCounts`: bitwise, decode, halt, commit, keccak, keccak_rnd,
-/// keccak_rc, register, ecsm, ecdas, hint.
-pub const FIXED_TABLE_COUNT: usize = 11;
+/// keccak_rc, blake3, register, ecsm, ecdas, hint.
+///
+/// ⚠ Every always-on table costs every proof a near-empty AIR even when the
+/// workload never touches it (the EC-campaign lesson, PR #871). BLAKE3 adds
+/// one (min 4 rows × ~3.2k cols); its real-workload cost must be ABBA-checked
+/// before this merges.
+pub const FIXED_TABLE_COUNT: usize = 12;
 
 /// Number of chunks for each split table.
 /// The verifier needs this to reconstruct matching AIRs.
@@ -521,6 +526,7 @@ pub(crate) struct VmAirs {
     pub keccak: VmAir,
     pub keccak_rnd: VmAir,
     pub keccak_rc: VmAir,
+    pub blake3: VmAir,
     pub ecsm: VmAir,
     pub ecdas: VmAir,
     pub hint: VmAir,
@@ -547,6 +553,7 @@ impl VmAirs {
             (self.keccak.as_ref(), &mut traces.keccak, &()),
             (self.keccak_rnd.as_ref(), &mut traces.keccak_rnd, &()),
             (self.keccak_rc.as_ref(), &mut traces.keccak_rc, &()),
+            (self.blake3.as_ref(), &mut traces.blake3, &()),
             (self.ecsm.as_ref(), &mut traces.ecsm, &()),
             (self.ecdas.as_ref(), &mut traces.ecdas, &()),
             (self.hint.as_ref(), &mut traces.hint, &()),
@@ -622,6 +629,7 @@ impl VmAirs {
             self.keccak.as_ref(),
             self.keccak_rnd.as_ref(),
             self.keccak_rc.as_ref(),
+            self.blake3.as_ref(),
             self.ecsm.as_ref(),
             self.ecdas.as_ref(),
             self.hint.as_ref(),
@@ -790,6 +798,7 @@ impl VmAirs {
         let commit: VmAir = Box::new(create_commit_air(proof_options));
         let keccak: VmAir = Box::new(create_keccak_air(proof_options));
         let keccak_rnd: VmAir = Box::new(create_keccak_rnd_air(proof_options));
+        let blake3: VmAir = Box::new(create_blake3_air(proof_options));
         let keccak_rc: VmAir = Box::new(create_keccak_rc_air(proof_options).with_preprocessed(
             tables::keccak_rc::preprocessed_commitment(proof_options),
             tables::keccak_rc::NUM_PRECOMPUTED_COLS,
@@ -915,6 +924,7 @@ impl VmAirs {
             keccak,
             keccak_rnd,
             keccak_rc,
+            blake3,
             ecsm,
             ecdas,
             hint,
