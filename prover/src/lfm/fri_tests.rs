@@ -284,7 +284,10 @@ fn the_fri_leaf_is_byte_identical_to_productions_own_backends() {
         (ext(9), FEE::new([component(12), component(13), FE::one()])),
     ];
 
-    let mut b = LfmBuilder::new();
+    // The wrap hash production commits under: this leg's whole claim is that
+    // the machine's leaf IS the verifier's leaf, and the verifier's backend
+    // follows the aliases.
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::Blake3);
     let arena = b.declare_arena(2);
     let v0 = b.hint_word(arena, 0);
     let v1 = b.hint_word(arena, 1);
