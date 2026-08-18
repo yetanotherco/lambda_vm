@@ -2636,12 +2636,8 @@ mod absorb_tests {
             let row = row_of(&trace, row_idx);
             assert_eq!(row[cols::MU], FE::one());
             assert_eq!(row[cols::MU_S], FE::one());
-            for c in cols::MU_A..cols::NUM_COLUMNS {
-                assert_eq!(
-                    row[c],
-                    FE::zero(),
-                    "absorb column {c} must be 0 in single mode"
-                );
+            for (c, v) in row.iter().enumerate().skip(cols::MU_A) {
+                assert_eq!(*v, FE::zero(), "absorb column {c} must be 0 in single mode");
             }
         }
     }
@@ -2921,7 +2917,7 @@ mod absorb_tests {
             (cols::in_word(26, 0), FE::one()), // block_len 64 -> 65
         ] {
             let mut main = row_of(&trace, 0);
-            main[col] = main[col] + delta;
+            main[col] += delta;
             assert!(
                 eval_main_row(main).iter().any(|v| *v != FE::zero()),
                 "column {col} must be pinned on an absorb row"
@@ -2957,7 +2953,7 @@ mod absorb_tests {
     fn the_countdown_must_decrement_by_one() {
         let trace = trace_of(&[], &[absorb_op(4, 3, 1)]);
         let mut main = row_of(&trace, 0);
-        main[cols::REM_DECR] = main[cols::REM_DECR] + FE::one();
+        main[cols::REM_DECR] += FE::one();
         assert!(
             eval_main_row(main).iter().any(|v| *v != FE::zero()),
             "REM_DECR + 1 = REMAINING must reject a skipped block"
