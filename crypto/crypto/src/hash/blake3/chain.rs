@@ -404,6 +404,57 @@ impl Blake3Chain {
     }
 }
 
+/// ★ A 64-byte Merkle parent in ONE compression, with no sponge around it.
+///
+/// **P2 is what makes this exact** (PA-PLAN §1.7.2): a 64-byte message is a
+/// single block, first and last at once, so `Blake3Chain::hash(left ‖ right)`
+/// IS `compress(IV, left‖right, t = 0, block_len = 64, FLAGS_ONE_BLOCK)`. This
+/// computes that directly — no `Blake3Chain` object, no incremental absorb, no
+/// per-byte copy into a pending block, no runtime decision about which flags a
+/// block carries.
+///
+/// It is worth its own function because of what the guest measurement showed:
+/// at 64 bytes the accelerated hash costs ~556 cycles of which only ~248 is the
+/// compression, so roughly 55% is digest-layer plumbing around one ecall. A
+/// Merkle parent is the shape a FRI query path is made of, so that overhead is
+/// paid per path step per query.
+///
+/// ⚠ **ONE FRAMING.** It goes through [`compress_block`], the same dispatch
+/// every other block in this file uses, so on a guest with the accelerator this
+/// is the ecall and at any other round count it is the software path. Writing a
+/// second call to `blake3_compress_rounds` here would put a compression outside
+/// the accelerator's reach and split the two paths silently — the trap the
+/// dispatch's own doc names.
+pub fn blake3_parent_rounds(left: &[u8; 32], right: &[u8; 32], rounds: usize) -> [u8; 32] {
+    // Same little-endian word packing as `block_words`, over the concatenation.
+    let byte = |i: usize| if i < 32 { left[i] } else { right[i - 32] };
+    let block: [u32; 16] = core::array::from_fn(|i| {
+        u32::from_le_bytes([
+            byte(4 * i),
+            byte(4 * i + 1),
+            byte(4 * i + 2),
+            byte(4 * i + 3),
+        ])
+    });
+    let out = compress_block(
+        &BLAKE3_IV,
+        &block,
+        BLOCK_LEN as u32,
+        FLAGS_ONE_BLOCK,
+        rounds,
+    );
+    let mut digest = [0u8; 32];
+    for i in 0..8 {
+        digest[4 * i..4 * i + 4].copy_from_slice(&out[i].to_le_bytes());
+    }
+    digest
+}
+
+/// [`blake3_parent_rounds`] at the crate-global round count.
+pub fn blake3_parent(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+    blake3_parent_rounds(left, right, BLAKE3_ROUNDS)
+}
+
 impl HashMarker for Blake3Chain {}
 
 impl OutputSizeUser for Blake3Chain {
@@ -588,6 +639,56 @@ pub const CHAIN_KAT_6ROUND: [[u8; 32]; 12] = [
 mod tests {
     use super::*;
     use crate::hash::blake3::{BLAKE3_SIX_ROUNDS, BLAKE3_STANDARD_ROUNDS};
+
+    /// ★ The parent specialization is the streaming path, byte for byte, at
+    /// BOTH round counts.
+    ///
+    /// This is the gate the specialization needs: it exists only to skip the
+    /// sponge, so the one thing that must never differ is the answer. Driven
+    /// over inputs that move every word — including the all-zero and all-0xff
+    /// corners, where a wrong flag or a swapped operand is easiest to miss.
+    #[test]
+    fn the_parent_specialization_equals_the_streaming_path() {
+        use digest::Digest;
+        let pattern = |seed: u8| -> [u8; 32] {
+            core::array::from_fn(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
+        };
+        let cases: [([u8; 32], [u8; 32]); 6] = [
+            ([0u8; 32], [0u8; 32]),
+            ([0xffu8; 32], [0xffu8; 32]),
+            ([0u8; 32], [0xffu8; 32]),
+            (pattern(0), pattern(1)),
+            (pattern(7), pattern(200)),
+            (pattern(1), pattern(0)),
+        ];
+        for rounds in [BLAKE3_SIX_ROUNDS, BLAKE3_STANDARD_ROUNDS] {
+            for (i, (l, r)) in cases.iter().enumerate() {
+                let mut streamed = Blake3Chain::with_rounds(rounds);
+                streamed.update(l);
+                streamed.update(r);
+                assert_eq!(
+                    blake3_parent_rounds(l, r, rounds),
+                    streamed.finalize_digest(),
+                    "rounds {rounds}, case {i}: the specialization must be the \
+                     streaming digest of the two concatenated nodes"
+                );
+            }
+        }
+
+        // NON-VACUITY: swapping the operands must move the digest, or the test
+        // above would pass for a function that ignored its inputs.
+        let (l, r) = (pattern(3), pattern(9));
+        assert_ne!(
+            blake3_parent_rounds(&l, &r, BLAKE3_SIX_ROUNDS),
+            blake3_parent_rounds(&r, &l, BLAKE3_SIX_ROUNDS),
+            "the parent must not be symmetric in its operands"
+        );
+        // And the two round counts must disagree, or "both" means one.
+        assert_ne!(
+            blake3_parent_rounds(&l, &r, BLAKE3_SIX_ROUNDS),
+            blake3_parent_rounds(&l, &r, BLAKE3_STANDARD_ROUNDS),
+        );
+    }
     use alloc::vec::Vec;
 
     fn message(len: usize) -> Vec<u8> {
