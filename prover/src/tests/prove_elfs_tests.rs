@@ -13,7 +13,22 @@
 //!
 //! TODO: LT bus (needs LT table integration)
 
-use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+// ★ The Fiat-Shamir transcript MUST be the one `DefaultStarkHash` names, not
+// `DefaultTranscript`'s own type-parameter default.
+//
+// `crypto::…::DefaultTranscript<F, T = KeccakTranscriptHash>` defaults to keccak;
+// since BLAKE3 became `DefaultStarkHash`, that default is no longer the
+// production hash. Proving under the bare type while
+// `compute_expected_commit_bus_balance_view` replays under
+// `DefaultStarkTranscript` derives the two sides' LogUp challenges from
+// DIFFERENT hashes, so the expected COMMIT contribution is computed at the wrong
+// challenge point and every program with non-empty public output fails to verify
+// with "LogUp bus does not balance" — 19 tests in this file. `config.rs` warns
+// about exactly this half-flip ("the type system cannot force this; naming the
+// alias is what makes the production path follow DefaultStarkHash"); the warning
+// applies to the test harness too.
+use stark::config::DefaultStarkTranscript as DefaultTranscript;
+
 use math::field::element::FieldElement;
 use stark::constraints::builder::EmptyConstraints;
 use stark::lookup::{AirWithBuses, AuxiliaryTraceBuildData};
