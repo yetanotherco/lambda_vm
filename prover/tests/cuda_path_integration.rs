@@ -181,15 +181,16 @@ fn gpu_opening_gather_fires_and_verifies() {
 
 /// The full-residency Stage-3 device-only path fires: at least one table keeps
 /// its round-1 LDE device-resident (the host D2H is skipped), and the proof
-/// still verifies. This exercises every `host_trace_empty` hard-abort guard on
-/// the happy path (none may fire) plus the GPU-only R2/R3/R4 paths reading the
-/// device LDE with no host trace behind them. A regression that silently
-/// reverts to the host D2H drops the counter to 0 (while the proof would still
-/// verify). A mis-gate that forces a host fallback shows up one of two ways:
-/// at R3/R4 it panics one of the guards, while at R2 and the R1 resident-aux
-/// commit it recovers silently and is caught by the downgrade-counter
-/// assertions below — one per site, since the R1 counter also covers tables the
-/// device-only gate never cleared.
+/// still verifies. This exercises the GPU-only R2/R3/R4 paths reading the
+/// device LDE with no host trace behind them, plus the `host_trace_empty`
+/// hard-abort guards that remain on the R4 opening path (none may fire). A
+/// regression that silently reverts to the host D2H drops the counter to 0
+/// (while the proof would still verify). A mis-gate that forces a host
+/// fallback does not panic at the R2 commit, R3 or the R4 DEEP loop: those
+/// sites download the resident data and continue host-backed, so the counter
+/// assertions below are the only thing that surfaces one — one per site, since
+/// the R1 counter also covers tables the device-only gate never cleared, and
+/// the parts counter covers the H part evaluations rather than the trace.
 #[test]
 #[ignore = "requires GPU; run with --ignored --nocapture"]
 fn gpu_device_only_residency_fires_and_verifies() {
@@ -206,6 +207,15 @@ fn gpu_device_only_residency_fires_and_verifies() {
         "a device-only table was downgraded back to a host trace on the happy \
          path (its R2 dispatch declined at runtime: the gate should mirror the \
           missing condition)"
+    );
+    assert_eq!(
+        stark::gpu_lde::gpu_composition_parts_downloads(),
+        0,
+        "a device-only table's composition-poly parts were downloaded back to \
+         the host on the happy path (the R2 commit, the R3 parts OOD or the R4 \
+         DEEP H terms fell back to the host part evals: either the gate should \
+         mirror a missing dispatch condition, or the dispatch declined \
+         transiently under VRAM pressure)"
     );
     assert_eq!(
         stark::gpu_lde::gpu_resident_aux_downgrades(),

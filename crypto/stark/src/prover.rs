@@ -1740,7 +1740,8 @@ pub trait IsStarkProver<
             );
         }
 
-        let lde_composition_poly_parts_evaluations = if let Some(parts) = precomputed_parts {
+        #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
+        let mut lde_composition_poly_parts_evaluations = if let Some(parts) = precomputed_parts {
             parts
         } else if number_of_parts == 2 {
             // Direct quotient decomposition: avoid full-size iFFT by algebraically
@@ -1825,6 +1826,15 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         let fft_dur = t_sub.elapsed();
 
+        // Fold the R2 device composition parts handle into the session
+        // (resident R2 to R4) before the commit: the tree build below, its
+        // recovery, R3 OOD, R4 DEEP and the openings all read it from the
+        // trace. The host evaluations stay in `Round2` for the R4 openings.
+        #[cfg(feature = "cuda")]
+        if let Some(handle) = gpu_composition_parts {
+            round_1_result.lde_trace.set_gpu_composition_parts(handle);
+        }
+
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
         // GPU fast path for the comp-poly Merkle commit: hash straight from
@@ -1835,8 +1845,9 @@ pub trait IsStarkProver<
         // `Round2.gpu_composition_tree`.
         #[cfg(feature = "cuda")]
         let (composition_poly_merkle_tree, composition_poly_root, gpu_composition_tree) =
-            match gpu_composition_parts
-                .as_ref()
+            match round_1_result
+                .lde_trace
+                .gpu_composition_parts()
                 .and_then(|h| {
                     crate::gpu_lde::try_build_comp_poly_tree_gpu_from_dev::<
                         FieldExtension,
@@ -1855,19 +1866,23 @@ pub trait IsStarkProver<
                 }
                 None => {
                     // The host part evals are empty under device-only (the R2
-                    // drain is skipped); abort with the device-only contract's
-                    // message instead of a misleading EmptyCommitment. Gate on
-                    // the parts the CPU fallback actually consumes, not on
+                    // drain is skipped) — repopulate them from the resident
+                    // parts handle rather than abort. Gate on the parts the
+                    // CPU fallback actually consumes, not on
                     // `host_trace_empty()`: the trace can stay device-resident
                     // while these parts were downloaded to the host anyway (the
                     // GPU decompose fell back to `decompose_and_extend_d2`), in
-                    // which case this fallback is valid and must not panic.
+                    // which case the materialize is a no-op. The assert fires
+                    // only when the handle cannot serve the data.
+                    let recovered = crate::gpu_lde::materialize_composition_parts_host(
+                        &round_1_result.lde_trace,
+                        &mut lde_composition_poly_parts_evaluations,
+                    );
                     assert!(
-                        lde_composition_poly_parts_evaluations
-                            .first()
-                            .is_none_or(|p| !p.is_empty()),
-                        "R2 composition commit fell back to the host part evals, \
-                         but they are device-only (empty)"
+                        recovered,
+                        "R2 composition commit fell back to the host part evals \
+                         on a device-only table and the resident parts handle \
+                         could not be downloaded"
                     );
                     let (tree, root) = crate::commitment::commit_bit_reversed(
                         &lde_composition_poly_parts_evaluations,
@@ -1890,13 +1905,6 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         crate::instruments::store_r2_sub(constraints_dur, fft_dur, merkle_dur);
 
-        // Fold the R2 device composition parts handle into the session (resident
-        // R2 to R4). The host evaluations stay in `Round2` for R4 openings.
-        #[cfg(feature = "cuda")]
-        if let Some(handle) = gpu_composition_parts {
-            round_1_result.lde_trace.set_gpu_composition_parts(handle);
-        }
-
         Ok(Round2 {
             lde_composition_poly_evaluations: lde_composition_poly_parts_evaluations,
             composition_poly_merkle_tree,
@@ -1910,8 +1918,8 @@ pub trait IsStarkProver<
     fn round_3_evaluate_polynomials_in_out_of_domain_element(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         domain: &Domain<Field>,
-        round_1_result: &Round1<Field, FieldExtension>,
-        round_2_result: &Round2<FieldExtension>,
+        round_1_result: &mut Round1<Field, FieldExtension>,
+        round_2_result: &mut Round2<FieldExtension>,
         z: &FieldElement<FieldExtension>,
     ) -> Round3<FieldExtension>
     where
@@ -1975,16 +1983,22 @@ pub trait IsStarkProver<
             Some(v) => v,
             None => {
                 // The host part evals are empty under device-only (the R2
-                // drain is skipped); reaching this arm there is a mis-gate.
+                // drain is skipped) — repopulate them from the resident parts
+                // handle rather than abort; the assert fires only when the
+                // handle cannot serve the data.
                 #[cfg(feature = "cuda")]
-                assert!(
-                    round_2_result
-                        .lde_composition_poly_evaluations
-                        .first()
-                        .is_none_or(|p| !p.is_empty()),
-                    "R3 parts OOD fell back to the host part evals, but they are \
-                     device-only (empty)"
-                );
+                {
+                    let recovered = crate::gpu_lde::materialize_composition_parts_host(
+                        &round_1_result.lde_trace,
+                        &mut round_2_result.lde_composition_poly_evaluations,
+                    );
+                    assert!(
+                        recovered,
+                        "R3 parts OOD fell back to the host part evals on a \
+                         device-only table and the resident parts handle could \
+                         not be downloaded"
+                    );
+                }
                 let comp_inv_denoms =
                     math::polynomial::barycentric_inv_denoms(&z_power, &dc.points);
                 round_2_result
@@ -2011,7 +2025,7 @@ pub trait IsStarkProver<
 
         // === Trace polynomials: barycentric evaluation via LDE ===
         let trace_ood_evaluations = crate::trace::get_trace_evaluations_from_lde(
-            &round_1_result.lde_trace,
+            &mut round_1_result.lde_trace,
             domain,
             z,
             &air.context().transition_offsets,
@@ -2046,8 +2060,8 @@ pub trait IsStarkProver<
     fn round_4_compute_and_run_fri_on_the_deep_composition_polynomial(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         domain: &Domain<Field>,
-        round_1_result: &Round1<Field, FieldExtension>,
-        round_2_result: &Round2<FieldExtension>,
+        round_1_result: &mut Round1<Field, FieldExtension>,
+        round_2_result: &mut Round2<FieldExtension>,
         round_3_result: &Round3<FieldExtension>,
         z: &FieldElement<FieldExtension>,
         transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
@@ -2139,7 +2153,7 @@ pub trait IsStarkProver<
             #[cfg(feature = "instruments")]
             let t_sub = Instant::now();
             let deep_evals = Self::compute_deep_composition_poly_evaluations(
-                &round_1_result.lde_trace,
+                &mut round_1_result.lde_trace,
                 round_2_result,
                 round_3_result,
                 z,
@@ -2300,8 +2314,8 @@ pub trait IsStarkProver<
 
     #[allow(clippy::too_many_arguments)]
     fn compute_deep_composition_poly_evaluations(
-        lde_trace: &LDETraceTable<Field, FieldExtension>,
-        round_2_result: &Round2<FieldExtension>,
+        lde_trace: &mut LDETraceTable<Field, FieldExtension>,
+        round_2_result: &mut Round2<FieldExtension>,
         round_3_result: &Round3<FieldExtension>,
         z: &FieldElement<FieldExtension>,
         domain: &Domain<Field>,
@@ -2413,14 +2427,32 @@ pub trait IsStarkProver<
         }
 
         // Reaching here means both GPU DEEP arms fell through to the host loop
-        // below (which reads `get_main`/`get_aux`). Under the device-only gate
-        // the host trace is empty, so a fall-through is a mis-gate or an
-        // unexpected GPU failure: hard-abort rather than read empty buffers.
+        // below, which reads the host trace (`get_main`/`get_aux`) AND the
+        // host part evals. Under the device-only gate either may be empty —
+        // download the resident data rather than abort; the asserts fire only
+        // when a resident handle cannot serve it.
         #[cfg(feature = "cuda")]
-        assert!(
-            !lde_trace.host_trace_empty(),
-            "R4 DEEP composition fell back to the host trace, but it is device-only (empty)"
-        );
+        {
+            if lde_trace.host_trace_empty() {
+                let recovered = crate::gpu_lde::materialize_lde_trace_host(lde_trace);
+                assert!(
+                    recovered,
+                    "R4 DEEP composition fell back to the host trace on a \
+                     device-only table and the resident handles could not be \
+                     downloaded"
+                );
+            }
+            let parts_recovered = crate::gpu_lde::materialize_composition_parts_host(
+                lde_trace,
+                &mut round_2_result.lde_composition_poly_evaluations,
+            );
+            assert!(
+                parts_recovered,
+                "R4 DEEP composition fell back to the host part evals on a \
+                 device-only table and the resident parts handle could not be \
+                 downloaded"
+            );
+        }
 
         // OOD column compression (Plonky3-style): precompute one value per eval point,
         //   ood_compressed_k = Σ_j gamma[j][k] * ood[j][k].
@@ -3938,7 +3970,7 @@ pub trait IsStarkProver<
             coefficients.drain(..num_transition_constraints).collect();
         let boundary_coefficients = coefficients;
 
-        let round_2_result = Self::round_2_compute_composition_polynomial(
+        let mut round_2_result = Self::round_2_compute_composition_polynomial(
             air,
             pub_inputs,
             domain,
@@ -3967,7 +3999,7 @@ pub trait IsStarkProver<
             air,
             domain,
             round_1_result,
-            &round_2_result,
+            &mut round_2_result,
             &z,
         );
         #[cfg(feature = "instruments")]
@@ -4003,7 +4035,7 @@ pub trait IsStarkProver<
             air,
             domain,
             round_1_result,
-            &round_2_result,
+            &mut round_2_result,
             &round_3_result,
             &z,
             transcript,

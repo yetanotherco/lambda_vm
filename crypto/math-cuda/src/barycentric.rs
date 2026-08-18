@@ -143,6 +143,8 @@ pub fn barycentric_base_on_device(
     inv_denoms_ext3: &[u64],
     n: usize,
 ) -> Result<Vec<u64>> {
+    #[cfg(feature = "test-faults")]
+    crate::faults::check_sticky(&crate::faults::FAULT_BARYCENTRIC_STICKY)?;
     assert_eq!(coset_points.len(), n);
     assert_eq!(inv_denoms_ext3.len(), 3 * n);
     let num_cols = main_handle.m;
@@ -204,6 +206,8 @@ pub fn barycentric_base_on_device_with_dev_inv_denoms(
     inv_offset_u64: usize,
     n: usize,
 ) -> Result<Vec<u64>> {
+    #[cfg(feature = "test-faults")]
+    crate::faults::check_sticky(&crate::faults::FAULT_BARYCENTRIC_STICKY)?;
     main_handle.wait_ready_on(stream)?;
     assert!(coset_points_dev.len() >= n);
     let inv_end = inv_offset_u64
@@ -255,6 +259,8 @@ pub fn barycentric_ext3_on_device(
     inv_denoms_ext3: &[u64],
     n: usize,
 ) -> Result<Vec<u64>> {
+    #[cfg(feature = "test-faults")]
+    crate::faults::check_sticky(&crate::faults::FAULT_BARYCENTRIC_STICKY)?;
     assert_eq!(coset_points.len(), n);
     assert_eq!(inv_denoms_ext3.len(), 3 * n);
     let num_cols = aux_handle.m;
@@ -308,6 +314,8 @@ pub fn barycentric_ext3_on_device_with_dev_inv_denoms(
     inv_offset_u64: usize,
     n: usize,
 ) -> Result<Vec<u64>> {
+    #[cfg(feature = "test-faults")]
+    crate::faults::check_sticky(&crate::faults::FAULT_BARYCENTRIC_STICKY)?;
     aux_handle.wait_ready_on(stream)?;
     assert!(coset_points_dev.len() >= n);
     let inv_end = inv_offset_u64

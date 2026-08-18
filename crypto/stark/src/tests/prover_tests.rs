@@ -186,7 +186,7 @@ fn barycentric_trace_eval_matches_horner_trace_eval() {
         .collect();
 
     // Build LDE trace table
-    let lde_trace = LDETraceTable::from_columns(
+    let mut lde_trace = LDETraceTable::from_columns(
         lde_evaluations,
         Vec::<Vec<Felt>>::new(),
         air.step_size(),
@@ -213,7 +213,7 @@ fn barycentric_trace_eval_matches_horner_trace_eval() {
 
     // Barycentric evaluation (new path)
     let result =
-        get_trace_evaluations_from_lde(&lde_trace, &domain, &z, &frame_offsets, step_size, &dc);
+        get_trace_evaluations_from_lde(&mut lde_trace, &domain, &z, &frame_offsets, step_size, &dc);
 
     assert_eq!(result.width, expected.width);
     assert_eq!(result.height, expected.height);

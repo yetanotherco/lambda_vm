@@ -705,8 +705,13 @@ where
 /// Accepts a [`DomainConstants`] to avoid redundant computation when the caller
 /// has already derived these values (e.g., round_3 shares them with composition
 /// poly evaluation).
+///
+/// Takes `lde_trace` by `&mut` so a device-only table whose GPU barycentric arm
+/// declines can recover in place: the arm downloads the resident LDEs into the
+/// host buffers ([`crate::gpu_lde::materialize_lde_trace_host`]) and continues
+/// on the host path, rather than reading an empty host trace.
 pub fn get_trace_evaluations_from_lde<F, E>(
-    lde_trace: &LDETraceTable<F, E>,
+    lde_trace: &mut LDETraceTable<F, E>,
     domain: &Domain<F>,
     z: &FieldElement<E>,
     frame_offsets: &[usize],
@@ -813,15 +818,23 @@ where
         let main_evals: Vec<FieldElement<E>> = if let Some(v) = main_gpu {
             v
         } else {
-            // Device-only tables have no host trace; a GPU fall-through here would
-            // read empty `main_data`. Hard-abort instead of a wrong OOD eval. The
-            // check is on the buffer itself, not the table-wide flag: a mixed
-            // state can leave a valid host copy on one side only.
+            // Device-only tables have no host trace; a GPU fall-through here
+            // would read empty `main_data` — download the resident LDEs rather
+            // than abort (the materialize fills both missing sides and clears
+            // the flag). The check is on the buffer itself, not the table-wide
+            // flag: a mixed state can leave a valid host copy on one side
+            // only. The assert fires only when the handles cannot serve the
+            // data.
             #[cfg(feature = "cuda")]
-            assert!(
-                lde_trace.num_main_cols() == 0 || !lde_trace.main_data.is_empty(),
-                "R3 barycentric (main) fell back to the host trace, but it is device-only (empty)"
-            );
+            if lde_trace.num_main_cols() > 0 && lde_trace.main_data.is_empty() {
+                crate::gpu_lde::materialize_lde_trace_host(lde_trace);
+                assert!(
+                    !lde_trace.main_data.is_empty(),
+                    "R3 barycentric (main) fell back to the host trace on a \
+                     device-only table and the resident handles could not be \
+                     downloaded"
+                );
+            }
             let inv_denoms_v =
                 inv_denoms.get_or_insert_with(|| barycentric_inv_denoms(eval_point, &dc.points));
             let col_scale = col_scale.get_or_insert_with(|| {
@@ -873,14 +886,19 @@ where
         let aux_evals: Vec<FieldElement<E>> = if let Some(v) = aux_gpu {
             v
         } else {
-            // Device-only tables have no host trace; a GPU fall-through here would
-            // read empty `aux_data`. Hard-abort instead of a wrong OOD eval. Same
+            // Device-only tables have no host trace; a GPU fall-through here
+            // would read empty `aux_data` — download rather than abort. Same
             // buffer-level check as the main arm: mixed states are valid here.
             #[cfg(feature = "cuda")]
-            assert!(
-                lde_trace.num_aux_cols() == 0 || !lde_trace.aux_data.is_empty(),
-                "R3 barycentric (aux) fell back to the host trace, but it is device-only (empty)"
-            );
+            if lde_trace.num_aux_cols() > 0 && lde_trace.aux_data.is_empty() {
+                crate::gpu_lde::materialize_lde_trace_host(lde_trace);
+                assert!(
+                    !lde_trace.aux_data.is_empty(),
+                    "R3 barycentric (aux) fell back to the host trace on a \
+                     device-only table and the resident handles could not be \
+                     downloaded"
+                );
+            }
             let inv_denoms_v =
                 inv_denoms.get_or_insert_with(|| barycentric_inv_denoms(eval_point, &dc.points));
             let col_scale = col_scale.get_or_insert_with(|| {
