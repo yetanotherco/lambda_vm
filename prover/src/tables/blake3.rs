@@ -1498,8 +1498,8 @@ mod executor_syscall_packing {
 #[cfg(test)]
 mod executor_absorb_parity {
     use crypto::hash::blake3::chain::{
-        BLOCK_LEN, Blake3Chain, blake3_chain_rounds, block_flags, bulk_absorb_blocks,
-        kat_message_byte, pack_absorb_ctrl, unpack_absorb_cv, ABSORB_CV_OUT_DWORD,
+        ABSORB_CV_OUT_DWORD, BLOCK_LEN, Blake3Chain, blake3_chain_rounds, block_flags,
+        bulk_absorb_blocks, kat_message_byte, pack_absorb_ctrl, unpack_absorb_cv,
     };
     use crypto::hash::blake3::{BLAKE3_IV, BLAKE3_SIX_ROUNDS};
     use executor::vm::instruction::decoding::Instruction;

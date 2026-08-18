@@ -174,7 +174,11 @@ pub const fn bulk_absorb_blocks(pending: usize, input_len: usize, aligned: bool)
         return 0;
     }
     let n = input_len.saturating_sub(1) / BLOCK_LEN;
-    if n > ABSORB_MAX_BLOCKS { ABSORB_MAX_BLOCKS } else { n }
+    if n > ABSORB_MAX_BLOCKS {
+        ABSORB_MAX_BLOCKS
+    } else {
+        n
+    }
 }
 
 /// Lay a chaining value out as the absorb accelerator's control region.
@@ -1024,7 +1028,11 @@ mod tests {
         // A half-filled pending block: whole blocks of `input` are not blocks
         // of the message.
         for pending in 1..BLOCK_LEN {
-            assert_eq!(bulk_absorb_blocks(pending, 4096, true), 0, "pending {pending}");
+            assert_eq!(
+                bulk_absorb_blocks(pending, 4096, true),
+                0,
+                "pending {pending}"
+            );
         }
         // Unaligned: the accelerator reads doublewords.
         assert_eq!(bulk_absorb_blocks(0, 4096, false), 0);
