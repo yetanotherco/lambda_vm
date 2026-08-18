@@ -422,7 +422,10 @@ fn test_blake3_absorb_rejects_overlapping_regions() {
 
 #[test]
 fn test_blake3_absorb_rejects_overflowing_message_range() {
-    // `num_blocks * 64` must not wrap and the last byte must be addressable.
+    // The message's last byte must be addressable. This fires on the address
+    // check, NOT on the `num_blocks * 64` multiply: the block-count cap already
+    // bounds that product by 4 MiB, so its `checked_mul` is belt-and-braces
+    // against a future cap change and is unreachable from here.
     let mut registers = absorb_registers(0x1000, u64::MAX - 63, 2, 0);
     assert!(matches!(
         run_absorb(&mut registers).unwrap_err(),

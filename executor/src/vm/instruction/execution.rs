@@ -83,10 +83,19 @@ const BLAKE3_OUT_DWORDS: u64 = 14;
 /// | 4..=7   | `cv_out[0..8]` — the outgoing chaining value (written) |
 ///
 /// `cv_in` and `cv_out` are disjoint on purpose: every memory access of one
-/// absorb happens at a single timestamp, so an address that was both read and
-/// written would be touched twice at that timestamp and the MEMW consistency
-/// argument could not order the two. For the same reason the control and message
+/// absorb happens at a single timestamp, and the chip reads `cv_in` and writes
+/// `cv_out` through SEPARATE `Memw` interactions (one gated on the group's first
+/// row, one on its last). Two separate interactions at one timestamp on one
+/// address are a pair the MEMW consistency argument cannot order, so the two
+/// halves have to be disjoint — and for the same reason the control and message
 /// regions must not overlap ([`ExecutionError::Blake3AbsorbRegionOverlap`]).
+///
+/// Note this is a consequence of the chip's interaction layout, NOT a blanket
+/// property of the machine: a single COMBINED read+write interaction on one
+/// address at one timestamp is fine, and is exactly what keccak does for its 25
+/// lanes and what the single-compression BLAKE3 mode does for its output region
+/// (the `old_out` columns). Stated broadly the rule would imply keccak is
+/// broken, which it is not.
 ///
 /// The block schedule this applies — `t = 0`, `block_len = 64` on every block,
 /// `first_flags` on block 0 and `0` on every later block — is a SECOND statement
@@ -101,15 +110,34 @@ pub const BLAKE3_BLOCK_BYTES: u64 = 64;
 pub const BLAKE3_ABSORB_CTRL_DWORDS: u64 = 8;
 /// Dword offset of `cv_out` inside the absorb control region.
 pub const BLAKE3_ABSORB_CV_OUT_DWORD: u64 = 4;
-/// Largest `num_blocks` one absorb ecall accepts — 4 MiB of message.
+/// Largest `num_blocks` one absorb ecall accepts — 1 024 blocks, 64 KiB of
+/// message.
 ///
 /// A guest with more to hash calls again; the chain is stateless across calls
-/// because the chaining value travels through the control region. The cap is a
-/// soundness bound as much as a sanity one: the chip counts a group's rows down
-/// from `num_blocks` in a single field element, and the count must stay far
-/// below the field's modulus for "the group has exactly `num_blocks` rows" to
-/// follow from "the counter reaches 1".
-pub const BLAKE3_ABSORB_MAX_BLOCKS: u64 = 1 << 16;
+/// because the chaining value travels through the control region.
+///
+/// Three things the cap has to do, in increasing order of how easy they are to
+/// get wrong:
+///
+/// 1. **Soundness.** The chip counts a group's rows down from `num_blocks` in a
+///    single field element, so the count must stay far below the modulus for
+///    "the group has exactly `num_blocks` rows" to follow from "the counter
+///    reaches 1".
+/// 2. **Address arithmetic.** `num_blocks * 64` must not wrap.
+/// 3. ★ **Trace height.** Every other accelerator is one CPU cycle to one chip
+///    row, so an epoch's table heights are implicitly bounded by its cycle
+///    budget — epochs split on cycles. This ecall is the first to break that
+///    ratio: it is ONE cycle and up to `BLAKE3_ABSORB_MAX_BLOCKS` BLAKE3 rows,
+///    and the BLAKE3 table has no entry in `prover::tables::max_rows` at all.
+///    At 3 219 columns a row is ~26 KiB of trace, so an unbounded absorb near
+///    an epoch boundary could demand a table height nothing sized for.
+///
+/// 1 024 is chosen for (3), and it is free: the guest cost of an absorb is flat
+/// in message length past ~4 blocks (measured 552 cycles at both 256 B and
+/// 1 KiB, 558 at 4 KiB), and real absorbs — verifier leaves, transcript
+/// segments — are KiB-class. So capping at 64 KiB costs nothing measurable and
+/// bounds one ecall's trace to ~26 MiB instead of ~1.7 GiB.
+pub const BLAKE3_ABSORB_MAX_BLOCKS: u64 = 1 << 10;
 
 /// Syscall number for the ECSM (elliptic-curve scalar multiply) accelerator.
 ///
@@ -670,6 +698,11 @@ impl Instruction {
                         }
 
                         let ctrl_bytes = BLAKE3_ABSORB_CTRL_DWORDS * 8;
+                        // Unreachable today — the cap above bounds this by
+                        // 2^16 · 64 = 4 MiB — and kept anyway, so that raising
+                        // BLAKE3_ABSORB_MAX_BLOCKS cannot silently turn a
+                        // multiply into a wrap. The tests reach the address
+                        // overflow below, not this arm.
                         let msg_bytes = num_blocks
                             .checked_mul(BLAKE3_BLOCK_BYTES)
                             .ok_or(ExecutionError::Blake3AbsorbAddressOverflow(msg_addr))?;
@@ -729,6 +762,13 @@ impl Instruction {
                             )?;
                         }
 
+                        // Logged for the CPU row the way the other accelerators
+                        // log theirs. Both are inert today: `EcallEbreak`'s
+                        // decode writes no register, and `CpuOperation::from_log`
+                        // reads `dst_val` only under the Commit classification.
+                        // They are here for the absorb classification the chip
+                        // will add, which — like ECSM and HINT — will recover
+                        // x10..x13 from the register state rather than the log.
                         src2_val = ctrl_addr;
                         dst_val = msg_addr;
                     }

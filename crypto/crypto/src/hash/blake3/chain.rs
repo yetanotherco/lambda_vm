@@ -144,10 +144,18 @@ pub const ABSORB_CTRL_DWORDS: usize = 8;
 /// dwords `0..4` and writes the outgoing chaining value into `4..8`.
 pub const ABSORB_CV_OUT_DWORD: usize = 4;
 
-/// Largest block run one absorb ecall accepts. Mirrors the executor's
-/// `BLAKE3_ABSORB_MAX_BLOCKS`; a longer message simply takes several calls,
-/// because the chaining value travels through the control region.
-pub const ABSORB_MAX_BLOCKS: usize = 1 << 16;
+/// Largest block run one absorb ecall accepts — 1 024 blocks, 64 KiB. Mirrors
+/// the executor's `BLAKE3_ABSORB_MAX_BLOCKS` (a test pins them equal); a longer
+/// message simply takes several calls, because the chaining value travels
+/// through the control region.
+///
+/// The binding reason for the value is trace height, not guest cost: the ecall
+/// is one CPU cycle and up to this many chip rows, which breaks the
+/// one-cycle-to-one-row ratio every other accelerator keeps and that epoch
+/// splitting relies on. See the executor constant for the full argument. It
+/// costs the guest nothing — absorb cost is flat in message length past about
+/// four blocks.
+pub const ABSORB_MAX_BLOCKS: usize = 1 << 10;
 
 /// How many whole blocks of `input` a bulk absorb may take, given `pending`
 /// bytes already held in the block buffer and whether `input` is 8-byte aligned.

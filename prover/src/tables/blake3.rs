@@ -1641,7 +1641,10 @@ mod executor_absorb_parity {
     /// applied it because it is block 0 of *its* run, would produce a valid
     /// proof of the wrong digest and nothing else here would notice.
     ///
-    /// 4 MiB + 2 blocks: the smallest message that forces exactly two ecalls.
+    /// `(ABSORB_MAX_BLOCKS + 2) * 64` forces exactly two ecalls. Not the
+    /// *smallest* message that does — that is `ABSORB_MAX_BLOCKS * 64 + 1`,
+    /// one byte past a full cap's worth — but it leaves the second run a clean
+    /// whole block, which is the shape worth pinning.
     #[test]
     fn a_message_past_the_block_cap_takes_several_ecalls() {
         use crypto::hash::blake3::chain::ABSORB_MAX_BLOCKS;
