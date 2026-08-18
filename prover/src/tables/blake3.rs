@@ -1630,6 +1630,36 @@ mod executor_absorb_parity {
         assert_ne!(cv, BLAKE3_IV, "the absorb must fold the block in");
     }
 
+    /// ★ A message past the block cap takes SEVERAL absorb ecalls, and the
+    /// second one is where the flag schedule can go wrong.
+    ///
+    /// Every other case here fits in one ecall, so `first_flags` is always
+    /// `CHUNK_START` and the "0 on every later block" half of the schedule is
+    /// exercised only *within* a run. Past `ABSORB_MAX_BLOCKS` the guest calls
+    /// again with `started` already true, and the second run's first block must
+    /// carry NO flags — a run that re-sent `CHUNK_START`, or an executor that
+    /// applied it because it is block 0 of *its* run, would produce a valid
+    /// proof of the wrong digest and nothing else here would notice.
+    ///
+    /// 4 MiB + 2 blocks: the smallest message that forces exactly two ecalls.
+    #[test]
+    fn a_message_past_the_block_cap_takes_several_ecalls() {
+        use crypto::hash::blake3::chain::ABSORB_MAX_BLOCKS;
+
+        let len = (ABSORB_MAX_BLOCKS + 2) * BLOCK_LEN;
+        // Two full runs plus the final block that `finalize_digest` keeps.
+        assert_eq!(bulk_absorb_blocks(0, len, true), ABSORB_MAX_BLOCKS);
+        let after_first = len - ABSORB_MAX_BLOCKS * BLOCK_LEN;
+        assert_eq!(bulk_absorb_blocks(0, after_first, true), 1);
+
+        let msg = message(len);
+        assert_eq!(
+            chain_through_the_accelerator(&msg),
+            blake3_chain_rounds(&msg, BLAKE3_SIX_ROUNDS),
+            "a multi-ecall absorb must still be the chain"
+        );
+    }
+
     /// ★ The two crates' copies of the absorb ABI's shape are the same numbers.
     ///
     /// `crypto` states the control-region layout and the block cap for the guest
