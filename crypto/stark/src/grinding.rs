@@ -78,7 +78,10 @@ fn is_valid_nonce_for_inner_hash(inner_hash: &[u8; 32], candidate_nonce: u64, li
 /// Returns the bit-string constructed as
 /// Hash(prefix || seed || grinding_factor)
 /// `prefix` is the bit-string `0x123456789abcded`
-fn get_inner_hash(seed: &[u8; 32], grinding_factor: u8) -> [u8; 32] {
+///
+/// Public so the GPU parity test can build the same inner-hash lanes the
+/// device kernel searches over.
+pub fn get_inner_hash(seed: &[u8; 32], grinding_factor: u8) -> [u8; 32] {
     let mut inner_data = [0u8; 41];
     inner_data[0..8].copy_from_slice(&PREFIX);
     inner_data[8..40].copy_from_slice(seed);
@@ -86,4 +89,48 @@ fn get_inner_hash(seed: &[u8; 32], grinding_factor: u8) -> [u8; 32] {
 
     let digest = Keccak256::digest(inner_data);
     digest[..32].try_into().unwrap()
+}
+
+/// Grind on the GPU when a CUDA backend is up, falling back to the CPU search
+/// otherwise (or on any device error). The nonce is the smallest valid one in
+/// the searched range, which — like the CPU's — the verifier accepts by
+/// checking `is_valid_nonce`; nothing downstream depends on which valid nonce
+/// is chosen. The heavy per-table-per-epoch ~2^grinding_factor hashing is the
+/// prover's dominant CPU cost, so this moves it off the 16 cores onto the idle
+/// GPU.
+#[cfg(feature = "cuda")]
+pub fn generate_nonce_maybe_gpu(seed: &[u8; 32], grinding_factor: u8) -> Option<u64> {
+    debug_assert!(
+        (1..=64).contains(&grinding_factor),
+        "grinding_factor must be in 1..=64, got {grinding_factor}"
+    );
+    // Kill switch (presence-based, matching `LAMBDA_VM_NO_GPU_LOGUP`):
+    // `LAMBDA_VM_NO_GPU_GRIND` forces the CPU search — a production escape hatch
+    // and fallback-path coverage. Cached; read once.
+    static GPU_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *GPU_DISABLED.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_GPU_GRIND").is_some()) {
+        return generate_nonce(seed, grinding_factor);
+    }
+    let inner_hash = get_inner_hash(seed, grinding_factor);
+    // Keccak reads the 32-byte inner hash as four little-endian lanes.
+    let inner_lanes: [u64; 4] = core::array::from_fn(|i| {
+        u64::from_le_bytes(inner_hash[i * 8..i * 8 + 8].try_into().unwrap())
+    });
+    if let Some(nonce) = math_cuda::grinding::generate_nonce_gpu(&inner_lanes, grinding_factor) {
+        // Validate unconditionally (one host hash against the ~2^grinding_factor
+        // device search): a kernel/driver defect must degrade to the CPU search,
+        // never append an unverifiable nonce to the transcript. This runs in
+        // release too — the cost is negligible next to the grind it replaces.
+        if is_valid_nonce(seed, nonce, grinding_factor) {
+            crate::gpu_lde::GPU_GRIND_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Some(nonce);
+        }
+        log::warn!("GPU grind returned an invalid nonce ({nonce}); falling back to CPU search");
+    }
+    generate_nonce(seed, grinding_factor)
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn generate_nonce_maybe_gpu(seed: &[u8; 32], grinding_factor: u8) -> Option<u64> {
+    generate_nonce(seed, grinding_factor)
 }
