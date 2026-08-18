@@ -15,7 +15,7 @@
   show raw: r => r.text
   it
 }
-// TODO: aside, todo callouts (rj/et/cdsg), the alternating table colors of decode
+// TODO: todo callouts (rj/et/cdsg), the alternating table colors of decode
 
 #let nav(chapter) = {
   let content = meta.summary.map(((title, chapters)) => {

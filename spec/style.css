@@ -22,6 +22,8 @@
   --endnote-fg: #555;
   --border: #c8c8c8;
   --table-border: black;
+  --aside-border: #808080;
+  --aside-border-size: 2pt;
 
   /* --font-body: TODO SUGGESTIONS WELCOME*/
   /* --font-code: TODO SUGGESTIONS WELCOME*/
@@ -292,6 +294,36 @@ a {
 a:hover {
   color: var(--link-hover);
   text-decoration: underline;
+}
+
+/* asides */
+.aside {
+  margin: 1em 0;
+  border: var(--aside-border-size) solid var(--aside-border);
+  border-radius: var(--radius);
+  overflow-x: auto;
+  padding: 0 1em 1em;
+}
+
+.aside-title {
+  /* Make it stick in case of overflow-x */
+  position: sticky;
+  left: -1em;
+
+  /* Span the entire width */
+  margin: 0 -1em 0.5em;
+  /* Separator between title and body */
+  border-bottom: var(--aside-border-size) solid var(--aside-border);
+
+  background: rgb(85, 170, 255);
+  color: black;
+  padding: 0.4em 1em;
+  font-weight: 600;
+}
+
+.aside-title strong {
+  display: block;
+  text-align: center;
 }
 
 /* footnotes */
