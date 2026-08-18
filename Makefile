@@ -691,7 +691,12 @@ clippy:
 	# a GPU tree committing under a different hash than the CPU one, so linting
 	# them apart would certify a combination nothing should ever build. The
 	# prover's feature forwards to crypto's, so naming it covers both host halves.
-	cargo clippy --workspace --all-targets --features lambda-vm-prover/blake3-6round,math-cuda/blake3-6round -- -D warnings -A clippy::op_ref
+	#
+	# `blake3-absorb` rather than `blake3-6round`: it implies the latter, so this
+	# stays the 6-round pass while also compiling the guest chained-absorb arm,
+	# which no other pass reaches. Its `cfg(not(...))` counterpart is what the
+	# four passes above compile, so both arms stay linted.
+	cargo clippy --workspace --all-targets --features lambda-vm-prover/blake3-absorb,math-cuda/blake3-6round -- -D warnings -A clippy::op_ref
 
 fmt:
 	cargo fmt --all
@@ -709,7 +714,12 @@ lint:
 	# a GPU tree committing under a different hash than the CPU one, so linting
 	# them apart would certify a combination nothing should ever build. The
 	# prover's feature forwards to crypto's, so naming it covers both host halves.
-	cargo clippy --workspace --all-targets --features lambda-vm-prover/blake3-6round,math-cuda/blake3-6round -- -D warnings -A clippy::op_ref
+	#
+	# `blake3-absorb` rather than `blake3-6round`: it implies the latter, so this
+	# stays the 6-round pass while also compiling the guest chained-absorb arm,
+	# which no other pass reaches. Its `cfg(not(...))` counterpart is what the
+	# four passes above compile, so both arms stay linted.
+	cargo clippy --workspace --all-targets --features lambda-vm-prover/blake3-absorb,math-cuda/blake3-6round -- -D warnings -A clippy::op_ref
 	# The cuda feature gates whole modules + cuda-only integration tests. build.rs emits empty
 	# cubin stubs when nvcc is absent, so this checks on a GPU-less host (CI lint runner, dev laptop)
 	# too — no GPU required. Catches cuda-gated breakage that the non-cuda passes above miss.
