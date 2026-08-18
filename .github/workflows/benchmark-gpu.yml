@@ -238,7 +238,12 @@ jobs:
           # whole, but up to 7 noisy neighbors share the host CPU/PCIe and add per-pair
           # variance that ABBA pairing can't cancel (it's not static drift). Dedicated boxes
           # exist in the same pool, just priced lower per slot.
-          QUERY="gpu_name=${GPU_NAME} num_gpus=1 gpu_frac=1 cpu_cores_effective>=16 cpu_cores_effective<=32 cpu_ram>=48 disk_space>=64 verified=true rentable=true cuda_max_good>=12.8 dph_total<=${PRICE_CAP}"
+          # reliability>=0.95 drops chronically-flaky hosts (Vast's machine reliability
+          # score, 0-1) before renting — cheaper than renting a bad box and catching it
+          # at the toolchain sanity gate. `reliability` is the queryable field (the
+          # `reliability2` in the response schema is display-only, not filterable).
+          # Over-strict just yields no offers, surfaced by the retry loop's "No offer".
+          QUERY="gpu_name=${GPU_NAME} num_gpus=1 gpu_frac=1 cpu_cores_effective>=16 cpu_cores_effective<=32 cpu_ram>=48 disk_space>=64 verified=true rentable=true reliability>=0.95 cuda_max_good>=12.8 dph_total<=${PRICE_CAP}"
           echo "Query: $QUERY (+ client-side driver_version major >= $MIN_DRIVER)"
           # Keep only offers whose driver major >= MIN_DRIVER, then most expensive first
           # (within the price cap). Within the now whole-machine pool, price just tracks
@@ -359,25 +364,43 @@ jobs:
           SSH="ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o BatchMode=yes -i $KEY -p $PORT root@$HOST"
 
           echo "Waiting for the template onstart script to finish (Rust + LLVM + sysroot + clone)..."
-          # The bootstrap's final stdout line is "=== done ===". Vast captures onstart
-          # output to /var/log/onstart.log; fall back to checking the artifacts it leaves.
-          for _ in $(seq 1 120); do   # ~20 min
+          # The bootstrap's final stdout line is "=== done ===", captured by Vast to
+          # /var/log/onstart.log. That marker is the ONLY trusted completion signal:
+          # the previous "artifacts exist" fallback fired as soon as a few files were
+          # present, which let the build start while onstart was still populating the
+          # sysroot — the C compiler then read a half-written header (e.g. a truncated
+          # `bits/timex.h` -> "unterminated #ifndef") or a still-installing toolchain,
+          # producing the confusing dual-build failures. Waiting for the marker (or
+          # rerolling the box) is strictly safer than building on a half-ready host.
+          DONE=""
+          for _ in $(seq 1 150); do   # ~25 min
             if $SSH 'grep -q "=== done ===" /var/log/onstart.log 2>/dev/null'; then
-              echo "onstart reported done"; exit 0
-            fi
-            # Fallback if the log marker isn't found: the late-stage artifacts (cargo + the
-            # sysroot + the cloned repo) imply the earlier Rust/LLVM/toolchain install finished.
-            # Deliberately no toolchain-date check — it would go stale when the repo bumps nightly.
-            # shellcheck disable=SC2016  # $HOME must expand on the remote box, not the runner
-            if $SSH 'test -x "$HOME/.cargo/bin/cargo" \
-                  && test -f /opt/lambda-vm-sysroot/include/stdlib.h \
-                  && test -d /workspace/lambda_vm/.git'; then
-              echo "provisioning artifacts present"; exit 0
+              DONE=1; echo "onstart reported done"; break
             fi
             sleep 10
           done
-          echo "::error::onstart provisioning did not complete in time"
-          exit 1
+          if [ -z "$DONE" ]; then
+            echo "::error::onstart never reported '=== done ===' in ~25 min — slow or broken host. Re-run /bench-gpu to reroll the box."
+            exit 1
+          fi
+
+          # Sanity gate: even a box that reports done can have a corrupt toolchain
+          # (bad host RAM shows up as gcc/rustc SIGSEGV on the first heavy crate, e.g.
+          # jemalloc or serde_derive). Compile a trivial C and Rust unit up front so a
+          # bad box fails HERE with a clear message instead of mid-build with an
+          # internal-compiler-error backtrace. Cheap (~1s) vs a ~10 min dual build.
+          echo "Toolchain sanity check (gcc + rustc)..."
+          # shellcheck disable=SC2016  # $HOME expands on the remote box, not the runner
+          if ! $SSH 'set -e; d=$(mktemp -d); \
+                printf "#include <stdlib.h>\nint main(void){return 0;}\n" > "$d/t.c"; \
+                cc -O2 "$d/t.c" -o "$d/tc" && "$d/tc"; \
+                printf "fn main(){}\n" > "$d/t.rs"; \
+                "$HOME/.cargo/bin/rustc" -O "$d/t.rs" -o "$d/tr" && "$d/tr"; \
+                rm -rf "$d"'; then
+            echo "::error::Toolchain sanity check failed — this host's gcc/rustc is broken (likely bad RAM: compilers SIGSEGV on stock code). Re-run /bench-gpu to reroll the box."
+            exit 1
+          fi
+          echo "toolchain sane"
 
       - name: Run GPU ABBA benchmark
         id: bench
@@ -425,12 +448,19 @@ jobs:
           # symbol the box's driver doesn't export, e.g. cuDevSmResourceSplit -> runtime panic).
           # MIN_DRIVER>=580 still guards the too-old end (older drivers lack cuCtxGetDevice_v2 and
           # the GPU path falls back to CPU). nvidia-smi is logged for diagnosing driver issues.
+          # CARGO_BUILD_JOBS caps the dual build's parallelism. Uncapped, cargo runs
+          # one rustc per core (16-32 here) and jemalloc-sys's nested `make -j` inherits
+          # the same jobserver, so the initial ramp co-schedules many memory-hungry LLVM
+          # codegen units (syn/serde_derive) with jemalloc's parallel C compiles and can
+          # transiently exceed the box's RAM — memory pressure that shows up as compiler
+          # SIGSEGV. 8 leaves ~6 GB/job on the >=48 GB floor; the build is a one-time
+          # per-bench cost well inside the job timeout.
           REMOTE="set -e; cd /workspace/lambda_vm; \
             command -v python3 >/dev/null || { apt-get update -qq && apt-get install -y -qq python3; }; \
             nvidia-smi || true; \
             git fetch --force origin main; $FETCH; \
             git checkout -f origin/main; \
-            REBUILD=1 CUDARC_PIN=cuda-12080 SYSROOT_DIR=/opt/lambda-vm-sysroot BENCH_FEATURES='$BENCH_FEATURES' \
+            CARGO_BUILD_JOBS=8 REBUILD=1 CUDARC_PIN=cuda-12080 SYSROOT_DIR=/opt/lambda-vm-sysroot BENCH_FEATURES='$BENCH_FEATURES' \
             WORKLOAD=real CONTINUATIONS=1 EPOCH_SIZE_LOG2=$GPU_REAL_EPOCH_LOG2 \
             scripts/bench_abba.sh $REF_A origin/main $PAIRS"
 
