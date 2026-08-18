@@ -3686,28 +3686,45 @@ pub trait IsStarkProver<
                             let aux_recovered = recovered;
                             if recovered && device_only {
                                 let mut cell = main_lde_cells[idx].lock().unwrap();
-                                if let Some((data, _)) = cell.as_mut()
-                                    && data.is_empty()
-                                    && trace.num_main_columns > 0
-                                {
-                                    recovered = match (
-                                        gpu_main_cells[idx].lock().unwrap().as_ref(),
-                                        math_cuda::device::backend(),
-                                    ) {
-                                        (Some(h), Ok(be)) => {
-                                            match crate::gpu_lde::download_main_lde_row_major::<Field>(
-                                                h,
-                                                &be.next_stream(),
+                                // Matched exhaustively on purpose: `MainLdeSlot`
+                                // exists so a consumer between Round 1 and the
+                                // fused task cannot read an empty buffer as if it
+                                // were an LDE, and this recovery is exactly such a
+                                // consumer.
+                                match cell.as_mut() {
+                                    // The retained buffer is the one the fused task
+                                    // reads, so under device-only it is empty and
+                                    // has to come back off the device handle.
+                                    Some(MainLdeSlot::Retained((data, _))) => {
+                                        if data.is_empty() && trace.num_main_columns > 0 {
+                                            recovered = match (
+                                                gpu_main_cells[idx].lock().unwrap().as_ref(),
+                                                math_cuda::device::backend(),
                                             ) {
-                                                Some(v) => {
-                                                    *data = v;
-                                                    true
+                                                (Some(h), Ok(be)) => {
+                                                    match crate::gpu_lde::download_main_lde_row_major::<
+                                                        Field,
+                                                    >(
+                                                        h, &be.next_stream()
+                                                    ) {
+                                                        Some(v) => {
+                                                            *data = v;
+                                                            true
+                                                        }
+                                                        None => false,
+                                                    }
                                                 }
-                                                None => false,
-                                            }
+                                                _ => false,
+                                            };
                                         }
-                                        _ => false,
-                                    };
+                                    }
+                                    // `RecomputeLde` dropped the buffer by design:
+                                    // the fused task rebuilds the main LDE from the
+                                    // host trace, which a device decline never
+                                    // touched. There is nothing to download and
+                                    // nothing to fail — the aux recovery above is
+                                    // the whole job.
+                                    Some(MainLdeSlot::Dropped { .. }) | None => {}
                                 }
                             }
                             if !recovered {
