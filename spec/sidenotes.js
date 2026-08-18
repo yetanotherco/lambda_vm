@@ -12,11 +12,14 @@
       const sup = ref.parentElement;
       const aside = document.createElement("aside");
       aside.className = "sidenote";
-      // Duplicate of the real endnote: keep it out of the tab order and a11y tree
-      aside.setAttribute("inert", "");
 
       const content = endnote.cloneNode(true);
       aside.replaceChildren(...content.childNodes);
+
+      // Duplicate of the real endnote: keep it out of the tab order and a11y tree
+      aside.setAttribute("aria-hidden", "true");
+      // incomplete selector, but could be extended if anything becomes relevant, ever
+      aside.querySelectorAll("a, summary, iframe, [tabindex]").forEach(el => el.setAttribute("tabindex", "-1"));
 
       sup.after(aside);
     }
