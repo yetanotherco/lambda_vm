@@ -2687,9 +2687,11 @@ pub trait IsStarkProver<
                 !lde_trace.host_trace_empty(),
                 "R4 {what} opening fell back to the host tree, but it is device-only (empty)"
             );
-            // A root-only host tree means the nodes are device-resident: the
-            // host walk would emit an empty path for position 0 instead of
-            // failing, so a broken proofs↔tree pairing must abort here.
+            // A root-only host tree means the nodes are device-resident, so a
+            // broken proofs↔tree pairing must abort here. `get_proof_by_pos`
+            // already refuses a root-only tree, but the panic it produces
+            // downstream reads "FRI query index in bounds" — this names the
+            // real cause instead.
             assert!(
                 !tree.is_root_only(),
                 "R4 {what} opening fell back to a root-only host tree (nodes device-resident)"

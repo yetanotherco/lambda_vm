@@ -54,8 +54,10 @@ where
 }
 
 /// Device-resident row-major main trace, pre-uploaded ahead of the prove.
-/// Excluded from logical trace equality and opaque in `Debug`, matching
-/// [`ResidentMainTrace`].
+/// Opaque in `Debug` like [`ResidentMainTrace`], and fully excluded from
+/// logical trace equality: this is a cache of data the host trace still owns,
+/// so two traces that differ only here are equal. (`ResidentMainTrace` still
+/// compares its row count, because it can be the sole owner of the data.)
 #[cfg(feature = "cuda")]
 #[derive(Clone)]
 pub(crate) struct PreUploadedMainTrace {

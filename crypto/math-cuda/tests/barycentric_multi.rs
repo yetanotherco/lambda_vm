@@ -140,14 +140,17 @@ fn run_ext3(log_trace: u32, blowup: usize, num_cols: usize, k_points: usize, see
 #[test]
 fn bary_base_multi_matches_single_point() {
     // Covers: k=1 degenerate, the production k=2, the kernel cap k=8, a
-    // single-chunk tiny n, and a column count that forces the chunk heuristic
-    // to its occupancy branch.
+    // single-chunk tiny n, a multi-chunk mid case, and the 64-chunk cap —
+    // the most chunks any shape can ask for, so parity is pinned at both
+    // ends of the chunk range. (`bary_num_chunks`'s own branch selection is
+    // covered by its unit tests; only the kernels are exercised here.)
     for (log_t, blowup, cols, k) in [
         (4u32, 2usize, 3usize, 1usize),
         (8, 4, 10, 2),
         (12, 2, 5, 3),
         (14, 2, 100, 2),
         (10, 2, 4, 8),
+        (20, 2, 4, 2),
     ] {
         run_base(log_t, blowup, cols, k, 3000 + log_t as u64 + k as u64);
     }
@@ -161,6 +164,7 @@ fn bary_ext3_multi_matches_single_point() {
         (10, 2, 3, 3),
         (14, 2, 40, 2),
         (10, 2, 4, 8),
+        (19, 2, 2, 2),
     ] {
         run_ext3(log_t, blowup, cols, k, 4000 + log_t as u64 + k as u64);
     }

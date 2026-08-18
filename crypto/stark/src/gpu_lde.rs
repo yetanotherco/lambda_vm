@@ -46,6 +46,12 @@ use crate::trace::LDETraceTable;
 /// measured sweep optimum on ethrex continuations (2^14 beats 2^15..2^19 and
 /// also beats "everything on GPU", where sub-2^14 tables lose to launch
 /// overhead). Override via env var for tuning.
+///
+/// The same value gates the whole dispatch layer, not just the commit: R2
+/// decompose, the R3 inv-denoms/barycentric contexts, R4 DEEP and the FRI
+/// fold all admit on it, so moving it moves every one of those floors
+/// together. The device-only envelope is the one gate that does NOT ride on
+/// it — see [`DEFAULT_DEVICE_ONLY_MIN_LDE`].
 const DEFAULT_GPU_LDE_THRESHOLD: usize = 1 << 14;
 
 fn gpu_lde_threshold() -> usize {
@@ -66,6 +72,15 @@ fn gpu_lde_threshold() -> usize {
 /// eligibility (the LOCKSTEP note below). Keep device-only to the large-table
 /// envelope where those paths are exercised; mid tables keep a host copy so a
 /// dispatch decline degrades to CPU instead of aborting.
+///
+/// That degradation covers the sites that READ the LDE — they all gate on
+/// `host_trace_empty()` and take their host arm. It does NOT cover the R4
+/// Merkle-proof gather: the host tree is root-only for every GPU-committed
+/// table (the tree stays resident from [`DEFAULT_GPU_LDE_THRESHOLD`] upward,
+/// whatever `retain_host_lde` says), so a declined `gather_proofs_dev` has
+/// nothing to fall back to and aborts regardless of the host LDE. Lowering
+/// the commit threshold therefore widens that one abort site even though it
+/// leaves this envelope alone.
 const DEFAULT_DEVICE_ONLY_MIN_LDE: usize = 1 << 19;
 
 fn gpu_device_only_threshold() -> usize {
@@ -2633,8 +2648,9 @@ where
 /// returning one [`Proof`] per position in the same order. Byte-identical to
 /// the host `MerkleTree::get_proof_by_pos` (guarded by the `merkle_gather`
 /// parity test), so R4 query openings can source proofs from the resident
-/// device tree instead of the host tree. Returns `None` on any cudarc error
-/// (the caller then falls back to the host tree).
+/// device tree instead of the host tree. Returns `None` on any cudarc error —
+/// which every caller treats as a hard abort, NOT a fallback: a resident tree
+/// leaves the host tree root-only, so there is no host path to walk.
 pub(crate) fn gather_proofs_dev(
     tree: &math_cuda::lde::GpuMerkleTree,
     positions: &[usize],
@@ -3162,7 +3178,8 @@ mod split_tree_tests {
     /// isolates the tree layout/hashing under test.
     #[test]
     fn split_trees_match_cpu_subset_commits() {
-        // Above the dispatch threshold (2^19 LDE) so the GPU path must engage.
+        // This shape's LDE is 2^19, well above the dispatch threshold, so the
+        // GPU path must engage.
         let n: usize = 1 << 18;
         let blowup: usize = 2;
         let m: usize = 5;
