@@ -25,18 +25,19 @@ pub static FAULT_COMP_TREE_STICKY: AtomicI64 = AtomicI64::new(-1);
 ///
 /// The transition is a single `fetch_update`, so concurrent table dispatches
 /// (the prover runs a rayon task per table) cannot race the load against the
-/// decrement: the counter saturates at 0 and never underflows past it, which
-/// keeps both the sticky guarantee and the `== 0` fired check sound. A CAS
-/// loser's returned prior value can lag by one, so the Err decision reads the
-/// post-update state instead.
+/// decrement: each caller walks the counter one step (the closure returns
+/// `None` at `<= 0`, so it parks at 0 and never underflows), which keeps both
+/// the sticky guarantee and the `== 0` fired check sound. The fire decision
+/// reads `fetch_update`'s own result — `Ok(prev)` for the call that
+/// decremented, `Err(cur)` for a no-op — so no second load is needed.
 pub fn check_sticky(counter: &AtomicI64) -> Result<()> {
     // One atomic transition, so concurrent dispatches saturate at 0 rather
     // than underflowing: a decrement only happens from a positive value.
     let fired = counter
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| match v {
-            n if n < 0 => None,   // disarmed: never fires
-            0 => None,            // already parked: stay fired (sticky)
-            _ => Some(v - 1),     // count down toward the parked 0
+            n if n < 0 => None, // disarmed: never fires
+            0 => None,          // already parked: stay fired (sticky)
+            _ => Some(v - 1),   // count down toward the parked 0
         })
         // Ok(prev): this call decremented — the 1 → 0 step fires.
         // Err(cur): no-op — fires only if already parked at 0.
