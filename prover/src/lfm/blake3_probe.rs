@@ -424,8 +424,8 @@ fn the_hosted_chip_cell_budget_at_both_round_counts() {
 }
 
 /// Every constraint index is emitted exactly once, and the count is the one the
-/// module documents. #903 emits 814; the 45 address-derivation constraints have
-/// no counterpart here.
+/// module documents. The syscall chip's single-compression core emits 814; the
+/// 45 address-derivation constraints have no counterpart here.
 #[test]
 fn the_chip_emits_its_constraints_at_degree_3() {
     // 16 per G-instance — two add3s (a sum identity and two carry booleanities
@@ -438,10 +438,11 @@ fn the_chip_emits_its_constraints_at_degree_3() {
         NUM_CONSTRAINTS,
         3 * (NUM_G * 2) + NUM_G * 2 + 4 * (NUM_G * 2) + 1
     );
-    // #903's syscall variant emits 814 at 6 rounds; the 45 address-derivation
+    // The syscall variant's single-compression core emits 814 at 6 rounds (its
+    // absorb mode adds 34 more, none of them per-G); the 45 address-derivation
     // constraints have no counterpart here.
     if BLAKE3_ROUNDS == 6 {
-        assert_eq!(814 - 45, NUM_CONSTRAINTS, "vs #903's syscall variant");
+        assert_eq!(814 - 45, NUM_CONSTRAINTS, "vs the syscall variant's core");
     }
 
     let set = Blake3LfmConstraints;

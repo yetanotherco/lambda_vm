@@ -8,6 +8,16 @@
 # Cross-checked totals at spec-writing time: 3,219 main columns, 1,397
 # interactions, 814 constraints, max degree 3 (incl. the ×μ gating factor).
 #
+# ⚠ SCOPE. Everything below describes the SINGLE-COMPRESSION mode
+# (`BLAKE3_SYSCALL_NUMBER`), and the totals above are that mode's. The table
+# also carries a chained-absorb mode (`BLAKE3_ABSORB_SYSCALL_NUMBER`: one ecall
+# folds a run of 64-byte blocks across `num_blocks + 1` rows linked by the
+# `Blake3Absorb` bus), which takes the shipped chip to 3,266 main columns, 1,473
+# interactions and 848 constraints at the same max degree 3. That mode is NOT
+# described here yet; the Rust is its normative source, and the totals pinned by
+# `prover::tables::blake3::absorb_tests::the_tables_shape_is_pinned` are what to
+# compare against until this file catches up.
+#
 # One row = one compression call: 6 rounds × 8 G-functions fully unrolled in
 # SSA form. Message schedule = the literal per-round index table `SCHED` below
 # (permute^r of the identity under MSG_PERMUTATION =

@@ -549,6 +549,7 @@ fn collect_ops_from_cpu(
     Vec<CommitOperation>,
     Vec<KeccakOperation>,
     Vec<Blake3Operation>,
+    Vec<blake3::Blake3AbsorbOperation>,
     Vec<cpu32::Cpu32Operation>,
     Vec<ecsm::EcsmOperation>,
     Vec<ecdas::EcdasOperation>,
@@ -562,6 +563,7 @@ fn collect_ops_from_cpu(
     let mut commit_ops = Vec::new();
     let mut keccak_ops = Vec::new();
     let mut blake3_ops = Vec::new();
+    let mut blake3_absorb_ops = Vec::new();
     let mut cpu32_ops = Vec::new();
     let mut ecsm_ops = Vec::new();
     let mut ecdas_ops = Vec::new();
@@ -705,6 +707,16 @@ fn collect_ops_from_cpu(
             });
         }
 
+        // Collect Blake3Absorb ECALL operations. One ecall becomes a whole GROUP
+        // of `num_blocks + 1` BLAKE3 rows, so unlike every other accelerator the
+        // chip op collected here is a group rather than a row.
+        if op.ecall_blake3_absorb {
+            let (absorb_memw, absorb_op) =
+                collect_blake3_absorb_ops(op, memory_state, register_state);
+            memw.extend_ops(absorb_memw);
+            blake3_absorb_ops.push(absorb_op);
+        }
+
         // Collect ECSM ecall operations (memory I/O + the two table row sets)
         if op.ecall_ecsm {
             let (ecsm_memw, ecsm_op, ecdas_rows) =
@@ -774,6 +786,7 @@ fn collect_ops_from_cpu(
         commit_ops,
         keccak_ops,
         blake3_ops,
+        blake3_absorb_ops,
         cpu32_ops,
         ecsm_ops,
         ecdas_ops,
@@ -1559,6 +1572,122 @@ fn collect_keccak_memw_ops(
     }
 
     memw_ops
+}
+
+/// Collect the MEMW operations and the chip group for one Blake3Absorb ECALL.
+///
+/// The four operands come from the register state the way ECSM's and HINT's do
+/// — the CPU row carries nothing useful for an ecall that expands to a group.
+/// Every access happens at the ecall's single timestamp, which is why the ABI
+/// requires the control and message regions to be disjoint: MEMW orders
+/// accesses to one address by timestamp and cannot order two at the same one.
+///
+/// The message is read but never written, so `memory_state` is untouched by the
+/// block reads; only `cv_out` advances it.
+fn collect_blake3_absorb_ops(
+    op: &CpuOperation,
+    memory_state: &mut MemoryState,
+    register_state: &mut RegisterState,
+) -> (Vec<MemwOperation>, blake3::Blake3AbsorbOperation) {
+    use executor::vm::instruction::execution::{BLAKE3_ABSORB_CV_OUT_DWORD, BLAKE3_BLOCK_BYTES};
+
+    let ts = op.timestamp;
+    let ctrl_addr = register_state.read(10).0;
+    let msg_addr = register_state.read(11).0;
+    let num_blocks = register_state.read(12).0;
+    let first_flags = register_state.read(13).0;
+    let num_blocks_usize =
+        usize::try_from(num_blocks).expect("absorb block count must be validated by the executor");
+
+    // 4 register reads + 4 cv_in dwords + 8 dwords per block + 4 cv_out dwords.
+    let mut memw_ops = Vec::with_capacity(12 + num_blocks_usize * 8);
+
+    // Bind x10..x13 at ts through the memory argument (reads: old == value).
+    for (reg, value) in [
+        (10u8, ctrl_addr),
+        (11, msg_addr),
+        (12, num_blocks),
+        (13, first_flags),
+    ] {
+        let reg_value = pack_register_value(value);
+        let (_old_val, old_ts) = register_state.read(reg);
+        memw_ops.push(
+            MemwOperation::new(true, 2 * reg as u64, reg_value, ts, 2, true)
+                .with_old(reg_value, [old_ts, old_ts, 0, 0, 0, 0, 0, 0]),
+        );
+        register_state.write(reg, value, ts);
+    }
+
+    // A pure 8-byte read: `old == value`, the content unchanged. It still
+    // advances the address's timestamp, because MEMW models every access as
+    // consuming the (addr, old_ts, old_value) token and producing (addr, ts,
+    // value) — a read that left the token alone would leave the next access
+    // claiming an `old_timestamp` no longer in flight.
+    let mut read_dword = |addr: u64, memw_ops: &mut Vec<MemwOperation>| -> u64 {
+        let (vals, old_ts) = memory_state.read_bytes(addr, 8);
+        let mut dw = 0u64;
+        for (b, &v) in vals.iter().enumerate() {
+            dw |= (v as u64) << (8 * b);
+        }
+        memw_ops.push(MemwOperation::new(false, addr, vals, ts, 8, true).with_old(vals, old_ts));
+        memory_state.write_bytes(addr, dw, 8, ts);
+        dw
+    };
+
+    // cv_in: control dwords 0..4, read into the same `h` columns single mode uses.
+    let mut cv_in = [0u32; 8];
+    for k in 0..4u64 {
+        let dw = read_dword(ctrl_addr + k * 8, &mut memw_ops);
+        cv_in[2 * k as usize] = dw as u32;
+        cv_in[2 * k as usize + 1] = (dw >> 32) as u32;
+    }
+
+    // The message blocks, read in place.
+    let mut blocks = Vec::with_capacity(num_blocks_usize);
+    for i in 0..num_blocks {
+        let block_addr = msg_addr + i * BLAKE3_BLOCK_BYTES;
+        let mut m = [0u32; 16];
+        for k in 0..8u64 {
+            let dw = read_dword(block_addr + k * 8, &mut memw_ops);
+            m[2 * k as usize] = dw as u32;
+            m[2 * k as usize + 1] = (dw >> 32) as u32;
+        }
+        blocks.push(m);
+    }
+
+    let mut absorb_op = blake3::Blake3AbsorbOperation {
+        timestamp: ts,
+        ctrl_addr,
+        msg_addr,
+        first_flags: first_flags as u32,
+        cv_in,
+        blocks,
+        old_cv_out: [0; 32],
+    };
+
+    // cv_out: control dwords 4..8, written on the group's END row with the
+    // chaining value the chain bus delivers there. `expand_absorb` is the same
+    // function the trace filler runs, so this cannot disagree with the row it
+    // is the write for.
+    let rows = blake3::expand_absorb(&absorb_op);
+    let final_cv = rows.last().expect("an absorb group has at least 2 rows").h;
+    for k in 0..4u64 {
+        let addr = ctrl_addr + (BLAKE3_ABSORB_CV_OUT_DWORD + k) * 8;
+        let dw = (final_cv[2 * k as usize] as u64) | ((final_cv[2 * k as usize + 1] as u64) << 32);
+        let mut value = [0u32; 8];
+        for (j, slot) in value.iter_mut().enumerate() {
+            *slot = ((dw >> (8 * j)) & 0xFF) as u32;
+        }
+        let (old_vals, old_ts) = memory_state.read_bytes(addr, 8);
+        for (j, &v) in old_vals.iter().enumerate() {
+            absorb_op.old_cv_out[k as usize * 8 + j] = v as u8;
+        }
+        memw_ops
+            .push(MemwOperation::new(false, addr, value, ts, 8, true).with_old(old_vals, old_ts));
+        memory_state.write_bytes(addr, dw, 8, ts);
+    }
+
+    (memw_ops, absorb_op)
 }
 
 /// Collect MEMW operations for a Blake3Compress ECALL.
@@ -2575,8 +2704,27 @@ pub(crate) fn collect_bitwise_from_ecdas(ops: &[ecdas::EcdasOperation]) -> Vec<B
 /// ByteAlu XORs and shift-halfword AreBytes (both via `blake3::ValueFlow`,
 /// the same canonical enumeration the senders are built from), the message
 /// AreBytes and the OLD_OUT AreBytes.
-pub(crate) fn collect_bitwise_from_blake3(blake3_ops: &[Blake3Operation]) -> Vec<BitwiseOperation> {
+///
+/// The absorb mode's rows are mirrored the same way, off the same
+/// `blake3::expand_absorb` the trace filler uses, so a row and the
+/// multiplicities it consumes cannot come from two different enumerations.
+pub(crate) fn collect_bitwise_from_blake3(
+    blake3_ops: &[Blake3Operation],
+    absorb_ops: &[blake3::Blake3AbsorbOperation],
+) -> Vec<BitwiseOperation> {
     let mut ops = Vec::new();
+
+    /// The four halfword range checks of one DWordHL pointer.
+    fn is_half_dword(ops: &mut Vec<BitwiseOperation>, ptr: u64) {
+        for shift in [0, 16, 32, 48] {
+            let half = ((ptr >> shift) & 0xFFFF) as u16;
+            ops.push(BitwiseOperation::halfword(
+                BitwiseOperationType::IsHalf,
+                (half & 0xFF) as u8,
+                ((half >> 8) & 0xFF) as u8,
+            ));
+        }
+    }
 
     for bop in blake3_ops {
         let state_addr = bop.state_addr;
@@ -2653,6 +2801,123 @@ pub(crate) fn collect_bitwise_from_blake3(blake3_ops: &[Blake3Operation]) -> Vec
                 bop.old_out[2 * p],
                 bop.old_out[2 * p + 1],
             ));
+        }
+    }
+
+    // ---- absorb mode ----
+    for aop in absorb_ops {
+        let rows = blake3::expand_absorb(aop);
+        let n_rows = rows.len();
+        for (i, r) in rows.iter().enumerate() {
+            let compressing = !r.end;
+            // Gated on μ: every row of the group.
+            ops.push(BitwiseOperation::byte_op(
+                BitwiseOperationType::ByteAluAnd,
+                (aop.ctrl_addr & 0xFF) as u8,
+                7,
+            ));
+            for p in 0..4 {
+                let lo = ((aop.ctrl_addr >> (2 * p * 8)) & 0xFF) as u8;
+                let hi = ((aop.ctrl_addr >> ((2 * p + 1) * 8)) & 0xFF) as u8;
+                ops.push(BitwiseOperation::byte_op(
+                    BitwiseOperationType::AreBytes,
+                    lo,
+                    hi,
+                ));
+            }
+            // Only the control region's pointers: ptr[8..22] are MU_S-gated.
+            for k in 0..blake3::CTRL_DWORDS {
+                is_half_dword(
+                    &mut ops,
+                    aop.ctrl_addr
+                        .checked_add(k as u64 * 8)
+                        .expect("absorb control region range must be validated by the executor"),
+                );
+            }
+            // OLD_OUT is all-zero except on the END row, where it carries the
+            // previous content of cv_out; the check itself is μ-gated either way.
+            for p in 0..32 {
+                let (lo, hi) = if r.end {
+                    (aop.old_cv_out.get(2 * p), aop.old_cv_out.get(2 * p + 1))
+                } else {
+                    (None, None)
+                };
+                ops.push(BitwiseOperation::byte_op(
+                    BitwiseOperationType::AreBytes,
+                    lo.copied().unwrap_or(0),
+                    hi.copied().unwrap_or(0),
+                ));
+            }
+            // ZERO[REMAINING] -> END, on every absorb row.
+            ops.push(BitwiseOperation::zero(r.remaining));
+            // M_BASE halfwords, on every absorb row (it rides the chain to END).
+            is_half_dword(&mut ops, r.m_base);
+
+            if compressing {
+                // The mixing core, in the senders' canonical order.
+                let flow = blake3::ValueFlow::compute(&r.h, &r.m, 0, 64, r.flags);
+                for &(a, b, _out) in &flow.xors {
+                    for byte in 0..4 {
+                        ops.push(BitwiseOperation::byte_op(
+                            BitwiseOperationType::ByteAluXor,
+                            ((a >> (8 * byte)) & 0xFF) as u8,
+                            ((b >> (8 * byte)) & 0xFF) as u8,
+                        ));
+                    }
+                }
+                for &(sll_lo, sllc_lo, sll_hi, sllc_hi, _y) in &flow.rots {
+                    for hw in [sll_lo, sllc_lo, sll_hi, sllc_hi] {
+                        ops.push(BitwiseOperation::byte_op(
+                            BitwiseOperationType::AreBytes,
+                            (hw & 0xFF) as u8,
+                            (hw >> 8) as u8,
+                        ));
+                    }
+                }
+                for m in r.m {
+                    for p in 0..2 {
+                        ops.push(BitwiseOperation::byte_op(
+                            BitwiseOperationType::AreBytes,
+                            ((m >> (16 * p)) & 0xFF) as u8,
+                            ((m >> (16 * p + 8)) & 0xFF) as u8,
+                        ));
+                    }
+                }
+                // M_BASE_INCR and the 8 message dword pointers.
+                is_half_dword(&mut ops, r.m_base.wrapping_add(64));
+                for j in 0..blake3::MSG_DWORDS {
+                    is_half_dword(
+                        &mut ops,
+                        r.m_base
+                            .checked_add(j as u64 * 8)
+                            .expect("absorb message range must be validated by the executor"),
+                    );
+                }
+            } else {
+                // END row: `h`'s bytes are range-checked here instead of by the
+                // mixing core, which is gated off (soundness ledger 14).
+                for p in 0..16 {
+                    let w = r.h[p / 2];
+                    let shift = 16 * (p % 2);
+                    ops.push(BitwiseOperation::byte_op(
+                        BitwiseOperationType::AreBytes,
+                        ((w >> shift) & 0xFF) as u8,
+                        ((w >> (shift + 8)) & 0xFF) as u8,
+                    ));
+                }
+            }
+
+            if r.first {
+                // The in-circuit block cap: IsB20[REM_DECR · 2^10].
+                let value = (r.remaining as u64 - 1) * blake3::ABSORB_CAP_SCALE;
+                ops.push(BitwiseOperation::b20(
+                    (value & 0xFF) as u8,
+                    ((value >> 8) & 0xFF) as u8,
+                    ((value >> 16) & 0xF) as u8,
+                ));
+            }
+            debug_assert_eq!(r.first, i == 0, "FIRST is the group's first row");
+            debug_assert_eq!(r.end, i + 1 == n_rows, "END is the group's last row");
         }
     }
 
@@ -3133,6 +3398,7 @@ struct CollectedOps {
     commit_ops: Vec<CommitOperation>,
     keccak_ops: Vec<KeccakOperation>,
     blake3_ops: Vec<Blake3Operation>,
+    blake3_absorb_ops: Vec<blake3::Blake3AbsorbOperation>,
     // Auxiliary ALU / memory / CPU32 dispatch chips (driven by the CPU ALU/MEMORY dispatch).
     eq_ops: Vec<eq::EqOperation>,
     bytewise_ops: Vec<bytewise::BytewiseOperation>,
@@ -3195,6 +3461,7 @@ fn collect_all_ops(
     commit_ops: Vec<CommitOperation>,
     keccak_ops: Vec<KeccakOperation>,
     blake3_ops: Vec<Blake3Operation>,
+    blake3_absorb_ops: Vec<blake3::Blake3AbsorbOperation>,
     cpu32_ops: Vec<cpu32::Cpu32Operation>,
     ecsm_ops: Vec<ecsm::EcsmOperation>,
     ecdas_ops: Vec<ecdas::EcdasOperation>,
@@ -3336,6 +3603,7 @@ fn collect_all_ops(
         commit_ops,
         keccak_ops,
         blake3_ops,
+        blake3_absorb_ops,
         eq_ops,
         bytewise_ops,
         store_ops,
@@ -3381,6 +3649,7 @@ fn build_traces<I: ImageSource + Sync>(
         commit_ops,
         keccak_ops,
         blake3_ops,
+        blake3_absorb_ops,
         eq_ops,
         bytewise_ops,
         store_ops,
@@ -3472,7 +3741,12 @@ fn build_traces<I: ImageSource + Sync>(
         Box::new(|h| h.add_ops(&collect_bitwise_from_memw_aligned(&memw_aligned_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_commit(&commit_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_keccak(&keccak_ops))),
-        Box::new(|h| h.add_ops(&collect_bitwise_from_blake3(&blake3_ops))),
+        Box::new(|h| {
+            h.add_ops(&collect_bitwise_from_blake3(
+                &blake3_ops,
+                &blake3_absorb_ops,
+            ))
+        }),
         Box::new(|h| h.add_ops(&collect_bitwise_from_ecsm(&ecsm_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_ecdas(&ecdas_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_hint(&hint_ops))),
@@ -3743,7 +4017,7 @@ fn build_traces<I: ImageSource + Sync>(
             .collect();
         keccak_rnd::generate_keccak_rnd_trace(&keccak_rnd_ops)
     };
-    let gen_blake3 = || blake3::generate_blake3_trace(&blake3_ops);
+    let gen_blake3 = || blake3::generate_blake3_trace(&blake3_ops, &blake3_absorb_ops);
     let gen_keccak_rc = || {
         let mut keccak_rc_trace = keccak_rc::generate_keccak_rc_trace();
         keccak_rc::update_multiplicities(&mut keccak_rc_trace, keccak_ops.len());
@@ -4835,6 +5109,7 @@ impl Traces {
             commit_ops,
             keccak_ops,
             blake3_ops,
+            blake3_absorb_ops,
             cpu32_ops,
             ecsm_ops,
             ecdas_ops,
@@ -4855,6 +5130,7 @@ impl Traces {
             commit_ops,
             keccak_ops,
             blake3_ops,
+            blake3_absorb_ops,
             cpu32_ops,
             ecsm_ops,
             ecdas_ops,
@@ -4950,6 +5226,7 @@ impl Traces {
             commit_ops,
             keccak_ops,
             blake3_ops,
+            blake3_absorb_ops,
             cpu32_ops,
             ecsm_ops,
             ecdas_ops,
@@ -4966,6 +5243,7 @@ impl Traces {
             commit_ops,
             keccak_ops,
             blake3_ops,
+            blake3_absorb_ops,
             cpu32_ops,
             ecsm_ops,
             ecdas_ops,

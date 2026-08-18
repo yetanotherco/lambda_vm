@@ -1168,6 +1168,66 @@ fn test_prove_elfs_blake3() {
     );
 }
 
+/// ★ The chained-absorb mode, end to end through the REAL prover.
+///
+/// The unit suite in `tables::blake3::absorb_tests` checks the mode's
+/// constraints and its internal bus in isolation; this is the honest path that
+/// exercises everything they cannot: the CPU's `Ecall` send meeting the group's
+/// FIRST row, the MEMW ordering of a dozen accesses that all carry the ecall's
+/// single timestamp, the BITWISE multiplicities the group's rows consume, and a
+/// second group whose `cv_out` write lands on memory the first group wrote.
+///
+/// The guest absorbs three blocks in one ecall and one more in a second, so the
+/// trace holds a 4-row group and a 2-row group at different timestamps — the
+/// shape that would break if the chain were keyed on anything but the timestamp.
+#[test]
+fn test_prove_elfs_blake3_absorb() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_blake3_absorb");
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
+    let result = executor.run().expect("Failed to run program");
+
+    // Replay the guest's two absorbs against the ecall's pure form. The guest
+    // seeds cv_in with dwords 1..4 and the message with dwords 100..123, then
+    // absorbs blocks 0..3 under CHUNK_START and block 1 again under interior
+    // flags.
+    use executor::vm::instruction::execution::blake3_absorb_chain_6round;
+    let dword_words = |dwords: &[u64]| -> Vec<u32> {
+        dwords
+            .iter()
+            .flat_map(|d| [*d as u32, (*d >> 32) as u32])
+            .collect()
+    };
+    let cv_in: [u32; 8] = dword_words(&[1, 2, 3, 4]).try_into().unwrap();
+    let msg: Vec<u32> = dword_words(&(100u64..124).collect::<Vec<_>>());
+    let block = |i: usize| -> [u32; 16] { msg[i * 16..(i + 1) * 16].try_into().unwrap() };
+
+    let after_first = blake3_absorb_chain_6round(&cv_in, &[block(0), block(1), block(2)], 1);
+    let after_second = blake3_absorb_chain_6round(&after_first, &[block(1)], 0);
+    let expected_bytes: Vec<u8> = after_second.iter().flat_map(|w| w.to_le_bytes()).collect();
+
+    assert_eq!(
+        result.return_values.memory_values, expected_bytes,
+        "committed chaining value must match two chained absorb ecalls"
+    );
+
+    // Stack RAM needs PAGE tables, like keccak and the single-compression mode.
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
+    assert_eq!(
+        traces.public_output_bytes,
+        result.return_values.memory_values
+    );
+
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "blake3 absorb prove/verify failed"
+    );
+}
+
 #[test]
 fn test_prove_elfs_ecsm() {
     let _ = env_logger::builder().is_test(true).try_init();
