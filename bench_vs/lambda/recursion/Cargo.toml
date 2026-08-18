@@ -21,6 +21,15 @@ blowup8 = []
 # memory-bounded inner prove) instead of a monolithic VmProof. Selects the
 # `recursion-cont-<preset>-bench` bins below.
 continuation = []
+# Also orthogonal: let the guest's BLAKE3 hashing reach the chained-absorb
+# ecall, so a leaf costs one ecall per run of blocks instead of one per block.
+#
+# OFF by default, and deliberately so: the prover-side chip mode that receives
+# this ecall does not exist yet, so a guest built with this yields honest CYCLE
+# counts but NOT a provable trace — the Ecall bus would have a send with no
+# receiver. It exists so the cycle measurement is reproducible from the tree
+# rather than from a scratch directory.
+absorb = ["lambda-vm-prover/blake3-absorb"]
 
 # One distinctly named binary per preset (selected by its feature) so a parallel
 # `make -j` builds them to different filenames — structurally race-free, no cp
