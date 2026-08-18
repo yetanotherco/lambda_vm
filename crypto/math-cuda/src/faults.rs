@@ -22,15 +22,26 @@ pub static FAULT_COMP_TREE_STICKY: AtomicI64 = AtomicI64::new(-1);
 /// production state); N > 0 counts down across calls and the Nth call — and
 /// every call after it — returns Err (the counter parks at 0); 0 therefore
 /// doubles as the "fired" marker. Disarm by storing -1.
+///
+/// The transition is a single `fetch_update`, so concurrent table dispatches
+/// (the prover runs a rayon task per table) cannot race the load against the
+/// decrement: the counter saturates at 0 and never underflows past it, which
+/// keeps both the sticky guarantee and the `== 0` fired check sound. A CAS
+/// loser's returned prior value can lag by one, so the Err decision reads the
+/// post-update state instead.
 pub fn check_sticky(counter: &AtomicI64) -> Result<()> {
-    let v = counter.load(Ordering::Relaxed);
-    if v < 0 {
-        return Ok(());
-    }
-    if v > 0 {
-        counter.fetch_sub(1, Ordering::Relaxed);
-    }
-    if v <= 1 {
+    // One atomic transition, so concurrent dispatches saturate at 0 rather
+    // than underflowing: a decrement only happens from a positive value.
+    let fired = counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| match v {
+            n if n < 0 => None,   // disarmed: never fires
+            0 => None,            // already parked: stay fired (sticky)
+            _ => Some(v - 1),     // count down toward the parked 0
+        })
+        // Ok(prev): this call decremented — the 1 → 0 step fires.
+        // Err(cur): no-op — fires only if already parked at 0.
+        .map_or_else(|cur| cur == 0, |prev| prev <= 1);
+    if fired {
         return Err(cudarc::driver::DriverError(
             cudarc::driver::sys::CUresult::CUDA_ERROR_UNKNOWN,
         ));

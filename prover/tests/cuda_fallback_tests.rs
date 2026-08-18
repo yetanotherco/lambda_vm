@@ -123,6 +123,20 @@ fn gpu_batch_invert_fault_falls_back_to_cpu() {
     stark::gpu_lde::schedule_inverse_fault(-1);
 }
 
+/// Disarms every sticky fault on drop. The hooks are process-global and these
+/// tests run `--test-threads=1`, so a panic inside `prove` or a failing assert
+/// must not leave a fault armed — a later test would otherwise prove with all
+/// of that stage's dispatches failing and cascade into confusing failures. The
+/// one-shot hooks self-heal; the sticky ones need this.
+struct StickyFaultGuard;
+impl Drop for StickyFaultGuard {
+    fn drop(&mut self) {
+        stark::gpu_lde::schedule_comp_tree_fault_sticky(-1);
+        stark::gpu_lde::schedule_barycentric_fault_sticky(-1);
+        stark::gpu_lde::schedule_deep_fault_sticky(-1);
+    }
+}
+
 /// Warm up with a clean prove and require the device-only residency path to
 /// have fired: the cliff sites these recovery tests cover (empty host trace /
 /// empty host part evals) only arm on device-only tables.
@@ -148,6 +162,8 @@ fn gpu_comp_tree_fault_recovers_device_only_parts() {
     let elf = asm_elf_bytes("fib_iterative_1M");
     warm_up_requiring_device_only(&elf);
 
+    // Disarms on scope exit — including a panic in `prove` or a failing assert.
+    let _guard = StickyFaultGuard;
     stark::gpu_lde::schedule_comp_tree_fault_sticky(1);
     reset_all_gpu_call_counters();
     let recovered = prove(&elf).expect("prove with sticky comp-tree fault");
@@ -155,7 +171,6 @@ fn gpu_comp_tree_fault_recovers_device_only_parts() {
         stark::gpu_lde::comp_tree_fault_fired(),
         "injected comp-tree fault never fired"
     );
-    stark::gpu_lde::schedule_comp_tree_fault_sticky(-1);
     assert!(
         gpu_composition_parts_downloads() > 0,
         "no composition parts were downloaded: the CPU commit either never \
@@ -179,6 +194,8 @@ fn gpu_barycentric_fault_recovers_device_only_trace() {
     let elf = asm_elf_bytes("fib_iterative_1M");
     warm_up_requiring_device_only(&elf);
 
+    // Disarms on scope exit — including a panic in `prove` or a failing assert.
+    let _guard = StickyFaultGuard;
     stark::gpu_lde::schedule_barycentric_fault_sticky(1);
     reset_all_gpu_call_counters();
     let recovered = prove(&elf).expect("prove with sticky barycentric fault");
@@ -186,7 +203,6 @@ fn gpu_barycentric_fault_recovers_device_only_trace() {
         stark::gpu_lde::barycentric_fault_fired(),
         "injected barycentric fault never fired"
     );
-    stark::gpu_lde::schedule_barycentric_fault_sticky(-1);
     assert!(
         gpu_device_only_downgrades() > 0,
         "no device-only table was downgraded: the R3 trace-OOD host loop \
@@ -215,6 +231,8 @@ fn gpu_deep_fault_recovers_device_only_trace_and_parts() {
     let elf = asm_elf_bytes("fib_iterative_1M");
     warm_up_requiring_device_only(&elf);
 
+    // Disarms on scope exit — including a panic in `prove` or a failing assert.
+    let _guard = StickyFaultGuard;
     stark::gpu_lde::schedule_deep_fault_sticky(1);
     reset_all_gpu_call_counters();
     let recovered = prove(&elf).expect("prove with sticky DEEP fault");
@@ -222,7 +240,6 @@ fn gpu_deep_fault_recovers_device_only_trace_and_parts() {
         stark::gpu_lde::deep_fault_fired(),
         "injected DEEP fault never fired"
     );
-    stark::gpu_lde::schedule_deep_fault_sticky(-1);
     assert!(
         gpu_device_only_downgrades() > 0,
         "no device-only table was downgraded: the R4 DEEP host loop either \

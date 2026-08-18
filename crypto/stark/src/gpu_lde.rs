@@ -1471,11 +1471,13 @@ pub(crate) static GPU_BATCH_INVERT_CALLS: AtomicU64 = AtomicU64::new(0);
 /// entered from the R2 host evaluator, the R3 barycentric arms and the R4
 /// DEEP host loop). Nonzero means the device-only gate cleared a table whose
 /// downstream dispatch then declined at runtime — the table continued
-/// host-backed, correct but slower — so every count is a gate miss, and the
-/// fix is to mirror the missing condition into the gate. The R1 resident-aux
-/// downgrade is counted by [`GPU_RESIDENT_AUX_DOWNGRADES`] instead: it fires
-/// on tables the gate never marked device-only, so summing the two would
-/// blame the gate for declines it never made.
+/// host-backed, correct but slower. A count is either a gate miss (a static
+/// condition worth mirroring into the gate) or a transient device decline
+/// (VRAM pressure), which by definition cannot be gated out — see
+/// [`materialize_lde_trace_host`]'s own note. The R1 resident-aux downgrade
+/// is counted by [`GPU_RESIDENT_AUX_DOWNGRADES`] instead: it fires on tables
+/// the gate never marked device-only, so summing the two would blame the gate
+/// for declines it never made.
 pub(crate) static GPU_DEVICE_ONLY_DOWNGRADES: AtomicU64 = AtomicU64::new(0);
 pub fn gpu_device_only_downgrades() -> u64 {
     GPU_DEVICE_ONLY_DOWNGRADES.load(Ordering::Relaxed)
@@ -1763,16 +1765,43 @@ where
     if slabs.len() != m * lde * 3 {
         return None;
     }
+    // Per part: de-interleave the 3 slabs into row-major ext3 and reinterpret
+    // the u64 buffer in place — mirroring `materialize_lde_trace_host` rather
+    // than copying again through `u64_to_ext3_vec`. The row fill is parallel;
+    // this path fires often under VRAM pressure and otherwise dominates the
+    // D2H it follows.
     let parts = (0..m)
         .map(|p| {
             let mut interleaved = vec![0u64; lde * 3];
-            for k in 0..3 {
-                let slab = &slabs[(p * 3 + k) * lde..(p * 3 + k + 1) * lde];
-                for (r, v) in slab.iter().enumerate() {
-                    interleaved[r * 3 + k] = *v;
+            #[cfg(feature = "parallel")]
+            interleaved
+                .par_chunks_exact_mut(3)
+                .enumerate()
+                .for_each(|(r, dst)| {
+                    for (k, d) in dst.iter_mut().enumerate() {
+                        *d = slabs[(p * 3 + k) * lde + r];
+                    }
+                });
+            #[cfg(not(feature = "parallel"))]
+            for (r, dst) in interleaved.chunks_exact_mut(3).enumerate() {
+                for (k, d) in dst.iter_mut().enumerate() {
+                    *d = slabs[(p * 3 + k) * lde + r];
                 }
             }
-            u64_to_ext3_vec::<E>(&interleaved)
+            // SAFETY: E == Ext3 per the tower check above; FieldElement<Ext3>
+            // is [u64; 3]. `vec![0u64; lde*3]` has len == capacity == lde*3.
+            unsafe {
+                let mut v = std::mem::ManuallyDrop::new(interleaved);
+                debug_assert!(
+                    v.len().is_multiple_of(3) && v.capacity().is_multiple_of(3),
+                    "interleaved len/capacity must be a multiple of 3 for Fp3 reinterpret"
+                );
+                Vec::from_raw_parts(
+                    v.as_mut_ptr() as *mut FieldElement<E>,
+                    v.len() / 3,
+                    v.capacity() / 3,
+                )
+            }
         })
         .collect();
     GPU_COMPOSITION_PARTS_DOWNLOADS.fetch_add(1, Ordering::Relaxed);

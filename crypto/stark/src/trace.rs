@@ -705,6 +705,11 @@ where
 /// Accepts a [`DomainConstants`] to avoid redundant computation when the caller
 /// has already derived these values (e.g., round_3 shares them with composition
 /// poly evaluation).
+///
+/// Takes `lde_trace` by `&mut` so a device-only table whose GPU barycentric arm
+/// declines can recover in place: the arm downloads the resident LDEs into the
+/// host buffers ([`crate::gpu_lde::materialize_lde_trace_host`]) and continues
+/// on the host path, rather than reading an empty host trace.
 pub fn get_trace_evaluations_from_lde<F, E>(
     lde_trace: &mut LDETraceTable<F, E>,
     domain: &Domain<F>,
