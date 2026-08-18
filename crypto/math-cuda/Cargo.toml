@@ -41,8 +41,19 @@ test-faults = []
 # stark/prover layers). Zero-cost when disabled; when enabled but
 # libnvToolsExt is absent at runtime, every call is a cheap no-op.
 nvtx = ["dep:libloading"]
+# Compile `kernels/blake3.cu` for the 6-round internal BLAKE3 variant instead of
+# the 7-round standard one. Same polarity as the host tree's `blake3-6round`
+# (default = 7), and it has to be set in lockstep with it: they are separate
+# crates' features and a mismatch is a GPU tree committing under a different hash
+# than the CPU one. `blake3::device_rounds` reads the cubin's round count back so
+# that is assertable rather than discoverable — see
+# `tests/blake3_compress_parity.rs`.
+blake3-6round = []
 
 [dev-dependencies]
+# 7-round-only, so it can anchor the standard arm of the BLAKE3 kernels and
+# nothing else — the same dev-only role it has in `prover/Cargo.toml`.
+blake3 = { version = "1.8.5", default-features = false, features = ["std", "pure"] }
 crypto = { path = "../crypto" }
 rand = { version = "0.8.5", features = ["std"] }
 rand_chacha = "0.3.1"

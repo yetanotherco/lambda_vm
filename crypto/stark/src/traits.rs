@@ -270,15 +270,46 @@ pub trait AIR: Send + Sync {
     /// prefix (its length is `num_base_transition_constraints()`).
     fn constraints_meta(&self) -> &[ConstraintMeta];
 
-    /// The lazily captured flat IR ([`ConstraintProgram`]) of every transition
-    /// constraint, for the CPU interpreter and the GPU kernel.
+    /// The flat IR ([`ConstraintProgram`]) of every transition constraint, for
+    /// the CPU interpreter and the GPU kernel — captured on demand unless a
+    /// pre-captured program was supplied (see
+    /// [`Self::precaptured_constraint_program`]).
     ///
-    /// GUEST-SAFETY: capture hash-conses, so the verify/recursion path must
-    /// NEVER call this — only the prover, GPU lowering, and tests do. The
-    /// default panics precisely so any accidental verify-path use is caught;
-    /// AIRs that support capture override it with a cached (`OnceLock`) build.
+    /// GUEST-SAFETY: this MAY capture, and capture hash-conses, so the
+    /// verify/recursion path must never call it — only the prover, GPU
+    /// lowering, and tests do. The default panics precisely so any accidental
+    /// verify-path use is caught; AIRs that support capture override it with a
+    /// cached (`OnceLock`) build.
+    ///
+    /// The prohibition is on CAPTURE, not on constraint programs as such: a
+    /// program serialized at build time is ordinary data, and consuming one is
+    /// allowed anywhere. That path is
+    /// [`Self::precaptured_constraint_program`].
     fn constraint_program(&self) -> &ConstraintProgram<Self::Field, Self::FieldExtension> {
         unimplemented!("constraint_program is not available for this AIR")
+    }
+
+    /// A pre-captured constraint program supplied at build time, if this AIR was
+    /// given one; `None` otherwise.
+    ///
+    /// GUEST-SAFETY: unlike [`Self::constraint_program`], this NEVER captures
+    /// under any circumstance — it is a borrow of data handed to the AIR at
+    /// construction, so it is safe on the verify/recursion path. That is the
+    /// entire distinction between the two methods, and it is why they are
+    /// separate rather than one method with a flag: an accidental verify-path
+    /// call to the capturing one still hits the panic above.
+    ///
+    /// `None` is not an error — it means nobody supplied an artifact, and the
+    /// caller must fall back to the compiled folder. A caller that needs a
+    /// program on a guest path must treat `None` as fatal itself, because
+    /// falling back to `constraint_program()` there would reintroduce capture.
+    ///
+    /// See [`ConstraintArtifact`](crate::constraint_ir::ConstraintArtifact) for
+    /// the serialized form and for what validating one does and does not prove.
+    fn precaptured_constraint_program(
+        &self,
+    ) -> Option<&ConstraintProgram<Self::Field, Self::FieldExtension>> {
+        None
     }
 
     fn boundary_constraints(

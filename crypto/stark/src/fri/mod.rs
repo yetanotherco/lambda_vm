@@ -1,14 +1,17 @@
+pub mod batched;
 pub mod fri_commitment;
 pub mod fri_decommit;
 pub(crate) mod fri_functions;
+pub mod mmcs;
 pub(crate) mod terminal;
 
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
+use crypto::merkle_tree::merkle::MerkleTree;
 use math::field::element::FieldElement;
 use math::field::traits::{IsFFTField, IsField, IsSubFieldOf};
 use math::traits::AsBytes;
 
-use crate::config::{FriLayerMerkleTree, FriLayerMerkleTreeBackend};
+use crate::config::StarkHash;
 
 use self::fri_commitment::FriLayer;
 use self::fri_decommit::FriDecommitment;
@@ -19,6 +22,14 @@ use self::fri_functions::{fold_evaluations_in_place, update_twiddles_in_place};
 /// of degree < 2^`final_poly_log_degree` with blowup 2^`blowup_log`, and
 /// returns the coefficient vector of that terminal polynomial.
 ///
+/// Layer trees are built with `H::Pair` — the commitment configuration's
+/// FRI-layer backend, the same `H` the caller's prover and verifier are
+/// instantiated at. That is what makes the layer roots this returns
+/// authenticable by [`crate::verifier::IsStarkVerifier::verify`], which
+/// re-hashes each opened pair through `H::Batched`: the two are one hash by
+/// [`StarkHash`]'s two-element invariant, so agreement is a property of naming
+/// one configuration rather than of two call sites happening to match.
+///
 /// The `T: Clone` and `F/E: 'static` bounds are required by the cuda GPU
 /// fast path (`try_fri_commit_gpu` snapshots the transcript and TypeId-
 /// checks the field types). They are present unconditionally (including
@@ -28,6 +39,7 @@ pub fn commit_phase_from_evaluations<
     F: IsFFTField + IsSubFieldOf<E> + 'static,
     E: IsField + 'static + Send + Sync,
     T: IsStarkTranscript<E, F> + Clone,
+    H: StarkHash,
 >(
     mut evals: Vec<FieldElement<E>>,
     transcript: &mut T,
@@ -36,10 +48,7 @@ pub fn commit_phase_from_evaluations<
     blowup_log: u32,
     final_poly_log_degree: u32,
     inv_twiddles: &[FieldElement<F>],
-) -> (
-    Vec<FieldElement<E>>,
-    Vec<FriLayer<E, FriLayerMerkleTreeBackend<E>>>,
-)
+) -> (Vec<FieldElement<E>>, Vec<FriLayer<E, H::Pair<E>>>)
 where
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
@@ -59,7 +68,7 @@ where
         // `Some` with the final-polynomial coefficients. It returns `None` on any
         // precondition miss or cudarc error — restoring the transcript first — so
         // the CPU path below then runs as if the GPU had never been tried.
-        if let Some(result) = crate::gpu_lde::try_fri_commit_gpu::<F, E, T>(
+        if let Some(result) = crate::gpu_lde::try_fri_commit_gpu::<F, E, T, H::Pair<E>>(
             &evals,
             transcript,
             coset_offset,
@@ -102,7 +111,7 @@ where
             .chunks_exact(2)
             .map(|chunk| [chunk[0].clone(), chunk[1].clone()])
             .collect();
-        let merkle_tree = FriLayerMerkleTree::build(&leaves)
+        let merkle_tree = MerkleTree::<H::Pair<E>>::build(&leaves)
             .expect("FRI commit: Merkle tree construction must succeed");
         let root = merkle_tree.root;
         fri_layer_list.push(FriLayer::new(&evals, merkle_tree));
@@ -150,8 +159,14 @@ where
     (final_poly_coeffs, fri_layer_list)
 }
 
-pub fn query_phase<F: IsField + 'static>(
-    fri_layers: &[FriLayer<F, FriLayerMerkleTreeBackend<F>>],
+/// Open every committed layer at each query index, producing one
+/// [`FriDecommitment`] per query.
+///
+/// Takes the layers [`commit_phase_from_evaluations`] built, so it is generic
+/// over the same configuration `H`: the authentication paths it walks are only
+/// meaningful against roots the verifier re-derives through `H`.
+pub fn query_phase<F: IsField + 'static, H: StarkHash>(
+    fri_layers: &[FriLayer<F, H::Pair<F>>],
     iotas: &[usize],
 ) -> Vec<FriDecommitment<F>>
 where
@@ -161,7 +176,9 @@ where
     // layer trees stay resident from the GPU commit). Falls back to the host
     // walk below if any layer lacks a device tree.
     #[cfg(feature = "cuda")]
-    if let Some(decommits) = crate::gpu_lde::try_fri_query_phase_gpu::<F>(fri_layers, iotas) {
+    if let Some(decommits) =
+        crate::gpu_lde::try_fri_query_phase_gpu::<F, H::Pair<F>>(fri_layers, iotas)
+    {
         return decommits;
     }
 

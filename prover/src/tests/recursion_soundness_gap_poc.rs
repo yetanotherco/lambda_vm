@@ -184,6 +184,7 @@ fn custom_prove_with_statement_elf(
         &mut transcript,
         #[cfg(feature = "disk-spill")]
         stark::storage_mode::StorageMode::Ram,
+        stark::residency_mode::ResidencyMode::Retain,
     )
     .expect("multi_prove failed");
 

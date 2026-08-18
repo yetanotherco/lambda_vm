@@ -142,6 +142,7 @@ fn test_eval_fold_matches_coeff_fold() {
 ///     reconstructed terminal codeword at the query's terminal-layer position.
 #[test]
 fn test_commit_phase_early_termination_roundtrip() {
+    use crate::config::KeccakStarkHash;
     use crate::fri::fri_functions::update_twiddles_in_place;
     use crate::fri::terminal::terminal_codeword_from_coeffs;
     use crate::fri::{commit_phase_from_evaluations, query_phase};
@@ -176,7 +177,7 @@ fn test_commit_phase_early_termination_roundtrip() {
     let mut transcript = DefaultTranscript::<F>::new(&[]);
     let inv_twiddles =
         crate::fri::fri_functions::compute_coset_twiddles_inv::<F>(&offset, initial_len);
-    let (final_poly_coeffs, fri_layers) = commit_phase_from_evaluations::<F, F, _>(
+    let (final_poly_coeffs, fri_layers) = commit_phase_from_evaluations::<F, F, _, KeccakStarkHash>(
         codeword.clone(),
         &mut transcript,
         &offset,
@@ -199,7 +200,7 @@ fn test_commit_phase_early_termination_roundtrip() {
 
     // query_phase must still work against the committed layers.
     let iotas = vec![0usize, 1, 5, 17, 30];
-    let _decommitments = query_phase(&fri_layers, &iotas);
+    let _decommitments = query_phase::<F, KeccakStarkHash>(&fri_layers, &iotas);
 
     // ---- Reconstruct terminal codeword from the emitted coefficients ----
     let terminal_len = (1usize << blowup_log) << final_poly_log_degree; // 8

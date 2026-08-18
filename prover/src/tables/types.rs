@@ -359,6 +359,18 @@ pub enum BusId {
     /// Cross-epoch memory bus: the local-to-global table's per-cell init/fini
     /// boundary claims, matched across epochs by the final aggregation LogUp.
     GlobalMemory = 31,
+
+    // =========================================================================
+    // LFM — the Lambda Field Machine (recursion machine; `lfm` module)
+    // =========================================================================
+    /// LFM write-once memory: token `(addr, v0..v3)`. Writes send with the
+    /// preprocessed static read count; reads receive gated by is_real.
+    LfmMem = 32,
+    /// LFM 16-bit range lookup (the `LFM_RANGE` fixed table).
+    LfmRange = 33,
+    /// LFM public values: token `(index, v0..v3)`; closed by a
+    /// consumer-computed balance (the COMMIT-bus pattern).
+    LfmPublic = 34,
 }
 
 impl BusId {
@@ -388,6 +400,9 @@ impl BusId {
             BusId::Ecdas => "Ecdas",
             BusId::Bit => "Bit",
             BusId::GlobalMemory => "GlobalMemory",
+            BusId::LfmMem => "LfmMem",
+            BusId::LfmRange => "LfmRange",
+            BusId::LfmPublic => "LfmPublic",
         }
     }
 }
@@ -420,6 +435,9 @@ impl TryFrom<u64> for BusId {
             28 => Ok(BusId::Ecdas),
             30 => Ok(BusId::Bit),
             31 => Ok(BusId::GlobalMemory),
+            32 => Ok(BusId::LfmMem),
+            33 => Ok(BusId::LfmRange),
+            34 => Ok(BusId::LfmPublic),
             other => Err(other),
         }
     }

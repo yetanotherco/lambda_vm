@@ -114,7 +114,7 @@ pub const RES_EXT_BIT: u32 = 1 << 31;
 /// for root-pinned uniform leaves); `res` is the result slot with [`RES_EXT_BIT`]
 /// selecting the slot class.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct DeviceNode {
     pub op: u32,
     pub a: u32,

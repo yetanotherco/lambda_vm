@@ -94,3 +94,163 @@ fn empty_and_zero_row_inputs_short_circuit() {
     assert!(keccak_leaves_bit_reversed_grouped(&zero_rows, ROWS_PER_LEAF).is_empty());
     assert!(commit_bit_reversed(&zero_rows, ROWS_PER_LEAF).is_none());
 }
+
+/// ★ The [`StarkHash`] two-element-leaf invariant, for the keccak configuration.
+///
+/// The prover commits FRI layers with `Pair` and the verifier authenticates
+/// those openings with `Batched` (`verify_fri_layer_openings` builds a
+/// two-element `Vec`). Nothing in the type system makes those agree — this is
+/// what says they do, so a second configuration that breaks it fails here
+/// rather than by rejecting every honest proof at its first FRI query.
+#[test]
+fn batched_and_pair_agree_on_a_two_element_leaf() {
+    use crate::config::{KeccakStarkHash, StarkHash};
+    use crypto::merkle_tree::traits::IsMerkleTreeBackend;
+
+    type Batched = <KeccakStarkHash as StarkHash>::Batched<F>;
+    type Pair = <KeccakStarkHash as StarkHash>::Pair<F>;
+
+    for (a, b) in [(0u64, 1u64), (7, 7), (u64::MAX - 1, 12345)] {
+        let (x, y) = (Felt::from(a), Felt::from(b));
+        assert_eq!(
+            <Batched as IsMerkleTreeBackend>::hash_data(&vec![x, y]),
+            <Pair as IsMerkleTreeBackend>::hash_data(&[x, y]),
+            "Batched and Pair must hash the pair ({a}, {b}) identically"
+        );
+    }
+}
+
+/// ★ The same invariant for the BLAKE3 configuration.
+///
+/// Under `Blake3StarkHash` it holds by construction rather than by coincidence:
+/// both families are the same generic backend over `Blake3Chain`, and a
+/// two-element leaf is 16 bytes, one block, one compression. This is here
+/// because "holds by construction" is an argument about today's code, and the
+/// invariant has to survive tomorrow's.
+#[cfg(not(feature = "cuda"))]
+#[test]
+fn blake3_batched_and_pair_agree_on_a_two_element_leaf() {
+    use crate::config::{Blake3StarkHash, StarkHash};
+    use crypto::merkle_tree::traits::IsMerkleTreeBackend;
+
+    type Batched = <Blake3StarkHash as StarkHash>::Batched<F>;
+    type Pair = <Blake3StarkHash as StarkHash>::Pair<F>;
+
+    for (a, b) in [(0u64, 1u64), (7, 7), (u64::MAX - 1, 12345)] {
+        let (x, y) = (Felt::from(a), Felt::from(b));
+        assert_eq!(
+            <Batched as IsMerkleTreeBackend>::hash_data(&vec![x, y]),
+            <Pair as IsMerkleTreeBackend>::hash_data(&[x, y]),
+            "Batched and Pair must hash the pair ({a}, {b}) identically"
+        );
+    }
+}
+
+/// The two configurations are actually different hashes.
+///
+/// Without this, every BLAKE3 test in this file would pass just as well if the
+/// blake3 aliases had been left pointing at the keccak backends — which is a
+/// realistic way for a type alias change to be wrong, and one that nothing else
+/// here would notice.
+#[cfg(not(feature = "cuda"))]
+#[test]
+fn the_blake3_and_keccak_configurations_commit_differently() {
+    use crate::config::{Blake3StarkHash, KeccakStarkHash, StarkHash};
+    use crypto::merkle_tree::traits::IsMerkleTreeBackend;
+
+    let leaf: Vec<Felt> = (0..5u64).map(Felt::from).collect();
+    assert_ne!(
+        <<Blake3StarkHash as StarkHash>::Batched<F> as IsMerkleTreeBackend>::hash_data(&leaf),
+        <<KeccakStarkHash as StarkHash>::Batched<F> as IsMerkleTreeBackend>::hash_data(&leaf),
+    );
+}
+
+/// A commit → open → verify round trip over the BLAKE3 configuration, through
+/// the production commitment path.
+///
+/// `commit_bit_reversed_with` is the entry point the prover's main trace commit
+/// uses, and it is already backend-generic, so this exercises the real leaf
+/// serialization (bit-reversed, row-grouped, big-endian) and the real tree
+/// construction — not a hand-rolled tree over the backend.
+///
+/// # What this does and does not establish
+///
+/// It is a **same-reference** check: this build's prover and this build's
+/// verifier agree, over the commitment layer. It makes no cross-version claim.
+/// It is also deliberately narrow — the commitment layer alone, isolated from
+/// FRI, the transcript and the AIR. The full prove→verify under this
+/// configuration lives in `tests::blake3_stark_roundtrip_tests`; when both fail
+/// together the fault is here, and this test says where.
+#[cfg(not(feature = "cuda"))]
+#[test]
+fn blake3_commitments_open_and_verify() {
+    use crate::commitment::{commit_bit_reversed_with, leaves_bit_reversed_grouped};
+    use crate::config::{Blake3StarkHash, StarkHash};
+    use crypto::merkle_tree::merkle::MerkleTree;
+    use crypto::merkle_tree::proof::verify_merkle_path_from_leaf_hash;
+
+    type Batched = <Blake3StarkHash as StarkHash>::Batched<F>;
+
+    let columns: Vec<Vec<Felt>> = (0..4u64)
+        .map(|c| (0..16u64).map(|r| Felt::from(1000 * c + r + 1)).collect())
+        .collect();
+
+    let (tree, root) =
+        commit_bit_reversed_with::<F, Batched>(&columns, ROWS_PER_LEAF).expect("commit");
+    let leaves = leaves_bit_reversed_grouped::<F, Batched>(&columns, ROWS_PER_LEAF);
+    assert_eq!(root, tree.root);
+    assert_eq!(leaves.len(), 16 / ROWS_PER_LEAF);
+
+    for (i, leaf) in leaves.iter().enumerate() {
+        let proof = tree
+            .get_proof_by_pos(i)
+            .expect("proof for an in-range leaf");
+        assert!(
+            verify_merkle_path_from_leaf_hash::<Batched>(&proof.merkle_path, &root, i, *leaf),
+            "the honest opening of leaf {i} must verify"
+        );
+
+        // NEGATIVE CONTROL: the same path must not authenticate a different
+        // leaf, or "verify" above would be measuring nothing.
+        let other = leaves[(i + 1) % leaves.len()];
+        assert!(
+            !verify_merkle_path_from_leaf_hash::<Batched>(&proof.merkle_path, &root, i, other),
+            "a path must not authenticate a leaf it is not for, at {i}"
+        );
+    }
+
+    // And the root is the tree the leaves make, built independently.
+    let rebuilt = MerkleTree::<Batched>::build_from_hashed_leaves(leaves).expect("rebuild");
+    assert_eq!(rebuilt.root, root);
+}
+
+/// The streaming routes and the owned-`Data` route are the same leaf.
+#[test]
+fn streaming_leaf_routes_match_hash_data() {
+    use crate::config::{KeccakStarkHash, StarkHash};
+    use crypto::merkle_tree::traits::{IsMerkleTreeBackend, IsStreamingLeafBackend};
+
+    type Batched = <KeccakStarkHash as StarkHash>::Batched<F>;
+
+    let row: Vec<Felt> = (0..5u64).map(Felt::from).collect();
+    let (left, right) = row.split_at(2);
+
+    let owned = <Batched as IsMerkleTreeBackend>::hash_data(&row);
+    assert_eq!(
+        owned,
+        <Batched as IsStreamingLeafBackend<F>>::hash_data_from_slices(left, right),
+        "hash_data_from_slices must equal hash_data on the concatenation"
+    );
+
+    let mut buf = Vec::new();
+    for e in &row {
+        let mut b = [0u8; 8];
+        e.write_bytes_be(&mut b);
+        buf.extend_from_slice(&b);
+    }
+    assert_eq!(
+        owned,
+        <Batched as IsStreamingLeafBackend<F>>::hash_bytes(&buf),
+        "hash_bytes must equal hash_data on the elements those bytes encode"
+    );
+}

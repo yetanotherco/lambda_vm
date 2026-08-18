@@ -1,9 +1,12 @@
 pub mod air_tests;
 pub mod aux_opening_width_tests;
+pub mod batched_mmcs_soundness_tests;
+pub mod blake3_stark_roundtrip_tests;
 #[cfg(feature = "debug-checks")]
 pub mod bus_debug_tests;
 pub mod bus_tests;
 pub mod commitment_tests;
+pub mod constraint_index_tests;
 pub mod domain_cache_stats;
 pub mod fri_tests;
 pub mod grinding_tests;
@@ -11,6 +14,7 @@ pub mod opening_width_tests;
 pub mod proof_options_tests;
 pub mod prove_verify_roundtrip_tests;
 pub mod prover_tests;
+pub mod residency_mode_tests;
 pub mod row_pair_opening_tests;
 pub mod small_trace_tests;
 #[cfg(feature = "disk-spill")]

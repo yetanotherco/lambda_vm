@@ -838,6 +838,14 @@ pub struct AirWithBuses<
     /// program (16-25K nodes on the big tables) per epoch/shard instance.
     constraint_program:
         std::sync::OnceLock<std::sync::Arc<crate::constraint_ir::ConstraintProgram<F, E>>>,
+    /// A build-time program supplied via [`Self::with_precaptured`], if any.
+    ///
+    /// Kept separate from `constraint_program` rather than pre-filling that
+    /// `OnceLock`: `precaptured_constraint_program()` must answer "was one
+    /// SUPPLIED", not "has one been materialized by any means". Sharing the
+    /// cell would make a capture triggered by an earlier prover call look like
+    /// a build-time artifact.
+    precaptured_program: Option<crate::constraint_ir::ConstraintProgram<F, E>>,
     auxiliary_trace_build_data: AuxiliaryTraceBuildData,
     boundary_constraint_builder: PhantomData<(B, PI)>,
     /// Commitment to precomputed columns (if this is a preprocessed table)
@@ -874,6 +882,7 @@ impl<
             meta: self.meta.clone(),
             num_base: self.num_base,
             constraint_program: self.constraint_program.clone(),
+            precaptured_program: self.precaptured_program.clone(),
             auxiliary_trace_build_data: self.auxiliary_trace_build_data.clone(),
             boundary_constraint_builder: PhantomData,
             preprocessed_commitment: self.preprocessed_commitment,
@@ -960,6 +969,7 @@ impl<
             meta,
             num_base,
             constraint_program: std::sync::OnceLock::new(),
+            precaptured_program: None,
             auxiliary_trace_build_data,
             boundary_constraint_builder: PhantomData,
             preprocessed_commitment: None,
@@ -992,6 +1002,43 @@ impl<
     ) -> Self {
         self.preprocessed_commitment = Some(commitment);
         self.num_precomputed_cols = Some(num_precomputed_cols);
+        self
+    }
+
+    /// Supply a constraint program captured at BUILD time, so this AIR never
+    /// has to capture one.
+    ///
+    /// This is the guest-safe half of the constraint-program story: with a
+    /// program supplied, both [`AIR::constraint_program`] and
+    /// [`AIR::precaptured_constraint_program`] hand it back without running the
+    /// hash-consing capture, which is what makes a constraint program usable on
+    /// a verify/recursion path at all.
+    ///
+    /// The caller is responsible for the program actually being this AIR's.
+    /// [`ConstraintArtifact::validate_against`] rejects the shape-level
+    /// mismatches (wrong table, stale widths, changed exemptions); it cannot
+    /// detect an edit that changes a constraint's arithmetic without changing
+    /// any shape, which is what the build-time drift test is for.
+    ///
+    /// [`ConstraintArtifact::validate_against`]:
+    ///     crate::constraint_ir::ConstraintArtifact::validate_against
+    pub fn with_precaptured(
+        mut self,
+        program: crate::constraint_ir::ConstraintProgram<F, E>,
+    ) -> Self {
+        assert_eq!(
+            program.roots.len(),
+            self.meta.len(),
+            "pre-captured program has {} roots but this AIR has {} transition constraints",
+            program.roots.len(),
+            self.meta.len()
+        );
+        assert_eq!(
+            program.num_base, self.num_base,
+            "pre-captured program declares num_base {} but this AIR has {}",
+            program.num_base, self.num_base
+        );
+        self.precaptured_program = Some(program);
         self
     }
 
@@ -1124,9 +1171,15 @@ where
     fn constraint_program(
         &self,
     ) -> &crate::constraint_ir::ConstraintProgram<Self::Field, Self::FieldExtension> {
-        // Lazily captured once (prover/GPU/tests only — the verify path never
-        // calls this). Runs the table set AND the LogUp emission through one
-        // CaptureBuilder, matching the folder emission order/indexing exactly.
+        // A build-time program, if one was supplied, short-circuits capture
+        // entirely.
+        if let Some(prog) = &self.precaptured_program {
+            return prog;
+        }
+        // Otherwise lazily captured once (prover/GPU/tests only — the verify
+        // path never calls this). Runs the table set AND the LogUp emission
+        // through one CaptureBuilder, matching the folder emission
+        // order/indexing exactly.
         self.constraint_program
             .get_or_init(|| {
                 let mut cb = crate::constraints::builder::CaptureBuilder::<F, E>::new();
@@ -1136,6 +1189,14 @@ where
                 std::sync::Arc::new(prog)
             })
             .as_ref()
+    }
+
+    fn precaptured_constraint_program(
+        &self,
+    ) -> Option<&crate::constraint_ir::ConstraintProgram<Self::Field, Self::FieldExtension>> {
+        // Deliberately NOT `constraint_program.get()`: only a program supplied
+        // at build time counts, never one a prover run happened to capture.
+        self.precaptured_program.as_ref()
     }
 
     fn build_auxiliary_trace(

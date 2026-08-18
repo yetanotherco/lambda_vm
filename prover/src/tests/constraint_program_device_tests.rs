@@ -155,31 +155,14 @@ fn check_air_device(
 #[test]
 fn all_table_programs_lower_and_match_folders() {
     let opts = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
+    let airs = production_airs(&opts);
+    assert_eq!(
+        airs.len(),
+        NUM_PRODUCTION_AIRS,
+        "production AIR list changed size"
+    );
 
-    check_air_device(&create_cpu_air(&opts), "CPU");
-    check_air_device(&create_bitwise_air(&opts), "BITWISE");
-    check_air_device(&create_lt_air(&opts), "LT");
-    check_air_device(&create_shift_air(&opts), "SHIFT");
-    check_air_device(&create_eq_air(&opts), "EQ");
-    check_air_device(&create_bytewise_air(&opts), "BYTEWISE");
-    check_air_device(&create_store_air(&opts), "STORE");
-    check_air_device(&create_cpu32_air(&opts), "CPU32");
-    check_air_device(&create_memw_air(&opts), "MEMW");
-    check_air_device(&create_memw_aligned_air(&opts), "MEMW_A");
-    check_air_device(&create_memw_register_air(&opts), "MEMW_R");
-    check_air_device(&create_load_air(&opts), "LOAD");
-    check_air_device(&create_decode_air(&opts), "DECODE");
-    check_air_device(&create_mul_air(&opts), "MUL");
-    check_air_device(&create_dvrm_air(&opts), "DVRM");
-    check_air_device(&create_branch_air(&opts), "BRANCH");
-    check_air_device(&create_halt_air(&opts), "HALT");
-    check_air_device(&create_commit_air(&opts), "COMMIT");
-    check_air_device(&create_page_air(&opts, 0x1000), "PAGE");
-    check_air_device(&create_register_air(&opts), "REGISTER");
-    check_air_device(&create_keccak_air(&opts), "KECCAK");
-    check_air_device(&create_keccak_rnd_air(&opts), "KECCAK_RND");
-    check_air_device(&create_keccak_rc_air(&opts), "KECCAK_RC");
-    check_air_device(&create_ecsm_air(&opts), "ECSM");
-    check_air_device(&create_ecdas_air(&opts), "ECDAS");
-    check_air_device(&create_hint_air(&opts), "HINT");
+    for (label, air) in &airs {
+        check_air_device(&**air, label);
+    }
 }

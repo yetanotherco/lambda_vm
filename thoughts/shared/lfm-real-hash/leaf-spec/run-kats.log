@@ -1,0 +1,13 @@
+==========================================================================
+LFML LEAF-MODE KATs (option C, ratified)
+==========================================================================
+  [PASS] L1 PASS: 5 leaf rows, word route == byte route
+  [PASS] L6 PASS: 8-felt leaf = 3 compresses (2 LFML + 1 LFMC) @7r
+  [PASS] L1 PASS: 5 leaf rows, word route == byte route
+  [PASS] L6 PASS: 8-felt leaf = 3 compresses (2 LFML + 1 LFMC) @6r
+  [PASS] L2 PASS: 6 boundary felts round-trip
+  [PASS] L3 PASS: 3 non-canonical inputs rejected, not reduced
+  [PASS] L4 PASS: predicate == (v < p) on 300007 cases including every boundary
+  [PASS] L5 PASS: LFML / LFMC / LFMT are pairwise distinct on the same eight lanes
+--------------------------------------------------------------------------
+LFML LEAF KATs: PASS

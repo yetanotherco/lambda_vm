@@ -155,7 +155,10 @@ pub(crate) fn absorb_statement_with_digest(
 
 /// Continuation domain tags. Distinct from the monolithic `DOMAIN_TAG` so a
 /// monolithic proof and a continuation proof can never share a transcript prefix.
-const CONTINUATION_EPOCH_TAG: &[u8] = b"LAMBDAVM_CONTINUATION_EPOCH_V2";
+/// `pub(crate)` so the LFM statement replay emits the identical tag instead of
+/// duplicating the literal: a second copy would drift silently on a version
+/// bump, and the tag existing at all depends on both sides agreeing on it.
+pub(crate) const CONTINUATION_EPOCH_TAG: &[u8] = b"LAMBDAVM_CONTINUATION_EPOCH_V2";
 const CONTINUATION_GLOBAL_TAG: &[u8] = b"LAMBDAVM_CONTINUATION_GLOBAL_V2";
 
 /// Statement bound into the cross-epoch **global** proof's transcript before

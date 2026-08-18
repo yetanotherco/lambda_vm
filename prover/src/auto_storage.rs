@@ -228,6 +228,23 @@ pub fn decide(lengths: &TableLengths, blowup_factor: u8) -> StorageMode {
     mode
 }
 
+/// The LFM wrap's `StorageMode`: `Disk` when `FORCE_DISK_SPILL` is set, else
+/// `Ram`.
+///
+/// There is deliberately no estimate here. [`decide`]'s is keyed off the RV64
+/// executor's [`TableLengths`], and the wrap has no analogue of one — its table
+/// set is program shape, fixed before execution, and its dominant family
+/// (`KECCAK_RND`, one table per chunk) has a column profile the model was never
+/// calibrated against. Guessing a mode from it would decide the wrap's storage
+/// on an uncalibrated number; the explicit knob decides it on the operator's.
+pub fn decide_lfm() -> StorageMode {
+    if std::env::var("FORCE_DISK_SPILL").is_ok() {
+        log::info!("lfm storage_mode: Disk (forced via FORCE_DISK_SPILL)");
+        return StorageMode::Disk;
+    }
+    StorageMode::Ram
+}
+
 /// Peak RAM estimate in bytes for a proof whose trace shape matches `lengths`.
 ///
 /// `table_parallelism` is how many tables' rounds 2-4 transients this assumes

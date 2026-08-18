@@ -143,7 +143,7 @@ fn global_transcript(
 /// The L2G epoch-local table's single transition constraint: `MU ∈ {0,1}`
 /// (`MU·(1−MU) = 0`) at constraint index 0.
 #[derive(Clone, Copy)]
-struct L2gMemoryConstraints;
+pub(crate) struct L2gMemoryConstraints;
 
 impl ConstraintSet<F, E> for L2gMemoryConstraints {
     fn eval<B: ConstraintBuilder<F, E>>(&self, b: &mut B) {
@@ -163,7 +163,7 @@ impl ConstraintSet<F, E> for L2gMemoryConstraints {
 /// committed trace (equal Merkle roots). So under collision resistance the trace the
 /// global bus runs over already satisfies all those constraints — do not add them
 /// here (it would be redundant, not a missing check).
-fn l2g_global_air(
+pub(crate) fn l2g_global_air(
     opts: &ProofOptions,
     epoch_label: u64,
 ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), EmptyConstraints> {
@@ -184,7 +184,7 @@ fn l2g_global_air(
 /// check too: this proof has the BITWISE provider, and the global proof commits
 /// the identical trace (the commitment binding compares roots), so checking here
 /// covers both. `epoch_label` is the `fini_epoch` constant used by both.
-fn l2g_memory_air(
+pub(crate) fn l2g_memory_air(
     opts: &ProofOptions,
     epoch_label: u64,
 ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), L2gMemoryConstraints> {
@@ -223,7 +223,7 @@ fn l2g_memory_air(
 /// genesis commitment from `config.init_values` — the recursion guest's
 /// supplied roots skip the in-VM FFT + Merkle build (see `verify_global`).
 /// `None` recomputes from `config` as before.
-fn global_memory_air(
+pub(crate) fn global_memory_air(
     opts: &ProofOptions,
     config: &PageConfig,
     preprocessed: Option<Commitment>,
@@ -492,6 +492,55 @@ impl ContinuationProof {
     }
 }
 
+/// Zero-copy readers over an ARCHIVED bundle, for the LFM arena filler.
+///
+/// Deliberately on the archived type only. The recursion guest never holds a
+/// `ContinuationProof` — it reads a blob from private input and verifies in
+/// place ([`verify_continuation_archived`]) — so these expose a path production
+/// actually traverses. The equivalent on the owned type would expose a structure
+/// the real recursion path never sees, which is a weaker proposition.
+///
+/// Methods rather than relaxed field visibility because rkyv mirrors the source
+/// field's visibility onto the archived struct: opening `epochs` would open the
+/// owned type at the same time.
+impl ArchivedContinuationProof {
+    pub(crate) fn num_epochs(&self) -> usize {
+        self.epochs.len()
+    }
+
+    /// Epoch `i`'s STARK proof (its tables, epoch-local L2G sub-table last), as
+    /// the same view the verifier reads in place.
+    pub(crate) fn epoch_proof(&self, i: usize) -> MultiProofView<'_, F, E, ()> {
+        MultiProofView::Archived(&self.epochs[i].proof)
+    }
+
+    /// Bytes epoch `i` committed.
+    pub(crate) fn epoch_public_output(&self, i: usize) -> &[u8] {
+        self.epochs[i].public_output.as_slice()
+    }
+
+    /// Epoch `i`'s own committed L2G table root — the left-hand side of the
+    /// cross-epoch binding [`crate::verify_l2g_commitment_binding_view`] checks
+    /// against the global proof's `i`-th sub-proof.
+    pub(crate) fn epoch_l2g_root(&self, i: usize) -> Commitment {
+        self.epochs[i].l2g_root
+    }
+
+    /// Epoch `i`'s final register file `R_{i+1}`, the vector
+    /// [`build_epoch_airs`] preprocesses as FINI and the chaining loop carries
+    /// forward as epoch `i+1`'s INIT.
+    pub(crate) fn epoch_reg_fini(&self, i: usize) -> Result<Vec<u32>, Error> {
+        EpochProofView::Archived(&self.epochs[i]).reg_fini()
+    }
+
+    /// The one cross-epoch global-memory proof, as the same view the verifier
+    /// reads in place. Its first `num_epochs()` sub-proofs are the per-epoch L2G
+    /// tables the binding ties to.
+    pub(crate) fn global_proof(&self) -> MultiProofView<'_, F, E, ()> {
+        MultiProofView::Archived(&self.global)
+    }
+}
+
 /// Borrowed view over an [`EpochProof`] (owned or archived-in-place). Lets
 /// `verify_epoch` take a single argument again instead of the field-by-field
 /// parameter list the owned/archived split used to force on every caller:
@@ -744,6 +793,7 @@ fn prove_epoch(
         &mut seed(),
         #[cfg(feature = "disk-spill")]
         stark::storage_mode::StorageMode::Ram,
+        stark::residency_mode::ResidencyMode::Retain,
     )
     .map_err(|e| Error::Prover(format!("{e:?}")))?;
 
@@ -941,6 +991,7 @@ fn prove_global(
         ),
         #[cfg(feature = "disk-spill")]
         stark::storage_mode::StorageMode::Ram,
+        stark::residency_mode::ResidencyMode::Retain,
     )
     .map_err(|e| Error::Prover(format!("{e:?}")))
 }

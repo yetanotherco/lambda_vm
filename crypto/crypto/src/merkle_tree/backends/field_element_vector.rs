@@ -1,7 +1,7 @@
 use core::marker::PhantomData;
 
 use crate::hash::poseidon::Poseidon;
-use crate::merkle_tree::traits::IsMerkleTreeBackend;
+use crate::merkle_tree::traits::{IsMerkleTreeBackend, IsStreamingLeafBackend};
 use alloc::vec::Vec;
 use digest::{Digest, Output};
 use math::{
@@ -199,6 +199,31 @@ where
 
     fn hash_new_parent(left: &[u8; NUM_BYTES], right: &[u8; NUM_BYTES]) -> [u8; NUM_BYTES] {
         hash_new_parent_bytes::<D, NUM_BYTES>(left, right)
+    }
+}
+
+/// Exposes the streaming leaf routes to callers that reach this backend through
+/// a commitment configuration rather than by name. Both bodies go through
+/// [`hash_streamed`], which is where the absorbed byte layout is defined, so
+/// they agree with `hash_data` by construction.
+impl<F, D: Digest + 'static, const NUM_BYTES: usize> IsStreamingLeafBackend<F>
+    for FieldElementVectorBackend<F, D, NUM_BYTES>
+where
+    F: IsField,
+    FieldElement<F>: AsBytes,
+    [u8; NUM_BYTES]: From<Output<D>>,
+    Vec<FieldElement<F>>: Sync + Send,
+{
+    fn hash_bytes(data: &[u8]) -> [u8; NUM_BYTES] {
+        hash_streamed::<D, NUM_BYTES>(|sink| sink(data))
+    }
+
+    fn hash_data_from_slices(a: &[FieldElement<F>], b: &[FieldElement<F>]) -> [u8; NUM_BYTES] {
+        hash_streamed::<D, NUM_BYTES>(|sink| {
+            for element in a.iter().chain(b.iter()) {
+                element.stream_bytes(sink);
+            }
+        })
     }
 }
 

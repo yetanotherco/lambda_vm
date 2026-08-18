@@ -33,6 +33,9 @@ use math::traits::{AsBytes, ByteConversion};
 #[cfg(feature = "parallel")]
 use rayon::prelude::{IntoParallelIterator, ParallelIterator};
 
+use crypto::merkle_tree::merkle::MerkleTree;
+use crypto::merkle_tree::traits::IsStreamingLeafBackend;
+
 use crate::config::{BatchedMerkleTree, BatchedMerkleTreeBackend, Commitment};
 
 /// Number of consecutive (bit-reversed) rows packed into one Merkle leaf for the
@@ -49,12 +52,13 @@ pub const ROWS_PER_LEAF: usize = 2;
 /// exact leaf byte layout. This is the single code path behind both the per-row
 /// ([`keccak_leaves_bit_reversed`]) and per-row-pair
 /// ([`keccak_leaves_row_pair_bit_reversed`]) commitments.
-pub fn keccak_leaves_bit_reversed_grouped<E>(
+pub fn leaves_bit_reversed_grouped<E, B>(
     columns: &[Vec<FieldElement<E>>],
     rows_per_leaf: usize,
 ) -> Vec<Commitment>
 where
     E: IsField,
+    B: IsStreamingLeafBackend<E, Node = Commitment>,
     FieldElement<E>: AsBytes + Sync + Send + ByteConversion,
 {
     if columns.is_empty() || columns[0].is_empty() {
@@ -87,7 +91,7 @@ where
                 offset += byte_len;
             }
         }
-        BatchedMerkleTreeBackend::<E>::hash_bytes(buf)
+        <B as IsStreamingLeafBackend<E>>::hash_bytes(buf)
     };
 
     // Per-thread buffer reuse (map_init) avoids millions of small allocations.
@@ -106,6 +110,19 @@ where
     result
 }
 
+/// [`leaves_bit_reversed_grouped`] at the keccak backend — the production leaf
+/// hash, and the one the CUDA kernels and their parity tests mirror.
+pub fn keccak_leaves_bit_reversed_grouped<E>(
+    columns: &[Vec<FieldElement<E>>],
+    rows_per_leaf: usize,
+) -> Vec<Commitment>
+where
+    E: IsField,
+    FieldElement<E>: AsBytes + Sync + Send + ByteConversion,
+{
+    leaves_bit_reversed_grouped::<E, BatchedMerkleTreeBackend<E>>(columns, rows_per_leaf)
+}
+
 /// Per-row Keccak-256 leaf hashes (one leaf per bit-reversed row). Thin wrapper
 /// over [`keccak_leaves_bit_reversed_grouped`] with `rows_per_leaf = 1`.
 ///
@@ -117,7 +134,7 @@ where
     E: IsField,
     FieldElement<E>: AsBytes + Sync + Send + ByteConversion,
 {
-    keccak_leaves_bit_reversed_grouped(columns, 1)
+    leaves_bit_reversed_grouped::<E, BatchedMerkleTreeBackend<E>>(columns, 1)
 }
 
 /// Per-row-pair Keccak-256 leaf hashes (leaf `i` hashes bit-reversed rows `2i`,
@@ -128,7 +145,7 @@ where
     E: IsField,
     FieldElement<E>: AsBytes + Sync + Send + ByteConversion,
 {
-    keccak_leaves_bit_reversed_grouped(parts, 2)
+    leaves_bit_reversed_grouped::<E, BatchedMerkleTreeBackend<E>>(parts, 2)
 }
 
 /// Builds the Merkle tree committing to `columns`' bit-reversed, column-major LDE
@@ -145,11 +162,29 @@ where
     E: IsField,
     FieldElement<E>: AsBytes + Sync + Send + ByteConversion,
 {
+    commit_bit_reversed_with::<E, BatchedMerkleTreeBackend<E>>(columns, rows_per_leaf)
+}
+
+/// [`commit_bit_reversed`] under an explicit leaf backend.
+///
+/// The backend is a parameter rather than the fixed alias because the prover is
+/// generic over its commitment configuration; `commit_bit_reversed` is this
+/// function at the keccak backend, and is what every caller that commits a
+/// fixed production table still uses.
+pub fn commit_bit_reversed_with<E, B>(
+    columns: &[Vec<FieldElement<E>>],
+    rows_per_leaf: usize,
+) -> Option<(MerkleTree<B>, Commitment)>
+where
+    E: IsField,
+    B: IsStreamingLeafBackend<E, Node = Commitment>,
+    FieldElement<E>: AsBytes + Sync + Send + ByteConversion,
+{
     if columns.is_empty() || columns[0].is_empty() {
         return None;
     }
-    let hashed_leaves = keccak_leaves_bit_reversed_grouped(columns, rows_per_leaf);
-    let tree = BatchedMerkleTree::<E>::build_from_hashed_leaves(hashed_leaves)?;
+    let hashed_leaves = leaves_bit_reversed_grouped::<E, B>(columns, rows_per_leaf);
+    let tree = MerkleTree::<B>::build_from_hashed_leaves(hashed_leaves)?;
     let root = tree.root;
     Some((tree, root))
 }

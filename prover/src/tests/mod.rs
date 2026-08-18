@@ -15,6 +15,8 @@ pub mod commit_tests;
 #[cfg(test)]
 pub mod compute_commit_bus_offset_tests;
 #[cfg(test)]
+pub mod constraint_artifact_tests;
+#[cfg(test)]
 pub mod constraint_emit_tests;
 #[cfg(test)]
 pub mod constraint_program_device_tests;
