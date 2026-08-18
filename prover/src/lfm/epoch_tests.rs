@@ -163,7 +163,7 @@ struct Arenas {
 /// hardcoded precomputed commitment when the AIR is preprocessed, the main
 /// root, then the shared LogUp challenges. The fork follows, then rounds 2-4.
 fn challenge_program(h: &HostTable) -> LfmProgram {
-    let mut b = LfmBuilder::new();
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
     let shape = &h.shape;
 
     let a = Arenas {
@@ -387,7 +387,7 @@ fn the_z_guard_rejects_a_point_in_either_domain() {
     };
 
     let program = {
-        let mut b = LfmBuilder::new();
+        let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
         let a = b.declare_arena(1);
         let z = b.hint_word(a, 0).as_ext();
         super::epoch::assert_z_outside_domains(&mut b, z, &shape);
@@ -711,7 +711,6 @@ pub(super) fn real_epoch_with(opts: crate::ProofOptions) -> RealEpoch {
 pub(super) fn real_epoch_from(opts: crate::ProofOptions, inputs: EpochInputs) -> RealEpoch {
     use crate::tables::trace_builder::{Traces, build_initial_image_paged};
     use crate::tables::{MaxRowsConfig, bitwise, local_to_global, register};
-    use crypto::fiat_shamir::default_transcript::DefaultTranscript;
     use crypto::fiat_shamir::is_transcript::IsTranscript;
     use executor::elf::Elf;
     use executor::vm::execution::Executor;
@@ -791,7 +790,7 @@ pub(super) fn real_epoch_from(opts: crate::ProofOptions, inputs: EpochInputs) ->
     let mut l2g_trace = local_to_global::generate_local_to_global_trace(&boundary);
 
     let seed = || {
-        let mut t = DefaultTranscript::<Ext3>::new(&[]);
+        let mut t = stark::config::DefaultStarkTranscript::<Ext3>::new(&[]);
         crate::statement::absorb_statement(
             &mut t,
             crate::statement::StatementKind::ContinuationEpoch { epoch_label: label },
@@ -972,7 +971,7 @@ fn host_table_forked(
     view: StarkProofView<'_, Gl, Ext3, ()>,
     index: usize,
     num_tables: usize,
-    fork: &mut crypto::fiat_shamir::default_transcript::DefaultTranscript<Ext3>,
+    fork: &mut stark::config::DefaultStarkTranscript<Ext3>,
     lookup_challenges: &[FEE],
 ) -> HostTable {
     use stark::domain::new_verifier_domain;
@@ -1097,7 +1096,7 @@ pub(super) fn epoch_program(e: &RealEpoch, with_legs: bool) -> LfmProgram {
 fn epoch_program_with(e: &RealEpoch, with_legs: bool, split_decode: bool) -> LfmProgram {
     use super::statement_replay::{EpochStatementVars, PhaseATable, absorb_epoch_statement};
 
-    let mut b = LfmBuilder::new();
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
     let n = e.tables.len();
     assert_eq!(e.legs.len(), n, "one leg reading per sub-proof");
 
@@ -2019,7 +2018,7 @@ fn the_derivation_binds_every_register_boundary_word() {
 fn the_register_boundary_is_width_checked() {
     // ---- (1) the check itself.
     let drive = |v: u64| {
-        let mut b = LfmBuilder::new();
+        let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
         let arena = b.declare_arena(1);
         let cell = b.hint_felt(arena, 0);
         super::epoch::assert_u32(&mut b, cell);

@@ -10,6 +10,8 @@ use math::{
 };
 
 #[cfg(target_arch = "riscv64")]
+use crate::hash::blake3::chain::{Blake3Chain, blake3_parent};
+#[cfg(target_arch = "riscv64")]
 use crate::hash::platform_keccak::PlatformKeccak256;
 #[cfg(target_arch = "riscv64")]
 use core::any::TypeId;
@@ -80,6 +82,28 @@ fn hash_new_parent_bytes<D: Digest + 'static, const NUM_BYTES: usize>(
         let l: &[u8; 32] = left[..].try_into().unwrap();
         let r: &[u8; 32] = right[..].try_into().unwrap();
         let hash = lambda_vm_syscalls::keccak::keccak256_pair(l, r);
+        let mut result = [0u8; NUM_BYTES];
+        result.copy_from_slice(&hash);
+        return result;
+    }
+
+    // The BLAKE3 twin of the branch above, and it is the same trade: a 64-byte
+    // parent is ONE compression (P2), so the sponge around it is pure plumbing.
+    // In-guest that plumbing measured ~55% of a 64-byte hash — ~556 cycles for
+    // ~248 of compression — and a Merkle parent is the shape every FRI query
+    // path step is made of.
+    //
+    // Keyed on the CONCRETE digest, exactly like keccak's: `Blake3Chain` is the
+    // type `BatchBlake3Backend`/`PairBlake3Backend` instantiate, so no other
+    // digest can fall into this branch. `blake3_parent` goes through
+    // `chain.rs`'s single `compress_block` dispatch, so this is the accelerator
+    // ecall on a guest that has it and the software path otherwise — one
+    // framing, not a second transcription.
+    #[cfg(target_arch = "riscv64")]
+    if NUM_BYTES == 32 && TypeId::of::<D>() == TypeId::of::<Blake3Chain>() {
+        let l: &[u8; 32] = left[..].try_into().unwrap();
+        let r: &[u8; 32] = right[..].try_into().unwrap();
+        let hash = blake3_parent(l, r);
         let mut result = [0u8; NUM_BYTES];
         result.copy_from_slice(&hash);
         return result;

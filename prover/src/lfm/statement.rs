@@ -1,9 +1,11 @@
 //! LFM program identity and statement binding.
 //!
 //! `lfm_program_id` binds the instruction column groups (roots + heights),
-//! the machine version and the preset — it is the digest the registry pins
-//! and the consumer's attestation folds. Keccak today; `_V2` rides the
-//! ecosystem hash migration (a host/consumer-side artifact).
+//! the machine version, the preset and the hash those roots were committed
+//! under — it is the digest the registry pins and the consumer's attestation
+//! folds. The digest FUNCTION here is keccak regardless of what the roots were
+//! committed with: it is a host-side program identity, not a commitment, and
+//! `_V2` rides the ecosystem hash migration.
 //!
 //! The statement absorb seeds the Fiat–Shamir transcript before
 //! `multi_prove` / `multi_verify_views`, exactly like the RV64 VM's
@@ -14,7 +16,7 @@ use crypto::fiat_shamir::is_transcript::IsTranscript;
 use crypto::hash::platform_keccak::PlatformKeccak256 as Keccak256;
 use digest::Digest;
 use math::field::traits::IsPrimeField;
-use stark::config::Commitment;
+use stark::config::{Commitment, CommitmentHash};
 
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 
@@ -31,6 +33,23 @@ pub const LFM_PRESET_TAG: u32 = 0;
 const LFM_PROGRAM_TAG: &[u8] = b"LAMBDAVM_LFM_PROGRAM_V1";
 const LFM_STATEMENT_TAG: &[u8] = b"LAMBDAVM_LFM_STATEMENT_V1";
 
+/// The byte that names a commitment hash inside [`lfm_program_id`].
+///
+/// Exhaustive on purpose, and that is the whole of what remains of the tripwire
+/// `build_artifacts_with_hasher` used to carry: a third commitment hash cannot
+/// be added without choosing a tag for it here, and choosing a tag is the act of
+/// deciding what program identity says about it. The old guard made that
+/// decision unskippable by refusing to compile; this makes it unskippable by
+/// having no default.
+///
+/// Tags are frozen. Changing one re-blesses every `LFM_REGISTRY` entry.
+const fn commitment_hash_tag(hash: CommitmentHash) -> u8 {
+    match hash {
+        CommitmentHash::Keccak256 => 0,
+        CommitmentHash::Blake3 => 1,
+    }
+}
+
 /// The program digest over the frozen chip order.
 ///
 /// `keccak_rnd_chunks` is bound alongside the roots and heights because it is
@@ -46,6 +65,24 @@ const LFM_STATEMENT_TAG: &[u8] = b"LAMBDAVM_LFM_STATEMENT_V1";
 /// tag the only thing separating one permutation's machine from another's would
 /// be a main-trace width coincidence, which a third candidate could collide
 /// with. The tag is what makes two hashers two programs.
+///
+/// ★ **The COMMITMENT hash is bound too, and it is a different axis from
+/// `hasher`.** `hasher` names the `LFM_HASH` chip the machine RUNS;
+/// [`commitment_hash_tag`] names the hash the `roots` above were BUILT with. The
+/// two were separate axes with only the first one named, which is what
+/// `build_artifacts_with_hasher`'s guard existed to force a decision about. The
+/// decision is here: a build committing under a different hash is a different
+/// program identity by name, not merely by value.
+///
+/// Binding it by value alone would not have been enough. The roots do move when
+/// the commitment hash moves, so the digest already changed — but "changed" and
+/// "says which" are different properties, and only the second one lets a
+/// mismatch be reported as *what it is* rather than as an unrecognised root.
+///
+/// It is read from the global rather than taken as a parameter because the three
+/// commit helpers in `registry.rs` are hard-wired to `stark`'s default aliases,
+/// which is exactly what `stark::config::COMMITMENT_HASH` names. Should those
+/// helpers ever become generic over `H`, this read moves with them.
 pub fn lfm_program_id(
     roots: &[Commitment; NUM_LFM_CHIPS],
     log_heights: &[u8; NUM_LFM_CHIPS],
@@ -57,6 +94,7 @@ pub fn lfm_program_id(
     h.update(LFM_MACHINE_VERSION.to_le_bytes());
     h.update(LFM_PRESET_TAG.to_le_bytes());
     h.update([hasher.as_tag()]);
+    h.update([commitment_hash_tag(stark::config::COMMITMENT_HASH)]);
     for i in 0..NUM_LFM_CHIPS {
         h.update([i as u8]);
         h.update(roots[i]);

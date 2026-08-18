@@ -82,7 +82,7 @@ pub(super) fn folding_fixture(
         CellBoundary, FiniClaim, InitClaim, generate_local_to_global_trace,
     };
     use crate::test_utils::{EPOCH_TEST_LABEL, multi_prove_ram};
-    use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+    use stark::config::DefaultStarkTranscript;
 
     assert!(
         num_boundaries.is_power_of_two(),
@@ -115,7 +115,7 @@ pub(super) fn folding_fixture(
         _,
         _,
     )> = vec![(&air, &mut trace, &())];
-    let proof = multi_prove_ram(pairs, &mut DefaultTranscript::<Ext3>::new(&[]))
+    let proof = multi_prove_ram(pairs, &mut DefaultStarkTranscript::<Ext3>::new(&[]))
         .expect("the L2G_MEMORY fixture must prove at any power-of-two row count");
 
     (Box::new(air), proof)
@@ -284,7 +284,10 @@ fn the_fri_leaf_is_byte_identical_to_productions_own_backends() {
         (ext(9), FEE::new([component(12), component(13), FE::one()])),
     ];
 
-    let mut b = LfmBuilder::new();
+    // The wrap hash production commits under: this leg's whole claim is that
+    // the machine's leaf IS the verifier's leaf, and the verifier's backend
+    // follows the aliases.
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
     let arena = b.declare_arena(2);
     let v0 = b.hint_word(arena, 0);
     let v1 = b.hint_word(arena, 1);
@@ -343,7 +346,7 @@ fn the_fri_leaf_is_byte_identical_to_productions_own_backends() {
 /// Arena order: the per-query `(index, p₀, p₀ˢ)` block, then the four
 /// [`FriArenas`].
 fn fri_only_program(shape: FriShape, num_queries: usize) -> LfmProgram {
-    let mut b = LfmBuilder::new();
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
     let q = b.declare_arena(3 * num_queries as u32);
     let (arenas, fri) = declare_fri(&mut b, shape, num_queries);
     for i in 0..num_queries {
@@ -694,7 +697,7 @@ fn the_two_legs_verify_one_real_folding_proof_as_one_program() {
         ..h.shape
     };
 
-    let mut b = LfmBuilder::new();
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
     let (_, _, terminal) =
         super::fri::emit_sub_proof_with_fri(&mut b, &h.trace.shape, shape, queries.len());
     for v in &terminal {
@@ -727,11 +730,10 @@ fn the_two_legs_verify_one_real_folding_proof_as_one_program() {
 }
 
 fn permutations(program: &LfmProgram) -> usize {
-    program
-        .instrs
-        .iter()
-        .filter(|i| matches!(i, super::instr::Instr::KeccakF(_)))
-        .count()
+    // The CONFIGURED wrap hash's compressions. Filtering `KeccakF` here read
+    // zero the moment production moved to BLAKE3, turning a cost measurement
+    // into a failed assertion about a count nobody had re-derived.
+    super::machine_tests::wrap_hash_instrs(program)
 }
 
 fn count_matching<F: Fn(&super::instr::Instr) -> bool>(program: &LfmProgram, f: F) -> usize {
@@ -919,7 +921,7 @@ fn the_fri_join_adds_no_second_point_derivation() {
         |p: &LfmProgram| count_matching(p, |i| matches!(i, super::instr::Instr::BitDec { .. }));
 
     let emit = |n: usize| {
-        let mut b = LfmBuilder::new();
+        let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
         super::fri::emit_sub_proof_with_fri(
             &mut b,
             sub,
@@ -1189,7 +1191,7 @@ fn the_fri_leg_proves_and_verifies() {
         ..h.shape
     };
 
-    let mut b = LfmBuilder::new();
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
     let (_, _, terminal) =
         super::fri::emit_sub_proof_with_fri(&mut b, &h.trace.shape, shape, queries.len());
     for v in &terminal {

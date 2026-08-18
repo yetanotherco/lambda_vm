@@ -315,6 +315,7 @@ fn every_constraint_index_is_emitted_exactly_once() {
 #[test]
 fn the_chip_occupies_its_registered_slot() {
     use super::airs::{KECCAK_RND_SLOT, LFM_CHIP_NAMES, NUM_LFM_CHIPS};
+    use super::registry::LfmProgramKind;
     assert_eq!(NUM_LFM_CHIPS, 15, "the promotion is 14 -> 15");
     assert_eq!(LFM_CHIP_NAMES[11], "LFM_BLAKE3");
     assert_eq!(
@@ -324,12 +325,23 @@ fn the_chip_occupies_its_registered_slot() {
     assert_eq!(LFM_CHIP_NAMES[KECCAK_RND_SLOT], "KECCAK_RND");
     assert_eq!(LFM_CHIP_NAMES[13], "KECCAK_RC");
     assert_eq!(LFM_CHIP_NAMES[14], "BITWISE");
-    // Every registry entry carries a root and a height for the new slot.
+    // Every registry entry carries a root and a height for the new slot, and
+    // since the flip the heights SPLIT — which is the fixed-machine principle
+    // seen from both sides.
+    //
+    // A program that never compresses still commits the chip's empty group,
+    // padded to the 4-row minimum: the slot is machine shape, not program
+    // shape. A program that does compress is above that minimum, and the two
+    // that are above it are exactly the two the flip moved.
     for entry in super::registry::LFM_REGISTRY {
+        let expected = match entry.kind {
+            LfmProgramKind::TranscriptReplayV0 => 3,
+            LfmProgramKind::StatementReplayV0 => 4,
+            _ => 2,
+        };
         assert_eq!(
-            entry.log_heights[11], 2,
-            "{:?}: a program with no compression still commits the chip's empty \
-             group, padded to the 4-row minimum — the fixed-machine principle",
+            entry.log_heights[11], expected,
+            "{:?}: LFM_BLAKE3 slot height",
             entry.kind
         );
     }
@@ -818,10 +830,14 @@ fn keccak_still_proves_and_verifies_through_the_switched_emitters() {
     );
 }
 
-/// The default is keccak, everywhere, and nothing selects BLAKE3 by omission.
+/// `WrapHash::default()` is the UNSET value, not the production one.
 ///
-/// One line, and it is the statement the whole stage rests on: the chip and the
-/// emitters landed, the flip did not.
+/// Before the flip these two lines said "nothing selects BLAKE3 by omission".
+/// They still hold and they still matter, but the reason inverted: production
+/// is BLAKE3 now, and the default stayed keccak deliberately so that no
+/// constructor can acquire the production hash by saying nothing. Every
+/// `programs.rs` constructor that hashes names its hash; see that module's
+/// header for the two kinds of exception.
 #[test]
 fn the_default_wrap_hash_is_keccak() {
     assert_eq!(WrapHash::default(), WrapHash::Keccak);
@@ -1158,69 +1174,88 @@ fn the_select_chain_rule_is_the_hosts_fallback() {
 }
 
 /// ★ THE FLIP INVENTORY, pinned — which registered programs the Stage-6 flip
-/// moves, and which it must NOT.
+/// moved, and which it must NOT have.
 ///
 /// Review finding rev-emit E3: every `LfmProgramSource` constructor in
-/// `programs.rs` builds its own `LfmBuilder`, and only two of the twenty pass a
-/// hash. At the flip each production constructor is edited individually and
-/// nothing catches one left on the default — which composes with the
-/// undischarged `CommitmentHash` guard into the residual R-3 risk (a valid
-/// proof of the wrong digest). The full site list and the flip procedure live
-/// in PA-PLAN's Stage-6 section; this is the half that can go stale silently,
-/// so it is executable.
+/// `programs.rs` builds its own `LfmBuilder`, and before the flip only two of
+/// the twenty passed a hash. Each production constructor was edited
+/// individually, and this is what catches one left behind — a constructor still
+/// on keccak inside a machine everything else believes is BLAKE3 is a valid
+/// proof of the wrong digest (R-3), not a failure.
 ///
-/// The classification is MEASURED, not asserted: a program that emits no hash
-/// instruction at all is flip-inert whatever its constructor says, and a
-/// program that emits `KeccakF` either must flip or is deliberately pinned. The
-/// two categories are named per entry so adding a registered program forces the
+/// **The polarity is now post-flip**, which is the point: before the flip this
+/// test asserted `blake3 == 0` for every program, and that assertion passing
+/// today would mean the flip did not happen. The counts are MEASURED — a
+/// BLAKE3 count is not the keccak count it replaced, because a 136-byte sponge
+/// rate and a 64-byte compression block do not divide a message the same way.
+///
+/// The classification stays measured rather than asserted: a program that emits
+/// no hash instruction is flip-inert whatever its constructor says. The
+/// categories are named per entry so adding a registered program forces the
 /// question rather than inheriting an answer.
 #[test]
 fn the_flip_inventory_of_registered_programs_is_pinned() {
+    /// Compressions the flipped registered programs emit, MEASURED on the
+    /// flipped tree.
+    ///
+    /// These are not the keccak counts they replaced (6 and 5). `Blake3Chain`
+    /// takes a 64-byte block where the keccak sponge takes a 136-byte rate, so
+    /// the same message divides into more compressions — which is the in-machine
+    /// half of the cost the campaign priced, visible here as a row count.
+    const TRANSCRIPT_REPLAY_BLAKE3_ROWS: usize = 8;
+    const STATEMENT_REPLAY_BLAKE3_ROWS: usize = 9;
+
     use super::instr::Instr;
     use super::programs::{
         KECCAK_SPONGE_LEN, fri_toy_program, keccak_chain_program, keccak_sponge_program,
         statement_replay_program, transcript_replay_program, trivial_program,
     };
 
-    /// What the Stage-6 flip owes each registered program.
+    /// What the Stage-6 flip did to each registered program.
     #[derive(Debug, PartialEq, Eq)]
     enum Fate {
-        /// Emits no hash at all — the flip cannot move it.
+        /// Emits no hash at all — the flip could not move it.
         Inert,
-        /// Emits the wrap hash. Its constructor MUST take the flip.
-        MustFlip,
+        /// Emits the wrap hash, and its constructor took the flip. Emits BLAKE3
+        /// and no keccak.
+        Flipped,
         /// Emits keccak deliberately: an instrument that is ABOUT keccak, whose
         /// identity is pinned in `LFM_REGISTRY`. A BLAKE3 twin would be a new
         /// program and a new row, never a re-blessing of this one.
         PinnedKeccak,
     }
 
-    let cases: [(&str, super::compiler::LfmProgram, Fate, usize); 6] = [
-        ("TrivialV0", trivial_program(), Fate::Inert, 0),
-        ("FriToyV0", fri_toy_program(), Fate::Inert, 0),
+    // (name, program, fate, keccak rows, blake3 rows)
+    let cases: [(&str, super::compiler::LfmProgram, Fate, usize, usize); 6] = [
+        ("TrivialV0", trivial_program(), Fate::Inert, 0, 0),
+        ("FriToyV0", fri_toy_program(), Fate::Inert, 0, 0),
         (
             "KeccakChainV0",
             keccak_chain_program(),
             Fate::PinnedKeccak,
             2,
+            0,
         ),
         (
             "KeccakSpongeV0",
             keccak_sponge_program(KECCAK_SPONGE_LEN),
             Fate::PinnedKeccak,
             2,
+            0,
         ),
         (
             "TranscriptReplayV0",
             transcript_replay_program(),
-            Fate::MustFlip,
-            6,
+            Fate::Flipped,
+            0,
+            TRANSCRIPT_REPLAY_BLAKE3_ROWS,
         ),
         (
             "StatementReplayV0",
             statement_replay_program(),
-            Fate::MustFlip,
-            5,
+            Fate::Flipped,
+            0,
+            STATEMENT_REPLAY_BLAKE3_ROWS,
         ),
     ];
 
@@ -1231,7 +1266,7 @@ fn the_flip_inventory_of_registered_programs_is_pinned() {
          one is a program the flip would move or miss by accident"
     );
 
-    for (name, program, fate, keccak_rows) in &cases {
+    for (name, program, fate, keccak_rows, blake3_rows) in &cases {
         let keccak = program
             .instrs
             .iter()
@@ -1247,24 +1282,45 @@ fn the_flip_inventory_of_registered_programs_is_pinned() {
             "{name}: the emitted keccak count is what the fate below is a \
              judgement about"
         );
-        assert_eq!(blake3, 0, "{name}: nothing selects BLAKE3 before the flip");
+        assert_eq!(blake3, *blake3_rows, "{name}: emitted BLAKE3 count moved");
         match fate {
             Fate::Inert => assert_eq!(
-                keccak, 0,
-                "{name} is classified flip-inert but emits {keccak} hash rows"
+                keccak + blake3,
+                0,
+                "{name} is classified flip-inert but emits hash rows"
             ),
-            Fate::MustFlip | Fate::PinnedKeccak => assert!(
-                keccak > 0,
-                "{name} is classified as hashing but emits none — the fate is \
-                 wrong, or the program is"
-            ),
+            // The two halves are what make this an oracle for a missed
+            // constructor rather than a count: a site left behind shows up as
+            // keccak > 0, and a site that flipped but emits nothing shows up as
+            // blake3 == 0.
+            Fate::Flipped => {
+                assert_eq!(
+                    keccak, 0,
+                    "{name} must not emit keccak after the flip — its \
+                     constructor was left on the default"
+                );
+                assert!(
+                    blake3 > 0,
+                    "{name} is classified flipped but emits no BLAKE3"
+                );
+            }
+            Fate::PinnedKeccak => {
+                assert!(
+                    keccak > 0,
+                    "{name} is classified as hashing keccak but emits none"
+                );
+                assert_eq!(
+                    blake3, 0,
+                    "{name} is a keccak instrument and must not follow the flip"
+                );
+            }
         }
     }
 
     // NON-VACUITY: the classification must actually split the set, or "every
     // program has a fate" is satisfied by giving them all the same one.
     assert!(cases.iter().any(|c| c.2 == Fate::Inert));
-    assert!(cases.iter().any(|c| c.2 == Fate::MustFlip));
+    assert!(cases.iter().any(|c| c.2 == Fate::Flipped));
     assert!(cases.iter().any(|c| c.2 == Fate::PinnedKeccak));
 }
 

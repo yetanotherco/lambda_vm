@@ -50,11 +50,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use executor::elf::Elf;
 use executor::vm::execution::Executor;
 use math::field::element::FieldElement;
 use stark::config::Commitment;
+use stark::config::DefaultStarkTranscript;
 use stark::constraints::builder::{ConstraintBuilder, ConstraintSet, EmptyConstraints};
 use stark::lookup::{AirWithBuses, AuxiliaryTraceBuildData, NullBoundaryConstraintBuilder};
 use stark::proof::options::ProofOptions;
@@ -94,8 +94,8 @@ fn epoch_transcript(
     runtime_page_ranges: &[RuntimePageRange],
     epoch_label: u64,
     fri_final_poly_log_degree: u8,
-) -> DefaultTranscript<E> {
-    let mut transcript = DefaultTranscript::<E>::new(&[]);
+) -> DefaultStarkTranscript<E> {
+    let mut transcript = DefaultStarkTranscript::<E>::new(&[]);
     absorb_statement(
         &mut transcript,
         StatementKind::ContinuationEpoch { epoch_label },
@@ -119,8 +119,8 @@ fn global_transcript(
     num_private_input_pages: usize,
     fri_final_poly_log_degree: u8,
     touched_page_bases: &[u64],
-) -> DefaultTranscript<E> {
-    let mut transcript = DefaultTranscript::<E>::new(&[]);
+) -> DefaultStarkTranscript<E> {
+    let mut transcript = DefaultStarkTranscript::<E>::new(&[]);
     absorb_continuation_global_statement(
         &mut transcript,
         elf_bytes,

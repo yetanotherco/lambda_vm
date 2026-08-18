@@ -386,7 +386,7 @@ fn the_join_premises_hold_on_a_real_proof() {
     // bit weights here instead would only check a host formula against
     // production and leave the emitter unexamined — the same oracle mistake
     // the method rules warn about, one level up.
-    let mut b = LfmBuilder::new();
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
     let arena = b.declare_arena(1);
     let index = b.hint_felt(arena, 0);
     let bits = b.bit_dec(index, s.merkle_depth);
@@ -429,7 +429,7 @@ fn the_join_matches_the_production_verifier_on_every_query() {
     let h = host_sub_proof();
     let all: Vec<usize> = (0..h.iotas.len()).collect();
 
-    let mut b = LfmBuilder::new();
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
     let (_, outs) = emit_sub_proof(&mut b, &h.shape, all.len());
     for (p, s) in &outs {
         b.public(p.as_cell());
@@ -595,10 +595,10 @@ struct PerQuery {
 }
 
 fn marginal(shape: &SubProofShape) -> PerQuery {
-    let mut one = LfmBuilder::new();
+    let mut one = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
     emit_sub_proof(&mut one, shape, 1);
     let one = compile(one.finish());
-    let mut two = LfmBuilder::new();
+    let mut two = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
     emit_sub_proof(&mut two, shape, 2);
     let two = compile(two.finish());
     PerQuery {
@@ -648,16 +648,16 @@ fn deep_only_rows(shape: &SubProofShape) -> usize {
         (g, z, steps, parts, openings, points)
     };
 
-    let mut bare = LfmBuilder::new();
+    let mut bare = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
     let _ = plumb(&mut bare);
     let baseline = bare.finish().instrs.len();
 
-    let mut inv_only = LfmBuilder::new();
+    let mut inv_only = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
     let (g, z, steps, parts, _, _) = plumb(&mut inv_only);
     let _ = emit_deep_invariants(&mut inv_only, d, g, z, &steps, &parts);
     let invariant_rows = inv_only.finish().instrs.len() - baseline;
 
-    let mut full = LfmBuilder::new();
+    let mut full = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
     let (g, z, steps, parts, openings, points) = plumb(&mut full);
     let inv = emit_deep_invariants(&mut full, d, g, z, &steps, &parts);
     for (k, (trace, qparts)) in openings.into_iter().enumerate() {
@@ -850,7 +850,7 @@ fn control_program_source(
     shape: &SubProofShape,
     control: Control,
 ) -> super::builder::LfmProgramSource {
-    let mut b = LfmBuilder::new();
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
     let groups = shape.groups();
 
     let uniforms = b.declare_arena(2);
@@ -1011,7 +1011,7 @@ fn the_join_proves_and_verifies() {
     let opts = prove_options();
     let queries = [0usize];
 
-    let mut b = LfmBuilder::new();
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
     let (_, outs) = emit_sub_proof(&mut b, &h.shape, queries.len());
     for (p, s) in &outs {
         b.public(p.as_cell());
@@ -1076,7 +1076,7 @@ fn sweep_tampers(h: &HostSubProof, label: &str) {
     let q = 0usize;
     let groups = h.shape.groups();
 
-    let mut b = LfmBuilder::new();
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
     let (_, outs) = emit_sub_proof(&mut b, &h.shape, 1);
     for (p, s) in &outs {
         b.public(p.as_cell());
@@ -1353,7 +1353,7 @@ fn preprocessed_fixture() -> (
 ) {
     use crate::tables::types::{BusId, alu_op};
     use crate::test_utils::multi_prove_ram;
-    use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+    use stark::config::DefaultStarkTranscript;
     use stark::lookup::{
         AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, BusValue, Multiplicity,
         NullBoundaryConstraintBuilder, Packing,
@@ -1434,11 +1434,13 @@ fn preprocessed_fixture() -> (
     };
 
     let trace = make_trace();
+    // `DefaultStarkHash`, not a named hash: this commitment has to be the one
+    // `multi_prove_ram` below recomputes, and that follows the alias.
     let commitment = <stark::prover::Prover<Gl, Ext3, ()> as IsStarkProver<
         Gl,
         Ext3,
         (),
-        stark::config::KeccakStarkHash,
+        stark::config::DefaultStarkHash,
     >>::compute_precomputed_commitment_for_testing(
         &trace, &build(None), NUM_PRECOMPUTED
     )
@@ -1451,7 +1453,7 @@ fn preprocessed_fixture() -> (
         _,
         _,
     )> = vec![(&air, &mut trace, &())];
-    let proof = multi_prove_ram(pairs, &mut DefaultTranscript::<Ext3>::new(&[]))
+    let proof = multi_prove_ram(pairs, &mut DefaultStarkTranscript::<Ext3>::new(&[]))
         .expect("the preprocessed fixture must prove");
     (Box::new(air), proof)
 }
@@ -1519,7 +1521,7 @@ fn the_precomputed_group_comes_first_and_that_is_checkable() {
 
     // ---- half one: the machine agrees with production. -------------------
     let queries: Vec<usize> = (0..h.iotas.len().min(16)).collect();
-    let mut b = LfmBuilder::new();
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
     let (_, outs) = emit_sub_proof(&mut b, &h.shape, queries.len());
     for (p, s) in &outs {
         b.public(p.as_cell());
@@ -1677,7 +1679,7 @@ fn the_exposed_bits_are_the_cells_the_walk_consumed() {
     let h = host_sub_proof();
     const QUERIES: usize = 3;
 
-    let mut b = LfmBuilder::new();
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
     let (_, out) = emit_sub_proof_with_bits(&mut b, &h.shape, QUERIES);
     let src = b.finish();
     assert_eq!(out.len(), QUERIES);

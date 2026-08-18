@@ -1,5 +1,5 @@
 use super::{
-    config::{KeccakStarkHash, StarkHash},
+    config::{DefaultStarkHash, StarkHash},
     domain::VerifierDomain,
     grinding,
     proof::stark::StarkProof,
@@ -50,9 +50,15 @@ pub struct GenericVerifier<
     phantom: PhantomData<(Field, FieldExtension, PI, H)>,
 }
 
-/// The production verifier: [`GenericVerifier`] at the keccak configuration.
+/// The production verifier: [`GenericVerifier`] at the default commitment
+/// configuration.
+///
+/// Naming [`DefaultStarkHash`] rather than a fixed hash is what lets the RV64
+/// recursion guest verify a BLAKE3-committed proof: `verify_and_attest_blob` and
+/// `verify_continuation_and_attest` take only a `&ProofOptions`, so this alias is
+/// the only thing that selects the configuration they reach.
 pub type Verifier<Field, FieldExtension, PI> =
-    GenericVerifier<Field, FieldExtension, PI, KeccakStarkHash>;
+    GenericVerifier<Field, FieldExtension, PI, DefaultStarkHash>;
 
 impl<
     Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync + 'static,

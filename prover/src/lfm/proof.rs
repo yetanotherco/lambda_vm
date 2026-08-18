@@ -7,10 +7,10 @@
 //! compute the expected `LfmPublic` balance from the *claimed* public words
 //! (the COMMIT-bus pattern), and run `multi_verify_views`.
 
-use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use math::field::element::FieldElement;
 use math::field::traits::IsPrimeField;
 use stark::config::Commitment;
+use stark::config::DefaultStarkTranscript;
 use stark::proof::options::ProofOptions;
 use stark::proof::stark::MultiProof;
 use stark::proof::view::MultiProofView;
@@ -173,7 +173,7 @@ pub(crate) fn prove_traces_with_hasher(
         artifacts.keccak_rnd_chunks,
         hasher,
     );
-    let mut transcript = DefaultTranscript::<E>::new(&[]);
+    let mut transcript = DefaultStarkTranscript::<E>::new(&[]);
     absorb_lfm_statement(
         &mut transcript,
         &artifacts.program_id,
@@ -270,7 +270,7 @@ pub fn verify_against(
     let airs = LfmAirs::new_with_hasher(roots, options, keccak_rnd_chunks, hasher);
     let refs = airs.air_refs();
 
-    let mut transcript = DefaultTranscript::<E>::new(&[]);
+    let mut transcript = DefaultStarkTranscript::<E>::new(&[]);
     absorb_lfm_statement(
         &mut transcript,
         program_id,

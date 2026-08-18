@@ -584,14 +584,14 @@ where
 mod tests {
     use super::*;
     use crate::commitment::commit_bit_reversed;
-    use crate::config::KeccakStarkHash;
+    use crate::config::DefaultStarkHash;
     use math::field::element::FieldElement;
     use math::field::goldilocks::GoldilocksField;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     type FE = FieldElement<GoldilocksField>;
-    type Mmcs<E> = MixedMmcs<E, KeccakStarkHash>;
+    type Mmcs<E> = MixedMmcs<E, DefaultStarkHash>;
 
     /// Reference [`LeafSource`] owning bit-reversed row-major matrices. Every
     /// test commits/opens through this, so the byte-parity assertion against
@@ -712,6 +712,12 @@ mod tests {
     /// IS the existing per-table row-pair tree. It holds by construction — both
     /// go through `H::Batched<E>`'s `hash_data` / `hash_new_parent` — and this
     /// pins that no second leaf encoding crept in.
+    ///
+    /// Both sides have to be the SAME `H` for that to mean anything, which is
+    /// why this module commits under `DefaultStarkHash`: `commit_bit_reversed`
+    /// is alias-pinned, so naming a fixed hash here compares two configurations
+    /// and reports a hash difference as a layout difference. It did exactly that
+    /// at the P-a flip, when the alias moved and this side did not.
     #[test]
     fn single_matrix_root_matches_existing_row_pair_tree() {
         let log_height = 3usize;
@@ -813,7 +819,7 @@ mod tests {
         let arow = |r: usize| a_data[r * 2..(r + 1) * 2].to_vec();
         let brow = |r: usize| b_data[r * 3..(r + 1) * 3].to_vec();
         let h = |v: Vec<FE>| {
-            <<KeccakStarkHash as StarkHash>::Batched<GoldilocksField> as IsMerkleTreeBackend>::hash_data(&v)
+            <<DefaultStarkHash as StarkHash>::Batched<GoldilocksField> as IsMerkleTreeBackend>::hash_data(&v)
         };
 
         // Base layer (matrix A only): leaf k = H(A.row(2k) || A.row(2k+1)).
@@ -825,11 +831,11 @@ mod tests {
         let l01 = h(leaf1);
 
         // Climb to layer 1 (root): compress the base pair, then inject B (h=1).
-        let parent = compress::<GoldilocksField, KeccakStarkHash>(&l00, &l01);
+        let parent = compress::<GoldilocksField, DefaultStarkHash>(&l00, &l01);
         let mut binj = brow(0);
         binj.extend(brow(1));
         let inj = h(binj);
-        let expected_root = compress::<GoldilocksField, KeccakStarkHash>(&parent, &inj);
+        let expected_root = compress::<GoldilocksField, DefaultStarkHash>(&parent, &inj);
 
         assert_eq!(
             mmcs.root(),
@@ -952,7 +958,7 @@ mod tests {
         let src = OwnedMatrices {
             mats: vec![(data, log_height, width)],
         };
-        let mmcs = MixedMmcs::<Fp3, KeccakStarkHash>::commit(&src);
+        let mmcs = MixedMmcs::<Fp3, DefaultStarkHash>::commit(&src);
         assert_eq!(
             mmcs.root(),
             existing_root,
@@ -963,7 +969,7 @@ mod tests {
         let widths = [width];
         for iota in 0..(1usize << (log_height - 1)) {
             let opening = mmcs.open_batch(iota, &src);
-            assert!(MixedMmcs::<Fp3, KeccakStarkHash>::verify_batch(
+            assert!(MixedMmcs::<Fp3, DefaultStarkHash>::verify_batch(
                 &mmcs.root(),
                 iota,
                 &opening,
@@ -974,7 +980,7 @@ mod tests {
 
         let mut opening = mmcs.open_batch(0, &src);
         opening.per_matrix[0].evaluations[0] = &opening.per_matrix[0].evaluations[0] + &F3::one();
-        assert!(!MixedMmcs::<Fp3, KeccakStarkHash>::verify_batch(
+        assert!(!MixedMmcs::<Fp3, DefaultStarkHash>::verify_batch(
             &mmcs.root(),
             0,
             &opening,

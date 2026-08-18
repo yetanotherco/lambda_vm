@@ -36,7 +36,19 @@ use rayon::prelude::{IntoParallelIterator, ParallelIterator};
 use crypto::merkle_tree::merkle::MerkleTree;
 use crypto::merkle_tree::traits::IsStreamingLeafBackend;
 
-use crate::config::{BatchedMerkleTree, BatchedMerkleTreeBackend, Commitment};
+use crate::config::{
+    BatchedMerkleTree, BatchedMerkleTreeBackend, Commitment, KeccakStarkHash, StarkHash,
+};
+
+/// The keccak batched leaf backend, named rather than aliased.
+///
+/// The `keccak_leaves_*` helpers below exist to BE the keccak reference the
+/// CUDA parity tests compare their kernels against. They used to reach it
+/// through [`BatchedMerkleTreeBackend`], which was the same type while keccak
+/// was the default — and stopped being at the P-a flip, at which point three
+/// functions with `keccak` in their names would have computed BLAKE3 and the
+/// GPU parity tests would have reported a hash change as a kernel bug.
+type KeccakBatched<E> = <KeccakStarkHash as StarkHash>::Batched<E>;
 
 /// Number of consecutive (bit-reversed) rows packed into one Merkle leaf for the
 /// trace AND composition-polynomial commitments: the row-pair leaf the FRI
@@ -110,17 +122,22 @@ where
     result
 }
 
-/// [`leaves_bit_reversed_grouped`] at the keccak backend — the production leaf
-/// hash, and the one the CUDA kernels and their parity tests mirror.
+/// [`leaves_bit_reversed_grouped`] at the keccak backend — the leaf hash the
+/// CUDA keccak kernels and their parity tests mirror.
+///
+/// ⚠ Since the P-a flip this is no longer the *default* leaf hash; it is the
+/// keccak one, which is what the keccak kernels compute and therefore what
+/// their parity tests need. For the production leaf hash of the current
+/// configuration, use [`commit_bit_reversed`] or the alias directly.
 pub fn keccak_leaves_bit_reversed_grouped<E>(
     columns: &[Vec<FieldElement<E>>],
     rows_per_leaf: usize,
 ) -> Vec<Commitment>
 where
-    E: IsField,
+    E: IsField + 'static,
     FieldElement<E>: AsBytes + Sync + Send + ByteConversion,
 {
-    leaves_bit_reversed_grouped::<E, BatchedMerkleTreeBackend<E>>(columns, rows_per_leaf)
+    leaves_bit_reversed_grouped::<E, KeccakBatched<E>>(columns, rows_per_leaf)
 }
 
 /// Per-row Keccak-256 leaf hashes (one leaf per bit-reversed row). Thin wrapper
@@ -131,10 +148,10 @@ where
 /// the GPU parity tests in dependent crates can compare the per-row code path.
 pub fn keccak_leaves_bit_reversed<E>(columns: &[Vec<FieldElement<E>>]) -> Vec<Commitment>
 where
-    E: IsField,
+    E: IsField + 'static,
     FieldElement<E>: AsBytes + Sync + Send + ByteConversion,
 {
-    leaves_bit_reversed_grouped::<E, BatchedMerkleTreeBackend<E>>(columns, 1)
+    leaves_bit_reversed_grouped::<E, KeccakBatched<E>>(columns, 1)
 }
 
 /// Per-row-pair Keccak-256 leaf hashes (leaf `i` hashes bit-reversed rows `2i`,
@@ -142,10 +159,10 @@ where
 /// over [`keccak_leaves_bit_reversed_grouped`] with `rows_per_leaf = 2`.
 pub fn keccak_leaves_row_pair_bit_reversed<E>(parts: &[Vec<FieldElement<E>>]) -> Vec<Commitment>
 where
-    E: IsField,
+    E: IsField + 'static,
     FieldElement<E>: AsBytes + Sync + Send + ByteConversion,
 {
-    leaves_bit_reversed_grouped::<E, BatchedMerkleTreeBackend<E>>(parts, 2)
+    leaves_bit_reversed_grouped::<E, KeccakBatched<E>>(parts, 2)
 }
 
 /// Builds the Merkle tree committing to `columns`' bit-reversed, column-major LDE

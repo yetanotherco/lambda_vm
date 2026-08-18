@@ -45,6 +45,7 @@ use super::constraints::{
     emit_quotient, emit_table_offset,
 };
 use super::deep::{DeepInvariants, emit_deep_invariants};
+use super::edsl::WrapHash;
 use super::epoch::{RootCells, TableAbsorbs, TableChallenges, emit_reconstruct_ood};
 use super::fri::{
     FriCommitments, FriQuery, FriShape, LayerCommitment, emit_query_fri, hint_layer_openings_from,
@@ -538,6 +539,48 @@ pub fn query_permutations_at_rate(shape: &TableVerifyShape, rate_felts: usize) -
         + fri_leaf_permutations_at_rate(&shape.fri, rate_felts)
         + groups * shape.sub.merkle_depth
         + shape.fri.path_steps_per_query();
+    shape.num_queries * per_query
+}
+
+/// Felts a BLAKE3 block holds: 64 bytes at 8 bytes per felt.
+pub const BLAKE3_BLOCK_FELTS: usize = 8;
+
+/// Compressions absorbing `felts` costs under `hash`, with each hash's OWN
+/// block rule.
+///
+/// The two rules genuinely differ and the difference is not a rate change.
+/// Keccak's `⌊n/rate⌋ + 1` always spends a trailing block, because `pad10*1`
+/// appends one even when the length divides the rate. `Blake3Chain` does not:
+/// an exact multiple of 64 emits no spurious final block — that is KAT K5, and
+/// the P2 parent identity depends on it. So BLAKE3 is `max(1, ⌈n/8⌉)`, with the
+/// `max` carrying the other half of the same fact: the empty message is ONE
+/// block, not zero.
+pub fn blocks_for(felts: usize, hash: WrapHash) -> usize {
+    match hash {
+        WrapHash::Keccak => blocks_at_rate(felts, KECCAK_RATE_FELTS),
+        WrapHash::Blake3 => felts.div_ceil(BLAKE3_BLOCK_FELTS).max(1),
+    }
+}
+
+/// [`query_permutations`] under an explicit wrap hash.
+///
+/// Same decomposition as [`query_permutations_at_rate`] — **absorption moves
+/// with the block, compression does not** — but it takes the hash rather than a
+/// rate, because the block COUNT rule is part of the hash and not a parameter
+/// of it (see [`blocks_for`]). A Merkle parent is 64 bytes and is exactly one
+/// compression under both, so every parent term is unchanged; only the leaf
+/// absorptions move.
+pub fn query_permutations_for(shape: &TableVerifyShape, hash: WrapHash) -> usize {
+    let groups = shape.sub.groups().len();
+    let leaves: usize = shape
+        .sub
+        .groups()
+        .iter()
+        .map(|g| blocks_for(group_leaf_felts(g), hash))
+        .sum();
+    let fri_leaves = shape.fri.num_committed() * blocks_for(FRI_LEAF_FELTS, hash);
+    let per_query =
+        leaves + fri_leaves + groups * shape.sub.merkle_depth + shape.fri.path_steps_per_query();
     shape.num_queries * per_query
 }
 

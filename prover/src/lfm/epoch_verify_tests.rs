@@ -435,10 +435,10 @@ fn the_assembled_epoch_verifier_runs() {
 
     // ---- THE MEASUREMENT ----
     let spine = super::epoch_tests::epoch_program(&e, false);
-    let count = |p: &super::compiler::LfmProgram, f: fn(&super::instr::Instr) -> bool| {
-        p.instrs.iter().filter(|i| f(i)).count()
-    };
-    let perms = |p: &_| count(p, |i| matches!(i, super::instr::Instr::KeccakF(_)));
+    // The CONFIGURED hash's compressions — the closed form counts Merkle
+    // levels and query paths, which is hash-independent, so counting keccak
+    // specifically read zero under BLAKE3.
+    let perms = |p: &_| super::machine_tests::wrap_hash_instrs(p);
     let words = |p: &super::compiler::LfmProgram| -> usize {
         p.arena_schema.lens.iter().map(|l| *l as usize).sum()
     };
@@ -527,11 +527,13 @@ fn the_assembled_epoch_verifier_runs() {
                     .collect();
                 (z, beta, parts, steps, evals)
             };
-            let mut bare = super::builder::LfmBuilder::new();
+            let mut bare = super::builder::LfmBuilder::new()
+                .with_wrap_hash(super::edsl::WrapHash::production());
             let _ = plumb(&mut bare);
             let baseline = bare.finish().instrs.len();
 
-            let mut full = super::builder::LfmBuilder::new();
+            let mut full = super::builder::LfmBuilder::new()
+                .with_wrap_hash(super::edsl::WrapHash::production());
             let (z, beta, parts, steps, evals) = plumb(&mut full);
             let ood = super::constraints::OodOperands {
                 steps,
@@ -566,24 +568,44 @@ fn the_assembled_epoch_verifier_runs() {
     // ---- the permutation bill, against a CLOSED FORM over the shapes.
     //
     // Not a difference of two emitter passes (which rule 7's refinement rules
-    // out) but arithmetic over byte widths: every group's leaf is
-    // `⌊bytes/136⌋ + 1` rate blocks, every Merkle level is one, and FRI's own
-    // per-query figure is the one the FRI leg pinned. Asserted, not printed, so
-    // a leg that silently stopped hashing a group would fail here.
+    // out) but arithmetic over byte widths: every group's leaf costs the
+    // configured hash's block count, every Merkle level is ONE compression
+    // under either hash (a parent is 64 bytes), and FRI splits the same way.
+    // Asserted, not printed, so a leg that silently stopped hashing a group
+    // would fail here.
+    //
+    // The leaf and FRI-leaf halves are the ones that move with the hash —
+    // absorption is block-sensitive, compression is not — so they go through
+    // `blocks_for` while the walk terms stay plain counts.
+    use super::epoch_verify::blocks_for;
+    let hash = super::edsl::WrapHash::production();
     let mut fri_perms = 0usize;
     let mut leaf_perms = 0usize;
     let mut walk_perms = 0usize;
     for leg in &e.legs {
         let groups = leg.verify.sub.groups().len();
-        fri_perms += leg.verify.num_queries * leg.verify.fri.permutations_per_query();
-        leaf_perms +=
-            leg.verify.num_queries * super::epoch_verify::leaf_permutations(&leg.verify.sub);
+        let fri_leaves =
+            leg.verify.fri.num_committed() * blocks_for(super::epoch_verify::FRI_LEAF_FELTS, hash);
+        fri_perms += leg.verify.num_queries * (fri_leaves + leg.verify.fri.path_steps_per_query());
+        leaf_perms += leg.verify.num_queries
+            * leg
+                .verify
+                .sub
+                .groups()
+                .iter()
+                .map(|g| blocks_for(super::epoch_verify::group_leaf_felts(g), hash))
+                .sum::<usize>();
         walk_perms += leg.verify.num_queries * groups * leg.verify.sub.merkle_depth;
     }
     let predicted: usize = e
         .legs
         .iter()
-        .map(|l| super::epoch_verify::query_permutations(&l.verify))
+        .map(|l| {
+            super::epoch_verify::query_permutations_for(
+                &l.verify,
+                super::edsl::WrapHash::production(),
+            )
+        })
         .sum();
     assert_eq!(
         predicted,

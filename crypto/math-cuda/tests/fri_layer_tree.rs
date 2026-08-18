@@ -7,7 +7,7 @@ use math::field::goldilocks::GoldilocksField;
 use math_cuda::merkle::build_fri_layer_tree_from_evals_ext3;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
-use stark::config::FriLayerMerkleTree;
+use stark::config::KeccakFriLayerMerkleTree as FriLayerMerkleTree;
 
 type Fp = FieldElement<GoldilocksField>;
 type Fp3 = FieldElement<Degree3GoldilocksExtensionField>;
