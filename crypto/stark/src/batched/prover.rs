@@ -391,14 +391,14 @@ where
             #[cfg(feature = "disk-spill")]
             storage_mode,
         );
-        let lde_trace = lde_trace_of(&ldes, air.step_size(), domain.blowup_factor);
+        let mut lde_trace = lde_trace_of(&ldes, air.step_size(), domain.blowup_factor);
 
         let computed = P::compute_composition_parts(
             *air,
             pub_inputs,
             domain,
             &twiddles[table],
-            &lde_trace,
+            &mut lde_trace,
             &lookup_challenges,
             bus_public_inputs[table].as_ref(),
             &transition_coefficients,
@@ -469,12 +469,12 @@ where
             #[cfg(feature = "disk-spill")]
             storage_mode,
         );
-        let lde_trace = lde_trace_of(&ldes, air.step_size(), domain.blowup_factor);
+        let mut lde_trace = lde_trace_of(&ldes, air.step_size(), domain.blowup_factor);
         let round3 = P::round_3_evaluate_polynomials_in_out_of_domain_element(
             *air,
             domain,
-            &lde_trace,
-            &retained_parts[table],
+            &mut lde_trace,
+            &mut retained_parts[table],
             &z,
         );
         release_ldes(
@@ -519,7 +519,9 @@ where
         let domains = &domains;
         let twiddles = &twiddles;
         let shape = &shape;
-        let retained_parts = &retained_parts;
+        // `&mut`: the DEEP host loop repopulates a table's part evals from the
+        // resident handle when the device-only gate left them empty.
+        let retained_parts = &mut retained_parts;
         let round3s = &round3s;
         let zs = &zs;
         let gammas = &gammas;
@@ -556,12 +558,12 @@ where
                         #[cfg(feature = "disk-spill")]
                         storage_mode,
                     );
-                    let lde_trace = lde_trace_of(&ldes, air.step_size(), domain.blowup_factor);
+                    let mut lde_trace = lde_trace_of(&ldes, air.step_size(), domain.blowup_factor);
                     let mut deep = deep_codeword::<Field, FieldExtension, PI, H, P>(
                         *air,
                         domain,
-                        &lde_trace,
-                        &retained_parts[table],
+                        &mut lde_trace,
+                        &mut retained_parts[table],
                         &round3s[table],
                         &zs[table],
                         &gammas[table],
@@ -968,8 +970,11 @@ where
 fn deep_codeword<Field, FieldExtension, PI, H, P>(
     air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
     domain: &Domain<Field>,
-    lde_trace: &LDETraceTable<Field, FieldExtension>,
-    composition_parts: &[Vec<FieldElement<FieldExtension>>],
+    // `&mut` to match `compute_deep_composition_poly_evaluations`, whose host
+    // loop downloads the resident trace and part evals in place when the
+    // device-only gate left them empty.
+    lde_trace: &mut LDETraceTable<Field, FieldExtension>,
+    composition_parts: &mut [Vec<FieldElement<FieldExtension>>],
     round3: &crate::prover::Round3<FieldExtension>,
     z: &FieldElement<FieldExtension>,
     gamma: &FieldElement<FieldExtension>,
