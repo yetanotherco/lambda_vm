@@ -1630,6 +1630,37 @@ mod executor_absorb_parity {
         assert_ne!(cv, BLAKE3_IV, "the absorb must fold the block in");
     }
 
+    /// ★ The two crates' copies of the absorb ABI's shape are the same numbers.
+    ///
+    /// `crypto` states the control-region layout and the block cap for the guest
+    /// (`ABSORB_*`), and `executor` states them again for the handler
+    /// (`BLAKE3_ABSORB_*`), because neither crate can see the other's. Nothing
+    /// above catches drift: the parity test drives well-formed absorbs, so a
+    /// guest whose cap exceeded the executor's would fault only on the long
+    /// messages no test reaches. `prover` sees both crates, so this is where
+    /// they can be pinned.
+    ///
+    /// The guest's own control array is already pinned to the syscall wrapper's
+    /// by the type system (`[u64; N]` on both sides) when the guest compiles;
+    /// this covers the half no type can see.
+    #[test]
+    fn the_two_crates_agree_on_the_absorb_abi() {
+        use crypto::hash::blake3::chain::{ABSORB_CTRL_DWORDS, ABSORB_MAX_BLOCKS};
+        use executor::vm::instruction::execution::{
+            BLAKE3_ABSORB_CTRL_DWORDS, BLAKE3_ABSORB_CV_OUT_DWORD, BLAKE3_ABSORB_MAX_BLOCKS,
+            BLAKE3_BLOCK_BYTES,
+        };
+
+        assert_eq!(ABSORB_CTRL_DWORDS as u64, BLAKE3_ABSORB_CTRL_DWORDS);
+        assert_eq!(ABSORB_CV_OUT_DWORD as u64, BLAKE3_ABSORB_CV_OUT_DWORD);
+        assert_eq!(ABSORB_MAX_BLOCKS as u64, BLAKE3_ABSORB_MAX_BLOCKS);
+        assert_eq!(BLOCK_LEN as u64, BLAKE3_BLOCK_BYTES);
+        // `cv_out` starts past `cv_in`'s four dwords and the region holds both —
+        // the disjointness the single-timestamp memory argument depends on.
+        assert_eq!(BLAKE3_ABSORB_CV_OUT_DWORD, 4);
+        assert_eq!(BLAKE3_ABSORB_CTRL_DWORDS, 8);
+    }
+
     /// CONTROL: the parity is sensitive to the run's FIRST flag word — the one
     /// value the guest marshals rather than the executor deriving it. Absorbing
     /// under interior flags where `CHUNK_START` belongs must not agree, or the
