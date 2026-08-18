@@ -23,8 +23,8 @@
   --border: #c8c8c8;
   --table-border: black;
 
-  /* --font-body: SUGGESTIONS WELCOME*/
-  /* --font-code: SUGGESTIONS WELCOME*/
+  /* --font-body: TODO SUGGESTIONS WELCOME*/
+  /* --font-code: TODO SUGGESTIONS WELCOME*/
   /* TODO? Include fonts as assets */
   --font-math: "STIX Two Math", "Latin Modern Math", "Libertinus Math",
     "XITS Math", "Cambria Math", math, serif;
@@ -32,6 +32,12 @@
 
   /* Breakpoints (for reference — CSS vars can't be used in @media) */
   /* --bp-mobile: 768px; */
+}
+
+/* Keep fragment targets (footnote backlinks, in-page references) clear of
+   the sticky header when scrolled to */
+:root {
+  scroll-padding-top: calc(var(--header-height) + var(--border-size));
 }
 
 

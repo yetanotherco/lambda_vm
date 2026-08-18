@@ -64,6 +64,8 @@
 #let chapter(filename, title, mainbody) = [
   #document("/" + filename + ".html", title: title, {
       html.link(href: "/style.css", rel: "stylesheet")
+      html.link(href: "/sidenotes.css", rel: "stylesheet")
+      html.script(src: "/sidenotes.js", defer: true)
       heading(numbering: none, link(<doc:index>, meta.title))
       nav(filename)
       html.main(mainbody)
@@ -72,7 +74,8 @@
 ]
 
 #asset("/style.css", read("style.css"))
-// TODO? sidenotes
+#asset("/sidenotes.css", read("sidenotes.css"))
+#asset("/sidenotes.js", read("sidenotes.js"))
 #chapter("index", meta.title, include "front.typ")
 
 #for (partname, part) in meta.summary {
