@@ -234,9 +234,16 @@ $(RECURSION_ARTIFACTS_DIR)/%.elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_
 # dir "recursion") or copy-paste (presets list is the single source of truth).
 # $(1) is the preset; the recipe uses $$ so `$$(call build_guest_elf,...)`
 # expands at recipe-run time (where $@ is defined).
+#
+# `absorb` rides along with every preset: it routes the verifier legs' coalesced
+# leaf hashing through the chained-absorb ecall, which the prover's BLAKE3 table
+# answers with its absorb mode. It is a feature rather than a default of the
+# guest crate so the no-absorb leg stays buildable for A/B cycle measurement —
+# drop it from RECURSION_GUEST_FEATURES to rebuild that leg.
+RECURSION_GUEST_FEATURES := absorb
 define recursion_verifier_rule
 $(RECURSION_ARTIFACTS_DIR)/recursion-$(1).elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
-	$$(call build_guest_elf,$$(RECURSION_GUESTS_DIR)/recursion,recursion-$(1)-bench,--features $(1))
+	$$(call build_guest_elf,$$(RECURSION_GUESTS_DIR)/recursion,recursion-$(1)-bench,--features "$(1) $$(RECURSION_GUEST_FEATURES)")
 endef
 $(foreach preset,$(RECURSION_VERIFIER_PRESETS),$(eval $(call recursion_verifier_rule,$(preset))))
 
@@ -244,7 +251,7 @@ $(foreach preset,$(RECURSION_VERIFIER_PRESETS),$(eval $(call recursion_verifier_
 # feature -> recursion-cont-<preset>-bench -> recursion-cont-<preset>.elf.
 define recursion_cont_verifier_rule
 $(RECURSION_ARTIFACTS_DIR)/recursion-cont-$(1).elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
-	$$(call build_guest_elf,$$(RECURSION_GUESTS_DIR)/recursion,recursion-cont-$(1)-bench,--features "continuation $(1)")
+	$$(call build_guest_elf,$$(RECURSION_GUESTS_DIR)/recursion,recursion-cont-$(1)-bench,--features "continuation $(1) $$(RECURSION_GUEST_FEATURES)")
 endef
 $(foreach preset,$(RECURSION_CONT_PRESETS),$(eval $(call recursion_cont_verifier_rule,$(preset))))
 

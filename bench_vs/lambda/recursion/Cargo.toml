@@ -24,11 +24,15 @@ continuation = []
 # Also orthogonal: let the guest's BLAKE3 hashing reach the chained-absorb
 # ecall, so a leaf costs one ecall per run of blocks instead of one per block.
 #
-# OFF by default, and deliberately so: the prover-side chip mode that receives
-# this ecall does not exist yet, so a guest built with this yields honest CYCLE
-# counts but NOT a provable trace — the Ecall bus would have a send with no
-# receiver. It exists so the cycle measurement is reproducible from the tree
-# rather than from a scratch directory.
+# The prover's BLAKE3 table answers this ecall with its absorb mode, so a guest
+# built with it is provable as well as cheaper. Every `recursion-*.elf` the
+# Makefile builds turns it on; it stays a feature rather than a default so the
+# no-absorb leg stays buildable for A/B cycle measurement.
+#
+# ⚠ Compile-time ONLY, and it must stay that way. Which hash a guest computes,
+# and how it reaches the accelerator, are part of what a proof means — a guest
+# that could pick either from its private input would let the input decide what
+# was proved. Same reason the ProofOptions presets are hardcoded.
 absorb = ["lambda-vm-prover/blake3-absorb"]
 
 # One distinctly named binary per preset (selected by its feature) so a parallel
