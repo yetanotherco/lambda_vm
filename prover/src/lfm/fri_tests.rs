@@ -730,11 +730,10 @@ fn the_two_legs_verify_one_real_folding_proof_as_one_program() {
 }
 
 fn permutations(program: &LfmProgram) -> usize {
-    program
-        .instrs
-        .iter()
-        .filter(|i| matches!(i, super::instr::Instr::KeccakF(_)))
-        .count()
+    // The CONFIGURED wrap hash's compressions. Filtering `KeccakF` here read
+    // zero the moment production moved to BLAKE3, turning a cost measurement
+    // into a failed assertion about a count nobody had re-derived.
+    super::machine_tests::wrap_hash_instrs(program)
 }
 
 fn count_matching<F: Fn(&super::instr::Instr) -> bool>(program: &LfmProgram, f: F) -> usize {

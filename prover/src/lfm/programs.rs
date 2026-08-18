@@ -881,6 +881,17 @@ pub fn keccak_merkle_opening_program(shape: MerkleOpeningShape) -> LfmProgram {
     compile(keccak_merkle_opening_program_source(shape))
 }
 
+/// The R1f Merkle-opening walk at the hash production commits under — the
+/// BLAKE3 twin [`keccak_merkle_opening_program_source`]'s comment anticipates.
+///
+/// Use this to authenticate a REAL opening: the walk has to re-derive a root
+/// the host built, so it must hash the way the host committed. The keccak
+/// program above stays exactly as it is — it is the instrument whose identity
+/// the registry pins, and this is a second program, not a re-blessing of it.
+pub fn merkle_opening_program(shape: MerkleOpeningShape) -> LfmProgram {
+    merkle_opening_program_with_hash(shape, WrapHash::production())
+}
+
 pub fn merkle_opening_program_with_hash(
     shape: MerkleOpeningShape,
     wrap_hash: super::edsl::WrapHash,

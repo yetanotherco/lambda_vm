@@ -1454,6 +1454,12 @@ fn registry_drift_transcript_replay_v0_blowup2() {
 /// missing squeeze — the classic invalidation-rule bug — moves this number.
 #[test]
 fn transcript_replay_cell_counts() {
+    /// Compressions the replay emits under the CONFIGURED wrap hash. It was 6
+    /// under keccak — "five squeezes over six rate blocks" — and a 136-byte
+    /// sponge rate does not divide this script the way a 64-byte BLAKE3 block
+    /// does, so the number is re-derived rather than carried over.
+    const TRANSCRIPT_REPLAY_COMPRESSIONS: usize = 8;
+
     let program = transcript_replay_program();
     let (main, aux) = super::airs::lfm_cell_counts(&program);
     println!(
@@ -1464,8 +1470,9 @@ fn transcript_replay_cell_counts() {
         aux
     );
     assert_eq!(
-        program.groups.keccak.real_rows, 6,
-        "five squeezes over six rate blocks"
+        wrap_hash_rows(&program),
+        TRANSCRIPT_REPLAY_COMPRESSIONS,
+        "the replay's compression count"
     );
     assert!(main > 0 && aux > 0);
 }
@@ -3045,7 +3052,7 @@ fn supplied_preprocessed_roots_are_embedded_in_the_blob() {
 // The oracle is the proof's root. Nothing here recomputes an expected answer
 // with a local model and compares the machine against itself.
 
-use super::programs::{MerkleOpeningShape, keccak_merkle_opening_program};
+use super::programs::{MerkleOpeningShape, keccak_merkle_opening_program, merkle_opening_program};
 use super::proof_arena::MainTraceOpening;
 
 /// Which opening the leg authenticates.
@@ -3154,10 +3161,13 @@ fn real_opening_is_a_usable_tamper_target() {
 /// is what makes it a proof rather than an execution, which per method rule 2
 /// is the only thing that says anything about the chips.
 #[test]
-fn keccak_merkle_walk_authenticates_a_real_opening() {
+fn the_merkle_walk_authenticates_a_real_opening() {
     let opts = options();
     let (opening, index) = r1f_opening();
-    let program = keccak_merkle_opening_program(R1F_SHAPE);
+    // The PRODUCTION twin: the opening is real, so the walk has to re-derive a
+    // root the host actually built. The keccak instrument cannot, and the name
+    // moved with the hash rather than outliving it.
+    let program = merkle_opening_program(R1F_SHAPE);
     let artifacts = build_artifacts(&program, &opts);
     let proved = lfm_prove(&program, &artifacts, &merkle_arenas(opening, *index), &opts)
         .expect("the honest opening must execute and prove");
@@ -3205,7 +3215,9 @@ struct TamperVector {
 fn tampered_merkle_opening_rejects() {
     let opts = options();
     let (opening, index) = r1f_opening();
-    let program = keccak_merkle_opening_program(R1F_SHAPE);
+    // Same production twin as the honest-path test above — a tamper control is
+    // only a control over the walk the honest path uses.
+    let program = merkle_opening_program(R1F_SHAPE);
     let artifacts = build_artifacts(&program, &opts);
     let honest = lfm_prove(&program, &artifacts, &merkle_arenas(opening, *index), &opts)
         .expect("honest prove");
@@ -3317,6 +3329,34 @@ pub(super) fn byteswap_cells() -> u64 {
     let bitdec_w = (bitdec::cols::NUM_COLUMNS - layout::bitdec::PREP_WIDTH) as u64;
     let balu_w = (balu::cols::NUM_COLUMNS - layout::balu::PREP_WIDTH) as u64;
     bitdec_w + 64 * balu_w
+}
+
+/// ★ Rows the CONFIGURED wrap hash occupies in a program.
+///
+/// Structural counts — "a Merkle tree over `n` leaves costs `2n − 1` hashes" —
+/// are claims about tree shape, not about a hash, so they must be counted
+/// against whichever chip group the configured hash fills. Reading
+/// `groups.keccak` directly made them silently read ZERO the moment production
+/// moved to BLAKE3, which reports a true structural claim as a failed one.
+pub(super) fn wrap_hash_rows(program: &super::compiler::LfmProgram) -> usize {
+    match super::edsl::WrapHash::production() {
+        super::edsl::WrapHash::Keccak => program.groups.keccak.real_rows,
+        super::edsl::WrapHash::Blake3 => program.groups.blake3.real_rows,
+    }
+}
+
+/// [`wrap_hash_rows`]'s instruction-stream twin: emitted compressions of the
+/// configured wrap hash.
+pub(super) fn wrap_hash_instrs(program: &super::compiler::LfmProgram) -> usize {
+    use super::instr::Instr;
+    program
+        .instrs
+        .iter()
+        .filter(|i| match super::edsl::WrapHash::production() {
+            super::edsl::WrapHash::Keccak => matches!(i, Instr::KeccakF(_)),
+            super::edsl::WrapHash::Blake3 => matches!(i, Instr::Blake3(_)),
+        })
+        .count()
 }
 
 /// Main-trace cells one keccak permutation costs: the `LFM_KECCAK` row that
@@ -4268,9 +4308,13 @@ fn register_derivation_cost() {
             "blowup {blowup}: the shape's own arithmetic must give the predicted count"
         );
         assert_eq!(
-            program.groups.keccak.real_rows, predicted,
-            "blowup {blowup}: the EMITTED permutation count must be 2·leaves − 1 \
-             ({predicted}); a miss means the tree's shape is not what the design says"
+            wrap_hash_rows(&program),
+            predicted,
+            "blowup {blowup}: the EMITTED compression count must be 2·leaves − 1 \
+             ({predicted}); a miss means the tree's shape is not what the design \
+             says. Counted against the CONFIGURED hash: the claim is about tree \
+             shape, and it holds under both — a 48-byte leaf and a 64-byte parent \
+             are each one keccak rate block and each one BLAKE3 block"
         );
         // Every leaf is 48 bytes and every parent 64 — one rate block each, so
         // the permutation count is exactly the node count and nothing else.
