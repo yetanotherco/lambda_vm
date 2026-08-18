@@ -472,7 +472,7 @@ impl Blake3Chain {
     /// The accelerator supplies `0` for every later block, and *that* half of
     /// the schedule is the executor's restatement, gated by the parity tests
     /// rather than trusted.
-    #[cfg(all(target_arch = "riscv64", feature = "blake3-6round"))]
+    #[cfg(all(target_arch = "riscv64", feature = "blake3-absorb"))]
     fn bulk_absorb(&mut self, input: &[u8]) -> usize {
         // Same reasoning as `compress_block`: the accelerator is 6-round only,
         // so an anchoring instance at another count takes the software path.
@@ -498,7 +498,7 @@ impl Blake3Chain {
     /// hashes block at a time. Returning `0` makes the caller's fast path
     /// vanish, so the streaming semantics are identical on every target — which
     /// is what lets the host tests cover the result of taking it.
-    #[cfg(not(all(target_arch = "riscv64", feature = "blake3-6round")))]
+    #[cfg(not(all(target_arch = "riscv64", feature = "blake3-absorb")))]
     fn bulk_absorb(&mut self, _input: &[u8]) -> usize {
         0
     }

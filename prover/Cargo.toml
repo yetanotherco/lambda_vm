@@ -27,6 +27,10 @@ disk-spill = ["stark/disk-spill"]
 # which the `SOCKET_ROUNDS == BLAKE3_ROUNDS` assertion in `lfm::blake3_socket`
 # catches at compile time.
 blake3-6round = ["crypto/blake3-6round"]
+# Forwards `crypto`'s guest-side chained-absorb switch. See that feature's note
+# for why it stays separate from `blake3-6round`: a guest emitting the absorb
+# ecall needs the prover's absorb mode present to receive it.
+blake3-absorb = ["crypto/blake3-absorb"]
 
 [dependencies]
 stark = { path = "../crypto/stark" }
