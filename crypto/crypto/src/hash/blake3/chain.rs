@@ -517,10 +517,20 @@ impl Blake3Chain {
             }
             // With an empty pending block, whole blocks of `input` are blocks
             // of the message and the accelerator can take them in one call.
-            let bulk = self.bulk_absorb(input);
-            if bulk != 0 {
-                input = &input[bulk..];
-                continue;
+            //
+            // The length test is what keeps the parent path free. A 64-byte
+            // message — a Merkle parent, the shape FRI query paths are made of
+            // — can never absorb anything, because the run always leaves the
+            // final block behind; without this guard it would still pay for the
+            // call and its checks, which measured at 22 cycles on 432, a 5%
+            // regression on the hash this accelerator is best at. `>` and not
+            // `>=`: at exactly one block there is nothing to take.
+            if input.len() > BLOCK_LEN {
+                let bulk = self.bulk_absorb(input);
+                if bulk != 0 {
+                    input = &input[bulk..];
+                    continue;
+                }
             }
             let take = (BLOCK_LEN - self.block_len).min(input.len());
             self.block[self.block_len..self.block_len + take].copy_from_slice(&input[..take]);
