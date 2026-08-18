@@ -2581,7 +2581,7 @@ fn coset_points_device_handle(
         for i in [2usize, coset_u64.len() / 2, coset_u64.len() - 1] {
             assert_eq!(
                 Fp::from_raw(coset_u64[i]),
-                &p0 * &w.pow(i as u64),
+                p0 * w.pow(i as u64),
                 "coset_points_device_handle: input is not a geometric coset"
             );
         }
