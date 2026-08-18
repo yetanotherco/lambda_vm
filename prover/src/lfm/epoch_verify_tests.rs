@@ -527,11 +527,13 @@ fn the_assembled_epoch_verifier_runs() {
                     .collect();
                 (z, beta, parts, steps, evals)
             };
-            let mut bare = super::builder::LfmBuilder::new();
+            let mut bare = super::builder::LfmBuilder::new()
+                .with_wrap_hash(super::edsl::WrapHash::production());
             let _ = plumb(&mut bare);
             let baseline = bare.finish().instrs.len();
 
-            let mut full = super::builder::LfmBuilder::new();
+            let mut full = super::builder::LfmBuilder::new()
+                .with_wrap_hash(super::edsl::WrapHash::production());
             let (z, beta, parts, steps, evals) = plumb(&mut full);
             let ood = super::constraints::OodOperands {
                 steps,

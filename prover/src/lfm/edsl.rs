@@ -408,8 +408,8 @@ pub fn keccak_merkle_tree_root(b: &mut LfmBuilder, leaves: &[KeccakDigest]) -> K
 ///   honest-path control (keccak still proves and verifies through the same
 ///   code) is a real control rather than a different code path.
 ///
-/// [`Keccak`](WrapHash::Keccak) is the default and nothing selects
-/// [`Blake3`](WrapHash::Blake3) yet: the flip is a separate, announced step.
+/// [`Keccak`](WrapHash::Keccak) is the **unset** value, not the production one
+/// — see [`WrapHash::production`] and the header of `programs.rs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WrapHash {
     #[default]
@@ -418,6 +418,34 @@ pub enum WrapHash {
 }
 
 impl WrapHash {
+    /// ★ The wrap hash that matches the host's commitment configuration.
+    ///
+    /// **Any wrap program that AUTHENTICATES a host proof must hash the way the
+    /// host committed.** Its Merkle walks re-derive roots the host built and its
+    /// leaf hashes reproduce leaves the host hashed; under the wrong hash none
+    /// of that reconstructs, and the leg is verifying nothing.
+    ///
+    /// ⚠ **It does not fail as a wrong digest.** The walk produces a root
+    /// matching nothing, the leg then inverts a difference that should have been
+    /// non-zero, and the executor reports `DivByZero` at some address. That is
+    /// the diagnostic signature of a leg left on the default — and it is why
+    /// this is a named function rather than a constant each site spells out,
+    /// because the failure names neither the hash nor the site.
+    ///
+    /// The match is exhaustive on purpose: a third commitment hash cannot be
+    /// added without deciding what the in-machine verifier does about it, the
+    /// same tripwire `commitment_hash_tag` carries for program identity.
+    ///
+    /// **Not for programs that are ABOUT a hash.** The R1b/R1c/R1d keccak
+    /// instruments and `program_id_program_source` name their hash directly and
+    /// must keep doing so.
+    pub const fn production() -> Self {
+        match stark::config::COMMITMENT_HASH {
+            stark::config::CommitmentHash::Keccak256 => WrapHash::Keccak,
+            stark::config::CommitmentHash::Blake3 => WrapHash::Blake3,
+        }
+    }
+
     /// The hash of a byte stream supplied as `u32`-half felts.
     ///
     /// Both hashes take the SAME packing — four bytes per felt, little-endian

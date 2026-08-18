@@ -48,9 +48,9 @@
 //! can produce such a proof. Entry 9's closure is therefore about the emitter's
 //! grid indexing, not about an end-to-end run.
 
-use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use crypto::fiat_shamir::is_transcript::IsTranscript;
 use math::field::traits::IsField;
+use stark::config::DefaultStarkTranscript;
 use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 use stark::examples::fibonacci_multi_column::{
     FibonacciMultiColumnAIR, FibonacciMultiColumnPublicInputs, compute_trace,
@@ -317,7 +317,7 @@ fn the_prover_cannot_prove_a_step_size_two_air() {
         _,
         _,
     )> = vec![(&air, &mut trace, &())];
-    let _ = multi_prove_ram(pairs, &mut DefaultTranscript::<Ext3>::new(&[]));
+    let _ = multi_prove_ram(pairs, &mut DefaultStarkTranscript::<Ext3>::new(&[]));
 }
 
 /// ★ The same ceiling, as release actually reaches it — see the debug body above
@@ -340,7 +340,7 @@ fn the_prover_cannot_prove_a_step_size_two_air() {
         _,
         _,
     )> = vec![(&air, &mut trace, &())];
-    let proof = multi_prove_ram(pairs, &mut DefaultTranscript::<Ext3>::new(&[]))
+    let proof = multi_prove_ram(pairs, &mut DefaultStarkTranscript::<Ext3>::new(&[]))
         .expect("with the debug_assert compiled out the prover runs to completion");
 
     let refs: Vec<&dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = ()>> = vec![&air];
@@ -348,7 +348,7 @@ fn the_prover_cannot_prove_a_step_size_two_air() {
         !Verifier::multi_verify_views(
             &refs,
             MultiProofView::Owned(&proof),
-            &mut DefaultTranscript::<Ext3>::new(&[]),
+            &mut DefaultStarkTranscript::<Ext3>::new(&[]),
             &FEE::zero(),
         ),
         "production accepted a step_size = 2 proof — the framework ceiling lifted, \
@@ -396,7 +396,7 @@ fn fib_proof() -> (
         _,
         _,
     )> = vec![(&air, &mut trace, &pi)];
-    let proof = multi_prove_ram(pairs, &mut DefaultTranscript::<Ext3>::new(&[]))
+    let proof = multi_prove_ram(pairs, &mut DefaultStarkTranscript::<Ext3>::new(&[]))
         .expect("the three-offset fixture must prove");
     (air, pi, proof)
 }
@@ -437,7 +437,7 @@ fn fib_replay(
     // preprocessed and has no aux trace, so it is the main root and nothing else.
     assert!(!air.is_preprocessed(), "the fixture is not preprocessed");
     assert!(!air.has_aux_trace(), "the fixture has no aux trace");
-    let mut transcript = DefaultTranscript::<Ext3>::new(&[]);
+    let mut transcript = DefaultStarkTranscript::<Ext3>::new(&[]);
     transcript.append_bytes(view.lde_trace_main_merkle_root());
 
     let domain = new_verifier_domain(air, trace_length);
@@ -501,7 +501,7 @@ fn fib_challenge_program(
     r: &FibReplay,
 ) -> (super::compiler::LfmProgram, Vec<Vec<super::word::LfmWord>>) {
     let s = &r.shape;
-    let mut b = LfmBuilder::new();
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
 
     let a_main = b.declare_arena(2);
     let a_composition = b.declare_arena(2);
@@ -605,7 +605,7 @@ fn the_machine_absorbs_a_multi_row_ood_block_in_productions_order() {
         Verifier::multi_verify_views(
             &refs,
             MultiProofView::Owned(&proof),
-            &mut DefaultTranscript::<Ext3>::new(&[]),
+            &mut DefaultStarkTranscript::<Ext3>::new(&[]),
             &FEE::zero(),
         ),
         "production must accept the three-offset fixture"
@@ -707,7 +707,7 @@ fn the_machine_absorbs_a_multi_row_ood_block_in_productions_order() {
 /// the control needs nothing past `γ`.
 fn row_major_control_gamma(r: &FibReplay) -> FEE {
     let s = &r.shape;
-    let mut b = LfmBuilder::new();
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
 
     let a_main = b.declare_arena(2);
     let a_composition = b.declare_arena(2);

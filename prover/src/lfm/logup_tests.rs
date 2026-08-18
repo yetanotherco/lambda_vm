@@ -21,7 +21,7 @@
 //! verifies a real epoch and runs the closure over all twenty-four of its
 //! contributions.
 
-use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+use stark::config::DefaultStarkTranscript;
 use stark::proof::stark::MultiProof;
 use stark::proof::view::StarkProofView;
 use stark::traits::AIR;
@@ -260,7 +260,7 @@ fn balanced_pair() -> (Vec<BoxedAir>, MultiProof<Gl, Ext3, ()>) {
         (&sender, &mut sender_trace, &()),
         (&receiver, &mut receiver_trace, &()),
     ];
-    let proof = multi_prove_ram(pairs, &mut DefaultTranscript::<Ext3>::new(&[]))
+    let proof = multi_prove_ram(pairs, &mut DefaultStarkTranscript::<Ext3>::new(&[]))
         .expect("the balanced pair must prove");
     (vec![Box::new(sender), Box::new(receiver)], proof)
 }
@@ -283,7 +283,7 @@ fn the_closure_matches_a_bus_that_really_balances() {
         Verifier::multi_verify(
             &air_refs,
             &proof,
-            &mut DefaultTranscript::<Ext3>::new(&[]),
+            &mut DefaultStarkTranscript::<Ext3>::new(&[]),
             &FEE::zero(),
         ),
         "production must accept this pair at target zero, or the fixture is not \
@@ -731,7 +731,7 @@ fn chunked_family() -> (Vec<BoxedAir>, MultiProof<Gl, Ext3, ()>) {
         (&recv0, &mut recv0_trace, &()),
         (&recv1, &mut recv1_trace, &()),
     ];
-    let proof = multi_prove_ram(pairs, &mut DefaultTranscript::<Ext3>::new(&[]))
+    let proof = multi_prove_ram(pairs, &mut DefaultStarkTranscript::<Ext3>::new(&[]))
         .expect("the chunked family must prove");
     (
         vec![Box::new(sender), Box::new(recv0), Box::new(recv1)],
@@ -762,7 +762,7 @@ fn the_closure_accumulates_per_chunk_not_per_family() {
         Verifier::multi_verify(
             &air_refs,
             &proof,
-            &mut DefaultTranscript::<Ext3>::new(&[]),
+            &mut DefaultStarkTranscript::<Ext3>::new(&[]),
             &FEE::zero(),
         ),
         "production must accept the chunked family at target zero, or the \

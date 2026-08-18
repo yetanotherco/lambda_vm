@@ -836,8 +836,8 @@ fn neg_air() -> FixtureAir<NegConstraints> {
 // (c) + (d) — the quotient recombination, against a REAL proof
 // =============================================================================
 
-use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use crypto::fiat_shamir::is_transcript::IsTranscript;
+use stark::config::DefaultStarkTranscript;
 use stark::domain::new_verifier_domain;
 use stark::lookup::{BusPublicInputs, LOGUP_CHALLENGE_ALPHA, LOGUP_NUM_CHALLENGES};
 use stark::proof::stark::MultiProof;
@@ -914,7 +914,7 @@ pub(super) fn real_fixture() -> (BoxedAir, MultiProof<Gl, Ext3, ()>) {
         _,
         _,
     )> = vec![(&air, &mut trace, &())];
-    let proof = multi_prove_ram(pairs, &mut DefaultTranscript::<Ext3>::new(&[]))
+    let proof = multi_prove_ram(pairs, &mut DefaultStarkTranscript::<Ext3>::new(&[]))
         .expect("the L2G_MEMORY fixture must prove");
 
     (Box::new(air), proof)
@@ -937,7 +937,7 @@ pub(super) fn open_sub_proof(
 
     // ---- Round 1, Phase A/B/C, transcribed from `multi_verify_views` for the
     // single-table case (no per-table domain separator).
-    let mut transcript = DefaultTranscript::<Ext3>::new(&[]);
+    let mut transcript = DefaultStarkTranscript::<Ext3>::new(&[]);
     if air.is_preprocessed() {
         transcript.append_bytes(&air.precomputed_commitment());
     }
