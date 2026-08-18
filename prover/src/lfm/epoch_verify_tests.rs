@@ -435,9 +435,6 @@ fn the_assembled_epoch_verifier_runs() {
 
     // ---- THE MEASUREMENT ----
     let spine = super::epoch_tests::epoch_program(&e, false);
-    let count = |p: &super::compiler::LfmProgram, f: fn(&super::instr::Instr) -> bool| {
-        p.instrs.iter().filter(|i| f(i)).count()
-    };
     // The CONFIGURED hash's compressions — the closed form counts Merkle
     // levels and query paths, which is hash-independent, so counting keccak
     // specifically read zero under BLAKE3.

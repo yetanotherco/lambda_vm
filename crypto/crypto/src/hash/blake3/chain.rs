@@ -649,7 +649,6 @@ mod tests {
     /// corners, where a wrong flag or a swapped operand is easiest to miss.
     #[test]
     fn the_parent_specialization_equals_the_streaming_path() {
-        use digest::Digest;
         let pattern = |seed: u8| -> [u8; 32] {
             core::array::from_fn(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
         };
