@@ -394,7 +394,7 @@ jobs:
             sleep 10
           done
           if [ -z "$DONE" ]; then
-            fail "onstart never reported '=== done ===' in ~25 min — slow or broken host. Re-run /bench-gpu to reroll the box."
+            fail "onstart never reported '=== done ===' in ~25 min — slow or broken host. Wait a few minutes before re-running /bench-gpu: offer selection is deterministic (priciest match), so an immediate retry can re-pick this same host once it relists."
           fi
 
           # Sanity gate: even a box that reports done can have an unusable toolchain —
@@ -437,7 +437,7 @@ jobs:
             if [ "$GATE_RC" -eq 255 ]; then
               fail "Toolchain sanity check could not reach the box (ssh exit 255) — transport failure, not necessarily a bad host. Re-run /bench-gpu."
             fi
-            fail "Toolchain sanity check failed (exit $GATE_RC): cc or rustc could not compile and run a trivial program on this host. Usually a partially provisioned image (missing cc/rustc/headers); can also be faulty host RAM, which makes compilers crash on stock code. Output above. Re-run /bench-gpu to reroll the box."
+            fail "Toolchain sanity check failed (exit $GATE_RC): cc or rustc could not compile and run a trivial program on this host. Usually a partially provisioned image (missing cc/rustc/headers); can also be faulty host RAM, which makes compilers crash on stock code. Output above. Wait a few minutes before re-running /bench-gpu: offer selection is deterministic (priciest match), so an immediate retry can re-pick this same host once it relists."
           fi
           echo "toolchain sane"
 
