@@ -673,10 +673,17 @@ impl Instruction {
                         let msg_bytes = num_blocks
                             .checked_mul(BLAKE3_BLOCK_BYTES)
                             .ok_or(ExecutionError::Blake3AbsorbAddressOverflow(msg_addr))?;
-                        ctrl_addr
+                        // The LAST addressable byte of each region, kept rather
+                        // than discarded: the overlap test below is written on
+                        // these, so it cannot overflow on a guest-chosen address.
+                        // (`end = addr + bytes` would: a region ending exactly at
+                        // 2^64 wraps to 0, which panics in a debug build and in
+                        // release silently reports "no overlap" for regions that
+                        // do overlap.)
+                        let ctrl_last = ctrl_addr
                             .checked_add(ctrl_bytes - 1)
                             .ok_or(ExecutionError::Blake3AbsorbAddressOverflow(ctrl_addr))?;
-                        msg_addr
+                        let msg_last = msg_addr
                             .checked_add(msg_bytes - 1)
                             .ok_or(ExecutionError::Blake3AbsorbAddressOverflow(msg_addr))?;
 
@@ -685,7 +692,7 @@ impl Instruction {
                         // twice at that timestamp and the MEMW consistency
                         // argument could not order the pair. Reject rather than
                         // emit a trace the prover cannot close.
-                        if ctrl_addr < msg_addr + msg_bytes && msg_addr < ctrl_addr + ctrl_bytes {
+                        if ctrl_addr <= msg_last && msg_addr <= ctrl_last {
                             return Err(ExecutionError::Blake3AbsorbRegionOverlap);
                         }
 

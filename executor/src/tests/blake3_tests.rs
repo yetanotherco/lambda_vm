@@ -429,3 +429,40 @@ fn test_blake3_absorb_rejects_overflowing_message_range() {
         ExecutionError::Blake3AbsorbAddressOverflow(_)
     ));
 }
+
+/// A region ending exactly at the top of the address space must not wrap the
+/// overlap test.
+///
+/// The overlap check is written on each region's LAST addressable byte rather
+/// than on `addr + bytes`, because the latter is `2^64` for a region ending at
+/// `u64::MAX` — which panics in a debug build on a guest-chosen argument, and
+/// in a release build wraps to `0` and makes the check report "no overlap" for
+/// two regions that do overlap. Both are reachable from the guest, so neither
+/// is acceptable: the executor must return an error, never panic, and never
+/// accept an overlap.
+#[test]
+fn test_blake3_absorb_handles_a_region_ending_at_the_top_of_memory() {
+    // The message's last byte is exactly u64::MAX: 64 blocks of 64 bytes ending
+    // at the ceiling. The control region sits inside it, so this IS an overlap
+    // and must be reported as one rather than wrapping into acceptance.
+    let msg_addr = u64::MAX - 64 * 64 + 1;
+    let ctrl_addr = msg_addr + 128;
+    let mut registers = absorb_registers(ctrl_addr, msg_addr, 64, 0);
+    assert!(matches!(
+        run_absorb(&mut registers).unwrap_err(),
+        ExecutionError::Blake3AbsorbRegionOverlap
+    ));
+
+    // And the same top-of-memory message with a control region well clear of it
+    // must get past the range and overlap checks rather than faulting on them.
+    let mut registers = absorb_registers(0x1000, msg_addr, 64, 0);
+    let err = run_absorb(&mut registers);
+    assert!(
+        !matches!(
+            err,
+            Err(ExecutionError::Blake3AbsorbRegionOverlap)
+                | Err(ExecutionError::Blake3AbsorbAddressOverflow(_))
+        ),
+        "a region ending exactly at u64::MAX is addressable, got {err:?}"
+    );
+}
