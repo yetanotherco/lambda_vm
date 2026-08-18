@@ -33,7 +33,7 @@ def main():
     api = load_api_calls(con, tset)
     chain_at = build_range_lookup(nvtx)
 
-    def chain_for(corr, start):
+    def chain_for(corr):
         if corr in api:
             api_start, tid = api[corr]
             c = chain_at(tid, api_start)
@@ -55,7 +55,7 @@ def main():
     for start, end, kind, nbytes, corr in memcpys:
         if kind not in ("h2d", "d2h"):
             continue
-        chain = chain_for(corr, start)
+        chain = chain_for(corr)
         key = (kind, coarse_of(chain), innermost(chain), nbytes)
         h = hist[key]
         h[0] += 1

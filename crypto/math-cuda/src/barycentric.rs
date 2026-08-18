@@ -586,3 +586,28 @@ pub fn gather_rows_ext3_on_device(
     stream.synchronize()?;
     Ok(host)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::bary_num_chunks;
+
+    /// Pins which of the three terms binds, per regime. Pure arithmetic — the
+    /// kernels' parity across chunk counts is covered by
+    /// `tests/barycentric_multi.rs`, which allocates a GPU.
+    #[test]
+    fn bary_num_chunks_branches() {
+        // Rows-bound: the domain is too short to split further, whatever the
+        // grid wants. 2^14/8192 = 2, under the occupancy term's 2048/100 = 20.
+        assert_eq!(bary_num_chunks(100, 1 << 14), 2);
+        // Occupancy-bound: the columns alone nearly fill the grid, so the
+        // domain is split less than its length would allow. 2048/256 = 8,
+        // under the rows term's 2^17/8192 = 16.
+        assert_eq!(bary_num_chunks(256, 1 << 17), 8);
+        // Cap-bound: at production shapes both terms clear 64 (512 and 128).
+        assert_eq!(bary_num_chunks(4, 1 << 20), 64);
+        // Degenerate inputs still yield a launchable grid (>= 1 chunk).
+        assert_eq!(bary_num_chunks(0, 0), 1);
+        assert_eq!(bary_num_chunks(usize::MAX, 1 << 20), 1);
+        assert_eq!(bary_num_chunks(1, 0), 1);
+    }
+}

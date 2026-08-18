@@ -590,7 +590,7 @@ test-cuda-integration:
 test-cuda-fallback:
 	$(GPU_TEST_TIMEOUT) cargo test -p lambda-vm-prover --release --features test-cuda-faults \
 	    --test cuda_fallback_tests -- --ignored --nocapture --test-threads=1
-	cargo test -p lambda-vm-prover --release --features lambda-vm-prover/cuda \
+	$(GPU_TEST_TIMEOUT) cargo test -p lambda-vm-prover --release --features lambda-vm-prover/cuda \
 	    --test gpu_force_downgrade -- --ignored --nocapture --test-threads=1
 
 # The prover/stark/crypto/ecsm test suite with the GPU (cuda) path enabled (requires NVIDIA
