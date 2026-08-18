@@ -46,9 +46,9 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # Vast offer search: RTX 5090, >=16 cores, >=48GB RAM, >=64GB disk, verified +
-  # rentable, Blackwell-capable driver, <= cap. gpu_frac=1 (whole-machine, dedicated
-  # host) — see the query step for why.
+  # Vast offer search: RTX 5090, 16-32 cores, >=48GB RAM, >=64GB disk, verified +
+  # rentable, Blackwell-capable driver, cuda_max_good>=12.8, reliability>=0.95, <= cap.
+  # gpu_frac=1 (whole-machine, dedicated host) — see the query step for why.
   GPU_NAME: RTX_5090
   PRICE_CAP: "1"
   VAST_IMAGE_DISK: "64"
@@ -170,7 +170,10 @@ jobs:
             const marker = 'GPU Benchmark (ABBA)';
             // Reference: 4 pairs measured 20 min 11 s end-to-end — 3 min 56 s of rental,
             // checkout and dual cuda build, then 4.06 min per pair, since a pair is TWO
-            // proves at ~2 min each. Per-prove wall varies with the rented host's CPU
+            // proves at ~2 min each. That 3 min 56 s intercept was measured with an
+            // UNCAPPED build; CARGO_BUILD_JOBS=8 (see the bench step) raises it by an
+            // amount nobody has measured yet, which the 12 min intercept below absorbs.
+            // Per-prove wall varies with the rented host's CPU
             // (the prover is partly host-CPU-bound), so the slope is the measured one
             // and the intercept carries slack for a colder box.
             const mins = 12 + Number(process.env.PAIRS) * 4;
@@ -265,7 +268,7 @@ jobs:
             sleep "$OFFER_INTERVAL"
           done
           if [ -z "$OFFER_ID" ]; then
-            echo "::error::No RTX 5090 offer matched after $OFFER_ATTEMPTS attempts (>=16 cores, >=48GB RAM, >=64GB disk, driver>=${MIN_DRIVER}, <= \$${PRICE_CAP}/hr)"
+            echo "::error::No RTX 5090 offer matched after $OFFER_ATTEMPTS attempts (whole-machine gpu_frac=1, 16-32 cores, >=48GB RAM, >=64GB disk, driver>=${MIN_DRIVER}, reliability>=0.95, cuda_max_good>=12.8, <= \$${PRICE_CAP}/hr). Full query echoed above."
             exit 1
           fi
           echo "id=$OFFER_ID" >> "$GITHUB_OUTPUT"
@@ -363,6 +366,17 @@ jobs:
         run: |
           SSH="ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o BatchMode=yes -i $KEY -p $PORT root@$HOST"
 
+          # Fail loudly AND legibly. The "Comment ABBA result on PR" step reports failures
+          # by tailing $RUNNER_TEMP/abba_out.txt, but only the bench step writes that file —
+          # so a failure in THIS step used to post "Run failed" above an empty code block,
+          # leaving the operator with nothing but a red X. Record the reason there too.
+          # The bench step's `tee` truncates the file, so a successful run is unaffected.
+          fail() {
+            printf '%s\n' "$1" >> "$RUNNER_TEMP/abba_out.txt"
+            echo "::error::$1"
+            exit 1
+          }
+
           echo "Waiting for the template onstart script to finish (Rust + LLVM + sysroot + clone)..."
           # The bootstrap's final stdout line is "=== done ===", captured by Vast to
           # /var/log/onstart.log. That marker is the ONLY trusted completion signal:
@@ -380,25 +394,50 @@ jobs:
             sleep 10
           done
           if [ -z "$DONE" ]; then
-            echo "::error::onstart never reported '=== done ===' in ~25 min — slow or broken host. Re-run /bench-gpu to reroll the box."
-            exit 1
+            fail "onstart never reported '=== done ===' in ~25 min — slow or broken host. Wait a few minutes before re-running /bench-gpu: offer selection is deterministic (priciest match), so an immediate retry can re-pick this same host once it relists."
           fi
 
-          # Sanity gate: even a box that reports done can have a corrupt toolchain
-          # (bad host RAM shows up as gcc/rustc SIGSEGV on the first heavy crate, e.g.
-          # jemalloc or serde_derive). Compile a trivial C and Rust unit up front so a
-          # bad box fails HERE with a clear message instead of mid-build with an
-          # internal-compiler-error backtrace. Cheap (~1s) vs a ~10 min dual build.
+          # Sanity gate: even a box that reports done can have an unusable toolchain —
+          # a partially provisioned image (no cc, no rustc, missing headers), or a host
+          # whose RAM is faulty enough that compilers die on stock code. Compile AND run
+          # a trivial C and Rust unit so such a box fails HERE, with a clear message,
+          # rather than part-way through the dual build with an internal-compiler-error
+          # backtrace. Costs ~1 s against a build measured in minutes.
+          #
+          # Scope, deliberately narrow. This exercises the HOST toolchain and its default
+          # include path only; it does not touch /opt/lambda-vm-sysroot (the cross sysroot
+          # the guest ELF build uses), so sysroot completeness rests on the onstart marker
+          # above rather than on this check. And a ~1 s compile touching a few MB cannot
+          # reliably surface marginal RAM that only fails under a multi-GB build: it
+          # catches a missing or half-installed toolchain every time, bad RAM only
+          # sometimes. Both are worth a second of wall clock.
+          #
+          # Every command below is a bare statement. Do NOT reintroduce a mid-list `&&`:
+          # under `set -e` a non-final operand of an `&&` list is exempt from errexit and
+          # the list's non-zero status does not re-trigger it, so a compiler that died
+          # would be swallowed and the remote exit status would be the last command's.
+          # The trap keeps the tmpdir cleanup on both the success and failure paths.
+          # `cd` into the repo first so rustup resolves the pinned toolchain from
+          # rust-toolchain.toml, not whatever default the image happens to carry.
           echo "Toolchain sanity check (gcc + rustc)..."
-          # shellcheck disable=SC2016  # $HOME expands on the remote box, not the runner
-          if ! $SSH 'set -e; d=$(mktemp -d); \
+          GATE_OUT=""; GATE_RC=0
+          # shellcheck disable=SC2016  # $HOME and $d expand on the remote box, not the runner
+          GATE_OUT=$($SSH 'set -e; cd /workspace/lambda_vm; \
+                d=$(mktemp -d); trap "rm -rf \"$d\"" EXIT; \
                 printf "#include <stdlib.h>\nint main(void){return 0;}\n" > "$d/t.c"; \
-                cc -O2 "$d/t.c" -o "$d/tc" && "$d/tc"; \
+                cc -O2 "$d/t.c" -o "$d/tc"; "$d/tc"; \
                 printf "fn main(){}\n" > "$d/t.rs"; \
-                "$HOME/.cargo/bin/rustc" -O "$d/t.rs" -o "$d/tr" && "$d/tr"; \
-                rm -rf "$d"'; then
-            echo "::error::Toolchain sanity check failed — this host's gcc/rustc is broken (likely bad RAM: compilers SIGSEGV on stock code). Re-run /bench-gpu to reroll the box."
-            exit 1
+                "$HOME/.cargo/bin/rustc" -O "$d/t.rs" -o "$d/tr"; "$d/tr"' 2>&1) || GATE_RC=$?
+          if [ "$GATE_RC" -ne 0 ]; then
+            if [ -n "$GATE_OUT" ]; then
+              echo "$GATE_OUT"
+              printf '%s\n' "$GATE_OUT" >> "$RUNNER_TEMP/abba_out.txt"
+            fi
+            # 255 is ssh's own "could not talk to the host", not a verdict on the toolchain.
+            if [ "$GATE_RC" -eq 255 ]; then
+              fail "Toolchain sanity check could not reach the box (ssh exit 255) — transport failure, not necessarily a bad host. Re-run /bench-gpu."
+            fi
+            fail "Toolchain sanity check failed (exit $GATE_RC): cc or rustc could not compile and run a trivial program on this host. Usually a partially provisioned image (missing cc/rustc/headers); can also be faulty host RAM, which makes compilers crash on stock code. Output above. Wait a few minutes before re-running /bench-gpu: offer selection is deterministic (priciest match), so an immediate retry can re-pick this same host once it relists."
           fi
           echo "toolchain sane"
 
@@ -448,13 +487,16 @@ jobs:
           # symbol the box's driver doesn't export, e.g. cuDevSmResourceSplit -> runtime panic).
           # MIN_DRIVER>=580 still guards the too-old end (older drivers lack cuCtxGetDevice_v2 and
           # the GPU path falls back to CPU). nvidia-smi is logged for diagnosing driver issues.
-          # CARGO_BUILD_JOBS caps the dual build's parallelism. Uncapped, cargo runs
-          # one rustc per core (16-32 here) and jemalloc-sys's nested `make -j` inherits
-          # the same jobserver, so the initial ramp co-schedules many memory-hungry LLVM
-          # codegen units (syn/serde_derive) with jemalloc's parallel C compiles and can
-          # transiently exceed the box's RAM — memory pressure that shows up as compiler
-          # SIGSEGV. 8 leaves ~6 GB/job on the >=48 GB floor; the build is a one-time
-          # per-bench cost well inside the job timeout.
+          # CARGO_BUILD_JOBS caps the dual build's parallelism. Uncapped, cargo runs one
+          # rustc per core (16-32 here), and jemalloc-sys forwards CARGO_MAKEFLAGS to its
+          # nested `make`, which therefore joins the same jobserver — so the initial ramp
+          # co-schedules many memory-hungry LLVM codegen units (syn/serde_derive) with
+          # jemalloc's parallel C compiles and can transiently exhaust the box's RAM.
+          # That surfaces as the OOM killer reaping a rustc ("signal: 9") or as an
+          # allocation failure mid-compile. (Distinct from the toolchain gate's concern
+          # above, which is a host that is broken before any load is applied.)
+          # 8 leaves ~6 GB/job on the >=48 GB floor; the build is a one-time per-bench
+          # cost, and the job timeout above has ample room for it.
           REMOTE="set -e; cd /workspace/lambda_vm; \
             command -v python3 >/dev/null || { apt-get update -qq && apt-get install -y -qq python3; }; \
             nvidia-smi || true; \
