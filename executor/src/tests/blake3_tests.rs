@@ -8,7 +8,8 @@
 
 use crate::vm::instruction::decoding::Instruction;
 use crate::vm::instruction::execution::{
-    BLAKE3_SYSCALL_NUMBER, ExecutionError, blake3_compress_6round,
+    BLAKE3_ABSORB_MAX_BLOCKS, BLAKE3_ABSORB_SYSCALL_NUMBER, BLAKE3_SYSCALL_NUMBER, ExecutionError,
+    blake3_compress_6round,
 };
 use crate::vm::memory::Memory;
 use crate::vm::registers::Registers;
@@ -315,5 +316,116 @@ fn test_blake3_syscall_rejects_overflowing_state_range() {
     assert!(matches!(
         err,
         ExecutionError::Blake3StateAddressOverflow(addr) if addr == u64::MAX - 167
+    ));
+}
+
+// =============================================================================
+// The chained-absorb ecall's argument validation
+// =============================================================================
+//
+// What the absorb ecall COMPUTES is gated in
+// `prover::tables::blake3::executor_absorb_parity`, which drives it against
+// `crypto`'s `Blake3Chain` over exhaustive message lengths — this crate cannot,
+// having no `crypto` dependency. Checked here is the other half: that every
+// argument the chip's constraints assume was validated is in fact rejected when
+// it is wrong. A handler that accepted one would hand the prover a trace it
+// cannot close, or — worse — one whose memory argument quietly means something
+// other than the guest asked for.
+
+/// Registers for a well-formed absorb.
+fn absorb_registers(ctrl: u64, msg: u64, num_blocks: u64, first_flags: u64) -> Registers {
+    let mut registers = Registers::default();
+    registers.write(17, BLAKE3_ABSORB_SYSCALL_NUMBER).unwrap();
+    registers.write(10, ctrl).unwrap();
+    registers.write(11, msg).unwrap();
+    registers.write(12, num_blocks).unwrap();
+    registers.write(13, first_flags).unwrap();
+    registers
+}
+
+fn run_absorb(registers: &mut Registers) -> Result<(), ExecutionError> {
+    let mut pc = 0;
+    let mut memory = Memory::default();
+    Instruction::EcallEbreak
+        .run(&mut pc, registers, &mut memory)
+        .map(|_| ())
+}
+
+#[test]
+fn test_blake3_absorb_rejects_unaligned_addresses() {
+    // The accelerator reads both regions as doublewords.
+    for (ctrl, msg) in [(0x1004u64, 0x2000u64), (0x1000, 0x2004)] {
+        let mut registers = absorb_registers(ctrl, msg, 1, 0);
+        let err = run_absorb(&mut registers).unwrap_err();
+        assert!(
+            matches!(err, ExecutionError::UnalignedBlake3AbsorbAddress(_)),
+            "ctrl={ctrl:#x} msg={msg:#x} gave {err:?}"
+        );
+    }
+}
+
+#[test]
+fn test_blake3_absorb_rejects_block_counts_outside_the_range() {
+    // Zero blocks would put an Ecall tuple on the bus with no compression row
+    // to answer it.
+    let mut registers = absorb_registers(0x1000, 0x2000, 0, 0);
+    assert!(matches!(
+        run_absorb(&mut registers).unwrap_err(),
+        ExecutionError::Blake3AbsorbBlockCountOutOfRange(0)
+    ));
+
+    // Past the cap the chip's row counter would no longer be bounded far below
+    // the field's modulus, and "the counter reaches 1" would stop implying "the
+    // group has exactly `num_blocks` rows".
+    let over = BLAKE3_ABSORB_MAX_BLOCKS + 1;
+    let mut registers = absorb_registers(0x1000, 0x2000, over, 0);
+    assert!(matches!(
+        run_absorb(&mut registers).unwrap_err(),
+        ExecutionError::Blake3AbsorbBlockCountOutOfRange(n) if n == over
+    ));
+}
+
+#[test]
+fn test_blake3_absorb_rejects_flags_wider_than_the_column() {
+    // The chip commits `flags` as one 32-bit word; a wider value would be
+    // truncated into the trace and the proof would attest a different hash.
+    let mut registers = absorb_registers(0x1000, 0x2000, 1, 1u64 << 32);
+    assert!(matches!(
+        run_absorb(&mut registers).unwrap_err(),
+        ExecutionError::Blake3AbsorbFlagsOutOfRange(f) if f == 1u64 << 32
+    ));
+}
+
+#[test]
+fn test_blake3_absorb_rejects_overlapping_regions() {
+    // Every access of one absorb carries the same timestamp, so an address in
+    // both regions would be touched twice at that timestamp and the MEMW
+    // consistency argument could not order the pair.
+    let ctrl = 0x1000u64;
+    for msg in [ctrl, ctrl - 64, ctrl + 32, ctrl + 56] {
+        let mut registers = absorb_registers(ctrl, msg, 2, 0);
+        let err = run_absorb(&mut registers).unwrap_err();
+        assert!(
+            matches!(err, ExecutionError::Blake3AbsorbRegionOverlap),
+            "msg={msg:#x} gave {err:?}"
+        );
+    }
+    // CONTROL: regions that merely abut are accepted — the message's 128 bytes
+    // end exactly where the control region starts — so the check is discriminating
+    // overlap rather than rejecting every nearby address.
+    let mut registers = absorb_registers(ctrl, ctrl - 128, 2, 0);
+    assert!(!matches!(
+        run_absorb(&mut registers),
+        Err(ExecutionError::Blake3AbsorbRegionOverlap)
+    ));
+}
+
+#[test]
+fn test_blake3_absorb_rejects_overflowing_message_range() {
+    // `num_blocks * 64` must not wrap and the last byte must be addressable.
+    let mut registers = absorb_registers(0x1000, u64::MAX - 63, 2, 0);
+    assert!(matches!(
+        run_absorb(&mut registers).unwrap_err(),
+        ExecutionError::Blake3AbsorbAddressOverflow(_)
     ));
 }

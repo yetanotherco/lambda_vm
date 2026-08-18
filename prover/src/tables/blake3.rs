@@ -1474,3 +1474,193 @@ mod executor_syscall_packing {
         );
     }
 }
+
+/// ★ The absorb ecall folds blocks the way `Blake3Chain` folds them.
+///
+/// The absorb syscall exists so a long message costs one ecall instead of one
+/// per 64 bytes, and paying for that means the executor applies a flag and
+/// `block_len` schedule of its own: `t = 0` and `block_len = 64` on every block,
+/// the caller's `first_flags` on block 0 and nothing after it
+/// ([`executor::vm::instruction::execution::blake3_absorb_chain_6round`]).
+/// `executor` cannot call `crypto`, so that schedule is a SECOND statement of
+/// the framing `Blake3Chain` owns — precisely the thing PA-PLAN §1.4 forbids
+/// leaving unchecked, and precisely the thing that fails invisibly: a guest that
+/// absorbs under the wrong flags produces a perfectly valid proof of a digest
+/// nobody else computes.
+///
+/// This is the gate. It drives real `EcallEbreak` instructions through the
+/// executor exactly as the guest's `bulk_absorb` arm does, finishes the hash
+/// with `Blake3Chain` itself, and compares against `blake3_chain_rounds` — over
+/// every length from the empty message past two blocks, plus the boundaries
+/// that discriminate the schedule. Nothing here restates the framing: the run's
+/// first flag word comes from [`block_flags`], and resuming after the run goes
+/// through `Blake3Chain::resume_with_rounds`, the same call the guest makes.
+#[cfg(test)]
+mod executor_absorb_parity {
+    use crypto::hash::blake3::chain::{
+        BLOCK_LEN, Blake3Chain, blake3_chain_rounds, block_flags, bulk_absorb_blocks,
+        kat_message_byte, pack_absorb_ctrl, unpack_absorb_cv, ABSORB_CV_OUT_DWORD,
+    };
+    use crypto::hash::blake3::{BLAKE3_IV, BLAKE3_SIX_ROUNDS};
+    use executor::vm::instruction::decoding::Instruction;
+    use executor::vm::instruction::execution::BLAKE3_ABSORB_SYSCALL_NUMBER;
+    use executor::vm::memory::Memory;
+    use executor::vm::registers::Registers;
+
+    /// Pre-filled into `cv_out`, so an absorb that wrote nowhere near the
+    /// control region cannot pass on stale bytes.
+    const SENTINEL: u64 = 0xDEAD_BEEF_DEAD_BEEF;
+    /// Disjoint by construction — the ecall rejects overlapping regions, and
+    /// 0x2000 is past the control region's 64 bytes at 0x1000.
+    const CTRL_ADDR: u64 = 0x1000;
+    const MSG_ADDR: u64 = 0x2000;
+
+    fn message(len: usize) -> Vec<u8> {
+        (0..len).map(kat_message_byte).collect()
+    }
+
+    /// One absorb the way a guest performs it: pack the control region, lay the
+    /// blocks out in memory, ecall, read the chaining value back.
+    fn absorb_through_the_accelerator(
+        cv_in: &[u32; 8],
+        blocks: &[u8],
+        first_flags: u32,
+    ) -> [u32; 8] {
+        assert!(blocks.len().is_multiple_of(BLOCK_LEN) && !blocks.is_empty());
+        let mut memory = Memory::default();
+        let mut registers = Registers::default();
+
+        let mut ctrl = pack_absorb_ctrl(cv_in);
+        for dword in &mut ctrl[ABSORB_CV_OUT_DWORD..] {
+            *dword = SENTINEL;
+        }
+        for (k, dword) in ctrl.iter().enumerate() {
+            memory
+                .store_doubleword(CTRL_ADDR + (k as u64) * 8, *dword)
+                .unwrap();
+        }
+        for (k, chunk) in blocks.chunks_exact(8).enumerate() {
+            let dword = u64::from_le_bytes(chunk.try_into().unwrap());
+            memory
+                .store_doubleword(MSG_ADDR + (k as u64) * 8, dword)
+                .unwrap();
+        }
+
+        let mut pc = 0;
+        registers.write(17, BLAKE3_ABSORB_SYSCALL_NUMBER).unwrap();
+        registers.write(10, CTRL_ADDR).unwrap();
+        registers.write(11, MSG_ADDR).unwrap();
+        registers
+            .write(12, (blocks.len() / BLOCK_LEN) as u64)
+            .unwrap();
+        registers.write(13, first_flags as u64).unwrap();
+        Instruction::EcallEbreak
+            .run(&mut pc, &mut registers, &mut memory)
+            .unwrap();
+
+        for (k, dword) in ctrl.iter_mut().enumerate() {
+            *dword = memory.load_doubleword(CTRL_ADDR + (k as u64) * 8).unwrap();
+        }
+        for (k, dword) in ctrl.iter().enumerate().skip(ABSORB_CV_OUT_DWORD) {
+            assert_ne!(*dword, SENTINEL, "cv_out dword {k} was never written");
+        }
+        unpack_absorb_cv(&ctrl)
+    }
+
+    /// `Blake3Chain::update`'s bulk path, driven against the real ecall: absorb
+    /// whole blocks while the schedule will take them, then let the hasher
+    /// finish the tail — which is where the final block's `CHUNK_END | ROOT`
+    /// and true byte count stay.
+    fn chain_through_the_accelerator(msg: &[u8]) -> [u8; 32] {
+        let mut cv = BLAKE3_IV;
+        let mut started = false;
+        let mut rest = msg;
+        loop {
+            // VM addresses here are 8-aligned by construction.
+            let blocks = bulk_absorb_blocks(0, rest.len(), true);
+            if blocks == 0 {
+                break;
+            }
+            // What `Blake3Chain::flags(false)` evaluates to at this point: the
+            // closed form at the next block's index, read rather than restated.
+            let index = usize::from(started);
+            let first_flags = block_flags(index, index + 2);
+            let taken = blocks * BLOCK_LEN;
+            cv = absorb_through_the_accelerator(&cv, &rest[..taken], first_flags);
+            started = true;
+            rest = &rest[taken..];
+        }
+        let mut chain = if started {
+            Blake3Chain::resume_with_rounds(cv, BLAKE3_SIX_ROUNDS)
+        } else {
+            Blake3Chain::with_rounds(BLAKE3_SIX_ROUNDS)
+        };
+        chain.update(rest);
+        chain.finalize_digest()
+    }
+
+    /// ★ Exhaustive over every length through two blocks and past, plus the
+    /// lengths PA-PLAN §1.7.4 singles out. Anything the executor gets wrong
+    /// about the interior schedule moves a digest here.
+    #[test]
+    fn the_absorb_ecall_is_the_chain() {
+        let lengths = (0..=300usize).chain([511, 512, 513, 1023, 1024, 1025, 1088, 4096]);
+        for len in lengths {
+            let msg = message(len);
+            assert_eq!(
+                chain_through_the_accelerator(&msg),
+                blake3_chain_rounds(&msg, BLAKE3_SIX_ROUNDS),
+                "the absorb path must be the chain, at length {len}"
+            );
+        }
+    }
+
+    /// CONTROL: the test above must actually be taking the ecall. If
+    /// `bulk_absorb_blocks` returned 0 everywhere, every assertion would still
+    /// pass — `chain_through_the_accelerator` would degrade to plain
+    /// `Blake3Chain` and gate nothing at all.
+    #[test]
+    fn the_parity_test_really_reaches_the_accelerator() {
+        assert_eq!(bulk_absorb_blocks(0, 65, true), 1);
+        assert_eq!(bulk_absorb_blocks(0, 1024, true), 15);
+        // And an absorb changes the chaining value away from the IV, so the
+        // ecall is doing work rather than copying `cv_in` through.
+        let msg = message(128);
+        let cv = absorb_through_the_accelerator(&BLAKE3_IV, &msg[..64], block_flags(0, 2));
+        assert_ne!(cv, BLAKE3_IV, "the absorb must fold the block in");
+    }
+
+    /// CONTROL: the parity is sensitive to the run's FIRST flag word — the one
+    /// value the guest marshals rather than the executor deriving it. Absorbing
+    /// under interior flags where `CHUNK_START` belongs must not agree, or the
+    /// gate would survive dropping the flag entirely.
+    #[test]
+    fn the_absorb_parity_is_first_flag_sensitive() {
+        let msg = message(128);
+        let honest = absorb_through_the_accelerator(&BLAKE3_IV, &msg[..64], block_flags(0, 2));
+        let tampered = absorb_through_the_accelerator(&BLAKE3_IV, &msg[..64], 0);
+        assert_ne!(honest, tampered, "CHUNK_START must change the absorb");
+    }
+
+    /// CONTROL: the executor applies `first_flags` to block 0 ONLY. A run of
+    /// two blocks must differ from one where the flag were applied to both, or
+    /// "and nothing after it" would be untested.
+    #[test]
+    fn the_absorb_applies_the_first_flag_to_one_block_only() {
+        let msg = message(128);
+        let two_at_once =
+            absorb_through_the_accelerator(&BLAKE3_IV, &msg[..128], block_flags(0, 2));
+        // The same two blocks as two separate runs, each carrying the flag.
+        let first = absorb_through_the_accelerator(&BLAKE3_IV, &msg[..64], block_flags(0, 2));
+        let flagged_twice =
+            absorb_through_the_accelerator(&first, &msg[64..128], block_flags(0, 2));
+        assert_ne!(
+            two_at_once, flagged_twice,
+            "the flag must land on block 0 alone"
+        );
+        // ...and chaining two single-block runs with the interior flag on the
+        // second IS the two-block run: that is what "chained" means.
+        let flagged_once = absorb_through_the_accelerator(&first, &msg[64..128], 0);
+        assert_eq!(two_at_once, flagged_once, "the run must chain its blocks");
+    }
+}
