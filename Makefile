@@ -693,9 +693,12 @@ clippy:
 	# prover's feature forwards to crypto's, so naming it covers both host halves.
 	#
 	# `blake3-absorb` rather than `blake3-6round`: it implies the latter, so this
-	# stays the 6-round pass while also compiling the guest chained-absorb arm,
-	# which no other pass reaches. Its `cfg(not(...))` counterpart is what the
-	# four passes above compile, so both arms stay linted.
+	# stays the 6-round pass while also resolving the absorb feature graph, which
+	# no other pass does. ⚠ It does NOT compile the guest absorb arm: that arm is
+	# `cfg(all(target_arch = "riscv64", feature = "blake3-absorb"))` and this is a
+	# host pass, so what compiles here is its `cfg(not(...))` stub. The riscv64
+	# arm still has no CI coverage at all — RESUME-PA-STAGE4 §4.2's standing hole,
+	# which needs a guest-target build to close, not a clippy feature.
 	cargo clippy --workspace --all-targets --features lambda-vm-prover/blake3-absorb,math-cuda/blake3-6round -- -D warnings -A clippy::op_ref
 
 fmt:
@@ -716,9 +719,12 @@ lint:
 	# prover's feature forwards to crypto's, so naming it covers both host halves.
 	#
 	# `blake3-absorb` rather than `blake3-6round`: it implies the latter, so this
-	# stays the 6-round pass while also compiling the guest chained-absorb arm,
-	# which no other pass reaches. Its `cfg(not(...))` counterpart is what the
-	# four passes above compile, so both arms stay linted.
+	# stays the 6-round pass while also resolving the absorb feature graph, which
+	# no other pass does. ⚠ It does NOT compile the guest absorb arm: that arm is
+	# `cfg(all(target_arch = "riscv64", feature = "blake3-absorb"))` and this is a
+	# host pass, so what compiles here is its `cfg(not(...))` stub. The riscv64
+	# arm still has no CI coverage at all — RESUME-PA-STAGE4 §4.2's standing hole,
+	# which needs a guest-target build to close, not a clippy feature.
 	cargo clippy --workspace --all-targets --features lambda-vm-prover/blake3-absorb,math-cuda/blake3-6round -- -D warnings -A clippy::op_ref
 	# The cuda feature gates whole modules + cuda-only integration tests. build.rs emits empty
 	# cubin stubs when nvcc is absent, so this checks on a GPU-less host (CI lint runner, dev laptop)
