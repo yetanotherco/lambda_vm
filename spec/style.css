@@ -65,7 +65,13 @@ body {
     "nav main ." 1fr
     "nav footnotes ." auto
     "nav footnav footnav" auto
-    / 1fr 6fr 1fr;
+    / minmax(139px, 1fr) 6fr 1fr;
+    /* We go for the minmax to ensure the nav doesn't get squished too much.
+       139px is still enough space, and it makes sure we have pure 1fr-6fr-1fr
+       at the sidenotes.css breakpoint.
+       The 139 is subtracted before the fr calculations, so we need (width - 139)/8 >= 139.
+       And so bp >= 9 * 139.
+    */
   min-height: 100vh;
 }
 
@@ -82,6 +88,10 @@ p:empty {
       "main" auto
       "footnotes" auto
       "footnav" auto;
+  }
+
+  :root {
+    --content-padding-x: 16px;
   }
 }
 
@@ -284,6 +294,7 @@ main {
   padding: 0 var(--content-padding-x);
   margin: 0 auto;
   width: 100%;
+  min-width: 0;
 }
 
 a {
@@ -389,6 +400,8 @@ pre code {
 /* tables */
 figure {
     margin: 1em 0.3em;
+    overflow-x: auto;
+    overflow-y: clip;
 }
 
 table {
