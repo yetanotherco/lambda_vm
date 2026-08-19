@@ -827,16 +827,20 @@ impl LfmAirs {
 
     /// Prove-side projection, frozen order (must match `air_refs`).
     ///
-    /// `traces.keccak_rnd` must have exactly one trace per chunk; a mismatch
-    /// would silently shorten the pair list under `zip`, so it is asserted.
+    /// When the keccak family is present, `traces.keccak_rnd` must have exactly
+    /// one trace per chunk; a mismatch would silently shorten the pair list
+    /// under `zip`, so it is asserted. When the family is ABSENT the counts
+    /// legitimately differ: trace building is mask-blind (the chunk split
+    /// always yields at least one, empty, trace), and the mask simply never
+    /// pairs it — so the assert is gated, or every keccak-less program would
+    /// panic any debug-profile prove while release proved fine.
     #[allow(clippy::type_complexity)]
     pub fn air_trace_pairs<'a>(
         &'a self,
         traces: &'a mut LfmTraces,
     ) -> Vec<(DynLfmAir<'a>, &'a mut TraceTable<F, E>, &'a ())> {
-        debug_assert_eq!(
-            self.keccak_rnd.len(),
-            traces.keccak_rnd.len(),
+        debug_assert!(
+            !self.chip_set.keccak || self.keccak_rnd.len() == traces.keccak_rnd.len(),
             "KECCAK_RND chunk count differs between the AIR set and the traces \
              — artifacts and traces were built from different chunking policies"
         );

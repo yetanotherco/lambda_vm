@@ -177,13 +177,18 @@ pub(super) fn report_census(label: &str, program: &LfmProgram) -> (u64, u64) {
     // independent check of the total — it is the same arithmetic. What IS
     // independent is that the sub-proof COUNT the census implies must equal the
     // AIR count the verifier builds from the program's chunk policy.
+    // Mask-aware, like the census itself: an absent family contributes no
+    // AIRs, so the expected count comes from the program's own chip set and
+    // its family-gated chunk count — `num_lfm_airs` is the FULL-mask count and
+    // no real program is FULL (a program uses at most one hash family).
+    let chip_set = super::airs::ChipSet::for_program(program);
     assert_eq!(
         census.len(),
-        super::airs::num_lfm_airs(
+        chip_set.num_airs(chip_set.keccak_rnd_chunks(
             program
                 .chunking
                 .chunk_count(program.groups.keccak.real_rows)
-        ),
+        )),
         "the census must have one entry per sub-proof the AIR set builds"
     );
     println!("\n★ CHIP CENSUS — {label}");
