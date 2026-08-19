@@ -13,4 +13,4 @@ lambda-vm-syscalls = { path = "../../../../syscalls" }
 lambda-vm-ethrex-crypto = { path = "../../../../crypto/ethrex-crypto" }
 # The `Crypto` trait the guest calls through. Same rev + default-features=false
 # as lambda-vm-ethrex-crypto's own dep, so feature unification adds nothing.
-ethrex-crypto = { git = "https://github.com/lambdaclass/ethrex.git", rev = "156cb8d6a3974f411d71622eecd1b249ee37ff1c", package = "ethrex-crypto", default-features = false }
+ethrex-crypto = { git = "https://github.com/lambdaclass/ethrex.git", rev = "4f658c2b3d10e3f21d35ce546870f55ca3f940fc", package = "ethrex-crypto", default-features = false }
