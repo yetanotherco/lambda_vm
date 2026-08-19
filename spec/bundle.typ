@@ -68,8 +68,8 @@
       html.link(href: "/sidenotes.css", rel: "stylesheet")
       html.script(src: "/sidenotes.js", defer: true)
       heading(numbering: none, link(<doc:index>, meta.title))
-      nav(filename)
       html.main(mainbody)
+      nav(filename)
       prev_next(filename)
   })#label("doc:"+filename)
 ]
