@@ -184,11 +184,13 @@ pub(super) fn report_census(label: &str, program: &LfmProgram) -> (u64, u64) {
     let chip_set = super::airs::ChipSet::for_program(program);
     assert_eq!(
         census.len(),
-        chip_set.num_airs(chip_set.keccak_rnd_chunks(
-            program
-                .chunking
-                .chunk_count(program.groups.keccak.real_rows)
-        )),
+        chip_set.num_airs(
+            chip_set.keccak_rnd_chunks(
+                program
+                    .chunking
+                    .chunk_count(program.groups.keccak.real_rows)
+            )
+        ),
         "the census must have one entry per sub-proof the AIR set builds"
     );
     println!("\n★ CHIP CENSUS — {label}");
