@@ -2936,8 +2936,11 @@ use super::proof_fixture;
 /// simply misses the cache.
 fn fixture_cache() -> std::path::PathBuf {
     let elf = proof_fixture::FIXTURE_INNER_ELF.replace(['/', '\\', '.'], "_");
+    // The format key keeps branches that encode differently off each other's
+    // blob — see `proof_fixture::cache_format_key`.
+    let fmt = proof_fixture::cache_format_key().replace(['/', '\\', '.'], "_");
     std::env::temp_dir().join(format!(
-        "lfm-r1f-continuation-fixture-{elf}-log2_{}.bin",
+        "lfm-r1f-continuation-fixture-{elf}-log2_{}-{fmt}.bin",
         proof_fixture::FIXTURE_EPOCH_LOG2
     ))
 }
