@@ -1563,32 +1563,26 @@ fn collect_keccak_memw_ops(
     memw_ops
 }
 
-/// Collect MEMW operations for a Blake3Compress ECALL.
-///
-/// One register read of x10 plus 22 dword ops at the call's timestamp: the 14
-/// input dwords are pure reads (old = value = the input bytes, re-written at
-/// `ts` like a LOAD), the 8 output dwords write the compression output over
-/// the previous content.
-/// ★ TEST-ONLY — suppresses BLAKE3's *side* contributions to the shared tables.
-///
-/// A BLAKE3 syscall touches four things: the BLAKE3 table itself, the Ecall bus
-/// (CPU sends, BLAKE3 receives), MEMW (it reads and writes the state region),
-/// and BITWISE (its XORs and byte checks). Omitting the BLAKE3 table from a
-/// proof therefore unbalances FOUR buses at once, and the resulting rejection
-/// says nothing about which one did the work — the omission forgery would be
-/// rejected identically if the Ecall receiver did not exist at all.
-///
-/// Setting this builds the trace with the MEMW and BITWISE contributions left
-/// out, so those two balance without the table and **Ecall is the only
-/// unmatched interaction left**. That is what makes the forgery test in
-/// `prove_elfs_tests` a test of the Ecall argument rather than of arithmetic
-/// that would hold anyway.
-///
-/// It exists behind `cfg(test)` because it builds a trace that does not
-/// describe the execution: nothing may prove under it except a deliberate
-/// forgery.
 #[cfg(test)]
 thread_local! {
+    /// ★ TEST-ONLY — suppresses BLAKE3's *side* contributions to the shared tables.
+    ///
+    /// A BLAKE3 syscall touches four things: the BLAKE3 table itself, the Ecall bus
+    /// (CPU sends, BLAKE3 receives), MEMW (it reads and writes the state region),
+    /// and BITWISE (its XORs and byte checks). Omitting the BLAKE3 table from a
+    /// proof therefore unbalances FOUR buses at once, and the resulting rejection
+    /// says nothing about which one did the work — the omission forgery would be
+    /// rejected identically if the Ecall receiver did not exist at all.
+    ///
+    /// Setting this builds the trace with the MEMW and BITWISE contributions left
+    /// out, so those two balance without the table and **Ecall is the only
+    /// unmatched interaction left**. That is what makes the forgery test in
+    /// `prove_elfs_tests` a test of the Ecall argument rather than of arithmetic
+    /// that would hold anyway.
+    ///
+    /// It exists behind `cfg(test)` because it builds a trace that does not
+    /// describe the execution: nothing may prove under it except a deliberate
+    /// forgery.
     pub(crate) static STRIP_BLAKE3_SIDE_EFFECTS: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
 }
@@ -1603,6 +1597,12 @@ pub(crate) fn strip_blake3_side_effects() -> bool {
     false
 }
 
+/// Collect MEMW operations for a Blake3Compress ECALL.
+///
+/// One register read of x10 plus 22 dword ops at the call's timestamp: the 14
+/// input dwords are pure reads (old = value = the input bytes, re-written at
+/// `ts` like a LOAD), the 8 output dwords write the compression output over
+/// the previous content.
 fn collect_blake3_memw_ops(
     op: &CpuOperation,
     words: &[u32; 28],
