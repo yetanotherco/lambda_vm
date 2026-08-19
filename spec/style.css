@@ -257,11 +257,26 @@ body > h2:first-of-type {
   position: sticky;
   top: 0;
   z-index: 10;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 body > h2:first-of-type a {
   color: inherit;
   text-decoration: none;
+}
+
+.subheader {
+  color: var(--author-fg);
+  font-size: 0.6em;
+  font-weight: 400;
+  white-space: nowrap;
+}
+
+.subheader::before {
+  /* A bullet + some spacing */
+  content: " \2022 \00a0";
 }
 
 body::before {

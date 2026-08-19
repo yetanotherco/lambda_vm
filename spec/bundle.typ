@@ -63,11 +63,17 @@
 }
 
 #let chapter(filename, title, mainbody) = [
-  #document("/" + filename + ".html", title: title, {
+  #let (doctitle, vistitle) = if title == meta.title {
+    (title, title)
+  } else {
+    (title + " | " + meta.title, meta.title + html.span(class: "subheader", title))
+  }
+
+  #document("/" + filename + ".html", title: doctitle, {
       html.link(href: "/style.css", rel: "stylesheet")
       html.link(href: "/sidenotes.css", rel: "stylesheet")
       html.script(src: "/sidenotes.js", defer: true)
-      heading(numbering: none, link(<doc:index>, meta.title))
+      heading(numbering: none, link(<doc:index>, vistitle))
       html.main(mainbody)
       nav(filename)
       prev_next(filename)
@@ -81,7 +87,7 @@
 
 #for (partname, part) in meta.summary {
   for (name, title, ref) in part {
-    chapter(name, title + " | " + meta.title, [
+    chapter(name, title, [
       #heading(level: 1, title)#ref
       #set heading(offset: 1)
       #include name + ".typ"
