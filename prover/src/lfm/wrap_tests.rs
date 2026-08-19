@@ -37,6 +37,7 @@ use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};
 
 use super::airs::{HeightRule, LfmChipCells, lfm_cell_counts, lfm_chip_census};
 use super::compiler::LfmProgram;
+use super::edsl::WrapHash;
 use super::epoch_tests::EpochInputs;
 use super::executor::execute;
 use super::hash::TestPermutation;
@@ -82,6 +83,21 @@ pub(super) fn permutations(program: &LfmProgram) -> usize {
         .instrs
         .iter()
         .filter(|i| matches!(i, Instr::KeccakF(_)))
+        .count()
+}
+
+/// The production wrap hash's own operations in a program — keccak
+/// permutations or BLAKE3 compressions, whichever `hash` names. The census's
+/// closed-form check compares like with like: `query_permutations_for` counts
+/// compressions under the same hash's block rule.
+pub(super) fn hash_ops(program: &LfmProgram, hash: WrapHash) -> usize {
+    program
+        .instrs
+        .iter()
+        .filter(|i| match hash {
+            WrapHash::Keccak => matches!(i, Instr::KeccakF(_)),
+            WrapHash::Blake3 => matches!(i, Instr::Blake3(_)),
+        })
         .count()
 }
 
@@ -532,27 +548,33 @@ fn wrap_run_from(inner: ProofOptions, inputs: EpochInputs) {
     // that quietly stopped hashing a group fails here rather than printing a
     // smaller number.
     let spine = super::epoch_tests::epoch_program(&e, false);
-    let leg_perms = permutations(&program) - permutations(&spine);
+    // The legs hash with the PRODUCTION wrap hash — keccak pre-flip, BLAKE3
+    // after it — so both sides of the closed-form check follow it: the emitted
+    // count is that hash's own instruction, and the prediction uses its block
+    // rule. Counting keccak against a BLAKE3 leg reads 0 and fails spuriously.
+    let wrap_hash = WrapHash::production();
+    let leg_hash_ops = hash_ops(&program, wrap_hash) - hash_ops(&spine, wrap_hash);
     let predicted: usize = e
         .legs
         .iter()
-        .map(|l| super::epoch_verify::query_permutations(&l.verify))
+        .map(|l| super::epoch_verify::query_permutations_for(&l.verify, wrap_hash))
         .sum();
     assert_eq!(
-        leg_perms, predicted,
-        "the emitted leg permutations must equal the closed form over the shapes"
+        leg_hash_ops, predicted,
+        "the emitted leg {wrap_hash:?} operations must equal the closed form over the shapes"
     );
     let queries = e.legs[0].verify.num_queries;
     println!(
-        "   spine {} instr / {} perms / {} words   legs {} / {} / {}   \
-         per query: {:.1} perms ({} queries, closed form checked)",
+        "   spine {} instr / {} {:?} ops / {} words   legs {} / {} / {}   \
+         per query: {:.1} ops ({} queries, closed form checked)",
         spine.instrs.len(),
-        permutations(&spine),
+        hash_ops(&spine, wrap_hash),
+        wrap_hash,
         arena_words(&spine),
         program.instrs.len() - spine.instrs.len(),
-        leg_perms,
+        leg_hash_ops,
         arena_words(&program) - arena_words(&spine),
-        leg_perms as f64 / queries as f64,
+        leg_hash_ops as f64 / queries as f64,
         queries,
     );
 
@@ -969,6 +991,18 @@ fn projected_peak_bytes(main: u64, aux: u64) -> f64 {
 #[test]
 #[ignore]
 fn the_wrap_census_at_blowup_8() {
+    // This instrument compares against wave-6 PINNED keccak-era predictions
+    // (openings 100,959; FRI 14,454/sub-proof) and decomposes with the
+    // keccak-rate helpers. Under a BLAKE3 wrap those comparisons are not wrong
+    // by a constant — they are about a different program. Re-derive the pins
+    // under the production hash before running it there; until then, fail with
+    // the cause named instead of an inscrutable count mismatch.
+    assert_eq!(
+        WrapHash::production(),
+        WrapHash::Keccak,
+        "the blowup-8 census's pinned predictions are keccak-era; re-derive them \
+         under the production wrap hash before running this instrument"
+    );
     let inner = crate::recursion::Preset::Blowup8.options();
     let t = Instant::now();
     let e = super::epoch_tests::real_epoch_with(inner.clone());
