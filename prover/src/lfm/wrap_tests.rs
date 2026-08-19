@@ -323,6 +323,7 @@ fn the_wrap_reports_gpu_counters() {
             &proved.public_words,
             &opts,
             artifacts.hasher,
+            artifacts.chip_set,
         ),
         "the wrap proof must verify"
     );
@@ -497,6 +498,7 @@ fn wrap_run_from(inner: ProofOptions, inputs: EpochInputs) {
             &proved.public_words,
             &opts,
             artifacts.hasher,
+            artifacts.chip_set,
         ),
         "the wrap proof must verify"
     );
@@ -572,6 +574,7 @@ fn wrap_run_from(inner: ProofOptions, inputs: EpochInputs) {
             &moved,
             &opts,
             artifacts.hasher,
+            artifacts.chip_set,
         ),
         "a moved claimed public word must make the wrap proof UNVERIFIABLE"
     );
@@ -592,6 +595,7 @@ fn wrap_run_from(inner: ProofOptions, inputs: EpochInputs) {
             &proved.public_words,
             &opts,
             artifacts.hasher,
+            artifacts.chip_set,
         ),
         "a moved program digest must make the wrap proof UNVERIFIABLE"
     );
@@ -670,6 +674,7 @@ fn the_wrap_commitments_match_across_residency_modes() {
                 &proved.public_words,
                 &opts,
                 artifacts.hasher,
+                artifacts.chip_set,
             ),
             "the wrap proof must verify under {residency:?}"
         );
@@ -986,6 +991,15 @@ fn the_census_agrees_with_the_traces_the_prover_builds() {
         crate::tables::types::GoldilocksField,
         crate::tables::types::GoldilocksExtension,
     >| (t.num_rows(), t.num_main_columns);
+    // Gated exactly as `air_trace_pairs` gates: this list is what the PROVER
+    // proves, and the chain program hashes with keccak, so it carries the
+    // keccak family and omits LFM_BLAKE3.
+    let chip_set = super::airs::ChipSet::for_program(&program);
+    assert_eq!(
+        (chip_set.keccak, chip_set.blake3),
+        (true, false),
+        "the keccak chain must be a keccak-family program with no BLAKE3 work"
+    );
     let mut built: Vec<(usize, usize)> = vec![
         dims(&traces.const_),
         dims(&traces.balu),
@@ -993,15 +1007,21 @@ fn the_census_agrees_with_the_traces_the_prover_builds() {
         dims(&traces.select),
         dims(&traces.bitdec),
         dims(&traces.hash),
-        dims(&traces.keccak),
-        dims(&traces.lanes),
-        dims(&traces.hint),
-        dims(&traces.public),
-        dims(&traces.range),
-        dims(&traces.blake3),
     ];
-    built.extend(traces.keccak_rnd.iter().map(dims));
-    built.push(dims(&traces.keccak_rc));
+    if chip_set.keccak {
+        built.push(dims(&traces.keccak));
+    }
+    built.push(dims(&traces.lanes));
+    built.push(dims(&traces.hint));
+    built.push(dims(&traces.public));
+    built.push(dims(&traces.range));
+    if chip_set.blake3 {
+        built.push(dims(&traces.blake3));
+    }
+    if chip_set.keccak {
+        built.extend(traces.keccak_rnd.iter().map(dims));
+        built.push(dims(&traces.keccak_rc));
+    }
     built.push(dims(&traces.bitwise));
 
     assert_eq!(
@@ -1027,7 +1047,12 @@ fn the_census_agrees_with_the_traces_the_prover_builds() {
     // ---- the AIR set: the names and the widths, in the frozen order.
     let opts = wrap_options();
     let artifacts = build_artifacts(&program, &opts);
-    let airs = super::airs::LfmAirs::new(&artifacts.roots, &opts, artifacts.keccak_rnd_chunks);
+    let airs = super::airs::LfmAirs::new(
+        &artifacts.roots,
+        &opts,
+        artifacts.keccak_rnd_chunks,
+        artifacts.chip_set,
+    );
     let refs = airs.air_refs();
     assert_eq!(
         census.len(),

@@ -20,7 +20,7 @@ use stark::verifier::{IsStarkVerifier, Verifier};
 
 use crate::tables::types::{BusId, GoldilocksExtension, GoldilocksField};
 
-use super::airs::{LfmAirs, NUM_LFM_CHIPS, num_lfm_airs};
+use super::airs::{ChipSet, LfmAirs, NUM_LFM_CHIPS};
 use super::compiler::LfmProgram;
 use super::executor::{LfmExecError, execute};
 use super::hash::HasherKind;
@@ -172,6 +172,7 @@ pub(crate) fn prove_traces_with_hasher(
         options,
         artifacts.keccak_rnd_chunks,
         hasher,
+        artifacts.chip_set,
     );
     let mut transcript = DefaultStarkTranscript::<E>::new(&[]);
     absorb_lfm_statement(
@@ -228,6 +229,7 @@ pub fn lfm_verify(
         claimed_public,
         options,
         entry.hasher,
+        entry.chip_set,
     ))
 }
 
@@ -256,18 +258,26 @@ pub fn verify_against(
     claimed_public: &[(u32, LfmWord)],
     options: &ProofOptions,
     hasher: HasherKind,
+    chip_set: ChipSet,
 ) -> bool {
-    // A zero chunk count would drop KECCAK_RND — and its constraints — from
-    // the set entirely. Reject the shape rather than build it.
-    if keccak_rnd_chunks == 0 {
+    // The chunk count and the mask must agree, and BOTH come from the resolved
+    // registry entry rather than the proof — so this rejects a malformed entry,
+    // not a hostile prover.
+    //
+    // With the keccak family present a zero chunk count would drop KECCAK_RND —
+    // and its constraints — from a set that still contains LFM_KECCAK's sends,
+    // which is the shape the old unconditional guard existed to refuse. With
+    // the family absent, zero is the only correct count: the chip has no work,
+    // no sends and no reason to exist.
+    if chip_set.keccak != (keccak_rnd_chunks > 0) {
         return false;
     }
     let view = MultiProofView::Owned(proof);
-    if view.len() != num_lfm_airs(keccak_rnd_chunks) {
+    if view.len() != chip_set.num_airs(keccak_rnd_chunks) {
         return false;
     }
 
-    let airs = LfmAirs::new_with_hasher(roots, options, keccak_rnd_chunks, hasher);
+    let airs = LfmAirs::new_with_hasher(roots, options, keccak_rnd_chunks, hasher, chip_set);
     let refs = airs.air_refs();
 
     let mut transcript = DefaultStarkTranscript::<E>::new(&[]);

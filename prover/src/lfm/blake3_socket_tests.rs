@@ -1433,6 +1433,7 @@ fn the_blake3_socket_proves_and_verifies() {
             &proved.public_words,
             &opts,
             artifacts.hasher,
+            artifacts.chip_set,
         ),
         "an honest BLAKE3-configured proof must verify"
     );
@@ -1469,6 +1470,7 @@ fn a_blake3_proof_does_not_verify_under_another_hasher() {
                 &proved.public_words,
                 &opts,
                 other,
+                artifacts.chip_set,
             ),
             "a BLAKE3 proof must not verify under {other:?}"
         );
@@ -1524,6 +1526,7 @@ fn round_trip(mutate: impl FnOnce(&mut TraceTable<F, E>)) -> Result<bool, String
             &exec.public_words,
             &opts,
             KIND,
+            artifacts.chip_set,
         )),
         Err(e) => Err(format!("{e:?}")),
     }
@@ -1589,6 +1592,7 @@ fn the_trivial_program_proves_and_verifies_under_blake3() {
             &proved.public_words,
             &opts,
             artifacts.hasher,
+            artifacts.chip_set,
         ),
         "an honest BLAKE3 proof of TrivialV0 must verify"
     );

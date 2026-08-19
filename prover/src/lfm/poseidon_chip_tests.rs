@@ -511,6 +511,7 @@ fn the_poseidon_chip_proves_and_verifies() {
             &proved.public_words,
             &opts,
             artifacts.hasher,
+            artifacts.chip_set,
         ),
         "an honest Poseidon-configured proof must verify"
     );
@@ -544,6 +545,7 @@ fn a_proof_does_not_verify_under_the_other_hasher() {
                 &proved.public_words,
                 &opts,
                 verified_under,
+                artifacts.chip_set,
             ),
             "a proof made under {proved_under:?} must not verify under {verified_under:?}"
         );

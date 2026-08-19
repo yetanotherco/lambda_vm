@@ -82,10 +82,110 @@ pub const LFM_CHIP_NAMES: [&str; NUM_LFM_CHIPS] = [
 /// index expression here is written against.
 pub const KECCAK_RND_SLOT: usize = 12;
 
+/// The hash-family slots [`ChipSet`] gates. `BITWISE` (14) is deliberately not
+/// among them: both families send to its `ByteAlu`/`AreBytes` buses, so it is
+/// shared infrastructure rather than either family's chip.
+pub const KECCAK_SLOT: usize = 6;
+pub const BLAKE3_SLOT: usize = 11;
+pub const KECCAK_RC_SLOT: usize = 13;
+
 /// AIR instances (and sub-proofs) in a proof whose `KECCAK_RND` is split into
 /// `keccak_rnd_chunks` instances.
 pub const fn num_lfm_airs(keccak_rnd_chunks: usize) -> usize {
-    NUM_LFM_CHIPS - 1 + keccak_rnd_chunks
+    ChipSet::FULL.num_airs(keccak_rnd_chunks)
+}
+
+/// ★ Which hash-family chip groups a program instantiates.
+///
+/// The machine hosts two hash families, and a program uses at most one of them.
+/// Carrying the other is a whole AIR per chip — commitment, Merkle tree,
+/// opening, FRI — for zero rows. On a real block that bill was measured: the
+/// always-on BLAKE3 RV64 table cost the recursion wrap +31.2% of its trace
+/// cells and +44% of its peak memory while carrying 0.035% of the epoch's own
+/// cells (`thoughts/shared/block-compression/WRAP-GROWTH-BISECT.md`). Whichever
+/// hash is not in use should not be paying for a chip group — in **both**
+/// directions, which is why this is one mask and not two special cases.
+///
+/// ## Scope: the hash families only
+///
+/// Deliberately NOT "drop any chip with no rows". Most programs leave several
+/// chips at the four-row floor (`TrivialV0` leaves eight), and dropping those
+/// would dissolve the fixed-machine property for every program instead of
+/// retiring two mutually-exclusive families. `BITWISE` is excluded for a
+/// second reason: both families send to its `ByteAlu`/`AreBytes` buses, so it
+/// is shared infrastructure, not part of either family.
+///
+/// ## Why this does not negotiate shape on the verify path
+///
+/// `airs.rs`' header refuses a program-dependent chip set *negotiated from the
+/// proof*, and names the exception: shape "read from the registry, not
+/// negotiated on the verify path" is legitimate, which is how `KECCAK_RND`'s
+/// chunk count already works. This is that. The mask is computed from the
+/// compiled program at bless time, stored in the registry entry, and folded
+/// into `program_id` via [`Self::as_tag`] — so a verifier takes it from the
+/// entry it resolved, never from the prover. There is no prover assertion here
+/// to attack, which makes this a strictly stronger position than the RV64
+/// side's conditional BLAKE3 table.
+///
+/// ## What decides it
+///
+/// A program's own compiled groups. `WrapHash::production()` is the upstream
+/// cause — it is what makes an authenticating program's keccak group empty
+/// once the commitment hash is BLAKE3 — but it is not the predicate: programs
+/// that are ABOUT a hash (`KeccakChainV0`, `KeccakSpongeV0`) name keccak
+/// directly and keep the keccak family no matter what the production hash is.
+/// Keying off the global would have silently broken exactly those.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChipSet {
+    /// `LFM_KECCAK`, every `KECCAK_RND` chunk, and `KECCAK_RC`.
+    pub keccak: bool,
+    /// `LFM_BLAKE3`.
+    pub blake3: bool,
+}
+
+impl ChipSet {
+    /// Both families — the shape every program had before this was conditional.
+    pub const FULL: Self = Self {
+        keccak: true,
+        blake3: true,
+    };
+
+    /// The families a compiled program actually uses.
+    pub fn for_program(program: &super::compiler::LfmProgram) -> Self {
+        Self {
+            keccak: program.groups.keccak.real_rows > 0,
+            blake3: program.groups.blake3.real_rows > 0,
+        }
+    }
+
+    /// Sub-proofs a proof under this mask carries.
+    pub const fn num_airs(self, keccak_rnd_chunks: usize) -> usize {
+        // The classes no family owns: all 15 less KECCAK_RND (counted per
+        // chunk below), less LFM_KECCAK and KECCAK_RC (keccak's), less
+        // LFM_BLAKE3 (blake3's).
+        let mut n = NUM_LFM_CHIPS - 4;
+        if self.keccak {
+            n += 2 + keccak_rnd_chunks;
+        }
+        if self.blake3 {
+            n += 1;
+        }
+        n
+    }
+
+    /// `KECCAK_RND` instances under this mask. Zero when the family is absent —
+    /// the chunking policy's own floor of one exists to keep an unused chip
+    /// present, which is the decision this reverses.
+    pub fn keccak_rnd_chunks(self, policy_chunks: usize) -> usize {
+        if self.keccak { policy_chunks } else { 0 }
+    }
+
+    /// One byte, folded into `program_id`. The mask is program shape, so a
+    /// build under a different mask is a different program identity by name —
+    /// not merely by a root that happens to differ.
+    pub const fn as_tag(self) -> u8 {
+        (self.keccak as u8) | ((self.blake3 as u8) << 1)
+    }
 }
 
 /// Permutations in each `KECCAK_RND` chunk, in chunk order.
@@ -252,9 +352,14 @@ pub fn lfm_chip_census_with_hasher(
     // `BITWISE`. `per_chip` above lists the classes with the last two at the
     // end, so the chunks are spliced in before them rather than appended.
     let rnd_interactions = keccak_rnd::bus_interactions().len();
+    // The census reports the chips the machine actually instantiates, so it
+    // gates on the same mask `air_refs` does — a census that counted an absent
+    // family would describe a different machine than the one being proved,
+    // which is precisely what this function's doc promises it cannot.
+    let chip_set = ChipSet::for_program(program);
     let mut census = Vec::with_capacity(per_chip.len() + 1);
     for (slot, (rows, num_cols, prep, interactions)) in per_chip.into_iter().enumerate() {
-        if slot == KECCAK_RND_SLOT {
+        if slot == KECCAK_RND_SLOT && chip_set.keccak {
             for rows in keccak_rnd_chunk_rows(program) {
                 census.push(LfmChipCells {
                     name: LFM_CHIP_NAMES[KECCAK_RND_SLOT],
@@ -264,15 +369,24 @@ pub fn lfm_chip_census_with_hasher(
                 });
             }
         }
+        // `per_chip`'s last two entries are chip classes 13 and 14, which sit
+        // at indices 12 and 13 of that array — hence the shift past the
+        // `KECCAK_RND` slot rather than a plain index.
+        let class = if slot >= KECCAK_RND_SLOT {
+            slot + 1
+        } else {
+            slot
+        };
+        let present = match class {
+            KECCAK_SLOT | KECCAK_RC_SLOT => chip_set.keccak,
+            BLAKE3_SLOT => chip_set.blake3,
+            _ => true,
+        };
+        if !present {
+            continue;
+        }
         census.push(LfmChipCells {
-            // `per_chip`'s last two entries are chip classes 13 and 14, which sit
-            // at indices 12 and 13 of that array — hence the shift past the
-            // `KECCAK_RND` slot rather than a plain index.
-            name: LFM_CHIP_NAMES[if slot >= KECCAK_RND_SLOT {
-                slot + 1
-            } else {
-                slot
-            }],
+            name: LFM_CHIP_NAMES[class],
             rows,
             main_cols: num_cols - prep,
             aux_cols: interactions.div_ceil(2),
@@ -328,6 +442,10 @@ pub struct LfmAirs {
     keccak_rnd: Vec<LfmAir<keccak_rnd::KeccakRndConstraints>>,
     keccak_rc: LfmAir<EmptyConstraints>,
     bitwise: LfmAir<EmptyConstraints>,
+    /// Which hash families this set instantiates. The unused family's AIRs are
+    /// still BUILT (construction is free — there is no keygen here) but are not
+    /// offered to the prover or the verifier, so a proof never carries them.
+    chip_set: ChipSet,
 }
 
 /// Builds an AIR with **no** preprocessed columns — `KECCAK_RND` only.
@@ -381,8 +499,15 @@ impl LfmAirs {
         roots: &[Commitment; NUM_LFM_CHIPS],
         options: &ProofOptions,
         keccak_rnd_chunks: usize,
+        chip_set: ChipSet,
     ) -> Self {
-        Self::new_with_hasher(roots, options, keccak_rnd_chunks, HasherKind::default())
+        Self::new_with_hasher(
+            roots,
+            options,
+            keccak_rnd_chunks,
+            HasherKind::default(),
+            chip_set,
+        )
     }
 
     /// [`LfmAirs::new`] with the `LFM_HASH` permutation chosen explicitly.
@@ -399,6 +524,7 @@ impl LfmAirs {
         options: &ProofOptions,
         keccak_rnd_chunks: usize,
         hasher: HasherKind,
+        chip_set: ChipSet,
     ) -> Self {
         LfmAirs {
             const_: build_air(
@@ -544,6 +670,7 @@ impl LfmAirs {
                 roots[14],
                 bitwise::NUM_PRECOMPUTED_COLS,
             ),
+            chip_set,
         }
     }
 
@@ -561,15 +688,23 @@ impl LfmAirs {
             &self.select,
             &self.bitdec,
             &self.hash,
-            &self.keccak,
-            &self.lanes,
-            &self.hint,
-            &self.public,
-            &self.range,
-            &self.blake3,
         ];
-        refs.extend(self.keccak_rnd.iter().map(|a| a as DynLfmAir<'_>));
-        refs.push(&self.keccak_rc);
+        // The frozen order is unchanged; an absent family leaves a hole in it
+        // rather than moving anything after it.
+        if self.chip_set.keccak {
+            refs.push(&self.keccak);
+        }
+        refs.push(&self.lanes);
+        refs.push(&self.hint);
+        refs.push(&self.public);
+        refs.push(&self.range);
+        if self.chip_set.blake3 {
+            refs.push(&self.blake3);
+        }
+        if self.chip_set.keccak {
+            refs.extend(self.keccak_rnd.iter().map(|a| a as DynLfmAir<'_>));
+            refs.push(&self.keccak_rc);
+        }
         refs.push(&self.bitwise);
         refs
     }
@@ -596,20 +731,28 @@ impl LfmAirs {
             (&self.select, &mut traces.select, &()),
             (&self.bitdec, &mut traces.bitdec, &()),
             (&self.hash, &mut traces.hash, &()),
-            (&self.keccak, &mut traces.keccak, &()),
-            (&self.lanes, &mut traces.lanes, &()),
-            (&self.hint, &mut traces.hint, &()),
-            (&self.public, &mut traces.public, &()),
-            (&self.range, &mut traces.range, &()),
-            (&self.blake3, &mut traces.blake3, &()),
         ];
-        pairs.extend(
-            self.keccak_rnd
-                .iter()
-                .zip(traces.keccak_rnd.iter_mut())
-                .map(|(air, trace)| (air as DynLfmAir<'a>, trace, &())),
-        );
-        pairs.push((&self.keccak_rc, &mut traces.keccak_rc, &()));
+        // Same gating as `air_refs`, in the same order — these two ARE the
+        // proof's layout and must move together.
+        if self.chip_set.keccak {
+            pairs.push((&self.keccak, &mut traces.keccak, &()));
+        }
+        pairs.push((&self.lanes, &mut traces.lanes, &()));
+        pairs.push((&self.hint, &mut traces.hint, &()));
+        pairs.push((&self.public, &mut traces.public, &()));
+        pairs.push((&self.range, &mut traces.range, &()));
+        if self.chip_set.blake3 {
+            pairs.push((&self.blake3, &mut traces.blake3, &()));
+        }
+        if self.chip_set.keccak {
+            pairs.extend(
+                self.keccak_rnd
+                    .iter()
+                    .zip(traces.keccak_rnd.iter_mut())
+                    .map(|(air, trace)| (air as DynLfmAir<'a>, trace, &())),
+            );
+            pairs.push((&self.keccak_rc, &mut traces.keccak_rc, &()));
+        }
         pairs.push((&self.bitwise, &mut traces.bitwise, &()));
         pairs
     }

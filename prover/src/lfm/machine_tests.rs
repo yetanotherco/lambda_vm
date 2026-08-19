@@ -655,6 +655,7 @@ fn keccak_sponge_reference_lengths_prove_and_verify() {
                 &proved.public_words,
                 &opts,
                 artifacts.hasher,
+                artifacts.chip_set,
             ),
             "len {len}: the machine proof of keccak256 must verify"
         );
@@ -717,6 +718,7 @@ fn tampered_stream_half_rejects() {
             &honest.public_words,
             &opts,
             artifacts.hasher,
+            artifacts.chip_set,
         ),
         "claiming the honest digest for a tampered stream must reject"
     );
@@ -759,6 +761,7 @@ fn tampered_absorb_xor_rejects() {
             &exec.public_words,
             &opts,
             artifacts.hasher,
+            artifacts.chip_set,
         ),
         "a broken absorb XOR must reject"
     );
@@ -849,6 +852,7 @@ fn permute_row_cannot_substitute_the_permuted_state() {
             &exec.public_words,
             &opts,
             artifacts.hasher,
+            artifacts.chip_set,
         ),
         "a permute row whose PERM_IN differs from the state it read must reject"
     );
@@ -956,6 +960,7 @@ fn machine_proves_the_sample_replay() {
                 &proved.public_words,
                 &opts,
                 artifacts.hasher,
+                artifacts.chip_set,
             ),
             "len {len}: the machine proof of sample() must verify"
         );
@@ -1246,6 +1251,7 @@ fn canonicity_guard_rejects_an_out_of_range_candidate_in_the_proof() {
             &exec.public_words,
             &opts,
             artifacts.hasher,
+            artifacts.chip_set,
         ),
         "a candidate at p must fail the canonicity guard"
     );
@@ -1422,6 +1428,7 @@ fn tampered_transcript_absorb_half_rejects() {
                 &honest.public_words,
                 &opts,
                 artifacts.hasher,
+                artifacts.chip_set,
             ),
             "{what}: claiming the honest challenges for a tampered absorb must reject"
         );
@@ -1878,6 +1885,7 @@ fn append_ext_proves_and_verifies() {
             &proved.public_words,
             &opts,
             artifacts.hasher,
+            artifacts.chip_set,
         ),
         "the big-endian absorb must verify"
     );
@@ -2012,6 +2020,7 @@ fn splice_proves_and_verifies() {
             &proved.public_words,
             &opts,
             artifacts.hasher,
+            artifacts.chip_set,
         ),
         "the spliced absorb must verify"
     );
@@ -2299,6 +2308,7 @@ fn tampered_statement_or_root_rejects() {
                 &honest.public_words,
                 &opts,
                 artifacts.hasher,
+                artifacts.chip_set,
             ),
             "{what}: claiming the honest challenges must reject"
         );
@@ -2421,15 +2431,22 @@ fn round_ops_of(
     keccak_adapter::round_operations(&ops)
 }
 
-/// Every registered program is single-chunk under the default policy, so the
-/// production path is unchanged by this feature — chunking is dormant until a
-/// program exceeds 21,845 permutations.
+/// Every registered program that HAS the keccak family is single-chunk under
+/// the default policy, so the production path is unchanged by this feature —
+/// chunking is dormant until a program exceeds 21,845 permutations.
+///
+/// A program without the family carries zero instances, not one. The policy's
+/// own floor of one exists to keep an unused chip present, and `ChipSet` is
+/// what retired that: post-flip the authenticating programs hash with BLAKE3
+/// and have no keccak work at all, so a KECCAK_RND instance would be a whole
+/// AIR — commitment, tree, opening, FRI — carrying nothing.
 #[test]
 fn registered_programs_are_single_chunk() {
     for entry in super::registry::LFM_REGISTRY {
+        let expected = usize::from(entry.chip_set.keccak);
         assert_eq!(
-            entry.keccak_rnd_chunks, 1,
-            "{:?} is registered with a chunk count other than 1",
+            entry.keccak_rnd_chunks, expected,
+            "{:?} is registered with a chunk count its chip set does not imply",
             entry.kind
         );
     }
@@ -2509,6 +2526,7 @@ fn every_registry_entry_binds_its_hasher_into_its_digest() {
                 &entry.log_heights,
                 entry.keccak_rnd_chunks,
                 entry.hasher,
+                entry.chip_set,
             ),
             entry.program_id,
             "{:?}: the stored digest must be what the stored shape derives",
@@ -2524,6 +2542,7 @@ fn every_registry_entry_binds_its_hasher_into_its_digest() {
                     &entry.log_heights,
                     entry.keccak_rnd_chunks,
                     other,
+                    entry.chip_set,
                 ),
                 entry.program_id,
                 "{:?}: {other:?} must not share {:?}'s program identity",
@@ -2574,6 +2593,7 @@ fn the_registry_hasher_is_what_verify_builds() {
                 &proved.public_words,
                 &opts,
                 other,
+                entry.chip_set,
             ),
             "the entry's own proof must not verify under {other:?}"
         );
@@ -2636,7 +2656,7 @@ fn chunked_sponge_proves_and_verifies() {
     );
     assert_eq!(
         stark::proof::view::MultiProofView::Owned(&proved.proof).len(),
-        num_lfm_airs(2),
+        artifacts.chip_set.num_airs(2),
         "the proof must carry one sub-proof per AIR instance"
     );
     assert!(
@@ -2648,6 +2668,7 @@ fn chunked_sponge_proves_and_verifies() {
             &proved.public_words,
             &opts,
             artifacts.hasher,
+            artifacts.chip_set,
         ),
         "a two-chunk KECCAK_RND proof must verify"
     );
@@ -2693,6 +2714,7 @@ fn chunking_does_not_change_what_is_proved() {
                 &proof.public_words,
                 &opts,
                 artifacts.hasher,
+                artifacts.chip_set,
             ),
             "both chunkings must verify against their own artifacts"
         );
@@ -2736,6 +2758,7 @@ fn tampered_second_chunk_permutation_rejects() {
             &exec.public_words,
             &opts,
             artifacts.hasher,
+            artifacts.chip_set,
         ),
         "a corrupted permutation in the second chunk must reject"
     );
@@ -2774,6 +2797,7 @@ fn dropping_the_second_chunks_permutation_rejects() {
             &exec.public_words,
             &opts,
             artifacts.hasher,
+            artifacts.chip_set,
         ),
         "a chunk missing its permutation must reject"
     );
@@ -2817,6 +2841,7 @@ fn permutations_may_be_reassigned_across_chunk_boundaries() {
             &exec.public_words,
             &opts,
             artifacts.hasher,
+            artifacts.chip_set,
         ),
         "chunk assignment is free — a 1+2 split proves the same statement as 2+1"
     );
@@ -2850,6 +2875,7 @@ fn verify_rejects_a_chunk_count_that_does_not_match_the_proof() {
                 &proved.public_words,
                 &opts,
                 artifacts.hasher,
+                artifacts.chip_set,
             ),
             "chunk count {wrong} must not verify a 2-chunk proof"
         );
@@ -3186,6 +3212,7 @@ fn the_merkle_walk_authenticates_a_real_opening() {
             &proved.public_words,
             &opts,
             artifacts.hasher,
+            artifacts.chip_set,
         ),
         "the authenticated opening must verify"
     );
@@ -3314,6 +3341,7 @@ fn tampered_merkle_opening_rejects() {
                 &honest.public_words,
                 &opts,
                 artifacts.hasher,
+                artifacts.chip_set,
             ),
             "{what}: claiming the real committed root for a forged walk must reject"
         );
@@ -3698,6 +3726,7 @@ fn l2g_binding_proves_and_verifies() {
             &proved.public_words,
             &opts,
             artifacts.hasher,
+            artifacts.chip_set,
         ),
         "the L2G binding must verify"
     );
@@ -3773,6 +3802,7 @@ fn tampered_l2g_binding_rejects() {
             &honest.public_words,
             &opts,
             artifacts.hasher,
+            artifacts.chip_set,
         ),
         "claiming the real per-epoch roots for a reordered binding must reject"
     );
@@ -3854,6 +3884,7 @@ fn program_id_matches_production_on_the_real_fixture() {
             &proved.public_words,
             &opts,
             artifacts.hasher,
+            artifacts.chip_set,
         ),
         "the program-id fold must verify"
     );
@@ -3911,6 +3942,7 @@ fn program_id_folds_pages_in_the_production_layout() {
                 &proved.public_words,
                 &opts,
                 artifacts.hasher,
+                artifacts.chip_set,
             ),
             "{num_pages} pages: the fold must verify"
         );
@@ -3991,6 +4023,7 @@ fn tampered_program_id_inputs_change_the_id() {
                 &honest.public_words,
                 &opts,
                 artifacts.hasher,
+                artifacts.chip_set,
             ),
             "{what}: claiming the honest id must reject"
         );
@@ -4433,6 +4466,7 @@ fn the_register_derivation_proves_and_verifies() {
             &proved.public_words,
             &opts,
             artifacts.hasher,
+            artifacts.chip_set,
         ),
         "the derivation must verify"
     );
@@ -4496,6 +4530,7 @@ fn tampering_the_register_files_moves_the_derived_root() {
                 &honest.public_words,
                 &opts,
                 artifacts.hasher,
+                artifacts.chip_set,
             ),
             "{what}: claiming the honest root must reject"
         );
@@ -4600,4 +4635,210 @@ fn negative_hash_multiplicity_in_a_registered_group_fails_admission() {
         ),
         "a negative multiplicity in the committed group must fail admission"
     );
+}
+
+// =============================================================================
+// ★ R2 — the symmetric conditional hash-family chip group
+// =============================================================================
+//
+// The machine hosts two hash families and a program uses at most one. Carrying
+// the other costs a whole AIR per chip for zero rows. `ChipSet` retires the
+// unused one — in BOTH directions from one mask, which is the point: post-flip
+// the live direction is dropping the KECCAK family, and pre-flip it was
+// dropping LFM_BLAKE3.
+//
+// Unlike the RV64 side's conditional BLAKE3 table, nothing here is
+// prover-asserted. The mask is computed from the compiled program at bless
+// time, stored in the registry entry and folded into `program_id`, so a
+// verifier reads it from the entry it resolved. There is no forgery direction
+// to test because there is no prover claim to forge — the tests that matter are
+// that the mask is what the programs actually use, that both directions prove
+// and verify, and that a wrong mask cannot be substituted.
+
+/// ★ PRIMARY — the live post-flip direction: a program that authenticates with
+/// BLAKE3 carries no keccak family at all.
+///
+/// `StatementReplayV0` is the real one (the continuation-epoch statement bind
+/// plus Phase A). Post-flip it hashes with BLAKE3, so LFM_KECCAK, every
+/// KECCAK_RND chunk and KECCAK_RC are all absent — four sub-proofs that were
+/// pure overhead.
+#[test]
+fn a_blake3_authenticating_program_carries_no_keccak_family() {
+    let opts = options();
+    let program = statement_replay_program();
+    let artifacts = build_artifacts(&program, &opts);
+
+    assert_eq!(
+        (artifacts.chip_set.keccak, artifacts.chip_set.blake3),
+        (false, true),
+        "post-flip the authenticating programs hash with BLAKE3 and use no keccak"
+    );
+    assert_eq!(
+        artifacts.keccak_rnd_chunks, 0,
+        "an absent keccak family carries zero KECCAK_RND instances"
+    );
+
+    let airs = super::airs::LfmAirs::new_with_hasher(
+        &artifacts.roots,
+        &opts,
+        artifacts.keccak_rnd_chunks,
+        artifacts.hasher,
+        artifacts.chip_set,
+    );
+    let names: Vec<&str> = airs.air_refs().iter().map(|a| a.name()).collect();
+    for absent in ["LFM_KECCAK", "KECCAK_RND", "KECCAK_RC"] {
+        assert!(
+            !names.contains(&absent),
+            "{absent} must not be instantiated for a BLAKE3-authenticating program"
+        );
+    }
+    assert!(
+        names.contains(&"LFM_BLAKE3"),
+        "the family it DOES use must be present"
+    );
+    assert!(
+        names.contains(&"BITWISE"),
+        "BITWISE is shared infrastructure — both families send to its buses — \
+         and must survive dropping either one"
+    );
+
+    // The honest path: it still proves and verifies without them.
+    let f = statement_fixture();
+    let proved = lfm_prove(&program, &artifacts, &statement_arenas(&f), &opts).expect("prove");
+    assert!(
+        verify_against(
+            &artifacts.roots,
+            &artifacts.program_id,
+            artifacts.keccak_rnd_chunks,
+            &proved.proof,
+            &proved.public_words,
+            &opts,
+            artifacts.hasher,
+            artifacts.chip_set,
+        ),
+        "a BLAKE3 program must prove and verify with the keccak family absent"
+    );
+}
+
+/// The other direction of the SAME mask: a program that is ABOUT keccak keeps
+/// the keccak family and drops LFM_BLAKE3.
+///
+/// This is the control that makes the primary test mean something. It also
+/// pins why the mask is per-program rather than keyed on
+/// `WrapHash::production()`: the production wrap hash here is BLAKE3, and
+/// keying off it would have silently stripped the keccak family from the very
+/// programs that exist to exercise keccak.
+#[test]
+fn a_keccak_program_keeps_the_keccak_family_whatever_the_production_hash() {
+    let opts = options();
+    let program = keccak_chain_program();
+    let artifacts = build_artifacts(&program, &opts);
+
+    assert_eq!(
+        (artifacts.chip_set.keccak, artifacts.chip_set.blake3),
+        (true, false),
+        "a keccak instrument uses keccak and no BLAKE3, regardless of the \
+         production commitment hash"
+    );
+    assert_eq!(artifacts.keccak_rnd_chunks, 1);
+
+    let airs = super::airs::LfmAirs::new_with_hasher(
+        &artifacts.roots,
+        &opts,
+        artifacts.keccak_rnd_chunks,
+        artifacts.hasher,
+        artifacts.chip_set,
+    );
+    let names: Vec<&str> = airs.air_refs().iter().map(|a| a.name()).collect();
+    assert!(names.contains(&"LFM_KECCAK") && names.contains(&"KECCAK_RC"));
+    assert!(
+        !names.contains(&"LFM_BLAKE3"),
+        "the unused BLAKE3 chip must not be instantiated"
+    );
+}
+
+/// A program using NEITHER family drops both — the mask is not a two-way
+/// switch, it is a per-family presence bit.
+#[test]
+fn a_program_using_no_hash_family_carries_neither() {
+    let opts = options();
+    let artifacts = build_artifacts(&trivial_program(), &opts);
+    assert_eq!(
+        (artifacts.chip_set.keccak, artifacts.chip_set.blake3),
+        (false, false),
+        "the trivial program hashes nothing"
+    );
+    let airs = super::airs::LfmAirs::new_with_hasher(
+        &artifacts.roots,
+        &opts,
+        artifacts.keccak_rnd_chunks,
+        artifacts.hasher,
+        artifacts.chip_set,
+    );
+    let names: Vec<&str> = airs.air_refs().iter().map(|a| a.name()).collect();
+    for absent in ["LFM_KECCAK", "KECCAK_RND", "KECCAK_RC", "LFM_BLAKE3"] {
+        assert!(!names.contains(&absent), "{absent} must be absent");
+    }
+}
+
+/// The registry's masks are what the programs actually compile to.
+///
+/// The mask is the authority the verifier reads, so a registry entry claiming a
+/// family the program does not use — or omitting one it does — would build the
+/// wrong AIR set. This recomputes every entry's mask from its program.
+#[test]
+fn every_registry_mask_is_the_programs_own_usage() {
+    let opts = options();
+    let cases: [(LfmProgramKind, super::compiler::LfmProgram); 6] = [
+        (LfmProgramKind::TrivialV0, trivial_program()),
+        (LfmProgramKind::FriToyV0, super::programs::fri_toy_program()),
+        (LfmProgramKind::KeccakChainV0, keccak_chain_program()),
+        (
+            LfmProgramKind::KeccakSpongeV0,
+            super::programs::keccak_sponge_program(super::programs::KECCAK_SPONGE_LEN),
+        ),
+        (
+            LfmProgramKind::TranscriptReplayV0,
+            super::programs::transcript_replay_program(),
+        ),
+        (
+            LfmProgramKind::StatementReplayV0,
+            statement_replay_program(),
+        ),
+    ];
+    for (kind, program) in &cases {
+        let entry = super::registry::resolve(*kind, 2).expect("registered");
+        let computed = super::airs::ChipSet::for_program(program);
+        assert_eq!(
+            entry.chip_set, computed,
+            "{kind:?}: the registry mask must be the program's own family usage"
+        );
+        assert_eq!(
+            entry.keccak_rnd_chunks,
+            computed.keccak_rnd_chunks(
+                program
+                    .chunking
+                    .chunk_count(program.groups.keccak.real_rows)
+            ),
+            "{kind:?}: chunk count must follow the mask"
+        );
+        // And the mask is bound: a different one is a different identity.
+        let other = super::airs::ChipSet {
+            keccak: !computed.keccak,
+            blake3: computed.blake3,
+        };
+        let _ = &opts;
+        assert_ne!(
+            super::statement::lfm_program_id(
+                &entry.roots,
+                &entry.log_heights,
+                entry.keccak_rnd_chunks,
+                entry.hasher,
+                other,
+            ),
+            entry.program_id,
+            "{kind:?}: the chip set must be folded into program_id, or a verifier \
+             could resolve one mask and build another"
+        );
+    }
 }

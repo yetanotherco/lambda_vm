@@ -560,6 +560,7 @@ fn fri_toy_proves_and_verifies_under_blake3() {
             &proved.public_words,
             &opts,
             artifacts.hasher,
+            artifacts.chip_set,
         ),
         "an honest BLAKE3 proof of FriToyV0 must verify"
     );
@@ -588,6 +589,7 @@ fn fri_toy_proves_and_verifies_under_every_hasher() {
                 &proved.public_words,
                 &opts,
                 artifacts.hasher,
+                artifacts.chip_set,
             ),
             "an honest proof of FriToyV0 must verify under {kind:?}"
         );

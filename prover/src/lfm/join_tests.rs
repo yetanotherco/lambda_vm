@@ -1041,6 +1041,7 @@ fn the_join_proves_and_verifies() {
             &proved.public_words,
             &opts,
             artifacts.hasher,
+            artifacts.chip_set,
         ),
         "the joined run must verify"
     );

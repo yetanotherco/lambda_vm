@@ -72,6 +72,10 @@ fn main() {
                 artifacts.keccak_rnd_chunks
             );
             println!("        hasher: HasherKind::{:?},", artifacts.hasher);
+            println!(
+                "        chip_set: ChipSet {{ keccak: {}, blake3: {} }},",
+                artifacts.chip_set.keccak, artifacts.chip_set.blake3
+            );
             println!("        program_id: {},", fmt_bytes(&artifacts.program_id));
             println!("    }},");
         }

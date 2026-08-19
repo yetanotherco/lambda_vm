@@ -557,6 +557,7 @@ fn the_transcript_proves_and_verifies_under_blake3() {
             &proved.public_words,
             &opts,
             artifacts.hasher,
+            artifacts.chip_set,
         ),
         "an honest BLAKE3 transcript proof must verify"
     );
@@ -587,6 +588,7 @@ fn the_transcript_proves_and_verifies_under_every_hasher() {
                 &proved.public_words,
                 &opts,
                 artifacts.hasher,
+                artifacts.chip_set,
             ),
             "an honest transcript proof must verify under {kind:?}"
         );

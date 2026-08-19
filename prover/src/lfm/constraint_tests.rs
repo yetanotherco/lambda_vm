@@ -1357,6 +1357,7 @@ fn constraint_leg_proves_and_verifies() {
             &proved.public_words,
             &opts,
             artifacts.hasher,
+            artifacts.chip_set,
         ),
         "the proved composition check must verify"
     );
@@ -1375,6 +1376,7 @@ fn constraint_leg_proves_and_verifies() {
             &wrong,
             &opts,
             artifacts.hasher,
+            artifacts.chip_set,
         ),
         "a mismatched claimed composition must be rejected"
     );

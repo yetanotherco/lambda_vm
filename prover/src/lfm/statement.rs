@@ -20,7 +20,7 @@ use stark::config::{Commitment, CommitmentHash};
 
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 
-use super::airs::NUM_LFM_CHIPS;
+use super::airs::{ChipSet, NUM_LFM_CHIPS};
 use super::hash::HasherKind;
 use super::word::LfmWord;
 
@@ -88,6 +88,7 @@ pub fn lfm_program_id(
     log_heights: &[u8; NUM_LFM_CHIPS],
     keccak_rnd_chunks: usize,
     hasher: HasherKind,
+    chip_set: ChipSet,
 ) -> Commitment {
     let mut h = Keccak256::new();
     h.update(LFM_PROGRAM_TAG);
@@ -95,6 +96,13 @@ pub fn lfm_program_id(
     h.update(LFM_PRESET_TAG.to_le_bytes());
     h.update([hasher.as_tag()]);
     h.update([commitment_hash_tag(stark::config::COMMITMENT_HASH)]);
+    // ★ The chip set is program shape and is bound by NAME, for the reason the
+    // commitment hash is: the roots of an absent family are still in the array
+    // (a hole, like KECCAK_RND's), so nothing else in this digest distinguishes
+    // a program that instantiates a family from one that omits it. Without this
+    // byte a verifier resolving the wrong mask would build a different AIR set
+    // and report an unrecognised shape rather than the mismatch it is.
+    h.update([chip_set.as_tag()]);
     for i in 0..NUM_LFM_CHIPS {
         h.update([i as u8]);
         h.update(roots[i]);

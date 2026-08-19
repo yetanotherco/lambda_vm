@@ -483,6 +483,7 @@ fn the_blake3_chip_proves_and_verifies() {
                 &proved.public_words,
                 &opts,
                 artifacts.hasher,
+                artifacts.chip_set,
             ),
             "len {len}: the machine proof of Blake3Chain must verify"
         );
@@ -520,6 +521,7 @@ fn tampering_with_the_blake3_witness_is_not_accepted() {
                 &exec.public_words,
                 &opts,
                 artifacts.hasher,
+                artifacts.chip_set,
             ),
             "a tampered LFM_BLAKE3 witness must not verify"
         ),
@@ -645,6 +647,7 @@ fn the_two_wrap_hashes_produce_mutually_unverifiable_proofs() {
             &proved.public_words,
             &opts,
             artifacts.hasher,
+            artifacts.chip_set,
         )
     };
     // The honest control comes first: each proof verifies under its own.
@@ -825,6 +828,7 @@ fn keccak_still_proves_and_verifies_through_the_switched_emitters() {
             &proved.public_words,
             &opts,
             artifacts.hasher,
+            artifacts.chip_set,
         ),
         "the keccak proof must still verify"
     );
@@ -1386,6 +1390,7 @@ fn the_reversed_digest_send_proves_and_verifies() {
                 &proved.public_words,
                 &opts,
                 artifacts.hasher,
+                artifacts.chip_set,
             ),
             "len {len}: a proof carrying the reversed-digest send must verify"
         );
@@ -1490,6 +1495,7 @@ fn both_blake3_surfaces_in_one_machine_balance_bitwise() {
                 &proved.public_words,
                 &opts,
                 HasherKind::Blake3,
+                artifacts.chip_set,
             ),
             "{what}: must verify — a shared-BITWISE cross-balance between the \
              socket and the chip would show up here"
