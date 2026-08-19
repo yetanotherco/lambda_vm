@@ -401,11 +401,17 @@ fn the_assembled_epoch_verifier_runs() {
     // asserted, so the next always-on table fails here saying which input
     // moved instead of leaving a bare literal to re-bless.
     //
+    // It has now moved the other way, by the same accounting: BLAKE3 stopped
+    // being always-on (it is `TableCounts::blake3`, and this epoch does not use
+    // it), so 26 → 25 and 119 → 115. This epoch is exactly the workload the
+    // bisect priced — a near-empty always-on table is four challenges here and
+    // +31.2% of the wrap's cells at the secure preset.
+    //
     // `LFM_BLAKE3` (P-a Stage 5) does NOT appear in either number: it is a chip
     // of the LFM machine, counted by `NUM_LFM_CHIPS`, and this is the RV64
     // epoch the LFM machine verifies.
-    const SUB_PROOFS: usize = 26;
-    const CHALLENGES_AT_MIN_PRESET: usize = 119;
+    const SUB_PROOFS: usize = 25;
+    const CHALLENGES_AT_MIN_PRESET: usize = 115;
     const CHALLENGES_PER_ALWAYS_ON_TABLE: usize = 4;
     assert_eq!(
         e.tables.len(),
