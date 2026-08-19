@@ -80,3 +80,15 @@ rkyv = ["dep:rkyv", "math/rkyv"]
 # exercises both, and `math_cuda::blake3::device_rounds` makes the match
 # assertable rather than discoverable as a wrong root.
 blake3-6round = []
+# Let `Blake3Chain::update` reach the chained-absorb ecall — one call per run of
+# whole blocks instead of one per block. Implies `blake3-6round`: the absorb
+# accelerator, like the compression one, implements six rounds and nothing else.
+#
+# ⚠ SEPARATE FROM `blake3-6round` ON PURPOSE, and not for tuning. A guest that
+# emits this ecall puts an `Ecall` bus tuple on the bus that only the prover's
+# BLAKE3 absorb mode can receive. Until that mode lands, a guest built with this
+# feature produces a trace whose LogUp argument cannot balance — a proof that
+# fails with no algebraic pointer to the cause. Keeping the guest arm behind its
+# own switch means flipping `blake3-6round` to a default cannot turn the absorb
+# path on by accident.
+blake3-absorb = ["blake3-6round"]

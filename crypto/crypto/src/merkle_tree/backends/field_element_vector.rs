@@ -243,11 +243,82 @@ where
     }
 
     fn hash_data_from_slices(a: &[FieldElement<F>], b: &[FieldElement<F>]) -> [u8; NUM_BYTES] {
+        // A size threshold below which this streams straight through was tried
+        // and MEASURED NEUTRAL-TO-WORSE (963.56M vs 963.28M cycles on a blowup8
+        // verify, with `verify_fri` unmoved to the cycle). The 6.9M `verify_fri`
+        // rise that this change costs is NOT the staging buffer — gating the
+        // buffer away does not recover it — so it is not worth a branch here.
+        // Do not re-add one without a measurement.
         hash_streamed::<D, NUM_BYTES>(|sink| {
+            let mut stage = LeafStage::new();
             for element in a.iter().chain(b.iter()) {
-                element.stream_bytes(sink);
+                element.stream_bytes(&mut |bytes| stage.push(bytes, sink));
             }
+            stage.flush(sink);
         })
+    }
+}
+
+/// Bytes of the leaf staging buffer. A multiple of the BLAKE3 block so a full
+/// flush is a whole number of blocks, and large enough that the run reaching the
+/// hasher is worth batching — 16 blocks.
+const LEAF_STAGE_BYTES: usize = 1024;
+
+/// Coalesces a leaf's field elements into large aligned runs before they reach
+/// the hasher.
+///
+/// ★ Why this exists. A leaf arrives one field element at a time — eight bytes
+/// per `stream_bytes` call — so the hasher only ever saw eight bytes at a time,
+/// and `Blake3Chain`'s bulk-absorb path (which needs more than one block in hand
+/// to batch anything) could never engage. The leaf therefore paid one ecall and
+/// one 112-byte marshal per 64 bytes, which is the cost the absorb ecall exists
+/// to remove and, measured, the dominant term in a real in-guest verify.
+///
+/// The staging buffer is `align(8)` because the accelerator reads the message as
+/// doublewords and declines an unaligned slice — an unaligned buffer here would
+/// silently give back the per-block path with no diagnostic.
+///
+/// **This cannot change any digest.** The same bytes reach the hasher in the
+/// same order; only the call boundaries move, and `Blake3Chain::update` is
+/// split-invariant by construction (`streaming_splits_agree_with_one_shot`
+/// checks every split of every length through two blocks). It is also hash-
+/// agnostic: keccak's sponge is equally split-invariant and simply sees fewer,
+/// larger `update` calls.
+#[repr(align(8))]
+struct LeafStage {
+    buf: [u8; LEAF_STAGE_BYTES],
+    len: usize,
+}
+
+impl LeafStage {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            buf: [0u8; LEAF_STAGE_BYTES],
+            len: 0,
+        }
+    }
+
+    #[inline]
+    fn push(&mut self, mut bytes: &[u8], sink: &mut dyn FnMut(&[u8])) {
+        while !bytes.is_empty() {
+            if self.len == LEAF_STAGE_BYTES {
+                sink(&self.buf[..LEAF_STAGE_BYTES]);
+                self.len = 0;
+            }
+            let take = (LEAF_STAGE_BYTES - self.len).min(bytes.len());
+            self.buf[self.len..self.len + take].copy_from_slice(&bytes[..take]);
+            self.len += take;
+            bytes = &bytes[take..];
+        }
+    }
+
+    #[inline]
+    fn flush(&mut self, sink: &mut dyn FnMut(&[u8])) {
+        if self.len > 0 {
+            sink(&self.buf[..self.len]);
+            self.len = 0;
+        }
     }
 }
 

@@ -13,7 +13,22 @@
 //!
 //! TODO: LT bus (needs LT table integration)
 
-use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+// ★ The Fiat-Shamir transcript MUST be the one `DefaultStarkHash` names, not
+// `DefaultTranscript`'s own type-parameter default.
+//
+// `crypto::…::DefaultTranscript<F, T = KeccakTranscriptHash>` defaults to keccak;
+// since BLAKE3 became `DefaultStarkHash`, that default is no longer the
+// production hash. Proving under the bare type while
+// `compute_expected_commit_bus_balance_view` replays under
+// `DefaultStarkTranscript` derives the two sides' LogUp challenges from
+// DIFFERENT hashes, so the expected COMMIT contribution is computed at the wrong
+// challenge point and every program with non-empty public output fails to verify
+// with "LogUp bus does not balance" — 19 tests in this file. `config.rs` warns
+// about exactly this half-flip ("the type system cannot force this; naming the
+// alias is what makes the production path follow DefaultStarkHash"); the warning
+// applies to the test harness too.
+use stark::config::DefaultStarkTranscript as DefaultTranscript;
+
 use math::field::element::FieldElement;
 use stark::constraints::builder::EmptyConstraints;
 use stark::lookup::{AirWithBuses, AuxiliaryTraceBuildData};
@@ -1150,6 +1165,160 @@ fn test_prove_elfs_blake3() {
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
         "blake3 prove/verify failed"
+    );
+}
+
+/// ★ The chained-absorb mode, end to end through the REAL prover.
+///
+/// The unit suite in `tables::blake3::absorb_tests` checks the mode's
+/// constraints and its internal bus in isolation; this is the honest path that
+/// exercises everything they cannot: the CPU's `Ecall` send meeting the group's
+/// FIRST row, the MEMW ordering of a dozen accesses that all carry the ecall's
+/// single timestamp, the BITWISE multiplicities the group's rows consume, and a
+/// second group whose `cv_out` write lands on memory the first group wrote.
+///
+/// The guest absorbs three blocks in one ecall and one more in a second, so the
+/// trace holds a 4-row group and a 2-row group at different timestamps — the
+/// shape that would break if the chain were keyed on anything but the timestamp.
+#[test]
+fn test_prove_elfs_blake3_absorb() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_blake3_absorb");
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
+    let result = executor.run().expect("Failed to run program");
+
+    // Replay the guest's two absorbs against the ecall's pure form. The guest
+    // seeds cv_in with dwords 1..4 and the message with dwords 100..123, then
+    // absorbs blocks 0..3 under CHUNK_START and block 1 again under interior
+    // flags.
+    use executor::vm::instruction::execution::blake3_absorb_chain_6round;
+    let dword_words = |dwords: &[u64]| -> Vec<u32> {
+        dwords
+            .iter()
+            .flat_map(|d| [*d as u32, (*d >> 32) as u32])
+            .collect()
+    };
+    let cv_in: [u32; 8] = dword_words(&[1, 2, 3, 4]).try_into().unwrap();
+    let msg: Vec<u32> = dword_words(&(100u64..124).collect::<Vec<_>>());
+    let block = |i: usize| -> [u32; 16] { msg[i * 16..(i + 1) * 16].try_into().unwrap() };
+
+    let after_first = blake3_absorb_chain_6round(&cv_in, &[block(0), block(1), block(2)], 1);
+    let after_second = blake3_absorb_chain_6round(&after_first, &[block(1)], 0);
+    let expected_bytes: Vec<u8> = after_second.iter().flat_map(|w| w.to_le_bytes()).collect();
+
+    assert_eq!(
+        result.return_values.memory_values, expected_bytes,
+        "committed chaining value must match two chained absorb ecalls"
+    );
+
+    // Stack RAM needs PAGE tables, like keccak and the single-compression mode.
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
+    assert_eq!(
+        traces.public_output_bytes,
+        result.return_values.memory_values
+    );
+
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "blake3 absorb prove/verify failed"
+    );
+}
+
+/// ★ F1 acceptance: a machine-level attempt at an UNALIGNED absorb must not
+/// verify — and this records WHICH layer rejects it, because that turned out to
+/// be load-bearing and undocumented.
+///
+/// The executor refuses an unaligned x11 outright, so no program can reach this
+/// state; the trace has to be forged. Rewriting `M_BASE`'s low halfword, and the
+/// eight `MSG_PTR` low halfwords with it so the pointer arithmetic still holds,
+/// is exactly the shape a prover would submit.
+///
+/// TWO independent layers reject it now, and the order matters to anyone
+/// changing either:
+///
+///  1. **The chip's alignment constraint** `FIRST·(M_BASE[0] − 8·Q) = 0`, added
+///     for F1. This is what makes the rejection a statement about the ABI.
+///  2. **The MEMW argument**, which would have rejected this particular forgery
+///     even before (1) existed — for an unrelated reason worth naming: the
+///     chip's message reads would address `msg+1 …`, and the MEMW table holds no
+///     access there, so the `Memw` bus has sends with no receiver. That is a
+///     property of THIS forgery, not a general defence: a forger who also
+///     rewrote the MEMW rows clears (2) and is caught only by (1).
+///
+/// The test asserts the rejection and pins (2)'s premise — that MEMW really has
+/// no row at the unaligned address — so the claim cannot rot silently.
+#[test]
+fn test_prove_elfs_blake3_absorb_unaligned_message_rejected() {
+    use crate::tables::blake3::MSG_DWORDS;
+    use crate::tables::blake3::cols as b3;
+    use crate::tables::memw::cols as memw_cols;
+    use crate::tables::memw_aligned::cols as memw_a_cols;
+
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_blake3_absorb");
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
+    let result = executor.run().expect("Failed to run program");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
+
+    let one = FieldElement::<GoldilocksField>::one();
+    let zero = FieldElement::<GoldilocksField>::zero();
+
+    // The first row of an absorb group, and its honest message base.
+    let first_row = (0..traces.blake3.num_rows())
+        .find(|&r| *traces.blake3.main_table.get(r, b3::FIRST) == one)
+        .expect("the guest performs at least one absorb");
+    let honest_base_lo = *traces.blake3.main_table.get(first_row, b3::M_BASE);
+
+    // Premise of rejection path (2): the memory tables access the aligned base
+    // and nothing one byte past it. An 8-aligned dword read takes the MEMW_A
+    // fast path, so both tables have to be scanned, and both are chunked.
+    let memw_has_base = |addr: FieldElement<GoldilocksField>| {
+        let in_memw = traces.memws.iter().any(|t| {
+            (0..t.num_rows()).any(|r| {
+                *t.main_table.get(r, memw_cols::IS_REGISTER) == zero
+                    && *t.main_table.get(r, memw_cols::BASE_ADDRESS_0) == addr
+            })
+        });
+        let in_memw_a = traces.memw_aligneds.iter().any(|t| {
+            (0..t.num_rows()).any(|r| {
+                *t.main_table.get(r, memw_a_cols::IS_REGISTER) == zero
+                    && *t.main_table.get(r, memw_a_cols::BASE_ADDRESS[0]) == addr
+            })
+        });
+        in_memw || in_memw_a
+    };
+    assert!(
+        memw_has_base(honest_base_lo),
+        "the honest message base must be a real MEMW access"
+    );
+    assert!(
+        !memw_has_base(honest_base_lo + one),
+        "nothing accesses the unaligned address — this is why MEMW also rejects"
+    );
+
+    // Forge: shift the message base and its dword pointers by one byte, keeping
+    // `msg_ptr[j] = M_BASE + 8j` internally consistent.
+    traces
+        .blake3
+        .main_table
+        .set(first_row, b3::M_BASE, honest_base_lo + one);
+    for j in 0..MSG_DWORDS {
+        let c = b3::msg_ptr(j, 0);
+        let v = *traces.blake3.main_table.get(first_row, c);
+        traces.blake3.main_table.set(first_row, c, v + one);
+    }
+
+    assert!(
+        !prove_and_verify_vm_minimal(&elf, &mut traces),
+        "an unaligned absorb message must not verify"
     );
 }
 

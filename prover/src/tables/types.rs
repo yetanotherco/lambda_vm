@@ -371,6 +371,16 @@ pub enum BusId {
     /// LFM public values: token `(index, v0..v3)`; closed by a
     /// consumer-computed balance (the COMMIT-bus pattern).
     LfmPublic = 34,
+
+    // =========================================================================
+    // BLAKE3 chained absorb
+    // =========================================================================
+    /// BLAKE3 absorb self-referencing chain (row N → row N+1 of one absorb
+    /// group): `(timestamp, remaining, msg_base, ctrl_addr, cv[0..8])`.
+    ///
+    /// ID 35 rather than 29: 29 is a gap left by a removed bus and reusing it
+    /// would make a stale artifact decode as this one.
+    Blake3Absorb = 35,
 }
 
 impl BusId {
@@ -403,6 +413,7 @@ impl BusId {
             BusId::LfmMem => "LfmMem",
             BusId::LfmRange => "LfmRange",
             BusId::LfmPublic => "LfmPublic",
+            BusId::Blake3Absorb => "Blake3Absorb",
         }
     }
 }
@@ -438,6 +449,7 @@ impl TryFrom<u64> for BusId {
             32 => Ok(BusId::LfmMem),
             33 => Ok(BusId::LfmRange),
             34 => Ok(BusId::LfmPublic),
+            35 => Ok(BusId::Blake3Absorb),
             other => Err(other),
         }
     }

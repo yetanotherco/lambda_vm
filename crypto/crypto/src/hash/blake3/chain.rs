@@ -131,6 +131,120 @@ pub const fn block_len_of(index: usize, len_bytes: usize) -> u32 {
     }
 }
 
+// -------------------------------------------------------------------------
+// The bulk-absorb accelerator path
+// -------------------------------------------------------------------------
+
+/// Dwords in the absorb accelerator's control region: `cv_in[8 words] |
+/// cv_out[8 words]`, two little-endian `u32` words per dword. Mirrors
+/// `BLAKE3_ABSORB_CTRL_DWORDS` in `executor::vm::instruction::execution`.
+pub const ABSORB_CTRL_DWORDS: usize = 8;
+
+/// First dword of `cv_out` inside the control region — the accelerator reads
+/// dwords `0..4` and writes the outgoing chaining value into `4..8`.
+pub const ABSORB_CV_OUT_DWORD: usize = 4;
+
+/// Largest block run one absorb ecall accepts — 1 024 blocks, 64 KiB. Mirrors
+/// the executor's `BLAKE3_ABSORB_MAX_BLOCKS` (a test pins them equal); a longer
+/// message simply takes several calls, because the chaining value travels
+/// through the control region.
+///
+/// The binding reason for the value is trace height, not guest cost: the ecall
+/// is one CPU cycle and up to this many chip rows, which breaks the
+/// one-cycle-to-one-row ratio every other accelerator keeps and that epoch
+/// splitting relies on. See the executor constant for the full argument. It
+/// costs the guest nothing — absorb cost is flat in message length past about
+/// four blocks.
+pub const ABSORB_MAX_BLOCKS: usize = 1 << 10;
+
+/// How many whole blocks of `input` a bulk absorb may take, given `pending`
+/// bytes already held in the block buffer and whether `input` is 8-byte aligned.
+///
+/// Zero means "take the ordinary buffered path". Three conditions have to hold
+/// for the accelerator to be usable at all, and each is a correctness condition
+/// rather than a tuning choice:
+///
+/// - **`pending == 0`** — the ecall reads whole blocks straight out of the
+///   caller's slice, so a half-filled buffer would put the block boundary
+///   somewhere the slice does not start.
+/// - **`aligned`** — the accelerator reads the message as doublewords.
+/// - **at least one byte left over** — the LAST block of a message carries
+///   `CHUNK_END | ROOT` and the true byte count, and which block is last is not
+///   known until the message ends. Leaving a byte behind keeps that block in
+///   `finalize_digest`'s hands, so the ecall never has to know the final
+///   framing. It is why `input_len` of exactly one block absorbs nothing.
+///
+/// Compiled on every target and unit-tested on the host, so the schedule this
+/// picks is checkable without a guest — the riscv64 arm below is then only the
+/// ecall around it.
+///
+/// # ⚠ Read this before routing NEW data through the absorb ecall
+///
+/// The cost of an absorb is asymmetric between the guest and the prover, and the
+/// asymmetry is large. One absorb ecall is **one CPU cycle** but up to **1,025
+/// BLAKE3 chip rows and ~8,196 MEMW operations** — against keccak's one cycle to
+/// one row and 25 lane accesses. A loop of capped absorbs therefore inflates an
+/// epoch's BLAKE3 row count by roughly **170×** over what the cycle-keyed epoch
+/// splitter believes it is scheduling: the splitter counts cycles, and this is
+/// the one accelerator whose row count is not a function of them.
+///
+/// Nothing enforces a per-epoch absorb budget today. That is a bet on the CALL
+/// SITES, not a proof of safety, and it is worth stating which bet:
+///
+/// * Absorb ecalls are emitted only by OUR guest code — the recursion verifier's
+///   leaf hashing and runtime paths hashing our own buffers. The block counts
+///   are functions of proof shape and internal buffer sizes, not of anything an
+///   adversary supplies.
+/// * Untrusted input executed INSIDE a guest (EVM bytecode and calldata under
+///   ethrex, say) never reaches this function; that code hashes through the
+///   ordinary path and cannot name this syscall.
+///
+/// So adversarial exposure is bounded today by construction of the call graph.
+///
+/// ★ **The condition that makes a hard budget REQUIRED rather than optional:**
+/// any new call site where untrusted input can drive the absorb COUNT or the
+/// blocks per absorb. From that moment an attacker picks an epoch's BLAKE3 table
+/// height independently of its cycle budget, and the splitter's assumption stops
+/// being an approximation and becomes exploitable. If you are adding that
+/// surface, add the budget in the same change — a per-epoch cap on absorbed
+/// blocks, enforced where epochs are cut, not here.
+pub const fn bulk_absorb_blocks(pending: usize, input_len: usize, aligned: bool) -> usize {
+    if pending != 0 || !aligned {
+        return 0;
+    }
+    let n = input_len.saturating_sub(1) / BLOCK_LEN;
+    if n > ABSORB_MAX_BLOCKS {
+        ABSORB_MAX_BLOCKS
+    } else {
+        n
+    }
+}
+
+/// Lay a chaining value out as the absorb accelerator's control region.
+///
+/// The guest side of the absorb ABI, and the only place this crate encodes it.
+/// `cv_out` is left zero; the accelerator fills it.
+pub fn pack_absorb_ctrl(cv: &[u32; 8]) -> [u64; ABSORB_CTRL_DWORDS] {
+    let mut ctrl = [0u64; ABSORB_CTRL_DWORDS];
+    for (k, dword) in ctrl[..ABSORB_CV_OUT_DWORD].iter_mut().enumerate() {
+        *dword = (cv[2 * k] as u64) | ((cv[2 * k + 1] as u64) << 32);
+    }
+    ctrl
+}
+
+/// Read the chaining value the accelerator wrote into [`pack_absorb_ctrl`]'s
+/// region. The inverse of that layout, over dwords `4..8`.
+pub fn unpack_absorb_cv(ctrl: &[u64; ABSORB_CTRL_DWORDS]) -> [u32; 8] {
+    core::array::from_fn(|i| {
+        let dword = ctrl[ABSORB_CV_OUT_DWORD + i / 2];
+        if i.is_multiple_of(2) {
+            dword as u32
+        } else {
+            (dword >> 32) as u32
+        }
+    })
+}
+
 /// [`Blake3Chain`] as a one-shot over a byte slice.
 ///
 /// The streaming type and this agree by construction — this *is* the streaming
@@ -326,6 +440,25 @@ impl Blake3Chain {
         }
     }
 
+    /// Resume the chain from a chaining value computed outside it — what the
+    /// absorb accelerator returns after folding a run of whole blocks.
+    ///
+    /// `started` is set, because a resumed chain has already compressed at
+    /// least one block: `CHUNK_START` is spent and the next block is interior.
+    /// ★ This is the single statement of that fact. The riscv64 bulk-absorb arm
+    /// resumes through here, and so does the parity test that gates the
+    /// accelerator against this hasher — so the test cannot agree with the
+    /// guest about the flag schedule by restating it.
+    pub fn resume_with_rounds(cv: [u32; 8], rounds: usize) -> Self {
+        Self {
+            cv,
+            block: [0u8; BLOCK_LEN],
+            block_len: 0,
+            started: true,
+            rounds,
+        }
+    }
+
     /// The pending block as 16 little-endian message words.
     fn block_words(&self) -> [u32; 16] {
         core::array::from_fn(|i| {
@@ -367,6 +500,52 @@ impl Blake3Chain {
         self.started = true;
     }
 
+    /// Fold whole blocks of `input` into the chaining value with ONE ecall,
+    /// reading them in place. Returns the bytes consumed, `0` if the
+    /// accelerator was not usable here ([`bulk_absorb_blocks`] says when).
+    ///
+    /// This is the only reason the absorb ABI exists: the block-at-a-time path
+    /// below marshals 112 bytes and pays an ecall per 64 bytes of message,
+    /// which is what makes a long BLAKE3 absorb cost more in-guest than the
+    /// same absorb under keccak.
+    ///
+    /// The flag word handed over is `self.flags(false)` — the streaming
+    /// hasher's own schedule, evaluated before `started` moves — so the run's
+    /// first block carries exactly what it would have carried block by block.
+    /// The accelerator supplies `0` for every later block, and *that* half of
+    /// the schedule is the executor's restatement, gated by the parity tests
+    /// rather than trusted.
+    #[cfg(all(target_arch = "riscv64", feature = "blake3-absorb"))]
+    fn bulk_absorb(&mut self, input: &[u8]) -> usize {
+        // Same reasoning as `compress_block`: the accelerator is 6-round only,
+        // so an anchoring instance at another count takes the software path.
+        if self.rounds != BLAKE3_ROUNDS {
+            return 0;
+        }
+        let aligned = (input.as_ptr() as usize).is_multiple_of(8);
+        let blocks = bulk_absorb_blocks(self.block_len, input.len(), aligned);
+        if blocks == 0 {
+            return 0;
+        }
+        let taken = blocks * BLOCK_LEN;
+        let mut ctrl = pack_absorb_ctrl(&self.cv);
+        lambda_vm_syscalls::syscalls::blake3_absorb(&mut ctrl, &input[..taken], self.flags(false));
+        // The pending block is empty here (`bulk_absorb_blocks` required it), so
+        // resuming replaces the whole state rather than only the chaining value.
+        *self = Self::resume_with_rounds(unpack_absorb_cv(&ctrl), self.rounds);
+        taken
+    }
+
+    /// The bulk-absorb path, absent. See the riscv64 arm above for what this is
+    /// one of two of: every host build, and any guest without the accelerator,
+    /// hashes block at a time. Returning `0` makes the caller's fast path
+    /// vanish, so the streaming semantics are identical on every target — which
+    /// is what lets the host tests cover the result of taking it.
+    #[cfg(not(all(target_arch = "riscv64", feature = "blake3-absorb")))]
+    fn bulk_absorb(&mut self, _input: &[u8]) -> usize {
+        0
+    }
+
     /// Absorb more message. Identical results for any split of the same bytes —
     /// `streaming_splits_agree_with_one_shot`.
     pub fn update(&mut self, mut input: &[u8]) {
@@ -374,6 +553,23 @@ impl Blake3Chain {
             // Only now is the pending block known not to be the last one.
             if self.block_len == BLOCK_LEN {
                 self.compress_pending();
+            }
+            // With an empty pending block, whole blocks of `input` are blocks
+            // of the message and the accelerator can take them in one call.
+            //
+            // The length test is what keeps the parent path free. A 64-byte
+            // message — a Merkle parent, the shape FRI query paths are made of
+            // — can never absorb anything, because the run always leaves the
+            // final block behind; without this guard it would still pay for the
+            // call and its checks, which measured at 22 cycles on 432, a 5%
+            // regression on the hash this accelerator is best at. `>` and not
+            // `>=`: at exactly one block there is nothing to take.
+            if input.len() > BLOCK_LEN {
+                let bulk = self.bulk_absorb(input);
+                if bulk != 0 {
+                    input = &input[bulk..];
+                    continue;
+                }
             }
             let take = (BLOCK_LEN - self.block_len).min(input.len());
             self.block[self.block_len..self.block_len + take].copy_from_slice(&input[..take]);
@@ -952,6 +1148,79 @@ mod tests {
         Reset::reset(&mut chain);
         chain.update(&message(7));
         assert_eq!(chain.finalize_digest(), blake3_chain(&message(7)));
+    }
+
+    /// ★ The bulk-absorb schedule always leaves a block for `finalize_digest`.
+    ///
+    /// This is the property the whole absorb path rests on: the accelerator
+    /// never sees the message's last block, so it never has to know
+    /// `CHUNK_END | ROOT` or the true byte count, and the final framing stays
+    /// where `Blake3Chain` already had it. If this could ever return every
+    /// block, a full-block message would finalize on a block that had already
+    /// been compressed under interior flags — a different hash.
+    #[test]
+    fn a_bulk_absorb_always_leaves_the_final_block() {
+        for len in 0..=600usize {
+            let blocks = bulk_absorb_blocks(0, len, true);
+            let taken = blocks * BLOCK_LEN;
+            assert!(taken < len || len == 0, "length {len} absorbed everything");
+            // What is left is a whole message tail, never a negative remainder.
+            assert!(taken <= len.saturating_sub(1), "length {len}");
+            // And it is maximal: one more block would not have fit.
+            assert!(taken + BLOCK_LEN > len.saturating_sub(1), "length {len}");
+        }
+    }
+
+    /// The two conditions that make the ecall unusable, and the cap.
+    #[test]
+    fn a_bulk_absorb_declines_what_it_cannot_read() {
+        // A half-filled pending block: whole blocks of `input` are not blocks
+        // of the message.
+        for pending in 1..BLOCK_LEN {
+            assert_eq!(
+                bulk_absorb_blocks(pending, 4096, true),
+                0,
+                "pending {pending}"
+            );
+        }
+        // Unaligned: the accelerator reads doublewords.
+        assert_eq!(bulk_absorb_blocks(0, 4096, false), 0);
+        // One block exactly is the message's last block; nothing to absorb.
+        assert_eq!(bulk_absorb_blocks(0, BLOCK_LEN, true), 0);
+        assert_eq!(bulk_absorb_blocks(0, BLOCK_LEN + 1, true), 1);
+        // The cap holds, and a longer message just takes another call.
+        let huge = (ABSORB_MAX_BLOCKS + 10) * BLOCK_LEN;
+        assert_eq!(bulk_absorb_blocks(0, huge, true), ABSORB_MAX_BLOCKS);
+    }
+
+    /// The control region round-trips a chaining value through the layout the
+    /// executor reads and writes — the absorb ABI's counterpart to
+    /// `pack_syscall_state`/`unpack_syscall_out`, checkable without a guest.
+    #[test]
+    fn the_absorb_control_region_round_trips() {
+        let cv: [u32; 8] = core::array::from_fn(|i| (i as u32).wrapping_mul(0x9E37_79B9) ^ 0xA5A5);
+        let mut ctrl = pack_absorb_ctrl(&cv);
+        // `cv_in` occupies the low half and `cv_out` is left for the accelerator.
+        assert_eq!(&ctrl[ABSORB_CV_OUT_DWORD..], &[0u64; 4]);
+        // Simulate the accelerator writing the outgoing value.
+        for k in 0..4 {
+            ctrl[ABSORB_CV_OUT_DWORD + k] = ctrl[k];
+        }
+        assert_eq!(unpack_absorb_cv(&ctrl), cv);
+    }
+
+    /// NEGATIVE CONTROL: the round-trip discriminates word ORDER within a
+    /// dword, which is the likeliest thing to transpose and the one a
+    /// symmetric test would miss.
+    #[test]
+    fn the_absorb_control_region_is_word_order_sensitive() {
+        let cv: [u32; 8] = core::array::from_fn(|i| i as u32 + 1);
+        let ctrl = pack_absorb_ctrl(&cv);
+        let mut swapped = [0u64; ABSORB_CTRL_DWORDS];
+        for k in 0..4 {
+            swapped[ABSORB_CV_OUT_DWORD + k] = ctrl[k].rotate_left(32);
+        }
+        assert_ne!(unpack_absorb_cv(&swapped), cv);
     }
 
     /// The `digest` route and the free function are the same hash — the backends

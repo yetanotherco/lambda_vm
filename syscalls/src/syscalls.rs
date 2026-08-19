@@ -33,6 +33,11 @@ const KECCAK_SYSCALL_NUMBER: usize = usize::MAX - 1;
 #[cfg(target_arch = "riscv64")]
 const BLAKE3_SYSCALL_NUMBER: usize = usize::MAX - 2;
 
+/// Syscall number for the BLAKE3 6-round chained-absorb accelerator
+/// (u64::MAX - 3).
+#[cfg(target_arch = "riscv64")]
+const BLAKE3_ABSORB_SYSCALL_NUMBER: usize = usize::MAX - 3;
+
 /// Syscall number for the ECSM secp256k1 scalar-multiply accelerator (-11 as usize).
 #[cfg(target_arch = "riscv64")]
 const ECSM_SYSCALL_NUMBER: usize = usize::MAX - 10;
@@ -200,6 +205,47 @@ pub fn blake3_compress_6round(state: &mut [u64; 22]) {
 #[cfg(not(target_arch = "riscv64"))]
 /// BLAKE3 6-round compression via the accelerator (internal variant).
 pub fn blake3_compress_6round(_state: &mut [u64; 22]) {
+    unimplemented!("syscalls are only implemented for riscv64 targets");
+}
+
+/// Dwords in the BLAKE3 absorb control region: `cv_in[8 words] | cv_out[8]`.
+/// Mirrors `BLAKE3_ABSORB_CTRL_DWORDS` in `executor::vm::instruction::execution`.
+pub const BLAKE3_ABSORB_CTRL_DWORDS: usize = 8;
+
+#[cfg(target_arch = "riscv64")]
+/// Fold whole 64-byte blocks into a BLAKE3 **6-round** chaining value with a
+/// single ecall (internal variant — see [`blake3_compress_6round`]).
+///
+/// `ctrl` is the 64-byte control region as 8 dwords: dwords `0..4` carry the
+/// incoming chaining value `cv_in` and the accelerator writes the outgoing one
+/// into dwords `4..8`. `blocks` is the message, read in place — no copy, which
+/// is the point of this call. `first_flags` is the flag word of the run's first
+/// block; every later block carries none.
+///
+/// The caller must satisfy what the executor checks, or the ecall faults:
+/// `blocks.len()` is a nonzero multiple of 64 and at most `2^16` blocks,
+/// `blocks` is 8-byte aligned, and `blocks` does not overlap `ctrl`. Using
+/// `[u64; 8]` for `ctrl` guarantees its own alignment.
+pub fn blake3_absorb(ctrl: &mut [u64; BLAKE3_ABSORB_CTRL_DWORDS], blocks: &[u8], first_flags: u32) {
+    unsafe {
+        asm!(
+            "ecall",
+            in("a0") ctrl.as_mut_ptr(),
+            in("a1") blocks.as_ptr(),
+            in("a2") blocks.len() / 64,
+            in("a3") first_flags as usize,
+            in("a7") BLAKE3_ABSORB_SYSCALL_NUMBER,
+        )
+    }
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+/// Fold whole 64-byte blocks into a BLAKE3 6-round chaining value in one ecall.
+pub fn blake3_absorb(
+    _ctrl: &mut [u64; BLAKE3_ABSORB_CTRL_DWORDS],
+    _blocks: &[u8],
+    _first_flags: u32,
+) {
     unimplemented!("syscalls are only implemented for riscv64 targets");
 }
 

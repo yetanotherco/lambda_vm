@@ -234,9 +234,16 @@ $(RECURSION_ARTIFACTS_DIR)/%.elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_
 # dir "recursion") or copy-paste (presets list is the single source of truth).
 # $(1) is the preset; the recipe uses $$ so `$$(call build_guest_elf,...)`
 # expands at recipe-run time (where $@ is defined).
+#
+# `absorb` rides along with every preset: it routes the verifier legs' coalesced
+# leaf hashing through the chained-absorb ecall, which the prover's BLAKE3 table
+# answers with its absorb mode. It is a feature rather than a default of the
+# guest crate so the no-absorb leg stays buildable for A/B cycle measurement —
+# drop it from RECURSION_GUEST_FEATURES to rebuild that leg.
+RECURSION_GUEST_FEATURES := absorb
 define recursion_verifier_rule
 $(RECURSION_ARTIFACTS_DIR)/recursion-$(1).elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
-	$$(call build_guest_elf,$$(RECURSION_GUESTS_DIR)/recursion,recursion-$(1)-bench,--features $(1))
+	$$(call build_guest_elf,$$(RECURSION_GUESTS_DIR)/recursion,recursion-$(1)-bench,--features "$(1) $$(RECURSION_GUEST_FEATURES)")
 endef
 $(foreach preset,$(RECURSION_VERIFIER_PRESETS),$(eval $(call recursion_verifier_rule,$(preset))))
 
@@ -244,7 +251,7 @@ $(foreach preset,$(RECURSION_VERIFIER_PRESETS),$(eval $(call recursion_verifier_
 # feature -> recursion-cont-<preset>-bench -> recursion-cont-<preset>.elf.
 define recursion_cont_verifier_rule
 $(RECURSION_ARTIFACTS_DIR)/recursion-cont-$(1).elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
-	$$(call build_guest_elf,$$(RECURSION_GUESTS_DIR)/recursion,recursion-cont-$(1)-bench,--features "continuation $(1)")
+	$$(call build_guest_elf,$$(RECURSION_GUESTS_DIR)/recursion,recursion-cont-$(1)-bench,--features "continuation $(1) $$(RECURSION_GUEST_FEATURES)")
 endef
 $(foreach preset,$(RECURSION_CONT_PRESETS),$(eval $(call recursion_cont_verifier_rule,$(preset))))
 
@@ -636,6 +643,20 @@ test-blake3-second-source:
 	thoughts/blake3/reference-impl/build.sh
 	python3 thoughts/blake3/reference-impl/check.py
 
+# z3/SMT gate for the BLAKE3 chained-absorb mode's row-local constraints: the
+# compression equivalence under the absorb framing, the flags schedule, the mode
+# gating, the countdown/END logic, and the byte-width assumptions.
+#
+# Read `formal_verification/blake3_absorb/README.md` before extending it. The 6
+# rounds are verified ONE AT A TIME because the composed query does not close —
+# commit 89aeeb8c measured 145 minutes of `unknown` — and the negative controls
+# are what make a green board mean anything.
+#
+# z3's Python bindings are the only dependency. No cargo, no GPU, ~25 seconds.
+test-blake3-absorb-fv:
+	python3 formal_verification/blake3_absorb/test_ref.py
+	python3 formal_verification/blake3_absorb/z3_absorb_verify.py
+
 # End-to-end cuda dispatch coverage (requires NVIDIA GPU + nvcc).
 # Asserts the R1-R4 GPU dispatch counters fired on a real prove.
 # --test-threads=1: these tests reset and assert on process-global GPU call
@@ -715,6 +736,14 @@ clippy:
 	# which `math_cuda::blake3::device_rounds` makes assertable rather than
 	# discoverable as a wrong root.
 	cargo clippy -p crypto --all-targets --no-default-features --features std,asm -- -D warnings -A clippy::op_ref
+	# The chained-absorb guest arm's feature graph. Nothing else resolves it: it is
+	# not a default and no dependency names it, so a typo in the forwarding chain
+	# would go unnoticed. ⚠ This does NOT compile the guest absorb arm — that arm
+	# is `cfg(all(target_arch = "riscv64", feature = "blake3-absorb"))` and this is
+	# a host pass, so what compiles is its `cfg(not(...))` stub. The riscv64 arm
+	# has no CI coverage at all (RESUME-PA-STAGE4 §4.2); closing that needs a
+	# guest-target build, not a clippy feature.
+	cargo clippy --workspace --all-targets --features lambda-vm-prover/blake3-absorb -- -D warnings -A clippy::op_ref
 
 fmt:
 	cargo fmt --all
@@ -744,6 +773,14 @@ lint:
 	# which `math_cuda::blake3::device_rounds` makes assertable rather than
 	# discoverable as a wrong root.
 	cargo clippy -p crypto --all-targets --no-default-features --features std,asm -- -D warnings -A clippy::op_ref
+	# The chained-absorb guest arm's feature graph. Nothing else resolves it: it is
+	# not a default and no dependency names it, so a typo in the forwarding chain
+	# would go unnoticed. ⚠ This does NOT compile the guest absorb arm — that arm
+	# is `cfg(all(target_arch = "riscv64", feature = "blake3-absorb"))` and this is
+	# a host pass, so what compiles is its `cfg(not(...))` stub. The riscv64 arm
+	# has no CI coverage at all (RESUME-PA-STAGE4 §4.2); closing that needs a
+	# guest-target build, not a clippy feature.
+	cargo clippy --workspace --all-targets --features lambda-vm-prover/blake3-absorb -- -D warnings -A clippy::op_ref
 	# The cuda feature gates whole modules + cuda-only integration tests. build.rs emits empty
 	# cubin stubs when nvcc is absent, so this checks on a GPU-less host (CI lint runner, dev laptop)
 	# too — no GPU required. Catches cuda-gated breakage that the non-cuda passes above miss.
