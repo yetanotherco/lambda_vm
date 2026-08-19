@@ -102,31 +102,6 @@ pub fn generate() -> (Vec<u8>, usize) {
     (blob, num_epochs)
 }
 
-/// Loads the cached blob, generating and caching it when absent.
-///
-/// Proving is slow enough that regenerating per test is not viable, but a
-/// checked-in binary is worse: it can drift from the encoder silently. So the
-/// cache lives outside the repository and the GENERATION path is what tests
-/// exercise on a cold cache.
-///
-/// ## ⚠ The blob is NOT reproducible — measured, and it constrains callers
-///
-/// Two `generate()` calls on identical inputs produce blobs that differ in
-/// ~65k of 587k bytes, and the difference is SEMANTIC, not archive padding:
-/// some sub-proofs commit to different roots, which moves the Fiat-Shamir
-/// challenges, which opens different leaves. (`machine_tests::
-/// fixture_generation_is_not_reproducible` is the standing evidence.)
-///
-/// So **nothing derived from a specific blob may be pinned as a constant** —
-/// not a query index, not a leaf value, not a root. Pin SHAPE (column counts,
-/// tree depths), which is stable, and recover per-blob values from the blob.
-/// R1f's `R1F_SHAPE` and its recovered leaf index are built that way; a pinned
-/// index would have broken on the very next cold cache.
-///
-/// The write is atomic (temp file then rename) because the cache is shared by
-/// tests that run in parallel and one of them regenerates it: without the
-/// rename a reader can observe a half-written blob, and since blobs differ,
-/// "it was fine last time" proves nothing.
 /// ★ The cache key for everything that changes these bytes INCOMPATIBLY.
 ///
 /// The cache lives in the shared temp directory and is keyed on the inner ELF
@@ -166,6 +141,31 @@ fn prefix_is_readable(bytes: &[u8]) -> bool {
             == crate::RECURSION_INPUT_VERSION
 }
 
+/// Loads the cached blob, generating and caching it when absent.
+///
+/// Proving is slow enough that regenerating per test is not viable, but a
+/// checked-in binary is worse: it can drift from the encoder silently. So the
+/// cache lives outside the repository and the GENERATION path is what tests
+/// exercise on a cold cache.
+///
+/// ## ⚠ The blob is NOT reproducible — measured, and it constrains callers
+///
+/// Two `generate()` calls on identical inputs produce blobs that differ in
+/// ~65k of 587k bytes, and the difference is SEMANTIC, not archive padding:
+/// some sub-proofs commit to different roots, which moves the Fiat-Shamir
+/// challenges, which opens different leaves. (`machine_tests::
+/// fixture_generation_is_not_reproducible` is the standing evidence.)
+///
+/// So **nothing derived from a specific blob may be pinned as a constant** —
+/// not a query index, not a leaf value, not a root. Pin SHAPE (column counts,
+/// tree depths), which is stable, and recover per-blob values from the blob.
+/// R1f's `R1F_SHAPE` and its recovered leaf index are built that way; a pinned
+/// index would have broken on the very next cold cache.
+///
+/// The write ([`write_cache`]) is atomic (temp file then rename) because the
+/// cache is shared by tests that run in parallel and one of them regenerates
+/// it: without the rename a reader can observe a half-written blob, and since
+/// blobs differ, "it was fine last time" proves nothing.
 pub fn load_or_generate(cache: &Path) -> Vec<u8> {
     if let Ok(bytes) = std::fs::read(cache) {
         // A stale or foreign blob REGENERATES rather than erroring downstream:

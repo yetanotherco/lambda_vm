@@ -130,12 +130,16 @@ pub struct TableCounts {
     ///   the guest's register — **trace data**, not a constant
     ///   (`tables/cpu.rs`, the ECALL sender).
     /// - Each syscall table RECEIVES on that same bus with its own syscall
-    ///   number as a hardcoded constant in the tuple. BLAKE3's receiver carries
-    ///   `BLAKE3_SYSCALL_NUMBER` (`tables/blake3.rs`, interaction 1), and no
-    ///   other receiver in the machine carries that constant.
+    ///   number as a hardcoded constant in the tuple. The BLAKE3 table has TWO
+    ///   such receivers, one per mode: the single-compression receive carries
+    ///   `BLAKE3_SYSCALL_NUMBER` (`tables/blake3.rs`, interaction 1) and the
+    ///   absorb receive carries `BLAKE3_ABSORB_SYSCALL_NUMBER` (gated on the
+    ///   group's FIRST row). No other receiver in the machine carries either
+    ///   constant, so the argument covers both syscalls: omitting the table
+    ///   strands compress sends and absorb sends alike.
     ///
-    /// So a workload that executes a BLAKE3 syscall necessarily puts a send on
-    /// the Ecall bus whose tuple only the BLAKE3 table can match. Omit the
+    /// So a workload that executes a BLAKE3 syscall — either mode — necessarily
+    /// puts a send on the Ecall bus whose tuple only the BLAKE3 table can match. Omit the
     /// table and that send has no receiver: the global LogUp sum is non-zero,
     /// and `multi_verify` rejects on bus balance before any constraint is
     /// evaluated. A prover claiming `blake3: 0` for an epoch that used BLAKE3

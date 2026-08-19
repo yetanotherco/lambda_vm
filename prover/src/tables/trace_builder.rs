@@ -715,7 +715,13 @@ fn collect_ops_from_cpu(
         if op.ecall_blake3_absorb {
             let (absorb_memw, absorb_op) =
                 collect_blake3_absorb_ops(op, memory_state, register_state);
-            memw.extend_ops(absorb_memw);
+            // Same strip gate as the single-compression MEMW above: the switch
+            // promises "MEMW and BITWISE left out" for BOTH modes, and an
+            // ungated arm here would silently reintroduce a MEMW imbalance the
+            // moment the omission forgery is retargeted at an absorb workload.
+            if !strip_blake3_side_effects() {
+                memw.extend_ops(absorb_memw);
+            }
             blake3_absorb_ops.push(absorb_op);
         }
 
