@@ -5,7 +5,9 @@
 //! regressions (GPU path fired but produced output that fails verification).
 //!
 //! `#[ignore]`'d so the no-GPU CI path skips it. Run via `make test-cuda-integration`
-//! or `cargo test -p lambda-vm-prover --release --features cuda --test cuda_path_integration -- --ignored --nocapture`.
+//! or `cargo test -p lambda-vm-prover --release --features cuda --test cuda_path_integration -- --ignored --nocapture --test-threads=1`.
+//! The single test thread is not optional: the counters these tests assert on
+//! are process-global, so parallel proves in one process cross-contaminate them.
 #![cfg(feature = "cuda")]
 
 use lambda_vm_prover::test_utils::asm_elf_bytes;
@@ -179,11 +181,16 @@ fn gpu_opening_gather_fires_and_verifies() {
 
 /// The full-residency Stage-3 device-only path fires: at least one table keeps
 /// its round-1 LDE device-resident (the host D2H is skipped), and the proof
-/// still verifies. This exercises every `host_trace_empty` hard-abort guard on
-/// the happy path (none may fire) plus the GPU-only R2/R3/R4 paths reading the
-/// device LDE with no host trace behind them. A regression that silently
-/// reverts to the host D2H drops the counter to 0 (while the proof would still
-/// verify), and a mis-gate that forces a host fallback panics one of the guards.
+/// still verifies. This exercises the GPU-only R2/R3/R4 paths reading the
+/// device LDE with no host trace behind them, plus the `host_trace_empty`
+/// hard-abort guards that remain on the R4 opening path (none may fire). A
+/// regression that silently reverts to the host D2H drops the counter to 0
+/// (while the proof would still verify). A mis-gate that forces a host
+/// fallback does not panic at the R2 commit, R3 or the R4 DEEP loop: those
+/// sites download the resident data and continue host-backed, so the counter
+/// assertions below are the only thing that surfaces one — one per site, since
+/// the R1 counter also covers tables the device-only gate never cleared, and
+/// the parts counter covers the H part evaluations rather than the trace.
 #[test]
 #[ignore = "requires GPU; run with --ignored --nocapture"]
 fn gpu_device_only_residency_fires_and_verifies() {
@@ -193,6 +200,30 @@ fn gpu_device_only_residency_fires_and_verifies() {
     assert!(
         gpu_device_only_calls() > 0,
         "device-only residency path did not fire (every table kept its host trace)"
+    );
+    assert_eq!(
+        stark::gpu_lde::gpu_device_only_downgrades(),
+        0,
+        "a device-only table was downgraded back to a host trace on the happy \
+         path (its R2 dispatch declined at runtime: the gate should mirror the \
+          missing condition)"
+    );
+    assert_eq!(
+        stark::gpu_lde::gpu_composition_parts_downloads(),
+        0,
+        "a device-only table's composition-poly parts were downloaded back to \
+         the host on the happy path (the R2 commit, the R3 parts OOD or the R4 \
+         DEEP H terms fell back to the host part evals: either the gate should \
+         mirror a missing dispatch condition, or the dispatch declined \
+         transiently under VRAM pressure)"
+    );
+    assert_eq!(
+        stark::gpu_lde::gpu_resident_aux_downgrades(),
+        0,
+        "a table's resident aux trace was downloaded back to the host on the \
+         happy path (the device aux LDE declined and the drain-and-retry did \
+          not recover it — usually VRAM pressure, and not gated on device-only, \
+          so this can fire for a table that was never device-only)"
     );
     assert!(
         verify(&proof, &elf).expect("verify"),

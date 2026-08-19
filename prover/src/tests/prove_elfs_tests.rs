@@ -3079,8 +3079,8 @@ fn test_prove_wsuffix_64bit() {
 
 /// Proves a minimal Rust std program that uses `init_allocator()` and
 /// `String::from("Hello World") + commit`. Exercises the full Rust-std stack:
-/// TLSF heap init (SRL on high-bit values), CSR instructions injected by
-/// the Rust toolchain, and the allocator's memory access patterns.
+/// guest heap init, CSR instructions injected by the Rust toolchain, and the
+/// allocator's memory access patterns.
 #[test]
 fn test_prove_allocator_minimal_reproducer() {
     let _ = env_logger::builder().is_test(true).try_init();
