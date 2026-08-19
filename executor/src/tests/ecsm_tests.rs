@@ -177,10 +177,7 @@ fn ecsm_syscall_rejects_address_overflow() {
 
 /// Runs the ECSM syscall and returns the whole 96-byte output buffer as
 /// `(xR, yR, yG)`, all little-endian.
-fn run_ecsm_full(
-    k_bytes: &[u8; 32],
-    xg_le: &[u8; 32],
-) -> Result<([u8; 32], [u8; 32], [u8; 32]), ExecutionError> {
+fn run_ecsm_full(k_bytes: &[u8; 32], xg_le: &[u8; 32]) -> Result<ecsm::EcsmOutput, ExecutionError> {
     let mut pc = 0;
     let mut registers = Registers::default();
     let mut memory = Memory::default();
