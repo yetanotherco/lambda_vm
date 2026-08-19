@@ -177,6 +177,37 @@ pub const ABSORB_MAX_BLOCKS: usize = 1 << 10;
 /// Compiled on every target and unit-tested on the host, so the schedule this
 /// picks is checkable without a guest — the riscv64 arm below is then only the
 /// ecall around it.
+///
+/// # ⚠ Read this before routing NEW data through the absorb ecall
+///
+/// The cost of an absorb is asymmetric between the guest and the prover, and the
+/// asymmetry is large. One absorb ecall is **one CPU cycle** but up to **1,025
+/// BLAKE3 chip rows and ~8,196 MEMW operations** — against keccak's one cycle to
+/// one row and 25 lane accesses. A loop of capped absorbs therefore inflates an
+/// epoch's BLAKE3 row count by roughly **170×** over what the cycle-keyed epoch
+/// splitter believes it is scheduling: the splitter counts cycles, and this is
+/// the one accelerator whose row count is not a function of them.
+///
+/// Nothing enforces a per-epoch absorb budget today. That is a bet on the CALL
+/// SITES, not a proof of safety, and it is worth stating which bet:
+///
+/// * Absorb ecalls are emitted only by OUR guest code — the recursion verifier's
+///   leaf hashing and runtime paths hashing our own buffers. The block counts
+///   are functions of proof shape and internal buffer sizes, not of anything an
+///   adversary supplies.
+/// * Untrusted input executed INSIDE a guest (EVM bytecode and calldata under
+///   ethrex, say) never reaches this function; that code hashes through the
+///   ordinary path and cannot name this syscall.
+///
+/// So adversarial exposure is bounded today by construction of the call graph.
+///
+/// ★ **The condition that makes a hard budget REQUIRED rather than optional:**
+/// any new call site where untrusted input can drive the absorb COUNT or the
+/// blocks per absorb. From that moment an attacker picks an epoch's BLAKE3 table
+/// height independently of its cycle budget, and the splitter's assumption stops
+/// being an approximation and becomes exploitable. If you are adding that
+/// surface, add the budget in the same change — a per-epoch cap on absorbed
+/// blocks, enforced where epochs are cut, not here.
 pub const fn bulk_absorb_blocks(pending: usize, input_len: usize, aligned: bool) -> usize {
     if pending != 0 || !aligned {
         return 0;

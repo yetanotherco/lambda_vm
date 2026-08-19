@@ -90,8 +90,8 @@ import sys
 import time
 
 from z3 import (
-    And, BitVec, BitVecVal, BitVecSort, Concat, Function, Int, Or, RotateRight,
-    Solver, ZeroExt, sat, unsat,
+    And, BitVec, BitVecVal, BitVecSort, Concat, Function, If, Implies, Int, Or,
+    RotateRight, Solver, ZeroExt, sat, unsat,
 )
 
 import blake3_ref as ref
@@ -356,6 +356,41 @@ def pointer_add(cons, tag, drop=(), offset=64):
     cong0(cons, lo(base) + offset - lo(incr) - c0 * W32, -span, span)
     cong0(cons, hi(base) + c0 - hi(incr) - c1 * W32, -span, span)
     return base, incr, (c0, c1)
+
+
+def msg_addressing(cons, tag="a", drop=()):
+    """blake3.rs — the two ADDRESS conditions the ABI states and the executor
+    rejects without, added after the adversarial review found the chip accepted
+    absorbs the executor refuses:
+
+      * x11 is 8-aligned: `FIRST·(M_BASE[0] − 8·Q) = 0` with `IsHalfword[Q]`;
+      * the message region wraps only on its LAST block:
+        `(MU_C − NEXT_IS_END)·carry_1(M_BASE + 64 = M_BASE_INCR) = 0`,
+        with `NEXT_IS_END` the `Zero[REM_DECR]` output.
+
+    Returns the alignment witness, the address limbs and the successor carry.
+    """
+    base, incr, (c0, c1) = pointer_add(cons, tag, drop=drop)
+
+    q = fe(f"{tag}_msg_align_q", cons)
+    if "ishalf_q" not in drop:
+        cons.append(q < HALF)
+
+    # ⚠ The alignment equation is a FIELD congruence, not an integer equation,
+    # and the difference is the entire content of this property. Written as
+    # `base[0] == 8*q` over the integers the model silently re-imposes the very
+    # bound the negative control removes: no integer `q` divides an odd base, so
+    # the vacuous variant would report unsat and look safe. `8·q` reaches ~8p, so
+    # the quotient window is (-8p, p].
+    if "align" not in drop or "align_scaled" in drop:
+        cong0(cons, base[0] - 8 * q, -8 * P, P)
+    if "align_scaled" in drop:
+        # The REJECTED sketch, modelled so its vacuity is machine-checked rather
+        # than argued: bound Q ONLY through the scaled IsB20 product.
+        prod = fe(f"{tag}_scaled", cons)
+        cong0(cons, prod - 128 * q, -128 * P, P)
+        cons.append(prod < 2**20)
+    return {"base": base, "incr": incr, "c0": c0, "c1": c1, "q": q}
 
 
 # ===========================================================================
@@ -761,6 +796,71 @@ def main():
         countdown(c2, v2, drop=(dropped,))
         res, dt, m = solve(c2, goal(v2))
         b.record("P4-neg", f"drop {dropped}: {goal_name}", "sat", res, dt, m)
+
+    # ---------------------------------------------------------------- P6 ---
+    print("\n=== P6  the ABI's ADDRESS conditions, in circuit (field) ===")
+    print("    Added after the review found the chip accepted absorbs the")
+    print("    executor rejects: an unaligned x11, and a wrapping message region.")
+
+    # --- 6a. alignment -----------------------------------------------------
+    cons = []
+    a = msg_addressing(cons, "p6a")
+    # An unaligned low halfword is unreachable: 8·Q is even for every Q, and Q
+    # is halfword-bounded, so the equality is over integers.
+    res, dt, m = solve(cons, a["base"][0] % 8 != 0)
+    b.record("P6.1", "FIRST row: M_BASE[0] ≡ 0 (mod 8) — x11 is 8-aligned",
+             "unsat", res, dt, m)
+    res, dt, m = solve(cons, a["base"][0] == 8)
+    b.record("P6.2", "…and that model is consistent (non-vacuity)", "sat", res, dt, m)
+
+    print("\n  negative controls:")
+    c2 = []
+    a2 = msg_addressing(c2, "p6b", drop=("align",))
+    res, dt, m = solve(c2, a2["base"][0] == 1)
+    b.record("P6-neg", "drop the alignment constraint: an odd message base",
+             "sat", res, dt, m)
+
+    # ★ The rejected sketch. `IsB20[Q·2^7]` looks like the block cap's trick and
+    # is VACUOUS: with Q bounded only through the scaled product a prover takes
+    # Q = M_BASE[0]·8⁻¹ mod p, and Q·2^7 = M_BASE[0]·16 < 2^20 for ANY halfword.
+    c3 = []
+    a3 = msg_addressing(c3, "p6c", drop=("ishalf_q", "align", "align_scaled"))
+    res, dt, m = solve(c3, a3["base"][0] == 1)
+    b.record("P6-neg", "★ the SCALED form IsB20[Q·2^7] admits an odd base "
+                       "(why the shipped chip uses IsHalfword[Q])",
+             "sat", res, dt, m)
+
+    # --- 6b. the message region wraps only on its last block ---------------
+    cons = []
+    v = mode_algebra(cons)
+    countdown(cons, v)
+    a = msg_addressing(cons, "p6d")
+    nie = bit("p6d_next_is_end", cons)
+    # Zero[REM_DECR] -> NEXT_IS_END, on compressing rows.
+    cons.append(Implies(v["MU_C"] == 1, nie == If(v["REM_DECR"] == 0, 1, 0)))
+    cons.append(nie * (1 - v["MU_C"]) == 0)
+    # (MU_C − NEXT_IS_END) · carry_1 = 0
+    cons.append((v["MU_C"] - nie) * a["c1"] == 0)
+
+    res, dt, m = solve(cons, And(v["MU_C"] == 1, v["REM_DECR"] != 0, a["c1"] == 1))
+    b.record("P6.3", "a NON-final block's successor address cannot wrap",
+             "unsat", res, dt, m)
+    res, dt, m = solve(cons, And(v["MU_C"] == 1, v["REM_DECR"] == 0, a["c1"] == 1))
+    b.record("P6.4", "…but the FINAL block's may (a message may end at 2^64)",
+             "sat", res, dt, m)
+
+    print("\n  negative controls:")
+    c4 = []
+    v4 = mode_algebra(c4)
+    countdown(c4, v4)
+    a4 = msg_addressing(c4, "p6e")
+    nie4 = bit("p6e_next_is_end", c4)
+    c4.append(Implies(v4["MU_C"] == 1, nie4 == If(v4["REM_DECR"] == 0, 1, 0)))
+    c4.append(nie4 * (1 - v4["MU_C"]) == 0)
+    # gate dropped: no no-overflow at all — the pre-review chip.
+    res, dt, m = solve(c4, And(v4["MU_C"] == 1, v4["REM_DECR"] == 5, a4["c1"] == 1))
+    b.record("P6-neg", "drop the wrap gate: a mid-group block wraps to address 0",
+             "sat", res, dt, m)
 
     # ---------------------------------------------------------------- P2 ---
     print("\n=== P2  flags schedule / interior framing (field) ===")

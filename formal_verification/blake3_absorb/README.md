@@ -14,7 +14,7 @@ stands alone.
 
 ```
 python3 test_ref.py            # anchor the reference outside this repo
-python3 z3_absorb_verify.py    # the gate — 53 queries, ~25 s
+python3 z3_absorb_verify.py    # the gate — 60 queries, ~25 s
 make test-blake3-absorb-fv     # both, from the repo root
 ```
 
@@ -103,7 +103,7 @@ recorded here because they are the model's trust boundary:
 
 ## The board
 
-53 queries, ~25 s wall on an M-series laptop, z3 4.15.4. `P*-neg` rows are
+60 queries, ~25 s wall on an M-series laptop, z3 4.15.4. `P*-neg` rows are
 negative controls and **must** be SAT.
 
 | # | property | verdict |
@@ -125,9 +125,33 @@ negative controls and **must** be SAT.
 | **P4.6** | ★ the cap cannot be wrapped mod p | PROVED |
 | **P5.1** | the END row's `cv_out` bytes are **unique** given the chain-delivered words | PROVED |
 | **P5.2** | `M_BASE_INCR` is a function of `M_BASE` | PROVED |
+| **P6.1-2** | a FIRST row's `M_BASE[0] ≡ 0 (mod 8)` — x11 is 8-aligned — with the model shown consistent | PROVED |
+| **P6.3** | a NON-final block's successor address cannot leave the address space | PROVED |
+| **P6.4** | …but the FINAL block's may, so a message ending at `2^64` stays provable | SAT (intended) |
 
 No counterexample was found against any shipped constraint. Every negative
 control flipped to SAT.
+
+**P6 was added by the F1 fix pass**, after the adversarial review demonstrated
+two absorbs the chip accepted and the executor rejects: an unaligned `x11`, and
+a message region wrapping the address space mid-group.
+
+### ★ The witness that changed the fix
+
+`P6-neg: the SCALED form IsB20[Q·2^7] admits an odd base`. The review sketched
+the alignment check as `M_BASE[0] = 8·Q` bounded by `IsB20[Q · 2^7]`, mirroring
+the block cap's scaling trick. It is **vacuous**: with `Q` bounded only through
+the scaled product a prover takes `Q = M_BASE[0] · 8⁻¹ mod p`, and then
+`Q · 2^7 = M_BASE[0] · 16`, under `2^20` for ANY halfword base, aligned or not.
+The shipped chip bounds `Q` directly with `IsHalfword[Q]` instead, which forces
+the congruence to be an integer equation and so forces `8 | M_BASE[0]`.
+
+The block cap survives the identical attack only because `REMAINING`'s domain
+bound arrives first from the ZERO lookup — the same reason P4.6 needs
+`zero_domain` present. Modelling the alignment equation as an integer equality
+rather than a field congruence hides all of this: no integer `Q` divides an odd
+base, so the vacuous variant reports UNSAT and looks safe. That trap is why
+`msg_addressing` uses `cong0`.
 
 ### Two witnesses worth reading
 

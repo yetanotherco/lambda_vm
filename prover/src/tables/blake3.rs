@@ -50,6 +50,24 @@
 //! 15. The block cap is enforced in-circuit (`IsB20[REM_DECR · 2^10]` on the
 //!     FIRST row), not inherited from the executor, so the chip accepts exactly
 //!     the `1..=1024` the VM semantics accept.
+//! 16. The ABI's address conditions are checked here too, not only by the
+//!     executor: x11 is 8-aligned (`FIRST·(M_BASE[0] − 8·Q) = 0`, with `Q` a
+//!     halfword) and the message region does not wrap the address space except
+//!     on its last block (`MU_C − NEXT_IS_END` gating the successor's carry).
+//!     Without them the chip accepted absorbs the executor rejects.
+//!
+//! ## ⚠ Row budget: one cycle, up to 1,025 rows
+//!
+//! This is the only accelerator whose row count is not a function of cycles: one
+//! absorb ecall is one CPU cycle and up to 1,025 rows plus ~8,196 MEMW ops,
+//! where keccak is one cycle to one row. A capped-absorb loop therefore inflates
+//! an epoch's BLAKE3 rows ~170× over what the cycle-keyed splitter expects.
+//!
+//! No per-epoch budget enforces this, which is safe only because of WHO calls
+//! the ecall. The trust boundary, and the condition under which a hard budget
+//! becomes required, are written at `crypto::hash::blake3::chain::bulk_absorb_blocks`
+//! — the gate every guest absorb goes through, and so the place the next person
+//! adding a call site will actually read.
 //!
 //! ## The single-dataflow rule
 //!
@@ -203,7 +221,15 @@ pub mod cols {
     /// Per-dword message pointers `[8][4]` halfwords, `msg_ptr[j] = M_BASE + 8j`.
     pub const MSG_PTR: usize = M_BASE_INCR + 4; // 3234
 
-    pub const NUM_COLUMNS: usize = MSG_PTR + super::MSG_DWORDS * 4; // 3266
+    /// `M_BASE[0] / 8` on the FIRST row — the witness that the message address
+    /// the caller passed in x11 is 8-aligned, which the ABI requires and the
+    /// executor rejects without.
+    pub const MSG_ALIGN_Q: usize = MSG_PTR + super::MSG_DWORDS * 4; // 3266
+    /// `REM_DECR == 0`: this compressing row is the group's LAST one. Only that
+    /// row may let `M_BASE + 64` leave the address space.
+    pub const NEXT_IS_END: usize = MSG_ALIGN_Q + 1; // 3267
+
+    pub const NUM_COLUMNS: usize = NEXT_IS_END + 1; // 3268
 
     /// `msg_ptr[j][hw]` — halfword `hw` of the pointer to message dword `j`.
     #[inline]
@@ -966,6 +992,9 @@ pub fn generate_blake3_trace(
             table.set_fe(row, cols::MU_C, FE::one());
             table.set_u64(row, cols::REM_DECR, (r.remaining - 1) as u64);
             table.set_dword_hl(row, cols::M_BASE_INCR, r.m_base.wrapping_add(64));
+            // The last compressing row, and only it, may let M_BASE + 64 leave
+            // the address space.
+            table.set_bool(row, cols::NEXT_IS_END, r.remaining == 1);
             for j in 0..MSG_DWORDS {
                 let ptr = r
                     .m_base
@@ -975,6 +1004,10 @@ pub fn generate_blake3_trace(
             }
             let flow = ValueFlow::compute(&r.h, &r.m, 0, 64, r.flags);
             fill_mixing_core(table, row, &flow);
+        }
+        if r.first {
+            // The 8-alignment witness for x11: M_BASE's low halfword is 8·Q.
+            table.set_u64(row, cols::MSG_ALIGN_Q, (r.m_base & 0xFFFF) / 8);
         }
     }
 
@@ -1427,10 +1460,28 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // the receive cannot drift apart — the failure DESIGN.md §1.1 describes is
     // exactly a drift between them. The tuple leads with the timestamp (which
     // identifies the group) and carries the control address and message base as
-    // well as the chaining value: without `ADDR` the END row would need a second
-    // x10 read at the group's one timestamp, and without `M_BASE` a prover could
-    // point any row at a block of its choosing and still balance MEMW, because
-    // reading some other address is a legitimate read.
+    // well as the chaining value: without `M_BASE` a prover could point any row
+    // at a block of its choosing and still balance MEMW, because reading some
+    // other address is a legitimate read.
+    //
+    // `ADDR` rides for a different reason. The END row needs the control address
+    // to write `cv_out`, and it cannot get it from a second x10 read, because no
+    // address may be touched twice at one timestamp. That claim rests on MEMW's
+    // token argument, and the short form of it ("LT(T, T) → 1 is unsatisfiable")
+    // is under-argued — a second access at T could consume an OLDER token rather
+    // than the one the first access produced. The argument that does hold:
+    //
+    //   Per address, MEMW's genesis and finalization tokens have cardinality
+    //   one, so the accesses to that address form a PERFECT MATCHING between
+    //   produced and consumed tokens — a disjoint union of paths and cycles.
+    //   Every edge carries `old_ts < ts` strictly, so no cycle can close, and
+    //   the union is a single strictly increasing path. Timestamps along that
+    //   path are therefore pairwise distinct, for ANY pair of accesses and not
+    //   merely adjacent ones. Two accesses at one timestamp cannot both sit on
+    //   it, so the trace has no such pair.
+    //
+    // That is also what makes the ABI's control/message disjointness enforceable
+    // without a chip constraint — see the note on the region overlap check.
     let chain_values = |remaining_col: usize, m_base_col: usize, cv_base: usize| -> Vec<BusValue> {
         let mut values = Vec::with_capacity(15);
         values.push(direct(cols::TIMESTAMP_0));
@@ -1480,6 +1531,41 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         }])],
     ));
 
+    // 10g-bis. ★ `NEXT_IS_END = (REM_DECR == 0)` — "this is the group's LAST
+    // compressing row". It exists to let exactly that row's `M_BASE + 64` leave
+    // the address space (a message may legally end at the top of memory) while
+    // every earlier row's may not; see the constraint that gates on it.
+    //
+    // The same send also bounds `REM_DECR < 2^20` directly on compressing rows,
+    // which is what makes the block cap's `IsB20[REM_DECR · 2^10]` above safe
+    // from field wraparound at its own site rather than only via `REMAINING`.
+    interactions.push(BusInteraction::sender(
+        BusId::Zero,
+        Multiplicity::Column(cols::MU_C),
+        vec![direct(cols::REM_DECR), direct(cols::NEXT_IS_END)],
+    ));
+
+    // 10g-ter. ★ x11 is 8-aligned: `M_BASE[0] = 8·Q` with `Q` a halfword.
+    //
+    // The bound on `Q` has to come from a lookup whose ARGUMENT is `Q` itself.
+    // Scaling it the way the block cap scales `REM_DECR` — `IsB20[Q · 2^7]` —
+    // does NOT work here and is worth writing down, because it looks identical:
+    // with `Q` otherwise unconstrained a prover sets `Q = M_BASE[0] · 8⁻¹ mod p`,
+    // and then `Q · 2^7 = M_BASE[0] · 16`, which is under 2^20 for ANY halfword
+    // `M_BASE[0]` — aligned or not. The scaled form is vacuous. The block cap
+    // survives the same attack only because `REMAINING`'s domain bound arrives
+    // first from a different lookup.
+    //
+    // `IsHalfword[Q]` closes it: `Q < 2^16` as an INTEGER, so `8Q < 2^19 < p` is
+    // computed without reduction, and `8Q = M_BASE[0] < 2^16` then forces
+    // `Q < 2^13` and `8 | M_BASE[0]`. Since `8 | 65536`, a multiple of 8 in the
+    // low halfword is exactly an 8-aligned address.
+    interactions.push(BusInteraction::sender(
+        BusId::IsHalfword,
+        Multiplicity::Column(cols::FIRST),
+        vec![direct(cols::MSG_ALIGN_Q)],
+    ));
+
     // 10h. IS_HALF on the absorb-only pointer arithmetic: the message base (live
     // on every absorb row, including END, where it rides the chain), its
     // increment and the 8 message dword pointers.
@@ -1514,7 +1600,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 // Single-source constraint set
 // =========================================================================
 
-/// The BLAKE3 table's transition constraints (848 total):
+/// The BLAKE3 table's transition constraints (851 total):
 /// - idx 0..44:    22 pointer `ADD` carry pairs (`ptr[k] = addr + 8k`); the
 ///   control region's 8 are μ-gated, the 14 above it MU_S-gated;
 /// - idx 44, 45:   top-pointer no-overflow, once per mode — `MU_S·carry_1` of
@@ -1538,7 +1624,12 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 /// - idx 825..843: `M_BASE + 64 = M_BASE_INCR` and the 8 `msg_ptr[j]` ADD pairs;
 /// - idx 843:      `MU_C·carry_1` of `m_base + 56 = msg_ptr[7]`;
 /// - idx 844..848: the interior schedule — `t = 0`, `block_len = 64`, and flags
-///   zero on every compressing row but the FIRST.
+///   zero on every compressing row but the FIRST;
+/// - idx 848:      x11 is 8-aligned — `FIRST·(M_BASE[0] − 8·Q) = 0`;
+/// - idx 849:      `NEXT_IS_END·(1 − MU_C) = 0`, so the flag is off the rows
+///   whose `REM_DECR` the ZERO lookup does not pin;
+/// - idx 850:      `(MU_C − NEXT_IS_END)·carry_1` of `M_BASE + 64 = M_BASE_INCR`
+///   — the message region wraps the address space on its LAST block or not at all.
 ///
 /// Every constraint is gated by the mode it belongs to, and the mixing core by
 /// `μ − END`. Max degree 3 (the booleanities; identities are degree 2).
@@ -1866,6 +1957,58 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for Blake3Constraints {
             let flags = word_expr(b, &WordRef::Cols(word_cols(cols::in_word(27, 0))));
             let root = gate * flags;
             b.emit_base(idx, root);
+            idx += 1;
+        }
+
+        // ★ x11 is 8-aligned: `M_BASE[0] = 8·Q`, with `Q` bounded to a halfword
+        // by its own `IsHalfword` send. The ABI requires the alignment and the
+        // executor rejects without it, so a chip that did not check it would
+        // accept absorbs the VM semantics reject. Only the FIRST row needs it:
+        // `M_BASE + 64` preserves 8-alignment down the group.
+        {
+            let eight = b.const_base(8);
+            let root = b.main(0, cols::FIRST)
+                * (b.main(0, cols::M_BASE) - b.main(0, cols::MSG_ALIGN_Q) * eight);
+            b.emit_base(idx, root);
+            idx += 1;
+        }
+
+        // `NEXT_IS_END` is zero off the compressing rows, so the gate below is a
+        // bit there rather than a negative. On a compressing row the ZERO lookup
+        // pins it to `REM_DECR == 0`, so it needs no IS_BIT of its own — it is
+        // fully determined either way.
+        {
+            let one = b.one();
+            let root = b.main(0, cols::NEXT_IS_END) * (one - b.main(0, cols::MU_C));
+            b.emit_base(idx, root);
+            idx += 1;
+        }
+
+        // ★ The message region does not wrap the address space — except that its
+        // LAST block may end exactly at the top of it.
+        //
+        // `M_BASE_INCR = M_BASE + 64` is the next block's address, so forbidding
+        // its carry on every compressing row would reject a message ending at
+        // 2^64, which the ABI accepts. Forbidding it on NONE of them (the
+        // previous state of this chip) let a group of N blocks wrap and fold
+        // blocks read from the bottom of memory, which the executor rejects.
+        // Gating on `MU_C − NEXT_IS_END` is the exact distinction: every
+        // compressing row but the last.
+        {
+            let c65536 = b.const_base(65536);
+            let base_lo = b.main(0, cols::M_BASE) + b.main(0, cols::M_BASE + 1) * c65536.clone();
+            let base_hi =
+                b.main(0, cols::M_BASE + 2) + b.main(0, cols::M_BASE + 3) * c65536.clone();
+            let incr_lo =
+                b.main(0, cols::M_BASE_INCR) + b.main(0, cols::M_BASE_INCR + 1) * c65536.clone();
+            let incr_hi =
+                b.main(0, cols::M_BASE_INCR + 2) + b.main(0, cols::M_BASE_INCR + 3) * c65536;
+            let inv_2_32 = b.const_base(INV_SHIFT_32);
+            let off = b.const_base(64);
+            let carry_0 = (base_lo + off - incr_lo) * inv_2_32.clone();
+            let carry_1 = (base_hi + carry_0 - incr_hi) * inv_2_32;
+            let gate = b.main(0, cols::MU_C) - b.main(0, cols::NEXT_IS_END);
+            b.emit_base(idx, gate * carry_1);
         }
     }
 }
@@ -2442,9 +2585,16 @@ mod absorb_tests {
     }
 
     fn single_op(timestamp: u64) -> Blake3Operation {
+        single_op_with_flags(timestamp, 11)
+    }
+
+    /// A single compression with a chosen `flags` word. `flags = 0` is not a
+    /// detail: several absorb constraints multiply the flags word, so a fixture
+    /// with nonzero flags can make a test pass through the WRONG constraint.
+    fn single_op_with_flags(timestamp: u64, flags: u32) -> Blake3Operation {
         let h: [u32; 8] = core::array::from_fn(|i| 0x9E3779B9u32.wrapping_mul(i as u32 + 1));
         let m: [u32; 16] = core::array::from_fn(|i| 0x85EBCA6Bu32.wrapping_mul(i as u32 + 7));
-        let (t, block_len, flags) = (0x0123_4567u64, 64u32, 11u32);
+        let (t, block_len) = (0x0123_4567u64, 64u32);
         Blake3Operation {
             timestamp,
             state_addr: 0x2000,
@@ -2521,15 +2671,33 @@ mod absorb_tests {
 
     /// The net multiset of tuples on `bus`, as `key → (senders − receivers)`.
     /// An honest trace leaves this empty: that IS the LogUp condition.
-    fn bus_net(
-        trace: &TraceTable<GoldilocksField, GoldilocksExtension>,
-        bus: BusId,
-    ) -> BTreeMap<String, i64> {
+    /// A bus's net multiset, plus how many tuples were actually put on it.
+    ///
+    /// ★ `touched` exists so an `is_empty()` control cannot pass vacuously. An
+    /// empty net means "senders and receivers cancelled"; it says nothing about
+    /// whether anything was sent at all, and a mutation that gates the whole
+    /// chain off would satisfy the balance assertion while proving nothing.
+    struct BusNet {
+        net: BTreeMap<String, i64>,
+        touched: usize,
+    }
+
+    impl BusNet {
+        fn is_empty(&self) -> bool {
+            self.net.is_empty()
+        }
+        fn len(&self) -> usize {
+            self.net.len()
+        }
+    }
+
+    fn bus_net(trace: &TraceTable<GoldilocksField, GoldilocksExtension>, bus: BusId) -> BusNet {
         let interactions: Vec<BusInteraction> = bus_interactions()
             .into_iter()
             .filter(|i| i.bus_id == u64::from(bus))
             .collect();
         let mut net: BTreeMap<String, i64> = BTreeMap::new();
+        let mut touched = 0usize;
         for row_idx in 0..trace.num_rows() {
             let row = row_of(trace, row_idx);
             for it in &interactions {
@@ -2538,6 +2706,7 @@ mod absorb_tests {
                     continue;
                 }
                 assert_eq!(mult, FE::one(), "chip multiplicities are 0 or 1");
+                touched += 1;
                 let values: Vec<FE> = it
                     .values
                     .iter()
@@ -2548,7 +2717,22 @@ mod absorb_tests {
             }
         }
         net.retain(|_, v| *v != 0);
-        net
+        BusNet { net, touched }
+    }
+
+    /// The chain balances AND actually carried `expected` tuples. A group of N
+    /// blocks puts 2N on the bus: N sends from the compressing rows, N receives
+    /// from the rows after the first.
+    fn assert_chain_balances(
+        trace: &TraceTable<GoldilocksField, GoldilocksExtension>,
+        expected: usize,
+    ) {
+        let n = bus_net(trace, BusId::Blake3Absorb);
+        assert!(n.is_empty(), "the honest chain must balance");
+        assert_eq!(
+            n.touched, expected,
+            "the balance assertion must not pass vacuously"
+        );
     }
 
     /// Number of rows whose `Ecall` receive fires, split by syscall.
@@ -2578,10 +2762,8 @@ mod absorb_tests {
     fn both_modes_share_the_table() {
         let trace = trace_of(&[single_op(4)], &[absorb_op(8, 1, 1), absorb_op(12, 3, 1)]);
         assert_constraints_hold(&trace, None);
-        assert!(
-            bus_net(&trace, BusId::Blake3Absorb).is_empty(),
-            "the honest chain must balance"
-        );
+        // 2N tuples per group: 2·1 for the one-block group, 2·3 for the other.
+        assert_chain_balances(&trace, 8);
         assert_eq!(ecall_receives(&trace), (1, 2), "one Ecall per ecall");
     }
 
@@ -2631,7 +2813,8 @@ mod absorb_tests {
     fn the_single_mode_is_untouched() {
         let trace = trace_of(&[single_op(4), single_op(8)], &[]);
         assert_constraints_hold(&trace, None);
-        assert!(bus_net(&trace, BusId::Blake3Absorb).is_empty());
+        // 0 touched is the POINT here: the single mode must not reach the bus.
+        assert_chain_balances(&trace, 0);
         for row_idx in 0..2 {
             let row = row_of(&trace, row_idx);
             assert_eq!(row[cols::MU], FE::one());
@@ -2648,7 +2831,7 @@ mod absorb_tests {
     fn the_cap_boundary_and_the_degenerate_group_both_hold() {
         let one = trace_of(&[], &[absorb_op(4, 1, 1)]);
         assert_constraints_hold(&one, None);
-        assert!(bus_net(&one, BusId::Blake3Absorb).is_empty());
+        assert_chain_balances(&one, 2);
 
         let n = ABSORB_MAX_BLOCKS as usize;
         let full = trace_of(&[], &[absorb_op(4, n, 1)]);
@@ -2664,10 +2847,7 @@ mod absorb_tests {
         // The constraint set rebuilds the wire flow per call, so sample the
         // boundaries rather than all 2 048 rows.
         assert_constraints_hold(&full, Some(&[0, 1, n - 1, n, n + 1, full.num_rows() - 1]));
-        assert!(
-            bus_net(&full, BusId::Blake3Absorb).is_empty(),
-            "a group at the cap must still chain"
-        );
+        assert_chain_balances(&full, 2 * n);
     }
 
     // ---------------------------------------------------------------------
@@ -2679,7 +2859,7 @@ mod absorb_tests {
     #[test]
     fn a_tampered_chained_cv_unbalances_the_chain() {
         let mut trace = trace_of(&[], &[absorb_op(4, 3, 1)]);
-        assert!(bus_net(&trace, BusId::Blake3Absorb).is_empty(), "control");
+        assert_chain_balances(&trace, 6);
         // Row 1's incoming chaining value, one byte off.
         let c = cols::in_word(0, 0);
         let old = *trace.main_table.get(1, c);
@@ -2696,7 +2876,7 @@ mod absorb_tests {
     #[test]
     fn a_group_without_its_end_row_leaves_a_dangling_send() {
         let mut trace = trace_of(&[], &[absorb_op(4, 2, 1)]);
-        assert!(bus_net(&trace, BusId::Blake3Absorb).is_empty(), "control");
+        assert_chain_balances(&trace, 4);
         // Blank the END row (row 2) exactly as a padding row.
         for c in 0..cols::NUM_COLUMNS {
             trace.main_table.set_fe(2, c, FE::zero());
@@ -2741,11 +2921,12 @@ mod absorb_tests {
         let answerable =
             |(input, output): &(FE, FE)| (*input == FE::zero()) == (*output == FE::one());
 
-        // CONTROL: an honest group sends one ZERO tuple per absorb row, and the
-        // precomputed table answers every one of them.
+        // CONTROL: a 3-block group sends 7 ZERO tuples — `ZERO[REMAINING] → END`
+        // on each of its 4 rows, and `ZERO[REM_DECR] → NEXT_IS_END` on the 3
+        // compressing ones — and the precomputed table answers every one.
         let trace = trace_of(&[], &[absorb_op(4, 3, 1)]);
         let honest = zero_tuples(&trace);
-        assert_eq!(honest.len(), 4, "one ZERO send per row of a 3-block group");
+        assert_eq!(honest.len(), 7, "4 END lookups + 3 NEXT_IS_END lookups");
         assert!(
             honest.iter().all(answerable),
             "BITWISE answers every honest lookup"
@@ -2788,15 +2969,39 @@ mod absorb_tests {
     /// the absorb bus.
     #[test]
     fn a_single_row_cannot_mint_a_boundary() {
-        let trace = trace_of(&[single_op(4)], &[]);
-        for col in [cols::FIRST, cols::END] {
-            let mut main = row_of(&trace, 0);
-            main[col] = FE::one();
-            assert!(
-                eval_main_row(main).iter().any(|v| *v != FE::zero()),
-                "a single-compression row must not claim {col}"
-            );
+        // ★ flags = 0 on purpose. With the default fixture's flags = 11 the
+        // FIRST half of this test passes through `(MU_C − FIRST)·flags = 0`
+        // rather than through the boundary lock — the assertion would survive
+        // deleting the lock entirely. Zeroing the flags removes that path and
+        // leaves the lock as the only constraint that can fire.
+        for op in [single_op_with_flags(4, 0), single_op(4)] {
+            let trace = trace_of(&[op], &[]);
+            for col in [cols::FIRST, cols::END] {
+                let mut main = row_of(&trace, 0);
+                main[col] = FE::one();
+                assert!(
+                    eval_main_row(main).iter().any(|v| *v != FE::zero()),
+                    "a single-compression row must not claim {col}"
+                );
+            }
         }
+
+        // ...and specifically the LOCK fires, not something downstream: on the
+        // flags = 0 fixture it is the only nonzero constraint.
+        let trace = trace_of(&[single_op_with_flags(4, 0)], &[]);
+        let mut main = row_of(&trace, 0);
+        main[cols::FIRST] = FE::one();
+        let fired: Vec<usize> = eval_main_row(main)
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| **v != FE::zero())
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            fired.len(),
+            1,
+            "exactly the boundary lock should fire, got {fired:?}"
+        );
     }
 
     /// The two modes are exclusive, so one row cannot answer two syscalls.
@@ -2948,6 +3153,106 @@ mod absorb_tests {
         );
     }
 
+    /// ★ x11 must be 8-aligned, the way the executor requires and the way the
+    /// chip's own MEMW dword reads assume. Before this constraint the chip
+    /// accepted an unaligned message and folded blocks the ABI forbids.
+    #[test]
+    fn an_unaligned_message_address_is_rejected() {
+        // CONTROL: the aligned fixture satisfies the alignment constraint, and
+        // its witness is the honest quotient.
+        let trace = trace_of(&[], &[absorb_op(4, 2, 1)]);
+        assert_constraints_hold(&trace, None);
+        let row = row_of(&trace, 0);
+        assert_eq!(row[cols::MSG_ALIGN_Q], FE::from(MSG / 8));
+
+        // The attack: an unaligned base. The witness a prover would need is
+        // `M_BASE[0] / 8`, and for an odd low halfword no HALFWORD value works —
+        // 8·Q would have to be odd, and 8·Q is even for every integer Q.
+        let mut main = row_of(&trace, 0);
+        main[cols::M_BASE] += FE::one(); // low halfword now MSG+1, unaligned
+        assert!(
+            eval_main_row(main.clone()).iter().any(|v| *v != FE::zero()),
+            "an unaligned M_BASE must fail with the honest quotient"
+        );
+
+        // ...and no small Q rescues it: the constraint is an equality over
+        // integers once Q is halfword-bounded, so an odd target is unreachable.
+        for q in 0u64..=0xFFFF {
+            main[cols::MSG_ALIGN_Q] = FE::from(q);
+            if eval_main_row(main.clone()).iter().all(|v| *v == FE::zero()) {
+                panic!("Q = {q} satisfied an unaligned M_BASE");
+            }
+        }
+    }
+
+    /// ★ The scaled form of the alignment check — `IsB20[Q · 2^7]`, mirroring
+    /// the block cap — is VACUOUS, and this test is why the shipped chip uses
+    /// `IsHalfword[Q]` instead.
+    ///
+    /// With `Q` bounded only through a scaled product, a prover sets
+    /// `Q = M_BASE[0] · 8⁻¹ mod p`; then `Q · 2^7 = M_BASE[0] · 16`, which is
+    /// under 2^20 for ANY halfword `M_BASE[0]`, aligned or not. The block cap
+    /// survives the identical attack only because `REMAINING`'s domain bound
+    /// arrives first from the ZERO lookup — a distinction easy to lose.
+    #[test]
+    fn the_scaled_alignment_check_would_have_been_vacuous() {
+        const B20: u64 = 1 << 20;
+        let eight_inv = (FE::one() / FE::from(8u64)).expect("8 is invertible");
+        for base in [1u64, 3, 0xFFFF, 12345] {
+            let q = FE::from(base) * eight_inv;
+            // The bogus witness satisfies the equality...
+            assert_eq!(FE::from(8u64) * q, FE::from(base));
+            // ...and the SCALED range check would have accepted it.
+            let scaled = q * FE::from(128u64);
+            assert_eq!(scaled, FE::from(base * 16));
+            assert!(
+                base * 16 < B20,
+                "the scaled form admits unaligned base {base}"
+            );
+        }
+        // The shipped form does not: Q would have to exceed a halfword.
+        for base in [1u64, 3, 12345] {
+            let q = FE::from(base) * eight_inv;
+            assert!(
+                *q.value() > 0xFFFF,
+                "the halfword bound must exclude the bogus witness for {base}"
+            );
+        }
+    }
+
+    /// ★ A message region may end at the top of memory, but it may not WRAP
+    /// through it. The distinction is the last block: only its `M_BASE + 64`
+    /// is allowed to carry.
+    #[test]
+    fn the_message_region_may_end_at_the_top_but_not_wrap() {
+        // The legal shape: a one-block group whose block is the last 64 bytes of
+        // the address space. `M_BASE + 64` = 2^64 wraps, and that is fine.
+        let mut op = absorb_op(4, 1, 1);
+        op.msg_addr = u64::MAX - 63;
+        let trace = trace_of(&[], &[op]);
+        assert_constraints_hold(&trace, None);
+        assert_eq!(row_of(&trace, 0)[cols::NEXT_IS_END], FE::one());
+
+        // The illegal shape: two blocks from the same base, so block 0's
+        // successor address wraps to 0 and block 1 is read from the bottom of
+        // memory. This is the executor's `Blake3AbsorbAddressOverflow` case.
+        let mut op = absorb_op(4, 2, 1);
+        op.msg_addr = u64::MAX - 63;
+        let rows = expand_absorb(&op);
+        assert_eq!(rows[1].m_base, 0, "the fixture really does wrap");
+        let trace = trace_of(&[], &[op]);
+        let row0 = row_of(&trace, 0);
+        assert_eq!(
+            row0[cols::NEXT_IS_END],
+            FE::zero(),
+            "block 0 is not the last block"
+        );
+        assert!(
+            eval_main_row(row0).iter().any(|v| *v != FE::zero()),
+            "a non-final block whose successor address wraps must be rejected"
+        );
+    }
+
     /// The countdown cannot be re-based mid-group.
     #[test]
     fn the_countdown_must_decrement_by_one() {
@@ -2988,20 +3293,60 @@ mod absorb_tests {
     #[test]
     fn the_block_cap_is_enforced_in_circuit() {
         const B20: u64 = 1 << 20;
-        for n in [1u64, 2, 1023, ABSORB_MAX_BLOCKS] {
-            assert!(
-                (n - 1) * ABSORB_CAP_SCALE < B20,
-                "a legal count of {n} blocks must pass IsB20"
-            );
+
+        /// The value the chip actually puts on the `IsB20` bus for a group of
+        /// `n` blocks — read off a generated TRACE through the shipped
+        /// interaction, not recomputed from the constants.
+        fn cap_lookup_value(n: usize) -> u64 {
+            let trace = trace_of(&[], &[absorb_op(4, n, 1)]);
+            let row = row_of(&trace, 0);
+            assert_eq!(row[cols::FIRST], FE::one(), "row 0 is the group's FIRST");
+            let sends: Vec<Vec<FE>> = bus_interactions()
+                .iter()
+                .filter(|i| {
+                    i.bus_id == u64::from(BusId::IsB20)
+                        && matches!(i.multiplicity, Multiplicity::Column(c) if c == cols::FIRST)
+                })
+                .map(|i| {
+                    i.values
+                        .iter()
+                        .flat_map(|v| v.combine_from::<GoldilocksField, _>(|c| row[c]))
+                        .collect()
+                })
+                .collect();
+            assert_eq!(sends.len(), 1, "exactly one cap lookup per group");
+            assert_eq!(sends[0].len(), 1, "IsB20 takes one bus element");
+            // BITWISE holds [0, 2^20); anything at or above it is answerable by
+            // no row. The value is a small integer, so its canonical
+            // representative IS the integer the lookup asks for.
+            *sends[0][0].value()
         }
-        for n in [ABSORB_MAX_BLOCKS + 1, ABSORB_MAX_BLOCKS + 2, 4096] {
-            assert!(
-                (n - 1) * ABSORB_CAP_SCALE >= B20,
-                "an over-cap count of {n} blocks must fail IsB20"
-            );
-            // ...and it fails by being out of range, not by wrapping the field.
-            assert!((n - 1) * ABSORB_CAP_SCALE < 1u64 << 30);
-        }
+
+        // ★ The scale is in the emitted tuple, not just in the constant. At
+        // n = 2 the countdown is 1, so a chip that dropped ABSORB_CAP_SCALE
+        // would put 1 on the bus; the shipped one puts 1024.
+        assert_eq!(cap_lookup_value(2), ABSORB_CAP_SCALE);
+        assert_ne!(cap_lookup_value(2), 1, "dropping the scale must be visible");
+        assert_eq!(cap_lookup_value(1), 0);
+        assert_eq!(cap_lookup_value(7), 6 * ABSORB_CAP_SCALE);
+
+        // Legal groups land inside the table; the one at the cap lands at its
+        // very top row.
+        assert!(cap_lookup_value(ABSORB_MAX_BLOCKS as usize) < B20);
+        assert_eq!(
+            cap_lookup_value(ABSORB_MAX_BLOCKS as usize),
+            B20 - ABSORB_CAP_SCALE
+        );
+
+        // ★ One block past the cap leaves the table, so no BITWISE row answers
+        // the lookup and the range-check bus cannot balance. The trace builder
+        // will happily BUILD that group — the cap is enforced by this lookup,
+        // not by the witness generator, which is the point.
+        let over = cap_lookup_value(ABSORB_MAX_BLOCKS as usize + 1);
+        assert_eq!(over, B20);
+        assert!(over >= B20, "an over-cap group must fall outside IsB20");
+        // ...and it fails by being out of range, not by wrapping the field.
+        assert!(over < 1u64 << 30);
     }
 
     /// The table's shape, pinned so a change has to be deliberate. The absorb
@@ -3010,10 +3355,41 @@ mod absorb_tests {
     /// denominator on single-compression rows too.
     #[test]
     fn the_tables_shape_is_pinned() {
-        assert_eq!(cols::NUM_COLUMNS, 3266);
-        assert_eq!(bus_interactions().len(), 1473);
-        assert_eq!(Blake3Constraints.meta().len(), 848);
+        assert_eq!(cols::NUM_COLUMNS, 3268);
+        assert_eq!(bus_interactions().len(), 1475);
+        assert_eq!(Blake3Constraints.meta().len(), 851);
         assert_eq!(Blake3Constraints.max_degree(), 3);
+    }
+
+    /// ★ The END-gated `AreBytes` sends cover the chaining value, and nothing
+    /// else — the mutation this catches is re-pointing them at columns that are
+    /// already range-checked.
+    ///
+    /// Those 16 sends are the ONLY byte range check `h` has on the END row (the
+    /// mixing core, which range-checks it everywhere else as an XOR operand, is
+    /// gated off there). Aim them at the message or the output columns and every
+    /// bus still balances, every constraint still holds, and the `cv_out` write
+    /// is free to put a non-byte in memory. Nothing behavioural distinguishes
+    /// the mutant, so the test has to be structural.
+    #[test]
+    fn the_end_row_range_checks_the_chaining_value_itself() {
+        let mut covered: Vec<usize> = bus_interactions()
+            .iter()
+            .filter(|i| {
+                i.bus_id == u64::from(BusId::AreBytes)
+                    && matches!(i.multiplicity, Multiplicity::Column(c) if c == cols::END)
+            })
+            .flat_map(|i| i.values.iter().flat_map(|v| v.column_indices()))
+            .collect();
+        covered.sort_unstable();
+
+        // h[0..8] is 32 bytes at cols::IN — the columns the chain receive fills
+        // and the cv_out write reads.
+        let expected: Vec<usize> = (cols::IN..cols::IN + 32).collect();
+        assert_eq!(
+            covered, expected,
+            "the END-gated AreBytes must range-check exactly h's 32 bytes"
+        );
     }
 
     /// Every interaction's columns are inside the row.

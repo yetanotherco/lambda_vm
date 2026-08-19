@@ -1579,8 +1579,19 @@ fn collect_keccak_memw_ops(
 /// The four operands come from the register state the way ECSM's and HINT's do
 /// — the CPU row carries nothing useful for an ecall that expands to a group.
 /// Every access happens at the ecall's single timestamp, which is why the ABI
-/// requires the control and message regions to be disjoint: MEMW orders
-/// accesses to one address by timestamp and cannot order two at the same one.
+/// requires the control and message regions to be disjoint — an overlap would
+/// touch one address twice at one timestamp, and no trace can do that:
+///
+///   Per address, MEMW's genesis and finalization tokens have cardinality one,
+///   so that address's accesses form a perfect matching between produced and
+///   consumed tokens — a disjoint union of paths and cycles. Every edge carries
+///   `old_ts < ts` strictly, so no cycle closes, leaving a single strictly
+///   increasing path. Its timestamps are pairwise distinct, for ANY pair of
+///   accesses rather than only adjacent ones.
+///
+/// (The shorter form — "the pair would need `LT(T, T) → 1`" — is not enough on
+/// its own: the second access could consume an OLDER token instead of the one
+/// the first produced. The matching argument is what rules that out.)
 ///
 /// The message is read but never written, so `memory_state` is untouched by the
 /// block reads; only `cv_out` advances it.
@@ -2852,8 +2863,19 @@ pub(crate) fn collect_bitwise_from_blake3(
             ops.push(BitwiseOperation::zero(r.remaining));
             // M_BASE halfwords, on every absorb row (it rides the chain to END).
             is_half_dword(&mut ops, r.m_base);
+            if r.first {
+                // IS_HALF[Q]: the x11 8-alignment witness, `M_BASE[0] / 8`.
+                let q = (r.m_base & 0xFFFF) / 8;
+                ops.push(BitwiseOperation::halfword(
+                    BitwiseOperationType::IsHalf,
+                    (q & 0xFF) as u8,
+                    ((q >> 8) & 0xFF) as u8,
+                ));
+            }
 
             if compressing {
+                // ZERO[REM_DECR] -> NEXT_IS_END, on compressing rows only.
+                ops.push(BitwiseOperation::zero(r.remaining - 1));
                 // The mixing core, in the senders' canonical order.
                 let flow = blake3::ValueFlow::compute(&r.h, &r.m, 0, 64, r.flags);
                 for &(a, b, _out) in &flow.xors {
