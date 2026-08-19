@@ -1074,6 +1074,8 @@ pub fn prove_continuation(
     let __root = stark::instruments::span("prove_continuation_total");
 
     let elf = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
+    let resolved_hints = crate::resolve_hints(&elf, private_inputs, hints)?;
+    let hints: &[[u8; 32]] = &resolved_hints;
     let mut executor = Executor::new(&elf, private_inputs.to_vec(), hints)
         .map_err(|e| Error::Execution(format!("{e}")))?;
     // The DECODE precomputed commitment depends only on (ELF, opts): compute
@@ -1431,7 +1433,8 @@ pub fn prove_continuation(
             let run = || -> Result<GlobalResult, Error> {
                 #[cfg(feature = "instruments")]
                 let __sp = stark::instruments::span("prove_global");
-                let num_private_input_pages = page::private_input_page_count(private_inputs, hints);
+                let num_private_input_pages =
+                    page::private_input_page_count(private_inputs, hints);
                 // SINGLE source of truth: the same page-base list drives the
                 // committed GLOBAL_MEMORY tables and is shipped in the bundle,
                 // so the two can never diverge in set or order.

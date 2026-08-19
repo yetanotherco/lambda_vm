@@ -1273,6 +1273,72 @@ fn test_prove_hint_arena_rust_guest() {
     assert_eq!(proof.public_output, expected.to_vec());
 }
 
+/// Auto-record policy: proving a hint-consuming guest with NO explicit arena
+/// must transparently run the two-pass recording flow ([`crate::resolve_hints`])
+/// and cover the cheap hinted trace — not the software-fallback one. Asserts
+/// the trace element counts match an explicit-arena call and that both proofs
+/// verify with identical public outputs. Regression coverage for the removed
+/// hint ecall's always-on ergonomics (hint-less `ethrex_10_transfers` measured
+/// 3.35M cycles vs 1.31M hinted — flows that supply nothing must not regress).
+#[test]
+fn test_prove_ecrecover_hints_auto_records_arena() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .to_path_buf();
+    let elf_bytes =
+        std::fs::read(workspace_root.join("executor/program_artifacts/rust/ecrecover_hints.elf"))
+            .expect("ecrecover_hints.elf not found — run `make compile-programs-rust`");
+    let program = executor::elf::Elf::load(&elf_bytes).expect("ELF load");
+
+    // Two ecrecover records (sig(64) || recid(1) || msg(32)), as built by the
+    // executor driver's fixture generator: r = 1 and 2 (both quadratic
+    // residues for r³ + 7), s = 1000/1001, recid parity 0/1, msg = 0x01.. / 0x08...
+    const REC0: [u8; 97] = [
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x03, 0xE8, 0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+        0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+        0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+    ];
+    const REC1: [u8; 97] = [
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x03, 0xE9, 0x01, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08,
+        0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08,
+        0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08,
+    ];
+    let mut input = Vec::with_capacity(4 + 2 * 97);
+    input.extend_from_slice(&2u32.to_le_bytes());
+    input.extend_from_slice(&REC0);
+    input.extend_from_slice(&REC1);
+
+    // The recording pass answers the guest's requests (sqrt + batched field
+    // inverse + scalar inverse per recovery, in that order).
+    let hints = executor::vm::execution::collect_hints(&program, input.clone())
+        .expect("collect_hints");
+    assert_eq!(hints.len(), 6, "2 recoveries × 3 hint requests");
+
+    // The policy under test: no explicit arena ⇒ auto-record ⇒ the SAME
+    // (hinted) trace an explicit arena produces.
+    let auto = crate::count_elements(&elf_bytes, &input, &[]).expect("count auto");
+    let explicit = crate::count_elements(&elf_bytes, &input, &hints).expect("count explicit");
+    assert_eq!(auto, explicit, "auto-record must produce the hinted trace");
+
+    // And both proofs verify with identical committed output.
+    let proof_auto = prove_vm_minimal(&elf_bytes, &input, &[], &Default::default());
+    let proof_hints = prove_vm_minimal(&elf_bytes, &input, &hints, &Default::default());
+    assert!(verify_vm_minimal(&proof_auto, &elf_bytes));
+    assert!(verify_vm_minimal(&proof_hints, &elf_bytes));
+    assert_eq!(proof_auto.public_output, proof_hints.public_output);
+}
+
 /// Soundness: the verifier REJECTS a forged ECSM result.
 ///
 /// A malicious prover must not be able to claim a wrong `k·G`. We tamper the result

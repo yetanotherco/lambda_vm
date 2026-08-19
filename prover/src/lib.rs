@@ -1037,6 +1037,34 @@ pub(crate) fn verify_l2g_commitment_binding_view(
 // Public API: Prove / Verify
 // =============================================================================
 
+/// Resolve the hint arena for a prove/count entry point: `hints` as-is when
+/// non-empty, otherwise the two-pass recording flow — execute once with an
+/// empty arena, answer the guest's logged requests with
+/// [`executor::vm::instruction::execution::compute_hint`], and use the answers
+/// as the arena for the proved run.
+///
+/// The auto-record restores the ergonomics the removed hint ecall had: a
+/// hint-consuming guest proved with no explicit arena still gets the cheap
+/// in-guest-verify trace instead of the software-fallback one (measured on
+/// `ethrex_10_transfers`: 3.35M cycles hint-less vs 1.31M hinted). Both runs
+/// commit the same output — the arena only changes how cheaply the guest gets
+/// there — so this never changes the statement being proved. For a guest that
+/// requests nothing the record pass yields an empty arena and the proved run
+/// is identical to what it would have been anyway; the only cost is one extra
+/// execution, negligible against proving.
+fn resolve_hints<'a>(
+    program: &Elf,
+    private_inputs: &[u8],
+    hints: &'a [[u8; 32]],
+) -> Result<std::borrow::Cow<'a, [[u8; 32]]>, Error> {
+    if !hints.is_empty() {
+        return Ok(std::borrow::Cow::Borrowed(hints));
+    }
+    let recorded = executor::vm::execution::collect_hints(program, private_inputs.to_vec())
+        .map_err(|e| Error::Execution(format!("hint recording pass: {e}")))?;
+    Ok(std::borrow::Cow::Owned(recorded))
+}
+
 /// Prove an ELF binary execution. Returns a serializable proof bundle.
 pub fn prove(elf_bytes: &[u8]) -> Result<VmProof, Error> {
     prove_with_inputs(elf_bytes, &[], &[])
@@ -1046,7 +1074,10 @@ pub fn prove(elf_bytes: &[u8]) -> Result<VmProof, Error> {
 ///
 /// `hints` are untrusted 32-byte values appended to the private-input memory
 /// region's hint arena; the guest reads them with ordinary loads and must
-/// verify them in-circuit.
+/// verify them in-circuit. When empty, the recording pass of the two-pass
+/// hint flow runs automatically (see [`resolve_hints`]), so hint-consuming
+/// guests get the cheap in-guest-verify trace without the caller supplying
+/// anything.
 pub fn prove_with_inputs(
     elf_bytes: &[u8],
     private_inputs: &[u8],
@@ -1075,7 +1106,8 @@ pub fn count_elements(
     hints: &[[u8; 32]],
 ) -> Result<(u64, u64), Error> {
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
-    let executor = Executor::new(&program, private_inputs.to_vec(), hints)
+    let hints = resolve_hints(&program, private_inputs, hints)?;
+    let executor = Executor::new(&program, private_inputs.to_vec(), &hints)
         .map_err(|e| Error::Execution(format!("{e}")))?;
     let result = executor
         .run()
@@ -1085,7 +1117,7 @@ pub fn count_elements(
         &result.logs,
         &MaxRowsConfig::default(),
         private_inputs,
-        hints,
+        &hints,
         #[cfg(feature = "disk-spill")]
         StorageMode::Ram,
     )?;
@@ -1129,7 +1161,8 @@ pub fn prove_with_options_and_inputs(
     let __sp = stark::instruments::span("execute");
 
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
-    let executor = Executor::new(&program, private_inputs.to_vec(), hints)
+    let hints = resolve_hints(&program, private_inputs, hints)?;
+    let executor = Executor::new(&program, private_inputs.to_vec(), &hints)
         .map_err(|e| Error::Execution(format!("{e}")))?;
     let result = executor
         .run()
@@ -1150,7 +1183,8 @@ pub fn prove_with_options_and_inputs(
 
     #[cfg(feature = "disk-spill")]
     let storage_mode = {
-        let lengths = count_table_lengths(&program, &result.logs, max_rows, private_inputs, hints)?;
+        let lengths =
+            count_table_lengths(&program, &result.logs, max_rows, private_inputs, &hints)?;
         auto_storage::decide(&lengths, proof_options.blowup_factor)
     };
 
@@ -1159,7 +1193,7 @@ pub fn prove_with_options_and_inputs(
         &result.logs,
         max_rows,
         private_inputs,
-        hints,
+        &hints,
         #[cfg(feature = "disk-spill")]
         storage_mode,
     )?;
