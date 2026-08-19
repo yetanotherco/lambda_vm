@@ -127,9 +127,51 @@ pub fn generate() -> (Vec<u8>, usize) {
 /// tests that run in parallel and one of them regenerates it: without the
 /// rename a reader can observe a half-written blob, and since blobs differ,
 /// "it was fine last time" proves nothing.
+/// ★ The cache key for everything that changes these bytes INCOMPATIBLY.
+///
+/// The cache lives in the shared temp directory and is keyed on the inner ELF
+/// and the epoch size — neither of which says anything about the proof format.
+/// Every format-moving branch on one machine therefore wrote its blob over
+/// everyone else's, and the next branch to read it got bytes its own
+/// `rkyv::access` could not validate. That surfaces as
+/// `"fixture blob must validate"` in whichever test happened to read first
+/// (`arena_filler_reads_real_committed_roots`, `keccak_merkle_opening_cost`) —
+/// a phantom failure with no relationship to the branch under test, which cost
+/// a baseline reconciliation to diagnose.
+///
+/// So the key names the two axes that actually move the bytes: the statement
+/// encoding version and the commitment hash. A branch that changes either gets
+/// its own file instead of corrupting the shared one.
+pub fn cache_format_key() -> String {
+    let tag = std::str::from_utf8(crate::statement::DOMAIN_TAG).unwrap_or("stmt");
+    format!("{tag}-{:?}", stark::config::COMMITMENT_HASH)
+}
+
+/// Whether `bytes` still look like a blob this build can read.
+///
+/// Only the wire prefix — the magic and the version [`crate::encode_recursion_input`]
+/// writes. It is deliberately cheap: this is the last line of defence for a
+/// truncated or foreign file, not the format check. Separating
+/// format-incompatible builds is [`cache_format_key`]'s job, because two
+/// branches can share this prefix and still disagree about everything after it.
+fn prefix_is_readable(bytes: &[u8]) -> bool {
+    bytes.len() > crate::RECURSION_INPUT_PREFIX_LEN
+        && bytes[0..4] == crate::RECURSION_INPUT_MAGIC
+        && u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]])
+            == crate::RECURSION_INPUT_VERSION
+}
+
 pub fn load_or_generate(cache: &Path) -> Vec<u8> {
     if let Ok(bytes) = std::fs::read(cache) {
-        return bytes;
+        // A stale or foreign blob REGENERATES rather than erroring downstream:
+        // the failure it used to cause named a validation site, never the cache.
+        if prefix_is_readable(&bytes) {
+            return bytes;
+        }
+        eprintln!(
+            "fixture cache at {} is not readable by this build — regenerating",
+            cache.display()
+        );
     }
     let (blob, _) = generate();
     write_cache(cache, &blob);

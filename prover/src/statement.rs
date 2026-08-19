@@ -17,7 +17,7 @@ use crate::test_utils::E;
 use crate::{RuntimePageRange, TableCounts};
 
 /// Domain-separation tag. Bump the suffix (`_V2`, ...) on any encoding change.
-const DOMAIN_TAG: &[u8] = b"LAMBDAVM_STARK_STATEMENT_V3";
+pub(crate) const DOMAIN_TAG: &[u8] = b"LAMBDAVM_STARK_STATEMENT_V3";
 
 /// Canonical full-ELF identity digest — exactly what [`absorb_statement`] binds
 /// into the transcript. The recursion attestation folds the same digest into
