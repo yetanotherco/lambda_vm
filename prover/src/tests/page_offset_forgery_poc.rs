@@ -32,7 +32,12 @@
 //! Run under **production** proof options, not `default_test_options()`, so none
 //! of this can be written off as an artefact of a low-query configuration.
 
-use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+// The bare `crypto` DefaultTranscript's type default is keccak, which since the
+// stage-6 flip is NOT the configuration's transcript. This harness must sample
+// Fiat-Shamir from the hash production replays (`DefaultStarkHash`), or every
+// honest proof it builds is rejected at challenge derivation. Same half-flip
+// `config.rs` warns about; the warning applies to test harnesses too.
+use stark::config::DefaultStarkTranscript as DefaultTranscript;
 use stark::proof::options::ProofOptions;
 use stark::prover::{IsStarkProver, Prover};
 
