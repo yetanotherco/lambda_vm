@@ -46,9 +46,9 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # Vast offer search: RTX 5090, >=16 cores, >=48GB RAM, >=64GB disk, verified +
-  # rentable, Blackwell-capable driver, <= cap. gpu_frac=1 (whole-machine, dedicated
-  # host) — see the query step for why.
+  # Vast offer search: RTX 5090, 16-32 cores, >=48GB RAM, >=64GB disk, verified +
+  # rentable, Blackwell-capable driver, cuda_max_good>=12.8, reliability>=0.95, <= cap.
+  # gpu_frac=1 (whole-machine, dedicated host) — see the query step for why.
   GPU_NAME: RTX_5090
   PRICE_CAP: "1"
   VAST_IMAGE_DISK: "64"
@@ -170,7 +170,10 @@ jobs:
             const marker = 'GPU Benchmark (ABBA)';
             // Reference: 4 pairs measured 20 min 11 s end-to-end — 3 min 56 s of rental,
             // checkout and dual cuda build, then 4.06 min per pair, since a pair is TWO
-            // proves at ~2 min each. Per-prove wall varies with the rented host's CPU
+            // proves at ~2 min each. That 3 min 56 s intercept was measured with an
+            // UNCAPPED build; CARGO_BUILD_JOBS=8 (see the bench step) raises it by an
+            // amount nobody has measured yet, which the 12 min intercept below absorbs.
+            // Per-prove wall varies with the rented host's CPU
             // (the prover is partly host-CPU-bound), so the slope is the measured one
             // and the intercept carries slack for a colder box.
             const mins = 12 + Number(process.env.PAIRS) * 4;
@@ -238,7 +241,12 @@ jobs:
           # whole, but up to 7 noisy neighbors share the host CPU/PCIe and add per-pair
           # variance that ABBA pairing can't cancel (it's not static drift). Dedicated boxes
           # exist in the same pool, just priced lower per slot.
-          QUERY="gpu_name=${GPU_NAME} num_gpus=1 gpu_frac=1 cpu_cores_effective>=16 cpu_cores_effective<=32 cpu_ram>=48 disk_space>=64 verified=true rentable=true cuda_max_good>=12.8 dph_total<=${PRICE_CAP}"
+          # reliability>=0.95 drops chronically-flaky hosts (Vast's machine reliability
+          # score, 0-1) before renting — cheaper than renting a bad box and catching it
+          # at the toolchain sanity gate. `reliability` is the queryable field (the
+          # `reliability2` in the response schema is display-only, not filterable).
+          # Over-strict just yields no offers, surfaced by the retry loop's "No offer".
+          QUERY="gpu_name=${GPU_NAME} num_gpus=1 gpu_frac=1 cpu_cores_effective>=16 cpu_cores_effective<=32 cpu_ram>=48 disk_space>=64 verified=true rentable=true reliability>=0.95 cuda_max_good>=12.8 dph_total<=${PRICE_CAP}"
           echo "Query: $QUERY (+ client-side driver_version major >= $MIN_DRIVER)"
           # Keep only offers whose driver major >= MIN_DRIVER, then most expensive first
           # (within the price cap). Within the now whole-machine pool, price just tracks
@@ -260,7 +268,7 @@ jobs:
             sleep "$OFFER_INTERVAL"
           done
           if [ -z "$OFFER_ID" ]; then
-            echo "::error::No RTX 5090 offer matched after $OFFER_ATTEMPTS attempts (>=16 cores, >=48GB RAM, >=64GB disk, driver>=${MIN_DRIVER}, <= \$${PRICE_CAP}/hr)"
+            echo "::error::No RTX 5090 offer matched after $OFFER_ATTEMPTS attempts (whole-machine gpu_frac=1, 16-32 cores, >=48GB RAM, >=64GB disk, driver>=${MIN_DRIVER}, reliability>=0.95, cuda_max_good>=12.8, <= \$${PRICE_CAP}/hr). Full query echoed above."
             exit 1
           fi
           echo "id=$OFFER_ID" >> "$GITHUB_OUTPUT"
@@ -358,26 +366,80 @@ jobs:
         run: |
           SSH="ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o BatchMode=yes -i $KEY -p $PORT root@$HOST"
 
+          # Fail loudly AND legibly. The "Comment ABBA result on PR" step reports failures
+          # by tailing $RUNNER_TEMP/abba_out.txt, but only the bench step writes that file —
+          # so a failure in THIS step used to post "Run failed" above an empty code block,
+          # leaving the operator with nothing but a red X. Record the reason there too.
+          # The bench step's `tee` truncates the file, so a successful run is unaffected.
+          fail() {
+            printf '%s\n' "$1" >> "$RUNNER_TEMP/abba_out.txt"
+            echo "::error::$1"
+            exit 1
+          }
+
           echo "Waiting for the template onstart script to finish (Rust + LLVM + sysroot + clone)..."
-          # The bootstrap's final stdout line is "=== done ===". Vast captures onstart
-          # output to /var/log/onstart.log; fall back to checking the artifacts it leaves.
-          for _ in $(seq 1 120); do   # ~20 min
+          # The bootstrap's final stdout line is "=== done ===", captured by Vast to
+          # /var/log/onstart.log. That marker is the ONLY trusted completion signal:
+          # the previous "artifacts exist" fallback fired as soon as a few files were
+          # present, which let the build start while onstart was still populating the
+          # sysroot — the C compiler then read a half-written header (e.g. a truncated
+          # `bits/timex.h` -> "unterminated #ifndef") or a still-installing toolchain,
+          # producing the confusing dual-build failures. Waiting for the marker (or
+          # rerolling the box) is strictly safer than building on a half-ready host.
+          DONE=""
+          for _ in $(seq 1 150); do   # ~25 min
             if $SSH 'grep -q "=== done ===" /var/log/onstart.log 2>/dev/null'; then
-              echo "onstart reported done"; exit 0
-            fi
-            # Fallback if the log marker isn't found: the late-stage artifacts (cargo + the
-            # sysroot + the cloned repo) imply the earlier Rust/LLVM/toolchain install finished.
-            # Deliberately no toolchain-date check — it would go stale when the repo bumps nightly.
-            # shellcheck disable=SC2016  # $HOME must expand on the remote box, not the runner
-            if $SSH 'test -x "$HOME/.cargo/bin/cargo" \
-                  && test -f /opt/lambda-vm-sysroot/include/stdlib.h \
-                  && test -d /workspace/lambda_vm/.git'; then
-              echo "provisioning artifacts present"; exit 0
+              DONE=1; echo "onstart reported done"; break
             fi
             sleep 10
           done
-          echo "::error::onstart provisioning did not complete in time"
-          exit 1
+          if [ -z "$DONE" ]; then
+            fail "onstart never reported '=== done ===' in ~25 min — slow or broken host. Wait a few minutes before re-running /bench-gpu: offer selection is deterministic (priciest match), so an immediate retry can re-pick this same host once it relists."
+          fi
+
+          # Sanity gate: even a box that reports done can have an unusable toolchain —
+          # a partially provisioned image (no cc, no rustc, missing headers), or a host
+          # whose RAM is faulty enough that compilers die on stock code. Compile AND run
+          # a trivial C and Rust unit so such a box fails HERE, with a clear message,
+          # rather than part-way through the dual build with an internal-compiler-error
+          # backtrace. Costs ~1 s against a build measured in minutes.
+          #
+          # Scope, deliberately narrow. This exercises the HOST toolchain and its default
+          # include path only; it does not touch /opt/lambda-vm-sysroot (the cross sysroot
+          # the guest ELF build uses), so sysroot completeness rests on the onstart marker
+          # above rather than on this check. And a ~1 s compile touching a few MB cannot
+          # reliably surface marginal RAM that only fails under a multi-GB build: it
+          # catches a missing or half-installed toolchain every time, bad RAM only
+          # sometimes. Both are worth a second of wall clock.
+          #
+          # Every command below is a bare statement. Do NOT reintroduce a mid-list `&&`:
+          # under `set -e` a non-final operand of an `&&` list is exempt from errexit and
+          # the list's non-zero status does not re-trigger it, so a compiler that died
+          # would be swallowed and the remote exit status would be the last command's.
+          # The trap keeps the tmpdir cleanup on both the success and failure paths.
+          # `cd` into the repo first so rustup resolves the pinned toolchain from
+          # rust-toolchain.toml, not whatever default the image happens to carry.
+          echo "Toolchain sanity check (gcc + rustc)..."
+          GATE_OUT=""; GATE_RC=0
+          # shellcheck disable=SC2016  # $HOME and $d expand on the remote box, not the runner
+          GATE_OUT=$($SSH 'set -e; cd /workspace/lambda_vm; \
+                d=$(mktemp -d); trap "rm -rf \"$d\"" EXIT; \
+                printf "#include <stdlib.h>\nint main(void){return 0;}\n" > "$d/t.c"; \
+                cc -O2 "$d/t.c" -o "$d/tc"; "$d/tc"; \
+                printf "fn main(){}\n" > "$d/t.rs"; \
+                "$HOME/.cargo/bin/rustc" -O "$d/t.rs" -o "$d/tr"; "$d/tr"' 2>&1) || GATE_RC=$?
+          if [ "$GATE_RC" -ne 0 ]; then
+            if [ -n "$GATE_OUT" ]; then
+              echo "$GATE_OUT"
+              printf '%s\n' "$GATE_OUT" >> "$RUNNER_TEMP/abba_out.txt"
+            fi
+            # 255 is ssh's own "could not talk to the host", not a verdict on the toolchain.
+            if [ "$GATE_RC" -eq 255 ]; then
+              fail "Toolchain sanity check could not reach the box (ssh exit 255) — transport failure, not necessarily a bad host. Re-run /bench-gpu."
+            fi
+            fail "Toolchain sanity check failed (exit $GATE_RC): cc or rustc could not compile and run a trivial program on this host. Usually a partially provisioned image (missing cc/rustc/headers); can also be faulty host RAM, which makes compilers crash on stock code. Output above. Wait a few minutes before re-running /bench-gpu: offer selection is deterministic (priciest match), so an immediate retry can re-pick this same host once it relists."
+          fi
+          echo "toolchain sane"
 
       - name: Run GPU ABBA benchmark
         id: bench
@@ -425,12 +487,22 @@ jobs:
           # symbol the box's driver doesn't export, e.g. cuDevSmResourceSplit -> runtime panic).
           # MIN_DRIVER>=580 still guards the too-old end (older drivers lack cuCtxGetDevice_v2 and
           # the GPU path falls back to CPU). nvidia-smi is logged for diagnosing driver issues.
+          # CARGO_BUILD_JOBS caps the dual build's parallelism. Uncapped, cargo runs one
+          # rustc per core (16-32 here), and jemalloc-sys forwards CARGO_MAKEFLAGS to its
+          # nested `make`, which therefore joins the same jobserver — so the initial ramp
+          # co-schedules many memory-hungry LLVM codegen units (syn/serde_derive) with
+          # jemalloc's parallel C compiles and can transiently exhaust the box's RAM.
+          # That surfaces as the OOM killer reaping a rustc ("signal: 9") or as an
+          # allocation failure mid-compile. (Distinct from the toolchain gate's concern
+          # above, which is a host that is broken before any load is applied.)
+          # 8 leaves ~6 GB/job on the >=48 GB floor; the build is a one-time per-bench
+          # cost, and the job timeout above has ample room for it.
           REMOTE="set -e; cd /workspace/lambda_vm; \
             command -v python3 >/dev/null || { apt-get update -qq && apt-get install -y -qq python3; }; \
             nvidia-smi || true; \
             git fetch --force origin main; $FETCH; \
             git checkout -f origin/main; \
-            REBUILD=1 CUDARC_PIN=cuda-12080 SYSROOT_DIR=/opt/lambda-vm-sysroot BENCH_FEATURES='$BENCH_FEATURES' \
+            CARGO_BUILD_JOBS=8 REBUILD=1 CUDARC_PIN=cuda-12080 SYSROOT_DIR=/opt/lambda-vm-sysroot BENCH_FEATURES='$BENCH_FEATURES' \
             WORKLOAD=real CONTINUATIONS=1 EPOCH_SIZE_LOG2=$GPU_REAL_EPOCH_LOG2 \
             scripts/bench_abba.sh $REF_A origin/main $PAIRS"
 

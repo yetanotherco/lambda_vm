@@ -175,8 +175,16 @@ jobs:
       - name: Run CLI tests
         run: cargo test -p cli
 
-      - name: Run syscalls host tests (keccak differential vs sha3)
+      - name: Run syscalls host tests (allocator + keccak differential vs sha3)
         run: make test-syscalls
+
+      # The dlmalloc fallback is feature-selected, so nothing else in CI compiles it and it
+      # can rot silently. Its tests run here too.
+      - name: Test the dlmalloc guest allocator fallback
+        run: |
+          cd syscalls
+          cargo test --features dlmalloc-alloc
+          cargo test --release --features dlmalloc-alloc
 
       - name: Run ethrex-crypto host tests (hint verify-then-fallback + ecrecover)
         run: make test-ethrex-crypto
