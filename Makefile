@@ -631,6 +631,20 @@ test-blake3-second-source:
 	thoughts/blake3/reference-impl/build.sh
 	python3 thoughts/blake3/reference-impl/check.py
 
+# z3/SMT gate for the BLAKE3 chained-absorb mode's row-local constraints: the
+# compression equivalence under the absorb framing, the flags schedule, the mode
+# gating, the countdown/END logic, and the byte-width assumptions.
+#
+# Read `formal_verification/blake3_absorb/README.md` before extending it. The 6
+# rounds are verified ONE AT A TIME because the composed query does not close —
+# commit 89aeeb8c measured 145 minutes of `unknown` — and the negative controls
+# are what make a green board mean anything.
+#
+# z3's Python bindings are the only dependency. No cargo, no GPU, ~25 seconds.
+test-blake3-absorb-fv:
+	python3 formal_verification/blake3_absorb/test_ref.py
+	python3 formal_verification/blake3_absorb/z3_absorb_verify.py
+
 # End-to-end cuda dispatch coverage (requires NVIDIA GPU + nvcc).
 # Asserts the R1-R4 GPU dispatch counters fired on a real prove.
 # --test-threads=1: these tests reset and assert on process-global GPU call
