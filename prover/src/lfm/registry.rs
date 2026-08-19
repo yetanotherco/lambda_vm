@@ -248,9 +248,11 @@ pub fn prep_round_dims(
 ///   agree-on-the-same-wrong-shape failure §3.3 warns about.
 ///
 /// ★ Every registered program today has `keccak_rnd_chunks <= 1`, which hides
-/// the first axis, and the FULL mask hides the second. The tests drive both:
-/// `the_slot_to_table_map_is_not_the_identity_beyond_one_chunk` at three
-/// chunks, and the masked programs' own drift rows for the holes.
+/// the first axis. The second is live in the table itself — four of the six
+/// registry entries mask out at least one family, and no entry is FULL. The
+/// tests drive both: `the_slot_to_table_map_is_not_the_identity_beyond_one_chunk`
+/// at three chunks, and the masked TrivialV0 epoch in
+/// `a_batched_lfm_epoch_is_refused_for_the_round_coverage_gap` for the holes.
 ///
 /// `None` for a table index past the end of the set.
 pub fn slot_of_table(table: usize, keccak_rnd_chunks: usize, chip_set: ChipSet) -> Option<usize> {
