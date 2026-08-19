@@ -9,7 +9,7 @@
 
 use math::polynomial::Polynomial;
 use stark::commitment::{ROWS_PER_LEAF, commit_bit_reversed};
-use stark::config::{Commitment, KeccakStarkHash};
+use stark::config::{Commitment, DefaultStarkHash};
 use stark::fri::mmcs::{BorrowedMatrix, StreamingMmcsBuilder};
 use stark::proof::options::ProofOptions;
 use stark::prover::evaluate_polynomial_on_lde_domain;
@@ -102,7 +102,7 @@ pub fn commit_group(group: &ColumnGroup, options: &ProofOptions) -> Commitment {
 /// registry's own `log_heights` are trace heights, and the two differ by
 /// `log2(blowup)`.
 pub struct PrepRoundBuilder {
-    builder: StreamingMmcsBuilder<GoldilocksField, KeccakStarkHash>,
+    builder: StreamingMmcsBuilder<GoldilocksField, DefaultStarkHash>,
 }
 
 impl PrepRoundBuilder {
