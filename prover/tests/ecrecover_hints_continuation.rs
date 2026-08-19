@@ -31,7 +31,11 @@ fn ecrecover_arena_continuation_proof() {
     );
     let hints_bin = std::fs::read(dir.join("ecrecover_hints.hints.bin"))
         .expect("ecrecover_hints.hints.bin missing — run the executor driver");
-    assert_eq!(hints_bin.len() % 32, 0, "hints fixture must be 32-byte slots");
+    assert_eq!(
+        hints_bin.len() % 32,
+        0,
+        "hints fixture must be 32-byte slots"
+    );
     let hints: Vec<[u8; 32]> = hints_bin
         .chunks_exact(32)
         .map(|c| c.try_into().unwrap())

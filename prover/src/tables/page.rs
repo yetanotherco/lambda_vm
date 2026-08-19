@@ -183,7 +183,9 @@ impl PageConfig {
 ///
 /// [`Memory::store_private_inputs`]: executor::vm::memory::Memory::store_private_inputs
 pub(crate) fn private_input_page_count(private_inputs: &[u8], hints: &[[u8; 32]]) -> usize {
-    use executor::vm::memory::{HINT_ARENA_HEADER_BYTES, HINT_SLOT_BYTES, hint_arena_header_offset};
+    use executor::vm::memory::{
+        HINT_ARENA_HEADER_BYTES, HINT_SLOT_BYTES, hint_arena_header_offset,
+    };
     if private_inputs.is_empty() && hints.is_empty() {
         return 0;
     }

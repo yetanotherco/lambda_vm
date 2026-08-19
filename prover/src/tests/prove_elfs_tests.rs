@@ -1076,8 +1076,8 @@ fn test_prove_elfs_keccak_multi_call() {
 
     let elf_bytes = crate::test_utils::asm_elf_bytes("test_keccak_multi");
     let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
-    let executor =
-        executor::vm::execution::Executor::new(&elf, vec![], &[]).expect("Failed to create executor");
+    let executor = executor::vm::execution::Executor::new(&elf, vec![], &[])
+        .expect("Failed to create executor");
     let result = executor.run().expect("Failed to run program");
 
     // The guest initializes lane[i] = i + 1 and applies keccak-f[1600] three times.
@@ -1098,7 +1098,8 @@ fn test_prove_elfs_keccak_multi_call() {
     );
 
     let mut traces =
-        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[], &[]).unwrap();
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[], &[])
+            .unwrap();
     assert_eq!(
         traces.public_output_bytes,
         result.return_values.memory_values
@@ -1116,8 +1117,8 @@ fn test_prove_elfs_ecsm() {
 
     let elf_bytes = crate::test_utils::asm_elf_bytes("test_ecsm");
     let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
-    let executor =
-        executor::vm::execution::Executor::new(&elf, vec![], &[]).expect("Failed to create executor");
+    let executor = executor::vm::execution::Executor::new(&elf, vec![], &[])
+        .expect("Failed to create executor");
     let result = executor.run().expect("Failed to run program");
 
     // The guest computes 5·G and commits the 32-byte x-coordinate; cross-check it against
@@ -1138,7 +1139,8 @@ fn test_prove_elfs_ecsm() {
     );
 
     let mut traces =
-        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[], &[]).unwrap();
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[], &[])
+            .unwrap();
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
         "ECSM prove/verify failed"
@@ -1151,8 +1153,8 @@ fn test_prove_elfs_ecsm_multi() {
 
     let elf_bytes = crate::test_utils::asm_elf_bytes("test_ecsm_multi");
     let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
-    let executor =
-        executor::vm::execution::Executor::new(&elf, vec![], &[]).expect("Failed to create executor");
+    let executor = executor::vm::execution::Executor::new(&elf, vec![], &[])
+        .expect("Failed to create executor");
     let result = executor.run().expect("Failed to run program");
 
     // Gx little-endian.
@@ -1177,7 +1179,8 @@ fn test_prove_elfs_ecsm_multi() {
     );
 
     let mut traces =
-        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[], &[]).unwrap();
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[], &[])
+            .unwrap();
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
         "ECSM multi-call prove/verify failed"
@@ -1321,8 +1324,8 @@ fn test_prove_ecrecover_hints_auto_records_arena() {
 
     // The recording pass answers the guest's requests (sqrt + batched field
     // inverse + scalar inverse per recovery, in that order).
-    let hints = executor::vm::execution::collect_hints(&program, input.clone())
-        .expect("collect_hints");
+    let hints =
+        executor::vm::execution::collect_hints(&program, input.clone()).expect("collect_hints");
     assert_eq!(hints.len(), 6, "2 recoveries × 3 hint requests");
 
     // The policy under test: no explicit arena ⇒ auto-record ⇒ the SAME
@@ -1354,11 +1357,12 @@ fn test_prove_elfs_ecsm_forged_result_rejected() {
 
     let elf_bytes = crate::test_utils::asm_elf_bytes("test_ecsm");
     let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
-    let executor =
-        executor::vm::execution::Executor::new(&elf, vec![], &[]).expect("Failed to create executor");
+    let executor = executor::vm::execution::Executor::new(&elf, vec![], &[])
+        .expect("Failed to create executor");
     let result = executor.run().expect("Failed to run program");
     let mut traces =
-        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[], &[]).unwrap();
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[], &[])
+            .unwrap();
 
     // Forge the low byte of xR on the (single) real ECSM row.
     let orig = *traces.ecsm.main_table.get(0, ecsm_cols::xr(0));
@@ -1382,11 +1386,12 @@ fn test_prove_elfs_ecsm_forged_ecdas_mu_rejected() {
 
     let elf_bytes = crate::test_utils::asm_elf_bytes("test_ecsm");
     let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
-    let executor =
-        executor::vm::execution::Executor::new(&elf, vec![], &[]).expect("Failed to create executor");
+    let executor = executor::vm::execution::Executor::new(&elf, vec![], &[])
+        .expect("Failed to create executor");
     let result = executor.run().expect("Failed to run program");
     let mut traces =
-        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[], &[]).unwrap();
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[], &[])
+            .unwrap();
 
     // Row 0 is a real ECDAS step (µ=1); forge µ to a non-boolean value.
     traces.ecdas.main_table.set(
@@ -1418,11 +1423,12 @@ fn test_prove_elfs_keccak_unaligned_state_addr() {
 
     let elf_bytes = crate::test_utils::asm_elf_bytes("test_keccak_multi");
     let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
-    let executor =
-        executor::vm::execution::Executor::new(&elf, vec![], &[]).expect("Failed to create executor");
+    let executor = executor::vm::execution::Executor::new(&elf, vec![], &[])
+        .expect("Failed to create executor");
     let result = executor.run().expect("Failed to run program");
     let mut traces =
-        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[], &[]).unwrap();
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[], &[])
+            .unwrap();
 
     // Tamper the first real keccak row: replace addr(1) (a byte cell) with a
     // value outside [0, 256). The new ARE_BYTES bus sender will emit this
@@ -1444,8 +1450,8 @@ fn test_prove_elfs_keccak_unaligned_state_addr() {
 fn test_prove_elfs_test_commit_4() {
     let elf_bytes = crate::test_utils::asm_elf_bytes("test_commit_4");
     let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
-    let executor =
-        executor::vm::execution::Executor::new(&elf, vec![], &[]).expect("Failed to create executor");
+    let executor = executor::vm::execution::Executor::new(&elf, vec![], &[])
+        .expect("Failed to create executor");
     let result = executor.run().expect("Failed to run program");
 
     // Verify public output matches the committed bytes [0xAA, 0xBB, 0xCC, 0xDD]
@@ -1456,7 +1462,8 @@ fn test_prove_elfs_test_commit_4() {
     );
 
     let mut traces =
-        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[], &[]).unwrap();
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[], &[])
+            .unwrap();
     assert_eq!(
         traces.public_output_bytes,
         result.return_values.memory_values
@@ -1478,11 +1485,12 @@ fn test_prove_elfs_test_commit_4_wrong_pages_rejected() {
     let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
 
     let proof_options = ProofOptions::default_test_options();
-    let executor =
-        executor::vm::execution::Executor::new(&elf, vec![], &[]).expect("Failed to create executor");
+    let executor = executor::vm::execution::Executor::new(&elf, vec![], &[])
+        .expect("Failed to create executor");
     let result = executor.run().expect("Failed to run program");
     let mut traces =
-        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[], &[]).unwrap();
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[], &[])
+            .unwrap();
 
     // Prover uses correct page configs
     let table_counts = traces.table_counts();
@@ -2233,11 +2241,12 @@ fn test_deep_stack_runtime_pages_roundtrip() {
     let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
 
     let proof_options = ProofOptions::default_test_options();
-    let executor =
-        executor::vm::execution::Executor::new(&elf, vec![], &[]).expect("Failed to create executor");
+    let executor = executor::vm::execution::Executor::new(&elf, vec![], &[])
+        .expect("Failed to create executor");
     let result = executor.run().expect("Failed to run program");
     let mut traces =
-        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[], &[]).unwrap();
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[], &[])
+            .unwrap();
 
     let runtime_page_ranges = traces.runtime_page_ranges();
     let table_counts = traces.table_counts();
@@ -2315,11 +2324,12 @@ fn test_deep_stack_missing_pages_rejected() {
     let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
 
     let proof_options = ProofOptions::default_test_options();
-    let executor =
-        executor::vm::execution::Executor::new(&elf, vec![], &[]).expect("Failed to create executor");
+    let executor = executor::vm::execution::Executor::new(&elf, vec![], &[])
+        .expect("Failed to create executor");
     let result = executor.run().expect("Failed to run program");
     let mut traces =
-        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[], &[]).unwrap();
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[], &[])
+            .unwrap();
 
     // Prover uses correct page configs (auto-detected from MemoryState)
     let table_counts = traces.table_counts();
@@ -2417,11 +2427,12 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
     let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
 
     let proof_options = ProofOptions::default_test_options();
-    let executor =
-        executor::vm::execution::Executor::new(&elf, vec![], &[]).expect("Failed to create executor");
+    let executor = executor::vm::execution::Executor::new(&elf, vec![], &[])
+        .expect("Failed to create executor");
     let result = executor.run().expect("Failed to run program");
     let mut traces =
-        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[], &[]).unwrap();
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[], &[])
+            .unwrap();
 
     let runtime_page_ranges = traces.runtime_page_ranges();
     let table_counts = traces.table_counts();
@@ -2808,8 +2819,8 @@ fn test_pure_commit_rust() {
 #[test]
 fn test_prove_with_input_empty() {
     let elf_bytes = crate::test_utils::asm_elf_bytes("sub");
-    let result =
-        crate::prove_with_inputs(&elf_bytes, &[], &[]).expect("prove_with_inputs should succeed on sub");
+    let result = crate::prove_with_inputs(&elf_bytes, &[], &[])
+        .expect("prove_with_inputs should succeed on sub");
     assert!(
         crate::verify(&result, &elf_bytes).expect("verify should not error"),
         "prove_with_inputs(empty) proof should verify"

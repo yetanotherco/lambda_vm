@@ -220,9 +220,7 @@ pub fn collect_hints(
     Ok(result
         .hint_requests
         .iter()
-        .map(|(hint_id, input)| {
-            crate::vm::instruction::execution::compute_hint(*hint_id, input)
-        })
+        .map(|(hint_id, input)| crate::vm::instruction::execution::compute_hint(*hint_id, input))
         .collect())
 }
 

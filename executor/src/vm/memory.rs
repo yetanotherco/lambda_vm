@@ -68,10 +68,8 @@ pub const HINT_ARENA_HEADER_BYTES: u64 = 8;
 /// the recording pass of the two-pass hint flow. The host reads them back with
 /// [`Memory::hint_requests`]. Must match `HINT_LOG_START` in
 /// `syscalls/src/syscalls.rs`.
-pub const HINT_LOG_START_INDEX: u64 = 0xFF000000
-    + PRIVATE_INPUT_LENGTH_PREFIX_BYTES as u64
-    + MAX_PRIVATE_INPUT_SIZE
-    + 4;
+pub const HINT_LOG_START_INDEX: u64 =
+    0xFF000000 + PRIVATE_INPUT_LENGTH_PREFIX_BYTES as u64 + MAX_PRIVATE_INPUT_SIZE + 4;
 /// Size in bytes of the request-log header (`[u32 LE count][u32 zero pad]`).
 pub const HINT_LOG_HEADER_BYTES: u64 = 8;
 /// Size in bytes of one request-log entry (`[u64 LE hint_id][32-byte input]`).
@@ -97,7 +95,8 @@ pub fn encode_private_input_region(
     inputs: &[u8],
     hints: &[[u8; 32]],
 ) -> Result<Vec<u8>, MemoryError> {
-    let main_len = u32::try_from(inputs.len()).map_err(|_| MemoryError::PrivateInputSizeExceeded)?;
+    let main_len =
+        u32::try_from(inputs.len()).map_err(|_| MemoryError::PrivateInputSizeExceeded)?;
     let header_offset = hint_arena_header_offset(inputs.len() as u64);
     let hints_bytes = (hints.len() as u64)
         .checked_mul(HINT_SLOT_BYTES)
@@ -296,9 +295,8 @@ impl Memory {
         let count = self.load_word(HINT_LOG_START_INDEX)? as usize;
         let mut out = Vec::with_capacity(count);
         for i in 0..count {
-            let entry = HINT_LOG_START_INDEX
-                + HINT_LOG_HEADER_BYTES
-                + i as u64 * HINT_LOG_ENTRY_BYTES;
+            let entry =
+                HINT_LOG_START_INDEX + HINT_LOG_HEADER_BYTES + i as u64 * HINT_LOG_ENTRY_BYTES;
             let hint_id = self.load_doubleword(entry)?;
             let bytes = self.load_bytes(entry + 8, 32)?;
             let mut input = [0u8; 32];
@@ -461,7 +459,9 @@ mod tests {
         for (i, hint) in hints.iter().enumerate() {
             let slot = memory
                 .load_bytes(
-                    PRIVATE_INPUT_START_INDEX + header + HINT_ARENA_HEADER_BYTES
+                    PRIVATE_INPUT_START_INDEX
+                        + header
+                        + HINT_ARENA_HEADER_BYTES
                         + i as u64 * HINT_SLOT_BYTES,
                     HINT_SLOT_BYTES,
                 )

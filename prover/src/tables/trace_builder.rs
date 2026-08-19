@@ -3413,9 +3413,13 @@ fn build_traces<I: ImageSource + Sync>(
         // Continuation epochs (l2g_memory_bookend) skip PAGE: the L2G table owns
         // every touched cell's Memory init/fini, and every untouched PAGE row
         // self-cancels (init==fini, ts=0), so PAGE contributes nothing here.
-        Some(image) if !l2g_memory_bookend => {
-            generate_page_tables(image, memory_state, private_input, hints, l2g_memory_bookend)
-        }
+        Some(image) if !l2g_memory_bookend => generate_page_tables(
+            image,
+            memory_state,
+            private_input,
+            hints,
+            l2g_memory_bookend,
+        ),
         _ => (Vec::new(), Vec::new()),
     };
     let gen_register = || register::generate_register_trace(&register_final_state, register_init);
@@ -3671,8 +3675,7 @@ pub fn count_table_lengths(
     let decode_rows = (instructions.len() as u64 + 1).next_power_of_two().max(2);
 
     // Memory + register state for partition predicates that need timestamps.
-    let mut memory_state =
-        MemoryState::from_image(&build_initial_image(elf, private_input, hints));
+    let mut memory_state = MemoryState::from_image(&build_initial_image(elf, private_input, hints));
     let mut register_state = RegisterState::new(elf.entry_point);
 
     // Raw counts (pre-chunking + pre-padding).

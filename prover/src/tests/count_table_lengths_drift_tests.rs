@@ -11,8 +11,8 @@ fn assert_count_table_lengths_matches(elf: &Elf, logs: &[Log]) {
 
     let predicted =
         count_table_lengths(elf, logs, &max_rows, &[], &[]).expect("count_table_lengths succeeds");
-    let traces =
-        Traces::from_elf_and_logs_minimal(elf, logs, &max_rows, &[], &[]).expect("trace build succeeds");
+    let traces = Traces::from_elf_and_logs_minimal(elf, logs, &max_rows, &[], &[])
+        .expect("trace build succeeds");
 
     let sum_heights = |tables: &[stark::trace::TraceTable<_, _>]| -> u64 {
         tables.iter().map(|t| t.main_table.height as u64).sum()

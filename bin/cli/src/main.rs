@@ -297,19 +297,14 @@ fn main() -> ExitCode {
             epoch_size_log2,
             hints,
         } => {
+            let inputs = ProveInputPaths {
+                private_input,
+                hints,
+            };
             if continuations {
-                cmd_prove_continuation(
-                    elf,
-                    output,
-                    private_input,
-                    epoch_size_log2,
-                    blowup,
-                    time,
-                    cycles,
-                    hints,
-                )
+                cmd_prove_continuation(elf, output, inputs, epoch_size_log2, blowup, time, cycles)
             } else {
-                cmd_prove(elf, output, private_input, blowup, time, cycles, elements, hints)
+                cmd_prove(elf, output, inputs, blowup, time, cycles, elements)
             }
         }
         Commands::Verify {
@@ -366,11 +361,7 @@ fn read_hints(path: Option<&PathBuf>) -> Result<Vec<[u8; 32]>, String> {
     }
 }
 
-fn count_cycles(
-    elf_data: &[u8],
-    private_inputs: &[u8],
-    hints: &[[u8; 32]],
-) -> Result<u64, String> {
+fn count_cycles(elf_data: &[u8], private_inputs: &[u8], hints: &[[u8; 32]]) -> Result<u64, String> {
     let program =
         Elf::load(elf_data).map_err(|e| format!("Failed to load ELF for cycle count: {e:?}"))?;
     let executor = Executor::new(&program, private_inputs.to_vec(), hints)
@@ -638,15 +629,22 @@ fn cmd_execute(
     ExitCode::SUCCESS
 }
 
+/// Input file paths shared by the prove commands: the guest's private input
+/// and an optional hint arena (see [`read_hints`]). Grouped so the prove
+/// commands stay under the argument-count lint.
+struct ProveInputPaths {
+    private_input: Option<PathBuf>,
+    hints: Option<PathBuf>,
+}
+
 fn cmd_prove(
     elf_path: PathBuf,
     output_path: PathBuf,
-    private_input_path: Option<PathBuf>,
+    inputs: ProveInputPaths,
     blowup: u8,
     time: bool,
     cycles: bool,
     elements: bool,
-    hints_path: Option<PathBuf>,
 ) -> ExitCode {
     eprintln!("Reading ELF file...");
     let elf_data = match std::fs::read(&elf_path) {
@@ -657,7 +655,7 @@ fn cmd_prove(
         }
     };
 
-    let private_inputs = match read_private_input(private_input_path.as_ref()) {
+    let private_inputs = match read_private_input(inputs.private_input.as_ref()) {
         Ok(inputs) => inputs,
         Err(e) => {
             eprintln!("{e}");
@@ -665,7 +663,7 @@ fn cmd_prove(
         }
     };
 
-    let hints = match read_hints(hints_path.as_ref()) {
+    let hints = match read_hints(inputs.hints.as_ref()) {
         Ok(hints) => hints,
         Err(e) => {
             eprintln!("{e}");
@@ -841,12 +839,11 @@ fn cmd_verify(proof_path: PathBuf, elf_path: PathBuf, blowup: u8, time: bool) ->
 fn cmd_prove_continuation(
     elf_path: PathBuf,
     output_path: PathBuf,
-    private_input_path: Option<PathBuf>,
+    inputs: ProveInputPaths,
     epoch_size_log2: Option<u32>,
     blowup: u8,
     time: bool,
     cycles: bool,
-    hints_path: Option<PathBuf>,
 ) -> ExitCode {
     eprintln!("Reading ELF file...");
     let elf_data = match std::fs::read(&elf_path) {
@@ -857,7 +854,7 @@ fn cmd_prove_continuation(
         }
     };
 
-    let private_inputs = match read_private_input(private_input_path.as_ref()) {
+    let private_inputs = match read_private_input(inputs.private_input.as_ref()) {
         Ok(inputs) => inputs,
         Err(e) => {
             eprintln!("{e}");
@@ -865,7 +862,7 @@ fn cmd_prove_continuation(
         }
     };
 
-    let hints = match read_hints(hints_path.as_ref()) {
+    let hints = match read_hints(inputs.hints.as_ref()) {
         Ok(hints) => hints,
         Err(e) => {
             eprintln!("{e}");

@@ -291,8 +291,6 @@ pub fn request_hint(_hint_id: usize, _input: &[u8; 32]) -> Option<[u8; 32]> {
     unimplemented!("syscalls are only implemented for riscv64 targets");
 }
 
-
-
 #[cfg(target_arch = "riscv64")]
 pub fn sys_halt() -> ! {
     // NOTE: no print_string here — the Print ecall is unmatched on the Ecall bus

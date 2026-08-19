@@ -9,8 +9,8 @@
 //!   cargo test -p executor --test hint_arena_ecrecover -- --ignored --nocapture
 
 use executor::elf::Elf;
-use executor::vm::instruction::execution::compute_hint;
 use executor::vm::execution::Executor;
+use executor::vm::instruction::execution::compute_hint;
 use std::time::Instant;
 
 /// Number of ecrecovers the guest performs (3 hint requests each).
@@ -98,8 +98,12 @@ fn ecrecover_two_pass_cycles() {
     );
 
     println!("[ecrecover-hints] N = {N} recoveries");
-    println!("[ecrecover-hints] pass 1 (software fallback): {pass1_cycles} cycles in {pass1_time:?}");
-    println!("[ecrecover-hints] pass 2 (arena hints):       {pass2_cycles} cycles in {pass2_time:?}");
+    println!(
+        "[ecrecover-hints] pass 1 (software fallback): {pass1_cycles} cycles in {pass1_time:?}"
+    );
+    println!(
+        "[ecrecover-hints] pass 2 (arena hints):       {pass2_cycles} cycles in {pass2_time:?}"
+    );
     println!(
         "[ecrecover-hints] guest cycle ratio pass1/pass2: {:.2}x",
         pass1_cycles as f64 / pass2_cycles as f64

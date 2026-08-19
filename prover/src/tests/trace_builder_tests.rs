@@ -837,7 +837,11 @@ fn test_from_image_and_logs_matches_from_elf_and_logs() {
 
     let elf_bytes = asm_elf_bytes("basic_program");
     let program = Elf::load(&elf_bytes).unwrap();
-    let logs = Executor::new(&program, vec![], &[]).unwrap().run().unwrap().logs;
+    let logs = Executor::new(&program, vec![], &[])
+        .unwrap()
+        .run()
+        .unwrap()
+        .logs;
     let max_rows = MaxRowsConfig::default();
 
     let from_elf = Traces::from_elf_and_logs(
