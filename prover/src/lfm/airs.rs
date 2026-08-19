@@ -111,6 +111,26 @@ pub fn keccak_rnd_chunk_rows(program: &super::compiler::LfmProgram) -> Vec<usize
         .collect()
 }
 
+/// What sets a chip's trace height, and therefore whether the padding below its
+/// next power-of-two step is a margin the workload can consume.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeightRule {
+    /// `rows` is `real_rows.next_power_of_two()` and `real_rows` moves with the
+    /// workload. The only rule under which headroom is a cliff warning: this
+    /// chip's whole contribution doubles the moment the mix outgrows the gap.
+    Workload,
+    /// A lookup table at a compile-time constant height. Every row of it is
+    /// real, so it reports zero headroom — because it is full, not because it
+    /// is about to double. It cannot move with the workload at all.
+    Fixed,
+    /// One chunk of a split table. The chunking policy caps a chunk just under
+    /// a power of two (`KECCAK_RND`: 21,845 permutations = 524,280 of 524,288
+    /// rows), so a full chunk permanently reads ~0% headroom and yet can never
+    /// cross one — the policy emits another chunk instead. Watching these would
+    /// be watching a false alarm that is always on.
+    Chunked,
+}
+
 /// One chip instance's trace geometry, as the cell instrument sees it.
 ///
 /// The per-chip decomposition of [`lfm_cell_counts`] — that function sums
@@ -122,6 +142,13 @@ pub struct LfmChipCells {
     pub name: &'static str,
     /// Padded trace rows — the height the prover commits.
     pub rows: u64,
+    /// Rows the workload actually occupies, before padding to `rows`. Only the
+    /// gap between the two is available to grow into; see
+    /// [`LfmChipCells::headroom`].
+    pub real_rows: u64,
+    /// What sets this chip's height, and so whether its headroom is a margin
+    /// worth watching. See [`HeightRule`].
+    pub height_rule: HeightRule,
     /// Value columns: the AIR's width less its preprocessed prefix.
     pub main_cols: usize,
     /// Aux (LogUp) columns, one per pair of bus interactions.
@@ -136,6 +163,39 @@ impl LfmChipCells {
     pub fn aux_cells(&self) -> u64 {
         self.rows * self.aux_cols as u64
     }
+
+    /// Fraction of the committed height that is padding, i.e. how far this chip
+    /// is below the next power-of-two step.
+    ///
+    /// A chip's cells are a STEP function of its workload: `rows` is
+    /// `real_rows.next_power_of_two()`, so a chip sitting at 1% headroom doubles
+    /// its whole contribution the moment the workload grows 1%, while one at 45%
+    /// absorbs a near-doubling for free. That asymmetry is invisible in the row
+    /// count alone, and it is what made #903's four near-empty BLAKE3 rows cost
+    /// the wrap five simultaneous chip doublings — the campaign was standing
+    /// 1.2% under a step on `LFM_LANES` and nobody could see it
+    /// (`thoughts/shared/block-compression/WRAP-GROWTH-BISECT.md`).
+    ///
+    /// Only a cliff warning under [`HeightRule::Workload`]; see [`Self::at_risk`].
+    pub fn headroom(&self) -> f64 {
+        if self.rows == 0 {
+            return 0.0;
+        }
+        (self.rows - self.real_rows) as f64 / self.rows as f64
+    }
+
+    /// Whether this chip's [`Self::headroom`] is a margin the workload can
+    /// actually consume, rather than a constant of the machine.
+    pub fn at_risk(&self) -> bool {
+        self.height_rule == HeightRule::Workload
+    }
+
+    /// Base-field equivalents this chip would ADD by crossing its next step —
+    /// its height doubles, so it adds exactly what it already contributes.
+    /// An extension element is three base felts, matching the census total.
+    pub fn cliff_cost(&self) -> u64 {
+        self.main_cells() + 3 * self.aux_cells()
+    }
 }
 
 /// Per-chip trace geometry for a compiled program, in the frozen AIR order
@@ -148,6 +208,22 @@ pub fn lfm_chip_census(program: &super::compiler::LfmProgram) -> Vec<LfmChipCell
     lfm_chip_census_with_hasher(program, HasherKind::default())
 }
 
+/// One entry of [`lfm_chip_census_with_hasher`]'s per-chip table: a chip class's
+/// two heights plus its width decomposition.
+///
+/// Named rather than a positional tuple because `real_rows` and `padded_rows`
+/// are interchangeable at a glance, and swapping them would invert every
+/// headroom the panel prints while leaving the cell totals — the numbers under
+/// test — correct.
+struct ChipShape {
+    real_rows: u64,
+    padded_rows: u64,
+    height_rule: HeightRule,
+    num_cols: usize,
+    prep: usize,
+    interactions: usize,
+}
+
 /// [`lfm_chip_census`] for a program proved under `hasher`.
 ///
 /// Only `LFM_HASH`'s width moves with the hasher; every other chip is
@@ -157,90 +233,113 @@ pub fn lfm_chip_census_with_hasher(
     program: &super::compiler::LfmProgram,
     hasher: HasherKind,
 ) -> Vec<LfmChipCells> {
-    let range_rows = layout::range::NUM_ROWS as u64;
     let g = &program.groups;
+    // A workload-sized chip: the compiler already computed both heights, and
+    // `padded_rows` is `real_rows.next_power_of_two()`, so the gap between them
+    // is this chip's distance to its next doubling.
+    let sized = |group: &super::compiler::ColumnGroup,
+                 num_cols: usize,
+                 prep: usize,
+                 interactions: usize| ChipShape {
+        real_rows: group.real_rows as u64,
+        padded_rows: group.padded_rows as u64,
+        height_rule: HeightRule::Workload,
+        num_cols,
+        prep,
+        interactions,
+    };
+    // A lookup table: its height is a compile-time constant and every row of it
+    // is real, so it reports no headroom and is flagged as unable to move.
+    let lookup = |rows: u64, num_cols: usize, prep: usize, interactions: usize| ChipShape {
+        real_rows: rows,
+        padded_rows: rows,
+        height_rule: HeightRule::Fixed,
+        num_cols,
+        prep,
+        interactions,
+    };
     // Every chip class except `KECCAK_RND`, which is counted per chunk below.
-    let per_chip: [(u64, usize, usize, usize); NUM_LFM_CHIPS - 1] = [
-        (
-            g.const_.padded_rows as u64,
+    let per_chip: [ChipShape; NUM_LFM_CHIPS - 1] = [
+        sized(
+            &g.const_,
             const_::cols::NUM_COLUMNS,
             layout::const_::PREP_WIDTH,
             const_::bus_interactions().len(),
         ),
-        (
-            g.balu.padded_rows as u64,
+        sized(
+            &g.balu,
             balu::cols::NUM_COLUMNS,
             layout::balu::PREP_WIDTH,
             balu::bus_interactions().len(),
         ),
-        (
-            g.xalu.padded_rows as u64,
+        sized(
+            &g.xalu,
             xalu::cols::NUM_COLUMNS,
             layout::xalu::PREP_WIDTH,
             xalu::bus_interactions().len(),
         ),
-        (
-            g.select.padded_rows as u64,
+        sized(
+            &g.select,
             select::cols::NUM_COLUMNS,
             layout::select::PREP_WIDTH,
             select::bus_interactions().len(),
         ),
-        (
-            g.bitdec.padded_rows as u64,
+        sized(
+            &g.bitdec,
             bitdec::cols::NUM_COLUMNS,
             layout::bitdec::PREP_WIDTH,
             bitdec::bus_interactions().len(),
         ),
-        (
-            g.hash.padded_rows as u64,
+        sized(
+            &g.hash,
             hash::num_columns(hasher),
             layout::hash::PREP_WIDTH,
             hash::bus_interactions(hasher).len(),
         ),
-        (
-            g.keccak.padded_rows as u64,
+        sized(
+            &g.keccak,
             keccak::cols::NUM_COLUMNS,
             layout::keccak::PREP_WIDTH,
             keccak::bus_interactions().len(),
         ),
-        (
-            g.lanes.padded_rows as u64,
+        sized(
+            &g.lanes,
             lanes::cols::NUM_COLUMNS,
             layout::lanes::PREP_WIDTH,
             lanes::bus_interactions().len(),
         ),
-        (
-            g.hint.padded_rows as u64,
+        sized(
+            &g.hint,
             hint::cols::NUM_COLUMNS,
             layout::hint::PREP_WIDTH,
             hint::bus_interactions().len(),
         ),
-        (
-            g.public.padded_rows as u64,
+        sized(
+            &g.public,
             public::cols::NUM_COLUMNS,
             layout::public::PREP_WIDTH,
             public::bus_interactions().len(),
         ),
-        (
-            range_rows,
+        lookup(
+            layout::range::NUM_ROWS as u64,
             range::cols::NUM_COLUMNS,
             layout::range::PREP_WIDTH,
             range::bus_interactions().len(),
         ),
-        (
-            g.blake3.padded_rows as u64,
+        sized(
+            &g.blake3,
             blake3_chip::cols::NUM_COLUMNS,
             layout::blake3::PREP_WIDTH,
             blake3_chip::bus_interactions().len(),
         ),
         // The keccak family's two fixed tables. `KECCAK_RND`'s chunks follow.
-        (
+        lookup(
             keccak_rc::NUM_ROWS as u64,
             keccak_rc::cols::NUM_COLUMNS,
             keccak_rc::NUM_PRECOMPUTED_COLS,
             keccak_rc::bus_interactions().len(),
         ),
-        (
+        lookup(
             bitwise::NUM_ROWS as u64,
             bitwise::cols::NUM_COLUMNS,
             bitwise::NUM_PRECOMPUTED_COLS,
@@ -253,17 +352,32 @@ pub fn lfm_chip_census_with_hasher(
     // end, so the chunks are spliced in before them rather than appended.
     let rnd_interactions = keccak_rnd::bus_interactions().len();
     let mut census = Vec::with_capacity(per_chip.len() + 1);
-    for (slot, (rows, num_cols, prep, interactions)) in per_chip.into_iter().enumerate() {
+    for (slot, shape) in per_chip.into_iter().enumerate() {
         if slot == KECCAK_RND_SLOT {
-            for rows in keccak_rnd_chunk_rows(program) {
+            for (perms, rows) in keccak_rnd_chunk_permutations(program)
+                .into_iter()
+                .zip(keccak_rnd_chunk_rows(program))
+            {
                 census.push(LfmChipCells {
                     name: LFM_CHIP_NAMES[KECCAK_RND_SLOT],
                     rows: rows as u64,
+                    // `keccak_rnd_chunk_rows` pads exactly this product, so the
+                    // pair is the chunk's real-vs-committed height.
+                    real_rows: (perms * super::chunking::KECCAK_RND_ROWS_PER_PERMUTATION) as u64,
+                    height_rule: HeightRule::Chunked,
                     main_cols: keccak_rnd::cols::NUM_COLUMNS,
                     aux_cols: rnd_interactions.div_ceil(2),
                 });
             }
         }
+        let ChipShape {
+            real_rows,
+            padded_rows,
+            height_rule,
+            num_cols,
+            prep,
+            interactions,
+        } = shape;
         census.push(LfmChipCells {
             // `per_chip`'s last two entries are chip classes 13 and 14, which sit
             // at indices 12 and 13 of that array — hence the shift past the
@@ -273,7 +387,9 @@ pub fn lfm_chip_census_with_hasher(
             } else {
                 slot
             }],
-            rows,
+            rows: padded_rows,
+            real_rows,
+            height_rule,
             main_cols: num_cols - prep,
             aux_cols: interactions.div_ceil(2),
         });
