@@ -569,7 +569,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::KeccakStarkHash;
+    use crate::config::DefaultStarkHash;
     use crate::fri::commit_phase_from_evaluations;
     use crate::fri::fri_functions::{compute_coset_twiddles_inv, fold_evaluations_in_place};
     use crypto::fiat_shamir::default_transcript::DefaultTranscript;
@@ -683,7 +683,7 @@ mod tests {
         let mut transcript = Transcript::new(b"batched_fri_test");
         let mut transcript_check = transcript.clone();
 
-        let (_coeffs, layers) = batched_commit_phase::<_, _, _, KeccakStarkHash>(
+        let (_coeffs, layers) = batched_commit_phase::<_, _, _, DefaultStarkHash>(
             combined,
             &mut transcript,
             &coset_offset,
@@ -740,7 +740,7 @@ mod tests {
             GoldilocksField,
             GoldilocksField,
             Transcript,
-            KeccakStarkHash,
+            DefaultStarkHash,
         >(
             evals.clone(),
             &mut t_unbatched,
@@ -754,7 +754,7 @@ mod tests {
         let mut combined: Vec<Option<Vec<FE>>> = vec![None; h + 1];
         combined[h] = Some(evals);
         let mut t_batched = Transcript::new(b"terminal_parity");
-        let (batched_coeffs, batched_layers) = batched_commit_phase::<_, _, _, KeccakStarkHash>(
+        let (batched_coeffs, batched_layers) = batched_commit_phase::<_, _, _, DefaultStarkHash>(
             combined,
             &mut t_batched,
             &coset_offset,
@@ -812,7 +812,7 @@ mod tests {
         combined[7] = Some((0..128u64).map(|i| FE::from(i + 1)).collect());
         combined[4] = Some((0..16u64).map(|i| FE::from(i * 3 + 5)).collect());
         let mut transcript = Transcript::new(b"floor_test");
-        let (coeffs, layers) = batched_commit_phase::<_, _, _, KeccakStarkHash>(
+        let (coeffs, layers) = batched_commit_phase::<_, _, _, DefaultStarkHash>(
             combined,
             &mut transcript,
             &coset_offset,
@@ -868,12 +868,10 @@ mod tests {
         let grinding_seed_a = transcript_a.state();
         // Test-only: derive a real PoW nonce so the grinding step is exercised
         // identically by both sides (the nonce search itself is not under test).
-        let nonce =
-            crate::grinding::generate_nonce::<crate::config::GrindingDigest<KeccakStarkHash>>(
-                &grinding_seed_a,
-                grinding_factor,
-            )
-            .expect("a valid grinding nonce exists for this small grinding_factor");
+        let nonce = crate::grinding::generate_nonce::<
+            crate::config::GrindingDigest<DefaultStarkHash>,
+        >(&grinding_seed_a, grinding_factor)
+        .expect("a valid grinding nonce exists for this small grinding_factor");
         transcript_a.append_bytes(&nonce.to_be_bytes());
 
         let iotas_a: Vec<usize> = (0..num_queries)

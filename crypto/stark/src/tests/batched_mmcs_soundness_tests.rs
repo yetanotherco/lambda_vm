@@ -22,7 +22,7 @@ use math::field::goldilocks::GoldilocksField;
 
 use crate::batched::round4::BatchedFriCommit;
 use crate::batched::round4::tests as round4_tests;
-use crate::config::KeccakStarkHash;
+use crate::config::DefaultStarkHash;
 use crate::fri::batched::{
     BatchedFriLayout, absorb_shape_histogram, derive_batched_fri_challenges,
 };
@@ -31,7 +31,7 @@ use crate::fri::mmcs::{LeafSource, MixedMmcs, MixedOpening};
 
 type F = GoldilocksField;
 type FE = FieldElement<F>;
-type Mmcs = MixedMmcs<F, KeccakStarkHash>;
+type Mmcs = MixedMmcs<F, DefaultStarkHash>;
 type Transcript = DefaultTranscript<F>;
 
 /// Bit-reversed row-major matrices, in the layout the MMCS commits.
@@ -351,7 +351,7 @@ fn the_shape_encoding_separates_distinct_epochs() {
 /// One honest batched round 4 plus everything a verifier needs to check a query.
 struct Round4Fixture {
     tables: Vec<round4_tests::FakeTable>,
-    commit: BatchedFriCommit<F, KeccakStarkHash>,
+    commit: BatchedFriCommit<F, DefaultStarkHash>,
     betas: Vec<FE>,
     decommitments: Vec<FriDecommitment<F>>,
     alpha: FE,
@@ -365,7 +365,7 @@ impl Round4Fixture {
         let mut transcript = round4_tests::Transcript::new(b"batched_soundness_r4");
         let commit = round4_tests::commit_fixture(&tables, &mut transcript, 0, 6);
         let decommitments =
-            crate::fri::query_phase::<F, KeccakStarkHash>(&commit.layers, &commit.iotas);
+            crate::fri::query_phase::<F, DefaultStarkHash>(&commit.layers, &commit.iotas);
 
         let mut verifier_transcript = round4_tests::Transcript::new(b"batched_soundness_r4");
         let replay = crate::batched::round4::replay_batched_fri::<F, round4_tests::Transcript>(
@@ -650,7 +650,7 @@ fn malformed_batched_fri_inputs_are_rejected_without_panicking() {
                iota: usize,
                buckets: &[Option<FE>],
                terminal: &[FE]| {
-        crate::batched::round4::verify_batched_fri_query::<F, F, KeccakStarkHash>(
+        crate::batched::round4::verify_batched_fri_query::<F, F, DefaultStarkHash>(
             layer_roots,
             betas,
             &f.commit.layout,
@@ -866,7 +866,7 @@ fn a_standalone_table_contributes_no_injection() {
 mod epoch {
     use super::*;
     use crate::batched::verifier::{replay_epoch_transcript, verify_epoch_commitments};
-    use crate::config::KeccakStarkHash;
+    use crate::config::DefaultStarkHash;
     use crate::residency_mode::ResidencyMode;
     use crate::tests::batched_prover_tests::{Air, E, F, folding_options, prove_repeated};
     use crate::traits::AIR;
@@ -891,7 +891,7 @@ mod epoch {
         // `None`: this fixture has no preprocessed table, which is the only
         // shape an unpinned caller may verify (`verify_prep_round`). The pinned
         // arm is covered in `batched_prover_tests`, where the fixture does.
-        Some(verify_epoch_commitments::<F, E, (), KeccakStarkHash>(
+        Some(verify_epoch_commitments::<F, E, (), DefaultStarkHash>(
             proof,
             &shape,
             &params,
@@ -1171,7 +1171,7 @@ mod epoch {
 // once. Any one of them wrong and the terminal check fails.
 mod fri_join {
     use crate::batched::verifier::{replay_epoch_transcript, verify_epoch_fri};
-    use crate::config::KeccakStarkHash;
+    use crate::config::DefaultStarkHash;
     use crate::residency_mode::ResidencyMode;
     use crate::tests::batched_prover_tests::{Air, E, F, folding_options, prove_repeated};
     use crate::traits::AIR;
@@ -1180,7 +1180,7 @@ mod fri_join {
     use math::field::element::FieldElement;
 
     type Proof = crate::batched::proof::BatchedMultiProof<F, E, ()>;
-    type V = GenericVerifier<F, E, (), KeccakStarkHash>;
+    type V = GenericVerifier<F, E, (), DefaultStarkHash>;
 
     fn join_holds(airs: &[Air], proof: &Proof) -> Option<bool> {
         let refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = airs
@@ -1189,7 +1189,7 @@ mod fri_join {
             .collect();
         let (shape, params, challenges) =
             replay_epoch_transcript(&refs, proof, &mut DefaultTranscript::<E>::new(&[]))?;
-        Some(verify_epoch_fri::<F, E, (), KeccakStarkHash, V>(
+        Some(verify_epoch_fri::<F, E, (), DefaultStarkHash, V>(
             &refs,
             proof,
             &shape,
@@ -1317,7 +1317,7 @@ mod fri_join {
 // ===========================================================================
 mod full_verify {
     use crate::batched::verifier::multi_verify_batched;
-    use crate::config::KeccakStarkHash;
+    use crate::config::DefaultStarkHash;
     use crate::residency_mode::ResidencyMode;
     use crate::tests::batched_prover_tests::{Air, E, F, folding_options, prove_repeated};
     use crate::traits::AIR;
@@ -1326,7 +1326,7 @@ mod full_verify {
     use math::field::element::FieldElement;
 
     type Proof = crate::batched::proof::BatchedMultiProof<F, E, ()>;
-    type V = GenericVerifier<F, E, (), KeccakStarkHash>;
+    type V = GenericVerifier<F, E, (), DefaultStarkHash>;
 
     fn verifies(airs: &[Air], proof: &Proof) -> bool {
         let refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = airs
@@ -1335,7 +1335,7 @@ mod full_verify {
             .collect();
         // Unpinned, which `verify_prep_round` allows only because this fixture
         // has no preprocessed table.
-        multi_verify_batched::<F, E, (), KeccakStarkHash, V, _>(
+        multi_verify_batched::<F, E, (), DefaultStarkHash, V, _>(
             &refs,
             proof,
             &mut DefaultTranscript::<E>::new(&[]),
@@ -1400,7 +1400,7 @@ mod full_verify {
             .map(|a| a as &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>)
             .collect();
         assert!(
-            multi_verify_batched::<F, E, (), KeccakStarkHash, V, _>(
+            multi_verify_batched::<F, E, (), DefaultStarkHash, V, _>(
                 &refs,
                 &proof,
                 &mut DefaultTranscript::<E>::new(&[]),
@@ -1410,7 +1410,7 @@ mod full_verify {
             "honest-path control: the epoch balances at zero"
         );
         assert!(
-            !multi_verify_batched::<F, E, (), KeccakStarkHash, V, _>(
+            !multi_verify_batched::<F, E, (), DefaultStarkHash, V, _>(
                 &refs,
                 &proof,
                 &mut DefaultTranscript::<E>::new(&[]),
@@ -1477,7 +1477,7 @@ mod full_verify {
 mod prep_binding {
     use crate::batched::shape::PinnedPrep;
     use crate::batched::verifier::multi_verify_batched;
-    use crate::config::KeccakStarkHash;
+    use crate::config::DefaultStarkHash;
     use crate::tests::batched_prover_tests::{
         Air, E, F, PREP_WIDTHS, honest_prep_root, prove_preprocessed,
     };
@@ -1487,14 +1487,14 @@ mod prep_binding {
     use math::field::element::FieldElement;
 
     type Proof = crate::batched::proof::BatchedMultiProof<F, E, ()>;
-    type V = GenericVerifier<F, E, (), KeccakStarkHash>;
+    type V = GenericVerifier<F, E, (), DefaultStarkHash>;
 
     fn verifies(airs: &[Air], proof: &Proof, expected_prep: Option<PinnedPrep<'_>>) -> bool {
         let refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = airs
             .iter()
             .map(|a| a as &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>)
             .collect();
-        multi_verify_batched::<F, E, (), KeccakStarkHash, V, _>(
+        multi_verify_batched::<F, E, (), DefaultStarkHash, V, _>(
             &refs,
             proof,
             &mut DefaultTranscript::<E>::new(&[]),

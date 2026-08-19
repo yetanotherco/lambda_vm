@@ -454,7 +454,7 @@ where
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::config::KeccakStarkHash;
+    use crate::config::DefaultStarkHash;
     use crate::fri::batched::{HeightCombiner, combine_by_height};
     use crate::fri::terminal::terminal_codeword_from_coeffs;
     use crypto::fiat_shamir::default_transcript::DefaultTranscript;
@@ -550,10 +550,10 @@ pub(crate) mod tests {
         transcript: &mut Transcript,
         grinding_factor: u8,
         num_queries: usize,
-    ) -> BatchedFriCommit<F, KeccakStarkHash> {
+    ) -> BatchedFriCommit<F, DefaultStarkHash> {
         let heights = heights_of(tables);
         let widths = widths_of(tables);
-        commit_batched_fri::<F, F, Transcript, KeccakStarkHash, _>(
+        commit_batched_fri::<F, F, Transcript, DefaultStarkHash, _>(
             transcript,
             &heights,
             &widths,
@@ -622,7 +622,7 @@ pub(crate) mod tests {
     /// Verify one query end to end against the committed layers.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn verify_one_query(
-        commit: &BatchedFriCommit<F, KeccakStarkHash>,
+        commit: &BatchedFriCommit<F, DefaultStarkHash>,
         betas: &[FE],
         h_max: usize,
         iota: usize,
@@ -638,7 +638,7 @@ pub(crate) mod tests {
             &terminal_offset,
             commit.layout.terminal_len,
         );
-        verify_batched_fri_query::<F, F, KeccakStarkHash>(
+        verify_batched_fri_query::<F, F, DefaultStarkHash>(
             layer_roots,
             betas,
             &commit.layout,
@@ -688,7 +688,7 @@ pub(crate) mod tests {
             "one β per committed layer plus the final fold"
         );
         assert!(
-            crate::grinding::is_valid_nonce::<crate::config::GrindingDigest<KeccakStarkHash>>(
+            crate::grinding::is_valid_nonce::<crate::config::GrindingDigest<DefaultStarkHash>>(
                 &replay.grinding_seed,
                 commit.nonce.expect("grinding was requested"),
                 4
@@ -714,7 +714,7 @@ pub(crate) mod tests {
         let commit = commit_fixture(&tables, &mut transcript, 0, 8);
 
         let decommitments =
-            crate::fri::query_phase::<F, KeccakStarkHash>(&commit.layers, &commit.iotas);
+            crate::fri::query_phase::<F, DefaultStarkHash>(&commit.layers, &commit.iotas);
 
         let mut verifier_transcript = Transcript::new(b"batched_round4");
         let replay = replay_batched_fri::<F, Transcript>(

@@ -17,7 +17,7 @@ use math::field::{
 use crate::batched::proof::{BatchedMultiProof, BatchedProveStats};
 use crate::batched::prover::multi_prove_batched;
 use crate::batched::shape::{EpochShape, PinnedPrep, RoundShape};
-use crate::config::KeccakStarkHash;
+use crate::config::DefaultStarkHash;
 use crate::examples::multi_table_lookup::{
     new_add_air_with_lookup, new_cpu_air_with_lookup, new_mul_air_with_lookup,
 };
@@ -177,16 +177,21 @@ pub(crate) fn prove_repeated_with(
         .collect();
 
     let trace_lengths: Vec<usize> = (0..repeats).flat_map(|_| [8usize, 4, 4]).collect();
-    let (proof, stats) =
-        multi_prove_batched::<F, E, (), KeccakStarkHash, GenericProver<F, E, (), KeccakStarkHash>>(
-            pairs,
-            transcript,
-            None,
-            #[cfg(feature = "disk-spill")]
-            crate::storage_mode::StorageMode::Ram,
-            residency,
-        )
-        .expect("the fixture is a well-shaped epoch");
+    let (proof, stats) = multi_prove_batched::<
+        F,
+        E,
+        (),
+        DefaultStarkHash,
+        GenericProver<F, E, (), DefaultStarkHash>,
+    >(
+        pairs,
+        transcript,
+        None,
+        #[cfg(feature = "disk-spill")]
+        crate::storage_mode::StorageMode::Ram,
+        residency,
+    )
+    .expect("the fixture is a well-shaped epoch");
 
     (airs, proof, stats, trace_lengths)
 }
@@ -220,7 +225,7 @@ where
     else {
         return false;
     };
-    MixedMmcs::<C, KeccakStarkHash>::verify_batch(
+    MixedMmcs::<C, DefaultStarkHash>::verify_batch(
         root,
         iota,
         opening,
@@ -528,15 +533,20 @@ pub(crate) fn prove_preprocessed(
             )
         })
         .collect();
-    let (proof, _) =
-        multi_prove_batched::<F, E, (), KeccakStarkHash, GenericProver<F, E, (), KeccakStarkHash>>(
-            pairs,
-            &mut DefaultTranscript::<E>::new(&[]),
-            expected_prep,
-            #[cfg(feature = "disk-spill")]
-            crate::storage_mode::StorageMode::Ram,
-            ResidencyMode::Retain,
-        )?;
+    let (proof, _) = multi_prove_batched::<
+        F,
+        E,
+        (),
+        DefaultStarkHash,
+        GenericProver<F, E, (), DefaultStarkHash>,
+    >(
+        pairs,
+        &mut DefaultTranscript::<E>::new(&[]),
+        expected_prep,
+        #[cfg(feature = "disk-spill")]
+        crate::storage_mode::StorageMode::Ram,
+        ResidencyMode::Retain,
+    )?;
     Ok((airs, proof, vec![8, 4, 4]))
 }
 
@@ -612,7 +622,7 @@ fn the_un_reduced_index_does_not_authenticate_the_preprocessed_round() {
         }
         any_differed = true;
         assert!(
-            !MixedMmcs::<F, KeccakStarkHash>::verify_batch(
+            !MixedMmcs::<F, DefaultStarkHash>::verify_batch(
                 &root,
                 iota,
                 opening,
