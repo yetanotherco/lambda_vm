@@ -400,6 +400,10 @@ thead tr:first-child {
     border-bottom: var(--table-header-border-size) solid var(--table-border);
 }
 
+tfoot tr:first-child {
+  border-top: var(--table-header-border-size) solid var(--table-border);
+}
+
 tr:has(th em) {
     border-bottom: var(--border-size) solid var(--table-border);
     text-align: left;
@@ -412,6 +416,10 @@ tr th:has(em) {
 
 tbody tr th:has(em) {
     padding-top: 1.5em;
+}
+
+.striped table tbody tr:nth-child(odd) {
+  background: color-mix(in srgb, var(--link) 8%, var(--bg));
 }
 
 /* math */

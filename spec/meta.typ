@@ -80,3 +80,14 @@
   assert(false, message: "Unsupported target: " + target())
 }
 
+#let stripe_tables(body) = context if target() == "html" {
+  show table: it => html.div(class: "striped", it)
+  body
+} else if target() == "paged" {
+  set table(fill: (_, y) => if calc.odd(y) { color.rgb(0, 0, 100, 20) } else { color.rgb(255, 255, 255, 20) })
+  body
+} else {
+  assert(false, message: "Unsupported target: " + target())
+}
+
+

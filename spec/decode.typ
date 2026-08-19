@@ -8,6 +8,7 @@
   render_chip_padding_table,
 )
 #import "/expr.typ": expr_to_math
+#import "/meta.typ": stripe_tables
 
 #let config = load_config()
 #let chip = load_chip("src/decode.toml", config)
@@ -88,16 +89,13 @@ Further clarification is provided in the notes following the table.
 
 #let decoding_table(lines) = {
   show figure: set block(breakable: true)
+  show: stripe_tables
 
   figure(table(
     columns: (auto, auto, auto, auto, 1fr, auto),
     stroke: 0pt,
     inset: (right: .5em),
     align: (left, right, center, center, left, right),
-    fill: (_, y) =>
-      // Overlay a low-opacity fill color to distinguish the different rows better
-      if calc.odd(y) and y <= lines.len() { color.rgb(0, 0, 100, 20) }
-      else { color.rgb(255, 255, 255, 20) },
     table.header([*Operation*], [*alu*], [*`w_instr`*], [*`signed`*], [*other*], []),
     table.hline(stroke: 1.5pt),
     table.vline(x: 1, start: 1, end: lines.len() + 1, stroke: .5pt),
