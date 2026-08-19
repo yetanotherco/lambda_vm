@@ -139,6 +139,11 @@ pub fn generate() -> (Vec<u8>, usize) {
 /// a phantom failure with no relationship to the branch under test, which cost
 /// a baseline reconciliation to diagnose.
 ///
+/// It is worse than a wasted debugging hour: the stash-and-rerun control used
+/// to separate "pre-existing failure" from "my change broke it" SHARES this
+/// cache, so a poisoned blob makes both arms fail and the control cannot tell
+/// them apart. An exoneration taken against a stale blob proves nothing.
+///
 /// So the key names the two axes that actually move the bytes: the statement
 /// encoding version and the commitment hash. A branch that changes either gets
 /// its own file instead of corrupting the shared one.

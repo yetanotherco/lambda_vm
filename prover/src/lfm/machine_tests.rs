@@ -2166,6 +2166,7 @@ fn host_statement_challenges(f: &StatementFixture) -> (ExtFE, ExtFE) {
         bytewise: c[11],
         store: c[12],
         cpu32: c[13],
+        blake3: c[14],
     };
     let ranges: Vec<RuntimePageRange> = shape
         .page_ranges
@@ -2213,7 +2214,7 @@ fn assert_challenges_match(public: &[(u32, LfmWord)], f: &StatementFixture, what
 /// Phase A is spliced and at what shift.
 ///
 /// CORRECTION to an earlier claim of mine: the statement is NOT unconditionally
-/// 3 bytes past a boundary. Its length is `207 + L + 16R`, so the shift Phase A
+/// 3 bytes past a boundary. Its length is `215 + L + 16R`, so the shift Phase A
 /// inherits is `(3 + L) mod 4` — it is 3 only when the public output happens to
 /// be a multiple of four, and it is ZERO (Phase A entirely unspliced) whenever
 /// `L ≡ 1 (mod 4)`. Since `L` is one byte per COMMIT op and therefore workload-
@@ -2223,9 +2224,12 @@ fn assert_challenges_match(public: &[(u32, LfmWord)], f: &StatementFixture, what
 fn epoch_statement_cursor_is_three_plus_output_len() {
     let shape = epoch_statement_shape();
     let r = shape.page_ranges.len();
-    assert_eq!(shape.byte_len(), 207 + STMT_PUBLIC_OUTPUT_LEN + 16 * r);
+    // 215, not the 207 of the fourteen-count era: `TableCounts::blake3` added
+    // one absorbed u64. Eight bytes is a whole number of halves, so the shift
+    // Phase A inherits is unchanged.
+    assert_eq!(shape.byte_len(), 215 + STMT_PUBLIC_OUTPUT_LEN + 16 * r);
     for l in 0..8usize {
-        let total = 207 + l + 16 * r;
+        let total = 215 + l + 16 * r;
         assert_eq!(
             total % keccak_host::BYTES_PER_HALF,
             (3 + l) % keccak_host::BYTES_PER_HALF,

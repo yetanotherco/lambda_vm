@@ -17,7 +17,12 @@ use crate::test_utils::E;
 use crate::{RuntimePageRange, TableCounts};
 
 /// Domain-separation tag. Bump the suffix (`_V2`, ...) on any encoding change.
-pub(crate) const DOMAIN_TAG: &[u8] = b"LAMBDAVM_STARK_STATEMENT_V3";
+/// V4 appends `TableCounts::blake3`, which made the BLAKE3 table conditional.
+/// [`CONTINUATION_EPOCH_TAG`] moved to V3 in the same change and for the same
+/// reason: the count loop below is SHARED, so a continuation epoch absorbs the
+/// new u64 too. Bumping only the monolithic tag would have left continuation
+/// proofs from two encodings sharing a transcript prefix.
+pub(crate) const DOMAIN_TAG: &[u8] = b"LAMBDAVM_STARK_STATEMENT_V4";
 
 /// Canonical full-ELF identity digest — exactly what [`absorb_statement`] binds
 /// into the transcript. The recursion attestation folds the same digest into
@@ -111,6 +116,7 @@ pub(crate) fn absorb_statement_with_digest(
         bytewise,
         store,
         cpu32,
+        blake3,
     } = table_counts;
     for count in [
         cpu,
@@ -127,6 +133,10 @@ pub(crate) fn absorb_statement_with_digest(
         bytewise,
         store,
         cpu32,
+        // 0 or 1, and the one count the verifier cannot derive for itself —
+        // binding it is what stops prover and verifier building different AIR
+        // sets from the same bytes (see `TableCounts::blake3`).
+        blake3,
     ] {
         t.append_bytes(&(count as u64).to_le_bytes());
     }
@@ -158,7 +168,7 @@ pub(crate) fn absorb_statement_with_digest(
 /// `pub(crate)` so the LFM statement replay emits the identical tag instead of
 /// duplicating the literal: a second copy would drift silently on a version
 /// bump, and the tag existing at all depends on both sides agreeing on it.
-pub(crate) const CONTINUATION_EPOCH_TAG: &[u8] = b"LAMBDAVM_CONTINUATION_EPOCH_V2";
+pub(crate) const CONTINUATION_EPOCH_TAG: &[u8] = b"LAMBDAVM_CONTINUATION_EPOCH_V3";
 const CONTINUATION_GLOBAL_TAG: &[u8] = b"LAMBDAVM_CONTINUATION_GLOBAL_V2";
 
 /// Statement bound into the cross-epoch **global** proof's transcript before

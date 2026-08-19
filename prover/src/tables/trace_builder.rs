@@ -691,7 +691,9 @@ fn collect_ops_from_cpu(
             }
             let blake3_memw_ops =
                 collect_blake3_memw_ops(op, &words, &out, memory_state, register_state);
-            memw.extend_ops(blake3_memw_ops);
+            if !strip_blake3_side_effects() {
+                memw.extend_ops(blake3_memw_ops);
+            }
             blake3_ops.push(Blake3Operation {
                 timestamp: op.timestamp,
                 state_addr,
@@ -1559,6 +1561,40 @@ fn collect_keccak_memw_ops(
     }
 
     memw_ops
+}
+
+#[cfg(test)]
+thread_local! {
+    /// ★ TEST-ONLY — suppresses BLAKE3's *side* contributions to the shared tables.
+    ///
+    /// A BLAKE3 syscall touches four things: the BLAKE3 table itself, the Ecall bus
+    /// (CPU sends, BLAKE3 receives), MEMW (it reads and writes the state region),
+    /// and BITWISE (its XORs and byte checks). Omitting the BLAKE3 table from a
+    /// proof therefore unbalances FOUR buses at once, and the resulting rejection
+    /// says nothing about which one did the work — the omission forgery would be
+    /// rejected identically if the Ecall receiver did not exist at all.
+    ///
+    /// Setting this builds the trace with the MEMW and BITWISE contributions left
+    /// out, so those two balance without the table and **Ecall is the only
+    /// unmatched interaction left**. That is what makes the forgery test in
+    /// `prove_elfs_tests` a test of the Ecall argument rather than of arithmetic
+    /// that would hold anyway.
+    ///
+    /// It exists behind `cfg(test)` because it builds a trace that does not
+    /// describe the execution: nothing may prove under it except a deliberate
+    /// forgery.
+    pub(crate) static STRIP_BLAKE3_SIDE_EFFECTS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn strip_blake3_side_effects() -> bool {
+    STRIP_BLAKE3_SIDE_EFFECTS.with(|c| c.get())
+}
+
+#[cfg(not(test))]
+pub(crate) fn strip_blake3_side_effects() -> bool {
+    false
 }
 
 /// Collect MEMW operations for a Blake3Compress ECALL.
@@ -3089,6 +3125,14 @@ pub struct Traces {
     /// BLAKE3 6-round compression table (one row per compression call)
     pub blake3: TraceTable<GoldilocksField, GoldilocksExtension>,
 
+    /// BLAKE3 compressions the workload actually performed.
+    ///
+    /// Not derivable from `blake3` above: that trace pads to a 4-row minimum,
+    /// so an unused table and a table with four compressions are the same
+    /// height. This is what decides whether the proof carries the table at all
+    /// (`crate::TableCounts::blake3`).
+    pub num_blake3_ops: usize,
+
     /// ECSM core table (one row per scalar-multiplication ecall)
     pub ecsm: TraceTable<GoldilocksField, GoldilocksExtension>,
 
@@ -3472,7 +3516,11 @@ fn build_traces<I: ImageSource + Sync>(
         Box::new(|h| h.add_ops(&collect_bitwise_from_memw_aligned(&memw_aligned_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_commit(&commit_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_keccak(&keccak_ops))),
-        Box::new(|h| h.add_ops(&collect_bitwise_from_blake3(&blake3_ops))),
+        Box::new(|h| {
+            if !strip_blake3_side_effects() {
+                h.add_ops(&collect_bitwise_from_blake3(&blake3_ops));
+            }
+        }),
         Box::new(|h| h.add_ops(&collect_bitwise_from_ecsm(&ecsm_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_ecdas(&ecdas_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_hint(&hint_ops))),
@@ -3743,6 +3791,7 @@ fn build_traces<I: ImageSource + Sync>(
             .collect();
         keccak_rnd::generate_keccak_rnd_trace(&keccak_rnd_ops)
     };
+    let num_blake3_ops = blake3_ops.len();
     let gen_blake3 = || blake3::generate_blake3_trace(&blake3_ops);
     let gen_keccak_rc = || {
         let mut keccak_rc_trace = keccak_rc::generate_keccak_rc_trace();
@@ -3952,6 +4001,7 @@ fn build_traces<I: ImageSource + Sync>(
         keccak: keccak_trace,
         keccak_rnd: keccak_rnd_trace,
         blake3: blake3_trace,
+        num_blake3_ops,
         keccak_rc: keccak_rc_trace,
         ecsm: ecsm_trace,
         ecdas: ecdas_trace,
@@ -4258,6 +4308,7 @@ impl Traces {
 
         let Traces {
             cpus,
+            num_blake3_ops,
             bitwise,
             lts,
             shifts,
@@ -4332,7 +4383,11 @@ impl Traces {
         total += (keccak.num_rows() * KECCAK_COLS) as u64;
         total += (keccak_rnd.num_rows() * KECCAK_RND_COLS) as u64;
         total += (keccak_rc.num_rows() * (KECCAK_RC_COLS - KECCAK_RC_PRECOMPUTED)) as u64;
-        total += (blake3.num_rows() * BLAKE3_COLS) as u64;
+        // Counted only when the proof carries the table (`table_counts().blake3`);
+        // an unused BLAKE3 trace is padding the prover never commits.
+        if *num_blake3_ops > 0 {
+            total += (blake3.num_rows() * BLAKE3_COLS) as u64;
+        }
         for t in eqs {
             total += (t.num_rows() * EQ_COLS) as u64;
         }
@@ -4394,6 +4449,7 @@ impl Traces {
 
         let Traces {
             cpus,
+            num_blake3_ops,
             bitwise,
             lts,
             shifts,
@@ -4468,7 +4524,9 @@ impl Traces {
         total += (keccak.num_rows() * n_keccak) as u64;
         total += (keccak_rnd.num_rows() * n_keccak_rnd) as u64;
         total += (keccak_rc.num_rows() * n_keccak_rc) as u64;
-        total += (blake3.num_rows() * n_blake3) as u64;
+        if *num_blake3_ops > 0 {
+            total += (blake3.num_rows() * n_blake3) as u64;
+        }
         for t in eqs {
             total += (t.num_rows() * n_eq) as u64;
         }
@@ -4504,6 +4562,8 @@ impl Traces {
             bytewise: self.bytewises.len(),
             store: self.stores.len(),
             cpu32: self.cpu32s.len(),
+            // 0 or 1: the table is carried only when the workload used it.
+            blake3: usize::from(self.num_blake3_ops > 0),
         }
     }
 

@@ -742,10 +742,17 @@ fn continuation_epoch_constraint_leg() {
         "CPU", "LT", "SHIFT", "MEMW", "MEMW_A", "LOAD", "MUL", "DVRM", "BRANCH", "MEMW_R", "EQ",
         "BYTEWISE", "STORE", "CPU32",
     ];
-    // FIXED_TABLE_COUNT = 10 (`prover/src/lib.rs`): always exactly one sub-proof
-    // each, REGARDLESS of TableCounts — a zero-row table still needs its proof,
-    // or its constraints drop out of verification. HALT is the one an
-    // intermediate epoch omits.
+    // The `FIXED_TABLE_COUNT` always-on tables (`prover/src/lib.rs`): exactly one
+    // sub-proof each REGARDLESS of TableCounts, because a zero-row table still
+    // needs its proof or its constraints drop out of verification. HALT is the
+    // one an intermediate epoch omits.
+    //
+    // ⚠ BLAKE3 is deliberately NOT here. It left this list when it became
+    // `TableCounts::blake3`, a 0-or-1 count — a workload that never executes a
+    // BLAKE3 syscall carries no BLAKE3 sub-proof at all, so the counts below are
+    // the blake3-free shape and a blake3-using epoch is one higher. HINT was
+    // missing from this list outright, which is why it read 10 while the
+    // constant said 11.
     let fixed_final = [
         "BITWISE",
         "DECODE",
@@ -757,7 +764,15 @@ fn continuation_epoch_constraint_leg() {
         "REGISTER",
         "ECSM",
         "ECDAS",
+        "HINT",
     ];
+    // The list is a census OF the constant, so it must not be able to drift from
+    // it silently — the failure this pin previously had.
+    assert_eq!(
+        fixed_final.len(),
+        crate::FIXED_TABLE_COUNT,
+        "the always-on list must name every FIXED_TABLE_COUNT table"
+    );
 
     let families_instr: usize = families.iter().map(|l| get(l)).sum();
     let fixed_final_instr: usize = fixed_final.iter().map(|l| get(l)).sum();
@@ -771,14 +786,15 @@ fn continuation_epoch_constraint_leg() {
     let n_final = families.len() + fixed_final.len() + 1;
     assert_eq!(
         (n_intermediate, n_final),
-        (24, 25),
-        "epoch sub-proof composition no longer reproduces the measured 24 intermediate / 25 final"
+        (25, 26),
+        "epoch sub-proof composition no longer reproduces the measured 25 intermediate / \
+         26 final (blake3-free; a BLAKE3-using epoch is one higher)"
     );
 
     println!(
         "\ncontinuation epoch constraint leg (minimum: one chunk per family)\n  \
            14 split families      {families_instr}\n  \
-           9 fixed (no HALT)      {fixed_intermediate_instr}\n  \
+           10 fixed (no HALT)     {fixed_intermediate_instr}\n  \
            1 L2G_MEMORY           {l2g}\n  \
            INTERMEDIATE epoch     {intermediate} instr over {n_intermediate} sub-proofs\n  \
            FINAL epoch (+HALT)    {final_epoch} instr over {n_final} sub-proofs\n  \

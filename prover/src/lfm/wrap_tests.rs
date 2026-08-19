@@ -35,7 +35,7 @@ use std::time::Instant;
 
 use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};
 
-use super::airs::{LfmChipCells, lfm_cell_counts, lfm_chip_census};
+use super::airs::{HeightRule, LfmChipCells, lfm_cell_counts, lfm_chip_census};
 use super::compiler::LfmProgram;
 use super::epoch_tests::EpochInputs;
 use super::executor::execute;
@@ -90,10 +90,85 @@ pub(super) fn arena_words(program: &LfmProgram) -> usize {
     program.arena_schema.lens.iter().map(|l| *l as usize).sum()
 }
 
+/// A chip's headroom as the census table prints it: a percentage for the chips
+/// that can actually grow into it, and the reason otherwise.
+fn headroom_cell(c: &LfmChipCells) -> String {
+    match c.height_rule {
+        HeightRule::Workload => format!("{:.1}%", 100.0 * c.headroom()),
+        HeightRule::Fixed => "fixed".to_string(),
+        HeightRule::Chunked => "chunked".to_string(),
+    }
+}
+
+/// ★ THE ROW-CLIFF PANEL — what the census could not say before.
+///
+/// The wrap's cell count is a STEP function of the instruction mix: every
+/// workload-sized chip commits `real_rows.next_power_of_two()` rows, so a chip
+/// sitting just under a step doubles its entire contribution on the next 1% of
+/// growth, while one just over a step absorbs a near-doubling for free.
+///
+/// The census has always computed both heights and printed only the padded one,
+/// which is why #903's cost was invisible until a rented box measured it: four
+/// near-empty BLAKE3 rows grew the mix ~21%, and the campaign happened to be
+/// standing 1.2% under a step on `LFM_LANES` and within 18% on four more chips,
+/// so that growth tripped FIVE simultaneous doublings and turned +21% of
+/// permutations into +31% of cells
+/// (`thoughts/shared/block-compression/WRAP-GROWTH-BISECT.md`).
+///
+/// This panel makes that legible at emission time. It reports the tightest
+/// chips, what crossing each would cost, and the total exposure — the cells the
+/// wrap would gain if every chip within the warning band crossed at once, which
+/// is exactly the quantity Stage 4 spent without anyone pricing it.
+fn report_row_cliffs(census: &[LfmChipCells]) {
+    /// Headroom under which a chip is called out. A change of this order is
+    /// routine — Stage 4's was ~21% — so anything inside the band should be
+    /// read as "will cross on the next ordinary change", not as a safe margin.
+    const WARN: f64 = 0.20;
+
+    let total: u64 = census.iter().map(|c| c.cliff_cost()).sum();
+    let mut at_risk: Vec<&LfmChipCells> = census.iter().filter(|c| c.at_risk()).collect();
+    at_risk.sort_by(|a, b| a.headroom().total_cmp(&b.headroom()));
+
+    println!("\n   ★ ROW-CLIFF PANEL — cells are a step function of the mix");
+    if at_risk.is_empty() {
+        println!("      no workload-sized chips in this census");
+        return;
+    }
+
+    let exposed: Vec<&&LfmChipCells> = at_risk.iter().filter(|c| c.headroom() < WARN).collect();
+    let pct = |n: u64| 100.0 * n as f64 / total as f64;
+
+    for c in at_risk.iter().take(5) {
+        let flag = if c.headroom() < WARN { "⚠" } else { " " };
+        println!(
+            "      {flag} {:>12} {:>7.1}% headroom ({} of {} rows) — crossing costs \
+             {} base-field equivalents ({:.1}% of the total)",
+            c.name,
+            100.0 * c.headroom(),
+            c.real_rows,
+            c.rows,
+            c.cliff_cost(),
+            pct(c.cliff_cost()),
+        );
+    }
+
+    let exposure: u64 = exposed.iter().map(|c| c.cliff_cost()).sum();
+    println!(
+        "      {} of {} workload-sized chips are within {:.0}% of a step; if all of them \
+         crossed the wrap would gain {} base-field equivalents (+{:.1}%)",
+        exposed.len(),
+        at_risk.len(),
+        100.0 * WARN,
+        exposure,
+        pct(exposure),
+    );
+}
+
 /// ★ The registry-entry shape record: what the machine proves for one program.
 ///
 /// Prints the chip census — one line per SUB-PROOF, since `KECCAK_RND`'s chunks
-/// are separate AIRs at separate heights — and the totals the hash matrix wants.
+/// are separate AIRs at separate heights — the per-chip row-cliff headroom, and
+/// the totals the hash matrix wants.
 /// Returns `(main_cells, aux_cells)` so a caller can assert on them.
 pub(super) fn report_census(label: &str, program: &LfmProgram) -> (u64, u64) {
     let census = lfm_chip_census(program);
@@ -113,14 +188,16 @@ pub(super) fn report_census(label: &str, program: &LfmProgram) -> (u64, u64) {
     );
     println!("\n★ CHIP CENSUS — {label}");
     println!(
-        "   {:>12} {:>10} {:>6} {:>6} {:>16} {:>14}",
-        "chip", "rows", "main", "aux", "main cells", "aux cells"
+        "   {:>12} {:>10} {:>12} {:>9} {:>6} {:>6} {:>16} {:>14}",
+        "chip", "rows", "used", "headroom", "main", "aux", "main cells", "aux cells"
     );
     for c in &census {
         println!(
-            "   {:>12} {:>10} {:>6} {:>6} {:>16} {:>14}",
+            "   {:>12} {:>10} {:>12} {:>9} {:>6} {:>6} {:>16} {:>14}",
             c.name,
             c.rows,
+            c.real_rows,
+            headroom_cell(c),
             c.main_cols,
             c.aux_cols,
             c.main_cells(),
@@ -128,14 +205,17 @@ pub(super) fn report_census(label: &str, program: &LfmProgram) -> (u64, u64) {
         );
     }
     println!(
-        "   {:>12} {:>10} {:>6} {:>6} {:>16} {:>14}",
+        "   {:>12} {:>10} {:>12} {:>9} {:>6} {:>6} {:>16} {:>14}",
         "TOTAL",
         census.iter().map(|c| c.rows).sum::<u64>(),
+        census.iter().map(|c| c.real_rows).sum::<u64>(),
+        "",
         "",
         "",
         main,
         aux
     );
+    report_row_cliffs(&census);
     println!(
         "   cells per verify = {main} main + {aux} aux ext = {} base-field equivalents \
          (an ext element is 3 base felts)",
@@ -875,7 +955,7 @@ fn projected_peak_bytes(main: u64, aux: u64) -> f64 {
 ///
 /// This is the cells-per-verify number the hash matrix wants, and it is a
 /// MEASUREMENT of the emitted program rather than a projection from a per-leg
-/// cost: the same emitter, the same real epoch, the same 26 sub-proofs, with only
+/// cost: the same emitter, the same real epoch, the same 25 sub-proofs, with only
 /// the inner proof's options moved. Whether the resulting program can be PROVED is
 /// a separate question and the test answers it with the projection above rather
 /// than by pretending to have run it.
@@ -1094,4 +1174,144 @@ fn the_census_agrees_with_the_traces_the_prover_builds() {
         cells_of(&census, "KECCAK_RND") > 0,
         "the chain program hashes, so KECCAK_RND must carry rows"
     );
+}
+
+/// ★ R3 — the row-cliff instrument reports the two heights honestly.
+///
+/// The panel's whole value is that `real_rows` is the height the workload
+/// actually occupies and `rows` is the one the prover pays for. If those two
+/// were ever the same number the headroom column would read 0% everywhere and
+/// silently stop warning, which is exactly the failure mode the panel exists to
+/// end — so this pins the relationship rather than the values.
+#[test]
+fn the_census_reports_real_and_committed_heights_separately() {
+    use super::airs::HeightRule;
+    use super::layout::MIN_GROUP_ROWS;
+
+    let program = super::programs::keccak_chain_program();
+    let census = lfm_chip_census(&program);
+    let chunk_perms = super::airs::keccak_rnd_chunk_permutations(&program);
+    let mut chunk = chunk_perms.iter();
+
+    for c in &census {
+        assert!(
+            c.real_rows <= c.rows,
+            "{}: a chip cannot occupy more rows than it commits ({} > {})",
+            c.name,
+            c.real_rows,
+            c.rows
+        );
+        // The headroom column is this subtraction and nothing else, so an entry
+        // whose two heights are inconsistent with the padding rule would print a
+        // number that means nothing.
+        let expected = (c.rows - c.real_rows) as f64 / c.rows as f64;
+        assert!(
+            (c.headroom() - expected).abs() < 1e-12,
+            "{}: headroom must be the padding fraction",
+            c.name
+        );
+
+        match c.height_rule {
+            HeightRule::Workload => {
+                assert_eq!(
+                    c.rows,
+                    (c.real_rows as usize)
+                        .next_power_of_two()
+                        .max(MIN_GROUP_ROWS) as u64,
+                    "{}: a workload-sized chip commits its real height padded to the \
+                     next power of two — if this ever stops holding, the headroom is \
+                     not a distance to a cliff",
+                    c.name
+                );
+                assert!(
+                    c.at_risk(),
+                    "{}: workload-sized chips are watchable",
+                    c.name
+                );
+            }
+            HeightRule::Fixed => {
+                assert_eq!(
+                    c.real_rows, c.rows,
+                    "{}: a lookup table is full, so its two heights coincide",
+                    c.name
+                );
+                assert!(
+                    !c.at_risk(),
+                    "{}: a fixed table reads 0% headroom because it is full, not \
+                     because it is about to double — the panel must not warn on it",
+                    c.name
+                );
+            }
+            HeightRule::Chunked => {
+                let perms = chunk.next().expect("one census chunk per policy chunk");
+                assert_eq!(
+                    c.real_rows,
+                    (perms * super::chunking::KECCAK_RND_ROWS_PER_PERMUTATION) as u64,
+                    "a chunk occupies 24 rows per permutation it carries"
+                );
+                assert!(
+                    !c.at_risk(),
+                    "a full chunk sits permanently just under a power of two and can \
+                     never cross it — the policy emits another chunk instead"
+                );
+            }
+        }
+    }
+    assert!(
+        chunk.next().is_none(),
+        "every policy chunk must appear in the census"
+    );
+    assert!(
+        census.iter().any(|c| c.height_rule == HeightRule::Workload),
+        "the census must contain workload-sized chips for the panel to watch"
+    );
+}
+
+/// ★ R3 — the headroom the panel would have printed for the artifact.
+///
+/// The bisect measured `LFM_LANES` at 4,141,992 of 4,194,304 rows on the real
+/// block at 110 queries and called it 1.2% — the margin that let #903's ~21%
+/// growth trip five chip doublings at once. That number is the instrument's
+/// reason to exist, so it is pinned here against the recorded measurement
+/// (`thoughts/shared/block-compression/WRAP-GROWTH-BISECT.md`, "Headroom at the
+/// artifact"). A 110q census needs ~30 GiB to emit, so the arithmetic is pinned
+/// on the recorded row counts rather than by re-running it.
+#[test]
+fn the_row_cliff_panel_reproduces_the_artifacts_measured_headroom() {
+    use super::airs::HeightRule;
+
+    // (chip, rows the mix occupied, rows committed, headroom the bisect reports)
+    let artifact = [
+        ("LFM_LANES", 4_141_992u64, 4_194_304u64, 1.2),
+        ("LFM_SELECT", 463_650, 524_288, 11.6),
+        ("LFM_BALU", 110_147_086, 134_217_728, 17.9),
+        ("LFM_BITDEC", 1_717_958, 2_097_152, 18.1),
+        ("LFM_CONST", 1_656, 2_048, 19.1),
+        ("LFM_HINT", 1_523_011, 2_097_152, 27.4),
+        ("LFM_XALU", 1_485_219, 2_097_152, 29.2),
+    ];
+
+    for (name, real_rows, rows, expected_pct) in artifact {
+        let c = LfmChipCells {
+            name,
+            rows,
+            real_rows,
+            height_rule: HeightRule::Workload,
+            main_cols: 1,
+            aux_cols: 0,
+        };
+        assert_eq!(
+            rows,
+            (real_rows as usize).next_power_of_two() as u64,
+            "{name}: the recorded committed height must be the recorded real height padded",
+        );
+        let got = 100.0 * c.headroom();
+        assert!(
+            (got - expected_pct).abs() < 0.05,
+            "{name}: panel would print {got:.1}%, the bisect measured {expected_pct}%",
+        );
+        // Crossing doubles the height, so the chip adds exactly what it already
+        // contributes — the quantity the panel prices.
+        assert_eq!(c.cliff_cost(), c.main_cells() + 3 * c.aux_cells());
+    }
 }

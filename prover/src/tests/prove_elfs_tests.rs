@@ -2799,6 +2799,7 @@ fn test_verify_rejects_zero_table_counts() {
             bytewise: 0,
             store: 0,
             cpu32: 0,
+            blake3: 0,
         },
         ..vm_proof
     };
@@ -2874,6 +2875,9 @@ fn test_crafted_zero_count_proof_must_not_verify() {
         bytewise: 0,
         store: 0,
         cpu32: 0,
+        // 0 is legal here (the table is conditional), so this fixture stays a
+        // test of the REQUIRED tables' zero-rejection.
+        blake3: 0,
     };
     let airs = VmAirs::new(
         &elf,
@@ -3910,4 +3914,431 @@ fn test_epoch_memory_bus_with_l2g_bookend() {
         ),
         "epoch Memory bus must balance with L2G bookend + PAGE excluding touched cells"
     );
+}
+
+// =============================================================================
+// ★ R1 — the conditional BLAKE3 table
+// =============================================================================
+//
+// BLAKE3 left `FIXED_TABLE_COUNT` and became `TableCounts::blake3`, a 0-or-1
+// count. That is a soundness claim, not a size optimisation: it asserts that
+// omitting the table is safe BECAUSE a workload that used BLAKE3 leaves an
+// Ecall-bus send with no receiver, so the omission cannot verify. These four
+// tests are that claim — the two honest directions, the forgery, and the
+// binding that stops prover and verifier disagreeing quietly.
+//
+// Why it matters at all: always-on, the table cost a real block's recursion
+// wrap +31.2% of its trace cells and +44% of its peak memory while carrying
+// 0.035% of the epoch's own cells (WRAP-GROWTH-BISECT.md).
+
+/// Build traces for an asm ELF, the same minimal path the suite's other
+/// prove tests use.
+fn traces_for_asm(name: &str) -> (Vec<u8>, Elf, Traces) {
+    let elf_bytes = crate::test_utils::asm_elf_bytes(name);
+    let elf = Elf::load(&elf_bytes).expect("ELF load");
+    let executor = Executor::new(&elf, vec![]).expect("executor");
+    let result = executor.run().expect("execution");
+    let traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
+    (elf_bytes, elf, traces)
+}
+
+/// (a) A workload that never touches BLAKE3 proves and verifies WITHOUT the
+/// table — the recovery R1 exists for.
+///
+/// The count is what the sub-proof arithmetic is checked against, so asserting
+/// it here is asserting the table is genuinely absent rather than merely small.
+#[test]
+fn a_workload_without_blake3_proves_without_the_table() {
+    let (_, elf, mut traces) = traces_for_asm("sub");
+
+    assert_eq!(
+        traces.num_blake3_ops, 0,
+        "the `sub` program must not use BLAKE3, or this tests nothing"
+    );
+    let counts = traces.table_counts();
+    assert_eq!(counts.blake3, 0, "an unused BLAKE3 table is not carried");
+
+    let airs = VmAirs::new(
+        &elf,
+        &ProofOptions::default_test_options(),
+        true,
+        &traces.page_configs,
+        &counts,
+        None,
+        true,
+        None,
+        None,
+        None,
+    );
+    assert!(!airs.include_blake3);
+    assert!(
+        !airs.air_refs().iter().any(|a| a.name() == "BLAKE3"),
+        "the AIR set must not contain a table the proof does not carry"
+    );
+
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "a keccak-free, blake3-free program must prove and verify with no BLAKE3 table"
+    );
+}
+
+/// (b) A workload that DOES use BLAKE3 proves and verifies WITH the table.
+///
+/// The control for (a): the conditional must not have made the table
+/// unreachable, which an "always omit" bug would pass (a) and fail here.
+#[test]
+fn a_workload_using_blake3_proves_with_the_table() {
+    let (_, elf, mut traces) = traces_for_asm("test_blake3");
+
+    assert!(
+        traces.num_blake3_ops > 0,
+        "the `test_blake3` program must use BLAKE3, or this tests nothing"
+    );
+    let counts = traces.table_counts();
+    assert_eq!(counts.blake3, 1, "a used BLAKE3 table is carried");
+
+    let airs = VmAirs::new(
+        &elf,
+        &ProofOptions::default_test_options(),
+        true,
+        &traces.page_configs,
+        &counts,
+        None,
+        true,
+        None,
+        None,
+        None,
+    );
+    assert!(airs.include_blake3);
+    assert!(
+        airs.air_refs().iter().any(|a| a.name() == "BLAKE3"),
+        "the AIR set must contain the table the proof carries"
+    );
+
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "a blake3-using program must prove and verify with the BLAKE3 table"
+    );
+}
+
+/// ★ (c) THE FORGERY — stripped, and honest about how far the stripping got.
+///
+/// The naive version of this test is INERT. A BLAKE3 syscall touches several
+/// buses, and omitting the table unbalances all of them at once: Memory/MEMW
+/// (its state reads and writes), AreBytes, IsHalfword and ByteAlu (its byte
+/// checks and XORs), and only then Ecall. Those are numerically overwhelming,
+/// so the naive proof is rejected long before the Ecall argument matters — it
+/// would be rejected identically if the Ecall receiver had never been written.
+///
+/// `STRIP_BLAKE3_SIDE_EFFECTS` builds the trace with BLAKE3's MEMW ops and its
+/// BITWISE multiplicities left out, to narrow the rejection toward Ecall alone.
+///
+/// ## ⚠ MEASURED: it is narrowed, NOT yet sole
+///
+/// Under `--features debug-checks` this forgery leaves THREE buses imbalanced
+/// beyond the by-design `Commit` residual:
+///
+/// - **19 `Ecall`** — the one this argument is about.
+/// - **16 `Memory`** — removing BLAKE3's MEMW ops breaks the memory chain for
+///   the state region; `test_blake3` does not satisfy the "never re-reads the
+///   digest region" precondition that would make the removal chain-consistent.
+/// - **24 `ByteAlu`** — subtracting `collect_bitwise_from_blake3` did not zero
+///   BLAKE3's whole ByteAlu contribution.
+///
+/// `AreBytes` and `IsHalfword` DO balance, so the strip is doing real work: it
+/// takes the imbalance from five buses to three. But this test does not yet
+/// establish Ecall as the sole cause, and must not be cited as if it did.
+/// Finishing it needs a workload whose digest region is never re-read, plus a
+/// subtract path for the remaining ByteAlu multiplicities (there is none on
+/// `bitwise::update_multiplicities` today). See RESUME-WRAPSLIM.md, F1.
+///
+/// What it DOES establish, and what the inert version did not: the omission is
+/// rejected with the two largest confounders removed, prover and verifier
+/// agreeing on the false shape throughout — both build the AIR set from
+/// `blake3: 0`, so the counts are self-consistent and the sub-proof cross-check
+/// cannot separate them.
+#[test]
+fn a_blake3_workload_claiming_no_blake3_table_is_rejected() {
+    use crate::tables::trace_builder::STRIP_BLAKE3_SIDE_EFFECTS;
+
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_blake3");
+    let elf = Elf::load(&elf_bytes).expect("ELF load");
+    let executor = Executor::new(&elf, vec![]).expect("executor");
+    let result = executor.run().expect("execution");
+
+    // ---- the control: the SAME workload, unstripped, is honest and verifies.
+    // Without this, a stripped trace that fails for some unrelated reason would
+    // read as the argument working.
+    {
+        let mut honest =
+            Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[])
+                .unwrap();
+        assert_eq!(honest.table_counts().blake3, 1);
+        assert!(
+            prove_and_verify_vm_minimal(&elf, &mut honest),
+            "the control must verify, or the stripped arm below proves nothing"
+        );
+    }
+
+    // ---- the forgery: BLAKE3's side contributions stripped, table claimed absent.
+    STRIP_BLAKE3_SIDE_EFFECTS.with(|c| c.set(true));
+    let stripped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[])
+    }));
+    STRIP_BLAKE3_SIDE_EFFECTS.with(|c| c.set(false));
+    let mut traces = stripped
+        .expect("stripping must not panic the trace builder")
+        .expect("stripped traces build");
+
+    assert!(
+        traces.num_blake3_ops > 0,
+        "the workload really used BLAKE3 — only its SIDE effects were stripped, \
+         so the CPU ecall and its Ecall send are still present"
+    );
+
+    let mut forged = traces.table_counts();
+    assert_eq!(forged.blake3, 1, "honest count before the tamper");
+    forged.blake3 = 0;
+    assert!(
+        forged.validate().is_ok(),
+        "a zero BLAKE3 count is well-formed; only the bus may reject it"
+    );
+
+    let proof_options = ProofOptions::default_test_options();
+    let airs = VmAirs::new(
+        &elf,
+        &proof_options,
+        true,
+        &traces.page_configs,
+        &forged,
+        None,
+        true,
+        None,
+        None,
+        None,
+    );
+    assert!(!airs.include_blake3, "the forged shape must omit the table");
+
+    let pairs = airs.air_trace_pairs(&mut traces);
+    let proved = multi_prove_ram(pairs, &mut DefaultTranscript::<E>::new(&[]));
+
+    let verified = match &proved {
+        Err(_) => false,
+        Ok(multi_proof) => {
+            let views: Vec<StarkProofView<F, E, ()>> = multi_proof
+                .proofs
+                .iter()
+                .map(StarkProofView::Owned)
+                .collect();
+            let mut replay = DefaultTranscript::<E>::new(&[]);
+            match crate::compute_expected_commit_bus_balance_view(
+                &airs.air_refs(),
+                &views,
+                &traces.public_output_bytes,
+                0,
+                &mut replay,
+            ) {
+                None => false,
+                Some(expected) => Verifier::multi_verify_views(
+                    &airs.air_refs(),
+                    &views,
+                    &mut DefaultTranscript::<E>::new(&[]),
+                    &expected,
+                ),
+            }
+        }
+    };
+
+    assert!(
+        !verified,
+        "a proof that omits the BLAKE3 table for a workload that used BLAKE3 must \
+         NOT verify. Ecall is among the buses left unmatched (see the doc above \
+         for the two that are not yet stripped). If this fires, the soundness \
+         argument on `TableCounts::blake3` is in question and the table must go \
+         back to always-on until it is re-established."
+    );
+    println!(
+        "stripped forgery rejected at: {}",
+        if proved.is_err() {
+            "prove (no consistent auxiliary trace)"
+        } else {
+            "verify (bus balance)"
+        }
+    );
+}
+
+/// (d) The count is bound into the transcript, so prover and verifier cannot
+/// disagree about it silently.
+///
+/// `include_blake3` is prover-asserted — unlike `include_halt`, the verifier
+/// cannot derive it a priori. Binding is what turns a disagreement into a
+/// rejection instead of two parties verifying different statements.
+#[test]
+fn the_blake3_count_is_bound_into_the_statement() {
+    use crate::statement::{StatementKind, absorb_statement};
+    use crypto::fiat_shamir::is_transcript::IsTranscript;
+
+    let elf_bytes = crate::test_utils::asm_elf_bytes("sub");
+    let mut counts = crate::TableCounts {
+        cpu: 3,
+        lt: 1,
+        memw: 2,
+        memw_aligned: 1,
+        load: 1,
+        mul: 1,
+        dvrm: 1,
+        shift: 1,
+        branch: 2,
+        memw_register: 1,
+        eq: 1,
+        bytewise: 1,
+        store: 1,
+        cpu32: 1,
+        blake3: 1,
+    };
+
+    let challenge_for = |counts: &crate::TableCounts| {
+        let mut t = DefaultTranscript::<E>::new(&[]);
+        absorb_statement(
+            &mut t,
+            StatementKind::Monolithic,
+            &elf_bytes,
+            &[1, 2, 3],
+            counts,
+            0,
+            &[],
+            7,
+        );
+        t.sample_field_element()
+    };
+
+    counts.blake3 = 1;
+    let with = challenge_for(&counts);
+    counts.blake3 = 0;
+    let without = challenge_for(&counts);
+
+    assert_ne!(
+        with, without,
+        "the BLAKE3 count must change the transcript — unbound, a prover could \
+         claim one shape and a verifier build another from the same bytes"
+    );
+}
+
+/// (e) A BLAKE3 count above one is rejected before any AIR is built.
+///
+/// `TableCounts::blake3` is a 0-or-1 presence count, but `total()` adds it while
+/// `VmAirs` derives `include_blake3` as `== 1`. Those two disagree for any value
+/// outside {0, 1}: a count of 2 inflates the expected sub-proof total by two
+/// while the AIR set gains none. `validate()`'s upper bound is what keeps that
+/// disagreement unreachable, so the bound itself is pinned here rather than left
+/// as an invariant nobody tests.
+///
+/// It fails safe twice over — the arithmetic below shows the count check would
+/// also reject — but a proof should never get that far on a malformed count.
+#[test]
+fn a_blake3_count_above_one_is_rejected() {
+    let mut counts = crate::TableCounts {
+        cpu: 1,
+        lt: 1,
+        memw: 1,
+        memw_aligned: 1,
+        load: 1,
+        mul: 1,
+        dvrm: 1,
+        shift: 1,
+        branch: 1,
+        memw_register: 1,
+        eq: 1,
+        bytewise: 1,
+        store: 1,
+        cpu32: 1,
+        blake3: 1,
+    };
+    assert!(counts.validate().is_ok(), "1 is the honest maximum");
+    counts.blake3 = 0;
+    assert!(
+        counts.validate().is_ok(),
+        "0 is legal — the table is conditional (see TableCounts::blake3)"
+    );
+
+    for bogus in [2usize, 3, usize::MAX] {
+        counts.blake3 = bogus;
+        let err = counts
+            .validate()
+            .expect_err("a BLAKE3 count above one must be rejected");
+        assert!(
+            format!("{err}").contains("blake3"),
+            "the rejection must name the field, got {err}"
+        );
+    }
+
+    // The second line of defence, stated so the ordering is deliberate: even
+    // unvalidated, `total()` counts 2 where `air_refs` would build 0, so the
+    // sub-proof cross-check cannot pass either.
+    counts.blake3 = 2;
+    let with_two = counts.total();
+    counts.blake3 = 0;
+    assert_eq!(
+        with_two,
+        counts.total() + 2,
+        "total() counts every claimed BLAKE3 table, so a count the AIR set does \
+         not honour can never match the proof length"
+    );
+}
+
+/// (f) The six Ecall receivers carry pairwise-distinct syscall numbers.
+///
+/// This is the premise the whole omission argument rests on: CPU sends the
+/// syscall number as trace data, each receiver matches its own constant, and
+/// BLAKE3's is matched by no other table — so removing BLAKE3 leaves its sends
+/// unreceivable rather than absorbed by a neighbour. That is currently true by
+/// inspection of six literals in five files, which is exactly the kind of fact
+/// that stops being true silently.
+///
+/// A collision here would not be a failed test so much as a soundness break: two
+/// tables sharing a number could receive each other's sends, and a workload
+/// using one could be proved with only the other present.
+#[test]
+fn the_ecall_receiver_syscall_numbers_are_pairwise_distinct() {
+    use executor::vm::instruction::execution::{
+        BLAKE3_SYSCALL_NUMBER, ECSM_SYSCALL_NUMBER, HINT_SYSCALL_NUMBER, KECCAK_SYSCALL_NUMBER,
+    };
+
+    // HALT and COMMIT spell their numbers inline in their receivers
+    // (`tables/halt.rs`, `tables/commit.rs`) rather than via a shared constant.
+    const HALT_SYSCALL_NUMBER: u64 = 93;
+    const COMMIT_SYSCALL_NUMBER: u64 = 64;
+
+    let receivers = [
+        ("HALT", HALT_SYSCALL_NUMBER),
+        ("COMMIT", COMMIT_SYSCALL_NUMBER),
+        ("KECCAK", KECCAK_SYSCALL_NUMBER),
+        ("BLAKE3", BLAKE3_SYSCALL_NUMBER),
+        ("ECSM", ECSM_SYSCALL_NUMBER),
+        ("HINT", HINT_SYSCALL_NUMBER),
+    ];
+
+    for (i, (name_a, a)) in receivers.iter().enumerate() {
+        for (name_b, b) in &receivers[i + 1..] {
+            assert_ne!(
+                a, b,
+                "{name_a} and {name_b} share an Ecall syscall number — either could \
+                 receive the other's sends, and omitting one table would stop being \
+                 detectable"
+            );
+        }
+    }
+
+    // The split the receivers actually compare on is (lo32, hi32), so equal
+    // halves would collide even with distinct u64s.
+    let halves: Vec<(u32, u32)> = receivers
+        .iter()
+        .map(|(_, n)| ((n & 0xFFFF_FFFF) as u32, (n >> 32) as u32))
+        .collect();
+    for (i, a) in halves.iter().enumerate() {
+        for b in &halves[i + 1..] {
+            assert_ne!(a, b, "two receivers agree on both 32-bit halves");
+        }
+    }
 }

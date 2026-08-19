@@ -1554,14 +1554,14 @@ fn continuation_epoch_constraint_leg_cost() {
     let design_intermediate = families_unfused + fixed_unfused + l2g_unfused;
 
     println!(
-        "\ncontinuation epoch, constraint leg (minimum shape, 26 sub-proofs)\n\
+        "\ncontinuation epoch, constraint leg (minimum shape, 25 sub-proofs)\n\
          \x20 14 split families        {families:>7}  (unfused {families_unfused})\n\
          \x20  9 fixed, no HALT        {fixed_no_halt:>7}  (unfused {fixed_unfused})\n\
          \x20  1 L2G_MEMORY            {l2g:>7}  (unfused {l2g_unfused})\n\
          \x20 INTERMEDIATE leg         {intermediate:>7}  vs the design's {design_intermediate}\n\
          \x20 + recombination @ log2(N) = {LOG2_TRACE_LENGTH}  {recombination:>7}  \
          (zerofier, beta-fold, one division, claimed-parts Horner, assert)\n\
-         \x20 INTERMEDIATE total       {:>7}  over 26 sub-proofs\n\
+         \x20 INTERMEDIATE total       {:>7}  over 25 sub-proofs\n\
          \x20 FINAL epoch (+HALT)      {final_leg:>7} leg, {final_total} total, \
          over 25 sub-proofs",
         intermediate + recombination
