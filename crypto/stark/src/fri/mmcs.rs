@@ -129,18 +129,25 @@
 //!   may therefore produce a height group's LDEs, commit, and drop them before
 //!   the next group is needed.
 //! - Within one height group the leaf is a single `hash_data` over the group's
-//!   concatenated rows, so every matrix of that height must be *readable*
-//!   simultaneously. That does not require them all to be resident — a
-//!   `LeafSource` may serve rows from disk, from device memory, or by
-//!   recomputation — but a caller that serves them from full in-RAM LDE buffers
-//!   holds the whole group at once. Streaming *within* a height group would need
-//!   an incremental leaf hasher (absorb matrix by matrix into one sponge per
-//!   leaf), which the backend trait does not currently expose.
+//!   concatenated rows, so `commit` reads every matrix of that height at every
+//!   leaf: their access windows overlap, and a caller serving them from in-RAM
+//!   LDE buffers holds the whole group at once. Since the tallest group is most
+//!   of a real epoch's tables, that is `O(N)` resident at the base layer.
+//!
+//! [`StreamingMmcsBuilder`] is the escape, and it is the one a batched prover
+//! must use for the base group. It keeps one incremental leaf hasher per leaf
+//! (`IsLeafHasher`) and absorbs matrices as they arrive, so a caller produces one
+//! matrix's LDE, absorbs it and drops it — retained state is
+//! `O(leaves x hasher_state)`, independent of how many matrices there are and how
+//! wide they get. `streaming_builder_serves_the_base_group_without_holding_it`
+//! traces both halves: that `commit`'s base-group windows overlap, and that the
+//! builder's are pairwise disjoint at every height. A `LeafSource` serving from
+//! disk, device memory or recomputation remains a second, orthogonal escape.
 
 use core::marker::PhantomData;
 
 use crypto::merkle_tree::proof::Proof;
-use crypto::merkle_tree::traits::IsMerkleTreeBackend;
+use crypto::merkle_tree::traits::{IsLeafHasher, IsMerkleTreeBackend, IsStreamingLeafBackend};
 use math::fft::bit_reversing::reverse_index;
 use math::field::element::FieldElement;
 use math::field::traits::IsField;
@@ -371,18 +378,45 @@ where
             .map(|(log_height, _)| *log_height)
             .max()
             .expect("dims is non-empty");
-        let n0 = 1usize << (h_max - 1);
 
-        // Base digest layer: batch all tallest matrices' row pairs (input order).
-        let base_group: Vec<usize> = (0..num_matrices).filter(|&m| dims[m].0 == h_max).collect();
+        // Per-height group leaf digests, built in descending height order — the
+        // order that makes the memory claim in the module header true. Index `h`
+        // is `Some` exactly when some matrix has that height.
+        let mut group_digests: Vec<Option<Vec<Commitment>>> = vec![None; h_max + 1];
+        for h in (1..=h_max).rev() {
+            let group: Vec<usize> = (0..num_matrices).filter(|&m| dims[m].0 == h).collect();
+            if group.is_empty() {
+                continue;
+            }
+            // 2^(h-1) independent group-leaf hashes; at `h == h_max` that is the
+            // bulk of the tree's hashing (half of all nodes). Parallel across
+            // leaves.
+            group_digests[h] = Some(crate::par::par_map_collect(0..1usize << (h - 1), |k| {
+                hash_group_leaf::<E, H, S>(source, &group, k)
+            }));
+        }
 
+        Self::from_group_digests(dims, h_max, group_digests)
+    }
+
+    /// Build the tree from each height group's already-hashed leaf digests.
+    ///
+    /// The single climb implementation. [`Self::commit`] reaches it having hashed
+    /// every group leaf in one pass; [`StreamingMmcsBuilder`] reaches it having
+    /// hashed them incrementally, matrix by matrix. That the two produce the same
+    /// tree is therefore a property of calling one function, not a coincidence
+    /// two code paths have to be shown to share.
+    fn from_group_digests(
+        dims: Vec<(usize, usize)>,
+        h_max: usize,
+        mut group_digests: Vec<Option<Vec<Commitment>>>,
+    ) -> Self {
         let mut layers: Vec<Vec<Commitment>> = Vec::with_capacity(h_max);
-        // Base layer: 2^(h_max-1) independent group-leaf hashes — the bulk of the
-        // tree's hashing (half of all nodes). Parallel across leaves.
-        let base: Vec<Commitment> = crate::par::par_map_collect(0..n0, |k| {
-            hash_group_leaf::<E, H, S>(source, &base_group, k)
-        });
-        layers.push(base);
+        layers.push(
+            group_digests[h_max]
+                .take()
+                .expect("the tallest height group is occupied by construction"),
+        );
 
         // Climb, compressing pairs and injecting shorter matrices where the layer
         // width matches their leaf count. Each level's nodes are independent
@@ -391,19 +425,15 @@ where
         let mut i = 0usize;
         while layers[i].len() > 1 {
             let next_len = layers[i].len() / 2;
-            let inject_h = h_max - 1 - i;
-            let inject_group: Vec<usize> = (0..num_matrices)
-                .filter(|&m| dims[m].0 == inject_h)
-                .collect();
+            let injected = group_digests[h_max - 1 - i].take();
 
             let cur = &layers[i];
             let next: Vec<Commitment> = crate::par::par_map_collect(0..next_len, |j| {
-                let mut parent = compress::<E, H>(&cur[2 * j], &cur[2 * j + 1]);
-                if !inject_group.is_empty() {
-                    let inj = hash_group_leaf::<E, H, S>(source, &inject_group, j);
-                    parent = compress::<E, H>(&parent, &inj);
+                let parent = compress::<E, H>(&cur[2 * j], &cur[2 * j + 1]);
+                match &injected {
+                    Some(digests) => compress::<E, H>(&parent, &digests[j]),
+                    None => parent,
                 }
-                parent
             });
             layers.push(next);
             i += 1;
@@ -436,6 +466,37 @@ where
     /// this accessor exists so a prover can bind the shape it actually committed.
     pub fn dims(&self) -> &[(usize, usize)] {
         &self.dims
+    }
+
+    /// The leaf of matrix `m` that query `iota` opens: `iota >> (h_max - h_m)`.
+    /// `None` when `m` is not a committed matrix or `iota` is out of this tree's
+    /// index space.
+    ///
+    /// Exposed alongside [`Self::auth_path`] so a prover can assemble a
+    /// [`MixedOpening`] ONE MATRIX AT A TIME. [`Self::open_batch`] wants a
+    /// `LeafSource` describing the whole round, which means every matrix's rows
+    /// readable at once — the same `O(N)` residency [`StreamingMmcsBuilder`]
+    /// exists to keep out of the commit. Query indices are only known after the
+    /// FRI, so without these two the win would be given back at opening time.
+    pub fn row_pair_leaf(&self, iota: usize, m: usize) -> Option<usize> {
+        if iota >= 1usize << (self.h_max - 1) {
+            return None;
+        }
+        let (log_height, _) = *self.dims.get(m)?;
+        Some(iota >> (self.h_max - log_height))
+    }
+
+    /// The shared authentication path for `iota`, reading no matrix rows at all.
+    /// `None` when `iota` is outside this tree's index space.
+    pub fn auth_path(&self, iota: usize) -> Option<Proof<Commitment>> {
+        if iota >= 1usize << (self.h_max - 1) {
+            return None;
+        }
+        let mut merkle_path = Vec::with_capacity(self.h_max - 1);
+        for level in 0..(self.h_max - 1) {
+            merkle_path.push(self.layers[level][(iota >> level) ^ 1]);
+        }
+        Some(Proof { merkle_path })
     }
 
     /// Open all matrices at query `iota in [0, 2^(h_max-1))`, returning each
@@ -580,6 +641,159 @@ where
     }
 }
 
+/// One leaf hasher of the commitment configuration's batched leaf backend.
+type LeafHasherOf<E, H> = <<H as StarkHash>::Batched<E> as IsStreamingLeafBackend<E>>::LeafHasher;
+
+/// Builds a [`MixedMmcs`] by absorbing matrices ONE AT A TIME, so a prover never
+/// has to hold a height group's LDE buffers simultaneously.
+///
+/// # Why this exists
+///
+/// [`MixedMmcs::commit`] reads matrix `m` only while building level
+/// `h_max - h_m`, so a caller may drop a height group before the next is needed.
+/// That is not enough for the group that matters. Within one height the leaf is a
+/// single hash over the concatenation of every matrix's row pair, so `commit`
+/// needs them all readable at once — and the tallest group is most of an epoch's
+/// tables. A caller serving those rows from full in-RAM LDE buffers is back to
+/// `O(N)` at the base layer, which is the whole memory win given back.
+///
+/// This builder inverts the loop: it keeps one incremental leaf hasher per leaf
+/// ([`IsLeafHasher`]) and absorbs matrices into them as they arrive, so the
+/// caller produces one matrix's LDE, absorbs it, and drops it. Retained state is
+/// `O(leaves × hasher_state)` — bounded by the epoch's tallest height and
+/// independent of how many matrices there are or how wide they get.
+///
+/// # Contract
+///
+/// The shape is declared up front and matrices arrive in that order: the leaf
+/// concatenation binds input order (see the module's determinism section), and a
+/// builder that let matrices arrive out of order would commit a different tree
+/// than [`MixedMmcs::commit`] over the same input. The resulting tree IS that
+/// tree — both finish through one climb — which is what makes the two
+/// interchangeable rather than merely tested to agree.
+pub struct StreamingMmcsBuilder<E: IsField + 'static, H: StarkHash>
+where
+    FieldElement<E>: AsBytes + Sync + Send,
+{
+    dims: Vec<(usize, usize)>,
+    h_max: usize,
+    /// Indexed by height: the in-progress leaf hashers of that height group,
+    /// present from construction until the group's last matrix is absorbed.
+    pending: Vec<Option<Vec<LeafHasherOf<E, H>>>>,
+    /// Indexed by height: the group's finalized leaf digests.
+    group_digests: Vec<Option<Vec<Commitment>>>,
+    /// Matrices of each height still to arrive. A height reaching zero is what
+    /// releases that group's hashers.
+    remaining: Vec<usize>,
+    next: usize,
+}
+
+impl<E, H> StreamingMmcsBuilder<E, H>
+where
+    E: IsField + 'static,
+    H: StarkHash,
+    FieldElement<E>: AsBytes + Sync + Send,
+{
+    /// Declare the epoch's shape: `(log_height, width)` per matrix, in the order
+    /// the matrices will be absorbed and in the order the verifier will present
+    /// their openings.
+    pub fn new(dims: &[(usize, usize)]) -> Self {
+        assert!(
+            !dims.is_empty(),
+            "StreamingMmcsBuilder requires at least one matrix"
+        );
+        assert!(
+            dims.iter().all(|(log_height, _)| *log_height >= 1),
+            "log_height must be >= 1 (row-pair leaves need at least 2 rows)"
+        );
+        let h_max = dims
+            .iter()
+            .map(|(log_height, _)| *log_height)
+            .max()
+            .expect("dims is non-empty");
+
+        let mut remaining = vec![0usize; h_max + 1];
+        for (log_height, _) in dims {
+            remaining[*log_height] += 1;
+        }
+
+        let pending = (0..=h_max)
+            .map(|h| {
+                (remaining[h] > 0).then(|| {
+                    (0..1usize << (h - 1))
+                        .map(|_| <H::Batched<E> as IsStreamingLeafBackend<E>>::leaf_hasher())
+                        .collect()
+                })
+            })
+            .collect();
+
+        Self {
+            dims: dims.to_vec(),
+            h_max,
+            pending,
+            group_digests: vec![None; h_max + 1],
+            remaining,
+            next: 0,
+        }
+    }
+
+    /// Absorb the next declared matrix, reading its rows from `source` at index
+    /// `m`. The caller may drop that matrix's buffers as soon as this returns.
+    ///
+    /// Panics when the arriving matrix's shape disagrees with what was declared —
+    /// a prover-side programming error, not proof data.
+    pub fn absorb<S: LeafSource<E> + Sync>(&mut self, source: &S, m: usize) {
+        let index = self.next;
+        assert!(
+            index < self.dims.len(),
+            "absorbed more matrices ({}) than were declared ({})",
+            index + 1,
+            self.dims.len()
+        );
+        let (log_height, width) = self.dims[index];
+        assert_eq!(
+            (source.log_height(m), source.width(m)),
+            (log_height, width),
+            "matrix {index} arrived with a shape the builder was not declared for"
+        );
+
+        let hashers = self.pending[log_height]
+            .as_mut()
+            .expect("a height with matrices outstanding still holds its hashers");
+        // One update per leaf, parallel across leaves — the same shape, and the
+        // same cost, as `commit`'s one-shot group hash.
+        crate::par::par_for_each_mut_indexed(hashers, |leaf, hasher| {
+            let mut row_pair = Vec::with_capacity(2 * width);
+            source.append_row(m, 2 * leaf, &mut row_pair);
+            source.append_row(m, 2 * leaf + 1, &mut row_pair);
+            hasher.update(&row_pair);
+        });
+
+        self.next += 1;
+        self.remaining[log_height] -= 1;
+        if self.remaining[log_height] == 0 {
+            let hashers = self.pending[log_height]
+                .take()
+                .expect("the group was present a moment ago");
+            self.group_digests[log_height] =
+                Some(hashers.into_iter().map(IsLeafHasher::finalize).collect());
+        }
+    }
+
+    /// Finish the tree. Panics if a declared matrix never arrived — the digests
+    /// would silently commit to a leaf that absorbed less than it claims.
+    pub fn finish(self) -> MixedMmcs<E, H> {
+        assert_eq!(
+            self.next,
+            self.dims.len(),
+            "{} of {} declared matrices were absorbed",
+            self.next,
+            self.dims.len()
+        );
+        MixedMmcs::from_group_digests(self.dims, self.h_max, self.group_digests)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -588,7 +802,7 @@ mod tests {
     use math::field::element::FieldElement;
     use math::field::goldilocks::GoldilocksField;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     type FE = FieldElement<GoldilocksField>;
     type Mmcs<E> = MixedMmcs<E, DefaultStarkHash>;
@@ -1241,6 +1455,302 @@ mod tests {
         assert!(!Mmcs::verify_batch(&root, 1, &short_path, &[h], &[w]));
     }
 
+    /// Wraps a source and records, per matrix, the first and last global access
+    /// sequence number, plus a residency model the caller drives. `Mutex` /
+    /// atomics (not `Cell`) because both `commit` and the streaming builder read
+    /// the source from rayon workers.
+    struct Tracing<'a, E: IsField> {
+        inner: &'a OwnedMatrices<E>,
+        clock: AtomicUsize,
+        window: Mutex<Vec<(usize, usize)>>,
+        /// The residency model: which matrices the caller says it is holding.
+        resident: Vec<AtomicBool>,
+        live: AtomicUsize,
+        peak: AtomicUsize,
+        /// Rows served for a matrix the caller had already dropped. Any nonzero
+        /// count means the access pattern does not fit the residency policy.
+        reads_while_dropped: AtomicUsize,
+    }
+
+    impl<'a, E: IsField> Tracing<'a, E> {
+        fn new(inner: &'a OwnedMatrices<E>) -> Self {
+            let n = inner.num_matrices();
+            Self {
+                inner,
+                clock: AtomicUsize::new(0),
+                window: Mutex::new(vec![(usize::MAX, 0); n]),
+                resident: (0..n).map(|_| AtomicBool::new(false)).collect(),
+                live: AtomicUsize::new(0),
+                peak: AtomicUsize::new(0),
+                reads_while_dropped: AtomicUsize::new(0),
+            }
+        }
+
+        /// Declare every matrix held for the whole build — the only policy
+        /// `MixedMmcs::commit` can be served under.
+        fn materialize_all(&self) {
+            for m in 0..self.inner.num_matrices() {
+                self.materialize(m);
+            }
+        }
+
+        fn materialize(&self, m: usize) {
+            if !self.resident[m].swap(true, Ordering::SeqCst) {
+                let live = self.live.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak.fetch_max(live, Ordering::SeqCst);
+            }
+        }
+
+        fn drop_matrix(&self, m: usize) {
+            if self.resident[m].swap(false, Ordering::SeqCst) {
+                self.live.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+
+        fn windows(self) -> (Vec<(usize, usize)>, usize, usize) {
+            let peak = self.peak.load(Ordering::SeqCst);
+            let dropped_reads = self.reads_while_dropped.load(Ordering::SeqCst);
+            let windows = self.window.into_inner().expect("uncontended after commit");
+            (windows, peak, dropped_reads)
+        }
+    }
+
+    impl<E: IsField> LeafSource<E> for Tracing<'_, E> {
+        fn num_matrices(&self) -> usize {
+            self.inner.num_matrices()
+        }
+        fn log_height(&self, m: usize) -> usize {
+            self.inner.log_height(m)
+        }
+        fn width(&self, m: usize) -> usize {
+            self.inner.width(m)
+        }
+        fn append_row(&self, m: usize, bitrev_row: usize, out: &mut Vec<FieldElement<E>>) {
+            if !self.resident[m].load(Ordering::SeqCst) {
+                self.reads_while_dropped.fetch_add(1, Ordering::SeqCst);
+            }
+            let t = self.clock.fetch_add(1, Ordering::SeqCst);
+            let mut w = self.window.lock().expect("no test thread panics here");
+            w[m].0 = w[m].0.min(t);
+            w[m].1 = w[m].1.max(t);
+            drop(w);
+            self.inner.append_row(m, bitrev_row, out);
+        }
+    }
+
+    /// Heights {5, 5, 3, 2}: two matrices share the TALLEST height, so the base
+    /// group actually batches — which is the group the memory claim is about.
+    fn residency_fixture() -> ([(usize, usize, u64); 4], OwnedMatrices<GoldilocksField>) {
+        let specs = [(5usize, 2usize, 1u64), (5, 3, 2), (3, 1, 3), (2, 4, 4)];
+        let inner = owned(
+            specs
+                .iter()
+                .map(|&(lh, w, seed)| {
+                    (
+                        row_major_bit_reversed(&make_columns(w, 1 << lh, seed), 1 << lh),
+                        lh,
+                        w,
+                    )
+                })
+                .collect(),
+        );
+        (specs, inner)
+    }
+
+    /// The streaming builder is not a second implementation of the tree: it
+    /// finishes through the same climb `commit` does. This pins the consequence —
+    /// same root, same layers, same openings — so a future change that forked the
+    /// two would fail here rather than at a verifier three modules away.
+    #[test]
+    fn streaming_builder_commits_the_same_tree_as_commit() {
+        let (specs, inner) = residency_fixture();
+        let dims: Vec<(usize, usize)> = specs.iter().map(|&(lh, w, _)| (lh, w)).collect();
+
+        let mut builder = StreamingMmcsBuilder::<GoldilocksField, DefaultStarkHash>::new(&dims);
+        for m in 0..dims.len() {
+            builder.absorb(&inner, m);
+        }
+        let streamed = builder.finish();
+        let reference = Mmcs::commit(&inner);
+
+        assert_eq!(
+            streamed.root(),
+            reference.root(),
+            "the streamed root must equal the one-shot root"
+        );
+        assert_eq!(streamed.h_max(), reference.h_max());
+        assert_eq!(streamed.dims(), reference.dims());
+
+        let heights: Vec<usize> = specs.iter().map(|&(lh, _, _)| lh).collect();
+        let widths: Vec<usize> = specs.iter().map(|&(_, w, _)| w).collect();
+        for iota in 0..1usize << (streamed.h_max() - 1) {
+            let opening = streamed.open_batch(iota, &inner);
+            assert!(
+                Mmcs::verify_batch(&streamed.root(), iota, &opening, &heights, &widths),
+                "an opening of the streamed tree must verify at iota {iota}"
+            );
+            assert_eq!(
+                opening.proof.merkle_path,
+                reference.open_batch(iota, &inner).proof.merkle_path,
+                "the authentication path at iota {iota} must be the same path"
+            );
+        }
+    }
+
+    /// ★ The acceptance test for the batched commit's memory claim.
+    ///
+    /// `commit`'s contract is per height GROUP: it reads a group inside one
+    /// contiguous phase, so a caller may drop the group before the next. That is
+    /// not enough. Within the tallest group the leaf is one hash over every
+    /// matrix's concatenated row pair, so `commit` reads all of them at every
+    /// leaf — their access windows OVERLAP, and a caller has to hold the whole
+    /// group. On a real epoch the tallest group is most of the tables, so that is
+    /// `O(N)` resident at the base layer: the memory batching exists to remove,
+    /// given back.
+    ///
+    /// The streaming builder's windows are pairwise disjoint across ALL matrices,
+    /// same-height ones included, so the residency policy "materialize, absorb,
+    /// drop" serves it with exactly ONE matrix live. Both halves are traced here;
+    /// the second is the property the batched R1 / aux / parts commits must be
+    /// built on, and the first is what makes it a real difference rather than a
+    /// restatement.
+    #[test]
+    fn streaming_builder_serves_the_base_group_without_holding_it() {
+        let (specs, inner) = residency_fixture();
+        let dims: Vec<(usize, usize)> = specs.iter().map(|&(lh, w, _)| (lh, w)).collect();
+        let base_group: Vec<usize> = (0..specs.len()).filter(|&m| specs[m].0 == 5).collect();
+        assert!(
+            base_group.len() > 1,
+            "the fixture must batch more than one matrix at the tallest height"
+        );
+
+        // --- What `commit` requires: the whole group resident at once. ---
+        let tracing = Tracing::new(&inner);
+        tracing.materialize_all();
+        let commit_root = Mmcs::commit(&tracing).root();
+        let (commit_windows, commit_peak, commit_dropped_reads) = tracing.windows();
+        assert_eq!(commit_dropped_reads, 0, "the control held everything");
+        assert_eq!(
+            commit_peak,
+            specs.len(),
+            "serving `commit` needs every matrix resident"
+        );
+        for (i, &m) in base_group.iter().enumerate() {
+            for &n in &base_group[i + 1..] {
+                let (fm, lm) = commit_windows[m];
+                let (fn_, ln) = commit_windows[n];
+                assert!(
+                    fm <= ln && fn_ <= lm,
+                    "matrices {m} and {n} share the base height, so `commit` must \
+                     read them in OVERLAPPING windows [{fm},{lm}] / [{fn_},{ln}] — \
+                     if this ever stops holding, the escape below is no longer the \
+                     thing that buys the memory"
+                );
+            }
+        }
+
+        // --- What the streaming builder requires: one matrix at a time. ---
+        let tracing = Tracing::new(&inner);
+        let mut builder = StreamingMmcsBuilder::<GoldilocksField, DefaultStarkHash>::new(&dims);
+        for m in 0..dims.len() {
+            tracing.materialize(m);
+            builder.absorb(&tracing, m);
+            tracing.drop_matrix(m);
+        }
+        let streamed_root = builder.finish().root();
+        let (streamed_windows, streamed_peak, streamed_dropped_reads) = tracing.windows();
+
+        assert_eq!(
+            streamed_root, commit_root,
+            "the escape must not change what is committed"
+        );
+        assert_eq!(
+            streamed_dropped_reads, 0,
+            "no row may be read after the caller dropped its matrix"
+        );
+        assert_eq!(
+            streamed_peak,
+            1,
+            "the base height group must be served with ONE matrix resident, not \
+             {} — this is the batched commit's whole memory claim",
+            specs.len()
+        );
+        for (m, &(first, last)) in streamed_windows.iter().enumerate() {
+            assert!(first <= last, "matrix {m} was never read");
+            for (n, &(fn_, ln)) in streamed_windows.iter().enumerate().skip(m + 1) {
+                assert!(
+                    last < fn_ || ln < first,
+                    "matrices {m} and {n} were read in overlapping windows \
+                     [{first},{last}] / [{fn_},{ln}] — the builder must finish one \
+                     matrix before the next is needed, at EVERY height"
+                );
+            }
+        }
+    }
+
+    /// A declared matrix that never arrives would leave its group's leaves having
+    /// absorbed less than the shape says, committing a tree no verifier rebuilds.
+    /// The builder refuses rather than producing it.
+    #[test]
+    #[should_panic(expected = "of 4 declared matrices were absorbed")]
+    fn finishing_with_a_matrix_missing_panics() {
+        let (specs, inner) = residency_fixture();
+        let dims: Vec<(usize, usize)> = specs.iter().map(|&(lh, w, _)| (lh, w)).collect();
+        let mut builder = StreamingMmcsBuilder::<GoldilocksField, DefaultStarkHash>::new(&dims);
+        for m in 0..dims.len() - 1 {
+            builder.absorb(&inner, m);
+        }
+        builder.finish();
+    }
+
+    /// The incremental leaf hasher's whole contract: where the updates fall must
+    /// not show. Checked at every split point of a leaf, and for the extension
+    /// field the aux and composition matrices actually use — a framing bug that
+    /// only appeared at an element boundary would slip past a base-field check.
+    #[test]
+    fn leaf_hasher_splits_anywhere_and_matches_hash_data() {
+        use crypto::merkle_tree::traits::IsLeafHasher;
+        use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Fp3;
+
+        fn check<E: IsField + 'static>(leaf: Vec<FieldElement<E>>)
+        where
+            FieldElement<E>: AsBytes + Sync + Send,
+        {
+            let expected =
+                <<DefaultStarkHash as StarkHash>::Batched<E> as IsMerkleTreeBackend>::hash_data(
+                    &leaf,
+                );
+            for split in 0..=leaf.len() {
+                let mut hasher =
+                    <<DefaultStarkHash as StarkHash>::Batched<E> as IsStreamingLeafBackend<E>>::leaf_hasher();
+                hasher.update(&leaf[..split]);
+                hasher.update(&leaf[split..]);
+                assert_eq!(
+                    hasher.finalize(),
+                    expected,
+                    "splitting the leaf at {split} changed the digest"
+                );
+            }
+            // Three updates, so an implementation that only ever saw two would not
+            // pass by accident.
+            let mut hasher =
+                <<DefaultStarkHash as StarkHash>::Batched<E> as IsStreamingLeafBackend<E>>::leaf_hasher();
+            for element in &leaf {
+                hasher.update(core::slice::from_ref(element));
+            }
+            assert_eq!(hasher.finalize(), expected, "element-at-a-time must agree");
+        }
+
+        check::<GoldilocksField>((1u64..=9).map(FE::from).collect());
+        check::<Fp3>(
+            (1u64..=9)
+                .map(|i| {
+                    FieldElement::<Fp3>::new([FE::from(i), FE::from(i * 7 + 1), FE::from(i * 13)])
+                })
+                .collect(),
+        );
+    }
+
     /// The memory contract from the module's "what the caller may drop" section,
     /// made falsifiable: `commit` reads each height group's rows inside ONE
     /// contiguous window of the build, and the windows run in descending height
@@ -1248,35 +1758,6 @@ mod tests {
     /// a group after moving on, would fail here.
     #[test]
     fn commit_reads_each_height_group_in_one_contiguous_phase() {
-        /// Wraps a source and records, per matrix, the first and last global
-        /// access sequence number. `Mutex` (not `Cell`) because `commit` reads the
-        /// source from rayon workers.
-        struct Tracing<'a, E: IsField> {
-            inner: &'a OwnedMatrices<E>,
-            clock: AtomicUsize,
-            window: Mutex<Vec<(usize, usize)>>,
-        }
-
-        impl<E: IsField> LeafSource<E> for Tracing<'_, E> {
-            fn num_matrices(&self) -> usize {
-                self.inner.num_matrices()
-            }
-            fn log_height(&self, m: usize) -> usize {
-                self.inner.log_height(m)
-            }
-            fn width(&self, m: usize) -> usize {
-                self.inner.width(m)
-            }
-            fn append_row(&self, m: usize, bitrev_row: usize, out: &mut Vec<FieldElement<E>>) {
-                let t = self.clock.fetch_add(1, Ordering::SeqCst);
-                let mut w = self.window.lock().expect("no test thread panics here");
-                w[m].0 = w[m].0.min(t);
-                w[m].1 = w[m].1.max(t);
-                drop(w);
-                self.inner.append_row(m, bitrev_row, out);
-            }
-        }
-
         // Heights {5, 5, 3, 2}: two groups sharing the base layer, two injected.
         let specs = [(5usize, 2usize, 1u64), (5, 3, 2), (3, 1, 3), (2, 4, 4)];
         let inner = owned(
@@ -1291,11 +1772,8 @@ mod tests {
                 })
                 .collect(),
         );
-        let tracing = Tracing {
-            inner: &inner,
-            clock: AtomicUsize::new(0),
-            window: Mutex::new(vec![(usize::MAX, 0); specs.len()]),
-        };
+        let tracing = Tracing::new(&inner);
+        tracing.materialize_all();
 
         let traced_root = Mmcs::commit(&tracing).root();
         assert_eq!(
@@ -1304,10 +1782,7 @@ mod tests {
             "tracing must not change what is committed"
         );
 
-        let windows = tracing
-            .window
-            .into_inner()
-            .expect("uncontended after commit");
+        let (windows, _peak, _dropped) = tracing.windows();
         for (m, (first, last)) in windows.iter().enumerate() {
             assert!(*first <= *last, "matrix {m} was never read");
         }

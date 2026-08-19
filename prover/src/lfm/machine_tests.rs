@@ -131,6 +131,14 @@ fn registry_drift_trivial_v0_blowup2() {
     );
     assert_eq!(entry.hasher, artifacts.hasher, "hasher drifted");
     assert_eq!(entry.program_id, artifacts.program_id, "program_id drifted");
+    assert_eq!(
+        entry.prep_root, artifacts.prep_root,
+        "batched preprocessed-round root drifted"
+    );
+    assert_eq!(
+        entry.prep_widths, artifacts.prep_widths,
+        "batched preprocessed-round widths drifted"
+    );
 }
 
 #[test]
@@ -243,6 +251,14 @@ fn registry_drift_fri_toy_v0_blowup2() {
     );
     assert_eq!(entry.hasher, artifacts.hasher, "hasher drifted");
     assert_eq!(entry.program_id, artifacts.program_id, "program_id drifted");
+    assert_eq!(
+        entry.prep_root, artifacts.prep_root,
+        "batched preprocessed-round root drifted"
+    );
+    assert_eq!(
+        entry.prep_widths, artifacts.prep_widths,
+        "batched preprocessed-round widths drifted"
+    );
 }
 
 /// The kill-risk-3 instrument on the first real verification program.
@@ -539,6 +555,14 @@ fn registry_drift_keccak_chain_v0_blowup2() {
     );
     assert_eq!(entry.hasher, artifacts.hasher, "hasher drifted");
     assert_eq!(entry.program_id, artifacts.program_id, "program_id drifted");
+    assert_eq!(
+        entry.prep_root, artifacts.prep_root,
+        "batched preprocessed-round root drifted"
+    );
+    assert_eq!(
+        entry.prep_widths, artifacts.prep_widths,
+        "batched preprocessed-round widths drifted"
+    );
 }
 
 /// The kill-risk-3 instrument with the keccak family in the set.
@@ -785,6 +809,14 @@ fn registry_drift_keccak_sponge_v0_blowup2() {
     );
     assert_eq!(entry.hasher, artifacts.hasher, "hasher drifted");
     assert_eq!(entry.program_id, artifacts.program_id, "program_id drifted");
+    assert_eq!(
+        entry.prep_root, artifacts.prep_root,
+        "batched preprocessed-round root drifted"
+    );
+    assert_eq!(
+        entry.prep_widths, artifacts.prep_widths,
+        "batched preprocessed-round widths drifted"
+    );
 }
 
 #[test]
@@ -1453,6 +1485,14 @@ fn registry_drift_transcript_replay_v0_blowup2() {
     );
     assert_eq!(entry.hasher, artifacts.hasher, "hasher drifted");
     assert_eq!(entry.program_id, artifacts.program_id, "program_id drifted");
+    assert_eq!(
+        entry.prep_root, artifacts.prep_root,
+        "batched preprocessed-round root drifted"
+    );
+    assert_eq!(
+        entry.prep_widths, artifacts.prep_widths,
+        "batched preprocessed-round widths drifted"
+    );
 }
 
 /// Pins the emitted SHAPE, which the value tests would only catch indirectly:
@@ -2336,6 +2376,14 @@ fn registry_drift_statement_replay_v0_blowup2() {
     );
     assert_eq!(entry.hasher, artifacts.hasher, "hasher drifted");
     assert_eq!(entry.program_id, artifacts.program_id, "program_id drifted");
+    assert_eq!(
+        entry.prep_root, artifacts.prep_root,
+        "batched preprocessed-round root drifted"
+    );
+    assert_eq!(
+        entry.prep_widths, artifacts.prep_widths,
+        "batched preprocessed-round widths drifted"
+    );
 }
 
 #[test]
@@ -4848,4 +4896,433 @@ fn every_registry_mask_is_the_programs_own_usage() {
              could resolve one mask and build another"
         );
     }
+}
+
+// ===========================================================================
+// The batched preprocessed round (M-6)
+// ===========================================================================
+
+/// The round's membership is a scope decision, so it is pinned rather than left
+/// to be inferred from whichever slots happened to have columns. Widening it —
+/// to cover `KECCAK_RC` and `BITWISE` — is a real option with a real cost (every
+/// `build_artifacts` call would expand `bitwise`'s 2^20 x 11 table instead of
+/// reading a pinned constant), and this test is what makes taking it deliberate.
+#[test]
+fn the_prep_round_covers_exactly_the_program_groups() {
+    use crate::lfm::airs::{KECCAK_RND_SLOT, NUM_LFM_CHIPS};
+    use crate::lfm::registry::PREP_ROUND_SLOTS;
+
+    let artifacts = build_artifacts(&trivial_program(), &options());
+
+    assert_eq!(
+        PREP_ROUND_SLOTS,
+        0..12,
+        "the round covers the twelve program-dependent groups"
+    );
+    assert!(
+        !PREP_ROUND_SLOTS.contains(&KECCAK_RND_SLOT),
+        "KECCAK_RND has no preprocessed columns, so it has no leaf in the round"
+    );
+
+    // Membership is read from PREP_ROUND_SLOTS and NOWHERE ELSE. An earlier
+    // draft asserted `inside == (width > 0)` and described a zero width as "how
+    // a verifier reads 'not in this round'". That is a SECOND, independent
+    // derivation of a fact the slot list already states, and it is the failure
+    // shape MMCS-PLAN §3.3 warns about: if the two ever disagreed — a genuinely
+    // zero-width group, or a non-member slot carrying a width — a prover and a
+    // verifier would both derive the same wrong round and honest proofs would
+    // keep verifying with nothing failing.
+    //
+    // The widths are still checked, but as an ENCODING property (members are
+    // non-empty, non-members carry nothing), never as the definition.
+    for slot in PREP_ROUND_SLOTS {
+        assert!(
+            artifacts.prep_widths[slot] > 0,
+            "slot {slot} is in the round, so it must contribute a non-empty matrix"
+        );
+    }
+    for slot in (0..NUM_LFM_CHIPS).filter(|s| !PREP_ROUND_SLOTS.contains(s)) {
+        assert_eq!(
+            artifacts.prep_widths[slot], 0,
+            "slot {slot} is outside the round, so the entry carries no width for it — \
+             an encoding check, NOT the definition of membership"
+        );
+    }
+    assert_ne!(
+        artifacts.prep_root, [0u8; 32],
+        "the round must actually commit something"
+    );
+}
+
+/// ★ The property that makes `prep_root` a commitment to the SAME evaluations
+/// the per-slot roots commit to, rather than to an independently built copy.
+///
+/// A mixed-height MMCS over ONE matrix is the per-table row-pair tree, by
+/// construction and not by coincidence — both finish through the same leaf hash
+/// and the same climb. Checking it here pins that the registry's two commitment
+/// paths share a leaf encoding; if they ever stopped, `prep_root` would be
+/// binding a different parse of the same columns and nothing else would say so.
+#[test]
+fn a_single_slot_prep_round_equals_that_slots_own_root() {
+    use crate::lfm::commit::{PrepRoundBuilder, commit_lde_columns, group_columns, lde_columns};
+
+    let opts = options();
+    let program = trivial_program();
+    let lde = lde_columns(&group_columns(&program.groups.const_), &opts);
+    let log_height = lde[0].len().trailing_zeros() as usize;
+
+    let mut round = PrepRoundBuilder::new(&[(log_height, lde.len())]);
+    round.absorb(&lde);
+
+    assert_eq!(
+        round.finish(),
+        commit_lde_columns(&lde),
+        "a one-matrix batched round must equal the per-slot row-pair tree"
+    );
+}
+
+/// Falsification: the round must be sensitive to the data it covers. A root
+/// that never moved would satisfy every equality test above while binding
+/// nothing.
+#[test]
+fn a_changed_group_moves_the_prep_root() {
+    use crate::lfm::commit::{PrepRoundBuilder, group_columns, lde_columns};
+
+    let opts = options();
+    let program = trivial_program();
+    let mut columns = group_columns(&program.groups.const_);
+
+    let lde = lde_columns(&columns, &opts);
+    let log_height = lde[0].len().trailing_zeros() as usize;
+    let dims = [(log_height, lde.len())];
+    let mut round = PrepRoundBuilder::new(&dims);
+    round.absorb(&lde);
+    let honest = round.finish();
+
+    columns[0][0] += crate::tables::types::FE::one();
+    let tampered_lde = lde_columns(&columns, &opts);
+    let mut round = PrepRoundBuilder::new(&dims);
+    round.absorb(&tampered_lde);
+
+    assert_ne!(
+        round.finish(),
+        honest,
+        "a changed preprocessed value must move the batched round's root"
+    );
+}
+
+/// ★ The slot-to-table map is NOT the identity, and the registry cannot show
+/// that on its own.
+///
+/// Every registered program has `keccak_rnd_chunks == 1`, which makes slot and
+/// table indices coincide for all fifteen slots. A map hard-coded to the
+/// identity would therefore pass every registry-derived test in this file. This
+/// drives it at a chunk count above one, which is the only place the shift is
+/// observable.
+#[test]
+fn the_slot_to_table_map_is_not_the_identity_beyond_one_chunk() {
+    use crate::lfm::airs::{ChipSet, KECCAK_RND_SLOT};
+    use crate::lfm::registry::slot_of_table;
+
+    // The FULL set: this test drives the chunking axis alone; the chip-mask
+    // axis (absent families leaving holes) is driven by the masked epoch in
+    // `a_batched_lfm_epoch_is_refused_for_the_round_coverage_gap`.
+    const FULL: ChipSet = ChipSet::FULL;
+
+    // One chunk: the degenerate case the whole registry lives in.
+    assert_eq!(slot_of_table(12, 1, FULL), Some(KECCAK_RND_SLOT));
+    assert_eq!(slot_of_table(13, 1, FULL), Some(13));
+    assert_eq!(slot_of_table(14, 1, FULL), Some(14));
+    assert_eq!(slot_of_table(15, 1, FULL), None, "past the end of the set");
+
+    // Three chunks: KECCAK_RC moves from table 13 to table 15. An identity map
+    // would answer 13 here and be wrong by exactly the off-by-one this exists
+    // to catch.
+    for table in 12..15 {
+        assert_eq!(
+            slot_of_table(table, 3, FULL),
+            Some(KECCAK_RND_SLOT),
+            "table {table} is a KECCAK_RND copy at three chunks"
+        );
+    }
+    assert_eq!(
+        slot_of_table(15, 3, FULL),
+        Some(13),
+        "KECCAK_RC shifted by chunks"
+    );
+    assert_eq!(
+        slot_of_table(16, 3, FULL),
+        Some(14),
+        "BITWISE shifted by chunks"
+    );
+    assert_ne!(
+        slot_of_table(13, 3, FULL),
+        Some(13),
+        "the map must not be the identity once more than one chunk exists"
+    );
+}
+
+/// ★ The compaction refuses the real LFM epoch, loudly, because the round is
+/// partial.
+///
+/// `KECCAK_RC` and `BITWISE` are preprocessed AIRs, so an LFM epoch's prep round
+/// has fourteen contributing matrices while `PREP_ROUND_SLOTS` covers twelve.
+/// Returning a twelve-entry slice for a fourteen-matrix round would describe a
+/// different round than `prep_root` commits — so the answer must be `None`, and
+/// the honest-path arm below shows `None` is discrimination and not a stub.
+#[test]
+fn the_width_compaction_rejects_a_round_it_does_not_cover() {
+    use crate::lfm::airs::ChipSet;
+    use crate::lfm::registry::{PREP_ROUND_SLOTS, pinned_prep_widths};
+    use stark::batched::shape::RoundShape;
+
+    let artifacts = build_artifacts(&trivial_program(), &options());
+
+    // The shape a FULL-set LFM epoch has: the twelve groups plus KECCAK_RC and
+    // BITWISE, at one KECCAK_RND chunk.
+    let real = RoundShape {
+        tables: (0..12).chain([13, 14]).collect(),
+        dims: (0..14).map(|_| (4usize, 1usize)).collect(),
+    };
+    assert_eq!(
+        pinned_prep_widths(&real, &artifacts.prep_widths, 1, ChipSet::FULL),
+        None,
+        "the round does not cover KECCAK_RC/BITWISE, so it must refuse rather than \
+         hand back a slice describing a different round"
+    );
+
+    // Honest-path control: restricted to the slots the round DOES cover, the
+    // compaction succeeds and reproduces the entry's widths in table order.
+    let covered = RoundShape {
+        tables: PREP_ROUND_SLOTS.collect(),
+        dims: PREP_ROUND_SLOTS.map(|_| (4usize, 1usize)).collect(),
+    };
+    let expected: Vec<usize> = PREP_ROUND_SLOTS
+        .map(|s| artifacts.prep_widths[s] as usize)
+        .collect();
+    assert_eq!(
+        pinned_prep_widths(&covered, &artifacts.prep_widths, 1, ChipSet::FULL),
+        Some(expected),
+        "honest-path control: a round inside PREP_ROUND_SLOTS must compact cleanly"
+    );
+}
+
+/// The compaction indexes `tables`, so reordering the round reorders the slice.
+/// A filter-the-zeros implementation would return ascending slot order whatever
+/// `tables` said, and would pass every other test in this file.
+#[test]
+fn the_width_compaction_follows_table_order_not_slot_order() {
+    use crate::lfm::registry::pinned_prep_widths;
+    use stark::batched::shape::RoundShape;
+
+    let artifacts = build_artifacts(&trivial_program(), &options());
+
+    let forward: Vec<usize> = (0..4).collect();
+    let reversed: Vec<usize> = (0..4).rev().collect();
+    let dims: Vec<(usize, usize)> = (0..4).map(|_| (4usize, 1usize)).collect();
+
+    let a = pinned_prep_widths(
+        &RoundShape {
+            tables: forward,
+            dims: dims.clone(),
+        },
+        &artifacts.prep_widths,
+        1,
+        crate::lfm::airs::ChipSet::FULL,
+    )
+    .expect("slots 0..4 are covered");
+    let b = pinned_prep_widths(
+        &RoundShape {
+            tables: reversed,
+            dims,
+        },
+        &artifacts.prep_widths,
+        1,
+        crate::lfm::airs::ChipSet::FULL,
+    )
+    .expect("slots 0..4 are covered");
+
+    let mut a_rev = a.clone();
+    a_rev.reverse();
+    assert_eq!(b, a_rev, "the slice must follow `tables` order");
+    assert_ne!(
+        a, b,
+        "the fixture's first four slots must have distinct widths, or this test \
+         cannot tell the two orders apart"
+    );
+}
+
+/// ★ M-7 end to end: a batched LFM epoch PROVES, and is then REFUSED, and the
+/// refusal is the round-coverage gap rather than anything else.
+///
+/// Splitting cause from symptom is the whole point. `verify_against_batched`
+/// returning `false` is compatible with a dozen unrelated bugs, so the cause is
+/// asserted independently: the epoch's preprocessed round contains matrices
+/// `PREP_ROUND_SLOTS` does not cover, so `pinned_prep_widths` refuses, and
+/// `multi_verify_batched` fails closed rather than trusting the proof's own root.
+///
+/// When the round is widened (M-8's prerequisite), THIS test is the one that
+/// must flip — and it should be flipped deliberately, not deleted.
+#[test]
+fn a_batched_lfm_epoch_is_refused_for_the_round_coverage_gap() {
+    use crate::lfm::airs::LfmAirs;
+    use crate::lfm::proof::{lfm_prove_batched, verify_against_batched};
+    use crate::lfm::registry::{PREP_ROUND_SLOTS, slot_of_table};
+    use stark::batched::shape::EpochShape;
+
+    let opts = options();
+    let program = trivial_program();
+    let artifacts = build_artifacts(&program, &opts);
+
+    // It PROVES. The prover's disposition of an unpinned round is permissive,
+    // which is what makes the verifier's refusal below a statement about the
+    // verifier and not about a prove that never happened.
+    let proved = lfm_prove_batched(&program, &artifacts, &arenas(), &opts, None)
+        .expect("a batched LFM epoch must prove");
+
+    // THE CAUSE: the epoch's prep round reaches past the round's slots.
+    let airs = LfmAirs::new_with_hasher(
+        &artifacts.roots,
+        &opts,
+        artifacts.keccak_rnd_chunks,
+        artifacts.hasher,
+        artifacts.chip_set,
+    );
+    let refs = airs.air_refs();
+    let lengths: Vec<usize> = proved.proof.tables.iter().map(|t| t.trace_length).collect();
+    let (shape, _) = EpochShape::derive(&refs, &lengths).expect("a well-shaped epoch");
+
+    // With the chip masks in, TrivialV0's epoch carries neither hash family, so
+    // its round is ten groups plus BITWISE — FEWER matrices than the round's
+    // twelve slots, and a bare count comparison can no longer state the gap.
+    // What holds for every program is the membership form: the round contains
+    // at least one matrix (BITWISE always; KECCAK_RC when the keccak family is
+    // present) whose slot is outside PREP_ROUND_SLOTS.
+    let outside = shape
+        .prep
+        .tables
+        .iter()
+        .filter(|&&t| {
+            slot_of_table(t, artifacts.keccak_rnd_chunks, artifacts.chip_set)
+                .is_none_or(|s| !PREP_ROUND_SLOTS.contains(&s))
+        })
+        .count();
+    assert!(
+        outside > 0,
+        "the epoch's preprocessed round must contain a matrix outside the round's \
+         slots — BITWISE is a preprocessed AIR the round does not cover; if this \
+         ever stops holding, the round was widened and this whole test should flip"
+    );
+    assert_eq!(
+        artifacts.pinned_prep_widths(&shape.prep),
+        None,
+        "so the compaction must refuse"
+    );
+
+    // THE SYMPTOM.
+    assert!(
+        !verify_against_batched(&artifacts, &proved.proof, &proved.public_words, &opts),
+        "and the verifier must fail closed rather than trust the proof's own \
+         preprocessed root"
+    );
+}
+
+/// The shape a batched verifier reads back must be the shape the round was
+/// built with. Two derivations of the same thing are how the LDE-vs-trace
+/// height distinction gets lost: `prep_round_dims` is one function with two
+/// callers precisely so this can be asserted rather than hoped for.
+#[test]
+fn the_prep_round_shape_matches_what_was_committed() {
+    use crate::lfm::commit::PrepRoundBuilder;
+    use crate::lfm::commit::{group_columns, lde_columns};
+    use crate::lfm::registry::PREP_ROUND_SLOTS;
+
+    let opts = options();
+    let program = trivial_program();
+    let artifacts = build_artifacts(&program, &opts);
+    let (heights, widths) = artifacts.prep_round_shape(opts.blowup_factor);
+
+    assert_eq!(heights.len(), widths.len());
+    assert_eq!(
+        heights.len(),
+        PREP_ROUND_SLOTS.len(),
+        "every program group participates in this fixture"
+    );
+
+    // Heights are LDE heights, not trace heights — the distinction this shape
+    // exists to get right.
+    let blowup_log = (opts.blowup_factor as usize).trailing_zeros() as usize;
+    for (i, slot) in PREP_ROUND_SLOTS.enumerate() {
+        assert_eq!(
+            heights[i],
+            artifacts.log_heights[slot] as usize + blowup_log,
+            "slot {slot}: the round's height must be the LDE height"
+        );
+    }
+
+    // And rebuilding the round from that shape reproduces the pinned root.
+    let groups = [
+        &program.groups.const_,
+        &program.groups.balu,
+        &program.groups.xalu,
+        &program.groups.select,
+        &program.groups.bitdec,
+        &program.groups.hash,
+        &program.groups.keccak,
+        &program.groups.lanes,
+        &program.groups.hint,
+        &program.groups.public,
+        &crate::lfm::trace::range_group(),
+        &program.groups.blake3,
+    ];
+    let dims: Vec<(usize, usize)> = heights
+        .iter()
+        .copied()
+        .zip(widths.iter().copied())
+        .collect();
+    let mut round = PrepRoundBuilder::new(&dims);
+    for g in groups.iter() {
+        round.absorb(&lde_columns(&group_columns(g), &opts));
+    }
+    assert_eq!(
+        round.finish(),
+        artifacts.prep_root,
+        "the shape a verifier reads back must rebuild the pinned root"
+    );
+}
+
+/// M-7's entry point must agree with the seven-argument form it delegates to —
+/// on an honest proof, and on a tampered digest. Without the negative this
+/// would pass for a function that returned `true` unconditionally.
+#[test]
+fn verify_against_artifacts_agrees_with_the_registry_path() {
+    use crate::lfm::verify_against_artifacts;
+
+    let opts = options();
+    let program = trivial_program();
+    let artifacts = build_artifacts(&program, &opts);
+    let proved =
+        lfm_prove(&program, &artifacts, &arenas(), &opts).expect("the trivial program must prove");
+
+    assert!(
+        verify_against_artifacts(&artifacts, &proved.proof, &proved.public_words, &opts),
+        "honest-path control: artifacts built from the program must verify its proof"
+    );
+    assert!(
+        lfm_verify(
+            LfmProgramKind::TrivialV0,
+            &proved.proof,
+            &proved.public_words,
+            &opts
+        )
+        .expect("TrivialV0@2 is registered"),
+        "and the registry path must agree"
+    );
+
+    let mut wrong = artifacts;
+    wrong.program_id[0] ^= 0xff;
+    assert!(
+        !verify_against_artifacts(&wrong, &proved.proof, &proved.public_words, &opts),
+        "a program digest the proof was not bound to must be rejected"
+    );
 }

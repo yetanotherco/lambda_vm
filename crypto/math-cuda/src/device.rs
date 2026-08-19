@@ -202,6 +202,14 @@ pub struct Backend {
     pub keccak_merkle_level: CudaFunction,
     pub keccak_merkle_tail: CudaFunction,
     pub merkle_gather_paths: CudaFunction,
+    // Mixed-height MMCS (batched commitments). The per-leaf sponge is kept in
+    // device memory and matrices are absorbed into it one at a time, so a height
+    // group never needs all its LDEs resident — see `kernels/keccak.cu`.
+    pub mmcs_states_init: CudaFunction,
+    pub mmcs_absorb_row_pair_row_major: CudaFunction,
+    pub mmcs_absorb_row_pair_ext3_slabs: CudaFunction,
+    pub mmcs_states_finalize: CudaFunction,
+    pub keccak_mmcs_level: CudaFunction,
 
     // blake3.cubin — the leaf kernels, the Merkle level/tail compressors, and
     // the parity-harness probes that are the only host-visible handle on the
@@ -460,6 +468,13 @@ impl Backend {
             keccak_merkle_level: keccak.load_function("keccak_merkle_level")?,
             keccak_merkle_tail: keccak.load_function("keccak_merkle_tail")?,
             merkle_gather_paths: keccak.load_function("merkle_gather_paths")?,
+            mmcs_states_init: keccak.load_function("mmcs_states_init")?,
+            mmcs_absorb_row_pair_row_major: keccak
+                .load_function("mmcs_absorb_row_pair_row_major")?,
+            mmcs_absorb_row_pair_ext3_slabs: keccak
+                .load_function("mmcs_absorb_row_pair_ext3_slabs")?,
+            mmcs_states_finalize: keccak.load_function("mmcs_states_finalize")?,
+            keccak_mmcs_level: keccak.load_function("keccak_mmcs_level")?,
             blake3_leaves_base_row_major_row_pair: blake3
                 .load_function("blake3_leaves_base_row_major_row_pair")?,
             blake3_leaves_base_row_major_row_pair_range: blake3

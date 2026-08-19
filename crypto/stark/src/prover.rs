@@ -565,7 +565,10 @@ fn domain_twiddle_cache() -> &'static std::sync::Mutex<
     CACHE.get_or_init(Default::default)
 }
 
-fn domain_and_twiddles<F, A>(air: &A, trace_length: usize) -> (Arc<Domain<F>>, Arc<LdeTwiddles<F>>)
+pub(crate) fn domain_and_twiddles<F, A>(
+    air: &A,
+    trace_length: usize,
+) -> (Arc<Domain<F>>, Arc<LdeTwiddles<F>>)
 where
     F: IsFFTField + 'static,
     FieldElement<F>: Send + Sync,
@@ -837,12 +840,33 @@ where
     pub(crate) gpu_composition_tree: Option<math_cuda::lde::GpuMerkleTree>,
 }
 
+/// The composition-polynomial parts, before any commitment is taken over them.
+///
+/// Returned by [`IsStarkProver::compute_composition_parts`], which round 2 and
+/// the batched prover share. The device handle rides along rather than being
+/// installed on the `Round1` inside, because the two callers install it at
+/// different points: round 2 folds it into the table's own LDE session, the
+/// batched prover keeps every table's parts alive only until they have been
+/// absorbed into the epoch's MMCS.
+pub(crate) struct CompositionParts<F: IsField + 'static>
+where
+    FieldElement<F>: AsBytes + Sync + Send,
+{
+    pub(crate) parts: Vec<Vec<FieldElement<F>>>,
+    #[cfg(feature = "cuda")]
+    pub(crate) gpu_parts: Option<math_cuda::lde::GpuLdeExt3>,
+    #[cfg(feature = "instruments")]
+    pub(crate) constraints_dur: Duration,
+    #[cfg(feature = "instruments")]
+    pub(crate) fft_dur: Duration,
+}
+
 /// A container for the results of the third round of the STARK Prove protocol.
 pub(crate) struct Round3<F: IsField> {
     /// Evaluations of the trace polynomials, main and auxiliary, at the out-of-domain challenge.
-    trace_ood_evaluations: Table<F>,
+    pub(crate) trace_ood_evaluations: Table<F>,
     /// Evaluations of the composition polynomial parts at the out-of-domain challenge.
-    composition_poly_parts_ood_evaluation: Vec<FieldElement<F>>,
+    pub(crate) composition_poly_parts_ood_evaluation: Vec<FieldElement<F>>,
 }
 
 /// A container for the results of the fourth round of the STARK Prove protocol.
@@ -1449,6 +1473,43 @@ pub trait IsStarkProver<
         (main_data, total_cols)
     }
 
+    /// Expand a table's auxiliary trace to its coset LDE, row-major, without
+    /// building any Merkle tree — the aux counterpart of
+    /// [`Self::expand_main_lde_row_major`], and extracted for the same reason:
+    /// the batched prover rebuilds this buffer once per phase instead of
+    /// retaining it, and a second expansion written elsewhere would be a second
+    /// encoding of the committed one.
+    fn expand_aux_lde_row_major(
+        trace: &TraceTable<Field, FieldExtension>,
+        domain: &Domain<Field>,
+        twiddles: &LdeTwiddles<Field>,
+        #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
+    ) -> (Vec<FieldElement<FieldExtension>>, usize) {
+        let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
+        let (trace_data, total_cols) = trace.aux_data_row_major();
+
+        let mut aux_data: Vec<FieldElement<FieldExtension>> =
+            Vec::with_capacity(lde_size * total_cols);
+        aux_data.extend_from_slice(trace_data);
+
+        #[cfg(feature = "disk-spill")]
+        if storage_mode == StorageMode::Disk {
+            trace.aux_table.advise_drop_cache();
+        }
+
+        Polynomial::<FieldElement<FieldExtension>>::coset_lde_full_expand_row_major::<Field>(
+            &mut aux_data,
+            total_cols,
+            domain.blowup_factor,
+            &twiddles.coset_weights,
+            &twiddles.two_half_inv,
+            &twiddles.two_half_fwd,
+        )
+        .expect("row-major aux coset LDE expansion");
+
+        (aux_data, total_cols)
+    }
+
     /// Spill a committed Merkle tree to disk when `storage_mode` is `Disk`,
     /// tagging any I/O error with `label`. No-op otherwise. Shared by every commit
     /// site (main / preprocessed split / aux).
@@ -1688,16 +1749,31 @@ pub trait IsStarkProver<
         .expect("coset extension")
     }
 
-    /// Returns the result of the second round of the STARK Prove protocol.
-    fn round_2_compute_composition_polynomial(
+    /// The evaluations of the composition-polynomial parts over the LDE domain,
+    /// and nothing else — no commitment.
+    ///
+    /// This is the half of round 2 that the batched path shares with the
+    /// per-table one. Round 2 commits each table's parts to its own Merkle tree;
+    /// [`crate::batched::prover::multi_prove_batched`] streams every table's
+    /// parts into one mixed-height MMCS instead. Both need the same parts, and
+    /// the arm selection (`number_of_parts` 1 / 2 / d>2, the device paths and
+    /// their fallbacks) is intricate enough that a second copy would drift — so
+    /// there is one function, and the commitment is what differs.
+    #[allow(clippy::too_many_arguments)]
+    fn compute_composition_parts(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         pub_inputs: &PI,
         domain: &Domain<Field>,
         twiddles: &LdeTwiddles<Field>,
-        round_1_result: &mut Round1<Field, FieldExtension, H>,
+        // `&mut` for the device-only recovery below: when the host evaluator is
+        // reached on a device-resident trace, the LDEs are downloaded back into
+        // the host buffers in place rather than aborting the table.
+        lde_trace: &mut LDETraceTable<Field, FieldExtension>,
+        rap_challenges: &[FieldElement<FieldExtension>],
+        bus_public_inputs: Option<&BusPublicInputs<FieldExtension>>,
         transition_coefficients: &[FieldElement<FieldExtension>],
         boundary_coefficients: &[FieldElement<FieldExtension>],
-    ) -> Result<Round2<FieldExtension, H>, ProvingError>
+    ) -> Result<CompositionParts<FieldExtension>, ProvingError>
     where
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
@@ -1707,8 +1783,8 @@ pub trait IsStarkProver<
         let evaluator = ConstraintEvaluator::new(
             air,
             pub_inputs,
-            &round_1_result.rap_challenges,
-            round_1_result.bus_public_inputs.as_ref(),
+            rap_challenges,
+            bus_public_inputs,
             trace_length,
         );
         let number_of_parts = air.composition_poly_degree_bound(trace_length) / trace_length;
@@ -1745,17 +1821,17 @@ pub trait IsStarkProver<
             let _r2_serial_guard = crate::gpu_lde::r2_serialize_guard();
             if let Some(h_dev) = evaluator.evaluate_dev(
                 air,
-                &round_1_result.lde_trace,
+                lde_trace,
                 domain,
                 transition_coefficients,
                 boundary_coefficients,
-                &round_1_result.rap_challenges,
+                rap_challenges,
             ) {
                 match crate::gpu_lde::try_decompose_extend_d2_dev::<Field, FieldExtension>(
                     &h_dev,
                     twiddles.inv_2x(domain),
                     &twiddles.composition(domain).weights,
-                    !round_1_result.lde_trace.host_trace_empty(),
+                    !lde_trace.host_trace_empty(),
                 ) {
                     Some((parts, handle)) => {
                         gpu_composition_parts = Some(handle);
@@ -1792,9 +1868,8 @@ pub trait IsStarkProver<
         // message rather than a bare index-out-of-bounds from somewhere inside
         // the evaluator.
         #[cfg(feature = "cuda")]
-        if precomputed_parts.is_none() && round_1_result.lde_trace.host_trace_empty() {
-            let recovered =
-                crate::gpu_lde::materialize_lde_trace_host(&mut round_1_result.lde_trace);
+        if precomputed_parts.is_none() && lde_trace.host_trace_empty() {
+            let recovered = crate::gpu_lde::materialize_lde_trace_host(lde_trace);
             assert!(
                 recovered,
                 "R2 composition fell back to the host evaluator on a device-only \
@@ -1803,13 +1878,12 @@ pub trait IsStarkProver<
                 air.name(),
                 trace_length,
                 number_of_parts,
-                round_1_result.lde_trace.num_main_cols(),
-                round_1_result.lde_trace.num_aux_cols(),
+                lde_trace.num_main_cols(),
+                lde_trace.num_aux_cols(),
             );
         }
 
-        #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
-        let mut lde_composition_poly_parts_evaluations = if let Some(parts) = precomputed_parts {
+        let lde_composition_poly_parts_evaluations = if let Some(parts) = precomputed_parts {
             parts
         } else if number_of_parts == 2 {
             // Direct quotient decomposition: avoid full-size iFFT by algebraically
@@ -1819,32 +1893,32 @@ pub trait IsStarkProver<
             // On the LDE coset {g·ω^i}, we have -g·ω^i = g·ω^{i+N} since ω^N = -1.
             let constraint_evaluations = evaluator.evaluate(
                 air,
-                &round_1_result.lde_trace,
+                lde_trace,
                 domain,
                 transition_coefficients,
                 boundary_coefficients,
-                &round_1_result.rap_challenges,
+                rap_challenges,
             );
             Self::decompose_and_extend_d2(&constraint_evaluations, domain, twiddles)
         } else if number_of_parts == 1 {
             // Degree bound equals trace length: constraint evals are the LDE directly.
             vec![evaluator.evaluate(
                 air,
-                &round_1_result.lde_trace,
+                lde_trace,
                 domain,
                 transition_coefficients,
                 boundary_coefficients,
-                &round_1_result.rap_challenges,
+                rap_challenges,
             )]
         } else {
             // Fallback for any future AIR with d > 2.
             let constraint_evaluations = evaluator.evaluate(
                 air,
-                &round_1_result.lde_trace,
+                lde_trace,
                 domain,
                 transition_coefficients,
                 boundary_coefficients,
-                &round_1_result.rap_challenges,
+                rap_challenges,
             );
             let composition_poly =
                 Polynomial::interpolate_offset_fft(&constraint_evaluations, &domain.coset_offset)?;
@@ -1893,6 +1967,53 @@ pub trait IsStarkProver<
         };
         #[cfg(feature = "instruments")]
         let fft_dur = t_sub.elapsed();
+
+        Ok(CompositionParts {
+            parts: lde_composition_poly_parts_evaluations,
+            #[cfg(feature = "cuda")]
+            gpu_parts: gpu_composition_parts,
+            #[cfg(feature = "instruments")]
+            constraints_dur,
+            #[cfg(feature = "instruments")]
+            fft_dur,
+        })
+    }
+
+    /// Returns the result of the second round of the STARK Prove protocol.
+    fn round_2_compute_composition_polynomial(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        pub_inputs: &PI,
+        domain: &Domain<Field>,
+        twiddles: &LdeTwiddles<Field>,
+        round_1_result: &mut Round1<Field, FieldExtension, H>,
+        transition_coefficients: &[FieldElement<FieldExtension>],
+        boundary_coefficients: &[FieldElement<FieldExtension>],
+    ) -> Result<Round2<FieldExtension, H>, ProvingError>
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+    {
+        let computed = Self::compute_composition_parts(
+            air,
+            pub_inputs,
+            domain,
+            twiddles,
+            &mut round_1_result.lde_trace,
+            &round_1_result.rap_challenges,
+            round_1_result.bus_public_inputs.as_ref(),
+            transition_coefficients,
+            boundary_coefficients,
+        )?;
+        // `mut` for the device-only recovery in the commit arm below, which
+        // repopulates these from the resident parts handle.
+        #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
+        let mut lde_composition_poly_parts_evaluations = computed.parts;
+        #[cfg(feature = "cuda")]
+        let gpu_composition_parts = computed.gpu_parts;
+        #[cfg(feature = "instruments")]
+        let constraints_dur = computed.constraints_dur;
+        #[cfg(feature = "instruments")]
+        let fft_dur = computed.fft_dur;
 
         // Fold the R2 device composition parts handle into the session
         // (resident R2 to R4) before the commit: the tree build below, its
@@ -1989,15 +2110,18 @@ pub trait IsStarkProver<
     fn round_3_evaluate_polynomials_in_out_of_domain_element(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         domain: &Domain<Field>,
-        round_1_result: &mut Round1<Field, FieldExtension, H>,
-        round_2_result: &mut Round2<FieldExtension, H>,
+        // Both `&mut` for the device-only recoveries below: the parts OOD arm
+        // repopulates the host part evals from the resident handle, and the
+        // trace OOD reads through a trace that may have to be materialized.
+        lde_trace: &mut LDETraceTable<Field, FieldExtension>,
+        composition_parts: &mut [Vec<FieldElement<FieldExtension>>],
         z: &FieldElement<FieldExtension>,
     ) -> Round3<FieldExtension>
     where
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
     {
-        let num_parts = round_2_result.lde_composition_poly_evaluations.len();
+        let num_parts = composition_parts.len();
         let z_power = z.pow(num_parts);
         let domain_size = domain.interpolation_domain_size;
         let blowup_factor = domain.blowup_factor;
@@ -2013,8 +2137,7 @@ pub trait IsStarkProver<
         // the host stride-extract and the sequential CPU fold per part.
         #[cfg(feature = "cuda")]
         let gpu_parts_ood: Option<Vec<FieldElement<FieldExtension>>> =
-            round_1_result
-                .lde_trace
+            lde_trace
                 .gpu_composition_parts()
                 .and_then(|parts_dev| {
                     let dispatch = |inv_host: &[FieldElement<FieldExtension>],
@@ -2034,7 +2157,7 @@ pub trait IsStarkProver<
                     match crate::gpu_lde::try_prep_r3_dev_context::<Field, FieldExtension>(
                         &dc.points,
                         std::slice::from_ref(&z_power),
-                        round_1_result.lde_trace.bound_stream(),
+                        lde_trace.bound_stream(),
                     ) {
                         Some(ctx) => dispatch(&[], Some((&ctx, 0))),
                         // Below the dev-context threshold (single eval point):
@@ -2060,8 +2183,8 @@ pub trait IsStarkProver<
                 #[cfg(feature = "cuda")]
                 {
                     let recovered = crate::gpu_lde::materialize_composition_parts_host(
-                        &round_1_result.lde_trace,
-                        &mut round_2_result.lde_composition_poly_evaluations,
+                        lde_trace,
+                        composition_parts,
                     );
                     assert!(
                         recovered,
@@ -2072,8 +2195,7 @@ pub trait IsStarkProver<
                 }
                 let comp_inv_denoms =
                     math::polynomial::barycentric_inv_denoms(&z_power, &dc.points);
-                round_2_result
-                    .lde_composition_poly_evaluations
+                composition_parts
                     .iter()
                     .map(|lde_evals| {
                         // Extract trace-size evaluations (stride = blowup_factor)
@@ -2096,7 +2218,7 @@ pub trait IsStarkProver<
 
         // === Trace polynomials: barycentric evaluation via LDE ===
         let trace_ood_evaluations = crate::trace::get_trace_evaluations_from_lde(
-            &mut round_1_result.lde_trace,
+            lde_trace,
             domain,
             z,
             &air.context().transition_offsets,
@@ -2146,7 +2268,10 @@ pub trait IsStarkProver<
 
         let gamma = transcript.sample_field_element();
 
-        let n_terms_composition_poly = round_2_result.lde_composition_poly_evaluations.len();
+        // The parts under their shared name; round 4 still holds the whole
+        // `Round2` because the openings need its Merkle tree.
+        let composition_parts = &round_2_result.lde_composition_poly_evaluations;
+        let n_terms_composition_poly = composition_parts.len();
         // g·z pruning: only the current-row block (all columns) plus the masked
         // next-row columns get an opening / DEEP coefficient.
         let layout = Self::ood_layout(air);
@@ -2180,7 +2305,7 @@ pub trait IsStarkProver<
         #[cfg(feature = "cuda")]
         let precomputed_fri = Self::try_compute_deep_dev(
             &round_1_result.lde_trace,
-            round_2_result,
+            composition_parts,
             round_3_result,
             z,
             domain,
@@ -2225,7 +2350,7 @@ pub trait IsStarkProver<
             let t_sub = Instant::now();
             let deep_evals = Self::compute_deep_composition_poly_evaluations(
                 &mut round_1_result.lde_trace,
-                round_2_result,
+                &mut round_2_result.lde_composition_poly_evaluations,
                 round_3_result,
                 z,
                 domain,
@@ -2339,7 +2464,7 @@ pub trait IsStarkProver<
     #[allow(clippy::too_many_arguments)]
     fn try_compute_deep_dev(
         lde_trace: &LDETraceTable<Field, FieldExtension>,
-        round_2_result: &Round2<FieldExtension, H>,
+        composition_parts: &[Vec<FieldElement<FieldExtension>>],
         round_3_result: &Round3<FieldExtension>,
         z: &FieldElement<FieldExtension>,
         domain: &Domain<Field>,
@@ -2352,7 +2477,7 @@ pub trait IsStarkProver<
         FieldElement<FieldExtension>: AsBytes,
     {
         let parts_dev = lde_trace.gpu_composition_parts()?;
-        let num_parts = round_2_result.lde_composition_poly_evaluations.len();
+        let num_parts = composition_parts.len();
         let z_power = z.pow(num_parts);
         let num_eval_points = if trace_terms_gammas.is_empty() {
             0
@@ -2388,8 +2513,11 @@ pub trait IsStarkProver<
 
     #[allow(clippy::too_many_arguments)]
     fn compute_deep_composition_poly_evaluations(
+        // Both `&mut` for the device-only recovery in the host DEEP loop: the
+        // trace and the part evals are downloaded back in place there rather
+        // than aborting the table.
         lde_trace: &mut LDETraceTable<Field, FieldExtension>,
-        round_2_result: &mut Round2<FieldExtension, H>,
+        composition_parts: &mut [Vec<FieldElement<FieldExtension>>],
         round_3_result: &Round3<FieldExtension>,
         z: &FieldElement<FieldExtension>,
         domain: &Domain<Field>,
@@ -2401,7 +2529,7 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
     {
-        let num_parts = round_2_result.lde_composition_poly_evaluations.len();
+        let num_parts = composition_parts.len();
         let z_power = z.pow(num_parts); // pole for H terms
 
         // Number of evaluation points per trace column (= transition_offsets.len() * step_size)
@@ -2450,7 +2578,7 @@ pub trait IsStarkProver<
                     crate::gpu_lde::try_deep_composition_gpu::<Field, FieldExtension>(
                         lde_trace,
                         lde_trace.gpu_composition_parts(),
-                        &round_2_result.lde_composition_poly_evaluations,
+                        composition_parts,
                         h_ood,
                         &trace_ood_columns,
                         composition_poly_gammas,
@@ -2486,7 +2614,7 @@ pub trait IsStarkProver<
                 crate::gpu_lde::try_deep_composition_gpu::<Field, FieldExtension>(
                     lde_trace,
                     lde_trace.gpu_composition_parts(),
-                    &round_2_result.lde_composition_poly_evaluations,
+                    composition_parts,
                     h_ood,
                     &trace_ood_columns,
                     composition_poly_gammas,
@@ -2516,10 +2644,8 @@ pub trait IsStarkProver<
                      downloaded"
                 );
             }
-            let parts_recovered = crate::gpu_lde::materialize_composition_parts_host(
-                lde_trace,
-                &mut round_2_result.lde_composition_poly_evaluations,
-            );
+            let parts_recovered =
+                crate::gpu_lde::materialize_composition_parts_host(lde_trace, composition_parts);
             assert!(
                 parts_recovered,
                 "R4 DEEP composition fell back to the host part evals on a \
@@ -2570,7 +2696,7 @@ pub trait IsStarkProver<
 
             // H terms
             for j in 0..num_parts {
-                let h_j_val = &round_2_result.lde_composition_poly_evaluations[j][i];
+                let h_j_val = &composition_parts[j][i];
                 let h_j_ood = &h_ood[j];
                 result += &composition_poly_gammas[j] * (h_j_val - h_j_ood) * &inv_h[i];
             }
@@ -2873,6 +2999,7 @@ pub trait IsStarkProver<
     {
         let mut openings = Vec::with_capacity(indexes_to_open.len());
 
+        let composition_parts = &round_2_result.lde_composition_poly_evaluations;
         let lde_trace = &round_1_result.lde_trace;
         let main_commit = &round_1_result.main;
         let is_preprocessed = main_commit.is_preprocessed();
@@ -3009,7 +3136,7 @@ pub trait IsStarkProver<
         let comp_num_parts = lde_trace
             .gpu_composition_parts()
             .map(|h| h.m)
-            .unwrap_or_else(|| round_2_result.lde_composition_poly_evaluations.len());
+            .unwrap_or_else(|| composition_parts.len());
         #[cfg(feature = "cuda")]
         let comp_dev_values: Option<Vec<FieldElement<FieldExtension>>> =
             comp_dev_proofs.as_ref().and_then(|_| {
@@ -3129,7 +3256,7 @@ pub trait IsStarkProver<
                             {
                                 let expected = Self::open_composition_poly_with_proof(
                                     proofs[qi].clone(),
-                                    &round_2_result.lde_composition_poly_evaluations,
+                                    composition_parts,
                                     *index,
                                 );
                                 assert_eq!(
@@ -3158,13 +3285,13 @@ pub trait IsStarkProver<
                             );
                             Self::open_composition_poly_with_proof(
                                 proofs[qi].clone(),
-                                &round_2_result.lde_composition_poly_evaluations,
+                                composition_parts,
                                 *index,
                             )
                         }
                         _ => Self::open_composition_poly(
                             &round_2_result.composition_poly_merkle_tree,
-                            &round_2_result.lde_composition_poly_evaluations,
+                            composition_parts,
                             *index,
                         ),
                     }
@@ -3173,7 +3300,7 @@ pub trait IsStarkProver<
                 {
                     Self::open_composition_poly(
                         &round_2_result.composition_poly_merkle_tree,
-                        &round_2_result.lde_composition_poly_evaluations,
+                        composition_parts,
                         *index,
                     )
                 }
@@ -3792,29 +3919,19 @@ pub trait IsStarkProver<
                         // CPU path: copy the already-row-major aux trace directly
                         // (one memcpy — no transpose) and expand with the
                         // cache-blocked batched two-half FFT.
-                        let (trace_data, total_cols) = trace.aux_data_row_major();
-
                         #[cfg(feature = "instruments")]
                         let t_sub = Instant::now();
 
-                        let mut aux_data: Vec<FieldElement<FieldExtension>> =
-                            Vec::with_capacity(lde_size * total_cols);
-                        aux_data.extend_from_slice(trace_data);
-
-                        #[cfg(feature = "disk-spill")]
-                        if storage_mode == StorageMode::Disk {
-                            trace.aux_table.advise_drop_cache();
-                        }
-
-                        Polynomial::<FieldElement<FieldExtension>>::coset_lde_full_expand_row_major::<Field>(
-                            &mut aux_data,
-                            total_cols,
-                            domain.blowup_factor,
-                            &twiddles.coset_weights,
-                            &twiddles.two_half_inv,
-                            &twiddles.two_half_fwd,
-                        )
-                        .expect("row-major aux coset LDE expansion");
+                        let _ = lde_size;
+                        let (aux_data, total_cols) = Self::expand_aux_lde_row_major(
+                            trace,
+                            domain,
+                            twiddles,
+                            #[cfg(feature = "disk-spill")]
+                            storage_mode,
+                        );
+                        #[allow(unused_mut)]
+                        let mut aux_data = aux_data;
 
                         #[cfg(feature = "instruments")]
                         let aux_lde_dur = t_sub.elapsed();
@@ -4148,8 +4265,8 @@ pub trait IsStarkProver<
         let round_3_result = Self::round_3_evaluate_polynomials_in_out_of_domain_element(
             air,
             domain,
-            round_1_result,
-            &mut round_2_result,
+            &mut round_1_result.lde_trace,
+            &mut round_2_result.lde_composition_poly_evaluations,
             &z,
         );
         #[cfg(feature = "instruments")]

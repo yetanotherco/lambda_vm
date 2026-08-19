@@ -17,6 +17,7 @@ pub mod inverse;
 pub mod lde;
 pub mod logup;
 pub mod merkle;
+pub mod mmcs;
 pub mod ntt;
 pub mod nvtx;
 

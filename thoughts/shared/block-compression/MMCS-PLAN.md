@@ -1226,3 +1226,362 @@ inv,_ = node_cost(REAL21_WRAP, REAL21_RND, 219, 'blake3')
 print(inv*BLAKE3_CELLS_PER_COMPRESSION/0.935*BYTES_PER_CELL/GIB)   # 559, not 452
 "
 ```
+
+---
+
+## ADDENDUM A — M-13b: are any rounds-1-3 challenges shape-exploitable?
+
+Written on `mmcs-integration` alongside M-3 / M-4. §M-10.4 split M-13 into (a)
+add widths to the round-4 histogram (done on `mmcs-primitives`) and (b) this
+question, which gates §3.4's addendum ratification.
+
+### A.0 Answer
+
+**No round-1-3 challenge is shape-exploitable — but the argument that makes it
+so is NOT a transcript-ordering argument, and that is worth knowing before
+ratifying §3.4.** Every round-1-3 challenge is drawn strictly before the shape
+histogram is absorbed, so the only thing standing between a prover and a
+post-hoc shape choice is that each round's *root* implicitly binds its own
+shape through the tree structure. That holds, and the primitive's tests pin the
+two ways it could fail. It is a collision-resistance argument, one link longer
+than the ordering argument §3.4 uses for round 4.
+
+**Recommendation (S, and it removes the extra link): absorb the shape histogram
+ONCE more, at the very start of round 1, before the first batched root.** Cost
+is two field-sized absorptions per table per proof — the same encoding
+`absorb_shape_histogram` already defines, and for the LFM machine the vectors
+are registry constants that are already in `program_id`. With it, every
+challenge in every round is drawn after the shape is explicitly bound, and the
+answer above becomes true for the same reason round 4's is.
+
+### A.1 What "the shape" is, and which parts the prover picks
+
+| component | who supplies it | ✓/? |
+|---|---|---|
+| per-table `width` | the AIR set, never the proof | ✓ VERIFIED — `verifier.rs:639` states the rule for aux widths and `trace_opening_widths_well_formed` enforces it; `MixedMmcs::verify_batch` takes `widths` from the caller |
+| table count and order | the AIR set (`airs` argument) | ✓ VERIFIED `verifier.rs:1232-1252` — `multi_verify_views` rejects `airs.len() != proofs.view_len()` |
+| per-table `log_height` | **the PROOF** (`trace_length`) | ✓ VERIFIED `verifier.rs:1269`, `:1484` — read from the proof and used to build the domain |
+
+✓ VERIFIED **`trace_length` is never absorbed into the transcript.** Grepping
+`verifier.rs` for `trace_length` returns only domain construction and the
+part-count check at `:1270-1273`. So heights are the prover-chosen half of the
+shape, today as well as under batching.
+
+### A.2 The challenge order, verified
+
+| round | challenge | drawn after | site |
+|---|---|---|---|
+| 1 | LogUp challenges | every main root | ✓ `prover.rs:3271-3314`, `verifier.rs:1263-1330` |
+| 2 | `beta` (constraint coefficients) | the aux root | ✓ `prover.rs:3617` then `:3869` |
+| 2 | — | composition-parts root absorbed | ✓ `prover.rs:3903` |
+| 3 | `z` (OOD) | the parts root | ✓ `prover.rs:3909-3913` |
+| 4 | `gamma` (DEEP) | the OOD evaluations | ✓ `prover.rs:2032` |
+| 4 | shape histogram → `alpha` | — | the batched path, `batched/round4.rs` |
+
+Under batching the histogram lands in round 4, so **(1), (2) and (3) are all
+drawn before the shape is explicitly bound.** That is the whole question.
+
+### A.3 The four exploits considered, and why each fails
+
+**E1 — move columns between matrices inside one round (the aux-width break,
+one level up).** `verifier.rs:633-649` records the live break: the aux root was
+absorbed after the shared challenges, so a prover that moved main columns into
+the aux tree chose them after seeing `z`/`alpha`. The batched analogue is
+shifting a boundary inside a height group's concatenated leaf — lengthen one
+matrix's `evaluations` by one, shorten its `evaluations_sym` by one, and the
+flat bytes are unchanged. ✗ **Blocked, and by the same remedy: the width, not
+the ordering.** `MixedMmcs::verify_batch` length-checks every matrix's opening
+against verifier-derived widths. ✓ VERIFIED, `boundary_shift_forgery_rejected`
+asserts the flat concatenation is byte-identical first, so the rejection
+provably comes from the width binding and not from a differing hash.
+
+**E2 — relabel a matrix's height after seeing a challenge.** The injection
+level is `h_max - h`, so a relabelled height changes where the matrix enters the
+climb. ✗ **Blocked by the committed tree**: the root was absorbed before the
+challenge, and a relabelled schedule no longer reproduces it. ✓ VERIFIED,
+`rejects_a_relabelled_injection_height`.
+
+**E3 — claim a different `h_max`.** ✗ Blocked: `verify_batch` requires
+`merkle_path.len() == h_max - 1` and rejects `iota >= 2^(h_max-1)`, and the M-14
+guard makes an index from a taller domain a rejection rather than a silent
+mis-binding. ✓ VERIFIED, `verify_batch_rejects_malformed_shapes_without_panicking`
+and `short_round_low_bit_convention_is_exercised`.
+
+**E4 — commit ONE root that opens validly under TWO shapes, then pick the shape
+after seeing the round-1-3 challenges.** This is the residual, and it is the
+one that is not closed by a check. ✗ Blocked only because producing such a root
+is a collision on the leaf/parent hash. **? INFERRED** — no reduction is written
+down, and none is attempted here; it is the standard Merkle binding assumption
+the rest of the system already rests on. What is new under batching is that
+MORE of the epoch's structure (the injection schedule, the group boundaries)
+now hangs off that same assumption, where per-table commitments carried one
+root per table and bound the count structurally.
+
+E4 is exactly what the A.0 recommendation removes: absorb the histogram before
+the first root and the shape is pinned by the transcript, so no root has to be
+binding for the shape to be.
+
+### A.4 Consequence for §3.4's ratification
+
+§3.4's addendum ("the transcript must bind the SHAPE, not only the leaf") is
+**confirmed and should be ratified**, with one amendment:
+
+> Absorb the `(height, width)` histogram before the FIRST batched root of the
+> proof, not only before the batched root of round 4.
+
+Two smaller notes for the same pass:
+
+1. **§3.4's recommended option (b) — one header cell per matrix, at its
+   injection level — is NOT what the primitive implements.** `hash_group_leaf`
+   concatenates rows with no per-matrix header; the boundary is pinned by the
+   verifier-supplied `widths` length check instead (E1 above). That is sound for
+   the boundary question, and it is free where option (b) costs 0.9-6.9% per
+   query (§3.4's table). What it does NOT bind is `kind`: two matrices of equal
+   width at the same height are distinguished only by their position in the
+   input order. Since the verifier fixes that order from the AIR set, position
+   is as good as a label — but the argument is now "the order is fixed
+   externally" rather than "the leaf says which matrix this is", and M1 should be
+   ratified in those terms or the header added.
+2. **M2 is moot as posed.** It asks whether `matrix_index` replacing
+   `ROWS_PER_LEAF` in the header closes the reordering surface. With no header
+   at all, reordering is closed by `rejects_swapped_openings_within_a_height_group`
+   — the concatenation binds input order, so two same-shape matrices' openings
+   swapped is a different leaf. ✓ VERIFIED.
+
+### A.5 What this does NOT answer
+
+- Whether the *AIR set itself* is program shape in the RV64 epoch proof, as it
+  is in the LFM machine (where `num_lfm_airs(keccak_rnd_chunks)` comes from the
+  registry). A.1's table assumes it is, on the strength of `multi_verify_views`
+  taking `airs` from the caller. If an epoch's table set is ever derived from
+  the proof, the whole of A.3 has to be revisited — every "the AIR set supplies
+  it" row becomes a prover choice.
+- The eps_C consequence of batching, which is a separate question with its own
+  addendum below.
+
+---
+
+## ADDENDUM B — the `eps_C` delta from batching
+
+Required before the batched path may ship: the 2026-08-15 security audit
+(SECURITY-LEVELS §1.3) found the proximity-gaps batching term to be the system's
+soundness FLOOR, and batching moves the two inputs it depends on. Grounded in
+the REAL census — `bench_cache/lfm_census_2026-08-12/census_logs/ethrex_e20_blowup2_skip.log`,
+block 25368371, epoch 2^20, 28 sub-proofs with measured per-leg
+`log2_trace_length`, LDE, main and aux widths.
+
+### B.0 Answer
+
+**Batching costs 6.87 bits (union framing) / 8.43 bits (RBR-max framing) at epoch
+2^20, at BOTH blowups.** Robust to ±0.2 bits across epochs 2^20/2^21/2^22, both
+blowups, a keccak-heavy synthetic profile, and all six `L`-model variants.
+
+| | blowup 2 | blowup 4 |
+|---|---|---|
+| today, worst single instance | 97.08 | 97.06 |
+| today, union over 28 instances | 95.52 | 95.50 |
+| **batched, conservative `(L − 1/2)`** | **88.65** | **88.62** |
+| delta (union framing) | **−6.87** | **−6.88** |
+
+With the two design adjustments in B.5 the batched floor is **94.19** — a
+conservative cost of ~1.3 bits against today's union — and after the `eta`/`m`
+retune (Mauro-gated, SECURITY-LEVELS §2.3) the residual is **−1.93 bits at
+worst**. That package is the ruling; §B.5 is what the integration implements.
+
+### B.1 The cause, and the framing that gets it backwards
+
+**100% of the penalty is the `|D0|²` lift of short tables. 0% is the batch
+size.** ✓ VERIFIED by construction: 28 separate instances all at 2^22 give
+88.653 bits; one batched instance carrying `Sum L_t` at 2^22 gives 88.649. For an
+epoch whose tables are all the same height, batching is soundness-neutral to
+within 0.004 bits.
+
+The reason is worth stating because the natural framing has it exactly wrong.
+"Thirty instances collapse to one, so the union bound over thirty goes away" is
+FALSE — **the union bound over per-table instances already sums the `L_t`**, so
+the batch-size factor is identical on both sides:
+
+```
+eps_today = (C/|F|) · Sum_t (L_t − 1/2) · |D0_t|²
+eps_batch = (C/|F|) · (Sum_t L_t − 1/2) · |D0_max|²
+```
+
+`C` depends only on `m` and `rho` — per-proof, not per-table — so it cancels and
+no part of Haböck Thm 2 has to be re-derived to compare them. Dropping the `1/2`
+(every `L_t` is in the hundreds), with `w_t = L_t / Sum L`:
+
+```
+R = eps_batch / eps_today = 1 / Sum_t ( w_t · 4^-(h_max − h_t) )
+bits lost = log2(R) >= 0,  equality iff every table sits at h_max
+```
+
+`R >= 1` always: **batching is never a soundness improvement.**
+
+### B.2 Why the real epoch is the bad case
+
+The loss is governed by how much of the batch's WIDTH sits below the tallest
+table, and it is insensitive to how many short tables there are. The measured
+profile is close to the worst arrangement of that quantity:
+
+- `Sum L_t = 5018` over 28 legs; `h_max` = 2^22 (blowup 2) / 2^23 (blowup 4).
+- **The 13 legs at `log2_trace_length <= 7` carry `Sum L = 4601` — 92% of the
+  batch — and each is lifted 28-38 bits.**
+- `KECCAK_RND` alone is `L = 1999` at 2^3 rows: 127.98 bits on its own domain,
+  **89.98 lifted to 2^22**.
+- The table that sets `h_max` is `LOCAL_TO_GLOBAL`, which is 9 main + 3 aux
+  columns — `L ~ 15`, about 0.3% of the batch weight.
+
+So nearly all the width sits at the bottom and nearly all the height at the top.
+`L` and `h` are close to anti-correlated across this table set, which is the
+configuration `R` punishes hardest.
+
+### B.3 Corrections to §1.3's inputs, found while grounding this
+
+Four, all ✓ VERIFIED against the census and the code, and all of which make
+TODAY's floor better than §1.3 reports rather than worse:
+
+1. **§1.3's 92.0 is a single worst-instance figure (its own §5 item 2 says so)
+   and the instance is HYPOTHETICAL.** It pairs the widest table's `L`
+   (1480 + 516) with the deepest table's `|D0|` (2^21). No real table has both:
+   the 1996-column table is `KECCAK_RND` at 4 ROWS; the 2^21-row table has 12
+   columns. Today's real floor is **95.52** (union) / 97.08 (worst instance).
+2. **"trace <= 2^20" is false.** Measured epochs contain 2^21 and 2^22-row
+   tables.
+3. **`LOCAL_TO_GLOBAL` has NO `max_rows` entry** — ✓ VERIFIED,
+   `prover/src/tables/mod.rs:83-99` lists 14 tables and it is not among them. It
+   is therefore the table that sets `h_max` at every epoch size.
+4. **The union costs only 1.0-1.6 bits, not `log2(28) = 4.8`**, because one tall
+   table dominates the sum.
+5. `L_t = 2 (parts) + (mainW + auxW) + 1 (next row)`. ✓ VERIFIED `step_size = 1`
+   and `transition_offsets = [0,1]` for every production AIR, and
+   `trace_ood_next_row_columns()` returns exactly ONE column (the LogUp
+   accumulator) — not the conservative full-width default.
+
+### B.4 The affine `3/2` is NOT available — do not ship claiming it
+
+✓ VERIFIED `HeightCombiner::absorb` scales by `next_power` and then does
+`next_power *= alpha` (`fri/batched.rs:74-85`): powers of ONE challenge, so the
+outer level is a degree-`(T-1)` curve carrying `(T - 1/2)`, not `3/2`.
+
+Two further reasons it does not become available cheaply:
+
+- Even if the outer level WERE affine, the composite coefficient is
+  `c_t · gamma_t^i` — the inner per-table `gamma` ladders survive, so
+  `Sum_t (L_t − 1/2)` stays. Outer-affine buys `log2(27.5/1.5) = 4.2` bits on a
+  term already 8 bits below the dominant one: **net ~0.00**.
+- ✓ VERIFIED `inject_bucket` adds `beta² · bucket` using the SAME `beta` as that
+  layer's fold (`fri/batched.rs:308-326`), so each fold-and-inject step is a
+  degree-2 curve in `beta`. The affine reading is not available even for the fold
+  steps.
+
+The `3/2` is only reachable by making the INNER per-table DEEP batching affine —
+SECURITY-LEVELS R2, roughly 5000 extra transcript squeezes in the recursion
+guest. That is a prover change with a real cycle cost, not a parameter change.
+
+### B.5 The remedies, and the ruling
+
+Epoch 2^20, blowup 2, union framing. Full batch = 88.65.
+
+| remedy | floor | recovered |
+|---|---|---|
+| exclude the `friL == 0` tables (13 legs, `log2tr <= 7`) | 92.24 | **+3.59** |
+| cap `LOCAL_TO_GLOBAL` at `max_rows` 2^20 | 90.64 | **+2.00** |
+| **both** | **94.19** | **+5.54** (81% of the loss) |
+| two batched instances split at 2^19-2^20 | ~92.6 | +4.0 |
+| affine INNER batching (R2) | ~100 | +11, real guest cycles |
+| `eta`/`m` retune (R1) | see below | the answer |
+
+**Excluding the `friL == 0` tables is not a compromise, it is a correction.**
+Those 13 legs have ZERO committed FRI layers per the census, so batching them
+buys no FRI-layer saving whatsoever while paying the full `|D0|²` lift — pure
+loss for zero gain. They keep their own trivial per-table instances. This also
+REDUCES integration work.
+
+**R1 is the answer to the residual.** Batched + R1 = 112.42 bits (`m = 9`);
+today + R1 = 114.35 (`m = 16`). So after the retune the batching penalty is only
+**−1.93 bits** (blowup 4: 116.43 → 114.87, −1.56). Zero queries, zero prover
+cost, one expression in `with_params`. ⚠ The constant is **Mauro's ratification
+item** (SECURITY-LEVELS §2.3) and is not implemented here.
+
+**Queries cannot buy any of this back.** ✓ VERIFIED: at `m = 106`, blowup 2,
+`s = 219` gives floor 88.65; `s = 10,000` gives floor 88.65 (the query term
+reaches 4952 bits and the floor does not move). This reproduces §1.3's
+falsification pass 3. The query term actually IMPROVES under batching
+(123.21 union → 128.01 single instance) but sits 39 bits above the floor and is
+inert. More blowup does not help either: `eps_C` is blowup-independent —
+`m^7·rho^-1.5·|D0|²` with `m ~ sqrt(rho)` and `|D0| ~ 1/rho` gives `rho^0`.
+
+### B.6 ✗ UNCERTAIN — the gate item, carried verbatim
+
+**No theorem in the campaign's cited literature (BCIKS20, Haböck 2022/1216,
+Block et al. 2024/1161) covers STAGED, HEIGHT-INJECTED, MIXED-DOMAIN batched
+FRI.** All three treat `L` codewords on a COMMON `D0`. The conservative
+`L = Sum L_t` figure above is defensible as a two-level hierarchical union with
+BOTH levels instantiated at `|D_max|` — **that derivation is ours, not a
+citation.**
+
+A third reading that is plausibly physically right — "staged", where each table's
+`(L_t − 1/2)` attaches to its own injection-layer domain and only the ~22
+fold/inject steps and ~13 bucket-`alpha` curves are paid at the taller domains —
+gives **94.57 bits, delta only −0.95**. If a citable analysis for
+mixed-degree/staged FRI turns up (Plonky3-style, or STIR/WHIR degree
+correction), the penalty likely collapses from −6.9 to −1.0.
+
+**Until then: the claim that ships is the conservative two-level hierarchical
+union at `|D_max|`, NOT the affine `3/2`.**
+
+### B.7 One soundness positive, verified in passing
+
+`absorb_shape_histogram` binds heights and widths BEFORE `alpha` is sampled
+(`fri/batched.rs:445-447`), so an adversary cannot choose the height profile
+after seeing `alpha`. That binding is load-bearing for everything above — the
+whole analysis assumes the height profile is fixed. Keep it. (Addendum A's
+recommendation to absorb it once more before the FIRST batched root strengthens
+the same property for rounds 1-3.)
+
+### B.8 ⛔ Capping `LOCAL_TO_GLOBAL` is NOT a small isolated commit — NOT DONE
+
+B.5 costs the cap at +2.00 bits and it is the second half of the remedy package.
+It was scoped as "a small, separate commit, isolated so it can be cherry-picked
+or dropped at review". **The code contradicts that scoping, so it is not
+implemented here.** What it actually touches, ✓ VERIFIED:
+
+1. **`EpochProof::l2g_root` is ONE `Commitment`, not a vector**
+   (`prover/src/continuation.rs:455`), and it is an **rkyv-archived field** read
+   in place by the #845 zero-copy view layer (`:618-621`). Chunking L2G makes it
+   `Vec<Commitment>` — a wire-format change to the continuation bundle, on
+   exactly the surface MMCS-PLAN §2.1 flags as a silent-deletion hazard.
+2. **The cross-proof binding is index-aligned and one-per-epoch.**
+   `verify_l2g_commitment_binding_view` (`prover/src/lib.rs:1035-1044`) rests on
+   "the final proof commits one local-to-global sub-table per epoch as its FIRST
+   `N` tables, so `final_proof.get(i)` is epoch `i`'s L2G commitment". Chunking
+   breaks that alignment, and this is the check that stops the global proof
+   committing different boundary claims than the epochs did — a soundness
+   binding, not bookkeeping.
+3. **The epoch prover rebuilds the same table to match roots**
+   (`continuation.rs:785-789`: "identical to the one the global proof commits —
+   the commitment binding compares their roots"). Both sides would have to chunk
+   identically, so the chunk policy becomes part of the protocol.
+4. `l2g_global_air(opts, epoch_label(i))` is one AIR per epoch carrying that
+   epoch's label constant; a per-chunk variant has to keep every boundary firing
+   its interactions exactly once, or the bus stops balancing.
+
+**Two ways forward, for whoever picks this up — the choice is a design call, not
+an implementation detail:**
+
+- **(a) Chunk the L2G table.** Costs the wire change in (1) and the rewrite in
+  (2). Buys the +2.00 bits and a smaller batched domain at every epoch size.
+- **(b) Cap the EPOCH instead.** Cut epochs so an epoch's touched-cell count
+  stays under 2^20. One L2G table per epoch, one root, binding untouched — but
+  it changes the continuation schedule, so it trades a wire change for a
+  policy change. This is probably what "changes epoch chunking for L2G" meant,
+  and it is the cheaper of the two on the soundness surface.
+
+Either way the honest-path control is the same and is not optional: an
+end-to-end continuation prove/verify across an epoch boundary that straddles the
+cap, asserting `verify_l2g_commitment_binding_view` still accepts.
+
+Without the cap the remedy package delivers **+3.59 bits** (the class split
+alone, B.5 row 1), not +5.54, so the conservative batched floor is **92.24
+rather than 94.19** — a ~3.3-bit conservative cost against today's 95.52 union,
+which the `eta` retune still absorbs.

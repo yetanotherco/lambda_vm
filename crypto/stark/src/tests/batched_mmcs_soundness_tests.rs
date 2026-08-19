@@ -7,10 +7,12 @@
 //! re-asserted in every test, so a false-reject regression cannot make the
 //! negatives pass vacuously.
 //!
-//! Scope: these reach only what the primitives decide. The forgeries that a
-//! batched *proof* must also resist — a tampered per-query FRI layer evaluation,
-//! an OOD value, the bus balance, the query count, the grinding nonce — need the
-//! prover/verifier integration and belong with it.
+//! Scope grows with the integration. The first section reaches only what the
+//! primitives decide; the per-query batched-FRI section below arrived with the
+//! round-4 wiring ([`crate::batched::round4`]), which is what made a tampered
+//! layer evaluation, a mis-sized decommitment and a wrong injection expressible.
+//! The forgeries that still need the full prover/verifier integration — an OOD
+//! value, the bus balance, the query count, the grinding nonce — belong with it.
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use crypto::fiat_shamir::is_transcript::IsTranscript;
@@ -18,10 +20,13 @@ use math::fft::bit_reversing::reverse_index;
 use math::field::element::FieldElement;
 use math::field::goldilocks::GoldilocksField;
 
+use crate::batched::round4::BatchedFriCommit;
+use crate::batched::round4::tests as round4_tests;
 use crate::config::KeccakStarkHash;
 use crate::fri::batched::{
     BatchedFriLayout, absorb_shape_histogram, derive_batched_fri_challenges,
 };
+use crate::fri::fri_decommit::FriDecommitment;
 use crate::fri::mmcs::{LeafSource, MixedMmcs, MixedOpening};
 
 type F = GoldilocksField;
@@ -336,4 +341,1324 @@ fn the_shape_encoding_separates_distinct_epochs() {
 
     // Swapping height and width within a table is a different epoch.
     assert_ne!(absorbed(&[3, 4], &[4, 3]), absorbed(&[4, 3], &[3, 4]));
+}
+
+// ---------------------------------------------------------------------------
+// Per-query batched FRI (M-3). These need the round-4 wiring, not only the
+// primitives, so they were deferred when the primitives landed.
+// ---------------------------------------------------------------------------
+
+/// One honest batched round 4 plus everything a verifier needs to check a query.
+struct Round4Fixture {
+    tables: Vec<round4_tests::FakeTable>,
+    commit: BatchedFriCommit<F, KeccakStarkHash>,
+    betas: Vec<FE>,
+    decommitments: Vec<FriDecommitment<F>>,
+    alpha: FE,
+    h_max: usize,
+    plan: crate::fri::batched::FriInstancePlan,
+}
+
+impl Round4Fixture {
+    fn build() -> Self {
+        let tables = round4_tests::fixture();
+        let mut transcript = round4_tests::Transcript::new(b"batched_soundness_r4");
+        let commit = round4_tests::commit_fixture(&tables, &mut transcript, 0, 6);
+        let decommitments =
+            crate::fri::query_phase::<F, KeccakStarkHash>(&commit.layers, &commit.iotas);
+
+        let mut verifier_transcript = round4_tests::Transcript::new(b"batched_soundness_r4");
+        let replay = crate::batched::round4::replay_batched_fri::<F, round4_tests::Transcript>(
+            &mut verifier_transcript,
+            &round4_tests::heights_of(&tables),
+            &round4_tests::widths_of(&tables),
+            &commit.layer_roots,
+            &commit.final_poly_coeffs,
+            round4_tests::BLOWUP_LOG,
+            round4_tests::FINAL_POLY_LOG_DEGREE,
+            0,
+            None,
+            6,
+        )
+        .expect("an honest shape must derive");
+
+        Self {
+            tables,
+            betas: replay.betas,
+            alpha: replay.alpha,
+            h_max: replay.plan.h_max,
+            plan: replay.plan,
+            decommitments,
+            commit,
+        }
+    }
+
+    /// Verify query `q` with every input honest except what `mutate` changes.
+    fn check_query_with<M>(&self, q: usize, mutate: M) -> bool
+    where
+        M: FnOnce(&mut FriDecommitment<F>, &mut (FE, FE), &mut Vec<Option<FE>>, &mut Vec<FE>),
+    {
+        let iota = self.commit.iotas[q];
+        let (mut p0, mut buckets) = round4_tests::query_inputs(&self.tables, &self.alpha, iota);
+        let mut decommitment = self.decommitments[q].clone();
+        let mut coeffs = self.commit.final_poly_coeffs.clone();
+        mutate(&mut decommitment, &mut p0, &mut buckets, &mut coeffs);
+        round4_tests::verify_one_query(
+            &self.commit,
+            &self.betas,
+            self.h_max,
+            iota,
+            &decommitment,
+            (&p0.0, &p0.1),
+            &buckets,
+            &self.commit.layer_roots,
+            &coeffs,
+        )
+    }
+
+    fn check_query(&self, q: usize) -> bool {
+        self.check_query_with(q, |_, _, _, _| {})
+    }
+}
+
+/// The honest-path control for every negative below. Also pins that the fixture
+/// is not degenerate: it must actually commit layers, or the fold loop the
+/// negatives target would never run.
+#[test]
+fn honest_batched_fri_queries_verify() {
+    let f = Round4Fixture::build();
+    assert!(
+        f.commit.layout.num_committed >= 1,
+        "the fixture must commit at least one FRI layer"
+    );
+    assert!(
+        f.commit.layout.total_folds as usize > f.commit.layout.num_committed,
+        "the fixture must exercise the final fold"
+    );
+    for q in 0..f.commit.iotas.len() {
+        assert!(f.check_query(q), "honest query {q} must verify");
+    }
+}
+
+/// A per-query FRI layer evaluation is prover-supplied and NOT in the
+/// transcript; only the layer's Merkle root binds it.
+#[test]
+fn a_tampered_fri_layer_evaluation_is_rejected() {
+    let f = Round4Fixture::build();
+    for q in 0..f.commit.iotas.len() {
+        assert!(f.check_query(q), "honest control for query {q}");
+        for layer in 0..f.commit.layout.num_committed {
+            assert!(
+                !f.check_query_with(q, |d, _, _, _| {
+                    d.layers_evaluations_sym[layer] =
+                        &d.layers_evaluations_sym[layer] + &FE::from(1u64);
+                }),
+                "query {q}: a tampered evaluation at layer {layer} must be rejected"
+            );
+        }
+    }
+}
+
+/// The authentication path is what carries the layer opening to the root.
+#[test]
+fn a_tampered_fri_layer_auth_path_is_rejected() {
+    let f = Round4Fixture::build();
+    for layer in 0..f.commit.layout.num_committed {
+        assert!(f.check_query(0), "honest control");
+        assert!(
+            !f.check_query_with(0, |d, _, _, _| {
+                d.layers_auth_paths[layer].merkle_path[0][0] ^= 1;
+            }),
+            "a tampered sibling at layer {layer} must be rejected"
+        );
+    }
+}
+
+/// The decommitment vectors are not bound by Fiat-Shamir, so their lengths have
+/// to be pinned before anything iterates them: a short one would end the fold
+/// early and accept without reaching the terminal, a long one would run past it.
+#[test]
+fn a_mis_sized_fri_decommitment_is_rejected() {
+    let f = Round4Fixture::build();
+    assert!(f.check_query(0), "honest control");
+
+    assert!(
+        !f.check_query_with(0, |d, _, _, _| {
+            d.layers_auth_paths.pop();
+            d.layers_evaluations_sym.pop();
+        }),
+        "a truncated decommitment must be rejected"
+    );
+    assert!(
+        !f.check_query_with(0, |d, _, _, _| {
+            let path = d.layers_auth_paths[0].clone();
+            let evaluation = d.layers_evaluations_sym[0];
+            d.layers_auth_paths.push(path);
+            d.layers_evaluations_sym.push(evaluation);
+        }),
+        "a padded decommitment must be rejected"
+    );
+    assert!(
+        !f.check_query_with(0, |d, _, _, _| {
+            d.layers_auth_paths.clear();
+            d.layers_evaluations_sym.clear();
+        }),
+        "an empty decommitment must be rejected, not accepted vacuously"
+    );
+}
+
+/// The terminal polynomial is where FRI's low-degree claim is finally cashed in.
+#[test]
+fn a_tampered_terminal_coefficient_is_rejected() {
+    let f = Round4Fixture::build();
+    assert!(f.check_query(0), "honest control");
+    for i in 0..f.commit.final_poly_coeffs.len() {
+        assert!(
+            !f.check_query_with(0, |_, _, _, coeffs| {
+                coeffs[i] = &coeffs[i] + &FE::from(1u64);
+            }),
+            "a tampered terminal coefficient {i} must be rejected"
+        );
+    }
+}
+
+/// The tallest tables enter FRI as layer 0, which is never committed — the only
+/// thing binding them is that the fold has to land on the terminal.
+#[test]
+fn a_tampered_layer_zero_value_is_rejected() {
+    let f = Round4Fixture::build();
+    assert!(f.check_query(0), "honest control");
+    assert!(
+        !f.check_query_with(0, |_, p0, _, _| { p0.0 = &p0.0 + &FE::from(1u64) }),
+        "a tampered p0 must be rejected"
+    );
+    assert!(
+        !f.check_query_with(0, |_, p0, _, _| { p0.1 = &p0.1 + &FE::from(1u64) }),
+        "a tampered p0 symmetric value must be rejected"
+    );
+    assert!(
+        !f.check_query_with(0, |_, p0, _, _| { core::mem::swap(&mut p0.0, &mut p0.1) }),
+        "swapping the layer-0 pair must be rejected — the two are not interchangeable"
+    );
+}
+
+/// The injected buckets are the whole point of a mixed-height batch: a short
+/// table is bound ONLY by the value it contributes at its injection layer. Three
+/// ways to get that wrong, all of which leave the tall tables untouched and so
+/// would pass a control that only tampered the base group.
+#[test]
+fn a_wrong_injection_is_rejected() {
+    let f = Round4Fixture::build();
+    // The BATCHED class's short heights — the standalone class is not injected at
+    // all, and asking for its bucket would be asking about a codeword that is not
+    // in this instance.
+    let injected_heights: Vec<usize> = f
+        .plan
+        .batched
+        .iter()
+        .map(|&t| f.tables[t].height)
+        .filter(|h| *h < f.h_max)
+        .collect();
+    assert!(
+        !injected_heights.is_empty(),
+        "the fixture must have at least one injected height"
+    );
+
+    for q in 0..f.commit.iotas.len() {
+        assert!(f.check_query(q), "honest control for query {q}");
+        for &h in &injected_heights {
+            assert!(
+                !f.check_query_with(q, |_, _, buckets, _| {
+                    let value = buckets[h].take().expect("the height is occupied");
+                    buckets[h] = Some(&value + &FE::from(1u64));
+                }),
+                "query {q}: a tampered injection at height {h} must be rejected"
+            );
+            assert!(
+                !f.check_query_with(q, |_, _, buckets, _| { buckets[h] = None }),
+                "query {q}: dropping the injection at height {h} must be rejected"
+            );
+        }
+    }
+}
+
+/// The injection position is derived, not sent, and prover and verifier derive it
+/// separately — so a control that only tampers the VALUE would pass under a wrong
+/// derivation. Reading the other row of the same opened pair is the mistake a
+/// off-by-one in `injection_position` would make, so it is the one to pin.
+#[test]
+fn an_injection_read_at_the_sibling_row_is_rejected() {
+    let f = Round4Fixture::build();
+    let mut exercised = 0usize;
+    for (q, &iota) in f.commit.iotas.iter().enumerate() {
+        assert!(f.check_query(q), "honest control for query {q}");
+        for &t in f.plan.batched.iter() {
+            let h = f.tables[t].height;
+            if h == f.h_max {
+                continue;
+            }
+            let position = crate::batched::round4::injection_position(iota, f.h_max, h);
+            let sibling = position ^ 1;
+            let inputs: Vec<(Vec<FE>, usize)> = f
+                .plan
+                .batched
+                .iter()
+                .map(|&b| (f.tables[b].codeword.clone(), f.tables[b].height))
+                .collect();
+            let combined = crate::fri::batched::combine_by_height(&inputs, &f.alpha);
+            let bucket = combined[h].as_ref().expect("the height is occupied");
+            // A degenerate codeword whose two rows coincide would make this
+            // vacuous; skip rather than assert a rejection that means nothing.
+            if bucket[position] == bucket[sibling] {
+                continue;
+            }
+            exercised += 1;
+            let sibling_value = bucket[sibling];
+            assert!(
+                !f.check_query_with(q, |_, _, buckets, _| {
+                    buckets[h] = Some(sibling_value);
+                }),
+                "query {q}: reading height {h}'s injection at the sibling row must be rejected"
+            );
+        }
+    }
+    assert!(
+        exercised > 0,
+        "no non-degenerate sibling pair was exercised — the test proved nothing"
+    );
+}
+
+/// Everything on the verifier's path is prover-supplied, so it must fail closed
+/// on shapes that cannot occur honestly rather than panic on them.
+#[test]
+fn malformed_batched_fri_inputs_are_rejected_without_panicking() {
+    let f = Round4Fixture::build();
+    let iota = f.commit.iotas[0];
+    let (p0, buckets) = round4_tests::query_inputs(&f.tables, &f.alpha, iota);
+    let terminal_offset =
+        FE::from(round4_tests::COSET_OFFSET).pow(1u64 << f.commit.layout.total_folds);
+    let terminal = crate::fri::terminal::terminal_codeword_from_coeffs::<F, F>(
+        &f.commit.final_poly_coeffs,
+        &terminal_offset,
+        f.commit.layout.terminal_len,
+    );
+    let point_inv = round4_tests::evaluation_point_inv(iota, f.h_max);
+
+    let run = |layer_roots: &[[u8; 32]],
+               betas: &[FE],
+               h_max: usize,
+               iota: usize,
+               buckets: &[Option<FE>],
+               terminal: &[FE]| {
+        crate::batched::round4::verify_batched_fri_query::<F, F, KeccakStarkHash>(
+            layer_roots,
+            betas,
+            &f.commit.layout,
+            h_max,
+            iota,
+            &f.decommitments[0],
+            &point_inv,
+            (&p0.0, &p0.1),
+            buckets,
+            terminal,
+        )
+    };
+
+    assert!(
+        run(
+            &f.commit.layer_roots,
+            &f.betas,
+            f.h_max,
+            iota,
+            &buckets,
+            &terminal
+        ),
+        "honest control"
+    );
+    assert!(
+        !run(&[], &f.betas, f.h_max, iota, &buckets, &terminal),
+        "a missing layer-root vector must be rejected"
+    );
+    assert!(
+        !run(
+            &f.commit.layer_roots,
+            &[],
+            f.h_max,
+            iota,
+            &buckets,
+            &terminal
+        ),
+        "a missing beta vector must be rejected"
+    );
+    assert!(
+        !run(
+            &f.commit.layer_roots,
+            &f.betas,
+            0,
+            iota,
+            &buckets,
+            &terminal
+        ),
+        "h_max = 0 must be rejected, not shifted by"
+    );
+    assert!(
+        !run(
+            &f.commit.layer_roots,
+            &f.betas,
+            f.h_max,
+            1usize << (f.h_max - 1),
+            &buckets,
+            &terminal
+        ),
+        "an iota from a taller domain must be rejected"
+    );
+    assert!(
+        !run(
+            &f.commit.layer_roots,
+            &f.betas,
+            f.h_max,
+            iota,
+            &buckets[..1],
+            &terminal
+        ),
+        "a bucket vector too short to cover every height must be rejected"
+    );
+    assert!(
+        !run(
+            &f.commit.layer_roots,
+            &f.betas,
+            f.h_max,
+            iota,
+            &buckets,
+            &[]
+        ),
+        "an empty terminal codeword must be rejected"
+    );
+}
+
+/// ★ The control the two-class split requires: a table of EACH class must be
+/// tamper-checked.
+///
+/// The classes read the same query index in different spaces — the batched class
+/// uses `iota` directly, a standalone table uses `iota >> (h_max - h)`. Prover
+/// and verifier both derive that shift from the shape, so a wrong convention is
+/// self-consistent and honest proofs keep verifying; the failure is that the
+/// standalone tables end up checked at positions nothing else reaches. A control
+/// that only tampered the batched class would pass under ANY convention for the
+/// other, which is exactly how consolidating a per-table check loses coverage.
+#[test]
+fn each_instance_class_is_tamper_checked() {
+    let f = Round4Fixture::build();
+    assert!(
+        !f.plan.standalone.is_empty(),
+        "the fixture must exercise BOTH classes, or this control proves nothing \
+         about the split"
+    );
+    assert!(
+        f.plan.batched.len() > 1,
+        "the batched class must carry more than the tallest table"
+    );
+
+    // --- Batched class: covered by the fold recursion. ---
+    assert!(f.check_query(0), "honest control");
+    assert!(
+        !f.check_query_with(0, |_, p0, _, _| { p0.0 = &p0.0 + &FE::from(1u64) }),
+        "a tampered batched-class value must be rejected"
+    );
+
+    // --- Standalone class: its own terminal-only instance. ---
+    for &t in &f.plan.standalone {
+        let table = &f.tables[t];
+        // A zero-layer table's terminal codeword IS its deep-composition
+        // codeword — nothing folds — so the honest terminal is the codeword.
+        let terminal = &table.codeword;
+        for (q, &iota) in f.commit.iotas.iter().enumerate() {
+            let reduced = crate::batched::round4::reduce_iota_to_round(iota, f.h_max, table.height)
+                .expect("a standalone table is never taller than the FRI");
+            let honest = (terminal[reduced * 2], terminal[reduced * 2 + 1]);
+            assert!(
+                crate::batched::round4::verify_standalone_fri_query::<F>(
+                    iota,
+                    f.h_max,
+                    table.height,
+                    (&honest.0, &honest.1),
+                    terminal,
+                ),
+                "query {q}: the honest standalone opening must verify"
+            );
+            let tampered = &honest.0 + &FE::from(1u64);
+            assert!(
+                !crate::batched::round4::verify_standalone_fri_query::<F>(
+                    iota,
+                    f.h_max,
+                    table.height,
+                    (&tampered, &honest.1),
+                    terminal,
+                ),
+                "query {q}: a tampered standalone value must be rejected"
+            );
+            // The index rule itself: reading the table at the UNREDUCED batched
+            // index is the mistake the two-class split makes possible, and it is
+            // silent unless something rejects it.
+            if iota != reduced && iota * 2 + 1 < terminal.len() {
+                assert!(
+                    !crate::batched::round4::verify_standalone_fri_query::<F>(
+                        iota,
+                        f.h_max,
+                        table.height,
+                        (&terminal[iota * 2], &terminal[iota * 2 + 1]),
+                        terminal,
+                    ),
+                    "query {q}: the un-reduced index must not authenticate a \
+                     standalone table"
+                );
+            }
+        }
+    }
+}
+
+/// A standalone table must not be reachable through the batched instance's
+/// injection path: it contributes no bucket, so a prover that manufactured one
+/// is claiming a codeword this instance never mixed.
+#[test]
+fn a_standalone_table_contributes_no_injection() {
+    let f = Round4Fixture::build();
+    assert!(
+        !f.plan.standalone.is_empty(),
+        "the fixture needs both classes"
+    );
+    for &t in &f.plan.standalone {
+        let h = f.tables[t].height;
+        assert!(
+            !f.plan.batched.iter().any(|&b| f.tables[b].height == h),
+            "the fixture's standalone height must be unique to that class"
+        );
+        for q in 0..f.commit.iotas.len() {
+            assert!(f.check_query(q), "honest control for query {q}");
+            assert!(
+                !f.check_query_with(q, |_, _, buckets, _| {
+                    buckets[h] = Some(FE::from(7u64));
+                }),
+                "query {q}: a bucket manufactured at a standalone height must be \
+                 rejected"
+            );
+        }
+    }
+}
+
+// ===========================================================================
+// EPOCH-LEVEL NEGATIVES — the items M-2 deferred "with the integration"
+// ===========================================================================
+//
+// Everything above decides what the PRIMITIVES can decide: a tampered row, a
+// mis-sized path, a replayed index, a swapped opening. These need a whole
+// epoch, so they arrive with `multi_prove_batched` and
+// `batched::verifier::replay_epoch_transcript`.
+//
+// ⚠ What is covered and what is not. Query count, the grinding nonce, the OOD
+// values and the bus-contribution BINDING are covered. Bus BALANCE — that the
+// per-table contributions sum to the expected value across the epoch — is NOT,
+// and cannot be until the batched verifier grows the constraint half; see
+// `batched/verifier.rs`'s header for why that is blocked and on what.
+//
+// Every negative below has an honest-path control beside it. Without one, a
+// rejection proves only that the checker rejects, not that it discriminates.
+mod epoch {
+    use super::*;
+    use crate::batched::verifier::{replay_epoch_transcript, verify_epoch_commitments};
+    use crate::config::KeccakStarkHash;
+    use crate::residency_mode::ResidencyMode;
+    use crate::tests::batched_prover_tests::{Air, E, F, folding_options, prove_repeated};
+    use crate::traits::AIR;
+    use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+    use math::field::element::FieldElement;
+
+    type Proof = crate::batched::proof::BatchedMultiProof<F, E, ()>;
+
+    fn air_refs(airs: &[Air]) -> Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> {
+        airs.iter()
+            .map(|a| a as &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>)
+            .collect()
+    }
+
+    /// Replay `proof` and run the commitment checks. `None` when the replay
+    /// itself rejects, so a test can tell "rejected structurally" from
+    /// "rejected on the openings".
+    fn replay_and_check(airs: &[Air], proof: &Proof) -> Option<bool> {
+        let refs = air_refs(airs);
+        let (shape, params, challenges) =
+            replay_epoch_transcript(&refs, proof, &mut DefaultTranscript::<E>::new(&[]))?;
+        // `None`: this fixture has no preprocessed table, which is the only
+        // shape an unpinned caller may verify (`verify_prep_round`). The pinned
+        // arm is covered in `batched_prover_tests`, where the fixture does.
+        Some(verify_epoch_commitments::<F, E, (), KeccakStarkHash>(
+            proof,
+            &shape,
+            &params,
+            &challenges,
+            None,
+        ))
+    }
+
+    fn honest() -> (Vec<Air>, Proof) {
+        let (airs, proof, _, _) = prove_repeated(1, &folding_options(), ResidencyMode::Retain);
+        (airs, proof)
+    }
+
+    /// ★ The strongest oracle available for "the prover and the verifier are one
+    /// protocol": not that some challenge agrees, but that the two transcripts
+    /// END in the same state. A divergence anywhere in the sequence — a root
+    /// absorbed in the wrong order, a challenge sampled that the other side does
+    /// not sample, an OOD block walked differently — lands here, where comparing
+    /// individual challenges would only catch it if you happened to compare the
+    /// right one.
+    #[test_log::test]
+    fn replay_matches_the_provers_ending_state() {
+        let mut prover_transcript = DefaultTranscript::<E>::new(&[]);
+        let (airs, proof, _, _) = crate::tests::batched_prover_tests::prove_repeated_with(
+            1,
+            &folding_options(),
+            ResidencyMode::Retain,
+            &mut prover_transcript,
+        );
+
+        let mut verifier_transcript = DefaultTranscript::<E>::new(&[]);
+        let refs = air_refs(&airs);
+        replay_epoch_transcript(&refs, &proof, &mut verifier_transcript)
+            .expect("an honest epoch must replay");
+
+        assert_eq!(
+            prover_transcript.state(),
+            verifier_transcript.state(),
+            "prover and verifier must end the epoch in the same transcript state"
+        );
+    }
+
+    /// The honest-path control every negative below leans on.
+    #[test_log::test]
+    fn an_honest_epoch_passes_the_commitment_checks() {
+        let (airs, proof) = honest();
+        assert_eq!(
+            replay_and_check(&airs, &proof),
+            Some(true),
+            "an honest epoch must replay and authenticate"
+        );
+    }
+
+    /// Query count. Nothing the transcript has already checked implies it: a
+    /// prover that sent fewer openings would simply be checked less often.
+    #[test_log::test]
+    fn a_short_query_list_is_rejected() {
+        let (airs, mut proof) = honest();
+        assert!(
+            proof.queries.len() > 1,
+            "the fixture must have queries to drop"
+        );
+        proof.queries.pop();
+        assert_eq!(
+            replay_and_check(&airs, &proof),
+            Some(false),
+            "dropping a query must be rejected"
+        );
+    }
+
+    /// Grinding. The nonce is absorbed, so a forged one moves every later
+    /// challenge AND fails its own proof-of-work check; either rejection is
+    /// correct and the test asserts the outcome, not the route.
+    #[test_log::test]
+    fn a_forged_grinding_nonce_is_rejected() {
+        let (airs, mut proof) = honest();
+        let nonce = proof.nonce.expect("the fixture grinds");
+        proof.nonce = Some(nonce.wrapping_add(1));
+        assert_ne!(
+            replay_and_check(&airs, &proof),
+            Some(true),
+            "a nonce the prover did not grind must be rejected"
+        );
+    }
+
+    /// A missing nonce where the epoch's grinding factor demands one.
+    #[test_log::test]
+    fn an_absent_grinding_nonce_is_rejected() {
+        let (airs, mut proof) = honest();
+        proof.nonce = None;
+        assert_ne!(
+            replay_and_check(&airs, &proof),
+            Some(true),
+            "an epoch with a positive grinding factor must carry a nonce"
+        );
+    }
+
+    /// OOD values. They are absorbed before alpha, so tampering one must move
+    /// the query indices — which is what makes the openings, honestly produced
+    /// at the honest indices, stop authenticating.
+    #[test_log::test]
+    fn a_tampered_ood_value_is_rejected() {
+        let (airs, honest_proof) = honest();
+        let refs = air_refs(&airs);
+        let honest_iotas =
+            replay_epoch_transcript(&refs, &honest_proof, &mut DefaultTranscript::<E>::new(&[]))
+                .expect("honest replay")
+                .2
+                .fri
+                .iotas;
+
+        let mut proof = honest_proof.clone();
+        proof.tables[0].composition_poly_parts_ood_evaluation[0] += FieldElement::<E>::one();
+        let (_, _, tampered) =
+            replay_epoch_transcript(&refs, &proof, &mut DefaultTranscript::<E>::new(&[]))
+                .expect("the shape is still structurally consistent");
+        assert_ne!(
+            tampered.fri.iotas, honest_iotas,
+            "an OOD value the prover did not commit must move the query indices"
+        );
+        assert_eq!(
+            replay_and_check(&airs, &proof),
+            Some(false),
+            "and the openings must then fail to authenticate"
+        );
+    }
+
+    /// A trace OOD value, tampered in the other block, must behave the same —
+    /// the two blocks are absorbed separately and a control on only one would
+    /// miss a verifier that walked just that one.
+    #[test_log::test]
+    fn a_tampered_trace_ood_value_is_rejected() {
+        let (airs, mut proof) = honest();
+        let table = &mut proof.tables[0];
+        let value = *table.trace_ood_evaluations.get(0, 0);
+        table
+            .trace_ood_evaluations
+            .set(0, 0, value + FieldElement::<E>::one());
+        assert_eq!(
+            replay_and_check(&airs, &proof),
+            Some(false),
+            "a trace OOD value the prover did not commit must be rejected"
+        );
+    }
+
+    /// Bus-contribution BINDING (not balance): which tables carry one is a fact
+    /// about the AIR set, so dropping one must be a structural rejection rather
+    /// than a transcript that quietly absorbs one element fewer.
+    #[test_log::test]
+    fn a_dropped_bus_contribution_is_rejected() {
+        let (airs, mut proof) = honest();
+        assert!(
+            proof.tables[0].bus_public_inputs.is_some(),
+            "the fixture's tables all have a RAP"
+        );
+        proof.tables[0].bus_public_inputs = None;
+        assert_eq!(
+            replay_and_check(&airs, &proof),
+            None,
+            "a table whose AIR has a RAP must carry a bus contribution"
+        );
+    }
+
+    /// A tampered bus contribution is absorbed, so it moves the challenges.
+    #[test_log::test]
+    fn a_tampered_bus_contribution_is_rejected() {
+        let (airs, mut proof) = honest();
+        if let Some(bpi) = proof.tables[0].bus_public_inputs.as_mut() {
+            bpi.table_contribution += FieldElement::<E>::one();
+        }
+        assert_eq!(
+            replay_and_check(&airs, &proof),
+            Some(false),
+            "a bus contribution the prover did not commit must be rejected"
+        );
+    }
+
+    /// A whole round's root, dropped. The AIR set says the aux round exists, so
+    /// its absence is a structural rejection — without this a prover could
+    /// remove a round's binding entirely.
+    #[test_log::test]
+    fn a_dropped_round_root_is_rejected() {
+        let (airs, mut proof) = honest();
+        proof.aux_root = None;
+        assert_eq!(
+            replay_and_check(&airs, &proof),
+            None,
+            "the aux round exists in this epoch, so its root cannot be absent"
+        );
+    }
+
+    /// A root the epoch does not have. The preprocessed round is empty for this
+    /// fixture, so inventing a root must reject rather than be absorbed.
+    #[test_log::test]
+    fn an_invented_round_root_is_rejected() {
+        let (airs, mut proof) = honest();
+        assert!(
+            proof.prep_root.is_none(),
+            "the fixture has no preprocessed table"
+        );
+        proof.prep_root = Some(proof.main_root);
+        assert_eq!(
+            replay_and_check(&airs, &proof),
+            None,
+            "an epoch with no preprocessed table must not carry a preprocessed root"
+        );
+    }
+
+    /// The instance-class partition is derived from the shape and never sent, so
+    /// a terminal polynomial present for a batched table — or of the wrong
+    /// length for a standalone one — must be rejected.
+    #[test_log::test]
+    fn a_misplaced_standalone_terminal_polynomial_is_rejected() {
+        let (airs, honest_proof) = honest();
+
+        let mut invented = honest_proof.clone();
+        let batched_table = invented
+            .tables
+            .iter()
+            .position(|t| t.standalone_final_poly_coeffs.is_none())
+            .expect("the tallest table is always batched");
+        invented.tables[batched_table].standalone_final_poly_coeffs =
+            Some(vec![FieldElement::<E>::one(); 2]);
+        assert_eq!(
+            replay_and_check(&airs, &invented),
+            Some(false),
+            "a batched table must not carry a terminal-only polynomial"
+        );
+
+        if let Some(standalone_table) = honest_proof
+            .tables
+            .iter()
+            .position(|t| t.standalone_final_poly_coeffs.is_some())
+        {
+            let mut truncated = honest_proof.clone();
+            let coeffs = truncated.tables[standalone_table]
+                .standalone_final_poly_coeffs
+                .as_mut()
+                .expect("just checked");
+            coeffs.pop();
+            assert_eq!(
+                replay_and_check(&airs, &truncated),
+                Some(false),
+                "a standalone terminal polynomial of the wrong degree bound must be rejected"
+            );
+        }
+    }
+
+    /// The width the openings are authenticated under is the verifier's, and a
+    /// table whose declared trace length disagrees with the epoch it was proved
+    /// for moves the whole shape — heights, histogram, every challenge.
+    #[test_log::test]
+    fn a_tampered_trace_length_is_rejected() {
+        let (airs, mut proof) = honest();
+        proof.tables[1].trace_length *= 2;
+        assert_ne!(
+            replay_and_check(&airs, &proof),
+            Some(true),
+            "a trace length the prover did not commit must be rejected"
+        );
+    }
+}
+
+// ===========================================================================
+// The DEEP / FRI join (M-5 core)
+// ===========================================================================
+//
+// These are the tests that give the authenticated openings meaning. Everything
+// in `epoch` above shows the proof opened the rows its roots bind; these show
+// those rows evaluate to a codeword the batched FRI folds to the terminal
+// polynomial it sent.
+//
+// The honest path is unusually load-bearing here: it can only pass if the DEEP
+// reconstruction, the alpha mixing in `plan.batched` order, the per-table index
+// reduction, the injection convention (value chosen from the opened row pair by
+// `injection_position`'s low bit) and the coset relabelling are ALL right at
+// once. Any one of them wrong and the terminal check fails.
+mod fri_join {
+    use crate::batched::verifier::{replay_epoch_transcript, verify_epoch_fri};
+    use crate::config::KeccakStarkHash;
+    use crate::residency_mode::ResidencyMode;
+    use crate::tests::batched_prover_tests::{Air, E, F, folding_options, prove_repeated};
+    use crate::traits::AIR;
+    use crate::verifier::GenericVerifier;
+    use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+    use math::field::element::FieldElement;
+
+    type Proof = crate::batched::proof::BatchedMultiProof<F, E, ()>;
+    type V = GenericVerifier<F, E, (), KeccakStarkHash>;
+
+    fn join_holds(airs: &[Air], proof: &Proof) -> Option<bool> {
+        let refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = airs
+            .iter()
+            .map(|a| a as &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>)
+            .collect();
+        let (shape, params, challenges) =
+            replay_epoch_transcript(&refs, proof, &mut DefaultTranscript::<E>::new(&[]))?;
+        Some(verify_epoch_fri::<F, E, (), KeccakStarkHash, V>(
+            &refs,
+            proof,
+            &shape,
+            &params,
+            &challenges,
+        ))
+    }
+
+    fn honest() -> (Vec<Air>, Proof) {
+        let (airs, proof, _, _) = prove_repeated(1, &folding_options(), ResidencyMode::Retain);
+        (airs, proof)
+    }
+
+    /// ★ The honest path — and passing it is the joint statement listed above.
+    #[test_log::test]
+    fn the_batched_fri_join_verifies_an_honest_epoch() {
+        let (airs, proof) = honest();
+        assert_eq!(
+            join_holds(&airs, &proof),
+            Some(true),
+            "an honest epoch's opened rows must fold to the terminal polynomial it sent"
+        );
+    }
+
+    /// It must also hold at the degenerate shape, where every table terminates
+    /// immediately and the batched instance folds nothing — the branch
+    /// `verify_batched_fri_query` handles with `total_folds == 0` and the one
+    /// that puts every other table in the standalone class.
+    #[test_log::test]
+    fn the_join_verifies_a_no_fold_epoch() {
+        let (airs, proof, _, _) = prove_repeated(
+            1,
+            &crate::proof::options::ProofOptions::default_test_options(),
+            ResidencyMode::Retain,
+        );
+        assert_eq!(
+            join_holds(&airs, &proof),
+            Some(true),
+            "an epoch whose tables all terminate immediately must still verify"
+        );
+    }
+
+    /// The FRI layer openings are NOT absorbed into the transcript — the
+    /// structural length check and this recursion are the only things pinning
+    /// them. Tampering one leaves every Merkle root and every challenge intact,
+    /// so it is caught here or nowhere.
+    #[test_log::test]
+    fn a_tampered_fri_layer_evaluation_breaks_the_join() {
+        let (airs, honest_proof) = honest();
+        assert_eq!(
+            join_holds(&airs, &honest_proof),
+            Some(true),
+            "honest-path control"
+        );
+
+        let layers = honest_proof.queries[0].fri.layers_evaluations_sym.len();
+        assert!(layers > 0, "the folding fixture must commit a layer");
+        let mut proof = honest_proof.clone();
+        proof.queries[0].fri.layers_evaluations_sym[0] += FieldElement::<E>::one();
+        assert_eq!(
+            join_holds(&airs, &proof),
+            Some(false),
+            "a FRI layer value the prover did not commit must break the fold"
+        );
+    }
+
+    /// A truncated decommitment would make the fold loop run fewer rounds and
+    /// accept the query without ever reaching the terminal. The length check
+    /// runs before the loop for exactly that reason.
+    #[test_log::test]
+    fn a_truncated_fri_decommitment_is_rejected() {
+        let (airs, mut proof) = honest();
+        proof.queries[0].fri.layers_evaluations_sym.pop();
+        assert_eq!(
+            join_holds(&airs, &proof),
+            Some(false),
+            "a short decommitment must be rejected, not folded fewer times"
+        );
+    }
+
+    /// An opened trace row that the MMCS would accept only if the roots moved
+    /// with it: tampering one must break the DEEP value it feeds, so the join
+    /// fails independently of the Merkle check.
+    #[test_log::test]
+    fn a_tampered_opened_row_breaks_the_join() {
+        let (airs, mut proof) = honest();
+        proof.queries[0].main.per_matrix[0].evaluations[0] += FieldElement::<F>::one();
+        assert_eq!(
+            join_holds(&airs, &proof),
+            Some(false),
+            "a tampered trace row must change the DEEP value and fail the fold"
+        );
+    }
+
+    /// A standalone table's terminal polynomial is checked by the OTHER class's
+    /// routine, so it needs its own control: a tampered coefficient must be
+    /// caught even though the batched instance is untouched.
+    #[test_log::test]
+    fn a_tampered_standalone_terminal_polynomial_breaks_the_join() {
+        let (airs, honest_proof) = honest();
+        let Some(table) = honest_proof
+            .tables
+            .iter()
+            .position(|t| t.standalone_final_poly_coeffs.is_some())
+        else {
+            // The fixture's shape put every table in the batched class; nothing
+            // to test, and saying so beats a silently vacuous pass.
+            return;
+        };
+        let mut proof = honest_proof.clone();
+        proof.tables[table]
+            .standalone_final_poly_coeffs
+            .as_mut()
+            .expect("just checked")[0] += FieldElement::<E>::one();
+        assert_ne!(
+            join_holds(&airs, &proof),
+            Some(true),
+            "a standalone terminal polynomial the prover did not commit must be rejected"
+        );
+    }
+}
+
+// ===========================================================================
+// `multi_verify_batched` — the complete verification
+// ===========================================================================
+mod full_verify {
+    use crate::batched::verifier::multi_verify_batched;
+    use crate::config::KeccakStarkHash;
+    use crate::residency_mode::ResidencyMode;
+    use crate::tests::batched_prover_tests::{Air, E, F, folding_options, prove_repeated};
+    use crate::traits::AIR;
+    use crate::verifier::GenericVerifier;
+    use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+    use math::field::element::FieldElement;
+
+    type Proof = crate::batched::proof::BatchedMultiProof<F, E, ()>;
+    type V = GenericVerifier<F, E, (), KeccakStarkHash>;
+
+    fn verifies(airs: &[Air], proof: &Proof) -> bool {
+        let refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = airs
+            .iter()
+            .map(|a| a as &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>)
+            .collect();
+        // Unpinned, which `verify_prep_round` allows only because this fixture
+        // has no preprocessed table.
+        multi_verify_batched::<F, E, (), KeccakStarkHash, V, _>(
+            &refs,
+            proof,
+            &mut DefaultTranscript::<E>::new(&[]),
+            &FieldElement::zero(),
+            None,
+        )
+    }
+
+    fn honest() -> (Vec<Air>, Proof) {
+        let (airs, proof, _, _) = prove_repeated(1, &folding_options(), ResidencyMode::Retain);
+        (airs, proof)
+    }
+
+    /// ★★ Completeness: a proof this repository's batched prover produced is
+    /// accepted by this repository's batched verifier, end to end — replay,
+    /// commitments, constraint identity at every `z`, bus balance, and the
+    /// DEEP/FRI join across both instance classes.
+    #[test_log::test]
+    fn an_honest_batched_epoch_verifies_end_to_end() {
+        let (airs, proof) = honest();
+        assert!(
+            verifies(&airs, &proof),
+            "an honest batched epoch must verify"
+        );
+    }
+
+    /// The same at the degenerate shape, where nothing folds.
+    #[test_log::test]
+    fn an_honest_no_fold_epoch_verifies_end_to_end() {
+        let (airs, proof, _, _) = prove_repeated(
+            1,
+            &crate::proof::options::ProofOptions::default_test_options(),
+            ResidencyMode::Retain,
+        );
+        assert!(
+            verifies(&airs, &proof),
+            "an epoch whose tables all terminate immediately must verify"
+        );
+    }
+
+    /// Residency is a performance choice, so it must be invisible to a verifier
+    /// as well as to the roots.
+    #[test_log::test]
+    fn both_residency_modes_produce_verifying_proofs() {
+        for mode in [ResidencyMode::Retain, ResidencyMode::RecomputeLde] {
+            let (airs, proof, _, _) = prove_repeated(1, &folding_options(), mode);
+            assert!(
+                verifies(&airs, &proof),
+                "{mode:?} must produce a valid proof"
+            );
+        }
+    }
+
+    /// The bus balance is the one cross-table statement, and no per-table check
+    /// can make it. Verifying against a balance the epoch does not have must
+    /// fail — with the honest expectation as the control.
+    #[test_log::test]
+    fn a_wrong_expected_bus_balance_is_rejected() {
+        let (airs, proof) = honest();
+        let refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = airs
+            .iter()
+            .map(|a| a as &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>)
+            .collect();
+        assert!(
+            multi_verify_batched::<F, E, (), KeccakStarkHash, V, _>(
+                &refs,
+                &proof,
+                &mut DefaultTranscript::<E>::new(&[]),
+                &FieldElement::zero(),
+                None,
+            ),
+            "honest-path control: the epoch balances at zero"
+        );
+        assert!(
+            !multi_verify_batched::<F, E, (), KeccakStarkHash, V, _>(
+                &refs,
+                &proof,
+                &mut DefaultTranscript::<E>::new(&[]),
+                &FieldElement::one(),
+                None,
+            ),
+            "an expected balance the epoch does not have must be rejected"
+        );
+    }
+
+    /// The constraint identity. A composition-parts OOD value the trace does not
+    /// justify must fail — this is the check whose absence would let the batched
+    /// path accept a proof of a false statement while every root and every
+    /// opening stayed consistent.
+    #[test_log::test]
+    fn a_claimed_composition_value_the_trace_does_not_justify_is_rejected() {
+        let (airs, mut proof) = honest();
+        proof.tables[0].composition_poly_parts_ood_evaluation[0] += FieldElement::<E>::one();
+        assert!(
+            !verifies(&airs, &proof),
+            "a composition OOD value the trace does not justify must be rejected"
+        );
+    }
+
+    /// Every negative already covered piecewise must also be rejected by the
+    /// whole verifier — a check that exists but is never reached is not a check.
+    #[test_log::test]
+    fn the_whole_verifier_rejects_what_the_pieces_reject() {
+        let (airs, honest_proof) = honest();
+        assert!(verifies(&airs, &honest_proof), "honest-path control");
+
+        let mut short_queries = honest_proof.clone();
+        short_queries.queries.pop();
+        assert!(!verifies(&airs, &short_queries), "short query list");
+
+        let mut bad_nonce = honest_proof.clone();
+        bad_nonce.nonce = Some(bad_nonce.nonce.expect("the fixture grinds").wrapping_add(1));
+        assert!(!verifies(&airs, &bad_nonce), "forged grinding nonce");
+
+        let mut bad_row = honest_proof.clone();
+        bad_row.queries[0].main.per_matrix[0].evaluations[0] += FieldElement::<F>::one();
+        assert!(!verifies(&airs, &bad_row), "tampered opened row");
+
+        let mut bad_layer = honest_proof.clone();
+        bad_layer.queries[0].fri.layers_evaluations_sym[0] += FieldElement::<E>::one();
+        assert!(!verifies(&airs, &bad_layer), "tampered FRI layer value");
+
+        let mut no_aux_root = honest_proof.clone();
+        no_aux_root.aux_root = None;
+        assert!(!verifies(&airs, &no_aux_root), "dropped aux root");
+    }
+}
+
+// ===========================================================================
+// The pinned preprocessed round (M-6) — through the WHOLE verifier
+// ===========================================================================
+//
+// `batched_prover_tests` covers the prover's fail-fast and the per-matrix
+// tamper control at the MMCS level. What it cannot show is that
+// `multi_verify_batched` actually reaches the comparison: MMCS-PLAN §3.3 warns
+// that consolidating a per-table soundness check into one comparison is where
+// coverage quietly goes missing, and a comparison the top-level verifier never
+// calls is exactly that failure.
+mod prep_binding {
+    use crate::batched::shape::PinnedPrep;
+    use crate::batched::verifier::multi_verify_batched;
+    use crate::config::KeccakStarkHash;
+    use crate::tests::batched_prover_tests::{
+        Air, E, F, PREP_WIDTHS, honest_prep_root, prove_preprocessed,
+    };
+    use crate::traits::AIR;
+    use crate::verifier::GenericVerifier;
+    use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+    use math::field::element::FieldElement;
+
+    type Proof = crate::batched::proof::BatchedMultiProof<F, E, ()>;
+    type V = GenericVerifier<F, E, (), KeccakStarkHash>;
+
+    fn verifies(airs: &[Air], proof: &Proof, expected_prep: Option<PinnedPrep<'_>>) -> bool {
+        let refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = airs
+            .iter()
+            .map(|a| a as &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>)
+            .collect();
+        multi_verify_batched::<F, E, (), KeccakStarkHash, V, _>(
+            &refs,
+            proof,
+            &mut DefaultTranscript::<E>::new(&[]),
+            &FieldElement::zero(),
+            expected_prep,
+        )
+    }
+
+    fn honest() -> (Vec<Air>, Proof, crate::config::Commitment) {
+        let root = honest_prep_root();
+        let (airs, proof, _) = prove_preprocessed(Some(PinnedPrep {
+            root: &root,
+            widths: &PREP_WIDTHS,
+        }))
+        .expect("an honest preprocessed epoch");
+        (airs, proof, root)
+    }
+
+    /// ★★ The honest path. A preprocessed epoch proved against a pinned root
+    /// verifies end to end against that same root — every other test in this
+    /// module is a rejection, and without this one they would all be satisfied
+    /// by a verifier that rejected everything.
+    #[test_log::test]
+    fn an_honest_preprocessed_epoch_verifies_against_its_pinned_root() {
+        let (airs, proof, root) = honest();
+        assert!(
+            verifies(
+                &airs,
+                &proof,
+                Some(PinnedPrep {
+                    root: &root,
+                    widths: &PREP_WIDTHS,
+                })
+            ),
+            "an honest preprocessed epoch must verify against its pinned root"
+        );
+    }
+
+    /// ★ The check M-6 exists for. Everything else in the batched verifier
+    /// authenticates openings against roots the PROOF carries; a prover who
+    /// chose the preprocessed matrices chose those roots too, so without this
+    /// comparison a proof over ANY preprocessed content would be self-consistent
+    /// and accepted.
+    #[test_log::test]
+    fn a_prep_root_the_program_does_not_pin_is_rejected() {
+        let (airs, proof, root) = honest();
+        let mut wrong = root;
+        wrong[0] ^= 0xff;
+        assert!(
+            !verifies(
+                &airs,
+                &proof,
+                Some(PinnedPrep {
+                    root: &wrong,
+                    widths: &PREP_WIDTHS,
+                })
+            ),
+            "a proof whose prep root is not the pinned one must be rejected"
+        );
+    }
+
+    /// The pinned widths are compared, and positionally. Swapping them keeps the
+    /// multiset and the total width identical, so only a positional comparison
+    /// rejects it — and it must reject even under the honest root, or the widths
+    /// are decoration the root comparison happens to cover.
+    #[test_log::test]
+    fn the_pinned_widths_are_compared() {
+        let (airs, proof, root) = honest();
+        let swapped = [PREP_WIDTHS[1], PREP_WIDTHS[0]];
+        assert_ne!(
+            swapped, PREP_WIDTHS,
+            "the fixture's two preprocessed matrices must have different widths, \
+             or this test passes vacuously"
+        );
+        assert!(
+            !verifies(
+                &airs,
+                &proof,
+                Some(PinnedPrep {
+                    root: &root,
+                    widths: &swapped,
+                })
+            ),
+            "pinned widths in the wrong order must be rejected under the honest root"
+        );
+    }
+
+    /// ★ `None` fails closed. An epoch WITH a preprocessed round and no pinned
+    /// root must be rejected rather than fall back to the proof's own root —
+    /// that fallback is precisely the hole the per-table path does not have.
+    #[test_log::test]
+    fn an_unpinned_caller_cannot_verify_a_preprocessed_epoch() {
+        let (airs, proof, _) = honest();
+        assert!(
+            !verifies(&airs, &proof, None),
+            "a preprocessed epoch must not verify without a pinned root"
+        );
+    }
+
+    /// The mirror: a pinned root supplied for an epoch whose AIR set has no
+    /// preprocessed table is a caller/AIR-set disagreement, not something to
+    /// wave through.
+    #[test_log::test]
+    fn a_pinned_root_on_an_unpreprocessed_epoch_is_rejected() {
+        use crate::residency_mode::ResidencyMode;
+        use crate::tests::batched_prover_tests::{folding_options, prove_repeated};
+
+        let (airs, proof, _, _) = prove_repeated(1, &folding_options(), ResidencyMode::Retain);
+        let root = honest_prep_root();
+        assert!(
+            !verifies(
+                &airs,
+                &proof,
+                Some(PinnedPrep {
+                    root: &root,
+                    widths: &PREP_WIDTHS,
+                })
+            ),
+            "a pinned prep root for an epoch with no preprocessed round must be rejected"
+        );
+    }
+
+    /// ★ The per-matrix quantifier, reached through the WHOLE verifier rather
+    /// than through `MixedMmcs::verify_batch` alone. MMCS-PLAN §3.3: the single
+    /// comparison must fail if ANY one table's preprocessed matrix is wrong.
+    #[test_log::test]
+    fn a_tampered_prep_matrix_is_rejected_per_matrix_end_to_end() {
+        let (airs, honest_proof, root) = honest();
+        let pinned = || {
+            Some(PinnedPrep {
+                root: &root,
+                widths: &PREP_WIDTHS,
+            })
+        };
+        assert!(
+            verifies(&airs, &honest_proof, pinned()),
+            "honest-path control"
+        );
+
+        let matrices = honest_proof.queries[0]
+            .prep
+            .as_ref()
+            .expect("prep opening")
+            .per_matrix
+            .len();
+        assert_eq!(
+            matrices,
+            PREP_WIDTHS.len(),
+            "the fixture must contribute one opening per preprocessed matrix"
+        );
+
+        for matrix in 0..matrices {
+            let mut tampered = honest_proof.clone();
+            tampered.queries[0]
+                .prep
+                .as_mut()
+                .expect("prep opening")
+                .per_matrix[matrix]
+                .evaluations[0] += FieldElement::<F>::one();
+            assert!(
+                !verifies(&airs, &tampered, pinned()),
+                "prep matrix {matrix}: a tampered precomputed value must be rejected \
+                 by the whole verifier"
+            );
+        }
+    }
 }

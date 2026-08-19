@@ -3,6 +3,7 @@
 #[cfg(all(target_arch = "wasm32", feature = "disk-spill"))]
 compile_error!("the `disk-spill` feature requires memmap2, which does not compile on wasm32");
 
+pub mod batched;
 #[cfg(feature = "debug-checks")]
 pub mod bus_debug;
 pub mod commitment;
