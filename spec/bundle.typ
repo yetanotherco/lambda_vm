@@ -23,7 +23,7 @@
     strong(title);
     list(..chapters.map(((cname, ctitle, cref)) => {
       if cname == chapter {
-        html.a(ctitle, class: "current", tabindex: -1)
+        html.a(ctitle, class: "current", tabindex: -1, aria-current: "page")
       } else {
         link(label("doc:" + str(cname)), ctitle)
       }
