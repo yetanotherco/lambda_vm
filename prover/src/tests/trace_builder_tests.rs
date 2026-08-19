@@ -837,7 +837,7 @@ fn test_from_image_and_logs_matches_from_elf_and_logs() {
 
     let elf_bytes = asm_elf_bytes("basic_program");
     let program = Elf::load(&elf_bytes).unwrap();
-    let logs = Executor::new(&program, vec![]).unwrap().run().unwrap().logs;
+    let logs = Executor::new(&program, vec![], &[]).unwrap().run().unwrap().logs;
     let max_rows = MaxRowsConfig::default();
 
     let from_elf = Traces::from_elf_and_logs(
@@ -845,12 +845,13 @@ fn test_from_image_and_logs_matches_from_elf_and_logs() {
         &logs,
         &max_rows,
         &[],
+        &[],
         #[cfg(feature = "disk-spill")]
         stark::storage_mode::StorageMode::Ram,
     )
     .unwrap();
 
-    let image = build_initial_image(&program, &[]);
+    let image = build_initial_image(&program, &[], &[]);
     let register_init =
         crate::tables::register::register_init_from_entry_point(program.entry_point);
     let from_image = Traces::from_image_and_logs(
@@ -859,6 +860,7 @@ fn test_from_image_and_logs_matches_from_elf_and_logs() {
         &register_init,
         &logs,
         &max_rows,
+        &[],
         &[],
         true,
         false,
@@ -889,14 +891,14 @@ fn test_epoch_end_memory_converts_to_image() {
     let elf_bytes = asm_elf_bytes("basic_program");
     let program = Elf::load(&elf_bytes).unwrap();
 
-    let total = Executor::new(&program, vec![])
+    let total = Executor::new(&program, vec![], &[])
         .unwrap()
         .run()
         .unwrap()
         .logs
         .len();
     let epoch_size = (total / 3).max(1);
-    let epochs = Executor::new(&program, vec![])
+    let epochs = Executor::new(&program, vec![], &[])
         .unwrap()
         .run_epochs(epoch_size)
         .unwrap();
@@ -920,14 +922,14 @@ fn test_build_traces_for_all_epochs() {
     let elf_bytes = asm_elf_bytes("basic_program");
     let program = Elf::load(&elf_bytes).unwrap();
 
-    let total = Executor::new(&program, vec![])
+    let total = Executor::new(&program, vec![], &[])
         .unwrap()
         .run()
         .unwrap()
         .logs
         .len();
     let epoch_size = (total / 3).max(1);
-    let epochs = Executor::new(&program, vec![])
+    let epochs = Executor::new(&program, vec![], &[])
         .unwrap()
         .run_epochs(epoch_size)
         .unwrap();
@@ -941,7 +943,7 @@ fn test_build_traces_for_all_epochs() {
         // previous epoch's ending memory + register snapshot.
         let (image, register_init): (HashMap<u64, u8>, Vec<u32>) = if i == 0 {
             (
-                build_initial_image(&program, &[]),
+                build_initial_image(&program, &[], &[]),
                 crate::tables::register::register_init_from_entry_point(program.entry_point),
             )
         } else {
@@ -960,6 +962,7 @@ fn test_build_traces_for_all_epochs() {
             &register_init,
             &epoch.logs,
             &max_rows,
+            &[],
             &[],
             i == last,
             false,
@@ -989,14 +992,14 @@ fn test_terminating_epoch_rejected_when_not_final() {
     let elf_bytes = asm_elf_bytes("basic_program");
     let program = Elf::load(&elf_bytes).unwrap();
 
-    let total = Executor::new(&program, vec![])
+    let total = Executor::new(&program, vec![], &[])
         .unwrap()
         .run()
         .unwrap()
         .logs
         .len();
     let epoch_size = (total / 3).max(1);
-    let epochs = Executor::new(&program, vec![])
+    let epochs = Executor::new(&program, vec![], &[])
         .unwrap()
         .run_epochs(epoch_size)
         .unwrap();
@@ -1015,6 +1018,7 @@ fn test_terminating_epoch_rejected_when_not_final() {
         &register_init,
         &epochs[last].logs,
         &MaxRowsConfig::default(),
+        &[],
         &[],
         false,
         false,
@@ -1043,20 +1047,20 @@ fn test_local_to_global_traces_from_real_execution() {
     let elf_bytes = asm_elf_bytes("all_loadstore_32");
     let program = Elf::load(&elf_bytes).unwrap();
 
-    let total = Executor::new(&program, vec![])
+    let total = Executor::new(&program, vec![], &[])
         .unwrap()
         .run()
         .unwrap()
         .logs
         .len();
     let epoch_size = (total / 3).max(1);
-    let epochs = Executor::new(&program, vec![])
+    let epochs = Executor::new(&program, vec![], &[])
         .unwrap()
         .run_epochs(epoch_size)
         .unwrap();
     assert!(epochs.len() >= 2);
 
-    let elf_image = build_initial_image(&program, &[]);
+    let elf_image = build_initial_image(&program, &[], &[]);
     let total_memory = elf_image.len();
 
     // Per-epoch touched cells from real execution (epoch 0 from the ELF image,

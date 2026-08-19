@@ -48,7 +48,7 @@ fn read_guest_elf(name: &str) -> Vec<u8> {
 /// The set of program-counter values fetched during a run of `elf_bytes`.
 fn executed_pcs(elf_bytes: &[u8]) -> HashSet<u64> {
     let elf = Elf::load(elf_bytes).expect("ELF load failed");
-    let executor = Executor::new(&elf, vec![]).expect("executor new");
+    let executor = Executor::new(&elf, vec![], &[]).expect("executor new");
     let result = executor.run().expect("run failed");
     result.logs.iter().map(|l| l.current_pc).collect()
 }
@@ -132,7 +132,7 @@ fn custom_prove_with_statement_elf(
     opts: &stark::proof::options::ProofOptions,
 ) -> VmProof {
     let program = Elf::load(prove_elf).expect("prove ELF load failed");
-    let executor = Executor::new(&program, vec![]).expect("executor new");
+    let executor = Executor::new(&program, vec![], &[]).expect("executor new");
     let result = executor.run().expect("run failed");
 
     let max_rows = MaxRowsConfig::default();
@@ -140,6 +140,7 @@ fn custom_prove_with_statement_elf(
         &program,
         &result.logs,
         &max_rows,
+        &[],
         &[],
         #[cfg(feature = "disk-spill")]
         stark::storage_mode::StorageMode::Ram,

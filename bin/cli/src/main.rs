@@ -147,6 +147,23 @@ enum Commands {
         /// data).
         #[arg(long)]
         cycles: bool,
+
+        /// Path to a hint arena file (concatenated 32-byte slots) appended to
+        /// the private-input region; produce one with --record-hints. The
+        /// flamegraph path always runs hint-free (conservative profiles).
+        #[arg(long, value_hint = ValueHint::FilePath, conflicts_with = "flamegraph")]
+        hints: Option<PathBuf>,
+
+        /// Recording pass of the two-pass hint flow: run once with an empty
+        /// hint arena, answer the guest's logged hint requests host-side, and
+        /// write the resulting arena (concatenated 32-byte slots) to this file
+        /// for use with --hints on the second, provable run.
+        #[arg(
+            long,
+            value_hint = ValueHint::FilePath,
+            conflicts_with_all = ["flamegraph", "cycle_budget", "hints", "cycles"]
+        )]
+        record_hints: Option<PathBuf>,
     },
 
     /// Generate a proof for an ELF program
@@ -193,6 +210,11 @@ enum Commands {
             long_help = "Continuation epoch size as log2(cycles); e.g. 20 means 1,048,576 cycles.\n\nDefault when omitted: 20. Values below 18 are rejected for the CLI because tiny epochs are dominated by fixed overhead. Indicative ethrex 10-transfer distinct-account peak heap from a local sweep: 19 ~= 6.9 GB, 20 ~= 9.5 GB, 21 ~= 15.8 GB, 22 ~= 26.8 GB. Higher values reduce epoch count, continuation bundle size, and fixed per-epoch overhead, but increase peak memory. For a new workload, try the highest value your machine can run without swapping."
         )]
         epoch_size_log2: Option<u32>,
+
+        /// Path to a hint arena file (concatenated 32-byte slots) appended to
+        /// the private-input region; produce one with `execute --record-hints`.
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        hints: Option<PathBuf>,
     },
 
     /// Verify a proof bundle
@@ -227,6 +249,11 @@ enum Commands {
         /// Path to the private input file
         #[arg(long, value_hint = ValueHint::FilePath)]
         private_input: Option<PathBuf>,
+
+        /// Path to a hint arena file (concatenated 32-byte slots) appended to
+        /// the private-input region; produce one with `execute --record-hints`.
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        hints: Option<PathBuf>,
     },
 }
 
@@ -243,6 +270,8 @@ fn main() -> ExitCode {
             flamegraph_checkpoint_cycles,
             cycle_budget,
             cycles,
+            hints,
+            record_hints,
         } => cmd_execute(
             elf,
             private_input,
@@ -253,6 +282,8 @@ fn main() -> ExitCode {
             },
             cycle_budget,
             cycles,
+            hints,
+            record_hints,
         ),
         Commands::Prove {
             elf,
@@ -264,6 +295,7 @@ fn main() -> ExitCode {
             elements,
             continuations,
             epoch_size_log2,
+            hints,
         } => {
             if continuations {
                 cmd_prove_continuation(
@@ -274,9 +306,10 @@ fn main() -> ExitCode {
                     blowup,
                     time,
                     cycles,
+                    hints,
                 )
             } else {
-                cmd_prove(elf, output, private_input, blowup, time, cycles, elements)
+                cmd_prove(elf, output, private_input, blowup, time, cycles, elements, hints)
             }
         }
         Commands::Verify {
@@ -292,7 +325,11 @@ fn main() -> ExitCode {
                 cmd_verify(proof, elf, blowup, time)
             }
         }
-        Commands::CountElements { elf, private_input } => cmd_count_elements(elf, private_input),
+        Commands::CountElements {
+            elf,
+            private_input,
+            hints,
+        } => cmd_count_elements(elf, private_input, hints),
     }
 }
 
@@ -306,10 +343,37 @@ fn read_private_input(path: Option<&PathBuf>) -> Result<Vec<u8>, String> {
     }
 }
 
-fn count_cycles(elf_data: &[u8], private_inputs: &[u8]) -> Result<u64, String> {
+/// Read a hint arena file: concatenated 32-byte slots, in the guest's request
+/// order (see `executor::vm::memory::encode_private_input_region`).
+fn read_hints(path: Option<&PathBuf>) -> Result<Vec<[u8; 32]>, String> {
+    match path {
+        Some(path) => {
+            eprintln!("Reading hint arena file...");
+            let bytes =
+                std::fs::read(path).map_err(|e| format!("Failed to read hint arena file: {e}"))?;
+            if bytes.len() % 32 != 0 {
+                return Err(format!(
+                    "Hint arena file must be whole 32-byte slots, got {} bytes",
+                    bytes.len()
+                ));
+            }
+            Ok(bytes
+                .chunks_exact(32)
+                .map(|slot| slot.try_into().expect("32-byte chunk"))
+                .collect())
+        }
+        None => Ok(vec![]),
+    }
+}
+
+fn count_cycles(
+    elf_data: &[u8],
+    private_inputs: &[u8],
+    hints: &[[u8; 32]],
+) -> Result<u64, String> {
     let program =
         Elf::load(elf_data).map_err(|e| format!("Failed to load ELF for cycle count: {e:?}"))?;
-    let executor = Executor::new(&program, private_inputs.to_vec())
+    let executor = Executor::new(&program, private_inputs.to_vec(), hints)
         .map_err(|e| format!("Failed to create executor for cycle count: {e:?}"))?;
     executor
         .run()
@@ -383,6 +447,8 @@ fn cmd_execute(
     flamegraph: FlamegraphCliOptions,
     cycle_budget: Option<u64>,
     cycles: bool,
+    hints_path: Option<PathBuf>,
+    record_hints_path: Option<PathBuf>,
 ) -> ExitCode {
     let elf_data = match std::fs::read(&elf_path) {
         Ok(data) => data,
@@ -402,6 +468,36 @@ fn cmd_execute(
 
     let private_inputs = match read_private_input(private_input_path.as_ref()) {
         Ok(inputs) => inputs,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Recording pass of the two-pass hint flow: run hint-free, answer the
+    // guest's logged requests host-side, and write the arena for --hints runs.
+    if let Some(record_path) = record_hints_path {
+        let hints = match executor::vm::execution::collect_hints(&program, private_inputs) {
+            Ok(hints) => hints,
+            Err(e) => {
+                eprintln!("Hint recording run failed: {e:?}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let mut bytes = Vec::with_capacity(32 * hints.len());
+        for slot in &hints {
+            bytes.extend_from_slice(slot);
+        }
+        if let Err(e) = std::fs::write(&record_path, &bytes) {
+            eprintln!("Failed to write hint arena file: {e}");
+            return ExitCode::FAILURE;
+        }
+        eprintln!("Recorded {} hint slots to {:?}", hints.len(), record_path);
+        return ExitCode::SUCCESS;
+    }
+
+    let hints = match read_hints(hints_path.as_ref()) {
+        Ok(hints) => hints,
         Err(e) => {
             eprintln!("{e}");
             return ExitCode::FAILURE;
@@ -469,7 +565,7 @@ fn cmd_execute(
 
         total_cycles
     } else {
-        let mut executor = match Executor::new(&program, private_inputs) {
+        let mut executor = match Executor::new(&program, private_inputs, &hints) {
             Ok(e) => e,
             Err(e) => {
                 eprintln!("Failed to create executor: {:?}", e);
@@ -550,6 +646,7 @@ fn cmd_prove(
     time: bool,
     cycles: bool,
     elements: bool,
+    hints_path: Option<PathBuf>,
 ) -> ExitCode {
     eprintln!("Reading ELF file...");
     let elf_data = match std::fs::read(&elf_path) {
@@ -568,11 +665,19 @@ fn cmd_prove(
         }
     };
 
+    let hints = match read_hints(hints_path.as_ref()) {
+        Ok(hints) => hints,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     // Pre-pass: execute once outside the timer to count dynamic instructions.
     // Mirrors SP1's cycle-count pass so both provers report the same kind of
     // number without inflating the measured proving time.
     let cycle_count = if cycles {
-        match count_cycles(&elf_data, &private_inputs) {
+        match count_cycles(&elf_data, &private_inputs, &hints) {
             Ok(count) => Some(count),
             Err(e) => {
                 eprintln!("{e}");
@@ -585,7 +690,7 @@ fn cmd_prove(
 
     // Pre-pass: build traces and count field elements without running the proof.
     let element_count = if elements {
-        match prover::count_elements(&elf_data, &private_inputs) {
+        match prover::count_elements(&elf_data, &private_inputs, &hints) {
             Ok(counts) => Some(counts),
             Err(e) => {
                 eprintln!("Failed to count elements: {:?}", e);
@@ -620,6 +725,7 @@ fn cmd_prove(
     let proof = prover::prove_with_options_and_inputs(
         &elf_data,
         &private_inputs,
+        &hints,
         &opts,
         &Default::default(),
     );
@@ -740,6 +846,7 @@ fn cmd_prove_continuation(
     blowup: u8,
     time: bool,
     cycles: bool,
+    hints_path: Option<PathBuf>,
 ) -> ExitCode {
     eprintln!("Reading ELF file...");
     let elf_data = match std::fs::read(&elf_path) {
@@ -758,8 +865,16 @@ fn cmd_prove_continuation(
         }
     };
 
+    let hints = match read_hints(hints_path.as_ref()) {
+        Ok(hints) => hints,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let cycle_count = if cycles {
-        match count_cycles(&elf_data, &private_inputs) {
+        match count_cycles(&elf_data, &private_inputs, &hints) {
             Ok(count) => Some(count),
             Err(e) => {
                 eprintln!("{e}");
@@ -800,6 +915,7 @@ fn cmd_prove_continuation(
     let bundle = match prover::continuation::prove_continuation(
         &elf_data,
         &private_inputs,
+        &hints,
         epoch_size_log2,
         &opts,
     ) {
@@ -916,7 +1032,11 @@ fn cmd_verify_continuation(
     }
 }
 
-fn cmd_count_elements(elf_path: PathBuf, private_input_path: Option<PathBuf>) -> ExitCode {
+fn cmd_count_elements(
+    elf_path: PathBuf,
+    private_input_path: Option<PathBuf>,
+    hints_path: Option<PathBuf>,
+) -> ExitCode {
     let elf_data = match std::fs::read(&elf_path) {
         Ok(data) => data,
         Err(e) => {
@@ -933,7 +1053,15 @@ fn cmd_count_elements(elf_path: PathBuf, private_input_path: Option<PathBuf>) ->
         }
     };
 
-    match prover::count_elements(&elf_data, &private_inputs) {
+    let hints = match read_hints(hints_path.as_ref()) {
+        Ok(hints) => hints,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    match prover::count_elements(&elf_data, &private_inputs, &hints) {
         Ok((main, aux)) => {
             println!("Elements: {}", main);
             println!("Aux elements (EF-cols): {}", aux);

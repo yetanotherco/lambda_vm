@@ -33,7 +33,7 @@ fn peak_bytes_does_not_underestimate_measured_heap() {
 
     let max_rows = MaxRowsConfig::default();
     let lengths =
-        count_table_lengths(&elf, &logs, &max_rows, &[]).expect("count_table_lengths succeeds");
+        count_table_lengths(&elf, &logs, &max_rows, &[], &[]).expect("count_table_lengths succeeds");
 
     let opts = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is valid");
     let predicted = peak_bytes(&lengths, opts.blowup_factor, table_parallelism()) as usize;
@@ -56,7 +56,7 @@ fn peak_bytes_does_not_underestimate_measured_heap() {
     };
 
     let _proof =
-        prove_with_options_and_inputs(&elf_bytes, &[], &opts, &max_rows).expect("proof succeeds");
+        prove_with_options_and_inputs(&elf_bytes, &[], &[], &opts, &max_rows).expect("proof succeeds");
 
     stop.store(true, Ordering::Relaxed);
     sampler.join().expect("sampler joins");

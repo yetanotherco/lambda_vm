@@ -25,6 +25,10 @@ pub struct ExecutionResult {
     /// Predecoded instructions map (pc -> instruction)
     /// Use this to look up instructions by their PC from the logs
     pub instructions: U64HashMap<Instruction>,
+    /// `(hint_id, input)` pairs the guest appended to the hint request log
+    /// (arena exhausted), in request order — the recording pass of the two-pass
+    /// hint flow. Empty when the arena covered every request.
+    pub hint_requests: Vec<(u64, [u8; 32])>,
 }
 
 /// Size of each log chunk - balances memory usage vs callback overhead
@@ -51,9 +55,13 @@ pub struct Executor {
 }
 
 impl Executor {
-    pub fn new(program: &Elf, private_inputs: Vec<u8>) -> Result<Self, ExecutorError> {
+    pub fn new(
+        program: &Elf,
+        private_inputs: Vec<u8>,
+        hints: &[[u8; 32]],
+    ) -> Result<Self, ExecutorError> {
         let mut memory = Memory::default();
-        memory.store_private_inputs(private_inputs)?;
+        memory.store_private_inputs(private_inputs, hints)?;
         let instructions = InstructionCache::new(&program.data)?;
         load_program(&program.data, &mut memory)?;
 
@@ -163,6 +171,7 @@ impl Executor {
             return_values: self.get_return_values()?,
             logs,
             instructions: self.instructions.into_instruction_map(),
+            hint_requests: self.memory.hint_requests()?,
         })
     }
 
@@ -188,6 +197,33 @@ impl Executor {
         }
         Ok(epochs)
     }
+}
+
+/// Record the guest's hint requests and answer them — the host half of the
+/// two-pass hint flow for guests whose hints are not known before the run.
+///
+/// The program runs once with an empty hint arena: every
+/// `syscalls::syscalls::request_hint` misses, is appended to the guest's
+/// request log, and the guest recomputes in software (correct, just slower).
+/// Each logged `(hint_id, input)` is then answered with
+/// [`crate::vm::instruction::execution::compute_hint`], and the answers — in
+/// request order — are returned as the hint arena for the second, provable
+/// pass: pass them as `hints` to [`Executor::new`] (or the prover's `prove_*`
+/// functions) together with the same program and private input. Both passes
+/// produce the same committed output; the arena only changes how cheaply the
+/// guest gets there. A guest that requests nothing yields an empty arena.
+pub fn collect_hints(
+    program: &Elf,
+    private_inputs: Vec<u8>,
+) -> Result<Vec<[u8; 32]>, ExecutorError> {
+    let result = Executor::new(program, private_inputs, &[])?.run()?;
+    Ok(result
+        .hint_requests
+        .iter()
+        .map(|(hint_id, input)| {
+            crate::vm::instruction::execution::compute_hint(*hint_id, input)
+        })
+        .collect())
 }
 
 fn load_program(segments: &[crate::elf::Segment], memory: &mut Memory) -> Result<(), MemoryError> {

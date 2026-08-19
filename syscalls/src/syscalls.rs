@@ -33,12 +33,7 @@ const KECCAK_SYSCALL_NUMBER: usize = usize::MAX - 1;
 #[cfg(target_arch = "riscv64")]
 const ECSM_SYSCALL_NUMBER: usize = usize::MAX - 10;
 
-/// Syscall number for the non-constraining Hint ecall.
-/// Must match `executor::...::execution::HINT_SYSCALL_NUMBER` (u64::MAX - 30).
-#[cfg(target_arch = "riscv64")]
-const HINT_SYSCALL_NUMBER: usize = usize::MAX - 30;
-
-/// Hint selectors passed in `a0` (must match the executor's `HINT_*`).
+/// Hint selectors for the request log (must match the executor's `HINT_*`).
 pub const HINT_FIELD_INV: usize = 0;
 pub const HINT_SCALAR_INV: usize = 1;
 pub const HINT_FIELD_SQRT: usize = 2;
@@ -138,6 +133,166 @@ pub fn get_private_input_slice() -> &'static [u8] {
     unimplemented!("syscalls are only implemented for riscv64 targets");
 }
 
+// =============================================================================
+// Hint arena — untrusted, host-supplied 32-byte hint values appended to the
+// private-input region after the length-prefixed main data:
+//
+//   [u32 LE main_len][main data][zero-pad to 8][u32 LE hint_count][u32 pad]
+//   then `hint_count` slots of 32 bytes, 8-aligned.
+//
+// Must match `executor::vm::memory::{hint_arena_header_offset,
+// HINT_ARENA_HEADER_BYTES, HINT_SLOT_BYTES}` — the executor writes the region,
+// this crate reads it.
+//
+// The values are UNTRUSTED (the prover chooses them): the caller MUST verify
+// each hint in-guest (e.g. `x·inv == 1`) and recompute in software on failure.
+// Consumption is positional — one slot per request, pass or fail — so a lying
+// host can only trigger fallbacks, never shift the hint stream.
+// =============================================================================
+
+/// Byte size of one hint slot in the hint arena.
+/// Must match `executor::vm::memory::HINT_SLOT_BYTES`.
+#[cfg(target_arch = "riscv64")]
+pub const HINT_SLOT_BYTES: usize = 32;
+
+/// Byte size of the arena header (`[u32 LE hint_count][u32 zero pad]`).
+/// Must match `executor::vm::memory::HINT_ARENA_HEADER_BYTES`.
+#[cfg(target_arch = "riscv64")]
+const HINT_ARENA_HEADER_BYTES: usize = 8;
+
+/// Offset from `PRIVATE_INPUT_START` of the arena header for a given main-input
+/// length: the 4-byte length prefix plus the data, padded up to 8 bytes.
+/// Must match `executor::vm::memory::hint_arena_header_offset`.
+#[cfg(target_arch = "riscv64")]
+const fn hint_arena_header_offset(main_len: usize) -> usize {
+    (4 + main_len + 7) & !7
+}
+
+/// Absolute address of the arena header, derived from the (clamped) length
+/// prefix — the same value `get_private_input_slice` trusts.
+#[cfg(target_arch = "riscv64")]
+fn hint_arena_header_addr() -> usize {
+    let len = (unsafe { core::ptr::read_volatile(PRIVATE_INPUT_START as *const u32) } as usize)
+        .min(MAX_PRIVATE_INPUT_SIZE);
+    PRIVATE_INPUT_START + hint_arena_header_offset(len)
+}
+
+/// Number of hint slots the host supplied. 0 when no arena was written (the
+/// header reads back as zero-filled memory).
+#[cfg(target_arch = "riscv64")]
+pub fn hint_count() -> usize {
+    unsafe { core::ptr::read_volatile(hint_arena_header_addr() as *const u32) as usize }
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+pub fn hint_count() -> usize {
+    unimplemented!("syscalls are only implemented for riscv64 targets");
+}
+
+/// Read hint slot `i` as raw bytes, or `None` when the arena has no slot `i`.
+/// The slot is read as four aligned 8-byte words (the fast aligned-load path);
+/// slots are 8-aligned by construction.
+#[cfg(target_arch = "riscv64")]
+pub fn hint_slot(i: usize) -> Option<[u8; 32]> {
+    if i >= hint_count() {
+        return None;
+    }
+    let addr = hint_arena_header_addr() + HINT_ARENA_HEADER_BYTES + i * HINT_SLOT_BYTES;
+    debug_assert_eq!(addr % 8, 0, "hint slot address must stay 8-aligned");
+    // Read as four u64 words and re-serialize little-endian: the VM is
+    // little-endian, so this reproduces the exact byte sequence the host wrote.
+    let words: [u64; 4] = unsafe { core::ptr::read_volatile(addr as *const [u64; 4]) };
+    let mut out = [0u8; 32];
+    for (k, w) in words.iter().enumerate() {
+        out[8 * k..8 * k + 8].copy_from_slice(&w.to_le_bytes());
+    }
+    Some(out)
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+pub fn hint_slot(_i: usize) -> Option<[u8; 32]> {
+    unimplemented!("syscalls are only implemented for riscv64 targets");
+}
+
+/// Consume the next hint slot positionally. Returns `None` once the arena is
+/// exhausted — the caller then recomputes in software. One slot is consumed per
+/// call whether or not the hint verifies, so a host that supplies fewer hints
+/// than requested only forces fallbacks; it cannot desynchronize the stream.
+#[cfg(target_arch = "riscv64")]
+pub fn next_hint() -> Option<[u8; 32]> {
+    // Single-threaded guest: a relaxed atomic cursor is sufficient (the guest
+    // target lowers atomics via `-C passes=lower-atomic`).
+    static CURSOR: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    let i = CURSOR.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    hint_slot(i)
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+pub fn next_hint() -> Option<[u8; 32]> {
+    unimplemented!("syscalls are only implemented for riscv64 targets");
+}
+
+// =============================================================================
+// Hint request log — the recording pass for hints that are NOT known
+// beforehand. When the arena is exhausted, `request_hint` appends
+// `(hint_id, input)` to a fixed scratch region above the private-input window;
+/// the host reads it after the run (executor's `Memory::hint_requests`),
+/// computes the answers, and re-runs with a complete arena. The log region:
+///
+//   [u32 LE count][u32 pad], then entries of [u64 LE hint_id][32-byte input].
+//
+// Must match `executor::vm::memory::{HINT_LOG_START_INDEX,
+// HINT_LOG_HEADER_BYTES, HINT_LOG_ENTRY_BYTES}`.
+// =============================================================================
+
+/// Start of the hint request log: just past the reserved private-input window
+/// (`PRIVATE_INPUT_START + 4 + MAX_PRIVATE_INPUT_SIZE`, rounded up to 8). The
+/// stack lives at the top of the 64-bit space and the heap grows up from the
+/// ELF image, so this region is collision-free in practice.
+/// Must match `executor::vm::memory::HINT_LOG_START_INDEX`.
+#[cfg(target_arch = "riscv64")]
+pub const HINT_LOG_START: usize = 0xFF000000 + 4 + 512 * 1024 * 1024 + 4;
+
+/// Log header size (`[u32 LE count][u32 pad]`).
+/// Must match `executor::vm::memory::HINT_LOG_HEADER_BYTES`.
+#[cfg(target_arch = "riscv64")]
+const HINT_LOG_HEADER_BYTES: usize = 8;
+
+/// Log entry size (`[u64 LE hint_id][32-byte input]`).
+/// Must match `executor::vm::memory::HINT_LOG_ENTRY_BYTES`.
+#[cfg(target_arch = "riscv64")]
+const HINT_LOG_ENTRY_BYTES: usize = 40;
+
+/// Consume the next hint slot for a `(hint_id, input)` request; on an exhausted
+/// arena, append the request to the hint request log and return `None` (the
+/// caller then recomputes in software). One slot is consumed per call whether
+/// or not the hint verifies — see [`next_hint`].
+#[cfg(target_arch = "riscv64")]
+pub fn request_hint(hint_id: usize, input: &[u8; 32]) -> Option<[u8; 32]> {
+    if let Some(slot) = next_hint() {
+        return Some(slot);
+    }
+    let count_addr = HINT_LOG_START;
+    let count = unsafe { core::ptr::read_volatile(count_addr as *const u32) } as usize;
+    let entry = count_addr + HINT_LOG_HEADER_BYTES + count * HINT_LOG_ENTRY_BYTES;
+    unsafe {
+        core::ptr::write_volatile(entry as *mut u64, hint_id as u64);
+        for k in 0..4 {
+            let word = u64::from_le_bytes(input[8 * k..8 * k + 8].try_into().unwrap());
+            core::ptr::write_volatile((entry + 8 + 8 * k) as *mut u64, word);
+        }
+        core::ptr::write_volatile(count_addr as *mut u32, count as u32 + 1);
+    }
+    None
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+pub fn request_hint(_hint_id: usize, _input: &[u8; 32]) -> Option<[u8; 32]> {
+    unimplemented!("syscalls are only implemented for riscv64 targets");
+}
+
+
+
 #[cfg(target_arch = "riscv64")]
 pub fn sys_halt() -> ! {
     // NOTE: no print_string here — the Print ecall is unmatched on the Ecall bus
@@ -194,32 +349,6 @@ pub fn ecsm_mul(xr: &mut [u8; 32], xg: &[u8; 32], k: &[u8; 32]) {
 #[cfg(not(target_arch = "riscv64"))]
 /// Compute `xR = (k·G)_x` on secp256k1 via the ECSM accelerator (32-byte little-endian values).
 pub fn ecsm_mul(_xr: &mut [u8; 32], _xg: &[u8; 32], _k: &[u8; 32]) {
-    unimplemented!("syscalls are only implemented for riscv64 targets");
-}
-
-/// Ask the host for a non-constraining hint (modular inverse/sqrt).
-/// `hint_id` selects the operation ([`HINT_FIELD_INV`]/[`HINT_SCALAR_INV`]/
-/// [`HINT_FIELD_SQRT`]); `input`/`out` are 32-byte **big-endian** field/scalar
-/// elements — k256's own serialization, so consumers pass `to_bytes()` straight
-/// through. Note this differs from [`ecsm_mul`], which is little-endian.
-/// The result is UNTRUSTED — the caller MUST verify it in-guest (e.g. `x·inv == 1`)
-/// AND recompute in software on failure, since this ecall adds no correctness
-/// constraint and the prover chooses the returned bytes.
-#[cfg(target_arch = "riscv64")]
-pub fn hint(hint_id: usize, out: &mut [u8; 32], input: &[u8; 32]) {
-    unsafe {
-        asm!(
-            "ecall",
-            in("a0") hint_id,           // x10 = hint selector
-            in("a1") input.as_ptr(),    // x11 = input address (32-byte BE)
-            in("a2") out.as_mut_ptr(),  // x12 = output address (32-byte BE)
-            in("a7") HINT_SYSCALL_NUMBER,
-        )
-    }
-}
-
-#[cfg(not(target_arch = "riscv64"))]
-pub fn hint(_hint_id: usize, _out: &mut [u8; 32], _input: &[u8; 32]) {
     unimplemented!("syscalls are only implemented for riscv64 targets");
 }
 

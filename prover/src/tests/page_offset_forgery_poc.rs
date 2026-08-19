@@ -147,7 +147,7 @@ fn craft_proof(
     // Execution logs come from whatever `run_elf` is.
     let run_program = Elf::load(run_elf).expect("run ELF load");
     let executor =
-        Executor::new(&run_program, private_inputs.to_vec()).expect("executor construction");
+        Executor::new(&run_program, private_inputs.to_vec(), &[]).expect("executor construction");
     let result = executor.run().expect("run");
 
     let max_rows = MaxRowsConfig::default();
@@ -156,6 +156,7 @@ fn craft_proof(
         &result.logs,
         &max_rows,
         private_inputs,
+        &[],
         #[cfg(feature = "disk-spill")]
         stark::storage_mode::StorageMode::Ram,
     )
@@ -541,7 +542,7 @@ fn poc_real_ethrex_inputs_produce_private_input_pages() {
         let Ok(bytes) = std::fs::read(&path) else {
             continue; // fixture not present in this checkout
         };
-        let pages = private_input_page_count(&bytes);
+        let pages = private_input_page_count(&bytes, &[]);
         println!(
             "{name}: {} bytes -> {pages} private-input page(s) = {} free-OFFSET rows",
             bytes.len(),
@@ -633,7 +634,7 @@ fn craft_proof_with_duplicate_page(
     let options = opts();
     let program = Elf::load(honest_elf).expect("honest ELF load");
     let run_program = Elf::load(run_elf).expect("run ELF load");
-    let executor = Executor::new(&run_program, vec![]).expect("executor construction");
+    let executor = Executor::new(&run_program, vec![], &[]).expect("executor construction");
     let result = executor.run().expect("run");
 
     let max_rows = MaxRowsConfig::default();
@@ -641,6 +642,7 @@ fn craft_proof_with_duplicate_page(
         &program,
         &result.logs,
         &max_rows,
+        &[],
         &[],
         #[cfg(feature = "disk-spill")]
         stark::storage_mode::StorageMode::Ram,

@@ -12,7 +12,7 @@ fn run_program(elf_path: &str) {
     println!("Testing {}", elf_path);
     let elf_data = std::fs::read(elf_path).unwrap();
     let program = Elf::load(&elf_data).unwrap();
-    let mut executor = Executor::new(&program, vec![]).expect("Failed to create executor");
+    let mut executor = Executor::new(&program, vec![], &[]).expect("Failed to create executor");
 
     while let Some(_logs) = executor.resume().expect("Failed to execute") {}
 
@@ -31,7 +31,7 @@ fn test_private_input_memory_mapped() {
     let elf_data = std::fs::read("./program_artifacts/asm/test_private_input_xpage.elf").unwrap();
     let program = Elf::load(&elf_data).unwrap();
     let input: Vec<u8> = (0u8..16).collect();
-    let executor = Executor::new(&program, input.clone()).unwrap();
+    let executor = Executor::new(&program, input.clone(), &[]).unwrap();
     let result = executor.run().unwrap();
     // Committed bytes are at 0xFF000008 = data bytes [4..12]
     assert_eq!(result.return_values.memory_values, input[4..12].to_vec());
@@ -476,7 +476,7 @@ fn test_misalign_sd() {
 fn test_misaligned_pc_traps() {
     let elf_data = std::fs::read("./program_artifacts/asm/misaligned_pc.elf").unwrap();
     let program = Elf::load(&elf_data).unwrap();
-    let mut executor = Executor::new(&program, vec![]).expect("Failed to create executor");
+    let mut executor = Executor::new(&program, vec![], &[]).expect("Failed to create executor");
     let err = loop {
         match executor.resume() {
             Ok(Some(_)) => continue,
@@ -886,7 +886,7 @@ fn test_keccak() {
     // Expected output is the FIPS-202 zero-input KAT.
     let elf_data = std::fs::read("./program_artifacts/asm/test_keccak.elf").unwrap();
     let program = Elf::load(&elf_data).unwrap();
-    let executor = Executor::new(&program, vec![]).expect("Failed to create executor");
+    let executor = Executor::new(&program, vec![], &[]).expect("Failed to create executor");
     let result = executor.run().expect("Failed to run program");
 
     let expected_state: [u64; 25] = [
@@ -930,7 +930,7 @@ fn test_run_epochs_splits_execution_into_n_cycle_epochs() {
     let program = Elf::load(&elf_data).unwrap();
 
     // Reference: full single-pass run.
-    let full = Executor::new(&program, vec![]).unwrap().run().unwrap();
+    let full = Executor::new(&program, vec![], &[]).unwrap().run().unwrap();
 
     // Pick an epoch size that splits this program into a few epochs, whatever
     // its exact length.
@@ -938,7 +938,7 @@ fn test_run_epochs_splits_execution_into_n_cycle_epochs() {
     assert!(total_cycles >= 2);
     let epoch_size = (total_cycles / 3).max(1);
 
-    let epochs = Executor::new(&program, vec![])
+    let epochs = Executor::new(&program, vec![], &[])
         .unwrap()
         .run_epochs(epoch_size)
         .unwrap();

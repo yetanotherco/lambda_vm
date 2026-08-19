@@ -353,7 +353,9 @@ pub fn run_with_flamegraph(
 ) -> (FlamegraphGenerator, Result<u64, FlamegraphDriveError>) {
     let symbols = SymbolTable::parse(elf_bytes);
     let mut generator = FlamegraphGenerator::new(symbols, program.entry_point);
-    let mut executor = match Executor::new(program, private_inputs) {
+    // Profiling entry point: no hint arena (pass `&[]`); hint-consuming programs
+    // fall back to software paths here, which only makes profiles conservative.
+    let mut executor = match Executor::new(program, private_inputs, &[]) {
         Ok(executor) => executor,
         Err(e) => return (generator, Err(e.into())),
     };

@@ -170,10 +170,11 @@ impl PageConfig {
 // =========================================================================
 
 /// Number of pages the private input occupies, starting at
-/// `PRIVATE_INPUT_START_INDEX`. The wire format is the 4-byte length prefix plus
-/// the data ([`Memory::store_private_inputs`]), and `PRIVATE_INPUT_START_INDEX` is
-/// page-aligned, so the span is `ceil((prefix + len) / page_size)` consecutive
-/// pages (0 when there is no input).
+/// `PRIVATE_INPUT_START_INDEX`. The wire format is `[len:4][data][pad8]` plus the
+/// always-written 8-byte hint-arena header and its 32-byte slots
+/// ([`Memory::store_private_inputs`]), and `PRIVATE_INPUT_START_INDEX` is
+/// page-aligned, so the span is `ceil((align8(4 + len) + 8 + 32 * hint_count) /
+/// page_size)` consecutive pages (0 when there is neither input nor hints).
 ///
 /// SINGLE source of truth: the monolithic trace builder, the continuation prover,
 /// and both verifiers' classification all derive from this count — a divergence
@@ -181,12 +182,15 @@ impl PageConfig {
 /// the other commits it, which is a soundness bug, so do not reimplement it.
 ///
 /// [`Memory::store_private_inputs`]: executor::vm::memory::Memory::store_private_inputs
-pub(crate) fn private_input_page_count(private_inputs: &[u8]) -> usize {
-    use executor::vm::memory::PRIVATE_INPUT_LENGTH_PREFIX_BYTES;
-    if private_inputs.is_empty() {
+pub(crate) fn private_input_page_count(private_inputs: &[u8], hints: &[[u8; 32]]) -> usize {
+    use executor::vm::memory::{HINT_ARENA_HEADER_BYTES, HINT_SLOT_BYTES, hint_arena_header_offset};
+    if private_inputs.is_empty() && hints.is_empty() {
         return 0;
     }
-    (PRIVATE_INPUT_LENGTH_PREFIX_BYTES + private_inputs.len()).div_ceil(DEFAULT_PAGE_SIZE)
+    let extent = hint_arena_header_offset(private_inputs.len() as u64)
+        + HINT_ARENA_HEADER_BYTES
+        + hints.len() as u64 * HINT_SLOT_BYTES;
+    (extent as usize).div_ceil(DEFAULT_PAGE_SIZE)
 }
 
 /// Whether `page_base` is one of the first `num_private_input_pages` pages starting
@@ -224,6 +228,11 @@ pub(crate) fn private_input_page_bases(
 /// a MAX-size input including its length prefix — no slack (an honest max-size
 /// input occupies exactly this many pages). Both the monolithic and continuation
 /// verifiers bound the deserialized, untrusted count with this before sizing AIRs.
+///
+/// Still valid with the hint arena: `encode_private_input_region` caps the whole
+/// two-section region (main section + always-written arena header + hint slots)
+/// at `4 + MAX_PRIVATE_INPUT_SIZE` bytes, so no honest region can span more pages
+/// than this bound.
 pub(crate) fn max_private_input_pages() -> usize {
     use executor::vm::memory::{MAX_PRIVATE_INPUT_SIZE, PRIVATE_INPUT_LENGTH_PREFIX_BYTES};
     (MAX_PRIVATE_INPUT_SIZE as usize + PRIVATE_INPUT_LENGTH_PREFIX_BYTES)
