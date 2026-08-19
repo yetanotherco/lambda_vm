@@ -3089,6 +3089,14 @@ pub struct Traces {
     /// BLAKE3 6-round compression table (one row per compression call)
     pub blake3: TraceTable<GoldilocksField, GoldilocksExtension>,
 
+    /// BLAKE3 compressions the workload actually performed.
+    ///
+    /// Not derivable from `blake3` above: that trace pads to a 4-row minimum,
+    /// so an unused table and a table with four compressions are the same
+    /// height. This is what decides whether the proof carries the table at all
+    /// (`crate::TableCounts::blake3`).
+    pub num_blake3_ops: usize,
+
     /// ECSM core table (one row per scalar-multiplication ecall)
     pub ecsm: TraceTable<GoldilocksField, GoldilocksExtension>,
 
@@ -3743,6 +3751,7 @@ fn build_traces<I: ImageSource + Sync>(
             .collect();
         keccak_rnd::generate_keccak_rnd_trace(&keccak_rnd_ops)
     };
+    let num_blake3_ops = blake3_ops.len();
     let gen_blake3 = || blake3::generate_blake3_trace(&blake3_ops);
     let gen_keccak_rc = || {
         let mut keccak_rc_trace = keccak_rc::generate_keccak_rc_trace();
@@ -3952,6 +3961,7 @@ fn build_traces<I: ImageSource + Sync>(
         keccak: keccak_trace,
         keccak_rnd: keccak_rnd_trace,
         blake3: blake3_trace,
+        num_blake3_ops,
         keccak_rc: keccak_rc_trace,
         ecsm: ecsm_trace,
         ecdas: ecdas_trace,
@@ -4258,6 +4268,7 @@ impl Traces {
 
         let Traces {
             cpus,
+            num_blake3_ops,
             bitwise,
             lts,
             shifts,
@@ -4332,7 +4343,11 @@ impl Traces {
         total += (keccak.num_rows() * KECCAK_COLS) as u64;
         total += (keccak_rnd.num_rows() * KECCAK_RND_COLS) as u64;
         total += (keccak_rc.num_rows() * (KECCAK_RC_COLS - KECCAK_RC_PRECOMPUTED)) as u64;
-        total += (blake3.num_rows() * BLAKE3_COLS) as u64;
+        // Counted only when the proof carries the table (`table_counts().blake3`);
+        // an unused BLAKE3 trace is padding the prover never commits.
+        if *num_blake3_ops > 0 {
+            total += (blake3.num_rows() * BLAKE3_COLS) as u64;
+        }
         for t in eqs {
             total += (t.num_rows() * EQ_COLS) as u64;
         }
@@ -4394,6 +4409,7 @@ impl Traces {
 
         let Traces {
             cpus,
+            num_blake3_ops,
             bitwise,
             lts,
             shifts,
@@ -4468,7 +4484,9 @@ impl Traces {
         total += (keccak.num_rows() * n_keccak) as u64;
         total += (keccak_rnd.num_rows() * n_keccak_rnd) as u64;
         total += (keccak_rc.num_rows() * n_keccak_rc) as u64;
-        total += (blake3.num_rows() * n_blake3) as u64;
+        if *num_blake3_ops > 0 {
+            total += (blake3.num_rows() * n_blake3) as u64;
+        }
         for t in eqs {
             total += (t.num_rows() * n_eq) as u64;
         }
@@ -4504,6 +4522,8 @@ impl Traces {
             bytewise: self.bytewises.len(),
             store: self.stores.len(),
             cpu32: self.cpu32s.len(),
+            // 0 or 1: the table is carried only when the workload used it.
+            blake3: usize::from(self.num_blake3_ops > 0),
         }
     }
 

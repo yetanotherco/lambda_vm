@@ -923,6 +923,7 @@ pub(super) fn real_epoch_from(opts: crate::ProofOptions, inputs: EpochInputs) ->
                 table_counts.bytewise as u64,
                 table_counts.store as u64,
                 table_counts.cpu32 as u64,
+                table_counts.blake3 as u64,
             ],
             num_private_input_pages: 0,
             fri_final_poly_log_degree: opts.fri_final_poly_log_degree,

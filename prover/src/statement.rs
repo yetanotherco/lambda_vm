@@ -17,7 +17,8 @@ use crate::test_utils::E;
 use crate::{RuntimePageRange, TableCounts};
 
 /// Domain-separation tag. Bump the suffix (`_V2`, ...) on any encoding change.
-const DOMAIN_TAG: &[u8] = b"LAMBDAVM_STARK_STATEMENT_V3";
+/// V4 appends `TableCounts::blake3`, which made the BLAKE3 table conditional.
+const DOMAIN_TAG: &[u8] = b"LAMBDAVM_STARK_STATEMENT_V4";
 
 /// Canonical full-ELF identity digest — exactly what [`absorb_statement`] binds
 /// into the transcript. The recursion attestation folds the same digest into
@@ -111,6 +112,7 @@ pub(crate) fn absorb_statement_with_digest(
         bytewise,
         store,
         cpu32,
+        blake3,
     } = table_counts;
     for count in [
         cpu,
@@ -127,6 +129,10 @@ pub(crate) fn absorb_statement_with_digest(
         bytewise,
         store,
         cpu32,
+        // 0 or 1, and the one count the verifier cannot derive for itself —
+        // binding it is what stops prover and verifier building different AIR
+        // sets from the same bytes (see `TableCounts::blake3`).
+        blake3,
     ] {
         t.append_bytes(&(count as u64).to_le_bytes());
     }

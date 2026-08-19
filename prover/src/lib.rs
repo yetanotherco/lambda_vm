@@ -83,13 +83,16 @@ pub struct RuntimePageRange {
 
 /// Number of tables that always contribute exactly one sub-proof, regardless
 /// of `TableCounts`: bitwise, decode, halt, commit, keccak, keccak_rnd,
-/// keccak_rc, blake3, register, ecsm, ecdas, hint.
+/// keccak_rc, register, ecsm, ecdas, hint.
 ///
 /// ⚠ Every always-on table costs every proof a near-empty AIR even when the
-/// workload never touches it (the EC-campaign lesson, PR #871). BLAKE3 adds
-/// one (min 4 rows × ~3.2k cols); its real-workload cost must be ABBA-checked
-/// before this merges.
-pub const FIXED_TABLE_COUNT: usize = 12;
+/// workload never touches it (the EC-campaign lesson, PR #871). BLAKE3 was
+/// always-on for one release and that bill came due: on a real block it cost
+/// the recursion wrap +31.2% of its trace cells and +44% of its peak memory,
+/// out of a table carrying 0.035% of the epoch's own cells. It is counted in
+/// [`TableCounts::blake3`] now — see that field for why omitting it is sound
+/// (`thoughts/shared/block-compression/WRAP-GROWTH-BISECT.md`).
+pub const FIXED_TABLE_COUNT: usize = 11;
 
 /// Number of chunks for each split table.
 /// The verifier needs this to reconstruct matching AIRs.
@@ -110,6 +113,51 @@ pub struct TableCounts {
     pub bytewise: usize,
     pub store: usize,
     pub cpu32: usize,
+    /// ★ BLAKE3 tables: **0 or 1**, not a chunk count — 1 iff the workload
+    /// executed at least one BLAKE3 syscall.
+    ///
+    /// ## Why a zero here is sound, when a zero anywhere else is not
+    ///
+    /// Every other field in this struct is rejected at zero by
+    /// [`TableCounts::validate`], because dropping (say) the LT table would
+    /// delete its constraints while the CPU rows that depend on them stay in
+    /// the proof — the classic remove-the-checker forgery. BLAKE3 is different,
+    /// and the difference is a bus argument, not a convention:
+    ///
+    /// - CPU is the sole SENDER on [`tables::types::BusId::Ecall`], with
+    ///   multiplicity `Column(cols::ECALL)` and tuple
+    ///   `[timestamp, 0, rv1]`, where `rv1` is the syscall number read out of
+    ///   the guest's register — **trace data**, not a constant
+    ///   (`tables/cpu.rs`, the ECALL sender).
+    /// - Each syscall table RECEIVES on that same bus with its own syscall
+    ///   number as a hardcoded constant in the tuple. BLAKE3's receiver carries
+    ///   `BLAKE3_SYSCALL_NUMBER` (`tables/blake3.rs`, interaction 1), and no
+    ///   other receiver in the machine carries that constant.
+    ///
+    /// So a workload that executes a BLAKE3 syscall necessarily puts a send on
+    /// the Ecall bus whose tuple only the BLAKE3 table can match. Omit the
+    /// table and that send has no receiver: the global LogUp sum is non-zero,
+    /// and `multi_verify` rejects on bus balance before any constraint is
+    /// evaluated. A prover claiming `blake3: 0` for an epoch that used BLAKE3
+    /// is therefore not saving work — it is producing a proof that cannot
+    /// verify. The count is a size hint the bus already enforces, not a
+    /// permission the verifier grants.
+    ///
+    /// ## Why it must still be bound into the statement
+    ///
+    /// `include_halt` is NOT a precedent for leaving this unbound: `is_final`
+    /// is known to the verifier a priori, whereas "this epoch used BLAKE3" is
+    /// asserted by the prover. Unbound, prover and verifier could build
+    /// different AIR sets from the same bytes. It is bound the same way every
+    /// other count is — absorbed into the Fiat-Shamir transcript by
+    /// `statement::absorb_statement_with_digest`, so a disagreement diverges
+    /// every derived challenge — and cross-checked against the sub-proof count
+    /// in `verify_proof_parts`.
+    ///
+    /// Bounded above by 1 in [`TableCounts::validate`]: extra BLAKE3 tables buy
+    /// an attacker nothing, but an unbounded count would let a malformed proof
+    /// make the verifier build arbitrarily many AIRs before any other check.
+    pub blake3: usize,
 }
 
 impl TableCounts {
@@ -129,13 +177,28 @@ impl TableCounts {
             + self.bytewise
             + self.store
             + self.cpu32
+            + self.blake3
     }
 
-    /// Validate that all required tables have at least one chunk.
+    /// Validate the chunk counts.
     ///
-    /// A zero count for any table would remove its constraints from verification,
-    /// allowing a malicious prover to bypass soundness checks.
+    /// A zero count for a required table would remove its constraints from
+    /// verification, allowing a malicious prover to bypass soundness checks, so
+    /// every table below must carry at least one chunk.
+    ///
+    /// [`TableCounts::blake3`] is deliberately NOT in that list — it is 0 or 1,
+    /// and a zero is safe because the Ecall bus leaves a BLAKE3 syscall with no
+    /// receiver when the table is absent. The full argument is on the field.
+    /// It is bounded above instead: nothing is gained by claiming more than one
+    /// BLAKE3 table, and an unbounded count would have the verifier allocate
+    /// AIRs off a number the proof has not yet been checked against.
     pub fn validate(&self) -> Result<(), Error> {
+        if self.blake3 > 1 {
+            return Err(Error::InvalidTableCounts(format!(
+                "blake3 count is {} — the table is present at most once",
+                self.blake3
+            )));
+        }
         let checks = [
             ("cpu", self.cpu),
             ("lt", self.lt),
@@ -536,6 +599,16 @@ pub(crate) struct VmAirs {
     /// Whether the HALT table participates in this proof. False for intermediate
     /// continuation epochs, which do not terminate the program.
     pub include_halt: bool,
+    /// Whether the BLAKE3 table participates in this proof — `table_counts
+    /// .blake3 == 1`, i.e. the workload executed a BLAKE3 syscall.
+    ///
+    /// Unlike `include_halt`, this is NOT verifier-known a priori: `is_final`
+    /// follows from the epoch's position, while "did this workload use BLAKE3"
+    /// is asserted by the prover. Honouring that assertion is safe only because
+    /// a false one cannot verify — see [`TableCounts::blake3`] for the
+    /// Ecall-bus argument. Both sides derive this from the same bound count, so
+    /// they cannot silently build different AIR sets.
+    pub include_blake3: bool,
     // Auxiliary ALU / memory / CPU32 dispatch chips
     pub eqs: Vec<VmAir>,
     pub bytewises: Vec<VmAir>,
@@ -553,12 +626,17 @@ impl VmAirs {
             (self.keccak.as_ref(), &mut traces.keccak, &()),
             (self.keccak_rnd.as_ref(), &mut traces.keccak_rnd, &()),
             (self.keccak_rc.as_ref(), &mut traces.keccak_rc, &()),
-            (self.blake3.as_ref(), &mut traces.blake3, &()),
-            (self.ecsm.as_ref(), &mut traces.ecsm, &()),
-            (self.ecdas.as_ref(), &mut traces.ecdas, &()),
-            (self.hint.as_ref(), &mut traces.hint, &()),
-            (self.register.as_ref(), &mut traces.register, &()),
         ];
+        // BLAKE3 keeps its original slot between KECCAK_RC and ECSM, so a proof
+        // that carries the table is laid out exactly as it always was; a proof
+        // that does not simply omits this one entry.
+        if self.include_blake3 {
+            pairs.push((self.blake3.as_ref(), &mut traces.blake3, &()));
+        }
+        pairs.push((self.ecsm.as_ref(), &mut traces.ecsm, &()));
+        pairs.push((self.ecdas.as_ref(), &mut traces.ecdas, &()));
+        pairs.push((self.hint.as_ref(), &mut traces.hint, &()));
+        pairs.push((self.register.as_ref(), &mut traces.register, &()));
         if self.include_halt {
             pairs.push((self.halt.as_ref(), &mut traces.halt, &()));
         }
@@ -629,12 +707,16 @@ impl VmAirs {
             self.keccak.as_ref(),
             self.keccak_rnd.as_ref(),
             self.keccak_rc.as_ref(),
-            self.blake3.as_ref(),
-            self.ecsm.as_ref(),
-            self.ecdas.as_ref(),
-            self.hint.as_ref(),
-            self.register.as_ref(),
         ];
+        // The same slot as `air_trace_pairs`: these two orders ARE the proof's
+        // layout, and must move together.
+        if self.include_blake3 {
+            refs.push(self.blake3.as_ref());
+        }
+        refs.push(self.ecsm.as_ref());
+        refs.push(self.ecdas.as_ref());
+        refs.push(self.hint.as_ref());
+        refs.push(self.register.as_ref());
         if self.include_halt {
             refs.push(self.halt.as_ref());
         }
@@ -932,6 +1014,7 @@ impl VmAirs {
             pages,
             memw_registers,
             include_halt,
+            include_blake3: table_counts.blake3 == 1,
             eqs,
             bytewises,
             stores,

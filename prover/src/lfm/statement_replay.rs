@@ -19,7 +19,7 @@
 //! The tag is 30 bytes, `≡ 2 (mod 4)`, so the ELF digest immediately after it
 //! straddles half boundaries; the one-byte `fri_final_poly_log_degree` later
 //! moves the cursor again. The whole statement is
-//! `207 + public_output_len + 16·page_ranges` bytes, which is `≡ 3 (mod 4)`
+//! `215 + public_output_len + 16·page_ranges` bytes, which is `≡ 3 (mod 4)`
 //! whenever `public_output_len ≡ 0 (mod 4)` — so **every Phase-A root absorb is
 //! spliced at shift 3 too**, at about one `BitDec` and 34 `BALU` rows per half.
 //! A single pad byte at the end of the statement encoding would make all of
@@ -41,8 +41,12 @@ use super::builder::{Ext, Felt, LfmBuilder};
 use super::keccak_host::BYTES_PER_HALF;
 use super::transcript_replay::TranscriptReplay;
 
-/// `TableCounts` has fourteen split-table families.
-pub const NUM_TABLE_COUNTS: usize = 14;
+/// Counts `TableCounts` absorbs: fourteen split-table families plus the
+/// 0-or-1 BLAKE3 presence count. The guest must absorb exactly what the host's
+/// `statement::absorb_statement_with_digest` does — one count too few and every
+/// challenge downstream diverges, so this tracks that encoding, not a
+/// structural property of the machine.
+pub const NUM_TABLE_COUNTS: usize = 15;
 
 /// The shape-static half of the statement — emitted as program constants.
 #[derive(Debug, Clone)]
@@ -50,7 +54,8 @@ pub struct EpochStatementShape {
     /// Length of the public output in bytes. Shape-static: it fixes how many
     /// arena halves the program reads.
     pub public_output_len: usize,
-    /// The fourteen split-table chunk counts, in `TableCounts` declaration order.
+    /// The absorbed counts, in `TableCounts` declaration order: the fourteen
+    /// split-table chunk counts, then BLAKE3's 0-or-1.
     pub table_counts: [u64; NUM_TABLE_COUNTS],
     pub num_private_input_pages: u64,
     pub fri_final_poly_log_degree: u8,

@@ -1085,8 +1085,12 @@ fn a_zero_row_fixed_table_carries_some_zero_not_none() {
     // reaching its own assertion. A hand-written census that does not pin its
     // own length against the constant it is a census OF goes stale exactly that
     // way again, so the length is now asserted below.
+    //
+    // BLAKE3 has since left this list in the other direction: it is no longer
+    // always-on but counted in `TableCounts::blake3`, and this epoch does not
+    // use it, so it contributes no sub-proof to census.
     let census: Vec<(&str, usize, bool)> = {
-        use crate::tables::{blake3, ecdas, hint, keccak, keccak_rc};
+        use crate::tables::{ecdas, hint, keccak, keccak_rc};
         let fixed: [(&str, &TraceTable<Gl, Ext3>, RowWitness); crate::FIXED_TABLE_COUNT - 1] = [
             ("BITWISE", &traces.bitwise, RowWitness::Populated),
             ("DECODE", &traces.decode, RowWitness::Populated),
@@ -1101,13 +1105,6 @@ fn a_zero_row_fixed_table_carries_some_zero_not_none() {
                 "KECCAK_RC",
                 &traces.keccak_rc,
                 RowWitness::GatedOff(&[keccak_rc::cols::MU]),
-            ),
-            // #903's table pads with a nonzero `ptr[k] = 8k` identity, so "no
-            // rows" here is the gate being off, not the trace being empty.
-            (
-                "BLAKE3",
-                &traces.blake3,
-                RowWitness::GatedOff(&[blake3::cols::MU]),
             ),
             ("ECSM", &traces.ecsm, RowWitness::Blank),
             (

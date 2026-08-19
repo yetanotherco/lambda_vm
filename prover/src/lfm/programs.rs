@@ -494,7 +494,7 @@ pub fn stmt_arena_halves() -> u32 {
 pub fn epoch_statement_shape() -> super::statement_replay::EpochStatementShape {
     super::statement_replay::EpochStatementShape {
         public_output_len: STMT_PUBLIC_OUTPUT_LEN,
-        table_counts: [3, 1, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+        table_counts: [3, 1, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
         num_private_input_pages: 2,
         fri_final_poly_log_degree: 7,
         page_ranges: vec![(0x1000, 4), (0x8000, 1)],
