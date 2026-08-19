@@ -23,7 +23,7 @@
 //!
 //! It stops at the challenges. That the legs then CONSUME these cells is
 //! [`the_legs_consume_the_replayed_challenges`]'s job, and the whole-epoch
-//! composition (26 sub-proofs behind one statement) is not built here.
+//! composition (25 sub-proofs behind one statement) is not built here.
 
 use stark::config::Commitment;
 use stark::proof::stark::MultiProof;

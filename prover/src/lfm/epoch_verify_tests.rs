@@ -1,8 +1,8 @@
 //! ★ The assembled epoch verifier — spine plus legs — run on a real
 //! continuation epoch proof.
 //!
-//! [`super::epoch_tests`] built the Fiat-Shamir spine and checked all 119 of a
-//! real 26-sub-proof epoch's challenges against production's own replay. Every
+//! [`super::epoch_tests`] built the Fiat-Shamir spine and checked all 115 of a
+//! real 25-sub-proof epoch's challenges against production's own replay. Every
 //! verification leg, meanwhile, was driven by its own isolation program with
 //! HINTED challenges. This module hangs the legs off the spine: per sub-proof the
 //! OOD grid is rebuilt from the two pruned blocks the transcript absorbed, the
@@ -19,7 +19,7 @@
 //! `assert_word_eq_lanes` against a root the transcript absorbed, and the FRI
 //! chain ends in `assert_eq_ext` against the terminal polynomial. A program that
 //! executes at all has passed them. So the differential that remains is the
-//! spine's — the 119 challenges, still checked — plus the fact of execution, and
+//! spine's — the 115 challenges, still checked — plus the fact of execution, and
 //! the falsification tests below are what turn "it executed" into evidence, by
 //! showing what does NOT execute.
 //!
@@ -27,7 +27,7 @@
 //!
 //! The preset. The fixture epoch is proved at the MIN preset (blowup 2, one
 //! query per table, grinding factor 1), because that is what
-//! `proof_fixture::fixture_options` gives and what keeps a 26-sub-proof epoch
+//! `proof_fixture::fixture_options` gives and what keeps a 25-sub-proof epoch
 //! provable in a unit test. Every per-query cost here is therefore ONE query's,
 //! and the blowup-8 predictions the phase pinned (73 queries, 14,454 FRI
 //! permutations per sub-proof) are reached by scaling, not by measurement — the
@@ -341,12 +341,12 @@ impl TableLegs {
 /// continuation epoch proof that production accepts.
 ///
 /// What executing proves, stated precisely. Every check is an assert inside the
-/// program, so reaching the end means: all 26 quotient identities held at the
-/// spine's own `z` and `β`; every one of the 26 sub-proofs' opened row pairs
+/// program, so reaching the end means: all 25 quotient identities held at the
+/// spine's own `z` and `β`; every one of the 25 sub-proofs' opened row pairs
 /// hashed to a leaf that walked to the root the transcript absorbed, at the index
 /// the transcript sampled; every DEEP reconstruction fed a FRI chain that folded
 /// to the terminal polynomial the transcript absorbed; and the LogUp closure
-/// reached production's COMMIT-bus target. The 119 published challenges are
+/// reached production's COMMIT-bus target. The 115 published challenges are
 /// checked against production's replay on top, so the Fiat-Shamir the whole thing
 /// hangs from is still differentialled.
 #[test]
@@ -561,7 +561,7 @@ fn the_assembled_epoch_verifier_runs() {
     println!(
         "\x20 constraint leg inside the assembled verifier: {constraint_alu} ALU \
          rows lowering ({constraint_unfused} unfused) + {recombination} \
-         recombination = {} over 26 sub-proofs  [pinned: 54,358 + 2,894 = 57,252]\
+         recombination = {} over 25 sub-proofs  [pinned: see the run output]\
          \n\x20 that is {:.1}% of the legs' {} instructions",
         constraint_alu + recombination,
         100.0 * (constraint_alu + recombination) as f64
@@ -623,7 +623,7 @@ fn the_assembled_epoch_verifier_runs() {
     // The pinned 213,744 came from `join_tests::join_leg_cost`, whose stated
     // assumptions are: all 28 PRODUCTION AIRs, every trace at a UNIFORM
     // 2^20, blowup 8, 73 queries, and NO FRI (the joined leg has none). The
-    // measurement above is: this epoch's 26 sub-proofs, at their REAL trace
+    // measurement above is: this epoch's 25 sub-proofs, at their REAL trace
     // lengths, blowup 2, one query, FRI included. Three parameters differ, so
     // the two numbers cannot be compared directly — they are projected onto each
     // other one parameter at a time instead, which is also what says which
@@ -759,7 +759,7 @@ fn the_assembled_epoch_verifier_runs() {
         "\n  RECONCILIATION against the pinned blowup-8 predictions (projections \
          from shapes — this run is at the min preset and measures none of them):\n\
          \x20 openings only, 73 queries, UNIFORM 2^20 (deep-join's own \
-         assumption, over this epoch's 26 sub-proofs): {}   [pinned: 213,744 \
+         assumption, over this epoch's 25 sub-proofs): {}   [pinned: see the run output \
          over all 28 production AIRs]\n\
          \x20 openings only, 73 queries, this epoch's REAL trace lengths: {}\n\
          \x20 openings + FRI, 73 queries, real lengths: {}\n\
@@ -1258,7 +1258,7 @@ fn the_assembled_verifier_contains_every_composition_and_terminal_check() {
          shapes, or the expected count is only half checked"
     );
     println!(
-        "  {} equality assertions added by the legs (26 composition + FRI \
+        "  {} equality assertions added by the legs (25 composition + FRI \
          terminals)",
         expected
     );

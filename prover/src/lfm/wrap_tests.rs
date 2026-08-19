@@ -950,7 +950,7 @@ fn projected_peak_bytes(main: u64, aux: u64) -> f64 {
 ///
 /// This is the cells-per-verify number the hash matrix wants, and it is a
 /// MEASUREMENT of the emitted program rather than a projection from a per-leg
-/// cost: the same emitter, the same real epoch, the same 26 sub-proofs, with only
+/// cost: the same emitter, the same real epoch, the same 25 sub-proofs, with only
 /// the inner proof's options moved. Whether the resulting program can be PROVED is
 /// a separate question and the test answers it with the projection above rather
 /// than by pretending to have run it.

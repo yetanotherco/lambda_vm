@@ -1352,7 +1352,7 @@ fn a_zero_row_fixed_table_carries_some_zero_not_none() {
     // None would make every real epoch unverifiable. That is now a run: strip
     // the bus public inputs off a zero-row sub-proof and watch this very proof
     // stop verifying. Only the `is_some` direction can be tested on an epoch —
-    // all 26 sub-proofs declare interactions, so :1244's converse has no
+    // all 25 sub-proofs declare interactions, so :1244's converse has no
     // subject here.
     for (i, (name, _, no_rows)) in census.iter().enumerate() {
         if !no_rows {
