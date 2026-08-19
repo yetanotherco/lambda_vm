@@ -176,24 +176,34 @@ pub fn keccak_permute(_state: &mut [u64; 25]) {
 }
 
 #[cfg(target_arch = "riscv64")]
-/// Compute `xR = (k·G)_x` on secp256k1 via the ECSM accelerator. All values are 32-byte
-/// little-endian. Requires `0 < k < N` and a canonical valid `xG` curve coordinate.
-/// `xG` and `k` must not overlap; `xR` may alias either input.
-pub fn ecsm_mul(xr: &mut [u8; 32], xg: &[u8; 32], k: &[u8; 32]) {
+/// Compute `k·G` on secp256k1 via the ECSM accelerator, writing `[xR ‖ yR ‖ yG]` as three
+/// contiguous 32-byte little-endian values into `out`. Requires `0 < k < N` and a canonical
+/// valid `xG` curve coordinate. `xG` and `k` must not overlap; `out` may alias either input.
+///
+/// `yG` is the root of `xG` the chip actually used, and the chip is free to pick either one
+/// (the AIR binds only `yG² ≡ xG³ + b`). So `yR` is the y of `k·(xG, yG)`, which is `±y(k·P)`
+/// for the caller's point `P`. Compare `yG` against your own base point's y and negate `yR`
+/// when they differ; that also validates `yG`, since a value that is neither root means the
+/// output is unusable and the caller should fall back.
+///
+/// `out` should be 8-byte aligned so the twelve doubleword accesses land on the aligned
+/// memory path (MEMW_A) instead of the general one; the same goes for `xg` and `k`.
+pub fn ecsm_mul(out: &mut [u8; 96], xg: &[u8; 32], k: &[u8; 32]) {
     unsafe {
         asm!(
             "ecall",
-            in("a0") xr.as_mut_ptr(), // x10 = address to write xR
-            in("a1") xg.as_ptr(),     // x11 = address of xG
-            in("a2") k.as_ptr(),      // x12 = address of k
+            in("a0") out.as_mut_ptr(), // x10 = address to write [xR ‖ yR ‖ yG]
+            in("a1") xg.as_ptr(),      // x11 = address of xG
+            in("a2") k.as_ptr(),       // x12 = address of k
             in("a7") ECSM_SYSCALL_NUMBER,
         )
     }
 }
 
 #[cfg(not(target_arch = "riscv64"))]
-/// Compute `xR = (k·G)_x` on secp256k1 via the ECSM accelerator (32-byte little-endian values).
-pub fn ecsm_mul(_xr: &mut [u8; 32], _xg: &[u8; 32], _k: &[u8; 32]) {
+/// Compute `k·G` on secp256k1 via the ECSM accelerator, writing `[xR ‖ yR ‖ yG]`
+/// (three 32-byte little-endian values) into `out`.
+pub fn ecsm_mul(_out: &mut [u8; 96], _xg: &[u8; 32], _k: &[u8; 32]) {
     unimplemented!("syscalls are only implemented for riscv64 targets");
 }
 

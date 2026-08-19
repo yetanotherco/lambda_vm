@@ -120,9 +120,28 @@ pub(crate) fn prepare(
 }
 
 /// Computes the x-coordinate of `k·G` over secp256k1, given `k` and `xG` as little-endian
-/// 32-byte values. This is the executor's entry point — it writes the returned bytes back
-/// to guest memory at `addr_xR`.
+/// 32-byte values.
 pub fn scalar_mul_x(k_le: &[u8; 32], xg_le: &[u8; 32]) -> Result<[u8; 32], EcsmError> {
+    Ok(scalar_mul_full(k_le, xg_le)?.0)
+}
+
+/// The ECSM ecall's memory image: `(xR, yR, yG)`, three little-endian 32-byte values written
+/// back as one contiguous 96-byte buffer.
+pub type EcsmOutput = ([u8; 32], [u8; 32], [u8; 32]);
+
+/// The executor's entry point: `(xR, yR, yG)` as little-endian 32-byte values, written back
+/// to guest memory as one contiguous 96-byte buffer at `addr_xR`.
+///
+/// `yG` is echoed because the chip is free to witness *either* root of `xG` — the AIR only
+/// binds `yG² ≡ xG³ + b`, so nothing pins the sign (see `spec/ecsm.typ`, "Two options for
+/// `y_G`"). Returning `yR` alone would therefore be ambiguous: it is the y of `k·(xG, yG)`
+/// for whichever root the prover chose, which is `±y(k·P)` for the caller's own point `P`.
+/// Echoing `yG` resolves it caller-side at no cost: the caller checks `yG < p` (free — it
+/// is the field-element parse) and compares `yG`'s parity against its own base point's, so
+/// a flipped root just flips the sign it applies to `yR`. That keeps the root a free choice
+/// for the prover, exactly as the spec's aside argues, while still handing back a usable y.
+pub fn scalar_mul_full(k_le: &[u8; 32], xg_le: &[u8; 32]) -> Result<EcsmOutput, EcsmError> {
     let (k, g) = prepare(k_le, xg_le)?;
-    Ok(to_le_32(&curve::scalar_mul_affine_x(&k, &g)))
+    let r = curve::scalar_mul_affine(&k, &g);
+    Ok((to_le_32(&r.x), to_le_32(&r.y), to_le_32(&g.y)))
 }

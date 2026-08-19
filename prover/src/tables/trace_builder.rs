@@ -862,7 +862,7 @@ fn collect_ecsm_ops(
     let witness = ::ecsm::compute_witness(&k, &xg)
         .expect("ECSM witness: executor validates 0 < k < N and xG on curve");
 
-    let mut memw_ops = Vec::with_capacity(15);
+    let mut memw_ops = Vec::with_capacity(23);
 
     // x11 -> addr_xG (register read at T), x12 -> addr_k (register read at T+1).
     {
@@ -926,20 +926,30 @@ fn collect_ecsm_ops(
         register_state.write(10, val, t + 2);
     }
 
-    // xR writes at T + 2 (4 doublewords).
-    for i in 0..4 {
-        let addr = addr_xr.wrapping_add((8 * i) as u64);
-        let mut value = [0u32; 8];
-        let mut dword = 0u64;
-        for j in 0..8 {
-            value[j] = witness.x_r[8 * i + j] as u32;
-            dword |= (witness.x_r[8 * i + j] as u64) << (8 * j);
+    // Output buffer [xR ‖ yR ‖ yG] — 12 doubleword writes at addr_xR + off + 8i.
+    // xR at T + 2 (grouped with the x10 register read), yR and yG at T + 3, the free fourth
+    // sub-timestamp of the stride-4 window. The three chunks are disjoint 32-byte ranges, so
+    // sharing T + 3 between the last two never touches an address twice. `yG` is echoed so
+    // the guest can tell which root of xG the chip witnessed; see `ecsm::bus_interactions`.
+    for (bytes, off, ts) in [
+        (&witness.x_r, 0u64, t + 2),
+        (&witness.y_r, 32, t + 3),
+        (&witness.y_g, 64, t + 3),
+    ] {
+        for i in 0..4 {
+            let addr = addr_xr.wrapping_add(off).wrapping_add((8 * i) as u64);
+            let mut value = [0u32; 8];
+            let mut dword = 0u64;
+            for j in 0..8 {
+                value[j] = bytes[8 * i + j] as u32;
+                dword |= (bytes[8 * i + j] as u64) << (8 * j);
+            }
+            let (old_vals, old_ts) = memory_state.read_bytes(addr, 8);
+            memw_ops.push(
+                MemwOperation::new(false, addr, value, ts, 8, false).with_old(old_vals, old_ts),
+            );
+            memory_state.write_bytes(addr, dword, 8, ts);
         }
-        let (old_vals, old_ts) = memory_state.read_bytes(addr, 8);
-        memw_ops.push(
-            MemwOperation::new(false, addr, value, t + 2, 8, false).with_old(old_vals, old_ts),
-        );
-        memory_state.write_bytes(addr, dword, 8, t + 2);
     }
 
     let ecdas_ops = witness

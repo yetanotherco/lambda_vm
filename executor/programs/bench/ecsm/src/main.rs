@@ -22,10 +22,13 @@ pub fn main() {
     ];
     k.reverse();
 
-    let mut xr = [0u8; 32];
+    // The precompile writes [xR ‖ yR ‖ yG]; the chain feeds xR back as the next base point.
+    #[repr(C, align(8))]
+    struct Align8<const N: usize>([u8; N]);
+    let mut out = Align8([0u8; 96]);
     for _ in 0..ITERATIONS {
-        syscalls::syscalls::ecsm_mul(&mut xr, &xg, &k);
-        xg = xr;
+        syscalls::syscalls::ecsm_mul(&mut out.0, &xg, &k);
+        xg.copy_from_slice(&out.0[..32]);
     }
-    syscalls::syscalls::commit(&xr);
+    syscalls::syscalls::commit(&out.0[..32]);
 }

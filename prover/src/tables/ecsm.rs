@@ -420,27 +420,46 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             0,
         ),
     ));
-    // write xR: 4 doublewords at addr_xR + 8i (ts + 2).
-    for i in 0..4 {
-        let base_lo = BusValue::linear(vec![
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::ADDR_XR_0,
-            },
-            LinearTerm::Constant((8 * i) as i64),
-        ]);
-        out.push(BusInteraction::sender(
-            BusId::Memw,
-            mu(),
-            memw_write(
-                dword_bytes(cols::XR, i),
-                base_lo,
-                packed(cols::ADDR_XR_1),
-                ts_lo_plus(2),
-                ts_hi(),
-                1,
-            ),
-        ));
+    // Write the 96-byte output buffer [xR ‖ yR ‖ yG] as 12 doublewords at addr_xR + off + 8i.
+    //
+    // `yG` is echoed because the chip may witness EITHER root of xG — the AIR binds only
+    // `yG² ≡ xG³ + b`, so nothing here pins the sign (see the "Two options for y_G" aside in
+    // `spec/ecsm.typ`). `yR` alone would therefore be ambiguous: it is `±y(k·P)` for the
+    // caller's own point P. Handing back the root the chip used lets the guest resolve it
+    // with one comparison, which keeps the root a free choice exactly as the aside argues
+    // while still exposing a usable y — and costs no column, since `YR` and `YG` are already
+    // witnessed (YR arrives on the ECDAS bus, YG is proved by the yG convolution).
+    //
+    // xR keeps ts + 2 (grouped with the x10 register read); yR and yG take ts + 3, the free
+    // fourth sub-timestamp of the instruction's stride-4 window. Several doubleword accesses
+    // may share a timestamp as long as their addresses differ, which they do — the three
+    // chunks are disjoint 32-byte ranges of one buffer.
+    for (col, off, ts) in [
+        (cols::XR, 0i64, ts_lo_plus(2)),
+        (cols::YR, 32, ts_lo_plus(3)),
+        (cols::YG, 64, ts_lo_plus(3)),
+    ] {
+        for i in 0..4 {
+            let base_lo = BusValue::linear(vec![
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::ADDR_XR_0,
+                },
+                LinearTerm::Constant(off + (8 * i) as i64),
+            ]);
+            out.push(BusInteraction::sender(
+                BusId::Memw,
+                mu(),
+                memw_write(
+                    dword_bytes(col, i),
+                    base_lo,
+                    packed(cols::ADDR_XR_1),
+                    ts.clone(),
+                    ts_hi(),
+                    1,
+                ),
+            ));
+        }
     }
 
     // IS_BYTE range checks (single byte → AreBytes[x, 0]).

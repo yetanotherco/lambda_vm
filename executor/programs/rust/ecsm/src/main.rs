@@ -14,7 +14,11 @@ pub fn main() {
     let mut k = [0u8; 32];
     k[0] = 5;
 
-    let mut xr = [0u8; 32];
-    syscalls::syscalls::ecsm_mul(&mut xr, &xg, &k);
-    syscalls::syscalls::commit(&xr);
+    // The precompile writes [xR ‖ yR ‖ yG]; only xR is committed. 8-byte aligned so the
+    // twelve doubleword accesses take the aligned memory path (MEMW_A).
+    #[repr(C, align(8))]
+    struct Align8<const N: usize>([u8; N]);
+    let mut out = Align8([0u8; 96]);
+    syscalls::syscalls::ecsm_mul(&mut out.0, &xg, &k);
+    syscalls::syscalls::commit(&out.0[..32]);
 }
