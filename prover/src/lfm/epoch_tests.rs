@@ -1620,6 +1620,33 @@ fn batched_epoch_program(e: &RealBatchedEpoch) -> LfmProgram {
     batched_epoch_program_with(e, false, false)
 }
 
+/// Per-table [`super::deep::DeepShape`]s, from the AIR set and the proof's
+/// trace lengths — the same derivation [`build_table_legs`]'s per-table
+/// sibling makes, minus the per-table view.
+///
+/// [`build_table_legs`]: super::epoch_verify_tests::build_table_legs
+fn batched_deep_shapes(e: &RealBatchedEpoch) -> Vec<super::deep::DeepShape> {
+    use stark::verifier::{IsStarkVerifier, Verifier};
+
+    e.refs()
+        .iter()
+        .zip(&e.proof.tables)
+        .map(|(air, data)| {
+            let layout = Verifier::<Gl, Ext3, ()>::ood_layout(*air);
+            let artifact = stark::constraint_ir::ConstraintArtifact::capture(*air);
+            let (main_width, aux_width) = air.trace_layout();
+            super::deep::DeepShape {
+                step_size: layout.step_size(),
+                num_eval_points: artifact.shape.transition_offsets.len() * layout.step_size(),
+                num_total_cols: main_width + aux_width,
+                next_row_cols: layout.next_row_cols().to_vec(),
+                num_composition_parts: data.composition_poly_parts_ood_evaluation.len(),
+                log2_trace_length: data.trace_length.trailing_zeros(),
+            }
+        })
+        .collect()
+}
+
 /// Hint `count` consecutive words of `arena`, advancing `cursor` — the
 /// walk over the batched opening arena's declared order.
 fn hint_run(
@@ -1736,6 +1763,13 @@ fn batched_epoch_program_with(
         b.declare_arena(
             (e.proof.queries.len()
                 * super::epoch_verify_tests::batched_opening_words_per_query(&e.shape))
+                as u32,
+        )
+    });
+    let a_fri_legs = with_openings.then(|| {
+        b.declare_arena(
+            (e.proof.queries.len()
+                * super::epoch_verify_tests::batched_fri_words_per_query(&e.shape, &e.fri_params))
                 as u32,
         )
     });
@@ -1944,12 +1978,74 @@ fn batched_epoch_program_with(
         };
         use super::sub_proof::{GroupCommitment, GroupOpening, GroupShape};
 
+        use super::deep::DeepOpening;
+
+        let n = e.proof.tables.len();
         let h_max_fri = e.shape.heights.iter().copied().max().expect("tables");
+
+        // Every table's matrix position in each round — the crossing's read,
+        // the same one `table_deep_pairs` makes.
+        let prep_pos: Vec<Option<usize>> = (0..n)
+            .map(|t| e.shape.prep.tables.iter().position(|&x| x == t))
+            .collect();
+        let main_pos: Vec<usize> = (0..n)
+            .map(|t| {
+                e.shape
+                    .main
+                    .tables
+                    .iter()
+                    .position(|&x| x == t)
+                    .expect("every table has a main matrix")
+            })
+            .collect();
+        let aux_pos: Vec<Option<usize>> = (0..n)
+            .map(|t| e.shape.aux.tables.iter().position(|&x| x == t))
+            .collect();
+        let parts_pos: Vec<usize> = (0..n)
+            .map(|t| {
+                e.shape
+                    .parts
+                    .tables
+                    .iter()
+                    .position(|&x| x == t)
+                    .expect("every table has a parts matrix")
+            })
+            .collect();
+
+        // Per-table DEEP invariants, hoisted across queries — the OOD grid is
+        // rebuilt from the very cells the spine absorbed, so there is no
+        // second copy of the grid for a prover to disagree with.
+        let deep_shapes = batched_deep_shapes(e);
+        let dinvs: Vec<super::deep::DeepInvariants> = (0..n)
+            .map(|t_i| {
+                let ood_rows = super::epoch::emit_reconstruct_ood(
+                    &mut b,
+                    &deep_shapes[t_i],
+                    &ood_cells[t_i].0,
+                    &ood_cells[t_i].1,
+                );
+                super::deep::emit_deep_invariants(
+                    &mut b,
+                    &deep_shapes[t_i],
+                    ch.gammas[t_i],
+                    ch.zs[t_i],
+                    &ood_rows,
+                    &ood_cells[t_i].2,
+                )
+            })
+            .collect();
+        let fri_layer_commitments: Vec<super::fri::LayerCommitment> = fri_root_cells
+            .iter()
+            .map(|c| super::fri::LayerCommitment {
+                root_lanes: c.lanes,
+            })
+            .collect();
+
         let mut cursor: u32 = 0;
+        let mut fri_cursor: u32 = 0;
         for bits in &ch.iota_bits {
-            // Preprocessed tables, `shape.prep.tables` order — each a standard
-            // per-table row-pair tree at its OWN height, walked at its own
-            // reduction of the shared index.
+            // ---- the walks: preprocessed tables, then the mixed rounds ----
+            let mut prep_values: Vec<Vec<super::builder::Cell>> = Vec::new();
             for (slot, &(h, w)) in e.shape.prep.tables.iter().zip(e.shape.prep.dims.iter()) {
                 let cells = prep_cells[*slot]
                     .as_ref()
@@ -1972,13 +2068,20 @@ fn batched_epoch_program_with(
                             is_ext: false,
                         },
                     ),
-                    &GroupOpening { values, siblings },
+                    &GroupOpening {
+                        values: values.clone(),
+                        siblings,
+                    },
                     tbits,
                 );
+                prep_values.push(values);
             }
 
             // The three mixed rounds: per-matrix row pairs in round INPUT
-            // order, then the round's ONE shared path.
+            // order, then the round's ONE shared path. The value cells are
+            // KEPT — the crossing below reads the cells the walks
+            // authenticated, never a second copy.
+            let mut round_values: Vec<Vec<Vec<super::builder::Cell>>> = Vec::new();
             let mut rounds: Vec<(&stark::batched::shape::RoundShape, &RootCells, bool)> =
                 vec![(&e.shape.main, &main_cells, false)];
             if let Some(aux) = aux_cells.as_ref() {
@@ -2012,6 +2115,159 @@ fn batched_epoch_program_with(
                     reduce_iota_bits(bits, h_max_fri, h_round)
                 };
                 emit_mixed_verify_batch(&mut b, root, &matrices, &siblings, rbits);
+                round_values.push(per_values);
+            }
+            let main_values = &round_values[0];
+            let aux_values = aux_cells.as_ref().map(|_| &round_values[1]);
+            let parts_values = round_values.last().expect("the parts round");
+
+            // ---- the crossing: per table, the authenticated cells re-read
+            // by POINT, folded to the DEEP pair at the reduced index ----
+            let mut points: Vec<(super::builder::Felt, super::builder::Felt)> =
+                Vec::with_capacity(n);
+            let mut deep_pairs: Vec<(super::builder::Ext, super::builder::Ext)> =
+                Vec::with_capacity(n);
+            for t_i in 0..n {
+                let h_t = e.shape.heights[t_i];
+                let rbits = reduce_iota_bits(bits, h_max_fri, h_t);
+                let (point, point_sym) = super::sub_proof::emit_points_from_bits(
+                    &mut b,
+                    h_t as u32,
+                    shape.coset_offset,
+                    rbits,
+                );
+
+                let mut trace = Vec::with_capacity(deep_shapes[t_i].num_total_cols);
+                let mut trace_sym = Vec::with_capacity(deep_shapes[t_i].num_total_cols);
+                if let Some(m) = prep_pos[t_i] {
+                    let w = e.shape.prep.dims[m].1;
+                    let vals = &prep_values[m];
+                    trace.extend((0..w).map(|c| vals[c].as_ext()));
+                    trace_sym.extend((0..w).map(|c| vals[w + c].as_ext()));
+                }
+                {
+                    let m = main_pos[t_i];
+                    let w = e.shape.main.dims[m].1;
+                    let vals = &main_values[m];
+                    trace.extend((0..w).map(|c| vals[c].as_ext()));
+                    trace_sym.extend((0..w).map(|c| vals[w + c].as_ext()));
+                }
+                if let Some(m) = aux_pos[t_i] {
+                    let w = e.shape.aux.dims[m].1;
+                    let vals = &aux_values.expect("an aux position implies an aux round")[m];
+                    trace.extend((0..w).map(|c| vals[c].as_ext()));
+                    trace_sym.extend((0..w).map(|c| vals[w + c].as_ext()));
+                }
+                assert_eq!(
+                    trace.len(),
+                    deep_shapes[t_i].num_total_cols,
+                    "the crossing must cover exactly the DEEP column set"
+                );
+                let m = parts_pos[t_i];
+                let w = e.shape.parts.dims[m].1;
+                assert_eq!(
+                    w, deep_shapes[t_i].num_composition_parts,
+                    "the parts matrix is one column per composition part"
+                );
+                let vals = &parts_values[m];
+                let parts: Vec<super::builder::Ext> = (0..w).map(|c| vals[c].as_ext()).collect();
+                let parts_sym: Vec<super::builder::Ext> =
+                    (0..w).map(|c| vals[w + c].as_ext()).collect();
+
+                let regular = DeepOpening {
+                    point,
+                    trace,
+                    parts,
+                };
+                let symmetric = DeepOpening {
+                    point: point_sym,
+                    trace: trace_sym,
+                    parts: parts_sym,
+                };
+                deep_pairs.push((
+                    super::deep::emit_deep_point(
+                        &mut b,
+                        &deep_shapes[t_i],
+                        ch.gammas[t_i],
+                        &dinvs[t_i],
+                        &regular,
+                    ),
+                    super::deep::emit_deep_point(
+                        &mut b,
+                        &deep_shapes[t_i],
+                        ch.gammas[t_i],
+                        &dinvs[t_i],
+                        &symmetric,
+                    ),
+                ));
+                points.push((point, point_sym));
+            }
+
+            // ---- the mix, the batched instance, the standalone class ----
+            let (p0, p0_sym, buckets) = super::batched_epoch_verify::emit_query_mix(
+                &mut b,
+                &shape.fri.plan.batched,
+                &e.shape.heights,
+                h_max_fri,
+                ch.alpha,
+                &deep_pairs,
+                bits,
+            );
+            // υ in the TALLEST domain is the tallest table's own point — its
+            // reduction is the identity, so reusing the cell adds no second
+            // derivation.
+            let tallest = e
+                .shape
+                .heights
+                .iter()
+                .position(|&h| h == h_max_fri)
+                .expect("a tallest table exists");
+            let fri_openings_q: Vec<super::fri::LayerOpening> = (0..shape.fri.num_committed())
+                .map(|i| {
+                    let sym = {
+                        let c = b.hint_word(
+                            a_fri_legs.expect("the FRI arena exists with the legs"),
+                            fri_cursor,
+                        );
+                        fri_cursor += 1;
+                        c.as_ext()
+                    };
+                    let siblings = hint_digests(
+                        &mut b,
+                        a_fri_legs.expect("the FRI arena exists with the legs"),
+                        &mut fri_cursor,
+                        h_max_fri - i - 2,
+                    );
+                    super::fri::LayerOpening { sym, siblings }
+                })
+                .collect();
+            super::batched_epoch_verify::emit_batched_query_fri(
+                &mut b,
+                &shape.fri.layout,
+                h_max_fri,
+                &fri_layer_commitments,
+                &ch.zetas,
+                &coeff_cells,
+                bits,
+                points[tallest].0,
+                points[tallest].1,
+                p0,
+                p0_sym,
+                &buckets,
+                &fri_openings_q,
+            );
+            for &t_i in &shape.fri.plan.standalone {
+                let coeffs = standalone_cells[t_i]
+                    .as_ref()
+                    .expect("a standalone table has terminal cells");
+                super::batched_epoch_verify::emit_standalone_terminal_check(
+                    &mut b,
+                    coeffs,
+                    points[t_i].0,
+                    points[t_i].1,
+                    deep_pairs[t_i].0,
+                    deep_pairs[t_i].1,
+                );
             }
         }
         assert_eq!(
@@ -2019,6 +2275,12 @@ fn batched_epoch_program_with(
             e.proof.queries.len()
                 * super::epoch_verify_tests::batched_opening_words_per_query(&e.shape),
             "the walks must consume exactly the declared opening arena"
+        );
+        assert_eq!(
+            fri_cursor as usize,
+            e.proof.queries.len()
+                * super::epoch_verify_tests::batched_fri_words_per_query(&e.shape, &e.fri_params),
+            "the FRI legs must consume exactly the declared arena"
         );
     }
 
@@ -2201,12 +2463,16 @@ fn the_batched_openings_authenticate_against_the_spine_roots() {
     let program = batched_epoch_program_with(&e, true, false);
     let mut arenas = batched_epoch_arenas(&e);
     arenas.push(super::epoch_verify_tests::batched_opening_arena(&e));
+    arenas.push(super::epoch_verify_tests::batched_fri_arena(&e));
     execute(&program, &arenas, &TestPermutation)
         .expect("every opening of an honest batched epoch must authenticate");
 
     // A moved opening VALUE is unprovable (the first arena word is the first
-    // preprocessed table's first evaluation).
-    let open_idx = arenas.len() - 1;
+    // preprocessed table's first evaluation) — and since the crossing folds
+    // the SAME cell, a value that somehow re-authenticated would still move
+    // the DEEP pair and die at the FRI terminal.
+    let open_idx = arenas.len() - 2;
+    let fri_idx = arenas.len() - 1;
     let mut tampered = arenas.clone();
     tampered[open_idx][0] = base_word(FE::from(999_999u64));
     assert!(
@@ -2223,6 +2489,50 @@ fn the_batched_openings_authenticate_against_the_spine_roots() {
         execute(&program, &tampered, &TestPermutation).is_err(),
         "a tampered sibling must not authenticate"
     );
+
+    // A moved FRI layer value (the first FRI arena word is layer 0's
+    // symmetric evaluation) must fail its layer walk — or, had it somehow
+    // re-authenticated, the fold chain's terminal.
+    if !arenas[fri_idx].is_empty() {
+        let mut tampered = arenas.clone();
+        tampered[fri_idx][0] = base_word(FE::from(999_999u64));
+        assert!(
+            execute(&program, &tampered, &TestPermutation).is_err(),
+            "a tampered FRI layer opening must not verify"
+        );
+    }
+
+    // A moved STANDALONE terminal coefficient shifts the transcript (it is
+    // absorbed — the binding the campaign's soundness fix added) AND the
+    // polynomial the standalone check evaluates; both directions kill it.
+    if !e.challenges.fri.plan.standalone.is_empty() {
+        // Position: statement, prep, main_root, reg_init, reg_fini, pc_start,
+        // [aux_root], per-RAP-table contribution, per-table (ood_c, ood_n,
+        // parts), parts_root, THEN the standalone arenas. Count forward.
+        let n = e.proof.tables.len();
+        let num_contrib = e
+            .proof
+            .tables
+            .iter()
+            .filter(|t| t.bus_public_inputs.is_some())
+            .count();
+        let idx = 6 + usize::from(e.proof.aux_root.is_some()) + num_contrib + 3 * n + 1;
+        // The arm must point at what it claims to tamper — pinned by size,
+        // since tampering ANY absorbed arena also fails and would mask a
+        // wrong index.
+        let first_standalone = e.challenges.fri.plan.standalone[0];
+        assert_eq!(
+            arenas[idx].len(),
+            1usize << (e.shape.heights[first_standalone] as u32 - e.fri_params.blowup_log),
+            "the tamper arm must point at the first standalone terminal arena"
+        );
+        let mut tampered = arenas.clone();
+        tampered[idx][0] = ext_word(&FEE::from(999_999u64));
+        assert!(
+            execute(&program, &tampered, &TestPermutation).is_err(),
+            "a tampered standalone terminal coefficient must not verify"
+        );
+    }
 
     // ★ The index-reduction DIRECTION (`fri/mmcs.rs`'s convention section):
     // keeping the low bits instead of the high ones is self-consistent

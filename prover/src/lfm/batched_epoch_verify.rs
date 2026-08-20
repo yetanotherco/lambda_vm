@@ -165,3 +165,200 @@ pub fn reduce_iota_bits(bits: &[Bit], h_max_fri: usize, h_max_round: usize) -> &
     );
     &bits[(h_max_fri - h_max_round)..]
 }
+
+// ================= the DEEP mix and the batched FRI leg =================
+
+/// α-mix one query's per-table DEEP pairs into the tallest-domain pair `p0`
+/// and the per-height injection buckets — `verify_epoch_fri`'s loop, emitted.
+///
+/// ★ Powers of α go by `plan_batched` POSITION, not table index and not
+/// position within a height group — the three orders coincide on a same-height
+/// epoch and diverge on a real one (`batched/verifier.rs`' warning). A short
+/// table contributes ONE value, chosen from its pair by the injection
+/// position's low bit — which is bit `h_max − h − 1` of the SHARED index, so
+/// the choice is a `Select` on a bit the transcript drew, never a hint.
+///
+/// `deep_pairs` is indexed by TABLE; entries outside the batched class are
+/// not read.
+pub fn emit_query_mix(
+    b: &mut LfmBuilder,
+    plan_batched: &[usize],
+    heights: &[usize],
+    h_max: usize,
+    alpha: super::builder::Ext,
+    deep_pairs: &[(super::builder::Ext, super::builder::Ext)],
+    bits: &[Bit],
+) -> (
+    super::builder::Ext,
+    super::builder::Ext,
+    Vec<Option<super::builder::Ext>>,
+) {
+    assert!(!plan_batched.is_empty(), "the batched class is never empty");
+    assert_eq!(bits.len(), h_max - 1, "the shared index has h_max − 1 bits");
+
+    let mut p0: Option<(super::builder::Ext, super::builder::Ext)> = None;
+    let mut buckets: Vec<Option<super::builder::Ext>> = vec![None; h_max];
+    let mut power: Option<super::builder::Ext> = None;
+    for &table in plan_batched {
+        let (d, d_sym) = deep_pairs[table];
+        let h = heights[table];
+        assert!(h <= h_max, "no batched table is taller than the instance");
+        // α^pos — position in plan.batched. pos 0 multiplies by nothing.
+        let scale = |b: &mut LfmBuilder, v: super::builder::Ext| match power {
+            None => v,
+            Some(p) => b.emul(p, v),
+        };
+        if h == h_max {
+            let sd = scale(b, d);
+            let sds = scale(b, d_sym);
+            p0 = Some(match p0 {
+                None => (sd, sds),
+                Some((a, s)) => (b.eadd(a, sd), b.eadd(s, sds)),
+            });
+        } else {
+            // `injected_value_at_query`: the injection position's low bit is
+            // bit `h_max − h − 1` of the shared index; 0 picks the regular
+            // value, 1 the symmetric one — `select` at 0 returns its first
+            // argument first, so `.0` IS that conditional.
+            let (chosen, _) = b.select(bits[h_max - h - 1], d.as_cell(), d_sym.as_cell());
+            let sv = scale(b, chosen.as_ext());
+            buckets[h] = Some(match buckets[h].take() {
+                None => sv,
+                Some(acc) => b.eadd(acc, sv),
+            });
+        }
+        power = Some(match power {
+            None => alpha,
+            Some(p) => b.emul(p, alpha),
+        });
+    }
+    let (p0, p0_sym) = p0.expect("the tallest table is always batched");
+    (p0, p0_sym, buckets)
+}
+
+/// One query of the BATCHED FRI instance: the fold-with-injection recursion,
+/// every committed layer's opening authenticated at the shared index, and the
+/// terminal check — `verify_batched_fri_query`, emitted.
+///
+/// The per-table [`super::fri::emit_query_fri`]'s shape with two additions:
+/// after EVERY fold (the uncommitted first one included) the height the
+/// running codeword just reached may have a bucket, injected as
+/// `v += ζ² · bucket` — the schedule is program shape and UNROLLS — and the
+/// terminal Horner runs at `υ^(2^total_folds)` of the TALLEST domain, whose
+/// coset offset the caller already folded into `point`.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_batched_query_fri(
+    b: &mut LfmBuilder,
+    layout: &stark::fri::batched::BatchedFriLayout,
+    h_max: usize,
+    layers: &[super::fri::LayerCommitment],
+    zetas: &[super::builder::Ext],
+    coeffs: &[super::builder::Ext],
+    bits: &[Bit],
+    point: Felt,
+    point_sym: Felt,
+    p0: super::builder::Ext,
+    p0_sym: super::builder::Ext,
+    buckets: &[Option<super::builder::Ext>],
+    openings: &[super::fri::LayerOpening],
+) -> super::builder::Ext {
+    use super::edsl::horner_ext;
+    use super::fri::FRI_LEAF_GROUP;
+    use crate::tables::types::FE;
+
+    let c = layout.num_committed;
+    assert_eq!(bits.len(), h_max - 1, "the shared index has h_max − 1 bits");
+    assert_eq!(layers.len(), c, "one commitment per committed layer");
+    assert_eq!(openings.len(), c, "one opening per committed layer");
+    assert_eq!(
+        coeffs.len(),
+        1usize << layout.effective_k,
+        "the terminal polynomial carries 2^effective_k coefficients"
+    );
+    assert_eq!(buckets.len(), h_max, "one bucket slot per height");
+
+    if layout.total_folds == 0 {
+        // The codeword never folds: the terminal IS the tallest codeword and
+        // no bucket can exist (`h_min == h_max` is what makes folds zero).
+        assert!(zetas.is_empty(), "a codeword that never folds draws no ζ");
+        assert!(
+            buckets.iter().all(Option::is_none),
+            "no injection exists below a terminal-height instance"
+        );
+        let at = horner_ext(b, point.as_ext(), coeffs);
+        b.assert_eq_ext(at, p0);
+        let at_sym = horner_ext(b, point_sym.as_ext(), coeffs);
+        b.assert_eq_ext(at_sym, p0_sym);
+        return p0;
+    }
+    assert_eq!(zetas.len(), c + 1, "folds exceed committed layers by one");
+
+    let inject = |b: &mut LfmBuilder,
+                  v: super::builder::Ext,
+                  zeta: super::builder::Ext,
+                  height: usize|
+     -> super::builder::Ext {
+        match buckets.get(height).and_then(|o| o.as_ref()) {
+            None => v,
+            Some(bucket) => {
+                let zeta_sq = b.emul(zeta, zeta);
+                let term = b.emul(zeta_sq, *bucket);
+                b.eadd(v, term)
+            }
+        }
+    };
+
+    let one = b.felt_const(FE::one());
+    let inv = b.div(one, point);
+
+    // Fold 0 consumes the mixed DEEP pair and authenticates nothing; the
+    // height just below joins before the first committed layer, exactly as
+    // `batched_commit_phase` injects before it commits.
+    let mut v = super::edsl::fri_fold(b, p0, p0_sym, zetas[0], inv);
+    v = inject(b, v, zetas[0], h_max - 1);
+
+    let mut inv_pow = inv;
+    for (i, opening) in openings.iter().enumerate() {
+        let (first, second) = b.select(bits[i], v.as_cell(), opening.sym.as_cell());
+        let leaf = super::sub_proof::emit_leaf_hash(b, FRI_LEAF_GROUP, &[first, second]);
+        let root = super::edsl::wrap_merkle_walk(b, leaf, &bits[i + 1..], &opening.siblings);
+        super::edsl::assert_word_eq_lanes(b, root[0], &layers[i].root_lanes[0]);
+        super::edsl::assert_word_eq_lanes(b, root[1], &layers[i].root_lanes[1]);
+
+        inv_pow = b.mul(inv_pow, inv_pow);
+        v = super::edsl::fri_fold(b, v, opening.sym, zetas[i + 1], inv_pow);
+        if let Some(height) = (h_max - 1).checked_sub(i + 1) {
+            v = inject(b, v, zetas[i + 1], height);
+        }
+    }
+
+    // `υ^(2^total_folds)` — the terminal codeword's own point at the reduced
+    // position, coset offset included by construction (the point already
+    // carries it, so raising it raises the offset too:
+    // `terminal_offset = coset_offset^(2^total_folds)`).
+    let mut x = point;
+    for _ in 0..layout.total_folds {
+        x = b.mul(x, x);
+    }
+    let at = horner_ext(b, x.as_ext(), coeffs);
+    b.assert_eq_ext(at, v);
+    v
+}
+
+/// One query of a STANDALONE table's terminal-only instance: the sent
+/// polynomial (the ARENA CELLS the spine absorbed — one cell, two consumers)
+/// evaluated at the table's own reduced pair must equal its DEEP pair —
+/// `verify_standalone_fri_query`, emitted. Nothing folds and nothing walks.
+pub fn emit_standalone_terminal_check(
+    b: &mut LfmBuilder,
+    coeffs: &[super::builder::Ext],
+    point: Felt,
+    point_sym: Felt,
+    deep: super::builder::Ext,
+    deep_sym: super::builder::Ext,
+) {
+    let at = super::edsl::horner_ext(b, point.as_ext(), coeffs);
+    b.assert_eq_ext(at, deep);
+    let at_sym = super::edsl::horner_ext(b, point_sym.as_ext(), coeffs);
+    b.assert_eq_ext(at_sym, deep_sym);
+}
