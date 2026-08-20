@@ -1617,10 +1617,63 @@ fn batched_shape_of(e: &RealBatchedEpoch) -> super::batched_epoch::BatchedEpochS
 /// attestation join, the ONE-transcript batched challenge replay, and the
 /// LogUp closure. The batched sibling of [`epoch_program`]'s spine half.
 fn batched_epoch_program(e: &RealBatchedEpoch) -> LfmProgram {
+    batched_epoch_program_with(e, false, false)
+}
+
+/// Hint `count` consecutive words of `arena`, advancing `cursor` — the
+/// walk over the batched opening arena's declared order.
+fn hint_run(
+    b: &mut LfmBuilder,
+    arena: super::instr::ArenaId,
+    cursor: &mut u32,
+    count: usize,
+) -> Vec<super::builder::Cell> {
+    (0..count)
+        .map(|_| {
+            let c = b.hint_word(arena, *cursor);
+            *cursor += 1;
+            c
+        })
+        .collect()
+}
+
+/// Hint `count` digests (two words each) of `arena`, advancing `cursor`.
+fn hint_digests(
+    b: &mut LfmBuilder,
+    arena: super::instr::ArenaId,
+    cursor: &mut u32,
+    count: usize,
+) -> Vec<super::edsl::WrapDigest> {
+    (0..count)
+        .map(|_| {
+            let d = [b.hint_word(arena, *cursor), b.hint_word(arena, *cursor + 1)];
+            *cursor += 2;
+            d
+        })
+        .collect()
+}
+
+/// [`batched_epoch_program`] with the OPENING AUTHENTICATION legs hung off
+/// the spine (`with_openings`), and with the deliberately WRONG index
+/// reduction (`wrong_reduction`) — the machine port of
+/// `short_round_low_bit_convention_is_exercised`: keeping the LOW bits of
+/// the shared index instead of the high ones is self-consistent host-side,
+/// and here it must make an honest proof's walk UNPROVABLE, because the
+/// spine's roots were computed over the other convention.
+fn batched_epoch_program_with(
+    e: &RealBatchedEpoch,
+    with_openings: bool,
+    wrong_reduction: bool,
+) -> LfmProgram {
     use super::batched_epoch::{
         BatchedEpochAbsorbs, BatchedPrepRoot, BatchedTableOod, emit_batched_epoch_challenges,
     };
     use super::statement_replay::{EpochStatementVars, absorb_epoch_statement};
+
+    assert!(
+        !wrong_reduction || with_openings,
+        "the reduction control is a property of the walks"
+    );
 
     let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
     let shape = batched_shape_of(e);
@@ -1664,6 +1717,15 @@ fn batched_epoch_program(e: &RealBatchedEpoch) -> LfmProgram {
     let a_fri_roots = b.declare_arena(2 * shape.fri.num_committed() as u32);
     let a_fri_coeffs = b.declare_arena(shape.fri.num_terminal_coeffs() as u32);
     let a_nonce = (shape.grinding_factor > 0).then(|| b.declare_arena(1));
+    // The opening arena, LAST and exactly the T1 serializer's size — the
+    // program declares what `batched_opening_arena` fills, in its order.
+    let a_openings = with_openings.then(|| {
+        b.declare_arena(
+            (e.proof.queries.len()
+                * super::epoch_verify_tests::batched_opening_words_per_query(&e.shape))
+                as u32,
+        )
+    });
 
     // ---- the statement ----
     let stmt: Vec<_> = (0..stmt_halves as u32)
@@ -1702,7 +1764,10 @@ fn batched_epoch_program(e: &RealBatchedEpoch) -> LfmProgram {
         .iter()
         .map(|prep| match prep {
             None => None,
-            Some(PrepSource::Constant(_)) => None, // absorbed as program text below
+            // Interned: the legs compare against these lanes; the ABSORB still
+            // goes through `BatchedPrepRoot::Constant`'s literal bytes (the
+            // splice economy). Both views are the same program text.
+            Some(PrepSource::Constant(c)) => Some(RootCells::constant(&mut b, c)),
             Some(PrepSource::Register(_)) => {
                 let digest = super::programs::emit_register_commitment(
                     &mut b, reg_shape, &reg_init, &reg_fini,
@@ -1845,6 +1910,92 @@ fn batched_epoch_program(e: &RealBatchedEpoch) -> LfmProgram {
     );
     let total = super::logup::emit_bus_closure(&mut b, &lshape, &contributions, target);
     b.public(total.as_cell());
+
+    // ---- the opening walks: every round authenticated at the REDUCED shared
+    // index, against the very root cells the spine absorbed ----
+    if let Some(a_open) = a_openings {
+        use super::batched_epoch_verify::{
+            MixedMatrixOpening, emit_mixed_verify_batch, reduce_iota_bits,
+        };
+        use super::sub_proof::{GroupCommitment, GroupOpening, GroupShape};
+
+        let h_max_fri = e.shape.heights.iter().copied().max().expect("tables");
+        let mut cursor: u32 = 0;
+        for bits in &ch.iota_bits {
+            // Preprocessed tables, `shape.prep.tables` order — each a standard
+            // per-table row-pair tree at its OWN height, walked at its own
+            // reduction of the shared index.
+            for (slot, &(h, w)) in e.shape.prep.tables.iter().zip(e.shape.prep.dims.iter()) {
+                let cells = prep_cells[*slot]
+                    .as_ref()
+                    .expect("a preprocessed table has root cells");
+                let values = hint_run(&mut b, a_open, &mut cursor, 2 * w);
+                let siblings = hint_digests(&mut b, a_open, &mut cursor, h - 1);
+                let tbits = if wrong_reduction && h < h_max_fri {
+                    // ★ THE BROKEN CONTROL: keep the LOW bits instead of the
+                    // high ones — same length, wrong index space.
+                    &bits[..h - 1]
+                } else {
+                    reduce_iota_bits(bits, h_max_fri, h)
+                };
+                super::sub_proof::emit_group_authentication(
+                    &mut b,
+                    &GroupCommitment::from_lanes(
+                        cells.lanes,
+                        GroupShape {
+                            num_columns: w,
+                            is_ext: false,
+                        },
+                    ),
+                    &GroupOpening { values, siblings },
+                    tbits,
+                );
+            }
+
+            // The three mixed rounds: per-matrix row pairs in round INPUT
+            // order, then the round's ONE shared path.
+            let mut rounds: Vec<(&stark::batched::shape::RoundShape, &RootCells, bool)> =
+                vec![(&e.shape.main, &main_cells, false)];
+            if let Some(aux) = aux_cells.as_ref() {
+                rounds.push((&e.shape.aux, aux, true));
+            }
+            rounds.push((&e.shape.parts, &parts_cells, true));
+            for (round, root, is_ext) in rounds {
+                let h_round = round.h_max().expect("a committed round is non-empty");
+                let per_values: Vec<Vec<super::builder::Cell>> = round
+                    .dims
+                    .iter()
+                    .map(|&(_, w)| hint_run(&mut b, a_open, &mut cursor, 2 * w))
+                    .collect();
+                let siblings = hint_digests(&mut b, a_open, &mut cursor, h_round - 1);
+                let matrices: Vec<MixedMatrixOpening<'_>> = round
+                    .dims
+                    .iter()
+                    .zip(&per_values)
+                    .map(|(&(h, w), values)| MixedMatrixOpening {
+                        shape: GroupShape {
+                            num_columns: w,
+                            is_ext,
+                        },
+                        log_height: h,
+                        values,
+                    })
+                    .collect();
+                let rbits = if wrong_reduction && h_round < h_max_fri {
+                    &bits[..h_round - 1]
+                } else {
+                    reduce_iota_bits(bits, h_max_fri, h_round)
+                };
+                emit_mixed_verify_batch(&mut b, root, &matrices, &siblings, rbits);
+            }
+        }
+        assert_eq!(
+            cursor as usize,
+            e.proof.queries.len()
+                * super::epoch_verify_tests::batched_opening_words_per_query(&e.shape),
+            "the walks must consume exactly the declared opening arena"
+        );
+    }
 
     let program = compile(b.finish());
     validate(&program).expect("the batched epoch spine must be admissible");
@@ -1999,6 +2150,67 @@ fn the_batched_epoch_challenge_spine_matches_production() {
         exec.public_words.len(),
         "every published word must be checked"
     );
+}
+
+/// ★ THE WALKS: every round of a real batched epoch authenticates in the
+/// machine at the REDUCED shared index — each preprocessed table against the
+/// AIR-set root cells, the main/aux/parts mixed rounds against the roots the
+/// spine absorbed, one shared path per round with the injection schedule
+/// unrolled. The tamper arms and the wrong-reduction control show what does
+/// NOT authenticate, which is what turns "it executed" into evidence.
+#[test]
+fn the_batched_openings_authenticate_against_the_spine_roots() {
+    let e = real_batched_epoch_with(super::proof_fixture::fixture_options());
+    let program = batched_epoch_program_with(&e, true, false);
+    let mut arenas = batched_epoch_arenas(&e);
+    arenas.push(super::epoch_verify_tests::batched_opening_arena(&e));
+    execute(&program, &arenas, &TestPermutation)
+        .expect("every opening of an honest batched epoch must authenticate");
+
+    // A moved opening VALUE is unprovable (the first arena word is the first
+    // preprocessed table's first evaluation).
+    let open_idx = arenas.len() - 1;
+    let mut tampered = arenas.clone();
+    tampered[open_idx][0] = base_word(FE::from(999_999u64));
+    assert!(
+        execute(&program, &tampered, &TestPermutation).is_err(),
+        "a tampered opening value must not authenticate"
+    );
+
+    // A moved SIBLING is unprovable (the last arena word is path data — every
+    // round ends with its shared path).
+    let mut tampered = arenas.clone();
+    let last = tampered[open_idx].len() - 1;
+    tampered[open_idx][last] = base_word(FE::from(999_999u64));
+    assert!(
+        execute(&program, &tampered, &TestPermutation).is_err(),
+        "a tampered sibling must not authenticate"
+    );
+
+    // ★ The index-reduction DIRECTION (`fri/mmcs.rs`'s convention section):
+    // keeping the low bits instead of the high ones is self-consistent
+    // host-side, so nothing there rejects it; against real roots the walk
+    // must be unprovable. Discrimination is checked, not hoped for: the arm
+    // only proves something when some short walk's two slices actually
+    // differ for this proof's drawn indices.
+    let h_max_fri = e.shape.heights.iter().copied().max().expect("tables");
+    let discriminates = e.challenges.fri.iotas.iter().any(|&iota| {
+        e.shape.prep.dims.iter().any(|&(h, _)| {
+            h < h_max_fri && (iota >> (h_max_fri - h)) != (iota & ((1usize << (h - 1)) - 1))
+        })
+    });
+    if discriminates {
+        let wrong = batched_epoch_program_with(&e, true, true);
+        assert!(
+            execute(&wrong, &arenas, &TestPermutation).is_err(),
+            "the wrong reduction direction must not authenticate an honest epoch"
+        );
+    } else {
+        // Astronomically unlikely (every short walk's high and low slices
+        // coincide at every query), but a vacuous control must say so rather
+        // than pass silently.
+        eprintln!("wrong-reduction control skipped: the drawn indices do not discriminate");
+    }
 }
 
 /// [`host_table`] for a sub-proof inside a multi-table epoch: the fork is
