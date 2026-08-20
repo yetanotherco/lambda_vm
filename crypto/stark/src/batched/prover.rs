@@ -14,8 +14,8 @@
 //!
 //! ```text
 //!   shape histogram                       <- bound BEFORE the first root
-//!   per table: main LDE -> prep/main MMCS builders           [barrier]
-//!   prep_root, main_root
+//!   per table: main LDE -> per-table prep tree + main MMCS builder [barrier]
+//!   per-table prep roots (from the AIR set), main_root
 //!   LogUp challenges
 //!   per table: aux trace + aux LDE -> aux MMCS builder       [barrier]
 //!   aux_root
@@ -70,7 +70,8 @@ use crate::batched::proof::{
     lde_bytes,
 };
 use crate::batched::round4::commit_batched_fri;
-use crate::batched::shape::{EpochShape, PinnedPrep, RoundShape, ShapeError};
+use crate::batched::shape::{EpochShape, RoundShape, ShapeError};
+use crypto::merkle_tree::merkle::MerkleTree;
 use crate::config::StarkHash;
 use crate::domain::Domain;
 use crate::fri::batched::HeightCombiner;
@@ -116,20 +117,15 @@ struct LdePair<Field: IsField, FieldExtension: IsField> {
 
 /// Prove one epoch with batched commitments.
 ///
-/// `expected_prep`, when supplied, is the registry's committed preprocessed root
-/// and the widths it was committed over (M-6). The prover compares its own
-/// against them and fails fast, preserving the property the per-table path gets
-/// from `air.precomputed_commitment()`: a stale preprocessed constant is caught
-/// here rather than by every future verifier.
-///
-/// `None` is permissive here — it is how the root is generated in the first
-/// place. That is the opposite of the verifier's disposition; see
-/// [`PinnedPrep`].
+/// Preprocessed matrices are committed per table (the trees
+/// `air.precomputed_commitment()` pins), so the per-table path's stale-constant
+/// guard runs here unconditionally: a built prep tree that disagrees with the
+/// AIR's own root fails the prove with the same error the per-table prover
+/// raises.
 #[allow(clippy::too_many_arguments)]
 pub fn multi_prove_batched<Field, FieldExtension, PI, H, P>(
     mut air_trace_pairs: Vec<BatchedAirTracePair<'_, Field, FieldExtension, PI>>,
     transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone + Send),
-    expected_prep: Option<PinnedPrep<'_>>,
     #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
     residency: ResidencyMode,
 ) -> Result<
@@ -199,14 +195,22 @@ where
     // Both builders are fed from the SAME expansion: a preprocessed table's
     // precomputed columns and its multiplicity columns are two column ranges of
     // one row-major main LDE, exactly as `commit_main_trace` splits them.
-    let mut prep_builder =
-        (!shape.prep.is_empty()).then(|| StreamingMmcsBuilder::<Field, H>::new(&shape.prep.dims));
+    // ★ Per-table preprocessed trees — #768's arrangement, kept for the same
+    // reason (see `BatchedQueryOpening::prep`): each preprocessed table keeps
+    // its OWN row-pair tree, the one `air.precomputed_commitment()` pins, and
+    // both sides absorb that root FROM THE AIR SET, never from the proof —
+    // the per-table path's critical soundness check, verbatim. The trees are
+    // process-cached by root, so continuation epochs stop re-committing the
+    // execution-independent tables (DECODE, BITWISE, ...), exactly as the
+    // per-table prover does.
+    let mut prep_trees: Vec<Option<std::sync::Arc<MerkleTree<H::Batched<Field>>>>> =
+        (0..num_tables).map(|_| None).collect();
     let mut main_builder = StreamingMmcsBuilder::<Field, H>::new(&shape.main.dims);
     let mut retained_main: Vec<Option<(Vec<FieldElement<Field>>, usize)>> =
         (0..num_tables).map(|_| None).collect();
 
     for table in 0..num_tables {
-        let (_, trace, _) = &air_trace_pairs[table];
+        let (air, trace, _) = &air_trace_pairs[table];
         let (main_data, total_cols) = P::expand_main_lde_row_major(
             trace,
             &domains[table],
@@ -221,17 +225,36 @@ where
         let height = shape.heights[table];
         let num_precomputed = total_cols - matrix_width(&shape.main, table);
 
-        if let Some(builder) = prep_builder.as_mut()
-            && num_precomputed > 0
-        {
-            let src = vec![BorrowedMatrix::RowMajorNatural {
-                data: &main_data,
-                stride: total_cols,
-                col_start: 0,
-                width: num_precomputed,
-                log_height: height,
-            }];
-            builder.absorb(&src, 0);
+        if num_precomputed > 0 {
+            // The root every verifier will absorb is the AIR's own; building a
+            // tree that disagrees with it is a stale constant or a wrong LDE,
+            // and the per-table path's error is the honest name for both.
+            let expected = air.precomputed_commitment();
+            let tree = match crate::prover::precomputed_tree_cache_get::<H::Batched<Field>>(
+                &expected,
+            ) {
+                Some(tree) => tree,
+                None => {
+                    let (tree, root) = P::commit_rows_bit_reversed_subset::<Field>(
+                        &main_data,
+                        total_cols,
+                        0,
+                        num_precomputed,
+                    )
+                    .ok_or(ProvingError::PrecomputedCommitmentMismatch)?;
+                    if root != expected {
+                        return Err(ProvingError::PrecomputedCommitmentMismatch);
+                    }
+                    let tree = std::sync::Arc::new(tree);
+                    crate::prover::precomputed_tree_cache_put(
+                        expected,
+                        std::sync::Arc::clone(&tree),
+                    );
+                    tree
+                }
+            };
+            transcript.append_bytes(&expected);
+            prep_trees[table] = Some(tree);
         }
         let src = vec![BorrowedMatrix::RowMajorNatural {
             data: &main_data,
@@ -253,24 +276,7 @@ where
         }
     }
 
-    let prep_mmcs = prep_builder.map(StreamingMmcsBuilder::finish);
     let main_mmcs = main_builder.finish();
-    let prep_root = prep_mmcs.as_ref().map(MixedMmcs::root);
-    // The widths are compared first because they are the more legible failure:
-    // a registry whose entry predates a change to some AIR's precomputed column
-    // count disagrees here in a way that names the cause, instead of surfacing
-    // as a root mismatch that could equally be a stale constant.
-    if let Some(expected) = expected_prep {
-        if expected.widths != shape.prep.widths().as_slice() {
-            return Err(ProvingError::PrecomputedCommitmentMismatch);
-        }
-        if prep_root.as_ref() != Some(expected.root) {
-            return Err(ProvingError::PrecomputedCommitmentMismatch);
-        }
-    }
-    if let Some(root) = prep_root {
-        transcript.append_bytes(&root);
-    }
     let main_root = main_mmcs.root();
     transcript.append_bytes(&main_root);
 
@@ -603,7 +609,10 @@ where
     let iotas = commit.iotas.clone();
     let fri_decommitments = crate::fri::query_phase::<FieldExtension, H>(&commit.layers, &iotas);
 
-    let mut prep_openings = empty_openings::<Field>(&iotas, shape.prep.tables.len());
+    // Per-query, per-prep-table standard openings (prep-table order =
+    // `shape.prep.tables`, which is AIR order).
+    let mut prep_openings: Vec<Vec<crate::proof::stark::PolynomialOpenings<Field>>> =
+        (0..iotas.len()).map(|_| Vec::new()).collect();
     let mut main_openings = empty_openings::<Field>(&iotas, shape.main.tables.len());
     let mut aux_openings = empty_openings::<FieldExtension>(&iotas, shape.aux.tables.len());
     let mut parts_openings = empty_openings::<FieldExtension>(&iotas, shape.parts.tables.len());
@@ -614,9 +623,6 @@ where
     // (the prep round's `h_max` is below the FRI's whenever the tallest
     // preprocessed table is not the tallest table), and a round that reduced
     // again on the way out would land somewhere else entirely.
-    let prep_iotas = prep_mmcs
-        .as_ref()
-        .map(|mmcs| reduced_iotas(&iotas, h_max, mmcs.h_max()));
     let main_iotas = reduced_iotas(&iotas, h_max, main_mmcs.h_max());
     let aux_iotas = aux_mmcs
         .as_ref()
@@ -644,16 +650,15 @@ where
         let (main_data, total_cols) = &ldes.main;
         let num_precomputed = total_cols - matrix_width(&shape.main, table);
 
-        if let (Some(mmcs), Some(m)) = (prep_mmcs.as_ref(), matrix_index(&shape.prep, table)) {
-            let src = vec![BorrowedMatrix::RowMajorNatural {
-                data: main_data,
-                stride: *total_cols,
-                col_start: 0,
-                width: num_precomputed,
-                log_height: height,
-            }];
-            let indices = prep_iotas.as_ref().expect("the prep MMCS exists here");
-            fill_openings(mmcs, m, &src, indices, &mut prep_openings);
+        if let Some(tree) = prep_trees[table].as_ref() {
+            // The per-table tree lives in the TABLE's own index space; reduce
+            // the shared FRI index by the height difference once, here.
+            let table_iotas = reduced_iotas(&iotas, h_max, height);
+            for (q, &idx) in table_iotas.iter().enumerate() {
+                prep_openings[q].push(P::open_polys_with(&domains[table], tree, idx, |row| {
+                    main_data[row * total_cols..row * total_cols + num_precomputed].to_vec()
+                }));
+            }
         }
         if let Some(m) = matrix_index(&shape.main, table) {
             let src = vec![BorrowedMatrix::RowMajorNatural {
@@ -697,11 +702,7 @@ where
 
     let queries = (0..iotas.len())
         .map(|q| BatchedQueryOpening {
-            prep: prep_mmcs.as_ref().map(|mmcs| {
-                let indices = prep_iotas.as_ref().expect("the prep MMCS exists here");
-                assemble(mmcs, indices[q], &mut prep_openings, q)
-                    .expect("the prep round was opened at these very indices")
-            }),
+            prep: std::mem::take(&mut prep_openings[q]),
             main: assemble(&main_mmcs, main_iotas[q], &mut main_openings, q)
                 .expect("the main round was opened at these very indices"),
             aux: aux_mmcs.as_ref().map(|mmcs| {
@@ -739,7 +740,6 @@ where
     Ok((
         BatchedMultiProof {
             tables,
-            prep_root,
             main_root,
             aux_root,
             parts_root,

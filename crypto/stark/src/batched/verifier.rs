@@ -12,7 +12,7 @@
 //! | piece | what it decides |
 //! |---|---|
 //! | [`replay_epoch_transcript`] | every challenge, and every structural fact the transcript binds |
-//! | [`verify_epoch_commitments`] | the preprocessed round is the pinned one ([`verify_prep_round`]), and the openings are the rows the roots bind at the derived indices |
+//! | [`verify_epoch_commitments`] | every preprocessed table's opening authenticates against `air.precomputed_commitment()` (the per-table critical check), and the batched rounds' openings are the rows the roots bind at the derived indices |
 //! | [`verify_epoch_constraints`] | the claimed composition polynomial, and the bus balance |
 //! | [`verify_epoch_fri`] | those rows fold to the terminal polynomial the proof sent |
 //!
@@ -52,7 +52,7 @@ use math::traits::AsBytes;
 
 use crate::batched::proof::BatchedMultiProof;
 use crate::batched::round4::reduce_iota_to_round;
-use crate::batched::shape::{EpochFriParams, EpochShape, PinnedPrep, RoundShape};
+use crate::batched::shape::{EpochFriParams, EpochShape, RoundShape};
 use crate::config::{Commitment, GrindingDigest, StarkHash};
 use crate::fri::batched::{BatchedFriChallenges, absorb_shape_histogram};
 use crate::fri::mmcs::{MixedMmcs, MixedOpening};
@@ -104,13 +104,14 @@ where
     // committed to what it is.
     absorb_shape_histogram::<FieldExtension, T>(transcript, &shape.heights, &shape.total_widths());
 
-    // A round the AIR set says exists must have a root, and one it says does not
-    // must not — otherwise a prover could add or drop a whole round's binding.
-    if shape.prep.is_empty() != proof.prep_root.is_none() {
-        return None;
-    }
-    if let Some(root) = proof.prep_root.as_ref() {
-        transcript.append_bytes(root);
+    // ★ Preprocessed roots are absorbed FROM THE AIR SET, never from the
+    // proof — per table, in table order, exactly as the per-table path's
+    // Phase A does. A prover that committed different preprocessed content
+    // walked a different transcript and diverges from here on.
+    for air in airs {
+        if air.is_preprocessed() {
+            transcript.append_bytes(&air.precomputed_commitment());
+        }
     }
     transcript.append_bytes(&proof.main_root);
 
@@ -254,11 +255,11 @@ where
 /// ⛔ See the module header: this is NOT a complete verification. It is the
 /// commitment half.
 pub fn verify_epoch_commitments<Field, FieldExtension, PI, H>(
+    airs: &[&dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>],
     proof: &BatchedMultiProof<Field, FieldExtension, PI>,
     shape: &EpochShape,
     params: &EpochFriParams,
     challenges: &EpochChallenges<FieldExtension>,
-    expected_prep: Option<PinnedPrep<'_>>,
 ) -> bool
 where
     Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync + 'static,
@@ -267,15 +268,6 @@ where
     FieldElement<FieldExtension>: AsBytes + Sync + Send,
     H: StarkHash,
 {
-    // ★ The pinned preprocessed comparison. Everything else in this function
-    // authenticates openings against roots the PROOF carries; this is the one
-    // check that makes the preprocessed content the verifier's rather than the
-    // prover's, and it is the batched counterpart of the per-table
-    // `air.precomputed_commitment()` comparison. Done first so a wrong program
-    // is rejected before any Merkle work.
-    if !verify_prep_round(expected_prep, proof.prep_root.as_ref(), &shape.prep) {
-        return false;
-    }
 
     // The query count is not implied by anything the transcript already
     // checked: a prover that sent fewer openings would simply be checked less.
@@ -340,14 +332,40 @@ where
         ) {
             return false;
         }
-        match (proof.prep_root.as_ref(), opening.prep.as_ref()) {
-            (Some(root), Some(o)) => {
-                if !round_authenticates::<Field, H>(root, o, &shape.prep, iota, h_max) {
-                    return false;
-                }
+        // ★ Per-table preprocessed authentication — the per-table path's
+        // critical soundness check, verbatim: each opening authenticates
+        // against `air.precomputed_commitment()`, a root the VERIFIER owns.
+        // Width and count are bound by the AIR set, not the proof.
+        if opening.prep.len() != shape.prep.tables.len() {
+            return false;
+        }
+        for (k, &t) in shape.prep.tables.iter().enumerate() {
+            let Some(air) = airs.get(t) else {
+                return false;
+            };
+            let Some(&height) = shape.heights.get(t) else {
+                return false;
+            };
+            let Some(leaf) = reduce_iota_to_round(iota, h_max, height) else {
+                return false;
+            };
+            let o = &opening.prep[k];
+            let width = air.num_precomputed_columns();
+            if o.evaluations.len() != width || o.evaluations_sym.len() != width {
+                return false;
             }
-            (None, None) => {}
-            _ => return false,
+            let leaf_hash = <H::Batched<Field> as crypto::merkle_tree::traits::IsStreamingLeafBackend<Field>>::hash_data_from_slices(
+                &o.evaluations,
+                &o.evaluations_sym,
+            );
+            if !crypto::merkle_tree::proof::verify_merkle_path_from_leaf_hash::<H::Batched<Field>>(
+                &o.proof.merkle_path,
+                &air.precomputed_commitment(),
+                leaf,
+                leaf_hash,
+            ) {
+                return false;
+            }
         }
         match (proof.aux_root.as_ref(), opening.aux.as_ref()) {
             (Some(root), Some(o)) => {
@@ -361,59 +379,6 @@ where
     }
 
     true
-}
-
-/// Decide the epoch's preprocessed round against what the caller has pinned.
-///
-/// This is the check MMCS-PLAN §3.3 calls out as the consolidation risk. The
-/// per-table path compares each preprocessed table's root against
-/// `air.precomputed_commitment()` — "the critical soundness check", one
-/// comparison per table. The batched path has one tree and therefore one
-/// comparison, and that is only equivalent if the round's SHAPE pins how each
-/// leaf is parsed. Two things make it so:
-///
-/// - `shape` is derived from the AIR set, never read off the proof
-///   (`EpochShape::derive`), so the heights and widths the MMCS walk uses are
-///   the verifier's own numbers; and
-/// - `expected.widths` is compared against them, so a caller holding one
-///   program's pinned root while running another program's AIR set is rejected
-///   here, naming the disagreement, instead of failing later as an
-///   unexplained root mismatch.
-///
-/// With both, a wrong preprocessed matrix for ANY single contributing table
-/// changes the batched root, so the single comparison rejects exactly what the
-/// per-table comparisons did. `a_tampered_precomputed_row_is_rejected_per_matrix`
-/// is the control that keeps that falsifiable per matrix rather than in
-/// aggregate.
-///
-/// # `None` fails closed
-///
-/// A caller with no pinned root can verify only an epoch whose AIR set has no
-/// preprocessed table. It is not an opt-out: for an epoch that HAS a
-/// preprocessed round the only root left to compare against would be the
-/// proof's own, which the prover chose along with the matrices it commits, so
-/// accepting would be checking a prover's arithmetic against its own claim. The
-/// prover's disposition of `None` is the opposite and deliberately so — see
-/// [`PinnedPrep`].
-pub fn verify_prep_round(
-    expected_prep: Option<PinnedPrep<'_>>,
-    proof_root: Option<&Commitment>,
-    shape: &RoundShape,
-) -> bool {
-    match expected_prep {
-        None => shape.is_empty() && proof_root.is_none(),
-        Some(expected) => {
-            let Some(actual) = proof_root else {
-                // A pinned root for an epoch the AIR set says has no
-                // preprocessed round is a caller/AIR-set disagreement, not a
-                // valid proof.
-                return false;
-            };
-            !shape.is_empty()
-                && expected.widths == shape.widths().as_slice()
-                && actual == expected.root
-        }
-    }
 }
 
 /// Authenticate one round at one query, reducing the shared FRI index into the
@@ -759,7 +724,7 @@ where
         let empty_ext: &[FieldElement<FieldExtension>] = &[];
         let (prep, prep_sym) = match prep_matrix {
             Some(m) => {
-                let o = opening.prep.as_ref()?.per_matrix.get(m)?;
+                let o = opening.prep.get(m)?;
                 (o.evaluations.as_slice(), o.evaluations_sym.as_slice())
             }
             None => (empty_base, empty_base),
@@ -932,10 +897,9 @@ where
 /// verification — every check the per-table path makes has a counterpart here,
 /// reached through the same functions where the check is shared.
 ///
-/// `expected_prep` is the caller's pinned preprocessed root and widths — for
-/// the LFM machine, its registry entry's. It **fails closed**: passing `None`
-/// for an epoch whose AIR set has a preprocessed table rejects the proof rather
-/// than skipping the check ([`verify_prep_round`]).
+/// Preprocessed binding needs no caller-side pin: every preprocessed table's
+/// root is `air.precomputed_commitment()` — the verifier's own value, absorbed
+/// and compared per table exactly as the per-table path does.
 ///
 /// Returns `false` on every malformed proof; it never panics.
 pub fn multi_verify_batched<Field, FieldExtension, PI, H, V, T>(
@@ -943,7 +907,6 @@ pub fn multi_verify_batched<Field, FieldExtension, PI, H, V, T>(
     proof: &BatchedMultiProof<Field, FieldExtension, PI>,
     transcript: &mut T,
     expected_bus_balance: &FieldElement<FieldExtension>,
-    expected_prep: Option<PinnedPrep<'_>>,
 ) -> bool
 where
     Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync + 'static,
@@ -962,11 +925,11 @@ where
         return false;
     };
     verify_epoch_commitments::<Field, FieldExtension, PI, H>(
+        airs,
         proof,
         &shape,
         &params,
         &challenges,
-        expected_prep,
     ) && verify_epoch_constraints::<Field, FieldExtension, PI, H, V>(
         airs,
         proof,

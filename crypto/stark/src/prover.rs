@@ -205,7 +205,7 @@ fn precomputed_tree_cache()
     CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
 
-fn precomputed_tree_cache_get<B: IsMerkleTreeBackend + 'static>(
+pub(crate) fn precomputed_tree_cache_get<B: IsMerkleTreeBackend + 'static>(
     root: &Commitment,
 ) -> Option<Arc<MerkleTree<B>>> {
     let cache = precomputed_tree_cache().lock().unwrap();
@@ -215,7 +215,7 @@ fn precomputed_tree_cache_get<B: IsMerkleTreeBackend + 'static>(
         .and_then(|any| any.downcast::<MerkleTree<B>>().ok())
 }
 
-fn precomputed_tree_cache_put<B: IsMerkleTreeBackend + 'static>(
+pub(crate) fn precomputed_tree_cache_put<B: IsMerkleTreeBackend + 'static>(
     root: Commitment,
     tree: Arc<MerkleTree<B>>,
 ) {

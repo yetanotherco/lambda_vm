@@ -11,7 +11,6 @@ use math::field::element::FieldElement;
 use math::field::traits::IsPrimeField;
 use stark::batched::proof::BatchedMultiProof;
 use stark::batched::prover::multi_prove_batched;
-use stark::batched::shape::{EpochShape, PinnedPrep};
 use stark::batched::verifier::{multi_verify_batched, replay_epoch_transcript};
 use stark::config::Commitment;
 use stark::config::DefaultStarkTranscript;
@@ -390,16 +389,15 @@ fn expected_public_balance(
 
 /// Proves an LFM program as ONE batched epoch.
 ///
-/// `expected_prep` is the registry's preprocessed pin, threaded straight to
-/// `multi_prove_batched`. `None` is permitted here and is how a root is
-/// generated in the first place; see `stark::batched::shape::PinnedPrep` for why
-/// the verifier's disposition of `None` is the opposite.
+/// Preprocessed binding is per table: the prover builds each preprocessed
+/// chip's own tree and fails unless its root equals the AIR's supplied one —
+/// which for this machine is `artifacts.roots[slot]`, so a stale registry
+/// entry fails the prove with the per-table path's own error.
 pub fn lfm_prove_batched(
     program: &LfmProgram,
     artifacts: &LfmArtifacts,
     arenas: &[Vec<LfmWord>],
     options: &ProofOptions,
-    expected_prep: Option<PinnedPrep<'_>>,
 ) -> Result<BatchedLfmProof, LfmProveError> {
     let hasher = artifacts.hasher;
     let exec = execute(program, arenas, &hasher).map_err(LfmProveError::Exec)?;
@@ -424,7 +422,6 @@ pub fn lfm_prove_batched(
         multi_prove_batched::<F, E, (), stark::config::DefaultStarkHash, Prover<F, E, ()>>(
             airs.air_trace_pairs(&mut traces),
             &mut transcript,
-            expected_prep,
             #[cfg(feature = "disk-spill")]
             crate::auto_storage::decide_lfm(),
             decide_lfm_residency(),
@@ -474,26 +471,19 @@ pub fn lfm_verify_batched(
     ))
 }
 
-/// Verifies a batched epoch against supplied artifacts.
+/// Verifies a batched epoch against supplied artifacts — a COMPLETE
+/// verification.
 ///
-/// # The preprocessed pin, and why this refuses today
+/// # The preprocessed binding, and why the old refusal is gone
 ///
-/// `multi_verify_batched` FAILS CLOSED on an unpinned preprocessed round: an
-/// epoch whose AIR set has preprocessed tables and no pinned root is rejected,
-/// because the only root left to compare against would be the prover's own.
-/// Every LFM epoch's preprocessed round contains at least one matrix outside
-/// `PREP_ROUND_SLOTS` — `BITWISE` always, plus `KECCAK_RC` for keccak-family
-/// programs (the chip masks drop an absent family's slots, so the exact count
-/// is per-program) — so `pinned_prep_widths` returns `None` and this returns
-/// `false`.
-///
-/// That is deliberate and it is the correct answer. Passing `None` through would
-/// mean verifying the preprocessed content against the prover's claim, and
-/// passing a twelve-entry slice would describe a different round than
-/// `prep_root` commits. Widening the round is M-8's prerequisite; until then a
-/// batched LFM epoch is provable but not verifiable, and
-/// `a_batched_lfm_epoch_is_refused_for_the_round_coverage_gap` pins exactly that
-/// with the cause separated from the symptom.
+/// Preprocessed chips are bound PER TABLE inside the batched proof: each
+/// root is the AIR's own supplied value (`artifacts.roots[slot]`, and the
+/// production pins for `KECCAK_RC`/`BITWISE`), absorbed by both sides from
+/// the AIR set and authenticated per query at the reduced per-table index.
+/// That covers every preprocessed AIR — including the two the old fused
+/// round's `PREP_ROUND_SLOTS` did not — so the round-coverage refusal this
+/// function used to return has no cause left. The old refusal test flipped
+/// deliberately, exactly as its own doc mandated.
 pub fn verify_against_batched(
     artifacts: &LfmArtifacts,
     proof: &BatchedMultiProof<F, E, ()>,
@@ -518,18 +508,6 @@ pub fn verify_against_batched(
     if refs.len() != artifacts.chip_set.num_airs(artifacts.keccak_rnd_chunks) {
         return false;
     }
-
-    let trace_lengths: Vec<usize> = proof.tables.iter().map(|t| t.trace_length).collect();
-    let Ok((shape, _params)) = EpochShape::derive(&refs, &trace_lengths) else {
-        return false;
-    };
-    let Some(widths) = artifacts.pinned_prep_widths(&shape.prep) else {
-        return false;
-    };
-    let pin = PinnedPrep {
-        root: &artifacts.prep_root,
-        widths: &widths,
-    };
 
     let mut transcript = DefaultStarkTranscript::<E>::new(&[]);
     absorb_lfm_statement(
@@ -559,6 +537,5 @@ pub fn verify_against_batched(
         proof,
         &mut transcript,
         &expected,
-        Some(pin),
     )
 }

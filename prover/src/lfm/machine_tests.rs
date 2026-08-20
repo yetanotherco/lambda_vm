@@ -5152,78 +5152,57 @@ fn the_width_compaction_follows_table_order_not_slot_order() {
     );
 }
 
-/// ★ M-7 end to end: a batched LFM epoch PROVES, and is then REFUSED, and the
-/// refusal is the round-coverage gap rather than anything else.
+/// ★ M-7 + M-8's round half, end to end: a batched LFM epoch PROVES and now
+/// VERIFIES.
 ///
-/// Splitting cause from symptom is the whole point. `verify_against_batched`
-/// returning `false` is compatible with a dozen unrelated bugs, so the cause is
-/// asserted independently: the epoch's preprocessed round contains matrices
-/// `PREP_ROUND_SLOTS` does not cover, so `pinned_prep_widths` refuses, and
-/// `multi_verify_batched` fails closed rather than trusting the proof's own root.
+/// This is the DELIBERATE FLIP of `a_batched_lfm_epoch_is_refused_for_the_
+/// round_coverage_gap`, executed exactly as that test's own doc mandated. The
+/// old refusal's cause was the fused prep round covering twelve slots while a
+/// real epoch's round had matrices outside them (`BITWISE` always). The fused
+/// round is gone: preprocessed chips are bound PER TABLE against the AIR set's
+/// own roots — `artifacts.roots[slot]` plus the production `KECCAK_RC`/
+/// `BITWISE` pins — which covers every preprocessed AIR, so no gap remains to
+/// refuse over.
 ///
-/// When the round is widened (M-8's prerequisite), THIS test is the one that
-/// must flip — and it should be flipped deliberately, not deleted.
+/// The tamper arm keeps the flip honest: acceptance must be discrimination,
+/// not a verifier that stopped checking.
 #[test]
-fn a_batched_lfm_epoch_is_refused_for_the_round_coverage_gap() {
-    use crate::lfm::airs::LfmAirs;
+fn a_batched_lfm_epoch_verifies_end_to_end() {
     use crate::lfm::proof::{lfm_prove_batched, verify_against_batched};
-    use crate::lfm::registry::{PREP_ROUND_SLOTS, slot_of_table};
-    use stark::batched::shape::EpochShape;
 
     let opts = options();
     let program = trivial_program();
     let artifacts = build_artifacts(&program, &opts);
 
-    // It PROVES. The prover's disposition of an unpinned round is permissive,
-    // which is what makes the verifier's refusal below a statement about the
-    // verifier and not about a prove that never happened.
-    let proved = lfm_prove_batched(&program, &artifacts, &arenas(), &opts, None)
+    let proved = lfm_prove_batched(&program, &artifacts, &arenas(), &opts)
         .expect("a batched LFM epoch must prove");
 
-    // THE CAUSE: the epoch's prep round reaches past the round's slots.
-    let airs = LfmAirs::new_with_hasher(
-        &artifacts.roots,
-        &opts,
-        artifacts.keccak_rnd_chunks,
-        artifacts.hasher,
-        artifacts.chip_set,
+    assert!(
+        verify_against_batched(&artifacts, &proved.proof, &proved.public_words, &opts),
+        "a batched LFM epoch must verify end to end against its own artifacts"
     );
-    let refs = airs.air_refs();
-    let lengths: Vec<usize> = proved.proof.tables.iter().map(|t| t.trace_length).collect();
-    let (shape, _) = EpochShape::derive(&refs, &lengths).expect("a well-shaped epoch");
 
-    // With the chip masks in, TrivialV0's epoch carries neither hash family, so
-    // its round is ten groups plus BITWISE — FEWER matrices than the round's
-    // twelve slots, and a bare count comparison can no longer state the gap.
-    // What holds for every program is the membership form: the round contains
-    // at least one matrix (BITWISE always; KECCAK_RC when the keccak family is
-    // present) whose slot is outside PREP_ROUND_SLOTS.
-    let outside = shape
+    // Tamper arm: one preprocessed value moved in one opening must reject.
+    let mut tampered = proved.proof.clone();
+    let prep0 = tampered.queries[0]
         .prep
-        .tables
-        .iter()
-        .filter(|&&t| {
-            slot_of_table(t, artifacts.keccak_rnd_chunks, artifacts.chip_set)
-                .is_none_or(|s| !PREP_ROUND_SLOTS.contains(&s))
-        })
-        .count();
+        .first_mut()
+        .expect("the LFM machine has preprocessed chips");
+    prep0.evaluations[0] += crate::tables::types::FE::one();
     assert!(
-        outside > 0,
-        "the epoch's preprocessed round must contain a matrix outside the round's \
-         slots — BITWISE is a preprocessed AIR the round does not cover; if this \
-         ever stops holding, the round was widened and this whole test should flip"
-    );
-    assert_eq!(
-        artifacts.pinned_prep_widths(&shape.prep),
-        None,
-        "so the compaction must refuse"
+        !verify_against_batched(&artifacts, &tampered, &proved.public_words, &opts),
+        "a tampered preprocessed opening must be rejected"
     );
 
-    // THE SYMPTOM.
+    // And a moved public word must reject — the claimed-public binding is the
+    // batched path's COMMIT-bus check, same as the per-table one.
+    let mut moved = proved.public_words.clone();
+    if let Some(w) = moved.first_mut() {
+        w.0 ^= 1;
+    }
     assert!(
-        !verify_against_batched(&artifacts, &proved.proof, &proved.public_words, &opts),
-        "and the verifier must fail closed rather than trust the proof's own \
-         preprocessed root"
+        !verify_against_batched(&artifacts, &proved.proof, &moved, &opts),
+        "a moved claimed public word must be rejected"
     );
 }
 

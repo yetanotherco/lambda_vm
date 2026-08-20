@@ -868,7 +868,6 @@ fn the_real_block_base_epoch_ab() {
             >(
                 pairs,
                 &mut seed(),
-                None,
                 #[cfg(feature = "disk-spill")]
                 stark::storage_mode::StorageMode::Ram,
                 residency,
@@ -877,11 +876,11 @@ fn the_real_block_base_epoch_ab() {
             let prove_secs = t.elapsed().as_secs_f64();
             println!(
                 "★ BASE A/B RESULT mode=batched PROVE_SECS={prove_secs:.2} \
-                 TABLES={} QUERIES={} FRI_LAYERS={} PREP_ROOT={}",
+                 TABLES={} QUERIES={} FRI_LAYERS={} PREP_TABLES={}",
                 proof.tables.len(),
                 proof.queries.len(),
                 proof.fri_layer_roots.len(),
-                proof.prep_root.is_some(),
+                proof.queries.first().map_or(0, |q| q.prep.len()),
             );
             println!("   BATCHED_STATS {stats:?}");
         }

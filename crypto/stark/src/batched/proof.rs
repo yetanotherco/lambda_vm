@@ -21,6 +21,7 @@ use math::field::traits::IsField;
 use crate::config::Commitment;
 use crate::fri::fri_decommit::FriDecommitment;
 use crate::fri::mmcs::MixedOpening;
+use crate::proof::stark::PolynomialOpenings;
 use crate::lookup::BusPublicInputs;
 use crate::table::Table;
 
@@ -56,8 +57,20 @@ pub struct BatchedTableData<E: IsField, PI> {
 /// FRI layer decommitment.
 #[derive(Debug, Clone)]
 pub struct BatchedQueryOpening<F: IsField, E: IsField> {
-    /// Preprocessed round. `None` when the epoch has no preprocessed table.
-    pub prep: Option<MixedOpening<F>>,
+    /// Preprocessed openings, ONE PER PREPROCESSED TABLE in AIR order — each a
+    /// standard row-pair opening against that table's own precomputed tree.
+    ///
+    /// ★ Deliberately NOT a round of the mixed MMCS (this is #768's
+    /// arrangement, kept for the same reason): the per-table precomputed trees
+    /// are exactly the ones `air.precomputed_commitment()` pins, so the
+    /// verifier absorbs and compares roots it already owns — the per-table
+    /// path's critical soundness check, verbatim — and a recursive verifier
+    /// binds each root with the provenance machinery that already exists
+    /// (interned constant / derived in-machine / ELF-attested). A fused
+    /// mixed-height prep root has no in-machine binding story: its provenance
+    /// classes are mixed into one digest, which is the M-8 blocker this layout
+    /// dissolves. Empty when the epoch has no preprocessed table.
+    pub prep: Vec<PolynomialOpenings<F>>,
     /// Main round — always present; every table contributes a matrix.
     pub main: MixedOpening<F>,
     /// Auxiliary round. `None` when no table has a RAP.
@@ -72,19 +85,11 @@ pub struct BatchedQueryOpening<F: IsField, E: IsField> {
 #[derive(Debug, Clone)]
 pub struct BatchedMultiProof<F: IsField, E: IsField, PI> {
     pub tables: Vec<BatchedTableData<E, PI>>,
-    /// Root of the mixed-height MMCS over every preprocessed matrix. `None` when
-    /// the epoch has none.
-    ///
-    /// ⚠ This root REPLACES the per-table `air.precomputed_commitment()`
-    /// comparison, which is the per-table path's critical soundness check. A
-    /// single comparison here is only equivalent if the shape pins the parse —
-    /// see [`crate::batched::verifier::verify_prep_round`] and the per-matrix
-    /// tamper control beside it.
-    ///
-    /// ⚠ Reading this field is not checking it. What decides whether the epoch
-    /// used the preprocessed matrices the program pins is the comparison
-    /// against `PinnedPrep::root`; this is the prover's claim.
-    pub prep_root: Option<Commitment>,
+    /// ★ There is deliberately NO `prep_root` here. Preprocessed matrices are
+    /// committed per table and their roots are `air.precomputed_commitment()`
+    /// — absorbed by both sides FROM THE AIR SET, never from the proof,
+    /// exactly as the per-table path's Phase A does. The proof carries only
+    /// the per-query openings ([`BatchedQueryOpening::prep`]).
     pub main_root: Commitment,
     pub aux_root: Option<Commitment>,
     pub parts_root: Commitment,
