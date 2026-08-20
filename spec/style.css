@@ -25,12 +25,11 @@
   --aside-border: #808080;
   --aside-border-size: 2pt;
 
-  /* --font-body: TODO SUGGESTIONS WELCOME*/
-  /* --font-code: TODO SUGGESTIONS WELCOME*/
-  /* TODO? Include fonts as assets */
-  --font-math: "STIX Two Math", "Latin Modern Math", "Libertinus Math",
-    "XITS Math", "Cambria Math", math, serif;
-  --font-mtext: "STIX Two Text", "Latin Modern Math", Georgia, serif;
+  /* Try to match typst PDF fonts */
+  --font-body: "Libertinus Serif", serif;
+  --font-code: "DejaVu Sans Mono", monospace;
+  --font-math: "New Computer Modern Math", "STIX Two Text", math, serif;
+  --font-mtext: "New Computer Modern Math", "STIX Two Text", serif;
 
   /* Breakpoints (for reference — CSS vars can't be used in @media) */
   /* --bp-mobile: 768px; */
@@ -391,11 +390,15 @@ sup[role="doc-noteref"] {
 /* code blocks */
 code {
   font-family: var(--font-code);
-  font-size: 0.9rem;
+  font-size: 0.7rem;
   color: var(--code-fg);
   background: var(--code-bg);
-  padding: 2px 6px;
+  padding: 2px 4px;
   border-radius: var(--radius);
+}
+
+h2 code {
+  font-size: 1rem;
 }
 
 pre {
@@ -465,5 +468,4 @@ math[display="block"] {
 
 mtext {
   font-family: var(--font-mtext);
-  font-size: 0.9rem;
 }

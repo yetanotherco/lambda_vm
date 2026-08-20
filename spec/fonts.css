@@ -1,0 +1,78 @@
+/*
+  Bundled font faces, from the official releases (converted, where needed, to woff2).
+  License files are present in this directory:
+
+  Presented in this format to ease regex extraction in bundle.typ :)
+  url("fonts/LICENSE-DejaVu.txt")
+  url("fonts/OFL-Libertinus.txt")
+  url("fonts/OFL-STIX.txt")
+  url("fonts/LICENSE-NewCMMath.txt")
+*/
+@font-face {
+  font-family: 'Libertinus Serif';
+  font-style:  normal;
+  font-weight: 400;
+  src: local(Libertinus Serif), local(Libertinus Serif Regular), local(Libertinus), local(Linux Libertine), url("fonts/LibertinusSerif-Regular.woff2") format("woff2");
+}
+@font-face {
+  font-family: 'Libertinus Serif';
+  font-style:  italic;
+  font-weight: 400;
+  src: local(Libertinus Serif Italic), url("fonts/LibertinusSerif-Italic.woff2") format("woff2");
+}
+@font-face {
+  font-family: 'Libertinus Serif';
+  font-style:  normal;
+  font-weight: 600;
+  src: local(Libertinus Serif), local(Libertinus Serif Semibold), url("fonts/LibertinusSerif-Semibold.woff2") format("woff2");
+}
+@font-face {
+  font-family: 'Libertinus Serif';
+  font-style:  normal;
+  font-weight: 700;
+  src: local(Libertinus Serif Bold), url("fonts/LibertinusSerif-Bold.woff2") format("woff2");
+}
+@font-face {
+  font-family: 'Libertinus Serif';
+  font-style:  italic;
+  font-weight: 700;
+  src: local(Libertinus Serif Bold Italic), url("fonts/LibertinusSerif-BoldItalic.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: 'New Computer Modern Math';
+  font-style:  normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("fonts/NewCMMath-Book.woff2") format("woff2");
+}
+@font-face {
+  font-family: 'New Computer Modern Math';
+  font-style:  normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url("fonts/NewCMMath-Bold.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: 'STIX Two Text';
+  font-style:  normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("fonts/STIXTwoText-Regular.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: 'DejaVu Sans Mono';
+  font-style:  normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("fonts/DejaVuSansMono.woff2") format("woff2");
+}
+@font-face {
+  font-family: 'DejaVu Sans Mono';
+  font-style:  normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url("fonts/DejaVuSansMono-Bold.woff2") format("woff2");
+}

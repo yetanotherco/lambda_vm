@@ -71,6 +71,7 @@
 
   #document("/" + filename + ".html", title: doctitle, {
       html.link(href: "/style.css", rel: "stylesheet")
+      html.link(href: "/fonts.css", rel: "stylesheet")
       html.link(href: "/sidenotes.css", rel: "stylesheet")
       html.script(src: "/sidenotes.js", defer: true)
       heading(numbering: none, link(<doc:index>, vistitle))
@@ -81,10 +82,20 @@
 ]
 
 #asset("/style.css", read("style.css"))
+#asset("/fonts.css", read("fonts.css"))
 #asset("/sidenotes.css", read("sidenotes.css"))
 #asset("/sidenotes.js", read("sidenotes.js"))
-#chapter("index", meta.title, include "front.typ")
 
+// Bundled fonts
+#for f in (
+  read("fonts.css")
+    .matches(regex("url\\(\"([^\"]+)\"\\)"))
+    .map(m => m.captures.first())
+) {
+  asset("/" + f, read(f, encoding: none))
+}
+
+#chapter("index", meta.title, include "front.typ")
 #for (partname, part) in meta.summary {
   for (name, title, ref) in part {
     chapter(name, title, [
