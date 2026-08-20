@@ -265,13 +265,27 @@ fn tampering_the_fri_transcript_moves_the_query_indices() {
     let roots: Vec<[u8; 32]> = (0u8..layout.num_committed as u8).map(|i| [i; 32]).collect();
     let coeffs: Vec<FE> = (0..(1u64 << layout.effective_k)).map(FE::from).collect();
 
-    let derive = |roots: &[[u8; 32]], coeffs: &[FE], heights: &[usize], widths: &[usize]| {
+    // Height 7 folds no layer at these parameters, so table 3 is standalone
+    // and its terminal polynomial is transcript-bound alongside the rest.
+    let standalone: Vec<Option<Vec<FE>>> = vec![
+        None,
+        None,
+        None,
+        Some((0..(1u64 << (7 - blowup_log))).map(FE::from).collect()),
+    ];
+    let derive = |roots: &[[u8; 32]],
+                  coeffs: &[FE],
+                  heights: &[usize],
+                  widths: &[usize],
+                  standalone: &[Option<Vec<FE>>]| {
+        let standalone_refs: Vec<Option<&[FE]>> = standalone.iter().map(|c| c.as_deref()).collect();
         derive_batched_fri_challenges(
             &mut Transcript::new(b"batched_soundness"),
             heights,
             widths,
             roots,
             coeffs,
+            &standalone_refs,
             blowup_log,
             k,
             0,
@@ -282,14 +296,14 @@ fn tampering_the_fri_transcript_moves_the_query_indices() {
         .iotas
     };
 
-    let base = derive(&roots, &coeffs, &heights, &widths);
+    let base = derive(&roots, &coeffs, &heights, &widths, &standalone);
     assert!(!base.is_empty());
 
     let mut other_root = roots.clone();
     other_root[0][0] ^= 1;
     assert_ne!(
         base,
-        derive(&other_root, &coeffs, &heights, &widths),
+        derive(&other_root, &coeffs, &heights, &widths, &standalone),
         "a tampered FRI layer root must move the query indices"
     );
 
@@ -297,7 +311,7 @@ fn tampering_the_fri_transcript_moves_the_query_indices() {
     other_coeffs[0] = &other_coeffs[0] + &FE::from(1u64);
     assert_ne!(
         base,
-        derive(&roots, &other_coeffs, &heights, &widths),
+        derive(&roots, &other_coeffs, &heights, &widths, &standalone),
         "a tampered terminal coefficient must move the query indices"
     );
 
@@ -305,7 +319,7 @@ fn tampering_the_fri_transcript_moves_the_query_indices() {
     other_heights[2] = 9;
     assert_ne!(
         base,
-        derive(&roots, &coeffs, &other_heights, &widths),
+        derive(&roots, &coeffs, &other_heights, &widths, &standalone),
         "a tampered height must move the query indices"
     );
 
@@ -313,8 +327,22 @@ fn tampering_the_fri_transcript_moves_the_query_indices() {
     other_widths[2] = 4;
     assert_ne!(
         base,
-        derive(&roots, &coeffs, &heights, &other_widths),
+        derive(&roots, &coeffs, &heights, &other_widths, &standalone),
         "a tampered width must move the query indices"
+    );
+
+    // ★ The standalone class's terminal polynomial is transcript-bound too —
+    // the whole point of the absorb: a polynomial the indices did not depend
+    // on could be chosen AFTER them, and each query's proximity test against
+    // it would bind nothing until the queries saturate the table's domain.
+    let mut other_standalone = standalone.clone();
+    if let Some(cs) = other_standalone[3].as_mut() {
+        cs[0] = &cs[0] + &FE::from(1u64);
+    }
+    assert_ne!(
+        base,
+        derive(&roots, &coeffs, &heights, &widths, &other_standalone),
+        "a tampered standalone terminal must move the query indices"
     );
 }
 
@@ -374,6 +402,7 @@ impl Round4Fixture {
             &round4_tests::widths_of(&tables),
             &commit.layer_roots,
             &commit.final_poly_coeffs,
+            &round4_tests::standalone_refs(&commit),
             round4_tests::BLOWUP_LOG,
             round4_tests::FINAL_POLY_LOG_DEGREE,
             0,
@@ -1124,8 +1153,10 @@ mod epoch {
             Some(vec![FieldElement::<E>::one(); 2]);
         assert_eq!(
             replay_and_check(&airs, &invented),
-            Some(false),
-            "a batched table must not carry a terminal-only polynomial"
+            None,
+            "a batched table must not carry a terminal-only polynomial — and the \
+             refusal now lands at the TRANSCRIPT REPLAY: presence is bound with \
+             the standalone absorb, before any challenge is drawn"
         );
 
         if let Some(standalone_table) = honest_proof

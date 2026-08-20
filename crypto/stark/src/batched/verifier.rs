@@ -190,12 +190,18 @@ where
         .map(|_| transcript.sample_field_element())
         .collect();
 
+    let standalone_coeffs: Vec<Option<&[FieldElement<FieldExtension>]>> = proof
+        .tables
+        .iter()
+        .map(|t| t.standalone_final_poly_coeffs.as_deref())
+        .collect();
     let fri = crate::fri::batched::derive_batched_fri_challenges::<FieldExtension, T>(
         transcript,
         &shape.heights,
         &shape.total_widths(),
         &proof.fri_layer_roots,
         &proof.fri_final_poly_coeffs,
+        &standalone_coeffs,
         params.blowup_log,
         params.final_poly_log_degree,
         params.grinding_factor,

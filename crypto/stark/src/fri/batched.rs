@@ -492,9 +492,20 @@ pub struct BatchedFriChallenges<E: IsField> {
 /// iotas) and returns the derived challenges. The one routine the prover and the
 /// verifier both call, so they provably derive identical challenges.
 ///
+/// `standalone_coeffs[t]` is table `t`'s terminal-only polynomial, `Some`
+/// exactly for the standalone class — presence is checked against the derived
+/// plan and every coefficient is ABSORBED, right after `α` and before the
+/// first `ζ`. That absorb is load-bearing: the standalone check evaluates the
+/// sent polynomial at the query indices drawn BELOW, so a polynomial that
+/// were not bound here could be chosen after the indices are known, and each
+/// query's proximity test would bind nothing until the queries saturate the
+/// table's domain. The unbatched path absorbs its terminal before sampling
+/// queries for the same reason; this keeps the batched path's binding equal.
+///
 /// Returns `None` when the proof's layer-root count disagrees with the layout the
-/// epoch's shape implies, or when the terminal coefficient count is wrong — both
-/// are prover-supplied and both are rejections, not panics.
+/// epoch's shape implies, when the terminal coefficient count is wrong, or when
+/// a standalone polynomial is present for the wrong class — all prover-supplied,
+/// all rejections, not panics.
 #[allow(clippy::too_many_arguments)]
 pub fn derive_batched_fri_challenges<E, T>(
     transcript: &mut T,
@@ -502,6 +513,7 @@ pub fn derive_batched_fri_challenges<E, T>(
     widths: &[usize],
     layer_roots: &[[u8; 32]],
     final_poly_coeffs: &[FieldElement<E>],
+    standalone_coeffs: &[Option<&[FieldElement<E>]>],
     blowup_log: u32,
     final_poly_log_degree: u32,
     grinding_factor: u8,
@@ -522,6 +534,7 @@ where
     let layout = BatchedFriLayout::new(h_max, h_min, blowup_log, final_poly_log_degree);
     if layer_roots.len() != layout.num_committed
         || final_poly_coeffs.len() != 1usize << layout.effective_k
+        || standalone_coeffs.len() != heights.len()
     {
         return None;
     }
@@ -529,6 +542,21 @@ where
     absorb_shape_histogram(transcript, heights, widths);
 
     let alpha = transcript.sample_field_element();
+
+    // The standalone class's terminal polynomials, bound before any query can
+    // depend on them — per table ascending, each coefficient in order. The
+    // length pin (`2^(h_t − blowup_log)`, exactly) stays with
+    // `verify_epoch_commitments`.
+    for (table, coeffs) in standalone_coeffs.iter().enumerate() {
+        if coeffs.is_some() != plan.standalone.contains(&table) {
+            return None;
+        }
+        if let Some(coeffs) = coeffs {
+            for c in coeffs.iter() {
+                transcript.append_field_element(c);
+            }
+        }
+    }
 
     let mut betas = Vec::with_capacity(layout.num_committed + 1);
     for root in layer_roots {
@@ -837,6 +865,9 @@ mod tests {
 
         let layer_roots: Vec<[u8; 32]> = (0u8..3).map(|i| [i; 32]).collect();
         let final_poly_coeffs: Vec<FE> = (0..(1u64 << layout.effective_k)).map(FE::from).collect();
+        // Height 7 folds no layer at these parameters, so table 5 is standalone
+        // and its terminal polynomial is part of the round-4 sequence.
+        let standalone_terminal: Vec<FE> = (0..(1u64 << (7 - blowup_log))).map(FE::from).collect();
 
         let grinding_factor: u8 = 4;
         let num_queries = 3;
@@ -848,6 +879,9 @@ mod tests {
         // --- Clone A: prover-inline sequence, by hand ---
         absorb_shape_histogram(&mut transcript_a, &heights, &widths);
         let alpha_a = transcript_a.sample_field_element();
+        for c in &standalone_terminal {
+            transcript_a.append_field_element(c);
+        }
 
         let mut betas_a = Vec::with_capacity(layer_roots.len() + 1);
         for root in &layer_roots {
@@ -879,12 +913,21 @@ mod tests {
             .collect();
 
         // --- Clone B: shared replay routine ---
+        let standalone: Vec<Option<&[FE]>> = vec![
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(standalone_terminal.as_slice()),
+        ];
         let result = derive_batched_fri_challenges(
             &mut transcript_b,
             &heights,
             &widths,
             &layer_roots,
             &final_poly_coeffs,
+            &standalone,
             blowup_log,
             k,
             grinding_factor,
@@ -918,10 +961,21 @@ mod tests {
         let coeffs: Vec<FE> = vec![FE::one(); 1usize << layout.effective_k];
         let roots: Vec<[u8; 32]> = vec![[0u8; 32]; layout.num_committed];
 
+        let no_standalone: Vec<Option<&[FE]>> = vec![None; heights.len()];
         let mut ok = Transcript::new(b"reject");
         assert!(
             derive_batched_fri_challenges(
-                &mut ok, &heights, &widths, &roots, &coeffs, blowup_log, k, 0, None, 1
+                &mut ok,
+                &heights,
+                &widths,
+                &roots,
+                &coeffs,
+                &no_standalone,
+                blowup_log,
+                k,
+                0,
+                None,
+                1
             )
             .is_some()
         );
@@ -934,6 +988,7 @@ mod tests {
                 &widths,
                 &roots[..roots.len() - 1],
                 &coeffs,
+                &no_standalone,
                 blowup_log,
                 k,
                 0,
@@ -952,6 +1007,7 @@ mod tests {
                 &widths,
                 &roots,
                 &coeffs[..coeffs.len() - 1],
+                &no_standalone,
                 blowup_log,
                 k,
                 0,
@@ -973,12 +1029,14 @@ mod tests {
         let roots: Vec<[u8; 32]> = vec![[0u8; 32]; 3];
 
         let derive = |heights: &[usize]| {
+            let no_standalone: Vec<Option<&[FE]>> = vec![None; heights.len()];
             derive_batched_fri_challenges(
                 &mut Transcript::new(b"range"),
                 heights,
                 &widths,
                 &roots,
                 &coeffs,
+                &no_standalone,
                 blowup_log,
                 k,
                 0,

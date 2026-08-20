@@ -519,9 +519,6 @@ where
         .map(|_| transcript.sample_field_element())
         .collect();
 
-    let mut standalone_coeffs: Vec<Option<Vec<FieldElement<FieldExtension>>>> =
-        (0..num_tables).map(|_| None).collect();
-
     let commit = {
         let air_trace_pairs = &air_trace_pairs;
         let domains = &domains;
@@ -537,7 +534,6 @@ where
         let retained_aux = &mut retained_aux;
         let stats = &mut stats;
         let ledger = &mut ledger;
-        let standalone_coeffs = &mut standalone_coeffs;
         let coset_offset_ref = &coset_offset;
 
         commit_batched_fri::<Field, FieldExtension, _, H, _>(
@@ -545,6 +541,11 @@ where
             &shape.heights,
             &shape.total_widths(),
             move |alpha, plan| {
+                // The standalone class's terminal polynomials, handed back so
+                // `commit_batched_fri` binds them into the transcript and the
+                // wire carries the very coefficients that were bound.
+                let mut standalone_coeffs: Vec<Option<Vec<FieldElement<FieldExtension>>>> =
+                    (0..num_tables).map(|_| None).collect();
                 let mut combiner = HeightCombiner::new(*alpha);
                 // Ascending table order, which is also `plan.batched`'s order —
                 // absorption order is what defines the alpha powers, so the two
@@ -595,7 +596,7 @@ where
                         ));
                     }
                 }
-                combiner.finish()
+                (combiner.finish(), standalone_coeffs)
             },
             &coset_offset,
             params.blowup_log,
@@ -730,7 +731,7 @@ where
                     .clone(),
                 bus_public_inputs: bus_public_inputs[table].clone(),
                 public_inputs: air_trace_pairs[table].2.clone(),
-                standalone_final_poly_coeffs: standalone_coeffs[table].clone(),
+                standalone_final_poly_coeffs: commit.standalone_coeffs[table].clone(),
             }
         })
         .collect();

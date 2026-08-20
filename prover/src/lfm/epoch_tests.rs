@@ -1714,6 +1714,19 @@ fn batched_epoch_program_with(
         })
         .collect();
     let a_parts_root = b.declare_arena(2);
+    // The standalone class's terminal polynomials — per table, sized by the
+    // trace-length degree bound, absorbed in round 4 and evaluated by the
+    // standalone terminal checks.
+    let a_standalone: Vec<Option<super::instr::ArenaId>> = (0..shape.tables.len())
+        .map(|t| {
+            shape
+                .fri
+                .plan
+                .standalone
+                .contains(&t)
+                .then(|| b.declare_arena(1u32 << (shape.heights[t] as u32 - shape.log2_blowup)))
+        })
+        .collect();
     let a_fri_roots = b.declare_arena(2 * shape.fri.num_committed() as u32);
     let a_fri_coeffs = b.declare_arena(shape.fri.num_terminal_coeffs() as u32);
     let a_nonce = (shape.grinding_factor > 0).then(|| b.declare_arena(1));
@@ -1826,6 +1839,17 @@ fn batched_epoch_program_with(
         })
         .collect();
     let parts_cells = RootCells::hint(&mut b, a_parts_root, 0);
+    let standalone_cells: Vec<Option<Vec<super::builder::Ext>>> = a_standalone
+        .iter()
+        .enumerate()
+        .map(|(t, id)| {
+            id.map(|id| {
+                (0..1u32 << (shape.heights[t] as u32 - shape.log2_blowup))
+                    .map(|k| b.hint_word(id, k).as_ext())
+                    .collect()
+            })
+        })
+        .collect();
     let fri_root_cells: Vec<_> = (0..shape.fri.num_committed())
         .map(|k| RootCells::hint(&mut b, a_fri_roots, 2 * k as u32))
         .collect();
@@ -1854,6 +1878,7 @@ fn batched_epoch_program_with(
             contributions: &contribs,
             parts_root: &parts_cells,
             ood: &oods,
+            standalone_coeffs: &standalone_cells,
             fri_roots: &fri_root_cells,
             fri_coeffs: &coeff_cells,
             nonce,
@@ -2078,6 +2103,11 @@ fn batched_epoch_arenas(e: &RealBatchedEpoch) -> Vec<Vec<LfmWord>> {
     out.push(super::proof_arena::commitments_to_arena(&[e
         .proof
         .parts_root]));
+    for table in &e.proof.tables {
+        if let Some(coeffs) = table.standalone_final_poly_coeffs.as_ref() {
+            out.push(coeffs.iter().map(ext_word).collect());
+        }
+    }
     out.push(super::proof_arena::commitments_to_arena(
         &e.proof.fri_layer_roots,
     ));
@@ -2100,6 +2130,13 @@ fn the_batched_epoch_challenge_spine_matches_production() {
     let arenas = batched_epoch_arenas(&e);
     let exec =
         execute(&program, &arenas, &TestPermutation).expect("the batched epoch spine must execute");
+
+    // Vacuity guard: the fixture must exercise BOTH instance classes, or the
+    // standalone-terminal absorb and the class split are dead paths here.
+    assert!(
+        !e.challenges.fri.plan.standalone.is_empty() && !e.challenges.fri.plan.batched.is_empty(),
+        "the fixture epoch must have both batched and standalone tables"
+    );
 
     let pub_ext = |i: usize| word_as_ext(&exec.public_words[i].1).expect("an ext challenge");
     let [z, alpha] = e.challenges.lookup.as_slice() else {

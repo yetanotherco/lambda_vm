@@ -4,7 +4,7 @@
 //! # The transcript sequence, and why it has one owner
 //!
 //! ```text
-//! shape histogram → α → (β, layer root)* → β_final → terminal coeffs → grinding → iotas
+//! shape histogram → α → standalone terminals → (β, layer root)* → β_final → terminal coeffs → grinding → iotas
 //! ```
 //!
 //! [`commit_batched_fri`] walks it on the prover's side;
@@ -97,6 +97,12 @@ where
     /// Which tables this instance carries, and which keep a terminal-only
     /// instance of their own. See [`FriInstancePlan`].
     pub plan: FriInstancePlan,
+    /// Per table: the standalone class's terminal polynomial, `Some` exactly
+    /// for `plan.standalone`. Produced by `combine`, ABSORBED here (right
+    /// after α, before the first ζ — see `derive_batched_fri_challenges` for
+    /// why that absorb is load-bearing), and returned so the caller puts the
+    /// very coefficients the transcript bound onto the wire.
+    pub standalone_coeffs: Vec<Option<Vec<FieldElement<E>>>>,
 }
 
 /// Prover side of the batched round-4 sequence.
@@ -107,10 +113,11 @@ where
 /// codewords in, since absorption order is what defines the α powers.
 ///
 /// `combine` receives α and returns the per-height buckets (see
-/// [`crate::fri::batched::HeightCombiner::finish`]). It is a closure rather than
-/// a materialized `Vec` so a caller can produce one table's DEEP codeword,
-/// absorb it and drop it: holding all of them at once is the memory cost
-/// batching exists to remove.
+/// [`crate::fri::batched::HeightCombiner::finish`]) TOGETHER WITH the
+/// standalone class's terminal polynomials, per table (`Some` exactly for
+/// `plan.standalone`). It is a closure rather than a materialized `Vec` so a
+/// caller can produce one table's DEEP codeword, absorb it and drop it:
+/// holding all of them at once is the memory cost batching exists to remove.
 #[allow(clippy::too_many_arguments)]
 pub fn commit_batched_fri<F, E, T, H, C>(
     transcript: &mut T,
@@ -128,7 +135,13 @@ where
     E: IsField + 'static + Send + Sync,
     T: IsStarkTranscript<E, F> + Clone,
     H: StarkHash,
-    C: FnOnce(&FieldElement<E>, &FriInstancePlan) -> Vec<Option<Vec<FieldElement<E>>>>,
+    C: FnOnce(
+        &FieldElement<E>,
+        &FriInstancePlan,
+    ) -> (
+        Vec<Option<Vec<FieldElement<E>>>>,
+        Vec<Option<Vec<FieldElement<E>>>>,
+    ),
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
 {
@@ -143,7 +156,25 @@ where
     absorb_shape_histogram::<E, T>(transcript, heights, widths);
     let alpha = transcript.sample_field_element();
 
-    let combined = combine(&alpha, &plan);
+    let (combined, standalone_coeffs) = combine(&alpha, &plan);
+
+    // Bind the standalone class's terminal polynomials BEFORE the first ζ —
+    // the same walk `derive_batched_fri_challenges` replays, and the reason it
+    // does (its doc): a polynomial not bound here could be chosen after the
+    // query indices are known.
+    for (table, coeffs) in standalone_coeffs.iter().enumerate() {
+        assert_eq!(
+            coeffs.is_some(),
+            plan.standalone.contains(&table),
+            "the standalone terminals exist for exactly the standalone class"
+        );
+        if let Some(coeffs) = coeffs {
+            for c in coeffs.iter() {
+                transcript.append_field_element(c);
+            }
+        }
+    }
+
     let (final_poly_coeffs, layers) = batched_commit_phase::<F, E, T, H>(
         combined,
         transcript,
@@ -181,6 +212,7 @@ where
         iotas,
         alpha,
         plan,
+        standalone_coeffs,
     }
 }
 
@@ -427,6 +459,7 @@ pub fn replay_batched_fri<E, T>(
     widths: &[usize],
     layer_roots: &[Commitment],
     final_poly_coeffs: &[FieldElement<E>],
+    standalone_coeffs: &[Option<&[FieldElement<E>]>],
     blowup_log: u32,
     final_poly_log_degree: u32,
     grinding_factor: u8,
@@ -443,6 +476,7 @@ where
         widths,
         layer_roots,
         final_poly_coeffs,
+        standalone_coeffs,
         blowup_log,
         final_poly_log_degree,
         grinding_factor,
@@ -543,6 +577,17 @@ pub(crate) mod tests {
         tables.iter().map(|t| t.width).collect()
     }
 
+    /// The per-table standalone slices a replay call takes, off a commit.
+    pub(crate) fn standalone_refs(
+        commit: &BatchedFriCommit<F, DefaultStarkHash>,
+    ) -> Vec<Option<&[FE]>> {
+        commit
+            .standalone_coeffs
+            .iter()
+            .map(|c| c.as_deref())
+            .collect()
+    }
+
     /// Run the prover's batched round 4 over `tables`, streaming the codewords
     /// into the combiner one at a time — the shape a real prover uses.
     pub(crate) fn commit_fixture(
@@ -561,12 +606,27 @@ pub(crate) mod tests {
                 // Only the batched class is mixed in, and in the plan's order —
                 // absorption order is what defines the alpha powers, so a caller
                 // that absorbed the standalone tables too would shift every
-                // power and agree with no verifier.
+                // power and agree with no verifier. The standalone tables hand
+                // back their terminal polynomials instead, exactly as the real
+                // prover does.
                 let mut combiner = HeightCombiner::new(*alpha);
                 for &t in &plan.batched {
                     combiner.absorb(&tables[t].codeword, tables[t].height);
                 }
-                combiner.finish()
+                let standalone = tables
+                    .iter()
+                    .enumerate()
+                    .map(|(t, table)| {
+                        plan.standalone.contains(&t).then(|| {
+                            crate::fri::terminal::coeffs_from_terminal_codeword::<F, F>(
+                                &table.codeword,
+                                &FE::from(COSET_OFFSET),
+                                table.height as u32 - BLOWUP_LOG,
+                            )
+                        })
+                    })
+                    .collect();
+                (combiner.finish(), standalone)
             },
             &FE::from(COSET_OFFSET),
             BLOWUP_LOG,
@@ -671,6 +731,7 @@ pub(crate) mod tests {
             &widths_of(&tables),
             &commit.layer_roots,
             &commit.final_poly_coeffs,
+            &standalone_refs(&commit),
             BLOWUP_LOG,
             FINAL_POLY_LOG_DEGREE,
             4,
@@ -723,6 +784,7 @@ pub(crate) mod tests {
             &widths_of(&tables),
             &commit.layer_roots,
             &commit.final_poly_coeffs,
+            &standalone_refs(&commit),
             BLOWUP_LOG,
             FINAL_POLY_LOG_DEGREE,
             0,
@@ -818,6 +880,7 @@ pub(crate) mod tests {
             &widths,
             &commit.layer_roots,
             &commit.final_poly_coeffs,
+            &standalone_refs(&commit),
             BLOWUP_LOG,
             FINAL_POLY_LOG_DEGREE,
             0,

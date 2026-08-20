@@ -25,7 +25,7 @@
 //! reduction is free (slicing a cell vector emits nothing), but the DIRECTION
 //! is still the soundness-relevant choice: host-side a wrong shift is
 //! self-consistent between prover and verifier and fails silently, which is
-//! why `the_wrong_index_reduction_direction_fails_the_walk` ports the
+//! why `the_batched_openings_authenticate_against_the_spine_roots` ports the
 //! `short_round_low_bit_convention_is_exercised` control to the machine.
 
 use super::builder::{Bit, Cell, Felt, LfmBuilder};

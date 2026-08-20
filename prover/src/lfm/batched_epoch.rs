@@ -166,6 +166,13 @@ pub struct BatchedEpochAbsorbs<'a> {
     pub parts_root: &'a RootCells,
     /// Per table: the OOD data, row-major as the proof carries it.
     pub ood: &'a [BatchedTableOod<'a>],
+    /// Per table: the STANDALONE class's terminal polynomial, `Some` exactly
+    /// for `plan.standalone`. Absorbed right after the shared DEEP-mix `α`,
+    /// before the first `ζ` — the binding that keeps a standalone polynomial
+    /// from being chosen after the query indices are known (see
+    /// `derive_batched_fri_challenges`' doc). The standalone terminal checks
+    /// evaluate THESE cells.
+    pub standalone_coeffs: &'a [Option<Vec<Ext>>],
     /// The batched instance's committed layer roots, fold order.
     pub fri_roots: &'a [RootCells],
     /// The batched instance's terminal coefficients, low-to-high.
@@ -267,6 +274,26 @@ pub fn emit_batched_epoch_challenges(
         );
     }
     assert_eq!(
+        absorbs.standalone_coeffs.len(),
+        n,
+        "one standalone slot per table"
+    );
+    for (table, coeffs) in absorbs.standalone_coeffs.iter().enumerate() {
+        assert_eq!(
+            coeffs.is_some(),
+            shape.fri.plan.standalone.contains(&table),
+            "table {table}: a standalone terminal exists exactly for the \
+             standalone class"
+        );
+        if let Some(coeffs) = coeffs {
+            assert_eq!(
+                coeffs.len(),
+                1usize << (shape.heights[table] as u32 - shape.log2_blowup),
+                "table {table}: the standalone degree bound is the trace length"
+            );
+        }
+    }
+    assert_eq!(
         absorbs.fri_roots.len(),
         shape.fri.num_committed(),
         "one root per committed layer"
@@ -348,10 +375,20 @@ pub fn emit_batched_epoch_challenges(
     // ---- ALL gammas, consecutively.
     let gammas: Vec<Ext> = (0..n).map(|_| t.sample_ext(b)).collect();
 
-    // ---- round 4: the histogram again, α, ζ-then-root, terminal, grinding,
-    // and the ONE shared query-index set.
+    // ---- round 4: the histogram again, α, the standalone terminals, then
+    // ζ-then-root, the batched terminal, grinding, and the ONE shared
+    // query-index set.
     emit_shape_histogram(t, &shape.heights, &shape.total_widths);
     let alpha = t.sample_ext(b);
+
+    // The standalone class's terminal polynomials, bound before any ζ or
+    // query index can depend on them — per table ascending, coefficients in
+    // order, matching `commit_batched_fri` / `derive_batched_fri_challenges`.
+    for coeffs in absorbs.standalone_coeffs.iter().flatten() {
+        for c in coeffs {
+            super::epoch::append_ext_cell(b, t, *c);
+        }
+    }
 
     let mut zetas = Vec::with_capacity(shape.fri.num_committed() + 1);
     for root in absorbs.fri_roots {
