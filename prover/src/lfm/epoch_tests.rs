@@ -697,6 +697,198 @@ impl EpochInputs {
 /// is the fibonacci fixture unless a measurement run overrode it — so two runs
 /// at different options stay comparable, and assembly ledger entry 10 still
 /// holds: the trace-length profile travels with every number.
+/// ★ THE BASE-LAYER A/B — the real block's epoch 0 proved per-table vs
+/// BATCHED-MMCS, one arm per process.
+///
+/// `AB_MODE` selects the arm (`per_table` | `batched`); `LAMBDA_VM_RESIDENCY`
+/// moves BOTH arms through the same lever, so a residency difference between
+/// them cannot be an artifact of two code paths reading two knobs. Peak anon
+/// is a process-lifetime high-water mark, measured by the harness around the
+/// process — two arms sharing a process would each report the larger of the
+/// two and the comparison would be vacuous.
+///
+/// The epoch construction is byte-for-byte the census harness's
+/// ([`real_epoch_from`]): same executor slice, same traces, same L2G bookend,
+/// same statement-seeded transcript. Only the prove call differs.
+///
+/// ⚠ NEITHER arm verifies here, deliberately. The per-table construction is
+/// production-accepted every time `the_real_block_epoch_wraps` runs (its own
+/// gate), so it needs no second acceptance; the batched arm CANNOT verify —
+/// no pinned preprocessed round exists for the VM AIR set (the per-table
+/// verifier pins each table's root individually; the batched verifier needs
+/// ONE root over the whole round, which nothing blesses yet — the VM-side
+/// analogue of the M-8 round-coverage gap), and `multi_verify_batched` fails
+/// closed on that by design. This instrument measures the PROVE.
+#[test]
+#[ignore]
+fn the_real_block_base_epoch_ab() {
+    use crate::tables::trace_builder::{Traces, build_initial_image_paged};
+    use crate::tables::{MaxRowsConfig, bitwise, local_to_global, register};
+    use executor::elf::Elf;
+    use executor::vm::execution::Executor;
+    use stark::prover::IsStarkProver;
+
+    for var in ["LFM_CENSUS_ELF", "LFM_CENSUS_INPUT"] {
+        assert!(
+            std::env::var(var).is_ok(),
+            "{var} must name a file: this A/B measures a REAL block epoch"
+        );
+    }
+    let mode = std::env::var("AB_MODE").expect("AB_MODE must be per_table or batched");
+    let residency = match std::env::var("LAMBDA_VM_RESIDENCY").as_deref() {
+        Ok("recompute") => stark::residency_mode::ResidencyMode::RecomputeLde,
+        _ => stark::residency_mode::ResidencyMode::Retain,
+    };
+
+    let EpochInputs {
+        elf_bytes,
+        private_input,
+        epoch_log2,
+        label: guest_label,
+    } = EpochInputs::from_env();
+    let opts = crate::recursion::Preset::Blowup4.options();
+    let mut inner = opts;
+    if let Ok(v) = std::env::var("LFM_WRAP_QUERIES") {
+        inner.fri_number_of_queries = v.parse().expect("LFM_WRAP_QUERIES must be an integer");
+    }
+    let opts = inner;
+    println!(
+        "★ BASE A/B ARM: mode={mode} residency={residency:?}  guest {guest_label}, \
+         2^{epoch_log2} cycles/epoch, blowup {} / {} queries",
+        opts.blowup_factor, opts.fri_number_of_queries,
+    );
+
+    let elf = Elf::load(&elf_bytes).expect("the inner ELF must load");
+    let epoch_size = 1usize << epoch_log2;
+    let mut executor = Executor::new(&elf, private_input.clone()).expect("executor");
+    let image = build_initial_image_paged(&elf, &private_input);
+    let register_init = register::register_init_from_entry_point(elf.entry_point);
+    let logs = executor
+        .resume_with_limit(epoch_size)
+        .expect("resume")
+        .expect("the guest runs at least one epoch")
+        .to_vec();
+    let is_final = executor.pc() == 0;
+    assert!(!is_final, "wanted an INTERMEDIATE epoch");
+
+    let mut traces = Traces::from_image_and_logs(
+        &elf,
+        &image,
+        &register_init,
+        &logs,
+        &MaxRowsConfig::default(),
+        &private_input,
+        is_final,
+        true,
+        #[cfg(feature = "disk-spill")]
+        stark::storage_mode::StorageMode::Ram,
+    )
+    .expect("the epoch trace must build");
+
+    let label = local_to_global::epoch_label(0);
+    let mut provenance =
+        local_to_global::genesis_provenance(image.iter().map(|(a, v)| (a, v as u64)));
+    let boundary =
+        local_to_global::epoch_boundary(&mut provenance, label, &traces.touched_memory_cells);
+    bitwise::update_multiplicities(
+        &mut traces.bitwise,
+        &local_to_global::collect_bitwise_from_l2g(&boundary),
+    );
+
+    let reg_fini = register::fini_from_trace(&traces.register);
+    let table_counts = traces.table_counts();
+    let public_output = traces.public_output_bytes.clone();
+    let runtime_page_ranges = traces.runtime_page_ranges();
+
+    let airs = crate::VmAirs::new(
+        &elf,
+        &opts,
+        false,
+        &[],
+        &table_counts,
+        None,
+        is_final,
+        None,
+        None,
+        Some((
+            register::compute_precomputed_commitment_with_fini(&opts, &register_init, &reg_fini),
+            register::NUM_PREPROCESSED_COLS_WITH_FINI,
+        )),
+    );
+    let l2g_air = crate::continuation::l2g_memory_air(&opts, label);
+    let mut l2g_trace = local_to_global::generate_local_to_global_trace(&boundary);
+
+    let seed = || {
+        let mut t = stark::config::DefaultStarkTranscript::<Ext3>::new(&[]);
+        crate::statement::absorb_statement(
+            &mut t,
+            crate::statement::StatementKind::ContinuationEpoch { epoch_label: label },
+            &elf_bytes,
+            &public_output,
+            &table_counts,
+            0,
+            &runtime_page_ranges,
+            opts.fri_final_poly_log_degree,
+        );
+        t
+    };
+
+    let mut pairs = airs.air_trace_pairs(&mut traces);
+    pairs.push((&l2g_air, &mut l2g_trace, &()));
+
+    // ---- THE MEASURED PROVE. Everything above is identical shared setup.
+    let t = std::time::Instant::now();
+    match mode.as_str() {
+        "per_table" => {
+            let proof = stark::prover::Prover::<Gl, Ext3, ()>::multi_prove(
+                pairs,
+                &mut seed(),
+                #[cfg(feature = "disk-spill")]
+                stark::storage_mode::StorageMode::Ram,
+                residency,
+            )
+            .expect("the epoch must prove");
+            let prove_secs = t.elapsed().as_secs_f64();
+            let size = rkyv::to_bytes::<rkyv::rancor::Error>(&proof)
+                .expect("the epoch proof must serialize")
+                .len();
+            println!(
+                "★ BASE A/B RESULT mode=per_table PROVE_SECS={prove_secs:.2} \
+                 SUB_PROOFS={} PROOF_BYTES={size}",
+                proof.proofs.len(),
+            );
+        }
+        "batched" => {
+            let (proof, stats) = stark::batched::prover::multi_prove_batched::<
+                Gl,
+                Ext3,
+                (),
+                stark::config::DefaultStarkHash,
+                stark::prover::Prover<Gl, Ext3, ()>,
+            >(
+                pairs,
+                &mut seed(),
+                None,
+                #[cfg(feature = "disk-spill")]
+                stark::storage_mode::StorageMode::Ram,
+                residency,
+            )
+            .expect("the batched epoch must prove");
+            let prove_secs = t.elapsed().as_secs_f64();
+            println!(
+                "★ BASE A/B RESULT mode=batched PROVE_SECS={prove_secs:.2} \
+                 TABLES={} QUERIES={} FRI_LAYERS={} PREP_ROOT={}",
+                proof.tables.len(),
+                proof.queries.len(),
+                proof.fri_layer_roots.len(),
+                proof.prep_root.is_some(),
+            );
+            println!("   BATCHED_STATS {stats:?}");
+        }
+        other => panic!("AB_MODE must be per_table or batched, not {other}"),
+    }
+}
+
 pub(super) fn real_epoch_with(opts: crate::ProofOptions) -> RealEpoch {
     real_epoch_from(opts, EpochInputs::from_env())
 }
