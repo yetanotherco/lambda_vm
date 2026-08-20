@@ -71,7 +71,6 @@ use crate::batched::proof::{
 };
 use crate::batched::round4::commit_batched_fri;
 use crate::batched::shape::{EpochShape, RoundShape, ShapeError};
-use crypto::merkle_tree::merkle::MerkleTree;
 use crate::config::StarkHash;
 use crate::domain::Domain;
 use crate::fri::batched::HeightCombiner;
@@ -85,6 +84,7 @@ use crate::residency_mode::ResidencyMode;
 use crate::storage_mode::StorageMode;
 use crate::trace::{LDETraceTable, TraceTable};
 use crate::traits::AIR;
+use crypto::merkle_tree::merkle::MerkleTree;
 
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
 
@@ -106,6 +106,9 @@ pub type BatchedAirTracePair<'a, Field, FieldExtension, PI> = (
 type MainSlots<'a, Field> = &'a mut [Option<(Vec<FieldElement<Field>>, usize)>];
 /// The same for the auxiliary LDE.
 type AuxSlots<'a, FieldExtension> = &'a mut [Option<(Vec<FieldElement<FieldExtension>>, usize)>];
+/// A preprocessed table's own row-pair tree — `None` for a table with no
+/// preprocessed columns.
+type PrepTreeSlot<B> = Option<std::sync::Arc<MerkleTree<B>>>;
 
 /// A table's LDE buffers, alive only for as long as the current phase needs
 /// them, and accounted for while they are.
@@ -203,7 +206,7 @@ where
     // process-cached by root, so continuation epochs stop re-committing the
     // execution-independent tables (DECODE, BITWISE, ...), exactly as the
     // per-table prover does.
-    let mut prep_trees: Vec<Option<std::sync::Arc<MerkleTree<H::Batched<Field>>>>> =
+    let mut prep_trees: Vec<PrepTreeSlot<H::Batched<Field>>> =
         (0..num_tables).map(|_| None).collect();
     let mut main_builder = StreamingMmcsBuilder::<Field, H>::new(&shape.main.dims);
     let mut retained_main: Vec<Option<(Vec<FieldElement<Field>>, usize)>> =
@@ -230,29 +233,28 @@ where
             // tree that disagrees with it is a stale constant or a wrong LDE,
             // and the per-table path's error is the honest name for both.
             let expected = air.precomputed_commitment();
-            let tree = match crate::prover::precomputed_tree_cache_get::<H::Batched<Field>>(
-                &expected,
-            ) {
-                Some(tree) => tree,
-                None => {
-                    let (tree, root) = P::commit_rows_bit_reversed_subset::<Field>(
-                        &main_data,
-                        total_cols,
-                        0,
-                        num_precomputed,
-                    )
-                    .ok_or(ProvingError::PrecomputedCommitmentMismatch)?;
-                    if root != expected {
-                        return Err(ProvingError::PrecomputedCommitmentMismatch);
+            let tree =
+                match crate::prover::precomputed_tree_cache_get::<H::Batched<Field>>(&expected) {
+                    Some(tree) => tree,
+                    None => {
+                        let (tree, root) = P::commit_rows_bit_reversed_subset::<Field>(
+                            &main_data,
+                            total_cols,
+                            0,
+                            num_precomputed,
+                        )
+                        .ok_or(ProvingError::PrecomputedCommitmentMismatch)?;
+                        if root != expected {
+                            return Err(ProvingError::PrecomputedCommitmentMismatch);
+                        }
+                        let tree = std::sync::Arc::new(tree);
+                        crate::prover::precomputed_tree_cache_put(
+                            expected,
+                            std::sync::Arc::clone(&tree),
+                        );
+                        tree
                     }
-                    let tree = std::sync::Arc::new(tree);
-                    crate::prover::precomputed_tree_cache_put(
-                        expected,
-                        std::sync::Arc::clone(&tree),
-                    );
-                    tree
-                }
-            };
+                };
             transcript.append_bytes(&expected);
             prep_trees[table] = Some(tree);
         }

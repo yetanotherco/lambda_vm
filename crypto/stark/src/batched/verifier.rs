@@ -268,7 +268,6 @@ where
     FieldElement<FieldExtension>: AsBytes + Sync + Send,
     H: StarkHash,
 {
-
     // The query count is not implied by anything the transcript already
     // checked: a prover that sent fewer openings would simply be checked less.
     if proof.queries.len() != params.num_queries || challenges.fri.iotas.len() != params.num_queries

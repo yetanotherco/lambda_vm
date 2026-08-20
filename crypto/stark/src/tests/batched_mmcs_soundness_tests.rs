@@ -1090,11 +1090,15 @@ mod epoch {
             proof.queries[0].prep.is_empty(),
             "the fixture has no preprocessed table"
         );
-        proof.queries[0].prep.push(crate::proof::stark::PolynomialOpenings {
-            proof: crypto::merkle_tree::proof::Proof { merkle_path: Vec::new() },
-            evaluations: Vec::new(),
-            evaluations_sym: Vec::new(),
-        });
+        proof.queries[0]
+            .prep
+            .push(crate::proof::stark::PolynomialOpenings {
+                proof: crypto::merkle_tree::proof::Proof {
+                    merkle_path: Vec::new(),
+                },
+                evaluations: Vec::new(),
+                evaluations_sym: Vec::new(),
+            });
         assert_eq!(
             replay_and_check(&airs, &proof),
             Some(false),

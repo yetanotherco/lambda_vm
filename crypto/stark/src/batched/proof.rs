@@ -21,8 +21,8 @@ use math::field::traits::IsField;
 use crate::config::Commitment;
 use crate::fri::fri_decommit::FriDecommitment;
 use crate::fri::mmcs::MixedOpening;
-use crate::proof::stark::PolynomialOpenings;
 use crate::lookup::BusPublicInputs;
+use crate::proof::stark::PolynomialOpenings;
 use crate::table::Table;
 
 /// The per-table data a batched epoch proof still has to carry.

@@ -504,23 +504,18 @@ pub(crate) const PREP_WIDTHS: [usize; 2] = [2, 3];
 /// The row-pair subset root over the first `width` columns of `trace`'s main
 /// LDE — the value `air.precomputed_commitment()` must pin for the fixture to
 /// prove.
-fn real_prep_root(
-    air: &Air,
-    trace: &TraceTable<F, E>,
-    width: usize,
-) -> crate::config::Commitment {
+fn real_prep_root(air: &Air, trace: &TraceTable<F, E>, width: usize) -> crate::config::Commitment {
     let (domain, twiddles) = crate::prover::domain_and_twiddles(
         air as &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
         trace.num_rows(),
     );
-    let (data, total_cols) =
-        GenericProver::<F, E, (), DefaultStarkHash>::expand_main_lde_row_major(
-            trace,
-            &domain,
-            &twiddles,
-            #[cfg(feature = "disk-spill")]
-            crate::storage_mode::StorageMode::Ram,
-        );
+    let (data, total_cols) = GenericProver::<F, E, (), DefaultStarkHash>::expand_main_lde_row_major(
+        trace,
+        &domain,
+        &twiddles,
+        #[cfg(feature = "disk-spill")]
+        crate::storage_mode::StorageMode::Ram,
+    );
     GenericProver::<F, E, (), DefaultStarkHash>::commit_rows_bit_reversed_subset::<F>(
         &data, total_cols, 0, width,
     )
@@ -589,11 +584,9 @@ fn prep_table_verifies(
     use crate::config::StarkHash;
     use crypto::merkle_tree::traits::IsStreamingLeafBackend;
     o.evaluations.len() == width && o.evaluations_sym.len() == width && {
-        let leaf_hash =
-            <<DefaultStarkHash as StarkHash>::Batched<F> as IsStreamingLeafBackend<F>>::hash_data_from_slices(
-                &o.evaluations,
-                &o.evaluations_sym,
-            );
+        let leaf_hash = <<DefaultStarkHash as StarkHash>::Batched<F> as IsStreamingLeafBackend<
+            F,
+        >>::hash_data_from_slices(&o.evaluations, &o.evaluations_sym);
         crypto::merkle_tree::proof::verify_merkle_path_from_leaf_hash::<
             <DefaultStarkHash as StarkHash>::Batched<F>,
         >(&o.proof.merkle_path, root, leaf, leaf_hash)
@@ -615,7 +608,10 @@ fn the_preprocessed_tables_are_committed_and_authenticate() {
         PREP_WIDTHS,
         "two preprocessed tables at different widths"
     );
-    let prep_h_max = shape.prep.h_max().expect("the fixture has preprocessed tables");
+    let prep_h_max = shape
+        .prep
+        .h_max()
+        .expect("the fixture has preprocessed tables");
     assert!(
         prep_h_max < h_max,
         "the reduction must be non-trivial (prep {prep_h_max}, fri {h_max})"
@@ -625,12 +621,8 @@ fn the_preprocessed_tables_are_committed_and_authenticate() {
         let opening = &proof.queries[q];
         assert_eq!(opening.prep.len(), shape.prep.tables.len());
         for (k, &t) in shape.prep.tables.iter().enumerate() {
-            let leaf = crate::batched::round4::reduce_iota_to_round(
-                iota,
-                h_max,
-                shape.heights[t],
-            )
-            .expect("prep heights are a subset of table heights");
+            let leaf = crate::batched::round4::reduce_iota_to_round(iota, h_max, shape.heights[t])
+                .expect("prep heights are a subset of table heights");
             assert!(
                 prep_table_verifies(
                     &airs[t].precomputed_commitment(),
@@ -726,13 +718,13 @@ fn a_stale_precomputed_constant_fails_the_prove() {
     let (cpu, add, mul) = traces();
     let mul_air = new_mul_air_with_lookup(&options);
     let mul_root = real_prep_root(&mul_air, &mul, PREP_WIDTHS[1]);
-    let airs = vec![
+    let airs = [
         new_cpu_air_with_lookup(&options),
         // The stale constant: a root the trace's columns cannot reproduce.
         new_add_air_with_lookup(&options).with_preprocessed([7u8; 32], PREP_WIDTHS[0]),
         mul_air.with_preprocessed(mul_root, PREP_WIDTHS[1]),
     ];
-    let mut all_traces = vec![cpu, add, mul];
+    let mut all_traces = [cpu, add, mul];
     let unit = ();
     let pairs: Vec<_> = airs
         .iter()
