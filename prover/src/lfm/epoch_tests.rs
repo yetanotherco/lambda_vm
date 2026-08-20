@@ -2747,6 +2747,46 @@ fn the_batched_verifier_declares_and_hints_exactly_the_shape_words() {
     }
 }
 
+/// ★ The batched query CENSUS: the emitted legs hash exactly what the shape
+/// closed form declares — `batched_query_permutations_for`, checked as the
+/// delta between the with-legs and spine-only programs, so the count is
+/// absolute (the spine's own hashing subtracts out) and hash-aware (the
+/// other hash's delta must be zero: the legs hash under the wrap hash
+/// alone). This is the formula the campaign's wrap-side prediction rides
+/// on: paths per ROUND plus the small prep trees, not per table per group.
+#[test]
+fn the_batched_query_census_matches_the_closed_form() {
+    let e = real_batched_epoch_with(super::proof_fixture::fixture_options());
+    let spine = batched_epoch_program(&e);
+    let full = batched_epoch_program_with(&e, true, false);
+    let count = |p: &LfmProgram, keccak: bool| -> usize {
+        p.instrs
+            .iter()
+            .filter(|i| match i {
+                super::instr::Instr::KeccakF(_) => keccak,
+                super::instr::Instr::Blake3(_) => !keccak,
+                _ => false,
+            })
+            .count()
+    };
+    let hash = super::edsl::WrapHash::production();
+    let per_query =
+        super::batched_epoch_verify::batched_query_permutations_for(&e.shape, &e.fri_params, hash);
+    let is_keccak = matches!(hash, super::edsl::WrapHash::Keccak);
+    let wrap_delta = count(&full, is_keccak) - count(&spine, is_keccak);
+    let other_delta = count(&full, !is_keccak) - count(&spine, !is_keccak);
+    assert_eq!(
+        wrap_delta,
+        e.proof.queries.len() * per_query,
+        "the legs' wrap-hash permutations must be exactly the census closed form"
+    );
+    assert_eq!(other_delta, 0, "the legs hash under the wrap hash alone");
+    eprintln!(
+        "batched query census: {per_query} wrap permutations/query over {} tables",
+        e.proof.tables.len()
+    );
+}
+
 /// [`host_table`] for a sub-proof inside a multi-table epoch: the fork is
 /// already positioned (separator, aux root and `L` absorbed), so the oracle
 /// comes from `replay_rounds_after_round_1` on THAT transcript.

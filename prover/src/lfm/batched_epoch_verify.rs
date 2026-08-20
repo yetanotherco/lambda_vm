@@ -362,3 +362,79 @@ pub fn emit_standalone_terminal_check(
     let at_sym = super::edsl::horner_ext(b, point_sym.as_ext(), coeffs);
     b.assert_eq_ext(at_sym, deep_sym);
 }
+
+// ======================= the batched query census =======================
+
+/// Wrap-hash permutations ONE query of the batched epoch costs, from shape
+/// alone — the batched counterpart of
+/// [`super::epoch_verify::query_permutations_for`], and the campaign's
+/// wrap-side economy as one formula: authentication paths per ROUND (plus
+/// each preprocessed table's own small tree), never per table per group.
+///
+/// Per query: each preprocessed table's leaf and path; per mixed round the
+/// FUSED base leaf (every tallest matrix in one absorption), the ONE shared
+/// path, and per injected height group one leaf plus ONE extra compression;
+/// then the batched FRI instance's layer leaves and path steps. Standalone
+/// tables cost NO hashing at all — their check is polynomial evaluation.
+///
+/// A closed form over the shapes (the layout and partition are production's
+/// own), so comparing it against the emitted count is an absolute check.
+pub fn batched_query_permutations_for(
+    shape: &stark::batched::shape::EpochShape,
+    params: &stark::batched::shape::EpochFriParams,
+    hash: super::edsl::WrapHash,
+) -> usize {
+    use super::epoch_verify::{FRI_LEAF_FELTS, blocks_for};
+    use stark::fri::batched::{BatchedFriLayout, FriInstancePlan};
+
+    let mut per_query = 0usize;
+
+    for &(h, w) in &shape.prep.dims {
+        per_query += blocks_for(2 * w, hash);
+        per_query += h - 1;
+    }
+
+    for (round, ext) in [
+        (&shape.main, false),
+        (&shape.aux, true),
+        (&shape.parts, true),
+    ] {
+        let Some(h_max) = round.h_max() else { continue };
+        let per_value = if ext { 3 } else { 1 };
+        let group_felts = |height: usize| -> usize {
+            round
+                .dims
+                .iter()
+                .filter(|&&(h, _)| h == height)
+                .map(|&(_, w)| 2 * w * per_value)
+                .sum()
+        };
+        per_query += blocks_for(group_felts(h_max), hash);
+        per_query += h_max - 1;
+        for h in 1..h_max {
+            let felts = group_felts(h);
+            if felts > 0 {
+                per_query += blocks_for(felts, hash) + 1;
+            }
+        }
+    }
+
+    let plan = FriInstancePlan::new(
+        &shape.heights,
+        params.blowup_log,
+        params.final_poly_log_degree,
+    )
+    .expect("a real epoch's heights partition");
+    let layout = BatchedFriLayout::new(
+        plan.h_max,
+        plan.h_min,
+        params.blowup_log,
+        params.final_poly_log_degree,
+    );
+    per_query += layout.num_committed * blocks_for(FRI_LEAF_FELTS, hash);
+    per_query += (0..layout.num_committed)
+        .map(|i| plan.h_max - i - 2)
+        .sum::<usize>();
+
+    per_query
+}
