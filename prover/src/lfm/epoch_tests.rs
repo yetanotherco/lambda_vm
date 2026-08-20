@@ -1523,6 +1523,22 @@ fn a_batched_vm_epoch_host_verifies_end_to_end() {
         assert_eq!(q.prep.len(), num_preprocessed);
     }
 
+    // The arena serializers fill EXACTLY what the shape-derived closed forms
+    // declare — the asserts live inside them; called here so the discipline
+    // gates on the same proof the tampers gate on.
+    let opening = super::epoch_verify_tests::batched_opening_arena(&e);
+    let fri = super::epoch_verify_tests::batched_fri_arena(&e);
+    assert!(
+        !opening.is_empty(),
+        "every epoch opens at least the main round"
+    );
+    eprintln!(
+        "batched arenas: {} opening words, {} FRI words over {} queries",
+        opening.len(),
+        fri.len(),
+        e.proof.queries.len()
+    );
+
     let mut tampered = e.proof.clone();
     tampered.queries[0]
         .prep

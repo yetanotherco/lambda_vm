@@ -36,8 +36,11 @@
 //! commitment problem (ledger entry 7), which is about where a root COMES from
 //! and not about what is done with it.
 
+use stark::batched::shape::{EpochFriParams, EpochShape};
 use stark::config::Commitment;
 use stark::constraint_ir::ConstraintArtifact;
+use stark::fri::batched::{BatchedFriLayout, FriInstancePlan};
+use stark::fri::mmcs::MixedOpening;
 use stark::proof::view::StarkProofView;
 use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
@@ -46,6 +49,7 @@ use crate::tables::types::{FE, FEE, GoldilocksExtension, GoldilocksField};
 
 use super::constraints::{Analysis, BoundaryTerm, QuotientShape, analyze};
 use super::deep::DeepShape;
+use super::epoch_tests::RealBatchedEpoch;
 use super::epoch_verify::{TableVerifyShape, boundary_terms};
 use super::executor::execute;
 use super::fri::FriShape;
@@ -335,6 +339,136 @@ impl TableLegs {
         );
         out
     }
+}
+
+// ================== the batched epoch's leg inputs (T1) ==================
+
+/// Arena words ONE query of the batched epoch's trace openings occupies, as
+/// arithmetic over the epoch shape — the AIR-set-derived closed form, never a
+/// count of what a serializer happened to produce (`expected_arena_words`'s
+/// discipline, ported ahead of the emitter so the schema is pinned from the
+/// AIR set rather than from the emitter's own opinion of itself).
+///
+/// Per query: each preprocessed table's row pair and OWN path (a standard
+/// per-table tree at that table's LDE height), then per mixed round — main,
+/// aux, parts — every matrix's row pair in round INPUT order and the round's
+/// ONE shared path (`h_max − 1` levels, two words per sibling digest).
+pub(super) fn batched_opening_words_per_query(shape: &EpochShape) -> usize {
+    let mut words = 0;
+    for &(h, width) in &shape.prep.dims {
+        words += 2 * width + 2 * (h - 1);
+    }
+    for round in [&shape.main, &shape.aux, &shape.parts] {
+        let Some(h_max) = round.h_max() else { continue };
+        words += round.dims.iter().map(|&(_, w)| 2 * w).sum::<usize>();
+        words += 2 * (h_max - 1);
+    }
+    words
+}
+
+/// Arena words ONE query of the batched FRI instance occupies: per committed
+/// layer the symmetric evaluation and its path. Layer `i`'s codeword is
+/// `2^(h_max−i−1)` long and its leaves are pairs, so its tree is
+/// `h_max − i − 2` deep — `FriShape::layer_path_len`'s arithmetic at the
+/// BATCHED CLASS's `h_max`. The layout is production's own
+/// ([`FriInstancePlan`] + [`BatchedFriLayout`]), not a re-derivation;
+/// standalone tables carry no layers at all, and every terminal coefficient
+/// is spine data.
+pub(super) fn batched_fri_words_per_query(shape: &EpochShape, params: &EpochFriParams) -> usize {
+    let plan = FriInstancePlan::new(
+        &shape.heights,
+        params.blowup_log,
+        params.final_poly_log_degree,
+    )
+    .expect("a real epoch's heights partition");
+    let layout = BatchedFriLayout::new(
+        plan.h_max,
+        plan.h_min,
+        params.blowup_log,
+        params.final_poly_log_degree,
+    );
+    (0..layout.num_committed)
+        .map(|i| 1 + 2 * (plan.h_max - i - 2))
+        .sum()
+}
+
+/// The batched analogue of [`TableLegs::opening_arena`]: per query — each
+/// preprocessed table's opening, then the main, aux and parts rounds, each as
+/// its per-matrix row pairs in round INPUT order followed by the ONE shared
+/// path. NO index word, for the same reason as the per-table arena: the
+/// assembled verifier's index is the transcript's own bits.
+pub(super) fn batched_opening_arena(e: &RealBatchedEpoch) -> Vec<LfmWord> {
+    fn push_mixed_base(out: &mut Vec<LfmWord>, o: &MixedOpening<Gl>) {
+        for m in &o.per_matrix {
+            out.extend(m.evaluations.iter().map(|v| base_word(*v)));
+            out.extend(m.evaluations_sym.iter().map(|v| base_word(*v)));
+        }
+        out.extend(super::proof_arena::commitments_to_arena(
+            &o.proof.merkle_path,
+        ));
+    }
+    fn push_mixed_ext(out: &mut Vec<LfmWord>, o: &MixedOpening<Ext3>) {
+        for m in &o.per_matrix {
+            out.extend(m.evaluations.iter().map(ext_word));
+            out.extend(m.evaluations_sym.iter().map(ext_word));
+        }
+        out.extend(super::proof_arena::commitments_to_arena(
+            &o.proof.merkle_path,
+        ));
+    }
+
+    let mut out = Vec::new();
+    for q in &e.proof.queries {
+        for p in &q.prep {
+            out.extend(p.evaluations.iter().map(|v| base_word(*v)));
+            out.extend(p.evaluations_sym.iter().map(|v| base_word(*v)));
+            out.extend(super::proof_arena::commitments_to_arena(
+                &p.proof.merkle_path,
+            ));
+        }
+        push_mixed_base(&mut out, &q.main);
+        if let Some(aux) = &q.aux {
+            push_mixed_ext(&mut out, aux);
+        }
+        push_mixed_ext(&mut out, &q.parts);
+    }
+    assert_eq!(
+        out.len(),
+        e.proof.queries.len() * batched_opening_words_per_query(&e.shape),
+        "the batched opening arena must fill exactly what the shape declares"
+    );
+    out
+}
+
+/// The batched analogue of [`TableLegs::fri_arena`]: per query, per committed
+/// layer of the ONE shared instance — the symmetric evaluation then its path.
+pub(super) fn batched_fri_arena(e: &RealBatchedEpoch) -> Vec<LfmWord> {
+    let mut out = Vec::new();
+    for q in &e.proof.queries {
+        // `zip` is not a length check; the closed-form assert below only sees
+        // totals, and a sym missing its path could hide behind a path missing
+        // its sym.
+        assert_eq!(
+            q.fri.layers_evaluations_sym.len(),
+            q.fri.layers_auth_paths.len(),
+            "every committed layer opens a symmetric evaluation AND a path"
+        );
+        for (sym, path) in q
+            .fri
+            .layers_evaluations_sym
+            .iter()
+            .zip(&q.fri.layers_auth_paths)
+        {
+            out.push(ext_word(sym));
+            out.extend(super::proof_arena::commitments_to_arena(&path.merkle_path));
+        }
+    }
+    assert_eq!(
+        out.len(),
+        e.proof.queries.len() * batched_fri_words_per_query(&e.shape, &e.fri_params),
+        "the batched FRI arena must fill exactly what the shape declares"
+    );
+    out
 }
 
 /// ★ THE RUN: the whole epoch verifier — spine AND legs — on a real
