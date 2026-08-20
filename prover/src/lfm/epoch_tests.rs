@@ -25,6 +25,9 @@
 //! [`the_legs_consume_the_replayed_challenges`]'s job, and the whole-epoch
 //! composition (25 sub-proofs behind one statement) is not built here.
 
+use stark::batched::proof::{BatchedMultiProof, BatchedProveStats};
+use stark::batched::shape::{EpochFriParams, EpochShape};
+use stark::batched::verifier::{EpochChallenges, multi_verify_batched, replay_epoch_transcript};
 use stark::config::Commitment;
 use stark::proof::stark::MultiProof;
 use stark::proof::view::StarkProofView;
@@ -707,25 +710,22 @@ impl EpochInputs {
 /// process — two arms sharing a process would each report the larger of the
 /// two and the comparison would be vacuous.
 ///
-/// The epoch construction is byte-for-byte the census harness's
-/// ([`real_epoch_from`]): same executor slice, same traces, same L2G bookend,
-/// same statement-seeded transcript. Only the prove call differs.
+/// The epoch construction IS the census harness's ([`EpochFront`], the same
+/// call [`real_epoch_from`] makes): same executor slice, same traces, same
+/// L2G bookend, same statement-seeded transcript. Only the prove call
+/// differs.
 ///
-/// ⚠ NEITHER arm verifies here, deliberately. The per-table construction is
-/// production-accepted every time `the_real_block_epoch_wraps` runs (its own
-/// gate), so it needs no second acceptance; the batched arm CANNOT verify —
-/// no pinned preprocessed round exists for the VM AIR set (the per-table
-/// verifier pins each table's root individually; the batched verifier needs
-/// ONE root over the whole round, which nothing blesses yet — the VM-side
-/// analogue of the M-8 round-coverage gap), and `multi_verify_batched` fails
-/// closed on that by design. This instrument measures the PROVE.
+/// ⚠ NEITHER arm verifies here, deliberately. Each arm's construction is
+/// production-accepted by its own gate elsewhere — the per-table one every
+/// time `the_real_block_epoch_wraps` runs, the batched one by
+/// [`a_batched_vm_epoch_host_verifies_end_to_end`] (per-table preprocessed
+/// binding made `multi_verify_batched` a complete verification for the VM
+/// AIR set too) — and a verify inside a memory instrument would smear its
+/// own footprint over the number being measured. This instrument measures
+/// the PROVE.
 #[test]
 #[ignore]
 fn the_real_block_base_epoch_ab() {
-    use crate::tables::trace_builder::{Traces, build_initial_image_paged};
-    use crate::tables::{MaxRowsConfig, bitwise, local_to_global, register};
-    use executor::elf::Elf;
-    use executor::vm::execution::Executor;
     use stark::prover::IsStarkProver;
 
     for var in ["LFM_CENSUS_ELF", "LFM_CENSUS_INPUT"] {
@@ -740,12 +740,7 @@ fn the_real_block_base_epoch_ab() {
         _ => stark::residency_mode::ResidencyMode::Retain,
     };
 
-    let EpochInputs {
-        elf_bytes,
-        private_input,
-        epoch_log2,
-        label: guest_label,
-    } = EpochInputs::from_env();
+    let inputs = EpochInputs::from_env();
     let opts = crate::recursion::Preset::Blowup4.options();
     let mut inner = opts;
     if let Ok(v) = std::env::var("LFM_WRAP_QUERIES") {
@@ -753,88 +748,14 @@ fn the_real_block_base_epoch_ab() {
     }
     let opts = inner;
     println!(
-        "★ BASE A/B ARM: mode={mode} residency={residency:?}  guest {guest_label}, \
-         2^{epoch_log2} cycles/epoch, blowup {} / {} queries",
-        opts.blowup_factor, opts.fri_number_of_queries,
+        "★ BASE A/B ARM: mode={mode} residency={residency:?}  guest {}, \
+         2^{} cycles/epoch, blowup {} / {} queries",
+        inputs.label, inputs.epoch_log2, opts.blowup_factor, opts.fri_number_of_queries,
     );
 
-    let elf = Elf::load(&elf_bytes).expect("the inner ELF must load");
-    let epoch_size = 1usize << epoch_log2;
-    let mut executor = Executor::new(&elf, private_input.clone()).expect("executor");
-    let image = build_initial_image_paged(&elf, &private_input);
-    let register_init = register::register_init_from_entry_point(elf.entry_point);
-    let logs = executor
-        .resume_with_limit(epoch_size)
-        .expect("resume")
-        .expect("the guest runs at least one epoch")
-        .to_vec();
-    let is_final = executor.pc() == 0;
-    assert!(!is_final, "wanted an INTERMEDIATE epoch");
-
-    let mut traces = Traces::from_image_and_logs(
-        &elf,
-        &image,
-        &register_init,
-        &logs,
-        &MaxRowsConfig::default(),
-        &private_input,
-        is_final,
-        true,
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
-    )
-    .expect("the epoch trace must build");
-
-    let label = local_to_global::epoch_label(0);
-    let mut provenance =
-        local_to_global::genesis_provenance(image.iter().map(|(a, v)| (a, v as u64)));
-    let boundary =
-        local_to_global::epoch_boundary(&mut provenance, label, &traces.touched_memory_cells);
-    bitwise::update_multiplicities(
-        &mut traces.bitwise,
-        &local_to_global::collect_bitwise_from_l2g(&boundary),
-    );
-
-    let reg_fini = register::fini_from_trace(&traces.register);
-    let table_counts = traces.table_counts();
-    let public_output = traces.public_output_bytes.clone();
-    let runtime_page_ranges = traces.runtime_page_ranges();
-
-    let airs = crate::VmAirs::new(
-        &elf,
-        &opts,
-        false,
-        &[],
-        &table_counts,
-        None,
-        is_final,
-        None,
-        None,
-        Some((
-            register::compute_precomputed_commitment_with_fini(&opts, &register_init, &reg_fini),
-            register::NUM_PREPROCESSED_COLS_WITH_FINI,
-        )),
-    );
-    let l2g_air = crate::continuation::l2g_memory_air(&opts, label);
-    let mut l2g_trace = local_to_global::generate_local_to_global_trace(&boundary);
-
-    let seed = || {
-        let mut t = stark::config::DefaultStarkTranscript::<Ext3>::new(&[]);
-        crate::statement::absorb_statement(
-            &mut t,
-            crate::statement::StatementKind::ContinuationEpoch { epoch_label: label },
-            &elf_bytes,
-            &public_output,
-            &table_counts,
-            0,
-            &runtime_page_ranges,
-            opts.fri_final_poly_log_degree,
-        );
-        t
-    };
-
-    let mut pairs = airs.air_trace_pairs(&mut traces);
-    pairs.push((&l2g_air, &mut l2g_trace, &()));
+    let mut front = EpochFront::build(opts, inputs);
+    let mut transcript = front.seed();
+    let pairs = front.pairs();
 
     // ---- THE MEASURED PROVE. Everything above is identical shared setup.
     let t = std::time::Instant::now();
@@ -842,7 +763,7 @@ fn the_real_block_base_epoch_ab() {
         "per_table" => {
             let proof = stark::prover::Prover::<Gl, Ext3, ()>::multi_prove(
                 pairs,
-                &mut seed(),
+                &mut transcript,
                 #[cfg(feature = "disk-spill")]
                 stark::storage_mode::StorageMode::Ram,
                 residency,
@@ -867,7 +788,7 @@ fn the_real_block_base_epoch_ab() {
                 stark::prover::Prover<Gl, Ext3, ()>,
             >(
                 pairs,
-                &mut seed(),
+                &mut transcript,
                 #[cfg(feature = "disk-spill")]
                 stark::storage_mode::StorageMode::Ram,
                 residency,
@@ -892,131 +813,264 @@ pub(super) fn real_epoch_with(opts: crate::ProofOptions) -> RealEpoch {
     real_epoch_from(opts, EpochInputs::from_env())
 }
 
-/// [`real_epoch_with`] with the guest, its input and the epoch size supplied
-/// rather than read from the environment.
+/// The statement-seeded transcript every prover and every verifier of one
+/// epoch starts from. One function rather than per-harness closures so the
+/// per-table and batched harnesses CANNOT drift on the absorb — a drift here
+/// would fail neither harness's own gate; it would just make their proofs
+/// answer different statements, which is exactly the failure a per-table vs
+/// batched comparison cannot detect from inside.
+pub(super) fn epoch_seed(
+    epoch_label: u64,
+    elf_bytes: &[u8],
+    public_output: &[u8],
+    table_counts: &crate::TableCounts,
+    runtime_page_ranges: &[crate::RuntimePageRange],
+    fri_final_poly_log_degree: u8,
+) -> stark::config::DefaultStarkTranscript<Ext3> {
+    let mut t = stark::config::DefaultStarkTranscript::<Ext3>::new(&[]);
+    crate::statement::absorb_statement(
+        &mut t,
+        crate::statement::StatementKind::ContinuationEpoch { epoch_label },
+        elf_bytes,
+        public_output,
+        table_counts,
+        0,
+        runtime_page_ranges,
+        fri_final_poly_log_degree,
+    );
+    t
+}
+
+/// The census-env epoch-0 construction, shared BY STRUCTURE between the
+/// per-table harness ([`real_epoch_from`]), the base-layer A/B and the
+/// batched harness ([`real_batched_epoch_from`]): same executor slice, same
+/// traces, same L2G bookend, same statement-seeded transcript. The premise of
+/// every per-table vs batched comparison this file hosts is "same epoch,
+/// different prove", and sharing this front is what makes the premise
+/// structural rather than by-inspection.
 ///
 /// Only epoch 0 is built: the boundary starts from genesis provenance and the
 /// label is `epoch_label(0)`, so a later epoch would need the previous one's
 /// provenance carried in. That is a real limit of this harness and not an
 /// oversight — the first epoch is what the compression work needs.
+pub(super) struct EpochFront {
+    pub(super) opts: crate::ProofOptions,
+    pub(super) elf_bytes: Vec<u8>,
+    pub(super) elf: executor::elf::Elf,
+    pub(super) guest_label: String,
+    pub(super) epoch_log2: u32,
+    /// How many cycles the executor actually ran — reported alongside the
+    /// prove, since a duration without its workload identifies nothing.
+    pub(super) cycles_executed: usize,
+    pub(super) traces: crate::tables::trace_builder::Traces,
+    pub(super) airs: crate::VmAirs,
+    pub(super) l2g_air: Box<dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = ()>>,
+    pub(super) l2g_trace: stark::trace::TraceTable<Gl, Ext3>,
+    pub(super) register_init: Vec<u32>,
+    pub(super) reg_fini: Vec<u32>,
+    pub(super) table_counts: crate::TableCounts,
+    pub(super) public_output: Vec<u8>,
+    pub(super) runtime_page_ranges: Vec<crate::RuntimePageRange>,
+    /// `epoch_label(0)`.
+    pub(super) label: u64,
+    /// The attestation fold's DECODE input, from PRODUCTION's own function —
+    /// the same value `VmAirs::new` puts on the DECODE AIR, and the same one
+    /// `recursion::check_attestation` recomputes from a trusted ELF.
+    pub(super) decode_root: Commitment,
+}
+
+impl EpochFront {
+    pub(super) fn build(opts: crate::ProofOptions, inputs: EpochInputs) -> Self {
+        use crate::tables::trace_builder::{Traces, build_initial_image_paged};
+        use crate::tables::{MaxRowsConfig, bitwise, local_to_global, register};
+        use executor::elf::Elf;
+        use executor::vm::execution::Executor;
+
+        let EpochInputs {
+            elf_bytes,
+            private_input,
+            epoch_log2,
+            label: guest_label,
+        } = inputs;
+        let elf = Elf::load(&elf_bytes).expect("the inner ELF must load");
+        let epoch_size = 1usize << epoch_log2;
+
+        let mut executor = Executor::new(&elf, private_input.clone()).expect("executor");
+        let image = build_initial_image_paged(&elf, &private_input);
+        let register_init = register::register_init_from_entry_point(elf.entry_point);
+        let logs = executor
+            .resume_with_limit(epoch_size)
+            .expect("resume")
+            .expect("the guest runs at least one epoch")
+            .to_vec();
+        let is_final = executor.pc() == 0;
+        assert!(!is_final, "wanted an INTERMEDIATE epoch");
+
+        let mut traces = Traces::from_image_and_logs(
+            &elf,
+            &image,
+            &register_init,
+            &logs,
+            &MaxRowsConfig::default(),
+            &private_input,
+            is_final,
+            true,
+            #[cfg(feature = "disk-spill")]
+            stark::storage_mode::StorageMode::Ram,
+        )
+        .expect("the epoch trace must build");
+
+        let label = local_to_global::epoch_label(0);
+        let mut provenance =
+            local_to_global::genesis_provenance(image.iter().map(|(a, v)| (a, v as u64)));
+        let boundary =
+            local_to_global::epoch_boundary(&mut provenance, label, &traces.touched_memory_cells);
+        bitwise::update_multiplicities(
+            &mut traces.bitwise,
+            &local_to_global::collect_bitwise_from_l2g(&boundary),
+        );
+
+        let reg_fini = register::fini_from_trace(&traces.register);
+        let table_counts = traces.table_counts();
+        let public_output = traces.public_output_bytes.clone();
+        let runtime_page_ranges = traces.runtime_page_ranges();
+
+        let airs = crate::VmAirs::new(
+            &elf,
+            &opts,
+            false,
+            &[],
+            &table_counts,
+            None,
+            is_final,
+            None,
+            None,
+            Some((
+                register::compute_precomputed_commitment_with_fini(
+                    &opts,
+                    &register_init,
+                    &reg_fini,
+                ),
+                register::NUM_PREPROCESSED_COLS_WITH_FINI,
+            )),
+        );
+        let decode_root = crate::tables::decode::commitment_from_elf(&elf, &opts)
+            .expect("the DECODE commitment must compute");
+        let l2g_air = Box::new(crate::continuation::l2g_memory_air(&opts, label));
+        let l2g_trace = local_to_global::generate_local_to_global_trace(&boundary);
+
+        Self {
+            opts,
+            elf_bytes,
+            elf,
+            guest_label,
+            epoch_log2,
+            cycles_executed: logs.len(),
+            traces,
+            airs,
+            l2g_air,
+            l2g_trace,
+            register_init,
+            reg_fini,
+            table_counts,
+            public_output,
+            runtime_page_ranges,
+            label,
+            decode_root,
+        }
+    }
+
+    /// [`epoch_seed`] over this epoch's own statement.
+    pub(super) fn seed(&self) -> stark::config::DefaultStarkTranscript<Ext3> {
+        epoch_seed(
+            self.label,
+            &self.elf_bytes,
+            &self.public_output,
+            &self.table_counts,
+            &self.runtime_page_ranges,
+            self.opts.fri_final_poly_log_degree,
+        )
+    }
+
+    /// Every table's `(air, trace, public inputs)` in sub-proof order — the
+    /// VM tables then the L2G bookend — the one argument both prove calls
+    /// take.
+    #[allow(clippy::type_complexity)]
+    pub(super) fn pairs(
+        &mut self,
+    ) -> Vec<(
+        &dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = ()>,
+        &mut stark::trace::TraceTable<Gl, Ext3>,
+        &(),
+    )> {
+        let mut pairs = self.airs.air_trace_pairs(&mut self.traces);
+        pairs.push((&*self.l2g_air, &mut self.l2g_trace, &()));
+        pairs
+    }
+}
+
+/// [`real_epoch_with`] with the guest, its input and the epoch size supplied
+/// rather than read from the environment. Construction is [`EpochFront`];
+/// this adds the per-table prove, production's acceptance, and the replay
+/// harvest.
 pub(super) fn real_epoch_from(opts: crate::ProofOptions, inputs: EpochInputs) -> RealEpoch {
-    use crate::tables::trace_builder::{Traces, build_initial_image_paged};
-    use crate::tables::{MaxRowsConfig, bitwise, local_to_global, register};
+    use crate::tables::register;
     use crypto::fiat_shamir::is_transcript::IsTranscript;
-    use executor::elf::Elf;
-    use executor::vm::execution::Executor;
     use stark::proof::view::MultiProofView;
     use stark::verifier::IsStarkVerifier;
 
-    let EpochInputs {
-        elf_bytes,
-        private_input,
-        epoch_log2,
-        label: guest_label,
-    } = inputs;
-    let elf = Elf::load(&elf_bytes).expect("the inner ELF must load");
-    let epoch_size = 1usize << epoch_log2;
-
-    let mut executor = Executor::new(&elf, private_input.clone()).expect("executor");
-    let image = build_initial_image_paged(&elf, &private_input);
-    let register_init = register::register_init_from_entry_point(elf.entry_point);
-    let logs = executor
-        .resume_with_limit(epoch_size)
-        .expect("resume")
-        .expect("the guest runs at least one epoch")
-        .to_vec();
-    let is_final = executor.pc() == 0;
-    assert!(!is_final, "wanted an INTERMEDIATE epoch");
-
-    let mut traces = Traces::from_image_and_logs(
-        &elf,
-        &image,
-        &register_init,
-        &logs,
-        &MaxRowsConfig::default(),
-        &private_input,
-        is_final,
-        true,
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
-    )
-    .expect("the epoch trace must build");
-
-    let label = local_to_global::epoch_label(0);
-    let mut provenance =
-        local_to_global::genesis_provenance(image.iter().map(|(a, v)| (a, v as u64)));
-    let boundary =
-        local_to_global::epoch_boundary(&mut provenance, label, &traces.touched_memory_cells);
-    bitwise::update_multiplicities(
-        &mut traces.bitwise,
-        &local_to_global::collect_bitwise_from_l2g(&boundary),
-    );
-
-    let reg_fini = register::fini_from_trace(&traces.register);
-    let table_counts = traces.table_counts();
-    let public_output = traces.public_output_bytes.clone();
-    let runtime_page_ranges = traces.runtime_page_ranges();
-
-    let airs = crate::VmAirs::new(
-        &elf,
-        &opts,
-        false,
-        &[],
-        &table_counts,
-        None,
-        is_final,
-        None,
-        None,
-        Some((
-            register::compute_precomputed_commitment_with_fini(&opts, &register_init, &reg_fini),
-            register::NUM_PREPROCESSED_COLS_WITH_FINI,
-        )),
-    );
-    // The attestation fold's DECODE input, from PRODUCTION's own function — the
-    // same value `VmAirs::new` puts on the DECODE AIR, and the same one
-    // `recursion::check_attestation` recomputes from a trusted ELF.
-    let decode_root = crate::tables::decode::commitment_from_elf(&elf, &opts)
-        .expect("the DECODE commitment must compute");
-    let l2g_air = crate::continuation::l2g_memory_air(&opts, label);
-    let mut l2g_trace = local_to_global::generate_local_to_global_trace(&boundary);
-
-    let seed = || {
-        let mut t = stark::config::DefaultStarkTranscript::<Ext3>::new(&[]);
-        crate::statement::absorb_statement(
-            &mut t,
-            crate::statement::StatementKind::ContinuationEpoch { epoch_label: label },
-            &elf_bytes,
-            &public_output,
-            &table_counts,
-            0,
-            &runtime_page_ranges,
-            opts.fri_final_poly_log_degree,
-        );
-        t
-    };
+    let mut front = EpochFront::build(opts, inputs);
 
     let proof = {
-        let mut pairs = airs.air_trace_pairs(&mut traces);
-        pairs.push((&l2g_air, &mut l2g_trace, &()));
+        let mut transcript = front.seed();
         let t = std::time::Instant::now();
-        let proof =
-            crate::test_utils::multi_prove_ram(pairs, &mut seed()).expect("the epoch must prove");
+        let proof = crate::test_utils::multi_prove_ram(front.pairs(), &mut transcript)
+            .expect("the epoch must prove");
         // The inner prove is the expensive half of a real-block run and is
         // otherwise invisible inside the wrap's own timings, so it reports
         // itself — with the guest and epoch size, since a number without them
         // does not identify a workload.
         eprintln!(
-            "inner epoch: {guest_label}, 2^{epoch_log2} cycles, {} cycles executed, \
+            "inner epoch: {}, 2^{} cycles, {} cycles executed, \
              {} sub-proofs, proved in {:.1}s",
-            logs.len(),
+            front.guest_label,
+            front.epoch_log2,
+            front.cycles_executed,
             proof.proofs.len(),
             t.elapsed().as_secs_f64()
         );
         proof
     };
+
+    // The traces fed the prove; drop them here — what follows reads the PROOF.
+    let EpochFront {
+        opts,
+        elf_bytes,
+        elf,
+        airs,
+        l2g_air,
+        register_init,
+        reg_fini,
+        table_counts,
+        public_output,
+        runtime_page_ranges,
+        label,
+        decode_root,
+        ..
+    } = front;
+    let seed = || {
+        epoch_seed(
+            label,
+            &elf_bytes,
+            &public_output,
+            &table_counts,
+            &runtime_page_ranges,
+            opts.fri_final_poly_log_degree,
+        )
+    };
     let refs = {
         let mut r = airs.air_refs();
-        r.push(&l2g_air);
+        r.push(&*l2g_air);
         r
     };
     let view = MultiProofView::Owned(&proof);
@@ -1153,6 +1207,349 @@ pub(super) fn real_epoch_from(opts: crate::ProofOptions, inputs: EpochInputs) ->
         start_index,
         expected_bus_balance: expected,
     }
+}
+
+/// The batched-path analogue of [`RealEpoch`] — the host half of the M-8
+/// full-recursion campaign: the SAME construction ([`EpochFront`]), proved
+/// through `multi_prove_batched`, host-verified COMPLETELY before anything
+/// downstream reads it.
+///
+/// The struct keeps the AIR set alive because every verification —
+/// the constructor's gate and every tamper arm — rebuilds `refs()` from it,
+/// and T2's shape derivations read program shape from the AIRs rather than
+/// the proof. The traces are dropped at the end of construction: holders pay
+/// for the proof, not the epoch's tables.
+// The fields nothing reads yet are the emitter's contract (handoff T2): the
+// spine reads statement/challenges/prep provenance/register files, the legs
+// read shape/fri_params, the census reads prove_stats. Removing one because
+// it is currently unread would just re-derive it worse there.
+#[allow(dead_code)]
+pub(super) struct RealBatchedEpoch {
+    pub(super) opts: crate::ProofOptions,
+    pub(super) statement: super::statement_replay::EpochStatementShape,
+    pub(super) elf_bytes: Vec<u8>,
+    pub(super) elf_digest: [u8; 32],
+    pub(super) public_output: Vec<u8>,
+    pub(super) epoch_label: u64,
+    pub(super) table_counts: crate::TableCounts,
+    pub(super) runtime_page_ranges: Vec<crate::RuntimePageRange>,
+    airs: crate::VmAirs,
+    l2g_air: Box<dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = ()>>,
+    pub(super) register_init: Vec<u32>,
+    pub(super) reg_fini: Vec<u32>,
+    pub(super) pc_start: u64,
+    pub(super) expected_program_id: [u8; 32],
+    /// Per table in sub-proof order: preprocessed provenance when the AIR is
+    /// preprocessed — [`prep_source`]'s taxonomy, unchanged, because the
+    /// batched proof binds the same per-table roots the per-table path does,
+    /// so the wrap's binding machinery is the existing one. There are no
+    /// per-table main roots to pair these with: the shared mixed roots live
+    /// on the proof itself.
+    pub(super) prep_sources: Vec<Option<PrepSource>>,
+    pub(super) proof: BatchedMultiProof<Gl, Ext3, ()>,
+    pub(super) shape: EpochShape,
+    pub(super) fri_params: EpochFriParams,
+    /// Every challenge the batched transcript derives, recovered through
+    /// `replay_epoch_transcript` — the oracle T2's emitted spine
+    /// differentials against.
+    pub(super) challenges: EpochChallenges<Ext3>,
+    /// The carried commit index — `reg_init[X254_INDEX]`, same meaning as
+    /// [`RealEpoch::start_index`].
+    pub(super) start_index: u64,
+    /// The COMMIT-bus target derived from the REPLAYED shared pair, exactly
+    /// as `verify_against_batched` derives it: the batched path has no
+    /// per-table Phase A to walk.
+    pub(super) expected_bus_balance: FEE,
+    pub(super) prove_stats: BatchedProveStats,
+}
+
+impl RealBatchedEpoch {
+    /// [`epoch_seed`] over this epoch's statement, with the claimed output
+    /// substitutable so a tamper arm can ask the question it means: "does
+    /// THIS proof answer for THAT output?".
+    fn seed_for(&self, public_output: &[u8]) -> stark::config::DefaultStarkTranscript<Ext3> {
+        epoch_seed(
+            self.epoch_label,
+            &self.elf_bytes,
+            public_output,
+            &self.table_counts,
+            &self.runtime_page_ranges,
+            self.opts.fri_final_poly_log_degree,
+        )
+    }
+
+    /// The AIR set in sub-proof order — the VM tables then the L2G bookend,
+    /// the same order [`EpochFront::pairs`] proved in.
+    pub(super) fn refs(
+        &self,
+    ) -> Vec<&dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = ()>> {
+        let mut r = self.airs.air_refs();
+        r.push(&*self.l2g_air);
+        r
+    }
+
+    /// The COMPLETE host verification of `proof` against this epoch's AIR
+    /// set and the given claimed output, mirroring `verify_against_batched`:
+    /// the challenges replayed on a fork of the statement seed, the expected
+    /// COMMIT-bus balance from the replayed shared pair, then
+    /// `multi_verify_batched`. `false` on any tamper; never panics on proof
+    /// data.
+    pub(super) fn host_verifies_for(
+        &self,
+        proof: &BatchedMultiProof<Gl, Ext3, ()>,
+        claimed_output: &[u8],
+    ) -> bool {
+        let refs = self.refs();
+        let mut replay = self.seed_for(claimed_output);
+        let Some((_, _, challenges)) = replay_epoch_transcript(&refs, proof, &mut replay) else {
+            return false;
+        };
+        let [z, alpha] = challenges.lookup.as_slice() else {
+            return false;
+        };
+        let Some(expected) =
+            crate::compute_commit_bus_offset(claimed_output, self.start_index, z, alpha)
+        else {
+            return false;
+        };
+        let mut transcript = self.seed_for(claimed_output);
+        multi_verify_batched::<
+            Gl,
+            Ext3,
+            (),
+            stark::config::DefaultStarkHash,
+            stark::verifier::Verifier<Gl, Ext3, ()>,
+            _,
+        >(&refs, proof, &mut transcript, &expected)
+    }
+
+    /// [`RealBatchedEpoch::host_verifies_for`] at this epoch's own output.
+    pub(super) fn host_verifies(&self, proof: &BatchedMultiProof<Gl, Ext3, ()>) -> bool {
+        self.host_verifies_for(proof, &self.public_output)
+    }
+}
+
+pub(super) fn real_batched_epoch_with(opts: crate::ProofOptions) -> RealBatchedEpoch {
+    real_batched_epoch_from(opts, EpochInputs::from_env())
+}
+
+/// [`real_epoch_from`]'s batched sibling. Panics — loudly, this is a harness
+/// — if the proof does not host-verify: nothing downstream may read an epoch
+/// production would reject.
+pub(super) fn real_batched_epoch_from(
+    opts: crate::ProofOptions,
+    inputs: EpochInputs,
+) -> RealBatchedEpoch {
+    use crate::tables::register;
+
+    let mut front = EpochFront::build(opts, inputs);
+
+    let (proof, prove_stats) = {
+        let mut transcript = front.seed();
+        let t = std::time::Instant::now();
+        let (proof, stats) = stark::batched::prover::multi_prove_batched::<
+            Gl,
+            Ext3,
+            (),
+            stark::config::DefaultStarkHash,
+            stark::prover::Prover<Gl, Ext3, ()>,
+        >(
+            front.pairs(),
+            &mut transcript,
+            #[cfg(feature = "disk-spill")]
+            stark::storage_mode::StorageMode::Ram,
+            stark::residency_mode::ResidencyMode::Retain,
+        )
+        .expect("the batched epoch must prove");
+        eprintln!(
+            "batched inner epoch: {}, 2^{} cycles, {} cycles executed, \
+             {} tables, proved in {:.1}s",
+            front.guest_label,
+            front.epoch_log2,
+            front.cycles_executed,
+            proof.tables.len(),
+            t.elapsed().as_secs_f64()
+        );
+        (proof, stats)
+    };
+
+    // The traces fed the prove; drop them here — what follows reads the PROOF.
+    let EpochFront {
+        opts,
+        elf_bytes,
+        elf,
+        airs,
+        l2g_air,
+        register_init,
+        reg_fini,
+        table_counts,
+        public_output,
+        runtime_page_ranges,
+        label,
+        decode_root,
+        ..
+    } = front;
+
+    let refs = {
+        let mut r = airs.air_refs();
+        r.push(&*l2g_air);
+        r
+    };
+
+    // ---- the replay: every challenge, and the shape both sides derive.
+    let mut replay = epoch_seed(
+        label,
+        &elf_bytes,
+        &public_output,
+        &table_counts,
+        &runtime_page_ranges,
+        opts.fri_final_poly_log_degree,
+    );
+    let (shape, fri_params, challenges) = replay_epoch_transcript(&refs, &proof, &mut replay)
+        .expect("the batched epoch's transcript must replay");
+    let [z, alpha] = challenges.lookup.as_slice() else {
+        panic!("an epoch uses LogUp, so the shared pair must be exactly (z, α)");
+    };
+    let start_index = register_init[register::X254_INDEX] as u64;
+    let expected = crate::compute_commit_bus_offset(&public_output, start_index, z, alpha)
+        .expect("the COMMIT bus target must compute");
+
+    let prep_sources = refs
+        .iter()
+        .map(|air| {
+            air.is_preprocessed().then(|| {
+                prep_source(
+                    air.precomputed_commitment(),
+                    &opts,
+                    &elf,
+                    &register_init,
+                    &reg_fini,
+                )
+            })
+        })
+        .collect();
+    drop(refs);
+
+    let e = RealBatchedEpoch {
+        statement: super::statement_replay::EpochStatementShape {
+            public_output_len: public_output.len(),
+            table_counts: [
+                table_counts.cpu as u64,
+                table_counts.lt as u64,
+                table_counts.memw as u64,
+                table_counts.memw_aligned as u64,
+                table_counts.load as u64,
+                table_counts.mul as u64,
+                table_counts.dvrm as u64,
+                table_counts.shift as u64,
+                table_counts.branch as u64,
+                table_counts.memw_register as u64,
+                table_counts.eq as u64,
+                table_counts.bytewise as u64,
+                table_counts.store as u64,
+                table_counts.cpu32 as u64,
+                table_counts.blake3 as u64,
+            ],
+            num_private_input_pages: 0,
+            fri_final_poly_log_degree: opts.fri_final_poly_log_degree,
+            page_ranges: runtime_page_ranges
+                .iter()
+                .map(|r| (r.base, r.count))
+                .collect(),
+        },
+        elf_digest: crate::statement::elf_digest(&elf_bytes),
+        expected_program_id: crate::recursion::program_id_from_digest(
+            &crate::statement::elf_digest(&elf_bytes),
+            elf.entry_point,
+            &decode_root,
+            &[],
+        ),
+        pc_start: elf.entry_point,
+        opts,
+        elf_bytes,
+        public_output,
+        epoch_label: label,
+        table_counts,
+        runtime_page_ranges,
+        airs,
+        l2g_air,
+        register_init,
+        reg_fini,
+        prep_sources,
+        proof,
+        shape,
+        fri_params,
+        challenges,
+        start_index,
+        expected_bus_balance: expected,
+        prove_stats,
+    };
+
+    // ---- production-shaped acceptance, or nothing above describes a real
+    // epoch. `host_verifies` is the complete check — the same derivation the
+    // per-table harness's `multi_verify_views` gate plays on its side; the
+    // tamper arms in `a_batched_vm_epoch_host_verifies_end_to_end` keep it
+    // discriminating.
+    assert!(
+        e.host_verifies(&e.proof),
+        "the batched epoch must host-verify completely"
+    );
+    e
+}
+
+/// ★ THE H2 GATE: the same construction the per-table harness proves is
+/// proved through the BATCHED path and host-verified COMPLETELY — then
+/// tampered, so acceptance is discrimination, not a verifier that stopped
+/// checking.
+///
+/// Arms: a preprocessed opening value (the per-table critical check, on the
+/// batched proof's own per-query openings), a main-round mixed opening value
+/// (the shared-tree authentication), and the claimed output (the statement +
+/// COMMIT-bus binding; the fixture's output is empty, so the arm EXTENDS it
+/// rather than moving a byte — length is bound either way).
+#[test]
+fn a_batched_vm_epoch_host_verifies_end_to_end() {
+    let e = real_batched_epoch_with(super::proof_fixture::fixture_options());
+
+    // The replayed challenge lists are per table in table order, and the
+    // proof's per-query preprocessed openings are one per preprocessed AIR —
+    // the alignments every T2 consumer will assume, asserted where the
+    // harness is built.
+    assert_eq!(e.challenges.betas.len(), e.proof.tables.len());
+    assert_eq!(e.challenges.zs.len(), e.proof.tables.len());
+    assert_eq!(e.challenges.deep_gammas.len(), e.proof.tables.len());
+    let num_preprocessed = e.prep_sources.iter().filter(|s| s.is_some()).count();
+    for q in &e.proof.queries {
+        assert_eq!(q.prep.len(), num_preprocessed);
+    }
+
+    let mut tampered = e.proof.clone();
+    tampered.queries[0]
+        .prep
+        .first_mut()
+        .expect("a VM epoch has preprocessed tables")
+        .evaluations[0] += FE::one();
+    assert!(
+        !e.host_verifies(&tampered),
+        "a tampered preprocessed opening must be rejected"
+    );
+
+    let mut tampered = e.proof.clone();
+    tampered.queries[0].main.per_matrix[0].evaluations[0] += FE::one();
+    assert!(
+        !e.host_verifies(&tampered),
+        "a tampered main-round opening must be rejected"
+    );
+
+    let mut moved = e.public_output.clone();
+    match moved.first_mut() {
+        Some(byte) => *byte ^= 1,
+        None => moved.push(1),
+    }
+    assert!(
+        !e.host_verifies_for(&e.proof, &moved),
+        "a moved claimed output must be rejected"
+    );
 }
 
 /// [`host_table`] for a sub-proof inside a multi-table epoch: the fork is
