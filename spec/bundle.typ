@@ -6,6 +6,17 @@
 #set heading(numbering: "1.1")
 #show: common-formatting
 
+// Add an HTML attr to an element if not present. Helps guard against show rule recursion.
+// `value` can also be a function depending on the element
+#let add-attr(key, value) = it => {
+  if key in it.attrs {
+    it
+  } else {
+    let v = if type(value) == function { value(it) } else { value }
+    html.elem(it.tag, attrs: it.attrs + ((key):v), it.body)
+  }
+}
+
 // HTML-specific stuff
 // TODO: improve
 #show align: it => it.body
@@ -16,7 +27,8 @@
   it
 }
 // TODO: todo callouts (rj/et/cdsg)
-// TODO: divider lines (vline/hline)
+// TODO: table divider lines (vline/hline)
+// TODO(a11y): replace table.header calls with custom functions to indicate "scope" (col/row/rowgroup) so that we can export that to the html th
 
 #let nav(chapter) = {
   let content = meta.summary.map(((title, chapters)) => {
@@ -37,6 +49,11 @@
 }
 
 #let prev_next(chapter) = {
+  let rellink(label, title, rel) = {
+    show html.elem.where(tag: "a"): add-attr("rel", rel)
+    link(label, title)
+  }
+
   let flat = meta.summary.map(((_, chapters)) => chapters).sum(default: ())
   let index = flat.position(c => c.at(0) == chapter)
   if index == none {
@@ -46,27 +63,27 @@
   html.nav(class: "prev-next",
     html.div(class: "prev",
       if index == 0 {
-        link(label("doc:index"), meta.title)
+        rellink(label("doc:index"), meta.title, "prev")
       } else if index > 0 {
         let (name, title, _) = flat.at(index - 1)
-        link(label("doc:" + name), title)
+        rellink(label("doc:" + name), title, "prev")
       }
     )
     +
     html.div(class: "next",
       if index < flat.len() - 1 {
         let (name, title, _) = flat.at(index + 1)
-        link(label("doc:" + name), title)
+        rellink(label("doc:" + name), title, "next")
       }
     )
   )
 }
 
-#let chapter(filename, title, mainbody) = [
-  #let (doctitle, vistitle) = if title == meta.title {
-    (title, title)
+#let chapter(filename, ctitle, mainbody) = [
+  #let (doctitle, vistitle) = if ctitle == meta.title {
+    (ctitle, ctitle)
   } else {
-    (title + " | " + meta.title, meta.title + html.span(class: "subheader", title))
+    (ctitle + " | " + meta.title, meta.title + html.span(class: "subheader", ctitle))
   }
 
   #document("/" + filename + ".html", title: doctitle, {
@@ -74,7 +91,7 @@
       html.link(href: "/fonts.css", rel: "stylesheet")
       html.link(href: "/sidenotes.css", rel: "stylesheet")
       html.script(src: "/sidenotes.js", defer: true)
-      heading(numbering: none, link(<doc:index>, vistitle))
+      html.header(title(link(<doc:index>, vistitle)))
       html.main(mainbody)
       nav(filename)
       prev_next(filename)
