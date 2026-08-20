@@ -2564,6 +2564,31 @@ fn the_assembled_batched_epoch_verifier_runs() {
         "a tampered sibling must not authenticate"
     );
 
+    // A moved value in an INJECTED matrix — a main-round matrix SHORTER than
+    // the round's tallest, so both the injection compress in the walk and the
+    // α-mix bucket in the FRI join read it.
+    {
+        let mut off = 0usize;
+        for &(h, w) in &e.shape.prep.dims {
+            off += 2 * w + 2 * (h - 1);
+        }
+        let h_main = e.shape.main.h_max().expect("the main round is non-empty");
+        match e.shape.main.dims.iter().position(|&(h, _)| h < h_main) {
+            Some(m) => {
+                for &(_, w) in &e.shape.main.dims[..m] {
+                    off += 2 * w;
+                }
+                let mut tampered = arenas.clone();
+                tampered[open_idx][off] = base_word(FE::from(999_999u64));
+                assert!(
+                    execute(&program, &tampered, &TestPermutation).is_err(),
+                    "a tampered injected-matrix value must not verify"
+                );
+            }
+            None => eprintln!("injected-matrix arm skipped: all main matrices are tallest"),
+        }
+    }
+
     // A moved FRI layer value (the first FRI arena word is layer 0's
     // symmetric evaluation) must fail its layer walk — or, had it somehow
     // re-authenticated, the fold chain's terminal.
@@ -2631,6 +2656,94 @@ fn the_assembled_batched_epoch_verifier_runs() {
         // coincide at every query), but a vacuous control must say so rather
         // than pass silently.
         eprintln!("wrong-reduction control skipped: the drawn indices do not discriminate");
+    }
+}
+
+/// Arena words the BATCHED epoch program MUST declare, as arithmetic over the
+/// epoch's shapes — `expected_arena_words`' discipline on the batched schema.
+/// Every term comes from the harness's host data (the proof the host
+/// verification accepted, the replayed shape and params), never from the
+/// emitter, so the comparison against the compiled program is absolute.
+fn expected_batched_arena_words(e: &RealBatchedEpoch, with_legs: bool) -> usize {
+    let num_reg = crate::tables::register::NUM_REGISTER_ADDRESSES;
+    let mut total = 8 + e.statement.public_output_len.div_ceil(4) + 2;
+    total += 2 * e
+        .prep_sources
+        .iter()
+        .filter(|p| p.is_some_and(PrepSource::is_arena))
+        .count();
+    total += 2; // main_root — ONE, which is the whole batched economy
+    total += 2 * num_reg;
+    total += 2; // pc_start
+    total += 2 * usize::from(e.proof.aux_root.is_some());
+    total += e
+        .proof
+        .tables
+        .iter()
+        .filter(|t| t.bus_public_inputs.is_some())
+        .count();
+    for t in &e.proof.tables {
+        total += t.trace_ood_evaluations.width * t.trace_ood_evaluations.height;
+        total += t.trace_ood_next_evaluations.width * t.trace_ood_next_evaluations.height;
+        total += t.composition_poly_parts_ood_evaluation.len();
+    }
+    total += 2; // parts_root
+    for t in &e.proof.tables {
+        if let Some(coeffs) = t.standalone_final_poly_coeffs.as_ref() {
+            total += coeffs.len();
+        }
+    }
+    total += 2 * e.proof.fri_layer_roots.len();
+    total += e.proof.fri_final_poly_coeffs.len();
+    total += usize::from(e.fri_params.grinding_factor > 0);
+    if with_legs {
+        total += e.proof.queries.len()
+            * (super::epoch_verify_tests::batched_opening_words_per_query(&e.shape)
+                + super::epoch_verify_tests::batched_fri_words_per_query(&e.shape, &e.fri_params));
+    }
+    total
+}
+
+/// ★ The two ABSOLUTE structural guards, on the BATCHED program — the same
+/// pair that closes the two-consumer class for the per-table one
+/// ([`the_spine_hints_each_proof_value_once`] and
+/// [`the_assembled_verifier_declares_exactly_the_shape_words`]): no arena
+/// word is read twice, every declared word is read, and the schema is
+/// exactly the epoch's shapes — a surplus word is where a second copy of a
+/// joined value (a root, a contribution, a standalone terminal) would hide.
+#[test]
+fn the_batched_verifier_declares_and_hints_exactly_the_shape_words() {
+    use std::collections::HashMap;
+
+    let e = real_batched_epoch_with(super::proof_fixture::fixture_options());
+    for with_legs in [false, true] {
+        let program = batched_epoch_program_with(&e, with_legs, false);
+        let declared: usize = program.arena_schema.lens.iter().map(|l| *l as usize).sum();
+        assert_eq!(
+            declared,
+            expected_batched_arena_words(&e, with_legs),
+            "with_legs = {with_legs}: the batched arena schema must be exactly \
+             the epoch's shapes and nothing more"
+        );
+
+        let mut hints: HashMap<(super::instr::ArenaId, u32), usize> = HashMap::new();
+        for instr in &program.instrs {
+            if let super::instr::Instr::Hint { arena, index, .. } = instr {
+                *hints.entry((*arena, *index)).or_default() += 1;
+            }
+        }
+        let doubled: Vec<_> = hints.iter().filter(|(_, n)| **n > 1).collect();
+        assert!(
+            doubled.is_empty(),
+            "with_legs = {with_legs}: these arena words are hinted more than \
+             once, which is the two-consumer hazard: {doubled:?}"
+        );
+        assert_eq!(
+            hints.len(),
+            declared,
+            "with_legs = {with_legs}: every declared arena word must be read \
+             exactly once"
+        );
     }
 }
 
