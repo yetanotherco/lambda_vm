@@ -1620,12 +1620,20 @@ fn batched_epoch_program(e: &RealBatchedEpoch) -> LfmProgram {
     batched_epoch_program_with(e, false, false)
 }
 
-/// Per-table [`super::deep::DeepShape`]s, from the AIR set and the proof's
-/// trace lengths — the same derivation [`build_table_legs`]'s per-table
-/// sibling makes, minus the per-table view.
+/// One table's leg shapes, from the AIR set and the proof's trace lengths —
+/// the same derivations [`build_table_legs`] makes, minus the per-table view
+/// the batched proof does not have.
 ///
 /// [`build_table_legs`]: super::epoch_verify_tests::build_table_legs
-fn batched_deep_shapes(e: &RealBatchedEpoch) -> Vec<super::deep::DeepShape> {
+struct BatchedTableLeg {
+    deep: super::deep::DeepShape,
+    analysis: super::constraints::Analysis,
+    quotient: super::constraints::QuotientShape,
+    main_width: usize,
+    num_alpha_powers: usize,
+}
+
+fn batched_leg_shapes(e: &RealBatchedEpoch) -> Vec<BatchedTableLeg> {
     use stark::verifier::{IsStarkVerifier, Verifier};
 
     e.refs()
@@ -1635,13 +1643,29 @@ fn batched_deep_shapes(e: &RealBatchedEpoch) -> Vec<super::deep::DeepShape> {
             let layout = Verifier::<Gl, Ext3, ()>::ood_layout(*air);
             let artifact = stark::constraint_ir::ConstraintArtifact::capture(*air);
             let (main_width, aux_width) = air.trace_layout();
-            super::deep::DeepShape {
-                step_size: layout.step_size(),
-                num_eval_points: artifact.shape.transition_offsets.len() * layout.step_size(),
-                num_total_cols: main_width + aux_width,
-                next_row_cols: layout.next_row_cols().to_vec(),
-                num_composition_parts: data.composition_poly_parts_ood_evaluation.len(),
-                log2_trace_length: data.trace_length.trailing_zeros(),
+            let num_total_cols = main_width + aux_width;
+            let has_aux = air.has_aux_trace();
+            BatchedTableLeg {
+                deep: super::deep::DeepShape {
+                    step_size: layout.step_size(),
+                    num_eval_points: artifact.shape.transition_offsets.len() * layout.step_size(),
+                    num_total_cols,
+                    next_row_cols: layout.next_row_cols().to_vec(),
+                    num_composition_parts: data.composition_poly_parts_ood_evaluation.len(),
+                    log2_trace_length: data.trace_length.trailing_zeros(),
+                },
+                analysis: super::constraints::analyze(&artifact),
+                quotient: super::constraints::QuotientShape {
+                    log2_trace_length: data.trace_length.trailing_zeros(),
+                    num_composition_parts: data.composition_poly_parts_ood_evaluation.len(),
+                    boundary: super::epoch_verify::boundary_terms(has_aux, num_total_cols),
+                },
+                main_width,
+                num_alpha_powers: if has_aux {
+                    artifact.shape.max_bus_elements as usize
+                } else {
+                    0
+                },
             }
         })
         .collect()
@@ -2012,24 +2036,65 @@ fn batched_epoch_program_with(
             })
             .collect();
 
-        // Per-table DEEP invariants, hoisted across queries — the OOD grid is
-        // rebuilt from the very cells the spine absorbed, so there is no
-        // second copy of the grid for a prover to disagree with.
-        let deep_shapes = batched_deep_shapes(e);
+        // Per table, hoisted across queries: the OOD grid rebuilt from the
+        // very cells the spine absorbed (no second copy for a prover to
+        // disagree with), the CONSTRAINT identity and the quotient check at
+        // this table's z — production's own evaluators, reached through
+        // emit_analyzed/emit_quotient exactly as the per-table program does —
+        // and the DEEP invariants over the same grid and the same parts.
+        let legs = batched_leg_shapes(e);
         let dinvs: Vec<super::deep::DeepInvariants> = (0..n)
             .map(|t_i| {
-                let ood_rows = super::epoch::emit_reconstruct_ood(
+                let leg = &legs[t_i];
+                let grid = super::epoch::emit_reconstruct_ood(
                     &mut b,
-                    &deep_shapes[t_i],
+                    &leg.deep,
                     &ood_cells[t_i].0,
                     &ood_cells[t_i].1,
                 );
+
+                // The LogUp uniforms, DERIVED: α powers from the one shared α
+                // the spine sampled, and the per-row offset from the one `L`
+                // it absorbed — the same cell the closure sums.
+                let alpha_powers = if leg.num_alpha_powers > 0 {
+                    super::constraints::emit_alpha_powers(&mut b, ch.lookup.1, leg.num_alpha_powers)
+                } else {
+                    Vec::new()
+                };
+                let table_offset = match contribs[t_i] {
+                    Some(l) => super::constraints::emit_table_offset(
+                        &mut b,
+                        l,
+                        leg.quotient.log2_trace_length,
+                    ),
+                    None => b.felt_const(FE::zero()).as_ext(),
+                };
+                let steps = super::epoch_verify::frame_step_view(&grid, leg.deep.step_size);
+                let ood_ops = super::constraints::OodOperands {
+                    steps,
+                    main_width: leg.main_width,
+                    rap_challenges: vec![ch.lookup.0, ch.lookup.1],
+                    alpha_powers,
+                    table_offset,
+                };
+                let evals = super::constraints::emit_analyzed(&mut b, &leg.analysis, &ood_ops);
+                let q = super::constraints::emit_quotient(
+                    &mut b,
+                    &leg.quotient,
+                    &ood_ops,
+                    ch.zs[t_i],
+                    ch.betas[t_i],
+                    &evals,
+                    &ood_cells[t_i].2,
+                );
+                b.assert_eq_ext(q.claimed, q.composition);
+
                 super::deep::emit_deep_invariants(
                     &mut b,
-                    &deep_shapes[t_i],
+                    &leg.deep,
                     ch.gammas[t_i],
                     ch.zs[t_i],
-                    &ood_rows,
+                    &grid,
                     &ood_cells[t_i].2,
                 )
             })
@@ -2137,8 +2202,8 @@ fn batched_epoch_program_with(
                     rbits,
                 );
 
-                let mut trace = Vec::with_capacity(deep_shapes[t_i].num_total_cols);
-                let mut trace_sym = Vec::with_capacity(deep_shapes[t_i].num_total_cols);
+                let mut trace = Vec::with_capacity(legs[t_i].deep.num_total_cols);
+                let mut trace_sym = Vec::with_capacity(legs[t_i].deep.num_total_cols);
                 if let Some(m) = prep_pos[t_i] {
                     let w = e.shape.prep.dims[m].1;
                     let vals = &prep_values[m];
@@ -2160,13 +2225,13 @@ fn batched_epoch_program_with(
                 }
                 assert_eq!(
                     trace.len(),
-                    deep_shapes[t_i].num_total_cols,
+                    legs[t_i].deep.num_total_cols,
                     "the crossing must cover exactly the DEEP column set"
                 );
                 let m = parts_pos[t_i];
                 let w = e.shape.parts.dims[m].1;
                 assert_eq!(
-                    w, deep_shapes[t_i].num_composition_parts,
+                    w, legs[t_i].deep.num_composition_parts,
                     "the parts matrix is one column per composition part"
                 );
                 let vals = &parts_values[m];
@@ -2187,14 +2252,14 @@ fn batched_epoch_program_with(
                 deep_pairs.push((
                     super::deep::emit_deep_point(
                         &mut b,
-                        &deep_shapes[t_i],
+                        &legs[t_i].deep,
                         ch.gammas[t_i],
                         &dinvs[t_i],
                         &regular,
                     ),
                     super::deep::emit_deep_point(
                         &mut b,
-                        &deep_shapes[t_i],
+                        &legs[t_i].deep,
                         ch.gammas[t_i],
                         &dinvs[t_i],
                         &symmetric,
@@ -2451,14 +2516,23 @@ fn the_batched_epoch_challenge_spine_matches_production() {
     );
 }
 
-/// ★ THE WALKS: every round of a real batched epoch authenticates in the
-/// machine at the REDUCED shared index — each preprocessed table against the
-/// AIR-set root cells, the main/aux/parts mixed rounds against the roots the
-/// spine absorbed, one shared path per round with the injection schedule
-/// unrolled. The tamper arms and the wrong-reduction control show what does
-/// NOT authenticate, which is what turns "it executed" into evidence.
+/// ★ THE RUN: the whole ASSEMBLED BATCHED epoch verifier — spine and legs —
+/// on a real continuation epoch proved through the batched path.
+///
+/// What executing proves, stated precisely. Every check is an assert inside
+/// the program, so reaching the end means: all 25 constraint identities and
+/// quotient checks held at the batched spine's own z and β; every round's
+/// opened row pairs hashed — tallest matrices batched, shorter height groups
+/// INJECTED — into the roots the ONE transcript absorbed, at the reduced
+/// shared index; every preprocessed table authenticated against the AIR-set
+/// root its provenance admits; the per-table DEEP crossings fed the α-mixed
+/// injected FRI fold to the batched terminal; every standalone table's
+/// transcript-BOUND polynomial matched its DEEP pair at its own reduced
+/// points; and the LogUp closure reached production's COMMIT-bus target. The
+/// tamper arms and the wrong-reduction control show what does NOT execute,
+/// which is what turns "it executed" into evidence.
 #[test]
-fn the_batched_openings_authenticate_against_the_spine_roots() {
+fn the_assembled_batched_epoch_verifier_runs() {
     let e = real_batched_epoch_with(super::proof_fixture::fixture_options());
     let program = batched_epoch_program_with(&e, true, false);
     let mut arenas = batched_epoch_arenas(&e);
