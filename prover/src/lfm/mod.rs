@@ -16,6 +16,7 @@
 //! three being the production keccak family hosted unchanged (see `airs`).
 
 pub mod airs;
+pub mod batched_epoch;
 pub mod blake3;
 pub mod blake3_chip;
 pub mod blake3_socket;

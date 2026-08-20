@@ -299,9 +299,28 @@ pub fn emit_z_ood(
 /// function is that `the_z_guard_rejects_a_point_in_either_domain` can then
 /// feed it the points production would have rejected.
 pub fn assert_z_outside_domains(b: &mut LfmBuilder, z: Ext, shape: &TableChallengeShape) {
+    assert_z_outside_domains_raw(
+        b,
+        z,
+        shape.log2_trace_length,
+        shape.log2_blowup,
+        shape.coset_offset,
+    );
+}
+
+/// [`assert_z_outside_domains`] from the three domain parameters directly —
+/// the batched spine draws per-table `z`s without a per-table
+/// [`TableChallengeShape`] to hand over.
+pub fn assert_z_outside_domains_raw(
+    b: &mut LfmBuilder,
+    z: Ext,
+    log2_trace_length: u32,
+    log2_blowup: u32,
+    coset_offset: FE,
+) {
     // z^N by repeated squaring; N = 2^log2_trace_length.
     let mut z_pow_trace = z;
-    for _ in 0..shape.log2_trace_length {
+    for _ in 0..log2_trace_length {
         z_pow_trace = b.emul(z_pow_trace, z_pow_trace);
     }
     let one = b.ext_const(&FEE::one());
@@ -310,12 +329,11 @@ pub fn assert_z_outside_domains(b: &mut LfmBuilder, z: Ext, shape: &TableChallen
     // (z^N)^blowup against coset_offset^lde — the offset power is a program
     // constant because the domain is shape.
     let mut z_pow_lde = z_pow_trace;
-    for _ in 0..shape.log2_blowup {
+    for _ in 0..log2_blowup {
         z_pow_lde = b.emul(z_pow_lde, z_pow_lde);
     }
-    let offset_pow = shape
-        .coset_offset
-        .pow(1u64 << shape.log2_lde_length())
+    let offset_pow = coset_offset
+        .pow(1u64 << (log2_trace_length + log2_blowup))
         .to_extension::<GoldilocksExtension>();
     let offset_pow = b.ext_const(&offset_pow);
     assert_ne_ext(b, z_pow_lde, offset_pow);
@@ -347,7 +365,7 @@ fn assert_ne_ext(b: &mut LfmBuilder, x: Ext, y: Ext) {
 /// Skipping the check would not merely be untidy: the nonce is absorbed, so
 /// the query indices depend on it, and an unchecked nonce is a free re-roll of
 /// every query index at zero cost.
-fn emit_grinding_check(
+pub(super) fn emit_grinding_check(
     b: &mut LfmBuilder,
     seed: [Cell; DIGEST_WORDS],
     nonce_halves: [Felt; 2],
@@ -410,7 +428,7 @@ fn emit_grinding_check(
 /// The transcript reads halves as four LITTLE-endian bytes, so the big-endian
 /// rendering is the felt's two halves in reversed ORDER, each byte-swapped —
 /// which is exactly what `felt_be_halves` produces.
-fn nonce_halves(b: &mut LfmBuilder, nonce: Felt) -> [Felt; 2] {
+pub(super) fn nonce_halves(b: &mut LfmBuilder, nonce: Felt) -> [Felt; 2] {
     super::transcript_replay::felt_be_halves(b, nonce)
 }
 
@@ -595,7 +613,7 @@ pub fn emit_reconstruct_ood(
 
 /// Absorb an extension cell the way `append_field_element` streams it: three
 /// coordinates, each eight big-endian bytes.
-fn append_ext_cell(b: &mut LfmBuilder, t: &mut TranscriptReplay, v: Ext) {
+pub(super) fn append_ext_cell(b: &mut LfmBuilder, t: &mut TranscriptReplay, v: Ext) {
     let coords = b.unpack(v.as_cell());
     t.append_ext(b, [coords[0], coords[1], coords[2]]);
 }

@@ -1568,6 +1568,439 @@ fn a_batched_vm_epoch_host_verifies_end_to_end() {
     );
 }
 
+/// The batched spine's program shape, host-derived from the harness — each
+/// field the value the emitter reads off the AIR set and the options, never
+/// off the proof (the OOD dims come from the proof's blocks exactly as the
+/// per-table `TableChallengeShape` takes them, blessed as program shape for
+/// the same reason: the program is emitted for one epoch shape).
+fn batched_shape_of(e: &RealBatchedEpoch) -> super::batched_epoch::BatchedEpochShape {
+    use super::batched_epoch::{BatchedEpochShape, BatchedFriShape, BatchedTableShape};
+
+    let refs = e.refs();
+    let tables: Vec<BatchedTableShape> = e
+        .proof
+        .tables
+        .iter()
+        .zip(&refs)
+        .map(|(t, air)| BatchedTableShape {
+            log2_trace_length: t.trace_length.trailing_zeros(),
+            has_contribution: air.has_aux_trace(),
+            ood_current_dims: (
+                t.trace_ood_evaluations.width,
+                t.trace_ood_evaluations.height,
+            ),
+            ood_next_dims: (
+                t.trace_ood_next_evaluations.width,
+                t.trace_ood_next_evaluations.height,
+            ),
+            num_parts: t.composition_poly_parts_ood_evaluation.len(),
+        })
+        .collect();
+    BatchedEpochShape {
+        tables,
+        heights: e.shape.heights.clone(),
+        total_widths: e.shape.total_widths(),
+        log2_blowup: e.fri_params.blowup_log,
+        coset_offset: FE::from(e.fri_params.coset_offset),
+        has_aux: !e.shape.aux.is_empty(),
+        fri: BatchedFriShape::new(
+            &e.shape.heights,
+            e.fri_params.blowup_log,
+            e.fri_params.final_poly_log_degree,
+        ),
+        grinding_factor: e.fri_params.grinding_factor,
+        num_queries: e.fri_params.num_queries,
+    }
+}
+
+/// The batched epoch's spine program — statement, prep provenance, the
+/// attestation join, the ONE-transcript batched challenge replay, and the
+/// LogUp closure. The batched sibling of [`epoch_program`]'s spine half.
+fn batched_epoch_program(e: &RealBatchedEpoch) -> LfmProgram {
+    use super::batched_epoch::{
+        BatchedEpochAbsorbs, BatchedPrepRoot, BatchedTableOod, emit_batched_epoch_challenges,
+    };
+    use super::statement_replay::{EpochStatementVars, absorb_epoch_statement};
+
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let shape = batched_shape_of(e);
+
+    // ---- arenas, declaration order = absorb order ----
+    let stmt_halves = 8 + e.statement.public_output_len.div_ceil(4) + 2;
+    let a_stmt = b.declare_arena(stmt_halves as u32);
+    let num_arena_prep = e
+        .prep_sources
+        .iter()
+        .filter(|p| p.is_some_and(PrepSource::is_arena))
+        .count();
+    let a_prep_roots = b.declare_arena(2 * num_arena_prep as u32);
+    let a_main_root = b.declare_arena(2);
+    let num_reg = crate::tables::register::NUM_REGISTER_ADDRESSES as u32;
+    let a_reg_init = b.declare_arena(num_reg);
+    let a_reg_fini = b.declare_arena(num_reg);
+    let a_pc_start = b.declare_arena(2);
+    let a_aux_root = shape.has_aux.then(|| b.declare_arena(2));
+    let a_contrib: Vec<Option<super::instr::ArenaId>> = shape
+        .tables
+        .iter()
+        .map(|t| t.has_contribution.then(|| b.declare_arena(1)))
+        .collect();
+    let a_ood: Vec<(
+        super::instr::ArenaId,
+        super::instr::ArenaId,
+        super::instr::ArenaId,
+    )> = shape
+        .tables
+        .iter()
+        .map(|t| {
+            (
+                b.declare_arena((t.ood_current_dims.0 * t.ood_current_dims.1) as u32),
+                b.declare_arena((t.ood_next_dims.0 * t.ood_next_dims.1) as u32),
+                b.declare_arena(t.num_parts as u32),
+            )
+        })
+        .collect();
+    let a_parts_root = b.declare_arena(2);
+    let a_fri_roots = b.declare_arena(2 * shape.fri.num_committed() as u32);
+    let a_fri_coeffs = b.declare_arena(shape.fri.num_terminal_coeffs() as u32);
+    let a_nonce = (shape.grinding_factor > 0).then(|| b.declare_arena(1));
+
+    // ---- the statement ----
+    let stmt: Vec<_> = (0..stmt_halves as u32)
+        .map(|i| b.hint_felt(a_stmt, i))
+        .collect();
+    let out_halves = e.statement.public_output_len.div_ceil(4);
+    let (elf_digest, rest) = stmt.split_at(8);
+    let (public_output, epoch_label) = rest.split_at(out_halves);
+
+    let mut t = TranscriptReplay::new(&[]);
+    absorb_epoch_statement(
+        &mut t,
+        &e.statement,
+        &EpochStatementVars {
+            elf_digest,
+            public_output,
+            epoch_label,
+        },
+    );
+
+    // ---- registers, and the preprocessed roots from their provenances ----
+    let reg_init: Vec<_> = (0..num_reg).map(|r| b.hint_felt(a_reg_init, r)).collect();
+    let reg_fini: Vec<_> = (0..num_reg).map(|r| b.hint_felt(a_reg_fini, r)).collect();
+    for cell in reg_init.iter().chain(&reg_fini) {
+        super::epoch::assert_u32(&mut b, *cell);
+    }
+    let reg_shape = super::programs::RegisterDerivationShape {
+        blowup: e.opts.blowup_factor as usize,
+        coset_offset: e.opts.coset_offset,
+    };
+
+    let mut next_arena_prep = 0usize;
+    let mut decode_cells: Option<RootCells> = None;
+    let prep_cells: Vec<Option<RootCells>> = e
+        .prep_sources
+        .iter()
+        .map(|prep| match prep {
+            None => None,
+            Some(PrepSource::Constant(_)) => None, // absorbed as program text below
+            Some(PrepSource::Register(_)) => {
+                let digest = super::programs::emit_register_commitment(
+                    &mut b, reg_shape, &reg_init, &reg_fini,
+                );
+                Some(RootCells::from_digest(&mut b, digest))
+            }
+            Some(PrepSource::ElfDependent(_)) => {
+                let cells = RootCells::hint(&mut b, a_prep_roots, 2 * next_arena_prep as u32);
+                next_arena_prep += 1;
+                assert!(
+                    decode_cells.is_none(),
+                    "a continuation epoch has one ELF-dependent preprocessed root"
+                );
+                decode_cells = Some(cells.clone());
+                Some(cells)
+            }
+        })
+        .collect();
+    assert_eq!(next_arena_prep, num_arena_prep);
+
+    let prep_slots: Vec<Option<BatchedPrepRoot<'_>>> = e
+        .prep_sources
+        .iter()
+        .zip(&prep_cells)
+        .map(|(prep, cells)| match (prep, cells) {
+            (None, _) => None,
+            (Some(PrepSource::Constant(c)), _) => Some(BatchedPrepRoot::Constant(c)),
+            (_, Some(cells)) => Some(BatchedPrepRoot::Cells(cells)),
+            _ => unreachable!("a non-constant prep source has cells"),
+        })
+        .collect();
+
+    // ---- the proof-carried cells ----
+    let main_cells = RootCells::hint(&mut b, a_main_root, 0);
+    let aux_cells = a_aux_root.map(|id| RootCells::hint(&mut b, id, 0));
+    let contribs: Vec<Option<super::builder::Ext>> = a_contrib
+        .iter()
+        .map(|id| id.map(|id| b.hint_word(id, 0).as_ext()))
+        .collect();
+    let ood_cells: Vec<(Vec<_>, Vec<_>, Vec<_>)> = shape
+        .tables
+        .iter()
+        .zip(&a_ood)
+        .map(|(t, (ac, an, ap))| {
+            (
+                (0..(t.ood_current_dims.0 * t.ood_current_dims.1) as u32)
+                    .map(|k| b.hint_word(*ac, k).as_ext())
+                    .collect(),
+                (0..(t.ood_next_dims.0 * t.ood_next_dims.1) as u32)
+                    .map(|k| b.hint_word(*an, k).as_ext())
+                    .collect(),
+                (0..t.num_parts as u32)
+                    .map(|k| b.hint_word(*ap, k).as_ext())
+                    .collect(),
+            )
+        })
+        .collect();
+    let parts_cells = RootCells::hint(&mut b, a_parts_root, 0);
+    let fri_root_cells: Vec<_> = (0..shape.fri.num_committed())
+        .map(|k| RootCells::hint(&mut b, a_fri_roots, 2 * k as u32))
+        .collect();
+    let coeff_cells: Vec<_> = (0..shape.fri.num_terminal_coeffs() as u32)
+        .map(|k| b.hint_word(a_fri_coeffs, k).as_ext())
+        .collect();
+    let nonce = a_nonce.map(|id| b.hint_felt(id, 0));
+
+    // ---- the ONE-transcript spine ----
+    let oods: Vec<BatchedTableOod<'_>> = ood_cells
+        .iter()
+        .map(|(c, x, p)| BatchedTableOod {
+            current: c,
+            next: x,
+            parts: p,
+        })
+        .collect();
+    let ch = emit_batched_epoch_challenges(
+        &mut b,
+        &mut t,
+        &shape,
+        &BatchedEpochAbsorbs {
+            prep_roots: &prep_slots,
+            main_root: &main_cells,
+            aux_root: aux_cells.as_ref(),
+            contributions: &contribs,
+            parts_root: &parts_cells,
+            ood: &oods,
+            fri_roots: &fri_root_cells,
+            fri_coeffs: &coeff_cells,
+            nonce,
+        },
+    );
+
+    // ---- publishes: the pair, then the attestation, then every challenge ----
+    b.public(ch.lookup.0.as_cell());
+    b.public(ch.lookup.1.as_cell());
+    {
+        let pc_start: Vec<_> = (0..2).map(|i| b.hint_felt(a_pc_start, i)).collect();
+        let decode = decode_cells
+            .as_ref()
+            .expect("a continuation epoch has a DECODE sub-proof")
+            .halves();
+        let id = super::programs::emit_program_id(
+            &mut b,
+            super::programs::ProgramIdShape { num_pages: 0 },
+            elf_digest,
+            &pc_start,
+            &decode,
+            &[],
+        );
+        b.public(id[0]);
+        b.public(id[1]);
+    }
+    for v in ch.betas.iter().chain(&ch.zs).chain(&ch.gammas) {
+        b.public(v.as_cell());
+    }
+    b.public(ch.alpha.as_cell());
+    for zeta in &ch.zetas {
+        b.public(zeta.as_cell());
+    }
+    for bits in &ch.iota_bits {
+        let felt = edsl::bits_to_felt(&mut b, bits);
+        b.public(felt.as_cell());
+    }
+
+    // ---- the LogUp closure, on the cells the spine absorbed ----
+    let contributions: Vec<super::builder::Ext> = contribs.iter().copied().flatten().collect();
+    let lshape = super::logup::LogUpShape {
+        num_contributing_tables: contributions.len(),
+        num_output_bytes: e.statement.public_output_len,
+    };
+    let start = reg_init[crate::tables::register::X254_INDEX];
+    let bytes = super::epoch::emit_output_bytes(&mut b, public_output, lshape.num_output_bytes);
+    let target = super::logup::emit_commit_bus_target(
+        &mut b,
+        &lshape,
+        ch.lookup.0,
+        ch.lookup.1,
+        start,
+        &bytes,
+    );
+    let total = super::logup::emit_bus_closure(&mut b, &lshape, &contributions, target);
+    b.public(total.as_cell());
+
+    let program = compile(b.finish());
+    validate(&program).expect("the batched epoch spine must be admissible");
+    program
+}
+
+/// The arenas [`batched_epoch_program`] declares, in the same order, filled
+/// from the harness's proof.
+fn batched_epoch_arenas(e: &RealBatchedEpoch) -> Vec<Vec<LfmWord>> {
+    let mut stmt: Vec<FE> = Vec::new();
+    let halves = |bytes: &[u8]| -> Vec<FE> {
+        bytes
+            .chunks(4)
+            .map(|c| {
+                let mut w = [0u8; 4];
+                w[..c.len()].copy_from_slice(c);
+                FE::from(u32::from_le_bytes(w) as u64)
+            })
+            .collect()
+    };
+    stmt.extend(halves(&e.elf_digest));
+    stmt.extend(halves(&e.public_output));
+    stmt.extend(halves(&e.epoch_label.to_le_bytes()));
+
+    let prep: Vec<Commitment> = e
+        .prep_sources
+        .iter()
+        .filter_map(|p| match p {
+            Some(PrepSource::ElfDependent(c)) => Some(*c),
+            _ => None,
+        })
+        .collect();
+    let reg = |v: &[u32]| -> Vec<LfmWord> {
+        assert_eq!(
+            v.len(),
+            crate::tables::register::NUM_REGISTER_ADDRESSES,
+            "a register boundary vector is one word per register word address"
+        );
+        v.iter()
+            .map(|w| base_word(FE::from(u64::from(*w))))
+            .collect()
+    };
+
+    let mut out = vec![
+        stmt.iter().map(|h| base_word(*h)).collect(),
+        super::proof_arena::commitments_to_arena(&prep),
+        super::proof_arena::commitments_to_arena(&[e.proof.main_root]),
+        reg(&e.register_init),
+        reg(&e.reg_fini),
+        super::keccak_host::pack_stream(&e.pc_start.to_le_bytes())
+            .into_iter()
+            .map(base_word)
+            .collect(),
+    ];
+    if let Some(root) = e.proof.aux_root.as_ref() {
+        out.push(super::proof_arena::commitments_to_arena(&[*root]));
+    }
+    for table in &e.proof.tables {
+        if let Some(bpi) = table.bus_public_inputs.as_ref() {
+            out.push(vec![ext_word(&bpi.table_contribution)]);
+        }
+    }
+    for table in &e.proof.tables {
+        let block_words = |block: &stark::table::Table<Ext3>| -> Vec<LfmWord> {
+            (0..block.height)
+                .flat_map(|r| block.get_row(r).to_vec())
+                .map(|v| ext_word(&v))
+                .collect()
+        };
+        out.push(block_words(&table.trace_ood_evaluations));
+        out.push(block_words(&table.trace_ood_next_evaluations));
+        out.push(
+            table
+                .composition_poly_parts_ood_evaluation
+                .iter()
+                .map(ext_word)
+                .collect(),
+        );
+    }
+    out.push(super::proof_arena::commitments_to_arena(&[e
+        .proof
+        .parts_root]));
+    out.push(super::proof_arena::commitments_to_arena(
+        &e.proof.fri_layer_roots,
+    ));
+    out.push(e.proof.fri_final_poly_coeffs.iter().map(ext_word).collect());
+    if let Some(nc) = e.proof.nonce {
+        out.push(vec![base_word(FE::from(nc))]);
+    }
+    out
+}
+
+/// ★ THE RUN: the BATCHED epoch's Fiat-Shamir spine, executed against a real
+/// batched epoch proof the host verification accepts, and differentialled
+/// against `replay_epoch_transcript`'s own challenges — every β, z, γ, the
+/// shared pair, the shared α, every ζ, every shared iota, the attestation
+/// program_id, and the COMMIT-bus closure.
+#[test]
+fn the_batched_epoch_challenge_spine_matches_production() {
+    let e = real_batched_epoch_with(super::proof_fixture::fixture_options());
+    let program = batched_epoch_program(&e);
+    let arenas = batched_epoch_arenas(&e);
+    let exec =
+        execute(&program, &arenas, &TestPermutation).expect("the batched epoch spine must execute");
+
+    let pub_ext = |i: usize| word_as_ext(&exec.public_words[i].1).expect("an ext challenge");
+    let [z, alpha] = e.challenges.lookup.as_slice() else {
+        panic!("the shared pair is (z, α)");
+    };
+    assert_eq!(pub_ext(0), *z, "the shared LogUp z");
+    assert_eq!(pub_ext(1), *alpha, "the shared LogUp alpha");
+    assert_eq!(
+        published_digest(&exec.public_words, 2),
+        e.expected_program_id,
+        "the attestation program_id must match production's"
+    );
+
+    let n = e.proof.tables.len();
+    let mut cursor = 4usize;
+    for (i, want) in e.challenges.betas.iter().enumerate() {
+        assert_eq!(pub_ext(cursor + i), *want, "beta of table {i}");
+    }
+    cursor += n;
+    for (i, want) in e.challenges.zs.iter().enumerate() {
+        assert_eq!(pub_ext(cursor + i), *want, "z of table {i}");
+    }
+    cursor += n;
+    for (i, want) in e.challenges.deep_gammas.iter().enumerate() {
+        assert_eq!(pub_ext(cursor + i), *want, "gamma of table {i}");
+    }
+    cursor += n;
+    assert_eq!(pub_ext(cursor), e.challenges.fri.alpha, "the shared DEEP α");
+    cursor += 1;
+    for (k, want) in e.challenges.fri.betas.iter().enumerate() {
+        assert_eq!(pub_ext(cursor + k), *want, "zeta {k}");
+    }
+    cursor += e.challenges.fri.betas.len();
+    for (q, want) in e.challenges.fri.iotas.iter().enumerate() {
+        let w = exec.public_words[cursor + q].1;
+        let got = super::word::word_as_base(&w).expect("an index is a base felt");
+        assert_eq!(got, FE::from(*want as u64), "shared iota {q}");
+    }
+    cursor += e.challenges.fri.iotas.len();
+    assert_eq!(
+        word_as_ext(&exec.public_words[cursor].1).expect("the bus total is ext"),
+        e.expected_bus_balance,
+        "the LogUp closure must reach production's COMMIT-bus target"
+    );
+    cursor += 1;
+    assert_eq!(
+        cursor,
+        exec.public_words.len(),
+        "every published word must be checked"
+    );
+}
+
 /// [`host_table`] for a sub-proof inside a multi-table epoch: the fork is
 /// already positioned (separator, aux root and `L` absorbed), so the oracle
 /// comes from `replay_rounds_after_round_1` on THAT transcript.
