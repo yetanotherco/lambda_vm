@@ -2,34 +2,25 @@
 
 #show: book-page("recursion.typ")
 
+// Spaces and instances
+#let (functionSpace, function) = ($cal(F)$, $bb(f)$)
+#let (inputSpace, input) = ($II$, $bb(i)$)
+#let (instanceSpace, instance) = ($XX$, $bb(x)$)
+#let (witnessSpace, witness) = ($WW$, $bb(w)$)
+#let (proofSpace, proof) = ($bb(Pi)$, $bb(pi)$)
 
-// Outline
-#let binaryVM = raw("binaryVM")
-#let fieldVM = raw("fieldVM")
-
-
-#let functionSpace = $cal(F)$
-#let verifierSpace = $cal(V)$
-#let privateFunctionSpace = $hat(cal(F))$
-#let program = $f$
-#let inputSpace = $II$
-#let input = $bb(i)$
-#let instanceSpace = $XX$
-#let instanceCommitmentSpace = $CC$
-#let instance = $bb(x)$
-#let instance2 = $bb(y)$
-#let witnessSpace = $WW$
-#let witness = $bb(w)$
-#let proofSpace = $bb(Pi)$
-#let proof = $bb(pi)$
-#let prove = $italic("p")$
-#let verify = $italic("v")$
+#let (commitmentSpace, commitment) = ($CC$, $bb(c)$)
 #let commit(x) = $overline(#x)$
 #let comm(x) = $commit(#x)$
-#let one = $bb(1)$
-#let zero = $bb(0)$
-#let function = $bb(f)$
+
+#let program = $f$
 #let relation = $cal(R)$
+
+#let verifierSpace = $cal(V)$
+#let (prove, verify) = ($italic("p")$, $italic("v")$)
+
+// Mathematical symbols
+#let (zero, one) = ($bb(0)$, $bb(1)$)
 #let iff = $arrow.double.l.r$
 #let implies = $arrow.double.r$
 #let prob = $PP$
@@ -49,12 +40,12 @@ as the set of all _solvable instances_,
 i.e., all instances $instance in instanceSpace$
 for which there exists a witness $witness in witnessSpace$ such that 
 $instance\(witness) = one$.
-Lastly, we introduce the commitment function $c: instanceSpace mapsto instanceCommitmentSpace$.
+Lastly, we introduce the commitment function $c: instanceSpace mapsto commitmentSpace$.
 To simplify notation, we use $commit(instance) = c(instance)$.
 
 We now assume the existence of _proving system_ $(prove, verify)$ with 
 prover $prove: instanceSpace times witnessSpace mapsto proofSpace$ and 
-verifier $verify: instanceCommitmentSpace times proofSpace mapsto BB$ such that
+verifier $verify: commitmentSpace times proofSpace mapsto BB$ such that
 $
 forall (instance, witness) in relation times witnessSpace 
 &: prob[verify\(commit(instance), prove\(instance; witness)) = one | instance(witness) = one] = 1 \
@@ -76,7 +67,7 @@ convincing them of the prover's claim.
 
 = Proof recursion
 Now observe that the verifier $verify$ is itself a function in 
-$verifierSpace := {hat(f): instanceSpace times proofSpace mapsto BB} subset.eq functionSpace$.
+$verifierSpace := {hat(f): commitmentSpace times proofSpace mapsto BB} subset.eq functionSpace$.
 This means that we can use $prove$ to prove that the verification of a proof $proof$ 
 for a given instance $instance$ succeeds:
 $
@@ -108,15 +99,15 @@ This increase in verifier computation is undesirable and should be avoided.
 
 A solution to this, is to leverage the following variation to the verification algorithm:
 $
-  verify': instanceCommitmentSpace^2 times {0, 1} times proofSpace: (c_0, c_1, b, proof) mapsto
+  verify': commitmentSpace^2 times {0, 1} times proofSpace: (commitment_0, commitment_1, b, proof) mapsto
   cases(
-    verify(c_0, proof) &text("if") b=0,
-    verify(c_1(c_0, c_1, dot), proof) &text("if") b=1
+    verify(commitment_0, proof) &text("if") b=0,
+    verify(commitment_1(commitment_0, commitment_1, dot), proof) &text("if") b=1
   )
 $
 where it is assumed that $comm(function(x_1, x_2, dot))$ can be easily
 constructed from $comm(function), comm(x_1)$, and $comm(x_2)$.
-By choosing $c_0 = commit(instance)$ and $c_1 = commit(verify')$, the prover can then prove
+By choosing $commitment_0 = commit(instance)$ and $commitment_1 = commit(verify')$, the prover can then prove
 the base case by selecting $b=0$, and set $b=1$ during further recursion.
 Then, when presented with depth-n proof $proof^((n))$ and base instance $instance$, 
 the verifier executes
@@ -203,20 +194,20 @@ Below, we provide a division that, in theory, is expected to achieve solid perfo
 *Record $record$.*
 The record contains all challenges the prover derived using Fiat-Shamir.
 
-*Tasks for $verify'_b\(c_0, c_1, b, proof, record)$:*
+*Tasks for $verify'_b\(commitment_0, commitment_1, b, proof, record)$:*
 + assert that $b in {0, 1}$,
 + verify challenges on record $record$ according to Fiat-Shamir,
 + verify the various opening proofs;
     - if $b=0$: 
-        verify binary-VM DECODE table (@decode) query opening against $c_0$
+        verify binary-VM DECODE table (@decode) query opening against $commitment_0$
     - if $b=1$:
-        verify binary-VM DECODE table (@decode) query opening against $c_(1,b)$ and
-        verify field-VM DECODE table (@field-decode) query opening against $c_(1,f)$
-+ `COMMIT` to $c_0$ and $c_1$ (see @commit)
+        verify binary-VM DECODE table (@decode) query opening against $commitment_(1,b)$ and
+        verify field-VM DECODE table (@field-decode) query opening against $commitment_(1,f)$
++ `COMMIT` to $commitment_0$ and $commitment_1$ (see @commit)
 
-*Tasks $verify'_f\(c_0, c_1, b, proof, record)$:*
+*Tasks $verify'_f\(commitment_0, commitment_1, b, proof, record)$:*
 + verify LogUp openings sum to zero,
-    - if $b=1$, use $c_0$ and $c_1$ to complete the `COMMIT` balance.
+    - if $b=1$, use $commitment_0$ and $commitment_1$ to complete the `COMMIT` balance.
 + verify `DEEP` evaluation
 + verify `FRI` folding
 + verify `FRI` output low degreeness check.
