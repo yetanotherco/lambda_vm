@@ -26,7 +26,10 @@ end
 P->V: FRI low-degree output
 note over V: verify low-degreeness
 loop FRI-verify
-P<-V: FRI-opening challenge
-P->V: opening
-note over V: verify opening
+note over V: sample folding\nchallenges
+P<-V: challenges
+P->V: openings
+note over V: verify openings
+note over V: verify folding\nsteps
 end
+note over V: verify DEEP
