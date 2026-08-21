@@ -1,0 +1,66 @@
+name = "FEXT_LOAD"
+code = "FXL"
+
+[[variables.input]]
+name = "timestamp"
+type = "Word"
+desc = "The timestamp"
+pad = 0
+
+[[variables.input]]
+name = "addr"
+type = "DWordWL"
+desc = "The address at which to store the field element"
+pad = 0
+
+[[variables.input]]
+name = "coeffs"
+type = ["DWordWL", 3]
+desc = "The extension field element coefficients, in native form"
+pad = 0
+
+[[variables.multiplicity]]
+name = "μ"
+type = "Bit"
+desc = ""
+pad = 0
+
+[[constraint_groups]]
+name = "all"
+
+[[constraints.all]]
+kind = "template"
+tag = "REG"
+input = [10, "addr", "timestamp"]
+output = "addr"
+cond = "μ"
+
+[[constraints.all]]
+kind = "template"
+tag = "REG"
+input = [["+", 11, "i"], ["idx", "coeffs", "i"], "timestamp"]
+output = ["idx", "coeffs", "i"]
+cond = "μ"
+iter = ["i", 0, 2]
+
+[[constraints.all]]
+kind = "interaction"
+tag = "ALU"
+input = [["idx", "coeffs", "i"], ["arr", 1, ["-", ["^", 2, 32], 1]], ["opsel", "LT"]]
+output = ["cast", 1, "DWordWL"]
+iter = ["i", 0, 2]
+multiplicity = "μ"
+
+# This can either happen directly, or we introduce another dedicated MEMW accelerator?
+[[constraints.all]]
+kind = "interaction"
+tag = "MEMW"
+input = [["+", 3, "i"], "addr", ["arr", ["+", ["*", ["^", 2, 32], ["idx", ["idx", "coeffs", "i"], 1]], ["idx", ["idx", "coeffs", "i"], 0]], 0, 0, 0, 0, 0, 0, 0], "timestamp", 0, 0, 0]
+iter = ["i", 0, 2]
+multiplicity = "μ"
+
+[[constraints.all]]
+kind = "interaction"
+tag = "ECALL"
+input = ["timestamp", ["arr", ["-", ["^", 2, 32], 20], ["-", ["^", 2, 32], 1]]]
+multiplicity = ["-", "μ"]

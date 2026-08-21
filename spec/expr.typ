@@ -148,7 +148,7 @@
         cwrap(`-` + rec(PREC.neg, e.at(1)), pp < PREC.neg)
       } else {
         // Subtraction
-        cwrap(e.slice(1).map(rec.with(PREC.sub)).join(` - `), pp < PREC.sub)
+        cwrap(e.slice(1).map(rec.with(PREC.sub)).join(` - `), pp <= PREC.sub)
       }
     },
     "cast": (pp, rec, e) => {

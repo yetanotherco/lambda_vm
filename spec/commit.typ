@@ -63,10 +63,25 @@ However, since it is practically impossible to commit more than $2^64-2^32$ byte
 
 Next, we read the `value` located at buffer address `address` and commit to it under the given `index`.
 This is only performed when we have not yet reached the `end` of the commit sequence.
+Values are committed by letting the verifier initialize and finalize the global memory argument (see @memory and @streaming),
+with the claimed commitments in its own domain separated part of memory, with domain separator value 2.#footnote[
+  In order to make sure the verifier can properly finalize the committed values, the last epoch can "bring forward"
+  all commitments from earlier epochs, similar to padded values, in the `L2G` table.
+  Then the contribution of the commitments only consists of the tuples `(2, address, last_epoch_index, value)`, which is entirely known to the verifier.
+]
+This chip then checks that the same value as the one being committed is then found at the corresponding address.
+In doing this, we enforce that all values being committed match the claimed commitment,
+and the verifier should additionally check that register 254 contains the correct value to ensure
+the correct amount of bytes have been committed.#footnote[
+  We additionally note here that for very large commitments (with index $>= 2^32$),
+  the (commit space) address can potentially become denormalized, but since no other chips or systems interact with
+  this memory domain, there is no issue.
+  The usual consistency guarantee from the LogUp argument and correct initialization as for general addresses applies.
+]
 #render_constraint_table(chip, config, groups: "commit")
 
 In parallel, we compute $#`address_incr` = #`address` + 1$ (@commit:c:address_incr) as address of the next byte to commit, and $#`count_decr` = #`count` - 1$ (@commit:c:count_decr) as the number of bytes that still has to be committed after committing this byte.
-@commit:c:range_address_incr and @commit:c:range_count_decr are included to satisfy @add:a:sum respectively @add:a:rhs.
+@commit:c:range_address_incr and @commit:c:range_count_decr are included to satisfy @add:a:sum respectively @sub:a:diff.
 #render_constraint_table(chip, config, groups: "incr_decr")
 
 When `count` hits $0$, we should stop performing further recursive calls.

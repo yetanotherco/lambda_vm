@@ -1,4 +1,5 @@
 name = "SIGN"
+code = "SGN"
 
 [[variables.input]]
 name = "X"

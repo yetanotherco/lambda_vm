@@ -1,4 +1,5 @@
 name = "LOAD"
+code = "LD"
 
 # Input
 
@@ -10,7 +11,7 @@ pad = 0
 
 [[variables.input]]
 name = "timestamp"
-type = "DWordWL"
+type = "Word"
 desc = "The timestamp at which this memory access is said to occur"
 pad = 0
 
@@ -76,8 +77,7 @@ desc = "`IS_WORD[base_address[i]]`"
 iter = ["i", 0, 1]
 
 [[assumptions]]
-desc = "`IS_WORD[timestamp[i]]`"
-iter = ["i", 0, 1]
+desc = "`IS_WORD[timestamp]`"
 
 
 [[constraint_groups]]

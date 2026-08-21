@@ -7,6 +7,12 @@ name = "page"
 type = "DWordWL"
 desc = "Constant column containing the page base address; should be integrated into the constraints directly"
 
+[[variables.constant]]
+name = "domain"
+type = "Byte"
+desc = "The memory domain to provide a page for"
+
+
 [[variables.input]]
 name = "offset"
 type = "RowIndex"
@@ -23,9 +29,9 @@ type = "Byte"
 desc = "The final value this address took"
 
 [[variables.input]]
-name = "timestamp"
-type = "DWordWL"
-desc = "The timestamp at which this address was last accessed"
+name = "fini_epoch"
+type = "B20"
+desc = "The epoch at which this address was last accessed"
 
 # Virtual
 
@@ -34,7 +40,6 @@ name = "address"
 type = "DWordWL"
 desc = "Adding `offset` to the page base address `page`. `page` is a constant with respect to a single instance of this table."
 def = ["+", "page", ["*", "offset", ["cast", 1, "DWordWL"]]]
-
 
 [[constraint_groups]]
 name = "all"
@@ -45,18 +50,13 @@ tag = "IS_BYTE"
 input = ["init"]
 
 [[constraints.all]]
-kind = "template"
-tag = "IS_BYTE"
-input = ["fini"]
-
-[[constraints.all]]
 kind = "interaction"
-tag = "memory"
-input = [0, "address", ["cast", 0, "DWordWL"], "init"]
+tag = "GLOBAL_MEM"
+input = ["domain", "address", 0, "init"]
 multiplicity = -1
 
 [[constraints.all]]
 kind = "interaction"
-tag = "memory"
-input = [0, "address", "timestamp", "fini"]
+tag = "GLOBAL_MEM"
+input = ["domain", "address", "fini_epoch", "fini"]
 multiplicity = 1

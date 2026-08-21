@@ -31,7 +31,7 @@ The #halt chip:
 + makes sure register `x10` (containing the exit code) equals $0$ (@halt:c:read_zero_exit_code),
 + writes $0$ to all other registers (@halt:c:zeroize_registers_lo/@halt:c:zeroize_registers_hi), and
 + sets `pc` equal to $1$ (@halt:c:consume_pc, @halt:c:emit_pc).
-Note that the writes performed by all these interactions --- except for the `pc` --- are accompanied by the timestamp $2^64-1$; the maximum timestamp.
+Note that the writes performed by all these interactions --- except for the `pc` --- are accompanied by the timestamp $2^32-1$; the maximum timestamp.
 This prevents any other operation involving memory from being executed hereafter.
 The `pc` is consumed and re-emitted at the same timestamp to enable padding rows for the CPU.
 This means that the verifier will have to know the final timestamp at which a CPU padding `pc` was written

@@ -1,8 +1,9 @@
 name = "SHA256ROUND"
+code = "SHD"
 
 [[variables.input]]
 name = "timestamp"
-type = "DWordWL"
+type = "Word"
 desc = "The timestamp/identifier for this execution of the round function"
 pad = 0
 
@@ -127,18 +128,6 @@ desc = "`w[index]`"
 pad = 0
 
 [[variables.virtual]]
-name = "carry_a"
-type = "Byte"
-desc = "The carry from `out_a`"
-def = ["*", ["^", 2, -32], ["-", ["+", "temp1", "temp2"], ["cast", "out_a", "Word"]]]
-
-[[variables.virtual]]
-name = "carry_e"
-type = "Byte"
-desc = "The carry from `out_e`"
-def = ["*", ["^", 2, -32], ["-", ["+", "d", "temp1"], ["cast", "out_e", "Word"]]]
-
-[[variables.virtual]]
 name = "ch"
 type = "Word"
 desc = "ch value"
@@ -161,6 +150,18 @@ name = "temp2"
 type = "BaseField"
 desc = "`temp2` value"
 def = ["+", "S0", "maj"]
+
+[[variables.virtual]]
+name = "carry_a"
+type = "Byte"
+desc = "The carry from `out_a`"
+def = ["*", ["^", 2, -32], ["-", ["+", "temp1", "temp2"], ["cast", "out_a", "Word"]]]
+
+[[variables.virtual]]
+name = "carry_e"
+type = "Byte"
+desc = "The carry from `out_e`"
+def = ["*", ["^", 2, -32], ["-", ["+", "d", "temp1"], ["cast", "out_e", "Word"]]]
 
 [[variables.multiplicity]]
 name = "μ"

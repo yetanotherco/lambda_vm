@@ -30,3 +30,8 @@ Negative numbers (represented as 2s complement 64-bit numbers), are used for our
 / 93: `exit` (@halt)
 / -1: `SHA256` (@sha256)
 / -2: `KECCAK` (@keccak)
+/ -11: `ECSM`/`secp256k1` (@ecsm)
+/ -12: `ECSM`/`secp256r1` (@ecsm)
+/ -20: `FEXT_LOAD` (@fext)
+/ -21: `FEXT_FMA` (@fext)
+/ -22: `FEXT_ZERO` (@fext)

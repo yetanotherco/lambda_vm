@@ -133,9 +133,41 @@ desc = """\
        """
 
 [[variables.types]]
+label = "U256BL"
+subtypes = ["Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte"]
+desc = """\
+       Variable that can only assume values in the range $[0, 2^256)$. \\
+       Represented as an array of thirty-two `Byte` variables.\
+       """
+
+[[variables.types]]
+label = "U256HL"
+subtypes = ["Half", "Half", "Half", "Half", "Half", "Half", "Half", "Half", "Half", "Half", "Half", "Half", "Half", "Half", "Half", "Half"]
+desc = """\
+       Variable that can only assume values in the range $[0, 2^256)$. \\
+       Represented as an array of sixteen `Half` variables.\
+       """
+
+[[variables.types]]
+label = "U256WL"
+subtypes = ["Word", "Word", "Word", "Word", "Word", "Word", "Word", "Word"]
+desc = """\
+       Variable that can only assume values in the range $[0, 2^256)$. \\
+       Represented as an array of eight `Word` variables.\
+       """
+
+[[variables.types]]
+label = "U512BL"
+subtypes = ["Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte"]
+desc = """\
+       Variable that can only assume values in the range $[0, 2^512)$. \\
+       Represented as an array of sixty-four `Byte` variables.\
+       """
+
+[[variables.types]]
 label = "Timestamp"
-subtypes = ["DWordWL"]
-desc = "A preprocessed column holding timestamps as `DWordWL`. Row `i` of the column contains the value $2^2 dot (i + 1)$. Used in the CPU chip (@cpu), see there for more details about the magic number."
+subtypes = ["Word"]
+desc = "A preprocessed column holding timestamps as `Word`. Row `i` of the column contains the value $2^2 dot (i + 1)$. Used in the CPU chip (@cpu), see there for more details about the magic number."
 preprocessed = true
 
 [[variables.types]]

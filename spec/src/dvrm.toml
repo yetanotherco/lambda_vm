@@ -41,7 +41,7 @@ pad = 0
 name = "div_by_zero"
 type = "Bit"
 desc = "Whether $#`d`=0$."
-pad = 1
+pad = 0
 
 [[variables.auxiliary]]
 name = "overflow"

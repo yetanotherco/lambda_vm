@@ -1,8 +1,9 @@
 name = "SHA256MSGSCHED"
+code = "SHM"
 
 [[variables.input]]
 name = "timestamp"
-type = "DWordWL"
+type = "Word"
 desc = "The timestamp/identifier for this execution of the message schedule"
 pad = 0
 

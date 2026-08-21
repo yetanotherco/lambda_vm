@@ -1,8 +1,9 @@
 name = "SHA256"
+code = "SHA"
 
 [[variables.input]]
 name = "timestamp"
-type = "DWordWL"
+type = "Word"
 desc = "Timestamp at which the ECALL is invoked. Used as unique identifier for this invocation."
 pad = 0
 
@@ -53,11 +54,11 @@ pad = 0
 name = "memory"
 
 [[constraints.memory]]
-kind = "interaction"
-tag = "MEMW"
-input = [1, ["cast", ["*", 2, 11], "DWordWL"], ["arr", ["idx", ["cast", ["idx", "m_addr", 0], "DWordWL"], 0], ["idx", ["cast", ["idx", "m_addr", 0], "DWordWL"], 1], 0, 0, 0, 0, 0, 0], "timestamp", 1, 0, 0]
-output = ["arr", ["idx", ["cast", ["idx", "m_addr", 0], "DWordWL"], 0], ["idx", ["cast", ["idx", "m_addr", 0], "DWordWL"], 1], 0, 0, 0, 0, 0, 0]
-multiplicity = "μ"
+kind = "template"
+tag = "REG"
+input = [11, ["cast", ["idx", "m_addr", 0], "DWordWL"], "timestamp"]
+output = ["cast", ["idx", "m_addr", 0], "DWordWL"]
+cond = "μ"
 
 [[constraints.memory]]
 kind = "interaction"
@@ -100,11 +101,11 @@ iter = ["i", 0, 7]
 ref = "sha256:c:read_chunk"
 
 [[constraints.memory]]
-kind = "interaction"
-tag = "MEMW"
-input = [1, ["cast", ["*", 2, 10], "DWordWL"], ["arr", ["idx", ["cast", ["idx", "h_addr", 0], "DWordWL"], 0], ["idx", ["cast", ["idx", "h_addr", 0], "DWordWL"], 1], 0, 0, 0, 0, 0, 0], "timestamp", 1, 0, 0]
-output = ["arr", ["idx", ["cast", ["idx", "h_addr", 0], "DWordWL"], 0], ["idx", ["cast", ["idx", "h_addr", 0], "DWordWL"], 1], 0, 0, 0, 0, 0, 0]
-multiplicity = "μ"
+kind = "template"
+tag = "REG"
+input = [10, ["cast", ["idx", "h_addr", 0], "DWordWL"], "timestamp"]
+output = ["cast", ["idx", "h_addr", 0], "DWordWL"]
+cond = "μ"
 
 [[constraints.memory]]
 kind = "interaction"
@@ -135,7 +136,7 @@ input = [
       ["idx", "out", ["+", ["*", 8, "i"], 6]],
       ["idx", "out", ["+", ["*", 8, "i"], 5]],
       ["idx", "out", ["+", ["*", 8, "i"], 4]]],
-  ["+", "timestamp", ["cast", 1, "DWordWL"]],
+  ["+", "timestamp", 1],
   0, 0, 1
 ]
 output = ["arr",

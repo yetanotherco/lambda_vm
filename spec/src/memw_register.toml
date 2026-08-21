@@ -1,4 +1,5 @@
 name = "MEMW_R"
+code = "MWR"
 
 # Variables
 
@@ -10,7 +11,7 @@ pad = 0
 
 [[variables.input]]
 name = "timestamp"
-type = "DWordWL"
+type = "Word"
 desc = "timestamp at which the access takes place"
 pad = 0
 
@@ -27,16 +28,10 @@ desc = "value of this register at `old_timestamp`."
 pad = 0
 
 [[variables.auxiliary]]
-name = "old_timestamp_lo"
-type = "Word"
-desc = "the lower limb of `old_timestamp`"
-pad = 0
-
-[[variables.virtual]]
 name = "old_timestamp"
-type = "DWordWL"
-desc = "timestamp at which this register was last accessed"
-def = ["cast", ["arr", "old_timestamp_lo", ["idx", "timestamp", 1]], "DWordWL"]
+type = "Word"
+desc = "The timestamp at which this register was last accessed"
+pad = 0
 
 [[variables.virtual]]
 name = "μ_sum"
@@ -66,8 +61,7 @@ iter = ["i", 0, 1]
 ref = "regw:a:val"
 
 [[assumptions]]
-desc = "`IS_WORD[timestamp[i]]`"
-iter = ["i", 0, 1]
+desc = "`IS_WORD[timestamp]`"
 ref = "regw:a:timestamp"
 
 # Constraints
@@ -78,7 +72,7 @@ name = "diff"
 [[constraints.diff]]
 kind = "interaction"
 tag = "IS_HALF"
-input = [["-", ["idx", "timestamp", 0], ["idx", "old_timestamp", 0], 1]]
+input = [["-", "timestamp", "old_timestamp", 1]]
 multiplicity = "μ_sum"
 ref = "regw:c:diff"
 

@@ -1,4 +1,4 @@
-#import "/meta.typ": meta, common-formatting
+#import "/meta.typ": meta, common-formatting, highlights
 
 #context assert(target() == "bundle", message: "Please compile this file only with `--format bundle`")
 
@@ -19,11 +19,18 @@
 
 // HTML-specific stuff
 // TODO: improve
+#show pagebreak: none
 #show align: it => it.body
+#show pad: it => it.body
 #show grid: it => table(columns: it.columns, gutter: it.column-gutter, ..it.children.map(c => c.body))
 #show math.frac.where(style: "skewed"): it => math.frac(it.num, it.denom, style: "horizontal")
 #show math.equation: it => {
   show raw: r => r.text
+  it
+}
+#show selector.or(..highlights.keys().map(k => figure.where(kind: k))): it => {
+  show html.elem.where(tag: "figure"): add-attr("data-kind", "highlight")
+  show html.elem.where(tag: "figcaption"): add-attr("style", "background-color:" + highlights.at(it.kind).at(1).to-hex() + ";")
   it
 }
 // TODO: todo callouts (rj/et/cdsg)

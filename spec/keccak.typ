@@ -39,7 +39,7 @@ The chip therefore contributes the following interaction to the lookup-argument:
 #render_constraint_table(chip, config, groups: "output")
 
 The address containing the state to be permuted is passed in as argument `A0 = x10`.
-The following constraints describe that this address is read into `addr` (@keccak:c:read_addr), from which `state_ptr` --- the collection of pointers to all lanes of the state --- is derived (@keccak:c:state_ptr).
+The following constraints describe that this address is read into `state_ptr[0][0]` (@keccak:c:read_state_ptr), from which full `state_ptr` --- the collection of pointers to all lanes of the state --- is derived (@keccak:c:state_ptr); @keccak:c:range_state_ptr is included to satisfy @add:a:lhs respectively @add:a:sum.
 The state is then read into `input_state`, while the `output_state` is written back to the indicated address (@keccak:c:load_store_state).
 #render_constraint_table(chip, config, groups: "mem")
 
@@ -81,6 +81,8 @@ That is, $#`rho_offset[x][y]` = #`rnc[x][y]` + 16 dot #`rbc[x][y][0]` + 32 dot #
 
 The following constraints ensure that `theta` captures the state after applying the first subpermutation of the round-permutation: $theta$.
 Note here that `Cxz_left` and `Cxz_right` do have to be range-checked; it cannot be assumed that this implicitly follows from @keccak:c:Dxz combined with `rotated_Cxz`'s definition.
+Both here and in the constraints for `rho`, we can represent a halfword shift by a byte amount directly with
+an arithmetic constraint, avoiding the need for an interaction with `HWSL`.
 #render_constraint_table(round_chip, config, groups: "theta")
 
 Next, we constrain that `rho` captures the state after applying subpermutation $rho$.
@@ -100,7 +102,9 @@ Lastly, the round chip contributes the following interactions to the lookup:
 #render_constraint_table(round_chip, config, groups: "io")
 
 == Notes/potential optimizations
-- one does not have to repeat `addr` in `state_ptr`; this saves 4 columns and 4 `IS_HALF` checks.
+- one does not have to range check `state_ptr[0][0]` since it is read from memory.
+  Moreover, it could be represented as a `DWordWL`. 
+  All this would save 2 columns and 4 `IS_HALF` checks.
 - step $rho$ does not need to be applied to `state[0][0]`; its has a zero-shift. This saves 16 columns and 4 `HWSL` interactions.
 - when the output of `HWSL` are `Byte`s mapped as `Half`s, we find that out of every four output bytes, at least one is zero. 
   Since `rnc` is constant, @keccak:c:rho_rotation makes those zero-bytes show up in `rot_left` and `rot_right` at constant locations.
@@ -110,6 +114,8 @@ Lastly, the round chip contributes the following interactions to the lookup:
 - $#`rc[2]` = #`rc[4]` = #`rc[5]` = #`rc[6]` = 0$. As such, those elements need not be stored in `rc`, and need not be XORed into the state in the $iota$-step. This saves 8 columns and 4 `XOR_BYTE` interactions.
 - when executed in large volumnes, `KECCAK_RND` could benefit from having a three-way XOR lookup table. With this in place, the 80 interactions in @keccak:c:theta_cxz_start and @keccak:c:theta_cxz could be dropped.
   Likewise, 80 columns could be removed from the chip (a \~5% savings).
+- Since we don't need to strictly split `rho` into `Half`s for interactions with `HWSL`, we may be able to do a larger part of the round constant at once and reduce the need for `rbc`
+- At the cost of complicating the padding, the degree of the shift constraints in `theta` and `rho` can be reduced to 2, by omitting the dependency on the multiplicity.
 
 = Round constant lookup
 #let rc_chip = load_chip("src/keccak_rc.toml", config)

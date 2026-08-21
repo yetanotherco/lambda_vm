@@ -140,5 +140,5 @@ Lastly, this chip contributes the following to the lookup:
 #render_constraint_table(chip, config, groups:("output", ))
 
 = Padding
-To pad the #dvrm table, we use the following data, representing the unsigned division $frac(0, 0, style: "horizontal")$:
+To pad the #dvrm table, we use the following data:
 #render_chip_padding_table(chip, config)
