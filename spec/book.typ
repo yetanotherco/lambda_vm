@@ -13,6 +13,7 @@
         ("logup.typ", [`LogUp` argument], <logup>),
         ("memory.typ", [Memory argument], <memory>),
         ("streaming.typ", [Streaming prover], <streaming>),
+        ("verifier.typ", [Verification], <verification>)
     )),
     ("OVERVIEW", (
         ("variables.typ", [Variables], <vars>),

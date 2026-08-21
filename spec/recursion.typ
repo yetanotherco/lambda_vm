@@ -8,11 +8,14 @@
 #let fieldVM = raw("fieldVM")
 
 
-#let functionSpace = $PP$
-#let program = $bb(p)$
+#let functionSpace = $cal(F)$
+#let verifierSpace = $cal(V)$
+#let privateFunctionSpace = $hat(cal(F))$
+#let program = $f$
 #let inputSpace = $II$
 #let input = $bb(i)$
 #let instanceSpace = $XX$
+#let instanceCommitmentSpace = $CC$
 #let instance = $bb(x)$
 #let instance2 = $bb(y)$
 #let witnessSpace = $WW$
@@ -21,244 +24,439 @@
 #let proof = $bb(pi)$
 #let prove = $italic("p")$
 #let verify = $italic("v")$
-#let commit = $italic("c")$
+#let commit(x) = $overline(#x)$
+#let comm(x) = $commit(#x)$
 #let one = $bb(1)$
 #let zero = $bb(0)$
-#let function = $cal(F)$
+#let function = $bb(f)$
 #let relation = $cal(R)$
+#let iff = $arrow.double.l.r$
+#let implies = $arrow.double.r$
+#let prob = $PP$
 
 #show math.equation.where(block: false): box
 
 = Notation
+Let $BB := { zero, one }$ denote the boolean set and let 
+$functionSpace := {f: inputSpace times witnessSpace mapsto BB}$ denote 
+the set of functions mapping the (public) input space $inputSpace$ and (private) 
+witness space $witnessSpace$ to this set.
+We use $instanceSpace := functionSpace times inputSpace = {instance: witnessSpace mapsto BB}$ 
+to denote the set of functions with the public input "baked in"; 
+elements in this set are henceforth referred to as _function instances_, or simply _instances_.
+We then define $relation subset.eq instanceSpace$ 
+as the set of all _solvable instances_, 
+i.e., all instances $instance in instanceSpace$
+for which there exists a witness $witness in witnessSpace$ such that 
+$instance\(witness) = one$.
+Lastly, we introduce the commitment function $c: instanceSpace mapsto instanceCommitmentSpace$.
+To simplify notation, we use $commit(instance) = c(instance)$.
 
-Let $functionSpace := {function: inputSpace times witnessSpace mapsto BB}$ denote the set of functions mapping input-witness pairs $(input; witness) in inputSpace times witnessSpace$ to a boolean ${ zero, one } in BB$.
-Let relation $relation subset.eq functionSpace times inputSpace =: instanceSpace$ denote the set of all succesfully terminating program instances, i.e., all function-input instances $(program, input) in functionSpace times inputSpace$ for which there exists a witness $witness in witnessSpace$ such that $program\(input; witness) = one$.
+We now assume the existence of _proving system_ $(prove, verify)$ with 
+prover $prove: instanceSpace times witnessSpace mapsto proofSpace$ and 
+verifier $verify: instanceCommitmentSpace times proofSpace mapsto BB$ such that
+$
+forall (instance, witness) in relation times witnessSpace &: prob[verify\(commit(instance), prove\(instance; witness)) = one | instance(witness) = one] = 1 \
+forall instance in instanceSpace without relation,  forall proof in proofSpace &: prob[verify\(commit(instance), proof) = one] < epsilon
+$
+with $epsilon$ negligibly small and $proofSpace$ the proof space.
+That is: any valid proof for a solvable instance verifies successfully, 
+while the probability of any proof verifying an unsolvable instance is negligible.
 
-Let there furthermore exist _proving system_ $(prove, verify)$ with prover $prove in { function: instanceSpace times witnessSpace mapsto proofSpace }$ and verifier $verify in { function: instanceSpace times proofSpace mapsto BB}$ such that
-$
-forall (instance, witness) in relation times witnessSpace &: PP[verify\(instance, prove\(instance; witness)) = one | instance(witness) = one] = 1 \
-forall instance in instanceSpace without relation,  forall proof in proofSpace &: PP[verify\(instance, proof) = one] < epsilon
-$
-with $epsilon$ negligibly small.
-That is: any valid proof for a terminating program verifiers successfully, while the probability of any proof verifying a unsuccesfully-terminating program is negligible.
+Translating this to the purposes of this VM, a prover wishes to convince the verifier 
+that for some agreed upon program ($program in functionSpace$) and specified public input ($input in inputSpace$),
+they know a private input ($witness in witnessSpace$) such that the program terminates successfully 
+(i.e., $(program, input) in relation$).
+To this end, the prover uses $prove\((program, input); witness) = prove\(instance; witness)$ 
+to construct some proof $proof in proofSpace$ and sends this to the verifier.
+They then use $verify(comm(instance), proof)$ to check that the proof is valid, 
+convincing them of the prover's claim.
 
 = Proof recursion
-In our application, the prover wishes to convince the verifier that for some public program-input instance $instance = (program, input) in instanceSpace$ they know a private witness $witness in witnessSpace$ such that $program\(input; witness) = one$.
-To this end, the prover uses $prove\(program, input; witness) = prove\(instance; witness)$ to generate proof $proof$ and sends this to the verifier.
-They then use $verify(instance, proof)$ to check that the proof is valid, convincing them of the prover's claim.
-
-When we observe that $verify in functionSpace$, we can now let the prover compute $prove\(verify, instance; prove\(instance; witness)) = proof'$ and send this proof for the verifier to $verify((verify, instance), proof')$, proving that they _know a proof attesting that $instance$ is in the relation_.
-This concept, colloquially known as _proof recursion_, can be applied recursively.
-This is often beneficial for _succint_ proving systems where proof size (and verification time) typically shrinks as the level of recursion increases.
-The technique is mostly useful in settings where the extra time spent by the prover is outweighed by the time saved by the verifier(s), e.g., a computationally constrained verifier, or multiple verifiers.
-
-== Proof traceability
-Importantly, the final recursive proof should be _tied_ to both the original instance $instance$, as well as the entire stack of verifiers used along the way. 
-Without this, the final verifier cannot verify that the received proof attests to the original claim.
-We exemplify this in the following triple-nested example:
+Now observe that the verifier $verify$ is itself a function in 
+$verifierSpace := {hat(f): instanceSpace times proofSpace mapsto BB} subset.eq functionSpace$.
+This means that we can use $prove$ to prove that the verification of a proof $proof$ for a given instance $instance$ succeeds:
 $
-&prove\([verify, instance'']; prove\([verify, instance']; prove\([verify, instance]; prove\(instance; witness))) = proof'''\
-&verify(instance''', proof''') in BB
+  &prove\(verify(comm(instance), dot); proof) = proof', text("and")
+  &verify(comm(verify(comm(instance), dot)), proof') = one.
 $
-which requires $instance''' = [verify, instance''] = [verify, [verify, instance']] = [verify, [verify, [verify, instance]]]$: the original instance, as well as the full stack of verification functions used during recursion.
+This new proof $proof'$ thus attests to _the existence of a proof $proof$ that 
+satisfies the verifier on the given instance $instance$_.
 
-It is undesirable for the instance to grow as the level of recursion increases.
-To this end, one can construct the modified proving system $(prove', verify')$ such that
+This concept, colloquially known as _proof recursion_, can be applied repeatedly.
+The technique is specifically beneficial for _succint_ proving systems where proof size
+typically shrinks (and verification time therefore reduces) as the level of recursion increases.
+The technique is mostly useful in settings where the extra time spent by the prover
+is outweighed by the time saved by the verifier(s), 
+e.g., a computationally constrained verifier, or multiple verifiers.
+
+= Resolving growing instance complexity
+While recursive proving leads to a decrease in proof size, this is naively traded off
+against an increase in instance complexity.
+Looking at a depth-two recursive proof,
 $
-forall (instance, witness) in relation times witnessSpace &: PP[verify'\(commit\(instance), prove'\(commit\(instance); instance, witness)) = one | instance(witness) = one] = 1 \
-forall instance in instanceSpace without relation,  forall proof in proofSpace &: PP[verify'\(commit\(instance), proof) = one] < epsilon
+  &prove\(verify(comm(verify(comm(instance), dot)), dot); proof') = proof'', text("and")\
+  &verify(comm(verify(comm(verify(comm(instance), dot)), dot)), proof'') = one.
 $
-where $commit\(dot)$ denotes a constant-size cryptographic commitment of the provided value.
-Importantly, this allows the instance to be constant size.
-It does, however, trade instance size for computation time, as the verifier now has to (pre)compute the $n$th nested commitment to verify an $n$-deep recursion.
+we see that the verifier first the verifier first has to derive the commitment
+$comm(verify(comm(verify(comm(instance), dot)), dot))$
+from the given base instance $instance$ before verifying the proof.
+This increase in verifier computation is undesirable and should be avoided.
 
-#et(
-  "design a setup such that the validators does not have to track the entire verification stack, i.e., if a verifier accepts the top level proof for the instance, that must mean that the instance's program was either 1) itself, or 2) the guest (= base level). The tricky thing here is that you'd have to somehow bypass the validator code containing the hash-root of a commitment of itself (which you should not be able to do with cryptographic hash functions)"
-)
+A solution to this, is to leverage the following variation to the verification algorithm:
+$
+  verify': instanceCommitmentSpace^2 times {0, 1} times proofSpace: (c_0, c_1, b, proof) mapsto
+  cases(
+    verify(c_0, proof) &text("if") b=0,
+    verify(c_1(c_0, c_1, dot), proof) &text("if") b=1
+  )
+$
+where it is assumed that $comm(function(x_1, x_2, dot))$ can be easily
+constructed from $comm(function), comm(x_1)$, and $comm(x_2)$.
+By choosing $c_0 = commit(instance)$ and $c_1 = commit(verify')$, the prover can then prove
+the base case by selecting $b=0$, and set $b=1$ during further recursion.
+Then, when presented with depth-n proof $proof^((n))$ and base instance $instance$, 
+the verifier executes
+$
+  verify'(commit(instance), commit(verify'), 1, proof^((n)))
+  &= verify(verify'(commit(instance), commit(verify'), dot), proof^((n)))\
+  &= verify(verify(verify'(commit(instance), commit(verify'), dot dot), dot), proof^((n)))\
+  &= verify(verify(verify(dots.c(v(commit(instance), dot), dot), dots.c), dot), dot), proof^((n))).
+$
+In other words, we have constructed a verifier $verify'$ which can only verify 
+the desired base case, or a proof it produced itself.
+This means that with successful verification of the ultimate proof $proof^((n))$, 
+it is also guaranteed that $verify'$ must have been used at every step in the proof recursion.
+This solution moreover reduces the verifier overhead on parsing the instance to a minimum, 
+as both $comm(instance)$ and $comm(verify')$ can typically be precomputed.
 
-= Operation-specific verification
-#let scratch = $bb(s)$
+#aside([$comm(verify')$ absorption])[
+Note that $commit(verify')$ must be provided to $verify'$ as a _parameter_;
+absorbing it into $verify'$ would imply an object containing a cryptographic commitment of itself, 
+which is theoretically impossible.
+]
 
-To verify a proof, several checks of different types need to be performed.
-For the purposes of this discussion, we distinguish two types of checks: 
-those that rely primarily on binary arithmetic, and those relying on field arithmetic.
+#et("illustrate that there comes a termination point, i.e., a proof cannot prove itself.")
+#et("note shakiness of recursion")
 
-Emulating either type of arithmetic on a VM designed for the other, typically incurs significant performance overhead.
-Yet, recursive proving heavily relies on both types.
-With the aim of bypassing a performance penalty, we introduce a field arithmetic-oriented mini-VM (henceforth referred to as the _field-VM_),
-which will act as a _co-processor_ to the established specified binary arithmetic-oriented VM (henceforth referred to as _binary-VM_).
-Since both VMs are proven using the same proof system, a unified proof can be produced for the parallel execution of both VMs.
+= Split processing
+#let record = $bb(r)$
+In practice, we find that the set of operations utilized for verification differs vastly from
+those typically performed by guest programs.
+Specifically, verification primarily involves hashing and (extension) field arithmetic, 
+where especially the second is absent in typical guest programs.
 
-The introduction of this split requires the verification algorithm be split as well.
-In the process of verifying proofs of the current proof system (`DEEP-FRI` + `LogUp`), results of binary arithmetic are used to verify field arithmetical constraints --- e.g., field challenges extracted from binary hash outputs --- and vice-versa --- e.g., hashing merkle leafs containing field elements during FRI-query proof verification.
+Emulating field arithmetic on the a binary arithmetic-oriented VM, typically
+incurs significant computational overhead.
+With the aim of avoiding this performance penalty, we introduce a field 
+arithmetic-oriented mini-VM (henceforth referred to as the _field-VM_),
+which will act as a _co-processor_ to the established _binary-VM_.
+Since both VMs are proven using the same proof system, a unified proof can be 
+produced for the parallel execution of both VMs.
+
+The introduction of this split allows the verification algorithm to be split in two halves,
+with each VM performing the computations it is fastest at.
+The two halves cannot work independently, however.
+In the process of verifying proofs of the current proof system (`DEEP-FRI` + `LogUp`),
+results of binary arithmetic are used to verify field arithmetical constraints 
+--- e.g., field challenges extracted from binary hash outputs --- 
+and vice-versa --- e.g., hashing merkle leafs containing field elements during FRI-query proof verification.
 This implies that some form of communication between both VMs is required.
 
-This architecture solves this by introducing a prover-hinted _communication record_ accessible to both VMs.
-In practice, this record will primarily contain values being reinterpreted --- from $FF$ to $ZZ_(2^N)$ and vice-versa --- during verification.
-The two halves of the split verification algorithm should be designed to verify the record: for each value on the record, one of the VMs _verifies_ the value to be correct, while the other _assumes_ the value to be correct and resumes the verification algorithm under this assumption.
+This architecture enables the required communications by introducing a 
+prover-hinted _communication record_ $record$ accessible to both VMs.
+In practice, this record will primarily contain values being reinterpreted 
+--- from $FF$ to $ZZ_(2^64)$ and vice-versa --- during verification.
+The two halves of the split verification algorithm are adapted to leverage
+the record: for each value on the record, one of the VMs _verifies_ the value to be correct, 
+while the other _assumes_ its correctness and resumes verification under this assumption.
 
-To ensure this verification happens correctly, both verification algorithms must align on the interpretation of each value on the proof-record pair.
-To this end, the dimensions of the record must be determined at _algorithm design-time_ and parametrized in terms of the proof only.
-Then, both verification algorithm halves should be designed to agree on the interpretation of the proof and communication record, irrespective of the provided proof.
-
-Note that, as part of check correctness of a proof-of-split-verification, the verifier must now verify that the VMs were given 1) the same proof and communication record, and 2) a synchronized algorithm pair; otherwise the prover could cheat.
+To ensure correct verification, both verification-algorithm halves must align
+on the interpretation of each value on the proof-record pair.
+To this end, the dimensions of the record must be determined at _verification algorithm design-time_ 
+and parametrized in terms of the proof only.
+Then, both verification algorithm halves can be given the same logic to interpret the record, 
+effectively synchronizing their interpretation.
 
 #aside("Coupling")[
   As observed, both verification halves must be synchronized to correctly verify a proof.
   This implies that some coupling between both halves must exist.
-  This design utilizes little coupling in the VM design, instead forcing the guest programs to solve synchronization, as a result introducing the coupling there. 
+  This design utilizes little coupling in the VM design, instead forcing 
+  the guest programs to solve synchronization, as a result introducing the coupling there. 
   
-  This no-coupling VM design permits one of the two halves to transition to a different proof system (e.g., moving to Flock #footnote(link("https://eprint.iacr.org/2026/1329", "Flock: Fast Proving for Batch Boolean Computations. src: https://eprint.iacr.org/2026/1329")) to accelerate hash-verification) while incurring as little design overhead as possible.
+  This no-coupling VM design permits one of the two halves to transition to a 
+  different proof system (e.g., moving to Flock 
+  #footnote(link(
+    "https://eprint.iacr.org/2026/1329", 
+    "Flock: Fast Proving for Batch Boolean Computations. src: https://eprint.iacr.org/2026/1329"
+  )) 
+  to accelerate hash-verification) while incurring as little design overhead as possible.
 ]
 
-// #let bool = $#`B`$
-// #let field = $#`F`$
-// #let equal = $#`E`$
-// #let consistency = $#`C`$
+In theory, any division of tasks between the two VMs would work.
+Yet, it is expected that some division will be more performant than others.
+Below, we provide a division that, in theory, is expected to achieve solid performance:
 
+*Record $record$.*
+The record contains all challenges the prover derived using Fiat-Shamir.
 
-// - Let $verify_bool || verify_field  := verify$ denote the decomposed verifier.
-// $
-//   prove\([verify_bool || verify_field, instance]; [proof, scratch]) = proof'
-// $
-// $
-// v'(instance, proof) := verify([verify_bool || verify_field, instance], proof)
-// $
-// $
-//   verify\([verify_bool || verify_field, instance], proof')\
-//   // &=verify'\(instance, proof')\
-//   &=verify\([verify_bool, instance], proof') times verify\([verify_field, instance], proof')\
-// $
-// $
-//   &prove\([verify', [verify_bool || verify_field, instance]]; [proof', scratch'])\
-//   &=prove\([verify_bool || verify_field || verify_consistency, [verify, instance]]; proof')\
-//   // &=prove\([verify_bool\([verify, instance], dot) times verify_field\([verify, instance], dot); proof')\
-//   &=[
-//     prove\([verify_bool, [verify, instance]]; proof'),
-//     prove\([verify_field, [verify, instance]]; proof'),
-//     prove\([verify_consistency, [verify, instance]]; proof')
-//   ]\
-//   &= [proof'_bool, proof'_field]\
-//   &= proof''\
-//   &\ \
-//   &prove\([verify, [verify, instance]]; proof')\
-//   &=prove\([verify_bool || verify_field, [verify, instance]]; proof')\
-//   &=[
-//     prove\([verify_bool, [verify, instance]]; proof'),
-//     prove\([verify_field, [verify, instance]]; proof')
-//   ]\
-//   &= [proof'_bool, proof'_field]\
-//   &= proof''\
-//   &\ \
-//   &verify\([verify, [verify, instance]], proof'')\
-//   &=verify\([verify_bool || verify_field, [verify, instance]], [proof'_bool, proof'_field])\
-//   &=verify\([verify_bool, instance], proof'_bool) times verify\([verify_field, instance], proof'_field)\
-// $
-// ---
-// - $prove\((verify_bool, instance); proof) -> proof_bool$
-// - $prove\((verify_field, instance); proof) -> proof_field$
-// - $verify\(((verify_bool, instance),(verify_field, instance)), (proof_bool, proof_field)) $
-// ---
-// $
-// &verify'\((verify_bool, verify_field, instance), (proof_bool, proof_field)) \
-// &= verify((verify_bool, instance), proof_bool) times verify\((verify_field, instance), proof_field)
-// &\ \
-// &overline(prove)\((verify'_bool, verify'_field, (verify_bool, verify_field, instance)); (proof_bool, proof_field))\
-// &= (
-//   prove\((verify'_bool, (verify_bool, verify_field, instance)); (proof_bool, proof_field)),
-//   prove\((verify'_field, (verify_bool, verify_field, instance)); (proof_bool, proof_field))
-//   )\
-// &= (proof^1_bool, proof^1_field)
-// &\ \
-// &verify'\((verify'_bool, verify'_field, (verify_bool, verify_field, instance)), (proof'_bool, proof'_field))
-// $
-// - $prove\((verify'_field, (verify_bool, verify_field, instance)); (proof_bool, proof_field)) -> proof'_field$
-// - $verify'\((verify'_bool, verify'_field, (verify_bool, verify_field, instance)), (proof'_bool, proof'_field))$
-// ---
-// - $prove\((verify'_bool, (verify'_bool, verify'_field, (verify_bool, verify_field, instance))); (proof'_bool, proof'_field)) -> proof''_bool$
-// - $prove\((verify'_field, (verify'_bool, verify'_field, (verify_bool, verify_field, instance))); (proof'_bool, proof'_field)) -> proof''_field$
-// - $verify\((verify'_bool, verify'_field, (verify'_bool, verify'_field, (verify'_bool, verify'_field, (verify_bool, verify_field, instance)))), (proof''_bool, proof''_field))$
-// ---
-// - $prove\((verify_bool, ((verify_bool, instance),(verify_field, instance))); (proof_bool, proof_field)) -> proof_bool'$
-// - $prove\((verify_field, ((verify_bool, instance),(verify_field, instance))); (proof_bool, proof_field)) -> proof_field'$
-// - $verify\(((verify_bool, ((verify_bool, instance),(verify_field, instance))), (verify_field, ((verify_bool, instance),(verify_field, instance)))), (proof_0', proof_1'))$
+*Tasks for $verify'_b\(c_0, c_1, b, proof, record)$:*
++ assert that $b in {0, 1}$,
++ verify challenges on record $record$ according to Fiat-Shamir,
++ verify the various opening proofs;
+    - if $b=0$: 
+        verify binary-VM DECODE table (@decode) query opening against $c_0$
+    - if $b=1$:
+        verify binary-VM DECODE table (@decode) query opening against $c_(1,b)$ and
+        verify field-VM DECODE table (@field-decode) query opening against $c_(1,f)$
++ `COMMIT` to $c_0$ and $c_1$ (see @commit)
 
+*Tasks $verify'_f\(c_0, c_1, b, proof, record)$:*
++ verify LogUp openings sum to zero,
+    - if $b=1$, use $c_0$ and $c_1$ to complete the `COMMIT` balance.
++ verify `DEEP` evaluation
++ verify `FRI` folding
++ verify `FRI` output low degreeness check.
 
-// - typically, verification algorithms reinterpret data based on the field.
-// - expand proof to include prover-provided "scratch space", 
-// - commit to this "expanded proof"
-// - have both VMs use the same expanded proof to 
-//   - verify programs must be tuned such that all values in the scratch space are
-//     - checked by one of the two VMs and
-//     - leveraged by other VM to speed up verification.
-// - 
+*Prover.*
+The prover performs the following steps:
+$
+   proof &arrow.l prove(instance, witness)\
+   proof' &arrow.l prove(verify'_b || verify'_f, (commit(instance), [commit(verify'_b), commit(verify'_f)], 0, proof, record))\
+   proof^((n)) &arrow.l prove(verify'_b || verify'_f, (commit(instance), [commit(verify'_b), commit(verify'_f)], 1, proof^((n-1)), record))
+$
 
-// - specific verify programs.
+*Ultimate verification.*
+$verify'(commit(instance), [commit(verify'_b), commit(verify'_f)], 1, proof^((n-1))) =? one$
 
 
 
-= Theory applied
-Applying these observations and design requirements to this VM, we present the following design
-
-- separate field-VM (@field-VM) with its own `DECODE` table (@field-decode).
-
-== Split Verification Algorithm(s)
-
-=== Verification of guest program proof
-#let FRI = raw("FRI")
-#let DEEP = raw("DEEP")
-#let LogUp = raw("LogUp")
-#let challenges = $bb(C)$
-#let table_commitments = $cal(C)_cal(T)$
-#let logup_commitments = $cal(C)_cal(L)$
-#let DEEP_commitments = $cal(C)_cal(D)$
-#let DEEP_openings = $cal(O)_cal(D)$
-#let FRI_folding_commitments = $cal(C)_cal(F)$
-#let FRI_query_openings = $cal(O)_cal(F)$
-#let proof = $bb(pi)$
-#let expanded_proof = $proof^*$
-#let fs = $#`FiatShamir`$
-
-#grid(
-  columns: (1fr, auto),
-  column-gutter: 1em,
-  [
-    Proof contents:
-    - #table_commitments: the commitments to all AIR-tables, 
-    - #logup_commitments: the commitments to the #LogUp columns, 
-    - #DEEP_commitments: the #DEEP commitments, 
-    - #DEEP_openings: the #DEEP openings, 
-    - #FRI_folding_commitments: the #FRI folding commitments, and 
-    - #FRI_query_openings: the #FRI query openings.
-
-    On communcation record:
-    - all the challenges: lincomb, segment, DEEP coordinate, LogUp, folding & query
-
-    Native verification steps:
-    - binaryVM:
-      - [B] Derive lincomb challenges from table commitments + public input
-      - [B] Derive segment challenges from quotient commitments + table commitments + public input
-      - [B] Derive DEEP point from segment + quotient + table commitments + public input
-      - [B] Derive LogUp challenges from table commitments + public input
-      - [B] verify LogUp opening proofs
-      - [B] derive folding challenges from (everything before)
-      - [B] derive FRI-query challenges
-      - [B] verify query proofs
-    - fieldVM:
-      - [F] verify opened LogUp sums
-      - [F] verify low-degreeness of FRI output
-      - [F] verify query opening validity.
-      - [F] verify DEEP quotient/segmenting using DEEP-point
-  ],
-  figure(image("figures/DEEP-FRI_verification.svg", height: 90%))
-)
+// // #let bool = $#`B`$
+// // #let field = $#`F`$
+// // #let equal = $#`E`$
+// // #let consistency = $#`C`$
 
 
-== Verification of verification-proof
-TODO
+// // - Let $verify_bool || verify_field  := verify$ denote the decomposed verifier.
+// // $
+// //   prove\([verify_bool || verify_field, instance]; [proof, scratch]) = proof'
+// // $
+// // $
+// // v'(instance, proof) := verify([verify_bool || verify_field, instance], proof)
+// // $
+// // $
+// //   verify\([verify_bool || verify_field, instance], proof')\
+// //   // &=verify'\(instance, proof')\
+// //   &=verify\([verify_bool, instance], proof') times verify\([verify_field, instance], proof')\
+// // $
+// // $
+// //   &prove\([verify', [verify_bool || verify_field, instance]]; [proof', scratch'])\
+// //   &=prove\([verify_bool || verify_field || verify_consistency, [verify, instance]]; proof')\
+// //   // &=prove\([verify_bool\([verify, instance], dot) times verify_field\([verify, instance], dot); proof')\
+// //   &=[
+// //     prove\([verify_bool, [verify, instance]]; proof'),
+// //     prove\([verify_field, [verify, instance]]; proof'),
+// //     prove\([verify_consistency, [verify, instance]]; proof')
+// //   ]\
+// //   &= [proof'_bool, proof'_field]\
+// //   &= proof''\
+// //   &\ \
+// //   &prove\([verify, [verify, instance]]; proof')\
+// //   &=prove\([verify_bool || verify_field, [verify, instance]]; proof')\
+// //   &=[
+// //     prove\([verify_bool, [verify, instance]]; proof'),
+// //     prove\([verify_field, [verify, instance]]; proof')
+// //   ]\
+// //   &= [proof'_bool, proof'_field]\
+// //   &= proof''\
+// //   &\ \
+// //   &verify\([verify, [verify, instance]], proof'')\
+// //   &=verify\([verify_bool || verify_field, [verify, instance]], [proof'_bool, proof'_field])\
+// //   &=verify\([verify_bool, instance], proof'_bool) times verify\([verify_field, instance], proof'_field)\
+// // $
+// // ---
+// // - $prove\((verify_bool, instance); proof) -> proof_bool$
+// // - $prove\((verify_field, instance); proof) -> proof_field$
+// // - $verify\(((verify_bool, instance),(verify_field, instance)), (proof_bool, proof_field)) $
+// // ---
+// // $
+// // &verify'\((verify_bool, verify_field, instance), (proof_bool, proof_field)) \
+// // &= verify((verify_bool, instance), proof_bool) times verify\((verify_field, instance), proof_field)
+// // &\ \
+// // &overline(prove)\((verify'_bool, verify'_field, (verify_bool, verify_field, instance)); (proof_bool, proof_field))\
+// // &= (
+// //   prove\((verify'_bool, (verify_bool, verify_field, instance)); (proof_bool, proof_field)),
+// //   prove\((verify'_field, (verify_bool, verify_field, instance)); (proof_bool, proof_field))
+// //   )\
+// // &= (proof^1_bool, proof^1_field)
+// // &\ \
+// // &verify'\((verify'_bool, verify'_field, (verify_bool, verify_field, instance)), (proof'_bool, proof'_field))
+// // $
+// // - $prove\((verify'_field, (verify_bool, verify_field, instance)); (proof_bool, proof_field)) -> proof'_field$
+// // - $verify'\((verify'_bool, verify'_field, (verify_bool, verify_field, instance)), (proof'_bool, proof'_field))$
+// // ---
+// // - $prove\((verify'_bool, (verify'_bool, verify'_field, (verify_bool, verify_field, instance))); (proof'_bool, proof'_field)) -> proof''_bool$
+// // - $prove\((verify'_field, (verify'_bool, verify'_field, (verify_bool, verify_field, instance))); (proof'_bool, proof'_field)) -> proof''_field$
+// // - $verify\((verify'_bool, verify'_field, (verify'_bool, verify'_field, (verify'_bool, verify'_field, (verify_bool, verify_field, instance)))), (proof''_bool, proof''_field))$
+// // ---
+// // - $prove\((verify_bool, ((verify_bool, instance),(verify_field, instance))); (proof_bool, proof_field)) -> proof_bool'$
+// // - $prove\((verify_field, ((verify_bool, instance),(verify_field, instance))); (proof_bool, proof_field)) -> proof_field'$
+// // - $verify\(((verify_bool, ((verify_bool, instance),(verify_field, instance))), (verify_field, ((verify_bool, instance),(verify_field, instance)))), (proof_0', proof_1'))$
+
+
+// // - typically, verification algorithms reinterpret data based on the field.
+// // - expand proof to include prover-provided "scratch space", 
+// // - commit to this "expanded proof"
+// // - have both VMs use the same expanded proof to 
+// //   - verify programs must be tuned such that all values in the scratch space are
+// //     - checked by one of the two VMs and
+// //     - leveraged by other VM to speed up verification.
+// // - 
+
+// // - specific verify programs.
+
+
+
+// = Theory applied
+// Applying these observations and design requirements to this VM, we present the following design
+
+// - separate field-VM (@field-VM) with its own `DECODE` table (@field-decode).
+
+// == Split Verification Algorithm(s)
+
+// === Verification of guest program proof
+// #let FRI = raw("FRI")
+// #let DEEP = raw("DEEP")
+// #let LogUp = raw("LogUp")
+// #let challenges = $bb(C)$
+// #let guestProgramCommitment = $cal(C)_cal(G)$
+// #let tableCommitments = $cal(C)_cal(T)$
+// #let logupCommitments = $cal(C)_cal(L)$
+// #let logupOpenings = $cal(O)_cal(L)$
+// #let quotientCommitments = $cal(C)_cal(Q)$
+// #let deepCommitments = $cal(C)_cal(D)$
+// #let deepOpenings = $cal(O)_cal(D)$
+// #let friFoldingCommitments = $cal(C)_cal(F)$
+// #let friQueryOpenings = $cal(O)_cal(F)$
+// #let proof = $bb(pi)$
+// #let expanded_proof = $proof^*$
+// #let fs = $#`FiatShamir`$
+
+// #grid(
+//   columns: (1fr, auto),
+//   column-gutter: 1em,
+//   [
+//     Proof contents:
+//     - #tableCommitments: the commitments to all AIR-tables, 
+//     - #logupCommitments: the #LogUp commitments, 
+//     - #logupOpenings: the #LogUp openings, 
+//     - #deepCommitments: the #DEEP commitments, 
+//     - #deepOpenings: the #DEEP openings, 
+//     - #friFoldingCommitments: the #FRI folding commitments, and 
+//     - #friQueryOpenings: the #FRI query openings.
+
+//     *Native verification*:
+
+//     input:
+//         - proof
+//         - public commitment (i.e., program + public input)
+//     verification steps:
+//       - derive lincomb challenges
+//       - derive segment challenges
+//       - derive DEEP point
+//       - derive LogUp challenges
+//       - verify LogUp opening proofs
+//       - verify LogUp openings sum to zero,
+//       - derive folding challenges
+//       - verify low-degreeness of FRI output,
+//       - derive FRI-query challenges,
+//       - verify FRI-query proofs,
+//       - verify folding was done correctly,
+//       - verify DEEP quotient/segmenting using DEEP-point.
+
+//     *Split verification steps*:
+//     - communcation record:
+//         - all the challenges: lincomb, segment, DEEP point, LogUp, folding & query
+//     - binaryVM: verify
+//       - recorded lincomb challenges,
+//       - recorded segment challenges,
+//       - recorded DEEP point,
+//       - recorded LogUp challenges,
+//       - LogUp opening proofs,
+//       - recorded folding challenges,
+//       - recorded FRI-query challenges, and
+//       - FRI-query proofs.
+//     - fieldVM: verify
+//       - LogUp openings sum to zero,
+//       - low-degreeness of FRI output,
+//       - query opening are valid,
+//       - DEEP quotient/segmenting using DEEP-point.
+
+//   ],
+//   figure(image("figures/DEEP-FRI_verification.svg", height: 90%))
+// )
+
+// == Transformation
+// - COMMIT to any public input
+//     -> this forces the verifier in the next-layer to include it in verifying this proof.
+// - use 
+
+// == Verification of verification-proof
+// *Native verification steps*:
+// - public input:
+//     - commitment of guest program + public parameters
+// - private input:
+//     - guest program + public parameters
+//     - proof that guest program in R
+// - steps:
+//     - commit to guest program: COMMIT to commitment.
+//     - _all of the above_, where
+//         - openings of guest program table are verified against that commitment
+
+
+
+// #let get = $arrow.l$
+// #let FS = $#`FiatShamir`$
+
+// == Verify base
+// Input:
+// - instance:
+//     - #guestProgramCommitment: commitment to guest program.
+// - proof:
+//     - #tableCommitments: commitments to all AIR-tables, 
+//     - #logupCommitments: #LogUp commitments, 
+//     - #logupOpenings: #LogUp openings, 
+//     - #quotientCommitments: quotient commitments, 
+//     - #deepCommitments: #DEEP commitments, 
+//     - #deepOpenings: #DEEP openings, 
+//     - #friFoldingCommitments: #FRI folding commitments, and 
+//     - #friQueryOpenings: #FRI query openings.
+
+// Steps:
+// + derive linear combination challenges,
+// + derive segment challenges,
+// + derive DEEP point,
+// + derive LogUp challenges,
+// + verify LogUp opening proofs,
+// + verify LogUp openings sum to zero,
+// + derive folding challenges,
+// + verify low-degreeness of FRI output,
+// + derive FRI-query challenges,
+// + verify FRI-query proofs,
+// + verify folding was done correctly,
+// + verify DEEP quotient/segmenting using DEEP-point.
+
+
+// - what needs to be done to verify a base proof, (see verification)
+// - what extra needs to be done to do this usiing the split verifier,
+// - what extra needs to be done to _prove_ this verification.
+
+// - what needs to be done to verify a recursive proof,
+// - what extra needs to be done to do this using the split verifier,
+// - what extra needs to be done to _prove_ this verification.
 
 // = L0 proof
-// Let $proof\(g,x) := (#table_commitments, #DEEP_commitments, #DEEP_openings, #FRI_folding_commitments, #FRI_query_openings)$ denote a proof produced by the prover for program $g$ on public input $x$, with 
+// Let $proof\(g,x) := (#tableCommitments, #DEEP_commitments, #DEEP_openings, #FRI_folding_commitments, #FRI_query_openings)$ denote a proof produced by the prover for program $g$ on public input $x$, with 
 // - #table_commitments the commitments to all AIR-tables, 
 // - #DEEP_commitments the #DEEP commitments, 
 // - #DEEP_openings the #DEEP openings, 
