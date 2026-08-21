@@ -1616,7 +1616,7 @@ fn batched_shape_of(e: &RealBatchedEpoch) -> super::batched_epoch::BatchedEpochS
 /// The batched epoch's spine program — statement, prep provenance, the
 /// attestation join, the ONE-transcript batched challenge replay, and the
 /// LogUp closure. The batched sibling of [`epoch_program`]'s spine half.
-fn batched_epoch_program(e: &RealBatchedEpoch) -> LfmProgram {
+pub(super) fn batched_epoch_program(e: &RealBatchedEpoch) -> LfmProgram {
     batched_epoch_program_with(e, false, false)
 }
 
@@ -1711,7 +1711,7 @@ fn hint_digests(
 /// the shared index instead of the high ones is self-consistent host-side,
 /// and here it must make an honest proof's walk UNPROVABLE, because the
 /// spine's roots were computed over the other convention.
-fn batched_epoch_program_with(
+pub(super) fn batched_epoch_program_with(
     e: &RealBatchedEpoch,
     with_openings: bool,
     wrong_reduction: bool,
@@ -2356,7 +2356,7 @@ fn batched_epoch_program_with(
 
 /// The arenas [`batched_epoch_program`] declares, in the same order, filled
 /// from the harness's proof.
-fn batched_epoch_arenas(e: &RealBatchedEpoch) -> Vec<Vec<LfmWord>> {
+pub(super) fn batched_epoch_arenas(e: &RealBatchedEpoch) -> Vec<Vec<LfmWord>> {
     let mut stmt: Vec<FE> = Vec::new();
     let halves = |bytes: &[u8]| -> Vec<FE> {
         bytes
