@@ -411,13 +411,21 @@ figure[data-kind="highlight"] figcaption {
 }
 
 /* theorem boxes */
-figure[data-kind="lemma"], figure[data-kind="corollary"] {
+figure:is([data-kind="lemma"], [data-kind="corollary"]) {
   border-radius: var(--radius);
   overflow-x: auto;
   overflow-y: clip;
   margin: 1em 0;
-  padding: 0 1em 1em;
+  padding: 1em;
   background-color: var(--bg-subtle);
+}
+
+figure:is([data-kind="lemma"], [data-kind="corollary"]) p:first-child {
+  margin-top: 0;
+}
+
+figure:is([data-kind="lemma"], [data-kind="corollary"]) p:last-child {
+  margin-bottom: 0;
 }
 
 figure[data-kind="proof"] math:has(.qed) {
