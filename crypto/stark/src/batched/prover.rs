@@ -60,7 +60,7 @@
 //! numbers above unreproducible. Under `--features cuda` this path compiles and
 //! runs on the host.
 
-use math::fft::bit_reversing::in_place_bit_reverse_permute;
+use math::fft::bit_reversing::in_place_bit_reverse_permute_row_major;
 use math::field::element::FieldElement;
 use math::field::traits::{IsFFTField, IsField, IsSubFieldOf};
 use math::traits::AsBytes;
@@ -595,7 +595,9 @@ where
                         ledger,
                         residency,
                     );
-                    in_place_bit_reverse_permute(&mut deep);
+                    // Row-major variant at one column = the parallel path; the
+                    // serial swap loop was pure wall time, 27 times per epoch.
+                    in_place_bit_reverse_permute_row_major(&mut deep, 1);
 
                     if plan.batched.contains(&table) {
                         combiner.absorb(&deep, shape.heights[table]);

@@ -402,6 +402,13 @@ fn residency_mode_does_not_move_any_batched_root() {
         retained.fri_final_poly_coeffs,
         recomputed.fri_final_poly_coeffs
     );
+    // The NONCE is deliberately not compared: under `parallel` the grinding
+    // search races and any valid nonce may win, so it is nondeterministic
+    // between runs of the SAME mode — the per-table residency oracle excludes
+    // it for the same reason ("everything the grinding nonce cannot reach").
+    // The transcript state the nonce grinds on IS compared, via every root
+    // and coefficient above.
+    #[cfg(not(feature = "parallel"))]
     assert_eq!(retained.nonce, recomputed.nonce);
 }
 

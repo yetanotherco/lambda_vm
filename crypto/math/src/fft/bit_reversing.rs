@@ -40,10 +40,7 @@ pub fn reverse_index(i: usize, size: u64) -> usize {
 /// `debug_assert!`): a non-power-of-two `n` would break the disjointness the
 /// parallel path relies on, turning a bad caller's input into a data race.
 #[cfg(feature = "alloc")]
-pub(crate) fn in_place_bit_reverse_permute_row_major<E: Send + Sync>(
-    buf: &mut [E],
-    num_cols: usize,
-) {
+pub fn in_place_bit_reverse_permute_row_major<E: Send + Sync>(buf: &mut [E], num_cols: usize) {
     if num_cols == 0 || buf.is_empty() {
         return;
     }

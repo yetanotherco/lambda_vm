@@ -23,6 +23,8 @@ use crypto::merkle_tree::merkle::MerkleTree;
 use math::field::element::FieldElement;
 use math::field::traits::{IsFFTField, IsField, IsSubFieldOf};
 use math::traits::AsBytes;
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 
 use crate::config::StarkHash;
 use crate::fri::fri_commitment::FriLayer;
@@ -72,6 +74,29 @@ impl<E: IsField> HeightCombiner<E> {
             self.buckets.resize_with(height + 1, || None);
         }
         let scaled = &self.next_power;
+        // Data-parallel under `parallel`: the scale and the scale-accumulate
+        // are elementwise over up to 2^h_max elements, and this loop has no
+        // per-table overlap to hide behind — it was serial wall time once per
+        // absorbed table. Same arithmetic in both arms, identical result.
+        #[cfg(feature = "parallel")]
+        match &mut self.buckets[height] {
+            None => {
+                self.buckets[height] = Some(
+                    codeword
+                        .par_iter()
+                        .map(|x| scaled * x)
+                        .collect::<Vec<FieldElement<E>>>(),
+                );
+            }
+            Some(acc) => {
+                acc.par_iter_mut()
+                    .zip(codeword.par_iter())
+                    .for_each(|(a, x)| {
+                        *a = &*a + &(scaled * x);
+                    });
+            }
+        }
+        #[cfg(not(feature = "parallel"))]
         match &mut self.buckets[height] {
             None => {
                 self.buckets[height] = Some(codeword.iter().map(|x| scaled * x).collect());
