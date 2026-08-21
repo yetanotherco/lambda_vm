@@ -2203,8 +2203,9 @@ pub trait IsStarkProver<
         let security_bits = air.context().proof_options.grinding_factor;
         let mut nonce = None;
         if security_bits > 0 {
-            let nonce_value = grinding::generate_nonce(&transcript.state(), security_bits)
-                .expect("nonce not found");
+            let nonce_value =
+                grinding::generate_nonce_maybe_gpu(&transcript.state(), security_bits)
+                    .expect("nonce not found");
             transcript.append_bytes(&nonce_value.to_be_bytes());
             nonce = Some(nonce_value);
         }
