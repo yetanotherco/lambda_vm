@@ -389,6 +389,7 @@ figure[data-kind="highlight"] {
   border: var(--aside-border-size) solid var(--aside-border);
   border-radius: var(--radius);
   overflow-x: auto;
+  overflow-y: clip;
   padding: 0 1em 1em;
 }
 
@@ -407,6 +408,24 @@ figure[data-kind="highlight"] figcaption {
   font-weight: 600;
   display: block;
   text-align: center;
+}
+
+/* theorem boxes */
+figure[data-kind="lemma"], figure[data-kind="corollary"] {
+  border-radius: var(--radius);
+  overflow-x: auto;
+  overflow-y: clip;
+  margin: 1em 0;
+  padding: 0 1em 1em;
+  background-color: var(--bg-subtle);
+}
+
+figure[data-kind="proof"] math:has(.qed) {
+  float: right;
+}
+
+figure[data-kind="proof"] math:has(.qed)::before {
+  content: "∎"
 }
 
 /* footnotes */
@@ -465,6 +484,7 @@ pre {
   border-radius: var(--radius);
   padding: 12px 16px;
   overflow-x: auto;
+  overflow-y: clip;
 }
 
 pre code {
@@ -475,9 +495,9 @@ pre code {
 
 /* tables */
 figure {
-    margin: 1em 0.3em;
-    overflow-x: auto;
-    overflow-y: clip;
+  margin: 1em 0.3em;
+  overflow-x: auto;
+  overflow-y: clip;
 }
 
 table {
@@ -522,6 +542,7 @@ math[display="block"] {
   font-size: 1.12em;
   margin: 1.2em 0;
   overflow-x: auto;
+  overflow-y: clip;
 }
 
 mtext {

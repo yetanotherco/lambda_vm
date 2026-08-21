@@ -112,12 +112,16 @@
     )
     block(inset: (left: 1em, right: 1em, bottom: 1em), stroke: rgb("#d7d5cd"), breakable: false, align(left, it))
   }
-  show: thmrules.with(qed-symbol: $square$)
+  show: it => context if target() == "paged" {
+    thmrules.with(qed-symbol: $square$)(it)
+  } else {
+    // Don't apply full thmrules, so we can do the html styling ourselves in bundle.typ
+    it
+  }
   body
 }
 
 // Theorem/lemma formatting
-// TODO: Web override
 #let lemma = thmbox("lemma", "Lemma", fill: rgb("#f2f1ed"), base_level: 0)
 #let corollary = thmbox("lemma", "Corollary", fill: rgb("#f2f1ed"), base_level: 0)
 #let proof = thmproof("proof", "Proof")

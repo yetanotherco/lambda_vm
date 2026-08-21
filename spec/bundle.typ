@@ -21,7 +21,6 @@
 // TODO: improve
 #show pagebreak: none
 #show align: it => it.body
-#show pad: it => it.body
 #show grid: it => table(columns: it.columns, gutter: it.column-gutter, ..it.children.map(c => c.body))
 #show math.frac.where(style: "skewed"): it => math.frac(it.num, it.denom, style: "horizontal")
 #show math.equation: it => {
@@ -32,6 +31,14 @@
   show html.elem.where(tag: "figure"): add-attr("data-kind", "highlight")
   show html.elem.where(tag: "figcaption"): add-attr("style", "background-color:" + highlights.at(it.kind).at(1).to-hex() + ";color:" + highlights.at(it.kind).at(2).to-hex() + ";")
   it
+}
+#show figure.where(kind: "thmenv"): fig => {
+  show html.elem.where(tag: "figure"): add-attr("data-kind", lower(repr(fig.supplement).slice(1, -1)))
+  show pad: it => it.body
+  show h: none
+  show figure.caption: none
+  show "∎": html.elem("mrow", attrs: ("class": "qed"), "")
+  fig
 }
 // TODO: todo callouts (rj/et/cdsg)
 // TODO: table divider lines (vline/hline)

@@ -1,12 +1,5 @@
-#import "@preview/ctheorems:1.1.3": *
+#import "meta.typ": lemma, corollary, proof
 #import "equate-lite.typ": equate
-
-
-// Theorem/lemma formatting
-#show: thmrules.with(qed-symbol: $square$)
-#let lemma = thmbox("lemma", "Lemma", fill: rgb("#f2f1ed"), base_level: 0)
-#let corollary = thmbox("lemma", "Corollary", fill: rgb("#f2f1ed"), base_level: 0)
-#let proof = thmproof("proof", "Proof")
 
 // Equation formatting
 #show: equate.with(breakable: true, sub-numbering: true, number-mode: "label")
