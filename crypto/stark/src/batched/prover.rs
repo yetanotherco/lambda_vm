@@ -195,6 +195,7 @@ where
     // =====================================================================
     // Phase 1 — the preprocessed and main rounds, one main LDE pass per table
     // =====================================================================
+    let t_phase = std::time::Instant::now();
     // Both builders are fed from the SAME expansion: a preprocessed table's
     // precomputed columns and its multiplicity columns are two column ranges of
     // one row-major main LDE, exactly as `commit_main_trace` splits them.
@@ -285,6 +286,8 @@ where
     // =====================================================================
     // Phase 2 — LogUp challenges, then the auxiliary round
     // =====================================================================
+    stats.phase_wall[0] = t_phase.elapsed();
+    let t_phase = std::time::Instant::now();
     let needs_lookup = airs.iter().any(|air| air.has_aux_trace());
     let lookup_challenges: Vec<FieldElement<FieldExtension>> = if needs_lookup {
         (0..LOGUP_NUM_CHALLENGES)
@@ -354,6 +357,8 @@ where
     // =====================================================================
     // Phase 3 — bus contributions, beta per table, the composition-parts round
     // =====================================================================
+    stats.phase_wall[1] = t_phase.elapsed();
+    let t_phase = std::time::Instant::now();
     for bpi in bus_public_inputs.iter().flatten() {
         transcript.append_field_element(&bpi.table_contribution);
     }
@@ -446,6 +451,8 @@ where
     // =====================================================================
     // Phase 4 — z per table, OOD evaluations
     // =====================================================================
+    stats.phase_wall[2] = t_phase.elapsed();
+    let t_phase = std::time::Instant::now();
     let mut zs = Vec::with_capacity(num_tables);
     let mut round3s = Vec::with_capacity(num_tables);
     let mut ood_blocks = Vec::with_capacity(num_tables);
@@ -515,6 +522,8 @@ where
     // =====================================================================
     // Phase 5 — gamma per table, then ONE batched FRI
     // =====================================================================
+    stats.phase_wall[3] = t_phase.elapsed();
+    let t_phase = std::time::Instant::now();
     let gammas: Vec<FieldElement<FieldExtension>> = (0..num_tables)
         .map(|_| transcript.sample_field_element())
         .collect();
@@ -609,6 +618,8 @@ where
     // =====================================================================
     // Phase 6 — openings, one table at a time
     // =====================================================================
+    stats.phase_wall[4] = t_phase.elapsed();
+    let t_phase = std::time::Instant::now();
     let iotas = commit.iotas.clone();
     let fri_decommitments = crate::fri::query_phase::<FieldExtension, H>(&commit.layers, &iotas);
 
@@ -736,6 +747,7 @@ where
         })
         .collect();
 
+    stats.phase_wall[5] = t_phase.elapsed();
     stats.peak_trace_lde_bytes = ledger.peak();
     stats.retained_parts_bytes = parts_ledger.peak();
     stats.peak_lde_bytes = stats.peak_trace_lde_bytes + stats.retained_parts_bytes;
@@ -884,6 +896,7 @@ where
     let main = match retained_main[table].take() {
         Some(lde) => lde,
         None => {
+            let t_expand = std::time::Instant::now();
             let lde = P::expand_main_lde_row_major(
                 trace,
                 &domains[table],
@@ -891,6 +904,7 @@ where
                 #[cfg(feature = "disk-spill")]
                 storage_mode,
             );
+            stats.lde_expansion_wall += t_expand.elapsed();
             stats.main_lde_expansions += 1;
             let b = lde_bytes::<Field>(lde.0.len());
             ledger.alloc(b);
@@ -903,6 +917,7 @@ where
         match retained_aux[table].take() {
             Some(lde) => lde,
             None => {
+                let t_expand = std::time::Instant::now();
                 let lde = P::expand_aux_lde_row_major(
                     trace,
                     &domains[table],
@@ -910,6 +925,7 @@ where
                     #[cfg(feature = "disk-spill")]
                     storage_mode,
                 );
+                stats.lde_expansion_wall += t_expand.elapsed();
                 stats.aux_lde_expansions += 1;
                 let b = lde_bytes::<FieldExtension>(lde.0.len());
                 ledger.alloc(b);

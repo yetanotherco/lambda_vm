@@ -139,6 +139,18 @@ pub struct BatchedProveStats {
     /// retains them instead; this counter exists to make that visible if it ever
     /// stops being true.
     pub parts_computations: usize,
+    /// Wall clock per phase, indices 0..6 = phases 1..6 (main commit, aux
+    /// commit, composition parts, OOD, DEEP+FRI, openings). A latency
+    /// breakdown of the whole prove: the six entries plus the pre-phase
+    /// setup sum to the call's wall time. Returned in the stats — not logged —
+    /// for the same reason the residency numbers are: the A/B harness prints
+    /// the struct, so every box run carries its own phase profile.
+    pub phase_wall: [core::time::Duration; 6],
+    /// Wall clock spent inside LDE expansions (main and aux, all phases) —
+    /// the recompute traffic itself, separated from what the phases do with
+    /// the buffers. Under `RecomputeLde` this is the price of the residency
+    /// mode; under `Retain` it is the floor (one main + one aux per table).
+    pub lde_expansion_wall: core::time::Duration,
 }
 
 /// Running account of live LDE bytes, so [`BatchedProveStats`] reports what the
