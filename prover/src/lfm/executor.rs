@@ -347,7 +347,11 @@ pub fn execute(
                     out_r: or,
                 });
             }
-            Instr::BitDec { input, bits } => {
+            Instr::BitDec {
+                input,
+                bits,
+                halves,
+            } => {
                 let v = m.read_base(*input)?;
                 let canon = GoldilocksField::canonical(v.value());
                 let bit_vals: [FE; 64] = core::array::from_fn(|i| FE::from((canon >> i) & 1));
@@ -365,6 +369,13 @@ pub fn execute(
                 };
                 for (i, (addr, _)) in bits.iter().enumerate() {
                     m.write(*addr, base_word(bit_vals[i]))?;
+                }
+                if let Some([h0, h1]) = halves {
+                    // Half 0 is the HIGH word: it leads in big-endian order.
+                    let hi = (canon >> 32) as u32;
+                    let lo = (canon & 0xFFFF_FFFF) as u32;
+                    m.write(h0.0, base_word(FE::from(hi.swap_bytes() as u64)))?;
+                    m.write(h1.0, base_word(FE::from(lo.swap_bytes() as u64)))?;
                 }
                 records.bitdec.push(BitDecRow {
                     bits: bit_vals,

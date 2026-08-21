@@ -415,6 +415,33 @@ pub mod bitdec {
                 base_token(cols::bit_addr(i), cols::BITS0 + i),
             ));
         }
+        // The two BIG-ENDIAN halves, as linear forms over the SAME bit
+        // columns booleanity and canonicity already pin: bit `8k + j` of
+        // half-word `h` (h = 0 is the value's HIGH word — it leads in
+        // big-endian order) lands at byte `3 − k`, so its weight is
+        // `2^(j + 8(3 − k))`. No value column, no constraint: the senders
+        // are functions of already-constrained columns.
+        for (h, first) in [(0usize, 32usize), (1, 0)] {
+            let half = BusValue::Linear(
+                (0..4)
+                    .flat_map(|k| (0..8).map(move |j| (k, j)))
+                    .map(|(k, j)| LinearTerm::ColumnUnsigned {
+                        coefficient: 1u64 << (j + 8 * (3 - k)),
+                        column: cols::BITS0 + first + 8 * k + j,
+                    })
+                    .collect(),
+            );
+            let (addr, mult) = if h == 0 {
+                (cols::HALF0_ADDR, cols::HALF0_MULT)
+            } else {
+                (cols::HALF1_ADDR, cols::HALF1_MULT)
+            };
+            interactions.push(BusInteraction::sender(
+                BusId::LfmMem,
+                Multiplicity::Column(mult),
+                vec![direct(addr), half, zero(), zero(), zero()],
+            ));
+        }
         interactions
     }
 

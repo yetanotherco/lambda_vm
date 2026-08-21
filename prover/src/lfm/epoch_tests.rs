@@ -3909,7 +3909,7 @@ fn the_register_boundary_is_width_checked() {
         .instrs
         .iter()
         .filter_map(|i| match i {
-            super::instr::Instr::BitDec { input, bits } if bits.len() == 32 => Some(*input),
+            super::instr::Instr::BitDec { input, bits, .. } if bits.len() == 32 => Some(*input),
             _ => None,
         })
         .collect();

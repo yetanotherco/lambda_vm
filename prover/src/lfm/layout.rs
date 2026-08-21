@@ -74,7 +74,16 @@ pub mod bitdec {
     pub const fn bit_mult(i: usize) -> usize {
         3 + 2 * i
     }
-    pub const PREP_WIDTH: usize = 2 + 2 * NUM_BITS; // 130
+    /// The two BIG-ENDIAN `u32` halves of the decomposed value, sent as
+    /// LINEAR forms over the bit columns — the keccak `REV_ADDR` pattern:
+    /// two interactions, four preprocessed columns, NO value columns. This
+    /// is what lets `felt_be_halves` cost one row instead of one row plus
+    /// 64 base-ALU rows: the byte swap lives in the bus coefficients.
+    pub const HALF0_ADDR: usize = 2 + 2 * NUM_BITS; // 130
+    pub const HALF0_MULT: usize = HALF0_ADDR + 1;
+    pub const HALF1_ADDR: usize = HALF0_ADDR + 2;
+    pub const HALF1_MULT: usize = HALF0_ADDR + 3;
+    pub const PREP_WIDTH: usize = 2 + 2 * NUM_BITS + 4; // 134
 }
 
 /// `LFM_HASH` — the hash chiplet (frozen tuple contract).

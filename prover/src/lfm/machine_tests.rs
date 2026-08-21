@@ -1931,8 +1931,16 @@ fn append_ext_proves_and_verifies() {
     );
 }
 
-/// Pins the gadget's cost, which is the reason `append_field_element` was
-/// deferred out of R1d: one `BitDec` plus 64 `BALU` rows per felt.
+/// Pins the gadget's cost: ONE `BitDec` row per felt and NOTHING else.
+///
+/// The 64 base-ALU recomposition rows this gadget used to cost are gone —
+/// the chip sends the two big-endian halves as linear forms over its own bit
+/// columns (the keccak `REV_ADDR` pattern), so the byte permutation lives in
+/// the bus coefficients. At the real epoch that recomposition was 99.9% of
+/// all BALU rows and 77% of the whole wrap program (measured 2026-08-21),
+/// which is why this pin exists in the zero direction too: a regression that
+/// reintroduced per-felt ALU work must fail here, not resurface as a moved
+/// census.
 #[test]
 fn felt_be_halves_cost() {
     let program = super::programs::append_felt_program();
@@ -1947,8 +1955,8 @@ fn felt_be_halves_cost() {
         "one decomposition per felt"
     );
     assert_eq!(
-        program.groups.balu.real_rows, 64,
-        "two accumulators, each 1 Mul + 31 MulAdd over its 32 bits"
+        program.groups.balu.real_rows, 0,
+        "the halves are bus sends over the row's own bit columns — no ALU work"
     );
 }
 
@@ -3578,8 +3586,9 @@ fn keccak_merkle_opening_cost() {
     );
     assert_eq!(
         program.groups.balu.real_rows,
-        64 * R1F_SHAPE.leaf_values + 8 * 2,
-        "64 rows per byteswap, plus the two root asserts (4 sub + 4 div each)"
+        8 * 2,
+        "the byteswaps are bus sends off the BitDec rows now, so only the two \
+         root asserts remain (4 sub + 4 div each)"
     );
     assert_eq!(
         program.groups.select.real_rows,
@@ -3588,10 +3597,8 @@ fn keccak_merkle_opening_cost() {
     );
     println!(
         "R1f leaf: {} values -> {leaf_bytes} bytes -> {leaf_perms} permutations, \
-         against {} bitdec + {} balu rows of byteswapping",
-        R1F_SHAPE.leaf_values,
-        R1F_SHAPE.leaf_values,
-        64 * R1F_SHAPE.leaf_values,
+         against {} bitdec rows (and ZERO balu rows) of byteswapping",
+        R1F_SHAPE.leaf_values, R1F_SHAPE.leaf_values,
     );
     // The fixed floor, for scale: BITWISE alone is 2^20 rows regardless of what
     // the program does, so nothing above is a claim about total proof cost.
@@ -4420,19 +4427,18 @@ fn register_derivation_cost() {
         // Where the arithmetic goes, to the row. The transform is
         // `2 · (n/2·log₂n butterflies + blowup · (n scalings + n/2·log₂n
         // butterflies))` at two rows per butterfly and one per scaling, over
-        // the TWO dynamic columns; the swap is 64 rows for each of the leaf's
-        // six values. Pinning the split is what makes a later change to either
-        // half visible instead of showing up as one moved total.
+        // the TWO dynamic columns. The byte swapping costs NO balu rows any
+        // more — the halves are bus sends off the BitDec rows — so the pin is
+        // the transform alone, and a reintroduced per-value swap cost fails
+        // here rather than showing up as one moved total.
         let n = shape.num_rows() as u64;
         let butterflies = n / 2 * n.trailing_zeros() as u64;
         let per_column = 2 * butterflies + blowup as u64 * (n + 2 * butterflies);
         let transform = 2 * per_column;
-        let swap = shape.leaves() as u64 * 6 * 64;
         assert_eq!(
-            program.groups.balu.real_rows as u64,
-            transform + swap,
-            "blowup {blowup}: LFM_BALU rows must be {transform} of transform plus \
-             {swap} of byte swapping"
+            program.groups.balu.real_rows as u64, transform,
+            "blowup {blowup}: LFM_BALU rows must be exactly the {transform} of \
+             the transform — byte swapping is free now"
         );
         assert_eq!(
             program.groups.bitdec.real_rows,
@@ -4455,11 +4461,8 @@ fn register_derivation_cost() {
              `keccak_merkle_walk` would put one per parent here"
         );
         println!(
-            "  blowup {blowup}: transform {transform} balu rows ({:.1}%), \
-             byteswap {swap} ({:.1}%); a Select would cost {} cells against a \
-             permutation's {}",
-            100.0 * transform as f64 / (transform + swap) as f64,
-            100.0 * swap as f64 / (transform + swap) as f64,
+            "  blowup {blowup}: transform {transform} balu rows (byteswap is \
+             free now); a Select would cost {} cells against a permutation's {}",
             select_cells(),
             permutation_cells(),
         );

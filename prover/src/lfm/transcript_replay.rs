@@ -775,19 +775,20 @@ pub fn split_half(b: &mut LfmBuilder, d: Felt, k: usize) -> (Felt, Felt) {
 ///
 /// A byte swap is not field arithmetic, so it goes through the canonical bit
 /// decomposition: bit `j` of byte `k` must land at bit `j` of byte `3 − k`,
-/// which is just a different constant weight per bit. Each half is therefore one
-/// 32-term linear form, and the whole byte permutation lives in the weights
-/// rather than in any emitted instruction.
+/// which is just a different constant weight per bit. Each half is one
+/// 32-term linear form over the row's bit columns — and since the chip sends
+/// those forms on the bus directly ([`LfmBuilder::bit_dec_be_halves`]), the
+/// whole byte permutation lives in the BUS COEFFICIENTS rather than in any
+/// emitted instruction.
 ///
 /// ## Cost
 ///
-/// One `LFM_BITDEC` row plus 64 `LFM_BALU` rows (per half: a `Mul` to open the
-/// accumulator, then 31 `MulAdd`s), and the 32 weight constants are interned
-/// once and shared by both halves — they are the powers `2^0..2^31`, since
-/// `j + 8(3 − k)` runs over `0..32` bijectively.
+/// One `LFM_BITDEC` row. Nothing else: the 64 base-ALU recomposition rows
+/// this gadget used to cost — 77% of the whole wrap program at the real
+/// epoch, measured 2026-08-21 — are gone, which is the point.
 ///
-/// `bit_dec` also enforces canonicity (`< p`), which is exactly right: production
-/// renders `canonical_u64()`.
+/// The row also enforces canonicity (`< p`), which is exactly right:
+/// production renders `canonical_u64()`.
 ///
 /// Note for callers re-absorbing a value the transcript just produced: a
 /// challenge from [`TranscriptReplay::sample_felt`] arrives as a recomposed
@@ -795,23 +796,7 @@ pub fn split_half(b: &mut LfmBuilder, d: Felt, k: usize) -> (Felt, Felt) {
 /// `BitDec`; carrying the halves through would avoid it, and is worth doing only
 /// if a profile says so.
 pub fn felt_be_halves(b: &mut LfmBuilder, v: Felt) -> [Felt; 2] {
-    let bits = b.bit_dec(v, 64);
-    core::array::from_fn(|h| {
-        // Half 0 carries the value's HIGH 32 bits: they lead in big-endian order.
-        let first = if h == 0 { 32 } else { 0 };
-        let mut acc: Option<Felt> = None;
-        for k in 0..4 {
-            for j in 0..8 {
-                let weight = b.felt_const(FE::from(1u64 << (j + 8 * (3 - k))));
-                let bit = bits[first + 8 * k + j].as_felt();
-                acc = Some(match acc {
-                    None => b.mul(bit, weight),
-                    Some(a) => b.mul_add(bit, weight, a),
-                });
-            }
-        }
-        acc.expect("32 bits per half")
-    })
+    b.bit_dec_be_halves(v)
 }
 
 /// Per-candidate probability that the production sampler rejects: there are

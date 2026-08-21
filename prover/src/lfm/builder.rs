@@ -321,8 +321,29 @@ impl LfmBuilder {
         self.read(x.0);
         let bits: Vec<(Addr, u64)> = (0..nbits).map(|_| (self.alloc(), 0)).collect();
         let handles = bits.iter().map(|(a, _)| Bit(*a)).collect();
-        self.instrs.push(Instr::BitDec { input: x.0, bits });
+        self.instrs.push(Instr::BitDec {
+            input: x.0,
+            bits,
+            halves: None,
+        });
         handles
+    }
+
+    /// The two BIG-ENDIAN `u32` halves of `x`'s 8-byte rendering —
+    /// `[byteswap32(high word), byteswap32(low word)]` — as one `BitDec` row
+    /// and NOTHING else: the halves are bus sends that are linear forms over
+    /// the row's own bit columns, so the 64 base-ALU rows the in-program
+    /// recomposition used to cost are gone. Canonicity (`< p`) is enforced by
+    /// the row, exactly as production renders `canonical_u64()`.
+    pub fn bit_dec_be_halves(&mut self, x: Felt) -> [Felt; 2] {
+        self.read(x.0);
+        let halves = [(self.alloc(), 0), (self.alloc(), 0)];
+        self.instrs.push(Instr::BitDec {
+            input: x.0,
+            bits: Vec::new(),
+            halves: Some(halves),
+        });
+        [Felt(halves[0].0), Felt(halves[1].0)]
     }
 
     // ---- hash ----

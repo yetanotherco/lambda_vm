@@ -250,6 +250,12 @@ pub enum Instr {
     BitDec {
         input: Addr,
         bits: Vec<(Addr, u64)>,
+        /// The value's two BIG-ENDIAN `u32` halves as output cells —
+        /// `[high-word half, low-word half]`, i.e. what
+        /// `append_field_element` puts on the wire. `None` for a plain
+        /// decomposition. The halves are linear forms over the bit columns,
+        /// so they cost no extra row and no ALU work.
+        halves: Option<[(Addr, u64); 2]>,
     },
     Hash {
         mode: HashMode,
@@ -322,7 +328,11 @@ impl Instr {
                 v
             }
             Instr::Select { out_l, out_r, .. } => vec![*out_l, *out_r],
-            Instr::BitDec { bits, .. } => bits.iter().map(|(a, _)| *a).collect(),
+            Instr::BitDec { bits, halves, .. } => bits
+                .iter()
+                .map(|(a, _)| *a)
+                .chain(halves.iter().flat_map(|hs| hs.iter().map(|(a, _)| *a)))
+                .collect(),
             Instr::Hash { mode, outs, .. } => outs[..mode.num_output_cells()].to_vec(),
             Instr::Public { .. } => vec![],
         }

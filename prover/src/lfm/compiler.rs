@@ -246,9 +246,14 @@ pub fn compile(source: LfmProgramSource) -> LfmProgram {
                 *mult_l = take(*out_l, &mut written, &mut read_counts);
                 *mult_r = take(*out_r, &mut written, &mut read_counts);
             }
-            Instr::BitDec { bits, .. } => {
+            Instr::BitDec { bits, halves, .. } => {
                 for (addr, mult) in bits.iter_mut() {
                     *mult = take(*addr, &mut written, &mut read_counts);
+                }
+                if let Some(hs) = halves {
+                    for (addr, mult) in hs.iter_mut() {
+                        *mult = take(*addr, &mut written, &mut read_counts);
+                    }
                 }
             }
             Instr::Hash {
@@ -390,7 +395,11 @@ fn emit_column_groups(instrs: &[Instr], _public_len: u32) -> LfmColumnGroups {
                 select.set(r, l::MULT_R, fe(*mult_r));
                 select.set(r, l::IS_REAL, FE::one());
             }
-            Instr::BitDec { input, bits } => {
+            Instr::BitDec {
+                input,
+                bits,
+                halves,
+            } => {
                 use layout::bitdec as l;
                 let r = bitdec.open_row();
                 bitdec.set(r, l::IN_ADDR, fe(input.0));
@@ -398,6 +407,12 @@ fn emit_column_groups(instrs: &[Instr], _public_len: u32) -> LfmColumnGroups {
                 for (i, (addr, mult)) in bits.iter().enumerate() {
                     bitdec.set(r, l::bit_addr(i), fe(addr.0));
                     bitdec.set(r, l::bit_mult(i), fe(*mult));
+                }
+                if let Some([h0, h1]) = halves {
+                    bitdec.set(r, l::HALF0_ADDR, fe(h0.0.0));
+                    bitdec.set(r, l::HALF0_MULT, fe(h0.1));
+                    bitdec.set(r, l::HALF1_ADDR, fe(h1.0.0));
+                    bitdec.set(r, l::HALF1_MULT, fe(h1.1));
                 }
             }
             Instr::Hash {

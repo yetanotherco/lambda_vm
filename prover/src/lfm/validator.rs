@@ -201,8 +201,11 @@ fn check_multiplicities(program: &LfmProgram) -> Result<(), LfmViolation> {
                 check(*out_l, *mult_l)?;
                 check(*out_r, *mult_r)?;
             }
-            Instr::BitDec { bits, .. } => {
+            Instr::BitDec { bits, halves, .. } => {
                 for (addr, mult) in bits {
+                    check(*addr, *mult)?;
+                }
+                for (addr, mult) in halves.iter().flatten() {
                     check(*addr, *mult)?;
                 }
             }
