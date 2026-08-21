@@ -134,6 +134,13 @@ pub struct BatchedProveStats {
     pub main_lde_expansions: usize,
     /// Same for the auxiliary LDE.
     pub aux_lde_expansions: usize,
+    /// Size-`n` coset evaluations (main), phase 4's cheap materialization
+    /// under `RecomputeLde` — about 37% of a full expansion's work and a
+    /// quarter of its bytes, counted apart so the full-expansion budget
+    /// stays an honest number.
+    pub main_coset_evals: usize,
+    /// Same for aux.
+    pub aux_coset_evals: usize,
     /// How many times a table's composition parts were computed. Recomputing
     /// these means re-running constraint evaluation, so the batched prover
     /// retains them instead; this counter exists to make that visible if it ever

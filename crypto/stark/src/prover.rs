@@ -425,6 +425,9 @@ pub(crate) struct LdeTwiddles<F: IsFFTField> {
     /// `two_half_fwd` size-`n·blowup` forward.
     two_half_inv: TwoHalfTwiddles<F>,
     two_half_fwd: TwoHalfTwiddles<F>,
+    /// Size-`n` FORWARD set, built lazily — only the batched phase-4 coset
+    /// evaluation wants it (a full LDE's forward set is size `n·blowup`).
+    two_half_fwd_n: OnceLock<TwoHalfTwiddles<F>>,
     coset_weights: Vec<FieldElement<F>>,
     /// Composition half-extension cache, initialized only when the degree-2
     /// decomposition path actually runs on CPU.
@@ -505,10 +508,19 @@ impl<F: IsFFTField> LdeTwiddles<F> {
                 .expect("valid inverse two-half twiddles"),
             two_half_fwd: TwoHalfTwiddles::<F>::new(lde_size.trailing_zeros() as usize, false)
                 .expect("valid forward two-half twiddles"),
+            two_half_fwd_n: OnceLock::new(),
             coset_weights,
             composition: OnceLock::new(),
             inv_2x: OnceLock::new(),
         }
+    }
+
+    /// The size-`n` forward set for the phase-4 coset evaluation, built once.
+    pub(crate) fn fwd_n(&self, domain_size: usize) -> &TwoHalfTwiddles<F> {
+        self.two_half_fwd_n.get_or_init(|| {
+            TwoHalfTwiddles::<F>::new(domain_size.trailing_zeros() as usize, false)
+                .expect("valid size-n forward two-half twiddles")
+        })
     }
 
     fn composition(&self, domain: &Domain<F>) -> &CompositionLdeTwiddles<F> {
@@ -1471,6 +1483,54 @@ pub trait IsStarkProver<
         .expect("row-major coset LDE expansion");
 
         (main_data, total_cols)
+    }
+
+    /// The MAIN trace's size-`n` coset evaluation, row-major — the stride-
+    /// `blowup` subsample of [`Self::expand_main_lde_row_major`]'s output,
+    /// computed directly: iFFT(n) → coset weights → FFT(n), about 37% of a
+    /// full expansion's work and a quarter of its bytes. Values are
+    /// bit-identical to the subsample (exact modular arithmetic; both compute
+    /// the same DFT), which is what the batched phase 4 reads and ALL it
+    /// reads.
+    fn expand_main_coset_eval_row_major(
+        trace: &TraceTable<Field, FieldExtension>,
+        domain: &Domain<Field>,
+        twiddles: &LdeTwiddles<Field>,
+    ) -> (Vec<FieldElement<Field>>, usize) {
+        let (trace_data, total_cols) = trace.main_data_row_major();
+        let mut main_data: Vec<FieldElement<Field>> = Vec::with_capacity(trace_data.len());
+        main_data.extend_from_slice(trace_data);
+        Polynomial::<FieldElement<Field>>::coset_lde_full_expand_row_major::<Field>(
+            &mut main_data,
+            total_cols,
+            1,
+            &twiddles.coset_weights,
+            &twiddles.two_half_inv,
+            twiddles.fwd_n(domain.interpolation_domain_size),
+        )
+        .expect("row-major coset evaluation");
+        (main_data, total_cols)
+    }
+
+    /// The AUX counterpart of [`Self::expand_main_coset_eval_row_major`].
+    fn expand_aux_coset_eval_row_major(
+        trace: &TraceTable<Field, FieldExtension>,
+        domain: &Domain<Field>,
+        twiddles: &LdeTwiddles<Field>,
+    ) -> (Vec<FieldElement<FieldExtension>>, usize) {
+        let (trace_data, total_cols) = trace.aux_data_row_major();
+        let mut aux_data: Vec<FieldElement<FieldExtension>> = Vec::with_capacity(trace_data.len());
+        aux_data.extend_from_slice(trace_data);
+        Polynomial::<FieldElement<FieldExtension>>::coset_lde_full_expand_row_major::<Field>(
+            &mut aux_data,
+            total_cols,
+            1,
+            &twiddles.coset_weights,
+            &twiddles.two_half_inv,
+            twiddles.fwd_n(domain.interpolation_domain_size),
+        )
+        .expect("row-major aux coset evaluation");
+        (aux_data, total_cols)
     }
 
     /// Expand a table's auxiliary trace to its coset LDE, row-major, without

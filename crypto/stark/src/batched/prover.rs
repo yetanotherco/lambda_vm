@@ -470,37 +470,75 @@ where
             &coset_offset,
         );
 
-        let ldes = materialize_ldes::<Field, FieldExtension, PI, H, P>(
-            table,
-            &air_trace_pairs,
-            &domains,
-            &twiddles,
-            &shape,
-            &mut retained_main,
-            &mut retained_aux,
-            &mut stats,
-            &mut ledger,
-            residency,
-            #[cfg(feature = "disk-spill")]
-            storage_mode,
-        );
-        let (mut lde_trace, carried_bytes) =
-            lde_trace_take(ldes, air.step_size(), domain.blowup_factor);
-        let round3 = P::round_3_evaluate_polynomials_in_out_of_domain_element(
-            *air,
-            domain,
-            &mut lde_trace,
-            &mut retained_parts[table],
-            &z,
-        );
-        release_ldes(
-            ldes_from_trace(lde_trace, carried_bytes),
-            &mut retained_main,
-            &mut retained_aux,
-            table,
-            &mut ledger,
-            residency,
-        );
+        // Phase 4 reads the trace ONLY at stride `blowup` — the size-`n`
+        // coset evaluation. Under `Retain` the full LDE is already on hand
+        // and the strided read is free; under `RecomputeLde` a full 4n
+        // expansion here would be paid just to subsample it, so the
+        // recompute arm materializes the n-sized evaluation directly
+        // (bit-identical values, ~37% of the work, a quarter of the bytes)
+        // and hands `round_3` a blowup-1 table, whose OWN stride the trace
+        // reads follow.
+        let round3 = if retained_main[table].is_some() {
+            let ldes = materialize_ldes::<Field, FieldExtension, PI, H, P>(
+                table,
+                &air_trace_pairs,
+                &domains,
+                &twiddles,
+                &shape,
+                &mut retained_main,
+                &mut retained_aux,
+                &mut stats,
+                &mut ledger,
+                residency,
+                #[cfg(feature = "disk-spill")]
+                storage_mode,
+            );
+            let (mut lde_trace, carried_bytes) =
+                lde_trace_take(ldes, air.step_size(), domain.blowup_factor);
+            let round3 = P::round_3_evaluate_polynomials_in_out_of_domain_element(
+                *air,
+                domain,
+                &mut lde_trace,
+                &mut retained_parts[table],
+                &z,
+            );
+            release_ldes(
+                ldes_from_trace(lde_trace, carried_bytes),
+                &mut retained_main,
+                &mut retained_aux,
+                table,
+                &mut ledger,
+                residency,
+            );
+            round3
+        } else {
+            let (_, trace, _) = &air_trace_pairs[table];
+            let t_expand = std::time::Instant::now();
+            let main = P::expand_main_coset_eval_row_major(trace, domain, &twiddles[table]);
+            let aux = if matrix_index(&shape.aux, table).is_some() {
+                let aux = P::expand_aux_coset_eval_row_major(trace, domain, &twiddles[table]);
+                stats.aux_coset_evals += 1;
+                aux
+            } else {
+                (Vec::new(), 0)
+            };
+            stats.lde_expansion_wall += t_expand.elapsed();
+            stats.main_coset_evals += 1;
+            let bytes = lde_bytes::<Field>(main.0.len()) + lde_bytes::<FieldExtension>(aux.0.len());
+            ledger.alloc(bytes);
+            let mut lde_trace =
+                LDETraceTable::from_row_major(main.0, main.1, aux.0, aux.1, air.step_size(), 1);
+            let round3 = P::round_3_evaluate_polynomials_in_out_of_domain_element(
+                *air,
+                domain,
+                &mut lde_trace,
+                &mut retained_parts[table],
+                &z,
+            );
+            drop(lde_trace);
+            ledger.free(bytes);
+            round3
+        };
 
         let (block0, block1) = P::ood_layout(*air).split_full(&round3.trace_ood_evaluations);
         for block in [&block0, &block1] {

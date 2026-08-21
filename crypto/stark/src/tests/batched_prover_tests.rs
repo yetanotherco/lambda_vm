@@ -361,14 +361,21 @@ fn the_recompute_budget_is_five_expansions_per_table() {
     let tables = 6;
     assert_eq!(
         recompute.main_lde_expansions,
-        5 * tables,
-        "main LDE: one expansion per table per phase that reads it"
+        4 * tables,
+        "main LDE: one FULL expansion per table per phase that reads the whole \
+         LDE — phase 4 reads only the stride subsample and materializes the \
+         size-n coset evaluation instead"
     );
     assert_eq!(
         recompute.aux_lde_expansions,
-        5 * tables,
-        "aux LDE: every table in this fixture has a RAP, so the same five phases"
+        4 * tables,
+        "aux LDE: every table in this fixture has a RAP, so the same four phases"
     );
+    assert_eq!(
+        recompute.main_coset_evals, tables,
+        "phase 4's cheap materialization, once per table"
+    );
+    assert_eq!(recompute.aux_coset_evals, tables, "and its aux side");
     assert_eq!(
         retain.main_lde_expansions, tables,
         "retaining pays the floor: one expansion per table"
@@ -376,6 +383,12 @@ fn the_recompute_budget_is_five_expansions_per_table() {
     assert_eq!(
         retain.aux_lde_expansions, tables,
         "retaining pays the floor for aux too"
+    );
+    assert_eq!(
+        (retain.main_coset_evals, retain.aux_coset_evals),
+        (0, 0),
+        "retention serves phase 4 from the full LDE; the n-sized path is the \
+         recompute arm's"
     );
     for stats in [recompute, retain] {
         assert_eq!(
