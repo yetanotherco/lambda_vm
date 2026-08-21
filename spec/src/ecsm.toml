@@ -20,8 +20,8 @@ pad = 0
 
 [[variables.input]]
 name = "addr_xR"
-type = ["DWordHL", 4]
-desc = "address to which the `x`-coordinate of result point `R` is to be written"
+type = ["DWordHL", 12]
+desc = "address of the 96-byte output buffer, holding $x_R$, $y_R$ and $y_G$ in that order"
 pad = 0
 
 [[variables.output]]
@@ -30,7 +30,7 @@ type = "U256BL"
 desc = "$(#`k` times #`G`)_x$"
 pad = 0
 
-[[variables.auxiliary]]
+[[variables.output]]
 name = "yR"
 type = "U256BL"
 desc = "$(#`k` times #`G`)_y$"
@@ -54,10 +54,10 @@ type = "U256BL"
 desc = "$x_G$"
 pad = 0
 
-[[variables.auxiliary]]
+[[variables.output]]
 name = "yG"
 type = "U256BL"
-desc = "$y_G$"
+desc = "$y_G$; the root of $x_G$ this chip witnessed, returned so the caller can tell which of the two it was"
 pad = 0
 
 [[variables.auxiliary]]
@@ -250,6 +250,15 @@ name = "μ"
 type = "Bit"
 desc = ""
 pad = 0
+
+[[assumptions]]
+desc = "the caller resolves the root: it compares the returned `yG` against the $y$ of its own base point *as a field element* (that is, modulo $p$) and negates `yR` when the two differ. A `yG` matching neither $y$ nor $-y$ means this chip did not multiply the caller's point, and the result must be discarded."
+ref = "ec:a:root_resolved"
+
+[[assumptions]]
+desc = "the caller reduces `yR` modulo $p$ before using it. Unlike $x_R$, $y_R$ carries no range check here, so it may be any 256-bit representative of $(#`k` times #`G`)_y$."
+ref = "ec:a:yR_reduced"
+
 
 # Load xG from memory
 
@@ -650,7 +659,7 @@ ref = "ec:c:load_addr_xR"
 kind = "interaction"
 tag = "IS_HALF"
 input = [["idx", ["idx", "addr_xR", "i"], "j"]]
-iters = [["i", 0, 3], ["j", 0, 3]]
+iters = [["i", 0, 11], ["j", 0, 3]]
 multiplicity = "μ"
 ref = "ec:c:range_addr_xR"
 
@@ -659,7 +668,7 @@ kind = "template"
 tag = "ADD"
 input = [["cast", ["idx", "addr_xR", 0], "DWordWL"], ["cast", ["*", 8, "i"], "DWordWL"]]
 output = ["cast", ["idx", "addr_xR", "i"], "DWordWL"]
-iter = ["i", 0, 3]
+iter = ["i", 0, 11]
 cond = "μ"
 ref = "ec:c:extrapolate_addr_xR"
 
@@ -685,6 +694,52 @@ input = [
 iter = ["i", 0, 3]
 multiplicity = "μ"
 ref = "ec:c:write_xR"
+
+[[constraints.write_xR]]
+kind = "interaction"
+tag = "MEMW"
+input = [
+    0,
+    ["cast", ["idx", "addr_xR", ["+", "i", 4]], "DWordWL"],
+    ["arr",
+        ["idx", "yR", ["+", ["*", 8, "i"], 0]],
+        ["idx", "yR", ["+", ["*", 8, "i"], 1]],
+        ["idx", "yR", ["+", ["*", 8, "i"], 2]],
+        ["idx", "yR", ["+", ["*", 8, "i"], 3]],
+        ["idx", "yR", ["+", ["*", 8, "i"], 4]],
+        ["idx", "yR", ["+", ["*", 8, "i"], 5]],
+        ["idx", "yR", ["+", ["*", 8, "i"], 6]],
+        ["idx", "yR", ["+", ["*", 8, "i"], 7]],
+    ],
+    ["+", "timestamp", 3],
+    0, 0, 1
+]
+iter = ["i", 0, 3]
+multiplicity = "μ"
+ref = "ec:c:write_yR"
+
+[[constraints.write_xR]]
+kind = "interaction"
+tag = "MEMW"
+input = [
+    0,
+    ["cast", ["idx", "addr_xR", ["+", "i", 8]], "DWordWL"],
+    ["arr",
+        ["idx", "yG", ["+", ["*", 8, "i"], 0]],
+        ["idx", "yG", ["+", ["*", 8, "i"], 1]],
+        ["idx", "yG", ["+", ["*", 8, "i"], 2]],
+        ["idx", "yG", ["+", ["*", 8, "i"], 3]],
+        ["idx", "yG", ["+", ["*", 8, "i"], 4]],
+        ["idx", "yG", ["+", ["*", 8, "i"], 5]],
+        ["idx", "yG", ["+", ["*", 8, "i"], 6]],
+        ["idx", "yG", ["+", ["*", 8, "i"], 7]],
+    ],
+    ["+", "timestamp", 3],
+    0, 0, 1
+]
+iter = ["i", 0, 3]
+multiplicity = "μ"
+ref = "ec:c:write_yG"
 
 
 [[constraint_groups]]

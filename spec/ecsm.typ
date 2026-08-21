@@ -51,7 +51,7 @@ When $x_P = x_Q$ and $y_P eq.not - y_Q$, one instead uses $lambda = frac(3x_P^2,
 The remaing case that $(x_P, y_P) = (x_Q, -y_Q)$ corresponds with $Q = -P$; the addition results in $#inf$.
 
 = Overview
-This accelerator provides a compact way to prove the $x$-coordinate of the product $k times G$ for scalar $k in [1, N)$ and point $G in E(a, b, p) without {#inf}$ with $p in [3, 2^256)$ that induce curves of odd order.
+This accelerator provides a compact way to prove the product $k times G$ for scalar $k in [1, N)$ and point $G in E(a, b, p) without {#inf}$ with $p in [3, 2^256)$ that induce curves of odd order.
 In particular, the accelerator supports the curves `secp256k1` and `secp256r1`.
 
 #attention("Variable space.")[
@@ -65,7 +65,7 @@ The accelerator comprises two chips:
     - loading $k$ from memory and verifying that it is contained in $[1, N)$,
     - loading inputs $x_G$, verifying $x_G < p$, and reconstructing $y_G$,
     - verifying $(k times G)_x < p$, and
-    - writing $(k times G)_x$ to memory.
+    - writing $(k times G)_x$, $(k times G)_y$ and the witnessed $y_G$ to memory.
     It interacts with the `ECDAS` chip, sending $k$ and $G$ as input, and receiving $k times G$ as result.
 - *`ECDAS` (Elliptic Curve Double/Add Sequence)*.
     This chip computes $k times G$ by recursively interacting with itself.
@@ -94,10 +94,12 @@ Supporting other curves only requires assigning them a unique `id`.#footnote([No
 
 The chip is triggered by executing `ECALL`, with the ECALL-number set to $-11$ (`secp256k1`) or $-12$ (`secp256r1`).
 The chip expects 
-- `x10` to contain the address where $x_R := (k times G)_x$ is to be stored, 
+- `x10` to contain the address of a 96-byte output buffer, receiving $x_R := (k times G)_x$ at offset 0, $y_R := (k times G)_y$ at offset 32 and $y_G$ at offset 64,
 - `x11` to contain the address at which the least significant byte of $x_G$ is to be found,
 - `x12` to contain the address at which the least significant byte of $k$ is to be found,
-where it is assumed that $x_G$ and $k$ are provided as little-endian integers; $x_R$ is written to memory in little-endian form.
+where it is assumed that $x_G$ and $k$ are provided as little-endian integers; all three output values are written to memory in little-endian form.
+
+Why $y_G$ comes back is the subject of the aside below: this chip does not constrain _which_ root of $x_G$ it uses, so returning it is what makes $y_R$ usable.
 
 == Columns
 #let nr_variables = total_nr_variables(ecsm_chip)
@@ -106,6 +108,10 @@ where it is assumed that $x_G$ and $k$ are provided as little-endian integers; $
 
 The #ecsm chip is comprised of #nr_variables variables that are expressed using #nr_columns columns and leverages #nr_interactions interaction(s):
 #render_chip_variable_table(ecsm_chip, config)
+
+== Assumptions
+Returning $y_R$ shifts two obligations onto the caller. Neither is a constraint here.
+#render_chip_assumptions(ecsm_chip, config)
 
 == Constraints
 
@@ -150,7 +156,14 @@ We must therefore support quotients $q_0 in [0, 2^256)$ and $q_1 in [0, 2^258)$.
 #aside("Two options for " + $y_G$)[
   In most cases, $y_G^2$ has _two_ roots $mod p$.
   This means that enforcing the above relation does not fully constrain the prover: it can choose which of the two to provide as hint.
-  However, in this setting, this is not a problem: the `ECSM`-chip only outputs the $x$-coordinate of $k times G$, which is the same, irrespective of the chosen root.
+  The chip leaves that choice free — and hands it back, writing $y_G$ to memory alongside the result (@ec:c:write_yG).
+
+  That is what keeps the ambiguity harmless now that $y_R$ is returned too.
+  Writing $y_R$ alone would not do: the chip multiplies $(x_G, y_G)$ for whichever root it picked, which is $P$ or $-P$ for the caller's own point $P$, so $y_R$ would be the $y$ of $k times P$ or of $-(k times P)$ with nothing to say which.
+  Returning $y_G$ settles it caller-side at no cost. The caller already holds the $y$ of its base point; comparing the two says which root was used, and $k times (-P) = -(k times P)$ makes the correction a single negation (@ec:a:root_resolved).
+
+  The same comparison is what validates. A $y_G$ equal to neither $y$ nor $-y$ means this chip did not multiply the caller's point, and the caller must discard the result rather than use it.
+  Note the comparison has to be made modulo $p$: $y_G$ carries no range check, so the prover may witness any 256-bit representative of the root, and all of them agree as field elements.
 ]
 
 Below, we enforce the first of the two sub-relations.
@@ -184,9 +197,17 @@ The addition is constrained by requiring that `c4` are bits (@ec:c:range_c4); an
 
 #render_constraint_table(ecsm_chip, config, groups: "range_xR")
 
-=== Write `xR`
-We read `addr_xR` from register `x10` (@ec:c:load_addr_xR), and subsequently write `xR` to this address (@ec:c:write_xR).
-Note that the `timestamp` on both memory accesses is offset to allow `addr_xR` to equal `addr_xG` and thus for $x_R$ to overwrite $x_G$ in memory.
+No such check is made on $y_R$, deliberately.
+Nothing in this chip reads it as a number — it travels from the `ECDAS` result straight to memory — so a range check here would serve only the caller, who obtains the same guarantee more cheaply by reducing modulo $p$ on the way in (@ec:a:yR_reduced).
+
+=== Write the result
+We read `addr_xR` from register `x10` (@ec:c:load_addr_xR), and subsequently write the 96-byte output buffer to this address: $x_R$ at offset 0 (@ec:c:write_xR), $y_R$ at offset 32 (@ec:c:write_yR) and $y_G$ at offset 64 (@ec:c:write_yG).
+
+The `timestamp`s are staggered across the instruction's four sub-timestamps: the two operand reads take $t$ and $t+1$, the register read and $x_R$ take $t+2$, and $y_R$ and $y_G$ take $t+3$.
+Two things follow.
+First, `addr_xR` may still equal `addr_xG` or `addr_k`: every write happens strictly after both reads, so each per-address chain stays monotone even though the buffer now spans 96 bytes and can cover both operands at once.
+Second, $y_R$ and $y_G$ share $t+3$, which is sound because they occupy disjoint 32-byte ranges — the same pattern the four doublewords of $x_R$ already use at $t+2$.
+Note that this fills the stride-4 window: a further output would need a different arrangement.
 #render_constraint_table(ecsm_chip, config, groups: "write_xR")
 
 == Carry offsets
