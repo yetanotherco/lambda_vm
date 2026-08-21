@@ -154,6 +154,7 @@ pub fn gpu_lde_calls() -> u64 {
 pub fn reset_all_gpu_call_counters() {
     GPU_LDE_CALLS.store(0, Ordering::Relaxed);
     GPU_EXTEND_HALVES_CALLS.store(0, Ordering::Relaxed);
+    GPU_COMP_H_SLABS_CALLS.store(0, Ordering::Relaxed);
     GPU_LEAF_HASH_CALLS.store(0, Ordering::Relaxed);
     GPU_MERKLE_TREE_CALLS.store(0, Ordering::Relaxed);
     GPU_PARTS_LDE_CALLS.store(0, Ordering::Relaxed);
@@ -185,6 +186,15 @@ pub fn gpu_grind_calls() -> u64 {
 pub(crate) static GPU_EXTEND_HALVES_CALLS: AtomicU64 = AtomicU64::new(0);
 pub fn gpu_extend_halves_calls() -> u64 {
     GPU_EXTEND_HALVES_CALLS.load(Ordering::Relaxed)
+}
+
+/// Device-resident num_parts==1 composition-parts dispatches: one per table
+/// whose single composition part (`H` itself) was de-interleaved into a slab
+/// [`math_cuda::lde::GpuLdeExt3`] on device instead of the host arm. Nonzero
+/// confirms the degree-1 device DEEP/FRI path engaged.
+pub(crate) static GPU_COMP_H_SLABS_CALLS: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_comp_h_slabs_calls() -> u64 {
+    GPU_COMP_H_SLABS_CALLS.load(Ordering::Relaxed)
 }
 
 /// Successful LogUp aux-build GPU dispatches (one per table that took either
@@ -769,6 +779,44 @@ where
     .ok()?;
 
     Some((vec![lde_h0, lde_h1], handle))
+}
+
+/// Fully device-resident num_parts==1 composition-parts path: `H` itself is the
+/// single part, already on the LDE coset, so — unlike [`try_decompose_extend_d2_dev`]
+/// — there is no decompose and no re-extension, only a de-interleave into the slab
+/// layout the commit / DEEP / FRI consumers read (all of which already read the
+/// part count from `handle.m`). The single part is always drained to host too (the
+/// interleaved `H` download IS that part, identical values in interleaved layout):
+/// num_parts==1 tables are never device-only — they keep their preprocessed host
+/// trace (see `device_only_for`) — so there is no device-only host-elision here.
+/// `None` → the caller downloads `H` and uses it directly as the single host part.
+pub(crate) fn try_deinterleave_comp_h_dev<F, E>(
+    h: &math_cuda::constraint_interp::GpuCompH,
+) -> Option<(Vec<Vec<FieldElement<E>>>, math_cuda::lde::GpuLdeExt3)>
+where
+    F: IsField + 'static,
+    E: IsField + 'static,
+{
+    if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
+        return None;
+    }
+    if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
+        return None;
+    }
+    let lde_size = h.num_rows;
+    if lde_size < gpu_lde_threshold() || !lde_size.is_power_of_two() {
+        return None;
+    }
+
+    // The interleaved `H` download IS the single composition part on the LDE
+    // coset — same values the slab handle holds, just interleaved. Download
+    // before building the handle so a decline leaves nothing to unwind.
+    let host = vec![download_comp_h_to_field::<E>(h)?];
+
+    let handle = math_cuda::constraint_interp::comp_h_to_slabs(h).ok()?;
+    GPU_COMP_H_SLABS_CALLS.fetch_add(1, Ordering::Relaxed);
+
+    Some((host, handle))
 }
 
 /// D2H bridge for the fallback: download a resident `H` and lift it into

@@ -115,6 +115,37 @@ fn all_ops_program() -> ConstraintProgram<Gl, Ext> {
     b.finish(1) // 1 base root, 2 ext roots
 }
 
+/// DECODE-shaped program: a preprocessed LogUp-only table declares
+/// `EmptyConstraints` (no base transition roots) — only the framework's aux
+/// LogUp ext roots. Mirrors that shape (`num_base == 0`) so the composition
+/// kernel is exercised on a program with zero base-dim roots, the case the
+/// DECODE `num_parts == 1` device path relies on.
+fn decode_shaped_program() -> ConstraintProgram<Gl, Ext> {
+    let mut b = IrBuilder::<Gl, Ext>::new();
+
+    // Root 0 (ext): main(0,0)·challenge(0) + alpha_pow(1)·aux(0,0) − table_offset.
+    let m0 = b.main(0, 0);
+    let ch = b.challenge(0);
+    let ap = b.alpha_power(1);
+    let a0 = b.aux(0, 0);
+    let off = b.table_offset();
+    let t1 = b.mul(m0, ch); // base × ext → ext (auto-embed)
+    let t2 = b.mul(ap, a0); // ext × ext
+    let s = b.add(t1, t2);
+    let r0 = b.sub(s, off);
+    b.emit(0, r0);
+
+    // Root 1 (ext): aux(1,0) − aux(0,0) + const_ext (next-row aux read).
+    let a0n = b.aux(1, 0);
+    let a0c = b.aux(0, 0);
+    let ce = b.const_ext(ext3(5, 4, 3));
+    let d = b.sub(a0n, a0c);
+    let r1 = b.add(d, ce);
+    b.emit(1, r1);
+
+    b.finish(0) // 0 base roots, 2 ext roots — the EmptyConstraints (LogUp-only) shape
+}
+
 /// Derive the trace/uniform footprint the program actually touches, so the
 /// harness works for any program (synthetic or real): #main cols, #aux cols,
 /// #rap challenges, #alpha powers, and the max frame offset.
@@ -519,11 +550,46 @@ fn check_composition(prog: &ConstraintProgram<Gl, Ext>, label: &str, seed: u64) 
             enc(&h_cpu)
         );
     }
+
+    // evaluate_dev parity: the device-resident `H` (keep=true) that the
+    // num_parts==1 slab path consumes must equal the host-drained `H`
+    // (keep=false) bit-for-bit — same kernel, only the D2H differs. Confirms the
+    // composition path engages AND agrees on a device-resident `H`, including
+    // the empty-base (LogUp-only) program shape.
+    let dev = match try_eval_composition_gpu(
+        prog, &main, &aux, &rap, &alpha, &offset, NEXT_STEP, NUM_ROWS, &inputs, true,
+    ) {
+        Some(stark::constraint_ir::gpu_interp::GpuComposition::Dev(h)) => h,
+        _ => panic!("[{label}] GPU composition Dev (keep) path must engage"),
+    };
+    let dev_raw = math_cuda::constraint_interp::download_comp_h(&dev)
+        .unwrap_or_else(|e| panic!("[{label}] download_comp_h failed: {e:?}"));
+    assert_eq!(
+        dev_raw, gpu,
+        "[{label}] evaluate_dev (keep=true) H != host-drained H, seed {seed:#x}"
+    );
+
+    // This closes the num_parts==1 device DEEP/FRI path (`gpu_comp_h_slabs_calls`)
+    // at the unit level. Its end-to-end counterpart is not asserted in
+    // `prover/tests/cuda_path_integration.rs`: every asm fixture there is a
+    // `fib_iterative_*` variant whose DECODE ROM is below the GPU LDE threshold,
+    // so no d1 table engages. The end-to-end d1 path is exercised by real-program
+    // proves (ethrex) and the GPU bench instead.
 }
 
 #[test]
 fn gpu_composition_matches_cpu_oracle_all_ops() {
     for seed in [0x0123_4567_89AB_CDEF, 0xDEAD_BEEF_CAFE_F00D, 7] {
         check_composition(&all_ops_program(), "ALL_OPS_COMP", seed);
+    }
+}
+
+/// num_parts==1 de-risk: the DECODE-shaped (empty-base, LogUp-only) program must
+/// evaluate on the GPU composition kernel, match the CPU oracle, and produce a
+/// device-resident `H` bit-identical to the host-drained one.
+#[test]
+fn gpu_composition_matches_cpu_oracle_decode_shaped() {
+    for seed in [0x0123_4567_89AB_CDEF, 0xDEAD_BEEF_CAFE_F00D, 7] {
+        check_composition(&decode_shaped_program(), "DECODE_SHAPED_COMP", seed);
     }
 }
