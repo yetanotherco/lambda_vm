@@ -1,3 +1,4 @@
+#import "@preview/ctheorems:1.1.3": thmrules, thmbox, thmproof
 #import "equate-lite.typ": equate
 
 #let meta = (
@@ -67,9 +68,10 @@
 #let cdsg = todo.with(background: olive, name: "Cyprien")
 
 
+/* Colors from the 3MI brand guidelines */
 #let highlights = (
-  "aside": ("Aside", rgb("55aaff")),
-  "attention": ("Attention", rgb("ff2600")),
+  "aside": ("Aside", rgb("ffd700"), rgb("#1a1a1a")),
+  "attention": ("Attention", rgb("b3261e"), white),
 )
 
 #let highlight(title, body, ref: none, kind: "aside") = [
@@ -88,7 +90,7 @@
   show table: it => html.div(class: "striped", it)
   body
 } else if target() == "paged" {
-  set table(fill: (_, y) => if calc.odd(y) { color.rgb(0, 0, 100, 20) } else { color.rgb(255, 255, 255, 20) })
+  set table(fill: (_, y) => if calc.odd(y) { color.rgb(255, 215, 0, 10%) } else { color.rgb(255, 255, 255, 20) })
   body
 } else {
   assert(false, message: "Unsupported target: " + target())
@@ -105,10 +107,17 @@
       outset: (left: 1em),
       width: 100% + 1em,
       fill: highlights.at(it.kind).at(1),
-      stroke: luma(50%),
-      align(center, strong(text(fill: black, cap)))
+      stroke: rgb("#d7d5cd"),
+      align(center, strong(text(fill: highlights.at(it.kind).at(2), cap)))
     )
-    block(inset: (left: 1em, right: 1em, bottom: 1em), stroke: luma(50%), breakable: false, align(left, it))
+    block(inset: (left: 1em, right: 1em, bottom: 1em), stroke: rgb("#d7d5cd"), breakable: false, align(left, it))
   }
+  show: thmrules.with(qed-symbol: $square$)
   body
 }
+
+// Theorem/lemma formatting
+// TODO: Web override
+#let lemma = thmbox("lemma", "Lemma", fill: rgb("#f2f1ed"), base_level: 0)
+#let corollary = thmbox("lemma", "Corollary", fill: rgb("#f2f1ed"), base_level: 0)
+#let proof = thmproof("proof", "Proof")

@@ -30,7 +30,7 @@
 }
 #show selector.or(..highlights.keys().map(k => figure.where(kind: k))): it => {
   show html.elem.where(tag: "figure"): add-attr("data-kind", "highlight")
-  show html.elem.where(tag: "figcaption"): add-attr("style", "background-color:" + highlights.at(it.kind).at(1).to-hex() + ";")
+  show html.elem.where(tag: "figcaption"): add-attr("style", "background-color:" + highlights.at(it.kind).at(1).to-hex() + ";color:" + highlights.at(it.kind).at(2).to-hex() + ";")
   it
 }
 // TODO: todo callouts (rj/et/cdsg)
@@ -42,7 +42,7 @@
     strong(title);
     list(..chapters.map(((cname, ctitle, cref)) => {
       if cname == chapter {
-        html.a(ctitle, class: "current", tabindex: -1, aria-current: "page")
+        html.a(ctitle, href: "#", class: "current", aria-current: "page")
       } else {
         link(label("doc:" + str(cname)), ctitle)
       }

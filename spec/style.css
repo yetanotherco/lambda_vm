@@ -1,3 +1,40 @@
+/* Brand colors */
+:root {
+  --gold: #ffd700;
+  --gold-hover: #efcb00;
+  --gold-bronze: #6b5200;
+  --accent-ink: #1a1a1a;
+  --logo-field: #0d0d0d;
+
+  --bg: #fbfaf7;
+  --bg-subtle: #f2f1ed;
+  --surface-card: #ffffff;
+  --text: #18181a;
+  --text-muted: #56565c;
+  --border: #e6e4dd;
+  --border-strong: #d7d5cd;
+
+  --link: #6b5200;
+  --status-error: #b3261e;
+  --status-ok: #1c7c43;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --gold-hover: #ffe34d;
+    --bg: #101113;
+    --bg-subtle: #15161a;
+    --surface-card: #1a1b1f;
+    --text: #ededec;
+    --text-muted: #a2a2a8;
+    --border: #2a2b30;
+    --border-strong: #3a3b42;
+    --link: #ffd700;
+    --status-error: #f1707a;
+    --status-ok: #5fcf8e;
+  }
+}
+
+/* Configuration */
 :root {
   --content-max-width: 860px;
   --content-padding-x: 48px;
@@ -5,25 +42,23 @@
   --border-size: 1px;
   --table-header-border-size: 3px;
 
-  --radius: 3px;
+  --radius: 4px;
 
-  --bg: white;
-  --fg: #1a1a1a;
-  --author-fg: #606060;
-  --header-bg: #e8e8e8;
-  --sidebar-bg: #f2f2f2;
-  --sidebar-fg: #303030;
-  --nav-hover-bg: #d6d6d6;
-  --nav-current-bg: #c8c8c8;
-  --link: #4183c4;
-  --link-hover: #1a5276;
-  --code-bg: #f0f0f0;
-  --code-fg: #333;
-  --endnote-fg: #555;
-  --border: #c8c8c8;
-  --table-border: black;
-  --aside-border: #808080;
+  --fg: var(--text);
+  --author-fg: var(--text-muted);
+  --endnote-fg: var(--text-muted);
+  --header-bg: var(--bg-subtle);
+  --sidebar-bg: var(--bg-subtle);
+  --sidebar-fg: var(--text);
+  --code-bg: var(--bg-subtle);
+  --code-fg: var(--text);
+  --table-border: var(--text);
+  --aside-border: var(--border-strong);
   --aside-border-size: 2pt;
+  --link-hover: var(--gold-bronze);
+  --focus-outline-color: var(--text);
+  --nav-hover-bg: color-mix(in srgb, var(--gold) 15%, var(--sidebar-bg));
+  --nav-current-bg: color-mix(in srgb, var(--gold) 28%, var(--sidebar-bg));
 
   /* Try to match typst PDF fonts */
   --font-body: "Libertinus Serif", serif;
@@ -33,6 +68,18 @@
 
   /* Breakpoints (for reference — CSS vars can't be used in @media) */
   /* --bp-mobile: 768px; */
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    /* Exceptions */
+    --link-hover: var(--gold-hover);
+    --focus-outline-color: var(--gold);
+  }
+
+  /* Overwrite typst's syntax highlight colors. We've only seen these two emitted so far */
+  code span[style="color: #4b69c6"] { color: #82aaff !important; }
+  code span[style="color: #d73948"] { color: var(--status-error) !important; }
 }
 
 /* Keep fragment targets (footnote backlinks, in-page references) clear of
@@ -148,6 +195,7 @@ nav li a:hover {
 
 nav li a.current {
   background: var(--nav-current-bg);
+  box-shadow: inset 3px 0 0 var(--gold);
   font-weight: 600;
   pointer-events: none;
 }
@@ -291,12 +339,13 @@ body::before {
   position: sticky;
   top: 0;
   min-height: var(--header-height);
+  z-index: 1; /* Go above the nav bar */
 }
 
 body::after {
     content: "";
     grid-area: headerBorder;
-    background: var(--border);
+    background: var(--gold);
     position: sticky;
     top: var(--header-height);
 }
@@ -327,6 +376,13 @@ a:hover {
   text-decoration: underline;
 }
 
+:focus-visible {
+  outline: 3px solid;
+  outline-color: var(--focus-outline-color);
+  outline-offset: 2px;
+  border-radius: var(--radius);
+}
+
 /* highlights */
 figure[data-kind="highlight"] {
   margin: 1em 0;
@@ -346,8 +402,7 @@ figure[data-kind="highlight"] figcaption {
   /* Separator between title and body */
   border-bottom: var(--aside-border-size) solid var(--aside-border);
 
-  /* Background color is provided through typst */
-  color: black;
+  /* Colors are provided through typst */
   padding: 0.4em 1em;
   font-weight: 600;
   display: block;
@@ -453,7 +508,7 @@ tbody tr th:has(em) {
 }
 
 .striped table tbody tr:nth-child(odd) {
-  background: color-mix(in srgb, var(--link) 8%, var(--bg));
+  background: color-mix(in srgb, var(--gold) 10%, var(--bg));
 }
 
 /* math */

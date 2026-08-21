@@ -18,8 +18,9 @@
 
   font-size: 0.85em;
   color: var(--endnote-fg);
-  background: color-mix(in srgb, var(--link) 8%, var(--bg));
-  border: 1px solid color-mix(in srgb, var(--link) 45%, var(--border));
+  /* Gold-tinted card, works on both light and dark paper */
+  background: color-mix(in srgb, var(--gold) 7%, var(--surface-card));
+  border: 1px solid color-mix(in srgb, var(--gold) 30%, var(--border));
   border-radius: var(--radius);
   padding: 0.4em 0.6em;
 }
