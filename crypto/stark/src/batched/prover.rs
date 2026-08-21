@@ -404,7 +404,8 @@ where
             #[cfg(feature = "disk-spill")]
             storage_mode,
         );
-        let mut lde_trace = lde_trace_of(&ldes, air.step_size(), domain.blowup_factor);
+        let (mut lde_trace, carried_bytes) =
+            lde_trace_take(ldes, air.step_size(), domain.blowup_factor);
 
         let computed = P::compute_composition_parts(
             *air,
@@ -434,14 +435,13 @@ where
         // Parts are RETAINED: rebuilding them is a second constraint evaluation.
         retained_parts[table] = parts;
         release_ldes(
-            ldes,
+            ldes_from_trace(lde_trace, carried_bytes),
             &mut retained_main,
             &mut retained_aux,
             table,
             &mut ledger,
             residency,
         );
-        drop(lde_trace);
     }
 
     let parts_mmcs = parts_builder.finish();
@@ -484,7 +484,8 @@ where
             #[cfg(feature = "disk-spill")]
             storage_mode,
         );
-        let mut lde_trace = lde_trace_of(&ldes, air.step_size(), domain.blowup_factor);
+        let (mut lde_trace, carried_bytes) =
+            lde_trace_take(ldes, air.step_size(), domain.blowup_factor);
         let round3 = P::round_3_evaluate_polynomials_in_out_of_domain_element(
             *air,
             domain,
@@ -493,14 +494,13 @@ where
             &z,
         );
         release_ldes(
-            ldes,
+            ldes_from_trace(lde_trace, carried_bytes),
             &mut retained_main,
             &mut retained_aux,
             table,
             &mut ledger,
             residency,
         );
-        drop(lde_trace);
 
         let (block0, block1) = P::ood_layout(*air).split_full(&round3.trace_ood_evaluations);
         for block in [&block0, &block1] {
@@ -576,7 +576,8 @@ where
                         #[cfg(feature = "disk-spill")]
                         storage_mode,
                     );
-                    let mut lde_trace = lde_trace_of(&ldes, air.step_size(), domain.blowup_factor);
+                    let (mut lde_trace, carried_bytes) =
+                        lde_trace_take(ldes, air.step_size(), domain.blowup_factor);
                     let mut deep = deep_codeword::<Field, FieldExtension, PI, H, P>(
                         *air,
                         domain,
@@ -586,8 +587,14 @@ where
                         &zs[table],
                         &gammas[table],
                     );
-                    release_ldes(ldes, retained_main, retained_aux, table, ledger, residency);
-                    drop(lde_trace);
+                    release_ldes(
+                        ldes_from_trace(lde_trace, carried_bytes),
+                        retained_main,
+                        retained_aux,
+                        table,
+                        ledger,
+                        residency,
+                    );
                     in_place_bit_reverse_permute(&mut deep);
 
                     if plan.batched.contains(&table) {
@@ -965,23 +972,43 @@ fn release_ldes<Field: IsField, FieldExtension: IsField>(
     }
 }
 
-fn lde_trace_of<Field, FieldExtension>(
-    ldes: &LdePair<Field, FieldExtension>,
+/// Move a table's LDE buffers into the trace view the phase reads — no copy.
+/// The phases never mutate the buffers on the host path (the one bulk writer,
+/// the cuda `set_host_data`, only FILLS deliberately-empty buffers), so the
+/// same allocation flows phase → view → [`ldes_from_trace`] → retention, and
+/// the transient double-residency the old clone created — one table's whole
+/// main+aux LDE, invisible to the ledger — is gone.
+fn lde_trace_take<Field, FieldExtension>(
+    ldes: LdePair<Field, FieldExtension>,
     step_size: usize,
     blowup_factor: usize,
-) -> LDETraceTable<Field, FieldExtension>
+) -> (LDETraceTable<Field, FieldExtension>, usize)
 where
     Field: IsFFTField + IsSubFieldOf<FieldExtension>,
     FieldExtension: IsField,
 {
-    LDETraceTable::from_row_major(
-        ldes.main.0.clone(),
-        ldes.main.1,
-        ldes.aux.0.clone(),
-        ldes.aux.1,
-        step_size,
-        blowup_factor,
+    let LdePair { main, aux, bytes } = ldes;
+    (
+        LDETraceTable::from_row_major(main.0, main.1, aux.0, aux.1, step_size, blowup_factor),
+        bytes,
     )
+}
+
+/// Take the buffers back out of the trace view for release or retention —
+/// the inverse of [`lde_trace_take`], carrying the byte account through.
+fn ldes_from_trace<Field, FieldExtension>(
+    lde_trace: LDETraceTable<Field, FieldExtension>,
+    bytes: usize,
+) -> LdePair<Field, FieldExtension>
+where
+    Field: IsFFTField + IsSubFieldOf<FieldExtension>,
+    FieldExtension: IsField,
+{
+    LdePair {
+        main: (lde_trace.main_data, lde_trace.num_main_cols),
+        aux: (lde_trace.aux_data, lde_trace.num_aux_cols),
+        bytes,
+    }
 }
 
 /// One table's DEEP composition codeword, in NATURAL order.
