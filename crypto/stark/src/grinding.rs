@@ -78,10 +78,7 @@ fn is_valid_nonce_for_inner_hash(inner_hash: &[u8; 32], candidate_nonce: u64, li
 /// Returns the bit-string constructed as
 /// Hash(prefix || seed || grinding_factor)
 /// `prefix` is the bit-string `0x123456789abcded`
-///
-/// Public so the GPU parity test can build the same inner-hash lanes the
-/// device kernel searches over.
-pub fn get_inner_hash(seed: &[u8; 32], grinding_factor: u8) -> [u8; 32] {
+fn get_inner_hash(seed: &[u8; 32], grinding_factor: u8) -> [u8; 32] {
     let mut inner_data = [0u8; 41];
     inner_data[0..8].copy_from_slice(&PREFIX);
     inner_data[8..40].copy_from_slice(seed);
@@ -91,13 +88,27 @@ pub fn get_inner_hash(seed: &[u8; 32], grinding_factor: u8) -> [u8; 32] {
     digest[..32].try_into().unwrap()
 }
 
+/// The inner hash as the four little-endian u64 lanes Keccak absorbs it into —
+/// the form the device nonce search takes as input.
+///
+/// The GPU dispatch and its test both go through here rather than each doing
+/// their own byte-to-lane conversion: a second copy would let this one drift
+/// (`from_le_bytes` → `from_be_bytes` reads identically at a glance) with every
+/// test still green, while at runtime `is_valid_nonce` rejected every device
+/// nonce and the search silently sat on the CPU fallback forever.
+pub fn inner_hash_lanes(seed: &[u8; 32], grinding_factor: u8) -> [u64; 4] {
+    let inner_hash = get_inner_hash(seed, grinding_factor);
+    core::array::from_fn(|i| u64::from_le_bytes(inner_hash[i * 8..i * 8 + 8].try_into().unwrap()))
+}
+
 /// Grind on the GPU when a CUDA backend is up, falling back to the CPU search
-/// otherwise (or on any device error). The nonce is the smallest valid one in
-/// the searched range, which — like the CPU's — the verifier accepts by
-/// checking `is_valid_nonce`; nothing downstream depends on which valid nonce
-/// is chosen. The heavy per-table-per-epoch ~2^grinding_factor hashing is the
-/// prover's dominant CPU cost, so this moves it off the 16 cores onto the idle
-/// GPU.
+/// otherwise (or on any device error). Which valid nonce comes back depends on
+/// the arm: the device search returns the smallest in the range it scanned,
+/// while the CPU's `find_any` returns an arbitrary one. Neither is a contract —
+/// the verifier accepts any nonce passing `is_valid_nonce`, and nothing
+/// downstream depends on the choice. The heavy per-table-per-epoch
+/// ~2^grinding_factor hashing is the prover's dominant CPU cost, so this moves
+/// it off the 16 cores onto the idle GPU.
 #[cfg(feature = "cuda")]
 pub fn generate_nonce_maybe_gpu(seed: &[u8; 32], grinding_factor: u8) -> Option<u64> {
     debug_assert!(
@@ -111,11 +122,7 @@ pub fn generate_nonce_maybe_gpu(seed: &[u8; 32], grinding_factor: u8) -> Option<
     if *GPU_DISABLED.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_GPU_GRIND").is_some()) {
         return generate_nonce(seed, grinding_factor);
     }
-    let inner_hash = get_inner_hash(seed, grinding_factor);
-    // Keccak reads the 32-byte inner hash as four little-endian lanes.
-    let inner_lanes: [u64; 4] = core::array::from_fn(|i| {
-        u64::from_le_bytes(inner_hash[i * 8..i * 8 + 8].try_into().unwrap())
-    });
+    let inner_lanes = inner_hash_lanes(seed, grinding_factor);
     if let Some(nonce) = math_cuda::grinding::generate_nonce_gpu(&inner_lanes, grinding_factor) {
         // Validate unconditionally (one host hash against the ~2^grinding_factor
         // device search): a kernel/driver defect must degrade to the CPU search,
@@ -125,7 +132,14 @@ pub fn generate_nonce_maybe_gpu(seed: &[u8; 32], grinding_factor: u8) -> Option<
             crate::gpu_lde::GPU_GRIND_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Some(nonce);
         }
-        log::warn!("GPU grind returned an invalid nonce ({nonce}); falling back to CPU search");
+        // eprintln, not log::warn: the CLI initialises env_logger with no
+        // default filter, so a warn-level line is invisible unless RUST_LOG is
+        // set — and this is the only signal that the kernel has started
+        // returning garbage and the feature has silently reverted to the CPU
+        // search. Matches the `[gpu]` prefix the other device-decline paths use.
+        eprintln!(
+            "[gpu] grind returned an invalid nonce ({nonce}); falling back to the CPU search"
+        );
     }
     generate_nonce(seed, grinding_factor)
 }

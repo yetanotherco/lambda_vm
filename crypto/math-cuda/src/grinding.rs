@@ -20,7 +20,8 @@ const GRIND_MIN_FACTOR: u8 = 12;
 /// is unavailable/errors (the caller then runs the CPU search).
 ///
 /// `inner_lanes` are the four little-endian-read u64 lanes of the 32-byte
-/// `inner_hash` (`get_inner_hash` on the host). `grinding_factor` (1..=64)
+/// inner hash — build them with `stark::grinding::inner_hash_lanes`, which is
+/// what the prover and the tests here both call. `grinding_factor` (1..=64)
 /// fixes `limit = 1 << (64 - grinding_factor)` and sizes the search: the
 /// expected first valid nonce is ~`2^grinding_factor`, so each launch scans a
 /// contiguous block several times that, from 0 upward, and the first block that
