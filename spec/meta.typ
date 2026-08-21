@@ -10,6 +10,7 @@
         ("logup", [`LogUp` argument], <logup>),
         ("memory", [Memory argument], <memory>),
         ("streaming", [Streaming prover], <streaming>),
+        ("verifier", [Verification], <verification>),
     )),
     ("OVERVIEW", (
         ("variables", [Variables], <vars>),
