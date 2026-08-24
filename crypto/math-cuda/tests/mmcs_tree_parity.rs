@@ -27,11 +27,13 @@
 
 use math::field::element::FieldElement;
 use math::field::goldilocks::GoldilocksField;
-use stark::config::KeccakStarkHash;
+use math_cuda::DeviceHash;
+use stark::config::{Blake3StarkHash, KeccakStarkHash};
 use stark::fri::mmcs::{LeafSource, MixedMmcs};
 
 type Fp = FieldElement<GoldilocksField>;
 type Mmcs = MixedMmcs<GoldilocksField, KeccakStarkHash>;
+type MmcsB3 = MixedMmcs<GoldilocksField, Blake3StarkHash>;
 
 /// Bit-reversed row-major matrices, the layout the MMCS commits and the layout
 /// `mmcs_absorb_row_pair_row_major` reads (the kernel bit-reverses internally, so
@@ -74,6 +76,10 @@ fn raw(data: &[Fp]) -> Vec<u64> {
 /// freeing each matrix's device buffer before the next — the residency policy the
 /// whole design exists for.
 fn device_tree(mats: &Matrices) -> ([u8; 32], Vec<u8>) {
+    device_tree_with(mats, DeviceHash::Keccak256)
+}
+
+fn device_tree_with(mats: &Matrices, hash: DeviceHash) -> ([u8; 32], Vec<u8>) {
     let be = math_cuda::device::backend().expect("a GPU box: no backend means nothing to test");
     let stream = be.next_stream();
 
@@ -92,8 +98,8 @@ fn device_tree(mats: &Matrices) -> ([u8; 32], Vec<u8>) {
         if group.is_empty() {
             continue;
         }
-        let mut hasher = math_cuda::mmcs::MmcsGroupHasher::new(&stream, h as u64)
-            .expect("group sponge allocation");
+        let mut hasher = math_cuda::mmcs::MmcsGroupHasher::new(&stream, h as u64, hash)
+            .expect("group state allocation");
         for &m in &group {
             let (data, _, width) = &mats.mats[m];
             let dev = stream.clone_htod(&raw(data)).expect("H2D");
@@ -106,7 +112,7 @@ fn device_tree(mats: &Matrices) -> ([u8; 32], Vec<u8>) {
         *slot = Some(hasher.finalize(&stream).expect("finalize"));
     }
 
-    let nodes = math_cuda::mmcs::build_mmcs_tree_on_device(&stream, &group_digests)
+    let nodes = math_cuda::mmcs::build_mmcs_tree_on_device(&stream, &group_digests, hash)
         .expect("device tree build");
     let root = math_cuda::mmcs::read_mmcs_root(&stream, &nodes).expect("root readback");
     let all = stream.clone_dtoh(&nodes).expect("node readback");
@@ -195,6 +201,108 @@ fn paths_match_the_host_at_every_query() {
                 &node[..],
                 "query {iota}, level {level}: the device path must be the host path — \
                  `merkle_gather_paths` is reused precisely because the layouts agree"
+            );
+        }
+    }
+}
+
+// ── The BLAKE3 arm: the same contract under the chain hash ───────────────────
+
+#[test]
+fn blake3_single_matrix_mmcs_root_matches_the_per_table_tree() {
+    let mats = Matrices {
+        mats: vec![matrix(6, 5, 7)],
+    };
+    let (device_root, _) = device_tree_with(&mats, DeviceHash::Blake3);
+    assert_eq!(
+        device_root,
+        MmcsB3::commit(&mats).root(),
+        "a one-matrix BLAKE3 MMCS must be the existing row-pair tree, byte for byte"
+    );
+}
+
+#[test]
+fn blake3_mixed_height_root_matches_the_host() {
+    let mats = Matrices {
+        mats: vec![
+            matrix(7, 3, 11),
+            matrix(7, 6, 23),
+            matrix(5, 2, 41),
+            matrix(2, 4, 59),
+        ],
+    };
+    let (device_root, _) = device_tree_with(&mats, DeviceHash::Blake3);
+    assert_eq!(
+        device_root,
+        MmcsB3::commit(&mats).root(),
+        "the BLAKE3 device climb with injection must reproduce the host tree"
+    );
+}
+
+#[test]
+fn blake3_absorption_order_is_bound() {
+    let forward = Matrices {
+        mats: vec![matrix(6, 3, 11), matrix(6, 3, 23)],
+    };
+    let reversed = Matrices {
+        mats: vec![matrix(6, 3, 23), matrix(6, 3, 11)],
+    };
+    let (forward_root, _) = device_tree_with(&forward, DeviceHash::Blake3);
+    let (reversed_root, _) = device_tree_with(&reversed, DeviceHash::Blake3);
+
+    assert_eq!(forward_root, MmcsB3::commit(&forward).root());
+    assert_eq!(reversed_root, MmcsB3::commit(&reversed).root());
+    assert_ne!(
+        forward_root, reversed_root,
+        "two same-shape matrices absorbed in the other order must commit a \
+         different tree — input order is part of the commitment"
+    );
+}
+
+#[test]
+fn blake3_multi_block_leaves_cross_block_boundaries() {
+    // 11 columns per matrix, two matrices: 44 felts per leaf = 352 bytes =
+    // 5.5 blocks, so the chain's held-block state machine crosses block
+    // boundaries mid-absorb and between absorbs. A framing bug that only
+    // shows past one block hides from narrow shapes.
+    let mats = Matrices {
+        mats: vec![matrix(6, 11, 13), matrix(6, 11, 29)],
+    };
+    let (device_root, _) = device_tree_with(&mats, DeviceHash::Blake3);
+    assert_eq!(
+        device_root,
+        MmcsB3::commit(&mats).root(),
+        "multi-block BLAKE3 leaves must chain across absorb calls exactly as the host"
+    );
+}
+
+#[test]
+fn blake3_paths_match_the_host_at_every_query() {
+    let mats = Matrices {
+        mats: vec![matrix(6, 3, 11), matrix(6, 2, 23), matrix(4, 5, 41)],
+    };
+    let host = MmcsB3::commit(&mats);
+    let (device_root, nodes_host) = device_tree_with(&mats, DeviceHash::Blake3);
+    assert_eq!(device_root, host.root());
+
+    let be = math_cuda::device::backend().expect("a GPU box");
+    let stream = be.next_stream();
+    let nodes = stream.clone_htod(&nodes_host).expect("H2D nodes");
+
+    let leaves_len = 1usize << (host.h_max() - 1);
+    let positions: Vec<u32> = (0..leaves_len as u32).collect();
+    let depth = host.h_max() - 1;
+    let paths = math_cuda::merkle::gather_merkle_paths_dev(&nodes, leaves_len, &positions, &stream)
+        .expect("path gather");
+
+    for iota in 0..leaves_len {
+        let expected = host.open_batch(iota, &mats).proof.merkle_path;
+        for (level, node) in expected.iter().enumerate() {
+            let start = (iota * depth + level) * 32;
+            assert_eq!(
+                &paths[start..start + 32],
+                &node[..],
+                "query {iota}, level {level}: the BLAKE3 device path must be the host path"
             );
         }
     }

@@ -614,6 +614,191 @@ extern "C" __global__ void blake3_merkle_tail(uint8_t *nodes, uint64_t level_beg
 }
 
 // ---------------------------------------------------------------------------
+// Mixed-height MMCS under BLAKE3 — twins of `keccak.cu`'s mmcs kernels, chain
+// for sponge. The host contract is the same single source of truth
+// (`crypto/stark/src/fri/mmcs.rs`, the STREAMING builder): leaf `k` of a height
+// group is `Blake3Chain` over the concatenation, in INPUT order, of each
+// matrix's bit-reversed rows `2k` and `2k+1`; the climb compresses pairs and,
+// where a shorter group injects, compresses the parent again with that group's
+// leaf digest — both single-block parent compressions.
+//
+// Retained state is 104 bytes per leaf (26 u32: cv[8], the pending block's 16
+// words, nwords, started), against keccak's 204. The absorbed byte stream is
+// identical to the keccak twins': same bit reversal, same column/component
+// order, same row-pair order — `blake3_leaves_base_row_major_row_pair` is the
+// single-matrix case of the row-major absorb below.
+// ---------------------------------------------------------------------------
+
+// 26 u32s per leaf: cv, pending block, nwords, started.
+#define BLAKE3_MMCS_STATE_WORDS 26
+
+__device__ __forceinline__ void blake3_chain_load(const uint32_t *st, Blake3Chain &h) {
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) h.cv[i] = st[i];
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) h.block.m[i] = st[8 + i];
+    h.block.nwords = st[24];
+    h.started = st[25] != 0u;
+}
+
+__device__ __forceinline__ void blake3_chain_store(uint32_t *st, const Blake3Chain &h) {
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) st[i] = h.cv[i];
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) st[8 + i] = h.block.m[i];
+    st[24] = h.block.nwords;
+    st[25] = h.started ? 1u : 0u;
+}
+
+// Per-leaf chain state, initialized. `states` is
+// `num_leaves * BLAKE3_MMCS_STATE_WORDS` u32s.
+extern "C" __global__ void blake3_mmcs_states_init(
+    uint32_t *states,
+    uint64_t num_leaves)
+{
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_leaves) return;
+    Blake3Chain h;
+    h.init();
+    blake3_chain_store(states + tid * BLAKE3_MMCS_STATE_WORDS, h);
+}
+
+// Absorb one ROW-MAJOR matrix's row pair into every leaf's running chain.
+// Same signature and read pattern as `mmcs_absorb_row_pair_row_major`.
+extern "C" __global__ void blake3_mmcs_absorb_row_pair_row_major(
+    uint32_t *states,
+    const uint64_t *data,
+    uint64_t m,
+    uint64_t col_start,
+    uint64_t col_end,
+    uint64_t num_rows,
+    uint64_t log_num_rows,
+    uint64_t num_leaves)
+{
+    (void)num_rows;
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_leaves) return;
+
+    uint64_t br_0 = __brevll(2 * tid) >> (64 - log_num_rows);
+    uint64_t br_1 = __brevll(2 * tid + 1) >> (64 - log_num_rows);
+    const uint64_t *row_0 = data + br_0 * m;
+    const uint64_t *row_1 = data + br_1 * m;
+
+    Blake3Chain h;
+    blake3_chain_load(states + tid * BLAKE3_MMCS_STATE_WORDS, h);
+
+    for (uint64_t c = col_start; c < col_end; ++c) h.push_felt(row_0[c]);
+    for (uint64_t c = col_start; c < col_end; ++c) h.push_felt(row_1[c]);
+
+    blake3_chain_store(states + tid * BLAKE3_MMCS_STATE_WORDS, h);
+}
+
+// Absorb one COLUMN-MAJOR ext3 slab matrix's row pair — the composition-poly
+// LDE layout. Same signature and read pattern as
+// `mmcs_absorb_row_pair_ext3_slabs`; `blake3_comp_poly_leaves_ext3` is this
+// kernel's single-matrix case.
+extern "C" __global__ void blake3_mmcs_absorb_row_pair_ext3_slabs(
+    uint32_t *states,
+    const uint64_t *parts_base_ptr,
+    uint64_t col_stride,
+    uint64_t num_parts,
+    uint64_t num_rows,
+    uint64_t log_num_rows,
+    uint64_t num_leaves)
+{
+    (void)num_rows;
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_leaves) return;
+
+    uint64_t br_0 = __brevll(2 * tid) >> (64 - log_num_rows);
+    uint64_t br_1 = __brevll(2 * tid + 1) >> (64 - log_num_rows);
+
+    Blake3Chain h;
+    blake3_chain_load(states + tid * BLAKE3_MMCS_STATE_WORDS, h);
+
+    for (uint64_t p = 0; p < num_parts; ++p) {
+        #pragma unroll
+        for (int k = 0; k < 3; ++k) {
+            h.push_felt(parts_base_ptr[(p * 3 + (uint64_t)k) * col_stride + br_0]);
+        }
+    }
+    for (uint64_t p = 0; p < num_parts; ++p) {
+        #pragma unroll
+        for (int k = 0; k < 3; ++k) {
+            h.push_felt(parts_base_ptr[(p * 3 + (uint64_t)k) * col_stride + br_1]);
+        }
+    }
+
+    blake3_chain_store(states + tid * BLAKE3_MMCS_STATE_WORDS, h);
+}
+
+// Finalize every leaf's chain into its 32-byte digest.
+extern "C" __global__ void blake3_mmcs_states_finalize(
+    const uint32_t *states,
+    uint64_t num_leaves,
+    uint8_t *digests_out)
+{
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_leaves) return;
+    Blake3Chain h;
+    blake3_chain_load(states + tid * BLAKE3_MMCS_STATE_WORDS, h);
+    h.finalize(digests_out + tid * 32);
+}
+
+// Parent of two 32-byte digests at arbitrary addresses — the same single-block
+// compression `blake3_hash_merkle_parent` does inside the node buffer.
+__device__ __forceinline__ void blake3_parent_of(const uint32_t *left, const uint32_t *right,
+                                                 uint32_t *dst) {
+    uint32_t m[16];
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        m[i] = left[i];
+        m[i + 8] = right[i];
+    }
+    uint32_t out[16];
+    blake3_compress<BLAKE3_ROUNDS>(BLAKE3_IV, m, 0, BLAKE3_PARENT_BLOCK_LEN,
+                                   BLAKE3_FLAGS_ONE_BLOCK, out);
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) dst[i] = out[i];
+}
+
+// One climb level of the mixed-height tree: `parent = P(left, right)`, and
+// where a shorter height group injects at this level,
+// `parent = P(parent, inject[j])`. Twin of `keccak_mmcs_level`, node indexing
+// identical.
+extern "C" __global__ void blake3_mmcs_level(
+    uint8_t *nodes,
+    uint64_t parent_begin,
+    uint64_t n_pairs,
+    const uint8_t *inject,
+    uint32_t has_inject)
+{
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n_pairs) return;
+
+    const uint32_t *left = reinterpret_cast<const uint32_t *>(
+        nodes + (parent_begin + n_pairs + 2 * tid) * 32);
+    const uint32_t *right = reinterpret_cast<const uint32_t *>(
+        nodes + (parent_begin + n_pairs + 2 * tid + 1) * 32);
+
+    uint32_t parent[8];
+    blake3_parent_of(left, right, parent);
+
+    uint32_t *out = reinterpret_cast<uint32_t *>(nodes + (parent_begin + tid) * 32);
+    if (!has_inject) {
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) out[i] = parent[i];
+        return;
+    }
+
+    const uint32_t *inj = reinterpret_cast<const uint32_t *>(inject + tid * 32);
+    uint32_t folded[8];
+    blake3_parent_of(parent, inj, folded);
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) out[i] = folded[i];
+}
+
+// ---------------------------------------------------------------------------
 // Parity-harness entry points.
 //
 // The device compression function is not otherwise reachable from host code, so

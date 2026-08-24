@@ -2,10 +2,12 @@
 //! matrices.
 //!
 //! The host contract this must reproduce byte for byte lives in
-//! `crypto/stark/src/fri/mmcs.rs`: leaf `k` of a height group is Keccak-256 over
-//! the concatenation, in INPUT order, of each matrix's bit-reversed rows `2k` and
-//! `2k+1`; the climb compresses pairs and, where a shorter group's height matches
-//! the halved layer, compresses the parent again with that group's leaf digest.
+//! `crypto/stark/src/fri/mmcs.rs`: leaf `k` of a height group is the
+//! configuration's batched hash over the concatenation, in INPUT order, of each
+//! matrix's bit-reversed rows `2k` and `2k+1`; the climb compresses pairs and,
+//! where a shorter group's height matches the halved layer, compresses the
+//! parent again with that group's leaf digest. Both kernel families implement
+//! it — [`DeviceHash`] selects at every launch.
 //!
 //! # Why this mirrors the streaming builder, not `commit`
 //!
@@ -17,8 +19,9 @@
 //! are absorbed into it one at a time, so the caller produces one matrix's LDE on
 //! device, absorbs it, and frees it.
 //!
-//! Sponge state is 204 bytes per leaf (25 lanes plus the rate cursor):
-//! ~214 MiB at 2^20 leaves, against one full LDE per matrix in the group.
+//! Retained state per leaf: 204 bytes under keccak (25 lanes plus the rate
+//! cursor), 104 under BLAKE3 (the chain's cv + pending block) — ~214 / ~109 MiB
+//! at 2^20 leaves, against one full LDE per matrix in the group.
 //!
 //! # Node layout, and why the path gather is unchanged
 //!
@@ -33,9 +36,15 @@
 use cudarc::driver::{CudaSlice, CudaStream, PushKernelArg};
 use std::sync::Arc;
 
+use crate::DeviceHash;
 use crate::Result;
+use crate::blake3::blake3_launch_cfg;
 use crate::device::backend;
 use crate::merkle::keccak_launch_cfg;
+
+/// 26 u32s per leaf: cv, the pending block's words, nwords, started. Mirrors
+/// `BLAKE3_MMCS_STATE_WORDS` in `kernels/blake3.cu`.
+const BLAKE3_MMCS_STATE_WORDS: usize = 26;
 
 /// One height group's per-leaf sponges, live on device between absorptions.
 ///
@@ -43,8 +52,7 @@ use crate::merkle::keccak_launch_cfg;
 /// [`Self::absorb_ext3_slabs`] once per matrix at that height IN INPUT ORDER
 /// (the leaf concatenation binds that order), then [`Self::finalize`].
 pub struct MmcsGroupHasher {
-    states: CudaSlice<u64>,
-    rate_pos: CudaSlice<u32>,
+    state: HasherState,
     num_leaves: u64,
     /// `log2` of the group's row count — every matrix absorbed here must have it,
     /// since they share the leaves.
@@ -52,35 +60,67 @@ pub struct MmcsGroupHasher {
     absorbed: usize,
 }
 
+/// The per-leaf running state, shaped by the hash family: keccak keeps the 25
+/// sponge lanes plus a rate cursor, BLAKE3 the chain's cv + pending block.
+enum HasherState {
+    Keccak {
+        states: CudaSlice<u64>,
+        rate_pos: CudaSlice<u32>,
+    },
+    Blake3 {
+        states: CudaSlice<u32>,
+    },
+}
+
 impl MmcsGroupHasher {
-    /// Zeroed sponges for a height group of `2^log_num_rows` rows, i.e.
-    /// `2^(log_num_rows - 1)` leaves.
-    pub fn new(stream: &Arc<CudaStream>, log_num_rows: u64) -> Result<Self> {
+    /// Initialized per-leaf states for a height group of `2^log_num_rows`
+    /// rows, i.e. `2^(log_num_rows - 1)` leaves, under the given hash family.
+    pub fn new(stream: &Arc<CudaStream>, log_num_rows: u64, hash: DeviceHash) -> Result<Self> {
         assert!(
             log_num_rows >= 1,
             "row-pair leaves need at least 2 rows (log_num_rows >= 1)"
         );
         let be = backend()?;
         let num_leaves = 1u64 << (log_num_rows - 1);
-        let mut states = stream.alloc_zeros::<u64>((num_leaves * 25) as usize)?;
-        let mut rate_pos = stream.alloc_zeros::<u32>(num_leaves as usize)?;
 
-        // `alloc_zeros` already gives the state we want; the kernel runs anyway so
-        // the zeroing is this module's own statement rather than an allocator
-        // property a future change could quietly take away.
-        let cfg = keccak_launch_cfg(num_leaves);
-        unsafe {
-            stream
-                .launch_builder(&be.mmcs_states_init)
-                .arg(&mut states)
-                .arg(&mut rate_pos)
-                .arg(&num_leaves)
-                .launch(cfg)?;
-        }
+        let state = match hash {
+            DeviceHash::Keccak256 => {
+                let mut states = stream.alloc_zeros::<u64>((num_leaves * 25) as usize)?;
+                let mut rate_pos = stream.alloc_zeros::<u32>(num_leaves as usize)?;
+                // `alloc_zeros` already gives the state we want; the kernel runs
+                // anyway so the zeroing is this module's own statement rather
+                // than an allocator property a future change could quietly take
+                // away.
+                let cfg = keccak_launch_cfg(num_leaves);
+                unsafe {
+                    stream
+                        .launch_builder(&be.mmcs_states_init)
+                        .arg(&mut states)
+                        .arg(&mut rate_pos)
+                        .arg(&num_leaves)
+                        .launch(cfg)?;
+                }
+                HasherState::Keccak { states, rate_pos }
+            }
+            DeviceHash::Blake3 => {
+                let mut states =
+                    stream.alloc_zeros::<u32>((num_leaves as usize) * BLAKE3_MMCS_STATE_WORDS)?;
+                // The chain's initial cv is the IV, not zero — the init kernel
+                // is load-bearing here, not a statement.
+                let cfg = blake3_launch_cfg(num_leaves);
+                unsafe {
+                    stream
+                        .launch_builder(&be.blake3_mmcs_states_init)
+                        .arg(&mut states)
+                        .arg(&num_leaves)
+                        .launch(cfg)?;
+                }
+                HasherState::Blake3 { states }
+            }
+        };
 
         Ok(Self {
-            states,
-            rate_pos,
+            state,
             num_leaves,
             log_num_rows,
             absorbed: 0,
@@ -112,20 +152,40 @@ impl MmcsGroupHasher {
         );
         let be = backend()?;
         let num_rows = 1u64 << self.log_num_rows;
-        let cfg = keccak_launch_cfg(self.num_leaves);
-        unsafe {
-            stream
-                .launch_builder(&be.mmcs_absorb_row_pair_row_major)
-                .arg(&mut self.states)
-                .arg(&mut self.rate_pos)
-                .arg(data)
-                .arg(&row_stride)
-                .arg(&col_start)
-                .arg(&col_end)
-                .arg(&num_rows)
-                .arg(&self.log_num_rows)
-                .arg(&self.num_leaves)
-                .launch(cfg)?;
+        match &mut self.state {
+            HasherState::Keccak { states, rate_pos } => {
+                let cfg = keccak_launch_cfg(self.num_leaves);
+                unsafe {
+                    stream
+                        .launch_builder(&be.mmcs_absorb_row_pair_row_major)
+                        .arg(states)
+                        .arg(rate_pos)
+                        .arg(data)
+                        .arg(&row_stride)
+                        .arg(&col_start)
+                        .arg(&col_end)
+                        .arg(&num_rows)
+                        .arg(&self.log_num_rows)
+                        .arg(&self.num_leaves)
+                        .launch(cfg)?;
+                }
+            }
+            HasherState::Blake3 { states } => {
+                let cfg = blake3_launch_cfg(self.num_leaves);
+                unsafe {
+                    stream
+                        .launch_builder(&be.blake3_mmcs_absorb_row_pair_row_major)
+                        .arg(states)
+                        .arg(data)
+                        .arg(&row_stride)
+                        .arg(&col_start)
+                        .arg(&col_end)
+                        .arg(&num_rows)
+                        .arg(&self.log_num_rows)
+                        .arg(&self.num_leaves)
+                        .launch(cfg)?;
+                }
+            }
         }
         self.absorbed += 1;
         Ok(())
@@ -142,19 +202,38 @@ impl MmcsGroupHasher {
     ) -> Result<()> {
         let be = backend()?;
         let num_rows = 1u64 << self.log_num_rows;
-        let cfg = keccak_launch_cfg(self.num_leaves);
-        unsafe {
-            stream
-                .launch_builder(&be.mmcs_absorb_row_pair_ext3_slabs)
-                .arg(&mut self.states)
-                .arg(&mut self.rate_pos)
-                .arg(parts)
-                .arg(&col_stride)
-                .arg(&num_parts)
-                .arg(&num_rows)
-                .arg(&self.log_num_rows)
-                .arg(&self.num_leaves)
-                .launch(cfg)?;
+        match &mut self.state {
+            HasherState::Keccak { states, rate_pos } => {
+                let cfg = keccak_launch_cfg(self.num_leaves);
+                unsafe {
+                    stream
+                        .launch_builder(&be.mmcs_absorb_row_pair_ext3_slabs)
+                        .arg(states)
+                        .arg(rate_pos)
+                        .arg(parts)
+                        .arg(&col_stride)
+                        .arg(&num_parts)
+                        .arg(&num_rows)
+                        .arg(&self.log_num_rows)
+                        .arg(&self.num_leaves)
+                        .launch(cfg)?;
+                }
+            }
+            HasherState::Blake3 { states } => {
+                let cfg = blake3_launch_cfg(self.num_leaves);
+                unsafe {
+                    stream
+                        .launch_builder(&be.blake3_mmcs_absorb_row_pair_ext3_slabs)
+                        .arg(states)
+                        .arg(parts)
+                        .arg(&col_stride)
+                        .arg(&num_parts)
+                        .arg(&num_rows)
+                        .arg(&self.log_num_rows)
+                        .arg(&self.num_leaves)
+                        .launch(cfg)?;
+                }
+            }
         }
         self.absorbed += 1;
         Ok(())
@@ -170,15 +249,30 @@ impl MmcsGroupHasher {
         );
         let be = backend()?;
         let mut digests = stream.alloc_zeros::<u8>((self.num_leaves * 32) as usize)?;
-        let cfg = keccak_launch_cfg(self.num_leaves);
-        unsafe {
-            stream
-                .launch_builder(&be.mmcs_states_finalize)
-                .arg(&self.states)
-                .arg(&self.rate_pos)
-                .arg(&self.num_leaves)
-                .arg(&mut digests)
-                .launch(cfg)?;
+        match &self.state {
+            HasherState::Keccak { states, rate_pos } => {
+                let cfg = keccak_launch_cfg(self.num_leaves);
+                unsafe {
+                    stream
+                        .launch_builder(&be.mmcs_states_finalize)
+                        .arg(states)
+                        .arg(rate_pos)
+                        .arg(&self.num_leaves)
+                        .arg(&mut digests)
+                        .launch(cfg)?;
+                }
+            }
+            HasherState::Blake3 { states } => {
+                let cfg = blake3_launch_cfg(self.num_leaves);
+                unsafe {
+                    stream
+                        .launch_builder(&be.blake3_mmcs_states_finalize)
+                        .arg(states)
+                        .arg(&self.num_leaves)
+                        .arg(&mut digests)
+                        .launch(cfg)?;
+                }
+            }
         }
         Ok(digests)
     }
@@ -197,6 +291,7 @@ impl MmcsGroupHasher {
 pub fn build_mmcs_tree_on_device(
     stream: &Arc<CudaStream>,
     group_digests: &[Option<CudaSlice<u8>>],
+    hash: DeviceHash,
 ) -> Result<CudaSlice<u8>> {
     let h_max = group_digests.len() - 1;
     assert!(
@@ -226,15 +321,21 @@ pub fn build_mmcs_tree_on_device(
         let injected = group_digests.get(inject_h).and_then(Option::as_ref);
         let has_inject: u32 = u32::from(injected.is_some());
 
-        // `keccak_mmcs_level` reads `inject` only when `has_inject` is set, so a
-        // level with no injection still needs a pointer argument. Reuse the
-        // node buffer's own base rather than allocating a dummy: it is a valid
-        // device pointer that the kernel provably never dereferences.
-        let cfg = keccak_launch_cfg(n_pairs);
+        // The level kernels read `inject` only when `has_inject` is set, so a
+        // level with no injection still needs a valid pointer argument that is
+        // provably never dereferenced.
+        let level_fn = match hash {
+            DeviceHash::Keccak256 => &be.keccak_mmcs_level,
+            DeviceHash::Blake3 => &be.blake3_mmcs_level,
+        };
+        let cfg = match hash {
+            DeviceHash::Keccak256 => keccak_launch_cfg(n_pairs),
+            DeviceHash::Blake3 => blake3_launch_cfg(n_pairs),
+        };
         match injected {
             Some(digests) => unsafe {
                 stream
-                    .launch_builder(&be.keccak_mmcs_level)
+                    .launch_builder(level_fn)
                     .arg(&mut nodes)
                     .arg(&new_begin)
                     .arg(&n_pairs)
@@ -246,7 +347,7 @@ pub fn build_mmcs_tree_on_device(
                 let empty = stream.alloc_zeros::<u8>(32)?;
                 unsafe {
                     stream
-                        .launch_builder(&be.keccak_mmcs_level)
+                        .launch_builder(level_fn)
                         .arg(&mut nodes)
                         .arg(&new_begin)
                         .arg(&n_pairs)

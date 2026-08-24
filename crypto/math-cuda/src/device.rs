@@ -211,6 +211,11 @@ pub struct Backend {
     pub mmcs_absorb_row_pair_ext3_slabs: CudaFunction,
     pub mmcs_states_finalize: CudaFunction,
     pub keccak_mmcs_level: CudaFunction,
+    pub blake3_mmcs_states_init: CudaFunction,
+    pub blake3_mmcs_absorb_row_pair_row_major: CudaFunction,
+    pub blake3_mmcs_absorb_row_pair_ext3_slabs: CudaFunction,
+    pub blake3_mmcs_states_finalize: CudaFunction,
+    pub blake3_mmcs_level: CudaFunction,
 
     // blake3.cubin — the leaf kernels, the Merkle level/tail compressors, and
     // the parity-harness probes that are the only host-visible handle on the
@@ -480,6 +485,13 @@ impl Backend {
                 .load_function("mmcs_absorb_row_pair_ext3_slabs")?,
             mmcs_states_finalize: keccak.load_function("mmcs_states_finalize")?,
             keccak_mmcs_level: keccak.load_function("keccak_mmcs_level")?,
+            blake3_mmcs_states_init: blake3.load_function("blake3_mmcs_states_init")?,
+            blake3_mmcs_absorb_row_pair_row_major: blake3
+                .load_function("blake3_mmcs_absorb_row_pair_row_major")?,
+            blake3_mmcs_absorb_row_pair_ext3_slabs: blake3
+                .load_function("blake3_mmcs_absorb_row_pair_ext3_slabs")?,
+            blake3_mmcs_states_finalize: blake3.load_function("blake3_mmcs_states_finalize")?,
+            blake3_mmcs_level: blake3.load_function("blake3_mmcs_level")?,
             blake3_leaves_base_row_major_row_pair: blake3
                 .load_function("blake3_leaves_base_row_major_row_pair")?,
             blake3_leaves_base_row_major_row_pair_range: blake3
