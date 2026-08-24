@@ -32,6 +32,23 @@ use crate::device::{Backend, backend};
 
 pub type Result<T> = std::result::Result<T, cudarc::driver::DriverError>;
 
+/// Which hash family a device tree build launches.
+///
+/// The fused LDE+commit pipelines ([`lde`]), the composition-poly tree
+/// builders ([`merkle`] / [`blake3`]) and the FRI layer commits ([`fri`])
+/// each exist kernel-for-kernel in both families; this enum is the dispatch
+/// key callers pass down. It deliberately carries no round counts or
+/// parameters: within one build each family is a single concrete hash
+/// (keccak-256, or `Blake3Chain` at the compiled round count), exactly as on
+/// the host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceHash {
+    /// Keccak-256 leaves and parents.
+    Keccak256,
+    /// `Blake3Chain` leaves and parents at the compiled round count.
+    Blake3,
+}
+
 /// Toolchain sanity: plain wrapping u64 vector add. Not a field op.
 pub fn vector_add_u64(a: &[u64], b: &[u64]) -> Result<Vec<u64>> {
     launch_binary_u64(a, b, |be| &be.vector_add_u64)

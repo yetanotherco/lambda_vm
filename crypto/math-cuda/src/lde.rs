@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use cudarc::driver::{CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 
+use crate::DeviceHash;
 use crate::Result;
 use crate::device::{Backend, backend};
 use crate::merkle::{keccak_launch_cfg, launch_keccak_base, launch_keccak_base_row_pair};
@@ -33,7 +34,7 @@ fn assert_u32_domain(n: usize, what: &str) {
 
 /// Output shape requested from the fused LDE + Keccak entry points.
 #[derive(Copy, Clone, PartialEq, Eq)]
-enum KeccakCommit {
+enum TreeCommit {
     /// Only the keccak-256 leaves; no inner-tree build. Caller receives
     /// `num_leaves * 32` bytes.
     LeavesOnly,
@@ -42,18 +43,18 @@ enum KeccakCommit {
     FullTree,
 }
 
-impl KeccakCommit {
+impl TreeCommit {
     fn total_nodes_bytes(self, num_leaves: usize) -> usize {
         match self {
-            KeccakCommit::LeavesOnly => num_leaves * 32,
-            KeccakCommit::FullTree => (2 * num_leaves - 1) * 32,
+            TreeCommit::LeavesOnly => num_leaves * 32,
+            TreeCommit::FullTree => (2 * num_leaves - 1) * 32,
         }
     }
 
     fn leaves_offset_bytes(self, num_leaves: usize) -> usize {
         match self {
-            KeccakCommit::LeavesOnly => 0,
-            KeccakCommit::FullTree => (num_leaves - 1) * 32,
+            TreeCommit::LeavesOnly => 0,
+            TreeCommit::FullTree => (num_leaves - 1) * 32,
         }
     }
 }
@@ -520,7 +521,8 @@ fn expand_row_major_on_stream(
     Ok((buf, trace_col_major))
 }
 
-/// Shared row-major LDE + Keccak + Merkle pipeline for the base and ext3 paths.
+/// Shared row-major LDE + leaf-hash + Merkle pipeline for the base and ext3
+/// paths, committing with the kernel family `hash` selects.
 ///
 /// `total_cols` is the number of base-field columns in the row-major layout:
 /// `m` for base, `m * 3` for ext3. Because `Fp3 = [u64; 3]`, the three ext3
@@ -533,10 +535,29 @@ fn expand_row_major_on_stream(
 /// `retain_trace_col_major`). The buffer is transposed to column-major (as
 /// required by the downstream GPU kernels DEEP/barycentric); callers wrap it in
 /// the appropriate LDE handle.
+/// Walk the inner Merkle levels with the kernel family `hash` selects.
+fn build_inner_tree_levels_for(
+    hash: DeviceHash,
+    stream: &CudaStream,
+    be: &crate::device::Backend,
+    nodes_dev: &mut CudaSlice<u8>,
+    leaves_len: usize,
+) -> Result<()> {
+    match hash {
+        DeviceHash::Keccak256 => {
+            crate::merkle::build_inner_tree_levels(stream, be, nodes_dev, leaves_len)
+        }
+        DeviceHash::Blake3 => {
+            crate::blake3::build_inner_tree_levels(stream, be, nodes_dev, leaves_len)
+        }
+    }
+}
+
 #[allow(clippy::type_complexity)]
 #[allow(clippy::too_many_arguments)]
 fn coset_lde_row_major_inner(
     input: InnerInput,
+    hash: DeviceHash,
     n: usize,
     total_cols: usize,
     blowup_factor: usize,
@@ -567,7 +588,7 @@ fn coset_lde_row_major_inner(
     // verifier's `verify_opening_pair`. `lde_size` is a power of two >= 2, so it
     // is always even.
     let num_leaves = lde_size / 2;
-    let nodes_bytes = KeccakCommit::FullTree.total_nodes_bytes(num_leaves);
+    let nodes_bytes = TreeCommit::FullTree.total_nodes_bytes(num_leaves);
     let log_lde = lde_size.trailing_zeros() as u64;
     let lde_u64 = lde_size as u64;
     let cols_u64 = total_cols as u64;
@@ -586,24 +607,36 @@ fn coset_lde_row_major_inner(
         retain_trace_col_major,
     )?;
 
-    // Keccak + Merkle on-device. Each row-pair leaf reads two bit-reversed rows
-    // of `total_cols` consecutive u64s (`lde_u64` is the bit-reverse modulus; the
-    // kernel emits `lde_size / 2` leaves).
+    // Leaf hashing + Merkle on-device, with the kernel family `hash` selects.
+    // Each row-pair leaf reads two bit-reversed rows of `total_cols` consecutive
+    // u64s (`lde_u64` is the bit-reverse modulus; the kernel emits
+    // `lde_size / 2` leaves).
     let mut nodes_dev = unsafe { stream.alloc::<u8>(nodes_bytes) }?;
-    let leaves_offset = KeccakCommit::FullTree.leaves_offset_bytes(num_leaves);
+    let leaves_offset = TreeCommit::FullTree.leaves_offset_bytes(num_leaves);
     {
         let mut leaves_view = nodes_dev.slice_mut(leaves_offset..leaves_offset + num_leaves * 32);
-        launch_keccak_base_row_major_row_pair(
-            stream.as_ref(),
-            be,
-            &buf,
-            cols_u64,
-            lde_u64,
-            log_lde,
-            &mut leaves_view,
-        )?;
+        match hash {
+            DeviceHash::Keccak256 => launch_keccak_base_row_major_row_pair(
+                stream.as_ref(),
+                be,
+                &buf,
+                cols_u64,
+                lde_u64,
+                log_lde,
+                &mut leaves_view,
+            )?,
+            DeviceHash::Blake3 => crate::blake3::launch_leaves_base_row_major_row_pair(
+                stream.as_ref(),
+                be,
+                &buf,
+                cols_u64,
+                lde_u64,
+                log_lde,
+                &mut leaves_view,
+            )?,
+        }
     }
-    crate::merkle::build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
+    build_inner_tree_levels_for(hash, stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
 
     // Copy the 32-byte root BEFORE queueing the big drain/transpose: this
     // pageable copy host-blocks until everything queued so far lands, so
@@ -661,7 +694,8 @@ fn coset_lde_row_major_inner(
     ))
 }
 
-/// Row-major LDE + Keccak + Merkle, all on-device, keeping the Merkle tree
+/// Row-major LDE + leaf hashing + Merkle, all on-device, keeping the Merkle
+/// tree
 /// resident on device (in the handle's `tree`). The host tree is not built, so
 /// the whole tree copy to host is eliminated; query openings gather paths from
 /// the device tree.
@@ -671,9 +705,11 @@ fn coset_lde_row_major_inner(
 /// critical path), the expansion D2D-copies from it instead of a fresh H2D.
 /// Returns the `GpuLdeBase` handle (column-major buf, plus the device tree)
 /// and the row-major LDE Vec.
+#[allow(clippy::too_many_arguments)]
 pub fn coset_lde_row_major_with_merkle_tree_keep(
     row_major: &[u64],
     predev: Option<&CudaSlice<u64>>,
+    hash: DeviceHash,
     n: usize,
     m: usize,
     blowup_factor: usize,
@@ -686,6 +722,7 @@ pub fn coset_lde_row_major_with_merkle_tree_keep(
     };
     let (tree, col_major_dev, lde_out, trace_col_major, ready) = coset_lde_row_major_inner(
         input,
+        hash,
         n,
         m,
         blowup_factor,
@@ -726,6 +763,7 @@ pub fn coset_lde_row_major_with_merkle_tree_keep(
 pub fn coset_lde_row_major_split_trees(
     row_major: &[u64],
     predev: Option<&CudaSlice<u64>>,
+    hash: DeviceHash,
     n: usize,
     m: usize,
     blowup_factor: usize,
@@ -745,8 +783,8 @@ pub fn coset_lde_row_major_split_trees(
     let lde_size = n * blowup_factor;
     assert_u32_domain(lde_size, "coset_lde_row_major_split lde_size");
     let num_leaves = lde_size / 2;
-    let nodes_bytes = KeccakCommit::FullTree.total_nodes_bytes(num_leaves);
-    let leaves_offset = KeccakCommit::FullTree.leaves_offset_bytes(num_leaves);
+    let nodes_bytes = TreeCommit::FullTree.total_nodes_bytes(num_leaves);
+    let leaves_offset = TreeCommit::FullTree.leaves_offset_bytes(num_leaves);
     let log_lde = lde_size.trailing_zeros() as u64;
     let lde_u64 = lde_size as u64;
     let cols_u64 = m as u64;
@@ -767,19 +805,32 @@ pub fn coset_lde_row_major_split_trees(
         {
             let mut leaves_view =
                 nodes_dev.slice_mut(leaves_offset..leaves_offset + num_leaves * 32);
-            launch_keccak_base_row_major_row_pair_range(
-                stream.as_ref(),
-                be,
-                &buf,
-                cols_u64,
-                col_start,
-                col_end,
-                lde_u64,
-                log_lde,
-                &mut leaves_view,
-            )?;
+            match hash {
+                DeviceHash::Keccak256 => launch_keccak_base_row_major_row_pair_range(
+                    stream.as_ref(),
+                    be,
+                    &buf,
+                    cols_u64,
+                    col_start,
+                    col_end,
+                    lde_u64,
+                    log_lde,
+                    &mut leaves_view,
+                )?,
+                DeviceHash::Blake3 => crate::blake3::launch_leaves_base_row_major_row_pair_range(
+                    stream.as_ref(),
+                    be,
+                    &buf,
+                    cols_u64,
+                    col_start,
+                    col_end,
+                    lde_u64,
+                    log_lde,
+                    &mut leaves_view,
+                )?,
+            }
         }
-        crate::merkle::build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
+        build_inner_tree_levels_for(hash, stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
         Ok(nodes_dev)
     };
 
@@ -842,7 +893,7 @@ pub fn coset_lde_row_major_split_trees(
     Ok((precomputed_nodes, handle, lde_out))
 }
 
-/// Row-major ext3 LDE + Keccak + Merkle, all on-device.
+/// Row-major ext3 LDE + leaf hashing + Merkle, all on-device.
 ///
 /// `Fp3` is `[u64; 3]` in memory, so row-major ext3 with `m` ext3 columns is
 /// identical to row-major base-field with `m3 = m * 3`. The same row-major NTT
@@ -854,6 +905,7 @@ pub fn coset_lde_row_major_split_trees(
 /// Returns (merkle_nodes, GpuLdeExt3 handle, row-major ext3 LDE Vec<u64>).
 pub fn coset_lde_ext3_row_major_with_merkle_tree_keep(
     row_major: &[u64],
+    hash: DeviceHash,
     n: usize,
     m: usize,
     blowup_factor: usize,
@@ -862,6 +914,7 @@ pub fn coset_lde_ext3_row_major_with_merkle_tree_keep(
 ) -> Result<(GpuLdeExt3, Vec<u64>)> {
     let (tree, col_major_dev, lde_out, _, ready) = coset_lde_row_major_inner(
         InnerInput::Host(row_major),
+        hash,
         n,
         m * 3,
         blowup_factor,
@@ -886,6 +939,7 @@ pub fn coset_lde_ext3_row_major_with_merkle_tree_keep(
 /// scratch. Used by the resident LogUp aux path.
 pub fn coset_lde_ext3_row_major_with_merkle_tree_keep_dev(
     input_dev: &CudaSlice<u64>,
+    hash: DeviceHash,
     n: usize,
     m: usize,
     blowup_factor: usize,
@@ -894,6 +948,7 @@ pub fn coset_lde_ext3_row_major_with_merkle_tree_keep_dev(
 ) -> Result<(GpuLdeExt3, Vec<u64>)> {
     let (tree, col_major_dev, lde_out, _, ready) = coset_lde_row_major_inner(
         InnerInput::Dev(input_dev),
+        hash,
         n,
         m * 3,
         blowup_factor,
@@ -1385,7 +1440,8 @@ pub fn coset_lde_batch_base_into(
     Ok(())
 }
 
-/// Fused LDE + row-pair Keccak-256 leaf hashing. Caller receives
+/// Fused LDE + row-pair leaf hashing under the family `hash` selects.
+/// Caller receives
 /// `(lde_size / 2) * 32` bytes of leaf hashes in `hashed_leaves_out` (one
 /// 32-byte digest per bit-reversed row pair, in natural leaf order, matching
 /// `commit_bit_reversed(.., 2)` on the CPU side). Thin wrapper over
@@ -1393,6 +1449,7 @@ pub fn coset_lde_batch_base_into(
 /// inner-tree build, no device handle.
 pub fn coset_lde_batch_base_into_with_leaf_hash(
     columns: &[&[u64]],
+    hash: DeviceHash,
     blowup_factor: usize,
     weights: &[u64],
     outputs: &mut [&mut [u64]],
@@ -1400,11 +1457,12 @@ pub fn coset_lde_batch_base_into_with_leaf_hash(
 ) -> Result<()> {
     coset_lde_batch_base_into_with_merkle_tree_inner(
         columns,
+        hash,
         blowup_factor,
         weights,
         outputs,
         hashed_leaves_out,
-        KeccakCommit::LeavesOnly,
+        TreeCommit::LeavesOnly,
         false,
         2,
     )
@@ -1414,11 +1472,12 @@ pub fn coset_lde_batch_base_into_with_leaf_hash(
 #[allow(clippy::too_many_arguments)]
 fn coset_lde_batch_base_into_with_merkle_tree_inner(
     columns: &[&[u64]],
+    hash: DeviceHash,
     blowup_factor: usize,
     weights: &[u64],
     outputs: &mut [&mut [u64]],
     nodes_out: &mut [u8],
-    commit: KeccakCommit,
+    commit: TreeCommit,
     keep_device_buf: bool,
     // 1 = one leaf per bit-reversed row; 2 = one leaf per row pair (2i, 2i+1),
     // matching the CPU `commit_bit_reversed(.., 2)` used for the trace commit.
@@ -1548,29 +1607,44 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
     {
         let mut leaves_view =
             nodes_dev.slice_mut(leaves_offset_bytes..leaves_offset_bytes + num_leaves * 32);
-        if rows_per_leaf == 2 {
-            launch_keccak_base_row_pair(
+        match (hash, rows_per_leaf == 2) {
+            (DeviceHash::Keccak256, true) => launch_keccak_base_row_pair(
                 stream.as_ref(),
                 &buf,
                 col_stride_u64,
                 m as u64,
                 lde_u64,
                 &mut leaves_view,
-            )?;
-        } else {
-            launch_keccak_base(
+            )?,
+            (DeviceHash::Keccak256, false) => launch_keccak_base(
                 stream.as_ref(),
                 &buf,
                 col_stride_u64,
                 m as u64,
                 lde_u64,
                 &mut leaves_view,
-            )?;
+            )?,
+            (DeviceHash::Blake3, true) => crate::blake3::launch_leaves_base_row_pair(
+                stream.as_ref(),
+                &buf,
+                col_stride_u64,
+                m as u64,
+                lde_u64,
+                &mut leaves_view,
+            )?,
+            (DeviceHash::Blake3, false) => crate::blake3::launch_leaves_base(
+                stream.as_ref(),
+                &buf,
+                col_stride_u64,
+                m as u64,
+                lde_u64,
+                &mut leaves_view,
+            )?,
         }
     }
 
-    if commit == KeccakCommit::FullTree {
-        crate::merkle::build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
+    if commit == TreeCommit::FullTree {
+        build_inner_tree_levels_for(hash, stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
     }
 
     // Release the staging slot before the drain: the uploads have landed once
@@ -1635,6 +1709,9 @@ pub fn evaluate_poly_coset_batch_ext3_into(
 ) -> Result<()> {
     evaluate_poly_coset_batch_ext3_into_inner(
         coefs,
+        // No tree on this face (`merkle_nodes_out: None`): the hash dispatch
+        // key is never read.
+        DeviceHash::Keccak256,
         n,
         blowup_factor,
         weights,
@@ -1657,6 +1734,9 @@ pub fn evaluate_poly_coset_batch_ext3_into_keep(
 ) -> Result<GpuLdeExt3> {
     let opt = evaluate_poly_coset_batch_ext3_into_inner(
         coefs,
+        // No tree on this face (`merkle_nodes_out: None` below): the hash
+        // dispatch key is never read.
+        DeviceHash::Keccak256,
         n,
         blowup_factor,
         weights,
@@ -1667,8 +1747,10 @@ pub fn evaluate_poly_coset_batch_ext3_into_keep(
     Ok(opt.expect("keep_device_buf=true must return Some"))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn evaluate_poly_coset_batch_ext3_into_inner(
     coefs: &[&[u64]],
+    hash: DeviceHash,
     n: usize,
     blowup_factor: usize,
     weights: &[u64],
@@ -1775,20 +1857,34 @@ fn evaluate_poly_coset_batch_ext3_into_inner(
                 nodes_dev.slice_mut(leaves_offset_bytes..leaves_offset_bytes + num_leaves * 32);
             let log_num_rows = log_lde;
             let num_parts_u64 = m as u64;
-            let cfg = keccak_launch_cfg(num_leaves as u64);
-            unsafe {
-                stream
-                    .launch_builder(&be.keccak_comp_poly_leaves_ext3)
-                    .arg(&buf)
-                    .arg(&col_stride_u64)
-                    .arg(&num_parts_u64)
-                    .arg(&lde_u64)
-                    .arg(&log_num_rows)
-                    .arg(&mut leaves_view)
-                    .launch(cfg)?;
+            match hash {
+                DeviceHash::Keccak256 => {
+                    let cfg = keccak_launch_cfg(num_leaves as u64);
+                    unsafe {
+                        stream
+                            .launch_builder(&be.keccak_comp_poly_leaves_ext3)
+                            .arg(&buf)
+                            .arg(&col_stride_u64)
+                            .arg(&num_parts_u64)
+                            .arg(&lde_u64)
+                            .arg(&log_num_rows)
+                            .arg(&mut leaves_view)
+                            .launch(cfg)?;
+                    }
+                }
+                DeviceHash::Blake3 => crate::blake3::launch_comp_poly_leaves_ext3(
+                    stream.as_ref(),
+                    be,
+                    &buf,
+                    col_stride_u64,
+                    num_parts_u64,
+                    lde_u64,
+                    log_num_rows,
+                    &mut leaves_view,
+                )?,
             }
         }
-        crate::merkle::build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
+        build_inner_tree_levels_for(hash, stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
         Some((nodes_dev, nodes_out))
     } else {
         None
@@ -1841,6 +1937,7 @@ fn evaluate_poly_coset_batch_ext3_into_inner(
 /// `(lde_size - 1) * 32`. Requires `lde_size >= 2`.
 pub fn evaluate_poly_coset_batch_ext3_into_with_merkle_tree(
     coefs: &[&[u64]],
+    hash: DeviceHash,
     n: usize,
     blowup_factor: usize,
     weights: &[u64],
@@ -1849,6 +1946,7 @@ pub fn evaluate_poly_coset_batch_ext3_into_with_merkle_tree(
 ) -> Result<()> {
     evaluate_poly_coset_batch_ext3_into_inner(
         coefs,
+        hash,
         n,
         blowup_factor,
         weights,
