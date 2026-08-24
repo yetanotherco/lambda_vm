@@ -155,11 +155,16 @@ where
     H: StarkHash,
     FieldElement<E>: AsBytes + Sync + Send,
 {
-    fn new(dims: &[(usize, usize)]) -> Self {
+    fn new(dims: &[(usize, usize)], round: &'static str) -> Self {
+        #[cfg(not(feature = "cuda"))]
+        let _ = round;
         #[cfg(feature = "cuda")]
         if let Some(lanes) = super::gpu::lanes_per_element::<E>()
-            && let Some(dev) =
-                super::gpu::DeviceStreamingMmcs::try_new(dims, super::gpu::device_hash_of::<H>())
+            && let Some(dev) = super::gpu::DeviceStreamingMmcs::try_new(
+                dims,
+                super::gpu::device_hash_of::<H>(),
+                round,
+            )
         {
             return RoundCommit::Dev {
                 dev,
@@ -343,7 +348,7 @@ where
     // per-table prover does.
     let mut prep_trees: Vec<PrepTreeSlot<H::Batched<Field>>> =
         (0..num_tables).map(|_| None).collect();
-    let mut main_builder = RoundCommit::<Field, H>::new(&shape.main.dims);
+    let mut main_builder = RoundCommit::<Field, H>::new(&shape.main.dims, "main");
     let mut retained_main: Vec<Option<(Vec<FieldElement<Field>>, usize)>> =
         (0..num_tables).map(|_| None).collect();
 
@@ -433,7 +438,7 @@ where
     let mut bus_public_inputs: Vec<Option<BusPublicInputs<FieldExtension>>> =
         (0..num_tables).map(|_| None).collect();
     let mut aux_builder =
-        (!shape.aux.is_empty()).then(|| RoundCommit::<FieldExtension, H>::new(&shape.aux.dims));
+        (!shape.aux.is_empty()).then(|| RoundCommit::<FieldExtension, H>::new(&shape.aux.dims, "aux"));
     let mut retained_aux: Vec<Option<(Vec<FieldElement<FieldExtension>>, usize)>> =
         (0..num_tables).map(|_| None).collect();
 
@@ -489,7 +494,7 @@ where
         transcript.append_field_element(&bpi.table_contribution);
     }
 
-    let mut parts_builder = RoundCommit::<FieldExtension, H>::new(&shape.parts.dims);
+    let mut parts_builder = RoundCommit::<FieldExtension, H>::new(&shape.parts.dims, "parts");
     let mut retained_parts: Vec<Vec<Vec<FieldElement<FieldExtension>>>> =
         (0..num_tables).map(|_| Vec::new()).collect();
 

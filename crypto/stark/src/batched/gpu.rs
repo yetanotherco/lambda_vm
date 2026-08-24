@@ -77,8 +77,19 @@ impl DeviceStreamingMmcs {
     /// `None` when the device path is unavailable (no backend, or disabled via
     /// `LAMBDA_VM_DISABLE_GPU_MMCS`) — the caller falls back to the host
     /// builder BEFORE anything is absorbed, never mid-round.
-    pub(crate) fn try_new(dims: &[(usize, usize)], hash: DeviceHash) -> Option<Self> {
+    pub(crate) fn try_new(
+        dims: &[(usize, usize)],
+        hash: DeviceHash,
+        round: &'static str,
+    ) -> Option<Self> {
         if std::env::var_os("LAMBDA_VM_DISABLE_GPU_MMCS").is_some() {
+            return None;
+        }
+        // Diagnostic scoping: when set, only the named round takes the device
+        // path ("main" | "aux" | "parts") — bisects a divergence to one round.
+        if let Some(only) = std::env::var_os("LAMBDA_VM_GPU_MMCS_ONLY")
+            && only != round
+        {
             return None;
         }
         let be = math_cuda::device::backend().ok()?;
