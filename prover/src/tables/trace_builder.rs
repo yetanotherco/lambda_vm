@@ -2405,7 +2405,8 @@ pub(crate) fn collect_bitwise_from_ecsm(ops: &[ecsm::EcsmOperation]) -> Vec<Bitw
             out.push(is_half_op((w.c0[i] + ecsm::CARRY_OFFSET_X2) as u16));
             out.push(is_half_op((w.c1[i] + ecsm::CARRY_OFFSET_YG) as u16));
         }
-        // IS_HALF on the U256HL limbs of xG_sub_p, k_sub_N and xR_sub_p.
+        // IS_HALF on the U256HL limbs of xG_sub_p, k_sub_N, xR_sub_p, yR_sub_p and yG_sub_p.
+        // One receive per send in `ecsm::bus_interactions`, or IsHalfword does not balance.
         for i in 0..16 {
             out.push(is_half_op(
                 w.x_g_sub_p[2 * i] as u16 + ((w.x_g_sub_p[2 * i + 1] as u16) << 8),
@@ -2415,6 +2416,16 @@ pub(crate) fn collect_bitwise_from_ecsm(ops: &[ecsm::EcsmOperation]) -> Vec<Bitw
             ));
             out.push(is_half_op(
                 w.x_r_sub_p[2 * i] as u16 + ((w.x_r_sub_p[2 * i + 1] as u16) << 8),
+            ));
+        }
+        for i in 0..16 {
+            out.push(is_half_op(
+                w.y_r_sub_p[2 * i] as u16 + ((w.y_r_sub_p[2 * i + 1] as u16) << 8),
+            ));
+        }
+        for i in 0..16 {
+            out.push(is_half_op(
+                w.y_g_sub_p[2 * i] as u16 + ((w.y_g_sub_p[2 * i + 1] as u16) << 8),
             ));
         }
         // ZERO: assert k != 0 (sum of k's bytes).

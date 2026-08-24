@@ -202,7 +202,8 @@ pub fn keccak_permute(_state: &mut [u64; 25]) {
 /// (the AIR binds only `yG² ≡ xG³ + b`). So `yR` is the y of `k·(xG, yG)`, which is `±y(k·P)`
 /// for the caller's point `P`. Compare `yG` against your own base point's y and negate `yR`
 /// when they differ; that also validates `yG`, since a value that is neither root means the
-/// output is unusable and the caller should fall back.
+/// output is unusable and the caller should fall back. Both `yG` and `yR` come back reduced
+/// mod `p` (the chip range-checks them), so the comparison is safe on the raw bytes.
 ///
 /// All three buffers are [`Align8`], so the twenty doubleword accesses land on the aligned
 /// memory path (`MEMW_A`) instead of the general one.

@@ -22,6 +22,8 @@ const IDX_YG_CONV0: usize = 323; // ConvCarry(Yg, 0)
 const IDX_Q1_BIT32: usize = 388; // IS_BIT(q1[32])
 const IDX_XG_CARRY0: usize = 389; // CarryBit(XgLtP, 0)
 const IDX_XG_OVERFLOW: usize = 396; // OverflowRequired(XgLtP)
+const IDX_YR_OVERFLOW: usize = 420; // OverflowRequired(YrLtP)
+const IDX_YG_OVERFLOW: usize = 428; // OverflowRequired(YgLtP)
 
 fn gx_le() -> [u8; 32] {
     // secp256k1 Gx, little-endian.
@@ -97,7 +99,7 @@ fn constraints_hold_on_generated_trace() {
 
 #[test]
 fn constraint_set_count() {
-    assert_eq!(EcsmConstraints.meta().len(), 413);
+    assert_eq!(EcsmConstraints.meta().len(), 429);
 }
 
 /// The yG carry recurrence closes on all-zero padding because both the `µ·p²` offset and the
@@ -206,6 +208,33 @@ fn xg_ge_p_overflow_required_fires() {
         FE::zero(),
         "OverflowRequired must fire when xG = p"
     );
+}
+
+/// `yR` and `yG` are published to guest memory, and the caller resolves the root by comparing
+/// the echoed `yG` against its own `y`. A non-canonical representative would break that: `p`
+/// is odd, so `y` and `p − y` differ in parity, but `y + p` — a second 256-bit representative
+/// whenever `y < 2^256 − p ≈ 2^32`, and reachable, since `3 | p−1` leaves a third of the small
+/// `y` with a curve `x` — carries the opposite parity. `OverflowRequired` is what forbids it;
+/// `y = p` is the boundary where the addition stops overflowing.
+#[test]
+fn yr_and_yg_ge_p_overflow_required_fires() {
+    for (coord, idx, name) in [
+        (cols::YR, IDX_YR_OVERFLOW, "yR"),
+        (cols::YG, IDX_YG_OVERFLOW, "yG"),
+    ] {
+        let mut main = vec![FE::zero(); cols::NUM_COLUMNS];
+        main[cols::MU] = FE::one();
+        // y = p, y_sub_p = 0 (invalid subtraction witness — fine for this isolation test).
+        for (i, &b) in P_BYTES.iter().enumerate() {
+            main[coord + i] = FE::from(b as u64);
+        }
+        let row = eval_main_row(main);
+        assert_ne!(
+            row[idx],
+            FE::zero(),
+            "OverflowRequired must fire when {name} = p"
+        );
+    }
 }
 
 fn five_g_x_le() -> [u8; 32] {
