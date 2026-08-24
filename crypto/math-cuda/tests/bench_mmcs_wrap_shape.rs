@@ -85,16 +85,7 @@ fn device_root(raw: &[u64], lanes_stride: usize) -> ([u8; 32], std::time::Durati
     let t = Instant::now();
     let mut hasher =
         MmcsGroupHasher::new(&stream, LOG_LDE as u64, DeviceHash::Blake3).expect("hasher");
-    // SAFETY: every element is written by the staged copy before the kernel reads.
-    let mut dev = unsafe { stream.alloc::<u64>(raw.len()) }.expect("alloc");
-    math_cuda::device::htod_via(
-        &stream,
-        be.pinned_staging(),
-        &be.ctx,
-        raw,
-        &mut dev.as_view_mut(),
-    )
-    .expect("pinned H2D");
+    let dev = stream.clone_htod(raw).expect("H2D");
     hasher
         .absorb_row_major(&stream, &dev, lanes_stride as u64, 0, lanes_stride as u64)
         .expect("absorb");
