@@ -1,6 +1,24 @@
 #[cfg(target_arch = "riscv64")]
 use core::arch::asm;
 
+/// 8-byte-aligned wrapper for an ecall operand buffer.
+///
+/// The accelerator tables read and write their operands as doublewords. On an 8-byte-aligned
+/// buffer those take the aligned memory path (`MEMW_A`, 29 columns + 1 range check); a bare
+/// `[u8; N]` on the stack is only 1-aligned, which forces every access onto the general path
+/// (49 + 8) and inflates the trace. Taking `&Align8<N>` in the ecall wrappers makes that a
+/// type-level guarantee rather than a comment a caller can miss — and missing it fails
+/// silently, as a bigger trace and nothing else.
+#[repr(C, align(8))]
+pub struct Align8<const N: usize>(pub [u8; N]);
+
+impl<const N: usize> Align8<N> {
+    /// A zeroed, 8-byte-aligned buffer.
+    pub const fn zeroed() -> Self {
+        Self([0u8; N])
+    }
+}
+
 /// Memory-mapped private input region start address.
 /// Layout: 4-byte LE length prefix at this address, data at +4.
 /// The host pre-loads the input; the guest reads directly (no ecall).
@@ -186,15 +204,15 @@ pub fn keccak_permute(_state: &mut [u64; 25]) {
 /// when they differ; that also validates `yG`, since a value that is neither root means the
 /// output is unusable and the caller should fall back.
 ///
-/// `out` should be 8-byte aligned so the twelve doubleword accesses land on the aligned
-/// memory path (MEMW_A) instead of the general one; the same goes for `xg` and `k`.
-pub fn ecsm_mul(out: &mut [u8; 96], xg: &[u8; 32], k: &[u8; 32]) {
+/// All three buffers are [`Align8`], so the twenty doubleword accesses land on the aligned
+/// memory path (`MEMW_A`) instead of the general one.
+pub fn ecsm_mul(out: &mut Align8<96>, xg: &Align8<32>, k: &Align8<32>) {
     unsafe {
         asm!(
             "ecall",
-            in("a0") out.as_mut_ptr(), // x10 = address to write [xR ‖ yR ‖ yG]
-            in("a1") xg.as_ptr(),      // x11 = address of xG
-            in("a2") k.as_ptr(),       // x12 = address of k
+            in("a0") out.0.as_mut_ptr(), // x10 = address to write [xR ‖ yR ‖ yG]
+            in("a1") xg.0.as_ptr(),      // x11 = address of xG
+            in("a2") k.0.as_ptr(),       // x12 = address of k
             in("a7") ECSM_SYSCALL_NUMBER,
         )
     }
@@ -203,7 +221,7 @@ pub fn ecsm_mul(out: &mut [u8; 96], xg: &[u8; 32], k: &[u8; 32]) {
 #[cfg(not(target_arch = "riscv64"))]
 /// Compute `k·G` on secp256k1 via the ECSM accelerator, writing `[xR ‖ yR ‖ yG]`
 /// (three 32-byte little-endian values) into `out`.
-pub fn ecsm_mul(_out: &mut [u8; 96], _xg: &[u8; 32], _k: &[u8; 32]) {
+pub fn ecsm_mul(_out: &mut Align8<96>, _xg: &Align8<32>, _k: &Align8<32>) {
     unimplemented!("syscalls are only implemented for riscv64 targets");
 }
 
