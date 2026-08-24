@@ -7,10 +7,12 @@
 //!
 //! The tree-building entries here are generic over a Merkle backend `B` that
 //! they never call: the leaf and parent hashing happens in the `math-cuda`
-//! keccak kernels, and `B` only types the host `MerkleTree` the root is wrapped
-//! in. `B` is therefore bound to [`KeccakTreeBackend`] rather than
-//! `IsMerkleTreeBackend`, so the label cannot disagree with the kernel that
-//! produced the bytes.
+//! kernels, and `B` only types the host `MerkleTree` the root is wrapped in.
+//! `B` is therefore bound to [`DeviceTreeBackend`] rather than
+//! `IsMerkleTreeBackend`: its `COMMITMENT_HASH` constant is the dispatch key
+//! handed to `math-cuda` (selecting the keccak or the BLAKE3 kernel family at
+//! every leaf, level and FRI-layer launch), so the label cannot disagree with
+//! the kernel that produced the bytes.
 
 use core::mem::transmute_copy;
 use std::any::TypeId;
@@ -35,9 +37,17 @@ use math::traits::AsBytes;
 #[cfg(feature = "parallel")]
 use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
 
-use crate::config::{Commitment, KeccakTreeBackend};
+use crate::config::{Commitment, CommitmentHash, DeviceTreeBackend};
 use crate::domain::Domain;
 use crate::fri::fri_commitment::FriLayer;
+
+/// The `math_cuda` dispatch key for `B`'s hash.
+fn device_hash_of<B: DeviceTreeBackend>() -> math_cuda::DeviceHash {
+    match B::COMMITMENT_HASH {
+        CommitmentHash::Keccak256 => math_cuda::DeviceHash::Keccak256,
+        CommitmentHash::Blake3 => math_cuda::DeviceHash::Blake3,
+    }
+}
 use crate::fri::fri_decommit::FriDecommitment;
 use crate::trace::LDETraceTable;
 
@@ -811,7 +821,7 @@ pub(crate) fn try_expand_leaf_and_tree_row_major_keep<F, E, B>(
 where
     F: IsField + 'static,
     E: IsField + 'static,
-    B: KeccakTreeBackend,
+    B: DeviceTreeBackend,
 {
     let lde_size = n.saturating_mul(blowup_factor);
     if lde_size < gpu_lde_threshold() {
@@ -839,6 +849,7 @@ where
     let (handle, lde_u64) = math_cuda::lde::coset_lde_row_major_with_merkle_tree_keep(
         raw,
         predev,
+        device_hash_of::<B>(),
         n,
         m,
         blowup_factor,
@@ -869,7 +880,7 @@ where
 /// [`MerkleTree`], the exact layout `from_precomputed_nodes` expects.
 fn tree_from_node_bytes<B>(nodes: Vec<u8>) -> Option<MerkleTree<B>>
 where
-    B: KeccakTreeBackend,
+    B: DeviceTreeBackend,
 {
     debug_assert_eq!(nodes.len() % 32, 0);
     let nodes: Vec<[u8; 32]> = nodes
@@ -918,7 +929,7 @@ pub(crate) fn try_expand_split_trees_row_major_keep<F, E, B>(
 where
     F: IsField + 'static,
     E: IsField + 'static,
-    B: KeccakTreeBackend,
+    B: DeviceTreeBackend,
 {
     let lde_size = n.saturating_mul(blowup_factor);
     if lde_size < gpu_lde_threshold() {
@@ -947,6 +958,7 @@ where
     let (pre_nodes, handle, lde_u64) = math_cuda::lde::coset_lde_row_major_split_trees(
         raw,
         predev,
+        device_hash_of::<B>(),
         n,
         m,
         blowup_factor,
@@ -1002,7 +1014,7 @@ pub(crate) fn try_expand_leaf_and_tree_ext3_row_major_keep<F, E, B>(
 where
     F: IsField + 'static,
     E: IsField + 'static,
-    B: KeccakTreeBackend,
+    B: DeviceTreeBackend,
 {
     let lde_size = n.saturating_mul(blowup_factor);
     if lde_size < gpu_lde_threshold() {
@@ -1031,6 +1043,7 @@ where
     // `retain_host_lde=false` additionally skips the row-major D2H (device-only).
     let (handle, lde_u64) = math_cuda::lde::coset_lde_ext3_row_major_with_merkle_tree_keep(
         raw,
+        device_hash_of::<B>(),
         n,
         m,
         blowup_factor,
@@ -1238,7 +1251,7 @@ pub(crate) fn try_build_comp_poly_tree_gpu<E, B>(
 ) -> Option<(MerkleTree<B>, math_cuda::lde::GpuMerkleTree)>
 where
     E: IsField + 'static,
-    B: KeccakTreeBackend,
+    B: DeviceTreeBackend,
 {
     if lde_parts.is_empty() {
         return None;
@@ -1271,7 +1284,14 @@ where
     // Keep the composition tree resident on device, so the whole tree copy to
     // host is eliminated. R4 composition openings gather paths from the device
     // tree (`gather_proofs_dev`); the returned host tree is root only.
-    let dev_tree = match math_cuda::merkle::build_comp_poly_tree_from_evals_ext3_keep(&raw_parts) {
+    let dev_tree = match match device_hash_of::<B>() {
+        math_cuda::DeviceHash::Keccak256 => {
+            math_cuda::merkle::build_comp_poly_tree_from_evals_ext3_keep(&raw_parts)
+        }
+        math_cuda::DeviceHash::Blake3 => {
+            math_cuda::blake3::build_comp_poly_tree_from_evals_ext3_keep(&raw_parts)
+        }
+    } {
         Ok(t) => t,
         Err(_) => return None,
     };
@@ -1289,7 +1309,7 @@ pub(crate) fn try_build_comp_poly_tree_gpu_from_dev<E, B>(
 ) -> Option<(MerkleTree<B>, math_cuda::lde::GpuMerkleTree)>
 where
     E: IsField + 'static,
-    B: KeccakTreeBackend,
+    B: DeviceTreeBackend,
 {
     if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
         return None;
@@ -1301,12 +1321,20 @@ where
     let be = math_cuda::device::backend().ok()?;
     let stream = be.next_stream();
     handle.wait_ready_on(&stream).ok()?;
-    let dev_tree = math_cuda::merkle::build_comp_poly_tree_from_slabs_dev(
-        &stream,
-        handle.buf.as_ref(),
-        handle.m,
-        handle.lde_size,
-    )
+    let dev_tree = match device_hash_of::<B>() {
+        math_cuda::DeviceHash::Keccak256 => math_cuda::merkle::build_comp_poly_tree_from_slabs_dev(
+            &stream,
+            handle.buf.as_ref(),
+            handle.m,
+            handle.lde_size,
+        ),
+        math_cuda::DeviceHash::Blake3 => math_cuda::blake3::build_comp_poly_tree_from_slabs_dev(
+            &stream,
+            handle.buf.as_ref(),
+            handle.m,
+            handle.lde_size,
+        ),
+    }
     .ok()?;
     GPU_COMP_POLY_TREE_CALLS.fetch_add(1, Ordering::Relaxed);
     let host = MerkleTree::<B>::from_root(dev_tree.root);
@@ -2298,7 +2326,7 @@ pub(crate) fn try_expand_leaf_and_tree_ext3_row_major_keep_dev<F, E, B>(
 where
     F: IsField + 'static,
     E: IsField + 'static,
-    B: KeccakTreeBackend,
+    B: DeviceTreeBackend,
 {
     if TypeId::of::<F>() != TypeId::of::<GoldilocksField>()
         || TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>()
@@ -2313,6 +2341,7 @@ where
 
     let (handle, lde_u64) = math_cuda::lde::coset_lde_ext3_row_major_with_merkle_tree_keep_dev(
         &ra.buf,
+        device_hash_of::<B>(),
         ra.num_rows,
         ra.num_aux_cols,
         blowup_factor,
@@ -2972,7 +3001,7 @@ where
     FieldElement<F>: AsBytes,
     FieldElement<E>: AsBytes,
     T: IsStarkTranscript<E, F> + Clone,
-    B: KeccakTreeBackend,
+    B: DeviceTreeBackend,
 {
     // GPU drives the early-termination FRI commit phase, mirroring
     // `commit_phase_from_evaluations`: for each committed layer (sample zeta,
@@ -3012,7 +3041,12 @@ where
     // SAFETY: E == Ext3; FieldElement<Ext3> backing is [u64; 3].
     let evals_u64: &[u64] = unsafe { ext3_slice_to_u64::<E>(evals) };
 
-    let state = match math_cuda::fri::FriCommitState::new(evals_u64, &inv_tw_u64, n0) {
+    let state = match math_cuda::fri::FriCommitState::new(
+        evals_u64,
+        &inv_tw_u64,
+        n0,
+        device_hash_of::<B>(),
+    ) {
         Ok(s) => s,
         Err(_) => return None,
     };
@@ -3046,7 +3080,7 @@ where
     FieldElement<F>: AsBytes,
     FieldElement<E>: AsBytes,
     T: IsStarkTranscript<E, F> + Clone,
-    B: KeccakTreeBackend,
+    B: DeviceTreeBackend,
 {
     if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
         return None;
@@ -3069,10 +3103,12 @@ where
         let v: u64 = unsafe { *(t.value() as *const _ as *const u64) };
         inv_tw_u64.push(v);
     }
-    let state = match math_cuda::fri::FriCommitState::new_dev(codeword, &inv_tw_u64) {
-        Ok(s) => s,
-        Err(_) => return None,
-    };
+    let state =
+        match math_cuda::fri::FriCommitState::new_dev(codeword, &inv_tw_u64, device_hash_of::<B>())
+        {
+            Ok(s) => s,
+            Err(_) => return None,
+        };
     fri_commit_gpu_drive::<F, E, T, B>(
         state,
         transcript,
@@ -3104,7 +3140,7 @@ where
     FieldElement<F>: AsBytes,
     FieldElement<E>: AsBytes,
     T: IsStarkTranscript<E, F> + Clone,
-    B: KeccakTreeBackend,
+    B: DeviceTreeBackend,
 {
     // The unsafe zeta reads below reinterpret `FieldElement<E>` as 3 u64:
     // every caller gates the tower, but assert here so a future caller with
@@ -3228,7 +3264,7 @@ pub(crate) fn try_fri_query_phase_gpu<E, B>(
 where
     E: IsField + 'static,
     FieldElement<E>: AsBytes + Sync + Send,
-    B: KeccakTreeBackend,
+    B: DeviceTreeBackend,
 {
     if fri_layers.is_empty() {
         return None;

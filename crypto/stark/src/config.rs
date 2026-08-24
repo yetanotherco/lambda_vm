@@ -1,5 +1,6 @@
-use crypto::fiat_shamir::transcript_hash::{KeccakTranscriptHash, TranscriptHash};
-#[cfg(not(feature = "cuda"))]
+use crypto::fiat_shamir::transcript_hash::{
+    Blake3TranscriptHash, KeccakTranscriptHash, TranscriptHash,
+};
 use crypto::merkle_tree::backends::types::{BatchBlake3Backend, PairBlake3Backend};
 use crypto::merkle_tree::{
     backends::types::{BatchKeccak256Backend, PairKeccak256Backend},
@@ -22,40 +23,25 @@ pub const COMMITMENT_SIZE: usize = 32;
 pub type Commitment = [u8; COMMITMENT_SIZE];
 
 /// The default commitment configuration — what every unparameterized `Prover`,
-/// `Verifier` and Merkle alias in this crate resolves to.
+/// `Verifier` and Merkle alias in this crate resolves to — on every build,
+/// `cuda` included.
 ///
-/// ★ **It forks on `cuda`, and that fork is a proof-format fork.** A non-cuda
-/// build commits with [`Blake3StarkHash`]; a cuda build commits with
-/// [`KeccakStarkHash`]. Proofs do not cross: a GPU-produced proof is not
-/// verifiable by a CPU build of the same commit, and vice versa.
-///
-/// This is deliberate and it is the *conservative* arm of PA-PLAN §6.2 row 6,
-/// taken because `gpu_lde` has no BLAKE3 dispatch (see the note above
-/// [`Blake3StarkHash`] for exactly what is and is not built). The alternative —
-/// flipping the aliases under `cuda` too — would not produce BLAKE3 GPU proofs,
-/// it would produce keccak trees *labelled* BLAKE3, which is the failure the
-/// [`KeccakTreeBackend`] marker exists to make impossible.
-///
-/// **Retirement condition**, both halves required: `gpu_lde`'s tree entry points
-/// dispatch to `math_cuda::blake3::*` instead of `math_cuda::merkle::*`, and the
-/// BLAKE3 device parity tests pass on real hardware. Until then GPU proving is
-/// keccak-only and this fork stays.
-#[cfg(not(feature = "cuda"))]
+/// A cuda build honours it because `gpu_lde`'s tree entry points dispatch on
+/// the configuration: every backend they accept is a [`DeviceTreeBackend`],
+/// whose `COMMITMENT_HASH` constant selects the device kernel family
+/// (keccak or the Track G BLAKE3 kernels) at each leaf, level and FRI-layer
+/// launch. The transcript and grinding follow the same configuration through
+/// [`StarkHash::Transcript`], and the pairing asserts at the bottom of this
+/// file keep a configuration's commitment and Fiat-Shamir hashes from ever
+/// being edited apart.
 pub type DefaultStarkHash = Blake3StarkHash;
-/// The default commitment configuration. See the non-cuda definition for the
-/// fork and its retirement condition.
-#[cfg(feature = "cuda")]
-pub type DefaultStarkHash = KeccakStarkHash;
 
 // Spelled as the concrete backends rather than as `<DefaultStarkHash as
 // StarkHash>::Batched<F>`: the associated types carry `F: 'static`, which the
 // alias would propagate into every caller that is merely generic over a field.
 // The assertion at the bottom of this file is what keeps the two spellings the
 // same type.
-#[cfg(not(feature = "cuda"))]
 pub type BatchedMerkleTreeBackend<F> = BatchBlake3Backend<F>;
-#[cfg(feature = "cuda")]
-pub type BatchedMerkleTreeBackend<F> = BatchKeccak256Backend<F>;
 pub type BatchedMerkleTree<F> = MerkleTree<BatchedMerkleTreeBackend<F>>;
 
 /// The keccak tree families, named rather than reached through the aliases.
@@ -70,35 +56,53 @@ pub type KeccakFriLayerMerkleTreeBackend<F> = PairKeccak256Backend<F>;
 pub type KeccakFriLayerMerkleTree<F> = MerkleTree<KeccakFriLayerMerkleTreeBackend<F>>;
 
 // FRI layer uses fixed-size pairs for efficiency (avoids Vec allocation per pair)
-#[cfg(not(feature = "cuda"))]
 pub type FriLayerMerkleTreeBackend<F> = PairBlake3Backend<F>;
-#[cfg(feature = "cuda")]
-pub type FriLayerMerkleTreeBackend<F> = PairKeccak256Backend<F>;
 pub type FriLayerMerkleTree<F> = MerkleTree<FriLayerMerkleTreeBackend<F>>;
 
-/// A Merkle backend whose leaves and parents are Keccak-256, byte for byte.
+/// A Merkle backend the GPU tree entry points can honour, naming its hash.
 ///
-/// A marker: no methods, nothing to implement wrongly. It exists because
 /// `IsMerkleTreeBackend<Node = Commitment>` is too weak a bound wherever the
 /// backend does not actually do the hashing. The GPU tree entry points in
-/// `gpu_lde` are exactly that case — they take a backend parameter and then
-/// launch the `math-cuda` keccak kernels unconditionally, so `B` is a label on
-/// bytes `B` never touched. Any 32-byte-node backend satisfies the weak bound,
-/// so a backend over some other hash would compile there and hand back keccak
-/// trees wearing its name, with nothing failing.
+/// `gpu_lde` are exactly that case — they hash on the device and use `B` only
+/// as the label on the host `MerkleTree` the roots are wrapped in, so any
+/// 32-byte-node backend would compile there and hand back trees wearing a
+/// name whose hash the kernels never computed.
 ///
-/// Requiring this marker instead makes that a compile error at the call site,
-/// and makes implementing it for a non-keccak backend a deliberate, reviewable
+/// This trait closes that hole from both ends: `COMMITMENT_HASH` is the
+/// dispatch key `gpu_lde` hands to `math-cuda` (selecting the keccak or the
+/// BLAKE3 kernel family at every leaf, level and FRI-layer launch), and
+/// implementing the trait is the reviewable claim that device kernels
+/// producing exactly this backend's hash exist. A backend over some other
+/// hash has no true constant to supply, so writing the impl is a deliberate
 /// false statement rather than an omission nobody had to make.
-pub trait KeccakTreeBackend: IsMerkleTreeBackend<Node = Commitment> {}
-
-impl<F> KeccakTreeBackend for BatchKeccak256Backend<F> where
-    Self: IsMerkleTreeBackend<Node = Commitment>
-{
+pub trait DeviceTreeBackend: IsMerkleTreeBackend<Node = Commitment> {
+    /// The hash the device kernels must compute for trees labelled `Self`.
+    const COMMITMENT_HASH: CommitmentHash;
 }
-impl<F> KeccakTreeBackend for PairKeccak256Backend<F> where
-    Self: IsMerkleTreeBackend<Node = Commitment>
+
+impl<F> DeviceTreeBackend for BatchKeccak256Backend<F>
+where
+    Self: IsMerkleTreeBackend<Node = Commitment>,
 {
+    const COMMITMENT_HASH: CommitmentHash = CommitmentHash::Keccak256;
+}
+impl<F> DeviceTreeBackend for PairKeccak256Backend<F>
+where
+    Self: IsMerkleTreeBackend<Node = Commitment>,
+{
+    const COMMITMENT_HASH: CommitmentHash = CommitmentHash::Keccak256;
+}
+impl<F> DeviceTreeBackend for BatchBlake3Backend<F>
+where
+    Self: IsMerkleTreeBackend<Node = Commitment>,
+{
+    const COMMITMENT_HASH: CommitmentHash = CommitmentHash::Blake3;
+}
+impl<F> DeviceTreeBackend for PairBlake3Backend<F>
+where
+    Self: IsMerkleTreeBackend<Node = Commitment>,
+{
+    const COMMITMENT_HASH: CommitmentHash = CommitmentHash::Blake3;
 }
 
 /// The hash every commitment this crate produces is built with.
@@ -180,15 +184,14 @@ pub const COMMITMENT_HASH: CommitmentHash = <DefaultStarkHash as StarkHash>::COM
 pub trait StarkHash: Send + Sync + 'static {
     /// The batched leaf backend: one leaf per row group, streamed.
     ///
-    /// Under `cuda` this additionally has to be [`KeccakTreeBackend`]. That is
-    /// not a preference: `gpu_lde`'s tree entries hash on the device with the
-    /// keccak kernels and only *label* the result with this type, so a cuda
-    /// build has no way to honour any other configuration. The bound says so at
-    /// compile time instead of letting the label be wrong. It comes off when
-    /// the device kernels stop being keccak-only.
+    /// Under `cuda` this additionally has to be [`DeviceTreeBackend`]:
+    /// `gpu_lde`'s tree entries hash on the device with the kernel family the
+    /// backend's `COMMITMENT_HASH` names, and only *label* the result with
+    /// this type — the bound is what guarantees the label and the kernels
+    /// agree, at compile time.
     #[cfg(feature = "cuda")]
     type Batched<F>: IsStreamingLeafBackend<F, Node = Commitment, Data = Vec<FieldElement<F>>>
-        + KeccakTreeBackend
+        + DeviceTreeBackend
         + 'static
     where
         F: IsField + 'static,
@@ -204,15 +207,13 @@ pub trait StarkHash: Send + Sync + 'static {
 
     /// The FRI-layer backend: one leaf per fixed pair, no `Vec` per leaf.
     ///
-    /// Under `cuda` this carries the same [`KeccakTreeBackend`] obligation
+    /// Under `cuda` this carries the same [`DeviceTreeBackend`] obligation
     /// [`Self::Batched`] does, and for the same reason: `gpu_lde`'s FRI commit
     /// drives the whole commit phase on device, hashing every layer tree with
-    /// the keccak kernels and only *labelling* the result with this type. A cuda
-    /// build cannot honour any other configuration for FRI layers either, so the
-    /// bound says so at compile time rather than letting the label be wrong.
+    /// the kernel family the backend's `COMMITMENT_HASH` names.
     #[cfg(feature = "cuda")]
     type Pair<F>: IsMerkleTreeBackend<Node = Commitment, Data = [FieldElement<F>; 2]>
-        + KeccakTreeBackend
+        + DeviceTreeBackend
         + 'static
     where
         F: IsField + 'static,
@@ -266,9 +267,8 @@ pub type DefaultStarkTranscript<F> = crypto::fiat_shamir::default_transcript::De
 
 /// The keccak-256 configuration.
 ///
-/// Since the flip it is the default only under `cuda` (see [`DefaultStarkHash`]);
-/// on every other build it is reachable by naming it, and is what the
-/// keccak-pinned LFM instruments and the GPU path commit under.
+/// Reachable by naming it: the keccak-pinned LFM instruments and the GPU
+/// keccak A/B arms commit under it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeccakStarkHash;
 
@@ -308,39 +308,16 @@ impl StarkHash for KeccakStarkHash {
 ///
 /// # What selects it
 ///
-/// ★ **Everything, on a non-`cuda` build.** This is [`DefaultStarkHash`]: every
+/// ★ **Everything, on every build.** This is [`DefaultStarkHash`]: every
 /// `Prover` and `Verifier` alias resolves here, [`COMMITMENT_HASH`] names it,
-/// and the transcript and grinding follow through [`StarkHash::Transcript`]. The
-/// RV64 guest reaches it through the same aliases and hashes with the
-/// `blake3_compress_6round` precompile.
-#[cfg(not(feature = "cuda"))]
+/// and the transcript and grinding follow through [`StarkHash::Transcript`].
+/// The RV64 guest reaches it through the same aliases and hashes with the
+/// `blake3_compress_6round` precompile; a cuda build reaches it through
+/// `gpu_lde`'s [`DeviceTreeBackend`] dispatch onto the Track G BLAKE3
+/// kernels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Blake3StarkHash;
 
-// Under `cuda` there is deliberately no BLAKE3 configuration to name.
-//
-// [`StarkHash::Batched`] additionally requires [`KeccakTreeBackend`] there,
-// because `gpu_lde`'s tree entry points hash on the device with the keccak
-// kernels and only *label* the result with the backend type — so a cuda build
-// has no way to honour any other configuration, and the bound says so at compile
-// time instead of letting the label be wrong. Implementing `KeccakTreeBackend`
-// for a BLAKE3 backend to get past it would be precisely the deliberate false
-// statement that marker exists to require, so the configuration does not exist
-// under `cuda` at all.
-//
-// ★ What is missing is NOT the kernels. Track G landed the whole device side:
-// `math-cuda/kernels/blake3.cu` carries all nine leaf/level kernels and a
-// device `Blake3Chain` transcribed from this host construction, and
-// `math_cuda::blake3` carries a wrapper for every `math_cuda::merkle` entry the
-// tree path uses. The gap is one layer up — `gpu_lde` calls
-// `math_cuda::merkle::*` unconditionally and has no BLAKE3 dispatch — and none
-// of the device side has been exercised on real hardware yet.
-//
-// So this comes off when `gpu_lde` dispatches on the configuration AND the
-// BLAKE3 parity tests have passed on a GPU. Both halves: a dispatch without the
-// hardware run would ship an unvalidated hash, and a hardware run without the
-// dispatch changes nothing about what the prover commits.
-#[cfg(not(feature = "cuda"))]
 impl StarkHash for Blake3StarkHash {
     type Batched<F>
         = BatchBlake3Backend<F>
@@ -354,7 +331,7 @@ impl StarkHash for Blake3StarkHash {
         F: IsField + 'static,
         FieldElement<F>: AsBytes + Sync + Send;
 
-    type Transcript = crypto::fiat_shamir::transcript_hash::Blake3TranscriptHash;
+    type Transcript = Blake3TranscriptHash;
 
     const COMMITMENT_HASH: CommitmentHash = CommitmentHash::Blake3;
 }
@@ -367,7 +344,6 @@ impl StarkHash for Blake3StarkHash {
 /// configuration assembled from one hash's batched backend and another's pair
 /// backend fails to compile, rather than producing proofs whose roots no single
 /// name describes.
-#[cfg(not(feature = "cuda"))]
 const _: fn() = || {
     fn assert_same<T>(_: core::marker::PhantomData<(T, T)>) {}
 
@@ -385,21 +361,33 @@ const _: fn() = || {
     );
 };
 
-/// The H3 marker's tie-in, and — since the flip — the guard on the `cuda` fork.
-///
-/// [`KeccakStarkHash`]'s own members satisfy the marker, which is what makes the
-/// impls above true statements rather than decoration. The load-bearing half is
-/// the second block: under `cuda`, [`DefaultStarkHash`] must be a configuration
-/// the device kernels can actually honour, because `gpu_lde` hashes with the
-/// keccak kernels and only *labels* the result with the alias. Point the aliases
-/// at BLAKE3 under `cuda` and this is where you find out — before a GPU run
-/// hands back keccak trees wearing a BLAKE3 name.
+/// The device marker's tie-in: each configuration's members carry the
+/// constant that names the configuration's own hash, which is what makes the
+/// [`DeviceTreeBackend`] impls above true statements rather than decoration —
+/// `gpu_lde` dispatches device kernels on that constant, so a mismatch here
+/// would be a GPU run hashing under a name the roots do not deserve.
 const _: fn() = || {
-    fn assert_keccak_backend<B: KeccakTreeBackend>() {}
+    fn assert_device_hash<B: DeviceTreeBackend>(expect: CommitmentHash) {
+        assert!(matches!(
+            (B::COMMITMENT_HASH, expect),
+            (CommitmentHash::Keccak256, CommitmentHash::Keccak256)
+                | (CommitmentHash::Blake3, CommitmentHash::Blake3)
+        ));
+    }
     fn assert_same<T>(_: core::marker::PhantomData<(T, T)>) {}
 
-    assert_keccak_backend::<<KeccakStarkHash as StarkHash>::Batched<GoldilocksField>>();
-    assert_keccak_backend::<<KeccakStarkHash as StarkHash>::Pair<GoldilocksField>>();
+    assert_device_hash::<<KeccakStarkHash as StarkHash>::Batched<GoldilocksField>>(
+        CommitmentHash::Keccak256,
+    );
+    assert_device_hash::<<KeccakStarkHash as StarkHash>::Pair<GoldilocksField>>(
+        CommitmentHash::Keccak256,
+    );
+    assert_device_hash::<<Blake3StarkHash as StarkHash>::Batched<GoldilocksField>>(
+        CommitmentHash::Blake3,
+    );
+    assert_device_hash::<<Blake3StarkHash as StarkHash>::Pair<GoldilocksField>>(
+        CommitmentHash::Blake3,
+    );
 
     // The aliases ARE [`DefaultStarkHash`]'s members, not a second opinion.
     // They are spelled concretely for the lifetime reason noted at their
@@ -419,25 +407,50 @@ const _: fn() = || {
     );
 };
 
-/// Under `cuda` the aliases must stay keccak — see [`DefaultStarkHash`].
-#[cfg(feature = "cuda")]
-const _: fn() = || {
-    fn assert_keccak_backend<B: KeccakTreeBackend>() {}
-
-    assert_keccak_backend::<BatchedMerkleTreeBackend<GoldilocksField>>();
-    assert_keccak_backend::<FriLayerMerkleTreeBackend<GoldilocksField>>();
-};
-
-/// The flip, stated positively: the shipping (non-`cuda`) default commits BLAKE3.
+/// Stated positively: the default commits BLAKE3, on every build.
 ///
 /// The alias definitions make [`COMMITMENT_HASH`] follow [`DefaultStarkHash`]
 /// automatically, so nothing above can *disagree* — what this catches is the
-/// whole fork being reverted or re-pointed without the blessed artifacts moving
-/// with it. Every pinned root in this workspace (`LFM_REGISTRY`,
+/// default being re-pointed without the blessed artifacts moving with it.
+/// Every pinned root in this workspace (`LFM_REGISTRY`,
 /// `static_zero_page_commitment`, the preprocessed table commitments) was
-/// generated under this arm.
-#[cfg(not(feature = "cuda"))]
+/// generated under this configuration.
 const _: () = assert!(matches!(COMMITMENT_HASH, CommitmentHash::Blake3));
+
+/// ★ The transcript follows the commitment hash — per configuration, by
+/// assertion.
+///
+/// `multi_prove` / `multi_verify` take `impl IsStarkTranscript`, so the type
+/// system cannot force a caller's transcript to match its commitment
+/// configuration; what CAN be forced is that each named configuration pairs
+/// its commitment hash with its own family's Fiat-Shamir hash, so following
+/// the configuration (as `DefaultStarkTranscript` does) can never produce the
+/// half-flip — one family's sponge over the other family's roots, which is
+/// self-consistent between prover and verifier and therefore silent.
+const _: fn() = || {
+    fn assert_same<T>(_: core::marker::PhantomData<(T, T)>) {}
+
+    assert_same::<Blake3TranscriptHash>(
+        core::marker::PhantomData::<(
+            Blake3TranscriptHash,
+            <Blake3StarkHash as StarkHash>::Transcript,
+        )>,
+    );
+    assert_same::<KeccakTranscriptHash>(
+        core::marker::PhantomData::<(
+            KeccakTranscriptHash,
+            <KeccakStarkHash as StarkHash>::Transcript,
+        )>,
+    );
+};
+const _: () = assert!(matches!(
+    <Blake3StarkHash as StarkHash>::COMMITMENT_HASH,
+    CommitmentHash::Blake3
+));
+const _: () = assert!(matches!(
+    <KeccakStarkHash as StarkHash>::COMMITMENT_HASH,
+    CommitmentHash::Keccak256
+));
 
 /// ★ The round-count lockstep, and the reason the default build must carry
 /// `blake3-6round`.
@@ -449,9 +462,6 @@ const _: () = assert!(matches!(COMMITMENT_HASH, CommitmentHash::Blake3));
 /// drift-test time, with a mismatch that names no cause. Here it is a compile
 /// error that names one.
 ///
-/// It is scoped to the arm that actually commits BLAKE3: a `cuda` build commits
-/// keccak, so its round count is free.
-#[cfg(not(feature = "cuda"))]
 const _: () = assert!(
     crypto::hash::blake3::BLAKE3_ROUNDS == crypto::hash::blake3::BLAKE3_SIX_ROUNDS,
     "the default commitment configuration is BLAKE3, so this build must enable \

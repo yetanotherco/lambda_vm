@@ -12,9 +12,9 @@
 use cudarc::driver::{CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 use std::sync::Arc;
 
+use crate::DeviceHash;
 use crate::Result;
 use crate::device::backend;
-use crate::merkle::build_inner_tree_levels;
 
 /// Test-only fault injection. When the `test-faults` feature is on, setting
 /// this to a finite value forces the next `fold_and_commit_layer` call to
@@ -47,6 +47,8 @@ fn check_fault_injection() -> Result<()> {
 /// of the evals exists. Freed when the last holder drops.
 pub struct FriCommitState {
     pub stream: Arc<CudaStream>,
+    /// Which hash family commits each layer's tree.
+    hash: DeviceHash,
     /// Current fold input. Each fold allocates a fresh output buffer that is
     /// both returned to the caller (kept resident for the query phase) and
     /// becomes the next fold's input.
@@ -61,7 +63,12 @@ impl FriCommitState {
     /// H2D the starting evals (ext3 interleaved, 3 * n0 u64) and the
     /// initial inv_twiddles (base field, n0/2 u64). `n0` must be a power of
     /// two and >= 2.
-    pub fn new(evals_host: &[u64], inv_tw_host: &[u64], n0: usize) -> Result<Self> {
+    pub fn new(
+        evals_host: &[u64],
+        inv_tw_host: &[u64],
+        n0: usize,
+        hash: DeviceHash,
+    ) -> Result<Self> {
         assert!(n0 >= 2 && n0.is_power_of_two());
         assert_eq!(evals_host.len(), 3 * n0);
         assert_eq!(inv_tw_host.len(), n0 / 2);
@@ -76,6 +83,7 @@ impl FriCommitState {
 
         Ok(Self {
             stream,
+            hash,
             current: Arc::new(evals),
             inv_tw,
             current_n: n0,
@@ -84,7 +92,11 @@ impl FriCommitState {
 
     /// Like [`Self::new`], but adopts a device-resident codeword (already in
     /// FRI bit-reversed order) and its producing stream — no evals H2D.
-    pub fn new_dev(codeword: crate::deep::GpuDeepCodeword, inv_tw_host: &[u64]) -> Result<Self> {
+    pub fn new_dev(
+        codeword: crate::deep::GpuDeepCodeword,
+        inv_tw_host: &[u64],
+        hash: DeviceHash,
+    ) -> Result<Self> {
         let crate::deep::GpuDeepCodeword { buf, n, stream } = codeword;
         assert!(n >= 2 && n.is_power_of_two());
         assert_eq!(buf.len(), 3 * n);
@@ -94,13 +106,15 @@ impl FriCommitState {
 
         Ok(Self {
             stream,
+            hash,
             current: Arc::new(buf),
             inv_tw,
             current_n: n,
         })
     }
 
-    /// Fold the current layer using `zeta`, run the row-pair Keccak leaves and
+    /// Fold the current layer using `zeta`, run the row-pair leaf kernels of
+    /// the configured hash family and
     /// pair-hash Merkle tree kernels on the result, and return the layer's
     /// evals — device-resident Arc, plus a host copy only when `want_host` —
     /// with its resident Merkle tree (root D2H'd, 32 bytes).
@@ -167,22 +181,46 @@ impl FriCommitState {
             let mut leaves_view =
                 nodes_dev.slice_mut(leaves_offset_bytes..leaves_offset_bytes + num_leaves * 32);
             let num_leaves_u64 = num_leaves as u64;
-            let grid = (num_leaves as u32).div_ceil(128);
-            let kcfg = LaunchConfig {
-                grid_dim: (grid, 1, 1),
-                block_dim: (128, 1, 1),
-                shared_mem_bytes: 0,
-            };
-            unsafe {
-                self.stream
-                    .launch_builder(&be.keccak_fri_leaves_ext3)
-                    .arg(&out)
-                    .arg(&num_leaves_u64)
-                    .arg(&mut leaves_view)
-                    .launch(kcfg)?;
+            match self.hash {
+                DeviceHash::Keccak256 => {
+                    let grid = (num_leaves as u32).div_ceil(128);
+                    let kcfg = LaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (128, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    unsafe {
+                        self.stream
+                            .launch_builder(&be.keccak_fri_leaves_ext3)
+                            .arg(&out)
+                            .arg(&num_leaves_u64)
+                            .arg(&mut leaves_view)
+                            .launch(kcfg)?;
+                    }
+                }
+                DeviceHash::Blake3 => crate::blake3::launch_fri_leaves_ext3(
+                    self.stream.as_ref(),
+                    be,
+                    &out,
+                    num_leaves_u64,
+                    &mut leaves_view,
+                )?,
             }
         }
-        build_inner_tree_levels(self.stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
+        match self.hash {
+            DeviceHash::Keccak256 => crate::merkle::build_inner_tree_levels(
+                self.stream.as_ref(),
+                be,
+                &mut nodes_dev,
+                num_leaves,
+            )?,
+            DeviceHash::Blake3 => crate::blake3::build_inner_tree_levels(
+                self.stream.as_ref(),
+                be,
+                &mut nodes_dev,
+                num_leaves,
+            )?,
+        }
 
         // Update inv_twiddles for the next layer: `new[j] = old[2j]^2` for
         // j in 0..n_out/2. (If n_out == 1, skip; no next fold.) Writes into

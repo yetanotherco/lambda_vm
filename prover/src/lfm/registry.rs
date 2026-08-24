@@ -417,8 +417,8 @@ pub fn build_artifacts(program: &LfmProgram, options: &ProofOptions) -> LfmArtif
 /// `hasher` names the `LFM_HASH` chip the machine RUNS. The hash the roots below
 /// are BUILT with is a different question: `commit_group` and the two
 /// `preprocessed_commitment` helpers all commit through `stark`'s Merkle layer,
-/// i.e. under whatever [`stark::config::COMMITMENT_HASH`] names — BLAKE3 since
-/// the P-a flip, keccak on a `cuda` build.
+/// i.e. under whatever [`stark::config::COMMITMENT_HASH`] names — BLAKE3, on
+/// every build.
 ///
 /// Both are folded into `program_id` (see [`lfm_program_id`]), which is what
 /// discharges the compile-time guard this function used to carry. That guard

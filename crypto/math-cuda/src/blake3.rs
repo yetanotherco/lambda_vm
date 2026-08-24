@@ -3,8 +3,11 @@
 //! function, byte serialization and chain construction.
 //!
 //! Twin of [`crate::merkle`]'s keccak path, kernel for kernel, so the two read
-//! against each other. Keccak stays the prover's default hash: nothing in the
-//! production dispatch reaches this module yet.
+//! against each other. Production dispatch reaches this module through
+//! [`crate::DeviceHash::Blake3`]: the fused LDE+commit pipelines ([`crate::lde`]),
+//! the comp-poly tree builders and the FRI layer commits ([`crate::fri`]) all
+//! select between the keccak launchers and these at every leaf, level and
+//! FRI-layer launch.
 //!
 //! # What a parent is
 //!
@@ -35,13 +38,13 @@
 //! (PA-PLAN §1.7.3), implemented here as the working default by standing
 //! decision.
 //!
-//! # What is missing, and why
+//! # Coverage
 //!
-//! Nothing on the kernel side: all seven leaf kernels, both tree compressors and
-//! the six wrapper twins are here. What has NOT happened is production dispatch —
-//! `stark::config::StarkHash` still requires `KeccakTreeBackend` under `cuda`
-//! (`config.rs:116-122`), so no prover path reaches this module. Retiring that
-//! bound is PA-PLAN's Stage 6, not track G.
+//! All seven leaf kernels, both tree compressors and the wrapper twins are
+//! here; the device-side launchers (`launch_*`) are what the dispatch sites in
+//! [`crate::lde`] and [`crate::fri`] call. The streaming mixed-MMCS builder
+//! ([`crate::mmcs`]) has no BLAKE3 twin: it has no production caller on any
+//! hash yet.
 
 use cudarc::driver::{CudaSlice, CudaStream, CudaViewMut, LaunchConfig, PushKernelArg};
 use std::sync::Arc;
@@ -340,35 +343,165 @@ fn leaves_row_major_row_pair_inner(
     let m_u64 = m as u64;
     let num_rows_u64 = num_rows as u64;
     let log_num_rows = num_rows.trailing_zeros() as u64;
-    let cfg = blake3_launch_cfg((num_rows / 2) as u64);
-    unsafe {
-        if ranged {
-            let cs = col_start as u64;
-            let ce = col_end as u64;
-            stream
-                .launch_builder(&be.blake3_leaves_base_row_major_row_pair_range)
-                .arg(&data_dev)
-                .arg(&m_u64)
-                .arg(&cs)
-                .arg(&ce)
-                .arg(&num_rows_u64)
-                .arg(&log_num_rows)
-                .arg(&mut out_dev.as_view_mut())
-                .launch(cfg)?;
-        } else {
-            stream
-                .launch_builder(&be.blake3_leaves_base_row_major_row_pair)
-                .arg(&data_dev)
-                .arg(&m_u64)
-                .arg(&num_rows_u64)
-                .arg(&log_num_rows)
-                .arg(&mut out_dev.as_view_mut())
-                .launch(cfg)?;
-        }
+    if ranged {
+        launch_leaves_base_row_major_row_pair_range(
+            stream.as_ref(),
+            be,
+            &data_dev,
+            m_u64,
+            col_start as u64,
+            col_end as u64,
+            num_rows_u64,
+            log_num_rows,
+            &mut out_dev.as_view_mut(),
+        )?;
+    } else {
+        launch_leaves_base_row_major_row_pair(
+            stream.as_ref(),
+            be,
+            &data_dev,
+            m_u64,
+            num_rows_u64,
+            log_num_rows,
+            &mut out_dev.as_view_mut(),
+        )?;
     }
     let out = stream.clone_dtoh(&out_dev)?;
     stream.synchronize()?;
     Ok(out)
+}
+
+/// Row-major ROW-PAIR leaf hashing under BLAKE3: leaf `i` hashes the two
+/// consecutive bit-reversed rows `reverse_index(2i)`, `reverse_index(2i+1)`
+/// (each `m` lanes, read contiguously from the row-major `buf`), producing
+/// `num_rows / 2` leaves. Device-buffer twin of the keccak launcher the fused
+/// LDE pipeline dispatches against; matches the CPU `commit_bit_reversed(.., 2)`
+/// and the verifier's `verify_opening_pair`.
+pub(crate) fn launch_leaves_base_row_major_row_pair(
+    stream: &CudaStream,
+    be: &Backend,
+    buf: &CudaSlice<u64>,
+    m: u64,
+    num_rows: u64,
+    log_num_rows: u64,
+    leaves_out: &mut CudaViewMut<'_, u8>,
+) -> Result<()> {
+    // The kernel derives rows as `__brevll(2*tid + k) >> (64 - log_num_rows)`;
+    // a 64-bit shift is UB at `log_num_rows == 0`, so require `num_rows >= 2`
+    // (also the minimum for a single row pair).
+    debug_assert!(
+        num_rows >= 2,
+        "row-major row-pair blake3 requires num_rows >= 2"
+    );
+    let cfg = blake3_launch_cfg(num_rows >> 1);
+    unsafe {
+        stream
+            .launch_builder(&be.blake3_leaves_base_row_major_row_pair)
+            .arg(buf)
+            .arg(&m)
+            .arg(&num_rows)
+            .arg(&log_num_rows)
+            .arg(leaves_out)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
+/// Column-range variant of [`launch_leaves_base_row_major_row_pair`]: leaves
+/// hash only columns `[col_start, col_end)` of each bit-reversed row pair
+/// (`m` stays the full row stride). Matches the CPU
+/// `commit_rows_bit_reversed_subset`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_leaves_base_row_major_row_pair_range(
+    stream: &CudaStream,
+    be: &Backend,
+    buf: &CudaSlice<u64>,
+    m: u64,
+    col_start: u64,
+    col_end: u64,
+    num_rows: u64,
+    log_num_rows: u64,
+    leaves_out: &mut CudaViewMut<'_, u8>,
+) -> Result<()> {
+    debug_assert!(
+        num_rows >= 2,
+        "row-major row-pair blake3 requires num_rows >= 2"
+    );
+    debug_assert!(
+        col_start < col_end && col_end <= m,
+        "column range in bounds"
+    );
+    let cfg = blake3_launch_cfg(num_rows >> 1);
+    unsafe {
+        stream
+            .launch_builder(&be.blake3_leaves_base_row_major_row_pair_range)
+            .arg(buf)
+            .arg(&m)
+            .arg(&col_start)
+            .arg(&col_end)
+            .arg(&num_rows)
+            .arg(&log_num_rows)
+            .arg(leaves_out)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
+/// Composition-part leaf hashing under BLAKE3: leaf `i` hashes the ext3
+/// components of every part at the two bit-reversed rows `2i`, `2i+1`, read
+/// from per-component slabs with stride `col_stride`. Device-buffer twin of
+/// the keccak launch the comp-poly tree build dispatches against.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_comp_poly_leaves_ext3(
+    stream: &CudaStream,
+    be: &Backend,
+    buf: &CudaSlice<u64>,
+    col_stride: u64,
+    num_parts: u64,
+    num_rows: u64,
+    log_num_rows: u64,
+    leaves_out: &mut CudaViewMut<'_, u8>,
+) -> Result<()> {
+    debug_assert!(
+        num_rows >= 2,
+        "comp-poly blake3 leaves require num_rows >= 2"
+    );
+    let cfg = blake3_launch_cfg(num_rows >> 1);
+    unsafe {
+        stream
+            .launch_builder(&be.blake3_comp_poly_leaves_ext3)
+            .arg(buf)
+            .arg(&col_stride)
+            .arg(&num_parts)
+            .arg(&num_rows)
+            .arg(&log_num_rows)
+            .arg(leaves_out)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
+/// FRI-layer leaf hashing under BLAKE3: leaf `i` hashes the two consecutive
+/// ext3 evals `2i`, `2i+1` of an interleaved eval vector (48 bytes — a single
+/// compression). Device-buffer twin of the keccak launch the FRI layer commit
+/// dispatches against.
+pub(crate) fn launch_fri_leaves_ext3(
+    stream: &CudaStream,
+    be: &Backend,
+    evals: &CudaSlice<u64>,
+    num_leaves: u64,
+    leaves_out: &mut CudaViewMut<'_, u8>,
+) -> Result<()> {
+    let cfg = blake3_launch_cfg(num_leaves);
+    unsafe {
+        stream
+            .launch_builder(&be.blake3_fri_leaves_ext3)
+            .arg(evals)
+            .arg(&num_leaves)
+            .arg(leaves_out)
+            .launch(cfg)?;
+    }
+    Ok(())
 }
 
 /// Walk the inner Merkle tree on device under BLAKE3. `nodes_dev` already has
