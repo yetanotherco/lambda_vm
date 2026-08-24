@@ -185,10 +185,13 @@ Combining both upper bounds, we now find that
 Given $alpha in [L]$ and $mu in [L/2]$ where at least one of the two is non-zero, 
 then for all $i <= 2n$:
 $
-c_i &<= max(&max_(i in [n]) #h(1em) mu (i+1) (L-1) + alpha - mu - delta,\ 
-  &max_(k in [n]) #h(1em) mu (n-k-1)(L-2) + mu (n-k) - delta')\
-&= max(mu n (L-1) + alpha - mu - delta, mu (n-1)(L-2) + mu n - delta')\
-&= mu n (L-1) + max(alpha - mu - delta, - mu (L-2) - delta').
+c_i <= max(&max_(j in [n]) mu (i+1) (L-1) + alpha - mu - delta,\
+  &max_(k in [n]) mu (n-k-1)(L-2) + mu (n-k) - delta')
+$
+And maximizing over both possibilities yields
+$
+c_i &<= max(mu n (L-1) + alpha - mu - delta, mu (n-1)(L-2) + mu n - delta')\
+    &= mu n (L-1) + max(alpha - mu - delta, - mu (L-2) - delta').
 $
 Note that this simplifies to $mu n (L-1) + alpha - mu - delta$ for $L >= 4$.
 ]<limbs:cor:carry-upper-bound>
