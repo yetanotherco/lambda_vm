@@ -3,7 +3,7 @@
 use num_bigint::BigUint;
 
 use crate::witness::compute_witness;
-use crate::{n, scalar_mul_x, to_le_32};
+use crate::{n, scalar_mul_full, scalar_mul_x, to_le_32};
 
 fn gx_le() -> [u8; 32] {
     let gx = BigUint::parse_bytes(
@@ -58,4 +58,31 @@ fn witness_works_near_curve_order() {
     let w = compute_witness(&to_le_32(&(n() - BigUint::from(1u8))), &gx).expect("witness");
     assert_eq!(w.x_r, gx); // (N-1)·G = -G shares x with G
     assert_eq!(w.len_k, 255);
+}
+
+/// The executor writes `scalar_mul_full`'s bytes into guest memory while the prover writes the
+/// witness columns, and the MEMW bus asserts the two images are the same claim. Publishing
+/// `yR` and `yG` put two more values under that coupling — the executor takes them from k256's
+/// affine scalar multiplication, the witness from its own double-and-add replay — so the two
+/// disagreeing anywhere (a sign, a representative) would surface only as an unbalanced bus on
+/// whichever scalar hit it. Pin the agreement directly instead.
+#[test]
+fn witness_matches_the_executor_output_image() {
+    let gx = gx_le();
+    let scalars = [
+        BigUint::from(1u8),
+        BigUint::from(5u8),
+        BigUint::from(0xABCDEFu64),
+        (n() - BigUint::from(1u8)) / BigUint::from(2u8),
+        n() - BigUint::from(1u8),
+    ];
+    for k_big in scalars {
+        let k = to_le_32(&k_big);
+        let w = compute_witness(&k, &gx).expect("witness");
+        let (x_r, y_r, y_g) = scalar_mul_full(&k, &gx).expect("executor output");
+        assert_eq!(w.x_r, x_r, "xR disagrees for k = {k_big}");
+        assert_eq!(w.y_r, y_r, "yR disagrees for k = {k_big}");
+        assert_eq!(w.y_g, y_g, "yG disagrees for k = {k_big}");
+        assert_eq!(y_g[0] & 1, 0, "xG is lifted to its even root on both sides");
+    }
 }
