@@ -324,11 +324,12 @@ fn ecsm_lincomb2(
 /// Values cross the ABI as 32-byte little-endian; `x_le` and `k_le` are distinct stack
 /// arrays so the executor's `|addr_x_le − addr_k_le| ≥ 32` assumption holds by construction.
 ///
-/// `None` on any coordinate that is not a canonical field element. That parse is load-bearing
-/// for `ŷ`, not just hygiene: `p` is odd, so `y` and `p − y` differ in parity, but a value
-/// `y + p` (a second 256-bit representative of `y`, possible when `y < 2^256 − p ≈ 2^32`)
-/// would carry the *opposite* parity. Rejecting `≥ p` here is what pins `ŷ` to exactly one
-/// of the two true roots, and it costs nothing — it is the field-element parse.
+/// `None` on any coordinate that is not a canonical field element. The chip already range-
+/// checks all three to `< p` (`OverflowKind::XrLtP` / `YrLtP` / `YgLtP`), so this parse is a
+/// free second line rather than the guarantee: it is what the caller would otherwise have to
+/// rely on, since `p` is odd — `y` and `p − y` differ in parity, but `y + p`, a second 256-bit
+/// representative when `y < 2^256 − p ≈ 2^32`, carries the *opposite* parity, which is exactly
+/// what [`oracle_point`] reads to resolve the root.
 #[cfg(target_arch = "riscv64")]
 fn ecsm_oracle(x: &FieldElement, k: &Scalar) -> Option<(FieldElement, FieldElement, FieldElement)> {
     let x_be = x.to_bytes();
@@ -463,9 +464,10 @@ where
 ///
 /// The oracle multiplied `(xp, ŷ)` for whichever root `ŷ` the chip witnessed, so the result
 /// is `k·(xp, yp)` when `ŷ = yp` and `−k·(xp, yp)` when `ŷ = −yp`. Since `ŷ` is canonical
-/// (the oracle's field-element parse rejected `≥ p`) and satisfies `ŷ² ≡ xp³ + b`, those are
-/// the only two cases; anything else means the oracle did not multiply *this* point, so we
-/// return `None` and the caller falls back to software.
+/// (the chip's `yG < p` range check, re-checked by the oracle's parse) and satisfies
+/// `ŷ² ≡ xp³ + b` (the yG convolution), those are the only two cases; anything else means the
+/// oracle did not multiply *this* point, so we return `None` and the caller falls back to
+/// software.
 ///
 /// Compared by value rather than `ct_eq`: k256 compares raw limbs *and* the magnitude and
 /// `normalized` tags, so a subtraction result never compares equal to a normalized constant

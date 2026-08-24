@@ -47,6 +47,17 @@ pub struct EcsmWitness {
     pub k_sub_n: [u8; 32],
     /// `(xR - p) mod 2^256`
     pub x_r_sub_p: [u8; 32],
+    /// `(yR - p) mod 2^256`, the addend that forces `yR < p`.
+    pub y_r_sub_p: [u8; 32],
+    /// `(yG - p) mod 2^256`, the addend that forces `yG < p`.
+    ///
+    /// Both are needed because `yR` and `yG` are published to guest memory. The byte range
+    /// checks alone bound them by `2^256`, and the quotient columns absorb a multiple of `p`,
+    /// so a witness could publish `y + p` for any `y < 2^256 - p` (~2^32) — and such points
+    /// are constructible, since `3 | p-1` makes cubing 3-to-1, so a third of small `y` have a
+    /// curve `x`. `y + p` carries the opposite parity, which is exactly what the caller reads
+    /// to resolve the root.
+    pub y_g_sub_p: [u8; 32],
     /// position of the most significant set bit of `k`
     pub len_k: u8,
     pub x_r: [u8; 32],
@@ -328,6 +339,8 @@ pub fn compute_witness(k_le: &[u8; 32], xg_le: &[u8; 32]) -> Result<EcsmWitness,
     let x_r = to_le_32(&result.x);
     let y_r = to_le_32(&result.y);
     let x_r_sub_p = to_le_32(&((&two_256 + &result.x) - p()));
+    let y_r_sub_p = to_le_32(&((&two_256 + &result.y) - p()));
+    let y_g_sub_p = to_le_32(&((&two_256 + &g.y) - p()));
 
     // Steps are independent witnesses (each builds its own λ/quotient/carry data
     // from one StepPts), so they parallelize freely when rayon is available.
@@ -354,6 +367,8 @@ pub fn compute_witness(k_le: &[u8; 32], xg_le: &[u8; 32]) -> Result<EcsmWitness,
         x_g_sub_p,
         k_sub_n,
         x_r_sub_p,
+        y_r_sub_p,
+        y_g_sub_p,
         len_k,
         x_r,
         y_r,

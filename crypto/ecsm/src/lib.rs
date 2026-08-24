@@ -136,10 +136,12 @@ pub type EcsmOutput = ([u8; 32], [u8; 32], [u8; 32]);
 /// binds `yG² ≡ xG³ + b`, so nothing pins the sign (see `spec/ecsm.typ`, "Two options for
 /// `y_G`"). Returning `yR` alone would therefore be ambiguous: it is the y of `k·(xG, yG)`
 /// for whichever root the prover chose, which is `±y(k·P)` for the caller's own point `P`.
-/// Echoing `yG` resolves it caller-side at no cost: the caller checks `yG < p` (free — it
-/// is the field-element parse) and compares `yG`'s parity against its own base point's, so
-/// a flipped root just flips the sign it applies to `yR`. That keeps the root a free choice
-/// for the prover, exactly as the spec's aside argues, while still handing back a usable y.
+/// Echoing `yG` resolves it caller-side at no cost: the caller compares `yG` against its own
+/// base point's `y`, so a flipped root just flips the sign it applies to `yR`. That keeps the
+/// root a free choice for the prover, exactly as the spec's aside argues, while still handing
+/// back a usable y. The comparison is safe on bytes because the chip range-checks `yG < p`
+/// and `yR < p` (`OverflowKind::YgLtP` / `YrLtP`): without those the prover could publish the
+/// second representative `y + p`, which agrees mod `p` but carries the opposite parity.
 pub fn scalar_mul_full(k_le: &[u8; 32], xg_le: &[u8; 32]) -> Result<EcsmOutput, EcsmError> {
     let (k, g) = prepare(k_le, xg_le)?;
     let r = curve::scalar_mul_affine(&k, &g);
