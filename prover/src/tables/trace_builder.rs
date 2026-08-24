@@ -1178,8 +1178,11 @@ fn replay_dma_memcpy_for_sizing(
     let rows = snapshot_count + 1;
     // This pass counts rows by replaying the chunk loop rather than by calling the
     // shared formula, so pin the two together: a sizing pass that disagrees with
-    // the trace builder mis-sizes the spilled DMA trace.
-    debug_assert_eq!(
+    // the trace builder mis-sizes the spilled DMA trace. A plain assert, not a
+    // debug one: every job that exercises the sizing pass builds with --release
+    // and no profile raises debug-assertions, so a debug assert here is never
+    // evaluated in CI. The cost is one division per DMA ecall.
+    assert_eq!(
         rows as u64,
         executor::vm::instruction::execution::dma_memcpy_trace_rows(count),
         "sizing-pass row count must match the shared DMA row formula"
