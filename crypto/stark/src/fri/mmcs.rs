@@ -406,7 +406,7 @@ where
     /// hashed them incrementally, matrix by matrix. That the two produce the same
     /// tree is therefore a property of calling one function, not a coincidence
     /// two code paths have to be shown to share.
-    fn from_group_digests(
+    pub(crate) fn from_group_digests(
         dims: Vec<(usize, usize)>,
         h_max: usize,
         mut group_digests: Vec<Option<Vec<Commitment>>>,

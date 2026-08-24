@@ -126,6 +126,140 @@ struct LdePair<Field: IsField, FieldExtension: IsField> {
 /// AIR's own root fails the prove with the same error the per-table prover
 /// raises.
 #[allow(clippy::too_many_arguments)]
+/// One streaming MMCS round's committer: the host builder, or the device
+/// leaf hasher when a backend is up and the fields are the device-served pair.
+/// The device arm ends in `MixedMmcs::from_group_digests`, so the finished
+/// object — root, openings, everything the transcript sees — is the host code
+/// path either way. Selection happens BEFORE the first absorb; there is no
+/// mid-round fallback, and a device failure aborts the prove with an error
+/// rather than risking a wrong commitment.
+enum RoundCommit<E, H>
+where
+    E: IsField + 'static,
+    H: StarkHash,
+    FieldElement<E>: AsBytes + Sync + Send,
+{
+    Host(StreamingMmcsBuilder<E, H>),
+    #[cfg(feature = "cuda")]
+    Dev {
+        dev: super::gpu::DeviceStreamingMmcs,
+        dims: Vec<(usize, usize)>,
+        lanes: usize,
+        _config: core::marker::PhantomData<H>,
+    },
+}
+
+impl<E, H> RoundCommit<E, H>
+where
+    E: IsField + 'static,
+    H: StarkHash,
+    FieldElement<E>: AsBytes + Sync + Send,
+{
+    fn new(dims: &[(usize, usize)]) -> Self {
+        #[cfg(feature = "cuda")]
+        if let Some(lanes) = super::gpu::lanes_per_element::<E>()
+            && let Some(dev) =
+                super::gpu::DeviceStreamingMmcs::try_new(dims, super::gpu::device_hash_of::<H>())
+        {
+            return RoundCommit::Dev {
+                dev,
+                dims: dims.to_vec(),
+                lanes,
+                _config: core::marker::PhantomData,
+            };
+        }
+        RoundCommit::Host(StreamingMmcsBuilder::new(dims))
+    }
+
+    fn absorb_row_major_natural(
+        &mut self,
+        data: &[FieldElement<E>],
+        stride: usize,
+        col_start: usize,
+        width: usize,
+        log_height: usize,
+    ) -> Result<(), ProvingError> {
+        match self {
+            RoundCommit::Host(builder) => {
+                let src = vec![BorrowedMatrix::RowMajorNatural {
+                    data,
+                    stride,
+                    col_start,
+                    width,
+                    log_height,
+                }];
+                builder.absorb(&src, 0);
+                Ok(())
+            }
+            #[cfg(feature = "cuda")]
+            RoundCommit::Dev { dev, lanes, .. } => {
+                let l = *lanes;
+                // SAFETY: `lanes` came from `lanes_per_element::<E>()`.
+                let raw = unsafe { super::gpu::felts_as_lanes(data, l) };
+                dev.absorb_row_major(
+                    raw,
+                    stride * l,
+                    col_start * l,
+                    (col_start + width) * l,
+                    log_height,
+                )
+                .map_err(|e| ProvingError::WrongParameter(format!("GPU MMCS absorb: {e}")))
+            }
+        }
+    }
+
+    fn absorb_col_major_natural(
+        &mut self,
+        cols: &[Vec<FieldElement<E>>],
+        log_height: usize,
+    ) -> Result<(), ProvingError> {
+        match self {
+            RoundCommit::Host(builder) => {
+                let src = vec![BorrowedMatrix::ColMajorNatural { cols, log_height }];
+                builder.absorb(&src, 0);
+                Ok(())
+            }
+            #[cfg(feature = "cuda")]
+            RoundCommit::Dev { dev, lanes, .. } => {
+                // Repack to natural-order row-major (the leaf byte order the
+                // host's ColMajorNatural walk produces): row `r` is column 0's
+                // element, column 1's, ... — each `lanes` u64s.
+                let l = *lanes;
+                let num_rows = cols.first().map_or(0, Vec::len);
+                let width = cols.len();
+                let mut packed: Vec<u64> = Vec::with_capacity(num_rows * width * l);
+                for r in 0..num_rows {
+                    for col in cols {
+                        // SAFETY: `lanes` came from `lanes_per_element::<E>()`.
+                        let raw = unsafe { super::gpu::felts_as_lanes(&col[r..r + 1], l) };
+                        packed.extend_from_slice(raw);
+                    }
+                }
+                dev.absorb_row_major(&packed, width * l, 0, width * l, log_height)
+                    .map_err(|e| ProvingError::WrongParameter(format!("GPU MMCS absorb: {e}")))
+            }
+        }
+    }
+
+    fn finish(self) -> Result<MixedMmcs<E, H>, ProvingError> {
+        match self {
+            RoundCommit::Host(builder) => Ok(builder.finish()),
+            #[cfg(feature = "cuda")]
+            RoundCommit::Dev { dev, dims, .. } => {
+                let h_max = dims
+                    .iter()
+                    .map(|&(h, _)| h)
+                    .max()
+                    .expect("a round has at least one matrix");
+                let digests = dev
+                    .finish()
+                    .map_err(|e| ProvingError::WrongParameter(format!("GPU MMCS finish: {e}")))?;
+                Ok(MixedMmcs::from_group_digests(dims, h_max, digests))
+            }
+        }
+    }
+}
+
 pub fn multi_prove_batched<Field, FieldExtension, PI, H, P>(
     mut air_trace_pairs: Vec<BatchedAirTracePair<'_, Field, FieldExtension, PI>>,
     transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone + Send),
@@ -209,7 +343,7 @@ where
     // per-table prover does.
     let mut prep_trees: Vec<PrepTreeSlot<H::Batched<Field>>> =
         (0..num_tables).map(|_| None).collect();
-    let mut main_builder = StreamingMmcsBuilder::<Field, H>::new(&shape.main.dims);
+    let mut main_builder = RoundCommit::<Field, H>::new(&shape.main.dims);
     let mut retained_main: Vec<Option<(Vec<FieldElement<Field>>, usize)>> =
         (0..num_tables).map(|_| None).collect();
 
@@ -259,14 +393,13 @@ where
             transcript.append_bytes(&expected);
             prep_trees[table] = Some(tree);
         }
-        let src = vec![BorrowedMatrix::RowMajorNatural {
-            data: &main_data,
-            stride: total_cols,
-            col_start: num_precomputed,
-            width: total_cols - num_precomputed,
-            log_height: height,
-        }];
-        main_builder.absorb(&src, 0);
+        main_builder.absorb_row_major_natural(
+            &main_data,
+            total_cols,
+            num_precomputed,
+            total_cols - num_precomputed,
+            height,
+        )?;
 
         // The root is what Fiat-Shamir needs; the buffer is not. Under
         // `RecomputeLde` it dies here and every later phase rebuilds it.
@@ -279,7 +412,7 @@ where
         }
     }
 
-    let main_mmcs = main_builder.finish();
+    let main_mmcs = main_builder.finish()?;
     let main_root = main_mmcs.root();
     transcript.append_bytes(&main_root);
 
@@ -299,8 +432,8 @@ where
 
     let mut bus_public_inputs: Vec<Option<BusPublicInputs<FieldExtension>>> =
         (0..num_tables).map(|_| None).collect();
-    let mut aux_builder = (!shape.aux.is_empty())
-        .then(|| StreamingMmcsBuilder::<FieldExtension, H>::new(&shape.aux.dims));
+    let mut aux_builder =
+        (!shape.aux.is_empty()).then(|| RoundCommit::<FieldExtension, H>::new(&shape.aux.dims));
     let mut retained_aux: Vec<Option<(Vec<FieldElement<FieldExtension>>, usize)>> =
         (0..num_tables).map(|_| None).collect();
 
@@ -331,14 +464,7 @@ where
         stats.aux_lde_expansions += 1;
         let bytes = lde_bytes::<FieldExtension>(aux_data.len());
         ledger.alloc(bytes);
-        let src = vec![BorrowedMatrix::RowMajorNatural {
-            data: &aux_data,
-            stride: aux_cols,
-            col_start: 0,
-            width: aux_cols,
-            log_height: shape.heights[table],
-        }];
-        builder.absorb(&src, 0);
+        builder.absorb_row_major_natural(&aux_data, aux_cols, 0, aux_cols, shape.heights[table])?;
         match residency {
             ResidencyMode::Retain => retained_aux[table] = Some((aux_data, aux_cols)),
             ResidencyMode::RecomputeLde => {
@@ -348,7 +474,7 @@ where
         }
     }
 
-    let aux_mmcs = aux_builder.map(StreamingMmcsBuilder::finish);
+    let aux_mmcs = aux_builder.map(RoundCommit::finish).transpose()?;
     let aux_root = aux_mmcs.as_ref().map(MixedMmcs::root);
     if let Some(root) = aux_root {
         transcript.append_bytes(&root);
@@ -363,7 +489,7 @@ where
         transcript.append_field_element(&bpi.table_contribution);
     }
 
-    let mut parts_builder = StreamingMmcsBuilder::<FieldExtension, H>::new(&shape.parts.dims);
+    let mut parts_builder = RoundCommit::<FieldExtension, H>::new(&shape.parts.dims);
     let mut retained_parts: Vec<Vec<Vec<FieldElement<FieldExtension>>>> =
         (0..num_tables).map(|_| Vec::new()).collect();
 
@@ -426,11 +552,7 @@ where
             .map(|p| lde_bytes::<FieldExtension>(p.len()))
             .sum();
         parts_ledger.alloc(parts_bytes);
-        let src = vec![BorrowedMatrix::ColMajorNatural {
-            cols: &parts,
-            log_height: shape.heights[table],
-        }];
-        parts_builder.absorb(&src, 0);
+        parts_builder.absorb_col_major_natural(&parts, shape.heights[table])?;
 
         // Parts are RETAINED: rebuilding them is a second constraint evaluation.
         retained_parts[table] = parts;
@@ -444,7 +566,7 @@ where
         );
     }
 
-    let parts_mmcs = parts_builder.finish();
+    let parts_mmcs = parts_builder.finish()?;
     let parts_root = parts_mmcs.root();
     transcript.append_bytes(&parts_root);
 

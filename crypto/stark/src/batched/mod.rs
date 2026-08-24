@@ -20,6 +20,8 @@
 //! - [`verifier`] — the transcript replay, and ⛔ only the commitment half of a
 //!   verification. Read its header before assuming otherwise.
 
+#[cfg(feature = "cuda")]
+pub mod gpu;
 pub mod proof;
 pub mod prover;
 pub mod round4;
