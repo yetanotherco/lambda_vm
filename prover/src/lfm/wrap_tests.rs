@@ -1560,6 +1560,78 @@ fn the_real_block_epoch_wraps_batched() {
     batched_wrap_run_from(inner, inputs);
 }
 
+/// The SAME real-block batched-verifier program the test above proves
+/// per-table, proven in the BATCHED LFM format (`lfm_prove_batched` — one
+/// root set, one shared FRI) and verified with `verify_against_batched`.
+/// This is the wrap-side arrangement the aggregation design assumes, and
+/// the prove the device-residency work targets; with
+/// `LAMBDA_VM_WRAP_PHASE_TELEMETRY` set the prove prints its
+/// `BatchedProveStats` phase split.
+///
+/// ```text
+/// LFM_CENSUS_ELF=/path/to/ethrex.elf \
+/// LFM_CENSUS_INPUT=/path/to/ethrex_mainnet_25368371.bin \
+/// LFM_CENSUS_EPOCH_LOG2=16 \
+/// cargo test --release -p lambda-vm-prover --lib \
+///   lfm::wrap_tests::the_real_block_wrap_proves_in_the_batched_format \
+///   -- --ignored --exact --nocapture
+/// ```
+#[test]
+#[ignore]
+fn the_real_block_wrap_proves_in_the_batched_format() {
+    for var in ["LFM_CENSUS_ELF", "LFM_CENSUS_INPUT"] {
+        assert!(
+            std::env::var(var).is_ok(),
+            "{var} must name a file: this test wraps a REAL block epoch"
+        );
+    }
+    let inputs = EpochInputs::from_env();
+    let mut inner = crate::recursion::Preset::Blowup4.options();
+    if let Ok(v) = std::env::var("LFM_WRAP_QUERIES") {
+        inner.fri_number_of_queries = v.parse().expect("LFM_WRAP_QUERIES must be an integer");
+    }
+    let t = Instant::now();
+    let e = super::epoch_tests::real_batched_epoch_from(inner, inputs);
+    println!(
+        "batched inner epoch built and HOST-VERIFIED in {:.1}s",
+        t.elapsed().as_secs_f64()
+    );
+    let program = super::epoch_tests::batched_epoch_program_with(&e, true, false);
+    let mut arenas = super::epoch_tests::batched_epoch_arenas(&e);
+    arenas.push(super::epoch_verify_tests::batched_opening_arena(&e));
+    arenas.push(super::epoch_verify_tests::batched_fri_arena(&e));
+    let opts = wrap_options();
+    let artifacts = build_artifacts(&program, &opts);
+
+    let t = Instant::now();
+    let proved = super::proof::lfm_prove_batched(&program, &artifacts, &arenas, &opts)
+        .expect("the batched-format wrap must prove");
+    let prove_secs = t.elapsed().as_secs_f64();
+    let t = Instant::now();
+    let verified = super::proof::verify_against_batched(
+        &artifacts,
+        &proved.proof,
+        &proved.public_words,
+        &opts,
+    );
+    let verify_secs = t.elapsed().as_secs_f64();
+    println!(
+        "\n★ BATCHED-FORMAT WRAP: prove {prove_secs:.1}s / verify {verify_secs:.2}s / \
+         {} queries / {} published words",
+        proved.proof.queries.len(),
+        proved.public_words.len(),
+    );
+    assert!(verified, "the batched-format wrap proof must verify");
+
+    let pub_ext =
+        |i: usize| super::word::word_as_ext(&proved.public_words[i].1).expect("an ext challenge");
+    let [z, alpha] = e.challenges.lookup.as_slice() else {
+        panic!("the shared pair is (z, alpha)");
+    };
+    assert_eq!(pub_ext(0), *z, "the proved run publishes z");
+    assert_eq!(pub_ext(1), *alpha, "the proved run publishes alpha");
+}
+
 /// The batched wrap at the FIXTURE, not ignored — the whole T3 instrument's
 /// flow (batched inner, emitted verifier, per-table LFM prove, verify, both
 /// falsification arms) gated on every suite run, so the box run cannot be the
