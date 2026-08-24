@@ -34,6 +34,12 @@ use k256::{AffinePoint, FieldBytes, ProjectivePoint, Scalar, U256};
 // host unit tests); unused on a non-test host build.
 #[cfg(any(target_arch = "riscv64", test))]
 use k256::elliptic_curve::sec1::FromEncodedPoint;
+
+// 8-byte-aligned ecall operand buffers (`ecsm_mul` takes them by type; `hint` wants the
+// same alignment for its four 8-byte writes).
+#[cfg(target_arch = "riscv64")]
+use lambda_vm_syscalls::syscalls::Align8;
+
 #[cfg(any(target_arch = "riscv64", test))]
 use k256::{EncodedPoint, FieldElement};
 
@@ -80,14 +86,6 @@ fn get_hint(hint_id: usize, x_be: &[u8; 32]) -> [u8; 32] {
     lambda_vm_syscalls::syscalls::hint(hint_id, &mut out.0, x_be);
     out.0
 }
-
-/// 8-byte-aligned wrapper for an ecall operand buffer, so the table's 8-byte accesses land
-/// on the aligned memory path (MEMW_A, 29 columns + 1 range check) instead of the general
-/// one (49 + 8). A bare `[u8; N]` on the stack is only 1-aligned, which forces every access
-/// onto the unaligned path and inflates the trace.
-#[cfg(target_arch = "riscv64")]
-#[repr(C, align(8))]
-struct Align8<const N: usize>([u8; N]);
 
 /// Scalar-field inverse `x⁻¹ mod n`.
 ///
@@ -342,7 +340,7 @@ fn ecsm_oracle(x: &FieldElement, k: &Scalar) -> Option<(FieldElement, FieldEleme
         k_le.0[i] = k_be[31 - i];
     }
     let mut out = Align8([0u8; 96]);
-    lambda_vm_syscalls::syscalls::ecsm_mul(&mut out.0, &x_le.0, &k_le.0);
+    lambda_vm_syscalls::syscalls::ecsm_mul(&mut out, &x_le, &k_le);
     let load = |chunk: usize| -> Option<FieldElement> {
         let mut be = [0u8; 32];
         for i in 0..32 {
