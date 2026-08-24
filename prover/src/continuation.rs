@@ -436,7 +436,7 @@ struct BuildJob {
 /// per-epoch page config set is empty — the verifier builds the AIRs with no PAGE
 /// tables rather than trusting any prover-supplied page config.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-struct EpochProof {
+pub(crate) struct EpochProof {
     /// The epoch's STARK proof (its tables + the epoch-local L2G sub-table last).
     proof: MultiProof<F, E, ()>,
     /// Bytes this epoch committed — the COMMIT-bus receiver reference.
@@ -490,6 +490,70 @@ impl ContinuationProof {
     pub fn num_epochs(&self) -> usize {
         self.epochs.len()
     }
+
+    /// Epoch `i`'s bundle, as the same [`EpochProofView`] the verifier reads.
+    #[cfg(test)]
+    pub(crate) fn epoch_view(&self, i: usize) -> EpochProofView<'_> {
+        EpochProofView::Owned(&self.epochs[i])
+    }
+}
+
+#[cfg(test)]
+impl ContinuationProof {
+    /// Test-only: flip one bit of epoch `i`'s bound `reg_fini` — a
+    /// prover-supplied bundle field the verifier re-binds through the REGISTER
+    /// preprocessed commitment, so any consumer that rebuilds the epoch's AIRs
+    /// from the bundle must reject the flip.
+    pub(crate) fn corrupt_epoch_reg_fini_for_tests(&mut self, i: usize) {
+        self.epochs[i].reg_fini[0] ^= 1;
+    }
+
+    /// Test-only: flip one bit of epoch `i`'s claimed L2G root — the value
+    /// [`verify_epoch`] checks against the proof's own committed root.
+    pub(crate) fn corrupt_epoch_l2g_root_for_tests(&mut self, i: usize) {
+        self.epochs[i].l2g_root[0] ^= 1;
+    }
+}
+
+/// The chain-derived inputs epoch `index` of a bundle verifies under, by the
+/// same rule as [`verify_continuation_view`]'s loop: `register_init` starts
+/// from the ELF entry point, each epoch's bound `reg_fini` becomes the next
+/// epoch's INIT, the label is the epoch's position, and the last epoch is
+/// final.
+#[cfg(test)]
+pub(crate) struct EpochChainPosition {
+    pub(crate) register_init: Vec<u32>,
+    pub(crate) is_final: bool,
+    pub(crate) label: u64,
+}
+
+/// Derive [`EpochChainPosition`] for epoch `index` of `bundle`. `Ok(None)` if
+/// `index` is out of range or an earlier epoch's `reg_fini` has the wrong
+/// length (a malformed bundle the verifier rejects up front); `Err` iff a
+/// metadata field fails to materialize.
+#[cfg(test)]
+pub(crate) fn epoch_chain_position(
+    bundle: &ContinuationProof,
+    elf: &Elf,
+    index: usize,
+) -> Result<Option<EpochChainPosition>, Error> {
+    let n = bundle.num_epochs();
+    if index >= n {
+        return Ok(None);
+    }
+    let mut register_init = register::register_init_from_entry_point(elf.entry_point);
+    for prior in 0..index {
+        let view = bundle.epoch_view(prior);
+        if view.reg_fini_len() != register::NUM_REGISTER_ADDRESSES {
+            return Ok(None);
+        }
+        register_init = view.reg_fini()?;
+    }
+    Ok(Some(EpochChainPosition {
+        register_init,
+        is_final: index == n - 1,
+        label: local_to_global::epoch_label(index as u64),
+    }))
 }
 
 /// Zero-copy readers over an ARCHIVED bundle, for the LFM arena filler.
@@ -546,9 +610,12 @@ impl ArchivedContinuationProof {
 /// parameter list the owned/archived split used to force on every caller:
 /// each accessor reads straight off whichever representation is behind it, a
 /// plain field copy on the owned side and (for the small metadata fields) an
-/// `rkyv::deserialize` on the archived side.
+/// `rkyv::deserialize` on the archived side. The wrap flow's from-proof
+/// constructor reads the same view (via [`ContinuationProof::epoch_view`] +
+/// [`reconstruct_epoch_airs`]), so an epoch's verifier-side reconstruction has
+/// exactly one reader-facing surface.
 #[derive(Clone, Copy)]
-enum EpochProofView<'a> {
+pub(crate) enum EpochProofView<'a> {
     Owned(&'a EpochProof),
     Archived(&'a ArchivedEpochProof),
 }
@@ -557,7 +624,7 @@ impl<'a> EpochProofView<'a> {
     /// The epoch's STARK proof (its tables + the epoch-local L2G sub-table
     /// last), as a [`MultiProofView`] — never materialized into an owned
     /// `MultiProof` on the archived side.
-    fn proof(&self) -> MultiProofView<'a, F, E, ()> {
+    pub(crate) fn proof(&self) -> MultiProofView<'a, F, E, ()> {
         match self {
             Self::Owned(e) => MultiProofView::Owned(&e.proof),
             Self::Archived(e) => MultiProofView::Archived(&e.proof),
@@ -565,14 +632,14 @@ impl<'a> EpochProofView<'a> {
     }
 
     /// Bytes this epoch committed (zero-copy borrow either way).
-    fn public_output(&self) -> &'a [u8] {
+    pub(crate) fn public_output(&self) -> &'a [u8] {
         match self {
             Self::Owned(e) => &e.public_output,
             Self::Archived(e) => e.public_output.as_slice(),
         }
     }
 
-    fn table_counts(&self) -> Result<TableCounts, Error> {
+    pub(crate) fn table_counts(&self) -> Result<TableCounts, Error> {
         match self {
             Self::Owned(e) => Ok(e.table_counts.clone()),
             Self::Archived(e) => {
@@ -586,7 +653,7 @@ impl<'a> EpochProofView<'a> {
     /// Always empty for continuation epochs (PAGE is skipped); still routed
     /// through the archive rather than assumed, so a malformed non-empty
     /// bundle value surfaces instead of being silently ignored.
-    fn runtime_page_ranges(&self) -> Result<Vec<RuntimePageRange>, Error> {
+    pub(crate) fn runtime_page_ranges(&self) -> Result<Vec<RuntimePageRange>, Error> {
         match self {
             Self::Owned(e) => Ok(e.runtime_page_ranges.clone()),
             Self::Archived(e) => rkyv::deserialize::<Vec<RuntimePageRange>, rkyv::rancor::Error>(
@@ -605,7 +672,7 @@ impl<'a> EpochProofView<'a> {
         }
     }
 
-    fn reg_fini(&self) -> Result<Vec<u32>, Error> {
+    pub(crate) fn reg_fini(&self) -> Result<Vec<u32>, Error> {
         match self {
             Self::Owned(e) => Ok(e.reg_fini.clone()),
             Self::Archived(e) => rkyv::deserialize::<Vec<u32>, rkyv::rancor::Error>(&e.reg_fini)
@@ -615,7 +682,7 @@ impl<'a> EpochProofView<'a> {
         }
     }
 
-    fn l2g_root(&self) -> Commitment {
+    pub(crate) fn l2g_root(&self) -> Commitment {
         match self {
             Self::Owned(e) => e.l2g_root,
             Self::Archived(e) => e.l2g_root,
@@ -815,12 +882,85 @@ fn prove_epoch(
     })
 }
 
+/// An epoch's verifier-side reconstruction: the AIR set (VM tables + the
+/// epoch-local L2G air) and the statement values, all rebuilt from the proof
+/// bundle plus the chain-derived inputs (`register_init`, `is_final`,
+/// `label`). Shared by [`verify_epoch`] and the wrap flow's
+/// `RealEpoch`-from-proof constructor so the two reconstructions cannot
+/// diverge.
+pub(crate) struct EpochReconstruction {
+    pub(crate) airs: VmAirs,
+    pub(crate) l2g_air: Box<dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>>,
+    pub(crate) table_counts: TableCounts,
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) reg_fini: Vec<u32>,
+    pub(crate) runtime_page_ranges: Vec<RuntimePageRange>,
+}
+
+/// Rebuild epoch `epoch`'s AIR set from the bundle alone. `Ok(None)` = a
+/// well-formed bundle that is structurally wrong (degenerate table counts,
+/// sub-proof count mismatch) — the cases [`verify_epoch`] rejects with
+/// `Ok(false)`; `Err` iff a small metadata field failed to materialize off an
+/// archived bundle.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn reconstruct_epoch_airs(
+    elf: &Elf,
+    epoch: EpochProofView<'_>,
+    register_init: &[u32],
+    is_final: bool,
+    label: u64,
+    opts: &ProofOptions,
+    decode_commitment: Option<Commitment>,
+) -> Result<Option<EpochReconstruction>, Error> {
+    let table_counts = epoch.table_counts()?;
+    // Reject degenerate table counts (mirrors the monolithic verifier).
+    if table_counts.validate().is_err() {
+        return Ok(None);
+    }
+
+    // Cross-check table_counts before building AIRs from bundle data. Continuation
+    // epochs have no PAGE proofs, and append one epoch-local L2G proof after the VM
+    // tables. HALT is present only on the final epoch.
+    let fixed_tables = if is_final {
+        FIXED_TABLE_COUNT
+    } else {
+        FIXED_TABLE_COUNT - 1
+    };
+    let expected_proof_count = table_counts.total() + fixed_tables + 1;
+    if expected_proof_count != epoch.proof().len() {
+        return Ok(None);
+    }
+
+    let reg_fini = epoch.reg_fini()?;
+    let runtime_page_ranges = epoch.runtime_page_ranges()?;
+
+    let airs = build_epoch_airs(
+        elf,
+        opts,
+        &[],
+        &table_counts,
+        register_init,
+        &reg_fini,
+        is_final,
+        decode_commitment,
+    );
+    let l2g_air = Box::new(l2g_memory_air(opts, label))
+        as Box<dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>>;
+    Ok(Some(EpochReconstruction {
+        airs,
+        l2g_air,
+        table_counts,
+        reg_fini,
+        runtime_page_ranges,
+    }))
+}
+
 /// Verify one epoch using ONLY the epoch's public statement fields (via
 /// [`EpochProofView`]) plus the verifier-derived `register_init` (epoch 0:
 /// from the ELF; epoch i>0: from the previous epoch's `reg_fini`), `is_final`,
 /// and `label`. Rebuilds the AIRs and transcript from the bundle's statement
-/// values and indexes commits from the carried x254
-/// (`register_init[X254_INDEX]`), never from the prover's memory. PAGE is
+/// values ([`reconstruct_epoch_airs`]) and indexes commits from the carried
+/// x254 (`register_init[X254_INDEX]`), never from the prover's memory. PAGE is
 /// skipped for continuation epochs, so the AIRs are built with no page configs
 /// (the bundle does not get to supply any). Returns `Ok(true)` iff the proof
 /// verifies and its committed L2G root matches the claimed one; `Err` iff a
@@ -838,43 +978,30 @@ fn verify_epoch(
     opts: &ProofOptions,
     decode_commitment: Option<Commitment>,
 ) -> Result<bool, Error> {
-    let table_counts = epoch.table_counts()?;
-    // Reject degenerate table counts (mirrors the monolithic verifier).
-    if table_counts.validate().is_err() {
-        return Ok(false);
-    }
-
-    // Cross-check table_counts before building AIRs from bundle data. Continuation
-    // epochs have no PAGE proofs, and append one epoch-local L2G proof after the VM
-    // tables. HALT is present only on the final epoch.
-    let fixed_tables = if is_final {
-        FIXED_TABLE_COUNT
-    } else {
-        FIXED_TABLE_COUNT - 1
-    };
-    let proof = epoch.proof();
-    let expected_proof_count = table_counts.total() + fixed_tables + 1;
-    if expected_proof_count != proof.len() {
-        return Ok(false);
-    }
-
-    let reg_fini = epoch.reg_fini()?;
-    let runtime_page_ranges = epoch.runtime_page_ranges()?;
-    let public_output = epoch.public_output();
-
-    let airs = build_epoch_airs(
+    let Some(recon) = reconstruct_epoch_airs(
         elf,
-        opts,
-        &[],
-        &table_counts,
+        epoch,
         register_init,
-        &reg_fini,
         is_final,
+        label,
+        opts,
         decode_commitment,
-    );
-    let l2g_air = l2g_memory_air(opts, label);
+    )?
+    else {
+        return Ok(false);
+    };
+    let EpochReconstruction {
+        airs,
+        l2g_air,
+        table_counts,
+        reg_fini: _,
+        runtime_page_ranges,
+    } = recon;
+
+    let proof = epoch.proof();
+    let public_output = epoch.public_output();
     let mut refs = airs.air_refs();
-    refs.push(&l2g_air);
+    refs.push(&*l2g_air);
 
     let seed = || {
         epoch_transcript(
