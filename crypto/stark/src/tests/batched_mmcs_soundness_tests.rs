@@ -1397,6 +1397,41 @@ mod full_verify {
         );
     }
 
+    /// The tall fixture is a well-formed epoch on the host path — the
+    /// baseline the cuda arm below is compared against.
+    #[test_log::test]
+    fn a_tall_batched_epoch_verifies_end_to_end() {
+        let (airs, proof, _) = crate::tests::batched_prover_tests::prove_tall(
+            4,
+            &folding_options(),
+            ResidencyMode::Retain,
+        );
+        assert!(
+            verifies(&airs, &proof),
+            "the tall fixture must verify on the host path"
+        );
+    }
+
+    /// A cuda build must produce the same accepting proof a non-cuda build
+    /// does. The GPU LogUp aux build becomes eligible at 2^10 rows; at
+    /// 2^13/2^12-row tables the aux round only verifies if the host trace
+    /// columns its LDE expands from are actually written — a device-resident
+    /// aux build that skips them makes this fail at the OOD composition
+    /// check.
+    #[cfg(feature = "cuda")]
+    #[test_log::test]
+    fn a_tall_batched_epoch_verifies_under_cuda() {
+        let (airs, proof, _) = crate::tests::batched_prover_tests::prove_tall(
+            1 << 10,
+            &folding_options(),
+            ResidencyMode::Retain,
+        );
+        assert!(
+            verifies(&airs, &proof),
+            "the cuda build's batched aux round must match the host build's"
+        );
+    }
+
     /// The same at the degenerate shape, where nothing folds.
     #[test_log::test]
     fn an_honest_no_fold_epoch_verifies_end_to_end() {

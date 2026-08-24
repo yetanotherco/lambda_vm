@@ -117,6 +117,71 @@ fn traces() -> (TraceTable<F, E>, TraceTable<F, E>, TraceTable<F, E>) {
     (cpu, add, mul)
 }
 
+/// The 8/4/4-row fixture tiled `k` times vertically: every column repeated
+/// end to end, so each bus send still meets its receive `k`-for-`k` and the
+/// epoch stays balanced at `k`× the height. Heights at or above 2^10 rows are
+/// where the GPU LogUp aux build becomes eligible, which is what the
+/// cfg-invariance test needs.
+pub(crate) fn tall_traces(k: usize) -> (TraceTable<F, E>, TraceTable<F, E>, TraceTable<F, E>) {
+    let tile = |t: &TraceTable<F, E>| {
+        let cols: Vec<Vec<FE>> = t
+            .columns_main()
+            .iter()
+            .map(|col| {
+                let mut tall = Vec::with_capacity(col.len() * k);
+                for _ in 0..k {
+                    tall.extend_from_slice(col);
+                }
+                tall
+            })
+            .collect();
+        TraceTable::from_columns_main(cols, 1)
+    };
+    let (cpu, add, mul) = traces();
+    (tile(&cpu), tile(&add), tile(&mul))
+}
+
+/// One epoch of the tall fixture ([`tall_traces`]), proved batched.
+pub(crate) fn prove_tall(
+    k: usize,
+    options: &ProofOptions,
+    residency: ResidencyMode,
+) -> (Vec<Air>, BatchedMultiProof<F, E, ()>, BatchedProveStats) {
+    let (mut cpu, mut add, mut mul) = tall_traces(k);
+    let airs = vec![
+        new_cpu_air_with_lookup(options),
+        new_add_air_with_lookup(options),
+        new_mul_air_with_lookup(options),
+    ];
+    let unit = ();
+    let pairs: Vec<_> = airs
+        .iter()
+        .zip([&mut cpu, &mut add, &mut mul])
+        .map(|(air, trace)| {
+            (
+                air as &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+                trace,
+                &unit,
+            )
+        })
+        .collect();
+    let (proof, stats) = multi_prove_batched::<
+        F,
+        E,
+        (),
+        DefaultStarkHash,
+        GenericProver<F, E, (), DefaultStarkHash>,
+    >(
+        pairs,
+        &mut DefaultTranscript::<E>::new(&[]),
+        #[cfg(feature = "disk-spill")]
+        crate::storage_mode::StorageMode::Ram,
+        residency,
+    )
+    .expect("the tall fixture is a well-shaped epoch");
+    (airs, proof, stats)
+}
+
 /// Prove `repeats` copies of the fixture as one epoch. `repeats == 1` is the
 /// three-table epoch; higher values are how the residency claim is put on a
 /// curve instead of a threshold.

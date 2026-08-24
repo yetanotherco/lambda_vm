@@ -297,6 +297,16 @@ where
         Vec::new()
     };
 
+    // The aux round expands its LDE from the host trace columns
+    // (`expand_aux_lde_row_major` below); the device-resident aux build
+    // returns the columns device-side only and leaves the host trace
+    // unwritten, so it is disabled for every table here — the same switch
+    // the per-table prover throws under disk-spill and `RecomputeLde`.
+    #[cfg(feature = "cuda")]
+    for (_, trace, _) in air_trace_pairs.iter_mut() {
+        trace.set_resident_aux_ok(false);
+    }
+
     let mut bus_public_inputs: Vec<Option<BusPublicInputs<FieldExtension>>> =
         (0..num_tables).map(|_| None).collect();
     let mut aux_builder = (!shape.aux.is_empty())
