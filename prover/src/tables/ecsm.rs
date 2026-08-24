@@ -63,6 +63,10 @@ pub mod cols {
     pub const fn xr(i: usize) -> usize {
         XR + i
     }
+    #[inline]
+    pub const fn yr(i: usize) -> usize {
+        YR + i
+    }
     /// Bit `i` of the scalar `k` (0 = LSB, 255 = MSB).
     #[inline]
     pub const fn k_bit(i: usize) -> usize {

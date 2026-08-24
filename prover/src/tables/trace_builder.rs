@@ -832,10 +832,13 @@ fn collect_store_op_from_cpu(op: &CpuOperation, memory_state: &mut MemoryState) 
 /// Collects all MEMW ops and the ECSM / ECDAS table ops for one ECSM ecall.
 ///
 /// Timestamp scheme: `x11` register read and `xG` memory reads at `T`;
-/// `x12` register read and `k` memory reads at `T + 1`; `x10` register read and
-/// `xR` memory writes at `T + 2`. Every read advances
+/// `x12` register read and `k` memory reads at `T + 1`; `x10` register read and the four
+/// `xR` memory writes at `T + 2`; the `yR` and `yG` writes at `T + 3`, the fourth and last
+/// sub-timestamp of the instruction's stride-4 window. Every read advances
 /// `memory_state` / `register_state` (the offline read-old + write-new model), so later
-/// accesses always observe a strictly smaller old timestamp.
+/// accesses always observe a strictly smaller old timestamp — and every write of the
+/// 96-byte output lands strictly after both operand reads, which is what lets the output
+/// buffer alias `xG` or `k` even though it can now cover both.
 #[allow(clippy::needless_range_loop)]
 fn collect_ecsm_ops(
     op: &CpuOperation,
