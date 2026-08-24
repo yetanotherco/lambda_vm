@@ -1572,6 +1572,68 @@ fn test_prove_elfs_ecsm_forged_result_rejected() {
     );
 }
 
+/// Soundness: `yR` is published to guest memory now, so it must be as unforgeable as `xR`.
+///
+/// It is what the guest reconstructs `k·P` from — move it and you move the recovered public
+/// key, i.e. the address `ecrecover` returns. Two things pin it: the ECDAS final-receiver
+/// tuple `[ts, xR, yR, xG, yG, -1, 0]` ties the column to the constrained double-and-add
+/// output, and the MEMW senders publish that same column to memory.
+#[test]
+fn test_prove_elfs_ecsm_forged_yr_rejected() {
+    use crate::tables::ecsm::cols as ecsm_cols;
+
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_ecsm");
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
+    let result = executor.run().expect("Failed to run program");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
+
+    // Forge the low byte of yR on the (single) real ECSM row.
+    let orig = *traces.ecsm.main_table.get(0, ecsm_cols::yr(0));
+    let forged = orig + FieldElement::<GoldilocksField>::one();
+    traces.ecsm.main_table.set(0, ecsm_cols::yr(0), forged);
+
+    assert!(
+        !prove_and_verify_vm_minimal(&elf, &mut traces),
+        "Verifier must reject a forged ECSM result yR"
+    );
+}
+
+/// Soundness: the prover may choose EITHER root of `xG`, but not a non-root.
+///
+/// The AIR binds only `yG² ≡ xG³ + b`, and that freedom is deliberate — the guest resolves
+/// the sign by comparing the echoed `yG` against its own base point's y. A `yG` free of the
+/// curve relation would therefore be a free sign on `k·P`. The `Relation::Yg` convolution is
+/// what forbids it; the ECDAS start tuple and the MEMW senders carry the same column.
+#[test]
+fn test_prove_elfs_ecsm_forged_yg_rejected() {
+    use crate::tables::ecsm::cols as ecsm_cols;
+
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_ecsm");
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
+    let result = executor.run().expect("Failed to run program");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
+
+    // Forge the low byte of the witnessed root yG on the (single) real ECSM row.
+    let orig = *traces.ecsm.main_table.get(0, ecsm_cols::yg(0));
+    let forged = orig + FieldElement::<GoldilocksField>::one();
+    traces.ecsm.main_table.set(0, ecsm_cols::yg(0), forged);
+
+    assert!(
+        !prove_and_verify_vm_minimal(&elf, &mut traces),
+        "Verifier must reject a yG that is not a root of xG"
+    );
+}
+
 /// Regression test: `µ` is the multiplicity of every ECDAS bus interaction, so it must remain
 /// boolean. Forge a non-boolean `µ` on a real ECDAS row and assert the verifier rejects.
 /// (k=5 produces 3 ECDAS rows.)
