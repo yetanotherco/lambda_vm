@@ -121,7 +121,20 @@ impl DeviceStreamingMmcs {
         col_end_lanes: usize,
         log_height: usize,
     ) -> math_cuda::Result<()> {
-        let dev = self.stream.clone_htod(data)?;
+        let be = math_cuda::device::backend()?;
+        // Staged through the pinned slot: the upload IS the device arm's
+        // dominant cost at wrap shapes, and the pageable path runs at roughly
+        // half the pinned line rate.
+        // SAFETY: every element is written by the staged copy below before the
+        // absorb kernel reads it.
+        let mut dev = unsafe { self.stream.alloc::<u64>(data.len()) }?;
+        math_cuda::device::htod_via(
+            &self.stream,
+            be.pinned_staging(),
+            &be.ctx,
+            data,
+            &mut dev.as_view_mut(),
+        )?;
         let hasher = self.groups[log_height]
             .as_mut()
             .expect("a matrix's height group exists by construction of the dims");
