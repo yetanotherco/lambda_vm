@@ -123,6 +123,10 @@ Useful prover knobs for A/B experiments (pre-existing, see plan §11):
 `LAMBDA_VM_GPU_BARY_THRESHOLD`, `LAMBDA_VM_VRAM_BUDGET_MB`,
 `TABLE_PARALLELISM`.
 
+| var | effect |
+|---|---|
+| `LAMBDA_VM_NO_GPU_GRIND=1` | force the round-4 proof-of-work nonce search onto the CPU (presence-based, like `LAMBDA_VM_NO_GPU_LOGUP`). The production escape hatch if the device search ever misbehaves; also the way to A/B the grind on its own. Below grinding factor 12 the GPU path declines regardless, so wrap and recursion proves (factor 1) never use it |
+
 Residency and diagnostic knobs:
 
 | var | effect |

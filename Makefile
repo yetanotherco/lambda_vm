@@ -573,9 +573,10 @@ test-disk-spill:
 # timeout's 124 exit fails the target so gpu_test.sh reports the group as failed.
 GPU_TEST_TIMEOUT := timeout -k 30 2700
 
-# math-cuda parity tests (requires NVIDIA GPU + nvcc)
+# math-cuda kernel tests (requires NVIDIA GPU + nvcc). Group 1 of gpu_test.sh,
+# so a hang here also costs Groups 2-5: they run after it, sequentially.
 test-math-cuda:
-	cargo test -p math-cuda --release
+	$(GPU_TEST_TIMEOUT) cargo test -p math-cuda --release
 
 # End-to-end cuda dispatch coverage (requires NVIDIA GPU + nvcc).
 # Asserts the R1-R4 GPU dispatch counters fired on a real prove.
