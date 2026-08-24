@@ -45,6 +45,87 @@ where
     /// LDE did not run for this table.
     #[cfg(feature = "cuda")]
     pub(crate) main_trace_dev: Option<ResidentMainTrace>,
+    /// Row-major main trace pre-uploaded to device off the prove critical path
+    /// (by the epoch pipeline's builder thread, which finishes ~1s before the
+    /// prover consumes the epoch). The R1 main commit D2D-copies from it
+    /// instead of paying the H2D inside its chain.
+    #[cfg(feature = "cuda")]
+    pub(crate) main_rowmajor_dev: Option<PreUploadedMainTrace>,
+}
+
+/// Device-resident row-major main trace, pre-uploaded ahead of the prove.
+/// Opaque in `Debug` like [`ResidentMainTrace`], and fully excluded from
+/// logical trace equality: this is a cache of data the host trace still owns,
+/// so two traces that differ only here are equal. (`ResidentMainTrace` still
+/// compares its row count, because it can be the sole owner of the data.)
+#[cfg(feature = "cuda")]
+#[derive(Clone)]
+pub(crate) struct PreUploadedMainTrace {
+    pub(crate) buf: std::sync::Arc<math_cuda::CudaSlice<u64>>,
+}
+
+#[cfg(feature = "cuda")]
+impl core::fmt::Debug for PreUploadedMainTrace {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PreUploadedMainTrace")
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl PartialEq for PreUploadedMainTrace {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Eq for PreUploadedMainTrace {}
+
+// Separate impl: the `TypeId` tower check needs `'static`, which the main
+// `TraceTable` impl does not require of its parameters.
+#[cfg(feature = "cuda")]
+impl<F, E> TraceTable<F, E>
+where
+    E: IsField + 'static,
+    F: IsSubFieldOf<E> + IsFFTField + 'static,
+{
+    /// Pre-upload the row-major main trace to device, off the prove critical
+    /// path (called from the epoch pipeline's builder thread). Returns the
+    /// bytes uploaded (0 = skipped: non-Goldilocks tower, empty, below the
+    /// size floor, or upload failure — the commit then does its own H2D).
+    /// The upload stream is synchronized before publishing, so any stream may
+    /// read the buffer afterwards.
+    pub fn preupload_main_to_device(&mut self, min_bytes: usize) -> usize {
+        use std::any::TypeId;
+        if self.main_rowmajor_dev.is_some() {
+            return 0;
+        }
+        if TypeId::of::<F>() != TypeId::of::<math::field::goldilocks::GoldilocksField>() {
+            return 0;
+        }
+        let (data, cols) = self.main_data_row_major();
+        let bytes = std::mem::size_of_val(data);
+        if cols == 0 || data.is_empty() || bytes < min_bytes {
+            return 0;
+        }
+        let Ok(be) = math_cuda::device::backend() else {
+            return 0;
+        };
+        let stream = be.next_stream();
+        // SAFETY: F == Goldilocks per the TypeId check; FieldElement<Gl> is
+        // #[repr(transparent)] over u64.
+        let raw: &[u64] =
+            unsafe { core::slice::from_raw_parts(data.as_ptr() as *const u64, data.len()) };
+        let Ok(buf) = stream.clone_htod(raw) else {
+            return 0;
+        };
+        if stream.synchronize().is_err() {
+            return 0;
+        }
+        self.main_rowmajor_dev = Some(PreUploadedMainTrace { buf: Arc::new(buf) });
+        bytes
+    }
 }
 
 /// Device-resident trace-domain main columns (column-major `[col*rows + row]`),
@@ -105,6 +186,8 @@ where
             resident_aux_ok: true,
             #[cfg(feature = "cuda")]
             main_trace_dev: None,
+            #[cfg(feature = "cuda")]
+            main_rowmajor_dev: None,
         }
     }
 
@@ -133,6 +216,8 @@ where
             resident_aux_ok: true,
             #[cfg(feature = "cuda")]
             main_trace_dev: None,
+            #[cfg(feature = "cuda")]
+            main_rowmajor_dev: None,
         }
     }
 
@@ -154,6 +239,8 @@ where
             resident_aux_ok: true,
             #[cfg(feature = "cuda")]
             main_trace_dev: None,
+            #[cfg(feature = "cuda")]
+            main_rowmajor_dev: None,
         }
     }
 
@@ -211,6 +298,20 @@ where
     #[cfg(feature = "cuda")]
     pub fn clear_main_trace_dev(&mut self) {
         self.main_trace_dev = None;
+    }
+
+    /// The pre-uploaded row-major main trace, if the builder produced one.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn main_rowmajor_dev(&self) -> Option<&math_cuda::CudaSlice<u64>> {
+        self.main_rowmajor_dev.as_ref().map(|p| p.buf.as_ref())
+    }
+
+    /// Drop the pre-uploaded row-major trace. Its only consumer is the R1 main
+    /// commit, so the prover clears it alongside `clear_main_trace_dev` to
+    /// reclaim the VRAM before the aux-commit + DEEP/FRI peak.
+    #[cfg(feature = "cuda")]
+    pub fn clear_main_rowmajor_dev(&mut self) {
+        self.main_rowmajor_dev = None;
     }
 
     pub fn num_steps(&self) -> usize {
@@ -690,6 +791,23 @@ where
     }
 }
 
+// Diagnostic (see `gpu_lde::gpu_xcheck`): while set on the current thread,
+// `get_trace_evaluations_from_lde` skips every GPU dispatch and runs the
+// host arms, so a second call can cross-check the device results.
+#[cfg(feature = "cuda")]
+thread_local! {
+    static R3_FORCE_HOST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with the R3 GPU dispatches disabled on this thread.
+#[cfg(feature = "cuda")]
+pub(crate) fn with_r3_force_host<R>(f: impl FnOnce() -> R) -> R {
+    R3_FORCE_HOST.with(|c| c.set(true));
+    let out = f();
+    R3_FORCE_HOST.with(|c| c.set(false));
+    out
+}
+
 /// Evaluates trace polynomials at OOD points using barycentric interpolation
 /// on the LDE evaluations, without needing coefficient-form polynomials.
 ///
@@ -748,15 +866,55 @@ where
     // into a single device context. The barycentric kernels below read
     // both via offset, with no per-eval-point or per-{main,aux} H2D.
     #[cfg(feature = "cuda")]
-    let r3_ctx: Option<crate::gpu_lde::R3DevContext> =
+    let r3_force_host = R3_FORCE_HOST.with(|c| c.get());
+    #[cfg(feature = "cuda")]
+    let r3_ctx: Option<crate::gpu_lde::R3DevContext> = if r3_force_host {
+        None
+    } else {
         crate::gpu_lde::try_prep_r3_dev_context::<F, E>(
             &dc.points,
             &evaluation_points,
             lde_trace.bound_stream(),
-        );
+        )
+    };
     #[allow(unused_variables)]
     #[cfg(not(feature = "cuda"))]
     let r3_ctx: Option<()> = None;
+
+    // Multi-eval-point GPU fast path: ONE kernel pass per {main, aux} computes
+    // the barycentric sums for every evaluation point (the per-point loop below
+    // then just consumes its slice). `None` (handle absent, too many points,
+    // kernel error) falls through to the per-point dispatch inside the loop,
+    // which preserves the original behavior arm by arm.
+    #[cfg(feature = "cuda")]
+    let (main_multi, aux_multi) = match r3_ctx.as_ref() {
+        Some(ctx) => {
+            let z_pows: Vec<FieldElement<E>> = evaluation_points.iter().map(|p| p.pow(n)).collect();
+            (
+                crate::gpu_lde::try_barycentric_base_on_handle_multi::<F, E>(
+                    lde_trace,
+                    bf,
+                    n,
+                    &dc.offset_pow_n,
+                    &dc.size_inv,
+                    &dc.offset_pow_n_inv,
+                    &z_pows,
+                    ctx,
+                ),
+                crate::gpu_lde::try_barycentric_ext3_on_handle_multi::<F, E>(
+                    lde_trace,
+                    bf,
+                    n,
+                    &dc.offset_pow_n,
+                    &dc.size_inv,
+                    &dc.offset_pow_n_inv,
+                    &z_pows,
+                    ctx,
+                ),
+            )
+        }
+        None => (None, None),
+    };
 
     #[cfg_attr(not(feature = "cuda"), allow(clippy::unused_enumerate_index))]
     for (eval_point_idx, eval_point) in evaluation_points.iter().enumerate() {
@@ -801,17 +959,26 @@ where
         #[cfg(feature = "cuda")]
         let r3_arg = r3_ctx.as_ref().map(|ctx| (ctx, eval_point_idx * 3 * n));
         #[cfg(feature = "cuda")]
-        let main_gpu = crate::gpu_lde::try_barycentric_base_on_handle::<F, E>(
-            lde_trace,
-            bf,
-            &dc.points,
-            &dc.offset_pow_n,
-            &dc.size_inv,
-            &dc.offset_pow_n_inv,
-            &z_pow_n,
-            inv_denoms.as_deref().unwrap_or(&[]),
-            r3_arg,
-        );
+        let main_gpu = if r3_force_host {
+            None
+        } else {
+            main_multi
+                .as_ref()
+                .map(|per_point| per_point[eval_point_idx].clone())
+                .or_else(|| {
+                    crate::gpu_lde::try_barycentric_base_on_handle::<F, E>(
+                        lde_trace,
+                        bf,
+                        &dc.points,
+                        &dc.offset_pow_n,
+                        &dc.size_inv,
+                        &dc.offset_pow_n_inv,
+                        &z_pow_n,
+                        inv_denoms.as_deref().unwrap_or(&[]),
+                        r3_arg,
+                    )
+                })
+        };
         #[cfg(not(feature = "cuda"))]
         let main_gpu: Option<Vec<FieldElement<E>>> = None;
 
@@ -869,17 +1036,26 @@ where
         #[cfg(feature = "cuda")]
         let r3_arg_aux = r3_ctx.as_ref().map(|ctx| (ctx, eval_point_idx * 3 * n));
         #[cfg(feature = "cuda")]
-        let aux_gpu = crate::gpu_lde::try_barycentric_ext3_on_handle::<F, E>(
-            lde_trace,
-            bf,
-            &dc.points,
-            &dc.offset_pow_n,
-            &dc.size_inv,
-            &dc.offset_pow_n_inv,
-            &z_pow_n,
-            inv_denoms.as_deref().unwrap_or(&[]),
-            r3_arg_aux,
-        );
+        let aux_gpu = if r3_force_host {
+            None
+        } else {
+            aux_multi
+                .as_ref()
+                .map(|per_point| per_point[eval_point_idx].clone())
+                .or_else(|| {
+                    crate::gpu_lde::try_barycentric_ext3_on_handle::<F, E>(
+                        lde_trace,
+                        bf,
+                        &dc.points,
+                        &dc.offset_pow_n,
+                        &dc.size_inv,
+                        &dc.offset_pow_n_inv,
+                        &z_pow_n,
+                        inv_denoms.as_deref().unwrap_or(&[]),
+                        r3_arg_aux,
+                    )
+                })
+        };
         #[cfg(not(feature = "cuda"))]
         let aux_gpu: Option<Vec<FieldElement<E>>> = None;
 
