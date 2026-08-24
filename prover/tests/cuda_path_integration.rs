@@ -110,13 +110,22 @@ fn gpu_path_fires_end_to_end() {
     );
 
     // R4 proof-of-work grind: with_blowup(2) grinds at factor 20 (above the
-    // GPU min-factor gate), so the device search fires for every table and a
-    // valid nonce is served. A silent CPU fallback (or an invalid kernel result
-    // rejected by the host check) would drop this to zero.
-    assert!(
-        gpu_grind_calls() > 0,
-        "R4 GPU proof-of-work grind did not fire"
-    );
+    // GPU min-factor gate). The device search implements the keccak digest
+    // only, and the grinding seed is the transcript's — so under the BLAKE3
+    // default configuration the grind runs on host by design and the counter
+    // stays zero, while a keccak configuration must take the device path.
+    match stark::config::COMMITMENT_HASH {
+        stark::config::CommitmentHash::Keccak256 => assert!(
+            gpu_grind_calls() > 0,
+            "R4 GPU proof-of-work grind did not fire"
+        ),
+        stark::config::CommitmentHash::Blake3 => assert_eq!(
+            gpu_grind_calls(),
+            0,
+            "the device grind implements the keccak digest only; a nonzero \
+             counter under BLAKE3 means it ran on the wrong digest"
+        ),
+    }
 
     // Counters only prove the dispatches ran; this checks the GPU proof
     // actually satisfies the verifier.
