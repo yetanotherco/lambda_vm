@@ -307,6 +307,7 @@ fn new_row_major_pipeline_base_root_matches_cpu() {
 
                 let (handle, _lde) = math_cuda::lde::coset_lde_row_major_with_merkle_tree_keep(
                     &row_major,
+                    None,
                     n,
                     num_cols,
                     blowup,

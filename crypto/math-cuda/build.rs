@@ -72,6 +72,13 @@ fn to_real_arch(arch: &str) -> String {
     }
 }
 
+/// Single source for the barycentric multi-kernel eval-point cap. The CUDA
+/// side sizes a per-thread accumulator array with it (`BARY_MAX_K`, passed via
+/// `-D` at the barycentric.cu call site below) and the Rust dispatch asserts
+/// against it (generated into `bary_consts.rs`) — defining it twice invites
+/// stack corruption in the kernel the day one side moves without the other.
+const BARY_MAX_EVAL_POINTS: usize = 8;
+
 fn compile_kernel(src: &str, out_name: &str, have_nvcc: bool, defines: &[&str]) {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
@@ -137,6 +144,19 @@ fn compile_kernel(src: &str, out_name: &str, have_nvcc: bool, defines: &[&str]) 
 }
 
 fn main() {
+    // Rust-side mirror of the kernel cap; see BARY_MAX_EVAL_POINTS above.
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    fs::write(
+        out_dir.join("bary_consts.rs"),
+        format!(
+            "/// Compile-time cap of the multi kernels' per-thread accumulator array\n\
+             /// (`BARY_MAX_K` in barycentric.cu — single-sourced from build.rs).\n\
+             /// Callers with more evaluation points fall back to the per-point kernels.\n\
+             pub const BARY_MAX_EVAL_POINTS: usize = {BARY_MAX_EVAL_POINTS};\n"
+        ),
+    )
+    .expect("failed to write bary_consts.rs");
+
     // Headers aren't compiled, so emit rerun-if-changed to rebuild on
     // header edits.
     println!("cargo:rerun-if-changed=kernels/goldilocks.cuh");
@@ -161,7 +181,13 @@ fn main() {
     compile_kernel("arith.cu", "arith.cubin", have_nvcc, &[]);
     compile_kernel("ntt.cu", "ntt.cubin", have_nvcc, &[]);
     compile_kernel("keccak.cu", "keccak.cubin", have_nvcc, &[]);
-    compile_kernel("barycentric.cu", "barycentric.cubin", have_nvcc, &[]);
+    let bary_define = format!("-DBARY_MAX_K={BARY_MAX_EVAL_POINTS}");
+    compile_kernel(
+        "barycentric.cu",
+        "barycentric.cubin",
+        have_nvcc,
+        &[&bary_define],
+    );
     compile_kernel("deep.cu", "deep.cubin", have_nvcc, &[]);
     compile_kernel("fri.cu", "fri.cubin", have_nvcc, &[]);
     compile_kernel("inverse.cu", "inverse.cubin", have_nvcc, &[]);

@@ -580,9 +580,10 @@ test-disk-spill:
 # timeout's 124 exit fails the target so gpu_test.sh reports the group as failed.
 GPU_TEST_TIMEOUT := timeout -k 30 2700
 
-# math-cuda parity tests (requires NVIDIA GPU + nvcc)
+# math-cuda kernel tests (requires NVIDIA GPU + nvcc). Group 1 of gpu_test.sh,
+# so a hang here also costs Groups 2-5: they run after it, sequentially.
 test-math-cuda:
-	cargo test -p math-cuda --release
+	$(GPU_TEST_TIMEOUT) cargo test -p math-cuda --release
 
 # Known-answer tests for the BLAKE3 device kernels, run on the HOST. No GPU, no
 # nvcc, no cargo — a couple of seconds.
@@ -670,6 +671,8 @@ test-cuda-integration:
 test-cuda-fallback:
 	$(GPU_TEST_TIMEOUT) cargo test -p lambda-vm-prover --release --features test-cuda-faults \
 	    --test cuda_fallback_tests -- --ignored --nocapture --test-threads=1
+	$(GPU_TEST_TIMEOUT) cargo test -p lambda-vm-prover --release --features lambda-vm-prover/cuda \
+	    --test gpu_force_downgrade -- --ignored --nocapture --test-threads=1
 
 # The prover/stark/crypto/ecsm test suite with the GPU (cuda) path enabled (requires NVIDIA
 # GPU + nvcc). The GPU CI counterpart of CPU CI's sharded prover tests. Single-threaded: the

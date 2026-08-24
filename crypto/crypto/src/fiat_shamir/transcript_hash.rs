@@ -23,8 +23,10 @@ pub trait TranscriptHash: 'static {
     /// the squeeze is `finalize_reset`. The 32-byte output size is pinned rather
     /// than left associated: `state()` returns `[u8; 32]`, and that is what
     /// seeds grinding, so a configuration with a different digest width would
-    /// not be a drop-in anywhere it is consumed.
-    type Digest: Digest + FixedOutputReset + OutputSizeUser<OutputSize = U32> + Clone;
+    /// not be a drop-in anywhere it is consumed. `'static` because the GPU
+    /// grinding dispatch keys the device search on the concrete digest by
+    /// `TypeId`, like the merkle backends' keccak fast paths.
+    type Digest: Digest + FixedOutputReset + OutputSizeUser<OutputSize = U32> + Clone + 'static;
 
     /// How many 64-bit candidates one *base coordinate* draws.
     ///
