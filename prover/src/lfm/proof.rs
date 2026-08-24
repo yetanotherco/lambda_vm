@@ -418,7 +418,7 @@ pub fn lfm_prove_batched(
         options.fri_final_poly_log_degree,
     );
 
-    let (proof, _stats) =
+    let (proof, stats) =
         multi_prove_batched::<F, E, (), stark::config::DefaultStarkHash, Prover<F, E, ()>>(
             airs.air_trace_pairs(&mut traces),
             &mut transcript,
@@ -427,6 +427,10 @@ pub fn lfm_prove_batched(
             decide_lfm_residency(),
         )
         .map_err(LfmProveError::Prover)?;
+    // Opt-in phase telemetry, to stderr so stdout parsing stays stable.
+    if std::env::var_os("LAMBDA_VM_WRAP_PHASE_TELEMETRY").is_some() {
+        eprintln!("wrap BatchedProveStats: {stats:?}");
+    }
 
     Ok(BatchedLfmProof {
         proof,
