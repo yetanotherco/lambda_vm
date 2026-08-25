@@ -3849,6 +3849,83 @@ pub fn count_table_lengths(
 }
 
 impl Traces {
+    /// Pre-upload the epoch's biggest main traces to device, called from the
+    /// epoch pipeline's builder thread (idle slack ahead of the prover) so the
+    /// R1 main commits D2D-copy instead of paying the H2D inside their chains.
+    /// Biggest tables first, bounded by `LAMBDA_VM_TRACE_PREUPLOAD_MB` (default
+    /// 4096) of VRAM riding ahead per epoch; tables that don't fit (or are
+    /// below the 8 MiB floor, or whose upload fails) keep the normal H2D path.
+    #[cfg(feature = "cuda")]
+    pub fn preupload_main_traces(&mut self) {
+        const MIN_BYTES: usize = 8 << 20;
+        static BUDGET_BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let budget = *BUDGET_BYTES.get_or_init(|| {
+            // Default OFF: pre-uploading was wall-neutral on the 5090 (the
+            // scheduler already hides the H2D) and its riding-ahead buffers
+            // sit outside the VRAM admission gate — at epoch 2^22 they pushed
+            // the prove past the card's headroom. Opt in for PCIe-bound
+            // setups via the env var.
+            let env_cap = std::env::var("LAMBDA_VM_TRACE_PREUPLOAD_MB")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(0)
+                << 20;
+            // These buffers ride ahead of the prover's own VRAM admission
+            // gate (they exist before their table is admitted), so cap them
+            // to a slice of the device budget rather than competing with the
+            // prove peak on small cards.
+            match stark::gpu_lde::device_vram_budget_bytes() {
+                Some(dev) => env_cap.min((dev / 4) as usize),
+                None => env_cap,
+            }
+        });
+        if budget == 0 {
+            return;
+        }
+
+        let mut tables: Vec<&mut TraceTable<GoldilocksField, GoldilocksExtension>> = Vec::new();
+        tables.extend(self.cpus.iter_mut());
+        tables.extend(self.lts.iter_mut());
+        tables.extend(self.shifts.iter_mut());
+        tables.extend(self.memws.iter_mut());
+        tables.extend(self.memw_aligneds.iter_mut());
+        tables.extend(self.memw_registers.iter_mut());
+        tables.extend(self.loads.iter_mut());
+        tables.extend(self.muls.iter_mut());
+        tables.extend(self.dvrms.iter_mut());
+        tables.extend(self.pages.iter_mut());
+        tables.extend(self.branches.iter_mut());
+        tables.extend(self.eqs.iter_mut());
+        tables.extend(self.bytewises.iter_mut());
+        tables.extend(self.stores.iter_mut());
+        tables.extend(self.cpu32s.iter_mut());
+        // BITWISE is excluded: `prove_epoch` mutates its multiplicities in
+        // place (L2G range-check lookups) after the build, which would leave
+        // a stale device copy to be committed.
+        tables.push(&mut self.decode);
+        tables.push(&mut self.keccak);
+        tables.push(&mut self.keccak_rnd);
+        tables.push(&mut self.ecsm);
+        tables.push(&mut self.ecdas);
+
+        let bytes_of = |t: &TraceTable<GoldilocksField, GoldilocksExtension>| {
+            t.num_rows() * t.num_main_columns * 8
+        };
+        tables.sort_by_key(|t| std::cmp::Reverse(bytes_of(t)));
+
+        let mut left = budget;
+        for t in tables {
+            let est = bytes_of(t);
+            if est < MIN_BYTES {
+                break;
+            }
+            if est > left {
+                continue;
+            }
+            left -= t.preupload_main_to_device(MIN_BYTES);
+        }
+    }
+
     /// Returns the total number of main-trace field elements across all tables.
     ///
     /// Counts only the main (base-field) trace columns — equivalent to SP1's

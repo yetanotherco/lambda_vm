@@ -104,6 +104,7 @@ the phase that enqueued them even if they execute later.
 | `capture_env.sh` | env JSON to stdout — attach to anything you measure by hand |
 | `phase_table.py [--util u.csv]… tl.json…` | aggregate timelines; `--instances LABEL` adds per-instance tables for deeper repeated spans, `--min-pct X` hides noise rows |
 | `nsys_phase_busy.py report.sqlite [--top N]` | the GPU busy report from `nsys export --type sqlite` |
+| `h2d_histo.py report.sqlite` | H2D/D2H bytes grouped by (phase, innermost NVTX range, transfer size) — names the dominant uploaders inside a phase. Prints the top 20 per direction |
 | `nvml_sampler.py -o out.csv [-i 0.1]` | standalone 10 Hz GPU util sampler (epoch-ns timestamps, aligns with span `start_ns`) |
 | `timeline_to_perfetto.py tl.json > trace.json` | span tree for ui.perfetto.dev |
 
@@ -121,6 +122,19 @@ Useful prover knobs for A/B experiments (pre-existing, see plan §11):
 `LAMBDA_VM_DISABLE_DEVICE_ONLY`, `LAMBDA_VM_GPU_LDE_THRESHOLD`,
 `LAMBDA_VM_GPU_BARY_THRESHOLD`, `LAMBDA_VM_VRAM_BUDGET_MB`,
 `TABLE_PARALLELISM`.
+
+| var | effect |
+|---|---|
+| `LAMBDA_VM_NO_GPU_GRIND=1` | force the round-4 proof-of-work nonce search onto the CPU (presence-based, like `LAMBDA_VM_NO_GPU_LOGUP`). The production escape hatch if the device search ever misbehaves; also the way to A/B the grind on its own. Below grinding factor 12 the GPU path declines regardless, so wrap and recursion proves (factor 1) never use it |
+
+Residency and diagnostic knobs:
+
+| var | effect |
+|---|---|
+| `LAMBDA_VM_GPU_DEVICE_ONLY_THRESHOLD=<lde_size>` | minimum LDE size for the device-only envelope (default 2^19), independent of `LAMBDA_VM_GPU_LDE_THRESHOLD`. Raise it to shed device-only tables without giving up GPU commits — a finer instrument than `LAMBDA_VM_DISABLE_DEVICE_ONLY=1` |
+| `LAMBDA_VM_TRACE_PREUPLOAD_MB=<mb>` | budget for pre-uploading the epoch's biggest main traces from the builder thread, so R1 commits D2D-copy instead of paying their H2D. Default 0 (off); capped at a quarter of the device VRAM budget. Wall-neutral on a 5090 and it competes with the prove peak on small cards, so it is for PCIe-bound setups |
+| `LAMBDA_VM_GPU_FORCE_DOWNGRADE=1` | test hook: decline the device R2 path unconditionally, so every device-only table exercises the host recovery. Used by the `gpu_force_downgrade` test |
+| `LAMBDA_VM_GPU_XCHECK=1` | after each table, re-run the verifier's composition consistency check in-process; on a mismatch, recompute each device stage on host, report which one diverged, and abort. For localizing silent device-side corruption |
 
 ## Continuations: per-epoch data for parallelization
 
