@@ -260,6 +260,13 @@ where
         self.aux_resident.as_ref()
     }
 
+    /// Drop the device-resident aux handle (and its buffer). Called once a
+    /// consumer has materialized or committed the aux columns it needs.
+    #[cfg(feature = "cuda")]
+    pub fn clear_aux_resident(&mut self) {
+        self.aux_resident = None;
+    }
+
     /// Whether the GPU-resident aux build is allowed (false under disk-spill).
     #[cfg(feature = "cuda")]
     pub fn resident_aux_ok(&self) -> bool {

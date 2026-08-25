@@ -630,7 +630,23 @@ where
         if !air.has_aux_trace() {
             continue;
         }
+
+        // The device LogUp BUILD (opt-in `LAMBDA_VM_GPU_AUX_BUILD`): allow
+        // the resident arm for this table — `build_auxiliary_trace` builds
+        // the aux columns on device and the materialization below downloads
+        // the size-`n` matrix, replacing the host fingerprint build. The
+        // blanket disable above stays the default: an UNCONSUMED resident
+        // build is exactly the cfg(cuda) divergence this prover once had.
+        #[cfg(feature = "cuda")]
+        if std::env::var_os("LAMBDA_VM_GPU_AUX_BUILD").is_some()
+            && super::gpu::lanes_per_element::<Field>() == Some(1)
+            && super::gpu::lanes_per_element::<FieldExtension>() == Some(3)
+        {
+            trace.set_resident_aux_ok(true);
+        }
         bus_public_inputs[table] = air.build_auxiliary_trace(trace, &lookup_challenges);
+        #[cfg(feature = "cuda")]
+        materialize_resident_aux(trace)?;
 
         #[cfg(feature = "disk-spill")]
         if storage_mode == StorageMode::Disk {
@@ -1214,6 +1230,43 @@ where
         },
         stats,
     ))
+}
+
+/// The device LogUp build's consumption: download the complete row-major aux
+/// matrix (committed + accumulated columns, trace domain) into the host trace
+/// and drop the device handle. One size-`n` transfer replaces the host
+/// fingerprint build; the values are byte-exact against the host build (the
+/// kernel parity unit pins the arithmetic, the materialization unit pins this
+/// path), so nothing downstream can tell the builds apart. `Ok(false)` = no
+/// resident build to consume.
+#[cfg(feature = "cuda")]
+pub(crate) fn materialize_resident_aux<Field, FieldExtension>(
+    trace: &mut TraceTable<Field, FieldExtension>,
+) -> Result<bool, ProvingError>
+where
+    Field: IsFFTField + IsSubFieldOf<FieldExtension> + Send + Sync,
+    FieldExtension: IsField + Send + Sync + 'static,
+{
+    let (width, rows, buf) = match trace.aux_resident() {
+        None => return Ok(false),
+        Some(ra) => (ra.num_aux_cols, ra.num_rows, std::sync::Arc::clone(&ra.buf)),
+    };
+    let be = math_cuda::device::backend()
+        .map_err(|e| ProvingError::WrongParameter(format!("GPU aux build backend: {e}")))?;
+    let stream = be.next_stream();
+    let raw: Vec<u64> = stream
+        .clone_dtoh(buf.as_ref())
+        .map_err(|e| ProvingError::WrongParameter(format!("GPU aux download: {e}")))?;
+    if raw.len() != rows * width * 3 {
+        return Err(ProvingError::WrongParameter(format!(
+            "resident aux buffer holds {} lanes, expected {rows}x{width} ext3",
+            raw.len()
+        )));
+    }
+    let host = crate::gpu_lde::u64_to_ext3_vec::<FieldExtension>(&raw);
+    trace.aux_table = crate::table::Table::new(host, width);
+    trace.clear_aux_resident();
+    Ok(true)
 }
 
 /// Matrix index of `table` inside `round`, or `None` when it does not

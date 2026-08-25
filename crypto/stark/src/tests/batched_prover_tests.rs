@@ -182,6 +182,46 @@ pub(crate) fn prove_tall(
     (airs, proof, stats)
 }
 
+/// The device LogUp build, materialized into the host trace, equals the host
+/// build byte for byte — columns and bus contribution alike. Pins the
+/// batched prover's consumption path end to end (the kernel arithmetic is
+/// pinned separately by the logup_gpu parity unit).
+#[cfg(feature = "cuda")]
+#[test_log::test]
+fn the_device_aux_build_materializes_byte_exact() {
+    use crate::lookup::BusPublicInputs;
+    use crate::traits::AIR;
+    if std::env::var_os("LAMBDA_VM_NO_GPU_LOGUP").is_some() {
+        return;
+    }
+    let options = folding_options();
+    let (mut host_t, _, _) = tall_traces(1 << 8);
+    let (mut dev_t, _, _) = tall_traces(1 << 8);
+    let air = new_cpu_air_with_lookup(&options);
+    let challenges: Vec<FieldElement<E>> =
+        vec![FieldElement::from(7u64), FieldElement::from(11u64)];
+
+    host_t.set_resident_aux_ok(false);
+    let bpi_host = air.build_auxiliary_trace(&mut host_t, &challenges);
+
+    dev_t.set_resident_aux_ok(true);
+    let bpi_dev = air.build_auxiliary_trace(&mut dev_t, &challenges);
+    assert!(
+        dev_t.aux_resident().is_some(),
+        "the device build must engage at 2^11 rows"
+    );
+    crate::batched::prover::materialize_resident_aux(&mut dev_t)
+        .expect("the materialization must succeed");
+
+    assert_eq!(
+        host_t.aux_data_row_major(),
+        dev_t.aux_data_row_major(),
+        "materialized device aux must equal the host build byte for byte"
+    );
+    let c = |b: &Option<BusPublicInputs<E>>| b.as_ref().map(|x| x.table_contribution);
+    assert_eq!(c(&bpi_host), c(&bpi_dev), "bus contributions must match");
+}
+
 /// Prove `repeats` copies of the fixture as one epoch. `repeats == 1` is the
 /// three-table epoch; higher values are how the residency claim is put on a
 /// curve instead of a threshold.
