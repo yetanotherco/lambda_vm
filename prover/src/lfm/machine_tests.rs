@@ -5209,6 +5209,70 @@ fn a_batched_lfm_epoch_verifies_end_to_end() {
     );
 }
 
+/// The batched LFM path proves and verifies at the AGGREGATION wrap preset
+/// (blowup 4 / 110 queries / terminal 2^8) — the options the block's wraps
+/// carry into the aggregator. Pins the derived query count and terminal so a
+/// drive-by change to the options builder moves this test, not the block
+/// record; the tamper arm keeps acceptance discriminating at the new preset.
+#[test]
+fn a_batched_lfm_epoch_verifies_at_the_aggregation_preset() {
+    use crate::lfm::proof::{aggregation_wrap_options, lfm_prove_batched, verify_against_batched};
+
+    let opts = aggregation_wrap_options();
+    assert_eq!(opts.blowup_factor, 4, "the decided A point is blowup 4");
+    assert_eq!(
+        opts.fri_number_of_queries, 110,
+        "blowup 4 at the 128-bit Johnson-bound target is 110 queries"
+    );
+    assert_eq!(opts.fri_final_poly_log_degree, 8, "the adopted terminal");
+
+    let program = trivial_program();
+    let artifacts = build_artifacts(&program, &opts);
+    let proved = lfm_prove_batched(&program, &artifacts, &arenas(), &opts)
+        .expect("a batched LFM epoch must prove at the aggregation preset");
+    assert!(
+        verify_against_batched(&artifacts, &proved.proof, &proved.public_words, &opts),
+        "a batched LFM epoch must verify at the aggregation preset"
+    );
+
+    let mut tampered = proved.proof.clone();
+    tampered.queries[0].main.per_matrix[0].evaluations[0] += crate::tables::types::FE::one();
+    assert!(
+        !verify_against_batched(&artifacts, &tampered, &proved.public_words, &opts),
+        "a tampered opening must be rejected at the aggregation preset"
+    );
+}
+
+/// A batched LFM proof survives the rkyv wire and still verifies — the
+/// shipping property the aggregation layer stands on: a block's wraps travel
+/// as bytes, and what arrives must be exactly what proves. The deserialized
+/// proof AND its public words go back through the complete verifier, so a
+/// wire layout that silently reordered or dropped anything fails here, not
+/// at the aggregator.
+#[test]
+fn a_batched_lfm_proof_round_trips_the_wire() {
+    use crate::lfm::proof::{BatchedLfmProof, lfm_prove_batched, verify_against_batched};
+
+    let opts = options();
+    let program = trivial_program();
+    let artifacts = build_artifacts(&program, &opts);
+    let proved = lfm_prove_batched(&program, &artifacts, &arenas(), &opts)
+        .expect("a batched LFM epoch must prove");
+
+    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&proved).expect("the wrap must serialize");
+    let back = rkyv::from_bytes::<BatchedLfmProof, rkyv::rancor::Error>(&bytes)
+        .expect("the wrap must deserialize");
+
+    assert_eq!(
+        back.public_words, proved.public_words,
+        "the public words must survive the wire byte for byte"
+    );
+    assert!(
+        verify_against_batched(&artifacts, &back.proof, &back.public_words, &opts),
+        "the deserialized batched wrap must verify completely"
+    );
+}
+
 /// The shape a batched verifier reads back must be the shape the round was
 /// built with. Two derivations of the same thing are how the LDE-vs-trace
 /// height distinction gets lost: `prep_round_dims` is one function with two
