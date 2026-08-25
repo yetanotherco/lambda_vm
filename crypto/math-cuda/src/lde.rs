@@ -1353,6 +1353,139 @@ pub fn coset_lde_batch_base(
     Ok(out)
 }
 
+/// [`coset_lde_batch_base`] that keeps the LDE on device: the same pipeline
+/// with no download — returns the column-major handle
+/// (`buf[c * lde_size + r]`) the strided consumers (barycentric, DEEP) read,
+/// carrying a `ready` event for cross-stream waits. `None` when there is
+/// nothing to expand.
+pub fn coset_lde_batch_base_keep(
+    columns: &[&[u64]],
+    blowup_factor: usize,
+    weights: &[u64],
+) -> Result<Option<GpuLdeBase>> {
+    if columns.is_empty() {
+        return Ok(None);
+    }
+    let m = columns.len();
+    let n = columns[0].len();
+    if n == 0 {
+        return Ok(None);
+    }
+    assert!(n.is_power_of_two(), "column length must be a power of two");
+    assert_eq!(weights.len(), n, "weights length must match column length");
+    assert!(
+        blowup_factor.is_power_of_two(),
+        "blowup must be power of two"
+    );
+    for c in columns.iter() {
+        assert_eq!(c.len(), n, "all columns must be the same size");
+    }
+    let lde_size = n * blowup_factor;
+    assert_u32_domain(lde_size, "coset_lde_batch_base_keep lde_size");
+    let log_n = n.trailing_zeros() as u64;
+    let log_lde = lde_size.trailing_zeros() as u64;
+
+    let be = backend()?;
+    let stream = be.next_stream();
+    let staging_slot = be.pinned_staging();
+
+    let mut staging = staging_slot.lock().unwrap();
+    staging.ensure_capacity(m * n, &be.ctx)?;
+    // SAFETY: staging is locked, the slice alias ends before we unlock.
+    let pinned = unsafe { staging.as_mut_slice(m * n) };
+    // Pack columns into the pinned buffer. Runs under the pinned-staging
+    // lock, where rayon can deadlock. See `Backend::pinned_staging`.
+    for (c, col) in columns.iter().enumerate() {
+        pinned[c * n..c * n + n].copy_from_slice(col);
+    }
+
+    // Column layout: `buf[c * lde_size + r]`. Zeroed so the [n, lde_size)
+    // tail of each column is already the zero-pad the CPU path does.
+    let mut buf = stream.alloc_zeros::<u64>(m * lde_size)?;
+    let mut drain_on_err = crate::device::DrainOnErr {
+        stream: &stream,
+        armed: true,
+    };
+    for c in 0..m {
+        let mut dst = buf.slice_mut(c * lde_size..c * lde_size + n);
+        stream.memcpy_htod(&pinned[c * n..c * n + n], &mut dst)?;
+    }
+    staging.record_event(&stream)?;
+
+    let inv_tw = be.inv_twiddles_for(log_n)?;
+    let fwd_tw = be.fwd_twiddles_for(log_lde)?;
+    let weights_dev = stream.clone_htod(weights)?;
+
+    let n_u64 = n as u64;
+    let lde_u64 = lde_size as u64;
+    let col_stride_u64 = lde_size as u64;
+    let m_u32 = m as u32;
+
+    launch_bit_reverse_batched(
+        stream.as_ref(),
+        be,
+        &mut buf,
+        n_u64,
+        log_n,
+        col_stride_u64,
+        m_u32,
+    )?;
+    run_batched_ntt_body(
+        stream.as_ref(),
+        &mut buf,
+        inv_tw.as_ref(),
+        n_u64,
+        log_n,
+        col_stride_u64,
+        m_u32,
+    )?;
+    launch_pointwise_mul_batched(
+        stream.as_ref(),
+        be,
+        &mut buf,
+        &weights_dev,
+        n_u64,
+        col_stride_u64,
+        m_u32,
+    )?;
+    launch_bit_reverse_batched(
+        stream.as_ref(),
+        be,
+        &mut buf,
+        lde_u64,
+        log_lde,
+        col_stride_u64,
+        m_u32,
+    )?;
+    run_batched_ntt_body(
+        stream.as_ref(),
+        &mut buf,
+        fwd_tw.as_ref(),
+        lde_u64,
+        log_lde,
+        col_stride_u64,
+        m_u32,
+    )?;
+
+    // The uploads have landed once the slot event fires; no download follows,
+    // so the handle's `ready` event is what orders every consumer.
+    staging.sync_event()?;
+    drain_on_err.armed = false;
+    drop(staging);
+
+    let ready = be.take_event()?;
+    ready.event().record(&stream)?;
+    Ok(Some(GpuLdeBase {
+        buf: Arc::new(buf),
+        m,
+        lde_size,
+        tree: None,
+        ready: Some(Arc::new(ready)),
+        trace_dev: None,
+        trace_rows: 0,
+    }))
+}
+
 /// Like `coset_lde_batch_base` but writes directly into caller-provided
 /// output slices instead of allocating fresh `Vec<u64>`s. Each output slice
 /// must already have length `n * blowup_factor`. Avoids pageable allocator
