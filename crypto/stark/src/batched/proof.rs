@@ -26,7 +26,7 @@ use crate::proof::stark::PolynomialOpenings;
 use crate::table::Table;
 
 /// The per-table data a batched epoch proof still has to carry.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct BatchedTableData<E: IsField, PI> {
     /// This table's interpolation-domain size. The verifier derives the table's
     /// height — and therefore every index reduction — from this, so it is bound
@@ -55,7 +55,7 @@ pub struct BatchedTableData<E: IsField, PI> {
 
 /// One query's openings: one authentication path per batched round, plus the
 /// FRI layer decommitment.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct BatchedQueryOpening<F: IsField, E: IsField> {
     /// Preprocessed openings, ONE PER PREPROCESSED TABLE in AIR order — each a
     /// standard row-pair opening against that table's own precomputed tree.
@@ -77,12 +77,18 @@ pub struct BatchedQueryOpening<F: IsField, E: IsField> {
     pub aux: Option<MixedOpening<E>>,
     /// Composition-parts round — always present.
     pub parts: MixedOpening<E>,
+    /// The carved table's main row pair, a standard row-pair opening against
+    /// [`BatchedMultiProof::carved_main_root`] at the REDUCED index
+    /// (`reduce_iota_to_round(iota, h_max, h_carved)`). Present iff the epoch
+    /// is carved ([`crate::batched::shape::CarvedMain`]); the verifier rejects
+    /// a stray or missing one.
+    pub carved_main: Option<PolynomialOpenings<F>>,
     /// The batched FRI instance's per-layer openings for this query.
     pub fri: FriDecommitment<E>,
 }
 
 /// One epoch, one proof.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct BatchedMultiProof<F: IsField, E: IsField, PI> {
     pub tables: Vec<BatchedTableData<E, PI>>,
     /// ★ There is deliberately NO `prep_root` here. Preprocessed matrices are
@@ -91,6 +97,15 @@ pub struct BatchedMultiProof<F: IsField, E: IsField, PI> {
     /// exactly as the per-table path's Phase A does. The proof carries only
     /// the per-query openings ([`BatchedQueryOpening::prep`]).
     pub main_root: Commitment,
+    /// The carved table's standalone main-tree root — PROOF-CARRIED (absorbed
+    /// from the proof, like `main_root`), unlike the preprocessed roots, which
+    /// absorb from the AIR set. It is absorbed after the preprocessed roots and
+    /// before `main_root`, so every challenge is drawn after it. Present iff
+    /// the epoch is carved; whether the epoch IS carved is verifier-owned
+    /// configuration, never read from the proof. For a continuation epoch this
+    /// root is the L2G commitment `verify_l2g_commitment_binding_view` compares
+    /// against the global proof — byte-identical to the per-table L2G tree.
+    pub carved_main_root: Option<Commitment>,
     pub aux_root: Option<Commitment>,
     pub parts_root: Commitment,
     /// The batched FRI instance's committed layer roots.

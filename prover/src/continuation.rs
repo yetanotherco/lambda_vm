@@ -435,10 +435,35 @@ struct BuildJob {
 /// Note: continuation epochs use the L2G memory bookend, so PAGE is skipped and the
 /// per-epoch page config set is empty — the verifier builds the AIRs with no PAGE
 /// tables rather than trusting any prover-supplied page config.
+/// One epoch's proof body — the per-table format or the batched one.
+///
+/// Both arms prove the SAME AIR set (the VM tables + the epoch-local L2G
+/// sub-table last) under the same statement seed. In the batched arm the L2G
+/// table's main matrix is CARVED into a standalone tree
+/// (`stark::batched::shape::CarvedMain`) whose root is byte-identical to the
+/// per-table L2G tree's — which is what lets `verify_l2g_commitment_binding_view`
+/// read the same commitment out of either format.
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub(crate) enum EpochProofBody {
+    PerTable(MultiProof<F, E, ()>),
+    Batched(Box<stark::batched::proof::BatchedMultiProof<F, E, ()>>),
+}
+
+/// Which format each epoch of a continuation proves in. The GLOBAL memory
+/// proof is per-table in both cases; only the epoch proofs change format.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EpochProofFormat {
+    /// One `StarkProof` per table (`multi_prove`).
+    PerTable,
+    /// One mixed-MMCS proof for the whole epoch
+    /// (`multi_prove_batched_carved`), the L2G main matrix carved standalone.
+    Batched,
+}
+
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub(crate) struct EpochProof {
     /// The epoch's STARK proof (its tables + the epoch-local L2G sub-table last).
-    proof: MultiProof<F, E, ()>,
+    proof: EpochProofBody,
     /// Bytes this epoch committed — the COMMIT-bus receiver reference.
     public_output: Vec<u8>,
     /// Statement values the epoch transcript is seeded with (re-derived on verify).
@@ -572,10 +597,20 @@ impl ArchivedContinuationProof {
         self.epochs.len()
     }
 
-    /// Epoch `i`'s STARK proof (its tables, epoch-local L2G sub-table last), as
-    /// the same view the verifier reads in place.
+    /// Epoch `i`'s PER-TABLE STARK proof (its tables, epoch-local L2G
+    /// sub-table last), as the same view the verifier reads in place.
+    ///
+    /// The per-table proof arena serves per-table bundles only; a batched
+    /// epoch's wrap reads the batched proof through its own filler. Feeding a
+    /// batched bundle here is a caller bug, not a proof defect, hence the
+    /// panic rather than a rejection.
     pub(crate) fn epoch_proof(&self, i: usize) -> MultiProofView<'_, F, E, ()> {
-        MultiProofView::Archived(&self.epochs[i].proof)
+        match &self.epochs[i].proof {
+            ArchivedEpochProofBody::PerTable(p) => MultiProofView::Archived(p),
+            ArchivedEpochProofBody::Batched(_) => {
+                panic!("the per-table proof arena was fed a batched epoch bundle")
+            }
+        }
     }
 
     /// Bytes epoch `i` committed.
@@ -620,14 +655,84 @@ pub(crate) enum EpochProofView<'a> {
     Archived(&'a ArchivedEpochProof),
 }
 
-impl<'a> EpochProofView<'a> {
-    /// The epoch's STARK proof (its tables + the epoch-local L2G sub-table
-    /// last), as a [`MultiProofView`] — never materialized into an owned
-    /// `MultiProof` on the archived side.
-    pub(crate) fn proof(&self) -> MultiProofView<'a, F, E, ()> {
+/// A batched epoch proof, borrowed from either bundle representation. The
+/// batched verifier consumes plain data, so the archived arm deserializes on
+/// demand ([`BatchedEpochProofRef::materialize`]) — a host-side cost the
+/// per-table path does not pay, accepted because batched bundles are verified
+/// host-side (their recursive verification goes through the emitted batched
+/// program, never through the in-place bundle walk).
+pub(crate) enum BatchedEpochProofRef<'a> {
+    Owned(&'a stark::batched::proof::BatchedMultiProof<F, E, ()>),
+    Archived(&'a <stark::batched::proof::BatchedMultiProof<F, E, ()> as rkyv::Archive>::Archived),
+}
+
+impl<'a> BatchedEpochProofRef<'a> {
+    /// The proof as plain data: a borrow on the owned side, a deserialization
+    /// on the archived side.
+    pub(crate) fn materialize(
+        &self,
+    ) -> Result<std::borrow::Cow<'a, stark::batched::proof::BatchedMultiProof<F, E, ()>>, Error>
+    {
         match self {
-            Self::Owned(e) => MultiProofView::Owned(&e.proof),
-            Self::Archived(e) => MultiProofView::Archived(&e.proof),
+            Self::Owned(p) => Ok(std::borrow::Cow::Borrowed(p)),
+            Self::Archived(p) => rkyv::deserialize::<
+                stark::batched::proof::BatchedMultiProof<F, E, ()>,
+                rkyv::rancor::Error,
+            >(*p)
+            .map(std::borrow::Cow::Owned)
+            .map_err(|err| {
+                Error::Execution(format!(
+                    "rkyv deserialize batched epoch proof failed: {err}"
+                ))
+            }),
+        }
+    }
+}
+
+impl<'a> EpochProofView<'a> {
+    /// The epoch's PER-TABLE proof (its tables + the epoch-local L2G sub-table
+    /// last), as a [`MultiProofView`] — never materialized into an owned
+    /// `MultiProof` on the archived side. `None` for a batched epoch.
+    pub(crate) fn per_table_proof(&self) -> Option<MultiProofView<'a, F, E, ()>> {
+        match self {
+            Self::Owned(e) => match &e.proof {
+                EpochProofBody::PerTable(p) => Some(MultiProofView::Owned(p)),
+                EpochProofBody::Batched(_) => None,
+            },
+            Self::Archived(e) => match &e.proof {
+                ArchivedEpochProofBody::PerTable(p) => Some(MultiProofView::Archived(p)),
+                ArchivedEpochProofBody::Batched(_) => None,
+            },
+        }
+    }
+
+    /// The epoch's BATCHED proof. `None` for a per-table epoch.
+    pub(crate) fn batched_proof(&self) -> Option<BatchedEpochProofRef<'a>> {
+        match self {
+            Self::Owned(e) => match &e.proof {
+                EpochProofBody::PerTable(_) => None,
+                EpochProofBody::Batched(p) => Some(BatchedEpochProofRef::Owned(p.as_ref())),
+            },
+            Self::Archived(e) => match &e.proof {
+                ArchivedEpochProofBody::PerTable(_) => None,
+                ArchivedEpochProofBody::Batched(p) => Some(BatchedEpochProofRef::Archived(p)),
+            },
+        }
+    }
+
+    /// Sub-proof count: per-table proofs per table, or the batched proof's
+    /// table count — the SAME number for the same AIR set, which is what
+    /// [`reconstruct_epoch_airs`]'s structural check needs.
+    pub(crate) fn num_sub_proofs(&self) -> usize {
+        match self {
+            Self::Owned(e) => match &e.proof {
+                EpochProofBody::PerTable(p) => p.proofs.len(),
+                EpochProofBody::Batched(p) => p.tables.len(),
+            },
+            Self::Archived(e) => match &e.proof {
+                ArchivedEpochProofBody::PerTable(p) => p.proofs.len(),
+                ArchivedEpochProofBody::Batched(p) => p.tables.len(),
+            },
         }
     }
 
@@ -797,6 +902,7 @@ fn prove_epoch(
     boundary: &[CellBoundary],
     opts: &ProofOptions,
     decode_commitment: Commitment,
+    format: EpochProofFormat,
 ) -> Result<EpochProof, Error> {
     // Count this L2G table's range-check lookups into the BITWISE table so its
     // AreBytes/IsHalfword multiplicities balance the range-check senders.
@@ -855,22 +961,59 @@ fn prove_epoch(
 
     let mut pairs = airs.air_trace_pairs(&mut traces);
     pairs.push((&l2g_air, &mut l2g_trace, &()));
-    let proof = Prover::multi_prove(
-        pairs,
-        &mut seed(),
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
-        stark::residency_mode::ResidencyMode::Retain,
-    )
-    .map_err(|e| Error::Prover(format!("{e:?}")))?;
 
-    let l2g_root = proof
-        .proofs
-        .last()
-        .ok_or_else(|| {
-            Error::ContinuationInvariant("epoch proof is missing the L2G sub-table".to_string())
-        })?
-        .lde_trace_main_merkle_root;
+    let (proof, l2g_root) = match format {
+        EpochProofFormat::PerTable => {
+            let proof = Prover::multi_prove(
+                pairs,
+                &mut seed(),
+                #[cfg(feature = "disk-spill")]
+                stark::storage_mode::StorageMode::Ram,
+                stark::residency_mode::ResidencyMode::Retain,
+            )
+            .map_err(|e| Error::Prover(format!("{e:?}")))?;
+
+            let l2g_root = proof
+                .proofs
+                .last()
+                .ok_or_else(|| {
+                    Error::ContinuationInvariant(
+                        "epoch proof is missing the L2G sub-table".to_string(),
+                    )
+                })?
+                .lde_trace_main_merkle_root;
+            (EpochProofBody::PerTable(proof), l2g_root)
+        }
+        EpochProofFormat::Batched => {
+            // The L2G table is the LAST pair — the carved one. Its standalone
+            // tree is byte-identical to the per-table L2G tree, so the carved
+            // root plays exactly the role the last sub-proof's main root plays
+            // above.
+            let l2g_index = pairs.len() - 1;
+            let (proof, _stats) = stark::batched::prover::multi_prove_batched_carved::<
+                F,
+                E,
+                (),
+                stark::config::DefaultStarkHash,
+                Prover<F, E, ()>,
+            >(
+                pairs,
+                &mut seed(),
+                #[cfg(feature = "disk-spill")]
+                stark::storage_mode::StorageMode::Ram,
+                stark::residency_mode::ResidencyMode::Retain,
+                Some(l2g_index),
+            )
+            .map_err(|e| Error::Prover(format!("{e:?}")))?;
+
+            let l2g_root = proof.carved_main_root.ok_or_else(|| {
+                Error::ContinuationInvariant(
+                    "batched epoch proof is missing the carved L2G root".to_string(),
+                )
+            })?;
+            (EpochProofBody::Batched(Box::new(proof)), l2g_root)
+        }
+    };
 
     Ok(EpochProof {
         proof,
@@ -927,7 +1070,7 @@ pub(crate) fn reconstruct_epoch_airs(
         FIXED_TABLE_COUNT - 1
     };
     let expected_proof_count = table_counts.total() + fixed_tables + 1;
-    if expected_proof_count != epoch.proof().len() {
+    if expected_proof_count != epoch.num_sub_proofs() {
         return Ok(None);
     }
 
@@ -998,7 +1141,6 @@ fn verify_epoch(
         runtime_page_ranges,
     } = recon;
 
-    let proof = epoch.proof();
     let public_output = epoch.public_output();
     let mut refs = airs.air_refs();
     refs.push(&*l2g_air);
@@ -1021,27 +1163,77 @@ fn verify_epoch(
         .copied()
         .unwrap_or(0) as u64;
 
-    let expected = match compute_expected_commit_bus_balance_view(
+    if let Some(proof) = epoch.per_table_proof() {
+        let expected = match compute_expected_commit_bus_balance_view(
+            &refs,
+            proof,
+            public_output,
+            commit_start_index,
+            &mut seed(),
+        ) {
+            Some(expected) => expected,
+            None => return Ok(false),
+        };
+
+        stark::profile_markers::step_marker::<
+            { stark::profile_markers::STEP_AIRS_AND_BUS_BALANCE_DONE },
+        >();
+
+        if !Verifier::multi_verify_views(&refs, proof, &mut seed(), &expected) {
+            return Ok(false);
+        }
+
+        // The claimed L2G root must be the one this proof actually committed (it is
+        // what verify_l2g_commitment_binding_view later ties to the global proof).
+        return Ok(proof.last().map(|p| *p.lde_trace_main_merkle_root()) == Some(epoch.l2g_root()));
+    }
+
+    // The batched arm: one mixed-MMCS proof, the L2G main matrix carved
+    // standalone (always the LAST air — the same position the per-table path
+    // appends it at). The COMPLETE verification mirrors the per-table arm:
+    // challenges replayed on a fork of the statement seed, the expected
+    // COMMIT-bus balance from the replayed shared pair, the full batched
+    // verify, then the claimed-vs-committed L2G root equality — here the
+    // proof-carried carved root, byte-identical to the per-table tree's.
+    let Some(proof_ref) = epoch.batched_proof() else {
+        return Ok(false);
+    };
+    let proof = proof_ref.materialize()?;
+    let l2g_index = refs.len() - 1;
+
+    let Some((_, _, challenges)) = stark::batched::verifier::replay_epoch_transcript_carved(
         &refs,
-        proof,
-        public_output,
-        commit_start_index,
+        &proof,
         &mut seed(),
-    ) {
-        Some(expected) => expected,
-        None => return Ok(false),
+        Some(l2g_index),
+    ) else {
+        return Ok(false);
+    };
+    let [z, alpha] = challenges.lookup.as_slice() else {
+        return Ok(false);
+    };
+    let Some(expected) =
+        crate::compute_commit_bus_offset(public_output, commit_start_index, z, alpha)
+    else {
+        return Ok(false);
     };
 
     stark::profile_markers::step_marker::<{ stark::profile_markers::STEP_AIRS_AND_BUS_BALANCE_DONE }>(
     );
 
-    if !Verifier::multi_verify_views(&refs, proof, &mut seed(), &expected) {
+    if !stark::batched::verifier::multi_verify_batched_carved::<
+        F,
+        E,
+        (),
+        stark::config::DefaultStarkHash,
+        Verifier<F, E, ()>,
+        _,
+    >(&refs, &proof, &mut seed(), &expected, Some(l2g_index))
+    {
         return Ok(false);
     }
 
-    // The claimed L2G root must be the one this proof actually committed (it is what
-    // verify_l2g_commitment_binding_view later ties to the global proof).
-    Ok(proof.last().map(|p| *p.lde_trace_main_merkle_root()) == Some(epoch.l2g_root()))
+    Ok(proof.carved_main_root == Some(epoch.l2g_root()))
 }
 
 /// Build the cross-epoch global memory proof: every epoch's L2G sub-table on the
@@ -1231,6 +1423,42 @@ pub fn prove_continuation(
     epoch_size_log2: u32,
     opts: &ProofOptions,
 ) -> Result<ContinuationProof, Error> {
+    prove_continuation_with_format(
+        elf_bytes,
+        private_inputs,
+        epoch_size_log2,
+        opts,
+        EpochProofFormat::PerTable,
+    )
+}
+
+/// As [`prove_continuation`], with every epoch proven in the BATCHED format
+/// (one mixed-MMCS proof per epoch, the L2G main matrix carved standalone).
+/// The global memory proof and the cross-epoch binding are unchanged: the
+/// carved root is byte-identical to the per-table L2G tree's, so
+/// `verify_l2g_commitment_binding_view` reads the same commitment.
+pub fn prove_continuation_batched(
+    elf_bytes: &[u8],
+    private_inputs: &[u8],
+    epoch_size_log2: u32,
+    opts: &ProofOptions,
+) -> Result<ContinuationProof, Error> {
+    prove_continuation_with_format(
+        elf_bytes,
+        private_inputs,
+        epoch_size_log2,
+        opts,
+        EpochProofFormat::Batched,
+    )
+}
+
+fn prove_continuation_with_format(
+    elf_bytes: &[u8],
+    private_inputs: &[u8],
+    epoch_size_log2: u32,
+    opts: &ProofOptions,
+    format: EpochProofFormat,
+) -> Result<ContinuationProof, Error> {
     if epoch_size_log2 < 2 {
         return Err(Error::InvalidContinuationEpochSize(
             "epoch_size_log2 must be at least 2 (4 cycles)".to_string(),
@@ -1351,6 +1579,7 @@ pub fn prove_continuation(
                 &prepared.boundary,
                 opts,
                 decode_commitment,
+                format,
             ) {
                 Ok(epoch) => proved.push((prepared.index, epoch)),
                 Err(e) => {
@@ -2042,7 +2271,15 @@ mod tests {
         let b = load(&std::env::var("PROOF_B").unwrap());
         assert_eq!(a.epochs.len(), b.epochs.len(), "epoch count");
         for (e, (ea, eb)) in a.epochs.iter().zip(b.epochs.iter()).enumerate() {
-            diff_multi(&format!("epoch {e}"), &ea.proof, &eb.proof);
+            match (&ea.proof, &eb.proof) {
+                (EpochProofBody::PerTable(pa), EpochProofBody::PerTable(pb)) => {
+                    diff_multi(&format!("epoch {e}"), pa, pb)
+                }
+                (EpochProofBody::Batched(_), EpochProofBody::Batched(_)) => {
+                    println!("epoch {e}: batched bodies (field diff not implemented)")
+                }
+                _ => println!("epoch {e}: FORMAT differs (per-table vs batched)"),
+            }
             if ea.public_output != eb.public_output {
                 println!("epoch {e}: public_output differs");
             }
@@ -2371,6 +2608,93 @@ mod tests {
         let out = verify_continuation(&elf_bytes, &restored, &ProofOptions::default_test_options())
             .unwrap();
         assert_eq!(out.as_deref(), Some(&[0xAA, 0xBB, 0xCC, 0xDD][..]));
+    }
+
+    /// ★★ THE D1 DIFFERENTIAL GATE: the same execution proven per-table and
+    /// batched yields BYTE-EQUAL L2G roots for every epoch — the carved tree
+    /// IS the per-table tree — and the batched bundle passes the COMPLETE
+    /// host verification (`verify_epoch`'s batched arm, the global proof,
+    /// `verify_l2g_commitment_binding_view`) end to end, through the rkyv
+    /// wire format. Verdict condition 5 rides along: the epochs must span at
+    /// least two distinct L2G heights, so the carve's index reduction is
+    /// exercised at more than one shift.
+    #[test]
+    fn the_batched_continuation_matches_the_per_table_l2g_roots() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let elf_bytes = asm_elf_bytes("all_loadstore_32");
+        let opts = ProofOptions::default_test_options();
+
+        let per_table = prove_continuation(&elf_bytes, &[], 3, &opts).unwrap();
+        let batched = prove_continuation_batched(&elf_bytes, &[], 3, &opts).unwrap();
+        assert!(batched.num_epochs() > 1, "the fixture must split");
+        assert_eq!(per_table.num_epochs(), batched.num_epochs());
+
+        let mut l2g_heights = std::collections::BTreeSet::new();
+        for i in 0..per_table.num_epochs() {
+            assert_eq!(
+                per_table.epoch_view(i).l2g_root(),
+                batched.epoch_view(i).l2g_root(),
+                "epoch {i}: the carved root must be the per-table root, byte for byte"
+            );
+            let proof = batched
+                .epoch_view(i)
+                .batched_proof()
+                .expect("a batched bundle holds batched bodies")
+                .materialize()
+                .unwrap();
+            assert_eq!(
+                proof.carved_main_root,
+                Some(batched.epoch_view(i).l2g_root()),
+                "epoch {i}: the claimed root is the committed carved root"
+            );
+            l2g_heights.insert(proof.tables.last().unwrap().trace_length);
+        }
+        assert!(
+            l2g_heights.len() >= 2,
+            "the differential must span ≥2 distinct L2G heights (got {l2g_heights:?}); \
+             pick a fixture/epoch size that varies the boundary size"
+        );
+
+        // The complete host verification, through the wire format.
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&batched).unwrap();
+        let restored: ContinuationProof =
+            rkyv::from_bytes::<_, rkyv::rancor::Error>(&bytes).unwrap();
+        let out = verify_continuation(&elf_bytes, &restored, &opts).unwrap();
+        assert!(out.is_some(), "an honest batched continuation must verify");
+    }
+
+    /// D1 tamper arms at the continuation level: a flipped claimed L2G root
+    /// and a flipped bound `reg_fini` are both rejected on the batched arm,
+    /// exactly as on the per-table one.
+    #[test]
+    fn a_tampered_batched_continuation_is_rejected() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let elf_bytes = asm_elf_bytes("all_loadstore_32");
+        let opts = ProofOptions::default_test_options();
+
+        let bundle = prove_continuation_batched(&elf_bytes, &[], 3, &opts).unwrap();
+        assert!(bundle.num_epochs() > 1, "the fixture must split");
+
+        let mut flipped_root = rkyv::from_bytes::<ContinuationProof, rkyv::rancor::Error>(
+            &rkyv::to_bytes::<rkyv::rancor::Error>(&bundle).unwrap(),
+        )
+        .unwrap();
+        flipped_root.corrupt_epoch_l2g_root_for_tests(1);
+        assert!(
+            verify_continuation(&elf_bytes, &flipped_root, &opts)
+                .unwrap()
+                .is_none(),
+            "a flipped claimed L2G root must be rejected"
+        );
+
+        let mut flipped_fini = bundle;
+        flipped_fini.corrupt_epoch_reg_fini_for_tests(1);
+        assert!(
+            verify_continuation(&elf_bytes, &flipped_fini, &opts)
+                .unwrap()
+                .is_none(),
+            "a flipped reg_fini must be rejected through the REGISTER binding"
+        );
     }
 
     // Negative: dropping the final (halting) epoch must be rejected — the new last
