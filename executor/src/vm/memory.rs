@@ -218,12 +218,6 @@ impl Memory {
                 self.store_byte(address + i as u64, *b);
             }
         }
-        // The guest completes a hint-request log entry by bumping the count word,
-        // and that store is the executor's cue to answer it (see
-        // `answer_hint_request`). One comparison on the word-store path.
-        if address == HINT_LOG_START_INDEX {
-            self.answer_hint_request(value)?;
-        }
         Ok(())
     }
 
@@ -367,6 +361,16 @@ impl Memory {
     /// Answer the hint request the guest just completed by bumping the log's
     /// count word to `new_count`.
     ///
+    /// Called from the guest's STORE-WORD instruction (see
+    /// `vm::instruction::execution`), not from [`Memory::store_word`]. That
+    /// placement is deliberate and load-bearing: this crate is linked into the
+    /// in-VM STARK verifier (the recursion guest links `lambda-vm-prover`, which
+    /// depends on it), and that guest writes words through `Memory` without ever
+    /// executing a guest store. A comparison on `store_word` therefore costs it
+    /// real PROVED cycles — measured at +927k (+0.28%) on `recursion-min` before
+    /// this moved. Hooking the store *instruction* means only a running guest
+    /// pays, which is also what the hook actually means.
+    ///
     /// This is the whole one-pass mechanism: entry `new_count - 1` names a
     /// `(hint_id, input)`, and the guest's very next instructions read arena slot
     /// `new_count - 1`. That slot has never been touched, so its value is still
@@ -385,7 +389,7 @@ impl Memory {
     /// trace would carry the pre-bump value while the image carries the final
     /// one. No guest mixes the two styles today. Closing it properly wants a mode
     /// flag in the header's spare pad word rather than a convention.
-    fn answer_hint_request(&mut self, new_count: u32) -> Result<(), MemoryError> {
+    pub(crate) fn answer_hint_request(&mut self, new_count: u32) -> Result<(), MemoryError> {
         if self.hints_silenced {
             return Ok(());
         }
@@ -708,16 +712,18 @@ mod tests {
     }
 
     // Writes request `index` into the log the way the guest does: the entry
-    // first, then the count word — whose store is what makes the executor answer.
+    // first, then the count word. The guest's STORE-WORD instruction is what
+    // makes the executor answer (see `vm::instruction::execution`), so this
+    // mirrors that pair — the store, then the answer.
     fn write_hint_request(memory: &mut Memory, index: u64, hint_id: u64, input: &[u8; 32]) {
         let entry = HINT_LOG_START_INDEX + HINT_LOG_HEADER_BYTES + index * HINT_LOG_ENTRY_BYTES;
         memory.store_doubleword(entry, hint_id).unwrap();
         for (i, b) in input.iter().enumerate() {
             memory.store_byte(entry + 8 + i as u64, *b);
         }
-        memory
-            .store_word(HINT_LOG_START_INDEX, index as u32 + 1)
-            .unwrap();
+        let count = index as u32 + 1;
+        memory.store_word(HINT_LOG_START_INDEX, count).unwrap();
+        memory.answer_hint_request(count).unwrap();
     }
 
     // THE invariant the one-pass design rests on: after answering requests during
@@ -817,7 +823,8 @@ mod tests {
         for (i, b) in x.iter().enumerate() {
             memory.store_byte(entry + 8 + i as u64, *b);
         }
-        let err = memory.store_word(HINT_LOG_START_INDEX, 1).unwrap_err();
+        memory.store_word(HINT_LOG_START_INDEX, 1).unwrap();
+        let err = memory.answer_hint_request(1).unwrap_err();
         assert!(matches!(err, MemoryError::HintSlotAlreadyWritten));
     }
 
@@ -827,7 +834,8 @@ mod tests {
     fn a_count_that_skips_ahead_is_rejected() {
         let mut memory = Memory::default();
         memory.store_private_inputs(vec![], &[]).unwrap();
-        let err = memory.store_word(HINT_LOG_START_INDEX, 7).unwrap_err();
+        memory.store_word(HINT_LOG_START_INDEX, 7).unwrap();
+        let err = memory.answer_hint_request(7).unwrap_err();
         assert!(matches!(err, MemoryError::HintRequestOutOfOrder));
     }
 

@@ -272,6 +272,18 @@ impl Instruction {
                     }
                     LoadStoreWidth::Word => {
                         memory.store_word(addr, read_value as u32)?;
+                        // The guest completes a hint-request log entry by bumping
+                        // the log's count word, and THAT store is the cue to answer
+                        // it. The check lives here, on the guest's store
+                        // instruction, rather than inside `Memory::store_word`:
+                        // this crate is linked into the in-VM STARK verifier, which
+                        // writes words through `Memory` without executing a single
+                        // guest store, so a comparison down there costs it real
+                        // proved cycles for nothing (measured: +927k, +0.28% on
+                        // `recursion-min`).
+                        if addr == crate::vm::memory::HINT_LOG_START_INDEX {
+                            memory.answer_hint_request(read_value as u32)?;
+                        }
                     }
                     LoadStoreWidth::DoubleWord => {
                         memory.store_doubleword(addr, read_value)?;
