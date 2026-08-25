@@ -578,6 +578,38 @@ where
         .flatten()
 }
 
+/// [`try_expand_columns_batched_keep`]'s ext3 sibling: expands the ext3
+/// columns into the slab-layout device LDE the R4 consumers read and returns
+/// the handle. No download, no host mutation. `None` = not device-served.
+pub(crate) fn try_expand_columns_batched_ext3_keep<F, E>(
+    columns: &[Vec<FieldElement<E>>],
+    blowup_factor: usize,
+    weights: &[FieldElement<F>],
+) -> Option<math_cuda::lde::GpuLdeExt3>
+where
+    F: IsField + 'static,
+    E: IsField + 'static,
+{
+    if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>()
+        || TypeId::of::<F>() != TypeId::of::<GoldilocksField>()
+    {
+        return None;
+    }
+    let n = columns.first().map_or(0, Vec::len);
+    if n == 0 || !n.is_power_of_two() || columns.iter().any(|c| c.len() != n) {
+        return None;
+    }
+    // SAFETY: `E == Ext3`, established above.
+    let raw_columns = unsafe { columns_to_u64_ext3::<E>(columns) };
+    // SAFETY: `F == GoldilocksField`, established above.
+    let weights_u64 = unsafe { weights_to_u64::<F>(weights) };
+    let slices: Vec<&[u64]> = raw_columns.iter().map(|c| c.as_slice()).collect();
+    GPU_LDE_CALLS.fetch_add(columns.len() as u64, Ordering::Relaxed);
+    math_cuda::lde::coset_lde_batch_ext3_keep(&slices, n, blowup_factor, &weights_u64)
+        .ok()
+        .flatten()
+}
+
 /// Try to GPU-batch all columns in one pass.
 ///
 /// Engaged for Goldilocks-base and ext3 tables whose LDE size is above the

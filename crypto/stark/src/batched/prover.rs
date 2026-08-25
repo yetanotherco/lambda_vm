@@ -126,6 +126,22 @@ struct LdePair<Field: IsField, FieldExtension: IsField> {
     main: (Vec<FieldElement<Field>>, usize),
     aux: (Vec<FieldElement<FieldExtension>>, usize),
     bytes: usize,
+    /// Device-resident main LDE for a consumer whose device dispatch reads
+    /// it (`Some` ⇒ `main` is deliberately empty — the device-only shape).
+    /// Dropped with the pair; never retained.
+    #[cfg(feature = "cuda")]
+    gpu_main: Option<math_cuda::lde::GpuLdeBase>,
+    /// The aux twin of `gpu_main`.
+    #[cfg(feature = "cuda")]
+    gpu_aux: Option<math_cuda::lde::GpuLdeExt3>,
+}
+
+/// The later-phase residency opt-in: eligible re-expansions materialize on
+/// device and their consumers read the handle (the shared OOD/DEEP routines'
+/// device dispatch), downloading only results.
+#[cfg(feature = "cuda")]
+fn resident_phases_enabled() -> bool {
+    std::env::var_os("LAMBDA_VM_GPU_RESIDENT_PHASES").is_some()
 }
 
 /// Prove one epoch with batched commitments.
@@ -828,6 +844,8 @@ where
             &mut stats,
             &mut ledger,
             residency,
+            // The parts phase feeds the host constraint evaluator.
+            false,
             #[cfg(feature = "disk-spill")]
             storage_mode,
         );
@@ -913,6 +931,9 @@ where
                 &mut stats,
                 &mut ledger,
                 residency,
+                // This arm runs only when the LDEs are retained; a device
+                // re-expansion never applies here.
+                false,
                 #[cfg(feature = "disk-spill")]
                 storage_mode,
             );
@@ -1034,6 +1055,9 @@ where
                         stats,
                         ledger,
                         residency,
+                        // DEEP's device dispatch reads the handle and its
+                        // decline recovery downloads in place.
+                        true,
                         #[cfg(feature = "disk-spill")]
                         storage_mode,
                     );
@@ -1128,6 +1152,8 @@ where
             &mut stats,
             &mut ledger,
             residency,
+            // The openings phase gathers host rows.
+            false,
             #[cfg(feature = "disk-spill")]
             storage_mode,
         );
@@ -1410,6 +1436,7 @@ fn materialize_ldes<Field, FieldExtension, PI, H, P>(
     stats: &mut BatchedProveStats,
     ledger: &mut ResidencyLedger,
     residency: ResidencyMode,
+    device_ok: bool,
     #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
 ) -> LdePair<Field, FieldExtension>
 where
@@ -1422,10 +1449,41 @@ where
 {
     let (_, trace, _) = &air_trace_pairs[table];
     let mut bytes = 0usize;
+    #[cfg(not(feature = "cuda"))]
+    let _ = device_ok;
+    #[cfg(feature = "cuda")]
+    let mut gpu_main: Option<math_cuda::lde::GpuLdeBase> = None;
 
     let main = match retained_main[table].take() {
         Some(lde) => lde,
-        None => {
+        None => 'main_lde: {
+            // The device arm: the re-expansion materializes column-major on
+            // device and the phase's consumer reads the handle (the caller
+            // passes `device_ok` only for phases whose dispatch does).
+            // Recompute-only — under `Retain` the host copy IS the retained
+            // artifact and must exist. The carved table stays host per the
+            // standing follow-up.
+            #[cfg(feature = "cuda")]
+            if device_ok
+                && residency == ResidencyMode::RecomputeLde
+                && resident_phases_enabled()
+                && super::gpu::lanes_per_element::<Field>() == Some(1)
+                && shape.carved_main.map(|c| c.table) != Some(table)
+            {
+                let t_expand = std::time::Instant::now();
+                let cols = trace.columns_main();
+                if let Some(h) = crate::gpu_lde::try_expand_columns_batched_keep::<Field, Field>(
+                    &cols,
+                    domains[table].blowup_factor,
+                    &twiddles[table].coset_weights,
+                ) {
+                    stats.lde_expansion_wall += t_expand.elapsed();
+                    stats.main_lde_expansions += 1;
+                    let width = h.m;
+                    gpu_main = Some(h);
+                    break 'main_lde (Vec::new(), width);
+                }
+            }
             let t_expand = std::time::Instant::now();
             let lde = P::expand_main_lde_row_major(
                 trace,
@@ -1443,10 +1501,38 @@ where
         }
     };
 
+    #[cfg(feature = "cuda")]
+    let mut gpu_aux: Option<math_cuda::lde::GpuLdeExt3> = None;
     let aux = if matrix_index(&shape.aux, table).is_some() {
         match retained_aux[table].take() {
             Some(lde) => lde,
-            None => {
+            None => 'aux_lde: {
+                // The ext3 twin of the main device arm above; the R4 device
+                // dispatch requires BOTH sides resident for an aux-carrying
+                // table, so this fires under the same conditions.
+                #[cfg(feature = "cuda")]
+                if device_ok
+                    && residency == ResidencyMode::RecomputeLde
+                    && resident_phases_enabled()
+                    && super::gpu::lanes_per_element::<FieldExtension>() == Some(3)
+                {
+                    let t_expand = std::time::Instant::now();
+                    let cols = trace.columns_aux();
+                    if let Some(h) = crate::gpu_lde::try_expand_columns_batched_ext3_keep::<
+                        Field,
+                        FieldExtension,
+                    >(
+                        &cols,
+                        domains[table].blowup_factor,
+                        &twiddles[table].coset_weights,
+                    ) {
+                        stats.lde_expansion_wall += t_expand.elapsed();
+                        stats.aux_lde_expansions += 1;
+                        let width = h.m;
+                        gpu_aux = Some(h);
+                        break 'aux_lde (Vec::new(), width);
+                    }
+                }
                 let t_expand = std::time::Instant::now();
                 let lde = P::expand_aux_lde_row_major(
                     trace,
@@ -1468,7 +1554,15 @@ where
     };
 
     let _ = residency;
-    LdePair { main, aux, bytes }
+    LdePair {
+        main,
+        aux,
+        bytes,
+        #[cfg(feature = "cuda")]
+        gpu_main,
+        #[cfg(feature = "cuda")]
+        gpu_aux,
+    }
 }
 
 /// Give a table's LDEs back to the retention slots, or drop them.
@@ -1510,11 +1604,44 @@ where
     Field: IsFFTField + IsSubFieldOf<FieldExtension>,
     FieldExtension: IsField,
 {
-    let LdePair { main, aux, bytes } = ldes;
-    (
-        LDETraceTable::from_row_major(main.0, main.1, aux.0, aux.1, step_size, blowup_factor),
+    let LdePair {
+        main,
+        aux,
         bytes,
-    )
+        #[cfg(feature = "cuda")]
+        gpu_main,
+        #[cfg(feature = "cuda")]
+        gpu_aux,
+    } = ldes;
+    #[cfg(not(feature = "cuda"))]
+    let lde_trace =
+        LDETraceTable::from_row_major(main.0, main.1, aux.0, aux.1, step_size, blowup_factor);
+    #[cfg(feature = "cuda")]
+    let lde_trace = {
+        let mut t =
+            LDETraceTable::from_row_major(main.0, main.1, aux.0, aux.1, step_size, blowup_factor);
+        let device_backed = gpu_main.is_some() || gpu_aux.is_some();
+        if let Some(h) = gpu_main {
+            if t.num_rows == 0 {
+                t.set_num_rows(h.lde_size);
+            }
+            t.set_gpu_main(h);
+        }
+        if let Some(h) = gpu_aux {
+            if t.num_rows == 0 {
+                t.set_num_rows(h.lde_size);
+            }
+            t.set_gpu_aux(h);
+        }
+        if device_backed {
+            // The device-only shape the shared consumers' dispatch expects:
+            // the empty host side is deliberate (the guards abort on any host
+            // read the dispatch did not recover).
+            t.set_host_trace_empty(true);
+        }
+        t
+    };
+    (lde_trace, bytes)
 }
 
 /// Take the buffers back out of the trace view for release or retention —
@@ -1531,6 +1658,12 @@ where
         main: (lde_trace.main_data, lde_trace.num_main_cols),
         aux: (lde_trace.aux_data, lde_trace.num_aux_cols),
         bytes,
+        // A device handle never survives the phase: the device arm runs only
+        // under `RecomputeLde`, whose release drops the pair.
+        #[cfg(feature = "cuda")]
+        gpu_main: None,
+        #[cfg(feature = "cuda")]
+        gpu_aux: None,
     }
 }
 

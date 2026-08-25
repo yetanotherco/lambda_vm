@@ -2301,6 +2301,57 @@ pub fn coset_lde_batch_ext3_into(
     Ok(())
 }
 
+/// [`coset_lde_batch_ext3_into`]'s keep sibling for HOST input: packs the
+/// ext3 columns into device slabs and runs
+/// [`coset_lde_batch_ext3_slabs_keep`] with no drain — nothing leaves the
+/// device and the handle carries a `ready` event. `None` when there is
+/// nothing to expand.
+pub fn coset_lde_batch_ext3_keep(
+    columns: &[&[u64]],
+    n: usize,
+    blowup_factor: usize,
+    weights: &[u64],
+) -> Result<Option<GpuLdeExt3>> {
+    if columns.is_empty() || n == 0 {
+        return Ok(None);
+    }
+    let m = columns.len();
+    assert!(n.is_power_of_two(), "n must be a power of two");
+    assert_eq!(weights.len(), n, "weights length must match n");
+    assert!(
+        blowup_factor.is_power_of_two(),
+        "blowup must be power of two"
+    );
+    for c in columns.iter() {
+        assert_eq!(c.len(), 3 * n, "each ext3 column must be 3*n u64s");
+    }
+    let lde_size = n * blowup_factor;
+    assert_u32_domain(lde_size, "coset_lde_batch_ext3_keep lde_size");
+    let mb = 3 * m;
+
+    let be = backend()?;
+    let stream = be.next_stream();
+    let staging_slot = be.pinned_staging();
+    let mut staging = staging_slot.lock().unwrap();
+    staging.ensure_capacity(mb * n, &be.ctx)?;
+    // SAFETY: staging is locked, the slice alias ends before we unlock.
+    let pinned = unsafe { staging.as_mut_slice(mb * n) };
+    pack_ext3_to_pinned_slabs(columns, pinned, n);
+
+    let mut buf = stream.alloc_zeros::<u64>(mb * lde_size)?;
+    for s in 0..mb {
+        let mut dst = buf.slice_mut(s * lde_size..s * lde_size + n);
+        stream.memcpy_htod(&pinned[s * n..s * n + n], &mut dst)?;
+    }
+    // Block until the async uploads (pinned source) land, then release the
+    // slot; the butterfly pipeline queues behind them in stream order.
+    staging.record_event(&stream)?;
+    staging.sync_event()?;
+    drop(staging);
+
+    coset_lde_batch_ext3_slabs_keep(&stream, buf, m, n, blowup_factor, weights, None).map(Some)
+}
+
 /// Batched ext3 coset LDE over columns ALREADY resident on device in slab
 /// layout (`3m` slabs of `lde_size` u64, first `n` of each filled, rest
 /// zero-padded), e.g. from the on-device degree-2 decomposition. Runs the
