@@ -1625,8 +1625,6 @@ fn real_batched_epoch_from_with_carve(
     inputs: EpochInputs,
     carve_l2g: bool,
 ) -> RealBatchedEpoch {
-    use crate::tables::register;
-
     let mut front = EpochFront::build(opts, inputs);
 
     let (proof, prove_stats, carved_index) = {
@@ -1679,6 +1677,51 @@ fn real_batched_epoch_from_with_carve(
         ..
     } = front;
 
+    harvest_real_batched_epoch(
+        opts,
+        elf_bytes,
+        &elf,
+        airs,
+        l2g_air,
+        register_init,
+        reg_fini,
+        table_counts,
+        public_output,
+        runtime_page_ranges,
+        label,
+        decode_root,
+        proof,
+        carved_index,
+        prove_stats,
+    )
+    .expect("the session-built batched epoch must harvest")
+}
+
+/// Everything downstream of a batched epoch's PROOF: the replay, the COMMIT
+/// target, the preprocessed provenances, the statement shape — and the
+/// complete host verification as the acceptance gate. Shared by the session
+/// harness above and the from-continuation constructor below, so the two
+/// reconstructions cannot diverge (the P1 discipline, batched).
+#[allow(clippy::too_many_arguments)]
+fn harvest_real_batched_epoch(
+    opts: crate::ProofOptions,
+    elf_bytes: Vec<u8>,
+    elf: &executor::elf::Elf,
+    airs: crate::VmAirs,
+    l2g_air: Box<dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = ()>>,
+    register_init: Vec<u32>,
+    reg_fini: Vec<u32>,
+    table_counts: crate::TableCounts,
+    public_output: Vec<u8>,
+    runtime_page_ranges: Vec<crate::RuntimePageRange>,
+    label: u64,
+    decode_root: Commitment,
+    proof: BatchedMultiProof<Gl, Ext3, ()>,
+    carved_index: Option<usize>,
+    prove_stats: BatchedProveStats,
+) -> Result<RealBatchedEpoch, String> {
+    use crate::tables::register;
+
     let refs = {
         let mut r = airs.air_refs();
         r.push(&*l2g_air);
@@ -1694,19 +1737,24 @@ fn real_batched_epoch_from_with_carve(
         &runtime_page_ranges,
         opts.fri_final_poly_log_degree,
     );
-    let (shape, fri_params, challenges) = stark::batched::verifier::replay_epoch_transcript_carved(
-        &refs,
-        &proof,
-        &mut replay,
-        carved_index,
-    )
-    .expect("the batched epoch's transcript must replay");
+    let Some((shape, fri_params, challenges)) =
+        stark::batched::verifier::replay_epoch_transcript_carved(
+            &refs,
+            &proof,
+            &mut replay,
+            carved_index,
+        )
+    else {
+        return Err("the batched epoch's transcript rejects: it does not replay".to_string());
+    };
     let [z, alpha] = challenges.lookup.as_slice() else {
-        panic!("an epoch uses LogUp, so the shared pair must be exactly (z, α)");
+        return Err("an epoch uses LogUp, so the shared pair must be exactly (z, α)".to_string());
     };
     let start_index = register_init[register::X254_INDEX] as u64;
-    let expected = crate::compute_commit_bus_offset(&public_output, start_index, z, alpha)
-        .expect("the COMMIT bus target must compute");
+    let Some(expected) = crate::compute_commit_bus_offset(&public_output, start_index, z, alpha)
+    else {
+        return Err("the COMMIT bus target rejects: it does not compute".to_string());
+    };
 
     let prep_sources = refs
         .iter()
@@ -1715,7 +1763,7 @@ fn real_batched_epoch_from_with_carve(
                 prep_source(
                     air.precomputed_commitment(),
                     &opts,
-                    &elf,
+                    elf,
                     &register_init,
                     &reg_fini,
                 )
@@ -1784,11 +1832,79 @@ fn real_batched_epoch_from_with_carve(
     // per-table harness's `multi_verify_views` gate plays on its side; the
     // tamper arms in `a_batched_vm_epoch_host_verifies_end_to_end` keep it
     // discriminating.
-    assert!(
-        e.host_verifies(&e.proof),
-        "the batched epoch must host-verify completely"
-    );
-    e
+    if !e.host_verifies(&e.proof) {
+        return Err("production's batched verifier rejects this epoch".to_string());
+    }
+    Ok(e)
+}
+
+/// [`RealBatchedEpoch`] for epoch `epoch_index` of an EXISTING continuation
+/// bundle proven BATCHED — the from-proof path, mirroring
+/// [`real_epoch_from_continuation`]: the AIR set and statement values from
+/// [`crate::continuation::reconstruct_epoch_airs`] (the SAME reconstruction
+/// `verify_epoch` runs), the chain position from
+/// [`crate::continuation::epoch_chain_position`], the harvest shared with the
+/// session path. The epoch's proof is the bundle's batched body, its L2G main
+/// matrix carved (always the LAST table); production's complete batched
+/// verify inside the harvest is the acceptance gate.
+pub(super) fn real_batched_epoch_from_continuation(
+    opts: &crate::ProofOptions,
+    elf_bytes: &[u8],
+    bundle: &crate::continuation::ContinuationProof,
+    epoch_index: usize,
+    decode_commitment: Option<Commitment>,
+) -> Result<RealBatchedEpoch, String> {
+    use executor::elf::Elf;
+
+    let elf = Elf::load(elf_bytes).map_err(|e| format!("the inner ELF must load: {e}"))?;
+    let position = crate::continuation::epoch_chain_position(bundle, &elf, epoch_index)
+        .map_err(|e| format!("chain position for epoch {epoch_index}: {e:?}"))?
+        .ok_or_else(|| format!("epoch {epoch_index} is out of range or the bundle is malformed"))?;
+    let view = bundle.epoch_view(epoch_index);
+    let recon = crate::continuation::reconstruct_epoch_airs(
+        &elf,
+        view,
+        &position.register_init,
+        position.is_final,
+        position.label,
+        opts,
+        decode_commitment,
+    )
+    .map_err(|e| format!("reconstructing epoch {epoch_index}: {e:?}"))?
+    .ok_or_else(|| format!("epoch {epoch_index} is structurally invalid"))?;
+    let decode_root = match decode_commitment {
+        Some(c) => c,
+        None => crate::tables::decode::commitment_from_elf(&elf, opts)
+            .map_err(|e| format!("DECODE commitment from ELF: {e}"))?,
+    };
+    let proof = view
+        .batched_proof()
+        .ok_or_else(|| {
+            format!(
+                "epoch {epoch_index} is per-table; the batched constructor reads batched bundles"
+            )
+        })?
+        .materialize()
+        .map_err(|e| format!("materializing epoch {epoch_index}'s batched proof: {e:?}"))?
+        .into_owned();
+    let carved_index = Some(proof.tables.len() - 1);
+    harvest_real_batched_epoch(
+        opts.clone(),
+        elf_bytes.to_vec(),
+        &elf,
+        recon.airs,
+        recon.l2g_air,
+        position.register_init,
+        recon.reg_fini,
+        recon.table_counts,
+        view.public_output().to_vec(),
+        recon.runtime_page_ranges,
+        position.label,
+        decode_root,
+        proof,
+        carved_index,
+        BatchedProveStats::default(),
+    )
 }
 
 /// ★ THE H2 GATE: the same construction the per-table harness proves is
@@ -2293,6 +2409,33 @@ pub(super) fn batched_epoch_program_with(
     );
     let total = super::logup::emit_bus_closure(&mut b, &lshape, &contributions, target);
     b.public(total.as_cell());
+
+    // ---- the aggregator-facing published-word schema (carved programs only
+    // — the continuation batched format). P3's aggregator byte-compares
+    // these across the five wraps and against the global proof; publishing
+    // them here is what makes cross-epoch chaining a check on PUBLISHED
+    // words instead of a trust. Order of record: register boundary vectors
+    // (init then fini), the epoch label, the epoch's output bytes, then the
+    // carved L2G root. Every cell is already program state (hinted once,
+    // bound by the walks/statement above) — publishing adds no arena words
+    // and no wrap-hash permutations.
+    if shape.carved_main.is_some() {
+        for cell in reg_init.iter().chain(&reg_fini) {
+            b.public(cell.as_cell());
+        }
+        for half in epoch_label {
+            b.public(half.as_cell());
+        }
+        for byte in &bytes {
+            b.public(byte.as_cell());
+        }
+        let carved = carved_cells
+            .as_ref()
+            .expect("a carved epoch has carved root cells");
+        for half in carved.halves() {
+            b.public(half.as_cell());
+        }
+    }
 
     // ---- the opening walks: every round authenticated at the REDUCED shared
     // index, against the very root cells the spine absorbed ----
@@ -3252,6 +3395,63 @@ fn the_assembled_carved_batched_epoch_verifier_runs() {
     } else {
         eprintln!("carved wrong-reduction arm skipped: the carved table is the tallest");
     }
+}
+
+/// ★★ P2's from-proof gates, batched: a continuation proven BATCHED wraps
+/// from the bundle alone. Epoch 0 AND the FINAL epoch reconstruct through
+/// [`real_batched_epoch_from_continuation`] (production's complete batched
+/// verify inside the harvest is the acceptance gate), each emits its CARVED
+/// program, the arenas fill to the schema, and the assembled verifier RUNS.
+/// A tampered bundle is rejected by the constructor's production verify —
+/// the P1 gate pair, on the batched format.
+#[test]
+fn the_batched_from_proof_constructor_runs_a_continuation_epoch() {
+    let elf_bytes = super::proof_fixture::read_inner_elf();
+    let opts = super::proof_fixture::fixture_options();
+    let bundle = crate::continuation::prove_continuation_batched(
+        &elf_bytes,
+        &[],
+        super::proof_fixture::FIXTURE_EPOCH_LOG2,
+        &opts,
+    )
+    .expect("the fixture continuation must prove batched");
+    assert!(
+        bundle.num_epochs() >= 2,
+        "the fixture continuation must have a second (final) epoch"
+    );
+
+    for (epoch, name) in [(0usize, "genesis"), (bundle.num_epochs() - 1, "FINAL")] {
+        let e = real_batched_epoch_from_continuation(&opts, &elf_bytes, &bundle, epoch, None)
+            .unwrap_or_else(|err| panic!("epoch {epoch} ({name}) must reconstruct: {err}"));
+        assert!(
+            e.shape.carved_main.is_some(),
+            "a continuation batched epoch is carved"
+        );
+        let program = batched_epoch_program_with(&e, true, false);
+        let mut arenas = batched_epoch_arenas(&e);
+        arenas.push(super::epoch_verify_tests::batched_opening_arena(&e));
+        arenas.push(super::epoch_verify_tests::batched_fri_arena(&e));
+        execute(&program, &arenas, &TestPermutation).unwrap_or_else(|err| {
+            panic!("epoch {epoch} ({name})'s carved program must run: {err:?}")
+        });
+        eprintln!(
+            "★ P2 GATE: the {name} epoch's carved program ran ({} instrs)",
+            program.instrs.len()
+        );
+    }
+
+    // Tamper: a corrupted bound reg_fini is rejected by the constructor's
+    // production verify, exactly as on the per-table path.
+    let mut tampered = bundle;
+    tampered.corrupt_epoch_reg_fini_for_tests(1);
+    let err = match real_batched_epoch_from_continuation(&opts, &elf_bytes, &tampered, 1, None) {
+        Err(e) => e,
+        Ok(_) => panic!("a corrupted reg_fini must not reconstruct"),
+    };
+    assert!(
+        err.contains("rejects"),
+        "the corruption is caught by the production verify inside the constructor: {err}"
+    );
 }
 
 /// [`host_table`] for a sub-proof inside a multi-table epoch: the fork is
