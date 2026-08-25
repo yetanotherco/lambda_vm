@@ -149,6 +149,16 @@ pub struct Memory {
     /// on for the fallback measurement baseline and for the "a host that answers
     /// nothing cannot change the result" test arm.
     hints_silenced: bool,
+    /// `(address, byte)` pairs this run decided as INITIAL memory while
+    /// answering hint requests — the arena slots plus the header's count word.
+    /// Drained by [`Memory::take_seeded_bytes`].
+    ///
+    /// A caller that built its initial image before the run (the continuation
+    /// prover freezes its image, PAGE init data and genesis provenance before
+    /// streaming epochs) has to fold these in, or it commits an image that
+    /// disagrees with what the guest read. A caller that builds the image
+    /// afterwards from [`Memory::hint_arena`] gets them for free.
+    seeded_bytes: Vec<(u64, u8)>,
 }
 
 impl Memory {
@@ -406,8 +416,11 @@ impl Memory {
         // the region stays byte-identical to `encode_private_input_region(input,
         // hint_arena)` — the image the prover will build.
         let header = PRIVATE_INPUT_START_INDEX + self.hint_arena_header_offset()?;
-        self.cells
-            .insert(header, (self.hint_arena.len() as u32).to_le_bytes());
+        let count = (self.hint_arena.len() as u32).to_le_bytes();
+        self.cells.insert(header, count);
+        for (i, b) in count.iter().enumerate() {
+            self.seeded_bytes.push((header + i as u64, *b));
+        }
         Ok(())
     }
 
@@ -430,7 +443,16 @@ impl Memory {
             word.copy_from_slice(&value[4 * w..4 * w + 4]);
             self.cells.insert(base + 4 * w as u64, word);
         }
+        for (i, b) in value.iter().enumerate() {
+            self.seeded_bytes.push((base + i as u64, *b));
+        }
         Ok(())
+    }
+
+    /// Drain the initial-memory bytes decided so far while answering hint
+    /// requests. See [`Memory::seeded_bytes`].
+    pub fn take_seeded_bytes(&mut self) -> Vec<(u64, u8)> {
+        std::mem::take(&mut self.seeded_bytes)
     }
 
     /// Offset of the arena header from `PRIVATE_INPUT_START_INDEX`, derived from

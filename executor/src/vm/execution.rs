@@ -122,6 +122,20 @@ impl Executor {
         self.memory.silence_hints();
     }
 
+    /// Drain the initial-memory bytes decided while answering hint requests
+    /// since the last call — see [`Memory::take_seeded_bytes`]. A driver that
+    /// froze an initial image before running (the continuation prover) must
+    /// fold these in after each chunk, before replaying that chunk's memory.
+    pub fn take_seeded_bytes(&mut self) -> Vec<(u64, u8)> {
+        self.memory.take_seeded_bytes()
+    }
+
+    /// The hint arena this run has used so far — the `hints` it started with
+    /// plus every slot answered on demand.
+    pub fn hint_arena(&self) -> &[[u8; 32]] {
+        self.memory.hint_arena()
+    }
+
     /// Resume execution, running at most `limit` cycles, and return the logs
     /// produced. Returns None when the program is finished.
     pub fn resume_with_limit(&mut self, limit: usize) -> Result<Option<&[Log]>, ExecutorError> {

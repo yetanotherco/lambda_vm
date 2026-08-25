@@ -2625,7 +2625,7 @@ fn generate_page_tables<I: ImageSource>(
 
     // Determine which page bases hold private input data — count-based, via the
     // shared helpers (single source of truth with the continuation path).
-    let num_private_input_pages = page::private_input_page_count(private_input, hints);
+    let num_private_input_pages = page::private_input_page_count(private_input, hints.len());
 
     for &page_base in &page_bases {
         let config = if page::is_private_input_page(page_base, num_private_input_pages) {

@@ -1037,33 +1037,6 @@ pub(crate) fn verify_l2g_commitment_binding_view(
 // Public API: Prove / Verify
 // =============================================================================
 
-/// Resolve the hint arena for the CONTINUATION prove path: `hints` as-is when
-/// non-empty, otherwise a pre-pass that runs the guest and returns the arena it
-/// produced.
-///
-/// The monolithic path does not need this — it takes `ExecutionResult::hints`
-/// from the single run it already performs, because the executor answers each
-/// request inline. The continuation prover cannot: it freezes its initial image
-/// and genesis provenance before streaming epochs, so it needs the arena up
-/// front. The pre-pass is the same cheap in-guest-verify path the proved run
-/// takes (not the software fallback), and it drains its logs instead of
-/// collecting them, so it costs one execution and no allocation spike.
-///
-/// Both runs commit the same output — the arena only changes how cheaply the
-/// guest gets there — so this never changes the statement being proved.
-fn resolve_hints<'a>(
-    program: &Elf,
-    private_inputs: &[u8],
-    hints: &'a [[u8; 32]],
-) -> Result<std::borrow::Cow<'a, [[u8; 32]]>, Error> {
-    if !hints.is_empty() {
-        return Ok(std::borrow::Cow::Borrowed(hints));
-    }
-    let recorded = executor::vm::execution::collect_hints(program, private_inputs.to_vec())
-        .map_err(|e| Error::Execution(format!("hint recording pass: {e}")))?;
-    Ok(std::borrow::Cow::Owned(recorded))
-}
-
 /// Prove an ELF binary execution. Returns a serializable proof bundle.
 pub fn prove(elf_bytes: &[u8]) -> Result<VmProof, Error> {
     prove_with_inputs(elf_bytes, &[], &[])

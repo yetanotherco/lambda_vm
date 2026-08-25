@@ -1351,6 +1351,35 @@ fn test_prove_ecrecover_hints_on_demand_arena() {
     assert!(verify_vm_minimal(&proof_auto, &elf_bytes));
     assert!(verify_vm_minimal(&proof_hints, &elf_bytes));
     assert_eq!(proof_auto.public_output, proof_hints.public_output);
+
+    // The continuation prover is the harder case: it freezes its initial image,
+    // genesis provenance and PAGE init data before streaming epochs, so a slot
+    // decided mid-stream has to be folded back into all three. Prove the same
+    // run both ways and require the bundles to verify to the same output.
+    let opts = ProofOptions::default_test_options();
+    let bundle_auto = crate::continuation::prove_continuation(&elf_bytes, &input, &[], 16, &opts)
+        .expect("continuation prove, arena answered on demand");
+    let bundle_hints =
+        crate::continuation::prove_continuation(&elf_bytes, &input, &hints, 16, &opts)
+            .expect("continuation prove, arena supplied up front");
+    let out_auto = crate::continuation::verify_continuation(&elf_bytes, &bundle_auto, &opts)
+        .expect("verify on-demand bundle")
+        .expect("on-demand bundle must verify");
+    let out_hints = crate::continuation::verify_continuation(&elf_bytes, &bundle_hints, &opts)
+        .expect("verify explicit bundle")
+        .expect("explicit bundle must verify");
+    assert_eq!(
+        out_auto, out_hints,
+        "a continuation whose arena was decided mid-stream must commit the same output"
+    );
+    // NOT asserted: byte-identical bundles. This prover is not byte-deterministic
+    // — two proves of the SAME program, input and arena already differ from byte
+    // 0 (same length), monolithic and continuation alike. Verified output equality
+    // is the property that actually holds.
+    assert_eq!(
+        out_auto, proof_auto.public_output,
+        "continuation and monolithic must agree with each other too"
+    );
 }
 
 /// Soundness: the verifier REJECTS a forged ECSM result.
