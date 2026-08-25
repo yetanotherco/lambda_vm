@@ -31,7 +31,9 @@ pub const LFM_MACHINE_VERSION: u32 = 1;
 pub const LFM_PRESET_TAG: u32 = 0;
 
 const LFM_PROGRAM_TAG: &[u8] = b"LAMBDAVM_LFM_PROGRAM_V1";
-const LFM_STATEMENT_TAG: &[u8] = b"LAMBDAVM_LFM_STATEMENT_V1";
+/// `pub(super)`: the aggregation layer's emitted verifier replays
+/// [`absorb_lfm_statement`] byte for byte and needs the same tag bytes.
+pub(super) const LFM_STATEMENT_TAG: &[u8] = b"LAMBDAVM_LFM_STATEMENT_V1";
 
 /// The byte that names a commitment hash inside [`lfm_program_id`].
 ///

@@ -1897,6 +1897,46 @@ fn the_real_block_proves_and_wraps_end_to_end() {
 /// proves are `Retain`. Same env contract as the per-table driver; run both
 /// on the same box for the P2 comparison the campaign exists to make.
 ///
+/// The real block's cross-epoch PAGE CENSUS — execution and collection only,
+/// nothing proven. Prints the numbers the aggregator's closed-form census
+/// consumes: the global memory proof carries one GLOBAL_MEMORY table per
+/// touched page, so the aggregation program's global-verify legs scale with
+/// exactly what this prints. Runs locally in minutes (same env contract as
+/// the block drivers).
+#[test]
+#[ignore]
+fn the_real_blocks_page_census() {
+    for var in ["LFM_CENSUS_ELF", "LFM_CENSUS_INPUT"] {
+        assert!(
+            std::env::var(var).is_ok(),
+            "{var} must name a file: this census is only meaningful on a real block"
+        );
+    }
+    let inputs = EpochInputs::from_env();
+    let census = crate::continuation::block_page_census(
+        &inputs.elf_bytes,
+        &inputs.private_input,
+        inputs.epoch_log2,
+    )
+    .expect("the census run must execute");
+    let mut hist: std::collections::BTreeMap<u32, usize> = std::collections::BTreeMap::new();
+    for &cells in &census.page_cells {
+        *hist
+            .entry(cells.next_power_of_two().max(4).trailing_zeros())
+            .or_default() += 1;
+    }
+    println!(
+        "★ PAGE CENSUS {}: {} epochs, {} touched pages ({} private-input), \
+         crossing cells per epoch {:?}",
+        inputs.label,
+        census.num_epochs,
+        census.touched_page_bases.len(),
+        census.num_private_input_pages,
+        census.l2g_cells,
+    );
+    println!("   page-table height histogram (log2 padded rows -> pages): {hist:?}");
+}
+
 /// Run at the 2^24 posture:
 /// ```text
 /// LFM_CENSUS_ELF=/path/to/ethrex.elf \
