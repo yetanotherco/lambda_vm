@@ -2215,14 +2215,12 @@ fn the_real_block_aggregates_end_to_end() {
         .expect("the block must prove batched")
     };
     let n = bundle.num_epochs();
-    if !bundle_cached {
-        if let Some(dir) = &art_dir {
-            std::fs::create_dir_all(dir).expect("the artifact dir must create");
-            let bytes =
-                rkyv::to_bytes::<rkyv::rancor::Error>(&bundle).expect("the bundle must serialize");
-            std::fs::write(cache_path("bundle.rkyv").expect("cache path"), &bytes)
-                .expect("the bundle must persist");
-        }
+    if let (false, Some(dir)) = (bundle_cached, &art_dir) {
+        std::fs::create_dir_all(dir).expect("the artifact dir must create");
+        let bytes =
+            rkyv::to_bytes::<rkyv::rancor::Error>(&bundle).expect("the bundle must serialize");
+        std::fs::write(cache_path("bundle.rkyv").expect("cache path"), &bytes)
+            .expect("the bundle must persist");
     }
     println!(
         "   base: {n} epochs + global proof in {:.1}s ({}), peak RSS {:?} GiB",
