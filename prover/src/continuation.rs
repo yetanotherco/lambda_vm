@@ -400,7 +400,7 @@ fn canonical_page_bases(page_bases: &[u64]) -> Vec<u64> {
 /// genesis from the ELF and never needs the raw private bytes. They are identified EXACTLY
 /// as the monolithic verifier does — the first `num_private_input_pages` pages from
 /// `PRIVATE_INPUT_START_INDEX` (see [`page::is_private_input_page`]).
-fn global_memory_configs(
+pub(crate) fn global_memory_configs(
     page_bases: &[u64],
     elf: &Elf,
     num_private_input_pages: usize,
@@ -624,6 +624,24 @@ impl ContinuationProof {
     #[cfg(test)]
     pub(crate) fn epoch_view(&self, i: usize) -> EpochProofView<'_> {
         EpochProofView::Owned(&self.epochs[i])
+    }
+
+    /// The global proof, as the same view the verifier reads.
+    #[cfg(test)]
+    pub(crate) fn global_proof_view(&self) -> MultiProofView<'_, F, E, ()> {
+        MultiProofView::Owned(&self.global)
+    }
+
+    /// The shipped touched-page-base list (value-free consumer data).
+    #[cfg(test)]
+    pub(crate) fn touched_pages(&self) -> &[u64] {
+        &self.touched_page_bases
+    }
+
+    /// The shipped private-input page count.
+    #[cfg(test)]
+    pub(crate) fn num_private_pages(&self) -> usize {
+        self.num_private_input_pages
     }
 }
 

@@ -1717,7 +1717,7 @@ fn the_from_proof_final_epoch_wraps() {
 
 /// Peak RSS high-water mark of this process, GiB — `VmHWM` on Linux (the box);
 /// `None` elsewhere.
-fn peak_rss_gib() -> Option<f64> {
+pub(super) fn peak_rss_gib() -> Option<f64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
     let line = status.lines().find(|l| l.starts_with("VmHWM:"))?;
     let kb: f64 = line.split_whitespace().nth(1)?.parse().ok()?;

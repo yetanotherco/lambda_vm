@@ -169,7 +169,7 @@ pub(crate) fn absorb_statement_with_digest(
 /// duplicating the literal: a second copy would drift silently on a version
 /// bump, and the tag existing at all depends on both sides agreeing on it.
 pub(crate) const CONTINUATION_EPOCH_TAG: &[u8] = b"LAMBDAVM_CONTINUATION_EPOCH_V3";
-const CONTINUATION_GLOBAL_TAG: &[u8] = b"LAMBDAVM_CONTINUATION_GLOBAL_V2";
+pub(crate) const CONTINUATION_GLOBAL_TAG: &[u8] = b"LAMBDAVM_CONTINUATION_GLOBAL_V2";
 
 /// Statement bound into the cross-epoch **global** proof's transcript before
 /// Phase A: the ELF (so the global proof is program-bound), the epoch count (so a
