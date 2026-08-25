@@ -19,11 +19,14 @@ use stark::constraints::builder::EmptyConstraints;
 use stark::lookup::{AirWithBuses, AuxiliaryTraceBuildData};
 use stark::proof::options::ProofOptions;
 use stark::proof::view::{MultiProofView, StarkProofView};
+use stark::trace::TraceTable;
 use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
 use crate::VmProof;
 use crate::tables::MaxRowsConfig;
+use crate::tables::memw::cols as memw_cols;
+use crate::tables::memw_aligned::cols as memw_aligned_cols;
 use crate::tables::trace_builder::Traces;
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 
@@ -1599,6 +1602,155 @@ fn test_prove_elfs_ecsm_forged_ecdas_mu_rejected() {
     assert!(
         !prove_and_verify_vm_minimal(&elf, &mut traces),
         "Verifier must reject a non-boolean ECDAS multiplicity"
+    );
+}
+
+/// Runs an ECSM asm guest and returns its ELF plus the minimal traces, the shape
+/// the three tests below share.
+fn ecsm_traces(program: &str) -> (Elf, Traces) {
+    let elf_bytes = crate::test_utils::asm_elf_bytes(program);
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+    let result = executor::vm::execution::Executor::new(&elf, vec![])
+        .expect("Failed to create executor")
+        .run()
+        .expect("Failed to run program");
+    let traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
+    (elf, traces)
+}
+
+/// Where a memory table keeps the three cells these tests read. The general and
+/// the aligned MEMW tables lay their rows out differently, and an ECSM write goes
+/// to whichever one the caller's buffer alignment selects, so neither layout can
+/// be assumed.
+struct MemwLayout {
+    is_register: usize,
+    timestamp_lo: usize,
+    timestamp_hi: usize,
+    first_value: usize,
+}
+
+const MEMW: MemwLayout = MemwLayout {
+    is_register: memw_cols::IS_REGISTER,
+    timestamp_lo: memw_cols::TIMESTAMP_0,
+    timestamp_hi: memw_cols::TIMESTAMP_1,
+    first_value: memw_cols::VALUE[0],
+};
+
+const MEMW_ALIGNED: MemwLayout = MemwLayout {
+    is_register: memw_aligned_cols::IS_REGISTER,
+    timestamp_lo: memw_aligned_cols::TIMESTAMP_0,
+    timestamp_hi: memw_aligned_cols::TIMESTAMP_1,
+    first_value: memw_aligned_cols::VALUE[0],
+};
+
+/// The timestamp of the single real ECSM row (row 0; these guests make one call).
+fn ecsm_timestamp(traces: &Traces) -> u64 {
+    dword_wl(
+        &traces.ecsm,
+        0,
+        crate::tables::ecsm::cols::TIMESTAMP_0,
+        crate::tables::ecsm::cols::TIMESTAMP_1,
+    )
+}
+
+/// A `DWordWL` pair read back as one number.
+fn dword_wl(
+    table: &TraceTable<GoldilocksField, GoldilocksExtension>,
+    row: usize,
+    lo: usize,
+    hi: usize,
+) -> u64 {
+    table.main_table.get(row, lo).to_raw() + (table.main_table.get(row, hi).to_raw() << 32)
+}
+
+/// Rows of memory (not register) writes/reads at `timestamp`, as
+/// `(table index in its own vector, row)`, keyed by which table they came from.
+fn memory_rows_at_timestamp(traces: &Traces, timestamp: u64) -> Vec<(bool, usize, usize)> {
+    let mut out = Vec::new();
+    for (aligned, tables) in [(false, &traces.memws), (true, &traces.memw_aligneds)] {
+        let layout = if aligned { &MEMW_ALIGNED } else { &MEMW };
+        for (index, table) in tables.iter().enumerate() {
+            for row in 0..table.num_rows() {
+                let is_register = table.main_table.get(row, layout.is_register).to_raw();
+                let ts = dword_wl(table, row, layout.timestamp_lo, layout.timestamp_hi);
+                if is_register == 0 && ts == timestamp {
+                    out.push((aligned, index, row));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The echoed outputs are only worth anything if the memory they land in is
+/// authenticated, so this pins the shape of the writes #941 adds: `yR` and `yG`
+/// are written at the ECSM ecall's FOURTH sub-timestamp (reads at T and T+1,
+/// the register read and `xR` at T+2), four doublewords each. Eight non-register
+/// memory rows at `ts + 3` is what "the free fourth sub-timestamp" means
+/// concretely, and it is the window the design says is now full.
+#[test]
+fn test_ecsm_echoes_yr_and_yg_at_the_fourth_subtimestamp() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let (_elf, traces) = ecsm_traces("test_ecsm");
+    let writes = memory_rows_at_timestamp(&traces, ecsm_timestamp(&traces) + 3);
+
+    assert_eq!(
+        writes.len(),
+        8,
+        "yR and yG are four doublewords each, all at the ecall's fourth \
+         sub-timestamp; a different count means the write schedule moved"
+    );
+}
+
+/// Verifier REJECTS a forged value on one of the echoed writes. `yR` arrives on
+/// the ECDAS bus and `yG` is the witnessed root, so both were already in the
+/// trace before #941 — what is new is that they are WRITTEN, and a write is only
+/// trustworthy if the memory argument ties it to the chip's own witness. Forge
+/// the payload of one of those rows and the memory bus must not balance.
+#[test]
+fn test_prove_elfs_ecsm_forged_echoed_write_rejected() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let (elf, mut traces) = ecsm_traces("test_ecsm");
+    let target = ecsm_timestamp(&traces) + 3;
+
+    let rows = memory_rows_at_timestamp(&traces, target);
+    let &(aligned, index, row) = rows
+        .first()
+        .expect("no echoed write found at the fourth sub-timestamp — the tamper would be vacuous");
+    let layout = if aligned { &MEMW_ALIGNED } else { &MEMW };
+    let table = if aligned {
+        &mut traces.memw_aligneds[index]
+    } else {
+        &mut traces.memws[index]
+    };
+    let value = table.main_table.get(row, layout.first_value);
+    table.main_table.set(
+        row,
+        layout.first_value,
+        value + FieldElement::<GoldilocksField>::one(),
+    );
+
+    assert!(
+        !prove_and_verify_vm_minimal(&elf, &mut traces),
+        "Verifier must reject a forged payload on an echoed yR/yG write"
+    );
+}
+
+/// The 96-byte output buffer is allowed to alias either input, which the design
+/// justifies by the read/write timestamp split. The executor covers that the
+/// bytes come out right; this covers that the TRACE of it verifies — the claim
+/// is about per-address chains staying monotone, and only a proof exercises them.
+#[test]
+fn test_prove_elfs_ecsm_output_aliases_inputs() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let (elf, mut traces) = ecsm_traces("test_ecsm_alias");
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "a proof of an ECSM call whose output aliases its inputs must verify"
     );
 }
 
