@@ -14,8 +14,9 @@ use lambda_vm_prover::test_utils::asm_elf_bytes;
 use lambda_vm_prover::{prove, verify};
 use stark::gpu_lde::{
     gpu_bary_calls, gpu_batch_invert_calls, gpu_comp_poly_tree_calls, gpu_composition_calls,
-    gpu_deep_calls, gpu_device_only_calls, gpu_extend_halves_calls, gpu_fri_calls, gpu_lde_calls,
-    gpu_logup_calls, gpu_opening_gather_calls, gpu_parts_lde_calls, reset_all_gpu_call_counters,
+    gpu_deep_calls, gpu_device_only_calls, gpu_extend_halves_calls, gpu_fri_calls, gpu_grind_calls,
+    gpu_lde_calls, gpu_logup_calls, gpu_opening_gather_calls, gpu_parts_lde_calls,
+    reset_all_gpu_call_counters,
 };
 
 /// The R2 GPU composition-poly path (fused `H = z·Σβᵢ·Cᵢ + boundary`) fires and
@@ -106,6 +107,15 @@ fn gpu_path_fires_end_to_end() {
     assert!(
         gpu_batch_invert_calls() > 0,
         "GPU batch-invert dispatch did not fire on R3 + R4"
+    );
+
+    // R4 proof-of-work grind: with_blowup(2) grinds at factor 20 (above the
+    // GPU min-factor gate), so the device search fires for every table and a
+    // valid nonce is served. A silent CPU fallback (or an invalid kernel result
+    // rejected by the host check) would drop this to zero.
+    assert!(
+        gpu_grind_calls() > 0,
+        "R4 GPU proof-of-work grind did not fire"
     );
 
     // Counters only prove the dispatches ran; this checks the GPU proof
