@@ -112,6 +112,11 @@ pub struct BatchedEpochShape {
     /// Whether ANY table has a RAP — fixes the aux root's and the shared
     /// LogUp draw's presence together.
     pub has_aux: bool,
+    /// The carved table `(index, main width)`, when the epoch commits one
+    /// table's main matrix standalone (the L2G carve —
+    /// `stark::batched::shape::CarvedMain`). Program shape: fixes the carved
+    /// root's absorb slot and the carved walk's presence.
+    pub carved_main: Option<(usize, usize)>,
     pub fri: BatchedFriShape,
     pub grinding_factor: u8,
     pub num_queries: usize,
@@ -157,6 +162,11 @@ pub struct BatchedEpochAbsorbs<'a> {
     /// Per table in table order: the preprocessed root, `Some` exactly when
     /// the AIR is preprocessed.
     pub prep_roots: &'a [Option<BatchedPrepRoot<'a>>],
+    /// The carved table's standalone main root — PROOF-CARRIED cells, present
+    /// exactly when [`BatchedEpochShape::carved_main`] is. Absorbed after
+    /// every preprocessed root, before `main_root` — the slot production's
+    /// `replay_epoch_transcript_carved` pins.
+    pub carved_root: Option<&'a RootCells>,
     pub main_root: &'a RootCells,
     /// Present exactly when [`BatchedEpochShape::has_aux`].
     pub aux_root: Option<&'a RootCells>,
@@ -325,6 +335,14 @@ pub fn emit_batched_epoch_challenges(
             BatchedPrepRoot::Constant(bytes) => t.append_const_bytes(&bytes[..]),
             BatchedPrepRoot::Cells(cells) => t.append_halves_misaligned(&cells.halves()),
         }
+    }
+    assert_eq!(
+        absorbs.carved_root.is_some(),
+        shape.carved_main.is_some(),
+        "the carved root's presence is shape"
+    );
+    if let Some(root) = absorbs.carved_root {
+        t.append_halves_misaligned(&root.halves());
     }
     t.append_halves_misaligned(&absorbs.main_root.halves());
 

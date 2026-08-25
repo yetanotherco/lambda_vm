@@ -27,7 +27,7 @@
 
 use stark::batched::proof::{BatchedMultiProof, BatchedProveStats};
 use stark::batched::shape::{EpochFriParams, EpochShape};
-use stark::batched::verifier::{EpochChallenges, multi_verify_batched, replay_epoch_transcript};
+use stark::batched::verifier::EpochChallenges;
 use stark::config::Commitment;
 use stark::proof::stark::MultiProof;
 use stark::proof::view::StarkProofView;
@@ -1558,9 +1558,17 @@ impl RealBatchedEpoch {
         proof: &BatchedMultiProof<Gl, Ext3, ()>,
         claimed_output: &[u8],
     ) -> bool {
+        // One code path for both formats: the carve configuration rides in
+        // the shape this epoch was replayed under (None ≡ uncarved).
+        let carved = self.shape.carved_main.map(|c| c.table);
         let refs = self.refs();
         let mut replay = self.seed_for(claimed_output);
-        let Some((_, _, challenges)) = replay_epoch_transcript(&refs, proof, &mut replay) else {
+        let Some((_, _, challenges)) = stark::batched::verifier::replay_epoch_transcript_carved(
+            &refs,
+            proof,
+            &mut replay,
+            carved,
+        ) else {
             return false;
         };
         let [z, alpha] = challenges.lookup.as_slice() else {
@@ -1572,14 +1580,14 @@ impl RealBatchedEpoch {
             return false;
         };
         let mut transcript = self.seed_for(claimed_output);
-        multi_verify_batched::<
+        stark::batched::verifier::multi_verify_batched_carved::<
             Gl,
             Ext3,
             (),
             stark::config::DefaultStarkHash,
             stark::verifier::Verifier<Gl, Ext3, ()>,
             _,
-        >(&refs, proof, &mut transcript, &expected)
+        >(&refs, proof, &mut transcript, &expected, carved)
     }
 
     /// [`RealBatchedEpoch::host_verifies_for`] at this epoch's own output.
@@ -1599,25 +1607,47 @@ pub(super) fn real_batched_epoch_from(
     opts: crate::ProofOptions,
     inputs: EpochInputs,
 ) -> RealBatchedEpoch {
+    real_batched_epoch_from_with_carve(opts, inputs, false)
+}
+
+/// [`real_batched_epoch_from`] with the L2G table CARVED — the continuation
+/// batched format ([`crate::continuation::prove_continuation_batched`]'s
+/// per-epoch shape), for the carved emitter gates.
+pub(super) fn real_batched_epoch_carved_from(
+    opts: crate::ProofOptions,
+    inputs: EpochInputs,
+) -> RealBatchedEpoch {
+    real_batched_epoch_from_with_carve(opts, inputs, true)
+}
+
+fn real_batched_epoch_from_with_carve(
+    opts: crate::ProofOptions,
+    inputs: EpochInputs,
+    carve_l2g: bool,
+) -> RealBatchedEpoch {
     use crate::tables::register;
 
     let mut front = EpochFront::build(opts, inputs);
 
-    let (proof, prove_stats) = {
+    let (proof, prove_stats, carved_index) = {
         let mut transcript = front.seed();
         let t = std::time::Instant::now();
-        let (proof, stats) = stark::batched::prover::multi_prove_batched::<
+        let pairs = front.pairs();
+        // The L2G bookend is the LAST pair — the carved table, when carving.
+        let carved_index = carve_l2g.then(|| pairs.len() - 1);
+        let (proof, stats) = stark::batched::prover::multi_prove_batched_carved::<
             Gl,
             Ext3,
             (),
             stark::config::DefaultStarkHash,
             stark::prover::Prover<Gl, Ext3, ()>,
         >(
-            front.pairs(),
+            pairs,
             &mut transcript,
             #[cfg(feature = "disk-spill")]
             stark::storage_mode::StorageMode::Ram,
             stark::residency_mode::ResidencyMode::Retain,
+            carved_index,
         )
         .expect("the batched epoch must prove");
         eprintln!(
@@ -1629,7 +1659,7 @@ pub(super) fn real_batched_epoch_from(
             proof.tables.len(),
             t.elapsed().as_secs_f64()
         );
-        (proof, stats)
+        (proof, stats, carved_index)
     };
 
     // The traces fed the prove; drop them here — what follows reads the PROOF.
@@ -1664,8 +1694,13 @@ pub(super) fn real_batched_epoch_from(
         &runtime_page_ranges,
         opts.fri_final_poly_log_degree,
     );
-    let (shape, fri_params, challenges) = replay_epoch_transcript(&refs, &proof, &mut replay)
-        .expect("the batched epoch's transcript must replay");
+    let (shape, fri_params, challenges) = stark::batched::verifier::replay_epoch_transcript_carved(
+        &refs,
+        &proof,
+        &mut replay,
+        carved_index,
+    )
+    .expect("the batched epoch's transcript must replay");
     let [z, alpha] = challenges.lookup.as_slice() else {
         panic!("an epoch uses LogUp, so the shared pair must be exactly (z, α)");
     };
@@ -1862,6 +1897,7 @@ fn batched_shape_of(e: &RealBatchedEpoch) -> super::batched_epoch::BatchedEpochS
         log2_blowup: e.fri_params.blowup_log,
         coset_offset: FE::from(e.fri_params.coset_offset),
         has_aux: !e.shape.aux.is_empty(),
+        carved_main: e.shape.carved_main.map(|c| (c.table, c.width)),
         fri: BatchedFriShape::new(
             &e.shape.heights,
             e.fri_params.blowup_log,
@@ -1997,6 +2033,9 @@ pub(super) fn batched_epoch_program_with(
         .filter(|p| p.is_some_and(PrepSource::is_arena))
         .count();
     let a_prep_roots = b.declare_arena(2 * num_arena_prep as u32);
+    // The carved root's arena sits between the prep roots and main_root —
+    // declaration order is absorb order, and that is its transcript slot.
+    let a_carved_root = shape.carved_main.map(|_| b.declare_arena(2));
     let a_main_root = b.declare_arena(2);
     let num_reg = crate::tables::register::NUM_REGISTER_ADDRESSES as u32;
     let a_reg_init = b.declare_arena(num_reg);
@@ -2131,6 +2170,7 @@ pub(super) fn batched_epoch_program_with(
         .collect();
 
     // ---- the proof-carried cells ----
+    let carved_cells = a_carved_root.map(|id| RootCells::hint(&mut b, id, 0));
     let main_cells = RootCells::hint(&mut b, a_main_root, 0);
     let aux_cells = a_aux_root.map(|id| RootCells::hint(&mut b, id, 0));
     let contribs: Vec<Option<super::builder::Ext>> = a_contrib
@@ -2190,6 +2230,7 @@ pub(super) fn batched_epoch_program_with(
         &shape,
         &BatchedEpochAbsorbs {
             prep_roots: &prep_slots,
+            carved_root: carved_cells.as_ref(),
             main_root: &main_cells,
             aux_root: aux_cells.as_ref(),
             contributions: &contribs,
@@ -2271,15 +2312,10 @@ pub(super) fn batched_epoch_program_with(
         let prep_pos: Vec<Option<usize>> = (0..n)
             .map(|t| e.shape.prep.tables.iter().position(|&x| x == t))
             .collect();
-        let main_pos: Vec<usize> = (0..n)
-            .map(|t| {
-                e.shape
-                    .main
-                    .tables
-                    .iter()
-                    .position(|&x| x == t)
-                    .expect("every table has a main matrix")
-            })
+        // `None` exactly for a carved table, whose main row pair comes from
+        // its standalone walk instead of the mixed main round.
+        let main_pos: Vec<Option<usize>> = (0..n)
+            .map(|t| e.shape.main.tables.iter().position(|&x| x == t))
             .collect();
         let aux_pos: Vec<Option<usize>> = (0..n)
             .map(|t| e.shape.aux.tables.iter().position(|&x| x == t))
@@ -2401,6 +2437,42 @@ pub(super) fn batched_epoch_program_with(
                 prep_values.push(values);
             }
 
+            // ---- the carved table's standalone walk: the preprocessed
+            // pattern with the root PROOF-CARRIED — authenticated against the
+            // very cells the spine absorbed, at the reduced shared index. The
+            // wrong-reduction control covers this walk exactly as it covers
+            // the others (verdict condition 4's emitted side).
+            let mut carved_values: Option<Vec<super::builder::Cell>> = None;
+            if let Some((ct, cw)) = shape.carved_main {
+                let cells = carved_cells
+                    .as_ref()
+                    .expect("a carved epoch has carved root cells");
+                let h = e.shape.heights[ct];
+                let values = hint_run(&mut b, a_open, &mut cursor, 2 * cw);
+                let siblings = hint_digests(&mut b, a_open, &mut cursor, h - 1);
+                let tbits = if wrong_reduction && h < h_max_fri {
+                    &bits[..h - 1]
+                } else {
+                    reduce_iota_bits(bits, h_max_fri, h)
+                };
+                super::sub_proof::emit_group_authentication(
+                    &mut b,
+                    &GroupCommitment::from_lanes(
+                        cells.lanes,
+                        GroupShape {
+                            num_columns: cw,
+                            is_ext: false,
+                        },
+                    ),
+                    &GroupOpening {
+                        values: values.clone(),
+                        siblings,
+                    },
+                    tbits,
+                );
+                carved_values = Some(values);
+            }
+
             // The three mixed rounds: per-matrix row pairs in round INPUT
             // order, then the round's ONE shared path. The value cells are
             // KEPT — the crossing below reads the cells the walks
@@ -2469,12 +2541,24 @@ pub(super) fn batched_epoch_program_with(
                     trace.extend((0..w).map(|c| vals[c].as_ext()));
                     trace_sym.extend((0..w).map(|c| vals[w + c].as_ext()));
                 }
-                {
-                    let m = main_pos[t_i];
-                    let w = e.shape.main.dims[m].1;
-                    let vals = &main_values[m];
-                    trace.extend((0..w).map(|c| vals[c].as_ext()));
-                    trace_sym.extend((0..w).map(|c| vals[w + c].as_ext()));
+                match main_pos[t_i] {
+                    Some(m) => {
+                        let w = e.shape.main.dims[m].1;
+                        let vals = &main_values[m];
+                        trace.extend((0..w).map(|c| vals[c].as_ext()));
+                        trace_sym.extend((0..w).map(|c| vals[w + c].as_ext()));
+                    }
+                    None => {
+                        let (ct, cw) = shape
+                            .carved_main
+                            .expect("only a carved table lacks a main matrix");
+                        assert_eq!(ct, t_i, "the carved table is the one without a main slot");
+                        let vals = carved_values
+                            .as_ref()
+                            .expect("the carved walk authenticated this query");
+                        trace.extend((0..cw).map(|c| vals[c].as_ext()));
+                        trace_sym.extend((0..cw).map(|c| vals[cw + c].as_ext()));
+                    }
                 }
                 if let Some(m) = aux_pos[t_i] {
                     let w = e.shape.aux.dims[m].1;
@@ -2653,6 +2737,16 @@ pub(super) fn batched_epoch_arenas(e: &RealBatchedEpoch) -> Vec<Vec<LfmWord>> {
     let mut out = vec![
         stmt.iter().map(|h| base_word(*h)).collect(),
         super::proof_arena::commitments_to_arena(&prep),
+    ];
+    // The carved root's arena sits between the prep roots and main_root —
+    // the program's declaration order is the absorb order.
+    if e.shape.carved_main.is_some() {
+        out.push(super::proof_arena::commitments_to_arena(&[e
+            .proof
+            .carved_main_root
+            .expect("a carved epoch proof carries its carved root")]));
+    }
+    out.extend([
         super::proof_arena::commitments_to_arena(&[e.proof.main_root]),
         reg(&e.register_init),
         reg(&e.reg_fini),
@@ -2660,7 +2754,7 @@ pub(super) fn batched_epoch_arenas(e: &RealBatchedEpoch) -> Vec<Vec<LfmWord>> {
             .into_iter()
             .map(base_word)
             .collect(),
-    ];
+    ]);
     if let Some(root) = e.proof.aux_root.as_ref() {
         out.push(super::proof_arena::commitments_to_arena(&[*root]));
     }
@@ -2931,6 +3025,7 @@ fn expected_batched_arena_words(e: &RealBatchedEpoch, with_legs: bool) -> usize 
         .iter()
         .filter(|p| p.is_some_and(PrepSource::is_arena))
         .count();
+    total += 2 * usize::from(e.shape.carved_main.is_some()); // the carved root
     total += 2; // main_root — ONE, which is the whole batched economy
     total += 2 * num_reg;
     total += 2; // pc_start
@@ -3044,6 +3139,119 @@ fn the_batched_query_census_matches_the_closed_form() {
         "batched query census: {per_query} wrap permutations/query over {} tables",
         e.proof.tables.len()
     );
+}
+
+/// ★★ The CARVED emitter gates — D1's emitted side, on the continuation
+/// batched format (the L2G main matrix carved standalone). One test, five
+/// arms: the assembled verifier RUNS on an honest carved epoch; the census
+/// closed form and the schema words match the carved program exactly
+/// (structural); a tampered carved ROOT, opening VALUE and SIBLING are each
+/// unprovable; and the wrong-reduction control fires on the carved walk
+/// (verdict condition 4's emitted side), discrimination checked, not hoped
+/// for.
+#[test]
+fn the_assembled_carved_batched_epoch_verifier_runs() {
+    let e = real_batched_epoch_carved_from(
+        super::proof_fixture::fixture_options(),
+        EpochInputs::from_env(),
+    );
+    let c = e
+        .shape
+        .carved_main
+        .expect("the harness carved the L2G table");
+    assert_eq!(
+        c.table,
+        e.proof.tables.len() - 1,
+        "the carve is the L2G bookend, the last table"
+    );
+    let h_carved = e.shape.heights[c.table];
+    let h_max_fri = e.shape.h_max();
+
+    let program = batched_epoch_program_with(&e, true, false);
+    let mut arenas = batched_epoch_arenas(&e);
+    arenas.push(super::epoch_verify_tests::batched_opening_arena(&e));
+    arenas.push(super::epoch_verify_tests::batched_fri_arena(&e));
+    execute(&program, &arenas, &TestPermutation)
+        .expect("an honest carved batched epoch must run end to end");
+
+    // Structural: the census closed form and the schema words, on the CARVED
+    // shape — the same absolute guards the uncarved program carries.
+    let spine = batched_epoch_program_with(&e, false, false);
+    let count = |p: &LfmProgram, keccak: bool| -> usize {
+        p.instrs
+            .iter()
+            .filter(|i| match i {
+                super::instr::Instr::KeccakF(_) => keccak,
+                super::instr::Instr::Blake3(_) => !keccak,
+                _ => false,
+            })
+            .count()
+    };
+    let hash = super::edsl::WrapHash::production();
+    let per_query =
+        super::batched_epoch_verify::batched_query_permutations_for(&e.shape, &e.fri_params, hash);
+    let is_keccak = matches!(hash, super::edsl::WrapHash::Keccak);
+    assert_eq!(
+        count(&program, is_keccak) - count(&spine, is_keccak),
+        e.proof.queries.len() * per_query,
+        "the carved legs' wrap-hash permutations must be exactly the closed form"
+    );
+    for with_legs in [false, true] {
+        let p = batched_epoch_program_with(&e, with_legs, false);
+        let declared: usize = p.arena_schema.lens.iter().map(|l| *l as usize).sum();
+        assert_eq!(
+            declared,
+            expected_batched_arena_words(&e, with_legs),
+            "the carved program's schema must be exactly the shape's words"
+        );
+    }
+
+    // Tamper: the carved ROOT — its arena is index 2, right after the
+    // statement and the prep roots (declaration order = absorb order).
+    let open_idx = arenas.len() - 2;
+    let mut tampered = arenas.clone();
+    tampered[2][0] = base_word(FE::from(999_999u64));
+    assert!(
+        execute(&program, &tampered, &TestPermutation).is_err(),
+        "a tampered carved root must not verify"
+    );
+
+    // Tamper: the carved opening VALUE and a carved path SIBLING — the
+    // carved block sits after the prep openings in the opening arena.
+    let mut off = 0usize;
+    for &(h, w) in &e.shape.prep.dims {
+        off += 2 * w + 2 * (h - 1);
+    }
+    let mut tampered = arenas.clone();
+    tampered[open_idx][off] = base_word(FE::from(999_999u64));
+    assert!(
+        execute(&program, &tampered, &TestPermutation).is_err(),
+        "a tampered carved opening value must not verify"
+    );
+    let mut tampered = arenas.clone();
+    tampered[open_idx][off + 2 * c.width] = base_word(FE::from(999_999u64));
+    assert!(
+        execute(&program, &tampered, &TestPermutation).is_err(),
+        "a tampered carved sibling must not verify"
+    );
+
+    // The wrong-reduction control, on the carved walk specifically.
+    if h_carved < h_max_fri {
+        let discriminates = e.challenges.fri.iotas.iter().any(|&iota| {
+            (iota >> (h_max_fri - h_carved)) != (iota & ((1usize << (h_carved - 1)) - 1))
+        });
+        if discriminates {
+            let wrong = batched_epoch_program_with(&e, true, true);
+            assert!(
+                execute(&wrong, &arenas, &TestPermutation).is_err(),
+                "the wrong reduction direction must not authenticate the carved walk"
+            );
+        } else {
+            eprintln!("carved wrong-reduction arm skipped: the drawn indices do not discriminate");
+        }
+    } else {
+        eprintln!("carved wrong-reduction arm skipped: the carved table is the tallest");
+    }
 }
 
 /// [`host_table`] for a sub-proof inside a multi-table epoch: the fork is
