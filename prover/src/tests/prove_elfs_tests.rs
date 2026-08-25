@@ -1745,28 +1745,11 @@ fn memory_rows_at_timestamp(traces: &Traces, timestamp: u64) -> Vec<(bool, usize
     out
 }
 
-/// The echoed outputs are only worth anything if the memory they land in is
-/// authenticated, so this pins the shape of the writes #941 adds: `yR` and `yG`
-/// are written at the ECSM ecall's FOURTH sub-timestamp (reads at T and T+1,
-/// the register read and `xR` at T+2), four doublewords each. Eight non-register
-/// memory rows at `ts + 3` is what "the free fourth sub-timestamp" means
-/// concretely, and it is the window the design says is now full.
-#[test]
-fn test_ecsm_echoes_yr_and_yg_at_the_fourth_subtimestamp() {
-    let _ = env_logger::builder().is_test(true).try_init();
-
-    let (_elf, traces) = ecsm_traces("test_ecsm");
-    let writes = memory_rows_at_timestamp(&traces, ecsm_timestamp(&traces) + 3);
-
-    assert_eq!(
-        writes.len(),
-        8,
-        "yR and yG are four doublewords each, all at the ecall's fourth \
-         sub-timestamp; a different count means the write schedule moved"
-    );
-}
-
-/// Verifier REJECTS a forged value on one of the echoed writes. `yR` arrives on
+/// Verifier REJECTS a forged value on one of the echoed writes. Which rows those
+/// are — twelve writes, `xR` at T+2 and `yR`/`yG` at T+3 — is pinned structurally
+/// by `output_buffer_memw_writes_are_twelve_at_the_expected_offsets`; this covers
+/// the live edge that structural test cannot: that the payload actually written is
+/// tied to the chip's witness. `yR` arrives on
 /// the ECDAS bus and `yG` is the witnessed root, so both were already in the
 /// trace before #941 — what is new is that they are WRITTEN, and a write is only
 /// trustworthy if the memory argument ties it to the chip's own witness. Forge
