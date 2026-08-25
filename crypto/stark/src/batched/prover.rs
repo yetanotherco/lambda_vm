@@ -1425,6 +1425,8 @@ where
 /// Build (or take back) a table's main and aux LDEs for the phase about to read
 /// them.
 #[allow(clippy::too_many_arguments)]
+// The labeled blocks are broken out of only by the cfg(cuda) device arms.
+#[cfg_attr(not(feature = "cuda"), allow(unused_labels))]
 fn materialize_ldes<Field, FieldExtension, PI, H, P>(
     table: usize,
     air_trace_pairs: &[BatchedAirTracePair<'_, Field, FieldExtension, PI>],
