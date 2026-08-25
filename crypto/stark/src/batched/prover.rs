@@ -650,10 +650,17 @@ where
         // path uses), and the resident buffer absorbs by device pointer.
         // `Retain` downloads the one host copy the later phases read;
         // `RecomputeLde` never materializes it.
+        //
+        // OPT-IN (`LAMBDA_VM_GPU_RESIDENT_AUX`): measured NEGATIVE under
+        // `Retain` on the block box — downloading the wide ext3 LDEs costs
+        // more than the device NTT saves against a many-thread host
+        // (bench_cache/v2_bigbox_2026-08-25). The arm stays for the
+        // recompute postures, where no download exists.
         #[cfg(feature = "cuda")]
         {
             let done = 'resident: {
-                if std::env::var_os("LAMBDA_VM_DISABLE_GPU_RESIDENT_LDE").is_some()
+                if std::env::var_os("LAMBDA_VM_GPU_RESIDENT_AUX").is_none()
+                    || std::env::var_os("LAMBDA_VM_DISABLE_GPU_RESIDENT_LDE").is_some()
                     || !matches!(builder, RoundCommit::Dev { .. })
                     || super::gpu::lanes_per_element::<FieldExtension>() != Some(3)
                 {
