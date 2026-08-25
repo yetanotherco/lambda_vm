@@ -548,6 +548,33 @@ pub fn coset_lde_row_major_expand_on(
     Ok(buf)
 }
 
+/// [`coset_lde_row_major_expand_on`] that also snapshots the trace-domain
+/// input column-major (`[col*n + row]`) before the in-place NTT destroys it —
+/// the layout the LogUp fingerprint kernel reads as its resident main, so an
+/// aux build that follows skips its multi-GB main re-upload.
+pub fn coset_lde_row_major_expand_snapshot_on(
+    stream: &Arc<CudaStream>,
+    trace_row_major: &[u64],
+    n: usize,
+    total_cols: usize,
+    blowup_factor: usize,
+    weights: &[u64],
+) -> Result<(CudaSlice<u64>, CudaSlice<u64>)> {
+    let be = crate::device::backend()?;
+    let (buf, snap) = expand_row_major_on_stream(
+        stream,
+        be,
+        InnerInput::Host(trace_row_major),
+        n,
+        total_cols,
+        blowup_factor,
+        weights,
+        true,
+    )?;
+    let snap = snap.expect("retain_trace_col_major=true returns the snapshot");
+    Ok((buf, snap))
+}
+
 /// Shared row-major LDE + leaf-hash + Merkle pipeline for the base and ext3
 /// paths, committing with the kernel family `hash` selects.
 ///

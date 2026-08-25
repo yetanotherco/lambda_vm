@@ -413,7 +413,7 @@ where
     let mut carved_root: Option<crate::config::Commitment> = None;
 
     for table in 0..num_tables {
-        let (air, trace, _) = &air_trace_pairs[table];
+        let (air, trace, _) = &mut air_trace_pairs[table];
 
         // The device-resident arm: the table's LDE is born on the round's
         // stream and absorbed in place — the size-`n` trace is the only
@@ -462,15 +462,38 @@ where
                 let RoundCommit::Dev { dev, .. } = &mut main_builder else {
                     break 'resident false;
                 };
-                let buf = math_cuda::lde::coset_lde_row_major_expand_on(
-                    dev.stream(),
-                    raw,
-                    n,
-                    total_cols,
-                    domains[table].blowup_factor,
-                    &weights,
-                )
-                .map_err(|e| ProvingError::WrongParameter(format!("GPU resident LDE: {e}")))?;
+                // Under the device aux BUILD, the expansion also snapshots
+                // the trace-domain main column-major — the LogUp fingerprint
+                // kernel's resident-main layout — so the aux build skips its
+                // multi-GB main re-upload. The snapshots co-live until each
+                // table's aux build clears them: a wrap-scale VRAM budget,
+                // which is what the opt-in covers.
+                let want_snapshot = std::env::var_os("LAMBDA_VM_GPU_AUX_BUILD").is_some()
+                    && air.has_aux_trace()
+                    && super::gpu::lanes_per_element::<FieldExtension>() == Some(3);
+                let buf = if want_snapshot {
+                    let (buf, snap) = math_cuda::lde::coset_lde_row_major_expand_snapshot_on(
+                        dev.stream(),
+                        raw,
+                        n,
+                        total_cols,
+                        domains[table].blowup_factor,
+                        &weights,
+                    )
+                    .map_err(|e| ProvingError::WrongParameter(format!("GPU resident LDE: {e}")))?;
+                    trace.set_main_trace_dev(std::sync::Arc::new(snap), n);
+                    buf
+                } else {
+                    math_cuda::lde::coset_lde_row_major_expand_on(
+                        dev.stream(),
+                        raw,
+                        n,
+                        total_cols,
+                        domains[table].blowup_factor,
+                        &weights,
+                    )
+                    .map_err(|e| ProvingError::WrongParameter(format!("GPU resident LDE: {e}")))?
+                };
                 if let Some((expected, tree)) = prep {
                     transcript.append_bytes(&expected);
                     prep_trees[table] = Some(tree);
@@ -646,7 +669,12 @@ where
         }
         bus_public_inputs[table] = air.build_auxiliary_trace(trace, &lookup_challenges);
         #[cfg(feature = "cuda")]
-        materialize_resident_aux(trace)?;
+        {
+            materialize_resident_aux(trace)?;
+            // The build was the snapshot's only consumer — free its VRAM now,
+            // whichever arm the build took.
+            trace.clear_main_trace_dev();
+        }
 
         #[cfg(feature = "disk-spill")]
         if storage_mode == StorageMode::Disk {
