@@ -1034,6 +1034,24 @@ fn verify_global(
     )
 }
 
+/// What the global prove needs to know about genesis memory, and which the run
+/// can still add to.
+///
+/// The hint arena is the reason this is not fixed up front: the executor answers
+/// a hint request by deciding the initial value of an arena slot nobody has
+/// touched, so genesis bytes and the arena's slot count are both discovered as
+/// the guest runs. The producer folds each epoch's discoveries in before that
+/// epoch's memory is replayed; the global prove reads the finished picture after
+/// the boundary channel closes.
+struct GenesisFacts {
+    /// Per-page initial bytes for the PAGE init columns (see
+    /// [`build_init_page_data`]).
+    page_data: HashMap<u64, Vec<u8>>,
+    /// Arena slots decided so far — the private-input region's page span is a
+    /// function of this count.
+    hint_count: usize,
+}
+
 /// Prove a full continuation and return a self-contained [`ContinuationProof`]
 /// (prove half only — no verification). Splits the execution into `2^epoch_size_log2`
 /// cycle epochs, proves each, and proves the one cross-epoch global-memory linkage.
@@ -1074,8 +1092,6 @@ pub fn prove_continuation(
     let __root = stark::instruments::span("prove_continuation_total");
 
     let elf = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
-    let resolved_hints = crate::resolve_hints(&elf, private_inputs, hints)?;
-    let hints: &[[u8; 32]] = &resolved_hints;
     let mut executor = Executor::new(&elf, private_inputs.to_vec(), hints)
         .map_err(|e| Error::Execution(format!("{e}")))?;
     // The DECODE precomputed commitment depends only on (ELF, opts): compute
@@ -1090,9 +1106,20 @@ pub fn prove_continuation(
     // The cross-epoch memory image, carried forward: epoch i+1's init is epoch i's
     // fini, updated in place with each epoch's touched-cell final values.
     let mut image = build_initial_image_paged(&elf, private_inputs, hints);
-    let init_page_data = build_init_page_data(&image);
     let mut provenance =
         local_to_global::genesis_provenance(image.iter().map(|(a, v)| (a, v as u64)));
+
+    // Genesis facts the global prove needs, which the run can still ADD to: the
+    // executor answers a hint request by deciding the initial value of an
+    // untouched arena slot, which is a genesis byte discovered mid-stream (see
+    // `Memory::take_seeded_bytes`). The producer folds each epoch's seeds in
+    // before that epoch's memory is replayed; the global prove reads them after
+    // the boundary channel closes, i.e. after the producer is done — so the lock
+    // is never contended and the ordering is the channel's, not the lock's.
+    let genesis = std::sync::Mutex::new(GenesisFacts {
+        page_data: build_init_page_data(&image),
+        hint_count: hints.len(),
+    });
 
     let mut epochs: Vec<EpochProof> = Vec::new();
     // Full per-epoch boundaries, kept prover-local for `prove_global` (L2G traces +
@@ -1137,6 +1164,7 @@ pub fn prove_continuation(
     let first_err: std::sync::Mutex<Option<Error>> = std::sync::Mutex::new(None);
     let decode_artifacts_ref = &decode_artifacts;
     let first_err_ref = &first_err;
+    let genesis_ref = &genesis;
     // On error the prover DRAINS the channel (discarding items) instead of
     // returning: the senders are bounded and can only unblock via a recv, so
     // an early return would leave a builder parked in `send` forever and the
@@ -1230,6 +1258,13 @@ pub fn prove_continuation(
                 None::<&std::collections::HashMap<u64, u8>>,
                 &job.register_init,
                 &MaxRowsConfig::default(),
+                // Reached only by PAGE generation, which the line above skips —
+                // so `hints` here is the caller's arena, NOT the effective one
+                // the run may have grown on demand, and that is harmless only
+                // because nothing reads it. Anything that re-enables PAGE for
+                // epochs has to take the effective arena instead (the count is
+                // in `GenesisFacts`), or it will size the private-input region
+                // from a stale slot count.
                 private_inputs,
                 hints,
                 job.is_final,
@@ -1328,6 +1363,44 @@ pub fn prove_continuation(
                     drop(__sp);
                     let is_final = executor.pc() == 0;
 
+                    // Fold in the genesis bytes this epoch discovered: the
+                    // executor answered the guest's hint requests by deciding
+                    // the initial value of untouched arena slots. Those cells
+                    // have no history — nothing read or wrote them before — so
+                    // claiming them as genesis is exactly as true as having
+                    // shipped them in the private input, and it has to happen
+                    // HERE: `collect_epoch` below replays this epoch's memory
+                    // over `image`, and `epoch_boundary` takes each touched
+                    // cell's init from `provenance`. Both would otherwise read
+                    // back zero for a slot the guest just read.
+                    let seeded = executor.take_seeded_bytes();
+                    if !seeded.is_empty() {
+                        let mut genesis = genesis_ref.lock().unwrap();
+                        for (address, value) in seeded {
+                            // Only a cell with no history can be claimed as
+                            // genesis. If an earlier epoch already bound this
+                            // address, its boundary carries the old init and
+                            // rewriting genesis here would contradict it — the
+                            // bundle would simply fail to verify, with nothing
+                            // pointing at the cause. Fail here instead.
+                            if provenance.get(address).0 != local_to_global::GENESIS_EPOCH {
+                                return Err(Error::ContinuationInvariant(format!(
+                                    "hint arena cell {address:#x} was already bound by an \
+                                     earlier epoch; it cannot be seeded as genesis"
+                                )));
+                            }
+                            image.set(address, value);
+                            provenance
+                                .set(address, (local_to_global::GENESIS_EPOCH, value as u64, 0));
+                            let page = genesis
+                                .page_data
+                                .entry(page::page_base_for_address(address))
+                                .or_insert_with(|| vec![0u8; page::DEFAULT_PAGE_SIZE]);
+                            page[page::offset_in_page(address)] = value;
+                        }
+                        genesis.hint_count = executor.hint_arena().len();
+                    }
+
                     // Invariant: a non-final epoch ran the full `epoch_size` (a power
                     // of two), so its CPU table has no padding rows.
                     if !is_final && logs.len() != epoch_size {
@@ -1419,7 +1492,7 @@ pub fn prove_continuation(
         // global proof consumes only execution artifacts (boundaries, ELF,
         // genesis pages) — never an epoch proof — so this is pure schedule.
         let global_result_ref = &global_result;
-        let init_page_data_ref = &init_page_data;
+        let genesis_for_global = &genesis;
         scope.spawn(move || {
             let mut all: Vec<Arc<Vec<CellBoundary>>> = Vec::new();
             while let Ok(b) = boundary_rx.recv() {
@@ -1433,7 +1506,12 @@ pub fn prove_continuation(
             let run = || -> Result<GlobalResult, Error> {
                 #[cfg(feature = "instruments")]
                 let __sp = stark::instruments::span("prove_global");
-                let num_private_input_pages = page::private_input_page_count(private_inputs, hints);
+                // The producer is done (the boundary channel above closed), so
+                // genesis is final: it holds every arena slot the run decided
+                // on demand, not just the ones the caller supplied.
+                let genesis = genesis_for_global.lock().unwrap();
+                let num_private_input_pages =
+                    page::private_input_page_count(private_inputs, genesis.hint_count);
                 // SINGLE source of truth: the same page-base list drives the
                 // committed GLOBAL_MEMORY tables and is shipped in the bundle,
                 // so the two can never diverge in set or order.
@@ -1441,7 +1519,7 @@ pub fn prove_continuation(
                 let global = prove_global(
                     &all,
                     elf_bytes,
-                    init_page_data_ref,
+                    &genesis.page_data,
                     &touched,
                     num_private_input_pages,
                     opts,
@@ -2392,34 +2470,34 @@ mod tests {
         // private_input_page_count: wire format is `[len:4][data][pad8][count:4][pad:4]`
         // plus 32-byte hint slots; the region is page-aligned. The always-written
         // 8-byte arena header shifts the old boundaries by +8 bytes.
-        assert_eq!(page::private_input_page_count(&[], &[]), 0);
-        assert_eq!(page::private_input_page_count(&[0u8; 16], &[]), 1);
+        assert_eq!(page::private_input_page_count(&[], 0), 0);
+        assert_eq!(page::private_input_page_count(&[0u8; 16], 0), 1);
         // 4-byte prefix + (page_size - 12) data pads to page_size - 8, plus the
         // 8-byte header exactly fills one page.
         assert_eq!(
-            page::private_input_page_count(&vec![0u8; page::DEFAULT_PAGE_SIZE - 12], &[]),
+            page::private_input_page_count(&vec![0u8; page::DEFAULT_PAGE_SIZE - 12], 0),
             1
         );
         // One more byte pads up to page_size and the header spills into a second page.
         assert_eq!(
-            page::private_input_page_count(&vec![0u8; page::DEFAULT_PAGE_SIZE - 11], &[]),
+            page::private_input_page_count(&vec![0u8; page::DEFAULT_PAGE_SIZE - 11], 0),
             2
         );
         // The old single-page boundary (page_size - 4) now needs two pages: the
         // data section alone fills the page and the +8 header spills over.
         assert_eq!(
-            page::private_input_page_count(&vec![0u8; page::DEFAULT_PAGE_SIZE - 4], &[]),
+            page::private_input_page_count(&vec![0u8; page::DEFAULT_PAGE_SIZE - 4], 0),
             2
         );
         assert_eq!(
-            page::private_input_page_count(&vec![0u8; page::DEFAULT_PAGE_SIZE - 3], &[]),
+            page::private_input_page_count(&vec![0u8; page::DEFAULT_PAGE_SIZE - 3], 0),
             2
         );
         // Hints extend the region: empty main + one hint = align8(4) + 8 + 32 = 48 bytes.
-        assert_eq!(page::private_input_page_count(&[], &[[0u8; 32]]), 1);
+        assert_eq!(page::private_input_page_count(&[], 1), 1);
         // The arena alone can push the span past a page boundary.
         let hints = vec![[0u8; 32]; page::DEFAULT_PAGE_SIZE / 32];
-        assert_eq!(page::private_input_page_count(&[], &hints), 2);
+        assert_eq!(page::private_input_page_count(&[], hints.len()), 2);
     }
 
     // `private_input_page_bases` must enumerate exactly the aligned bases that

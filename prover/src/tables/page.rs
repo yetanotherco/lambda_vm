@@ -182,16 +182,19 @@ impl PageConfig {
 /// the other commits it, which is a soundness bug, so do not reimplement it.
 ///
 /// [`Memory::store_private_inputs`]: executor::vm::memory::Memory::store_private_inputs
-pub(crate) fn private_input_page_count(private_inputs: &[u8], hints: &[[u8; 32]]) -> usize {
+/// Takes the arena's SLOT COUNT rather than the slots: the span depends only on
+/// how many there are, and the continuation prover knows the count before it has
+/// the bytes (its executor answers requests as the guest makes them).
+pub(crate) fn private_input_page_count(private_inputs: &[u8], hint_count: usize) -> usize {
     use executor::vm::memory::{
         HINT_ARENA_HEADER_BYTES, HINT_SLOT_BYTES, hint_arena_header_offset,
     };
-    if private_inputs.is_empty() && hints.is_empty() {
+    if private_inputs.is_empty() && hint_count == 0 {
         return 0;
     }
     let extent = hint_arena_header_offset(private_inputs.len() as u64)
         + HINT_ARENA_HEADER_BYTES
-        + hints.len() as u64 * HINT_SLOT_BYTES;
+        + hint_count as u64 * HINT_SLOT_BYTES;
     (extent as usize).div_ceil(DEFAULT_PAGE_SIZE)
 }
 
