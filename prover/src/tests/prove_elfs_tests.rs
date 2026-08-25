@@ -115,9 +115,17 @@ fn prove_vm_minimal(
     let elf = Elf::load(elf_bytes).expect("ELF load");
     let executor = Executor::new(&elf, private_inputs.to_vec(), hints).expect("executor");
     let result = executor.run().expect("execution");
-    let mut traces =
-        Traces::from_elf_and_logs_minimal(&elf, &result.logs, max_rows, private_inputs, hints)
-            .unwrap();
+    // The arena the run actually used, not the one passed in: the executor answers
+    // requests on demand, so those slots are part of the region the guest read and
+    // must be in the initial image.
+    let mut traces = Traces::from_elf_and_logs_minimal(
+        &elf,
+        &result.logs,
+        max_rows,
+        private_inputs,
+        &result.hints,
+    )
+    .unwrap();
     let table_counts = traces.table_counts();
     let airs = VmAirs::new(
         &elf,
@@ -1276,15 +1284,15 @@ fn test_prove_hint_arena_rust_guest() {
     assert_eq!(proof.public_output, expected.to_vec());
 }
 
-/// Auto-record policy: proving a hint-consuming guest with NO explicit arena
-/// must transparently run the two-pass recording flow ([`crate::resolve_hints`])
-/// and cover the cheap hinted trace — not the software-fallback one. Asserts
-/// the trace element counts match an explicit-arena call and that both proofs
-/// verify with identical public outputs. Regression coverage for the removed
-/// hint ecall's always-on ergonomics (hint-less `ethrex_10_transfers` measured
-/// 3.35M cycles vs 1.31M hinted — flows that supply nothing must not regress).
+/// Proving a hint-consuming guest with NO explicit arena must cover the cheap
+/// hinted trace, not the software-fallback one — and must do it in the single
+/// execution the prover already performs, with the executor answering each
+/// request as the guest makes it. Asserts the trace element counts match an
+/// explicit-arena call and that both proofs verify with identical public
+/// outputs: the arena decided mid-run is indistinguishable from one shipped up
+/// front, which is exactly what makes seeding it legal.
 #[test]
-fn test_prove_ecrecover_hints_auto_records_arena() {
+fn test_prove_ecrecover_hints_on_demand_arena() {
     let _ = env_logger::builder().is_test(true).try_init();
 
     let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1322,17 +1330,20 @@ fn test_prove_ecrecover_hints_auto_records_arena() {
     input.extend_from_slice(&REC0);
     input.extend_from_slice(&REC1);
 
-    // The recording pass answers the guest's requests (sqrt + batched field
+    // The arena a run produces: one slot per request (sqrt + batched field
     // inverse + scalar inverse per recovery, in that order).
     let hints =
         executor::vm::execution::collect_hints(&program, input.clone()).expect("collect_hints");
     assert_eq!(hints.len(), 6, "2 recoveries × 3 hint requests");
 
-    // The policy under test: no explicit arena ⇒ auto-record ⇒ the SAME
+    // The policy under test: no explicit arena ⇒ answered on demand ⇒ the SAME
     // (hinted) trace an explicit arena produces.
     let auto = crate::count_elements(&elf_bytes, &input, &[]).expect("count auto");
     let explicit = crate::count_elements(&elf_bytes, &input, &hints).expect("count explicit");
-    assert_eq!(auto, explicit, "auto-record must produce the hinted trace");
+    assert_eq!(
+        auto, explicit,
+        "on-demand answers must produce the hinted trace"
+    );
 
     // And both proofs verify with identical committed output.
     let proof_auto = prove_vm_minimal(&elf_bytes, &input, &[], &Default::default());

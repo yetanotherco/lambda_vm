@@ -65,10 +65,11 @@ impl Crypto for LambdaVmEcsmCrypto {
 // ── ECDSA secp256k1 recovery via the ECSM precompile ────────────────────────
 
 /// Fetch a hint for `(hint_id, x_be)` from the private-input hint arena
-/// (positional — one slot per request). On an exhausted arena the request is
-/// appended to the guest's hint request log (the recording pass of the
-/// two-pass hint flow) and zeros are returned, which fail the caller's
-/// in-guest verify and trigger its software fallback.
+/// (positional — one slot per request). The request is published to the guest's
+/// hint request log and the executor answers it in the same run by seeding the
+/// arena slot this call then reads. When nobody answers, the slot reads back as
+/// zeros, which fail the caller's in-guest verify and trigger its software
+/// fallback.
 ///
 /// The hint is UNTRUSTED — the prover chooses the arena bytes, so every caller
 /// MUST verify it in-guest (`x·inv == 1`, `y² == x³+7`) AND recompute in
@@ -79,7 +80,7 @@ impl Crypto for LambdaVmEcsmCrypto {
 /// the fallback that closes that hole.
 #[cfg(target_arch = "riscv64")]
 fn get_hint(hint_id: usize, x_be: &[u8; 32]) -> [u8; 32] {
-    lambda_vm_syscalls::syscalls::request_hint(hint_id, x_be).unwrap_or([0u8; 32])
+    lambda_vm_syscalls::syscalls::request_hint(hint_id, x_be)
 }
 
 /// Scalar-field inverse `x⁻¹ mod n`.

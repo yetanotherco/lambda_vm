@@ -179,6 +179,13 @@ fn hint_arena_header_addr() -> usize {
 
 /// Number of hint slots the host supplied. 0 when no arena was written (the
 /// header reads back as zero-filled memory).
+///
+/// ONLY for an arena supplied up front. Do NOT mix this (or [`next_hint`]) with
+/// [`request_hint`] in the same guest: answering a request on demand also moves
+/// the count word, and a read of that word taken BEFORE the first request would
+/// see a value the proved initial image no longer holds. Pick one style per
+/// guest — the count-bounded one for a shipped arena, `request_hint` for hints
+/// the host can only know during the run.
 #[cfg(target_arch = "riscv64")]
 pub fn hint_count() -> usize {
     unsafe { core::ptr::read_volatile(hint_arena_header_addr() as *const u32) as usize }
@@ -189,14 +196,12 @@ pub fn hint_count() -> usize {
     unimplemented!("syscalls are only implemented for riscv64 targets");
 }
 
-/// Read hint slot `i` as raw bytes, or `None` when the arena has no slot `i`.
+/// Read slot `i`'s raw bytes with no bounds check against the arena header.
 /// The slot is read as four aligned 8-byte words (the fast aligned-load path);
-/// slots are 8-aligned by construction.
+/// slots are 8-aligned by construction. An unwritten slot reads back as zeros,
+/// which fails the caller's verify and sends it to its software fallback.
 #[cfg(target_arch = "riscv64")]
-pub fn hint_slot(i: usize) -> Option<[u8; 32]> {
-    if i >= hint_count() {
-        return None;
-    }
+fn read_slot(i: usize) -> [u8; 32] {
     let addr = hint_arena_header_addr() + HINT_ARENA_HEADER_BYTES + i * HINT_SLOT_BYTES;
     debug_assert_eq!(addr % 8, 0, "hint slot address must stay 8-aligned");
     // Read as four u64 words and re-serialize little-endian: the VM is
@@ -206,7 +211,20 @@ pub fn hint_slot(i: usize) -> Option<[u8; 32]> {
     for (k, w) in words.iter().enumerate() {
         out[8 * k..8 * k + 8].copy_from_slice(&w.to_le_bytes());
     }
-    Some(out)
+    out
+}
+
+/// Read hint slot `i` as raw bytes, or `None` when the arena has no slot `i`.
+/// Bounds-checked against the arena header, so this is the API for an arena the
+/// host supplied up front (its count word says how many slots exist). The
+/// on-demand path uses [`request_hint`] instead, which is not bounded by the
+/// count word — see its docs.
+#[cfg(target_arch = "riscv64")]
+pub fn hint_slot(i: usize) -> Option<[u8; 32]> {
+    if i >= hint_count() {
+        return None;
+    }
+    Some(read_slot(i))
 }
 
 #[cfg(not(target_arch = "riscv64"))]
@@ -233,13 +251,18 @@ pub fn next_hint() -> Option<[u8; 32]> {
 }
 
 // =============================================================================
-// Hint request log — the recording pass for hints that are NOT known
-// beforehand. When the arena is exhausted, `request_hint` appends
-// `(hint_id, input)` to a fixed scratch region above the private-input window;
-/// the host reads it after the run (executor's `Memory::hint_requests`),
-/// computes the answers, and re-runs with a complete arena. The log region:
-///
+// Hint request log — how the guest asks for a hint whose value the host cannot
+// know before the run. `request_hint` appends `(hint_id, input)` to a fixed
+// scratch region above the private-input window and then reads its answer from
+// the arena slot with the same index. The log region:
+//
 //   [u32 LE count][u32 pad], then entries of [u64 LE hint_id][32-byte input].
+//
+// The store of the count word is what COMPLETES an entry, and the executor
+// answers on that store: it seeds arena slot `count` with `compute_hint` before
+// the guest's read of that slot is executed. One execution, no recording pass.
+// The answer is still untrusted private-input data — the caller verifies it and
+// falls back to software on failure, exactly as before.
 //
 // Must match `executor::vm::memory::{HINT_LOG_START_INDEX,
 // HINT_LOG_HEADER_BYTES, HINT_LOG_ENTRY_BYTES}`.
@@ -251,7 +274,7 @@ pub fn next_hint() -> Option<[u8; 32]> {
 /// ELF image, so this region is collision-free in practice.
 /// Must match `executor::vm::memory::HINT_LOG_START_INDEX`.
 #[cfg(target_arch = "riscv64")]
-pub const HINT_LOG_START: usize = 0xFF000000 + 4 + 512 * 1024 * 1024 + 4;
+pub const HINT_LOG_START: usize = PRIVATE_INPUT_START + 4 + MAX_PRIVATE_INPUT_SIZE + 4;
 
 /// Log header size (`[u32 LE count][u32 pad]`).
 /// Must match `executor::vm::memory::HINT_LOG_HEADER_BYTES`.
@@ -263,31 +286,39 @@ const HINT_LOG_HEADER_BYTES: usize = 8;
 #[cfg(target_arch = "riscv64")]
 const HINT_LOG_ENTRY_BYTES: usize = 40;
 
-/// Consume the next hint slot for a `(hint_id, input)` request; on an exhausted
-/// arena, append the request to the hint request log and return `None` (the
-/// caller then recomputes in software). One slot is consumed per call whether
-/// or not the hint verifies — see [`next_hint`].
+/// Ask for the hint for `(hint_id, input)` and read the answer.
+///
+/// Publishes the request to the log FIRST, then reads arena slot `index` — the
+/// order matters: the store of the count word is the executor's cue to seed
+/// that slot, so by the time the read below executes, the answer is already the
+/// slot's (prover-chosen) initial value. Requests and slots are positional and
+/// in lockstep: request `i` always reads slot `i`.
+///
+/// The returned bytes are UNTRUSTED and may be zeros (nobody answered, or the
+/// host lied). The caller MUST verify them in-guest and recompute in software on
+/// failure — that is what keeps the result independent of the hint.
+///
+/// Do not mix with [`hint_count`] / [`next_hint`] in the same guest — see
+/// `hint_count`'s docs for why.
 #[cfg(target_arch = "riscv64")]
-pub fn request_hint(hint_id: usize, input: &[u8; 32]) -> Option<[u8; 32]> {
-    if let Some(slot) = next_hint() {
-        return Some(slot);
-    }
+pub fn request_hint(hint_id: usize, input: &[u8; 32]) -> [u8; 32] {
     let count_addr = HINT_LOG_START;
-    let count = unsafe { core::ptr::read_volatile(count_addr as *const u32) } as usize;
-    let entry = count_addr + HINT_LOG_HEADER_BYTES + count * HINT_LOG_ENTRY_BYTES;
+    let index = unsafe { core::ptr::read_volatile(count_addr as *const u32) } as usize;
+    let entry = count_addr + HINT_LOG_HEADER_BYTES + index * HINT_LOG_ENTRY_BYTES;
     unsafe {
         core::ptr::write_volatile(entry as *mut u64, hint_id as u64);
         for k in 0..4 {
             let word = u64::from_le_bytes(input[8 * k..8 * k + 8].try_into().unwrap());
             core::ptr::write_volatile((entry + 8 + 8 * k) as *mut u64, word);
         }
-        core::ptr::write_volatile(count_addr as *mut u32, count as u32 + 1);
+        // Completes the entry. The executor answers here.
+        core::ptr::write_volatile(count_addr as *mut u32, index as u32 + 1);
     }
-    None
+    read_slot(index)
 }
 
 #[cfg(not(target_arch = "riscv64"))]
-pub fn request_hint(_hint_id: usize, _input: &[u8; 32]) -> Option<[u8; 32]> {
+pub fn request_hint(_hint_id: usize, _input: &[u8; 32]) -> [u8; 32] {
     unimplemented!("syscalls are only implemented for riscv64 targets");
 }
 

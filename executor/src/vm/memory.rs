@@ -64,9 +64,10 @@ pub const HINT_ARENA_HEADER_BYTES: u64 = 8;
 
 /// Start of the hint request log: just past the reserved private-input window,
 /// rounded up to 8 (`0xFF000000 + 4 + 512 MiB + 4` = `0x11F000008`). The guest
-/// appends `(hint_id, input)` entries here when the hint arena is exhausted —
-/// the recording pass of the two-pass hint flow. The host reads them back with
-/// [`Memory::hint_requests`]. Must match `HINT_LOG_START` in
+/// appends a `(hint_id, input)` entry here for every hint it wants, and the
+/// store that bumps the count word is what makes the executor answer it —
+/// see [`Memory::answer_hint_request`]. [`Memory::hint_requests`] reads the log
+/// back for measurement. Must match `HINT_LOG_START` in
 /// `syscalls/src/syscalls.rs`.
 pub const HINT_LOG_START_INDEX: u64 =
     0xFF000000 + PRIVATE_INPUT_LENGTH_PREFIX_BYTES as u64 + MAX_PRIVATE_INPUT_SIZE + 4;
@@ -130,6 +131,24 @@ pub struct Memory {
     /// onto the Commit bus by `index`), so this buffer is purely the
     /// executor's view used by `read_return_value` and CLI display.
     public_output: Vec<u8>,
+    /// The hint arena as it actually stands in this region: slot `i` is what the
+    /// guest reads for request `i`. Seeded from the host-supplied `hints` in
+    /// [`Memory::store_private_inputs`] and extended in place by
+    /// [`Memory::answer_hint_request`] when the guest logs a request the arena
+    /// does not already cover.
+    ///
+    /// This is the arena the PROVER must put in the initial image: the region's
+    /// bytes are always exactly `encode_private_input_region(input, hint_arena)`,
+    /// which is what makes the seeded values legal — a value nobody has touched
+    /// yet is prover-chosen page data, and deciding it mid-run is the same
+    /// statement as deciding it up front.
+    hint_arena: Vec<[u8; 32]>,
+    /// When set, hint requests go unanswered: the guest reads zeros, its
+    /// in-guest verify rejects them, and it recomputes in software. Off in
+    /// production (the default is to answer); [`Memory::silence_hints`] turns it
+    /// on for the fallback measurement baseline and for the "a host that answers
+    /// nothing cannot change the result" test arm.
+    hints_silenced: bool,
 }
 
 impl Memory {
@@ -188,6 +207,12 @@ impl Memory {
             for (i, b) in bytes.iter().enumerate() {
                 self.store_byte(address + i as u64, *b);
             }
+        }
+        // The guest completes a hint-request log entry by bumping the count word,
+        // and that store is the executor's cue to answer it (see
+        // `answer_hint_request`). One comparison on the word-store path.
+        if address == HINT_LOG_START_INDEX {
+            self.answer_hint_request(value)?;
         }
         Ok(())
     }
@@ -288,12 +313,19 @@ impl Memory {
         Ok(self.public_output.clone())
     }
 
-    /// Read the hint request log the guest appended via `request_hint` (the
-    /// recording pass of the two-pass hint flow): `(hint_id, input)` entries in
-    /// request order. Empty when the arena covered every request.
+    /// Read the hint request log the guest appended via `request_hint`:
+    /// `(hint_id, input)` entries in request order. Every entry has already been
+    /// answered by [`Memory::answer_hint_request`] — this is a debugging /
+    /// measurement view of what the guest asked for, not a work queue.
+    ///
+    /// The count word is guest-written memory, so the capacity it implies is
+    /// reserved fallibly (same discipline as [`Memory::load_bytes`]) rather than
+    /// letting a bogus count abort the host on allocation.
     pub fn hint_requests(&self) -> Result<Vec<(u64, [u8; 32])>, MemoryError> {
         let count = self.load_word(HINT_LOG_START_INDEX)? as usize;
-        let mut out = Vec::with_capacity(count);
+        let mut out = Vec::new();
+        out.try_reserve_exact(count)
+            .map_err(|_| MemoryError::AllocationFailed)?;
         for i in 0..count {
             let entry =
                 HINT_LOG_START_INDEX + HINT_LOG_HEADER_BYTES + i as u64 * HINT_LOG_ENTRY_BYTES;
@@ -304,6 +336,109 @@ impl Memory {
             out.push((hint_id, input));
         }
         Ok(out)
+    }
+
+    /// The hint arena as it stands: slot `i` is what the guest reads for request
+    /// `i`. Equal to the `hints` passed to [`Memory::store_private_inputs`] plus
+    /// everything [`Memory::answer_hint_request`] seeded during the run. The
+    /// prover must pass THIS to the trace builder — it is the arena the region's
+    /// bytes actually encode.
+    pub fn hint_arena(&self) -> &[[u8; 32]] {
+        &self.hint_arena
+    }
+
+    /// Stop answering hint requests, so the guest falls back to software for
+    /// every one of them. For measurement and for the tests that pin "an
+    /// unanswered hint cannot change the result" — not a production path.
+    pub fn silence_hints(&mut self) {
+        self.hints_silenced = true;
+    }
+
+    /// Answer the hint request the guest just completed by bumping the log's
+    /// count word to `new_count`.
+    ///
+    /// This is the whole one-pass mechanism: entry `new_count - 1` names a
+    /// `(hint_id, input)`, and the guest's very next instructions read arena slot
+    /// `new_count - 1`. That slot has never been touched, so its value is still
+    /// the prover's to choose — seeding it here is the same statement as having
+    /// shipped it in the private input up front, and it needs no memory write in
+    /// the trace (a write would have to be justified by a chip; an initial value
+    /// does not). The seeded bytes stay unconstrained and untrusted: the guest
+    /// verifies them and falls back to software on failure.
+    ///
+    /// A slot the caller already supplied is left alone — an explicitly passed
+    /// arena wins, and the guest reads exactly what the caller shipped.
+    ///
+    /// One sharp edge, documented on the guest side too (`syscalls::hint_count`):
+    /// seeding also moves the arena's count word, so a guest must not read that
+    /// word (via `hint_count`/`next_hint`) BEFORE making on-demand requests — the
+    /// trace would carry the pre-bump value while the image carries the final
+    /// one. No guest mixes the two styles today. Closing it properly wants a mode
+    /// flag in the header's spare pad word rather than a convention.
+    fn answer_hint_request(&mut self, new_count: u32) -> Result<(), MemoryError> {
+        if self.hints_silenced {
+            return Ok(());
+        }
+        let Some(index) = new_count.checked_sub(1) else {
+            return Ok(()); // count reset to 0: nothing completed
+        };
+        let index = index as usize;
+        if index < self.hint_arena.len() {
+            return Ok(()); // already covered by the host-supplied arena
+        }
+        if index != self.hint_arena.len() {
+            // The count word skipped ahead: entries and slots are positional, so
+            // guessing which request this is would silently desync the arena.
+            return Err(MemoryError::HintRequestOutOfOrder);
+        }
+
+        let entry =
+            HINT_LOG_START_INDEX + HINT_LOG_HEADER_BYTES + index as u64 * HINT_LOG_ENTRY_BYTES;
+        let hint_id = self.load_doubleword(entry)?;
+        let mut input = [0u8; 32];
+        input.copy_from_slice(&self.load_bytes(entry + 8, 32)?);
+
+        let value = crate::vm::instruction::execution::compute_hint(hint_id, &input);
+        self.seed_hint_slot(index as u64, &value)?;
+        self.hint_arena.push(value);
+
+        // Keep the arena header's count word in step with the slots that exist, so
+        // the region stays byte-identical to `encode_private_input_region(input,
+        // hint_arena)` — the image the prover will build.
+        let header = PRIVATE_INPUT_START_INDEX + self.hint_arena_header_offset()?;
+        self.cells
+            .insert(header, (self.hint_arena.len() as u32).to_le_bytes());
+        Ok(())
+    }
+
+    /// Write `value` into arena slot `index` as an INITIAL value: eight aligned
+    /// word cells, no log entry, no timestamp. Only legal on cells nobody has
+    /// touched — a value that is going to be presented as "there since timestamp
+    /// 0" must not have a prior history in the trace.
+    fn seed_hint_slot(&mut self, index: u64, value: &[u8; 32]) -> Result<(), MemoryError> {
+        let base = PRIVATE_INPUT_START_INDEX
+            + self.hint_arena_header_offset()?
+            + HINT_ARENA_HEADER_BYTES
+            + index * HINT_SLOT_BYTES;
+        for w in 0..8u64 {
+            if self.cells.contains_key(&(base + 4 * w)) {
+                return Err(MemoryError::HintSlotAlreadyWritten);
+            }
+        }
+        for w in 0..8usize {
+            let mut word = [0u8; 4];
+            word.copy_from_slice(&value[4 * w..4 * w + 4]);
+            self.cells.insert(base + 4 * w as u64, word);
+        }
+        Ok(())
+    }
+
+    /// Offset of the arena header from `PRIVATE_INPUT_START_INDEX`, derived from
+    /// the stored length prefix — the same derivation the guest does, so both
+    /// agree on where slot 0 lives.
+    fn hint_arena_header_offset(&self) -> Result<u64, MemoryError> {
+        let main_len = self.load_word(PRIVATE_INPUT_START_INDEX)? as u64;
+        Ok(hint_arena_header_offset(main_len))
     }
 
     /// Pre-loads private input bytes at `PRIVATE_INPUT_START_INDEX` in the
@@ -321,6 +456,7 @@ impl Memory {
         inputs: Vec<u8>,
         hints: &[[u8; 32]],
     ) -> Result<(), MemoryError> {
+        self.hint_arena = hints.to_vec();
         if inputs.is_empty() && hints.is_empty() {
             return Ok(());
         }
@@ -379,6 +515,10 @@ pub enum MemoryError {
     AddressOverflow,
     #[error("Failed to allocate memory for load_bytes")]
     AllocationFailed,
+    #[error("Hint request log count skipped ahead: requests and arena slots are positional")]
+    HintRequestOutOfOrder,
+    #[error("Hint arena slot was already written: it cannot be seeded as an initial value")]
+    HintSlotAlreadyWritten,
 }
 
 #[cfg(test)]
@@ -543,6 +683,154 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    // Writes request `index` into the log the way the guest does: the entry
+    // first, then the count word — whose store is what makes the executor answer.
+    fn write_hint_request(memory: &mut Memory, index: u64, hint_id: u64, input: &[u8; 32]) {
+        let entry = HINT_LOG_START_INDEX + HINT_LOG_HEADER_BYTES + index * HINT_LOG_ENTRY_BYTES;
+        memory.store_doubleword(entry, hint_id).unwrap();
+        for (i, b) in input.iter().enumerate() {
+            memory.store_byte(entry + 8 + i as u64, *b);
+        }
+        memory
+            .store_word(HINT_LOG_START_INDEX, index as u32 + 1)
+            .unwrap();
+    }
+
+    // THE invariant the one-pass design rests on: after answering requests during
+    // a run, the private-input region is byte-for-byte what the canonical encoder
+    // produces for the arena the executor reports. That is what lets the prover
+    // rebuild the same initial image from `ExecutionResult::hints` — the seeded
+    // slots are indistinguishable from slots shipped up front.
+    #[test]
+    fn answering_on_demand_keeps_the_region_canonical() {
+        use crate::vm::instruction::execution::{HINT_FIELD_INV, compute_hint};
+
+        let mut memory = Memory::default();
+        let inputs = vec![0x11u8; 5]; // odd length exercises the pad-to-8
+        memory.store_private_inputs(inputs.clone(), &[]).unwrap();
+
+        let mut x = [0u8; 32];
+        x[31] = 3; // big-endian 3
+        write_hint_request(&mut memory, 0, HINT_FIELD_INV, &x);
+
+        assert_eq!(memory.hint_arena().len(), 1, "the request was answered");
+        assert_eq!(memory.hint_arena()[0], compute_hint(HINT_FIELD_INV, &x));
+
+        let canonical = encode_private_input_region(&inputs, memory.hint_arena()).unwrap();
+        let stored = memory
+            .load_bytes(PRIVATE_INPUT_START_INDEX, canonical.len() as u64)
+            .unwrap();
+        assert_eq!(
+            stored, canonical,
+            "region must equal encode_private_input_region(input, reported arena)"
+        );
+    }
+
+    // The same invariant with no main input at all: nothing was written up front,
+    // so the length prefix, the count word and the slot all have to come out right
+    // from the seeding path alone.
+    #[test]
+    fn answering_on_demand_with_no_main_input() {
+        use crate::vm::instruction::execution::{HINT_SCALAR_INV, compute_hint};
+
+        let mut memory = Memory::default();
+        memory.store_private_inputs(vec![], &[]).unwrap();
+
+        let mut x = [0u8; 32];
+        x[31] = 5;
+        write_hint_request(&mut memory, 0, HINT_SCALAR_INV, &x);
+
+        assert_eq!(memory.hint_arena()[0], compute_hint(HINT_SCALAR_INV, &x));
+        let canonical = encode_private_input_region(&[], memory.hint_arena()).unwrap();
+        let stored = memory
+            .load_bytes(PRIVATE_INPUT_START_INDEX, canonical.len() as u64)
+            .unwrap();
+        assert_eq!(stored, canonical);
+    }
+
+    // A slot the caller already supplied is NOT re-seeded: an explicit arena wins,
+    // and the guest reads exactly the bytes that were shipped.
+    #[test]
+    fn a_supplied_slot_is_not_overwritten_by_an_answer() {
+        use crate::vm::instruction::execution::HINT_FIELD_INV;
+
+        let mut memory = Memory::default();
+        let supplied = [[0xABu8; 32]];
+        memory.store_private_inputs(vec![], &supplied).unwrap();
+
+        let mut x = [0u8; 32];
+        x[31] = 3;
+        write_hint_request(&mut memory, 0, HINT_FIELD_INV, &x);
+
+        assert_eq!(memory.hint_arena(), &supplied[..]);
+        let header = hint_arena_header_offset(0);
+        let slot = memory
+            .load_bytes(
+                PRIVATE_INPUT_START_INDEX + header + HINT_ARENA_HEADER_BYTES,
+                HINT_SLOT_BYTES,
+            )
+            .unwrap();
+        assert_eq!(slot, supplied[0]);
+    }
+
+    // Seeding is only legal on an untouched cell. A guest that scribbles on the
+    // slot before asking gets a loud error instead of an initial value that
+    // contradicts the trace.
+    #[test]
+    fn seeding_a_written_slot_is_rejected() {
+        use crate::vm::instruction::execution::HINT_FIELD_INV;
+
+        let mut memory = Memory::default();
+        memory.store_private_inputs(vec![], &[]).unwrap();
+        let slot =
+            PRIVATE_INPUT_START_INDEX + hint_arena_header_offset(0) + HINT_ARENA_HEADER_BYTES;
+        memory.store_word(slot, 0xDEADBEEF).unwrap();
+
+        let mut x = [0u8; 32];
+        x[31] = 3;
+        let entry = HINT_LOG_START_INDEX + HINT_LOG_HEADER_BYTES;
+        memory.store_doubleword(entry, HINT_FIELD_INV).unwrap();
+        for (i, b) in x.iter().enumerate() {
+            memory.store_byte(entry + 8 + i as u64, *b);
+        }
+        let err = memory.store_word(HINT_LOG_START_INDEX, 1).unwrap_err();
+        assert!(matches!(err, MemoryError::HintSlotAlreadyWritten));
+    }
+
+    // Requests and slots are positional. A count word that skips ahead cannot be
+    // matched to a request, so it fails rather than desyncing the arena.
+    #[test]
+    fn a_count_that_skips_ahead_is_rejected() {
+        let mut memory = Memory::default();
+        memory.store_private_inputs(vec![], &[]).unwrap();
+        let err = memory.store_word(HINT_LOG_START_INDEX, 7).unwrap_err();
+        assert!(matches!(err, MemoryError::HintRequestOutOfOrder));
+    }
+
+    // Silenced: nothing is answered, the arena stays empty, and the slot the guest
+    // reads is still zeros — the software-fallback path.
+    #[test]
+    fn silenced_hints_answer_nothing() {
+        use crate::vm::instruction::execution::HINT_FIELD_INV;
+
+        let mut memory = Memory::default();
+        memory.store_private_inputs(vec![], &[]).unwrap();
+        memory.silence_hints();
+
+        let mut x = [0u8; 32];
+        x[31] = 3;
+        write_hint_request(&mut memory, 0, HINT_FIELD_INV, &x);
+
+        assert!(memory.hint_arena().is_empty());
+        let slot = memory
+            .load_bytes(
+                PRIVATE_INPUT_START_INDEX + hint_arena_header_offset(0) + HINT_ARENA_HEADER_BYTES,
+                HINT_SLOT_BYTES,
+            )
+            .unwrap();
+        assert_eq!(slot, vec![0u8; 32]);
     }
 
     // Size cap: `align8(4 + main_len) + 8 + 32 * hint_count` must stay within

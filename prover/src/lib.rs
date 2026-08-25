@@ -1037,21 +1037,20 @@ pub(crate) fn verify_l2g_commitment_binding_view(
 // Public API: Prove / Verify
 // =============================================================================
 
-/// Resolve the hint arena for a prove/count entry point: `hints` as-is when
-/// non-empty, otherwise the two-pass recording flow — execute once with an
-/// empty arena, answer the guest's logged requests with
-/// [`executor::vm::instruction::execution::compute_hint`], and use the answers
-/// as the arena for the proved run.
+/// Resolve the hint arena for the CONTINUATION prove path: `hints` as-is when
+/// non-empty, otherwise a pre-pass that runs the guest and returns the arena it
+/// produced.
 ///
-/// The auto-record restores the ergonomics the removed hint ecall had: a
-/// hint-consuming guest proved with no explicit arena still gets the cheap
-/// in-guest-verify trace instead of the software-fallback one (measured on
-/// `ethrex_10_transfers`: 3.35M cycles hint-less vs 1.31M hinted). Both runs
-/// commit the same output — the arena only changes how cheaply the guest gets
-/// there — so this never changes the statement being proved. For a guest that
-/// requests nothing the record pass yields an empty arena and the proved run
-/// is identical to what it would have been anyway; the only cost is one extra
-/// execution, negligible against proving.
+/// The monolithic path does not need this — it takes `ExecutionResult::hints`
+/// from the single run it already performs, because the executor answers each
+/// request inline. The continuation prover cannot: it freezes its initial image
+/// and genesis provenance before streaming epochs, so it needs the arena up
+/// front. The pre-pass is the same cheap in-guest-verify path the proved run
+/// takes (not the software fallback), and it drains its logs instead of
+/// collecting them, so it costs one execution and no allocation spike.
+///
+/// Both runs commit the same output — the arena only changes how cheaply the
+/// guest gets there — so this never changes the statement being proved.
 fn resolve_hints<'a>(
     program: &Elf,
     private_inputs: &[u8],
@@ -1106,18 +1105,21 @@ pub fn count_elements(
     hints: &[[u8; 32]],
 ) -> Result<(u64, u64), Error> {
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
-    let hints = resolve_hints(&program, private_inputs, hints)?;
-    let executor = Executor::new(&program, private_inputs.to_vec(), &hints)
+    let executor = Executor::new(&program, private_inputs.to_vec(), hints)
         .map_err(|e| Error::Execution(format!("{e}")))?;
     let result = executor
         .run()
         .map_err(|e| Error::Execution(format!("{e}")))?;
+    // The arena the run actually used: what the caller passed, plus every slot the
+    // executor answered on demand. Counting against anything else would count a
+    // different region than the one the guest read.
+    let hints = &result.hints;
     let traces = Traces::from_elf_and_logs(
         &program,
         &result.logs,
         &MaxRowsConfig::default(),
         private_inputs,
-        &hints,
+        hints,
         #[cfg(feature = "disk-spill")]
         StorageMode::Ram,
     )?;
@@ -1161,12 +1163,15 @@ pub fn prove_with_options_and_inputs(
     let __sp = stark::instruments::span("execute");
 
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
-    let hints = resolve_hints(&program, private_inputs, hints)?;
-    let executor = Executor::new(&program, private_inputs.to_vec(), &hints)
+    let executor = Executor::new(&program, private_inputs.to_vec(), hints)
         .map_err(|e| Error::Execution(format!("{e}")))?;
-    let result = executor
+    let mut result = executor
         .run()
         .map_err(|e| Error::Execution(format!("{e}")))?;
+    // The arena the run actually used: what the caller passed, plus every slot the
+    // executor answered on demand. Taken out of `result` because the trace build
+    // drops `result` while still needing the arena.
+    let hints = std::mem::take(&mut result.hints);
 
     #[cfg(feature = "instruments")]
     drop(__sp);
