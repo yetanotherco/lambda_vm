@@ -282,6 +282,7 @@ fn touched_page_bases(boundaries: &[Arc<Vec<CellBoundary>>]) -> Vec<u64> {
 /// GLOBAL_MEMORY table per touched page, sized by that page's crossing cells,
 /// and the aggregator's cost per page follows the table height — so pricing
 /// the aggregation program requires exactly this and nothing heavier.
+#[cfg(test)]
 pub(crate) struct BlockPageCensus {
     pub num_epochs: usize,
     /// Sorted, deduped — [`touched_page_bases`]' own order.
@@ -297,6 +298,7 @@ pub(crate) struct BlockPageCensus {
 /// Runs the guest to completion and collects [`BlockPageCensus`] — the
 /// producer loop's sequential-critical half (execute, collect, boundary,
 /// image carry) with every prove and trace build omitted.
+#[cfg(test)]
 pub(crate) fn block_page_census(
     elf_bytes: &[u8],
     private_inputs: &[u8],

@@ -25,7 +25,6 @@ use stark::batched::proof::BatchedMultiProof;
 use stark::batched::shape::{EpochFriParams, EpochShape};
 use stark::batched::verifier::{EpochChallenges, replay_epoch_transcript};
 use stark::config::Commitment;
-use stark::traits::AIR;
 
 use crate::tables::types::{FE, FEE, GoldilocksExtension, GoldilocksField};
 
@@ -374,7 +373,7 @@ pub(super) fn declare_lfm_leg_arenas(b: &mut LfmBuilder, e: &RealBatchedLfm) -> 
                 .map(|t| {
                     fri.plan.standalone.contains(&t).then(|| {
                         b.declare_arena(
-                            1u32 << (e.shape.heights[t] as u32 - e.fri_params.blowup_log as u32),
+                            1u32 << (e.shape.heights[t] as u32 - e.fri_params.blowup_log),
                         )
                     })
                 })
@@ -527,7 +526,7 @@ pub(super) fn emit_lfm_leg(
         .enumerate()
         .map(|(t, id)| {
             id.map(|id| {
-                (0..1u32 << (e.shape.heights[t] as u32 - e.fri_params.blowup_log as u32))
+                (0..1u32 << (e.shape.heights[t] as u32 - e.fri_params.blowup_log))
                     .map(|k| b.hint_word(id, k).as_ext())
                     .collect()
             })
@@ -962,7 +961,7 @@ impl WrapPublicLayout {
             n_tables: e.proof.tables.len(),
             n_zetas: e.challenges.fri.betas.len(),
             n_iotas: e.fri_params.num_queries,
-            num_reg: crate::tables::register::NUM_REGISTER_ADDRESSES as usize,
+            num_reg: crate::tables::register::NUM_REGISTER_ADDRESSES,
             out_bytes: e.statement.public_output_len,
         }
     }
@@ -1345,7 +1344,7 @@ fn the_assembled_aggregator_runs_on_the_fixture_chain() {
     // The aggregate's own publishes: id halves, block register boundaries,
     // final output bytes, then every wrap's L2G root halves — compare the
     // roots against the wraps' published words.
-    let num_reg = crate::tables::register::NUM_REGISTER_ADDRESSES as usize;
+    let num_reg = crate::tables::register::NUM_REGISTER_ADDRESSES;
     let l_last = layouts.last().expect("nonempty");
     let root_base = 2 + 2 * num_reg + l_last.out_bytes;
     for (k, wrap) in wraps.iter().enumerate() {
