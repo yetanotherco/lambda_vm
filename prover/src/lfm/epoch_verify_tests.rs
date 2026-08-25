@@ -358,6 +358,11 @@ pub(super) fn batched_opening_words_per_query(shape: &EpochShape) -> usize {
     for &(h, width) in &shape.prep.dims {
         words += 2 * width + 2 * (h - 1);
     }
+    // The carved table's standalone opening: a preprocessed table's layout —
+    // the row pair then its own path at the carved height.
+    if let Some(c) = &shape.carved_main {
+        words += 2 * c.width + 2 * (shape.heights[c.table] - 1);
+    }
     for round in [&shape.main, &shape.aux, &shape.parts] {
         let Some(h_max) = round.h_max() else { continue };
         words += round.dims.iter().map(|&(_, w)| 2 * w).sum::<usize>();
@@ -424,6 +429,13 @@ pub(super) fn batched_opening_arena(e: &RealBatchedEpoch) -> Vec<LfmWord> {
             out.extend(p.evaluations_sym.iter().map(|v| base_word(*v)));
             out.extend(super::proof_arena::commitments_to_arena(
                 &p.proof.merkle_path,
+            ));
+        }
+        if let Some(o) = &q.carved_main {
+            out.extend(o.evaluations.iter().map(|v| base_word(*v)));
+            out.extend(o.evaluations_sym.iter().map(|v| base_word(*v)));
+            out.extend(super::proof_arena::commitments_to_arena(
+                &o.proof.merkle_path,
             ));
         }
         push_mixed_base(&mut out, &q.main);

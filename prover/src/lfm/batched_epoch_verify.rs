@@ -394,6 +394,14 @@ pub fn batched_query_permutations_for(
         per_query += h - 1;
     }
 
+    // The carved table's standalone main tree: exactly a preprocessed table's
+    // cost shape — one row-pair leaf and its own path at the carved height —
+    // with the root proof-carried instead of AIR-owned.
+    if let Some(c) = &shape.carved_main {
+        per_query += blocks_for(2 * c.width, hash);
+        per_query += shape.heights[c.table] - 1;
+    }
+
     for (round, ext) in [
         (&shape.main, false),
         (&shape.aux, true),
