@@ -913,3 +913,306 @@ fn the_preprocessed_round_is_never_taller_than_the_fri() {
         );
     }
 }
+
+// ===========================================================================
+// The carved main matrix (the L2G carve-out's stark layer)
+// ===========================================================================
+mod carved {
+    use super::{Air, E, F, folding_options, traces};
+    use crate::batched::proof::BatchedMultiProof;
+    use crate::batched::prover::multi_prove_batched_carved;
+    use crate::batched::verifier::{
+        multi_verify_batched, multi_verify_batched_carved, replay_epoch_transcript_carved,
+    };
+    use crate::config::DefaultStarkHash;
+    use crate::prover::{GenericProver, IsStarkProver};
+    use crate::residency_mode::ResidencyMode;
+    use crate::traits::AIR;
+    use crate::verifier::GenericVerifier;
+    use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+    use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
+    use math::field::element::FieldElement;
+
+    type P = GenericProver<F, E, (), DefaultStarkHash>;
+    type V = GenericVerifier<F, E, (), DefaultStarkHash>;
+    type Proof = BatchedMultiProof<F, E, ()>;
+
+    /// The carved table of every test here: ADD (index 1), 4 rows — SHORTER
+    /// than the 8-row CPU, so `h_carved < h_max` and the index reduction on the
+    /// carved tree is exercised for real, never as the identity.
+    const CARVED: usize = 1;
+
+    fn airs() -> Vec<Air> {
+        let options = folding_options();
+        vec![
+            super::new_cpu_air_with_lookup(&options),
+            super::new_add_air_with_lookup(&options),
+            super::new_mul_air_with_lookup(&options),
+        ]
+    }
+
+    fn refs(airs: &[Air]) -> Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> {
+        airs.iter()
+            .map(|a| a as &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>)
+            .collect()
+    }
+
+    fn prove_carved() -> (Vec<Air>, Proof) {
+        let (mut cpu, mut add, mut mul) = traces();
+        let airs = airs();
+        let unit = ();
+        let pairs: Vec<_> = airs
+            .iter()
+            .zip([&mut cpu, &mut add, &mut mul])
+            .map(|(air, trace)| {
+                (
+                    air as &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+                    trace,
+                    &unit,
+                )
+            })
+            .collect();
+        let (proof, _) = multi_prove_batched_carved::<F, E, (), DefaultStarkHash, P>(
+            pairs,
+            &mut DefaultTranscript::<E>::new(&[]),
+            #[cfg(feature = "disk-spill")]
+            crate::storage_mode::StorageMode::Ram,
+            ResidencyMode::Retain,
+            Some(CARVED),
+        )
+        .expect("the carved fixture is a well-shaped epoch");
+        (airs, proof)
+    }
+
+    fn verifies_carved(airs: &[Air], proof: &Proof, carved: Option<usize>) -> bool {
+        multi_verify_batched_carved::<F, E, (), DefaultStarkHash, V, _>(
+            &refs(airs),
+            proof,
+            &mut DefaultTranscript::<E>::new(&[]),
+            &FieldElement::zero(),
+            carved,
+        )
+    }
+
+    /// ★★ Completeness: a carved epoch round-trips end to end — replay with the
+    /// proof-carried root in its slot, carved-opening authentication at the
+    /// reduced index, the carved row pair feeding the DEEP/FRI join.
+    #[test_log::test]
+    fn an_honest_carved_epoch_verifies_end_to_end() {
+        let (airs, proof) = prove_carved();
+        assert!(proof.carved_main_root.is_some(), "the carve produced a root");
+        assert!(
+            proof.queries.iter().all(|q| q.carved_main.is_some()),
+            "every query carries a carved opening"
+        );
+        assert!(verifies_carved(&airs, &proof, Some(CARVED)));
+    }
+
+    /// ★★ The differential gate — the property the L2G binding rests on: the
+    /// carved root is BYTE-IDENTICAL to the root the PER-TABLE prover commits
+    /// for the same table. (Main commitments precede every challenge, so the
+    /// two paths' different transcripts cannot make the roots differ; equality
+    /// here means the tree — blowup, leaf layout, row-pair order, hash — is
+    /// the same tree.)
+    #[test_log::test]
+    fn the_carved_root_is_byte_identical_to_the_per_table_tree() {
+        let (_, batched_proof) = prove_carved();
+
+        let (mut cpu, mut add, mut mul) = traces();
+        let airs = airs();
+        let unit = ();
+        let pairs: Vec<_> = airs
+            .iter()
+            .zip([&mut cpu, &mut add, &mut mul])
+            .map(|(air, trace)| {
+                (
+                    air as &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+                    trace,
+                    &unit,
+                )
+            })
+            .collect();
+        let per_table = P::multi_prove(
+            pairs,
+            &mut DefaultTranscript::<E>::new(&[]),
+            #[cfg(feature = "disk-spill")]
+            crate::storage_mode::StorageMode::Ram,
+            ResidencyMode::Retain,
+        )
+        .expect("the fixture proves per-table");
+
+        let carved_root = batched_proof
+            .carved_main_root
+            .expect("the carve produced a root");
+        assert_eq!(
+            per_table.proofs[CARVED].lde_trace_main_merkle_root, carved_root,
+            "the carved tree must be the per-table tree, byte for byte"
+        );
+        // Sanity that the equality is discriminating, not vacuous: the OTHER
+        // tables' per-table roots are different trees.
+        assert_ne!(per_table.proofs[0].lde_trace_main_merkle_root, carved_root);
+        assert_ne!(per_table.proofs[2].lde_trace_main_merkle_root, carved_root);
+    }
+
+    /// Tamper arm 1: one flipped byte of the proof-carried root is rejected.
+    #[test_log::test]
+    fn a_tampered_carved_root_is_rejected() {
+        let (airs, proof) = prove_carved();
+        let mut tampered = proof.clone();
+        tampered
+            .carved_main_root
+            .as_mut()
+            .expect("the carve produced a root")[0] ^= 1;
+        assert!(!verifies_carved(&airs, &tampered, Some(CARVED)));
+    }
+
+    /// Tamper arm 2: one flipped element of an opened carved row is rejected.
+    #[test_log::test]
+    fn a_tampered_carved_opening_is_rejected() {
+        let (airs, proof) = prove_carved();
+        let mut tampered = proof.clone();
+        let o = tampered.queries[0]
+            .carved_main
+            .as_mut()
+            .expect("every query carries a carved opening");
+        o.evaluations[0] += FieldElement::<F>::one();
+        assert!(!verifies_carved(&airs, &tampered, Some(CARVED)));
+    }
+
+    /// The carve state is verifier-owned configuration: a carved proof checked
+    /// as uncarved is rejected, and an uncarved proof checked as carved is
+    /// rejected — in BOTH directions at the replay, before any challenge is
+    /// trusted.
+    #[test_log::test]
+    fn the_carve_state_must_match_the_verifiers_configuration() {
+        let (airs, carved_proof) = prove_carved();
+        assert!(
+            !multi_verify_batched::<F, E, (), DefaultStarkHash, V, _>(
+                &refs(&airs),
+                &carved_proof,
+                &mut DefaultTranscript::<E>::new(&[]),
+                &FieldElement::zero(),
+            ),
+            "a carved proof must not pass an uncarved verifier"
+        );
+
+        let (uncarved_airs, uncarved_proof, _, _) = super::prove_repeated(
+            1,
+            &folding_options(),
+            ResidencyMode::Retain,
+        );
+        assert!(
+            !verifies_carved(&uncarved_airs, &uncarved_proof, Some(CARVED)),
+            "an uncarved proof must not pass a carved verifier"
+        );
+    }
+
+    /// The absorb-before-draw pin: the first challenge drawn after the roots
+    /// depends on the carved root's SLOT. Replaying the prefix with the carved
+    /// root moved after `main_root` produces a different challenge — the
+    /// transcript-ordering fact the whole carve rests on, demonstrated on the
+    /// transcript itself rather than asserted.
+    #[test_log::test]
+    fn the_carved_absorb_slot_is_load_bearing() {
+        let (airs, proof) = prove_carved();
+        let refs = refs(&airs);
+        let trace_lengths: Vec<usize> = proof.tables.iter().map(|t| t.trace_length).collect();
+        let (shape, _) =
+            crate::batched::shape::EpochShape::derive_carved(&refs, &trace_lengths, Some(CARVED))
+                .expect("the fixture derives");
+        let carved_root = proof.carved_main_root.expect("the carve produced a root");
+
+        // A fresh transcript, the histogram, the two roots in the given order,
+        // one draw. Generic over the transcript so the trait's methods resolve
+        // with both field parameters fixed.
+        fn draw_after<T: IsStarkTranscript<E, F>>(
+            transcript: &mut T,
+            heights: &[usize],
+            widths: &[usize],
+            first: &crate::config::Commitment,
+            second: &crate::config::Commitment,
+        ) -> FieldElement<E> {
+            crate::fri::batched::absorb_shape_histogram::<E, T>(transcript, heights, widths);
+            transcript.append_bytes(first);
+            transcript.append_bytes(second);
+            transcript.sample_field_element()
+        }
+
+        let challenge_in_order = draw_after(
+            &mut DefaultTranscript::<E>::new(&[]),
+            &shape.heights,
+            &shape.total_widths(),
+            &carved_root,
+            &proof.main_root,
+        );
+        let challenge_swapped = draw_after(
+            &mut DefaultTranscript::<E>::new(&[]),
+            &shape.heights,
+            &shape.total_widths(),
+            &proof.main_root,
+            &carved_root,
+        );
+
+        assert_ne!(
+            challenge_in_order, challenge_swapped,
+            "moving the carved absorb after main_root must move every draw"
+        );
+    }
+
+    /// ★ The index-reduction CONVENTION pin, against independently computed
+    /// values: the carved opening at every query is the row pair
+    /// `(br(2·leaf), br(2·leaf + 1))` of the carved table's OWN main LDE at
+    /// `leaf = reduce(iota)` — recomputed here from the trace with none of the
+    /// verifier's shared reduction code in the loop. A self-consistent wrong
+    /// shift on both sides would authenticate and verify; THIS is the check
+    /// that fails it.
+    #[test_log::test]
+    fn the_carved_opening_is_the_reduced_leafs_row_pair() {
+        let (airs, proof) = prove_carved();
+        let refs = refs(&airs);
+        let (shape, _, challenges) = replay_epoch_transcript_carved(
+            &refs,
+            &proof,
+            &mut DefaultTranscript::<E>::new(&[]),
+            Some(CARVED),
+        )
+        .expect("an honest carved proof replays");
+
+        // The carved table's main LDE, expanded independently.
+        let (_, add, _) = traces();
+        let carved_air: &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()> = &airs[CARVED];
+        let (domain, twiddles) = crate::prover::domain_and_twiddles(carved_air, add.num_rows());
+        let (lde, cols) = P::expand_main_lde_row_major(
+            &add,
+            &domain,
+            &twiddles,
+            #[cfg(feature = "disk-spill")]
+            crate::storage_mode::StorageMode::Ram,
+        );
+
+        let h_max = shape.h_max();
+        let h_carved = shape.heights[CARVED];
+        let lde_len = 1u64 << h_carved;
+        for (q, &iota) in challenges.fri.iotas.iter().enumerate() {
+            // The convention, written out literally: drop the low bits the
+            // taller domain has and the carved one does not.
+            let leaf = iota >> (h_max - h_carved);
+            let row = math::fft::bit_reversing::reverse_index(leaf * 2, lde_len);
+            let row_sym = math::fft::bit_reversing::reverse_index(leaf * 2 + 1, lde_len);
+            let opening = proof.queries[q]
+                .carved_main
+                .as_ref()
+                .expect("every query carries a carved opening");
+            assert_eq!(
+                opening.evaluations,
+                lde[row * cols..(row + 1) * cols].to_vec(),
+                "query {q}: the opened row must be the reduced leaf's row"
+            );
+            assert_eq!(
+                opening.evaluations_sym,
+                lde[row_sym * cols..(row_sym + 1) * cols].to_vec(),
+                "query {q}: the symmetric row must be the reduced leaf's pair"
+            );
+        }
+    }
+}

@@ -127,10 +127,54 @@ struct LdePair<Field: IsField, FieldExtension: IsField> {
 /// raises.
 #[allow(clippy::too_many_arguments)]
 pub fn multi_prove_batched<Field, FieldExtension, PI, H, P>(
+    air_trace_pairs: Vec<BatchedAirTracePair<'_, Field, FieldExtension, PI>>,
+    transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone + Send),
+    #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
+    residency: ResidencyMode,
+) -> Result<
+    (
+        BatchedMultiProof<Field, FieldExtension, PI>,
+        BatchedProveStats,
+    ),
+    ProvingError,
+>
+where
+    Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync + Copy + 'static,
+    FieldExtension: IsField + Send + Sync + Copy + 'static,
+    FieldElement<Field>: AsBytes + math::traits::ByteConversion + Sync + Send,
+    FieldElement<FieldExtension>: AsBytes + math::traits::ByteConversion + Sync + Send,
+    PI: Send + Sync + Clone,
+    H: StarkHash,
+    P: IsStarkProver<Field, FieldExtension, PI, H> + ?Sized,
+    <Field as IsField>::BaseType: math::spill_safe::SpillSafe,
+    <FieldExtension as IsField>::BaseType: math::spill_safe::SpillSafe,
+{
+    multi_prove_batched_carved::<Field, FieldExtension, PI, H, P>(
+        air_trace_pairs,
+        transcript,
+        #[cfg(feature = "disk-spill")]
+        storage_mode,
+        residency,
+        None,
+    )
+}
+
+/// As [`multi_prove_batched`], with one table's main matrix carved into a
+/// standalone row-pair tree ([`crate::batched::shape::CarvedMain`]).
+///
+/// The carved tree is built by `commit_rows_bit_reversed_subset` over the FULL
+/// committed-main range of the same LDE expansion — the identical call the
+/// per-table prover makes for a non-preprocessed table — so the carved root is
+/// byte-identical to the root a per-table prove of the same trace commits.
+/// The root is absorbed after the preprocessed roots and before `main_root`,
+/// ahead of every challenge draw.
+#[allow(clippy::too_many_arguments)]
+pub fn multi_prove_batched_carved<Field, FieldExtension, PI, H, P>(
     mut air_trace_pairs: Vec<BatchedAirTracePair<'_, Field, FieldExtension, PI>>,
     transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone + Send),
     #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
     residency: ResidencyMode,
+    carved_main: Option<usize>,
 ) -> Result<
     (
         BatchedMultiProof<Field, FieldExtension, PI>,
@@ -176,7 +220,7 @@ where
         .iter()
         .map(|d| d.interpolation_domain_size)
         .collect();
-    let (shape, params) = EpochShape::derive(&airs, &trace_lengths)?;
+    let (shape, params) = EpochShape::derive_carved(&airs, &trace_lengths, carved_main)?;
     let h_max = shape.h_max();
     let coset_offset = FieldElement::<Field>::from(params.coset_offset);
 
@@ -212,6 +256,12 @@ where
     let mut main_builder = StreamingMmcsBuilder::<Field, H>::new(&shape.main.dims);
     let mut retained_main: Vec<Option<(Vec<FieldElement<Field>>, usize)>> =
         (0..num_tables).map(|_| None).collect();
+    // The carved table's standalone main tree and its root. Built inside the
+    // phase-1 loop from the same expansion every other table commits from; the
+    // root is absorbed AFTER the loop (after every preprocessed root) and
+    // before `main_root`.
+    let mut carved_tree: Option<MerkleTree<H::Batched<Field>>> = None;
+    let mut carved_root: Option<crate::config::Commitment> = None;
 
     for table in 0..num_tables {
         let (air, trace, _) = &air_trace_pairs[table];
@@ -227,7 +277,14 @@ where
         ledger.alloc(bytes);
 
         let height = shape.heights[table];
-        let num_precomputed = total_cols - matrix_width(&shape.main, table);
+        let is_carved = shape.carved_main.map(|c| c.table) == Some(table);
+        let num_precomputed = if is_carved {
+            // `derive_carved` rejects a preprocessed carved table, so the
+            // carved matrix is the full main range.
+            0
+        } else {
+            total_cols - matrix_width(&shape.main, table)
+        };
 
         if num_precomputed > 0 {
             // The root every verifier will absorb is the AIR's own; building a
@@ -259,14 +316,34 @@ where
             transcript.append_bytes(&expected);
             prep_trees[table] = Some(tree);
         }
-        let src = vec![BorrowedMatrix::RowMajorNatural {
-            data: &main_data,
-            stride: total_cols,
-            col_start: num_precomputed,
-            width: total_cols - num_precomputed,
-            log_height: height,
-        }];
-        main_builder.absorb(&src, 0);
+        if is_carved {
+            // The carve: the identical committer call the per-table prover
+            // makes for a non-preprocessed table (`commit_rows_bit_reversed` =
+            // the subset call over the full range), on the identical
+            // expansion — the root is byte-identical to the per-table tree's.
+            let (tree, root) = P::commit_rows_bit_reversed_subset::<Field>(
+                &main_data,
+                total_cols,
+                0,
+                total_cols,
+            )
+            .ok_or_else(|| {
+                ProvingError::WrongParameter(
+                    "the carved table's main matrix has no committable rows".to_string(),
+                )
+            })?;
+            carved_tree = Some(tree);
+            carved_root = Some(root);
+        } else {
+            let src = vec![BorrowedMatrix::RowMajorNatural {
+                data: &main_data,
+                stride: total_cols,
+                col_start: num_precomputed,
+                width: total_cols - num_precomputed,
+                log_height: height,
+            }];
+            main_builder.absorb(&src, 0);
+        }
 
         // The root is what Fiat-Shamir needs; the buffer is not. Under
         // `RecomputeLde` it dies here and every later phase rebuilds it.
@@ -277,6 +354,14 @@ where
                 ledger.free(bytes);
             }
         }
+    }
+
+    // The carved root's transcript slot: after every preprocessed root, before
+    // `main_root` — so every challenge (LogUp, beta, z, gamma, alpha, iotas) is
+    // drawn after it. Proof-carried on the verifier's side, absorbed here from
+    // the tree just built.
+    if let Some(root) = carved_root.as_ref() {
+        transcript.append_bytes(root);
     }
 
     let main_mmcs = main_builder.finish();
@@ -687,6 +772,8 @@ where
     let mut main_openings = empty_openings::<Field>(&iotas, shape.main.tables.len());
     let mut aux_openings = empty_openings::<FieldExtension>(&iotas, shape.aux.tables.len());
     let mut parts_openings = empty_openings::<FieldExtension>(&iotas, shape.parts.tables.len());
+    let mut carved_openings: Vec<Option<crate::proof::stark::PolynomialOpenings<Field>>> =
+        (0..iotas.len()).map(|_| None).collect();
 
     // ★ Each round is read in ITS OWN index space, and the reduction happens
     // exactly once, here. Doing it inside the read would be wrong twice over: a
@@ -719,7 +806,26 @@ where
         let _ = air;
         let height = shape.heights[table];
         let (main_data, total_cols) = &ldes.main;
-        let num_precomputed = total_cols - matrix_width(&shape.main, table);
+        let is_carved = shape.carved_main.map(|c| c.table) == Some(table);
+        let num_precomputed = if is_carved {
+            0
+        } else {
+            total_cols - matrix_width(&shape.main, table)
+        };
+
+        if is_carved {
+            let tree = carved_tree
+                .as_ref()
+                .expect("the carved tree was built in phase 1");
+            // The carved tree lives in the TABLE's own index space, exactly
+            // like a preprocessed tree: reduce the shared FRI index once.
+            let table_iotas = reduced_iotas(&iotas, h_max, height);
+            for (q, &idx) in table_iotas.iter().enumerate() {
+                carved_openings[q] = Some(P::open_polys_with(&domains[table], tree, idx, |row| {
+                    main_data[row * total_cols..(row + 1) * total_cols].to_vec()
+                }));
+            }
+        }
 
         if let Some(tree) = prep_trees[table].as_ref() {
             // The per-table tree lives in the TABLE's own index space; reduce
@@ -783,6 +889,7 @@ where
             }),
             parts: assemble(&parts_mmcs, parts_iotas[q], &mut parts_openings, q)
                 .expect("the parts round was opened at these very indices"),
+            carved_main: carved_openings[q].take(),
             fri: fri_decommitments[q].clone(),
         })
         .collect();
@@ -813,6 +920,7 @@ where
         BatchedMultiProof {
             tables,
             main_root,
+            carved_main_root: carved_root,
             aux_root,
             parts_root,
             fri_layer_roots: commit.layer_roots,

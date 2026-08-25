@@ -93,11 +93,33 @@ where
     FieldExtension: IsField + Send + Sync + 'static,
     T: IsStarkTranscript<FieldExtension, Field>,
 {
+    replay_epoch_transcript_carved(airs, proof, transcript, None)
+}
+
+/// As [`replay_epoch_transcript`], for an epoch with a carved main matrix
+/// ([`crate::batched::shape::CarvedMain`]).
+///
+/// `carved_main` is VERIFIER-OWNED configuration, like the AIR set — never
+/// read from the proof. The carved root itself IS proof-carried: it is
+/// absorbed from `proof.carved_main_root` after the preprocessed roots and
+/// before `main_root`, so every challenge is drawn after it. A proof whose
+/// carve state disagrees with the configuration is rejected.
+pub fn replay_epoch_transcript_carved<Field, FieldExtension, PI, T>(
+    airs: &[&dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>],
+    proof: &BatchedMultiProof<Field, FieldExtension, PI>,
+    transcript: &mut T,
+    carved_main: Option<usize>,
+) -> Option<(EpochShape, EpochFriParams, EpochChallenges<FieldExtension>)>
+where
+    Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync + 'static,
+    FieldExtension: IsField + Send + Sync + 'static,
+    T: IsStarkTranscript<FieldExtension, Field>,
+{
     if airs.len() != proof.tables.len() || airs.is_empty() {
         return None;
     }
     let trace_lengths: Vec<usize> = proof.tables.iter().map(|t| t.trace_length).collect();
-    let (shape, params) = EpochShape::derive(airs, &trace_lengths).ok()?;
+    let (shape, params) = EpochShape::derive_carved(airs, &trace_lengths, carved_main).ok()?;
 
     // Recommendation S: the shape is bound before the first root, so every
     // challenge below — not only round 4's — is drawn after the epoch has
@@ -113,6 +135,16 @@ where
             transcript.append_bytes(&air.precomputed_commitment());
         }
     }
+
+    // The carved root, PROOF-CARRIED, in its pinned slot: after every
+    // preprocessed root, before `main_root`. Presence must match the
+    // verifier-owned carve configuration exactly.
+    match (&shape.carved_main, proof.carved_main_root.as_ref()) {
+        (Some(_), Some(root)) => transcript.append_bytes(root),
+        (None, None) => {}
+        _ => return None,
+    }
+
     transcript.append_bytes(&proof.main_root);
 
     let needs_lookup = airs.iter().any(|air| air.has_aux_trace());
@@ -372,6 +404,44 @@ where
                 return false;
             }
         }
+        // ★ The carved table's standalone main opening: authenticated against
+        // the PROOF-CARRIED root (`carved_main_root`) at the reduced index,
+        // exactly the mechanics of a preprocessed opening with the root's
+        // provenance moved from the AIR set to the proof — the transcript slot
+        // (before every challenge) is what binds it. Present iff the epoch is
+        // carved; a stray or missing opening is a rejection.
+        match (
+            &shape.carved_main,
+            proof.carved_main_root.as_ref(),
+            opening.carved_main.as_ref(),
+        ) {
+            (Some(c), Some(root), Some(o)) => {
+                let Some(&height) = shape.heights.get(c.table) else {
+                    return false;
+                };
+                let Some(leaf) = reduce_iota_to_round(iota, h_max, height) else {
+                    return false;
+                };
+                if o.evaluations.len() != c.width || o.evaluations_sym.len() != c.width {
+                    return false;
+                }
+                let leaf_hash = <H::Batched<Field> as crypto::merkle_tree::traits::IsStreamingLeafBackend<Field>>::hash_data_from_slices(
+                    &o.evaluations,
+                    &o.evaluations_sym,
+                );
+                if !crypto::merkle_tree::proof::verify_merkle_path_from_leaf_hash::<H::Batched<Field>>(
+                    &o.proof.merkle_path,
+                    root,
+                    leaf,
+                    leaf_hash,
+                ) {
+                    return false;
+                }
+            }
+            (None, None, None) => {}
+            _ => return false,
+        }
+
         match (proof.aux_root.as_ref(), opening.aux.as_ref()) {
             (Some(root), Some(o)) => {
                 if !round_authenticates::<FieldExtension, H>(root, o, &shape.aux, iota, h_max) {
@@ -707,7 +777,15 @@ where
     let primitive_root = Field::get_primitive_root_of_unity(domain.root_order as u64).ok()?;
 
     let prep_matrix = shape.prep.tables.iter().position(|&t| t == table);
-    let main_matrix = shape.main.tables.iter().position(|&t| t == table)?;
+    // A carved table has no main-round matrix: its main row pair comes from the
+    // standalone carved opening instead (authenticated against the
+    // proof-carried root by `verify_epoch_commitments`).
+    let is_carved = shape.carved_main.map(|c| c.table) == Some(table);
+    let main_matrix = if is_carved {
+        None
+    } else {
+        Some(shape.main.tables.iter().position(|&t| t == table)?)
+    };
     let aux_matrix = shape.aux.tables.iter().position(|&t| t == table);
     let parts_matrix = shape.parts.tables.iter().position(|&t| t == table)?;
 
@@ -734,7 +812,16 @@ where
             }
             None => (empty_base, empty_base),
         };
-        let main = opening.main.per_matrix.get(main_matrix)?;
+        let (main_evals, main_evals_sym) = match main_matrix {
+            Some(m) => {
+                let o = opening.main.per_matrix.get(m)?;
+                (o.evaluations.as_slice(), o.evaluations_sym.as_slice())
+            }
+            None => {
+                let o = opening.carved_main.as_ref()?;
+                (o.evaluations.as_slice(), o.evaluations_sym.as_slice())
+            }
+        };
         let (aux, aux_sym) = match aux_matrix {
             Some(m) => {
                 let o = opening.aux.as_ref()?.per_matrix.get(m)?;
@@ -753,11 +840,11 @@ where
             ood_layout.next_row_cols(),
             step_size,
             prep,
-            &main.evaluations,
+            main_evals,
             aux,
             &parts.evaluations,
             prep_sym,
-            &main.evaluations_sym,
+            main_evals_sym,
             aux_sym,
             &parts.evaluations_sym,
         )?;
@@ -926,7 +1013,47 @@ where
     V: crate::verifier::IsStarkVerifier<Field, FieldExtension, PI, H> + ?Sized,
     T: IsStarkTranscript<FieldExtension, Field>,
 {
-    let Some((shape, params, challenges)) = replay_epoch_transcript(airs, proof, transcript) else {
+    multi_verify_batched_carved::<Field, FieldExtension, PI, H, V, T>(
+        airs,
+        proof,
+        transcript,
+        expected_bus_balance,
+        None,
+    )
+}
+
+/// As [`multi_verify_batched`], for an epoch with a carved main matrix.
+///
+/// `carved_main` is verifier-owned configuration (which table, if any, commits
+/// its main matrix standalone) — the same value the prover was called with,
+/// supplied by the CALLER, never read from the proof. Everything else about
+/// the carve is checked: the proof-carried root's transcript slot
+/// ([`replay_epoch_transcript_carved`]), the per-query opening's
+/// authentication and width ([`verify_epoch_commitments`]), and the opened
+/// row pair's participation in the DEEP/FRI join ([`verify_epoch_fri`]).
+pub fn multi_verify_batched_carved<Field, FieldExtension, PI, H, V, T>(
+    airs: &[&dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>],
+    proof: &BatchedMultiProof<Field, FieldExtension, PI>,
+    transcript: &mut T,
+    expected_bus_balance: &FieldElement<FieldExtension>,
+    carved_main: Option<usize>,
+) -> bool
+where
+    Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync + 'static,
+    FieldExtension: IsField + Send + Sync + 'static,
+    FieldElement<Field>: AsBytes + Sync + Send,
+    FieldElement<FieldExtension>: AsBytes + Sync + Send,
+    Field::BaseType: math::field::element::NativeArchived,
+    FieldExtension::BaseType: math::field::element::NativeArchived,
+    PI: rkyv::Archive + Clone,
+    <PI as rkyv::Archive>::Archived: rkyv::Deserialize<PI, crate::verifier::PiDeserializer>,
+    H: StarkHash,
+    V: crate::verifier::IsStarkVerifier<Field, FieldExtension, PI, H> + ?Sized,
+    T: IsStarkTranscript<FieldExtension, Field>,
+{
+    let Some((shape, params, challenges)) =
+        replay_epoch_transcript_carved(airs, proof, transcript, carved_main)
+    else {
         return false;
     };
     verify_epoch_commitments::<Field, FieldExtension, PI, H>(

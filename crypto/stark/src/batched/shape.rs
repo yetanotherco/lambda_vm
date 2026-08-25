@@ -88,6 +88,25 @@ impl RoundShape {
     }
 }
 
+/// The one table whose MAIN matrix is committed as its own standalone row-pair
+/// tree instead of contributing a matrix to the shared main round.
+///
+/// This is the L2G carve-out: a continuation epoch's LOCAL_TO_GLOBAL table
+/// keeps a per-table main commitment so the cross-epoch root-equality binding
+/// (`verify_l2g_commitment_binding_view`) reads the SAME root from a batched
+/// epoch as from a per-table one. The carved tree is built by the same
+/// committer the per-table prover uses (`commit_rows_bit_reversed_subset` over
+/// the full committed-main range), so the two roots are byte-identical for the
+/// same trace. The carved table's aux and composition-parts matrices stay in
+/// the shared rounds; only its main commitment moves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CarvedMain {
+    /// The carved table's index in the AIR set.
+    pub table: usize,
+    /// The carved matrix's width — the table's committed main columns.
+    pub width: usize,
+}
+
 /// The shape of every batched round in one epoch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EpochShape {
@@ -96,15 +115,19 @@ pub struct EpochShape {
     pub heights: Vec<usize>,
     /// Preprocessed columns. Empty when no table is preprocessed.
     pub prep: RoundShape,
-    /// Main trace columns — every table. For a preprocessed table this is the
-    /// MULTIPLICITY columns only, matching the per-table path's split
-    /// (`commit_main_trace`: `[0, num_precomputed)` is the preprocessed matrix,
-    /// `[num_precomputed, total)` the committed main one).
+    /// Main trace columns — every table except a carved one. For a
+    /// preprocessed table this is the MULTIPLICITY columns only, matching the
+    /// per-table path's split (`commit_main_trace`: `[0, num_precomputed)` is
+    /// the preprocessed matrix, `[num_precomputed, total)` the committed main
+    /// one).
     pub main: RoundShape,
     /// Auxiliary (RAP) columns. Empty when no table has a RAP.
     pub aux: RoundShape,
     /// Composition-polynomial parts — every table.
     pub parts: RoundShape,
+    /// The table (at most one) whose main matrix is committed standalone.
+    /// `None` for an ordinary epoch. See [`CarvedMain`].
+    pub carved_main: Option<CarvedMain>,
 }
 
 /// Why an epoch cannot be proved (or verified) with one batched instance.
@@ -124,6 +147,13 @@ pub enum ShapeError {
     /// per-table path has no such requirement, which is exactly why this is
     /// checked rather than assumed.
     MixedProofOptions { table: usize, field: &'static str },
+    /// The carved-main table index does not name a table of this epoch.
+    CarvedOutOfRange { table: usize },
+    /// A preprocessed table cannot be carved: its main-round matrix is the
+    /// multiplicity columns only, while the per-table root the carve must
+    /// reproduce commits the full main range. The one production carve (L2G)
+    /// has no preprocessed columns, so this is rejected rather than supported.
+    CarvedTablePreprocessed { table: usize },
 }
 
 impl core::fmt::Display for ShapeError {
@@ -141,6 +171,14 @@ impl core::fmt::Display for ShapeError {
                 f,
                 "table {table} disagrees with table 0 on `{field}`; one batched FRI \
                  instance needs one set of parameters"
+            ),
+            ShapeError::CarvedOutOfRange { table } => {
+                write!(f, "carved-main table {table} is not a table of this epoch")
+            }
+            ShapeError::CarvedTablePreprocessed { table } => write!(
+                f,
+                "carved-main table {table} is preprocessed; the carve commits the full \
+                 main range and cannot reproduce a preprocessed table's per-table root"
             ),
         }
     }
@@ -175,8 +213,36 @@ impl EpochShape {
             + 'static,
         E: math::field::traits::IsField + Send + Sync + 'static,
     {
+        Self::derive_carved(airs, trace_lengths, None)
+    }
+
+    /// As [`EpochShape::derive`], with one table's main matrix carved into a
+    /// standalone commitment ([`CarvedMain`]). Both sides pass the SAME
+    /// `carved_main`: it is verifier-owned configuration (like the AIR set),
+    /// never read from a proof.
+    pub fn derive_carved<F, E, PI>(
+        airs: &[&dyn AIR<Field = F, FieldExtension = E, PublicInputs = PI>],
+        trace_lengths: &[usize],
+        carved_main: Option<usize>,
+    ) -> Result<(Self, EpochFriParams), ShapeError>
+    where
+        F: math::field::traits::IsFFTField
+            + math::field::traits::IsSubFieldOf<E>
+            + Send
+            + Sync
+            + 'static,
+        E: math::field::traits::IsField + Send + Sync + 'static,
+    {
         if airs.is_empty() || airs.len() != trace_lengths.len() {
             return Err(ShapeError::Empty);
+        }
+        if let Some(c) = carved_main {
+            if c >= airs.len() {
+                return Err(ShapeError::CarvedOutOfRange { table: c });
+            }
+            if airs[c].is_preprocessed() {
+                return Err(ShapeError::CarvedTablePreprocessed { table: c });
+            }
         }
 
         let first = airs[0].options();
@@ -193,6 +259,7 @@ impl EpochShape {
         let mut main = RoundShape::default();
         let mut aux = RoundShape::default();
         let mut parts = RoundShape::default();
+        let mut carved = None;
 
         for (table, (air, &trace_length)) in airs.iter().zip(trace_lengths).enumerate() {
             let options = air.options();
@@ -250,8 +317,15 @@ impl EpochShape {
                 prep.tables.push(table);
                 prep.dims.push((h, num_precomputed));
             }
-            main.tables.push(table);
-            main.dims.push((h, committed_main));
+            if carved_main == Some(table) {
+                carved = Some(CarvedMain {
+                    table,
+                    width: committed_main,
+                });
+            } else {
+                main.tables.push(table);
+                main.dims.push((h, committed_main));
+            }
             if aux_cols > 0 && air.has_aux_trace() {
                 aux.tables.push(table);
                 aux.dims.push((h, aux_cols));
@@ -268,6 +342,7 @@ impl EpochShape {
                 main,
                 aux,
                 parts,
+                carved_main: carved,
             },
             params,
         ))
@@ -295,6 +370,11 @@ impl EpochShape {
             for (&table, (_, w)) in round.tables.iter().zip(round.dims.iter()) {
                 widths[table] += *w;
             }
+        }
+        // A carved main matrix is committed outside the shared rounds but is
+        // still committed width: the histogram binds it like any other.
+        if let Some(c) = &self.carved_main {
+            widths[c.table] += c.width;
         }
         widths
     }
