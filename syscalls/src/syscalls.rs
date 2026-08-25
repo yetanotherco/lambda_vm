@@ -4,11 +4,16 @@ use core::arch::asm;
 /// 8-byte-aligned wrapper for an ecall operand buffer.
 ///
 /// The accelerator tables read and write their operands as doublewords. On an 8-byte-aligned
-/// buffer those take the aligned memory path (`MEMW_A`, 29 columns + 1 range check); a bare
-/// `[u8; N]` on the stack is only 1-aligned, which forces every access onto the general path
-/// (49 + 8) and inflates the trace. Taking `&Align8<N>` in the ecall wrappers makes that a
-/// type-level guarantee rather than a comment a caller can miss — and missing it fails
+/// buffer those can take the aligned memory path (`MEMW_A`, 29 columns + 1 range check); a
+/// bare `[u8; N]` on the stack is only 1-aligned, which forces every access onto the general
+/// path (49 + 8) and inflates the trace. Taking `&Align8<N>` in the ecall wrappers puts the
+/// alignment in the type rather than in a comment a caller can miss — and missing it fails
 /// silently, as a bigger trace and nothing else.
+///
+/// Alignment is necessary, not sufficient: `MEMW_A` also requires all eight bytes of a
+/// doubleword to carry the same previous timestamp, which a buffer spanning regions last
+/// written at different times does not — an output aliasing an operand, say. Those accesses
+/// still fall back to the general path.
 #[repr(C, align(8))]
 pub struct Align8<const N: usize>(pub [u8; N]);
 

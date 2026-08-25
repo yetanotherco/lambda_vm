@@ -3917,6 +3917,24 @@ pub fn count_table_lengths(
                 .ok_or_else(|| Error::Execution("commit index exceeds u32 range".into()))?;
         }
 
+        if cpu_op.ecall_ecsm {
+            // Mirror `collect_ecsm_ops`: three register reads (a0/a1/a2), four `xG` and four
+            // `k` doubleword reads, and the twelve writes of the `[xR ‖ yR ‖ yG]` output all
+            // go through the memory argument. Replaying it here keeps memory/register state
+            // in sync with generation, exactly like commit/hint. The LT rows those accesses
+            // derive are added by the `lt_from_memw + memw_aligned_count` closing below.
+            let (ecsm_memw, _ecsm_op, _ecdas_ops) =
+                collect_ecsm_ops(&cpu_op, &mut memory_state, &mut register_state);
+            for memw_op in &ecsm_memw {
+                partition_memw(
+                    memw_op,
+                    &mut memw_by_width,
+                    &mut memw_aligned_count,
+                    &mut memw_register_count,
+                );
+            }
+        }
+
         if cpu_op.ecall_hint {
             // Mirror `collect_hint_ops`: three register reads (a0/a1/a2) and four
             // 8-byte output writes go through the memory argument, plus the three LT

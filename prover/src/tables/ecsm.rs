@@ -2,9 +2,10 @@
 //!
 //! One row per `ECALL(-11)`. It reads `xG` and `k` from memory, witnesses `yG` and proves
 //! `yG² ≡ xG³ + b mod p` (via two byte-limb convolution relations with quotients `q0,q1`
-//! and 64-entry carry arrays `c0,c1`), enforces `0 < k < N` and `xR < p`, writes `xR` back,
-//! serves the scalar bits directly via the `Bit` bus, and delegates the double-and-add to ECDAS
-//! over the `Ecdas`/`Bit` buses.
+//! and 64-entry carry arrays `c0,c1`), enforces `0 < k < N` and `xR, yR, yG < p`, writes the
+//! 96-byte output `[xR ‖ yR ‖ yG]` back (`yG` is echoed so the guest can tell which root of
+//! `xG` the chip witnessed), serves the scalar bits directly via the `Bit` bus, and delegates
+//! the double-and-add to ECDAS over the `Ecdas`/`Bit` buses.
 //!
 //! See `spec/src/ecsm.toml`. All multi-limb arithmetic uses 8-bit limbs; the witness is built
 //! by `ecsm::compute_witness`, which reproduces these exact recurrences.
@@ -501,7 +502,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     is_byte(cols::Q1, 33, &mut out); // q1[0..=32] (all 33 bytes)
     // xG and k are byte-checked at memory write time (store.rs AreBytes), not re-checked here.
 
-    // IS_HALF range checks on shifted carries, then k_sub_N / xR_sub_p.
+    // IS_HALF range checks on shifted carries, then xG_sub_p / k_sub_N / xR_sub_p, and
+    // (since the chip publishes them) yR_sub_p / yG_sub_p.
     let half_offset = |col: usize, off: i64| {
         BusValue::linear(vec![
             LinearTerm::Column {

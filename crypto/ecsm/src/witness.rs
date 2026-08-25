@@ -55,8 +55,9 @@ pub struct EcsmWitness {
     /// checks alone bound them by `2^256`, and the quotient columns absorb a multiple of `p`,
     /// so a witness could publish `y + p` for any `y < 2^256 - p` (~2^32) — and such points
     /// are constructible, since `3 | p-1` makes cubing 3-to-1, so a third of small `y` have a
-    /// curve `x`. `y + p` carries the opposite parity, which is exactly what the caller reads
-    /// to resolve the root.
+    /// curve `x`. Ruling it out is what makes the published bytes canonical, so a caller may
+    /// resolve the root by comparing them — or their parity, since `p` is odd and `y + p`
+    /// flips it.
     pub y_g_sub_p: [u8; 32],
     /// position of the most significant set bit of `k`
     pub len_k: u8,

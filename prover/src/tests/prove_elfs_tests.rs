@@ -1667,9 +1667,12 @@ fn test_prove_elfs_ecsm_forged_ecdas_mu_rejected() {
     );
 }
 
-/// Runs an ECSM asm guest and returns its ELF plus the minimal traces, the shape
-/// the three tests below share.
-fn ecsm_traces(program: &str) -> (Elf, Traces) {
+/// Runs an ECSM asm guest and returns its ELF, the minimal traces, and what the
+/// EXECUTOR committed — the shape the tests below share. The committed bytes come
+/// from the executor's own memory, not from `traces`, so a caller can check the two
+/// views agree: the prover rebuilds the ECSM output from its own replay, so a guest
+/// whose two images diverged would still produce a self-consistent, verifying proof.
+fn ecsm_traces(program: &str) -> (Elf, Traces, Vec<u8>) {
     let elf_bytes = crate::test_utils::asm_elf_bytes(program);
     let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
     let result = executor::vm::execution::Executor::new(&elf, vec![])
@@ -1678,7 +1681,7 @@ fn ecsm_traces(program: &str) -> (Elf, Traces) {
         .expect("Failed to run program");
     let traces =
         Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
-    (elf, traces)
+    (elf, traces, result.return_values.memory_values)
 }
 
 /// Where a memory table keeps the three cells these tests read. The general and
@@ -1758,7 +1761,7 @@ fn memory_rows_at_timestamp(traces: &Traces, timestamp: u64) -> Vec<(bool, usize
 fn test_prove_elfs_ecsm_forged_echoed_write_rejected() {
     let _ = env_logger::builder().is_test(true).try_init();
 
-    let (elf, mut traces) = ecsm_traces("test_ecsm");
+    let (elf, mut traces, _committed) = ecsm_traces("test_ecsm");
     let target = ecsm_timestamp(&traces) + 3;
 
     let rows = memory_rows_at_timestamp(&traces, target);
@@ -1785,14 +1788,42 @@ fn test_prove_elfs_ecsm_forged_echoed_write_rejected() {
 }
 
 /// The 96-byte output buffer is allowed to alias either input, which the design
-/// justifies by the read/write timestamp split. The executor covers that the
-/// bytes come out right; this covers that the TRACE of it verifies — the claim
-/// is about per-address chains staying monotone, and only a proof exercises them.
+/// justifies by the read/write timestamp split. This covers both halves of that
+/// claim: the ANSWER is still right when every operand byte gets overwritten, and
+/// the TRACE of it verifies — the per-address chains stay monotone, which only a
+/// proof exercises.
+///
+/// Checking the value is not redundant with the executor's own aliasing test. The
+/// prover rebuilds the ECSM output from its own memory replay rather than from the
+/// executor's image, so a load/store ordering regression on either side would leave
+/// both self-consistent and the proof would still verify; comparing the executor's
+/// committed bytes against the expected `x(5·G)`, and the prover's view against the
+/// executor's, is what ties the two together.
 #[test]
 fn test_prove_elfs_ecsm_output_aliases_inputs() {
     let _ = env_logger::builder().is_test(true).try_init();
 
-    let (elf, mut traces) = ecsm_traces("test_ecsm_alias");
+    let (elf, mut traces, committed) = ecsm_traces("test_ecsm_alias");
+
+    // The guest commits xR, which by then sits where xG used to be.
+    let mut gx = [
+        0x79u8, 0xBE, 0x66, 0x7E, 0xF9, 0xDC, 0xBB, 0xAC, 0x55, 0xA0, 0x62, 0x95, 0xCE, 0x87, 0x0B,
+        0x07, 0x02, 0x9B, 0xFC, 0xDB, 0x2D, 0xCE, 0x28, 0xD9, 0x59, 0xF2, 0x81, 0x5B, 0x16, 0xF8,
+        0x17, 0x98,
+    ];
+    gx.reverse();
+    let mut k = [0u8; 32];
+    k[0] = 5;
+    assert_eq!(
+        committed,
+        ecsm::scalar_mul_x(&k, &gx).unwrap(),
+        "an output aliasing both operands must still commit x(5·G)"
+    );
+    assert_eq!(
+        traces.public_output_bytes, committed,
+        "the prover's replay of an aliased ECSM must match the executor's memory image"
+    );
+
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
         "a proof of an ECSM call whose output aliases its inputs must verify"

@@ -325,11 +325,14 @@ fn ecsm_lincomb2(
 /// arrays so the executor's `|addr_x_le − addr_k_le| ≥ 32` assumption holds by construction.
 ///
 /// `None` on any coordinate that is not a canonical field element. The chip already range-
-/// checks all three to `< p` (`OverflowKind::XrLtP` / `YrLtP` / `YgLtP`), so this parse is a
-/// free second line rather than the guarantee: it is what the caller would otherwise have to
-/// rely on, since `p` is odd — `y` and `p − y` differ in parity, but `y + p`, a second 256-bit
-/// representative when `y < 2^256 − p ≈ 2^32`, carries the *opposite* parity, which is exactly
-/// what [`oracle_point`] reads to resolve the root.
+/// checks all three to `< p` (`OverflowKind::XrLtP` / `YrLtP` / `YgLtP`); this parse is the
+/// free second line, and together they make the ecall's output a canonical byte string.
+///
+/// That canonicity is an ABI guarantee, not something this caller leans on. `y + p` — a second
+/// 256-bit representative whenever `y < 2^256 − p ≈ 2^32` — agrees mod `p` but is a different
+/// byte string, and flips parity because `p` is odd, so a caller that resolved the root by
+/// comparing bytes or their parity would need it ruled out. [`oracle_point`] compares field
+/// elements instead, so it would be right either way.
 #[cfg(target_arch = "riscv64")]
 fn ecsm_oracle(x: &FieldElement, k: &Scalar) -> Option<(FieldElement, FieldElement, FieldElement)> {
     let x_be = x.to_bytes();
