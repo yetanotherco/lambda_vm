@@ -57,9 +57,9 @@
 //! The streaming rounds commit through [`RoundCommit`]: the host builder, or
 //! the device leaf hasher when a backend is up (`LAMBDA_VM_DISABLE_GPU_MMCS`
 //! switches it off; digest climbs stay host, so the transcript sees the host
-//! code path either way). On top of that, the MAIN round can produce a
-//! table's LDE directly on the device and absorb it in place
-//! (`LAMBDA_VM_DISABLE_GPU_RESIDENT_LDE` switches it off) — under `Retain`
+//! code path either way). On top of that, the MAIN and AUX rounds can
+//! produce a table's LDE directly on the device and absorb it in place
+//! (`LAMBDA_VM_DISABLE_GPU_RESIDENT_LDE` switches both off) — under `Retain`
 //! one download replaces the upload, under `RecomputeLde` no host copy of
 //! that LDE ever exists. Selection happens before the first absorb of a
 //! round; after selection a device failure aborts the prove rather than
@@ -642,6 +642,68 @@ where
         let Some(builder) = aux_builder.as_mut() else {
             continue;
         };
+
+        // The aux round's device-resident arm, the ext3 twin of the main
+        // round's: the aux columns (host-built above) upload once at size
+        // `n`, the ext3 LDE runs componentwise on the round's stream (three
+        // adjacent base columns per element, the same trick the ext3 tree
+        // path uses), and the resident buffer absorbs by device pointer.
+        // `Retain` downloads the one host copy the later phases read;
+        // `RecomputeLde` never materializes it.
+        #[cfg(feature = "cuda")]
+        {
+            let done = 'resident: {
+                if std::env::var_os("LAMBDA_VM_DISABLE_GPU_RESIDENT_LDE").is_some()
+                    || !matches!(builder, RoundCommit::Dev { .. })
+                    || super::gpu::lanes_per_element::<FieldExtension>() != Some(3)
+                {
+                    break 'resident false;
+                }
+                let n = domains[table].interpolation_domain_size;
+                if n < RESIDENT_MIN_ROWS {
+                    break 'resident false;
+                }
+                let height = shape.heights[table];
+                let (trace_data, aux_cols) = trace.aux_data_row_major();
+                if aux_cols == 0 {
+                    break 'resident false;
+                }
+                // SAFETY: three u64 lanes per element, established above.
+                let raw = unsafe { super::gpu::felts_as_lanes(trace_data, 3) };
+                let weights = unsafe {
+                    crate::gpu_lde::weights_to_u64::<Field>(&twiddles[table].coset_weights)
+                };
+                let RoundCommit::Dev { dev, .. } = builder else {
+                    break 'resident false;
+                };
+                let buf = math_cuda::lde::coset_lde_row_major_expand_on(
+                    dev.stream(),
+                    raw,
+                    n,
+                    aux_cols * 3,
+                    domains[table].blowup_factor,
+                    &weights,
+                )
+                .map_err(|e| ProvingError::WrongParameter(format!("GPU resident aux LDE: {e}")))?;
+                dev.absorb_row_major_dev(&buf, aux_cols * 3, 0, aux_cols * 3, height)
+                    .map_err(|e| ProvingError::WrongParameter(format!("GPU MMCS absorb: {e}")))?;
+                stats.aux_lde_expansions += 1;
+                if let ResidencyMode::Retain = residency {
+                    let raw_lde = dev.stream().clone_dtoh(&buf).map_err(|e| {
+                        ProvingError::WrongParameter(format!("GPU aux LDE download: {e}"))
+                    })?;
+                    let host = crate::gpu_lde::u64_to_ext3_vec::<FieldExtension>(&raw_lde);
+                    let bytes = lde_bytes::<FieldExtension>(host.len());
+                    ledger.alloc(bytes);
+                    retained_aux[table] = Some((host, aux_cols));
+                }
+                true
+            };
+            if done {
+                continue;
+            }
+        }
+
         let (aux_data, aux_cols) = P::expand_aux_lde_row_major(
             trace,
             &domains[table],
