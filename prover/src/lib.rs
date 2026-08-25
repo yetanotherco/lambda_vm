@@ -1046,10 +1046,10 @@ pub fn prove(elf_bytes: &[u8]) -> Result<VmProof, Error> {
 ///
 /// `hints` are untrusted 32-byte values appended to the private-input memory
 /// region's hint arena; the guest reads them with ordinary loads and must
-/// verify them in-circuit. When empty, the recording pass of the two-pass
-/// hint flow runs automatically (see [`resolve_hints`]), so hint-consuming
-/// guests get the cheap in-guest-verify trace without the caller supplying
-/// anything.
+/// verify them in-circuit. Passing an empty arena is the normal case: the
+/// executor answers each request as the guest makes it, in the single execution
+/// this call already performs, so a hint-consuming guest gets the cheap
+/// in-guest-verify trace without the caller supplying anything.
 pub fn prove_with_inputs(
     elf_bytes: &[u8],
     private_inputs: &[u8],
