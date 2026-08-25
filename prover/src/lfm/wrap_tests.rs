@@ -1603,6 +1603,16 @@ fn the_real_block_wrap_proves_in_the_batched_format() {
     let opts = wrap_options();
     let artifacts = build_artifacts(&program, &opts);
 
+    // With `LAMBDA_VM_WRAP_PROVE_TWICE` set the prove runs twice in-process:
+    // the first pays the preprocessed-tree cache misses, the second is the
+    // production shape (a block proves five wraps in one process) and the
+    // one a cache-gated device arm serves.
+    if std::env::var_os("LAMBDA_VM_WRAP_PROVE_TWICE").is_some() {
+        let t = Instant::now();
+        let _ = super::proof::lfm_prove_batched(&program, &artifacts, &arenas, &opts)
+            .expect("the batched-format wrap must prove (cold)");
+        println!("   cold prove {:.1}s", t.elapsed().as_secs_f64());
+    }
     let t = Instant::now();
     let proved = super::proof::lfm_prove_batched(&program, &artifacts, &arenas, &opts)
         .expect("the batched-format wrap must prove");

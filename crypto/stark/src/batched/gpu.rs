@@ -109,6 +109,34 @@ impl DeviceStreamingMmcs {
         })
     }
 
+    /// The stream this round's device work runs on. An LDE produced on it is
+    /// ordered before the absorbs that read it.
+    pub(crate) fn stream(&self) -> &Arc<CudaStream> {
+        &self.stream
+    }
+
+    /// [`Self::absorb_row_major`] for a matrix already resident on this
+    /// round's stream — no upload.
+    pub(crate) fn absorb_row_major_dev(
+        &mut self,
+        dev: &math_cuda::CudaSlice<u64>,
+        stride_lanes: usize,
+        col_start_lanes: usize,
+        col_end_lanes: usize,
+        log_height: usize,
+    ) -> math_cuda::Result<()> {
+        let hasher = self.groups[log_height]
+            .as_mut()
+            .expect("a matrix's height group exists by construction of the dims");
+        hasher.absorb_row_major(
+            &self.stream,
+            dev,
+            stride_lanes as u64,
+            col_start_lanes as u64,
+            col_end_lanes as u64,
+        )
+    }
+
     /// Absorb one natural-order row-major matrix: lanes `[col_start, col_end)`
     /// of bit-reversed rows `2k`, `2k+1` into leaf `k` of its height group.
     /// All positions in u64 LANES (an ext3 element is three consecutive lanes),

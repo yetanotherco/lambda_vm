@@ -521,6 +521,33 @@ fn expand_row_major_on_stream(
     Ok((buf, trace_col_major))
 }
 
+/// Row-major coset LDE, expansion only, on the CALLER's stream: upload the
+/// size-`n` row-major trace and return the `n·blowup × total_cols` row-major
+/// natural LDE resident on device. All work queues on `stream`, so a consumer
+/// on the same stream (a leaf hasher, a download) is ordered after it with no
+/// extra synchronization.
+pub fn coset_lde_row_major_expand_on(
+    stream: &Arc<CudaStream>,
+    trace_row_major: &[u64],
+    n: usize,
+    total_cols: usize,
+    blowup_factor: usize,
+    weights: &[u64],
+) -> Result<CudaSlice<u64>> {
+    let be = crate::device::backend()?;
+    let (buf, _) = expand_row_major_on_stream(
+        stream,
+        be,
+        InnerInput::Host(trace_row_major),
+        n,
+        total_cols,
+        blowup_factor,
+        weights,
+        false,
+    )?;
+    Ok(buf)
+}
+
 /// Shared row-major LDE + leaf-hash + Merkle pipeline for the base and ext3
 /// paths, committing with the kernel family `hash` selects.
 ///

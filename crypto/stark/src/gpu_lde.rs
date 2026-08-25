@@ -467,7 +467,7 @@ unsafe fn columns_to_u64_ext3<E: IsField>(columns: &[Vec<FieldElement<E>>]) -> V
 /// Convert weights to raw `Vec<u64>`.
 ///
 /// SAFETY: caller must have established `F == GoldilocksField`.
-unsafe fn weights_to_u64<F: IsField>(weights: &[FieldElement<F>]) -> Vec<u64> {
+pub(crate) unsafe fn weights_to_u64<F: IsField>(weights: &[FieldElement<F>]) -> Vec<u64> {
     weights
         .iter()
         .map(|w| unsafe { *(w.value() as *const _ as *const u64) })
@@ -2373,6 +2373,23 @@ where
     let root = handle.tree.as_ref()?.root;
     let tree = MerkleTree::<B>::from_root(root);
     Some((tree, handle, lde_out))
+}
+
+/// Convert base-field evals into a freshly allocated `Vec<FieldElement<F>>`.
+/// Caller must have established `F == GoldilocksField`.
+pub(crate) fn u64_to_base_vec<F>(raw: Vec<u64>) -> Vec<FieldElement<F>>
+where
+    F: IsField + 'static,
+{
+    assert_eq!(TypeId::of::<F>(), TypeId::of::<GoldilocksField>());
+    raw.into_iter()
+        .map(|v| {
+            let f = FieldElement::<GoldilocksField>::from_raw(v);
+            // SAFETY: TypeId-checked above. F == GoldilocksField, identical
+            // layout.
+            unsafe { transmute_copy::<FieldElement<GoldilocksField>, FieldElement<F>>(&f) }
+        })
+        .collect()
 }
 
 /// Convert ext3 evals (3*n u64s, interleaved) into a freshly allocated

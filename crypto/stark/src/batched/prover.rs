@@ -52,13 +52,18 @@
 //! prove. `parts_computations` stays at one per table, and the counter is there
 //! so that stops being silent if it ever changes.
 //!
-//! # What is deliberately absent
+//! # Device arms
 //!
-//! No device paths. The GPU mixed-height MMCS exists (`crypto/math-cuda/`) and
-//! is box-gated; wiring it in is a separate step, and a batched prover that
-//! silently fell back between host and device arms would make the residency
-//! numbers above unreproducible. Under `--features cuda` this path compiles and
-//! runs on the host.
+//! The streaming rounds commit through [`RoundCommit`]: the host builder, or
+//! the device leaf hasher when a backend is up (`LAMBDA_VM_DISABLE_GPU_MMCS`
+//! switches it off; digest climbs stay host, so the transcript sees the host
+//! code path either way). On top of that, the MAIN round can produce a
+//! table's LDE directly on the device and absorb it in place
+//! (`LAMBDA_VM_DISABLE_GPU_RESIDENT_LDE` switches it off) — under `Retain`
+//! one download replaces the upload, under `RecomputeLde` no host copy of
+//! that LDE ever exists. Selection happens before the first absorb of a
+//! round; after selection a device failure aborts the prove rather than
+//! risking a mixed commitment.
 
 use math::fft::bit_reversing::in_place_bit_reverse_permute_row_major;
 use math::field::element::FieldElement;
@@ -100,6 +105,11 @@ pub type BatchedAirTracePair<'a, Field, FieldExtension, PI> = (
     &'a mut TraceTable<Field, FieldExtension>,
     &'a PI,
 );
+
+/// The device-resident arm is not worth its launch overhead below this trace
+/// height; tiny tables expand on host in microseconds anyway.
+#[cfg(feature = "cuda")]
+const RESIDENT_MIN_ROWS: usize = 1 << 10;
 
 /// A retention slot for one table's main LDE: `Some` while the buffer is being
 /// held between phases, `None` while it is out on loan or was dropped.
@@ -354,6 +364,83 @@ where
 
     for table in 0..num_tables {
         let (air, trace, _) = &air_trace_pairs[table];
+
+        // The device-resident arm: the table's LDE is born on the round's
+        // stream and absorbed in place — the size-`n` trace is the only
+        // upload, `blowup`× smaller than the LDE the host arm ships. Under
+        // `Retain` one download materializes the host copy the later phases
+        // read; under `RecomputeLde` no host copy ever exists. A table whose
+        // preprocessed tree is not yet cached takes the host arm (the fresh
+        // subset commit reads host bytes), as does anything tiny, non-base,
+        // host-committed, or switched off via
+        // `LAMBDA_VM_DISABLE_GPU_RESIDENT_LDE`. A device error after
+        // selection aborts the prove — no mid-round fallback.
+        #[cfg(feature = "cuda")]
+        {
+            let done = 'resident: {
+                if std::env::var_os("LAMBDA_VM_DISABLE_GPU_RESIDENT_LDE").is_some()
+                    || !matches!(main_builder, RoundCommit::Dev { .. })
+                    || super::gpu::lanes_per_element::<Field>() != Some(1)
+                {
+                    break 'resident false;
+                }
+                let n = domains[table].interpolation_domain_size;
+                if n < RESIDENT_MIN_ROWS {
+                    break 'resident false;
+                }
+                let height = shape.heights[table];
+                let (trace_data, total_cols) = trace.main_data_row_major();
+                let num_precomputed = total_cols - matrix_width(&shape.main, table);
+                let prep = if num_precomputed > 0 {
+                    let expected = air.precomputed_commitment();
+                    match crate::prover::precomputed_tree_cache_get::<H::Batched<Field>>(&expected)
+                    {
+                        Some(tree) => Some((expected, tree)),
+                        None => break 'resident false,
+                    }
+                } else {
+                    None
+                };
+                // SAFETY: one u64 lane per element, established above.
+                let raw = unsafe { super::gpu::felts_as_lanes(trace_data, 1) };
+                let weights = unsafe {
+                    crate::gpu_lde::weights_to_u64::<Field>(&twiddles[table].coset_weights)
+                };
+                let RoundCommit::Dev { dev, .. } = &mut main_builder else {
+                    break 'resident false;
+                };
+                let buf = math_cuda::lde::coset_lde_row_major_expand_on(
+                    dev.stream(),
+                    raw,
+                    n,
+                    total_cols,
+                    domains[table].blowup_factor,
+                    &weights,
+                )
+                .map_err(|e| ProvingError::WrongParameter(format!("GPU resident LDE: {e}")))?;
+                if let Some((expected, tree)) = prep {
+                    transcript.append_bytes(&expected);
+                    prep_trees[table] = Some(tree);
+                }
+                dev.absorb_row_major_dev(&buf, total_cols, num_precomputed, total_cols, height)
+                    .map_err(|e| ProvingError::WrongParameter(format!("GPU MMCS absorb: {e}")))?;
+                stats.main_lde_expansions += 1;
+                if let ResidencyMode::Retain = residency {
+                    let raw_lde = dev.stream().clone_dtoh(&buf).map_err(|e| {
+                        ProvingError::WrongParameter(format!("GPU LDE download: {e}"))
+                    })?;
+                    let host = crate::gpu_lde::u64_to_base_vec::<Field>(raw_lde);
+                    let bytes = lde_bytes::<Field>(host.len());
+                    ledger.alloc(bytes);
+                    retained_main[table] = Some((host, total_cols));
+                }
+                true
+            };
+            if done {
+                continue;
+            }
+        }
+
         let (main_data, total_cols) = P::expand_main_lde_row_major(
             trace,
             &domains[table],
