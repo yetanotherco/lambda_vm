@@ -1,9 +1,15 @@
-//! Two-pass hint-arena measurement driver for the `ecrecover_hints` guest.
+//! Hint-arena measurement driver for the `ecrecover_hints` guest.
 //!
-//! Pass 1 runs with an empty arena: every hint request misses, is appended to
-//! the guest's request log, and the guest recomputes in software (correct,
-//! just slow). The host then answers the logged requests with `compute_hint`,
-//! and pass 2 re-runs with a complete arena — the provable configuration.
+//! Three runs, all of the same program and input:
+//!
+//! - **silenced**: no hint is answered, so the guest recomputes every one in
+//!   software. The fallback baseline, and the arm that pins the property the
+//!   whole design rests on — an unanswered hint cannot change the result.
+//! - **on demand**: the executor answers each request during the run by seeding
+//!   the arena slot the guest is about to read. One execution, no recording
+//!   pass. This is what the prover now runs.
+//! - **explicit arena**: the arena from the on-demand run, passed up front.
+//!   Must be indistinguishable from it — same cycles, same output.
 //!
 //! Run explicitly (prints cycle counts; the guest ELF must be built):
 //!   cargo test -p executor --test hint_arena_ecrecover -- --ignored --nocapture
@@ -60,53 +66,85 @@ fn ecrecover_two_pass_cycles() {
     let elf = Elf::load(&elf_bytes).expect("ELF load");
     let input = build_input();
 
-    // ── Pass 1: empty arena — all hints miss, logged, software fallback. ──
+    // ── Silenced: nothing is answered, every hint recomputed in software. ──
     let t0 = Instant::now();
-    let pass1 = Executor::new(&elf, input.clone(), &[])
-        .expect("executor")
-        .run()
-        .expect("pass 1");
-    let pass1_time = t0.elapsed();
-    let pass1_cycles = pass1.logs.len();
+    let mut silenced_ex = Executor::new(&elf, input.clone(), &[]).expect("executor");
+    silenced_ex.silence_hints();
+    let silenced = silenced_ex.run().expect("silenced run");
+    let silenced_time = t0.elapsed();
+    let silenced_cycles = silenced.logs.len();
     assert_eq!(
-        pass1.hint_requests.len(),
+        silenced.hint_requests.len(),
         3 * N,
         "every recovery must log sqrt + scalar_inv + field_inv"
     );
+    assert!(
+        silenced.hints.is_empty(),
+        "a silenced run answers nothing, so it builds no arena"
+    );
 
-    // Host answers the requests, in order — that IS the arena.
-    let hints: Vec<[u8; 32]> = pass1
+    // ── On demand: answered during the run, no recording pass. ──
+    let t0 = Instant::now();
+    let ondemand = Executor::new(&elf, input.clone(), &[])
+        .expect("executor")
+        .run()
+        .expect("on-demand run");
+    let ondemand_time = t0.elapsed();
+    let ondemand_cycles = ondemand.logs.len();
+    assert_eq!(
+        ondemand.hints.len(),
+        3 * N,
+        "one slot answered per request, in request order"
+    );
+    // The executor's answers are exactly what the host would have precomputed.
+    let expected: Vec<[u8; 32]> = ondemand
         .hint_requests
         .iter()
         .map(|(id, input)| compute_hint(*id, input))
         .collect();
+    assert_eq!(ondemand.hints, expected, "answers must be compute_hint's");
 
-    // ── Pass 2: complete arena — every hint hits and verifies. ──
+    // ── Explicit arena: the same bytes, shipped up front. ──
+    let hints = ondemand.hints.clone();
     let t0 = Instant::now();
-    let pass2 = Executor::new(&elf, input.clone(), &hints)
+    let explicit = Executor::new(&elf, input.clone(), &hints)
         .expect("executor")
         .run()
-        .expect("pass 2");
-    let pass2_time = t0.elapsed();
-    let pass2_cycles = pass2.logs.len();
-    assert!(pass2.hint_requests.is_empty(), "arena must cover pass 2");
-
-    // Same program, same input: identical committed output.
+        .expect("explicit-arena run");
+    let explicit_time = t0.elapsed();
+    let explicit_cycles = explicit.logs.len();
     assert_eq!(
-        pass1.return_values.memory_values, pass2.return_values.memory_values,
+        explicit.hints, hints,
+        "an explicitly supplied arena must survive the run untouched"
+    );
+    assert_eq!(
+        explicit_cycles, ondemand_cycles,
+        "answering on demand must produce the same trace as shipping the arena"
+    );
+
+    // Same program, same input: identical committed output in all three.
+    assert_eq!(
+        silenced.return_values.memory_values, ondemand.return_values.memory_values,
+        "an unanswered hint must not change the result"
+    );
+    assert_eq!(
+        ondemand.return_values.memory_values, explicit.return_values.memory_values,
         "hint source must not change the result"
     );
 
     println!("[ecrecover-hints] N = {N} recoveries");
     println!(
-        "[ecrecover-hints] pass 1 (software fallback): {pass1_cycles} cycles in {pass1_time:?}"
+        "[ecrecover-hints] silenced (software fallback): {silenced_cycles} cycles in {silenced_time:?}"
     );
     println!(
-        "[ecrecover-hints] pass 2 (arena hints):       {pass2_cycles} cycles in {pass2_time:?}"
+        "[ecrecover-hints] on demand (one execution):    {ondemand_cycles} cycles in {ondemand_time:?}"
     );
     println!(
-        "[ecrecover-hints] guest cycle ratio pass1/pass2: {:.2}x",
-        pass1_cycles as f64 / pass2_cycles as f64
+        "[ecrecover-hints] explicit arena:               {explicit_cycles} cycles in {explicit_time:?}"
+    );
+    println!(
+        "[ecrecover-hints] guest cycle ratio silenced/hinted: {:.2}x",
+        silenced_cycles as f64 / ondemand_cycles as f64
     );
 
     // Dump the fixtures the prover-side continuation measurement consumes:

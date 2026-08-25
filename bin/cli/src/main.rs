@@ -154,10 +154,11 @@ enum Commands {
         #[arg(long, value_hint = ValueHint::FilePath, conflicts_with = "flamegraph")]
         hints: Option<PathBuf>,
 
-        /// Recording pass of the two-pass hint flow: run once with an empty
-        /// hint arena, answer the guest's logged hint requests host-side, and
-        /// write the resulting arena (concatenated 32-byte slots) to this file
-        /// for use with --hints on the second, provable run.
+        /// Run the guest once and write the hint arena it produced
+        /// (concatenated 32-byte slots) to this file, for later use with
+        /// --hints. Requests are answered during that run, so this is the
+        /// cheap hinted path, not the software-fallback one; the file is only
+        /// needed to reuse an arena across runs.
         #[arg(
             long,
             value_hint = ValueHint::FilePath,
@@ -465,8 +466,8 @@ fn cmd_execute(
         }
     };
 
-    // Recording pass of the two-pass hint flow: run hint-free, answer the
-    // guest's logged requests host-side, and write the arena for --hints runs.
+    // Run once and dump the arena the executor built answering the guest's
+    // requests, for --hints runs that want to reuse it.
     if let Some(record_path) = record_hints_path {
         let hints = match executor::vm::execution::collect_hints(&program, private_inputs) {
             Ok(hints) => hints,

@@ -25,10 +25,15 @@ pub struct ExecutionResult {
     /// Predecoded instructions map (pc -> instruction)
     /// Use this to look up instructions by their PC from the logs
     pub instructions: U64HashMap<Instruction>,
-    /// `(hint_id, input)` pairs the guest appended to the hint request log
-    /// (arena exhausted), in request order — the recording pass of the two-pass
-    /// hint flow. Empty when the arena covered every request.
+    /// `(hint_id, input)` pairs the guest appended to the hint request log, in
+    /// request order. Every one of them was answered during this run; this is a
+    /// measurement view, not work left over.
     pub hint_requests: Vec<(u64, [u8; 32])>,
+    /// The hint arena this run actually used: the `hints` passed to
+    /// [`Executor::new`] plus every slot the executor seeded on demand. The
+    /// prover MUST pass this to the trace builder — it is what the private-input
+    /// region's bytes encode, and therefore what the initial image has to hold.
+    pub hints: Vec<[u8; 32]>,
 }
 
 /// Size of each log chunk - balances memory usage vs callback overhead
@@ -110,6 +115,13 @@ impl Executor {
         &self.memory
     }
 
+    /// Run without answering any hint request, so the guest recomputes every
+    /// hint in software. Measurement and test hook — see
+    /// [`Memory::silence_hints`].
+    pub fn silence_hints(&mut self) {
+        self.memory.silence_hints();
+    }
+
     /// Resume execution, running at most `limit` cycles, and return the logs
     /// produced. Returns None when the program is finished.
     pub fn resume_with_limit(&mut self, limit: usize) -> Result<Option<&[Log]>, ExecutorError> {
@@ -172,6 +184,7 @@ impl Executor {
             logs,
             instructions: self.instructions.into_instruction_map(),
             hint_requests: self.memory.hint_requests()?,
+            hints: self.memory.hint_arena().to_vec(),
         })
     }
 
@@ -199,29 +212,26 @@ impl Executor {
     }
 }
 
-/// Record the guest's hint requests and answer them — the host half of the
-/// two-pass hint flow for guests whose hints are not known before the run.
+/// Run the program and return the hint arena it used, for callers that need the
+/// arena BEFORE they start proving — today only the continuation prover, which
+/// freezes its initial image and provenance before streaming epochs and so
+/// cannot take the arena the run itself produces.
 ///
-/// The program runs once with an empty hint arena: every
-/// `syscalls::syscalls::request_hint` misses, is appended to the guest's
-/// request log, and the guest recomputes in software (correct, just slower).
-/// Each logged `(hint_id, input)` is then answered with
-/// [`crate::vm::instruction::execution::compute_hint`], and the answers — in
-/// request order — are returned as the hint arena for the second, provable
-/// pass: pass them as `hints` to [`Executor::new`] (or the prover's `prove_*`
-/// functions) together with the same program and private input. Both passes
-/// produce the same committed output; the arena only changes how cheaply the
-/// guest gets there. A guest that requests nothing yields an empty arena.
+/// Every request is answered inline (see `Memory::answer_hint_request`), so this
+/// run takes the same cheap in-guest-verify path the proved run will: it is not
+/// the software-fallback path. The logs are drained rather than collected —
+/// nothing here needs them, and a real block would otherwise materialize tens of
+/// millions of `Log`s just to read an arena.
+///
+/// The monolithic prove path does NOT use this: it takes `ExecutionResult::hints`
+/// from the single run it already performs.
 pub fn collect_hints(
     program: &Elf,
     private_inputs: Vec<u8>,
 ) -> Result<Vec<[u8; 32]>, ExecutorError> {
-    let result = Executor::new(program, private_inputs, &[])?.run()?;
-    Ok(result
-        .hint_requests
-        .iter()
-        .map(|(hint_id, input)| crate::vm::instruction::execution::compute_hint(*hint_id, input))
-        .collect())
+    let mut executor = Executor::new(program, private_inputs, &[])?;
+    while executor.resume()?.is_some() {}
+    Ok(executor.memory.hint_arena().to_vec())
 }
 
 fn load_program(segments: &[crate::elf::Segment], memory: &mut Memory) -> Result<(), MemoryError> {
