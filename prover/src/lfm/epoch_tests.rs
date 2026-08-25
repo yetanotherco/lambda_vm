@@ -60,18 +60,18 @@ pub(super) struct HostTable {
     /// The verifier's HARDCODED precomputed commitment, when the AIR is
     /// preprocessed. A program constant, not arena data: the verifier does not
     /// take this from the proof (`verifier.rs:1187`).
-    precomputed_root: Option<Commitment>,
-    main_root: Commitment,
-    aux_root: Option<Commitment>,
+    pub(super) precomputed_root: Option<Commitment>,
+    pub(super) main_root: Commitment,
+    pub(super) aux_root: Option<Commitment>,
     pub(super) contribution: Option<FEE>,
-    composition_root: Commitment,
+    pub(super) composition_root: Commitment,
     /// Row-major, as `row_major_data` carries it.
     pub(super) ood_current: Vec<FEE>,
     pub(super) ood_next: Vec<FEE>,
     pub(super) parts: Vec<FEE>,
-    fri_roots: Vec<Commitment>,
+    pub(super) fri_roots: Vec<Commitment>,
     pub(super) fri_coeffs: Vec<FEE>,
-    nonce: Option<u64>,
+    pub(super) nonce: Option<u64>,
     needs_lookup_challenges: bool,
 
     // ---- the oracle ----
@@ -3457,7 +3457,7 @@ fn the_batched_from_proof_constructor_runs_a_continuation_epoch() {
 /// [`host_table`] for a sub-proof inside a multi-table epoch: the fork is
 /// already positioned (separator, aux root and `L` absorbed), so the oracle
 /// comes from `replay_rounds_after_round_1` on THAT transcript.
-fn host_table_forked(
+pub(super) fn host_table_forked(
     air: &dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = ()>,
     view: StarkProofView<'_, Gl, Ext3, ()>,
     index: usize,

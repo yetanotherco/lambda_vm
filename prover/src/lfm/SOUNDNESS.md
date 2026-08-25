@@ -247,3 +247,35 @@ current transcript would be a second proof-breaking change for no other benefit.
 8. Is the base tree at or past every framework verifier fix the inherited premises of §1.1 name —
    currently per-column opening-width pinning (`trace_opening_widths_well_formed`, #909 /
    `6949ceb9`)? On an older base (B) is not delivered, and nothing below §1.1 can recover it.
+
+## 8. Proven bits at the aggregation-era presets (the η re-tune, applied)
+
+Every security claim in this stack is quoted in PROVEN bits under the
+Johnson/proximity-gaps bound (1 − √ρ regime) — never the capacity conjecture.
+Two consequences of the adopted η re-tune, both derivation-level (no runtime
+parameter moved):
+
+1. **Per-table / per-proof base.** At blowup 4 / 110 queries the presets'
+   proven soundness re-derives from ≈ 95.5 bits to ≈ 114–117 bits at the SAME
+   query count: the slack parameter η in the Johnson-bound proximity term was
+   set conservatively, and re-optimizing it against the actual domain sizes
+   tightens bits-per-query with zero prover or verifier cost. The security
+   audit of 2026-08-15 carries the derivation; the numbers here are its
+   published range.
+
+2. **The batched class-split floor tracks the re-tune 1:1.** The batched
+   format's additional loss (≈ 3.3 bits of class split inside the measured
+   ≈ 92.2-bit floor against the ≈ 95.5 per-table base) comes from the |D₀|²
+   union lift in ε_C — a term in DOMAIN SIZE, independent of η. An additive
+   bits penalty that does not contain η moves with the base unchanged:
+   post-re-tune the batched floor is ≈ (114–117) − 3.3 ≈ 111–114 proven bits.
+   This settles the design review's unresolved point ("does the batched floor
+   move with η") in the affirmative, from the ε_C derivation's own structure.
+
+Query headroom above the presets is priced in the aggregation census's query
+sweep (blowup 4, terminal 2^8): every program boundary — the wrap's 2^18, the
+global wrap's 2^20, the aggregator's 2^21 — holds through q = 121
+(≈ 125–128 proven bits post-re-tune); q ≥ 124 additionally requires the
+global proof's terminal at 2^8 to keep the global wrap under its boundary.
+Raising q is a preset decision with registry consequences (new program
+identities), not part of this note.
