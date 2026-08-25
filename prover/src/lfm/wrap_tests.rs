@@ -1643,3 +1643,244 @@ fn the_fixture_epoch_wraps_batched() {
         EpochInputs::fixture(),
     );
 }
+
+/// ★ GATE B (P1) — a from-proof epoch wraps end to end, and it is the FINAL
+/// epoch of its continuation (HALT on board): the shape the real block's last
+/// epoch has, which the session harness cannot build. The epoch reaches the
+/// wrap through [`super::epoch_tests::real_epoch_from_continuation`] — proofs
+/// alone, no live proving session — and the proved run must publish the
+/// epoch's own oracles.
+///
+/// Run with:
+/// `cargo test --release -p lambda-vm-prover --lib lfm::wrap_tests::the_from_proof_final_epoch_wraps -- --ignored --exact --nocapture`
+#[test]
+#[ignore]
+fn the_from_proof_final_epoch_wraps() {
+    let elf_bytes = super::proof_fixture::read_inner_elf();
+    let inner = super::epoch_tests::from_proof_gate_options();
+    let bundle = crate::continuation::prove_continuation(
+        &elf_bytes,
+        &[],
+        super::proof_fixture::FIXTURE_EPOCH_LOG2,
+        &inner,
+    )
+    .expect("the fixture continuation must prove");
+    let n = bundle.num_epochs();
+    assert!(n >= 2, "the fixture continuation must have a final epoch");
+
+    let e =
+        super::epoch_tests::real_epoch_from_continuation(&inner, &elf_bytes, &bundle, n - 1, None)
+            .expect("the final epoch must reconstruct from proofs alone");
+    let program = super::epoch_tests::epoch_program(&e, true);
+    let arenas = super::epoch_tests::epoch_arena_words(&e, true);
+    let opts = wrap_options();
+    let artifacts = build_artifacts(&program, &opts);
+
+    let t = Instant::now();
+    let proved = lfm_prove(&program, &artifacts, &arenas, &opts).expect("the wrap must prove");
+    let prove_secs = t.elapsed().as_secs_f64();
+    assert!(
+        verify_against(
+            &artifacts.roots,
+            &artifacts.program_id,
+            artifacts.keccak_rnd_chunks,
+            &proved.proof,
+            &proved.public_words,
+            &opts,
+            artifacts.hasher,
+            artifacts.chip_set,
+        ),
+        "the wrap of the final epoch must verify"
+    );
+
+    // The proved run publishes the epoch's own oracles.
+    let pub_ext =
+        |i: usize| super::word::word_as_ext(&proved.public_words[i].1).expect("an ext challenge");
+    assert_eq!(pub_ext(0), e.z_alpha.0, "the proved run publishes z");
+    assert_eq!(pub_ext(1), e.z_alpha.1, "the proved run publishes alpha");
+    assert_eq!(
+        super::word::word_as_ext(&proved.public_words[proved.public_words.len() - 1].1)
+            .expect("the bus total is ext"),
+        e.expected_bus_balance,
+        "the proved run reaches production's own COMMIT-bus target"
+    );
+    println!(
+        "\n★ P1 GATE B: the FINAL epoch (epoch {} of {n}), wrapped from proofs alone — \
+         proved in {prove_secs:.1}s, verified, {} sub-proofs, {} published words",
+        n - 1,
+        proved.proof.proofs.len(),
+        proved.public_words.len(),
+    );
+}
+
+/// Peak RSS high-water mark of this process, GiB — `VmHWM` on Linux (the box);
+/// `None` elsewhere.
+fn peak_rss_gib() -> Option<f64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = status.lines().find(|l| l.starts_with("VmHWM:"))?;
+    let kb: f64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kb / (1024.0 * 1024.0))
+}
+
+/// ★ P1 — THE BLOCK, end to end, in one process: the production continuation
+/// prove (every epoch + the global proof), full bundle host verification
+/// (every epoch, the global proof, and the L2G root-equality binding), then
+/// EVERY epoch wrapped from the proofs alone. The numbers this prints are
+/// BLOCK numbers; per-epoch lines are supporting detail.
+///
+/// Residency: the epoch proves are `Retain` (hardcoded in
+/// `prove_continuation`); the wrap proves are `Retain` (the `lfm_prove`
+/// default). Proof BYTES are not run-reproducible (grinding nonces); roots
+/// are.
+///
+/// env (required): `LFM_CENSUS_ELF`, `LFM_CENSUS_INPUT`. Optional:
+/// `LFM_CENSUS_EPOCH_LOG2` (epoch size), `LFM_WRAP_QUERIES` (inner query
+/// count override; the default is the secure preset's).
+///
+/// Run at the 2^24 posture:
+/// ```text
+/// LFM_CENSUS_ELF=/path/to/ethrex.elf \
+/// LFM_CENSUS_INPUT=/path/to/ethrex_mainnet_25368371.bin \
+/// LFM_CENSUS_EPOCH_LOG2=24 LAMBDA_VM_MAX_ROWS_LOG2=24 \
+/// cargo test --release -p lambda-vm-prover --lib \
+///   lfm::wrap_tests::the_real_block_proves_and_wraps_end_to_end -- --ignored --exact --nocapture
+/// ```
+#[test]
+#[ignore]
+fn the_real_block_proves_and_wraps_end_to_end() {
+    for var in ["LFM_CENSUS_ELF", "LFM_CENSUS_INPUT"] {
+        assert!(
+            std::env::var(var).is_ok(),
+            "{var} must name a file: this test proves a REAL block, and without \
+             it the harness would build the fibonacci fixture and report it \
+             under this test's name"
+        );
+    }
+    let inputs = EpochInputs::from_env();
+    let mut inner = crate::recursion::Preset::Blowup4.options();
+    if let Ok(v) = std::env::var("LFM_WRAP_QUERIES") {
+        inner.fri_number_of_queries = v.parse().expect("LFM_WRAP_QUERIES must be an integer");
+    }
+    println!(
+        "★ P1 BLOCK RUN: guest {}, {} bytes of private input, 2^{} cycles/epoch, \
+         inner blowup {} / {} queries{}  — epoch residency Retain, wrap residency Retain",
+        inputs.label,
+        inputs.private_input.len(),
+        inputs.epoch_log2,
+        inner.blowup_factor,
+        inner.fri_number_of_queries,
+        if inner.fri_number_of_queries < 110 {
+            "  (REDUCED — not a security parameter set)"
+        } else {
+            "  (the secure preset)"
+        },
+    );
+
+    let t_total = Instant::now();
+
+    // ---- the base layer: every epoch + the global proof, production's path.
+    let t = Instant::now();
+    let bundle = crate::continuation::prove_continuation(
+        &inputs.elf_bytes,
+        &inputs.private_input,
+        inputs.epoch_log2,
+        &inner,
+    )
+    .expect("the block must prove");
+    let base_secs = t.elapsed().as_secs_f64();
+    let n = bundle.num_epochs();
+    let bundle_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&bundle)
+        .expect("the bundle must serialize")
+        .len();
+    println!(
+        "   base: {n} epochs + global proof in {base_secs:.1}s ({bundle_bytes} bundle bytes), \
+         peak RSS so far {:?} GiB",
+        peak_rss_gib(),
+    );
+
+    // ---- full host verification: every epoch, the global proof, the binding.
+    let t = Instant::now();
+    let out = crate::continuation::verify_continuation(&inputs.elf_bytes, &bundle, &inner)
+        .expect("the bundle must be well-formed");
+    assert!(
+        out.is_some(),
+        "the block bundle must host-verify (epochs + global + L2G root binding)"
+    );
+    let host_verify_secs = t.elapsed().as_secs_f64();
+    println!("   host verify (epochs + global + binding): {host_verify_secs:.1}s");
+
+    // ---- every epoch, wrapped from the proofs alone.
+    let elf = executor::elf::Elf::load(&inputs.elf_bytes).expect("the inner ELF must load");
+    let decode = crate::tables::decode::commitment_from_elf(&elf, &inner)
+        .expect("the DECODE commitment must compute");
+    let wrap_opts = wrap_options();
+    let (mut construct_secs, mut wrap_prove_secs, mut wrap_verify_secs) = (0f64, 0f64, 0f64);
+    let mut wrap_sizes = Vec::new();
+    for i in 0..n {
+        let t = Instant::now();
+        let e = super::epoch_tests::real_epoch_from_continuation(
+            &inner,
+            &inputs.elf_bytes,
+            &bundle,
+            i,
+            Some(decode),
+        )
+        .unwrap_or_else(|err| panic!("epoch {i} must reconstruct from the bundle: {err}"));
+        let program = super::epoch_tests::epoch_program(&e, true);
+        let arenas = super::epoch_tests::epoch_arena_words(&e, true);
+        let artifacts = build_artifacts(&program, &wrap_opts);
+        let c = t.elapsed().as_secs_f64();
+        construct_secs += c;
+
+        let t = Instant::now();
+        let proved = lfm_prove(&program, &artifacts, &arenas, &wrap_opts)
+            .unwrap_or_else(|err| panic!("epoch {i}'s wrap must prove: {err:?}"));
+        let p = t.elapsed().as_secs_f64();
+        wrap_prove_secs += p;
+
+        let t = Instant::now();
+        assert!(
+            verify_against(
+                &artifacts.roots,
+                &artifacts.program_id,
+                artifacts.keccak_rnd_chunks,
+                &proved.proof,
+                &proved.public_words,
+                &wrap_opts,
+                artifacts.hasher,
+                artifacts.chip_set,
+            ),
+            "epoch {i}'s wrap must verify"
+        );
+        let v = t.elapsed().as_secs_f64();
+        wrap_verify_secs += v;
+
+        let size = rkyv::to_bytes::<rkyv::rancor::Error>(&proved.proof)
+            .expect("the wrap proof must serialize")
+            .len();
+        wrap_sizes.push(size);
+        println!(
+            "   epoch {i}: reconstruct+emit {c:.1}s, wrap prove {p:.1}s, verify {v:.2}s, \
+             {size} bytes, {} sub-proofs",
+            proved.proof.proofs.len(),
+        );
+    }
+
+    let total = t_total.elapsed().as_secs_f64();
+    println!(
+        "\n★★★ P1 BLOCK RECORD (per-table): {n} epochs @2^{} cycles, inner blowup {} / {}q, \
+         wrap blowup {} / {}q, residency Retain both layers\n    \
+         base prove {base_secs:.1}s + host verify {host_verify_secs:.1}s + wrap constructs \
+         {construct_secs:.1}s + wrap proves {wrap_prove_secs:.1}s + wrap verifies \
+         {wrap_verify_secs:.1}s\n    TOTAL WALL {total:.1}s ({:.1} min)\n    \
+         proofs: bundle {bundle_bytes} B, wraps {wrap_sizes:?} B\n    \
+         peak RSS (VmHWM): {:?} GiB",
+        inputs.epoch_log2,
+        inner.blowup_factor,
+        inner.fri_number_of_queries,
+        wrap_opts.blowup_factor,
+        wrap_opts.fri_number_of_queries,
+        total / 60.0,
+        peak_rss_gib(),
+    );
+}

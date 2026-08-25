@@ -1014,10 +1014,7 @@ impl EpochFront {
 /// this adds the per-table prove, production's acceptance, and the replay
 /// harvest.
 pub(super) fn real_epoch_from(opts: crate::ProofOptions, inputs: EpochInputs) -> RealEpoch {
-    use crate::tables::register;
-    use crypto::fiat_shamir::is_transcript::IsTranscript;
     use stark::proof::view::MultiProofView;
-    use stark::verifier::IsStarkVerifier;
 
     let mut front = EpochFront::build(opts, inputs);
 
@@ -1058,6 +1055,51 @@ pub(super) fn real_epoch_from(opts: crate::ProofOptions, inputs: EpochInputs) ->
         decode_root,
         ..
     } = front;
+    harvest_real_epoch(
+        &opts,
+        elf_bytes,
+        &elf,
+        &airs,
+        &*l2g_air,
+        register_init,
+        reg_fini,
+        table_counts,
+        public_output,
+        runtime_page_ranges,
+        label,
+        decode_root,
+        MultiProofView::Owned(&proof),
+    )
+    .expect("production must accept the epoch this suite differentials against")
+}
+
+/// The replay harvest shared by [`real_epoch_from`] (session path — the epoch
+/// proved inline moments before) and [`real_epoch_from_continuation`]
+/// (from-proof path — the epoch read off an existing continuation bundle):
+/// everything a [`RealEpoch`] holds, read from the AIR set, the statement
+/// values and the PROOF view. Checks production accepts the (AIRs, proof,
+/// statement) triple first — `Err` otherwise, and nothing below the check
+/// describes a real epoch.
+#[allow(clippy::too_many_arguments)]
+fn harvest_real_epoch(
+    opts: &crate::ProofOptions,
+    elf_bytes: Vec<u8>,
+    elf: &executor::elf::Elf,
+    airs: &crate::VmAirs,
+    l2g_air: &dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = ()>,
+    register_init: Vec<u32>,
+    reg_fini: Vec<u32>,
+    table_counts: crate::TableCounts,
+    public_output: Vec<u8>,
+    runtime_page_ranges: Vec<crate::RuntimePageRange>,
+    label: u64,
+    decode_root: Commitment,
+    view: stark::proof::view::MultiProofView<'_, Gl, Ext3, ()>,
+) -> Result<RealEpoch, String> {
+    use crate::tables::register;
+    use crypto::fiat_shamir::is_transcript::IsTranscript;
+    use stark::verifier::IsStarkVerifier;
+
     let seed = || {
         epoch_seed(
             label,
@@ -1070,10 +1112,9 @@ pub(super) fn real_epoch_from(opts: crate::ProofOptions, inputs: EpochInputs) ->
     };
     let refs = {
         let mut r = airs.air_refs();
-        r.push(&*l2g_air);
+        r.push(l2g_air);
         r
     };
-    let view = MultiProofView::Owned(&proof);
     assert_eq!(refs.len(), view.len(), "one AIR per sub-proof");
 
     // ---- production must ACCEPT it, or nothing below describes a real epoch.
@@ -1085,11 +1126,10 @@ pub(super) fn real_epoch_from(opts: crate::ProofOptions, inputs: EpochInputs) ->
         start_index,
         &mut seed(),
     )
-    .expect("the COMMIT bus target must compute");
-    assert!(
-        stark::verifier::Verifier::multi_verify_views(&refs, view, &mut seed(), &expected),
-        "production must accept the epoch this suite differentials against"
-    );
+    .ok_or("the COMMIT bus target must compute")?;
+    if !stark::verifier::Verifier::multi_verify_views(&refs, view, &mut seed(), &expected) {
+        return Err("production's verifier rejects the epoch".to_string());
+    }
 
     // ---- Phase A, transcribed from `multi_verify_views:1160-1227`.
     let mut transcript = seed();
@@ -1101,7 +1141,7 @@ pub(super) fn real_epoch_from(opts: crate::ProofOptions, inputs: EpochInputs) ->
             transcript.append_bytes(&prep);
             transcript.append_bytes(v.lde_trace_main_merkle_root());
             phase_a.push((
-                Some(prep_source(prep, &opts, &elf, &register_init, &reg_fini)),
+                Some(prep_source(prep, opts, elf, &register_init, &reg_fini)),
                 *v.lde_trace_main_merkle_root(),
             ));
         } else {
@@ -1149,7 +1189,7 @@ pub(super) fn real_epoch_from(opts: crate::ProofOptions, inputs: EpochInputs) ->
         })
         .collect();
 
-    RealEpoch {
+    Ok(RealEpoch {
         statement: super::statement_replay::EpochStatementShape {
             public_output_len: public_output.len(),
             table_counts: [
@@ -1206,7 +1246,225 @@ pub(super) fn real_epoch_from(opts: crate::ProofOptions, inputs: EpochInputs) ->
         z_alpha,
         start_index,
         expected_bus_balance: expected,
+    })
+}
+
+/// [`RealEpoch`] for epoch `epoch_index` of an EXISTING continuation bundle —
+/// the from-proof path. The AIR set and statement values come from
+/// [`crate::continuation::reconstruct_epoch_airs`], the SAME reconstruction
+/// `verify_epoch` runs; the chain position (INIT chained from the prior
+/// epoch's bound fini, final = last, label = position) from
+/// [`crate::continuation::epoch_chain_position`]; the replay harvest is
+/// [`harvest_real_epoch`], shared with the session path. So a wrap can be
+/// emitted for ANY epoch of a continuation — including the FINAL one, which
+/// the session harness cannot build — from the proofs alone, with no live
+/// proving session.
+///
+/// `decode_commitment`: `Some` reuses a DECODE root computed once per bundle
+/// (it is a function of (ELF, opts) only); `None` recomputes it here.
+/// `Err` = malformed bundle, out-of-range index, or a proof production's
+/// verifier rejects.
+pub(super) fn real_epoch_from_continuation(
+    opts: &crate::ProofOptions,
+    elf_bytes: &[u8],
+    bundle: &crate::continuation::ContinuationProof,
+    epoch_index: usize,
+    decode_commitment: Option<Commitment>,
+) -> Result<RealEpoch, String> {
+    use executor::elf::Elf;
+
+    let elf = Elf::load(elf_bytes).map_err(|e| format!("the inner ELF must load: {e}"))?;
+    let position = crate::continuation::epoch_chain_position(bundle, &elf, epoch_index)
+        .map_err(|e| format!("chain position for epoch {epoch_index}: {e:?}"))?
+        .ok_or_else(|| format!("epoch {epoch_index} is out of range or the bundle is malformed"))?;
+    let view = bundle.epoch_view(epoch_index);
+    let recon = crate::continuation::reconstruct_epoch_airs(
+        &elf,
+        view,
+        &position.register_init,
+        position.is_final,
+        position.label,
+        opts,
+        decode_commitment,
+    )
+    .map_err(|e| format!("reconstructing epoch {epoch_index}: {e:?}"))?
+    .ok_or_else(|| format!("epoch {epoch_index} is structurally invalid"))?;
+    let decode_root = match decode_commitment {
+        Some(c) => c,
+        None => crate::tables::decode::commitment_from_elf(&elf, opts)
+            .map_err(|e| format!("DECODE commitment from ELF: {e}"))?,
+    };
+    harvest_real_epoch(
+        opts,
+        elf_bytes.to_vec(),
+        &elf,
+        &recon.airs,
+        &*recon.l2g_air,
+        position.register_init,
+        recon.reg_fini,
+        recon.table_counts,
+        view.public_output().to_vec(),
+        recon.runtime_page_ranges,
+        position.label,
+        decode_root,
+        view.proof(),
+    )
+}
+
+/// Inner options for the P1 from-proof gates: MIN's cost profile but at
+/// blowup 4, because the fixture epoch carries height-1 tables and the
+/// per-table replay indexes each table's own LDE pairs
+/// (`TableChallengeShape::index_bits` = `log2(h·blowup) − 1`, which must be
+/// ≥ 1). Diagnostics-grade, not a security parameter set.
+pub(super) fn from_proof_gate_options() -> crate::ProofOptions {
+    crate::ProofOptions {
+        blowup_factor: 4,
+        fri_number_of_queries: 2,
+        coset_offset: 3,
+        grinding_factor: 1,
+        fri_final_poly_log_degree: 7,
     }
+}
+
+/// ★ GATE A (P1) — the from-proof constructor IS the session harness.
+///
+/// Two constructions of the same fixture epoch: [`real_epoch_from`] proves
+/// epoch 0 inline; [`real_epoch_from_continuation`] reads epoch 0 of the
+/// fixture CONTINUATION bundle (same guest, same epoch size, same options).
+/// The proof bytes differ between the two proves (grinding nonces move the
+/// query openings), but everything shape- and statement-derived must agree —
+/// and the emitted wrap programs must be byte-identical, checked through
+/// their registry artifacts (the roots ARE commitments over the program +
+/// preprocessed text).
+///
+/// Epoch 1 — the bundle's FINAL epoch, the shape the real block's last epoch
+/// has and the session harness cannot build (it wants an intermediate
+/// epoch) — must also reconstruct, pass production's verifier inside the
+/// constructor, and emit a program.
+#[test]
+fn the_from_proof_constructor_matches_the_session_harness() {
+    let elf_bytes = super::proof_fixture::read_inner_elf();
+    let opts = from_proof_gate_options();
+
+    let session = real_epoch_from(from_proof_gate_options(), EpochInputs::fixture());
+    let bundle = crate::continuation::prove_continuation(
+        &elf_bytes,
+        &[],
+        super::proof_fixture::FIXTURE_EPOCH_LOG2,
+        &opts,
+    )
+    .expect("the fixture continuation must prove");
+    assert!(
+        bundle.num_epochs() >= 2,
+        "the fixture continuation must have a second (final) epoch — \
+         re-measure FIXTURE_EPOCH_LOG2 (see proof_fixture)"
+    );
+
+    let from_proof = real_epoch_from_continuation(&opts, &elf_bytes, &bundle, 0, None)
+        .expect("epoch 0 must reconstruct from the bundle alone");
+
+    // Statement-level scalars: two paths, one epoch.
+    assert_eq!(session.register_init, from_proof.register_init);
+    assert_eq!(session.reg_fini, from_proof.reg_fini);
+    assert_eq!(session.public_output, from_proof.public_output);
+    assert_eq!(session.epoch_label, from_proof.epoch_label);
+    assert_eq!(session.start_index, from_proof.start_index);
+    assert_eq!(session.expected_program_id, from_proof.expected_program_id);
+
+    // Preprocessed PROVENANCE is shape/statement-derived and must agree per
+    // slot. The committed MAIN roots are allowed to differ: the session
+    // harness builds traces through `Traces::from_image_and_logs` and
+    // `prove_continuation` through `Traces::build_from_collected`, and the
+    // two builders may make different (equally valid, production-accepted)
+    // byte choices inside one table — both proofs pass `multi_verify_views`
+    // above. A root difference therefore also moves the transcript-derived
+    // oracles (`z_alpha`, the bus target), so those are per-proof values,
+    // not cross-path invariants. What MUST be invariant is the program.
+    assert_eq!(session.phase_a.len(), from_proof.phase_a.len());
+    for (i, (s, f)) in session.phase_a.iter().zip(&from_proof.phase_a).enumerate() {
+        assert_eq!(s.0, f.0, "preprocessed provenance differs at sub-proof {i}");
+        if s.1 != f.1 {
+            println!(
+                "   note: sub-proof {i}'s committed main root differs between \
+                 the two trace builders (both production-accepted)"
+            );
+        }
+    }
+
+    // The emitted wrap programs, byte-identical through the registry artifacts.
+    let p_session = epoch_program(&session, true);
+    let p_proof = epoch_program(&from_proof, true);
+    assert_eq!(p_session.instrs.len(), p_proof.instrs.len());
+    let a_session = super::registry::build_artifacts(&p_session, &opts);
+    let a_proof = super::registry::build_artifacts(&p_proof, &opts);
+    assert_eq!(
+        a_session.roots, a_proof.roots,
+        "the two paths must emit byte-identical wrap programs"
+    );
+    assert_eq!(a_session.program_id, a_proof.program_id);
+    assert_eq!(a_session.log_heights, a_proof.log_heights);
+
+    // Epoch 1: the FINAL shape, from proofs alone. The constructor's internal
+    // production-verify is the acceptance gate; emission must handle the
+    // final-epoch table set (HALT on board).
+    let final_epoch = real_epoch_from_continuation(&opts, &elf_bytes, &bundle, 1, None)
+        .expect("the FINAL epoch must reconstruct from the bundle alone");
+    let p_final = epoch_program(&final_epoch, true);
+    let a_final = super::registry::build_artifacts(&p_final, &opts);
+    println!(
+        "★ P1 GATE A: epoch 0 program identical across both paths ({} instrs); \
+         FINAL epoch reconstructed and emitted ({} instrs, {} chips)",
+        p_proof.instrs.len(),
+        p_final.instrs.len(),
+        a_final.log_heights.len(),
+    );
+}
+
+/// ★ GATE C (P1) — one corrupted byte of the bundle, rejected, and WHERE.
+///
+/// `reg_fini` is a prover-supplied bundle field the verifier re-binds through
+/// the REGISTER preprocessed commitment: corrupting it makes the
+/// constructor's own production-verify reject (the constructor layer). The
+/// claimed `l2g_root` is not an AIR input — the constructor does not read
+/// it — so its corruption is caught by `verify_continuation`'s root re-check
+/// instead (the bundle-verify layer the block driver runs first).
+#[test]
+fn the_from_proof_constructor_rejects_a_tampered_bundle() {
+    let elf_bytes = super::proof_fixture::read_inner_elf();
+    let opts = super::proof_fixture::fixture_options();
+    let mut bundle = crate::continuation::prove_continuation(
+        &elf_bytes,
+        &[],
+        super::proof_fixture::FIXTURE_EPOCH_LOG2,
+        &opts,
+    )
+    .expect("the fixture continuation must prove");
+    assert!(bundle.num_epochs() >= 2);
+
+    // Layer 1: the constructor's production-verify.
+    bundle.corrupt_epoch_reg_fini_for_tests(1);
+    let err = match real_epoch_from_continuation(&opts, &elf_bytes, &bundle, 1, None) {
+        Err(e) => e,
+        Ok(_) => panic!("a corrupted reg_fini must not reconstruct"),
+    };
+    assert!(
+        err.contains("rejects"),
+        "the corruption is caught by the production verify inside the constructor: {err}"
+    );
+    bundle.corrupt_epoch_reg_fini_for_tests(1);
+
+    // Layer 2: the bundle verifier's claimed-root re-check.
+    bundle.corrupt_epoch_l2g_root_for_tests(1);
+    assert!(
+        crate::continuation::verify_continuation(&elf_bytes, &bundle, &opts)
+            .expect("the tampered bundle is still well-formed")
+            .is_none(),
+        "a corrupted claimed L2G root must fail bundle verification"
+    );
+    println!(
+        "★ P1 GATE C: reg_fini corruption rejected by the constructor; \
+         l2g_root corruption rejected by the bundle verifier"
+    );
 }
 
 /// The batched-path analogue of [`RealEpoch`] — the host half of the M-8
