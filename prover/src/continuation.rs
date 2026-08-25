@@ -275,6 +275,110 @@ fn touched_page_bases(boundaries: &[Arc<Vec<CellBoundary>>]) -> Vec<u64> {
         .collect()
 }
 
+/// The cross-epoch page census of an execution, WITHOUT proving anything: how
+/// many epochs the guest runs, which page bases the epoch-crossing cells fall
+/// on, and how many cells each page contributes. This is the shape data the
+/// aggregation layer's census consumes — the global memory proof commits one
+/// GLOBAL_MEMORY table per touched page, sized by that page's crossing cells,
+/// and the aggregator's cost per page follows the table height — so pricing
+/// the aggregation program requires exactly this and nothing heavier.
+#[cfg(test)]
+pub(crate) struct BlockPageCensus {
+    pub num_epochs: usize,
+    /// Sorted, deduped — [`touched_page_bases`]' own order.
+    pub touched_page_bases: Vec<u64>,
+    pub num_private_input_pages: usize,
+    /// Epoch-crossing cells per touched page, in `touched_page_bases` order —
+    /// the GLOBAL_MEMORY table height driver (rows before padding).
+    pub page_cells: Vec<usize>,
+    /// Cells in each epoch's L2G table (rows before padding), epoch order.
+    pub l2g_cells: Vec<usize>,
+}
+
+/// Runs the guest to completion and collects [`BlockPageCensus`] — the
+/// producer loop's sequential-critical half (execute, collect, boundary,
+/// image carry) with every prove and trace build omitted.
+#[cfg(test)]
+pub(crate) fn block_page_census(
+    elf_bytes: &[u8],
+    private_inputs: &[u8],
+    epoch_size_log2: u32,
+) -> Result<BlockPageCensus, Error> {
+    let epoch_size = 1usize
+        .checked_shl(epoch_size_log2)
+        .ok_or_else(|| Error::InvalidContinuationEpochSize("epoch size overflow".to_string()))?;
+    let elf = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
+    let mut executor = Executor::new(&elf, private_inputs.to_vec())
+        .map_err(|e| Error::Execution(format!("{e}")))?;
+    let decode_artifacts = DecodeArtifacts::from_elf(&elf)?;
+    let mut image = build_initial_image_paged(&elf, private_inputs);
+    let mut provenance =
+        local_to_global::genesis_provenance(image.iter().map(|(a, v)| (a, v as u64)));
+
+    let mut boundaries: Vec<Arc<Vec<CellBoundary>>> = Vec::new();
+    let mut prev_fini: Option<Vec<u32>> = None;
+    let mut index: u64 = 0;
+    loop {
+        if executor.pc() == 0 {
+            break;
+        }
+        if index >= local_to_global::MAX_EPOCHS {
+            return Err(Error::InvalidContinuationEpochSize(
+                "execution exceeds the IsB20 cross-epoch ordering range".to_string(),
+            ));
+        }
+        let register_init: Vec<u32> = match (index, prev_fini.take()) {
+            (0, _) => register::register_init_from_entry_point(elf.entry_point),
+            (_, Some(fini)) => fini,
+            (_, None) => {
+                return Err(Error::ContinuationInvariant(
+                    "previous epoch final registers are missing after the first epoch".to_string(),
+                ));
+            }
+        };
+        let logs = match executor
+            .resume_with_limit(epoch_size)
+            .map_err(|e| Error::Execution(format!("{e}")))?
+        {
+            Some(logs) => logs.to_vec(),
+            None => break,
+        };
+        let is_final = executor.pc() == 0;
+        let collected =
+            Traces::collect_epoch(&decode_artifacts, &image, &register_init, &logs, is_final)?;
+        let boundary = Arc::new(local_to_global::epoch_boundary(
+            &mut provenance,
+            local_to_global::epoch_label(index),
+            &collected.touched_memory_cells(),
+        ));
+        prev_fini = Some(collected.register_fini(&register_init));
+        for cell in boundary.iter() {
+            image.set(cell.address, (cell.fini.value & 0xFF) as u8);
+        }
+        boundaries.push(boundary);
+        if is_final {
+            break;
+        }
+        index += 1;
+    }
+
+    let bases = touched_page_bases(&boundaries);
+    let mut per_page: std::collections::BTreeMap<u64, usize> =
+        bases.iter().map(|&b| (b, 0)).collect();
+    for b in boundaries.iter().flat_map(|epoch| epoch.iter()) {
+        *per_page
+            .get_mut(&page::page_base_for_address(b.address))
+            .expect("every crossing cell's page is in the census") += 1;
+    }
+    Ok(BlockPageCensus {
+        num_epochs: boundaries.len(),
+        page_cells: bases.iter().map(|b| per_page[b]).collect(),
+        touched_page_bases: bases,
+        num_private_input_pages: page::private_input_page_count(private_inputs),
+        l2g_cells: boundaries.iter().map(|b| b.len()).collect(),
+    })
+}
+
 /// Canonicalize a possibly-untrusted, out-of-order page-base list to the same sorted,
 /// deduped form the prover produces via [`touched_page_bases`], so the verifier rebuilds
 /// tables in the committed order regardless of the wire order (a shuffled-but-same-set

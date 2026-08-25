@@ -439,9 +439,34 @@ pub fn lfm_prove_batched(
 }
 
 /// An LFM epoch proved through the batched commitment path.
+///
+/// Carries the rkyv wire derives because this IS a shipping artifact: the
+/// aggregation layer consumes batched-format wraps as serialized inputs, and
+/// a block's wrap set travels between processes and machines as bytes. The
+/// round trip is gated by `a_batched_lfm_proof_round_trips_the_wire`.
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct BatchedLfmProof {
     pub proof: BatchedMultiProof<F, E, ()>,
     pub public_words: Vec<(u32, LfmWord)>,
+}
+
+/// The wrap layer's options when the wrap feeds the AGGREGATOR: blowup 4
+/// (110 queries at the 128-bit Johnson-bound target) with the FRI terminal at
+/// degree 2^8.
+///
+/// The choice optimizes the wrap's VERIFIER — the aggregation program pays
+/// per query per wrap, and 110 queries against blowup-4 trees nearly halve
+/// its Merkle-walk volume versus the 219-query blowup-2 wrap (the priced
+/// A-decision point). The terminal at 2^8 trades one committed FRI layer —
+/// 110 more openings the aggregator would walk — for 128 more terminal
+/// coefficients it merely absorbs. Inner epochs are NOT touched by this
+/// choice: the wrap PROGRAM is a function of the inner proof's options, so
+/// this constructor moves no program identity.
+pub fn aggregation_wrap_options() -> ProofOptions {
+    let mut opts = stark::proof::options::GoldilocksCubicProofOptions::with_blowup(4)
+        .expect("blowup=4 is valid");
+    opts.fri_final_poly_log_degree = 8;
+    opts
 }
 
 /// [`lfm_verify`] for a batched epoch proof.

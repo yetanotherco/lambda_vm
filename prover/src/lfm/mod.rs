@@ -74,6 +74,8 @@ pub use validator::{LfmViolation, validate};
 pub use word::{LfmWord, base_word, ext_word, pack_digest, unpack_digest};
 
 #[cfg(test)]
+mod aggregator_tests;
+#[cfg(test)]
 mod blake3_chip_tests;
 #[cfg(test)]
 mod blake3_probe;
