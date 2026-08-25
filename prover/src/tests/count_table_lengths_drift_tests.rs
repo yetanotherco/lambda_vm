@@ -126,3 +126,21 @@ fn count_table_lengths_matches_nonempty_hint_trace() {
     );
     assert_count_table_lengths_matches(&elf, &result.logs);
 }
+
+/// ECSM routes three register reads, four `k`/`xG` memory reads and now TWELVE
+/// output writes through the memory argument, plus the IsHalfword receives its
+/// range checks add. `count_table_lengths` has no `ecall_ecsm` branch, so this
+/// asserts what that omission costs: MEMW and MEMW_A are exact-match tables in
+/// the helper above, so a missing replay shows up here rather than as a
+/// mis-sized trace under Disk storage.
+#[test]
+fn count_table_lengths_matches_nonempty_ecsm_trace() {
+    let (elf, logs, _) = run_asm_elf("test_ecsm");
+    assert!(
+        logs.iter().any(|log| {
+            log.src1_val == executor::vm::instruction::execution::ECSM_SYSCALL_NUMBER
+        }),
+        "fixture must contain an ECSM ecall"
+    );
+    assert_count_table_lengths_matches(&elf, &logs);
+}
