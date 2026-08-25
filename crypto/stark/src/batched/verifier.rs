@@ -425,10 +425,12 @@ where
                 if o.evaluations.len() != c.width || o.evaluations_sym.len() != c.width {
                     return false;
                 }
-                let leaf_hash = <H::Batched<Field> as crypto::merkle_tree::traits::IsStreamingLeafBackend<Field>>::hash_data_from_slices(
-                    &o.evaluations,
-                    &o.evaluations_sym,
-                );
+                let leaf_hash =
+                    <H::Batched<Field> as crypto::merkle_tree::traits::IsStreamingLeafBackend<
+                        Field,
+                    >>::hash_data_from_slices(
+                        &o.evaluations, &o.evaluations_sym
+                    );
                 if !crypto::merkle_tree::proof::verify_merkle_path_from_leaf_hash::<H::Batched<Field>>(
                     &o.proof.merkle_path,
                     root,

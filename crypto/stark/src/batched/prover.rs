@@ -321,17 +321,13 @@ where
             // makes for a non-preprocessed table (`commit_rows_bit_reversed` =
             // the subset call over the full range), on the identical
             // expansion — the root is byte-identical to the per-table tree's.
-            let (tree, root) = P::commit_rows_bit_reversed_subset::<Field>(
-                &main_data,
-                total_cols,
-                0,
-                total_cols,
-            )
-            .ok_or_else(|| {
-                ProvingError::WrongParameter(
-                    "the carved table's main matrix has no committable rows".to_string(),
-                )
-            })?;
+            let (tree, root) =
+                P::commit_rows_bit_reversed_subset::<Field>(&main_data, total_cols, 0, total_cols)
+                    .ok_or_else(|| {
+                        ProvingError::WrongParameter(
+                            "the carved table's main matrix has no committable rows".to_string(),
+                        )
+                    })?;
             carved_tree = Some(tree);
             carved_root = Some(root);
         } else {

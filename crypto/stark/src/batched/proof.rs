@@ -26,7 +26,7 @@ use crate::proof::stark::PolynomialOpenings;
 use crate::table::Table;
 
 /// The per-table data a batched epoch proof still has to carry.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct BatchedTableData<E: IsField, PI> {
     /// This table's interpolation-domain size. The verifier derives the table's
     /// height — and therefore every index reduction — from this, so it is bound
@@ -55,7 +55,7 @@ pub struct BatchedTableData<E: IsField, PI> {
 
 /// One query's openings: one authentication path per batched round, plus the
 /// FRI layer decommitment.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct BatchedQueryOpening<F: IsField, E: IsField> {
     /// Preprocessed openings, ONE PER PREPROCESSED TABLE in AIR order — each a
     /// standard row-pair opening against that table's own precomputed tree.
@@ -88,7 +88,7 @@ pub struct BatchedQueryOpening<F: IsField, E: IsField> {
 }
 
 /// One epoch, one proof.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct BatchedMultiProof<F: IsField, E: IsField, PI> {
     pub tables: Vec<BatchedTableData<E, PI>>,
     /// ★ There is deliberately NO `prep_root` here. Preprocessed matrices are

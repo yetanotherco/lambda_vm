@@ -1000,7 +1000,10 @@ mod carved {
     #[test_log::test]
     fn an_honest_carved_epoch_verifies_end_to_end() {
         let (airs, proof) = prove_carved();
-        assert!(proof.carved_main_root.is_some(), "the carve produced a root");
+        assert!(
+            proof.carved_main_root.is_some(),
+            "the carve produced a root"
+        );
         assert!(
             proof.queries.iter().all(|q| q.carved_main.is_some()),
             "every query carries a carved opening"
@@ -1096,11 +1099,8 @@ mod carved {
             "a carved proof must not pass an uncarved verifier"
         );
 
-        let (uncarved_airs, uncarved_proof, _, _) = super::prove_repeated(
-            1,
-            &folding_options(),
-            ResidencyMode::Retain,
-        );
+        let (uncarved_airs, uncarved_proof, _, _) =
+            super::prove_repeated(1, &folding_options(), ResidencyMode::Retain);
         assert!(
             !verifies_carved(&uncarved_airs, &uncarved_proof, Some(CARVED)),
             "an uncarved proof must not pass a carved verifier"
