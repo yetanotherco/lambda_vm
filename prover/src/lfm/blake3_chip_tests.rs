@@ -506,8 +506,8 @@ fn tampering_with_the_blake3_witness_is_not_accepted() {
 
     // One output byte of the first compression.
     let col = cols::out_word(0, 0);
-    let old = traces.blake3.main_table.get_row(0)[col];
-    traces.blake3.main_table.set_fe(0, col, old + FE::one());
+    let old = traces.blake3[0].main_table.get_row(0)[col];
+    traces.blake3[0].main_table.set_fe(0, col, old + FE::one());
 
     let proved = super::proof::prove_traces(&artifacts, &mut traces, &exec.public_words, &opts);
     match proved {
@@ -1501,4 +1501,509 @@ fn both_blake3_surfaces_in_one_machine_balance_bitwise() {
              socket and the chip would show up here"
         );
     }
+}
+
+// =========================================================================
+// `LFM_BLAKE3` chunking — the chip past one table
+// =========================================================================
+//
+// One row per compression at 3,056 value columns, so the chip's matrix is WIDE:
+// the aggregation program's ~1.39M compressions are a 2^21 x 3,056 table whose
+// blowup-2 LDE is a single ~102 GB allocation. These tests cover the split — the
+// shape it produces, that a multi-chunk program proves and verifies on both the
+// per-table and the batched path, that it proves the SAME thing, and the two
+// ways the split itself can be wrong (a corrupted non-first chunk, a chunk count
+// that does not match the proof).
+
+use super::chunking::Blake3Chunking;
+
+/// 12 compressions: 768 bytes is exactly 12 BLAKE3 blocks.
+const CHUNKED_CHAIN_LEN: usize = 768;
+
+/// Five compressions per chunk. 12 splits 5 + 5 + 2, so the fixture is three
+/// chunks with a partial final one — the case a uniform split would miss — and
+/// two distinct trace heights (8, 8, 4), so a height read off the wrong chunk
+/// cannot pass unnoticed.
+fn test_blake3_chunking() -> Blake3Chunking {
+    Blake3Chunking::from_compressions(5)
+}
+
+fn chunked_chain_program() -> super::compiler::LfmProgram {
+    blake3_sponge_program(CHUNKED_CHAIN_LEN).with_blake3_chunking(test_blake3_chunking())
+}
+
+/// The split's shape: chunk count, per-chunk compression counts, per-chunk trace
+/// heights, per-chunk roots, AIR count and trace count all agree.
+#[test]
+fn blake3_chunking_splits_the_chain_into_uneven_chunks() {
+    use super::airs::{ChipSet, blake3_chunk_rows, num_lfm_airs};
+
+    let program = chunked_chain_program();
+    assert_eq!(
+        program.groups.blake3.real_rows, 12,
+        "{CHUNKED_CHAIN_LEN} bytes must be 12 BLAKE3 blocks"
+    );
+
+    assert_eq!(program.blake3_chunk_count(), 3);
+    assert_eq!(program.blake3_chunk_real_rows(), vec![5, 5, 2]);
+    // 5 rows -> 8; the 2-row tail -> the 4-row group floor.
+    assert_eq!(blake3_chunk_rows(&program), vec![8, 8, 4]);
+
+    let opts = options();
+    let artifacts = build_artifacts(&program, &opts);
+    assert_eq!(artifacts.blake3_chunks(), 3);
+    assert_eq!(artifacts.blake3_chunk_log_heights, vec![3, 3, 2]);
+    assert_eq!(
+        artifacts.roots[super::airs::BLAKE3_SLOT],
+        artifacts.blake3_chunk_roots[0],
+        "slot 11's root IS chunk 0's — that is what makes one chunk the \
+         unchunked machine"
+    );
+    assert_eq!(
+        artifacts.log_heights[super::airs::BLAKE3_SLOT],
+        artifacts.blake3_chunk_log_heights[0]
+    );
+    // The chunks commit different rows, so no two share a root. Without this the
+    // per-chunk commitment could be committing the same matrix three times.
+    for i in 0..3 {
+        for j in (i + 1)..3 {
+            assert_ne!(
+                artifacts.blake3_chunk_roots[i], artifacts.blake3_chunk_roots[j],
+                "chunks {i} and {j} must commit different matrices"
+            );
+        }
+    }
+    // A BLAKE3-only program: the keccak family is masked out, so the AIR count is
+    // the FULL-mask count less that family.
+    assert_eq!(
+        (artifacts.chip_set.keccak, artifacts.chip_set.blake3),
+        (false, true)
+    );
+    assert_eq!(artifacts.chip_set.num_airs(0, 3), num_lfm_airs(0, 3) - 2);
+
+    let exec = execute(
+        &program,
+        &sponge_arenas(&message(CHUNKED_CHAIN_LEN)),
+        &TestPermutation,
+    )
+    .expect("honest execution");
+    let traces = super::trace::build_traces(&program, &exec.records);
+    assert_eq!(traces.blake3.len(), 3, "one LFM_BLAKE3 trace per chunk");
+    assert_eq!(
+        traces
+            .blake3
+            .iter()
+            .map(|t| t.num_rows())
+            .collect::<Vec<_>>(),
+        vec![8, 8, 4],
+        "chunk traces must match the heights the artifacts predict"
+    );
+    let _ = ChipSet::FULL;
+}
+
+/// The arithmetic the census and the round shape read must be the split the
+/// prover actually materializes. Two derivations of one boundary is how a chunk
+/// comes to commit a different matrix than the one it proves.
+#[test]
+fn the_blake3_chunk_arithmetic_is_the_group_split() {
+    use super::airs::blake3_chunk_rows;
+
+    for per in [1usize, 2, 5, 7, 12, 13] {
+        let program = blake3_sponge_program(CHUNKED_CHAIN_LEN)
+            .with_blake3_chunking(Blake3Chunking::from_compressions(per));
+        let real = program.blake3_chunk_real_rows();
+        let padded = blake3_chunk_rows(&program);
+        assert_eq!(real.len(), program.blake3_chunk_count());
+        assert_eq!(real.iter().sum::<usize>(), 12, "per={per}: rows were lost");
+        for (c, (&r, &p)) in real.iter().zip(&padded).enumerate() {
+            let group = program.blake3_chunk_group(c);
+            assert_eq!(group.real_rows, r, "per={per} chunk {c}: real rows");
+            assert_eq!(group.padded_rows, p, "per={per} chunk {c}: padded rows");
+            assert_eq!(group.width, program.groups.blake3.width);
+            assert_eq!(group.data.len(), p * group.width);
+            // And the rows really are this chunk's slice of the whole group.
+            let base = c * per;
+            for row in 0..r {
+                for col in 0..group.width {
+                    assert_eq!(
+                        group.at(row, col),
+                        program.groups.blake3.at(base + row, col),
+                        "per={per} chunk {c} row {row} col {col}: wrong source row"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// ★ The acceptance test: a program needing three `LFM_BLAKE3` chunks proves and
+/// verifies COMPLETELY, on both the per-table and the batched path, and its
+/// digest is still the host chain's.
+#[test]
+fn chunked_blake3_proves_and_verifies() {
+    use super::proof::{lfm_prove_batched, verify_against_artifacts, verify_against_batched};
+
+    let opts = options();
+    let msg = message(CHUNKED_CHAIN_LEN);
+    let program = chunked_chain_program();
+    let artifacts = build_artifacts(&program, &opts);
+    assert_eq!(artifacts.blake3_chunks(), 3, "this test needs 3 chunks");
+
+    let proved = lfm_prove(&program, &artifacts, &sponge_arenas(&msg), &opts).expect("prove");
+    assert_eq!(
+        digest_bytes(&proved.public_words),
+        blake3_chain(&msg),
+        "a chunked proof must hash the same as the host chain"
+    );
+    assert_eq!(
+        stark::proof::view::MultiProofView::Owned(&proved.proof).len(),
+        artifacts.chip_set.num_airs(0, 3),
+        "the proof must carry one sub-proof per AIR instance"
+    );
+    assert!(
+        verify_against_artifacts(&artifacts, &proved.proof, &proved.public_words, &opts),
+        "a three-chunk LFM_BLAKE3 proof must verify"
+    );
+
+    // The batched path is the one the aggregation layer proves on, so it is the
+    // one that has to carry chunking; verifying only the per-table path would
+    // leave the real consumer untested.
+    let batched = lfm_prove_batched(&program, &artifacts, &sponge_arenas(&msg), &opts)
+        .expect("the chunked program must prove batched");
+    assert_eq!(
+        digest_bytes(&batched.public_words),
+        blake3_chain(&msg),
+        "the batched chunked proof must hash the same"
+    );
+    assert!(
+        verify_against_batched(&artifacts, &batched.proof, &batched.public_words, &opts),
+        "a three-chunk batched proof must verify completely"
+    );
+}
+
+/// ★ Chunking is a prover-side layout choice, not a semantic one: the same
+/// message proved at 1 and at 3 chunks publishes byte-identical words.
+///
+/// The program *identity* does differ — and here, unlike `KECCAK_RND` chunking,
+/// so does slot 11's ROOT, because this chip's chunks each commit their own
+/// slice of the instruction group. Every other root is untouched, which is what
+/// says the split is confined to the chip it names.
+#[test]
+fn blake3_chunking_does_not_change_what_is_proved() {
+    use super::airs::BLAKE3_SLOT;
+    use super::proof::verify_against_artifacts;
+
+    let opts = options();
+    let msg = message(CHUNKED_CHAIN_LEN);
+
+    let one = blake3_sponge_program(CHUNKED_CHAIN_LEN);
+    let one_artifacts = build_artifacts(&one, &opts);
+    assert_eq!(one_artifacts.blake3_chunks(), 1);
+    let one_proof = lfm_prove(&one, &one_artifacts, &sponge_arenas(&msg), &opts).expect("prove");
+
+    let three = chunked_chain_program();
+    let three_artifacts = build_artifacts(&three, &opts);
+    let three_proof =
+        lfm_prove(&three, &three_artifacts, &sponge_arenas(&msg), &opts).expect("prove");
+
+    assert_eq!(
+        one_proof.public_words, three_proof.public_words,
+        "chunking must not change the program's output"
+    );
+    for slot in 0..super::airs::NUM_LFM_CHIPS {
+        if slot == BLAKE3_SLOT {
+            continue;
+        }
+        assert_eq!(
+            one_artifacts.roots[slot], three_artifacts.roots[slot],
+            "slot {slot}: chunking LFM_BLAKE3 must move no other chip's root"
+        );
+    }
+    assert_ne!(
+        one_artifacts.roots[BLAKE3_SLOT], three_artifacts.roots[BLAKE3_SLOT],
+        "chunk 0 is a different matrix than the whole group, so its root differs"
+    );
+    assert_ne!(
+        one_artifacts.program_id, three_artifacts.program_id,
+        "the chunk shape is program shape and must be bound into the digest"
+    );
+    for (artifacts, proof) in [
+        (&one_artifacts, &one_proof),
+        (&three_artifacts, &three_proof),
+    ] {
+        assert!(
+            verify_against_artifacts(artifacts, &proof.proof, &proof.public_words, &opts),
+            "both chunkings must verify against their own artifacts"
+        );
+    }
+    // And neither crosses: the digests bind the shape, so a proof of one split
+    // is not a proof under the other's identity.
+    assert!(
+        !verify_against_artifacts(
+            &one_artifacts,
+            &three_proof.proof,
+            &three_proof.public_words,
+            &opts
+        ),
+        "a three-chunk proof must not verify against the single-table identity"
+    );
+    assert!(
+        !verify_against_artifacts(
+            &three_artifacts,
+            &one_proof.proof,
+            &one_proof.public_words,
+            &opts
+        ),
+        "a single-table proof must not verify against the three-chunk identity"
+    );
+}
+
+/// ★ Tamper: corrupting a compression that lives in the LAST chunk must reject.
+/// The first two chunks are untouched, so this only rejects if chunk 2's rows are
+/// really part of the proof's bus balance.
+#[test]
+fn a_tampered_non_first_blake3_chunk_rejects() {
+    use super::proof::verify_against_artifacts;
+
+    let opts = options();
+    let msg = message(CHUNKED_CHAIN_LEN);
+    let program = chunked_chain_program();
+    let artifacts = build_artifacts(&program, &opts);
+    let exec = execute(&program, &sponge_arenas(&msg), &TestPermutation).expect("execute");
+
+    let mut traces = super::trace::build_traces(&program, &exec.records);
+    assert_eq!(traces.blake3.len(), 3);
+    // One output byte of the LAST chunk's first compression — the eleventh of
+    // the twelve, which no other chunk carries.
+    let col = cols::out_word(0, 0);
+    let old = traces.blake3[2].main_table.get_row(0)[col];
+    traces.blake3[2].main_table.set_fe(0, col, old + FE::one());
+
+    match super::proof::prove_traces(&artifacts, &mut traces, &exec.public_words, &opts) {
+        Err(_) => {}
+        Ok(proof) => assert!(
+            !verify_against_artifacts(&artifacts, &proof, &exec.public_words, &opts),
+            "a corrupted compression in the third chunk must reject"
+        ),
+    }
+}
+
+/// The verifier builds its AIR set from the supplied chunk roots, so a chunk list
+/// that disagrees with the proof's shape must be rejected — including the
+/// single-root list `verify_against` supplies, which is why a chunked caller has
+/// to go through the artifacts door.
+#[test]
+fn verify_rejects_a_blake3_chunk_list_that_does_not_match_the_proof() {
+    use super::proof::verify_against_chunked;
+
+    let opts = options();
+    let msg = message(CHUNKED_CHAIN_LEN);
+    let program = chunked_chain_program();
+    let artifacts = build_artifacts(&program, &opts);
+    let proved = lfm_prove(&program, &artifacts, &sponge_arenas(&msg), &opts).expect("prove");
+
+    // The single-table door: one instance against a three-instance proof.
+    assert!(
+        !verify_against(
+            &artifacts.roots,
+            &artifacts.program_id,
+            artifacts.keccak_rnd_chunks,
+            &proved.proof,
+            &proved.public_words,
+            &opts,
+            artifacts.hasher,
+            artifacts.chip_set,
+        ),
+        "the single-LFM_BLAKE3 door must not verify a three-chunk proof"
+    );
+    // Every wrong length, and the right length with the TAIL roots swapped.
+    // Chunk 0 stays put deliberately: it is the roots array's slot-11 entry, and
+    // a list that disagreed with it would be a caller bug the AIR set asserts on,
+    // not a proof outcome. Swapping chunks 1 and 2 — which commit different
+    // matrices at different heights — is the same falsification without that.
+    let mut roots = artifacts.blake3_chunk_roots.clone();
+    roots.swap(1, 2);
+    for wrong in [
+        &artifacts.blake3_chunk_roots[..1],
+        &artifacts.blake3_chunk_roots[..2],
+        &roots[..],
+    ] {
+        assert!(
+            !verify_against_chunked(
+                &artifacts.roots,
+                wrong,
+                &artifacts.program_id,
+                artifacts.keccak_rnd_chunks,
+                &proved.proof,
+                &proved.public_words,
+                &opts,
+                artifacts.hasher,
+                artifacts.chip_set,
+            ),
+            "a {}-root chunk list must not verify this proof",
+            wrong.len()
+        );
+    }
+}
+
+/// ★ The census counts every chunk — one entry per sub-proof, at the chunk's own
+/// height, and the cell totals are that decomposition summed.
+#[test]
+fn the_census_counts_every_blake3_chunk() {
+    use super::airs::{HeightRule, blake3_chunk_rows, lfm_cell_counts, lfm_chip_census};
+
+    let one = blake3_sponge_program(CHUNKED_CHAIN_LEN);
+    let three = chunked_chain_program();
+
+    for (label, program, chunks) in [("1 chunk", &one, 1usize), ("3 chunks", &three, 3)] {
+        let census = lfm_chip_census(program);
+        let artifacts = build_artifacts(program, &options());
+        assert_eq!(
+            census.len(),
+            artifacts
+                .chip_set
+                .num_airs(artifacts.keccak_rnd_chunks, artifacts.blake3_chunks()),
+            "{label}: the census must have one entry per sub-proof"
+        );
+        let entries: Vec<_> = census.iter().filter(|c| c.name == "LFM_BLAKE3").collect();
+        assert_eq!(entries.len(), chunks, "{label}: one census entry per chunk");
+        assert_eq!(
+            entries.iter().map(|c| c.rows).collect::<Vec<_>>(),
+            blake3_chunk_rows(program)
+                .into_iter()
+                .map(|r| r as u64)
+                .collect::<Vec<_>>(),
+            "{label}: census heights must be the chunk heights"
+        );
+        assert_eq!(
+            entries.iter().map(|c| c.real_rows).sum::<u64>(),
+            12,
+            "{label}: the chunks' real rows must be the program's compressions"
+        );
+        // A split table's headroom is a policy artefact, not a cliff; a single
+        // table's is the workload's own.
+        let want = if chunks > 1 {
+            HeightRule::Chunked
+        } else {
+            HeightRule::Workload
+        };
+        assert!(
+            entries.iter().all(|c| c.height_rule == want),
+            "{label}: wrong height rule"
+        );
+        // The totals ARE this decomposition, so they cannot disagree with it.
+        let (main, aux) = lfm_cell_counts(program);
+        assert_eq!(
+            (main, aux),
+            census.iter().fold((0u64, 0u64), |(m, a), c| (
+                m + c.main_cells(),
+                a + c.aux_cells()
+            )),
+            "{label}: cell totals must be the census summed"
+        );
+    }
+}
+
+/// The batched preprocessed round expands with the chunks: eleven fixed slot
+/// matrices, then ONE per `LFM_BLAKE3` chunk at that chunk's own LDE height —
+/// and the shape a verifier reads back rebuilds the pinned root.
+///
+/// The round is absorbed in slot order and this chip is the last slot in it, so
+/// the chunks land at the end; getting the count or an individual height wrong
+/// is not loud (the tree still builds), which is why the rebuild is the
+/// assertion rather than the shape alone.
+#[test]
+fn the_prep_round_expands_with_the_blake3_chunks() {
+    use super::commit::{PrepRoundBuilder, group_columns, lde_columns};
+    use super::registry::PREP_ROUND_SLOTS;
+
+    let opts = options();
+    let program = chunked_chain_program();
+    let artifacts = build_artifacts(&program, &opts);
+    let (heights, widths) = artifacts.prep_round_shape(opts.blowup_factor);
+
+    assert_eq!(heights.len(), widths.len());
+    assert_eq!(
+        heights.len(),
+        PREP_ROUND_SLOTS.len() - 1 + 3,
+        "eleven fixed slots plus one matrix per chunk"
+    );
+    let blowup_log = (opts.blowup_factor as usize).trailing_zeros() as usize;
+    for (i, slot) in PREP_ROUND_SLOTS.take(super::airs::BLAKE3_SLOT).enumerate() {
+        assert_eq!(
+            heights[i],
+            artifacts.log_heights[slot] as usize + blowup_log
+        );
+    }
+    for (c, h) in artifacts.blake3_chunk_log_heights.iter().enumerate() {
+        assert_eq!(
+            heights[super::airs::BLAKE3_SLOT + c],
+            *h as usize + blowup_log,
+            "chunk {c}: the round's height must be the chunk's LDE height"
+        );
+        assert_eq!(
+            widths[super::airs::BLAKE3_SLOT + c],
+            program.groups.blake3.width
+        );
+    }
+
+    let range = super::trace::range_group();
+    let fixed = [
+        &program.groups.const_,
+        &program.groups.balu,
+        &program.groups.xalu,
+        &program.groups.select,
+        &program.groups.bitdec,
+        &program.groups.hash,
+        &program.groups.keccak,
+        &program.groups.lanes,
+        &program.groups.hint,
+        &program.groups.public,
+        &range,
+    ];
+    let dims: Vec<(usize, usize)> = heights
+        .iter()
+        .copied()
+        .zip(widths.iter().copied())
+        .collect();
+    let mut round = PrepRoundBuilder::new(&dims);
+    for g in fixed.iter() {
+        round.absorb(&lde_columns(&group_columns(g), &opts));
+    }
+    for c in 0..artifacts.blake3_chunks() {
+        let g = program.blake3_chunk_group(c);
+        round.absorb(&lde_columns(&group_columns(&g), &opts));
+    }
+    assert_eq!(
+        round.finish(),
+        artifacts.prep_root,
+        "the shape a verifier reads back must rebuild the pinned root"
+    );
+}
+
+/// The knob's whole path: a variable VALUE becomes a policy, the policy becomes
+/// chunks, and the chunked program proves and verifies. The parse itself is
+/// tested in [`super::chunking`]; this is what says the value reaches the
+/// machine rather than stopping at a struct nobody reads.
+#[test]
+fn the_env_knob_value_chunks_a_real_prove() {
+    use super::proof::verify_against_artifacts;
+
+    let opts = options();
+    let msg = message(CHUNKED_CHAIN_LEN);
+    let chunking = Blake3Chunking::from_env_value(Some("2")).expect("a set knob is a policy");
+    let program = blake3_sponge_program(CHUNKED_CHAIN_LEN).with_blake3_chunking(chunking);
+    assert_eq!(
+        program.blake3_chunk_count(),
+        3,
+        "2^2 rows per chunk over 12 compressions is three chunks"
+    );
+
+    let artifacts = build_artifacts(&program, &opts);
+    let proved = lfm_prove(&program, &artifacts, &sponge_arenas(&msg), &opts).expect("prove");
+    assert_eq!(digest_bytes(&proved.public_words), blake3_chain(&msg));
+    assert!(
+        verify_against_artifacts(&artifacts, &proved.proof, &proved.public_words, &opts),
+        "the knob's own shape must prove and verify"
+    );
 }

@@ -31,6 +31,9 @@ pub const LFM_MACHINE_VERSION: u32 = 1;
 pub const LFM_PRESET_TAG: u32 = 0;
 
 const LFM_PROGRAM_TAG: &[u8] = b"LAMBDAVM_LFM_PROGRAM_V1";
+/// Separates the `LFM_BLAKE3` chunk tail from the fixed part of the preimage.
+/// See the suffix note in [`lfm_program_id`].
+const LFM_BLAKE3_CHUNK_TAG: &[u8] = b"LAMBDAVM_LFM_BLAKE3_CHUNKS_V1";
 /// `pub(super)`: the aggregation layer's emitted verifier replays
 /// [`absorb_lfm_statement`] byte for byte and needs the same tag bytes.
 pub(super) const LFM_STATEMENT_TAG: &[u8] = b"LAMBDAVM_LFM_STATEMENT_V1";
@@ -57,7 +60,11 @@ const fn commitment_hash_tag(hash: CommitmentHash) -> u8 {
 /// `keccak_rnd_chunks` is bound alongside the roots and heights because it is
 /// program shape too: it decides how many `KECCAK_RND` instances the verifier
 /// builds. Binding it here is what makes the registry entry — rather than the
-/// proof — the authority on that shape.
+/// proof — the authority on that shape. `blake3_chunk_roots` /
+/// `blake3_chunk_log_heights` are the same decision for `LFM_BLAKE3`, and they
+/// are slices rather than a count because that chip's chunks are not identical:
+/// each commits its own slice of the instruction group. They are absorbed as a
+/// tail, for the reason spelled out at the absorb itself.
 ///
 /// `hasher` is bound for the same reason and is the one piece of program shape
 /// the roots cannot carry: `LFM_HASH`'s preprocessed group is its INSTRUCTION
@@ -85,12 +92,15 @@ const fn commitment_hash_tag(hash: CommitmentHash) -> u8 {
 /// commit helpers in `registry.rs` are hard-wired to `stark`'s default aliases,
 /// which is exactly what `stark::config::COMMITMENT_HASH` names. Should those
 /// helpers ever become generic over `H`, this read moves with them.
+#[allow(clippy::too_many_arguments)]
 pub fn lfm_program_id(
     roots: &[Commitment; NUM_LFM_CHIPS],
     log_heights: &[u8; NUM_LFM_CHIPS],
     keccak_rnd_chunks: usize,
     hasher: HasherKind,
     chip_set: ChipSet,
+    blake3_chunk_roots: &[Commitment],
+    blake3_chunk_log_heights: &[u8],
 ) -> Commitment {
     let mut h = Keccak256::new();
     h.update(LFM_PROGRAM_TAG);
@@ -111,6 +121,39 @@ pub fn lfm_program_id(
         h.update([log_heights[i]]);
     }
     h.update((keccak_rnd_chunks as u64).to_le_bytes());
+    // ★ `LFM_BLAKE3` chunking rides as a SUFFIX, and only when it is on.
+    //
+    // The chip's chunks each commit their own instruction group, so a split
+    // program has roots and heights the fifteen-wide arrays cannot hold. Chunk 0
+    // is already bound above — it IS `roots[BLAKE3_SLOT]` — so what is left is
+    // chunks 1.. , and a program with none of them absorbs NOTHING here. That is
+    // deliberate: a single-table program is the machine as it stood before
+    // chunking existed, and every blessed `LFM_REGISTRY` digest must stay the
+    // byte-identical value it was blessed at.
+    //
+    // Ambiguity between "no tail" and "a tail" is what a suffix encoding has to
+    // rule out, and the length prefix does it: a non-empty tail contributes at
+    // least the tag and eight length bytes, so no empty-tail preimage can equal
+    // a non-empty one, and two non-empty tails of different lengths cannot
+    // collide either. The chunk COUNT is bound by that same length — `n` tail
+    // entries is `n + 1` chunks — so nothing about the split is left unnamed.
+    debug_assert_eq!(
+        blake3_chunk_roots.len(),
+        blake3_chunk_log_heights.len(),
+        "an LFM_BLAKE3 chunk has exactly one root and one height"
+    );
+    if blake3_chunk_roots.len() > 1 {
+        h.update(LFM_BLAKE3_CHUNK_TAG);
+        h.update(((blake3_chunk_roots.len() - 1) as u64).to_le_bytes());
+        for (root, height) in blake3_chunk_roots
+            .iter()
+            .zip(blake3_chunk_log_heights)
+            .skip(1)
+        {
+            h.update(root);
+            h.update([*height]);
+        }
+    }
     h.finalize().into()
 }
 

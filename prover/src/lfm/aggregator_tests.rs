@@ -2131,6 +2131,27 @@ fn the_aggregate_leg_census_matches_the_closed_form() {
         "an aggregator leg's walks must hash exactly the census closed form"
     );
     assert_eq!(other_delta, 0, "the walks hash under the wrap hash alone");
+
+    // ★ The closed form is CHUNK-INVARIANT, and that is a property, not an
+    // accident. `LFM_BLAKE3` chunking redistributes the chip's rows over AIR
+    // instances AFTER compilation, so the instruction stream this census counts
+    // is the same program either way. Asserted rather than argued: a chunking
+    // that reached back into emission would move the census silently, and the
+    // aggregation program is exactly where chunking gets switched on.
+    let per = full.groups.blake3.real_rows.div_ceil(3).max(1);
+    let chunked =
+        full.with_blake3_chunking(super::chunking::Blake3Chunking::from_compressions(per));
+    assert!(
+        chunked.blake3_chunk_count() > 1,
+        "the control needs a real split, got {} chunks of {per}",
+        chunked.blake3_chunk_count()
+    );
+    assert_eq!(
+        count(&chunked, is_keccak) - count(&spine, is_keccak),
+        wrap_delta,
+        "chunking must not move the leg's wrap-hash census"
+    );
+
     eprintln!(
         "aggregate leg census: {per_query} wrap permutations/query over {} chips at the          aggregation preset",
         e.proof.tables.len()
@@ -2342,7 +2363,16 @@ fn the_real_block_aggregates_end_to_end() {
     pages.sort_by_key(|(base, _)| *base);
     let elf_digest = crate::statement::elf_digest(&inputs.elf_bytes);
     let t = Instant::now();
-    let program = aggregator_program(
+    // ★ LFM_BLAKE3 chunking, chosen at EMISSION time. The aggregation program is
+    // where the chip's ~1.39M compressions land in ONE table, whose blowup-2 LDE
+    // is a single ~102 GB allocation; `LFM_BLAKE3_MAX_CHUNK_ROWS_LOG2=k` splits
+    // it into 2^k-row tables. Applied HERE and nowhere else: the wraps are cached
+    // artifacts at the census point, and re-chunking them would invalidate them.
+    // The chunk shape is bound into `program_id`, so the aggregation identity
+    // moves with the knob — which is fine, and is what the consumer contract
+    // pins.
+    let blake3_chunking = super::chunking::Blake3Chunking::from_env();
+    let mut program = aggregator_program(
         &wraps,
         &layouts,
         &labels,
@@ -2354,6 +2384,19 @@ fn the_real_block_aggregates_end_to_end() {
             num_private_input_pages: bundle.num_private_pages(),
         },
     );
+    if let Some(chunking) = blake3_chunking {
+        program = program.with_blake3_chunking(chunking);
+        println!(
+            "   aggregation LFM_BLAKE3 chunking: {} compressions/chunk -> {} chunks of {:?} rows \
+             ({} compressions) ({})",
+            chunking.compressions_per_chunk(),
+            program.blake3_chunk_count(),
+            super::airs::blake3_chunk_rows(&program),
+            program.groups.blake3.real_rows,
+            super::chunking::BLAKE3_MAX_CHUNK_ROWS_LOG2_ENV,
+        );
+    }
+    let program = program;
     let mut arenas: Vec<Vec<LfmWord>> = wraps.iter().flat_map(leg_arena_words).collect();
     arenas.extend(leg_arena_words(&global_wrap));
     let f = FixtureAggregate {

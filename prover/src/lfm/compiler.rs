@@ -17,7 +17,7 @@
 use crate::tables::types::FE;
 
 use super::builder::{ArenaSchema, LfmProgramSource};
-use super::chunking::KeccakChunking;
+use super::chunking::{Blake3Chunking, KeccakChunking};
 use super::instr::{Addr, BaseOp, ExtOp, HashMode, Instr, KeccakMode};
 use super::layout::{self, padded_rows};
 
@@ -136,6 +136,13 @@ pub struct LfmProgram {
     /// instances. Program shape, not a runtime knob: it is fixed here, bound
     /// into the program digest and pinned in the registry.
     pub chunking: KeccakChunking,
+    /// How this program's compressions are spread over `LFM_BLAKE3` instances.
+    /// Program shape on the same terms as [`Self::chunking`] — and with one
+    /// consequence that policy does not have: `LFM_BLAKE3` carries a
+    /// preprocessed instruction group, so each chunk commits its own root.
+    /// Defaults to a single table, which is the machine as it stood before
+    /// chunking existed.
+    pub blake3_chunking: Blake3Chunking,
 }
 
 impl LfmProgram {
@@ -148,6 +155,67 @@ impl LfmProgram {
     pub fn with_keccak_chunking(mut self, chunking: KeccakChunking) -> Self {
         self.chunking = chunking;
         self
+    }
+
+    /// Replaces the `LFM_BLAKE3` chunking policy.
+    ///
+    /// Safe after compilation for [`Self::with_keccak_chunking`]'s reason —
+    /// chunking redistributes rows over AIR instances and never changes what is
+    /// compiled — but note the extra consequence: this chip's chunks each commit
+    /// their own instruction group, so a program re-chunked after
+    /// `build_artifacts` has been called needs FRESH artifacts, and its
+    /// `program_id` differs from the unchunked one's.
+    pub fn with_blake3_chunking(mut self, chunking: Blake3Chunking) -> Self {
+        self.blake3_chunking = chunking;
+        self
+    }
+
+    /// `LFM_BLAKE3` instances this program's policy asks for — at least one,
+    /// even with no compressions at all. The chip MASK is what drops an unused
+    /// family; see [`ChipSet::blake3_chunks`](super::airs::ChipSet::blake3_chunks).
+    pub fn blake3_chunk_count(&self) -> usize {
+        self.blake3_chunking
+            .chunk_count(self.groups.blake3.real_rows)
+    }
+
+    /// Compressions in each `LFM_BLAKE3` chunk, in chunk order.
+    pub fn blake3_chunk_real_rows(&self) -> Vec<usize> {
+        let total = self.groups.blake3.real_rows;
+        (0..self.blake3_chunk_count())
+            .map(|c| self.blake3_chunking.chunk_range(total, c).len())
+            .collect()
+    }
+
+    /// One `LFM_BLAKE3` chunk's instruction column group: the rows the policy
+    /// assigns it, re-padded to its own power-of-two height.
+    ///
+    /// Built one chunk at a time rather than returned as a `Vec` because the
+    /// aggregation program's group is ~1.39M rows x 20 columns; the artifact
+    /// builder and the trace builder each commit or copy a chunk and drop it, so
+    /// peak residency stays one chunk instead of a second whole group.
+    ///
+    /// # Panics
+    ///
+    /// On a chunk index at or past [`Self::blake3_chunk_count`] — a caller bug,
+    /// and this runs at program-build time, never on a verify path.
+    pub fn blake3_chunk_group(&self, chunk: usize) -> ColumnGroup {
+        let count = self.blake3_chunk_count();
+        assert!(
+            chunk < count,
+            "LFM_BLAKE3 chunk {chunk} requested of a {count}-chunk program"
+        );
+        let group = &self.groups.blake3;
+        let rows = self.blake3_chunking.chunk_range(group.real_rows, chunk);
+        let real_rows = rows.len();
+        let padded_rows = padded_rows(real_rows);
+        let mut data = group.data[rows.start * group.width..rows.end * group.width].to_vec();
+        data.resize(padded_rows * group.width, FE::zero());
+        ColumnGroup {
+            width: group.width,
+            real_rows,
+            padded_rows,
+            data,
+        }
     }
 }
 
@@ -293,6 +361,7 @@ pub fn compile(source: LfmProgramSource) -> LfmProgram {
         public_len,
         groups,
         chunking: KeccakChunking::default(),
+        blake3_chunking: Blake3Chunking::default(),
     }
 }
 

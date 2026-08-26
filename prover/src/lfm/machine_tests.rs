@@ -6,6 +6,7 @@ use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};
 
 use crate::tables::types::FE;
 
+use super::airs::BLAKE3_SLOT;
 use super::executor::LfmExecError;
 use super::fixture::{self, bump_lane0, fixture_prove};
 use super::programs::{fri_toy_program, trivial_program, trivial_program_source};
@@ -2587,6 +2588,8 @@ fn every_registry_entry_binds_its_hasher_into_its_digest() {
                 entry.keccak_rnd_chunks,
                 entry.hasher,
                 entry.chip_set,
+                &[entry.roots[BLAKE3_SLOT]],
+                &[entry.log_heights[BLAKE3_SLOT]],
             ),
             entry.program_id,
             "{:?}: the stored digest must be what the stored shape derives",
@@ -2603,6 +2606,8 @@ fn every_registry_entry_binds_its_hasher_into_its_digest() {
                     entry.keccak_rnd_chunks,
                     other,
                     entry.chip_set,
+                    &[entry.roots[BLAKE3_SLOT]],
+                    &[entry.log_heights[BLAKE3_SLOT]],
                 ),
                 entry.program_id,
                 "{:?}: {other:?} must not share {:?}'s program identity",
@@ -2676,7 +2681,7 @@ fn chunking_splits_the_sponge_into_two_uneven_chunks() {
 
     let artifacts = build_artifacts(&program, &options());
     assert_eq!(artifacts.keccak_rnd_chunks, 2);
-    assert_eq!(num_lfm_airs(2), super::NUM_LFM_CHIPS + 1);
+    assert_eq!(num_lfm_airs(2, 1), super::NUM_LFM_CHIPS + 1);
 
     let exec = super::executor::execute(
         &program,
@@ -2716,7 +2721,7 @@ fn chunked_sponge_proves_and_verifies() {
     );
     assert_eq!(
         stark::proof::view::MultiProofView::Owned(&proved.proof).len(),
-        artifacts.chip_set.num_airs(2),
+        artifacts.chip_set.num_airs(2, artifacts.blake3_chunks()),
         "the proof must carry one sub-proof per AIR instance"
     );
     assert!(
@@ -4839,15 +4844,11 @@ fn a_program_using_no_hash_family_carries_neither() {
     }
 }
 
-/// The registry's masks are what the programs actually compile to.
-///
-/// The mask is the authority the verifier reads, so a registry entry claiming a
-/// family the program does not use — or omitting one it does — would build the
-/// wrong AIR set. This recomputes every entry's mask from its program.
-#[test]
-fn every_registry_mask_is_the_programs_own_usage() {
-    let opts = options();
-    let cases: [(LfmProgramKind, super::compiler::LfmProgram); 6] = [
+/// Every registered program next to the kind it is blessed under — the list the
+/// entry-vs-program tests recompute from. One copy, so a seventh row cannot be
+/// added to the table while a test keeps checking six.
+fn registry_program_cases() -> [(LfmProgramKind, super::compiler::LfmProgram); 6] {
+    [
         (LfmProgramKind::TrivialV0, trivial_program()),
         (LfmProgramKind::FriToyV0, super::programs::fri_toy_program()),
         (LfmProgramKind::KeccakChainV0, keccak_chain_program()),
@@ -4863,7 +4864,53 @@ fn every_registry_mask_is_the_programs_own_usage() {
             LfmProgramKind::StatementReplayV0,
             statement_replay_program(),
         ),
-    ];
+    ]
+}
+
+/// ★ The premise `LfmRegistryEntry::artifacts` rests on: every registered
+/// program is a SINGLE `LFM_BLAKE3` table.
+///
+/// The entry has no `blake3_chunks` column — the chunk shape is derived as "slot
+/// 11's own root and height" — which is only correct while every registered
+/// program sits at the policy default. Recomputing each program's chunk count
+/// here is what turns that from a convention into a checked premise: blessing a
+/// chunked program fails this test, which is the moment to add the column.
+#[test]
+fn every_registry_entry_is_a_single_blake3_table() {
+    let opts = options();
+    for (kind, program) in registry_program_cases() {
+        assert_eq!(
+            program.blake3_chunk_count(),
+            1,
+            "{kind:?}: a registered program must be a single LFM_BLAKE3 table"
+        );
+        let entry = resolve(kind, opts.blowup_factor).expect("registered");
+        let artifacts = build_artifacts(&program, &opts);
+        let derived = entry.artifacts();
+        assert_eq!(
+            derived.blake3_chunk_roots, artifacts.blake3_chunk_roots,
+            "{kind:?}: the derived chunk roots must be the program's own"
+        );
+        assert_eq!(
+            derived.blake3_chunk_log_heights, artifacts.blake3_chunk_log_heights,
+            "{kind:?}: the derived chunk heights must be the program's own"
+        );
+        assert_eq!(
+            derived.program_id, artifacts.program_id,
+            "{kind:?}: and the digest the pair derives must be the blessed one"
+        );
+    }
+}
+
+/// The registry's masks are what the programs actually compile to.
+///
+/// The mask is the authority the verifier reads, so a registry entry claiming a
+/// family the program does not use — or omitting one it does — would build the
+/// wrong AIR set. This recomputes every entry's mask from its program.
+#[test]
+fn every_registry_mask_is_the_programs_own_usage() {
+    let opts = options();
+    let cases = registry_program_cases();
     for (kind, program) in &cases {
         let entry = super::registry::resolve(*kind, 2).expect("registered");
         let computed = super::airs::ChipSet::for_program(program);
@@ -4893,6 +4940,8 @@ fn every_registry_mask_is_the_programs_own_usage() {
                 entry.keccak_rnd_chunks,
                 entry.hasher,
                 other,
+                &[entry.roots[BLAKE3_SLOT]],
+                &[entry.log_heights[BLAKE3_SLOT]],
             ),
             entry.program_id,
             "{kind:?}: the chip set must be folded into program_id, or a verifier \
@@ -5033,33 +5082,37 @@ fn the_slot_to_table_map_is_not_the_identity_beyond_one_chunk() {
     const FULL: ChipSet = ChipSet::FULL;
 
     // One chunk: the degenerate case the whole registry lives in.
-    assert_eq!(slot_of_table(12, 1, FULL), Some(KECCAK_RND_SLOT));
-    assert_eq!(slot_of_table(13, 1, FULL), Some(13));
-    assert_eq!(slot_of_table(14, 1, FULL), Some(14));
-    assert_eq!(slot_of_table(15, 1, FULL), None, "past the end of the set");
+    assert_eq!(slot_of_table(12, 1, 1, FULL), Some(KECCAK_RND_SLOT));
+    assert_eq!(slot_of_table(13, 1, 1, FULL), Some(13));
+    assert_eq!(slot_of_table(14, 1, 1, FULL), Some(14));
+    assert_eq!(
+        slot_of_table(15, 1, 1, FULL),
+        None,
+        "past the end of the set"
+    );
 
     // Three chunks: KECCAK_RC moves from table 13 to table 15. An identity map
     // would answer 13 here and be wrong by exactly the off-by-one this exists
     // to catch.
     for table in 12..15 {
         assert_eq!(
-            slot_of_table(table, 3, FULL),
+            slot_of_table(table, 3, 1, FULL),
             Some(KECCAK_RND_SLOT),
             "table {table} is a KECCAK_RND copy at three chunks"
         );
     }
     assert_eq!(
-        slot_of_table(15, 3, FULL),
+        slot_of_table(15, 3, 1, FULL),
         Some(13),
         "KECCAK_RC shifted by chunks"
     );
     assert_eq!(
-        slot_of_table(16, 3, FULL),
+        slot_of_table(16, 3, 1, FULL),
         Some(14),
         "BITWISE shifted by chunks"
     );
     assert_ne!(
-        slot_of_table(13, 3, FULL),
+        slot_of_table(13, 3, 1, FULL),
         Some(13),
         "the map must not be the identity once more than one chunk exists"
     );
@@ -5088,7 +5141,7 @@ fn the_width_compaction_rejects_a_round_it_does_not_cover() {
         dims: (0..14).map(|_| (4usize, 1usize)).collect(),
     };
     assert_eq!(
-        pinned_prep_widths(&real, &artifacts.prep_widths, 1, ChipSet::FULL),
+        pinned_prep_widths(&real, &artifacts.prep_widths, 1, 1, ChipSet::FULL),
         None,
         "the round does not cover KECCAK_RC/BITWISE, so it must refuse rather than \
          hand back a slice describing a different round"
@@ -5104,7 +5157,7 @@ fn the_width_compaction_rejects_a_round_it_does_not_cover() {
         .map(|s| artifacts.prep_widths[s] as usize)
         .collect();
     assert_eq!(
-        pinned_prep_widths(&covered, &artifacts.prep_widths, 1, ChipSet::FULL),
+        pinned_prep_widths(&covered, &artifacts.prep_widths, 1, 1, ChipSet::FULL),
         Some(expected),
         "honest-path control: a round inside PREP_ROUND_SLOTS must compact cleanly"
     );
@@ -5131,6 +5184,7 @@ fn the_width_compaction_follows_table_order_not_slot_order() {
         },
         &artifacts.prep_widths,
         1,
+        1,
         crate::lfm::airs::ChipSet::FULL,
     )
     .expect("slots 0..4 are covered");
@@ -5140,6 +5194,7 @@ fn the_width_compaction_follows_table_order_not_slot_order() {
             dims,
         },
         &artifacts.prep_widths,
+        1,
         1,
         crate::lfm::airs::ChipSet::FULL,
     )
