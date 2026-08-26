@@ -564,3 +564,23 @@ math[display="block"] {
 mtext {
   font-family: var(--font-mtext);
 }
+
+/* Definition lists */
+dl {
+  display: grid;
+  grid-template-columns: max-content auto;
+}
+
+dt {
+  grid-column-start: 1;
+  text-align: right;
+  font-weight: bold;
+}
+
+dt::after {
+  content: ": "
+}
+
+dd {
+  grid-column-start: 2;
+}
