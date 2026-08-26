@@ -43,7 +43,7 @@ $instance\(witness) = one$.
 Lastly, we introduce the commitment function $c: instanceSpace mapsto commitmentSpace$.
 To simplify notation, we use $commit(instance) = c(instance)$.
 
-We now assume the existence of _proving system_ $(prove, verify)$ with 
+We now assume the existence of _proof system_ $(prove, verify)$ with 
 prover $prove: instanceSpace times witnessSpace mapsto proofSpace$ and 
 verifier $verify: commitmentSpace times proofSpace mapsto BB$ such that
 $
@@ -78,8 +78,8 @@ This new proof $proof'$ thus attests to _the existence of a proof $proof$ that
 satisfies the verifier on the given instance $instance$_.
 
 This concept, colloquially known as _proof recursion_, can be applied repeatedly.
-The technique is specifically beneficial for _succint_ proving systems where proof size
-typically shrinks (and verification time therefore reduces) as the level of recursion increases.
+The technique is specifically beneficial for _succinct_ proving systems where proof size
+typically shrinks (and verification time reduces) as the level of recursion increases.
 The technique is mostly useful in settings where the extra time spent by the prover
 is outweighed by the time saved by the verifier(s), 
 e.g., a computationally constrained verifier, or multiple verifiers.
@@ -157,7 +157,7 @@ results of binary arithmetic are used to verify field arithmetical constraints
 and vice-versa --- e.g., hashing merkle leafs containing field elements during FRI-query proof verification.
 This implies that some form of communication between both VMs is required.
 
-This architecture enables the required communications by introducing a 
+Our architecture enables the required communications by introducing a 
 prover-hinted _communication record_ $record$ accessible to both VMs.
 In practice, this record will primarily contain values being reinterpreted 
 --- from $FF$ to $ZZ_(2^64)$ and vice-versa --- during verification.
