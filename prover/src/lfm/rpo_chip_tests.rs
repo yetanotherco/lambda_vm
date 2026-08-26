@@ -48,9 +48,12 @@ use crate::tables::types::{FE, GoldilocksExtension, GoldilocksField};
 
 use super::airs::lfm_chip_census_with_hasher;
 use super::chips::hash::{self, HashConstraints, rpo_cols as rc};
+use super::executor::LfmExecError;
+use super::fixture::{bump_lane0, fixture_prove_with_hasher};
 use super::hash::{HASH_STATE_FELTS, HasherKind, LfmHasher};
 use super::instr::HashMode;
-use super::programs::trivial_program;
+use super::programs::{fri_toy_program, trivial_program};
+use super::proof::LfmProveError;
 use super::proof::{lfm_prove_with_hasher, verify_against};
 use super::registry::{build_artifacts, build_artifacts_with_hasher};
 use super::rpo::{NUM_ROUNDS, Rpo256};
@@ -746,6 +749,128 @@ fn the_hasher_tags_are_stable_and_distinct() {
     assert_eq!(HasherKind::Blake3.as_tag(), 2);
     assert_eq!(HasherKind::Rpo.as_tag(), 3);
     assert_eq!(HasherKind::default(), HasherKind::Test);
+}
+
+// =========================================================================
+// End to end — a real inner proof, committed and verified under RPO
+// =========================================================================
+
+/// ★★★ **The whole socket-native pipeline under RPO, end to end.**
+///
+/// This is the test that turns "RPO is a chip" into "RPO is the machine's
+/// hash". A host FRI commitment-opening proof is produced with **every hash it
+/// performs — Merkle leaves, tree nodes and the Fiat–Shamir transcript — going
+/// through RPO** (`fixture::fixture_prove_with_hasher`), and the machine then
+/// verifies it: sponge transcript replay, Merkle-authenticated openings,
+/// α-combination, two unnormalized folds, terminal check. The resulting machine
+/// proof is then itself verified.
+///
+/// ⚠ **Nothing in the emitted verifier program is RPO-specific**, and that is
+/// the finding rather than an implementation detail. `programs::fri_toy_program`
+/// is emitted once and unchanged; it speaks only the frozen `LFM_HASH` socket
+/// ops. Which permutation those rows prove is `HasherKind`, chosen at AIR-build
+/// time. So the SAME program text is a Test-verifier, a Poseidon-verifier and an
+/// RPO-verifier — which is what makes a three-way comparison possible on one
+/// instrument instead of three emitters.
+#[test]
+fn the_machine_verifies_a_fixture_fri_proof_end_to_end_under_rpo() {
+    let opts = options();
+    let program = fri_toy_program();
+    let artifacts = build_artifacts_with_hasher(&program, &opts, HasherKind::Rpo);
+    let inner = fixture_prove_with_hasher(HasherKind::Rpo);
+    let proved = lfm_prove_with_hasher(
+        &program,
+        &artifacts,
+        &[inner.commitments.clone(), inner.openings.clone()],
+        &opts,
+        HasherKind::Rpo,
+    )
+    .expect("the machine must accept an RPO-committed inner proof");
+
+    // The attested public output is the inner proof's identity: both roots.
+    assert_eq!(proved.public_words[0].1, inner.commitments[0]);
+    assert_eq!(proved.public_words[1].1, inner.commitments[1]);
+
+    assert!(
+        verify_against(
+            &artifacts.roots,
+            &artifacts.program_id,
+            artifacts.keccak_rnd_chunks,
+            &proved.proof,
+            &proved.public_words,
+            &opts,
+            artifacts.hasher,
+            artifacts.chip_set,
+        ),
+        "the machine proof of RPO-committed FRI verification must verify"
+    );
+}
+
+/// Every tamper vector must make the RPO-configured verification program
+/// UNPROVABLE — the executor hits the same failed assert whose division the AIR
+/// makes unsatisfiable.
+///
+/// A verifier that accepts an honest proof proves nothing on its own; these are
+/// what say the RPO Merkle walks and the RPO transcript are load-bearing.
+#[test]
+fn the_machine_rejects_tampered_fri_proofs_under_rpo() {
+    let opts = options();
+    let program = fri_toy_program();
+    let artifacts = build_artifacts_with_hasher(&program, &opts, HasherKind::Rpo);
+    let honest = fixture_prove_with_hasher(HasherKind::Rpo);
+    let arenas = |p: &super::fixture::FriToyProof| vec![p.commitments.clone(), p.openings.clone()];
+
+    let expect_reject = |a: Vec<Vec<LfmWord>>, what: &str| match lfm_prove_with_hasher(
+        &program,
+        &artifacts,
+        &a,
+        &opts,
+        HasherKind::Rpo,
+    ) {
+        Err(LfmProveError::Exec(LfmExecError::DivByZero { .. })) => {}
+        other => panic!(
+            "{what}: expected a failed in-machine assert, got {:?}",
+            other.map(|_| "accepted")
+        ),
+    };
+
+    // (a) a tampered opened row value must break its RPO Merkle path.
+    let mut t = arenas(&honest);
+    t[1][0] = bump_lane0(&t[1][0]);
+    expect_reject(t, "tampered opened row");
+
+    // (b) a tampered commitment must break the transcript replay, which under
+    // RPO is a chain of `MODE_T` rows in the "LFMT" capacity domain.
+    let mut t = arenas(&honest);
+    t[0][0] = bump_lane0(&t[0][0]);
+    expect_reject(t, "tampered commitment");
+}
+
+/// ★ **A proof committed under one algebraic hash must not verify under
+/// another.**
+///
+/// The emitted program is identical across hashers, so this is exactly the
+/// property that keeps that from being a weakness: the inner proof's Merkle
+/// roots and transcript are RPO's, and a Poseidon-configured machine
+/// reconstructs neither. The rejection surfaces as an unprovable program, the
+/// same way a tampered proof does.
+#[test]
+fn a_fixture_proof_committed_under_rpo_is_not_provable_under_poseidon() {
+    let opts = options();
+    let program = fri_toy_program();
+    let inner = fixture_prove_with_hasher(HasherKind::Rpo);
+    let arenas = vec![inner.commitments.clone(), inner.openings.clone()];
+
+    for other in [HasherKind::Poseidon, HasherKind::Test] {
+        let artifacts = build_artifacts_with_hasher(&program, &opts, other);
+        match lfm_prove_with_hasher(&program, &artifacts, &arenas, &opts, other) {
+            Err(LfmProveError::Exec(LfmExecError::DivByZero { .. })) => {}
+            other_result => panic!(
+                "an RPO-committed proof must not be provable under {other:?}, got {:?}",
+                other_result.map(|_| "accepted")
+            ),
+        }
+    }
 }
 
 // =========================================================================
