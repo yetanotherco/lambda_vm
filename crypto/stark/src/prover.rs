@@ -1091,18 +1091,20 @@ pub trait IsStarkProver<
         //    empty constraint set makes `all(end_exemptions == 0)` vacuously
         //    true here but `is_uniform()` false downstream (0 groups).
         //  - Device-only is entered only for the d=2 quotient decomposition,
-        //    checked below once `n` is in hand. The d=1 device R2 path exists
-        //    too but keeps its host trace (never device-only), so it is not a
-        //    concern here.
+        //    checked below once `n` is in hand. A d=1 table also has a device R2
+        //    path, but the gate below excludes it, so it stays device-additive.
         if !air.has_aux_trace() || air.constraints_meta().is_empty() {
             return false;
         }
         let n = domain.interpolation_domain_size;
-        // Device-only is entered only for the d=2 quotient decomposition. The d=1
-        // (num_parts==1) device R2 path exists too, but keeps its host trace
-        // (`want_host` stays true) so the preprocessed main commit still sees real
-        // data — zeroing a preprocessed table's host trace fails its commitment
-        // check. So d=1 tables run device-additive, never device-only.
+        // Only the d=2 quotient decomposition has a device-resident R2 path that
+        // can serve every downstream consumer from the handle alone. A d=1 table
+        // does have a device R2 path, but it always drains its single part to host
+        // (the query-0 composition canary reads it), so it gains nothing from
+        // dropping the host trace and this gate keeps it device-additive. Any other
+        // part count has no device R2 path at all and needs the host evaluator,
+        // which device-only would leave without data until the R2 downgrade
+        // recovered it.
         if air.composition_poly_degree_bound(n) / n != 2 {
             return false;
         }
@@ -1544,11 +1546,13 @@ pub trait IsStarkProver<
     /// Decompose the resident composition `H` into device-resident parts per the
     /// AIR's part count: the trivial d=1 de-interleave (`H` is the single part on
     /// the LDE coset) or the d=2 quotient split H₀/H₁. Both keep the parts
-    /// device-resident (commit / R3 OOD / R4 DEEP / openings all read the count
-    /// from the handle); `None` → the caller falls back to the host path. Shared
-    /// by the R2 producer and the `xcheck` mirror so the two cannot drift.
-    /// `want_host` gates the d=2 host drain only — d=1 tables are never
-    /// device-only, so they always keep their host part.
+    /// device-resident — the commit tree and the R4 openings read `handle.m`, while
+    /// R3 and R4 DEEP read the host part Vec's length (see
+    /// [`crate::gpu_lde::try_comp_h_to_slabs_dev`] for the invariant that ties the
+    /// two together). `None` → the caller falls back to the host path. Shared by the
+    /// R2 producer and the `xcheck` mirror so the two cannot drift. `want_host` gates
+    /// the d=2 host drain only — d=1 tables are never device-only, so they always
+    /// keep their host part.
     #[cfg(feature = "cuda")]
     fn decompose_comp_h_dev(
         number_of_parts: usize,
@@ -1561,9 +1565,9 @@ pub trait IsStarkProver<
         math_cuda::lde::GpuLdeExt3,
     )> {
         if number_of_parts == 1 {
-            // d=1 is never device-only (the degree gate below / `device_only_for`
-            // only admit d=2), so the single part is always kept on host —
-            // `want_host` must hold, and the d=1 helper ignores it by design.
+            // d=1 is never device-only (`device_only_for`'s degree gate admits only
+            // d=2), so the single part is always kept on host — `want_host` must
+            // hold, and the d=1 helper ignores it by design.
             debug_assert!(
                 want_host,
                 "d=1 composition parts are never device-only; want_host must hold"
@@ -1576,7 +1580,7 @@ pub trait IsStarkProver<
                 domain.interpolation_domain_size * domain.blowup_factor,
                 "d=1 H row count must equal the LDE domain size"
             );
-            crate::gpu_lde::try_deinterleave_comp_h_dev::<Field, FieldExtension>(h_dev)
+            crate::gpu_lde::try_comp_h_to_slabs_dev::<Field, FieldExtension>(h_dev)
         } else {
             crate::gpu_lde::try_decompose_extend_d2_dev::<Field, FieldExtension>(
                 h_dev,
@@ -1743,14 +1747,13 @@ pub trait IsStarkProver<
                 let want_host = !round_1_result.lde_trace.host_trace_empty();
                 // num_parts==1 de-interleaves `H` (the single part); num_parts==2
                 // runs the degree-2 quotient split. Both keep the parts resident.
-                let decomposed = Self::decompose_comp_h_dev(
+                match Self::decompose_comp_h_dev(
                     number_of_parts,
                     &h_dev,
                     domain,
                     twiddles,
                     want_host,
-                );
-                match decomposed {
+                ) {
                     Some((parts, handle)) => {
                         gpu_composition_parts = Some(handle);
                         precomputed_parts = Some(parts);
