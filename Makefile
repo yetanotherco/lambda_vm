@@ -311,8 +311,8 @@ ETHREX_REAL_BLOCK := 25368371
 # archived ProgramInput layout moves with the pin, so one block has one fixture per rev.
 # Uploading under a new name rather than replacing the old one keeps `main` — which still
 # expects the pre-bump sha256 — fetching its own artifact while this branch is open.
-ETHREX_REAL_BLOCK_FIXTURE_URL := https://github.com/yetanotherco/lambda_vm/releases/download/bench-fixtures-v1/ethrex_mainnet_25368371_4f658c2b.bin
-ETHREX_REAL_BLOCK_FIXTURE_SHA256 := 0a301731b84515260c2ad7779fef3e4ef8b2424fbcc055ee2f5a224bc88120ab
+ETHREX_REAL_BLOCK_FIXTURE_URL := https://github.com/yetanotherco/lambda_vm/releases/download/bench-fixtures-v1/ethrex_mainnet_25368371_797df554.bin
+ETHREX_REAL_BLOCK_FIXTURE_SHA256 := 573004e62e3680a00d3cdbae19dc4897e2ec60d6ec0c1d05d9ef118cb8aef17f
 # The block's source cache, hosted in the same release. Only `regen-real-block-fixture`
 # reads it — the converter's TESTS use a different, upstream-pinned cache (below).
 ETHREX_REAL_BLOCK_CACHE_URL := https://github.com/yetanotherco/lambda_vm/releases/download/bench-fixtures-v1/cache_mainnet_25368371.json
