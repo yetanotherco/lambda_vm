@@ -43,6 +43,8 @@
 // TODO: todo callouts (rj/et/cdsg)
 // TODO: table divider lines (vline/hline)
 // TODO(a11y): replace table.header calls with custom functions to indicate "scope" (col/row/rowgroup) so that we can export that to the html th
+// TODO: full-text search (pagefind?)
+// TODO: Manual color scheme toggle
 
 #let nav(chapter) = {
   let content = meta.summary.map(((title, chapters)) => {
