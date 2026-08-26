@@ -2187,19 +2187,49 @@ fn the_real_block_aggregates_end_to_end() {
     );
     let t_total = Instant::now();
 
+    // The artifact cache: with P3_ARTIFACT_DIR set, the bundle and all six
+    // wrap proofs persist to disk after production (the rkyv wire), and a
+    // relaunch LOADS them — an aggregation attempt never re-pays the base
+    // and wrap proves. Programs and artifacts are re-emitted either way
+    // (minutes, deterministic); only the PROVES are cached.
+    let art_dir = std::env::var("P3_ARTIFACT_DIR").ok();
+    let cache_path = |name: &str| art_dir.as_ref().map(|d| std::path::Path::new(d).join(name));
+    let bundle_cached = cache_path("bundle.rkyv").is_some_and(|p| p.exists());
+
     // ---- base ----
     let t = Instant::now();
-    let bundle = crate::continuation::prove_continuation_batched(
-        &inputs.elf_bytes,
-        &inputs.private_input,
-        inputs.epoch_log2,
-        &inner,
-    )
-    .expect("the block must prove batched");
+    let bundle = if bundle_cached {
+        let bytes = std::fs::read(cache_path("bundle.rkyv").expect("cache path"))
+            .expect("the cached bundle must read");
+        let mut aligned = rkyv::util::AlignedVec::<16>::with_capacity(bytes.len());
+        aligned.extend_from_slice(&bytes);
+        rkyv::from_bytes::<crate::continuation::ContinuationProof, rkyv::rancor::Error>(&aligned)
+            .expect("the cached bundle must deserialize")
+    } else {
+        crate::continuation::prove_continuation_batched(
+            &inputs.elf_bytes,
+            &inputs.private_input,
+            inputs.epoch_log2,
+            &inner,
+        )
+        .expect("the block must prove batched")
+    };
     let n = bundle.num_epochs();
+    if let (false, Some(dir)) = (bundle_cached, &art_dir) {
+        std::fs::create_dir_all(dir).expect("the artifact dir must create");
+        let bytes =
+            rkyv::to_bytes::<rkyv::rancor::Error>(&bundle).expect("the bundle must serialize");
+        std::fs::write(cache_path("bundle.rkyv").expect("cache path"), &bytes)
+            .expect("the bundle must persist");
+    }
     println!(
-        "   base: {n} epochs + global proof in {:.1}s, peak RSS {:?} GiB",
+        "   base: {n} epochs + global proof in {:.1}s ({}), peak RSS {:?} GiB",
         t.elapsed().as_secs_f64(),
+        if bundle_cached {
+            "LOADED from cache"
+        } else {
+            "proved"
+        },
         super::wrap_tests::peak_rss_gib(),
     );
     let t = Instant::now();
@@ -2230,13 +2260,31 @@ fn the_real_block_aggregates_end_to_end() {
         arenas.push(super::epoch_verify_tests::batched_opening_arena(&e));
         arenas.push(super::epoch_verify_tests::batched_fri_arena(&e));
         let artifacts = build_artifacts(&program, &agg_opts);
+        let wrap_file = format!("wrap_{k}.rkyv");
+        let cached = cache_path(&wrap_file).is_some_and(|p| p.exists());
         let tp = Instant::now();
-        let proved = lfm_prove_batched(&program, &artifacts, &arenas, &agg_opts)
-            .expect("the epoch wrap must prove");
+        let proved = if cached {
+            let bytes = std::fs::read(cache_path(&wrap_file).expect("cache path"))
+                .expect("the cached wrap must read");
+            let mut aligned = rkyv::util::AlignedVec::<16>::with_capacity(bytes.len());
+            aligned.extend_from_slice(&bytes);
+            rkyv::from_bytes::<BatchedLfmProof, rkyv::rancor::Error>(&aligned)
+                .expect("the cached wrap must deserialize")
+        } else {
+            let proved = lfm_prove_batched(&program, &artifacts, &arenas, &agg_opts)
+                .expect("the epoch wrap must prove");
+            if let Some(p) = cache_path(&wrap_file) {
+                let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&proved)
+                    .expect("the wrap must serialize");
+                std::fs::write(p, &bytes).expect("the wrap must persist");
+            }
+            proved
+        };
         println!(
-            "   epoch {k}: construct {:.1}s, wrap prove {:.1}s, {} program instrs",
+            "   epoch {k}: construct {:.1}s, wrap prove {:.1}s ({}), {} program instrs",
             tk.elapsed().as_secs_f64() - tp.elapsed().as_secs_f64(),
             tp.elapsed().as_secs_f64(),
+            if cached { "LOADED" } else { "proved" },
             program.instrs.len(),
         );
         wraps.push(real_batched_lfm(artifacts, agg_opts.clone(), &proved));
@@ -2246,9 +2294,25 @@ fn the_real_block_aggregates_end_to_end() {
     let g_program = global_verifier_program(&g);
     let g_arenas = global_arena_words(&g);
     let g_artifacts = build_artifacts(&g_program, &agg_opts);
+    let g_cached = cache_path("global_wrap.rkyv").is_some_and(|p| p.exists());
     let tp = Instant::now();
-    let g_proved = lfm_prove_batched(&g_program, &g_artifacts, &g_arenas, &agg_opts)
-        .expect("the global wrap must prove");
+    let g_proved = if g_cached {
+        let bytes = std::fs::read(cache_path("global_wrap.rkyv").expect("cache path"))
+            .expect("the cached global wrap must read");
+        let mut aligned = rkyv::util::AlignedVec::<16>::with_capacity(bytes.len());
+        aligned.extend_from_slice(&bytes);
+        rkyv::from_bytes::<BatchedLfmProof, rkyv::rancor::Error>(&aligned)
+            .expect("the cached global wrap must deserialize")
+    } else {
+        let proved = lfm_prove_batched(&g_program, &g_artifacts, &g_arenas, &agg_opts)
+            .expect("the global wrap must prove");
+        if let Some(p) = cache_path("global_wrap.rkyv") {
+            let bytes =
+                rkyv::to_bytes::<rkyv::rancor::Error>(&proved).expect("the wrap must serialize");
+            std::fs::write(p, &bytes).expect("the global wrap must persist");
+        }
+        proved
+    };
     println!(
         "   global: construct {:.1}s, wrap prove {:.1}s, {} tables, {} program instrs",
         tg.elapsed().as_secs_f64() - tp.elapsed().as_secs_f64(),
@@ -2304,8 +2368,18 @@ fn the_real_block_aggregates_end_to_end() {
     );
 
     let agg_artifacts = build_artifacts(&program, &agg_opts);
+    // The aggregation prove's own residency posture, decoupled from the wrap
+    // proves': P3_AGG_RESIDENCY=recompute trades ~2× prove time for the LDE
+    // peak (the first real-scale Retain attempt OOM-killed a 483 GiB box).
+    // env::set_var is process-global and this driver is single-threaded by
+    // contract (--test-threads=1); unsafe per the 2024 edition's signature.
+    if let Ok(residency) = std::env::var("P3_AGG_RESIDENCY") {
+        println!("   aggregation residency: {residency} (P3_AGG_RESIDENCY)");
+        unsafe { std::env::set_var("LAMBDA_VM_RESIDENCY", residency) };
+    }
+    let agg_artifacts_ = &agg_artifacts;
     let t = Instant::now();
-    let final_proof = lfm_prove_batched(&program, &agg_artifacts, &arenas, &agg_opts)
+    let final_proof = lfm_prove_batched(&program, agg_artifacts_, &arenas, &agg_opts)
         .expect("★ THE AGGREGATION MUST PROVE");
     let agg_prove_s = t.elapsed().as_secs_f64();
     let final_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&final_proof)
