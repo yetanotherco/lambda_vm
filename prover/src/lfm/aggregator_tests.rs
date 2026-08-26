@@ -2325,12 +2325,20 @@ fn the_real_block_aggregates_end_to_end() {
 
     // ---- the aggregation ----
     let elf = Elf::load(&inputs.elf_bytes).expect("the ELF must load");
+    // Timed on its own line: this native FFT+Merkle pass is the consumer
+    // ritual's expensive half (design-review condition 1 asked for its
+    // price; run 4 left it inside a ~401 s unaccounted gap).
+    let t = Instant::now();
     let (decode_root, mut pages) = crate::continuation::continuation_precomputed_commitments(
         &inputs.elf_bytes,
         &bundle,
         &inner,
     )
     .expect("the consumer recompute must run");
+    println!(
+        "   consumer precompute (decode_root + pages, native FFT+Merkle): {:.1}s",
+        t.elapsed().as_secs_f64()
+    );
     pages.sort_by_key(|(base, _)| *base);
     let elf_digest = crate::statement::elf_digest(&inputs.elf_bytes);
     let t = Instant::now();
@@ -2391,7 +2399,12 @@ fn the_real_block_aggregates_end_to_end() {
         }
         Err(_) => agg_opts.clone(),
     };
+    let t = Instant::now();
     let agg_artifacts = build_artifacts(&program, &terminal_opts);
+    println!(
+        "   aggregation artifacts built in {:.1}s",
+        t.elapsed().as_secs_f64()
+    );
     // The aggregation prove's own residency posture, decoupled from the wrap
     // proves': P3_AGG_RESIDENCY=recompute trades ~2× prove time for the LDE
     // peak (the first real-scale Retain attempt OOM-killed a 483 GiB box).
@@ -2406,9 +2419,16 @@ fn the_real_block_aggregates_end_to_end() {
     let final_proof = lfm_prove_batched(&program, agg_artifacts_, &arenas, &terminal_opts)
         .expect("★ THE AGGREGATION MUST PROVE");
     let agg_prove_s = t.elapsed().as_secs_f64();
-    let final_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&final_proof)
-        .expect("the block proof must serialize")
-        .len();
+    let final_proof_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&final_proof)
+        .expect("the block proof must serialize");
+    let final_bytes = final_proof_bytes.len();
+    // THE deliverable persists: run 4 proved the block and saved nothing
+    // but a byte count. Same cache dir as the inputs; the record run's
+    // proof is the artifact of record.
+    if let Some(path) = cache_path("block_proof.rkyv") {
+        std::fs::write(&path, &final_proof_bytes).expect("the block proof must persist");
+        println!("   block proof persisted: {}", path.display());
+    }
     println!(
         "   ★ AGGREGATION PROVE: {agg_prove_s:.1}s, THE BLOCK PROOF = {final_bytes} bytes, \
          peak RSS {:?} GiB",
