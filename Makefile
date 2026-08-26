@@ -3,7 +3,7 @@ compile-programs compile-recursion-elfs clean-asm clean-rust clean-bench clean-s
 clean-recursion-elfs clean test test-asm \
 test-rust test-ethrex test-ethrex-offline test-executor test-syscalls test-flamegraph flamegraph-prover test-profile-recursion test-profile-recursion-single test-profile-recursion-multi \
 test-profile-recursion-block recursion-profile-block-input \
-test-fast test-prover test-prover-all test-prover-debug test-disk-spill test-math-cuda test-cuda-integration test-cuda-fallback \
+test-fast test-prover test-prover-all test-prover-debug test-disk-spill test-math-cuda test-cuda-integration test-cuda-d1 test-cuda-fallback \
 test-prover-cuda test-prover-comprehensive-cuda \
 bench-math-cuda bench-prover bench-prover-cuda build check clippy fmt lint regen-ethrex-fixtures \
 update-ethrex-fixture-checksums check-ethrex-fixture-checksums ethrex-real-block-fixture \
@@ -585,6 +585,19 @@ test-math-cuda:
 test-cuda-integration:
 	$(GPU_TEST_TIMEOUT) cargo test -p lambda-vm-prover --release --features cuda \
 	    --test cuda_path_integration -- --ignored --nocapture --test-threads=1
+
+# num_parts==1 (DECODE) device DEEP/FRI coverage (requires NVIDIA GPU + nvcc).
+# The steady-state cuda_path_integration fixtures never cross the default LDE
+# threshold (1<<14) for a num_parts==1 table, so lower it here so DECODE engages
+# the d=1 device path end to end. 64 = the exact LDE size of fib_iterative_1M's
+# DECODE ROM: high enough to engage only DECODE (not the tiny tables whose GPU
+# NTT degenerates below ~16), low enough that DECODE crosses it. Its own binary +
+# a process-wide env because gpu_lde_threshold() caches the value on first read
+# (OnceLock), so it must be set before any prove in the process.
+test-cuda-d1:
+	LAMBDA_VM_GPU_LDE_THRESHOLD=64 $(GPU_TEST_TIMEOUT) cargo test -p lambda-vm-prover \
+	    --release --features cuda \
+	    --test cuda_d1_path -- --ignored --nocapture --test-threads=1
 
 # GPU error-path coverage (requires NVIDIA GPU + nvcc).
 # Forces cuda dispatch errors and asserts the CPU fallback still produces a verifying proof.

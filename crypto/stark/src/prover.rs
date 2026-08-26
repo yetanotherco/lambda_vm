@@ -1561,6 +1561,21 @@ pub trait IsStarkProver<
         math_cuda::lde::GpuLdeExt3,
     )> {
         if number_of_parts == 1 {
+            // d=1 is never device-only (the degree gate below / `device_only_for`
+            // only admit d=2), so the single part is always kept on host —
+            // `want_host` must hold, and the d=1 helper ignores it by design.
+            debug_assert!(
+                want_host,
+                "d=1 composition parts are never device-only; want_host must hold"
+            );
+            // The d=1 helper trusts `h_dev.num_rows` as the LDE size; the d=2 arm
+            // gets an incidental domain check via `weights.len() == n`. Pin the
+            // same invariant here so a domain/`H` size mismatch can't slip through.
+            debug_assert_eq!(
+                h_dev.num_rows,
+                domain.interpolation_domain_size * domain.blowup_factor,
+                "d=1 H row count must equal the LDE domain size"
+            );
             crate::gpu_lde::try_deinterleave_comp_h_dev::<Field, FieldExtension>(h_dev)
         } else {
             crate::gpu_lde::try_decompose_extend_d2_dev::<Field, FieldExtension>(

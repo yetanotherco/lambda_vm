@@ -785,10 +785,14 @@ where
 /// single part, already on the LDE coset, so — unlike [`try_decompose_extend_d2_dev`]
 /// — there is no decompose and no re-extension, only a de-interleave into the slab
 /// layout the commit / DEEP / FRI consumers read (all of which already read the
-/// part count from `handle.m`). The single part is always drained to host too (the
-/// interleaved `H` download IS that part, identical values in interleaved layout):
-/// num_parts==1 tables are never device-only — they keep their preprocessed host
-/// trace (see `device_only_for`) — so there is no device-only host-elision here.
+/// part count from `handle.m`). The single part is always drained to host — not
+/// just because it can be (num_parts==1 tables are never device-only; they keep
+/// their preprocessed host trace, see `device_only_for`), but because that host
+/// part is what feeds the query-0 composition-opening canary: release-active for
+/// `qi == 0` and guarded on a non-empty host part, it is the only end-to-end check
+/// that the device m=1 gather / DEEP / FRI layout is correct. Returning empty parts
+/// (`vec![Vec::new()]`, as the d=2 device-only arm does) would save the D2H and keep
+/// num_parts==1 — but silently disable that canary.
 /// `None` → the caller downloads `H` and uses it directly as the single host part.
 pub(crate) fn try_deinterleave_comp_h_dev<F, E>(
     h: &math_cuda::constraint_interp::GpuCompH,
