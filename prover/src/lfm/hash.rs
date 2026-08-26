@@ -274,6 +274,15 @@ pub enum HasherKind {
     /// digest rather than the socket's documented 64-bit one) and
     /// domain-separated (through the capacity, see [`LfmHasher::mode_iv`]).
     Rpo = 3,
+    /// [`super::rpx::Rpx256`] — Rescue-Prime eXtended (XHash12), width 12,
+    /// `FB E FB E FB E M`.
+    ///
+    /// RPO's geometry with RPO's constants and a different round schedule:
+    /// three of the seven rounds trade the ~2^63-dense inverse S-box for a
+    /// seventh power in the degree-3 EXTENSION field, and the last round is
+    /// linear. Cheaper on the host and narrower in the AIR than [`Self::Rpo`],
+    /// at a weaker provenance — miden publishes no known-answer table for it.
+    Rpx = 4,
 }
 
 impl HasherKind {
@@ -294,6 +303,7 @@ impl LfmHasher for HasherKind {
             HasherKind::Poseidon => super::poseidon::PoseidonGoldilocks.permute(state),
             HasherKind::Blake3 => super::blake3_socket::Blake3Permutation.permute(state),
             HasherKind::Rpo => super::rpo::Rpo256.permute(state),
+            HasherKind::Rpx => super::rpx::Rpx256.permute(state),
         }
     }
 
@@ -303,6 +313,7 @@ impl LfmHasher for HasherKind {
             HasherKind::Poseidon => super::poseidon::PoseidonGoldilocks.compress_iv(),
             HasherKind::Blake3 => super::blake3_socket::Blake3Permutation.compress_iv(),
             HasherKind::Rpo => super::rpo::Rpo256.compress_iv(),
+            HasherKind::Rpx => super::rpx::Rpx256.compress_iv(),
         }
     }
 
@@ -318,6 +329,7 @@ impl LfmHasher for HasherKind {
             HasherKind::Poseidon => super::poseidon::PoseidonGoldilocks.transcript_iv(),
             HasherKind::Blake3 => super::blake3_socket::Blake3Permutation.transcript_iv(),
             HasherKind::Rpo => super::rpo::Rpo256.transcript_iv(),
+            HasherKind::Rpx => super::rpx::Rpx256.transcript_iv(),
         }
     }
 
@@ -328,6 +340,7 @@ impl LfmHasher for HasherKind {
             HasherKind::Poseidon => super::poseidon::PoseidonGoldilocks.leaf_iv(),
             HasherKind::Blake3 => super::blake3_socket::Blake3Permutation.leaf_iv(),
             HasherKind::Rpo => super::rpo::Rpo256.leaf_iv(),
+            HasherKind::Rpx => super::rpx::Rpx256.leaf_iv(),
         }
     }
 
@@ -339,6 +352,7 @@ impl LfmHasher for HasherKind {
             HasherKind::Poseidon => super::poseidon::PoseidonGoldilocks.compress(a, b),
             HasherKind::Blake3 => super::blake3_socket::Blake3Permutation.compress(a, b),
             HasherKind::Rpo => super::rpo::Rpo256.compress(a, b),
+            HasherKind::Rpx => super::rpx::Rpx256.compress(a, b),
         }
     }
 
@@ -351,6 +365,7 @@ impl LfmHasher for HasherKind {
             HasherKind::Poseidon => super::poseidon::PoseidonGoldilocks.compress_out(a, b),
             HasherKind::Blake3 => super::blake3_socket::Blake3Permutation.compress_out(a, b),
             HasherKind::Rpo => super::rpo::Rpo256.compress_out(a, b),
+            HasherKind::Rpx => super::rpx::Rpx256.compress_out(a, b),
         }
     }
 
@@ -365,6 +380,7 @@ impl LfmHasher for HasherKind {
             HasherKind::Poseidon => super::poseidon::PoseidonGoldilocks.transcript_out(a, b),
             HasherKind::Blake3 => super::blake3_socket::Blake3Permutation.transcript_out(a, b),
             HasherKind::Rpo => super::rpo::Rpo256.transcript_out(a, b),
+            HasherKind::Rpx => super::rpx::Rpx256.transcript_out(a, b),
         }
     }
 
@@ -374,6 +390,7 @@ impl LfmHasher for HasherKind {
             HasherKind::Poseidon => super::poseidon::PoseidonGoldilocks.transcript(a, b),
             HasherKind::Blake3 => super::blake3_socket::Blake3Permutation.transcript(a, b),
             HasherKind::Rpo => super::rpo::Rpo256.transcript(a, b),
+            HasherKind::Rpx => super::rpx::Rpx256.transcript(a, b),
         }
     }
 
@@ -387,6 +404,7 @@ impl LfmHasher for HasherKind {
             HasherKind::Poseidon => super::poseidon::PoseidonGoldilocks.leaf_out(acc, felts),
             HasherKind::Blake3 => super::blake3_socket::Blake3Permutation.leaf_out(acc, felts),
             HasherKind::Rpo => super::rpo::Rpo256.leaf_out(acc, felts),
+            HasherKind::Rpx => super::rpx::Rpx256.leaf_out(acc, felts),
         }
     }
 
@@ -396,6 +414,7 @@ impl LfmHasher for HasherKind {
             HasherKind::Poseidon => super::poseidon::PoseidonGoldilocks.leaf(acc, felts),
             HasherKind::Blake3 => super::blake3_socket::Blake3Permutation.leaf(acc, felts),
             HasherKind::Rpo => super::rpo::Rpo256.leaf(acc, felts),
+            HasherKind::Rpx => super::rpx::Rpx256.leaf(acc, felts),
         }
     }
 
@@ -405,6 +424,7 @@ impl LfmHasher for HasherKind {
             HasherKind::Poseidon => super::poseidon::PoseidonGoldilocks.admits(mode, state),
             HasherKind::Blake3 => super::blake3_socket::Blake3Permutation.admits(mode, state),
             HasherKind::Rpo => super::rpo::Rpo256.admits(mode, state),
+            HasherKind::Rpx => super::rpx::Rpx256.admits(mode, state),
         }
     }
 }

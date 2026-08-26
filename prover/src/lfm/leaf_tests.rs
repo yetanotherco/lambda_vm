@@ -752,6 +752,13 @@ fn leaf_row_with_third_cell(
             row[cols::OUT0..cols::OUT0 + out.len()].copy_from_slice(&out);
             super::trace::fill_rpo_witness(&mut row);
         }
+        HasherKind::Rpx => {
+            // Same as RPO's: the filler is the whole witness, so the junk
+            // propagates through every round rather than only into `OUT`.
+            let out = kind.leaf_out(acc, felts);
+            row[cols::OUT0..cols::OUT0 + out.len()].copy_from_slice(&out);
+            super::trace::fill_rpx_witness(&mut row);
+        }
     }
     row
 }

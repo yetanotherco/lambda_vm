@@ -710,6 +710,119 @@ pub mod hash {
             5 + super::NUM_UNREAD_INPUT_PINS + NUM_ROUNDS * 5 * HASH_STATE_FELTS;
     }
 
+    /// Column layout for the [`HasherKind::Rpx`] configuration — Layout W with
+    /// a MIXED round schedule.
+    ///
+    /// The frozen prefix keeps its offsets, so [`bus_interactions`] is
+    /// hasher-INDEPENDENT here exactly as it is for RPO and Poseidon. What
+    /// changes is that RPX's seven rounds are not alike, so the appended block
+    /// width depends on the round KIND:
+    ///
+    /// | round | kind | appended columns |
+    /// |---|---|---|
+    /// | 0, 2, 4 | FB | `u²`, `u³`, `y²`, `y³` (48) + the round output (12) = **60** |
+    /// | 1, 3, 5 | E | `t²`, `t³` in the extension (24) + the round output (12) = **36** |
+    /// | 6 | M | **0** — `MDS(state) + ARK1[6]` is degree 1 and lands straight in `OUT` |
+    ///
+    /// Width: `28 + 3·60 + 3·36 = 316` value columns, against
+    /// [`rpo_cols`]' 436 — **27% narrower**, because half the rounds trade a
+    /// twelve-lane double ladder for four triples of extension intermediates,
+    /// and the last round commits nothing at all.
+    pub mod rpx_cols {
+        use crate::lfm::hash::HASH_STATE_FELTS;
+        use crate::lfm::rpx::{EXT_DEGREE, EXT_ELEMENTS, NUM_ROUNDS, is_fb_round, is_final_round};
+
+        pub use super::cols::{
+            IN0, MODE_C, MODE_L, MODE_P, MODE_T, OUT0, PREP_WIDTH, S8, SHARED_VALUE_COLUMNS,
+        };
+
+        /// First appended witness column.
+        pub const ROUNDS: usize = PREP_WIDTH + SHARED_VALUE_COLUMNS;
+
+        /// Committed columns per lane in an FB round: `u²`, `u³`, `y²`, `y³`.
+        pub const FB_LADDER_COLUMNS: usize = 4;
+        /// Committed extension intermediates per E round lane: `t²`, `t³`.
+        pub const EXT_LADDER_COLUMNS: usize = 2;
+
+        pub const fn block_width(r: usize) -> usize {
+            if is_final_round(r) {
+                0
+            } else if is_fb_round(r) {
+                FB_LADDER_COLUMNS * HASH_STATE_FELTS + HASH_STATE_FELTS
+            } else {
+                EXT_LADDER_COLUMNS * HASH_STATE_FELTS + HASH_STATE_FELTS
+            }
+        }
+
+        pub const fn block(r: usize) -> usize {
+            let mut off = ROUNDS;
+            let mut i = 0;
+            while i < r {
+                off += block_width(i);
+                i += 1;
+            }
+            off
+        }
+
+        /// `u_lane²` — FB rounds only.
+        pub const fn u2(r: usize, lane: usize) -> usize {
+            block(r) + lane
+        }
+        /// `u_lane³` — FB rounds only.
+        pub const fn u3(r: usize, lane: usize) -> usize {
+            block(r) + HASH_STATE_FELTS + lane
+        }
+        /// `y_lane²` — FB rounds only.
+        pub const fn y2(r: usize, lane: usize) -> usize {
+            block(r) + 2 * HASH_STATE_FELTS + lane
+        }
+        /// `y_lane³` — FB rounds only.
+        pub const fn y3(r: usize, lane: usize) -> usize {
+            block(r) + 3 * HASH_STATE_FELTS + lane
+        }
+
+        /// `x²` in the extension, coefficient `k` of element `e` — E rounds only.
+        pub const fn t2(r: usize, e: usize, k: usize) -> usize {
+            block(r) + e * EXT_DEGREE + k
+        }
+        /// `x³` in the extension — E rounds only.
+        pub const fn t3(r: usize, e: usize, k: usize) -> usize {
+            block(r) + HASH_STATE_FELTS + e * EXT_DEGREE + k
+        }
+
+        /// Round `r`'s output lane `j`. The M round writes `OUT` directly.
+        pub const fn out(r: usize, j: usize) -> usize {
+            if is_final_round(r) {
+                OUT0 + j
+            } else if is_fb_round(r) {
+                block(r) + FB_LADDER_COLUMNS * HASH_STATE_FELTS + j
+            } else {
+                block(r) + EXT_LADDER_COLUMNS * HASH_STATE_FELTS + j
+            }
+        }
+
+        pub const NUM_COLUMNS: usize = block(NUM_ROUNDS);
+
+        /// 4 capacity copies + 1 mode boolean + the unread-`IN` pins, plus per
+        /// round: FB five per lane, E three per extension operation on each of
+        /// four triples, M one per output lane.
+        pub const NUM_CONSTRAINTS: usize = {
+            let mut n = 5 + super::NUM_UNREAD_INPUT_PINS;
+            let mut r = 0;
+            while r < NUM_ROUNDS {
+                if is_final_round(r) {
+                    n += HASH_STATE_FELTS;
+                } else if is_fb_round(r) {
+                    n += 5 * HASH_STATE_FELTS;
+                } else {
+                    n += 3 * EXT_DEGREE * EXT_ELEMENTS;
+                }
+                r += 1;
+            }
+            n
+        };
+    }
+
     /// The chip's total width under `kind` — the number the AIR is built with,
     /// the census reads, and the trace filler allocates.
     pub const fn num_columns(kind: HasherKind) -> usize {
@@ -718,6 +831,7 @@ pub mod hash {
             HasherKind::Poseidon => poseidon_cols::NUM_COLUMNS,
             HasherKind::Blake3 => crate::lfm::blake3_socket::cols::NUM_COLUMNS,
             HasherKind::Rpo => rpo_cols::NUM_COLUMNS,
+            HasherKind::Rpx => rpx_cols::NUM_COLUMNS,
         }
     }
 
@@ -846,6 +960,7 @@ pub mod hash {
             HasherKind::Poseidon => poseidon_cols::NUM_CONSTRAINTS - NUM_UNREAD_INPUT_PINS,
             HasherKind::Blake3 => crate::lfm::blake3_socket::UNREAD_IDX,
             HasherKind::Rpo => rpo_cols::NUM_CONSTRAINTS - NUM_UNREAD_INPUT_PINS,
+            HasherKind::Rpx => rpx_cols::NUM_CONSTRAINTS - NUM_UNREAD_INPUT_PINS,
         }
     }
 
@@ -933,6 +1048,11 @@ pub mod hash {
             kind: HasherKind::Rpo,
         };
 
+        /// The Rescue-Prime eXtended configuration.
+        pub const RPX: Self = Self {
+            kind: HasherKind::Rpx,
+        };
+
         /// Constraints emitted under `kind` — the count the framework's
         /// dense-index invariant requires `eval` to fill exactly.
         pub const fn num_constraints(kind: HasherKind) -> usize {
@@ -941,6 +1061,7 @@ pub mod hash {
                 HasherKind::Poseidon => poseidon_cols::NUM_CONSTRAINTS,
                 HasherKind::Blake3 => crate::lfm::blake3_socket::NUM_CONSTRAINTS,
                 HasherKind::Rpo => rpo_cols::NUM_CONSTRAINTS,
+                HasherKind::Rpx => rpx_cols::NUM_CONSTRAINTS,
             }
         }
     }
@@ -966,6 +1087,7 @@ pub mod hash {
                 // trace filler is what keeps the four in step.
                 HasherKind::Blake3 => crate::lfm::blake3_socket::eval(b),
                 HasherKind::Rpo => Self::eval_rpo(b),
+                HasherKind::Rpx => Self::eval_rpx(b),
             }
         }
     }
@@ -1155,6 +1277,57 @@ pub mod hash {
             );
         }
 
+        /// ★ Constraints 0–4 of every CAPACITY-SEPARATED algebraic tenant: the
+        /// per-mode capacity copy and the mode-sum booleanity.
+        ///
+        /// Shared rather than restated per arm, and that is the point. RPO and
+        /// RPX have identical socket geometry — same state width, same rate and
+        /// capacity, same four-felt digest, same three domain tags — so the one
+        /// place their AIRs could silently disagree about DOMAIN SEPARATION is
+        /// this prefix. One emitter means they cannot.
+        ///
+        /// `S_k = MODE_P·IN_{8+k} + MODE_C·IVC_k + MODE_T·IVT_k + MODE_L·IVL_k`.
+        /// A permutation row carries its own third input cell; every other mode
+        /// takes its domain's capacity. `DOMAIN_COMPRESS` is zero, so that arm
+        /// contributes nothing and a Merkle parent is a plain `merge`. Degree 2
+        /// — a selector column times a constant.
+        ///
+        /// Returns the mode sum `m` — the row's is-real flag, which scales every
+        /// round constant so padding rows need no `IS_REAL` gate — and the
+        /// `MODE_P` selector.
+        fn emit_socket_prefix<B: ConstraintBuilder<F, E>>(b: &mut B) -> (B::Expr, B::Expr) {
+            use crate::lfm::rpo::{DOMAIN_COMPRESS, DOMAIN_LEAF, DOMAIN_TRANSCRIPT, domain_iv};
+
+            let mode_c = b.main(0, cols::MODE_C);
+            let mode_t = b.main(0, cols::MODE_T);
+            let mode_l = b.main(0, cols::MODE_L);
+            let mode_p = b.main(0, cols::MODE_P);
+            let m = mode_c + mode_t + mode_l + mode_p.clone();
+
+            const MODE_IVS: [(usize, u64); 3] = [
+                (cols::MODE_C, DOMAIN_COMPRESS),
+                (cols::MODE_T, DOMAIN_TRANSCRIPT),
+                (cols::MODE_L, DOMAIN_LEAF),
+            ];
+            for k in 0..4 {
+                let s = b.main(0, cols::S8 + k);
+                let in_k = b.main(0, cols::IN0 + 8 + k);
+                let mut rhs = mode_p.clone() * in_k;
+                for (sel_col, domain) in MODE_IVS {
+                    let iv_k = domain_iv(domain)[k];
+                    if iv_k != 0 {
+                        let sel = b.main(0, sel_col);
+                        rhs = rhs + sel * b.const_base(iv_k);
+                    }
+                }
+                b.emit_base(k, s - rhs);
+            }
+
+            let one = b.one();
+            b.emit_base(4, m.clone() * (one - m.clone()));
+            (m, mode_p)
+        }
+
         /// Rescue-Prime Optimized at width 12: seven rounds of
         /// `MDS → +ARK1 → x^7 → MDS → +ARK2 → x^{1/7}`, one row per
         /// permutation.
@@ -1182,49 +1355,13 @@ pub mod hash {
         /// so `S8..11` takes a different constant under `MODE_C`, `MODE_T` and
         /// `MODE_L`. Still degree 2: a selector column times a constant.
         fn eval_rpo<B: ConstraintBuilder<F, E>>(b: &mut B) {
-            use crate::lfm::rpo::{
-                ARK1, ARK2, DOMAIN_COMPRESS, DOMAIN_LEAF, DOMAIN_TRANSCRIPT, MDS_CIRC_ROW,
-                NUM_ROUNDS, domain_iv,
-            };
+            use crate::lfm::rpo::{ARK1, ARK2, MDS_CIRC_ROW, NUM_ROUNDS};
             use rpo_cols as rc;
 
-            let mode_c = b.main(0, rc::MODE_C);
-            let mode_t = b.main(0, rc::MODE_T);
-            let mode_l = b.main(0, rc::MODE_L);
-            let mode_p = b.main(0, rc::MODE_P);
-            let m = mode_c + mode_t + mode_l + mode_p.clone();
-
-            // idx 0–3: the per-mode capacity copy —
-            // S_k = MODE_P·IN_{8+k} + MODE_C·IVC_k + MODE_T·IVT_k + MODE_L·IVL_k.
-            // A permutation row carries its own third input cell; every other
-            // mode takes its domain's capacity. `DOMAIN_COMPRESS` is zero, so
-            // that arm contributes nothing and a Merkle parent is a plain
-            // `Rpo256::merge`.
-            const MODE_IVS: [(usize, u64); 3] = [
-                (rc::MODE_C, DOMAIN_COMPRESS),
-                (rc::MODE_T, DOMAIN_TRANSCRIPT),
-                (rc::MODE_L, DOMAIN_LEAF),
-            ];
-            for k in 0..4 {
-                let s = b.main(0, rc::S8 + k);
-                let in_k = b.main(0, rc::IN0 + 8 + k);
-                let mut rhs = mode_p.clone() * in_k;
-                for (sel_col, domain) in MODE_IVS {
-                    let iv_k = domain_iv(domain)[k];
-                    if iv_k != 0 {
-                        let sel = b.main(0, sel_col);
-                        rhs = rhs + sel * b.const_base(iv_k);
-                    }
-                }
-                b.emit_base(k, s - rhs);
-            }
-
-            // idx 4: mode sum-boolean (exactly-one-of is the registrar's).
-            let one = b.one();
-            b.emit_base(4, m.clone() * (one - m.clone()));
+            let (m, _mode_p) = Self::emit_socket_prefix::<B>(b);
 
             // The circulant MDS, as an expression over whatever carries the
-            // state: `out_o = Σ_i MDS_CIRC_ROW[(i − o) mod 12] · f_i`, the same
+            // state: `out_o = Σ_i MDS_CIRC_ROW[(i − o) mod 12] · f_i` — the same
             // orientation `rpo::Rpo256::mds` uses and one of the conventions the
             // external KAT pins.
             fn mds<B: ConstraintBuilder<F, E>>(b: &mut B, f: &[B::Expr], o: usize) -> B::Expr {
@@ -1315,6 +1452,177 @@ pub mod hash {
             debug_assert_eq!(
                 idx,
                 rpo_cols::NUM_CONSTRAINTS,
+                "every declared constraint index must be emitted exactly once"
+            );
+        }
+
+        /// Rescue-Prime eXtended at width 12: `FB E FB E FB E M`, one row per
+        /// permutation.
+        ///
+        /// **Degree is exactly 3, in all three round kinds.** The FB rounds are
+        /// [`Self::eval_rpo`]'s round verbatim — forward `u^7 = (u³)²·u`, and
+        /// the inverse S-box verified as the FORWARD power via `(y³)²·y = v`.
+        /// The E rounds lower the EXTENSION seventh power the same way:
+        /// `t² = x·x` and `t³ = t²·x` are committed (degree 2 each), and the
+        /// output rides as `(t³)²·x`, degree 3. The M round is degree 1.
+        ///
+        /// **Each extension operation is THREE constraints, not one** — the
+        /// product of two `GF(p³)` elements is three base-field coefficients, so
+        /// the AIR states them coefficient by coefficient. That is the whole
+        /// reason an E round costs 36 columns where an FB round costs 60.
+        ///
+        /// **Padding by zero survives all three kinds.** With `m = 0`: an FB
+        /// round is RPO's argument unchanged; an E round has `x = 0`, so every
+        /// extension product is zero and `(0)²·0 = 0` holds; the M round is
+        /// `MDS·0 + 0 = 0`. No `IS_REAL` gate anywhere, so blowup 2 survives.
+        fn eval_rpx<B: ConstraintBuilder<F, E>>(b: &mut B) {
+            use crate::lfm::rpo::{ARK1, ARK2, MDS_CIRC_ROW};
+            use crate::lfm::rpx::{
+                EXT_DEGREE, EXT_ELEMENTS, NUM_ROUNDS, is_fb_round, is_final_round,
+            };
+            use rpx_cols as rc;
+
+            let (m, mode_p) = Self::emit_socket_prefix::<B>(b);
+
+            fn mds<B: ConstraintBuilder<F, E>>(b: &mut B, f: &[B::Expr], o: usize) -> B::Expr {
+                f.iter()
+                    .enumerate()
+                    .fold(None::<B::Expr>, |acc, (i, fi)| {
+                        let c = b.const_base(
+                            MDS_CIRC_ROW[(i + HASH_STATE_FELTS - o) % HASH_STATE_FELTS],
+                        );
+                        let term = c * fi.clone();
+                        Some(match acc {
+                            None => term,
+                            Some(x) => x + term,
+                        })
+                    })
+                    .expect("twelve lanes")
+            }
+
+            /// The cubic-extension product `a·b` reduced by `φ³ = φ + 1`, as
+            /// three coefficient expressions — the same closed form
+            /// `rpx::cubic_ext::mul` computes, so the chip is a transcription of
+            /// the host function rather than a second derivation of it.
+            fn ext_mul<B: ConstraintBuilder<F, E>>(
+                a: &[B::Expr; EXT_DEGREE],
+                bb: &[B::Expr; EXT_DEGREE],
+            ) -> [B::Expr; EXT_DEGREE] {
+                let p = |i: usize, j: usize| a[i].clone() * bb[j].clone();
+                [
+                    p(0, 0) + p(1, 2) + p(2, 1),
+                    p(0, 1) + p(1, 0) + p(1, 2) + p(2, 1) + p(2, 2),
+                    p(0, 2) + p(1, 1) + p(2, 0) + p(2, 2),
+                ]
+            }
+
+            let mut state: Vec<B::Expr> = (0..HASH_STATE_FELTS)
+                .map(|i| {
+                    if i < 8 {
+                        b.main(0, rc::IN0 + i)
+                    } else {
+                        b.main(0, rc::S8 + (i - 8))
+                    }
+                })
+                .collect();
+
+            let mut idx = 5;
+            for r in 0..NUM_ROUNDS {
+                if is_final_round(r) {
+                    // (M) — MDS then constants, straight into OUT. Degree 1.
+                    for (o, ark) in ARK1[r].iter().enumerate() {
+                        let mixed = mds(b, &state, o);
+                        let rc_o = b.const_base(*ark);
+                        let out = b.main(0, rc::out(r, o));
+                        b.emit_base(idx, out - (mixed + rc_o * m.clone()));
+                        idx += 1;
+                    }
+                } else if is_fb_round(r) {
+                    // (FB) — RPO's round, verbatim.
+                    let u: Vec<B::Expr> = (0..HASH_STATE_FELTS)
+                        .map(|o| {
+                            let mixed = mds(b, &state, o);
+                            let rc_o = b.const_base(ARK1[r][o]);
+                            mixed + rc_o * m.clone()
+                        })
+                        .collect();
+                    for (lane, u_lane) in u.iter().enumerate() {
+                        let u2 = b.main(0, rc::u2(r, lane));
+                        let u3 = b.main(0, rc::u3(r, lane));
+                        b.emit_base(idx, u2.clone() - u_lane.clone() * u_lane.clone());
+                        b.emit_base(idx + 1, u3 - u2 * u_lane.clone());
+                        idx += 2;
+                    }
+                    let x: Vec<B::Expr> = (0..HASH_STATE_FELTS)
+                        .map(|lane| {
+                            let u3 = b.main(0, rc::u3(r, lane));
+                            u3.clone() * u3 * u[lane].clone()
+                        })
+                        .collect();
+                    let v: Vec<B::Expr> = (0..HASH_STATE_FELTS)
+                        .map(|o| {
+                            let mixed = mds(b, &x, o);
+                            let rc_o = b.const_base(ARK2[r][o]);
+                            mixed + rc_o * m.clone()
+                        })
+                        .collect();
+                    for (lane, v_lane) in v.into_iter().enumerate() {
+                        let y = b.main(0, rc::out(r, lane));
+                        let y2 = b.main(0, rc::y2(r, lane));
+                        let y3 = b.main(0, rc::y3(r, lane));
+                        b.emit_base(idx, y2.clone() - y.clone() * y.clone());
+                        b.emit_base(idx + 1, y3.clone() - y2 * y.clone());
+                        b.emit_base(idx + 2, y3.clone() * y3 * y - v_lane);
+                        idx += 3;
+                    }
+                } else {
+                    // (E) — constants then x^7 in GF(p³) on four triples. No MDS.
+                    for e in 0..EXT_ELEMENTS {
+                        let base = e * EXT_DEGREE;
+                        let x: [B::Expr; EXT_DEGREE] = core::array::from_fn(|k| {
+                            let rc_k = b.const_base(ARK1[r][base + k]);
+                            state[base + k].clone() + rc_k * m.clone()
+                        });
+                        let t2_cols: [B::Expr; EXT_DEGREE] =
+                            core::array::from_fn(|k| b.main(0, rc::t2(r, e, k)));
+                        let t3_cols: [B::Expr; EXT_DEGREE] =
+                            core::array::from_fn(|k| b.main(0, rc::t3(r, e, k)));
+
+                        // t² = x·x, three coefficients, degree 2.
+                        let sq = ext_mul::<B>(&x, &x);
+                        for (k, want) in sq.into_iter().enumerate() {
+                            b.emit_base(idx, t2_cols[k].clone() - want);
+                            idx += 1;
+                        }
+                        // t³ = t²·x, degree 2.
+                        let cube = ext_mul::<B>(&t2_cols, &x);
+                        for (k, want) in cube.into_iter().enumerate() {
+                            b.emit_base(idx, t3_cols[k].clone() - want);
+                            idx += 1;
+                        }
+                        // out = (t³)²·x — degree 3, the extension fold.
+                        let t6 = ext_mul::<B>(&t3_cols, &t3_cols);
+                        let seventh = ext_mul::<B>(&t6, &x);
+                        for (k, want) in seventh.into_iter().enumerate() {
+                            let out = b.main(0, rc::out(r, base + k));
+                            b.emit_base(idx, out - want);
+                            idx += 1;
+                        }
+                    }
+                }
+
+                if !is_final_round(r) {
+                    state = (0..HASH_STATE_FELTS)
+                        .map(|j| b.main(0, rc::out(r, j)))
+                        .collect();
+                }
+            }
+
+            let _ = mode_p;
+            idx = emit_unread_input_pins(b, idx);
+            debug_assert_eq!(
+                idx,
+                rpx_cols::NUM_CONSTRAINTS,
                 "every declared constraint index must be emitted exactly once"
             );
         }

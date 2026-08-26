@@ -158,6 +158,65 @@ pub(super) fn fill_rpo_witness(out: &mut [FE]) {
     );
 }
 
+/// Writes the RPX round witness into a hash row whose `IN`/`S`/`OUT` columns are
+/// already filled.
+///
+/// Same discipline as the other two fillers: the permutation input is read back
+/// out of the row's own `IN`/`S` columns, so the witness cannot describe a
+/// different input than the one the AIR constrains.
+///
+/// The one thing that differs is that RPX's rounds are not alike — the FB rounds
+/// write two ladders per lane, the E rounds two extension intermediates per
+/// triple, and the M round writes only `OUT` — so this walks the schedule rather
+/// than a uniform loop.
+pub(super) fn fill_rpx_witness(out: &mut [FE]) {
+    use super::chips::hash::rpx_cols as rc;
+    use super::rpx::{
+        EXT_DEGREE, EXT_ELEMENTS, NUM_ROUNDS, is_fb_round, is_final_round, kind_index,
+        permutation_witness,
+    };
+
+    let state: [FE; HASH_STATE_FELTS] = core::array::from_fn(|i| {
+        if i < 8 {
+            out[hash::cols::IN0 + i]
+        } else {
+            out[hash::cols::S8 + (i - 8)]
+        }
+    });
+    let w = permutation_witness(state);
+    for r in 0..NUM_ROUNDS {
+        if is_final_round(r) {
+            continue; // the M round's output IS `OUT`, already written.
+        }
+        if is_fb_round(r) {
+            let round = &w.fb[kind_index(r)];
+            for lane in 0..HASH_STATE_FELTS {
+                out[rc::u2(r, lane)] = round.u2[lane];
+                out[rc::u3(r, lane)] = round.u3[lane];
+                out[rc::y2(r, lane)] = round.y2[lane];
+                out[rc::y3(r, lane)] = round.y3[lane];
+                out[rc::out(r, lane)] = round.y[lane];
+            }
+        } else {
+            let round = &w.ext[kind_index(r)];
+            for e in 0..EXT_ELEMENTS {
+                for k in 0..EXT_DEGREE {
+                    out[rc::t2(r, e, k)] = round.t2[e * EXT_DEGREE + k];
+                    out[rc::t3(r, e, k)] = round.t3[e * EXT_DEGREE + k];
+                }
+            }
+            for j in 0..HASH_STATE_FELTS {
+                out[rc::out(r, j)] = round.out[j];
+            }
+        }
+    }
+    debug_assert_eq!(
+        &out[hash::cols::OUT0..hash::cols::OUT0 + HASH_STATE_FELTS],
+        w.final_out.as_slice(),
+        "the M round's output is the OUT columns the executor already wrote"
+    );
+}
+
 pub fn build_traces(program: &LfmProgram, records: &LfmRecords) -> LfmTraces {
     build_traces_with_hasher(program, records, HasherKind::default())
 }
@@ -336,6 +395,7 @@ pub fn build_traces_with_hasher(
                 // discipline `fill_poseidon_witness` follows for its input.
                 HasherKind::Blake3 => blake3_socket::fill_socket_witness(out),
                 HasherKind::Rpo => fill_rpo_witness(out),
+                HasherKind::Rpx => fill_rpx_witness(out),
             }
         }),
         keccak: chip_trace(&g.keccak, keccak::cols::NUM_COLUMNS, |row, out| {
