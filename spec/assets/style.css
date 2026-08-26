@@ -242,7 +242,7 @@ nav li code {
   }
 
   .mobile-nav summary::before {
-    content: '\2630 ';
+    content: '\2630 \00a0';
   }
 
   .mobile-nav summary::-webkit-details-marker {
