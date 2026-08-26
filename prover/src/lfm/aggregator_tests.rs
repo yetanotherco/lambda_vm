@@ -2367,7 +2367,31 @@ fn the_real_block_aggregates_end_to_end() {
         t.elapsed().as_secs_f64()
     );
 
-    let agg_artifacts = build_artifacts(&program, &agg_opts);
+    // The TERMINAL layer's own options, decoupled from the wrap layer's: the
+    // wraps and the aggregation PROGRAM keep Design A's blowup4/110q (the
+    // census point — cached wrap proofs stay valid), while the aggregation
+    // prove itself may take a smaller blowup. P3_AGG_TERMINAL_BLOWUP=2 halves
+    // every LDE term — the 483 GiB box OOM-killed three straight attempts at
+    // blowup 4 (P3-OOM-REPORT.md). The query count re-derives from the same
+    // 128-bit Johnson target by construction (`with_blowup`), so 2 -> 219 q;
+    // the FRI terminal stays at the aggregation preset's fp8.
+    let terminal_opts = match std::env::var("P3_AGG_TERMINAL_BLOWUP") {
+        Ok(b) => {
+            let blowup: u8 = b
+                .parse()
+                .expect("P3_AGG_TERMINAL_BLOWUP must be a power-of-two u8");
+            let mut o = stark::proof::options::GoldilocksCubicProofOptions::with_blowup(blowup)
+                .expect("P3_AGG_TERMINAL_BLOWUP must be a valid blowup");
+            o.fri_final_poly_log_degree = agg_opts.fri_final_poly_log_degree;
+            println!(
+                "   aggregation TERMINAL options: blowup {} / {} q / fp{} (P3_AGG_TERMINAL_BLOWUP)",
+                o.blowup_factor, o.fri_number_of_queries, o.fri_final_poly_log_degree
+            );
+            o
+        }
+        Err(_) => agg_opts.clone(),
+    };
+    let agg_artifacts = build_artifacts(&program, &terminal_opts);
     // The aggregation prove's own residency posture, decoupled from the wrap
     // proves': P3_AGG_RESIDENCY=recompute trades ~2× prove time for the LDE
     // peak (the first real-scale Retain attempt OOM-killed a 483 GiB box).
@@ -2379,7 +2403,7 @@ fn the_real_block_aggregates_end_to_end() {
     }
     let agg_artifacts_ = &agg_artifacts;
     let t = Instant::now();
-    let final_proof = lfm_prove_batched(&program, agg_artifacts_, &arenas, &agg_opts)
+    let final_proof = lfm_prove_batched(&program, agg_artifacts_, &arenas, &terminal_opts)
         .expect("★ THE AGGREGATION MUST PROVE");
     let agg_prove_s = t.elapsed().as_secs_f64();
     let final_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&final_proof)
@@ -2398,7 +2422,7 @@ fn the_real_block_aggregates_end_to_end() {
             &agg_artifacts,
             &final_proof.proof,
             &final_proof.public_words,
-            &agg_opts
+            &terminal_opts
         ),
         "the block proof must verify against the pinned aggregator identity"
     );
