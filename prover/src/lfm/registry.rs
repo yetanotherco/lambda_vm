@@ -21,6 +21,7 @@ use stark::batched::shape::RoundShape;
 
 use super::airs::{
     BLAKE3_SLOT, ChipSet, KECCAK_RC_SLOT, KECCAK_RND_SLOT, KECCAK_SLOT, NUM_LFM_CHIPS,
+    blake3_chunk_rows,
 };
 use super::commit::{PrepRoundBuilder, commit_lde_columns, group_columns, lde_columns};
 use super::compiler::LfmProgram;
@@ -66,6 +67,16 @@ pub enum LfmRegistryError {
     },
 }
 
+/// One blessed program: its committed roots, its heights and the pieces of
+/// proof shape a verifier must not read off the proof.
+///
+/// ★ **There is deliberately no `blake3_chunks` column**, unlike
+/// [`Self::keccak_rnd_chunks`]. Every registered program is a fixture that
+/// compresses a handful of blocks at most, so all six sit at the policy default
+/// of ONE `LFM_BLAKE3` table, and a column that can only ever read 1 would be a
+/// shape a verifier could get wrong for no reason. [`Self::artifacts`] derives
+/// it, and `every_registry_entry_is_a_single_blake3_table` pins the premise.
+/// Blessing a chunked program means adding the column then, alongside the row.
 pub struct LfmRegistryEntry {
     pub kind: LfmProgramKind,
     pub blowup_factor: u8,
@@ -96,11 +107,50 @@ pub struct LfmRegistryEntry {
     pub prep_widths: [u16; NUM_LFM_CHIPS],
 }
 
+impl LfmRegistryEntry {
+    /// This entry as [`LfmArtifacts`] — the shape both verify paths read.
+    ///
+    /// The `LFM_BLAKE3` chunk list is DERIVED rather than stored: every
+    /// registered program sits at the policy default of one table, so the
+    /// committed list is exactly slot 11's own root and height. See the note on
+    /// the struct for why there is no column, and
+    /// `every_registry_entry_is_a_single_blake3_table` for what keeps the
+    /// premise honest.
+    pub fn artifacts(&self) -> LfmArtifacts {
+        LfmArtifacts {
+            roots: self.roots,
+            log_heights: self.log_heights,
+            keccak_rnd_chunks: self.keccak_rnd_chunks,
+            blake3_chunk_roots: vec![self.roots[BLAKE3_SLOT]],
+            blake3_chunk_log_heights: vec![self.log_heights[BLAKE3_SLOT]],
+            hasher: self.hasher,
+            chip_set: self.chip_set,
+            program_id: self.program_id,
+            prep_root: self.prep_root,
+            prep_widths: self.prep_widths,
+        }
+    }
+}
+
 /// A program's committed artifacts (what a registry entry pins).
 pub struct LfmArtifacts {
     pub roots: [Commitment; NUM_LFM_CHIPS],
     pub log_heights: [u8; NUM_LFM_CHIPS],
     pub keccak_rnd_chunks: usize,
+    /// One preprocessed root per `LFM_BLAKE3` chunk, in chunk order — empty when
+    /// the BLAKE3 family is absent.
+    ///
+    /// The chip's chunks are NOT interchangeable the way `KECCAK_RND`'s are:
+    /// each commits its own slice of the instruction column group, so each has
+    /// its own root and its own height. `blake3_chunk_roots[0]` IS
+    /// `roots[BLAKE3_SLOT]` and `blake3_chunk_log_heights[0]` IS
+    /// `log_heights[BLAKE3_SLOT]`, which is what makes a single-chunk program
+    /// bit-identical to an unchunked one; chunks 1.. live only here and are
+    /// folded into `program_id` as a tail (see
+    /// [`lfm_program_id`](super::statement::lfm_program_id)).
+    pub blake3_chunk_roots: Vec<Commitment>,
+    /// Trace log-height of each `LFM_BLAKE3` chunk, in chunk order.
+    pub blake3_chunk_log_heights: Vec<u8>,
     /// The hasher `program_id` was derived under; the prove and verify paths
     /// both take it from here rather than defaulting.
     pub hasher: HasherKind,
@@ -154,13 +204,32 @@ impl LfmArtifacts {
             prep,
             &self.prep_widths,
             self.keccak_rnd_chunks,
+            self.blake3_chunks(),
             self.chip_set,
         )
+    }
+
+    /// `LFM_BLAKE3` instances this program COMMITS — never zero, since slot 11's
+    /// group is committed even for a program that never compresses.
+    ///
+    /// Whether a PROOF carries them is the chip mask's decision, taken where it
+    /// always was: [`ChipSet::num_airs`](super::airs::ChipSet::num_airs) gates on
+    /// `blake3`, and [`LfmAirs::air_refs`](super::airs::LfmAirs::air_refs) omits
+    /// the instances. That is why this reports the committed count rather than
+    /// the gated one, unlike [`Self::keccak_rnd_chunks`] — `KECCAK_RND` commits
+    /// nothing, so it can legitimately drop to zero instances.
+    pub fn blake3_chunks(&self) -> usize {
+        self.blake3_chunk_roots.len()
     }
 }
 
 /// The slots the batched preprocessed round covers: the twelve
 /// program-dependent column groups (0–11).
+///
+/// ★ Slot 11 contributes one MATRIX PER `LFM_BLAKE3` CHUNK, so a chunked
+/// program's round has eleven fixed matrices plus `n` — see
+/// [`prep_round_dims`], which expands the slot in place. The membership rule is
+/// still this range and nothing else.
 ///
 /// # Why not all fifteen
 ///
@@ -206,10 +275,11 @@ pub fn prep_round_dims(
     log_heights: &[u8; NUM_LFM_CHIPS],
     prep_widths: &[u16; NUM_LFM_CHIPS],
     blowup_factor: u8,
+    blake3_chunk_log_heights: &[u8],
 ) -> Vec<(usize, usize)> {
     let blowup_log = (blowup_factor as usize).trailing_zeros() as usize;
     PREP_ROUND_SLOTS
-        .map(|i| {
+        .flat_map(|i| {
             // Membership is PREP_ROUND_SLOTS and nothing else. An earlier draft
             // wrote `.filter(|&i| prep_widths[i] > 0)` here, which is a SECOND
             // derivation of the round's membership competing with the slot range
@@ -223,10 +293,21 @@ pub fn prep_round_dims(
                 prep_widths[i] > 0,
                 "slot {i} is in PREP_ROUND_SLOTS but carries no committed columns"
             );
-            (
-                log_heights[i] as usize + blowup_log,
-                prep_widths[i] as usize,
-            )
+            let width = prep_widths[i] as usize;
+            // `LFM_BLAKE3` contributes one matrix PER CHUNK, at each chunk's own
+            // height and at the shared group width. Expanded in place rather
+            // than appended, because the round is absorbed in slot order and the
+            // chip's slot is 11 — the last of the round. A single-chunk program
+            // yields exactly the one entry this used to emit, so the round's
+            // shape (and its root) do not move when chunking is off.
+            if i == BLAKE3_SLOT {
+                blake3_chunk_log_heights
+                    .iter()
+                    .map(|h| (*h as usize + blowup_log, width))
+                    .collect::<Vec<_>>()
+            } else {
+                vec![(log_heights[i] as usize + blowup_log, width)]
+            }
         })
         .collect()
 }
@@ -237,9 +318,9 @@ pub fn prep_round_dims(
 /// The two orders diverge on two independent axes, and both must be walked
 /// here exactly as `air_refs` emits them:
 ///
-/// - **Chunking**: `KECCAK_RND` appears `keccak_rnd_chunks` times, so
-///   `KECCAK_RC` sits `chunks` tables after the last always-on slot, not at a
-///   fixed index.
+/// - **Chunking**: `KECCAK_RND` appears `keccak_rnd_chunks` times and
+///   `LFM_BLAKE3` appears `blake3_chunks` times, so `KECCAK_RC` sits that many
+///   tables after the last always-on slot, not at a fixed index.
 /// - **The chip mask**: an absent family's slots are not emitted at all —
 ///   `KECCAK_SLOT` (6), the `KECCAK_RND` copies and `KECCAK_RC` leave with the
 ///   keccak family, `BLAKE3_SLOT` (11) with the blake3 one — and every table
@@ -255,7 +336,12 @@ pub fn prep_round_dims(
 /// `a_batched_lfm_epoch_is_refused_for_the_round_coverage_gap` for the holes.
 ///
 /// `None` for a table index past the end of the set.
-pub fn slot_of_table(table: usize, keccak_rnd_chunks: usize, chip_set: ChipSet) -> Option<usize> {
+pub fn slot_of_table(
+    table: usize,
+    keccak_rnd_chunks: usize,
+    blake3_chunks: usize,
+    chip_set: ChipSet,
+) -> Option<usize> {
     let mut t = table;
     // Slots 0..=5, always present.
     if t < 6 {
@@ -274,10 +360,10 @@ pub fn slot_of_table(table: usize, keccak_rnd_chunks: usize, chip_set: ChipSet) 
     }
     t -= 4;
     if chip_set.blake3 {
-        if t == 0 {
+        if t < blake3_chunks {
             return Some(BLAKE3_SLOT);
         }
-        t -= 1;
+        t -= blake3_chunks;
     }
     if chip_set.keccak {
         if t < keccak_rnd_chunks {
@@ -318,12 +404,13 @@ pub fn pinned_prep_widths(
     prep: &RoundShape,
     prep_widths: &[u16; NUM_LFM_CHIPS],
     keccak_rnd_chunks: usize,
+    blake3_chunks: usize,
     chip_set: ChipSet,
 ) -> Option<Vec<usize>> {
     prep.tables
         .iter()
         .map(|&table| {
-            let slot = slot_of_table(table, keccak_rnd_chunks, chip_set)?;
+            let slot = slot_of_table(table, keccak_rnd_chunks, blake3_chunks, chip_set)?;
             if !PREP_ROUND_SLOTS.contains(&slot) {
                 return None;
             }
@@ -345,7 +432,12 @@ impl LfmArtifacts {
     /// `the_prep_round_shape_matches_what_was_committed` pins that passing the
     /// options a caller committed with reproduces the declared shape.
     pub fn prep_round_shape(&self, blowup_factor: u8) -> (Vec<usize>, Vec<usize>) {
-        let dims = prep_round_dims(&self.log_heights, &self.prep_widths, blowup_factor);
+        let dims = prep_round_dims(
+            &self.log_heights,
+            &self.prep_widths,
+            blowup_factor,
+            &self.blake3_chunk_log_heights,
+        );
         (
             dims.iter().map(|(h, _)| *h).collect(),
             dims.iter().map(|(_, w)| *w).collect(),
@@ -366,7 +458,13 @@ impl LfmArtifacts {
 ///   table or to the commit pipeline moves every program digest.
 /// - **slot 11 (`LFM_BLAKE3`)** — a program-dependent instruction column group
 ///   like slots 0–9, placed after `LFM_RANGE` so the hosted keccak family stays
-///   contiguous at the end (`airs::KECCAK_RND_SLOT`).
+///   contiguous at the end (`airs::KECCAK_RND_SLOT`). ★ It is also SPLITTABLE
+///   (`chunking::Blake3Chunking`), and unlike `KECCAK_RND` it commits: a chunked
+///   program's chunk 0 is what this slot holds, and chunks 1.. ride
+///   [`LfmArtifacts::blake3_chunk_roots`], bound into the digest as a tail. A
+///   single-chunk program — every registered one — is bit-identical to the
+///   unchunked machine, which is why no blessed digest moved when chunking
+///   arrived.
 /// - **slots 13–14 (`KECCAK_RC`, `BITWISE`)** — same treatment as `LFM_RANGE`,
 ///   except their preprocessed columns are owned by `tables/`, so the roots come
 ///   from those modules' own `preprocessed_commitment` — which is both what the
@@ -442,6 +540,9 @@ pub fn build_artifacts_with_hasher(
     hasher: HasherKind,
 ) -> LfmArtifacts {
     let range = range_group();
+    // Slots 0..=10 in slot order. Slot 11 (`LFM_BLAKE3`) is not here because it
+    // is the CHUNKED one: it contributes one committed matrix per chunk, built
+    // and absorbed after this list, which is where slot order puts it anyway.
     let groups = [
         &program.groups.const_,
         &program.groups.balu,
@@ -454,7 +555,6 @@ pub fn build_artifacts_with_hasher(
         &program.groups.hint,
         &program.groups.public,
         &range,
-        &program.groups.blake3,
     ];
     let mut roots = [[0u8; 32]; NUM_LFM_CHIPS];
     let mut log_heights = [0u8; NUM_LFM_CHIPS];
@@ -470,7 +570,24 @@ pub fn build_artifacts_with_hasher(
                 u16::try_from(g.width).expect("a chip group is far under 65535 columns");
         }
     }
-    let prep_dims = prep_round_dims(&log_heights, &prep_widths, options.blowup_factor);
+    // The chunk heights are arithmetic (`blake3_chunk_rows`), so the round's
+    // shape is declared without materializing a single chunk group. Slot 11's
+    // own entries are chunk 0's — the two arrays stay the shape a single-table
+    // program has always had.
+    let blake3_chunk_log_heights: Vec<u8> = blake3_chunk_rows(program)
+        .into_iter()
+        .map(|rows| rows.trailing_zeros() as u8)
+        .collect();
+    log_heights[BLAKE3_SLOT] = blake3_chunk_log_heights[0];
+    prep_widths[BLAKE3_SLOT] = u16::try_from(program.groups.blake3.width)
+        .expect("a chip group is far under 65535 columns");
+
+    let prep_dims = prep_round_dims(
+        &log_heights,
+        &prep_widths,
+        options.blowup_factor,
+        &blake3_chunk_log_heights,
+    );
     let mut prep = PrepRoundBuilder::new(&prep_dims);
 
     for (i, g) in groups.iter().enumerate() {
@@ -486,6 +603,21 @@ pub fn build_artifacts_with_hasher(
         // Dropped here — peak residency is one group's LDE, exactly as before.
         drop(lde);
     }
+    // Then `LFM_BLAKE3`, one chunk at a time: materialize the chunk's group,
+    // expand it, commit it, absorb it, drop both. Peak residency stays one
+    // chunk's LDE — which is the whole point of chunking this chip.
+    let blake3_chunk_roots: Vec<Commitment> = (0..blake3_chunk_log_heights.len())
+        .map(|c| {
+            let group = program.blake3_chunk_group(c);
+            let lde = lde_columns(&group_columns(&group), options);
+            drop(group);
+            let root = commit_lde_columns(&lde);
+            prep.absorb(&lde);
+            drop(lde);
+            root
+        })
+        .collect();
+    roots[BLAKE3_SLOT] = blake3_chunk_roots[0];
     let prep_root = prep.finish();
     // Slot 12 (KECCAK_RND) keeps the all-zero sentinel installed above.
     roots[13] = keccak_rc::preprocessed_commitment(options);
@@ -503,15 +635,33 @@ pub fn build_artifacts_with_hasher(
             .chunking
             .chunk_count(program.groups.keccak.real_rows),
     );
+    // ★ `blake3_chunk_roots` is NOT mask-gated the way `keccak_rnd_chunks` is,
+    // and the asymmetry is real: `KECCAK_RND` commits nothing, so an absent
+    // family can drop to zero instances for free, while `LFM_BLAKE3`'s
+    // instruction group is COMMITTED whether the family is used or not — slot 11
+    // has always carried a root and a height for a program that never
+    // compresses. So the chunk lists describe what was committed (never empty)
+    // and the mask decides what a proof carries, exactly where it always did:
+    // `ChipSet::num_airs` and `LfmAirs::air_refs`.
 
     // `prep_root` and `prep_widths` are deliberately NOT arguments here: the
     // batched-round pins ride the entry, not the digest. Folding them in
     // belongs to the next deliberate re-bless. See `LfmArtifacts::prep_root`.
-    let program_id = lfm_program_id(&roots, &log_heights, keccak_rnd_chunks, hasher, chip_set);
+    let program_id = lfm_program_id(
+        &roots,
+        &log_heights,
+        keccak_rnd_chunks,
+        hasher,
+        chip_set,
+        &blake3_chunk_roots,
+        &blake3_chunk_log_heights,
+    );
     LfmArtifacts {
         roots,
         log_heights,
         keccak_rnd_chunks,
+        blake3_chunk_roots,
+        blake3_chunk_log_heights,
         hasher,
         chip_set,
         program_id,

@@ -44,10 +44,10 @@ pub type DynLfmAir<'a> = &'a dyn AIR<Field = F, FieldExtension = E, PublicInputs
 /// negotiation onto the verify path, which this design refuses.
 ///
 /// This is the count of chip *classes*, and the width of the roots and
-/// log-heights arrays. `KECCAK_RND` (slot 12) may be instantiated more than
-/// once — see [`num_lfm_airs`] — but its chunk count is program shape read
-/// from the registry, not shape negotiated on the verify path, so the
-/// principle above holds.
+/// log-heights arrays. `KECCAK_RND` (slot 12) and `LFM_BLAKE3` (slot 11) may
+/// each be instantiated more than once — see [`num_lfm_airs`] — but their chunk
+/// counts are program shape read from the registry, not shape negotiated on the
+/// verify path, so the principle above holds.
 pub const NUM_LFM_CHIPS: usize = 15;
 pub const LFM_CHIP_NAMES: [&str; NUM_LFM_CHIPS] = [
     "LFM_CONST",
@@ -85,14 +85,23 @@ pub const KECCAK_RND_SLOT: usize = 12;
 /// The hash-family slots [`ChipSet`] gates. `BITWISE` (14) is deliberately not
 /// among them: both families send to its `ByteAlu`/`AreBytes` buses, so it is
 /// shared infrastructure rather than either family's chip.
+///
+/// `BLAKE3_SLOT` is the machine's SECOND splittable slot
+/// ([`super::chunking::Blake3Chunking`]): its chunks sit contiguously at 11..,
+/// before `KECCAK_RND`'s at 12+chunks... , so the frozen order is the class
+/// order with each splittable class expanded in place. Unlike `KECCAK_RND`, the
+/// chip has preprocessed columns, so chunk 0's root is the roots array's slot-11
+/// entry and the rest ride
+/// [`LfmArtifacts`](super::registry::LfmArtifacts::blake3_chunk_roots).
 pub const KECCAK_SLOT: usize = 6;
 pub const BLAKE3_SLOT: usize = 11;
 pub const KECCAK_RC_SLOT: usize = 13;
 
 /// AIR instances (and sub-proofs) in a proof whose `KECCAK_RND` is split into
-/// `keccak_rnd_chunks` instances.
-pub const fn num_lfm_airs(keccak_rnd_chunks: usize) -> usize {
-    ChipSet::FULL.num_airs(keccak_rnd_chunks)
+/// `keccak_rnd_chunks` instances and whose `LFM_BLAKE3` is split into
+/// `blake3_chunks`.
+pub const fn num_lfm_airs(keccak_rnd_chunks: usize, blake3_chunks: usize) -> usize {
+    ChipSet::FULL.num_airs(keccak_rnd_chunks, blake3_chunks)
 }
 
 /// ★ Which hash-family chip groups a program instantiates.
@@ -159,16 +168,16 @@ impl ChipSet {
     }
 
     /// Sub-proofs a proof under this mask carries.
-    pub const fn num_airs(self, keccak_rnd_chunks: usize) -> usize {
+    pub const fn num_airs(self, keccak_rnd_chunks: usize, blake3_chunks: usize) -> usize {
         // The classes no family owns: all 15 less KECCAK_RND (counted per
         // chunk below), less LFM_KECCAK and KECCAK_RC (keccak's), less
-        // LFM_BLAKE3 (blake3's).
+        // LFM_BLAKE3 (blake3's, counted per chunk below).
         let mut n = NUM_LFM_CHIPS - 4;
         if self.keccak {
             n += 2 + keccak_rnd_chunks;
         }
         if self.blake3 {
-            n += 1;
+            n += blake3_chunks;
         }
         n
     }
@@ -178,6 +187,11 @@ impl ChipSet {
     /// present, which is the decision this reverses.
     pub fn keccak_rnd_chunks(self, policy_chunks: usize) -> usize {
         if self.keccak { policy_chunks } else { 0 }
+    }
+
+    /// `LFM_BLAKE3` instances under this mask, on exactly the same terms.
+    pub fn blake3_chunks(self, policy_chunks: usize) -> usize {
+        if self.blake3 { policy_chunks } else { 0 }
     }
 
     /// One byte, folded into `program_id`. The mask is program shape, so a
@@ -211,6 +225,21 @@ pub fn keccak_rnd_chunk_rows(program: &super::compiler::LfmProgram) -> Vec<usize
         .collect()
 }
 
+/// Each `LFM_BLAKE3` chunk's trace height: one row per compression, padded to
+/// the `padded_rows` rule the compiler applies to every group — now once per
+/// chunk, which is exactly what
+/// [`LfmProgram::blake3_chunk_group`](super::compiler::LfmProgram::blake3_chunk_group)
+/// materializes. Arithmetic rather than a walk of the groups, so a census costs
+/// nothing on a program whose chunks are millions of rows;
+/// `the_blake3_chunk_arithmetic_is_the_group_split` pins the agreement.
+pub fn blake3_chunk_rows(program: &super::compiler::LfmProgram) -> Vec<usize> {
+    program
+        .blake3_chunk_real_rows()
+        .into_iter()
+        .map(super::layout::padded_rows)
+        .collect()
+}
+
 /// What sets a chip's trace height, and therefore whether the padding below its
 /// next power-of-two step is a margin the workload can consume.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -223,11 +252,12 @@ pub enum HeightRule {
     /// real, so it reports zero headroom — because it is full, not because it
     /// is about to double. It cannot move with the workload at all.
     Fixed,
-    /// One chunk of a split table. The chunking policy caps a chunk just under
-    /// a power of two (`KECCAK_RND`: 21,845 permutations = 524,280 of 524,288
-    /// rows), so a full chunk permanently reads ~0% headroom and yet can never
-    /// cross one — the policy emits another chunk instead. Watching these would
-    /// be watching a false alarm that is always on.
+    /// One chunk of a split table. The chunking policy caps a chunk at or just
+    /// under a power of two (`KECCAK_RND`: 21,845 permutations = 524,280 of
+    /// 524,288 rows; `LFM_BLAKE3` at a `2^k` row cap: exactly full), so a full
+    /// chunk permanently reads ~0% headroom and yet can never cross one — the
+    /// policy emits another chunk instead. Watching these would be watching a
+    /// false alarm that is always on.
     Chunked,
 }
 
@@ -456,7 +486,11 @@ pub fn lfm_chip_census_with_hasher(
     // family would describe a different machine than the one being proved,
     // which is precisely what this function's doc promises it cannot.
     let chip_set = ChipSet::for_program(program);
-    let mut census = Vec::with_capacity(per_chip.len() + 1);
+    let mut census = Vec::with_capacity(
+        per_chip.len()
+            + program.chunking.chunk_count(g.keccak.real_rows)
+            + program.blake3_chunk_count(),
+    );
     for (slot, shape) in per_chip.into_iter().enumerate() {
         if slot == KECCAK_RND_SLOT && chip_set.keccak {
             for (perms, rows) in keccak_rnd_chunk_permutations(program)
@@ -499,6 +533,30 @@ pub fn lfm_chip_census_with_hasher(
             prep,
             interactions,
         } = shape;
+        // `LFM_BLAKE3` expands in place, like `KECCAK_RND` above but at its own
+        // slot: the class is one entry per chunk, at the chunk's own height.
+        // A single-chunk program keeps the `Workload` rule — it IS the
+        // workload-sized table, and its headroom is a real cliff — while a split
+        // one reads `Chunked` for the reason [`HeightRule::Chunked`] gives.
+        if class == BLAKE3_SLOT {
+            let chunk_rows = program.blake3_chunk_real_rows();
+            let rule = if chunk_rows.len() > 1 {
+                HeightRule::Chunked
+            } else {
+                height_rule
+            };
+            for real in chunk_rows {
+                census.push(LfmChipCells {
+                    name: LFM_CHIP_NAMES[BLAKE3_SLOT],
+                    rows: super::layout::padded_rows(real) as u64,
+                    real_rows: real as u64,
+                    height_rule: rule,
+                    main_cols: num_cols - prep,
+                    aux_cols: interactions.div_ceil(2),
+                });
+            }
+            continue;
+        }
         census.push(LfmChipCells {
             name: LFM_CHIP_NAMES[class],
             rows: padded_rows,
@@ -551,16 +609,21 @@ pub struct LfmAirs {
     /// hosted family. Its AIR and its trace filler live in
     /// [`super::blake3_chip`] rather than in `chips.rs` for that reason: there
     /// is nothing here to adapt, only a chip to name.
-    blake3: LfmAir<blake3_chip::Blake3LfmConstraints>,
+    ///
+    /// One instance per chunk (see [`super::chunking::Blake3Chunking`]). Unlike
+    /// `KECCAK_RND`'s vector below, the instances are NOT identical: each carries
+    /// its own chunk's preprocessed root, so they are built from the supplied
+    /// root slice rather than in a loop over one argument set.
+    blake3: Vec<LfmAir<blake3_chip::Blake3LfmConstraints>>,
     /// One instance per `KECCAK_RND` chunk. Every instance is the identical
     /// AIR — chunking changes only how many rows each one carries — so they
     /// are built in a loop rather than named individually.
     keccak_rnd: Vec<LfmAir<keccak_rnd::KeccakRndConstraints>>,
     keccak_rc: LfmAir<EmptyConstraints>,
     bitwise: LfmAir<EmptyConstraints>,
-    /// Which hash families this set instantiates. The unused family's AIRs are
-    /// still BUILT (construction is free — there is no keygen here) but are not
-    /// offered to the prover or the verifier, so a proof never carries them.
+    /// Which hash families this set instantiates. An unused family's AIRs may
+    /// still be BUILT (construction is free — there is no keygen here) but are
+    /// not offered to the prover or the verifier, so a proof never carries them.
     chip_set: ChipSet,
 }
 
@@ -606,7 +669,8 @@ fn build_air<CS: ConstraintSet<F, E> + 'static>(
 impl LfmAirs {
     /// Builds the chip set against the supplied (registry-resolved or
     /// freshly built) instruction-column-group roots, in the frozen order,
-    /// with `KECCAK_RND` instantiated `keccak_rnd_chunks` times.
+    /// with `KECCAK_RND` instantiated `keccak_rnd_chunks` times and `LFM_BLAKE3`
+    /// once.
     ///
     /// A zero chunk count builds no `KECCAK_RND` at all; callers on the verify
     /// path must reject that shape before getting here rather than relying on
@@ -642,6 +706,47 @@ impl LfmAirs {
         hasher: HasherKind,
         chip_set: ChipSet,
     ) -> Self {
+        // The unchunked `LFM_BLAKE3`: slot 11's root IS chunk 0's root, so a
+        // one-element window over the array is the whole of what a single-table
+        // program supplies. See [`Self::new_chunked`].
+        Self::new_chunked(
+            roots,
+            &roots[BLAKE3_SLOT..=BLAKE3_SLOT],
+            options,
+            keccak_rnd_chunks,
+            hasher,
+            chip_set,
+        )
+    }
+
+    /// [`LfmAirs::new_with_hasher`] with `LFM_BLAKE3` instantiated once per
+    /// supplied chunk root.
+    ///
+    /// The general constructor. `blake3_roots` is a slice rather than a count
+    /// because the chunks are not interchangeable: each commits its own slice of
+    /// the instruction column group, so each AIR needs its own preprocessed
+    /// root. `blake3_roots[0]` must be `roots[BLAKE3_SLOT]` — the digest binds
+    /// chunk 0 through the roots array and the rest through
+    /// [`LfmArtifacts::blake3_chunk_roots`](super::registry::LfmArtifacts::blake3_chunk_roots)
+    /// — and an empty slice builds no instance at all, which is the shape an
+    /// absent BLAKE3 family has.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_chunked(
+        roots: &[Commitment; NUM_LFM_CHIPS],
+        blake3_roots: &[Commitment],
+        options: &ProofOptions,
+        keccak_rnd_chunks: usize,
+        hasher: HasherKind,
+        chip_set: ChipSet,
+    ) -> Self {
+        debug_assert!(
+            blake3_roots
+                .first()
+                .is_none_or(|first| *first == roots[BLAKE3_SLOT]),
+            "LFM_BLAKE3 chunk 0's root must be the roots array's slot-11 entry — \
+             the digest binds chunk 0 there and the rest as a tail, so a pair that \
+             disagrees describes two different programs"
+        );
         LfmAirs {
             const_: build_air(
                 const_::cols::NUM_COLUMNS,
@@ -742,15 +847,20 @@ impl LfmAirs {
                 roots[10],
                 layout::range::PREP_WIDTH,
             ),
-            blake3: build_air(
-                blake3_chip::cols::NUM_COLUMNS,
-                blake3_chip::bus_interactions(),
-                options,
-                blake3_chip::Blake3LfmConstraints,
-                LFM_CHIP_NAMES[11],
-                roots[11],
-                layout::blake3::PREP_WIDTH,
-            ),
+            blake3: blake3_roots
+                .iter()
+                .map(|root| {
+                    build_air(
+                        blake3_chip::cols::NUM_COLUMNS,
+                        blake3_chip::bus_interactions(),
+                        options,
+                        blake3_chip::Blake3LfmConstraints,
+                        LFM_CHIP_NAMES[BLAKE3_SLOT],
+                        *root,
+                        layout::blake3::PREP_WIDTH,
+                    )
+                })
+                .collect(),
             // KECCAK_RND has no preprocessed columns: `roots[KECCAK_RND_SLOT]`
             // is the all-zero sentinel and is never consulted. Its correctness
             // is entirely its own constraints plus bus balance, both
@@ -795,6 +905,11 @@ impl LfmAirs {
         self.keccak_rnd.len()
     }
 
+    /// Number of `LFM_BLAKE3` instances this set was built with.
+    pub fn blake3_chunks(&self) -> usize {
+        self.blake3.len()
+    }
+
     /// Verify-side projection, frozen order (must match `air_trace_pairs`).
     pub fn air_refs(&self) -> Vec<DynLfmAir<'_>> {
         let mut refs: Vec<DynLfmAir<'_>> = vec![
@@ -815,7 +930,7 @@ impl LfmAirs {
         refs.push(&self.public);
         refs.push(&self.range);
         if self.chip_set.blake3 {
-            refs.push(&self.blake3);
+            refs.extend(self.blake3.iter().map(|a| a as DynLfmAir<'_>));
         }
         if self.chip_set.keccak {
             refs.extend(self.keccak_rnd.iter().map(|a| a as DynLfmAir<'_>));
@@ -834,6 +949,11 @@ impl LfmAirs {
     /// always yields at least one, empty, trace), and the mask simply never
     /// pairs it — so the assert is gated, or every keccak-less program would
     /// panic any debug-profile prove while release proved fine.
+    ///
+    /// `traces.blake3` is asserted the same way and gated for the same reason:
+    /// slot 11's group is committed for every program, so the split always
+    /// yields at least one trace, and a BLAKE3-less program simply never pairs
+    /// it.
     #[allow(clippy::type_complexity)]
     pub fn air_trace_pairs<'a>(
         &'a self,
@@ -842,6 +962,11 @@ impl LfmAirs {
         debug_assert!(
             !self.chip_set.keccak || self.keccak_rnd.len() == traces.keccak_rnd.len(),
             "KECCAK_RND chunk count differs between the AIR set and the traces \
+             — artifacts and traces were built from different chunking policies"
+        );
+        debug_assert!(
+            !self.chip_set.blake3 || self.blake3.len() == traces.blake3.len(),
+            "LFM_BLAKE3 chunk count differs between the AIR set and the traces \
              — artifacts and traces were built from different chunking policies"
         );
         let mut pairs: Vec<(DynLfmAir<'a>, &'a mut TraceTable<F, E>, &'a ())> = vec![
@@ -862,7 +987,12 @@ impl LfmAirs {
         pairs.push((&self.public, &mut traces.public, &()));
         pairs.push((&self.range, &mut traces.range, &()));
         if self.chip_set.blake3 {
-            pairs.push((&self.blake3, &mut traces.blake3, &()));
+            pairs.extend(
+                self.blake3
+                    .iter()
+                    .zip(traces.blake3.iter_mut())
+                    .map(|(air, trace)| (air as DynLfmAir<'a>, trace, &())),
+            );
         }
         if self.chip_set.keccak {
             pairs.extend(

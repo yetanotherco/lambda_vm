@@ -30,7 +30,10 @@ pub struct LfmTraces {
     pub bitdec: TraceTable<F, E>,
     pub hash: TraceTable<F, E>,
     pub keccak: TraceTable<F, E>,
-    pub blake3: TraceTable<F, E>,
+    /// One trace per `LFM_BLAKE3` chunk (see [`super::chunking::Blake3Chunking`]).
+    /// A `Vec` even when the policy is the default single table, so the prove and
+    /// verify paths have one shape to walk rather than two.
+    pub blake3: Vec<TraceTable<F, E>>,
     pub lanes: TraceTable<F, E>,
     pub hint: TraceTable<F, E>,
     pub public: TraceTable<F, E>,
@@ -41,7 +44,8 @@ pub struct LfmTraces {
     ///
     /// `KECCAK_RND` is one trace per chunk (see [`super::chunking`]); the
     /// other two stay single shared instances whose multiplicities count the
-    /// lookups from *every* chunk.
+    /// lookups from *every* chunk — including `LFM_BLAKE3`'s, which `BITWISE`
+    /// receives whole however that chip's rows were split.
     pub keccak_rnd: Vec<TraceTable<F, E>>,
     pub keccak_rc: TraceTable<F, E>,
     pub bitwise: TraceTable<F, E>,
@@ -168,6 +172,24 @@ pub fn build_traces_with_hasher(
         .map(keccak_rnd::generate_keccak_rnd_trace)
         .collect();
 
+    // `LFM_BLAKE3` splits on the same principle, with one step `KECCAK_RND` does
+    // not need: the chip carries a preprocessed instruction group, so a chunk is
+    // its own slice of that group as well as its own slice of the records. Each
+    // chunk's group is materialized, copied into the trace and dropped, so peak
+    // residency is one chunk rather than a second whole group.
+    let blake3_traces: Vec<TraceTable<F, E>> = (0..program.blake3_chunk_count())
+        .map(|c| {
+            let group = program.blake3_chunk_group(c);
+            let base = program
+                .blake3_chunking
+                .chunk_range(g.blake3.real_rows, c)
+                .start;
+            chip_trace(&group, blake3_chip::cols::NUM_COLUMNS, |row, out| {
+                blake3_chip::fill_blake3_witness(out, &records.blake3[base + row]);
+            })
+        })
+        .collect();
+
     // KECCAK_RC and BITWISE are single shared tables: their multiplicities are
     // totals over the whole proof, so they are fed the complete operation list
     // regardless of how the round rows were chunked.
@@ -285,9 +307,7 @@ pub fn build_traces_with_hasher(
                 out[keccak::cols::BLOCK + k] = FE::from(u64::from(v));
             }
         }),
-        blake3: chip_trace(&g.blake3, blake3_chip::cols::NUM_COLUMNS, |row, out| {
-            blake3_chip::fill_blake3_witness(out, &records.blake3[row]);
-        }),
+        blake3: blake3_traces,
         lanes: chip_trace(&g.lanes, lanes::cols::NUM_COLUMNS, |row, out| {
             out[lanes::cols::V0..lanes::cols::V0 + 4].copy_from_slice(&records.lanes[row]);
         }),

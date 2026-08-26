@@ -205,7 +205,8 @@ pub(super) fn report_census(label: &str, program: &LfmProgram) -> (u64, u64) {
                 program
                     .chunking
                     .chunk_count(program.groups.keccak.real_rows)
-            )
+            ),
+            program.blake3_chunk_count(),
         ),
         "the census must have one entry per sub-proof the AIR set builds"
     );
@@ -1137,7 +1138,7 @@ fn the_census_agrees_with_the_traces_the_prover_builds() {
     built.push(dims(&traces.public));
     built.push(dims(&traces.range));
     if chip_set.blake3 {
-        built.push(dims(&traces.blake3));
+        built.extend(traces.blake3.iter().map(dims));
     }
     if chip_set.keccak {
         built.extend(traces.keccak_rnd.iter().map(dims));

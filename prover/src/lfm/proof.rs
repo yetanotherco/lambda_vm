@@ -23,7 +23,7 @@ use stark::verifier::{IsStarkVerifier, Verifier};
 
 use crate::tables::types::{BusId, GoldilocksExtension, GoldilocksField};
 
-use super::airs::{ChipSet, LfmAirs, NUM_LFM_CHIPS};
+use super::airs::{BLAKE3_SLOT, ChipSet, LfmAirs, NUM_LFM_CHIPS};
 use super::compiler::LfmProgram;
 use super::executor::{LfmExecError, execute};
 use super::hash::HasherKind;
@@ -170,8 +170,9 @@ pub(crate) fn prove_traces_with_hasher(
     hasher: HasherKind,
     residency: ResidencyMode,
 ) -> Result<MultiProof<F, E, ()>, ProvingError> {
-    let airs = LfmAirs::new_with_hasher(
+    let airs = LfmAirs::new_chunked(
         &artifacts.roots,
+        &artifacts.blake3_chunk_roots,
         options,
         artifacts.keccak_rnd_chunks,
         hasher,
@@ -224,15 +225,11 @@ pub fn lfm_verify(
     options: &ProofOptions,
 ) -> Result<bool, LfmRegistryError> {
     let entry = resolve(kind, options.blowup_factor)?;
-    Ok(verify_against(
-        &entry.roots,
-        &entry.program_id,
-        entry.keccak_rnd_chunks,
+    Ok(verify_against_artifacts(
+        &entry.artifacts(),
         proof,
         claimed_public,
         options,
-        entry.hasher,
-        entry.chip_set,
     ))
 }
 
@@ -264,8 +261,9 @@ pub fn verify_against_artifacts(
     claimed_public: &[(u32, LfmWord)],
     options: &ProofOptions,
 ) -> bool {
-    verify_against(
+    verify_against_chunked(
         &artifacts.roots,
+        &artifacts.blake3_chunk_roots,
         &artifacts.program_id,
         artifacts.keccak_rnd_chunks,
         proof,
@@ -285,6 +283,13 @@ pub fn verify_against_artifacts(
 /// and tests covering program shapes that are not (and need not be) registered,
 /// such as the per-length keccak256 programs.
 ///
+/// ⚠ This is the SINGLE-`LFM_BLAKE3` door: it builds one instance, from slot
+/// 11's root. A program whose `LFM_BLAKE3` is chunked has extra roots that the
+/// fifteen-wide array cannot hold, so its callers go through
+/// [`verify_against_artifacts`] (or [`verify_against_chunked`]); handing a
+/// chunked proof to this function rejects it on the AIR count rather than
+/// verifying it against the wrong shape.
+///
 /// Every piece is supplied for the same reason: it is program shape the
 /// verifier must know to build the AIR set, and none of it is ever read off the
 /// proof. That includes the hasher — which a caller holding artifacts should
@@ -295,6 +300,41 @@ pub fn verify_against_artifacts(
 #[allow(clippy::too_many_arguments)]
 pub fn verify_against(
     roots: &[Commitment; NUM_LFM_CHIPS],
+    program_id: &Commitment,
+    keccak_rnd_chunks: usize,
+    proof: &MultiProof<F, E, ()>,
+    claimed_public: &[(u32, LfmWord)],
+    options: &ProofOptions,
+    hasher: HasherKind,
+    chip_set: ChipSet,
+) -> bool {
+    // Slot 11's root IS chunk 0's, so a one-element window over the array is the
+    // whole `LFM_BLAKE3` shape a single-table program has. A CHUNKED program's
+    // extra roots live only in `LfmArtifacts`, which is why chunked callers go
+    // through `verify_against_artifacts` — this door would build one instance
+    // against a proof carrying several and reject on the AIR count.
+    verify_against_chunked(
+        roots,
+        &roots[BLAKE3_SLOT..=BLAKE3_SLOT],
+        program_id,
+        keccak_rnd_chunks,
+        proof,
+        claimed_public,
+        options,
+        hasher,
+        chip_set,
+    )
+}
+
+/// [`verify_against`] with `LFM_BLAKE3` split over `blake3_roots` instances.
+///
+/// The general form. Chunk roots are supplied rather than derived for the same
+/// reason every other piece here is: they are program shape the verifier must
+/// know to build the AIR set, and none of it is ever read off the proof.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_against_chunked(
+    roots: &[Commitment; NUM_LFM_CHIPS],
+    blake3_roots: &[Commitment],
     program_id: &Commitment,
     keccak_rnd_chunks: usize,
     proof: &MultiProof<F, E, ()>,
@@ -316,11 +356,18 @@ pub fn verify_against(
         return false;
     }
     let view = MultiProofView::Owned(proof);
-    if view.len() != chip_set.num_airs(keccak_rnd_chunks) {
+    if view.len() != chip_set.num_airs(keccak_rnd_chunks, blake3_roots.len()) {
         return false;
     }
 
-    let airs = LfmAirs::new_with_hasher(roots, options, keccak_rnd_chunks, hasher, chip_set);
+    let airs = LfmAirs::new_chunked(
+        roots,
+        blake3_roots,
+        options,
+        keccak_rnd_chunks,
+        hasher,
+        chip_set,
+    );
     let refs = airs.air_refs();
 
     let mut transcript = DefaultStarkTranscript::<E>::new(&[]);
@@ -403,8 +450,9 @@ pub fn lfm_prove_batched(
     let exec = execute(program, arenas, &hasher).map_err(LfmProveError::Exec)?;
     let mut traces = build_traces_with_hasher(program, &exec.records, hasher);
 
-    let airs = LfmAirs::new_with_hasher(
+    let airs = LfmAirs::new_chunked(
         &artifacts.roots,
+        &artifacts.blake3_chunk_roots,
         options,
         artifacts.keccak_rnd_chunks,
         hasher,
@@ -480,16 +528,7 @@ pub fn lfm_verify_batched(
 ) -> Result<bool, LfmRegistryError> {
     let entry = resolve(kind, options.blowup_factor)?;
     Ok(verify_against_batched(
-        &LfmArtifacts {
-            roots: entry.roots,
-            log_heights: entry.log_heights,
-            keccak_rnd_chunks: entry.keccak_rnd_chunks,
-            hasher: entry.hasher,
-            chip_set: entry.chip_set,
-            program_id: entry.program_id,
-            prep_root: entry.prep_root,
-            prep_widths: entry.prep_widths,
-        },
+        &entry.artifacts(),
         proof,
         claimed_public,
         options,
@@ -522,15 +561,20 @@ pub fn verify_against_batched(
     if artifacts.chip_set.keccak != (artifacts.keccak_rnd_chunks > 0) {
         return false;
     }
-    let airs = LfmAirs::new_with_hasher(
+    let airs = LfmAirs::new_chunked(
         &artifacts.roots,
+        &artifacts.blake3_chunk_roots,
         options,
         artifacts.keccak_rnd_chunks,
         artifacts.hasher,
         artifacts.chip_set,
     );
     let refs = airs.air_refs();
-    if refs.len() != artifacts.chip_set.num_airs(artifacts.keccak_rnd_chunks) {
+    if refs.len()
+        != artifacts
+            .chip_set
+            .num_airs(artifacts.keccak_rnd_chunks, artifacts.blake3_chunks())
+    {
         return false;
     }
 
