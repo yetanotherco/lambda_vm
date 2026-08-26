@@ -50,7 +50,7 @@
   --header-bg: var(--bg-subtle);
   --sidebar-bg: var(--bg-subtle);
   --sidebar-fg: var(--text);
-  --code-bg: var(--bg-subtle);
+  --code-bg: var(--surface-card);
   --code-fg: var(--text);
   --table-border: var(--text);
   --aside-border: var(--border-strong);
@@ -417,7 +417,7 @@ figure:is([data-kind="lemma"], [data-kind="corollary"]) {
   overflow-y: clip;
   margin: 1em 0;
   padding: 1em;
-  background-color: var(--bg-subtle);
+  background-color: var(--code-bg);
 }
 
 figure:is([data-kind="lemma"], [data-kind="corollary"]) p:first-child {
