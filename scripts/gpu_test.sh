@@ -42,7 +42,7 @@ nvidia-smi --query-gpu=name,driver_version,compute_cap --format=csv,noheader
 
 # --- Build the guest ELFs the tests prove ---------------------------------------
 # math-cuda parity needs none; cuda_path_integration / cuda_fallback prove an asm ELF; the
-# prover suite (Groups 4 & 5) proves asm AND rust guests. Build both up front.
+# prover suite (Groups 5 & 6) proves asm AND rust guests. Build both up front.
 log "compiling guest programs (asm + rust)"
 make compile-programs-asm
 make compile-programs-rust

@@ -574,7 +574,7 @@ test-disk-spill:
 GPU_TEST_TIMEOUT := timeout -k 30 2700
 
 # math-cuda kernel tests (requires NVIDIA GPU + nvcc). Group 1 of gpu_test.sh,
-# so a hang here also costs Groups 2-5: they run after it, sequentially.
+# so a hang here also costs Groups 2-6: they run after it, sequentially.
 test-math-cuda:
 	$(GPU_TEST_TIMEOUT) cargo test -p math-cuda --release
 

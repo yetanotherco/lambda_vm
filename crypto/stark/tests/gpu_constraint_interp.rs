@@ -568,13 +568,6 @@ fn check_composition(prog: &ConstraintProgram<Gl, Ext>, label: &str, seed: u64) 
         dev_raw, gpu,
         "[{label}] evaluate_dev (keep=true) H != host-drained H, seed {seed:#x}"
     );
-
-    // This closes the num_parts==1 device DEEP/FRI path (`gpu_comp_h_slabs_calls`)
-    // at the unit level. Its end-to-end counterpart is not asserted in
-    // `prover/tests/cuda_path_integration.rs`: every asm fixture there is a
-    // `fib_iterative_*` variant whose DECODE ROM is below the GPU LDE threshold,
-    // so no d1 table engages. The end-to-end d1 path is exercised by real-program
-    // proves (ethrex) and the GPU bench instead.
 }
 
 #[test]
@@ -587,6 +580,12 @@ fn gpu_composition_matches_cpu_oracle_all_ops() {
 /// num_parts==1 de-risk: the DECODE-shaped (empty-base, LogUp-only) program must
 /// evaluate on the GPU composition kernel, match the CPU oracle, and produce a
 /// device-resident `H` bit-identical to the host-drained one.
+///
+/// This closes the num_parts==1 device path at the unit level — the `H` the slab
+/// de-interleave consumes. The end-to-end counterpart (de-interleave -> commit ->
+/// OOD -> DEEP -> FRI -> openings, then verify) is `prover/tests/cuda_d1_path.rs`,
+/// which needs a lowered `LAMBDA_VM_GPU_LDE_THRESHOLD` because no fixture crosses
+/// the default for a d=1 table; `make test-cuda-d1` runs it.
 #[test]
 fn gpu_composition_matches_cpu_oracle_decode_shaped() {
     for seed in [0x0123_4567_89AB_CDEF, 0xDEAD_BEEF_CAFE_F00D, 7] {
