@@ -311,8 +311,8 @@ ETHREX_REAL_BLOCK := 25368371
 # archived ProgramInput layout moves with the pin, so one block has one fixture per rev.
 # Uploading under a new name rather than replacing the old one keeps `main` — which still
 # expects the pre-bump sha256 — fetching its own artifact while this branch is open.
-ETHREX_REAL_BLOCK_FIXTURE_URL := https://github.com/yetanotherco/lambda_vm/releases/download/bench-fixtures-v1/ethrex_mainnet_25368371_4f658c2b.bin
-ETHREX_REAL_BLOCK_FIXTURE_SHA256 := 0a301731b84515260c2ad7779fef3e4ef8b2424fbcc055ee2f5a224bc88120ab
+ETHREX_REAL_BLOCK_FIXTURE_URL := https://github.com/yetanotherco/lambda_vm/releases/download/bench-fixtures-v1/ethrex_mainnet_25368371_797df554.bin
+ETHREX_REAL_BLOCK_FIXTURE_SHA256 := 573004e62e3680a00d3cdbae19dc4897e2ec60d6ec0c1d05d9ef118cb8aef17f
 # The block's source cache, hosted in the same release. Only `regen-real-block-fixture`
 # reads it — the converter's TESTS use a different, upstream-pinned cache (below).
 ETHREX_REAL_BLOCK_CACHE_URL := https://github.com/yetanotherco/lambda_vm/releases/download/bench-fixtures-v1/cache_mainnet_25368371.json
@@ -578,9 +578,10 @@ test-disk-spill:
 # timeout's 124 exit fails the target so gpu_test.sh reports the group as failed.
 GPU_TEST_TIMEOUT := timeout -k 30 2700
 
-# math-cuda parity tests (requires NVIDIA GPU + nvcc)
+# math-cuda kernel tests (requires NVIDIA GPU + nvcc). Group 1 of gpu_test.sh,
+# so a hang here also costs Groups 2-5: they run after it, sequentially.
 test-math-cuda:
-	cargo test -p math-cuda --release
+	$(GPU_TEST_TIMEOUT) cargo test -p math-cuda --release
 
 # End-to-end cuda dispatch coverage (requires NVIDIA GPU + nvcc).
 # Asserts the R1-R4 GPU dispatch counters fired on a real prove.
@@ -595,6 +596,8 @@ test-cuda-integration:
 test-cuda-fallback:
 	$(GPU_TEST_TIMEOUT) cargo test -p lambda-vm-prover --release --features test-cuda-faults \
 	    --test cuda_fallback_tests -- --ignored --nocapture --test-threads=1
+	$(GPU_TEST_TIMEOUT) cargo test -p lambda-vm-prover --release --features lambda-vm-prover/cuda \
+	    --test gpu_force_downgrade -- --ignored --nocapture --test-threads=1
 
 # The prover/stark/crypto/ecsm test suite with the GPU (cuda) path enabled (requires NVIDIA
 # GPU + nvcc). The GPU CI counterpart of CPU CI's sharded prover tests. Single-threaded: the
