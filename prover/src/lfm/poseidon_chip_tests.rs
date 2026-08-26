@@ -54,9 +54,11 @@ const PINNED_VALUE_COLUMNS: usize = 612;
 /// §6.4's pinned constraint count, same reasoning.
 /// §6.4's pinned constraint count, plus the shared unread-input pins.
 ///
-/// 601 was the figure §6.4 pinned; the +8 are `chips::hash`'s unread-`IN` pins,
-/// which every arm emits since the D1 fix (a leaf row's unread cells were free
-/// on this arm, and this arm's round 0 reads them).
+/// 601 was the figure §6.4 pinned; the rest are `chips::hash`'s unread-`IN`
+/// pins, which every arm emits since the D1 fix (a leaf row's unread cells were
+/// free on this arm, and this arm's round 0 reads them). There are four of them
+/// — one input slot times four columns — since the leaf RATE gave `Leaf` a
+/// second input cell and emptied slot 1's set.
 const PINNED_CONSTRAINTS: usize = 601 + super::chips::hash::NUM_UNREAD_INPUT_PINS;
 /// §6.3's pinned base-equivalent cells per permutation: `612 + 3·3`.
 const PINNED_CELLS_PER_PERMUTATION: u64 = 621;

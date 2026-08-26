@@ -114,6 +114,46 @@ pub(super) fn fill_poseidon_witness(out: &mut [FE]) {
     );
 }
 
+/// Writes the RPO round witness into a hash row whose `IN`/`S`/`OUT` columns are
+/// already filled.
+///
+/// Same discipline as [`fill_poseidon_witness`]: the permutation input is read
+/// back out of the row's own `IN`/`S` columns — the exact cells round 0's
+/// constraints read — rather than from the executor record, so the witness
+/// cannot describe a different input than the one the AIR constrains.
+///
+/// `permutation_witness` supplies the intermediates in the association the
+/// degree-3 lowering needs, including the inverse S-box's `y²`/`y³` ladder,
+/// which the AIR checks FORWARD as `(y³)²·y = v`. This filler is where the real
+/// `x^{1/7}` exponentiation is paid — twelve lanes times seven rounds per row.
+pub(super) fn fill_rpo_witness(out: &mut [FE]) {
+    use super::chips::hash::rpo_cols as rc;
+    use super::rpo::{NUM_ROUNDS, permutation_witness};
+
+    let state: [FE; HASH_STATE_FELTS] = core::array::from_fn(|i| {
+        if i < 8 {
+            out[hash::cols::IN0 + i]
+        } else {
+            out[hash::cols::S8 + (i - 8)]
+        }
+    });
+    let witness = permutation_witness(state);
+    for (r, round) in witness.iter().enumerate() {
+        for lane in 0..HASH_STATE_FELTS {
+            out[rc::u2(r, lane)] = round.u2[lane];
+            out[rc::u3(r, lane)] = round.u3[lane];
+            out[rc::y2(r, lane)] = round.y2[lane];
+            out[rc::y3(r, lane)] = round.y3[lane];
+            out[rc::y(r, lane)] = round.y[lane];
+        }
+    }
+    debug_assert_eq!(
+        &out[hash::cols::OUT0..hash::cols::OUT0 + HASH_STATE_FELTS],
+        witness[NUM_ROUNDS - 1].y.as_slice(),
+        "the final round's output is the OUT columns the executor already wrote"
+    );
+}
+
 pub fn build_traces(program: &LfmProgram, records: &LfmRecords) -> LfmTraces {
     build_traces_with_hasher(program, records, HasherKind::default())
 }
@@ -139,7 +179,11 @@ pub fn build_traces_with_hasher(
             _ => None,
         })
         .collect();
-    let iv = hasher.compress_iv();
+    // The capacity a row takes is its MODE's, not one value for the whole
+    // trace: RPO separates its socket domains through the capacity, so a
+    // transcript row and a parent row carry different constants. `mode_iv` is
+    // the one rule the executor reads too.
+    let mode_iv = |mode: HashMode| hasher.mode_iv(mode);
 
     // The keccak family's traces are driven by the executor's records; the tag
     // is the row ordinal, exactly as the compiler emitted it into the
@@ -258,7 +302,7 @@ pub fn build_traces_with_hasher(
                 out[hash::cols::S8 + k] = if hash_modes[row] == HashMode::Permute {
                     r.ins[8 + k]
                 } else {
-                    iv[k]
+                    mode_iv(hash_modes[row])[k]
                 };
             }
             out[hash::cols::OUT0..hash::cols::OUT0 + 12].copy_from_slice(&r.outs);
@@ -269,6 +313,7 @@ pub fn build_traces_with_hasher(
                 // `chip_trace` populated before calling this — the same
                 // discipline `fill_poseidon_witness` follows for its input.
                 HasherKind::Blake3 => blake3_socket::fill_socket_witness(out),
+                HasherKind::Rpo => fill_rpo_witness(out),
             }
         }),
         keccak: chip_trace(&g.keccak, keccak::cols::NUM_COLUMNS, |row, out| {

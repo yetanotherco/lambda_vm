@@ -47,6 +47,7 @@ pub mod proof;
 pub mod proof_arena;
 pub mod proof_fixture;
 pub mod registry;
+pub mod rpo;
 pub mod statement;
 pub mod statement_replay;
 pub mod sub_proof;
@@ -107,6 +108,8 @@ mod logup_tests;
 mod machine_tests;
 #[cfg(test)]
 mod poseidon_chip_tests;
+#[cfg(test)]
+mod rpo_chip_tests;
 #[cfg(test)]
 mod step_size_tests;
 #[cfg(test)]

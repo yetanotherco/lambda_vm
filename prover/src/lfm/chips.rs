@@ -610,6 +610,106 @@ pub mod hash {
         };
     }
 
+    /// Column layout for the [`HasherKind::Rpo`] configuration — **Layout W**,
+    /// one row per permutation with all seven rounds unrolled.
+    ///
+    /// The frozen prefix (`IN0..12`, `S8..12`, `OUT0..12`) keeps the offsets
+    /// [`cols`] gives it, so [`bus_interactions`] stays hasher-INDEPENDENT and
+    /// the `LFM_HASH` tuple contract stays literally frozen. Everything RPO
+    /// additionally witnesses is appended from [`ROUNDS`] on.
+    ///
+    /// Per round the AIR commits the two S-box ladders and the round output:
+    /// `u²`, `u³` for the FORWARD `x^7` layer, `y²`, `y³` for the INVERSE
+    /// `x^{1/7}` layer, and `y` itself — except the last round, whose `y` IS
+    /// `OUT0..12`. The two linear layers and the forward S-box output are
+    /// recomputed as expressions and cost no columns.
+    ///
+    /// Width: `28 + 7·48 + 6·12 = 436` value columns.
+    ///
+    /// **Why the inverse layer costs the same as the forward one.** `y = v^{1/7}`
+    /// is verified as the FORWARD power — `(y³)²·y = v` — which is the spec's
+    /// own §4.3 folding trick and the reason an inverse S-box with a ~2^63
+    /// exponent is not a ~2^63-degree constraint. The prover pays the real
+    /// exponentiation once, in the trace filler; the AIR only checks a cube.
+    ///
+    /// Contrast with [`poseidon_cols`]' 612: RPO S-boxes MORE lanes (168 ladder
+    /// pairs against Poseidon's 118) and still lands narrower, because round
+    /// COUNT dominates layout width — 7 rounds of state against 30.
+    pub mod rpo_cols {
+        use crate::lfm::hash::HASH_STATE_FELTS;
+        use crate::lfm::rpo::NUM_ROUNDS;
+
+        pub use super::cols::{
+            IN0, MODE_C, MODE_L, MODE_P, MODE_T, OUT0, PREP_WIDTH, S8, SHARED_VALUE_COLUMNS,
+        };
+
+        /// Committed columns per lane per round: `u²`, `u³`, `y²`, `y³`.
+        pub const LADDER_COLUMNS: usize = 4;
+
+        /// First appended witness column.
+        pub const ROUNDS: usize = PREP_WIDTH + SHARED_VALUE_COLUMNS;
+
+        /// Width of round `r`'s appended block: the four ladder columns for
+        /// every lane, plus the twelve output columns — none for the last
+        /// round, which writes its output into `OUT`.
+        pub const fn block_width(r: usize) -> usize {
+            let out = if r + 1 == NUM_ROUNDS {
+                0
+            } else {
+                HASH_STATE_FELTS
+            };
+            LADDER_COLUMNS * HASH_STATE_FELTS + out
+        }
+
+        /// First column of round `r`'s appended block.
+        pub const fn block(r: usize) -> usize {
+            let mut off = ROUNDS;
+            let mut i = 0;
+            while i < r {
+                off += block_width(i);
+                i += 1;
+            }
+            off
+        }
+
+        /// `u_lane²` for round `r` — the forward S-box ladder's first step.
+        pub const fn u2(r: usize, lane: usize) -> usize {
+            block(r) + lane
+        }
+
+        /// `u_lane³` for round `r`. `u^7 = (u³)²·u` is then a degree-3
+        /// expression, which is what keeps the chip at `max_degree() = 3`.
+        pub const fn u3(r: usize, lane: usize) -> usize {
+            block(r) + HASH_STATE_FELTS + lane
+        }
+
+        /// `y_lane²` for round `r` — the inverse S-box ladder's first step.
+        pub const fn y2(r: usize, lane: usize) -> usize {
+            block(r) + 2 * HASH_STATE_FELTS + lane
+        }
+
+        /// `y_lane³` for round `r`.
+        pub const fn y3(r: usize, lane: usize) -> usize {
+            block(r) + 3 * HASH_STATE_FELTS + lane
+        }
+
+        /// Round `r`'s output lane `j` — `OUT` for the final round.
+        pub const fn y(r: usize, j: usize) -> usize {
+            if r + 1 == NUM_ROUNDS {
+                OUT0 + j
+            } else {
+                block(r) + LADDER_COLUMNS * HASH_STATE_FELTS + j
+            }
+        }
+
+        pub const NUM_COLUMNS: usize = block(NUM_ROUNDS);
+
+        /// 4 capacity copies + 1 mode-boolean + the unread-`IN` pins + per round
+        /// five constraints per lane (`u²`, `u³`, `y²`, `y³`, and the fold).
+        pub const NUM_CONSTRAINTS: usize =
+            5 + super::NUM_UNREAD_INPUT_PINS + NUM_ROUNDS * 5 * HASH_STATE_FELTS;
+    }
+
     /// The chip's total width under `kind` — the number the AIR is built with,
     /// the census reads, and the trace filler allocates.
     pub const fn num_columns(kind: HasherKind) -> usize {
@@ -617,6 +717,7 @@ pub mod hash {
             HasherKind::Test => cols::TEST_NUM_COLUMNS,
             HasherKind::Poseidon => poseidon_cols::NUM_COLUMNS,
             HasherKind::Blake3 => crate::lfm::blake3_socket::cols::NUM_COLUMNS,
+            HasherKind::Rpo => rpo_cols::NUM_COLUMNS,
         }
     }
 
@@ -744,6 +845,7 @@ pub mod hash {
             HasherKind::Test => 17,
             HasherKind::Poseidon => poseidon_cols::NUM_CONSTRAINTS - NUM_UNREAD_INPUT_PINS,
             HasherKind::Blake3 => crate::lfm::blake3_socket::UNREAD_IDX,
+            HasherKind::Rpo => rpo_cols::NUM_CONSTRAINTS - NUM_UNREAD_INPUT_PINS,
         }
     }
 
@@ -826,6 +928,11 @@ pub mod hash {
             kind: HasherKind::Blake3,
         };
 
+        /// The Rescue-Prime Optimized configuration.
+        pub const RPO: Self = Self {
+            kind: HasherKind::Rpo,
+        };
+
         /// Constraints emitted under `kind` — the count the framework's
         /// dense-index invariant requires `eval` to fill exactly.
         pub const fn num_constraints(kind: HasherKind) -> usize {
@@ -833,6 +940,7 @@ pub mod hash {
                 HasherKind::Test => 17 + NUM_UNREAD_INPUT_PINS,
                 HasherKind::Poseidon => poseidon_cols::NUM_CONSTRAINTS,
                 HasherKind::Blake3 => crate::lfm::blake3_socket::NUM_CONSTRAINTS,
+                HasherKind::Rpo => rpo_cols::NUM_CONSTRAINTS,
             }
         }
     }
@@ -857,6 +965,7 @@ pub mod hash {
                 // and putting it beside its column layout, its senders and its
                 // trace filler is what keeps the four in step.
                 HasherKind::Blake3 => crate::lfm::blake3_socket::eval(b),
+                HasherKind::Rpo => Self::eval_rpo(b),
             }
         }
     }
@@ -1042,6 +1151,170 @@ pub mod hash {
             debug_assert_eq!(
                 idx,
                 poseidon_cols::NUM_CONSTRAINTS,
+                "every declared constraint index must be emitted exactly once"
+            );
+        }
+
+        /// Rescue-Prime Optimized at width 12: seven rounds of
+        /// `MDS → +ARK1 → x^7 → MDS → +ARK2 → x^{1/7}`, one row per
+        /// permutation.
+        ///
+        /// **Degree is exactly 3, by construction, in BOTH S-box directions.**
+        /// The forward layer lowers `u^7` to `(u³)²·u` over the witnessed
+        /// `u²`/`u³` columns, exactly as `eval_poseidon` does. The inverse layer
+        /// is the interesting one: `y = v^{1/7}` is not constrained as a root
+        /// but as the FORWARD power of the witnessed output — `(y³)²·y = v` —
+        /// which is the RPO spec's own §4.3 folding argument. Both sides of
+        /// that equation are degree 3, so an exponent of ~2^63 costs the AIR
+        /// nothing beyond one more ladder.
+        ///
+        /// **The round constants are scaled by the mode sum, and that is
+        /// load-bearing.** With `m = 0` a zero-filled padding row gives
+        /// `u = MDS·0 + 0 = 0`, hence `u² = u³ = 0`, hence the forward output
+        /// `0²·0 = 0`, hence `v = 0`, and `y = y² = y³ = 0` satisfies
+        /// `0²·0 = 0` — inductively through all seven rounds, so padding
+        /// satisfies every constraint without a degree-4 `IS_REAL` gate. On a
+        /// real row `m = 1` and the permutation is unchanged.
+        ///
+        /// **The capacity copy is PER MODE**, unlike every arm before it. RPO
+        /// separates its three socket domains through the capacity (miden's
+        /// `merge_in_domain` construction — see [`crate::lfm::rpo`]'s header),
+        /// so `S8..11` takes a different constant under `MODE_C`, `MODE_T` and
+        /// `MODE_L`. Still degree 2: a selector column times a constant.
+        fn eval_rpo<B: ConstraintBuilder<F, E>>(b: &mut B) {
+            use crate::lfm::rpo::{
+                ARK1, ARK2, DOMAIN_COMPRESS, DOMAIN_LEAF, DOMAIN_TRANSCRIPT, MDS_CIRC_ROW,
+                NUM_ROUNDS, domain_iv,
+            };
+            use rpo_cols as rc;
+
+            let mode_c = b.main(0, rc::MODE_C);
+            let mode_t = b.main(0, rc::MODE_T);
+            let mode_l = b.main(0, rc::MODE_L);
+            let mode_p = b.main(0, rc::MODE_P);
+            let m = mode_c + mode_t + mode_l + mode_p.clone();
+
+            // idx 0–3: the per-mode capacity copy —
+            // S_k = MODE_P·IN_{8+k} + MODE_C·IVC_k + MODE_T·IVT_k + MODE_L·IVL_k.
+            // A permutation row carries its own third input cell; every other
+            // mode takes its domain's capacity. `DOMAIN_COMPRESS` is zero, so
+            // that arm contributes nothing and a Merkle parent is a plain
+            // `Rpo256::merge`.
+            const MODE_IVS: [(usize, u64); 3] = [
+                (rc::MODE_C, DOMAIN_COMPRESS),
+                (rc::MODE_T, DOMAIN_TRANSCRIPT),
+                (rc::MODE_L, DOMAIN_LEAF),
+            ];
+            for k in 0..4 {
+                let s = b.main(0, rc::S8 + k);
+                let in_k = b.main(0, rc::IN0 + 8 + k);
+                let mut rhs = mode_p.clone() * in_k;
+                for (sel_col, domain) in MODE_IVS {
+                    let iv_k = domain_iv(domain)[k];
+                    if iv_k != 0 {
+                        let sel = b.main(0, sel_col);
+                        rhs = rhs + sel * b.const_base(iv_k);
+                    }
+                }
+                b.emit_base(k, s - rhs);
+            }
+
+            // idx 4: mode sum-boolean (exactly-one-of is the registrar's).
+            let one = b.one();
+            b.emit_base(4, m.clone() * (one - m.clone()));
+
+            // The circulant MDS, as an expression over whatever carries the
+            // state: `out_o = Σ_i MDS_CIRC_ROW[(i − o) mod 12] · f_i`, the same
+            // orientation `rpo::Rpo256::mds` uses and one of the conventions the
+            // external KAT pins.
+            fn mds<B: ConstraintBuilder<F, E>>(b: &mut B, f: &[B::Expr], o: usize) -> B::Expr {
+                f.iter()
+                    .enumerate()
+                    .fold(None::<B::Expr>, |acc, (i, fi)| {
+                        let c = b.const_base(
+                            MDS_CIRC_ROW[(i + HASH_STATE_FELTS - o) % HASH_STATE_FELTS],
+                        );
+                        let term = c * fi.clone();
+                        Some(match acc {
+                            None => term,
+                            Some(x) => x + term,
+                        })
+                    })
+                    .expect("twelve lanes")
+            }
+
+            // Round 0's input is the row's own IN/S columns; every later round
+            // reads the previous round's committed output.
+            let mut state: Vec<B::Expr> = (0..HASH_STATE_FELTS)
+                .map(|i| {
+                    if i < 8 {
+                        b.main(0, rc::IN0 + i)
+                    } else {
+                        b.main(0, rc::S8 + (i - 8))
+                    }
+                })
+                .collect();
+
+            let mut idx = 5;
+            for r in 0..NUM_ROUNDS {
+                // u = MDS(state) + ARK1[r]·m — degree 1.
+                let u: Vec<B::Expr> = (0..HASH_STATE_FELTS)
+                    .map(|o| {
+                        let mixed = mds(b, &state, o);
+                        let rc_o = b.const_base(ARK1[r][o]);
+                        mixed + rc_o * m.clone()
+                    })
+                    .collect();
+
+                // The forward ladder, both steps degree 2.
+                for (lane, u_lane) in u.iter().enumerate() {
+                    let u2 = b.main(0, rc::u2(r, lane));
+                    let u3 = b.main(0, rc::u3(r, lane));
+                    b.emit_base(idx, u2.clone() - u_lane.clone() * u_lane.clone());
+                    b.emit_base(idx + 1, u3 - u2 * u_lane.clone());
+                    idx += 2;
+                }
+
+                // x = u^7 = (u³)²·u — degree 3, never committed.
+                let x: Vec<B::Expr> = (0..HASH_STATE_FELTS)
+                    .map(|lane| {
+                        let u3 = b.main(0, rc::u3(r, lane));
+                        u3.clone() * u3 * u[lane].clone()
+                    })
+                    .collect();
+
+                // v = MDS(x) + ARK2[r]·m — degree 3, never committed.
+                let v: Vec<B::Expr> = (0..HASH_STATE_FELTS)
+                    .map(|o| {
+                        let mixed = mds(b, &x, o);
+                        let rc_o = b.const_base(ARK2[r][o]);
+                        mixed + rc_o * m.clone()
+                    })
+                    .collect();
+
+                // The inverse ladder plus the fold. `y` is this round's output.
+                for (lane, v_lane) in v.into_iter().enumerate() {
+                    let y = b.main(0, rc::y(r, lane));
+                    let y2 = b.main(0, rc::y2(r, lane));
+                    let y3 = b.main(0, rc::y3(r, lane));
+                    b.emit_base(idx, y2.clone() - y.clone() * y.clone());
+                    b.emit_base(idx + 1, y3.clone() - y2 * y.clone());
+                    // ★ the fold: y is pinned as the seventh root of v by
+                    // checking the CUBE ladder forward. `x ↦ x^7` is a
+                    // bijection over Goldilocks, so this determines y.
+                    b.emit_base(idx + 2, y3.clone() * y3 * y - v_lane);
+                    idx += 3;
+                }
+
+                state = (0..HASH_STATE_FELTS)
+                    .map(|j| b.main(0, rc::y(r, j)))
+                    .collect();
+            }
+
+            idx = emit_unread_input_pins(b, idx);
+            debug_assert_eq!(
+                idx,
+                rpo_cols::NUM_CONSTRAINTS,
                 "every declared constraint index must be emitted exactly once"
             );
         }

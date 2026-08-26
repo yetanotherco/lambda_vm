@@ -715,7 +715,9 @@ fn leaf_row_with_third_cell(
     row[cols::IN0..cols::IN0 + 4].copy_from_slice(acc);
     row[cols::IN0 + 4..cols::IN0 + 8].copy_from_slice(felts);
     row[cols::IN0 + 8..cols::IN0 + 12].copy_from_slice(extra);
-    let iv = kind.compress_iv();
+    // A LEAF row's capacity, which is not always the compress one: RPO
+    // domain-separates its modes through the capacity.
+    let iv = kind.leaf_iv();
     row[cols::S8..cols::S8 + iv.len()].copy_from_slice(&iv);
 
     match kind {
@@ -742,6 +744,13 @@ fn leaf_row_with_third_cell(
             // round intermediate AND `OUT`, so the whole witness follows the
             // junk rather than only the final output.
             super::trace::fill_poseidon_witness(&mut row);
+        }
+        HasherKind::Rpo => {
+            // Same as Poseidon's: the filler is the whole witness, so the junk
+            // propagates through every round rather than only into `OUT`.
+            let out = kind.leaf_out(acc, felts);
+            row[cols::OUT0..cols::OUT0 + out.len()].copy_from_slice(&out);
+            super::trace::fill_rpo_witness(&mut row);
         }
     }
     row

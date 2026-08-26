@@ -399,7 +399,12 @@ pub fn execute(
                     let b = m.read_word(ins[1])?;
                     state[0..4].clone_from_slice(&a);
                     state[4..8].clone_from_slice(&b);
-                    state[8..12].clone_from_slice(&hasher.compress_iv());
+                    // The capacity is the MODE's, not always the compress one:
+                    // a hasher that domain-separates through the capacity (RPO)
+                    // makes a transcript step and a parent different functions
+                    // here, and the chip's `S8` copy constraint agrees because
+                    // both read `LfmHasher::mode_iv`.
+                    state[8..12].clone_from_slice(&hasher.mode_iv(*mode));
                     in_cols[0..4].clone_from_slice(&a);
                     in_cols[4..8].clone_from_slice(&b);
                     // lanes 8–11 of the IN columns stay zero on two-cell rows
