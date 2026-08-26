@@ -230,7 +230,7 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect();
         assert_eq!(
-            digest, "6ffc80b25ec9ed3c203c35bdb8a4a05aff08d98b1a9c71648447bc199a552dc9",
+            digest, "8b3fb1294a5cd7296452d4a0422b0623c2d243e84bc8a51d3f15bc3899354553",
             "fixture bytes changed — regenerate it and update the README checksum",
         );
     }

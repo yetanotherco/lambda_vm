@@ -48,19 +48,19 @@ Known fixtures:
 
 ```text
 ethrex_empty_block.bin
-  sha256: ca7454142f13db5d04356366e3917d264cbea709ddd1b5e6526720dbaa12064d
+  sha256: 8d6f6061c71c23fad1d5dee26242d631efe0bff8d7f49422c2ba4cde9d4be919
   contents: stateless ethrex empty block ProgramInput (0 transactions)
 
 ethrex_simple_tx.bin
-  sha256: 29c1607297d21d88accb33767c8e03eb6536d746e6b2399930afdc9d67f1fe3f
+  sha256: c40bce364f22758ab7fa6fe8b45ce4c305dee5add4536ef6dca0e74e410e2729
   contents: stateless ethrex block with one plain ETH transfer transaction
 
 ethrex_10_transfers.bin
-  sha256: d04cfed35bd16c8248ab8ebf2f3ca2ff01c08269271b17e5d5db3b1f22ea03ad
+  sha256: 4d862e8537284729ff11c7bcf91c971e562dd6bbce2a1e181ba5bf48cb6b65cf
   contents: stateless ethrex block with ten plain ETH transfer transactions
 
 ethrex_bench_4.bin
-  sha256: bb26e6d6595f537c2fd57bfd59da6abe82241bd92690a21c2225da94d5cf507a
+  sha256: 03ed0d175622af6ef9a981d7652ba7c86630b9473f49cae17edf649724b704e1
   contents: stateless ethrex block with four plain ETH transfers, `distinct` mode
             (N senders -> N recipients); read by the recursion profile target
 ```
