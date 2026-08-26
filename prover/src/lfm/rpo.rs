@@ -1039,6 +1039,82 @@ mod throughput {
     /// Felts one permutation absorbs at rate 8 — the sponge's throughput unit.
     const RATE: usize = 8;
 
+    /// ★ **Is the scalar path already pipeline-saturated at twelve lanes?**
+    ///
+    /// [`Rpo256::inv_sbox_layer`] won 5.3× over per-element by interleaving the
+    /// twelve independent lanes of ONE permutation. The commitment workload has
+    /// a billion independent permutations, so the obvious next question is
+    /// whether interleaving TWO or FOUR of them widens the win further — a
+    /// portable answer that would need no SIMD, no `unsafe`, and no
+    /// architecture-specific code.
+    ///
+    /// **It does not.** Measured on an M-series laptop, cost per lane RISES
+    /// monotonically with width: 12 → 46.2 ns, 24 → 51.1, 48 → 54.2, 96 → 53.7.
+    /// Twelve chains already saturate the multiplier pipeline, and past that the
+    /// working set (a width-24 state is 24 `u64` plus seven `t` temporaries)
+    /// exceeds the general-purpose register file and spills.
+    ///
+    /// That is the load-bearing negative result for this lane's SIMD decision:
+    /// **there is no portable instruction-level parallelism left to extract**,
+    /// so any further speedup has to come from real vector instructions. Kept
+    /// rather than deleted because "we checked, and wider is worse" is the
+    /// evidence for not writing a batching layer.
+    #[test]
+    #[ignore]
+    fn the_inverse_sbox_is_pipeline_saturated_at_twelve_lanes() {
+        fn inv_layer_n<const N: usize>(state: &mut [FE; N]) {
+            fn exp_acc<const N: usize>(base: &[FE; N], tail: &[FE; N], m: usize) -> [FE; N] {
+                let mut acc = *base;
+                for _ in 0..m {
+                    for a in acc.iter_mut() {
+                        *a = a.square();
+                    }
+                }
+                core::array::from_fn(|i| &acc[i] * &tail[i])
+            }
+            let t1: [FE; N] = core::array::from_fn(|i| state[i].square());
+            let t2: [FE; N] = core::array::from_fn(|i| t1[i].square());
+            let t3 = exp_acc(&t2, &t2, 3);
+            let t4 = exp_acc(&t3, &t3, 6);
+            let t5 = exp_acc(&t4, &t4, 12);
+            let t6 = exp_acc(&t5, &t3, 6);
+            let t7 = exp_acc(&t6, &t6, 31);
+            for (i, s) in state.iter_mut().enumerate() {
+                let a = (&t7[i].square() * &t6[i]).square().square();
+                let b = &(&t1[i] * &t2[i]) * &*s;
+                *s = &a * &b;
+            }
+        }
+
+        fn bench<const N: usize>(label: &str) -> f64 {
+            const LANES_TOTAL: usize = 12 * 20_000 * 7;
+            let iters = LANES_TOTAL / N;
+            let mut st: [FE; N] = core::array::from_fn(|i| FE::from(i as u64 + 1));
+            let start = std::time::Instant::now();
+            for _ in 0..iters {
+                inv_layer_n(&mut st);
+            }
+            let e = start.elapsed();
+            assert_ne!(st[0], FE::zero());
+            let per_lane = e.as_nanos() as f64 / (iters * N) as f64;
+            println!("  {label}: width {N} ⇒ {per_lane:.2} ns per lane");
+            per_lane
+        }
+        println!("inverse S-box, independent-chain width sweep:");
+        let w12 = bench::<12>("1 permutation ");
+        let w24 = bench::<24>("2 permutations");
+        let w48 = bench::<48>("4 permutations");
+        let _ = bench::<96>("8 permutations");
+        // The conclusion, asserted rather than left to the reader: widening does
+        // not buy a real multiple. A generous 10% tolerance, because this is a
+        // timing test and the claim is "no win", not "exactly this number".
+        assert!(
+            w24 > w12 * 0.9 && w48 > w12 * 0.9,
+            "if wider batching ever DOES win, this lane's SIMD verdict needs revisiting: \
+             12 lanes {w12:.1} ns, 24 lanes {w24:.1} ns, 48 lanes {w48:.1} ns per lane"
+        );
+    }
+
     #[test]
     #[ignore]
     fn rpo_throughput() {
