@@ -112,18 +112,18 @@
   })#label("doc:"+filename)
 ]
 
-#asset("/style.css", read("style.css"))
-#asset("/fonts.css", read("fonts.css"))
-#asset("/sidenotes.css", read("sidenotes.css"))
-#asset("/sidenotes.js", read("sidenotes.js"))
+#asset("/style.css", read("/assets/style.css"))
+#asset("/fonts.css", read("/assets/fonts.css"))
+#asset("/sidenotes.css", read("/assets/sidenotes.css"))
+#asset("/sidenotes.js", read("/assets/sidenotes.js"))
 
 // Bundled fonts
 #for f in (
-  read("fonts.css")
+  read("/assets/fonts.css")
     .matches(regex("url\\(\"([^\"]+)\"\\)"))
     .map(m => m.captures.first())
 ) {
-  asset("/" + f, read(f, encoding: none))
+  asset(f, read("/assets/" + f, encoding: none))
 }
 
 #chapter("index", meta.title, include "front.typ")
@@ -132,7 +132,7 @@
     chapter(name, title, [
       #heading(level: 1, title)#ref
       #set heading(offset: 1)
-      #include name + ".typ"
+      #include "/chapters/" + name + ".typ"
     ])
   }
 }

@@ -39,6 +39,6 @@
     pagebreak(weak: true)
     [#heading(level: 2, supplement: [Section], sec_title)#ref]
     set heading(offset: 2)
-    include sec + ".typ"
+    include "/chapters/" + sec + ".typ"
   }
 }

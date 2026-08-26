@@ -1,5 +1,5 @@
-#import "meta.typ": lemma, corollary, proof
-#import "equate-lite.typ": equate
+#import "/meta.typ": lemma, corollary, proof
+#import "/equate-lite.typ": equate
 
 // Equation formatting
 #show: equate.with(breakable: true, sub-numbering: true, number-mode: "label")
