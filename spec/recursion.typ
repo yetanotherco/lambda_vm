@@ -3,13 +3,13 @@
 #show: book-page("recursion.typ")
 
 // Spaces and instances
-#let (functionSpace, function) = ($cal(F)$, $bb(f)$)
+#let (functionSpace, function) = ($cal(F)$, $f$)
 #let (inputSpace, input) = ($II$, $bb(i)$)
 #let (instanceSpace, instance) = ($XX$, $bb(x)$)
 #let (witnessSpace, witness) = ($WW$, $bb(w)$)
 #let (proofSpace, proof) = ($bb(Pi)$, $bb(pi)$)
 
-#let (commitmentSpace, commitment) = ($CC$, $bb(c)$)
+#let (commitmentSpace, commitment) = ($cal(C)$, $bb(c)$)
 #let commit(x) = $overline(#x)$
 #let comm(x) = $commit(#x)$
 
@@ -29,7 +29,7 @@
 
 = Notation
 Let $BB := { zero, one }$ denote the boolean set and let 
-$functionSpace := {f: inputSpace times witnessSpace mapsto BB}$ denote 
+$functionSpace := {function: inputSpace times witnessSpace mapsto BB}$ denote 
 the set of functions mapping the (public) input space $inputSpace$ and (private) 
 witness space $witnessSpace$ to this set.
 We use $instanceSpace := functionSpace times inputSpace = {instance: witnessSpace mapsto BB}$ 
@@ -40,8 +40,12 @@ as the set of all _solvable instances_,
 i.e., all instances $instance in instanceSpace$
 for which there exists a witness $witness in witnessSpace$ such that 
 $instance\(witness) = one$.
-Lastly, we introduce the commitment function $c: instanceSpace mapsto commitmentSpace$.
-To simplify notation, we use $commit(instance) = c(instance)$.
+Lastly, we introduce the instance commitment function $c: instanceSpace mapsto commitmentSpace$.
+Note that this commitment scheme does not involve randomness; it is a determistic scheme.
+Randomness is typically required to make a commitment _hiding_.
+For the purposes of this discussion, we are not concerned with this property, 
+as the function will only be used for committing to public information. 
+To simplify notation, we henceforth use $commit(instance)$ to represent the commitment $c(instance)$ of $instance$.
 
 We now assume the existence of _proof system_ $(prove, verify)$ with 
 prover $prove: instanceSpace times witnessSpace mapsto proofSpace$ and 
