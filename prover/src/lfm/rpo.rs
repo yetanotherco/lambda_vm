@@ -923,3 +923,123 @@ mod tests {
         assert_eq!(s, [FE::zero(); HASH_STATE_FELTS]);
     }
 }
+
+/// Host throughput of the RPO permutation — the blueprint's second-riskiest
+/// unknown, measured.
+///
+/// `#[ignore]`d because it is a timing measurement, not a property: it prints
+/// numbers and asserts only a floor loose enough that no honest machine trips
+/// it. Run it with
+/// `cargo test --release -p lambda-vm-prover --lib rpo_throughput -- --ignored --nocapture`.
+///
+/// **Why this number matters.** Under BLAKE3 the host's commitment hashing is a
+/// rounding error next to the LDE. RPO is native field arithmetic — roughly
+/// 8.4k Goldilocks multiplications per permutation, most of it the two inverse
+/// S-box layers — so commitment hashing becomes a phase with a name. What this
+/// measures is how big a phase.
+#[cfg(test)]
+mod throughput {
+    use super::*;
+    use std::time::Instant;
+
+    /// Permutations timed. Small enough to run in seconds, large enough that
+    /// the timer's resolution is not the measurement.
+    const PERMUTATIONS: usize = 20_000;
+
+    /// Felts one permutation absorbs at rate 8 — the sponge's throughput unit.
+    const RATE: usize = 8;
+
+    #[test]
+    #[ignore]
+    fn rpo_throughput() {
+        // A chained input so the optimizer cannot hoist the permutation out of
+        // the loop: each iteration's input depends on the last one's output.
+        let mut state: [FE; HASH_STATE_FELTS] = core::array::from_fn(|i| FE::from(i as u64 + 1));
+        let start = Instant::now();
+        for _ in 0..PERMUTATIONS {
+            state = Rpo256.permute(state);
+        }
+        let elapsed = start.elapsed();
+        // Consume the result so the loop is not dead code.
+        assert_ne!(state[0], FE::zero(), "the chain must not collapse to zero");
+
+        let per_perm_ns = elapsed.as_nanos() as f64 / PERMUTATIONS as f64;
+        let perms_per_sec = 1e9 / per_perm_ns;
+        let felts_per_sec = perms_per_sec * RATE as f64;
+
+        println!("RPO256 host permutation, single thread:");
+        println!("  {per_perm_ns:.0} ns / permutation");
+        println!("  {:.2} M permutations / s", perms_per_sec / 1e6);
+        println!(
+            "  {:.1} M felts / s absorbed at rate {RATE} ({:.0} MB/s of field data)",
+            felts_per_sec / 1e6,
+            felts_per_sec * 8.0 / 1e6
+        );
+
+        // The inverse S-box is the cost centre; price it alone so a regression
+        // in the addition chain is attributable rather than diffuse.
+        let mut x = FE::from(0x9E37_79B9_7F4A_7C15u64);
+        let inv_iters = PERMUTATIONS * HASH_STATE_FELTS * NUM_ROUNDS;
+        let start = Instant::now();
+        for _ in 0..inv_iters {
+            x = Rpo256::inv_sbox(&x);
+        }
+        let inv_elapsed = start.elapsed();
+        assert_ne!(x, FE::zero());
+        let inv_ns = inv_elapsed.as_nanos() as f64 / inv_iters as f64;
+        println!(
+            "  inverse S-box: {inv_ns:.0} ns each; {} per permutation ⇒ {:.0} ns, {:.0}% of the permutation",
+            HASH_STATE_FELTS * NUM_ROUNDS,
+            inv_ns * (HASH_STATE_FELTS * NUM_ROUNDS) as f64,
+            100.0 * inv_ns * (HASH_STATE_FELTS * NUM_ROUNDS) as f64 / per_perm_ns
+        );
+
+        // Attribution, so a bad number is a bad number SOMEWHERE rather than a
+        // verdict on RPO. A permutation is ~8.4k Goldilocks multiplications, so
+        // if the field multiply is slow the permutation is slow and the hash
+        // has nothing to do with it.
+        let mut a = FE::from(0x9E37_79B9_7F4A_7C15u64);
+        let b = FE::from(0xD1B5_4A32_D192_ED03u64);
+        const MULS: usize = 20_000_000;
+        let start = Instant::now();
+        for _ in 0..MULS {
+            a = &a * &b;
+        }
+        let mul_elapsed = start.elapsed();
+        assert_ne!(a, FE::zero());
+        let mul_ns = mul_elapsed.as_nanos() as f64 / MULS as f64;
+        println!("  Goldilocks FieldElement multiply: {mul_ns:.2} ns");
+        println!(
+            "  ⇒ inverse S-box's ~72 multiplies would be {:.0} ns of pure field work \
+             against {inv_ns:.0} ns measured",
+            72.0 * mul_ns
+        );
+
+        // BLAKE3 on the SAME machine, at the shape a Merkle parent takes: two
+        // 32-byte nodes. This is the ratio that matters for the host commit
+        // phase, and measuring both here means it is one machine's number and
+        // not two quoted from different pages.
+        let left = [0x5Au8; 32];
+        let mut right = [0xA5u8; 32];
+        const PARENTS: usize = 2_000_000;
+        let start = Instant::now();
+        for _ in 0..PARENTS {
+            right = crypto::hash::blake3::chain::blake3_parent(&left, &right);
+        }
+        let b3_elapsed = start.elapsed();
+        assert_ne!(right, [0u8; 32]);
+        let b3_ns = b3_elapsed.as_nanos() as f64 / PARENTS as f64;
+        println!("  BLAKE3 64-byte parent on this machine: {b3_ns:.0} ns");
+        println!(
+            "  ⇒ RPO / BLAKE3 per 2-to-1 compression: {:.0}×",
+            per_perm_ns / b3_ns
+        );
+
+        // A floor no honest machine trips. It exists so the test is a test and
+        // not only a print; the numbers above are the point.
+        assert!(
+            perms_per_sec > 5_000.0,
+            "under 5k permutations/s means something is very wrong, not slow"
+        );
+    }
+}
