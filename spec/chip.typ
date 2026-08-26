@@ -265,10 +265,10 @@
 #let render_chip_assumptions(chip, config) = {
   let tag(assumption) = {
     let code = chip.at("code", default: chip.name)
-    let index = (("",) + iters_of(assumption).map(it => it.at(0))).join(`.`)
+    let index = ((``,) + iters_of(assumption).map(it => raw(it.at(0)))).join(`.`)
     let lbl(idx) = raw(code + "-A" + str(idx))
 
-    show figure: (it) => align(left, block[#context lbl(it.counter.get().at(0))#index])
+    show figure: (it) => align(left, block[#context flatten_code(lbl(it.counter.get().at(0))+index)])
     cref(assumption)[#figure(kind: code + "assumption", numbering: (i) => lbl(i), supplement: [], [])]
   }
 
@@ -304,7 +304,7 @@
     let counter-kind = code + "constraint"
     let tag = code + "-" + constraint.id
     
-    let indices = (("",) + iters_of(constraint).map(it => it.at(0))).join(".")
+    let indices = ((``,) + iters_of(constraint).map(it => raw(it.at(0)))).join(`.`)
 
     let pad-width() = calc.max(calc.ceil(calc.log(counter(figure.where(kind: counter-kind)).final().at(0) + 1)), 2)
     let z-pad(s) = context "0" * calc.max(pad-width() - s.len(), 0) + s
@@ -312,7 +312,7 @@
     return (
       context super[#emph(z-pad(str(counter(figure.where(kind: counter-kind)).get().at(0) + 1)))],
       [
-        #show figure: (it) => align(left, raw(tag + indices))
+        #show figure: (it) => align(left, flatten_code(raw(tag) + indices))
         #cref(constraint)[#figure(kind: counter-kind, numbering: (i) => ref-tag(i), supplement: [], [])]
       ],
     )
@@ -323,10 +323,20 @@
     let kind = constraint.kind
 
     if kind == "interaction" {
+      show raw.where(block: false): it => context if target() == "html" {
+        html.span(class: "wrap", it)
+      } else {
+        it
+      }
       flatten_code(raw(constraint.tag) + `[` + args_interaction_like(constraint.input, constraint.at("output", default: none)) + `]`)
     } else if kind == "arith" {
       [#eval(constraint.constraint, mode: "markup")]
     } else if kind == "template" {
+      show raw.where(block: false): it => context if target() == "html" {
+        html.span(class: "wrap", it)
+      } else {
+        it
+      }
       let cond = if "cond" in constraint {
         $#expr_to_math(constraint.cond) arrow.r.double$ + " "
       }

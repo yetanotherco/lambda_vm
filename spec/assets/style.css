@@ -539,6 +539,14 @@ tbody tr th:has(em) {
   background: color-mix(in srgb, var(--gold) 10%, var(--bg));
 }
 
+table code {
+  white-space: nowrap;
+}
+
+table .wrap code {
+  white-space: inherit;
+}
+
 /* math */
 math {
   font-family: var(--font-math);
