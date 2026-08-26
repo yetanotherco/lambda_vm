@@ -422,11 +422,12 @@ pub fn permutation_witness(state: [FE; HASH_STATE_FELTS]) -> RpoWitness {
         let mixed = Rpo256::mds(&x);
         round.v = core::array::from_fn(|i| &mixed[i] + FE::from(ARK2[r][i]));
 
+        round.y = round.v;
+        Rpo256::inv_sbox_layer(&mut round.y);
         for lane in 0..HASH_STATE_FELTS {
-            let y = Rpo256::inv_sbox(&round.v[lane]);
-            round.y[lane] = y;
-            round.y2[lane] = &y * &y;
-            round.y3[lane] = &round.y2[lane] * &y;
+            let y = &round.y[lane];
+            round.y2[lane] = y * y;
+            round.y3[lane] = &round.y2[lane] * y;
         }
         s = round.y;
     }
@@ -440,55 +441,107 @@ impl Rpo256 {
     /// `x^7` by square-and-multiply, in exactly the association the AIR's
     /// degree-3 lowering uses (`x²`, `x³ = x²·x`, `x^7 = (x³)²·x`), so the
     /// executor and the chip agree by construction rather than by luck.
-    fn sbox(x: &FE) -> FE {
+    pub(crate) fn sbox(x: &FE) -> FE {
         let x2 = x * x;
         let x3 = &x2 * x;
         let x6 = &x3 * &x3;
         &x6 * x
     }
 
-    /// `x^{1/7}` — the inverse S-box, by miden-crypto's documented addition
-    /// chain (72 multiplications for a ~2^63 exponent, against ~93 for naive
-    /// square-and-multiply).
+    /// `x^{1/7}` over the WHOLE STATE — the inverse S-box layer, by
+    /// miden-crypto's documented addition chain (72 multiplications for a
+    /// ~2^63 exponent, against ~93 for naive square-and-multiply).
     ///
-    /// This is the prover's per-lane trace-fill cost and it runs 84 times per
-    /// permutation, so the chain is worth having.
+    /// ★ **Whole-state rather than per-element, and that is a measurement, not
+    /// a style.** The chain is 72 multiplications each depending on the last,
+    /// so a single lane is LATENCY-bound: the Goldilocks multiply's ~2.6 ns of
+    /// latency times 72 is the entire cost, and the multiplier pipeline sits
+    /// idle between them. The twelve lanes are independent, so running them in
+    /// lockstep interleaves twelve chains and fills that pipeline — the same
+    /// shape miden's scalar fallback has, and the shape its SVE/AVX2/AVX512
+    /// kernels vectorize from.
+    ///
+    /// This layer is 87% of the permutation and the permutation is the host's
+    /// commitment cost, so this loop is the hot one in the whole hash.
     /// [`tests::the_inverse_sbox_chain_agrees_with_the_exponent`] pins it
-    /// against `pow(INV_ALPHA)`, and
-    /// [`tests::the_inverse_sbox_inverts_the_forward_sbox`] pins both against
-    /// the property that actually matters.
-    pub fn inv_sbox(x: &FE) -> FE {
-        // `base^(2^m) * tail` — the chain's one building block.
-        fn exp_acc(base: &FE, tail: &FE, m: usize) -> FE {
+    /// against `pow(INV_ALPHA)` — a different algorithm for the same number —
+    /// and [`tests::the_inverse_sbox_inverts_the_forward_sbox`] pins both
+    /// against the property that actually matters.
+    pub fn inv_sbox_layer(state: &mut [FE; HASH_STATE_FELTS]) {
+        // `base^(2^m) · tail`, lane-wise — the chain's one building block.
+        fn exp_acc(
+            base: &[FE; HASH_STATE_FELTS],
+            tail: &[FE; HASH_STATE_FELTS],
+            m: usize,
+        ) -> [FE; HASH_STATE_FELTS] {
             let mut acc = *base;
             for _ in 0..m {
-                acc = acc.square();
+                for a in acc.iter_mut() {
+                    *a = a.square();
+                }
             }
-            &acc * tail
+            core::array::from_fn(|i| &acc[i] * &tail[i])
         }
-        let t1 = x.square();
-        let t2 = t1.square();
+
+        let t1: [FE; HASH_STATE_FELTS] = core::array::from_fn(|i| state[i].square());
+        let t2: [FE; HASH_STATE_FELTS] = core::array::from_fn(|i| t1[i].square());
         let t3 = exp_acc(&t2, &t2, 3);
         let t4 = exp_acc(&t3, &t3, 6);
         let t5 = exp_acc(&t4, &t4, 12);
         let t6 = exp_acc(&t5, &t3, 6);
         let t7 = exp_acc(&t6, &t6, 31);
-        let a = (&t7.square() * &t6).square().square();
-        let b = &(&t1 * &t2) * x;
-        &a * &b
+        for (i, s) in state.iter_mut().enumerate() {
+            let a = (&t7[i].square() * &t6[i]).square().square();
+            let b = &(&t1[i] * &t2[i]) * &*s;
+            *s = &a * &b;
+        }
+    }
+
+    /// [`Rpo256::inv_sbox_layer`] for a single element.
+    ///
+    /// The trace filler and the permutation both go through the layer; this
+    /// exists for the tests and for the witness recorder's per-lane reading, and
+    /// it is deliberately the SAME chain rather than a second transcription.
+    pub fn inv_sbox(x: &FE) -> FE {
+        let mut state = [*x; HASH_STATE_FELTS];
+        Self::inv_sbox_layer(&mut state);
+        state[0]
     }
 
     /// The circulant MDS product, `out_i = Σ_j MDS_CIRC_ROW[(j − i) mod 12]·s_j`
     /// — the orientation the external KAT pins, and the same one
     /// `poseidon::PoseidonGoldilocks::mds` uses.
-    fn mds(state: &[FE; HASH_STATE_FELTS]) -> [FE; HASH_STATE_FELTS] {
+    ///
+    /// ★ **One `u128` accumulation and one reduction per lane, not twelve field
+    /// multiplications.** The MDS constants are all ≤ 26, so every term
+    /// `c·s_j` fits in 70 bits and the whole twelve-term row sum fits in 73 —
+    /// comfortably inside a `u128` (the bound is asserted in
+    /// [`tests::the_mds_row_sum_cannot_overflow_a_u128`]). So the row is
+    /// accumulated with no reduction at all and reduced once at the end, using
+    /// `2^64 ≡ EPSILON (mod p)`: `hi·2^64 + lo ≡ lo + hi·EPSILON`, and with
+    /// `hi < 2^9` the correction term `hi·EPSILON < 2^41` needs no reduction of
+    /// its own.
+    ///
+    /// This matters because the MDS runs FOURTEEN times per permutation and,
+    /// once the inverse S-box layer stops dominating, it is the largest
+    /// remaining share of the host's commitment cost.
+    pub(crate) fn mds(state: &[FE; HASH_STATE_FELTS]) -> [FE; HASH_STATE_FELTS] {
+        /// `2^32 − 1`, and `2^64 ≡ EPSILON (mod p)` for the Goldilocks prime.
+        /// Written here rather than imported because the field crate keeps its
+        /// own copy private; [`tests::the_epsilon_identity_holds`] re-derives it.
+        const EPSILON: u64 = 0xFFFF_FFFF;
+
+        let raw: [u64; HASH_STATE_FELTS] = core::array::from_fn(|j| *state[j].value());
         core::array::from_fn(|i| {
-            let mut acc = FE::zero();
-            for (j, s) in state.iter().enumerate() {
-                let c = FE::from(MDS_CIRC_ROW[(j + HASH_STATE_FELTS - i) % HASH_STATE_FELTS]);
-                acc += c * s;
+            let mut acc: u128 = 0;
+            for (j, s) in raw.iter().enumerate() {
+                let c = MDS_CIRC_ROW[(j + HASH_STATE_FELTS - i) % HASH_STATE_FELTS];
+                acc += (*s as u128) * (c as u128);
             }
-            acc
+            let lo = acc as u64;
+            let hi = (acc >> 64) as u64;
+            // hi < 2^9, so hi·EPSILON < 2^41 and neither `from` reduces twice.
+            FE::from(lo) + FE::from(hi * EPSILON)
         })
     }
 }
@@ -514,9 +567,7 @@ impl LfmHasher for Rpo256 {
             for (lane, v) in s.iter_mut().enumerate() {
                 *v += FE::from(ARK2[r][lane]);
             }
-            for v in s.iter_mut() {
-                *v = Self::inv_sbox(v);
-            }
+            Self::inv_sbox_layer(&mut s);
         }
         s
     }
@@ -783,6 +834,34 @@ mod tests {
         assert_eq!(Rpo256::inv_sbox(&FE::zero()), FE::zero());
     }
 
+    /// The `u128` accumulation in [`Rpo256::mds`] must not be able to overflow,
+    /// and the margin must be large rather than lucky.
+    #[test]
+    fn the_mds_row_sum_cannot_overflow_a_u128() {
+        let max_c = MDS_CIRC_ROW.iter().copied().max().expect("twelve entries");
+        // Every stored value is < 2^64 (the field allows non-canonical storage).
+        let max_row_sum = (HASH_STATE_FELTS as u128) * (max_c as u128) * ((1u128 << 64) - 1);
+        assert!(
+            max_row_sum.checked_add(1).is_some(),
+            "the twelve-term row sum must fit a u128"
+        );
+        // The carry the reduction multiplies must stay small enough that
+        // `hi * EPSILON` cannot itself overflow a u64.
+        let max_hi = max_row_sum >> 64;
+        assert!(
+            max_hi * 0xFFFF_FFFF < (1u128 << 64),
+            "hi·EPSILON must fit a u64 without its own reduction"
+        );
+    }
+
+    /// `2^64 ≡ EPSILON (mod p)` — the identity [`Rpo256::mds`]'s single
+    /// reduction rests on, re-derived rather than trusted to a comment.
+    #[test]
+    fn the_epsilon_identity_holds() {
+        const P: u128 = (1u128 << 64) - (1u128 << 32) + 1;
+        assert_eq!((1u128 << 64) % P, 0xFFFF_FFFF);
+    }
+
     #[test]
     fn the_round_constant_tables_have_one_row_per_round() {
         assert_eq!(ARK1.len(), NUM_ROUNDS);
@@ -978,20 +1057,59 @@ mod throughput {
 
         // The inverse S-box is the cost centre; price it alone so a regression
         // in the addition chain is attributable rather than diffuse.
-        let mut x = FE::from(0x9E37_79B9_7F4A_7C15u64);
-        let inv_iters = PERMUTATIONS * HASH_STATE_FELTS * NUM_ROUNDS;
+        let mut layer: [FE; HASH_STATE_FELTS] =
+            core::array::from_fn(|i| FE::from(0x9E37_79B9_7F4A_7C15u64 + i as u64));
+        let layer_iters = PERMUTATIONS * NUM_ROUNDS;
         let start = Instant::now();
-        for _ in 0..inv_iters {
-            x = Rpo256::inv_sbox(&x);
+        for _ in 0..layer_iters {
+            Rpo256::inv_sbox_layer(&mut layer);
         }
         let inv_elapsed = start.elapsed();
-        assert_ne!(x, FE::zero());
-        let inv_ns = inv_elapsed.as_nanos() as f64 / inv_iters as f64;
+        assert_ne!(layer[0], FE::zero());
+        let layer_ns = inv_elapsed.as_nanos() as f64 / layer_iters as f64;
         println!(
-            "  inverse S-box: {inv_ns:.0} ns each; {} per permutation ⇒ {:.0} ns, {:.0}% of the permutation",
-            HASH_STATE_FELTS * NUM_ROUNDS,
-            inv_ns * (HASH_STATE_FELTS * NUM_ROUNDS) as f64,
-            100.0 * inv_ns * (HASH_STATE_FELTS * NUM_ROUNDS) as f64 / per_perm_ns
+            "  inverse S-box LAYER (12 lanes): {layer_ns:.0} ns; {NUM_ROUNDS} per permutation \
+             ⇒ {:.0} ns, {:.0}% of the permutation ({:.1} ns per lane)",
+            layer_ns * NUM_ROUNDS as f64,
+            100.0 * layer_ns * NUM_ROUNDS as f64 / per_perm_ns,
+            layer_ns / HASH_STATE_FELTS as f64
+        );
+
+        // The other half. Two MDS products and one forward S-box layer per round
+        // is what is left once the inverse layer stops dominating, and knowing
+        // which of them to attack next is the point of measuring both.
+        let mut mds_state: [FE; HASH_STATE_FELTS] =
+            core::array::from_fn(|i| FE::from(0xD1B5_4A32_D192_ED03u64 + i as u64));
+        let mds_iters = PERMUTATIONS * NUM_ROUNDS * 2;
+        let start = Instant::now();
+        for _ in 0..mds_iters {
+            mds_state = Rpo256::mds(&mds_state);
+        }
+        let mds_elapsed = start.elapsed();
+        assert_ne!(mds_state[0], FE::zero());
+        let mds_ns = mds_elapsed.as_nanos() as f64 / mds_iters as f64;
+        println!(
+            "  MDS product: {mds_ns:.0} ns; {} per permutation ⇒ {:.0} ns, {:.0}% of the permutation",
+            NUM_ROUNDS * 2,
+            mds_ns * (NUM_ROUNDS * 2) as f64,
+            100.0 * mds_ns * (NUM_ROUNDS * 2) as f64 / per_perm_ns
+        );
+
+        let mut fwd: [FE; HASH_STATE_FELTS] =
+            core::array::from_fn(|i| FE::from(0x1234_5678_9ABC_DEF0u64 + i as u64));
+        let start = Instant::now();
+        for _ in 0..(PERMUTATIONS * NUM_ROUNDS) {
+            for v in fwd.iter_mut() {
+                *v = Rpo256::sbox(v);
+            }
+        }
+        let fwd_elapsed = start.elapsed();
+        assert_ne!(fwd[0], FE::zero());
+        let fwd_ns = fwd_elapsed.as_nanos() as f64 / (PERMUTATIONS * NUM_ROUNDS) as f64;
+        println!(
+            "  forward S-box layer: {fwd_ns:.0} ns; {NUM_ROUNDS} per permutation ⇒ {:.0} ns, {:.0}% of the permutation",
+            fwd_ns * NUM_ROUNDS as f64,
+            100.0 * fwd_ns * NUM_ROUNDS as f64 / per_perm_ns
         );
 
         // Attribution, so a bad number is a bad number SOMEWHERE rather than a
@@ -1010,9 +1128,10 @@ mod throughput {
         let mul_ns = mul_elapsed.as_nanos() as f64 / MULS as f64;
         println!("  Goldilocks FieldElement multiply: {mul_ns:.2} ns");
         println!(
-            "  ⇒ inverse S-box's ~72 multiplies would be {:.0} ns of pure field work \
-             against {inv_ns:.0} ns measured",
-            72.0 * mul_ns
+            "  ⇒ 72 SERIAL multiplies would be {:.0} ns of dependent field work; the layer \
+             does 12 such chains in {layer_ns:.0} ns, i.e. {:.1}× the serial rate",
+            72.0 * mul_ns,
+            12.0 * 72.0 * mul_ns / layer_ns
         );
 
         // BLAKE3 on the SAME machine, at the shape a Merkle parent takes: two
