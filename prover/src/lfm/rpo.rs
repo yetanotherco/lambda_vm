@@ -320,6 +320,17 @@ pub const ARK2: [[u64; HASH_STATE_FELTS]; NUM_ROUNDS] = [
     ],
 ];
 
+/// Felts the sponge absorbs per permutation — the RATE.
+///
+/// ★ **This is why the census needs no RPO arm.** The census counts a "block"
+/// as an 8-felt absorb (`epoch_verify::blocks_for`, BLAKE3's `⌈felts/8⌉`), and
+/// RPO's rate is also 8, with the same no-spurious-final-block rule: an exact
+/// multiple of the rate emits no extra permutation under either. So for every
+/// leaf of one felt or more the two counts are EQUAL, and a Merkle parent is one
+/// invocation under both (four-felt digests on both sides, eight felts in).
+/// `rpo_chip_tests::the_rate_eight_census_is_hash_invariant` is the proof.
+pub const RATE_FELTS: usize = 8;
+
 /// Capacity lane carrying the sponge padding flag — reserved, never a domain.
 ///
 /// Miden's `hash_elements` writes `total_len % RATE` here; the socket's modes

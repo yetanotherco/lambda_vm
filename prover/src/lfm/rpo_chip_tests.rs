@@ -749,6 +749,79 @@ fn the_hasher_tags_are_stable_and_distinct() {
 }
 
 // =========================================================================
+// The census
+// =========================================================================
+
+/// ★★ **The permutation count does not move with the hash, and that is what
+/// lets the RPO column be computed on the instrument that measured the BLAKE3
+/// one.**
+///
+/// The census decomposition is "absorption is rate-sensitive, compression is
+/// not" (`epoch_verify`). RPO's rate is 8 felts and BLAKE3's block is 8 felts
+/// (64 bytes), and both share the no-spurious-final-block rule — an exact
+/// multiple of the rate emits no extra invocation, unlike keccak's `pad10*1`.
+/// So every leaf absorption costs the same COUNT under both, and a Merkle
+/// parent costs one invocation under both because a digest is four felts on
+/// each side.
+///
+/// The consequence is that `blocks_for` and `query_permutations_for` need no
+/// RPO arm at all: the aggregator's measured 1.39M BLAKE3 compressions ARE its
+/// RPO permutation count. Only the cells-per-invocation changes — 4,946 to the
+/// 445 measured below.
+///
+/// ⚠ **What this assumes, stated so it can be checked:** the rate-8 OVERWRITE
+/// DUPLEX absorb (RPO spec §2.6), not the socket's as-built rate-4 leaf chain.
+/// Under the chain the absorb terms double and this invariance fails — which is
+/// exactly the fork §B of the lane doc is about. This test pins the arithmetic
+/// of the good branch, not that the good branch was taken.
+#[test]
+fn the_rate_eight_census_is_hash_invariant() {
+    use super::epoch_verify::{BLAKE3_BLOCK_FELTS, blocks_for};
+    use super::rpo::RATE_FELTS;
+
+    assert_eq!(
+        RATE_FELTS, BLAKE3_BLOCK_FELTS,
+        "the two rates must be the same eight felts, or the counts diverge"
+    );
+
+    // Every leaf width a real shape can present, plus the exact-multiple
+    // boundaries where a padding rule would betray itself.
+    for felts in (1..=4_096usize).chain([6_160, 3_816, 8_192, 12_288]) {
+        let blake3 = blocks_for(felts, super::edsl::WrapHash::Blake3);
+        let rpo = felts.div_ceil(RATE_FELTS);
+        assert_eq!(
+            blake3, rpo,
+            "a {felts}-felt leaf must cost the same count under both hashes"
+        );
+    }
+
+    // The FRI leaf and a Merkle parent, named because they are the two terms
+    // the census treats as rate-INsensitive.
+    assert_eq!(
+        blocks_for(
+            super::epoch_verify::FRI_LEAF_FELTS,
+            super::edsl::WrapHash::Blake3
+        ),
+        1
+    );
+    assert_eq!(super::epoch_verify::FRI_LEAF_FELTS.div_ceil(RATE_FELTS), 1);
+    // A parent is two four-felt digests.
+    assert_eq!((2 * super::hash::HASH_DIGEST_FELTS).div_ceil(RATE_FELTS), 1);
+
+    // Keccak is the control: its `pad10*1` DOES spend a trailing block on an
+    // exact multiple, so this invariance is a property of these two hashes and
+    // not of the closed form.
+    assert_ne!(
+        blocks_for(
+            super::epoch_verify::KECCAK_RATE_FELTS,
+            super::edsl::WrapHash::Keccak
+        ),
+        super::epoch_verify::KECCAK_RATE_FELTS.div_ceil(super::epoch_verify::KECCAK_RATE_FELTS),
+        "keccak must NOT share the rule, or the control is vacuous"
+    );
+}
+
+// =========================================================================
 // The measurement — the number this lane exists for
 // =========================================================================
 
