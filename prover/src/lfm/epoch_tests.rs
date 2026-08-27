@@ -785,7 +785,7 @@ fn the_real_block_base_epoch_ab() {
                 Ext3,
                 (),
                 crate::hash_pin::BlockStarkHash,
-                stark::prover::Prover<Gl, Ext3, ()>,
+                crate::hash_pin::BlockProver<Gl, Ext3, ()>,
             >(
                 pairs,
                 &mut transcript,
@@ -1585,7 +1585,7 @@ impl RealBatchedEpoch {
             Ext3,
             (),
             crate::hash_pin::BlockStarkHash,
-            stark::verifier::Verifier<Gl, Ext3, ()>,
+            crate::hash_pin::BlockVerifier<Gl, Ext3, ()>,
             _,
         >(&refs, proof, &mut transcript, &expected, carved)
     }
@@ -1638,7 +1638,7 @@ fn real_batched_epoch_from_with_carve(
             Ext3,
             (),
             crate::hash_pin::BlockStarkHash,
-            stark::prover::Prover<Gl, Ext3, ()>,
+            crate::hash_pin::BlockProver<Gl, Ext3, ()>,
         >(
             pairs,
             &mut transcript,

@@ -1116,7 +1116,7 @@ fn prove_epoch(
                 E,
                 (),
                 crate::hash_pin::BlockStarkHash,
-                Prover<F, E, ()>,
+                crate::hash_pin::BlockProver<F, E, ()>,
             >(
                 pairs,
                 &mut seed(),
@@ -1347,7 +1347,7 @@ fn verify_epoch(
         E,
         (),
         crate::hash_pin::BlockStarkHash,
-        Verifier<F, E, ()>,
+        crate::hash_pin::BlockVerifier<F, E, ()>,
         _,
     >(&refs, &proof, &mut seed(), &expected, Some(l2g_index))
     {

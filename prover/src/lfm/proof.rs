@@ -465,15 +465,20 @@ pub fn lfm_prove_batched(
         options.fri_final_poly_log_degree,
     );
 
-    let (proof, _stats) =
-        multi_prove_batched::<F, E, (), crate::hash_pin::BlockStarkHash, Prover<F, E, ()>>(
-            airs.air_trace_pairs(&mut traces),
-            &mut transcript,
-            #[cfg(feature = "disk-spill")]
-            crate::auto_storage::decide_lfm(),
-            decide_lfm_residency(),
-        )
-        .map_err(LfmProveError::Prover)?;
+    let (proof, _stats) = multi_prove_batched::<
+        F,
+        E,
+        (),
+        crate::hash_pin::BlockStarkHash,
+        crate::hash_pin::BlockProver<F, E, ()>,
+    >(
+        airs.air_trace_pairs(&mut traces),
+        &mut transcript,
+        #[cfg(feature = "disk-spill")]
+        crate::auto_storage::decide_lfm(),
+        decide_lfm_residency(),
+    )
+    .map_err(LfmProveError::Prover)?;
 
     Ok(BatchedLfmProof {
         proof,
@@ -600,10 +605,12 @@ pub fn verify_against_batched(
         return false;
     };
 
-    multi_verify_batched::<F, E, (), crate::hash_pin::BlockStarkHash, Verifier<F, E, ()>, _>(
-        &refs,
-        proof,
-        &mut transcript,
-        &expected,
-    )
+    multi_verify_batched::<
+        F,
+        E,
+        (),
+        crate::hash_pin::BlockStarkHash,
+        crate::hash_pin::BlockVerifier<F, E, ()>,
+        _,
+    >(&refs, proof, &mut transcript, &expected)
 }

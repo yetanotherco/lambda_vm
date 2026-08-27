@@ -13,6 +13,10 @@
 //! still comes out right, only the values are wrong.
 
 use crypto::merkle_tree::proof::verify_merkle_path_from_leaf_hash;
+// Through the TRAIT rather than the byte backend's inherent method: the pinned
+// backend is whichever `hash_pin` names, and only the trait form is common to
+// all of them.
+use crypto::merkle_tree::traits::IsStreamingLeafBackend;
 use math::field::element::FieldElement;
 use stark::config::Commitment;
 
@@ -174,7 +178,12 @@ impl MainTraceOpening {
     /// The leaf hash, computed by the PRODUCTION hasher on the production
     /// split — literally the call `verify_opening_pair` makes.
     pub fn leaf_hash(&self) -> Commitment {
-        MainBackend::hash_data_from_slices(
+        // ⚠ Named through the TRAIT, not left to inherent-method resolution. The
+        // byte backend happens to carry an inherent `hash_data_from_slices` and
+        // an algebraic one does not, so the unqualified call silently resolves to
+        // the byte backend's own method and then fails to exist under any other
+        // pin. The trait form is the one every backend has.
+        <MainBackend as IsStreamingLeafBackend<GoldilocksField>>::hash_data_from_slices(
             &self.values[..self.num_columns],
             &self.values[self.num_columns..],
         )

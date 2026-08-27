@@ -1111,7 +1111,10 @@ pub(crate) fn compute_expected_commit_bus_balance_view<'p>(
     proofs: impl ProofViewSource<'p, F, E, ()>,
     public_output_bytes: &[u8],
     start_index: u64,
-    transcript: &mut DefaultStarkTranscript<E>,
+    // Any transcript, not the byte one by name: the block path's transcript is
+    // whatever `hash_pin` pins, and on an algebraic branch that is a different
+    // TYPE rather than the same type over a different digest.
+    transcript: &mut impl crypto::fiat_shamir::is_transcript::IsTranscript<E>,
 ) -> Option<FieldElement<E>> {
     let (z, alpha) = replay_transcript_phase_a_view(airs, proofs, transcript);
     compute_commit_bus_offset(public_output_bytes, start_index, &z, &alpha)

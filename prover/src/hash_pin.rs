@@ -40,18 +40,38 @@
 //! algebraic branch they become, for example:
 //!
 //! ```ignore
-//! pub type BlockStarkHash = crate::lfm::algebraic_commit::RpoStarkHash;
+//! pub type BlockStarkHash  = crate::lfm::algebraic_commit::RpoStarkHash;
 //! pub type BlockTranscript = crate::lfm::algebraic_transcript::AlgebraicTranscript;
 //! pub fn block_transcript(seed: &[u8]) -> BlockTranscript {
 //!     BlockTranscript::with_seed(crate::lfm::hash::HasherKind::Rpo, seed)
 //! }
 //! ```
 //!
-//! ⚠ A pin change is **not** complete without regenerating `LFM_REGISTRY`: the
-//! hasher is folded into every `program_id`, so the blessed table moves with it.
-//! `registry.rs` governs that — a drift failure is investigated, never
-//! re-blessed to silence the test — and the regeneration goes through
-//! `cargo run --bin compute_lfm_registry --release`, never a hand edit.
+//! ✓ VERIFIED that flip compiles and runs end to end — it was performed, built,
+//! and executed against this crate's own prove/verify tests before this module
+//! was written, which is how [`BlockProver`], the generic transcript parameter
+//! on `compute_expected_commit_bus_balance_view`, and the
+//! `IsStreamingLeafBackend` import in `proof_arena` were found. None of those
+//! three shows up on a build that only ever pins BLAKE3.
+//!
+//! # ⚠ TWO regenerations, not one
+//!
+//! A pin change is **not** complete until every root blessed under the old hash
+//! is regenerated, and there are two families of them:
+//!
+//! 1. **`LFM_REGISTRY`** — the hasher is folded into every `program_id`.
+//!    `cargo run --bin compute_lfm_registry --release`.
+//! 2. **The static preprocessed commitments** — `bitwise`, `keccak_rc` and
+//!    `page` each return a BLESSED CONSTANT from `preprocessed_commitment`
+//!    rather than recomputing, so under a new pin the prover recomputes an
+//!    RPO root, compares it against a BLAKE3 constant, and fails with
+//!    `ProvingError::PrecomputedCommitmentMismatch`.
+//!    `cargo run --bin compute_static_commitments --release`.
+//!
+//! ✓ VERIFIED (2) empirically: it is exactly how the trial flip failed, and it
+//! is the correct failure — loud, at prove time, naming the cause. `registry.rs`
+//! governs both: a drift failure is investigated, never re-blessed to silence
+//! the test, and neither table is ever hand-edited.
 
 use crate::tables::types::GoldilocksExtension as E;
 
@@ -77,6 +97,22 @@ pub type BlockTranscript = stark::config::DefaultStarkTranscript<E>;
 pub fn block_transcript(seed: &[u8]) -> BlockTranscript {
     BlockTranscript::new(seed)
 }
+
+/// The prover the block path drives, at [`BlockStarkHash`].
+///
+/// ⚠ **Not `stark::prover::Prover`.** That alias is `GenericProver` at
+/// `DefaultStarkHash`, so it is BLAKE3-fixed regardless of what `H` a call site
+/// passes alongside it — and the two disagreeing is a type error rather than a
+/// silent wrong hash, which is how this was found. The `IsStarkProver` impl
+/// itself is fully generic over `H`; only the alias is pinned, so the fix is an
+/// alias at the pin rather than anything in `crypto/stark`.
+pub type BlockProver<Field, FieldExtension, PI> =
+    stark::prover::GenericProver<Field, FieldExtension, PI, BlockStarkHash>;
+
+/// The verifier the block path drives, at [`BlockStarkHash`]. See
+/// [`BlockProver`] for why the `stark::verifier::Verifier` alias is not it.
+pub type BlockVerifier<Field, FieldExtension, PI> =
+    stark::verifier::GenericVerifier<Field, FieldExtension, PI, BlockStarkHash>;
 
 /// The [`CommitmentHash`] the block path's roots may be called by.
 ///

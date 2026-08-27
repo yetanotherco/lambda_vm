@@ -1437,7 +1437,7 @@ fn preprocessed_fixture() -> (
     let trace = make_trace();
     // `DefaultStarkHash`, not a named hash: this commitment has to be the one
     // `multi_prove_ram` below recomputes, and that follows the alias.
-    let commitment = <stark::prover::Prover<Gl, Ext3, ()> as IsStarkProver<
+    let commitment = <crate::hash_pin::BlockProver<Gl, Ext3, ()> as IsStarkProver<
         Gl,
         Ext3,
         (),
