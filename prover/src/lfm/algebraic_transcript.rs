@@ -41,9 +41,9 @@
 //!
 //! | operation | absorbs |
 //! |---|---|
-//! | `append_bytes(b)` | `[len(b), 0, 0, 0]` as a DIGEST cell, then `⌈len/32⌉` payload cells, each 32 bytes read as four canonical little-endian `u64` felts, the last zero-padded |
+//! | `append_bytes(b)` | `[len(b), 0, 0, 0]` as a DIGEST cell, then `⌈len/32⌉` payload cells, each 32 bytes read as four canonical BIG-endian `u64` felts, the last zero-padded |
 //! | `append_field_element(x)` | `x`'s three Fp3 coefficients as one DATA cell `[x0, x1, x2, 0]`, through the LEAF encoding |
-//! | `state()` | the four state felts, canonical little-endian — the grinding seed |
+//! | `state()` | the four state felts, canonical big-endian — the grinding seed |
 //! | `sample_field_element()` | squeeze one cell, read lanes 0–2 as Fp3 |
 //! | `sample_u64(n)` | squeeze one cell, lane 0 canonical, masked to `n − 1` |
 //!
@@ -59,6 +59,24 @@
 //! The rule is deliberately UNIFORM rather than special-cased on 32 and 8. A
 //! conditional encoding is how a collision gets introduced later by someone
 //! adding a third call shape.
+//!
+//! ## ⚠ Byte order: ONE rule, and integers come in byte-swapped
+//!
+//! Felt↔byte is **canonical BIG-endian** everywhere on the algebraic path —
+//! the transcript, the Merkle nodes and the leaf buffers — because that is
+//! what `ByteConversion::write_bytes_be` already does for a Goldilocks felt
+//! (`canonical_u64().to_be_bytes()`), and that is how every leaf the STARK
+//! serialises reaches a commitment backend. A little-endian island here and a
+//! big-endian one there is how a root gets produced that nobody can reproduce.
+//!
+//! The consequence, stated because it looks wrong at first glance: the STARK
+//! core hands `append_bytes` **little-endian** integers
+//! (`(idx as u64).to_le_bytes()`), so the resulting felt is the byte-SWAP of
+//! that integer. This is harmless — those call sites carry compile-time
+//! constants, so an emitter materialises whatever felt the rule produces and
+//! no runtime swap exists anywhere — but it must be DERIVED from the rule at
+//! both ends rather than assumed. The differential gate caught precisely this:
+//! a machine side that hand-wrote `FE::from(idx)` disagreed with the host.
 //!
 //! ## Why DIGEST cells for bytes and a DATA cell for field elements
 //!
@@ -161,8 +179,17 @@ impl AlgebraicTranscript {
         out
     }
 
-    /// Read 32 bytes as four canonical little-endian felts. The inverse of
+    /// Read 32 bytes as four canonical BIG-endian felts. The inverse of
     /// [`Self::cell_to_bytes`].
+    ///
+    /// ★ **Big-endian, and that is not arbitrary.** It is the convention
+    /// `ByteConversion::write_bytes_be` already uses for a Goldilocks felt
+    /// (`canonical_u64().to_be_bytes()`), which is how every leaf the STARK
+    /// serialises reaches a commitment backend. One rule for felt↔byte across
+    /// the whole algebraic path — the transcript, the Merkle nodes and the leaf
+    /// buffers — rather than a little-endian island here and a big-endian one
+    /// there, which is the kind of asymmetry that produces a root nobody can
+    /// reproduce.
     ///
     /// ⚠ Bytes reaching here are Merkle roots produced by an algebraic backend,
     /// i.e. already canonical felts. A non-canonical eight-byte group would
@@ -177,16 +204,17 @@ impl AlgebraicTranscript {
                 let end = (start + 8).min(chunk.len());
                 b[..end - start].copy_from_slice(&chunk[start..end]);
             }
-            FE::from(u64::from_le_bytes(b))
+            FE::from(u64::from_be_bytes(b))
         })
     }
 
-    /// Four felts as 32 canonical little-endian bytes.
+    /// Four felts as 32 canonical big-endian bytes — the inverse of
+    /// [`Self::bytes_to_cell`], and the same rule `write_bytes_be` uses.
     pub fn cell_to_bytes(c: &LfmWord) -> [u8; BYTES_PER_CELL] {
         let mut out = [0u8; BYTES_PER_CELL];
         for (i, f) in c.iter().enumerate() {
             let v = GoldilocksField::canonical(f.value());
-            out[i * 8..(i + 1) * 8].copy_from_slice(&v.to_le_bytes());
+            out[i * 8..(i + 1) * 8].copy_from_slice(&v.to_be_bytes());
         }
         out
     }
@@ -214,7 +242,7 @@ impl IsTranscript<GoldilocksExtension> for AlgebraicTranscript {
         }
     }
 
-    /// The four state felts, canonical little-endian — the grinding seed.
+    /// The four state felts, canonical big-endian — the grinding seed.
     fn state(&self) -> [u8; 32] {
         Self::cell_to_bytes(&self.state)
     }
@@ -317,7 +345,16 @@ mod tests {
         // append_bytes(SMALL.to_le_bytes()): length cell, then the value cell.
         let len8 = b.digest_const([FE::from(8u64), FE::zero(), FE::zero(), FE::zero()]);
         sponge.absorb(&mut b, len8.as_cell());
-        let small = b.digest_const([FE::from(SMALL), FE::zero(), FE::zero(), FE::zero()]);
+        // ⚠ The payload cell is derived from the CONVENTION, not written by
+        // hand as `FE::from(SMALL)`. The STARK core hands `append_bytes`
+        // LITTLE-endian integers (`(idx as u64).to_le_bytes()`), and the one
+        // felt↔byte rule reads BIG-endian, so the felt is the byte-SWAP of the
+        // integer. That is harmless — these call sites are compile-time
+        // constants, so an emitter materialises whatever felt the rule
+        // produces and no runtime swap exists — but it is exactly the kind of
+        // mismatch that must be derived rather than assumed. Writing
+        // `FE::from(SMALL)` here is what this gate caught.
+        let small = b.digest_const(AlgebraicTranscript::bytes_to_cell(&SMALL.to_le_bytes()));
         sponge.absorb(&mut b, small.as_cell());
         let bb = sponge.squeeze_ext(&mut b);
 
