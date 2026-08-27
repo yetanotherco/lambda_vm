@@ -20,6 +20,9 @@ The #dma chip copies a range of bytes from one location in memory to another, th
 #footnote([Linux man-page on `memcpy`; man7.org. #link("https://man7.org/linux/man-pages/man3/memcpy.3.html")[[src]]])
 The guest performs such a copy with a RISC-V loop --- per copied doubleword a load, a store, two pointer increments and a branch, each of them a `CPU` row (@cpu) together with its memory operations.
 This accelerator replaces all of that with a single row per eight copied bytes.
+An accelerated `memcpy` is expected to conform to the Ethereum Foundation's Accelerated Memory Operations standard, which fixes the semantics the symbol must keep and how it must win linking.
+#footnote([Accelerated Memory Operations; eth-act/zkevm-standards. #link("https://github.com/eth-act/zkevm-standards/tree/main/standards/accelerated-memory-operations")[[src]]])
+Both obligations fall on the guest-side stub and on the link, outside this chapter; what the standard asks of the chip itself is that it assume no particular alignment of `dst`, `src` or `count`, which @dma:c:tail guarantees by choosing the width from `count` alone.
 
 = Variables
 #let nr_variables = total_nr_variables(chip)
