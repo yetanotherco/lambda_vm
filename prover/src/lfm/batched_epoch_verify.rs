@@ -143,8 +143,7 @@ pub fn emit_mixed_verify_batch(
         acc = parent;
     }
 
-    edsl::assert_word_eq_lanes(b, acc[0], &root.lanes[0]);
-    edsl::assert_word_eq_lanes(b, acc[1], &root.lanes[1]);
+    edsl::assert_digest_eq_lanes(b, acc, &root.lanes);
 }
 
 /// Reduce the SHARED query-index bits to a round (or per-table tree) whose
@@ -322,8 +321,7 @@ pub fn emit_batched_query_fri(
         let (first, second) = b.select(bits[i], v.as_cell(), opening.sym.as_cell());
         let leaf = super::sub_proof::emit_leaf_hash(b, FRI_LEAF_GROUP, &[first, second]);
         let root = super::edsl::wrap_merkle_walk(b, leaf, &bits[i + 1..], &opening.siblings);
-        super::edsl::assert_word_eq_lanes(b, root[0], &layers[i].root_lanes[0]);
-        super::edsl::assert_word_eq_lanes(b, root[1], &layers[i].root_lanes[1]);
+        super::edsl::assert_digest_eq_lanes(b, root, &layers[i].root_lanes);
 
         inv_pow = b.mul(inv_pow, inv_pow);
         v = super::edsl::fri_fold(b, v, opening.sym, zetas[i + 1], inv_pow);

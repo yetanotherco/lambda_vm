@@ -287,8 +287,7 @@ pub fn emit_group_authentication(
     );
     let leaf = emit_leaf_hash(b, commitment.shape, &opening.values);
     let root = edsl::wrap_merkle_walk(b, leaf, bits, &opening.siblings);
-    edsl::assert_word_eq_lanes(b, root[0], &commitment.root_lanes[0]);
-    edsl::assert_word_eq_lanes(b, root[1], &commitment.root_lanes[1]);
+    edsl::assert_digest_eq_lanes(b, root, &commitment.root_lanes);
 }
 
 /// The LDE-domain constants the point derivation multiplies together:

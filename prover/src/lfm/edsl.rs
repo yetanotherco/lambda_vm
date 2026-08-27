@@ -640,6 +640,28 @@ pub fn assert_word_eq(b: &mut LfmBuilder, x: Cell, y: Cell) {
 
 /// Assert a word equals four already-unpacked lanes (hoist the reference
 /// word's unpack out of a loop — e.g. one root compared per query).
+/// ★ Assert a whole DIGEST equals a root's lanes — the digest-shaped form of
+/// [`assert_word_eq_lanes`].
+///
+/// Five sites used to spell this as two indexed calls, `root[0]`/`root[1]`,
+/// which writes the digest's cell COUNT into every one of them. Looping here
+/// concentrates that count in one place, so a digest of a different width
+/// (an algebraic root is ONE cell of four felts, not two of 32 bytes) changes
+/// this function rather than five call sites.
+///
+/// Behaviour is identical for a two-cell digest; this is a refactor, not a
+/// change, and the gates that covered those five sites still cover it.
+pub fn assert_digest_eq_lanes(b: &mut LfmBuilder, d: WrapDigest, lanes: &[[Felt; 4]]) {
+    assert_eq!(
+        d.len(),
+        lanes.len(),
+        "a digest and the lanes it is compared against must have the same width"
+    );
+    for (cell, word) in d.iter().zip(lanes.iter()) {
+        assert_word_eq_lanes(b, *cell, word);
+    }
+}
+
 pub fn assert_word_eq_lanes(b: &mut LfmBuilder, x: Cell, y_lanes: &[Felt; 4]) {
     let xl = b.unpack(x);
     for i in 0..4 {

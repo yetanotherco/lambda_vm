@@ -562,8 +562,7 @@ pub fn emit_query_fri(
         let (first, second) = b.select(q.bits[i], v.as_cell(), opening.sym.as_cell());
         let leaf = sub_proof::emit_leaf_hash(b, FRI_LEAF_GROUP, &[first, second]);
         let root = edsl::wrap_merkle_walk(b, leaf, &q.bits[i + 1..], &opening.siblings);
-        edsl::assert_word_eq_lanes(b, root[0], &fri.layers[i].root_lanes[0]);
-        edsl::assert_word_eq_lanes(b, root[1], &fri.layers[i].root_lanes[1]);
+        edsl::assert_digest_eq_lanes(b, root, &fri.layers[i].root_lanes);
 
         // `evaluation_point_vec[i] = υ^(−2^(i+1))` — `inv.square()` then one
         // squaring per layer (`verifier.rs:692-697`).
