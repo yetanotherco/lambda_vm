@@ -675,6 +675,109 @@ mod tests {
     /// never restated: this lane has now written a host↔machine encoding three
     /// times and twice a differential caught a machine side that had
     /// hand-written a constant agreeing with the rule only until the rule moved.
+    /// ★★ **THE GRINDING LEG GATE.** The production emitter's grinding check —
+    /// `epoch::emit_grinding_check`, the thing every wrap program actually calls
+    /// — must accept exactly the nonces `grinding::is_valid_nonce` accepts under
+    /// the algebraic configuration.
+    ///
+    /// The gate above checks the DIGEST; this checks the LEG, which is a
+    /// different claim: the leg builds two preimages, and getting either one's
+    /// felt layout wrong gives a digest that is individually well-formed and
+    /// collectively wrong.
+    ///
+    /// It is a provability gate rather than a value comparison, because that is
+    /// what the leg is — it emits assertions and publishes nothing. A real
+    /// ground-out nonce must PROVE; the negative control below is what makes
+    /// that mean something.
+    #[test]
+    fn the_emitted_grinding_check_accepts_exactly_the_hosts_nonces() {
+        use crate::lfm::builder::{Felt, LfmBuilder};
+        use crate::lfm::compiler::compile;
+        use crate::lfm::edsl::{WrapDigest, WrapHash};
+        use crate::lfm::proof::lfm_prove_with_hasher;
+        use crate::lfm::registry::build_artifacts_with_hasher;
+        use stark::proof::options::GoldilocksCubicProofOptions;
+
+        // Small enough to grind in a unit test, big enough that a wrong digest
+        // fails with overwhelming probability.
+        const FACTOR: u8 = 8;
+        const SEED_CELL: LfmWord = [
+            FE::const_from_raw(0x0123_4567_89ab_cdef),
+            FE::const_from_raw(0x1111_2222_3333_4444),
+            FE::const_from_raw(0x0fed_cba9_8765_4321),
+            FE::const_from_raw(0x00ff_00ff_00ff_00ff),
+        ];
+
+        fn program(nonce_arena_len: u32) -> crate::lfm::compiler::LfmProgram {
+            let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::Algebraic);
+            let arena = b.declare_arena(nonce_arena_len);
+            let seed = b.hint_word(arena, 0);
+            let nonce_word = b.hint_word(arena, 1);
+            let [nonce, _, _, _] = b.unpack(nonce_word);
+            crate::lfm::epoch::emit_grinding_check(
+                &mut b,
+                WrapDigest::from_cell(seed),
+                Felt(nonce.as_cell().addr()),
+                FACTOR,
+            );
+            // Published so the program has an output and the proof is about
+            // something; the CHECK is the assertions the emitter just laid down.
+            b.public(seed);
+            compile(b.finish())
+        }
+
+        let opts = GoldilocksCubicProofOptions::with_blowup(2).expect("options");
+        let compiled = program(2);
+
+        // The three members that HAVE a commitment type — `HasherKind::Test`
+        // has none, so there is no host digest to grind against.
+        type Grind = fn(&Commitment, u8) -> Option<u64>;
+        let members: [(HasherKind, Grind); 3] = [
+            (HasherKind::Rpo, |s, f| {
+                stark::grinding::generate_nonce::<AlgebraicDigest<RpoCommit>>(s, f)
+            }),
+            (HasherKind::Rpx, |s, f| {
+                stark::grinding::generate_nonce::<AlgebraicDigest<RpxCommit>>(s, f)
+            }),
+            (HasherKind::Poseidon, |s, f| {
+                stark::grinding::generate_nonce::<AlgebraicDigest<PoseidonCommit>>(s, f)
+            }),
+        ];
+
+        for (hasher, grind) in members {
+            // HOST: the seed as `AlgebraicTranscript::state()` would serialise
+            // it, then a real ground-out nonce for this hasher.
+            let seed_bytes = digest_to_commitment(&SEED_CELL);
+            let nonce = grind(&seed_bytes, FACTOR).expect("a nonce must exist at factor 8");
+
+            let arena = vec![vec![
+                SEED_CELL,
+                [FE::from(nonce), FE::zero(), FE::zero(), FE::zero()],
+            ]];
+            let artifacts = build_artifacts_with_hasher(&compiled, &opts, hasher);
+            assert!(
+                lfm_prove_with_hasher(&compiled, &artifacts, &arena, &opts, hasher).is_ok(),
+                "{hasher:?}: the host's own ground-out nonce must prove"
+            );
+
+            // ⚠ THE CONTROL. Without it "it proved" says nothing: an emitter
+            // that asserted nothing would pass the line above.
+            let bad = vec![vec![
+                SEED_CELL,
+                [
+                    FE::from(nonce.wrapping_add(1)),
+                    FE::zero(),
+                    FE::zero(),
+                    FE::zero(),
+                ],
+            ]];
+            assert!(
+                lfm_prove_with_hasher(&compiled, &artifacts, &bad, &opts, hasher).is_err(),
+                "{hasher:?}: a nonce the host would reject must be unprovable"
+            );
+        }
+    }
+
     #[test]
     fn the_host_grinding_digest_and_the_machine_agree() {
         use crate::lfm::builder::LfmBuilder;

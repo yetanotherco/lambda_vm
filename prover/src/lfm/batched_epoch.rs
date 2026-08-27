@@ -429,9 +429,8 @@ pub fn emit_batched_epoch_challenges(
 
     if let Some(nonce) = absorbs.nonce {
         let seed = t.state(b);
-        let halves = super::epoch::nonce_halves(b, nonce);
-        super::epoch::emit_grinding_check(b, seed, halves, shape.grinding_factor);
-        t.append_halves(&halves);
+        super::epoch::emit_grinding_check(b, seed, nonce, shape.grinding_factor);
+        t.append_felt(b, nonce);
     }
 
     let iota_bits = (0..shape.num_queries)

@@ -267,7 +267,39 @@ impl TranscriptReplay {
     /// `sink(&self.canonical_u64().to_be_bytes())`, so the endianness flip is
     /// real work for this machine — see [`felt_be_halves`] for the gadget and
     /// its cost.
+    ///
+    /// ★ FREE on the algebraic arm, and by the same cancellation a root gets.
+    /// The host absorbs `append_bytes(&canonical(v).to_be_bytes())`, and
+    /// `bytes_to_cell` over exactly eight bytes puts that `u64` in lane 0 and
+    /// zero everywhere else — so the payload cell IS `[v, 0, 0, 0]`, with no
+    /// decomposition and no byte swap. The byte arm's `felt_be_halves` was the
+    /// price of a byte-oriented hash, not of the value.
     pub fn append_felt(&mut self, b: &mut LfmBuilder, v: Felt) {
+        if Self::is_algebraic(b) {
+            let mut sponge = self.drive_chain(b);
+            // Eight bytes of payload: the rule fixes the prefix and says there
+            // is exactly one payload cell.
+            // A probe rather than a zero payload: zero would cellify to zero
+            // whatever the placement, and PLACEMENT is the thing being relied
+            // on. This pins that a felt's eight big-endian bytes land in lane 0
+            // and nowhere else, which is what makes the pack below the rule
+            // rather than a restatement of it.
+            const PROBE: u64 = 0x0123_4567_89ab_cdef;
+            let rule = AlgebraicTranscript::append_bytes_cells(&PROBE.to_be_bytes());
+            assert_eq!(rule.len(), 2, "eight bytes is one prefix and one cell");
+            assert_eq!(
+                rule[1],
+                [FE::from(PROBE), FE::zero(), FE::zero(), FE::zero()],
+                "a felt's eight big-endian bytes must cellify to lane 0 alone"
+            );
+            let prefix = b.digest_const(rule[0]);
+            sponge.absorb(b, prefix.as_cell());
+            let zero = b.felt_const(FE::zero());
+            let cell = b.pack_word([v, zero, zero, zero]);
+            sponge.absorb(b, cell);
+            self.sponge = Some(sponge);
+            return;
+        }
         let halves = felt_be_halves(b, v);
         self.append_halves(&halves);
     }

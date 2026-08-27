@@ -370,7 +370,9 @@ pub(super) fn emit_grinding_check(
     // `seed` carries its own width, so an algebraic seed (ONE cell) needs no
     // change here.
     seed: super::edsl::WrapDigest,
-    nonce_halves: [Felt; 2],
+    // The nonce as a FELT rather than as its two big-endian halves: the halves
+    // are the byte hash's rendering of it, and the algebraic arm needs the value.
+    nonce: Felt,
     factor: u8,
 ) {
     assert!(
@@ -378,6 +380,12 @@ pub(super) fn emit_grinding_check(
         "a grinding factor is in 1..=64 (grinding.rs:22-25), got {factor}"
     );
 
+    if b.wrap_hash() == super::edsl::WrapHash::Algebraic {
+        emit_algebraic_grinding_check(b, seed, nonce, factor);
+        return;
+    }
+
+    let nonce_halves = nonce_halves(b, nonce);
     let mut inner = ByteString::new();
     inner.push_const(&GRINDING_PREFIX);
     let mut seed_halves = Vec::with_capacity(8);
@@ -422,6 +430,100 @@ pub(super) fn emit_grinding_check(
         };
         let v = Felt(bits[8 * (byte % 4) + bit].addr());
         b.assert_eq(v, zero);
+    }
+}
+
+/// The ALGEBRAIC arm of [`emit_grinding_check`] — two permutations and one bit
+/// decomposition, against the byte arm's two full sponge hashes.
+///
+/// ★ **Both preimages are already felts, so neither hash pays a byte encoding.**
+/// `is_valid_nonce` is `H(H(PREFIX ‖ seed ‖ factor) ‖ nonce_be)`, and under
+/// `AlgebraicDigest` the host reaches those bytes through `felts_from_bytes` —
+/// which reads 8-byte big-endian groups. The seed is
+/// `AlgebraicTranscript::state()`, i.e. its four state felts written canonically
+/// big-endian, so `felts_from_bytes` recovers exactly those four felts; the
+/// inner digest is likewise four canonical felts; and the nonce's eight
+/// big-endian bytes are the nonce. The same cancellation a commitment root gets
+/// in the transcript, twice more.
+///
+/// ⚠ A nonce at or above `p` reduces — on BOTH sides, since the host's
+/// `felts_from_bytes` calls `FE::from(u64)` exactly as this does — so the two
+/// agree. It remains the completeness restriction [`TableAbsorbs::nonce`]
+/// records, not a disagreement introduced here.
+///
+/// Every constant comes from the host's own rules: the byte→felt grouping from
+/// `felts_from_bytes`, the rate/capacity split and the padding flag from
+/// `single_block_leaf_cells`. The asserts pin the LANE PLACEMENT those rules
+/// imply, so the packs below are the rule rather than a second copy of it.
+fn emit_algebraic_grinding_check(
+    b: &mut LfmBuilder,
+    seed: super::edsl::WrapDigest,
+    nonce: Felt,
+    factor: u8,
+) {
+    use super::algebraic_commit::{felts_from_bytes, single_block_leaf_cells};
+
+    assert_eq!(seed.len(), 1, "an algebraic transcript state is ONE cell");
+
+    // ---- inner: H(PREFIX ‖ seed ‖ factor), 41 bytes → six felts, one block.
+    // The seed's 32 bytes are left ZERO here: those four felts are machine
+    // cells, and leaving them zero is what lets the asserts below prove the
+    // constants occupy the other two slots and nothing else.
+    let mut inner_bytes = [0u8; 41];
+    inner_bytes[..GRINDING_PREFIX.len()].copy_from_slice(&GRINDING_PREFIX);
+    inner_bytes[40] = factor;
+    let inner_felts = felts_from_bytes(&inner_bytes);
+    assert_eq!(inner_felts.len(), 6, "41 bytes is six big-endian groups");
+    assert_eq!(
+        &inner_felts[1..5],
+        &[FE::zero(); 4],
+        "the seed must occupy felts 1..5 exactly, or the packs below are wrong"
+    );
+    let inner_cells = single_block_leaf_cells(&inner_felts);
+    assert_eq!(
+        inner_cells[0],
+        [inner_felts[0], FE::zero(), FE::zero(), FE::zero()],
+        "rate cell 0 must carry the prefix felt and three seed felts"
+    );
+    assert_eq!(
+        inner_cells[1],
+        [FE::zero(), inner_felts[5], FE::zero(), FE::zero()],
+        "rate cell 1 must carry the fourth seed felt then the factor felt"
+    );
+
+    let s = b.unpack(seed[0]);
+    let zero = b.felt_const(FE::zero());
+    let prefix = b.felt_const(inner_felts[0]);
+    let factor_felt = b.felt_const(inner_felts[5]);
+    let inner_rate0 = b.pack_word([prefix, s[0], s[1], s[2]]);
+    let inner_rate1 = b.pack_word([s[3], factor_felt, zero, zero]);
+    let inner_cap = b.digest_const(inner_cells[2]);
+    let inner = b.permute([inner_rate0, inner_rate1, inner_cap.as_cell()])[0];
+
+    // ---- outer: H(inner ‖ nonce_be), 40 bytes → five felts, one block.
+    // ★ The inner digest cell IS rate cell 0 — its four lanes are felts 0..4 of
+    // this preimage — so nothing repacks it.
+    let outer_felts = felts_from_bytes(&[0u8; 40]);
+    assert_eq!(outer_felts.len(), 5, "40 bytes is five big-endian groups");
+    let outer_cells = single_block_leaf_cells(&outer_felts);
+    assert_eq!(
+        outer_cells[1],
+        [FE::zero(); 4],
+        "the nonce must be felt 4, i.e. lane 0 of rate cell 1"
+    );
+    let outer_rate1 = b.pack_word([nonce, zero, zero, zero]);
+    let outer_cap = b.digest_const(outer_cells[2]);
+    let digest = b.permute([inner, outer_rate1, outer_cap.as_cell()])[0];
+
+    // ---- the check: the first eight BIG-endian bytes of the digest, read as a
+    // `u64`, must be below `2^(64 − factor)`. Those eight bytes are lane 0's
+    // canonical `u64` (`cell_to_bytes` writes lane 0 first), so this is "the top
+    // `factor` bits of lane 0 are zero" — and `bit_dec` enforces canonicity as
+    // part of the row, which is exactly the `canonical()` the host applies.
+    let [lane0, _, _, _] = b.unpack(digest);
+    let bits = b.bit_dec(lane0, 64);
+    for bit in bits.iter().rev().take(factor as usize) {
+        b.assert_eq(Felt(bit.addr()), zero);
     }
 }
 
@@ -530,9 +632,11 @@ pub fn emit_table_challenges(
 
     if let Some(nonce) = absorbs.nonce {
         let seed = t.state(b);
-        let halves = nonce_halves(b, nonce);
-        emit_grinding_check(b, seed, halves, shape.grinding_factor);
-        t.append_halves(&halves);
+        emit_grinding_check(b, seed, nonce, shape.grinding_factor);
+        // `append_felt` IS `append_halves(&felt_be_halves(nonce))` on the byte
+        // arm — the same two halves this used to build by hand — and on the
+        // algebraic arm it is the free lane-0 cell.
+        t.append_felt(b, nonce);
     }
 
     let iota_bits = (0..shape.num_queries)
