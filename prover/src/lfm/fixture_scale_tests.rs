@@ -114,15 +114,21 @@ fn the_shaped_emitter_reproduces_the_blessed_program_at_the_default_size() {
 /// choice of scale below is made from it rather than by trial proving — so it
 /// is checked against the census the prover actually builds.
 ///
-/// One invocation is one `LFM_HASH` row under RPO, RPX and Poseidon alike (the
-/// chip is a full permutation per row), so `real_rows` IS the count. BLAKE3 is
-/// excluded here because its socket spends several rows per compression; the
-/// point of the check is the count, and the count is hasher-independent.
+/// One invocation is one `LFM_HASH` row under EVERY hasher — the chip is a full
+/// permutation per row and only its WIDTH moves — so `real_rows` is the count
+/// directly. That invariance is the reason a hash swap is a pure width change
+/// at fixed height, which is what makes the census's cells the only thing that
+/// moves and so the only thing a measurement has to explain.
 #[test]
 fn the_predicted_hash_invocation_count_matches_the_census() {
     for sh in [FixtureShape::default(), GREEN, FixtureShape::new(12, 5)] {
         let program = fri_toy_program_with_shape(sh);
-        for kind in [HasherKind::Rpo, HasherKind::Rpx, HasherKind::Poseidon] {
+        for kind in [
+            HasherKind::Rpo,
+            HasherKind::Rpx,
+            HasherKind::Poseidon,
+            HasherKind::Blake3,
+        ] {
             let census = lfm_chip_census_with_hasher(&program, kind);
             let h = census
                 .iter()
@@ -136,6 +142,57 @@ fn the_predicted_hash_invocation_count_matches_the_census() {
                 h.real_rows,
             );
         }
+    }
+}
+
+/// ★ The sizing constants, pinned: `LFM_HASH` cells per ROW, per hasher.
+///
+/// Every projected size in this lane is `rows · this`, so a silent width change
+/// would re-scale the whole ladder while every ratio still looked plausible.
+/// The convention is the census's own — main cells plus aux cells, an extension
+/// aux column counted once — which is NOT the `cliff_cost` convention that
+/// counts aux three times, and the two differ by six for RPO. Quoting one as
+/// the other is how 439 becomes 445.
+#[test]
+fn the_hash_chip_cells_per_row_are_pinned_per_hasher() {
+    let program = fri_toy_program_with_shape(GREEN);
+    for (kind, expect) in [
+        (HasherKind::Rpo, 439),
+        (HasherKind::Rpx, 319),
+        (HasherKind::Poseidon, 615),
+        (HasherKind::Blake3, 3579),
+    ] {
+        let census = lfm_chip_census_with_hasher(&program, kind);
+        let h = census
+            .iter()
+            .find(|c| c.name == "LFM_HASH")
+            .expect("the hash chip");
+        let per_row = (h.main_cells() + h.aux_cells()) / h.rows;
+        assert_eq!(per_row, expect, "{kind:?}: LFM_HASH cells per row moved");
+    }
+}
+
+/// The non-hash floor, pinned as the two constants it is: a fixed part that no
+/// workload moves, and a per-query part.
+///
+/// This is what makes the fixture a DIFFERENT regime from the aggregator, and
+/// the number that says how far it has to be scaled before a hash swap is
+/// visible at all. It is asserted rather than only measured because the whole
+/// sizing argument rests on the floor being flat.
+#[test]
+fn the_non_hash_floor_is_flat_in_the_query_count() {
+    let per_query = 4_272u64;
+    let fixed = 15_859_860u64;
+    for q in [32usize, 64, 256, 1024] {
+        let sh = FixtureShape::new(16, q);
+        let program = fri_toy_program_with_shape(sh);
+        let (total, hash, _) = census_totals(&program, HasherKind::Rpo);
+        let predicted = fixed + per_query * q as u64;
+        let non_hash = total - hash;
+        assert!(
+            non_hash.abs_diff(predicted) < 1_024,
+            "q={q}: non-hash cells {non_hash}, predicted {predicted}"
+        );
     }
 }
 
@@ -354,7 +411,12 @@ fn the_scaled_fixture_measures_one_arm() {
         env_usize("LFM_FIXTURE_LOG_LDE", 16),
         env_usize("LFM_FIXTURE_QUERIES", 1024),
     );
-    let opts = options();
+    // The blowup is an axis in its own right: committed CELLS do not move with
+    // it, but the LDE that holds them does, so a model that is cells-linear at
+    // one blowup is not automatically the same line at another. Projecting the
+    // laptop onto the box's posture needs to know which.
+    let blowup = env_usize("LFM_FIXTURE_BLOWUP", 2) as u8;
+    let opts = GoldilocksCubicProofOptions::with_blowup(blowup).expect("a valid blowup");
     let rss = || super::wrap_tests::peak_rss_gib().unwrap_or(f64::NAN);
 
     println!(
@@ -425,11 +487,13 @@ fn the_scaled_fixture_measures_one_arm() {
     // One machine-readable line per arm, for the driver to collect.
     println!(
         "RESULT hasher={kind:?} log_lde={} queries={} invocations={} cells={total} \
-         hash_cells={hash_cells} sub_proofs={} prove_secs={prove_secs:.3} peak_gib={prove_peak:.4}",
+         hash_cells={hash_cells} sub_proofs={} prove_secs={prove_secs:.3} \
+         peak_gib={prove_peak:.4} blowup={blowup} threads={}",
         sh.log_lde,
         sh.num_queries,
         sh.hash_invocations(),
         proved.proof.proofs.len(),
+        rayon_threads(),
     );
 }
 
