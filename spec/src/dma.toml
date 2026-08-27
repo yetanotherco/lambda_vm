@@ -1,0 +1,302 @@
+name = "DMA"
+
+# Input
+
+[[variables.input]]
+name = "timestamp"
+type = "Word"
+desc = "timestamp at which the copy is requested"
+pad = 0
+
+# Auxiliary
+
+[[variables.auxiliary]]
+name = "src"
+type = "DWordWL"
+desc = "Address of the first byte read by this row."
+pad = 0
+
+[[variables.auxiliary]]
+name = "src_incr"
+type = "DWordHL"
+desc = "$#`src` + #`step`$"
+pad = 1
+
+[[variables.auxiliary]]
+name = "dst"
+type = "DWordWL"
+desc = "Address of the first byte written by this row."
+pad = 0
+
+[[variables.auxiliary]]
+name = "dst_incr"
+type = "DWordHL"
+desc = "$#`dst` + #`step`$"
+pad = 1
+
+[[variables.auxiliary]]
+name = "count"
+type = "DWordWL"
+desc = "Number of bytes that still have to be copied, including those copied by this row."
+pad = 1
+
+[[variables.auxiliary]]
+name = "count_decr"
+type = "DWordHL"
+desc = "$#`count` - #`step`$"
+pad = ["arr", 0, 0, 0, 0]
+
+[[variables.auxiliary]]
+name = "first"
+type = "Bit"
+desc = "Whether this is the first row of this copy sequence."
+pad = 0
+
+[[variables.auxiliary]]
+name = "end"
+type = "Bit"
+desc = "Whether this is the end of the copy sequence."
+pad = 0
+
+[[variables.auxiliary]]
+name = "tail"
+type = "Bit"
+desc = "Whether $#`count` < 8$, i.e. whether this row copies a single byte rather than eight."
+pad = 1
+
+[[variables.auxiliary]]
+name = "value"
+type = "DWordBL"
+desc = "The bytes copied by this row; only $#`value`_0$ is copied when $#`tail` = 1$. Unconstrained on rows that copy nothing."
+pad = 0
+
+# Virtual
+
+[[variables.virtual]]
+name = "step"
+type = "Byte"
+desc = "The stride this row advances by: eight, or one when `tail` is set. No bytes are copied on the terminal row."
+def = ["-", 8, ["*", 7, "tail"]]
+
+# Multiplicity
+
+[[variables.multiplicity]]
+name = "μ"
+type = "Bit"
+desc = ""
+pad = 0
+
+# Assumptions
+
+[[assumptions]]
+desc = "`IS_WORD[timestamp]`"
+ref = "dma:a:timestamp"
+
+[[assumptions]]
+desc = "`IS_WORD[src[i]]`"
+iter = ["i", 0, 1]
+ref = "dma:a:src"
+
+[[assumptions]]
+desc = "`IS_WORD[dst[i]]`"
+iter = ["i", 0, 1]
+ref = "dma:a:dst"
+
+[[assumptions]]
+desc = "`IS_WORD[count[i]]`"
+iter = ["i", 0, 1]
+ref = "dma:a:count"
+
+# Constraints
+
+[[constraint_groups]]
+name = "incoming"
+
+[[constraints.incoming]]
+kind = "interaction"
+tag = "ECALL"
+input = ["timestamp", ["arr", ["-", ["^", 2, 32], 3], ["-", ["^", 2, 32], 1]]]
+multiplicity = ["-", "first"]
+ref = "dma:c:receive_ecall"
+
+[[constraint_groups]]
+name = "read_input"
+
+[[constraints.read_input]]
+kind = "template"
+tag = "REG"
+input = [10, "dst", "timestamp"]
+output = "dst"
+cond = "first"
+ref = "dma:c:read_dst"
+
+[[constraints.read_input]]
+kind = "template"
+tag = "REG"
+input = [11, "src", "timestamp"]
+output = "src"
+cond = "first"
+ref = "dma:c:read_src"
+
+[[constraints.read_input]]
+kind = "template"
+tag = "REG"
+input = [12, "count", "timestamp"]
+output = "count"
+cond = "first"
+ref = "dma:c:read_count"
+
+[[constraint_groups]]
+name = "width"
+
+[[constraints.width]]
+kind = "interaction"
+tag = "ALU"
+input = ["count", ["cast", 8, "DWordWL"], ["opsel", "LT"]]
+output = ["arr", "tail", 0]
+multiplicity = "μ"
+ref = "dma:c:tail"
+
+[[constraints.width]]
+kind = "interaction"
+tag = "ALU"
+input = ["count", ["cast", 257, "DWordWL"], ["opsel", "LT"]]
+output = ["arr", 1, 0]
+multiplicity = "first"
+ref = "dma:c:bound"
+
+[[constraint_groups]]
+name = "copy"
+
+[[constraints.copy]]
+kind = "interaction"
+tag = "MEMW"
+input = [0, "src", "value", ["+", "timestamp", 1], 0, 0, ["not", "tail"]]
+output = "value"
+multiplicity = ["-", "μ", "end"]
+ref = "dma:c:read_value"
+
+[[constraints.copy]]
+kind = "interaction"
+tag = "MEMW"
+input = [0, "dst", "value", ["+", "timestamp", 2], 0, 0, ["not", "tail"]]
+multiplicity = ["-", "μ", "end"]
+ref = "dma:c:write_value"
+
+[[constraints.copy]]
+kind = "arith"
+constraint = "$#`tail` => #`value`_i = 0$"
+poly = ["*", "tail", ["idx", "value", "i"]]
+iter = ["i", 1, 7]
+ref = "dma:c:tail_lanes"
+
+[[constraint_groups]]
+name = "incr_decr"
+
+[[constraints.incr_decr]]
+kind = "template"
+tag = "ADDNW"
+input = ["src", ["arr", "step", 0]]
+output = ["cast", "src_incr", "DWordWL"]
+cond = ["-", "μ", "end"]
+ref = "dma:c:src_incr"
+
+[[constraints.incr_decr]]
+kind = "interaction"
+tag = "IS_HALF"
+input = [["idx", "src_incr", "i"]]
+iter = ["i", 0, 3]
+multiplicity = "μ"
+ref = "dma:c:range_src_incr"
+
+[[constraints.incr_decr]]
+kind = "template"
+tag = "ADDNW"
+input = ["dst", ["arr", "step", 0]]
+output = ["cast", "dst_incr", "DWordWL"]
+cond = ["-", "μ", "end"]
+ref = "dma:c:dst_incr"
+
+[[constraints.incr_decr]]
+kind = "interaction"
+tag = "IS_HALF"
+input = [["idx", "dst_incr", "i"]]
+iter = ["i", 0, 3]
+multiplicity = "μ"
+ref = "dma:c:range_dst_incr"
+
+[[constraints.incr_decr]]
+kind = "template"
+tag = "SUB"
+input = ["count", ["arr", "step", 0]]
+output = ["cast", "count_decr", "DWordWL"]
+ref = "dma:c:count_decr"
+
+[[constraints.incr_decr]]
+kind = "interaction"
+tag = "IS_HALF"
+input = [["idx", "count_decr", "i"]]
+iter = ["i", 0, 3]
+multiplicity = "μ"
+ref = "dma:c:range_count_decr"
+
+[[constraint_groups]]
+name = "end"
+
+[[constraints.end]]
+kind = "interaction"
+tag = "ZERO"
+input = [["+", ["-", 0xFFFF, ["idx", "count_decr", 0]], ["-", 0xFFFF, ["idx", "count_decr", 1]], ["-", 0xFFFF, ["idx", "count_decr", 2]], ["-", 0xFFFF, ["idx", "count_decr", 3]]]]
+output = "end"
+multiplicity = "μ"
+ref = "dma:c:end"
+
+[[constraint_groups]]
+name = "bits"
+
+[[constraints.bits]]
+kind = "template"
+tag = "IS_BIT"
+input = ["first"]
+ref = "dma:c:range_first"
+
+[[constraints.bits]]
+kind = "template"
+tag = "IS_BIT"
+input = ["end"]
+ref = "dma:c:range_end"
+
+[[constraints.bits]]
+kind = "template"
+tag = "IS_BIT"
+input = ["tail"]
+ref = "dma:c:range_tail"
+
+[[constraints.bits]]
+kind = "template"
+tag = "IS_BIT"
+input = ["μ"]
+ref = "dma:c:range_mu"
+
+[[constraints.bits]]
+kind = "arith"
+constraint = "$#`first` + #`end` => #`μ` = 1$"
+poly = ["*", ["+", "first", "end"], ["not", "μ"]]
+ref = "dma:c:first_or_end_implies_mu"
+
+[[constraint_groups]]
+name = "lookups"
+
+[[constraints.lookups]]
+kind = "interaction"
+tag = "DMA_NEXT"
+input = ["timestamp", ["cast", "src_incr", "DWordWL"], ["cast", "dst_incr", "DWordWL"], ["cast", "count_decr", "DWordWL"]]
+multiplicity = ["-", "μ", "end"]
+ref = "dma:c:send_copy_next_chunk"
+
+[[constraints.lookups]]
+kind = "interaction"
+tag = "DMA_NEXT"
+input = ["timestamp", "src", "dst", "count"]
+multiplicity = ["-", ["-", "μ", "first"]]
+ref = "dma:c:receive_copy_next_chunk"

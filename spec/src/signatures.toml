@@ -28,6 +28,14 @@ input = ["DWordWL", "DWordWL"]
 output = "DWordWL"
 cond = "BaseField"
 
+# cond => ADDNW<sum; lhs, rhs>
+[[signatures]]
+tag = "ADDNW"
+kind = "template"
+input = ["DWordWL", "DWordWL"]
+output = "DWordWL"
+cond = "BaseField"
+
 # cond => NEG<neg; X>
 [[signatures]]
 tag = "NEG"
@@ -123,6 +131,12 @@ input = ["Word", "DWordWL"]
 tag = "CNB"
 kind = "interaction"
 input = ["Word", "BaseField", "DWordWL", "DWordWL"]
+
+# DMA_NEXT[timestamp, src, dst, count]
+[[signatures]]
+tag = "DMA_NEXT"
+kind = "interaction"
+input = ["Word", "DWordWL", "DWordWL", "DWordWL"]
 
 # BYTE_ALU[res; selector, X, Y]
 [[signatures]]
