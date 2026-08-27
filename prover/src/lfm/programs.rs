@@ -34,6 +34,7 @@ use crate::tables::types::{FE, FEE};
 use super::builder::{Cell, LfmBuilder, LfmProgramSource};
 use super::compiler::{LfmProgram, compile};
 use super::edsl::WrapHash;
+use super::fixture::FixtureShape;
 
 /// The Milestone-B trivial program: a few hundred instructions exercising
 /// every chip — constants, base ALU (incl. the assert lowering), Fp3 ALU,
@@ -630,27 +631,51 @@ pub fn canonicity_guard_program() -> LfmProgram {
 /// the terminal-polynomial check. Straight-line: every loop below unrolls at
 /// emission; the shape is a compile-time constant of the program.
 pub fn fri_toy_program_source() -> LfmProgramSource {
+    fri_toy_program_source_with_shape(FixtureShape::default())
+}
+
+/// [`fri_toy_program_source`] at an arbitrary [`FixtureShape`] — the SAME
+/// construction, with every unrolled bound read off the shape instead of a
+/// constant.
+///
+/// The shape enters in exactly four places, and they are the four that make the
+/// program's hash work scale: the Merkle path lengths (`main_path_len`,
+/// `l1_path_len`), the openings-arena stride (`words_per_query`), the query
+/// count, and the two fold-point factor tables, whose length is the number of
+/// index bits each fold's domain point depends on. Nothing else is size-aware —
+/// a word is four lanes and a terminal polynomial has two coefficients at every
+/// size.
+///
+/// ⚠ The emitted program is a different PROGRAM for every shape (a different
+/// preprocessed commitment, so a different `program_id`). Only the default shape
+/// is the blessed `FriToyV0`; the others exist to be measured, and go through
+/// `build_artifacts_with_hasher` rather than the registry.
+pub fn fri_toy_program_source_with_shape(sh: FixtureShape) -> LfmProgramSource {
     use super::builder::Cell;
     use super::edsl::{self, SpongeVar};
-    use super::fixture::{domain_constants, shape};
+    use super::fixture::domain_constants_for;
 
-    let (omega, offset) = domain_constants();
+    let (omega, offset) = domain_constants_for(sh);
     let omega_inv = omega.inv().expect("root of unity is invertible");
     let offset_inv = offset.inv().expect("coset offset is invertible");
     // Fold-0 point inverses over q0's bits: x = c·ω^{q0} ⇒ factors ω^{-2^i}.
-    let invx_factors: Vec<FE> = (0..shape::QUERY_BITS)
+    let invx_factors: Vec<FE> = (0..sh.query_bits())
         .map(|i| omega_inv.pow(1u64 << i))
         .collect();
-    // Fold-1 over j = q0 mod 8: y = c²·ω^{2j} ⇒ factors ω^{-2·2^i}, scale c⁻².
-    let invy_factors: Vec<FE> = (0..3).map(|i| omega_inv.pow(2u64 << i)).collect();
+    // Fold-1 over j = q0 mod (LDE/4): y = c²·ω^{2j} ⇒ factors ω^{-2·2^i}, scale c⁻².
+    let invy_factors: Vec<FE> = (0..sh.l1_path_len())
+        .map(|i| omega_inv.pow(2u64 << i))
+        .collect();
     let offset2_inv = offset_inv.square();
     // Terminal point y₂ = c⁴·ω^{4j}.
-    let y2_factors: Vec<FE> = (0..3).map(|i| omega.pow(4u64 << i)).collect();
+    let y2_factors: Vec<FE> = (0..sh.l1_path_len())
+        .map(|i| omega.pow(4u64 << i))
+        .collect();
     let offset4 = offset.square().square();
 
     let mut b = LfmBuilder::new();
     let commits = b.declare_arena(4);
-    let opens = b.declare_arena((shape::NUM_QUERIES * shape::WORDS_PER_QUERY) as u32);
+    let opens = b.declare_arena((sh.num_queries * sh.words_per_query()) as u32);
 
     let mut sponge = SpongeVar::new(&mut b);
     let main_root = b.hint_word(commits, 0);
@@ -673,31 +698,45 @@ pub fn fri_toy_program_source() -> LfmProgramSource {
     let main_root_lanes = b.unpack(main_root);
     let l1_root_lanes = b.unpack(l1_root);
 
-    for q in 0..shape::NUM_QUERIES {
-        let off = (q * shape::WORDS_PER_QUERY) as u32;
-        let bits = sponge.squeeze_bits(&mut b, shape::QUERY_BITS); // q0 = b0..b3
+    let (main_path, l1_path_len) = (sh.main_path_len(), sh.l1_path_len());
+    // Openings-arena offsets within one query, in the order the host writes them.
+    let (row_b_at, sibs_b_at) = (2 + main_path, 4 + main_path);
+    let (l1_lo_at, l1_sibs_at) = (4 + 2 * main_path, 6 + 2 * main_path);
+
+    for q in 0..sh.num_queries {
+        let off = (q * sh.words_per_query()) as u32;
+        let bits = sponge.squeeze_bits(&mut b, sh.query_bits());
         let zero_bit = b.bit_const(false);
         let one_bit = b.bit_const(true);
-        let path_a = [bits[1], bits[2], bits[3], zero_bit];
-        let path_b = [bits[1], bits[2], bits[3], one_bit];
+        // The main-tree leaf index is q0 >> 1, so its path is q0's bits from 1
+        // up; leaf B is the same leaf plus LDE/4, i.e. the same path under a
+        // set top bit.
+        let mut path_a: Vec<_> = bits[1..sh.query_bits()].to_vec();
+        let mut path_b = path_a.clone();
+        path_a.push(zero_bit);
+        path_b.push(one_bit);
 
         // Main-tree opening A (rows 2·l_A, 2·l_A+1 with l_A = q0 >> 1).
         let row_a_even = b.hint_word(opens, off);
         let row_a_odd = b.hint_word(opens, off + 1);
         let leaf_a = edsl::leaf_hash_pair(&mut b, row_a_even, row_a_odd);
-        let sibs_a: Vec<Cell> = (0..4).map(|i| b.hint_word(opens, off + 2 + i)).collect();
+        let sibs_a: Vec<Cell> = (0..main_path as u32)
+            .map(|i| b.hint_word(opens, off + 2 + i))
+            .collect();
         let root_a = edsl::merkle_walk(&mut b, leaf_a, &path_a, &sibs_a);
         edsl::assert_word_eq_lanes(&mut b, root_a.as_cell(), &main_root_lanes);
 
-        // Main-tree opening B (leaf l_A + 8, i.e. rows q0+16's pair).
-        let row_b_even = b.hint_word(opens, off + 6);
-        let row_b_odd = b.hint_word(opens, off + 7);
+        // Main-tree opening B (leaf l_A + LDE/4, i.e. the pair at q0 + LDE/2).
+        let row_b_even = b.hint_word(opens, off + row_b_at as u32);
+        let row_b_odd = b.hint_word(opens, off + row_b_at as u32 + 1);
         let leaf_b = edsl::leaf_hash_pair(&mut b, row_b_even, row_b_odd);
-        let sibs_b: Vec<Cell> = (0..4).map(|i| b.hint_word(opens, off + 8 + i)).collect();
+        let sibs_b: Vec<Cell> = (0..main_path as u32)
+            .map(|i| b.hint_word(opens, off + sibs_b_at as u32 + i))
+            .collect();
         let root_b = edsl::merkle_walk(&mut b, leaf_b, &path_b, &sibs_b);
         edsl::assert_word_eq_lanes(&mut b, root_b.as_cell(), &main_root_lanes);
 
-        // Row parity: q0 and q0+16 share bit 0.
+        // Row parity: q0 and q0 + LDE/2 share bit 0.
         let (row_a, _) = b.select(bits[0], row_a_even, row_a_odd);
         let (row_b, _) = b.select(bits[0], row_b_even, row_b_odd);
 
@@ -729,22 +768,25 @@ pub fn fri_toy_program_source() -> LfmProgramSource {
         let inv_x = edsl::pow_bits(&mut b, &bits, &invx_factors, offset_inv);
         let v1 = edsl::fri_fold(&mut b, lo, hi, zeta0, inv_x);
 
-        let l1_lo = b.hint_word(opens, off + 12);
-        let l1_hi = b.hint_word(opens, off + 13);
+        let l1_lo = b.hint_word(opens, off + l1_lo_at as u32);
+        let l1_hi = b.hint_word(opens, off + l1_lo_at as u32 + 1);
         let l1_leaf = edsl::leaf_hash_pair(&mut b, l1_lo, l1_hi);
-        let l1_sibs: Vec<Cell> = (0..3).map(|i| b.hint_word(opens, off + 14 + i)).collect();
-        let l1_path = [bits[0], bits[1], bits[2]];
-        let l1_root_c = edsl::merkle_walk(&mut b, l1_leaf, &l1_path, &l1_sibs);
+        let l1_sibs: Vec<Cell> = (0..l1_path_len as u32)
+            .map(|i| b.hint_word(opens, off + l1_sibs_at as u32 + i))
+            .collect();
+        let l1_path = &bits[0..l1_path_len];
+        let l1_root_c = edsl::merkle_walk(&mut b, l1_leaf, l1_path, &l1_sibs);
         edsl::assert_word_eq_lanes(&mut b, l1_root_c.as_cell(), &l1_root_lanes);
 
-        let (g1_at_q0, _) = b.select(bits[3], l1_lo, l1_hi);
+        // The L1 leaf holds g1[j] and g1[j + LDE/4]; q0's top bit says which.
+        let (g1_at_q0, _) = b.select(bits[sh.query_bits() - 1], l1_lo, l1_hi);
         b.assert_eq_ext(v1, g1_at_q0.as_ext());
 
         // Fold 1 → must equal the terminal polynomial at y₂.
-        let inv_y = edsl::pow_bits(&mut b, &bits[0..3], &invy_factors, offset2_inv);
+        let inv_y = edsl::pow_bits(&mut b, &bits[0..l1_path_len], &invy_factors, offset2_inv);
         let v2 = edsl::fri_fold(&mut b, l1_lo.as_ext(), l1_hi.as_ext(), zeta1, inv_y);
 
-        let y2 = edsl::pow_bits(&mut b, &bits[0..3], &y2_factors, offset4);
+        let y2 = edsl::pow_bits(&mut b, &bits[0..l1_path_len], &y2_factors, offset4);
         let t1y = b.emul_base(t1, y2);
         let t_eval = b.eadd(t0, t1y);
         b.assert_eq_ext(v2, t_eval);
@@ -757,6 +799,11 @@ pub fn fri_toy_program_source() -> LfmProgramSource {
 
 pub fn fri_toy_program() -> LfmProgram {
     compile(fri_toy_program_source())
+}
+
+/// [`fri_toy_program`] at an arbitrary size.
+pub fn fri_toy_program_with_shape(sh: FixtureShape) -> LfmProgram {
+    compile(fri_toy_program_source_with_shape(sh))
 }
 
 // ============ R1f: a real Merkle opening under the production hash ============

@@ -54,6 +54,10 @@ rkyv = { version = "0.8.10", default-features = false, features = ["alloc", "byt
 
 [dev-dependencies]
 env_logger = "*"
+# `getrusage` for the macOS arm of `lfm::wrap_tests::peak_rss_gib` — the laptop
+# has no `/proc/self/status`, so without this every local peak-RSS measurement
+# silently reports nothing.
+libc = "0.2"
 criterion = { version = "0.5", default-features = false }
 tikv-jemallocator = "0.6"
 tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }

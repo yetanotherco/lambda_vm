@@ -1716,13 +1716,40 @@ fn the_from_proof_final_epoch_wraps() {
     );
 }
 
-/// Peak RSS high-water mark of this process, GiB — `VmHWM` on Linux (the box);
-/// `None` elsewhere.
+/// Peak RSS high-water mark of this process, GiB — `VmHWM` on Linux (the box),
+/// `getrusage`'s `ru_maxrss` on macOS (the laptop), `None` elsewhere.
+///
+/// ⚠ The two sources are the same QUANTITY (a monotone high-water mark of
+/// resident set size) but not the same UNIT: Linux reports `VmHWM` in kilobytes
+/// and Darwin reports `ru_maxrss` in bytes. Reading one with the other's scale
+/// is a factor-of-1024 error in a number the campaign sizes hardware against,
+/// which is why the conversion sits next to the read rather than at the caller.
+#[cfg(target_os = "linux")]
 pub(super) fn peak_rss_gib() -> Option<f64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
     let line = status.lines().find(|l| l.starts_with("VmHWM:"))?;
     let kb: f64 = line.split_whitespace().nth(1)?.parse().ok()?;
     Some(kb / (1024.0 * 1024.0))
+}
+
+/// See the Linux arm. Darwin has no `/proc`, so the same high-water mark comes
+/// from `getrusage(RUSAGE_SELF)`, in bytes.
+#[cfg(target_os = "macos")]
+pub(super) fn peak_rss_gib() -> Option<f64> {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    // SAFETY: `getrusage` writes a complete `rusage` on success and the pointer
+    // is to a correctly sized, correctly aligned allocation.
+    let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+    if rc != 0 {
+        return None;
+    }
+    let usage = unsafe { usage.assume_init() };
+    Some(usage.ru_maxrss as f64 / (1024.0 * 1024.0 * 1024.0))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(super) fn peak_rss_gib() -> Option<f64> {
+    None
 }
 
 /// ★ P1 — THE BLOCK, end to end, in one process: the production continuation

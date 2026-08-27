@@ -44,6 +44,111 @@ pub mod shape {
     pub const WORDS_PER_QUERY: usize = 17;
 }
 
+/// A fixture SIZE — the two knobs that scale the fixture's workload, with every
+/// other dimension derived from them.
+///
+/// The `shape` constants above are this struct's default and stay the shape of
+/// the blessed `FriToyV0` program. What this adds is the ability to dial the
+/// same construction UP, which is the only way the fixture can say anything
+/// about a hash: at the default size `LFM_HASH` is 0.3-0.5% of the program's
+/// cells, so which permutation fills it is invisible next to the fixed-height
+/// lookup tables that dominate (`rpx_chip_tests::the_fixture_hash_share_is_too_
+/// small_to_measure_a_swap`).
+///
+/// **What scales, and why these two knobs.** Hash invocations are
+/// `num_queries · (3·log_lde + 1)` plus a constant transcript: each query walks
+/// two main-tree paths of `log_lde − 1` parents, one L1 path of `log_lde − 2`,
+/// and hashes three two-cell leaves. So Merkle DEPTH and QUERY COUNT are the
+/// two multipliers, and they are exactly the two that carry the real
+/// aggregator's hash work as well.
+///
+/// **What does NOT scale: the fold count.** The trace length stays
+/// [`shape::TRACE_LEN`] at every size, so two folds still land on a degree-1
+/// terminal and the emitter's fold chain stays two links long. Growing
+/// `log_lde` against a fixed trace length therefore means growing the BLOWUP,
+/// which at `log_lde = 20` is 2^17 — an absurd FRI parameter, and deliberately
+/// so. The fixture is an instrument for pricing hash work inside a real
+/// prove-and-verify, not a proposal about FRI: a low-degree test over a huge
+/// coset is still a real low-degree test, its Merkle paths are still real
+/// authentication paths, and its tampered openings are still rejected. What a
+/// large blowup costs is soundness margin, which is not a quantity this
+/// instrument reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FixtureShape {
+    /// log2 of the LDE domain. Must be at least 4, so the L1 tree has a path.
+    pub log_lde: usize,
+    /// Query repetitions. Each one is an independent opening set.
+    pub num_queries: usize,
+}
+
+impl Default for FixtureShape {
+    /// The blessed `FriToyV0` size — what every existing caller gets.
+    fn default() -> Self {
+        Self {
+            log_lde: shape::LOG_LDE,
+            num_queries: shape::NUM_QUERIES,
+        }
+    }
+}
+
+impl FixtureShape {
+    pub const fn new(log_lde: usize, num_queries: usize) -> Self {
+        assert!(log_lde >= 4, "the L1 tree needs at least a two-level path");
+        assert!(num_queries >= 1);
+        Self {
+            log_lde,
+            num_queries,
+        }
+    }
+
+    pub const fn lde_size(&self) -> usize {
+        1 << self.log_lde
+    }
+
+    /// Query indices are sampled in `[0, LDE/2)`.
+    pub const fn query_bits(&self) -> usize {
+        self.log_lde - 1
+    }
+
+    /// The main tree's leaves are ROW PAIRS, so it is one level shorter than the
+    /// domain.
+    pub const fn main_path_len(&self) -> usize {
+        self.log_lde - 1
+    }
+
+    /// The L1 tree co-locates fold partners, so it is one level shorter again.
+    pub const fn l1_path_len(&self) -> usize {
+        self.log_lde - 2
+    }
+
+    /// Words one query occupies in the openings arena: two main leaves (two rows
+    /// plus a path each) and one L1 leaf (two cells plus a path).
+    pub const fn words_per_query(&self) -> usize {
+        2 * (2 + self.main_path_len()) + 2 + self.l1_path_len()
+    }
+
+    /// `LFM_HASH` invocations the emitted verifier performs, counted from the
+    /// construction rather than measured — the census is the measurement, and
+    /// this is what it is checked against
+    /// (`fixture_scale_tests::the_predicted_hash_invocation_count_matches_the_census`).
+    ///
+    /// Per query: three leaf pairs at two calls each, two main paths of
+    /// `main_path_len` parents, one L1 path of `l1_path_len`, and one transcript
+    /// step per squeezed index. The constant is the header: one absorb per root,
+    /// four squeezes for α/ζ0/ζ1 and the two terminal coefficients' leaf-encoded
+    /// absorbs.
+    pub const fn hash_invocations(&self) -> usize {
+        let per_query = 6 + 2 * self.main_path_len() + self.l1_path_len() + 1;
+        self.num_queries * per_query + FIXTURE_TRANSCRIPT_INVOCATIONS
+    }
+}
+
+/// Hash calls the fixture's transcript makes before the first query: absorb the
+/// main root, squeeze α and ζ0, absorb the L1 root, squeeze ζ1, then absorb each
+/// terminal coefficient through the leaf encoding (one leaf call plus one
+/// chaining absorb each).
+pub const FIXTURE_TRANSCRIPT_INVOCATIONS: usize = 1 + 2 + 1 + 1 + 2 * 2;
+
 /// Host mirror of [`super::edsl::SpongeVar`] — the compress chain, state 1
 /// cell.
 ///
@@ -209,24 +314,39 @@ pub struct FriToyProof {
 /// The committed columns: fixed low-degree polynomials evaluated over the
 /// LDE coset. Deterministic — the honest witness.
 pub fn fixture_columns() -> [Vec<FE>; shape::NUM_COLS] {
-    let omega = GoldilocksField::get_primitive_root_of_unity(shape::LOG_LDE as u64)
-        .expect("32nd root of unity");
-    let offset = FE::from(shape::COSET_OFFSET);
-    core::array::from_fn(|k| {
-        // degree < TRACE_LEN coefficients, fixed per column.
-        let coeffs: Vec<FE> = (0..shape::TRACE_LEN)
-            .map(|j| FE::from(1_000 * (k as u64 + 1) + j as u64 + 1))
-            .collect();
-        (0..shape::LDE_SIZE)
-            .map(|i| {
-                let x = &offset * omega.pow(i as u64);
-                coeffs.iter().rev().fold(FE::zero(), |acc, c| acc * &x + c)
-            })
-            .collect()
-    })
+    let mut cols = fixture_columns_with_shape(FixtureShape::default()).into_iter();
+    core::array::from_fn(|_| cols.next().expect("NUM_COLS columns"))
 }
 
-fn row_word(cols: &[Vec<FE>; shape::NUM_COLS], i: usize) -> LfmWord {
+/// [`fixture_columns`] at an arbitrary [`FixtureShape`].
+///
+/// The COEFFICIENTS do not move with the shape: a column is the same
+/// degree-`TRACE_LEN` polynomial at every size, evaluated over whatever coset
+/// the shape names. That is what lets one emitter serve every size — growing
+/// `log_lde` grows the domain and the Merkle depth while leaving the low-degree
+/// claim the two folds check exactly where it was.
+pub fn fixture_columns_with_shape(sh: FixtureShape) -> Vec<Vec<FE>> {
+    let omega = GoldilocksField::get_primitive_root_of_unity(sh.log_lde as u64)
+        .expect("the LDE domain's root of unity");
+    let offset = FE::from(shape::COSET_OFFSET);
+    (0..shape::NUM_COLS)
+        .map(|k| {
+            let coeffs: Vec<FE> = (0..shape::TRACE_LEN)
+                .map(|j| FE::from(1_000 * (k as u64 + 1) + j as u64 + 1))
+                .collect();
+            let mut x = offset;
+            (0..sh.lde_size())
+                .map(|_| {
+                    let v = coeffs.iter().rev().fold(FE::zero(), |acc, c| acc * &x + c);
+                    x = &x * &omega;
+                    v
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn row_word(cols: &[Vec<FE>], i: usize) -> LfmWord {
     core::array::from_fn(|k| cols[k][i])
 }
 
@@ -241,28 +361,49 @@ pub fn fixture_prove_with_hasher(hasher: HasherKind) -> FriToyProof {
     fixture_prove_columns_with_hasher(&fixture_columns(), hasher)
 }
 
+/// [`fixture_prove`] under an explicitly chosen hasher AND size — the scaled
+/// fixture's entry point. The honest witness at that size comes from
+/// [`fixture_columns_with_shape`].
+pub fn fixture_prove_with_shape(hasher: HasherKind, sh: FixtureShape) -> FriToyProof {
+    fixture_prove_columns_with_shape(&fixture_columns_with_shape(sh), hasher, sh)
+}
+
 /// The prover proper, over arbitrary columns (tests tamper these).
 pub fn fixture_prove_columns(cols: &[Vec<FE>; shape::NUM_COLS]) -> FriToyProof {
     fixture_prove_columns_with_hasher(cols, HasherKind::default())
 }
 
 /// [`fixture_prove_columns`] under an explicitly chosen hasher.
-///
-/// Every hash this performs — leaves, tree nodes and the transcript — goes
-/// through `hasher`, so the proof it produces is one the machine can
-/// authenticate when proved under the same choice, and only then.
 pub fn fixture_prove_columns_with_hasher(
     cols: &[Vec<FE>; shape::NUM_COLS],
     hasher: HasherKind,
 ) -> FriToyProof {
-    let omega = GoldilocksField::get_primitive_root_of_unity(shape::LOG_LDE as u64)
-        .expect("32nd root of unity");
+    fixture_prove_columns_with_shape(cols, hasher, FixtureShape::default())
+}
+
+/// The prover proper, at an arbitrary size.
+///
+/// Every hash this performs — leaves, tree nodes and the transcript — goes
+/// through `hasher`, so the proof it produces is one the machine can
+/// authenticate when proved under the same choice, and only then. Every
+/// DIMENSION comes from `sh`, so the openings arena it fills is the one
+/// `programs::fri_toy_program_source_with_shape(sh)` reads; pairing a proof
+/// with a program at another size is a shape mismatch the arena declaration
+/// catches, not a subtle authentication failure.
+pub fn fixture_prove_columns_with_shape(
+    cols: &[Vec<FE>],
+    hasher: HasherKind,
+    sh: FixtureShape,
+) -> FriToyProof {
+    let omega = GoldilocksField::get_primitive_root_of_unity(sh.log_lde as u64)
+        .expect("the LDE domain's root of unity");
     let offset = FE::from(shape::COSET_OFFSET);
-    let half = shape::LDE_SIZE / 2; // 16
+    let half = sh.lde_size() / 2;
+    let quarter = half / 2;
 
     // Main tree: row-pair leaves. A leaf is DATA, so it hashes in the leaf
     // domain — two LFML rows and an LFMC parent, mirroring the emitter.
-    let leaves: Vec<LfmWord> = (0..shape::LDE_SIZE / 2)
+    let leaves: Vec<LfmWord> = (0..half)
         .map(|l| host_leaf_hash_pair(hasher, &row_word(cols, 2 * l), &row_word(cols, 2 * l + 1)))
         .collect();
     let main_tree = HostTree::build(hasher, leaves);
@@ -273,7 +414,7 @@ pub fn fixture_prove_columns_with_hasher(
     let zeta0 = sponge.squeeze_ext();
 
     // g0 = α-combination of the columns, over the full LDE domain.
-    let g0: Vec<FEE> = (0..shape::LDE_SIZE)
+    let g0: Vec<FEE> = (0..sh.lde_size())
         .map(|i| {
             let row = row_word(cols, i);
             row.iter().rev().fold(FEE::zero(), |acc, v| {
@@ -282,20 +423,20 @@ pub fn fixture_prove_columns_with_hasher(
         })
         .collect();
 
-    // Fold 0 (unnormalized): g1[j] = (g0[j]+g0[j+16]) + x_j⁻¹·ζ0·(g0[j]−g0[j+16]).
+    // Fold 0 (unnormalized): g1[j] = (g0[j]+g0[j+half]) + x_j⁻¹·ζ0·(g0[j]−g0[j+half]).
+    let mut x = offset;
     let g1: Vec<FEE> = (0..half)
         .map(|j| {
-            let x = &offset * omega.pow(j as u64);
             let inv_x = x.inv().expect("nonzero domain point");
+            x = &x * &omega;
             let (lo, hi) = (&g0[j], &g0[j + half]);
             (lo + hi) + (&zeta0 * (lo - hi)) * FEE::new([inv_x, FE::zero(), FE::zero()])
         })
         .collect();
 
-    // L1 tree co-locates fold partners: leaf j covers g1[j] and g1[j+8]. These
-    // are folded EXTENSION elements — arbitrary field data — so they are leaves
-    // in exactly the same sense the trace rows are.
-    let quarter = half / 2; // 8
+    // L1 tree co-locates fold partners: leaf j covers g1[j] and g1[j+quarter].
+    // These are folded EXTENSION elements — arbitrary field data — so they are
+    // leaves in exactly the same sense the trace rows are.
     let l1_leaves: Vec<LfmWord> = (0..quarter)
         .map(|j| host_leaf_hash_pair(hasher, &ext_word(&g1[j]), &ext_word(&g1[j + quarter])))
         .collect();
@@ -304,11 +445,13 @@ pub fn fixture_prove_columns_with_hasher(
     sponge.absorb(&l1_tree.root());
     let zeta1 = sponge.squeeze_ext();
 
-    // Fold 1 over the size-16 domain c²·⟨ω²⟩: y_j = c²ω^{2j}.
+    // Fold 1 over the half-size domain c²·⟨ω²⟩: y_j = c²ω^{2j}.
+    let omega2 = omega.square();
+    let mut y = offset.square();
     let g2: Vec<FEE> = (0..quarter)
         .map(|j| {
-            let y = offset.square() * omega.pow(2 * j as u64);
             let inv_y = y.inv().expect("nonzero domain point");
+            y = &y * &omega2;
             let (lo, hi) = (&g1[j], &g1[j + quarter]);
             (lo + hi) + (&zeta1 * (lo - hi)) * FEE::new([inv_y, FE::zero(), FE::zero()])
         })
@@ -332,11 +475,11 @@ pub fn fixture_prove_columns_with_hasher(
     sponge.absorb_felts(&ext_word(&t1));
 
     // Queries.
-    let mut openings = Vec::new();
-    for _ in 0..shape::NUM_QUERIES {
-        let q0 = sponge.squeeze_index(shape::QUERY_BITS) as usize; // [0, 16)
+    let mut openings = Vec::with_capacity(sh.num_queries * sh.words_per_query());
+    for _ in 0..sh.num_queries {
+        let q0 = sponge.squeeze_index(sh.query_bits()) as usize; // [0, LDE/2)
         let leaf_a = q0 >> 1;
-        let leaf_b = leaf_a + shape::LDE_SIZE / 4; // + 8
+        let leaf_b = leaf_a + quarter;
 
         // Main leaf A: its two rows + path.
         openings.push(row_word(cols, 2 * leaf_a));
@@ -352,7 +495,9 @@ pub fn fixture_prove_columns_with_hasher(
         openings.push(ext_word(&g1[j + quarter]));
         openings.extend(l1_tree.open(j));
     }
-    debug_assert_eq!(openings.len(), shape::NUM_QUERIES * shape::WORDS_PER_QUERY);
+    // The emitter declares an arena of exactly this length, so a drift between
+    // the two shows up here rather than as a hint read off the end of one.
+    assert_eq!(openings.len(), sh.num_queries * sh.words_per_query());
 
     FriToyProof {
         commitments: vec![
@@ -372,8 +517,14 @@ pub fn bump_lane0(w: &LfmWord) -> LfmWord {
 
 /// Re-exported for the emitter: ω and the coset offset as constants.
 pub fn domain_constants() -> (FE, FE) {
-    let omega = GoldilocksField::get_primitive_root_of_unity(shape::LOG_LDE as u64)
-        .expect("32nd root of unity");
+    domain_constants_for(FixtureShape::default())
+}
+
+/// [`domain_constants`] at an arbitrary size — the emitter's only shape-varying
+/// FIELD input, everything else it derives being a count.
+pub fn domain_constants_for(sh: FixtureShape) -> (FE, FE) {
+    let omega = GoldilocksField::get_primitive_root_of_unity(sh.log_lde as u64)
+        .expect("the LDE domain's root of unity");
     (omega, FE::from(shape::COSET_OFFSET))
 }
 
