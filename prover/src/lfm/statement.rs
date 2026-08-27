@@ -52,6 +52,9 @@ const fn commitment_hash_tag(hash: CommitmentHash) -> u8 {
     match hash {
         CommitmentHash::Keccak256 => 0,
         CommitmentHash::Blake3 => 1,
+        CommitmentHash::Rpo256 => 2,
+        CommitmentHash::Rpx256 => 3,
+        CommitmentHash::Poseidon => 4,
     }
 }
 

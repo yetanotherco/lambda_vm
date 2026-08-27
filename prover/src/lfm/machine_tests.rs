@@ -3438,6 +3438,9 @@ pub(super) fn wrap_hash_rows(program: &super::compiler::LfmProgram) -> usize {
     match super::edsl::WrapHash::production() {
         super::edsl::WrapHash::Keccak => program.groups.keccak.real_rows,
         super::edsl::WrapHash::Blake3 => program.groups.blake3.real_rows,
+        // The algebraic wrap hash IS the socket, so its rows are the hash
+        // chip's — the same table `HasherKind` selects the permutation for.
+        super::edsl::WrapHash::Algebraic => program.groups.hash.real_rows,
     }
 }
 
@@ -3451,6 +3454,7 @@ pub(super) fn wrap_hash_instrs(program: &super::compiler::LfmProgram) -> usize {
         .filter(|i| match super::edsl::WrapHash::production() {
             super::edsl::WrapHash::Keccak => matches!(i, Instr::KeccakF(_)),
             super::edsl::WrapHash::Blake3 => matches!(i, Instr::Blake3(_)),
+            super::edsl::WrapHash::Algebraic => matches!(i, Instr::Hash { .. }),
         })
         .count()
 }

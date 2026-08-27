@@ -415,6 +415,20 @@ pub enum WrapHash {
     #[default]
     Keccak,
     Blake3,
+    /// ★ **One variant for the whole ALGEBRAIC family**, and that is the point.
+    ///
+    /// RPO, RPX and Poseidon share this arm because they share everything the
+    /// EMITTER cares about: state 12, rate 8, capacity 4, and a **one-cell
+    /// four-felt digest** against the byte hashes' two-cell 32-byte one. Which
+    /// permutation the emitted socket rows actually prove is `HasherKind`,
+    /// chosen when the AIR set is built — an orthogonal axis. So a fourth
+    /// algebraic candidate needs no emitter work at all.
+    ///
+    /// ⚠ The byte-stream constructions (`hash_bytes`, `hash_bytes_with_rev`)
+    /// have **no meaning here**: what they hash IS felts, serialised only
+    /// because the incumbent hashes are byte-oriented. On this arm the
+    /// serialisation is deleted at the call site rather than reimplemented.
+    Algebraic,
 }
 
 impl WrapHash {
@@ -443,7 +457,44 @@ impl WrapHash {
         match stark::config::COMMITMENT_HASH {
             stark::config::CommitmentHash::Keccak256 => WrapHash::Keccak,
             stark::config::CommitmentHash::Blake3 => WrapHash::Blake3,
+            // ★ Three commitment hashes, ONE emitter arm. The permutation is
+            // `HasherKind`, an orthogonal axis chosen when the AIR set is built.
+            stark::config::CommitmentHash::Rpo256
+            | stark::config::CommitmentHash::Rpx256
+            | stark::config::CommitmentHash::Poseidon => WrapHash::Algebraic,
         }
+    }
+
+    /// ⚠ **The byte-stream constructions have no algebraic meaning, and this is the
+    /// boundary that says so out loud.**
+    ///
+    /// `hash_bytes` and `hash_bytes_with_rev` return [`WrapDigest`] — TWO cells,
+    /// because a byte hash's digest is 32 bytes. An algebraic digest is four felts,
+    /// i.e. ONE cell, so there is no value of the return type that would be
+    /// correct. The "rev" half is worse: it is a BYTE reversal, which is not an
+    /// operation on a field element at all.
+    ///
+    /// So these are not functions with a missing arm; they are the wrong API for
+    /// this hash. The fix is at the CALL SITES — `transcript_replay.rs`,
+    /// `sub_proof.rs`, `batched_epoch_verify.rs` — which serialise felts to a byte
+    /// stream only because the incumbent hashes are byte-oriented. The algebraic
+    /// path deletes that serialisation rather than reimplementing it, and that is
+    /// the remaining piece of B, gated on `WrapDigest` becoming shape-carrying.
+    ///
+    /// Until then this panics at EMIT time rather than returning something wrong.
+    /// That is deliberate and it matches this file's existing idiom
+    /// (`merkle_walk`'s "one sibling per level" assert): an emitter invariant is
+    /// checked when the program is built, where the failure names the cause, rather
+    /// than surfacing later as an unprovable row that names neither the hash nor
+    /// the site. It is not reachable by proof data — only by an emitter that routes
+    /// the algebraic path through the byte API, which is the bug it exists to catch.
+    fn algebraic_byte_hash_unreachable() -> ! {
+        panic!(
+            "WrapHash::Algebraic has no byte-stream hash: an algebraic digest is one \
+         cell of four felts, not two cells of 32 bytes. The algebraic path must \
+         absorb felts directly — see the call sites in transcript_replay.rs, \
+         sub_proof.rs and batched_epoch_verify.rs."
+        )
     }
 
     /// The hash of a byte stream supplied as `u32`-half felts.
@@ -458,6 +509,7 @@ impl WrapHash {
         match self {
             WrapHash::Keccak => keccak256(b, stream, len_bytes),
             WrapHash::Blake3 => blake3_256(b, stream, len_bytes),
+            WrapHash::Algebraic => Self::algebraic_byte_hash_unreachable(),
         }
     }
 
@@ -477,6 +529,7 @@ impl WrapHash {
         match self {
             WrapHash::Keccak => keccak256_with_rev(b, stream, len_bytes),
             WrapHash::Blake3 => blake3_256_with_rev(b, stream, len_bytes),
+            WrapHash::Algebraic => Self::algebraic_byte_hash_unreachable(),
         }
     }
 

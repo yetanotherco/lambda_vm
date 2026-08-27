@@ -559,6 +559,12 @@ pub fn blocks_for(felts: usize, hash: WrapHash) -> usize {
     match hash {
         WrapHash::Keccak => blocks_at_rate(felts, KECCAK_RATE_FELTS),
         WrapHash::Blake3 => felts.div_ceil(BLAKE3_BLOCK_FELTS).max(1),
+        // ✓ PROVEN identical to the BLAKE3 arm for every leaf of one felt or
+        // more (`rpo_chip_tests::the_rate_eight_census_is_hash_invariant`):
+        // the rate is the same eight felts and neither spends a trailing block
+        // on an exact multiple. Written as its own arm rather than merged, so
+        // the equality stays a checked property instead of an assumption.
+        WrapHash::Algebraic => felts.div_ceil(super::rpo::RATE_FELTS).max(1),
     }
 }
 

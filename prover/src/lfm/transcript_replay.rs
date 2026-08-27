@@ -957,6 +957,13 @@ fn candidates_per_coordinate(hash: WrapHash) -> usize {
     let schedule = match hash {
         WrapHash::Keccak => KeccakTranscriptHash::CANDIDATES_PER_COORDINATE,
         WrapHash::Blake3 => Blake3TranscriptHash::CANDIDATES_PER_COORDINATE,
+        // ★ One candidate, GUARANTEED rather than probabilistic: an algebraic
+        // squeeze returns felts canonical by construction, so a carved `u64`
+        // cannot miss. All three algebraic configurations share it, which is
+        // why one arm serves them (`SOUNDNESS.md` §6.4).
+        WrapHash::Algebraic => {
+            super::algebraic_commit::RpoTranscriptHash::CANDIDATES_PER_COORDINATE
+        }
     };
     schedule.map_or(1, core::num::NonZeroUsize::get)
 }
