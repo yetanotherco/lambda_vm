@@ -5,8 +5,8 @@
 //! Private input layout: `[u32 LE count]` then `count` records of
 //! `sig(64) || recid(1) || msg(32)`. The recovered addresses are XOR-folded and
 //! committed. Hint consumption is positional: per recovery the guest requests
-//! sqrt (decompress), the batched field inverse (lincomb), and the scalar
-//! inverse, in that order — the host's arena must follow the same order.
+//! sqrt (decompress), the scalar inverse, and the batched field inverse
+//! (lincomb), in that order — the host's arena must follow the same order.
 
 use ethrex_crypto::Crypto;
 use lambda_vm_ethrex_crypto::LambdaVmEcsmCrypto;
