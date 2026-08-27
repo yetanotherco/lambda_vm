@@ -31,6 +31,51 @@
 //! an invocation count that was 42% low. Neither is a linearity question; a
 //! linear model with a wrong coefficient is still linear. This tests the SHAPE
 //! of the model, not its inputs.
+//!
+//! ## ★ What it measured (2026-08-27, M-series laptop, 11 rayon threads)
+//!
+//! 140 samples, ABBA-ordered, one arm per process; 23 distinct (hasher, shape)
+//! points at blowup 2 spanning **17.4M to 254.8M committed cells** and hash
+//! shares from 7.5% to 92.1%. Peak RSS reproduced to 0.2-2.9% per point; wall
+//! clock to 1.3-11.6%, so RSS is by far the steadier instrument here.
+//!
+//! **Peak RSS is AFFINE in committed cells, and the line barely moves with the
+//! hasher.** Per-hasher fits at blowup 2:
+//!
+//! ```text
+//!   BLAKE3    1.308 GiB + 44.27 bytes/cell   R² 0.99984   (7 points)
+//!   RPO       1.323 GiB + 42.96 bytes/cell   R² 0.99898   (6)
+//!   RPX       1.241 GiB + 47.02 bytes/cell   R² 0.99269   (5)
+//!   Poseidon  1.358 GiB + 40.51 bytes/cell   R² 0.99850   (5)
+//! ```
+//!
+//! Four permutations whose `LFM_HASH` tables differ by 11x in width and 8x in
+//! height agree on the slope to ±7.5% and on the intercept to ±4.5%. A fit
+//! trained only on points up to 82M cells predicts the 254.8M-cell point — 3.1x
+//! beyond its training range — to **−0.19%**. Committed cells is the sufficient
+//! statistic; the hash table's aspect ratio is not.
+//!
+//! ⚠ **AFFINE, not PROPORTIONAL, and the difference is the whole point.** The
+//! intercept is real: 1.24-1.36 GiB, hasher-independent, against a process
+//! baseline of 0.02 GiB. So at this scale a through-the-origin cells model
+//! over-credits a hash swap badly. Swapping BLAKE3 for RPO on the SAME program
+//! cut cells 3.13x but peak RSS only 1.94x at 256 queries, and 5.20x versus
+//! 3.57x at 1024 — the realised saving approaches the promised one only as the
+//! fixed term stops mattering.
+//!
+//! ⚠ **The COEFFICIENT does not transfer between instruments, only the form.**
+//! 43.9 bytes/cell applied to the aggregator's 12.2B cells predicts ~500 GiB,
+//! where the aggregator measured 336.8. Anyone carrying a bytes/cell figure from
+//! one program to another is wrong by about 1.5x; scaling a program's own
+//! measured point by its own cell ratio is what the linearity result licenses.
+//!
+//! Blowup is a second axis and not a free one: at IDENTICAL committed cells,
+//! moving blowup 2 → 4 cost +73% peak RSS under RPO and +62% under BLAKE3
+//! (slope 43-47 → 59-71 bytes/cell, intercept 1.24-1.36 → 2.27-2.70 GiB).
+//! Committed cells do not move with the blowup; the LDE holding them does.
+//!
+//! Wall clock is cells-affine too but a worse instrument: 39.7 ns/cell for
+//! BLAKE3 against 47.9 for Poseidon, a 21% hasher spread where RSS showed 7.5%.
 
 use std::time::Instant;
 
