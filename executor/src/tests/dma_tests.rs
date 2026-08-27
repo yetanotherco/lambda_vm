@@ -1,6 +1,7 @@
 use crate::vm::instruction::decoding::Instruction;
 use crate::vm::instruction::execution::{
-    DMA_MEMCPY_MAX_BYTES, DMA_MEMCPY_SYSCALL_NUMBER, ExecutionError,
+    DMA_MEMCPY_MAX_BYTES, DMA_MEMCPY_SYSCALL_NUMBER, ExecutionError, dma_memcpy_data_rows,
+    dma_memcpy_trace_rows,
 };
 use crate::vm::memory::Memory;
 use crate::vm::registers::Registers;
@@ -68,6 +69,28 @@ fn dma_memcpy_rejects_oversized_direct_ecall() {
         Err(ExecutionError::DmaMemcpyChunkTooLarge(n))
             if n == DMA_MEMCPY_MAX_BYTES + 1
     ));
+}
+
+/// The row helpers are what the trace builder sizes the DMA trace with and what
+/// the CLI reports as the accelerator's cost, so pin them to the chunking rule
+/// the trace builder actually walks rather than to the closed form itself.
+#[test]
+fn dma_row_helpers_match_the_chunk_loop() {
+    for count in 0..=DMA_MEMCPY_MAX_BYTES {
+        let mut chunks = 0u64;
+        let mut remaining = count;
+        while remaining != 0 {
+            remaining -= if remaining >= 8 { 8 } else { 1 };
+            chunks += 1;
+        }
+
+        assert_eq!(dma_memcpy_data_rows(count), chunks, "count {count}");
+        assert_eq!(
+            dma_memcpy_trace_rows(count),
+            chunks + 1,
+            "count {count}: the terminal row is always emitted"
+        );
+    }
 }
 
 proptest! {

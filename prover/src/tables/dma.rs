@@ -1,6 +1,6 @@
 //! DMA memcpy table — proves a `memcpy(dst, src, n)` off the CPU execution trace.
 //!
-//! The guest's strong `memcpy` symbol (see `syscalls/src/syscalls.rs`)
+//! The guest's strong `memcpy` symbol (see `syscalls/src/entrypoint.rs`)
 //! dispatches bulk copies to the DMA ecall (`DMA_MEMCPY_SYSCALL_NUMBER`); this table
 //! proves the copy so the per-byte load/store loop leaves the CPU trace.
 //!
