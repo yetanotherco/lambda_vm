@@ -228,8 +228,71 @@ a design constraint to carry into that rebuild rather than a separate migration.
 costs nothing extra and removes this restriction for every future machine; retrofitting it onto the
 current transcript would be a second proof-breaking change for no other benefit.
 
+### 6.4 The algebraic transcript: the rebuild §6.3 anticipated, and it removes that restriction
+
+§6.3's closing note said the ecosystem hash migration would have to rebuild the transcript as a
+field-native sponge, and that constant-consumption sampling was a design constraint to carry into
+that rebuild rather than a separate migration. That rebuild is
+`lfm::algebraic_transcript::AlgebraicTranscript`, and the constraint was carried.
+
+For an algebraic configuration, `CANDIDATES_PER_COORDINATE = Some(1)` — **and it is guaranteed
+rather than probabilistic.** A squeeze returns four felts that are canonical *by construction*
+(they are field elements, not bytes reinterpreted), so the `u64`s carved out of their 32 canonical
+bytes are always in range. There is no rejection to schedule around: not "rejects with probability
+2^−32", but *cannot reject*.
+
+This is strictly stronger than the BLAKE3 configuration, which needs two candidates because its
+digest bytes are arbitrary and a single miss has nowhere to go (`transcript_hash.rs`), and it is
+stronger than keccak's `None`, which is the data-dependent loop §6.3 exists to talk about.
+
+**So §6.3's completeness restriction does not apply to an algebraic configuration.** The emitted
+program's no-rejection schedule is not a subset of the real relation there — it *is* the real
+relation, because the production sampler cannot take the other branch. The `q ≈ 2^−32` per-candidate
+bound and the `2^draws` program-explosion argument are both about the byte configurations and
+should not be quoted against an algebraic one.
+
+`algebraic_transcript::tests::the_host_transcript_and_the_machine_replay_derive_the_same_challenges`
+is the differential that pins host and machine to the same challenge stream, under every tenant.
+`sampling_is_constant_consumption` pins the one-cell-per-draw property directly.
+
+### 6.5 Grinding reuses the LEAF domain — a recorded weakening, and why it does not bite
+
+**What the socket separates.** `LFM_HASH` pins a per-mode capacity for `MODE_C` (Merkle parent),
+`MODE_T` (transcript step) and `MODE_L` (leaf), so those three are different functions and a row
+cannot claim a domain it does not carry (`chips::hash::emit_socket_prefix`; the AIR rejects a row
+carrying another mode's capacity).
+
+**What grinding does.** An algebraic configuration's `StarkHash::Transcript` — the hash the
+proof-of-work runs on — reuses the **leaf** construction and the leaf domain
+(`algebraic_commit::AlgebraicDigest`), rather than taking a fourth domain of its own.
+
+**Why the machine cannot do otherwise, which is the actual reason.** The per-mode capacities are
+pinned by the *preprocessed* mode selectors, so the only capacities an emitted program can produce
+are the three the chip pins (plus whatever a `MODE_P` row carries as program data). A
+grinding-specific domain would need a new mode, i.e. a change to the frozen `LFM_HASH` tuple
+contract. Grinding hashes a byte string — `state ‖ nonce`, 40 bytes, five felts — which *is* data,
+exactly what a leaf is, so the leaf construction is both the natural reading and the only one the
+verifier can emit with an existing mode. This is a constraint, not a preference.
+
+**Why the reuse is not exploitable.** Domain separation matters where a verifier ACCEPTS a digest
+the prover supplies, because there the prover chooses which domain's output to present. Grinding
+is not that: **the verifier RECOMPUTES the grinding digest itself, over a preimage the protocol
+fixes** — the transcript state at that point, concatenated with the nonce — and then tests its
+leading zeros. The prover supplies only the nonce, and every other input is already bound. There
+is therefore **no substitution surface**: a leaf digest cannot be presented in place of a grinding
+digest, whatever it might collide with, because no digest is presented at all.
+
+⚠ Recorded as a weakening nonetheless, because it *is* one relative to the socket's design intent
+— three domains carry four uses — and because the argument above depends on grinding staying a
+recompute-and-compare check. **If a future change ever has a verifier accept a grinding digest
+rather than recompute it, this subsection is the one that has to be revisited**, and at that point
+the fix is a fourth mode rather than a fourth constant.
+
 ## 7. Reviewer checklist (reject if any fails)
 
+0. For an algebraic configuration: is grinding still a RECOMPUTE-and-compare check (§6.5)? If a
+   verifier ever accepts a prover-supplied grinding digest, the leaf-domain reuse stops being
+   safe and needs a fourth socket mode.
 1. Is the validator actually on the only path into `LFM_REGISTRY`, in release builds, with no
    env-var or feature bypass?
 2. Do the drift tests pin the registry on every PR (not merge-queue-only)?

@@ -179,6 +179,36 @@ impl AlgebraicTranscript {
         out
     }
 
+    /// ★ **THE `append_bytes` RULE, stated once.** The cells that call absorbs,
+    /// in order: the length, then the payload in 32-byte groups.
+    ///
+    /// ⚠ **Exported so the MACHINE side derives from it rather than restating
+    /// it.** Every constant an emitter needs for a byte absorb comes from here.
+    /// This is the third time this lane has written a host↔machine encoding,
+    /// and twice the differential caught a machine side that had hand-written a
+    /// constant which agreed with the rule until the rule moved. A restated
+    /// convention is a convention with two definitions, and the second one is
+    /// always the one that rots.
+    pub fn append_bytes_cells(bytes: &[u8]) -> Vec<LfmWord> {
+        let mut cells = Vec::with_capacity(1 + bytes.len().div_ceil(BYTES_PER_CELL));
+        cells.push([
+            FE::from(bytes.len() as u64),
+            FE::zero(),
+            FE::zero(),
+            FE::zero(),
+        ]);
+        cells.extend(bytes.chunks(BYTES_PER_CELL).map(Self::bytes_to_cell));
+        cells
+    }
+
+    /// ★ **THE `append_field_element` RULE, stated once** — an Fp3 element as
+    /// one DATA cell. Exported for the same reason as
+    /// [`Self::append_bytes_cells`].
+    pub fn field_element_cell(element: &FEE) -> LfmWord {
+        let v = element.value();
+        [v[0], v[1], v[2], FE::zero()]
+    }
+
     /// Read 32 bytes as four canonical BIG-endian felts. The inverse of
     /// [`Self::cell_to_bytes`].
     ///
@@ -223,21 +253,13 @@ impl AlgebraicTranscript {
 impl IsTranscript<GoldilocksExtension> for AlgebraicTranscript {
     /// An Fp3 element as one DATA cell `[x0, x1, x2, 0]`.
     fn append_field_element(&mut self, element: &FEE) {
-        let v = element.value();
-        self.absorb_felts(&[v[0], v[1], v[2], FE::zero()]);
+        self.absorb_felts(&Self::field_element_cell(element));
     }
 
     /// The length prefix, then the payload in 32-byte cells. See the module
     /// header for why the prefix is the injectivity argument.
     fn append_bytes(&mut self, new_bytes: &[u8]) {
-        self.absorb_cell(&[
-            FE::from(new_bytes.len() as u64),
-            FE::zero(),
-            FE::zero(),
-            FE::zero(),
-        ]);
-        for chunk in new_bytes.chunks(BYTES_PER_CELL) {
-            let cell = Self::bytes_to_cell(chunk);
+        for cell in Self::append_bytes_cells(new_bytes) {
             self.absorb_cell(&cell);
         }
     }
@@ -336,25 +358,27 @@ mod tests {
 
         let mut sponge = SpongeVar::new(&mut b);
 
-        // append_bytes(ROOT): length cell, then one payload cell.
-        let len32 = b.digest_const([FE::from(32u64), FE::zero(), FE::zero(), FE::zero()]);
+        // append_bytes(ROOT) — every cell DERIVED from the rule. The payload
+        // arrives as an arena word so the program reads real data; the length
+        // cell is a program constant, and which constant is the rule's to say.
+        let root_cells = AlgebraicTranscript::append_bytes_cells(&ROOT);
+        let len32 = b.digest_const(root_cells[0]);
         sponge.absorb(&mut b, len32.as_cell());
         sponge.absorb(&mut b, root);
         let a = sponge.squeeze_ext(&mut b);
 
         // append_bytes(SMALL.to_le_bytes()): length cell, then the value cell.
-        let len8 = b.digest_const([FE::from(8u64), FE::zero(), FE::zero(), FE::zero()]);
+        let small_cells = AlgebraicTranscript::append_bytes_cells(&SMALL.to_le_bytes());
+        let len8 = b.digest_const(small_cells[0]);
         sponge.absorb(&mut b, len8.as_cell());
-        // ⚠ The payload cell is derived from the CONVENTION, not written by
-        // hand as `FE::from(SMALL)`. The STARK core hands `append_bytes`
-        // LITTLE-endian integers (`(idx as u64).to_le_bytes()`), and the one
-        // felt↔byte rule reads BIG-endian, so the felt is the byte-SWAP of the
-        // integer. That is harmless — these call sites are compile-time
-        // constants, so an emitter materialises whatever felt the rule
-        // produces and no runtime swap exists — but it is exactly the kind of
-        // mismatch that must be derived rather than assumed. Writing
-        // `FE::from(SMALL)` here is what this gate caught.
-        let small = b.digest_const(AlgebraicTranscript::bytes_to_cell(&SMALL.to_le_bytes()));
+        // append_bytes(SMALL.to_le_bytes()) — again every cell from the rule.
+        // ⚠ The payload felt is the byte-SWAP of the integer, because the STARK
+        // hands `append_bytes` LITTLE-endian integers and the one felt↔byte rule
+        // reads BIG-endian. Harmless — these are compile-time constants, so an
+        // emitter materialises whatever the rule produces and no runtime swap
+        // exists — but a machine side that hand-wrote `FE::from(SMALL)` is what
+        // this gate caught, which is why nothing here is hand-written.
+        let small = b.digest_const(small_cells[1]);
         sponge.absorb(&mut b, small.as_cell());
         let bb = sponge.squeeze_ext(&mut b);
 
@@ -370,10 +394,12 @@ mod tests {
     }
 
     fn replay_arena() -> Vec<Vec<LfmWord>> {
-        let root_cell = AlgebraicTranscript::bytes_to_cell(&ROOT);
-        let v = field_element();
-        let c = v.value();
-        vec![vec![root_cell, [c[0], c[1], c[2], FE::zero()]]]
+        // Both arena words DERIVED from the rule, not restated.
+        let root_cell = AlgebraicTranscript::append_bytes_cells(&ROOT)[1];
+        vec![vec![
+            root_cell,
+            AlgebraicTranscript::field_element_cell(&field_element()),
+        ]]
     }
 
     /// ★★ **THE A2 GATE.** The host transcript and the in-VM replay must derive

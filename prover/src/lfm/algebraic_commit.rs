@@ -56,11 +56,13 @@
 //! invent.
 
 use core::marker::PhantomData;
+use core::num::NonZeroUsize;
 
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsPrimeField};
 use math::traits::{AsBytes, ByteConversion};
 
+use crypto::fiat_shamir::transcript_hash::TranscriptHash;
 use crypto::merkle_tree::traits::{IsLeafHasher, IsMerkleTreeBackend, IsStreamingLeafBackend};
 use stark::config::Commitment;
 
@@ -130,16 +132,44 @@ pub fn commitment_to_digest(c: &Commitment) -> LfmWord {
 /// Capacity lane 0 is the padding flag `len mod 8`, lane 1 the LEAF domain.
 /// Each block OVERWRITES the eight rate lanes (spec §2.6), so absorption costs
 /// no field arithmetic outside the permutation; the tail block is zero-padded.
+/// ★ **THE LEAF CAPACITY RULE, stated once.** Lane 0 is the padding flag
+/// `len mod 8` — zero when the length divides the rate, which is why no
+/// trailing block is spent on an exact multiple — and lane 1 the LEAF domain.
+///
+/// ⚠ Exported so the MACHINE side derives it rather than restating it. Under
+/// `MODE_P` the capacity is program data, so an emitter must supply exactly
+/// this word; a second definition of it is a root nobody can reproduce.
+pub fn leaf_capacity(num_felts: usize) -> LfmWord {
+    let iv = domain_iv(DOMAIN_LEAF);
+    let mut cap: LfmWord = core::array::from_fn(|k| FE::from(iv[k]));
+    cap[0] = FE::from((num_felts % RATE_FELTS) as u64);
+    cap
+}
+
+/// ★ **The three `MODE_P` input cells for a SINGLE-BLOCK leaf sponge** — the
+/// rule, exported for the same reason [`leaf_capacity`] is.
+///
+/// Two rate cells carrying up to eight felts zero-padded, then the capacity.
+/// This is the shape grinding takes (`state ‖ nonce` is 40 bytes, five felts,
+/// one block), and the shape the duplex emitter's first block takes.
+pub fn single_block_leaf_cells(felts: &[FE]) -> [LfmWord; 3] {
+    debug_assert!(
+        felts.len() <= RATE_FELTS,
+        "a single block carries at most the rate ({RATE_FELTS} felts), got {}",
+        felts.len()
+    );
+    let lane = |i: usize| felts.get(i).copied().unwrap_or_else(FE::zero);
+    [
+        [lane(0), lane(1), lane(2), lane(3)],
+        [lane(4), lane(5), lane(6), lane(7)],
+        leaf_capacity(felts.len()),
+    ]
+}
+
 pub fn sponge_leaf(kind: HasherKind, felts: &[FE]) -> LfmWord {
     let mut state = [FE::zero(); HASH_STATE_FELTS];
-    let iv = domain_iv(DOMAIN_LEAF);
-    for (k, v) in iv.iter().enumerate() {
-        state[RATE_FELTS + k] = FE::from(*v);
-    }
-    // Capacity lane 0: how many felts the final block carries, zero when the
-    // length divides the rate — miden's rule, and the reason no trailing block
-    // is spent on an exact multiple.
-    state[RATE_FELTS] = FE::from((felts.len() % RATE_FELTS) as u64);
+    let cap = leaf_capacity(felts.len());
+    state[RATE_FELTS..].copy_from_slice(&cap);
 
     if felts.is_empty() {
         return [state[0], state[1], state[2], state[3]];
@@ -309,6 +339,152 @@ where
         digest_to_commitment(&sponge_leaf(H::KIND, &self.felts))
     }
 }
+
+// =========================================================================
+// The GRINDING hash — `StarkHash::Transcript`
+// =========================================================================
+
+/// A `digest::Digest` over an algebraic permutation, for the ONE thing a
+/// configuration's `Transcript` associated type still decides: **grinding**.
+///
+/// # Why this exists at all
+///
+/// The CHALLENGE stream does not flow through here.
+/// [`super::algebraic_transcript::AlgebraicTranscript`] carries that, because
+/// `prove`/`verify` take the transcript as a parameter. What
+/// `StarkHash::Transcript` forces is what the prover and verifier derive
+/// *internally from the configuration* — grinding, whose seed is
+/// `transcript.state()` and whose proof-of-work is `H(seed ‖ nonce)`.
+///
+/// ⚠ **And grinding is verified IN-VM** (`transcript_replay.rs` carries it; the
+/// verifier absorbs `nonce_value.to_be_bytes()`). So whatever hash grinds, the
+/// machine must be able to compute it. Leaving BLAKE3 here would keep the
+/// 3,056-column slot-11 chip in an algebraic branch's AIR set — which would
+/// make the four-branch comparison measure something other than the hash it
+/// names. That is why this type exists rather than a `Blake3TranscriptHash`
+/// alias.
+///
+/// # The construction is the LEAF one, deliberately
+///
+/// Grinding hashes a byte string — `state ‖ nonce`, 40 bytes, five felts — which
+/// is DATA, exactly what a leaf is. It therefore reuses [`sponge_leaf`] and the
+/// LEAF domain rather than inventing a fourth one.
+///
+/// ⚖ That is not only simplicity. The socket pins per-mode capacities for
+/// `MODE_C`/`MODE_T`/`MODE_L`, so **a grinding-specific domain is not something
+/// the in-VM verifier could emit with an existing mode.** Using the leaf
+/// construction is what keeps the machine side expressible. The domain reuse is
+/// not exploitable: the grinding check tests leading zeros of a hash whose
+/// preimage is transcript-bound, so colliding it with some leaf digest buys an
+/// adversary nothing.
+///
+/// # Buffering, for the third time and the same reason
+///
+/// `sponge_leaf`'s padding flag is `len mod 8`, needed in the capacity before
+/// the first permutation, so this accumulates bytes and sponges at finalize —
+/// the same resolution A1 and the transcript reached.
+pub struct AlgebraicDigest<H> {
+    buf: Vec<u8>,
+    _marker: PhantomData<fn() -> H>,
+}
+
+impl<H> Default for AlgebraicDigest<H> {
+    fn default() -> Self {
+        Self {
+            buf: Vec::new(),
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<H> Clone for AlgebraicDigest<H> {
+    fn clone(&self) -> Self {
+        Self {
+            buf: self.buf.clone(),
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<H: AlgebraicHasher> AlgebraicDigest<H> {
+    /// The digest of everything absorbed so far — the leaf construction over
+    /// the buffered bytes.
+    pub fn finalize_digest(&self) -> Commitment {
+        digest_to_commitment(&sponge_leaf(H::KIND, &felts_from_bytes(&self.buf)))
+    }
+}
+
+impl<H> digest::HashMarker for AlgebraicDigest<H> {}
+
+impl<H> digest::OutputSizeUser for AlgebraicDigest<H> {
+    type OutputSize = digest::typenum::U32;
+}
+
+impl<H: AlgebraicHasher> digest::Update for AlgebraicDigest<H> {
+    fn update(&mut self, data: &[u8]) {
+        self.buf.extend_from_slice(data);
+    }
+}
+
+impl<H: AlgebraicHasher> digest::FixedOutput for AlgebraicDigest<H> {
+    fn finalize_into(self, out: &mut digest::Output<Self>) {
+        out.copy_from_slice(&self.finalize_digest());
+    }
+}
+
+impl<H: AlgebraicHasher> digest::Reset for AlgebraicDigest<H> {
+    fn reset(&mut self) {
+        self.buf.clear();
+    }
+}
+
+impl<H: AlgebraicHasher> digest::FixedOutputReset for AlgebraicDigest<H> {
+    fn finalize_into_reset(&mut self, out: &mut digest::Output<Self>) {
+        out.copy_from_slice(&self.finalize_digest());
+        self.buf.clear();
+    }
+}
+
+/// The Fiat–Shamir configuration for an algebraic hash.
+///
+/// `CANDIDATES_PER_COORDINATE` is **`Some(1)`, and guaranteed rather than
+/// probabilistic** — the strongest schedule any configuration here has.
+/// A squeeze yields four felts that are canonical BY CONSTRUCTION, so the
+/// `u64`s carved out of their 32 canonical bytes are *always* in the field's
+/// range. BLAKE3 needs two candidates because its bytes are arbitrary and a
+/// single miss has nowhere to go; an algebraic squeeze cannot miss.
+macro_rules! algebraic_transcript_hash {
+    ($name:ident, $tag:ty, $label:literal, $doc:literal) => {
+        #[doc = $doc]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub struct $name;
+
+        impl TranscriptHash for $name {
+            type Digest = AlgebraicDigest<$tag>;
+            const CANDIDATES_PER_COORDINATE: Option<NonZeroUsize> = NonZeroUsize::new(1);
+            const NAME: &'static str = $label;
+        }
+    };
+}
+
+algebraic_transcript_hash!(
+    RpoTranscriptHash,
+    RpoCommit,
+    "rpo256",
+    "The RPO256 Fiat–Shamir configuration."
+);
+algebraic_transcript_hash!(
+    RpxTranscriptHash,
+    RpxCommit,
+    "rpx256",
+    "The RPX256 (XHash12) Fiat–Shamir configuration."
+);
+algebraic_transcript_hash!(
+    PoseidonTranscriptHash,
+    PoseidonCommit,
+    "poseidon-goldilocks",
+    "⚠ The Poseidon Fiat–Shamir configuration — UNSHIPPABLE, reference only."
+);
 
 #[cfg(test)]
 mod tests {
@@ -483,6 +659,119 @@ mod tests {
         assert_ne!(rpo, rpx);
         assert_ne!(rpo, pos);
         assert_ne!(rpx, pos);
+    }
+
+    /// ★★ **THE GRINDING GATE** — the host grinding digest and the in-VM
+    /// computation of it must agree, for every tenant.
+    ///
+    /// ⚠ Grinding is verified INSIDE the machine (`transcript_replay.rs`), so
+    /// this is not a host-only concern: if the two sides disagree, a proof-of-
+    /// work the prover found is one the verifier cannot confirm, and that fails
+    /// as an unprovable program rather than as a wrong answer.
+    ///
+    /// The preimage is `state ‖ nonce` — 32 + 8 bytes, five felts, **one rate
+    /// block** — so the machine side is a single `MODE_P` row. Every cell it
+    /// feeds is DERIVED from the exported rules ([`single_block_leaf_cells`]),
+    /// never restated: this lane has now written a host↔machine encoding three
+    /// times and twice a differential caught a machine side that had
+    /// hand-written a constant agreeing with the rule only until the rule moved.
+    #[test]
+    fn the_host_grinding_digest_and_the_machine_agree() {
+        use crate::lfm::builder::LfmBuilder;
+        use crate::lfm::compiler::compile;
+        use crate::lfm::proof::{lfm_prove_with_hasher, verify_against};
+        use crate::lfm::registry::build_artifacts_with_hasher;
+        use stark::proof::options::GoldilocksCubicProofOptions;
+
+        const SEED: [u8; 32] = [
+            0x9e, 0x37, 0x79, 0xb9, 0x7f, 0x4a, 0x7c, 0x00, 0xd1, 0xb5, 0x4a, 0x32, 0xd1, 0x92,
+            0xed, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x00, 0x11, 0x22, 0x33, 0x44,
+            0x55, 0x66, 0x77, 0x00,
+        ];
+        const NONCE: u64 = 0x0123_4567_89AB_CD00;
+
+        fn check<H: AlgebraicHasher>(name: &str) {
+            let opts = GoldilocksCubicProofOptions::with_blowup(2).expect("options");
+
+            // HOST: the grinding digest through the public `digest` interface.
+            let mut d = AlgebraicDigest::<H>::default();
+            digest::Digest::update(&mut d, SEED);
+            digest::Digest::update(&mut d, NONCE.to_be_bytes());
+            let want = d.finalize_digest();
+            // ⚠ The trait path must agree with the inherent one, or grinding —
+            // which reaches this through `digest::Digest` — computes something
+            // this test never checked.
+            let via_trait: Commitment = digest::Digest::finalize(d.clone()).into();
+            assert_eq!(
+                via_trait, want,
+                "{name}: Digest::finalize must be finalize_digest"
+            );
+
+            // The preimage's felts, and the MODE_P cells, both from the rules.
+            let mut preimage = SEED.to_vec();
+            preimage.extend_from_slice(&NONCE.to_be_bytes());
+            let felts = felts_from_bytes(&preimage);
+            assert_eq!(felts.len(), 5, "state ‖ nonce is five felts, one block");
+            let cells = single_block_leaf_cells(&felts);
+
+            // MACHINE: one permutation row, publishing the digest cell.
+            let mut b = LfmBuilder::new();
+            let arena = b.declare_arena(2);
+            let rate0 = b.hint_word(arena, 0);
+            let rate1 = b.hint_word(arena, 1);
+            let cap = b.digest_const(cells[2]);
+            let out = b.permute([rate0, rate1, cap.as_cell()]);
+            b.public(out[0]);
+            let program = compile(b.finish());
+
+            let artifacts = build_artifacts_with_hasher(&program, &opts, H::KIND);
+            let proved = lfm_prove_with_hasher(
+                &program,
+                &artifacts,
+                &[vec![cells[0], cells[1]]],
+                &opts,
+                H::KIND,
+            )
+            .expect("the grinding row must prove");
+
+            assert_eq!(
+                digest_to_commitment(&proved.public_words[0].1),
+                want,
+                "{name}: the machine's grinding digest must be the host's"
+            );
+            assert!(
+                verify_against(
+                    &artifacts.roots,
+                    &artifacts.program_id,
+                    artifacts.keccak_rnd_chunks,
+                    &proved.proof,
+                    &proved.public_words,
+                    &opts,
+                    artifacts.hasher,
+                    artifacts.chip_set,
+                ),
+                "{name}: the grinding proof must verify"
+            );
+        }
+        for_each_tenant!(check);
+    }
+
+    /// The `digest` interface must agree with the direct construction — i.e.
+    /// `update`-then-finalize is the leaf sponge over the concatenation, so a
+    /// caller that splits its updates gets the same grinding digest.
+    #[test]
+    fn the_grinding_digest_is_split_invariant() {
+        fn check<H: AlgebraicHasher>(name: &str) {
+            let msg: Vec<u8> = (0..40u8).collect();
+            let want = digest_to_commitment(&sponge_leaf(H::KIND, &felts_from_bytes(&msg)));
+            for cut in [0usize, 1, 8, 17, 32, 40] {
+                let mut d = AlgebraicDigest::<H>::default();
+                digest::Digest::update(&mut d, &msg[..cut]);
+                digest::Digest::update(&mut d, &msg[cut..]);
+                assert_eq!(d.finalize_digest(), want, "{name}: split at {cut}");
+            }
+        }
+        for_each_tenant!(check);
     }
 
     /// The leaf is DOMAIN-SEPARATED from a parent: hashing the eight felts of
