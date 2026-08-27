@@ -547,10 +547,18 @@ impl Instruction {
                         }
                         let xg = load_u256_le(memory, addr_xg)?;
                         let k = load_u256_le(memory, addr_k)?;
-                        let (xr, yr, yg) = ecsm::scalar_mul_full(&k, &xg)?;
-                        store_u256_le(memory, addr_xr, &xr)?;
-                        store_u256_le(memory, addr_xr + 32, &yr)?;
-                        store_u256_le(memory, addr_xr + 64, &yg)?;
+                        let out = ecsm::scalar_mul_full(&k, &xg)?;
+                        // `checked_add` rather than `+`, as the keccak lane pointers above do:
+                        // the bound at the top of this arm already forces `addr_xr + 95` to fit,
+                        // but that leaves the argument twenty lines from its use. If the bound is
+                        // ever relaxed or reordered, a wrap here would land the write on an
+                        // unrelated region in release builds instead of erroring.
+                        for (off, value) in [(0u64, &out.x_r), (32, &out.y_r), (64, &out.y_g)] {
+                            let addr = addr_xr
+                                .checked_add(off)
+                                .ok_or(ExecutionError::EcsmAddressOverflow)?;
+                            store_u256_le(memory, addr, value)?;
+                        }
                         // Carry addr_xG/addr_k in the CPU log; addr_xR is recovered from x10
                         // by the ECSM register-read path in the trace builder.
                         src2_val = addr_xg;

@@ -79,7 +79,8 @@ fn witness_matches_the_executor_output_image() {
     for k_big in scalars {
         let k = to_le_32(&k_big);
         let w = compute_witness(&k, &gx).expect("witness");
-        let (x_r, y_r, y_g) = scalar_mul_full(&k, &gx).expect("executor output");
+        let out = scalar_mul_full(&k, &gx).expect("executor output");
+        let (x_r, y_r, y_g) = (out.x_r, out.y_r, out.y_g);
         assert_eq!(w.x_r, x_r, "xR disagrees for k = {k_big}");
         assert_eq!(w.y_r, y_r, "yR disagrees for k = {k_big}");
         assert_eq!(w.y_g, y_g, "yG disagrees for k = {k_big}");

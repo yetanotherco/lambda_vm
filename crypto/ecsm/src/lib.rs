@@ -122,12 +122,25 @@ pub(crate) fn prepare(
 /// Computes the x-coordinate of `k·G` over secp256k1, given `k` and `xG` as little-endian
 /// 32-byte values.
 pub fn scalar_mul_x(k_le: &[u8; 32], xg_le: &[u8; 32]) -> Result<[u8; 32], EcsmError> {
-    Ok(scalar_mul_full(k_le, xg_le)?.0)
+    Ok(scalar_mul_full(k_le, xg_le)?.x_r)
 }
 
-/// The ECSM ecall's memory image: `(xR, yR, yG)`, three little-endian 32-byte values written
-/// back as one contiguous 96-byte buffer.
-pub type EcsmOutput = ([u8; 32], [u8; 32], [u8; 32]);
+/// The ECSM ecall's memory image: `xR ‖ yR ‖ yG`, three little-endian 32-byte values
+/// written back as one contiguous 96-byte buffer.
+///
+/// Named fields rather than a positional tuple: all three are `[u8; 32]`, so a tuple lets any
+/// producer or consumer transpose `y_r` and `y_g` with nothing for the compiler to catch. The
+/// two mean different things — the product's y versus the root of the *base* point — so a swap
+/// does not fail loudly; it yields a wrong recovered public key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EcsmOutput {
+    /// x of `k·(xG, yG)`.
+    pub x_r: [u8; 32],
+    /// y of `k·(xG, yG)`.
+    pub y_r: [u8; 32],
+    /// The root of `xG` the multiplication actually used.
+    pub y_g: [u8; 32],
+}
 
 /// The executor's entry point: `(xR, yR, yG)` as little-endian 32-byte values, written back
 /// to guest memory as one contiguous 96-byte buffer at `addr_xR`.
@@ -145,5 +158,9 @@ pub type EcsmOutput = ([u8; 32], [u8; 32], [u8; 32]);
 pub fn scalar_mul_full(k_le: &[u8; 32], xg_le: &[u8; 32]) -> Result<EcsmOutput, EcsmError> {
     let (k, g) = prepare(k_le, xg_le)?;
     let r = curve::scalar_mul_affine(&k, &g);
-    Ok((to_le_32(&r.x), to_le_32(&r.y), to_le_32(&g.y)))
+    Ok(EcsmOutput {
+        x_r: to_le_32(&r.x),
+        y_r: to_le_32(&r.y),
+        y_g: to_le_32(&g.y),
+    })
 }
