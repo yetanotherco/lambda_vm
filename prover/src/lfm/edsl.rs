@@ -481,6 +481,13 @@ impl WrapHash {
     /// path deletes that serialisation rather than reimplementing it, and that is
     /// the remaining piece of B, gated on `WrapDigest` becoming shape-carrying.
     ///
+    /// ⚠ **THIS PANIC IS AN INTERIM WITH A DEFINED EXIT, not a considered permanent
+    /// choice.** When [`WrapDigest`] becomes shape-carrying, the algebraic path must
+    /// become UNABLE to reach a byte-digest API — and at that point **this function
+    /// is DELETED, not kept as a belt.** A retained "defensive" panic behind a
+    /// type-level impossibility is exactly the dead production panic this repo's
+    /// no-production-panic policy exists to prevent.
+    ///
     /// Until then this panics at EMIT time rather than returning something wrong.
     /// That is deliberate and it matches this file's existing idiom
     /// (`merkle_walk`'s "one sibling per level" assert): an emitter invariant is
