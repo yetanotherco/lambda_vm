@@ -633,8 +633,73 @@ impl WrapHash {
     /// nowhere else: a leaf absorbs 136 bytes per keccak permutation against 64
     /// per BLAKE3 compression.
     pub fn leaf_hash(self, b: &mut LfmBuilder, values: &[Felt]) -> WrapDigest {
+        if self == WrapHash::Algebraic {
+            return Self::algebraic_leaf_hash(b, values);
+        }
         let (stream, len_bytes) = leaf_stream(b, values);
         self.hash_bytes(b, &stream, len_bytes)
+    }
+
+    /// ★ The ALGEBRAIC parent: one `compress` row, one cell out.
+    ///
+    /// The socket primitive `b.compress` already exists and is gated; this is
+    /// the wrap-world name for it. Under RPO the compress domain is zero, so
+    /// this is literally `Rpo256::merge` and matches
+    /// `algebraic_commit`'s `parent` on the host.
+    fn algebraic_hash_pair(b: &mut LfmBuilder, left: WrapDigest, right: WrapDigest) -> WrapDigest {
+        debug_assert_eq!(left.len(), 1, "an algebraic digest is one cell");
+        debug_assert_eq!(right.len(), 1, "an algebraic digest is one cell");
+        WrapDigest::from_cell(
+            b.compress(left[0].as_digest(), right[0].as_digest())
+                .as_cell(),
+        )
+    }
+
+    /// ★ The ALGEBRAIC leaf: the rate-8 OVERWRITE DUPLEX.
+    ///
+    /// Eight fresh felts per permutation, against the socket leaf chain's four —
+    /// the convention this lane priced at 25% of the aggregation program. Each
+    /// block overwrites the two rate cells and carries the capacity cell from
+    /// the previous permutation, which is exactly `MODE_P`: three cells in,
+    /// three out, already in the frozen bus contract.
+    ///
+    /// ⚠ Every constant comes from the ONE rule
+    /// (`algebraic_commit::leaf_capacity`), never restated here — the capacity
+    /// is program data under `MODE_P`, so a second definition of it is a root
+    /// the host cannot reproduce. This mirrors
+    /// `algebraic_commit::sponge_leaf` step for step.
+    fn algebraic_leaf_hash(b: &mut LfmBuilder, values: &[Felt]) -> WrapDigest {
+        use super::algebraic_commit::leaf_capacity;
+
+        let zero = b.felt_const(FE::zero());
+        let zero_cell = b.digest_const([FE::zero(); 4]).as_cell();
+
+        // Four felts per cell, the tail zero-padded.
+        let cells: Vec<Cell> = values
+            .chunks(4)
+            .map(|c| {
+                let lanes: [Felt; 4] = core::array::from_fn(|i| c.get(i).copied().unwrap_or(zero));
+                b.pack_word(lanes)
+            })
+            .collect();
+
+        // The capacity carries the padding flag and the leaf domain.
+        let mut cap = b.digest_const(leaf_capacity(values.len())).as_cell();
+        if cells.is_empty() {
+            // An empty leaf never permutes — the digest is the initial rate,
+            // which is zero. `sponge_leaf` returns the same.
+            return WrapDigest::from_cell(zero_cell);
+        }
+
+        let mut digest = zero_cell;
+        for block in cells.chunks(2) {
+            let rate0 = block[0];
+            let rate1 = block.get(1).copied().unwrap_or(zero_cell);
+            let out = b.permute([rate0, rate1, cap]);
+            digest = out[0];
+            cap = out[2];
+        }
+        WrapDigest::from_cell(digest)
     }
 
     /// The production Merkle PARENT hash: `hash(left ‖ right)`.
@@ -647,6 +712,9 @@ impl WrapHash {
     /// emitted. Keeping the two callers on one primitive is what makes "the walk
     /// and the build hash the same way" a property of the code.
     pub fn hash_pair(self, b: &mut LfmBuilder, left: WrapDigest, right: WrapDigest) -> WrapDigest {
+        if self == WrapHash::Algebraic {
+            return Self::algebraic_hash_pair(b, left, right);
+        }
         let stream = parent_stream(b, left, right);
         self.hash_bytes(b, &stream, 2 * COMMITMENT_BYTES)
     }

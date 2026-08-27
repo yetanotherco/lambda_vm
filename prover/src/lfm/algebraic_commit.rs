@@ -774,6 +774,103 @@ mod tests {
         for_each_tenant!(check);
     }
 
+    /// ★★★ **THE EMITTER GATE** — the in-VM leaf and parent must equal this
+    /// module's host constructions, for every tenant.
+    ///
+    /// This is the pair the whole migration turns on: the host commits with
+    /// `hash_data` / `hash_new_parent`, and the wrap program re-derives them
+    /// with `WrapHash::Algebraic`'s `leaf_hash` / `hash_pair`. If they disagree
+    /// the walk reconstructs nothing and the failure surfaces as a `DivByZero`
+    /// deep in a query walk, naming neither the hash nor the site — so it is
+    /// gated here, where a divergence is a failing test.
+    ///
+    /// The leaf is exercised at lengths that cross the rate boundary in both
+    /// directions, because the padding flag (`len mod 8`) is the one part of
+    /// the construction that is not the same on every block.
+    #[test]
+    fn the_emitted_leaf_and_parent_equal_the_host_backend() {
+        use crate::lfm::builder::LfmBuilder;
+        use crate::lfm::compiler::compile;
+        use crate::lfm::edsl::{WrapDigest, WrapHash};
+        use crate::lfm::proof::lfm_prove_with_hasher;
+        use crate::lfm::registry::build_artifacts_with_hasher;
+        use stark::proof::options::GoldilocksCubicProofOptions;
+
+        fn check<H: AlgebraicHasher>(name: &str) {
+            let opts = GoldilocksCubicProofOptions::with_blowup(2).expect("options");
+
+            for n in [1usize, 4, 8, 9, 12, 16] {
+                let leaf = base_leaf(n);
+                let want =
+                    <AlgebraicBatchBackend<Base, H> as IsMerkleTreeBackend>::hash_data(&leaf);
+
+                // The program reads the leaf's felts from an arena, four per
+                // word, and hashes them the way a wrap program would.
+                let words = n.div_ceil(4);
+                let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::Algebraic);
+                let arena = b.declare_arena(words as u32);
+                let felts: Vec<_> = (0..words)
+                    .flat_map(|w| {
+                        let c = b.hint_word(arena, w as u32);
+                        b.unpack(c).to_vec()
+                    })
+                    .take(n)
+                    .collect();
+                let d = WrapHash::Algebraic.leaf_hash(&mut b, &felts);
+                assert_eq!(d.len(), 1, "{name}: an algebraic digest is ONE cell");
+                b.public(d[0]);
+                let program = compile(b.finish());
+
+                let arena_words: Vec<LfmWord> = (0..words)
+                    .map(|w| {
+                        core::array::from_fn(|i| {
+                            leaf.get(4 * w + i).copied().unwrap_or_else(FE::zero)
+                        })
+                    })
+                    .collect();
+                let artifacts = build_artifacts_with_hasher(&program, &opts, H::KIND);
+                let proved =
+                    lfm_prove_with_hasher(&program, &artifacts, &[arena_words], &opts, H::KIND)
+                        .expect("the leaf program must prove");
+                assert_eq!(
+                    digest_to_commitment(&proved.public_words[0].1),
+                    want,
+                    "{name}: emitted leaf of {n} felts must equal the host's"
+                );
+            }
+
+            // And the parent.
+            let l = digest_to_commitment(&[FE::from(3u64), FE::from(5), FE::from(7), FE::from(11)]);
+            let r =
+                digest_to_commitment(&[FE::from(13u64), FE::from(17), FE::from(19), FE::from(23)]);
+            let want =
+                <AlgebraicBatchBackend<Base, H> as IsMerkleTreeBackend>::hash_new_parent(&l, &r);
+
+            let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::Algebraic);
+            let arena = b.declare_arena(2);
+            let lc = WrapDigest::from_cell(b.hint_word(arena, 0));
+            let rc = WrapDigest::from_cell(b.hint_word(arena, 1));
+            let d = WrapHash::Algebraic.hash_pair(&mut b, lc, rc);
+            b.public(d[0]);
+            let program = compile(b.finish());
+            let artifacts = build_artifacts_with_hasher(&program, &opts, H::KIND);
+            let proved = lfm_prove_with_hasher(
+                &program,
+                &artifacts,
+                &[vec![commitment_to_digest(&l), commitment_to_digest(&r)]],
+                &opts,
+                H::KIND,
+            )
+            .expect("the parent program must prove");
+            assert_eq!(
+                digest_to_commitment(&proved.public_words[0].1),
+                want,
+                "{name}: emitted parent must equal the host's"
+            );
+        }
+        for_each_tenant!(check);
+    }
+
     /// The leaf is DOMAIN-SEPARATED from a parent: hashing the eight felts of
     /// two digests as a LEAF must not equal compressing them as a PARENT.
     #[test]
