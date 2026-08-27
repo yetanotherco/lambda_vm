@@ -507,3 +507,60 @@ fn the_measured_cells_per_permutation_match_the_pinned_prediction() {
     const BLAKE3_CELLS_PER_COMPRESSION: u64 = 4_946;
     assert!(BLAKE3_CELLS_PER_COMPRESSION / rpx >= 15);
 }
+
+/// ★ **What share of a verifier program is the hash chip?** — the number that
+/// decides whether a fixture can produce a genuinely MEASURED algebraic data
+/// point, or whether every algebraic figure stays an extrapolation off BLAKE3.
+///
+/// Measured (M-series laptop): the FRI fixture's `LFM_HASH` is **0.3-0.5%** of
+/// its ~15.9M cells, because the program is dominated by FIXED-height lookup
+/// tables that do not scale with its workload. Swapping the hash therefore moves
+/// the fixture's total by ~0.1% — far under prove-time noise, so **the fixture
+/// at its current shape cannot test cells-linearity across a hash swap at all.**
+///
+/// The aggregator is the opposite mix: its hash table is ~85% of 12.2B cells and
+/// the fixed floor is a rounding error. Any fixture-based de-risk has to close
+/// that gap first by scaling queries and Merkle depth until the hash chip is a
+/// large share — see the swap-design document's §F for the sizing this number
+/// feeds.
+#[test]
+#[ignore]
+fn the_fixture_hash_share_is_too_small_to_measure_a_swap() {
+    use super::airs::lfm_chip_census_with_hasher;
+    use super::hash::HasherKind;
+    for (name, program) in [
+        ("fri_toy_program", super::programs::fri_toy_program()),
+        ("trivial_program", super::programs::trivial_program()),
+    ] {
+        println!("--- {name} ---");
+        for kind in [
+            HasherKind::Test,
+            HasherKind::Poseidon,
+            HasherKind::Rpo,
+            HasherKind::Rpx,
+        ] {
+            let census = lfm_chip_census_with_hasher(&program, kind);
+            let total: u64 = census.iter().map(|c| c.main_cells() + c.aux_cells()).sum();
+            let h = census.iter().find(|c| c.name == "LFM_HASH").expect("hash");
+            let hash_cells = h.main_cells() + h.aux_cells();
+            println!(
+                "  {:<9} total {total:>9}  LFM_HASH {hash_cells:>9} ({:>5.1}%)  rows {}  cols {}",
+                format!("{kind:?}"),
+                100.0 * hash_cells as f64 / total as f64,
+                h.rows,
+                h.main_cols,
+            );
+            if name == "fri_toy_program" {
+                // The finding, asserted rather than only printed: if the fixture
+                // ever DOES reach a share where a swap is measurable, this fails
+                // and §F's sizing should be revisited.
+                assert!(
+                    100.0 * hash_cells as f64 / (total as f64) < 5.0,
+                    "the fixture's hash share is now {:.1}% — large enough to \
+                     measure a swap, so the de-risk sizing needs revisiting",
+                    100.0 * hash_cells as f64 / (total as f64)
+                );
+            }
+        }
+    }
+}
