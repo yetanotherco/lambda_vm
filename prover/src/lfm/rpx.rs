@@ -609,20 +609,45 @@ mod tests {
 #[cfg(test)]
 mod ladder {
     use super::*;
-    use crate::lfm::hash::HasherKind;
     use crate::lfm::poseidon::PoseidonGoldilocks;
     use std::time::Instant;
 
-    const PERMUTATIONS: usize = 20_000;
+    const PERMUTATIONS: usize = 50_000;
+    /// Repeats, of which the BEST is reported.
+    ///
+    /// ⚠ **A single sample on a laptop is not a measurement.** This lane's own
+    /// `rpo::throughput` produced 4,712, 5,685 and 6,576 ns for the SAME code on
+    /// the same machine across runs — ±20%, which is larger than the difference
+    /// between two candidates would need to be to matter. The minimum is the
+    /// standard robust estimator for a throughput microbenchmark: noise only
+    /// ever adds time, so the fastest observed run is the closest to the
+    /// machine's actual capability.
+    const REPEATS: usize = 5;
 
-    fn time_permutation(label: &str, kind: HasherKind, baseline: Option<f64>) -> f64 {
-        let mut state: [FE; HASH_STATE_FELTS] = core::array::from_fn(|i| FE::from(i as u64 + 1));
-        let start = Instant::now();
-        for _ in 0..PERMUTATIONS {
-            state = kind.permute(state);
+    /// Generic over the CONCRETE hasher rather than over `HasherKind`, so this
+    /// loop is the same shape as `rpo::throughput`'s and the absolutes are
+    /// comparable across the lane.
+    ///
+    /// ⚠ **The enum dispatch was NOT the reason two numbers existed for the
+    /// same quantity, and it is worth recording what was.** Monomorphising moved
+    /// RPO only 5,922 → 5,647 ns; the gap to `rpo::throughput`'s 4,712 was
+    /// **run-to-run variance**, which on this laptop is ±20% — larger than the
+    /// difference between two candidates would need to be to matter. That is
+    /// what [`REPEATS`] is for, and it is why the RATIOS below are the load-
+    /// bearing output and the absolutes are not.
+    fn time_permutation<H: LfmHasher>(label: &str, h: &H, baseline: Option<f64>) -> f64 {
+        let mut ns = f64::MAX;
+        for _ in 0..REPEATS {
+            let mut state: [FE; HASH_STATE_FELTS] =
+                core::array::from_fn(|i| FE::from(i as u64 + 1));
+            let start = Instant::now();
+            for _ in 0..PERMUTATIONS {
+                state = h.permute(state);
+            }
+            let this = start.elapsed().as_nanos() as f64 / PERMUTATIONS as f64;
+            assert_ne!(state[0], FE::zero(), "the chain must not collapse to zero");
+            ns = ns.min(this);
         }
-        let ns = start.elapsed().as_nanos() as f64 / PERMUTATIONS as f64;
-        assert_ne!(state[0], FE::zero(), "the chain must not collapse to zero");
         match baseline {
             None => println!("  {label:<22} {ns:>9.0} ns/perm"),
             Some(b) => println!("  {label:<22} {ns:>9.0} ns/perm   {:.2}× RPO", ns / b),
@@ -634,19 +659,22 @@ mod ladder {
     #[ignore]
     fn hash_ladder_throughput() {
         println!("algebraic permutations, single thread, this machine:");
-        let rpo = time_permutation("RPO256", HasherKind::Rpo, None);
-        let rpx = time_permutation("RPX256 (XHash12)", HasherKind::Rpx, Some(rpo));
-        let pos = time_permutation("Poseidon (UNSHIPPABLE)", HasherKind::Poseidon, Some(rpo));
+        let rpo = time_permutation("RPO256", &Rpo256, None);
+        let rpx = time_permutation("RPX256 (XHash12)", &Rpx256, Some(rpo));
+        let pos = time_permutation("Poseidon (UNSHIPPABLE)", &PoseidonGoldilocks, Some(rpo));
 
         // The incumbent, at the shape a Merkle parent takes, on the same machine.
         let left = [0x5Au8; 32];
         let mut right = [0xA5u8; 32];
         const PARENTS: usize = 2_000_000;
-        let start = Instant::now();
-        for _ in 0..PARENTS {
-            right = crypto::hash::blake3::chain::blake3_parent(&left, &right);
+        let mut b3 = f64::MAX;
+        for _ in 0..REPEATS {
+            let start = Instant::now();
+            for _ in 0..PARENTS {
+                right = crypto::hash::blake3::chain::blake3_parent(&left, &right);
+            }
+            b3 = b3.min(start.elapsed().as_nanos() as f64 / PARENTS as f64);
         }
-        let b3 = start.elapsed().as_nanos() as f64 / PARENTS as f64;
         assert_ne!(right, [0u8; 32]);
         println!("  {:<22} {b3:>9.0} ns/parent", "BLAKE3 64-byte");
         println!();
