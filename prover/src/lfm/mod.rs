@@ -16,6 +16,7 @@
 //! three being the production keccak family hosted unchanged (see `airs`).
 
 pub mod airs;
+pub mod algebraic_commit;
 pub mod algebraic_transcript;
 pub mod batched_epoch;
 pub mod batched_epoch_verify;
