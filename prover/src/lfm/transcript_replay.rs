@@ -54,8 +54,9 @@
 
 use crate::tables::types::FE;
 
+use super::algebraic_transcript::AlgebraicTranscript;
 use super::builder::{Bit, Cell, Ext, Felt, LfmBuilder};
-use super::edsl::{self, WrapHash};
+use super::edsl::{self, SpongeVar, WrapHash};
 use super::keccak_host::{BYTES_PER_HALF, SQUEEZE_LEN};
 use super::layout::keccak::DIGEST_WORDS;
 
@@ -70,6 +71,53 @@ const CANDIDATES_PER_SQUEEZE: usize = SQUEEZE_LEN / CANDIDATE_BYTES;
 
 /// `2^32 − 1` — the only `hi` half that can put a candidate at or above `p`.
 const HI_MAX: u64 = 0xFFFF_FFFF;
+
+/// One host `append_bytes` call — the unit BOTH arms replay, and the reason it
+/// is represented rather than implied.
+///
+/// ★ **The call boundary is invisible on the byte arm and LOAD-BEARING on the
+/// algebraic one.** A keccak or BLAKE3 transcript absorbs into one flat segment,
+/// so two appends and one append of their concatenation are the same bytes and
+/// the same digest — [`TranscriptReplay::append_const_bytes`] relies on exactly
+/// that to concatenate constant runs before chunking. An ALGEBRAIC transcript
+/// prefixes every call with its LENGTH
+/// ([`AlgebraicTranscript::append_bytes_cells`]), so those same two appends are
+/// a DIFFERENT transcript.
+///
+/// The consequence for callers, stated once here: **on the algebraic arm the
+/// machine's append calls must correspond one-to-one with the host's
+/// `append_bytes` calls.** A coalescing that is free under keccak is a wrong
+/// challenge under RPO, and it fails as a diverged challenge rather than as
+/// anything that names the coalescing.
+#[derive(Clone)]
+enum Append {
+    /// Compile-time bytes, any length, any alignment.
+    Const(Vec<u8>),
+    /// `byte_len` machine-computed bytes carried as `ceil(byte_len / 4)` `u32`
+    /// halves, four bytes each little-endian. The trailing half carries only
+    /// its low `byte_len % 4` bytes.
+    Bytes { halves: Vec<Felt>, byte_len: usize },
+}
+
+impl Append {
+    /// The byte arm's view: appends flattened into packer pieces, boundaries
+    /// discarded because the byte stream does not have them.
+    fn push_pieces(&self, out: &mut Vec<SegPiece>) {
+        match self {
+            Append::Const(bytes) => out.push(SegPiece::Const(bytes.clone())),
+            Append::Bytes { halves, byte_len } => {
+                let full = byte_len / BYTES_PER_HALF;
+                let rem = byte_len % BYTES_PER_HALF;
+                if full > 0 {
+                    out.push(SegPiece::Halves(halves[..full].to_vec()));
+                }
+                if rem > 0 {
+                    out.push(SegPiece::Partial(halves[full], rem));
+                }
+            }
+        }
+    }
+}
 
 /// A piece of the pending segment, held UNPACKED until the squeeze.
 ///
@@ -120,9 +168,10 @@ struct SqueezeBuf {
 /// is hashed once and each fork diverges only past its domain separator.
 #[derive(Clone)]
 pub struct TranscriptReplay {
-    /// The pending segment — the hasher's unfinalized input — as unpacked
-    /// pieces. Packed into halves at squeeze time, not at append time.
-    segment: Vec<SegPiece>,
+    /// The pending appends — the hasher's unfinalized input. Turned into halves
+    /// (byte arm) or driven into the chain (algebraic arm) at the squeeze, never
+    /// at the append.
+    segment: Vec<Append>,
     /// The segment's length in BYTES: what drives keccak's length-dependent
     /// padding, and what decides where every half boundary falls.
     segment_len: usize,
@@ -130,6 +179,14 @@ pub struct TranscriptReplay {
     /// Bytes already handed out of the buffer; `SQUEEZE_LEN` means "empty, the
     /// next candidate forces a squeeze".
     out_pos: usize,
+    /// ★ The ALGEBRAIC arm's compress chain, `None` until the first
+    /// builder-taking call creates it.
+    ///
+    /// Lazily, and deliberately: [`TranscriptReplay::new`] takes no builder, and
+    /// the arm is a property of the BUILDER — the hash-pinned instruments
+    /// override it with `with_wrap_hash` — so it cannot be decided at
+    /// construction from the global configuration.
+    sponge: Option<SpongeVar>,
 }
 
 impl TranscriptReplay {
@@ -143,6 +200,7 @@ impl TranscriptReplay {
             segment_len: 0,
             buf: None,
             out_pos: SQUEEZE_LEN,
+            sponge: None,
         };
         t.append_const_bytes(seed);
         t
@@ -162,7 +220,10 @@ impl TranscriptReplay {
     /// 32, a Goldilocks felt streams as 8, a cubic-extension felt as 24.
     pub fn append_halves(&mut self, halves: &[Felt]) {
         self.assert_appendable();
-        self.segment.push(SegPiece::Halves(halves.to_vec()));
+        self.segment.push(Append::Bytes {
+            halves: halves.to_vec(),
+            byte_len: BYTES_PER_HALF * halves.len(),
+        });
         self.segment_len += BYTES_PER_HALF * halves.len();
         // Absorbing invalidates the buffer: a later challenge must depend on
         // this input, so bytes squeezed before it are dropped.
@@ -185,10 +246,18 @@ impl TranscriptReplay {
 
     /// Absorb a 32-byte keccak digest carried as two machine words — the shape a
     /// commitment root arrives in.
+    /// ⚠ ONE append, not two, and on the algebraic arm that is the difference
+    /// between the host's transcript and a different one: the host absorbs a
+    /// root with a single `append_bytes(root)`, so a machine that absorbed the
+    /// two words separately would emit two length prefixes. On the byte arm the
+    /// two spellings are the same 32 bytes, which is exactly why the mistake
+    /// would have been invisible until an algebraic challenge diverged.
     pub fn append_digest(&mut self, b: &mut LfmBuilder, words: &[Cell; DIGEST_WORDS]) {
+        let mut halves = Vec::with_capacity(4 * DIGEST_WORDS);
         for w in words {
-            self.append_word(b, *w);
+            halves.extend_from_slice(&b.unpack(*w));
         }
+        self.append_halves(&halves);
     }
 
     /// Absorb one base field element the way production streams it: the
@@ -213,7 +282,25 @@ impl TranscriptReplay {
     /// while the REVERSED 2, 1, 0 order belongs to the raw `[FpE; 3]` array
     /// type. Different types, no contradiction — but do not "fix" this to match
     /// the other impl.
+    ///
+    /// ★ On the ALGEBRAIC arm this is `append_field_element`, which is a
+    /// DIFFERENT host method rather than the same one over different bytes: one
+    /// DATA cell `[x0, x1, x2, 0]` absorbed through the leaf domain, against the
+    /// byte arm's three separate 8-byte renderings. So the arm is not an
+    /// optimisation of the loop below — routing through it would emit three
+    /// length-prefixed `append_bytes` calls where the host made one
+    /// `append_field_element`, and that is exactly what the emitter gate caught.
     pub fn append_ext(&mut self, b: &mut LfmBuilder, coords: [Felt; 3]) {
+        if Self::is_algebraic(b) {
+            let mut sponge = self.drive_chain(b);
+            // `field_element_cell`'s layout, in the machine's spelling: lanes
+            // 0-2 the coordinates, lane 3 zero. `pack_ext` already IS that
+            // packing, so the layout has one definition rather than two.
+            let cell = b.pack_ext(coords[0], coords[1], coords[2]);
+            sponge.absorb_felts(b, cell.as_cell());
+            self.sponge = Some(sponge);
+            return;
+        }
         for c in coords {
             self.append_felt(b, c);
         }
@@ -254,7 +341,7 @@ impl TranscriptReplay {
     /// `splice_misaligned(constant_prefix_len, dynamic_halves)` helper. That is
     /// an extension point, not a redesign.
     pub fn append_const_bytes(&mut self, bytes: &[u8]) {
-        self.segment.push(SegPiece::Const(bytes.to_vec()));
+        self.segment.push(Append::Const(bytes.to_vec()));
         self.segment_len += bytes.len();
         self.out_pos = SQUEEZE_LEN;
         self.buf = None;
@@ -272,6 +359,65 @@ impl TranscriptReplay {
         );
     }
 
+    /// Whether this builder's configuration replays the ALGEBRAIC chain.
+    ///
+    /// Read from the BUILDER and never from `WrapHash::production()`: the
+    /// hash-pinned instruments override the configuration with
+    /// `with_wrap_hash(WrapHash::Blake3)` and must keep the byte arm even in a
+    /// build whose default is algebraic.
+    fn is_algebraic(b: &LfmBuilder) -> bool {
+        b.wrap_hash() == WrapHash::Algebraic
+    }
+
+    /// Drive every pending append into the algebraic chain, creating it on first
+    /// use, and hand the chain back.
+    ///
+    /// Deferred rather than eager because two of the append methods
+    /// ([`Self::append_const_bytes`] and the `halves` family) take no builder
+    /// and so have nothing to emit with. The deferral is invisible: nothing
+    /// between two appends can emit, so draining at the next builder-taking call
+    /// preserves the absorb ORDER exactly, which is the only thing the chain
+    /// binds.
+    ///
+    /// Every constant it needs comes from [`AlgebraicTranscript`]'s exported
+    /// rules rather than being restated here — the length prefix, the 32-byte
+    /// grouping and the felt encoding alike. That discipline is not decoration:
+    /// twice in this lane a machine side hand-wrote a constant that agreed with
+    /// the host until the host's rule moved.
+    fn drive_chain(&mut self, b: &mut LfmBuilder) -> SpongeVar {
+        let mut sponge = self.sponge.take().unwrap_or_else(|| SpongeVar::new(b));
+        for append in core::mem::take(&mut self.segment) {
+            match append {
+                Append::Const(bytes) => {
+                    for cell in AlgebraicTranscript::append_bytes_cells(&bytes) {
+                        let c = b.digest_const(cell);
+                        sponge.absorb(b, c.as_cell());
+                    }
+                }
+                Append::Bytes { halves, byte_len } => {
+                    // The rule applied to a payload of the same LENGTH: it fixes
+                    // the prefix cell and the payload cell COUNT, neither of
+                    // which depends on the payload's value. Asserting the count
+                    // is what keeps the gadget below honest if the rule moves.
+                    let rule = AlgebraicTranscript::append_bytes_cells(&vec![0u8; byte_len]);
+                    let prefix = b.digest_const(rule[0]);
+                    sponge.absorb(b, prefix.as_cell());
+                    let cells = cells_from_halves_be(b, &halves, byte_len);
+                    assert_eq!(
+                        cells.len(),
+                        rule.len() - 1,
+                        "the machine's payload cell count must be the host rule's"
+                    );
+                    for cell in cells {
+                        sponge.absorb(b, cell);
+                    }
+                }
+            }
+        }
+        self.segment_len = 0;
+        sponge
+    }
+
     /// Absorb machine-computed data that does NOT start on a 4-byte boundary.
     ///
     /// Same bytes as [`TranscriptReplay::append_halves`], but it permits the
@@ -285,7 +431,10 @@ impl TranscriptReplay {
     /// The splice itself happens in [`TranscriptReplay::pack_segment`], not
     /// here, because only the packer knows the byte cursor.
     pub fn append_halves_misaligned(&mut self, halves: &[Felt]) {
-        self.segment.push(SegPiece::Halves(halves.to_vec()));
+        self.segment.push(Append::Bytes {
+            halves: halves.to_vec(),
+            byte_len: BYTES_PER_HALF * halves.len(),
+        });
         self.segment_len += BYTES_PER_HALF * halves.len();
         self.out_pos = SQUEEZE_LEN;
         self.buf = None;
@@ -306,14 +455,10 @@ impl TranscriptReplay {
             byte_len.div_ceil(BYTES_PER_HALF),
             "byte_len must match the supplied halves"
         );
-        let full = byte_len / BYTES_PER_HALF;
-        let rem = byte_len % BYTES_PER_HALF;
-        if full > 0 {
-            self.segment.push(SegPiece::Halves(halves[..full].to_vec()));
-        }
-        if rem > 0 {
-            self.segment.push(SegPiece::Partial(halves[full], rem));
-        }
+        self.segment.push(Append::Bytes {
+            halves: halves.to_vec(),
+            byte_len,
+        });
         self.segment_len += byte_len;
         self.out_pos = SQUEEZE_LEN;
         self.buf = None;
@@ -327,7 +472,11 @@ impl TranscriptReplay {
     /// packer is the only place that knows the cursor, which is why the splice
     /// lives here rather than at the append.
     fn pack_segment(&self, b: &mut LfmBuilder) -> Vec<Felt> {
-        pack_pieces(&self.segment, b)
+        let mut pieces = Vec::with_capacity(self.segment.len());
+        for append in &self.segment {
+            append.push_pieces(&mut pieces);
+        }
+        pack_pieces(&pieces, b)
     }
 
     /// `DefaultTranscript::sample()` — finalize, reverse the 32 digest bytes,
@@ -336,11 +485,25 @@ impl TranscriptReplay {
     /// The returned bytes and the re-absorbed bytes are the SAME 32 bytes; one
     /// keccak row produces both. Also invalidates the output buffer, exactly as
     /// production does.
-    pub fn sample(&mut self, b: &mut LfmBuilder) -> [Cell; DIGEST_WORDS] {
+    ///
+    /// ★ On the ALGEBRAIC arm this is one `squeeze_cell` — the state, then an
+    /// advance past it. That is a DEFINITION rather than a claim of fidelity:
+    /// `sample()` mirrors `DefaultTranscript::sample()`, a keccak-duplex
+    /// primitive with no counterpart on [`AlgebraicTranscript`], so there is
+    /// nothing on the host for it to agree with. It is defined as the chain's
+    /// own canonical self-advance so that the method is total on both arms
+    /// instead of being a hole one configuration falls into.
+    pub fn sample(&mut self, b: &mut LfmBuilder) -> edsl::WrapDigest {
+        if Self::is_algebraic(b) {
+            let mut sponge = self.drive_chain(b);
+            let c = sponge.squeeze_cell(b);
+            self.sponge = Some(sponge);
+            return edsl::WrapDigest::from_cell(c);
+        }
         let (_plain, rev) = self.squeeze(b);
         self.buf = None;
         self.out_pos = SQUEEZE_LEN;
-        rev
+        edsl::WrapDigest::from_pair(rev[0], rev[1])
     }
 
     /// One squeeze: emits the keccak row over the current segment, sets the
@@ -356,7 +519,10 @@ impl TranscriptReplay {
         for w in rev {
             halves.extend_from_slice(&b.unpack(w));
         }
-        self.segment = vec![SegPiece::Halves(halves)];
+        self.segment = vec![Append::Bytes {
+            halves,
+            byte_len: SQUEEZE_LEN,
+        }];
         self.segment_len = SQUEEZE_LEN;
         (plain, rev)
     }
@@ -378,6 +544,13 @@ impl TranscriptReplay {
     /// felt-representable, so it cannot be one cell until it has been range-
     /// checked. Consumers either check it ([`TranscriptReplay::sample_felt`]) or
     /// use only the low half ([`TranscriptReplay::sample_u64_pow2`]).
+    ///
+    /// ⚠ **The BYTE duplex's primitive.** The algebraic arm has no candidate
+    /// stream at all — its squeezes are canonical felts by construction, so
+    /// there is nothing to carve and nothing to reject — and each of
+    /// [`Self::sample_felt`], [`Self::sample_ext`] and [`Self::sample_u64_pow2`]
+    /// takes its own path there. None of them reaches here, which is why this
+    /// method needs no arm rather than needing a guard.
     pub fn next_candidate(&mut self, b: &mut LfmBuilder) -> Candidate {
         if self.out_pos + CANDIDATE_BYTES > SQUEEZE_LEN {
             self.refill(b);
@@ -446,6 +619,18 @@ impl TranscriptReplay {
     /// `sample_u64` reaches the raw candidate stream, not the fixed schedule,
     /// and at a power-of-two bound it accepts its first candidate.
     pub fn sample_felt(&mut self, b: &mut LfmBuilder) -> Felt {
+        if Self::is_algebraic(b) {
+            // Lane 0 of one squeezed cell. ⚠ No host counterpart: an algebraic
+            // transcript has no base-field draw — `sample_field_element` returns
+            // an Fp3 element and reads three lanes at once. This exists so the
+            // byte arm's `sample_ext` and the hash-pinned instruments keep one
+            // API, and nothing in production reaches it on this arm.
+            let mut sponge = self.drive_chain(b);
+            let c = sponge.squeeze_cell(b);
+            self.sponge = Some(sponge);
+            let [lane0, _, _, _] = b.unpack(c);
+            return lane0;
+        }
         let n = candidates_per_coordinate(b.wrap_hash());
         let candidates: Vec<Candidate> = (0..n).map(|_| self.next_candidate(b)).collect();
 
@@ -484,6 +669,18 @@ impl TranscriptReplay {
     /// extension elements, so an ext draw is where the completeness bound is
     /// paid three times over.
     pub fn sample_ext(&mut self, b: &mut LfmBuilder) -> Ext {
+        if Self::is_algebraic(b) {
+            // ★ ONE squeeze, not three. `sample_field_element` reads all three
+            // coordinates off a single squeezed cell (lanes 0-2) where the byte
+            // transcript carves three independent 64-bit candidates — so the
+            // squeeze count of a whole wrap program falls by a factor of three
+            // on this arm, and the completeness restriction of `SOUNDNESS.md`
+            // §6.3 does not apply to it at all.
+            let mut sponge = self.drive_chain(b);
+            let e = sponge.squeeze_ext(b);
+            self.sponge = Some(sponge);
+            return e;
+        }
         let a0 = self.sample_felt(b);
         let a1 = self.sample_felt(b);
         let a2 = self.sample_felt(b);
@@ -509,6 +706,16 @@ impl TranscriptReplay {
             "sample_u64_pow2: nbits must be in 1..=32, got {nbits} — above 32 the \
              answer would span both halves of the candidate"
         );
+        if Self::is_algebraic(b) {
+            // `sample_u64` at a power-of-two bound is `canonical(cell[0]) &
+            // (bound − 1)` — the low `nbits` of lane 0, which is exactly what
+            // `squeeze_bits` decomposes. Constant consumption either way: one
+            // cell, no rejection.
+            let mut sponge = self.drive_chain(b);
+            let bits = sponge.squeeze_bits(b, nbits);
+            self.sponge = Some(sponge);
+            return bits;
+        }
         let c = self.next_candidate(b);
         b.bit_dec(c.lo, nbits)
     }
@@ -527,6 +734,17 @@ impl TranscriptReplay {
     /// every caller reaching grinding through a `sample` — and a re-emitted
     /// splice would only be redundant work, never a different value.
     pub fn state(&mut self, b: &mut LfmBuilder) -> edsl::WrapDigest {
+        if Self::is_algebraic(b) {
+            // The chain's state cell, which is what `AlgebraicTranscript::state`
+            // serialises. Draining the pending appends here is not the extra
+            // step the byte arm's double pack is — the chain absorbs them once
+            // and a later squeeze sees the same state, so the two arms agree
+            // that `state()` observes without advancing.
+            let sponge = self.drive_chain(b);
+            let cell = sponge.state();
+            self.sponge = Some(sponge);
+            return edsl::WrapDigest::from_cell(cell);
+        }
         let packed = self.pack_segment(b);
         edsl::wrap_hash_bytes(b, &packed, self.segment_len)
     }
@@ -798,6 +1016,87 @@ pub fn split_half(b: &mut LfmBuilder, d: Felt, k: usize) -> (Felt, Felt) {
 /// if a profile says so.
 pub fn felt_be_halves(b: &mut LfmBuilder, v: Felt) -> [Felt; 2] {
     b.bit_dec_be_halves(v)
+}
+
+/// The payload cells the host's `append_bytes` produces, computed from the `u32`
+/// halves the machine holds — the inverse direction of [`felt_be_halves`].
+///
+/// ★ **This is the ONLY place the algebraic arm still pays for a byte encoding,
+/// and what does NOT reach it is the point.** A commitment root costs nothing:
+/// the host absorbs it with `append_bytes(root)`, whose payload cell is
+/// `AlgebraicTranscript::bytes_to_cell(root)`, and an algebraic backend
+/// serialises its digest as four canonical big-endian felts — so that call
+/// recovers exactly the digest cell the backend started from and the
+/// serialisation CANCELS. What arrives here is the genuinely byte-shaped data:
+/// a keccak ELF digest, a `public_output` run, a big-endian nonce.
+///
+/// ⚠ The cancellation's precondition is the backend's canonicity, exactly as
+/// `bytes_to_cell` states it — a non-canonical eight-byte group reduces, and
+/// reduction is what would make two different roots absorb identically. The same
+/// reduction applies here, and it applies to both sides: this gadget accumulates
+/// in the field and `bytes_to_cell` calls `FE::from(u64)`, so a group at or above
+/// `p` reduces the same way on the host and in the machine.
+///
+/// ## The encoding, byte for byte
+///
+/// Half `h` carries stream bytes `4h..4h+4` LITTLE-endian, so byte `t` of that
+/// half is bits `[8t, 8t+8)` of it — and the trailing half is decomposed to its
+/// LIVE bytes only, which is precisely the zero-pinning
+/// [`TranscriptReplay::append_bytes_misaligned`] promises rather than a separate
+/// mask. Each output felt is one 8-byte group read BIG-endian and LEFT-justified
+/// when the group is short, because `bytes_to_cell` reads a zero-filled buffer
+/// whose live bytes sit at the low indices.
+///
+/// ## Cost, and the cheaper route deliberately not taken
+///
+/// One `LFM_BITDEC` row per half, plus ~63 `LFM_BALU` rows per output felt.
+/// Hinting the felt and asserting `bit_dec_be_halves(felt) == [hi, lo]` would be
+/// roughly 30× cheaper — one row instead of a decomposition and a recomposition
+/// — and it is the right move IF a profile ever asks for it. It is not taken
+/// here because it costs an arena word per felt, i.e. a host-side layout change,
+/// to save on the order of a thousand rows per epoch statement against a
+/// 45.7M-instruction aggregation program. Written down so the trade is on record
+/// rather than rediscovered.
+fn cells_from_halves_be(b: &mut LfmBuilder, halves: &[Felt], byte_len: usize) -> Vec<Cell> {
+    assert_eq!(
+        halves.len(),
+        byte_len.div_ceil(BYTES_PER_HALF),
+        "byte_len must match the supplied halves"
+    );
+
+    let mut bytes: Vec<Felt> = Vec::with_capacity(byte_len);
+    for (h, half) in halves.iter().enumerate() {
+        let live = (byte_len - h * BYTES_PER_HALF).min(BYTES_PER_HALF);
+        let bits = b.bit_dec(*half, 8 * live);
+        for t in 0..live {
+            bytes.push(edsl::bits_to_felt(b, &bits[8 * t..8 * t + 8]));
+        }
+    }
+
+    let byte_radix = b.felt_const(FE::from(1u64 << 8));
+    let mut felts: Vec<Felt> = Vec::with_capacity(bytes.len().div_ceil(8));
+    for group in bytes.chunks(8) {
+        let mut acc = group[0];
+        for byte in &group[1..] {
+            acc = b.mul_add(acc, byte_radix, *byte);
+        }
+        if group.len() < 8 {
+            let shift = b.felt_const(FE::from(1u64 << (8 * (8 - group.len()))));
+            acc = b.mul(acc, shift);
+        }
+        felts.push(acc);
+    }
+
+    // A cell is four felts and a short final cell is zero-filled, again matching
+    // `bytes_to_cell`'s buffer rather than restating a convention.
+    let zero = b.felt_const(FE::zero());
+    while !felts.len().is_multiple_of(4) {
+        felts.push(zero);
+    }
+    felts
+        .chunks(4)
+        .map(|c| b.pack_word([c[0], c[1], c[2], c[3]]))
+        .collect()
 }
 
 /// Per-candidate probability that the production sampler rejects: there are

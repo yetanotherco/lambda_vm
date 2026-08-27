@@ -68,6 +68,7 @@ pub const SQUEEZE_MARK: u32 = u32::from_le_bytes(*b"SQZ0");
 /// length IS the query count**. A program whose runs exceed `k = 2^16` must
 /// revisit the analysis in the transcript spec §4.2; below that the 64-bit
 /// collision bound above dominates and this changes nothing.
+#[derive(Clone, Copy, Debug)]
 pub struct SpongeVar {
     state: Cell,
     /// The next squeeze's index — host-side bookkeeping, so it appears in the
@@ -114,6 +115,17 @@ impl SpongeVar {
     pub fn absorb2(&mut self, b: &mut LfmBuilder, c0: Cell, c1: Cell) {
         self.absorb(b, c0);
         self.absorb(b, c1);
+    }
+
+    /// The chain's state cell as it stands, WITHOUT advancing — what
+    /// `AlgebraicTranscript::state` serialises, and what grinding seeds from.
+    ///
+    /// Observation only: nothing here absorbs or squeezes, so a later step sees
+    /// the state this returned. That is the same contract
+    /// `DefaultTranscript::state` has on the byte side, where production
+    /// finalizes a CLONE of the hasher rather than the hasher.
+    pub fn state(&self) -> Cell {
+        self.state
     }
 
     /// Squeeze one cell: the current state, then advance past it with `SQ(i)`.

@@ -139,6 +139,22 @@ impl AlgebraicTranscript {
         }
     }
 
+    /// A fresh transcript under `hasher` with `seed` absorbed — the counterpart
+    /// of `DefaultTranscript::new(seed)`.
+    ///
+    /// ★ **The seed is the transcript's FIRST `append_bytes` call and nothing
+    /// more special than that.** That is what lets the machine's
+    /// `TranscriptReplay::new` mirror it with a single `append_const_bytes`, and
+    /// saying it as a constructor rather than leaving every caller to remember
+    /// the first absorb is what stops the two sides disagreeing about whether
+    /// the seed is INSIDE the transcript or beside it. The byte transcript makes
+    /// that choice in its constructor; so does this.
+    pub fn with_seed(hasher: HasherKind, seed: &[u8]) -> Self {
+        let mut t = Self::new(hasher);
+        t.append_bytes(seed);
+        t
+    }
+
     /// `SQ(i) = [SQUEEZE_MARK, i, 0, 0]` — the advance operand, identical to
     /// `SpongeVar`'s.
     pub fn squeeze_operand(i: u32) -> LfmWord {
@@ -452,6 +468,151 @@ mod tests {
                     artifacts.chip_set,
                 ),
                 "{hasher:?}: the replay proof must verify"
+            );
+        }
+    }
+
+    /// The seed both sides start from — the shape `DefaultTranscript::new`
+    /// takes, so the replay's own constructor is under test and not assumed.
+    const SEED: &[u8] = b"lfm-algebraic-replay-gate-v0";
+
+    /// The HOST side of the sequence the EMITTER gate mirrors.
+    ///
+    /// Deliberately the same four absorb shapes production uses and no others —
+    /// ✓ VERIFIED against `crypto/stark/src/verifier.rs`, whose entire absorb
+    /// vocabulary is `append_bytes(root)`, `append_bytes(<little-endian
+    /// integer>)`, `append_field_element(<Fp3>)` and `append_bytes(<nonce>)`.
+    fn host_replay_challenges(hasher: HasherKind) -> (FEE, FEE, u64, LfmWord) {
+        let mut t = AlgebraicTranscript::with_seed(hasher, SEED);
+        t.append_bytes(&ROOT);
+        let a = t.sample_field_element();
+        t.append_bytes(&SMALL.to_le_bytes());
+        t.append_field_element(&field_element());
+        let b = t.sample_field_element();
+        let q = t.sample_u64(1 << QUERY_BITS);
+        (a, b, q, AlgebraicTranscript::bytes_to_cell(&t.state()))
+    }
+
+    /// The MACHINE side through `TranscriptReplay` — the emitter production
+    /// actually uses, not a hand-rolled `SpongeVar` sequence.
+    ///
+    /// ★ That is what makes this a strictly stronger gate than the A2 one above.
+    /// A2 checks that the CONVENTION agrees on both sides; this checks that the
+    /// replay every wrap program is emitted through IMPLEMENTS that convention —
+    /// the length prefixes, the one-call-per-host-call boundary, the halves→BE
+    /// felt regrouping, the single-squeeze ext draw and the state read.
+    fn replay_emitter_program_source() -> LfmProgramSource {
+        use crate::lfm::edsl::WrapHash;
+        use crate::lfm::transcript_replay::TranscriptReplay;
+
+        let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::Algebraic);
+        let arena = b.declare_arena(3);
+        // The root exactly as production carries one: two arena words of four
+        // `u32` halves each, which is `epoch::RootCells::hint`'s shape. So the
+        // regrouping gadget runs on the real shape rather than a convenient one.
+        let root_words = [b.hint_word(arena, 0), b.hint_word(arena, 1)];
+        let ext_word = b.hint_word(arena, 2);
+
+        let mut t = TranscriptReplay::new(SEED);
+        t.append_digest(&mut b, &root_words);
+        let a = t.sample_ext(&mut b);
+        t.append_const_bytes(&SMALL.to_le_bytes());
+        let lanes = b.unpack(ext_word);
+        t.append_ext(&mut b, [lanes[0], lanes[1], lanes[2]]);
+        let bb = t.sample_ext(&mut b);
+        let bits = t.sample_u64_pow2(&mut b, QUERY_BITS);
+        let q = edsl::bits_to_felt(&mut b, &bits);
+        let state = t.state(&mut b);
+        assert_eq!(
+            state.len(),
+            1,
+            "an algebraic transcript state is ONE cell, not two"
+        );
+
+        b.public(a.as_cell());
+        b.public(bb.as_cell());
+        b.public(q.as_cell());
+        b.public(state[0]);
+        b.finish()
+    }
+
+    fn replay_emitter_arena() -> Vec<Vec<LfmWord>> {
+        // The root as the proof arena lays a commitment out: half `h` is bytes
+        // `4h..4h+4` LITTLE-endian, four halves to a word. Nothing here is the
+        // algebraic encoding — that is the point, the machine has to build it.
+        let mut words: Vec<LfmWord> = ROOT
+            .chunks(16)
+            .map(|w| {
+                core::array::from_fn(|j| {
+                    let mut le = [0u8; 4];
+                    le.copy_from_slice(&w[4 * j..4 * j + 4]);
+                    FE::from(u64::from(u32::from_le_bytes(le)))
+                })
+            })
+            .collect();
+        words.push(AlgebraicTranscript::field_element_cell(&field_element()));
+        vec![words]
+    }
+
+    /// ★★ **THE EMITTER GATE.** `TranscriptReplay` on the algebraic arm must
+    /// derive the host transcript's challenges — and its STATE — for every
+    /// algebraic tenant.
+    ///
+    /// The state is compared as well as the challenges because grinding seeds
+    /// from it: a replay that agreed on every challenge and disagreed on the
+    /// state would pass a challenge-only gate and then grind against the wrong
+    /// seed, which surfaces as an unprovable nonce check rather than as anything
+    /// that names the transcript.
+    #[test]
+    fn the_emitter_replay_derives_the_host_transcripts_challenges_and_state() {
+        let opts = options();
+        let program = compile(replay_emitter_program_source());
+        for hasher in ALGEBRAIC {
+            let (a, b, q, state) = host_replay_challenges(hasher);
+            let artifacts = build_artifacts_with_hasher(&program, &opts, hasher);
+            let proved =
+                lfm_prove_with_hasher(&program, &artifacts, &replay_emitter_arena(), &opts, hasher)
+                    .expect("the emitter replay program must prove");
+
+            let pub_a = proved.public_words[0].1;
+            let pub_b = proved.public_words[1].1;
+            let pub_q = proved.public_words[2].1;
+            let pub_state = proved.public_words[3].1;
+
+            assert_eq!(
+                [pub_a[0], pub_a[1], pub_a[2]],
+                *a.value(),
+                "{hasher:?}: the first challenge must agree"
+            );
+            assert_eq!(
+                [pub_b[0], pub_b[1], pub_b[2]],
+                *b.value(),
+                "{hasher:?}: the second challenge must agree — it follows a \
+                 CONSTANT absorb and a field-element absorb, so a disagreement \
+                 here and not above is about those two encodings"
+            );
+            assert_eq!(
+                GoldilocksField::canonical(pub_q[0].value()),
+                q,
+                "{hasher:?}: the sampled query index must agree"
+            );
+            assert_eq!(
+                pub_state, state,
+                "{hasher:?}: the transcript STATE must agree — this is grinding's seed"
+            );
+
+            assert!(
+                verify_against(
+                    &artifacts.roots,
+                    &artifacts.program_id,
+                    artifacts.keccak_rnd_chunks,
+                    &proved.proof,
+                    &proved.public_words,
+                    &opts,
+                    artifacts.hasher,
+                    artifacts.chip_set,
+                ),
+                "{hasher:?}: the emitter replay proof must verify"
             );
         }
     }
