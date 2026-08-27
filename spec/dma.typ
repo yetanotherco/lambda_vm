@@ -99,6 +99,13 @@ Such a row addresses `MEMW` with $#`write2` = #`write4` = #`write8` = 0$, i.e. i
 `MEMW` gates every memory interaction for lane $i >= 1$ on those same width flags (@memw), so the seven unused lanes never reach the memory argument at all;
 what they do reach is the `MEMW` tuple itself, and pinning them to zero is what keeps that tuple the canonical encoding of a single-byte access rather than one carrying seven free field elements.
 
+Which memory chip the two accesses reach is decided by their addresses, and this chip constrains neither.
+An eight-byte access lands on `MEMW_A`, the read-size aligned fast path (@memw), when its address is eight-byte aligned and all eight bytes were last touched at one timestamp: that chip stores a single old timestamp, so it needs one `LT` row (@lt) to order the access.
+Anything else falls to the general `MEMW`, which stores one old timestamp per byte and needs eight, on a row that is the wider of the two to begin with.
+The read and the write are routed independently, so a copy can take the fast path at one end and not at the other.
+And since @dma:c:tail picks the width from `count` alone, an end that begins misaligned stays misaligned for every chunk of the sequence --- this chip never emits a short leading row to realign one.
+A misaligned copy therefore commits strictly more cells than an aligned copy of the same length while producing exactly the same number of #dma rows, which is the reason the row counts this chapter reasons about are not on their own the cost of a copy.
+
 == Advancing to the next chunk
 In parallel, we compute $#`src_incr` = #`src` + #`step`$ and $#`dst_incr` = #`dst` + #`step`$ as the addresses at which the next chunk starts, and $#`count_decr` = #`count` - #`step`$ as the number of bytes that still have to be copied afterwards.
 The first two of @dma:c:range_src_incr, @dma:c:range_dst_incr and @dma:c:range_count_decr are included to satisfy @addnw:a:sum, and the last to satisfy @sub:a:diff.
@@ -173,6 +180,7 @@ It is not the only one --- @dma:c:range_src_incr and @dma:c:range_dst_incr, whic
   That is harmless, because @dma:c:write_value carries the same multiplicity and so does not fire either.
 - @dma:c:range_src_incr and @dma:c:range_dst_incr carry multiplicity $#`μ`$, but `src_incr` and `dst_incr` are constrained and consumed only at $#`μ` - #`end`$.
   Lowering both to $#`μ` - #`end`$ would drop eight `IS_HALF` lookups on every terminal row at no cost.
+  It would not make the proof smaller, though: `IS_HALF` is answered by a preprocessed table whose height is fixed at compile time, so dropping lookups moves multiplicities and leaves the number of committed cells where it was.
   @dma:c:range_count_decr genuinely needs $#`μ`$, since @dma:c:end consumes `count_decr` at that multiplicity.
 - `count` need not be a full `DWordWL`: @dma:c:bound already proves $#`count` < 257$ on the first row of a sequence, and every later `count` is smaller still.
   Representing it as a single `Word`, or even as a `Half`, would save a column and shrink both `LT` interactions --- at the cost of an extra range check where the value enters from the register.
@@ -180,3 +188,5 @@ It is not the only one --- @dma:c:range_src_incr and @dma:c:range_dst_incr, whic
   For a copy of exactly $256$ bytes the row count would drop from $33$ to $17$ and $9$.
   The _worst case_ over all admissible lengths behaves quite differently, however, since it is attained at $n = 255$ rather than at $n = 256$: it is $31 + 7 + 1 = 39$ rows today, $15 + 15 + 1 = 31$ with sixteen-byte rows, and $7 + 31 + 1 = 39$ again with thirty-two-byte rows.
   Widening the chunk moves work out of the wide rows and into the one-byte tail, so past sixteen bytes it buys nothing at all where it matters.
+  It also narrows the aligned fast path: `MEMW_A` admits an access only when it is aligned to its own width, so sixteen-byte rows would need sixteen-byte-aligned ends to stay on the cheap chip, and the widths `MEMW`'s signature can express today are one, two, four and eight.
+  Rows saved and cells saved therefore move in opposite directions here, and only the second is what the proof pays for.
