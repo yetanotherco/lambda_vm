@@ -193,6 +193,10 @@ remaining lever is the leaf rate.
 chunks → cells → 33.7 B/cell). Non-`KECCAK_RND` chips are held constant, which
 is conservative (their instruction counts shrink too):
 
+> ⚠ 33.7 is the MARGINAL slope and omits a ~1.2 GiB fixed term; it is confirmed
+> as a slope (33.94, 23 shapes × 4 hashers) but NOT as a through-origin model.
+> `lfm::fixture_scale_tests` has the fit and the provenance.
+
 | point | variant | leg perms | chunks N | cells | projected peak |
 |---|---|---|---|---|---|
 | 2^20/blowup4/110q | today | 487,740 | 23 | 35.7B | 1,122 GiB |

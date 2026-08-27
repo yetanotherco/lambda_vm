@@ -34,6 +34,9 @@ which fails by more than an order of magnitude.
 Projected peak = census cells × 33.7 bytes/cell (`MEASURED_BYTES_PER_CELL`, the
 slice-0 anchor: 481,327,124 cells → 15.1 GiB RSS).
 
+> ⚠ 33.7 is a MARGINAL, not an average, and there is a ~1.2 GiB fixed term it
+> omits — see the note in §5 before reusing this coefficient anywhere.
+
 | epoch | sub-proofs | preset | total keccak perms | KECCAK_RND chunks | cells | projected peak | fits 93 GiB | fits 110 GiB |
 |---|---|---|---|---|---|---|---|---|
 | 2^4 fixture | 25 | blowup2/219q | 311,214 | 15 | 22.3B+ | 701 GiB | NO (7.5×) | NO |
@@ -210,6 +213,23 @@ linear in total cells across 23–133 chunks, which holds only while all traces 
 simultaneously resident — the same assumption the bounded-residency lever above would
 break. This is why §4's coefficient-free floor is stated: the verdict does not depend
 on the coefficient.
+
+> ⚠ **On `MEASURED_BYTES_PER_CELL` = 33.7, which the record leaves ambiguous.**
+> `others/lfm-hash-matrix-scope.md:678` lists the one-parameter 33.7 model as
+> FALSIFIED, which reads as though the NUMBER were discredited. It is not: the
+> falsification was of the **form** (through-origin, no fixed term), not of the
+> **slope**. `prover/src/lfm/fixture_scale_tests` fits 23 shapes across four
+> hashers and measures **1.242 GiB + 33.94 B/cell** — the slope agrees to 0.7%,
+> and applied cold the law predicts the box's 12.2B-cell aggregation prove at
+> 386.8 GiB against 336.8 measured (+14.9%). Use 33.7 as a marginal, add the
+> ~1.2 GiB fixed term, and never take a bytes-per-cell figure as an AVERAGE off
+> one run — averages here range 36.6 to 79.0 B/cell with size alone.
+> Provenance, since it decides how far to trust it: 33.7 is a single **laptop**
+> measurement (`others/lfm-agent-status.log:186`) with ~5% run-to-run spread of
+> its own, not a box number. ⚠ None of this touches Part 2 §1's separate finding
+> that the coefficient is ~2.1x high for the `KECCAK_RND`-dominated shape, whose
+> direct peak model is `17.37·N + 30.2·k` GiB; that shape was not measured here
+> and this note neither confirms nor overturns it.
 
 **Not covered by either side of the cells count:** preprocessed columns, the composition
 polynomial's own commitment, LDEs and Merkle trees. The recursion ratio quoted by the

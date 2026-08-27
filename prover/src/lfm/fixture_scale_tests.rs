@@ -98,6 +98,31 @@
 //! all — 113 is an intercept divided by a constant, not a measurement of a
 //! per-sub-proof cost.
 //!
+//! ## ★★ If you scale this fixture, take the MARGINAL, never the AVERAGE
+//!
+//! This is the trap, and it is set for whoever reads this next. The obvious way
+//! to get a bytes-per-cell figure is to prove one shape and divide peak RSS by
+//! its cells. That number is not a coefficient — it is a coefficient plus the
+//! intercept smeared over however many cells you happened to prove, so it moves
+//! with the SIZE OF YOUR RUN and nothing else:
+//!
+//! ```text
+//!   average, smallest point measured (28.2M cells)   79.0 B/cell
+//!   average, largest  point measured (345.6M cells)  36.6 B/cell    ← 2.16x apart
+//!   MARGINAL, fitted over all 23 points              33.94 B/cell   ← stable
+//! ```
+//!
+//! Every one of those averages is a correct measurement of a real prove. An
+//! average taken from the smallest run over-projects by **2.33x**; the same
+//! spread in the census convention runs 49.7 to 127.8. Two points and a line
+//! cost one extra prove and remove the whole error, which is why nothing here is
+//! ever quoted from a single size.
+//!
+//! ⚖ This is the same failure class as the campaign's two model failures — a
+//! plausible aggregate quantity standing in for the right one — and it is the
+//! one an extension of this work is most likely to walk into, because the
+//! average is the number that falls out of a single run for free.
+//!
 //! Blowup is a second axis and not a free one: at IDENTICAL committed cells,
 //! moving blowup 2 → 4 cost +73% peak RSS under RPO and +62% under BLAKE3
 //! (slope 43-47 → 59-71 bytes/cell, intercept 1.24-1.36 → 2.27-2.70 GiB).

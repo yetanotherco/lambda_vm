@@ -105,7 +105,7 @@ and self-defeating for offloading the compression function the glue is made of. 
 |---|---|---|
 | GPU throughput | **67.13 M base-field-equivalent cells/s** | 481,327,124 cells (`EXPLORATION.md:186`) ÷ 7.17 s ABBA mean (`BOX-RESULTS.md:53,57`), one RTX 5090, `LAMBDA_VM_GPU_LDE_THRESHOLD=262144`, verify green ✓ MEASURED |
 | slot | 12 s | Ethereum |
-| bytes per cell (host RSS) | 33.7 | `wrap_tests.rs` `MEASURED_BYTES_PER_CELL` ✓ MEASURED |
+| bytes per cell (host RSS) | 33.7 **marginal**, + ~1.2 GiB fixed | `wrap_tests.rs` `MEASURED_BYTES_PER_CELL` ✓ MEASURED — a single LAPTOP point (~5% spread). Independently confirmed as a SLOPE at 33.94 by `lfm::fixture_scale_tests` (23 shapes × 4 hashers); the through-origin FORM is what was falsified, not the number. See that module's doc. |
 | hosted socket | **4,946** cells/compression | 3,056 main + 3×630 aux — ✓ **VERIFIED both**, `blake3_chip.rs:162,224` (main) and `:911-913` (1,259 interactions → 630 ext aux). MMCS-PLAN §5 and `tower.py:15` carried the aux as `? INFERRED`; it is now confirmed. |
 | #903 standalone chip | **5,316** cells/compression | 3,219 main / 1,397 sends → 3,219 + 3×699; PA-PLAN.md:541 quoting commit `35038501` ✓ VERIFIED from the commit message, ✗ UNVERIFIED against the branch source |
 | epochs per block | 2^20→72, 2^21→36, 2^22→18, 2^23→9 | block 25368371, 74.8M cycles, PLAN.md:8 ✓ MEASURED |
