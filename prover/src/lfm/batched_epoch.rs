@@ -338,7 +338,7 @@ pub fn emit_batched_epoch_challenges(
     for root in absorbs.prep_roots.iter().flatten() {
         match root {
             BatchedPrepRoot::Constant(bytes) => t.append_const_bytes(&bytes[..]),
-            BatchedPrepRoot::Cells(cells) => t.append_halves_misaligned(&cells.halves()),
+            BatchedPrepRoot::Cells(cells) => cells.absorb_misaligned(b, t),
         }
     }
     assert_eq!(
@@ -347,16 +347,16 @@ pub fn emit_batched_epoch_challenges(
         "the carved root's presence is shape"
     );
     if let Some(root) = absorbs.carved_root {
-        t.append_halves_misaligned(&root.halves());
+        root.absorb_misaligned(b, t);
     }
-    t.append_halves_misaligned(&absorbs.main_root.halves());
+    absorbs.main_root.absorb_misaligned(b, t);
 
     // ---- the shared LogUp pair.
     let lookup = (t.sample_ext(b), t.sample_ext(b));
 
     // ---- aux root, then every table's L.
     if let Some(root) = absorbs.aux_root {
-        t.append_halves(&root.halves());
+        root.absorb(b, t);
     }
     for l in absorbs.contributions.iter().flatten() {
         super::epoch::append_ext_cell(b, t, *l);
@@ -365,7 +365,7 @@ pub fn emit_batched_epoch_challenges(
     // ---- ALL betas, consecutively.
     let betas: Vec<Ext> = (0..n).map(|_| t.sample_ext(b)).collect();
 
-    t.append_halves(&absorbs.parts_root.halves());
+    absorbs.parts_root.absorb(b, t);
 
     // ---- per table: z, both OOD blocks COLUMN-major, parts.
     let mut zs = Vec::with_capacity(n);
@@ -418,7 +418,7 @@ pub fn emit_batched_epoch_challenges(
         // Sample FIRST, absorb SECOND — a ζ drawn after its own layer root is
         // a challenge the prover answers rather than one that binds them.
         zetas.push(t.sample_ext(b));
-        t.append_halves(&root.halves());
+        root.absorb(b, t);
     }
     if shape.fri.layout.total_folds > 0 {
         zetas.push(t.sample_ext(b));

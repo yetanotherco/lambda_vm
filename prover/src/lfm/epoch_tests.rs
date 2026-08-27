@@ -188,7 +188,7 @@ fn challenge_program(h: &HostTable) -> LfmProgram {
         t.append_const_bytes(&prep);
     }
     let main = RootCells::hint(&mut b, a.main_root, 0);
-    t.append_halves(&main.halves());
+    main.absorb(&mut b, &mut t);
     if h.needs_lookup_challenges {
         for _ in 0..stark::lookup::LOGUP_NUM_CHALLENGES {
             t.sample_ext(&mut b);
@@ -2370,7 +2370,7 @@ pub(super) fn batched_epoch_program_with(
         let decode = decode_cells
             .as_ref()
             .expect("a continuation epoch has a DECODE sub-proof")
-            .halves();
+            .lanes_flat();
         let id = super::programs::emit_program_id(
             &mut b,
             super::programs::ProgramIdShape { num_pages: 0 },
@@ -2435,7 +2435,7 @@ pub(super) fn batched_epoch_program_with(
         let carved = carved_cells
             .as_ref()
             .expect("a carved epoch has carved root cells");
-        for half in carved.halves() {
+        for half in carved.lanes_flat() {
             b.public(half.as_cell());
         }
     }
@@ -2543,7 +2543,7 @@ pub(super) fn batched_epoch_program_with(
         let fri_layer_commitments: Vec<super::fri::LayerCommitment> = fri_root_cells
             .iter()
             .map(|c| super::fri::LayerCommitment {
-                root_lanes: c.lanes,
+                root_lanes: c.lanes.clone(),
             })
             .collect();
 
@@ -2568,7 +2568,7 @@ pub(super) fn batched_epoch_program_with(
                 super::sub_proof::emit_group_authentication(
                     &mut b,
                     &GroupCommitment::from_lanes(
-                        cells.lanes,
+                        cells.lanes.clone(),
                         GroupShape {
                             num_columns: w,
                             is_ext: false,
@@ -2604,7 +2604,7 @@ pub(super) fn batched_epoch_program_with(
                 super::sub_proof::emit_group_authentication(
                     &mut b,
                     &GroupCommitment::from_lanes(
-                        cells.lanes,
+                        cells.lanes.clone(),
                         GroupShape {
                             num_columns: cw,
                             is_ext: false,
@@ -3723,9 +3723,9 @@ fn epoch_program_with(e: &RealEpoch, with_legs: bool, split_decode: bool) -> Lfm
         .collect();
     let prep_halves: Vec<Option<Vec<_>>> = prep_cells
         .iter()
-        .map(|c| c.as_ref().map(RootCells::halves))
+        .map(|c| c.as_ref().map(RootCells::lanes_flat))
         .collect();
-    let main_halves: Vec<Vec<_>> = main_cells.iter().map(RootCells::halves).collect();
+    let main_halves: Vec<Vec<_>> = main_cells.iter().map(RootCells::lanes_flat).collect();
     // The interned bytes, hoisted so Phase A can borrow them for the whole replay.
     let prep_constants: Vec<Option<Commitment>> = e
         .phase_a
@@ -3773,30 +3773,12 @@ fn epoch_program_with(e: &RealEpoch, with_legs: bool, split_decode: bool) -> Lfm
                 let base_halves: Vec<_> = (0..2).map(|j| b.hint_felt(arena, base + j)).collect();
                 let root_halves: Vec<_> =
                     (0..8).map(|j| b.hint_felt(arena, base + 2 + j)).collect();
-                (
-                    base_halves,
-                    RootCells {
-                        lanes: [
-                            [
-                                root_halves[0],
-                                root_halves[1],
-                                root_halves[2],
-                                root_halves[3],
-                            ],
-                            [
-                                root_halves[4],
-                                root_halves[5],
-                                root_halves[6],
-                                root_halves[7],
-                            ],
-                        ],
-                    },
-                )
+                (base_halves, RootCells::from_halves(&mut b, &root_halves))
             })
             .collect();
         let page_halves: Vec<(Vec<_>, Vec<_>)> = page_cells
             .iter()
-            .map(|(base, root)| (base.clone(), root.halves()))
+            .map(|(base, root)| (base.clone(), root.lanes_flat()))
             .collect();
         let page_refs: Vec<(&[_], &[_])> = page_halves
             .iter()
@@ -3805,11 +3787,11 @@ fn epoch_program_with(e: &RealEpoch, with_legs: bool, split_decode: bool) -> Lfm
         let decode = match a_split_decode {
             // ★ THE BROKEN CONTROL: a second, independent reading of the DECODE
             // root. The fold now attests to a value Phase A never absorbed.
-            Some(arena) => RootCells::hint(&mut b, arena, 0).halves(),
+            Some(arena) => RootCells::hint(&mut b, arena, 0).lanes_flat(),
             None => decode_cells
                 .as_ref()
                 .expect("a continuation epoch has a DECODE sub-proof")
-                .halves(),
+                .lanes_flat(),
         };
         let id = super::programs::emit_program_id(
             &mut b,

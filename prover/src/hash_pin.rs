@@ -73,8 +73,6 @@
 //! governs both: a drift failure is investigated, never re-blessed to silence
 //! the test, and neither table is ever hand-edited.
 
-use crate::tables::types::GoldilocksExtension as E;
-
 /// The commitment configuration the block path proves and verifies under.
 ///
 /// Every `multi_prove` / `multi_verify` instantiation in this crate names this
@@ -86,7 +84,8 @@ pub type BlockStarkHash = stark::config::DefaultStarkHash;
 ///
 /// See the module header for why this is pinned separately from
 /// [`BlockStarkHash`] rather than derived from it.
-pub type BlockTranscript = stark::config::DefaultStarkTranscript<E>;
+pub type BlockTranscript =
+    stark::config::DefaultStarkTranscript<crate::tables::types::GoldilocksExtension>;
 
 /// A fresh block-path transcript over `seed`.
 ///
@@ -127,6 +126,10 @@ pub const BLOCK_COMMITMENT_HASH: stark::config::CommitmentHash =
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Named here rather than at module scope: the byte arm's `BlockTranscript`
+    // mentions the extension field and an algebraic arm's does not, so a
+    // module-scope import would be unused on one of the two.
+    use crate::tables::types::GoldilocksExtension as E;
     use stark::config::StarkHash;
 
     /// ✓ The pin is COHERENT: the transcript object the block path builds sponges

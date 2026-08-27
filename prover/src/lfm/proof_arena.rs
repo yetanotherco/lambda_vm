@@ -90,16 +90,30 @@ pub fn halves_to_arena(halves: Vec<FE>) -> Vec<LfmWord> {
     halves.into_iter().map(base_word).collect()
 }
 
-/// A 32-byte commitment as the two machine words a keccak digest occupies:
-/// four `u32` halves per word, half `h` = bytes `4h..4h+4` little-endian.
+/// A 32-byte commitment as the arena words the machine reads it from — TWO on a
+/// byte hash, ONE on an algebraic one.
 ///
-/// This is NOT [`super::word::pack_digest`]'s layout. That one packs four FULL
-/// felts, which is the `LFM_HASH` (Milestone-C) digest; a keccak digest lives on
-/// the bus as eight `u32` halves and must be handed to the chip that way.
-pub fn commitment_words(c: &Commitment) -> [LfmWord; 2] {
+/// A byte digest lives on the bus as eight `u32` halves, four per word, half `h`
+/// = bytes `4h..4h+4` little-endian, and must be handed to the chip that way.
+///
+/// ★ The algebraic arm is the layout this function's own doc used to name as the
+/// thing it was NOT: [`super::word::pack_digest`]'s four FULL felts, the
+/// `LFM_HASH` digest. An algebraic backend serialises its digest as four
+/// canonical big-endian felts, so those 32 bytes ARE that word — the conversion
+/// is the backend's own (`algebraic_commit::commitment_to_digest`), not a second
+/// spelling of it.
+///
+/// ⚠ The machine side reads the same count through
+/// `epoch::RootCells::words_per_root`, and the two must agree or every root in
+/// the arena is off by a word. They agree because both are functions of the
+/// configuration's `WrapDigest` width and neither restates it.
+pub fn commitment_words(c: &Commitment) -> Vec<LfmWord> {
+    if super::edsl::WrapHash::production() == super::edsl::WrapHash::Algebraic {
+        return vec![super::algebraic_commit::commitment_to_digest(c)];
+    }
     let halves = pack_stream(c);
     debug_assert_eq!(halves.len(), ROOT_HALVES);
-    [
+    vec![
         [halves[0], halves[1], halves[2], halves[3]],
         [halves[4], halves[5], halves[6], halves[7]],
     ]
@@ -239,7 +253,7 @@ impl MainTraceOpening {
 
     /// The committed root as arena words.
     pub fn root_arena(&self) -> Vec<LfmWord> {
-        commitment_words(&self.root).to_vec()
+        commitment_words(&self.root)
     }
 }
 

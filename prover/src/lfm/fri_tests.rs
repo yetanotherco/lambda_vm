@@ -312,8 +312,8 @@ fn the_fri_leaf_is_byte_identical_to_productions_own_backends() {
              the verifier's batched backend are byte-identical; they are not"
         );
         assert_eq!(
-            got,
-            super::proof_arena::commitment_words(&batched),
+            got.as_slice(),
+            super::proof_arena::commitment_words(&batched).as_slice(),
             "vector {i}: the machine's leaf must be the verifier's leaf — this \
              is the byte-level check the FRI leg was handed as unverified"
         );

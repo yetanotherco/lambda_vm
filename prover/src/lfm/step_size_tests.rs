@@ -514,7 +514,7 @@ fn fib_challenge_program(
 
     let mut t = TranscriptReplay::new(&[]);
     let main = RootCells::hint(&mut b, a_main, 0);
-    t.append_halves(&main.halves());
+    main.absorb(&mut b, &mut t);
 
     let composition = RootCells::hint(&mut b, a_composition, 0);
     let current: Vec<_> = (0..(s.ood_current_dims.0 * s.ood_current_dims.1) as u32)
@@ -717,12 +717,12 @@ fn row_major_control_gamma(r: &FibReplay) -> FEE {
 
     let mut t = TranscriptReplay::new(&[]);
     let main = RootCells::hint(&mut b, a_main, 0);
-    t.append_halves(&main.halves());
+    main.absorb(&mut b, &mut t);
     let mut fork = fork_table(&t, s.index, s.num_tables);
 
     let _beta = fork.sample_ext(&mut b);
     let composition = RootCells::hint(&mut b, a_composition, 0);
-    fork.append_halves(&composition.halves());
+    composition.absorb(&mut b, &mut fork);
 
     let _z = super::epoch::emit_z_ood(&mut b, &mut fork, s);
     let current: Vec<_> = (0..(s.ood_current_dims.0 * s.ood_current_dims.1) as u32)

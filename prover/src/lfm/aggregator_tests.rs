@@ -703,7 +703,7 @@ pub(super) fn emit_lfm_leg(
     let fri_layer_commitments: Vec<super::fri::LayerCommitment> = fri_root_cells
         .iter()
         .map(|c| super::fri::LayerCommitment {
-            root_lanes: c.lanes,
+            root_lanes: c.lanes.clone(),
         })
         .collect();
 
@@ -737,7 +737,7 @@ pub(super) fn emit_lfm_leg(
             super::sub_proof::emit_group_authentication(
                 b,
                 &GroupCommitment::from_lanes(
-                    cells.lanes,
+                    cells.lanes.clone(),
                     GroupShape {
                         num_columns: w,
                         is_ext: false,
@@ -1460,7 +1460,7 @@ pub(super) fn global_verifier_program(g: &RealGlobal) -> LfmProgram {
     let main_cells: Vec<RootCells> = (0..n)
         .map(|i| RootCells::hint(&mut b, a_main_roots, 2 * i as u32))
         .collect();
-    let main_halves: Vec<Vec<Felt>> = main_cells.iter().map(RootCells::halves).collect();
+    let main_halves: Vec<Vec<Felt>> = main_cells.iter().map(RootCells::lanes_flat).collect();
     let prep_cells: Vec<Option<RootCells>> = g
         .tables
         .iter()
@@ -1488,7 +1488,7 @@ pub(super) fn global_verifier_program(g: &RealGlobal) -> LfmProgram {
     // The aggregator's byte-compare material: each epoch's L2G re-commit
     // root, the very cells Phase A absorbed.
     for cells in main_cells.iter().take(g.num_l2g) {
-        for half in cells.halves() {
+        for half in cells.lanes_flat() {
             b.public(half.as_cell());
         }
     }

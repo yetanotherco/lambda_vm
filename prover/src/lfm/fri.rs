@@ -261,17 +261,27 @@ pub const FRI_LEAF_GROUP: GroupShape = GroupShape {
 /// and a 219-query proof would otherwise pay 219 redundant `Unpack`s per layer.
 pub struct LayerCommitment {
     /// The root's two words as lanes.
-    pub root_lanes: [[Felt; 4]; 2],
+    /// ⚠ A `Vec`, ONE ENTRY PER DIGEST CELL, not `[_; 2]`: the array wrote the
+    /// byte digest's cell COUNT into the type, and an algebraic root is one cell
+    /// of four felts. `edsl::assert_digest_eq_lanes` zips a digest against these
+    /// and asserts the widths agree, so it works at either width unchanged.
+    pub root_lanes: Vec<[Felt; 4]>,
 }
 
 impl LayerCommitment {
     /// Read a layer root out of the arena and hoist its unpack.
     pub fn hint(b: &mut LfmBuilder, arena: ArenaId, base: u32) -> Self {
-        let w0 = b.hint_word(arena, base);
-        let w1 = b.hint_word(arena, base + 1);
-        LayerCommitment {
-            root_lanes: [b.unpack(w0), b.unpack(w1)],
-        }
+        // ⚠ The configuration's word count, not two: an algebraic root is ONE
+        // arena word of four felts. `RootCells::words_per_root` is the single
+        // definition; a second `+ 1` here would be a second definition.
+        let n = super::epoch::RootCells::words_per_root(b);
+        let root_lanes: Vec<[Felt; 4]> = (0..n)
+            .map(|i| {
+                let w = b.hint_word(arena, base + i);
+                b.unpack(w)
+            })
+            .collect();
+        LayerCommitment { root_lanes }
     }
 
     /// A layer commitment over lanes the caller already holds.
@@ -281,7 +291,7 @@ impl LayerCommitment {
     /// and those two consumers must read one cell. See
     /// [`super::sub_proof::GroupCommitment::from_lanes`] for the same argument at
     /// the trace trees.
-    pub fn from_lanes(root_lanes: [[Felt; 4]; 2]) -> Self {
+    pub fn from_lanes(root_lanes: Vec<[Felt; 4]>) -> Self {
         LayerCommitment { root_lanes }
     }
 }

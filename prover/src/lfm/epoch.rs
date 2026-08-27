@@ -71,16 +71,105 @@ const GRINDING_PREFIX: [u8; 8] = 0x0123_4567_89ab_cded_u64.to_be_bytes();
 /// the commitment is a function of, not a convenience.
 #[derive(Clone)]
 pub struct RootCells {
-    pub lanes: [[Felt; 4]; DIGEST_WORDS],
+    /// The root as the configuration's digest cells — TWO on a byte hash, ONE on
+    /// an algebraic one.
+    digest: super::edsl::WrapDigest,
+    /// Those cells unpacked, ONE ENTRY PER CELL, hoisted so every consumer reads
+    /// the same lanes.
+    ///
+    /// ⚠ A `Vec` rather than `[_; DIGEST_WORDS]`, and that is the whole shape
+    /// change: the array wrote the byte digest's cell COUNT into the type, so an
+    /// algebraic root — one cell of four felts, not two of 32 bytes — could not
+    /// be one of these. `edsl::assert_digest_eq_lanes` already zips a digest
+    /// against these and asserts the widths match, so it works at either width
+    /// unchanged once this stops being fixed at two.
+    ///
+    /// ⚠ On the algebraic arm these lanes are FULL FELTS, not `u32` halves.
+    /// Nothing may hand them to a byte-stream absorb; [`RootCells::absorb`]
+    /// exists so no caller has to know which it is holding.
+    pub lanes: Vec<[Felt; 4]>,
 }
 
 impl RootCells {
-    /// Read a root out of an arena at `base` (two words) and hoist its unpack.
-    pub fn hint(b: &mut LfmBuilder, arena: super::instr::ArenaId, base: u32) -> Self {
-        let words = [b.hint_word(arena, base), b.hint_word(arena, base + 1)];
-        RootCells {
-            lanes: [b.unpack(words[0]), b.unpack(words[1])],
+    /// Arena words one root occupies — the configuration's digest cell count.
+    ///
+    /// Read from the emitter's own `WrapDigest` shape rather than restated, so
+    /// the machine side and `proof_arena`'s writer cannot disagree about it.
+    pub fn words_per_root(b: &LfmBuilder) -> u32 {
+        match b.wrap_hash() {
+            super::edsl::WrapHash::Algebraic => 1,
+            _ => DIGEST_WORDS as u32,
         }
+    }
+
+    /// Read a root out of an arena at `base` and hoist its unpack.
+    ///
+    /// ⚠ Consumes [`RootCells::words_per_root`] words, not always two: an
+    /// algebraic root is ONE arena word of four felts. Callers that advance a
+    /// cursor across several roots must step by the same function.
+    pub fn hint(b: &mut LfmBuilder, arena: super::instr::ArenaId, base: u32) -> Self {
+        let n = Self::words_per_root(b);
+        let words: Vec<_> = (0..n).map(|i| b.hint_word(arena, base + i)).collect();
+        Self::from_cells(b, &words)
+    }
+
+    /// A root already in hand as the configuration's digest cells.
+    fn from_cells(b: &mut LfmBuilder, cells: &[super::builder::Cell]) -> Self {
+        RootCells {
+            digest: super::edsl::WrapDigest::from_cells(cells),
+            lanes: cells.iter().map(|c| b.unpack(*c)).collect(),
+        }
+    }
+
+    /// The root as the configuration's digest cells — what a comparison against
+    /// a computed digest takes.
+    pub fn digest(&self) -> super::edsl::WrapDigest {
+        self.digest
+    }
+
+    /// Absorb this root into a transcript.
+    ///
+    /// ★ The reason `halves()` is gone: nine call sites spelled
+    /// `t.append_halves(&root.halves())`, which writes "a root is eight `u32`
+    /// halves" into every one of them. It is one cell of four felts on an
+    /// algebraic hash, and the absorb is FREE there.
+    pub fn absorb(&self, b: &mut LfmBuilder, t: &mut TranscriptReplay) {
+        t.append_root_cells(b, self.digest.cells());
+    }
+
+    /// A BYTE-hash root from its eight `u32` halves — the instruments' shape.
+    ///
+    /// ⚠ Byte arm only by construction: eight halves IS the byte digest's
+    /// layout, and a caller holding them is by that fact not on the algebraic
+    /// arm. Kept for the hash-pinned instruments and the tests that build a root
+    /// half by half; production reads roots through [`RootCells::hint`].
+    pub fn from_halves(b: &mut LfmBuilder, halves: &[Felt]) -> Self {
+        assert_eq!(
+            halves.len(),
+            4 * DIGEST_WORDS,
+            "a byte root is eight halves"
+        );
+        let cells: Vec<_> = halves
+            .chunks(4)
+            .map(|c| b.pack_word([c[0], c[1], c[2], c[3]]))
+            .collect();
+        Self::from_cells(b, &cells)
+    }
+
+    /// The lanes flattened, in order.
+    ///
+    /// ⚠ These are `u32` HALVES on a byte hash and FULL FELTS on an algebraic
+    /// one, so this is meaningful only to a caller that already knows which it
+    /// is holding — which is why the transcript absorbs go through
+    /// [`RootCells::absorb`] instead. It exists for the hash-pinned instruments
+    /// and for tests that publish or compare a root's cells directly.
+    pub fn lanes_flat(&self) -> Vec<Felt> {
+        self.lanes.iter().flatten().copied().collect()
+    }
+
+    /// [`RootCells::absorb`] where the segment cursor is not 4-byte aligned.
+    pub fn absorb_misaligned(&self, b: &mut LfmBuilder, t: &mut TranscriptReplay) {
+        t.append_root_cells_misaligned(b, self.digest.cells());
     }
 
     /// A root that is PROGRAM TEXT — its eight halves interned as constants.
@@ -98,6 +187,15 @@ impl RootCells {
     /// `proof_arena::commitment_words`' layout, which is how a keccak digest
     /// reaches the chip.
     pub fn constant(b: &mut LfmBuilder, root: &[u8; 4 * 4 * DIGEST_WORDS]) -> Self {
+        if b.wrap_hash() == super::edsl::WrapHash::Algebraic {
+            // ★ The same 32 bytes read as the FOUR CANONICAL FELTS an algebraic
+            // backend serialised them from — one interned cell, not eight
+            // interned halves. The conversion is the backend's own, not a
+            // second spelling of it.
+            let cell = super::algebraic_commit::commitment_to_digest(root);
+            let d = b.digest_const(cell);
+            return Self::from_cells(b, &[d.as_cell()]);
+        }
         let halves: Vec<Felt> = root
             .chunks(4)
             .map(|c| {
@@ -106,13 +204,13 @@ impl RootCells {
                 b.felt_const(FE::from(u64::from(u32::from_le_bytes(bytes))))
             })
             .collect();
-        let mut lanes = [[halves[0]; 4]; DIGEST_WORDS];
-        for (w, word) in lanes.iter_mut().enumerate() {
-            for (j, lane) in word.iter_mut().enumerate() {
-                *lane = halves[4 * w + j];
-            }
-        }
-        RootCells { lanes }
+        let cells: Vec<_> = (0..DIGEST_WORDS)
+            .map(|w| {
+                let lane = |j: usize| halves[4 * w + j];
+                b.pack_word([lane(0), lane(1), lane(2), lane(3)])
+            })
+            .collect();
+        Self::from_cells(b, &cells)
     }
 
     /// A root the machine COMPUTED — the derivation's two digest words, unpacked
@@ -124,18 +222,7 @@ impl RootCells {
     /// the register boundary — the carried commit index among it — a free arena
     /// word.
     pub fn from_digest(b: &mut LfmBuilder, digest: super::edsl::WrapDigest) -> Self {
-        RootCells {
-            lanes: [b.unpack(digest[0]), b.unpack(digest[1])],
-        }
-    }
-
-    /// The 32 bytes as the eight `u32` halves the transcript absorbs, in order.
-    pub fn halves(&self) -> Vec<Felt> {
-        let mut out = Vec::with_capacity(2 * 4);
-        for lanes in &self.lanes {
-            out.extend_from_slice(lanes);
-        }
-        out
+        Self::from_cells(b, digest.cells())
     }
 }
 
@@ -586,7 +673,7 @@ pub fn emit_table_challenges(
 
     // ---- Phase C and the contribution bind, inside the fork.
     if let Some(root) = absorbs.aux_root {
-        t.append_halves(&root.halves());
+        root.absorb(b, t);
     }
     if let Some(l) = absorbs.contribution {
         append_ext_cell(b, t, l);
@@ -594,7 +681,7 @@ pub fn emit_table_challenges(
 
     // ---- Round 2: β, then the composition root.
     let beta = t.sample_ext(b);
-    t.append_halves(&absorbs.composition_root.halves());
+    absorbs.composition_root.absorb(b, t);
 
     // ---- Round 3: z, then both OOD blocks COLUMN-major, then the parts.
     let z = emit_z_ood(b, t, shape);
@@ -621,7 +708,7 @@ pub fn emit_table_challenges(
         // Sample FIRST, absorb SECOND — a ζ drawn after its own layer root is a
         // challenge the prover answers rather than one that binds them.
         zetas.push(t.sample_ext(b));
-        t.append_halves(&root.halves());
+        root.absorb(b, t);
     }
     if shape.fri.total_folds() > 0 {
         zetas.push(t.sample_ext(b));

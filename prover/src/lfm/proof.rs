@@ -16,9 +16,9 @@ use stark::config::Commitment;
 use stark::proof::options::ProofOptions;
 use stark::proof::stark::MultiProof;
 use stark::proof::view::MultiProofView;
-use stark::prover::{IsStarkProver, Prover, ProvingError};
+use stark::prover::{IsStarkProver, ProvingError};
 use stark::residency_mode::ResidencyMode;
-use stark::verifier::{IsStarkVerifier, Verifier};
+use stark::verifier::IsStarkVerifier;
 
 use crate::tables::types::{BusId, GoldilocksExtension, GoldilocksField};
 
@@ -184,7 +184,7 @@ pub(crate) fn prove_traces_with_hasher(
         public_words,
         options.fri_final_poly_log_degree,
     );
-    Prover::multi_prove(
+    crate::hash_pin::BlockProver::<F, E, ()>::multi_prove(
         airs.air_trace_pairs(traces),
         &mut transcript,
         #[cfg(feature = "disk-spill")]
@@ -386,7 +386,12 @@ pub fn verify_against_chunked(
         return false;
     };
 
-    Verifier::multi_verify_views(&refs, view, &mut transcript, &expected)
+    crate::hash_pin::BlockVerifier::<F, E, ()>::multi_verify_views(
+        &refs,
+        view,
+        &mut transcript,
+        &expected,
+    )
 }
 
 /// `Σ_i 1/(z − (LfmPublic + index_i·α + Σ_l v_l·α^{2+l}))` — the fingerprint

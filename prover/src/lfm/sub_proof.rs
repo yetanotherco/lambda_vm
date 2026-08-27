@@ -178,7 +178,11 @@ impl SubProofShape {
 /// 219 redundant `Unpack`s per group.
 pub struct GroupCommitment {
     /// The root's two words as lanes.
-    pub root_lanes: [[Felt; 4]; 2],
+    /// ⚠ A `Vec`, ONE ENTRY PER DIGEST CELL, not `[_; 2]`: the array wrote the
+    /// byte digest's cell COUNT into the type, and an algebraic root is one cell
+    /// of four felts. `edsl::assert_digest_eq_lanes` zips a digest against these
+    /// and asserts the widths agree, so it works at either width unchanged.
+    pub root_lanes: Vec<[Felt; 4]>,
     pub shape: GroupShape,
 }
 
@@ -190,12 +194,17 @@ impl GroupCommitment {
         base: u32,
         shape: GroupShape,
     ) -> Self {
-        let w0 = b.hint_word(arena, base);
-        let w1 = b.hint_word(arena, base + 1);
-        GroupCommitment {
-            root_lanes: [b.unpack(w0), b.unpack(w1)],
-            shape,
-        }
+        // ⚠ The configuration's word count, not two: an algebraic root is ONE
+        // arena word of four felts. `RootCells::words_per_root` is the single
+        // definition; a second `+ 1` here would be a second definition.
+        let n = super::epoch::RootCells::words_per_root(b);
+        let root_lanes: Vec<[Felt; 4]> = (0..n)
+            .map(|i| {
+                let w = b.hint_word(arena, base + i);
+                b.unpack(w)
+            })
+            .collect();
+        GroupCommitment { root_lanes, shape }
     }
 
     /// A commitment over lanes the caller already holds — the assembled
@@ -209,7 +218,7 @@ impl GroupCommitment {
     /// because the host packs the same bytes into both. This constructor is the
     /// join, and it takes lanes rather than words precisely so there is nothing
     /// left to hint.
-    pub fn from_lanes(root_lanes: [[Felt; 4]; 2], shape: GroupShape) -> Self {
+    pub fn from_lanes(root_lanes: Vec<[Felt; 4]>, shape: GroupShape) -> Self {
         GroupCommitment { root_lanes, shape }
     }
 }

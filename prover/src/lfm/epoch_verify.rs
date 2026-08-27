@@ -281,7 +281,7 @@ pub fn emit_table_verification(
     let mut commitments: Vec<GroupCommitment> = Vec::with_capacity(groups.len());
     let push = |root: &RootCells, out: &mut Vec<GroupCommitment>| {
         let g = groups[out.len()];
-        out.push(GroupCommitment::from_lanes(root.lanes, g));
+        out.push(GroupCommitment::from_lanes(root.lanes.clone(), g));
     };
     if let Some(prep) = inputs.precomputed_root {
         push(prep, &mut commitments);
@@ -303,7 +303,7 @@ pub fn emit_table_verification(
         layers: absorbs
             .fri_roots
             .iter()
-            .map(|r| LayerCommitment::from_lanes(r.lanes))
+            .map(|r| LayerCommitment::from_lanes(r.lanes.clone()))
             .collect(),
         zetas: challenges.zetas.clone(),
         coeffs: absorbs.fri_coeffs.to_vec(),

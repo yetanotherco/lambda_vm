@@ -246,6 +246,56 @@ impl TranscriptReplay {
 
     /// Absorb a 32-byte keccak digest carried as two machine words — the shape a
     /// commitment root arrives in.
+    /// Absorb one 32-byte commitment ROOT, carried as the configuration's digest
+    /// cells — two on a byte hash, ONE on an algebraic one.
+    ///
+    /// ★ **FREE on the algebraic arm, by the cancellation the whole felt↔byte
+    /// convention exists for.** The host absorbs a root with
+    /// `append_bytes(root)`, whose payload cell is `bytes_to_cell(root)`; an
+    /// algebraic backend serialises its digest as four canonical big-endian
+    /// felts; so that call recovers exactly the digest cell the backend started
+    /// from. No decomposition, no regrouping — one `absorb_cell` of the root's
+    /// own cell.
+    ///
+    /// ⚠ Precondition, exactly as `AlgebraicTranscript::bytes_to_cell` states
+    /// it: the backend's serialisation is canonical. A non-canonical eight-byte
+    /// group would reduce, and reduction is what makes two different roots
+    /// absorb identically.
+    pub fn append_root_cells(&mut self, b: &mut LfmBuilder, cells: &[Cell]) {
+        if Self::is_algebraic(b) {
+            assert_eq!(cells.len(), 1, "an algebraic root is ONE cell");
+            let mut sponge = self.drive_chain(b);
+            // The prefix from the rule, applied at a 32-byte payload length.
+            let rule = AlgebraicTranscript::append_bytes_cells(&[0u8; 32]);
+            assert_eq!(rule.len(), 2, "32 bytes is one prefix and one cell");
+            let prefix = b.digest_const(rule[0]);
+            sponge.absorb(b, prefix.as_cell());
+            sponge.absorb(b, cells[0]);
+            self.sponge = Some(sponge);
+            return;
+        }
+        let mut halves = Vec::with_capacity(4 * cells.len());
+        for c in cells {
+            halves.extend_from_slice(&b.unpack(*c));
+        }
+        self.append_halves(&halves);
+    }
+
+    /// [`Self::append_root_cells`] where the cursor is not 4-byte aligned — the
+    /// statement leg's position. Identical on the algebraic arm, which has no
+    /// cursor at all.
+    pub fn append_root_cells_misaligned(&mut self, b: &mut LfmBuilder, cells: &[Cell]) {
+        if Self::is_algebraic(b) {
+            self.append_root_cells(b, cells);
+            return;
+        }
+        let mut halves = Vec::with_capacity(4 * cells.len());
+        for c in cells {
+            halves.extend_from_slice(&b.unpack(*c));
+        }
+        self.append_halves_misaligned(&halves);
+    }
+
     /// ⚠ ONE append, not two, and on the algebraic arm that is the difference
     /// between the host's transcript and a different one: the host absorbs a
     /// root with a single `append_bytes(root)`, so a machine that absorbed the
