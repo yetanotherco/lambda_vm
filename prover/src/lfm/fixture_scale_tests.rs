@@ -274,15 +274,12 @@ fn census_totals(program: &LfmProgram, kind: HasherKind) -> (u64, u64, u64) {
 #[test]
 #[ignore]
 fn the_scaled_fixture_census() {
-    let shapes = [
-        FixtureShape::default(),
-        GREEN,
-        FixtureShape::new(16, 64),
-        FixtureShape::new(16, 256),
-        FixtureShape::new(16, 1024),
-        FixtureShape::new(16, 4096),
-        FixtureShape::new(16, 16384),
-    ];
+    let mut shapes = vec![FixtureShape::default(), GREEN];
+    let mut q = 32;
+    while q <= 4096 {
+        shapes.push(FixtureShape::new(16, q));
+        q *= 2;
+    }
     println!(
         "{:>18}  {:>8}  {:>7}  {:>13}  {:>13}  {:>6}",
         "shape", "hashinv", "hasher", "total cells", "LFM_HASH", "share"
