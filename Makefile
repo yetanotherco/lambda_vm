@@ -514,8 +514,12 @@ check-ethrex-fixture-checksums:
 # differential tests (the keccak sponge vs sha3 reference). Run them explicitly
 # in the crate dir; wired into `test` below and run as a dedicated step
 # in CI's cli-test job (pr_main.yaml).
+# Release too: the allocator's `init` guard degrades to an early return once
+# `debug_assert!` is compiled out, which is the configuration guests are built in,
+# and the test for that path is `#[cfg(not(debug_assertions))]`.
 test-syscalls:
 	cd syscalls && cargo test
+	cd syscalls && cargo test --release
 
 # ethrex-crypto is a detached workspace (excluded from the root members), so a
 # root `cargo test` never runs it. Run it explicitly, like test-syscalls.
@@ -561,23 +565,34 @@ test-disk-spill:
 	cargo test --release -p stark --features disk-spill disk_spill
 	FORCE_DISK_SPILL=1 cargo test --release -p lambda-vm-prover --features disk-spill -- disk_spill count_table_lengths
 
-# math-cuda parity tests (requires NVIDIA GPU + nvcc)
+# Per-target wall clock for the GPU prover targets below. A panic on a device-only
+# cliff assert can leave the prover hung rather than aborting — the panicking thread
+# unwinds while its siblings stay parked in CUDA driver waits, and the process never
+# exits — which would hold the rented merge-queue box until the workflow timeout.
+# 45 min is generous against their normal runtime; the SIGKILL follows 30s later, and
+# timeout's 124 exit fails the target so gpu_test.sh reports the group as failed.
+GPU_TEST_TIMEOUT := timeout -k 30 2700
+
+# math-cuda kernel tests (requires NVIDIA GPU + nvcc). Group 1 of gpu_test.sh,
+# so a hang here also costs Groups 2-5: they run after it, sequentially.
 test-math-cuda:
-	cargo test -p math-cuda --release
+	$(GPU_TEST_TIMEOUT) cargo test -p math-cuda --release
 
 # End-to-end cuda dispatch coverage (requires NVIDIA GPU + nvcc).
 # Asserts the R1-R4 GPU dispatch counters fired on a real prove.
 # --test-threads=1: these tests reset and assert on process-global GPU call
 # counters, so they must run serially or one test's reset races another's read.
 test-cuda-integration:
-	cargo test -p lambda-vm-prover --release --features cuda \
+	$(GPU_TEST_TIMEOUT) cargo test -p lambda-vm-prover --release --features cuda \
 	    --test cuda_path_integration -- --ignored --nocapture --test-threads=1
 
 # GPU error-path coverage (requires NVIDIA GPU + nvcc).
 # Forces cuda dispatch errors and asserts the CPU fallback still produces a verifying proof.
 test-cuda-fallback:
-	cargo test -p lambda-vm-prover --release --features test-cuda-faults \
+	$(GPU_TEST_TIMEOUT) cargo test -p lambda-vm-prover --release --features test-cuda-faults \
 	    --test cuda_fallback_tests -- --ignored --nocapture --test-threads=1
+	$(GPU_TEST_TIMEOUT) cargo test -p lambda-vm-prover --release --features lambda-vm-prover/cuda \
+	    --test gpu_force_downgrade -- --ignored --nocapture --test-threads=1
 
 # The prover/stark/crypto/ecsm test suite with the GPU (cuda) path enabled (requires NVIDIA
 # GPU + nvcc). The GPU CI counterpart of CPU CI's sharded prover tests. Single-threaded: the
@@ -586,14 +601,14 @@ test-cuda-fallback:
 # compile-recursion-elfs: this unfiltered run executes the non-ignored recursion
 # smoke tests, which read prebuilt guest ELFs; scripts/gpu_test.sh otherwise never builds them.
 test-prover-cuda: compile-recursion-elfs
-	cargo test --release -p lambda-vm-prover -p stark -p crypto -p ecsm \
+	$(GPU_TEST_TIMEOUT) cargo test --release -p lambda-vm-prover -p stark -p crypto -p ecsm \
 	    --features lambda-vm-prover/cuda -- --test-threads=1
 
 # The comprehensive all-instructions prove (ignored by default) on the GPU path (requires
 # NVIDIA GPU + nvcc). GPU counterpart of the all-instructions half of CPU CI's merge-queue-only
 # comprehensive job (the CPU job also runs test_recursion_execute; recursion has no GPU leg yet).
 test-prover-comprehensive-cuda:
-	cargo test --release -p lambda-vm-prover --features cuda \
+	$(GPU_TEST_TIMEOUT) cargo test --release -p lambda-vm-prover --features cuda \
 	    test_prove_elfs_all_instructions_64_full -- --ignored --test-threads=1 --nocapture
 
 # math-cuda quick microbench (median of 10 runs)
