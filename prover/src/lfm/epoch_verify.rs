@@ -329,7 +329,10 @@ pub fn emit_table_verification(
                         let lo = b.hint_word(arenas.openings, cursor);
                         let hi = b.hint_word(arenas.openings, cursor + 1);
                         cursor += 2;
-                        [lo, hi]
+                        // Two arena words per sibling IS the digest's width. When
+                        // the algebraic path lands this stride follows the width
+                        // rather than the literal.
+                        super::edsl::WrapDigest::from_pair(lo, hi)
                     })
                     .collect();
                 GroupOpening { values, siblings }

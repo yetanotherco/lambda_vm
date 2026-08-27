@@ -227,7 +227,81 @@ pub fn merkle_walk(
 /// across the two, which is what lets the constructions below be parameterized
 /// on the hash rather than duplicated per hash. The `LFM_HASH` socket would
 /// NOT have this property — its digest is 128 bits, one cell.
-pub type WrapDigest = [Cell; 2];
+/// The largest number of cells any wrap digest occupies — two, for the byte
+/// hashes' 32 bytes.
+pub const MAX_DIGEST_CELLS: usize = 2;
+
+/// A commitment digest as it lives in the machine, carrying its own WIDTH.
+///
+/// ★ **The width is data, not a constant, and that is the whole point.** A byte
+/// hash's digest is 32 bytes — two words of four `u32` halves. An **algebraic**
+/// hash's digest is four field elements: **ONE cell**. Both flow through the
+/// same walks, comparisons and openings, so the shape travels with the value
+/// rather than being written into every call site.
+///
+/// Before this, the type was `[Cell; 2]` and five root comparisons plus two
+/// Merkle walks each spelled the count out as `d[0]`, `d[1]`. Those are the
+/// sites a one-cell digest would have silently half-worked at.
+///
+/// Derefs to `[Cell]`, so `d[0]`, `d.len()` and `d.iter()` keep working and the
+/// forty-odd sites that only carry a digest around are untouched.
+#[derive(Debug, Clone, Copy)]
+pub struct WrapDigest {
+    cells: [Cell; MAX_DIGEST_CELLS],
+    len: u8,
+}
+
+impl WrapDigest {
+    /// A two-cell digest — the byte hashes' 32 bytes.
+    pub fn from_pair(a: Cell, b: Cell) -> Self {
+        WrapDigest {
+            cells: [a, b],
+            len: 2,
+        }
+    }
+
+    /// A ONE-cell digest — an algebraic hash's four felts.
+    ///
+    /// The unused slot repeats the cell rather than holding a sentinel: nothing
+    /// reads past `len`, and a repeated handle cannot be mistaken for a real
+    /// second word the way a zero cell could.
+    pub fn from_cell(c: Cell) -> Self {
+        WrapDigest {
+            cells: [c, c],
+            len: 1,
+        }
+    }
+
+    /// A digest of the same width as `cells`, from a slice.
+    ///
+    /// Used by the Merkle walks, which rebuild a digest cell by cell after
+    /// selecting each against its sibling on the level's bit.
+    pub fn from_cells(cells: &[Cell]) -> Self {
+        assert!(
+            (1..=MAX_DIGEST_CELLS).contains(&cells.len()),
+            "a digest is one or two cells, got {}",
+            cells.len()
+        );
+        let mut out = [cells[0]; MAX_DIGEST_CELLS];
+        out[..cells.len()].copy_from_slice(cells);
+        WrapDigest {
+            cells: out,
+            len: cells.len() as u8,
+        }
+    }
+
+    /// The cells this digest actually occupies.
+    pub fn cells(&self) -> &[Cell] {
+        &self.cells[..self.len as usize]
+    }
+}
+
+impl core::ops::Deref for WrapDigest {
+    type Target = [Cell];
+    fn deref(&self) -> &[Cell] {
+        self.cells()
+    }
+}
 
 /// A 32-byte keccak digest. See [`WrapDigest`].
 pub type KeccakDigest = WrapDigest;
@@ -514,8 +588,14 @@ impl WrapHash {
     /// blocks with zero padding and an explicit `block_len`.
     pub fn hash_bytes(self, b: &mut LfmBuilder, stream: &[Felt], len_bytes: usize) -> WrapDigest {
         match self {
-            WrapHash::Keccak => keccak256(b, stream, len_bytes),
-            WrapHash::Blake3 => blake3_256(b, stream, len_bytes),
+            WrapHash::Keccak => {
+                let d = keccak256(b, stream, len_bytes);
+                WrapDigest::from_pair(d[0], d[1])
+            }
+            WrapHash::Blake3 => {
+                let d = blake3_256(b, stream, len_bytes);
+                WrapDigest::from_pair(d[0], d[1])
+            }
             WrapHash::Algebraic => Self::algebraic_byte_hash_unreachable(),
         }
     }
@@ -534,8 +614,14 @@ impl WrapHash {
         len_bytes: usize,
     ) -> (WrapDigest, [Cell; 2]) {
         match self {
-            WrapHash::Keccak => keccak256_with_rev(b, stream, len_bytes),
-            WrapHash::Blake3 => blake3_256_with_rev(b, stream, len_bytes),
+            WrapHash::Keccak => {
+                let (d, rev) = keccak256_with_rev(b, stream, len_bytes);
+                (WrapDigest::from_pair(d[0], d[1]), rev)
+            }
+            WrapHash::Blake3 => {
+                let (d, rev) = blake3_256_with_rev(b, stream, len_bytes);
+                (WrapDigest::from_pair(d[0], d[1]), rev)
+            }
             WrapHash::Algebraic => Self::algebraic_byte_hash_unreachable(),
         }
     }
@@ -590,10 +676,27 @@ impl WrapHash {
         assert_eq!(bits.len(), siblings.len(), "one sibling per level");
         let mut current = leaf;
         for (bit, sibling) in bits.iter().zip(siblings) {
-            // Both halves of the digest must swap on the SAME bit.
-            let (l0, r0) = b.select(*bit, current[0], sibling[0]);
-            let (l1, r1) = b.select(*bit, current[1], sibling[1]);
-            current = self.hash_pair(b, [l0, l1], [r0, r1]);
+            // ★ EVERY cell of the digest swaps on the SAME bit — a loop rather
+            // than two hard-coded halves, so a ONE-cell algebraic digest costs
+            // ONE select per level where a byte digest costs two.
+            debug_assert_eq!(
+                current.len(),
+                sibling.len(),
+                "a node and its sibling must be the same width"
+            );
+            let mut left = [current[0]; MAX_DIGEST_CELLS];
+            let mut right = [current[0]; MAX_DIGEST_CELLS];
+            for k in 0..current.len() {
+                let (l, r) = b.select(*bit, current[k], sibling[k]);
+                left[k] = l;
+                right[k] = r;
+            }
+            let n = current.len();
+            current = self.hash_pair(
+                b,
+                WrapDigest::from_cells(&left[..n]),
+                WrapDigest::from_cells(&right[..n]),
+            );
         }
         current
     }
@@ -991,7 +1094,7 @@ fn blake3_absorb_all(
         h = [out[0], out[1]];
     }
 
-    (h, rev)
+    (WrapDigest::from_pair(h[0], h[1]), rev)
 }
 
 fn keccak256_absorb_all(

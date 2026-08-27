@@ -904,12 +904,12 @@ fn control_program_source(
                     c
                 })
                 .collect();
-            let siblings: Vec<[Cell; 2]> = (0..shape.merkle_depth)
+            let siblings: Vec<super::edsl::WrapDigest> = (0..shape.merkle_depth)
                 .map(|_| {
                     let lo = b.hint_word(queries, cursor);
                     let hi = b.hint_word(queries, cursor + 1);
                     cursor += 2;
-                    [lo, hi]
+                    super::edsl::WrapDigest::from_pair(lo, hi)
                 })
                 .collect();
             GroupOpening { values, siblings }

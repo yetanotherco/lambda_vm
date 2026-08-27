@@ -105,7 +105,8 @@ pub struct Candidate {
 /// draw that consumes one or two candidates emits a single `Unpack`.
 #[derive(Clone)]
 struct SqueezeBuf {
-    words: [Cell; DIGEST_WORDS],
+    // Carries its own width, so an algebraic squeeze (ONE cell) fits unchanged.
+    words: edsl::WrapDigest,
     lanes: [Option<[Felt; 4]>; DIGEST_WORDS],
 }
 
@@ -346,7 +347,7 @@ impl TranscriptReplay {
     /// segment to the reversed digest, and hands back both digests — the plain
     /// one because candidates are read off it, the reversed one because it is
     /// what `sample()` returns.
-    fn squeeze(&mut self, b: &mut LfmBuilder) -> ([Cell; DIGEST_WORDS], [Cell; DIGEST_WORDS]) {
+    fn squeeze(&mut self, b: &mut LfmBuilder) -> (edsl::WrapDigest, [Cell; DIGEST_WORDS]) {
         let packed = self.pack_segment(b);
         let (plain, rev) = edsl::wrap_hash_bytes_with_rev(b, &packed, self.segment_len);
         // The transcript absorbs the reversed bytes into a freshly reset hasher,
@@ -525,7 +526,7 @@ impl TranscriptReplay {
     /// squeeze). Packing is free for an aligned segment — which this one is,
     /// every caller reaching grinding through a `sample` — and a re-emitted
     /// splice would only be redundant work, never a different value.
-    pub fn state(&mut self, b: &mut LfmBuilder) -> [Cell; DIGEST_WORDS] {
+    pub fn state(&mut self, b: &mut LfmBuilder) -> edsl::WrapDigest {
         let packed = self.pack_segment(b);
         edsl::wrap_hash_bytes(b, &packed, self.segment_len)
     }
@@ -934,7 +935,7 @@ impl ByteString {
     /// For folds that follow the configuration — grinding, whose host side
     /// reaches the digest through `GrindingDigest<H>` (P-a Stage 3,
     /// `crypto/stark/src/config.rs`) and therefore moves with `H`.
-    pub fn wrap_hash(&self, b: &mut LfmBuilder) -> [Cell; DIGEST_WORDS] {
+    pub fn wrap_hash(&self, b: &mut LfmBuilder) -> edsl::WrapDigest {
         let packed = pack_pieces(&self.pieces, b);
         edsl::wrap_hash_bytes(b, &packed, self.len)
     }

@@ -601,7 +601,10 @@ pub fn emit_sub_proof_with_bits(
                         let lo = b.hint_word(queries, cursor);
                         let hi = b.hint_word(queries, cursor + 1);
                         cursor += 2;
-                        [lo, hi]
+                        // Two arena words per sibling IS the digest's width. When
+                        // the algebraic path lands this stride follows the width
+                        // rather than the literal.
+                        edsl::WrapDigest::from_pair(lo, hi)
                     })
                     .collect();
                 GroupOpening { values, siblings }

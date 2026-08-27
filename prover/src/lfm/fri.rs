@@ -420,7 +420,8 @@ pub fn hint_layer_openings_from(
                     let lo = b.hint_word(arena, cursor);
                     let hi = b.hint_word(arena, cursor + 1);
                     cursor += 2;
-                    [lo, hi]
+                    // Two arena words per sibling IS the digest's width.
+                    edsl::WrapDigest::from_pair(lo, hi)
                 })
                 .collect();
             LayerOpening { sym, siblings }

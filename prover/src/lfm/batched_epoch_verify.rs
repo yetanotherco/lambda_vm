@@ -125,9 +125,26 @@ pub fn emit_mixed_verify_batch(
     for (level, (bit, sibling)) in bits.iter().zip(siblings).enumerate() {
         // Both halves of the digest must swap on the SAME bit; bit = 0 means
         // the current node is the LEFT child, as in every walk here.
-        let (l0, r0) = b.select(*bit, acc[0], sibling[0]);
-        let (l1, r1) = b.select(*bit, acc[1], sibling[1]);
-        let mut parent = edsl::wrap_hash_pair(b, [l0, l1], [r0, r1]);
+        // ★ Every cell swaps on the SAME bit — a loop, so a one-cell algebraic
+        // digest costs ONE select per level where a byte digest costs two.
+        debug_assert_eq!(
+            acc.len(),
+            sibling.len(),
+            "node and sibling widths must match"
+        );
+        let n = acc.len();
+        let mut left = [acc[0]; edsl::MAX_DIGEST_CELLS];
+        let mut right = [acc[0]; edsl::MAX_DIGEST_CELLS];
+        for k in 0..n {
+            let (l, r) = b.select(*bit, acc[k], sibling[k]);
+            left[k] = l;
+            right[k] = r;
+        }
+        let mut parent = edsl::wrap_hash_pair(
+            b,
+            edsl::WrapDigest::from_cells(&left[..n]),
+            edsl::WrapDigest::from_cells(&right[..n]),
+        );
 
         // The injection, unrolled: heights are shape, so whether a group
         // enters here is decided now, not by an emitted branch.

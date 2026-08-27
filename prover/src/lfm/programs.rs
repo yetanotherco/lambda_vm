@@ -857,12 +857,12 @@ pub fn merkle_opening_program_source_with_hash(
     let index = b.hint_felt(index_arena, 0);
     let bits = b.bit_dec(index, shape.depth);
 
-    let siblings: Vec<[Cell; 2]> = (0..shape.depth as u32)
+    let siblings: Vec<edsl::WrapDigest> = (0..shape.depth as u32)
         .map(|l| {
-            [
+            edsl::WrapDigest::from_pair(
                 b.hint_word(sibling_arena, 2 * l),
                 b.hint_word(sibling_arena, 2 * l + 1),
-            ]
+            )
         })
         .collect();
 
@@ -1139,7 +1139,8 @@ pub fn emit_program_id(
     // `edsl::keccak256`" — produces a wrong proof exactly here, because
     // grinding (`epoch::emit_grinding_check`) shares this type and DOES follow
     // the configuration.
-    s.keccak256(b)
+    let d = s.keccak256(b);
+    super::edsl::WrapDigest::from_pair(d[0], d[1])
 }
 
 pub fn program_id_program(shape: ProgramIdShape) -> LfmProgram {

@@ -950,7 +950,10 @@ fn hint_digests(
 ) -> Vec<edsl::WrapDigest> {
     (0..count)
         .map(|_| {
-            let d = [b.hint_word(arena, *cursor), b.hint_word(arena, *cursor + 1)];
+            let d = super::edsl::WrapDigest::from_pair(
+                b.hint_word(arena, *cursor),
+                b.hint_word(arena, *cursor + 1),
+            );
             *cursor += 2;
             d
         })

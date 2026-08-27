@@ -707,8 +707,13 @@ fn the_merkle_constructions_agree_with_the_host_under_both_hashes() {
         // The same tree, in the machine, from hinted leaf digests.
         let mut b = LfmBuilder::new().with_wrap_hash(hash);
         let arena = b.declare_arena(8);
-        let cells: Vec<[Cell; 2]> = (0..4)
-            .map(|i| [b.hint_word(arena, 2 * i), b.hint_word(arena, 2 * i + 1)])
+        let cells: Vec<edsl::WrapDigest> = (0..4)
+            .map(|i| {
+                edsl::WrapDigest::from_pair(
+                    b.hint_word(arena, 2 * i),
+                    b.hint_word(arena, 2 * i + 1),
+                )
+            })
             .collect();
         let root = edsl::wrap_merkle_tree_root(&mut b, &cells);
         b.public(root[0]);

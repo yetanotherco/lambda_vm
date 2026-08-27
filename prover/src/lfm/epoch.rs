@@ -49,7 +49,7 @@
 
 use crate::tables::types::{FE, FEE, GoldilocksExtension};
 
-use super::builder::{Bit, Cell, Ext, Felt, LfmBuilder};
+use super::builder::{Bit, Ext, Felt, LfmBuilder};
 use super::fri::FriShape;
 use super::layout::keccak::DIGEST_WORDS;
 use super::transcript_replay::{ByteString, TranscriptReplay};
@@ -367,7 +367,9 @@ fn assert_ne_ext(b: &mut LfmBuilder, x: Ext, y: Ext) {
 /// every query index at zero cost.
 pub(super) fn emit_grinding_check(
     b: &mut LfmBuilder,
-    seed: [Cell; DIGEST_WORDS],
+    // `seed` carries its own width, so an algebraic seed (ONE cell) needs no
+    // change here.
+    seed: super::edsl::WrapDigest,
     nonce_halves: [Felt; 2],
     factor: u8,
 ) {
@@ -379,8 +381,8 @@ pub(super) fn emit_grinding_check(
     let mut inner = ByteString::new();
     inner.push_const(&GRINDING_PREFIX);
     let mut seed_halves = Vec::with_capacity(8);
-    for w in seed {
-        seed_halves.extend_from_slice(&b.unpack(w));
+    for w in seed.iter() {
+        seed_halves.extend_from_slice(&b.unpack(*w));
     }
     inner.push_halves(&seed_halves);
     inner.push_const(&[factor]);
@@ -388,8 +390,8 @@ pub(super) fn emit_grinding_check(
 
     let mut outer = ByteString::new();
     let mut inner_halves = Vec::with_capacity(8);
-    for w in inner_hash {
-        inner_halves.extend_from_slice(&b.unpack(w));
+    for w in inner_hash.iter() {
+        inner_halves.extend_from_slice(&b.unpack(*w));
     }
     outer.push_halves(&inner_halves);
     outer.push_halves(&nonce_halves);
