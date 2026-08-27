@@ -380,10 +380,10 @@ pub(super) fn emit_grinding_check(
         "a grinding factor is in 1..=64 (grinding.rs:22-25), got {factor}"
     );
 
-    if b.wrap_hash() == super::edsl::WrapHash::Algebraic {
+    let Some(byte_hash) = b.wrap_hash().byte_hash() else {
         emit_algebraic_grinding_check(b, seed, nonce, factor);
         return;
-    }
+    };
 
     let nonce_halves = nonce_halves(b, nonce);
     let mut inner = ByteString::new();
@@ -394,7 +394,7 @@ pub(super) fn emit_grinding_check(
     }
     inner.push_halves(&seed_halves);
     inner.push_const(&[factor]);
-    let inner_hash = inner.wrap_hash(b);
+    let inner_hash = inner.wrap_hash(b, byte_hash);
 
     let mut outer = ByteString::new();
     let mut inner_halves = Vec::with_capacity(8);
@@ -403,7 +403,7 @@ pub(super) fn emit_grinding_check(
     }
     outer.push_halves(&inner_halves);
     outer.push_halves(&nonce_halves);
-    let digest = outer.wrap_hash(b);
+    let digest = outer.wrap_hash(b, byte_hash);
 
     // The zero bits, as `(byte, bit-within-byte)` pairs of the big-endian run:
     // `factor / 8` whole leading bytes, then the top `factor % 8` bits of the

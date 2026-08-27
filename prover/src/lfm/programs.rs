@@ -217,7 +217,14 @@ pub fn blake3_sponge_program_source(len_bytes: usize) -> LfmProgramSource {
     let num_halves = super::keccak_host::num_stream_halves(len_bytes) as u32;
     let arena = b.declare_arena(num_halves);
     let stream: Vec<_> = (0..num_halves).map(|i| b.hint_felt(arena, i)).collect();
-    let digest = super::edsl::wrap_hash_bytes(&mut b, &stream, len_bytes);
+    // The builder is pinned to BLAKE3 above, so this names the byte hash
+    // directly — which a program that is ABOUT a hash should do anyway.
+    let digest = super::edsl::wrap_hash_bytes(
+        &mut b,
+        super::edsl::ByteWrapHash::Blake3,
+        &stream,
+        len_bytes,
+    );
     b.public(digest[0]);
     b.public(digest[1]);
     b.finish()

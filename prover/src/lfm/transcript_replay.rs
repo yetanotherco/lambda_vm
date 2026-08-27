@@ -56,7 +56,7 @@ use crate::tables::types::FE;
 
 use super::algebraic_transcript::AlgebraicTranscript;
 use super::builder::{Bit, Cell, Ext, Felt, LfmBuilder};
-use super::edsl::{self, SpongeVar, WrapHash};
+use super::edsl::{self, ByteWrapHash, SpongeVar, WrapHash};
 use super::keccak_host::{BYTES_PER_HALF, SQUEEZE_LEN};
 use super::layout::keccak::DIGEST_WORDS;
 
@@ -526,13 +526,13 @@ impl TranscriptReplay {
     /// own canonical self-advance so that the method is total on both arms
     /// instead of being a hole one configuration falls into.
     pub fn sample(&mut self, b: &mut LfmBuilder) -> edsl::WrapDigest {
-        if Self::is_algebraic(b) {
+        let Some(h) = b.wrap_hash().byte_hash() else {
             let mut sponge = self.drive_chain(b);
             let c = sponge.squeeze_cell(b);
             self.sponge = Some(sponge);
             return edsl::WrapDigest::from_cell(c);
-        }
-        let (_plain, rev) = self.squeeze(b);
+        };
+        let (_plain, rev) = self.squeeze(b, h);
         self.buf = None;
         self.out_pos = SQUEEZE_LEN;
         edsl::WrapDigest::from_pair(rev[0], rev[1])
@@ -542,9 +542,13 @@ impl TranscriptReplay {
     /// segment to the reversed digest, and hands back both digests — the plain
     /// one because candidates are read off it, the reversed one because it is
     /// what `sample()` returns.
-    fn squeeze(&mut self, b: &mut LfmBuilder) -> (edsl::WrapDigest, [Cell; DIGEST_WORDS]) {
+    fn squeeze(
+        &mut self,
+        b: &mut LfmBuilder,
+        h: ByteWrapHash,
+    ) -> (edsl::WrapDigest, [Cell; DIGEST_WORDS]) {
         let packed = self.pack_segment(b);
-        let (plain, rev) = edsl::wrap_hash_bytes_with_rev(b, &packed, self.segment_len);
+        let (plain, rev) = edsl::wrap_hash_bytes_with_rev(b, h, &packed, self.segment_len);
         // The transcript absorbs the reversed bytes into a freshly reset hasher,
         // so they are the WHOLE of the next segment, not a suffix of this one.
         let mut halves = Vec::with_capacity(SQUEEZE_HALVES);
@@ -560,8 +564,8 @@ impl TranscriptReplay {
     }
 
     /// Refill the output buffer with one squeeze, as `next_sample_u64` does.
-    fn refill(&mut self, b: &mut LfmBuilder) {
-        let (plain, _rev) = self.squeeze(b);
+    fn refill(&mut self, b: &mut LfmBuilder, h: ByteWrapHash) {
+        let (plain, _rev) = self.squeeze(b, h);
         self.buf = Some(SqueezeBuf {
             words: plain,
             lanes: [None; DIGEST_WORDS],
@@ -583,9 +587,9 @@ impl TranscriptReplay {
     /// [`Self::sample_felt`], [`Self::sample_ext`] and [`Self::sample_u64_pow2`]
     /// takes its own path there. None of them reaches here, which is why this
     /// method needs no arm rather than needing a guard.
-    pub fn next_candidate(&mut self, b: &mut LfmBuilder) -> Candidate {
+    pub fn next_candidate(&mut self, b: &mut LfmBuilder, h: ByteWrapHash) -> Candidate {
         if self.out_pos + CANDIDATE_BYTES > SQUEEZE_LEN {
-            self.refill(b);
+            self.refill(b, h);
         }
         debug_assert_eq!(
             self.out_pos % CANDIDATE_BYTES,
@@ -651,7 +655,7 @@ impl TranscriptReplay {
     /// `sample_u64` reaches the raw candidate stream, not the fixed schedule,
     /// and at a power-of-two bound it accepts its first candidate.
     pub fn sample_felt(&mut self, b: &mut LfmBuilder) -> Felt {
-        if Self::is_algebraic(b) {
+        let Some(h) = b.wrap_hash().byte_hash() else {
             // Lane 0 of one squeezed cell. ⚠ No host counterpart: an algebraic
             // transcript has no base-field draw — `sample_field_element` returns
             // an Fp3 element and reads three lanes at once. This exists so the
@@ -662,9 +666,9 @@ impl TranscriptReplay {
             self.sponge = Some(sponge);
             let [lane0, _, _, _] = b.unpack(c);
             return lane0;
-        }
+        };
         let n = candidates_per_coordinate(b.wrap_hash());
-        let candidates: Vec<Candidate> = (0..n).map(|_| self.next_candidate(b)).collect();
+        let candidates: Vec<Candidate> = (0..n).map(|_| self.next_candidate(b, h)).collect();
 
         // The fallback is the LAST candidate, matching the host's
         // `chosen.unwrap_or(last)`: when everything missed it hands back an
@@ -738,7 +742,7 @@ impl TranscriptReplay {
             "sample_u64_pow2: nbits must be in 1..=32, got {nbits} — above 32 the \
              answer would span both halves of the candidate"
         );
-        if Self::is_algebraic(b) {
+        let Some(h) = b.wrap_hash().byte_hash() else {
             // `sample_u64` at a power-of-two bound is `canonical(cell[0]) &
             // (bound − 1)` — the low `nbits` of lane 0, which is exactly what
             // `squeeze_bits` decomposes. Constant consumption either way: one
@@ -747,8 +751,8 @@ impl TranscriptReplay {
             let bits = sponge.squeeze_bits(b, nbits);
             self.sponge = Some(sponge);
             return bits;
-        }
-        let c = self.next_candidate(b);
+        };
+        let c = self.next_candidate(b, h);
         b.bit_dec(c.lo, nbits)
     }
 
@@ -766,7 +770,7 @@ impl TranscriptReplay {
     /// every caller reaching grinding through a `sample` — and a re-emitted
     /// splice would only be redundant work, never a different value.
     pub fn state(&mut self, b: &mut LfmBuilder) -> edsl::WrapDigest {
-        if Self::is_algebraic(b) {
+        let Some(h) = b.wrap_hash().byte_hash() else {
             // The chain's state cell, which is what `AlgebraicTranscript::state`
             // serialises. Draining the pending appends here is not the extra
             // step the byte arm's double pack is — the chain absorbs them once
@@ -776,9 +780,9 @@ impl TranscriptReplay {
             let cell = sponge.state();
             self.sponge = Some(sponge);
             return edsl::WrapDigest::from_cell(cell);
-        }
+        };
         let packed = self.pack_segment(b);
-        edsl::wrap_hash_bytes(b, &packed, self.segment_len)
+        edsl::wrap_hash_bytes(b, h, &packed, self.segment_len)
     }
 
     /// Emit-time buffer position, for tests that pin the consumption schedule.
@@ -1266,9 +1270,14 @@ impl ByteString {
     /// For folds that follow the configuration — grinding, whose host side
     /// reaches the digest through `GrindingDigest<H>` (P-a Stage 3,
     /// `crypto/stark/src/config.rs`) and therefore moves with `H`.
-    pub fn wrap_hash(&self, b: &mut LfmBuilder) -> edsl::WrapDigest {
+    ///
+    /// ⚠ Takes the byte hash rather than reading the builder's, because a
+    /// `ByteString` IS a byte stream: there is no algebraic reading of one, and
+    /// the caller that has an algebraic configuration must have handled it
+    /// before assembling any bytes at all. The parameter is where that shows up.
+    pub fn wrap_hash(&self, b: &mut LfmBuilder, h: ByteWrapHash) -> edsl::WrapDigest {
         let packed = pack_pieces(&self.pieces, b);
-        edsl::wrap_hash_bytes(b, &packed, self.len)
+        edsl::wrap_hash_bytes(b, h, &packed, self.len)
     }
 }
 

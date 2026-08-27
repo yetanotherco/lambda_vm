@@ -65,7 +65,7 @@ pub fn emit_group_leaf_hash(b: &mut LfmBuilder, group: &[&MixedMatrixOpening<'_>
     // ★ The ALGEBRAIC path absorbs the felts — same reasoning as
     // `sub_proof::emit_leaf_hash`: the byte stream below is a serialisation of
     // field elements that exists only for a byte-oriented hash.
-    if edsl::WrapHash::production() == edsl::WrapHash::Algebraic {
+    let Some(byte_hash) = b.wrap_hash().byte_hash() else {
         let mut felts: Vec<Felt> = Vec::new();
         for m in group {
             assert_eq!(
@@ -83,7 +83,7 @@ pub fn emit_group_leaf_hash(b: &mut LfmBuilder, group: &[&MixedMatrixOpening<'_>
             }
         }
         return edsl::wrap_leaf_hash(b, &felts);
-    }
+    };
 
     let mut stream: Vec<Felt> = Vec::new();
     for m in group {
@@ -104,7 +104,7 @@ pub fn emit_group_leaf_hash(b: &mut LfmBuilder, group: &[&MixedMatrixOpening<'_>
         }
     }
     let len_bytes = BYTES_PER_HALF * stream.len();
-    edsl::wrap_hash_bytes(b, &stream, len_bytes)
+    edsl::wrap_hash_bytes(b, byte_hash, &stream, len_bytes)
 }
 
 /// Authenticate one mixed round's openings against its committed root — the

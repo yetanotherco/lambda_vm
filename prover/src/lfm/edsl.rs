@@ -551,90 +551,33 @@ impl WrapHash {
         }
     }
 
-    /// ⚠ **The byte-stream constructions have no algebraic meaning, and this is the
-    /// boundary that says so out loud.**
+    /// This configuration's BYTE-stream hash, when it has one.
     ///
-    /// `hash_bytes` and `hash_bytes_with_rev` return [`WrapDigest`] — TWO cells,
-    /// because a byte hash's digest is 32 bytes. An algebraic digest is four felts,
-    /// i.e. ONE cell, so there is no value of the return type that would be
-    /// correct. The "rev" half is worse: it is a BYTE reversal, which is not an
-    /// operation on a field element at all.
+    /// ★ `None` on the algebraic arm is a FACT about that arm, not an error to
+    /// report. A byte-stream hash returns a 32-byte digest — two cells — and an
+    /// algebraic digest is four felts, one cell; there is no value of the return
+    /// type that would be correct. The "rev" half is worse still: a BYTE
+    /// reversal is not an operation on a field element at all.
     ///
-    /// So these are not functions with a missing arm; they are the wrong API for
-    /// this hash. The fix is at the CALL SITES — `transcript_replay.rs`,
-    /// `sub_proof.rs`, `batched_epoch_verify.rs` — which serialise felts to a byte
-    /// stream only because the incumbent hashes are byte-oriented. The algebraic
-    /// path deletes that serialisation rather than reimplementing it, and that is
-    /// the remaining piece of B, gated on `WrapDigest` becoming shape-carrying.
+    /// ⚠ **This replaces an emit-time panic, and the replacement is the point.**
+    /// While the byte constructions lived on [`WrapHash`] itself they needed an
+    /// algebraic arm, and that arm could only panic. The panic was recorded as an
+    /// INTERIM whose exit was "the algebraic path becomes UNABLE to reach a
+    /// byte-digest API, and then the panic is DELETED rather than kept as a
+    /// belt" — a retained defensive panic behind a type-level impossibility being
+    /// exactly the dead production panic this repo's no-production-panic policy
+    /// exists to prevent. Moving the constructions to [`ByteWrapHash`] is that
+    /// exit: an algebraic configuration cannot name them, so there is nothing
+    /// left to defend against.
     ///
-    /// ⚠ **THIS PANIC IS AN INTERIM WITH A DEFINED EXIT, not a considered permanent
-    /// choice.** When [`WrapDigest`] becomes shape-carrying, the algebraic path must
-    /// become UNABLE to reach a byte-digest API — and at that point **this function
-    /// is DELETED, not kept as a belt.** A retained "defensive" panic behind a
-    /// type-level impossibility is exactly the dead production panic this repo's
-    /// no-production-panic policy exists to prevent.
-    ///
-    /// Until then this panics at EMIT time rather than returning something wrong.
-    /// That is deliberate and it matches this file's existing idiom
-    /// (`merkle_walk`'s "one sibling per level" assert): an emitter invariant is
-    /// checked when the program is built, where the failure names the cause, rather
-    /// than surfacing later as an unprovable row that names neither the hash nor
-    /// the site. It is not reachable by proof data — only by an emitter that routes
-    /// the algebraic path through the byte API, which is the bug it exists to catch.
-    fn algebraic_byte_hash_unreachable() -> ! {
-        panic!(
-            "WrapHash::Algebraic has no byte-stream hash: an algebraic digest is one \
-         cell of four felts, not two cells of 32 bytes. The algebraic path must \
-         absorb felts directly — see the call sites in transcript_replay.rs, \
-         sub_proof.rs and batched_epoch_verify.rs."
-        )
-    }
-
-    /// The hash of a byte stream supplied as `u32`-half felts.
-    ///
-    /// Both hashes take the SAME packing — four bytes per felt, little-endian
-    /// ([`super::keccak_host::pack_stream`]) — because a BLAKE3 message word is
-    /// itself a little-endian `u32` of four consecutive message bytes. So a
-    /// stream built for one is a stream for the other, and only the framing
-    /// above it changes: 136-byte rate blocks with `pad10*1` against 64-byte
-    /// blocks with zero padding and an explicit `block_len`.
-    pub fn hash_bytes(self, b: &mut LfmBuilder, stream: &[Felt], len_bytes: usize) -> WrapDigest {
+    /// Every caller matches on this, and the `None` arm IS that caller's
+    /// algebraic implementation — so the exhaustiveness that used to be an
+    /// assertion is now the control flow.
+    pub const fn byte_hash(self) -> Option<ByteWrapHash> {
         match self {
-            WrapHash::Keccak => {
-                let d = keccak256(b, stream, len_bytes);
-                WrapDigest::from_pair(d[0], d[1])
-            }
-            WrapHash::Blake3 => {
-                let d = blake3_256(b, stream, len_bytes);
-                WrapDigest::from_pair(d[0], d[1])
-            }
-            WrapHash::Algebraic => Self::algebraic_byte_hash_unreachable(),
-        }
-    }
-
-    /// [`WrapHash::hash_bytes`] returning BOTH the digest and its byte-REVERSED
-    /// form — what `DefaultTranscript::sample()` returns and re-absorbs.
-    ///
-    /// Free under both hashes, for the same reason: the bus recomposes each
-    /// `u32` lane from four byte columns, so the reversal is a second `Linear`
-    /// over the same columns (`layout::keccak::REV_ADDR0`,
-    /// `layout::blake3::REV_ADDR0`).
-    pub fn hash_bytes_with_rev(
-        self,
-        b: &mut LfmBuilder,
-        stream: &[Felt],
-        len_bytes: usize,
-    ) -> (WrapDigest, [Cell; 2]) {
-        match self {
-            WrapHash::Keccak => {
-                let (d, rev) = keccak256_with_rev(b, stream, len_bytes);
-                (WrapDigest::from_pair(d[0], d[1]), rev)
-            }
-            WrapHash::Blake3 => {
-                let (d, rev) = blake3_256_with_rev(b, stream, len_bytes);
-                (WrapDigest::from_pair(d[0], d[1]), rev)
-            }
-            WrapHash::Algebraic => Self::algebraic_byte_hash_unreachable(),
+            WrapHash::Keccak => Some(ByteWrapHash::Keccak),
+            WrapHash::Blake3 => Some(ByteWrapHash::Blake3),
+            WrapHash::Algebraic => None,
         }
     }
 
@@ -645,11 +588,13 @@ impl WrapHash {
     /// nowhere else: a leaf absorbs 136 bytes per keccak permutation against 64
     /// per BLAKE3 compression.
     pub fn leaf_hash(self, b: &mut LfmBuilder, values: &[Felt]) -> WrapDigest {
-        if self == WrapHash::Algebraic {
-            return Self::algebraic_leaf_hash(b, values);
+        match self.byte_hash() {
+            None => Self::algebraic_leaf_hash(b, values),
+            Some(h) => {
+                let (stream, len_bytes) = leaf_stream(b, values);
+                h.hash_bytes(b, &stream, len_bytes)
+            }
         }
-        let (stream, len_bytes) = leaf_stream(b, values);
-        self.hash_bytes(b, &stream, len_bytes)
     }
 
     /// ★ The ALGEBRAIC parent: one `compress` row, one cell out.
@@ -724,11 +669,13 @@ impl WrapHash {
     /// emitted. Keeping the two callers on one primitive is what makes "the walk
     /// and the build hash the same way" a property of the code.
     pub fn hash_pair(self, b: &mut LfmBuilder, left: WrapDigest, right: WrapDigest) -> WrapDigest {
-        if self == WrapHash::Algebraic {
-            return Self::algebraic_hash_pair(b, left, right);
+        match self.byte_hash() {
+            None => Self::algebraic_hash_pair(b, left, right),
+            Some(h) => {
+                let stream = parent_stream(b, left, right);
+                h.hash_bytes(b, &stream, 2 * COMMITMENT_BYTES)
+            }
         }
-        let stream = parent_stream(b, left, right);
-        self.hash_bytes(b, &stream, 2 * COMMITMENT_BYTES)
     }
 
     /// Walk one Merkle authentication path under the production hash.
@@ -889,6 +836,74 @@ pub fn fri_fold(b: &mut LfmBuilder, lo: Ext, hi: Ext, zeta: Ext, inv_x: Felt) ->
     b.eadd(sum, scaled)
 }
 
+/// A configuration that hashes a BYTE STREAM — the two incumbents, and only
+/// them.
+///
+/// ★ It exists so that "this hash has a 32-byte digest" is a TYPE rather than a
+/// runtime check. [`WrapHash::byte_hash`] is the only way in, and it cannot
+/// produce one from an algebraic configuration — so the byte-stream
+/// constructions below are unreachable from the algebraic path by construction,
+/// which is what let the emit-time panic that used to guard them be deleted
+/// rather than retained.
+///
+/// The Merkle constructions (`leaf_hash`, `hash_pair`, `merkle_walk`) stay on
+/// [`WrapHash`] and are NOT split, because they are shape-generic: they take and
+/// return [`WrapDigest`], which carries its own width. Only the byte-STREAM
+/// entries have no algebraic meaning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ByteWrapHash {
+    Keccak,
+    Blake3,
+}
+
+impl ByteWrapHash {
+    /// The hash of a byte stream supplied as `u32`-half felts.
+    ///
+    /// Both hashes take the SAME packing — four bytes per felt, little-endian
+    /// ([`super::keccak_host::pack_stream`]) — because a BLAKE3 message word is
+    /// itself a little-endian `u32` of four consecutive message bytes. So a
+    /// stream built for one is a stream for the other, and only the framing
+    /// above it changes: 136-byte rate blocks with `pad10*1` against 64-byte
+    /// blocks with zero padding and an explicit `block_len`.
+    pub fn hash_bytes(self, b: &mut LfmBuilder, stream: &[Felt], len_bytes: usize) -> WrapDigest {
+        match self {
+            ByteWrapHash::Keccak => {
+                let d = keccak256(b, stream, len_bytes);
+                WrapDigest::from_pair(d[0], d[1])
+            }
+            ByteWrapHash::Blake3 => {
+                let d = blake3_256(b, stream, len_bytes);
+                WrapDigest::from_pair(d[0], d[1])
+            }
+        }
+    }
+
+    /// [`ByteWrapHash::hash_bytes`] returning BOTH the digest and its byte-REVERSED
+    /// form — what `DefaultTranscript::sample()` returns and re-absorbs.
+    ///
+    /// Free under both hashes, for the same reason: the bus recomposes each
+    /// `u32` lane from four byte columns, so the reversal is a second `Linear`
+    /// over the same columns (`layout::keccak::REV_ADDR0`,
+    /// `layout::blake3::REV_ADDR0`).
+    pub fn hash_bytes_with_rev(
+        self,
+        b: &mut LfmBuilder,
+        stream: &[Felt],
+        len_bytes: usize,
+    ) -> (WrapDigest, [Cell; 2]) {
+        match self {
+            ByteWrapHash::Keccak => {
+                let (d, rev) = keccak256_with_rev(b, stream, len_bytes);
+                (WrapDigest::from_pair(d[0], d[1]), rev)
+            }
+            ByteWrapHash::Blake3 => {
+                let (d, rev) = blake3_256_with_rev(b, stream, len_bytes);
+                (WrapDigest::from_pair(d[0], d[1]), rev)
+            }
+        }
+    }
+}
+
 // ============ the configured hash, as free functions ============
 //
 // Every construction below reads `b.wrap_hash()`. Call sites take no hash
@@ -897,19 +912,31 @@ pub fn fri_fold(b: &mut LfmBuilder, lo: Ext, hi: Ext, zeta: Ext, inv_x: Felt) ->
 // instruments) keep naming `keccak256` and friends directly, which makes a grep
 // for the pinned hash in `lfm/` return exactly the deliberate exceptions.
 
-/// [`WrapHash::hash_bytes`] under the builder's configured hash.
-pub fn wrap_hash_bytes(b: &mut LfmBuilder, stream: &[Felt], len_bytes: usize) -> WrapDigest {
-    let h = b.wrap_hash();
+/// [`ByteWrapHash::hash_bytes`] under a hash the CALLER has already established
+/// is a byte hash.
+///
+/// ⚠ It takes the hash rather than reading `b.wrap_hash()`, and that asymmetry
+/// with the other free functions here is deliberate: the rest are total over
+/// every configuration, this one is not. A caller reaches it by matching on
+/// [`WrapHash::byte_hash`], which is where its algebraic case is handled — so
+/// the parameter is the proof that the case was handled.
+pub fn wrap_hash_bytes(
+    b: &mut LfmBuilder,
+    h: ByteWrapHash,
+    stream: &[Felt],
+    len_bytes: usize,
+) -> WrapDigest {
     h.hash_bytes(b, stream, len_bytes)
 }
 
-/// [`WrapHash::hash_bytes_with_rev`] under the builder's configured hash.
+/// [`ByteWrapHash::hash_bytes_with_rev`], on the same terms as
+/// [`wrap_hash_bytes`].
 pub fn wrap_hash_bytes_with_rev(
     b: &mut LfmBuilder,
+    h: ByteWrapHash,
     stream: &[Felt],
     len_bytes: usize,
 ) -> (WrapDigest, [Cell; 2]) {
-    let h = b.wrap_hash();
     h.hash_bytes_with_rev(b, stream, len_bytes)
 }
 

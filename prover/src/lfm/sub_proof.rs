@@ -262,14 +262,14 @@ pub fn emit_leaf_hash(b: &mut LfmBuilder, shape: GroupShape, values: &[Cell]) ->
     // serialisation rather than reimplementing it. ✓ The host's decomposition
     // agrees by construction — `write_bytes_be` for an Fp3 element writes
     // components 0, 1, 2 in order, which is the lane order `unpack` returns.
-    if edsl::WrapHash::production() == edsl::WrapHash::Algebraic {
+    let Some(byte_hash) = b.wrap_hash().byte_hash() else {
         let mut felts = Vec::with_capacity(3 * values.len());
         for v in values {
             let lanes = b.unpack(*v);
             felts.extend_from_slice(&lanes[..3]);
         }
         return edsl::wrap_leaf_hash(b, &felts);
-    }
+    };
 
     let mut stream = Vec::with_capacity(6 * values.len());
     for v in values {
@@ -280,7 +280,7 @@ pub fn emit_leaf_hash(b: &mut LfmBuilder, shape: GroupShape, values: &[Cell]) ->
     }
     let len_bytes = BYTES_PER_HALF * stream.len();
     debug_assert_eq!(len_bytes, shape.leaf_bytes());
-    edsl::wrap_hash_bytes(b, &stream, len_bytes)
+    edsl::wrap_hash_bytes(b, byte_hash, &stream, len_bytes)
 }
 
 /// Authenticate one group's opened values against its committed root.
