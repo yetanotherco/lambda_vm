@@ -34,13 +34,15 @@ pub unsafe extern "C" fn _start() -> ! {
 // requires vendors to pick and document; see `docs/general_flow.md`.
 //
 // This placement is insurance, not a repair for an observed failure: in
-// `syscalls.rs` the symbol also won resolution, because rustc merged that module
-// into a codegen unit every guest already pulled in for `commit` and `sys_halt`.
-// What it buys is not depending on that — codegen-unit merging is an internal
-// rustc decision, and a guest that referenced nothing else from the module would
-// silently get the weak definition. Only same-module items are guaranteed to
-// share an object (partitioning places them together and merging never splits),
-// so `_start` is what makes the guarantee, and
+// `syscalls.rs` the symbol also won resolution, and not by luck — `_start` calls
+// `sys_halt` from that module and it is not `#[inline]`, so every guest carries
+// an undefined reference that forces the object out of the archive, whatever the
+// guest itself names. What the move buys is not depending on that: neither on
+// `_start` continuing to call into `syscalls.rs`, nor on rustc's codegen-unit
+// merging keeping the two modules together. Only same-module items are
+// guaranteed to share an object (partitioning places them together and merging
+// never splits), so co-locating with `_start` — the one symbol the linker is
+// obliged to resolve — makes the guarantee local.
 // `test_dma_memcpy_compiler_emitted_copies` is what detects a regression: a guest
 // that falls back still produces correct output, only its ecall count drops.
 //
