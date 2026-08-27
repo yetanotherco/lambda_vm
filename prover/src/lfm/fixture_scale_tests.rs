@@ -55,7 +55,8 @@
 //! beyond its training range — to **−0.19%**. Committed cells is the sufficient
 //! statistic; the hash table's aspect ratio is not.
 //!
-//! ⚠ **AFFINE, not PROPORTIONAL, and the difference is the whole point.** The
+//! ⚠ **AFFINE, not PROPORTIONAL, and the difference is what a projection gets
+//! wrong.** The
 //! intercept is real: 1.24-1.36 GiB, hasher-independent, against a process
 //! baseline of 0.02 GiB. So at this scale a through-the-origin cells model
 //! over-credits a hash swap badly. Swapping BLAKE3 for RPO on the SAME program
@@ -63,11 +64,39 @@
 //! 3.57x at 1024 — the realised saving approaches the promised one only as the
 //! fixed term stops mattering.
 //!
-//! ⚠ **The COEFFICIENT does not transfer between instruments, only the form.**
-//! 43.9 bytes/cell applied to the aggregator's 12.2B cells predicts ~500 GiB,
-//! where the aggregator measured 336.8. Anyone carrying a bytes/cell figure from
-//! one program to another is wrong by about 1.5x; scaling a program's own
-//! measured point by its own cell ratio is what the linearity result licenses.
+//! ⚠ **Both numbers above are in the CENSUS convention (`main + aux`).** The
+//! campaign's memory coefficient and its 12.2B-cell aggregator figure are in the
+//! BASE-FIELD-EQUIVALENT convention (`main + 3·aux`), and aux is ~37% of the
+//! base-equivalent total here, so the two slopes differ by 1.29x for no physical
+//! reason at all. Converted, the same 23 points fit
+//!
+//! ```text
+//!   1.242 GiB + 33.94 bytes/base-equivalent-cell     R² 0.98943
+//! ```
+//!
+//! ★ **and that transfers.** `wrap_tests::MEASURED_BYTES_PER_CELL` is 33.72,
+//! from ONE point on a different program; this is 33.94 from 23 points across
+//! four hashers. Applied cold, this law predicts that program's own 481.3M-cell
+//! point at 16.46 GiB against 15.11 measured (+8.9%), and the aggregation prove
+//! at 12.2B cells at 386.8 GiB against 336.8 measured (+14.9%) — **~15% across a
+//! 25x span and three different programs.** A bytes-per-cell figure is portable;
+//! a bytes-per-cell figure without its convention is not.
+//!
+//! ⚠ **What is NOT portable is using it through the ORIGIN.** Fitting these 23
+//! points proportionally gives 43.28 B/cell with residuals from **−15.4% to
+//! +82.7%** — it under-projects 2.4x at the blessed fixture's size and
+//! over-projects ~14% at aggregator scale. The slope was never the problem; the
+//! missing intercept is. `others/lfm-hash-matrix-scope.md` records the
+//! one-parameter model as falsified and replaced by a two-term fit, which this
+//! independently confirms — but `MEASURED_BYTES_PER_CELL` is still the live
+//! one-parameter constant every projection here runs through.
+//!
+//! ⚠ Forcing that document's 190 MB/sub-proof onto these points drives residuals
+//! to −26.2%, so it is too large for this program; the fitted 1.242 GiB over a
+//! constant 11 sub-proofs is 113 MB/sub-proof. But the sub-proof count is 11 in
+//! **every** point here, so this cannot attribute the fixed term to sub-proofs at
+//! all — 113 is an intercept divided by a constant, not a measurement of a
+//! per-sub-proof cost.
 //!
 //! Blowup is a second axis and not a free one: at IDENTICAL committed cells,
 //! moving blowup 2 → 4 cost +73% peak RSS under RPO and +62% under BLAKE3
@@ -370,6 +399,26 @@ fn census_totals(program: &LfmProgram, kind: HasherKind) -> (u64, u64, u64) {
     (total, h.main_cells() + h.aux_cells(), h.rows)
 }
 
+/// ⚠ **The campaign's OTHER cell convention, and the reason both are printed.**
+///
+/// Two counts of "cells" are in use and they are not interchangeable. The census
+/// convention counts an aux extension column ONCE (`main + aux`); the
+/// BASE-FIELD-EQUIVALENT convention counts it three times (`main + 3·aux`),
+/// because an extension element is three base felts. The campaign's live memory
+/// coefficient — `wrap_tests::MEASURED_BYTES_PER_CELL`, 33.7 bytes/cell — is
+/// defined on the base-equivalent count, and so is the 12.2B-cell figure the
+/// aggregator anchor is quoted against.
+///
+/// A bytes-per-cell number is therefore meaningless without its convention, and
+/// mixing them inflates a slope by the aux share — around 27% on this program.
+/// Both totals are reported so no downstream comparison has to guess.
+fn census_base_equivalent(program: &LfmProgram, kind: HasherKind) -> (u64, u64) {
+    let census = lfm_chip_census_with_hasher(program, kind);
+    census.iter().fold((0u64, 0u64), |(main, aux), c| {
+        (main + c.main_cells(), aux + c.aux_cells())
+    })
+}
+
 /// The sizing panel: hash share against shape, for every hasher.
 ///
 /// ```text
@@ -380,7 +429,7 @@ fn census_totals(program: &LfmProgram, kind: HasherKind) -> (u64, u64, u64) {
 #[ignore]
 fn the_scaled_fixture_census() {
     let mut shapes = vec![FixtureShape::default(), GREEN];
-    let mut q = 32;
+    let mut q = 16;
     while q <= 4096 {
         shapes.push(FixtureShape::new(16, q));
         q *= 2;
@@ -398,6 +447,12 @@ fn the_scaled_fixture_census() {
             HasherKind::Blake3,
         ] {
             let (total, hash, rows) = census_totals(&program, kind);
+            let (m, a) = census_base_equivalent(&program, kind);
+            println!(
+                "  BASEEQ hasher={kind:?} queries={} total={total} base_equiv={}",
+                sh.num_queries,
+                m + 3 * a
+            );
             println!(
                 "  log_lde {:>2} q {:>5}  {:>8}  {:>7}  {:>13}  {:>13}  {:>5.1}%  (rows {})",
                 sh.log_lde,
@@ -484,8 +539,11 @@ fn the_scaled_fixture_measures_one_arm() {
     );
 
     let (total, hash_cells, hash_rows) = census_totals(&program, kind);
+    let (main, aux) = census_base_equivalent(&program, kind);
+    let base_equiv = main + 3 * aux;
     println!(
-        "census         total {total} cells, LFM_HASH {hash_cells} ({:.1}%) over {hash_rows} rows",
+        "census         total {total} cells (main+aux), {base_equiv} base-equivalent \
+         (main+3aux), LFM_HASH {hash_cells} ({:.1}%) over {hash_rows} rows",
         100.0 * hash_cells as f64 / total as f64
     );
 
@@ -532,8 +590,8 @@ fn the_scaled_fixture_measures_one_arm() {
     // One machine-readable line per arm, for the driver to collect.
     println!(
         "RESULT hasher={kind:?} log_lde={} queries={} invocations={} cells={total} \
-         hash_cells={hash_cells} sub_proofs={} prove_secs={prove_secs:.3} \
-         peak_gib={prove_peak:.4} blowup={blowup} threads={}",
+         base_equiv={base_equiv} hash_cells={hash_cells} sub_proofs={} \
+         prove_secs={prove_secs:.3} peak_gib={prove_peak:.4} blowup={blowup} threads={}",
         sh.log_lde,
         sh.num_queries,
         sh.hash_invocations(),

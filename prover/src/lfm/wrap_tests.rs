@@ -970,10 +970,26 @@ fn the_wrap_census() {
 /// blowup-2 LDE, and the Merkle/quotient working set on top. Stated as a
 /// coefficient rather than derived from first principles because the derivation
 /// would be a guess about the prover's allocation pattern and this is an
-/// observation of it. What it CANNOT see: whether the coefficient holds at ten
-/// times the size (allocator behaviour, and the fact that a bigger program is
-/// bigger in different chips), so it is a projection and is labelled as one
-/// wherever it is printed.
+/// observation of it.
+///
+/// ★ **The "does it hold at ten times the size" question is now answered, and
+/// the answer splits.** `fixture_scale_tests` fits 23 shapes across four hashers
+/// on a different program and gets **1.242 GiB + 33.94 bytes per
+/// base-equivalent cell** — the SLOPE agrees with the 33.72 below to 0.7%, and
+/// applied cold it predicts this very point at 16.46 GiB against the 15.11
+/// measured (+8.9%) and the 12.2B-cell aggregation prove at 386.8 GiB against
+/// 336.8 measured (+14.9%). So the coefficient does transfer, to about 15% over
+/// a 25x span and three programs.
+///
+/// ⚠ **What does NOT transfer is the THROUGH-ORIGIN form used here.** Fitting
+/// those 23 points proportionally gives residuals from −15.4% to +82.7%: this
+/// constant under-projects 2.4x at small programs and over-projects ~14% at
+/// aggregator scale, because it folds a real ~1.2 GiB fixed term into the slope.
+/// `others/lfm-hash-matrix-scope.md` already recorded the one-parameter model as
+/// falsified in favour of a two-term fit; this is still the one-parameter form,
+/// so treat what it prints as a lower bound for small programs. Every use is
+/// labelled a projection wherever it is printed, which is the reason that is
+/// survivable rather than a bug.
 const MEASURED_BYTES_PER_CELL: f64 = 16_228_499_456.0 / 481_327_124.0;
 
 fn projected_peak_bytes(main: u64, aux: u64) -> f64 {
