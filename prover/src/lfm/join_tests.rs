@@ -1441,7 +1441,7 @@ fn preprocessed_fixture() -> (
         Gl,
         Ext3,
         (),
-        stark::config::DefaultStarkHash,
+        crate::hash_pin::BlockStarkHash,
     >>::compute_precomputed_commitment_for_testing(
         &trace, &build(None), NUM_PRECOMPUTED
     )

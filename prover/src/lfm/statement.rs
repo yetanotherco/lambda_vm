@@ -110,7 +110,7 @@ pub fn lfm_program_id(
     h.update(LFM_MACHINE_VERSION.to_le_bytes());
     h.update(LFM_PRESET_TAG.to_le_bytes());
     h.update([hasher.as_tag()]);
-    h.update([commitment_hash_tag(stark::config::COMMITMENT_HASH)]);
+    h.update([commitment_hash_tag(crate::hash_pin::BLOCK_COMMITMENT_HASH)]);
     // ★ The chip set is program shape and is bound by NAME, for the reason the
     // commitment hash is: the roots of an absent family are still in the array
     // (a hole, like KECCAK_RND's), so nothing else in this digest distinguishes

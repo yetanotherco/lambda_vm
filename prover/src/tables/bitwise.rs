@@ -26,7 +26,6 @@
 //! meaning other tables send to this table.
 
 use math::polynomial::Polynomial;
-use stark::commitment::{ROWS_PER_LEAF, commit_bit_reversed};
 use stark::config::Commitment;
 use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
 use stark::proof::options::ProofOptions;
@@ -329,9 +328,13 @@ pub fn compute_preprocessed_commitment(options: &ProofOptions) -> Commitment {
         })
         .collect();
 
-    let (_, root) = commit_bit_reversed(&lde_columns, ROWS_PER_LEAF)
-        .expect("Failed to build Merkle tree for bitwise LDE");
-    root
+    // ★ Through the LFM commit helper, which commits under the BLOCK PATH's pin
+    // rather than `stark`'s default aliases. This root is a PREPROCESSED
+    // commitment the block path's verifier absorbs, so it has to be built with
+    // the hash that path commits under — on a branch that pins an algebraic
+    // hash, a root left on the alias would be the one BLAKE3 artifact in an RPO
+    // proof, and it would fail as a root nothing reconstructs.
+    crate::lfm::commit::commit_lde_columns(&lde_columns)
 }
 
 /// Returns the preprocessed commitment for the bitwise table.

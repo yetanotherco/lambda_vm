@@ -13,7 +13,6 @@ use stark::batched::proof::BatchedMultiProof;
 use stark::batched::prover::multi_prove_batched;
 use stark::batched::verifier::{multi_verify_batched, replay_epoch_transcript};
 use stark::config::Commitment;
-use stark::config::DefaultStarkTranscript;
 use stark::proof::options::ProofOptions;
 use stark::proof::stark::MultiProof;
 use stark::proof::view::MultiProofView;
@@ -178,7 +177,7 @@ pub(crate) fn prove_traces_with_hasher(
         hasher,
         artifacts.chip_set,
     );
-    let mut transcript = DefaultStarkTranscript::<E>::new(&[]);
+    let mut transcript = crate::hash_pin::block_transcript(&[]);
     absorb_lfm_statement(
         &mut transcript,
         &artifacts.program_id,
@@ -370,7 +369,7 @@ pub fn verify_against_chunked(
     );
     let refs = airs.air_refs();
 
-    let mut transcript = DefaultStarkTranscript::<E>::new(&[]);
+    let mut transcript = crate::hash_pin::block_transcript(&[]);
     absorb_lfm_statement(
         &mut transcript,
         program_id,
@@ -458,7 +457,7 @@ pub fn lfm_prove_batched(
         hasher,
         artifacts.chip_set,
     );
-    let mut transcript = DefaultStarkTranscript::<E>::new(&[]);
+    let mut transcript = crate::hash_pin::block_transcript(&[]);
     absorb_lfm_statement(
         &mut transcript,
         &artifacts.program_id,
@@ -467,7 +466,7 @@ pub fn lfm_prove_batched(
     );
 
     let (proof, _stats) =
-        multi_prove_batched::<F, E, (), stark::config::DefaultStarkHash, Prover<F, E, ()>>(
+        multi_prove_batched::<F, E, (), crate::hash_pin::BlockStarkHash, Prover<F, E, ()>>(
             airs.air_trace_pairs(&mut traces),
             &mut transcript,
             #[cfg(feature = "disk-spill")]
@@ -578,7 +577,7 @@ pub fn verify_against_batched(
         return false;
     }
 
-    let mut transcript = DefaultStarkTranscript::<E>::new(&[]);
+    let mut transcript = crate::hash_pin::block_transcript(&[]);
     absorb_lfm_statement(
         &mut transcript,
         &artifacts.program_id,
@@ -601,7 +600,7 @@ pub fn verify_against_batched(
         return false;
     };
 
-    multi_verify_batched::<F, E, (), stark::config::DefaultStarkHash, Verifier<F, E, ()>, _>(
+    multi_verify_batched::<F, E, (), crate::hash_pin::BlockStarkHash, Verifier<F, E, ()>, _>(
         &refs,
         proof,
         &mut transcript,

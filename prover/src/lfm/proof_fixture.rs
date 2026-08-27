@@ -124,7 +124,7 @@ pub fn generate() -> (Vec<u8>, usize) {
 /// its own file instead of corrupting the shared one.
 pub fn cache_format_key() -> String {
     let tag = std::str::from_utf8(crate::statement::DOMAIN_TAG).unwrap_or("stmt");
-    format!("{tag}-{:?}", stark::config::COMMITMENT_HASH)
+    format!("{tag}-{:?}", crate::hash_pin::BLOCK_COMMITMENT_HASH)
 }
 
 /// Whether `bytes` still look like a blob this build can read.

@@ -514,9 +514,10 @@ pub fn build_artifacts(program: &LfmProgram, options: &ProofOptions) -> LfmArtif
 ///
 /// `hasher` names the `LFM_HASH` chip the machine RUNS. The hash the roots below
 /// are BUILT with is a different question: `commit_group` and the two
-/// `preprocessed_commitment` helpers all commit through `stark`'s Merkle layer,
-/// i.e. under whatever [`stark::config::COMMITMENT_HASH`] names — BLAKE3 since
-/// the P-a flip, keccak on a `cuda` build.
+/// `preprocessed_commitment` helpers all commit through `stark`'s Merkle layer
+/// under whatever [`crate::hash_pin::BLOCK_COMMITMENT_HASH`] names — BLAKE3 on
+/// this branch, keccak on a `cuda` build, an algebraic hash on a branch that
+/// pins one.
 ///
 /// Both are folded into `program_id` (see [`lfm_program_id`]), which is what
 /// discharges the compile-time guard this function used to carry. That guard
@@ -526,14 +527,19 @@ pub fn build_artifacts(program: &LfmProgram, options: &ProofOptions) -> LfmArtif
 /// it was holding out for: the artifacts now say which hash built the roots, so
 /// there is no unstated claim left to be wrong about.
 ///
-/// What is deliberately NOT done: making this function generic over `H` and
-/// reading `H::COMMITMENT_HASH`. That was PA-PLAN §6.0's suggested mechanism,
-/// and the mechanism is what changed, not the decision. The three commit helpers
-/// are hard-wired to the default aliases by design — they commit *production*
-/// tables — so the global const is the truthful name for their output, while an
-/// `H` parameter would introduce exactly one new way to be wrong: artifacts
-/// naming an `H` the helpers did not use. If those helpers are ever threaded,
-/// this read moves with them and the parameter becomes worth its cost.
+/// ★ **The read has MOVED, on exactly the condition this note set.** The commit
+/// helpers were hard-wired to `stark`'s default aliases, so the global const was
+/// then the truthful name for their output. They are now threaded through
+/// [`crate::hash_pin::BlockStarkHash`] — the block path's own configuration,
+/// which a hash-comparison branch re-points without touching the workspace
+/// default — and `lfm_program_id` reads `BLOCK_COMMITMENT_HASH` with them. The
+/// two axes still move together, which is the property that matters; what
+/// changed is that the axis they follow is the pin rather than the alias.
+///
+/// ⚠ Still deliberately NOT done: an `H` PARAMETER on this function. Threading
+/// the helpers to a build-wide pin keeps one answer per build; a parameter would
+/// reintroduce the failure this note was guarding against, artifacts naming an
+/// `H` the helpers did not use.
 pub fn build_artifacts_with_hasher(
     program: &LfmProgram,
     options: &ProofOptions,

@@ -8,8 +8,8 @@
 //! keygen in this framework).
 
 use math::polynomial::Polynomial;
-use stark::commitment::{ROWS_PER_LEAF, commit_bit_reversed};
-use stark::config::{Commitment, DefaultStarkHash};
+use stark::commitment::{ROWS_PER_LEAF, commit_bit_reversed_with};
+use stark::config::Commitment;
 use stark::fri::mmcs::{BorrowedMatrix, StreamingMmcsBuilder};
 use stark::proof::options::ProofOptions;
 use stark::prover::evaluate_polynomial_on_lde_domain;
@@ -53,8 +53,16 @@ pub fn lde_columns(columns: &[Vec<FE>], options: &ProofOptions) -> Vec<Vec<FE>> 
 
 /// Commits an already-expanded LDE column matrix.
 pub fn commit_lde_columns(lde_columns: &[Vec<FE>]) -> Commitment {
-    let (_, root) = commit_bit_reversed(lde_columns, ROWS_PER_LEAF)
-        .expect("Merkle build failed for LFM column group");
+    // ★ Under the block path's PIN, not `stark`'s default aliases. These commit
+    // the production tables whose roots `lfm_program_id` names, so the hash that
+    // BUILDS them and the hash the program identity CLAIMS have to be the same
+    // one — `registry.rs` records that as the condition under which this read
+    // moves, and the pin is what moved it.
+    let (_, root) = commit_bit_reversed_with::<
+        GoldilocksField,
+        <crate::hash_pin::BlockStarkHash as stark::config::StarkHash>::Batched<GoldilocksField>,
+    >(lde_columns, ROWS_PER_LEAF)
+    .expect("Merkle build failed for LFM column group");
     root
 }
 
@@ -102,7 +110,7 @@ pub fn commit_group(group: &ColumnGroup, options: &ProofOptions) -> Commitment {
 /// registry's own `log_heights` are trace heights, and the two differ by
 /// `log2(blowup)`.
 pub struct PrepRoundBuilder {
-    builder: StreamingMmcsBuilder<GoldilocksField, DefaultStarkHash>,
+    builder: StreamingMmcsBuilder<GoldilocksField, crate::hash_pin::BlockStarkHash>,
 }
 
 impl PrepRoundBuilder {

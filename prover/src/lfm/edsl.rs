@@ -540,7 +540,7 @@ impl WrapHash {
     /// instruments and `program_id_program_source` name their hash directly and
     /// must keep doing so.
     pub const fn production() -> Self {
-        match stark::config::COMMITMENT_HASH {
+        match crate::hash_pin::BLOCK_COMMITMENT_HASH {
             stark::config::CommitmentHash::Keccak256 => WrapHash::Keccak,
             stark::config::CommitmentHash::Blake3 => WrapHash::Blake3,
             // ★ Three commitment hashes, ONE emitter arm. The permutation is

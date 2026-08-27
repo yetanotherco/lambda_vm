@@ -14,7 +14,7 @@
 
 use crypto::merkle_tree::proof::verify_merkle_path_from_leaf_hash;
 use math::field::element::FieldElement;
-use stark::config::{BatchedMerkleTreeBackend, Commitment};
+use stark::config::Commitment;
 
 use crate::tables::types::GoldilocksField;
 
@@ -24,9 +24,11 @@ use super::word::{LfmWord, base_word};
 
 type FE = FieldElement<GoldilocksField>;
 
-/// The Merkle backend the main trace is committed under — the production alias,
-/// not a locally chosen equivalent, so a backend change reaches this module.
-type MainBackend = BatchedMerkleTreeBackend<GoldilocksField>;
+/// The Merkle backend the main trace is committed under — the BLOCK PATH's pin,
+/// not a locally chosen equivalent and no longer `stark`'s default alias, so a
+/// branch that pins a different hash reaches this module too.
+type MainBackend =
+    <crate::hash_pin::BlockStarkHash as stark::config::StarkHash>::Batched<GoldilocksField>;
 
 /// Halves in one 32-byte commitment.
 pub const ROOT_HALVES: usize = 8;
