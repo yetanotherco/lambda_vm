@@ -48,7 +48,7 @@ pub(super) const LFM_STATEMENT_TAG: &[u8] = b"LAMBDAVM_LFM_STATEMENT_V1";
 /// having no default.
 ///
 /// Tags are frozen. Changing one re-blesses every `LFM_REGISTRY` entry.
-const fn commitment_hash_tag(hash: CommitmentHash) -> u8 {
+pub(crate) const fn commitment_hash_tag(hash: CommitmentHash) -> u8 {
     match hash {
         CommitmentHash::Keccak256 => 0,
         CommitmentHash::Blake3 => 1,

@@ -60,7 +60,7 @@ use core::num::NonZeroUsize;
 
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsPrimeField};
-use math::traits::{AsBytes, ByteConversion};
+use math::traits::AsBytes;
 
 use crypto::fiat_shamir::transcript_hash::TranscriptHash;
 use crypto::merkle_tree::traits::{IsLeafHasher, IsMerkleTreeBackend, IsStreamingLeafBackend};
@@ -201,15 +201,34 @@ pub fn felts_from_bytes(bytes: &[u8]) -> Vec<FE> {
 
 /// Decompose a field element — base or extension — into its base felts, by the
 /// same serialisation the STARK uses.
+///
+/// ★ Through `AsBytes::stream_bytes` rather than `ByteConversion::write_bytes_be`,
+/// and the two are the SAME bytes: ✓ VERIFIED both Goldilocks impls —
+/// `FieldElement<GoldilocksField>` streams `canonical_u64().to_be_bytes()` and
+/// its `as_bytes` IS `to_bytes_be`, while `FieldElement<Degree3Goldilocks...>`
+/// streams by calling `write_bytes_be` into a stack buffer.
+///
+/// ⚠ The reason for going through `AsBytes` is not style: `StarkHash`'s
+/// associated types carry the bound `FieldElement<F>: AsBytes + Sync + Send` and
+/// nothing more, so a backend that additionally required `ByteConversion` could
+/// not BE a `StarkHash::Batched` — and the algebraic configurations could not be
+/// expressed at all. Taking the identical bytes through the weaker bound is what
+/// makes them expressible without widening a trait the whole workspace shares.
 fn element_felts<F>(e: &FieldElement<F>, out: &mut Vec<FE>)
 where
     F: IsField,
-    FieldElement<F>: AsBytes + ByteConversion,
+    FieldElement<F>: AsBytes,
 {
     let mut buf = [0u8; 64];
-    let len = <FieldElement<F> as ByteConversion>::BYTE_LEN;
-    debug_assert!(len <= buf.len(), "a field element must fit the scratch");
-    e.write_bytes_be(&mut buf[..len]);
+    let mut len = 0usize;
+    e.stream_bytes(&mut |bytes| {
+        debug_assert!(
+            len + bytes.len() <= buf.len(),
+            "a field element must fit the scratch"
+        );
+        buf[len..len + bytes.len()].copy_from_slice(bytes);
+        len += bytes.len();
+    });
     out.extend(felts_from_bytes(&buf[..len]));
 }
 
@@ -236,7 +255,7 @@ impl<F, H> IsMerkleTreeBackend for AlgebraicBatchBackend<F, H>
 where
     F: IsField + 'static,
     H: AlgebraicHasher,
-    FieldElement<F>: AsBytes + ByteConversion + Sync + Send,
+    FieldElement<F>: AsBytes + Sync + Send,
     Vec<FieldElement<F>>: Sync + Send,
 {
     type Node = Commitment;
@@ -255,7 +274,7 @@ impl<F, H> IsStreamingLeafBackend<F> for AlgebraicBatchBackend<F, H>
 where
     F: IsField + 'static,
     H: AlgebraicHasher,
-    FieldElement<F>: AsBytes + ByteConversion + Sync + Send,
+    FieldElement<F>: AsBytes + Sync + Send,
     Vec<FieldElement<F>>: Sync + Send,
 {
     /// ⚠ Must equal [`IsMerkleTreeBackend::hash_data`] on the elements `data`
@@ -287,7 +306,7 @@ impl<F, H> IsMerkleTreeBackend for AlgebraicPairBackend<F, H>
 where
     F: IsField + 'static,
     H: AlgebraicHasher,
-    FieldElement<F>: AsBytes + ByteConversion + Sync + Send,
+    FieldElement<F>: AsBytes + Sync + Send,
 {
     type Node = Commitment;
     type Data = [FieldElement<F>; 2];
@@ -325,7 +344,7 @@ impl<F, H> IsLeafHasher<F> for AlgebraicLeafHasher<F, H>
 where
     F: IsField,
     H: AlgebraicHasher,
-    FieldElement<F>: AsBytes + ByteConversion,
+    FieldElement<F>: AsBytes,
 {
     type Node = Commitment;
 
@@ -486,10 +505,128 @@ algebraic_transcript_hash!(
     "⚠ The Poseidon Fiat–Shamir configuration — UNSHIPPABLE, reference only."
 );
 
+/// ★★ **THE COMMITMENT CONFIGURATIONS** — the piece that makes an algebraic hash
+/// nameable by the prover, rather than merely implemented.
+///
+/// One `StarkHash` per member: the two Merkle families, the Fiat–Shamir
+/// configuration they are paired with, and the [`CommitmentHash`] all of them
+/// are. `IsStarkProver` and `IsStarkVerifier` are generic over this parameter
+/// already, so naming one of these at a call site is the whole flip — there is
+/// no global to re-point and nothing in `crypto/stark` moves.
+///
+/// ★ **They live HERE and not in `crypto/stark/src/config.rs`, and that is not a
+/// compromise.** `crypto/stark` does not depend on `prover`, so a configuration
+/// built from these backends cannot be written there; `impl StarkHash for
+/// RpoStarkHash` is legal here because the type is local. The alternative —
+/// moving the backends and the three permutations down into `crypto` so the
+/// workspace-wide `DefaultStarkHash` alias could name them — would re-point a
+/// default the whole workspace shares in order to reach three branches, and
+/// would put every blessed BLAKE3 artifact's enforcement (`config.rs`'s
+/// `COMMITMENT_HASH` assertion) in the blast radius of a comparison experiment.
+/// The pin belongs at the layer the block path lives in.
+///
+/// ⚠ **`Batched` and `Pair` are the same hash by construction**, not by
+/// convention: both are the generic algebraic backends at the same `H`, so a
+/// configuration mixing two permutations is not something to assert against —
+/// it is unspellable.
+// Only the non-cuda build can express an algebraic configuration — see the
+// macro's own note — so the imports it needs follow the same gate rather than
+// sitting unused in a cuda build.
+#[cfg(not(feature = "cuda"))]
+use stark::config::{CommitmentHash, StarkHash};
+
+/// ⚠ **NOT AVAILABLE UNDER `cuda`, and that is the `KeccakTreeBackend` marker
+/// working rather than a gap.** A cuda build drives the whole commit phase on
+/// device with the keccak kernels, so `StarkHash` there additionally requires
+/// `Batched` and `Pair` to BE keccak backends — a bound these cannot satisfy and
+/// must not. Under `cuda` an algebraic configuration is therefore not merely
+/// unused, it is inexpressible, which is exactly the property that stops a build
+/// producing keccak trees *labelled* RPO. `Blake3StarkHash` is gated the same way
+/// and for the same reason; the algebraic path is CPU-only, as BLAKE3's already
+/// is.
+macro_rules! algebraic_stark_hash {
+    ($name:ident, $tag:ty, $transcript:ty, $commitment:expr, $doc:literal) => {
+        #[doc = $doc]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub struct $name;
+
+        #[cfg(not(feature = "cuda"))]
+        impl StarkHash for $name {
+            type Batched<F>
+                = AlgebraicBatchBackend<F, $tag>
+            where
+                F: IsField + 'static,
+                FieldElement<F>: AsBytes + Sync + Send;
+
+            type Pair<F>
+                = AlgebraicPairBackend<F, $tag>
+            where
+                F: IsField + 'static,
+                FieldElement<F>: AsBytes + Sync + Send;
+
+            type Transcript = $transcript;
+
+            const COMMITMENT_HASH: CommitmentHash = $commitment;
+        }
+    };
+}
+
+algebraic_stark_hash!(
+    RpoStarkHash,
+    RpoCommit,
+    RpoTranscriptHash,
+    CommitmentHash::Rpo256,
+    "The RPO256 commitment configuration."
+);
+algebraic_stark_hash!(
+    RpxStarkHash,
+    RpxCommit,
+    RpxTranscriptHash,
+    CommitmentHash::Rpx256,
+    "The RPX256 (XHash12) commitment configuration."
+);
+algebraic_stark_hash!(
+    PoseidonStarkHash,
+    PoseidonCommit,
+    PoseidonTranscriptHash,
+    CommitmentHash::Poseidon,
+    "⚠ The Poseidon commitment configuration — UNSHIPPABLE, reference only."
+);
+
+/// ✓ The three configurations are INHABITED at the fields the prover actually
+/// commits over — the base field for main traces, the cubic extension for aux,
+/// composition and FRI, within one proof.
+///
+/// A `StarkHash` impl that type-checks in isolation can still be unusable: the
+/// associated types are generic over `F`, and the bound that matters is the one
+/// the prover instantiates them at. This is that instantiation, as a compile-time
+/// check rather than as a comment claiming it holds.
+#[cfg(not(feature = "cuda"))]
+const _: fn() = || {
+    fn assert_usable<H: StarkHash>()
+    where
+        H::Batched<GoldilocksField>: IsMerkleTreeBackend<Node = Commitment>,
+        H::Pair<GoldilocksField>: IsMerkleTreeBackend<Node = Commitment>,
+        H::Batched<crate::tables::types::GoldilocksExtension>:
+            IsMerkleTreeBackend<Node = Commitment>,
+        H::Pair<crate::tables::types::GoldilocksExtension>: IsMerkleTreeBackend<Node = Commitment>,
+    {
+    }
+
+    assert_usable::<RpoStarkHash>();
+    assert_usable::<RpxStarkHash>();
+    assert_usable::<PoseidonStarkHash>();
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::tables::types::{FEE, GoldilocksExtension};
+    // ★ The tests build their expected felts with `write_bytes_be` deliberately,
+    // while `element_felts` now goes through `AsBytes::stream_bytes`. That the
+    // two must agree is the whole reason the switch was safe, so the differential
+    // is checked here rather than asserted in a comment.
+    use math::traits::ByteConversion;
 
     type Base = GoldilocksField;
     type Ext = GoldilocksExtension;
@@ -675,6 +812,45 @@ mod tests {
     /// never restated: this lane has now written a host↔machine encoding three
     /// times and twice a differential caught a machine side that had
     /// hand-written a constant agreeing with the rule only until the rule moved.
+    /// Each configuration NAMES its own hash, and the statement's program-identity
+    /// tag agrees with that name.
+    ///
+    /// ⚠ The tag is what makes a proof's roots describable, and a configuration
+    /// whose `COMMITMENT_HASH` disagreed with the tag its programs carry would
+    /// produce proofs that verify against the wrong identity rather than failing.
+    /// Distinctness is asserted too: two configurations sharing a tag is the same
+    /// failure with an extra step.
+    #[test]
+    #[cfg(not(feature = "cuda"))]
+    fn each_configuration_names_its_own_hash_and_tag() {
+        use crate::lfm::statement::commitment_hash_tag;
+
+        let named = [
+            (
+                <RpoStarkHash as StarkHash>::COMMITMENT_HASH,
+                CommitmentHash::Rpo256,
+            ),
+            (
+                <RpxStarkHash as StarkHash>::COMMITMENT_HASH,
+                CommitmentHash::Rpx256,
+            ),
+            (
+                <PoseidonStarkHash as StarkHash>::COMMITMENT_HASH,
+                CommitmentHash::Poseidon,
+            ),
+        ];
+        let mut tags = Vec::new();
+        for (got, want) in named {
+            assert_eq!(got, want, "a configuration must name its own hash");
+            tags.push(commitment_hash_tag(got));
+        }
+        // Against the incumbents too — the tags share one space.
+        tags.push(commitment_hash_tag(CommitmentHash::Keccak256));
+        tags.push(commitment_hash_tag(CommitmentHash::Blake3));
+        let unique: std::collections::BTreeSet<_> = tags.iter().copied().collect();
+        assert_eq!(unique.len(), tags.len(), "every commitment tag is distinct");
+    }
+
     /// ★★ **THE GRINDING LEG GATE.** The production emitter's grinding check —
     /// `epoch::emit_grinding_check`, the thing every wrap program actually calls
     /// — must accept exactly the nonces `grinding::is_valid_nonce` accepts under
