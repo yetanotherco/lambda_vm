@@ -523,6 +523,14 @@ fn the_measured_cells_per_permutation_match_the_pinned_prediction() {
 /// that gap first by scaling queries and Merkle depth until the hash chip is a
 /// large share — see the swap-design document's §F for the sizing this number
 /// feeds.
+///
+/// ★ **That scaling was done** (`fixture_scale_tests`), and it reaches 92% hash
+/// share. So this test now says only what its NAME says: the BLESSED shape is
+/// too small. It stays as the guard on that shape — `FriToyV0` is a committed
+/// program and nothing should silently re-size it — and the measurement it once
+/// declared impossible lives in `fixture_scale_tests`, along with what it
+/// found: peak RSS is affine in committed cells with a nearly hasher-independent
+/// slope, and the fixed term is what a proportional projection gets wrong.
 #[test]
 #[ignore]
 fn the_fixture_hash_share_is_too_small_to_measure_a_swap() {
