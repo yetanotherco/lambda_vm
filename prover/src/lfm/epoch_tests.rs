@@ -208,7 +208,13 @@ fn challenge_program(h: &HostTable) -> LfmProgram {
         .map(|i| b.hint_word(a.parts, i).as_ext())
         .collect();
     let fri_roots: Vec<_> = (0..shape.fri.num_committed())
-        .map(|i| RootCells::hint(&mut b, a.fri_roots, 2 * i as u32))
+        .map(|i| {
+            RootCells::hint(
+                &mut b,
+                a.fri_roots,
+                super::proof_arena::words_per_root() as u32 * i as u32,
+            )
+        })
         .collect();
     let fri_coeffs: Vec<_> = (0..shape.fri.num_terminal_coeffs() as u32)
         .map(|i| b.hint_word(a.fri_coeffs, i).as_ext())
@@ -2263,7 +2269,11 @@ pub(super) fn batched_epoch_program_with(
                 Some(RootCells::from_digest(&mut b, digest))
             }
             Some(PrepSource::ElfDependent(_)) => {
-                let cells = RootCells::hint(&mut b, a_prep_roots, 2 * next_arena_prep as u32);
+                let cells = RootCells::hint(
+                    &mut b,
+                    a_prep_roots,
+                    super::proof_arena::words_per_root() as u32 * next_arena_prep as u32,
+                );
                 next_arena_prep += 1;
                 assert!(
                     decode_cells.is_none(),
@@ -2327,7 +2337,13 @@ pub(super) fn batched_epoch_program_with(
         })
         .collect();
     let fri_root_cells: Vec<_> = (0..shape.fri.num_committed())
-        .map(|k| RootCells::hint(&mut b, a_fri_roots, 2 * k as u32))
+        .map(|k| {
+            RootCells::hint(
+                &mut b,
+                a_fri_roots,
+                super::proof_arena::words_per_root() as u32 * k as u32,
+            )
+        })
         .collect();
     let coeff_cells: Vec<_> = (0..shape.fri.num_terminal_coeffs() as u32)
         .map(|k| b.hint_word(a_fri_coeffs, k).as_ext())
@@ -3696,7 +3712,11 @@ fn epoch_program_with(e: &RealEpoch, with_legs: bool, split_decode: bool) -> Lfm
                 Some(RootCells::from_digest(&mut b, digest))
             }
             Some(PrepSource::ElfDependent(_)) => {
-                let cells = RootCells::hint(&mut b, a_prep_roots, 2 * next_arena_prep as u32);
+                let cells = RootCells::hint(
+                    &mut b,
+                    a_prep_roots,
+                    super::proof_arena::words_per_root() as u32 * next_arena_prep as u32,
+                );
                 next_arena_prep += 1;
                 // Every ELF-dependent root of a continuation EPOCH is DECODE (the
                 // page family lives in the global proof), and the attestation
@@ -3719,7 +3739,13 @@ fn epoch_program_with(e: &RealEpoch, with_legs: bool, split_decode: bool) -> Lfm
 
     // ---- Phase A ----
     let main_cells: Vec<RootCells> = (0..n)
-        .map(|i| RootCells::hint(&mut b, a_main_roots, 2 * i as u32))
+        .map(|i| {
+            RootCells::hint(
+                &mut b,
+                a_main_roots,
+                super::proof_arena::words_per_root() as u32 * i as u32,
+            )
+        })
         .collect();
     let prep_halves: Vec<Option<Vec<_>>> = prep_cells
         .iter()
@@ -3825,7 +3851,13 @@ fn epoch_program_with(e: &RealEpoch, with_legs: bool, split_decode: bool) -> Lfm
             .map(|k| b.hint_word(a.parts, k).as_ext())
             .collect();
         let fri_roots: Vec<_> = (0..h.shape.fri.num_committed())
-            .map(|k| RootCells::hint(&mut b, a.fri_roots, 2 * k as u32))
+            .map(|k| {
+                RootCells::hint(
+                    &mut b,
+                    a.fri_roots,
+                    super::proof_arena::words_per_root() as u32 * k as u32,
+                )
+            })
             .collect();
         let fri_coeffs: Vec<_> = (0..h.shape.fri.num_terminal_coeffs() as u32)
             .map(|k| b.hint_word(a.fri_coeffs, k).as_ext())

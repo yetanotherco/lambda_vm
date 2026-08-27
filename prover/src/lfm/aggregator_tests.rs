@@ -341,8 +341,8 @@ pub(super) fn declare_lfm_leg_arenas(
     let has_aux = !e.shape.aux.dims.is_empty();
     LfmLegArenas {
         publics: b.declare_arena(8 * e.public_words.len() as u32),
-        main_root: b.declare_arena(2),
-        aux_root: has_aux.then(|| b.declare_arena(2)),
+        main_root: b.declare_arena(super::edsl::digest_words(b)),
+        aux_root: has_aux.then(|| b.declare_arena(super::edsl::digest_words(b))),
         contrib: e
             .airs()
             .air_refs()
@@ -366,7 +366,7 @@ pub(super) fn declare_lfm_leg_arenas(
                 )
             })
             .collect(),
-        parts_root: b.declare_arena(2),
+        parts_root: b.declare_arena(super::edsl::digest_words(b)),
         standalone: {
             let fri = super::batched_epoch::BatchedFriShape::new(
                 &e.shape.heights,
@@ -383,7 +383,8 @@ pub(super) fn declare_lfm_leg_arenas(
                 })
                 .collect()
         },
-        fri_roots: b.declare_arena(2 * e.proof.fri_layer_roots.len() as u32),
+        fri_roots: b
+            .declare_arena(super::edsl::digest_words(b) * e.proof.fri_layer_roots.len() as u32),
         fri_coeffs: b.declare_arena(e.proof.fri_final_poly_coeffs.len() as u32),
         nonce: (e.fri_params.grinding_factor > 0).then(|| b.declare_arena(1)),
         openings: with_openings.then(|| {
@@ -543,7 +544,13 @@ pub(super) fn emit_lfm_leg(
         })
         .collect();
     let fri_root_cells: Vec<RootCells> = (0..e.proof.fri_layer_roots.len())
-        .map(|k| RootCells::hint(b, a.fri_roots, 2 * k as u32))
+        .map(|k| {
+            RootCells::hint(
+                b,
+                a.fri_roots,
+                super::proof_arena::words_per_root() as u32 * k as u32,
+            )
+        })
         .collect();
     let coeff_cells: Vec<Ext> = (0..e.proof.fri_final_poly_coeffs.len() as u32)
         .map(|k| b.hint_word(a.fri_coeffs, k).as_ext())
@@ -950,11 +957,9 @@ fn hint_digests(
 ) -> Vec<edsl::WrapDigest> {
     (0..count)
         .map(|_| {
-            let d = super::edsl::WrapDigest::from_pair(
-                b.hint_word(arena, *cursor),
-                b.hint_word(arena, *cursor + 1),
-            );
-            *cursor += 2;
+            // The stride is the DIGEST's width, not a literal two.
+            let d = super::edsl::hint_digest(b, arena, *cursor);
+            *cursor += super::edsl::digest_words(b);
             d
         })
         .collect()
@@ -1432,20 +1437,24 @@ pub(super) fn global_verifier_program(g: &RealGlobal) -> LfmProgram {
     let n = g.tables.len();
 
     // ---- arenas, declaration order = absorb order ----
-    let a_main_roots = b.declare_arena(2 * n as u32);
+    let a_main_roots = b.declare_arena(super::edsl::digest_words(&b) * n as u32);
     let per_table: Vec<GlobalTableArenas> = g
         .tables
         .iter()
         .zip(&g.legs)
         .map(|(h, leg)| GlobalTableArenas {
-            aux_root: h.shape.has_aux_root.then(|| b.declare_arena(2)),
+            aux_root: h
+                .shape
+                .has_aux_root
+                .then(|| b.declare_arena(super::edsl::digest_words(&b))),
             contribution: h.shape.has_contribution.then(|| b.declare_arena(1)),
-            composition_root: b.declare_arena(2),
+            composition_root: b.declare_arena(super::edsl::digest_words(&b)),
             ood_current: b
                 .declare_arena((h.shape.ood_current_dims.0 * h.shape.ood_current_dims.1) as u32),
             ood_next: b.declare_arena((h.shape.ood_next_dims.0 * h.shape.ood_next_dims.1) as u32),
             parts: b.declare_arena(h.shape.num_parts as u32),
-            fri_roots: b.declare_arena(2 * h.shape.fri.num_committed() as u32),
+            fri_roots: b
+                .declare_arena(super::edsl::digest_words(&b) * h.shape.fri.num_committed() as u32),
             fri_coeffs: b.declare_arena(h.shape.fri.num_terminal_coeffs() as u32),
             nonce: (h.shape.grinding_factor > 0).then(|| b.declare_arena(1)),
             legs: super::epoch_verify::declare_table_arenas(&mut b, &leg.verify),
@@ -1458,7 +1467,13 @@ pub(super) fn global_verifier_program(g: &RealGlobal) -> LfmProgram {
 
     // ---- Phase A: prep constants, hinted main roots ----
     let main_cells: Vec<RootCells> = (0..n)
-        .map(|i| RootCells::hint(&mut b, a_main_roots, 2 * i as u32))
+        .map(|i| {
+            RootCells::hint(
+                &mut b,
+                a_main_roots,
+                super::proof_arena::words_per_root() as u32 * i as u32,
+            )
+        })
         .collect();
     let main_halves: Vec<Vec<Felt>> = main_cells.iter().map(RootCells::lanes_flat).collect();
     let prep_cells: Vec<Option<RootCells>> = g
@@ -1511,7 +1526,13 @@ pub(super) fn global_verifier_program(g: &RealGlobal) -> LfmProgram {
             .map(|k| b.hint_word(a.parts, k).as_ext())
             .collect();
         let fri_roots: Vec<RootCells> = (0..h.shape.fri.num_committed())
-            .map(|k| RootCells::hint(&mut b, a.fri_roots, 2 * k as u32))
+            .map(|k| {
+                RootCells::hint(
+                    &mut b,
+                    a.fri_roots,
+                    super::proof_arena::words_per_root() as u32 * k as u32,
+                )
+            })
             .collect();
         let fri_coeffs: Vec<Ext> = (0..h.shape.fri.num_terminal_coeffs() as u32)
             .map(|k| b.hint_word(a.fri_coeffs, k).as_ext())

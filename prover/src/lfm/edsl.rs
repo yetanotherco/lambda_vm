@@ -164,6 +164,29 @@ impl SpongeVar {
     }
 }
 
+/// Arena words one commitment DIGEST occupies under this builder's
+/// configuration — two on a byte hash, ONE on an algebraic one.
+///
+/// ★ The single definition of that stride. Six sites used to spell it as the
+/// literal `2`, three of them carrying a comment saying "two arena words per
+/// sibling IS the digest's width — when the algebraic path lands this stride
+/// follows the width rather than the literal". This is that.
+pub fn digest_words(b: &LfmBuilder) -> u32 {
+    match b.wrap_hash() {
+        WrapHash::Algebraic => 1,
+        _ => 2,
+    }
+}
+
+/// Read one commitment digest out of an arena at `base`, consuming
+/// [`digest_words`] words.
+pub fn hint_digest(b: &mut LfmBuilder, arena: super::instr::ArenaId, base: u32) -> WrapDigest {
+    let cells: Vec<Cell> = (0..digest_words(b))
+        .map(|i| b.hint_word(arena, base + i))
+        .collect();
+    WrapDigest::from_cells(&cells)
+}
+
 /// Where a leaf chain starts: the zero cell.
 ///
 /// ⚠ **This is a chain START, not a shape HEADER.** COMMIT.md §1.3 opens the

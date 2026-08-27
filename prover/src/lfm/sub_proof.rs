@@ -145,7 +145,8 @@ impl SubProofShape {
     /// offering the prover a second one.
     pub fn opening_words(&self) -> usize {
         let values: usize = self.groups().iter().map(GroupShape::num_values).sum();
-        let siblings = 2 * self.merkle_depth * self.groups().len();
+        let siblings =
+            super::proof_arena::words_per_root() * self.merkle_depth * self.groups().len();
         values + siblings
     }
 
@@ -568,7 +569,7 @@ pub fn emit_sub_proof_with_bits(
     let uniforms = b.declare_arena(2);
     let ood = b.declare_arena((shape.deep.num_eval_points * shape.deep.num_total_cols) as u32);
     let parts = b.declare_arena(shape.deep.num_composition_parts as u32);
-    let roots = b.declare_arena(2 * groups.len() as u32);
+    let roots = b.declare_arena(edsl::digest_words(b) * groups.len() as u32);
     let queries = b.declare_arena((num_queries * shape.query_words()) as u32);
     let arenas = SubProofArenas {
         uniforms,
@@ -600,7 +601,7 @@ pub fn emit_sub_proof_with_bits(
     let commitments: Vec<GroupCommitment> = groups
         .iter()
         .enumerate()
-        .map(|(i, g)| GroupCommitment::hint(b, roots, 2 * i as u32, *g))
+        .map(|(i, g)| GroupCommitment::hint(b, roots, edsl::digest_words(b) * i as u32, *g))
         .collect();
 
     let inv = emit_deep_invariants(b, &shape.deep, gamma, zeta, &ood_steps, &claimed_parts);
@@ -622,13 +623,10 @@ pub fn emit_sub_proof_with_bits(
                     .collect();
                 let siblings: Vec<WrapDigest> = (0..shape.merkle_depth)
                     .map(|_| {
-                        let lo = b.hint_word(queries, cursor);
-                        let hi = b.hint_word(queries, cursor + 1);
-                        cursor += 2;
-                        // Two arena words per sibling IS the digest's width. When
-                        // the algebraic path lands this stride follows the width
-                        // rather than the literal.
-                        edsl::WrapDigest::from_pair(lo, hi)
+                        // The stride follows the DIGEST's width, not a literal.
+                        let d = edsl::hint_digest(b, queries, cursor);
+                        cursor += edsl::digest_words(b);
+                        d
                     })
                     .collect();
                 GroupOpening { values, siblings }

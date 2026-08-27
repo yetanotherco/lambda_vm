@@ -354,19 +354,22 @@ impl TableLegs {
 /// aux, parts — every matrix's row pair in round INPUT order and the round's
 /// ONE shared path (`h_max − 1` levels, two words per sibling digest).
 pub(super) fn batched_opening_words_per_query(shape: &EpochShape) -> usize {
+    // ⚠ The sibling stride is the DIGEST's width, not a literal two — the
+    // opening VALUES' `2 *` is the row pair and is unrelated.
+    let sib = super::proof_arena::words_per_root();
     let mut words = 0;
     for &(h, width) in &shape.prep.dims {
-        words += 2 * width + 2 * (h - 1);
+        words += 2 * width + sib * (h - 1);
     }
     // The carved table's standalone opening: a preprocessed table's layout —
     // the row pair then its own path at the carved height.
     if let Some(c) = &shape.carved_main {
-        words += 2 * c.width + 2 * (shape.heights[c.table] - 1);
+        words += 2 * c.width + sib * (shape.heights[c.table] - 1);
     }
     for round in [&shape.main, &shape.aux, &shape.parts] {
         let Some(h_max) = round.h_max() else { continue };
         words += round.dims.iter().map(|&(_, w)| 2 * w).sum::<usize>();
-        words += 2 * (h_max - 1);
+        words += sib * (h_max - 1);
     }
     words
 }
@@ -392,8 +395,11 @@ pub(super) fn batched_fri_words_per_query(shape: &EpochShape, params: &EpochFriP
         params.blowup_log,
         params.final_poly_log_degree,
     );
+    // The `1` is the symmetric evaluation; the rest is the path, whose stride is
+    // the DIGEST's width rather than a literal two.
+    let sib = super::proof_arena::words_per_root();
     (0..layout.num_committed)
-        .map(|i| 1 + 2 * (plan.h_max - i - 2))
+        .map(|i| 1 + sib * (plan.h_max - i - 2))
         .sum()
 }
 

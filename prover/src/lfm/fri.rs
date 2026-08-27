@@ -160,7 +160,8 @@ impl FriShape {
     /// Arena words one query's FRI opening occupies: per committed layer the
     /// symmetric evaluation (one word) and its path (two words per level).
     pub fn query_words(self) -> usize {
-        self.num_committed() + 2 * self.path_steps_per_query()
+        // The path stride is the DIGEST's width, not a literal two.
+        self.num_committed() + super::proof_arena::words_per_root() * self.path_steps_per_query()
     }
 
     /// Keccak permutations the whole sub-proof's FRI costs.
@@ -368,13 +369,13 @@ pub fn declare_fri(
     let c = shape.num_committed();
     let num_zetas = if shape.total_folds() > 0 { c + 1 } else { 0 };
 
-    let roots = b.declare_arena(2 * c as u32);
+    let roots = b.declare_arena(edsl::digest_words(b) * c as u32);
     let zetas = b.declare_arena(num_zetas as u32);
     let coeffs = b.declare_arena(shape.num_terminal_coeffs() as u32);
     let queries = b.declare_arena((num_queries * shape.query_words()) as u32);
 
     let layers = (0..c)
-        .map(|i| LayerCommitment::hint(b, roots, 2 * i as u32))
+        .map(|i| LayerCommitment::hint(b, roots, edsl::digest_words(b) * i as u32))
         .collect();
     let zeta_cells = (0..num_zetas as u32)
         .map(|i| b.hint_word(zetas, i).as_ext())
@@ -427,11 +428,10 @@ pub fn hint_layer_openings_from(
             cursor += 1;
             let siblings: Vec<WrapDigest> = (0..shape.layer_path_len(layer))
                 .map(|_| {
-                    let lo = b.hint_word(arena, cursor);
-                    let hi = b.hint_word(arena, cursor + 1);
-                    cursor += 2;
-                    // Two arena words per sibling IS the digest's width.
-                    edsl::WrapDigest::from_pair(lo, hi)
+                    // The stride follows the DIGEST's width, not a literal.
+                    let d = edsl::hint_digest(b, arena, cursor);
+                    cursor += edsl::digest_words(b);
+                    d
                 })
                 .collect();
             LayerOpening { sym, siblings }

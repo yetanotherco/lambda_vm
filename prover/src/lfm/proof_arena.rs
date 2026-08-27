@@ -90,6 +90,20 @@ pub fn halves_to_arena(halves: Vec<FE>) -> Vec<LfmWord> {
     halves.into_iter().map(base_word).collect()
 }
 
+/// Arena words one commitment occupies, HOST side — the counterpart of
+/// `edsl::digest_words`, which is the machine side's reader.
+///
+/// ⚠ These two must agree or every root in the arena is off by a word. They do
+/// because both are functions of the configuration's digest width and neither
+/// restates it: this reads `WrapHash::production()`, that reads the builder's.
+pub fn words_per_root() -> usize {
+    if super::edsl::WrapHash::production() == super::edsl::WrapHash::Algebraic {
+        1
+    } else {
+        2
+    }
+}
+
 /// A 32-byte commitment as the arena words the machine reads it from — TWO on a
 /// byte hash, ONE on an algebraic one.
 ///

@@ -527,7 +527,13 @@ fn fib_challenge_program(
         .map(|i| b.hint_word(a_parts, i).as_ext())
         .collect();
     let fri_roots: Vec<_> = (0..s.fri.num_committed())
-        .map(|i| RootCells::hint(&mut b, a_fri_roots, 2 * i as u32))
+        .map(|i| {
+            RootCells::hint(
+                &mut b,
+                a_fri_roots,
+                super::proof_arena::words_per_root() as u32 * i as u32,
+            )
+        })
         .collect();
     let fri_coeffs: Vec<_> = (0..s.fri.num_terminal_coeffs() as u32)
         .map(|i| b.hint_word(a_fri_coeffs, i).as_ext())

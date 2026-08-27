@@ -326,13 +326,10 @@ pub fn emit_table_verification(
                     .collect();
                 let siblings = (0..shape.sub.merkle_depth)
                     .map(|_| {
-                        let lo = b.hint_word(arenas.openings, cursor);
-                        let hi = b.hint_word(arenas.openings, cursor + 1);
-                        cursor += 2;
-                        // Two arena words per sibling IS the digest's width. When
-                        // the algebraic path lands this stride follows the width
-                        // rather than the literal.
-                        super::edsl::WrapDigest::from_pair(lo, hi)
+                        // The stride follows the DIGEST's width, not a literal.
+                        let d = super::edsl::hint_digest(b, arenas.openings, cursor);
+                        cursor += super::edsl::digest_words(b);
+                        d
                     })
                     .collect();
                 GroupOpening { values, siblings }
