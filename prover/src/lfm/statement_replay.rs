@@ -91,7 +91,14 @@ pub struct EpochStatementVars<'a> {
     pub epoch_label: &'a [Felt],
 }
 
-/// Emits `absorb_statement(ContinuationEpoch)` byte for byte.
+/// Emits `absorb_statement(ContinuationEpoch)` byte for byte — and, since the
+/// algebraic arm landed, **call for call**.
+///
+/// ⚠ The call sequence below tracks
+/// `statement::absorb_statement_with_digest`'s `append_bytes` calls one for one.
+/// That is a real obligation rather than tidiness: a byte transcript concatenates
+/// and cannot see the boundaries, an algebraic one length-prefixes every call and
+/// sees nothing else.
 ///
 /// Every multi-byte field in this encoding is LITTLE-endian (`to_le_bytes`),
 /// unlike `append_field_element`'s big-endian rendering — so a `u64` carried as
@@ -119,21 +126,26 @@ pub fn absorb_epoch_statement(
     // than absorbed whole.
     t.append_bytes_misaligned(vars.public_output, shape.public_output_len);
 
-    // One constant run: the counts, the page total, the FRI byte and the range
-    // list are all shape-static, so they concatenate into a single run and the
-    // packer chunks them together.
-    let mut consts = Vec::new();
+    // ⚠ ONE APPEND PER HOST CALL, not one run. The counts, the page total, the
+    // FRI byte and the range list are all shape-static, so a byte transcript
+    // cannot tell a single concatenated run from this sequence — the packer
+    // chunks consecutive constants together either way, and the emitted halves
+    // are identical. An ALGEBRAIC transcript can: it prefixes every
+    // `append_bytes` call with that call's LENGTH, so coalescing here would
+    // absorb one long field where the host absorbed twenty short ones, and
+    // every challenge downstream would diverge. See `transcript_replay::Append`
+    // for the general statement of this.
     for count in shape.table_counts {
-        consts.extend_from_slice(&count.to_le_bytes());
+        t.append_const_bytes(&count.to_le_bytes());
     }
-    consts.extend_from_slice(&shape.num_private_input_pages.to_le_bytes());
-    consts.push(shape.fri_final_poly_log_degree);
-    consts.extend_from_slice(&(shape.page_ranges.len() as u64).to_le_bytes());
+    t.append_const_bytes(&shape.num_private_input_pages.to_le_bytes());
+    // A single byte, no endianness concern — and its own call.
+    t.append_const_bytes(&[shape.fri_final_poly_log_degree]);
+    t.append_const_bytes(&(shape.page_ranges.len() as u64).to_le_bytes());
     for (base, count) in &shape.page_ranges {
-        consts.extend_from_slice(&base.to_le_bytes());
-        consts.extend_from_slice(&count.to_le_bytes());
+        t.append_const_bytes(&base.to_le_bytes());
+        t.append_const_bytes(&count.to_le_bytes());
     }
-    t.append_const_bytes(&consts);
 
     // Continuation epochs bind their position last (replay protection).
     t.append_halves_misaligned(vars.epoch_label);

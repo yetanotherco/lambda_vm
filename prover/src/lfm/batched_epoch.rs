@@ -219,22 +219,27 @@ pub struct BatchedEpochChallenges {
     pub iota_bits: Vec<Vec<Bit>>,
 }
 
-/// The canonical shape-histogram binding (`absorb_shape_histogram`), as ONE
-/// constant byte run — every height and width is program shape. Production
+/// The canonical shape-histogram binding (`absorb_shape_histogram`) — every
+/// height and width is program shape, so all of it is constant. Production
 /// absorbs it twice (the spine's head and round 4), and so does the machine.
+///
+/// ⚠ `1 + 2n` appends, matching `absorb_shape_histogram`'s `append_bytes` calls
+/// one for one, and NOT the single concatenated run this used to emit. The two
+/// are the same bytes and the same digest under a byte transcript, which is why
+/// the run was correct and why it stayed correct silently; an algebraic
+/// transcript length-prefixes each call, so the run would absorb one long field
+/// where the host absorbed `1 + 2n` short ones. See `transcript_replay::Append`.
 pub fn emit_shape_histogram(t: &mut TranscriptReplay, heights: &[usize], widths: &[usize]) {
     assert_eq!(
         heights.len(),
         widths.len(),
         "the shape histogram needs one width per height"
     );
-    let mut bytes = Vec::with_capacity(8 + 16 * heights.len());
-    bytes.extend_from_slice(&(heights.len() as u64).to_le_bytes());
+    t.append_const_bytes(&(heights.len() as u64).to_le_bytes());
     for (h, w) in heights.iter().zip(widths) {
-        bytes.extend_from_slice(&(*h as u64).to_le_bytes());
-        bytes.extend_from_slice(&(*w as u64).to_le_bytes());
+        t.append_const_bytes(&(*h as u64).to_le_bytes());
+        t.append_const_bytes(&(*w as u64).to_le_bytes());
     }
-    t.append_const_bytes(&bytes);
 }
 
 /// Replay the whole batched epoch transcript. `t` must be positioned right
