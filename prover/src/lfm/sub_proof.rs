@@ -256,6 +256,21 @@ pub fn emit_leaf_hash(b: &mut LfmBuilder, shape: GroupShape, values: &[Cell]) ->
         return edsl::wrap_leaf_hash(b, &felts);
     }
 
+    // ★ The ALGEBRAIC path absorbs the felts. The byte stream below exists only
+    // because the incumbent hashes are byte-oriented: what it serialises IS
+    // three field elements per value, so an algebraic leaf deletes the
+    // serialisation rather than reimplementing it. ✓ The host's decomposition
+    // agrees by construction — `write_bytes_be` for an Fp3 element writes
+    // components 0, 1, 2 in order, which is the lane order `unpack` returns.
+    if edsl::WrapHash::production() == edsl::WrapHash::Algebraic {
+        let mut felts = Vec::with_capacity(3 * values.len());
+        for v in values {
+            let lanes = b.unpack(*v);
+            felts.extend_from_slice(&lanes[..3]);
+        }
+        return edsl::wrap_leaf_hash(b, &felts);
+    }
+
     let mut stream = Vec::with_capacity(6 * values.len());
     for v in values {
         let lanes = b.unpack(*v);

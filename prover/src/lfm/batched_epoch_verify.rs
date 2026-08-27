@@ -61,6 +61,30 @@ pub fn emit_group_leaf_hash(b: &mut LfmBuilder, group: &[&MixedMatrixOpening<'_>
     use super::transcript_replay::felt_be_halves;
 
     assert!(!group.is_empty(), "a group leaf covers at least one matrix");
+
+    // ★ The ALGEBRAIC path absorbs the felts — same reasoning as
+    // `sub_proof::emit_leaf_hash`: the byte stream below is a serialisation of
+    // field elements that exists only for a byte-oriented hash.
+    if edsl::WrapHash::production() == edsl::WrapHash::Algebraic {
+        let mut felts: Vec<Felt> = Vec::new();
+        for m in group {
+            assert_eq!(
+                m.values.len(),
+                m.shape.num_values(),
+                "a matrix's opening covers its whole row pair"
+            );
+            for v in m.values {
+                if m.shape.is_ext {
+                    let lanes = b.unpack(*v);
+                    felts.extend_from_slice(&lanes[..3]);
+                } else {
+                    felts.push(Felt(v.addr()));
+                }
+            }
+        }
+        return edsl::wrap_leaf_hash(b, &felts);
+    }
+
     let mut stream: Vec<Felt> = Vec::new();
     for m in group {
         assert_eq!(

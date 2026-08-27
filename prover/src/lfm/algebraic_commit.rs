@@ -839,6 +839,46 @@ mod tests {
                 );
             }
 
+            // ★ EXTENSION leaves — the decomposition the call sites rely on.
+            //
+            // `sub_proof::emit_leaf_hash` and `batched_epoch_verify` absorb an
+            // Fp3 value as `unpack(cell)[..3]`, deleting the byte serialisation.
+            // That is correct only if the host's own decomposition agrees:
+            // `write_bytes_be` for an Fp3 element writes components 0, 1, 2 in
+            // order. Verified by reading, and gated here so it stays true.
+            for n in [1usize, 2, 3, 5] {
+                let leaf = ext_leaf(n);
+                let want = <AlgebraicBatchBackend<Ext, H> as IsMerkleTreeBackend>::hash_data(&leaf);
+
+                let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::Algebraic);
+                let arena = b.declare_arena(n as u32);
+                let felts: Vec<_> = (0..n)
+                    .flat_map(|i| {
+                        let c = b.hint_word(arena, i as u32);
+                        b.unpack(c)[..3].to_vec()
+                    })
+                    .collect();
+                let d = WrapHash::Algebraic.leaf_hash(&mut b, &felts);
+                b.public(d[0]);
+                let program = compile(b.finish());
+
+                let words: Vec<LfmWord> = leaf
+                    .iter()
+                    .map(|e| {
+                        let v = e.value();
+                        [v[0], v[1], v[2], FE::zero()]
+                    })
+                    .collect();
+                let artifacts = build_artifacts_with_hasher(&program, &opts, H::KIND);
+                let proved = lfm_prove_with_hasher(&program, &artifacts, &[words], &opts, H::KIND)
+                    .expect("the extension leaf program must prove");
+                assert_eq!(
+                    digest_to_commitment(&proved.public_words[0].1),
+                    want,
+                    "{name}: emitted EXTENSION leaf of {n} elements must equal the host's"
+                );
+            }
+
             // And the parent.
             let l = digest_to_commitment(&[FE::from(3u64), FE::from(5), FE::from(7), FE::from(11)]);
             let r =
