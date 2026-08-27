@@ -96,7 +96,10 @@ fn the_shaped_emitter_reproduces_the_blessed_program_at_the_default_size() {
     for kind in [HasherKind::Test, HasherKind::Rpo] {
         let a = build_artifacts_with_hasher(&blessed, &opts, kind);
         let b = build_artifacts_with_hasher(&shaped, &opts, kind);
-        assert_eq!(a.program_id, b.program_id, "{kind:?}: program identity moved");
+        assert_eq!(
+            a.program_id, b.program_id,
+            "{kind:?}: program identity moved"
+        );
         assert_eq!(a.roots, b.roots, "{kind:?}: a preprocessed root moved");
         assert_eq!(a.log_heights, b.log_heights);
     }
@@ -195,14 +198,14 @@ fn the_machine_rejects_tampered_scaled_proofs() {
     let honest = fixture_prove_with_shape(kind, GREEN);
     let arenas = |p: &super::fixture::FriToyProof| vec![p.commitments.clone(), p.openings.clone()];
 
-    let expect_reject = |a: Vec<Vec<super::LfmWord>>, what: &str| {
-        match lfm_prove_with_hasher(&program, &artifacts, &a, &opts, kind) {
-            Err(LfmProveError::Exec(LfmExecError::DivByZero { .. })) => {}
-            other => panic!(
-                "{what}: expected a failed in-machine assert, got {:?}",
-                other.map(|_| "accepted")
-            ),
-        }
+    let expect_reject = |a: Vec<Vec<super::LfmWord>>, what: &str| match lfm_prove_with_hasher(
+        &program, &artifacts, &a, &opts, kind,
+    ) {
+        Err(LfmProveError::Exec(LfmExecError::DivByZero { .. })) => {}
+        other => panic!(
+            "{what}: expected a failed in-machine assert, got {:?}",
+            other.map(|_| "accepted")
+        ),
     };
 
     let stride = GREEN.words_per_query();
@@ -367,7 +370,11 @@ fn the_scaled_fixture_measures_one_arm() {
 
     let t = Instant::now();
     let program = fri_toy_program_with_shape(sh);
-    println!("emit+compile   {:>8.2}s   peak {:>6.3} GiB", t.elapsed().as_secs_f64(), rss());
+    println!(
+        "emit+compile   {:>8.2}s   peak {:>6.3} GiB",
+        t.elapsed().as_secs_f64(),
+        rss()
+    );
 
     let (total, hash_cells, hash_rows) = census_totals(&program, kind);
     println!(
@@ -377,11 +384,19 @@ fn the_scaled_fixture_measures_one_arm() {
 
     let t = Instant::now();
     let inner = fixture_prove_with_shape(kind, sh);
-    println!("host fixture   {:>8.2}s   peak {:>6.3} GiB", t.elapsed().as_secs_f64(), rss());
+    println!(
+        "host fixture   {:>8.2}s   peak {:>6.3} GiB",
+        t.elapsed().as_secs_f64(),
+        rss()
+    );
 
     let t = Instant::now();
     let artifacts = build_artifacts_with_hasher(&program, &opts, kind);
-    println!("artifacts      {:>8.2}s   peak {:>6.3} GiB", t.elapsed().as_secs_f64(), rss());
+    println!(
+        "artifacts      {:>8.2}s   peak {:>6.3} GiB",
+        t.elapsed().as_secs_f64(),
+        rss()
+    );
 
     let t = Instant::now();
     let proved = lfm_prove_with_hasher(
@@ -401,7 +416,11 @@ fn the_scaled_fixture_measures_one_arm() {
         verify_against_artifacts(&artifacts, &proved.proof, &proved.public_words, &opts),
         "the scaled machine proof must verify"
     );
-    println!("verify         {:>8.2}s   peak {:>6.3} GiB", t.elapsed().as_secs_f64(), rss());
+    println!(
+        "verify         {:>8.2}s   peak {:>6.3} GiB",
+        t.elapsed().as_secs_f64(),
+        rss()
+    );
 
     // One machine-readable line per arm, for the driver to collect.
     println!(
