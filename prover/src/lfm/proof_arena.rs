@@ -104,6 +104,33 @@ pub fn words_per_root() -> usize {
     }
 }
 
+/// LANES one commitment occupies once its arena words are unpacked — four per
+/// word, so EIGHT on a byte hash and FOUR on an algebraic one.
+///
+/// This is the count a PUBLISHED root has: everything that publishes a root
+/// publishes `epoch::RootCells::lanes_flat`, which is the unpack of exactly
+/// [`commitment_words`].
+///
+/// ⚠ Equal to [`ROOT_HALVES`] on the byte arm and NOT the same quantity. A byte
+/// lane is a `u32` half of the root's 32 bytes; an algebraic lane is a full
+/// canonical felt. A reader that spells the count `8` therefore reads the
+/// algebraic arm at twice the stride and walks off the schema — the failure is
+/// an index into the wrong field, not an out-of-bounds, so it surfaces as a
+/// value comparison rather than a shape error.
+pub fn lanes_per_root() -> usize {
+    super::word::WORD_LANES * words_per_root()
+}
+
+/// A commitment as the LANES the machine publishes for it.
+///
+/// The flattened [`commitment_words`], which is by construction what
+/// `RootCells::lanes_flat` yields for a root hinted out of those same words —
+/// so a test comparing published roots against host material has one function
+/// to call instead of a rendering to re-spell per arm.
+pub fn commitment_lanes(c: &Commitment) -> Vec<FE> {
+    commitment_words(c).into_iter().flatten().collect()
+}
+
 /// A 32-byte commitment as the arena words the machine reads it from — TWO on a
 /// byte hash, ONE on an algebraic one.
 ///
@@ -260,7 +287,8 @@ impl MainTraceOpening {
         self.values.iter().copied().map(base_word).collect()
     }
 
-    /// The sibling digests as arena words, two per level, leaf level first.
+    /// The sibling digests as arena words, [`words_per_root`] per level, leaf
+    /// level first — TWO on a byte hash, ONE on an algebraic one.
     pub fn sibling_arena(&self) -> Vec<LfmWord> {
         self.siblings.iter().flat_map(commitment_words).collect()
     }

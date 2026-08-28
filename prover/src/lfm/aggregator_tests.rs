@@ -992,6 +992,21 @@ pub(super) struct WrapPublicLayout {
     pub(super) n_iotas: usize,
     pub(super) num_reg: usize,
     pub(super) out_bytes: usize,
+    /// Words the carved L2G root occupies at the END of the schema — four per
+    /// digest cell, so EIGHT on a byte hash and FOUR on an algebraic one.
+    ///
+    /// ⚠ The one count here that is a function of the HASH rather than of the
+    /// inner epoch, which is why it is a field: `of_inner` reads it from
+    /// `proof_arena::lanes_per_root` and the assert prints it, so a
+    /// configuration whose emitter and reader disagree names the number instead
+    /// of leaving a bare arithmetic mismatch.
+    ///
+    /// ⛔ NOT the attestation id's width. That is `emit_program_id`'s output,
+    /// which is PINNED KECCAK on every arm (`programs::emit_program_id` names
+    /// `keccak256` deliberately, because the id identifies a program to
+    /// consumers rather than being part of the commitment layer), so it is two
+    /// published words under every configuration and stays a literal.
+    pub(super) l2g_lanes: usize,
 }
 
 impl WrapPublicLayout {
@@ -1009,22 +1024,24 @@ impl WrapPublicLayout {
             n_iotas: e.fri_params.num_queries,
             num_reg: crate::tables::register::NUM_REGISTER_ADDRESSES,
             out_bytes: e.statement.public_output_len,
+            l2g_lanes: super::proof_arena::lanes_per_root(),
         }
     }
     fn total(&self) -> usize {
-        self.schema_start() + 2 * self.num_reg + 2 + self.out_bytes + 8
+        self.schema_start() + 2 * self.num_reg + 2 + self.out_bytes + self.l2g_lanes
     }
     fn assert_covers(&self, wrap: &RealBatchedLfm) {
         assert_eq!(
             self.total(),
             wrap.public_words.len(),
             "the layout must cover the wrap's published words exactly \
-             (n={}, zetas={}, iotas={}, num_reg={}, out={})",
+             (n={}, zetas={}, iotas={}, num_reg={}, out={}, l2g_lanes={})",
             self.n_tables,
             self.n_zetas,
             self.n_iotas,
             self.num_reg,
             self.out_bytes,
+            self.l2g_lanes,
         );
     }
     fn id(&self, half: usize) -> usize {
@@ -1173,9 +1190,10 @@ pub(super) fn aggregator_program(
     for (layout, wrap) in layouts.iter().zip(wraps) {
         layout.assert_covers(wrap);
     }
+    let l2g_lanes = super::proof_arena::lanes_per_root();
     assert_eq!(
         global_wrap.public_words.len(),
-        2 + 8 * num_l2g,
+        2 + l2g_lanes * num_l2g,
         "the global wrap publishes its pair and one root per epoch"
     );
     emit_wrap_chain_bindings(&mut b, &legs, layouts, labels);
@@ -1183,11 +1201,11 @@ pub(super) fn aggregator_program(
     // ---- ★ the L2G root-equality binding, in-VM: epoch wrap k's published
     // carved root == the global wrap's published re-commit root k ----
     for (k, (leg, layout)) in legs.iter().zip(layouts).enumerate() {
-        for h in 0..8 {
+        for h in 0..l2g_lanes {
             assert_words_equal(
                 &mut b,
                 &leg.publics[layout.l2g_half(h)],
-                &g_leg.publics[2 + 8 * k + h],
+                &g_leg.publics[2 + l2g_lanes * k + h],
             );
         }
     }
@@ -1256,7 +1274,7 @@ pub(super) fn aggregator_program(
         b.public(last.publics[l_last.out_byte(i)].lanes[0].as_cell());
     }
     for (leg, layout) in legs.iter().zip(layouts.iter()) {
-        for h in 0..8 {
+        for h in 0..l2g_lanes {
             b.public(leg.publics[layout.l2g_half(h)].lanes[0].as_cell());
         }
     }
@@ -2127,16 +2145,21 @@ fn the_global_verifier_leg_runs_and_rejects_tampers() {
     assert_eq!(pub_ext(0), g.z_alpha.0, "the global z");
     assert_eq!(pub_ext(1), g.z_alpha.1, "the global alpha");
     // The published L2G re-commit roots equal the harvested main roots.
+    //
+    // ⚠ Compared through `proof_arena::commitment_lanes`, NOT by re-spelling
+    // the byte rendering here. The program publishes `RootCells::lanes_flat`,
+    // which is `u32` halves on a byte hash and FULL FELTS on an algebraic one;
+    // `commitment_lanes` is the flattened `commitment_words` the arena was
+    // written from, so the two agree by construction on either arm instead of
+    // this test carrying a second copy of one arm's layout.
+    let l2g_lanes = super::proof_arena::lanes_per_root();
     for k in 0..g.num_l2g {
-        for h in 0..8 {
-            let got = super::word::word_as_base(&exec.public_words[2 + 8 * k + h].1)
-                .expect("a root half");
-            let want = FE::from(u32::from_le_bytes(
-                g.tables[k].main_root[4 * h..4 * h + 4]
-                    .try_into()
-                    .expect("a root is 32 bytes"),
-            ) as u64);
-            assert_eq!(got, want, "L2G root {k} half {h}");
+        let want = super::proof_arena::commitment_lanes(&g.tables[k].main_root);
+        assert_eq!(want.len(), l2g_lanes, "a root's published lane count");
+        for (h, want) in want.into_iter().enumerate() {
+            let got = super::word::word_as_base(&exec.public_words[2 + l2g_lanes * k + h].1)
+                .expect("a root lane");
+            assert_eq!(got, want, "L2G root {k} lane {h}");
         }
     }
     println!(
@@ -2188,12 +2211,28 @@ fn the_aggregate_leg_census_matches_the_closed_form() {
         let _ = emit_lfm_leg(&mut b, &e, &a);
         compile(b.finish())
     };
-    let count = |p: &LfmProgram, keccak: bool| -> usize {
+    // ★ THE CLOSED FORM COUNTS PERMUTATIONS, and each of the three chips is
+    // exactly ONE permutation per instruction — `Instr::KeccakF` and
+    // `Instr::Blake3` on the byte arms, `Instr::Hash` on the algebraic socket
+    // (every `HashMode` is one permutation of the same socket). So this counter
+    // is arm-agnostic and the closed form needs no algebraic variant: the
+    // hash-dependence lives entirely inside `epoch_verify::blocks_for`, whose
+    // Algebraic arm is pinned width by width by
+    // `rpo_chip_tests::the_rate_eight_census_is_hash_invariant`.
+    //
+    // ⚠ Counting only the two BYTE chips is what this test used to do, and on
+    // an algebraic pin it reports ZERO against a nonzero closed form. That is a
+    // defect in the TEST's bookkeeping, not in the closed form or in the
+    // emitter — do not "fix" it by touching either.
+    let count = |p: &LfmProgram, hash: super::edsl::WrapHash| -> usize {
+        use super::edsl::WrapHash;
+        use super::instr::Instr;
         p.instrs
             .iter()
-            .filter(|i| match i {
-                super::instr::Instr::KeccakF(_) => keccak,
-                super::instr::Instr::Blake3(_) => !keccak,
+            .filter(|i| match (i, hash) {
+                (Instr::KeccakF(_), WrapHash::Keccak) => true,
+                (Instr::Blake3(_), WrapHash::Blake3) => true,
+                (Instr::Hash { .. }, WrapHash::Algebraic) => true,
                 _ => false,
             })
             .count()
@@ -2203,15 +2242,26 @@ fn the_aggregate_leg_census_matches_the_closed_form() {
     let hash = super::edsl::WrapHash::production();
     let per_query =
         super::batched_epoch_verify::batched_query_permutations_for(&e.shape, &e.fri_params, hash);
-    let is_keccak = matches!(hash, super::edsl::WrapHash::Keccak);
-    let wrap_delta = count(&full, is_keccak) - count(&spine, is_keccak);
-    let other_delta = count(&full, !is_keccak) - count(&spine, !is_keccak);
+    let wrap_delta = count(&full, hash) - count(&spine, hash);
     assert_eq!(
         wrap_delta,
         e.proof.queries.len() * per_query,
         "an aggregator leg's walks must hash exactly the census closed form"
     );
-    assert_eq!(other_delta, 0, "the walks hash under the wrap hash alone");
+    for other in [
+        super::edsl::WrapHash::Keccak,
+        super::edsl::WrapHash::Blake3,
+        super::edsl::WrapHash::Algebraic,
+    ] {
+        if other == hash {
+            continue;
+        }
+        assert_eq!(
+            count(&full, other) - count(&spine, other),
+            0,
+            "the walks hash under the wrap hash alone, not {other:?}"
+        );
+    }
 
     // ★ The closed form is CHUNK-INVARIANT, and that is a property, not an
     // accident. `LFM_BLAKE3` chunking redistributes the chip's rows over AIR
@@ -2219,19 +2269,26 @@ fn the_aggregate_leg_census_matches_the_closed_form() {
     // is the same program either way. Asserted rather than argued: a chunking
     // that reached back into emission would move the census silently, and the
     // aggregation program is exactly where chunking gets switched on.
-    let per = full.groups.blake3.real_rows.div_ceil(3).max(1);
-    let chunked =
-        full.with_blake3_chunking(super::chunking::Blake3Chunking::from_compressions(per));
-    assert!(
-        chunked.blake3_chunk_count() > 1,
-        "the control needs a real split, got {} chunks of {per}",
-        chunked.blake3_chunk_count()
-    );
-    assert_eq!(
-        count(&chunked, is_keccak) - count(&spine, is_keccak),
-        wrap_delta,
-        "chunking must not move the leg's wrap-hash census"
-    );
+    //
+    // ⚠ Runs only where there ARE `LFM_BLAKE3` rows to split. Under a keccak or
+    // an algebraic pin the leg emits none, so `from_compressions` has nothing to
+    // chunk and the control would assert against a single empty chunk — a
+    // vacuous failure about the chip's absence, not about the census.
+    if full.groups.blake3.real_rows > 0 {
+        let per = full.groups.blake3.real_rows.div_ceil(3).max(1);
+        let chunked =
+            full.with_blake3_chunking(super::chunking::Blake3Chunking::from_compressions(per));
+        assert!(
+            chunked.blake3_chunk_count() > 1,
+            "the control needs a real split, got {} chunks of {per}",
+            chunked.blake3_chunk_count()
+        );
+        assert_eq!(
+            count(&chunked, hash) - count(&spine, hash),
+            wrap_delta,
+            "chunking must not move the leg's wrap-hash census"
+        );
+    }
 
     eprintln!(
         "aggregate leg census: {per_query} wrap permutations/query over {} chips at the          aggregation preset",
