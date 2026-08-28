@@ -2130,11 +2130,9 @@ fn hint_digests(
 ) -> Vec<super::edsl::WrapDigest> {
     (0..count)
         .map(|_| {
-            let d = super::edsl::WrapDigest::from_pair(
-                b.hint_word(arena, *cursor),
-                b.hint_word(arena, *cursor + 1),
-            );
-            *cursor += 2;
+            // The stride is the DIGEST's width, not a literal two.
+            let d = super::edsl::hint_digest(b, arena, *cursor);
+            *cursor += super::edsl::digest_words(b);
             d
         })
         .collect()
@@ -3833,7 +3831,7 @@ fn epoch_program_with(e: &RealEpoch, with_legs: bool, split_decode: bool) -> Lfm
             .collect();
         let page_halves: Vec<(Vec<_>, Vec<_>)> = page_cells
             .iter()
-            .map(|(base, root)| (base.clone(), root.lanes_flat()))
+            .map(|(base, root)| (base.clone(), root.byte_halves(&mut b)))
             .collect();
         let page_refs: Vec<(&[_], &[_])> = page_halves
             .iter()
@@ -3842,11 +3840,11 @@ fn epoch_program_with(e: &RealEpoch, with_legs: bool, split_decode: bool) -> Lfm
         let decode = match a_split_decode {
             // ★ THE BROKEN CONTROL: a second, independent reading of the DECODE
             // root. The fold now attests to a value Phase A never absorbed.
-            Some(arena) => RootCells::hint(&mut b, arena, 0).lanes_flat(),
+            Some(arena) => RootCells::hint(&mut b, arena, 0).byte_halves(&mut b),
             None => decode_cells
                 .as_ref()
                 .expect("a continuation epoch has a DECODE sub-proof")
-                .lanes_flat(),
+                .byte_halves(&mut b),
         };
         let id = super::programs::emit_program_id(
             &mut b,
