@@ -268,7 +268,18 @@ pub(super) fn emit_lfm_statement(
     t.append_const_bytes(&(words.len() as u64).to_le_bytes());
     for word in words {
         t.append_const_bytes(&word.index.to_le_bytes());
-        t.append_halves_misaligned(&word.halves);
+        // ⚠ ONE APPEND PER LANE, not one per word. `absorb_lfm_statement`
+        // absorbs each lane with its own
+        // `append_bytes(&canonical(lane).to_le_bytes())` — FOUR calls of eight
+        // bytes, not one of thirty-two. A byte transcript concatenates and
+        // cannot tell the two apart, which is why coalescing survived here; an
+        // ALGEBRAIC one length-prefixes every call, so one long field where the
+        // host absorbed four short ones is a different chain from this word
+        // onward. Two halves are one lane's eight bytes, so the byte stream is
+        // unchanged and only the call boundaries move.
+        for lane in word.halves.chunks(2) {
+            t.append_halves_misaligned(lane);
+        }
     }
     t.append_const_bytes(&[fri_final_poly_log_degree]);
 }
