@@ -2229,11 +2229,13 @@ fn the_aggregate_leg_census_matches_the_closed_form() {
         use super::instr::Instr;
         p.instrs
             .iter()
-            .filter(|i| match (i, hash) {
-                (Instr::KeccakF(_), WrapHash::Keccak) => true,
-                (Instr::Blake3(_), WrapHash::Blake3) => true,
-                (Instr::Hash { .. }, WrapHash::Algebraic) => true,
-                _ => false,
+            .filter(|i| {
+                matches!(
+                    (i, hash),
+                    (Instr::KeccakF(_), WrapHash::Keccak)
+                        | (Instr::Blake3(_), WrapHash::Blake3)
+                        | (Instr::Hash { .. }, WrapHash::Algebraic)
+                )
             })
             .count()
     };
