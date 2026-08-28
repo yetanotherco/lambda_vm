@@ -554,6 +554,168 @@ mod tests {
         vec![words]
     }
 
+    /// ★★★ **THE STATEMENT GATE** — the call SEQUENCE, which was fixed by
+    /// reading and never checked by running.
+    ///
+    /// `absorb_epoch_statement` claims to mirror
+    /// `statement::absorb_statement_with_digest`'s `append_bytes` calls one for
+    /// one. That claim was made by comparing the two functions by eye when the
+    /// append call boundary turned out to be load-bearing, and reading is
+    /// exactly what has been wrong three times in this migration.
+    ///
+    /// ⚠ **A byte transcript cannot check this claim.** It concatenates, so a
+    /// miscounted or coalesced call is invisible there — which is why the
+    /// existing statement drift test passes either way and why this gate has to
+    /// be algebraic. Under length prefixing, one call too many or too few makes
+    /// every challenge downstream different, and the statement is absorbed
+    /// FIRST, so "different" means the whole leg.
+    ///
+    /// It drives BOTH sides from the same shape data, so what it compares is the
+    /// two absorb SEQUENCES and nothing else.
+    #[test]
+    fn the_statement_replay_absorbs_the_hosts_calls_one_for_one() {
+        use crate::lfm::builder::{Felt, LfmBuilder};
+        use crate::lfm::compiler::compile;
+        use crate::lfm::edsl::WrapHash;
+        use crate::lfm::proof::lfm_prove_with_hasher;
+        use crate::lfm::registry::build_artifacts_with_hasher;
+        use crate::lfm::statement_replay::{
+            EpochStatementShape, EpochStatementVars, NUM_TABLE_COUNTS, absorb_epoch_statement,
+        };
+        use crate::lfm::transcript_replay::TranscriptReplay;
+        use crate::lfm::word::base_word;
+        use crate::statement::{StatementKind, absorb_statement_with_digest};
+        use crate::{RuntimePageRange, TableCounts};
+
+        // A public output whose length is neither a multiple of four nor of 32,
+        // and a page-range list with more than one entry — the two places the
+        // sequence has a LOOP, which is where a call-count error would live.
+        const OUTPUT_LEN: usize = 37;
+        const EPOCH_LABEL: u64 = 0x0000_002A_0000_0007;
+        let elf_digest: [u8; 32] = core::array::from_fn(|i| 0x40 ^ (i as u8).wrapping_mul(11));
+        let public_output: Vec<u8> = (0..OUTPUT_LEN)
+            .map(|i| 0x90 ^ (i as u8).wrapping_mul(23))
+            .collect();
+        let page_ranges = [
+            RuntimePageRange {
+                base: 0x1000,
+                count: 3,
+            },
+            RuntimePageRange {
+                base: 0x9000,
+                count: 1,
+            },
+        ];
+        // Distinct per field, in the host's declaration order, so a transposed
+        // pair moves the transcript.
+        let counts = TableCounts {
+            cpu: 11,
+            lt: 12,
+            memw: 13,
+            memw_aligned: 14,
+            load: 15,
+            mul: 16,
+            dvrm: 17,
+            shift: 18,
+            branch: 19,
+            memw_register: 20,
+            eq: 21,
+            bytewise: 22,
+            store: 23,
+            cpu32: 24,
+            blake3: 1,
+        };
+        let count_array: [u64; NUM_TABLE_COUNTS] =
+            [11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 1];
+        const PAGES: usize = 6;
+        const FPLD: u8 = 3;
+
+        // Machine-side halves: four bytes each, LITTLE-endian, the arena layout.
+        let to_halves = |bytes: &[u8]| -> Vec<FE> {
+            bytes
+                .chunks(4)
+                .map(|c| {
+                    let mut le = [0u8; 4];
+                    le[..c.len()].copy_from_slice(c);
+                    FE::from(u64::from(u32::from_le_bytes(le)))
+                })
+                .collect()
+        };
+        let digest_halves = to_halves(&elf_digest);
+        let output_halves = to_halves(&public_output);
+        // A u64 carried as [low32, high32] — `to_le_bytes` needs no manipulation.
+        let label_halves = to_halves(&EPOCH_LABEL.to_le_bytes());
+
+        let shape = EpochStatementShape {
+            public_output_len: OUTPUT_LEN,
+            table_counts: count_array,
+            num_private_input_pages: PAGES as u64,
+            fri_final_poly_log_degree: FPLD,
+            page_ranges: page_ranges.iter().map(|r| (r.base, r.count)).collect(),
+        };
+
+        for hasher in ALGEBRAIC {
+            // HOST: production's own statement absorb, into an algebraic
+            // transcript, then a challenge.
+            let mut host = AlgebraicTranscript::with_seed(hasher, SEED);
+            absorb_statement_with_digest(
+                &mut host,
+                StatementKind::ContinuationEpoch {
+                    epoch_label: EPOCH_LABEL,
+                },
+                &elf_digest,
+                &public_output,
+                &counts,
+                PAGES,
+                &page_ranges,
+                FPLD,
+            );
+            let want = host.sample_field_element();
+
+            // MACHINE: the replay, over the same shape, from arena halves.
+            let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::Algebraic);
+            let total = digest_halves.len() + output_halves.len() + label_halves.len();
+            let arena = b.declare_arena(total as u32);
+            let all: Vec<Felt> = (0..total).map(|i| b.hint_felt(arena, i as u32)).collect();
+            let (d_cells, rest) = all.split_at(digest_halves.len());
+            let (o_cells, l_cells) = rest.split_at(output_halves.len());
+
+            let mut t = TranscriptReplay::new(SEED);
+            absorb_epoch_statement(
+                &mut t,
+                &shape,
+                &EpochStatementVars {
+                    elf_digest: d_cells,
+                    public_output: o_cells,
+                    epoch_label: l_cells,
+                },
+            );
+            let a = t.sample_ext(&mut b);
+            b.public(a.as_cell());
+            let program = compile(b.finish());
+
+            let arena_words: Vec<LfmWord> = digest_halves
+                .iter()
+                .chain(output_halves.iter())
+                .chain(label_halves.iter())
+                .map(|h| base_word(*h))
+                .collect();
+            let artifacts = build_artifacts_with_hasher(&program, &options(), hasher);
+            let proved =
+                lfm_prove_with_hasher(&program, &artifacts, &[arena_words], &options(), hasher)
+                    .expect("the statement replay program must prove");
+
+            let got = proved.public_words[0].1;
+            assert_eq!(
+                [got[0], got[1], got[2]],
+                *want.value(),
+                "{hasher:?}: the statement replay must absorb the host's calls one for one — \
+                 a coalesced or miscounted call is invisible under a byte transcript and \
+                 diverges every challenge under this one"
+            );
+        }
+    }
+
     /// ★★ **THE MACHINE-BYTES GATE** — every absorb shape the statement leg
     /// produces, including the ones the emitter gate above does not reach.
     ///

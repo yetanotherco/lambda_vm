@@ -212,6 +212,10 @@ pub(super) fn lfm_publics_arena(words: &[(u32, LfmWord)]) -> Vec<LfmWord> {
 /// One hinted public word: the emit-time-constant index, the eight hinted
 /// halves (absorbed by the statement), and the four lanes reassembled as
 /// CANONICITY-GUARDED felts (consumed by the balance and the binding legs).
+/// `u32` halves one lane's canonical `u64` occupies — the unit
+/// `absorb_lfm_statement` appends a lane in.
+const HALVES_PER_LANE: usize = 2;
+
 pub(super) struct HintedPublicWord {
     pub(super) index: u32,
     pub(super) halves: Vec<Felt>,
@@ -269,7 +273,17 @@ pub(super) fn emit_lfm_statement(
     t.append_const_bytes(&(words.len() as u64).to_le_bytes());
     for word in words {
         t.append_const_bytes(&word.index.to_le_bytes());
-        t.append_halves_misaligned(&word.halves);
+        // ⚠ ONE CALL PER LANE, not one for the word. `absorb_lfm_statement`
+        // appends each lane's canonical `u64` separately, so a word is FIVE
+        // host calls — the index and four lanes — not two. A byte transcript
+        // concatenates and cannot tell the difference, which is why this stood;
+        // an algebraic one length-prefixes every call, so absorbing the eight
+        // halves in one go is a DIFFERENT transcript, and since the statement
+        // is absorbed first that means every challenge downstream.
+        // See `transcript_replay::Append`.
+        for lane in word.halves.chunks(HALVES_PER_LANE) {
+            t.append_halves_misaligned(lane);
+        }
     }
     t.append_const_bytes(&[fri_final_poly_log_degree]);
 }
