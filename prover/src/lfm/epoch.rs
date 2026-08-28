@@ -167,6 +167,35 @@ impl RootCells {
         self.lanes.iter().flatten().copied().collect()
     }
 
+    /// ★ The root's 32 canonical bytes as the EIGHT `u32` halves a BYTE-STRING
+    /// construction absorbs — the same eight on both arms.
+    ///
+    /// ⚠ Not [`RootCells::lanes_flat`], whose own doc is the warning: those are
+    /// `u32` halves on a byte hash and FULL FELTS on an algebraic one. A
+    /// PINNED-KECCAK construction — `programs::emit_program_id`, which
+    /// identifies a program to consumers and deliberately does not follow the
+    /// configured hash — hashes a root's BYTES whatever the proof system commits
+    /// under, so it needs the byte rendering rather than the cells.
+    ///
+    /// Neither arm's rendering is restated here. On the byte arm the lanes
+    /// already ARE those halves (`proof_arena::commitment_words`: half `h` is
+    /// bytes `4h..4h+4`, four per word). On the algebraic arm a digest
+    /// serialises as four canonical BIG-endian felts
+    /// (`algebraic_commit::digest_to_commitment`), and
+    /// [`super::transcript_replay::felt_be_halves`] is by definition that felt's
+    /// two big-endian halves — so four lanes give the same eight bytes-worth.
+    pub fn halves(&self, b: &mut LfmBuilder) -> Vec<Felt> {
+        if self.lanes.len() == 1 {
+            let lanes = self.lanes[0];
+            let mut out = Vec::with_capacity(2 * lanes.len());
+            for lane in lanes {
+                out.extend(super::transcript_replay::felt_be_halves(b, lane));
+            }
+            return out;
+        }
+        self.lanes_flat()
+    }
+
     /// [`RootCells::absorb`] where the segment cursor is not 4-byte aligned.
     pub fn absorb_misaligned(&self, b: &mut LfmBuilder, t: &mut TranscriptReplay) {
         t.append_root_cells_misaligned(b, self.digest.cells());

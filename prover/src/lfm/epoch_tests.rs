@@ -2150,6 +2150,13 @@ pub(super) fn batched_epoch_program_with(
     let shape = batched_shape_of(e);
 
     // ---- arenas, declaration order = absorb order ----
+    // ⚠ Arena words per ROOT follow the configuration's digest width — TWO on a
+    // byte hash, ONE on an algebraic one — and the writer
+    // (`proof_arena::commitment_words`) already does. Spelling the literal `2`
+    // here is what puts every root in the arena off by a word under an
+    // algebraic pin; `pc_start` below keeps its `2` because it is a `u64`'s two
+    // halves and not a digest at all.
+    let root_words = RootCells::words_per_root(&b);
     let stmt_halves = 8 + e.statement.public_output_len.div_ceil(4) + 2;
     let a_stmt = b.declare_arena(stmt_halves as u32);
     let num_arena_prep = e
@@ -2157,16 +2164,16 @@ pub(super) fn batched_epoch_program_with(
         .iter()
         .filter(|p| p.is_some_and(PrepSource::is_arena))
         .count();
-    let a_prep_roots = b.declare_arena(2 * num_arena_prep as u32);
+    let a_prep_roots = b.declare_arena(root_words * num_arena_prep as u32);
     // The carved root's arena sits between the prep roots and main_root —
     // declaration order is absorb order, and that is its transcript slot.
-    let a_carved_root = shape.carved_main.map(|_| b.declare_arena(2));
-    let a_main_root = b.declare_arena(2);
+    let a_carved_root = shape.carved_main.map(|_| b.declare_arena(root_words));
+    let a_main_root = b.declare_arena(root_words);
     let num_reg = crate::tables::register::NUM_REGISTER_ADDRESSES as u32;
     let a_reg_init = b.declare_arena(num_reg);
     let a_reg_fini = b.declare_arena(num_reg);
     let a_pc_start = b.declare_arena(2);
-    let a_aux_root = shape.has_aux.then(|| b.declare_arena(2));
+    let a_aux_root = shape.has_aux.then(|| b.declare_arena(root_words));
     let a_contrib: Vec<Option<super::instr::ArenaId>> = shape
         .tables
         .iter()
@@ -2187,7 +2194,7 @@ pub(super) fn batched_epoch_program_with(
             )
         })
         .collect();
-    let a_parts_root = b.declare_arena(2);
+    let a_parts_root = b.declare_arena(root_words);
     // The standalone class's terminal polynomials — per table, sized by the
     // trace-length degree bound, absorbed in round 4 and evaluated by the
     // standalone terminal checks.
@@ -2201,7 +2208,7 @@ pub(super) fn batched_epoch_program_with(
                 .then(|| b.declare_arena(1u32 << (shape.heights[t] as u32 - shape.log2_blowup)))
         })
         .collect();
-    let a_fri_roots = b.declare_arena(2 * shape.fri.num_committed() as u32);
+    let a_fri_roots = b.declare_arena(root_words * shape.fri.num_committed() as u32);
     let a_fri_coeffs = b.declare_arena(shape.fri.num_terminal_coeffs() as u32);
     let a_nonce = (shape.grinding_factor > 0).then(|| b.declare_arena(1));
     // The opening arena, LAST and exactly the T1 serializer's size — the
@@ -2386,7 +2393,7 @@ pub(super) fn batched_epoch_program_with(
         let decode = decode_cells
             .as_ref()
             .expect("a continuation epoch has a DECODE sub-proof")
-            .lanes_flat();
+            .halves(&mut b);
         let id = super::programs::emit_program_id(
             &mut b,
             super::programs::ProgramIdShape { num_pages: 0 },
@@ -2971,7 +2978,8 @@ fn the_batched_epoch_challenge_spine_matches_production() {
     let program = batched_epoch_program(&e);
     let arenas = batched_epoch_arenas(&e);
     let exec =
-        execute(&program, &arenas, &TestPermutation).expect("the batched epoch spine must execute");
+        execute(&program, &arenas, &crate::hash_pin::block_hasher_kind())
+            .expect("the batched epoch spine must execute");
 
     // Vacuity guard: the fixture must exercise BOTH instance classes, or the
     // standalone-terminal absorb and the class split are dead paths here.
@@ -3804,7 +3812,7 @@ fn epoch_program_with(e: &RealEpoch, with_legs: bool, split_decode: bool) -> Lfm
             .collect();
         let page_halves: Vec<(Vec<_>, Vec<_>)> = page_cells
             .iter()
-            .map(|(base, root)| (base.clone(), root.lanes_flat()))
+            .map(|(base, root)| (base.clone(), root.halves(&mut b)))
             .collect();
         let page_refs: Vec<(&[_], &[_])> = page_halves
             .iter()
@@ -3813,11 +3821,11 @@ fn epoch_program_with(e: &RealEpoch, with_legs: bool, split_decode: bool) -> Lfm
         let decode = match a_split_decode {
             // ★ THE BROKEN CONTROL: a second, independent reading of the DECODE
             // root. The fold now attests to a value Phase A never absorbed.
-            Some(arena) => RootCells::hint(&mut b, arena, 0).lanes_flat(),
+            Some(arena) => RootCells::hint(&mut b, arena, 0).halves(&mut b),
             None => decode_cells
                 .as_ref()
                 .expect("a continuation epoch has a DECODE sub-proof")
-                .lanes_flat(),
+                .halves(&mut b),
         };
         let id = super::programs::emit_program_id(
             &mut b,
