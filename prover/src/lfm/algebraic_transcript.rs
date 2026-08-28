@@ -554,6 +554,97 @@ mod tests {
         vec![words]
     }
 
+    /// ★★ **THE MACHINE-BYTES GATE** — every absorb shape the statement leg
+    /// produces, including the ones the emitter gate above does not reach.
+    ///
+    /// That gate drives a 32-byte root through `cells_from_halves_be`, so the
+    /// ALIGNED whole-half path is covered. The statement leg also produces two
+    /// shapes it never exercises, and both come from real data rather than from
+    /// a corner case anyone chose:
+    ///
+    /// - a byte length that is **not a multiple of four** — `public_output` is
+    ///   collected one byte per COMMIT, so its length is whatever the workload
+    ///   produced, and the trailing half is masked to its live bytes;
+    /// - a length that is not a multiple of **32**, so the final payload cell is
+    ///   short and `bytes_to_cell` reads a zero-filled buffer LEFT-justified.
+    ///
+    /// ⚠ Those two paddings are independent and both are silent when wrong: the
+    /// statement is absorbed FIRST, so a single wrong felt here diverges every
+    /// challenge downstream and surfaces as a `DivByZero` deep in a query walk,
+    /// naming neither the encoding nor the site.
+    ///
+    /// The expectation comes from `AlgebraicTranscript` itself — the same host
+    /// object production would absorb through — so this compares the machine's
+    /// regrouping against the rule rather than against a second copy of it.
+    #[test]
+    fn the_machine_regroups_bytes_exactly_as_the_host_cellifies_them() {
+        use crate::lfm::builder::{Felt, LfmBuilder};
+        use crate::lfm::compiler::compile;
+        use crate::lfm::edsl::WrapHash;
+        use crate::lfm::proof::lfm_prove_with_hasher;
+        use crate::lfm::registry::build_artifacts_with_hasher;
+        use crate::lfm::transcript_replay::TranscriptReplay;
+        use crate::lfm::word::base_word;
+
+        // Lengths chosen on the axes that can hide a break: the 4-byte half
+        // boundary (the mask) and the 32-byte cell boundary (the left-justified
+        // tail), each hit exactly and missed in both directions.
+        const LENGTHS: [usize; 11] = [1, 3, 4, 5, 7, 8, 31, 32, 33, 40, 67];
+
+        for hasher in ALGEBRAIC {
+            for len in LENGTHS {
+                // Distinct, high-bit-set bytes: a dropped or misplaced byte
+                // moves the felt rather than colliding with a zero.
+                let bytes: Vec<u8> = (0..len)
+                    .map(|i| 0x80 ^ (i as u8).wrapping_mul(37))
+                    .collect();
+
+                // HOST: the transcript absorbs those bytes and squeezes.
+                let mut host = AlgebraicTranscript::with_seed(hasher, SEED);
+                host.append_bytes(&bytes);
+                let want = host.sample_field_element();
+
+                // MACHINE: the same bytes arrive as u32 halves, four bytes each
+                // LITTLE-endian — `proof_arena`'s layout — through the misaligned
+                // path, which is the one the statement leg uses.
+                let halves: Vec<FE> = bytes
+                    .chunks(4)
+                    .map(|c| {
+                        let mut le = [0u8; 4];
+                        le[..c.len()].copy_from_slice(c);
+                        FE::from(u64::from(u32::from_le_bytes(le)))
+                    })
+                    .collect();
+
+                let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::Algebraic);
+                let arena = b.declare_arena(halves.len() as u32);
+                let half_cells: Vec<Felt> = (0..halves.len())
+                    .map(|i| b.hint_felt(arena, i as u32))
+                    .collect();
+                let mut t = TranscriptReplay::new(SEED);
+                t.append_bytes_misaligned(&half_cells, len);
+                let a = t.sample_ext(&mut b);
+                b.public(a.as_cell());
+                let program = compile(b.finish());
+
+                let arena_words: Vec<LfmWord> = halves.iter().map(|h| base_word(*h)).collect();
+                let artifacts = build_artifacts_with_hasher(&program, &options(), hasher);
+                let proved =
+                    lfm_prove_with_hasher(&program, &artifacts, &[arena_words], &options(), hasher)
+                        .expect("the regrouping program must prove");
+
+                let got = proved.public_words[0].1;
+                assert_eq!(
+                    [got[0], got[1], got[2]],
+                    *want.value(),
+                    "{hasher:?} / {len} bytes: the machine's regrouping must be the host's \
+                     cellification — the trailing half's mask and the short payload cell's \
+                     left-justification are the two places this differs"
+                );
+            }
+        }
+    }
+
     /// ★★ **THE EMITTER GATE.** `TranscriptReplay` on the algebraic arm must
     /// derive the host transcript's challenges — and its STATE — for every
     /// algebraic tenant.
