@@ -1498,7 +1498,7 @@ pub(super) fn global_verifier_program(g: &RealGlobal) -> LfmProgram {
             )
         })
         .collect();
-    // ⚠ `halves`, not `lanes_flat`: Phase A absorbs a root through
+    // ⚠ `byte_halves`, not `lanes_flat`: Phase A absorbs a root through
     // `append_halves_misaligned`, whose byte length is `4 · halves.len()`, and
     // the host absorbs the root's THIRTY-TWO bytes in one `append_bytes`. On an
     // algebraic arm `lanes_flat` is four FULL FELTS, so that call would declare

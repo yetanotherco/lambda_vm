@@ -112,7 +112,12 @@ fn the_machine_transcript_tracks_the_host_absorb_for_absorb() {
         ];
         for c in &consts {
             host.append_bytes(c);
-            record(&host, &mut want, &mut steps, &format!("const bytes len {}", c.len()));
+            record(
+                &host,
+                &mut want,
+                &mut steps,
+                &format!("const bytes len {}", c.len()),
+            );
         }
 
         host.append_bytes(&root);
@@ -132,7 +137,12 @@ fn the_machine_transcript_tracks_the_host_absorb_for_absorb() {
         // `RootCells::lanes_flat` gives four FULL FELTS on the algebraic arm,
         // declaring sixteen bytes where the host declared thirty-two.
         host.append_bytes(&root);
-        record(&host, &mut want, &mut steps, "root via the Phase A halves path");
+        record(
+            &host,
+            &mut want,
+            &mut steps,
+            "root via the Phase A halves path",
+        );
 
         // ★ SQUEEZES. `sample_ext` is where every shared challenge comes from —
         // the LogUp pair, every beta, every z, every gamma — so the first
@@ -149,7 +159,12 @@ fn the_machine_transcript_tracks_the_host_absorb_for_absorb() {
             let e = host.sample_field_element();
             want.push(ext_word(&e));
             steps.push(format!("sample_ext {k} — the drawn value"));
-            record(&host, &mut want, &mut steps, &format!("sample_ext {k} — the state after"));
+            record(
+                &host,
+                &mut want,
+                &mut steps,
+                &format!("sample_ext {k} — the state after"),
+            );
         }
 
         // ---- the machine chain, same script ----
@@ -209,8 +224,7 @@ fn the_machine_transcript_tracks_the_host_absorb_for_absorb() {
         );
         for (i, (got, expect)) in exec.public_words.iter().zip(&want).enumerate() {
             assert_eq!(
-                &got.1,
-                expect,
+                &got.1, expect,
                 "{tenant}: transcript states part at step {i} ({}) — \
                  every later challenge is a different value",
                 steps[i]
