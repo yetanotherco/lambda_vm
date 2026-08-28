@@ -66,22 +66,7 @@ pub fn emit_group_leaf_hash(b: &mut LfmBuilder, group: &[&MixedMatrixOpening<'_>
     // `sub_proof::emit_leaf_hash`: the byte stream below is a serialisation of
     // field elements that exists only for a byte-oriented hash.
     let Some(byte_hash) = b.wrap_hash().byte_hash() else {
-        let mut felts: Vec<Felt> = Vec::new();
-        for m in group {
-            assert_eq!(
-                m.values.len(),
-                m.shape.num_values(),
-                "a matrix's opening covers its whole row pair"
-            );
-            for v in m.values {
-                if m.shape.is_ext {
-                    let lanes = b.unpack(*v);
-                    felts.extend_from_slice(&lanes[..3]);
-                } else {
-                    felts.push(Felt(v.addr()));
-                }
-            }
-        }
+        let felts = group_leaf_felts(b, group);
         return edsl::wrap_leaf_hash(b, &felts);
     };
 
@@ -105,6 +90,39 @@ pub fn emit_group_leaf_hash(b: &mut LfmBuilder, group: &[&MixedMatrixOpening<'_>
     }
     let len_bytes = BYTES_PER_HALF * stream.len();
     edsl::wrap_hash_bytes(b, byte_hash, &stream, len_bytes)
+}
+
+/// ★ The FELT SEQUENCE the algebraic arm of [`emit_group_leaf_hash`] absorbs,
+/// in absorption order — the machine's counterpart of
+/// `stark::fri::mmcs::group_opening_felts`.
+///
+/// Split out of its only production caller so a differential can compare the
+/// SEQUENCE the machine feeds against the sequence the host feeds, rather than
+/// only the digests they disagree on. The disagreement this path fails with is
+/// a `DivByZero` deep in a query walk, which names neither the site nor the
+/// felt; a sequence differential names the index.
+///
+/// A base value is ONE felt (the cell's own lane 0); an extension value is its
+/// three components, lanes 0, 1 and 2 of the unpacked word — lane 3 is not
+/// absorbed, for the reason [`emit_group_leaf_hash`] states.
+pub fn group_leaf_felts(b: &mut LfmBuilder, group: &[&MixedMatrixOpening<'_>]) -> Vec<Felt> {
+    let mut felts: Vec<Felt> = Vec::new();
+    for m in group {
+        assert_eq!(
+            m.values.len(),
+            m.shape.num_values(),
+            "a matrix's opening covers its whole row pair"
+        );
+        for v in m.values {
+            if m.shape.is_ext {
+                let lanes = b.unpack(*v);
+                felts.extend_from_slice(&lanes[..3]);
+            } else {
+                felts.push(Felt(v.addr()));
+            }
+        }
+    }
+    felts
 }
 
 /// Authenticate one mixed round's openings against its committed root — the
