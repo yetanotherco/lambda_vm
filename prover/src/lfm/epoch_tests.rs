@@ -832,8 +832,16 @@ pub(super) fn epoch_seed(
     table_counts: &crate::TableCounts,
     runtime_page_ranges: &[crate::RuntimePageRange],
     fri_final_poly_log_degree: u8,
-) -> stark::config::DefaultStarkTranscript<Ext3> {
-    let mut t = stark::config::DefaultStarkTranscript::<Ext3>::new(&[]);
+) -> crate::hash_pin::BlockTranscript {
+    // ⚠ The BLOCK PATH's transcript, not `stark`'s default alias. This builds
+    // the oracle every challenge differential is compared against, so it has to
+    // sponge on the hash the proof was produced under. On an algebraic pin the
+    // default alias is a BYTE sponge over algebraic commitments — the half-flip
+    // `hash_pin`'s own header warns about, self-consistent and therefore silent
+    // — and every challenge it derives would differ from the prover's.
+    // Identical to the old spelling under a byte pin, where `BlockTranscript`
+    // IS `DefaultStarkTranscript`.
+    let mut t = crate::hash_pin::block_transcript(&[]);
     crate::statement::absorb_statement(
         &mut t,
         crate::statement::StatementKind::ContinuationEpoch { epoch_label },
@@ -987,7 +995,7 @@ impl EpochFront {
     }
 
     /// [`epoch_seed`] over this epoch's own statement.
-    pub(super) fn seed(&self) -> stark::config::DefaultStarkTranscript<Ext3> {
+    pub(super) fn seed(&self) -> crate::hash_pin::BlockTranscript {
         epoch_seed(
             self.label,
             &self.elf_bytes,
@@ -1532,7 +1540,7 @@ impl RealBatchedEpoch {
     /// [`epoch_seed`] over this epoch's statement, with the claimed output
     /// substitutable so a tamper arm can ask the question it means: "does
     /// THIS proof answer for THAT output?".
-    fn seed_for(&self, public_output: &[u8]) -> stark::config::DefaultStarkTranscript<Ext3> {
+    fn seed_for(&self, public_output: &[u8]) -> crate::hash_pin::BlockTranscript {
         epoch_seed(
             self.epoch_label,
             &self.elf_bytes,
@@ -3488,7 +3496,7 @@ pub(super) fn host_table_forked(
     view: StarkProofView<'_, Gl, Ext3, ()>,
     index: usize,
     num_tables: usize,
-    fork: &mut stark::config::DefaultStarkTranscript<Ext3>,
+    fork: &mut crate::hash_pin::BlockTranscript,
     lookup_challenges: &[FEE],
 ) -> HostTable {
     use stark::domain::new_verifier_domain;

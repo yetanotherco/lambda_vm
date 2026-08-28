@@ -92,7 +92,7 @@ pub(super) fn real_batched_lfm(
         artifacts.chip_set,
     );
     let refs = airs.air_refs();
-    let mut t = stark::config::DefaultStarkTranscript::<Ext3>::new(&[]);
+    let mut t = crate::hash_pin::block_transcript(&[]);
     absorb_lfm_statement(
         &mut t,
         &artifacts.program_id,
@@ -1340,7 +1340,7 @@ pub(super) fn real_global(
     }
 
     let seed = || {
-        let mut t = stark::config::DefaultStarkTranscript::<Ext3>::new(&[]);
+        let mut t = crate::hash_pin::block_transcript(&[]);
         crate::statement::absorb_continuation_global_statement(
             &mut t,
             elf_bytes,
