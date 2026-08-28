@@ -1354,7 +1354,6 @@ fn preprocessed_fixture() -> (
 ) {
     use crate::tables::types::{BusId, alu_op};
     use crate::test_utils::multi_prove_ram;
-    use stark::config::DefaultStarkTranscript;
     use stark::lookup::{
         AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, BusValue, Multiplicity,
         NullBoundaryConstraintBuilder, Packing,
@@ -1454,7 +1453,7 @@ fn preprocessed_fixture() -> (
         _,
         _,
     )> = vec![(&air, &mut trace, &())];
-    let proof = multi_prove_ram(pairs, &mut DefaultStarkTranscript::<Ext3>::new(&[]))
+    let proof = multi_prove_ram(pairs, &mut crate::hash_pin::block_transcript(&[]))
         .expect("the preprocessed fixture must prove");
     (Box::new(air), proof)
 }

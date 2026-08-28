@@ -35,12 +35,11 @@ use crypto::fiat_shamir::is_transcript::IsTranscript;
 use executor::elf::Elf;
 use executor::vm::execution::Executor;
 use math::field::element::FieldElement;
-use stark::config::DefaultStarkTranscript;
-use stark::prover::{IsStarkProver, Prover};
+use stark::prover::IsStarkProver;
 #[cfg(feature = "disk-spill")]
 use stark::storage_mode::StorageMode;
 use stark::traits::AIR;
-use stark::verifier::{IsStarkVerifier, Verifier};
+use stark::verifier::IsStarkVerifier;
 
 use crate::statement::{StatementKind, absorb_statement, absorb_statement_with_digest};
 pub use crate::tables::MaxRowsConfig;
@@ -1308,7 +1307,7 @@ pub fn prove_with_options_and_inputs(
 
     // Bind the full statement (program, public output, table layout) into the
     // Fiat-Shamir transcript so every challenge depends on it.
-    let mut transcript = DefaultStarkTranscript::<E>::new(&[]);
+    let mut transcript = crate::hash_pin::block_transcript(&[]);
     absorb_statement(
         &mut transcript,
         StatementKind::Monolithic,
@@ -1323,7 +1322,9 @@ pub fn prove_with_options_and_inputs(
     // Phase 4: Prove (multi_prove)
     #[cfg(feature = "instruments")]
     let __sp = stark::instruments::span("proving");
-    let proof = Prover::multi_prove(
+    // ★ The block path's PIN, not `stark`'s default alias — the monolithic
+    // production prove, the twin of the batched one in `continuation.rs`.
+    let proof = crate::hash_pin::BlockProver::multi_prove(
         airs.air_trace_pairs(&mut traces),
         &mut transcript,
         #[cfg(feature = "disk-spill")]
@@ -1529,7 +1530,7 @@ fn verify_proof_parts(
     // Bind the statement into the verifier's transcript. A tampered statement
     // field makes this diverge from the prover's transcript state, so every
     // derived challenge differs and verification rejects.
-    let mut transcript = DefaultStarkTranscript::<E>::new(&[]);
+    let mut transcript = crate::hash_pin::block_transcript(&[]);
     absorb_statement_with_digest(
         &mut transcript,
         StatementKind::Monolithic,
@@ -1560,7 +1561,7 @@ fn verify_proof_parts(
     stark::profile_markers::step_marker::<{ stark::profile_markers::STEP_AIRS_AND_BUS_BALANCE_DONE }>(
     );
 
-    Ok(Verifier::multi_verify_views(
+    Ok(crate::hash_pin::BlockVerifier::multi_verify_views(
         &air_refs,
         proofs,
         &mut transcript,

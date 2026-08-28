@@ -82,7 +82,6 @@ pub(super) fn folding_fixture(
         CellBoundary, FiniClaim, InitClaim, generate_local_to_global_trace,
     };
     use crate::test_utils::{EPOCH_TEST_LABEL, multi_prove_ram};
-    use stark::config::DefaultStarkTranscript;
 
     assert!(
         num_boundaries.is_power_of_two(),
@@ -115,7 +114,7 @@ pub(super) fn folding_fixture(
         _,
         _,
     )> = vec![(&air, &mut trace, &())];
-    let proof = multi_prove_ram(pairs, &mut DefaultStarkTranscript::<Ext3>::new(&[]))
+    let proof = multi_prove_ram(pairs, &mut crate::hash_pin::block_transcript(&[]))
         .expect("the L2G_MEMORY fixture must prove at any power-of-two row count");
 
     (Box::new(air), proof)

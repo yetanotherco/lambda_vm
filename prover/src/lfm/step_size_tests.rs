@@ -50,7 +50,6 @@
 
 use crypto::fiat_shamir::is_transcript::IsTranscript;
 use math::field::traits::IsField;
-use stark::config::DefaultStarkTranscript;
 use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 use stark::examples::fibonacci_multi_column::{
     FibonacciMultiColumnAIR, FibonacciMultiColumnPublicInputs, compute_trace,
@@ -316,7 +315,7 @@ fn the_prover_cannot_prove_a_step_size_two_air() {
         _,
         _,
     )> = vec![(&air, &mut trace, &())];
-    let _ = multi_prove_ram(pairs, &mut DefaultStarkTranscript::<Ext3>::new(&[]));
+    let _ = multi_prove_ram(pairs, &mut crate::hash_pin::block_transcript(&[]));
 }
 
 /// ★ The same ceiling, as release actually reaches it — see the debug body above
@@ -339,15 +338,15 @@ fn the_prover_cannot_prove_a_step_size_two_air() {
         _,
         _,
     )> = vec![(&air, &mut trace, &())];
-    let proof = multi_prove_ram(pairs, &mut DefaultStarkTranscript::<Ext3>::new(&[]))
+    let proof = multi_prove_ram(pairs, &mut crate::hash_pin::block_transcript(&[]))
         .expect("with the debug_assert compiled out the prover runs to completion");
 
     let refs: Vec<&dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = ()>> = vec![&air];
     assert!(
-        !Verifier::multi_verify_views(
+        !crate::hash_pin::BlockVerifier::multi_verify_views(
             &refs,
             MultiProofView::Owned(&proof),
-            &mut DefaultStarkTranscript::<Ext3>::new(&[]),
+            &mut crate::hash_pin::block_transcript(&[]),
             &FEE::zero(),
         ),
         "production accepted a step_size = 2 proof — the framework ceiling lifted, \
@@ -395,7 +394,7 @@ fn fib_proof() -> (
         _,
         _,
     )> = vec![(&air, &mut trace, &pi)];
-    let proof = multi_prove_ram(pairs, &mut DefaultStarkTranscript::<Ext3>::new(&[]))
+    let proof = multi_prove_ram(pairs, &mut crate::hash_pin::block_transcript(&[]))
         .expect("the three-offset fixture must prove");
     (air, pi, proof)
 }
@@ -436,7 +435,7 @@ fn fib_replay(
     // preprocessed and has no aux trace, so it is the main root and nothing else.
     assert!(!air.is_preprocessed(), "the fixture is not preprocessed");
     assert!(!air.has_aux_trace(), "the fixture has no aux trace");
-    let mut transcript = DefaultStarkTranscript::<Ext3>::new(&[]);
+    let mut transcript = crate::hash_pin::block_transcript(&[]);
     transcript.append_bytes(view.lde_trace_main_merkle_root());
 
     let domain = new_verifier_domain(air, trace_length);
@@ -608,10 +607,10 @@ fn the_machine_absorbs_a_multi_row_ood_block_in_productions_order() {
     // Production must accept it, or the blocks below are not a real proof's.
     let refs: Vec<&dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = FibPi>> = vec![&air];
     assert!(
-        Verifier::multi_verify_views(
+        crate::hash_pin::BlockVerifier::multi_verify_views(
             &refs,
             MultiProofView::Owned(&proof),
-            &mut DefaultStarkTranscript::<Ext3>::new(&[]),
+            &mut crate::hash_pin::block_transcript(&[]),
             &FEE::zero(),
         ),
         "production must accept the three-offset fixture"
