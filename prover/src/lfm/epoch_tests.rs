@@ -783,7 +783,7 @@ fn the_real_block_base_epoch_ab() {
     let t = std::time::Instant::now();
     match mode.as_str() {
         "per_table" => {
-            let proof = stark::prover::Prover::<Gl, Ext3, ()>::multi_prove(
+            let proof = crate::hash_pin::BlockProver::<Gl, Ext3, ()>::multi_prove(
                 pairs,
                 &mut transcript,
                 #[cfg(feature = "disk-spill")]
@@ -1149,7 +1149,12 @@ fn harvest_real_epoch(
         &mut seed(),
     )
     .ok_or("the COMMIT bus target must compute")?;
-    if !stark::verifier::Verifier::multi_verify_views(&refs, view, &mut seed(), &expected) {
+    if !crate::hash_pin::BlockVerifier::<Gl, Ext3, ()>::multi_verify_views(
+        &refs,
+        view,
+        &mut seed(),
+        &expected,
+    ) {
         return Err("production's verifier rejects the epoch".to_string());
     }
 
@@ -3505,9 +3510,9 @@ pub(super) fn host_table_forked(
     fork: &mut crate::hash_pin::BlockTranscript,
     lookup_challenges: &[FEE],
 ) -> HostTable {
+    use crate::hash_pin::BlockVerifier as Verifier;
     use stark::domain::new_verifier_domain;
     use stark::verifier::IsStarkVerifier;
-    use stark::verifier::Verifier;
 
     let opts = air.options();
     let trace_length = view.trace_length();

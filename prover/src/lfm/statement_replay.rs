@@ -175,6 +175,32 @@ pub struct PhaseATable<'a> {
     pub main_root: &'a [Felt],
 }
 
+/// Absorb one root supplied as the configuration's ROOT FELTS — eight `u32`
+/// halves on a byte hash, the digest's four felts on an algebraic one.
+///
+/// ⚠ The byte arm's emission is deliberately unchanged: the felts go straight to
+/// `append_halves_misaligned` with no packing, because `statement_replay` is a
+/// REGISTRY program and one extra instruction would drift every blessed
+/// `program_id`. The algebraic arm packs the four felts into the one digest cell
+/// they already are, which is what `RootCells::absorb` does for a root the
+/// emitter holds as cells rather than as arena felts.
+fn absorb_root_felts(b: &mut LfmBuilder, t: &mut TranscriptReplay, felts: &[Felt]) {
+    // Four felts per digest cell: two `u32` halves each on a byte hash, the four
+    // Goldilocks felts themselves on an algebraic one.
+    let words = super::edsl::digest_words(b);
+    assert_eq!(
+        felts.len(),
+        4 * words as usize,
+        "a commitment is one root's felts"
+    );
+    if words == 1 {
+        let cell = b.pack_word([felts[0], felts[1], felts[2], felts[3]]);
+        t.append_root_cells(b, &[cell]);
+    } else {
+        t.append_halves_misaligned(felts);
+    }
+}
+
 /// Replays Phase A: the commitment absorbs, then the two shared LogUp
 /// challenges.
 ///
@@ -192,14 +218,10 @@ pub fn replay_phase_a(
     for table in tables {
         match &table.preprocessed_root {
             Some(PhaseAPreprocessed::Constant(bytes)) => t.append_const_bytes(&bytes[..]),
-            Some(PhaseAPreprocessed::Cells(prep)) => {
-                assert_eq!(prep.len(), 8, "a commitment is 32 bytes");
-                t.append_halves_misaligned(prep);
-            }
+            Some(PhaseAPreprocessed::Cells(prep)) => absorb_root_felts(b, t, prep),
             None => {}
         }
-        assert_eq!(table.main_root.len(), 8, "a commitment is 32 bytes");
-        t.append_halves_misaligned(table.main_root);
+        absorb_root_felts(b, t, table.main_root);
     }
     let z = t.sample_ext(b);
     let alpha = t.sample_ext(b);

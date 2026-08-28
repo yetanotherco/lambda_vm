@@ -1368,7 +1368,12 @@ pub(super) fn real_global(
     let view = bundle.global_proof_view();
     assert_eq!(refs.len(), view.len(), "one AIR per global sub-proof");
     assert!(
-        stark::verifier::Verifier::multi_verify_views(&refs, view, &mut seed(), &FEE::zero()),
+        crate::hash_pin::BlockVerifier::<Gl, Ext3, ()>::multi_verify_views(
+            &refs,
+            view,
+            &mut seed(),
+            &FEE::zero()
+        ),
         "production's verifier must accept the global proof"
     );
 
