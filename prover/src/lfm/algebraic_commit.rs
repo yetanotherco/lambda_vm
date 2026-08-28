@@ -851,6 +851,184 @@ mod tests {
         assert_eq!(unique.len(), tags.len(), "every commitment tag is distinct");
     }
 
+    /// ★★ **THE MIXED-GROUP LEAF GATE** — the one construction on the wrap
+    /// path that had no differential covering it.
+    ///
+    /// `the_emitted_leaf_and_parent_equal_the_host_backend` covers the leaf and
+    /// parent PRIMITIVES; this covers their COMPOSITION over a height group's
+    /// several matrices, which is a different claim. A leaf hash that is right
+    /// for one matrix can still be fed the wrong felts, in the wrong order, or
+    /// with the wrong padding flag, when several matrices are concatenated.
+    ///
+    /// ⚠ **The expectation is the host's own backend, not a reimplementation of
+    /// it.** `hash_data` over the concatenated values IS
+    /// `mmcs.rs::hash_group_openings` — for each matrix, all `evaluations` then
+    /// all `evaluations_sym`, flat, one hash — so a shared misunderstanding
+    /// between the two sides cannot make this pass. That is what A2 established
+    /// as the difference between a differential and a tautology.
+    ///
+    /// ⚠ The shapes vary on the axes that could hide a break rather than on one
+    /// convenient instance: several matrices of differing widths, the felt count
+    /// straddling the rate boundary in BOTH directions and landing on it exactly
+    /// (the padding flag `len mod 8` is the one part of the duplex that is not
+    /// identical on every block), and the single-matrix degenerate case.
+    ///
+    /// Groups are homogeneous in field, matching production: a round is base
+    /// (main) or extension (aux, parts), and the round is what groups by height.
+    #[test]
+    fn the_mixed_group_leaf_equals_the_hosts_group_hash() {
+        use crate::lfm::batched_epoch_verify::{MixedMatrixOpening, emit_group_leaf_hash};
+        use crate::lfm::builder::{Cell, LfmBuilder};
+        use crate::lfm::compiler::compile;
+        use crate::lfm::edsl::WrapHash;
+        use crate::lfm::proof::lfm_prove_with_hasher;
+        use crate::lfm::registry::build_artifacts_with_hasher;
+        use crate::lfm::sub_proof::GroupShape;
+        use crate::lfm::word::{base_word, ext_word};
+        use stark::proof::options::GoldilocksCubicProofOptions;
+
+        // (name, widths). A group's felt count is `2 · Σwidth` for a base group
+        // and `6 · Σwidth` for an extension one — RATE_FELTS is 8, so these
+        // straddle it in both directions and land on it exactly.
+        let base_cases: [(&str, &[usize]); 6] = [
+            ("base, single matrix, degenerate", &[1]), // 2 felts
+            ("base, under the rate", &[3]),            // 6
+            ("base, exactly one rate block", &[4]),    // 8
+            ("base, one over the rate", &[1, 4]),      // 10
+            ("base, differing widths", &[1, 3, 2]),    // 12
+            ("base, several blocks", &[5, 2, 4, 3]),   // 28
+        ];
+        let ext_cases: [(&str, &[usize]); 4] = [
+            ("ext, single matrix, degenerate", &[1]), // 6 felts
+            ("ext, straddling the rate", &[2]),       // 12
+            ("ext, differing widths", &[1, 2]),       // 18
+            ("ext, several blocks", &[3, 1, 2]),      // 36
+        ];
+
+        fn widths_to_shapes(widths: &[usize], is_ext: bool) -> Vec<GroupShape> {
+            widths
+                .iter()
+                .map(|&num_columns| GroupShape {
+                    num_columns,
+                    is_ext,
+                })
+                .collect()
+        }
+
+        // Distinct, non-trivial values, so a dropped or reordered element moves
+        // the digest rather than colliding with its neighbour.
+        let base_at = |i: usize| FE::from(0x51ED_2C7B_0000_0001u64 + i as u64 * 0x9E37_79B9);
+        let ext_at = |i: usize| FEE::new([base_at(3 * i), base_at(3 * i + 1), base_at(3 * i + 2)]);
+
+        for hasher in [HasherKind::Rpo, HasherKind::Rpx, HasherKind::Poseidon] {
+            let opts = GoldilocksCubicProofOptions::with_blowup(2).expect("options");
+
+            for (name, widths) in base_cases.iter().copied() {
+                let shapes = widths_to_shapes(widths, false);
+                let counts: Vec<usize> = shapes.iter().map(GroupShape::num_values).collect();
+                let total: usize = counts.iter().sum();
+
+                // HOST: `hash_group_openings`' buffer is every matrix's values
+                // concatenated in round input order, hashed once.
+                let values: Vec<FE> = (0..total).map(base_at).collect();
+                let want = match hasher {
+                    HasherKind::Rpo => <AlgebraicBatchBackend<Base, RpoCommit> as IsMerkleTreeBackend>::hash_data(&values),
+                    HasherKind::Rpx => <AlgebraicBatchBackend<Base, RpxCommit> as IsMerkleTreeBackend>::hash_data(&values),
+                    _ => <AlgebraicBatchBackend<Base, PoseidonCommit> as IsMerkleTreeBackend>::hash_data(&values),
+                };
+
+                // MACHINE: one arena word per value, grouped back into matrices.
+                let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::Algebraic);
+                let arena = b.declare_arena(total as u32);
+                let cells: Vec<Cell> = (0..total).map(|i| b.hint_word(arena, i as u32)).collect();
+                let mut cursor = 0usize;
+                let per_matrix: Vec<Vec<Cell>> = counts
+                    .iter()
+                    .map(|&n| {
+                        let slice = cells[cursor..cursor + n].to_vec();
+                        cursor += n;
+                        slice
+                    })
+                    .collect();
+                let openings: Vec<MixedMatrixOpening<'_>> = shapes
+                    .iter()
+                    .zip(per_matrix.iter())
+                    .map(|(shape, vals)| MixedMatrixOpening {
+                        shape: *shape,
+                        log_height: 10,
+                        values: vals,
+                    })
+                    .collect();
+                let refs: Vec<&MixedMatrixOpening<'_>> = openings.iter().collect();
+                let d = emit_group_leaf_hash(&mut b, &refs);
+                assert_eq!(d.len(), 1, "{name}: an algebraic digest is ONE cell");
+                b.public(d[0]);
+                let program = compile(b.finish());
+
+                let arena_words: Vec<LfmWord> = values.iter().map(|v| base_word(*v)).collect();
+                let artifacts = build_artifacts_with_hasher(&program, &opts, hasher);
+                let proved =
+                    lfm_prove_with_hasher(&program, &artifacts, &[arena_words], &opts, hasher)
+                        .expect("the group-leaf program must prove");
+                assert_eq!(
+                    digest_to_commitment(&proved.public_words[0].1),
+                    want,
+                    "{hasher:?} / {name}: the emitted group leaf must be the host's"
+                );
+            }
+
+            for (name, widths) in ext_cases.iter().copied() {
+                let shapes = widths_to_shapes(widths, true);
+                let counts: Vec<usize> = shapes.iter().map(GroupShape::num_values).collect();
+                let total: usize = counts.iter().sum();
+
+                let values: Vec<FEE> = (0..total).map(ext_at).collect();
+                let want = match hasher {
+                    HasherKind::Rpo => <AlgebraicBatchBackend<Ext, RpoCommit> as IsMerkleTreeBackend>::hash_data(&values),
+                    HasherKind::Rpx => <AlgebraicBatchBackend<Ext, RpxCommit> as IsMerkleTreeBackend>::hash_data(&values),
+                    _ => <AlgebraicBatchBackend<Ext, PoseidonCommit> as IsMerkleTreeBackend>::hash_data(&values),
+                };
+
+                let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::Algebraic);
+                let arena = b.declare_arena(total as u32);
+                let cells: Vec<Cell> = (0..total).map(|i| b.hint_word(arena, i as u32)).collect();
+                let mut cursor = 0usize;
+                let per_matrix: Vec<Vec<Cell>> = counts
+                    .iter()
+                    .map(|&n| {
+                        let slice = cells[cursor..cursor + n].to_vec();
+                        cursor += n;
+                        slice
+                    })
+                    .collect();
+                let openings: Vec<MixedMatrixOpening<'_>> = shapes
+                    .iter()
+                    .zip(per_matrix.iter())
+                    .map(|(shape, vals)| MixedMatrixOpening {
+                        shape: *shape,
+                        log_height: 10,
+                        values: vals,
+                    })
+                    .collect();
+                let refs: Vec<&MixedMatrixOpening<'_>> = openings.iter().collect();
+                let d = emit_group_leaf_hash(&mut b, &refs);
+                b.public(d[0]);
+                let program = compile(b.finish());
+
+                let arena_words: Vec<LfmWord> = values.iter().map(ext_word).collect();
+                let artifacts = build_artifacts_with_hasher(&program, &opts, hasher);
+                let proved =
+                    lfm_prove_with_hasher(&program, &artifacts, &[arena_words], &opts, hasher)
+                        .expect("the group-leaf program must prove");
+                assert_eq!(
+                    digest_to_commitment(&proved.public_words[0].1),
+                    want,
+                    "{hasher:?} / {name}: the emitted group leaf must be the host's"
+                );
+            }
+        }
+    }
+
     /// ★★ **THE GRINDING LEG GATE.** The production emitter's grinding check —
     /// `epoch::emit_grinding_check`, the thing every wrap program actually calls
     /// — must accept exactly the nonces `grinding::is_valid_nonce` accepts under
