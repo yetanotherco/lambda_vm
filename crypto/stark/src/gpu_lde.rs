@@ -692,10 +692,34 @@ where
     Some((lde_h0, lde_h1))
 }
 
+/// Shared admission gate for the device composition-parts producers: the tower
+/// must be the Goldilocks/ext3 pair the kernels are written for, and the LDE must
+/// be a power of two at or above the commit threshold. Returns the validated LDE
+/// size so callers can derive from it. Kept in one place so a future condition
+/// (a VRAM check, a tower widening) cannot land on only one of the d=1/d=2 arms.
+fn dev_comp_parts_gate<F, E>(num_rows: usize) -> Option<usize>
+where
+    F: IsField + 'static,
+    E: IsField + 'static,
+{
+    if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
+        return None;
+    }
+    if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
+        return None;
+    }
+    if num_rows < gpu_lde_threshold() || !num_rows.is_power_of_two() {
+        return None;
+    }
+    Some(num_rows)
+}
+
 /// Fully device-resident degree-2 decomposition + half extension: takes the
 /// resident composition evals `H`, decomposes into H0/H1 on device, LDE-extends
-/// both and keeps the de-interleaved parts buffer as a `GpuLdeExt3` (commit
-/// tree, R3 OOD, R4 DEEP and openings all read the handle). With `want_host`
+/// both and keeps the de-interleaved parts buffer as a `GpuLdeExt3` (the commit
+/// tree and the R4 openings read `handle.m`; R3 and R4 DEEP read the host part
+/// Vec's length and DEEP validates the handle against it — see
+/// [`try_comp_h_to_slabs_dev`] for why the two must stay equal). With `want_host`
 /// the evaluations are also drained to host for the fallback consumers;
 /// without it (device-only) the returned part Vecs are empty placeholders.
 /// `None` → the caller downloads `H` and runs the host decompose path.
@@ -709,16 +733,7 @@ where
     F: IsField + 'static,
     E: IsField + 'static,
 {
-    if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
-        return None;
-    }
-    if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
-        return None;
-    }
-    let lde_size = h.num_rows;
-    if lde_size < gpu_lde_threshold() || !lde_size.is_power_of_two() {
-        return None;
-    }
+    let lde_size = dev_comp_parts_gate::<F, E>(h.num_rows)?;
     let n = lde_size / 2;
     if weights.len() != n || inv_2x.len() < n {
         return None;
@@ -782,39 +797,46 @@ where
 }
 
 /// Fully device-resident num_parts==1 composition-parts path: `H` itself is the
-/// single part, already on the LDE coset, so — unlike [`try_decompose_extend_d2_dev`]
-/// — there is no decompose and no re-extension, only a de-interleave into the slab
-/// layout the commit / DEEP / FRI consumers read (all of which already read the
-/// part count from `handle.m`). The single part is always drained to host — not
-/// just because it can be (num_parts==1 tables are never device-only; they keep
-/// their preprocessed host trace, see `device_only_for`), but because that host
-/// part is what feeds the query-0 composition-opening canary: release-active for
-/// `qi == 0` and guarded on a non-empty host part, it is the only end-to-end check
-/// that the device m=1 gather / DEEP / FRI layout is correct. Returning empty parts
-/// (`vec![Vec::new()]`, as the d=2 device-only arm does) would save the D2H and keep
-/// num_parts==1 — but silently disable that canary.
+/// single part, already on the LDE coset, so — unlike [`try_comp_h_to_slabs_dev`]'s
+/// d=2 sibling [`try_decompose_extend_d2_dev`] — there is no decompose and no
+/// re-extension, only a de-interleave into the slab layout the downstream consumers
+/// read. No consumer needed changing for `m == 1`, but they do not agree on where
+/// the part count comes from, and the difference matters to anyone editing this:
+///
+/// - R2 commit and the R4 openings read `handle.m`.
+/// - R3's `z^P` exponent and R4 DEEP's gamma count read
+///   `lde_composition_poly_evaluations.len()` — the HOST part Vec's length. DEEP only
+///   *validates* the handle against it and declines on a mismatch.
+/// - FRI never sees the handle at all; it consumes the DEEP codeword.
+///
+/// So the invariant to preserve is `handle.m == lde_composition_poly_evaluations.len()`
+/// (`materialize_composition_parts_host` also requires it), not "the handle is
+/// authoritative".
+///
+/// The single part is always drained to host — not just because it can be
+/// (num_parts==1 tables are never device-only; `device_only_for`'s degree gate admits
+/// only d=2), but because that host part is what feeds the query-0
+/// composition-opening canary: release-active for `qi == 0` and guarded on a
+/// non-empty host part, it is the only *in-prove* check that the device m=1 gather is
+/// correct. It does not cover DEEP or FRI, which consume separate downstream buffers;
+/// those are covered by proof verification (`prover/tests/cuda_d1_path.rs`). Returning
+/// empty parts (`vec![Vec::new()]`, as the d=2 device-only arm does) would save the
+/// D2H and keep num_parts==1 — but silently disable that canary.
 /// `None` → the caller downloads `H` and uses it directly as the single host part.
-pub(crate) fn try_deinterleave_comp_h_dev<F, E>(
+pub(crate) fn try_comp_h_to_slabs_dev<F, E>(
     h: &math_cuda::constraint_interp::GpuCompH,
 ) -> Option<(Vec<Vec<FieldElement<E>>>, math_cuda::lde::GpuLdeExt3)>
 where
     F: IsField + 'static,
     E: IsField + 'static,
 {
-    if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
-        return None;
-    }
-    if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
-        return None;
-    }
-    let lde_size = h.num_rows;
-    if lde_size < gpu_lde_threshold() || !lde_size.is_power_of_two() {
-        return None;
-    }
+    dev_comp_parts_gate::<F, E>(h.num_rows)?;
 
     // The interleaved `H` download IS the single composition part on the LDE
-    // coset — same values the slab handle holds, just interleaved. Download
-    // before building the handle so a decline leaves nothing to unwind.
+    // coset — same values the slab handle holds, just interleaved. Downloading
+    // first keeps the blocking D2H off the tail of the de-interleave launch; a
+    // later handle failure just re-drains in the caller's fallback (both values
+    // drop by RAII on any early return, in either order).
     let host = vec![download_comp_h_to_field::<E>(h)?];
 
     let handle = math_cuda::constraint_interp::comp_h_to_slabs(h).ok()?;
