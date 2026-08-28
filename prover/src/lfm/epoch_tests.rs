@@ -3755,11 +3755,18 @@ fn epoch_program_with(e: &RealEpoch, with_legs: bool, split_decode: bool) -> Lfm
             )
         })
         .collect();
+    // ⚠ `halves`, not `lanes_flat`: Phase A absorbs a root through
+    // `append_halves_misaligned`, whose byte length is `4 · halves.len()`, and
+    // the host absorbs the root's THIRTY-TWO bytes in one `append_bytes`. On an
+    // algebraic arm `lanes_flat` is four FULL FELTS, so that call would declare
+    // sixteen bytes where the host declared thirty-two — a different length
+    // prefix and a different payload, hence a different chain from the first
+    // root onward. `halves` is the same eight on both arms.
     let prep_halves: Vec<Option<Vec<_>>> = prep_cells
         .iter()
-        .map(|c| c.as_ref().map(RootCells::lanes_flat))
+        .map(|c| c.as_ref().map(|c| c.halves(&mut b)))
         .collect();
-    let main_halves: Vec<Vec<_>> = main_cells.iter().map(RootCells::lanes_flat).collect();
+    let main_halves: Vec<Vec<_>> = main_cells.iter().map(|c| c.halves(&mut b)).collect();
     // The interned bytes, hoisted so Phase A can borrow them for the whole replay.
     let prep_constants: Vec<Option<Commitment>> = e
         .phase_a
