@@ -156,6 +156,38 @@ impl RootCells {
         Self::from_cells(b, &cells)
     }
 
+    /// The root's 32 BYTES as the eight `u32` halves a byte-stream fold takes —
+    /// correct on both arms.
+    ///
+    /// ★ Needed because `program_id` is **deliberately** keccak over bytes
+    /// whatever the configuration commits under: its host counterpart
+    /// `recursion::program_id_from_digest` names `PlatformKeccak256` explicitly,
+    /// since it identifies a program to CONSUMERS rather than being part of the
+    /// proof system's commitment layer. So one fold on this path still wants
+    /// bytes after everything around it became felts.
+    ///
+    /// On a byte hash the lanes ARE those halves and this is free. On an
+    /// algebraic one each of the four felts renders as its eight big-endian
+    /// bytes — `felt_be_halves`, one `LFM_BITDEC` row each — which is exactly
+    /// the serialisation `digest_to_commitment` performs host-side, so the two
+    /// agree by construction rather than by coincidence.
+    ///
+    /// ⚠ Not [`RootCells::lanes_flat`]: that yields FELTS on the algebraic arm,
+    /// and handing them to a byte fold would hash four values as if they were
+    /// eight — silently, since the count would still look plausible.
+    pub fn byte_halves(&self, b: &mut LfmBuilder) -> Vec<Felt> {
+        if b.wrap_hash() == super::edsl::WrapHash::Algebraic {
+            let mut out = Vec::with_capacity(4 * DIGEST_WORDS);
+            for lanes in &self.lanes {
+                for lane in lanes {
+                    out.extend_from_slice(&super::transcript_replay::felt_be_halves(b, *lane));
+                }
+            }
+            return out;
+        }
+        self.lanes_flat()
+    }
+
     /// The lanes flattened, in order.
     ///
     /// ⚠ These are `u32` HALVES on a byte hash and FULL FELTS on an algebraic

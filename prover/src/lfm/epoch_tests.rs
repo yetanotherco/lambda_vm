@@ -170,14 +170,18 @@ fn challenge_program(h: &HostTable) -> LfmProgram {
     let shape = &h.shape;
 
     let a = Arenas {
-        main_root: b.declare_arena(2),
-        aux_root: shape.has_aux_root.then(|| b.declare_arena(2)),
+        main_root: b.declare_arena(super::proof_arena::words_per_root() as u32),
+        aux_root: shape
+            .has_aux_root
+            .then(|| b.declare_arena(super::proof_arena::words_per_root() as u32)),
         contribution: shape.has_contribution.then(|| b.declare_arena(1)),
-        composition_root: b.declare_arena(2),
+        composition_root: b.declare_arena(super::proof_arena::words_per_root() as u32),
         ood_current: b.declare_arena((shape.ood_current_dims.0 * shape.ood_current_dims.1) as u32),
         ood_next: b.declare_arena((shape.ood_next_dims.0 * shape.ood_next_dims.1) as u32),
         parts: b.declare_arena(shape.num_parts as u32),
-        fri_roots: b.declare_arena(2 * shape.fri.num_committed() as u32),
+        fri_roots: b.declare_arena(
+            super::proof_arena::words_per_root() as u32 * shape.fri.num_committed() as u32,
+        ),
         fri_coeffs: b.declare_arena(shape.fri.num_terminal_coeffs() as u32),
         nonce: (shape.grinding_factor > 0).then(|| b.declare_arena(1)),
         legs: None,
@@ -832,8 +836,8 @@ pub(super) fn epoch_seed(
     table_counts: &crate::TableCounts,
     runtime_page_ranges: &[crate::RuntimePageRange],
     fri_final_poly_log_degree: u8,
-) -> stark::config::DefaultStarkTranscript<Ext3> {
-    let mut t = stark::config::DefaultStarkTranscript::<Ext3>::new(&[]);
+) -> crate::hash_pin::BlockTranscript {
+    let mut t = crate::hash_pin::block_transcript(&[]);
     crate::statement::absorb_statement(
         &mut t,
         crate::statement::StatementKind::ContinuationEpoch { epoch_label },
@@ -987,7 +991,7 @@ impl EpochFront {
     }
 
     /// [`epoch_seed`] over this epoch's own statement.
-    pub(super) fn seed(&self) -> stark::config::DefaultStarkTranscript<Ext3> {
+    pub(super) fn seed(&self) -> crate::hash_pin::BlockTranscript {
         epoch_seed(
             self.label,
             &self.elf_bytes,
@@ -1532,7 +1536,7 @@ impl RealBatchedEpoch {
     /// [`epoch_seed`] over this epoch's statement, with the claimed output
     /// substitutable so a tamper arm can ask the question it means: "does
     /// THIS proof answer for THAT output?".
-    fn seed_for(&self, public_output: &[u8]) -> stark::config::DefaultStarkTranscript<Ext3> {
+    fn seed_for(&self, public_output: &[u8]) -> crate::hash_pin::BlockTranscript {
         epoch_seed(
             self.epoch_label,
             &self.elf_bytes,
@@ -2157,16 +2161,21 @@ pub(super) fn batched_epoch_program_with(
         .iter()
         .filter(|p| p.is_some_and(PrepSource::is_arena))
         .count();
-    let a_prep_roots = b.declare_arena(2 * num_arena_prep as u32);
+    let a_prep_roots =
+        b.declare_arena(super::proof_arena::words_per_root() as u32 * num_arena_prep as u32);
     // The carved root's arena sits between the prep roots and main_root —
     // declaration order is absorb order, and that is its transcript slot.
-    let a_carved_root = shape.carved_main.map(|_| b.declare_arena(2));
-    let a_main_root = b.declare_arena(2);
+    let a_carved_root = shape
+        .carved_main
+        .map(|_| b.declare_arena(super::proof_arena::words_per_root() as u32));
+    let a_main_root = b.declare_arena(super::proof_arena::words_per_root() as u32);
     let num_reg = crate::tables::register::NUM_REGISTER_ADDRESSES as u32;
     let a_reg_init = b.declare_arena(num_reg);
     let a_reg_fini = b.declare_arena(num_reg);
     let a_pc_start = b.declare_arena(2);
-    let a_aux_root = shape.has_aux.then(|| b.declare_arena(2));
+    let a_aux_root = shape
+        .has_aux
+        .then(|| b.declare_arena(super::proof_arena::words_per_root() as u32));
     let a_contrib: Vec<Option<super::instr::ArenaId>> = shape
         .tables
         .iter()
@@ -2187,7 +2196,7 @@ pub(super) fn batched_epoch_program_with(
             )
         })
         .collect();
-    let a_parts_root = b.declare_arena(2);
+    let a_parts_root = b.declare_arena(super::proof_arena::words_per_root() as u32);
     // The standalone class's terminal polynomials — per table, sized by the
     // trace-length degree bound, absorbed in round 4 and evaluated by the
     // standalone terminal checks.
@@ -2201,7 +2210,9 @@ pub(super) fn batched_epoch_program_with(
                 .then(|| b.declare_arena(1u32 << (shape.heights[t] as u32 - shape.log2_blowup)))
         })
         .collect();
-    let a_fri_roots = b.declare_arena(2 * shape.fri.num_committed() as u32);
+    let a_fri_roots = b.declare_arena(
+        super::proof_arena::words_per_root() as u32 * shape.fri.num_committed() as u32,
+    );
     let a_fri_coeffs = b.declare_arena(shape.fri.num_terminal_coeffs() as u32);
     let a_nonce = (shape.grinding_factor > 0).then(|| b.declare_arena(1));
     // The opening arena, LAST and exactly the T1 serializer's size — the
@@ -2386,7 +2397,7 @@ pub(super) fn batched_epoch_program_with(
         let decode = decode_cells
             .as_ref()
             .expect("a continuation epoch has a DECODE sub-proof")
-            .lanes_flat();
+            .byte_halves(&mut b);
         let id = super::programs::emit_program_id(
             &mut b,
             super::programs::ProgramIdShape { num_pages: 0 },
@@ -3481,7 +3492,7 @@ pub(super) fn host_table_forked(
     view: StarkProofView<'_, Gl, Ext3, ()>,
     index: usize,
     num_tables: usize,
-    fork: &mut stark::config::DefaultStarkTranscript<Ext3>,
+    fork: &mut crate::hash_pin::BlockTranscript,
     lookup_challenges: &[FEE],
 ) -> HostTable {
     use stark::domain::new_verifier_domain;
@@ -3621,8 +3632,9 @@ fn epoch_program_with(e: &RealEpoch, with_legs: bool, split_decode: bool) -> Lfm
         .iter()
         .filter(|(p, _)| p.is_some_and(PrepSource::is_arena))
         .count();
-    let a_prep_roots = b.declare_arena(2 * num_arena_prep as u32);
-    let a_main_roots = b.declare_arena(2 * n as u32);
+    let a_prep_roots =
+        b.declare_arena(super::proof_arena::words_per_root() as u32 * num_arena_prep as u32);
+    let a_main_roots = b.declare_arena(super::proof_arena::words_per_root() as u32 * n as u32);
     // The register boundary vectors, at production's width. `start_index` is slot
     // 64 of INIT, and the REGISTER preprocessed root is COMPUTED from both — which
     // is what ties the index to the chain (ledger entry 2): production has no
@@ -3644,14 +3656,19 @@ fn epoch_program_with(e: &RealEpoch, with_legs: bool, split_decode: bool) -> Lfm
         .zip(&e.legs)
         .map(|(h, leg)| Arenas {
             main_root: a_main_roots,
-            aux_root: h.shape.has_aux_root.then(|| b.declare_arena(2)),
+            aux_root: h
+                .shape
+                .has_aux_root
+                .then(|| b.declare_arena(super::proof_arena::words_per_root() as u32)),
             contribution: h.shape.has_contribution.then(|| b.declare_arena(1)),
-            composition_root: b.declare_arena(2),
+            composition_root: b.declare_arena(super::proof_arena::words_per_root() as u32),
             ood_current: b
                 .declare_arena((h.shape.ood_current_dims.0 * h.shape.ood_current_dims.1) as u32),
             ood_next: b.declare_arena((h.shape.ood_next_dims.0 * h.shape.ood_next_dims.1) as u32),
             parts: b.declare_arena(h.shape.num_parts as u32),
-            fri_roots: b.declare_arena(2 * h.shape.fri.num_committed() as u32),
+            fri_roots: b.declare_arena(
+                super::proof_arena::words_per_root() as u32 * h.shape.fri.num_committed() as u32,
+            ),
             fri_coeffs: b.declare_arena(h.shape.fri.num_terminal_coeffs() as u32),
             nonce: (h.shape.grinding_factor > 0).then(|| b.declare_arena(1)),
             legs: with_legs.then(|| super::epoch_verify::declare_table_arenas(&mut b, &leg.verify)),

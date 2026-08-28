@@ -93,7 +93,7 @@ pub(super) fn real_batched_lfm(
         artifacts.chip_set,
     );
     let refs = airs.air_refs();
-    let mut t = stark::config::DefaultStarkTranscript::<Ext3>::new(&[]);
+    let mut t = crate::hash_pin::block_transcript(&[]);
     absorb_lfm_statement(
         &mut t,
         &artifacts.program_id,
@@ -1355,7 +1355,7 @@ pub(super) fn real_global(
     }
 
     let seed = || {
-        let mut t = stark::config::DefaultStarkTranscript::<Ext3>::new(&[]);
+        let mut t = crate::hash_pin::block_transcript(&[]);
         crate::statement::absorb_continuation_global_statement(
             &mut t,
             elf_bytes,
@@ -1724,6 +1724,45 @@ fn leg_arena_words(e: &RealBatchedLfm) -> Vec<Vec<LfmWord>> {
 /// roots, every quotient identity held, and FRI folded to the terminal. The
 /// published challenges are then differentialled against
 /// `replay_epoch_transcript`'s on the same wrap.
+/// ★ Diagnostic sibling of [`the_lfm_wrap_leg_runs_and_matches_the_host_replay`]:
+/// the SPINE ONLY, with no query walks to fail in.
+///
+/// The full leg's failure mode when a transcript absorb diverges is `DivByZero`
+/// deep in a walk, naming neither the absorb nor the site. This build omits the
+/// openings, so nothing authenticates and nothing can divide by zero — what it
+/// checks is only whether the emitted absorb sequence derives production's own
+/// challenges, and the FIRST challenge that disagrees names the absorb that
+/// diverged.
+///
+/// ⚠ Keep this even while the full leg passes. It is the difference between a
+/// transcript bug that reports itself and one that has to be bisected.
+#[test]
+fn the_lfm_wrap_leg_spine_derives_the_host_challenges() {
+    let (e, _full) = fixture_leg();
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let a = declare_lfm_leg_arenas(&mut b, &e, false);
+    let _ = emit_lfm_leg(&mut b, &e, &a);
+    let program = compile(b.finish());
+
+    let mut arenas = leg_arena_words(&e);
+    // The spine build declares no opening or FRI arenas.
+    arenas.truncate(program.arena_schema.lens.len());
+    let exec = execute(&program, &arenas, &TestPermutation).expect("the spine must execute");
+
+    let pub_ext = |i: usize| super::word::word_as_ext(&exec.public_words[i].1).expect("an ext");
+    assert_eq!(
+        pub_ext(0),
+        e.challenges.lookup[0],
+        "z — the FIRST challenge; a \
+        disagreement here is in the statement absorb or Phase A, before any \
+        per-table fork"
+    );
+    assert_eq!(pub_ext(1), e.challenges.lookup[1], "alpha");
+    for (i, beta) in e.challenges.betas.iter().enumerate() {
+        assert_eq!(pub_ext(2 + i), *beta, "beta[{i}] — the per-table forks");
+    }
+}
+
 #[test]
 fn the_lfm_wrap_leg_runs_and_matches_the_host_replay() {
     let (e, program) = fixture_leg();

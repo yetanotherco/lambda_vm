@@ -503,12 +503,13 @@ fn fib_challenge_program(
     let s = &r.shape;
     let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
 
-    let a_main = b.declare_arena(2);
-    let a_composition = b.declare_arena(2);
+    let a_main = b.declare_arena(super::proof_arena::words_per_root() as u32);
+    let a_composition = b.declare_arena(super::proof_arena::words_per_root() as u32);
     let a_current = b.declare_arena((s.ood_current_dims.0 * s.ood_current_dims.1) as u32);
     let a_next = b.declare_arena((s.ood_next_dims.0 * s.ood_next_dims.1) as u32);
     let a_parts = b.declare_arena(s.num_parts as u32);
-    let a_fri_roots = b.declare_arena(2 * s.fri.num_committed() as u32);
+    let a_fri_roots =
+        b.declare_arena(super::proof_arena::words_per_root() as u32 * s.fri.num_committed() as u32);
     let a_fri_coeffs = b.declare_arena(s.fri.num_terminal_coeffs() as u32);
     let a_nonce = (s.grinding_factor > 0).then(|| b.declare_arena(1));
 
@@ -715,8 +716,8 @@ fn row_major_control_gamma(r: &FibReplay) -> FEE {
     let s = &r.shape;
     let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
 
-    let a_main = b.declare_arena(2);
-    let a_composition = b.declare_arena(2);
+    let a_main = b.declare_arena(super::proof_arena::words_per_root() as u32);
+    let a_composition = b.declare_arena(super::proof_arena::words_per_root() as u32);
     let a_current = b.declare_arena((s.ood_current_dims.0 * s.ood_current_dims.1) as u32);
     let a_next = b.declare_arena((s.ood_next_dims.0 * s.ood_next_dims.1) as u32);
     let a_parts = b.declare_arena(s.num_parts as u32);
