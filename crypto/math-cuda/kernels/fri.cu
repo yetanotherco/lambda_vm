@@ -76,3 +76,23 @@ extern "C" __global__ void gather_ext3_at(
     out[i * 3 + 1] = evals[p * 3 + 1];
     out[i * 3 + 2] = evals[p * 3 + 2];
 }
+
+// Batched-FRI injection: `out[i] += beta_sq * bucket[i]` over ext3 elements,
+// interleaved layout. `out` is the just-folded running codeword and `bucket`
+// the shorter DEEP codeword whose height matches this layer; both hold `n` ext3
+// elements (3*n u64). Matches the host `inject_bucket` (fri/batched.rs).
+extern "C" __global__ void fri_inject_bucket_ext3(
+    uint64_t *out,             // 3 * n u64, modified in place
+    const uint64_t *bucket,    // 3 * n u64
+    const uint64_t *beta_sq,   // 3 u64 (ext3)
+    uint64_t n) {
+    uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    ext3::Fe3 v   = ext3::make(out[i * 3], out[i * 3 + 1], out[i * 3 + 2]);
+    ext3::Fe3 b   = ext3::make(bucket[i * 3], bucket[i * 3 + 1], bucket[i * 3 + 2]);
+    ext3::Fe3 bsq = ext3::make(beta_sq[0], beta_sq[1], beta_sq[2]);
+    ext3::Fe3 res = ext3::add(v, ext3::mul(bsq, b));
+    out[i * 3]     = res.a;
+    out[i * 3 + 1] = res.b;
+    out[i * 3 + 2] = res.c;
+}
