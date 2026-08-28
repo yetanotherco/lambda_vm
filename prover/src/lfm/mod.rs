@@ -84,6 +84,8 @@ mod aggregator_tests;
 // design — so the gate follows them rather than failing to compile there.
 #[cfg(all(test, not(feature = "cuda")))]
 mod group_leaf_tests;
+#[cfg(all(test, not(feature = "cuda")))]
+mod transcript_diff_tests;
 #[cfg(test)]
 mod blake3_chip_tests;
 #[cfg(test)]
