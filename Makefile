@@ -587,15 +587,29 @@ test-cuda-integration:
 	    --test cuda_path_integration -- --ignored --nocapture --test-threads=1
 
 # num_parts==1 (DECODE) device DEEP/FRI coverage (requires NVIDIA GPU + nvcc).
-# The steady-state cuda_path_integration fixtures never cross the default LDE
-# threshold (1<<14) for a num_parts==1 table, so lower it here so DECODE engages
-# the d=1 device path end to end. 64 = the exact LDE size of fib_iterative_1M's
-# DECODE ROM: high enough to engage only DECODE (not the tiny tables whose GPU
-# NTT degenerates below ~16), low enough that DECODE crosses it. Its own binary +
-# a process-wide env because gpu_lde_threshold() caches the value on first read
-# (OnceLock), so it must be set before any prove in the process.
+# No fixture crosses the default LDE threshold (1<<14) for a num_parts==1 table,
+# so lower it here until DECODE engages the d=1 device path end to end.
+#
+# Threshold and fixture are one choice, because there are exactly two d=1 tables
+# (a d=1 table is one with a single bus interaction): DECODE, whose rows come from
+# the guest's instruction count, and KECCAK_RC, fixed at NUM_ROWS=32 => LDE 64.
+# DECODE's ROM is derived from the ELF, NOT from cycles, so the whole
+# fib_iterative_* family is 13 executable words (the variants differ only in the
+# `li a0, <count>` immediate) => 16 rows => LDE 32. That sits BELOW KECCAK_RC's 64,
+# so with a fib fixture no threshold isolates DECODE: <=32 engages both and
+# 33..=64 engages only KECCAK_RC.
+#
+# all_instructions_64 is 66 executable words => 128 rows => DECODE LDE 256. At 128,
+# DECODE engages with 2x margin and KECCAK_RC (64) declines, so a nonzero
+# gpu_comp_h_slabs_calls() uniquely attributes to DECODE. 128 is also ABOVE the
+# PR's original 64, so it sends strictly fewer tables onto the GPU-committed path
+# and narrows -- rather than widens -- the R4 gather_proofs_dev abort site that
+# crypto/stark/src/gpu_lde.rs warns about for lowered thresholds.
+#
+# Its own binary + a process-wide env because gpu_lde_threshold() caches the value
+# on first read (OnceLock), so it must be set before any prove in the process.
 test-cuda-d1:
-	LAMBDA_VM_GPU_LDE_THRESHOLD=64 $(GPU_TEST_TIMEOUT) cargo test -p lambda-vm-prover \
+	LAMBDA_VM_GPU_LDE_THRESHOLD=128 $(GPU_TEST_TIMEOUT) cargo test -p lambda-vm-prover \
 	    --release --features cuda \
 	    --test cuda_d1_path -- --ignored --nocapture --test-threads=1
 
