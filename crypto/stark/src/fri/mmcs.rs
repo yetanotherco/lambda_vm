@@ -444,6 +444,50 @@ where
         }
     }
 
+    /// Reconstruct the tree from a STANDARD HEAP node array — the layout the GPU
+    /// commit (`math_cuda::mmcs::build_mmcs_tree_on_device`) produces: `2*L-1`
+    /// nodes of 32 bytes, root at index 0, inner nodes in `[0, L-1)`, the `L =
+    /// 2^(h_max-1)` leaves in the tail `[L-1, 2L-1)`, with leaf `j` at `L-1+j`.
+    ///
+    /// This is what makes a GPU-built tree serve the SAME [`Self::auth_path`] /
+    /// [`Self::open_batch`] a host-built one does: the keccak (leaf + climb) runs
+    /// on the device, only the digest layers come back, and every downstream
+    /// opening reads them unchanged. The heap ordering matches
+    /// `merkle_gather_paths` (validated by `mmcs_tree_parity`'s
+    /// `paths_match_the_host_at_every_query`), so `layers[level]` here is exactly
+    /// the level that kernel walks.
+    pub fn from_heap_nodes(dims: Vec<(usize, usize)>, h_max: usize, nodes: &[u8]) -> Self {
+        let leaves_len = 1usize << (h_max - 1);
+        assert_eq!(
+            nodes.len(),
+            (2 * leaves_len - 1) * 32,
+            "heap node array must be (2*L-1) 32-byte digests for L = 2^(h_max-1)"
+        );
+        let node = |i: usize| -> Commitment {
+            let mut c = [0u8; 32];
+            c.copy_from_slice(&nodes[i * 32..i * 32 + 32]);
+            c
+        };
+        // `layers[k]` is heap level `h_max-1-k`: `2^(h_max-1-k)` nodes starting at
+        // heap index `2^(h_max-1-k) - 1`. `layers[0]` is the leaf tail; the last
+        // layer is the single root at index 0.
+        let mut layers: Vec<Vec<Commitment>> = Vec::with_capacity(h_max);
+        for k in 0..h_max {
+            let level_size = leaves_len >> k;
+            let start = level_size - 1;
+            layers.push((0..level_size).map(|j| node(start + j)).collect());
+        }
+        let root = layers.last().expect("at least the base layer exists")[0];
+
+        MixedMmcs {
+            root,
+            layers,
+            dims,
+            h_max,
+            _marker: PhantomData,
+        }
+    }
+
     /// The committed root.
     pub fn root(&self) -> Commitment {
         self.root
@@ -1800,6 +1844,52 @@ mod tests {
                     specs[n].0
                 );
             }
+        }
+    }
+
+    /// The GPU commit returns a standard heap node array; `from_heap_nodes` must
+    /// rebuild a tree that serves the same root and authentication paths the
+    /// host build does — that is what lets the device tree be authoritative while
+    /// only the digest layers come back. Round-trips a real mixed-height tree's
+    /// layers through the heap layout and checks every query's path.
+    #[test]
+    fn from_heap_nodes_rebuilds_the_same_tree() {
+        let (specs, inner) = residency_fixture();
+        let m = Mmcs::commit(&inner);
+        let h_max = m.h_max();
+        let leaves_len = 1usize << (h_max - 1);
+
+        // Assemble the standard heap from the host layers, exactly as the device
+        // build writes it: layer `k` (heap level `h_max-1-k`) into
+        // `[2^(h_max-1-k) - 1, ..)`, leaf `j` at `L-1+j`.
+        let mut heap = vec![0u8; (2 * leaves_len - 1) * 32];
+        for (k, layer) in m.layers.iter().enumerate() {
+            let level_size = leaves_len >> k;
+            assert_eq!(layer.len(), level_size);
+            let start = level_size - 1;
+            for (j, digest) in layer.iter().enumerate() {
+                heap[(start + j) * 32..(start + j) * 32 + 32].copy_from_slice(digest);
+            }
+        }
+
+        let rebuilt = Mmcs::from_heap_nodes(m.dims.clone(), h_max, &heap);
+        assert_eq!(rebuilt.root(), m.root(), "root must survive the heap round-trip");
+        assert_eq!(rebuilt.h_max(), h_max);
+
+        let heights: Vec<usize> = specs.iter().map(|&(lh, _, _)| lh).collect();
+        let widths: Vec<usize> = specs.iter().map(|&(_, w, _)| w).collect();
+        for iota in 0..leaves_len {
+            assert_eq!(
+                rebuilt.auth_path(iota).unwrap().merkle_path,
+                m.auth_path(iota).unwrap().merkle_path,
+                "authentication path at iota {iota} must match the host tree"
+            );
+            // And a full opening off the rebuilt tree still verifies.
+            let opening = rebuilt.open_batch(iota, &inner);
+            assert!(
+                Mmcs::verify_batch(&rebuilt.root(), iota, &opening, &heights, &widths),
+                "an opening from the rebuilt tree must verify at iota {iota}"
+            );
         }
     }
 }
