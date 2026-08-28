@@ -792,6 +792,54 @@ extern "C" __global__ void mmcs_absorb_row_pair_ext3_slabs(
     rate_pos[tid] = rp;
 }
 
+// Absorb one ROW-MAJOR ext3 matrix's row pair — the batched aux LDE layout
+// (`expand_aux_lde_row_major`): element `(row, col)` is 3 consecutive u64 at
+// `(row * stride + col) * 3`, `stride` elements per row. Same absorbed byte
+// order as the host's row-major ext3 leaf.
+extern "C" __global__ void mmcs_absorb_row_pair_ext3_row_major(
+    uint64_t *states,
+    uint32_t *rate_pos,
+    const uint64_t *data,
+    uint64_t stride,
+    uint64_t col_start,
+    uint64_t col_end,
+    uint64_t num_rows,
+    uint64_t log_num_rows,
+    uint64_t num_leaves)
+{
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_leaves) return;
+    (void)num_rows;
+
+    uint64_t br_0 = __brevll(2 * tid) >> (64 - log_num_rows);
+    uint64_t br_1 = __brevll(2 * tid + 1) >> (64 - log_num_rows);
+
+    uint64_t st[25];
+    uint64_t *st_g = states + tid * 25;
+    #pragma unroll
+    for (int i = 0; i < 25; ++i) st[i] = st_g[i];
+    uint32_t rp = rate_pos[tid];
+
+    for (uint64_t c = col_start; c < col_end; ++c) {
+        const uint64_t *e = data + (br_0 * stride + c) * 3;
+        #pragma unroll
+        for (int k = 0; k < 3; ++k) {
+            absorb_lane(st, rp, bswap64(goldilocks::canonical(e[k])));
+        }
+    }
+    for (uint64_t c = col_start; c < col_end; ++c) {
+        const uint64_t *e = data + (br_1 * stride + c) * 3;
+        #pragma unroll
+        for (int k = 0; k < 3; ++k) {
+            absorb_lane(st, rp, bswap64(goldilocks::canonical(e[k])));
+        }
+    }
+
+    #pragma unroll
+    for (int i = 0; i < 25; ++i) st_g[i] = st[i];
+    rate_pos[tid] = rp;
+}
+
 // Pad and squeeze every leaf's sponge into a 32-byte digest.
 extern "C" __global__ void mmcs_states_finalize(
     const uint64_t *states,

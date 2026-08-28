@@ -208,6 +208,40 @@ impl MmcsGroupHasher {
         Ok(())
     }
 
+    /// Absorb one ROW-MAJOR ext3 matrix's row pair — the batched aux LDE layout
+    /// (`expand_aux_lde_row_major`), element `(row, col)` as 3 consecutive u64 at
+    /// `(row*stride + col)*3`, `stride` elements per row. Columns `[col_start,
+    /// col_end)` are absorbed. Same absorbed byte order as the host's row-major
+    /// ext3 leaf.
+    pub fn absorb_ext3_row_major(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        data: &CudaSlice<u64>,
+        stride: u64,
+        col_start: u64,
+        col_end: u64,
+    ) -> Result<()> {
+        let be = backend()?;
+        let num_rows = 1u64 << self.log_num_rows;
+        let cfg = keccak_launch_cfg(self.num_leaves);
+        unsafe {
+            stream
+                .launch_builder(&be.mmcs_absorb_row_pair_ext3_row_major)
+                .arg(&mut self.states)
+                .arg(&mut self.rate_pos)
+                .arg(data)
+                .arg(&stride)
+                .arg(&col_start)
+                .arg(&col_end)
+                .arg(&num_rows)
+                .arg(&self.log_num_rows)
+                .arg(&self.num_leaves)
+                .launch(cfg)?;
+        }
+        self.absorbed += 1;
+        Ok(())
+    }
+
     /// Pad and squeeze every leaf. Panics if nothing was absorbed: an empty
     /// group's digests would be the hash of nothing, which is a leaf no verifier
     /// can rebuild from an opening.
@@ -355,6 +389,84 @@ pub fn commit_mixed_row_major_root(inputs: &[MmcsRowMajorInput]) -> Result<[u8; 
             for m in inputs.iter().filter(|m| m.log_height == h) {
                 let dev = stream.clone_htod(m.data)?;
                 hasher.absorb_row_major(&stream, &dev, m.stride, m.col_start, m.col_end)?;
+                drop(dev);
+            }
+            group_digests[h as usize] = Some(hasher.finalize(&stream)?);
+        }
+        h -= 1;
+    }
+
+    let nodes = build_mmcs_tree_on_device(&stream, &group_digests)?;
+    read_mmcs_root(&stream, &nodes)
+}
+
+/// One ext3 matrix feeding a mixed-height MMCS commit, in absorb order, laid out
+/// as COLUMN-MAJOR SLABS: component `k` of column `p` at `(p*3 + k) * col_stride`
+/// (`col_stride` = rows per column), natural row order. This is the
+/// composition-poly / `GpuLdeExt3` layout.
+pub struct MmcsExt3SlabInput<'a> {
+    pub data: &'a [u64],
+    pub col_stride: u64,
+    pub num_parts: u64,
+    pub log_height: u64,
+}
+
+/// Build the whole mixed-height MMCS tree on the GPU from ext3 slab matrices and
+/// return its root — the ext3 twin of [`commit_mixed_row_major_root`], grouping
+/// by height and absorbing each group's matrices in the given order.
+pub fn commit_mixed_ext3_slabs_root(inputs: &[MmcsExt3SlabInput]) -> Result<[u8; 32]> {
+    let be = backend()?;
+    let stream = be.next_stream();
+
+    let h_max = inputs.iter().map(|m| m.log_height).max().unwrap_or(0);
+    let mut group_digests: Vec<Option<CudaSlice<u8>>> = (0..=h_max).map(|_| None).collect();
+
+    let mut h = h_max;
+    while h >= 1 {
+        if inputs.iter().any(|m| m.log_height == h) {
+            let mut hasher = MmcsGroupHasher::new(&stream, h)?;
+            for m in inputs.iter().filter(|m| m.log_height == h) {
+                let dev = stream.clone_htod(m.data)?;
+                hasher.absorb_ext3_slabs(&stream, &dev, m.col_stride, m.num_parts)?;
+                drop(dev);
+            }
+            group_digests[h as usize] = Some(hasher.finalize(&stream)?);
+        }
+        h -= 1;
+    }
+
+    let nodes = build_mmcs_tree_on_device(&stream, &group_digests)?;
+    read_mmcs_root(&stream, &nodes)
+}
+
+/// One ROW-MAJOR ext3 matrix feeding a mixed-height MMCS commit, in absorb
+/// order: element `(row, col)` as 3 consecutive u64 at `(row*stride + col)*3`.
+/// Columns `[col_start, col_end)` are committed. This is the batched aux LDE
+/// layout (`expand_aux_lde_row_major`).
+pub struct MmcsExt3RowMajorInput<'a> {
+    pub data: &'a [u64],
+    pub stride: u64,
+    pub col_start: u64,
+    pub col_end: u64,
+    pub log_height: u64,
+}
+
+/// Build the whole mixed-height MMCS tree on the GPU from ROW-MAJOR ext3
+/// matrices and return its root — the aux twin of [`commit_mixed_row_major_root`].
+pub fn commit_mixed_ext3_row_major_root(inputs: &[MmcsExt3RowMajorInput]) -> Result<[u8; 32]> {
+    let be = backend()?;
+    let stream = be.next_stream();
+
+    let h_max = inputs.iter().map(|m| m.log_height).max().unwrap_or(0);
+    let mut group_digests: Vec<Option<CudaSlice<u8>>> = (0..=h_max).map(|_| None).collect();
+
+    let mut h = h_max;
+    while h >= 1 {
+        if inputs.iter().any(|m| m.log_height == h) {
+            let mut hasher = MmcsGroupHasher::new(&stream, h)?;
+            for m in inputs.iter().filter(|m| m.log_height == h) {
+                let dev = stream.clone_htod(m.data)?;
+                hasher.absorb_ext3_row_major(&stream, &dev, m.stride, m.col_start, m.col_end)?;
                 drop(dev);
             }
             group_digests[h as usize] = Some(hasher.finalize(&stream)?);

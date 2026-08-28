@@ -500,6 +500,47 @@ where
         transcript.append_bytes(&root);
     }
 
+    // GPU cross-check (3c): the device row-major ext3 MMCS must build the same
+    // aux-round root the host did (Retain + Goldilocks-ext3 + GPU, else inert).
+    #[cfg(feature = "cuda")]
+    if let Some(aux_root_val) = aux_root {
+        use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
+        use std::any::TypeId;
+        if TypeId::of::<FieldExtension>() == TypeId::of::<Degree3GoldilocksExtensionField>() {
+            let mut raws: Vec<(Vec<u64>, u64, u64)> = Vec::new();
+            for table in 0..num_tables {
+                if let Some((data, aux_cols)) = &retained_aux[table] {
+                    // SAFETY: FieldExtension == Degree3Goldilocks (checked), a
+                    // contiguous `[u64; 3]` per element — same cast as
+                    // `gpu_lde::columns_to_u64_ext3`.
+                    let raw: Vec<u64> = unsafe {
+                        std::slice::from_raw_parts(data.as_ptr() as *const u64, data.len() * 3)
+                    }
+                    .to_vec();
+                    raws.push((raw, *aux_cols as u64, shape.heights[table] as u64));
+                }
+            }
+            if !raws.is_empty() {
+                let inputs: Vec<math_cuda::mmcs::MmcsExt3RowMajorInput> = raws
+                    .iter()
+                    .map(|(d, stride, h)| math_cuda::mmcs::MmcsExt3RowMajorInput {
+                        data: d.as_slice(),
+                        stride: *stride,
+                        col_start: 0,
+                        col_end: *stride,
+                        log_height: *h,
+                    })
+                    .collect();
+                if let Ok(dev_root) = math_cuda::mmcs::commit_mixed_ext3_row_major_root(&inputs) {
+                    debug_assert_eq!(
+                        dev_root, aux_root_val,
+                        "device aux-round MMCS root must equal the host root"
+                    );
+                }
+            }
+        }
+    }
+
     // =====================================================================
     // Phase 3 — bus contributions, beta per table, the composition-parts round
     // =====================================================================
@@ -593,6 +634,64 @@ where
     let parts_mmcs = parts_builder.finish();
     let parts_root = parts_mmcs.root();
     transcript.append_bytes(&parts_root);
+
+    // GPU cross-check (3c): the device ext3 mixed-height MMCS must build the same
+    // parts-round root the host did. Parts are always retained; the field is
+    // Goldilocks-ext3 and there is a GPU, or this is inert.
+    #[cfg(feature = "cuda")]
+    {
+        use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
+        use std::any::TypeId;
+        if TypeId::of::<FieldExtension>() == TypeId::of::<Degree3GoldilocksExtensionField>() {
+            let mut slabs: Vec<(Vec<u64>, u64, u64, u64)> = Vec::new();
+            let mut all_present = true;
+            for table in 0..num_tables {
+                let parts = &retained_parts[table];
+                if parts.is_empty() || parts[0].is_empty() {
+                    all_present = false;
+                    break;
+                }
+                let num_parts = parts.len();
+                let num_rows = parts[0].len();
+                let mut slab = vec![0u64; num_parts * 3 * num_rows];
+                for (p, col) in parts.iter().enumerate() {
+                    for (row, elem) in col.iter().enumerate() {
+                        // SAFETY: FieldExtension == Degree3Goldilocks (checked),
+                        // whose value is `[u64; 3]` — same cast as
+                        // `gpu_lde::columns_to_u64_ext3`.
+                        let comps =
+                            unsafe { std::slice::from_raw_parts(elem.value() as *const _ as *const u64, 3) };
+                        for (k, &c) in comps.iter().enumerate() {
+                            slab[(p * 3 + k) * num_rows + row] = c;
+                        }
+                    }
+                }
+                slabs.push((
+                    slab,
+                    num_rows as u64,
+                    num_parts as u64,
+                    shape.heights[table] as u64,
+                ));
+            }
+            if all_present && !slabs.is_empty() {
+                let inputs: Vec<math_cuda::mmcs::MmcsExt3SlabInput> = slabs
+                    .iter()
+                    .map(|(d, col_stride, num_parts, h)| math_cuda::mmcs::MmcsExt3SlabInput {
+                        data: d.as_slice(),
+                        col_stride: *col_stride,
+                        num_parts: *num_parts,
+                        log_height: *h,
+                    })
+                    .collect();
+                if let Ok(dev_root) = math_cuda::mmcs::commit_mixed_ext3_slabs_root(&inputs) {
+                    debug_assert_eq!(
+                        dev_root, parts_root,
+                        "device parts-round MMCS root must equal the host root"
+                    );
+                }
+            }
+        }
+    }
 
     // =====================================================================
     // Phase 4 — z per table, OOD evaluations
