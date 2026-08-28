@@ -214,7 +214,7 @@ pub fn felts_from_bytes(bytes: &[u8]) -> Vec<FE> {
 /// not BE a `StarkHash::Batched` — and the algebraic configurations could not be
 /// expressed at all. Taking the identical bytes through the weaker bound is what
 /// makes them expressible without widening a trait the whole workspace shares.
-fn element_felts<F>(e: &FieldElement<F>, out: &mut Vec<FE>)
+pub(crate) fn element_felts<F>(e: &FieldElement<F>, out: &mut Vec<FE>)
 where
     F: IsField,
     FieldElement<F>: AsBytes,

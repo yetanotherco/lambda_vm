@@ -1286,7 +1286,14 @@ pub(super) fn aggregator_program(
 /// constants at emit time), and the statement bytes (every field an
 /// emit-time constant of the block).
 pub(super) struct RealGlobal {
-    pub(super) statement_bytes: Vec<u8>,
+    /// ⚠ ONE ENTRY PER HOST `append_bytes` CALL, not one flat run.
+    /// `absorb_continuation_global_statement` makes a separate call for the
+    /// tag, the ELF digest, the epoch count, the private-page count, the FRI
+    /// byte, the page-base count and each page base. A byte transcript
+    /// concatenates and cannot tell one long field from that sequence; an
+    /// ALGEBRAIC one length-prefixes every call and can, so a flattened
+    /// statement is a different chain.
+    pub(super) statement_appends: Vec<Vec<u8>>,
     pub(super) tables: Vec<super::epoch_tests::HostTable>,
     pub(super) legs: Vec<super::epoch_verify_tests::TableLegs>,
     pub(super) num_l2g: usize,
@@ -1342,15 +1349,16 @@ pub(super) fn real_global(
     // (the seed below absorbs through the production function; the leg's
     // emitted challenges must then match the harvested ones, which fails if
     // this local encoding ever drifts).
-    let mut statement_bytes = Vec::new();
-    statement_bytes.extend_from_slice(crate::statement::CONTINUATION_GLOBAL_TAG);
-    statement_bytes.extend_from_slice(&crate::statement::elf_digest(elf_bytes));
-    statement_bytes.extend_from_slice(&(num_epochs as u64).to_le_bytes());
-    statement_bytes.extend_from_slice(&(npriv as u64).to_le_bytes());
-    statement_bytes.push(opts.fri_final_poly_log_degree);
-    statement_bytes.extend_from_slice(&(page_bases.len() as u64).to_le_bytes());
+    let mut statement_appends: Vec<Vec<u8>> = vec![
+        crate::statement::CONTINUATION_GLOBAL_TAG.to_vec(),
+        crate::statement::elf_digest(elf_bytes).to_vec(),
+        (num_epochs as u64).to_le_bytes().to_vec(),
+        (npriv as u64).to_le_bytes().to_vec(),
+        vec![opts.fri_final_poly_log_degree],
+        (page_bases.len() as u64).to_le_bytes().to_vec(),
+    ];
     for base in &page_bases {
-        statement_bytes.extend_from_slice(&u64::to_le_bytes(*base));
+        statement_appends.push(u64::to_le_bytes(*base).to_vec());
     }
 
     let seed = || {
@@ -1417,7 +1425,7 @@ pub(super) fn real_global(
         .collect();
 
     RealGlobal {
-        statement_bytes,
+        statement_appends,
         tables,
         legs,
         num_l2g: num_epochs,
@@ -1479,9 +1487,11 @@ pub(super) fn global_verifier_program(g: &RealGlobal) -> LfmProgram {
         })
         .collect();
 
-    // ---- the statement: one constant run ----
+    // ---- the statement: ONE APPEND PER HOST CALL, see `statement_appends` ----
     let mut t = TranscriptReplay::new(&[]);
-    t.append_const_bytes(&g.statement_bytes);
+    for append in &g.statement_appends {
+        t.append_const_bytes(append);
+    }
 
     // ---- Phase A: prep constants, hinted main roots ----
     let main_cells: Vec<RootCells> = (0..n)
@@ -1493,7 +1503,14 @@ pub(super) fn global_verifier_program(g: &RealGlobal) -> LfmProgram {
             )
         })
         .collect();
-    let main_halves: Vec<Vec<Felt>> = main_cells.iter().map(RootCells::lanes_flat).collect();
+    // ⚠ `byte_halves`, not `lanes_flat`: Phase A absorbs a root through
+    // `append_halves_misaligned`, whose byte length is `4 · halves.len()`, and
+    // the host absorbs the root's THIRTY-TWO bytes in one `append_bytes`. On an
+    // algebraic arm `lanes_flat` is four FULL FELTS, so that call would declare
+    // sixteen bytes where the host declared thirty-two — a different length
+    // prefix and a different payload, hence a different chain from the first
+    // root onward. `byte_halves` is the same eight on both arms.
+    let main_halves: Vec<Vec<Felt>> = main_cells.iter().map(|c| c.byte_halves(&mut b)).collect();
     let prep_cells: Vec<Option<RootCells>> = g
         .tables
         .iter()
