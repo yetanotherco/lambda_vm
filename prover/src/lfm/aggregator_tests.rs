@@ -1508,9 +1508,14 @@ pub(super) fn global_verifier_program(g: &RealGlobal) -> LfmProgram {
     // the host absorbs the root's THIRTY-TWO bytes in one `append_bytes`. On an
     // algebraic arm `lanes_flat` is four FULL FELTS, so that call would declare
     // sixteen bytes where the host declared thirty-two — a different length
-    // prefix and a different payload, hence a different chain from the first
-    // root onward. `byte_halves` is the same eight on both arms.
-    let main_halves: Vec<Vec<Felt>> = main_cells.iter().map(|c| c.byte_halves(&mut b)).collect();
+    // ⚠ The DIGEST's felts, not the root's bytes. `replay_phase_a` absorbs
+    // through `absorb_root_felts`, which declares the host's 32 bytes on both
+    // arms and packs the algebraic arm's four felts into the one digest cell
+    // they already are — so the root absorb CANCELS there rather than paying a
+    // byte regrouping. `byte_halves` is for `program_id`, which is deliberately
+    // keccak-over-bytes; handing it here would regroup felts the host never
+    // serialised.
+    let main_halves: Vec<Vec<Felt>> = main_cells.iter().map(RootCells::lanes_flat).collect();
     let prep_cells: Vec<Option<RootCells>> = g
         .tables
         .iter()
