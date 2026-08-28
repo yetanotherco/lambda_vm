@@ -80,15 +80,20 @@ fn the_machine_transcript_tracks_the_host_absorb_for_absorb() {
         let mut host = AlgebraicTranscript::new(H::KIND);
         let mut want: Vec<LfmWord> = Vec::new();
         let mut steps: Vec<String> = Vec::new();
-        let mut record = |host: &AlgebraicTranscript, want: &mut Vec<LfmWord>, label: &str| {
+        fn record(
+            host: &AlgebraicTranscript,
+            want: &mut Vec<LfmWord>,
+            steps: &mut Vec<String>,
+            label: &str,
+        ) {
             want.push(host.state_word());
             steps.push(label.to_string());
-        };
+        }
 
         // `TranscriptReplay::new(seed)` absorbs the seed as its first append,
         // and `AlgebraicTranscript::with_seed` is `new` plus that same call.
         host.append_bytes(&[]);
-        record(&host, &mut want, "seed (empty)");
+        record(&host, &mut want, &mut steps, "seed (empty)");
 
         // Const byte strings across the cell-grouping boundary in both
         // directions — 32 bytes is one payload cell, so 31/32/33 straddle it,
@@ -107,17 +112,17 @@ fn the_machine_transcript_tracks_the_host_absorb_for_absorb() {
         ];
         for c in &consts {
             host.append_bytes(c);
-            record(&host, &mut want, &format!("const bytes len {}", c.len()));
+            record(&host, &mut want, &mut steps, &format!("const bytes len {}", c.len()));
         }
 
         host.append_bytes(&root);
-        record(&host, &mut want, "root (32 bytes)");
+        record(&host, &mut want, &mut steps, "root (32 bytes)");
 
         host.append_bytes(&felt_bytes(felt_v));
-        record(&host, &mut want, "felt");
+        record(&host, &mut want, &mut steps, "felt");
 
         host.append_field_element(&ext_v);
-        record(&host, &mut want, "ext");
+        record(&host, &mut want, &mut steps, "ext");
 
         // ★ The PHASE A path: a root absorbed through the halves family rather
         // than through `append_root_cells`. `replay_phase_a` takes its roots as
@@ -127,7 +132,25 @@ fn the_machine_transcript_tracks_the_host_absorb_for_absorb() {
         // `RootCells::lanes_flat` gives four FULL FELTS on the algebraic arm,
         // declaring sixteen bytes where the host declared thirty-two.
         host.append_bytes(&root);
-        record(&host, &mut want, "root via the Phase A halves path");
+        record(&host, &mut want, &mut steps, "root via the Phase A halves path");
+
+        // ★ SQUEEZES. `sample_ext` is where every shared challenge comes from —
+        // the LogUp pair, every beta, every z, every gamma — so the first
+        // challenge a spine draws is one of these. Its host counterpart is
+        // unambiguous (`sample_field_element`, one squeezed cell read as lanes
+        // 0-2), unlike `sample()`, which the algebraic arm DEFINES rather than
+        // mirrors and which is therefore still out of scope here.
+        //
+        // Both the drawn VALUE and the state after it, because they fail
+        // differently: a wrong value with a right state is a read of the wrong
+        // lanes, a right value with a wrong state is a wrong advance, and only
+        // the second corrupts everything downstream.
+        for k in 0..3 {
+            let e = host.sample_field_element();
+            want.push(ext_word(&e));
+            steps.push(format!("sample_ext {k} — the drawn value"));
+            record(&host, &mut want, &mut steps, &format!("sample_ext {k} — the state after"));
+        }
 
         // ---- the machine chain, same script ----
         let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::Algebraic);
@@ -160,6 +183,12 @@ fn the_machine_transcript_tracks_the_host_absorb_for_absorb() {
         let phase_a_halves = root_cells.halves(&mut b);
         t.append_halves_misaligned(&phase_a_halves);
         publish(&mut b, &mut t);
+
+        for _ in 0..3 {
+            let e = t.sample_ext(&mut b);
+            b.public(e.as_cell());
+            publish(&mut b, &mut t);
+        }
 
         let program = compile(b.finish());
         let mut arenas = vec![vec![root_word, base_word(felt_v), ext_word(&ext_v)]];
