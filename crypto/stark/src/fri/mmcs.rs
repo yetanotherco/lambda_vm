@@ -310,20 +310,33 @@ where
     <H::Batched<E> as IsMerkleTreeBackend>::hash_data(&buf)
 }
 
-/// Verifier-side analogue of [`hash_group_leaf`]: hash the opened row pairs of a
-/// group of openings (in the given order) into one digest.
-fn hash_group_openings<E, H>(group: &[&PolynomialOpenings<E>]) -> Commitment
-where
-    E: IsField + 'static,
-    H: StarkHash,
-    FieldElement<E>: AsBytes + Sync + Send,
-{
+/// ★ The ELEMENT SEQUENCE one group leaf covers, in hashing order: per matrix,
+/// all of `evaluations` and then all of `evaluations_sym`, matrices in the
+/// group's given (round INPUT) order.
+///
+/// Split out of [`hash_group_openings`], its only production caller, so a
+/// differential can compare the SEQUENCE two implementations feed rather than
+/// only the digests they end up disagreeing on. A digest differential says THAT
+/// a re-derivation disagrees; this says WHERE. Callers must not restate the
+/// order themselves — that is the point of exporting it.
+pub fn group_opening_felts<E: IsField>(group: &[&PolynomialOpenings<E>]) -> Vec<FieldElement<E>> {
     let mut buf: Vec<FieldElement<E>> = Vec::new();
     for o in group {
         buf.extend_from_slice(&o.evaluations);
         buf.extend_from_slice(&o.evaluations_sym);
     }
-    <H::Batched<E> as IsMerkleTreeBackend>::hash_data(&buf)
+    buf
+}
+
+/// Verifier-side analogue of [`hash_group_leaf`]: hash the opened row pairs of a
+/// group of openings (in the given order) into one digest.
+pub fn hash_group_openings<E, H>(group: &[&PolynomialOpenings<E>]) -> Commitment
+where
+    E: IsField + 'static,
+    H: StarkHash,
+    FieldElement<E>: AsBytes + Sync + Send,
+{
+    <H::Batched<E> as IsMerkleTreeBackend>::hash_data(&group_opening_felts(group))
 }
 
 #[inline]

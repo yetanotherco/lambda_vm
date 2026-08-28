@@ -79,6 +79,11 @@ pub use word::{LfmWord, base_word, ext_word, pack_digest, unpack_digest};
 
 #[cfg(test)]
 mod aggregator_tests;
+// The algebraic `StarkHash` configurations this differential drives the host
+// with are `#[cfg(not(feature = "cuda"))]` — inexpressible under cuda, by
+// design — so the gate follows them rather than failing to compile there.
+#[cfg(all(test, not(feature = "cuda")))]
+mod group_leaf_tests;
 #[cfg(test)]
 mod blake3_chip_tests;
 #[cfg(test)]
