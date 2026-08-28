@@ -841,7 +841,11 @@ where
     E: IsField + 'static,
 {
     let n = domain.interpolation_domain_size;
-    let bf = domain.blowup_factor;
+    // The read stride is the TABLE's own blowup, not the domain's: the per-table
+    // path hands an LDE at the domain blowup (so these agree), and the batched
+    // phase 4 hands a blowup-1 table that IS the stride subsample already —
+    // same values, a quarter the buffer.
+    let bf = lde_trace.blowup_factor;
     let num_main_cols = lde_trace.num_main_cols();
     let num_aux_cols = lde_trace.num_aux_cols();
     let table_width = num_main_cols + num_aux_cols;

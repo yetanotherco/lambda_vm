@@ -188,7 +188,7 @@ fn precomputed_tree_cache()
     CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
 
-fn precomputed_tree_cache_get<F: IsField + 'static>(
+pub(crate) fn precomputed_tree_cache_get<F: IsField + 'static>(
     root: &Commitment,
 ) -> Option<Arc<BatchedMerkleTree<F>>>
 where
@@ -201,7 +201,7 @@ where
         .and_then(|any| any.downcast::<BatchedMerkleTree<F>>().ok())
 }
 
-fn precomputed_tree_cache_put<F: IsField + 'static>(
+pub(crate) fn precomputed_tree_cache_put<F: IsField + 'static>(
     root: Commitment,
     tree: Arc<BatchedMerkleTree<F>>,
 ) where
@@ -397,6 +397,9 @@ pub(crate) struct LdeTwiddles<F: IsFFTField> {
     /// `two_half_fwd` size-`n·blowup` forward.
     two_half_inv: TwoHalfTwiddles<F>,
     two_half_fwd: TwoHalfTwiddles<F>,
+    /// Size-`n` FORWARD set, built lazily — only the batched phase-4 coset
+    /// evaluation wants it (a full LDE's forward set is size `n·blowup`).
+    two_half_fwd_n: OnceLock<TwoHalfTwiddles<F>>,
     coset_weights: Vec<FieldElement<F>>,
     /// Composition half-extension cache, initialized only when the degree-2
     /// decomposition path actually runs on CPU.
@@ -477,10 +480,19 @@ impl<F: IsFFTField> LdeTwiddles<F> {
                 .expect("valid inverse two-half twiddles"),
             two_half_fwd: TwoHalfTwiddles::<F>::new(lde_size.trailing_zeros() as usize, false)
                 .expect("valid forward two-half twiddles"),
+            two_half_fwd_n: OnceLock::new(),
             coset_weights,
             composition: OnceLock::new(),
             inv_2x: OnceLock::new(),
         }
+    }
+
+    /// The size-`n` forward set for the phase-4 coset evaluation, built once.
+    pub(crate) fn fwd_n(&self, domain_size: usize) -> &TwoHalfTwiddles<F> {
+        self.two_half_fwd_n.get_or_init(|| {
+            TwoHalfTwiddles::<F>::new(domain_size.trailing_zeros() as usize, false)
+                .expect("valid size-n forward two-half twiddles")
+        })
     }
 
     fn composition(&self, domain: &Domain<F>) -> &CompositionLdeTwiddles<F> {
@@ -537,7 +549,10 @@ fn domain_twiddle_cache() -> &'static std::sync::Mutex<
     CACHE.get_or_init(Default::default)
 }
 
-fn domain_and_twiddles<F, A>(air: &A, trace_length: usize) -> (Arc<Domain<F>>, Arc<LdeTwiddles<F>>)
+pub(crate) fn domain_and_twiddles<F, A>(
+    air: &A,
+    trace_length: usize,
+) -> (Arc<Domain<F>>, Arc<LdeTwiddles<F>>)
 where
     F: IsFFTField + 'static,
     FieldElement<F>: Send + Sync,
@@ -808,12 +823,33 @@ where
     pub(crate) gpu_composition_tree: Option<math_cuda::lde::GpuMerkleTree>,
 }
 
+/// The composition-polynomial parts, before any commitment is taken over them.
+///
+/// Returned by [`IsStarkProver::compute_composition_parts`], which round 2 and
+/// the batched prover share. The device handle rides along rather than being
+/// installed on the `Round1` inside, because the two callers install it at
+/// different points: round 2 folds it into the table's own LDE session, the
+/// batched prover keeps every table's parts alive only until they have been
+/// absorbed into the epoch's MMCS.
+pub(crate) struct CompositionParts<F: IsField + 'static>
+where
+    FieldElement<F>: AsBytes + Sync + Send,
+{
+    pub(crate) parts: Vec<Vec<FieldElement<F>>>,
+    #[cfg(feature = "cuda")]
+    pub(crate) gpu_parts: Option<math_cuda::lde::GpuLdeExt3>,
+    #[cfg(feature = "instruments")]
+    pub(crate) constraints_dur: Duration,
+    #[cfg(feature = "instruments")]
+    pub(crate) fft_dur: Duration,
+}
+
 /// A container for the results of the third round of the STARK Prove protocol.
 pub(crate) struct Round3<F: IsField> {
     /// Evaluations of the trace polynomials, main and auxiliary, at the out-of-domain challenge.
-    trace_ood_evaluations: Table<F>,
+    pub(crate) trace_ood_evaluations: Table<F>,
     /// Evaluations of the composition polynomial parts at the out-of-domain challenge.
-    composition_poly_parts_ood_evaluation: Vec<FieldElement<F>>,
+    pub(crate) composition_poly_parts_ood_evaluation: Vec<FieldElement<F>>,
 }
 
 /// A container for the results of the fourth round of the STARK Prove protocol.
@@ -1387,6 +1423,129 @@ pub trait IsStarkProver<
         Ok((commit, (main_data, total_cols)))
     }
 
+    /// Expand a table's main trace to its coset LDE, row-major, without
+    /// building any Merkle tree.
+    ///
+    /// The Round-1 CPU commit and the `ResidencyMode::RecomputeLde` recompute
+    /// both go through here, which is what makes the recomputed buffer
+    /// bit-identical to the one the tree was built from — identical by
+    /// construction rather than by argument. The twiddles are process-cached,
+    /// so the second call re-runs the NTT over the same inputs.
+    fn expand_main_lde_row_major(
+        trace: &TraceTable<Field, FieldExtension>,
+        domain: &Domain<Field>,
+        twiddles: &LdeTwiddles<Field>,
+        #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
+    ) -> (Vec<FieldElement<Field>>, usize) {
+        let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
+        let (trace_data, total_cols) = trace.main_data_row_major();
+
+        let mut main_data: Vec<FieldElement<Field>> = Vec::with_capacity(lde_size * total_cols);
+        main_data.extend_from_slice(trace_data);
+
+        #[cfg(feature = "disk-spill")]
+        if storage_mode == StorageMode::Disk {
+            trace.main_table.advise_drop_cache();
+        }
+
+        Polynomial::<FieldElement<Field>>::coset_lde_full_expand_row_major::<Field>(
+            &mut main_data,
+            total_cols,
+            domain.blowup_factor,
+            &twiddles.coset_weights,
+            &twiddles.two_half_inv,
+            &twiddles.two_half_fwd,
+        )
+        .expect("row-major coset LDE expansion");
+
+        (main_data, total_cols)
+    }
+
+    /// The MAIN trace's size-`n` coset evaluation, row-major — the stride-
+    /// `blowup` subsample of [`Self::expand_main_lde_row_major`]'s output,
+    /// computed directly: iFFT(n) → coset weights → FFT(n), about 37% of a
+    /// full expansion's work and a quarter of its bytes. Values are
+    /// bit-identical to the subsample (exact modular arithmetic; both compute
+    /// the same DFT), which is what the batched phase 4 reads and ALL it
+    /// reads.
+    fn expand_main_coset_eval_row_major(
+        trace: &TraceTable<Field, FieldExtension>,
+        domain: &Domain<Field>,
+        twiddles: &LdeTwiddles<Field>,
+    ) -> (Vec<FieldElement<Field>>, usize) {
+        let (trace_data, total_cols) = trace.main_data_row_major();
+        let mut main_data: Vec<FieldElement<Field>> = Vec::with_capacity(trace_data.len());
+        main_data.extend_from_slice(trace_data);
+        Polynomial::<FieldElement<Field>>::coset_lde_full_expand_row_major::<Field>(
+            &mut main_data,
+            total_cols,
+            1,
+            &twiddles.coset_weights,
+            &twiddles.two_half_inv,
+            twiddles.fwd_n(domain.interpolation_domain_size),
+        )
+        .expect("row-major coset evaluation");
+        (main_data, total_cols)
+    }
+
+    /// The AUX counterpart of [`Self::expand_main_coset_eval_row_major`].
+    fn expand_aux_coset_eval_row_major(
+        trace: &TraceTable<Field, FieldExtension>,
+        domain: &Domain<Field>,
+        twiddles: &LdeTwiddles<Field>,
+    ) -> (Vec<FieldElement<FieldExtension>>, usize) {
+        let (trace_data, total_cols) = trace.aux_data_row_major();
+        let mut aux_data: Vec<FieldElement<FieldExtension>> = Vec::with_capacity(trace_data.len());
+        aux_data.extend_from_slice(trace_data);
+        Polynomial::<FieldElement<FieldExtension>>::coset_lde_full_expand_row_major::<Field>(
+            &mut aux_data,
+            total_cols,
+            1,
+            &twiddles.coset_weights,
+            &twiddles.two_half_inv,
+            twiddles.fwd_n(domain.interpolation_domain_size),
+        )
+        .expect("row-major aux coset evaluation");
+        (aux_data, total_cols)
+    }
+
+    /// Expand a table's auxiliary trace to its coset LDE, row-major, without
+    /// building any Merkle tree — the aux counterpart of
+    /// [`Self::expand_main_lde_row_major`], and extracted for the same reason:
+    /// the batched prover rebuilds this buffer once per phase instead of
+    /// retaining it, and a second expansion written elsewhere would be a second
+    /// encoding of the committed one.
+    fn expand_aux_lde_row_major(
+        trace: &TraceTable<Field, FieldExtension>,
+        domain: &Domain<Field>,
+        twiddles: &LdeTwiddles<Field>,
+        #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
+    ) -> (Vec<FieldElement<FieldExtension>>, usize) {
+        let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
+        let (trace_data, total_cols) = trace.aux_data_row_major();
+
+        let mut aux_data: Vec<FieldElement<FieldExtension>> =
+            Vec::with_capacity(lde_size * total_cols);
+        aux_data.extend_from_slice(trace_data);
+
+        #[cfg(feature = "disk-spill")]
+        if storage_mode == StorageMode::Disk {
+            trace.aux_table.advise_drop_cache();
+        }
+
+        Polynomial::<FieldElement<FieldExtension>>::coset_lde_full_expand_row_major::<Field>(
+            &mut aux_data,
+            total_cols,
+            domain.blowup_factor,
+            &twiddles.coset_weights,
+            &twiddles.two_half_inv,
+            &twiddles.two_half_fwd,
+        )
+        .expect("row-major aux coset LDE expansion");
+
+        (aux_data, total_cols)
+    }
+
     /// Spill a committed Merkle tree to disk when `storage_mode` is `Disk`,
     /// tagging any I/O error with `label`. No-op otherwise. Shared by every commit
     /// site (main / preprocessed split / aux).
@@ -1624,6 +1783,249 @@ pub trait IsStarkProver<
             &twiddles.fwd,
         )
         .expect("coset extension")
+    }
+
+    /// The evaluations of the composition-polynomial parts over the LDE domain,
+    /// and nothing else — no commitment.
+    ///
+    /// This is the half of round 2 that the batched path shares with the
+    /// per-table one. Round 2 commits each table's parts to its own Merkle tree;
+    /// [`crate::batched::prover::multi_prove_batched`] streams every table's
+    /// parts into one mixed-height MMCS instead. Both need the same parts, and
+    /// the arm selection (`number_of_parts` 1 / 2 / d>2, the device paths and
+    /// their fallbacks) is intricate enough that a second copy would drift — so
+    /// there is one function, and the commitment is what differs.
+    #[allow(clippy::too_many_arguments)]
+    fn compute_composition_parts(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        pub_inputs: &PI,
+        domain: &Domain<Field>,
+        twiddles: &LdeTwiddles<Field>,
+        // `&mut` for the device-only recovery below: when the host evaluator is
+        // reached on a device-resident trace, the LDEs are downloaded back into
+        // the host buffers in place rather than aborting the table.
+        lde_trace: &mut LDETraceTable<Field, FieldExtension>,
+        rap_challenges: &[FieldElement<FieldExtension>],
+        bus_public_inputs: Option<&BusPublicInputs<FieldExtension>>,
+        transition_coefficients: &[FieldElement<FieldExtension>],
+        boundary_coefficients: &[FieldElement<FieldExtension>],
+    ) -> Result<CompositionParts<FieldExtension>, ProvingError>
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+    {
+        // Compute the evaluations of the composition polynomial on the LDE domain.
+        let trace_length = domain.interpolation_domain_size;
+        let evaluator = ConstraintEvaluator::new(
+            air,
+            pub_inputs,
+            rap_challenges,
+            bus_public_inputs,
+            trace_length,
+        );
+        let number_of_parts = air.composition_poly_degree_bound(trace_length) / trace_length;
+
+        #[cfg(feature = "instruments")]
+        let t_sub = Instant::now();
+        #[cfg(feature = "cuda")]
+        let mut gpu_composition_parts: Option<math_cuda::lde::GpuLdeExt3> = None;
+
+        // Fully device-resident d=2 path: H stays on device through decompose +
+        // half extension, and the parts handle feeds the commit tree, R3 OOD,
+        // R4 DEEP and the openings. The evaluations are drained to host only
+        // while a host trace copy exists (fallback consumers); under
+        // device-only nothing leaves the device and the placeholders below
+        // stay empty. Any miss falls through to the host path (downloading H
+        // when the evaluation itself already ran on device).
+        #[cfg(feature = "cuda")]
+        let mut precomputed_parts: Option<Vec<Vec<FieldElement<FieldExtension>>>> = None;
+        // A downloaded `H` awaiting the host decompose: produced under the
+        // lock below, consumed after it — the host iFFT + LDEs are pure CPU
+        // work and must not serialize other tables' device windows.
+        #[cfg(feature = "cuda")]
+        let mut downloaded_h: Option<Vec<FieldElement<FieldExtension>>> = None;
+        #[cfg(feature = "cuda")]
+        if number_of_parts == 2 && !crate::gpu_lde::gpu_force_downgrade() {
+            // Serializing this window across tables (device constraint eval +
+            // decompose, where H is born) empirically eliminates a transient
+            // whole-buffer H corruption seen under concurrent R2 windows on
+            // VRAM pressure. What the guard orders is submission: a
+            // device-only table's window is enqueue-only, so its kernels may
+            // still overlap another table's on device. The commit, the host
+            // decompose of a downloaded `H` and every host arm run outside
+            // the lock. The force-downgrade test hook skips this fast path so
+            // every device-only table exercises the host recovery below.
+            let _r2_serial_guard = crate::gpu_lde::r2_serialize_guard();
+            if let Some(h_dev) = evaluator.evaluate_dev(
+                air,
+                lde_trace,
+                domain,
+                transition_coefficients,
+                boundary_coefficients,
+                rap_challenges,
+            ) {
+                match crate::gpu_lde::try_decompose_extend_d2_dev::<Field, FieldExtension>(
+                    &h_dev,
+                    twiddles.inv_2x(domain),
+                    &twiddles.composition(domain).weights,
+                    !lde_trace.host_trace_empty(),
+                ) {
+                    Some((parts, handle)) => {
+                        gpu_composition_parts = Some(handle);
+                        precomputed_parts = Some(parts);
+                    }
+                    None => {
+                        downloaded_h =
+                            crate::gpu_lde::download_comp_h_to_field::<FieldExtension>(&h_dev);
+                    }
+                }
+            }
+        }
+        #[cfg(feature = "cuda")]
+        if let Some(h) = downloaded_h.take() {
+            precomputed_parts = Some(Self::decompose_and_extend_d2(&h, domain, twiddles));
+        }
+        #[cfg(not(feature = "cuda"))]
+        let precomputed_parts: Option<Vec<Vec<FieldElement<FieldExtension>>>> = None;
+
+        #[cfg(feature = "instruments")]
+        let constraints_dur = t_sub.elapsed();
+        #[cfg(feature = "instruments")]
+        let t_sub = Instant::now();
+
+        // Every arm below runs the HOST evaluator, which reads `get_main` /
+        // `get_aux`. Under device-only those buffers are intentionally empty,
+        // so landing here means the device decompose AND the `H` download both
+        // failed. The gate is a static predicate and cannot mirror every
+        // dynamic decline, so recover rather than abort: download the resident
+        // LDEs into the host buffers (which also clears the device-only flag)
+        // and let the host arms run — slower for this table, never wrong. The
+        // assert is left for the case where the handles themselves cannot
+        // serve the data, so that failure carries the device-only contract's
+        // message rather than a bare index-out-of-bounds from somewhere inside
+        // the evaluator.
+        #[cfg(feature = "cuda")]
+        if precomputed_parts.is_none() && lde_trace.host_trace_empty() {
+            let recovered = crate::gpu_lde::materialize_lde_trace_host(lde_trace);
+            if recovered {
+                // Rare by design; the name tells which condition the gate is
+                // missing so it can be mirrored as an optimization.
+                eprintln!(
+                    "[gpu] device-only downgrade: table={} n={} num_parts={} \
+                     (device R2 path declined; continuing on host)",
+                    air.name(),
+                    trace_length,
+                    number_of_parts,
+                );
+            }
+            assert!(
+                recovered,
+                "R2 composition fell back to the host evaluator on a device-only \
+                 trace and the resident handles could not be downloaded: \
+                 table={} n={} num_parts={} main_cols={} aux_cols={}",
+                air.name(),
+                trace_length,
+                number_of_parts,
+                lde_trace.num_main_cols(),
+                lde_trace.num_aux_cols(),
+            );
+        }
+
+        let lde_composition_poly_parts_evaluations = if let Some(parts) = precomputed_parts {
+            parts
+        } else if number_of_parts == 2 {
+            // Direct quotient decomposition: avoid full-size iFFT by algebraically
+            // splitting H(x) = H₀(x²) + x·H₁(x²) using:
+            //   H₀(x²) = (H(x) + H(-x)) / 2
+            //   H₁(x²) = (H(x) - H(-x)) / (2x)
+            // On the LDE coset {g·ω^i}, we have -g·ω^i = g·ω^{i+N} since ω^N = -1.
+            let constraint_evaluations = evaluator.evaluate(
+                air,
+                lde_trace,
+                domain,
+                transition_coefficients,
+                boundary_coefficients,
+                rap_challenges,
+            );
+            Self::decompose_and_extend_d2(&constraint_evaluations, domain, twiddles)
+        } else if number_of_parts == 1 {
+            // Degree bound equals trace length: constraint evals are the LDE directly.
+            vec![evaluator.evaluate(
+                air,
+                lde_trace,
+                domain,
+                transition_coefficients,
+                boundary_coefficients,
+                rap_challenges,
+            )]
+        } else {
+            // Fallback for any future AIR with d > 2.
+            let constraint_evaluations = evaluator.evaluate(
+                air,
+                lde_trace,
+                domain,
+                transition_coefficients,
+                boundary_coefficients,
+                rap_challenges,
+            );
+            let composition_poly =
+                Polynomial::interpolate_offset_fft(&constraint_evaluations, &domain.coset_offset)?;
+            let composition_poly_parts = composition_poly.break_in_parts(number_of_parts);
+
+            let cpu_eval = || -> Result<Vec<Vec<FieldElement<FieldExtension>>>, ProvingError> {
+                composition_poly_parts
+                    .iter()
+                    .map(|part| {
+                        evaluate_polynomial_on_lde_domain(
+                            part,
+                            domain.blowup_factor,
+                            domain.interpolation_domain_size,
+                            &domain.coset_offset,
+                        )
+                        .map_err(ProvingError::from)
+                    })
+                    .collect()
+            };
+
+            // GPU fast path: batched ext3 LDE for all parts in one call.
+            // `_keep` variant retains the de-interleaved device buffer as a
+            // `GpuLdeExt3` handle stored on Round2 so R4 DEEP can skip the
+            // `num_parts * 3 * lde_size * 8` byte H2D.
+            #[cfg(feature = "cuda")]
+            {
+                let parts_slices: Vec<&[FieldElement<FieldExtension>]> = composition_poly_parts
+                    .iter()
+                    .map(|p| p.coefficients.as_slice())
+                    .collect();
+                match crate::gpu_lde::try_evaluate_parts_on_lde_gpu_keep::<Field, FieldExtension>(
+                    &parts_slices,
+                    domain.blowup_factor,
+                    domain.interpolation_domain_size,
+                    &domain.coset_offset,
+                ) {
+                    Some((evals, handle)) => {
+                        gpu_composition_parts = Some(handle);
+                        evals
+                    }
+                    None => cpu_eval()?,
+                }
+            }
+            #[cfg(not(feature = "cuda"))]
+            cpu_eval()?
+        };
+
+        #[cfg(feature = "instruments")]
+        let fft_dur = t_sub.elapsed();
+
+        Ok(CompositionParts {
+            parts: lde_composition_poly_parts_evaluations,
+            #[cfg(feature = "cuda")]
+            gpu_parts: gpu_composition_parts,
+            #[cfg(feature = "instruments")]
+            constraints_dur,
+            #[cfg(feature = "instruments")]
+            fft_dur,
+        })
     }
 
     /// Returns the result of the second round of the STARK Prove protocol.
@@ -1937,15 +2339,18 @@ pub trait IsStarkProver<
     fn round_3_evaluate_polynomials_in_out_of_domain_element(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         domain: &Domain<Field>,
-        round_1_result: &mut Round1<Field, FieldExtension>,
-        round_2_result: &mut Round2<FieldExtension>,
+        // Both `&mut` for the device-only recoveries below: the parts OOD arm
+        // repopulates the host part evals from the resident handle, and the
+        // trace OOD reads through a trace that may have to be materialized.
+        lde_trace: &mut LDETraceTable<Field, FieldExtension>,
+        composition_parts: &mut [Vec<FieldElement<FieldExtension>>],
         z: &FieldElement<FieldExtension>,
     ) -> Round3<FieldExtension>
     where
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
     {
-        let num_parts = round_2_result.lde_composition_poly_evaluations.len();
+        let num_parts = composition_parts.len();
         let z_power = z.pow(num_parts);
         let domain_size = domain.interpolation_domain_size;
         let blowup_factor = domain.blowup_factor;
@@ -1961,8 +2366,7 @@ pub trait IsStarkProver<
         // the host stride-extract and the sequential CPU fold per part.
         #[cfg(feature = "cuda")]
         let gpu_parts_ood: Option<Vec<FieldElement<FieldExtension>>> =
-            round_1_result
-                .lde_trace
+            lde_trace
                 .gpu_composition_parts()
                 .and_then(|parts_dev| {
                     let dispatch = |inv_host: &[FieldElement<FieldExtension>],
@@ -1982,7 +2386,7 @@ pub trait IsStarkProver<
                     match crate::gpu_lde::try_prep_r3_dev_context::<Field, FieldExtension>(
                         &dc.points,
                         std::slice::from_ref(&z_power),
-                        round_1_result.lde_trace.bound_stream(),
+                        lde_trace.bound_stream(),
                     ) {
                         Some(ctx) => dispatch(&[], Some((&ctx, 0))),
                         // Below the dev-context threshold (single eval point):
@@ -2008,8 +2412,8 @@ pub trait IsStarkProver<
                 #[cfg(feature = "cuda")]
                 {
                     let recovered = crate::gpu_lde::materialize_composition_parts_host(
-                        &round_1_result.lde_trace,
-                        &mut round_2_result.lde_composition_poly_evaluations,
+                        lde_trace,
+                        composition_parts,
                     );
                     assert!(
                         recovered,
@@ -2020,8 +2424,7 @@ pub trait IsStarkProver<
                 }
                 let comp_inv_denoms =
                     math::polynomial::barycentric_inv_denoms(&z_power, &dc.points);
-                round_2_result
-                    .lde_composition_poly_evaluations
+                composition_parts
                     .iter()
                     .map(|lde_evals| {
                         // Extract trace-size evaluations (stride = blowup_factor)
@@ -2044,7 +2447,7 @@ pub trait IsStarkProver<
 
         // === Trace polynomials: barycentric evaluation via LDE ===
         let trace_ood_evaluations = crate::trace::get_trace_evaluations_from_lde(
-            &mut round_1_result.lde_trace,
+            lde_trace,
             domain,
             z,
             &air.context().transition_offsets,
@@ -2173,7 +2576,7 @@ pub trait IsStarkProver<
             let t_sub = Instant::now();
             let deep_evals = Self::compute_deep_composition_poly_evaluations(
                 &mut round_1_result.lde_trace,
-                round_2_result,
+                &mut round_2_result.lde_composition_poly_evaluations,
                 round_3_result,
                 z,
                 domain,
@@ -2334,8 +2737,11 @@ pub trait IsStarkProver<
 
     #[allow(clippy::too_many_arguments)]
     fn compute_deep_composition_poly_evaluations(
+        // Both `&mut` for the device-only recovery in the host DEEP loop: the
+        // trace and the part evals are downloaded back in place there rather
+        // than aborting the table.
         lde_trace: &mut LDETraceTable<Field, FieldExtension>,
-        round_2_result: &mut Round2<FieldExtension>,
+        composition_parts: &mut [Vec<FieldElement<FieldExtension>>],
         round_3_result: &Round3<FieldExtension>,
         z: &FieldElement<FieldExtension>,
         domain: &Domain<Field>,
@@ -2347,7 +2753,7 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
     {
-        let num_parts = round_2_result.lde_composition_poly_evaluations.len();
+        let num_parts = composition_parts.len();
         let z_power = z.pow(num_parts); // pole for H terms
 
         // Number of evaluation points per trace column (= transition_offsets.len() * step_size)
@@ -2396,7 +2802,7 @@ pub trait IsStarkProver<
                     crate::gpu_lde::try_deep_composition_gpu::<Field, FieldExtension>(
                         lde_trace,
                         lde_trace.gpu_composition_parts(),
-                        &round_2_result.lde_composition_poly_evaluations,
+                        composition_parts,
                         h_ood,
                         &trace_ood_columns,
                         composition_poly_gammas,
@@ -2432,7 +2838,7 @@ pub trait IsStarkProver<
                 crate::gpu_lde::try_deep_composition_gpu::<Field, FieldExtension>(
                     lde_trace,
                     lde_trace.gpu_composition_parts(),
-                    &round_2_result.lde_composition_poly_evaluations,
+                    composition_parts,
                     h_ood,
                     &trace_ood_columns,
                     composition_poly_gammas,
@@ -2464,7 +2870,7 @@ pub trait IsStarkProver<
             }
             let parts_recovered = crate::gpu_lde::materialize_composition_parts_host(
                 lde_trace,
-                &mut round_2_result.lde_composition_poly_evaluations,
+                composition_parts,
             );
             assert!(
                 parts_recovered,
@@ -2516,7 +2922,7 @@ pub trait IsStarkProver<
 
             // H terms
             for j in 0..num_parts {
-                let h_j_val = &round_2_result.lde_composition_poly_evaluations[j][i];
+                let h_j_val = &composition_parts[j][i];
                 let h_j_ood = &h_ood[j];
                 result += &composition_poly_gammas[j] * (h_j_val - h_j_ood) * &inv_h[i];
             }
@@ -4435,8 +4841,8 @@ pub trait IsStarkProver<
         let round_3_result = Self::round_3_evaluate_polynomials_in_out_of_domain_element(
             air,
             domain,
-            round_1_result,
-            &mut round_2_result,
+            &mut round_1_result.lde_trace,
+            &mut round_2_result.lde_composition_poly_evaluations,
             &z,
         );
         #[cfg(feature = "instruments")]
