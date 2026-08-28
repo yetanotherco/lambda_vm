@@ -554,6 +554,85 @@ mod tests {
         vec![words]
     }
 
+    /// ★★★ **THE PHASE A GATE** — the absorbs between the statement and the
+    /// first challenge, which is where the spine's `z` diverges.
+    ///
+    /// `the_batched_epoch_challenge_spine_matches_production` under an algebraic
+    /// pin executes cleanly and then disagrees about the shared LogUp `z`. That
+    /// challenge is drawn after exactly two things: the statement absorb, which
+    /// its own gate covers, and Phase A. This is Phase A, beside the spine
+    /// rather than instrumented inside it — an instrument inside it perturbs the
+    /// program and produced a `DivByZero` of its own when tried.
+    ///
+    /// The host side is `crypto/stark/src/batched/verifier.rs:127-151` driven
+    /// through its OWN `absorb_shape_histogram`, not a restatement of it: the
+    /// histogram, then every preprocessed root from the AIR set, then the carved
+    /// root when the shape has one, then the single batched main root, then the
+    /// pair. Synthetic roots, because what is under test is the SEQUENCE and the
+    /// encoding, and controlling both sides is what makes a disagreement
+    /// attributable.
+    #[test]
+    fn phase_a_absorbs_derive_the_hosts_shared_pair() {
+        use crate::lfm::batched_epoch::emit_shape_histogram;
+        use crate::lfm::builder::LfmBuilder;
+        use crate::lfm::compiler::compile;
+        use crate::lfm::edsl::WrapHash;
+        use crate::lfm::epoch::RootCells;
+        use crate::lfm::proof::lfm_prove_with_hasher;
+        use crate::lfm::registry::build_artifacts_with_hasher;
+        use crate::lfm::transcript_replay::TranscriptReplay;
+        use stark::fri::batched::absorb_shape_histogram;
+
+        // A histogram with repeated and distinct heights, and widths that are
+        // not a function of them — a transposed pair has to move the transcript.
+        let heights: Vec<usize> = vec![10, 10, 8, 8, 5];
+        let widths: Vec<usize> = vec![4, 7, 2, 3, 1];
+        // Two preprocessed roots and one main root, distinct and non-canonical
+        // in their high bytes so a reduction would show.
+        let root_at =
+            |k: u8| -> [u8; 32] { core::array::from_fn(|i| k ^ (i as u8).wrapping_mul(29)) };
+        let preps = [root_at(0x11), root_at(0x22)];
+        let main = root_at(0x33);
+
+        for hasher in ALGEBRAIC {
+            // HOST: production's own histogram helper, then the roots.
+            let mut host = AlgebraicTranscript::with_seed(hasher, SEED);
+            absorb_shape_histogram::<GoldilocksExtension, _>(&mut host, &heights, &widths);
+            for p in &preps {
+                host.append_bytes(p);
+            }
+            host.append_bytes(&main);
+            let want = host.sample_field_element();
+
+            // MACHINE: the emitter's own histogram, then the roots as program
+            // constants — `RootCells::constant`'s provenance, which is what a
+            // preprocessed root from the AIR set is.
+            let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::Algebraic);
+            let mut t = TranscriptReplay::new(SEED);
+            emit_shape_histogram(&mut t, &heights, &widths);
+            for p in &preps {
+                let cells = RootCells::constant(&mut b, p);
+                cells.absorb_misaligned(&mut b, &mut t);
+            }
+            let main_cells = RootCells::constant(&mut b, &main);
+            main_cells.absorb_misaligned(&mut b, &mut t);
+            let z = t.sample_ext(&mut b);
+            b.public(z.as_cell());
+            let program = compile(b.finish());
+
+            let artifacts = build_artifacts_with_hasher(&program, &options(), hasher);
+            let proved = lfm_prove_with_hasher(&program, &artifacts, &[], &options(), hasher)
+                .expect("the Phase A program must prove");
+            let got = proved.public_words[0].1;
+            assert_eq!(
+                [got[0], got[1], got[2]],
+                *want.value(),
+                "{hasher:?}: Phase A must derive the host's shared pair — the histogram's \
+                 1 + 2n calls, then one call per root, then the pair"
+            );
+        }
+    }
+
     /// ★★★ **THE STATEMENT GATE** — the call SEQUENCE, which was fixed by
     /// reading and never checked by running.
     ///
