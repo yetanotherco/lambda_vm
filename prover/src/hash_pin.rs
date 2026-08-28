@@ -122,6 +122,39 @@ pub type BlockVerifier<Field, FieldExtension, PI> =
 pub const BLOCK_COMMITMENT_HASH: stark::config::CommitmentHash =
     <BlockStarkHash as stark::config::StarkHash>::COMMITMENT_HASH;
 
+/// ★★ The PERMUTATION a wrap program that authenticates a block-path proof must
+/// EXECUTE under — the second half of [`crate::lfm::edsl::WrapHash::production`].
+///
+/// ⚠ These are two axes, and conflating them is silent. `WrapHash` is what the
+/// EMITTER builds; `HasherKind` is which permutation the emitted `LFM_HASH`
+/// socket rows actually prove, and `edsl` says so — "an orthogonal axis chosen
+/// when the AIR set is built". A leg emitted on the right arm and executed on
+/// the wrong permutation computes every Merkle leaf and parent with a hash the
+/// host never used, so the walk reconstructs nothing and the leg fails as a
+/// `DivByZero` naming neither.
+///
+/// Under a BYTE hash the answer is [`HasherKind::Test`], and that is a FACT
+/// about that arm rather than a placeholder: `ByteWrapHash::hash_bytes` routes
+/// to the dedicated `KECCAK`/`LFM_BLAKE3` chips and emits no `Instr::Hash` at
+/// all, so the socket carries no commitment work and its permutation is free.
+/// That is also why this is a no-op for BLAKE3 — it returns exactly the value
+/// those call sites already passed.
+///
+/// Derived from [`BLOCK_COMMITMENT_HASH`] rather than spelled per branch, so a
+/// branch that re-pins the hash cannot forget to re-pin this. The match is
+/// exhaustive for the same reason `WrapHash::production`'s is.
+pub const fn block_hasher_kind() -> crate::lfm::hash::HasherKind {
+    use crate::lfm::hash::HasherKind;
+    match BLOCK_COMMITMENT_HASH {
+        stark::config::CommitmentHash::Keccak256 | stark::config::CommitmentHash::Blake3 => {
+            HasherKind::Test
+        }
+        stark::config::CommitmentHash::Rpo256 => HasherKind::Rpo,
+        stark::config::CommitmentHash::Rpx256 => HasherKind::Rpx,
+        stark::config::CommitmentHash::Poseidon => HasherKind::Poseidon,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -34,7 +34,6 @@ use super::compiler::{LfmProgram, compile};
 use super::edsl;
 use super::epoch::RootCells;
 use super::executor::execute;
-use super::hash::TestPermutation;
 use super::instr::ArenaId;
 use super::proof::{BatchedLfmProof, aggregation_wrap_options, verify_against_batched};
 use super::registry::{LfmArtifacts, build_artifacts};
@@ -1714,7 +1713,7 @@ fn leg_arena_words(e: &RealBatchedLfm) -> Vec<Vec<LfmWord>> {
 fn the_lfm_wrap_leg_runs_and_matches_the_host_replay() {
     let (e, program) = fixture_leg();
     let arenas = leg_arena_words(&e);
-    let exec = execute(&program, &arenas, &TestPermutation).expect("the leg must execute");
+    let exec = execute(&program, &arenas, &crate::hash_pin::block_hasher_kind()).expect("the leg must execute");
 
     let pub_ext = |i: usize| super::word::word_as_ext(&exec.public_words[i].1).expect("an ext");
     assert_eq!(pub_ext(0), e.challenges.lookup[0], "z");
@@ -1754,7 +1753,7 @@ fn the_lfm_wrap_leg_rejects_a_tampered_proof() {
     };
     let arenas = leg_arena_words(&tampered);
     assert!(
-        execute(&program, &arenas, &TestPermutation).is_err(),
+        execute(&program, &arenas, &crate::hash_pin::block_hasher_kind()).is_err(),
         "a tampered opening must make the leg unprovable"
     );
 }
@@ -1773,7 +1772,7 @@ fn the_lfm_wrap_leg_rejects_a_moved_public_word() {
     };
     let arenas = leg_arena_words(&moved);
     assert!(
-        execute(&program, &arenas, &TestPermutation).is_err(),
+        execute(&program, &arenas, &crate::hash_pin::block_hasher_kind()).is_err(),
         "a moved public word must make the leg unprovable"
     );
 }
@@ -1926,7 +1925,7 @@ fn the_assembled_aggregator_runs_on_the_fixture_chain() {
     let mut arenas: Vec<Vec<LfmWord>> = f.wraps.iter().flat_map(leg_arena_words).collect();
     arenas.extend(leg_arena_words(&f.global_wrap));
     arenas.push(attestation_arena_words(&f));
-    let exec = execute(&program, &arenas, &TestPermutation).expect("the aggregate must execute");
+    let exec = execute(&program, &arenas, &crate::hash_pin::block_hasher_kind()).expect("the aggregate must execute");
 
     // The consumer's own recompute is the oracle for the published id.
     let expected = crate::recursion::program_id_from_digest(
@@ -1977,7 +1976,7 @@ fn the_aggregator_rejects_a_broken_register_chain() {
         super::word::word_as_base(&arenas[0][8 * word_index]).expect("a half") + FE::one(),
     );
     assert!(
-        execute(&program, &arenas, &TestPermutation).is_err(),
+        execute(&program, &arenas, &crate::hash_pin::block_hasher_kind()).is_err(),
         "a broken register chain must make the aggregate unprovable"
     );
 }
@@ -2006,7 +2005,7 @@ fn the_aggregator_rejects_a_forged_attestation_input() {
     att[10][0] += FE::one(); // the DECODE root's first half
     arenas.push(att);
     assert!(
-        execute(&program, &arenas, &TestPermutation).is_err(),
+        execute(&program, &arenas, &crate::hash_pin::block_hasher_kind()).is_err(),
         "a forged attestation input must make the aggregate unprovable"
     );
 }
@@ -2038,7 +2037,7 @@ fn the_aggregator_rejects_a_moved_global_root() {
     arenas[g_base][8 * 2] =
         base_word(super::word::word_as_base(&arenas[g_base][8 * 2]).expect("a half") + FE::one());
     assert!(
-        execute(&program, &arenas, &TestPermutation).is_err(),
+        execute(&program, &arenas, &crate::hash_pin::block_hasher_kind()).is_err(),
         "a moved global L2G root must make the aggregate unprovable"
     );
 }
@@ -2064,7 +2063,7 @@ fn the_global_verifier_leg_runs_and_rejects_tampers() {
     let g = real_global(&elf_bytes, &bundle, &inner);
     let program = global_verifier_program(&g);
     let arenas = global_arena_words(&g);
-    let exec = execute(&program, &arenas, &TestPermutation).expect("the global leg must execute");
+    let exec = execute(&program, &arenas, &crate::hash_pin::block_hasher_kind()).expect("the global leg must execute");
 
     let pub_ext = |i: usize| super::word::word_as_ext(&exec.public_words[i].1).expect("an ext");
     assert_eq!(pub_ext(0), g.z_alpha.0, "the global z");
@@ -2096,7 +2095,7 @@ fn the_global_verifier_leg_runs_and_rejects_tampers() {
     let mut tampered = global_arena_words(&g);
     tampered[0][0][0] += FE::one();
     assert!(
-        execute(&program, &tampered, &TestPermutation).is_err(),
+        execute(&program, &tampered, &crate::hash_pin::block_hasher_kind()).is_err(),
         "a flipped L2G re-commit root must make the global leg unprovable"
     );
 }
