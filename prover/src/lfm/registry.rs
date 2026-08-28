@@ -499,7 +499,19 @@ impl LfmArtifacts {
 /// root above moves with it and the tag on its own stops being the whole
 /// binding.
 pub fn build_artifacts(program: &LfmProgram, options: &ProofOptions) -> LfmArtifacts {
-    build_artifacts_with_hasher(program, options, HasherKind::default())
+    // ★ The block path's PINNED socket permutation, not `HasherKind::default()`.
+    //
+    // ⚠ The default is `Test`, a one-round toy, and under a BYTE hash that is
+    // free and correct: `ByteWrapHash::hash_bytes` lowers to the dedicated
+    // KECCAK / `LFM_BLAKE3` chips and emits no `Instr::Hash` at all, so the
+    // socket hasher is never consulted. The algebraic arm goes through
+    // `compress` / `permute`, which ARE `Instr::Hash` — so a program built here
+    // would be proved with the toy permutation while the host committed under
+    // RPO, and every digest downstream would be wrong. It surfaces as the
+    // grinding check refusing an honest nonce, naming nothing.
+    //
+    // On a byte pin this is `HasherKind::Test` and the call is unchanged.
+    build_artifacts_with_hasher(program, options, crate::hash_pin::BLOCK_HASHER)
 }
 
 /// [`build_artifacts`] for a program proved under an explicitly chosen
