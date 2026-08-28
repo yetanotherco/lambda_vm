@@ -52,13 +52,19 @@
 //! prove. `parts_computations` stays at one per table, and the counter is there
 //! so that stops being silent if it ever changes.
 //!
-//! # What is deliberately absent
+//! # The GPU commit
 //!
-//! No device paths. The GPU mixed-height MMCS exists (`crypto/math-cuda/`) and
-//! is box-gated; wiring it in is a separate step, and a batched prover that
-//! silently fell back between host and device arms would make the residency
-//! numbers above unreproducible. Under `--features cuda` this path compiles and
-//! runs on the host.
+//! Under `--features cuda`, on Goldilocks (base + ext3) and `ResidencyMode::
+//! Retain`, all four MMCS trees (main / aux / parts) are committed ON THE DEVICE:
+//! the keccak leaf hash and the climb run on the GPU (`crypto/math-cuda/`'s
+//! mixed-height MMCS), and only the digest layers come back to rebuild the
+//! host-side [`MixedMmcs`] via [`MixedMmcs::from_heap_nodes`] — so the openings
+//! (row values from the retained LDE, one shared auth path per query) are served
+//! exactly as before. The host [`StreamingMmcsBuilder`] is skipped entirely for
+//! those rounds. This is a DELIBERATE mode select (see `device_commit_enabled`),
+//! not a silent per-call host↔device fallback — a device error is a hard abort —
+//! precisely so the residency numbers above stay reproducible. Off cuda / off
+//! Goldilocks / under `RecomputeLde`, the host builder commits as it always did.
 
 use math::fft::bit_reversing::in_place_bit_reverse_permute_row_major;
 use math::field::element::FieldElement;
@@ -251,7 +257,16 @@ where
     // per-table prover does.
     let mut prep_trees: Vec<PrepTreeSlot<BatchedMerkleTreeBackend<Field>>> =
         (0..num_tables).map(|_| None).collect();
-    let mut main_builder = StreamingMmcsBuilder::<Field>::new(&shape.main.dims);
+
+    // When the GPU can commit the main round (Goldilocks + Retain, so the LDEs
+    // are still around to feed the device tree), the keccak leaf+climb runs on
+    // the device and only the digest layers come back; the CPU
+    // `StreamingMmcsBuilder` is skipped entirely. Otherwise it builds the tree.
+    // Deliberate mode select (no silent per-call fallback); a device error is a
+    // hard abort.
+    let use_device_main = device_commit_enabled::<Field>(residency);
+    let mut main_builder =
+        (!use_device_main).then(|| StreamingMmcsBuilder::<Field>::new(&shape.main.dims));
     let mut retained_main: Vec<Option<(Vec<FieldElement<Field>>, usize)>> =
         (0..num_tables).map(|_| None).collect();
     // The carved table's standalone main tree and its root. Built inside the
@@ -329,14 +344,16 @@ where
             carved_tree = Some(tree);
             carved_root = Some(root);
         } else {
-            let src = vec![BorrowedMatrix::RowMajorNatural {
-                data: &main_data,
-                stride: total_cols,
-                col_start: num_precomputed,
-                width: total_cols - num_precomputed,
-                log_height: height,
-            }];
-            main_builder.absorb(&src, 0);
+            if let Some(builder) = main_builder.as_mut() {
+                let src = vec![BorrowedMatrix::RowMajorNatural {
+                    data: &main_data,
+                    stride: total_cols,
+                    col_start: num_precomputed,
+                    width: total_cols - num_precomputed,
+                    log_height: height,
+                }];
+                builder.absorb(&src, 0);
+            }
         }
 
         // The root is what Fiat-Shamir needs; the buffer is not. Under
@@ -358,66 +375,16 @@ where
         transcript.append_bytes(root);
     }
 
-    let main_mmcs = main_builder.finish();
+    let main_mmcs = if use_device_main {
+        commit_main_device(&retained_main, &shape, num_tables)?
+    } else {
+        main_builder
+            .take()
+            .expect("CPU main builder present when device commit is disabled")
+            .finish()
+    };
     let main_root = main_mmcs.root();
     transcript.append_bytes(&main_root);
-
-    // GPU cross-check (3c): the device mixed-height MMCS must build the same
-    // main-round root the host `StreamingMmcsBuilder` just did, from the same
-    // matrices (same height grouping, same absorb order, same column ranges).
-    // Inert unless every contributing main LDE is retained (so `RecomputeLde`
-    // skips it), the field is Goldilocks (the kernels are), and there is a GPU.
-    #[cfg(feature = "cuda")]
-    {
-        use math::field::goldilocks::GoldilocksField;
-        use std::any::TypeId;
-        if TypeId::of::<Field>() == TypeId::of::<GoldilocksField>() {
-            let mut raws: Vec<(Vec<u64>, u64, u64, u64)> = Vec::new();
-            let mut all_present = true;
-            for table in 0..num_tables {
-                if shape.carved_main.map(|c| c.table) == Some(table) {
-                    continue;
-                }
-                match &retained_main[table] {
-                    Some((data, total_cols)) => {
-                        let width = matrix_width(&shape.main, table) as u64;
-                        let stride = *total_cols as u64;
-                        // SAFETY: Field == GoldilocksField (checked), whose element
-                        // value is a `u64` — the same cast the per-table GPU commit
-                        // uses (`gpu_lde::columns_to_u64_base`).
-                        let raw: Vec<u64> = data
-                            .iter()
-                            .map(|e| unsafe { *(e.value() as *const _ as *const u64) })
-                            .collect();
-                        raws.push((raw, stride, stride - width, shape.heights[table] as u64));
-                    }
-                    None => {
-                        all_present = false;
-                        break;
-                    }
-                }
-            }
-            if all_present && !raws.is_empty() {
-                let inputs: Vec<math_cuda::mmcs::MmcsRowMajorInput> = raws
-                    .iter()
-                    .map(|(d, stride, col_start, h)| math_cuda::mmcs::MmcsRowMajorInput {
-                        data: d.as_slice(),
-                        stride: *stride,
-                        col_start: *col_start,
-                        col_end: *stride,
-                        log_height: *h,
-                    })
-                    .collect();
-                if let Ok(dev_root) = math_cuda::mmcs::commit_mixed_row_major_root(&inputs) {
-                    debug_assert_eq!(
-                        dev_root, main_root,
-                        "device main-round MMCS root must equal the host \
-                         StreamingMmcsBuilder root"
-                    );
-                }
-            }
-        }
-    }
 
     // =====================================================================
     // Phase 2 — LogUp challenges, then the auxiliary round
@@ -445,7 +412,8 @@ where
 
     let mut bus_public_inputs: Vec<Option<BusPublicInputs<FieldExtension>>> =
         (0..num_tables).map(|_| None).collect();
-    let mut aux_builder = (!shape.aux.is_empty())
+    let use_device_aux = device_commit_enabled::<FieldExtension>(residency);
+    let mut aux_builder = (!shape.aux.is_empty() && !use_device_aux)
         .then(|| StreamingMmcsBuilder::<FieldExtension>::new(&shape.aux.dims));
     let mut retained_aux: Vec<Option<(Vec<FieldElement<FieldExtension>>, usize)>> =
         (0..num_tables).map(|_| None).collect();
@@ -464,9 +432,9 @@ where
                 .map_err(|e| ProvingError::DiskSpill(format!("aux trace: {e}")))?;
         }
 
-        let Some(builder) = aux_builder.as_mut() else {
+        if shape.aux.is_empty() {
             continue;
-        };
+        }
         let (aux_data, aux_cols) = P::expand_aux_lde_row_major(
             trace,
             &domains[table],
@@ -477,14 +445,16 @@ where
         stats.aux_lde_expansions += 1;
         let bytes = lde_bytes::<FieldExtension>(aux_data.len());
         ledger.alloc(bytes);
-        let src = vec![BorrowedMatrix::RowMajorNatural {
-            data: &aux_data,
-            stride: aux_cols,
-            col_start: 0,
-            width: aux_cols,
-            log_height: shape.heights[table],
-        }];
-        builder.absorb(&src, 0);
+        if let Some(builder) = aux_builder.as_mut() {
+            let src = vec![BorrowedMatrix::RowMajorNatural {
+                data: &aux_data,
+                stride: aux_cols,
+                col_start: 0,
+                width: aux_cols,
+                log_height: shape.heights[table],
+            }];
+            builder.absorb(&src, 0);
+        }
         match residency {
             ResidencyMode::Retain => retained_aux[table] = Some((aux_data, aux_cols)),
             ResidencyMode::RecomputeLde => {
@@ -494,51 +464,14 @@ where
         }
     }
 
-    let aux_mmcs = aux_builder.map(StreamingMmcsBuilder::finish);
+    let aux_mmcs = if use_device_aux && !shape.aux.is_empty() {
+        Some(commit_aux_device(&retained_aux, &shape, num_tables)?)
+    } else {
+        aux_builder.map(StreamingMmcsBuilder::finish)
+    };
     let aux_root = aux_mmcs.as_ref().map(MixedMmcs::root);
     if let Some(root) = aux_root {
         transcript.append_bytes(&root);
-    }
-
-    // GPU cross-check (3c): the device row-major ext3 MMCS must build the same
-    // aux-round root the host did (Retain + Goldilocks-ext3 + GPU, else inert).
-    #[cfg(feature = "cuda")]
-    if let Some(aux_root_val) = aux_root {
-        use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
-        use std::any::TypeId;
-        if TypeId::of::<FieldExtension>() == TypeId::of::<Degree3GoldilocksExtensionField>() {
-            let mut raws: Vec<(Vec<u64>, u64, u64)> = Vec::new();
-            for table in 0..num_tables {
-                if let Some((data, aux_cols)) = &retained_aux[table] {
-                    // SAFETY: FieldExtension == Degree3Goldilocks (checked), a
-                    // contiguous `[u64; 3]` per element — same cast as
-                    // `gpu_lde::columns_to_u64_ext3`.
-                    let raw: Vec<u64> = unsafe {
-                        std::slice::from_raw_parts(data.as_ptr() as *const u64, data.len() * 3)
-                    }
-                    .to_vec();
-                    raws.push((raw, *aux_cols as u64, shape.heights[table] as u64));
-                }
-            }
-            if !raws.is_empty() {
-                let inputs: Vec<math_cuda::mmcs::MmcsExt3RowMajorInput> = raws
-                    .iter()
-                    .map(|(d, stride, h)| math_cuda::mmcs::MmcsExt3RowMajorInput {
-                        data: d.as_slice(),
-                        stride: *stride,
-                        col_start: 0,
-                        col_end: *stride,
-                        log_height: *h,
-                    })
-                    .collect();
-                if let Ok(dev_root) = math_cuda::mmcs::commit_mixed_ext3_row_major_root(&inputs) {
-                    debug_assert_eq!(
-                        dev_root, aux_root_val,
-                        "device aux-round MMCS root must equal the host root"
-                    );
-                }
-            }
-        }
     }
 
     // =====================================================================
@@ -550,7 +483,9 @@ where
         transcript.append_field_element(&bpi.table_contribution);
     }
 
-    let mut parts_builder = StreamingMmcsBuilder::<FieldExtension>::new(&shape.parts.dims);
+    let use_device_parts = device_commit_enabled::<FieldExtension>(residency);
+    let mut parts_builder = (!use_device_parts)
+        .then(|| StreamingMmcsBuilder::<FieldExtension>::new(&shape.parts.dims));
     let mut retained_parts: Vec<Vec<Vec<FieldElement<FieldExtension>>>> =
         (0..num_tables).map(|_| Vec::new()).collect();
 
@@ -613,11 +548,13 @@ where
             .map(|p| lde_bytes::<FieldExtension>(p.len()))
             .sum();
         parts_ledger.alloc(parts_bytes);
-        let src = vec![BorrowedMatrix::ColMajorNatural {
-            cols: &parts,
-            log_height: shape.heights[table],
-        }];
-        parts_builder.absorb(&src, 0);
+        if let Some(builder) = parts_builder.as_mut() {
+            let src = vec![BorrowedMatrix::ColMajorNatural {
+                cols: &parts,
+                log_height: shape.heights[table],
+            }];
+            builder.absorb(&src, 0);
+        }
 
         // Parts are RETAINED: rebuilding them is a second constraint evaluation.
         retained_parts[table] = parts;
@@ -631,67 +568,16 @@ where
         );
     }
 
-    let parts_mmcs = parts_builder.finish();
+    let parts_mmcs = if use_device_parts {
+        commit_parts_device(&retained_parts, &shape, num_tables)?
+    } else {
+        parts_builder
+            .take()
+            .expect("CPU parts builder present when device commit is disabled")
+            .finish()
+    };
     let parts_root = parts_mmcs.root();
     transcript.append_bytes(&parts_root);
-
-    // GPU cross-check (3c): the device ext3 mixed-height MMCS must build the same
-    // parts-round root the host did. Parts are always retained; the field is
-    // Goldilocks-ext3 and there is a GPU, or this is inert.
-    #[cfg(feature = "cuda")]
-    {
-        use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
-        use std::any::TypeId;
-        if TypeId::of::<FieldExtension>() == TypeId::of::<Degree3GoldilocksExtensionField>() {
-            let mut slabs: Vec<(Vec<u64>, u64, u64, u64)> = Vec::new();
-            let mut all_present = true;
-            for table in 0..num_tables {
-                let parts = &retained_parts[table];
-                if parts.is_empty() || parts[0].is_empty() {
-                    all_present = false;
-                    break;
-                }
-                let num_parts = parts.len();
-                let num_rows = parts[0].len();
-                let mut slab = vec![0u64; num_parts * 3 * num_rows];
-                for (p, col) in parts.iter().enumerate() {
-                    for (row, elem) in col.iter().enumerate() {
-                        // SAFETY: FieldExtension == Degree3Goldilocks (checked),
-                        // whose value is `[u64; 3]` — same cast as
-                        // `gpu_lde::columns_to_u64_ext3`.
-                        let comps =
-                            unsafe { std::slice::from_raw_parts(elem.value() as *const _ as *const u64, 3) };
-                        for (k, &c) in comps.iter().enumerate() {
-                            slab[(p * 3 + k) * num_rows + row] = c;
-                        }
-                    }
-                }
-                slabs.push((
-                    slab,
-                    num_rows as u64,
-                    num_parts as u64,
-                    shape.heights[table] as u64,
-                ));
-            }
-            if all_present && !slabs.is_empty() {
-                let inputs: Vec<math_cuda::mmcs::MmcsExt3SlabInput> = slabs
-                    .iter()
-                    .map(|(d, col_stride, num_parts, h)| math_cuda::mmcs::MmcsExt3SlabInput {
-                        data: d.as_slice(),
-                        col_stride: *col_stride,
-                        num_parts: *num_parts,
-                        log_height: *h,
-                    })
-                    .collect();
-                if let Ok(dev_root) = math_cuda::mmcs::commit_mixed_ext3_slabs_root(&inputs) {
-                    debug_assert_eq!(
-                        dev_root, parts_root,
-                        "device parts-round MMCS root must equal the host root"
-                    );
-                }
-            }
-        }
-    }
 
     // =====================================================================
     // Phase 4 — z per table, OOD evaluations
@@ -1086,6 +972,241 @@ where
 /// contribute one.
 fn matrix_index(round: &RoundShape, table: usize) -> Option<usize> {
     round.tables.iter().position(|&t| t == table)
+}
+
+/// Whether a round is committed on the GPU (device tree authoritative) rather
+/// than by the host `StreamingMmcsBuilder`. True only with the `cuda` feature,
+/// on a Goldilocks field (base or ext3 — the only fields the kernels support),
+/// and under `ResidencyMode::Retain` (the LDEs must survive to feed the device
+/// tree after the round's loop). A deliberate mode select; there is no silent
+/// per-call host↔device fallback — a device error aborts.
+#[cfg(feature = "cuda")]
+fn device_commit_enabled<F: 'static>(residency: ResidencyMode) -> bool {
+    use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
+    use math::field::goldilocks::GoldilocksField;
+    use std::any::TypeId;
+    residency == ResidencyMode::Retain
+        && (TypeId::of::<F>() == TypeId::of::<GoldilocksField>()
+            || TypeId::of::<F>() == TypeId::of::<Degree3GoldilocksExtensionField>())
+}
+
+#[cfg(not(feature = "cuda"))]
+fn device_commit_enabled<F: 'static>(_residency: ResidencyMode) -> bool {
+    false
+}
+
+/// Commit the main round on the GPU and rebuild the host-side `MixedMmcs` from
+/// the device heap (keccak on device, digest layers back). Only called when
+/// [`device_commit_enabled`] held, i.e. Goldilocks + Retain + cuda; a device
+/// error is a hard abort, never a silent host fallback.
+#[cfg(feature = "cuda")]
+fn commit_main_device<Field: IsField + 'static>(
+    retained_main: &[Option<(Vec<FieldElement<Field>>, usize)>],
+    shape: &EpochShape,
+    num_tables: usize,
+) -> Result<MixedMmcs<Field>, ProvingError>
+where
+    FieldElement<Field>: math::traits::AsBytes + Sync + Send,
+{
+    let mut raws: Vec<(Vec<u64>, u64, u64, u64)> = Vec::new();
+    for table in 0..num_tables {
+        if shape.carved_main.map(|c| c.table) == Some(table) {
+            continue;
+        }
+        match &retained_main[table] {
+            Some((data, total_cols)) => {
+                let width = matrix_width(&shape.main, table) as u64;
+                let stride = *total_cols as u64;
+                // SAFETY: Goldilocks (device_commit_enabled gated it), element
+                // value is a u64 — same cast as `gpu_lde::columns_to_u64_base`.
+                let raw: Vec<u64> = data
+                    .iter()
+                    .map(|e| unsafe { *(e.value() as *const _ as *const u64) })
+                    .collect();
+                raws.push((raw, stride, stride - width, shape.heights[table] as u64));
+            }
+            None => {
+                return Err(ProvingError::WrongParameter(
+                    "device main commit: a non-carved main LDE was not retained".to_string(),
+                ));
+            }
+        }
+    }
+    let inputs: Vec<math_cuda::mmcs::MmcsRowMajorInput> = raws
+        .iter()
+        .map(|(d, stride, col_start, h)| math_cuda::mmcs::MmcsRowMajorInput {
+            data: d.as_slice(),
+            stride: *stride,
+            col_start: *col_start,
+            col_end: *stride,
+            log_height: *h,
+        })
+        .collect();
+    let nodes = math_cuda::mmcs::commit_mixed_row_major_nodes(&inputs)
+        .map_err(|e| ProvingError::WrongParameter(format!("device main commit failed: {e:?}")))?;
+    let h_max = shape
+        .main
+        .dims
+        .iter()
+        .map(|&(lh, _)| lh)
+        .max()
+        .ok_or_else(|| ProvingError::WrongParameter("device main commit: empty round".to_string()))?;
+    Ok(MixedMmcs::from_heap_nodes(
+        shape.main.dims.clone(),
+        h_max,
+        &nodes,
+    ))
+}
+
+#[cfg(not(feature = "cuda"))]
+fn commit_main_device<Field: IsField + 'static>(
+    _retained_main: &[Option<(Vec<FieldElement<Field>>, usize)>],
+    _shape: &EpochShape,
+    _num_tables: usize,
+) -> Result<MixedMmcs<Field>, ProvingError>
+where
+    FieldElement<Field>: math::traits::AsBytes + Sync + Send,
+{
+    unreachable!("device commit is disabled without the cuda feature")
+}
+
+/// Commit the aux round (row-major ext3) on the GPU. Precondition + policy as
+/// [`commit_main_device`]. `retained_aux[t]` is `Some` exactly for the aux
+/// tables, in the order the host absorbs them.
+#[cfg(feature = "cuda")]
+fn commit_aux_device<E: IsField + 'static>(
+    retained_aux: &[Option<(Vec<FieldElement<E>>, usize)>],
+    shape: &EpochShape,
+    num_tables: usize,
+) -> Result<MixedMmcs<E>, ProvingError>
+where
+    FieldElement<E>: math::traits::AsBytes + Sync + Send,
+{
+    let mut raws: Vec<(Vec<u64>, u64, u64)> = Vec::new();
+    for table in 0..num_tables {
+        if let Some((data, aux_cols)) = &retained_aux[table] {
+            // SAFETY: ext3 Goldilocks (gated), contiguous `[u64; 3]` per element.
+            let raw: Vec<u64> =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u64, data.len() * 3) }
+                    .to_vec();
+            raws.push((raw, *aux_cols as u64, shape.heights[table] as u64));
+        }
+    }
+    if raws.is_empty() {
+        return Err(ProvingError::WrongParameter(
+            "device aux commit: no retained aux LDEs".to_string(),
+        ));
+    }
+    let inputs: Vec<math_cuda::mmcs::MmcsExt3RowMajorInput> = raws
+        .iter()
+        .map(|(d, stride, h)| math_cuda::mmcs::MmcsExt3RowMajorInput {
+            data: d.as_slice(),
+            stride: *stride,
+            col_start: 0,
+            col_end: *stride,
+            log_height: *h,
+        })
+        .collect();
+    let nodes = math_cuda::mmcs::commit_mixed_ext3_row_major_nodes(&inputs)
+        .map_err(|e| ProvingError::WrongParameter(format!("device aux commit failed: {e:?}")))?;
+    let h_max = shape
+        .aux
+        .dims
+        .iter()
+        .map(|&(lh, _)| lh)
+        .max()
+        .ok_or_else(|| ProvingError::WrongParameter("device aux commit: empty round".to_string()))?;
+    Ok(MixedMmcs::from_heap_nodes(shape.aux.dims.clone(), h_max, &nodes))
+}
+
+#[cfg(not(feature = "cuda"))]
+fn commit_aux_device<E: IsField + 'static>(
+    _retained_aux: &[Option<(Vec<FieldElement<E>>, usize)>],
+    _shape: &EpochShape,
+    _num_tables: usize,
+) -> Result<MixedMmcs<E>, ProvingError>
+where
+    FieldElement<E>: math::traits::AsBytes + Sync + Send,
+{
+    unreachable!("device commit is disabled without the cuda feature")
+}
+
+/// Commit the parts round (column-major ext3 slabs) on the GPU. Precondition +
+/// policy as [`commit_main_device`]. Parts are always retained.
+#[cfg(feature = "cuda")]
+fn commit_parts_device<E: IsField + 'static>(
+    retained_parts: &[Vec<Vec<FieldElement<E>>>],
+    shape: &EpochShape,
+    num_tables: usize,
+) -> Result<MixedMmcs<E>, ProvingError>
+where
+    FieldElement<E>: math::traits::AsBytes + Sync + Send,
+{
+    let mut slabs: Vec<(Vec<u64>, u64, u64, u64)> = Vec::new();
+    for table in 0..num_tables {
+        let parts = &retained_parts[table];
+        if parts.is_empty() || parts[0].is_empty() {
+            return Err(ProvingError::WrongParameter(
+                "device parts commit: a table has no retained parts".to_string(),
+            ));
+        }
+        let num_parts = parts.len();
+        let num_rows = parts[0].len();
+        let mut slab = vec![0u64; num_parts * 3 * num_rows];
+        for (p, col) in parts.iter().enumerate() {
+            for (row, elem) in col.iter().enumerate() {
+                // SAFETY: ext3 Goldilocks (gated), `[u64; 3]` per element.
+                let comps =
+                    unsafe { std::slice::from_raw_parts(elem.value() as *const _ as *const u64, 3) };
+                for (k, &c) in comps.iter().enumerate() {
+                    slab[(p * 3 + k) * num_rows + row] = c;
+                }
+            }
+        }
+        slabs.push((
+            slab,
+            num_rows as u64,
+            num_parts as u64,
+            shape.heights[table] as u64,
+        ));
+    }
+    let inputs: Vec<math_cuda::mmcs::MmcsExt3SlabInput> = slabs
+        .iter()
+        .map(|(d, col_stride, num_parts, h)| math_cuda::mmcs::MmcsExt3SlabInput {
+            data: d.as_slice(),
+            col_stride: *col_stride,
+            num_parts: *num_parts,
+            log_height: *h,
+        })
+        .collect();
+    let nodes = math_cuda::mmcs::commit_mixed_ext3_slabs_nodes(&inputs)
+        .map_err(|e| ProvingError::WrongParameter(format!("device parts commit failed: {e:?}")))?;
+    let h_max = shape
+        .parts
+        .dims
+        .iter()
+        .map(|&(lh, _)| lh)
+        .max()
+        .ok_or_else(|| {
+            ProvingError::WrongParameter("device parts commit: empty round".to_string())
+        })?;
+    Ok(MixedMmcs::from_heap_nodes(
+        shape.parts.dims.clone(),
+        h_max,
+        &nodes,
+    ))
+}
+
+#[cfg(not(feature = "cuda"))]
+fn commit_parts_device<E: IsField + 'static>(
+    _retained_parts: &[Vec<Vec<FieldElement<E>>>],
+    _shape: &EpochShape,
+    _num_tables: usize,
+) -> Result<MixedMmcs<E>, ProvingError>
+where
+    FieldElement<E>: math::traits::AsBytes + Sync + Send,
+{
+    unreachable!("device commit is disabled without the cuda feature")
 }
 
 /// The width `table` contributes to `round`. Zero when it contributes nothing.

@@ -375,7 +375,10 @@ pub struct MmcsRowMajorInput<'a> {
 ///
 /// Uploads each matrix and frees it before the next (the streaming residency
 /// policy). `inputs` must be non-empty and include the tallest height.
-pub fn commit_mixed_row_major_root(inputs: &[MmcsRowMajorInput]) -> Result<[u8; 32]> {
+/// Like [`commit_mixed_row_major_root`] but returns the WHOLE standard heap node
+/// array (host-side `Vec<u8>`, `(2L-1)*32` bytes) — feed it to
+/// `MixedMmcs::from_heap_nodes` to make the GPU tree authoritative.
+pub fn commit_mixed_row_major_nodes(inputs: &[MmcsRowMajorInput]) -> Result<Vec<u8>> {
     let be = backend()?;
     let stream = be.next_stream();
 
@@ -397,7 +400,14 @@ pub fn commit_mixed_row_major_root(inputs: &[MmcsRowMajorInput]) -> Result<[u8; 
     }
 
     let nodes = build_mmcs_tree_on_device(&stream, &group_digests)?;
-    read_mmcs_root(&stream, &nodes)
+    stream.clone_dtoh(&nodes)
+}
+
+pub fn commit_mixed_row_major_root(inputs: &[MmcsRowMajorInput]) -> Result<[u8; 32]> {
+    let nodes = commit_mixed_row_major_nodes(inputs)?;
+    let mut root = [0u8; 32];
+    root.copy_from_slice(&nodes[0..32]);
+    Ok(root)
 }
 
 /// One ext3 matrix feeding a mixed-height MMCS commit, in absorb order, laid out
@@ -414,7 +424,7 @@ pub struct MmcsExt3SlabInput<'a> {
 /// Build the whole mixed-height MMCS tree on the GPU from ext3 slab matrices and
 /// return its root — the ext3 twin of [`commit_mixed_row_major_root`], grouping
 /// by height and absorbing each group's matrices in the given order.
-pub fn commit_mixed_ext3_slabs_root(inputs: &[MmcsExt3SlabInput]) -> Result<[u8; 32]> {
+pub fn commit_mixed_ext3_slabs_nodes(inputs: &[MmcsExt3SlabInput]) -> Result<Vec<u8>> {
     let be = backend()?;
     let stream = be.next_stream();
 
@@ -436,7 +446,14 @@ pub fn commit_mixed_ext3_slabs_root(inputs: &[MmcsExt3SlabInput]) -> Result<[u8;
     }
 
     let nodes = build_mmcs_tree_on_device(&stream, &group_digests)?;
-    read_mmcs_root(&stream, &nodes)
+    stream.clone_dtoh(&nodes)
+}
+
+pub fn commit_mixed_ext3_slabs_root(inputs: &[MmcsExt3SlabInput]) -> Result<[u8; 32]> {
+    let nodes = commit_mixed_ext3_slabs_nodes(inputs)?;
+    let mut root = [0u8; 32];
+    root.copy_from_slice(&nodes[0..32]);
+    Ok(root)
 }
 
 /// One ROW-MAJOR ext3 matrix feeding a mixed-height MMCS commit, in absorb
@@ -453,7 +470,7 @@ pub struct MmcsExt3RowMajorInput<'a> {
 
 /// Build the whole mixed-height MMCS tree on the GPU from ROW-MAJOR ext3
 /// matrices and return its root — the aux twin of [`commit_mixed_row_major_root`].
-pub fn commit_mixed_ext3_row_major_root(inputs: &[MmcsExt3RowMajorInput]) -> Result<[u8; 32]> {
+pub fn commit_mixed_ext3_row_major_nodes(inputs: &[MmcsExt3RowMajorInput]) -> Result<Vec<u8>> {
     let be = backend()?;
     let stream = be.next_stream();
 
@@ -475,5 +492,12 @@ pub fn commit_mixed_ext3_row_major_root(inputs: &[MmcsExt3RowMajorInput]) -> Res
     }
 
     let nodes = build_mmcs_tree_on_device(&stream, &group_digests)?;
-    read_mmcs_root(&stream, &nodes)
+    stream.clone_dtoh(&nodes)
+}
+
+pub fn commit_mixed_ext3_row_major_root(inputs: &[MmcsExt3RowMajorInput]) -> Result<[u8; 32]> {
+    let nodes = commit_mixed_ext3_row_major_nodes(inputs)?;
+    let mut root = [0u8; 32];
+    root.copy_from_slice(&nodes[0..32]);
+    Ok(root)
 }
