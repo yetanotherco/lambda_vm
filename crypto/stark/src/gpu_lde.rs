@@ -3214,6 +3214,147 @@ where
     Some((final_poly_coeffs, fri_layer_list))
 }
 
+/// GPU drive of the BATCHED FRI commit — the height-combined analogue of
+/// [`fri_commit_gpu_drive`]. Same fold/commit/terminal machinery, but between
+/// each fold and its Merkle commit it injects that layer's DEEP bucket into the
+/// running codeword on the device (`fri_inject_bucket_ext3` =
+/// `fri/batched.rs`'s `inject_bucket`), and it uses the batched terminal floor
+/// [`crate::fri::batched::BatchedFriLayout`]. `combined[h]` is the bucket at
+/// height `h` (`2^h` ext3 elements); `combined[h_max]` is the starting codeword
+/// and is taken. Returns `None` (transcript restored) to fall back to the host.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub(crate) fn try_batched_fri_commit_gpu<F, E, T>(
+    combined: &[Option<Vec<FieldElement<E>>>],
+    transcript: &mut T,
+    coset_offset: &FieldElement<F>,
+    blowup_log: u32,
+    final_poly_log_degree: u32,
+    inv_twiddles: &[FieldElement<F>],
+    h_min: usize,
+    h_max: usize,
+) -> Option<(
+    Vec<FieldElement<E>>,
+    Vec<FriLayer<E, FriLayerMerkleTreeBackend<E>>>,
+)>
+where
+    F: IsFFTField + IsField + IsSubFieldOf<E> + 'static,
+    E: IsField + 'static + Send + Sync,
+    FieldElement<F>: AsBytes,
+    FieldElement<E>: AsBytes,
+    T: IsStarkTranscript<E, F> + Clone,
+{
+    if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
+        return None;
+    }
+    if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
+        return None;
+    }
+    let n0 = 1usize << h_max;
+    if n0 < 2 || n0 < gpu_lde_threshold() || inv_twiddles.len() != n0 / 2 {
+        return None;
+    }
+    let layout =
+        crate::fri::batched::BatchedFriLayout::new(h_max, h_min, blowup_log, final_poly_log_degree);
+    if layout.total_folds == 0 || layout.terminal_len < 2 {
+        return None;
+    }
+
+    // Pack inv_twiddles before any transcript mutation.
+    let mut inv_tw_u64: Vec<u64> = Vec::with_capacity(inv_twiddles.len());
+    for t in inv_twiddles {
+        // SAFETY: F == Goldilocks (checked); FieldElement<Gl> is transparent u64.
+        inv_tw_u64.push(unsafe { *(t.value() as *const _ as *const u64) });
+    }
+
+    // Clone (not take) the starting codeword so a later `None` return leaves
+    // `combined` intact for the host fallback.
+    let start = match combined.get(h_max).and_then(Option::as_ref) {
+        Some(c) if c.len() == n0 => c.clone(),
+        _ => return None,
+    };
+    // SAFETY: E == Ext3; backing is [u64; 3].
+    let start_u64: &[u64] = unsafe { ext3_slice_to_u64::<E>(&start) };
+    let mut state = match math_cuda::fri::FriCommitState::new(start_u64, &inv_tw_u64, n0) {
+        Ok(s) => s,
+        Err(_) => return None,
+    };
+
+    // Upload every shorter bucket to the device, indexed by height.
+    let mut buckets: Vec<Option<math_cuda::CudaSlice<u64>>> = (0..=h_max).map(|_| None).collect();
+    for h in 1..h_max {
+        if let Some(bucket) = combined.get(h).and_then(Option::as_ref) {
+            let bucket_u64: &[u64] = unsafe { ext3_slice_to_u64::<E>(bucket) };
+            match state.stream.clone_htod(bucket_u64) {
+                Ok(dev) => buckets[h] = Some(dev),
+                Err(_) => return None,
+            }
+        }
+    }
+
+    let transcript_snapshot = transcript.clone();
+    let mut fri_layer_list: Vec<FriLayer<E, FriLayerMerkleTreeBackend<E>>> =
+        Vec::with_capacity(layout.num_committed);
+
+    // `total_folds` folds: the first `num_committed` commit a layer; the last one
+    // is the terminal fold (no layer, coeffs emitted). Each fold to height `h`
+    // injects `combined[h]`.
+    for fold_idx in 0..layout.total_folds as usize {
+        let beta: FieldElement<E> = transcript.sample_field_element();
+        let beta_ptr = &beta as *const FieldElement<E> as *const u64;
+        // SAFETY: E == Ext3.
+        let beta_raw: [u64; 3] = unsafe { [*beta_ptr, *beta_ptr.add(1), *beta_ptr.add(2)] };
+        let beta_sq = beta.square();
+        let bsq_ptr = &beta_sq as *const FieldElement<E> as *const u64;
+        let beta_sq_raw: [u64; 3] = unsafe { [*bsq_ptr, *bsq_ptr.add(1), *bsq_ptr.add(2)] };
+
+        let inject_h = h_max - fold_idx - 1;
+        let bucket_arg = buckets
+            .get(inject_h)
+            .and_then(Option::as_ref)
+            .map(|b| (beta_sq_raw, b));
+
+        let (evals_u64, evals_dev, dev_tree) =
+            match state.fold_inject_commit_layer(beta_raw, bucket_arg, true) {
+                Ok(v) => v,
+                Err(_) => {
+                    *transcript = transcript_snapshot;
+                    return None;
+                }
+            };
+
+        if fold_idx < layout.num_committed {
+            let evaluation = evals_u64.map(|v| u64_to_ext3_vec::<E>(&v)).unwrap_or_default();
+            let root = dev_tree.root;
+            let merkle_tree = MerkleTree::<FriLayerMerkleTreeBackend<E>>::from_root(root);
+            fri_layer_list.push(FriLayer {
+                evaluation,
+                merkle_tree,
+                gpu_tree: Some(dev_tree),
+                gpu_evals: None,
+            });
+            let _ = evals_dev;
+            transcript.append_bytes(&root);
+        } else {
+            // Terminal fold: emit the low-degree coefficients.
+            let terminal = u64_to_ext3_vec::<E>(&evals_u64.expect("terminal fold drains to host"));
+            let terminal_offset = coset_offset.pow(1u64 << layout.total_folds);
+            let final_poly_coeffs = crate::fri::terminal::coeffs_from_terminal_codeword::<F, E>(
+                &terminal,
+                &terminal_offset,
+                layout.effective_k,
+            );
+            for c in &final_poly_coeffs {
+                transcript.append_field_element(c);
+            }
+            GPU_FRI_CALLS.fetch_add(1, Ordering::Relaxed);
+            return Some((final_poly_coeffs, fri_layer_list));
+        }
+    }
+    // total_folds >= 1 guarantees the terminal branch above returned.
+    unreachable!("batched FRI drive: terminal fold not reached")
+}
+
 /// GPU FRI query phase: gather each layer's paths on device instead of walking
 /// host trees. For layer `l` and query `iota` the opened position is
 /// `(iota >> l) >> 1`, matching [`crate::fri::query_phase`]. Paths for all

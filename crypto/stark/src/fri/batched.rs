@@ -339,12 +339,32 @@ where
     let (h_min, h_max) = bucket_height_range(&combined)
         .expect("batched_commit_phase: combined must have at least one Some entry");
 
+    let domain_size = 1usize << h_max;
+    // Inverse twiddle factors for the initial domain size.
+    let inv_twiddles = compute_coset_twiddles_inv(coset_offset, domain_size);
+
+    // GPU fast path: drive the fold → inject → commit loop below on the device
+    // (`fri_inject_bucket_ext3` + `FriCommitState::fold_inject_commit_layer`),
+    // returning `None` with the transcript restored to fall back to the host.
+    #[cfg(feature = "cuda")]
+    if let Some(result) = crate::gpu_lde::try_batched_fri_commit_gpu::<F, E, T>(
+        &combined,
+        transcript,
+        coset_offset,
+        blowup_log,
+        final_poly_log_degree,
+        &inv_twiddles,
+        h_min,
+        h_max,
+    ) {
+        return result;
+    }
+
     // Take the starting codeword — NOT committed; it plays the role of layer 0.
     let mut running = combined[h_max]
         .take()
         .expect("combined[h_max] is Some by construction");
 
-    let domain_size = 1usize << h_max;
     debug_assert_eq!(
         running.len(),
         domain_size,
@@ -353,8 +373,7 @@ where
 
     let layout = BatchedFriLayout::new(h_max, h_min, blowup_log, final_poly_log_degree);
 
-    // Inverse twiddle factors for the initial domain size.
-    let mut inv_twiddles = compute_coset_twiddles_inv(coset_offset, domain_size);
+    let mut inv_twiddles = inv_twiddles;
 
     let mut fri_layer_list = Vec::with_capacity(layout.num_committed);
 

@@ -116,6 +116,27 @@ impl FriCommitState {
         Arc<CudaSlice<u64>>,
         crate::lde::GpuMerkleTree,
     )> {
+        self.fold_inject_commit_layer(zeta_raw, None, want_host)
+    }
+
+    /// Like [`Self::fold_and_commit_layer`], but between the fold and the Merkle
+    /// commit it injects a shorter DEEP bucket into the folded codeword —
+    /// `running += beta_sq * bucket` (ext3), the batched FRI's height-combine
+    /// step (`fri/batched.rs`'s `inject_bucket`). `bucket` is
+    /// `Some((beta_sq_raw, codeword))` when a bucket at THIS layer's height
+    /// exists; its codeword must hold `current_n / 2` ext3 elements (the folded
+    /// length). `None` reproduces the plain commit.
+    #[allow(clippy::type_complexity)]
+    pub fn fold_inject_commit_layer(
+        &mut self,
+        zeta_raw: [u64; 3],
+        bucket: Option<([u64; 3], &CudaSlice<u64>)>,
+        want_host: bool,
+    ) -> Result<(
+        Option<Vec<u64>>,
+        Arc<CudaSlice<u64>>,
+        crate::lde::GpuMerkleTree,
+    )> {
         #[cfg(feature = "test-faults")]
         check_fault_injection()?;
         let be = backend()?;
@@ -156,6 +177,22 @@ impl FriCommitState {
                 .arg(&zeta_dev)
                 .arg(&mut out)
                 .launch(cfg)?;
+        }
+
+        // Batched injection: add this height's DEEP bucket into the folded
+        // codeword before it is committed (`running += beta_sq * bucket`), so the
+        // layer root binds the combined word — the device twin of `inject_bucket`.
+        if let Some((beta_sq_raw, bucket)) = bucket {
+            let beta_sq_dev = self.stream.clone_htod(&beta_sq_raw)?;
+            unsafe {
+                self.stream
+                    .launch_builder(&be.fri_inject_bucket_ext3)
+                    .arg(&mut out)
+                    .arg(bucket)
+                    .arg(&beta_sq_dev)
+                    .arg(&n_out_u64)
+                    .launch(cfg)?;
+            }
         }
 
         // SAFETY: keccak_fri_leaves_ext3 writes the leaves [num_leaves-1, 2*num_leaves-1)
