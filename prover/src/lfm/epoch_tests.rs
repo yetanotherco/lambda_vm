@@ -4702,3 +4702,96 @@ fn the_closure_rejects_a_moved_index_or_output() {
         );
     }
 }
+
+/// ★ **THE ROOT-WIDTH GATE** — the arena WRITER and the machine READER must
+/// agree on how many words a commitment occupies, and on what its published
+/// lanes are.
+///
+/// Three counts have to line up for a root to survive the trip:
+/// `proof_arena::words_per_root` (host — what the arena writer strides by),
+/// `epoch::RootCells::words_per_root` (machine — what `RootCells::hint`
+/// consumes) and `proof_arena::lanes_per_root` (what a PUBLISHED root occupies
+/// in the schema). All three read the configuration's digest width and none
+/// restates it — but "none restates it" is an argument, and this is the check.
+///
+/// ⚠ **The failure it exists for is not a shape error.** A reader striding by
+/// two where the writer strode by one reads root k+1's first word as root k's
+/// second: a well-formed root that authenticates nothing, surfacing as
+/// `DivByZero` thousands of instructions downstream with nothing named. Two
+/// roots are hinted BACK TO BACK for exactly that reason — a stride that is
+/// wrong only *between* roots reads correctly at root 0 and cannot hide here.
+///
+/// ⚖ ASSESSMENT: this gate is about WIDTH, not about the felt↔byte rendering.
+/// `lanes_flat` yields `u32` halves on a byte hash and full felts on an
+/// algebraic one, and a caller that hands the wrong one to a byte fold gets a
+/// plausible count with wrong content — `RootCells::byte_halves` exists for
+/// that distinction and is gated where it is used, not here.
+#[test]
+fn the_arena_writer_and_the_machine_reader_agree_on_a_roots_width() {
+    use super::proof_arena::{commitment_lanes, commitment_words, lanes_per_root, words_per_root};
+
+    // Two DISTINCT roots. Any 32 bytes are a valid commitment on either arm:
+    // the byte arm reads them as eight little-endian `u32` halves, the
+    // algebraic one as four big-endian felts reduced into the field, and both
+    // conversions are the backend's own.
+    let roots: [Commitment; 2] = [
+        core::array::from_fn(|i| (0x03u8.wrapping_mul(i as u8)).wrapping_add(0x11)),
+        core::array::from_fn(|i| (0x05u8.wrapping_mul(i as u8)).wrapping_add(0xA3)),
+    ];
+
+    // ---- the three counts agree ----
+    let per_root = words_per_root();
+    for root in &roots {
+        assert_eq!(
+            commitment_words(root).len(),
+            per_root,
+            "the arena writer must emit exactly `words_per_root` words"
+        );
+        assert_eq!(
+            commitment_lanes(root).len(),
+            lanes_per_root(),
+            "a published root's lanes are its words' lanes"
+        );
+    }
+    assert_eq!(
+        lanes_per_root(),
+        super::word::WORD_LANES * per_root,
+        "a lane count is a word count times the word's lanes"
+    );
+
+    // ---- the machine reads them back at the same stride ----
+    let mut b = LfmBuilder::new().with_wrap_hash(edsl::WrapHash::production());
+    assert_eq!(
+        RootCells::words_per_root(&b) as usize,
+        per_root,
+        "the machine reader and the arena writer must stride alike"
+    );
+    let arena = b.declare_arena(2 * per_root as u32);
+    for k in 0..2u32 {
+        let cells = RootCells::hint(&mut b, arena, k * per_root as u32);
+        for lane in cells.lanes_flat() {
+            b.public(lane.as_cell());
+        }
+    }
+    let program = compile(b.finish());
+    let words: Vec<LfmWord> = roots.iter().flat_map(commitment_words).collect();
+    let exec = execute(&program, &[words], &crate::hash_pin::BLOCK_HASHER)
+        .expect("the root-width program must execute");
+
+    let want: Vec<FE> = roots.iter().flat_map(commitment_lanes).collect();
+    assert_eq!(
+        exec.public_words.len(),
+        want.len(),
+        "two roots publish exactly `2 * lanes_per_root` lanes"
+    );
+    for (i, want) in want.into_iter().enumerate() {
+        let got = super::word::word_as_base(&exec.public_words[i].1).expect("a root lane");
+        assert_eq!(
+            got,
+            want,
+            "root {} lane {}",
+            i / lanes_per_root(),
+            i % lanes_per_root()
+        );
+    }
+}

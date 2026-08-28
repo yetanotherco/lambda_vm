@@ -798,20 +798,6 @@ mod tests {
         assert_ne!(rpx, pos);
     }
 
-    /// ★★ **THE GRINDING GATE** — the host grinding digest and the in-VM
-    /// computation of it must agree, for every tenant.
-    ///
-    /// ⚠ Grinding is verified INSIDE the machine (`transcript_replay.rs`), so
-    /// this is not a host-only concern: if the two sides disagree, a proof-of-
-    /// work the prover found is one the verifier cannot confirm, and that fails
-    /// as an unprovable program rather than as a wrong answer.
-    ///
-    /// The preimage is `state ‖ nonce` — 32 + 8 bytes, five felts, **one rate
-    /// block** — so the machine side is a single `MODE_P` row. Every cell it
-    /// feeds is DERIVED from the exported rules ([`single_block_leaf_cells`]),
-    /// never restated: this lane has now written a host↔machine encoding three
-    /// times and twice a differential caught a machine side that had
-    /// hand-written a constant agreeing with the rule only until the rule moved.
     /// Each configuration NAMES its own hash, and the statement's program-identity
     /// tag agrees with that name.
     ///
@@ -1132,6 +1118,20 @@ mod tests {
         }
     }
 
+    /// ★★ **THE GRINDING GATE** — the host grinding digest and the in-VM
+    /// computation of it must agree, for every tenant.
+    ///
+    /// ⚠ Grinding is verified INSIDE the machine (`transcript_replay.rs`), so
+    /// this is not a host-only concern: if the two sides disagree, a proof-of-
+    /// work the prover found is one the verifier cannot confirm, and that fails
+    /// as an unprovable program rather than as a wrong answer.
+    ///
+    /// The preimage is `state ‖ nonce` — 32 + 8 bytes, five felts, **one rate
+    /// block** — so the machine side is a single `MODE_P` row. Every cell it
+    /// feeds is DERIVED from the exported rules ([`single_block_leaf_cells`]),
+    /// never restated: this lane has now written a host↔machine encoding three
+    /// times and twice a differential caught a machine side that had
+    /// hand-written a constant agreeing with the rule only until the rule moved.
     #[test]
     fn the_host_grinding_digest_and_the_machine_agree() {
         use crate::lfm::builder::LfmBuilder;

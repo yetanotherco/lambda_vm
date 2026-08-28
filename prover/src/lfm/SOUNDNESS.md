@@ -288,6 +288,116 @@ recompute-and-compare check. **If a future change ever has a verifier accept a g
 rather than recompute it, this subsection is the one that has to be revisited**, and at that point
 the fix is a fourth mode rather than a fourth constant.
 
+### 6.6 The APPEND CALL BOUNDARY is part of the message
+
+**The rule.** A machine-side transcript replay must reproduce the host's `append_bytes` calls
+**one for one** — same number of calls, same split — not merely the concatenation of their bytes.
+
+**Why the byte arm hides it.** A byte transcript absorbs into one flat segment: the sponge sees a
+byte stream, so splitting one 64-byte absorb into two 32-byte ones, or coalescing two into one, is
+invisible. Emitters written against a byte hash therefore coalesce freely, and nothing in the code
+records that the boundary ever mattered. An **algebraic** transcript length-prefixes every
+`append_bytes` call, so the boundary is *in* the message: a coalesced replay absorbs a different
+message and derives different challenges.
+
+**How it fails.** Not as a wrong answer. The replay's challenge diverges from the host's, the leg
+then inverts a difference that should have been non-zero, and the executor reports `DivByZero` at
+some address — thousands of instructions from the cause, naming nothing. ✓ VERIFIED: six live
+instances were found this way on the migration, in the LFM statement, the global statement and the
+per-leg absorbs; each was a coalescing that was correct under BLAKE3.
+
+⚖ ASSESSMENT — **what class this is.** The length prefix is a soundness feature *of the algebraic
+transcript*: it makes the absorbed stream unambiguous, so a prover cannot re-split a message to
+land on another message's state. A replay that coalesces does not break that — it absorbs a
+different, still-unambiguous message — so the defect presents as **completeness** (the wrap program
+cannot prove) rather than as a forgery. It is recorded here because the *rule* is what keeps it
+that way: the moment a replay is allowed to differ from the host by "the same bytes, different
+calls", the transcript's injectivity stops being the thing the two sides agree on.
+
+**The general form, which is what to carry forward.** *When the byte hash makes a distinction
+irrelevant, the code stops expressing it, and the algebraic hash needs it back.* ✓ VERIFIED three
+instances of that shape: this one; the Fiat–Shamir transcript OBJECT being separable from the
+commitment configuration (§6.7, axis 2); and the `LFM_HASH` socket permutation being consulted at
+all (§6.7, axis 3).
+
+### 6.7 THE HASH IS NAMED, NEVER IMPLIED — three axes, and two deliberate carve-outs
+
+**The rule.** Every prove, verify, execute and commitment-building call on the block path names the
+pin (`hash_pin::BlockStarkHash`, `hash_pin::BlockTranscript` / `block_transcript`,
+`hash_pin::BLOCK_HASHER`). None reaches a workspace default alias.
+
+**Three orthogonal axes.** They must agree and nothing in the type system makes them:
+
+1. **The commitment configuration** — what the HOST commits under (`BlockStarkHash`). Reaching
+   `stark::config::DefaultStarkHash`, or the `stark::prover::Prover` / `stark::verifier::Verifier`
+   aliases (which are `GenericProver`/`GenericVerifier` *at* that default), pins BLAKE3 whatever
+   `H` the surrounding code passes.
+2. **The Fiat–Shamir transcript OBJECT** — built by the caller and handed to `multi_prove`, so its
+   type is not forced to match (1). ⚠ **This is the dangerous axis**: a half-flip is
+   self-consistent between prover and verifier and therefore **silent**, where (1) and (3) fail
+   loudly.
+3. **The `LFM_HASH` socket permutation** — which permutation the MACHINE's `Instr::Hash` rows
+   compute, passed per call to `execute` / `lfm_prove_with_hasher`. ★ Under a byte hash the
+   emitter's Merkle work lowers to the dedicated KECCAK / `LFM_BLAKE3` chips and emits no
+   `Instr::Hash` at all, so this argument is never consulted and a toy permutation is free and
+   correct — which is exactly why it stayed unnamed until an algebraic pin made it load-bearing.
+
+✓ VERIFIED: eleven sites were carrying an implied hash and were closed by enumerating every call
+site rather than by search; two of them were on axis 3.
+
+⛔ **TWO DELIBERATE CARVE-OUTS. Do not "fix" these — they are pinned KECCAK on every arm.**
+
+- `programs::emit_program_id` and its host counterpart `recursion::program_id_from_digest`. A
+  `program_id` identifies a program to CONSUMERS; it is not part of the proof system's commitment
+  layer. Following the configured hash would make the attestation join disagree with every host
+  consumer of a `program_id`, and the disagreement would surface as a consumer-side compare
+  failing rather than as an unprovable program. ✓ VERIFIED both name their hash explicitly.
+- `statement::elf_digest` (`prover/src/statement.rs:30`), same class: it names `Keccak256`
+  directly. ✓ VERIFIED.
+
+⚠ A naive sweep — "replace every `edsl::keccak256`" — produces a wrong proof at exactly these two
+sites, because grinding (`epoch::emit_grinding_check`) shares the same `ByteString` type and DOES
+follow the configuration.
+
+**A consequence for widths.** Because the id stays a two-cell keccak digest while a commitment root
+becomes one algebraic cell, a schema holding both carries two different root widths. Anything that
+counts published words must read `proof_arena::lanes_per_root` for a COMMITMENT and keep the
+literal two for the ID. `epoch_tests::the_arena_writer_and_the_machine_reader_agree_on_a_roots_width`
+gates the first; the second is stated at `aggregator_tests::WrapPublicLayout`.
+
+### 6.8 A FALSE DOC CLAIM RECRUITS THE NEXT CALLER — treat it as a defect, not a typo
+
+**The rule.** A helper whose doc asserts a capability its body does not have is a defect of the
+same class as the code errors above, and is worse than no doc at all: no doc makes a caller read
+the body, a wrong doc makes them skip it.
+
+✓ VERIFIED two instances on this migration, both structurally unreachable at the time and both
+therefore invisible to every test:
+
+- `edsl::digest_halves` — "Hash-agnostic: it is two `Unpack`s." It indexes `d[1]`, and an
+  algebraic `WrapDigest` is ONE cell whose second slot REPEATS the first
+  (`WrapDigest::from_cell`), so on that arm it would have returned `lo ‖ lo`: eight plausible
+  halves, four of them a duplicate, with nothing to notice. Now carries an emit-time width assert.
+- `edsl::parent_stream` — "Hash-agnostic … under either hash", on the one function that calls
+  `digest_halves`. Two false claims on a helper pair, which is the ordinary way this spreads.
+
+⚖ ASSESSMENT of severity: neither was reachable, so neither was a live bug — and that is exactly
+what makes the class worth naming. Unreachable-but-wrong survives every test suite indefinitely
+and is discharged only when a future caller takes the claim at face value, at which point it is a
+live bug in someone else's change.
+
+**The cheap instrument.** Grep the hash-adjacent helpers for generality phrases — "hash-agnostic",
+"either arm", "both hashes", "on both arms" — and check each against its body. That sweep found
+the two above and confirmed six others sound.
+
+★ **What the sound ones have in common is the fix.** `ByteWrapHash::hash_bytes` says "Both hashes
+take the SAME packing" and is correct, because it hangs on `ByteWrapHash`, a type whose only two
+inhabitants ARE the byte hashes — the claim cannot over-reach because the type will not let it.
+`epoch::RootCells::byte_halves` says "correct on both arms" and is correct because its body has an
+explicit algebraic branch. `transcript_replay::sample` names the algebraic arm and explains why its
+behaviour there is a DEFINITION rather than a fidelity claim. **So the durable remedy is the same
+one the width defects want: put the distinction in a TYPE, and the doc cannot lie about it.**
+
 ## 7. Reviewer checklist (reject if any fails)
 
 0. For an algebraic configuration: is grinding still a RECOMPUTE-and-compare check (§6.5)? If a
@@ -310,6 +420,14 @@ the fix is a fourth mode rather than a fourth constant.
 8. Is the base tree at or past every framework verifier fix the inherited premises of §1.1 name —
    currently per-column opening-width pinning (`trace_opening_widths_well_formed`, #909 /
    `6949ceb9`)? On an older base (B) is not delivered, and nothing below §1.1 can recover it.
+9. For an algebraic configuration: does every machine-side transcript replay match the host's
+   `append_bytes` calls ONE FOR ONE, not just byte for byte (§6.6)? A coalesced absorb is correct
+   under a byte hash and derives a different challenge under an algebraic one.
+10. Does every prove / verify / execute call on the block path NAME the pin rather than reach a
+    default alias, on all three axes (§6.7)? And are the two keccak carve-outs — `program_id` and
+    `elf_digest` — still pinned rather than following the configuration?
+11. Does every hash-adjacent helper's doc match its body (§6.8)? A "hash-agnostic" claim on a
+    function that indexes a second digest cell is a defect even when nothing reaches it.
 
 ## 8. Proven bits at the aggregation-era presets (the η re-tune, applied)
 
