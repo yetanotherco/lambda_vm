@@ -362,6 +362,63 @@ where
     let main_root = main_mmcs.root();
     transcript.append_bytes(&main_root);
 
+    // GPU cross-check (3c): the device mixed-height MMCS must build the same
+    // main-round root the host `StreamingMmcsBuilder` just did, from the same
+    // matrices (same height grouping, same absorb order, same column ranges).
+    // Inert unless every contributing main LDE is retained (so `RecomputeLde`
+    // skips it), the field is Goldilocks (the kernels are), and there is a GPU.
+    #[cfg(feature = "cuda")]
+    {
+        use math::field::goldilocks::GoldilocksField;
+        use std::any::TypeId;
+        if TypeId::of::<Field>() == TypeId::of::<GoldilocksField>() {
+            let mut raws: Vec<(Vec<u64>, u64, u64, u64)> = Vec::new();
+            let mut all_present = true;
+            for table in 0..num_tables {
+                if shape.carved_main.map(|c| c.table) == Some(table) {
+                    continue;
+                }
+                match &retained_main[table] {
+                    Some((data, total_cols)) => {
+                        let width = matrix_width(&shape.main, table) as u64;
+                        let stride = *total_cols as u64;
+                        // SAFETY: Field == GoldilocksField (checked), whose element
+                        // value is a `u64` — the same cast the per-table GPU commit
+                        // uses (`gpu_lde::columns_to_u64_base`).
+                        let raw: Vec<u64> = data
+                            .iter()
+                            .map(|e| unsafe { *(e.value() as *const _ as *const u64) })
+                            .collect();
+                        raws.push((raw, stride, stride - width, shape.heights[table] as u64));
+                    }
+                    None => {
+                        all_present = false;
+                        break;
+                    }
+                }
+            }
+            if all_present && !raws.is_empty() {
+                let inputs: Vec<math_cuda::mmcs::MmcsRowMajorInput> = raws
+                    .iter()
+                    .map(|(d, stride, col_start, h)| math_cuda::mmcs::MmcsRowMajorInput {
+                        data: d.as_slice(),
+                        stride: *stride,
+                        col_start: *col_start,
+                        col_end: *stride,
+                        log_height: *h,
+                    })
+                    .collect();
+                if let Ok(dev_root) = math_cuda::mmcs::commit_mixed_row_major_root(&inputs) {
+                    debug_assert_eq!(
+                        dev_root, main_root,
+                        "device main-round MMCS root must equal the host \
+                         StreamingMmcsBuilder root"
+                    );
+                }
+            }
+        }
+    }
+
     // =====================================================================
     // Phase 2 — LogUp challenges, then the auxiliary round
     // =====================================================================

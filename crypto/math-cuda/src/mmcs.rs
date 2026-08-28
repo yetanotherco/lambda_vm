@@ -320,3 +320,48 @@ pub fn read_mmcs_root(stream: &Arc<CudaStream>, nodes: &CudaSlice<u8>) -> Result
     root.copy_from_slice(&bytes);
     Ok(root)
 }
+
+/// One base-field matrix feeding a mixed-height MMCS commit, in absorb order.
+/// `data` is the full ROW-MAJOR `stride`-wide LDE buffer (Goldilocks u64 words);
+/// columns `[col_start, col_end)` are the ones committed (a preprocessed table
+/// commits its non-precomputed range).
+pub struct MmcsRowMajorInput<'a> {
+    pub data: &'a [u64],
+    pub stride: u64,
+    pub col_start: u64,
+    pub col_end: u64,
+    pub log_height: u64,
+}
+
+/// Build the whole mixed-height MMCS tree on the GPU from row-major base-field
+/// matrices and return its root — the device twin of the host
+/// `StreamingMmcsBuilder`: matrices are grouped by height, each group's leaves
+/// concatenate its matrices in the given order, and the climb injects the
+/// shorter groups. Callers hand matrices in the SAME order the host absorbs them.
+///
+/// Uploads each matrix and frees it before the next (the streaming residency
+/// policy). `inputs` must be non-empty and include the tallest height.
+pub fn commit_mixed_row_major_root(inputs: &[MmcsRowMajorInput]) -> Result<[u8; 32]> {
+    let be = backend()?;
+    let stream = be.next_stream();
+
+    let h_max = inputs.iter().map(|m| m.log_height).max().unwrap_or(0);
+    let mut group_digests: Vec<Option<CudaSlice<u8>>> = (0..=h_max).map(|_| None).collect();
+
+    let mut h = h_max;
+    while h >= 1 {
+        if inputs.iter().any(|m| m.log_height == h) {
+            let mut hasher = MmcsGroupHasher::new(&stream, h)?;
+            for m in inputs.iter().filter(|m| m.log_height == h) {
+                let dev = stream.clone_htod(m.data)?;
+                hasher.absorb_row_major(&stream, &dev, m.stride, m.col_start, m.col_end)?;
+                drop(dev);
+            }
+            group_digests[h as usize] = Some(hasher.finalize(&stream)?);
+        }
+        h -= 1;
+    }
+
+    let nodes = build_mmcs_tree_on_device(&stream, &group_digests)?;
+    read_mmcs_root(&stream, &nodes)
+}
