@@ -7,7 +7,7 @@
 #let (inputSpace, input) = ($II$, $bb(i)$)
 #let (instanceSpace, instance) = ($XX$, $bb(x)$)
 #let (witnessSpace, witness) = ($WW$, $bb(w)$)
-#let (proofSpace, proof) = ($bb(Pi)$, $bb(pi)$)
+#let (proofSpace, proof) = ($bb(Pi)$, $pi$)
 
 #let (commitmentSpace, commitment) = ($cal(C)$, $bb(c)$)
 #let commit(x) = $overline(#x)$
