@@ -59,10 +59,10 @@ use stark::lookup::{AirWithBuses, AuxiliaryTraceBuildData, NullBoundaryConstrain
 use stark::proof::options::ProofOptions;
 use stark::proof::stark::MultiProof;
 use stark::proof::view::MultiProofView;
-use stark::prover::{IsStarkProver, Prover};
+use stark::prover::IsStarkProver;
 use stark::trace::TraceTable;
 use stark::traits::AIR;
-use stark::verifier::{IsStarkVerifier, Verifier};
+use stark::verifier::IsStarkVerifier;
 
 use crate::statement::{StatementKind, absorb_continuation_global_statement, absorb_statement};
 use crate::tables::local_to_global::{self, CellBoundary};
@@ -1085,7 +1085,7 @@ fn prove_epoch(
 
     let (proof, l2g_root) = match format {
         EpochProofFormat::PerTable => {
-            let proof = Prover::multi_prove(
+            let proof = crate::hash_pin::BlockProver::<F, E, ()>::multi_prove(
                 pairs,
                 &mut seed(),
                 #[cfg(feature = "disk-spill")]
@@ -1300,7 +1300,12 @@ fn verify_epoch(
             { stark::profile_markers::STEP_AIRS_AND_BUS_BALANCE_DONE },
         >();
 
-        if !Verifier::multi_verify_views(&refs, proof, &mut seed(), &expected) {
+        if !crate::hash_pin::BlockVerifier::<F, E, ()>::multi_verify_views(
+            &refs,
+            proof,
+            &mut seed(),
+            &expected,
+        ) {
             return Ok(false);
         }
 
@@ -1420,7 +1425,7 @@ fn prove_global(
         pairs.push((air as AirRef, trace, &()));
     }
 
-    Prover::multi_prove(
+    crate::hash_pin::BlockProver::<F, E, ()>::multi_prove(
         pairs,
         &mut global_transcript(
             elf_bytes,
@@ -1511,7 +1516,7 @@ fn verify_global(
     stark::profile_markers::step_marker::<{ stark::profile_markers::STEP_AIRS_AND_BUS_BALANCE_DONE }>(
     );
 
-    Verifier::multi_verify_views(
+    crate::hash_pin::BlockVerifier::<F, E, ()>::multi_verify_views(
         &refs,
         proof,
         &mut global_transcript(
