@@ -3780,12 +3780,12 @@ fn epoch_program_with(e: &RealEpoch, with_legs: bool, split_decode: bool) -> Lfm
     // algebraic arm `lanes_flat` is four FULL FELTS, so that call would declare
     // sixteen bytes where the host declared thirty-two — a different length
     // prefix and a different payload, hence a different chain from the first
-    // root onward. `halves` is the same eight on both arms.
+    // root onward. `byte_halves` is the same eight on both arms.
     let prep_halves: Vec<Option<Vec<_>>> = prep_cells
         .iter()
-        .map(|c| c.as_ref().map(|c| c.halves(&mut b)))
+        .map(|c| c.as_ref().map(|c| c.byte_halves(&mut b)))
         .collect();
-    let main_halves: Vec<Vec<_>> = main_cells.iter().map(|c| c.halves(&mut b)).collect();
+    let main_halves: Vec<Vec<_>> = main_cells.iter().map(|c| c.byte_halves(&mut b)).collect();
     // The interned bytes, hoisted so Phase A can borrow them for the whole replay.
     let prep_constants: Vec<Option<Commitment>> = e
         .phase_a

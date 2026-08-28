@@ -180,7 +180,7 @@ fn the_machine_transcript_tracks_the_host_absorb_for_absorb() {
 
         let root_arena = b.declare_arena(super::epoch::RootCells::words_per_root(&b));
         let root_cells = super::epoch::RootCells::hint(&mut b, root_arena, 0);
-        let phase_a_halves = root_cells.halves(&mut b);
+        let phase_a_halves = root_cells.byte_halves(&mut b);
         t.append_halves_misaligned(&phase_a_halves);
         publish(&mut b, &mut t);
 

@@ -1504,8 +1504,8 @@ pub(super) fn global_verifier_program(g: &RealGlobal) -> LfmProgram {
     // algebraic arm `lanes_flat` is four FULL FELTS, so that call would declare
     // sixteen bytes where the host declared thirty-two — a different length
     // prefix and a different payload, hence a different chain from the first
-    // root onward. `halves` is the same eight on both arms.
-    let main_halves: Vec<Vec<Felt>> = main_cells.iter().map(|c| c.halves(&mut b)).collect();
+    // root onward. `byte_halves` is the same eight on both arms.
+    let main_halves: Vec<Vec<Felt>> = main_cells.iter().map(|c| c.byte_halves(&mut b)).collect();
     let prep_cells: Vec<Option<RootCells>> = g
         .tables
         .iter()
