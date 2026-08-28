@@ -198,3 +198,81 @@ fn paths_match_the_host_at_every_query() {
         }
     }
 }
+
+/// Column-major raw buffer of a matrix: element `(row, col)` at
+/// `col * num_rows + row`. This is main's resident `GpuLdeBase` layout, which
+/// `absorb_col_major` reads directly (no host transpose).
+fn raw_col_major(data: &[Fp], log_height: usize, width: usize) -> Vec<u64> {
+    let num_rows = 1usize << log_height;
+    let mut out = vec![0u64; num_rows * width];
+    for row in 0..num_rows {
+        for col in 0..width {
+            out[col * num_rows + row] = *data[row * width + col].value();
+        }
+    }
+    out
+}
+
+/// Like [`device_tree`], but feeds every matrix COLUMN-MAJOR through
+/// `absorb_col_major` — the bridge for main's resident base-field LDEs.
+fn device_tree_col_major(mats: &Matrices) -> [u8; 32] {
+    let be = math_cuda::device::backend().expect("a GPU box");
+    let stream = be.next_stream();
+
+    let h_max = (0..mats.num_matrices())
+        .map(|m| mats.log_height(m))
+        .max()
+        .expect("non-empty");
+
+    let mut group_digests: Vec<Option<cudarc::driver::CudaSlice<u8>>> =
+        (0..=h_max).map(|_| None).collect();
+
+    for (h, slot) in group_digests.iter_mut().enumerate().skip(1) {
+        let group: Vec<usize> = (0..mats.num_matrices())
+            .filter(|&m| mats.log_height(m) == h)
+            .collect();
+        if group.is_empty() {
+            continue;
+        }
+        let mut hasher = math_cuda::mmcs::MmcsGroupHasher::new(&stream, h as u64)
+            .expect("group sponge allocation");
+        for &m in &group {
+            let (data, log_height, width) = &mats.mats[m];
+            let num_rows = 1u64 << log_height;
+            let dev = stream
+                .clone_htod(&raw_col_major(data, *log_height, *width))
+                .expect("H2D");
+            hasher
+                .absorb_col_major(&stream, &dev, num_rows, 0, *width as u64)
+                .expect("absorb col-major");
+            drop(dev);
+        }
+        *slot = Some(hasher.finalize(&stream).expect("finalize"));
+    }
+
+    let nodes = math_cuda::mmcs::build_mmcs_tree_on_device(&stream, &group_digests)
+        .expect("device tree build");
+    math_cuda::mmcs::read_mmcs_root(&stream, &nodes).expect("root readback")
+}
+
+/// ★ RISK #1: main hands the batched prover its resident base-field LDEs
+/// COLUMN-MAJOR (`GpuLdeBase.buf`), but the MMCS leaf hash is defined row-major.
+/// `absorb_col_major` must produce the identical tree. Same mixed-height fixture
+/// as `mixed_height_root_matches_the_host`, fed column-major.
+#[test]
+fn col_major_root_matches_the_host() {
+    let mats = Matrices {
+        mats: vec![
+            matrix(7, 3, 11),
+            matrix(7, 6, 23),
+            matrix(5, 2, 41),
+            matrix(2, 4, 59),
+        ],
+    };
+    assert_eq!(
+        device_tree_col_major(&mats),
+        Mmcs::commit(&mats).root(),
+        "a device commit fed from a column-major (resident-LDE) buffer must match \
+         the host tree byte for byte — the col-major absorb bridge"
+    );
+}

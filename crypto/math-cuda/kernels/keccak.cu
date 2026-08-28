@@ -705,6 +705,47 @@ extern "C" __global__ void mmcs_absorb_row_pair_row_major(
     rate_pos[tid] = rp;
 }
 
+// Absorb one COLUMN-MAJOR base-field matrix's row pair — main's resident LDE
+// layout (`GpuLdeBase`): element (row, col) at `col * col_stride + row`. Same
+// absorbed byte order as `mmcs_absorb_row_pair_row_major`, so a matrix fed here
+// column-major produces the identical leaf digests it would fed row-major, and
+// the tree over them is byte-identical to the host's.
+extern "C" __global__ void mmcs_absorb_row_pair_col_major(
+    uint64_t *states,
+    uint32_t *rate_pos,
+    const uint64_t *data,
+    uint64_t col_stride,
+    uint64_t col_start,
+    uint64_t col_end,
+    uint64_t num_rows,
+    uint64_t log_num_rows,
+    uint64_t num_leaves)
+{
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_leaves) return;
+    (void)num_rows;
+
+    uint64_t br_0 = __brevll(2 * tid) >> (64 - log_num_rows);
+    uint64_t br_1 = __brevll(2 * tid + 1) >> (64 - log_num_rows);
+
+    uint64_t st[25];
+    uint64_t *st_g = states + tid * 25;
+    #pragma unroll
+    for (int i = 0; i < 25; ++i) st[i] = st_g[i];
+    uint32_t rp = rate_pos[tid];
+
+    for (uint64_t c = col_start; c < col_end; ++c) {
+        absorb_lane(st, rp, bswap64(goldilocks::canonical(data[c * col_stride + br_0])));
+    }
+    for (uint64_t c = col_start; c < col_end; ++c) {
+        absorb_lane(st, rp, bswap64(goldilocks::canonical(data[c * col_stride + br_1])));
+    }
+
+    #pragma unroll
+    for (int i = 0; i < 25; ++i) st_g[i] = st[i];
+    rate_pos[tid] = rp;
+}
+
 // Absorb one COLUMN-MAJOR ext3 slab matrix's row pair — the composition-poly
 // LDE layout (`GpuLdeExt3`): component `k` of column `c` at
 // `(c*3 + k) * col_stride`. Same absorbed byte order as

@@ -131,6 +131,54 @@ impl MmcsGroupHasher {
         Ok(())
     }
 
+    /// Absorb one COLUMN-MAJOR base-field matrix's row pair into every leaf —
+    /// main's resident LDE layout (`GpuLdeBase`), element `(row, col)` at
+    /// `col * col_stride + row`. Columns `[col_start, col_end)` are absorbed.
+    ///
+    /// Produces the identical leaf digests as [`Self::absorb_row_major`] over the
+    /// same matrix (same absorbed byte stream, only the read layout differs), so
+    /// a device commit fed from a resident column-major LDE is byte-identical to
+    /// the host tree. This is the bridge for main's resident base-field LDEs,
+    /// which are column-major; the ext3 parts already match [`Self::absorb_ext3_slabs`].
+    ///
+    /// The caller may free `data` as soon as this returns on `stream`.
+    pub fn absorb_col_major(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        data: &CudaSlice<u64>,
+        col_stride: u64,
+        col_start: u64,
+        col_end: u64,
+    ) -> Result<()> {
+        let num_rows = 1u64 << self.log_num_rows;
+        assert!(
+            col_start <= col_end,
+            "column range [{col_start}, {col_end}) is empty-or-inverted"
+        );
+        assert!(
+            num_rows <= col_stride,
+            "col_stride {col_stride} must hold all {num_rows} rows of a column"
+        );
+        let be = backend()?;
+        let cfg = keccak_launch_cfg(self.num_leaves);
+        unsafe {
+            stream
+                .launch_builder(&be.mmcs_absorb_row_pair_col_major)
+                .arg(&mut self.states)
+                .arg(&mut self.rate_pos)
+                .arg(data)
+                .arg(&col_stride)
+                .arg(&col_start)
+                .arg(&col_end)
+                .arg(&num_rows)
+                .arg(&self.log_num_rows)
+                .arg(&self.num_leaves)
+                .launch(cfg)?;
+        }
+        self.absorbed += 1;
+        Ok(())
+    }
+
     /// Absorb one column-major ext3 slab matrix — the composition-poly LDE
     /// layout, component `k` of column `c` at `(c*3 + k) * col_stride`.
     pub fn absorb_ext3_slabs(

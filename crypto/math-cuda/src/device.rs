@@ -207,6 +207,7 @@ pub struct Backend {
     // group never needs all its LDEs resident — see `kernels/keccak.cu`.
     pub mmcs_states_init: CudaFunction,
     pub mmcs_absorb_row_pair_row_major: CudaFunction,
+    pub mmcs_absorb_row_pair_col_major: CudaFunction,
     pub mmcs_absorb_row_pair_ext3_slabs: CudaFunction,
     pub mmcs_states_finalize: CudaFunction,
     pub keccak_mmcs_level: CudaFunction,
@@ -448,6 +449,8 @@ impl Backend {
             mmcs_states_init: keccak.load_function("mmcs_states_init")?,
             mmcs_absorb_row_pair_row_major: keccak
                 .load_function("mmcs_absorb_row_pair_row_major")?,
+            mmcs_absorb_row_pair_col_major: keccak
+                .load_function("mmcs_absorb_row_pair_col_major")?,
             mmcs_absorb_row_pair_ext3_slabs: keccak
                 .load_function("mmcs_absorb_row_pair_ext3_slabs")?,
             mmcs_states_finalize: keccak.load_function("mmcs_states_finalize")?,
