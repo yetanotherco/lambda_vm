@@ -1720,7 +1720,8 @@ fn leg_arena_words(e: &RealBatchedLfm) -> Vec<Vec<LfmWord>> {
 fn the_lfm_wrap_leg_runs_and_matches_the_host_replay() {
     let (e, program) = fixture_leg();
     let arenas = leg_arena_words(&e);
-    let exec = execute(&program, &arenas, &crate::hash_pin::block_hasher_kind()).expect("the leg must execute");
+    let exec = execute(&program, &arenas, &crate::hash_pin::block_hasher_kind())
+        .expect("the leg must execute");
 
     let pub_ext = |i: usize| super::word::word_as_ext(&exec.public_words[i].1).expect("an ext");
     assert_eq!(pub_ext(0), e.challenges.lookup[0], "z");
@@ -1932,7 +1933,8 @@ fn the_assembled_aggregator_runs_on_the_fixture_chain() {
     let mut arenas: Vec<Vec<LfmWord>> = f.wraps.iter().flat_map(leg_arena_words).collect();
     arenas.extend(leg_arena_words(&f.global_wrap));
     arenas.push(attestation_arena_words(&f));
-    let exec = execute(&program, &arenas, &crate::hash_pin::block_hasher_kind()).expect("the aggregate must execute");
+    let exec = execute(&program, &arenas, &crate::hash_pin::block_hasher_kind())
+        .expect("the aggregate must execute");
 
     // The consumer's own recompute is the oracle for the published id.
     let expected = crate::recursion::program_id_from_digest(
@@ -2070,7 +2072,8 @@ fn the_global_verifier_leg_runs_and_rejects_tampers() {
     let g = real_global(&elf_bytes, &bundle, &inner);
     let program = global_verifier_program(&g);
     let arenas = global_arena_words(&g);
-    let exec = execute(&program, &arenas, &crate::hash_pin::block_hasher_kind()).expect("the global leg must execute");
+    let exec = execute(&program, &arenas, &crate::hash_pin::block_hasher_kind())
+        .expect("the global leg must execute");
 
     let pub_ext = |i: usize| super::word::word_as_ext(&exec.public_words[i].1).expect("an ext");
     assert_eq!(pub_ext(0), g.z_alpha.0, "the global z");

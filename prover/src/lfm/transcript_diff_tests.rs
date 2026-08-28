@@ -173,8 +173,7 @@ fn the_machine_transcript_tracks_the_host_absorb_for_absorb() {
         );
         for (i, (got, expect)) in exec.public_words.iter().zip(&want).enumerate() {
             assert_eq!(
-                &got.1,
-                expect,
+                &got.1, expect,
                 "{tenant}: transcript states part at step {i} ({}) — \
                  every later challenge is a different value",
                 steps[i]

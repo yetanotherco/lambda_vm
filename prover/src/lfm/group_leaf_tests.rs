@@ -126,9 +126,7 @@ fn machine_run<H: AlgebraicHasher>(
 ) -> (Vec<FE>, [u8; 32]) {
     let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::Algebraic);
     let a = b.declare_arena(arena.len() as u32);
-    let cells: Vec<Cell> = (0..arena.len())
-        .map(|i| b.hint_word(a, i as u32))
-        .collect();
+    let cells: Vec<Cell> = (0..arena.len()).map(|i| b.hint_word(a, i as u32)).collect();
 
     let mut runs: Vec<Vec<Cell>> = Vec::new();
     let mut at = 0usize;
@@ -250,7 +248,11 @@ fn the_machine_group_leaf_absorbs_the_host_felt_sequence_base() {
         check_base::<H, S>(tenant, "single-w4 (8 felts, exactly rate)", &[4]);
         check_base::<H, S>(tenant, "single-w5 (10 felts, over rate)", &[5]);
         check_base::<H, S>(tenant, "multi-2,3,5 (20 felts, mixed widths)", &[2, 3, 5]);
-        check_base::<H, S>(tenant, "multi-1,1,1,1 (8 felts, exactly rate)", &[1, 1, 1, 1]);
+        check_base::<H, S>(
+            tenant,
+            "multi-1,1,1,1 (8 felts, exactly rate)",
+            &[1, 1, 1, 1],
+        );
         check_base::<H, S>(tenant, "multi-7,9 (32 felts)", &[7, 9]);
     }
     for_each_tenant!(check);

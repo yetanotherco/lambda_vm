@@ -2977,9 +2977,8 @@ fn the_batched_epoch_challenge_spine_matches_production() {
     let e = real_batched_epoch_with(super::proof_fixture::fixture_options());
     let program = batched_epoch_program(&e);
     let arenas = batched_epoch_arenas(&e);
-    let exec =
-        execute(&program, &arenas, &crate::hash_pin::block_hasher_kind())
-            .expect("the batched epoch spine must execute");
+    let exec = execute(&program, &arenas, &crate::hash_pin::block_hasher_kind())
+        .expect("the batched epoch spine must execute");
 
     // Vacuity guard: the fixture must exercise BOTH instance classes, or the
     // standalone-terminal absorb and the class split are dead paths here.
