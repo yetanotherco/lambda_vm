@@ -1860,8 +1860,22 @@ fn fixture_wraps() -> (
         arenas.push(super::epoch_verify_tests::batched_opening_arena(&e));
         arenas.push(super::epoch_verify_tests::batched_fri_arena(&e));
         let artifacts = build_artifacts(&program, &opts);
-        let proved = lfm_prove_batched(&program, &artifacts, &arenas, &opts)
-            .expect("the epoch's wrap must prove batched at the aggregation preset");
+        let proved = match lfm_prove_batched(&program, &artifacts, &arenas, &opts) {
+            Ok(p) => p,
+            Err(e) => {
+                // ★ A `DivByZero` is always a failing equality assert with the
+                // numerator's address, so the address names the assert — print
+                // the instruction that wrote it rather than leaving a bare
+                // number for someone to bisect.
+                if let super::proof::LfmProveError::Exec(
+                    super::executor::LfmExecError::DivByZero { addr },
+                ) = &e
+                {
+                    eprintln!("{}", super::executor::locate_addr(&program, *addr));
+                }
+                panic!("the epoch's wrap must prove batched at the aggregation preset: {e:?}");
+            }
+        };
         wraps.push(real_batched_lfm(artifacts, opts.clone(), &proved));
     }
     (wraps, layouts, labels, bundle, elf_bytes)

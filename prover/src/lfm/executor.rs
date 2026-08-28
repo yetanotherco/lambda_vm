@@ -645,3 +645,61 @@ pub fn execute(
         memory: m.memory,
     })
 }
+
+/// ★ Which instruction WROTE `addr`, with a window of its neighbours — the map
+/// from a [`LfmExecError::DivByZero`] address back to the assert that failed.
+///
+/// ⚠ **This is more generally useful than it looks.** `assert_eq` lowers to
+/// `diff = a − b; _ = diff / ZERO` (`builder.rs`), and the executor reports the
+/// NUMERATOR's address. So a `DivByZero` is never an inversion gone wrong — it
+/// is always a failing equality assert, and the address always names the `diff`
+/// cell. Given the address, the `Sub` that produced it and the two operands
+/// feeding that `Sub` identify the assert exactly, without bisecting the
+/// emitter.
+///
+/// Returns a human-readable report; for diagnostics, not for proving.
+pub fn locate_addr(program: &LfmProgram, addr: u64) -> String {
+    use core::fmt::Write as _;
+
+    let writes = |i: &Instr| -> Vec<u64> {
+        match i {
+            Instr::Const { out, .. } => vec![out.0],
+            Instr::BaseAlu { out, .. } | Instr::ExtAlu { out, .. } => vec![out.0],
+            Instr::Select { out_l, out_r, .. } => vec![out_l.0, out_r.0],
+            Instr::BitDec { bits, halves, .. } => bits
+                .iter()
+                .map(|(a, _)| a.0)
+                .chain(halves.iter().flatten().map(|(a, _)| a.0))
+                .collect(),
+            Instr::Hash { outs, .. } => outs.iter().map(|a| a.0).collect(),
+            Instr::Unpack { outs, .. } => outs.iter().map(|a| a.0).collect(),
+            Instr::Pack { out, .. } => vec![out.0],
+            _ => Vec::new(),
+        }
+    };
+
+    let mut out = String::new();
+    let Some(idx) = program
+        .instrs
+        .iter()
+        .position(|i| writes(i).contains(&addr))
+    else {
+        let _ = writeln!(
+            out,
+            "addr {addr}: no instruction writes it (an arena word?)"
+        );
+        return out;
+    };
+    let _ = writeln!(
+        out,
+        "addr {addr} written by instruction {idx} of {}:",
+        program.instrs.len()
+    );
+    let lo = idx.saturating_sub(4);
+    let hi = (idx + 3).min(program.instrs.len());
+    for (k, i) in program.instrs[lo..hi].iter().enumerate() {
+        let marker = if lo + k == idx { "→" } else { " " };
+        let _ = writeln!(out, "  {marker} [{}] {i:?}", lo + k);
+    }
+    out
+}
