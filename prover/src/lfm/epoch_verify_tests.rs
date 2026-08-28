@@ -728,7 +728,9 @@ fn the_assembled_epoch_verifier_runs() {
     // Not a difference of two emitter passes (which rule 7's refinement rules
     // out) but arithmetic over byte widths: every group's leaf costs the
     // configured hash's block count, every Merkle level is ONE compression
-    // under either hash (a parent is 64 bytes), and FRI splits the same way.
+    // under EVERY hash — a byte parent is 64 bytes, inside keccak's rate and
+    // exactly one BLAKE3 block, and an algebraic parent's two digest cells fill
+    // the rate-8 sponge exactly — and FRI splits the same way.
     // Asserted, not printed, so a leg that silently stopped hashing a group
     // would fail here.
     //

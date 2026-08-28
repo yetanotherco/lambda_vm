@@ -347,11 +347,27 @@ pub type Blake3Digest = WrapDigest;
 /// Halves in a 32-byte digest.
 pub const DIGEST_HALVES: usize = 8;
 
-/// The eight halves of a digest, ready to be streamed into another hash.
+/// The eight halves of a BYTE digest, ready to be streamed into another hash.
 ///
-/// Hash-agnostic: it is two `Unpack`s, and both production digests use the same
-/// half convention ([`WrapDigest`]).
+/// ⛔ **NOT hash-agnostic, whatever an earlier version of this comment said.**
+/// It indexes `d[1]`, and an algebraic `WrapDigest` is ONE cell whose second
+/// slot REPEATS the first ([`WrapDigest::from_cell`]) — so on that arm this
+/// would return `lo ‖ lo`: eight plausible halves, four of them a duplicate,
+/// with nothing to notice. The assert below is what makes that loud instead.
+///
+/// ✓ VERIFIED unreachable on the algebraic arm today: the only caller is
+/// `parent_stream`, inside [`WrapHash::hash_pair`]'s `Some(byte_hash)` arm. The
+/// assert is for the NEXT caller, since the stale claim is exactly what would
+/// invite one. The felt view of an algebraic digest is
+/// `epoch::RootCells::byte_halves`, which renders each felt big-endian rather
+/// than pretending the cells are `u32` lanes.
 pub fn digest_halves(b: &mut LfmBuilder, d: WrapDigest) -> [Felt; DIGEST_HALVES] {
+    assert_eq!(
+        d.cells().len(),
+        DIGEST_HALVES / 4,
+        "digest_halves is the BYTE digest's view; an algebraic digest's felts \
+         are not `u32` halves and go through RootCells::byte_halves"
+    );
     let lo = b.unpack(d[0]);
     let hi = b.unpack(d[1]);
     core::array::from_fn(|h| if h < 4 { lo[h] } else { hi[h - 4] })
@@ -460,14 +476,23 @@ pub fn keccak_hash_pair(
     WrapHash::Keccak.hash_pair(b, left, right)
 }
 
-/// The 16 halves a Merkle PARENT hashes: `left ‖ right`, 64 bytes.
+/// The 16 halves a BYTE-hash Merkle PARENT hashes: `left ‖ right`, 64 bytes.
 ///
-/// Hash-agnostic — `hash_new_parent` streams the two 32-byte nodes with no
-/// domain separation and no ordering flag under either hash. What differs is
-/// what 64 bytes COSTS: one keccak permutation (inside the 136-byte rate) and
-/// one BLAKE3 compression (exactly one 64-byte block). Both are one invocation,
-/// which is why the parent layer is 1:1 across the switch and the whole win
-/// there is per-compression cost.
+/// ⛔ **Byte arms only, and this doc used to say "hash-agnostic".** It is
+/// reached solely from [`WrapHash::hash_pair`]'s `Some(byte_hash)` arm, and it
+/// goes through [`digest_halves`], which is the byte digest's view — an
+/// algebraic digest has no `u32` halves to stream. The algebraic parent is
+/// `algebraic_hash_pair`, a compress over cells, and it builds no stream at all.
+///
+/// Across the TWO byte hashes it genuinely is uniform: `hash_new_parent`
+/// streams the two 32-byte nodes with no domain separation and no ordering
+/// flag under either. What differs is what 64 bytes COSTS — one keccak
+/// permutation (inside the 136-byte rate) and one BLAKE3 compression (exactly
+/// one 64-byte block). Both are one invocation, which is why the parent layer
+/// is 1:1 across that switch and the whole win there is per-compression cost.
+/// ⚖ One invocation is also what an algebraic parent costs (8 felts fills the
+/// rate exactly), so the LEVEL count is uniform across all three — it is only
+/// the byte STREAM that is not.
 fn parent_stream(b: &mut LfmBuilder, left: WrapDigest, right: WrapDigest) -> Vec<Felt> {
     let left_halves = digest_halves(b, left);
     let right_halves = digest_halves(b, right);
@@ -684,8 +709,11 @@ impl WrapHash {
 
     /// The production Merkle PARENT hash: `hash(left ‖ right)`.
     ///
-    /// One invocation under either hash — 64 bytes fits inside keccak's 136-byte
-    /// rate and IS exactly one BLAKE3 block. This is the step
+    /// One invocation under every hash — 64 bytes fits inside keccak's 136-byte
+    /// rate, IS exactly one BLAKE3 block, and an algebraic parent's two digest
+    /// cells fill the rate-8 sponge exactly. ⚠ Three arms, not two: the byte
+    /// ones build a stream through `parent_stream`, the algebraic one
+    /// compresses cells and builds no stream. This is the step
     /// [`WrapHash::merkle_walk`] performs once per level after its `Select`, and
     /// the step a whole-tree build performs once per internal node with no
     /// `Select` at all: a tree's child ORDER is known when the program is

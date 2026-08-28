@@ -851,10 +851,18 @@ pub fn merkle_opening_program_source_with_hash(
     );
 
     let mut b = LfmBuilder::new().with_wrap_hash(wrap_hash);
+    // ⚠ A root is `digest_words` arena words, not two. This program takes its
+    // hash BY ARGUMENT and `merkle_opening_program` passes
+    // `WrapHash::production()`, so under an algebraic pin every stride here is
+    // ONE word — while `machine_tests::merkle_arenas` writes the siblings with
+    // `proof_arena::commitment_words`, which already follows the pin. Spelling
+    // the stride `2` made the writer and the reader disagree exactly as the
+    // aggregator's published-word schema did.
+    let words = edsl::digest_words(&b);
     let leaf_arena = b.declare_arena(shape.leaf_values as u32);
-    let sibling_arena = b.declare_arena(2 * shape.depth as u32);
+    let sibling_arena = b.declare_arena(words * shape.depth as u32);
     let index_arena = b.declare_arena(1);
-    let root_arena = b.declare_arena(2);
+    let root_arena = b.declare_arena(words);
 
     let values: Vec<_> = (0..shape.leaf_values as u32)
         .map(|i| b.hint_felt(leaf_arena, i))
@@ -865,22 +873,19 @@ pub fn merkle_opening_program_source_with_hash(
     let bits = b.bit_dec(index, shape.depth);
 
     let siblings: Vec<edsl::WrapDigest> = (0..shape.depth as u32)
-        .map(|l| {
-            edsl::WrapDigest::from_pair(
-                b.hint_word(sibling_arena, 2 * l),
-                b.hint_word(sibling_arena, 2 * l + 1),
-            )
-        })
+        .map(|l| edsl::hint_digest(&mut b, sibling_arena, words * l))
         .collect();
 
     let root = edsl::wrap_merkle_walk(&mut b, leaf, &bits, &siblings);
 
-    let expected = [b.hint_word(root_arena, 0), b.hint_word(root_arena, 1)];
-    edsl::assert_word_eq(&mut b, root[0], expected[0]);
-    edsl::assert_word_eq(&mut b, root[1], expected[1]);
-
-    b.public(root[0]);
-    b.public(root[1]);
+    // The claimed root, compared cell by cell at whatever width the digest is.
+    let expected = edsl::hint_digest(&mut b, root_arena, 0);
+    for (got, want) in root.cells().iter().zip(expected.cells()) {
+        edsl::assert_word_eq(&mut b, *got, *want);
+    }
+    for cell in root.cells() {
+        b.public(*cell);
+    }
     b.finish()
 }
 
