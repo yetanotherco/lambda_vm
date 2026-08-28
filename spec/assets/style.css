@@ -1,5 +1,5 @@
 /* Brand colors */
-:root {
+body {
   --gold: #ffd700;
   --gold-hover: #efcb00;
   --gold-bronze: #6b5200;
@@ -18,8 +18,31 @@
   --status-error: #b3261e;
   --status-ok: #1c7c43;
 }
+
+* {
+  color-scheme: light;
+}
+
+html {
+  --theme: light;
+}
+
+html[data-invert-theme] {
+  --theme: dark;
+}
+
 @media (prefers-color-scheme: dark) {
-  :root {
+  html {
+    --theme: dark;
+  }
+
+  html[data-invert-theme] {
+    --theme: light;
+  }
+}
+
+@container style(--theme: dark) {
+  body {
     --gold-hover: #ffe34d;
     --bg: #101113;
     --bg-subtle: #15161a;
@@ -31,11 +54,23 @@
     --link: #ffd700;
     --status-error: #f1707a;
     --status-ok: #5fcf8e;
+
+    /* Exceptions */
+    --link-hover: var(--gold-hover);
+    --focus-outline-color: var(--gold);
   }
+
+  * {
+    color-scheme: dark;
+  }
+
+  /* Overwrite typst's syntax highlight colors. We've only seen these two emitted so far */
+  code span[style="color: #4b69c6"] { color: #82aaff !important; }
+  code span[style="color: #d73948"] { color: var(--status-error) !important; }
 }
 
 /* Configuration */
-:root {
+body {
   --content-max-width: 860px;
   --content-padding-x: 48px;
   --header-height: 72px;
@@ -70,17 +105,6 @@
   /* --bp-mobile: 768px; */
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    /* Exceptions */
-    --link-hover: var(--gold-hover);
-    --focus-outline-color: var(--gold);
-  }
-
-  /* Overwrite typst's syntax highlight colors. We've only seen these two emitted so far */
-  code span[style="color: #4b69c6"] { color: #82aaff !important; }
-  code span[style="color: #d73948"] { color: var(--status-error) !important; }
-}
 
 /* Keep fragment targets (footnote backlinks, in-page references) clear of
    the sticky header when scrolled to */
@@ -106,7 +130,7 @@ body {
   background: var(--bg);
   display: grid;
   grid-template:
-    "noHeader header header" var(--header-height)
+    "noHeader header headerButtons" var(--header-height)
     "headerBorder headerBorder headerBorder" var(--border-size)
     "nav main ." 1fr
     "nav footnotes ." auto
@@ -128,12 +152,13 @@ p:empty {
 @media (max-width: 768px) {
   body {
     grid-template:
-      "header" var(--header-height)
-      "headerBorder" var(--border-size)
-      "nav" auto
-      "main" auto
-      "footnotes" auto
-      "footnav" auto;
+      "header headerButtons" var(--header-height)
+      "headerBorder headerBorder" var(--border-size)
+      "nav nav" auto
+      "main main" auto
+      "footnotes footnotes" auto
+      "footnav footnav" auto
+      / auto 2.3em;
   }
 
   :root {
@@ -352,6 +377,47 @@ body::after {
 @media (max-width: 768px) {
   body::before {
     content: none;
+  }
+}
+
+.headerButtons {
+  grid-area: headerButtons;
+  background: var(--header-bg);
+  position: sticky;
+  top: 0;
+  min-height: var(--header-height);
+  z-index: 1; /* Go above the sidenotes */
+  padding-top: calc((var(--header-height) - 2em)/2);
+  padding-right: 0.3em;
+}
+
+#theme-toggle {
+  border: 1px solid var(--text);
+  border-radius: 2em;
+  width: 2em;
+  height: 2em;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--gold);
+  background-color: var(--text-muted);
+}
+
+#theme-toggle input ~ span::before {
+  content: "⏾";
+}
+
+#theme-toggle input {
+  display: none;
+}
+
+@container style(--theme: dark) {
+  #theme-toggle {
+    background-color: var(--bg-subtle);
+  }
+
+  #theme-toggle input ~ span::before {
+    content: "☀︎︎";
   }
 }
 

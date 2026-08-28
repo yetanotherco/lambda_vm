@@ -44,7 +44,6 @@
 // TODO: table divider lines (vline/hline)
 // TODO(a11y): replace table.header calls with custom functions to indicate "scope" (col/row/rowgroup) so that we can export that to the html th
 // TODO: full-text search (pagefind?)
-// TODO: Manual color scheme toggle
 
 #let nav(chapter) = {
   let content = meta.summary.map(((title, chapters)) => {
@@ -107,6 +106,8 @@
       html.link(href: "/fonts.css", rel: "stylesheet")
       html.link(href: "/sidenotes.css", rel: "stylesheet")
       html.script(src: "/sidenotes.js", defer: true)
+      html.div(class: "headerButtons")
+      html.script(src: "/themetoggle.js")
       html.header(title(link(<doc:index>, vistitle)))
       html.main(mainbody)
       nav(filename)
@@ -118,6 +119,7 @@
 #asset("/fonts.css", read("/assets/fonts.css"))
 #asset("/sidenotes.css", read("/assets/sidenotes.css"))
 #asset("/sidenotes.js", read("/assets/sidenotes.js"))
+#asset("/themetoggle.js", read("/assets/themetoggle.js"))
 
 // Bundled fonts
 #for f in (
