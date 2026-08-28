@@ -78,14 +78,13 @@
 /// Every `multi_prove` / `multi_verify` instantiation in this crate names this
 /// rather than `stark::config::DefaultStarkHash`, so the two can differ on a
 /// branch without the workspace default moving.
-pub type BlockStarkHash = stark::config::DefaultStarkHash;
+pub type BlockStarkHash = crate::lfm::algebraic_commit::RpoStarkHash;
 
 /// The Fiat–Shamir transcript OBJECT the block path builds.
 ///
 /// See the module header for why this is pinned separately from
 /// [`BlockStarkHash`] rather than derived from it.
-pub type BlockTranscript =
-    stark::config::DefaultStarkTranscript<crate::tables::types::GoldilocksExtension>;
+pub type BlockTranscript = crate::lfm::algebraic_transcript::AlgebraicTranscript;
 
 /// A fresh block-path transcript over `seed`.
 ///
@@ -94,7 +93,7 @@ pub type BlockTranscript =
 /// algebraic one absorbs it as its first `append_bytes` call. Callers should not
 /// have to know which.
 pub fn block_transcript(seed: &[u8]) -> BlockTranscript {
-    BlockTranscript::new(seed)
+    BlockTranscript::with_seed(crate::lfm::hash::HasherKind::Rpo, seed)
 }
 
 /// The prover the block path drives, at [`BlockStarkHash`].
