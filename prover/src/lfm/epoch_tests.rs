@@ -43,7 +43,6 @@ use super::epoch::{
 };
 use super::executor::execute;
 use super::fri::FriShape;
-use super::hash::TestPermutation;
 use super::instr::ArenaId;
 use super::transcript_replay::TranscriptReplay;
 use super::validator::validate;
@@ -286,7 +285,8 @@ fn challenge_arenas(h: &HostTable) -> Vec<Vec<LfmWord>> {
 fn run(h: &HostTable) -> (FEE, FEE, FEE, Vec<FEE>, Vec<u64>) {
     let program = challenge_program(h);
     let arenas = challenge_arenas(h);
-    let exec = execute(&program, &arenas, &TestPermutation).expect("the replay must execute");
+    let exec = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+        .expect("the replay must execute");
 
     let pub_ext = |i: usize| word_as_ext(&exec.public_words[i].1).expect("an ext challenge");
     let beta = pub_ext(0);
@@ -408,7 +408,14 @@ fn the_z_guard_rejects_a_point_in_either_domain() {
         validate(&program).expect("the guard program must be admissible");
         program
     };
-    let runs = |z: FEE| execute(&program, &[vec![ext_word(&z)]], &TestPermutation).is_ok();
+    let runs = |z: FEE| {
+        execute(
+            &program,
+            &[vec![ext_word(&z)]],
+            &crate::hash_pin::BLOCK_HASHER,
+        )
+        .is_ok()
+    };
 
     // Positive control: a generic point passes, so a guard that rejected
     // everything would not be mistaken for a working one.
@@ -467,7 +474,12 @@ fn a_nonce_that_did_not_grind_is_rejected() {
     let runs = |nonce: u64| {
         let mut h2 = h.clone();
         h2.nonce = Some(nonce);
-        execute(&program, &challenge_arenas(&h2), &TestPermutation).is_ok()
+        execute(
+            &program,
+            &challenge_arenas(&h2),
+            &crate::hash_pin::BLOCK_HASHER,
+        )
+        .is_ok()
     };
 
     assert!(runs(real), "the proof's own nonce must satisfy the check");
@@ -2981,8 +2993,8 @@ fn the_batched_epoch_challenge_spine_matches_production() {
     let e = real_batched_epoch_with(super::proof_fixture::fixture_options());
     let program = batched_epoch_program(&e);
     let arenas = batched_epoch_arenas(&e);
-    let exec =
-        execute(&program, &arenas, &TestPermutation).expect("the batched epoch spine must execute");
+    let exec = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+        .expect("the batched epoch spine must execute");
 
     // Vacuity guard: the fixture must exercise BOTH instance classes, or the
     // standalone-terminal absorb and the class split are dead paths here.
@@ -3064,7 +3076,7 @@ fn the_assembled_batched_epoch_verifier_runs() {
     let mut arenas = batched_epoch_arenas(&e);
     arenas.push(super::epoch_verify_tests::batched_opening_arena(&e));
     arenas.push(super::epoch_verify_tests::batched_fri_arena(&e));
-    execute(&program, &arenas, &TestPermutation)
+    execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
         .expect("every opening of an honest batched epoch must authenticate");
 
     // A moved opening VALUE is unprovable (the first arena word is the first
@@ -3076,7 +3088,7 @@ fn the_assembled_batched_epoch_verifier_runs() {
     let mut tampered = arenas.clone();
     tampered[open_idx][0] = base_word(FE::from(999_999u64));
     assert!(
-        execute(&program, &tampered, &TestPermutation).is_err(),
+        execute(&program, &tampered, &crate::hash_pin::BLOCK_HASHER).is_err(),
         "a tampered opening value must not authenticate"
     );
 
@@ -3086,7 +3098,7 @@ fn the_assembled_batched_epoch_verifier_runs() {
     let last = tampered[open_idx].len() - 1;
     tampered[open_idx][last] = base_word(FE::from(999_999u64));
     assert!(
-        execute(&program, &tampered, &TestPermutation).is_err(),
+        execute(&program, &tampered, &crate::hash_pin::BLOCK_HASHER).is_err(),
         "a tampered sibling must not authenticate"
     );
 
@@ -3107,7 +3119,7 @@ fn the_assembled_batched_epoch_verifier_runs() {
                 let mut tampered = arenas.clone();
                 tampered[open_idx][off] = base_word(FE::from(999_999u64));
                 assert!(
-                    execute(&program, &tampered, &TestPermutation).is_err(),
+                    execute(&program, &tampered, &crate::hash_pin::BLOCK_HASHER).is_err(),
                     "a tampered injected-matrix value must not verify"
                 );
             }
@@ -3122,7 +3134,7 @@ fn the_assembled_batched_epoch_verifier_runs() {
         let mut tampered = arenas.clone();
         tampered[fri_idx][0] = base_word(FE::from(999_999u64));
         assert!(
-            execute(&program, &tampered, &TestPermutation).is_err(),
+            execute(&program, &tampered, &crate::hash_pin::BLOCK_HASHER).is_err(),
             "a tampered FRI layer opening must not verify"
         );
     }
@@ -3154,7 +3166,7 @@ fn the_assembled_batched_epoch_verifier_runs() {
         let mut tampered = arenas.clone();
         tampered[idx][0] = ext_word(&FEE::from(999_999u64));
         assert!(
-            execute(&program, &tampered, &TestPermutation).is_err(),
+            execute(&program, &tampered, &crate::hash_pin::BLOCK_HASHER).is_err(),
             "a tampered standalone terminal coefficient must not verify"
         );
     }
@@ -3174,7 +3186,7 @@ fn the_assembled_batched_epoch_verifier_runs() {
     if discriminates {
         let wrong = batched_epoch_program_with(&e, true, true);
         assert!(
-            execute(&wrong, &arenas, &TestPermutation).is_err(),
+            execute(&wrong, &arenas, &crate::hash_pin::BLOCK_HASHER).is_err(),
             "the wrong reduction direction must not authenticate an honest epoch"
         );
     } else {
@@ -3344,7 +3356,7 @@ fn the_assembled_carved_batched_epoch_verifier_runs() {
     let mut arenas = batched_epoch_arenas(&e);
     arenas.push(super::epoch_verify_tests::batched_opening_arena(&e));
     arenas.push(super::epoch_verify_tests::batched_fri_arena(&e));
-    execute(&program, &arenas, &TestPermutation)
+    execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
         .expect("an honest carved batched epoch must run end to end");
 
     // Structural: the census closed form and the schema words, on the CARVED
@@ -3385,7 +3397,7 @@ fn the_assembled_carved_batched_epoch_verifier_runs() {
     let mut tampered = arenas.clone();
     tampered[2][0] = base_word(FE::from(999_999u64));
     assert!(
-        execute(&program, &tampered, &TestPermutation).is_err(),
+        execute(&program, &tampered, &crate::hash_pin::BLOCK_HASHER).is_err(),
         "a tampered carved root must not verify"
     );
 
@@ -3398,13 +3410,13 @@ fn the_assembled_carved_batched_epoch_verifier_runs() {
     let mut tampered = arenas.clone();
     tampered[open_idx][off] = base_word(FE::from(999_999u64));
     assert!(
-        execute(&program, &tampered, &TestPermutation).is_err(),
+        execute(&program, &tampered, &crate::hash_pin::BLOCK_HASHER).is_err(),
         "a tampered carved opening value must not verify"
     );
     let mut tampered = arenas.clone();
     tampered[open_idx][off + 2 * c.width] = base_word(FE::from(999_999u64));
     assert!(
-        execute(&program, &tampered, &TestPermutation).is_err(),
+        execute(&program, &tampered, &crate::hash_pin::BLOCK_HASHER).is_err(),
         "a tampered carved sibling must not verify"
     );
 
@@ -3416,7 +3428,7 @@ fn the_assembled_carved_batched_epoch_verifier_runs() {
         if discriminates {
             let wrong = batched_epoch_program_with(&e, true, true);
             assert!(
-                execute(&wrong, &arenas, &TestPermutation).is_err(),
+                execute(&wrong, &arenas, &crate::hash_pin::BLOCK_HASHER).is_err(),
                 "the wrong reduction direction must not authenticate the carved walk"
             );
         } else {
@@ -3461,7 +3473,7 @@ fn the_batched_from_proof_constructor_runs_a_continuation_epoch() {
         let mut arenas = batched_epoch_arenas(&e);
         arenas.push(super::epoch_verify_tests::batched_opening_arena(&e));
         arenas.push(super::epoch_verify_tests::batched_fri_arena(&e));
-        execute(&program, &arenas, &TestPermutation).unwrap_or_else(|err| {
+        execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER).unwrap_or_else(|err| {
             panic!("epoch {epoch} ({name})'s carved program must run: {err:?}")
         });
         eprintln!(
@@ -4109,7 +4121,8 @@ fn the_epoch_challenge_spine_matches_production() {
     let e = real_epoch();
     let program = epoch_challenge_program(&e);
     let arenas = epoch_arenas(&e);
-    let exec = execute(&program, &arenas, &TestPermutation).expect("the epoch spine must execute");
+    let exec = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+        .expect("the epoch spine must execute");
 
     let pub_ext = |i: usize| word_as_ext(&exec.public_words[i].1).expect("an ext challenge");
     assert_eq!(pub_ext(0), e.z_alpha.0, "the shared LogUp challenge z");
@@ -4432,7 +4445,7 @@ fn a_split_decode_cell_forges_the_attestation() {
     let split = epoch_program_with(&e, false, true);
     let mut split_arenas = honest.clone();
     split_arenas.push(super::proof_arena::commitments_to_arena(&[substituted]));
-    let exec = execute(&split, &split_arenas, &TestPermutation).expect(
+    let exec = execute(&split, &split_arenas, &crate::hash_pin::BLOCK_HASHER).expect(
         "the split-cell program must RUN on the forgery — that is the hazard, and \
          a rejection here would mean this control does not demonstrate it",
     );
@@ -4446,7 +4459,7 @@ fn a_split_decode_cell_forges_the_attestation() {
     // honest root in the surplus arena, publishes the honest id.
     let mut split_honest = honest.clone();
     split_honest.push(super::proof_arena::commitments_to_arena(&[real_decode]));
-    let exec_honest = execute(&split, &split_honest, &TestPermutation)
+    let exec_honest = execute(&split, &split_honest, &crate::hash_pin::BLOCK_HASHER)
         .expect("the split program must also run honestly");
     assert_eq!(
         published_digest(&exec_honest.public_words, 2),
@@ -4464,7 +4477,7 @@ fn a_split_decode_cell_forges_the_attestation() {
     let mut joined_arenas = honest.clone();
     joined_arenas[1] = super::proof_arena::commitments_to_arena(&[substituted]);
     assert!(
-        execute(&joined, &joined_arenas, &TestPermutation).is_err(),
+        execute(&joined, &joined_arenas, &crate::hash_pin::BLOCK_HASHER).is_err(),
         "with one cell, substituting the DECODE root must break the run: the \
          transcript absorbed it, so the challenges cannot survive it"
     );
@@ -4495,7 +4508,7 @@ fn the_derivation_binds_every_register_boundary_word() {
     let program = epoch_challenge_program(&e);
     let good = epoch_arenas(&e);
     assert!(
-        execute(&program, &good, &TestPermutation).is_ok(),
+        execute(&program, &good, &crate::hash_pin::BLOCK_HASHER).is_ok(),
         "the untampered epoch must run"
     );
 
@@ -4508,7 +4521,7 @@ fn the_derivation_binds_every_register_boundary_word() {
             let bumped = arenas[arena][slot][0] + FE::one();
             arenas[arena][slot] = base_word(bumped);
             assert!(
-                execute(&program, &arenas, &TestPermutation).is_err(),
+                execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER).is_err(),
                 "{what} slot {slot} moved by one must not verify: the REGISTER \
                  preprocessed root is derived from it, and the transcript absorbed \
                  that root"
@@ -4549,7 +4562,12 @@ fn the_register_boundary_is_width_checked() {
         super::epoch::assert_u32(&mut b, cell);
         let program = compile(b.finish());
         validate(&program).expect("the width check must be admissible");
-        execute(&program, &[vec![base_word(FE::from(v))]], &TestPermutation).is_ok()
+        execute(
+            &program,
+            &[vec![base_word(FE::from(v))]],
+            &crate::hash_pin::BLOCK_HASHER,
+        )
+        .is_ok()
     };
     // ⚠ The bad values are CANONICAL felts, and that is not pedantry — it is the
     // exact size of the gap. An arena word is a field element, so `FE::from(v)`
@@ -4635,7 +4653,7 @@ fn the_closure_rejects_a_moved_index_or_output() {
     let program = epoch_challenge_program(&e);
     let good = epoch_arenas(&e);
     assert!(
-        execute(&program, &good, &TestPermutation).is_ok(),
+        execute(&program, &good, &crate::hash_pin::BLOCK_HASHER).is_ok(),
         "the untampered epoch must run"
     );
 
@@ -4646,7 +4664,7 @@ fn the_closure_rejects_a_moved_index_or_output() {
         let mut arenas = good.clone();
         arenas[3][crate::tables::register::X254_INDEX] = base_word(FE::from(e.start_index + delta));
         assert!(
-            execute(&program, &arenas, &TestPermutation).is_err(),
+            execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER).is_err(),
             "start_index + {delta} must not close the bus"
         );
     }
@@ -4664,7 +4682,7 @@ fn the_closure_rejects_a_moved_index_or_output() {
         let bumped = arenas[0][idx][0] + FE::one();
         arenas[0][idx] = base_word(bumped);
         assert!(
-            execute(&program, &arenas, &TestPermutation).is_err(),
+            execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER).is_err(),
             "moving output half {half} must not verify"
         );
     }

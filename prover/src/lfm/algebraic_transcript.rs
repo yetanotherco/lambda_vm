@@ -610,10 +610,19 @@ mod tests {
             let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::Algebraic);
             let mut t = TranscriptReplay::new(SEED);
             emit_shape_histogram(&mut t, &heights, &widths);
-            for p in &preps {
-                let cells = RootCells::constant(&mut b, p);
-                cells.absorb_misaligned(&mut b, &mut t);
-            }
+            // ⚠ BOTH production constructions, on the same host call. A
+            // preprocessed root reaches the transcript one of two ways
+            // (`batched_epoch.rs:338-341`): program TEXT goes through
+            // `append_const_bytes` as literal bytes, proof-carried cells through
+            // `RootCells::absorb`. Under a byte hash those are the same 32
+            // bytes; under an algebraic one they are a byte cellification and a
+            // digest cell, which is only the same thing if `bytes_to_cell` and
+            // `commitment_to_digest` agree — the property this asserts rather
+            // than assumes. An earlier version of this gate drove only the
+            // second arm and claimed to cover the phase.
+            t.append_const_bytes(&preps[0][..]);
+            let cells = RootCells::constant(&mut b, &preps[1]);
+            cells.absorb_misaligned(&mut b, &mut t);
             let main_cells = RootCells::constant(&mut b, &main);
             main_cells.absorb_misaligned(&mut b, &mut t);
             let z = t.sample_ext(&mut b);

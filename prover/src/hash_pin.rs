@@ -113,6 +113,28 @@ pub type BlockProver<Field, FieldExtension, PI> =
 pub type BlockVerifier<Field, FieldExtension, PI> =
     stark::verifier::GenericVerifier<Field, FieldExtension, PI, BlockStarkHash>;
 
+/// The `LFM_HASH` socket permutation the block path's programs are EXECUTED and
+/// proved under — the machine's own hash chip.
+///
+/// ⚠ **A third axis, and it is orthogonal to [`BlockStarkHash`].** That one says
+/// which hash the HOST commits under; this says which permutation the MACHINE's
+/// `Instr::Hash` rows compute. They have to agree, and nothing in the type
+/// system makes them: the socket hasher is passed per call to `execute` and
+/// `lfm_prove_with_hasher`.
+///
+/// ★ **Why it went unpinned until it bit.** Under a byte hash the emitter's
+/// Merkle work goes through `ByteWrapHash::hash_bytes`, which lowers to the
+/// dedicated KECCAK / `LFM_BLAKE3` chips and emits **no `Instr::Hash` at all** —
+/// so the socket hasher handed to `execute` is never consulted, and passing
+/// `TestPermutation` is free and correct. The algebraic arm goes through
+/// `b.compress` / `b.permute`, which ARE `Instr::Hash`, executed by whatever is
+/// passed. The same distinction the byte hash made irrelevant, needed back.
+///
+/// Every `execute` and prove call on the block path names this rather than a
+/// literal, so the two axes cannot drift apart in a test harness while
+/// production stays correct.
+pub const BLOCK_HASHER: crate::lfm::hash::HasherKind = crate::lfm::hash::HasherKind::Test;
+
 /// The [`CommitmentHash`] the block path's roots may be called by.
 ///
 /// ★ Read this rather than `stark::config::COMMITMENT_HASH`. That const names

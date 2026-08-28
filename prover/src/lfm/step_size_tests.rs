@@ -72,7 +72,6 @@ use super::epoch::{
 };
 use super::executor::execute;
 use super::fri::FriShape;
-use super::hash::TestPermutation;
 use super::transcript_replay::TranscriptReplay;
 use super::validator::validate;
 use super::word::{base_word, ext_word, word_as_base, word_as_ext};
@@ -650,8 +649,8 @@ fn the_machine_absorbs_a_multi_row_ood_block_in_productions_order() {
 
     // ---- the differential: every challenge, against production's own replay.
     let (program, arenas) = fib_challenge_program(&r);
-    let exec =
-        execute(&program, &arenas, &TestPermutation).expect("the three-offset replay must execute");
+    let exec = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+        .expect("the three-offset replay must execute");
 
     let pub_ext = |i: usize| word_as_ext(&exec.public_words[i].1).expect("an ext challenge");
     assert_eq!(pub_ext(0), r.beta, "beta");
@@ -769,6 +768,7 @@ fn row_major_control_gamma(r: &FibReplay) -> FEE {
         r.ood_next.iter().map(ext_word).collect(),
         r.parts.iter().map(ext_word).collect(),
     ];
-    let exec = execute(&program, &arenas, &TestPermutation).expect("the control must execute");
+    let exec = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+        .expect("the control must execute");
     word_as_ext(&exec.public_words[0].1).expect("gamma is ext")
 }
