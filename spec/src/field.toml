@@ -1,0 +1,212 @@
+name = "FIELD"
+tag = "FLD"
+
+
+[[variables.input]]
+name = "timestamp"
+type = "BaseField"
+desc = ""
+pad = 0
+
+[[variables.input]]
+name = "register_idx"
+type = ["BaseField", 4]
+desc = ""
+pad = 0
+
+[[variables.input]]
+name = "scalars"
+type = ["BaseField", 4]
+desc = ""
+pad = 0
+
+[[variables.input]]
+name = "offsets"
+type = ["BaseField", 4]
+desc = ""
+pad = 0
+
+[[variables.input]]
+name = "modes"
+type = ["Bit", 4]
+desc = ""
+pad = 0
+
+[[variables.input]]
+name = "hinted"
+type = ["Bit", 5]
+desc = ""
+pad = 0
+
+[[variables.auxiliary]]
+name = "inv"
+type = "ExtField"
+desc = "inverse required to show the ZERO flag is set properly"
+pad = 0
+
+[[variables.auxiliary]]
+name = "PC"
+type = "ExtField"
+pad = 0
+desc = "program counter"
+
+[[variables.auxiliary]]
+name = "registers"
+type = ["ExtField", 4]
+desc = "registers"
+pad = 0
+
+
+[[variables.auxiliary]]
+name = "regvals"
+type = ["ExtField", 4]
+desc = "#`registers[indices]`"
+pad = 0
+
+[[variables.auxiliary]]
+name = "opvals"
+type = ["ExtField", 4]
+desc = "`regvals` or `[regvals]`, depending on `modes`"
+pad = 0
+
+[[variables.virtual]]
+name = "indices"
+type = ["BaseField", 4]
+desc = "$#`scalars` dot #`regidx` + #`offsets`$"
+def = {iter=["i", 0, 3], poly=["+", ["*", ["idx", "scalars", "i"], ["idx", "regidx", "i"]], ["idx", "offsets", "i"]]}
+
+[[variables.virtual]]
+name = "o"
+type = "ExtField"
+def = ["idx", "opvals", 0]
+desc = ""
+
+[[variables.virtual]]
+name = "a"
+type = "ExtField"
+def = ["idx", "opvals", 1]
+desc = ""
+
+[[variables.virtual]]
+name = "b"
+type = "ExtField"
+def = ["idx", "opvals", 2]
+desc = ""
+
+[[variables.virtual]]
+name = "c"
+type = "ExtField"
+def = ["idx", "opvals", 3]
+desc = ""
+
+[[variables.constant]]
+name = "ZERO"
+type = "BaseField"
+desc = "constant zero"
+
+[[variables.constant]]
+name = "α"
+type = "BaseField"
+desc = "The $#`X`^2$ coefficient of the defining polynomial"
+
+[[variables.constant]]
+name = "β"
+type = "BaseField"
+desc = "The $#`X`^1$ coefficient of the defining polynomial"
+
+[[variables.constant]]
+name = "γ"
+type = "BaseField"
+desc = "The $#`X`^0$ coefficient of the defining polynomial"
+
+
+[[constraint_groups]]
+name = "assumptions"
+
+[[constraints.assumptions]]
+kind = "template"
+tag = "IS_BIT"
+input = [["idx", "modes", "i"]]
+iter = ["i", 0, 3]
+
+[[constraint_groups]]
+name = "all"
+
+# lookup register_idx, scalars, offsets, modes, & hinted for given pc
+[[constraints.all]]
+kind = "interaction"
+tag = "FDEC"
+input = ["pc", "register_idx", "scalars", "offsets", "modes", "hinted"]
+
+# regvals <- mux register indices to find register values
+# TODO
+
+# opvals <- lookup operand in memory if mode = 1 (memory), copy if 0
+[[constraints.all]]
+kind = "interaction"
+tag = "FMR"
+input = [["+", ["idx", "regvals", "i"], ["*", ["idx", "scalars", "i"]], ["idx", "offsets", "i"]]]
+output = ["idx", "opvals", "i"]
+iter = ["i", 0, 3]
+multiplicity = ["idx", "modes", "i"]
+
+[[constraints.all]]
+kind = "arith"
+constraint = "$#`modes[i]` = 0 => #`opvals[i]` = #`regvals[i]`$"
+poly = ["*", ["not", ["idx", "modes", "i"]], ["-", ["idx", "opvals", "i"], ["idx", "regvals", "i"]]]
+
+[[constraints.all]]
+kind = "arith"
+constraint = "$#`modes[i]` = 0 => #`opvals[i]` = #`regvals[i]`$"
+poly = ["*", ["not", ["idx", "modes", "i"]], ["-", ["idx", "opvals", "i"], ["idx", "regvals", "i"]]]
+
+# opvals[1] * opvals[2] + opvals[3] - opvals[0] == 0
+[[constraints.all]]
+kind = "arith"
+constraint = "$#`o_0` = a_0 b_0 + gamma (a_1 b_2 + a_2 b_1 + alpha dot a_2 b_2) + c_0$"
+poly = ["-", ["idx", "o", 0],
+  ["*", ["idx", "a", 0], ["idx", "b", 0]],
+  ["*", "γ", ["+",
+      ["*", ["idx", "a", 1], ["idx", "b", 2]],
+      ["*", ["idx", "a", 2], ["idx", "b", 1]],
+      ["*", "α", ["idx", "a", 2], ["idx", "b", 2]]]],
+  ["idx", "c", 0]]
+
+[[constraints.all]]
+kind = "arith"
+constraint = "$#`o_1` = a_0 b_1 + a_1 b_0 + beta (a_1 b_2 + a_2 b_1) + (alpha beta + gamma) a_2 b_2 + c_1$"
+poly = ["-", ["idx", "o", 1],
+  ["*", ["idx", "a", 0], ["idx", "b", 1]],
+  ["*", ["idx", "a", 1], ["idx", "b", 0]],
+  ["*", "β", ["idx", "a", 1], ["idx", "b", 2]],
+  ["*", "β", ["idx", "a", 2], ["idx", "b", 1]],
+  ["*", ["+", ["*", "α", "β"], "γ"], ["idx", "a", 2], ["idx", "b", 2]],
+  ["idx", "c", 1]]
+
+[[constraints.all]]
+kind = "arith"
+constraint = "$#`o_2` = a_0 b_2 + a_1 b_1 + a_2 b_0 + alpha (a_1 b_2 + a_2 b_1) + (alpha^2 + beta) a_2 b_2 + c_2$"
+poly = ["-", ["idx", "o", 2],
+  ["*", ["idx", "a", 0], ["idx", "b", 2]],
+  ["*", ["idx", "a", 1], ["idx", "b", 1]],
+  ["*", ["idx", "a", 2], ["idx", "b", 0]],
+  ["*", "α", ["idx", "a", 1], ["idx", "b", 2]],
+  ["*", "α", ["idx", "a", 2], ["idx", "b", 1]],
+  ["*", ["+", ["*", "α", "α"], "β"], ["idx", "a", 2], ["idx", "b", 2]],
+  ["idx", "c", 2]]
+
+
+# reg[x] = reg'[x] unless hinted'[x] or out
+
+# increment timestamp
+
+
+[[constraint_groups]]
+name = "pc"
+
+[[constraints.pc]]
+kind = "arith"
+constraint = "$#`register_idx[0]` != 1 => #`pc'` = #`pc` + 1$"
+poly = ["*", ["-", "pc", ["idx", "register_idx", 0]], ["-", ["+", "pc", 1], ["next", "pc"]]]
+
+
