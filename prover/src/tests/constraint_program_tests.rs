@@ -156,6 +156,7 @@ fn all_table_programs_match_folders() {
 
     check_air(&create_cpu_air(&opts), "CPU");
     check_air(&create_dma_air(&opts), "DMA");
+    check_air(&create_dma_set_air(&opts), "DMA_SET");
     check_air(&create_bitwise_air(&opts), "BITWISE");
     check_air(&create_lt_air(&opts), "LT");
     check_air(&create_shift_air(&opts), "SHIFT");

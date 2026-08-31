@@ -362,6 +362,12 @@ pub enum BusId {
     /// copy. Only the first row receives the CPU's `Ecall`; the rest chain here.
     DmaNext = 29,
 
+    /// DMA memset streaming bus: each DMA_SET row sends
+    /// `(timestamp, dst_incr, count_decr, fill)` to the next row and receives
+    /// `(timestamp, dst, count, fill)` from the previous one. Separate from
+    /// [`BusId::DmaNext`] so a memcpy row can never consume a memset token.
+    DmaSetNext = 32,
+
     // =========================================================================
     // Continuations
     // =========================================================================
@@ -397,6 +403,7 @@ impl BusId {
             BusId::Ecdas => "Ecdas",
             BusId::Bit => "Bit",
             BusId::DmaNext => "DmaNext",
+            BusId::DmaSetNext => "DmaSetNext",
             BusId::GlobalMemory => "GlobalMemory",
         }
     }
@@ -429,6 +436,7 @@ impl TryFrom<u64> for BusId {
             27 => Ok(BusId::Cpu32),
             28 => Ok(BusId::Ecdas),
             29 => Ok(BusId::DmaNext),
+            32 => Ok(BusId::DmaSetNext),
             30 => Ok(BusId::Bit),
             31 => Ok(BusId::GlobalMemory),
             other => Err(other),
