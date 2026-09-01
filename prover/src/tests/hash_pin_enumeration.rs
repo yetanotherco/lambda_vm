@@ -42,6 +42,58 @@ const ALIAS_CALLS: &[&str] = &["Prover::multi_prove", "Verifier::multi_verify"];
 /// The pinned spellings, which contain [`ALIAS_CALLS`] as substrings.
 const PIN_CALLS: &[&str] = &["BlockProver::", "BlockVerifier::"];
 
+/// ★★ Items `prover` may name from `stark::config` — the hash-AGNOSTIC three.
+///
+/// **Everything else that module exports is a spelling of the workspace
+/// DEFAULT**, so this is an ALLOWLIST over a namespace rather than a list of
+/// forbidden names, and that difference is the point.
+///
+/// ⚠ The three misses this gate has had — `DefaultStarkHash` as a substring,
+/// then the `Prover`/`Verifier` call forms, then the Merkle backend type
+/// aliases — share one root: **the gate is lexical and the class is
+/// type-level**, so a name list always lags one spelling behind the newest way
+/// to denote the default. An allowlist cannot lag: a new alias added to
+/// `stark::config` is flagged the first time `prover` names it, without anyone
+/// remembering to extend this file.
+///
+/// ⚖ Deletion would be stronger still — let the compiler refuse the spelling
+/// rather than a test — and it was considered and is NOT available:
+/// `BatchedMerkleTreeBackend` and `FriLayerMerkleTreeBackend` have twelve
+/// legitimate consumers inside `crypto/stark` itself (`commitment.rs`,
+/// `gpu_lde.rs`, the cuda tests), where the workspace default IS the correct
+/// hash. `#[deprecated]` would fire on those under `-D warnings`, in the very
+/// crate that must keep using them.
+const CONFIG_ALLOWED: &[&str] = &["Commitment", "CommitmentHash", "StarkHash"];
+
+/// Every item named from `stark::config` on this line, `use` lists included.
+fn config_items(code: &str) -> Vec<String> {
+    const PREFIX: &str = "stark::config::";
+    let mut out = Vec::new();
+    let mut rest = code;
+    while let Some(i) = rest.find(PREFIX) {
+        rest = &rest[i + PREFIX.len()..];
+        if let Some(stripped) = rest.strip_prefix('{') {
+            let end = stripped.find('}').unwrap_or(stripped.len());
+            for part in stripped[..end].split(',') {
+                let name = part.trim().split_whitespace().next().unwrap_or("");
+                if !name.is_empty() {
+                    out.push(name.to_string());
+                }
+            }
+            rest = &stripped[end.min(stripped.len())..];
+        } else {
+            let end = rest
+                .find(|c: char| !c.is_alphanumeric() && c != '_')
+                .unwrap_or(rest.len());
+            if end > 0 {
+                out.push(rest[..end].to_string());
+            }
+            rest = &rest[end..];
+        }
+    }
+    out
+}
+
 /// The symbols that silently select a hash when nobody names one.
 const IMPLIED_HASH_SYMBOLS: &[&str] = &[
     // The workspace's commitment configuration, and the `Prover` / `Verifier`
@@ -116,20 +168,6 @@ const BLESSED: &[(&str, &str)] = &[
         "Host-side BYTE-transcript differentials: the oracle for the machine's \
          byte `TranscriptReplay` arm is deliberately the byte transcript.",
     ),
-    (
-        "tests/prove_elfs_tests.rs",
-        "Names `DefaultStarkTranscript` deliberately — its header records that \
-         the production path's transcript must be the one the default \
-         commitment configuration names, and the test exists to hold that.",
-    ),
-    (
-        "tests/recursion_soundness_gap_poc.rs",
-        "A proof-of-concept against the workspace default configuration.",
-    ),
-    (
-        "tests/page_offset_forgery_poc.rs",
-        "As `recursion_soundness_gap_poc.rs`.",
-    ),
 ];
 
 /// Every `.rs` under `dir`, relative to `root`.
@@ -190,7 +228,10 @@ fn no_call_site_outside_the_pin_reaches_a_default_alias() {
         let text = std::fs::read_to_string(root.join(rel)).expect("a readable source file");
         for line in text.lines() {
             let Some(code) = code_of(line) else { continue };
-            let implied = IMPLIED_HASH_SYMBOLS.iter().any(|s| code.contains(s));
+            let implied = IMPLIED_HASH_SYMBOLS.iter().any(|s| code.contains(s))
+                || config_items(code)
+                    .iter()
+                    .any(|item| !CONFIG_ALLOWED.contains(&item.as_str()));
             let aliased = ALIAS_CALLS.iter().any(|s| code.contains(s))
                 && !PIN_CALLS.iter().any(|s| code.contains(s));
             if implied || aliased {
