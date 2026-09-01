@@ -53,7 +53,6 @@ use super::epoch_tests::RealBatchedEpoch;
 use super::epoch_verify::{TableVerifyShape, boundary_terms};
 use super::executor::execute;
 use super::fri::FriShape;
-use super::hash::TestPermutation;
 use super::sub_proof::{GroupShape, SubProofShape};
 use super::word::{LfmWord, base_word, ext_word, word_as_ext};
 
@@ -507,7 +506,7 @@ fn the_assembled_epoch_verifier_runs() {
     let program = super::epoch_tests::epoch_program(&e, true);
     let arenas = super::epoch_tests::epoch_arena_words(&e, true);
     let exec =
-        execute(&program, &arenas, &TestPermutation).expect("the assembled verifier must execute");
+        execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER).expect("the assembled verifier must execute");
 
     // ---- the spine's differential, unchanged: production's own challenges.
     let pub_ext = |i: usize| word_as_ext(&exec.public_words[i].1).expect("an ext challenge");
@@ -1046,7 +1045,7 @@ fn the_assembled_verifier_rejects_tampered_leg_data() {
     let program = super::epoch_tests::epoch_program(&e, true);
     let good = super::epoch_tests::epoch_arena_words(&e, true);
     assert!(
-        execute(&program, &good, &TestPermutation).is_ok(),
+        execute(&program, &good, &crate::hash_pin::BLOCK_HASHER).is_ok(),
         "the untampered assembled verifier must run"
     );
 
@@ -1116,7 +1115,7 @@ fn the_assembled_verifier_rejects_tampered_leg_data() {
         let before = arenas[*arena][*word];
         arenas[*arena][*word][0] = before[0] + FE::one();
         assert!(
-            execute(&program, &arenas, &TestPermutation).is_err(),
+            execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER).is_err(),
             "tampering {label} must make the assembled verifier unexecutable, \
              and did not"
         );

@@ -285,7 +285,7 @@ use super::layout::keccak as klayout;
 use super::programs::{keccak_chain_program, keccak_chain_program_source};
 use super::proof::prove_traces;
 use super::registry::LfmArtifacts;
-use super::trace::{LfmTraces, build_traces};
+use super::trace::{LfmTraces, build_traces_with_hasher};
 use super::validator::LfmViolation;
 use crate::lfm::chips::keccak as kchip;
 use crate::tables::types::VmTable;
@@ -321,7 +321,7 @@ fn prove_keccak_chain_with_tamper(
     let exec =
         super::executor::execute(program, &keccak_arenas(seed), &super::hash::TestPermutation)
             .expect("honest execution");
-    let mut traces = build_traces(program, &exec.records);
+    let mut traces = build_traces_with_hasher(program, &exec.records, artifacts.hasher);
     mutate(&mut traces);
     let proof = prove_traces(artifacts, &mut traces, &exec.public_words, &opts)?;
     Ok((proof, exec.public_words))
@@ -606,10 +606,33 @@ fn sponge_arenas(msg: &[u8]) -> Vec<Vec<LfmWord>> {
     vec![halves.into_iter().map(super::word::base_word).collect()]
 }
 
-/// The 32-byte digest from the two public words: byte `j` is byte `j % 4` of
-/// half `j / 4`, and half `h` is lane `h % 4` of word `h / 4`.
+/// The 32 bytes a published digest stands for, at whatever width it was
+/// published.
+///
+/// A BYTE digest is two words read as eight little-endian `u32` halves: byte
+/// `j` is byte `j % 4` of half `j / 4`, and half `h` is lane `h % 4` of word
+/// `h / 4`. An ALGEBRAIC digest is ONE word of four canonical felts, and its 32
+/// bytes are the backend's own serialisation of them.
+///
+/// ⛔ **The discriminator is the slice's own length, NOT
+/// `WrapHash::production()`, and that distinction is the whole point.** This
+/// helper's callers mix two kinds of program: ones that pin a byte hash on their
+/// own builder (`keccak_sponge_program`, `blake3_sponge_program` — always two
+/// words, on every branch, because their identity is registry-pinned) and ones
+/// that follow the configuration (`merkle_opening_program` — one word on an
+/// algebraic arm). Branching on the global configuration would render the first
+/// group wrong on an algebraic branch, which is the same scope error as reading
+/// a root's width from the configuration instead of from the root.
 fn digest_bytes(public: &[(u32, LfmWord)]) -> [u8; 32] {
     use math::field::traits::IsPrimeField;
+    if public.len() == 1 {
+        return super::algebraic_commit::digest_to_commitment(&public[0].1);
+    }
+    assert_eq!(
+        public.len(),
+        2,
+        "a digest is one algebraic word or two byte words"
+    );
     let mut out = [0u8; 32];
     for h in 0..8 {
         let lane = public[h / 4].1[h % 4];
@@ -766,7 +789,7 @@ fn tampered_absorb_xor_rejects() {
         &super::hash::TestPermutation,
     )
     .expect("honest execution");
-    let mut traces = build_traces(&program, &exec.records);
+    let mut traces = build_traces_with_hasher(&program, &exec.records, artifacts.hasher);
     // Rate byte 5 of the first absorb row: XOR(state, block) no longer holds.
     let col = kchip::cols::PERM_IN + 5;
     let old = traces.keccak.main_table.get_row(0)[col];
@@ -873,7 +896,7 @@ fn permute_row_cannot_substitute_the_permuted_state() {
     exec.records.public[1] = words[0];
     exec.records.public[2] = words[1];
 
-    let mut traces = build_traces(&program, &exec.records);
+    let mut traces = build_traces_with_hasher(&program, &exec.records, artifacts.hasher);
     let proof = prove_traces(&artifacts, &mut traces, &exec.public_words, &opts)
         .expect("the prover has no constraint checks, so it accepts");
     assert!(
@@ -1272,7 +1295,7 @@ fn canonicity_guard_rejects_an_out_of_range_candidate_in_the_proof() {
     exec.records.public[0] = super::word::base_word(FE::zero());
     exec.public_words[0].1 = super::word::base_word(FE::zero());
 
-    let mut traces = build_traces(&program, &exec.records);
+    let mut traces = build_traces_with_hasher(&program, &exec.records, artifacts.hasher);
     let proof = prove_traces(&artifacts, &mut traces, &exec.public_words, &opts)
         .expect("the prover has no constraint checks, so it accepts");
     assert!(
@@ -2689,7 +2712,7 @@ fn chunking_splits_the_sponge_into_two_uneven_chunks() {
         &super::hash::TestPermutation,
     )
     .expect("honest execution");
-    let traces = build_traces(&program, &exec.records);
+    let traces = build_traces_with_hasher(&program, &exec.records, artifacts.hasher);
     assert_eq!(traces.keccak_rnd.len(), 2, "one KECCAK_RND trace per chunk");
     assert_eq!(
         traces
@@ -2802,7 +2825,7 @@ fn tampered_second_chunk_permutation_rejects() {
     )
     .expect("honest execution");
 
-    let mut traces = build_traces(&program, &exec.records);
+    let mut traces = build_traces_with_hasher(&program, &exec.records, artifacts.hasher);
     assert_eq!(traces.keccak_rnd.len(), 2);
     // Byte 0 of lane (0,0) on the second chunk's first row: the `Keccak`
     // receive token no longer matches the send that fed it.
@@ -2846,7 +2869,7 @@ fn dropping_the_second_chunks_permutation_rejects() {
     )
     .expect("honest execution");
 
-    let mut traces = build_traces(&program, &exec.records);
+    let mut traces = build_traces_with_hasher(&program, &exec.records, artifacts.hasher);
     // Same chunk COUNT — so the AIR set and the digest still match — but the
     // last chunk is now empty.
     traces.keccak_rnd[1] = keccak_rnd::generate_keccak_rnd_trace(&[]);
@@ -2890,7 +2913,7 @@ fn permutations_may_be_reassigned_across_chunk_boundaries() {
     let round_ops = round_ops_of(&program, &sponge_arenas(&msg));
     assert_eq!(round_ops.len(), 3);
 
-    let mut traces = build_traces(&program, &exec.records);
+    let mut traces = build_traces_with_hasher(&program, &exec.records, artifacts.hasher);
     // Canonical split is 2 + 1; re-split as 1 + 2.
     traces.keccak_rnd[0] = keccak_rnd::generate_keccak_rnd_trace(&round_ops[..1]);
     traces.keccak_rnd[1] = keccak_rnd::generate_keccak_rnd_trace(&round_ops[1..]);

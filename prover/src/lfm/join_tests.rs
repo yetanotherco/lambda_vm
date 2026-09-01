@@ -38,7 +38,6 @@ use super::builder::LfmBuilder;
 use super::compiler::compile;
 use super::constraint_tests::{deep_shape, open_sub_proof, real_fixture};
 use super::executor::execute;
-use super::hash::TestPermutation;
 use super::sub_proof::{
     GroupShape, ROWS_PER_LEAF, SubProofShape, emit_sub_proof, emit_sub_proof_with_bits,
 };
@@ -398,7 +397,7 @@ fn the_join_premises_hold_on_a_real_proof() {
 
     for (q, iota) in h.iotas.iter().enumerate() {
         let arenas = vec![vec![base_word(FE::from(*iota as u64))]];
-        let exec = execute(&program, &arenas, &TestPermutation).expect("the derivation executes");
+        let exec = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER).expect("the derivation executes");
         assert_eq!(
             exec.public_words[0].1[0], h.points[q].0,
             "query {q}: the machine's point must be \
@@ -438,7 +437,7 @@ fn the_join_matches_the_production_verifier_on_every_query() {
     let program = compile(b.finish());
     validate(&program).expect("the joined sub-proof program is admissible");
 
-    let exec = execute(&program, &h.arenas(&all), &TestPermutation)
+    let exec = execute(&program, &h.arenas(&all), &crate::hash_pin::BLOCK_HASHER)
         .expect("an honest sub-proof must authenticate and fold");
 
     let mut nonzero = 0usize;
@@ -1084,7 +1083,7 @@ fn sweep_tampers(h: &HostSubProof, label: &str) {
         b.public(s.as_cell());
     }
     let program = compile(b.finish());
-    let honest = execute(&program, &h.arenas(&[q]), &TestPermutation).expect("honest");
+    let honest = execute(&program, &h.arenas(&[q]), &crate::hash_pin::BLOCK_HASHER).expect("honest");
 
     // Sweep every value slot of every group, so no vector class (first group,
     // first column, regular point) is silently the only one tested.
@@ -1103,7 +1102,7 @@ fn sweep_tampers(h: &HostSubProof, label: &str) {
             arenas[4][word_of_slot][0] += FE::one();
 
             // Incoherent: the real roots, a moved leaf.
-            let err = execute(&program, &arenas, &TestPermutation)
+            let err = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
                 .err()
                 .unwrap_or_else(|| {
                     panic!("{label}: group {g} slot {slot}: a moved value must not authenticate")
@@ -1121,7 +1120,7 @@ fn sweep_tampers(h: &HostSubProof, label: &str) {
             let mut coherent_roots = h.roots.clone();
             coherent_roots[g] = forged;
             arenas[3] = commitments_to_arena(&coherent_roots);
-            let forged_run = execute(&program, &arenas, &TestPermutation).unwrap_or_else(|e| {
+            let forged_run = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER).unwrap_or_else(|e| {
                 panic!("{label}: group {g} slot {slot}: the coherent forgery must execute: {e:?}")
             });
             // Which of the two points moves is not incidental: a leaf holds
@@ -1188,14 +1187,14 @@ fn sweep_tampers(h: &HostSubProof, label: &str) {
              trees are degenerate at this index and the walk half of this vector \
              tests nothing"
         );
-        execute(&program, &arenas, &TestPermutation)
+        execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
             .err()
             .unwrap_or_else(|| {
                 panic!("{label}: index bit {level}: a moved index must not authenticate")
             });
 
         arenas[3] = commitments_to_arena(&coherent_roots);
-        let forged = execute(&program, &arenas, &TestPermutation).unwrap_or_else(|e| {
+        let forged = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER).unwrap_or_else(|e| {
             panic!("{label}: index bit {level}: coherent forgery must execute: {e:?}")
         });
         assert_ne!(
@@ -1217,7 +1216,7 @@ fn sweep_tampers(h: &HostSubProof, label: &str) {
         let base = 1 + groups[0].num_values();
         arenas[4][base..base + 2 * h.shape.merkle_depth]
             .copy_from_slice(&commitments_to_arena(&siblings));
-        execute(&program, &arenas, &TestPermutation)
+        execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
             .err()
             .unwrap_or_else(|| {
                 panic!("{label}: sibling level {level}: a moved path must not authenticate")
@@ -1266,7 +1265,7 @@ fn the_controls_show_what_the_join_denies() {
     validate(&program).expect("admissible");
     let mut arenas = h.arenas(&[q]);
     arenas.push(h.split_values(q));
-    let clean = execute(&program, &arenas, &TestPermutation)
+    let clean = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
         .expect("the control must accept honest inputs");
     assert_eq!(
         word_as_ext(&clean.public_words[0].1).expect("ext"),
@@ -1277,7 +1276,7 @@ fn the_controls_show_what_the_join_denies() {
 
     let mut attacked = arenas.clone();
     attacked[5][0][0] += FE::one();
-    let forged = execute(&program, &attacked, &TestPermutation).expect(
+    let forged = execute(&program, &attacked, &crate::hash_pin::BLOCK_HASHER).expect(
         "SplitValues: authenticating one set of values and folding another is \
          exactly what this control permits",
     );
@@ -1298,7 +1297,7 @@ fn the_controls_show_what_the_join_denies() {
     validate(&program).expect("admissible");
     let mut arenas = h.arenas(&[q]);
     arenas.push(vec![base_word(h.points[q].0), base_word(h.points[q].1)]);
-    let clean = execute(&program, &arenas, &TestPermutation).expect("honest");
+    let clean = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER).expect("honest");
     assert_eq!(
         word_as_ext(&clean.public_words[0].1).expect("ext"),
         h.expected[q].0
@@ -1306,7 +1305,7 @@ fn the_controls_show_what_the_join_denies() {
 
     let mut attacked = arenas.clone();
     attacked[5] = vec![base_word(h.points[other].0), base_word(h.points[other].1)];
-    let forged = execute(&program, &attacked, &TestPermutation).expect(
+    let forged = execute(&program, &attacked, &crate::hash_pin::BLOCK_HASHER).expect(
         "HintedPoint: a hinted point is not tied to the authenticated index, \
          which is what this control permits",
     );
@@ -1529,7 +1528,7 @@ fn the_precomputed_group_comes_first_and_that_is_checkable() {
     }
     let program = compile(b.finish());
     validate(&program).expect("admissible");
-    let exec = execute(&program, &h.arenas(&queries), &TestPermutation)
+    let exec = execute(&program, &h.arenas(&queries), &crate::hash_pin::BLOCK_HASHER)
         .expect("the four-group sub-proof must authenticate and fold");
     for (k, q) in queries.iter().enumerate() {
         assert_eq!(

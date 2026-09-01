@@ -48,7 +48,6 @@ use super::executor::execute;
 use super::fri::{
     FRI_LEAF_GROUP, FriQuery, FriShape, declare_fri, emit_query_fri, hint_layer_openings,
 };
-use super::hash::TestPermutation;
 use super::join_tests::{HostSubProof, build_host_sub_proof};
 use super::validator::validate;
 use super::word::{LfmWord, base_word, ext_word, word_as_ext};
@@ -299,7 +298,7 @@ fn the_fri_leaf_is_byte_identical_to_productions_own_backends() {
     let mut digests = Vec::new();
     for (i, (a, c)) in vectors.iter().enumerate() {
         let arenas = vec![vec![ext_word(a), ext_word(c)]];
-        let exec = execute(&program, &arenas, &TestPermutation).expect("the leaf hash executes");
+        let exec = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER).expect("the leaf hash executes");
         let got = [exec.public_words[0].1, exec.public_words[1].1];
 
         let batched =
@@ -622,7 +621,7 @@ fn the_fri_emitter_verifies_every_query_of_a_real_folding_proof() {
         let h = host_fri(rows, 2);
         let all: Vec<usize> = (0..h.trace.iotas.len()).collect();
         let program = fri_only_program(h.shape, all.len());
-        let exec = execute(&program, &h.all_arenas(&all), &TestPermutation).expect(
+        let exec = execute(&program, &h.all_arenas(&all), &crate::hash_pin::BLOCK_HASHER).expect(
             "an honest FRI decommitment must authenticate every layer and reach \
              the terminal polynomial",
         );
@@ -707,7 +706,7 @@ fn the_two_legs_verify_one_real_folding_proof_as_one_program() {
 
     let mut arenas = h.trace.arenas(&queries);
     arenas.extend(h.fri_arenas(&queries));
-    let exec = execute(&program, &arenas, &TestPermutation)
+    let exec = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
         .expect("the honest proof must authenticate, fold and reach the terminal");
 
     let codeword = h.terminal_codeword();
@@ -1031,7 +1030,7 @@ fn no_tampered_fri_value_can_pass() {
     };
     let program = fri_only_program(shape, queries.len());
     let honest = h.all_arenas(&queries);
-    execute(&program, &honest, &TestPermutation).expect("the honest run must execute");
+    execute(&program, &honest, &crate::hash_pin::BLOCK_HASHER).expect("the honest run must execute");
 
     let stride = h.shape.query_words();
     // (label, arena, word) — arena order is the driver's: deep, roots, zetas,
@@ -1057,7 +1056,7 @@ fn no_tampered_fri_value_can_pass() {
     for (label, arena, word) in bump {
         let mut tampered = honest.clone();
         tampered[arena][word][0] += FE::one();
-        let err = execute(&program, &tampered, &TestPermutation).expect_err(&format!(
+        let err = execute(&program, &tampered, &crate::hash_pin::BLOCK_HASHER).expect_err(&format!(
             "moving the {label} must make the program unexecutable"
         ));
         println!("  {label:<40} rejected: {err:?}");
@@ -1076,7 +1075,7 @@ fn no_tampered_fri_value_can_pass() {
          splice is a no-op and this vector proves nothing"
     );
     spliced[4][to..to + len].copy_from_slice(&borrowed);
-    let err = execute(&program, &spliced, &TestPermutation).expect_err(
+    let err = execute(&program, &spliced, &crate::hash_pin::BLOCK_HASHER).expect_err(
         "a REAL leaf and a REAL path, at the wrong index, must still be rejected \
          — the walk climbs at this query's own bits",
     );
@@ -1116,7 +1115,7 @@ fn the_shape_pins_the_lengths_production_must_check_at_runtime() {
     };
     let program = fri_only_program(shape, 1);
     let honest = h.all_arenas(&queries);
-    execute(&program, &honest, &TestPermutation).expect("the honest run must execute");
+    execute(&program, &honest, &crate::hash_pin::BLOCK_HASHER).expect("the honest run must execute");
 
     // (label, arena, what the truncation would buy a prover)
     let attacks: [(&str, usize, &str); 3] = [
@@ -1140,7 +1139,7 @@ fn the_shape_pins_the_lengths_production_must_check_at_runtime() {
     for (label, arena, mirrors) in attacks {
         let mut truncated = honest.clone();
         truncated[arena].clear();
-        let err = execute(&program, &truncated, &TestPermutation)
+        let err = execute(&program, &truncated, &crate::hash_pin::BLOCK_HASHER)
             .expect_err(&format!("{label} must be refused"));
         assert!(
             matches!(err, LfmExecError::ArenaLenMismatch { .. }),

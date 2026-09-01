@@ -23,10 +23,17 @@
 //!
 //! ## What this module cannot see
 //!
-//! The hash. Every permutation here is `TestPermutation` inside the LFM chips
-//! plus the production keccak family hosted for `keccak256`; the point of
-//! measuring cells at all is to have the first column of a matrix whose other
-//! columns (blake, Poseidon) do not exist yet. It also cannot see prove time or
+//! The hash — MOSTLY. This module was written when every permutation here was
+//! `TestPermutation` inside the LFM chips plus the production keccak family
+//! hosted for `keccak256`, and the point of measuring cells at all was to have
+//! the first column of a matrix whose other columns did not exist yet. Those
+//! columns exist now (BLAKE3, RPO, RPX, Poseidon), so
+//! ⚠ [`the_census_agrees_with_the_traces_the_prover_builds`] takes its tenant
+//! from `artifacts.hasher` rather than defaulting: it compares a census, a trace
+//! set and an AIR set, and the socket chip's WIDTH is tenant-dependent, so three
+//! defaults against one pinned artifact set is an out-of-bounds index rather
+//! than a disagreement. Everything else here is still tenant-agnostic. It also
+//! cannot see prove time or
 //! peak memory as a property of the machine — those are measured around the
 //! process, by the harness that runs it, and are reported as observations of one
 //! box rather than as machine invariants.
@@ -40,7 +47,6 @@ use super::compiler::LfmProgram;
 use super::edsl::WrapHash;
 use super::epoch_tests::EpochInputs;
 use super::executor::execute;
-use super::hash::TestPermutation;
 use super::instr::Instr;
 use super::proof::{LfmProveError, lfm_prove, lfm_prove_with_residency, verify_against};
 use super::registry::build_artifacts;
@@ -1103,9 +1109,19 @@ fn the_census_agrees_with_the_traces_the_prover_builds() {
     let state: [u64; 25] =
         core::array::from_fn(|i| 0x9E37_79B9_7F4A_7C15u64.wrapping_mul(i as u64 + 1));
     let arenas = vec![super::keccak_adapter::state_to_words(&state).to_vec()];
-    let exec = execute(&program, &arenas, &TestPermutation).expect("the chain program runs");
-    let traces = super::trace::build_traces(&program, &exec.records);
-    let census = lfm_chip_census(&program);
+    // ⚠ ONE tenant for all four of execution, traces, census and AIRs, taken
+    // from the artifacts this test is about to compare against. The four used to
+    // default to `HasherKind::Test` while `build_artifacts` named the pin, and a
+    // trace built for one tenant against constraints built for another is an
+    // out-of-bounds index inside `HashConstraints::eval` — the socket chip's
+    // width is tenant-dependent (436 columns for RPO against 3,056 for BLAKE3).
+    // It surfaces as a bounds panic in a rayon worker, which reaches the test as
+    // "a scoped thread panicked" and names nothing at all.
+    let opts = wrap_options();
+    let artifacts = build_artifacts(&program, &opts);
+    let exec = execute(&program, &arenas, &artifacts.hasher).expect("the chain program runs");
+    let traces = super::trace::build_traces_with_hasher(&program, &exec.records, artifacts.hasher);
+    let census = super::airs::lfm_chip_census_with_hasher(&program, artifacts.hasher);
 
     // The frozen AIR order, as the census emits it and `air_trace_pairs` proves
     // it. Built from the trace set so a chip whose height the census got from the
@@ -1168,12 +1184,11 @@ fn the_census_agrees_with_the_traces_the_prover_builds() {
     }
 
     // ---- the AIR set: the names and the widths, in the frozen order.
-    let opts = wrap_options();
-    let artifacts = build_artifacts(&program, &opts);
-    let airs = super::airs::LfmAirs::new(
+    let airs = super::airs::LfmAirs::new_with_hasher(
         &artifacts.roots,
         &opts,
         artifacts.keccak_rnd_chunks,
+        artifacts.hasher,
         artifacts.chip_set,
     );
     let refs = airs.air_refs();
