@@ -26,6 +26,7 @@
 //! distinguish a per-level walk from a two-level one; it is not enough to catch
 //! something that only appears past a word boundary in the index.
 
+use crypto::merkle_tree::traits::IsStreamingLeafBackend;
 use math::field::traits::IsFFTField;
 use stark::config::Commitment;
 use stark::domain::new_verifier_domain;
@@ -1176,13 +1177,13 @@ fn sweep_tampers(h: &HostSubProof, label: &str) {
         for (g, group) in groups.iter().enumerate() {
             let words = &h.openings[q][g].values;
             let leaf = if group.is_ext {
-                type ExtBackend = stark::config::BatchedMerkleTreeBackend<Ext3>;
+                type ExtBackend = super::proof_arena::BlockBatched<Ext3>;
                 let v: Vec<FEE> = words.iter().map(|w| FEE::new([w[0], w[1], w[2]])).collect();
-                ExtBackend::hash_data_from_slices(&v, &[])
+                <ExtBackend as IsStreamingLeafBackend<Ext3>>::hash_data_from_slices(&v, &[])
             } else {
-                type BaseBackend = stark::config::BatchedMerkleTreeBackend<Gl>;
+                type BaseBackend = super::proof_arena::BlockBatched<Gl>;
                 let v: Vec<FE> = words.iter().map(|w| w[0]).collect();
-                BaseBackend::hash_data_from_slices(&v, &[])
+                <BaseBackend as IsStreamingLeafBackend<Gl>>::hash_data_from_slices(&v, &[])
             };
             coherent_roots[g] = walk_to_root(leaf, bad, &h.openings[q][g].siblings);
             moved_a_root |= coherent_roots[g] != h.roots[g];
@@ -1237,18 +1238,18 @@ fn sweep_tampers(h: &HostSubProof, label: &str) {
     /// The leaf hash a tampered opening really produces, under production's own
     /// backend rather than a local model.
     fn tampered_leaf(h: &HostSubProof, q: usize, g: usize, slot: usize) -> Commitment {
-        type BaseBackend = stark::config::BatchedMerkleTreeBackend<Gl>;
-        type ExtBackend = stark::config::BatchedMerkleTreeBackend<Ext3>;
+        type BaseBackend = super::proof_arena::BlockBatched<Gl>;
+        type ExtBackend = super::proof_arena::BlockBatched<Ext3>;
         let group = h.shape.groups()[g];
         let words = &h.openings[q][g].values;
         if group.is_ext {
             let mut v: Vec<FEE> = words.iter().map(|w| FEE::new([w[0], w[1], w[2]])).collect();
             v[slot] = &v[slot] + FEE::new([FE::one(), FE::zero(), FE::zero()]);
-            ExtBackend::hash_data_from_slices(&v, &[])
+            <ExtBackend as IsStreamingLeafBackend<Ext3>>::hash_data_from_slices(&v, &[])
         } else {
             let mut v: Vec<FE> = words.iter().map(|w| w[0]).collect();
             v[slot] += FE::one();
-            BaseBackend::hash_data_from_slices(&v, &[])
+            <BaseBackend as IsStreamingLeafBackend<Gl>>::hash_data_from_slices(&v, &[])
         }
     }
 }
