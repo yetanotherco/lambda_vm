@@ -18,20 +18,52 @@ lambda-vm-syscalls = { path = "../../../../syscalls" }
 # lambda_vm repo and injected in src/main.rs — so crypto changes stay in our repo
 # and don't require an ethrex PR.
 lambda-vm-ethrex-crypto = { path = "../../../../crypto/ethrex-crypto" }
-# Pinned by immutable `rev` to a commit on the open LambdaVM-backend PR branch
-# (feat/lambdavm-prover-backend) of ethrex; re-pin to the merge commit once it
-# lands on ethrex `main`. The `lambdavm` feature is kept only for its dependency
-# wiring (`ProgramInput`/`execution_program`/`ProgramOutput::encode` + pure-Rust
-# crypto defaults); ethrex's own `LambdaVmCrypto` compiles unused — we inject our
-# own. KZG is NOT linked under this feature, so the point-evaluation precompile
-# (0x0a) is unsupported — see src/main.rs.
-ethrex-guest-program = { git = "https://github.com/lambdaclass/ethrex.git", rev = "156cb8d6a3974f411d71622eecd1b249ee37ff1c", package = "ethrex-guest-program", default-features = false, features = ["lambdavm"] }
+# Pinned by immutable `rev` to a commit on ethrex `main`. It used to point at the
+# open LambdaVM-backend PR branch (`feat/lambdavm-prover-backend`) and wait for
+# that to merge; it no longer does, because the branch stopped moving 69 commits
+# behind `main` while guest performance work kept landing there. Measured on the
+# real benchmark block, that wait had grown to -22.9%.
+#
+# No `features = [...]`, deliberately — not even `lambdavm`.
+#
+# `ethrex-guest-program` carries one feature per zkVM and, despite the names, none
+# of them selects a backend: each is only a list of optional crypto dependencies
+# to activate, and none gates any method of the `Crypto` trait (its gates are
+# `secp256k1`, `c-kzg`, `blst`, `std`). `lambdavm` was
+# `["dep:k256", "dep:lambda-vm-syscalls", "ethrex-l2-common/secp256k1"]`, and
+# since #702 moved the `Crypto` impl into this repo the syscalls it pulled are for
+# ethrex's own provider, which we no longer use — while this guest already depends
+# on `lambda-vm-syscalls` by path, three lines above.
+#
+# What makes this guest LambdaVM is those path deps plus the
+# `riscv64im-lambda-vm-elf` target. None of it travels through a feature: every
+# run reports its ECSM and keccak precompile calls, which is what actually proves
+# the injected crypto is live.
+#
+# Verified rather than assumed. Against the sibling feature activating the widest
+# dependency set, ethrex's own precompile stress fixtures come out identical to
+# the cycle — `stress_modexp_150M` 6,373,285,966 and `stress_alt_bn128_150M`
+# 22,986,061,145 both ways — and the real benchmark block is 30,498,818 here vs
+# 30,501,620 there, with a 2,928-byte smaller ELF. The difference is dead
+# `substrate-bn`/`bls12_381` that the arkworks-based trait defaults never call.
+#
+# Declaring nothing is also what frees the pin: `lambdavm` exists ONLY on that
+# unmerged branch, so requiring it is precisely what tied this guest to it. See
+# scripts/bench_ethrex_pr.sh, which re-pins across arbitrary revs to measure
+# upstream guest PRs.
+#
+# KZG is not linked, so the point-evaluation precompile (0x0a) is unsupported —
+# see src/main.rs.
+ethrex-guest-program = { git = "https://github.com/lambdaclass/ethrex.git", rev = "797df5540c7d35cafd69b6971a74b2a49c67d1dd", package = "ethrex-guest-program", default-features = false }
 # Exact pin: must match the fixture writer (tooling/ethrex-fixtures) and the
 # executor test reader so the rkyv ProgramInput layout stays consistent.
 rkyv = { version = "=0.8.16", features = ["std", "unaligned"] }
 
-# `ethrex-guest-program`'s `lambdavm` feature pins `lambda-vm-syscalls` to an
-# older commit. Override it with our working-tree copy so the guest links our
-# current syscalls (keccak_permute + the Print-ecall no-op fix).
+# `lambda-vm-syscalls` can still reach the graph as a git dep pinned to a commit
+# of THIS repo, which upstream bumps on its own schedule. Override it
+# with the working-tree copy so the guest always links the same syscalls as the rest
+# of the repo — including uncommitted local edits — rather than whatever commit
+# ethrex last pinned. (At the current ethrex rev the two happen to coincide; this
+# override is what keeps that coincidence from being load-bearing.)
 [patch."https://github.com/yetanotherco/lambda_vm.git"]
 lambda-vm-syscalls = { path = "../../../../syscalls" }

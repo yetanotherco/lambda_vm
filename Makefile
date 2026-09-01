@@ -307,8 +307,12 @@ test-rust: compile-programs-rust
 # measured cost.
 ETHREX_REAL_BLOCK_NETWORK := mainnet
 ETHREX_REAL_BLOCK := 25368371
-ETHREX_REAL_BLOCK_FIXTURE_URL := https://github.com/yetanotherco/lambda_vm/releases/download/bench-fixtures-v1/ethrex_mainnet_25368371.bin
-ETHREX_REAL_BLOCK_FIXTURE_SHA256 := 61eba49b6b254f4a05def5a47b08a21ae3eee56f0d37bcd7b3a24b0cc1e4a300
+# The asset name carries the ethrex rev because the bytes are a function of it: the
+# archived ProgramInput layout moves with the pin, so one block has one fixture per rev.
+# Uploading under a new name rather than replacing the old one keeps `main` — which still
+# expects the pre-bump sha256 — fetching its own artifact while this branch is open.
+ETHREX_REAL_BLOCK_FIXTURE_URL := https://github.com/yetanotherco/lambda_vm/releases/download/bench-fixtures-v1/ethrex_mainnet_25368371_797df554.bin
+ETHREX_REAL_BLOCK_FIXTURE_SHA256 := 573004e62e3680a00d3cdbae19dc4897e2ec60d6ec0c1d05d9ef118cb8aef17f
 # The block's source cache, hosted in the same release. Only `regen-real-block-fixture`
 # reads it — the converter's TESTS use a different, upstream-pinned cache (below).
 ETHREX_REAL_BLOCK_CACHE_URL := https://github.com/yetanotherco/lambda_vm/releases/download/bench-fixtures-v1/cache_mainnet_25368371.json
@@ -499,7 +503,8 @@ regen-ethrex-fixtures:
 	cd tooling/ethrex-fixtures && \
 		cargo run --release -- 0  ../../executor/tests/ethrex_empty_block.bin && \
 		cargo run --release -- 1  ../../executor/tests/ethrex_simple_tx.bin && \
-		cargo run --release -- 10 ../../executor/tests/ethrex_10_transfers.bin
+		cargo run --release -- 10 ../../executor/tests/ethrex_10_transfers.bin && \
+		cargo run --release -- 4  ../../executor/tests/ethrex_bench_4.bin distinct
 	$(MAKE) update-ethrex-fixture-checksums
 
 update-ethrex-fixture-checksums:

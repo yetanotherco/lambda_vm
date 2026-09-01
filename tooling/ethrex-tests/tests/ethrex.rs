@@ -127,11 +127,13 @@ fn test_ethrex_real_block_native() {
 /// backend too (invalid G1 encoding), and both paths surface as
 /// `CryptoError::Other`, so the variant can't tell them apart. The string comes
 /// from `ethrex-crypto`'s `KzgError::Unimplemented`; if upstream rewords it this
-/// test goes red, which is the safe direction.
+/// test goes red, which is the safe direction — and it has: the 4f658c2b rev bump
+/// dropped `openvm-kzg` from the sentence, so the expected text moved with it.
 ///
 /// Worth knowing why this can regress: `ethrex-crypto`'s own default feature set
-/// is `["std", "kzg-rs", "secp256k1"]`, so any future dependency pulling it in
-/// with defaults on restores a backend and silently removes the screen.
+/// is `["std", "kzg-rs", "secp256k1", "aws-lc-rs", "blst"]`, so any future
+/// dependency pulling it in with defaults on restores a backend and silently
+/// removes the screen.
 #[test]
 fn no_kzg_backend_linked() {
     use ethrex_guest_program::crypto::{Crypto, NativeCrypto};
@@ -141,7 +143,7 @@ fn no_kzg_backend_linked() {
         Err(err) => format!("{err:?}"),
     };
     assert!(
-        message.contains("One of features c-kzg, openvm-kzg or kzg-rs should be active"),
+        message.contains("One of features c-kzg or kzg-rs should be active"),
         "a KZG backend is linked into ethrex-tests, so test_ethrex_real_block_native no \
          longer screens precompile 0x0a: {message}"
     );
