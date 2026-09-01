@@ -801,6 +801,29 @@ fn run_admitted<T: Send>(
         .map(|_| std::sync::Mutex::new(None))
         .collect();
     let cursor = std::sync::atomic::AtomicUsize::new(0);
+    // ★ The first worker panic, kept so it can be re-raised on THIS thread.
+    //
+    // ⚠ Without this, a panic inside `task` is destroyed rather than reported.
+    // `std::thread::scope` propagates by panicking at the scope call with the
+    // fixed string "a scoped thread panicked", which names neither the cause nor
+    // its location; and the worker's own message does not survive either,
+    // because libtest installs a GLOBAL panic hook that suppresses the default
+    // output and files the message against the test thread it is capturing for —
+    // a spawned thread matches no test, so the message is dropped on the floor
+    // rather than merely misfiled. ✓ VERIFIED by grepping a full box run's raw
+    // log, stderr included: not one worker message appeared.
+    //
+    // The cost of that was eleven anonymous failures in one suite run. Catching
+    // the payload and re-raising it here puts the real message back inside the
+    // failing test's own block.
+    let first_panic: std::sync::Mutex<Option<Box<dyn std::any::Any + Send>>> =
+        std::sync::Mutex::new(None);
+    // A poisoned lock is itself a panic we are mid-way through reporting, so
+    // read through the poison rather than panicking about it and losing the
+    // message a second time.
+    let taken = |m: &std::sync::Mutex<Option<Box<dyn std::any::Any + Send>>>| {
+        m.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+    };
     std::thread::scope(|scope| {
         for _ in 0..workers.max(1).min(order.len().max(1)) {
             scope.spawn(|| {
@@ -809,15 +832,45 @@ fn run_admitted<T: Send>(
                     if pos >= order.len() {
                         return;
                     }
+                    // ⚖ Stop pulling work once a sibling has failed. The result
+                    // is discarded either way, so this only declines to spend
+                    // cores on it; the previous code let every remaining index
+                    // run to completion before the scope re-panicked.
+                    if taken(&first_panic) {
+                        return;
+                    }
                     let idx = order[pos];
                     let permit = gate.acquire(estimates[idx]);
-                    let out = task(idx);
-                    *results[idx].lock().unwrap() = Some(out);
+                    let out =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| task(idx)));
+                    // Released explicitly: the catch means unwinding no longer
+                    // drops it for us, and a leaked permit would deadlock every
+                    // remaining worker on the gate.
                     drop(permit);
+                    match out {
+                        Ok(v) => *results[idx].lock().unwrap() = Some(v),
+                        Err(payload) => {
+                            let mut slot =
+                                first_panic.lock().unwrap_or_else(|e| e.into_inner());
+                            if slot.is_none() {
+                                *slot = Some(payload);
+                            }
+                            return;
+                        }
+                    }
                 }
             });
         }
     });
+    if let Some(payload) = first_panic.into_inner().unwrap_or_else(|e| e.into_inner()) {
+        // ⚠ `resume_unwind` deliberately does NOT re-run the panic hook: the
+        // hook already ran in the worker, and running it again would print the
+        // same panic twice. The consequence is that the reported LOCATION is the
+        // harness's rather than the original `panic!` site — the message
+        // survives, the line number does not. That is the trade, and it is worth
+        // making: a named cause without a line beats a line without a cause.
+        std::panic::resume_unwind(payload);
+    }
     results
         .into_iter()
         .map(|m| m.into_inner().unwrap())
