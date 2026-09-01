@@ -112,17 +112,78 @@ the correct failure: loud, at prove time, naming the cause.
 ★ **Regenerate control-first.** Run each regenerator under the BLAKE3 pin and
 confirm it reproduces the existing table byte for byte BEFORE trusting it on RPO.
 
-✓ **VERIFIED on this cut, in the other direction too.** Both regenerators were
-re-run at the frozen base and their output compared against the tables carried
-forward from the previous cut: the four static-commitment families match, and the
-registry matches on **all 13,056 hex bytes** — the only textual difference is
-rustfmt's trailing commas. So the regeneration is deterministic, and the base's
-`programs.rs` change (the R1f Merkle instrument) moved no registered program
-identity, exactly as the six-kind `LfmProgramKind` list predicts.
+✓ **VERIFIED on this cut:** both regenerators were re-run at the frozen base and
+their output compared against the tables carried forward from the previous cut —
+the four static-commitment families match, and the registry matches on **all
+13,056 hex bytes**, the only textual difference being rustfmt's trailing commas.
+**So the regeneration is deterministic.**
+
+⛔ **AND THAT IS ALL IT PROVES. This control cannot tell you an identity has not
+moved, and it was once reported as if it could.** `compute_lfm_registry` names
+`REGISTRY_HASHER` explicitly and never reads `build_artifacts`, so re-running it
+validates the generator **against itself**. When `build_artifacts` was briefly
+changed to name `BLOCK_HASHER`, every registry program's `program_id` moved and
+this control reproduced byte-for-byte anyway — it could not have fired.
+
+★ **The check that DID fire is `machine_tests::registry_drift_*`**, immediately
+and exactly, because it recomputes from the changed path and compares against the
+blessed table. ⚖ The lesson is not that the regeneration control is bad; it is
+that **a self-consistency check and an independent check are not substitutes**,
+and quoting the first for a claim only the second can support is how a green
+number gets trusted for something it never examined.
 A regenerator that silently produced the wrong table would bless the wrong roots
 and every drift test would agree with it. `registry.rs` governs both: a drift
 failure is investigated, never re-blessed to silence the test, and neither table
 is ever hand-edited.
+
+## ★★ THE CLASSIFICATION RULE — which call sites name the pin
+
+The durable artifact of closing the pin-arm failures, and the thing to apply
+before adding any new call site:
+
+> **A program built at `WrapHash::production()` emits `Instr::Hash` and must be
+> proved under `BLOCK_HASHER`. A program that pins a byte hash on its own builder
+> emits none, never consults the socket, and is correct at the registry's blessed
+> default under every pin.**
+
+It is *checkable*, not a judgement — read which program the site builds. All 17
+block-path sites were classified this way: the aggregator's 7 and the wrap leg's
+8 name `BLOCK_HASHER` through `build_artifacts_with_hasher`; `wrap_tests`'
+keccak-chain census site keeps the default because `keccak_chain_program` pins
+keccak on its own builder.
+
+⚠ **What it replaced, and why the replacement matters.** `build_artifacts` was
+briefly made to name `BLOCK_HASHER` itself. That fixed a real defect —
+`lfm_prove_batched` takes `artifacts.hasher`, so the aggregator inherited a toy
+permutation — but at the shared entry point rather than at the block path's call
+sites, and **the hasher is part of program IDENTITY** (`HasherKind::as_tag` is
+folded into `lfm_program_id`). Every registry identity moved.
+`rpo_chip_tests::the_rpo_choice_moves_the_program_digest_and_no_root` asserts the
+default in its own message; `poseidon_chip_tests` and `blake3_socket_tests` carry
+the same contract.
+
+⛔ **Do not "fix" this by re-blessing the registry under the pin.** Beyond
+violating the table's own doctrine — *a second hasher becomes additional ROWS,
+never a silent replacement* — it would move registry identities on `hash-blake3`,
+**the control**, risking its published words and converting "control drifted →
+STOP and investigate" into a self-inflicted alarm on the one measurement the
+comparison turns on.
+
+## ⚠ THE ONE WIDTH DEFECT THAT COULD HAVE PASSED
+
+Every digest-width defect on this migration failed loudly, and there is a reason
+rather than luck: the machine reconstructs a root matching nothing, and nothing
+downstream can proceed. **One shape sidestepped reconstruction entirely.**
+
+`fri_tests`' leaf gate published its digest as two cells and compared them
+pairwise. An algebraic `WrapDigest` is ONE cell whose second slot **repeats the
+first** (`WrapDigest::from_cell`), so the comparison read one lane twice and would
+have **passed on a duplicated value** — a green test asserting nothing, in the one
+place whose entire claim is that the machine's leaf IS the verifier's leaf.
+
+✓ A sweep for other comparisons that could pass on a repeated cell came back
+clean: `edsl::keccak256` and the BLAKE3 chain return `[Cell; 2]` because those
+digests genuinely are two cells. This was the only instance.
 
 ## THE RECIPE — how to run this branch's block
 
