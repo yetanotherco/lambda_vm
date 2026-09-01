@@ -6,11 +6,9 @@
 //! - Padding: Auto-padding to power of 2 works correctly
 //! - Border cases: Edge values (0, MAX, signed boundaries) work
 
+use math::field::element::FieldElement;
 use stark::constraints::builder::EmptyConstraints;
 use std::collections::HashMap;
-
-use crypto::fiat_shamir::default_transcript::DefaultTranscript;
-use math::field::element::FieldElement;
 
 use stark::lookup::{
     AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, BusValue, Multiplicity,

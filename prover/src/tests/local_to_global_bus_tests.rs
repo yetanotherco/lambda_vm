@@ -5,11 +5,9 @@
 //! program-end receiver (final value of each cell). The bus balances iff every
 //! epoch's `fini` matches the next epoch's `init` (the cross-epoch telescoping).
 
+use math::field::element::FieldElement;
 use stark::constraints::builder::EmptyConstraints;
 use std::collections::HashMap;
-
-use crypto::fiat_shamir::default_transcript::DefaultTranscript;
-use math::field::element::FieldElement;
 
 use stark::config::Commitment;
 use stark::lookup::{
@@ -656,7 +654,8 @@ fn prove_and_verify_global_with_traces(
     air_trace_pairs.push((&genesis_anchor, &mut genesis_trace, &()));
     air_trace_pairs.push((&program_end_anchor, &mut program_end_trace, &()));
 
-    let proof = multi_prove_ram(air_trace_pairs, &mut crate::hash_pin::block_transcript(&[])).unwrap();
+    let proof =
+        multi_prove_ram(air_trace_pairs, &mut crate::hash_pin::block_transcript(&[])).unwrap();
 
     let mut airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = l2g_airs
         .iter()

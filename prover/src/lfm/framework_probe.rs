@@ -9,8 +9,6 @@
 //! a flipped preprocessed root is rejected by the prover (recommit mismatch)
 //! and by the verifier (root equality), and a tampered witness value breaks
 //! the bus balance.
-
-use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use crypto::fiat_shamir::is_transcript::IsTranscript;
 use stark::config::Commitment;
 use stark::constraints::builder::EmptyConstraints;
@@ -148,7 +146,12 @@ fn b0_preprocessed_multiplicity_round_trips() {
     let refs: Vec<DynAir> = vec![&sender, &receiver];
     let mut vt = transcript();
     assert!(
-        crate::hash_pin::BlockVerifier::multi_verify_views(&refs, MultiProofView::Owned(&proof), &mut vt, &FEE::zero(),),
+        crate::hash_pin::BlockVerifier::multi_verify_views(
+            &refs,
+            MultiProofView::Owned(&proof),
+            &mut vt,
+            &FEE::zero(),
+        ),
         "honest proof must verify"
     );
 }
@@ -180,7 +183,12 @@ fn b0_verifier_rejects_wrong_preprocessed_root() {
     let refs: Vec<DynAir> = vec![&bad_sender, &receiver];
     let mut vt = transcript();
     assert!(
-        !crate::hash_pin::BlockVerifier::multi_verify_views(&refs, MultiProofView::Owned(&proof), &mut vt, &FEE::zero(),),
+        !crate::hash_pin::BlockVerifier::multi_verify_views(
+            &refs,
+            MultiProofView::Owned(&proof),
+            &mut vt,
+            &FEE::zero(),
+        ),
         "a supplied root differing from the proof's must reject"
     );
 }
@@ -212,7 +220,12 @@ fn b0_tampered_witness_value_breaks_balance() {
     let refs: Vec<DynAir> = vec![&sender, &receiver];
     let mut vt = transcript();
     assert!(
-        !crate::hash_pin::BlockVerifier::multi_verify_views(&refs, MultiProofView::Owned(&proof), &mut vt, &FEE::zero(),),
+        !crate::hash_pin::BlockVerifier::multi_verify_views(
+            &refs,
+            MultiProofView::Owned(&proof),
+            &mut vt,
+            &FEE::zero(),
+        ),
         "unbalanced bus must reject"
     );
 }

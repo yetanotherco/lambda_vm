@@ -37,7 +37,6 @@
 // Fiat-Shamir from the hash production replays (`DefaultStarkHash`), or every
 // honest proof it builds is rejected at challenge derivation. Same half-flip
 // `config.rs` warns about; the warning applies to test harnesses too.
-use stark::config::DefaultStarkTranscript as DefaultTranscript;
 use stark::proof::options::ProofOptions;
 use stark::prover::IsStarkProver;
 
@@ -46,7 +45,7 @@ use crate::tables::bitwise::{cols as bw_cols, row_index as bw_row_index};
 use crate::tables::page::cols as page_cols;
 use crate::tables::trace_builder::Traces;
 use crate::tables::types::{FE, VmTable};
-use crate::test_utils::{E, asm_elf_bytes};
+use crate::test_utils::asm_elf_bytes;
 use crate::{MaxRowsConfig, VmAirs, VmProof};
 
 use executor::elf::Elf;

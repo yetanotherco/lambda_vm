@@ -841,8 +841,7 @@ fn run_admitted<T: Send>(
                     }
                     let idx = order[pos];
                     let permit = gate.acquire(estimates[idx]);
-                    let out =
-                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| task(idx)));
+                    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| task(idx)));
                     // Released explicitly: the catch means unwinding no longer
                     // drops it for us, and a leaked permit would deadlock every
                     // remaining worker on the gate.
@@ -850,8 +849,7 @@ fn run_admitted<T: Send>(
                     match out {
                         Ok(v) => *results[idx].lock().unwrap() = Some(v),
                         Err(payload) => {
-                            let mut slot =
-                                first_panic.lock().unwrap_or_else(|e| e.into_inner());
+                            let mut slot = first_panic.lock().unwrap_or_else(|e| e.into_inner());
                             if slot.is_none() {
                                 *slot = Some(payload);
                             }

@@ -21,13 +21,11 @@ use std::path::PathBuf;
 // Fiat-Shamir from the hash production replays (`DefaultStarkHash`), or every
 // honest proof it builds is rejected at challenge derivation. Same half-flip
 // `config.rs` warns about; the warning applies to test harnesses too.
-use stark::config::DefaultStarkTranscript as DefaultTranscript;
 use stark::prover::IsStarkProver;
 
 use crate::recursion::{MIN_PROOF_OPTIONS, precomputed_commitments};
 use crate::statement::{StatementKind, absorb_statement, elf_digest};
 use crate::tables::trace_builder::Traces;
-use crate::test_utils::E;
 use crate::{MaxRowsConfig, VmAirs, VmProof};
 
 use executor::elf::Elf;

@@ -27,7 +27,6 @@
 // about exactly this half-flip ("the type system cannot force this; naming the
 // alias is what makes the production path follow DefaultStarkHash"); the warning
 // applies to the test harness too.
-use stark::config::DefaultStarkTranscript as DefaultTranscript;
 
 use math::field::element::FieldElement;
 use stark::constraints::builder::EmptyConstraints;
@@ -84,11 +83,11 @@ fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
     // Build air_trace_pairs for all tables
     let air_trace_pairs = airs.air_trace_pairs(traces);
 
-    let multi_proof = match multi_prove_ram(air_trace_pairs, &mut crate::hash_pin::block_transcript(&[]))
-    {
-        Ok(proof) => proof,
-        Err(_) => return false,
-    };
+    let multi_proof =
+        match multi_prove_ram(air_trace_pairs, &mut crate::hash_pin::block_transcript(&[])) {
+            Ok(proof) => proof,
+            Err(_) => return false,
+        };
 
     // Compute the verifier-side expected COMMIT bus balance from public output bytes
     let views: Vec<StarkProofView<F, E, ()>> = multi_proof

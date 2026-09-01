@@ -505,8 +505,8 @@ fn the_assembled_epoch_verifier_runs() {
     let e = super::epoch_tests::real_epoch();
     let program = super::epoch_tests::epoch_program(&e, true);
     let arenas = super::epoch_tests::epoch_arena_words(&e, true);
-    let exec =
-        execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER).expect("the assembled verifier must execute");
+    let exec = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+        .expect("the assembled verifier must execute");
 
     // ---- the spine's differential, unchanged: production's own challenges.
     let pub_ext = |i: usize| word_as_ext(&exec.public_words[i].1).expect("an ext challenge");

@@ -397,7 +397,8 @@ fn the_join_premises_hold_on_a_real_proof() {
 
     for (q, iota) in h.iotas.iter().enumerate() {
         let arenas = vec![vec![base_word(FE::from(*iota as u64))]];
-        let exec = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER).expect("the derivation executes");
+        let exec = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+            .expect("the derivation executes");
         assert_eq!(
             exec.public_words[0].1[0], h.points[q].0,
             "query {q}: the machine's point must be \
@@ -1083,7 +1084,8 @@ fn sweep_tampers(h: &HostSubProof, label: &str) {
         b.public(s.as_cell());
     }
     let program = compile(b.finish());
-    let honest = execute(&program, &h.arenas(&[q]), &crate::hash_pin::BLOCK_HASHER).expect("honest");
+    let honest =
+        execute(&program, &h.arenas(&[q]), &crate::hash_pin::BLOCK_HASHER).expect("honest");
 
     // Sweep every value slot of every group, so no vector class (first group,
     // first column, regular point) is silently the only one tested.
@@ -1120,9 +1122,12 @@ fn sweep_tampers(h: &HostSubProof, label: &str) {
             let mut coherent_roots = h.roots.clone();
             coherent_roots[g] = forged;
             arenas[3] = commitments_to_arena(&coherent_roots);
-            let forged_run = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER).unwrap_or_else(|e| {
-                panic!("{label}: group {g} slot {slot}: the coherent forgery must execute: {e:?}")
-            });
+            let forged_run = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "{label}: group {g} slot {slot}: the coherent forgery must execute: {e:?}"
+                    )
+                });
             // Which of the two points moves is not incidental: a leaf holds
             // the row PAIR, its first half is the regular point and its second
             // the symmetric, and folding the halves into the wrong point is a
@@ -1194,9 +1199,10 @@ fn sweep_tampers(h: &HostSubProof, label: &str) {
             });
 
         arenas[3] = commitments_to_arena(&coherent_roots);
-        let forged = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER).unwrap_or_else(|e| {
-            panic!("{label}: index bit {level}: coherent forgery must execute: {e:?}")
-        });
+        let forged =
+            execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER).unwrap_or_else(|e| {
+                panic!("{label}: index bit {level}: coherent forgery must execute: {e:?}")
+            });
         assert_ne!(
             forged.public_words[0].1, honest.public_words[0].1,
             "{label}: index bit {level}: the index derives the evaluation point, so a \
@@ -1528,8 +1534,12 @@ fn the_precomputed_group_comes_first_and_that_is_checkable() {
     }
     let program = compile(b.finish());
     validate(&program).expect("admissible");
-    let exec = execute(&program, &h.arenas(&queries), &crate::hash_pin::BLOCK_HASHER)
-        .expect("the four-group sub-proof must authenticate and fold");
+    let exec = execute(
+        &program,
+        &h.arenas(&queries),
+        &crate::hash_pin::BLOCK_HASHER,
+    )
+    .expect("the four-group sub-proof must authenticate and fold");
     for (k, q) in queries.iter().enumerate() {
         assert_eq!(
             word_as_ext(&exec.public_words[2 * k].1).expect("ext"),

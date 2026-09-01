@@ -4,11 +4,9 @@
 //! - Completeness: Valid lookups to BITWISE are accepted
 //! - Soundness: Invalid lookups to BITWISE are rejected
 
+use math::field::element::FieldElement;
 use stark::constraints::builder::EmptyConstraints;
 use std::collections::HashMap;
-
-use crypto::fiat_shamir::default_transcript::DefaultTranscript;
-use math::field::element::FieldElement;
 
 use stark::lookup::{
     AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, BusValue, Multiplicity,
