@@ -254,8 +254,8 @@ impl HostFri {
 /// 48, and all of them move at least one.
 #[test]
 fn the_fri_leaf_is_byte_identical_to_productions_own_backends() {
+    use super::proof_arena::{BlockBatched, BlockPair};
     use crypto::merkle_tree::traits::IsMerkleTreeBackend;
-    use stark::config::{BatchedMerkleTreeBackend, FriLayerMerkleTreeBackend};
 
     // Six distinct components, each with six distinct nonzero bytes in
     // descending positions, so no two of the 48 bytes agree and no component is
@@ -290,8 +290,12 @@ fn the_fri_leaf_is_byte_identical_to_productions_own_backends() {
     let v0 = b.hint_word(arena, 0);
     let v1 = b.hint_word(arena, 1);
     let leaf = super::sub_proof::emit_leaf_hash(&mut b, FRI_LEAF_GROUP, &[v0, v1]);
-    b.public(leaf[0]);
-    b.public(leaf[1]);
+    // ⚠ The digest's OWN width. Two publishes assumed a byte digest; an
+    // algebraic one is a single cell whose second slot repeats the first, so
+    // the comparison below would have read one lane twice.
+    for cell in leaf.cells() {
+        b.public(*cell);
+    }
     let program = compile(b.finish());
     validate(&program).expect("the leaf program is admissible");
 
@@ -300,11 +304,10 @@ fn the_fri_leaf_is_byte_identical_to_productions_own_backends() {
         let arenas = vec![vec![ext_word(a), ext_word(c)]];
         let exec = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
             .expect("the leaf hash executes");
-        let got = [exec.public_words[0].1, exec.public_words[1].1];
+        let got: Vec<LfmWord> = exec.public_words.iter().map(|(_, w)| *w).collect();
 
-        let batched =
-            <BatchedMerkleTreeBackend<Ext3> as IsMerkleTreeBackend>::hash_data(&vec![*a, *c]);
-        let paired = <FriLayerMerkleTreeBackend<Ext3> as IsMerkleTreeBackend>::hash_data(&[*a, *c]);
+        let batched = <BlockBatched<Ext3> as IsMerkleTreeBackend>::hash_data(&vec![*a, *c]);
+        let paired = <BlockPair<Ext3> as IsMerkleTreeBackend>::hash_data(&[*a, *c]);
         assert_eq!(
             batched, paired,
             "vector {i}: the spec's claim is that the prover's pair backend and \

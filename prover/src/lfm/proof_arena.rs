@@ -28,11 +28,24 @@ use super::word::{LfmWord, base_word};
 
 type FE = FieldElement<GoldilocksField>;
 
+/// The BATCHED Merkle backend the block path commits under, over any field.
+///
+/// ⛔ Use this rather than `stark::config::BatchedMerkleTreeBackend`, which is
+/// `BatchBlake3Backend` by definition — a workspace-default ALIAS, and therefore
+/// the same silent spelling of the default that `Prover` and `Verifier` are. A
+/// test comparing a machine leaf against that alias compares against BLAKE3
+/// whatever the branch pins.
+pub type BlockBatched<F> =
+    <crate::hash_pin::BlockStarkHash as stark::config::StarkHash>::Batched<F>;
+
+/// The PAIR backend FRI layers commit under. See [`BlockBatched`]; the alias it
+/// replaces is `stark::config::FriLayerMerkleTreeBackend` = `PairBlake3Backend`.
+pub type BlockPair<F> = <crate::hash_pin::BlockStarkHash as stark::config::StarkHash>::Pair<F>;
+
 /// The Merkle backend the main trace is committed under — the BLOCK PATH's pin,
 /// not a locally chosen equivalent and no longer `stark`'s default alias, so a
 /// branch that pins a different hash reaches this module too.
-type MainBackend =
-    <crate::hash_pin::BlockStarkHash as stark::config::StarkHash>::Batched<GoldilocksField>;
+type MainBackend = BlockBatched<GoldilocksField>;
 
 /// Halves in one 32-byte commitment.
 pub const ROOT_HALVES: usize = 8;
