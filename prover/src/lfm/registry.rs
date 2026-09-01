@@ -498,6 +498,20 @@ impl LfmArtifacts {
 /// ever also selects the commitment scheme the roots are committed under, every
 /// root above moves with it and the tag on its own stops being the whole
 /// binding.
+/// ★ The `LFM_HASH` permutation `LFM_REGISTRY` is blessed under.
+///
+/// Bound into every digest in that table — `HasherKind::as_tag` is folded into
+/// `lfm_program_id` — so changing it here is a re-blessing of the whole table,
+/// not a re-run. **A second hasher becomes additional ROWS, never a silent
+/// replacement of these.**
+///
+/// ⚠ Lives here rather than in `compute_lfm_registry` because it is a property
+/// of the TABLE, not of the generator, and because [`build_artifacts`] has to
+/// name it: a default spelled `HasherKind::default()` is a silent global, while
+/// one spelled `REGISTRY_HASHER` is a statement about registry identity that a
+/// reader can check against the table.
+pub const REGISTRY_HASHER: HasherKind = HasherKind::Test;
+
 pub fn build_artifacts(program: &LfmProgram, options: &ProofOptions) -> LfmArtifacts {
     // ⛔ **DEFAULTS TO `Test`, AND MUST.** The hasher is part of program
     // IDENTITY — `HasherKind::as_tag` is folded into `lfm_program_id` — and
@@ -517,7 +531,7 @@ pub fn build_artifacts(program: &LfmProgram, options: &ProofOptions) -> LfmArtif
     // ([`build_artifacts_with_hasher`]) instead. Registry programs pin a byte
     // hash on their own builders, emit no `Instr::Hash`, and never consult the
     // socket — they are correct at `Test` under every pin.
-    build_artifacts_with_hasher(program, options, HasherKind::default())
+    build_artifacts_with_hasher(program, options, REGISTRY_HASHER)
 }
 
 /// [`build_artifacts`] for a program proved under an explicitly chosen
