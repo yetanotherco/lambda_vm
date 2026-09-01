@@ -502,7 +502,7 @@ fn tampering_with_the_blake3_witness_is_not_accepted() {
     let program = blake3_sponge_program(65);
     let artifacts = build_artifacts(&program, &opts);
     let exec = execute(&program, &sponge_arenas(&msg), &TestPermutation).expect("execute");
-    let mut traces = super::trace::build_traces(&program, &exec.records);
+    let mut traces = super::trace::build_traces_with_hasher(&program, &exec.records, artifacts.hasher);
 
     // One output byte of the first compression.
     let col = cols::out_word(0, 0);
@@ -1596,7 +1596,7 @@ fn blake3_chunking_splits_the_chain_into_uneven_chunks() {
         &TestPermutation,
     )
     .expect("honest execution");
-    let traces = super::trace::build_traces(&program, &exec.records);
+    let traces = super::trace::build_traces_with_hasher(&program, &exec.records, artifacts.hasher);
     assert_eq!(traces.blake3.len(), 3, "one LFM_BLAKE3 trace per chunk");
     assert_eq!(
         traces
@@ -1780,7 +1780,7 @@ fn a_tampered_non_first_blake3_chunk_rejects() {
     let artifacts = build_artifacts(&program, &opts);
     let exec = execute(&program, &sponge_arenas(&msg), &TestPermutation).expect("execute");
 
-    let mut traces = super::trace::build_traces(&program, &exec.records);
+    let mut traces = super::trace::build_traces_with_hasher(&program, &exec.records, artifacts.hasher);
     assert_eq!(traces.blake3.len(), 3);
     // One output byte of the LAST chunk's first compression — the eleventh of
     // the twelve, which no other chunk carries.
