@@ -176,8 +176,27 @@ where
 
     /// `parts = max_degree - 1`, matching the framework's rule in
     /// `LookupAir::composition_poly_degree_bound`.
+    ///
+    /// `LVM_DEGREE_DECLARED` overrides the *declared* degree independently of
+    /// the true degree `D`. That decouples the two things raising a constraint
+    /// degree does at once — more arithmetic per row, and more composition
+    /// parts — so each can be priced on its own:
+    ///
+    ///   true D=3, declared 3  → 2 parts, degree-3 expressions
+    ///   true D=5, declared 5  → 4 parts, degree-5 expressions   (the real d=5)
+    ///   true D=3, declared 5  → 4 parts, degree-3 expressions   (parts only)
+    ///
+    /// The third minus the first is the cost of the parts; the second minus the
+    /// third is the cost of the arithmetic. Over-declaring is always safe;
+    /// UNDER-declaring is not (the bound would no longer cover H's true degree),
+    /// so the override is clamped to at least the true degree.
     fn composition_poly_degree_bound(&self, trace_length: usize) -> usize {
-        trace_length * (D - 1).max(1)
+        let declared = std::env::var("LVM_DEGREE_DECLARED")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(D)
+            .max(D);
+        trace_length * (declared - 1).max(1)
     }
 
     fn trace_layout(&self) -> (usize, usize) {

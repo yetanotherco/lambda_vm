@@ -653,3 +653,123 @@ fn true_degree_vs_blowup_bound() {
     probe!(9, 8);
     probe!(9, 4);
 }
+
+// =============================================================================
+// ★ FIXED-CELLS CONSTRAINT-DEGREE ARM
+// =============================================================================
+//
+// The question: at IDENTICAL committed cells and identical blowup, does raising
+// the max constraint degree from 3 to 5 change prover cost, and by how much?
+//
+// Raising a degree does two separable things — more arithmetic per row, and
+// more composition parts. `LVM_DEGREE_DECLARED` decouples them:
+//
+//   A: true D=3, declared 3 → 2 parts, degree-3 expressions
+//   B: true D=5, declared 5 → 4 parts, degree-5 expressions  (the real d=5)
+//   C: true D=3, declared 5 → 4 parts, degree-3 expressions  (parts moved only)
+//
+//   C − A = cost of the extra composition parts
+//   B − C = cost of the degree-5 arithmetic
+//
+// All three use the same `W` columns and the same row count with zero
+// interactions, so committed trace cells are identical BY CONSTRUCTION — the
+// test asserts it rather than assuming it.
+
+/// Prove `DegreeAir<D, W>` once and report cells, parts and wall time.
+///
+/// Cell convention: base-field-equivalent `main + 3·aux`; `aux = 0` here, so
+/// cells are exactly `W · rows`.
+fn degree_fixed_cells_arm<const D: usize, const W: usize>(
+    declared: usize,
+    blowup: u8,
+    rows_log2: u32,
+) -> (usize, usize, f64) {
+    use crate::examples::degree_air::{DegreeAir, DegreePublicInputs, degree_trace};
+
+    unsafe { std::env::set_var("LVM_DEGREE_DECLARED", declared.to_string()) };
+    let rows = 1usize << rows_log2;
+    let seeds: Vec<Felt> = (0..W).map(|i| Felt::from(3 + i as u64)).collect();
+    let mut trace = degree_trace::<GoldilocksField, D>(&seeds, rows);
+
+    let proof_options = ProofOptions {
+        blowup_factor: blowup,
+        // Real 128-bit Johnson-bound counts, so query work is representative.
+        fri_number_of_queries: if blowup == 8 { 73 } else { 110 },
+        coset_offset: 3,
+        grinding_factor: 1,
+        fri_final_poly_log_degree: 7,
+    };
+    let pub_inputs = DegreePublicInputs {
+        seeds: seeds.clone(),
+    };
+    let air = DegreeAir::<GoldilocksField, D, W>::new(&proof_options);
+    let parts = air.composition_poly_degree_bound(rows) / rows;
+    let cells = W * rows; // aux = 0
+
+    let t0 = std::time::Instant::now();
+    let proof = Prover::prove(
+        &air,
+        &mut trace,
+        &pub_inputs,
+        &mut DefaultTranscript::<F>::new(&[]),
+    )
+    .expect("prove");
+    let secs = t0.elapsed().as_secs_f64();
+    std::hint::black_box(&proof);
+    (cells, parts, secs)
+}
+
+#[test]
+#[ignore = "degree-lane experiment; run explicitly, one arm per process"]
+fn degree_fixed_cells_sweep() {
+    let rows_log2: u32 = std::env::var("LVM_DEGREE_ROWS_LOG2")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(18);
+    let blowup: u8 = std::env::var("LVM_DEGREE_BLOWUP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4);
+    let reps: usize = std::env::var("LVM_DEGREE_REPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
+    const W: usize = 32;
+
+    // `LVM_DEGREE_ARM=A|B|C` runs ONE arm and exits — required for peak RSS,
+    // which is a high-water mark and so measures only the largest arm if two
+    // share a process. Unset runs the interleaved ABBA, which is the right
+    // shape for wall clock.
+    let single = std::env::var("LVM_DEGREE_ARM").ok();
+    let order: Vec<&str> = match single.as_deref() {
+        Some(a) => vec![a],
+        None => vec!["A", "C", "B", "B", "C", "A"],
+    };
+
+    let mut cells_seen: Option<usize> = None;
+    for rep in 1..=reps {
+        for arm in order.iter().copied() {
+            let (cells, parts, secs) = match arm {
+                "A" => degree_fixed_cells_arm::<3, W>(3, blowup, rows_log2),
+                "C" => degree_fixed_cells_arm::<3, W>(5, blowup, rows_log2),
+                "B" => degree_fixed_cells_arm::<5, W>(5, blowup, rows_log2),
+                other => panic!("unknown arm {other:?}: expected A, B or C"),
+            };
+            // The whole design rests on cells being equal across arms.
+            match cells_seen {
+                None => cells_seen = Some(cells),
+                Some(c) => assert_eq!(
+                    c, cells,
+                    "arm {arm}: committed cells MUST be identical across arms \
+                     (got {cells}, expected {c}) — the comparison is void otherwise"
+                ),
+            }
+            let true_degree = if arm == "B" { 5 } else { 3 };
+            println!(
+                "DEGREEFIXED arm={arm} true_degree={true_degree} parts={parts} \
+                 blowup={blowup} rows_log2={rows_log2} width={W} \
+                 cells_main_plus_3aux={cells} rep={rep} prove_secs={secs:.4}"
+            );
+        }
+    }
+}
