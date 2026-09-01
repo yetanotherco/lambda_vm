@@ -261,10 +261,14 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ));
     }
 
-    // 2. Keccak bus: send (timestamp, 0, input_state[200])
+    // 2. Keccak bus: send (timestamp, 0, seq = 0, input_state[200])
     // Per spec keccak.toml: input = ["timestamp", 0, "input_state"] where
     // input_state is [[[Byte, 8], 5], 5] — 200 Byte elements, each its own
-    // bus element (no packing).
+    // bus element (no packing). The `seq` element is a wire-format extension
+    // over the spec: KECCAK_SPONGE runs several permutations under ONE ecall
+    // timestamp and keys each with its block index so their outputs cannot be
+    // swapped (see `tables::keccak_sponge`); the classic one-permutation-per-
+    // ecall chip always sends seq = 0.
     {
         let mut values = vec![
             BusValue::Packed {
@@ -276,6 +280,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 packing: Packing::Direct,
             },
             BusValue::constant(0), // round = 0
+            BusValue::constant(0), // seq = 0 (single permutation per ecall)
         ];
         for x in 0..5 {
             for y in 0..5 {
@@ -294,7 +299,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ));
     }
 
-    // 3. Keccak bus: receive (timestamp, 24, output_state[200])
+    // 3. Keccak bus: receive (timestamp, 24, seq = 0, output_state[200])
     {
         let mut values = vec![
             BusValue::Packed {
@@ -306,6 +311,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 packing: Packing::Direct,
             },
             BusValue::constant(24), // round = 24
+            BusValue::constant(0),  // seq = 0 (single permutation per ecall)
         ];
         for x in 0..5 {
             for y in 0..5 {

@@ -314,7 +314,11 @@ pub enum BusId {
     /// COMMIT output bus: verifier computes the receiver contribution externally
     /// from `VmProof.public_output` using the shared LogUp challenges
     Commit = 21,
-    /// Keccak core ↔ round chip: (timestamp, round, state[200 bytes])
+    /// Keccak core/sponge ↔ round chip: (timestamp, round, seq, state[200 bytes]).
+    /// `seq` keys the permutation within one ecall: the classic core chip
+    /// always sends 0; KECCAK_SPONGE sends the block index (all blocks of one
+    /// absorb call share the ecall's timestamp, so without `seq` two blocks'
+    /// permutation outputs could be swapped with the bus still balancing).
     Keccak = 22,
     /// Keccak round ↔ RC lookup: (round, rc[8 bytes])
     KeccakRc = 23,
@@ -359,6 +363,16 @@ pub enum BusId {
     /// Cross-epoch memory bus: the local-to-global table's per-cell init/fini
     /// boundary claims, matched across epochs by the final aggregation LogUp.
     GlobalMemory = 31,
+
+    // =========================================================================
+    // Keccak sponge absorb accelerator
+    // =========================================================================
+    /// KECCAK_SPONGE self-referential block chain: row k of an absorb call
+    /// hands the permuted state (plus the call's registers) to row k+1 as
+    /// `(timestamp, seq+1, n, state_ptr, block_base+136, state[200 bytes])`.
+    /// The `(timestamp, seq)` key makes every link of one call unique — see
+    /// the swap-attack note in `tables::keccak_sponge`.
+    KeccakSponge = 32,
 }
 
 impl BusId {
@@ -388,6 +402,7 @@ impl BusId {
             BusId::Ecdas => "Ecdas",
             BusId::Bit => "Bit",
             BusId::GlobalMemory => "GlobalMemory",
+            BusId::KeccakSponge => "KeccakSponge",
         }
     }
 }
@@ -420,6 +435,7 @@ impl TryFrom<u64> for BusId {
             28 => Ok(BusId::Ecdas),
             30 => Ok(BusId::Bit),
             31 => Ok(BusId::GlobalMemory),
+            32 => Ok(BusId::KeccakSponge),
             other => Err(other),
         }
     }

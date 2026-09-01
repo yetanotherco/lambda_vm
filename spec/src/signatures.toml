@@ -198,11 +198,21 @@ kind = "interaction"
 input = ["Word", "Byte", "Byte", "Byte", "Bit"]
 output = "Word"
 
-# Keccak communication between rounds
+# Keccak communication between rounds.
+# `seq` distinguishes permutations that share one ECALL timestamp: the KECCAK
+# core chip runs a single permutation per ECALL and always sends 0, while
+# KECCAK_SPONGE sends the index of the rate block it is absorbing.
 [[signatures]]
 tag = "KECCAK"
 kind = "interaction"
-input = ["DWordWL", "BaseField", [[["Byte", 8], 5], 5]]
+input = ["DWordWL", "BaseField", "BaseField", [[["Byte", 8], 5], 5]]
+
+# KECCAK_SPONGE's self-referential block chain:
+# KSPONGE[timestamp, seq, n, state_ptr, block_ptr, state]
+[[signatures]]
+tag = "KSPONGE"
+kind = "interaction"
+input = ["DWordWL", "BaseField", "DWordWL", "DWordWL", "DWordWL", [[["Byte", 8], 5], 5]]
 
 # Keccak round constants
 [[signatures]]

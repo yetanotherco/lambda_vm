@@ -55,6 +55,7 @@ use super::hint;
 use super::keccak::{self, KeccakOperation};
 use super::keccak_rc;
 use super::keccak_rnd::{self, KeccakRoundOperation};
+use super::keccak_sponge::{self, KeccakSpongeOperation};
 use super::load::{self, LoadOperation};
 use super::local_to_global;
 use super::lt::{self, LtOperation};
@@ -533,7 +534,7 @@ fn build_reg_fallback(
 /// MEMW and LOAD collection requires sequential processing with state tracking.
 ///
 /// Returns: (memw_buckets, load_ops, lt_ops, shift_ops, bitwise_ops, commit_ops,
-/// keccak_ops, cpu32_ops, ecsm_ops, ecdas_ops)
+/// keccak_ops, keccak_sponge_ops, cpu32_ops, ecsm_ops, ecdas_ops)
 #[allow(clippy::type_complexity)]
 fn collect_ops_from_cpu(
     cpu_ops: &[CpuOperation],
@@ -547,6 +548,7 @@ fn collect_ops_from_cpu(
     Vec<BitwiseOperation>,
     Vec<CommitOperation>,
     Vec<KeccakOperation>,
+    Vec<KeccakSpongeOperation>,
     Vec<cpu32::Cpu32Operation>,
     Vec<ecsm::EcsmOperation>,
     Vec<ecdas::EcdasOperation>,
@@ -559,6 +561,7 @@ fn collect_ops_from_cpu(
     let mut bitwise_ops = Vec::with_capacity(cpu_ops.len() * 4);
     let mut commit_ops = Vec::new();
     let mut keccak_ops = Vec::new();
+    let mut keccak_sponge_ops = Vec::new();
     let mut cpu32_ops = Vec::new();
     let mut ecsm_ops = Vec::new();
     let mut ecdas_ops = Vec::new();
@@ -648,6 +651,16 @@ fn collect_ops_from_cpu(
             });
         }
 
+        // Collect KeccakAbsorbBlocks ECALL operations: one KECCAK_SPONGE row
+        // per absorbed 136-byte block (collect_keccak_sponge_ops handles the
+        // MEMW ops and the memory/register state updates).
+        if op.ecall_keccak_absorb {
+            let (sponge_memw_ops, sponge_rows) =
+                collect_keccak_sponge_ops(op, memory_state, register_state);
+            memw.extend_ops(sponge_memw_ops);
+            keccak_sponge_ops.extend(sponge_rows);
+        }
+
         // Collect ECSM ecall operations (memory I/O + the two table row sets)
         if op.ecall_ecsm {
             let (ecsm_memw, ecsm_op, ecdas_rows) =
@@ -716,6 +729,7 @@ fn collect_ops_from_cpu(
         bitwise_ops,
         commit_ops,
         keccak_ops,
+        keccak_sponge_ops,
         cpu32_ops,
         ecsm_ops,
         ecdas_ops,
@@ -1501,6 +1515,129 @@ fn collect_keccak_memw_ops(
     }
 
     memw_ops
+}
+
+/// Collect the MEMW ops and per-block table rows for a KeccakAbsorbBlocks
+/// ECALL. Mirrors `keccak_sponge::bus_interactions` op-for-op:
+///
+/// - at `ts`: three pure register reads (x10/x11/x12), 25 pure lane reads of
+///   the pre-call state, and `n × 17` pure dword reads of the message blocks
+///   (the executor rejects state/data overlap, so every `(address, ts)` pair
+///   is unique);
+/// - at `ts + 1`: 25 lane writes of the final state (write-only; `old` is the
+///   value the lane reads re-wrote at `ts`).
+///
+/// `n_blocks` is recovered from the x12 register state (the CPU log only
+/// carries the state/data addresses), like the ECSM operand addresses.
+fn collect_keccak_sponge_ops(
+    op: &CpuOperation,
+    memory_state: &mut MemoryState,
+    register_state: &mut RegisterState,
+) -> (Vec<MemwOperation>, Vec<KeccakSpongeOperation>) {
+    use super::keccak_sponge::RATE_BYTES;
+
+    let ts = op.timestamp;
+    let state_addr = op.keccak_absorb_state_addr;
+    let data_addr = op.keccak_absorb_data_addr;
+    let n_blocks = register_state.read(12).0;
+    debug_assert!(n_blocks > 0, "executor rejects n_blocks = 0");
+
+    let mut memw_ops = Vec::with_capacity(3 + 25 + 25 + (n_blocks as usize) * 17);
+
+    // Pure register reads of x10/x11/x12 at ts (value re-written unchanged so
+    // the register's timestamp advances, as in the other accelerator arms).
+    for (reg, expected) in [(10u8, state_addr), (11, data_addr), (12, n_blocks)] {
+        let (val, old_ts) = register_state.read(reg);
+        debug_assert_eq!(val, expected, "sponge ecall register x{reg} drifted");
+        let value = pack_register_value(val);
+        memw_ops.push(
+            MemwOperation::new(true, 2 * reg as u64, value, ts, 2, true)
+                .with_old(value, [old_ts, old_ts, 0, 0, 0, 0, 0, 0]),
+        );
+        register_state.write(reg, val, ts);
+    }
+
+    let overflow_msg = "keccak-absorb address ranges must be validated by the executor";
+
+    // Pure lane reads of the pre-call state at ts.
+    let mut state = [0u64; 25];
+    for (lane, slot) in state.iter_mut().enumerate() {
+        let lane_addr = state_addr.checked_add(lane as u64 * 8).expect(overflow_msg);
+        let (values, old_ts) = memory_state.read_bytes(lane_addr, 8);
+        let mut dword = 0u64;
+        for (b, &v) in values.iter().enumerate() {
+            dword |= (v as u64) << (b * 8);
+        }
+        memw_ops.push(
+            MemwOperation::new(false, lane_addr, values, ts, 8, true).with_old(values, old_ts),
+        );
+        memory_state.write_bytes(lane_addr, dword, 8, ts);
+        *slot = dword;
+    }
+
+    // Per block: 17 pure dword reads at ts, then XOR + permute.
+    let mut sponge_ops = Vec::with_capacity(n_blocks as usize);
+    for k in 0..n_blocks {
+        let block_addr = data_addr
+            .checked_add(k * RATE_BYTES as u64)
+            .expect(overflow_msg);
+        let mut block = [0u8; RATE_BYTES];
+        for j in 0..17u64 {
+            let dword_addr = block_addr.checked_add(j * 8).expect(overflow_msg);
+            let (values, old_ts) = memory_state.read_bytes(dword_addr, 8);
+            let mut dword = 0u64;
+            for (b, &v) in values.iter().enumerate() {
+                dword |= (v as u64) << (b * 8);
+                block[(j as usize) * 8 + b] = v as u8;
+            }
+            memw_ops.push(
+                MemwOperation::new(false, dword_addr, values, ts, 8, true).with_old(values, old_ts),
+            );
+            memory_state.write_bytes(dword_addr, dword, 8, ts);
+        }
+
+        let state_in = state;
+        for (j, lane) in state.iter_mut().take(17).enumerate() {
+            let mut m = 0u64;
+            for b in 0..8 {
+                m |= (block[j * 8 + b] as u64) << (b * 8);
+            }
+            *lane ^= m;
+        }
+        executor::vm::instruction::execution::keccak_f1600(&mut state);
+
+        sponge_ops.push(KeccakSpongeOperation {
+            timestamp: ts,
+            seq: k,
+            n_blocks,
+            state_addr,
+            block_addr,
+            state_in,
+            block,
+            state_out: state,
+            first: k == 0,
+            last: k == n_blocks - 1,
+        });
+    }
+
+    // Lane writes of the final state at ts + 1 (old = the value the lane
+    // reads above re-wrote at ts).
+    for (lane, &out) in state.iter().enumerate() {
+        let lane_addr = state_addr.checked_add(lane as u64 * 8).expect(overflow_msg);
+        let mut value = [0u32; 8];
+        for (b, v) in value.iter_mut().enumerate() {
+            *v = ((out >> (b * 8)) & 0xFF) as u32;
+        }
+        let (old_vals, old_ts) = memory_state.read_bytes(lane_addr, 8);
+        debug_assert_eq!(old_ts, [ts; 8], "state lanes were re-written at ts above");
+        memw_ops.push(
+            MemwOperation::new(false, lane_addr, value, ts + 1, 8, false)
+                .with_old(old_vals, old_ts),
+        );
+        memory_state.write_bytes(lane_addr, out, 8, ts + 1);
+    }
+
+    (memw_ops, sponge_ops)
 }
 
 ///
@@ -2445,8 +2582,6 @@ pub(crate) fn collect_bitwise_from_ecdas(ops: &[ecdas::EcdasOperation]) -> Vec<B
 /// All of these must be registered so the BITWISE table's multiplicities are correct.
 #[allow(clippy::needless_range_loop)]
 pub(crate) fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec<BitwiseOperation> {
-    use executor::vm::instruction::execution::{KECCAK_RC, KECCAK_RHO};
-
     let mut ops = Vec::new();
 
     for kop in keccak_ops {
@@ -2488,7 +2623,22 @@ pub(crate) fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec
         }
 
         // Replay keccak round computation to extract bitwise lookups
-        let mut state = kop.input;
+        push_keccak_round_bitwise(&kop.input, &mut ops);
+    }
+
+    ops
+}
+
+/// Replay one keccak-f[1600] permutation (24 rounds) and push the BYTE_ALU /
+/// ARE_BYTES lookups the KECCAK_RND chip sends for it. Shared by the classic
+/// KECCAK core collector and the KECCAK_SPONGE collector — both drive the same
+/// round chip, one permutation per (core row / absorbed block).
+#[allow(clippy::needless_range_loop)]
+pub(crate) fn push_keccak_round_bitwise(input: &[u64; 25], ops: &mut Vec<BitwiseOperation>) {
+    use executor::vm::instruction::execution::{KECCAK_RC, KECCAK_RHO};
+
+    {
+        let mut state = *input;
         for round in 0..24 {
             // --- theta: Cxz chain BYTE_ALU[XOR] (160) ---
             let mut cxz = [[[0u8; 8]; 4]; 5];
@@ -2678,6 +2828,67 @@ pub(crate) fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec
             state = chi_lanes;
         }
     }
+}
+
+/// Collect BITWISE lookups generated by the KECCAK_SPONGE chip.
+///
+/// Mirrors `keccak_sponge::bus_interactions` send-for-send, per row (= per
+/// absorbed block):
+/// - 136 `BYTE_ALU[XOR]` for `xored = state_in ^ block` over the absorbed
+///   region;
+/// - 1 `BYTE_ALU[AND]` alignment check on `s_addr[0] & 7`;
+/// - 4 paired `ARE_BYTES` on the `s_addr` bytes;
+/// - the 24-round replay of the ABSORBED state (the round chip's lookups for
+///   this block's permutation), shared with the classic collector via
+///   [`push_keccak_round_bitwise`].
+///
+/// No IS_HALF lookups: the sponge chip uses linear low-limb addressing (see
+/// its module docs), not the KECCAK core chip's DWordHL pointer apparatus.
+pub(crate) fn collect_bitwise_from_keccak_sponge(
+    ops_in: &[KeccakSpongeOperation],
+) -> Vec<BitwiseOperation> {
+    let mut ops = Vec::new();
+
+    for sop in ops_in {
+        // Alignment: s_addr[0] & 7 = 0.
+        ops.push(BitwiseOperation::byte_op(
+            BitwiseOperationType::ByteAluAnd,
+            (sop.state_addr & 0xFF) as u8,
+            7,
+        ));
+
+        // s_addr byte range checks, paired as (s_addr[2i], s_addr[2i+1]).
+        for i in 0..4 {
+            let lo = ((sop.state_addr >> (2 * i * 8)) & 0xFF) as u8;
+            let hi = ((sop.state_addr >> ((2 * i + 1) * 8)) & 0xFF) as u8;
+            ops.push(BitwiseOperation::byte_op(
+                BitwiseOperationType::AreBytes,
+                lo,
+                hi,
+            ));
+        }
+
+        // Absorb XORs: xored[i] = state_in[i] ^ block[i] over 136 bytes.
+        let mut absorbed = sop.state_in;
+        for (i, &m) in sop.block.iter().enumerate() {
+            let s = ((sop.state_in[i / 8] >> ((i % 8) * 8)) & 0xFF) as u8;
+            ops.push(BitwiseOperation::byte_op(
+                BitwiseOperationType::ByteAluXor,
+                s,
+                m,
+            ));
+        }
+        for (j, lane) in absorbed.iter_mut().take(17).enumerate() {
+            let mut m = 0u64;
+            for b in 0..8 {
+                m |= (sop.block[j * 8 + b] as u64) << (b * 8);
+            }
+            *lane ^= m;
+        }
+
+        // The round chip's lookups for this block's permutation.
+        push_keccak_round_bitwise(&absorbed, &mut ops);
+    }
 
     ops
 }
@@ -2864,6 +3075,9 @@ pub struct Traces {
     /// KECCAK_RC precomputed round constant table (32 rows)
     pub keccak_rc: TraceTable<GoldilocksField, GoldilocksExtension>,
 
+    /// KECCAK_SPONGE absorb table (one row per absorbed 136-byte block)
+    pub keccak_sponge: TraceTable<GoldilocksField, GoldilocksExtension>,
+
     /// ECSM core table (one row per scalar-multiplication ecall)
     pub ecsm: TraceTable<GoldilocksField, GoldilocksExtension>,
 
@@ -2907,6 +3121,7 @@ struct CollectedOps {
     dvrm_ops: Vec<(DvrmOperation, bool)>,
     commit_ops: Vec<CommitOperation>,
     keccak_ops: Vec<KeccakOperation>,
+    keccak_sponge_ops: Vec<KeccakSpongeOperation>,
     // Auxiliary ALU / memory / CPU32 dispatch chips (driven by the CPU ALU/MEMORY dispatch).
     eq_ops: Vec<eq::EqOperation>,
     bytewise_ops: Vec<bytewise::BytewiseOperation>,
@@ -2968,6 +3183,7 @@ fn collect_all_ops(
     mut bitwise_ops: Vec<BitwiseOperation>,
     commit_ops: Vec<CommitOperation>,
     keccak_ops: Vec<KeccakOperation>,
+    keccak_sponge_ops: Vec<KeccakSpongeOperation>,
     cpu32_ops: Vec<cpu32::Cpu32Operation>,
     ecsm_ops: Vec<ecsm::EcsmOperation>,
     ecdas_ops: Vec<ecdas::EcdasOperation>,
@@ -3108,6 +3324,7 @@ fn collect_all_ops(
         dvrm_ops,
         commit_ops,
         keccak_ops,
+        keccak_sponge_ops,
         eq_ops,
         bytewise_ops,
         store_ops,
@@ -3152,6 +3369,7 @@ fn build_traces<I: ImageSource + Sync>(
         dvrm_ops,
         commit_ops,
         keccak_ops,
+        keccak_sponge_ops,
         eq_ops,
         bytewise_ops,
         store_ops,
@@ -3243,6 +3461,7 @@ fn build_traces<I: ImageSource + Sync>(
         Box::new(|h| h.add_ops(&collect_bitwise_from_memw_aligned(&memw_aligned_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_commit(&commit_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_keccak(&keccak_ops))),
+        Box::new(|h| h.add_ops(&collect_bitwise_from_keccak_sponge(&keccak_sponge_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_ecsm(&ecsm_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_ecdas(&ecdas_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_hint(&hint_ops))),
@@ -3502,20 +3721,46 @@ fn build_traces<I: ImageSource + Sync>(
     };
     let gen_commit = || commit::generate_commit_trace(&commit_ops);
     let gen_keccak = || keccak::generate_keccak_trace(&keccak_ops);
+    let gen_keccak_sponge = || keccak_sponge::generate_keccak_sponge_trace(&keccak_sponge_ops);
+    // The round chip serves BOTH keccak front-ends: one permutation per classic
+    // core row (seq = 0) and one per sponge block (seq = the block index; the
+    // absorbed state — state_in XOR block over lanes 0..17 — is the round
+    // chip's input, matching the sponge chip's round-0 Keccak-bus send).
     let gen_keccak_rnd = || {
-        let keccak_rnd_ops: Vec<KeccakRoundOperation> = keccak_ops
-            .iter()
-            .map(|op| KeccakRoundOperation {
+        let mut keccak_rnd_ops: Vec<KeccakRoundOperation> =
+            Vec::with_capacity(keccak_ops.len() + keccak_sponge_ops.len());
+        keccak_rnd_ops.extend(keccak_ops.iter().map(|op| KeccakRoundOperation {
+            timestamp: op.timestamp,
+            seq: 0,
+            input: op.input,
+            output: op.output,
+        }));
+        keccak_rnd_ops.extend(keccak_sponge_ops.iter().map(|op| {
+            let mut absorbed = op.state_in;
+            for (j, lane) in absorbed.iter_mut().take(17).enumerate() {
+                let mut m = 0u64;
+                for b in 0..8 {
+                    m |= (op.block[j * 8 + b] as u64) << (b * 8);
+                }
+                *lane ^= m;
+            }
+            KeccakRoundOperation {
                 timestamp: op.timestamp,
-                input: op.input,
-                output: op.output,
-            })
-            .collect();
+                seq: op.seq,
+                input: absorbed,
+                output: op.state_out,
+            }
+        }));
         keccak_rnd::generate_keccak_rnd_trace(&keccak_rnd_ops)
     };
     let gen_keccak_rc = || {
         let mut keccak_rc_trace = keccak_rc::generate_keccak_rc_trace();
-        keccak_rc::update_multiplicities(&mut keccak_rc_trace, keccak_ops.len());
+        // One permutation (= 24 round-constant lookups) per classic core row
+        // AND per sponge block.
+        keccak_rc::update_multiplicities(
+            &mut keccak_rc_trace,
+            keccak_ops.len() + keccak_sponge_ops.len(),
+        );
         keccak_rc_trace
     };
     let gen_pages = || match initial_image {
@@ -3542,6 +3787,7 @@ fn build_traces<I: ImageSource + Sync>(
         (None, None, None, None);
     let (mut commit_slot, mut keccak_slot, mut keccak_rnd_slot, mut keccak_rc_slot) =
         (None, None, None, None);
+    let mut keccak_sponge_slot = None;
     let (mut pages_slot, mut register_slot, mut halt_slot) = (None, None, None);
     let (mut eqs_slot, mut bytewises_slot, mut stores_slot, mut cpu32s_slot) =
         (None, None, None, None);
@@ -3579,6 +3825,7 @@ fn build_traces<I: ImageSource + Sync>(
             spawn_into!(keccak_slot, gen_keccak);
             spawn_into!(keccak_rnd_slot, gen_keccak_rnd);
             spawn_into!(keccak_rc_slot, gen_keccak_rc);
+            spawn_into!(keccak_sponge_slot, gen_keccak_sponge);
             spawn_into!(commit_slot, gen_commit);
             spawn_into!(register_slot, gen_register);
             spawn_into!(halt_slot, gen_halt);
@@ -3607,6 +3854,7 @@ fn build_traces<I: ImageSource + Sync>(
         keccak_slot = Some(gen_keccak());
         keccak_rnd_slot = Some(gen_keccak_rnd());
         keccak_rc_slot = Some(gen_keccak_rc());
+        keccak_sponge_slot = Some(gen_keccak_sponge());
         pages_slot = Some(gen_pages());
         register_slot = Some(gen_register());
         halt_slot = Some(gen_halt());
@@ -3643,6 +3891,7 @@ fn build_traces<I: ImageSource + Sync>(
     let keccak_trace = keccak_slot.expect(PHASE5_RAN);
     let keccak_rnd_trace = keccak_rnd_slot.expect(PHASE5_RAN);
     let keccak_rc_trace = keccak_rc_slot.expect(PHASE5_RAN);
+    let keccak_sponge_trace = keccak_sponge_slot.expect(PHASE5_RAN);
     #[allow(unused_mut)]
     let (mut pages, page_configs) = pages_slot.expect(PHASE5_RAN);
     #[allow(unused_mut)]
@@ -3717,6 +3966,7 @@ fn build_traces<I: ImageSource + Sync>(
         keccak: keccak_trace,
         keccak_rnd: keccak_rnd_trace,
         keccak_rc: keccak_rc_trace,
+        keccak_sponge: keccak_sponge_trace,
         ecsm: ecsm_trace,
         ecdas: ecdas_trace,
         hint: hint_trace,
@@ -4083,6 +4333,7 @@ impl Traces {
         use super::keccak_rc::NUM_PRECOMPUTED_COLS as KECCAK_RC_PRECOMPUTED;
         use super::keccak_rc::cols::NUM_COLUMNS as KECCAK_RC_COLS;
         use super::keccak_rnd::cols::NUM_COLUMNS as KECCAK_RND_COLS;
+        use super::keccak_sponge::cols::NUM_COLUMNS as KECCAK_SPONGE_COLS;
         use super::load::cols::NUM_COLUMNS as LOAD_COLS;
         use super::lt::cols::NUM_COLUMNS as LT_COLS;
         use super::memw::cols::NUM_COLUMNS as MEMW_COLS;
@@ -4115,6 +4366,7 @@ impl Traces {
             keccak,
             keccak_rnd,
             keccak_rc,
+            keccak_sponge,
             ecsm,
             ecdas,
             hint,
@@ -4171,6 +4423,7 @@ impl Traces {
         total += (keccak.num_rows() * KECCAK_COLS) as u64;
         total += (keccak_rnd.num_rows() * KECCAK_RND_COLS) as u64;
         total += (keccak_rc.num_rows() * (KECCAK_RC_COLS - KECCAK_RC_PRECOMPUTED)) as u64;
+        total += (keccak_sponge.num_rows() * KECCAK_SPONGE_COLS) as u64;
         for t in eqs {
             total += (t.num_rows() * EQ_COLS) as u64;
         }
@@ -4221,6 +4474,7 @@ impl Traces {
         let n_keccak = aux_cols(super::keccak::bus_interactions().len());
         let n_keccak_rnd = aux_cols(super::keccak_rnd::bus_interactions().len());
         let n_keccak_rc = aux_cols(super::keccak_rc::bus_interactions().len());
+        let n_keccak_sponge = aux_cols(super::keccak_sponge::bus_interactions().len());
         let n_eq = aux_cols(super::eq::bus_interactions().len());
         let n_bytewise = aux_cols(super::bytewise::bus_interactions().len());
         let n_store = aux_cols(super::store::bus_interactions().len());
@@ -4248,6 +4502,7 @@ impl Traces {
             keccak,
             keccak_rnd,
             keccak_rc,
+            keccak_sponge,
             ecsm,
             ecdas,
             hint,
@@ -4304,6 +4559,7 @@ impl Traces {
         total += (keccak.num_rows() * n_keccak) as u64;
         total += (keccak_rnd.num_rows() * n_keccak_rnd) as u64;
         total += (keccak_rc.num_rows() * n_keccak_rc) as u64;
+        total += (keccak_sponge.num_rows() * n_keccak_sponge) as u64;
         for t in eqs {
             total += (t.num_rows() * n_eq) as u64;
         }
@@ -4669,6 +4925,7 @@ impl Traces {
             bitwise_ops,
             commit_ops,
             keccak_ops,
+            keccak_sponge_ops,
             cpu32_ops,
             ecsm_ops,
             ecdas_ops,
@@ -4688,6 +4945,7 @@ impl Traces {
             bitwise_ops,
             commit_ops,
             keccak_ops,
+            keccak_sponge_ops,
             cpu32_ops,
             ecsm_ops,
             ecdas_ops,
@@ -4782,6 +5040,7 @@ impl Traces {
             bitwise_ops,
             commit_ops,
             keccak_ops,
+            keccak_sponge_ops,
             cpu32_ops,
             ecsm_ops,
             ecdas_ops,
@@ -4797,6 +5056,7 @@ impl Traces {
             bitwise_ops,
             commit_ops,
             keccak_ops,
+            keccak_sponge_ops,
             cpu32_ops,
             ecsm_ops,
             ecdas_ops,

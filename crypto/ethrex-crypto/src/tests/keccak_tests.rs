@@ -53,6 +53,71 @@ fn keccak_sponge_matches_trusted_permutation() {
     check_keccak(&[0xbb; 271]);
 }
 
+/// Software mirror of the `ECALL -4` sponge-absorb accelerator, matching the
+/// executor arm (`executor/src/vm/instruction/execution.rs`,
+/// `SyscallNumbers::KeccakAbsorbBlocks`): per block, XOR 17 little-endian dword
+/// lanes into the state, then permute. Lets the host test the *composition* the
+/// guest uses — which blocks go to the chip, and where padding lands — without
+/// a VM.
+fn absorb_whole_blocks_mirror(state: &mut [u64; 25], blocks: &[u8]) -> usize {
+    const RATE: usize = 136;
+    assert_eq!(blocks.len() % RATE, 0);
+    let n_blocks = blocks.len() / RATE;
+    for k in 0..n_blocks {
+        absorb_block(state, &blocks[k * RATE..(k + 1) * RATE]);
+        keccak::f1600(state);
+    }
+    n_blocks
+}
+
+/// The accelerated composition must be digest-identical to the software sponge
+/// and to ethrex's reference `keccak_hash`, at every length that crosses a rate
+/// boundary. This is the host half of the `keccak-sponge-accel` correctness
+/// argument: it pins the *split* (whole blocks to the chip, padded tail to
+/// `keccak_permute`), while the chip's own semantics are the executor's and the
+/// prover's business.
+///
+/// Also covers the accelerator DECLINING (returning 0, as it does on a
+/// misaligned buffer): the software loop must then absorb everything and reach
+/// the same digest.
+#[test]
+fn accelerated_absorb_matches_software_sponge() {
+    let data: Vec<u8> = (0..4 * 136 + 8).map(|i| (i * 97 + 13) as u8).collect();
+
+    for len in [
+        0, 1, 8, 135, 136, 137, 271, 272, 273, 407, 408, 409, 500, 544, 552,
+    ] {
+        let msg = &data[..len];
+        let software = keccak256_with_permute(msg, keccak::f1600);
+        let accelerated = keccak256_with_backend(msg, keccak::f1600, absorb_whole_blocks_mirror);
+        let declined = keccak256_with_backend(msg, keccak::f1600, |_, _| 0);
+
+        assert_eq!(accelerated, keccak_hash(msg), "vs reference, len={len}");
+        assert_eq!(accelerated, software, "accel vs software, len={len}");
+        assert_eq!(declined, software, "declined vs software, len={len}");
+    }
+}
+
+/// The seam lets the accelerator absorb only a PREFIX of the whole blocks it is
+/// offered, with the software loop picking up the rest. Nothing in the guest
+/// takes a partial bite today, but the contract allows it and an off-by-one in
+/// the `offset` handoff would otherwise go unnoticed.
+#[test]
+fn partial_accelerated_take_matches_software_sponge() {
+    const RATE: usize = 136;
+    let data: Vec<u8> = (0..5 * RATE).map(|i| (i * 31 + 7) as u8).collect();
+
+    for len in [3 * RATE, 3 * RATE + 40, 5 * RATE] {
+        let msg = &data[..len];
+        for take in 0..=len / RATE {
+            let got = keccak256_with_backend(msg, keccak::f1600, |state, blocks| {
+                absorb_whole_blocks_mirror(state, &blocks[..take * RATE])
+            });
+            assert_eq!(got, keccak_hash(msg), "len={len} take={take}");
+        }
+    }
+}
+
 #[test]
 fn keccak_sponge_known_answer_vectors() {
     // Vectors from the Ethereum Yellow Paper / EIP-155. These use Keccak-256

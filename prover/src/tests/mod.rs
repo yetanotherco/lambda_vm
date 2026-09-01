@@ -53,6 +53,8 @@ pub mod ir_stats_dump;
 #[cfg(test)]
 pub mod keccak_rnd_tests;
 #[cfg(test)]
+pub mod keccak_sponge_tests;
+#[cfg(test)]
 pub mod load_tests;
 #[cfg(test)]
 pub mod local_to_global_bus_tests;

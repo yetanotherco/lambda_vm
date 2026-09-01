@@ -508,21 +508,41 @@ fn point_from_xy(x: &FieldElement, y: &FieldElement) -> Option<AffinePoint> {
 
 // ── Keccak-256 over the keccak_permute precompile (riscv64 guest) ───────────
 
-/// Keccak-256 sponge with an injected permutation function.
+/// Keccak-256 sponge with injected primitives.
 ///
 /// Keccak-f[1600], rate 1088 bits (136 bytes), capacity 512 bits.
 /// Padding: `0x01 ... 0x80` (multi-rate, last bit set). The state is a
 /// 25-element u64 array; bytes are absorbed into the state via little-endian
 /// XOR (matching the standard Keccak byte-to-lane mapping).
 ///
+/// `permute` runs one Keccak-f[1600]. `absorb_whole` is offered the message's
+/// whole-rate-block prefix and returns how many of those blocks it absorbed
+/// (XOR + permute each); returning 0 declines and leaves every block to the
+/// software loop below. That is the seam the `ECALL -4` sponge accelerator
+/// plugs into, and it is why the accelerator can bail out on an unmet
+/// precondition without the caller knowing — both routes leave the same state.
+///
+/// Padding never reaches `absorb_whole`: the final partial block is framed and
+/// absorbed here, always through `permute`.
+///
 /// Gated to `riscv64 | test` so the generic function is available to the host
 /// unit tests without being dead code in the non-test host build.
 #[cfg(any(target_arch = "riscv64", test))]
-fn keccak256_with_permute<F: FnMut(&mut [u64; 25])>(input: &[u8], mut permute: F) -> [u8; 32] {
+fn keccak256_with_backend<P, A>(input: &[u8], mut permute: P, mut absorb_whole: A) -> [u8; 32]
+where
+    P: FnMut(&mut [u64; 25]),
+    A: FnMut(&mut [u64; 25], &[u8]) -> usize,
+{
     const RATE: usize = 136;
 
     let mut state = [0u64; 25];
     let mut offset = 0;
+
+    let whole_len = (input.len() / RATE) * RATE;
+    if whole_len > 0 {
+        offset = absorb_whole(&mut state, &input[..whole_len]) * RATE;
+        debug_assert!(offset <= whole_len);
+    }
 
     while input.len() - offset >= RATE {
         absorb_block(&mut state, &input[offset..offset + RATE]);
@@ -547,10 +567,63 @@ fn keccak256_with_permute<F: FnMut(&mut [u64; 25])>(input: &[u8], mut permute: F
     output
 }
 
-/// Keccak-256 via LambdaVM's `keccak_permute` syscall (riscv64 guest only).
+/// Keccak-256 sponge driven by `permute` alone — the pure software absorb
+/// path. Test-only: the guest goes through [`keccak256_with_backend`] so it can
+/// offer the whole-block prefix to the accelerator.
+#[cfg(test)]
+fn keccak256_with_permute<F: FnMut(&mut [u64; 25])>(input: &[u8], permute: F) -> [u8; 32] {
+    keccak256_with_backend(input, permute, |_, _| 0)
+}
+
+/// Keccak-256 via LambdaVM's precompiles (riscv64 guest only): whole rate
+/// blocks through the sponge-absorb accelerator when it is compiled in, the
+/// padded tail always through `keccak_permute`.
 #[cfg(target_arch = "riscv64")]
 fn keccak256_via_lambdavm(input: &[u8]) -> [u8; 32] {
-    keccak256_with_permute(input, |s| lambda_vm_syscalls::syscalls::keccak_permute(s))
+    keccak256_with_backend(
+        input,
+        |s| lambda_vm_syscalls::syscalls::keccak_permute(s),
+        absorb_whole_blocks_accel,
+    )
+}
+
+/// Whole-block absorb through the `KECCAK_SPONGE` accelerator (`ECALL -4`),
+/// returning the number of blocks it took.
+///
+/// The executor *traps* on an unmet precondition, so each one is either
+/// discharged statically or checked here, and a failed check declines the whole
+/// prefix (returns 0) rather than risking the run:
+///
+/// - state 8-aligned: guaranteed, it is a `[u64; 25]`;
+/// - data 8-aligned: checked — the guest heap (rlsf) hands out 16-aligned
+///   payloads, but a node encoding borrowed at an odd offset would not be;
+/// - `n_blocks > 0`: the caller only passes a non-empty whole-block prefix;
+/// - low-limb room, i.e. `(addr mod 2^32) + last_offset < 2^32`: checked, since
+///   the chip addresses each dword as `base_lo + offset` with no carry;
+/// - regions disjoint: guaranteed, `state` is `&mut` and cannot alias `blocks`.
+#[cfg(all(target_arch = "riscv64", feature = "keccak-sponge-accel"))]
+fn absorb_whole_blocks_accel(state: &mut [u64; 25], blocks: &[u8]) -> usize {
+    const RATE: usize = 136;
+    const LOW_LIMB: u64 = 1 << 32;
+
+    let low_limb_ok =
+        |addr: usize, len: usize| ((addr as u64) & (LOW_LIMB - 1)) + (len as u64 - 1) < LOW_LIMB;
+    if !(blocks.as_ptr() as usize).is_multiple_of(8)
+        || !low_limb_ok(blocks.as_ptr() as usize, blocks.len())
+        || !low_limb_ok(state.as_ptr() as usize, 25 * 8)
+    {
+        return 0;
+    }
+    let n_blocks = blocks.len() / RATE;
+    lambda_vm_syscalls::syscalls::keccak_absorb_blocks(state, blocks, n_blocks);
+    n_blocks
+}
+
+/// Accelerator compiled out: decline every block, so the sponge is exactly the
+/// software one.
+#[cfg(all(target_arch = "riscv64", not(feature = "keccak-sponge-accel")))]
+fn absorb_whole_blocks_accel(_state: &mut [u64; 25], _blocks: &[u8]) -> usize {
+    0
 }
 
 /// XOR one rate-sized block of bytes into the state lanes (little-endian).

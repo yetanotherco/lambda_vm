@@ -12,6 +12,33 @@ name = "ethrex"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# ON BY DEFAULT, deliberately. `/bench` builds the workload with a plain
+# `make executor/program_artifacts/rust/ethrex.elf` and proves that one ELF, so
+# the accelerator has to be in the default build or the bench cannot see it.
+# `--no-default-features` still yields the plain software sponge — that is how
+# `ethrex-nosponge.elf` is built for a local correctness A/B.
+default = ["keccak-sponge-accel"]
+
+# Hash whole 136-byte keccak rate blocks on the KECCAK_SPONGE absorb
+# accelerator (ECALL -4) rather than in guest software; the `10*1`-padded tail
+# still goes through `keccak_permute`. The digests, and therefore the proven
+# block, are identical either way.
+#
+# What this actually reaches: ethrex's trie node hashes, contract-code hashes,
+# block/receipt hashes and the KECCAK256 opcode, all of which route through
+# `Crypto::keccak256` -> `lambda-vm-ethrex-crypto`. It does NOT reach the
+# `ethrex_crypto::keccak::keccak_hash` free function (software tiny-keccak),
+# which on this ethrex rev is cold anyway — see ethrex-wiring.md §2.
+#
+# ⚠ An ELF built with this on runs `ECALL -4`, which only exists on an executor
+# that has the KECCAK_SPONGE chip. It will NOT execute on `origin/main` until
+# PR #912 lands — see the /bench fallback hazard in ethrex-wiring.md §10.
+keccak-sponge-accel = [
+  "lambda-vm-ethrex-crypto/keccak-sponge-accel",
+  "lambda-vm-syscalls/keccak-sponge-accel",
+]
+
 [dependencies]
 lambda-vm-syscalls = { path = "../../../../syscalls" }
 # LambdaVM crypto provider (keccak + ECSM-accelerated ecrecover), defined in the

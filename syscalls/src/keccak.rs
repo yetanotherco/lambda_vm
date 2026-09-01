@@ -34,6 +34,37 @@ fn keccak_permute(state: &mut [u64; 25]) {
     keccak::f1600(state);
 }
 
+#[cfg(all(
+    feature = "keccak-sponge-accel",
+    not(all(test, not(target_arch = "riscv64")))
+))]
+use crate::syscalls::keccak_absorb_blocks;
+
+/// Software mirror of the `ECALL -4` sponge-absorb accelerator, so host
+/// `cargo test --features keccak-sponge-accel` exercises the *composition*
+/// (which blocks go to the accelerator, where padding lands) against the
+/// reference digest. Semantics copied from the executor arm
+/// (`executor/src/vm/instruction/execution.rs`, `SyscallNumbers::KeccakAbsorbBlocks`):
+/// per block, XOR 17 little-endian dword lanes into the state, then permute.
+///
+/// It counts the blocks it absorbs so the tests can assert the accelerated
+/// path actually fired instead of passing vacuously.
+#[cfg(all(feature = "keccak-sponge-accel", test, not(target_arch = "riscv64")))]
+fn keccak_absorb_blocks(state: &mut [u64; 25], data: &[u8], n_blocks: usize) {
+    assert_eq!(data.len(), n_blocks * RATE_BYTES);
+    assert!(n_blocks > 0);
+    assert_eq!(data.as_ptr() as usize % 8, 0);
+    for k in 0..n_blocks {
+        let block = &data[k * RATE_BYTES..(k + 1) * RATE_BYTES];
+        for (j, lane) in state.iter_mut().take(RATE_LANES).enumerate() {
+            let dword: &[u8; 8] = block[j * 8..j * 8 + 8].try_into().unwrap();
+            *lane ^= u64::from_le_bytes(*dword);
+        }
+        keccak_permute(state);
+    }
+    tests::ABSORBED_BLOCKS.fetch_add(n_blocks, core::sync::atomic::Ordering::Relaxed);
+}
+
 /// Keccak-256 sponge rate in bytes (1088 bits = 136 bytes; capacity = 512 bits).
 const RATE_BYTES: usize = 136;
 
@@ -48,6 +79,21 @@ const DELIMITER: u8 = 0x01;
 /// position in the last rate lane. When the delimiter also lands in byte 135
 /// the two XORs combine to the single-byte `0x81` pad, per pad10*1.
 const FINAL_PAD_LANE_BIT: u64 = (0x80u64) << 56;
+
+/// Guest-side mirror of the executor's `addr_limb_ok`: an
+/// accelerator operand's LAST byte must fit inside the pointer's low 32-bit
+/// limb, because the chip addresses each dword as `base_lo + offset` with no
+/// carry into the high limb. The executor *traps* when this fails, so check it
+/// here and fall back to software absorption instead — the fallback yields the
+/// same digest, so this only ever costs cycles, never correctness. A 200-byte
+/// state or a message buffer straddling a 4 GiB boundary is the only way to
+/// hit it.
+#[cfg(feature = "keccak-sponge-accel")]
+#[inline(always)]
+fn accel_low_limb_ok(addr: usize, len: usize) -> bool {
+    debug_assert!(len > 0);
+    ((addr as u64) & 0xFFFF_FFFF) + (len as u64 - 1) < (1u64 << 32)
+}
 
 /// Incremental Keccak-256 hasher; the state doubles as the absorption buffer.
 #[derive(Clone)]
@@ -92,6 +138,39 @@ impl Keccak256 {
     /// Absorb more input into the sponge.
     pub fn update(&mut self, mut input: &[u8]) {
         while !input.is_empty() {
+            // Sponge-absorb accelerator (ECALL -4): standing at a rate-block
+            // boundary with an 8-aligned pointer and at least one whole
+            // 136-byte block, hand ALL whole blocks to the chip in a single
+            // ecall. It XORs each block into lanes 0..17 and permutes, exactly
+            // what the two paths below do in guest software, so the sponge is
+            // left at `offset == 0` with `len % 136` bytes still to absorb —
+            // which the loop then feeds to the unchanged software path, and
+            // `finalize` pads as always. Padding never reaches the chip.
+            //
+            // Preconditions the executor enforces, and why each holds or is
+            // checked: 8-alignment of the state is guaranteed by `[u64; 25]`;
+            // 8-alignment of the data is the branch condition; `n_blocks > 0`
+            // follows from `len >= RATE_BYTES`; low-limb room is checked
+            // explicitly (see `accel_low_limb_ok`); and the state/data regions
+            // cannot overlap because `&mut self` is exclusive, so `input`
+            // cannot alias `self.state`.
+            #[cfg(feature = "keccak-sponge-accel")]
+            {
+                let n_blocks = input.len() / RATE_BYTES;
+                if cfg!(target_endian = "little")
+                    && self.offset == 0
+                    && n_blocks > 0
+                    && (input.as_ptr() as usize).is_multiple_of(8)
+                    && accel_low_limb_ok(input.as_ptr() as usize, n_blocks * RATE_BYTES)
+                    && accel_low_limb_ok(self.state.as_ptr() as usize, 25 * 8)
+                {
+                    let (blocks, rest) = input.split_at(n_blocks * RATE_BYTES);
+                    keccak_absorb_blocks(&mut self.state, blocks, n_blocks);
+                    input = rest;
+                    continue;
+                }
+            }
+
             // Whole-lane fast path: sponge offset on a lane boundary AND input
             // pointer 8-aligned (the VM traps on unaligned doubleword loads).
             // LE-only by construction: the raw `*const u64` read below equals the
@@ -225,6 +304,68 @@ mod tests {
 
     fn reference(input: &[u8]) -> [u8; 32] {
         RefKeccak256::digest(input).into()
+    }
+
+    /// Whole rate blocks routed through the `ECALL -4` shim, process-wide.
+    /// Only meaningful as a "did the accelerated path fire at all" witness —
+    /// tests run in parallel, so compare against a snapshot with `>`, never `==`.
+    #[cfg(feature = "keccak-sponge-accel")]
+    pub(super) static ABSORBED_BLOCKS: core::sync::atomic::AtomicUsize =
+        core::sync::atomic::AtomicUsize::new(0);
+
+    /// The A/B differential for the sponge-absorb accelerator. Run this file's
+    /// tests twice — with and without `--features keccak-sponge-accel` — and
+    /// both builds must match `sha3::Keccak256`; matching the same reference is
+    /// what makes the two guest variants digest-identical.
+    ///
+    /// The buffer is `repr(align(8))` so the accelerator's alignment
+    /// precondition is guaranteed rather than left to the allocator, and the
+    /// lengths straddle every interesting boundary: empty, sub-block,
+    /// rate−1/rate/rate+1, the same around 2 and 3 blocks, and ≥3-block
+    /// messages where the chip does real work. Each length is also fed as two
+    /// `update` calls so the accelerator is entered mid-stream (a split at 1 or
+    /// 8 leaves a non-zero sponge offset that the software path must drain
+    /// before the chip can take over).
+    #[test]
+    fn accel_length_sweep_matches_reference() {
+        #[repr(align(8))]
+        struct Aligned([u8; 640]);
+
+        let mut buf = Aligned([0u8; 640]);
+        for (i, b) in buf.0.iter_mut().enumerate() {
+            *b = (i * 97 + 13) as u8;
+        }
+        assert_eq!(buf.0.as_ptr() as usize % 8, 0, "repr(align(8)) must hold");
+
+        #[cfg(feature = "keccak-sponge-accel")]
+        let absorbed_before = ABSORBED_BLOCKS.load(core::sync::atomic::Ordering::Relaxed);
+
+        for len in [
+            0, 1, 8, 135, 136, 137, 271, 272, 273, 407, 408, 409, 500, 544, 640,
+        ] {
+            let msg = &buf.0[..len];
+            assert_eq!(keccak256(msg), reference(msg), "one-shot len={len}");
+
+            for split in [1usize, 8, 64, 135, 136, 137] {
+                if split > len {
+                    continue;
+                }
+                let mut hasher = Keccak256::new();
+                hasher.update(&msg[..split]);
+                hasher.update(&msg[split..]);
+                let mut out = [0u8; 32];
+                hasher.finalize(&mut out);
+                assert_eq!(out, reference(msg), "streaming len={len} split={split}");
+            }
+        }
+
+        // Without this the test would still pass if the accelerated branch were
+        // never taken (e.g. a mis-stated precondition silently disabling it).
+        #[cfg(feature = "keccak-sponge-accel")]
+        assert!(
+            ABSORBED_BLOCKS.load(core::sync::atomic::Ordering::Relaxed) > absorbed_before,
+            "accelerated absorb path never fired — the sweep proves nothing"
+        );
     }
 
     /// Every length from empty through three full rate blocks (+2), so every
