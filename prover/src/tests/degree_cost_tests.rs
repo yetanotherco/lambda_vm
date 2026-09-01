@@ -176,6 +176,75 @@ fn measure_arm(elf_bytes: &[u8], label: &str) {
     );
 }
 
+/// Prover-side arm: prove only, report wall time and committed volume.
+///
+/// One arm per process — peak RSS is a high-water mark, so two configurations
+/// in one process would only ever measure the larger. Run the test binary
+/// directly under `/usr/bin/time -v` and read "Maximum resident set size".
+///
+/// Cell convention, stated on every number: **base-field-equivalent
+/// `main + 3*aux`**, an extension element being three base felts. Composition
+/// parts are extension-valued too, so each part counts as 3 per LDE point —
+/// which is exactly why one part costs the same committed volume as one aux
+/// column, or three main columns.
+fn measure_prove_arm(elf_bytes: &[u8], label: &str) {
+    let opts = arm_options();
+    let elf = Elf::load(elf_bytes).expect("ELF load");
+    let executor = Executor::new(&elf, Vec::new()).expect("executor");
+    let result = executor.run().expect("execution");
+    let max_rows = MaxRowsConfig::default();
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &max_rows, &[]).unwrap();
+    let table_counts = traces.table_counts();
+    let airs = build_airs(&elf, &opts, &traces.page_configs, &table_counts);
+
+    let pairs = airs.air_trace_pairs(&mut traces);
+
+    // Committed volume, before proving (the trace is consumed by the prove).
+    let mut trace_cells = 0usize;
+    let mut part_cells = 0usize;
+    let mut total_parts = 0usize;
+    for (air, trace, _pub) in pairs.iter() {
+        let (main_w, aux_w) = air.trace_layout();
+        let n = trace.num_rows();
+        trace_cells += (main_w + 3 * aux_w) * n;
+        let parts = air.composition_poly_degree_bound(n) / n;
+        total_parts += parts;
+        // Each part is one extension column over the LDE domain.
+        part_cells += 3 * parts * n * opts.blowup_factor as usize;
+    }
+
+    let t0 = std::time::Instant::now();
+    let proof = multi_prove_ram(pairs, &mut DefaultTranscript::<E>::new(&[])).expect("prove");
+    let prove_secs = t0.elapsed().as_secs_f64();
+    std::hint::black_box(&proof);
+
+    println!(
+        "DEGREEPROVE label={label} vm_max_degree={} blowup={} queries={} \
+         force_generic={} total_parts={total_parts} \
+         trace_cells_main_plus_3aux={trace_cells} composition_part_cells_lde={part_cells} \
+         prove_secs={prove_secs:.4}",
+        crate::VM_MAX_DEGREE,
+        opts.blowup_factor,
+        opts.fri_number_of_queries,
+        std::env::var("LVM_FORCE_GENERIC_PARTS").unwrap_or_else(|_| "0".into()),
+    );
+}
+
+#[test]
+#[ignore = "degree-lane experiment; run explicitly"]
+fn degree_cost_prove() {
+    let name = std::env::var("LVM_DEGREE_ELF").unwrap_or_else(|_| "sub".to_string());
+    let elf = crate::test_utils::asm_elf_bytes(&name);
+    let reps: usize = std::env::var("LVM_DEGREE_REPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    for _ in 0..reps {
+        measure_prove_arm(&elf, &name);
+    }
+}
+
 #[test]
 #[ignore = "degree-lane experiment; run explicitly"]
 fn degree_cost_verifier_hashes() {
@@ -185,4 +254,34 @@ fn degree_cost_verifier_hashes() {
     let name = std::env::var("LVM_DEGREE_ELF").unwrap_or_else(|_| "sub".to_string());
     let elf = crate::test_utils::asm_elf_bytes(&name);
     measure_arm(&elf, &name);
+}
+
+/// Full production prove path (`prove_with_options`), which emits the
+/// `instruments` per-stage report. That report is the right instrument for the
+/// fast-path cliff: it times `decompose_and_extend_d2` / the generic fallback
+/// on its own, instead of hunting for the difference inside a noisy end-to-end
+/// wall clock.
+///
+/// One arm per process. Run under `/usr/bin/time -v` for peak RSS.
+#[test]
+#[ignore = "degree-lane experiment; run explicitly"]
+fn degree_cost_prove_instrumented() {
+    let name = std::env::var("LVM_DEGREE_ELF").unwrap_or_else(|_| "sub".to_string());
+    let elf = crate::test_utils::asm_elf_bytes(&name);
+    let opts = arm_options();
+    let max_rows = MaxRowsConfig::default();
+
+    let t0 = std::time::Instant::now();
+    let proof = crate::prove_with_options(&elf, &opts, &max_rows).expect("prove");
+    let prove_secs = t0.elapsed().as_secs_f64();
+    std::hint::black_box(&proof);
+
+    println!(
+        "DEGREEPROVEI label={name} vm_max_degree={} blowup={} queries={} force_generic={} \
+         total_secs={prove_secs:.4}",
+        crate::VM_MAX_DEGREE,
+        opts.blowup_factor,
+        opts.fri_number_of_queries,
+        std::env::var("LVM_FORCE_GENERIC_PARTS").unwrap_or_else(|_| "0".into()),
+    );
 }

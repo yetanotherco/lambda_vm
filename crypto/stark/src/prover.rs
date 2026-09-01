@@ -1262,7 +1262,17 @@ pub trait IsStarkProver<
         let t_sub = Instant::now();
         #[cfg(feature = "cuda")]
         let mut gpu_composition_parts: Option<math_cuda::lde::GpuLdeExt3> = None;
-        let lde_composition_poly_parts_evaluations = if number_of_parts == 2 {
+        // DEGREE-LANE EXPERIMENT (temporary): `LVM_FORCE_GENERIC_PARTS=1` routes
+        // the 2-part case through the generic fallback below. Production only
+        // ever runs 2 parts (every VM table declares degree 3), so that case has
+        // a hand-written fast path while every d>=5 arm lands in the untuned
+        // fallback. Forcing 2 parts down the slow path measures that
+        // implementation cliff on its own, so it can be subtracted from the
+        // apparent cost of higher degree.
+        let force_generic = std::env::var("LVM_FORCE_GENERIC_PARTS")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let lde_composition_poly_parts_evaluations = if number_of_parts == 2 && !force_generic {
             // Direct quotient decomposition: avoid full-size iFFT by algebraically
             // splitting H(x) = H₀(x²) + x·H₁(x²) using:
             //   H₀(x²) = (H(x) + H(-x)) / 2
