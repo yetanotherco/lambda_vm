@@ -13,6 +13,56 @@ by ~1.29×.
 
 ---
 
+## 0. ★ THE QUESTION: does raising degree change prover cost at fixed cells?
+
+> *"My purpose is to model the cost of a degree-5 constraint. Before, cost was mostly
+> trace cells and constraints didn't matter. Is this still the case?"* — Mauro
+
+**Provisional answer: still mostly yes.** At identical committed cells and identical
+blowup, moving from degree 3 to degree 5 costs about **+10% prove time** — real, but an
+order of magnitude short of the cell term. Cells still set prover cost; degree is a
+correction on top, not a new dominant axis.
+
+**And most of that +10% is not the arithmetic.** Raising a degree does two separable
+things — more multiplications per row, and more composition parts. `DegreeAir` decouples
+them via `LVM_DEGREE_DECLARED`, so each can be priced alone. All three arms use the same
+width and rows with zero interactions, so committed cells are identical **by
+construction** — the test asserts equality rather than assuming it.
+
+⚠ **PROVISIONAL — laptop, one small shape (2^18 rows × 32 cols, blowup 4, 110 q).**
+Server confirmation over a row-size ladder is pending; treat the split as more reliable
+than the absolute percentage.
+
+| arm | true degree | parts | mean prove s | n | cells (`main + 3·aux`) |
+|---|---|---|---|---|---|
+| A | 3 | 2 | 2.2485 | 3 | 8,388,608 |
+| C | 3 | **4** | 2.4115 | 3 | 8,388,608 |
+| B | **5** | 4 | 2.4734 | 4 | 8,388,608 |
+
+* **C − A = +7.25%** — the extra composition parts
+* **B − C = +2.57%** — the degree-5 arithmetic
+* **B − A = +10.00%** — total, degree 3 → 5 at fixed cells
+
+**≈72% of the cost of degree is the part count; ≈28% is the raw arithmetic.** The
+mechanism that bites is commitment and opening work, not multiplication count. Arm C
+exists precisely so this could have been refuted — had parts been free it would have
+landed near zero — and it was not refuted.
+
+The 72% half is also the half the recursive verifier pays, per query. It is priced there
+in §3 and is nearly free (+0.45% permutations at blowup 4). No contradiction: the prover
+commits every part across the whole LDE domain, while the verifier only opens them at
+110 points.
+
+**Caveats carried with the number.** `DegreeAir` has `aux = 0`. That is what makes the
+isolation exact, but it under-represents a VM where the bus dominates the cells — there
+the aux columns enlarge the denominator, making the +10% *smaller*, not larger. So
+**+10% is an upper bound on the fraction**, biased in favour of degree 5. Parts in this
+AIR are base-field rather than ext3, so its *absolute* parts cost is not the VM's; the
+B − C split is unaffected (both arms have 4 parts, so it cancels exactly), and the parts
+cost proper is measured separately on the real VM in §3 and §4.
+
+---
+
 ## 1. The degree ↔ blowup relationship
 
 ### 1.1 Degree sets the quotient part count, linearly
@@ -361,6 +411,12 @@ themselves. `aux = 0` here because their interaction count is unspecified; add
 ## 7. Reproduction
 
 ```bash
+# ★ the fixed-cells constraint-degree arm (§0) — interleaved ABBA
+for R in 18 20 22; do LVM_DEGREE_ROWS_LOG2=$R LVM_DEGREE_BLOWUP=4 LVM_DEGREE_REPS=3 \
+  cargo test -p stark --release degree_fixed_cells_sweep -- \
+  --ignored --nocapture --test-threads=1 | grep '^DEGREEFIXED'; done
+# one arm per process, for peak RSS: LVM_DEGREE_ARM=A|B|C
+
 # degree ↔ blowup bound (§1.3)
 cargo test -p stark --release true_degree_vs_blowup_bound -- --nocapture --test-threads=1
 
@@ -389,9 +445,9 @@ trap to avoid — external measurement sidesteps it.
 
 | file | purpose |
 |---|---|
-| `crypto/stark/src/examples/degree_air.rs` | `DegreeAir<F, D, W>` — true degree-D AIR, degree and width independent |
+| `crypto/stark/src/examples/degree_air.rs` | `DegreeAir<F, D, W>` — true degree-D AIR; `LVM_DEGREE_DECLARED` decouples declared degree (parts) from true degree (arithmetic) |
 | `prover/src/lib.rs` `VM_MAX_DEGREE` | one knob behind all ten tables; read by prover *and* guest verifier |
 | `crypto/crypto/src/hash_count.rs` | leaf/parent/permutation counters, `hash-count` feature |
 | `crypto/stark/src/prover.rs` `LVM_FORCE_GENERIC_PARTS` | routes 2 parts through the generic path (mutation-tested) |
 | `prover/src/tests/degree_tests.rs` | the measurement arms + the exclusivity guard |
-| `crypto/stark/src/tests/air_tests.rs` | `true_degree_vs_blowup_bound`, `degree_probe_parts_vs_blowup` |
+| `crypto/stark/src/tests/air_tests.rs` | `degree_fixed_cells_sweep` (§0), `true_degree_vs_blowup_bound`, `degree_probe_parts_vs_blowup` |
