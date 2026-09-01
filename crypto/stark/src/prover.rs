@@ -19,8 +19,6 @@ use math::{
     polynomial::Polynomial,
 };
 
-#[cfg(all(feature = "parallel", not(feature = "cuda")))]
-use rayon::prelude::IntoParallelRefIterator;
 #[cfg(feature = "parallel")]
 use rayon::prelude::{IntoParallelIterator, ParallelIterator};
 
@@ -752,13 +750,40 @@ fn run_admitted<T: Send>(
         .map(|_| std::sync::Mutex::new(None))
         .collect();
 
-    for chunk in order.chunks(workers.max(1)) {
-        let chunk_results: Vec<(usize, T)> =
-            chunk.par_iter().map(|&idx| (idx, task(idx))).collect();
-        for (idx, result) in chunk_results {
-            *results[idx].lock().unwrap() = Some(result);
+    // Same pull-cursor as the CUDA scheduler, but the workers are Rayon tasks
+    // rather than OS threads. That keeps both properties that matter here:
+    //
+    //  * the nested Rayon work each table runs stays *inside* the pool, so it
+    //    work-steals normally (spawning OS driver threads is what this file's
+    //    CPU path was fixing);
+    //  * a worker that finishes a small table immediately pulls the next one.
+    //    Batching `order` into fixed chunks instead would make every table wait
+    //    for the slowest of its chunk — precisely the behaviour `heaviest_first`
+    //    and the cursor were introduced to remove.
+    //
+    // Concurrency stays bounded by `workers`, so `TABLE_PARALLELISM` keeps its
+    // meaning and the number of simultaneously live per-table working sets is
+    // unchanged. Blocking is safe to do here only because, unlike the CUDA
+    // path, there is no admission gate for a worker to block on.
+    let cursor = std::sync::atomic::AtomicUsize::new(0);
+    let workers = workers.max(1).min(order.len().max(1));
+    rayon::scope(|scope| {
+        for _ in 0..workers {
+            let cursor = &cursor;
+            let results = &results;
+            let task = &task;
+            scope.spawn(move |_| {
+                loop {
+                    let pos = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(&idx) = order.get(pos) else {
+                        return;
+                    };
+                    let out = task(idx);
+                    *results[idx].lock().unwrap() = Some(out);
+                }
+            });
         }
-    }
+    });
 
     results
         .into_iter()
@@ -4198,5 +4223,91 @@ fn print_bus_balance_report<FieldExtension>(
             let report = tracker.analyze_mismatches();
             report.print_summary();
         }
+    }
+}
+
+#[cfg(test)]
+mod scheduler_tests {
+    use super::{VramGate, heaviest_first, run_admitted};
+
+    /// Every index must be filled exactly once, and each result must land in the
+    /// slot named by its own index — not by its position in `order`. The
+    /// scheduler hands out work heaviest-first, so those two orders differ.
+    #[test]
+    fn run_admitted_fills_every_slot_by_index() {
+        let estimates: Vec<u64> = vec![7, 1, 9, 3, 5, 5, 0, 11];
+        let order = heaviest_first(&estimates);
+        let gate = VramGate::new(u64::MAX);
+
+        for workers in [1usize, 2, 3, 8, 64] {
+            let out = run_admitted(&order, &estimates, &gate, workers, |idx| idx * 10);
+            assert_eq!(out.len(), estimates.len(), "workers={workers}");
+            for (idx, slot) in out.into_iter().enumerate() {
+                assert_eq!(slot, Some(idx * 10), "slot {idx}, workers={workers}");
+            }
+        }
+    }
+
+    /// A batch must not serialize when the *weight estimate mispredicts* actual
+    /// cost. Sorting heaviest-first makes fixed chunks look fine as long as the
+    /// estimate is accurate — each chunk then holds similar-weight work. The
+    /// failure mode is a chunk that contains one genuinely slow task the
+    /// estimate did not flag: everything else in that chunk finishes and waits.
+    ///
+    /// Here the estimates are uniform (so the order is the identity) while every
+    /// 4th task is slow. With `workers = 4` and fixed chunking that is one slow
+    /// task per chunk and the batch costs 4 x SLOW; a pull cursor runs the four
+    /// slow tasks concurrently and costs about 1 x SLOW.
+    #[test]
+    fn run_admitted_does_not_serialize_when_estimates_mispredict() {
+        use std::time::{Duration, Instant};
+        const N: usize = 16;
+        const WORKERS: usize = 4;
+        const SLOW: Duration = Duration::from_millis(120);
+        const FAST: Duration = Duration::from_millis(5);
+
+        let estimates: Vec<u64> = vec![1; N];
+        // Explicit identity order: this test is about the scheduler, not about
+        // how `heaviest_first` happens to break ties.
+        let order: Vec<usize> = (0..N).collect();
+        let gate = VramGate::new(u64::MAX);
+
+        let start = Instant::now();
+        let out = run_admitted(&order, &estimates, &gate, WORKERS, |idx| {
+            std::thread::sleep(if idx % WORKERS == WORKERS - 1 {
+                SLOW
+            } else {
+                FAST
+            });
+            idx
+        });
+        let elapsed = start.elapsed();
+
+        assert_eq!(out.len(), N);
+        for (idx, slot) in out.into_iter().enumerate() {
+            assert_eq!(slot, Some(idx));
+        }
+        // Fixed chunking costs >= 4 * 120ms = 480ms. A cursor overlaps the slow
+        // tasks and lands near 120ms; 300ms leaves generous CI headroom while
+        // still failing the chunked behaviour.
+        assert!(
+            elapsed < Duration::from_millis(300),
+            "took {elapsed:?}; a fixed-chunk scheduler would need >= 480ms here"
+        );
+    }
+
+    #[test]
+    fn heaviest_first_orders_by_descending_estimate() {
+        let estimates: Vec<u64> = vec![3, 10, 1, 10, 4];
+        let order = heaviest_first(&estimates);
+        assert_eq!(order.len(), estimates.len());
+        let weights: Vec<u64> = order.iter().map(|&i| estimates[i]).collect();
+        assert!(
+            weights.windows(2).all(|w| w[0] >= w[1]),
+            "not descending: {weights:?}"
+        );
+        let mut seen = order.clone();
+        seen.sort_unstable();
+        assert_eq!(seen, (0..estimates.len()).collect::<Vec<_>>());
     }
 }
