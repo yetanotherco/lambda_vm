@@ -24,6 +24,24 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
+/// ★★ Calls that reach a prover or verifier through the WORKSPACE ALIAS.
+///
+/// ⛔ `stark::prover::Prover` and `stark::verifier::Verifier` **are**
+/// `GenericProver` / `GenericVerifier` AT `DefaultStarkHash`. They are the
+/// SILENT spelling of the first symbol below, and this gate's first version
+/// omitted them — so it searched for the class by the one name the class never
+/// uses. Nineteen files kept calling the BLAKE3 alias against artifacts that
+/// follow the pin, on branches whose entire purpose is that the two differ, and
+/// the gate reported green.
+///
+/// Matched as call forms rather than as bare identifiers, because `Prover` and
+/// `Verifier` appear inside `IsStarkProver`, `BlockProver` and ordinary prose.
+/// A line naming the pin is excluded by [`PIN_CALLS`] rather than by the pattern.
+const ALIAS_CALLS: &[&str] = &["Prover::multi_prove", "Verifier::multi_verify"];
+
+/// The pinned spellings, which contain [`ALIAS_CALLS`] as substrings.
+const PIN_CALLS: &[&str] = &["BlockProver::", "BlockVerifier::"];
+
 /// The symbols that silently select a hash when nobody names one.
 const IMPLIED_HASH_SYMBOLS: &[&str] = &[
     // The workspace's commitment configuration, and the `Prover` / `Verifier`
@@ -38,6 +56,25 @@ const IMPLIED_HASH_SYMBOLS: &[&str] = &[
 ];
 
 /// Files allowed to mention an implied-hash symbol, each with its reason.
+///
+/// ⚠⚠ **THE QUESTION THIS LIST ANSWERS IS "IS THIS DEFAULT PAIRED WITH A
+/// NON-DEFAULT?", NOT "IS THIS REACHABLE FROM PRODUCTION?"** The first version
+/// asked the second, and every entry's reasoning was *true* and one scope too
+/// wide. `build_traces` really is test-only and production really does reach
+/// `build_traces_with_hasher` — and twelve tests still built traces at
+/// `HasherKind::Test` while proving against artifacts that followed the pin,
+/// which is an out-of-bounds index inside `HashConstraints::eval` because the
+/// socket chip's width is tenant-dependent.
+///
+/// ★ **"Test-only" is not "safe" — it is only "production-safe."** Before
+/// blessing an entry, name the CONSUMER the default is handed to and check what
+/// tenant *it* follows.
+///
+/// ⚖ And note the subtlest part: that mismatch did not pre-exist. Before
+/// `build_artifacts` was pinned, `artifacts.hasher` was ALSO `Test`, so the pair
+/// agreed **by both being wrong**. A correct fix to one half of a
+/// wrong-but-consistent pair CREATES the failure — so a red test after such a
+/// fix is evidence the fix worked, not that it broke something.
 ///
 /// Paths are relative to `prover/src`. Two files are excluded from the scan
 /// rather than blessed: `hash_pin.rs`, because naming the default is what it is
@@ -153,7 +190,10 @@ fn no_call_site_outside_the_pin_reaches_a_default_alias() {
         let text = std::fs::read_to_string(root.join(rel)).expect("a readable source file");
         for line in text.lines() {
             let Some(code) = code_of(line) else { continue };
-            if IMPLIED_HASH_SYMBOLS.iter().any(|s| code.contains(s)) {
+            let implied = IMPLIED_HASH_SYMBOLS.iter().any(|s| code.contains(s));
+            let aliased = ALIAS_CALLS.iter().any(|s| code.contains(s))
+                && !PIN_CALLS.iter().any(|s| code.contains(s));
+            if implied || aliased {
                 found.insert(rel.to_string_lossy().replace('\\', "/"));
             }
         }

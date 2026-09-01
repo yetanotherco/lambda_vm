@@ -424,7 +424,7 @@ mod soundness_tests {
     use stark::prover::{IsStarkProver, Prover};
     use stark::trace::TraceTable;
     use stark::traits::AIR;
-    use stark::verifier::{IsStarkVerifier, Verifier};
+    use stark::verifier::IsStarkVerifier;
 
     use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 
@@ -626,15 +626,15 @@ mod soundness_tests {
         ];
 
         let multi_proof =
-            multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+            multi_prove_ram(air_trace_pairs, &mut crate::hash_pin::block_transcript(&[])).unwrap();
 
         let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
             vec![&sender_air, &receiver_air];
 
-        let result = Verifier::multi_verify(
+        let result = crate::hash_pin::BlockVerifier::multi_verify(
             &airs,
             &multi_proof,
-            &mut DefaultTranscript::<E>::new(&[]),
+            &mut crate::hash_pin::block_transcript(&[]),
             &FieldElement::zero(),
         );
 
@@ -674,15 +674,15 @@ mod soundness_tests {
         ];
 
         let multi_proof =
-            multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+            multi_prove_ram(air_trace_pairs, &mut crate::hash_pin::block_transcript(&[])).unwrap();
 
         let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
             vec![&sender_air, &receiver_air];
 
-        let result = Verifier::multi_verify(
+        let result = crate::hash_pin::BlockVerifier::multi_verify(
             &airs,
             &multi_proof,
-            &mut DefaultTranscript::<E>::new(&[]),
+            &mut crate::hash_pin::block_transcript(&[]),
             &FieldElement::zero(),
         );
 
@@ -744,16 +744,16 @@ mod soundness_tests {
         ];
 
         let multi_proof =
-            multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+            multi_prove_ram(air_trace_pairs, &mut crate::hash_pin::block_transcript(&[])).unwrap();
 
         // Verifier uses DIFFERENT AIR with honest commitment
         let verifier_airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
             vec![&sender_air, &verifier_receiver_air];
 
-        let result = Verifier::multi_verify(
+        let result = crate::hash_pin::BlockVerifier::multi_verify(
             &verifier_airs,
             &multi_proof,
-            &mut DefaultTranscript::<E>::new(&[]),
+            &mut crate::hash_pin::block_transcript(&[]),
             &FieldElement::zero(),
         );
 

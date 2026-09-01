@@ -21,7 +21,7 @@ use stark::proof::stark::MultiProof;
 use stark::proof::view::MultiProofView;
 use stark::trace::TraceTable;
 use stark::traits::AIR;
-use stark::verifier::{IsStarkVerifier, Verifier};
+use stark::verifier::IsStarkVerifier;
 
 use crate::tables::bitwise::{BitwiseOperation, BitwiseOperationType};
 use crate::tables::local_to_global::{
@@ -340,12 +340,12 @@ fn prove_verify_memory(l2g_boundary: &[CellBoundary], memw_boundary: &[CellBound
         _,
         _,
     )> = vec![(&l2g, &mut l2g_trace, &()), (&memw, &mut memw_trace, &())];
-    let proof = multi_prove_ram(pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+    let proof = multi_prove_ram(pairs, &mut crate::hash_pin::block_transcript(&[])).unwrap();
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = vec![&l2g, &memw];
-    Verifier::multi_verify(
+    crate::hash_pin::BlockVerifier::multi_verify(
         &airs,
         &proof,
-        &mut DefaultTranscript::<E>::new(&[]),
+        &mut crate::hash_pin::block_transcript(&[]),
         &FieldElement::zero(),
     )
 }
@@ -367,13 +367,13 @@ fn prove_verify_l2g_range_with_trace(
         (&l2g, l2g_trace, &()),
         (&receiver, &mut receiver_trace, &()),
     ];
-    let proof = multi_prove_ram(pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+    let proof = multi_prove_ram(pairs, &mut crate::hash_pin::block_transcript(&[])).unwrap();
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&l2g, &receiver];
-    Verifier::multi_verify(
+    crate::hash_pin::BlockVerifier::multi_verify(
         &airs,
         &proof,
-        &mut DefaultTranscript::<E>::new(&[]),
+        &mut crate::hash_pin::block_transcript(&[]),
         &FieldElement::zero(),
     )
 }
@@ -407,7 +407,7 @@ fn l2g_root(boundary: &[CellBoundary]) -> Commitment {
         _,
         _,
     )> = vec![(&air, &mut trace, &())];
-    let proof = multi_prove_ram(pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+    let proof = multi_prove_ram(pairs, &mut crate::hash_pin::block_transcript(&[])).unwrap();
     proof.proofs[0].lde_trace_main_merkle_root
 }
 
@@ -468,7 +468,7 @@ pub(crate) fn prove_global(boundaries: &[Vec<CellBoundary>]) -> MultiProof<F, E,
     air_trace_pairs.push((&genesis_anchor, &mut genesis_trace, &()));
     air_trace_pairs.push((&program_end_anchor, &mut program_end_trace, &()));
 
-    multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap()
+    multi_prove_ram(air_trace_pairs, &mut crate::hash_pin::block_transcript(&[])).unwrap()
 }
 
 pub(crate) fn prove_and_verify(boundaries: &[Vec<CellBoundary>]) -> bool {
@@ -489,10 +489,10 @@ pub(crate) fn prove_and_verify(boundaries: &[Vec<CellBoundary>]) -> bool {
     airs.push(&genesis_anchor);
     airs.push(&program_end_anchor);
 
-    Verifier::multi_verify(
+    crate::hash_pin::BlockVerifier::multi_verify(
         &airs,
         &proof,
-        &mut DefaultTranscript::<E>::new(&[]),
+        &mut crate::hash_pin::block_transcript(&[]),
         &FieldElement::zero(),
     )
 }
@@ -593,12 +593,12 @@ fn prove_verify_memory_with_trace(
         _,
         _,
     )> = vec![(&l2g, l2g_trace, &()), (&memw, &mut memw_trace, &())];
-    let proof = multi_prove_ram(pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+    let proof = multi_prove_ram(pairs, &mut crate::hash_pin::block_transcript(&[])).unwrap();
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = vec![&l2g, &memw];
-    Verifier::multi_verify(
+    crate::hash_pin::BlockVerifier::multi_verify(
         &airs,
         &proof,
-        &mut DefaultTranscript::<E>::new(&[]),
+        &mut crate::hash_pin::block_transcript(&[]),
         &FieldElement::zero(),
     )
 }
@@ -656,7 +656,7 @@ fn prove_and_verify_global_with_traces(
     air_trace_pairs.push((&genesis_anchor, &mut genesis_trace, &()));
     air_trace_pairs.push((&program_end_anchor, &mut program_end_trace, &()));
 
-    let proof = multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+    let proof = multi_prove_ram(air_trace_pairs, &mut crate::hash_pin::block_transcript(&[])).unwrap();
 
     let mut airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = l2g_airs
         .iter()
@@ -665,10 +665,10 @@ fn prove_and_verify_global_with_traces(
     airs.push(&genesis_anchor);
     airs.push(&program_end_anchor);
 
-    Verifier::multi_verify(
+    crate::hash_pin::BlockVerifier::multi_verify(
         &airs,
         &proof,
-        &mut DefaultTranscript::<E>::new(&[]),
+        &mut crate::hash_pin::block_transcript(&[]),
         &FieldElement::zero(),
     )
 }
