@@ -13,6 +13,7 @@ debug-checks = ["stark/debug-checks"]
 instruments = ["stark/instruments"]
 profile-markers = ["stark/profile-markers"]
 disk-spill = ["stark/disk-spill"]
+hash-count = ["stark/hash-count", "crypto/hash-count"]  # DEGREE-LANE EXPERIMENT (temporary)
 
 [dependencies]
 stark = { path = "../crypto/stark" }

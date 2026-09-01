@@ -9,6 +9,8 @@ extern crate alloc;
 
 pub mod fiat_shamir;
 pub mod hash;
+#[cfg(feature = "hash-count")]
+pub mod hash_count;
 pub mod merkle_tree;
 #[cfg(feature = "disk-spill")]
 pub mod mmap_util;

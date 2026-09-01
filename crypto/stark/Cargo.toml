@@ -58,6 +58,7 @@ cuda = ["dep:math-cuda"]
 test-cuda-faults = ["cuda", "math-cuda/test-faults"]
 wasm = ["dep:wasm-bindgen", "dep:serde-wasm-bindgen", "dep:web-sys"]
 disk-spill = ["dep:memmap2", "dep:tempfile", "dep:libc", "crypto/disk-spill"]
+hash-count = ["crypto/hash-count"]  # DEGREE-LANE EXPERIMENT (temporary)
 
 
 [package.metadata.wasm-pack.profile.dev]

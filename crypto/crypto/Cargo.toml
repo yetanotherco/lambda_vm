@@ -47,3 +47,5 @@ parallel = ["dep:rayon"]
 disk-spill = ["std", "dep:memmap2", "dep:tempfile", "dep:libc"]
 alloc = []
 rkyv = ["dep:rkyv", "math/rkyv"]
+# DEGREE-LANE EXPERIMENT (temporary): count Merkle leaf/parent hash work.
+hash-count = []

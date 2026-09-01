@@ -54,6 +54,32 @@ fn hash_streamed<D: Digest + 'static, const NUM_BYTES: usize>(
         return result;
     }
 
+    #[cfg(feature = "hash-count")]
+    {
+        // DEGREE-LANE EXPERIMENT: tally absorbed width — where the composition
+        // part count shows up (a query leaf holds 2*parts extension elements).
+        // Cell, not a plain accumulator: the inner closure must be `Fn`.
+        let absorbed = core::cell::Cell::new(0usize);
+        let out = hash_streamed_uncounted::<D, NUM_BYTES>(|sink| {
+            feed(&mut |bytes| {
+                absorbed.set(absorbed.get() + bytes.len());
+                sink(bytes);
+            })
+        });
+        crate::hash_count::record_leaf(absorbed.get());
+        return out;
+    }
+    #[cfg(not(feature = "hash-count"))]
+    hash_streamed_uncounted::<D, NUM_BYTES>(feed)
+}
+
+/// The generic streaming digest, with no instrumentation. Both the counted
+/// leaf path and the fixed-shape parent path build on this, so a parent is
+/// never mistaken for a leaf.
+#[inline]
+fn hash_streamed_uncounted<D: Digest, const NUM_BYTES: usize>(
+    feed: impl Fn(&mut dyn FnMut(&[u8])),
+) -> [u8; NUM_BYTES] {
     let mut hasher = D::new();
     feed(&mut |bytes| hasher.update(bytes));
     let mut result_hash = [0_u8; NUM_BYTES];
@@ -85,7 +111,10 @@ fn hash_new_parent_bytes<D: Digest + 'static, const NUM_BYTES: usize>(
         return result;
     }
 
-    hash_streamed::<D, NUM_BYTES>(|sink| {
+    #[cfg(feature = "hash-count")]
+    crate::hash_count::record_parent();
+
+    hash_streamed_uncounted::<D, NUM_BYTES>(|sink| {
         sink(left);
         sink(right);
     })
