@@ -235,7 +235,32 @@ The blowup that d = 7 *forces* cuts queries 110 → 73, and that refunds far mor
 its four extra parts cost. **For a recursion VM the degree axis is nearly free; the
 query axis is everything.**
 
-### 3.4 Honest scaling
+### 3.4 Pre-registered prediction for the guest-cycle check
+
+Written **before** the run landed, so the check can refute rather than rationalise.
+Arms `a3cd3c0c` (d=7) vs `bb3da304` (d=3), `blowup4` preset, `empty` inner program,
+big box, both PRE-949.
+
+The only channel by which degree can cost the guest *more* than the host permutation
+counts predict is the DEEP composition loop, which iterates over parts per query. From
+the measured totals that is `(88 − 48) parts × 110 queries = 4,400` extra iterations.
+At 10–60 guest instructions per extension-field step, that is 44k–264k cycles, i.e.
+**0.02%–0.53%** of a 50–200M-cycle proof.
+
+So:
+
+| quantity | predicted |
+|---|---|
+| keccak calls (d=7 vs d=3) | **+1.3% to +1.5%** (host permutations gave +1.39% on `sub`, the closest workload) |
+| guest cycles | **+1% to +2%** — tracking keccak calls closely |
+| non-hash tail (cycles − keccak share) | **< 0.5%** |
+
+**Refutation condition: if guest cycles rise by more than ~3%, or by more than about
+double the keccak-call delta, the tail is material and §3.3's −29% headline must be
+re-derived in cycles rather than permutations.** Anything inside the table above leaves
+the headline standing as measured.
+
+### 3.5 Honest scaling
 
 ⚖ ASSESSMENT. The lever moves the ten constraint-carrying tables; the other fifteen
 (EmptyConstraints / preprocessed) stay at parts = 2, so `total_parts` went
