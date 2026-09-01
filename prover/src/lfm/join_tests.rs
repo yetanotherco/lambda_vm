@@ -1097,7 +1097,8 @@ fn sweep_tampers(h: &HostSubProof, label: &str) {
                 // Offset of this group's value `slot` inside the query arena.
                 let mut off = 1usize;
                 for prior in groups.iter().take(g) {
-                    off += prior.num_values() + 2 * h.shape.merkle_depth;
+                    off += prior.num_values()
+                        + super::proof_arena::words_per_root() * h.shape.merkle_depth;
                 }
                 off + slot
             };
@@ -1220,7 +1221,7 @@ fn sweep_tampers(h: &HostSubProof, label: &str) {
         siblings[level][0] ^= 1;
         let mut arenas = h.arenas(&[q]);
         let base = 1 + groups[0].num_values();
-        arenas[4][base..base + 2 * h.shape.merkle_depth]
+        arenas[4][base..base + super::proof_arena::words_per_root() * h.shape.merkle_depth]
             .copy_from_slice(&commitments_to_arena(&siblings));
         execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
             .err()

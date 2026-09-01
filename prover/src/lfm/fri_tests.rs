@@ -945,9 +945,9 @@ fn the_fri_join_adds_no_second_point_derivation() {
     let per_query_decs = decs(&two) - decs(&one);
 
     let expected_selects = h.shape.index_bits()
-        + 2 * sub.merkle_depth * groups.len()
+        + super::proof_arena::words_per_root() * sub.merkle_depth * groups.len()
         + h.shape.num_committed()
-        + 2 * h.shape.path_steps_per_query();
+        + super::proof_arena::words_per_root() * h.shape.path_steps_per_query();
     assert_eq!(
         per_query_selects,
         expected_selects,
@@ -956,11 +956,11 @@ fn the_fri_join_adds_no_second_point_derivation() {
          steps. A surplus of {} index bits is a second point derivation or a \
          second index decomposition",
         h.shape.index_bits(),
-        2 * sub.merkle_depth * groups.len(),
+        super::proof_arena::words_per_root() * sub.merkle_depth * groups.len(),
         groups.len(),
         sub.merkle_depth,
         h.shape.num_committed(),
-        2 * h.shape.path_steps_per_query(),
+        super::proof_arena::words_per_root() * h.shape.path_steps_per_query(),
         h.shape.path_steps_per_query(),
         h.shape.index_bits(),
     );
@@ -1056,7 +1056,7 @@ fn no_tampered_fri_value_can_pass() {
         (
             "layer 0 sibling, top level",
             4,
-            2 * h.shape.layer_path_len(0) - 1,
+            super::proof_arena::words_per_root() * h.shape.layer_path_len(0) - 1,
         ),
         ("second query's layer 0 evaluation", 4, stride),
     ];
@@ -1073,7 +1073,7 @@ fn no_tampered_fri_value_can_pass() {
     // decommitment. Every word is a real prover value.
     let mut spliced = honest.clone();
     let (from, to) = (stride, 0usize);
-    let len = 1 + 2 * h.shape.layer_path_len(0);
+    let len = 1 + super::proof_arena::words_per_root() * h.shape.layer_path_len(0);
     let borrowed: Vec<LfmWord> = spliced[4][from..from + len].to_vec();
     assert_ne!(
         borrowed,
