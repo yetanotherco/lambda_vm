@@ -1,6 +1,29 @@
 #[cfg(target_arch = "riscv64")]
 use core::arch::asm;
 
+/// 8-byte-aligned wrapper for an ecall operand buffer.
+///
+/// The accelerator tables read and write their operands as doublewords. On an 8-byte-aligned
+/// buffer those can take the aligned memory path (`MEMW_A`, 29 columns + 1 range check); a
+/// bare `[u8; N]` on the stack is only 1-aligned, which forces every access onto the general
+/// path (49 + 8) and inflates the trace. Taking `&Align8<N>` in the ecall wrappers puts the
+/// alignment in the type rather than in a comment a caller can miss — and missing it fails
+/// silently, as a bigger trace and nothing else.
+///
+/// Alignment is necessary, not sufficient: `MEMW_A` also requires all eight bytes of a
+/// doubleword to carry the same previous timestamp, which a buffer spanning regions last
+/// written at different times does not — an output aliasing an operand, say. Those accesses
+/// still fall back to the general path.
+#[repr(C, align(8))]
+pub struct Align8<const N: usize>(pub [u8; N]);
+
+impl<const N: usize> Align8<N> {
+    /// A zeroed, 8-byte-aligned buffer.
+    pub const fn zeroed() -> Self {
+        Self([0u8; N])
+    }
+}
+
 /// Memory-mapped private input region start address.
 /// Layout: 4-byte LE length prefix at this address, data at +4.
 /// The host pre-loads the input; the guest reads directly (no ecall).
@@ -176,24 +199,35 @@ pub fn keccak_permute(_state: &mut [u64; 25]) {
 }
 
 #[cfg(target_arch = "riscv64")]
-/// Compute `xR = (k·G)_x` on secp256k1 via the ECSM accelerator. All values are 32-byte
-/// little-endian. Requires `0 < k < N` and a canonical valid `xG` curve coordinate.
-/// `xG` and `k` must not overlap; `xR` may alias either input.
-pub fn ecsm_mul(xr: &mut [u8; 32], xg: &[u8; 32], k: &[u8; 32]) {
+/// Compute `k·G` on secp256k1 via the ECSM accelerator, writing `[xR ‖ yR ‖ yG]` as three
+/// contiguous 32-byte little-endian values into `out`. Requires `0 < k < N` and a canonical
+/// valid `xG` curve coordinate. `xG` and `k` must not overlap; `out` may alias either input.
+///
+/// `yG` is the root of `xG` the chip actually used, and the chip is free to pick either one
+/// (the AIR binds only `yG² ≡ xG³ + b`). So `yR` is the y of `k·(xG, yG)`, which is `±y(k·P)`
+/// for the caller's point `P`. Compare `yG` against your own base point's y and negate `yR`
+/// when they differ; that also validates `yG`, since a value that is neither root means the
+/// output is unusable and the caller should fall back. Both `yG` and `yR` come back reduced
+/// mod `p` (the chip range-checks them), so the comparison is safe on the raw bytes.
+///
+/// All three buffers are [`Align8`], so the twenty doubleword accesses land on the aligned
+/// memory path (`MEMW_A`) instead of the general one.
+pub fn ecsm_mul(out: &mut Align8<96>, xg: &Align8<32>, k: &Align8<32>) {
     unsafe {
         asm!(
             "ecall",
-            in("a0") xr.as_mut_ptr(), // x10 = address to write xR
-            in("a1") xg.as_ptr(),     // x11 = address of xG
-            in("a2") k.as_ptr(),      // x12 = address of k
+            in("a0") out.0.as_mut_ptr(), // x10 = address to write [xR ‖ yR ‖ yG]
+            in("a1") xg.0.as_ptr(),      // x11 = address of xG
+            in("a2") k.0.as_ptr(),       // x12 = address of k
             in("a7") ECSM_SYSCALL_NUMBER,
         )
     }
 }
 
 #[cfg(not(target_arch = "riscv64"))]
-/// Compute `xR = (k·G)_x` on secp256k1 via the ECSM accelerator (32-byte little-endian values).
-pub fn ecsm_mul(_xr: &mut [u8; 32], _xg: &[u8; 32], _k: &[u8; 32]) {
+/// Compute `k·G` on secp256k1 via the ECSM accelerator, writing `[xR ‖ yR ‖ yG]`
+/// (three 32-byte little-endian values) into `out`.
+pub fn ecsm_mul(_out: &mut Align8<96>, _xg: &Align8<32>, _k: &Align8<32>) {
     unimplemented!("syscalls are only implemented for riscv64 targets");
 }
 

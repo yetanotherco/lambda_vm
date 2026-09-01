@@ -19,11 +19,14 @@ use stark::constraints::builder::EmptyConstraints;
 use stark::lookup::{AirWithBuses, AuxiliaryTraceBuildData};
 use stark::proof::options::ProofOptions;
 use stark::proof::view::{MultiProofView, StarkProofView};
+use stark::trace::TraceTable;
 use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
 use crate::VmProof;
 use crate::tables::MaxRowsConfig;
+use crate::tables::memw::cols as memw_cols;
+use crate::tables::memw_aligned::cols as memw_aligned_cols;
 use crate::tables::trace_builder::Traces;
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 
@@ -1572,6 +1575,68 @@ fn test_prove_elfs_ecsm_forged_result_rejected() {
     );
 }
 
+/// Soundness: `yR` is published to guest memory now, so it must be as unforgeable as `xR`.
+///
+/// It is what the guest reconstructs `k·P` from — move it and you move the recovered public
+/// key, i.e. the address `ecrecover` returns. Two things pin it: the ECDAS final-receiver
+/// tuple `[ts, xR, yR, xG, yG, -1, 0]` ties the column to the constrained double-and-add
+/// output, and the MEMW senders publish that same column to memory.
+#[test]
+fn test_prove_elfs_ecsm_forged_yr_rejected() {
+    use crate::tables::ecsm::cols as ecsm_cols;
+
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_ecsm");
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
+    let result = executor.run().expect("Failed to run program");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
+
+    // Forge the low byte of yR on the (single) real ECSM row.
+    let orig = *traces.ecsm.main_table.get(0, ecsm_cols::yr(0));
+    let forged = orig + FieldElement::<GoldilocksField>::one();
+    traces.ecsm.main_table.set(0, ecsm_cols::yr(0), forged);
+
+    assert!(
+        !prove_and_verify_vm_minimal(&elf, &mut traces),
+        "Verifier must reject a forged ECSM result yR"
+    );
+}
+
+/// Soundness: the prover may choose EITHER root of `xG`, but not a non-root.
+///
+/// The AIR binds only `yG² ≡ xG³ + b`, and that freedom is deliberate — the guest resolves
+/// the sign by comparing the echoed `yG` against its own base point's y. A `yG` free of the
+/// curve relation would therefore be a free sign on `k·P`. The `Relation::Yg` convolution is
+/// what forbids it; the ECDAS start tuple and the MEMW senders carry the same column.
+#[test]
+fn test_prove_elfs_ecsm_forged_yg_rejected() {
+    use crate::tables::ecsm::cols as ecsm_cols;
+
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_ecsm");
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
+    let result = executor.run().expect("Failed to run program");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
+
+    // Forge the low byte of the witnessed root yG on the (single) real ECSM row.
+    let orig = *traces.ecsm.main_table.get(0, ecsm_cols::yg(0));
+    let forged = orig + FieldElement::<GoldilocksField>::one();
+    traces.ecsm.main_table.set(0, ecsm_cols::yg(0), forged);
+
+    assert!(
+        !prove_and_verify_vm_minimal(&elf, &mut traces),
+        "Verifier must reject a yG that is not a root of xG"
+    );
+}
+
 /// Regression test: `µ` is the multiplicity of every ECDAS bus interaction, so it must remain
 /// boolean. Forge a non-boolean `µ` on a real ECDAS row and assert the verifier rejects.
 /// (k=5 produces 3 ECDAS rows.)
@@ -1599,6 +1664,169 @@ fn test_prove_elfs_ecsm_forged_ecdas_mu_rejected() {
     assert!(
         !prove_and_verify_vm_minimal(&elf, &mut traces),
         "Verifier must reject a non-boolean ECDAS multiplicity"
+    );
+}
+
+/// Runs an ECSM asm guest and returns its ELF, the minimal traces, and what the
+/// EXECUTOR committed — the shape the tests below share. The committed bytes come
+/// from the executor's own memory, not from `traces`, so a caller can check the two
+/// views agree: the prover rebuilds the ECSM output from its own replay, so a guest
+/// whose two images diverged would still produce a self-consistent, verifying proof.
+fn ecsm_traces(program: &str) -> (Elf, Traces, Vec<u8>) {
+    let elf_bytes = crate::test_utils::asm_elf_bytes(program);
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+    let result = executor::vm::execution::Executor::new(&elf, vec![])
+        .expect("Failed to create executor")
+        .run()
+        .expect("Failed to run program");
+    let traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
+    (elf, traces, result.return_values.memory_values)
+}
+
+/// Where a memory table keeps the three cells these tests read. The general and
+/// the aligned MEMW tables lay their rows out differently, and an ECSM write goes
+/// to whichever one the caller's buffer alignment selects, so neither layout can
+/// be assumed.
+struct MemwLayout {
+    is_register: usize,
+    timestamp_lo: usize,
+    timestamp_hi: usize,
+    first_value: usize,
+}
+
+const MEMW: MemwLayout = MemwLayout {
+    is_register: memw_cols::IS_REGISTER,
+    timestamp_lo: memw_cols::TIMESTAMP_0,
+    timestamp_hi: memw_cols::TIMESTAMP_1,
+    first_value: memw_cols::VALUE[0],
+};
+
+const MEMW_ALIGNED: MemwLayout = MemwLayout {
+    is_register: memw_aligned_cols::IS_REGISTER,
+    timestamp_lo: memw_aligned_cols::TIMESTAMP_0,
+    timestamp_hi: memw_aligned_cols::TIMESTAMP_1,
+    first_value: memw_aligned_cols::VALUE[0],
+};
+
+/// The timestamp of the single real ECSM row (row 0; these guests make one call).
+fn ecsm_timestamp(traces: &Traces) -> u64 {
+    dword_wl(
+        &traces.ecsm,
+        0,
+        crate::tables::ecsm::cols::TIMESTAMP_0,
+        crate::tables::ecsm::cols::TIMESTAMP_1,
+    )
+}
+
+/// A `DWordWL` pair read back as one number.
+fn dword_wl(
+    table: &TraceTable<GoldilocksField, GoldilocksExtension>,
+    row: usize,
+    lo: usize,
+    hi: usize,
+) -> u64 {
+    table.main_table.get(row, lo).to_raw() + (table.main_table.get(row, hi).to_raw() << 32)
+}
+
+/// Rows of memory (not register) writes/reads at `timestamp`, as
+/// `(table index in its own vector, row)`, keyed by which table they came from.
+fn memory_rows_at_timestamp(traces: &Traces, timestamp: u64) -> Vec<(bool, usize, usize)> {
+    let mut out = Vec::new();
+    for (aligned, tables) in [(false, &traces.memws), (true, &traces.memw_aligneds)] {
+        let layout = if aligned { &MEMW_ALIGNED } else { &MEMW };
+        for (index, table) in tables.iter().enumerate() {
+            for row in 0..table.num_rows() {
+                let is_register = table.main_table.get(row, layout.is_register).to_raw();
+                let ts = dword_wl(table, row, layout.timestamp_lo, layout.timestamp_hi);
+                if is_register == 0 && ts == timestamp {
+                    out.push((aligned, index, row));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Verifier REJECTS a forged value on one of the echoed writes. Which rows those
+/// are — twelve writes, `xR` at T+2 and `yR`/`yG` at T+3 — is pinned structurally
+/// by `output_buffer_memw_writes_are_twelve_at_the_expected_offsets`; this covers
+/// the live edge that structural test cannot: that the payload actually written is
+/// tied to the chip's witness. `yR` arrives on
+/// the ECDAS bus and `yG` is the witnessed root, so both were already in the
+/// trace before #941 — what is new is that they are WRITTEN, and a write is only
+/// trustworthy if the memory argument ties it to the chip's own witness. Forge
+/// the payload of one of those rows and the memory bus must not balance.
+#[test]
+fn test_prove_elfs_ecsm_forged_echoed_write_rejected() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let (elf, mut traces, _committed) = ecsm_traces("test_ecsm");
+    let target = ecsm_timestamp(&traces) + 3;
+
+    let rows = memory_rows_at_timestamp(&traces, target);
+    let &(aligned, index, row) = rows
+        .first()
+        .expect("no echoed write found at the fourth sub-timestamp — the tamper would be vacuous");
+    let layout = if aligned { &MEMW_ALIGNED } else { &MEMW };
+    let table = if aligned {
+        &mut traces.memw_aligneds[index]
+    } else {
+        &mut traces.memws[index]
+    };
+    let value = table.main_table.get(row, layout.first_value);
+    table.main_table.set(
+        row,
+        layout.first_value,
+        value + FieldElement::<GoldilocksField>::one(),
+    );
+
+    assert!(
+        !prove_and_verify_vm_minimal(&elf, &mut traces),
+        "Verifier must reject a forged payload on an echoed yR/yG write"
+    );
+}
+
+/// The 96-byte output buffer is allowed to alias either input, which the design
+/// justifies by the read/write timestamp split. This covers both halves of that
+/// claim: the ANSWER is still right when every operand byte gets overwritten, and
+/// the TRACE of it verifies — the per-address chains stay monotone, which only a
+/// proof exercises.
+///
+/// Checking the value is not redundant with the executor's own aliasing test. The
+/// prover rebuilds the ECSM output from its own memory replay rather than from the
+/// executor's image, so a load/store ordering regression on either side would leave
+/// both self-consistent and the proof would still verify; comparing the executor's
+/// committed bytes against the expected `x(5·G)`, and the prover's view against the
+/// executor's, is what ties the two together.
+#[test]
+fn test_prove_elfs_ecsm_output_aliases_inputs() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let (elf, mut traces, committed) = ecsm_traces("test_ecsm_alias");
+
+    // The guest commits xR, which by then sits where xG used to be.
+    let mut gx = [
+        0x79u8, 0xBE, 0x66, 0x7E, 0xF9, 0xDC, 0xBB, 0xAC, 0x55, 0xA0, 0x62, 0x95, 0xCE, 0x87, 0x0B,
+        0x07, 0x02, 0x9B, 0xFC, 0xDB, 0x2D, 0xCE, 0x28, 0xD9, 0x59, 0xF2, 0x81, 0x5B, 0x16, 0xF8,
+        0x17, 0x98,
+    ];
+    gx.reverse();
+    let mut k = [0u8; 32];
+    k[0] = 5;
+    assert_eq!(
+        committed,
+        ecsm::scalar_mul_x(&k, &gx).unwrap(),
+        "an output aliasing both operands must still commit x(5·G)"
+    );
+    assert_eq!(
+        traces.public_output_bytes, committed,
+        "the prover's replay of an aliased ECSM must match the executor's memory image"
+    );
+
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "a proof of an ECSM call whose output aliases its inputs must verify"
     );
 }
 

@@ -156,6 +156,44 @@ fn ecsm_syscall_rejects_overlapping_xg_k() {
     run_ecsm_at(0x3000, 0x2000, 0x3000).expect("xR aliasing k is allowed");
 }
 
+/// The output spans 96 bytes, so it can cover **both** 32-byte operands at once. The syscall
+/// allows that on the grounds that the reads land at T and T+1 and the writes at T+2/T+3 —
+/// i.e. both operands are loaded before the first output byte is stored. The cases above only
+/// ever alias one operand at a time, and the two-at-once shape was covered solely by the
+/// prover-side `test_ecsm_alias.s`; the load-before-store ordering it rests on lives here.
+#[test]
+fn ecsm_syscall_output_may_span_both_operands() {
+    let xg = gx_le();
+    let k = k_le(0xABCDEF);
+
+    // xG at 0x2000..0x2020 and k at 0x2020..0x2040 are disjoint at the exact boundary the
+    // overlap guard permits (|diff| = 32). The output at 0x2000 runs to 0x2060 and so covers
+    // both of them.
+    let addr_out = 0x2000u64;
+    let addr_xg = 0x2000u64;
+    let addr_k = 0x2020u64;
+
+    let mut pc = 0;
+    let mut registers = Registers::default();
+    let mut memory = Memory::default();
+    write_u256_le(&mut memory, addr_xg, &xg);
+    write_u256_le(&mut memory, addr_k, &k);
+    registers.write(17, ECSM_SYSCALL_NUMBER).unwrap();
+    registers.write(10, addr_out).unwrap();
+    registers.write(11, addr_xg).unwrap();
+    registers.write(12, addr_k).unwrap();
+    Instruction::EcallEbreak
+        .run(&mut pc, &mut registers, &mut memory)
+        .expect("an output covering both operands must run");
+
+    // Had either operand been read after the output began overwriting it, the multiply would
+    // have consumed clobbered bytes and this would not match the pure computation.
+    let expected = ecsm::scalar_mul_full(&k, &xg).unwrap();
+    assert_eq!(read_u256_le(&memory, addr_out), expected.x_r, "xR");
+    assert_eq!(read_u256_le(&memory, addr_out + 32), expected.y_r, "yR");
+    assert_eq!(read_u256_le(&memory, addr_out + 64), expected.y_g, "yG");
+}
+
 #[test]
 fn ecsm_syscall_rejects_address_overflow() {
     // Every operand's last accessed byte must stay in the limb (+31); the 0xFFFF_FFE1
@@ -173,4 +211,83 @@ fn ecsm_syscall_rejects_address_overflow() {
             "expected address overflow for xR={addr_xr:#x}, xG={addr_xg:#x}, k={addr_k:#x}"
         );
     }
+}
+
+/// Runs the ECSM syscall and returns the whole 96-byte output buffer as
+/// `(xR, yR, yG)`, all little-endian.
+fn run_ecsm_full(k_bytes: &[u8; 32], xg_le: &[u8; 32]) -> Result<ecsm::EcsmOutput, ExecutionError> {
+    let mut pc = 0;
+    let mut registers = Registers::default();
+    let mut memory = Memory::default();
+
+    let addr_out = 0x1000u64;
+    let addr_xg = 0x2000u64;
+    let addr_k = 0x3000u64;
+    write_u256_le(&mut memory, addr_xg, xg_le);
+    write_u256_le(&mut memory, addr_k, k_bytes);
+
+    registers.write(17, ECSM_SYSCALL_NUMBER).unwrap();
+    registers.write(10, addr_out).unwrap();
+    registers.write(11, addr_xg).unwrap();
+    registers.write(12, addr_k).unwrap();
+
+    Instruction::EcallEbreak.run(&mut pc, &mut registers, &mut memory)?;
+    Ok(ecsm::EcsmOutput {
+        x_r: read_u256_le(&memory, addr_out),
+        y_r: read_u256_le(&memory, addr_out + 32),
+        y_g: read_u256_le(&memory, addr_out + 64),
+    })
+}
+
+/// `y² ≡ x³ + 7 (mod p)` for little-endian 32-byte coordinates.
+fn on_curve(x_le: &[u8; 32], y_le: &[u8; 32]) -> bool {
+    let fe = |le: &[u8; 32]| {
+        let mut be = *le;
+        be.reverse();
+        Option::<k256::FieldElement>::from(k256::FieldElement::from_bytes(&be.into()))
+    };
+    let (Some(x), Some(y)) = (fe(x_le), fe(y_le)) else {
+        return false;
+    };
+    let mut seven = [0u8; 32];
+    seven[31] = 7;
+    let b = k256::FieldElement::from_bytes(&seven.into()).unwrap();
+    // Negate `y²` (magnitude 1), not the RHS: the RHS is a sum carrying magnitude 2, and
+    // k256's `negate(1)` asserts its operand's magnitude is <= 1 in debug builds.
+    ((x.square() * x + b) + y.square().negate(1))
+        .normalizes_to_zero()
+        .into()
+}
+
+#[test]
+fn ecsm_syscall_writes_the_full_96_byte_output() {
+    let xg = gx_le();
+    for v in [1u64, 2, 5, 0xFFFF, 1_000_003] {
+        let k = k_le(v);
+        let got = run_ecsm_full(&k, &xg).unwrap();
+        assert_eq!(got, ecsm::scalar_mul_full(&k, &xg).unwrap());
+        let ecsm::EcsmOutput {
+            x_r: xr,
+            y_r: yr,
+            y_g: yg,
+        } = got;
+        // yG is the root of xG the chip used, and the executor lifts to the even one.
+        assert!(on_curve(&xg, &yg), "yG must satisfy yG² = xG³ + 7");
+        assert_eq!(yg[0] & 1, 0, "the executor lifts xG to its even root");
+        // yR is the y of k·(xG, yG), so the result is a curve point too.
+        assert!(on_curve(&xr, &yr), "yR must satisfy yR² = xR³ + 7");
+    }
+}
+
+#[test]
+fn ecsm_syscall_output_bound_covers_all_96_bytes() {
+    // The output spans +0..+95, so its low limb must stay under 2^32 - 95. One past the
+    // last accepted base is where the 96th byte would cross the limb boundary.
+    let last_ok = 0x1_0000_0000u64 - 96;
+    run_ecsm_at(last_ok, 0x2000, 0x3000).expect("+95 lands on the last byte of the limb");
+    let err = run_ecsm_at(last_ok + 1, 0x2000, 0x3000).unwrap_err();
+    assert!(
+        matches!(err, ExecutionError::EcsmAddressOverflow),
+        "an output whose 96th byte crosses the limb must be rejected"
+    );
 }

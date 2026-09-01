@@ -519,14 +519,16 @@ impl Instruction {
                     }
                     SyscallNumbers::Ecsm => {
                         // ECSM(-11): k×G on secp256k1.
-                        // x10 = addr to write xR, x11 = addr of xG, x12 = addr of k.
-                        // xG, k, xR are 32-byte little-endian values; xG and xR must be
+                        // x10 = addr of the 96-byte output buffer [xR ‖ yR ‖ yG],
+                        // x11 = addr of xG, x12 = addr of k.
+                        // All six values are 32-byte little-endian; xG and xR must be
                         // canonical field elements and k must be in [1, N).
                         let addr_xr = registers.read(10)?;
                         let addr_xg = registers.read(11)?;
                         let addr_k = registers.read(12)?;
+                        // The output spans +0..+95, so its bound is 95, not 31.
                         if !addr_limb_ok(addr_xg, 31)
-                            || !addr_limb_ok(addr_xr, 31)
+                            || !addr_limb_ok(addr_xr, 95)
                             || !addr_limb_ok(addr_k, 31)
                         {
                             return Err(ExecutionError::EcsmAddressOverflow);
@@ -537,14 +539,26 @@ impl Instruction {
                         // both timestamps and the MEMW consistency argument can't prove the
                         // access chain. The loaded values would still be well-defined — this
                         // guard is about trace provability, not correctness of the multiply.
-                        // xR may alias either: its accesses are at a later timestamp.
+                        // The output may alias either (even though it now spans 96 bytes and
+                        // so can cover both): its accesses are at T+2 and T+3, strictly after
+                        // both reads, so every per-address chain stays monotone.
                         if addr_xg.abs_diff(addr_k) < 32 {
                             return Err(ExecutionError::EcsmOperandOverlap);
                         }
                         let xg = load_u256_le(memory, addr_xg)?;
                         let k = load_u256_le(memory, addr_k)?;
-                        let xr = ecsm::scalar_mul_x(&k, &xg)?;
-                        store_u256_le(memory, addr_xr, &xr)?;
+                        let out = ecsm::scalar_mul_full(&k, &xg)?;
+                        // `checked_add` rather than `+`, as the keccak lane pointers above do:
+                        // the bound at the top of this arm already forces `addr_xr + 95` to fit,
+                        // but that leaves the argument twenty lines from its use. If the bound is
+                        // ever relaxed or reordered, a wrap here would land the write on an
+                        // unrelated region in release builds instead of erroring.
+                        for (off, value) in [(0u64, &out.x_r), (32, &out.y_r), (64, &out.y_g)] {
+                            let addr = addr_xr
+                                .checked_add(off)
+                                .ok_or(ExecutionError::EcsmAddressOverflow)?;
+                            store_u256_le(memory, addr, value)?;
+                        }
                         // Carry addr_xG/addr_k in the CPU log; addr_xR is recovered from x10
                         // by the ECSM register-read path in the trace builder.
                         src2_val = addr_xg;

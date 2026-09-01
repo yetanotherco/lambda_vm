@@ -1,6 +1,6 @@
-//! Tests for the x-only ECSM linear-combination reconstruction
+//! Tests for the ECSM linear-combination reconstruction
 //! (`lincomb2_with_oracle`) against the software `ProjectivePoint::lincomb`,
-//! plus the degenerate-configuration fallback guards.
+//! plus the root fix-up and the degenerate-configuration fallback guards.
 
 use crate::*;
 
@@ -11,15 +11,45 @@ fn curve_b() -> FieldElement {
     FieldElement::from_bytes(&bytes.into()).unwrap()
 }
 
-/// Software stand-in for the ECSM precompile: lift `x` to a curve point and
-/// return `x(k·P)` (parity-invariant, like the real ecall).
-fn soft_oracle(x: &FieldElement, k: &Scalar) -> Option<FieldElement> {
+fn is_odd(y: &FieldElement) -> bool {
+    y.normalize().to_bytes()[31] & 1 == 1
+}
+
+/// Software stand-in for the ECSM precompile, parameterised by which root of `x` the chip
+/// witnesses. The real chip is free to pick either (the AIR binds only `yG² ≡ xG³ + b`), so
+/// both settings are legal traces and the caller must handle them identically.
+/// Returns `(x(k·P̂), y(k·P̂), ŷ)` with `P̂ = (x, ŷ)`.
+fn soft_oracle_with_root(
+    x: &FieldElement,
+    k: &Scalar,
+    want_odd_root: bool,
+) -> Option<(FieldElement, FieldElement, FieldElement)> {
     let xn = x.normalize();
     let y2 = (xn.square() * xn + curve_b()).normalize();
-    let y = Option::<FieldElement>::from(y2.sqrt())?;
-    let p = point_from_xy(&xn, &y.normalize())?;
+    let y = Option::<FieldElement>::from(y2.sqrt())?.normalize();
+    let yg = if is_odd(&y) == want_odd_root {
+        y
+    } else {
+        (-y).normalize()
+    };
+    let p = point_from_xy(&xn, &yg)?;
     let prod = (p * k).to_affine();
-    Some(affine_xy(&prod)?.0)
+    let (xr, yr) = affine_xy(&prod)?;
+    Some((xr, yr, yg))
+}
+
+/// The canonical (even-root) lift, matching what `ecsm::recover_y_canonical` produces.
+fn soft_oracle(x: &FieldElement, k: &Scalar) -> Option<(FieldElement, FieldElement, FieldElement)> {
+    soft_oracle_with_root(x, k, false)
+}
+
+/// The other legal choice: the odd root. `k·P̂ = −(k·P)` here, so the caller's sign fix-up
+/// is what keeps the answer right.
+fn soft_oracle_odd(
+    x: &FieldElement,
+    k: &Scalar,
+) -> Option<(FieldElement, FieldElement, FieldElement)> {
+    soft_oracle_with_root(x, k, true)
 }
 
 fn g_times(n: u64) -> ProjectivePoint {
@@ -55,21 +85,94 @@ fn matches_software_lincomb_on_recovery_shape() {
     assert_eq!(got, expected.to_affine());
 }
 
+/// The property the echoed root buys: whichever root the chip picks, the reconstruction is
+/// the same point. With the odd root every `k·P̂` comes back negated, and only the caller's
+/// fix-up puts it right — so an unfixed implementation fails this and passes the one above.
 #[test]
-fn edge_scalars_fall_back() {
+fn either_witnessed_root_gives_the_same_result() {
+    let cases = [
+        (g_times(3), 123_456_789u64, g_times(7), 987_654_321u64),
+        (
+            ProjectivePoint::GENERATOR,
+            0xdead_beefu64,
+            g_times(0x1234),
+            0x0bad_f00du64,
+        ),
+        (g_times(11), 2u64.pow(20) + 5, g_times(2), 42u64),
+    ];
+    for (p1, k1, p2, k2) in cases {
+        let (k1, k2) = (Scalar::from(k1), Scalar::from(k2));
+        let expected = ProjectivePoint::lincomb(&p1, &k1, &p2, &k2).to_affine();
+        let even = lincomb2_with_oracle(&p1.to_affine(), &k1, &p2.to_affine(), &k2, soft_oracle)
+            .expect("even-root oracle must reconstruct");
+        let odd = lincomb2_with_oracle(&p1.to_affine(), &k1, &p2.to_affine(), &k2, soft_oracle_odd)
+            .expect("odd-root oracle must reconstruct");
+        assert_eq!(even, expected);
+        assert_eq!(
+            odd, expected,
+            "the root fix-up must absorb the chip's choice"
+        );
+    }
+}
+
+/// `ŷ` that is neither `y` nor `−y` means the oracle did not multiply the caller's point.
+/// The caller must decline rather than use the result.
+#[test]
+fn foreign_root_falls_back() {
+    let bogus = |x: &FieldElement, k: &Scalar| {
+        let (xr, yr, _) = soft_oracle(x, k)?;
+        // A valid field element, but not a root of this x.
+        let mut bytes = [0u8; 32];
+        bytes[31] = 9;
+        Some((xr, yr, FieldElement::from_bytes(&bytes.into()).unwrap()))
+    };
+    let p1 = g_times(3);
+    let p2 = g_times(7);
+    let k = Scalar::from(12345u64);
+    assert!(
+        lincomb2_with_oracle(&p1.to_affine(), &k, &p2.to_affine(), &k, bogus).is_none(),
+        "a yG that is neither root must be rejected"
+    );
+}
+
+/// `k = 1` and `k = N−1` were degenerate for the x-only predecessor (which needed a second
+/// `(k+1)·P` query); with `y` returned they are ordinary scalars.
+#[test]
+fn former_edge_scalars_now_reconstruct() {
+    let p1 = g_times(3);
+    let p2 = g_times(7);
+    let ok = Scalar::from(12345u64);
+    for k in [Scalar::ONE, -Scalar::ONE] {
+        for (a, ka, b, kb) in [(p1, k, p2, ok), (p1, ok, p2, k)] {
+            let expected = ProjectivePoint::lincomb(&a, &ka, &b, &kb);
+            let got = lincomb2_with_oracle(&a.to_affine(), &ka, &b.to_affine(), &kb, soft_oracle)
+                .expect("k = 1 / N−1 are ordinary scalars now");
+            assert_eq!(got, expected.to_affine());
+        }
+    }
+}
+
+#[test]
+fn zero_scalars_fall_back() {
     let p1 = g_times(3);
     let p2 = g_times(5);
     let ok = Scalar::from(12345u64);
-    for bad in [Scalar::ZERO, Scalar::ONE, -Scalar::ONE] {
-        assert!(
-            lincomb2_with_oracle(&p1.to_affine(), &bad, &p2.to_affine(), &ok, soft_oracle)
-                .is_none()
-        );
-        assert!(
-            lincomb2_with_oracle(&p1.to_affine(), &ok, &p2.to_affine(), &bad, soft_oracle)
-                .is_none()
-        );
-    }
+    assert!(lincomb2_with_oracle(
+        &p1.to_affine(),
+        &Scalar::ZERO,
+        &p2.to_affine(),
+        &ok,
+        soft_oracle
+    )
+    .is_none());
+    assert!(lincomb2_with_oracle(
+        &p1.to_affine(),
+        &ok,
+        &p2.to_affine(),
+        &Scalar::ZERO,
+        soft_oracle
+    )
+    .is_none());
 }
 
 #[test]
@@ -92,10 +195,8 @@ fn cancelling_and_doubling_terms_fall_back() {
 
 #[test]
 fn k_half_n_minus_1_reconstructs_correctly() {
-    // k = (n-1)/2 satisfies k·P = -(k+1)·P for any P, so the oracle returns
-    // the same x-coordinate for both the k and k+1 calls (xa = xc). The
-    // solve_y algebra still holds: lambda² = 2·xa + xp = t, so the check
-    // passes and the correct ya is recovered.
+    // k = (n-1)/2 satisfies k·P = -(k+1)·P for any P. It broke nothing before and it
+    // breaks nothing now; kept as a regression pin on a scalar with structure.
     let two_inv = Scalar::from(2u64)
         .invert_vartime()
         .expect("2 is invertible mod n");
@@ -107,7 +208,7 @@ fn k_half_n_minus_1_reconstructs_correctly() {
 
     let expected = ProjectivePoint::lincomb(&p1, &k_half, &p2, &k2);
     let got = lincomb2_with_oracle(&p1.to_affine(), &k_half, &p2.to_affine(), &k2, soft_oracle)
-        .expect("k=(n-1)/2 is not near-edge and must reconstruct correctly");
+        .expect("k=(n-1)/2 must reconstruct correctly");
     assert_eq!(got, expected.to_affine());
 }
 
@@ -130,54 +231,27 @@ fn cross_point_cancellation_falls_back() {
 }
 
 #[test]
-fn solve_y_rejects_inconsistent_oracle_xc() {
-    // Directly test that solve_y's lambda² == t check fires when xc is wrong.
-    // This is the oracle-misbehavior guard: it cannot easily be reached via
-    // lincomb2_with_oracle because the oracle is Fn (no mutable state to
-    // return xa correct and xc wrong in separate calls).
-    let (xp, yp) = affine_xy(&g_times(3).to_affine()).unwrap();
-    let k = Scalar::from(12345u64);
-
-    let xa = soft_oracle(&xp, &k).unwrap();
-    let xc_correct = soft_oracle(&xp, &(k + Scalar::ONE)).unwrap();
-    // xc from k+100 is inconsistent with xa from k — lambda²=t must reject it.
-    let xc_wrong = soft_oracle(&xp, &(k + Scalar::from(100u64))).unwrap();
-
-    let dx = (xa - xp).normalize();
-    let inv_den = Option::<FieldElement>::from((yp.double() * dx).invert())
-        .expect("dx is nonzero for k=12345");
-
-    assert!(
-        solve_y(&xp, &yp, &xa, &xc_correct, &dx, &inv_den).is_some(),
-        "correct xc must pass the lambda² check"
-    );
-    assert!(
-        solve_y(&xp, &yp, &xa, &xc_wrong, &dx, &inv_den).is_none(),
-        "inconsistent xc (oracle misbehavior) must be rejected by the lambda² check"
-    );
-}
-
-#[test]
 fn odd_y_base_point_reconstructs_correctly() {
-    // Validates the solve_y sign-selection argument: when P1 has odd y the
-    // reconstruction must still match ProjectivePoint::lincomb.
-    let (p1, _k_gen) = (2u64..200)
+    // A base point with odd y exercises the fix-up from the other side: the caller's own y
+    // is the odd root, so the canonical-lift oracle is the one that comes back negated.
+    let p1 = (2u64..200)
         .find_map(|n| {
             let p = g_times(n);
             let (_, y) = affine_xy(&p.to_affine())?;
-            if y.normalize().to_bytes()[31] & 1 == 1 {
-                Some((p, n))
-            } else {
-                None
-            }
+            is_odd(&y).then_some(p)
         })
         .expect("at least one of the first 200 multiples of G has odd y");
 
     let p2 = g_times(13);
     let k1 = Scalar::from(54321u64);
     let k2 = Scalar::from(11111u64);
-    let expected = ProjectivePoint::lincomb(&p1, &k1, &p2, &k2);
-    let got = lincomb2_with_oracle(&p1.to_affine(), &k1, &p2.to_affine(), &k2, soft_oracle)
-        .expect("odd-y base point is non-degenerate and must reconstruct correctly");
-    assert_eq!(got, expected.to_affine());
+    let expected = ProjectivePoint::lincomb(&p1, &k1, &p2, &k2).to_affine();
+    for oracle in [
+        soft_oracle as fn(&FieldElement, &Scalar) -> _,
+        soft_oracle_odd as fn(&FieldElement, &Scalar) -> _,
+    ] {
+        let got = lincomb2_with_oracle(&p1.to_affine(), &k1, &p2.to_affine(), &k2, oracle)
+            .expect("odd-y base point is non-degenerate and must reconstruct correctly");
+        assert_eq!(got, expected);
+    }
 }
