@@ -11,7 +11,18 @@ use crate::tables::commit::{bus_interactions as commit_buses, cols::NUM_COLUMNS 
 use crate::tables::cpu::{bus_interactions as cpu_buses, cols::NUM_COLUMNS as CPU_COLS};
 use crate::tables::decode::{bus_interactions as decode_buses, cols::NUM_COLUMNS as DECODE_COLS};
 use crate::tables::dvrm::{bus_interactions as dvrm_buses, cols::NUM_COLUMNS as DVRM_COLS};
+use crate::tables::ecdas::{bus_interactions as ecdas_buses, cols::NUM_COLUMNS as ECDAS_COLS};
+use crate::tables::ecsm::{bus_interactions as ecsm_buses, cols::NUM_COLUMNS as ECSM_COLS};
 use crate::tables::halt::{bus_interactions as halt_buses, cols::NUM_COLUMNS as HALT_COLS};
+use crate::tables::hint::{bus_interactions as hint_buses, cols::NUM_COLUMNS as HINT_COLS};
+use crate::tables::keccak::{bus_interactions as keccak_buses, cols::NUM_COLUMNS as KECCAK_COLS};
+use crate::tables::keccak_rc::{
+    NUM_ROWS as KECCAK_RC_ROWS, bus_interactions as keccak_rc_buses,
+    cols::NUM_COLUMNS as KECCAK_RC_COLS,
+};
+use crate::tables::keccak_rnd::{
+    bus_interactions as keccak_rnd_buses, cols::NUM_COLUMNS as KECCAK_RND_COLS,
+};
 use crate::tables::load::{bus_interactions as load_buses, cols::NUM_COLUMNS as LOAD_COLS};
 use crate::tables::lt::{bus_interactions as lt_buses, cols::NUM_COLUMNS as LT_COLS};
 use crate::tables::memw::{bus_interactions as memw_buses, cols::NUM_COLUMNS as MEMW_COLS};
@@ -109,6 +120,7 @@ fn table_specs(lengths: &TableLengths) -> Vec<TableSpec> {
     let bitwise_rows = BITWISE_ROWS as u64;
     let register_rows = NUM_REGISTER_ADDRESSES.next_power_of_two() as u64;
     let halt_rows = 1u64;
+    let keccak_rc_rows = KECCAK_RC_ROWS as u64;
     let page_rows = PAGE_SIZE as u64;
 
     let mut specs = vec![
@@ -176,6 +188,44 @@ fn table_specs(lengths: &TableLengths) -> Vec<TableSpec> {
             lengths.commit_padded_rows,
             COMMIT_COLS as u64,
             aux_cols(commit_buses().len()),
+            1,
+        ),
+        // Accelerator chips. Wide and driven by guest data, so leaving them out
+        // under-projects any keccak- or ECSM-heavy program.
+        (
+            lengths.keccak_padded_rows,
+            KECCAK_COLS as u64,
+            aux_cols(keccak_buses().len()),
+            1,
+        ),
+        (
+            lengths.keccak_rnd_padded_rows,
+            KECCAK_RND_COLS as u64,
+            aux_cols(keccak_rnd_buses().len()),
+            1,
+        ),
+        (
+            keccak_rc_rows,
+            KECCAK_RC_COLS as u64,
+            aux_cols(keccak_rc_buses().len()),
+            2,
+        ),
+        (
+            lengths.ecsm_padded_rows,
+            ECSM_COLS as u64,
+            aux_cols(ecsm_buses().len()),
+            1,
+        ),
+        (
+            lengths.ecdas_padded_rows,
+            ECDAS_COLS as u64,
+            aux_cols(ecdas_buses().len()),
+            1,
+        ),
+        (
+            lengths.hint_padded_rows,
+            HINT_COLS as u64,
+            aux_cols(hint_buses().len()),
             1,
         ),
         // BITWISE / DECODE / PAGE / REGISTER take the preprocessed-trace commit
