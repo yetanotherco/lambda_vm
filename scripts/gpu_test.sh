@@ -3,11 +3,12 @@
 # gpu_test.sh — run the CUDA-only test groups on a GPU box.
 #
 # Exercises the CUDA path, which CPU CI can't (GitHub runners have no GPU):
-#   1. math-cuda kernel parity         (make test-math-cuda)
-#   2. end-to-end GPU dispatch + proof  (make test-cuda-integration)
-#   3. GPU error-path / CPU fallback    (make test-cuda-fallback)
-#   4. prover/stark/crypto/ecsm suite   (make test-prover-cuda) — CPU CI's prover tests on GPU
-#   5. comprehensive all-instructions   (make test-prover-comprehensive-cuda)
+#   1. math-cuda kernel parity          (make test-math-cuda)
+#   2. end-to-end GPU dispatch + proof   (make test-cuda-integration)
+#   3. num_parts==1 (DECODE) device path (make test-cuda-d1)
+#   4. GPU error-path / CPU fallback     (make test-cuda-fallback)
+#   5. prover/stark/crypto/ecsm suite    (make test-prover-cuda) — CPU CI's prover tests on GPU
+#   6. comprehensive all-instructions    (make test-prover-comprehensive-cuda)
 #
 # Runs on the rented Vast box from the gpu-tests.yml merge-queue workflow. All groups
 # run even if one fails (so the log shows every failure); the script exits non-zero if ANY
@@ -41,7 +42,7 @@ nvidia-smi --query-gpu=name,driver_version,compute_cap --format=csv,noheader
 
 # --- Build the guest ELFs the tests prove ---------------------------------------
 # math-cuda parity needs none; cuda_path_integration / cuda_fallback prove an asm ELF; the
-# prover suite (Groups 4 & 5) proves asm AND rust guests. Build both up front.
+# prover suite (Groups 5 & 6) proves asm AND rust guests. Build both up front.
 log "compiling guest programs (asm + rust)"
 make compile-programs-asm
 make compile-programs-rust
@@ -57,9 +58,10 @@ run() {  # $1 = make target
 }
 run test-math-cuda                  # Group 1: kernel parity
 run test-cuda-integration           # Group 2: end-to-end GPU dispatch + proof verifies
-run test-cuda-fallback              # Group 3: GPU error -> CPU fallback still verifies
-run test-prover-cuda                # Group 4: prover/stark/crypto/ecsm suite on the GPU path
-run test-prover-comprehensive-cuda  # Group 5: comprehensive all-instructions prove on GPU
+run test-cuda-d1                    # Group 3: num_parts==1 (DECODE) device DEEP/FRI + verify
+run test-cuda-fallback              # Group 4: GPU error -> CPU fallback still verifies
+run test-prover-cuda                # Group 5: prover/stark/crypto/ecsm suite on the GPU path
+run test-prover-comprehensive-cuda  # Group 6: comprehensive all-instructions prove on GPU
 
 if [ "$fail" -ne 0 ]; then
     log "FAILED — one or more GPU test groups failed"
