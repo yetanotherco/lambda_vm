@@ -49,7 +49,7 @@ use super::epoch_tests::EpochInputs;
 use super::executor::execute;
 use super::instr::Instr;
 use super::proof::{LfmProveError, lfm_prove, lfm_prove_with_residency, verify_against};
-use super::registry::build_artifacts;
+use super::registry::{build_artifacts, build_artifacts_with_hasher};
 
 use crate::tables::types::FE;
 
@@ -398,7 +398,7 @@ fn the_wrap_reports_gpu_counters() {
     let program = super::epoch_tests::epoch_program(&e, true);
     let arenas = super::epoch_tests::epoch_arena_words(&e, true);
     let opts = wrap_options();
-    let artifacts = build_artifacts(&program, &opts);
+    let artifacts = build_artifacts_with_hasher(&program, &opts, crate::hash_pin::BLOCK_HASHER);
     println!("   chip log-heights: {:?}", artifacts.log_heights);
 
     g::reset_all_gpu_call_counters();
@@ -589,7 +589,7 @@ fn wrap_run_from(inner: ProofOptions, inputs: EpochInputs) {
     report_ratio(&e, main, aux);
 
     let opts = wrap_options();
-    let artifacts = build_artifacts(&program, &opts);
+    let artifacts = build_artifacts_with_hasher(&program, &opts, crate::hash_pin::BLOCK_HASHER);
     println!(
         "   wrap options: blowup {}, {} queries, grinding {}\n   chip log-heights: {:?}",
         opts.blowup_factor, opts.fri_number_of_queries, opts.grinding_factor, artifacts.log_heights
@@ -768,7 +768,7 @@ fn the_wrap_commitments_match_across_residency_modes() {
     let program = super::epoch_tests::epoch_program(&e, true);
     let arenas = super::epoch_tests::epoch_arena_words(&e, true);
     let opts = wrap_options();
-    let artifacts = build_artifacts(&program, &opts);
+    let artifacts = build_artifacts_with_hasher(&program, &opts, crate::hash_pin::BLOCK_HASHER);
 
     let prove_under = |residency: ResidencyMode| {
         let t = Instant::now();
@@ -1447,7 +1447,7 @@ fn batched_wrap_run_from(inner: ProofOptions, inputs: EpochInputs) {
     );
 
     let opts = wrap_options();
-    let artifacts = build_artifacts(&program, &opts);
+    let artifacts = build_artifacts_with_hasher(&program, &opts, crate::hash_pin::BLOCK_HASHER);
     println!(
         "   wrap options: blowup {}, {} queries, grinding {}\n   chip log-heights: {:?}",
         opts.blowup_factor, opts.fri_number_of_queries, opts.grinding_factor, artifacts.log_heights
@@ -1610,7 +1610,7 @@ fn the_fixture_continuation_epoch_wraps_batched_from_proofs() {
     arenas.push(super::epoch_verify_tests::batched_opening_arena(&e));
     arenas.push(super::epoch_verify_tests::batched_fri_arena(&e));
     let opts = wrap_options();
-    let artifacts = build_artifacts(&program, &opts);
+    let artifacts = build_artifacts_with_hasher(&program, &opts, crate::hash_pin::BLOCK_HASHER);
 
     let proved =
         lfm_prove(&program, &artifacts, &arenas, &opts).expect("the carved wrap must prove");
@@ -1693,7 +1693,7 @@ fn the_from_proof_final_epoch_wraps() {
     let program = super::epoch_tests::epoch_program(&e, true);
     let arenas = super::epoch_tests::epoch_arena_words(&e, true);
     let opts = wrap_options();
-    let artifacts = build_artifacts(&program, &opts);
+    let artifacts = build_artifacts_with_hasher(&program, &opts, crate::hash_pin::BLOCK_HASHER);
 
     let t = Instant::now();
     let proved = lfm_prove(&program, &artifacts, &arenas, &opts).expect("the wrap must prove");
@@ -1847,7 +1847,8 @@ fn the_real_block_proves_and_wraps_end_to_end() {
         .unwrap_or_else(|err| panic!("epoch {i} must reconstruct from the bundle: {err}"));
         let program = super::epoch_tests::epoch_program(&e, true);
         let arenas = super::epoch_tests::epoch_arena_words(&e, true);
-        let artifacts = build_artifacts(&program, &wrap_opts);
+        let artifacts =
+            build_artifacts_with_hasher(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
         let c = t.elapsed().as_secs_f64();
         construct_secs += c;
 
@@ -2049,7 +2050,8 @@ fn the_real_block_proves_and_wraps_end_to_end_batched() {
         let mut arenas = super::epoch_tests::batched_epoch_arenas(&e);
         arenas.push(super::epoch_verify_tests::batched_opening_arena(&e));
         arenas.push(super::epoch_verify_tests::batched_fri_arena(&e));
-        let artifacts = build_artifacts(&program, &wrap_opts);
+        let artifacts =
+            build_artifacts_with_hasher(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
         let c = t.elapsed().as_secs_f64();
         construct_secs += c;
 

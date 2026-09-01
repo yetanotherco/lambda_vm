@@ -36,7 +36,7 @@ use super::epoch::RootCells;
 use super::executor::execute;
 use super::instr::ArenaId;
 use super::proof::{BatchedLfmProof, aggregation_wrap_options, verify_against_batched};
-use super::registry::{LfmArtifacts, build_artifacts};
+use super::registry::{LfmArtifacts, build_artifacts_with_hasher};
 use super::statement::{LFM_MACHINE_VERSION, LFM_STATEMENT_TAG, absorb_lfm_statement};
 use super::transcript_replay::{Candidate, TranscriptReplay, assert_canonical, candidate_to_felt};
 use super::word::{LfmWord, base_word, ext_word};
@@ -1679,7 +1679,7 @@ fn fixture_leg() -> (RealBatchedLfm, LfmProgram) {
 
     let opts = aggregation_wrap_options();
     let program = trivial_program();
-    let artifacts = build_artifacts(&program, &opts);
+    let artifacts = build_artifacts_with_hasher(&program, &opts, crate::hash_pin::BLOCK_HASHER);
     let arenas: Vec<Vec<LfmWord>> = vec![
         (0..4u64)
             .map(|i| core::array::from_fn(|j| FE::from(1_000 * (i + 1) + j as u64)))
@@ -1877,7 +1877,7 @@ fn fixture_wraps() -> (
         let mut arenas = super::epoch_tests::batched_epoch_arenas(&e);
         arenas.push(super::epoch_verify_tests::batched_opening_arena(&e));
         arenas.push(super::epoch_verify_tests::batched_fri_arena(&e));
-        let artifacts = build_artifacts(&program, &opts);
+        let artifacts = build_artifacts_with_hasher(&program, &opts, crate::hash_pin::BLOCK_HASHER);
         let proved = match lfm_prove_batched(&program, &artifacts, &arenas, &opts) {
             Ok(p) => p,
             Err(e) => {
@@ -1925,7 +1925,7 @@ fn fixture_aggregate() -> FixtureAggregate {
     let g = real_global(&elf_bytes, &bundle, &inner);
     let program = global_verifier_program(&g);
     let arenas = global_arena_words(&g);
-    let artifacts = build_artifacts(&program, &opts);
+    let artifacts = build_artifacts_with_hasher(&program, &opts, crate::hash_pin::BLOCK_HASHER);
     let proved = lfm_prove_batched(&program, &artifacts, &arenas, &opts)
         .expect("the global wrap must prove batched at the aggregation preset");
     let global_wrap = real_batched_lfm(artifacts, opts, &proved);
@@ -2195,7 +2195,7 @@ fn the_aggregate_leg_census_matches_the_closed_form() {
 
     let opts = aggregation_wrap_options();
     let program = trivial_program();
-    let artifacts = build_artifacts(&program, &opts);
+    let artifacts = build_artifacts_with_hasher(&program, &opts, crate::hash_pin::BLOCK_HASHER);
     let arenas: Vec<Vec<LfmWord>> = vec![
         (0..4u64)
             .map(|i| core::array::from_fn(|j| FE::from(1_000 * (i + 1) + j as u64)))
@@ -2420,7 +2420,8 @@ fn the_real_block_aggregates_end_to_end() {
         let mut arenas = super::epoch_tests::batched_epoch_arenas(&e);
         arenas.push(super::epoch_verify_tests::batched_opening_arena(&e));
         arenas.push(super::epoch_verify_tests::batched_fri_arena(&e));
-        let artifacts = build_artifacts(&program, &agg_opts);
+        let artifacts =
+            build_artifacts_with_hasher(&program, &agg_opts, crate::hash_pin::BLOCK_HASHER);
         let wrap_file = format!("wrap_{k}.rkyv");
         let cached = cache_path(&wrap_file).is_some_and(|p| p.exists());
         let tp = Instant::now();
@@ -2454,7 +2455,8 @@ fn the_real_block_aggregates_end_to_end() {
     let g = real_global(&inputs.elf_bytes, &bundle, &inner);
     let g_program = global_verifier_program(&g);
     let g_arenas = global_arena_words(&g);
-    let g_artifacts = build_artifacts(&g_program, &agg_opts);
+    let g_artifacts =
+        build_artifacts_with_hasher(&g_program, &agg_opts, crate::hash_pin::BLOCK_HASHER);
     let g_cached = cache_path("global_wrap.rkyv").is_some_and(|p| p.exists());
     let tp = Instant::now();
     let g_proved = if g_cached {
@@ -2583,7 +2585,8 @@ fn the_real_block_aggregates_end_to_end() {
         Err(_) => agg_opts.clone(),
     };
     let t = Instant::now();
-    let agg_artifacts = build_artifacts(&program, &terminal_opts);
+    let agg_artifacts =
+        build_artifacts_with_hasher(&program, &terminal_opts, crate::hash_pin::BLOCK_HASHER);
     println!(
         "   aggregation artifacts built in {:.1}s",
         t.elapsed().as_secs_f64()
