@@ -98,7 +98,7 @@ pub struct RuntimePageRange {
 /// degree stays 3, the composition poly never exceeds the LDE domain, so the
 /// inflated arms are NOT bound by `max_degree <= blowup + 1` and can all run at
 /// a fixed blowup.
-pub const VM_MAX_DEGREE: usize = 3;
+pub const VM_MAX_DEGREE: usize = 7;
 
 pub const FIXED_TABLE_COUNT: usize = 10;
 
