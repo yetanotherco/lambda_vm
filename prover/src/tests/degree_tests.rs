@@ -12,6 +12,14 @@
 //! So degree widens the leaf but does not lengthen the walk. This test measures
 //! that split directly via the `hash-count` counters.
 //!
+//! ⚠ The hash counters are process-global atomics, and the prover/verifier hash
+//! on rayon worker threads, so a second test running concurrently in the same
+//! process corrupts the reading (measured: 158,730 → 655,613 permutations when
+//! the prove tests ran alongside). Always select the counting test EXACTLY —
+//! `degree_cost_verifier_hashes` — and never with a prefix that also matches
+//! the prove arms. The prove arms are deliberately named `degree_prove_*` so
+//! that a `degree_cost` filter cannot catch them.
+//!
 //! Sweep the arms with the `VM_MAX_DEGREE` constant (crate root) and the
 //! `LVM_DEGREE_BLOWUP` env var. Requires `--features hash-count`; counting is
 //! deterministic, so one run is an exact reading.
@@ -48,6 +56,64 @@ fn arm_options() -> ProofOptions {
     GoldilocksCubicProofOptions::with_blowup(blowup).expect("valid blowup")
 }
 
+
+/// Number of degree-lane measurement arms currently running in this process.
+///
+/// The hash counters are process-global and the prover hashes on rayon workers,
+/// so a concurrently running arm silently corrupts a reading. This turns that
+/// into a loud failure: every arm registers itself, and the counting arm
+/// asserts it is alone. Verified to fire — running the three arms together
+/// under one filter trips it, and the corrupt reading it prevents was
+/// 551,944 permutations against a true 158,730.
+static ACTIVE_ARMS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+struct ArmGuard;
+
+impl ArmGuard {
+    fn enter() -> Self {
+        ACTIVE_ARMS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self
+    }
+    /// Assert this arm has the process to itself. Must be checked at BOTH ends
+    /// of the measured window, not just at test entry: pollution happens when
+    /// another arm hashes *between* the counter reset and the read, which an
+    /// entry-only check cannot see.
+    fn assert_exclusive(&self, when: &str) {
+        let n = ACTIVE_ARMS.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            n, 1,
+            "degree-lane ({when}): {n} measurement arms are running concurrently, \
+             so the process-global hash counters are corrupted. Select exactly one \
+             arm (e.g. `degree_cost_verifier_hashes`) and run with --test-threads=1."
+        );
+    }
+}
+
+impl Drop for ArmGuard {
+    fn drop(&mut self) {
+        ACTIVE_ARMS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// The workload for this arm. `LVM_DEGREE_ELF_PATH` takes an arbitrary ELF
+/// (real-scale programs live outside `program_artifacts/asm`);
+/// `LVM_DEGREE_ELF` names one of the asm artifacts. Taller traces mean deeper
+/// Merkle trees, which shifts the balance between the per-query part cost and
+/// the per-query-per-level path cost.
+fn arm_elf() -> (String, Vec<u8>) {
+    if let Ok(path) = std::env::var("LVM_DEGREE_ELF_PATH") {
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+        let name = std::path::Path::new(&path)
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.clone());
+        return (name, bytes);
+    }
+    let name = std::env::var("LVM_DEGREE_ELF").unwrap_or_else(|_| "sub".to_string());
+    let bytes = crate::test_utils::asm_elf_bytes(&name);
+    (name, bytes)
+}
+
 fn build_airs(
     elf: &Elf,
     opts: &ProofOptions,
@@ -70,7 +136,7 @@ fn build_airs(
 
 /// Prove `elf` under this arm's options, then verify with the hash counters
 /// reset so the reading is the VERIFIER's work alone.
-fn measure_arm(elf_bytes: &[u8], label: &str) {
+fn measure_arm(elf_bytes: &[u8], label: &str, guard: &ArmGuard) {
     let opts = arm_options();
     let elf = Elf::load(elf_bytes).expect("ELF load");
     let executor = Executor::new(&elf, Vec::new()).expect("executor");
@@ -137,6 +203,7 @@ fn measure_arm(elf_bytes: &[u8], label: &str) {
     )
     .expect("bus balance");
 
+    guard.assert_exclusive("before reset");
     #[cfg(feature = "hash-count")]
     crypto::hash_count::reset();
 
@@ -151,6 +218,8 @@ fn measure_arm(elf_bytes: &[u8], label: &str) {
     #[cfg(feature = "hash-count")]
     {
         let (leaf_hashes, leaf_bytes, parent_hashes, perms) = crypto::hash_count::read();
+        // The load-bearing check: nothing else hashed during the window.
+        guard.assert_exclusive("after read");
         println!(
             "DEGREECOST label={label} vm_max_degree={} blowup={} queries={} tables={} \
              parts_per_table={} total_parts={} \
@@ -233,9 +302,9 @@ fn measure_prove_arm(elf_bytes: &[u8], label: &str) {
 
 #[test]
 #[ignore = "degree-lane experiment; run explicitly"]
-fn degree_cost_prove() {
-    let name = std::env::var("LVM_DEGREE_ELF").unwrap_or_else(|_| "sub".to_string());
-    let elf = crate::test_utils::asm_elf_bytes(&name);
+fn degree_prove_volume() {
+    let _guard = ArmGuard::enter();
+    let (name, elf) = arm_elf();
     let reps: usize = std::env::var("LVM_DEGREE_REPS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -248,12 +317,10 @@ fn degree_cost_prove() {
 #[test]
 #[ignore = "degree-lane experiment; run explicitly"]
 fn degree_cost_verifier_hashes() {
-    // `LVM_DEGREE_ELF` picks the workload; taller traces mean deeper Merkle
-    // trees, which shifts the balance between parts (per query) and path
-    // hashing (per query per level).
-    let name = std::env::var("LVM_DEGREE_ELF").unwrap_or_else(|_| "sub".to_string());
-    let elf = crate::test_utils::asm_elf_bytes(&name);
-    measure_arm(&elf, &name);
+    let guard = ArmGuard::enter();
+    guard.assert_exclusive("at entry");
+    let (name, elf) = arm_elf();
+    measure_arm(&elf, &name, &guard);
 }
 
 /// Full production prove path (`prove_with_options`), which emits the
@@ -265,9 +332,9 @@ fn degree_cost_verifier_hashes() {
 /// One arm per process. Run under `/usr/bin/time -v` for peak RSS.
 #[test]
 #[ignore = "degree-lane experiment; run explicitly"]
-fn degree_cost_prove_instrumented() {
-    let name = std::env::var("LVM_DEGREE_ELF").unwrap_or_else(|_| "sub".to_string());
-    let elf = crate::test_utils::asm_elf_bytes(&name);
+fn degree_prove_instrumented() {
+    let _guard = ArmGuard::enter();
+    let (name, elf) = arm_elf();
     let opts = arm_options();
     let max_rows = MaxRowsConfig::default();
 

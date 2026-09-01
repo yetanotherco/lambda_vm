@@ -69,7 +69,7 @@ pub mod ood_window_ir_tests;
 #[cfg(test)]
 pub mod page_tests;
 #[cfg(test)]
-pub mod degree_cost_tests;
+pub mod degree_tests;
 pub mod prove_elfs_tests;
 #[cfg(test)]
 pub mod recursion_smoke_test;

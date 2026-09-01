@@ -129,6 +129,14 @@ verifier-only.
 Counting is deterministic ⇒ **one run is an exact integer**; no replicates, no spread
 to report. This is why the verifier half of this document needed zero box time.
 
+⚠ **The counters are process-global and the prover hashes on rayon workers**, so a
+second arm running concurrently corrupts the reading — silently, and by a lot
+(551,944 permutations against a true 158,730). An `ArmGuard` now asserts exclusivity
+at **both ends of the measured window**; an entry-only check was written first and
+mutation-testing showed it did not fire, because the pollution lands *between* the
+reset and the read. The two-point check fired on 3 of 3 polluted runs and passes when
+an arm runs alone. Every number in §3.2 was produced by a single-arm run.
+
 ---
 
 ## 3. The verifier cost of degree — measured
@@ -385,5 +393,5 @@ trap to avoid — external measurement sidesteps it.
 | `prover/src/lib.rs` `VM_MAX_DEGREE` | one knob behind all ten tables; read by prover *and* guest verifier |
 | `crypto/crypto/src/hash_count.rs` | leaf/parent/permutation counters, `hash-count` feature |
 | `crypto/stark/src/prover.rs` `LVM_FORCE_GENERIC_PARTS` | routes 2 parts through the generic path (mutation-tested) |
-| `prover/src/tests/degree_cost_tests.rs` | the measurement arms |
+| `prover/src/tests/degree_tests.rs` | the measurement arms + the exclusivity guard |
 | `crypto/stark/src/tests/air_tests.rs` | `true_degree_vs_blowup_bound`, `degree_probe_parts_vs_blowup` |
