@@ -20,10 +20,10 @@ use stark::lookup::{
 };
 use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};
 use stark::proof::view::MultiProofView;
-use stark::prover::{IsStarkProver, Prover};
+use stark::prover::IsStarkProver;
 use stark::trace::TraceTable;
 use stark::traits::AIR;
-use stark::verifier::{IsStarkVerifier, Verifier};
+use stark::verifier::IsStarkVerifier;
 
 use crate::tables::types::{FE, FEE, GoldilocksExtension, GoldilocksField};
 
@@ -113,8 +113,8 @@ fn prep_root(opts: &ProofOptions) -> Commitment {
     commit_columns(&[values(), vec![FE::one(); NUM_ROWS]], opts)
 }
 
-fn transcript() -> DefaultTranscript<E> {
-    let mut t = DefaultTranscript::<E>::new(&[]);
+fn transcript() -> crate::hash_pin::BlockTranscript {
+    let mut t = crate::hash_pin::block_transcript(&[]);
     t.append_bytes(PROBE_TAG);
     t
 }
@@ -128,7 +128,7 @@ fn prove(
     let pairs: Vec<(DynAir, &mut TraceTable<F, E>, &())> =
         vec![(sender, &mut st, &()), (receiver, &mut rt, &())];
     let mut t = transcript();
-    Prover::multi_prove(
+    crate::hash_pin::BlockProver::multi_prove(
         pairs,
         &mut t,
         #[cfg(feature = "disk-spill")]
@@ -148,7 +148,7 @@ fn b0_preprocessed_multiplicity_round_trips() {
     let refs: Vec<DynAir> = vec![&sender, &receiver];
     let mut vt = transcript();
     assert!(
-        Verifier::multi_verify_views(&refs, MultiProofView::Owned(&proof), &mut vt, &FEE::zero(),),
+        crate::hash_pin::BlockVerifier::multi_verify_views(&refs, MultiProofView::Owned(&proof), &mut vt, &FEE::zero(),),
         "honest proof must verify"
     );
 }
@@ -180,7 +180,7 @@ fn b0_verifier_rejects_wrong_preprocessed_root() {
     let refs: Vec<DynAir> = vec![&bad_sender, &receiver];
     let mut vt = transcript();
     assert!(
-        !Verifier::multi_verify_views(&refs, MultiProofView::Owned(&proof), &mut vt, &FEE::zero(),),
+        !crate::hash_pin::BlockVerifier::multi_verify_views(&refs, MultiProofView::Owned(&proof), &mut vt, &FEE::zero(),),
         "a supplied root differing from the proof's must reject"
     );
 }
@@ -200,7 +200,7 @@ fn b0_tampered_witness_value_breaks_balance() {
     let pairs: Vec<(DynAir, &mut TraceTable<F, E>, &())> =
         vec![(&sender, &mut st, &()), (&receiver, &mut rt, &())];
     let mut t = transcript();
-    let proof = Prover::multi_prove(
+    let proof = crate::hash_pin::BlockProver::multi_prove(
         pairs,
         &mut t,
         #[cfg(feature = "disk-spill")]
@@ -212,7 +212,7 @@ fn b0_tampered_witness_value_breaks_balance() {
     let refs: Vec<DynAir> = vec![&sender, &receiver];
     let mut vt = transcript();
     assert!(
-        !Verifier::multi_verify_views(&refs, MultiProofView::Owned(&proof), &mut vt, &FEE::zero(),),
+        !crate::hash_pin::BlockVerifier::multi_verify_views(&refs, MultiProofView::Owned(&proof), &mut vt, &FEE::zero(),),
         "unbalanced bus must reject"
     );
 }

@@ -35,7 +35,7 @@ use stark::lookup::{AirWithBuses, AuxiliaryTraceBuildData};
 use stark::proof::options::ProofOptions;
 use stark::proof::view::{MultiProofView, StarkProofView};
 use stark::traits::AIR;
-use stark::verifier::{IsStarkVerifier, Verifier};
+use stark::verifier::IsStarkVerifier;
 
 use crate::VmProof;
 use crate::tables::MaxRowsConfig;
@@ -84,7 +84,7 @@ fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
     // Build air_trace_pairs for all tables
     let air_trace_pairs = airs.air_trace_pairs(traces);
 
-    let multi_proof = match multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[]))
+    let multi_proof = match multi_prove_ram(air_trace_pairs, &mut crate::hash_pin::block_transcript(&[]))
     {
         Ok(proof) => proof,
         Err(_) => return false,
@@ -107,10 +107,10 @@ fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
     .expect("fingerprint collision in test");
 
     // Verify using centralized air_refs() which includes all tables
-    Verifier::multi_verify_views(
+    crate::hash_pin::BlockVerifier::multi_verify_views(
         &airs.air_refs(),
         &views,
-        &mut DefaultTranscript::<E>::new(&[]),
+        &mut crate::hash_pin::block_transcript(&[]),
         &expected_bus_balance,
     )
 }
@@ -143,7 +143,7 @@ fn prove_vm_minimal(elf_bytes: &[u8], private_inputs: &[u8], max_rows: &MaxRowsC
     let runtime_page_ranges = traces.runtime_page_ranges();
     let proof = multi_prove_ram(
         airs.air_trace_pairs(&mut traces),
-        &mut DefaultTranscript::<E>::new(&[]),
+        &mut crate::hash_pin::block_transcript(&[]),
     )
     .expect("prove");
     let num_private_input_pages = traces
@@ -201,10 +201,10 @@ fn verify_vm_minimal(vm_proof: &VmProof, elf_bytes: &[u8]) -> bool {
         &mut replay_transcript,
     )
     .expect("fingerprint collision in test");
-    Verifier::multi_verify_views(
+    crate::hash_pin::BlockVerifier::multi_verify_views(
         &air_refs,
         &views,
-        &mut DefaultTranscript::<E>::new(&[]),
+        &mut crate::hash_pin::block_transcript(&[]),
         &expected_bus_balance,
     )
 }
@@ -255,15 +255,15 @@ fn test_cpu_only_no_bus() {
         _,
     )> = vec![(&cpu_air, &mut cpu_trace, &())];
 
-    let multi_proof = multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[]))
+    let multi_proof = multi_prove_ram(air_trace_pairs, &mut crate::hash_pin::block_transcript(&[]))
         .expect("Prover failed");
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = vec![&cpu_air];
     assert!(
-        Verifier::multi_verify(
+        crate::hash_pin::BlockVerifier::multi_verify(
             &airs,
             &multi_proof,
-            &mut DefaultTranscript::<E>::new(&[]),
+            &mut crate::hash_pin::block_transcript(&[]),
             &FieldElement::zero(),
         ),
         "CPU-only verification failed"
@@ -1919,7 +1919,7 @@ fn test_prove_elfs_test_commit_4_wrong_pages_rejected() {
     );
     let proof = multi_prove_ram(
         prover_airs.air_trace_pairs(&mut traces),
-        &mut DefaultTranscript::<E>::new(&[]),
+        &mut crate::hash_pin::block_transcript(&[]),
     )
     .expect("Prover failed");
 
@@ -1951,10 +1951,10 @@ fn test_prove_elfs_test_commit_4_wrong_pages_rejected() {
     )
     .expect("fingerprint collision in test");
 
-    let verified = Verifier::multi_verify_views(
+    let verified = crate::hash_pin::BlockVerifier::multi_verify_views(
         &verifier_air_refs,
         &views,
-        &mut DefaultTranscript::<E>::new(&[]),
+        &mut crate::hash_pin::block_transcript(&[]),
         &expected_bus_balance,
     );
     assert!(
@@ -2678,7 +2678,7 @@ fn test_deep_stack_runtime_pages_roundtrip() {
     );
     let proof = multi_prove_ram(
         prover_airs.air_trace_pairs(&mut traces),
-        &mut DefaultTranscript::<E>::new(&[]),
+        &mut crate::hash_pin::block_transcript(&[]),
     )
     .expect("Prover failed");
     // Verifier reconstructs from ELF + runtime_page_ranges hint
@@ -2710,10 +2710,10 @@ fn test_deep_stack_runtime_pages_roundtrip() {
     )
     .expect("fingerprint collision in test");
 
-    let verified = Verifier::multi_verify_views(
+    let verified = crate::hash_pin::BlockVerifier::multi_verify_views(
         &verifier_air_refs,
         &views,
-        &mut DefaultTranscript::<E>::new(&[]),
+        &mut crate::hash_pin::block_transcript(&[]),
         &expected_bus_balance,
     );
     assert!(
@@ -2755,7 +2755,7 @@ fn test_deep_stack_missing_pages_rejected() {
     );
     let proof = multi_prove_ram(
         prover_airs.air_trace_pairs(&mut traces),
-        &mut DefaultTranscript::<E>::new(&[]),
+        &mut crate::hash_pin::block_transcript(&[]),
     )
     .expect("Prover failed");
     // Verifier uses EMPTY runtime_page_ranges → missing stack/heap pages
@@ -2786,10 +2786,10 @@ fn test_deep_stack_missing_pages_rejected() {
     )
     .expect("fingerprint collision in test");
 
-    let verified = Verifier::multi_verify_views(
+    let verified = crate::hash_pin::BlockVerifier::multi_verify_views(
         &verifier_air_refs,
         &views,
-        &mut DefaultTranscript::<E>::new(&[]),
+        &mut crate::hash_pin::block_transcript(&[]),
         &expected_bus_balance,
     );
     assert!(
@@ -2866,7 +2866,7 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
     );
     let proof = multi_prove_ram(
         prover_airs.air_trace_pairs(&mut traces),
-        &mut DefaultTranscript::<E>::new(&[]),
+        &mut crate::hash_pin::block_transcript(&[]),
     )
     .expect("Prover failed");
     // Verifier reconstructs from ELF + runtime hint (ranges decoded to pages)
@@ -2898,10 +2898,10 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
     )
     .expect("fingerprint collision in test");
 
-    let verified = Verifier::multi_verify_views(
+    let verified = crate::hash_pin::BlockVerifier::multi_verify_views(
         &verifier_air_refs,
         &views,
-        &mut DefaultTranscript::<E>::new(&[]),
+        &mut crate::hash_pin::block_transcript(&[]),
         &expected_bus_balance,
     );
     assert!(
@@ -3079,15 +3079,15 @@ fn test_crafted_zero_count_proof_must_not_verify() {
         (airs.decode.as_ref(), &mut decode_trace, &()),
     ];
 
-    let proof = multi_prove_ram(pairs, &mut DefaultTranscript::<E>::new(&[]))
+    let proof = multi_prove_ram(pairs, &mut crate::hash_pin::block_transcript(&[]))
         .expect("Proof generation should succeed");
 
     assert_eq!(proof.proofs.len(), 2);
 
-    let verified = Verifier::multi_verify(
+    let verified = crate::hash_pin::BlockVerifier::multi_verify(
         &verifier_air_refs,
         &proof,
-        &mut DefaultTranscript::<E>::new(&[]),
+        &mut crate::hash_pin::block_transcript(&[]),
         &FieldElement::zero(),
     );
 
@@ -3546,7 +3546,7 @@ fn test_prove_first_epoch_without_halt() {
 
     let multi_proof = multi_prove_ram(
         airs.air_trace_pairs(&mut traces),
-        &mut DefaultTranscript::<E>::new(&[]),
+        &mut crate::hash_pin::block_transcript(&[]),
     )
     .expect("first epoch failed to prove");
 
@@ -3566,10 +3566,10 @@ fn test_prove_first_epoch_without_halt() {
     .expect("fingerprint collision in test");
 
     assert!(
-        Verifier::multi_verify_views(
+        crate::hash_pin::BlockVerifier::multi_verify_views(
             &airs.air_refs(),
             &views,
-            &mut DefaultTranscript::<E>::new(&[]),
+            &mut crate::hash_pin::block_transcript(&[]),
             &expected_bus_balance,
         ),
         "first epoch (HALT excluded) failed to verify"
@@ -3635,7 +3635,7 @@ fn test_prove_second_epoch_from_snapshot() {
 
     let multi_proof = multi_prove_ram(
         airs.air_trace_pairs(&mut traces),
-        &mut DefaultTranscript::<E>::new(&[]),
+        &mut crate::hash_pin::block_transcript(&[]),
     )
     .expect("second epoch failed to prove");
 
@@ -3655,10 +3655,10 @@ fn test_prove_second_epoch_from_snapshot() {
     .expect("fingerprint collision in test");
 
     assert!(
-        Verifier::multi_verify_views(
+        crate::hash_pin::BlockVerifier::multi_verify_views(
             &airs.air_refs(),
             &views,
-            &mut DefaultTranscript::<E>::new(&[]),
+            &mut crate::hash_pin::block_transcript(&[]),
             &expected_bus_balance,
         ),
         "second epoch (register init from snapshot) failed to verify"
@@ -3749,7 +3749,7 @@ fn test_epoch_proof_commits_l2g() {
     let mut pairs = airs.air_trace_pairs(&mut traces);
     pairs.push((&inert_l2g_air, &mut l2g_trace, &()));
 
-    let multi_proof = multi_prove_ram(pairs, &mut DefaultTranscript::<E>::new(&[]))
+    let multi_proof = multi_prove_ram(pairs, &mut crate::hash_pin::block_transcript(&[]))
         .expect("epoch proof with inert L2G failed to prove");
 
     let mut refs = airs.air_refs();
@@ -3771,10 +3771,10 @@ fn test_epoch_proof_commits_l2g() {
     .expect("fingerprint collision in test");
 
     assert!(
-        Verifier::multi_verify_views(
+        crate::hash_pin::BlockVerifier::multi_verify_views(
             &refs,
             &views,
-            &mut DefaultTranscript::<E>::new(&[]),
+            &mut crate::hash_pin::block_transcript(&[]),
             &expected_bus_balance,
         ),
         "epoch proof with inert L2G failed to verify"
@@ -3911,7 +3911,7 @@ fn test_continuation_pipeline_end_to_end() {
 
         let mut pairs = airs.air_trace_pairs(&mut traces);
         pairs.push((&inert_l2g_air, &mut l2g_trace, &()));
-        let multi_proof = multi_prove_ram(pairs, &mut DefaultTranscript::<E>::new(&[]))
+        let multi_proof = multi_prove_ram(pairs, &mut crate::hash_pin::block_transcript(&[]))
             .expect("epoch proof failed to prove");
 
         let mut refs = airs.air_refs();
@@ -3931,10 +3931,10 @@ fn test_continuation_pipeline_end_to_end() {
         )
         .expect("fingerprint collision in test");
         assert!(
-            Verifier::multi_verify_views(
+            crate::hash_pin::BlockVerifier::multi_verify_views(
                 &refs,
                 &views,
-                &mut DefaultTranscript::<E>::new(&[]),
+                &mut crate::hash_pin::block_transcript(&[]),
                 &expected_bus_balance,
             ),
             "epoch {i} failed to verify"
@@ -4054,7 +4054,7 @@ fn test_epoch_memory_bus_with_l2g_bookend() {
 
     let mut pairs = airs.air_trace_pairs(&mut traces);
     pairs.push((&l2g_air, &mut l2g_trace, &()));
-    let multi_proof = multi_prove_ram(pairs, &mut DefaultTranscript::<E>::new(&[]))
+    let multi_proof = multi_prove_ram(pairs, &mut crate::hash_pin::block_transcript(&[]))
         .expect("epoch with L2G memory bookend failed to prove");
 
     let mut refs = airs.air_refs();
@@ -4075,10 +4075,10 @@ fn test_epoch_memory_bus_with_l2g_bookend() {
     .expect("fingerprint collision in test");
 
     assert!(
-        Verifier::multi_verify_views(
+        crate::hash_pin::BlockVerifier::multi_verify_views(
             &refs,
             &views,
-            &mut DefaultTranscript::<E>::new(&[]),
+            &mut crate::hash_pin::block_transcript(&[]),
             &expected_bus_balance,
         ),
         "epoch Memory bus must balance with L2G bookend + PAGE excluding touched cells"
@@ -4290,7 +4290,7 @@ fn a_blake3_workload_claiming_no_blake3_table_is_rejected() {
     assert!(!airs.include_blake3, "the forged shape must omit the table");
 
     let pairs = airs.air_trace_pairs(&mut traces);
-    let proved = multi_prove_ram(pairs, &mut DefaultTranscript::<E>::new(&[]));
+    let proved = multi_prove_ram(pairs, &mut crate::hash_pin::block_transcript(&[]));
 
     let verified = match &proved {
         Err(_) => false,
@@ -4300,7 +4300,7 @@ fn a_blake3_workload_claiming_no_blake3_table_is_rejected() {
                 .iter()
                 .map(StarkProofView::Owned)
                 .collect();
-            let mut replay = DefaultTranscript::<E>::new(&[]);
+            let mut replay = crate::hash_pin::block_transcript(&[]);
             match crate::compute_expected_commit_bus_balance_view(
                 &airs.air_refs(),
                 &views,
@@ -4309,10 +4309,10 @@ fn a_blake3_workload_claiming_no_blake3_table_is_rejected() {
                 &mut replay,
             ) {
                 None => false,
-                Some(expected) => Verifier::multi_verify_views(
+                Some(expected) => crate::hash_pin::BlockVerifier::multi_verify_views(
                     &airs.air_refs(),
                     &views,
-                    &mut DefaultTranscript::<E>::new(&[]),
+                    &mut crate::hash_pin::block_transcript(&[]),
                     &expected,
                 ),
             }
@@ -4368,7 +4368,7 @@ fn the_blake3_count_is_bound_into_the_statement() {
     };
 
     let challenge_for = |counts: &crate::TableCounts| {
-        let mut t = DefaultTranscript::<E>::new(&[]);
+        let mut t = crate::hash_pin::block_transcript(&[]);
         absorb_statement(
             &mut t,
             StatementKind::Monolithic,

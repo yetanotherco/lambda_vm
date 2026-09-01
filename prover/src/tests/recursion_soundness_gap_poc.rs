@@ -22,7 +22,7 @@ use std::path::PathBuf;
 // honest proof it builds is rejected at challenge derivation. Same half-flip
 // `config.rs` warns about; the warning applies to test harnesses too.
 use stark::config::DefaultStarkTranscript as DefaultTranscript;
-use stark::prover::{IsStarkProver, Prover};
+use stark::prover::IsStarkProver;
 
 use crate::recursion::{MIN_PROOF_OPTIONS, precomputed_commitments};
 use crate::statement::{StatementKind, absorb_statement, elf_digest};
@@ -172,7 +172,7 @@ fn custom_prove_with_statement_elf(
         .filter(|c| c.is_private_input)
         .count();
 
-    let mut transcript = DefaultTranscript::<E>::new(&[]);
+    let mut transcript = crate::hash_pin::block_transcript(&[]);
     absorb_statement(
         &mut transcript,
         StatementKind::Monolithic,
@@ -184,7 +184,7 @@ fn custom_prove_with_statement_elf(
         opts.fri_final_poly_log_degree,
     );
 
-    let proof = Prover::multi_prove(
+    let proof = crate::hash_pin::BlockProver::multi_prove(
         airs.air_trace_pairs(&mut traces),
         &mut transcript,
         #[cfg(feature = "disk-spill")]
