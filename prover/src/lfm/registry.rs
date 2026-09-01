@@ -499,19 +499,25 @@ impl LfmArtifacts {
 /// root above moves with it and the tag on its own stops being the whole
 /// binding.
 pub fn build_artifacts(program: &LfmProgram, options: &ProofOptions) -> LfmArtifacts {
-    // ★ The block path's PINNED socket permutation, not `HasherKind::default()`.
+    // ⛔ **DEFAULTS TO `Test`, AND MUST.** The hasher is part of program
+    // IDENTITY — `HasherKind::as_tag` is folded into `lfm_program_id` — and
+    // `LFM_REGISTRY` is blessed under `compute_lfm_registry`'s
+    // `REGISTRY_HASHER = Test`, whose own doc calls changing it a re-blessing of
+    // the whole table rather than a re-run.
     //
-    // ⚠ The default is `Test`, a one-round toy, and under a BYTE hash that is
-    // free and correct: `ByteWrapHash::hash_bytes` lowers to the dedicated
-    // KECCAK / `LFM_BLAKE3` chips and emits no `Instr::Hash` at all, so the
-    // socket hasher is never consulted. The algebraic arm goes through
-    // `compress` / `permute`, which ARE `Instr::Hash` — so a program built here
-    // would be proved with the toy permutation while the host committed under
-    // RPO, and every digest downstream would be wrong. It surfaces as the
-    // grinding check refusing an honest nonce, naming nothing.
+    // ⚠ This entry point was briefly changed to name `hash_pin::BLOCK_HASHER`,
+    // to fix a real defect on the AGGREGATOR path where `lfm_prove_batched`
+    // inherited a toy permutation from a defaulted build. That fix was correct
+    // about the defect and wrong about its scope: it moved every registry
+    // program's identity away from the blessed table, and
+    // `rpo_chip_tests::the_rpo_choice_moves_the_program_digest_and_no_root`
+    // asserts this function defaults to `Test` in as many words.
     //
-    // On a byte pin this is `HasherKind::Test` and the call is unchanged.
-    build_artifacts_with_hasher(program, options, crate::hash_pin::BLOCK_HASHER)
+    // ★ The block path names its hasher AT THE CALL SITE
+    // ([`build_artifacts_with_hasher`]) instead. Registry programs pin a byte
+    // hash on their own builders, emit no `Instr::Hash`, and never consult the
+    // socket — they are correct at `Test` under every pin.
+    build_artifacts_with_hasher(program, options, HasherKind::default())
 }
 
 /// [`build_artifacts`] for a program proved under an explicitly chosen
