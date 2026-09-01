@@ -410,7 +410,7 @@ impl EcdasConstraints {
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for EcdasConstraints {
     // The Lambda ConvCarry has the op·(λ·Δx) term, making it degree 3.
     fn max_degree(&self) -> usize {
-        3
+        crate::VM_MAX_DEGREE
     }
 
     fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {

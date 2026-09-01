@@ -279,7 +279,7 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for CpuConstraints {
     // The conditional ADD/SUB carry pairs, arg2 exclusivity, mem-flags bit and
     // branch constraints are degree 3.
     fn max_degree(&self) -> usize {
-        3
+        crate::VM_MAX_DEGREE
     }
 
     fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {

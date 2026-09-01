@@ -15,6 +15,26 @@ use crate::{
 };
 use math::field::{element::FieldElement, traits::IsFFTField};
 
+/// DEGREE-LANE EXPERIMENT HOOK (temporary, not for merge).
+///
+/// Number of composition-polynomial parts this AIR advertises. The prover and
+/// verifier both derive the part count as
+/// `composition_poly_degree_bound(N) / N`, so overriding it here inflates the
+/// part count exactly as a higher-degree AIR would, while leaving the actual
+/// constraint (degree 2, one multiplication) untouched. That isolates the
+/// *structural* cost of extra quotient parts from the cost of evaluating
+/// genuinely higher-degree constraint expressions.
+///
+/// Read once from `LVM_DEGREE_PARTS`; defaults to the AIR's natural 2.
+fn parts_override() -> usize {
+    // Read per call (not cached): the probe sweeps several part counts inside a
+    // single process. Called O(1) times per prove/verify, never in a hot loop.
+    std::env::var("LVM_DEGREE_PARTS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2)
+}
+
 /// Single-body [`ConstraintSet`] for [`QuadraticAIR`]: `x_{i+1} = x_i²`,
 /// written once against the [`ConstraintBuilder`].
 pub struct QuadraticConstraints<F: IsFFTField> {
@@ -147,7 +167,7 @@ where
     }
 
     fn composition_poly_degree_bound(&self, trace_length: usize) -> usize {
-        2 * trace_length
+        parts_override() * trace_length
     }
 
     fn trace_layout(&self) -> (usize, usize) {

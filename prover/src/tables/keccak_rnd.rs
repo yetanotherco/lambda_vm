@@ -908,7 +908,7 @@ pub struct KeccakRndConstraints;
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for KeccakRndConstraints {
     // The IS_BIT constraints are gated by μ (cond·x·(1−x)), so degree 3.
     fn max_degree(&self) -> usize {
-        3
+        crate::VM_MAX_DEGREE
     }
 
     fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {

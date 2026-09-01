@@ -514,7 +514,7 @@ impl LoadConstraints {
 
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for LoadConstraints {
     fn max_degree(&self) -> usize {
-        3
+        crate::VM_MAX_DEGREE
     }
 
     fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {

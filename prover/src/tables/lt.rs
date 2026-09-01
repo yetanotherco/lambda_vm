@@ -400,7 +400,7 @@ impl LtConstraints {
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for LtConstraints {
     // The LT formula (idx 2) is degree 3; the rest are degree 2.
     fn max_degree(&self) -> usize {
-        3
+        crate::VM_MAX_DEGREE
     }
 
     fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {

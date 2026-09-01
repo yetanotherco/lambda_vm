@@ -533,3 +533,123 @@ fn test_multi_column_fibonacci_4_cols() {
         &mut DefaultTranscript::<GoldilocksExt>::new(&[])
     ));
 }
+
+// =============================================================================
+// DEGREE-LANE EXPERIMENT (temporary, not for merge)
+// =============================================================================
+
+/// Prove+verify `QuadraticAIR` with an inflated composition part count.
+///
+/// Returns whether the round trip succeeded. `parts` is injected via the
+/// `LVM_DEGREE_PARTS` hook in the example AIR, so the prover and verifier both
+/// see the same inflated bound (the count is AIR-derived on both sides).
+fn degree_probe_roundtrip(parts: usize, blowup: u8) -> bool {
+    unsafe { std::env::set_var("LVM_DEGREE_PARTS", parts.to_string()) };
+    let mut trace = quadratic_air::quadratic_trace(Felt::from(3), 64);
+    // Few queries: the part-count/blowup representability question is
+    // independent of query count, and this keeps the probe fast.
+    let proof_options = ProofOptions {
+        blowup_factor: blowup,
+        fri_number_of_queries: 3,
+        coset_offset: 3,
+        grinding_factor: 1,
+        fri_final_poly_log_degree: 2,
+    };
+    let pub_inputs = QuadraticPublicInputs { a0: Felt::from(3) };
+    let air = QuadraticAIR::<GoldilocksField>::new(&proof_options);
+
+    let Ok(proof) = Prover::prove(
+        &air,
+        &mut trace,
+        &pub_inputs,
+        &mut DefaultTranscript::<F>::new(&[]),
+    ) else {
+        return false;
+    };
+    Verifier::verify(&proof, &air, &mut DefaultTranscript::<F>::new(&[]))
+}
+
+#[test]
+fn degree_probe_parts_vs_blowup() {
+    // parts = max_degree - 1. The composition poly H has degree `parts * N` and
+    // is interpolated from the `blowup * N` constraint evaluations, so the
+    // representable region is exactly `parts <= blowup`.
+    println!("--- representable region: parts <= blowup (expect ok=true) ---");
+    for (parts, blowup) in [(2usize, 4u8), (3, 4), (4, 4), (5, 8), (6, 8), (8, 8)] {
+        let ok = degree_probe_roundtrip(parts, blowup);
+        println!("PROBE parts={parts} blowup={blowup} roundtrip_ok={ok}");
+    }
+    // MUTATION TEST: push past the representable region. H has degree
+    // `parts * N` but is interpolated from only `blowup * N` evaluations, so
+    // the high coefficients alias. Nothing guards this explicitly — the
+    // failure must surface as a broken proof, not a clean error.
+    println!("--- aliasing region: parts > blowup (expect ok=false) ---");
+    for (parts, blowup) in [(5usize, 4u8), (6, 4), (8, 4), (9, 8), (16, 8)] {
+        let ok = degree_probe_roundtrip(parts, blowup);
+        println!("PROBE parts={parts} blowup={blowup} roundtrip_ok={ok}");
+    }
+}
+
+/// Prove+verify the true-degree `DegreeAir` at a given blowup.
+fn true_degree_roundtrip<const D: usize, const W: usize>(blowup: u8) -> &'static str {
+    use crate::examples::degree_air::{DegreeAir, DegreePublicInputs, degree_trace};
+
+    let seeds: Vec<Felt> = (0..W).map(|i| Felt::from(3 + i as u64)).collect();
+    let mut trace = degree_trace::<GoldilocksField, D>(&seeds, 64);
+    let proof_options = ProofOptions {
+        blowup_factor: blowup,
+        fri_number_of_queries: 3,
+        coset_offset: 3,
+        grinding_factor: 1,
+        fri_final_poly_log_degree: 2,
+    };
+    let pub_inputs = DegreePublicInputs { seeds };
+    let air = DegreeAir::<GoldilocksField, D, W>::new(&proof_options);
+
+    let proof = match Prover::prove(
+        &air,
+        &mut trace,
+        &pub_inputs,
+        &mut DefaultTranscript::<F>::new(&[]),
+    ) {
+        Ok(p) => p,
+        Err(_) => return "PROVER_ERROR",
+    };
+    if Verifier::verify(&proof, &air, &mut DefaultTranscript::<F>::new(&[])) {
+        "ok"
+    } else {
+        "VERIFY_REJECT"
+    }
+}
+
+#[test]
+fn true_degree_vs_blowup_bound() {
+    // The composition poly H = C/Z has degree (D-1)*N and is recovered by
+    // interpolating the blowup*N constraint evaluations. Representable iff
+    // D - 1 <= blowup, i.e. max_degree <= blowup + 1.
+    macro_rules! probe {
+        ($d:literal, $b:literal) => {{
+            let outcome = true_degree_roundtrip::<$d, 2>($b);
+            let predicted = ($d - 1) <= $b;
+            let ok = outcome == "ok";
+            println!(
+                "TRUEDEG D={} blowup={} parts={} outcome={} predicted_ok={} {}",
+                $d,
+                $b,
+                $d - 1,
+                outcome,
+                predicted,
+                if ok == predicted { "MATCH" } else { "*** MISMATCH ***" }
+            );
+        }};
+    }
+    probe!(3, 2);
+    probe!(3, 4);
+    probe!(5, 2);
+    probe!(5, 4);
+    probe!(5, 8);
+    probe!(7, 4);
+    probe!(7, 8);
+    probe!(9, 8);
+    probe!(9, 4);
+}

@@ -414,7 +414,7 @@ pub struct BranchConstraints;
 
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for BranchConstraints {
     fn max_degree(&self) -> usize {
-        3
+        crate::VM_MAX_DEGREE
     }
 
     fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {

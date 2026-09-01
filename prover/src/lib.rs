@@ -83,6 +83,23 @@ pub struct RuntimePageRange {
 /// Number of tables that always contribute exactly one sub-proof, regardless
 /// of `TableCounts`: bitwise, decode, halt, commit, keccak, keccak_rnd,
 /// keccak_rc, register, ecsm, ecdas.
+/// DEGREE-LANE EXPERIMENT KNOB (temporary, not for merge).
+///
+/// The declared max constraint degree for every VM table. The framework turns
+/// this into the composition-polynomial part count as `parts = max_degree - 1`
+/// (see `LookupAir::composition_poly_degree_bound`), and BOTH the host prover
+/// and the in-guest recursive verifier read it from here — so changing this one
+/// value moves both sides of the experiment together.
+///
+/// The VM's constraints are genuinely degree 3. Declaring a HIGHER value is
+/// legal (the framework asserts `measured <= max_degree`, never equality): it
+/// inflates the part count without changing constraint-evaluation work, which
+/// isolates the structural cost of extra quotient parts. Because the true
+/// degree stays 3, the composition poly never exceeds the LDE domain, so the
+/// inflated arms are NOT bound by `max_degree <= blowup + 1` and can all run at
+/// a fixed blowup.
+pub const VM_MAX_DEGREE: usize = 3;
+
 pub const FIXED_TABLE_COUNT: usize = 10;
 
 /// Number of chunks for each split table.

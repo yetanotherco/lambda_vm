@@ -465,7 +465,7 @@ pub struct KeccakConstraints;
 
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for KeccakConstraints {
     fn max_degree(&self) -> usize {
-        3
+        crate::VM_MAX_DEGREE
     }
 
     fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
