@@ -276,3 +276,123 @@ fn col_major_root_matches_the_host() {
          the host tree byte for byte — the col-major absorb bridge"
     );
 }
+
+// ---- StreamingMixedMmcs device-buffer absorb (the resident-LDE commit path) ----
+//
+// `StreamingMixedMmcs` is the persistent streaming commit the batched prover
+// drives across its round loop. Today its `absorb_*` wrappers `clone_htod` a
+// host `Vec`; the fully-GPU prover needs to absorb the LDE where it already
+// lives (main's resident `GpuLdeBase.buf`), skipping the upload. These exercise
+// the new `absorb_*_dev` paths and pin them to the host tree.
+
+fn streaming_h_max(mats: &Matrices) -> u64 {
+    (0..mats.num_matrices())
+        .map(|m| mats.log_height(m))
+        .max()
+        .expect("non-empty") as u64
+}
+
+/// Reference: the EXISTING streaming path — host `Vec` per matrix, uploaded by
+/// the wrapper (`clone_htod`). Absorbs in input order; `StreamingMixedMmcs`
+/// routes each matrix to its height group internally.
+fn streaming_tree_row_major_host(mats: &Matrices) -> [u8; 32] {
+    let mut sm = math_cuda::mmcs::StreamingMixedMmcs::new(streaming_h_max(mats))
+        .expect("streaming mmcs");
+    for m in 0..mats.num_matrices() {
+        let (data, _, width) = &mats.mats[m];
+        sm.absorb_row_major(mats.log_height(m) as u64, &raw(data), *width as u64, 0, *width as u64)
+            .expect("absorb row-major host");
+    }
+    let nodes = sm.finish().expect("finish");
+    let mut root = [0u8; 32];
+    root.copy_from_slice(&nodes[0..32]);
+    root
+}
+
+/// The new path, row-major: the buffer is resident on device and absorbed with
+/// `absorb_row_major_dev` (no `clone_htod`). Buffers are produced on the commit
+/// stream (`sm.stream()`) and held alive until `finish` — the resident-LDE
+/// contract the `_dev` methods rely on (they do not synchronize).
+fn streaming_tree_row_major_dev(mats: &Matrices) -> [u8; 32] {
+    let mut sm = math_cuda::mmcs::StreamingMixedMmcs::new(streaming_h_max(mats))
+        .expect("streaming mmcs");
+    let stream = sm.stream();
+    let mut resident: Vec<cudarc::driver::CudaSlice<u64>> = Vec::new();
+    for m in 0..mats.num_matrices() {
+        let (data, _, width) = &mats.mats[m];
+        let dev = stream.clone_htod(&raw(data)).expect("H2D");
+        sm.absorb_row_major_dev(
+            mats.log_height(m) as u64,
+            &dev,
+            *width as u64,
+            0,
+            *width as u64,
+        )
+        .expect("absorb row-major dev");
+        resident.push(dev);
+    }
+    let nodes = sm.finish().expect("finish");
+    drop(resident);
+    let mut root = [0u8; 32];
+    root.copy_from_slice(&nodes[0..32]);
+    root
+}
+
+/// The new path, column-major: main's resident `GpuLdeBase.buf` layout, absorbed
+/// with `absorb_col_major_dev`. Same resident-buffer contract as above.
+fn streaming_tree_col_major_dev(mats: &Matrices) -> [u8; 32] {
+    let mut sm = math_cuda::mmcs::StreamingMixedMmcs::new(streaming_h_max(mats))
+        .expect("streaming mmcs");
+    let stream = sm.stream();
+    let mut resident: Vec<cudarc::driver::CudaSlice<u64>> = Vec::new();
+    for m in 0..mats.num_matrices() {
+        let (data, log_height, width) = &mats.mats[m];
+        let num_rows = 1u64 << log_height;
+        let dev = stream
+            .clone_htod(&raw_col_major(data, *log_height, *width))
+            .expect("H2D");
+        sm.absorb_col_major_dev(*log_height as u64, &dev, num_rows, 0, *width as u64)
+            .expect("absorb col-major dev");
+        resident.push(dev);
+    }
+    let nodes = sm.finish().expect("finish");
+    drop(resident);
+    let mut root = [0u8; 32];
+    root.copy_from_slice(&nodes[0..32]);
+    root
+}
+
+/// ★ Step 1 of the fully-GPU batched prover: `StreamingMixedMmcs` must commit a
+/// RESIDENT device buffer (no per-absorb upload) to the identical tree as the
+/// host-upload path and the authoritative host `MixedMmcs`. Same mixed-height
+/// fixture as `mixed_height_root_matches_the_host`.
+#[test]
+fn streaming_device_absorb_matches_host_upload_and_host_tree() {
+    let mats = Matrices {
+        mats: vec![
+            matrix(7, 3, 11),
+            matrix(7, 6, 23),
+            matrix(5, 2, 41),
+            matrix(2, 4, 59),
+        ],
+    };
+    let host = Mmcs::commit(&mats).root();
+
+    assert_eq!(
+        streaming_tree_row_major_host(&mats),
+        host,
+        "the existing streaming host-upload path must match the host tree"
+    );
+    assert_eq!(
+        streaming_tree_row_major_dev(&mats),
+        host,
+        "the streaming device-buffer path (row-major) must match — skipping \
+         clone_htod changes nothing but where the bytes are read from"
+    );
+    assert_eq!(
+        streaming_tree_col_major_dev(&mats),
+        host,
+        "the streaming device-buffer path (col-major) must match — this is the \
+         resident-LDE bridge main hands the batched prover (GpuLdeBase.buf)"
+    );
+}

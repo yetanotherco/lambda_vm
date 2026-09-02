@@ -538,6 +538,15 @@ impl StreamingMixedMmcs {
         })
     }
 
+    /// The stream every absorb + [`Self::finish`] runs on. A caller feeding the
+    /// device-buffer absorb paths (`absorb_*_dev`) should produce the resident
+    /// LDE on THIS stream (or synchronize its producer stream first), so the
+    /// absorb kernel is correctly ordered after the buffer is filled without a
+    /// device-wide sync.
+    pub fn stream(&self) -> Arc<CudaStream> {
+        self.stream.clone()
+    }
+
     fn group_mut(&mut self, log_height: u64) -> Result<&mut MmcsGroupHasher> {
         let idx = log_height as usize;
         assert!(
@@ -605,6 +614,83 @@ impl StreamingMixedMmcs {
             .absorb_ext3_slabs(&stream, &dev, col_stride, num_parts)?;
         stream.synchronize()?;
         Ok(())
+    }
+
+    // ---- Device-buffer absorb paths ------------------------------------------
+    //
+    // These take a DEVICE buffer already resident on the GPU (e.g. main's
+    // `GpuLdeBase.buf`, an aux `GpuLdeExt3`, or resident composition parts) and
+    // hash it in place — no `clone_htod`, no host `Vec`. This is the bridge that
+    // lets the batched prover commit its resident LDE where it already lives,
+    // instead of expanding on the CPU and uploading.
+    //
+    // Precondition (vs the host wrappers): `data` must be ready on
+    // [`Self::stream`] before the call — produce the LDE on that stream, or
+    // synchronize the producer first. Unlike the host wrappers these do NOT
+    // synchronize afterward: the resident buffer is meant to stay alive across
+    // the prover's later phases, and ordering into [`Self::finish`] is already
+    // guaranteed because both run on `self.stream`. The caller must therefore
+    // keep `data` alive until at least `finish` (its natural residency anyway).
+
+    /// Absorb one COLUMN-MAJOR base-field matrix resident on device — main's
+    /// `GpuLdeBase.buf` layout, element `(row, col)` at `col*col_stride + row`.
+    /// Byte-identical leaf digests to [`Self::absorb_row_major`] over the same
+    /// matrix; this is the resident-LDE bridge for the main round.
+    pub fn absorb_col_major_dev(
+        &mut self,
+        log_height: u64,
+        data: &CudaSlice<u64>,
+        col_stride: u64,
+        col_start: u64,
+        col_end: u64,
+    ) -> Result<()> {
+        let stream = self.stream.clone();
+        self.group_mut(log_height)?
+            .absorb_col_major(&stream, data, col_stride, col_start, col_end)
+    }
+
+    /// Absorb one ROW-MAJOR base-field matrix resident on device (same layout as
+    /// [`Self::absorb_row_major`], but the buffer already lives on the GPU).
+    pub fn absorb_row_major_dev(
+        &mut self,
+        log_height: u64,
+        data: &CudaSlice<u64>,
+        row_stride: u64,
+        col_start: u64,
+        col_end: u64,
+    ) -> Result<()> {
+        let stream = self.stream.clone();
+        self.group_mut(log_height)?
+            .absorb_row_major(&stream, data, row_stride, col_start, col_end)
+    }
+
+    /// Absorb one ROW-MAJOR ext3 matrix resident on device (aux round) — an
+    /// element's 3 components consecutive, `stride` elements per row.
+    pub fn absorb_ext3_row_major_dev(
+        &mut self,
+        log_height: u64,
+        data: &CudaSlice<u64>,
+        stride: u64,
+        col_start: u64,
+        col_end: u64,
+    ) -> Result<()> {
+        let stream = self.stream.clone();
+        self.group_mut(log_height)?
+            .absorb_ext3_row_major(&stream, data, stride, col_start, col_end)
+    }
+
+    /// Absorb one COLUMN-MAJOR ext3 slab matrix resident on device (parts round)
+    /// — component `k` of column `c` at `(c*3 + k) * col_stride`.
+    pub fn absorb_ext3_slabs_dev(
+        &mut self,
+        log_height: u64,
+        parts: &CudaSlice<u64>,
+        col_stride: u64,
+        num_parts: u64,
+    ) -> Result<()> {
+        let stream = self.stream.clone();
+        self.group_mut(log_height)?
+            .absorb_ext3_slabs(&stream, parts, col_stride, num_parts)
     }
 
     /// Finalize every absorbed group and climb, returning the standard heap node
