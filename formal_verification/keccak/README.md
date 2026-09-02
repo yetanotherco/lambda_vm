@@ -80,8 +80,9 @@ Each helper lookup is modeled by its contract, not its implementation:
    declaring those variables 8-bit bitvectors, and the θ carry `Cxz_right` is pinned
    directly to `ZeroExt(7, Extract(15, 15, in))`, with the separate `IS_BIT` disjunct
    redundant *in the model*. Both are `load-bearing` in the circuit
-   (`keccak_rnd.rs:7-8`, `:840-842`: the 20 μ-gated `IS_BIT`s make the θ shift
-   decomposition unique). Because neither can be removed from the model's constraint
+   (the `keccak_rnd.rs` module doc-comment and the `KeccakRndConstraints`
+   doc-comment: the 20 μ-gated `IS_BIT`s make the θ shift decomposition
+   unique). Because neither can be removed from the model's constraint
    list, **deleting them from the Rust leaves this gate printing `VERIFIED`** while
    the θ `left` halfwords go free — `2¹⁶` is invertible mod `p`, so the forged
    assignment exists. The model's pin is a sound *consequence* of the shipped
@@ -141,22 +142,18 @@ constraint-identical in QF-BV. Verified: `keccak_rnd.rs` is byte-identical acros
 `main`, this branch, and `6a280121` (same git blob `51b7759f`), so the wiring the
 model transcribes is the shipped wiring.
 
-The `rs:NNN` line citations in the code comments are nevertheless **stale**. They were
-written against the pre-#889 revision (`d83b4d9e`, blob `1b121a8b`, 926 lines), where
-each lands exactly on the construct it names; **#889 — the change that inlined the
-HWSL shifts — invalidated them all.** Most now point at a neighbouring construct:
-`rs:539-588` ("theta: Cxz XOR chain") is the KeccakRc sender, the chain being at
-`546-597`; `rs:796-870` ("chi: AND then XOR") is Iota, Chi's AND/XOR being at
-`716-759` and `761-794`.
+The code comments cite each modeled equation by **construct name** — the
+`// --- <Group>: <what> (<count>) ---` banner it sits under, or the `cols::` /
+`KeccakRndConstraints` symbol — never by line number. Names are the only citation
+that survives: line numbers rot from churn with nothing to do with the chip. The
+earlier `rs:NNN` citations were all invalidated by **#889** (which inlined the HWSL
+shifts), two of them naming `BusInteraction::sender(BusId::Hwsl, …)` blocks that
+#889 **deleted outright** — the file now contains zero `BusId::Hwsl` sends, and that
+content lives in the inline identities in `KeccakRndConstraints`. The `execution.rs`
+citation in `test_ref.py` was broken separately, by **#876** (an unrelated hint-ecall
+PR) merely growing the file by 136 lines.
 
-Two cannot be repointed at all: `rs:593-631` (θ HWSL) and `rs:723-766` (ρ HWSL) cite
-`BusInteraction::sender(BusId::Hwsl, …)` blocks that #889 **deleted outright** — the
-file now contains zero `BusId::Hwsl` sends, and that content lives in the inline
-identities at `:882-894` and `:896-920`. So it is not the case that every referenced
-construct still exists.
-
-Locate a construct by its `// --- Step: … ---` banner rather than by these line
-numbers.
+If you copy this template, cite by name for the same reason.
 
 **Known scope gap carried as the first follow-up:** QF-BV cannot test that the
 `AreBytes`/`IS_BIT` bounds are *sufficient* mod `p` for the inline identities (bit
