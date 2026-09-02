@@ -13,6 +13,7 @@
         ("logup.typ", [`LogUp` argument], <logup>),
         ("memory.typ", [Memory argument], <memory>),
         ("streaming.typ", [Streaming prover], <streaming>),
+        ("verifier.typ", [Verification], <verification>)
     )),
     ("OVERVIEW", (
         ("variables.typ", [Variables], <vars>),
@@ -54,6 +55,11 @@
       ("keccak.typ", [`KECCAK` accelerator], <keccak>),
       ("ecsm.typ", [`ECSM` accelerator], <ecsm>),
       ("fext.typ", [Extension field accelerator], <fext>),
+    )),
+    ("RECURSION", (
+      ("recursion.typ", [Recursive verification], <recursion>),
+      ("field.typ", [`Field` VM], <field-VM>),
+      ("field_decode.typ", [`Field` `DECODE` table], <field-decode>),
     )),
     ("MATHEMATICS", (
       ("limbs_and_carries.typ", [On limb decomposition and carries], <limbs>),
