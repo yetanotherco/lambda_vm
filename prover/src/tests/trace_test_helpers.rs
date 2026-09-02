@@ -131,12 +131,14 @@ impl Traces {
         logs: &[Log],
         max_rows: &MaxRowsConfig,
         private_input: &[u8],
+        hints: &[[u8; 32]],
     ) -> Result<Self, Error> {
         let mut traces = Self::from_elf_and_logs(
             elf,
             logs,
             max_rows,
             private_input,
+            hints,
             #[cfg(feature = "disk-spill")]
             StorageMode::Ram,
         )?;

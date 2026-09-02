@@ -64,38 +64,37 @@ impl Crypto for LambdaVmEcsmCrypto {
 
 // ── ECDSA secp256k1 recovery via the ECSM precompile ────────────────────────
 
-/// Obtain a 32-byte big-endian hint for `x_be` via the executor `hint` ecall
-/// (the host computes the modular inverse / sqrt; the value is provable via the
-/// prover's HINT table). The result is UNTRUSTED — the ecall adds no correctness
-/// constraint, so every caller MUST verify it in-guest (`x·inv == 1`, `y² == x³+7`)
-/// AND recompute in software on any verification failure. The hint is only ever
-/// allowed to save work, never to change the answer: because the prover chooses the
-/// bytes, an unverified-or-rejected-outright hint would let it steer a caller's
-/// accept/reject outcome (e.g. force a valid signature to look invalid). See
-/// [`scalar_inv`] / [`decompress_r`] for the fallback that closes that hole.
+/// Fetch a hint for `(hint_id, x_be)` from the private-input hint arena
+/// (positional — one slot per request). The request is published to the guest's
+/// hint request log and the executor answers it in the same run by seeding the
+/// arena slot this call then reads. When nobody answers, the slot reads back as
+/// zeros, which fail the caller's in-guest verify and trigger its software
+/// fallback.
+///
+/// The hint is UNTRUSTED — the prover chooses the arena bytes, so every caller
+/// MUST verify it in-guest (`x·inv == 1`, `y² == x³+7`) AND recompute in
+/// software on any verification failure. The hint is only ever allowed to save
+/// work, never to change the answer: an unverified-or-rejected-outright hint
+/// would let the prover steer a caller's accept/reject outcome (e.g. force a
+/// valid signature to look invalid). See [`scalar_inv`] / [`decompress_r`] for
+/// the fallback that closes that hole.
 #[cfg(target_arch = "riscv64")]
 fn get_hint(hint_id: usize, x_be: &[u8; 32]) -> [u8; 32] {
-    // 8-byte-aligned output buffer so the HINT table's four 8-byte writes land on the
-    // aligned memory path (MEMW_A) instead of the general MEMW path. An `[u8; 32]` on
-    // the stack is only 1-aligned, which forces the four writes onto the unaligned
-    // path and inflates the trace.
-    #[repr(C, align(8))]
-    struct Aligned32([u8; 32]);
-    let mut out = Aligned32([0u8; 32]);
-    lambda_vm_syscalls::syscalls::hint(hint_id, &mut out.0, x_be);
-    out.0
+    lambda_vm_syscalls::syscalls::request_hint(hint_id, x_be)
 }
 
 /// Scalar-field inverse `x⁻¹ mod n`.
 ///
-/// On riscv64 the inverse is first requested from the untrusted `hint` ecall and
-/// verified in-guest (`x·inv == 1`); **on any verification failure it is recomputed
-/// in software.** `x⁻¹` exists for every `x` this is called with — the only caller,
-/// `ecsm_ecrecover`, guarantees `r ≠ 0` before calling — so a failed verify can only
-/// mean the host lied, and the software value is authoritative. This is what keeps
-/// the result independent of the prover-chosen hint: a bad hint makes the guest do
-/// more work, it can never change the answer, so it cannot turn a valid signature
-/// into a recovery failure. Off-target (host) it inverts in software directly.
+/// On riscv64 the inverse is read from the untrusted private-input **hint
+/// arena** (positional — one slot per request) and verified in-guest
+/// (`x·inv == 1`); **on any verification failure or an exhausted arena it is
+/// recomputed in software.** `x⁻¹` exists for every `x` this is called with —
+/// the only caller, `ecsm_ecrecover`, guarantees `r ≠ 0` before calling — so a
+/// failed verify can only mean the host lied, and the software value is
+/// authoritative. This is what keeps the result independent of the
+/// prover-chosen hint: a bad hint makes the guest do more work, it can never
+/// change the answer, so it cannot turn a valid signature into a recovery
+/// failure. Off-target (host) it inverts in software directly.
 fn scalar_inv(x: &Scalar) -> Option<Scalar> {
     #[cfg(target_arch = "riscv64")]
     {
@@ -133,16 +132,16 @@ where
 
 /// Decompress R from its x-coordinate + parity.
 ///
-/// On riscv64 the square root `y = sqrt(x³+7)` is first requested from the untrusted
-/// `hint` ecall and verified in-guest (`y² == x³+7`), with parity selection; **on any
-/// verification failure the point is recomputed with the software
-/// `AffinePoint::decompress`.** Unlike the inverse, a failure here is *not*
-/// necessarily a lying host: a genuine non-residue (an invalid signature) has no
-/// root and must legitimately yield `None`. So the fallback is the authoritative
-/// software decompress, which returns `Some` for a residue and `None` for a
-/// non-residue regardless of the prover-chosen hint — the hint can only save work,
-/// never steer the accept/reject outcome. Off-target it uses the software
-/// decompress directly.
+/// On riscv64 the square root `y = sqrt(x³+7)` is read from the untrusted
+/// private-input **hint arena** and verified in-guest (`y² == x³+7`), with
+/// parity selection; **on any verification failure or an exhausted arena the
+/// point is recomputed with the software `AffinePoint::decompress`.** Unlike
+/// the inverse, a failure here is *not* necessarily a lying host: a genuine
+/// non-residue (an invalid signature) has no root and must legitimately yield
+/// `None`. So the fallback is the authoritative software decompress, which
+/// returns `Some` for a residue and `None` for a non-residue regardless of the
+/// prover-chosen hint — the hint can only save work, never steer the
+/// accept/reject outcome. Off-target it uses the software decompress directly.
 fn decompress_r(r_bytes: &FieldBytes, y_is_odd: bool) -> Option<AffinePoint> {
     #[cfg(target_arch = "riscv64")]
     {
@@ -337,12 +336,14 @@ fn ecsm_oracle(x: &FieldElement, k: &Scalar) -> Option<FieldElement> {
 
 /// Base-field inverse `x⁻¹ mod p`.
 ///
-/// On riscv64 the inverse is first requested from the untrusted `hint` ecall and
-/// verified in-guest (`x·inv == 1`); **on any verification failure it is recomputed
-/// in software.** A bad hint can only cost the guest extra work, never change the
-/// answer — it cannot steer a caller's accept/reject outcome. Off-target it inverts
-/// in software directly. Returns `None` only for a genuinely non-invertible input
-/// (`x = 0`), which the callers' degeneracy guards already exclude.
+/// On riscv64 the inverse is read from the untrusted private-input **hint
+/// arena** (positional — one slot per request) and verified in-guest
+/// (`x·inv == 1`); **on any verification failure or an exhausted arena it is
+/// recomputed in software.** A bad or missing hint can only cost the guest
+/// extra work, never change the answer — it cannot steer a caller's
+/// accept/reject outcome. Off-target it inverts in software directly. Returns
+/// `None` only for a genuinely non-invertible input (`x = 0`), which the
+/// callers' degeneracy guards already exclude.
 #[cfg(any(target_arch = "riscv64", test))]
 fn field_inv(x: &FieldElement) -> Option<FieldElement> {
     #[cfg(target_arch = "riscv64")]

@@ -353,6 +353,10 @@ pub fn run_with_flamegraph(
 ) -> (FlamegraphGenerator, Result<u64, FlamegraphDriveError>) {
     let symbols = SymbolTable::parse(elf_bytes);
     let mut generator = FlamegraphGenerator::new(symbols, program.entry_point);
+    // Profiling entry point: no caller-supplied arena. The executor answers hint
+    // requests during this run, so the profile reflects the accelerated paths —
+    // which is what the proved trace actually executes. Call `silence_hints()` on
+    // the executor if you deliberately want to profile the software fallback.
     let mut executor = match Executor::new(program, private_inputs) {
         Ok(executor) => executor,
         Err(e) => return (generator, Err(e.into())),

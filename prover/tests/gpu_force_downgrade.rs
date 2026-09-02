@@ -33,6 +33,8 @@ fn forced_downgrade_prove_verifies() {
         .expect("need ethrex.elf — run `make compile-programs-rust`");
     let input = std::fs::read(ws.join("executor/tests/ethrex_simple_tx.bin")).expect("fixture");
 
+    // Empty arena: the executor answers this guest's hint requests during the single
+    // execution `prove_with_inputs` already performs, so nothing has to be supplied here.
     let proof = lambda_vm_prover::prove_with_inputs(&elf, &input).expect("prove");
     assert!(
         stark::gpu_lde::gpu_device_only_downgrades() > 0,

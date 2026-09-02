@@ -141,6 +141,7 @@ fn custom_prove_with_statement_elf(
         &result.logs,
         &max_rows,
         &[],
+        &[],
         #[cfg(feature = "disk-spill")]
         stark::storage_mode::StorageMode::Ram,
     )

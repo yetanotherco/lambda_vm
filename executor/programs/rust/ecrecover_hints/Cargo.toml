@@ -1,0 +1,16 @@
+[workspace]
+
+[profile.release]
+lto = "thin"
+
+[package]
+name = "ecrecover_hints"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+lambda-vm-syscalls = { path = "../../../../syscalls" }
+lambda-vm-ethrex-crypto = { path = "../../../../crypto/ethrex-crypto" }
+# The `Crypto` trait the guest calls through. Same rev + default-features=false
+# as lambda-vm-ethrex-crypto's own dep, so feature unification adds nothing.
+ethrex-crypto = { git = "https://github.com/lambdaclass/ethrex.git", rev = "797df5540c7d35cafd69b6971a74b2a49c67d1dd", package = "ethrex-crypto", default-features = false }

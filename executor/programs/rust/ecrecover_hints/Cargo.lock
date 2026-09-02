@@ -268,6 +268,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ecrecover_hints"
+version = "0.1.0"
+dependencies = [
+ "ethrex-crypto",
+ "lambda-vm-ethrex-crypto",
+ "lambda-vm-syscalls",
+]
+
+[[package]]
 name = "educe"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -483,21 +492,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "keccak"
-version = "0.1.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb26cec98cce3a3d96cbb7bced3c4b16e3d13f27ec56dbd62cbc8f39cfb9d653"
-dependencies = [
- "cpufeatures",
-]
-
-[[package]]
 name = "lambda-vm-ethrex-crypto"
 version = "0.1.0"
 dependencies = [
  "ethrex-crypto",
  "k256",
- "keccak",
  "lambda-vm-syscalls",
 ]
 
