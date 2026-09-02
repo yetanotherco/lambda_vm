@@ -406,24 +406,87 @@ where
             }
             // Streaming device absorb: hash this table into the device tree NOW,
             // so the LDE can be freed below (RecomputeLde) without retaining it.
+            //
+            // Prefer the RESIDENT path: expand this table's main LDE on the GPU
+            // and absorb it column-major straight from VRAM — no host FFT upload,
+            // the whole point of a device-resident batched prover. Tables below
+            // the device LDE threshold decline the keep-expand and fall back to
+            // uploading the host LDE (mixed eligibility; identical root either
+            // way). Step 2: only the main COMMIT is device-resident here; the host
+            // `main_data` above still feeds prep trees, `retained_main` and the
+            // later phases, so this deliberately expands twice for now (step 3
+            // drops the host expand and moves the later phases to device recompute).
             #[cfg(feature = "cuda")]
             if let Some(dev) = device_main.as_mut() {
-                // SAFETY: Goldilocks base (device_commit_enabled gated it);
-                // FieldElement<Gl> is #[repr(transparent)] over u64. Committed
-                // columns are [num_precomputed, total_cols).
-                let data_u64 = unsafe {
-                    std::slice::from_raw_parts(main_data.as_ptr() as *const u64, main_data.len())
+                let (trace_slice, num_cols) = trace.main_data_row_major();
+                debug_assert_eq!(
+                    num_cols, total_cols,
+                    "the resident and host expansions must see the same column count"
+                );
+                let n = if num_cols > 0 {
+                    trace_slice.len() / num_cols
+                } else {
+                    0
                 };
-                dev.absorb_row_major(
-                    height as u64,
-                    data_u64,
-                    total_cols as u64,
-                    num_precomputed as u64,
-                    total_cols as u64,
-                )
-                .map_err(|e| {
-                    ProvingError::WrongParameter(format!("device main absorb failed: {e:?}"))
-                })?;
+                let resident = crate::gpu_lde::try_expand_row_major_keep_no_tree::<Field, Field>(
+                    trace_slice,
+                    trace.main_rowmajor_dev(),
+                    n,
+                    num_cols,
+                    domains[table].blowup_factor,
+                    &twiddles[table].coset_weights,
+                    false,
+                );
+                match resident {
+                    // Resident LDE: `handle.buf` is column-major (`col*lde_size +
+                    // row`); absorb the committed columns [num_precomputed,
+                    // total_cols) in place. `wait_ready_on` orders the absorb after
+                    // the producer's last kernel device-side (no host block). No
+                    // per-table tree is built (the shared MMCS is the tree);
+                    // dropping `handle` frees this table's LDE (stream-first).
+                    Some((handle, _host_lde)) => {
+                        let commit_stream = dev.stream();
+                        handle.wait_ready_on(&commit_stream).map_err(|e| {
+                            ProvingError::WrongParameter(format!(
+                                "device main LDE ready-wait failed: {e:?}"
+                            ))
+                        })?;
+                        dev.absorb_col_major_dev(
+                            height as u64,
+                            handle.buf.as_ref(),
+                            handle.lde_size as u64,
+                            num_precomputed as u64,
+                            total_cols as u64,
+                        )
+                        .map_err(|e| {
+                            ProvingError::WrongParameter(format!(
+                                "device main absorb (resident) failed: {e:?}"
+                            ))
+                        })?;
+                    }
+                    // Below the device LDE threshold: upload the host LDE and
+                    // absorb row-major, exactly as before.
+                    None => {
+                        // SAFETY: Goldilocks base (device_commit_enabled gated it);
+                        // FieldElement<Gl> is #[repr(transparent)] over u64.
+                        let data_u64 = unsafe {
+                            std::slice::from_raw_parts(
+                                main_data.as_ptr() as *const u64,
+                                main_data.len(),
+                            )
+                        };
+                        dev.absorb_row_major(
+                            height as u64,
+                            data_u64,
+                            total_cols as u64,
+                            num_precomputed as u64,
+                            total_cols as u64,
+                        )
+                        .map_err(|e| {
+                            ProvingError::WrongParameter(format!("device main absorb failed: {e:?}"))
+                        })?;
+                    }
+                }
             }
         }
 
@@ -553,25 +616,90 @@ where
             }];
             builder.absorb(&src, 0);
         }
-        // Streaming device absorb (ext3 row-major), so the aux LDE can be freed
-        // below without retaining it.
+        // Streaming device absorb: expand this table's aux LDE on the GPU and
+        // absorb it (slab layout) straight from VRAM — no host FFT upload. The
+        // resident slab buffer yields the byte-identical aux leaf as the host
+        // row-major absorb (both emit, per bit-reversed row, each column's 3
+        // components consecutively). Tables below the device LDE threshold — and
+        // disk-spilled traces (the natural aux trace lives on disk, the resident
+        // expand needs it in memory) — fall back to uploading the host LDE
+        // row-major (mixed eligibility, identical root). Like main, this is
+        // step-2-shaped: the host `expand_aux_lde_row_major` above still feeds the
+        // later phases; step 3 moves those to device recompute.
         #[cfg(feature = "cuda")]
         if let Some(dev) = device_aux.as_mut() {
-            // SAFETY: ext3 Goldilocks (device_commit_enabled gated it); an
-            // element is 3 consecutive u64.
-            let data_u64 = unsafe {
-                std::slice::from_raw_parts(aux_data.as_ptr() as *const u64, aux_data.len() * 3)
+            #[cfg(feature = "disk-spill")]
+            let aux_resident_ok = storage_mode != StorageMode::Disk;
+            #[cfg(not(feature = "disk-spill"))]
+            let aux_resident_ok = true;
+
+            let resident = if aux_resident_ok {
+                let (trace_slice, num_cols) = trace.aux_data_row_major();
+                debug_assert_eq!(
+                    num_cols, aux_cols,
+                    "the resident and host aux expansions must see the same column count"
+                );
+                let n = if num_cols > 0 {
+                    trace_slice.len() / num_cols
+                } else {
+                    0
+                };
+                crate::gpu_lde::try_expand_ext3_row_major_keep_no_tree::<Field, FieldExtension>(
+                    trace_slice,
+                    n,
+                    num_cols,
+                    domains[table].blowup_factor,
+                    &twiddles[table].coset_weights,
+                    false,
+                )
+            } else {
+                None
             };
-            dev.absorb_ext3_row_major(
-                shape.heights[table] as u64,
-                data_u64,
-                aux_cols as u64,
-                0,
-                aux_cols as u64,
-            )
-            .map_err(|e| {
-                ProvingError::WrongParameter(format!("device aux absorb failed: {e:?}"))
-            })?;
+
+            match resident {
+                // Resident slab LDE: absorb columns [0, aux_cols) in place;
+                // `wait_ready_on` orders the absorb after the producer device-side.
+                Some((handle, _host_lde)) => {
+                    let commit_stream = dev.stream();
+                    handle.wait_ready_on(&commit_stream).map_err(|e| {
+                        ProvingError::WrongParameter(format!(
+                            "device aux LDE ready-wait failed: {e:?}"
+                        ))
+                    })?;
+                    dev.absorb_ext3_slabs_dev(
+                        shape.heights[table] as u64,
+                        handle.buf.as_ref(),
+                        handle.lde_size as u64,
+                        aux_cols as u64,
+                    )
+                    .map_err(|e| {
+                        ProvingError::WrongParameter(format!(
+                            "device aux absorb (resident) failed: {e:?}"
+                        ))
+                    })?;
+                }
+                // Below threshold or disk-spilled: upload the host LDE row-major.
+                None => {
+                    // SAFETY: ext3 Goldilocks (device_commit_enabled gated it); an
+                    // element is 3 consecutive u64.
+                    let data_u64 = unsafe {
+                        std::slice::from_raw_parts(
+                            aux_data.as_ptr() as *const u64,
+                            aux_data.len() * 3,
+                        )
+                    };
+                    dev.absorb_ext3_row_major(
+                        shape.heights[table] as u64,
+                        data_u64,
+                        aux_cols as u64,
+                        0,
+                        aux_cols as u64,
+                    )
+                    .map_err(|e| {
+                        ProvingError::WrongParameter(format!("device aux absorb failed: {e:?}"))
+                    })?;
+                }
+            }
         }
         match residency {
             ResidencyMode::Retain => retained_aux[table] = Some((aux_data, aux_cols)),
@@ -1489,6 +1617,107 @@ where
 /// Build (or take back) a table's main and aux LDEs for the phase about to read
 /// them.
 #[allow(clippy::too_many_arguments)]
+/// Recompute a table's MAIN LDE on the GPU — the VRAM recompute mechanism: a
+/// cheap device coset NTT → the row-major LDE downloaded to host, BYTE-IDENTICAL
+/// to `expand_main_lde_row_major` (same DFT, exact modular arithmetic) but off
+/// the CPU. `None` = ineligible (below the device threshold / not Goldilocks /
+/// disk-spilled) → the caller falls back to the host FFT. Only the row-major host
+/// LDE is kept here; the resident handle (its col-major buf) is dropped — a later
+/// 3c step keeps it resident to skip the download and run R2/R3/R4 on-device.
+#[cfg(feature = "cuda")]
+fn device_recompute_main_lde<Field, FieldExtension>(
+    trace: &TraceTable<Field, FieldExtension>,
+    domain: &Domain<Field>,
+    twiddles: &crate::prover::LdeTwiddles<Field>,
+    #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
+) -> Option<(Vec<FieldElement<Field>>, usize)>
+where
+    Field: IsFFTField + IsSubFieldOf<FieldExtension> + 'static,
+    FieldExtension: IsField + 'static,
+{
+    // Disk mode spilled the trace; the device expand needs it in memory.
+    #[cfg(feature = "disk-spill")]
+    if storage_mode == StorageMode::Disk {
+        return None;
+    }
+    let (trace_slice, num_cols) = trace.main_data_row_major();
+    if num_cols == 0 {
+        return None;
+    }
+    let n = trace_slice.len() / num_cols;
+    let (_handle, host_lde) = crate::gpu_lde::try_expand_row_major_keep_no_tree::<Field, Field>(
+        trace_slice,
+        trace.main_rowmajor_dev(),
+        n,
+        num_cols,
+        domain.blowup_factor,
+        &twiddles.coset_weights,
+        true,
+    )?;
+    Some((host_lde, num_cols))
+}
+
+#[cfg(not(feature = "cuda"))]
+fn device_recompute_main_lde<Field, FieldExtension>(
+    _trace: &TraceTable<Field, FieldExtension>,
+    _domain: &Domain<Field>,
+    _twiddles: &crate::prover::LdeTwiddles<Field>,
+    #[cfg(feature = "disk-spill")] _storage_mode: StorageMode,
+) -> Option<(Vec<FieldElement<Field>>, usize)>
+where
+    Field: IsFFTField + IsSubFieldOf<FieldExtension> + 'static,
+    FieldExtension: IsField + 'static,
+{
+    None
+}
+
+/// Aux counterpart of [`device_recompute_main_lde`] (ext3 row-major LDE).
+#[cfg(feature = "cuda")]
+fn device_recompute_aux_lde<Field, FieldExtension>(
+    trace: &TraceTable<Field, FieldExtension>,
+    domain: &Domain<Field>,
+    twiddles: &crate::prover::LdeTwiddles<Field>,
+    #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
+) -> Option<(Vec<FieldElement<FieldExtension>>, usize)>
+where
+    Field: IsFFTField + IsSubFieldOf<FieldExtension> + 'static,
+    FieldExtension: IsField + 'static,
+{
+    #[cfg(feature = "disk-spill")]
+    if storage_mode == StorageMode::Disk {
+        return None;
+    }
+    let (trace_slice, num_cols) = trace.aux_data_row_major();
+    if num_cols == 0 {
+        return None;
+    }
+    let n = trace_slice.len() / num_cols;
+    let (_handle, host_lde) =
+        crate::gpu_lde::try_expand_ext3_row_major_keep_no_tree::<Field, FieldExtension>(
+            trace_slice,
+            n,
+            num_cols,
+            domain.blowup_factor,
+            &twiddles.coset_weights,
+            true,
+        )?;
+    Some((host_lde, num_cols))
+}
+
+#[cfg(not(feature = "cuda"))]
+fn device_recompute_aux_lde<Field, FieldExtension>(
+    _trace: &TraceTable<Field, FieldExtension>,
+    _domain: &Domain<Field>,
+    _twiddles: &crate::prover::LdeTwiddles<Field>,
+    #[cfg(feature = "disk-spill")] _storage_mode: StorageMode,
+) -> Option<(Vec<FieldElement<FieldExtension>>, usize)>
+where
+    Field: IsFFTField + IsSubFieldOf<FieldExtension> + 'static,
+    FieldExtension: IsField + 'static,
+{
+    None
+}
+
 fn materialize_ldes<Field, FieldExtension, PI, P>(
     table: usize,
     air_trace_pairs: &[BatchedAirTracePair<'_, Field, FieldExtension, PI>],
@@ -1516,13 +1745,25 @@ where
         Some(lde) => lde,
         None => {
             let t_expand = std::time::Instant::now();
-            let lde = P::expand_main_lde_row_major(
+            // Recompute on the GPU (cheap device NTT) when eligible — the VRAM
+            // recompute mechanism; falls back to the host FFT below threshold /
+            // non-Goldilocks / disk-spill. Byte-identical either way.
+            let lde = device_recompute_main_lde::<Field, FieldExtension>(
                 trace,
                 &domains[table],
                 &twiddles[table],
                 #[cfg(feature = "disk-spill")]
                 storage_mode,
-            );
+            )
+            .unwrap_or_else(|| {
+                P::expand_main_lde_row_major(
+                    trace,
+                    &domains[table],
+                    &twiddles[table],
+                    #[cfg(feature = "disk-spill")]
+                    storage_mode,
+                )
+            });
             stats.lde_expansion_wall += t_expand.elapsed();
             stats.main_lde_expansions += 1;
             let b = lde_bytes::<Field>(lde.0.len());
@@ -1537,13 +1778,22 @@ where
             Some(lde) => lde,
             None => {
                 let t_expand = std::time::Instant::now();
-                let lde = P::expand_aux_lde_row_major(
+                let lde = device_recompute_aux_lde::<Field, FieldExtension>(
                     trace,
                     &domains[table],
                     &twiddles[table],
                     #[cfg(feature = "disk-spill")]
                     storage_mode,
-                );
+                )
+                .unwrap_or_else(|| {
+                    P::expand_aux_lde_row_major(
+                        trace,
+                        &domains[table],
+                        &twiddles[table],
+                        #[cfg(feature = "disk-spill")]
+                        storage_mode,
+                    )
+                });
                 stats.lde_expansion_wall += t_expand.elapsed();
                 stats.aux_lde_expansions += 1;
                 let b = lde_bytes::<FieldExtension>(lde.0.len());

@@ -706,6 +706,95 @@ pub fn coset_lde_row_major_with_merkle_tree_keep(
     Ok((handle, lde_out))
 }
 
+/// Row-major coset LDE on device, transposed to column-major and kept resident,
+/// WITHOUT building any Merkle tree — for the batched prover, where the shared
+/// mixed-height MMCS is the one tree, so a per-table row-pair tree would be
+/// redundant on-device keccak (leaf hash + inner climb). The returned
+/// [`GpuLdeBase`] has `tree: None`; the caller absorbs `buf` (column-major,
+/// `col*lde_size + row`) straight into the shared streaming commit
+/// (`StreamingMixedMmcs::absorb_col_major_dev`).
+///
+/// The expansion + transpose are the SAME calls as
+/// [`coset_lde_row_major_with_merkle_tree_keep`] (`expand_row_major_on_stream`
+/// then `launch_row_to_col_major`), so the resident `buf` is byte-identical — it
+/// only skips the leaf hash, inner-tree build and root copy. `retain_host_lde`
+/// D2Hs the row-major LDE for host consumers (empty Vec when false; the
+/// device-resident batched path passes false). The trace-domain snapshot
+/// (`trace_dev`) is a LogUp-fingerprint concern of the per-table prover and is
+/// never taken here.
+pub fn coset_lde_row_major_keep_no_tree(
+    row_major: &[u64],
+    predev: Option<&CudaSlice<u64>>,
+    n: usize,
+    m: usize,
+    blowup_factor: usize,
+    weights: &[u64],
+    retain_host_lde: bool,
+) -> Result<(GpuLdeBase, Vec<u64>)> {
+    let input = match predev {
+        Some(d) if d.len() == row_major.len() => InnerInput::Dev(d),
+        _ => InnerInput::Host(row_major),
+    };
+    let input_len = match &input {
+        InnerInput::Host(h) => h.len(),
+        InnerInput::Dev(d) => d.len(),
+    };
+    assert_eq!(input_len, n * m);
+    assert!(n.is_power_of_two());
+    assert_eq!(weights.len(), n);
+    assert!(blowup_factor.is_power_of_two());
+    let lde_size = n * blowup_factor;
+    assert_u32_domain(lde_size, "coset_lde_row_major_keep_no_tree lde_size");
+    let lde_u64 = lde_size as u64;
+
+    let be = backend()?;
+    let stream = be.next_stream();
+
+    let (buf, _trace_col_major) =
+        expand_row_major_on_stream(&stream, be, input, n, m, blowup_factor, weights, false)?;
+
+    // D2H the row-major LDE only when a host consumer asks; the device-resident
+    // batched path passes false and keeps everything on device.
+    let lde_pending = if retain_host_lde {
+        Some(crate::device::async_dtoh_via(
+            &stream,
+            be.pinned_staging(),
+            &be.ctx,
+            &buf,
+            lde_size * m,
+        )?)
+    } else {
+        None
+    };
+
+    let col_major_dev = launch_row_to_col_major(&stream, be, &buf, lde_size, m, lde_u64)?;
+    // No host synchronize: the handle carries a `ready` event and consumers on
+    // other streams wait on it device-side (`wait_ready_on`), exactly as the
+    // tree-building keep path does.
+    let ready = be.take_event()?;
+    ready.event().record(&stream)?;
+
+    let lde_out = match lde_pending {
+        Some(p) => {
+            let mut out = vec![0u64; lde_size * m];
+            p.wait_into_u64(&mut out)?;
+            out
+        }
+        None => Vec::new(),
+    };
+
+    let handle = GpuLdeBase {
+        buf: Arc::new(col_major_dev),
+        m,
+        lde_size,
+        tree: None,
+        ready: Some(Arc::new(ready)),
+        trace_dev: None,
+        trace_rows: 0,
+    };
+    Ok((handle, lde_out))
+}
+
 /// Row-major LDE + TWO subset Merkle trees for preprocessed tables: the
 /// precomputed columns `[0, split_col)` and the multiplicity columns
 /// `[split_col, m)` commit to separate trees over the same row-major LDE,
@@ -876,6 +965,36 @@ pub fn coset_lde_ext3_row_major_with_merkle_tree_keep(
         lde_size: n * blowup_factor,
         tree: Some(tree),
         ready: Some(ready),
+    };
+    Ok((handle, lde_out))
+}
+
+/// Tree-less ext3 keep for the batched prover: expand the row-major ext3 trace
+/// to its coset LDE and keep it resident, building NO per-table Merkle tree (the
+/// shared MMCS is the tree). `Fp3 = [u64; 3]`, so this is the base no-tree keep
+/// over `m*3` columns; the resident `buf` is therefore the SLAB layout
+/// (component `k` of ext3 column `c` at `(c*3 + k)*lde_size + row`) that
+/// `mmcs_absorb_row_pair_ext3_slabs` reads — byte-identical leaves to the
+/// row-major ext3 absorb (both emit, per bit-reversed row, each column's 3
+/// components consecutively). Input: `row_major` is `n*m*3` u64s.
+pub fn coset_lde_ext3_row_major_keep_no_tree(
+    row_major: &[u64],
+    n: usize,
+    m: usize,
+    blowup_factor: usize,
+    weights: &[u64],
+    retain_host_lde: bool,
+) -> Result<(GpuLdeExt3, Vec<u64>)> {
+    let (base, lde_out) =
+        coset_lde_row_major_keep_no_tree(row_major, None, n, m * 3, blowup_factor, weights, retain_host_lde)?;
+    // `base.buf` is column-major over the `m*3` base columns = exactly the ext3
+    // slab layout; re-wrap the same resident buffer + ready event as a GpuLdeExt3.
+    let handle = GpuLdeExt3 {
+        buf: base.buf,
+        m,
+        lde_size: base.lde_size,
+        tree: None,
+        ready: base.ready,
     };
     Ok((handle, lde_out))
 }

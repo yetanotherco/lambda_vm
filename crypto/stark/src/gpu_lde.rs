@@ -858,6 +858,68 @@ where
     Some((tree, handle, lde_out))
 }
 
+/// Tree-less variant of [`try_expand_leaf_and_tree_row_major_keep`] for the
+/// batched prover: expand the row-major trace to its coset LDE on device and
+/// keep it resident column-major, building NO per-table Merkle tree — the shared
+/// mixed-height MMCS is the one tree, so a per-table row-pair tree here would be
+/// redundant on-device keccak. Returns the `GpuLdeBase` handle (`tree: None`,
+/// `buf` byte-identical to the tree-building path) and the row-major LDE (empty
+/// when `retain_host_lde=false`). `None` = declined (below threshold or not
+/// Goldilocks) so the caller falls back to a host-upload absorb.
+pub(crate) fn try_expand_row_major_keep_no_tree<F, E>(
+    row_major: &[FieldElement<E>],
+    predev: Option<&math_cuda::CudaSlice<u64>>,
+    n: usize,
+    m: usize,
+    blowup_factor: usize,
+    weights: &[FieldElement<F>],
+    retain_host_lde: bool,
+) -> Option<(math_cuda::lde::GpuLdeBase, Vec<FieldElement<E>>)>
+where
+    F: IsField + 'static,
+    E: IsField + 'static,
+{
+    let lde_size = n.saturating_mul(blowup_factor);
+    if lde_size < gpu_lde_threshold() {
+        return None;
+    }
+    if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
+        return None;
+    }
+    if TypeId::of::<E>() != TypeId::of::<GoldilocksField>() {
+        return None;
+    }
+    if row_major.len() != n * m || m == 0 || n == 0 {
+        return None;
+    }
+
+    let raw: &[u64] = unsafe { from_raw_parts(row_major.as_ptr() as *const u64, n * m) };
+    let weights_u64 = unsafe { weights_to_u64::<F>(weights) };
+
+    // Only the LDE columns are computed on device (no leaf hash / tree build), so
+    // bump only the LDE-call counter.
+    GPU_LDE_CALLS.fetch_add(m as u64, Ordering::Relaxed);
+
+    let (handle, lde_u64) = math_cuda::lde::coset_lde_row_major_keep_no_tree(
+        raw,
+        predev,
+        n,
+        m,
+        blowup_factor,
+        &weights_u64,
+        retain_host_lde,
+    )
+    .ok()?;
+
+    // Transmute Vec<u64> → Vec<FieldElement<E>> (zero-copy, E == GoldilocksField).
+    let lde_out: Vec<FieldElement<E>> = unsafe {
+        let mut v = std::mem::ManuallyDrop::new(lde_u64);
+        Vec::from_raw_parts(v.as_mut_ptr() as *mut FieldElement<E>, v.len(), v.capacity())
+    };
+
+    Some((handle, lde_out))
+}
+
 /// Convert a GPU-built full node buffer (`(2*leaves - 1) * 32` bytes, inner
 /// nodes first, root at offset 0, leaves at the tail) into a host
 /// [`MerkleTree`], the exact layout `from_precomputed_nodes` expects.
@@ -1052,6 +1114,73 @@ where
     let root = handle.tree.as_ref()?.root;
     let tree = MerkleTree::<B>::from_root(root);
     Some((tree, handle, lde_out))
+}
+
+/// Tree-less variant of [`try_expand_leaf_and_tree_ext3_row_major_keep`] for the
+/// batched aux round: expand the row-major ext3 trace to its coset LDE and keep
+/// it resident (slab layout), building NO per-table Merkle tree — the shared
+/// mixed-height MMCS is the tree. The caller absorbs the resident `buf` via
+/// `StreamingMixedMmcs::absorb_ext3_slabs_dev`, which produces the byte-identical
+/// aux leaf as the host row-major absorb. `None` = declined (below threshold or
+/// not Fp3) so the caller falls back to a host-upload absorb.
+pub(crate) fn try_expand_ext3_row_major_keep_no_tree<F, E>(
+    row_major: &[FieldElement<E>],
+    n: usize,
+    m: usize,
+    blowup_factor: usize,
+    weights: &[FieldElement<F>],
+    retain_host_lde: bool,
+) -> Option<(math_cuda::lde::GpuLdeExt3, Vec<FieldElement<E>>)>
+where
+    F: IsField + 'static,
+    E: IsField + 'static,
+{
+    let lde_size = n.saturating_mul(blowup_factor);
+    if lde_size < gpu_lde_threshold() {
+        return None;
+    }
+    if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
+        return None;
+    }
+    if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
+        return None;
+    }
+    if row_major.len() != n * m || m == 0 || n == 0 {
+        return None;
+    }
+
+    // Fp3 = [u64; 3] in memory — reinterpret as flat u64 slice (m3 = m*3).
+    let raw: &[u64] = unsafe { from_raw_parts(row_major.as_ptr() as *const u64, n * m * 3) };
+    let weights_u64 = unsafe { weights_to_u64::<F>(weights) };
+
+    // Only the LDE columns are computed on device (no leaf hash / tree build).
+    GPU_LDE_CALLS.fetch_add((m * 3) as u64, Ordering::Relaxed);
+
+    let (handle, lde_u64) = math_cuda::lde::coset_lde_ext3_row_major_keep_no_tree(
+        raw,
+        n,
+        m,
+        blowup_factor,
+        &weights_u64,
+        retain_host_lde,
+    )
+    .ok()?;
+
+    // Transmute Vec<u64> → Vec<FieldElement<E>> (zero-copy, E == Fp3 = [u64;3]).
+    let lde_out: Vec<FieldElement<E>> = unsafe {
+        let mut v = std::mem::ManuallyDrop::new(lde_u64);
+        debug_assert!(
+            v.len() % 3 == 0 && v.capacity() % 3 == 0,
+            "lde_u64 len/capacity must be a multiple of 3 for Fp3 reinterpret"
+        );
+        Vec::from_raw_parts(
+            v.as_mut_ptr() as *mut FieldElement<E>,
+            v.len() / 3,
+            v.capacity() / 3,
+        )
+    };
+
+    Some((handle, lde_out))
 }
 
 /// Ext3 specialisation of [`try_expand_columns_batched`]. `E` is known to be

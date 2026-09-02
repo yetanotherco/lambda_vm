@@ -400,7 +400,9 @@ pub(crate) struct LdeTwiddles<F: IsFFTField> {
     /// Size-`n` FORWARD set, built lazily — only the batched phase-4 coset
     /// evaluation wants it (a full LDE's forward set is size `n·blowup`).
     two_half_fwd_n: OnceLock<TwoHalfTwiddles<F>>,
-    coset_weights: Vec<FieldElement<F>>,
+    /// `pub(crate)` so the batched prover's device-resident main round can feed
+    /// the same coset weights to `gpu_lde::try_expand_leaf_and_tree_row_major_keep`.
+    pub(crate) coset_weights: Vec<FieldElement<F>>,
     /// Composition half-extension cache, initialized only when the degree-2
     /// decomposition path actually runs on CPU.
     composition: OnceLock<CompositionLdeTwiddles<F>>,
