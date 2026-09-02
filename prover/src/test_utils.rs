@@ -670,7 +670,10 @@ fn build_air<CS: ConstraintSet<F, E> + Clone + Send + Sync + 'static>(
     )
     .with_name(name);
     // Pre-capture the constraint IR so every clone carries it (the prover's
-    // GPU lowering and interpreter paths force it per instance otherwise).
+    // CUDA composition arm forces it per instance otherwise). NOT on the guest:
+    // the in-VM verifier reaches `build_air` through `VmAirs::new` and never
+    // calls `constraint_program()`.
+    #[cfg(not(target_arch = "riscv64"))]
     let _ = air.constraint_program();
     air_prototype_cache()
         .lock()
