@@ -4184,15 +4184,21 @@ pub trait IsStarkProver<
         );
         let transition_evals = air.compute_transition(&ctx);
 
+        // `1/(zᴺ − 1)` is shared by every transition constraint; only the
+        // end-exemptions correction varies per constraint.
+        let inv_zerofier_denominator = (-FieldElement::<Field>::one() + z.pow(trace_length))
+            .inv()
+            .unwrap();
         let mut denominators =
             vec![FieldElement::<FieldExtension>::zero(); air.num_transition_constraints()];
         air.constraints_meta().iter().for_each(|m| {
-            denominators[m.constraint_idx] = crate::constraints::zerofier::evaluate_zerofier(
-                m,
-                z,
-                &domain.trace_primitive_root,
-                trace_length,
-            );
+            denominators[m.constraint_idx] =
+                crate::constraints::zerofier::end_exemptions_correction(
+                    m.end_exemptions,
+                    z,
+                    &domain.trace_primitive_root,
+                    trace_length,
+                ) * &inv_zerofier_denominator;
         });
         let transition_sum = transition_evals
             .into_iter()
