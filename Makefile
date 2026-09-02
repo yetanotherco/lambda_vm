@@ -1,5 +1,6 @@
 .PHONY: deps deps-linux deps-macos compile-programs-asm compile-programs-rust compile-bench \
-compile-programs compile-recursion-elfs clean-asm clean-rust clean-bench clean-shared \
+compile-programs compile-recursion-elfs compile-prover-test-elfs check-prover-test-elfs \
+clean-asm clean-rust clean-bench clean-shared \
 clean-recursion-elfs clean test test-asm \
 test-rust test-ethrex test-ethrex-offline test-executor test-syscalls test-flamegraph flamegraph-prover test-profile-recursion test-profile-recursion-single test-profile-recursion-multi \
 test-profile-recursion-block recursion-profile-block-input \
@@ -47,6 +48,16 @@ ASM_ARTIFACTS := $(patsubst $(ASM_PROGRAMS_DIR)/%.s,$(ASM_ARTIFACTS_DIR)/%.elf,$
 RUST_PROGRAM_DIRS := $(dir $(wildcard $(RUST_PROGRAMS_DIR)/*/Cargo.toml))
 RUST_PROGRAMS := $(notdir $(basename $(RUST_PROGRAM_DIRS:%/=%)))
 RUST_ARTIFACTS := $(addprefix $(RUST_ARTIFACTS_DIR)/, $(addsuffix .elf, $(RUST_PROGRAMS)))
+
+# The Rust guests the prover test suite reads as prebuilt artifacts. The prover
+# targets build these instead of all $(RUST_PROGRAMS) because the .elf rules are
+# FORCE (see below), so the full set would compile 27 guest crates the prover
+# suite never opens. What that buys is the first build on a clean checkout: once
+# the target dir is warm the extra FORCE re-entries are about a second for all 35,
+# so this list is not worth widening for anything but correctness.
+# `check-prover-test-elfs` fails if a prover test reads one that is missing here.
+PROVER_TEST_GUESTS := allocator commit_sum ecsm ef_io_demo ethrex hint_min hint_multi pure_commit
+PROVER_TEST_ARTIFACTS := $(addprefix $(RUST_ARTIFACTS_DIR)/, $(addsuffix .elf, $(PROVER_TEST_GUESTS)))
 
 BENCH_PROGRAM_DIRS := $(dir $(wildcard $(BENCH_PROGRAMS_DIR)/*/Cargo.toml))
 BENCH_PROGRAMS := $(notdir $(basename $(BENCH_PROGRAM_DIRS:%/=%)))
@@ -170,6 +181,27 @@ compile-bench: prepare-sysroot $(BENCH_ARTIFACTS)
 compile-programs: compile-programs-asm compile-programs-rust compile-bench compile-recursion-elfs
 
 compile-recursion-elfs: prepare-sysroot $(RECURSION_ARTIFACTS) $(RECURSION_VERIFIER_ARTIFACTS)
+
+# Everything the prover suite reads off disk: the asm guests (via run_asm_elf),
+# the Rust guests listed above, and the recursion guests.
+compile-prover-test-elfs: compile-programs-asm compile-recursion-elfs $(PROVER_TEST_ARTIFACTS)
+
+# Guards the list against drift, in both directions. A prover test that reads a
+# Rust guest missing from $(PROVER_TEST_GUESTS) passes in CI (which builds every
+# guest) and panics with "elf not found" on a clean checkout running
+# `make test-prover` — that is how this got here. An entry left behind after its
+# guest is deleted is the mirror image: `compile-prover-test-elfs` then asks cargo
+# to build a directory that no longer exists, and nothing flags it at review time.
+# The empty-match case is a failure too: it means the path moved or the tests now
+# build the name at runtime, either of which silently disarms the guard.
+# Run from `lint`.
+# Rust guests only — the asm and recursion artifacts are built wholesale, so no
+# list can go stale for them. A prover test reading a bench guest (none do today)
+# would need its own entry here.
+check-prover-test-elfs:
+	@grep -rhoE 'program_artifacts/rust/[A-Za-z0-9_-]+\.elf' prover/src prover/tests prover/benches \
+		| sed -E 's#.*/##; s#\.elf$$##' | sort -u \
+		| awk -v known="$(PROVER_TEST_GUESTS)" 'BEGIN { n = split(known, a, " "); for (i = 1; i <= n; i++) k[a[i]] = 1 } { seen[$$0] = 1 } !($$0 in k) { if (!missing++) print "check-prover-test-elfs: prover tests read Rust guests missing from PROVER_TEST_GUESTS:"; print "  " $$0 } END { if (!NR) { print "check-prover-test-elfs: no program_artifacts/rust/*.elf reads found in prover/ — the grep pattern went stale, fix it or the guard checks nothing."; exit 1 } for (i = 1; i <= n; i++) if (!(a[i] in seen)) { if (!stale++) print "check-prover-test-elfs: PROVER_TEST_GUESTS entries no prover test reads:"; print "  " a[i] } if (missing) print "Add them to PROVER_TEST_GUESTS in the Makefile."; if (stale) print "Remove them from PROVER_TEST_GUESTS in the Makefile."; if (missing || stale) exit 1 }'
 
 $(RECURSION_ARTIFACTS_DIR):
 	mkdir -p $@
@@ -461,7 +493,8 @@ test-ethrex: compile-programs-rust ethrex-real-block-fixture
 test-ethrex-offline: compile-programs-rust
 	cd tooling/ethrex-tests && cargo test --release -- --include-ignored --skip test_ethrex_real_block
 
-test-flamegraph:
+# executor/tests/flamegraph.rs reads prebuilt asm and Rust guests off disk.
+test-flamegraph: compile-programs-asm compile-programs-rust
 	cargo test -p executor --test flamegraph
 
 test-profile-recursion: test-profile-recursion-single test-profile-recursion-multi
@@ -539,29 +572,30 @@ test: compile-programs test-syscalls test-ethrex-crypto
 
 # === Quick test shortcuts ===
 
-# Fast prover tests (skips ignored slow tests). Recursion smoke/PoC tests read
-# prebuilt guest ELFs, so build them first.
-test-fast: compile-recursion-elfs
+# Fast prover tests (skips ignored slow tests). The executor leg reads most of
+# the Rust guests, so this one needs the full set rather than the prover subset.
+test-fast: compile-programs-asm compile-programs-rust compile-recursion-elfs
 	cargo test -p lambda-vm-prover -p stark -p executor -F stark/parallel
 
 # Prover tests only
-test-prover: compile-recursion-elfs
+test-prover: compile-prover-test-elfs
 	cargo test -p lambda-vm-prover
 
 # Prover tests including slow ones. The recursion smoke tests read prebuilt
 # guest ELFs from executor/program_artifacts/recursion/ — the fast ones on every
 # run, the slow ones (still #[ignore]d) only under --include-ignored — so build
 # them first.
-test-prover-all: compile-recursion-elfs
+test-prover-all: compile-prover-test-elfs
 	cargo test -p lambda-vm-prover -- --include-ignored
 
 # Prover tests with debug-checks (shows bus balance report). Also unfiltered, so
 # it runs the non-ignored recursion tests that read prebuilt guest ELFs.
-test-prover-debug: compile-recursion-elfs
+test-prover-debug: compile-prover-test-elfs
 	cargo test -p lambda-vm-prover --features debug-checks -- --nocapture
 
 # Disk-spill tests (stark + prover). FORCE_DISK_SPILL is required by the prover tests.
-test-disk-spill:
+# The count_table_lengths filter picks up the drift tests, which read hint_min.elf.
+test-disk-spill: compile-prover-test-elfs
 	cargo test --release -p stark --features disk-spill disk_spill
 	FORCE_DISK_SPILL=1 cargo test --release -p lambda-vm-prover --features disk-spill -- disk_spill count_table_lengths
 
@@ -582,7 +616,8 @@ test-math-cuda:
 # Asserts the R1-R4 GPU dispatch counters fired on a real prove.
 # --test-threads=1: these tests reset and assert on process-global GPU call
 # counters, so they must run serially or one test's reset races another's read.
-test-cuda-integration:
+# compile-programs-asm: these tests prove a prebuilt asm guest (asm_elf_bytes).
+test-cuda-integration: compile-programs-asm
 	$(GPU_TEST_TIMEOUT) cargo test -p lambda-vm-prover --release --features cuda \
 	    --test cuda_path_integration -- --ignored --nocapture --test-threads=1
 
@@ -608,14 +643,17 @@ test-cuda-integration:
 #
 # Its own binary + a process-wide env because gpu_lde_threshold() caches the value
 # on first read (OnceLock), so it must be set before any prove in the process.
-test-cuda-d1:
+# compile-programs-asm: the fixture (all_instructions_64) is a prebuilt asm guest.
+test-cuda-d1: compile-programs-asm
 	LAMBDA_VM_GPU_LDE_THRESHOLD=128 $(GPU_TEST_TIMEOUT) cargo test -p lambda-vm-prover \
 	    --release --features cuda \
 	    --test cuda_d1_path -- --ignored --nocapture --test-threads=1
 
 # GPU error-path coverage (requires NVIDIA GPU + nvcc).
 # Forces cuda dispatch errors and asserts the CPU fallback still produces a verifying proof.
-test-cuda-fallback:
+# cuda_fallback_tests proves a prebuilt asm guest (asm_elf_bytes); gpu_force_downgrade
+# reads the ethrex Rust guest. Naming the one artifact keeps this off the other seven.
+test-cuda-fallback: compile-programs-asm $(RUST_ARTIFACTS_DIR)/ethrex.elf
 	$(GPU_TEST_TIMEOUT) cargo test -p lambda-vm-prover --release --features test-cuda-faults \
 	    --test cuda_fallback_tests -- --ignored --nocapture --test-threads=1
 	$(GPU_TEST_TIMEOUT) cargo test -p lambda-vm-prover --release --features lambda-vm-prover/cuda \
@@ -625,16 +663,17 @@ test-cuda-fallback:
 # GPU + nvcc). The GPU CI counterpart of CPU CI's sharded prover tests. Single-threaded: the
 # GPU serializes proves and the dispatch counters are process-global. cuda on prover cascades
 # to stark; crypto/ecsm build without it (they have no GPU path).
-# compile-recursion-elfs: this unfiltered run executes the non-ignored recursion
-# smoke tests, which read prebuilt guest ELFs; scripts/gpu_test.sh otherwise never builds them.
-test-prover-cuda: compile-recursion-elfs
+# compile-prover-test-elfs: this unfiltered run executes the non-ignored tests that
+# read prebuilt guest ELFs; scripts/gpu_test.sh otherwise never builds them.
+test-prover-cuda: compile-prover-test-elfs
 	$(GPU_TEST_TIMEOUT) cargo test --release -p lambda-vm-prover -p stark -p crypto -p ecsm \
 	    --features lambda-vm-prover/cuda -- --test-threads=1
 
 # The comprehensive all-instructions prove (ignored by default) on the GPU path (requires
 # NVIDIA GPU + nvcc). GPU counterpart of the all-instructions half of CPU CI's merge-queue-only
 # comprehensive job (the CPU job also runs test_recursion_execute; recursion has no GPU leg yet).
-test-prover-comprehensive-cuda:
+# compile-programs-asm: all_instructions_64 is a prebuilt asm guest.
+test-prover-comprehensive-cuda: compile-programs-asm
 	$(GPU_TEST_TIMEOUT) cargo test --release -p lambda-vm-prover --features cuda \
 	    test_prove_elfs_all_instructions_64_full -- --ignored --test-threads=1 --nocapture
 
@@ -643,12 +682,13 @@ bench-math-cuda:
 	cargo test -p math-cuda --release --test bench_quick -- --ignored --nocapture
 
 # Single-prove wall-time bench (warm-up + profiled run of fib_iterative_1M).
-bench-prover:
+# compile-programs-asm: fib_iterative_1M is a prebuilt asm guest (asm_elf_bytes).
+bench-prover: compile-programs-asm
 	cargo test -p lambda-vm-prover --release --test bench_single -- --ignored --nocapture
 
 # Single-prove wall-time bench with the GPU LDE path enabled.
 # Needs an NVIDIA GPU + CUDA toolkit/driver.
-bench-prover-cuda:
+bench-prover-cuda: compile-programs-asm
 	cargo test -p lambda-vm-prover --release --features cuda --test bench_single -- --ignored --nocapture
 
 # Build all
@@ -672,7 +712,7 @@ fmt:
 	cargo fmt --all
 
 # Run clippy + fmt check (used by CI)
-lint:
+lint: check-prover-test-elfs
 	cargo fmt --check --all
 	cargo clippy --workspace --all-targets -- -D warnings -A clippy::op_ref
 	cargo clippy --workspace --all-targets --no-default-features --features lambda-vm-prover/debug-checks -- -D warnings -A clippy::op_ref
