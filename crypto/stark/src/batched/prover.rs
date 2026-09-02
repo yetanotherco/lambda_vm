@@ -159,6 +159,16 @@ struct LdePair<Field: IsField, FieldExtension: IsField> {
     main: (Vec<FieldElement<Field>>, usize),
     aux: (Vec<FieldElement<FieldExtension>>, usize),
     bytes: usize,
+    /// Resident device LDE handles, present when `materialize_ldes` recomputed on
+    /// the GPU. `lde_trace_take` attaches them to the `LDETraceTable` so R2
+    /// constraint eval and R4 DEEP fire their device paths (they read
+    /// `gpu_main`/`gpu_aux`); the host LDE above is kept alongside so `want_host`
+    /// still drains parts to host and the host fallback stays valid
+    /// (`host_trace_empty` = false). `None` on the host / retained paths.
+    #[cfg(feature = "cuda")]
+    gpu_main: Option<math_cuda::lde::GpuLdeBase>,
+    #[cfg(feature = "cuda")]
+    gpu_aux: Option<math_cuda::lde::GpuLdeExt3>,
 }
 
 /// Prove one epoch with batched commitments.
@@ -1618,19 +1628,20 @@ where
 /// them.
 #[allow(clippy::too_many_arguments)]
 /// Recompute a table's MAIN LDE on the GPU — the VRAM recompute mechanism: a
-/// cheap device coset NTT → the row-major LDE downloaded to host, BYTE-IDENTICAL
-/// to `expand_main_lde_row_major` (same DFT, exact modular arithmetic) but off
-/// the CPU. `None` = ineligible (below the device threshold / not Goldilocks /
-/// disk-spilled) → the caller falls back to the host FFT. Only the row-major host
-/// LDE is kept here; the resident handle (its col-major buf) is dropped — a later
-/// 3c step keeps it resident to skip the download and run R2/R3/R4 on-device.
+/// cheap device coset NTT. Returns the row-major host LDE (BYTE-IDENTICAL to
+/// `expand_main_lde_row_major` — same DFT, exact modular arithmetic — kept so the
+/// parts drain + the host fallback stay valid) AND the resident device handle,
+/// which `lde_trace_take` attaches to the `LDETraceTable` so R2 constraint eval /
+/// R4 DEEP fire their device paths (`evaluate_dev` / `try_deep_composition_gpu`
+/// read `gpu_main`/`gpu_aux`, not `host_trace_empty`). `None` = ineligible (below
+/// the device threshold / not Goldilocks / disk-spilled) → host FFT.
 #[cfg(feature = "cuda")]
 fn device_recompute_main_lde<Field, FieldExtension>(
     trace: &TraceTable<Field, FieldExtension>,
     domain: &Domain<Field>,
     twiddles: &crate::prover::LdeTwiddles<Field>,
     #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
-) -> Option<(Vec<FieldElement<Field>>, usize)>
+) -> Option<(Vec<FieldElement<Field>>, usize, math_cuda::lde::GpuLdeBase)>
 where
     Field: IsFFTField + IsSubFieldOf<FieldExtension> + 'static,
     FieldExtension: IsField + 'static,
@@ -1645,7 +1656,7 @@ where
         return None;
     }
     let n = trace_slice.len() / num_cols;
-    let (_handle, host_lde) = crate::gpu_lde::try_expand_row_major_keep_no_tree::<Field, Field>(
+    let (handle, host_lde) = crate::gpu_lde::try_expand_row_major_keep_no_tree::<Field, Field>(
         trace_slice,
         trace.main_rowmajor_dev(),
         n,
@@ -1654,21 +1665,7 @@ where
         &twiddles.coset_weights,
         true,
     )?;
-    Some((host_lde, num_cols))
-}
-
-#[cfg(not(feature = "cuda"))]
-fn device_recompute_main_lde<Field, FieldExtension>(
-    _trace: &TraceTable<Field, FieldExtension>,
-    _domain: &Domain<Field>,
-    _twiddles: &crate::prover::LdeTwiddles<Field>,
-    #[cfg(feature = "disk-spill")] _storage_mode: StorageMode,
-) -> Option<(Vec<FieldElement<Field>>, usize)>
-where
-    Field: IsFFTField + IsSubFieldOf<FieldExtension> + 'static,
-    FieldExtension: IsField + 'static,
-{
-    None
+    Some((host_lde, num_cols, handle))
 }
 
 /// Aux counterpart of [`device_recompute_main_lde`] (ext3 row-major LDE).
@@ -1678,7 +1675,7 @@ fn device_recompute_aux_lde<Field, FieldExtension>(
     domain: &Domain<Field>,
     twiddles: &crate::prover::LdeTwiddles<Field>,
     #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
-) -> Option<(Vec<FieldElement<FieldExtension>>, usize)>
+) -> Option<(Vec<FieldElement<FieldExtension>>, usize, math_cuda::lde::GpuLdeExt3)>
 where
     Field: IsFFTField + IsSubFieldOf<FieldExtension> + 'static,
     FieldExtension: IsField + 'static,
@@ -1692,7 +1689,7 @@ where
         return None;
     }
     let n = trace_slice.len() / num_cols;
-    let (_handle, host_lde) =
+    let (handle, host_lde) =
         crate::gpu_lde::try_expand_ext3_row_major_keep_no_tree::<Field, FieldExtension>(
             trace_slice,
             n,
@@ -1701,21 +1698,7 @@ where
             &twiddles.coset_weights,
             true,
         )?;
-    Some((host_lde, num_cols))
-}
-
-#[cfg(not(feature = "cuda"))]
-fn device_recompute_aux_lde<Field, FieldExtension>(
-    _trace: &TraceTable<Field, FieldExtension>,
-    _domain: &Domain<Field>,
-    _twiddles: &crate::prover::LdeTwiddles<Field>,
-    #[cfg(feature = "disk-spill")] _storage_mode: StorageMode,
-) -> Option<(Vec<FieldElement<FieldExtension>>, usize)>
-where
-    Field: IsFFTField + IsSubFieldOf<FieldExtension> + 'static,
-    FieldExtension: IsField + 'static,
-{
-    None
+    Some((host_lde, num_cols, handle))
 }
 
 fn materialize_ldes<Field, FieldExtension, PI, P>(
@@ -1740,30 +1723,49 @@ where
 {
     let (_, trace, _) = &air_trace_pairs[table];
     let mut bytes = 0usize;
+    // Resident device handles captured from a GPU recompute; attached to the
+    // trace by `lde_trace_take` so R2/R4 fire their device paths.
+    #[cfg(feature = "cuda")]
+    let mut gpu_main: Option<math_cuda::lde::GpuLdeBase> = None;
+    #[cfg(feature = "cuda")]
+    let mut gpu_aux: Option<math_cuda::lde::GpuLdeExt3> = None;
 
     let main = match retained_main[table].take() {
         Some(lde) => lde,
         None => {
             let t_expand = std::time::Instant::now();
             // Recompute on the GPU (cheap device NTT) when eligible — the VRAM
-            // recompute mechanism; falls back to the host FFT below threshold /
-            // non-Goldilocks / disk-spill. Byte-identical either way.
-            let lde = device_recompute_main_lde::<Field, FieldExtension>(
+            // recompute mechanism; the resident handle is kept + attached to the
+            // trace so R2/R4 run on device. Falls back to the host FFT below
+            // threshold / non-Goldilocks / disk-spill. Byte-identical either way.
+            #[cfg(feature = "cuda")]
+            let lde = match device_recompute_main_lde::<Field, FieldExtension>(
                 trace,
                 &domains[table],
                 &twiddles[table],
                 #[cfg(feature = "disk-spill")]
                 storage_mode,
-            )
-            .unwrap_or_else(|| {
-                P::expand_main_lde_row_major(
+            ) {
+                Some((host_lde, cols, handle)) => {
+                    gpu_main = Some(handle);
+                    (host_lde, cols)
+                }
+                None => P::expand_main_lde_row_major(
                     trace,
                     &domains[table],
                     &twiddles[table],
                     #[cfg(feature = "disk-spill")]
                     storage_mode,
-                )
-            });
+                ),
+            };
+            #[cfg(not(feature = "cuda"))]
+            let lde = P::expand_main_lde_row_major(
+                trace,
+                &domains[table],
+                &twiddles[table],
+                #[cfg(feature = "disk-spill")]
+                storage_mode,
+            );
             stats.lde_expansion_wall += t_expand.elapsed();
             stats.main_lde_expansions += 1;
             let b = lde_bytes::<Field>(lde.0.len());
@@ -1778,22 +1780,34 @@ where
             Some(lde) => lde,
             None => {
                 let t_expand = std::time::Instant::now();
-                let lde = device_recompute_aux_lde::<Field, FieldExtension>(
+                #[cfg(feature = "cuda")]
+                let lde = match device_recompute_aux_lde::<Field, FieldExtension>(
                     trace,
                     &domains[table],
                     &twiddles[table],
                     #[cfg(feature = "disk-spill")]
                     storage_mode,
-                )
-                .unwrap_or_else(|| {
-                    P::expand_aux_lde_row_major(
+                ) {
+                    Some((host_lde, cols, handle)) => {
+                        gpu_aux = Some(handle);
+                        (host_lde, cols)
+                    }
+                    None => P::expand_aux_lde_row_major(
                         trace,
                         &domains[table],
                         &twiddles[table],
                         #[cfg(feature = "disk-spill")]
                         storage_mode,
-                    )
-                });
+                    ),
+                };
+                #[cfg(not(feature = "cuda"))]
+                let lde = P::expand_aux_lde_row_major(
+                    trace,
+                    &domains[table],
+                    &twiddles[table],
+                    #[cfg(feature = "disk-spill")]
+                    storage_mode,
+                );
                 stats.lde_expansion_wall += t_expand.elapsed();
                 stats.aux_lde_expansions += 1;
                 let b = lde_bytes::<FieldExtension>(lde.0.len());
@@ -1807,7 +1821,15 @@ where
     };
 
     let _ = residency;
-    LdePair { main, aux, bytes }
+    LdePair {
+        main,
+        aux,
+        bytes,
+        #[cfg(feature = "cuda")]
+        gpu_main,
+        #[cfg(feature = "cuda")]
+        gpu_aux,
+    }
 }
 
 /// Give a table's LDEs back to the retention slots, or drop them.
@@ -1849,11 +1871,32 @@ where
     Field: IsFFTField + IsSubFieldOf<FieldExtension>,
     FieldExtension: IsField,
 {
-    let LdePair { main, aux, bytes } = ldes;
-    (
-        LDETraceTable::from_row_major(main.0, main.1, aux.0, aux.1, step_size, blowup_factor),
+    let LdePair {
+        main,
+        aux,
         bytes,
-    )
+        #[cfg(feature = "cuda")]
+        gpu_main,
+        #[cfg(feature = "cuda")]
+        gpu_aux,
+    } = ldes;
+    #[allow(unused_mut)]
+    let mut lde_trace =
+        LDETraceTable::from_row_major(main.0, main.1, aux.0, aux.1, step_size, blowup_factor);
+    // Attach resident LDE handles (GPU recompute) so R2 constraint eval / R4 DEEP
+    // read them on device. `host_trace_empty` intentionally stays FALSE: the host
+    // LDE is present, so `want_host` still drains parts to host and the host
+    // fallback stays valid for tables whose device path declines.
+    #[cfg(feature = "cuda")]
+    {
+        if let Some(h) = gpu_main {
+            lde_trace.set_gpu_main(h);
+        }
+        if let Some(h) = gpu_aux {
+            lde_trace.set_gpu_aux(h);
+        }
+    }
+    (lde_trace, bytes)
 }
 
 /// Take the buffers back out of the trace view for release or retention —
@@ -1870,6 +1913,13 @@ where
         main: (lde_trace.main_data, lde_trace.num_main_cols),
         aux: (lde_trace.aux_data, lde_trace.num_aux_cols),
         bytes,
+        // The resident handles (if any) live in `lde_trace` and drop with it here;
+        // under RecomputeLde (the only path that attaches them) release drops
+        // everything and the next phase recomputes.
+        #[cfg(feature = "cuda")]
+        gpu_main: None,
+        #[cfg(feature = "cuda")]
+        gpu_aux: None,
     }
 }
 
