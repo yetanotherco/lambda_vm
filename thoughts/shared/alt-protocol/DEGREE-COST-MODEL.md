@@ -29,24 +29,23 @@ them via `LVM_DEGREE_DECLARED`, so each can be priced alone. All three arms use 
 width and rows with zero interactions, so committed cells are identical **by
 construction** — the test asserts equality rather than assuming it.
 
-⚠ **PROVISIONAL — laptop, one small shape (2^18 rows × 32 cols, blowup 4, 110 q).**
-Server confirmation over a row-size ladder is pending; treat the split as more reliable
-than the absolute percentage.
+✓ **MEASURED ON AN IDLE BOX** (195.139.71.84, 2026-09-01, 5–6 replicates per arm,
+interleaved ABBA, CV 0.14–0.83% — well inside the campaign's wall-clock reproducibility).
+Blowup 4, real 110-query shape, W = 32, `aux = 0`, cells asserted equal across arms.
 
-| arm | true degree | parts | mean prove s | n | cells (`main + 3·aux`) |
+| rows | cells (`main + 3·aux`) | C − A (parts) | B − C (arithmetic) | B − A (total) | parts share |
 |---|---|---|---|---|---|
-| A | 3 | 2 | 2.2485 | 3 | 8,388,608 |
-| C | 3 | **4** | 2.4115 | 3 | 8,388,608 |
-| B | **5** | 4 | 2.4734 | 4 | 8,388,608 |
+| 2^18 | 8,388,608 | +3.96% | +2.59% | **+6.54%** | 60.5% |
+| 2^20 | 33,554,432 | +4.86% | +3.16% | **+8.01%** | 60.6% |
+| 2^22 | 134,217,728 | +5.13% | +2.86% | **+7.99%** | 64.2% |
 
-* **C − A = +7.25%** — the extra composition parts
-* **B − C = +2.57%** — the degree-5 arithmetic
-* **B − A = +10.00%** — total, degree 3 → 5 at fixed cells
+**Degree 3 → 5 at fixed cells costs +6.5% to +8.0% of prove time**, and **~60–64% of
+that is the composition part count, ~36–40% the arithmetic**. The split is stable
+across a 16× range of cells, drifting slightly *toward* parts as size grows.
 
-**≈72% of the cost of degree is the part count; ≈28% is the raw arithmetic.** The
-mechanism that bites is commitment and opening work, not multiplication count. Arm C
-exists precisely so this could have been refuted — had parts been free it would have
-landed near zero — and it was not refuted.
+⚠ The earlier provisional laptop figures (+10.0% total, 72% parts, one shape at 2^18)
+**overstated both**. Superseded; do not quote them. The direction and the mechanism
+survived, the magnitudes did not — which is the reason the ladder was run.
 
 The 72% half is also the half the recursive verifier pays, per query. It is priced there
 in §3 and is nearly free (+0.45% permutations at blowup 4). No contradiction: the prover
@@ -260,6 +259,41 @@ double the keccak-call delta, the tail is material and §3.3's −29% headline m
 re-derived in cycles rather than permutations.** Anything inside the table above leaves
 the headline standing as measured.
 
+#### Outcome — ✓ MEASURED, refutation condition NOT met
+
+`blowup4`, `empty` inner, big box, both arms PRE-949:
+
+| | d = 3 (`bb3da304`) | d = 7 (`a3cd3c0c`) | Δ |
+|---|---|---|---|
+| guest cycles | 366,345,048 | 369,065,929 | **+0.743%** |
+| keccak calls | 189,337 | 191,546 | **+1.167%** |
+
+Both deltas are far above the ±100k cycle noise floor.
+
+**Cycles grew more slowly than keccak calls** — ratio 0.64, against a refutation
+threshold of 2.0, and +0.74% against a threshold of 3%. So the marginal work the extra
+parts create is *less* cycle-intensive per hash than the verifier's average mix: there
+is no positive non-hash tail to find. **The degree axis is confirmed in guest cycles and
+is even cheaper there than in permutations.**
+
+Honest scoring of the prediction: the refutation logic held, but **both point ranges
+were slightly high** — predicted keccak +1.3–1.5% against an actual +1.17%, predicted
+cycles +1–2% against an actual +0.74%. The host-side permutation counter still predicted
+the in-guest keccak delta to within the spread of its two calibration workloads (+0.90%
+on bench_32k, +1.39% on `sub`, actual +1.17%), which validates it as the cheap
+instrument for this axis.
+
+⚠ **What this does and does not confirm.** §3.3's −29% headline combines two axes: the
+degree axis (+parts) and the blowup axis (110 → 73 queries). **Only the degree axis is
+now confirmed in cycles.** The blowup axis remains measured in permutations alone, and
+per-proof work that does *not* scale with queries (archive handling, transcript setup,
+the program-id ELF keccak) is a larger share of cycles than of permutations — so the
+cycle-side blowup saving is plausibly somewhat *less* than −29.7%. Closing this is one
+arm-pair: `bench_recursion_cycles.sh a3cd3c0c bb3da304 blowup8`, which yields the
+blowup axis in cycles (its d=3 number against the 366,345,048 above) and the deployable
+d=7 point in one run. Until then, **quote −29% as a permutation result, not a cycle
+result.**
+
 ### 3.5 Honest scaling
 
 ⚖ ASSESSMENT. The lever moves the ten constraint-carrying tables; the other fifteen
@@ -323,17 +357,54 @@ Holding the path constant (both arms generic), 2 parts vs 4 parts moved the
 decomposition timer by nothing measurable (0.455 s vs 0.445 s) — the dominant term is
 the single full-size inverse FFT, whose cost is independent of the part count.
 
-### 4.3 What still needs the box
+### 4.3 ★ Peak RSS is FLAT across part count
 
-⧗ **NOT MEASURED: peak RSS and wall clock at real scale.** Local workloads run in
-~1–4 s with ~15% warmup drift, which swamps the effect; §4.1's volumes are exact but
-they are a *proxy* for memory and time, not a measurement of them. The established
-affine law (`1.242 GiB + 33.94 B/cell`, R² 0.989) predicts RSS from §4.1's volumes,
-but that law was fitted over **trace** cells and I have not verified the slope
-transfers to the composition-part population — arms B0–B2 exist to check exactly that,
-and they need the box.
+✓ MEASURED, and it answers the slope-transfer question more cleanly than the question
+was asked. One arm per process under `/usr/bin/time -v`, 2^22 rows × 32 columns,
+blowup 4, identical cells:
 
----
+| arm | parts | peak RSS (kB) | vs A |
+|---|---|---|---|
+| A | 2 | 10,878,284 | — |
+| C | 4 | 10,878,440 | +0.0014% |
+| B | 4 (degree-5 constraints) | 10,878,088 | −0.0018% |
+
+Spread across all three: **352 kB on 10.88 GB, ±0.003%.**
+
+**Composition parts move wall time but not the memory high-water mark**, at least at
+this scale. The parts are built and committed after the trace LDE peak has already been
+set, and their allocations fit underneath it.
+
+⚖ ASSESSMENT: this means the affine RSS law (`1.242 GiB + 33.94 B/cell`, fitted over
+*trace* cells) does **not** need its slope extended to the composition-part population
+— the population contributes ~nothing to peak RSS. That is a stronger and simpler
+statement than "the slope transfers", and it matters for the 128 GiB envelope: **raising
+constraint degree does not raise the memory ceiling.** Degree is a time cost, not a
+memory cost.
+
+Bounds on the claim: measured at parts 2 → 4, `aux = 0`, one width, one blowup. Parts 6
+and a bus-heavy real-VM shape are unverified — that is the re-queued sweep's job (§4.4).
+
+### 4.4 The real-VM prover sweep — NOT YET MEASURED (my bug)
+
+The B0–B5 + C0 sweep did not produce data. Every one of its 30 arms recorded `NA`, and
+the run exited 0, so it looked superficially like a completed job. **Peak RSS of ~4 MB
+was the tell** — three orders of magnitude too small for a prove.
+
+Cause: the VM arms read a compiled ASM artifact, and `executor/program_artifacts/` is
+**not tracked in git**, so the box's fresh clone had none; every arm panicked on the
+missing ELF in milliseconds. My script neither built the artifacts nor checked for them,
+and wrote `NA` rather than stopping.
+
+Fixed in `1c3e41fc`: the sweep now runs `make compile-programs-asm`, verifies the
+artifact exists and fails fast with the reason if not, and **aborts on the first arm
+that yields no wall time** instead of recording a grid of NA. Mutation-tested in a fresh
+artifact-less worktree — a bogus program name now fails fast where it previously
+produced the full NA grid.
+
+Worth noting the asymmetry: the guest lane had exactly this shape of guard for a missing
+sysroot, and it worked — it cost seconds instead of an hour. The prover lane did not have
+one. A failure that produces plausible-looking output is worse than one that crashes.
 
 ## 5. What I could not measure, and why
 
@@ -427,7 +498,12 @@ themselves. `aux = 0` here because their interaction count is unspecified; add
 4. **Budget the extra parts as trace columns.** One part = three main columns. That
    single conversion answers most "can we afford it" questions without measurement.
 
-5. If d ≥ 5 is chosen, **write a specialised decomposition** for the resulting part
+5. **Degree costs time, not memory.** Peak RSS was flat to ±0.003% across parts 2 → 4
+   at identical cells (§4.3), so raising constraint degree does not push against a
+   memory envelope — only against the clock. If the binding constraint is 128 GiB
+   rather than wall time, degree is close to free.
+
+6. If d ≥ 5 is chosen, **write a specialised decomposition** for the resulting part
    count. The generic fallback costs 2.12× the hand-written 2-part path (§4.2) and that
    penalty is implementation, not mathematics.
 
