@@ -79,15 +79,33 @@ Each helper lookup is modeled by its contract, not its implementation:
    cannot reveal. Here, `AreBytes` on `Cxz_left`/`rot_left`/`rot_right` is carried by
    declaring those variables 8-bit bitvectors, and the θ carry `Cxz_right` is pinned
    directly to `ZeroExt(7, Extract(15, 15, in))`, with the separate `IS_BIT` disjunct
-   redundant *in the model*. Both are `load-bearing` in the circuit
-   (the `keccak_rnd.rs` module doc-comment and the `KeccakRndConstraints`
-   doc-comment: the 20 μ-gated `IS_BIT`s make the θ shift decomposition
-   unique). Because neither can be removed from the model's constraint
-   list, **deleting them from the Rust leaves this gate printing `VERIFIED`** while
-   the θ `left` halfwords go free — `2¹⁶` is invertible mod `p`, so the forged
-   assignment exists. The model's pin is a sound *consequence* of the shipped
-   constraints today, which is why the current board is meaningful; what it is not is
-   a test that those constraints are still there.
+   redundant *in the model*. Because none of them can be removed from the model's
+   constraint list, **deleting them from the Rust leaves this gate printing
+   `VERIFIED`**. `necessity_theta.py` / `necessity_rho.py` / `witness_fullchip.py`
+   measure exactly what each one is worth, and the answer is **not uniform** — do not
+   summarise it as "they are all load-bearing":
+
+   | dropped | θ (`Cxz_left` / `Cxz_right`) | ρ (`rot_left` / `rot_right`) |
+   |---|---|---|
+   | the `left` range check | sound — implied | **FORGEABLE** |
+   | the `right` range check | sound — implied | sound — implied |
+   | both | **FORGEABLE** | **FORGEABLE**, output entirely free |
+
+   So in θ the *pair* is load-bearing and neither half is on its own, while in ρ
+   **`rot_left`'s check is load-bearing by itself**. The asymmetry is not incidental:
+   `left` and `right` enter the identity with weights `1` and `2¹⁶`, so bounding
+   `left` kills the deviation `(L, R) → (L − 2¹⁶d, R + d)` outright, while bounding
+   `right` only narrows it — and whether `d = ±1` still fits depends on the residual
+   window the downstream ByteAlu operand leaves. In θ that window is closed by the
+   *parity* of `left` (the shift is by one, so `left` is always even) and by the carry
+   being a single bit; in ρ, `right` is a halfword and `d = ±1` fits exactly at
+   saturation.
+
+   The model's pin is a sound *consequence* of the shipped constraints today, which is
+   why the current board is meaningful; what it is not is a test that those
+   constraints are still there. **The `24/24 UNSAT` verdict is conditional on the
+   range checks existing and must never be cited as evidence that they are
+   redundant.**
 
 2. **Positive control (non-vacuity).** Pin the input to a concrete value, drop the
    diff assertion, and confirm the constraint system is **SAT** *and* uniquely pins
@@ -107,7 +125,10 @@ Each helper lookup is modeled by its contract, not its implementation:
    *load-bearing at the field level* in a way QF-BV cannot see: `2¹⁶` is invertible
    mod the Goldilocks prime, so without the range bound the `(left, right)`
    decomposition is ambiguous. QF-BV proves the wiring given the bound; proving the
-   bound *suffices* mod `p` needs an integer/field model (see Scope + follow-ups).
+   bound *suffices* mod `p` needs an integer/field model — that is what
+   `field_model.py` and the two `necessity_*.py` scripts are, and their result is the
+   table in discipline 1. Run them whenever the shift identities or their range
+   checks change.
 
 4. **Independent reference.** The reference must be derived from the spec, not from
    the circuit or the repo's constant tables, then anchored to an outside
@@ -155,14 +176,21 @@ PR) merely growing the file by 136 lines.
 
 If you copy this template, cite by name for the same reason.
 
-**Known scope gap carried as the first follow-up:** QF-BV cannot test that the
-`AreBytes`/`IS_BIT` bounds are *sufficient* mod `p` for the inline identities (bit
-vectors make `2¹⁶` a zero divisor, not the invertible element it is mod the
-Goldilocks prime). That companion proof — an integer-mod-`p` model showing that
-dropping a range bound makes the decomposition ambiguous (SAT) — was written for the
-optimization PR that introduced the identities and is *not* included in this
-baseline. Porting it here (or moving to a solver with native field support) is the
-first extension of this template.
+**The scope gap this baseline declared is now closed.** QF-BV cannot test whether
+the `AreBytes`/`IS_BIT` bounds are *sufficient* mod `p` for the inline identities —
+bit vectors make `2¹⁶` a zero divisor, not the invertible element it is mod the
+Goldilocks prime, so the question is not merely unanswered there but unaskable.
+`field_model.py` supplies the companion integer-mod-`p` model, `necessity_theta.py`
+and `necessity_rho.py` decide every configuration, and `witness_fullchip.py` exhibits
+the ρ forgery as a complete, reachable round rather than an isolated lane. The result
+is the table in discipline 1.
+
+One consequence is worth recording for whoever touches the round next: **#889, which
+inlined the θ/ρ shifts to drop 120 HWSL sends per row, made `rot_left`'s range check
+load-bearing.** Under the HWSL *lookup* the pair `(left, right)` was pinned
+individually and dropping either check was harmless; under the shipped identity,
+dropping `rot_left`'s is forgeable. The 100 saved ρ sends were paid for with a range
+check that changed status, and nothing outside this directory records that.
 
 ## Scope
 
@@ -199,6 +227,16 @@ first extension of this template.
 - `model_dataflow.py`, `test_dataflow.py` — concrete byte-level forward mirror of the
   modeled equations, validated against the reference over random/structured inputs
   and confirmed to move under each injected bug.
+- `field_model.py` — the companion **integer-mod-`p`** model of the inline θ/ρ shift
+  identities, with a switch per range check. This is the piece the next chip copies
+  when its bounds are enforced by an identity rather than a lookup.
+- `combinatorics.py` — the solver-free premises the ρ result rests on: π is a
+  bijection on the lanes, all 400 byte columns are read exactly once by a pi operand,
+  the pi offsets are even, and `theta = 0xFFFF…FF` saturates every lane.
+- `necessity_theta.py`, `necessity_rho.py` — which range checks are load-bearing and
+  which are implied, per configuration, with the forged witnesses.
+- `witness_fullchip.py` — the ρ forgery as a complete KECCAK_RND row from a reachable
+  message state: 0 constraint violations, every lookup matching, wrong output.
 
 ## Running the gate
 
@@ -213,10 +251,19 @@ python3 z3_parallel.py           # the gate: 24 rounds + changed-constraint cont
 # or, single-process with inline printout:
 python3 z3_verify.py
 python3 tamper_test.py           # the removed-constraint controls (see discipline 1)
+python3 combinatorics.py         # the solver-free premises for the rho result
+python3 necessity_theta.py       # which theta range checks are load-bearing
+python3 necessity_rho.py         # which rho range checks are load-bearing
+python3 witness_fullchip.py      # the rho forgery as a complete, reachable round
 ```
 
 `tamper_test.py` is not optional: `z3_parallel.py` runs only the *changed*-constraint
 controls, so a run that skips it exercises no **removed**-constraint control at all.
 
 Expected board: positive control PASS, all negative controls **SAT** (caught), all
-24 rounds **UNSAT**. Anything else is a real signal — investigate before trusting.
+24 rounds **UNSAT**, every premise and necessity check **OK**, and the full-chip
+witness **VERIFIED**. Anything else is a real signal — investigate before trusting.
+
+The necessity scripts need no solver for their UNSAT results — those are exact
+integer-bounding arguments with finite, complete enumerations — so they run in
+seconds. Only the QF-BV gate is slow (~3 min on ten cores).
