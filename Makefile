@@ -629,7 +629,6 @@ clippy:
 fmt:
 	cargo fmt --all
 
-# Run clippy + fmt check (used by CI)
 .PHONY: verify-dma
 verify-dma: ## Run the DMA memcpy formal-verification gate (formal_verification/dma)
 	@# Oracle anchors + vector emission, the z3 soundness gate, and the
@@ -660,6 +659,7 @@ verify-dma: ## Run the DMA memcpy formal-verification gate (formal_verification/
 	fi; \
 	rm -f $$out $$st $$out.committed $$out.fresh
 
+# Run clippy + fmt check (used by CI)
 lint:
 	cargo fmt --check --all
 	cargo clippy --workspace --all-targets -- -D warnings -A clippy::op_ref
