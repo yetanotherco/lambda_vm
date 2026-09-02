@@ -772,6 +772,75 @@ mod keccak_tests {
             "KECCAK_RND: 20 IS_BIT(μ; Cxz_right_bit) + 20 θ + 100 ρ inline shift identities"
         );
     }
+
+    /// FNV-1a, spelled out because `std`'s hasher is explicitly not stable across
+    /// toolchains and the digests below are pinned in source.
+    fn fnv1a64(bytes: &[u8]) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    }
+
+    /// Pins the KECCAK_RND AIR's derived *structure*, not just its counts.
+    ///
+    /// The three count tests above catch anything that adds or removes an
+    /// interaction, a column or a constraint. They do not catch a **rewiring that
+    /// keeps the counts**. The concrete case: changing the first `BusValue` of the
+    /// "Rho: ARE_BYTES range checks on rot_left + rot_right" pair from
+    /// `cols::rot_left` to `cols::rot_right` leaves 1031/1480/140 untouched, is
+    /// still satisfied by every honest trace (so prove+verify passes), and makes
+    /// the ρ output forgeable.
+    ///
+    /// Nothing else in the tree would object. In particular the QF-BV gate in
+    /// `formal_verification/keccak/` cannot: it carries byte-ness as the *width* of
+    /// its bitvectors, so it prints `VERIFIED` either way — see its README,
+    /// discipline 1. `witness_fullchip.py` there exhibits the forgery as a
+    /// complete, reachable round with zero constraint violations, every lookup
+    /// matching, and two output lanes differing from FIPS-202.
+    ///
+    /// A failure here is not necessarily a bug: it means the round's wiring or its
+    /// constraint bodies changed. Re-run `formal_verification/keccak/` in full (the
+    /// four gates plus `combinatorics.py`, `necessity_theta.py`,
+    /// `necessity_rho.py`, `witness_fullchip.py`), confirm the expected board, then
+    /// update the digests below in the same commit.
+    #[test]
+    fn test_keccak_rnd_air_structure_is_pinned() {
+        use crate::tables::types::{GoldilocksExtension, GoldilocksField};
+        use stark::constraints::builder::{CaptureBuilder, ConstraintSet};
+
+        // BusInteraction is not Debug, so serialise its public fields explicitly:
+        // bus id, direction, multiplicity, and every BusValue (which carries the
+        // column indices, packings and linear-term coefficients).
+        let bus: String = keccak_rnd::bus_interactions()
+            .iter()
+            .map(|i| {
+                format!(
+                    "{}|{}|{:?}|{:?}\n",
+                    i.bus_id, i.is_sender, i.multiplicity, i.values
+                )
+            })
+            .collect();
+        assert_eq!(
+            fnv1a64(bus.as_bytes()),
+            0x0027_e508_0abb_991f,
+            "KECCAK_RND bus wiring changed (bus ids, multiplicities, column indices \
+             or linear-term coefficients). See this test's doc comment."
+        );
+
+        let n = keccak_rnd::KeccakRndConstraints.meta().len();
+        let mut cb = CaptureBuilder::<GoldilocksField, GoldilocksExtension>::new();
+        keccak_rnd::KeccakRndConstraints.eval(&mut cb);
+        let (prog, _) = cb.finish(n);
+        assert_eq!(
+            fnv1a64(format!("{prog:?}").as_bytes()),
+            0x83a3_3324_8bcb_a374,
+            "KECCAK_RND constraint IR changed (op tree, dimensions, field constants \
+             or roots). See this test's doc comment."
+        );
+    }
 }
 
 mod routing_tests {
