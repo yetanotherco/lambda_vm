@@ -243,11 +243,11 @@ pub fn peak_bytes(lengths: &TableLengths, blowup_factor: u8, table_parallelism: 
     let specs = table_specs(lengths);
 
     // Persistent: every table's main LDE + Merkle really is alive at once (the
-    // Round 1 main commit is a phase-wide barrier). The aux LDE is produced and
-    // consumed inside one table's fused task, so only the scheduler's k coexist
-    // — exactly all of them on `cuda`, fewer on CPU builds. Counted for every
-    // table either way, which is exact on `cuda` and an over-estimate on CPU
-    // rather than an unsound bound.
+    // Round 1 main commit is a phase-wide barrier). Counting the aux LDE and
+    // its Merkle tree for every table is exact rather than an over-estimate:
+    // the fused task on `cuda` holds only the scheduler's k of them, but k
+    // there is num_airs, and CPU builds stage every table's Round 1 result
+    // across the phase barrier between the aux/commit stage and rounds 2-4.
     let persistent_total: u64 = specs
         .iter()
         .map(|s| persistent_per_table(*s, blowup))

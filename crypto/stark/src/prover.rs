@@ -269,12 +269,15 @@ where
 /// aux commit and rounds 2-4 into one task:
 /// - main: produced by the Round 1 main commit, which is a phase-wide barrier,
 ///   so all N tables' main LDEs are live at once (O(N × main_cols × lde_size)).
-/// - aux: produced and consumed inside the same fused task, so at most the
-///   scheduler's `k` coexist (O(k × aux_cols × lde_size)) — which under `cuda`
-///   is `num_airs`, so there they are all-N-live like the main ones.
+/// - aux: all N are live at once too in every configuration built today
+///   (O(N × aux_cols × lde_size), and aux is ext3, so 24 B per element).
+///   Under `cuda` the fused task holds only the scheduler's `k` of them, but
+///   `k` there is `num_airs`. CPU builds keep a phase barrier between the
+///   aux/commit stage and rounds 2-4 and stage every table's aux LDE across
+///   it, so `k` does not bound this peak there at all.
 ///
-/// Under `debug-checks` the fused task is split around the cross-table bus
-/// balance check, so there the aux LDEs are all-N-live like the main ones.
+/// Under `debug-checks` the fused task is split on `cuda` as well, around the
+/// cross-table bus balance check.
 struct Lde<Field: IsFFTField, FieldExtension: IsField> {
     /// Row-major main LDE buffer + its column count.
     main: (Vec<FieldElement<Field>>, usize),
@@ -702,6 +705,11 @@ fn estimate_table_vram_bytes(main_cols: usize, aux_cols: usize, lde_size: usize)
 /// Only OS driver threads block here (see `run_admitted`) — never rayon
 /// workers, whose pool the admitted tables use internally and which a
 /// blocked worker would starve.
+///
+/// Device-only mechanism: CPU builds have no device allocation to admit
+/// against, so their `run_admitted` arms take the gate and ignore it. That is
+/// what the `allow(dead_code)` attributes here are for — `multi_prove` still
+/// constructs the gate unconditionally so the three arms share one signature.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 struct VramGate {
     used: std::sync::Mutex<u64>,
@@ -757,7 +765,7 @@ fn run_admitted<T: Send>(
     estimates: &[u64],
     gate: &VramGate,
     workers: usize,
-    task: impl Fn(usize) -> T + Send + Sync,
+    task: impl Fn(usize) -> T + Sync,
 ) -> Vec<Option<T>> {
     let results: Vec<std::sync::Mutex<Option<T>>> = estimates
         .iter()
@@ -796,27 +804,24 @@ fn run_admitted<T: Send>(
 #[cfg(all(not(feature = "cuda"), feature = "parallel"))]
 fn run_admitted<T: Send>(
     order: &[usize],
-    _estimates: &[u64],
+    estimates: &[u64],
     _gate: &VramGate,
     workers: usize,
-    task: impl Fn(usize) -> T + Send + Sync,
+    task: impl Fn(usize) -> T + Sync,
 ) -> Vec<Option<T>> {
-    let results: Vec<std::sync::Mutex<Option<T>>> = (0..order.len())
-        .map(|_| std::sync::Mutex::new(None))
-        .collect();
+    // No interior mutability here, unlike the `cuda` arm: `collect()` joins
+    // each chunk, so every slot is written from this thread.
+    let mut results: Vec<Option<T>> = (0..estimates.len()).map(|_| None).collect();
 
     for chunk in order.chunks(workers.max(1)) {
         let chunk_results: Vec<(usize, T)> =
             chunk.par_iter().map(|&idx| (idx, task(idx))).collect();
         for (idx, result) in chunk_results {
-            *results[idx].lock().unwrap() = Some(result);
+            results[idx] = Some(result);
         }
     }
 
     results
-        .into_iter()
-        .map(|m| m.into_inner().unwrap())
-        .collect()
 }
 
 /// Sequential fallback when the prover is built without its default
@@ -824,12 +829,12 @@ fn run_admitted<T: Send>(
 #[cfg(all(not(feature = "cuda"), not(feature = "parallel")))]
 fn run_admitted<T: Send>(
     order: &[usize],
-    _estimates: &[u64],
+    estimates: &[u64],
     _gate: &VramGate,
     _workers: usize,
-    task: impl Fn(usize) -> T + Send + Sync,
+    task: impl Fn(usize) -> T + Sync,
 ) -> Vec<Option<T>> {
-    let mut results: Vec<Option<T>> = (0..order.len()).map(|_| None).collect();
+    let mut results: Vec<Option<T>> = (0..estimates.len()).map(|_| None).collect();
     for &idx in order {
         results[idx] = Some(task(idx));
     }
@@ -4037,6 +4042,12 @@ pub trait IsStarkProver<
         // scheduler was introduced. The fused path above is intentionally
         // CUDA-only; interleaving these CPU-heavy regions regresses the host
         // prover through cache and memory-bandwidth contention.
+        //
+        // Cost of the barrier: every table's Round 1 result is staged until its
+        // rounds run, so the aux LDE *and* the aux Merkle tree are live for all
+        // N tables where the fused path held at most `k`. Under `disk-spill`'s
+        // Disk mode the trees are spilled but the aux LDE is a plain `Vec` with
+        // no spill path, so Disk does not bound this peak.
         #[cfg(all(not(feature = "cuda"), not(feature = "debug-checks")))]
         let table_results = {
             let aux_outs = run_admitted(&peak_order, &peak_estimates, &vram_gate, k, aux_stage);
@@ -4563,6 +4574,15 @@ pub trait IsStarkProver<
             &boundary_coefficients,
         )?;
 
+        // Round 2's sub-op timings travel in a thread-local, so take them here
+        // instead of after round 4: this thread re-enters rayon in rounds 3 and
+        // 4, and a worker that blocks there can run another table's whole
+        // scheduler task on top of this frame and consume the slot. Keeping
+        // store and take adjacent is what pins the pair to one thread — see
+        // `instruments::reset_all`.
+        #[cfg(feature = "instruments")]
+        let r2_sub = crate::instruments::take_r2_sub();
+
         // >>>> Send commitments: [H₁], [H₂]
         transcript.append_bytes(&round_2_result.composition_poly_root);
 
@@ -4659,8 +4679,7 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         {
             let zero = Duration::ZERO;
-            let (r2_constraints, r2_fft, r2_merkle) =
-                crate::instruments::take_r2_sub().unwrap_or((zero, zero, zero));
+            let (r2_constraints, r2_fft, r2_merkle) = r2_sub.unwrap_or((zero, zero, zero));
             let (r4_fft, r4_merkle, r4_deep_comp, r4_queries) =
                 crate::instruments::take_r4_sub().unwrap_or((zero, zero, zero, zero));
             crate::instruments::store_round_sub_ops(crate::instruments::TableSubOps {
