@@ -643,15 +643,17 @@ test-cuda-integration: compile-programs-asm
 #
 # Its own binary + a process-wide env because gpu_lde_threshold() caches the value
 # on first read (OnceLock), so it must be set before any prove in the process.
-test-cuda-d1:
+# compile-programs-asm: the fixture (all_instructions_64) is a prebuilt asm guest.
+test-cuda-d1: compile-programs-asm
 	LAMBDA_VM_GPU_LDE_THRESHOLD=128 $(GPU_TEST_TIMEOUT) cargo test -p lambda-vm-prover \
 	    --release --features cuda \
 	    --test cuda_d1_path -- --ignored --nocapture --test-threads=1
 
 # GPU error-path coverage (requires NVIDIA GPU + nvcc).
 # Forces cuda dispatch errors and asserts the CPU fallback still produces a verifying proof.
-# compile-programs-asm: these tests prove a prebuilt asm guest (asm_elf_bytes).
-test-cuda-fallback: compile-programs-asm
+# cuda_fallback_tests proves a prebuilt asm guest (asm_elf_bytes); gpu_force_downgrade
+# reads the ethrex Rust guest. Naming the one artifact keeps this off the other seven.
+test-cuda-fallback: compile-programs-asm $(RUST_ARTIFACTS_DIR)/ethrex.elf
 	$(GPU_TEST_TIMEOUT) cargo test -p lambda-vm-prover --release --features test-cuda-faults \
 	    --test cuda_fallback_tests -- --ignored --nocapture --test-threads=1
 	$(GPU_TEST_TIMEOUT) cargo test -p lambda-vm-prover --release --features lambda-vm-prover/cuda \
