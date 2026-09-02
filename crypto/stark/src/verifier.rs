@@ -196,6 +196,73 @@ pub trait IsStarkVerifier<
             && next.height() == expected_next_height
     }
 
+    /// Soundness (I3, opening side): every query opening's column counts are a
+    /// public function of the AIR, never of the (prover-controlled) proof.
+    ///
+    /// An opening splits the trace row into `precomputed ‖ main` (base) and `aux`
+    /// (extension), which the DEEP reconstruction consumes as one concatenated
+    /// row — so only their *sum* was pinned, against the AIR-pinned OOD width.
+    /// The leaf hash pins neither split either: `hash_data_from_slices` streams
+    /// `evaluations ‖ evaluations_sym` with no length prefix or separator.
+    ///
+    /// That is exploitable because the three trees are absorbed at different
+    /// times: the precomputed root not at all for a non-preprocessed AIR, and the
+    /// aux root only after the LogUp challenges. An unpinned split therefore lets
+    /// a prover pick columns *after* challenges they must precede. Both variants
+    /// accepted a false statement before this check; see `tests::opening_width_tests`
+    /// and `tests::aux_opening_width_tests`.
+    ///
+    /// Runs once per table, before any opening is read. Both slots are checked:
+    /// they are separate prover-supplied vectors.
+    fn trace_opening_widths_well_formed(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        proof: StarkProofView<'_, Field, FieldExtension, PI>,
+        num_queries: usize,
+    ) -> bool {
+        // A non-preprocessed AIR has no precomputed tree, so its openings must
+        // declare zero precomputed columns — `num_precomputed_columns()` is
+        // documented as meaningful only under `is_preprocessed()`.
+        let expected_precomputed = if air.is_preprocessed() {
+            air.num_precomputed_columns()
+        } else {
+            0
+        };
+        // Preprocessed tables commit columns `0..n` in the precomputed tree and
+        // the remaining main columns (the multiplicities) in the main tree.
+        let expected_main = match air.trace_layout().0.checked_sub(expected_precomputed) {
+            Some(n) => n,
+            // An AIR declaring more precomputed columns than it has main columns
+            // is malformed; no proof can be well formed against it.
+            None => return false,
+        };
+        let expected_aux = air.num_auxiliary_rap_columns();
+
+        if proof.deep_poly_openings_len() < num_queries {
+            return false;
+        }
+        (0..num_queries).all(|i| {
+            let opening = proof.deep_poly_opening(i);
+            // Absent optional openings count as zero columns, matching how the
+            // reconstruction reads them (`.unwrap_or(&[])`).
+            let (precomputed, precomputed_sym) = match opening.precomputed_trace_polys() {
+                Some(p) => (p.evaluations().len(), p.evaluations_sym().len()),
+                None => (0, 0),
+            };
+            let (aux, aux_sym) = match opening.aux_trace_polys() {
+                Some(a) => (a.evaluations().len(), a.evaluations_sym().len()),
+                None => (0, 0),
+            };
+            let main = opening.main_trace_polys();
+
+            precomputed == expected_precomputed
+                && precomputed_sym == expected_precomputed
+                && main.evaluations().len() == expected_main
+                && main.evaluations_sym().len() == expected_main
+                && aux == expected_aux
+                && aux_sym == expected_aux
+        })
+    }
+
     fn step_2_verify_claimed_composition_polynomial(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         proof: StarkProofView<'_, Field, FieldExtension, PI>,
@@ -567,9 +634,16 @@ pub trait IsStarkVerifier<
             iota,
         );
 
-        // Precomputed trace (preprocessed tables only). Mismatched presence is
-        // unreachable in practice (multi_verify rejects such proofs upstream),
-        // but a defensive check keeps this function self-contained.
+        // Precomputed trace (preprocessed tables only). Mismatched presence:
+        // `(Some(root), None)` and any `(None, Some(opening))` carrying at least
+        // one column are rejected upstream by `trace_opening_widths_well_formed`
+        // (which pins the precomputed opening width to the AIR — zero for a
+        // non-preprocessed AIR) and, for the missing-root case, by the round-1
+        // preprocessed-commitment check. What is left for this arm is the
+        // degenerate `(None, Some(opening))` with a zero-width opening, which
+        // upstream cannot distinguish from an absent one. Keep it: this is the
+        // only site that rejects that shape, and the check keeps the function
+        // self-contained.
         ok &= match (
             proof.lde_trace_precomputed_merkle_root(),
             deep_poly_openings.precomputed_trace_polys(),
@@ -579,7 +653,13 @@ pub trait IsStarkVerifier<
             _ => false,
         };
 
-        // Auxiliary trace.
+        // Auxiliary trace. This authenticates the opening against the aux root;
+        // it does NOT constrain how many columns that opening has. Nothing here
+        // did, and that was a live break: the aux root is absorbed only after the
+        // shared LogUp challenges, so a prover that moved main columns into the
+        // aux tree got to choose them after seeing `z`/`alpha`
+        // (`tests::aux_opening_width_tests`). The width is pinned upstream by
+        // `trace_opening_widths_well_formed`; do not re-derive it from the proof.
         ok &= match (
             proof.lde_trace_aux_merkle_root(),
             deep_poly_openings.aux_trace_polys(),
@@ -1030,6 +1110,16 @@ pub trait IsStarkVerifier<
         // whose column count does not match the OOD table width, or whose
         // regular/symmetric base-column split disagree. Without these checks
         // the indexing below would panic in release builds.
+        //
+        // These are panic guards on the *sum* only, and are redundant for proofs
+        // that reached here through `verify_rounds_2_to_4`:
+        // `trace_opening_widths_well_formed` already pinned each of the three
+        // widths (precomputed, main, aux) to the AIR, for both the regular and
+        // the symmetric slot. That is the authoritative check — soundness must
+        // not be argued from the sum alone, since the precomputed↔main and
+        // main↔aux splits move columns between trees that are transcript-bound at
+        // different times. This function has no AIR, so it keeps the weaker
+        // guards to stay panic-free on its own.
         if num_base != num_base_sym {
             return None;
         }
@@ -1578,6 +1668,21 @@ pub trait IsStarkVerifier<
 
         // Verify there are enough queries
         if proof.query_list_len() < air.options().fri_number_of_queries {
+            return false;
+        }
+
+        // Pin every query opening's precomputed/main/aux column split to the AIR
+        // before anything reads an opening (step 3 is the first consumer). The
+        // sum of the three widths was already pinned downstream; the individual
+        // terms were not, and each tree is transcript-bound at a different time —
+        // see `trace_opening_widths_well_formed`. Checked over the openings the
+        // query phase will actually use, which is exactly what the adjacent
+        // `query_list_len` guard counts (`sample_query_indexes` draws
+        // `fri_number_of_queries` iotas).
+        if !Self::trace_opening_widths_well_formed(air, proof, air.options().fri_number_of_queries)
+        {
+            #[cfg(not(feature = "test_fiat_shamir"))]
+            error!("Trace opening column split does not match the AIR");
             return false;
         }
 

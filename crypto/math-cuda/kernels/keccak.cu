@@ -138,6 +138,64 @@ __device__ __forceinline__ void finalize_keccak256(uint64_t st[25],
 }
 
 // ---------------------------------------------------------------------------
+// Proof-of-work grinding search.
+//
+// Mirrors the host `grinding::is_valid_nonce_for_inner_hash`: a nonce is valid
+// when the big-endian u64 of the first 8 bytes of
+//   Keccak256(inner_hash[32] || nonce.to_be_bytes()[8])
+// is `< limit`. The 40-byte message is exactly five Keccak lanes, so there is
+// no intermediate block permute — st[0..3] hold the inner hash (passed as four
+// LE-read lanes), st[4] holds the nonce lane (`bswap64(nonce)`, since the nonce
+// is serialised big-endian and Keccak reads lanes little-endian), padding lands
+// in st[5] and st[16], and the head we compare is `bswap64(st[0])` after one
+// permutation (the host takes `from_be_bytes(digest[..8])`, i.e. the byte-swap
+// of the first squeezed lane).
+//
+// Each thread strides over `[base, base+count)` and `atomicMin`s the smallest
+// valid nonce it finds into `*result` (initialised to U64_MAX by the caller),
+// so the launch returns the globally smallest valid nonce in the searched
+// block — deterministic, and any valid nonce satisfies the verifier.
+extern "C" __global__ void grind_search(const uint64_t *inner_lanes,
+                                        uint64_t limit,
+                                        uint64_t base,
+                                        uint64_t count,
+                                        volatile unsigned long long *result) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t stride = (uint64_t)gridDim.x * blockDim.x;
+    uint64_t h0 = inner_lanes[0], h1 = inner_lanes[1], h2 = inner_lanes[2],
+             h3 = inner_lanes[3];
+    for (uint64_t i = tid; i < count; i += stride) {
+        uint64_t nonce = base + i;
+        // Guard the u64 wrap on the final block (the host bounds the search to
+        // ~2^36 launches, so this is unreachable in practice): a wrapped nonce
+        // is < base, so stop rather than re-scan from 0.
+        if (nonce < base) break;
+        // A thread's nonces only increase, so once a smaller valid one is known
+        // this thread can never beat it — stop scanning. `result` is volatile
+        // so this load re-reads L2 (where the atomicMin writes land) instead of
+        // being hoisted into a register or served stale from L1; the early exit
+        // depends on that, though correctness does not.
+        if (nonce >= (uint64_t)*result) break;
+        uint64_t st[25];
+        #pragma unroll
+        for (int k = 0; k < 25; ++k) st[k] = 0;
+        st[0] = h0;
+        st[1] = h1;
+        st[2] = h2;
+        st[3] = h3;
+        st[4] = bswap64(nonce);
+        // Keccak (0x01) padding for a 40-byte message: 0x01 at byte 40 (lane 5)
+        // and 0x80 at byte 135 (top of lane 16).
+        st[5] ^= (uint64_t)0x01;
+        st[16] ^= ((uint64_t)0x80) << 56;
+        keccak_f1600(st);
+        if (bswap64(st[0]) < limit) {
+            atomicMin((unsigned long long *)result, (unsigned long long)nonce);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Goldilocks BASE-FIELD leaf hashing.
 //
 // For output row `row_idx` (natural order), the leaf hashes the canonical BE
@@ -366,13 +424,11 @@ extern "C" __global__ void keccak_fri_leaves_ext3(
 // concatenation of two 32-byte siblings, identical to
 // `FieldElementVectorBackend::hash_new_parent` on host.
 // ---------------------------------------------------------------------------
-extern "C" __global__ void keccak_merkle_level(
+__device__ __forceinline__ void hash_merkle_parent(
     uint8_t *nodes,
     uint64_t parent_begin,     // node index (counted in 32-byte nodes)
-    uint64_t n_pairs) {
-    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= n_pairs) return;
-
+    uint64_t n_pairs,
+    uint64_t tid) {
     uint64_t st[25];
     #pragma unroll
     for (int i = 0; i < 25; ++i) st[i] = 0;
@@ -391,6 +447,35 @@ extern "C" __global__ void keccak_merkle_level(
     for (int i = 0; i < 4; ++i) absorb_lane(st, rate_pos, right[i]);
 
     finalize_keccak256(st, rate_pos, nodes + (parent_begin + tid) * 32);
+}
+
+extern "C" __global__ void keccak_merkle_level(
+    uint8_t *nodes,
+    uint64_t parent_begin,     // node index (counted in 32-byte nodes)
+    uint64_t n_pairs) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n_pairs) return;
+    hash_merkle_parent(nodes, parent_begin, n_pairs, tid);
+}
+
+// Build every remaining level (from `level_begin` up to the root) in ONE
+// single-block launch: each level's pairs are grid-strided over the block,
+// with a __syncthreads() barrier between levels. Replaces log2 launches of
+// `keccak_merkle_level` for the small top levels of the tree, whose per-level
+// work is dwarfed by launch overhead.
+extern "C" __global__ void keccak_merkle_tail(
+    uint8_t *nodes,
+    uint64_t level_begin) {
+    uint64_t lb = level_begin;
+    while (lb != 0) {
+        uint64_t nb = lb / 2;
+        uint64_t n_pairs = lb - nb;
+        for (uint64_t tid = threadIdx.x; tid < n_pairs; tid += blockDim.x) {
+            hash_merkle_parent(nodes, nb, n_pairs, tid);
+        }
+        __syncthreads();
+        lb = nb;
+    }
 }
 
 // Gather Merkle authentication paths for a batch of leaf positions, reading the

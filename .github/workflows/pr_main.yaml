@@ -40,6 +40,14 @@ jobs:
       - name: Check ethrex fixture checksums
         run: make check-ethrex-fixture-checksums
 
+      # The benchmark comment harness: verifies every steps.X.outputs.Y consumed in
+      # benchmark-pr.yml has a producer (the orphaned-wiring class that once broke
+      # /bench-growth silently), then renders the full comment scenario suite.
+      # Pure node, no dependencies, ~10 s. Lives in Lint so it runs on every PR —
+      # a path filter would have to enumerate every file that can break the wiring.
+      - name: Check benchmark comment wiring
+        run: node scripts/render_bench_comment.js
+
   test-executor:
     name: Executor tests
     runs-on: ubuntu-latest
@@ -109,6 +117,15 @@ jobs:
         run: |
           cargo test --release -p executor --test flamegraph
 
+      # The unit tests under `executor/src/tests/` are a *lib* target (`pub mod tests;`
+      # in lib.rs), which none of the `--test <name>` steps above select — and the
+      # `test_ckzg` step below filters by name, so it doesn't run them either. Without
+      # this step they never run in CI. It shares the lib test binary with that step,
+      # so it costs a test run, not an extra compile.
+      - name: Run executor lib unit tests
+        run: |
+          cargo test --release -p executor --lib
+
       - name: Run ignored executor tests
         run: |
           cargo test --release -p executor test_ckzg -- --ignored
@@ -158,8 +175,19 @@ jobs:
       - name: Run CLI tests
         run: cargo test -p cli
 
-      - name: Run syscalls host tests (keccak differential vs sha3)
+      - name: Run syscalls host tests (allocator + keccak differential vs sha3)
         run: make test-syscalls
+
+      # The dlmalloc fallback is feature-selected, so nothing else in CI compiles it and it
+      # can rot silently. Its tests run here too.
+      - name: Test the dlmalloc guest allocator fallback
+        run: |
+          cd syscalls
+          cargo test --features dlmalloc-alloc
+          cargo test --release --features dlmalloc-alloc
+
+      - name: Run ethrex-crypto host tests (hint verify-then-fallback + ecrecover)
+        run: make test-ethrex-crypto
 
   # "Test" is a required check — keep this name to avoid branch protection changes.
   # This gate job passes only when CLI, executor, disk-spill, and prover tests succeed.
@@ -398,6 +426,15 @@ jobs:
           name: prover-tests
 
       - name: Run prover tests (shard ${{ matrix.partition }}/4)
+        # Shard 1 only: force k > 1 so the per-table admission scheduler really
+        # runs several table closures concurrently. ubuntu-latest has 2-4 vCPU
+        # and table_parallelism() defaults to (cores / 3).max(1), so every
+        # other shard proves with a single driver thread and never exercises
+        # the concurrent path or VramGate's blocking path on a PR. The other
+        # three shards keep the default-k coverage. An empty value on those
+        # fails to parse and falls back to the default, so this is inert there.
+        env:
+          TABLE_PARALLELISM: ${{ matrix.partition == 1 && '6' || '' }}
         run: |
           cargo nextest run \
             --archive-file prover-tests.tar.zst \

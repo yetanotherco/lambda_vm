@@ -14,7 +14,10 @@
 
 use lambda_vm_prover::test_utils::asm_elf_bytes;
 use lambda_vm_prover::{prove, verify};
-use stark::gpu_lde::{gpu_batch_invert_calls, gpu_fri_calls, reset_all_gpu_call_counters};
+use stark::gpu_lde::{
+    gpu_batch_invert_calls, gpu_composition_parts_downloads, gpu_device_only_calls,
+    gpu_device_only_downgrades, gpu_fri_calls, reset_all_gpu_call_counters,
+};
 
 /// FRI commit-phase CPU fallback: when the GPU dispatch errors after the
 /// first transcript mutation, `try_fri_commit_gpu` must restore the
@@ -118,4 +121,146 @@ fn gpu_batch_invert_fault_falls_back_to_cpu() {
     }
 
     stark::gpu_lde::schedule_inverse_fault(-1);
+}
+
+/// Disarms every sticky fault on drop. The hooks are process-global and these
+/// tests run `--test-threads=1`, so a panic inside `prove` or a failing assert
+/// must not leave a fault armed — a later test would otherwise prove with all
+/// of that stage's dispatches failing and cascade into confusing failures. The
+/// one-shot hooks self-heal; the sticky ones need this.
+struct StickyFaultGuard;
+impl Drop for StickyFaultGuard {
+    fn drop(&mut self) {
+        stark::gpu_lde::schedule_comp_tree_fault_sticky(-1);
+        stark::gpu_lde::schedule_barycentric_fault_sticky(-1);
+        stark::gpu_lde::schedule_deep_fault_sticky(-1);
+    }
+}
+
+/// Warm up with a clean prove and require the device-only residency path to
+/// have fired: the cliff sites these recovery tests cover (empty host trace /
+/// empty host part evals) only arm on device-only tables.
+fn warm_up_requiring_device_only(elf: &[u8]) {
+    reset_all_gpu_call_counters();
+    let _ = prove(elf).expect("warm-up");
+    assert!(
+        gpu_device_only_calls() > 0,
+        "device-only residency never fired on the warm-up prove; the cliff \
+         this test covers cannot arm (workload too small for the gate?)"
+    );
+}
+
+/// R2 comp-tree cliff recovery: with every `build_comp_poly_tree_from_*`
+/// dispatch failing (sticky — both the from-dev and the host-upload arms must
+/// decline in the same prove), the commit falls back to the CPU
+/// `commit_bit_reversed`, whose input part evals are empty under device-only.
+/// The recovery must download them from the resident R2 parts handle instead
+/// of hard-aborting, and the proof must verify.
+#[test]
+#[ignore = "requires GPU + test-cuda-faults; run with --ignored --nocapture"]
+fn gpu_comp_tree_fault_recovers_device_only_parts() {
+    let elf = asm_elf_bytes("fib_iterative_1M");
+    warm_up_requiring_device_only(&elf);
+
+    // Disarms on scope exit — including a panic in `prove` or a failing assert.
+    let _guard = StickyFaultGuard;
+    stark::gpu_lde::schedule_comp_tree_fault_sticky(1);
+    reset_all_gpu_call_counters();
+    let recovered = prove(&elf).expect("prove with sticky comp-tree fault");
+    assert!(
+        stark::gpu_lde::comp_tree_fault_fired(),
+        "injected comp-tree fault never fired"
+    );
+    assert!(
+        gpu_composition_parts_downloads() > 0,
+        "no composition parts were downloaded: the CPU commit either never \
+         ran on a device-only table or read empty part evals"
+    );
+    assert!(
+        verify(&recovered, &elf).expect("verify recovered"),
+        "post-recovery proof failed verification (comp-tree cliff)"
+    );
+}
+
+/// R3 barycentric cliff recovery: with every math-cuda barycentric dispatch
+/// failing (sticky — the per-eval-point main and aux arms all retry it), the
+/// trace OOD falls back to the host loop, which reads an empty host trace
+/// under device-only, and the parts OOD falls back to the host part evals,
+/// empty likewise. The recovery must download the resident data instead of
+/// hard-aborting — asserted for the parts OOD; the trace-OOD resident download
+/// is GPU-config dependent, so it is noted but not asserted — and the proof
+/// must verify.
+#[test]
+#[ignore = "requires GPU + test-cuda-faults; run with --ignored --nocapture"]
+fn gpu_barycentric_fault_recovers_device_only_trace() {
+    let elf = asm_elf_bytes("fib_iterative_1M");
+    warm_up_requiring_device_only(&elf);
+
+    // Disarms on scope exit — including a panic in `prove` or a failing assert.
+    let _guard = StickyFaultGuard;
+    stark::gpu_lde::schedule_barycentric_fault_sticky(1);
+    reset_all_gpu_call_counters();
+    let recovered = prove(&elf).expect("prove with sticky barycentric fault");
+    assert!(
+        stark::gpu_lde::barycentric_fault_fired(),
+        "injected barycentric fault never fired"
+    );
+    // The R3 trace-OOD resident download (`gpu_device_only_downgrades`) is not
+    // asserted: whether the barycentric-fault fallback routes the trace OOD of a
+    // device-only table through the *counted* resident download is GPU-config
+    // dependent (observed 0 on RTX 5090, where the host trace is served without
+    // it). Recovery is pinned by the parts-download check below and, decisively,
+    // by the final `verify` — a missing or wrong trace would fail verification.
+    if gpu_device_only_downgrades() == 0 {
+        eprintln!(
+            "[gpu-test] R3 trace-OOD served without a counted resident download \
+             on this GPU (device-only active, parts downloaded, proof verifies)"
+        );
+    }
+    assert!(
+        gpu_composition_parts_downloads() > 0,
+        "no composition parts were downloaded: the R3 parts-OOD host arm \
+         either never ran on a device-only table or read empty part evals"
+    );
+    assert!(
+        verify(&recovered, &elf).expect("verify recovered"),
+        "post-recovery proof failed verification (R3 barycentric cliff)"
+    );
+}
+
+/// R4 DEEP cliff recovery: with every math-cuda DEEP composition dispatch
+/// failing (sticky — the fully-resident arm and both mixed arms must all
+/// decline in the same prove), R4 falls back to the host DEEP loop, which
+/// reads the host trace AND the host part evals — both empty under
+/// device-only. The recovery must download both from the resident handles
+/// instead of hard-aborting, and the proof must verify.
+#[test]
+#[ignore = "requires GPU + test-cuda-faults; run with --ignored --nocapture"]
+fn gpu_deep_fault_recovers_device_only_trace_and_parts() {
+    let elf = asm_elf_bytes("fib_iterative_1M");
+    warm_up_requiring_device_only(&elf);
+
+    // Disarms on scope exit — including a panic in `prove` or a failing assert.
+    let _guard = StickyFaultGuard;
+    stark::gpu_lde::schedule_deep_fault_sticky(1);
+    reset_all_gpu_call_counters();
+    let recovered = prove(&elf).expect("prove with sticky DEEP fault");
+    assert!(
+        stark::gpu_lde::deep_fault_fired(),
+        "injected DEEP fault never fired"
+    );
+    assert!(
+        gpu_device_only_downgrades() > 0,
+        "no device-only table was downgraded: the R4 DEEP host loop either \
+         never ran on one or read an empty host trace"
+    );
+    assert!(
+        gpu_composition_parts_downloads() > 0,
+        "no composition parts were downloaded: the R4 DEEP host loop either \
+         never ran on a device-only table or read empty part evals"
+    );
+    assert!(
+        verify(&recovered, &elf).expect("verify recovered"),
+        "post-recovery proof failed verification (R4 DEEP cliff)"
+    );
 }

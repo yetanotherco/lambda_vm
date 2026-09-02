@@ -211,12 +211,14 @@ fn l2g_memory_air(
 /// zero-init pages (stack/heap) via the static zero-page commitment. The prover
 /// cannot choose those genesis values.
 ///
-/// Private-input pages are built NON-preprocessed (mirrors the monolithic PAGE in
+/// Private-input pages preprocess OFFSET **only** (mirrors the monolithic PAGE in
 /// `VmAirs::new`): INIT is a committed main-trace column the verifier never recomputes
 /// from the ELF, so the raw private input is neither bundled nor reconstructed by the
-/// verifier. Correctness is enforced by the GlobalMemory bus (the genesis token must
-/// telescope into the epochs' reads), not by ELF recomputation. (Not a ZK/hiding claim —
-/// the committed column is still opened at STARK query positions.)
+/// verifier. (Not a ZK/hiding claim — the committed column is still opened at STARK
+/// query positions.) OFFSET, by contrast, is preprocessed like everywhere else: it is
+/// program- and input-independent, and it is the row's address, so the GlobalMemory bus
+/// alone cannot police it. Leaving it free was a soundness hole — the genesis token
+/// could name any address in the page's high-limb space.
 /// `preprocessed`, when `Some`, is used directly instead of recomputing the
 /// genesis commitment from `config.init_values` — the recursion guest's
 /// supplied roots skip the in-VM FFT + Merkle build (see `verify_global`).
@@ -236,7 +238,15 @@ fn global_memory_air(
         EmptyConstraints,
     );
     if config.is_private_input {
-        return air;
+        // OFFSET only — see the matching branch in `VmAirs::new`. INIT stays a
+        // main-trace column (it is the private input); OFFSET must be committed or
+        // `address_lo = page_base_lo + OFFSET` is prover-chosen and the genesis
+        // token can name an arbitrary address. GLOBAL_MEMORY's OFFSET column is
+        // identical to PAGE's, so the same commitment serves both.
+        return air.with_preprocessed(
+            page::private_page_preprocessed_commitment(opts),
+            page::NUM_PREPROCESSED_COLS_PRIVATE,
+        );
     }
     let commitment = preprocessed.unwrap_or_else(|| {
         if config.init_values.is_some() {
@@ -845,6 +855,9 @@ fn verify_epoch(
         None => return Ok(false),
     };
 
+    stark::profile_markers::step_marker::<{ stark::profile_markers::STEP_AIRS_AND_BUS_BALANCE_DONE }>(
+    );
+
     if !Verifier::multi_verify_views(&refs, proof, &mut seed(), &expected) {
         return Ok(false);
     }
@@ -1003,6 +1016,9 @@ fn verify_global(
     for air in &gm_airs {
         refs.push(air as AirRef);
     }
+
+    stark::profile_markers::step_marker::<{ stark::profile_markers::STEP_AIRS_AND_BUS_BALANCE_DONE }>(
+    );
 
     Verifier::multi_verify_views(
         &refs,
@@ -1225,6 +1241,17 @@ pub fn prove_continuation(
             drop(__nvtx);
             match traces {
                 Ok(traces) => {
+                    // Pre-upload the big main traces from this builder thread
+                    // (idle slack ahead of the prover), so the R1 main commits
+                    // skip their H2D.
+                    #[cfg(feature = "cuda")]
+                    let traces = {
+                        let mut traces = traces;
+                        #[cfg(feature = "instruments")]
+                        let __sp = stark::instruments::span("p6_trace_preupload");
+                        traces.preupload_main_traces();
+                        traces
+                    };
                     let prepared = PreparedEpoch {
                         index: job.index,
                         register_init: job.register_init,
@@ -1756,6 +1783,101 @@ pub(crate) mod test_fault {
 mod tests {
     use super::*;
     use crate::test_utils::asm_elf_bytes;
+
+    // Diagnostic (not a regression test): structurally diff two continuation
+    // proof bundles of the same input. The prover is deterministic, so the
+    // first differing field per table names the round where a corrupt run
+    // diverged. Run with:
+    //   PROOF_A=<good.bin> PROOF_B=<bad.bin> \
+    //   cargo test -p prover --release proof_diff -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn proof_diff() {
+        fn load(path: &str) -> ContinuationProof {
+            use std::os::unix::fs::FileExt;
+            let file = std::fs::File::open(path).unwrap();
+            let len = file.metadata().unwrap().len() as usize;
+            let mut aligned = rkyv::util::AlignedVec::<16>::with_capacity(len);
+            aligned.resize(len, 0);
+            file.read_exact_at(&mut aligned, 0).unwrap();
+            rkyv::from_bytes::<ContinuationProof, rkyv::rancor::Error>(&aligned).unwrap()
+        }
+        fn table_eq(a: &stark::table::Table<E>, b: &stark::table::Table<E>) -> bool {
+            if a.width != b.width || a.height != b.height {
+                return false;
+            }
+            (0..a.height).all(|r| (0..a.width).all(|c| a.get(r, c) == b.get(r, c)))
+        }
+        fn diff_multi(label: &str, a: &MultiProof<F, E, ()>, b: &MultiProof<F, E, ()>) {
+            assert_eq!(a.proofs.len(), b.proofs.len(), "{label}: table count");
+            for (t, (pa, pb)) in a.proofs.iter().zip(b.proofs.iter()).enumerate() {
+                let mut d = Vec::new();
+                if pa.lde_trace_main_merkle_root != pb.lde_trace_main_merkle_root {
+                    d.push("main_root");
+                }
+                if pa.lde_trace_aux_merkle_root != pb.lde_trace_aux_merkle_root {
+                    d.push("aux_root");
+                }
+                if pa.lde_trace_precomputed_merkle_root != pb.lde_trace_precomputed_merkle_root {
+                    d.push("preproc_root");
+                }
+                if pa.bus_public_inputs.as_ref().map(|x| &x.table_contribution)
+                    != pb.bus_public_inputs.as_ref().map(|x| &x.table_contribution)
+                {
+                    d.push("bus_pi");
+                }
+                if pa.composition_poly_root != pb.composition_poly_root {
+                    d.push("comp_root");
+                }
+                if !table_eq(&pa.trace_ood_evaluations, &pb.trace_ood_evaluations) {
+                    d.push("trace_ood");
+                }
+                if !table_eq(
+                    &pa.trace_ood_next_evaluations,
+                    &pb.trace_ood_next_evaluations,
+                ) {
+                    d.push("trace_ood_next");
+                }
+                if pa.composition_poly_parts_ood_evaluation
+                    != pb.composition_poly_parts_ood_evaluation
+                {
+                    d.push("parts_ood");
+                }
+                if pa.fri_layers_merkle_roots != pb.fri_layers_merkle_roots {
+                    d.push("fri_roots");
+                }
+                if pa.fri_final_poly_coeffs != pb.fri_final_poly_coeffs {
+                    d.push("fri_final");
+                }
+                if pa.nonce != pb.nonce {
+                    d.push("nonce");
+                }
+                if !d.is_empty() {
+                    println!(
+                        "{label} table {t} (cols={} len={}): {d:?}",
+                        pa.trace_ood_evaluations.width, pa.trace_length
+                    );
+                }
+            }
+        }
+        let a = load(&std::env::var("PROOF_A").unwrap());
+        let b = load(&std::env::var("PROOF_B").unwrap());
+        assert_eq!(a.epochs.len(), b.epochs.len(), "epoch count");
+        for (e, (ea, eb)) in a.epochs.iter().zip(b.epochs.iter()).enumerate() {
+            diff_multi(&format!("epoch {e}"), &ea.proof, &eb.proof);
+            if ea.public_output != eb.public_output {
+                println!("epoch {e}: public_output differs");
+            }
+            if ea.reg_fini != eb.reg_fini {
+                println!("epoch {e}: reg_fini differs");
+            }
+            if ea.l2g_root != eb.l2g_root {
+                println!("epoch {e}: l2g_root differs");
+            }
+        }
+        diff_multi("global", &a.global, &b.global);
+        println!("diff complete");
+    }
 
     // `test_commit_split` issues two Commit syscalls, one early and one late, so a
     // small epoch puts the second commit in a later epoch. That epoch starts with

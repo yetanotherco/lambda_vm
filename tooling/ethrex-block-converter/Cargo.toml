@@ -35,11 +35,12 @@ serde_json = "1"
 # Not used by this crate's code directly — declared to pin k256's feature set.
 # `lambda-vm-ethrex-crypto` (a dev-dependency) is otherwise the only thing asking
 # for `expose-field`, and under resolver 3 dev-dependency features are not unified
-# into builds that exclude dev-dependencies: `cargo run` (the
-# `make ethrex-real-block-fixture` step) and the `cargo test` that follows it in
-# CI would resolve two different k256 feature sets, recompiling k256 and every
-# ethrex crate above it in the same job. Declaring the features here puts them in
-# both resolutions. Keep in sync with crypto/ethrex-crypto's k256 line; verify:
+# into builds that exclude dev-dependencies. This crate is built both ways against
+# one target dir: `cargo run` for `make regen-real-block-fixture`, `cargo test` for
+# `make test-ethrex-real-block-converter`. Without this line the two resolve
+# different k256 feature sets, so alternating between them recompiles k256 and every
+# ethrex crate above it. Declaring the features here puts them in both resolutions.
+# Keep in sync with crypto/ethrex-crypto's k256 line; verify:
 #   cargo tree -e features,no-dev -i k256   # must list expose-field
 #   cargo tree -e features -i k256          # must match the above
 k256 = { version = "=0.13.4", default-features = false, features = ["arithmetic", "expose-field"] }

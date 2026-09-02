@@ -12,12 +12,20 @@ on:
       - 'executor/**'
       - 'bin/cli/**'
       - 'tooling/ethrex-fixtures/**'
-      # A baseline is only valid for the workload it measured, and these two
-      # define the real-block workload: the converter decides the fixture's
-      # bytes, the Makefile decides which block it is. Without them a repointed
-      # block would leave main's baseline stale until some prover file happened
-      # to change — and the comparison guard would suppress the table until then.
-      - 'tooling/ethrex-block-converter/**'
+      # syscalls is linked into the guest ELF this job builds, so a change confined to
+      # it changes the bytes proven — a guest allocator swap moves cycles on every
+      # workload. Without it main's baseline would stay stale until some prover file
+      # happened to change, and the comparison guard would suppress the table until
+      # then. pr_main.yaml:99 already hashes 'syscalls/**' into the guest-ELF cache
+      # key; the two lists must agree on what rebuilds the guest.
+      - 'syscalls/**'
+      # A baseline is only valid for the workload it measured, and the Makefile is
+      # what defines that workload: it names the block and pins the URL and sha256
+      # of the .bin this job fetches. Without it a repointed block would leave
+      # main's baseline stale until some prover file happened to change — and the
+      # comparison guard would suppress the table until then. The converter is not
+      # listed: CI never runs it, so changing it cannot change the bytes proven
+      # here.
       - 'Makefile'
   # Uncomment to auto-run on PRs:
   # pull_request:
@@ -27,6 +35,7 @@ on:
   #     - 'crypto/**'
   #     - 'executor/**'
   #     - 'bin/cli/**'
+  #     - 'syscalls/**'
 
 permissions:
   contents: read
@@ -46,8 +55,8 @@ env:
   #   1. Its only unique coverage was the MONOLITHIC prove path, which is vestigial
   #      (reportedly slower than a 1-epoch continuation). Coverage of a path we intend
   #      to delete is not a reason to spend runner time.
-  #   2. Its crypto mix is one no real block has: 8.83 ECSM per Mcycle against a real
-  #      block's ~1.3-1.6. Screening against it tunes the prover for a worst case that
+  #   2. Its crypto mix is one no real block has: 9.16 ECSM per Mcycle against a real
+  #      block's 2.28. Screening against it tunes the prover for a worst case that
   #      cannot occur.
   #
   # The synthetic fixtures themselves are NOT gone — /bench-growth still sweeps them to
@@ -90,28 +99,31 @@ env:
   #   2^22   397.88 s   32.21 GiB RSS   13 epochs   1.15 GB proof
   #   2^23   356.47 s   60.01 GiB RSS    7 epochs   0.90 GB proof
   #
-  # This runner's floor is >=64 GiB, so 2^22's 32.2 GiB fits with ~50% headroom while
-  # 2^23's 60 GiB does not fit safely — memory, not speed, is what picks 2^22 here.
-  # Moving off 2^21 is worth ~14% wall on the calibration box. That box is NOT this
-  # runner (it measured 8.6 s/Mcycle against this runner's 5.3-5.6), so treat the
-  # ratio as transferable and the absolute seconds as not: the first /bench run at
-  # this epoch establishes this runner's actual time.
+  # Those RSS figures are the CALIBRATION BOX's, and memory does not transfer between
+  # machines any better than seconds do: this runner measured ~52 GB of peak heap for
+  # the same block at 2^22 — over 1.5x the calibration box's 32.21 GiB, and close
+  # enough to its >=64 GiB floor that 2^23 (60 GiB on the roomier box, so more here)
+  # is out of the question. Memory, not speed, is what picks 2^22. Moving off 2^21 is
+  # worth ~14% wall on the calibration box; treat that ratio as transferable and
+  # neither the absolute seconds nor the RSS column as such. This runner's own
+  # measured time at 2^22 is 158.8 s (median of 3, 2.8% spread, 13 epochs).
   #
   # Deliberately NOT the CLI's DEFAULT_CONTINUATION_EPOCH_SIZE_LOG2, which stays 20 so
   # a laptop can still prove; and not the GPU path's 2^22, which happens to coincide
   # but is chosen by VRAM rather than host RAM (see benchmark-gpu.yml).
   REAL_BLOCK_EPOCH_LOG2: "22"
-  # Sampled like the synthetic screen, 3 runs, and reported the same way (median +
-  # spread). Fewer than the synthetic's 5 because each run is minutes rather than
-  # seconds; enough that one slow run shows up as spread instead of moving the median.
+  # Sampled 3 times and reported as median + spread. Three rather than five because
+  # each run is minutes rather than seconds; enough that one slow run shows up as
+  # spread instead of moving the median.
   #
-  # THIS IS THE DIAL. The runner's per-run real-block time is still unmeasured — the
-  # calibration ran on a different box (see REAL_BLOCK_EPOCH_LOG2 above). If the first
-  # runs land above ~6 min each, /bench becomes a ~25 min occupancy of a runner every
-  # other bench queues behind, and this count is what to turn down (2, or 1) before
-  # reaching for anything else.
+  # THIS IS THE DIAL. A run measures 158.8 s on this runner (median of 3, 2.8% spread,
+  # at the epoch above), so 3 runs is ~8 min of proving and the right count. Should a
+  # future block or prover change take a run past ~6 min, /bench becomes a ~25 min
+  # occupancy of a runner every other bench queues behind, and this count is what to
+  # turn down (2, or 1) before reaching for anything else.
   # `/bench N` overrides this, clamped to [1,5]. Past 5 the cached comparison can't
-  # beat the ~1% session-drift wall anyway — that is what /bench-abba is for.
+  # beat the ~1% session-drift wall anyway — that is what /bench-abba is for, and it
+  # proves this same block at this same epoch, so escalating keeps the question fixed.
   BENCH_RUNS_REAL: 3
   # Memory-scaling sweep: same ELF, different N-transfer inputs. GROWTH_PROGRAMS
   # are the generated (gitignored) fixture basenames in executor/tests/; GROWTH_STEPS
@@ -210,21 +222,24 @@ jobs:
 
           # The real block runs on EVERY invocation — plain `/bench`, push to main, and
           # workflow_dispatch alike. It is the number that means something, so it should
-          # not need a second command to ask for; the synthetic screen rides along
-          # unchanged as the cheap, high-sensitivity half.
+          # not need a second command to ask for, and it is the only workload /bench
+          # proves.
           #
-          # The cost is real and lands on a shared runner: ~4.5-4.8 min per run x
-          # BENCH_RUNS_REAL, so every /bench and every push to main now occupies the
-          # bench server for roughly 15-20 min, and /bench-abba and /bench-verify queue
-          # behind it. That trade was made deliberately — see BENCH_RUNS_REAL above for
-          # the dial if it proves too expensive.
+          # The cost is real and lands on a shared runner: 158.8 s per run x
+          # BENCH_RUNS_REAL is ~8 min of proving, so every /bench and every push to main
+          # occupies the bench server for roughly 15 min once checkout, the two-sided
+          # build, the fixture fetch and the guest ELF are counted, and /bench-abba and
+          # /bench-verify queue behind it. That trade was made deliberately — see
+          # BENCH_RUNS_REAL above for the dial if it proves too expensive.
           RUN_REAL=true
 
           # The fixture is FETCHED from a pinned URL + sha256, not built (see the
           # Makefile). The guard covers the window after a repoint but before the new
-          # artifact is uploaded: degrade to the synthetic sections with a warning
-          # rather than failing, so a push to main cannot go red over an upload nobody
-          # in CI can perform.
+          # artifact is uploaded: warn instead of failing, so a push to main cannot go
+          # red over an upload nobody in CI can perform. On push and workflow_dispatch
+          # the growth sweep still runs and feeds the baseline artifact (no comment is
+          # posted on those events — the Comment step is gated to comment triggers);
+          # on a plain /bench nothing is left to measure, and the footer says so.
           if [ "$RUN_REAL" = "true" ] && [ -z "$(make -s print-real-block-fixture-url)" ]; then
             echo "::warning::Real-block benchmark skipped: ETHREX_REAL_BLOCK_FIXTURE_URL is unset in the Makefile."
             RUN_REAL=false
@@ -237,9 +252,9 @@ jobs:
           # workload even when main's Makefile names a different block.
           echo "REAL_INPUT=$(make -s print-real-block-fixture)" >> "$GITHUB_ENV"
 
-          # Every metrics writer appends; the step that used to create this file was the
-          # synthetic screen, which is gone. Truncate here (this step always runs) so a
-          # previous run's values can't survive on the persistent self-hosted runner.
+          # Every metrics writer appends, and no step creates this file. Truncate here
+          # (this step always runs) so a previous run's values can't survive on the
+          # persistent self-hosted runner.
           : > /tmp/metrics.txt
 
           # `/bench N` sets the real-block sample count. Both sides use the same count
@@ -253,8 +268,9 @@ jobs:
           fi
 
           # Clamp to 1-5. Beyond 5 the single-session cached comparison barely improves
-          # (it can't beat the ~1% drift wall); use the ABBA tiebreaker for finer deltas.
-          # At ~4-5 min a run this is also the difference between a 15 min and a 25 min
+          # (it can't beat the ~1% drift wall); use /bench-abba for finer deltas — it
+          # resolves ~1% over the same block in ~72 min at its default 12 pairs.
+          # At 158.8 s a run this is also the difference between a ~10 min and a ~20 min
           # occupancy of the one bench runner.
           if [ "$RUNS" -lt 1 ] 2>/dev/null || [ "$RUNS" -gt 5 ] 2>/dev/null; then
             echo "::warning::Run count $RUNS out of range [1,5], defaulting to $BENCH_RUNS_REAL"
@@ -265,7 +281,8 @@ jobs:
 
           # Optional table parallelism for the HEADLINE benchmark only (the memory
           # growth sweep always runs at default parallelism). `/bench k=N` overrides;
-          # otherwise default (cores/3). /bench-growth no longer forces k=1.
+          # otherwise the build's default (num_airs on cuda, cores/3 on CPU).
+          # /bench-growth no longer forces k=1.
           TABLE_K=""
           if [ "$EVENT_NAME" = "issue_comment" ]; then
             TABLE_K=$(echo "$COMMENT_BODY" | grep -o 'k=[0-9]*' | head -1 | cut -d= -f2)
@@ -354,13 +371,15 @@ jobs:
             printf "%.0f %.4f\n", slope, r2
           }')
 
-          echo "growth_steps=$STEPS_SLASH" >> "$GITHUB_OUTPUT"
+          # Only what Compare reads is a step output. growth_steps and growth_times had
+          # no consumer, so they live in the metrics artifact below instead.
           echo "growth_heaps=$GROWTH_HEAPS" >> "$GITHUB_OUTPUT"
-          echo "growth_times=$GROWTH_TIMES" >> "$GITHUB_OUTPUT"
           echo "growth_slope_mb=$SLOPE" >> "$GITHUB_OUTPUT"
           echo "growth_r2=$R2" >> "$GITHUB_OUTPUT"
 
-          # Append to metrics artifact
+          # The metrics artifact is the durable record, so it keeps the per-point times
+          # and the x-axis this sweep used even though the comment renders neither —
+          # a stored baseline's heaps cannot be read back without them.
           echo "growth_steps=$STEPS_SLASH" >> /tmp/metrics.txt
           echo "growth_heaps=$GROWTH_HEAPS" >> /tmp/metrics.txt
           echo "growth_times=$GROWTH_TIMES" >> /tmp/metrics.txt
@@ -410,9 +429,9 @@ jobs:
             EPOCHS="$E"
           done
 
-          # Same summary as the synthetic screen: median for the headline, spread so a
-          # single slow run is visible rather than silently shifting the verdict, and
-          # every raw value so a reader can judge for themselves.
+          # Median for the headline, spread so a single slow run is visible rather than
+          # silently shifting the verdict, and every raw value so a reader can judge for
+          # themselves.
           MEDIAN_POS=$(( (RUNS + 1) / 2 ))
           TIME_MEDIAN=$(echo $TIMES | tr ' ' '\n' | sort -n | awk "NR==$MEDIAN_POS")
           HEAP_MEDIAN=$(echo $HEAPS | tr ' ' '\n' | sort -n | awk "NR==$MEDIAN_POS")
@@ -420,6 +439,17 @@ jobs:
           TIME_MAX=$(echo $TIMES | tr ' ' '\n' | sort -n | tail -1)
           TIME_SPREAD=$(awk "BEGIN { if ($TIME_MEDIAN > 0) printf \"%.1f\", (($TIME_MAX - $TIME_MIN) / $TIME_MEDIAN) * 100; else print \"0.0\" }")
           ALL_TIMES=$(echo $TIMES | tr ' ' '\n' | paste -sd '/' -)
+
+          # Say it at record time, not only at consume time: on push/dispatch these
+          # numbers become the cached baseline, and a noisy one mis-verdicts every
+          # /bench until the next refresh (2026-08-03: a 65.8%-spread baseline made
+          # healthy PRs read as ±20-35% for half an hour).
+          # 3%: the comment's verdict bands treat >=3% as a reportable delta, so a
+          # spread that could manufacture one is by definition too noisy. Keep in
+          # sync with the two 3.0 thresholds in the Comment step's renderer.
+          if awk "BEGIN { exit !($TIME_SPREAD > 3.0) }"; then
+            echo "::warning::Real-block prove-time spread ${TIME_SPREAD}% ($ALL_TIMES) — if this run publishes a baseline, /bench will flag comparisons against it as unreliable."
+          fi
 
           {
             echo "real_time_s=$TIME_MEDIAN"
@@ -460,8 +490,8 @@ jobs:
                 # Anchored (`^key=`): `real_time_s` contains `time_s`, so an unanchored
                 # grep could match two lines and write a multi-line step output.
                 get() { grep "^$1=" "$BASELINE_FILE" | head -1 | cut -d= -f2; }
-                for key in growth_heaps growth_times growth_slope_mb growth_r2 \
-                           real_time_s real_peak_mb real_input; do
+                for key in growth_heaps growth_slope_mb growth_r2 \
+                           real_time_s real_peak_mb real_time_spread real_input; do
                   # A baseline predating the real block simply has no real_* keys; empty
                   # values hide the table rather than producing a bogus comparison.
                   echo "$key=$(get "$key")" >> "$GITHUB_OUTPUT"
@@ -506,14 +536,12 @@ jobs:
           PROGRAMS=($GROWTH_PROGRAMS)
           STEPS_ARR=($GROWTH_STEPS)
           GROWTH_HEAPS=""
-          GROWTH_TIMES=""
           SAMPLES=1
 
           for idx in "${!PROGRAMS[@]}"; do
             prog="${PROGRAMS[$idx]}"
             INPUT_PATH="executor/tests/${prog}.bin"
             SAMPLE_HEAPS=""
-            SAMPLE_TIMES=""
             for s in $(seq 1 $SAMPLES); do
               echo "--- Baseline growth: $prog (sample $s/$SAMPLES, default parallelism) ---"
               ./target/release/cli prove "$ELF" --private-input "$INPUT_PATH" -o /tmp/proof.bin --time \
@@ -521,17 +549,16 @@ jobs:
               rm -f /tmp/proof.bin
               T=$(grep -o 'Proving time: [0-9.]*' /tmp/baseline_growth_${prog}_${s}.txt | awk '{print $3}')
               H=$(grep -o 'Peak heap: [0-9]*' /tmp/baseline_growth_${prog}_${s}.txt | awk '{print $3}')
+              # T is parsed only to catch a prove that emitted no timing line; the
+              # baseline side compares heap alone.
               if [ -z "$T" ] || [ -z "$H" ]; then
                 echo "::error::Failed to parse baseline growth metrics for $prog sample $s"
                 exit 1
               fi
               SAMPLE_HEAPS="$SAMPLE_HEAPS $H"
-              SAMPLE_TIMES="$SAMPLE_TIMES $T"
             done
             H=$(echo $SAMPLE_HEAPS | tr ' ' '\n' | sort -n | head -1)
-            T=$(echo $SAMPLE_TIMES | tr ' ' '\n' | sort -n | head -1)
             GROWTH_HEAPS="${GROWTH_HEAPS:+$GROWTH_HEAPS/}$H"
-            GROWTH_TIMES="${GROWTH_TIMES:+$GROWTH_TIMES/}$T"
           done
 
           STEPS_SLASH=$(echo "${STEPS_ARR[@]}" | tr ' ' '/')
@@ -558,12 +585,11 @@ jobs:
           }')
 
           echo "growth_heaps=$GROWTH_HEAPS" >> "$GITHUB_OUTPUT"
-          echo "growth_times=$GROWTH_TIMES" >> "$GITHUB_OUTPUT"
           echo "growth_slope_mb=$SLOPE" >> "$GITHUB_OUTPUT"
           echo "growth_r2=$R2" >> "$GITHUB_OUTPUT"
           fi  # end run_growth check
 
-          # --- Real block (continuations, 1 sample) ---
+          # --- Real block (continuations, sampled to the PR side's count) ---
           # Only reached when no cached baseline exists, which is the expensive case:
           # push-to-main normally publishes the real-block numbers, so a /bench comment
           # pays for the PR side alone. $REAL_INPUT was resolved before this
@@ -610,22 +636,20 @@ jobs:
           # Baseline artifact outputs
           BASELINE_FOUND: ${{ steps.baseline-artifact.outputs.found }}
           BA_GROWTH_HEAPS: ${{ steps.baseline-artifact.outputs.growth_heaps }}
-          BA_GROWTH_TIMES: ${{ steps.baseline-artifact.outputs.growth_times }}
           BA_GROWTH_SLOPE: ${{ steps.baseline-artifact.outputs.growth_slope_mb }}
           BA_GROWTH_R2: ${{ steps.baseline-artifact.outputs.growth_r2 }}
           BA_REAL_TIME: ${{ steps.baseline-artifact.outputs.real_time_s }}
           BA_REAL_PEAK: ${{ steps.baseline-artifact.outputs.real_peak_mb }}
+          BA_REAL_SPREAD: ${{ steps.baseline-artifact.outputs.real_time_spread }}
           BA_REAL_INPUT: ${{ steps.baseline-artifact.outputs.real_input }}
           # Baseline run outputs
           BR_GROWTH_HEAPS: ${{ steps.baseline-run.outputs.growth_heaps }}
-          BR_GROWTH_TIMES: ${{ steps.baseline-run.outputs.growth_times }}
           BR_GROWTH_SLOPE: ${{ steps.baseline-run.outputs.growth_slope_mb }}
           BR_GROWTH_R2: ${{ steps.baseline-run.outputs.growth_r2 }}
           BR_REAL_TIME: ${{ steps.baseline-run.outputs.real_time_s }}
           BR_REAL_PEAK: ${{ steps.baseline-run.outputs.real_peak_mb }}
           # PR growth outputs
           PR_GROWTH_HEAPS: ${{ steps.pr-growth.outputs.growth_heaps }}
-          PR_GROWTH_TIMES: ${{ steps.pr-growth.outputs.growth_times }}
           PR_GROWTH_SLOPE: ${{ steps.pr-growth.outputs.growth_slope_mb }}
           PR_GROWTH_R2: ${{ steps.pr-growth.outputs.growth_r2 }}
           # PR real-block outputs
@@ -641,20 +665,22 @@ jobs:
           if [ "$BASELINE_FOUND" = "true" ]; then
             BASELINE_SRC="cached"
             BASELINE_GROWTH_HEAPS="$BA_GROWTH_HEAPS"
-            BASELINE_GROWTH_TIMES="$BA_GROWTH_TIMES"
             BASELINE_GROWTH_SLOPE="$BA_GROWTH_SLOPE"
             BASELINE_GROWTH_R2="$BA_GROWTH_R2"
             BASELINE_REAL_TIME="$BA_REAL_TIME"
             BASELINE_REAL_PEAK="$BA_REAL_PEAK"
+            BASELINE_REAL_SPREAD="$BA_REAL_SPREAD"
             BASELINE_REAL_INPUT="$BA_REAL_INPUT"
           else
             BASELINE_SRC="built from main"
             BASELINE_GROWTH_HEAPS="$BR_GROWTH_HEAPS"
-            BASELINE_GROWTH_TIMES="$BR_GROWTH_TIMES"
             BASELINE_GROWTH_SLOPE="$BR_GROWTH_SLOPE"
             BASELINE_GROWTH_R2="$BR_GROWTH_R2"
             BASELINE_REAL_TIME="$BR_REAL_TIME"
             BASELINE_REAL_PEAK="$BR_REAL_PEAK"
+            # A freshly-built baseline runs in this same session, so there is no
+            # recorded-earlier spread to distrust; empty suppresses the noise warning.
+            BASELINE_REAL_SPREAD=""
             # Freshly proven on this runner from $REAL_INPUT, so by construction the
             # same block the PR side used; the cached path carries its own label.
             BASELINE_REAL_INPUT="$PR_REAL_INPUT"
@@ -683,7 +709,9 @@ jobs:
           echo "pr_real_all_times=$PR_REAL_ALL_TIMES" >> "$GITHUB_OUTPUT"
           echo "baseline_real_time=$BASELINE_REAL_TIME" >> "$GITHUB_OUTPUT"
           echo "baseline_real_peak=$BASELINE_REAL_PEAK" >> "$GITHUB_OUTPUT"
-          echo "baseline_real_input=$BASELINE_REAL_INPUT" >> "$GITHUB_OUTPUT"
+          echo "baseline_real_spread=$BASELINE_REAL_SPREAD" >> "$GITHUB_OUTPUT"
+          # No baseline_real_input output: the comment never names the baseline's block
+          # except on a mismatch, which real_mismatch below already carries.
 
           if [ -n "$PR_REAL_TIME" ] && [ -n "$BASELINE_REAL_TIME" ]; then
             if [ -n "$BASELINE_REAL_INPUT" ] && [ "$BASELINE_REAL_INPUT" != "$PR_REAL_INPUT" ]; then
@@ -703,6 +731,17 @@ jobs:
             fi
           fi
 
+          # Growth comparison. The renderer keys the whole growth section off
+          # pr_growth_heaps, so these pass through even when only one side ran.
+          {
+            echo "pr_growth_heaps=$PR_GROWTH_HEAPS"
+            echo "pr_growth_slope=$PR_GROWTH_SLOPE"
+            echo "pr_growth_r2=$PR_GROWTH_R2"
+            echo "baseline_growth_heaps=$BASELINE_GROWTH_HEAPS"
+            echo "baseline_growth_slope=$BASELINE_GROWTH_SLOPE"
+            echo "baseline_growth_r2=$BASELINE_GROWTH_R2"
+          } >> "$GITHUB_OUTPUT"
+
           # Growth slope comparison
           if [ -n "$BASELINE_GROWTH_SLOPE" ] && [ -n "$PR_GROWTH_SLOPE" ]; then
             SLOPE_DIFF=$((PR_GROWTH_SLOPE - BASELINE_GROWTH_SLOPE))
@@ -716,12 +755,13 @@ jobs:
         uses: actions/github-script@v7
         env:
           BASELINE_SRC: ${{ steps.compare.outputs.baseline_src }}
+          # The growth table's x-axis, straight from the env the sweep itself iterates,
+          # so the labels cannot drift from the points they label.
+          GROWTH_STEPS: ${{ env.GROWTH_STEPS }}
           PR_GROWTH_HEAPS: ${{ steps.compare.outputs.pr_growth_heaps }}
-          PR_GROWTH_TIMES: ${{ steps.compare.outputs.pr_growth_times }}
           PR_GROWTH_SLOPE: ${{ steps.compare.outputs.pr_growth_slope }}
           PR_GROWTH_R2: ${{ steps.compare.outputs.pr_growth_r2 }}
           BASE_GROWTH_HEAPS: ${{ steps.compare.outputs.baseline_growth_heaps }}
-          BASE_GROWTH_TIMES: ${{ steps.compare.outputs.baseline_growth_times }}
           BASE_GROWTH_SLOPE: ${{ steps.compare.outputs.baseline_growth_slope }}
           BASE_GROWTH_R2: ${{ steps.compare.outputs.baseline_growth_r2 }}
           GROWTH_SLOPE_DIFF: ${{ steps.compare.outputs.growth_slope_diff }}
@@ -732,6 +772,7 @@ jobs:
           PR_REAL_INPUT: ${{ steps.compare.outputs.pr_real_input }}
           BASE_REAL_TIME: ${{ steps.compare.outputs.baseline_real_time }}
           BASE_REAL_PEAK: ${{ steps.compare.outputs.baseline_real_peak }}
+          BASE_REAL_SPREAD: ${{ steps.compare.outputs.baseline_real_spread }}
           REAL_TIME_DIFF: ${{ steps.compare.outputs.real_time_diff }}
           REAL_TIME_PCT: ${{ steps.compare.outputs.real_time_pct }}
           REAL_PEAK_DIFF: ${{ steps.compare.outputs.real_peak_diff }}
@@ -746,18 +787,17 @@ jobs:
         with:
           # Renderable offline: `node scripts/render_bench_comment.js` extracts this block
           # and prints the markdown for a set of scenarios, so wording and formatting can
-          # be checked without occupying the bench server for 15-20 min. Add a scenario
+          # be checked without occupying the bench server for ~15 min. Add a scenario
           # there when you add a branch here.
           script: |
             const baseSrc = process.env.BASELINE_SRC;
 
             // Growth data
+            const growthSteps = process.env.GROWTH_STEPS;
             const prGrowthHeaps = process.env.PR_GROWTH_HEAPS;
-            const prGrowthTimes = process.env.PR_GROWTH_TIMES;
             const prGrowthSlope = process.env.PR_GROWTH_SLOPE;
             const prGrowthR2 = process.env.PR_GROWTH_R2;
             const baseGrowthHeaps = process.env.BASE_GROWTH_HEAPS;
-            const baseGrowthTimes = process.env.BASE_GROWTH_TIMES;
             const baseGrowthSlope = process.env.BASE_GROWTH_SLOPE;
             const baseGrowthR2 = process.env.BASE_GROWTH_R2;
             const growthSlopeDiff = process.env.GROWTH_SLOPE_DIFF;
@@ -773,6 +813,7 @@ jobs:
             const realInput = process.env.PR_REAL_INPUT;
             const baseRealTime = process.env.BASE_REAL_TIME;
             const baseRealPeak = process.env.BASE_REAL_PEAK;
+            const baseRealSpread = process.env.BASE_REAL_SPREAD;
             const realTimeDiff = process.env.REAL_TIME_DIFF;
             const realTimePct = process.env.REAL_TIME_PCT;
             const realPeakDiff = process.env.REAL_PEAK_DIFF;
@@ -791,8 +832,8 @@ jobs:
             // --- Section 1: Real block (headline; present whenever the fixture is fetchable) ---
             if (realTime) {
               body += `## Benchmark — real block${realInput ? ` (\`${realInput}\`)` : ''}${parseInt(realRuns) > 1 ? ` (median of ${realRuns})` : ''}\n\n`;
-              // Run count lives in the heading ("median of N"), as on the synthetic
-              // section — repeating it here just made the two disagree in tone.
+              // Run count lives in the heading ("median of N"); the subheading carries
+              // only the prove configuration.
               body += `<sub>continuations · epoch 2^${realEpochLog2}`;
               if (realEpochs) body += ` · ${realEpochs} epochs`;
               body += `</sub>\n\n`;
@@ -803,27 +844,41 @@ jobs:
 
               const haveRealCmp = !!(baseRealTime && realTimePct && !realMismatch);
               if (haveRealCmp) {
+                // A noisy baseline invalidates every Δ in the table, so the row icons
+                // go neutral too — a 🟢 beside a number the warning below calls
+                // unreliable reads as a verdict anyway.
+                // 3%, matching the verdict band below: a delta >=3% is reportable, so
+                // a spread that could manufacture one makes the baseline unusable.
+                const baseNoisy = !!(baseRealSpread && parseFloat(baseRealSpread) > 3.0);
+                const rowIcon = (pct) => baseNoisy ? '❔' : icon(pct);
                 body += `| Metric | main | PR | Δ |\n`;
                 body += `|--------|------|----|---|\n`;
                 if (realPeak && baseRealPeak && realPeakPct) {
-                  body += `| **Peak heap** | ${baseRealPeak} MB | ${realPeak} MB | ${fmt(realPeakDiff)} MB (${fmt(realPeakPct)}%) ${icon(realPeakPct)} |\n`;
+                  body += `| **Peak heap** | ${baseRealPeak} MB | ${realPeak} MB | ${fmt(realPeakDiff)} MB (${fmt(realPeakPct)}%) ${rowIcon(realPeakPct)} |\n`;
                 }
-                body += `| **Prove time** | ${baseRealTime}s | ${realTime}s | ${fmt(realTimeDiff)}s (${fmt(realTimePct)}%) ${icon(realTimePct)} |\n\n`;
+                body += `| **Prove time** | ${baseRealTime}s | ${realTime}s | ${fmt(realTimeDiff)}s (${fmt(realTimePct)}%) ${rowIcon(realTimePct)} |\n\n`;
 
-                // Wider bands than the synthetic screen's 5%: 3 runs of a minutes-long
-                // prove resolve less than 5 runs of a 25s one, so the middle is reported
-                // as unresolved rather than as "fine".
+                // Bands of 10%/3%, wider than a fast workload would need: 3 runs of a
+                // minutes-long prove resolve coarsely, so the middle is reported as
+                // unresolved rather than as "fine".
                 const rp = parseFloat(realTimePct);
-                if (rp > 10) {
+                // A noisy baseline invalidates the verdict, not just softens it: on
+                // 2026-08-03 a 65.8%-spread baseline verdicted healthy PRs at ±20-35%.
+                // Same 3% threshold as the PR-side spread note below.
+                if (baseNoisy) {
+                  body += `> ⚠️ **The cached baseline was noisy when it was recorded** (prove-time spread ${baseRealSpread}%), so the Δ column compares against an unreliable number and no verdict is drawn. Refresh it (Actions → "Benchmark (PR)" → Run workflow on main), then re-run \`/bench\` — or use \`/bench-abba\`, which measures both sides itself.\n`;
+                } else if (rp > 10) {
                   body += `> ⚠️ **Regression on the real block** — prove time up ${Math.abs(rp).toFixed(1)}%.\n`;
                 } else if (rp < -10) {
                   body += `> 🎉 **Improvement on the real block** — prove time down ${Math.abs(rp).toFixed(1)}%.\n`;
                 } else if (Math.abs(rp) >= 3) {
-                  body += `> ❓ **${fmt(realTimePct)}% — beyond what ${realRuns} runs resolve.** Use \`/bench-abba\` for a paired test.\n`;
+                  // /bench-abba proves this same block at this same epoch, so the
+                  // escalation resolves the reading rather than changing the question.
+                  body += `> ❓ **${fmt(realTimePct)}% — beyond what ${realRuns} runs resolve.** Use \`/bench-abba\` for a paired test of the same block (default 12 pairs, ~72 min, resolves ~1%).\n`;
                 } else {
                   body += `> ✅ No significant change.\n`;
                 }
-                if (realTimeSpread && parseFloat(realTimeSpread) > 5.0) {
+                if (realTimeSpread && parseFloat(realTimeSpread) > 3.0) {
                   const vals = realAllTimes ? realAllTimes.split('/').map(t => `${t}s`).join(' / ') : '';
                   body += `>\n> ⚠️ Real-block prove-time spread: ${realTimeSpread}% (${vals}) — the median above is less trustworthy than usual.\n`;
                 } else if (realTimeSpread && parseInt(realRuns) > 1) {
@@ -841,15 +896,16 @@ jobs:
               body += `\n`;
             }
 
-            // --- Section 3: Memory growth ---
+            // --- Section 2: Memory growth (only when the growth sweep ran) ---
             // Synthetic on purpose: this plots heap against BLOCK SIZE, which needs a
             // family of blocks that differ only in transaction count. A real block is
             // one point and cannot produce a slope.
             if (prGrowthHeaps) {
               const prHeaps = prGrowthHeaps.split('/');
               const baseHeaps = baseGrowthHeaps ? baseGrowthHeaps.split('/') : null;
-              // Transfer counts (x-axis); keep in sync with GROWTH_STEPS in the env block.
-              const labels = ['4', '8', '12', '16', '20'];
+              // Transfer counts (x-axis) from GROWTH_STEPS — the same list the sweep
+              // iterates, so the labels cannot drift from the heaps beside them.
+              const labels = (growthSteps || '').trim().split(/\s+/).filter(Boolean);
               const n = prHeaps.length;
 
               body += `\n## Memory Growth\n\n`;

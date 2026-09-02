@@ -155,7 +155,9 @@ fn verify_vm_minimal(vm_proof: &VmProof, elf_bytes: &[u8]) -> bool {
         &elf,
         &vm_proof.runtime_page_ranges,
         vm_proof.num_private_input_pages,
-    );
+        usize::MAX,
+    )
+    .expect("honest page layout");
     let airs = VmAirs::new(
         &elf,
         &proof_options,
@@ -1210,6 +1212,334 @@ fn test_prove_ecsm_rust_guest() {
     );
 }
 
+/// End-to-end prove→verify for the non-constraining `Hint` ecall: the minimal Rust
+/// guest does one `hint` call (secp256k1 base-field inverse of 3) and commits the result.
+/// This exercises the whole HINT table bus surface (Ecall receive, the x10/x11/x12
+/// register reads, the two ALU `LT` operand range-checks, the four 8-byte output MEMW
+/// writes and the output byte range-checks) end-to-end through prove→verify, de-risking
+/// the bus balance before scaling to real consumers. The committed output must equal
+/// the value the executor's `compute_hint` produced (= 3^{-1} mod p).
+#[test]
+fn test_prove_hint_min_rust_guest() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .to_path_buf();
+    let elf_bytes =
+        std::fs::read(workspace_root.join("executor/program_artifacts/rust/hint_min.elf"))
+            .expect("hint_min.elf not found — run `make compile-programs-rust`");
+
+    let proof = prove_vm_minimal(&elf_bytes, &[], &Default::default());
+    assert!(
+        verify_vm_minimal(&proof, &elf_bytes),
+        "hint_min rust guest should verify"
+    );
+
+    // Committed output must equal the hinted value (field inverse of 3, 32-byte BE).
+    let mut input = [0u8; 32];
+    input[31] = 3;
+    let expected =
+        executor::vm::instruction::execution::compute_hint(0 /* HINT_FIELD_INV */, &input);
+    assert_eq!(proof.public_output, expected.to_vec());
+}
+
+/// Multi-hint: three `hint` ecalls, one per selector, each result read back with
+/// ordinary `LOAD`s. Complements `test_prove_hint_min_rust_guest` by proving the
+/// paths the ethrex consumer relies on that a single-call guest doesn't: **multiple
+/// real HINT rows** (padded), **all three selectors** (so the AIR's `selector < 3`
+/// range-check is exercised at every accepted value, not only at 0) and **read-back
+/// via normal LOAD** (MEMW reads chaining to the HINT writes). Committed output =
+/// XOR of the three hinted values.
+#[test]
+fn test_prove_hint_multi_rust_guest() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .to_path_buf();
+    let elf_bytes =
+        std::fs::read(workspace_root.join("executor/program_artifacts/rust/hint_multi.elf"))
+            .expect("hint_multi.elf not found — run `make compile-programs-rust`");
+
+    let proof = prove_vm_minimal(&elf_bytes, &[], &Default::default());
+    assert!(
+        verify_vm_minimal(&proof, &elf_bytes),
+        "hint_multi rust guest should verify"
+    );
+
+    // Expected = XOR of inv(3) mod p, inv(5) mod n and sqrt(4) mod p (32-byte BE),
+    // matching the guest's one-call-per-selector loop.
+    use executor::vm::instruction::execution::{
+        HINT_FIELD_INV, HINT_FIELD_SQRT, HINT_SCALAR_INV, compute_hint,
+    };
+    let mut expected = [0u8; 32];
+    for (hint_id, seed) in [
+        (HINT_FIELD_INV, 3u8),
+        (HINT_SCALAR_INV, 5u8),
+        (HINT_FIELD_SQRT, 4u8),
+    ] {
+        let mut input = [0u8; 32];
+        input[31] = seed;
+        let out = compute_hint(hint_id, &input);
+        for i in 0..32 {
+            expected[i] ^= out[i];
+        }
+    }
+    assert_eq!(proof.public_output, expected.to_vec());
+}
+
+/// Consistency: the verifier REJECTS a HINT row that disagrees with the
+/// MEMW rows.
+///
+/// The HINT table's `out_bytes` are unconstrained *by the table* — the point of a
+/// non-constraining hint. Editing one output byte on the (single) real HINT row makes
+/// the MEMW write it sends stop matching the write the MEMW table received (the honest
+/// value `collect_hint_ops` derived), so the Memw LogUp bus unbalances and the proof
+/// must fail to verify.
+///
+/// What this covers is an *internally inconsistent* trace — the failure mode of a buggy
+/// trace builder. It is **not** a forgery test: a prover that edits the HINT row and the
+/// corresponding MEMW rows together satisfies every constraint, because nothing in the
+/// AIR pins *which* value was hinted. That guarantee lives in the guest's verify
+/// (`x·inv == 1`, `y² == x³+7`), which this minimal guest deliberately omits. What the
+/// AIR does pin is *where* the value lands and that it is 32 bytes — see
+/// `test_hint_binds_out_addr_to_x12` and `test_hint_range_checks_its_output_bytes`.
+#[test]
+fn test_prove_hint_min_inconsistent_output_rejected() {
+    use crate::tables::hint::cols as hint_cols;
+
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .to_path_buf();
+    let elf_bytes =
+        std::fs::read(workspace_root.join("executor/program_artifacts/rust/hint_min.elf"))
+            .expect("hint_min.elf not found — run `make compile-programs-rust`");
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+    let executor = Executor::new(&elf, vec![]).expect("Failed to create executor");
+    let result = executor.run().expect("Failed to run program");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
+
+    // Forge the low byte of the output on the (single) real HINT row.
+    let orig = *traces.hint.main_table.get(0, hint_cols::out(0));
+    let forged = orig + FieldElement::<GoldilocksField>::one();
+    traces.hint.main_table.set(0, hint_cols::out(0), forged);
+
+    assert!(
+        !prove_and_verify_vm_minimal(&elf, &mut traces),
+        "Verifier must reject a forged hint output byte"
+    );
+}
+
+/// Load `hint_min` and build its minimal traces (for the operand-forgery tests below).
+fn hint_min_traces() -> (Elf, Traces) {
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .to_path_buf();
+    let elf_bytes =
+        std::fs::read(workspace_root.join("executor/program_artifacts/rust/hint_min.elf"))
+            .expect("hint_min.elf not found — run `make compile-programs-rust`");
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+    let result = Executor::new(&elf, vec![])
+        .expect("Failed to create executor")
+        .run()
+        .expect("Failed to run program");
+    let traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
+    (elf, traces)
+}
+
+/// Soundness: the verifier REJECTS a HINT row whose selector is out of range.
+///
+/// The executor rejects `hint_id ∉ {0,1,2}` up front (`HintUnknownSelector`). The AIR
+/// now matches that: it binds the selector to `x10` and range-checks it `< 3`, so a
+/// witness cannot prove a hint the executor would reject. Before `a0` was bound this
+/// forgery verified. Forcing the selector to 3 (one past the valid set) unbalances both
+/// the `x10` register read and the `LT(selector, 3)` interaction.
+#[test]
+fn test_prove_hint_min_forged_selector_rejected() {
+    use crate::tables::hint::cols as hint_cols;
+    let (elf, mut traces) = hint_min_traces();
+    traces.hint.main_table.set(
+        0,
+        hint_cols::SEL_0,
+        FieldElement::<GoldilocksField>::from(3u64),
+    );
+    assert!(
+        !prove_and_verify_vm_minimal(&elf, &mut traces),
+        "Verifier must reject a hint with an out-of-range selector"
+    );
+}
+
+/// Soundness: the verifier REJECTS a HINT row whose input address would straddle the
+/// 32-bit limb boundary — the executor rejects it (`HintAddressOverflow`), and the AIR
+/// now binds `in_addr` to `x11` and range-checks its low limb `< 2^32 - 31`. Forcing
+/// the low limb to `2^32 - 1` unbalances the `x11` read and the `LT` interaction.
+#[test]
+fn test_prove_hint_min_forged_input_address_rejected() {
+    use crate::tables::hint::cols as hint_cols;
+    let (elf, mut traces) = hint_min_traces();
+    traces.hint.main_table.set(
+        0,
+        hint_cols::ADDR_IN_0,
+        FieldElement::<GoldilocksField>::from(0xFFFF_FFFFu64),
+    );
+    assert!(
+        !prove_and_verify_vm_minimal(&elf, &mut traces),
+        "Verifier must reject a hint whose input range crosses the limb boundary"
+    );
+}
+
+/// Column a bus value reads, for the structural HINT tests below.
+fn hint_bus_column(v: &stark::lookup::BusValue) -> Option<usize> {
+    match v {
+        stark::lookup::BusValue::Packed { start_column, .. } => Some(*start_column),
+        stark::lookup::BusValue::Linear(_) => None,
+    }
+}
+
+/// Constant a bus value holds, for the structural HINT tests below.
+fn hint_bus_constant(v: &stark::lookup::BusValue) -> Option<i64> {
+    match v {
+        stark::lookup::BusValue::Linear(terms) => match terms.as_slice() {
+            [stark::lookup::LinearTerm::Constant(c)] => Some(*c),
+            _ => None,
+        },
+        stark::lookup::BusValue::Packed { .. } => None,
+    }
+}
+
+/// Soundness: the HINT table must bind its output address to `x12` (the ecall's `a2`).
+///
+/// The four output writes take their base from `ADDR_OUT_0`, an ordinary column in a
+/// table with no algebraic constraints, so the register read asserted here is the only
+/// thing pinning that column to the register the CPU actually held. Without it the
+/// witness chooses *where* the 32 hinted bytes land — an arbitrary memory write, which
+/// is a strictly larger hole than the unconstrained value the table is designed around.
+///
+/// Asserted structurally rather than by tampering: editing `ADDR_OUT_0` in a trace also
+/// unbalances the honest MEMW rows, so a tamper test passes either way and would not
+/// notice this interaction being dropped.
+#[test]
+fn test_hint_binds_out_addr_to_x12() {
+    use crate::tables::hint::{bus_interactions, cols as hint_cols};
+    use crate::tables::types::BusId;
+    use stark::lookup::Multiplicity;
+
+    let memw_id = u64::from(BusId::Memw);
+    let reads: Vec<_> = bus_interactions()
+        .into_iter()
+        .filter(|i| i.bus_id == memw_id && i.is_sender && i.values.len() == 24)
+        .collect();
+    assert_eq!(
+        reads.len(),
+        3,
+        "HINT must send three MEMW register reads (a0 → x10, a1 → x11, a2 → x12)"
+    );
+    // The out_addr binding is the x12 read (base address 2*12); the a0/a1 reads bind
+    // the selector and input address, checked by the range-check interactions.
+    let out_read = reads
+        .iter()
+        .find(|r| hint_bus_constant(&r.values[9]) == Some(2 * 12))
+        .expect("HINT must send a MEMW register read for x12 (out_addr)");
+    let v = &out_read.values;
+
+    // CO24 read layout: old[8], is_register, base_lo, base_hi, value[8], ts_lo, ts_hi,
+    // w2, w4, w8.
+    assert_eq!(hint_bus_constant(&v[8]), Some(1), "is_register must be 1");
+    assert_eq!(
+        hint_bus_constant(&v[9]),
+        Some(2 * 12),
+        "register address must be x12 (the ecall's a2)"
+    );
+    assert_eq!(hint_bus_constant(&v[10]), Some(0), "address hi must be 0");
+    assert_eq!(
+        hint_bus_constant(&v[21]),
+        Some(1),
+        "w2 must be 1 for a 2-word register access"
+    );
+    for (slot, col) in [(0, hint_cols::ADDR_OUT_0), (1, hint_cols::ADDR_OUT_1)] {
+        assert_eq!(
+            hint_bus_column(&v[slot]),
+            Some(col),
+            "old[{slot}] must carry out_addr"
+        );
+        assert_eq!(
+            hint_bus_column(&v[11 + slot]),
+            Some(col),
+            "value[{slot}] must carry out_addr (a read leaves the register unchanged)"
+        );
+    }
+    // The read must happen at THE ecall's timestamp (ts_lo/ts_hi = slots 19/20). A
+    // register read bound to x12 but at some other timestamp would pin out_addr to
+    // whatever x12 held then, not at the ecall — the writes below all use the same
+    // TIMESTAMP columns, so the binding is only meaningful if it reads x12 at T.
+    assert_eq!(
+        hint_bus_column(&v[19]),
+        Some(hint_cols::TIMESTAMP_0),
+        "ts_lo must be the ecall timestamp (the read must occur at T)"
+    );
+    assert_eq!(
+        hint_bus_column(&v[20]),
+        Some(hint_cols::TIMESTAMP_1),
+        "ts_hi must be the ecall timestamp (the read must occur at T)"
+    );
+    assert!(
+        matches!(out_read.multiplicity, Multiplicity::Column(c) if c == hint_cols::MU),
+        "the register read must be gated by mu, like every other HINT interaction"
+    );
+}
+
+/// Soundness: the HINT table must range-check all 32 output cells as bytes.
+///
+/// The cells are free columns that enter memory as MEMW write values, and MEMW
+/// range-checks nothing it receives — every table that writes fresh values into memory
+/// (STORE, KECCAK, ECSM, PAGE) checks its own cells for that reason. The hinted value is
+/// allowed to be wrong; it is not allowed to be a field element outside `[0, 256)`, or
+/// the witness can smuggle non-bytes into memory and break the byte decomposition that
+/// loads and the ALU rely on.
+#[test]
+fn test_hint_range_checks_its_output_bytes() {
+    use crate::tables::hint::{bus_interactions, cols as hint_cols};
+    use crate::tables::types::BusId;
+    use stark::lookup::Multiplicity;
+
+    let are_bytes_id = u64::from(BusId::AreBytes);
+    let checks: Vec<_> = bus_interactions()
+        .into_iter()
+        .filter(|i| i.bus_id == are_bytes_id)
+        .collect();
+    assert_eq!(checks.len(), 16, "32 output cells, paired two per lookup");
+
+    let mut covered = std::collections::BTreeSet::new();
+    for check in &checks {
+        assert!(check.is_sender, "range checks are sends; BITWISE receives");
+        assert_eq!(check.values.len(), 2, "ARE_BYTES takes exactly two values");
+        assert!(
+            matches!(check.multiplicity, Multiplicity::Column(c) if c == hint_cols::MU),
+            "range checks must be gated by mu, or padding rows unbalance BITWISE"
+        );
+        for v in &check.values {
+            covered
+                .insert(hint_bus_column(v).expect("a range check must reference an output column"));
+        }
+    }
+
+    // 16 lookups × 2 slots = 32 slots; 32 distinct columns means each cell exactly once.
+    let expected: std::collections::BTreeSet<usize> = (0..32).map(hint_cols::out).collect();
+    assert_eq!(
+        covered, expected,
+        "every output cell must be range-checked exactly once"
+    );
+}
+
 /// Soundness: the verifier REJECTS a forged ECSM result.
 ///
 /// A malicious prover must not be able to claim a wrong `k·G`. We tamper the result
@@ -1376,7 +1706,8 @@ fn test_prove_elfs_test_commit_4_wrong_pages_rejected() {
     .expect("Prover failed");
 
     // Verifier uses EMPTY runtime pages → missing stack/public-output pages
-    let wrong_configs = Traces::page_configs_from_elf_and_runtime(&elf, &[], 0);
+    let wrong_configs = Traces::page_configs_from_elf_and_runtime(&elf, &[], 0, usize::MAX)
+        .expect("honest page layout");
     let verifier_airs = crate::VmAirs::new(
         &elf,
         &proof_options,
@@ -2133,7 +2464,9 @@ fn test_deep_stack_runtime_pages_roundtrip() {
     )
     .expect("Prover failed");
     // Verifier reconstructs from ELF + runtime_page_ranges hint
-    let verifier_configs = Traces::page_configs_from_elf_and_runtime(&elf, &runtime_page_ranges, 0);
+    let verifier_configs =
+        Traces::page_configs_from_elf_and_runtime(&elf, &runtime_page_ranges, 0, usize::MAX)
+            .expect("honest page layout");
     let verifier_airs = crate::VmAirs::new(
         &elf,
         &proof_options,
@@ -2208,7 +2541,8 @@ fn test_deep_stack_missing_pages_rejected() {
     )
     .expect("Prover failed");
     // Verifier uses EMPTY runtime_page_ranges → missing stack/heap pages
-    let wrong_configs = Traces::page_configs_from_elf_and_runtime(&elf, &[], 0);
+    let wrong_configs = Traces::page_configs_from_elf_and_runtime(&elf, &[], 0, usize::MAX)
+        .expect("honest page layout");
     let verifier_airs = crate::VmAirs::new(
         &elf,
         &proof_options,
@@ -2318,7 +2652,9 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
     )
     .expect("Prover failed");
     // Verifier reconstructs from ELF + runtime hint (ranges decoded to pages)
-    let verifier_configs = Traces::page_configs_from_elf_and_runtime(&elf, &runtime_page_ranges, 0);
+    let verifier_configs =
+        Traces::page_configs_from_elf_and_runtime(&elf, &runtime_page_ranges, 0, usize::MAX)
+            .expect("honest page layout");
     let verifier_airs = crate::VmAirs::new(
         &elf,
         &proof_options,
@@ -2629,8 +2965,8 @@ fn test_prove_wsuffix_64bit() {
 
 /// Proves a minimal Rust std program that uses `init_allocator()` and
 /// `String::from("Hello World") + commit`. Exercises the full Rust-std stack:
-/// TLSF heap init (SRL on high-bit values), CSR instructions injected by
-/// the Rust toolchain, and the allocator's memory access patterns.
+/// guest heap init, CSR instructions injected by the Rust toolchain, and the
+/// allocator's memory access patterns.
 #[test]
 fn test_prove_allocator_minimal_reproducer() {
     let _ = env_logger::builder().is_test(true).try_init();

@@ -3,7 +3,7 @@ compile-programs compile-recursion-elfs clean-asm clean-rust clean-bench clean-s
 clean-recursion-elfs clean test test-asm \
 test-rust test-ethrex test-ethrex-offline test-executor test-syscalls test-flamegraph flamegraph-prover test-profile-recursion test-profile-recursion-single test-profile-recursion-multi \
 test-profile-recursion-block recursion-profile-block-input \
-test-fast test-prover test-prover-all test-prover-debug test-disk-spill test-math-cuda test-cuda-integration test-cuda-fallback \
+test-fast test-prover test-prover-all test-prover-debug test-disk-spill test-math-cuda test-cuda-integration test-cuda-d1 test-cuda-fallback \
 test-prover-cuda test-prover-comprehensive-cuda \
 bench-math-cuda bench-prover bench-prover-cuda build check clippy fmt lint regen-ethrex-fixtures \
 update-ethrex-fixture-checksums check-ethrex-fixture-checksums ethrex-real-block-fixture \
@@ -93,7 +93,7 @@ ASM_LDFLAGS ?= -fuse-ld=lld -nostdlib -Wl,-e,main
 # Custom RV64IM target spec location
 RV64_TARGET_SPEC=$(CURDIR)/executor/programs/riscv64im-lambda-vm-elf.json
 
-.PHONY: test prepare-sysroot
+.PHONY: test test-syscalls test-ethrex-crypto prepare-sysroot
 
 # The guard checks for include/stdlib.h (not just the include/ dir) so that a PARTIAL
 # sysroot — directories present but missing the C standard library headers — is detected
@@ -282,7 +282,8 @@ test-rust: compile-programs-rust
 #
 #   the fixture   the rkyv ProgramInput the benchmarks prove (~1 MB)
 #   the cache     the ethrex-replay JSON it was converted from (~2 MB), read only
-#                 by the converter's tests and by `regen-real-block-fixture`
+#                 by `regen-real-block-fixture`. The converter's TESTS read a
+#                 different, upstream-pinned cache — see below.
 #
 # Fetching a verified binary is the same contract as prepare-sysroot above, and it
 # keeps the converter, the ~335-package ethrex host dependency tree and an
@@ -296,7 +297,7 @@ test-rust: compile-programs-rust
 # below. It is a regeneration tool for ethrex rev bumps, not a build step.
 #
 # ---- Repointing to a different block ----
-# These FIVE lines and nothing else. Every path below derives from them, the
+# These SIX lines and nothing else. Every path below derives from them, the
 # benchmark scripts and CI resolve the fixture through
 # `make -s print-real-block-fixture`, and no workflow, script or env var anywhere
 # names a block. Outside this file the repoint touches only REAL_BLOCK_FIXTURE in
@@ -377,9 +378,10 @@ ethrex-real-block-cache:
 	$(call ensure_verified,$(ETHREX_REAL_BLOCK_CACHE_URL),$(ETHREX_REAL_BLOCK_CACHE_SHA256),$(ETHREX_REAL_BLOCK_CACHE),cache,ETHREX_REAL_BLOCK_CACHE_URL)
 
 # Single source of truth for the benchmark tooling. scripts/bench_verify.sh,
-# scripts/perf_diff.sh and .github/workflows/benchmark-pr.yml read the fixture
-# path from here instead of hardcoding it, so repointing the block above moves
-# every benchmark at once. `-s` on the caller's side keeps the output clean.
+# scripts/bench_abba.sh, scripts/perf_diff.sh and
+# .github/workflows/benchmark-pr.yml read the fixture path from here instead of
+# hardcoding it, so repointing the block above moves every benchmark at once.
+# `-s` on the caller's side keeps the output clean.
 print-real-block-fixture:
 	@echo $(ETHREX_REAL_BLOCK_FIXTURE)
 
@@ -443,8 +445,11 @@ regen-real-block-fixture: ethrex-real-block-cache
 
 # ethrex host-reference tests live in the detached `tooling/ethrex-tests`
 # workspace (ethrex pins rkyv's `unaligned` feature; isolated Cargo.lock).
-# Needs the real-block fixture, so it needs the fixture URL to be set; CI runs the
-# `-offline` variant below in the PR gate and this one only in ethrex-block-converter.yml.
+# Needs the real-block fixture, so it needs the fixture URL to be set. This is a
+# local convenience target: no workflow invokes it. The PR gate spells out the
+# `-offline` variant below inline (pr_main.yaml), and ethrex-block-converter.yml's
+# block-usability job fetches the fixture and runs
+# `test_ethrex_real_block_native` on its own.
 test-ethrex: compile-programs-rust ethrex-real-block-fixture
 	cd tooling/ethrex-tests && cargo test --release -- --include-ignored --skip test_ethrex_real_block_vm
 
@@ -509,10 +514,27 @@ check-ethrex-fixture-checksums:
 # differential tests (the keccak sponge vs sha3 reference). Run them explicitly
 # in the crate dir; wired into `test` below and run as a dedicated step
 # in CI's cli-test job (pr_main.yaml).
+# Release too: the allocator's `init` guard degrades to an early return once
+# `debug_assert!` is compiled out, which is the configuration guests are built in,
+# and the test for that path is `#[cfg(not(debug_assertions))]`.
 test-syscalls:
 	cd syscalls && cargo test
+	cd syscalls && cargo test --release
 
-test: compile-programs test-syscalls
+# ethrex-crypto is a detached workspace (excluded from the root members), so a
+# root `cargo test` never runs it. Run it explicitly, like test-syscalls.
+# Run BOTH profiles deliberately. k256 swaps its FieldElement implementation on
+# `debug_assertions` (k256 0.13.4 arithmetic/field.rs): debug uses the
+# magnitude-tracking `field_impl` wrapper, release uses the raw FieldElement5x52.
+# The guest ELF is built with --release, so a release run is the only one that
+# exercises the implementation that actually ships; the debug run is kept because
+# its magnitude debug_asserts turn a contract violation into a loud panic instead
+# of a silently wrong value.
+test-ethrex-crypto:
+	cd crypto/ethrex-crypto && cargo test
+	cd crypto/ethrex-crypto && cargo test --release
+
+test: compile-programs test-syscalls test-ethrex-crypto
 	cargo test
 
 # === Quick test shortcuts ===
@@ -543,23 +565,61 @@ test-disk-spill:
 	cargo test --release -p stark --features disk-spill disk_spill
 	FORCE_DISK_SPILL=1 cargo test --release -p lambda-vm-prover --features disk-spill -- disk_spill count_table_lengths
 
-# math-cuda parity tests (requires NVIDIA GPU + nvcc)
+# Per-target wall clock for the GPU prover targets below. A panic on a device-only
+# cliff assert can leave the prover hung rather than aborting — the panicking thread
+# unwinds while its siblings stay parked in CUDA driver waits, and the process never
+# exits — which would hold the rented merge-queue box until the workflow timeout.
+# 45 min is generous against their normal runtime; the SIGKILL follows 30s later, and
+# timeout's 124 exit fails the target so gpu_test.sh reports the group as failed.
+GPU_TEST_TIMEOUT := timeout -k 30 2700
+
+# math-cuda kernel tests (requires NVIDIA GPU + nvcc). Group 1 of gpu_test.sh,
+# so a hang here also costs Groups 2-6: they run after it, sequentially.
 test-math-cuda:
-	cargo test -p math-cuda --release
+	$(GPU_TEST_TIMEOUT) cargo test -p math-cuda --release
 
 # End-to-end cuda dispatch coverage (requires NVIDIA GPU + nvcc).
 # Asserts the R1-R4 GPU dispatch counters fired on a real prove.
 # --test-threads=1: these tests reset and assert on process-global GPU call
 # counters, so they must run serially or one test's reset races another's read.
 test-cuda-integration:
-	cargo test -p lambda-vm-prover --release --features cuda \
+	$(GPU_TEST_TIMEOUT) cargo test -p lambda-vm-prover --release --features cuda \
 	    --test cuda_path_integration -- --ignored --nocapture --test-threads=1
+
+# num_parts==1 (DECODE) device DEEP/FRI coverage (requires NVIDIA GPU + nvcc).
+# No fixture crosses the default LDE threshold (1<<14) for a num_parts==1 table,
+# so lower it here until DECODE engages the d=1 device path end to end.
+#
+# Threshold and fixture are one choice, because there are exactly two d=1 tables
+# (a d=1 table is one with a single bus interaction): DECODE, whose rows come from
+# the guest's instruction count, and KECCAK_RC, fixed at NUM_ROWS=32 => LDE 64.
+# DECODE's ROM is derived from the ELF, NOT from cycles, so the whole
+# fib_iterative_* family is 13 executable words (the variants differ only in the
+# `li a0, <count>` immediate) => 16 rows => LDE 32. That sits BELOW KECCAK_RC's 64,
+# so with a fib fixture no threshold isolates DECODE: <=32 engages both and
+# 33..=64 engages only KECCAK_RC.
+#
+# all_instructions_64 is 66 executable words => 128 rows => DECODE LDE 256. At 128,
+# DECODE engages with 2x margin and KECCAK_RC (64) declines, so a nonzero
+# gpu_comp_h_slabs_calls() uniquely attributes to DECODE. 128 is also ABOVE the
+# PR's original 64, so it sends strictly fewer tables onto the GPU-committed path
+# and narrows -- rather than widens -- the R4 gather_proofs_dev abort site that
+# crypto/stark/src/gpu_lde.rs warns about for lowered thresholds.
+#
+# Its own binary + a process-wide env because gpu_lde_threshold() caches the value
+# on first read (OnceLock), so it must be set before any prove in the process.
+test-cuda-d1:
+	LAMBDA_VM_GPU_LDE_THRESHOLD=128 $(GPU_TEST_TIMEOUT) cargo test -p lambda-vm-prover \
+	    --release --features cuda \
+	    --test cuda_d1_path -- --ignored --nocapture --test-threads=1
 
 # GPU error-path coverage (requires NVIDIA GPU + nvcc).
 # Forces cuda dispatch errors and asserts the CPU fallback still produces a verifying proof.
 test-cuda-fallback:
-	cargo test -p lambda-vm-prover --release --features test-cuda-faults \
+	$(GPU_TEST_TIMEOUT) cargo test -p lambda-vm-prover --release --features test-cuda-faults \
 	    --test cuda_fallback_tests -- --ignored --nocapture --test-threads=1
+	$(GPU_TEST_TIMEOUT) cargo test -p lambda-vm-prover --release --features lambda-vm-prover/cuda \
+	    --test gpu_force_downgrade -- --ignored --nocapture --test-threads=1
 
 # The prover/stark/crypto/ecsm test suite with the GPU (cuda) path enabled (requires NVIDIA
 # GPU + nvcc). The GPU CI counterpart of CPU CI's sharded prover tests. Single-threaded: the
@@ -568,14 +628,14 @@ test-cuda-fallback:
 # compile-recursion-elfs: this unfiltered run executes the non-ignored recursion
 # smoke tests, which read prebuilt guest ELFs; scripts/gpu_test.sh otherwise never builds them.
 test-prover-cuda: compile-recursion-elfs
-	cargo test --release -p lambda-vm-prover -p stark -p crypto -p ecsm \
+	$(GPU_TEST_TIMEOUT) cargo test --release -p lambda-vm-prover -p stark -p crypto -p ecsm \
 	    --features lambda-vm-prover/cuda -- --test-threads=1
 
 # The comprehensive all-instructions prove (ignored by default) on the GPU path (requires
 # NVIDIA GPU + nvcc). GPU counterpart of the all-instructions half of CPU CI's merge-queue-only
 # comprehensive job (the CPU job also runs test_recursion_execute; recursion has no GPU leg yet).
 test-prover-comprehensive-cuda:
-	cargo test --release -p lambda-vm-prover --features cuda \
+	$(GPU_TEST_TIMEOUT) cargo test --release -p lambda-vm-prover --features cuda \
 	    test_prove_elfs_all_instructions_64_full -- --ignored --test-threads=1 --nocapture
 
 # math-cuda quick microbench (median of 10 runs)
