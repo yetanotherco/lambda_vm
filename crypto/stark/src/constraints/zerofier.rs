@@ -18,11 +18,10 @@ use crate::domain::Domain;
 /// the constraint must skip. This returns its roots `rᵢ` so callers can
 /// evaluate the product `∏(x - rᵢ)` directly at the points they need.
 pub fn end_exemptions_roots<F: IsField>(
-    meta: &ConstraintMeta,
+    end_exemptions: usize,
     trace_primitive_root: &FieldElement<F>,
     trace_length: usize,
 ) -> Vec<FieldElement<F>> {
-    let end_exemptions = meta.end_exemptions;
     if end_exemptions == 0 {
         return Vec::new();
     }
@@ -49,7 +48,7 @@ pub fn end_exemptions_lde_evaluations<F: IsFFTField>(
     domain: &Domain<F>,
 ) -> Vec<FieldElement<F>> {
     let roots = end_exemptions_roots(
-        meta,
+        meta.end_exemptions,
         &domain.trace_primitive_root,
         domain.trace_roots_of_unity.len(),
     );
@@ -133,20 +132,13 @@ where
     F: IsSubFieldOf<E>,
     E: IsField,
 {
-    if end_exemptions == 0 {
-        return FieldElement::<E>::one();
-    }
-    // Roots are gᴺ⁻¹, g²⁽ᴺ⁻¹⁾, … (walking backward from the last row by
-    // g⁻¹ = gᴺ⁻¹). Written `-(rᵢ - z)` so the field ops only go subfield −
-    // superfield (`rᵢ ∈ F`, `z ∈ E`), matching `end_exemptions_roots`.
-    let decrement = trace_primitive_root.pow(trace_length - 1);
-    let mut current = decrement.clone();
-    let mut acc = FieldElement::<E>::one();
-    for _ in 0..end_exemptions {
-        acc *= -(current.clone() - z.clone());
-        current = &current * &decrement;
-    }
-    acc
+    // Written `-(rᵢ - z)` so the field ops only go subfield − superfield
+    // (`rᵢ ∈ F`, `z ∈ E`). Empty roots fold to `1`, the no-exemptions case.
+    end_exemptions_roots(end_exemptions, trace_primitive_root, trace_length)
+        .iter()
+        .fold(FieldElement::<E>::one(), |acc, root| {
+            acc * -(root.clone() - z.clone())
+        })
 }
 
 #[cfg(test)]

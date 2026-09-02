@@ -992,7 +992,7 @@ pub trait IsStarkVerifier<
         let mut deep_poly_evaluations = Vec::with_capacity(num_queries);
         let mut deep_poly_evaluations_sym = Vec::with_capacity(num_queries);
 
-        for (i, _iota) in challenges.iotas.iter().enumerate() {
+        for i in 0..num_queries {
             let opening = proof.deep_poly_opening(i);
             let primary_base = 2 * i * stride;
             let sym_base = primary_base + stride;
@@ -1037,10 +1037,8 @@ pub trait IsStarkVerifier<
                     lde_main_sym,
                     lde_aux_sym,
                     opening.composition_poly().evaluations_sym(),
-                    &denominators[primary_base..primary_base + ood_height],
-                    &denominators[primary_base + ood_height],
-                    &denominators[sym_base..sym_base + ood_height],
-                    &denominators[sym_base + ood_height],
+                    &denominators[primary_base..primary_base + stride],
+                    &denominators[sym_base..sym_base + stride],
                 )?;
             deep_poly_evaluations.push(evaluation);
             deep_poly_evaluations_sym.push(evaluation_sym);
@@ -1072,13 +1070,12 @@ pub trait IsStarkVerifier<
         lde_trace_main_evaluations_sym: &'b [FieldElement<Field>],
         lde_trace_aux_evaluations_sym: &[FieldElement<FieldExtension>],
         lde_composition_poly_parts_evaluation_sym: &[FieldElement<FieldExtension>],
-        // Pre-inverted 1/(evaluation_point − z·gᵏ) per OOD row and
-        // 1/(evaluation_point − z^parts) for the composition part, primary then
-        // symmetric — all from the caller's single whole-proof batch inverse.
-        inv_denoms_trace: &[FieldElement<FieldExtension>],
-        inv_denom_composition: &FieldElement<FieldExtension>,
-        inv_denoms_trace_sym: &[FieldElement<FieldExtension>],
-        inv_denom_composition_sym: &FieldElement<FieldExtension>,
+        // One `[per-OOD-row | composition]` chunk per point, primary then
+        // symmetric, each `ood_height + 1` long — from the caller's single
+        // whole-proof batch inverse. Split below rather than at the call site
+        // so the layout lives in one place.
+        inv_denoms: &[FieldElement<FieldExtension>],
+        inv_denoms_sym: &[FieldElement<FieldExtension>],
     ) -> Option<(FieldElement<FieldExtension>, FieldElement<FieldExtension>)> {
         let ood_evaluations_table_height = query_invariant_terms.ood_row_sum.len();
         let ood_evaluations_table_width = query_invariant_terms.ood_width;
@@ -1128,12 +1125,17 @@ pub trait IsStarkVerifier<
         {
             return None;
         }
-        // The caller passes one pre-inverted trace denominator per OOD row.
-        if inv_denoms_trace.len() != ood_evaluations_table_height
-            || inv_denoms_trace_sym.len() != ood_evaluations_table_height
+        // One pre-inverted trace denominator per OOD row, plus the
+        // composition part's.
+        if inv_denoms.len() != ood_evaluations_table_height + 1
+            || inv_denoms_sym.len() != ood_evaluations_table_height + 1
         {
             return None;
         }
+        let (inv_denoms_trace, inv_denom_composition) =
+            inv_denoms.split_at(ood_evaluations_table_height);
+        let (inv_denoms_trace_sym, inv_denom_composition_sym) =
+            inv_denoms_sym.split_at(ood_evaluations_table_height);
 
         let mut trace_term = FieldElement::<FieldExtension>::zero();
         let mut trace_term_sym = FieldElement::<FieldExtension>::zero();
@@ -1196,8 +1198,8 @@ pub trait IsStarkVerifier<
         }
         let h_diff = &h_sum - &query_invariant_terms.h_sum_zpow;
         let h_diff_sym = &h_sum_sym - &query_invariant_terms.h_sum_zpow;
-        let h_terms = &h_diff * inv_denom_composition;
-        let h_terms_sym = &h_diff_sym * inv_denom_composition_sym;
+        let h_terms = &h_diff * &inv_denom_composition[0];
+        let h_terms_sym = &h_diff_sym * &inv_denom_composition_sym[0];
 
         Some((trace_term + h_terms, trace_term_sym + h_terms_sym))
     }
