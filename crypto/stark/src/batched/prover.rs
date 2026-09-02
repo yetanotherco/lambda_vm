@@ -792,6 +792,9 @@ where
             &mut stats,
             &mut ledger,
             residency,
+            // R2: device-only recompute — constraint eval reads the resident LDE,
+            // only the small composition parts come back to host (below).
+            true,
             #[cfg(feature = "disk-spill")]
             storage_mode,
         );
@@ -810,7 +813,31 @@ where
             &boundary_coefficients,
         )?;
         stats.parts_computations += 1;
-        let parts = computed.parts;
+        #[allow(unused_mut)]
+        let mut parts = computed.parts;
+        // Device-only R2: the constraint eval ran on the resident LDE and the
+        // parts live in the handle (empty host placeholders). Download them —
+        // small (2 composition-poly columns, not the full LDE) — for the host
+        // parts commit + R3 coset-eval + R4 DEEP. No-op on the host path (parts
+        // already populated) or any table whose device R2 declined (recovery
+        // filled the host parts).
+        #[cfg(feature = "cuda")]
+        if parts.first().is_some_and(|p| p.is_empty()) {
+            let handle = computed.gpu_parts.as_ref().expect(
+                "device-only R2 must carry a resident parts handle when host parts are empty",
+            );
+            let stream = math_cuda::device::backend()
+                .map_err(|e| {
+                    ProvingError::WrongParameter(format!("backend for parts download: {e:?}"))
+                })?
+                .next_stream();
+            parts = crate::gpu_lde::download_composition_parts_host::<FieldExtension>(
+                handle, &stream,
+            )
+            .ok_or_else(|| {
+                ProvingError::WrongParameter("device-only R2 parts download failed".to_string())
+            })?;
+        }
 
         let parts_bytes: usize = parts
             .iter()
@@ -890,6 +917,9 @@ where
                 &mut stats,
                 &mut ledger,
                 residency,
+                // R3 runs only under Retain here (RecomputeLde uses the coset-eval
+                // branch below); the retained host LDE is used, so not device-only.
+                false,
                 #[cfg(feature = "disk-spill")]
                 storage_mode,
             );
@@ -1011,6 +1041,9 @@ where
                         stats,
                         ledger,
                         residency,
+                        // R4 DEEP: device-only recompute — reads the resident LDE
+                        // + host parts (downloaded in R2); no full-LDE D2H.
+                        true,
                         #[cfg(feature = "disk-spill")]
                         storage_mode,
                     );
@@ -1105,6 +1138,9 @@ where
             &mut stats,
             &mut ledger,
             residency,
+            // Openings read HOST LDE rows (`LeafSource::append_row`), so keep the
+            // host LDE (not device-only) — device openings would be a later step.
+            false,
             #[cfg(feature = "disk-spill")]
             storage_mode,
         );
@@ -1640,6 +1676,7 @@ fn device_recompute_main_lde<Field, FieldExtension>(
     trace: &TraceTable<Field, FieldExtension>,
     domain: &Domain<Field>,
     twiddles: &crate::prover::LdeTwiddles<Field>,
+    retain_host_lde: bool,
     #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
 ) -> Option<(Vec<FieldElement<Field>>, usize, math_cuda::lde::GpuLdeBase)>
 where
@@ -1656,6 +1693,9 @@ where
         return None;
     }
     let n = trace_slice.len() / num_cols;
+    // `retain_host_lde=false` = device-only: no D2H of the full LDE (host Vec
+    // comes back empty). R2/R4 read the resident handle; the openings phase keeps
+    // it true so its host row reads still work.
     let (handle, host_lde) = crate::gpu_lde::try_expand_row_major_keep_no_tree::<Field, Field>(
         trace_slice,
         trace.main_rowmajor_dev(),
@@ -1663,7 +1703,7 @@ where
         num_cols,
         domain.blowup_factor,
         &twiddles.coset_weights,
-        true,
+        retain_host_lde,
     )?;
     Some((host_lde, num_cols, handle))
 }
@@ -1674,6 +1714,7 @@ fn device_recompute_aux_lde<Field, FieldExtension>(
     trace: &TraceTable<Field, FieldExtension>,
     domain: &Domain<Field>,
     twiddles: &crate::prover::LdeTwiddles<Field>,
+    retain_host_lde: bool,
     #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
 ) -> Option<(Vec<FieldElement<FieldExtension>>, usize, math_cuda::lde::GpuLdeExt3)>
 where
@@ -1696,7 +1737,7 @@ where
             num_cols,
             domain.blowup_factor,
             &twiddles.coset_weights,
-            true,
+            retain_host_lde,
         )?;
     Some((host_lde, num_cols, handle))
 }
@@ -1712,6 +1753,12 @@ fn materialize_ldes<Field, FieldExtension, PI, P>(
     stats: &mut BatchedProveStats,
     ledger: &mut ResidencyLedger,
     residency: ResidencyMode,
+    // When true (R2 constraint eval, R4 DEEP), the GPU recompute is DEVICE-ONLY:
+    // no D2H of the full LDE — those phases read the resident handle and only the
+    // small composition parts come back to host. The openings phase passes false
+    // (it reads host LDE rows), so the LDE is downloaded there. Ignored on the
+    // host / retained paths.
+    #[cfg_attr(not(feature = "cuda"), allow(unused_variables))] device_only: bool,
     #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
 ) -> LdePair<Field, FieldExtension>
 where
@@ -1723,6 +1770,8 @@ where
 {
     let (_, trace, _) = &air_trace_pairs[table];
     let mut bytes = 0usize;
+    #[cfg(feature = "cuda")]
+    let retain_host_lde = !device_only;
     // Resident device handles captured from a GPU recompute; attached to the
     // trace by `lde_trace_take` so R2/R4 fire their device paths.
     #[cfg(feature = "cuda")]
@@ -1743,6 +1792,7 @@ where
                 trace,
                 &domains[table],
                 &twiddles[table],
+                retain_host_lde,
                 #[cfg(feature = "disk-spill")]
                 storage_mode,
             ) {
@@ -1785,6 +1835,7 @@ where
                     trace,
                     &domains[table],
                     &twiddles[table],
+                    retain_host_lde,
                     #[cfg(feature = "disk-spill")]
                     storage_mode,
                 ) {
@@ -1880,15 +1931,34 @@ where
         #[cfg(feature = "cuda")]
         gpu_aux,
     } = ldes;
+    // Detect device-only from the ACTUAL buffer state (empty host buffer + a
+    // resident handle) BEFORE the Vecs are moved — mirrors the per-table
+    // `build_lde_trace`. `device_only=false` (openings) keeps the host LDE, so
+    // these stay false and the trace is a plain host trace with handles attached
+    // (R2/R4 still read them via `gpu_main`/`gpu_aux`).
+    #[cfg(feature = "cuda")]
+    let main_empty = main.1 > 0 && main.0.is_empty() && gpu_main.is_some();
+    #[cfg(feature = "cuda")]
+    let host_trace_empty =
+        main_empty || (aux.1 > 0 && aux.0.is_empty() && gpu_aux.is_some());
+    #[cfg(feature = "cuda")]
+    let device_rows = gpu_main
+        .as_ref()
+        .map(|h| h.lde_size)
+        .or_else(|| gpu_aux.as_ref().map(|h| h.lde_size));
     #[allow(unused_mut)]
     let mut lde_trace =
         LDETraceTable::from_row_major(main.0, main.1, aux.0, aux.1, step_size, blowup_factor);
-    // Attach resident LDE handles (GPU recompute) so R2 constraint eval / R4 DEEP
-    // read them on device. `host_trace_empty` intentionally stays FALSE: the host
-    // LDE is present, so `want_host` still drains parts to host and the host
-    // fallback stays valid for tables whose device path declines.
     #[cfg(feature = "cuda")]
     {
+        if host_trace_empty {
+            // `from_row_major` read num_rows from the empty host buffer (→ 0);
+            // recover the true LDE row count from the resident handle.
+            if let Some(n) = device_rows {
+                lde_trace.set_num_rows(n);
+            }
+            lde_trace.set_host_trace_empty(true);
+        }
         if let Some(h) = gpu_main {
             lde_trace.set_gpu_main(h);
         }
