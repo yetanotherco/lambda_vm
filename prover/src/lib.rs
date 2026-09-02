@@ -1260,6 +1260,152 @@ pub fn prove_with_options_and_inputs(
     })
 }
 
+/// CPU structural comparison (see MEASUREMENT-PLAN.md): time JUST the batched
+/// `multi_prove_batched` prove step over the VM's real tables. Paired with
+/// [`time_per_table_prove`] on the SAME block, run non-cuda so BOTH are pure CPU,
+/// this isolates the multi-merkle-tree's structural cost from GPU optimization
+/// (the GPU comparison was confounded — per-table is device-resident, batched is
+/// not). `Retain` matches the per-table path's single-prove residency. NOT part
+/// of the shipping pipeline.
+pub fn time_batched_prove(
+    elf_bytes: &[u8],
+    private_inputs: &[u8],
+) -> Result<std::time::Duration, Error> {
+    let proof_options =
+        GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is always valid");
+    let max_rows = MaxRowsConfig::default();
+    let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
+    let executor = Executor::new(&program, private_inputs.to_vec())
+        .map_err(|e| Error::Execution(format!("{e}")))?;
+    let result = executor
+        .run()
+        .map_err(|e| Error::Execution(format!("{e}")))?;
+    #[cfg(feature = "disk-spill")]
+    let storage_mode = {
+        let lengths = count_table_lengths(&program, &result.logs, &max_rows, private_inputs)?;
+        auto_storage::decide(&lengths, proof_options.blowup_factor)
+    };
+    let mut traces = Traces::from_elf_and_logs(
+        &program,
+        &result.logs,
+        &max_rows,
+        private_inputs,
+        #[cfg(feature = "disk-spill")]
+        storage_mode,
+    )?;
+    drop(result);
+    let table_counts = traces.table_counts();
+    let airs = VmAirs::new(
+        &program,
+        &proof_options,
+        false,
+        &traces.page_configs,
+        &table_counts,
+        None,
+        true,
+        None,
+        None,
+        None,
+    );
+    let runtime_page_ranges = traces.runtime_page_ranges();
+    let num_private_input_pages = traces
+        .page_configs
+        .iter()
+        .filter(|c| c.is_private_input)
+        .count();
+    let mut transcript = DefaultTranscript::<E>::new(&[]);
+    absorb_statement(
+        &mut transcript,
+        StatementKind::Monolithic,
+        elf_bytes,
+        &traces.public_output_bytes,
+        &table_counts,
+        num_private_input_pages,
+        &runtime_page_ranges,
+        proof_options.fri_final_poly_log_degree,
+    );
+    let t = std::time::Instant::now();
+    let _ = stark::batched::prover::multi_prove_batched::<F, E, (), Prover<F, E, ()>>(
+        airs.air_trace_pairs(&mut traces),
+        &mut transcript,
+        #[cfg(feature = "disk-spill")]
+        storage_mode,
+        stark::residency_mode::ResidencyMode::Retain,
+    )
+    .map_err(|e| Error::Prover(format!("{e:?}")))?;
+    Ok(t.elapsed())
+}
+
+/// CPU structural comparison: time JUST the per-table `Prover::multi_prove` over
+/// the same tables. See [`time_batched_prove`].
+pub fn time_per_table_prove(
+    elf_bytes: &[u8],
+    private_inputs: &[u8],
+) -> Result<std::time::Duration, Error> {
+    let proof_options =
+        GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is always valid");
+    let max_rows = MaxRowsConfig::default();
+    let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
+    let executor = Executor::new(&program, private_inputs.to_vec())
+        .map_err(|e| Error::Execution(format!("{e}")))?;
+    let result = executor
+        .run()
+        .map_err(|e| Error::Execution(format!("{e}")))?;
+    #[cfg(feature = "disk-spill")]
+    let storage_mode = {
+        let lengths = count_table_lengths(&program, &result.logs, &max_rows, private_inputs)?;
+        auto_storage::decide(&lengths, proof_options.blowup_factor)
+    };
+    let mut traces = Traces::from_elf_and_logs(
+        &program,
+        &result.logs,
+        &max_rows,
+        private_inputs,
+        #[cfg(feature = "disk-spill")]
+        storage_mode,
+    )?;
+    drop(result);
+    let table_counts = traces.table_counts();
+    let airs = VmAirs::new(
+        &program,
+        &proof_options,
+        false,
+        &traces.page_configs,
+        &table_counts,
+        None,
+        true,
+        None,
+        None,
+        None,
+    );
+    let runtime_page_ranges = traces.runtime_page_ranges();
+    let num_private_input_pages = traces
+        .page_configs
+        .iter()
+        .filter(|c| c.is_private_input)
+        .count();
+    let mut transcript = DefaultTranscript::<E>::new(&[]);
+    absorb_statement(
+        &mut transcript,
+        StatementKind::Monolithic,
+        elf_bytes,
+        &traces.public_output_bytes,
+        &table_counts,
+        num_private_input_pages,
+        &runtime_page_ranges,
+        proof_options.fri_final_poly_log_degree,
+    );
+    let t = std::time::Instant::now();
+    let _ = Prover::multi_prove(
+        airs.air_trace_pairs(&mut traces),
+        &mut transcript,
+        #[cfg(feature = "disk-spill")]
+        storage_mode,
+    )
+    .map_err(|e| Error::Prover(format!("{e:?}")))?;
+    Ok(t.elapsed())
+}
+
 /// Verify a proof produced by [`prove`] using default proof options.
 ///
 /// Uses [`GoldilocksCubicProofOptions::with_blowup(2)`] for verification.
