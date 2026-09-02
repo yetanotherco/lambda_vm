@@ -183,16 +183,22 @@ compile-recursion-elfs: prepare-sysroot $(RECURSION_ARTIFACTS) $(RECURSION_VERIF
 # the Rust guests listed above, and the recursion guests.
 compile-prover-test-elfs: compile-programs-asm compile-recursion-elfs $(PROVER_TEST_ARTIFACTS)
 
-# Guards the list against drift: a new prover test that reads a Rust guest not in
-# $(PROVER_TEST_GUESTS) would pass in CI (which builds every guest) and panic with
-# "elf not found" on a clean checkout running `make test-prover`. Run from `lint`.
+# Guards the list against drift, in both directions. A prover test that reads a
+# Rust guest missing from $(PROVER_TEST_GUESTS) passes in CI (which builds every
+# guest) and panics with "elf not found" on a clean checkout running
+# `make test-prover` — that is how this got here. An entry left behind after its
+# guest is deleted is the mirror image: `compile-prover-test-elfs` then asks cargo
+# to build a directory that no longer exists, and nothing flags it at review time.
+# The empty-match case is a failure too: it means the path moved or the tests now
+# build the name at runtime, either of which silently disarms the guard.
+# Run from `lint`.
 # Rust guests only — the asm and recursion artifacts are built wholesale, so no
 # list can go stale for them. A prover test reading a bench guest (none do today)
 # would need its own entry here.
 check-prover-test-elfs:
-	@grep -rhoE 'program_artifacts/rust/[A-Za-z0-9_-]+\.elf' prover/src prover/tests \
+	@grep -rhoE 'program_artifacts/rust/[A-Za-z0-9_-]+\.elf' prover/src prover/tests prover/benches \
 		| sed -E 's#.*/##; s#\.elf$$##' | sort -u \
-		| awk -v known="$(PROVER_TEST_GUESTS)" 'BEGIN { n = split(known, a, " "); for (i = 1; i <= n; i++) k[a[i]] = 1 } !($$0 in k) { if (!missing++) print "check-prover-test-elfs: prover tests read Rust guests missing from PROVER_TEST_GUESTS:"; print "  " $$0 } END { if (missing) { print "Add them to PROVER_TEST_GUESTS in the Makefile."; exit 1 } }'
+		| awk -v known="$(PROVER_TEST_GUESTS)" 'BEGIN { n = split(known, a, " "); for (i = 1; i <= n; i++) k[a[i]] = 1 } { seen[$$0] = 1 } !($$0 in k) { if (!missing++) print "check-prover-test-elfs: prover tests read Rust guests missing from PROVER_TEST_GUESTS:"; print "  " $$0 } END { if (!NR) { print "check-prover-test-elfs: no program_artifacts/rust/*.elf reads found in prover/ — the grep pattern went stale, fix it or the guard checks nothing."; exit 1 } for (i = 1; i <= n; i++) if (!(a[i] in seen)) { if (!stale++) print "check-prover-test-elfs: PROVER_TEST_GUESTS entries no prover test reads:"; print "  " a[i] } if (missing) print "Add them to PROVER_TEST_GUESTS in the Makefile."; if (stale) print "Remove them from PROVER_TEST_GUESTS in the Makefile."; if (missing || stale) exit 1 }'
 
 $(RECURSION_ARTIFACTS_DIR):
 	mkdir -p $@
