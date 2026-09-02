@@ -490,7 +490,8 @@ test-ethrex: compile-programs-rust ethrex-real-block-fixture
 test-ethrex-offline: compile-programs-rust
 	cd tooling/ethrex-tests && cargo test --release -- --include-ignored --skip test_ethrex_real_block
 
-test-flamegraph:
+# executor/tests/flamegraph.rs reads prebuilt asm and Rust guests off disk.
+test-flamegraph: compile-programs-asm compile-programs-rust
 	cargo test -p executor --test flamegraph
 
 test-profile-recursion: test-profile-recursion-single test-profile-recursion-multi
@@ -599,13 +600,15 @@ test-math-cuda:
 # Asserts the R1-R4 GPU dispatch counters fired on a real prove.
 # --test-threads=1: these tests reset and assert on process-global GPU call
 # counters, so they must run serially or one test's reset races another's read.
-test-cuda-integration:
+# compile-programs-asm: these tests prove a prebuilt asm guest (asm_elf_bytes).
+test-cuda-integration: compile-programs-asm
 	cargo test -p lambda-vm-prover --release --features cuda \
 	    --test cuda_path_integration -- --ignored --nocapture --test-threads=1
 
 # GPU error-path coverage (requires NVIDIA GPU + nvcc).
 # Forces cuda dispatch errors and asserts the CPU fallback still produces a verifying proof.
-test-cuda-fallback:
+# compile-programs-asm: these tests prove a prebuilt asm guest (asm_elf_bytes).
+test-cuda-fallback: compile-programs-asm
 	cargo test -p lambda-vm-prover --release --features test-cuda-faults \
 	    --test cuda_fallback_tests -- --ignored --nocapture --test-threads=1
 
@@ -622,7 +625,8 @@ test-prover-cuda: compile-prover-test-elfs
 # The comprehensive all-instructions prove (ignored by default) on the GPU path (requires
 # NVIDIA GPU + nvcc). GPU counterpart of the all-instructions half of CPU CI's merge-queue-only
 # comprehensive job (the CPU job also runs test_recursion_execute; recursion has no GPU leg yet).
-test-prover-comprehensive-cuda:
+# compile-programs-asm: all_instructions_64 is a prebuilt asm guest.
+test-prover-comprehensive-cuda: compile-programs-asm
 	cargo test --release -p lambda-vm-prover --features cuda \
 	    test_prove_elfs_all_instructions_64_full -- --ignored --test-threads=1 --nocapture
 
@@ -631,12 +635,13 @@ bench-math-cuda:
 	cargo test -p math-cuda --release --test bench_quick -- --ignored --nocapture
 
 # Single-prove wall-time bench (warm-up + profiled run of fib_iterative_1M).
-bench-prover:
+# compile-programs-asm: fib_iterative_1M is a prebuilt asm guest (asm_elf_bytes).
+bench-prover: compile-programs-asm
 	cargo test -p lambda-vm-prover --release --test bench_single -- --ignored --nocapture
 
 # Single-prove wall-time bench with the GPU LDE path enabled.
 # Needs an NVIDIA GPU + CUDA toolkit/driver.
-bench-prover-cuda:
+bench-prover-cuda: compile-programs-asm
 	cargo test -p lambda-vm-prover --release --features cuda --test bench_single -- --ignored --nocapture
 
 # Build all
