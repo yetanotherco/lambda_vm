@@ -815,7 +815,7 @@ fn join_leg_cost() {
 use super::builder::{Bit, Cell, Ext, Felt};
 use super::deep::{DeepOpening, emit_deep_invariants, emit_deep_point};
 use super::proof::{lfm_prove, verify_against};
-use super::registry::build_artifacts;
+use super::registry::build_artifacts_with_hasher;
 use super::sub_proof::{
     GroupCommitment, GroupOpening, emit_group_authentication, emit_query_points,
 };
@@ -1019,7 +1019,11 @@ fn the_join_proves_and_verifies() {
         b.public(s.as_cell());
     }
     let program = compile(b.finish());
-    let artifacts = build_artifacts(&program, &opts);
+    // Built at `WrapHash::production()`, so it emits `Instr::Hash` and the
+    // artifacts must carry the pin's tenant — the classification rule in
+    // HASH-PINNING.md. `build_artifacts` defaults to the registry's blessed
+    // hasher, which is correct for registry programs and wrong for this one.
+    let artifacts = build_artifacts_with_hasher(&program, &opts, crate::hash_pin::BLOCK_HASHER);
     let proved = lfm_prove(&program, &artifacts, &h.arenas(&queries), &opts)
         .expect("the joined sub-proof must prove");
 

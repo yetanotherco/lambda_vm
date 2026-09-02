@@ -1184,7 +1184,7 @@ fn the_shape_pins_the_lengths_production_must_check_at_runtime() {
 #[test]
 fn the_fri_leg_proves_and_verifies() {
     use super::proof::{lfm_prove, verify_against};
-    use super::registry::build_artifacts;
+    use super::registry::build_artifacts_with_hasher;
 
     let h = host_fri(512, 2);
     assert_eq!(
@@ -1211,7 +1211,11 @@ fn the_fri_leg_proves_and_verifies() {
 
     let mut arenas = h.trace.arenas(&queries);
     arenas.extend(h.fri_arenas(&queries));
-    let artifacts = build_artifacts(&program, &opts);
+    // Built at `WrapHash::production()`, so it emits `Instr::Hash` and the
+    // artifacts must carry the pin's tenant — the classification rule in
+    // HASH-PINNING.md. `build_artifacts` defaults to the registry's blessed
+    // hasher, which is correct for registry programs and wrong for this one.
+    let artifacts = build_artifacts_with_hasher(&program, &opts, crate::hash_pin::BLOCK_HASHER);
     let proved = lfm_prove(&program, &artifacts, &arenas, &opts)
         .expect("the joined trace+DEEP+FRI program must prove");
 
