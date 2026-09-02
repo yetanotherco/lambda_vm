@@ -343,7 +343,8 @@ impl Memory {
     }
 
     /// The hint arena as it stands: slot `i` is what the guest reads for request
-    /// `i`. Equal to the `hints` passed to [`Memory::store_private_inputs`] plus
+    /// `i`. Equal to any arena passed to
+    /// [`Memory::store_private_inputs`] plus
     /// everything [`Memory::answer_hint_request`] seeded during the run. The
     /// prover must pass THIS to the trace builder — it is the arena the region's
     /// bytes actually encode.
@@ -380,15 +381,15 @@ impl Memory {
     /// does not). The seeded bytes stay unconstrained and untrusted: the guest
     /// verifies them and falls back to software on failure.
     ///
-    /// A slot the caller already supplied is left alone — an explicitly passed
-    /// arena wins, and the guest reads exactly what the caller shipped.
+    /// A slot [`Memory::store_private_inputs`] already filled is left
+    /// alone — a pre-answered slot wins, and the guest reads exactly those bytes.
     ///
-    /// One sharp edge, documented on the guest side too (`syscalls::hint_count`):
-    /// seeding also moves the arena's count word, so a guest must not read that
-    /// word (via `hint_count`/`next_hint`) BEFORE making on-demand requests — the
-    /// trace would carry the pre-bump value while the image carries the final
-    /// one. No guest mixes the two styles today. Closing it properly wants a mode
-    /// flag in the header's spare pad word rather than a convention.
+    /// Seeding also moves the arena's count word, which is safe because no guest
+    /// can read it: the guest ABI exposes only `request_hint`, and a request
+    /// addresses its slot by the index its OWN log assigned. Re-exposing a
+    /// count-word read to guests would reintroduce the hazard — a read taken
+    /// before the first request would see a value the proved initial image no
+    /// longer holds.
     pub(crate) fn answer_hint_request(&mut self, new_count: u32) -> Result<(), MemoryError> {
         if self.hints_silenced {
             return Ok(());
@@ -477,6 +478,16 @@ impl Memory {
     /// With no main input AND no hints nothing is written at all (the region
     /// reads back as all zeros, including a zero hint count) so a no-input
     /// program keeps zero private-input pages.
+    /// `hints` pre-answers the guest's first `hints.len()` requests:
+    /// [`Memory::answer_hint_request`] leaves a slot that is already filled
+    /// alone, so the guest reads exactly those bytes. Every prove path passes
+    /// an EMPTY arena — the executor answers requests as the guest makes them
+    /// (see [`Executor::new`]); a non-empty one reaches here only from
+    /// [`Executor::with_hint_arena`], a test and measurement hook that pins
+    /// "supplied up front and answered on demand produce the same region".
+    ///
+    /// [`Executor::new`]: crate::vm::execution::Executor::new
+    /// [`Executor::with_hint_arena`]: crate::vm::execution::Executor::with_hint_arena
     pub fn store_private_inputs(
         &mut self,
         inputs: Vec<u8>,

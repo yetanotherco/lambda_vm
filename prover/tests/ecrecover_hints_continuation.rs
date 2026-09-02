@@ -1,6 +1,7 @@
 //! Continuation-proof measurement for the `ecrecover_hints` guest on the hint
-//! arena: proves the pass-2 run (arena hints) with continuations to bound
-//! prover memory, and verifies the bundle.
+//! arena: proves the run with continuations to bound prover memory, and
+//! verifies the bundle. The executor answers each hint request as the guest
+//! makes it, so the prove takes the input and nothing else.
 //!
 //! Fixtures are produced by the executor-side driver — run it first:
 //!   cargo test -p executor --test hint_arena_ecrecover -- --ignored --nocapture
@@ -29,23 +30,11 @@ fn ecrecover_arena_continuation_proof() {
         "ecrecover_hints.input.bin missing — run the executor driver: \
          cargo test -p executor --test hint_arena_ecrecover -- --ignored",
     );
-    let hints_bin = std::fs::read(dir.join("ecrecover_hints.hints.bin"))
-        .expect("ecrecover_hints.hints.bin missing — run the executor driver");
-    assert_eq!(
-        hints_bin.len() % 32,
-        0,
-        "hints fixture must be 32-byte slots"
-    );
-    let hints: Vec<[u8; 32]> = hints_bin
-        .chunks_exact(32)
-        .map(|c| c.try_into().unwrap())
-        .collect();
-
     let opts = ProofOptions::default_test_options();
 
     let t0 = Instant::now();
-    let bundle = prove_continuation(&elf_bytes, &input, &hints, EPOCH_SIZE_LOG2, &opts)
-        .expect("continuation prove");
+    let bundle =
+        prove_continuation(&elf_bytes, &input, EPOCH_SIZE_LOG2, &opts).expect("continuation prove");
     let prove_time = t0.elapsed();
 
     let t0 = Instant::now();
@@ -55,7 +44,6 @@ fn ecrecover_arena_continuation_proof() {
     let verify_time = t0.elapsed();
 
     println!("[ecrecover-continuation] epochs = {}", bundle.num_epochs());
-    println!("[ecrecover-continuation] hints = {} slots", hints.len());
     println!("[ecrecover-continuation] prove = {prove_time:?}, verify = {verify_time:?}");
     println!(
         "[ecrecover-continuation] public output = {} bytes, first 8: {:02x?}",

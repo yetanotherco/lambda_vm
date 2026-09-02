@@ -1068,7 +1068,6 @@ struct GenesisFacts {
 pub fn prove_continuation(
     elf_bytes: &[u8],
     private_inputs: &[u8],
-    hints: &[[u8; 32]],
     epoch_size_log2: u32,
     opts: &ProofOptions,
 ) -> Result<ContinuationProof, Error> {
@@ -1092,7 +1091,7 @@ pub fn prove_continuation(
     let __root = stark::instruments::span("prove_continuation_total");
 
     let elf = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
-    let mut executor = Executor::new(&elf, private_inputs.to_vec(), hints)
+    let mut executor = Executor::new(&elf, private_inputs.to_vec())
         .map_err(|e| Error::Execution(format!("{e}")))?;
     // The DECODE precomputed commitment depends only on (ELF, opts): compute
     // it once here instead of once per epoch inside `build_epoch_airs`.
@@ -1105,7 +1104,7 @@ pub fn prove_continuation(
 
     // The cross-epoch memory image, carried forward: epoch i+1's init is epoch i's
     // fini, updated in place with each epoch's touched-cell final values.
-    let mut image = build_initial_image_paged(&elf, private_inputs, hints);
+    let mut image = build_initial_image_paged(&elf, private_inputs, &[]);
     let mut provenance =
         local_to_global::genesis_provenance(image.iter().map(|(a, v)| (a, v as u64)));
 
@@ -1118,7 +1117,7 @@ pub fn prove_continuation(
     // is never contended and the ordering is the channel's, not the lock's.
     let genesis = std::sync::Mutex::new(GenesisFacts {
         page_data: build_init_page_data(&image),
-        hint_count: hints.len(),
+        hint_count: 0,
     });
 
     let mut epochs: Vec<EpochProof> = Vec::new();
@@ -1258,15 +1257,13 @@ pub fn prove_continuation(
                 None::<&std::collections::HashMap<u64, u8>>,
                 &job.register_init,
                 &MaxRowsConfig::default(),
-                // Reached only by PAGE generation, which the line above skips —
-                // so `hints` here is the caller's arena, NOT the effective one
-                // the run may have grown on demand, and that is harmless only
-                // because nothing reads it. Anything that re-enables PAGE for
-                // epochs has to take the effective arena instead (the count is
-                // in `GenesisFacts`), or it will size the private-input region
-                // from a stale slot count.
+                // Reached only by PAGE generation, which the line above skips,
+                // so the empty arena here is never read. Anything that
+                // re-enables PAGE for epochs has to pass the effective arena
+                // instead (its count is in `GenesisFacts`), or it will size the
+                // private-input region from a stale slot count.
                 private_inputs,
-                hints,
+                &[],
                 job.is_final,
                 true,
                 #[cfg(feature = "disk-spill")]
@@ -1848,7 +1845,7 @@ pub fn prove_and_verify_continuation(
     epoch_size_log2: u32,
     opts: &ProofOptions,
 ) -> Result<Option<Vec<u8>>, Error> {
-    let bundle = prove_continuation(elf_bytes, private_inputs, &[], epoch_size_log2, opts)?;
+    let bundle = prove_continuation(elf_bytes, private_inputs, epoch_size_log2, opts)?;
     verify_continuation(elf_bytes, &bundle, opts)
 }
 
@@ -1972,7 +1969,7 @@ mod tests {
         let elf_bytes = asm_elf_bytes("test_commit_split");
         let expected_output: [u8; 4] = [0xAA, 0xBB, 0xCC, 0xDD];
 
-        let total = Executor::new(&Elf::load(&elf_bytes).unwrap(), vec![], &[])
+        let total = Executor::new(&Elf::load(&elf_bytes).unwrap(), vec![])
             .unwrap()
             .run()
             .unwrap()
@@ -1994,14 +1991,8 @@ mod tests {
         // 16-cycle epoch forces it into a later epoch where x254 is already 2.
         // Prove first so we can assert the run actually split into >1 epoch — without
         // this the test would silently pass even if it degraded to a single epoch.
-        let bundle = prove_continuation(
-            &elf_bytes,
-            &[],
-            &[],
-            4,
-            &ProofOptions::default_test_options(),
-        )
-        .unwrap();
+        let bundle =
+            prove_continuation(&elf_bytes, &[], 4, &ProofOptions::default_test_options()).unwrap();
         assert!(
             bundle.num_epochs() > 1,
             "16-cycle epochs must split the run into multiple epochs"
@@ -2030,7 +2021,6 @@ mod tests {
             let r = prove_continuation(
                 &elf_bytes,
                 test_fault::MAGIC,
-                &[],
                 2,
                 &ProofOptions::default_test_options(),
             );
@@ -2058,7 +2048,7 @@ mod tests {
         // Guard against silent degradation: the program must be longer than one
         // epoch, otherwise this collapses to a single final epoch and stops testing
         // the cross-epoch (intermediate-epoch) path.
-        let total = Executor::new(&Elf::load(&elf_bytes).unwrap(), vec![], &[])
+        let total = Executor::new(&Elf::load(&elf_bytes).unwrap(), vec![])
             .unwrap()
             .run()
             .unwrap()
@@ -2087,7 +2077,7 @@ mod tests {
     fn test_verify_continuation_with_supplied_roots() {
         let elf_bytes = asm_elf_bytes("data_page_touch");
         let opts = ProofOptions::default_test_options();
-        let bundle = prove_continuation(&elf_bytes, &[], &[], 3, &opts).unwrap();
+        let bundle = prove_continuation(&elf_bytes, &[], 3, &opts).unwrap();
 
         let expected = verify_continuation(&elf_bytes, &bundle, &opts)
             .unwrap()
@@ -2168,7 +2158,7 @@ mod tests {
         for name in ["data_page_touch", "all_loadstore_32"] {
             let elf_bytes = asm_elf_bytes(name);
             let opts = ProofOptions::default_test_options();
-            let bundle = prove_continuation(&elf_bytes, &[], &[], 3, &opts).unwrap();
+            let bundle = prove_continuation(&elf_bytes, &[], 3, &opts).unwrap();
             let elf = Elf::load(&elf_bytes).unwrap();
             let page_bases = canonical_page_bases(&bundle.touched_page_bases);
 
@@ -2206,7 +2196,7 @@ mod tests {
     fn test_ecsm_across_epochs_verifies() {
         let _ = env_logger::builder().is_test(true).try_init();
         let elf_bytes = asm_elf_bytes("test_ecsm_split");
-        let total = Executor::new(&Elf::load(&elf_bytes).unwrap(), vec![], &[])
+        let total = Executor::new(&Elf::load(&elf_bytes).unwrap(), vec![])
             .unwrap()
             .run()
             .unwrap()
@@ -2246,7 +2236,7 @@ mod tests {
     #[test]
     fn test_continuation_rejects_too_small_epoch_size_log2() {
         assert!(matches!(
-            prove_continuation(&[], &[], &[], 1, &ProofOptions::default_test_options()),
+            prove_continuation(&[], &[], 1, &ProofOptions::default_test_options()),
             Err(Error::InvalidContinuationEpochSize(_))
         ));
     }
@@ -2259,14 +2249,8 @@ mod tests {
     fn test_split_verify_roundtrip() {
         let _ = env_logger::builder().is_test(true).try_init();
         let elf_bytes = asm_elf_bytes("test_commit_split");
-        let bundle = prove_continuation(
-            &elf_bytes,
-            &[],
-            &[],
-            4,
-            &ProofOptions::default_test_options(),
-        )
-        .unwrap();
+        let bundle =
+            prove_continuation(&elf_bytes, &[], 4, &ProofOptions::default_test_options()).unwrap();
         let out = verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options())
             .unwrap();
         assert_eq!(out.as_deref(), Some(&[0xAA, 0xBB, 0xCC, 0xDD][..]));
@@ -2278,14 +2262,8 @@ mod tests {
     fn test_continuation_rkyv_roundtrip() {
         let _ = env_logger::builder().is_test(true).try_init();
         let elf_bytes = asm_elf_bytes("test_commit_split");
-        let bundle = prove_continuation(
-            &elf_bytes,
-            &[],
-            &[],
-            4,
-            &ProofOptions::default_test_options(),
-        )
-        .unwrap();
+        let bundle =
+            prove_continuation(&elf_bytes, &[], 4, &ProofOptions::default_test_options()).unwrap();
 
         let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&bundle).unwrap();
         let restored: ContinuationProof =
@@ -2303,14 +2281,8 @@ mod tests {
     fn test_split_verify_rejects_dropped_last_epoch() {
         let _ = env_logger::builder().is_test(true).try_init();
         let elf_bytes = asm_elf_bytes("all_loadstore_32");
-        let mut bundle = prove_continuation(
-            &elf_bytes,
-            &[],
-            &[],
-            3,
-            &ProofOptions::default_test_options(),
-        )
-        .unwrap();
+        let mut bundle =
+            prove_continuation(&elf_bytes, &[], 3, &ProofOptions::default_test_options()).unwrap();
         assert!(bundle.epochs.len() >= 3, "need multiple epochs");
         bundle.epochs.pop();
         assert!(
@@ -2327,14 +2299,8 @@ mod tests {
     fn test_split_verify_rejects_reordered_epochs() {
         let _ = env_logger::builder().is_test(true).try_init();
         let elf_bytes = asm_elf_bytes("all_loadstore_32");
-        let mut bundle = prove_continuation(
-            &elf_bytes,
-            &[],
-            &[],
-            3,
-            &ProofOptions::default_test_options(),
-        )
-        .unwrap();
+        let mut bundle =
+            prove_continuation(&elf_bytes, &[], 3, &ProofOptions::default_test_options()).unwrap();
         assert!(bundle.epochs.len() >= 3, "need multiple epochs");
         bundle.epochs.swap(0, 1);
         assert!(
@@ -2352,14 +2318,8 @@ mod tests {
     fn test_split_verify_rejects_tampered_register_fini() {
         let _ = env_logger::builder().is_test(true).try_init();
         let elf_bytes = asm_elf_bytes("all_loadstore_32");
-        let mut bundle = prove_continuation(
-            &elf_bytes,
-            &[],
-            &[],
-            3,
-            &ProofOptions::default_test_options(),
-        )
-        .unwrap();
+        let mut bundle =
+            prove_continuation(&elf_bytes, &[], 3, &ProofOptions::default_test_options()).unwrap();
         assert!(
             bundle.epochs.len() >= 2,
             "need a second epoch to chain into"
@@ -2381,14 +2341,8 @@ mod tests {
     fn test_split_verify_rejects_malformed_register_fini_length() {
         let _ = env_logger::builder().is_test(true).try_init();
         let elf_bytes = asm_elf_bytes("all_loadstore_32");
-        let mut bundle = prove_continuation(
-            &elf_bytes,
-            &[],
-            &[],
-            3,
-            &ProofOptions::default_test_options(),
-        )
-        .unwrap();
+        let mut bundle =
+            prove_continuation(&elf_bytes, &[], 3, &ProofOptions::default_test_options()).unwrap();
         assert!(!bundle.epochs.is_empty());
         bundle.epochs[0].reg_fini.pop();
         assert!(
@@ -2404,14 +2358,8 @@ mod tests {
     fn test_split_verify_rejects_inflated_epoch_table_count() {
         let _ = env_logger::builder().is_test(true).try_init();
         let elf_bytes = asm_elf_bytes("all_loadstore_32");
-        let mut bundle = prove_continuation(
-            &elf_bytes,
-            &[],
-            &[],
-            8,
-            &ProofOptions::default_test_options(),
-        )
-        .unwrap();
+        let mut bundle =
+            prove_continuation(&elf_bytes, &[], 8, &ProofOptions::default_test_options()).unwrap();
         bundle.epochs[0].table_counts.cpu += 1;
         assert!(
             verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options())
@@ -2434,14 +2382,9 @@ mod tests {
         let expected = input[4..12].to_vec();
 
         // Smallest epochs (2^2 = 4 cycles) so the short program splits across epochs.
-        let bundle = prove_continuation(
-            &elf_bytes,
-            &input,
-            &[],
-            2,
-            &ProofOptions::default_test_options(),
-        )
-        .unwrap();
+        let bundle =
+            prove_continuation(&elf_bytes, &input, 2, &ProofOptions::default_test_options())
+                .unwrap();
         assert!(
             bundle.num_epochs() > 1,
             "4-cycle epochs must split the run into multiple epochs"
@@ -2478,14 +2421,9 @@ mod tests {
         let _ = env_logger::builder().is_test(true).try_init();
         let elf_bytes = asm_elf_bytes("test_private_input_xpage");
         let input: Vec<u8> = (0u8..16).collect();
-        let mut bundle = prove_continuation(
-            &elf_bytes,
-            &input,
-            &[],
-            2,
-            &ProofOptions::default_test_options(),
-        )
-        .unwrap();
+        let mut bundle =
+            prove_continuation(&elf_bytes, &input, 2, &ProofOptions::default_test_options())
+                .unwrap();
         assert!(
             bundle.num_private_input_pages > 0,
             "baseline must have a touched private-input page"
@@ -2517,14 +2455,9 @@ mod tests {
         let _ = env_logger::builder().is_test(true).try_init();
         let elf_bytes = asm_elf_bytes("test_private_input_xpage");
         let input: Vec<u8> = (0u8..16).collect();
-        let mut bundle = prove_continuation(
-            &elf_bytes,
-            &input,
-            &[],
-            2,
-            &ProofOptions::default_test_options(),
-        )
-        .unwrap();
+        let mut bundle =
+            prove_continuation(&elf_bytes, &input, 2, &ProofOptions::default_test_options())
+                .unwrap();
         assert_eq!(
             bundle.num_private_input_pages, 1,
             "16 bytes of private input fits in one page"
@@ -2685,14 +2618,8 @@ mod tests {
     fn test_split_verify_rejects_oversized_num_private_input_pages() {
         let _ = env_logger::builder().is_test(true).try_init();
         let elf_bytes = asm_elf_bytes("all_loadstore_32");
-        let mut bundle = prove_continuation(
-            &elf_bytes,
-            &[],
-            &[],
-            3,
-            &ProofOptions::default_test_options(),
-        )
-        .unwrap();
+        let mut bundle =
+            prove_continuation(&elf_bytes, &[], 3, &ProofOptions::default_test_options()).unwrap();
         bundle.num_private_input_pages = page::max_private_input_pages() + 1;
         assert!(matches!(
             verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options()),
@@ -2721,14 +2648,9 @@ mod tests {
         let expected: [u8; 8] = [0xA1, 0xB2, 0xC3, 0xD4, 0xE5, 0xF6, 0x07, 0x18];
         input[commit_off..commit_off + 8].copy_from_slice(&expected);
 
-        let bundle = prove_continuation(
-            &elf_bytes,
-            &input,
-            &[],
-            4,
-            &ProofOptions::default_test_options(),
-        )
-        .unwrap();
+        let bundle =
+            prove_continuation(&elf_bytes, &input, 4, &ProofOptions::default_test_options())
+                .unwrap();
         assert!(
             bundle.num_private_input_pages >= 2,
             "input spanning two pages must give >=2 private pages"
@@ -2758,14 +2680,8 @@ mod tests {
     fn test_split_verify_tolerates_reordered_touched_page_bases() {
         let _ = env_logger::builder().is_test(true).try_init();
         let elf_bytes = asm_elf_bytes("all_loadstore_32");
-        let mut bundle = prove_continuation(
-            &elf_bytes,
-            &[],
-            &[],
-            3,
-            &ProofOptions::default_test_options(),
-        )
-        .unwrap();
+        let mut bundle =
+            prove_continuation(&elf_bytes, &[], 3, &ProofOptions::default_test_options()).unwrap();
         assert!(
             !bundle.touched_page_bases.is_empty(),
             "baseline must have touched pages"
@@ -2796,14 +2712,8 @@ mod tests {
     fn test_split_verify_rejects_dropped_touched_page_base() {
         let _ = env_logger::builder().is_test(true).try_init();
         let elf_bytes = asm_elf_bytes("all_loadstore_32");
-        let mut bundle = prove_continuation(
-            &elf_bytes,
-            &[],
-            &[],
-            3,
-            &ProofOptions::default_test_options(),
-        )
-        .unwrap();
+        let mut bundle =
+            prove_continuation(&elf_bytes, &[], 3, &ProofOptions::default_test_options()).unwrap();
         assert!(
             !bundle.touched_page_bases.is_empty(),
             "baseline must have touched pages"
@@ -2832,14 +2742,8 @@ mod tests {
     fn test_split_verify_rejects_non_page_aligned_touched_page_base() {
         let _ = env_logger::builder().is_test(true).try_init();
         let elf_bytes = asm_elf_bytes("all_loadstore_32");
-        let mut bundle = prove_continuation(
-            &elf_bytes,
-            &[],
-            &[],
-            3,
-            &ProofOptions::default_test_options(),
-        )
-        .unwrap();
+        let mut bundle =
+            prove_continuation(&elf_bytes, &[], 3, &ProofOptions::default_test_options()).unwrap();
         assert!(
             !bundle.touched_page_bases.is_empty(),
             "baseline must have touched pages"
@@ -2869,14 +2773,8 @@ mod tests {
     fn test_split_verify_rejects_tampered_l2g_root() {
         let _ = env_logger::builder().is_test(true).try_init();
         let elf_bytes = asm_elf_bytes("all_loadstore_32");
-        let mut bundle = prove_continuation(
-            &elf_bytes,
-            &[],
-            &[],
-            3,
-            &ProofOptions::default_test_options(),
-        )
-        .unwrap();
+        let mut bundle =
+            prove_continuation(&elf_bytes, &[], 3, &ProofOptions::default_test_options()).unwrap();
         assert!(
             bundle.epochs.len() >= 2,
             "need multiple epochs to exercise the binding"
@@ -2897,14 +2795,8 @@ mod tests {
     fn test_continuation_blob_rejects_tampered_l2g_root() {
         let _ = env_logger::builder().is_test(true).try_init();
         let elf_bytes = asm_elf_bytes("all_loadstore_32");
-        let mut bundle = prove_continuation(
-            &elf_bytes,
-            &[],
-            &[],
-            3,
-            &crate::recursion::MIN_PROOF_OPTIONS,
-        )
-        .unwrap();
+        let mut bundle =
+            prove_continuation(&elf_bytes, &[], 3, &crate::recursion::MIN_PROOF_OPTIONS).unwrap();
         assert!(
             bundle.epochs.len() >= 2,
             "need multiple epochs to exercise the binding"
@@ -2947,8 +2839,8 @@ mod tests {
         let input_a: Vec<u8> = (0u8..16).collect();
         let input_b: Vec<u8> = (0u8..16).map(|b| b ^ 0xFF).collect();
 
-        let mut bundle_a = prove_continuation(&elf_bytes, &input_a, &[], 2, &opts).unwrap();
-        let bundle_b = prove_continuation(&elf_bytes, &input_b, &[], 2, &opts).unwrap();
+        let mut bundle_a = prove_continuation(&elf_bytes, &input_a, 2, &opts).unwrap();
+        let bundle_b = prove_continuation(&elf_bytes, &input_b, 2, &opts).unwrap();
         assert!(
             verify_continuation(&elf_bytes, &bundle_a, &opts)
                 .unwrap()
@@ -2997,8 +2889,8 @@ mod tests {
         let input_a: Vec<u8> = (0u8..16).collect();
         let input_b: Vec<u8> = (0u8..16).map(|b| b ^ 0xFF).collect();
 
-        let mut bundle_a = prove_continuation(&elf_bytes, &input_a, &[], 2, &opts).unwrap();
-        let bundle_b = prove_continuation(&elf_bytes, &input_b, &[], 2, &opts).unwrap();
+        let mut bundle_a = prove_continuation(&elf_bytes, &input_a, 2, &opts).unwrap();
+        let bundle_b = prove_continuation(&elf_bytes, &input_b, 2, &opts).unwrap();
         assert_eq!(bundle_a.epochs.len(), bundle_b.epochs.len());
         assert_eq!(bundle_a.touched_page_bases, bundle_b.touched_page_bases);
         assert_ne!(bundle_a.epochs[0].l2g_root, bundle_b.epochs[0].l2g_root);

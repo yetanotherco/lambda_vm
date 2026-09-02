@@ -147,7 +147,7 @@ fn craft_proof(
     // Execution logs come from whatever `run_elf` is.
     let run_program = Elf::load(run_elf).expect("run ELF load");
     let executor =
-        Executor::new(&run_program, private_inputs.to_vec(), &[]).expect("executor construction");
+        Executor::new(&run_program, private_inputs.to_vec()).expect("executor construction");
     let result = executor.run().expect("run");
 
     let max_rows = MaxRowsConfig::default();
@@ -634,7 +634,7 @@ fn craft_proof_with_duplicate_page(
     let options = opts();
     let program = Elf::load(honest_elf).expect("honest ELF load");
     let run_program = Elf::load(run_elf).expect("run ELF load");
-    let executor = Executor::new(&run_program, vec![], &[]).expect("executor construction");
+    let executor = Executor::new(&run_program, vec![]).expect("executor construction");
     let result = executor.run().expect("run");
 
     let max_rows = MaxRowsConfig::default();

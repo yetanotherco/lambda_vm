@@ -68,7 +68,7 @@ fn ecrecover_two_pass_cycles() {
 
     // ── Silenced: nothing is answered, every hint recomputed in software. ──
     let t0 = Instant::now();
-    let mut silenced_ex = Executor::new(&elf, input.clone(), &[]).expect("executor");
+    let mut silenced_ex = Executor::new(&elf, input.clone()).expect("executor");
     silenced_ex.silence_hints();
     let silenced = silenced_ex.run().expect("silenced run");
     let silenced_time = t0.elapsed();
@@ -85,7 +85,7 @@ fn ecrecover_two_pass_cycles() {
 
     // ── On demand: answered during the run, no recording pass. ──
     let t0 = Instant::now();
-    let ondemand = Executor::new(&elf, input.clone(), &[])
+    let ondemand = Executor::new(&elf, input.clone())
         .expect("executor")
         .run()
         .expect("on-demand run");
@@ -107,7 +107,7 @@ fn ecrecover_two_pass_cycles() {
     // ── Explicit arena: the same bytes, shipped up front. ──
     let hints = ondemand.hints.clone();
     let t0 = Instant::now();
-    let explicit = Executor::new(&elf, input.clone(), &hints)
+    let explicit = Executor::with_hint_arena(&elf, input.clone(), &hints)
         .expect("executor")
         .run()
         .expect("explicit-arena run");
@@ -147,17 +147,10 @@ fn ecrecover_two_pass_cycles() {
         silenced_cycles as f64 / ondemand_cycles as f64
     );
 
-    // Dump the fixtures the prover-side continuation measurement consumes:
-    // `<stem>.input.bin` (the private input) and `<stem>.hints.bin` (the arena
-    // slots, concatenated).
+    // Dump the fixture the prover-side continuation measurement consumes: just
+    // the private input, since that prove answers its own hint requests.
     let dir = std::path::Path::new("program_artifacts/rust");
     let input_path = dir.join("ecrecover_hints.input.bin");
-    let hints_path = dir.join("ecrecover_hints.hints.bin");
     std::fs::write(&input_path, &input).expect("write input fixture");
-    let mut hints_bin = Vec::with_capacity(32 * hints.len());
-    for h in &hints {
-        hints_bin.extend_from_slice(h);
-    }
-    std::fs::write(&hints_path, &hints_bin).expect("write hints fixture");
-    println!("[ecrecover-hints] fixtures written: {input_path:?}, {hints_path:?}");
+    println!("[ecrecover-hints] fixture written: {input_path:?}");
 }

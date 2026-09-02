@@ -21,7 +21,7 @@ use std::time::Instant;
 
 fn run_case(elf: &Elf, input: &[u8], silenced: bool) -> (usize, std::time::Duration, usize) {
     let t0 = Instant::now();
-    let mut ex = Executor::new(elf, input.to_vec(), &[]).expect("executor");
+    let mut ex = Executor::new(elf, input.to_vec()).expect("executor");
     if silenced {
         ex.silence_hints();
     }
@@ -53,10 +53,10 @@ fn ethrex_block_hint_cost() {
         let (ondemand_cycles, ondemand_time, slots) = run_case(&elf, &input, false);
 
         let arena: Vec<[u8; 32]> = {
-            let ex = Executor::new(&elf, input.clone(), &[]).expect("executor");
+            let ex = Executor::new(&elf, input.clone()).expect("executor");
             ex.run().expect("run").hints
         };
-        let explicit = Executor::new(&elf, input.clone(), &arena)
+        let explicit = Executor::with_hint_arena(&elf, input.clone(), &arena)
             .expect("executor")
             .run()
             .expect("run");

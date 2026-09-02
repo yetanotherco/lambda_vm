@@ -29,10 +29,10 @@ pub struct ExecutionResult {
     /// request order. Every one of them was answered during this run; this is a
     /// measurement view, not work left over.
     pub hint_requests: Vec<(u64, [u8; 32])>,
-    /// The hint arena this run actually used: the `hints` passed to
-    /// [`Executor::new`] plus every slot the executor seeded on demand. The
-    /// prover MUST pass this to the trace builder — it is what the private-input
-    /// region's bytes encode, and therefore what the initial image has to hold.
+    /// The hint arena this run produced: one slot per request the guest made,
+    /// in request order. The prover MUST pass this to the trace builder — it is
+    /// what the private-input region's bytes encode, and therefore what the
+    /// initial image has to hold.
     pub hints: Vec<[u8; 32]>,
 }
 
@@ -60,7 +60,14 @@ pub struct Executor {
 }
 
 impl Executor {
-    pub fn new(
+    pub fn new(program: &Elf, private_inputs: Vec<u8>) -> Result<Self, ExecutorError> {
+        Self::with_hint_arena(program, private_inputs, &[])
+    }
+
+    /// Same, but with `hints` pre-answering the guest's first `hints.len()`
+    /// requests instead of the executor answering them during the run. Test and
+    /// measurement hook only — see [`Memory::store_private_inputs`].
+    pub fn with_hint_arena(
         program: &Elf,
         private_inputs: Vec<u8>,
         hints: &[[u8; 32]],
@@ -130,8 +137,8 @@ impl Executor {
         self.memory.take_seeded_bytes()
     }
 
-    /// The hint arena this run has used so far — the `hints` it started with
-    /// plus every slot answered on demand.
+    /// The hint arena this run has produced so far — one slot per request the
+    /// guest has made.
     pub fn hint_arena(&self) -> &[[u8; 32]] {
         self.memory.hint_arena()
     }
@@ -226,24 +233,23 @@ impl Executor {
     }
 }
 
-/// Run the program and return the hint arena it used, for callers that need the
-/// arena BEFORE they start proving — today only the continuation prover, which
-/// freezes its initial image and provenance before streaming epochs and so
-/// cannot take the arena the run itself produces.
+/// Run the program and return the hint arena it produced, without keeping its
+/// logs. No prove path needs this — every one of them takes the arena from the
+/// run it already performs (`ExecutionResult::hints`, or the executor itself for
+/// a continuation). It exists so a test can record an arena and then replay it
+/// through [`Executor::with_hint_arena`], which is how the equivalence between
+/// answering on demand and supplying up front is pinned.
 ///
 /// Every request is answered inline (see `Memory::answer_hint_request`), so this
 /// run takes the same cheap in-guest-verify path the proved run will: it is not
 /// the software-fallback path. The logs are drained rather than collected —
 /// nothing here needs them, and a real block would otherwise materialize tens of
 /// millions of `Log`s just to read an arena.
-///
-/// The monolithic prove path does NOT use this: it takes `ExecutionResult::hints`
-/// from the single run it already performs.
 pub fn collect_hints(
     program: &Elf,
     private_inputs: Vec<u8>,
 ) -> Result<Vec<[u8; 32]>, ExecutorError> {
-    let mut executor = Executor::new(program, private_inputs, &[])?;
+    let mut executor = Executor::new(program, private_inputs)?;
     while executor.resume()?.is_some() {}
     Ok(executor.memory.hint_arena().to_vec())
 }

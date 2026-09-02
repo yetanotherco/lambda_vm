@@ -105,19 +105,58 @@ fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
 ///
 /// Same unsoundness caveats as [`Traces::from_elf_and_logs_minimal`]. The full
 /// preprocessed bitwise path is covered by `test_prove_elfs_all_instructions_64_full`.
-fn prove_vm_minimal(
+fn prove_vm_minimal(elf_bytes: &[u8], private_inputs: &[u8], max_rows: &MaxRowsConfig) -> VmProof {
+    prove_vm_minimal_with_arena(elf_bytes, private_inputs, None, max_rows)
+}
+
+/// `crate::count_elements` with the arena supplied up front. The public entry
+/// point deliberately takes no arena — the executor answers requests during the
+/// run — so the control arm for "both routes build the same trace" lives here.
+fn count_elements_with_arena(
     elf_bytes: &[u8],
     private_inputs: &[u8],
     hints: &[[u8; 32]],
+) -> (u64, u64) {
+    let program = Elf::load(elf_bytes).expect("ELF load");
+    let executor =
+        Executor::with_hint_arena(&program, private_inputs.to_vec(), hints).expect("executor");
+    let result = executor.run().expect("execution");
+    let traces = Traces::from_elf_and_logs(
+        &program,
+        &result.logs,
+        &MaxRowsConfig::default(),
+        private_inputs,
+        &result.hints,
+        #[cfg(feature = "disk-spill")]
+        stark::storage_mode::StorageMode::Ram,
+    )
+    .expect("traces");
+    (
+        traces.total_field_elements(),
+        traces.total_auxiliary_field_elements(),
+    )
+}
+
+/// Same, but with `hints` pre-answering the guest's requests instead of the
+/// executor answering them during the run — the control arm for "an arena
+/// decided mid-run is indistinguishable from one shipped up front".
+fn prove_vm_minimal_with_arena(
+    elf_bytes: &[u8],
+    private_inputs: &[u8],
+    hints: Option<&[[u8; 32]]>,
     max_rows: &MaxRowsConfig,
 ) -> VmProof {
     let proof_options = ProofOptions::default_test_options();
     let elf = Elf::load(elf_bytes).expect("ELF load");
-    let executor = Executor::new(&elf, private_inputs.to_vec(), hints).expect("executor");
+    let executor = match hints {
+        Some(hints) => Executor::with_hint_arena(&elf, private_inputs.to_vec(), hints),
+        None => Executor::new(&elf, private_inputs.to_vec()),
+    }
+    .expect("executor");
     let result = executor.run().expect("execution");
-    // The arena the run actually used, not the one passed in: the executor answers
-    // requests on demand, so those slots are part of the region the guest read and
-    // must be in the initial image.
+    // The arena the run actually used, not the one passed in: without one the
+    // executor answers requests on demand, so those slots are part of the region
+    // the guest read and must be in the initial image.
     let mut traces = Traces::from_elf_and_logs_minimal(
         &elf,
         &result.logs,
@@ -1084,8 +1123,8 @@ fn test_prove_elfs_keccak_multi_call() {
 
     let elf_bytes = crate::test_utils::asm_elf_bytes("test_keccak_multi");
     let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
-    let executor = executor::vm::execution::Executor::new(&elf, vec![], &[])
-        .expect("Failed to create executor");
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
     let result = executor.run().expect("Failed to run program");
 
     // The guest initializes lane[i] = i + 1 and applies keccak-f[1600] three times.
@@ -1125,8 +1164,8 @@ fn test_prove_elfs_ecsm() {
 
     let elf_bytes = crate::test_utils::asm_elf_bytes("test_ecsm");
     let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
-    let executor = executor::vm::execution::Executor::new(&elf, vec![], &[])
-        .expect("Failed to create executor");
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
     let result = executor.run().expect("Failed to run program");
 
     // The guest computes 5·G and commits the 32-byte x-coordinate; cross-check it against
@@ -1161,8 +1200,8 @@ fn test_prove_elfs_ecsm_multi() {
 
     let elf_bytes = crate::test_utils::asm_elf_bytes("test_ecsm_multi");
     let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
-    let executor = executor::vm::execution::Executor::new(&elf, vec![], &[])
-        .expect("Failed to create executor");
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
     let result = executor.run().expect("Failed to run program");
 
     // Gx little-endian.
@@ -1208,7 +1247,7 @@ fn test_prove_ecsm_rust_guest() {
     let elf_bytes = std::fs::read(workspace_root.join("executor/program_artifacts/rust/ecsm.elf"))
         .expect("ecsm.elf not found — run `make compile-programs-rust`");
 
-    let proof = prove_vm_minimal(&elf_bytes, &[], &[], &Default::default());
+    let proof = prove_vm_minimal(&elf_bytes, &[], &Default::default());
     assert!(
         verify_vm_minimal(&proof, &elf_bytes),
         "ecsm rust guest should verify"
@@ -1229,12 +1268,14 @@ fn test_prove_ecsm_rust_guest() {
     );
 }
 
-/// End-to-end prove→verify for the hint arena: three hint values (one per
-/// selector — secp256k1 base-field inverse of 3, scalar inverse of 5, square
-/// root of 4) supplied as private-input hint-arena slots. The guest reads them
-/// with ordinary aligned loads (MEMR reads chained to the private-input pages) —
-/// the hint mechanism is just more private-input bytes. Committed output = XOR
-/// of the three slots.
+/// End-to-end prove→verify for the hint mechanism on its cheapest guest: three
+/// requests (one per selector), answered by the executor during the single run
+/// the prover performs, read back with ordinary aligned loads (MEMR reads
+/// chained to the private-input pages). No HINT table is involved — a hint is
+/// just more private-input bytes.
+///
+/// The guest commits how many requests came back non-zero, so this pins the
+/// property that matters: the guest, not the host, decides what the output is.
 #[test]
 fn test_prove_hint_arena_rust_guest() {
     let _ = env_logger::builder().is_test(true).try_init();
@@ -1247,41 +1288,29 @@ fn test_prove_hint_arena_rust_guest() {
         std::fs::read(workspace_root.join("executor/program_artifacts/rust/hint_arena.elf"))
             .expect("hint_arena.elf not found — run `make compile-programs-rust`");
 
-    // The host computes the three hints up front (the known-beforehand case) and
-    // passes them as arena slots, in the guest's request order.
-    use executor::vm::instruction::execution::{
-        HINT_FIELD_INV, HINT_FIELD_SQRT, HINT_SCALAR_INV, compute_hint,
-    };
-    let hints: Vec<[u8; 32]> = [
-        (HINT_FIELD_INV, 3u8),
-        (HINT_SCALAR_INV, 5u8),
-        (HINT_FIELD_SQRT, 4u8),
-    ]
-    .into_iter()
-    .map(|(hint_id, seed)| {
-        let mut input = [0u8; 32];
-        input[31] = seed;
-        compute_hint(hint_id, &input)
-    })
-    .collect();
-
-    let proof = prove_vm_minimal(&elf_bytes, &[], &hints, &Default::default());
+    let proof = prove_vm_minimal(&elf_bytes, &[], &Default::default());
     assert!(
         verify_vm_minimal(&proof, &elf_bytes),
         "hint_arena rust guest should verify"
     );
 
-    // Empty main input + 3 slots: the region spans align8(4) + 8 + 96 = 112 bytes,
-    // one private-input page.
+    // Empty main input + 3 slots the run seeded: the region spans
+    // align8(4) + 8 + 96 = 112 bytes, one private-input page.
     assert_eq!(proof.num_private_input_pages, 1);
 
+    // All three selectors can answer their input, so all three came back.
     let mut expected = [0u8; 32];
-    for hint in &hints {
-        for i in 0..32 {
-            expected[i] ^= hint[i];
-        }
-    }
+    expected[0] = 3;
     assert_eq!(proof.public_output, expected.to_vec());
+
+    // And with nothing answering, the same guest commits 0 — the hint bytes
+    // cannot steer the output, they can only save the guest work.
+    let elf = Elf::load(&elf_bytes).expect("ELF load");
+    let mut silenced = Executor::new(&elf, vec![]).expect("executor");
+    silenced.silence_hints();
+    let result = silenced.run().expect("execution");
+    assert!(result.hints.is_empty(), "a silenced run answers no request");
+    assert_eq!(result.return_values.memory_values[0], 0);
 }
 
 /// Proving a hint-consuming guest with NO explicit arena must cover the cheap
@@ -1337,41 +1366,35 @@ fn test_prove_ecrecover_hints_on_demand_arena() {
     assert_eq!(hints.len(), 6, "2 recoveries × 3 hint requests");
 
     // The policy under test: no explicit arena ⇒ answered on demand ⇒ the SAME
-    // (hinted) trace an explicit arena produces.
-    let auto = crate::count_elements(&elf_bytes, &input, &[]).expect("count auto");
-    let explicit = crate::count_elements(&elf_bytes, &input, &hints).expect("count explicit");
+    // (hinted) trace an explicit arena produces. Only the on-demand side has a
+    // public entry point; the control arm is built here, mirroring what
+    // `crate::count_elements` does with the arena supplied up front.
+    let auto = crate::count_elements(&elf_bytes, &input).expect("count auto");
+    let explicit = count_elements_with_arena(&elf_bytes, &input, &hints);
     assert_eq!(
         auto, explicit,
         "on-demand answers must produce the hinted trace"
     );
 
     // And both proofs verify with identical committed output.
-    let proof_auto = prove_vm_minimal(&elf_bytes, &input, &[], &Default::default());
-    let proof_hints = prove_vm_minimal(&elf_bytes, &input, &hints, &Default::default());
+    let proof_auto = prove_vm_minimal(&elf_bytes, &input, &Default::default());
+    let proof_hints =
+        prove_vm_minimal_with_arena(&elf_bytes, &input, Some(&hints), &Default::default());
     assert!(verify_vm_minimal(&proof_auto, &elf_bytes));
     assert!(verify_vm_minimal(&proof_hints, &elf_bytes));
     assert_eq!(proof_auto.public_output, proof_hints.public_output);
 
     // The continuation prover is the harder case: it freezes its initial image,
     // genesis provenance and PAGE init data before streaming epochs, so a slot
-    // decided mid-stream has to be folded back into all three. Prove the same
-    // run both ways and require the bundles to verify to the same output.
+    // decided mid-stream has to be folded back into all three. Its control arm
+    // is the monolithic output above rather than a second continuation with the
+    // arena shipped up front — no prove path takes one.
     let opts = ProofOptions::default_test_options();
-    let bundle_auto = crate::continuation::prove_continuation(&elf_bytes, &input, &[], 16, &opts)
+    let bundle_auto = crate::continuation::prove_continuation(&elf_bytes, &input, 16, &opts)
         .expect("continuation prove, arena answered on demand");
-    let bundle_hints =
-        crate::continuation::prove_continuation(&elf_bytes, &input, &hints, 16, &opts)
-            .expect("continuation prove, arena supplied up front");
     let out_auto = crate::continuation::verify_continuation(&elf_bytes, &bundle_auto, &opts)
         .expect("verify on-demand bundle")
         .expect("on-demand bundle must verify");
-    let out_hints = crate::continuation::verify_continuation(&elf_bytes, &bundle_hints, &opts)
-        .expect("verify explicit bundle")
-        .expect("explicit bundle must verify");
-    assert_eq!(
-        out_auto, out_hints,
-        "a continuation whose arena was decided mid-stream must commit the same output"
-    );
     // NOT asserted: byte-identical bundles. This prover is not byte-deterministic
     // — two proves of the SAME program, input and arena already differ from byte
     // 0 (same length), monolithic and continuation alike. Verified output equality
@@ -1397,8 +1420,8 @@ fn test_prove_elfs_ecsm_forged_result_rejected() {
 
     let elf_bytes = crate::test_utils::asm_elf_bytes("test_ecsm");
     let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
-    let executor = executor::vm::execution::Executor::new(&elf, vec![], &[])
-        .expect("Failed to create executor");
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
     let result = executor.run().expect("Failed to run program");
     let mut traces =
         Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[], &[])
@@ -1426,8 +1449,8 @@ fn test_prove_elfs_ecsm_forged_ecdas_mu_rejected() {
 
     let elf_bytes = crate::test_utils::asm_elf_bytes("test_ecsm");
     let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
-    let executor = executor::vm::execution::Executor::new(&elf, vec![], &[])
-        .expect("Failed to create executor");
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
     let result = executor.run().expect("Failed to run program");
     let mut traces =
         Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[], &[])
@@ -1463,8 +1486,8 @@ fn test_prove_elfs_keccak_unaligned_state_addr() {
 
     let elf_bytes = crate::test_utils::asm_elf_bytes("test_keccak_multi");
     let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
-    let executor = executor::vm::execution::Executor::new(&elf, vec![], &[])
-        .expect("Failed to create executor");
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
     let result = executor.run().expect("Failed to run program");
     let mut traces =
         Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[], &[])
@@ -1490,8 +1513,8 @@ fn test_prove_elfs_keccak_unaligned_state_addr() {
 fn test_prove_elfs_test_commit_4() {
     let elf_bytes = crate::test_utils::asm_elf_bytes("test_commit_4");
     let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
-    let executor = executor::vm::execution::Executor::new(&elf, vec![], &[])
-        .expect("Failed to create executor");
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
     let result = executor.run().expect("Failed to run program");
 
     // Verify public output matches the committed bytes [0xAA, 0xBB, 0xCC, 0xDD]
@@ -1525,8 +1548,8 @@ fn test_prove_elfs_test_commit_4_wrong_pages_rejected() {
     let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
 
     let proof_options = ProofOptions::default_test_options();
-    let executor = executor::vm::execution::Executor::new(&elf, vec![], &[])
-        .expect("Failed to create executor");
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
     let result = executor.run().expect("Failed to run program");
     let mut traces =
         Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[], &[])
@@ -2281,8 +2304,8 @@ fn test_deep_stack_runtime_pages_roundtrip() {
     let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
 
     let proof_options = ProofOptions::default_test_options();
-    let executor = executor::vm::execution::Executor::new(&elf, vec![], &[])
-        .expect("Failed to create executor");
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
     let result = executor.run().expect("Failed to run program");
     let mut traces =
         Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[], &[])
@@ -2364,8 +2387,8 @@ fn test_deep_stack_missing_pages_rejected() {
     let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
 
     let proof_options = ProofOptions::default_test_options();
-    let executor = executor::vm::execution::Executor::new(&elf, vec![], &[])
-        .expect("Failed to create executor");
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
     let result = executor.run().expect("Failed to run program");
     let mut traces =
         Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[], &[])
@@ -2467,8 +2490,8 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
     let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
 
     let proof_options = ProofOptions::default_test_options();
-    let executor = executor::vm::execution::Executor::new(&elf, vec![], &[])
-        .expect("Failed to create executor");
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
     let result = executor.run().expect("Failed to run program");
     let mut traces =
         Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[], &[])
@@ -2729,7 +2752,7 @@ fn test_small_max_rows_splits_tables() {
     let elf_bytes = crate::test_utils::asm_elf_bytes("all_instructions_64");
     let max_rows = crate::tables::MaxRowsConfig::small();
 
-    let vm_proof = prove_vm_minimal(&elf_bytes, &[], &[], &max_rows);
+    let vm_proof = prove_vm_minimal(&elf_bytes, &[], &max_rows);
 
     // With 2^5 max rows and 64+ instructions, tables should have multiple chunks.
     assert!(
@@ -2807,7 +2830,7 @@ fn test_verify_rejects_inflated_table_counts() {
 #[test]
 fn test_prove_wsuffix_64bit() {
     let elf_bytes = crate::test_utils::asm_elf_bytes("test_wsuffix_64bit");
-    let vm_proof = prove_vm_minimal(&elf_bytes, &[], &[], &Default::default());
+    let vm_proof = prove_vm_minimal(&elf_bytes, &[], &Default::default());
     assert!(
         verify_vm_minimal(&vm_proof, &elf_bytes),
         "W-suffix 64-bit register test should verify"
@@ -2828,7 +2851,7 @@ fn test_prove_allocator_minimal_reproducer() {
     let elf_bytes =
         std::fs::read(workspace_root.join("executor/program_artifacts/rust/allocator.elf"))
             .expect("allocator.elf not found — run `make compile-programs-rust`");
-    let proof = prove_vm_minimal(&elf_bytes, &[], &[], &Default::default());
+    let proof = prove_vm_minimal(&elf_bytes, &[], &Default::default());
     assert!(
         verify_vm_minimal(&proof, &elf_bytes),
         "allocator.elf should verify"
@@ -2847,7 +2870,7 @@ fn test_pure_commit_rust() {
     let elf_bytes =
         std::fs::read(workspace_root.join("executor/program_artifacts/rust/pure_commit.elf"))
             .expect("pure_commit.elf not found — run `make compile-programs-rust`");
-    let proof = prove_vm_minimal(&elf_bytes, &[], &[], &Default::default());
+    let proof = prove_vm_minimal(&elf_bytes, &[], &Default::default());
     assert!(
         verify_vm_minimal(&proof, &elf_bytes),
         "pure_commit.elf should verify"
@@ -2859,8 +2882,8 @@ fn test_pure_commit_rust() {
 #[test]
 fn test_prove_with_input_empty() {
     let elf_bytes = crate::test_utils::asm_elf_bytes("sub");
-    let result = crate::prove_with_inputs(&elf_bytes, &[], &[])
-        .expect("prove_with_inputs should succeed on sub");
+    let result =
+        crate::prove_with_inputs(&elf_bytes, &[]).expect("prove_with_inputs should succeed on sub");
     assert!(
         crate::verify(&result, &elf_bytes).expect("verify should not error"),
         "prove_with_inputs(empty) proof should verify"
@@ -2872,7 +2895,7 @@ fn test_prove_with_input_empty() {
 fn test_prove_private_input_xpage() {
     let elf_bytes = crate::test_utils::asm_elf_bytes("test_private_input_xpage");
     let input: Vec<u8> = (0u8..16).collect();
-    let proof = prove_vm_minimal(&elf_bytes, &input, &[], &Default::default());
+    let proof = prove_vm_minimal(&elf_bytes, &input, &Default::default());
     assert!(verify_vm_minimal(&proof, &elf_bytes), "proof should verify");
     assert_eq!(proof.public_output, input[4..12].to_vec());
 }
@@ -2885,7 +2908,7 @@ fn test_prove_private_input_different_values() {
         0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99,
         0x00,
     ];
-    let proof = prove_vm_minimal(&elf_bytes, &input, &[], &Default::default());
+    let proof = prove_vm_minimal(&elf_bytes, &input, &Default::default());
     assert!(verify_vm_minimal(&proof, &elf_bytes), "proof should verify");
     assert_eq!(proof.public_output, input[4..12].to_vec());
 }
@@ -2904,7 +2927,7 @@ fn test_prove_ef_io_demo_concatenates() {
         std::fs::read(workspace_root.join("executor/program_artifacts/rust/ef_io_demo.elf"))
             .expect("ef_io_demo.elf not found — run `make compile-programs-rust`");
     let input: &[u8] = b"hello world!";
-    let proof = crate::prove_with_inputs(&elf_bytes, input, &[]).expect("prove should succeed");
+    let proof = crate::prove_with_inputs(&elf_bytes, input).expect("prove should succeed");
     assert!(
         crate::verify(&proof, &elf_bytes).expect("verify should not error"),
         "ef_io_demo should verify"
@@ -2926,7 +2949,7 @@ fn test_prove_commit_sum() {
         std::fs::read(workspace_root.join("executor/program_artifacts/rust/commit_sum.elf"))
             .expect("commit_sum.elf not found — run `make compile-programs-rust`");
     let input = &[3u8, 5u8];
-    let proof = prove_vm_minimal(&elf_bytes, input, &[], &Default::default());
+    let proof = prove_vm_minimal(&elf_bytes, input, &Default::default());
     assert!(
         verify_vm_minimal(&proof, &elf_bytes),
         "commit_sum should verify"
@@ -2947,7 +2970,7 @@ fn test_prove_ethrex_empty_block() {
             .expect("need ethrex.elf");
     let input =
         std::fs::read(workspace_root.join("executor/tests/ethrex_empty_block.bin")).unwrap();
-    let proof = crate::prove_with_inputs(&elf_bytes, &input, &[]).expect("prove");
+    let proof = crate::prove_with_inputs(&elf_bytes, &input).expect("prove");
     assert!(
         crate::verify(&proof, &elf_bytes).expect("verify"),
         "ethrex empty block should verify"
@@ -2966,7 +2989,7 @@ fn test_prove_ethrex_empty_block() {
 fn test_verify_rejects_tampered_num_private_input_pages_zero() {
     let elf_bytes = crate::test_utils::asm_elf_bytes("test_private_input_xpage");
     let input: Vec<u8> = (0u8..16).collect();
-    let vm_proof = crate::prove_with_inputs(&elf_bytes, &input, &[]).expect("prove should succeed");
+    let vm_proof = crate::prove_with_inputs(&elf_bytes, &input).expect("prove should succeed");
 
     // Baseline: untampered proof must verify.
     assert!(
@@ -2997,7 +3020,7 @@ fn test_verify_rejects_tampered_num_private_input_pages_zero() {
 fn test_verify_rejects_inflated_num_private_input_pages() {
     let elf_bytes = crate::test_utils::asm_elf_bytes("test_private_input_xpage");
     let input: Vec<u8> = (0u8..16).collect();
-    let vm_proof = crate::prove_with_inputs(&elf_bytes, &input, &[]).expect("prove should succeed");
+    let vm_proof = crate::prove_with_inputs(&elf_bytes, &input).expect("prove should succeed");
 
     assert_eq!(
         vm_proof.num_private_input_pages, 1,
@@ -3022,7 +3045,7 @@ fn test_verify_rejects_inflated_num_private_input_pages() {
 fn test_verify_rejects_num_private_input_pages_exceeds_max() {
     let elf_bytes = crate::test_utils::asm_elf_bytes("test_private_input_xpage");
     let input: Vec<u8> = (0u8..16).collect();
-    let vm_proof = crate::prove_with_inputs(&elf_bytes, &input, &[]).expect("prove should succeed");
+    let vm_proof = crate::prove_with_inputs(&elf_bytes, &input).expect("prove should succeed");
 
     let tampered = crate::VmProof {
         num_private_input_pages: crate::tables::page::max_private_input_pages() + 1,
@@ -3041,7 +3064,7 @@ fn test_verify_rejects_num_private_input_pages_exceeds_max() {
 fn test_verify_rejects_private_input_with_tampered_public_output() {
     let elf_bytes = crate::test_utils::asm_elf_bytes("test_private_input_xpage");
     let input: Vec<u8> = (0u8..16).collect();
-    let vm_proof = crate::prove_with_inputs(&elf_bytes, &input, &[]).expect("prove should succeed");
+    let vm_proof = crate::prove_with_inputs(&elf_bytes, &input).expect("prove should succeed");
 
     assert!(
         crate::verify(&vm_proof, &elf_bytes).expect("verify should not error"),
@@ -3070,7 +3093,7 @@ fn test_verify_rejects_private_input_with_tampered_public_output() {
 fn test_proof_does_not_contain_private_input_field() {
     let elf_bytes = crate::test_utils::asm_elf_bytes("test_private_input_xpage");
     let input: Vec<u8> = (0xA0u8..0xB0).collect();
-    let vm_proof = crate::prove_with_inputs(&elf_bytes, &input, &[]).expect("prove should succeed");
+    let vm_proof = crate::prove_with_inputs(&elf_bytes, &input).expect("prove should succeed");
 
     // The VmProof struct should only contain num_private_input_pages (a count),
     // not the actual bytes. Verify the proof's public fields don't contain them.
@@ -3093,7 +3116,7 @@ fn test_proof_does_not_contain_private_input_field() {
 #[test]
 fn test_addiw_neg_immediate() {
     let elf_bytes = crate::test_utils::asm_elf_bytes("test_addiw_neg");
-    let proof = prove_vm_minimal(&elf_bytes, &[], &[], &Default::default());
+    let proof = prove_vm_minimal(&elf_bytes, &[], &Default::default());
     assert!(
         verify_vm_minimal(&proof, &elf_bytes),
         "addiw with negative immediate should verify"
@@ -3106,7 +3129,7 @@ fn test_addiw_neg_immediate() {
 #[test]
 fn test_count_elements_nonzero() {
     let elf_bytes = crate::test_utils::asm_elf_bytes("addi_one");
-    let (main, aux) = crate::count_elements(&elf_bytes, &[], &[]).expect("count_elements failed");
+    let (main, aux) = crate::count_elements(&elf_bytes, &[]).expect("count_elements failed");
     assert!(
         main > 0,
         "total_field_elements should be nonzero (got {main})"
@@ -3134,7 +3157,7 @@ fn test_prove_first_epoch_without_halt() {
     // intermediate epoch (4 cycles → no CPU padding rows) with the program
     // continuing past it.
     let epoch_size = 4;
-    let epochs = Executor::new(&elf, vec![], &[])
+    let epochs = Executor::new(&elf, vec![])
         .unwrap()
         .run_epochs(epoch_size)
         .unwrap();
@@ -3222,7 +3245,7 @@ fn test_prove_second_epoch_from_snapshot() {
     // arith_8 is ~10 cycles; epoch_size 4 (power of two) yields epochs 4/4/2, so
     // epoch 1 is intermediate (4 cycles → no CPU padding rows).
     let epoch_size = 4;
-    let epochs = Executor::new(&elf, vec![], &[])
+    let epochs = Executor::new(&elf, vec![])
         .unwrap()
         .run_epochs(epoch_size)
         .unwrap();
@@ -3316,7 +3339,7 @@ fn test_epoch_proof_commits_l2g() {
     // Power-of-two epoch size: all_loadstore_32 is ~34 cycles, so epoch_size 8
     // makes epoch 0 an intermediate epoch with no CPU padding rows.
     let epoch_size = 8;
-    let epochs = Executor::new(&elf, vec![], &[])
+    let epochs = Executor::new(&elf, vec![])
         .unwrap()
         .run_epochs(epoch_size)
         .unwrap();
@@ -3449,7 +3472,7 @@ fn test_continuation_pipeline_end_to_end() {
     // Split execution into power-of-two epochs (all_loadstore_32 is ~34 cycles, so
     // epoch_size 8 gives intermediate epochs with no CPU padding rows).
     let epoch_size = 8;
-    let epochs = Executor::new(&elf, vec![], &[])
+    let epochs = Executor::new(&elf, vec![])
         .unwrap()
         .run_epochs(epoch_size)
         .unwrap();
@@ -3620,7 +3643,7 @@ fn test_epoch_memory_bus_with_l2g_bookend() {
     // Power-of-two epoch size: all_loadstore_32 is ~34 cycles, so epoch_size 8
     // makes epoch 0 an intermediate epoch with no CPU padding rows.
     let epoch_size = 8;
-    let epochs = Executor::new(&elf, vec![], &[])
+    let epochs = Executor::new(&elf, vec![])
         .unwrap()
         .run_epochs(epoch_size)
         .unwrap();

@@ -837,11 +837,7 @@ fn test_from_image_and_logs_matches_from_elf_and_logs() {
 
     let elf_bytes = asm_elf_bytes("basic_program");
     let program = Elf::load(&elf_bytes).unwrap();
-    let logs = Executor::new(&program, vec![], &[])
-        .unwrap()
-        .run()
-        .unwrap()
-        .logs;
+    let logs = Executor::new(&program, vec![]).unwrap().run().unwrap().logs;
     let max_rows = MaxRowsConfig::default();
 
     let from_elf = Traces::from_elf_and_logs(
@@ -895,14 +891,14 @@ fn test_epoch_end_memory_converts_to_image() {
     let elf_bytes = asm_elf_bytes("basic_program");
     let program = Elf::load(&elf_bytes).unwrap();
 
-    let total = Executor::new(&program, vec![], &[])
+    let total = Executor::new(&program, vec![])
         .unwrap()
         .run()
         .unwrap()
         .logs
         .len();
     let epoch_size = (total / 3).max(1);
-    let epochs = Executor::new(&program, vec![], &[])
+    let epochs = Executor::new(&program, vec![])
         .unwrap()
         .run_epochs(epoch_size)
         .unwrap();
@@ -926,14 +922,14 @@ fn test_build_traces_for_all_epochs() {
     let elf_bytes = asm_elf_bytes("basic_program");
     let program = Elf::load(&elf_bytes).unwrap();
 
-    let total = Executor::new(&program, vec![], &[])
+    let total = Executor::new(&program, vec![])
         .unwrap()
         .run()
         .unwrap()
         .logs
         .len();
     let epoch_size = (total / 3).max(1);
-    let epochs = Executor::new(&program, vec![], &[])
+    let epochs = Executor::new(&program, vec![])
         .unwrap()
         .run_epochs(epoch_size)
         .unwrap();
@@ -996,14 +992,14 @@ fn test_terminating_epoch_rejected_when_not_final() {
     let elf_bytes = asm_elf_bytes("basic_program");
     let program = Elf::load(&elf_bytes).unwrap();
 
-    let total = Executor::new(&program, vec![], &[])
+    let total = Executor::new(&program, vec![])
         .unwrap()
         .run()
         .unwrap()
         .logs
         .len();
     let epoch_size = (total / 3).max(1);
-    let epochs = Executor::new(&program, vec![], &[])
+    let epochs = Executor::new(&program, vec![])
         .unwrap()
         .run_epochs(epoch_size)
         .unwrap();
@@ -1051,14 +1047,14 @@ fn test_local_to_global_traces_from_real_execution() {
     let elf_bytes = asm_elf_bytes("all_loadstore_32");
     let program = Elf::load(&elf_bytes).unwrap();
 
-    let total = Executor::new(&program, vec![], &[])
+    let total = Executor::new(&program, vec![])
         .unwrap()
         .run()
         .unwrap()
         .logs
         .len();
     let epoch_size = (total / 3).max(1);
-    let epochs = Executor::new(&program, vec![], &[])
+    let epochs = Executor::new(&program, vec![])
         .unwrap()
         .run_epochs(epoch_size)
         .unwrap();

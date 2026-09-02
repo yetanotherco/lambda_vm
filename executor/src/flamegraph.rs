@@ -357,7 +357,7 @@ pub fn run_with_flamegraph(
     // requests during this run, so the profile reflects the accelerated paths —
     // which is what the proved trace actually executes. Call `silence_hints()` on
     // the executor if you deliberately want to profile the software fallback.
-    let mut executor = match Executor::new(program, private_inputs, &[]) {
+    let mut executor = match Executor::new(program, private_inputs) {
         Ok(executor) => executor,
         Err(e) => return (generator, Err(e.into())),
     };

@@ -35,7 +35,7 @@ fn forced_downgrade_prove_verifies() {
 
     // Empty arena: the executor answers this guest's hint requests during the single
     // execution `prove_with_inputs` already performs, so nothing has to be supplied here.
-    let proof = lambda_vm_prover::prove_with_inputs(&elf, &input, &[]).expect("prove");
+    let proof = lambda_vm_prover::prove_with_inputs(&elf, &input).expect("prove");
     assert!(
         stark::gpu_lde::gpu_device_only_downgrades() > 0,
         "no table took the forced downgrade — the hook or the device-only gate moved"

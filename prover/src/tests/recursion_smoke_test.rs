@@ -48,7 +48,6 @@ fn prove_inner_and_encode_blob(
     let inner_proof = crate::prove_with_options_and_inputs(
         inner_elf,
         inner_input,
-        &[],
         opts,
         &crate::MaxRowsConfig::default(),
     )
@@ -77,7 +76,7 @@ fn execute_outer_and_commit(label: &str, recursion_elf_bytes: &[u8], blob: &[u8]
 
     eprintln!("[{label}] executing outer (recursion guest, in-VM verify, streaming) ...");
     let program = Elf::load(recursion_elf_bytes).expect("load recursion elf");
-    let mut executor = Executor::new(&program, blob.to_vec(), &[]).expect("executor new");
+    let mut executor = Executor::new(&program, blob.to_vec()).expect("executor new");
 
     let (total_cycles, exec_time) = drive_executor(
         &mut executor,
@@ -197,7 +196,7 @@ fn setup_guest_run(
         preset.name()
     );
     let executor =
-        executor::vm::execution::Executor::new(&program, blob, &[]).expect("Executor::new failed");
+        executor::vm::execution::Executor::new(&program, blob).expect("Executor::new failed");
     (guest_elf_bytes, program, executor, expected)
 }
 
@@ -243,7 +242,7 @@ fn setup_block4_blowup4_guest_run() -> (
         "recursion-cont-blowup4 ELF has entry_point=0 — build artifact is malformed",
     );
     let executor =
-        executor::vm::execution::Executor::new(&program, blob, &[]).expect("Executor::new failed");
+        executor::vm::execution::Executor::new(&program, blob).expect("Executor::new failed");
     (guest_elf_bytes, program, executor, expected)
 }
 
@@ -703,7 +702,6 @@ fn test_recursion_continuation_blob_decodes_and_verifies_on_host() {
     let bundle = crate::continuation::prove_continuation(
         &fib_elf_bytes,
         &inner_input,
-        &[],
         4,
         &MIN_PROOF_OPTIONS,
     )
@@ -993,7 +991,6 @@ fn test_dump_recursion_input() {
             let bundle = crate::continuation::prove_continuation(
                 &inner_elf_bytes,
                 &inner_input,
-                &[],
                 epoch_log2,
                 &opts,
             )

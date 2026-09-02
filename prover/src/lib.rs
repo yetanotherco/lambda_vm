@@ -1039,26 +1039,19 @@ pub(crate) fn verify_l2g_commitment_binding_view(
 
 /// Prove an ELF binary execution. Returns a serializable proof bundle.
 pub fn prove(elf_bytes: &[u8]) -> Result<VmProof, Error> {
-    prove_with_inputs(elf_bytes, &[], &[])
+    prove_with_inputs(elf_bytes, &[])
 }
 
 /// Prove an ELF binary execution with private inputs. Returns a serializable proof bundle.
 ///
-/// `hints` are untrusted 32-byte values appended to the private-input memory
-/// region's hint arena; the guest reads them with ordinary loads and must
-/// verify them in-circuit. Passing an empty arena is the normal case: the
-/// executor answers each request as the guest makes it, in the single execution
-/// this call already performs, so a hint-consuming guest gets the cheap
-/// in-guest-verify trace without the caller supplying anything.
-pub fn prove_with_inputs(
-    elf_bytes: &[u8],
-    private_inputs: &[u8],
-    hints: &[[u8; 32]],
-) -> Result<VmProof, Error> {
+/// A hint-consuming guest needs nothing extra from the caller: the executor
+/// answers each hint request as the guest makes it, inside the single execution
+/// this call already performs, and the arena that run produced is what the
+/// trace commits.
+pub fn prove_with_inputs(elf_bytes: &[u8], private_inputs: &[u8]) -> Result<VmProof, Error> {
     prove_with_options_and_inputs(
         elf_bytes,
         private_inputs,
-        hints,
         &GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is always valid"),
         &MaxRowsConfig::default(),
     )
@@ -1072,19 +1065,14 @@ pub fn prove_with_inputs(
 /// is the sum of `rows × ⌈bus_interactions/2⌉` over all tables — i.e. the number
 /// of committed extension-field columns times rows (LogUp batching packs two
 /// interactions per column).
-pub fn count_elements(
-    elf_bytes: &[u8],
-    private_inputs: &[u8],
-    hints: &[[u8; 32]],
-) -> Result<(u64, u64), Error> {
+pub fn count_elements(elf_bytes: &[u8], private_inputs: &[u8]) -> Result<(u64, u64), Error> {
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
-    let executor = Executor::new(&program, private_inputs.to_vec(), hints)
+    let executor = Executor::new(&program, private_inputs.to_vec())
         .map_err(|e| Error::Execution(format!("{e}")))?;
     let result = executor
         .run()
         .map_err(|e| Error::Execution(format!("{e}")))?;
-    // The arena the run actually used: what the caller passed, plus every slot the
-    // executor answered on demand. Counting against anything else would count a
+    // The arena the run produced. Counting against anything else would count a
     // different region than the one the guest read.
     let hints = &result.hints;
     let traces = Traces::from_elf_and_logs(
@@ -1108,7 +1096,7 @@ pub fn prove_with_options(
     proof_options: &ProofOptions,
     max_rows: &MaxRowsConfig,
 ) -> Result<VmProof, Error> {
-    prove_with_options_and_inputs(elf_bytes, &[], &[], proof_options, max_rows)
+    prove_with_options_and_inputs(elf_bytes, &[], proof_options, max_rows)
 }
 
 /// Prove an ELF binary execution with custom proof options, max rows config,
@@ -1116,7 +1104,6 @@ pub fn prove_with_options(
 pub fn prove_with_options_and_inputs(
     elf_bytes: &[u8],
     private_inputs: &[u8],
-    hints: &[[u8; 32]],
     proof_options: &ProofOptions,
     max_rows: &MaxRowsConfig,
 ) -> Result<VmProof, Error> {
@@ -1136,13 +1123,12 @@ pub fn prove_with_options_and_inputs(
     let __sp = stark::instruments::span("execute");
 
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
-    let executor = Executor::new(&program, private_inputs.to_vec(), hints)
+    let executor = Executor::new(&program, private_inputs.to_vec())
         .map_err(|e| Error::Execution(format!("{e}")))?;
     let mut result = executor
         .run()
         .map_err(|e| Error::Execution(format!("{e}")))?;
-    // The arena the run actually used: what the caller passed, plus every slot the
-    // executor answered on demand. Taken out of `result` because the trace build
+    // The arena the run produced. Taken out of `result` because the trace build
     // drops `result` while still needing the arena.
     let hints = std::mem::take(&mut result.hints);
 

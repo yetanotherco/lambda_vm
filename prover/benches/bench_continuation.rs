@@ -47,7 +47,7 @@ fn main() {
             use executor::elf::Elf;
             use executor::vm::execution::Executor;
             let program = Elf::load(&elf).expect("bad ELF");
-            let result = Executor::new(&program, private_inputs, &[])
+            let result = Executor::new(&program, private_inputs)
                 .expect("executor")
                 .run()
                 .expect("execution failed");
@@ -62,7 +62,7 @@ fn main() {
             use executor::vm::execution::Executor;
             use executor::vm::registers::STACK_TOP;
             let program = Elf::load(&elf).expect("bad ELF");
-            let mut ex = Executor::new(&program, private_inputs, &[]).expect("executor");
+            let mut ex = Executor::new(&program, private_inputs).expect("executor");
             while ex.pc() != 0 {
                 match ex.resume_with_limit(usize::MAX).expect("execution failed") {
                     Some(_) => {}
@@ -107,7 +107,7 @@ fn main() {
             }
         }
         "main" => {
-            lambda_vm_prover::prove_with_inputs(&elf, &private_inputs, &[])
+            lambda_vm_prover::prove_with_inputs(&elf, &private_inputs)
                 .expect("monolithic prove failed");
             println!("main prove ok ({} bytes ELF)", elf.len());
         }

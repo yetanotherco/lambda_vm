@@ -56,8 +56,8 @@ fn peak_bytes_does_not_underestimate_measured_heap() {
         })
     };
 
-    let _proof = prove_with_options_and_inputs(&elf_bytes, &[], &[], &opts, &max_rows)
-        .expect("proof succeeds");
+    let _proof =
+        prove_with_options_and_inputs(&elf_bytes, &[], &opts, &max_rows).expect("proof succeeds");
 
     stop.store(true, Ordering::Relaxed);
     sampler.join().expect("sampler joins");

@@ -134,8 +134,9 @@ pub fn get_private_input_slice() -> &'static [u8] {
 }
 
 // =============================================================================
-// Hint arena — untrusted, host-supplied 32-byte hint values appended to the
-// private-input region after the length-prefixed main data:
+// Hint arena — the untrusted 32-byte values that hint requests are answered
+// with. They live in the private-input region, after the length-prefixed main
+// data:
 //
 //   [u32 LE main_len][main data][zero-pad to 8][u32 LE hint_count][u32 pad]
 //   then `hint_count` slots of 32 bytes, 8-aligned.
@@ -144,16 +145,19 @@ pub fn get_private_input_slice() -> &'static [u8] {
 // HINT_ARENA_HEADER_BYTES, HINT_SLOT_BYTES}` — the executor writes the region,
 // this crate reads it.
 //
-// The values are UNTRUSTED (the prover chooses them): the caller MUST verify
-// each hint in-guest (e.g. `x·inv == 1`) and recompute in software on failure.
-// Consumption is positional — one slot per request, pass or fail — so a lying
-// host can only trigger fallbacks, never shift the hint stream.
+// The guest never reads the count word: a slot is addressed by the index its
+// own request log assigned it ([`request_hint`]), so no guest-visible read
+// depends on a count the host moves. The values are UNTRUSTED (the prover
+// chooses them): the caller MUST verify each hint in-guest (e.g. `x·inv == 1`)
+// and recompute in software on failure. Requests and slots are positional and
+// in lockstep, so an unanswered request only forces a fallback — it cannot
+// shift the hint stream.
 // =============================================================================
 
 /// Byte size of one hint slot in the hint arena.
 /// Must match `executor::vm::memory::HINT_SLOT_BYTES`.
 #[cfg(target_arch = "riscv64")]
-pub const HINT_SLOT_BYTES: usize = 32;
+const HINT_SLOT_BYTES: usize = 32;
 
 /// Byte size of the arena header (`[u32 LE hint_count][u32 zero pad]`).
 /// Must match `executor::vm::memory::HINT_ARENA_HEADER_BYTES`.
@@ -177,25 +181,6 @@ fn hint_arena_header_addr() -> usize {
     PRIVATE_INPUT_START + hint_arena_header_offset(len)
 }
 
-/// Number of hint slots the host supplied. 0 when no arena was written (the
-/// header reads back as zero-filled memory).
-///
-/// ONLY for an arena supplied up front. Do NOT mix this (or [`next_hint`]) with
-/// [`request_hint`] in the same guest: answering a request on demand also moves
-/// the count word, and a read of that word taken BEFORE the first request would
-/// see a value the proved initial image no longer holds. Pick one style per
-/// guest — the count-bounded one for a shipped arena, `request_hint` for hints
-/// the host can only know during the run.
-#[cfg(target_arch = "riscv64")]
-pub fn hint_count() -> usize {
-    unsafe { core::ptr::read_volatile(hint_arena_header_addr() as *const u32) as usize }
-}
-
-#[cfg(not(target_arch = "riscv64"))]
-pub fn hint_count() -> usize {
-    unimplemented!("syscalls are only implemented for riscv64 targets");
-}
-
 /// Read slot `i`'s raw bytes with no bounds check against the arena header.
 /// The slot is read as four aligned 8-byte words (the fast aligned-load path);
 /// slots are 8-aligned by construction. An unwritten slot reads back as zeros,
@@ -212,42 +197,6 @@ fn read_slot(i: usize) -> [u8; 32] {
         out[8 * k..8 * k + 8].copy_from_slice(&w.to_le_bytes());
     }
     out
-}
-
-/// Read hint slot `i` as raw bytes, or `None` when the arena has no slot `i`.
-/// Bounds-checked against the arena header, so this is the API for an arena the
-/// host supplied up front (its count word says how many slots exist). The
-/// on-demand path uses [`request_hint`] instead, which is not bounded by the
-/// count word — see its docs.
-#[cfg(target_arch = "riscv64")]
-pub fn hint_slot(i: usize) -> Option<[u8; 32]> {
-    if i >= hint_count() {
-        return None;
-    }
-    Some(read_slot(i))
-}
-
-#[cfg(not(target_arch = "riscv64"))]
-pub fn hint_slot(_i: usize) -> Option<[u8; 32]> {
-    unimplemented!("syscalls are only implemented for riscv64 targets");
-}
-
-/// Consume the next hint slot positionally. Returns `None` once the arena is
-/// exhausted — the caller then recomputes in software. One slot is consumed per
-/// call whether or not the hint verifies, so a host that supplies fewer hints
-/// than requested only forces fallbacks; it cannot desynchronize the stream.
-#[cfg(target_arch = "riscv64")]
-pub fn next_hint() -> Option<[u8; 32]> {
-    // Single-threaded guest: a relaxed atomic cursor is sufficient (the guest
-    // target lowers atomics via `-C passes=lower-atomic`).
-    static CURSOR: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-    let i = CURSOR.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    hint_slot(i)
-}
-
-#[cfg(not(target_arch = "riscv64"))]
-pub fn next_hint() -> Option<[u8; 32]> {
-    unimplemented!("syscalls are only implemented for riscv64 targets");
 }
 
 // =============================================================================
@@ -297,9 +246,6 @@ const HINT_LOG_ENTRY_BYTES: usize = 40;
 /// The returned bytes are UNTRUSTED and may be zeros (nobody answered, or the
 /// host lied). The caller MUST verify them in-guest and recompute in software on
 /// failure — that is what keeps the result independent of the hint.
-///
-/// Do not mix with [`hint_count`] / [`next_hint`] in the same guest — see
-/// `hint_count`'s docs for why.
 #[cfg(target_arch = "riscv64")]
 pub fn request_hint(hint_id: usize, input: &[u8; 32]) -> [u8; 32] {
     let count_addr = HINT_LOG_START;

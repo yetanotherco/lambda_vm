@@ -243,7 +243,7 @@ pub fn asm_elf_bytes(name: &str) -> Vec<u8> {
 pub fn run_asm_elf(name: &str) -> (Elf, Vec<Log>, U64HashMap<Instruction>) {
     let elf_data = asm_elf_bytes(name);
     let elf = Elf::load(&elf_data).expect("Failed to load ELF");
-    let executor = Executor::new(&elf, vec![], &[]).expect("Failed to create executor");
+    let executor = Executor::new(&elf, vec![]).expect("Failed to create executor");
     let result = executor.run().expect("Failed to run program");
     (elf, result.logs, result.instructions)
 }
