@@ -50,8 +50,11 @@ RUST_PROGRAMS := $(notdir $(basename $(RUST_PROGRAM_DIRS:%/=%)))
 RUST_ARTIFACTS := $(addprefix $(RUST_ARTIFACTS_DIR)/, $(addsuffix .elf, $(RUST_PROGRAMS)))
 
 # The Rust guests the prover test suite reads as prebuilt artifacts. The prover
-# targets build these instead of all $(RUST_PROGRAMS), because the .elf rules are
-# FORCE (see below) and would re-enter cargo once per guest on every test run.
+# targets build these instead of all $(RUST_PROGRAMS) because the .elf rules are
+# FORCE (see below), so the full set would compile 27 guest crates the prover
+# suite never opens. What that buys is the first build on a clean checkout: once
+# the target dir is warm the extra FORCE re-entries are about a second for all 35,
+# so this list is not worth widening for anything but correctness.
 # `check-prover-test-elfs` fails if a prover test reads one that is missing here.
 PROVER_TEST_GUESTS := allocator commit_sum ecsm ef_io_demo ethrex hint_min hint_multi pure_commit
 PROVER_TEST_ARTIFACTS := $(addprefix $(RUST_ARTIFACTS_DIR)/, $(addsuffix .elf, $(PROVER_TEST_GUESTS)))
