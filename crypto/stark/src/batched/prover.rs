@@ -1126,7 +1126,19 @@ where
     let parts_iotas = reduced_iotas(&iotas, h_max, parts_mmcs.h_max());
 
     for table in 0..num_tables {
-        let (air, _, _) = &air_trace_pairs[table];
+        let (air, trace, _) = &air_trace_pairs[table];
+        #[cfg(not(feature = "cuda"))]
+        let _ = &trace;
+        // Plain tables (no precomputed columns, not carved) gather their openings
+        // straight off the resident LDE — no full-LDE download. Precomputed and
+        // carved tables keep the host LDE (their per-table trees read it) but
+        // still gather the shared-MMCS main/aux openings from the resident handle.
+        let is_carved = shape.carved_main.map(|c| c.table) == Some(table);
+        #[cfg(feature = "cuda")]
+        let openings_device_only =
+            !is_carved && trace.main_data_row_major().1 == matrix_width(&shape.main, table);
+        #[cfg(not(feature = "cuda"))]
+        let openings_device_only = false;
         let ldes = materialize_ldes::<Field, FieldExtension, PI, P>(
             table,
             &air_trace_pairs,
@@ -1138,16 +1150,13 @@ where
             &mut stats,
             &mut ledger,
             residency,
-            // Openings read HOST LDE rows (`LeafSource::append_row`), so keep the
-            // host LDE (not device-only) — device openings would be a later step.
-            false,
+            openings_device_only,
             #[cfg(feature = "disk-spill")]
             storage_mode,
         );
         let _ = air;
         let height = shape.heights[table];
         let (main_data, total_cols) = &ldes.main;
-        let is_carved = shape.carved_main.map(|c| c.table) == Some(table);
         let num_precomputed = if is_carved {
             0
         } else {
@@ -1179,26 +1188,103 @@ where
             }
         }
         if let Some(m) = matrix_index(&shape.main, table) {
-            let src = vec![BorrowedMatrix::RowMajorNatural {
-                data: main_data,
-                stride: *total_cols,
-                col_start: num_precomputed,
-                width: total_cols - num_precomputed,
-                log_height: height,
-            }];
-            fill_openings(&main_mmcs, m, &src, &main_iotas, &mut main_openings);
+            #[cfg(feature = "cuda")]
+            {
+                // Gather this table's query row-pairs off the resident LDE handle
+                // (a small D2H of only the queried rows) instead of downloading
+                // the whole LDE. `None` when no handle (sub-threshold decline) →
+                // the host LDE (present in that case) serves the openings.
+                let gathered = ldes.gpu_main.as_ref().and_then(|h| {
+                    let rows = query_row_indices(&main_mmcs, m, &main_iotas, h.lde_size);
+                    let stream = math_cuda::device::backend().ok()?.next_stream();
+                    let raw =
+                        math_cuda::barycentric::gather_rows_base_on_device(h, &rows, &stream).ok()?;
+                    crate::constraint_ir::gpu_interp::base_u64_to_field::<Field>(&raw)
+                        .map(|v| (v, h.m))
+                });
+                match gathered {
+                    Some((g, ncols)) => fill_openings_from_gathered(
+                        &main_mmcs,
+                        m,
+                        &g,
+                        ncols,
+                        num_precomputed,
+                        *total_cols,
+                        &main_iotas,
+                        &mut main_openings,
+                    ),
+                    None => {
+                        let src = vec![BorrowedMatrix::RowMajorNatural {
+                            data: main_data,
+                            stride: *total_cols,
+                            col_start: num_precomputed,
+                            width: total_cols - num_precomputed,
+                            log_height: height,
+                        }];
+                        fill_openings(&main_mmcs, m, &src, &main_iotas, &mut main_openings);
+                    }
+                }
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                let src = vec![BorrowedMatrix::RowMajorNatural {
+                    data: main_data,
+                    stride: *total_cols,
+                    col_start: num_precomputed,
+                    width: total_cols - num_precomputed,
+                    log_height: height,
+                }];
+                fill_openings(&main_mmcs, m, &src, &main_iotas, &mut main_openings);
+            }
         }
         if let (Some(mmcs), Some(m)) = (aux_mmcs.as_ref(), matrix_index(&shape.aux, table)) {
-            let (aux_data, aux_cols) = &ldes.aux;
-            let src = vec![BorrowedMatrix::RowMajorNatural {
-                data: aux_data,
-                stride: *aux_cols,
-                col_start: 0,
-                width: *aux_cols,
-                log_height: height,
-            }];
             let indices = aux_iotas.as_ref().expect("the aux MMCS exists here");
-            fill_openings(mmcs, m, &src, indices, &mut aux_openings);
+            #[cfg(feature = "cuda")]
+            {
+                let gathered = ldes.gpu_aux.as_ref().and_then(|h| {
+                    let rows = query_row_indices(mmcs, m, indices, h.lde_size);
+                    let stream = math_cuda::device::backend().ok()?.next_stream();
+                    let raw =
+                        math_cuda::barycentric::gather_rows_ext3_on_device(h, &rows, &stream).ok()?;
+                    crate::constraint_ir::gpu_interp::ext3_u64_to_field::<FieldExtension>(&raw)
+                        .map(|v| (v, h.m))
+                });
+                match gathered {
+                    Some((g, ncols)) => fill_openings_from_gathered(
+                        mmcs,
+                        m,
+                        &g,
+                        ncols,
+                        0,
+                        ncols,
+                        indices,
+                        &mut aux_openings,
+                    ),
+                    None => {
+                        let (aux_data, aux_cols) = &ldes.aux;
+                        let src = vec![BorrowedMatrix::RowMajorNatural {
+                            data: aux_data,
+                            stride: *aux_cols,
+                            col_start: 0,
+                            width: *aux_cols,
+                            log_height: height,
+                        }];
+                        fill_openings(mmcs, m, &src, indices, &mut aux_openings);
+                    }
+                }
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                let (aux_data, aux_cols) = &ldes.aux;
+                let src = vec![BorrowedMatrix::RowMajorNatural {
+                    data: aux_data,
+                    stride: *aux_cols,
+                    col_start: 0,
+                    width: *aux_cols,
+                    log_height: height,
+                }];
+                fill_openings(mmcs, m, &src, indices, &mut aux_openings);
+            }
         }
         if let Some(m) = matrix_index(&shape.parts, table) {
             let src = vec![BorrowedMatrix::ColMajorNatural {
@@ -1619,6 +1705,75 @@ fn fill_openings<E, S>(
             evaluations_sym,
         });
     }
+}
+
+/// Device counterpart of [`fill_openings`]: the query row-pairs were already
+/// gathered off the resident LDE (`[even(q0), odd(q0), even(q1), odd(q1), ...]`,
+/// each `ncols` field elements in FULL-row order); slice columns
+/// `[col_start, col_end)` per query. Byte-identical output to `fill_openings`
+/// (empty merkle path, filled by `assemble`), because the gathered rows are the
+/// same rows `append_row` would have read from the host LDE — no full-LDE D2H.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn fill_openings_from_gathered<E>(
+    mmcs: &MixedMmcs<E>,
+    matrix: usize,
+    gathered: &[FieldElement<E>],
+    ncols: usize,
+    col_start: usize,
+    col_end: usize,
+    iotas: &[usize],
+    out: &mut [Vec<Option<PolynomialOpenings<E>>>],
+) where
+    E: IsField + 'static,
+    FieldElement<E>: AsBytes + Sync + Send,
+{
+    for (q, &iota) in iotas.iter().enumerate() {
+        // `row_pair_leaf` returning None means this round is shorter than the FRI
+        // and does not have the leaf; gathered rows for such queries are the row-0
+        // placeholder and skipped here (same as `fill_openings`).
+        if mmcs.row_pair_leaf(iota, matrix).is_none() {
+            continue;
+        }
+        let even = gathered[(2 * q) * ncols + col_start..(2 * q) * ncols + col_end].to_vec();
+        let odd =
+            gathered[(2 * q + 1) * ncols + col_start..(2 * q + 1) * ncols + col_end].to_vec();
+        out[q][matrix] = Some(PolynomialOpenings {
+            proof: crypto::merkle_tree::proof::Proof {
+                merkle_path: Vec::new(),
+            },
+            evaluations: even,
+            evaluations_sym: odd,
+        });
+    }
+}
+
+/// The NATURAL LDE row indices to gather for a matrix's query row-pairs:
+/// per query, `rev(2*leaf)` and `rev(2*leaf+1)` (leaf = `row_pair_leaf`), which
+/// is exactly what `append_row(2*leaf)` reads (it bit-reverses internally).
+/// Out-of-range queries get row 0 (skipped by `fill_openings_from_gathered`).
+#[cfg(feature = "cuda")]
+fn query_row_indices<E>(
+    mmcs: &MixedMmcs<E>,
+    matrix: usize,
+    iotas: &[usize],
+    lde_size: usize,
+) -> Vec<u32>
+where
+    E: IsField + 'static,
+    FieldElement<E>: AsBytes + Sync + Send,
+{
+    let n = lde_size as u64;
+    iotas
+        .iter()
+        .flat_map(|&iota| match mmcs.row_pair_leaf(iota, matrix) {
+            Some(leaf) => [
+                math::fft::bit_reversing::reverse_index(2 * leaf, n) as u32,
+                math::fft::bit_reversing::reverse_index(2 * leaf + 1, n) as u32,
+            ],
+            None => [0u32, 0u32],
+        })
+        .collect()
 }
 
 /// Reduce every FRI query index into one round's index space.
