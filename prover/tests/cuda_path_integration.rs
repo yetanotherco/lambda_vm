@@ -76,11 +76,14 @@ fn gpu_path_fires_end_to_end() {
     // path.
     assert!(gpu_bary_calls() > 0, "R3 GPU barycentric did not fire");
 
-    // R2 GPU composition-poly LDE. Fires via one of two paths depending on the
+    // R2 GPU composition-poly LDE. Fires via one of three paths depending on the
     // AIR's `number_of_parts`: the fused two-halves quotient decomposition for
     // the common degree-2 case (`== 2`, counted by `gpu_extend_halves_calls`),
-    // or the batched parts LDE for `> 2` (counted by `gpu_parts_lde_calls`).
-    // fib_iterative_1M only exercises the degree-2 path, so assert on either.
+    // the batched parts LDE for `> 2` (counted by `gpu_parts_lde_calls`), or the
+    // d=1 de-interleave (`== 1`, counted by `gpu_comp_h_slabs_calls` — covered
+    // separately by `cuda_d1_path.rs`, since no d=1 table here crosses the
+    // default LDE threshold). fib_iterative_1M only exercises the degree-2 path,
+    // so assert on either of the two counted here.
     assert!(
         gpu_extend_halves_calls() + gpu_parts_lde_calls() > 0,
         "R2 GPU composition LDE did not fire (neither two-halves d2 nor parts>2 path)"
