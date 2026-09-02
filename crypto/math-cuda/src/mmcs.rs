@@ -501,3 +501,124 @@ pub fn commit_mixed_ext3_row_major_root(inputs: &[MmcsExt3RowMajorInput]) -> Res
     root.copy_from_slice(&nodes[0..32]);
     Ok(root)
 }
+
+/// Persistent, streaming device commit for one mixed-height MMCS round — the
+/// same per-height [`MmcsGroupHasher`] machinery the `commit_mixed_*_nodes`
+/// helpers use, but kept ALIVE across the prover's round loop so each table's
+/// LDE is absorbed the moment it is produced and freed immediately, instead of
+/// every LDE being retained until one all-at-once commit. VRAM holds only the
+/// per-leaf sponges (~204 B/leaf) plus one table's uploaded buffer at a time,
+/// never `O(N)` LDEs — so the device commit runs under `RecomputeLde`, not only
+/// `Retain` (which is what made a large epoch OOM: it retained every LDE just to
+/// feed the commit).
+///
+/// Absorb matrices IN INPUT ORDER (the leaf concatenation binds it), one call
+/// per matrix, using the layout method matching the round (row-major base for
+/// main, ext3 row-major for aux, ext3 slabs for parts). Each absorb uploads the
+/// host buffer, hashes it, and synchronizes, so the caller may free the host LDE
+/// as soon as the call returns. [`Self::finish`] then finalizes every group and
+/// climbs, returning the standard heap node array (feed to
+/// `MixedMmcs::from_heap_nodes`) — byte-identical to the all-at-once commit
+/// because it is the same kernels in the same order.
+pub struct StreamingMixedMmcs {
+    stream: Arc<CudaStream>,
+    /// Indexed by `log_height`: the group's live sponges, created on first
+    /// absorb of a matrix at that height.
+    hashers: Vec<Option<MmcsGroupHasher>>,
+}
+
+impl StreamingMixedMmcs {
+    /// `h_max` is the tallest `log_height` in the round (its group is the tree's
+    /// base layer). Groups are created lazily as matrices arrive.
+    pub fn new(h_max: u64) -> Result<Self> {
+        let stream = backend()?.next_stream();
+        Ok(Self {
+            stream,
+            hashers: (0..=h_max as usize).map(|_| None).collect(),
+        })
+    }
+
+    fn group_mut(&mut self, log_height: u64) -> Result<&mut MmcsGroupHasher> {
+        let idx = log_height as usize;
+        assert!(
+            idx < self.hashers.len(),
+            "log_height {log_height} exceeds the h_max this StreamingMixedMmcs was built for"
+        );
+        if self.hashers[idx].is_none() {
+            self.hashers[idx] = Some(MmcsGroupHasher::new(&self.stream, log_height)?);
+        }
+        Ok(self.hashers[idx].as_mut().expect("just populated"))
+    }
+
+    /// Absorb one row-major base-field matrix (main round). `data` is the host
+    /// LDE (Goldilocks u64 words); columns `[col_start, col_end)` of `row_stride`
+    /// are committed.
+    pub fn absorb_row_major(
+        &mut self,
+        log_height: u64,
+        data: &[u64],
+        row_stride: u64,
+        col_start: u64,
+        col_end: u64,
+    ) -> Result<()> {
+        let stream = self.stream.clone();
+        let dev = stream.clone_htod(data)?;
+        self.group_mut(log_height)?
+            .absorb_row_major(&stream, &dev, row_stride, col_start, col_end)?;
+        // Defensive: ensure the H2D copy and the absorb that reads it have
+        // completed before the caller frees `data` (the streaming residency
+        // policy this type exists for).
+        stream.synchronize()?;
+        Ok(())
+    }
+
+    /// Absorb one ext3 row-major matrix (aux round). `data` is the host LDE with
+    /// an element's 3 components consecutive.
+    pub fn absorb_ext3_row_major(
+        &mut self,
+        log_height: u64,
+        data: &[u64],
+        stride: u64,
+        col_start: u64,
+        col_end: u64,
+    ) -> Result<()> {
+        let stream = self.stream.clone();
+        let dev = stream.clone_htod(data)?;
+        self.group_mut(log_height)?
+            .absorb_ext3_row_major(&stream, &dev, stride, col_start, col_end)?;
+        stream.synchronize()?;
+        Ok(())
+    }
+
+    /// Absorb one ext3 column-major slab matrix (parts round). `parts` is the
+    /// slab buffer, component `k` of column `c` at `(c*3 + k) * col_stride`.
+    pub fn absorb_ext3_slabs(
+        &mut self,
+        log_height: u64,
+        parts: &[u64],
+        col_stride: u64,
+        num_parts: u64,
+    ) -> Result<()> {
+        let stream = self.stream.clone();
+        let dev = stream.clone_htod(parts)?;
+        self.group_mut(log_height)?
+            .absorb_ext3_slabs(&stream, &dev, col_stride, num_parts)?;
+        stream.synchronize()?;
+        Ok(())
+    }
+
+    /// Finalize every absorbed group and climb, returning the standard heap node
+    /// array (`(2L-1)*32` bytes for `L = 2^(h_max-1)`), host-side.
+    pub fn finish(self) -> Result<Vec<u8>> {
+        let Self { stream, hashers } = self;
+        let mut group_digests: Vec<Option<CudaSlice<u8>>> =
+            (0..hashers.len()).map(|_| None).collect();
+        for (h, hasher) in hashers.into_iter().enumerate() {
+            if let Some(hasher) = hasher {
+                group_digests[h] = Some(hasher.finalize(&stream)?);
+            }
+        }
+        let nodes = build_mmcs_tree_on_device(&stream, &group_digests)?;
+        stream.clone_dtoh(&nodes)
+    }
+}

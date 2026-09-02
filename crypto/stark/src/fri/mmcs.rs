@@ -493,6 +493,24 @@ where
         self.root
     }
 
+    /// Serialize the digest layers back into the standard heap byte array that
+    /// [`Self::from_heap_nodes`] parses — the inverse round-trip a device build
+    /// produces directly on the GPU. Test-only; used to corrupt a single node
+    /// and confirm the device-commit canary fires.
+    #[cfg(test)]
+    pub(crate) fn heap_bytes(&self) -> Vec<u8> {
+        let leaves_len = 1usize << (self.h_max - 1);
+        let mut heap = vec![0u8; (2 * leaves_len - 1) * 32];
+        for (k, layer) in self.layers.iter().enumerate() {
+            let level_size = leaves_len >> k;
+            let start = level_size - 1;
+            for (j, digest) in layer.iter().enumerate() {
+                heap[(start + j) * 32..(start + j) * 32 + 32].copy_from_slice(digest);
+            }
+        }
+        heap
+    }
+
     /// `log2` of the tallest committed matrix. The query index this MMCS accepts
     /// lives in `[0, 2^(h_max-1))` — see the module's index-convention section.
     pub fn h_max(&self) -> usize {

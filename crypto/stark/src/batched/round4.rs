@@ -75,6 +75,7 @@ use crate::fri::batched::{
 use crate::fri::fri_commitment::FriLayer;
 use crate::fri::fri_decommit::FriDecommitment;
 use crate::grinding;
+use crate::prover::ProvingError;
 
 /// What the prover produced in the batched round 4, plus the challenges it drew
 /// on the way. The layers are kept so the caller can run the query phase over
@@ -118,6 +119,11 @@ where
 /// `plan.standalone`). It is a closure rather than a materialized `Vec` so a
 /// caller can produce one table's DEEP codeword, absorb it and drop it:
 /// holding all of them at once is the memory cost batching exists to remove.
+///
+/// Returns `Err` only when the device FRI commit is selected and a CUDA op
+/// fails — a hard abort, the same no-silent-fallback policy as the device MMCS
+/// commits (see the `batched/prover.rs` module header). The host build never
+/// errors.
 #[allow(clippy::too_many_arguments)]
 pub fn commit_batched_fri<F, E, T, C>(
     transcript: &mut T,
@@ -129,7 +135,7 @@ pub fn commit_batched_fri<F, E, T, C>(
     final_poly_log_degree: u32,
     grinding_factor: u8,
     num_queries: usize,
-) -> BatchedFriCommit<E>
+) -> Result<BatchedFriCommit<E>, ProvingError>
 where
     F: IsFFTField + IsSubFieldOf<E> + 'static,
     E: IsField + 'static + Send + Sync,
@@ -174,13 +180,51 @@ where
         }
     }
 
-    let (final_poly_coeffs, layers) = batched_commit_phase::<F, E, T>(
-        combined,
-        transcript,
-        coset_offset,
-        blowup_log,
-        final_poly_log_degree,
-    );
+    // Device fast path vs host build. Selecting here (rather than inside
+    // `batched_commit_phase`) keeps `crate::fri` free of the prover's error type
+    // and lets a device error be a hard abort: `?` propagates it instead of the
+    // fold loop silently falling back. `Ok(None)` = device not selected (off
+    // cuda, wrong field, or below the GPU threshold) → host build.
+    let (final_poly_coeffs, layers) = {
+        #[cfg(feature = "cuda")]
+        {
+            let (h_min, h_max_folds) = crate::fri::batched::bucket_height_range(&combined)
+                .expect("commit_batched_fri: combined has at least one occupied bucket");
+            let inv_twiddles = crate::fri::fri_functions::compute_coset_twiddles_inv(
+                coset_offset,
+                1usize << h_max_folds,
+            );
+            match crate::gpu_lde::try_batched_fri_commit_gpu::<F, E, T>(
+                &combined,
+                transcript,
+                coset_offset,
+                blowup_log,
+                final_poly_log_degree,
+                &inv_twiddles,
+                h_min,
+                h_max_folds,
+            )? {
+                Some(result) => result,
+                None => batched_commit_phase::<F, E, T>(
+                    combined,
+                    transcript,
+                    coset_offset,
+                    blowup_log,
+                    final_poly_log_degree,
+                ),
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            batched_commit_phase::<F, E, T>(
+                combined,
+                transcript,
+                coset_offset,
+                blowup_log,
+                final_poly_log_degree,
+            )
+        }
+    };
     let layer_roots: Vec<Commitment> = layers.iter().map(|layer| layer.merkle_tree.root).collect();
 
     // Grinding runs on the CONFIGURATION's transcript hash, not a hard-wired
@@ -199,7 +243,7 @@ where
         .map(|_| transcript.sample_u64(1u64 << (h_max - 1)) as usize)
         .collect();
 
-    BatchedFriCommit {
+    Ok(BatchedFriCommit {
         layers,
         layer_roots,
         final_poly_coeffs,
@@ -209,7 +253,7 @@ where
         alpha,
         plan,
         standalone_coeffs,
-    }
+    })
 }
 
 /// Verify one query against a STANDALONE table's terminal-only instance.
@@ -625,6 +669,7 @@ pub(crate) mod tests {
             grinding_factor,
             num_queries,
         )
+        .expect("the host batched FRI commit never errors")
     }
 
     /// υ⁻¹ for query `iota`: the inverse of the tallest coset's element at

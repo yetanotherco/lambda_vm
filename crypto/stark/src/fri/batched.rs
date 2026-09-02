@@ -343,22 +343,10 @@ where
     // Inverse twiddle factors for the initial domain size.
     let inv_twiddles = compute_coset_twiddles_inv(coset_offset, domain_size);
 
-    // GPU fast path: drive the fold → inject → commit loop below on the device
-    // (`fri_inject_bucket_ext3` + `FriCommitState::fold_inject_commit_layer`),
-    // returning `None` with the transcript restored to fall back to the host.
-    #[cfg(feature = "cuda")]
-    if let Some(result) = crate::gpu_lde::try_batched_fri_commit_gpu::<F, E, T>(
-        &combined,
-        transcript,
-        coset_offset,
-        blowup_log,
-        final_poly_log_degree,
-        &inv_twiddles,
-        h_min,
-        h_max,
-    ) {
-        return result;
-    }
+    // The device fast path is selected one layer up, in
+    // `crate::batched::round4::commit_batched_fri`, so this stays a pure host
+    // build and a device error there is a hard abort rather than a fallback into
+    // this function. `h_min` is still consumed by the terminal-floor layout.
 
     // Take the starting codeword — NOT committed; it plays the role of layer 0.
     let mut running = combined[h_max]
@@ -436,7 +424,9 @@ where
 }
 
 /// The `(h_min, h_max)` of the occupied buckets, or `None` when none are.
-fn bucket_height_range<E: IsField>(
+/// `pub(crate)` so `commit_batched_fri` can size the device FRI's twiddles from
+/// the same range this host build uses.
+pub(crate) fn bucket_height_range<E: IsField>(
     combined: &[Option<Vec<FieldElement<E>>>],
 ) -> Option<(usize, usize)> {
     let mut occupied = combined

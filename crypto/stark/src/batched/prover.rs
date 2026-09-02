@@ -54,17 +54,54 @@
 //!
 //! # The GPU commit
 //!
-//! Under `--features cuda`, on Goldilocks (base + ext3) and `ResidencyMode::
-//! Retain`, all four MMCS trees (main / aux / parts) are committed ON THE DEVICE:
-//! the keccak leaf hash and the climb run on the GPU (`crypto/math-cuda/`'s
-//! mixed-height MMCS), and only the digest layers come back to rebuild the
-//! host-side [`MixedMmcs`] via [`MixedMmcs::from_heap_nodes`] — so the openings
-//! (row values from the retained LDE, one shared auth path per query) are served
-//! exactly as before. The host [`StreamingMmcsBuilder`] is skipped entirely for
-//! those rounds. This is a DELIBERATE mode select (see `device_commit_enabled`),
-//! not a silent per-call host↔device fallback — a device error is a hard abort —
-//! precisely so the residency numbers above stay reproducible. Off cuda / off
-//! Goldilocks / under `RecomputeLde`, the host builder commits as it always did.
+//! Under `--features cuda`, on Goldilocks (base + ext3), all four MMCS trees
+//! (main / aux / parts) are committed ON THE DEVICE: the keccak leaf hash and
+//! the climb run on the GPU (`crypto/math-cuda/`'s mixed-height MMCS), and only
+//! the digest layers come back to rebuild the host-side [`MixedMmcs`] via
+//! [`MixedMmcs::from_heap_nodes`] — so the openings (row values from the LDE, one
+//! shared auth path per query) are served exactly as before. The host
+//! [`StreamingMmcsBuilder`] is skipped entirely for those rounds. This is a
+//! DELIBERATE mode select (see `device_commit_enabled`), not a silent per-call
+//! host↔device fallback — a device error is a hard abort. Off cuda / off
+//! Goldilocks the host builder commits as it always did.
+//!
+//! ## Streaming, so it runs under either residency
+//!
+//! The device commit is STREAMING ([`math_cuda::mmcs::StreamingMixedMmcs`], the
+//! device twin of [`StreamingMmcsBuilder`]): the main and aux rounds absorb each
+//! table's LDE into the device tree INSIDE the round loop — the moment it is
+//! produced — and free it, so only the per-leaf sponges stay resident, never all
+//! LDEs at once. It therefore runs under BOTH `Retain` and `RecomputeLde`. This
+//! is not cosmetic: the old all-at-once commit retained every LDE just to feed it
+//! (O(N) memory), which OOM'd a large epoch; streaming under `RecomputeLde` is
+//! what lets a big block commit on the GPU at all. Parts are ALWAYS retained
+//! (recomputing them re-runs constraint eval), so that round streams one slab at
+//! a time from the retained parts POST-loop instead.
+//!
+//! ## No silent fallback, enforced in release
+//!
+//! Because the device commit is authoritative, a silent device-side corruption
+//! (a layout / heap bug that ships a wrong-but-self-consistent tree) would
+//! otherwise ship a bad proof: the byte-identical device-vs-host parity that
+//! guards these paths is `debug_assert!` / test-only and compiled OUT of a
+//! release prove. So a device commit runs a canary (`xcheck_device_commit`) that
+//! re-authenticates a handful of the committed tree's leaves against the LDE on
+//! the host, through the same `open_batch` / `verify_batch` the verifier trusts.
+//! Its cost is `k` leaf paths against an `O(N)` tree build; a mismatch is a hard
+//! [`ProvingError`]. The canary reads the LDEs back, so main/aux run it only
+//! under `Retain` (`RecomputeLde` dropped them — the debug parity tests cover
+//! that path); parts, always retained, canary every time.
+//!
+//! The batched FRI commit follows the SAME policy. Its GPU drive is selected in
+//! [`crate::batched::round4::commit_batched_fri`] (not inside
+//! `crate::fri::batched`'s `batched_commit_phase`, which stays a pure host
+//! build): when the device path is selected and a CUDA op fails, the error
+//! propagates as a hard abort rather than silently restoring the transcript and
+//! rebuilding on the host. The only sanctioned host build is NON-selection (off
+//! cuda, off Goldilocks, or below the GPU threshold), reached before any
+//! transcript mutation. (A silent FRI-side corruption — a wrong-but-no-error
+//! device root — is not yet canaried here; the FRI verifier's own
+//! fold-consistency check is the current backstop. Deferred.)
 
 use math::fft::bit_reversing::in_place_bit_reverse_permute_row_major;
 use math::field::element::FieldElement;
@@ -267,6 +304,19 @@ where
     let use_device_main = device_commit_enabled::<Field>(residency);
     let mut main_builder =
         (!use_device_main).then(|| StreamingMmcsBuilder::<Field>::new(&shape.main.dims));
+    // The device twin of `main_builder`: created before the loop, absorbs each
+    // table's LDE inside it (streaming), climbed after. Present iff device main.
+    #[cfg(feature = "cuda")]
+    let mut device_main: Option<math_cuda::mmcs::StreamingMixedMmcs> = if use_device_main {
+        let h_max = round_h_max(&shape.main, "main")?;
+        Some(
+            math_cuda::mmcs::StreamingMixedMmcs::new(h_max as u64).map_err(|e| {
+                ProvingError::WrongParameter(format!("device main commit init failed: {e:?}"))
+            })?,
+        )
+    } else {
+        None
+    };
     let mut retained_main: Vec<Option<(Vec<FieldElement<Field>>, usize)>> =
         (0..num_tables).map(|_| None).collect();
     // The carved table's standalone main tree and its root. Built inside the
@@ -354,6 +404,27 @@ where
                 }];
                 builder.absorb(&src, 0);
             }
+            // Streaming device absorb: hash this table into the device tree NOW,
+            // so the LDE can be freed below (RecomputeLde) without retaining it.
+            #[cfg(feature = "cuda")]
+            if let Some(dev) = device_main.as_mut() {
+                // SAFETY: Goldilocks base (device_commit_enabled gated it);
+                // FieldElement<Gl> is #[repr(transparent)] over u64. Committed
+                // columns are [num_precomputed, total_cols).
+                let data_u64 = unsafe {
+                    std::slice::from_raw_parts(main_data.as_ptr() as *const u64, main_data.len())
+                };
+                dev.absorb_row_major(
+                    height as u64,
+                    data_u64,
+                    total_cols as u64,
+                    num_precomputed as u64,
+                    total_cols as u64,
+                )
+                .map_err(|e| {
+                    ProvingError::WrongParameter(format!("device main absorb failed: {e:?}"))
+                })?;
+            }
         }
 
         // The root is what Fiat-Shamir needs; the buffer is not. Under
@@ -376,7 +447,22 @@ where
     }
 
     let main_mmcs = if use_device_main {
-        commit_main_device(&retained_main, &shape, num_tables)?
+        #[cfg(feature = "cuda")]
+        {
+            finalize_device_main(
+                device_main
+                    .take()
+                    .expect("device_main present under use_device_main"),
+                &retained_main,
+                &shape,
+                num_tables,
+                residency,
+            )?
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            unreachable!("device commit requires the cuda feature")
+        }
     } else {
         main_builder
             .take()
@@ -415,6 +501,18 @@ where
     let use_device_aux = device_commit_enabled::<FieldExtension>(residency);
     let mut aux_builder = (!shape.aux.is_empty() && !use_device_aux)
         .then(|| StreamingMmcsBuilder::<FieldExtension>::new(&shape.aux.dims));
+    #[cfg(feature = "cuda")]
+    let mut device_aux: Option<math_cuda::mmcs::StreamingMixedMmcs> =
+        if use_device_aux && !shape.aux.is_empty() {
+            let h_max = round_h_max(&shape.aux, "aux")?;
+            Some(
+                math_cuda::mmcs::StreamingMixedMmcs::new(h_max as u64).map_err(|e| {
+                    ProvingError::WrongParameter(format!("device aux commit init failed: {e:?}"))
+                })?,
+            )
+        } else {
+            None
+        };
     let mut retained_aux: Vec<Option<(Vec<FieldElement<FieldExtension>>, usize)>> =
         (0..num_tables).map(|_| None).collect();
 
@@ -455,6 +553,26 @@ where
             }];
             builder.absorb(&src, 0);
         }
+        // Streaming device absorb (ext3 row-major), so the aux LDE can be freed
+        // below without retaining it.
+        #[cfg(feature = "cuda")]
+        if let Some(dev) = device_aux.as_mut() {
+            // SAFETY: ext3 Goldilocks (device_commit_enabled gated it); an
+            // element is 3 consecutive u64.
+            let data_u64 = unsafe {
+                std::slice::from_raw_parts(aux_data.as_ptr() as *const u64, aux_data.len() * 3)
+            };
+            dev.absorb_ext3_row_major(
+                shape.heights[table] as u64,
+                data_u64,
+                aux_cols as u64,
+                0,
+                aux_cols as u64,
+            )
+            .map_err(|e| {
+                ProvingError::WrongParameter(format!("device aux absorb failed: {e:?}"))
+            })?;
+        }
         match residency {
             ResidencyMode::Retain => retained_aux[table] = Some((aux_data, aux_cols)),
             ResidencyMode::RecomputeLde => {
@@ -465,7 +583,20 @@ where
     }
 
     let aux_mmcs = if use_device_aux && !shape.aux.is_empty() {
-        Some(commit_aux_device(&retained_aux, &shape, num_tables)?)
+        #[cfg(feature = "cuda")]
+        {
+            Some(finalize_device_aux(
+                device_aux.take().expect("device_aux present under use_device_aux"),
+                &retained_aux,
+                &shape,
+                num_tables,
+                residency,
+            )?)
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            unreachable!("device commit requires the cuda feature")
+        }
     } else {
         aux_builder.map(StreamingMmcsBuilder::finish)
     };
@@ -790,7 +921,7 @@ where
             params.final_poly_log_degree,
             params.grinding_factor,
             params.num_queries,
-        )
+        )?
     };
 
     // =====================================================================
@@ -975,19 +1106,21 @@ fn matrix_index(round: &RoundShape, table: usize) -> Option<usize> {
 }
 
 /// Whether a round is committed on the GPU (device tree authoritative) rather
-/// than by the host `StreamingMmcsBuilder`. True only with the `cuda` feature,
-/// on a Goldilocks field (base or ext3 — the only fields the kernels support),
-/// and under `ResidencyMode::Retain` (the LDEs must survive to feed the device
-/// tree after the round's loop). A deliberate mode select; there is no silent
-/// per-call host↔device fallback — a device error aborts.
+/// than by the host `StreamingMmcsBuilder`. True with the `cuda` feature on a
+/// Goldilocks field (base or ext3 — the only fields the kernels support), under
+/// EITHER residency: the streaming device commit
+/// ([`math_cuda::mmcs::StreamingMixedMmcs`]) absorbs each table's LDE inside the
+/// round loop and frees it, keeping only the per-leaf sponges resident, so it no
+/// longer needs `Retain` (which retained every LDE just to feed one all-at-once
+/// commit — the O(N) memory that OOM'd a large epoch). A deliberate mode select;
+/// there is no silent per-call host↔device fallback — a device error aborts.
 #[cfg(feature = "cuda")]
-fn device_commit_enabled<F: 'static>(residency: ResidencyMode) -> bool {
+fn device_commit_enabled<F: 'static>(_residency: ResidencyMode) -> bool {
     use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
     use math::field::goldilocks::GoldilocksField;
     use std::any::TypeId;
-    residency == ResidencyMode::Retain
-        && (TypeId::of::<F>() == TypeId::of::<GoldilocksField>()
-            || TypeId::of::<F>() == TypeId::of::<Degree3GoldilocksExtensionField>())
+    TypeId::of::<F>() == TypeId::of::<GoldilocksField>()
+        || TypeId::of::<F>() == TypeId::of::<Degree3GoldilocksExtensionField>()
 }
 
 #[cfg(not(feature = "cuda"))]
@@ -995,54 +1128,26 @@ fn device_commit_enabled<F: 'static>(_residency: ResidencyMode) -> bool {
     false
 }
 
-/// Commit the main round on the GPU and rebuild the host-side `MixedMmcs` from
-/// the device heap (keccak on device, digest layers back). Only called when
-/// [`device_commit_enabled`] held, i.e. Goldilocks + Retain + cuda; a device
-/// error is a hard abort, never a silent host fallback.
+/// Finalize the main round's STREAMING device commit: climb the tree from the
+/// per-leaf sponges the round loop already absorbed into `device` (one table at
+/// a time, then freed — see [`math_cuda::mmcs::StreamingMixedMmcs`]), rebuild the
+/// host-side `MixedMmcs` from the heap, and — when the LDEs are still resident
+/// (`Retain`) — run the release canary. Only reached under
+/// [`device_commit_enabled`]; a device error is a hard abort, never a silent
+/// host fallback.
 #[cfg(feature = "cuda")]
-fn commit_main_device<Field: IsField + 'static>(
+fn finalize_device_main<Field: IsField + 'static>(
+    device: math_cuda::mmcs::StreamingMixedMmcs,
     retained_main: &[Option<(Vec<FieldElement<Field>>, usize)>],
     shape: &EpochShape,
     num_tables: usize,
+    residency: ResidencyMode,
 ) -> Result<MixedMmcs<Field>, ProvingError>
 where
     FieldElement<Field>: math::traits::AsBytes + Sync + Send,
 {
-    let mut raws: Vec<(Vec<u64>, u64, u64, u64)> = Vec::new();
-    for table in 0..num_tables {
-        if shape.carved_main.map(|c| c.table) == Some(table) {
-            continue;
-        }
-        match &retained_main[table] {
-            Some((data, total_cols)) => {
-                let width = matrix_width(&shape.main, table) as u64;
-                let stride = *total_cols as u64;
-                // SAFETY: Goldilocks (device_commit_enabled gated it), element
-                // value is a u64 — same cast as `gpu_lde::columns_to_u64_base`.
-                let raw: Vec<u64> = data
-                    .iter()
-                    .map(|e| unsafe { *(e.value() as *const _ as *const u64) })
-                    .collect();
-                raws.push((raw, stride, stride - width, shape.heights[table] as u64));
-            }
-            None => {
-                return Err(ProvingError::WrongParameter(
-                    "device main commit: a non-carved main LDE was not retained".to_string(),
-                ));
-            }
-        }
-    }
-    let inputs: Vec<math_cuda::mmcs::MmcsRowMajorInput> = raws
-        .iter()
-        .map(|(d, stride, col_start, h)| math_cuda::mmcs::MmcsRowMajorInput {
-            data: d.as_slice(),
-            stride: *stride,
-            col_start: *col_start,
-            col_end: *stride,
-            log_height: *h,
-        })
-        .collect();
-    let nodes = math_cuda::mmcs::commit_mixed_row_major_nodes(&inputs)
+    let nodes = device
+        .finish()
         .map_err(|e| ProvingError::WrongParameter(format!("device main commit failed: {e:?}")))?;
     let h_max = shape
         .main
@@ -1051,88 +1156,84 @@ where
         .map(|&(lh, _)| lh)
         .max()
         .ok_or_else(|| ProvingError::WrongParameter("device main commit: empty round".to_string()))?;
-    Ok(MixedMmcs::from_heap_nodes(
-        shape.main.dims.clone(),
-        h_max,
-        &nodes,
-    ))
+    let mmcs = MixedMmcs::from_heap_nodes(shape.main.dims.clone(), h_max, &nodes);
+    // The canary reads the retained LDEs back through a source in the SAME order
+    // as the absorbed inputs; under `RecomputeLde` they are gone (the debug
+    // parity tests cover that path).
+    if residency == ResidencyMode::Retain {
+        let mut source: Vec<BorrowedMatrix<Field>> = Vec::new();
+        for table in 0..num_tables {
+            if shape.carved_main.map(|c| c.table) == Some(table) {
+                continue;
+            }
+            match &retained_main[table] {
+                Some((data, total_cols)) => {
+                    let width = matrix_width(&shape.main, table);
+                    source.push(BorrowedMatrix::RowMajorNatural {
+                        data,
+                        stride: *total_cols,
+                        col_start: *total_cols - width,
+                        width,
+                        log_height: shape.heights[table],
+                    });
+                }
+                None => {
+                    return Err(ProvingError::WrongParameter(
+                        "device main commit canary: a non-carved main LDE was not retained"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+        xcheck_device_commit("main", &mmcs, source)?;
+    }
+    Ok(mmcs)
 }
 
-#[cfg(not(feature = "cuda"))]
-fn commit_main_device<Field: IsField + 'static>(
-    _retained_main: &[Option<(Vec<FieldElement<Field>>, usize)>],
-    _shape: &EpochShape,
-    _num_tables: usize,
-) -> Result<MixedMmcs<Field>, ProvingError>
-where
-    FieldElement<Field>: math::traits::AsBytes + Sync + Send,
-{
-    unreachable!("device commit is disabled without the cuda feature")
-}
-
-/// Commit the aux round (row-major ext3) on the GPU. Precondition + policy as
-/// [`commit_main_device`]. `retained_aux[t]` is `Some` exactly for the aux
-/// tables, in the order the host absorbs them.
+/// Finalize the aux round's STREAMING device commit (ext3 row-major). Aux twin
+/// of [`finalize_device_main`]: the round loop absorbed each aux LDE into
+/// `device`; here we climb + rebuild + (under `Retain`) canary. The aux round
+/// commits every aux column, so `col_start = 0`.
 #[cfg(feature = "cuda")]
-fn commit_aux_device<E: IsField + 'static>(
+fn finalize_device_aux<E: IsField + 'static>(
+    device: math_cuda::mmcs::StreamingMixedMmcs,
     retained_aux: &[Option<(Vec<FieldElement<E>>, usize)>],
     shape: &EpochShape,
     num_tables: usize,
+    residency: ResidencyMode,
 ) -> Result<MixedMmcs<E>, ProvingError>
 where
     FieldElement<E>: math::traits::AsBytes + Sync + Send,
 {
-    let mut raws: Vec<(Vec<u64>, u64, u64)> = Vec::new();
-    for table in 0..num_tables {
-        if let Some((data, aux_cols)) = &retained_aux[table] {
-            // SAFETY: ext3 Goldilocks (gated), contiguous `[u64; 3]` per element.
-            let raw: Vec<u64> =
-                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u64, data.len() * 3) }
-                    .to_vec();
-            raws.push((raw, *aux_cols as u64, shape.heights[table] as u64));
-        }
-    }
-    if raws.is_empty() {
-        return Err(ProvingError::WrongParameter(
-            "device aux commit: no retained aux LDEs".to_string(),
-        ));
-    }
-    let inputs: Vec<math_cuda::mmcs::MmcsExt3RowMajorInput> = raws
-        .iter()
-        .map(|(d, stride, h)| math_cuda::mmcs::MmcsExt3RowMajorInput {
-            data: d.as_slice(),
-            stride: *stride,
-            col_start: 0,
-            col_end: *stride,
-            log_height: *h,
-        })
-        .collect();
-    let nodes = math_cuda::mmcs::commit_mixed_ext3_row_major_nodes(&inputs)
+    let nodes = device
+        .finish()
         .map_err(|e| ProvingError::WrongParameter(format!("device aux commit failed: {e:?}")))?;
-    let h_max = shape
-        .aux
-        .dims
-        .iter()
-        .map(|&(lh, _)| lh)
-        .max()
-        .ok_or_else(|| ProvingError::WrongParameter("device aux commit: empty round".to_string()))?;
-    Ok(MixedMmcs::from_heap_nodes(shape.aux.dims.clone(), h_max, &nodes))
+    let h_max = round_h_max(&shape.aux, "aux")?;
+    let mmcs = MixedMmcs::from_heap_nodes(shape.aux.dims.clone(), h_max, &nodes);
+    if residency == ResidencyMode::Retain {
+        let mut source: Vec<BorrowedMatrix<E>> = Vec::new();
+        for table in 0..num_tables {
+            if let Some((data, aux_cols)) = &retained_aux[table] {
+                source.push(BorrowedMatrix::RowMajorNatural {
+                    data,
+                    stride: *aux_cols,
+                    col_start: 0,
+                    width: *aux_cols,
+                    log_height: shape.heights[table],
+                });
+            }
+        }
+        xcheck_device_commit("aux", &mmcs, source)?;
+    }
+    Ok(mmcs)
 }
 
-#[cfg(not(feature = "cuda"))]
-fn commit_aux_device<E: IsField + 'static>(
-    _retained_aux: &[Option<(Vec<FieldElement<E>>, usize)>],
-    _shape: &EpochShape,
-    _num_tables: usize,
-) -> Result<MixedMmcs<E>, ProvingError>
-where
-    FieldElement<E>: math::traits::AsBytes + Sync + Send,
-{
-    unreachable!("device commit is disabled without the cuda feature")
-}
-
-/// Commit the parts round (column-major ext3 slabs) on the GPU. Precondition +
-/// policy as [`commit_main_device`]. Parts are always retained.
+/// Commit the parts round (column-major ext3 slabs) on the GPU via the streaming
+/// [`math_cuda::mmcs::StreamingMixedMmcs`]: build one table's slab, absorb it,
+/// free it, then the next — only one slab resident at a time instead of every
+/// table's slab at once. Parts are ALWAYS retained (recomputing them re-runs
+/// constraint eval, a prove's dominant cost), so — unlike main/aux — this reads
+/// them post-loop and always runs the canary.
 #[cfg(feature = "cuda")]
 fn commit_parts_device<E: IsField + 'static>(
     retained_parts: &[Vec<Vec<FieldElement<E>>>],
@@ -1142,7 +1243,10 @@ fn commit_parts_device<E: IsField + 'static>(
 where
     FieldElement<E>: math::traits::AsBytes + Sync + Send,
 {
-    let mut slabs: Vec<(Vec<u64>, u64, u64, u64)> = Vec::new();
+    let h_max = round_h_max(&shape.parts, "parts")?;
+    let mut device = math_cuda::mmcs::StreamingMixedMmcs::new(h_max as u64).map_err(|e| {
+        ProvingError::WrongParameter(format!("device parts commit init failed: {e:?}"))
+    })?;
     for table in 0..num_tables {
         let parts = &retained_parts[table];
         if parts.is_empty() || parts[0].is_empty() {
@@ -1163,38 +1267,32 @@ where
                 }
             }
         }
-        slabs.push((
-            slab,
-            num_rows as u64,
-            num_parts as u64,
-            shape.heights[table] as u64,
-        ));
+        device
+            .absorb_ext3_slabs(
+                shape.heights[table] as u64,
+                &slab,
+                num_rows as u64,
+                num_parts as u64,
+            )
+            .map_err(|e| {
+                ProvingError::WrongParameter(format!("device parts absorb failed: {e:?}"))
+            })?;
+        // `slab` is freed here — one table's slab resident at a time.
     }
-    let inputs: Vec<math_cuda::mmcs::MmcsExt3SlabInput> = slabs
-        .iter()
-        .map(|(d, col_stride, num_parts, h)| math_cuda::mmcs::MmcsExt3SlabInput {
-            data: d.as_slice(),
-            col_stride: *col_stride,
-            num_parts: *num_parts,
-            log_height: *h,
-        })
-        .collect();
-    let nodes = math_cuda::mmcs::commit_mixed_ext3_slabs_nodes(&inputs)
+    let nodes = device
+        .finish()
         .map_err(|e| ProvingError::WrongParameter(format!("device parts commit failed: {e:?}")))?;
-    let h_max = shape
-        .parts
-        .dims
-        .iter()
-        .map(|&(lh, _)| lh)
-        .max()
-        .ok_or_else(|| {
-            ProvingError::WrongParameter("device parts commit: empty round".to_string())
-        })?;
-    Ok(MixedMmcs::from_heap_nodes(
-        shape.parts.dims.clone(),
-        h_max,
-        &nodes,
-    ))
+    let mmcs = MixedMmcs::from_heap_nodes(shape.parts.dims.clone(), h_max, &nodes);
+    // Parts are always retained, so the canary source is always available.
+    let mut source: Vec<BorrowedMatrix<E>> = Vec::new();
+    for table in 0..num_tables {
+        source.push(BorrowedMatrix::ColMajorNatural {
+            cols: &retained_parts[table],
+            log_height: shape.heights[table],
+        });
+    }
+    xcheck_device_commit("parts", &mmcs, source)?;
+    Ok(mmcs)
 }
 
 #[cfg(not(feature = "cuda"))]
@@ -1207,6 +1305,94 @@ where
     FieldElement<E>: math::traits::AsBytes + Sync + Send,
 {
     unreachable!("device commit is disabled without the cuda feature")
+}
+
+/// How many leaves the [`xcheck_device_commit`] canary re-authenticates per
+/// round. `k * (h_max - 1)` compressions and one row-pair hash per matrix — a
+/// rounding error next to the `O(N)` device tree it guards.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+const CANARY_SAMPLES: usize = 8;
+
+/// Up to [`CANARY_SAMPLES`] DISTINCT leaf indices in `[0, n0)`, walked from a
+/// root-seeded base by a root-seeded odd stride. The stride is coprime to the
+/// power-of-two `n0`, so the first `k <= n0` steps never collide; seeding both
+/// from the device root spreads the probes with the committed data (rather than
+/// always testing leaf 0) without touching the transcript.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn canary_indices(root: &crate::config::Commitment, n0: usize) -> Vec<usize> {
+    debug_assert!(n0 >= 1);
+    let k = CANARY_SAMPLES.min(n0);
+    let seed = u64::from_le_bytes(root[0..8].try_into().expect("a commitment is 32 bytes"));
+    let base = (seed % n0 as u64) as usize;
+    // `| 1` forces an odd stride; odd is coprime to any power of two.
+    let stride = (u64::from_le_bytes(root[8..16].try_into().expect("a commitment is 32 bytes")) | 1)
+        as usize;
+    (0..k)
+        .map(|s| base.wrapping_add(s.wrapping_mul(stride)) % n0)
+        .collect()
+}
+
+/// Release-safe canary for a device MMCS commit. The device path is
+/// AUTHORITATIVE — the host [`StreamingMmcsBuilder`] is skipped — and the
+/// byte-identical device-vs-host parity that guards 3d/3e is `debug_assert!` /
+/// test-only, i.e. compiled OUT of a release prove. This re-authenticates a
+/// handful of the freshly committed tree's leaves against the retained LDE rows
+/// on the host, through the very [`MixedMmcs::open_batch`] /
+/// [`MixedMmcs::verify_batch`] the verifier trusts. A silent device-side
+/// corruption — a layout / heap bug that ships a wrong-but-self-consistent tree
+/// — then aborts the prove with a hard [`ProvingError`] instead of producing a
+/// proof that authenticates the wrong data. `source` must describe the SAME
+/// matrices, in the SAME order, as the ones fed to the device commit (the
+/// callers build it in the very loop that assembles the device inputs).
+///
+/// Compiled unconditionally (only CALLED under cuda) so the host-only negative
+/// test can exercise it without a GPU.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn xcheck_device_commit<E>(
+    round: &str,
+    mmcs: &MixedMmcs<E>,
+    source: Vec<BorrowedMatrix<'_, E>>,
+) -> Result<(), ProvingError>
+where
+    E: IsField + 'static,
+    FieldElement<E>: AsBytes + Sync + Send,
+{
+    let dims = mmcs.dims();
+    if source.len() != dims.len() {
+        return Err(ProvingError::WrongParameter(format!(
+            "device {round} commit canary: leaf source has {} matrices but the tree committed {}",
+            source.len(),
+            dims.len()
+        )));
+    }
+    let heights: Vec<usize> = dims.iter().map(|&(h, _)| h).collect();
+    let widths: Vec<usize> = dims.iter().map(|&(_, w)| w).collect();
+    let root = mmcs.root();
+    let n0 = 1usize << (mmcs.h_max() - 1);
+
+    for iota in canary_indices(&root, n0) {
+        let opening = mmcs.open_batch(iota, &source);
+        if !MixedMmcs::verify_batch(&root, iota, &opening, &heights, &widths) {
+            return Err(ProvingError::WrongParameter(format!(
+                "device {round} commit canary FAILED at leaf {iota}: the committed device \
+                 tree does not re-authenticate against the retained LDE — a silent device-side \
+                 corruption, aborting the prove (NO host fallback)"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The tallest committed `log_height` in a round — the base layer of its device
+/// tree. Errs on an empty round (no matrix to commit).
+#[cfg(feature = "cuda")]
+fn round_h_max(round: &RoundShape, name: &str) -> Result<usize, ProvingError> {
+    round
+        .dims
+        .iter()
+        .map(|&(lh, _)| lh)
+        .max()
+        .ok_or_else(|| ProvingError::WrongParameter(format!("device {name} commit: empty round")))
 }
 
 /// The width `table` contributes to `round`. Zero when it contributes nothing.
@@ -1482,4 +1668,82 @@ where
         &gammas,
         &trace_term_coeffs,
     )
+}
+
+#[cfg(test)]
+mod canary_tests {
+    use super::*;
+    use math::field::goldilocks::GoldilocksField;
+
+    type FE = FieldElement<GoldilocksField>;
+
+    // Two mixed-height, row-major matrices (tallest first), the exact layout the
+    // device main/aux commits hand the canary: matrix 0 is 8 rows × 2 cols
+    // (log_height 3), matrix 1 is 4 rows × 1 col (log_height 2).
+    fn source<'a>(d0: &'a [FE], d1: &'a [FE]) -> Vec<BorrowedMatrix<'a, GoldilocksField>> {
+        vec![
+            BorrowedMatrix::RowMajorNatural {
+                data: d0,
+                stride: 2,
+                col_start: 0,
+                width: 2,
+                log_height: 3,
+            },
+            BorrowedMatrix::RowMajorNatural {
+                data: d1,
+                stride: 1,
+                col_start: 0,
+                width: 1,
+                log_height: 2,
+            },
+        ]
+    }
+
+    fn fixture() -> (Vec<FE>, Vec<FE>) {
+        let d0: Vec<FE> = (0..16u64).map(|i| FE::from(i + 1)).collect();
+        let d1: Vec<FE> = (0..4u64).map(|i| FE::from(i + 100)).collect();
+        (d0, d1)
+    }
+
+    #[test]
+    fn canary_passes_on_a_tree_that_matches_its_data() {
+        let (d0, d1) = fixture();
+        let mmcs = MixedMmcs::commit(&source(&d0, &d1));
+        assert!(
+            xcheck_device_commit("test", &mmcs, source(&d0, &d1)).is_ok(),
+            "the canary must accept a device tree that re-authenticates against its LDE"
+        );
+    }
+
+    #[test]
+    fn canary_fires_when_the_data_disagrees_with_the_tree() {
+        let (d0, d1) = fixture();
+        let mmcs = MixedMmcs::commit(&source(&d0, &d1));
+        // The tallest matrix is hashed into EVERY leaf, so perturbing all its rows
+        // makes every sampled leaf mismatch — a stand-in for a device that
+        // committed the wrong data with a self-consistent tree.
+        let d0_bad: Vec<FE> = (0..16u64).map(|i| FE::from(i + 2)).collect();
+        assert!(
+            xcheck_device_commit("test", &mmcs, source(&d0_bad, &d1)).is_err(),
+            "the canary must reject a tree that disagrees with the retained LDE"
+        );
+    }
+
+    #[test]
+    fn canary_fires_when_a_committed_node_is_corrupted() {
+        let (d0, d1) = fixture();
+        let good = MixedMmcs::commit(&source(&d0, &d1));
+        let dims = good.dims().to_vec();
+        let h_max = good.h_max();
+        // Flip a bit in the root digest (heap index 0); it sits on every leaf's
+        // authentication path, so the recomputed climb from the honest data can
+        // no longer reach it.
+        let mut heap = good.heap_bytes();
+        heap[0] ^= 0x01;
+        let corrupted = MixedMmcs::from_heap_nodes(dims, h_max, &heap);
+        assert!(
+            xcheck_device_commit("test", &corrupted, source(&d0, &d1)).is_err(),
+            "the canary must reject a tree with a corrupted committed node"
+        );
+    }
 }
