@@ -1324,13 +1324,21 @@ pub fn time_batched_prove(
         &runtime_page_ranges,
         proof_options.fri_final_poly_log_degree,
     );
+    // `LAMBDA_BATCHED_RESIDENCY=recompute` exercises the device-resident R2/R4
+    // paths (they engage only under RecomputeLde, where `materialize_ldes`
+    // recomputes on the GPU and attaches the handles); default Retain keeps every
+    // LDE host-resident (the small-block path).
+    let residency = match std::env::var("LAMBDA_BATCHED_RESIDENCY").as_deref() {
+        Ok("recompute") => stark::residency_mode::ResidencyMode::RecomputeLde,
+        _ => stark::residency_mode::ResidencyMode::Retain,
+    };
     let t = std::time::Instant::now();
     let _ = stark::batched::prover::multi_prove_batched::<F, E, (), Prover<F, E, ()>>(
         airs.air_trace_pairs(&mut traces),
         &mut transcript,
         #[cfg(feature = "disk-spill")]
         storage_mode,
-        stark::residency_mode::ResidencyMode::Retain,
+        residency,
     )
     .map_err(|e| Error::Prover(format!("{e:?}")))?;
     Ok(t.elapsed())
