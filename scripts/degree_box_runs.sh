@@ -114,6 +114,8 @@ for l in sys.stdin:
   fi
 
   log "--- B: VM prover sweep B0-B5 + C0 (rebuilds per degree) ---"
+  # The sweep now builds/verifies the ASM artifact itself and aborts on the
+  # first unmeasurable arm; a fresh clone has no executor/program_artifacts/.
   timeout 14400 scripts/degree_prover_sweep.sh all_instructions_64 3 \
     2>&1 | tee -a "$OUT/prover_sweep.log"
 

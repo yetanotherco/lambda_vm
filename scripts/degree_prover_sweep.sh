@@ -110,11 +110,40 @@ run_arm() {
   commit=$(grep -E 'commit_bit_reversed \(comp' "$log" | grep -oE '[0-9]+\.[0-9]+s' | head -1 | tr -d 's')
   cons=$(grep -E 'R2  evaluate' "$log" | grep -oE '[0-9]+\.[0-9]+s' | head -1 | tr -d 's')
 
+  # A grid of NA is not a result — it is a silent failure that looks like data.
+  # If the very first arm produced no wall time, every later one will fail the
+  # same way, so stop and say why instead of burning the box for an hour.
+  if [ -z "${wall:-}" ]; then
+    echo "FATAL: arm d=$degree b=$blowup g=$force produced no measurement." >&2
+    echo "       The prove almost certainly panicked; first 20 lines of $log:" >&2
+    head -20 "$log" >&2
+    exit 1
+  fi
+
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$degree" "$((degree - 1))" "$blowup" "$force" "$rep" \
-    "${wall:-NA}" "${rss:-NA}" "${dec:-NA}" "${commit:-NA}" "${cons:-NA}" \
+    "$wall" "${rss:-NA}" "${dec:-NA}" "${commit:-NA}" "${cons:-NA}" \
     | tee -a "$RESULTS"
 }
+
+# The VM arms read a compiled ASM artifact, and `executor/program_artifacts/` is
+# NOT tracked in git — a fresh clone has none. Without this, every arm panics on
+# the missing ELF in milliseconds and the sweep records a full grid of NA that
+# looks like data. Build them, then verify, then fail fast if still absent.
+ASM_ELF="$REPO/executor/program_artifacts/asm/${ELF_NAME}.elf"
+if [ ! -f "$ASM_ELF" ]; then
+  echo "ASM artifact missing ($ASM_ELF) — running make compile-programs-asm"
+  if ! make -C "$REPO" compile-programs-asm > "$OUT/build_asm.log" 2>&1; then
+    echo "FATAL: make compile-programs-asm failed — see $OUT/build_asm.log" >&2
+    exit 1
+  fi
+fi
+if [ ! -f "$ASM_ELF" ]; then
+  echo "FATAL: $ASM_ELF still missing after compile-programs-asm." >&2
+  echo "       Check that '$ELF_NAME' is a real program under executor/programs/asm/." >&2
+  exit 1
+fi
+echo "ASM artifact OK: $ASM_ELF"
 
 echo "degree-lane prover sweep: elf=$ELF_NAME reps=$REPS out=$OUT"
 
