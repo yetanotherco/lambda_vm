@@ -6,6 +6,11 @@ on:
     paths:
       - 'executor/src/**'
       - 'executor/Cargo.toml'
+      # syscalls is linked into the guest ELFs this job builds and measures, so a change
+      # confined to it moves cycles on every benchmark. The cache key below already
+      # hashes it; both lists must agree on what rebuilds the guest, or a syscalls-only
+      # change (a guest allocator swap, say) never gets benchmarked at all.
+      - 'syscalls/**'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -35,7 +40,7 @@ jobs:
         id: cache
         with:
           path: ${{ matrix.branch }}_programs/*.elf
-          key: benchmarks-${{ matrix.branch }}-${{ hashFiles( 'executor/programs/bench/**', 'syscalls/src/**' ) }}
+          key: benchmarks-${{ matrix.branch }}-${{ hashFiles( 'executor/programs/bench/**', 'syscalls/**' ) }}
           restore-keys: benchmarks-${{ matrix.branch }}-
 
       - name: Setup Rust Environment
@@ -51,7 +56,7 @@ jobs:
 
       - name: Export benchmark hashes
         id: export-hashes
-        run: echo "benchmark-hashes-${{ matrix.branch }}=${{ hashFiles( 'executor/programs/bench/**', 'syscalls/src/**' ) }}" >> "$GITHUB_OUTPUT"
+        run: echo "benchmark-hashes-${{ matrix.branch }}=${{ hashFiles( 'executor/programs/bench/**', 'syscalls/**' ) }}" >> "$GITHUB_OUTPUT"
 
   build-binaries:
     strategy:

@@ -41,10 +41,18 @@ use crate::trace::LDETraceTable;
 /// check is on **lde size**, not trace length, because that's what
 /// determines the FFT workload.
 ///
-/// 2^19 is a conservative default calibrated against a 46-core machine where
-/// rayon-parallel CPU LDE is already fast. Override via env var for tuning
-/// on smaller machines, see `crypto/math-cuda/tests/bench_quick.rs`.
-const DEFAULT_GPU_LDE_THRESHOLD: usize = 1 << 19;
+/// The commit itself is not the whole cost: a table committed on CPU has no
+/// device handle, so every R2-R4 GPU dispatch re-uploads its LDE. 2^14 is the
+/// measured sweep optimum on ethrex continuations (2^14 beats 2^15..2^19 and
+/// also beats "everything on GPU", where sub-2^14 tables lose to launch
+/// overhead). Override via env var for tuning.
+///
+/// The same value gates the whole dispatch layer, not just the commit: R2
+/// decompose, the R3 inv-denoms/barycentric contexts, R4 DEEP and the FRI
+/// fold all admit on it, so moving it moves every one of those floors
+/// together. The device-only envelope is the one gate that does NOT ride on
+/// it — see [`DEFAULT_DEVICE_ONLY_MIN_LDE`].
+const DEFAULT_GPU_LDE_THRESHOLD: usize = 1 << 14;
 
 fn gpu_lde_threshold() -> usize {
     static CACHED: OnceLock<usize> = OnceLock::new();
@@ -54,6 +62,50 @@ fn gpu_lde_threshold() -> usize {
             .and_then(|s| s.parse().ok())
             .unwrap_or(DEFAULT_GPU_LDE_THRESHOLD)
     })
+}
+
+/// Minimum LDE size for the device-only envelope, decoupled from the commit
+/// threshold above. Committing on GPU and keeping the handle resident pays
+/// from small sizes (it kills the per-round re-uploads); dropping the HOST
+/// copy is a much stronger contract — every downstream dispatch must take its
+/// GPU path or the prove hard-aborts, and the gate cannot mirror kernel-side
+/// eligibility (the LOCKSTEP note below). Keep device-only to the large-table
+/// envelope where those paths are exercised; mid tables keep a host copy so a
+/// dispatch decline degrades to CPU instead of aborting.
+///
+/// That degradation covers the sites that READ the LDE — they all gate on
+/// `host_trace_empty()` and take their host arm. It does NOT cover the R4
+/// Merkle-proof gather: the host tree is root-only for every GPU-committed
+/// table (the tree stays resident from [`DEFAULT_GPU_LDE_THRESHOLD`] upward,
+/// whatever `retain_host_lde` says), so a declined `gather_proofs_dev` has
+/// nothing to fall back to and aborts regardless of the host LDE. Lowering
+/// the commit threshold therefore widens that one abort site even though it
+/// leaves this envelope alone.
+const DEFAULT_DEVICE_ONLY_MIN_LDE: usize = 1 << 19;
+
+fn gpu_device_only_threshold() -> usize {
+    static CACHED: OnceLock<usize> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("LAMBDA_VM_GPU_DEVICE_ONLY_THRESHOLD")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_DEVICE_ONLY_MIN_LDE)
+    })
+}
+
+/// Test hook: decline the device R2 path unconditionally so device-only
+/// tables exercise the [`materialize_lde_trace_host`] recovery end to end.
+pub(crate) fn gpu_force_downgrade() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var("LAMBDA_VM_GPU_FORCE_DOWNGRADE").is_ok_and(|v| v != "0"))
+}
+
+/// Diagnostic hook: recompute the R2 composition parts and the R3 OOD
+/// evaluations on host after each device dispatch and panic (naming the table
+/// and stage) on any mismatch. Localizes silent device-side corruption.
+pub(crate) fn gpu_xcheck() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var("LAMBDA_VM_GPU_XCHECK").is_ok_and(|v| v != "0"))
 }
 
 /// Serialize the SUBMISSION of the device R2 window (constraint eval +
@@ -102,6 +154,7 @@ pub fn gpu_lde_calls() -> u64 {
 pub fn reset_all_gpu_call_counters() {
     GPU_LDE_CALLS.store(0, Ordering::Relaxed);
     GPU_EXTEND_HALVES_CALLS.store(0, Ordering::Relaxed);
+    GPU_COMP_H_SLABS_CALLS.store(0, Ordering::Relaxed);
     GPU_LEAF_HASH_CALLS.store(0, Ordering::Relaxed);
     GPU_MERKLE_TREE_CALLS.store(0, Ordering::Relaxed);
     GPU_PARTS_LDE_CALLS.store(0, Ordering::Relaxed);
@@ -117,11 +170,31 @@ pub fn reset_all_gpu_call_counters() {
     GPU_DEVICE_ONLY_DOWNGRADES.store(0, Ordering::Relaxed);
     GPU_RESIDENT_AUX_RETRIES.store(0, Ordering::Relaxed);
     GPU_RESIDENT_AUX_DOWNGRADES.store(0, Ordering::Relaxed);
+    GPU_COMPOSITION_PARTS_DOWNLOADS.store(0, Ordering::Relaxed);
+    GPU_GRIND_CALLS.store(0, Ordering::Relaxed);
+}
+
+/// Successful GPU proof-of-work grind dispatches — one per table whose round-4
+/// nonce search ran on device and produced a nonce that passed the host
+/// validity check (a device miss or an invalid kernel result falls back to the
+/// CPU search and is not counted).
+pub(crate) static GPU_GRIND_CALLS: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_grind_calls() -> u64 {
+    GPU_GRIND_CALLS.load(Ordering::Relaxed)
 }
 
 pub(crate) static GPU_EXTEND_HALVES_CALLS: AtomicU64 = AtomicU64::new(0);
 pub fn gpu_extend_halves_calls() -> u64 {
     GPU_EXTEND_HALVES_CALLS.load(Ordering::Relaxed)
+}
+
+/// Device-resident num_parts==1 composition-parts dispatches: one per table
+/// whose single composition part (`H` itself) was de-interleaved into a slab
+/// [`math_cuda::lde::GpuLdeExt3`] on device instead of the host arm. Nonzero
+/// confirms the degree-1 device DEEP/FRI path engaged.
+pub(crate) static GPU_COMP_H_SLABS_CALLS: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_comp_h_slabs_calls() -> u64 {
+    GPU_COMP_H_SLABS_CALLS.load(Ordering::Relaxed)
 }
 
 /// Successful LogUp aux-build GPU dispatches (one per table that took either
@@ -240,7 +313,6 @@ pub(crate) fn device_only_disabled() -> bool {
 pub(crate) fn device_only_gate<F, E>(
     lde_size: usize,
     n: usize,
-    is_preprocessed: bool,
     offsets_contiguous: bool,
     zerofier_uniform: bool,
 ) -> bool
@@ -256,9 +328,8 @@ where
         && !device_only_disabled()
         && !gpu_composition_disabled()
         && lde_size.is_power_of_two()
-        && lde_size >= gpu_lde_threshold()
+        && lde_size >= gpu_device_only_threshold()
         && n >= gpu_bary_threshold()
-        && !is_preprocessed
         && offsets_contiguous
         && zerofier_uniform
 }
@@ -621,10 +692,34 @@ where
     Some((lde_h0, lde_h1))
 }
 
+/// Shared admission gate for the device composition-parts producers: the tower
+/// must be the Goldilocks/ext3 pair the kernels are written for, and the LDE must
+/// be a power of two at or above the commit threshold. Returns the validated LDE
+/// size so callers can derive from it. Kept in one place so a future condition
+/// (a VRAM check, a tower widening) cannot land on only one of the d=1/d=2 arms.
+fn dev_comp_parts_gate<F, E>(num_rows: usize) -> Option<usize>
+where
+    F: IsField + 'static,
+    E: IsField + 'static,
+{
+    if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
+        return None;
+    }
+    if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
+        return None;
+    }
+    if num_rows < gpu_lde_threshold() || !num_rows.is_power_of_two() {
+        return None;
+    }
+    Some(num_rows)
+}
+
 /// Fully device-resident degree-2 decomposition + half extension: takes the
 /// resident composition evals `H`, decomposes into H0/H1 on device, LDE-extends
-/// both and keeps the de-interleaved parts buffer as a `GpuLdeExt3` (commit
-/// tree, R3 OOD, R4 DEEP and openings all read the handle). With `want_host`
+/// both and keeps the de-interleaved parts buffer as a `GpuLdeExt3` (the commit
+/// tree and the R4 openings read `handle.m`; R3 and R4 DEEP read the host part
+/// Vec's length and DEEP validates the handle against it — see
+/// [`try_comp_h_to_slabs_dev`] for why the two must stay equal). With `want_host`
 /// the evaluations are also drained to host for the fallback consumers;
 /// without it (device-only) the returned part Vecs are empty placeholders.
 /// `None` → the caller downloads `H` and runs the host decompose path.
@@ -638,16 +733,7 @@ where
     F: IsField + 'static,
     E: IsField + 'static,
 {
-    if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
-        return None;
-    }
-    if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
-        return None;
-    }
-    let lde_size = h.num_rows;
-    if lde_size < gpu_lde_threshold() || !lde_size.is_power_of_two() {
-        return None;
-    }
+    let lde_size = dev_comp_parts_gate::<F, E>(h.num_rows)?;
     let n = lde_size / 2;
     if weights.len() != n || inv_2x.len() < n {
         return None;
@@ -710,6 +796,55 @@ where
     Some((vec![lde_h0, lde_h1], handle))
 }
 
+/// Fully device-resident num_parts==1 composition-parts path: `H` itself is the
+/// single part, already on the LDE coset, so — unlike [`try_comp_h_to_slabs_dev`]'s
+/// d=2 sibling [`try_decompose_extend_d2_dev`] — there is no decompose and no
+/// re-extension, only a de-interleave into the slab layout the downstream consumers
+/// read. No consumer needed changing for `m == 1`, but they do not agree on where
+/// the part count comes from, and the difference matters to anyone editing this:
+///
+/// - R2 commit and the R4 openings read `handle.m`.
+/// - R3's `z^P` exponent and R4 DEEP's gamma count read
+///   `lde_composition_poly_evaluations.len()` — the HOST part Vec's length. DEEP only
+///   *validates* the handle against it and declines on a mismatch.
+/// - FRI never sees the handle at all; it consumes the DEEP codeword.
+///
+/// So the invariant to preserve is `handle.m == lde_composition_poly_evaluations.len()`
+/// (`materialize_composition_parts_host` also requires it), not "the handle is
+/// authoritative".
+///
+/// The single part is always drained to host — not just because it can be
+/// (num_parts==1 tables are never device-only; `device_only_for`'s degree gate admits
+/// only d=2), but because that host part is what feeds the query-0
+/// composition-opening canary: release-active for `qi == 0` and guarded on a
+/// non-empty host part, it is the only *in-prove* check that the device m=1 gather is
+/// correct. It does not cover DEEP or FRI, which consume separate downstream buffers;
+/// those are covered by proof verification (`prover/tests/cuda_d1_path.rs`). Returning
+/// empty parts (`vec![Vec::new()]`, as the d=2 device-only arm does) would save the
+/// D2H and keep num_parts==1 — but silently disable that canary.
+/// `None` → the caller downloads `H` and uses it directly as the single host part.
+pub(crate) fn try_comp_h_to_slabs_dev<F, E>(
+    h: &math_cuda::constraint_interp::GpuCompH,
+) -> Option<(Vec<Vec<FieldElement<E>>>, math_cuda::lde::GpuLdeExt3)>
+where
+    F: IsField + 'static,
+    E: IsField + 'static,
+{
+    dev_comp_parts_gate::<F, E>(h.num_rows)?;
+
+    // The interleaved `H` download IS the single composition part on the LDE
+    // coset — same values the slab handle holds, just interleaved. Downloading
+    // first keeps the blocking D2H off the tail of the de-interleave launch; a
+    // later handle failure just re-drains in the caller's fallback (both values
+    // drop by RAII on any early return, in either order).
+    let host = vec![download_comp_h_to_field::<E>(h)?];
+
+    let handle = math_cuda::constraint_interp::comp_h_to_slabs(h).ok()?;
+    GPU_COMP_H_SLABS_CALLS.fetch_add(1, Ordering::Relaxed);
+
+    Some((host, handle))
+}
+
 /// D2H bridge for the fallback: download a resident `H` and lift it into
 /// field elements (the exact input the host decompose expects).
 pub(crate) fn download_comp_h_to_field<E: IsField + 'static>(
@@ -730,6 +865,7 @@ pub fn gpu_leaf_hash_calls() -> u64 {
 /// openings gather paths from the device tree via [`gather_proofs_dev`].
 pub(crate) fn try_expand_leaf_and_tree_row_major_keep<F, E, B>(
     row_major: &[FieldElement<E>],
+    predev: Option<&math_cuda::CudaSlice<u64>>,
     n: usize,
     m: usize,
     blowup_factor: usize,
@@ -770,6 +906,7 @@ where
     // `retain_host_lde=false` additionally skips the row-major D2H (device-only).
     let (handle, lde_u64) = math_cuda::lde::coset_lde_row_major_with_merkle_tree_keep(
         raw,
+        predev,
         n,
         m,
         blowup_factor,
@@ -825,16 +962,21 @@ where
 /// downstream GPU rounds.
 ///
 /// `build_precomputed=false` skips the precomputed tree (process-cache hit);
-/// the first element is then `None`.
+/// the first element is then `None`. With `want_host=false` the row-major LDE
+/// D2H is skipped and the returned Vec is empty (device-only tables: every
+/// consumer reads the handle).
 #[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn try_expand_split_trees_row_major_keep<F, E, B>(
     row_major: &[FieldElement<E>],
+    predev: Option<&math_cuda::CudaSlice<u64>>,
     n: usize,
     m: usize,
     blowup_factor: usize,
     weights: &[FieldElement<F>],
     split_col: usize,
     build_precomputed: bool,
+    want_host: bool,
 ) -> Option<(
     Option<MerkleTree<B>>,
     MerkleTree<B>,
@@ -872,12 +1014,14 @@ where
 
     let (pre_nodes, handle, lde_u64) = math_cuda::lde::coset_lde_row_major_split_trees(
         raw,
+        predev,
         n,
         m,
         blowup_factor,
         &weights_u64,
         split_col,
         build_precomputed,
+        want_host,
     )
     .ok()?;
 
@@ -1326,6 +1470,146 @@ where
     Some(apply_ext3_scalar::<E>(&sums_raw, scalar, num_cols))
 }
 
+/// Multi-eval-point variant of [`try_barycentric_base_on_handle`]: one kernel
+/// pass over the main LDE computes the OOD sums for every evaluation point at
+/// once (their inv_denom blocks are contiguous in the [`R3DevContext`] buffer),
+/// instead of re-reading the column data per point. Returns one scaled eval Vec
+/// per point, or `None` (→ per-point dispatch / CPU fallback) when the handle
+/// is absent, thresholds miss, there are more points than the kernel's
+/// accumulator cap, or the math-cuda call errs.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_barycentric_base_on_handle_multi<F, E>(
+    lde_trace: &LDETraceTable<F, E>,
+    row_stride: usize,
+    coset_points_len: usize,
+    coset_offset_pow_n: &FieldElement<F>,
+    n_inv: &FieldElement<F>,
+    g_n_inv: &FieldElement<F>,
+    z_pows: &[FieldElement<E>],
+    ctx: &R3DevContext,
+) -> Option<Vec<Vec<FieldElement<E>>>>
+where
+    F: IsField + IsSubFieldOf<E> + 'static,
+    E: IsField + 'static,
+{
+    if !is_goldilocks_ext3_tower::<F, E>() {
+        return None;
+    }
+    let k_points = z_pows.len();
+    if k_points == 0 || k_points > math_cuda::barycentric::BARY_MAX_EVAL_POINTS {
+        return None;
+    }
+    let main = lde_trace.gpu_main()?;
+    let num_cols = main.m;
+    if num_cols == 0 {
+        return Some(vec![Vec::new(); k_points]);
+    }
+    let n = coset_points_len;
+    if !n.is_power_of_two() || n < gpu_bary_threshold() {
+        return None;
+    }
+    if main.lde_size != n.checked_mul(row_stride)? {
+        return None;
+    }
+    if ctx.inv_denoms.len() < k_points * 3 * n {
+        return None;
+    }
+
+    let sums_raw = math_cuda::barycentric::barycentric_base_multi_on_device(
+        &ctx.stream,
+        main,
+        row_stride,
+        &ctx.coset_points,
+        &ctx.inv_denoms,
+        n,
+        k_points,
+    )
+    .ok()?;
+    GPU_BARY_CALLS.fetch_add(k_points as u64, Ordering::Relaxed);
+
+    Some(
+        z_pows
+            .iter()
+            .enumerate()
+            .map(|(k, z_pow_n)| {
+                let scalar = ood_ext3_scalar::<F, E>(coset_offset_pow_n, n_inv, g_n_inv, z_pow_n);
+                apply_ext3_scalar::<E>(
+                    &sums_raw[k * 3 * num_cols..(k + 1) * 3 * num_cols],
+                    scalar,
+                    num_cols,
+                )
+            })
+            .collect(),
+    )
+}
+
+/// Aux (ext3) counterpart of [`try_barycentric_base_on_handle_multi`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_barycentric_ext3_on_handle_multi<F, E>(
+    lde_trace: &LDETraceTable<F, E>,
+    row_stride: usize,
+    coset_points_len: usize,
+    coset_offset_pow_n: &FieldElement<F>,
+    n_inv: &FieldElement<F>,
+    g_n_inv: &FieldElement<F>,
+    z_pows: &[FieldElement<E>],
+    ctx: &R3DevContext,
+) -> Option<Vec<Vec<FieldElement<E>>>>
+where
+    F: IsField + IsSubFieldOf<E> + 'static,
+    E: IsField + 'static,
+{
+    if !is_goldilocks_ext3_tower::<F, E>() {
+        return None;
+    }
+    let k_points = z_pows.len();
+    if k_points == 0 || k_points > math_cuda::barycentric::BARY_MAX_EVAL_POINTS {
+        return None;
+    }
+    let aux = lde_trace.gpu_aux()?;
+    let num_cols = aux.m;
+    if num_cols == 0 {
+        return Some(vec![Vec::new(); k_points]);
+    }
+    let n = coset_points_len;
+    if !n.is_power_of_two() || n < gpu_bary_threshold() {
+        return None;
+    }
+    if aux.lde_size != n.checked_mul(row_stride)? {
+        return None;
+    }
+    if ctx.inv_denoms.len() < k_points * 3 * n {
+        return None;
+    }
+
+    let sums_raw = math_cuda::barycentric::barycentric_ext3_multi_on_device(
+        &ctx.stream,
+        aux,
+        row_stride,
+        &ctx.coset_points,
+        &ctx.inv_denoms,
+        n,
+        k_points,
+    )
+    .ok()?;
+    GPU_BARY_CALLS.fetch_add(k_points as u64, Ordering::Relaxed);
+
+    Some(
+        z_pows
+            .iter()
+            .enumerate()
+            .map(|(k, z_pow_n)| {
+                let scalar = ood_ext3_scalar::<F, E>(coset_offset_pow_n, n_inv, g_n_inv, z_pow_n);
+                apply_ext3_scalar::<E>(
+                    &sums_raw[k * 3 * num_cols..(k + 1) * 3 * num_cols],
+                    scalar,
+                    num_cols,
+                )
+            })
+            .collect(),
+    )
+}
+
 /// Ext3 counterpart of [`try_barycentric_base_on_handle`] for the aux LDE.
 /// Reads `lde_trace.gpu_aux()` (the de-interleaved 3-slab device buffer).
 #[allow(clippy::too_many_arguments)]
@@ -1464,16 +1748,19 @@ pub fn gpu_fri_calls() -> u64 {
 /// are counted here, so a single failed dispatch does not necessarily lower
 /// the total; R3's fallbacks are CPU-only, so a failure there does.
 pub(crate) static GPU_BATCH_INVERT_CALLS: AtomicU64 = AtomicU64::new(0);
-/// R2 downgrades, and only those: times a device-only table fell back to the
-/// host evaluator and had its resident LDEs downloaded into the host buffers
-/// first ([`materialize_lde_trace_host`], the sole site that bumps this).
-/// Nonzero means the device-only gate cleared a table whose R2 dispatch then
-/// declined at runtime — the table continued host-backed, correct but slower —
-/// so every count is a gate miss, and the fix is to mirror the missing
-/// condition into the gate. The R1 resident-aux downgrade is counted by
-/// [`GPU_RESIDENT_AUX_DOWNGRADES`] instead: it fires on tables the gate never
-/// marked device-only, so summing the two would blame the gate for declines it
-/// never made.
+/// Device-only trace downgrades: times a device-only table fell back to a
+/// host arm and had its resident LDEs downloaded into the host buffers first
+/// ([`materialize_lde_trace_host`], the sole function that bumps this —
+/// entered from the R2 host evaluator, the R3 barycentric arms and the R4
+/// DEEP host loop). Nonzero means the device-only gate cleared a table whose
+/// downstream dispatch then declined at runtime — the table continued
+/// host-backed, correct but slower. A count is either a gate miss (a static
+/// condition worth mirroring into the gate) or a transient device decline
+/// (VRAM pressure), which by definition cannot be gated out — see
+/// [`materialize_lde_trace_host`]'s own note. The R1 resident-aux downgrade
+/// is counted by [`GPU_RESIDENT_AUX_DOWNGRADES`] instead: it fires on tables
+/// the gate never marked device-only, so summing the two would blame the gate
+/// for declines it never made.
 pub(crate) static GPU_DEVICE_ONLY_DOWNGRADES: AtomicU64 = AtomicU64::new(0);
 pub fn gpu_device_only_downgrades() -> u64 {
     GPU_DEVICE_ONLY_DOWNGRADES.load(Ordering::Relaxed)
@@ -1491,6 +1778,18 @@ pub fn gpu_device_only_downgrades() -> u64 {
 pub(crate) static GPU_RESIDENT_AUX_DOWNGRADES: AtomicU64 = AtomicU64::new(0);
 pub fn gpu_resident_aux_downgrades() -> u64 {
     GPU_RESIDENT_AUX_DOWNGRADES.load(Ordering::Relaxed)
+}
+
+/// Times the composition-poly parts of a device-only table were downloaded
+/// from the resident R2 handle so a host consumer could run
+/// ([`download_composition_parts_host`], the sole site that bumps this). The
+/// parts-side counterpart of [`GPU_DEVICE_ONLY_DOWNGRADES`]: that one covers
+/// the trace LDEs, this one the H part evaluations whose R2 host drain was
+/// skipped, when the R2 commit, the R3 parts OOD or the R4 DEEP H terms later
+/// fall back to the host path.
+pub(crate) static GPU_COMPOSITION_PARTS_DOWNLOADS: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_composition_parts_downloads() -> u64 {
+    GPU_COMPOSITION_PARTS_DOWNLOADS.load(Ordering::Relaxed)
 }
 
 /// Times the R1 resident-aux LDE declined and the prover drained the device to
@@ -1725,6 +2024,154 @@ where
     true
 }
 
+/// Diagnostic: download a resident ext3 handle (3-slab layout) as per-column
+/// host Vecs. Used by the xcheck post-mortem to compare the committed R2
+/// parts against a host recompute.
+pub(crate) fn download_ext3_columns<E>(
+    h: &math_cuda::lde::GpuLdeExt3,
+) -> Option<Vec<Vec<FieldElement<E>>>>
+where
+    E: IsField + 'static,
+{
+    if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
+        return None;
+    }
+    let be = math_cuda::device::backend().ok()?;
+    let stream = be.next_stream();
+    h.wait_ready_on(&stream).ok()?;
+    let slabs = stream.clone_dtoh(h.buf.as_ref()).ok()?;
+    stream.synchronize().ok()?;
+    let (m, lde) = (h.m, h.lde_size);
+    if slabs.len() != m * lde * 3 {
+        return None;
+    }
+    let mut cols = Vec::with_capacity(m);
+    for c in 0..m {
+        let mut interleaved = vec![0u64; lde * 3];
+        for k in 0..3 {
+            let slab = &slabs[(c * 3 + k) * lde..(c * 3 + k + 1) * lde];
+            for r in 0..lde {
+                interleaved[r * 3 + k] = slab[r];
+            }
+        }
+        cols.push(u64_to_ext3_vec::<E>(&interleaved));
+    }
+    Some(cols)
+}
+
+/// The device's VRAM admission budget in bytes, if a CUDA backend is up.
+/// Lets callers outside this crate (the epoch builder's trace pre-upload)
+/// size their riding-ahead allocations relative to the same budget the
+/// per-table scheduler admits against.
+pub fn device_vram_budget_bytes() -> Option<u64> {
+    math_cuda::device::backend()
+        .ok()
+        .map(|be| be.vram_budget_bytes())
+}
+
+/// Parts counterpart of [`materialize_lde_trace_host`]: download the resident
+/// composition-poly parts (de-interleaved ext3 slabs, natural evaluation
+/// order) into per-part host Vecs. Serves the host consumers of the part
+/// evaluations — the R2 Merkle commit, the R3 parts OOD and the R4 DEEP H
+/// terms — when a device dispatch declines on a table whose R2 host drain was
+/// skipped (device-only). Returns `None` when the handle cannot serve the
+/// data: a non-ext3 field, a failed download or sync.
+pub(crate) fn download_composition_parts_host<E>(
+    h: &math_cuda::lde::GpuLdeExt3,
+    stream: &Arc<math_cuda::CudaStream>,
+) -> Option<Vec<Vec<FieldElement<E>>>>
+where
+    E: IsField + 'static,
+{
+    if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
+        return None;
+    }
+    h.wait_ready_on(stream).ok()?;
+    let slabs = stream.clone_dtoh(h.buf.as_ref()).ok()?;
+    stream.synchronize().ok()?;
+    let (m, lde) = (h.m, h.lde_size);
+    if slabs.len() != m * lde * 3 {
+        return None;
+    }
+    // Per part: de-interleave the 3 slabs into row-major ext3 and reinterpret
+    // the u64 buffer in place — mirroring `materialize_lde_trace_host` rather
+    // than copying again through `u64_to_ext3_vec`. The row fill is parallel;
+    // this path fires often under VRAM pressure and otherwise dominates the
+    // D2H it follows.
+    let parts = (0..m)
+        .map(|p| {
+            let mut interleaved = vec![0u64; lde * 3];
+            #[cfg(feature = "parallel")]
+            interleaved
+                .par_chunks_exact_mut(3)
+                .enumerate()
+                .for_each(|(r, dst)| {
+                    for (k, d) in dst.iter_mut().enumerate() {
+                        *d = slabs[(p * 3 + k) * lde + r];
+                    }
+                });
+            #[cfg(not(feature = "parallel"))]
+            for (r, dst) in interleaved.chunks_exact_mut(3).enumerate() {
+                for (k, d) in dst.iter_mut().enumerate() {
+                    *d = slabs[(p * 3 + k) * lde + r];
+                }
+            }
+            // SAFETY: E == Ext3 per the tower check above; FieldElement<Ext3>
+            // is [u64; 3]. `vec![0u64; lde*3]` has len == capacity == lde*3.
+            unsafe {
+                let mut v = std::mem::ManuallyDrop::new(interleaved);
+                debug_assert!(
+                    v.len().is_multiple_of(3) && v.capacity().is_multiple_of(3),
+                    "interleaved len/capacity must be a multiple of 3 for Fp3 reinterpret"
+                );
+                Vec::from_raw_parts(
+                    v.as_mut_ptr() as *mut FieldElement<E>,
+                    v.len() / 3,
+                    v.capacity() / 3,
+                )
+            }
+        })
+        .collect();
+    GPU_COMPOSITION_PARTS_DOWNLOADS.fetch_add(1, Ordering::Relaxed);
+    Some(parts)
+}
+
+/// Repopulate empty host part evaluations from the resident R2 parts handle
+/// held by `lde_trace`. Already-populated evaluations are left untouched (the
+/// R2 host drain ran, nothing is missing). Returns false only when the parts
+/// are empty and the handle cannot serve them — a missing handle or bound
+/// stream, a handle whose part count disagrees with the evaluations, or a
+/// failed download — so the caller's abort carries the device-only contract's
+/// message.
+pub(crate) fn materialize_composition_parts_host<F, E>(
+    lde_trace: &crate::trace::LDETraceTable<F, E>,
+    evals: &mut [Vec<FieldElement<E>>],
+) -> bool
+where
+    F: IsField + IsSubFieldOf<E> + 'static,
+    E: IsField + 'static,
+{
+    if evals.first().is_none_or(|p| !p.is_empty()) {
+        return true;
+    }
+    let Some(h) = lde_trace.gpu_composition_parts() else {
+        return false;
+    };
+    let Some(stream) = lde_trace.bound_stream() else {
+        return false;
+    };
+    if h.m != evals.len() {
+        return false;
+    }
+    let Some(parts) = download_composition_parts_host::<E>(h, &stream) else {
+        return false;
+    };
+    for (dst, src) in evals.iter_mut().zip(parts) {
+        *dst = src;
+    }
+    true
+}
+
 pub fn gpu_batch_invert_calls() -> u64 {
     GPU_BATCH_INVERT_CALLS.load(Ordering::Relaxed)
 }
@@ -1762,6 +2209,49 @@ pub fn fri_fold_fault_fired() -> bool {
 #[cfg(feature = "test-cuda-faults")]
 pub fn inverse_fault_fired() -> bool {
     math_cuda::inverse::FAULT_INVERSE_REMAINING_UNTIL_ERR.load(Ordering::Relaxed) < 0
+}
+
+/// Test-only: make the Nth upcoming math-cuda barycentric dispatch — and
+/// every one after it — return Err. Sticky, unlike the one-shot hooks above:
+/// the retry arms would absorb a single-shot fault before the fall-through
+/// could reach a device-only cliff site. Pass -1 to disarm (the production
+/// state). Only available with the `test-cuda-faults` feature.
+#[cfg(feature = "test-cuda-faults")]
+pub fn schedule_barycentric_fault_sticky(n_calls_until_err: i64) {
+    math_cuda::faults::FAULT_BARYCENTRIC_STICKY.store(n_calls_until_err, Ordering::Relaxed);
+}
+
+/// Test-only: whether the sticky barycentric fault reached its firing point
+/// (the countdown parks at 0 once it fires and stays there until disarmed).
+#[cfg(feature = "test-cuda-faults")]
+pub fn barycentric_fault_fired() -> bool {
+    math_cuda::faults::FAULT_BARYCENTRIC_STICKY.load(Ordering::Relaxed) == 0
+}
+
+/// Sticky counterpart of [`schedule_barycentric_fault_sticky`] for the R4
+/// DEEP composition dispatches (`deep_composition_ext3*`).
+#[cfg(feature = "test-cuda-faults")]
+pub fn schedule_deep_fault_sticky(n_calls_until_err: i64) {
+    math_cuda::faults::FAULT_DEEP_STICKY.store(n_calls_until_err, Ordering::Relaxed);
+}
+
+/// Test-only counterpart of [`barycentric_fault_fired`] for the DEEP hook.
+#[cfg(feature = "test-cuda-faults")]
+pub fn deep_fault_fired() -> bool {
+    math_cuda::faults::FAULT_DEEP_STICKY.load(Ordering::Relaxed) == 0
+}
+
+/// Sticky counterpart of [`schedule_barycentric_fault_sticky`] for the R2
+/// comp-poly tree builds (`build_comp_poly_tree_from_*`).
+#[cfg(feature = "test-cuda-faults")]
+pub fn schedule_comp_tree_fault_sticky(n_calls_until_err: i64) {
+    math_cuda::faults::FAULT_COMP_TREE_STICKY.store(n_calls_until_err, Ordering::Relaxed);
+}
+
+/// Test-only counterpart of [`barycentric_fault_fired`] for the comp-tree hook.
+#[cfg(feature = "test-cuda-faults")]
+pub fn comp_tree_fault_fired() -> bool {
+    math_cuda::faults::FAULT_COMP_TREE_STICKY.load(Ordering::Relaxed) == 0
 }
 
 /// R2 GPU dispatch: batched ext3 LDE over `parts_coefs` (composition-poly
@@ -2291,10 +2781,7 @@ where
     // SAFETY: F == Goldilocks per TypeId check; FieldElement<F> is
     // #[repr(transparent)] over u64.
     let coset_u64: &[u64] = unsafe { from_raw_parts(coset_base.as_ptr() as *const u64, n) };
-    let coset_dev = match stream.clone_htod(coset_u64) {
-        Ok(s) => s,
-        Err(_) => return None,
-    };
+    let coset_dev = coset_points_device_handle(coset_u64, stream)?;
 
     // SAFETY: E == Ext3 per TypeId check.
     let z_u64: &[u64] = unsafe { ext3_slice_to_u64::<E>(z_scalars) };
@@ -2309,6 +2796,66 @@ where
         }
         Err(_) => None,
     }
+}
+
+/// Device-resident coset point buffers, keyed by `(len, points[0], points[1])`
+/// — a geometric coset is fully determined by its length and first two terms,
+/// so the key needs no allocation pinning. R3 OOD and the R4 DEEP inv_denoms
+/// build used to re-upload the SAME domain points per table per epoch (~19 GB
+/// per 100tx prove measured); one upload per distinct coset now serves the
+/// whole process (a handful of sizes, ~2-16 MiB each, never evicted — same
+/// policy as the host-side domain caches).
+#[allow(clippy::type_complexity)]
+fn coset_points_device_cache()
+-> &'static std::sync::Mutex<std::collections::HashMap<(usize, u64, u64), Arc<CudaSlice<u64>>>> {
+    static CACHE: OnceLock<
+        std::sync::Mutex<std::collections::HashMap<(usize, u64, u64), Arc<CudaSlice<u64>>>>,
+    > = OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// Resolve a host coset-points slice to its device-resident copy, uploading
+/// once per distinct coset. The first upload synchronizes its stream so the
+/// buffer is safe to read from any other stream afterwards. Returns `None` on
+/// upload failure (→ the caller's fallback).
+fn coset_points_device_handle(
+    coset_u64: &[u64],
+    stream: &Arc<CudaStream>,
+) -> Option<Arc<CudaSlice<u64>>> {
+    if coset_u64.len() < 2 {
+        return stream.clone_htod(coset_u64).ok().map(Arc::new);
+    }
+    let key = (coset_u64.len(), coset_u64[0], coset_u64[1]);
+    if let Some(h) = coset_points_device_cache().lock().unwrap().get(&key) {
+        return Some(h.clone());
+    }
+    // The key only determines the full contents for a geometric sequence
+    // `p_i = p_0·w^i`: verify it at sampled indices so a non-coset caller
+    // trips here instead of silently aliasing another entry. Insert-only —
+    // a handful of times per process.
+    {
+        type Fp = FieldElement<GoldilocksField>;
+        let p0 = Fp::from_raw(coset_u64[0]);
+        let w = Fp::from_raw(coset_u64[1])
+            * p0.inv()
+                .expect("coset_points_device_handle: coset offset must be nonzero");
+        for i in [2usize, coset_u64.len() / 2, coset_u64.len() - 1] {
+            assert_eq!(
+                Fp::from_raw(coset_u64[i]),
+                p0 * w.pow(i as u64),
+                "coset_points_device_handle: input is not a geometric coset"
+            );
+        }
+    }
+    let buf = stream.clone_htod(coset_u64).ok()?;
+    // Settle the copy before publishing: consumers run on other streams.
+    stream.synchronize().ok()?;
+    let h = Arc::new(buf);
+    coset_points_device_cache()
+        .lock()
+        .unwrap()
+        .insert(key, h.clone());
+    Some(h)
 }
 
 /// Convenience wrapper for prover callers that don't yet own a stream:
@@ -2347,8 +2894,9 @@ where
 /// returning one [`Proof`] per position in the same order. Byte-identical to
 /// the host `MerkleTree::get_proof_by_pos` (guarded by the `merkle_gather`
 /// parity test), so R4 query openings can source proofs from the resident
-/// device tree instead of the host tree. Returns `None` on any cudarc error
-/// (the caller then falls back to the host tree).
+/// device tree instead of the host tree. Returns `None` on any cudarc error —
+/// which every caller treats as a hard abort, NOT a fallback: a resident tree
+/// leaves the host tree root-only, so there is no host path to walk.
 pub(crate) fn gather_proofs_dev(
     tree: &math_cuda::lde::GpuMerkleTree,
     positions: &[usize],
@@ -2396,7 +2944,7 @@ pub(crate) fn gather_proofs_dev(
 #[derive(Debug)]
 pub(crate) struct R3DevContext {
     pub inv_denoms: CudaSlice<u64>,
-    pub coset_points: CudaSlice<u64>,
+    pub coset_points: Arc<CudaSlice<u64>>,
     pub stream: Arc<CudaStream>,
 }
 
@@ -2442,7 +2990,7 @@ where
     // SAFETY: F == Goldilocks per TypeId check; FieldElement<F> is
     // #[repr(transparent)] over u64.
     let coset_u64: &[u64] = unsafe { from_raw_parts(coset_base.as_ptr() as *const u64, n) };
-    let coset_points = stream.clone_htod(coset_u64).ok()?;
+    let coset_points = coset_points_device_handle(coset_u64, &stream)?;
 
     // SAFETY: E == Ext3 per TypeId check.
     let z_u64: &[u64] = unsafe { ext3_slice_to_u64::<E>(z_scalars) };
@@ -2876,7 +3424,8 @@ mod split_tree_tests {
     /// isolates the tree layout/hashing under test.
     #[test]
     fn split_trees_match_cpu_subset_commits() {
-        // Above the dispatch threshold (2^19 LDE) so the GPU path must engage.
+        // This shape's LDE is 2^19, well above the dispatch threshold, so the
+        // GPU path must engage.
         let n: usize = 1 << 18;
         let blowup: usize = 2;
         let m: usize = 5;
@@ -2888,7 +3437,7 @@ mod split_tree_tests {
 
         let (pre_tree, mult_tree, handle, lde) =
             try_expand_split_trees_row_major_keep::<F, F, BatchedMerkleTreeBackend<F>>(
-                &data, n, m, blowup, &weights, split, true,
+                &data, None, n, m, blowup, &weights, split, true, true,
             )
             .expect("GPU split path must engage above the threshold");
         let pre_tree = pre_tree.expect("precomputed tree was requested");
