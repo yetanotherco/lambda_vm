@@ -35,6 +35,48 @@ fn main() {
     if cfg!(feature = "cuda") {
         println!("⚠️  built with cuda — run WITHOUT --features cuda for the FAIR CPU comparison");
     }
+    // VMPROVE=1: exercise the REAL VM API (`prove_with_inputs` + `verify`) after
+    // the batched cutover — the VM now proves/verifies with the multi-merkle-tree.
+    // This is the path a comparison-against-main harness hits. Build --features cuda.
+    if std::env::var("VMPROVE").is_ok() {
+        let t = std::time::Instant::now();
+        let vm_proof = lambda_vm_prover::prove_with_inputs(&elf, &input).expect("VM prove");
+        let dt = t.elapsed();
+        let ok = lambda_vm_prover::verify(&vm_proof, &elf).expect("VM verify");
+        println!("VMPROVE block={block}  prove={dt:?}  verify={ok}");
+        return;
+    }
+
+    // VERIFY=1: prove THEN verify a real block with the batched prover, device
+    // paths engaged (build with --features cuda). Closes the correctness loop at
+    // real-block scale (the timing/size paths only prove).
+    if std::env::var("VERIFY").is_ok() {
+        match lambda_vm_prover::prove_and_verify_batched_block(&elf, &input) {
+            Ok(true) => println!("VERIFY block={block}  batched prove->verify: PASS"),
+            Ok(false) => println!("VERIFY block={block}  batched prove->verify: FAIL (rejected)"),
+            Err(e) => println!("VERIFY block={block}  errored: {e:?}"),
+        }
+        return;
+    }
+
+    // SIZE=1: measure the serialized PROOF SIZE of both provers (the
+    // multi-merkle-tree's structural payoff — one shared auth path per query).
+    // Byte-identical on CPU or GPU, so this needs no GPU. Runs one prove each.
+    if std::env::var("SIZE").is_ok() {
+        let b = lambda_vm_prover::size_batched_prove(&elf, &input);
+        let p = lambda_vm_prover::size_per_table_prove(&elf, &input);
+        match (b, p) {
+            (Ok(b), Ok(p)) => println!(
+                "PROOF SIZE block={block}  batched={b} bytes ({:.2} MiB)  per-table={p} bytes ({:.2} MiB)  batched/per-table={:.3}",
+                b as f64 / (1u64 << 20) as f64,
+                p as f64 / (1u64 << 20) as f64,
+                b as f64 / p as f64,
+            ),
+            (b, p) => println!("PROOF SIZE failed: batched={b:?} per-table={p:?}"),
+        }
+        return;
+    }
+
     println!("=== CPU structural comparison — block={block} warmup={warmup} iters={iters} cooldown={cooldown}s ===");
     println!("(both provers on CPU; isolates the multi-merkle-tree structure vs per-table)");
 
