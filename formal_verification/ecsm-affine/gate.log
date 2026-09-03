@@ -18,12 +18,13 @@
 [READ(neg) ] P16 nothing constrains yG's parity [A3]  7 uses of cols::YG, all parity-blind (AreBytes range check (parity-blind), Ecdas seed/drain bus tuples (parity-blind), the Yg relation's yG² term — satisfied by BOTH roots, the affine yG MEMW read (the fix itself), trace fill)
 [READ(neg) ] P17 YR is not byte-checked in ecsm.rs [A2d]  ecsm.rs byte-checks ['Q0', 'Q1', 'X2', 'YG']; YR (and XR) are NOT among them ⇒ C4-YR is a contract, not a local emission
 [READ(neg) ] P20 no yG canonicality chain exists [A3g]  OverflowKind = ['XgLtP', 'KLtN', 'XrLtP', 'YrLtP']; no YgLtP ⇒ yG has no canonicality chain (A3g's subject). xG/xR/yR each do.
+[READ      ] P21 q1 width and boolean top byte [A3g]  Q1 has 33 range-checked byte columns, the Yg convolution reads 33 of them, and idx 388 makes q1(32) boolean ⇒ q1 < 2^264 with a boolean top byte, which is what admits A3g's y + p
 [READ      ] P19 the complete syscall set [A1f]  4 syscalls parsed: ECSM=MAX-10, ECSM_AFFINE=MAX-11, HINT=MAX-30, KECCAK=MAX-1
 [READ      ] P18 instruction timestamp stride [A4f]  builder stride parsed as [4] (model says 4); ECSM uses ts offsets {0} ∪ [1, 2, 3], max 3 == stride−1 ⇒ ts+3 is free and nothing spills
 
-[PROVED    ] mutation testing  20 mutations applied; every premise's check fails on its mutant
+[PROVED    ] mutation testing  21 mutations applied; every premise's check fails on its mutant
 
-TRANSCRIPTION AUDIT: 20/20 premises read from source, 20 mutation controls, 0 failures
+TRANSCRIPTION AUDIT: 21/21 premises read from source, 21 mutation controls, 0 failures
 
 === oracle_anchors ===
 [PASS ] A0 repo constants  4 constants parsed from crypto/ecsm/src/lib.rs match
@@ -62,7 +63,7 @@ q2 reduced by one. YrLtP is what excludes it.
 wrote small_y_point.json
 
 === harness (cargo) ===
-    Finished `release` profile [optimized] target(s) in 0.07s
+    Finished `release` profile [optimized] target(s) in 0.04s
 
 === a6_real_witness ===
 [PROVED      ] A6a real-witness evaluation  28 witnesses from ecsm::compute_witness{,_with_y}: oracle agreement, all four overflow chains, both convolution relations, carry windows, len_k and the ECDAS step count all re-derived
@@ -141,7 +142,7 @@ Summary:
 [SAT — FORGES] A3d control [drop the yG read]  both witnesses verify and are indistinguishable without the read ⇒ the IS_AFFINE-gated yG MEMW read is LOAD-BEARING; it is the ONLY thing pinning the input parity, and the affine ABI is what made the parity observable
 [PROVED      ] A3e imported L7 survives  20 instances: x(k·P) = x(k·(−P)) ⇒ the x-only path's conclusion is unaffected by the affine variant, and x-only rows may still leave parity free
 [PROVED      ] A3f YrLtP accepts both parities  both ±yR are canonical ⇒ YrLtP admits either ⇒ it addresses output REPRESENTATION (A2), never input parity. Two orthogonal gaps, two fixes.
-[SAT — FORGES] A3g yG canonicality is UNCHECKED  no YgLtP exists; yG = p + 1 = 0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc30 is a byte-representable non-canonical encoding of a real curve point, accepted by the AIR and rejected by the executor. All 6 facts hold. Consequence is BENIGN (same reduced point, same output) ⇒ VM-parity gap, not a forgery. Same class as A4c.
+[SAT — FORGES] A3g yG canonicality is UNCHECKED  no YgLtP exists; yG = p + 1 = 0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc30 is accepted by all 423 in-table constraints and rejected by the executor. All 13 facts hold. Margins: q1 256→257 bits with top byte 1 (idx 388 admits only 0/1), c1 window [16318, 26568] ⊂ [0, 65536); band width 2^32+977. Consequence is BENIGN (same reduced point, same output) ⇒ VM-parity gap, not a forgery. Same class as A4c.
 
 Summary:
   PROVED         A3a yG parity arithmetically free
