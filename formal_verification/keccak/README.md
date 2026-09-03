@@ -101,6 +101,29 @@ Each helper lookup is modeled by its contract, not its implementation:
    being a single bit; in ρ, `right` is a halfword and `d = ±1` fits exactly at
    saturation.
 
+   **How each cell is decided, and why not by comparing two bounds.** Dropping a
+   check does not free its column: the ByteAlu operand that reads it still
+   confines it to `[−255, 255]`, as long as the other summand is bounded
+   (`operand_summand_window`, resting on the read-once premise —
+   `combinatorics.py` sections 3 and 6; a column read *twice* would need the
+   intersection of two windows). Only with that window does the deviation `d`
+   become an integer at all, which is what `difference_form_is_exact` checks:
+   over the field `2¹⁶` is invertible, so an unbounded `right` admits a
+   full-size solution for *every* `left` and no argument about small `d` means
+   anything. With both intervals in hand, `surviving_deviation` sweeps **all
+   2¹⁶ input halfwords** against them and returns either "pinned" or the first
+   survivor — and asserts the honest pair lies inside the modelled intervals,
+   which is what catches a window modelled wrongly. The "both dropped" row is
+   the one configuration with no per-column window at all (the operand bounds
+   only the *sum* of two unchecked columns), so it is decided by an explicit
+   witness instead.
+
+   **The two implied halves are not the same kind of saving.** ρ's is 100
+   `AreBytes` sends. θ's is 20 *polynomial* constraints (`IS_BIT`, μ-gated,
+   degree 3 — the reason `KeccakRndConstraints` declares `max_degree() = 3`).
+   Neither is proposed here as an optimization; what the result bounds is the
+   ceiling: 100 of ρ's 200 sends, not 200.
+
    The model's pin is a sound *consequence* of the shipped constraints today, which is
    why the current board is meaningful; what it is not is a test that those
    constraints are still there. **The `24/24 UNSAT` verdict is conditional on the
@@ -127,8 +150,9 @@ Each helper lookup is modeled by its contract, not its implementation:
    decomposition is ambiguous. QF-BV proves the wiring given the bound; proving the
    bound *suffices* mod `p` needs an integer/field model — that is what
    `field_model.py` and the two `necessity_*.py` scripts are, and their result is the
-   table in discipline 1. Run them whenever the shift identities or their range
-   checks change.
+   table in discipline 1. `make verify-keccak` runs them, and CI runs
+   that on every PR touching this directory — so unlike the QF-BV gate they are
+   not a human obligation.
 
 4. **Independent reference.** The reference must be derived from the spec, not from
    the circuit or the repo's constant tables, then anchored to an outside
@@ -230,17 +254,30 @@ check that changed status, and nothing outside this directory records that.
 - `field_model.py` — the companion **integer-mod-`p`** model of the inline θ/ρ shift
   identities, with a switch per range check. This is the piece the next chip copies
   when its bounds are enforced by an identity rather than a lookup.
-- `combinatorics.py` — the solver-free premises the ρ result rests on: π is a
-  bijection on the lanes, all 400 byte columns are read exactly once by a pi operand,
-  the pi offsets are even, and `theta = 0xFFFF…FF` saturates every lane.
+- `combinatorics.py` — the solver-free premises the θ and ρ results rest on: π is a
+  bijection on the lanes, all 400 ρ byte columns are read exactly once by a pi
+  operand, the pi offsets are even, `theta = 0xFFFF…FF` saturates every lane, and the
+  four θ carries are a permutation of the four `rotated_C` low bytes. Exposed as
+  `premises()` and **imported** by both necessity scripts, so it cannot be skipped.
 - `necessity_theta.py`, `necessity_rho.py` — which range checks are load-bearing and
-  which are implied, per configuration, with the forged witnesses.
+  which are implied: one interval per column per configuration, decided by a complete
+  sweep over all 2¹⁶ input halfwords, plus the forged witnesses for the
+  configurations that have no per-column window.
 - `witness_fullchip.py` — the ρ forgery as a complete KECCAK_RND row from a reachable
-  message state: 0 constraint violations, every lookup matching, wrong output.
+  message state: 0 constraint violations, every lookup matching, wrong output, on
+  every saturated lane. Honest and forged rows come from one builder and the honest
+  one is required to be exactly FIPS-202, because "the output differs" is also what a
+  bug in the script itself produces.
 
 ## Running the gate
 
-z3's Python bindings are the only dependency (no cargo, no repo build):
+The solver-free half is one command, and it is the half CI runs:
+
+```
+make verify-keccak               # reference, mirror, premises, necessity, witness
+```
+
+The QF-BV gate itself needs z3's Python bindings (no cargo, no repo build):
 
 ```
 pip install z3-solver            # if not already importable
