@@ -1,0 +1,27 @@
+name: Formal verification gates
+on:
+  pull_request:
+    branches: ["**"]
+    paths: ["formal_verification/**", ".github/workflows/pr_formal_verification.yaml"]
+  push:
+    branches: ["main"]
+    paths: ["formal_verification/**"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  keccak:
+    # The solver-free scripts only. The QF-BV gate needs z3 and ~3 min; the
+    # directory README documents it as a manual step, and this job exists so
+    # that the parts which DO run unattended stop being a human obligation.
+    name: Keccak round gate (solver-free)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+      - run: make verify-keccak
