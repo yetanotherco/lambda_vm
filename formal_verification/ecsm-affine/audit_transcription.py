@@ -363,6 +363,26 @@ def p_no_yg_canonicality(s):
                 "(A3g's subject). xG/xR/yR each do.")
 
 
+def p_q1_width(s):
+    """A3g's second premise, and the margin its forgery survives on: `q1` has 33 byte
+    columns, all range-checked, and its top byte is IS_BIT-constrained (idx 388).
+
+    A non-canonical `yG = y + p` pushes `q1` from 256 to 257 bits, so its top byte becomes
+    exactly 1 — accepted only because the top byte exists and idx 388 admits {0, 1}. Narrow
+    `Q1` to 32 bytes and A3g's encoding stops being representable, i.e. the gap closes by
+    accident and A3g's verdict goes stale without anyone touching `OverflowKind`."""
+    src = _src(s, ECSM_RS)
+    checked = re.search(r"is_byte\(cols::Q1, (\d+), &mut out\);", src)
+    conv = re.search(r"byte\(cols::Q1, (\d+), j\)", src)
+    ok = (checked is not None and int(checked.group(1)) == 33
+          and conv is not None and int(conv.group(1)) == 33
+          and "//   388      : IS_BIT(q1(32))" in src
+          and "let q1_32 = b.main(0, cols::q1(32));" in src)
+    return ok, (f"Q1 has {checked.group(1) if checked else '?'} range-checked byte columns, "
+                f"the Yg convolution reads {conv.group(1) if conv else '?'} of them, and idx "
+                "388 makes q1(32) boolean ⇒ q1 < 2^264 with a boolean top byte, which is "
+                "what admits A3g's y + p")
+
 PREMISES = [
     Premise("P1 column layout", "A1/A2", "IS_AFFINE=667, YR_SUB_P=668..684, NUM_COLUMNS=684",
             p_columns,
@@ -440,6 +460,11 @@ PREMISES = [
             mutations=[(ECSM_RS, r"pub enum OverflowKind \{\n    XgLtP,",
                         "pub enum OverflowKind {\n    XgLtP,\n    YgLtP,",
                         "a yG canonicality chain appears ⇒ A3g is stale")]),
+    Premise("P21 q1 width and boolean top byte", "A3g",
+            "Q1 is 33 range-checked bytes with q1(32) IS_BIT-constrained", p_q1_width,
+            mutations=[(ECSM_RS, r"is_byte\(cols::Q1, 33, &mut out\);",
+                        "is_byte(cols::Q1, 32, &mut out);",
+                        "Q1 narrowed to 32 bytes ⇒ A3g's y+p no longer fits")]),
     Premise("P19 the complete syscall set", "A1f",
             "every u64::MAX-k syscall the Ecall bus can carry", p_all_syscall_numbers,
             mutations=[(EXEC_RS, r"pub const HINT_SYSCALL_NUMBER: u64 = u64::MAX - 30;",
