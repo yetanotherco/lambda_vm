@@ -20,7 +20,7 @@ Two earlier campaigns supply the playbook, both on unmerged branches under the g
    published multiples of `G`, 216 x-only-agreement pairs, 200 root-dependence instances, the
    executor's 8 rejections, ABI predicates over 193 offsets, 60 ecrecover-equivalence
    instances, 25 vectors against the PyPI `ecdsa` package.
-2. **Columns** — `a6_real_witness.py` over 32 witnesses from the repo's own
+2. **Columns** — `a6_real_witness.py` over the 28 witnesses (and 4 rejections) the repo's own
    `ecsm::compute_witness{,_with_y}` (`harness_dump.rs`): every field the model reads is
    re-derived, including all four overflow chains and both convolution relations.
 
@@ -56,7 +56,7 @@ Two earlier campaigns supply the playbook, both on unmerged branches under the g
 | **A3d** | **drop the `yG` read** | **SAT — FORGES** | the two A3b witnesses become indistinguishable. The read is the **only** thing pinning input parity. **LOAD-BEARING** |
 | **A3e** | the imported **L7** conclusion survives verbatim | PROVED | `x(k·P) = x(k·(−P))` over 20 instances ⇒ x-only rows may still leave parity free |
 | **A3f** | `YrLtP` is **not** a parity defence | PROVED | both `±yR` are canonical ⇒ two orthogonal gaps (input parity A3, output representation A2), two fixes |
-| **A3g** | `yG` canonicality is **UNCHECKED** | **SAT — FORGES** | no `YgLtP` in `OverflowKind`; `yG = p + 1` is a byte-representable non-canonical encoding of a real point, accepted by the AIR, rejected by the executor. Consequence BENIGN ⇒ VM-parity gap. **Medium**, Finding 8 |
+| **A3g** | `yG` canonicality is **UNCHECKED** | **SAT — FORGES** | no `YgLtP` in `OverflowKind`; the witness with `yG = p + 1` is built and **all 423 in-table constraints are evaluated on it — accepted**, and rejected by the executor. Consequence BENIGN ⇒ VM-parity gap. Survives on two margins: `q1` grows 256 → 257 bits, so its top byte is 1, the only non-zero value idx 388 admits, and the `c1` carries land at `[16318, 26568] ⊂ [0, 2^16)`. **Medium**, Finding 8 |
 | **A4a** | the `Alu` LT bound **==** the executor's `addr_limb_ok`, both modes | PROVED (z3 UNSAT ×2) | same accept set ⇒ no provable-but-halting execution, no legal execution made unprovable |
 | **A4b** | the affine `+32 + 8i` span cannot cross `2^32` | PROVED (z3 UNSAT) | 128 touched offsets, max `+63`, all `< 2^32` ⇒ reusing the high limb is safe |
 | **A4c** | the **seven-value band** the LT senders close | PROVED | exactly 7 per mode: `[2^32−31, 2^32−24)` and `[2^32−63, 2^32−56)` (Finding 2) |
@@ -65,8 +65,8 @@ Two earlier campaigns supply the playbook, both on unmerged branches under the g
 | **A4e-ctl** | **the `u64` wrap** | **SAT — FORGES** | `addr_xg = 2^64 − 64` passes `addr_limb_ok(·, 63)` and wraps the pre-fix `+64`, slipping a **total** overlap past the guard. The `u128` widening is **LOAD-BEARING** |
 | **A4f** | timestamp layout is collision-free | PROVED | `{xG, yG}@ts`, `k@ts+1`, `xR@ts+2`, `yR@ts+3`, stride 4 parsed from the builder; `xG`/`yG` share `ts` but are address-disjoint |
 | **A4g** | the mode-dependent bound is necessary in **both** directions | PROVED | a flat 64-byte bound rejects 32 legal x-only addresses; a flat 32-byte one admits 32 illegal affine ones |
-| **A5** | transcription audit | 20/20 premises READ, 20/20 mutations bite | `TRANSCRIPTION-AUDIT.md` |
-| **A6** | real-witness anchor | PROVED (+1 forgery exhibit) | 32 witnesses from `crypto/ecsm` itself; 9 ±yG pairs reproduce A3b outside the model |
+| **A5** | transcription audit | 21/21 premises READ, 21/21 mutations bite | `TRANSCRIPTION-AUDIT.md` |
+| **A6** | real-witness anchor | PROVED (+1 forgery exhibit) | 28 witnesses and 4 rejections from `crypto/ecsm` itself; 9 ±yG pairs reproduce A3b outside the model |
 
 Non-vacuity: **eight distinct attacks** (A1c-ctl, A1e, A1f, A2c-ctl, A2f/A2g, A3b/A3d, A3g,
 A4e-ctl), surfacing as **12 `SAT` lines** in `gate.log` because several are exhibited from more
@@ -170,8 +170,26 @@ authority, **C5** LogUp multiset soundness, **C6** Ecall binding, **C7** timesta
    board's own artifact (`yG = p + 1`); consequence benign, since every relation is a congruence
    mod `p`, so the computed point and output are unchanged. What is lost is VM-parity — a proof
    can attest to an ecall the executor would have halted on, exactly the class A4c measures.
-   **Medium**; the soundness theorem is corrected accordingly, and audit premise **P20** parses
-   `OverflowKind` so this cannot go stale silently.
+   **Medium**; the soundness theorem is corrected accordingly, and audit premises **P20** and
+   **P21** parse `OverflowKind` and `Q1`'s width so this cannot go stale silently.
+
+   **Instantiated, not argued.** The first version of this finding checked facts about the
+   *number* `y + p` and reported `SAT — FORGES` without evaluating a single constraint — the
+   standard this board holds A2f and A3b to, applied to itself only after the fact. It now
+   builds the witness and walks the 423. Three things that only showed up once it did:
+
+   * `q1` grows from 256 to 257 bits, so its top byte becomes **exactly 1** — the sole non-zero
+     value `IS_BIT(q1(32))` (idx 388) admits. Narrow `Q1` to 32 bytes and the encoding stops
+     being representable, closing the gap by accident (premise P21 now watches this).
+   * the `c1` carries stay inside the `+16319` window, at `[16318, 26568]` of `[0, 2^16)`.
+   * the band is narrow by construction: a non-canonical 32-byte `yG` is `y + p`, which needs
+     `y < 2^256 − p = 2^32 + 977` (A2h's number). The `y = 1` point is not a convenience, it is
+     nearly the only shape available.
+
+   And the gap is a **`k ≥ 2`** statement: at `k = 1` (`len_k = 0`) bus balance forces
+   drain = seed, so `YR = YG` and `YrLtP` bounds `yG` transitively. That is contract C4-YR's own
+   reasoning, bus-level and outside this gate, but it narrows the finding and is recorded here
+   rather than left for a reader to notice.
 
 ### The rule findings 5–8 generalise to
 
@@ -190,7 +208,7 @@ shape three times, which is enough recurrence to write down the rule rather than
 | A2c-ctl | honest witness (addend fixed) valid under `p` | rejected under `p+2` and under `N` |
 | A2g | A2f established every *other* constraint holds | the witness is accepted, guest gets `yR + p` |
 | A3d | A3c: the read's tuples differ between the two | `check_all_constraints` clean on both |
-| A3g | no constraint bounds `yG < p` | the consequence is benign (same reduced point) |
+| A3g | no constraint bounds `yG < p`, and the `y + p` witness is accepted by all 423 | the consequence is benign (same reduced point, same output) |
 | A4e-ctl | the `u128` form rejects the overlap | `addr_limb_ok` passes *and* the `u64` form accepts |
 
 **It paid for itself twice.** A1f's first implementation had an inverted sign in its modular
@@ -198,7 +216,12 @@ solve and found no foreign syscalls; half 2 alone would have reported "idx 421 R
 confident, wrong conclusion. Half 1 failed instead and surfaced the bug. A1e originally listed
 "the constraint families I believe remain" rather than walking the index map — the mirror-image
 hazard, where an over-permissive control reports a false FORGES by forgetting a constraint that
-would have blocked the state; it now enumerates all 423 and asserts the count.
+would have blocked the state; it now enumerates all 423 and asserts the count. `A3`'s
+`check_all_constraints` had the same shape and is now the same walker: every index emitted one
+at a time, `assert count == 423`, with the `AreBytes`/`IsHalfword`/`Zero` contracts reported
+separately because they are bus interactions, not part of the 423. A3b, A3d and A3g all take
+their "satisfies all 423" from it, so the count is part of the claim rather than a description
+of it.
 
 ---
 
@@ -232,8 +255,9 @@ would have blocked the state; it now enumerates all 423 and asserts the count.
 
 ```bash
 python3 -m venv .venv && ./.venv/bin/pip install z3-solver sympy ecdsa
-./run_gate.sh            # everything, transcript to gate.log
-./run_gate.sh --quick    # reuse the witness dump, skip the cargo build
+./run_gate.sh              # everything, transcript to gate.log
+./run_gate.sh --quick      # reuse the witness dump, skip the cargo build
+./run_gate.sh --check-log  # run to a temp file and fail if gate.log is stale
 ```
 
 `run_gate.sh` cds to its own directory, so it also works from the repo root. Individual stages

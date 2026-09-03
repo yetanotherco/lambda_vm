@@ -32,8 +32,8 @@ the source**, not re-derived from memory.
 whatever lemma consumes it.
 
 **negative-space** — the model relies on something being **absent**. These are the dangerous
-ones, because a reader checking the diff sees only what *is* written. Two of them here, and
-both carry real weight:
+ones, because a reader checking the diff sees only what *is* written. Three of them here, and
+all three carry real weight:
 
 - **P16 — nothing constrains `yG`'s parity.** This is A3's central premise. If any constraint
   did pin the parity, A3b's forgery would be blocked by it and A3d's "the `yG` read is
@@ -49,6 +49,10 @@ both carry real weight:
   a contract it must not silently assume. If a future commit adds `is_byte(cols::YR, 32, …)`
   the situation improves — and the audit should still notice, because RESULTS.md's contract
   list would then be stale.
+- **P20 — there is no `YgLtP`.** A3g's premise. `OverflowKind` is parsed and required to be
+  exactly `{XgLtP, KLtN, XrLtP, YrLtP}`, rather than grepped for the absent name, so a rename
+  cannot slip past. If a `yG < p` chain ever appears, the gap A3g reports is closed and the
+  audit fails, forcing the board to be re-read instead of leaving a stale finding standing.
 
 ## Mutation testing — a blind check is worse than a missing one
 
@@ -68,7 +72,7 @@ was checking documentation, not behaviour. It now parses the stride out of
 `let timestamp = (i as u64) * 4 + 4;` and compares the **parsed** value, and the mutant is
 caught.
 
-Current state: **19/19 premises read from source, 19/19 mutations bite, 0 failures.**
+Current state: **21/21 premises read from source, 21/21 mutations bite, 0 failures.**
 
 ## The premise table
 
@@ -92,6 +96,8 @@ Current state: **19/19 premises read from source, 19/19 mutations bite, 0 failur
 | **P16** | **A3** | **negative space:** every `cols::YG` use is parity-blind | `ecsm.rs`, all 7 sites | an unrecognised `cols::YG` use appears |
 | **P17** | **A2d** | **negative space:** `YR` is not in `ecsm.rs`'s `is_byte` list ⇒ C4-YR is inherited | `ecsm.rs` | `YR` gains a local byte check |
 | **P19** | **A1f** | **the COMPLETE syscall set** — every `u64::MAX − k` the `Ecall` bus can carry, parsed from source. A1f's conclusion is about which foreign syscalls the linear syscall word reaches, so a fifth syscall changes the answer | `execution.rs` | `HINT` renumbered `MAX-30 → MAX-40` |
+| **P20** | **A3g** | **negative space:** `OverflowKind` is exactly `{XgLtP, KLtN, XrLtP, YrLtP}` — no `yG` canonicality chain exists, which is the gap A3g exhibits | `ecsm.rs` `OverflowKind` | a `YgLtP` variant appears |
+| P21 | A3g | `Q1` is 33 range-checked byte columns and `q1(32)` is IS_BIT-constrained — the margin A3g's `y + p` encoding survives on (`q1` grows to 257 bits, top byte 1) | `ecsm.rs:623`, idx 388 | `is_byte(cols::Q1, 33, …)` narrowed to 32 |
 | P18 | A4f | one instruction consumes 4 sub-timestamps; ECSM uses offsets `{0,1,2,3}`, max `== stride−1` | `trace_builder.rs:348`, `ecsm.rs` `ts_lo_plus` | stride `4 → 3` |
 
 ## What the audit does NOT cover

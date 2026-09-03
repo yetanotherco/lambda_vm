@@ -44,17 +44,17 @@ audit premises (changed) and the drop-the-constraint controls A1e, A1f, A2g, A3d
 soundness theorem.
 
 ```
-audit:   20/20 premises read from source, 20/20 mutation controls bite, 0 failures
+audit:   21/21 premises read from source, 21/21 mutation controls bite, 0 failures
 oracle:  ORACLE STATUS: VALIDATED   (9 pass, 0 skip, 0 fail)
-anchor:  32 real witnesses from ecsm::compute_witness{,_with_y}, every field re-derived
+anchor:  28 real witnesses + 4 rejections from ecsm::compute_witness{,_with_y}
 A1 selector    : IS_BIT + µ-gating PROVED, Ecall pinning PROVED, 3 forgery controls
 A2 YrLtP       : lift + strict chain PROVED, forgery instantiated on a real y = 1 point
 A3 parity      : forgery instantiated (2 full witnesses), the yG read PROVED to close it
-A3g            : yG canonicality is UNCHECKED in spec AND impl — Medium, VM-parity gap
+A3g            : yG canonicality is UNCHECKED — forgery instantiated, Medium, VM-parity gap
 A4 addressing   : LT bound == executor's predicate PROVED, u64-wrap control FORGES
 ```
 
-Seven distinct attacks (11 `SAT` results; several are exhibited from more than one
+Eight distinct attacks (12 `SAT` results; several are exhibited from more than one
 angle). **Every new check in PR #879 has a control showing it is
 load-bearing** — the `yG` read, `YrLtP`, `IS_AFFINE`'s bit constraint and its µ-gate, the
 `Alu` LT senders and the `u128` widening each admit a concrete attack when removed.
@@ -133,6 +133,7 @@ in-table constraint set on each, and shows both are valid with the same `xR` and
 python3 -m venv .venv && ./.venv/bin/pip install z3-solver sympy ecdsa
 ./run_gate.sh                 # everything, transcript to gate.log
 ./run_gate.sh --quick         # reuse the witness dump, skip the cargo build
+./run_gate.sh --check-log     # run to a temp file and fail if gate.log is stale
 ```
 
 A few seconds plus one `cargo build`. The harness depends only on `crypto/ecsm`, deliberately:
@@ -142,7 +143,7 @@ back to `python3` from `PATH`.
 Committing is a plain `git add formal_verification/ecsm-affine` — no `-f`, no pathspecs. That
 is the practical reason this directory is not under `thoughts/`: `-f` would be required
 there, and **`-f` overrides the nested `.gitignore` too**, so it stages `.venv/` and
-`target/` as well (5108 files instead of 28). Outside an ignored parent, the nested
+`target/` as well (5108 files instead of 20). Outside an ignored parent, the nested
 `.gitignore` below does its job:
 
 ```
@@ -154,7 +155,7 @@ So **keep `.gitignore`** — it is what excludes the venv and the build output. 
 before committing:
 
 ```bash
-git add -n formal_verification/ecsm-affine | wc -l    # ~28, not 5108
+git add -n formal_verification/ecsm-affine | wc -l    # 20, not 5108
 ```
 
 `ecdsa` is optional — without it the oracle reports `PARTIALLY VALIDATED` and **names the
