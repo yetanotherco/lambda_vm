@@ -485,6 +485,223 @@ fn dma_maximum_chunk_has_no_tail_row() {
     assert!(rows.last().expect("terminal").end);
 }
 
+/// The oracle's full per-row column expansion, the companion to
+/// [`CANONICAL_ROWS`].
+///
+/// `canonical_dma_rows.txt` carries GEOMETRY only (`src|dst|count|tail|width`),
+/// which is all [`dma_trace_matches_oracle_row_decomposition`] needs — it tests
+/// the row *split*. This file carries every committed column of every row, which
+/// is what pins the other half: the formatter.
+const CANONICAL_COLUMNS: &str =
+    include_str!("../../../formal_verification/dma/canonical_dma_vectors.json");
+
+/// One named group of limb columns, compared against the oracle's expansion.
+fn assert_limbs(
+    row: &[FE],
+    columns: &[usize],
+    expected: &serde_json::Value,
+    what: &str,
+    ctx: &str,
+) {
+    let expected = expected
+        .as_array()
+        .unwrap_or_else(|| panic!("{ctx}: oracle field {what} is not a list"));
+    assert_eq!(
+        columns.len(),
+        expected.len(),
+        "{ctx}: {what} has {} columns but the oracle gives {} limbs",
+        columns.len(),
+        expected.len()
+    );
+    for (i, (&column, want)) in columns.iter().zip(expected).enumerate() {
+        let want = want
+            .as_u64()
+            .unwrap_or_else(|| panic!("{ctx}: {what} limb {i} is not an integer"));
+        assert_eq!(
+            row[column],
+            FE::from(want),
+            "{ctx}: {what} limb {i} disagrees with the oracle"
+        );
+    }
+}
+
+/// `generate_dma_trace` writes the columns the oracle says it must.
+///
+/// This is the formatter's only oracle-driven test. The row-decomposition test
+/// above deliberately avoids `generate_dma_trace` because that function proves
+/// nothing about the *split* — but the converse hole was left open: every other
+/// test of the formatter (`dma_trace_uses_eight_byte_rows_then_a_byte_tail` and
+/// friends) hand-writes its expectations, e.g. `FE::from(0x1008u64)`, so a wrong
+/// packing rule would have to be typed into the test to be caught.
+///
+/// What makes this non-vacuous, and non-circular: the fixture's row records and
+/// its `columns` records are SEPARATE fields. The row fields are the inputs
+/// (`src`, `dst`, `count`, `first`, `end`, `value`); the `columns` field is what
+/// `dma_ref.row_columns` independently derives in Python. So the comparison
+/// exercises exactly the derivation the inputs do not contain:
+///
+/// - `src + width` and `dst + width`, and which column each limb lands in,
+/// - `count - width` with wrapping — the terminal row is `0 - 1`, i.e. all four
+///   halves are 0xFFFF, which no geometry fixture can express,
+/// - `tail = count < 8`, derived here and asserted there,
+/// - `mu = 1` on data rows and `mu = 0` on padding.
+///
+/// It does NOT pin the limb packing, and cannot with this fixture: every
+/// address the ten canonical vectors use is below 2^16 (the largest is 12292),
+/// so `set_dword_hl` (four 16-bit halves) and `set_dword_wl` (two 32-bit words)
+/// write byte-identical columns — `[v, 0, 0, 0]` either way. I verified this by
+/// mutation: swapping the two on `SRC_INCR_0` leaves this test green. Nothing
+/// else in the campaign covers it either, since the z3 gate takes its expected
+/// columns from the same `row_columns`. Closing it needs an oracle vector whose
+/// addresses cross 2^16 and 2^32 — a case in `test_ref.py`'s `CANONICAL_CASES`,
+/// not a change here.
+///
+/// Acceptance criterion for any future change: each of these must fail this
+/// test — `src + width` -> `src + 8` (ignoring the tail's width), `count -
+/// width` -> `count - 1`, `count < 8` -> `count <= 8`, src/dst swapped, the
+/// value lanes shifted by one, and `mu = 1` on a padding row. All six are
+/// verified caught.
+#[test]
+fn dma_trace_columns_match_the_oracle() {
+    let vectors: serde_json::Value =
+        serde_json::from_str(CANONICAL_COLUMNS).expect("canonical vectors are not valid JSON");
+    let vectors = vectors
+        .as_array()
+        .expect("the fixture is a list of vectors");
+    assert_eq!(vectors.len(), 10, "expected all ten canonical vectors");
+
+    // Derived from the fixture's own lengths by the greedy rule, plus one
+    // terminal row each -- not a hand-typed total.
+    let expected_rows: usize = vectors
+        .iter()
+        .map(|v| {
+            let n = v["count"].as_u64().expect("vector count") as usize;
+            n / 8 + n % 8 + 1
+        })
+        .sum();
+
+    let mut checked = 0usize;
+    for vector in vectors {
+        let name = vector["name"].as_str().expect("vector name");
+        let timestamp = vector["timestamp"].as_u64().expect("vector timestamp");
+        let rows = vector["rows"].as_array().expect("vector rows");
+
+        let ops: Vec<DmaOperation> = rows
+            .iter()
+            .map(|r| {
+                let mut value = [0u8; 8];
+                for (lane, byte) in value.iter_mut().zip(r["value"].as_array().expect("value")) {
+                    *lane = byte.as_u64().expect("value byte") as u8;
+                }
+                DmaOperation {
+                    timestamp,
+                    src: r["src"].as_u64().expect("row src"),
+                    dst: r["dst"].as_u64().expect("row dst"),
+                    count: r["count"].as_u64().expect("row count"),
+                    first: r["first"].as_bool().expect("row first"),
+                    end: r["end"].as_bool().expect("row end"),
+                    value,
+                }
+            })
+            .collect();
+
+        let trace = generate_dma_trace(&ops);
+
+        for (i, r) in rows.iter().enumerate() {
+            let got = trace.main_table.get_row(i);
+            let want = &r["columns"];
+            let ctx = format!("{name}: row {i}");
+
+            assert_limbs(
+                got,
+                &[cols::TIMESTAMP_0, cols::TIMESTAMP_1],
+                &want["timestamp"],
+                "timestamp",
+                &ctx,
+            );
+            assert_limbs(got, &[cols::SRC_0, cols::SRC_1], &want["src"], "src", &ctx);
+            assert_limbs(got, &[cols::DST_0, cols::DST_1], &want["dst"], "dst", &ctx);
+            assert_limbs(
+                got,
+                &[cols::COUNT_0, cols::COUNT_1],
+                &want["count"],
+                "count",
+                &ctx,
+            );
+            assert_limbs(
+                got,
+                &[
+                    cols::SRC_INCR_0,
+                    cols::SRC_INCR_1,
+                    cols::SRC_INCR_2,
+                    cols::SRC_INCR_3,
+                ],
+                &want["src_incr"],
+                "src_incr",
+                &ctx,
+            );
+            assert_limbs(
+                got,
+                &[
+                    cols::DST_INCR_0,
+                    cols::DST_INCR_1,
+                    cols::DST_INCR_2,
+                    cols::DST_INCR_3,
+                ],
+                &want["dst_incr"],
+                "dst_incr",
+                &ctx,
+            );
+            assert_limbs(
+                got,
+                &[
+                    cols::COUNT_DECR_0,
+                    cols::COUNT_DECR_1,
+                    cols::COUNT_DECR_2,
+                    cols::COUNT_DECR_3,
+                ],
+                &want["count_decr"],
+                "count_decr",
+                &ctx,
+            );
+            assert_limbs(got, &cols::VALUE, &want["value"], "value", &ctx);
+
+            for (what, column) in [
+                ("first", cols::FIRST),
+                ("end", cols::END),
+                ("tail", cols::TAIL),
+                ("mu", cols::MU),
+            ] {
+                let flag = want[what].as_u64().unwrap_or_else(|| {
+                    panic!("{ctx}: oracle field {what} is not an integer");
+                });
+                assert_eq!(
+                    got[column],
+                    FE::from(flag),
+                    "{ctx}: {what} disagrees with the oracle"
+                );
+            }
+            checked += 1;
+        }
+
+        // Padding rows carry no memory operation. The oracle does not emit the
+        // padding pattern, so this asserts only the property the AIR turns on
+        // rather than restating `generate_dma_trace`'s own constants back at it.
+        for row_idx in rows.len()..trace.num_rows() {
+            assert_eq!(
+                trace.main_table.get_row(row_idx)[cols::MU],
+                FE::zero(),
+                "{name}: padding row {row_idx} must have mu = 0"
+            );
+        }
+    }
+
+    assert_eq!(
+        checked, expected_rows,
+        "every row of every vector must be checked"
+    );
+}
+
 #[test]
 fn dma_constraints_count_and_indices() {
     use crate::tables::dma::DmaConstraints;

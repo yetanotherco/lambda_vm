@@ -838,6 +838,7 @@ dependencies = [
  "math-cuda",
  "rayon",
  "rkyv",
+ "serde_json",
  "stark",
  "sysinfo",
  "tikv-jemalloc-ctl",
