@@ -162,11 +162,16 @@ memmove:
 //
 // Here rather than in `syscalls.rs` for the same reason as `memcpy` above.
 //
-// Same shape as `memcpy`: a strong assembly symbol that splits the fill into
-// bounded DMA ecalls. `a1` carries the fill byte rather than a source address,
-// so it is NOT advanced across chunks. The `andi` keeps only the low byte — C's
-// `memset` takes an `int` but writes `(unsigned char)c`, and the executor
-// rejects a wider value so the AIR can prove the byte bound.
+// memset is expressed as a *propagating* memmove, so it needs no accelerator of its
+// own: the stub seeds the first eight bytes with an ordinary store and then calls the
+// copy accelerator with `dst = seed_end`, `src = seed_start`. The chip runs that call
+// with the read/write timestamp order inverted — it writes at T+1 and reads at T+2 —
+// so every step observes the previous step's write and the seed propagates across the
+// range. The ecall number is what selects the order; the guest never chooses it.
+//
+// `a1` therefore carries a source address here, not the fill byte. Fills shorter than
+// sixteen bytes take a plain store loop: they cannot amortise the seed, and below eight
+// bytes there is nothing left to propagate.
 // ---------------------------------------------------------------------------
 
 global_asm!(
@@ -178,8 +183,21 @@ global_asm!(
 memset:
     mv t0, a0
     andi a1, a1, 255
-    mv t1, a2
-    beqz t1, .Ldma_memset_done
+    beqz a2, .Ldma_memset_done
+    li t2, 16
+    bltu a2, t2, .Ldma_memset_bytewise
+    // Broadcast the fill byte across a doubleword and seed the first eight bytes.
+    slli t3, a1, 8
+    or   t3, t3, a1
+    slli t4, t3, 16
+    or   t3, t3, t4
+    slli t4, t3, 32
+    or   t3, t3, t4
+    sd   t3, 0(a0)
+    mv   t1, a2
+    addi t1, t1, -8
+    mv   a1, a0
+    addi a0, a0, 8
 .Ldma_memset_loop:
     li a2, {max_bytes}
     bgeu t1, a2, .Ldma_memset_call
@@ -189,7 +207,16 @@ memset:
     ecall
     sub t1, t1, a2
     add a0, a0, a2
+    add a1, a1, a2
     bnez t1, .Ldma_memset_loop
+    j .Ldma_memset_done
+.Ldma_memset_bytewise:
+    mv t1, a2
+.Ldma_memset_byte_loop:
+    sb a1, 0(a0)
+    addi a0, a0, 1
+    addi t1, t1, -1
+    bnez t1, .Ldma_memset_byte_loop
 .Ldma_memset_done:
     mv a0, t0
     ret

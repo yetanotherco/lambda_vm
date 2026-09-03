@@ -1399,39 +1399,9 @@ fn test_prove_dma_memcpy_forged_wide_tail_rejected() {
     assert_dma_forgery_rejected(&elf, &mut traces, "TAIL must equal count < 8");
 }
 
-/// Soundness: the seven high lanes of a wide DMA_SET write cannot carry a byte
-/// other than `fill`. `fill_wide` has no counterpart in the memcpy table — it is
-/// the column that lets one write tuple serve both widths — so it is the one
-/// piece of this AIR with no already-tested ancestor.
-#[test]
-fn test_prove_dma_memset_forged_fill_wide_rejected() {
-    use crate::tables::dma_set::cols as dma_set_cols;
-
-    let (elf, mut traces) = dma_memset_fixture();
-    let forged_row = dma_set_row_matching(&traces, |_first, end, tail| !end && !tail);
-    let original = *traces
-        .dma_set
-        .main_table
-        .get(forged_row, dma_set_cols::FILL_WIDE);
-    traces.dma_set.main_table.set(
-        forged_row,
-        dma_set_cols::FILL_WIDE,
-        original + FieldElement::<GoldilocksField>::one(),
-    );
-
-    assert_dma_forgery_rejected(
-        &elf,
-        &mut traces,
-        "lanes 1..7 of a wide fill must carry the same byte as lane 0",
-    );
-}
-
-/// Soundness: `fill` rides the DmaSetNext chain, so an intermediate row cannot
-/// switch to a different byte mid-fill. This is the anchor that makes one
-/// register read on the first row bind every subsequent write.
 #[test]
 fn test_prove_dma_memset_forged_intermediate_fill_rejected() {
-    use crate::tables::dma_set::cols as dma_set_cols;
+    use crate::tables::memmove::cols as dma_set_cols;
 
     let (elf, mut traces) = dma_memset_fixture();
     // `!tail` matters: on a one-byte row `fill_wide` must stay zero, so shifting
@@ -1440,9 +1410,9 @@ fn test_prove_dma_memset_forged_intermediate_fill_rejected() {
     let forged_row = dma_set_row_matching(&traces, |first, end, tail| !first && !end && !tail);
     // Shift both lanes so the row stays internally consistent (constraint 10
     // still holds); only the chain token and the MEMW write disagree.
-    for column in [dma_set_cols::FILL, dma_set_cols::FILL_WIDE] {
-        let original = *traces.dma_set.main_table.get(forged_row, column);
-        traces.dma_set.main_table.set(
+    for column in [dma_set_cols::VALUE[0], dma_set_cols::VALUE[1]] {
+        let original = *traces.memmove.main_table.get(forged_row, column);
+        traces.memmove.main_table.set(
             forged_row,
             column,
             original + FieldElement::<GoldilocksField>::one(),
@@ -1458,12 +1428,12 @@ fn test_prove_dma_memset_forged_intermediate_fill_rejected() {
 
 #[test]
 fn test_prove_dma_memset_forged_early_end_rejected() {
-    use crate::tables::dma_set::cols as dma_set_cols;
+    use crate::tables::memmove::cols as dma_set_cols;
 
     let (elf, mut traces) = dma_memset_fixture();
     let forged_row = dma_set_row_matching(&traces, |_first, end, _tail| !end);
     traces
-        .dma_set
+        .memmove
         .main_table
         .set(forged_row, dma_set_cols::END, FieldElement::one());
 
@@ -1476,12 +1446,12 @@ fn test_prove_dma_memset_forged_early_end_rejected() {
 /// negative coverage here, the same gap the memcpy sibling has.
 #[test]
 fn test_prove_dma_memset_forged_wide_tail_rejected() {
-    use crate::tables::dma_set::cols as dma_set_cols;
+    use crate::tables::memmove::cols as dma_set_cols;
 
     let (elf, mut traces) = dma_memset_fixture();
     let forged_row = dma_set_row_matching(&traces, |_first, end, tail| !end && !tail);
     traces
-        .dma_set
+        .memmove
         .main_table
         .set(forged_row, dma_set_cols::TAIL, FieldElement::one());
 
@@ -1491,34 +1461,32 @@ fn test_prove_dma_memset_forged_wide_tail_rejected() {
 /// Soundness: a one-byte row must not broadcast its fill into lanes 1..7. This
 /// is the direction that matters — it is an eight-byte write where a single byte
 /// was authorised. The wide-row test above covers the opposite, harmless case.
+/// Soundness: the timestamp order is what makes a memset a memset. Clearing `IS_SET`
+/// on a chain turns the row back into an ordinary snapshot copy, which reads at `T+1`
+/// instead of `T+2` — so the read no longer observes the previous row's write and the
+/// MEMW tuples stop matching the memory the executor produced. This is the one piece of
+/// the unified chip with no ancestor in either of the tables it replaces.
 #[test]
-fn test_prove_dma_memset_forged_tail_fill_wide_rejected() {
-    use crate::tables::dma_set::cols as dma_set_cols;
+fn test_prove_dma_memset_forged_order_bit_rejected() {
+    use crate::tables::memmove::cols as mm_cols;
 
     let (elf, mut traces) = dma_memset_fixture();
-    let forged_row = dma_set_row_matching(&traces, |_first, end, tail| !end && tail);
-    let fill = *traces
-        .dma_set
-        .main_table
-        .get(forged_row, dma_set_cols::FILL);
+    let forged_row = dma_set_row_matching(&traces, |_first, end, _tail| !end);
     traces
-        .dma_set
+        .memmove
         .main_table
-        .set(forged_row, dma_set_cols::FILL_WIDE, fill);
+        .set(forged_row, mm_cols::IS_SET, FieldElement::zero());
 
     assert_dma_forgery_rejected(
         &elf,
         &mut traces,
-        "a one-byte row must not widen its write to eight lanes",
+        "clearing the order bit must break the propagation the fill depends on",
     );
 }
 
-/// Soundness: the destination chain. The memcpy suite tampers `src`/`src_incr`
-/// together; this is the memset analogue, and without it no test moves an
-/// address at all.
 #[test]
 fn test_prove_dma_memset_forged_intermediate_destination_rejected() {
-    use crate::tables::dma_set::cols as dma_set_cols;
+    use crate::tables::memmove::cols as dma_set_cols;
 
     let (elf, mut traces) = dma_memset_fixture();
     let forged_row = dma_set_row_matching(&traces, |first, end, tail| !first && !end && !tail);
@@ -1527,7 +1495,7 @@ fn test_prove_dma_memset_forged_intermediate_destination_rejected() {
     // The row's ADD stays valid; the predecessor's DmaSetNext tuple and the
     // memory write no longer match.
     for column in [dma_set_cols::DST_0, dma_set_cols::DST_INCR_0] {
-        let original = *traces.dma_set.main_table.get(forged_row, column);
+        let original = *traces.memmove.main_table.get(forged_row, column);
         traces
             .dma_set
             .main_table
@@ -1560,21 +1528,17 @@ fn dma_memset_fixture() -> (Elf, Traces) {
 }
 
 fn dma_set_row_matching(traces: &Traces, predicate: impl Fn(bool, bool, bool) -> bool) -> usize {
-    use crate::tables::dma_set::cols as dma_set_cols;
+    use crate::tables::memmove::cols as mm_cols;
 
-    (0..traces.dma_set.num_rows())
+    let one = FieldElement::<GoldilocksField>::one();
+    (0..traces.memmove.num_rows())
         .find(|&row| {
-            let active = *traces.dma_set.main_table.get(row, dma_set_cols::MU)
-                == FieldElement::<GoldilocksField>::one();
-            let first = *traces.dma_set.main_table.get(row, dma_set_cols::FIRST)
-                == FieldElement::<GoldilocksField>::one();
-            let end = *traces.dma_set.main_table.get(row, dma_set_cols::END)
-                == FieldElement::<GoldilocksField>::one();
-            let tail = *traces.dma_set.main_table.get(row, dma_set_cols::TAIL)
-                == FieldElement::<GoldilocksField>::one();
-            active && predicate(first, end, tail)
+            let get = |column| *traces.memmove.main_table.get(row, column) == one;
+            get(mm_cols::MU)
+                && get(mm_cols::IS_SET)
+                && predicate(get(mm_cols::FIRST), get(mm_cols::END), get(mm_cols::TAIL))
         })
-        .expect("guest must contain the requested real DMA_SET row")
+        .expect("guest must contain the requested real memset row")
 }
 
 fn dma_memcpy_fixture() -> (Elf, Traces) {

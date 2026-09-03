@@ -569,7 +569,7 @@ fn collect_ops_from_cpu(
     let mut ecsm_ops = Vec::new();
     let mut ecdas_ops = Vec::new();
     let dma_ops: Vec<dma::DmaOperation> = Vec::new();
-    let mut dma_set_ops = Vec::new();
+    let dma_set_ops: Vec<dma_set::DmaSetOperation> = Vec::new();
     let mut memmove_ops: Vec<memmove::MemmoveOperation> = Vec::new();
     let mut hint_ops = Vec::new();
     // Seed from the carried x254 (0 for a monolithic run or the first epoch) so a
@@ -707,9 +707,31 @@ fn collect_ops_from_cpu(
         // at T+1. There is no source phase — every byte written is the same
         // constant, so no snapshot is needed and overlap cannot arise.
         if op.ecall_dma_memset {
-            let (memset_memw, rows) = collect_dma_memset_ops(op, memory_state, register_state);
+            // memset is a memmove call whose only distinguishing feature is the
+            // inverted timestamp order; the stub already seeded the first eight
+            // bytes and passed dst = seed_end, src = seed_start, count = n - 8.
+            let dst = register_state.read(10).0;
+            let src = register_state.read(11).0;
+            let count = register_state.read(12).0;
+            for (reg, value) in [(10u8, dst), (11u8, src), (12u8, count)] {
+                let packed = pack_register_value(value);
+                let (_old_value, old_ts) = register_state.read(reg);
+                memw.extend_ops(vec![
+                    MemwOperation::new(true, 2 * reg as u64, packed, op.timestamp, 2, true)
+                        .with_old(packed, [old_ts, old_ts, 0, 0, 0, 0, 0, 0]),
+                ]);
+                register_state.write(reg, value, op.timestamp);
+            }
+            let (memset_memw, rows) = collect_memmove_ops(
+                memmove::Functionality::Set,
+                op.timestamp,
+                src,
+                dst,
+                count,
+                memory_state,
+            );
             memw.extend_ops(memset_memw);
-            dma_set_ops.extend(rows);
+            memmove_ops.extend(rows);
         }
 
         // Collect Hint ecall operations (the 32-byte output write).
@@ -1165,100 +1187,6 @@ pub fn memmove_row_width_for_test(destination_addr: u64, remaining: u64) -> u8 {
 ///
 /// Register operands are read at `T`; every destination chunk is written at
 /// `T+1`. Chunks are eight bytes while `remaining >= 8`, then one byte per tail
-/// row, matching the row schedule the DMA_SET AIR pins through the LT table.
-fn collect_dma_memset_ops(
-    op: &CpuOperation,
-    memory_state: &mut MemoryState,
-    register_state: &mut RegisterState,
-) -> (Vec<MemwOperation>, Vec<dma_set::DmaSetOperation>) {
-    let t = op.timestamp;
-    let dst = register_state.read(10).0;
-    let fill = register_state.read(11).0;
-    let count = register_state.read(12).0;
-    assert!(
-        count <= dma_set::DMA_MEMSET_MAX_BYTES,
-        "successful DMA memset ecall must respect the per-call chunk bound"
-    );
-    assert!(
-        fill <= dma_set::DMA_MEMSET_MAX_FILL,
-        "successful DMA memset ecall must carry a byte-sized fill"
-    );
-    let fill_byte = fill as u8;
-
-    let data_rows = count / 8 + count % 8;
-    let capacity = usize::try_from(data_rows)
-        .ok()
-        .and_then(|n| n.checked_add(3))
-        .expect("successful DMA memset execution must fit host address space");
-    let mut memw_ops = Vec::with_capacity(capacity);
-
-    // Bind the ecall's three argument registers to the first DMA_SET row.
-    for (reg, value) in [(10u8, dst), (11u8, fill), (12u8, count)] {
-        let packed = pack_register_value(value);
-        let (_old_value, old_ts) = register_state.read(reg);
-        memw_ops.push(
-            MemwOperation::new(true, 2 * reg as u64, packed, t, 2, true)
-                .with_old(packed, [old_ts, old_ts, 0, 0, 0, 0, 0, 0]),
-        );
-        register_state.write(reg, value, t);
-    }
-
-    let rows_capacity = usize::try_from(data_rows + 1)
-        .expect("successful DMA memset execution must fit host address space");
-    let mut rows = Vec::with_capacity(rows_capacity);
-    let mut offset = 0u64;
-    let mut remaining = count;
-    let mut first = true;
-
-    while remaining != 0 {
-        let width = if remaining >= 8 { 8u8 } else { 1u8 };
-        let destination_addr = dst
-            .checked_add(offset)
-            .expect("DMA memset range was validated by executor");
-        // Only the lanes actually written carry the fill; the rest stay zero so
-        // this matches the AIR, which sends `fill` in lane 0 and `fill_wide`
-        // (zero on one-byte tail rows) in lanes 1..7.
-        let mut value = [0u32; 8];
-        for lane in value.iter_mut().take(width as usize) {
-            *lane = fill_byte as u32;
-        }
-        let (old_values, old_timestamps) =
-            memory_state.read_bytes(destination_addr, width as usize);
-        memw_ops.push(
-            MemwOperation::new(false, destination_addr, value, t + 1, width, false)
-                .with_old(old_values, old_timestamps),
-        );
-        let dword = u64::from_le_bytes([fill_byte; 8]);
-        memory_state.write_bytes(destination_addr, dword, width as usize, t + 1);
-
-        rows.push(dma_set::DmaSetOperation {
-            timestamp: t,
-            dst: destination_addr,
-            count: remaining,
-            fill: fill_byte,
-            first,
-            end: false,
-        });
-
-        first = false;
-        offset += u64::from(width);
-        remaining -= width as u64;
-    }
-
-    rows.push(dma_set::DmaSetOperation {
-        timestamp: t,
-        dst: dst
-            .checked_add(count)
-            .expect("DMA memset range was validated by executor"),
-        count: 0,
-        fill: fill_byte,
-        first,
-        end: true,
-    });
-
-    (memw_ops, rows)
-}
-
 /// Sizing-pass replay of one bounded DMA ecall.
 ///
 /// This mirrors [`collect_dma_memcpy_ops`] but counts rows and routes each

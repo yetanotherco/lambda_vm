@@ -651,26 +651,28 @@ impl Instruction {
                         dst_val = n;
                     }
                     SyscallNumbers::DmaMemset => {
-                        // memset(dst = x10, fill = x11, n = x12). No source range
-                        // to snapshot: every byte written is the same constant, so
-                        // the DMA_SET trace carries one fill column instead of the
-                        // eight value columns memcpy needs.
+                        // memset(dst = x10, src = x11, n = x12) — a *propagating* copy,
+                        // not a fill. The stub seeds the first eight bytes with an
+                        // ordinary store and calls with `dst = seed_end`,
+                        // `src = seed_start`, so this is a plain overlapping memmove
+                        // and only the timestamp order distinguishes it: the accelerator
+                        // writes at T+1 and reads at T+2, so each step observes the
+                        // previous step's write and the seed propagates across the range.
+                        // A forward byte walk is exactly that semantics.
                         let dst = registers.read(10)?;
-                        let fill = registers.read(11)?;
+                        let src = registers.read(11)?;
                         let n = registers.read(12)?;
                         if n > DMA_MEMCPY_MAX_BYTES {
                             return Err(ExecutionError::DmaChunkTooLarge(n));
                         }
-                        if fill > DMA_MEMSET_MAX_FILL {
-                            return Err(ExecutionError::DmaMemsetFillTooLarge(fill));
-                        }
                         dst.checked_add(n).ok_or(MemoryError::AddressOverflow)?;
+                        src.checked_add(n).ok_or(MemoryError::AddressOverflow)?;
 
-                        let byte = fill as u8;
                         for i in 0..n {
+                            let byte = memory.load_byte(src + i);
                             memory.store_byte(dst + i, byte);
                         }
-                        src2_val = fill;
+                        src2_val = src;
                         dst_val = n;
                     }
                     SyscallNumbers::Hint => {
