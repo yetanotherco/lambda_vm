@@ -41,10 +41,10 @@ earlier version would have printed "the AIR REJECTS an honest row" on a slow box
 | `test_ref.py` | anchors the oracle against libc and CPython; emits the fixtures |
 | `tamper_test.py` | are those anchors sensitive? eight deliberate defects |
 | `z3_verify.py` | the gate: field-exact model of the AIR |
-| `audit_transcription.py` | 104 claims tying gate, spec and Rust together |
+| `audit_transcription.py` | 104 claims tying the gate and the Rust together |
 | `verify.log` | the gate's own output, committed |
-| `canonical_dma_rows.txt` | pinned vectors, `include_str!`-ed by the Rust test |
-| `canonical_dma_vectors.json` | the same vectors with full per-row column expansions |
+| `canonical_dma_rows.txt` | pinned vectors, geometry only; `include_str!`-ed by the Rust row-decomposition test |
+| `canonical_dma_vectors.json` | the same vectors with all 32 committed columns per row; `include_str!`-ed by the Rust column test |
 
 ## Results
 
@@ -64,8 +64,8 @@ gate:    layer 1 (row semantics)            PASS  6/6 UNSAT
          completeness sweep                 PASS  5153 honest + 257 padding rows
          OVERALL: PASS                            (~92 s on z3 5.0.0)
 
-audit:   104 claims, 0 findings; mutation-tested against 9 source mutants
-rust:    cargo test -p lambda-vm-prover --lib tests::dma_tests   10 passed
+audit:   104 claims, 0 findings; mutation-tested against 17 source mutants
+rust:    cargo test -p lambda-vm-prover --lib tests::dma_tests   11 passed
 ```
 
 Full gate transcript in `verify.log`, which is the gate's own stdout, **pasted not
@@ -74,7 +74,7 @@ dropped while the surrounding sentence claimed the block was verbatim. The
 `## Results` block above is hand-copied from it and nothing enforces that; if you
 regenerate, replace both.
 
-**`--lib dma` is 18 tests, but 7 need guest ELFs** — run
+**`--lib dma` is 19 tests, but 7 need guest ELFs** — run
 `make compile-programs-rust` first (RISC-V target) or use the narrower filter
 above. `make verify-dma` runs no cargo.
 
@@ -466,10 +466,10 @@ matching, so a `rustfmt` reflow does not produce a spurious red — which matter
 because a spurious red is how a check gets deleted rather than fixed.
 
 **Mutation-tested, and it needed it.** An audit that cannot fail is not an audit.
-Nine semantic mutants plus one must-not-fire control, applied to copies of the
+Seventeen semantic mutants plus two must-not-fire controls, applied to copies of the
 **Rust** source with the script re-run. (Distinct from `tamper_test.py`'s eight
 mutants, which perturb the **Python oracle** to test the anchors — two separate
-regression sets, and both happen to be about the same size.)
+regression sets.)
 
 | mutant | findings | notes |
 |---|---|---|
@@ -482,9 +482,18 @@ regression sets, and both happen to be about the same size.)
 | `num_bus_elements(DWordHHW)` `2 → 1` | 2 | added later: the first §G guard was **dark for this arm** (see below) |
 | `DmaNext` receiver tuple reordered (`SRC_0`↔`DST_0`) | 1 | **initially missed** — §D pinned membership, not order |
 | `DmaNext` sender tuple reordered (`SRC_INCR_0`↔`DST_INCR_0`) | 1 | **initially missed**, same cause |
+| the read tuple's `is_register` `constant(0)` → `(1)` | 1 | **initially missed** — the claim tested for the *comment* |
+| the read tuple's `w2` `constant(0)` → `(1)` | 1 | **initially missed** — three zero constants, the count needed only two |
+| `w8` `1 - tail` → `tail` | 1 | **initially missed** — `cols::TAIL` appears either way |
+| the `_INCR_0` sums swapped between constraint 5 and 7 | 2 | **initially missed** — §C pinned membership, not order |
+| `emit_is_bit(b, 2, cols::TAIL, None)` → `Some(cols::MU)` | 1 | **initially missed** — the pattern stopped before `cond_col` |
+| `value_columns()`'s `Packing::Direct` → `Word2L` | 1 | **initially missed** — `.*?` crossed the function boundary |
+| the `ZERO` receiver's `65536` coefficient → `65537` | 2 | **initially missed** — the domain claim compared two constants of its own |
+| the `ZERO` table's `for z in 0u32..16` → `..8` | 2 | same claim, other direction |
 | a `rustfmt`-style reflow of `if tail { 1 } else { 8 }` | **0** | must NOT fire |
+| `// 22. MEMW read` renamed to `// 22. Memw read` | **0** | must NOT fire — used to raise `IndexError` and print no report at all |
 
-**Four of the nine were initially missed, in a file whose entire job is catching
+**Eleven of the seventeen were initially missed, in a file whose entire job is catching
 exactly this.** The causes are worth naming because they are all the same species —
 a check that cannot fail:
 
@@ -501,8 +510,43 @@ a check that cannot fail:
   above. The third keys off the source's own `// Compounds` section marker, so all
   seven compound arms are covered and a newly added variant is covered by default.
   A guard written to close a gap was itself dark, twice, in a row.
-- The two ordering mutants: bus tuples were pinned by membership and not by ordinal
-  position, so a swap silently re-paired every field the gate models.
+- The two `DmaNext` ordering mutants: bus tuples were pinned by membership and not
+  by ordinal position, so a swap silently re-paired every field the gate models.
+- **And then the same defect again, in §C, which the `ordinal()` fix was never
+  propagated to.** The add operands were checked for membership anywhere in the
+  eval body, so swapping the two `_INCR_0` sums between constraint 5 and 7 — the
+  AIR proving `src + step = dst_incr` and `dst + step = src_incr` while the gate
+  models the opposite — passed. The lesson a gate writes down is not the lesson it
+  has applied everywhere; the operands are now pinned to their index, the way the
+  idx 9 claim always did it.
+- The three data-tuple mutants: a bus tuple is matched element-for-element against
+  its receiver, but the claims read it as a bag of substrings — and one of them
+  read the `// is_register` *comment* rather than the value, so a tuple that made
+  DMA read the register file at address `src` passed while deleting the comment
+  failed. Both tuples are now pinned as an ordered shape, which also cannot be
+  broken by a cosmetic comment edit.
+- The two `ZERO` domain mutants: the claim that the send fits the receiver's domain
+  compared `GATE_ZERO_SUM` against `GATE_ZERO_DOMAIN`, both defined in the audit
+  itself — a tautology reading no source. The domain is now derived from
+  `bitwise.rs`: the receiver's coefficients, the preprocessed loop bounds, and the
+  fact that each coefficient is the stride of the digits below it.
+- The `value_columns` mutant: `read()` strips every newline, so a `.*?` between two
+  anchors crosses function boundaries freely — the match simply ran on to a later
+  `Packing::Direct`. Character classes that exclude `}` cannot leave the body.
+- The `emit_is_bit` mutant, the only one of the eleven that drifts the other way:
+  the pattern stopped before the template's 4th argument, so `None` →
+  `Some(cols::MU)` was invisible. That leaves `tail` unconstrained wherever
+  `mu = 0` while the gate asserts `is_bit` unconditionally — a model STRONGER
+  than the AIR, which fails safe for the prover and unsafe for the campaign,
+  since every UNSAT the gate reports would then be proving something the AIR
+  does not enforce.
+
+**A section that dies has not passed.** The second must-not-fire control is a
+comment rename, which used to raise `IndexError` from `split(marker)[1]` and kill
+the run before anything was printed — so a cosmetic edit was a hard red and, to
+anything scoring by exit code, a crash was indistinguishable from a catch. The
+dispatch loop now reports it as a finding and the remaining sections still run;
+the two MEMW tuples and the `ZERO` receiver are located structurally instead.
 
 **The reflow mutant must produce zero findings, and used to produce two.** The
 literal checks match fragments like `if tail { 1 } else { 8 }`, and `rustfmt` breaks
