@@ -12,44 +12,63 @@ Downstream, pi is virtual and is consumed as a ByteAlu OPERAND (banners
 
     pi[z] = rot_left[l(z)] + rot_right[r(z)]      must be a byte
 
-Premises from combinatorics.py (run it first): the offsets are even, so a pi
-halfword reads one source halfword as P_h = L_(h+A) + R_(h+A-1), and every one
-of the 400 byte columns is read exactly once.
+so dropping one column's check does not free it: the operand still confines it
+(`operand_summand_window`), which is what makes configurations A and B sound and
+is the step a bound-vs-bound comparison cannot express. Premises live in
+combinatorics.py and are imported below, not left to be run by hand: the
+offsets are even, so a pi halfword reads one source halfword as
+P_h = L_(h+A) + R_(h+A-1), and every one of the 400 byte columns is read exactly
+once -- a column read twice would need the intersection of two windows.
 
 RESULT, and it is asymmetric — unlike theta, here ONE check is load-bearing on
 its own. `left` and `right` enter the identity with weights 1 and 2**16, so
 bounding `left` kills the deviation while bounding `right` does not.
 """
-from itertools import product
 from keccak_ref import RHO
-from field_model import (P, MASK16, as_field, honest_shift, identity_holds,
-                         deviate, rho_pi_offsets, rho_operand_bytes, is_byte)
+from combinatorics import premises
+from field_model import (P, BYTE, as_field, honest_shift, identity_holds,
+                         deviate, difference_form_is_exact, operand_summand_window,
+                         packed_pair_bounds, rho_pi_offsets, rho_operand_bytes,
+                         surviving_deviation, is_byte)
+
+premises(verbose=False)
 
 FAIL = []
 
 
 def check(cond, msg):
-    print(f"  {'OK  ' if cond else 'FALLA'} {msg}")
+    print(f"  {'OK  ' if cond else 'FAIL'} {msg}")
     if not cond:
         FAIL.append(msg)
 
 
 LANES = [(x, y) for x in range(5) for y in range(5)]
+RNCS = sorted({RHO[x][y] % 16 for (x, y) in LANES})
 
-print("=== A / B: left stays range-checked — d = 0 forced, on every lane ===")
-# L' = L - 2**16*d with L, L' both in [0, 2**16) leaves no room for d != 0. This
-# holds whatever `right` is allowed to be, so dropping rot_right's half of the
-# pair changes nothing: its value is then recovered from the identity, uniquely,
-# because 2**16 is invertible mod p. rot_right's check is IMPLIED.
-check(2**16 > MASK16, "|2**16 * d| >= 2**16 > 65535 for d != 0 -> A and B sound for all 25 lanes")
+# Both halves are byte PAIRS here (unlike theta's single carry column), so each
+# window is the packed span of two per-byte windows.
+CHECKED = packed_pair_bounds(BYTE, BYTE)
+OPERAND_ONLY = packed_pair_bounds(operand_summand_window(BYTE), operand_summand_window(BYTE))
 
-print("\n=== C: rot_left's check dropped — completeness of the search first ===")
-# right stays in [0, 2**16), so d = right' - right has |d| <= 65535. And
-# P'_h = P_h - 2**16*d_(h+A) + d_(h+A-1) in [0, 65535] with P_h in [0, 65535]
-# forces |2**16*d_j - d_(j-1)| <= 65535, so |d_j| >= 2 would need
-# |d_(j-1)| >= 2*2**16 - 65535 = 65537 > 65535. Hence |d_j| <= 1 for all j.
-check(2 * 2**16 - MASK16 > MASK16,
-      f"|d| >= 2 would need a neighbour |d| >= {2 * 2**16 - MASK16} > {MASK16} -> d in {{-1,0,1}}, search complete")
+print(f"=== A / B: left stays range-checked — complete sweep, all {len(RNCS)} distinct rotations ===")
+# Dropping rot_right's check leaves it the pi operand window; the sweep then
+# shows the honest pair is the only one, so rot_right's check is IMPLIED.
+for name, left_b, right_b in (("A: both checked", CHECKED, CHECKED),
+                              ("B: rot_right's check dropped", CHECKED, OPERAND_ONLY)):
+    surv = [(rnc, surviving_deviation(rnc, left_b, right_b)) for rnc in RNCS]
+    check(all(difference_form_is_exact(rnc, left_b, right_b) for rnc in RNCS),
+          f"{name}: every term < p/2, so the field identity IS the integer one")
+    check(all(s is None for _, s in surv),
+          f"{name}: left in {left_b}, right in {right_b} -> pinned on all "
+          f"{len(RNCS)} rotations x 2**16 inputs"
+          f"{'' if all(s is None for _, s in surv) else f' — SURVIVORS {[s for s in surv if s[1]][:2]}'}")
+
+print("\n=== C: rot_left's check dropped — the sweep already says forgeable ===")
+surv_c = {rnc: surviving_deviation(rnc, OPERAND_ONLY, CHECKED) for rnc in RNCS}
+check(all(s is not None for s in surv_c.values()),
+      f"a deviation survives on all {len(RNCS)} rotations, e.g. rnc={RNCS[0]} -> {surv_c[RNCS[0]]}")
+check(all(d == 1 for _, d in surv_c.values()),
+      "and it is d = +1 every time -> the witness below is the general shape, not a special case")
 
 print("\n=== C: the forged witness, verified PER BYTE on every lane ===")
 forged = 0
@@ -85,11 +104,12 @@ print("       note this is strictly stronger than the spec's own witness: rot_ri
 print("       byte-valued here, so only rot_left's check catches it.")
 
 print("\n=== D: both dropped — the lane's output is completely free ===")
-# Eliminating left via the identity leaves a cyclic system in right:
-#   right'_(j-1) - 2**16 * right'_j = c_j,  solvable because 1 - 2**64 is invertible.
-# The check verifies the TARGET is hit. `identity_holds` alone cannot fail here:
-# L is DERIVED from the identity, so it is true by construction, and with it as
-# the only check an index slip in the recurrence went unnoticed.
+# No per-column window survives (the operand bounds only the SUM of two
+# unchecked columns), so eliminating left via the identity leaves a cyclic
+# system in right: right'_(j-1) - 2**16 * right'_j = c_j, solvable because
+# 1 - 2**64 is invertible. The check below verifies the TARGET is hit, not just
+# that the identity holds -- the identity holds by construction, since L is
+# derived from it.
 INV = pow(1 - 2**64, -1, P)
 free = 0
 for (sx, sy) in LANES:
@@ -112,7 +132,8 @@ for (sx, sy) in LANES:
     hits = [(L[(h + A) % 4] + R[(h + A - 1) % 4]) % P for h in range(4)] == [q % P for q in Q]
     free += okid and hits
 check(free == 25, f"the forged pi halfwords equal the ARBITRARY target on {free}/25 lanes "
-                  f"(det = 1 - 2**64 = {(1 - 2**64) % P} mod p, invertible). Per-byte\n                   realizability is the construction exhibited in C.")
+                  f"(det = 1 - 2**64 = {(1 - 2**64) % P} mod p, invertible). Per-byte\n"
+                  f"                   realizability is the construction exhibited in C.")
 
 print("\n=== VERDICT ===")
 print("  A sound | B sound -> rot_right's check is IMPLIED by rot_left's + the pi operand")

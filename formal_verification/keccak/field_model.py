@@ -105,3 +105,85 @@ def rho_operand_bytes(rot_left, rot_right, rbc):
 
 def is_byte(v):
     return 0 <= v <= 255
+
+
+# --- the contracts that bound a column, and what survives dropping one -------
+#
+# Each interval below is the contract of a named construct, so that a change in
+# the chip changes the number here rather than leaving a stale comment:
+#
+#   ARE_BYTES pair   the two columns it carries are bytes            -> BYTE
+#   IS_BIT           the theta carry column is a bit                 -> BIT
+#   ByteAlu OPERAND  the BITWISE table holds byte rows only, so a virtual
+#                    operand `a + b` must land in [0, 255]. That still bounds a
+#                    column whose OWN range check is gone -- as long as the
+#                    other summand is bounded -- and it is the whole reason the
+#                    two "implied" verdicts hold.
+BYTE = (0, 255)
+BIT = (0, 1)
+
+
+def operand_summand_window(other):
+    """What a ByteAlu operand alone leaves for one summand.
+
+    `this + other` in [0, 255] with `other` in `other`, so `this` is confined to
+    [-max(other), 255 - min(other)] -- NOT to [0, 255], but small, which is the
+    only property the analysis needs. Requires the read-once premise (each
+    column read by exactly ONE operand byte: combinatorics sections 3 and 6) and
+    breaks down when BOTH summands are unchecked, since then the operand bounds
+    only their sum: that is configuration D, and it has no per-column window at
+    all, which is why its output is entirely free.
+    """
+    return -other[1], 255 - other[0]
+
+
+def packed_pair_bounds(lo, hi):
+    """The interval `lo_col + 256*hi_col` occupies, given per-byte intervals."""
+    return lo[0] + 256 * hi[0], lo[1] + 256 * hi[1]
+
+
+def difference_form_is_exact(rnc, left_bounds, right_bounds):
+    """Is the field identity the same statement as the integer identity?
+
+    Everything below parameterises deviations by an INTEGER `d`, which is only
+    legitimate while every term stays far below `p`. This is the step the
+    difference form silently assumed: widen a bound enough -- a column with no
+    bound at all -- and `d` ranges over the whole field, `2**16` is invertible,
+    and no sweep over small `d` means anything.
+    """
+    worst = (
+        MASK16 * 2**rnc
+        + max(abs(right_bounds[0]), abs(right_bounds[1])) * 2**16
+        + max(abs(left_bounds[0]), abs(left_bounds[1]))
+    )
+    return worst < P // 2
+
+
+def surviving_deviation(rnc, left_bounds, right_bounds):
+    """Complete sweep: does any input halfword admit a second `(left, right)`?
+
+    Returns `None` when all 2**16 inputs are pinned -- the configuration is
+    sound -- or `(in_hw, d)` for the first input that admits another solution.
+
+    Complete, not sampled: the identity's solution set is exactly
+    `(L - 2**16*d, R + d)` over `d`, `difference_form_is_exact` keeps `d` an
+    integer, and `left_bounds` caps `|d|`, so the `d` range below is exhaustive.
+    Also asserts the HONEST pair lies inside the bounds, which catches a window
+    modelled wrongly (the failure that would make a `None` here meaningless).
+    """
+    lo_l, hi_l = left_bounds
+    lo_r, hi_r = right_bounds
+    dmax = (hi_l - lo_l) // 2**16 + 1
+    for in_hw in range(1 << 16):
+        left, right = honest_shift(in_hw, rnc)
+        assert lo_l <= left <= hi_l and lo_r <= right <= hi_r, (
+            f"the honest pair for in={in_hw:#06x} falls outside the modelled "
+            f"bounds left={left_bounds} right={right_bounds}"
+        )
+        for d in range(-dmax, dmax + 1):
+            if d == 0:
+                continue
+            dev_left, dev_right = deviate(left, right, d)
+            if lo_l <= dev_left <= hi_l and lo_r <= dev_right <= hi_r:
+                return in_hw, d
+    return None
