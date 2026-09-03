@@ -87,6 +87,9 @@ print("       byte-valued here, so only rot_left's check catches it.")
 print("\n=== D: both dropped — the lane's output is completely free ===")
 # Eliminating left via the identity leaves a cyclic system in right:
 #   right'_(j-1) - 2**16 * right'_j = c_j,  solvable because 1 - 2**64 is invertible.
+# The check verifies the TARGET is hit. `identity_holds` alone cannot fail here:
+# L is DERIVED from the identity, so it is true by construction, and with it as
+# the only check an index slip in the recurrence went unnoticed.
 INV = pow(1 - 2**64, -1, P)
 free = 0
 for (sx, sy) in LANES:
@@ -101,11 +104,14 @@ for (sx, sy) in LANES:
     R = [0] * 4
     R[0] = r0
     for j in (1, 2, 3):
-        R[j] = ((R[j - 1] - c[(j + 1) % 4]) * pow(2**16, -1, P)) % P
+        # R[j-1] - 2**16*R[j] = c[j] is the relation r0's closed form above
+        # solves; the target check below is what pins this index.
+        R[j] = ((R[j - 1] - c[j]) * pow(2**16, -1, P)) % P
     L = [(in_hws[j] * (2**rnc) - (2**16) * R[j]) % P for j in range(4)]
     okid = all(identity_holds(in_hws[j], rnc, L[j], R[j]) for j in range(4))
-    free += okid
-check(free == 25, f"the packed system is solvable for an arbitrary target on {free}/25 lanes "
+    hits = [(L[(h + A) % 4] + R[(h + A - 1) % 4]) % P for h in range(4)] == [q % P for q in Q]
+    free += okid and hits
+check(free == 25, f"the forged pi halfwords equal the ARBITRARY target on {free}/25 lanes "
                   f"(det = 1 - 2**64 = {(1 - 2**64) % P} mod p, invertible). Per-byte\n                   realizability is the construction exhibited in C.")
 
 print("\n=== VERDICT ===")
