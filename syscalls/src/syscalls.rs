@@ -41,6 +41,10 @@ pub(crate) const DMA_MEMCPY_SYSCALL_NUMBER: usize = usize::MAX - 2;
 #[cfg(target_arch = "riscv64")]
 pub(crate) const DMA_MEMCPY_MAX_BYTES: usize = 256;
 
+/// DMA memset syscall number. Must match the executor.
+#[cfg(target_arch = "riscv64")]
+pub(crate) const DMA_MEMSET_SYSCALL_NUMBER: usize = usize::MAX - 3;
+
 /// Syscall number for the non-constraining Hint ecall.
 /// Must match `executor::...::execution::HINT_SYSCALL_NUMBER` (u64::MAX - 30).
 #[cfg(target_arch = "riscv64")]

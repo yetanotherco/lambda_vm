@@ -48,6 +48,7 @@ use super::cpu::{self, CpuOperation};
 use super::cpu32;
 use super::decode;
 use super::dma;
+use super::dma_set;
 use super::dvrm::{self, DvrmOperation};
 use super::ecdas;
 use super::ecsm;
@@ -553,6 +554,7 @@ fn collect_ops_from_cpu(
     Vec<ecsm::EcsmOperation>,
     Vec<ecdas::EcdasOperation>,
     Vec<dma::DmaOperation>,
+    Vec<dma_set::DmaSetOperation>,
     Vec<hint::HintOperation>,
 ) {
     let mut memw = MemwBuckets::with_register_capacity(cpu_ops.len() * 3);
@@ -566,6 +568,7 @@ fn collect_ops_from_cpu(
     let mut ecsm_ops = Vec::new();
     let mut ecdas_ops = Vec::new();
     let mut dma_ops = Vec::new();
+    let mut dma_set_ops = Vec::new();
     let mut hint_ops = Vec::new();
     // Seed from the carried x254 (0 for a monolithic run or the first epoch) so a
     // continuation epoch indexes its commits globally, matching the x254 the
@@ -669,6 +672,15 @@ fn collect_ops_from_cpu(
             dma_ops.extend(rows);
         }
 
+        // DMA memset: authenticate x10/x11/x12, then write every destination byte
+        // at T+1. There is no source phase — every byte written is the same
+        // constant, so no snapshot is needed and overlap cannot arise.
+        if op.ecall_dma_memset {
+            let (memset_memw, rows) = collect_dma_memset_ops(op, memory_state, register_state);
+            memw.extend_ops(memset_memw);
+            dma_set_ops.extend(rows);
+        }
+
         // Collect Hint ecall operations (the 32-byte output write).
         if op.ecall_hint {
             let (hint_memw, hint_op) = collect_hint_ops(op, memory_state, register_state);
@@ -732,6 +744,7 @@ fn collect_ops_from_cpu(
         ecsm_ops,
         ecdas_ops,
         dma_ops,
+        dma_set_ops,
         hint_ops,
     )
 }
@@ -1081,6 +1094,104 @@ fn collect_dma_memcpy_ops(
     (memw_ops, rows)
 }
 
+/// Replays one DMA memset ecall.
+///
+/// Register operands are read at `T`; every destination chunk is written at
+/// `T+1`. Chunks are eight bytes while `remaining >= 8`, then one byte per tail
+/// row, matching the row schedule the DMA_SET AIR pins through the LT table.
+fn collect_dma_memset_ops(
+    op: &CpuOperation,
+    memory_state: &mut MemoryState,
+    register_state: &mut RegisterState,
+) -> (Vec<MemwOperation>, Vec<dma_set::DmaSetOperation>) {
+    let t = op.timestamp;
+    let dst = register_state.read(10).0;
+    let fill = register_state.read(11).0;
+    let count = register_state.read(12).0;
+    assert!(
+        count <= dma_set::DMA_MEMSET_MAX_BYTES,
+        "successful DMA memset ecall must respect the per-call chunk bound"
+    );
+    assert!(
+        fill <= dma_set::DMA_MEMSET_MAX_FILL,
+        "successful DMA memset ecall must carry a byte-sized fill"
+    );
+    let fill_byte = fill as u8;
+
+    let data_rows = count / 8 + count % 8;
+    let capacity = usize::try_from(data_rows)
+        .ok()
+        .and_then(|n| n.checked_add(3))
+        .expect("successful DMA memset execution must fit host address space");
+    let mut memw_ops = Vec::with_capacity(capacity);
+
+    // Bind the ecall's three argument registers to the first DMA_SET row.
+    for (reg, value) in [(10u8, dst), (11u8, fill), (12u8, count)] {
+        let packed = pack_register_value(value);
+        let (_old_value, old_ts) = register_state.read(reg);
+        memw_ops.push(
+            MemwOperation::new(true, 2 * reg as u64, packed, t, 2, true)
+                .with_old(packed, [old_ts, old_ts, 0, 0, 0, 0, 0, 0]),
+        );
+        register_state.write(reg, value, t);
+    }
+
+    let rows_capacity = usize::try_from(data_rows + 1)
+        .expect("successful DMA memset execution must fit host address space");
+    let mut rows = Vec::with_capacity(rows_capacity);
+    let mut offset = 0u64;
+    let mut remaining = count;
+    let mut first = true;
+
+    while remaining != 0 {
+        let width = if remaining >= 8 { 8u8 } else { 1u8 };
+        let destination_addr = dst
+            .checked_add(offset)
+            .expect("DMA memset range was validated by executor");
+        // Only the lanes actually written carry the fill; the rest stay zero so
+        // this matches the AIR, which sends `fill` in lane 0 and `fill_wide`
+        // (zero on one-byte tail rows) in lanes 1..7.
+        let mut value = [0u32; 8];
+        for lane in value.iter_mut().take(width as usize) {
+            *lane = fill_byte as u32;
+        }
+        let (old_values, old_timestamps) =
+            memory_state.read_bytes(destination_addr, width as usize);
+        memw_ops.push(
+            MemwOperation::new(false, destination_addr, value, t + 1, width, false)
+                .with_old(old_values, old_timestamps),
+        );
+        let dword = u64::from_le_bytes([fill_byte; 8]);
+        memory_state.write_bytes(destination_addr, dword, width as usize, t + 1);
+
+        rows.push(dma_set::DmaSetOperation {
+            timestamp: t,
+            dst: destination_addr,
+            count: remaining,
+            fill: fill_byte,
+            first,
+            end: false,
+        });
+
+        first = false;
+        offset += u64::from(width);
+        remaining -= width as u64;
+    }
+
+    rows.push(dma_set::DmaSetOperation {
+        timestamp: t,
+        dst: dst
+            .checked_add(count)
+            .expect("DMA memset range was validated by executor"),
+        count: 0,
+        fill: fill_byte,
+        first,
+        end: true,
+    });
+
+    (memw_ops, rows)
+}
+
 /// Sizing-pass replay of one bounded DMA ecall.
 ///
 /// This mirrors [`collect_dma_memcpy_ops`] but counts rows and routes each
@@ -1182,6 +1293,81 @@ fn replay_dma_memcpy_for_sizing(
     // debug one: every job that exercises the sizing pass builds with --release
     // and no profile raises debug-assertions, so a debug assert here is never
     // evaluated in CI. The cost is one division per DMA ecall.
+    assert_eq!(
+        rows as u64,
+        executor::vm::instruction::execution::dma_memcpy_trace_rows(count),
+        "sizing-pass row count must match the shared DMA row formula"
+    );
+    rows
+}
+
+/// Sizing-pass replay of one bounded DMA memset ecall.
+///
+/// Mirrors [`collect_dma_memset_ops`] but counts rows and routes each
+/// `MemwOperation` immediately instead of allocating vectors. No snapshot buffer
+/// is needed: memset writes a constant, so there is no source to preserve.
+#[cfg(feature = "disk-spill")]
+fn replay_dma_memset_for_sizing(
+    op: &CpuOperation,
+    memory_state: &mut MemoryState,
+    register_state: &mut RegisterState,
+    mut visit_memw: impl FnMut(&MemwOperation),
+) -> usize {
+    let t = op.timestamp;
+    let dst = register_state.read(10).0;
+    let fill = register_state.read(11).0;
+    let count = register_state.read(12).0;
+    assert!(
+        count <= dma_set::DMA_MEMSET_MAX_BYTES,
+        "successful DMA memset ecall must respect the per-call chunk bound"
+    );
+    assert!(
+        fill <= dma_set::DMA_MEMSET_MAX_FILL,
+        "successful DMA memset ecall must carry a byte-sized fill"
+    );
+    let fill_byte = fill as u8;
+
+    for (reg, value) in [(10u8, dst), (11u8, fill), (12u8, count)] {
+        let packed = pack_register_value(value);
+        let (_old_value, old_ts) = register_state.read(reg);
+        let memw = MemwOperation::new(true, 2 * reg as u64, packed, t, 2, true)
+            .with_old(packed, [old_ts, old_ts, 0, 0, 0, 0, 0, 0]);
+        visit_memw(&memw);
+        register_state.write(reg, value, t);
+    }
+
+    let mut rows = 0usize;
+    let mut offset = 0u64;
+    let mut remaining = count;
+    let dword = u64::from_le_bytes([fill_byte; 8]);
+
+    while remaining != 0 {
+        let width = if remaining >= 8 { 8u8 } else { 1u8 };
+        let destination_addr = dst
+            .checked_add(offset)
+            .expect("DMA memset range was validated by executor");
+        // Only the lanes actually written carry the fill; the rest stay zero so
+        // this matches the AIR, which sends `fill` in lane 0 and `fill_wide`
+        // (zero on one-byte tail rows) in lanes 1..7.
+        let mut value = [0u32; 8];
+        for lane in value.iter_mut().take(width as usize) {
+            *lane = fill_byte as u32;
+        }
+        let (old_values, old_timestamps) =
+            memory_state.read_bytes(destination_addr, width as usize);
+        let memw = MemwOperation::new(false, destination_addr, value, t + 1, width, false)
+            .with_old(old_values, old_timestamps);
+        visit_memw(&memw);
+        memory_state.write_bytes(destination_addr, dword, width as usize, t + 1);
+
+        rows += 1;
+        offset += u64::from(width);
+        remaining -= u64::from(width);
+    }
+
+    let rows = rows + 1;
+    // Pinned the same way as the memcpy replay above. memset drives the identical
+    // row schedule, so the shared formula is the reference for both.
     assert_eq!(
         rows as u64,
         executor::vm::instruction::execution::dma_memcpy_trace_rows(count),
@@ -2565,6 +2751,36 @@ fn collect_bitwise_from_commit(commit_ops: &[CommitOperation]) -> Vec<BitwiseOpe
     lookups
 }
 
+fn collect_bitwise_from_dma_set(ops: &[dma_set::DmaSetOperation]) -> Vec<BitwiseOperation> {
+    let mut lookups = Vec::with_capacity(ops.len() * 9);
+    for op in ops {
+        let width = if op.count < 8 { 1 } else { 8 };
+        let count_decr = op.count.wrapping_sub(width);
+        let dst_incr = op.dst.wrapping_add(width);
+
+        for value in [count_decr, dst_incr] {
+            for shift in [0, 16, 32, 48] {
+                let half = ((value >> shift) & 0xFFFF) as u16;
+                lookups.push(BitwiseOperation::halfword(
+                    BitwiseOperationType::IsHalf,
+                    (half & 0xFF) as u8,
+                    (half >> 8) as u8,
+                ));
+            }
+        }
+
+        let halves = [
+            (count_decr & 0xFFFF) as u32,
+            ((count_decr >> 16) & 0xFFFF) as u32,
+            ((count_decr >> 32) & 0xFFFF) as u32,
+            ((count_decr >> 48) & 0xFFFF) as u32,
+        ];
+        let zero_input = halves.into_iter().map(|half| 65535 - half).sum();
+        lookups.push(BitwiseOperation::zero(zero_input));
+    }
+    lookups
+}
+
 fn collect_bitwise_from_dma(dma_ops: &[dma::DmaOperation]) -> Vec<BitwiseOperation> {
     let mut lookups = Vec::with_capacity(dma_ops.len() * 13);
     for op in dma_ops {
@@ -3135,6 +3351,9 @@ pub struct Traces {
     /// DMA memcpy table (eight-byte body rows plus byte tail rows).
     pub dma: TraceTable<GoldilocksField, GoldilocksExtension>,
 
+    /// DMA memset table (eight-byte body rows plus byte tail rows).
+    pub dma_set: TraceTable<GoldilocksField, GoldilocksExtension>,
+
     /// HINT table (one row per non-constraining hint ecall).
     pub hint: TraceTable<GoldilocksField, GoldilocksExtension>,
 
@@ -3182,6 +3401,8 @@ struct CollectedOps {
     ecdas_ops: Vec<ecdas::EcdasOperation>,
     // DMA memcpy rows (eight bytes per body row, byte tail, plus terminal rows).
     dma_ops: Vec<dma::DmaOperation>,
+    // DMA memset rows (same schedule; one fill byte instead of eight value lanes).
+    dma_set_ops: Vec<dma_set::DmaSetOperation>,
     // Non-constraining hint ecall.
     hint_ops: Vec<hint::HintOperation>,
 }
@@ -3239,6 +3460,7 @@ fn collect_all_ops(
     ecsm_ops: Vec<ecsm::EcsmOperation>,
     ecdas_ops: Vec<ecdas::EcdasOperation>,
     dma_ops: Vec<dma::DmaOperation>,
+    dma_set_ops: Vec<dma_set::DmaSetOperation>,
     hint_ops: Vec<hint::HintOperation>,
     register_state: &mut RegisterState,
     is_final: bool,
@@ -3384,6 +3606,7 @@ fn collect_all_ops(
         ecdas_ops,
         hint_ops,
         dma_ops,
+        dma_set_ops,
     }
 }
 
@@ -3428,6 +3651,7 @@ fn build_traces<I: ImageSource + Sync>(
         ecsm_ops,
         ecdas_ops,
         dma_ops,
+        dma_set_ops,
         hint_ops,
     } = ops;
 
@@ -3447,6 +3671,17 @@ fn build_traces<I: ImageSource + Sync>(
             .filter(|op| op.first)
             .map(|op| LtOperation::new(op.count, dma::DMA_MEMCPY_MAX_BYTES + 1, false)),
     );
+    lt_ops.extend(
+        dma_set_ops
+            .iter()
+            .map(|op| LtOperation::new(op.count, 8, false)),
+    );
+    lt_ops.extend(dma_set_ops.iter().filter(|op| op.first).flat_map(|op| {
+        [
+            LtOperation::new(op.count, dma_set::DMA_MEMSET_MAX_BYTES + 1, false),
+            LtOperation::new(u64::from(op.fill), dma_set::DMA_MEMSET_MAX_FILL + 1, false),
+        ]
+    }));
     // HINT range-checks: selector < 3 and both address low limbs < 2^32 - 31 (matching
     // the executor's HintUnknownSelector / HintAddressOverflow rejections). Three LT ops
     // per hint call; the HINT table sends the matching ALU LT interactions.
@@ -3524,6 +3759,7 @@ fn build_traces<I: ImageSource + Sync>(
         Box::new(|h| h.add_ops(&collect_bitwise_from_memw_aligned(&memw_aligned_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_commit(&commit_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_dma(&dma_ops))),
+        Box::new(|h| h.add_ops(&collect_bitwise_from_dma_set(&dma_set_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_keccak(&keccak_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_ecsm(&ecsm_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_ecdas(&ecdas_ops))),
@@ -3815,6 +4051,7 @@ fn build_traces<I: ImageSource + Sync>(
     let gen_ecsm = || ecsm::generate_ecsm_trace(&ecsm_ops);
     let gen_ecdas = || ecdas::generate_ecdas_trace(&ecdas_ops);
     let gen_dma = || dma::generate_dma_trace(&dma_ops);
+    let gen_dma_set = || dma_set::generate_dma_set_trace(&dma_set_ops);
     // HINT table (all-padding for programs that make no hint ecalls).
     let gen_hint = || hint::generate_hint_trace(&hint_ops);
 
@@ -3830,6 +4067,7 @@ fn build_traces<I: ImageSource + Sync>(
         (None, None, None, None);
     let (mut ecsm_slot, mut ecdas_slot) = (None, None);
     let mut dma_slot = None;
+    let mut dma_set_slot = None;
     let mut hint_slot = None;
 
     #[cfg(feature = "disk-spill")]
@@ -3873,6 +4111,7 @@ fn build_traces<I: ImageSource + Sync>(
             spawn_into!(ecsm_slot, gen_ecsm);
             spawn_into!(ecdas_slot, gen_ecdas);
             spawn_into!(dma_slot, gen_dma);
+            spawn_into!(dma_set_slot, gen_dma_set);
             spawn_into!(hint_slot, gen_hint);
         });
     } else {
@@ -3902,6 +4141,7 @@ fn build_traces<I: ImageSource + Sync>(
         ecsm_slot = Some(gen_ecsm());
         ecdas_slot = Some(gen_ecdas());
         dma_slot = Some(gen_dma());
+        dma_set_slot = Some(gen_dma_set());
         hint_slot = Some(gen_hint());
     }
 
@@ -3939,6 +4179,8 @@ fn build_traces<I: ImageSource + Sync>(
     let ecdas_trace = ecdas_slot.expect(PHASE5_RAN);
     #[allow(unused_mut)]
     let mut dma_trace = dma_slot.expect(PHASE5_RAN);
+    #[allow(unused_mut)]
+    let mut dma_set_trace = dma_set_slot.expect(PHASE5_RAN);
     let hint_trace = hint_slot.expect(PHASE5_RAN);
 
     // Fixed-size and per-page tables aren't built through `chunk_and_generate`,
@@ -3961,6 +4203,10 @@ fn build_traces<I: ImageSource + Sync>(
             .main_table
             .spill_to_disk()
             .map_err(|e| Error::Prover(format!("disk-spill dma: {e}")))?;
+        dma_set_trace
+            .main_table
+            .spill_to_disk()
+            .map_err(|e| Error::Prover(format!("disk-spill dma_set: {e}")))?;
         register_trace
             .main_table
             .spill_to_disk()
@@ -4012,6 +4258,7 @@ fn build_traces<I: ImageSource + Sync>(
         ecsm: ecsm_trace,
         ecdas: ecdas_trace,
         dma: dma_trace,
+        dma_set: dma_set_trace,
         hint: hint_trace,
         memw_registers,
         local_to_global,
@@ -4057,6 +4304,7 @@ pub struct TableLengths {
     pub branch_padded_rows: u64,
     pub commit_padded_rows: u64,
     pub dma_padded_rows: u64,
+    pub dma_set_padded_rows: u64,
     pub decode_rows: u64,
     pub unique_page_count: u64,
     pub cycle_count: u64,
@@ -4097,6 +4345,7 @@ pub fn count_table_lengths(
     let mut branch_count = 0usize;
     let mut commit_count = 0usize;
     let mut dma_count = 0usize;
+    let mut dma_set_count = 0usize;
     let mut current_commit_index = 0u32;
 
     let partition_memw = |op: &MemwOperation,
@@ -4208,6 +4457,26 @@ pub fn count_table_lengths(
             lt_count += dma_rows + 1;
         }
 
+        if cpu_op.ecall_dma_memset {
+            let rows = replay_dma_memset_for_sizing(
+                &cpu_op,
+                &mut memory_state,
+                &mut register_state,
+                |memw_op| {
+                    partition_memw(
+                        memw_op,
+                        &mut memw_by_width,
+                        &mut memw_aligned_count,
+                        &mut memw_register_count,
+                    );
+                },
+            );
+            dma_set_count += rows;
+            // One LT per row pins the 1-vs-8-byte width; the first row adds two
+            // more (the chunk cap and the fill-byte bound).
+            lt_count += rows + 2;
+        }
+
         if cpu_op.ecall_hint {
             // Mirror `collect_hint_ops`: three register reads (a0/a1/a2) and four
             // 8-byte output writes go through the memory argument, plus the three LT
@@ -4287,6 +4556,10 @@ pub fn count_table_lengths(
             .unwrap_or(usize::MAX)
             .max(4) as u64,
         dma_padded_rows: dma_count
+            .checked_next_power_of_two()
+            .unwrap_or(usize::MAX)
+            .max(4) as u64,
+        dma_set_padded_rows: dma_set_count
             .checked_next_power_of_two()
             .unwrap_or(usize::MAX)
             .max(4) as u64,
@@ -4393,6 +4666,7 @@ impl Traces {
         use super::decode::NUM_PRECOMPUTED_COLS as DECODE_PRECOMPUTED;
         use super::decode::cols::NUM_COLUMNS as DECODE_COLS;
         use super::dma::cols::NUM_COLUMNS as DMA_COLS;
+        use super::dma_set::cols::NUM_COLUMNS as DMA_SET_COLS;
         use super::dvrm::cols::NUM_COLUMNS as DVRM_COLS;
         use super::ecdas::cols::NUM_COLUMNS as ECDAS_COLS;
         use super::ecsm::cols::NUM_COLUMNS as ECSM_COLS;
@@ -4439,6 +4713,7 @@ impl Traces {
             ecdas,
             hint,
             dma,
+            dma_set,
             memw_registers,
             eqs,
             bytewises,
@@ -4507,6 +4782,7 @@ impl Traces {
         total += (ecsm.num_rows() * ECSM_COLS) as u64;
         total += (ecdas.num_rows() * ECDAS_COLS) as u64;
         total += (dma.num_rows() * DMA_COLS) as u64;
+        total += (dma_set.num_rows() * DMA_SET_COLS) as u64;
         total += (hint.num_rows() * HINT_COLS) as u64;
         total
     }
@@ -4550,6 +4826,7 @@ impl Traces {
         let n_ecsm = aux_cols(super::ecsm::bus_interactions().len());
         let n_ecdas = aux_cols(super::ecdas::bus_interactions().len());
         let n_dma = aux_cols(super::dma::bus_interactions().len());
+        let n_dma_set = aux_cols(super::dma_set::bus_interactions().len());
         let n_hint = aux_cols(super::hint::bus_interactions().len());
 
         let Traces {
@@ -4575,6 +4852,7 @@ impl Traces {
             ecdas,
             hint,
             dma,
+            dma_set,
             memw_registers,
             eqs,
             bytewises,
@@ -4643,6 +4921,7 @@ impl Traces {
         total += (ecsm.num_rows() * n_ecsm) as u64;
         total += (ecdas.num_rows() * n_ecdas) as u64;
         total += (dma.num_rows() * n_dma) as u64;
+        total += (dma_set.num_rows() * n_dma_set) as u64;
         total += (hint.num_rows() * n_hint) as u64;
         total
     }
@@ -4999,6 +5278,7 @@ impl Traces {
             ecdas_ops,
             hint_ops,
             dma_ops,
+            dma_set_ops,
         ) = collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
         #[cfg(feature = "instruments")]
         drop(__sp);
@@ -5019,6 +5299,7 @@ impl Traces {
             ecdas_ops,
             hint_ops,
             dma_ops,
+            dma_set_ops,
             &mut register_state,
             is_final,
         );
@@ -5114,6 +5395,7 @@ impl Traces {
             ecdas_ops,
             hint_ops,
             dma_ops,
+            dma_set_ops,
         ) = collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
 
         let ops = collect_all_ops(
@@ -5130,6 +5412,7 @@ impl Traces {
             ecdas_ops,
             hint_ops,
             dma_ops,
+            dma_set_ops,
             &mut register_state,
             true,
         );
