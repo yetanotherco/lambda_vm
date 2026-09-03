@@ -1,9 +1,11 @@
-use crate::tables::dma::{DmaOperation, cols, generate_dma_trace};
+use crate::tables::memmove::{MemmoveOperation, cols, generate_memmove_trace};
 use crate::tables::types::FE;
 use crate::test_utils::{busless_air, validate_busless};
 
-fn row(count: u64, first: bool, end: bool, value: [u8; 8]) -> DmaOperation {
-    DmaOperation {
+fn row(count: u64, first: bool, end: bool, value: [u8; 8]) -> MemmoveOperation {
+    MemmoveOperation {
+        width: if count < 8 { 1 } else { 8 },
+        functionality: crate::tables::memmove::Functionality::Copy,
         timestamp: 100,
         src: 0x1000,
         dst: 0x2000,
@@ -15,8 +17,8 @@ fn row(count: u64, first: bool, end: bool, value: [u8; 8]) -> DmaOperation {
 }
 
 #[test]
-fn dma_trace_uses_eight_byte_rows_then_a_byte_tail() {
-    let trace = generate_dma_trace(&[
+fn memmove_trace_uses_eight_byte_rows_then_a_byte_tail() {
+    let trace = generate_memmove_trace(&[
         row(10, true, false, *b"abcdefgh"),
         row(2, false, false, [b'i', 0, 0, 0, 0, 0, 0, 0]),
         row(1, false, false, [b'j', 0, 0, 0, 0, 0, 0, 0]),
@@ -42,14 +44,14 @@ fn dma_trace_uses_eight_byte_rows_then_a_byte_tail() {
     assert_eq!(terminal[cols::END], FE::one());
     assert_eq!(terminal[cols::TAIL], FE::one());
     assert_eq!(terminal[cols::COUNT_DECR_0], FE::from(0xFFFFu64));
-    assert_eq!(terminal[cols::COUNT_DECR_1], FE::from(0xFFFFu64));
-    assert_eq!(terminal[cols::COUNT_DECR_2], FE::from(0xFFFFu64));
-    assert_eq!(terminal[cols::COUNT_DECR_3], FE::from(0xFFFFu64));
+    assert_eq!(terminal[cols::COUNT_DECR_0 + 1], FE::from(0xFFFFu64));
+    assert_eq!(terminal[cols::COUNT_DECR_0 + 2], FE::from(0xFFFFu64));
+    assert_eq!(terminal[cols::COUNT_DECR_0 + 3], FE::from(0xFFFFu64));
 }
 
 #[test]
-fn empty_dma_call_is_a_single_first_and_terminal_row() {
-    let trace = generate_dma_trace(&[row(0, true, true, [0; 8])]);
+fn empty_memmove_call_is_a_single_first_and_terminal_row() {
+    let trace = generate_memmove_trace(&[row(0, true, true, [0; 8])]);
     let first = trace.main_table.get_row(0);
     assert_eq!(first[cols::FIRST], FE::one());
     assert_eq!(first[cols::END], FE::one());
@@ -57,13 +59,16 @@ fn empty_dma_call_is_a_single_first_and_terminal_row() {
 }
 
 #[test]
-fn dma_constraints_accept_valid_rows_and_reject_nonzero_tail_lanes() {
-    let mut trace = generate_dma_trace(&[
+fn memmove_constraints_accept_valid_rows_and_reject_nonzero_tail_lanes() {
+    let mut trace = generate_memmove_trace(&[
         row(2, true, false, [b'a', 0, 0, 0, 0, 0, 0, 0]),
         row(1, false, false, [b'b', 0, 0, 0, 0, 0, 0, 0]),
         row(0, false, true, [0; 8]),
     ]);
-    let air = busless_air(cols::NUM_COLUMNS, crate::tables::dma::DmaConstraints);
+    let air = busless_air(
+        cols::NUM_COLUMNS,
+        crate::tables::memmove::MemmoveConstraints,
+    );
     assert!(validate_busless(&air, &trace));
 
     trace.main_table.set(0, cols::VALUE[1], FE::one());
@@ -74,10 +79,15 @@ fn dma_constraints_accept_valid_rows_and_reject_nonzero_tail_lanes() {
 }
 
 #[test]
-fn dma_constraints_reject_active_source_or_destination_wrap() {
-    let air = busless_air(cols::NUM_COLUMNS, crate::tables::dma::DmaConstraints);
+fn memmove_constraints_reject_active_source_or_destination_wrap() {
+    let air = busless_air(
+        cols::NUM_COLUMNS,
+        crate::tables::memmove::MemmoveConstraints,
+    );
 
-    let source_wrap = generate_dma_trace(&[DmaOperation {
+    let source_wrap = generate_memmove_trace(&[MemmoveOperation {
+        width: 8,
+        functionality: crate::tables::memmove::Functionality::Copy,
         timestamp: 100,
         src: u64::MAX - 3,
         dst: 0x2000,
@@ -91,7 +101,9 @@ fn dma_constraints_reject_active_source_or_destination_wrap() {
         "an active source increment must not wrap modulo 2^64"
     );
 
-    let destination_wrap = generate_dma_trace(&[DmaOperation {
+    let destination_wrap = generate_memmove_trace(&[MemmoveOperation {
+        width: 8,
+        functionality: crate::tables::memmove::Functionality::Copy,
         timestamp: 100,
         src: 0x1000,
         dst: u64::MAX - 3,
@@ -107,8 +119,10 @@ fn dma_constraints_reject_active_source_or_destination_wrap() {
 }
 
 #[test]
-fn dma_terminal_row_may_wrap_unused_successor_columns() {
-    let trace = generate_dma_trace(&[DmaOperation {
+fn memmove_terminal_row_may_wrap_unused_successor_columns() {
+    let trace = generate_memmove_trace(&[MemmoveOperation {
+        width: 1,
+        functionality: crate::tables::memmove::Functionality::Copy,
         timestamp: 100,
         src: u64::MAX,
         dst: u64::MAX,
@@ -117,7 +131,10 @@ fn dma_terminal_row_may_wrap_unused_successor_columns() {
         end: true,
         value: [0; 8],
     }]);
-    let air = busless_air(cols::NUM_COLUMNS, crate::tables::dma::DmaConstraints);
+    let air = busless_air(
+        cols::NUM_COLUMNS,
+        crate::tables::memmove::MemmoveConstraints,
+    );
     assert!(
         validate_busless(&air, &trace),
         "terminal successors are not consumed and may wrap"
@@ -125,34 +142,39 @@ fn dma_terminal_row_may_wrap_unused_successor_columns() {
 }
 
 #[test]
-fn dma_bus_interactions_count() {
-    use crate::tables::dma::bus_interactions;
-    assert_eq!(bus_interactions().len(), 23);
+fn memmove_bus_interactions_count() {
+    use crate::tables::memmove::bus_interactions;
+    // 23 on the DMA table this replaces, plus the CommitDefer receive and the eight
+    // gated COMMIT-domain lane sends.
+    assert_eq!(bus_interactions().len(), 32);
 }
 
 #[test]
-fn dma_constraints_count_and_indices() {
-    use crate::tables::dma::DmaConstraints;
+fn memmove_constraints_count_and_indices() {
+    use crate::tables::memmove::MemmoveConstraints;
     use stark::constraints::builder::ConstraintSet;
-    let meta = DmaConstraints.meta();
-    assert_eq!(meta.len(), 18);
+    let meta = MemmoveConstraints.meta();
+    assert_eq!(meta.len(), 32);
     // Dense, idx-ordered.
     for (i, m) in meta.iter().enumerate() {
         assert_eq!(m.constraint_idx, i);
     }
     // All constraints are degree 2 (no over-degree slips in a template change).
-    assert_eq!(DmaConstraints.max_degree(), 2);
+    assert_eq!(MemmoveConstraints.max_degree(), 2);
 }
 
 #[test]
-fn dma_padding_row_cannot_claim_first_or_end() {
+fn memmove_padding_row_cannot_claim_first_or_end() {
     // Constraint 4, `(first + end) * (1 - mu) = 0`, is the sole guard that a
     // padding row (mu = 0) cannot masquerade as the first or terminal row of a
     // copy — bitness alone accepts first = 1 or end = 1, so nothing else rejects
     // it. A padding row claiming `first` would forge an ECALL receive; claiming
     // `end` would forge a copy's terminal row.
-    let air = busless_air(cols::NUM_COLUMNS, crate::tables::dma::DmaConstraints);
-    let base = generate_dma_trace(&[
+    let air = busless_air(
+        cols::NUM_COLUMNS,
+        crate::tables::memmove::MemmoveConstraints,
+    );
+    let base = generate_memmove_trace(&[
         row(2, true, false, [b'a', 0, 0, 0, 0, 0, 0, 0]),
         row(1, false, false, [b'b', 0, 0, 0, 0, 0, 0, 0]),
         row(0, false, true, [0; 8]),

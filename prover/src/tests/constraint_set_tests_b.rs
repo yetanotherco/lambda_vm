@@ -245,13 +245,13 @@ mod commit {
 // dma.rs
 // =============================================================================
 
-mod dma {
+mod memmove {
     use super::*;
-    use crate::tables::dma::{DmaConstraints, cols};
+    use crate::tables::memmove::{MemmoveConstraints, cols};
 
     #[test]
-    fn dma_constraint_set_folder_capture_agree() {
-        check_table("dma", &DmaConstraints, cols::NUM_COLUMNS);
+    fn memmove_constraint_set_folder_capture_agree() {
+        check_table("memmove", &MemmoveConstraints, cols::NUM_COLUMNS);
     }
 }
 

@@ -155,8 +155,7 @@ fn all_table_programs_match_folders() {
     let opts = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
 
     check_air(&create_cpu_air(&opts), "CPU");
-    check_air(&create_dma_air(&opts), "DMA");
-    check_air(&create_dma_set_air(&opts), "DMA_SET");
+    check_air(&create_memmove_air(&opts), "DMA");
     check_air(&create_bitwise_air(&opts), "BITWISE");
     check_air(&create_lt_air(&opts), "LT");
     check_air(&create_shift_air(&opts), "SHIFT");

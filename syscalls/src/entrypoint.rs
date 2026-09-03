@@ -186,14 +186,17 @@ memset:
     beqz a2, .Ldma_memset_done
     li t2, 16
     bltu a2, t2, .Ldma_memset_bytewise
-    // Broadcast the fill byte across a doubleword and seed the first eight bytes.
-    slli t3, a1, 8
-    or   t3, t3, a1
-    slli t4, t3, 16
-    or   t3, t3, t4
-    slli t4, t3, 32
-    or   t3, t3, t4
-    sd   t3, 0(a0)
+    // Seed the first eight bytes one at a time. A doubleword store would be shorter
+    // but would assume an alignment `dst` does not have: a byte array on the stack is
+    // 1-aligned, and seeding it with `sd` is silently wrong there.
+    sb a1, 0(a0)
+    sb a1, 1(a0)
+    sb a1, 2(a0)
+    sb a1, 3(a0)
+    sb a1, 4(a0)
+    sb a1, 5(a0)
+    sb a1, 6(a0)
+    sb a1, 7(a0)
     mv   t1, a2
     addi t1, t1, -8
     mv   a1, a0

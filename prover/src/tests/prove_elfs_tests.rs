@@ -1492,12 +1492,12 @@ fn test_prove_dma_memset_forged_intermediate_destination_rejected() {
     let forged_row = dma_set_row_matching(&traces, |first, end, tail| !first && !end && !tail);
 
     // Shift both the current destination and its locally-consistent successor.
-    // The row's ADD stays valid; the predecessor's DmaSetNext tuple and the
+    // The row's ADD stays valid; the predecessor's MemmoveNext tuple and the
     // memory write no longer match.
     for column in [dma_set_cols::DST_0, dma_set_cols::DST_INCR_0] {
         let original = *traces.memmove.main_table.get(forged_row, column);
         traces
-            .dma_set
+            .memmove
             .main_table
             .set(forged_row, column, original + FieldElement::from(8u64));
     }
