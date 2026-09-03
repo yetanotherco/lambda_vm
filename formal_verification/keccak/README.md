@@ -79,14 +79,56 @@ Each helper lookup is modeled by its contract, not its implementation:
    cannot reveal. Here, `AreBytes` on `Cxz_left`/`rot_left`/`rot_right` is carried by
    declaring those variables 8-bit bitvectors, and the θ carry `Cxz_right` is pinned
    directly to `ZeroExt(7, Extract(15, 15, in))`, with the separate `IS_BIT` disjunct
-   redundant *in the model*. Both are `load-bearing` in the circuit
-   (`keccak_rnd.rs:7-8`, `:840-842`: the 20 μ-gated `IS_BIT`s make the θ shift
-   decomposition unique). Because neither can be removed from the model's constraint
-   list, **deleting them from the Rust leaves this gate printing `VERIFIED`** while
-   the θ `left` halfwords go free — `2¹⁶` is invertible mod `p`, so the forged
-   assignment exists. The model's pin is a sound *consequence* of the shipped
-   constraints today, which is why the current board is meaningful; what it is not is
-   a test that those constraints are still there.
+   redundant *in the model*. Because none of them can be removed from the model's
+   constraint list, **deleting them from the Rust leaves this gate printing
+   `VERIFIED`**. `necessity_theta.py` / `necessity_rho.py` / `witness_fullchip.py`
+   measure exactly what each one is worth, and the answer is **not uniform** — do not
+   summarise it as "they are all load-bearing":
+
+   | dropped | θ (`Cxz_left` / `Cxz_right`) | ρ (`rot_left` / `rot_right`) |
+   |---|---|---|
+   | the `left` range check | sound — implied | **FORGEABLE** |
+   | the `right` range check | sound — implied | sound — implied |
+   | both | **FORGEABLE** | **FORGEABLE**, output entirely free |
+
+   So in θ the *pair* is load-bearing and neither half is on its own, while in ρ
+   **`rot_left`'s check is load-bearing by itself**. The asymmetry is not incidental:
+   `left` and `right` enter the identity with weights `1` and `2¹⁶`, so bounding
+   `left` kills the deviation `(L, R) → (L − 2¹⁶d, R + d)` outright, while bounding
+   `right` only narrows it — and whether `d = ±1` still fits depends on the residual
+   window the downstream ByteAlu operand leaves. In θ that window is closed by the
+   *parity* of `left` (the shift is by one, so `left` is always even) and by the carry
+   being a single bit; in ρ, `right` is a halfword and `d = ±1` fits exactly at
+   saturation.
+
+   **How each cell is decided, and why not by comparing two bounds.** Dropping a
+   check does not free its column: the ByteAlu operand that reads it still
+   confines it to `[−255, 255]`, as long as the other summand is bounded
+   (`operand_summand_window`, resting on the read-once premise —
+   `combinatorics.py` sections 3 and 6; a column read *twice* would need the
+   intersection of two windows). Only with that window does the deviation `d`
+   become an integer at all, which is what `difference_form_is_exact` checks:
+   over the field `2¹⁶` is invertible, so an unbounded `right` admits a
+   full-size solution for *every* `left` and no argument about small `d` means
+   anything. With both intervals in hand, `surviving_deviation` sweeps **all
+   2¹⁶ input halfwords** against them and returns either "pinned" or the first
+   survivor — and asserts the honest pair lies inside the modelled intervals,
+   which is what catches a window modelled wrongly. The "both dropped" row is
+   the one configuration with no per-column window at all (the operand bounds
+   only the *sum* of two unchecked columns), so it is decided by an explicit
+   witness instead.
+
+   **The two implied halves are not the same kind of saving.** ρ's is 100
+   `AreBytes` sends. θ's is 20 *polynomial* constraints (`IS_BIT`, μ-gated,
+   degree 3 — the reason `KeccakRndConstraints` declares `max_degree() = 3`).
+   Neither is proposed here as an optimization; what the result bounds is the
+   ceiling: 100 of ρ's 200 sends, not 200.
+
+   The model's pin is a sound *consequence* of the shipped constraints today, which is
+   why the current board is meaningful; what it is not is a test that those
+   constraints are still there. **The `24/24 UNSAT` verdict is conditional on the
+   range checks existing and must never be cited as evidence that they are
+   redundant.**
 
 2. **Positive control (non-vacuity).** Pin the input to a concrete value, drop the
    diff assertion, and confirm the constraint system is **SAT** *and* uniquely pins
@@ -106,7 +148,11 @@ Each helper lookup is modeled by its contract, not its implementation:
    *load-bearing at the field level* in a way QF-BV cannot see: `2¹⁶` is invertible
    mod the Goldilocks prime, so without the range bound the `(left, right)`
    decomposition is ambiguous. QF-BV proves the wiring given the bound; proving the
-   bound *suffices* mod `p` needs an integer/field model (see Scope + follow-ups).
+   bound *suffices* mod `p` needs an integer/field model — that is what
+   `field_model.py` and the two `necessity_*.py` scripts are, and their result is the
+   table in discipline 1. `make verify-keccak` runs them, and CI runs
+   that on every PR touching this directory — so unlike the QF-BV gate they are
+   not a human obligation.
 
 4. **Independent reference.** The reference must be derived from the spec, not from
    the circuit or the repo's constant tables, then anchored to an outside
@@ -141,31 +187,34 @@ constraint-identical in QF-BV. Verified: `keccak_rnd.rs` is byte-identical acros
 `main`, this branch, and `6a280121` (same git blob `51b7759f`), so the wiring the
 model transcribes is the shipped wiring.
 
-The `rs:NNN` line citations in the code comments are nevertheless **stale**. They were
-written against the pre-#889 revision (`d83b4d9e`, blob `1b121a8b`, 926 lines), where
-each lands exactly on the construct it names; **#889 — the change that inlined the
-HWSL shifts — invalidated them all.** Most now point at a neighbouring construct:
-`rs:539-588` ("theta: Cxz XOR chain") is the KeccakRc sender, the chain being at
-`546-597`; `rs:796-870` ("chi: AND then XOR") is Iota, Chi's AND/XOR being at
-`716-759` and `761-794`.
+The code comments cite each modeled equation by **construct name** — the
+`// --- <Group>: <what> (<count>) ---` banner it sits under, or the `cols::` /
+`KeccakRndConstraints` symbol — never by line number. Names are the only citation
+that survives: line numbers rot from churn with nothing to do with the chip. The
+earlier `rs:NNN` citations were all invalidated by **#889** (which inlined the HWSL
+shifts), two of them naming `BusInteraction::sender(BusId::Hwsl, …)` blocks that
+#889 **deleted outright** — the file now contains zero `BusId::Hwsl` sends, and that
+content lives in the inline identities in `KeccakRndConstraints`. The `execution.rs`
+citation in `test_ref.py` was broken separately, by **#876** (an unrelated hint-ecall
+PR) merely growing the file by 136 lines.
 
-Two cannot be repointed at all: `rs:593-631` (θ HWSL) and `rs:723-766` (ρ HWSL) cite
-`BusInteraction::sender(BusId::Hwsl, …)` blocks that #889 **deleted outright** — the
-file now contains zero `BusId::Hwsl` sends, and that content lives in the inline
-identities at `:882-894` and `:896-920`. So it is not the case that every referenced
-construct still exists.
+If you copy this template, cite by name for the same reason.
 
-Locate a construct by its `// --- Step: … ---` banner rather than by these line
-numbers.
+**The scope gap this baseline declared is now closed.** QF-BV cannot test whether
+the `AreBytes`/`IS_BIT` bounds are *sufficient* mod `p` for the inline identities —
+bit vectors make `2¹⁶` a zero divisor, not the invertible element it is mod the
+Goldilocks prime, so the question is not merely unanswered there but unaskable.
+`field_model.py` supplies the companion integer-mod-`p` model, `necessity_theta.py`
+and `necessity_rho.py` decide every configuration, and `witness_fullchip.py` exhibits
+the ρ forgery as a complete, reachable round rather than an isolated lane. The result
+is the table in discipline 1.
 
-**Known scope gap carried as the first follow-up:** QF-BV cannot test that the
-`AreBytes`/`IS_BIT` bounds are *sufficient* mod `p` for the inline identities (bit
-vectors make `2¹⁶` a zero divisor, not the invertible element it is mod the
-Goldilocks prime). That companion proof — an integer-mod-`p` model showing that
-dropping a range bound makes the decomposition ambiguous (SAT) — was written for the
-optimization PR that introduced the identities and is *not* included in this
-baseline. Porting it here (or moving to a solver with native field support) is the
-first extension of this template.
+One consequence is worth recording for whoever touches the round next: **#889, which
+inlined the θ/ρ shifts to drop 120 HWSL sends per row, made `rot_left`'s range check
+load-bearing.** Under the HWSL *lookup* the pair `(left, right)` was pinned
+individually and dropping either check was harmless; under the shipped identity,
+dropping `rot_left`'s is forgeable. The 100 saved ρ sends were paid for with a range
+check that changed status, and nothing outside this directory records that.
 
 ## Scope
 
@@ -202,10 +251,33 @@ first extension of this template.
 - `model_dataflow.py`, `test_dataflow.py` — concrete byte-level forward mirror of the
   modeled equations, validated against the reference over random/structured inputs
   and confirmed to move under each injected bug.
+- `field_model.py` — the companion **integer-mod-`p`** model of the inline θ/ρ shift
+  identities, with a switch per range check. This is the piece the next chip copies
+  when its bounds are enforced by an identity rather than a lookup.
+- `combinatorics.py` — the solver-free premises the θ and ρ results rest on: π is a
+  bijection on the lanes, all 400 ρ byte columns are read exactly once by a pi
+  operand, the pi offsets are even, `theta = 0xFFFF…FF` saturates every lane, and the
+  four θ carries are a permutation of the four `rotated_C` low bytes. Exposed as
+  `premises()` and **imported** by both necessity scripts, so it cannot be skipped.
+- `necessity_theta.py`, `necessity_rho.py` — which range checks are load-bearing and
+  which are implied: one interval per column per configuration, decided by a complete
+  sweep over all 2¹⁶ input halfwords, plus the forged witnesses for the
+  configurations that have no per-column window.
+- `witness_fullchip.py` — the ρ forgery as a complete KECCAK_RND row from a reachable
+  message state: 0 constraint violations, every lookup matching, wrong output, on
+  every saturated lane. Honest and forged rows come from one builder and the honest
+  one is required to be exactly FIPS-202, because "the output differs" is also what a
+  bug in the script itself produces.
 
 ## Running the gate
 
-z3's Python bindings are the only dependency (no cargo, no repo build):
+The solver-free half is one command, and it is the half CI runs:
+
+```
+make verify-keccak               # reference, mirror, premises, necessity, witness
+```
+
+The QF-BV gate itself needs z3's Python bindings (no cargo, no repo build):
 
 ```
 pip install z3-solver            # if not already importable
@@ -216,10 +288,19 @@ python3 z3_parallel.py           # the gate: 24 rounds + changed-constraint cont
 # or, single-process with inline printout:
 python3 z3_verify.py
 python3 tamper_test.py           # the removed-constraint controls (see discipline 1)
+python3 combinatorics.py         # the solver-free premises for the rho result
+python3 necessity_theta.py       # which theta range checks are load-bearing
+python3 necessity_rho.py         # which rho range checks are load-bearing
+python3 witness_fullchip.py      # the rho forgery as a complete, reachable round
 ```
 
 `tamper_test.py` is not optional: `z3_parallel.py` runs only the *changed*-constraint
 controls, so a run that skips it exercises no **removed**-constraint control at all.
 
 Expected board: positive control PASS, all negative controls **SAT** (caught), all
-24 rounds **UNSAT**. Anything else is a real signal — investigate before trusting.
+24 rounds **UNSAT**, every premise and necessity check **OK**, and the full-chip
+witness **VERIFIED**. Anything else is a real signal — investigate before trusting.
+
+The necessity scripts need no solver for their UNSAT results — those are exact
+integer-bounding arguments with finite, complete enumerations — so they run in
+seconds. Only the QF-BV gate is slow (~3 min on ten cores).
