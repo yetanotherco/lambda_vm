@@ -157,13 +157,39 @@ def audit_constants(a, repo):
          "LinearTerm::Constant(4 * 65535)" in dma
          and GATE_ZERO_SUM == 4 * 65535)
 
-    # The Zero receiver's domain: bitwise packs x + 256y + 65536z with z 4 bits.
+    # The Zero receiver's domain, DERIVED from bitwise.rs rather than asserted
+    # about it. The receiver packs X + 256*Y + 65536*Z and the preprocessed
+    # table enumerates x, y, z over the loop bounds below, so the largest
+    # representable argument is a function of the source.
+    #
+    # Both claims here used to read no source at all in the deciding position:
+    # the domain claim rode on `"coefficient: 65536" in bitwise`, which also
+    # matches the unrelated IS_B20 sender and is not tied to the ZERO receiver
+    # (its other disjunct, a `.replace` on `65536 * cols::Z`, never matched at
+    # all), and the fit claim compared GATE_ZERO_SUM against GATE_ZERO_DOMAIN,
+    # two constants defined in THIS file -- a tautology.
     bitwise = read(repo, "prover/src/tables/bitwise.rs")
-    a.ok("the Zero send stays inside the bitwise table's ZERO domain",
-         "65536 * z" in bitwise.replace("65536 * cols::Z", "65536 * z")
-         or "coefficient: 65536" in bitwise,
-         "the receiver packs x + 256y + 65536z with z < 16, i.e. arguments < 2^20")
-    a.ok("4 * 65535 fits that domain", GATE_ZERO_SUM < GATE_ZERO_DOMAIN)
+    zero_recv = (bitwise.split("BusId::Zero,")[1]
+                        .split("BusInteraction::")[0])
+    coeffs = {col: int(c) for c, col in
+              re.findall(r"coefficient: (-?\d+), column: cols::([XYZ])", zero_recv)}
+    bounds = {col.upper(): int(hi) for col, hi in
+              re.findall(r"for ([xyz]) in 0u32\.\.(\d+)", bitwise)}
+    a.ok("the ZERO receiver packs X + 256*Y + 65536*Z over the preprocessed "
+         "loop bounds",
+         coeffs == {"X": 1, "Y": 256, "Z": 65536}
+         and bounds == {"X": 256, "Y": 256, "Z": 16}
+         and coeffs["Y"] == bounds["X"]
+         and coeffs["Z"] == bounds["X"] * bounds["Y"],
+         "the last two equalities are what make the packing injective: each "
+         f"coefficient is the stride of the digits below it. coeffs={coeffs} "
+         f"bounds={bounds}")
+    zero_domain = sum(coeffs.get(c, 0) * (bounds.get(c, 1) - 1) for c in "XYZ")
+    a.ok("4 * 65535 fits that domain",
+         GATE_ZERO_SUM <= zero_domain == GATE_ZERO_DOMAIN - 1,
+         f"largest argument the ZERO table can represent is {zero_domain}; the "
+         f"gate's send is {GATE_ZERO_SUM} and the gate assumes a domain of "
+         f"{GATE_ZERO_DOMAIN}")
 
     a.ok("the row widths the gate uses are the widths dma.rs uses",
          "if tail { 1 } else { 8 }" in dma.replace("\n", " ")
@@ -228,31 +254,49 @@ def audit_constraints(a, repo):
     dma = read(repo, "prover/src/tables/dma.rs")
     body = dma.split("impl ConstraintSet")[1]
 
-    a.ok("idx 0-3 are the four booleanity constraints, in the gate's order",
-         re.search(r"emit_is_bit\(b, 0, cols::FIRST", body) and
-         re.search(r"emit_is_bit\(b, 1, cols::END", body) and
-         re.search(r"emit_is_bit\(b, 2, cols::TAIL", body) and
-         re.search(r"emit_is_bit\(b, 3, cols::MU", body))
+    a.ok("idx 0-3 are the four booleanity constraints, in the gate's order, "
+         "each UNGATED",
+         re.search(r"emit_is_bit\(b, 0, cols::FIRST, None\)", body) and
+         re.search(r"emit_is_bit\(b, 1, cols::END, None\)", body) and
+         re.search(r"emit_is_bit\(b, 2, cols::TAIL, None\)", body) and
+         re.search(r"emit_is_bit\(b, 3, cols::MU, None\)", body),
+         "the 4th argument is `cond_col` (templates.rs): `Some(c)` rewrites "
+         "x*(1-x) as c*x*(1-x), leaving the bit unconstrained wherever c = 0 "
+         "while the gate asserts `is_bit` unconditionally -- a model STRONGER "
+         "than the AIR, which is the drift direction this script exists to "
+         "catch. An earlier version stopped the pattern before this argument, "
+         "so None -> Some(cols::MU) on TAIL passed")
 
     a.ok("idx 4 is (first + end) * (1 - mu)",
          re.search(r"emit_base\(4,\s*\(first \+ end\) \* \(one - mu\)\)", body) is not None,
          "the gate rewrites this as Implies(mu == 0, first == 0 and end == 0)")
 
-    a.ok("idx 5 is the NO-OVERFLOW add on src, gated by (MU, END)",
-         re.search(r"emit_add_pair_no_overflow\(\s*b,\s*5,\s*cols::MU,\s*cols::END,",
-                   body) is not None)
-    a.ok("idx 7 is the NO-OVERFLOW add on dst, gated by (MU, END)",
-         re.search(r"emit_add_pair_no_overflow\(\s*b,\s*7,\s*cols::MU,\s*cols::END,",
-                   body) is not None)
+    # The operands are pinned TO THE INDEX, the way the idx 9 claim below
+    # already does it. An earlier version matched only up to `cols::END,` and
+    # checked the four operand strings for mere MEMBERSHIP somewhere in the
+    # body, so swapping the two _INCR_0 sums between idx 5 and idx 7 -- the AIR
+    # then proving `src + step = dst_incr` and `dst + step = src_incr` while the
+    # gate models the opposite -- passed. That is the same membership-not-order
+    # defect §D fixed with `ordinal()`; it was never applied here.
+    for idx, base, incr in ((5, "SRC_0", "SRC_INCR_0"), (7, "DST_0", "DST_INCR_0")):
+        a.ok(f"idx {idx} is the NO-OVERFLOW add pairing {base} with {incr}, "
+             "gated by (MU, END)",
+             re.search(rf"emit_add_pair_no_overflow\(\s*b,\s*{idx},\s*cols::MU,"
+                       rf"\s*cols::END,\s*&AddOperand::dword\(cols::{base}\),"
+                       rf"\s*&step,\s*&AddOperand::from_dword_hl\(cols::{incr}\)",
+                       body) is not None,
+             f"the sum for idx {idx} must be {incr}, not the other address's")
     a.ok("idx 9 is the PLAIN add on count (wrap permitted, unconditional)",
          re.search(r"emit_add_pair\(\s*b,\s*9,\s*&\[\],", body) is not None,
          "the gate relies on this being the plain form: the terminal row holds 0 - 1")
 
-    a.ok("src/dst adds read src as DWordWL and src_incr as DWordHL",
-         "AddOperand::dword(cols::SRC_0)" in body
-         and "AddOperand::from_dword_hl(cols::SRC_INCR_0)" in body
-         and "AddOperand::dword(cols::DST_0)" in body
-         and "AddOperand::from_dword_hl(cols::DST_INCR_0)" in body)
+    operands = re.findall(r"AddOperand::(?:dword|from_dword_hl)\(cols::(\w+)\)", body)
+    a.ok("the three adds use exactly six operands, each column exactly once",
+         sorted(operands) == sorted(["SRC_0", "SRC_INCR_0", "DST_0",
+                                     "DST_INCR_0", "COUNT_DECR_0", "COUNT_0"]),
+         "with the pairing pinned per index above, this is the completeness "
+         "half: a fourth add, a reused operand or a dropped one shows up here. "
+         f"found {sorted(operands)}")
     a.ok("the count add has count_decr on the LHS and count as the SUM",
          re.search(r"emit_add_pair\(\s*b,\s*9,\s*&\[\],\s*"
                    r"&AddOperand::from_dword_hl\(cols::COUNT_DECR_0\),\s*"
@@ -363,8 +407,14 @@ def audit_buses(a, repo):
          is not None)
 
     # ---- the wiring facts the gate explicitly cannot see -------------------
-    read_tuple = buses.split("// 22. MEMW read")[1].split("// 23.")[0]
-    write_tuple = buses.split("// 23. MEMW write")[1]
+    # Located STRUCTURALLY, by the only two `mu - end` Memw senders in the
+    # table, rather than by the `// 22.` / `// 23.` comments above them: a
+    # comment rename is a cosmetic edit and must not turn the audit red. Which
+    # of the two is the read and which the write is not assumed either -- the
+    # two shape claims below pin `ts+1` and `ts+2` respectively, so a swap is a
+    # finding rather than a silent relabel.
+    memw_data = buses.split("BusInteraction::sender(BusId::Memw, mu_minus_end")
+    read_tuple, write_tuple = memw_data[1], memw_data[2]
 
     a.ok("the read tuple carries value_columns() TWICE (old and value)",
          read_tuple.count("value_columns()") == 1
@@ -376,10 +426,14 @@ def audit_buses(a, repo):
          "THIS is why a copied byte cannot change: one set of columns feeds "
          "both memory tuples, so the gate never has to prove read == write")
     a.ok("value_columns() is exactly cols::VALUE, packed Direct",
-         re.search(r"fn value_columns\(\).*?cols::VALUE \.iter\(\)"
-                   r".*?packing: Packing::Direct", dma) is not None,
-         "note the source is whitespace-normalised by `read`, so this pattern "
-         "matches the reflow-insensitive form")
+         re.search(r"fn value_columns\(\)[^}]*cols::VALUE \.iter\(\)"
+                   r"[^}]*packing: Packing::Direct", dma) is not None,
+         "the source is whitespace-normalised by `read`, so this matches the "
+         "reflow-insensitive form -- but normalisation also removes every "
+         "newline, so an earlier `.*?` here crossed function boundaries: "
+         "mutating this packing to Word2L still matched by picking up a later "
+         "`Packing::Direct` (span 138 -> 583 chars). `[^}]*` cannot leave the "
+         "function body, since reaching any later item requires crossing `}`")
 
     a.ok("the read is at T+1 and the write at T+2",
          "timestamp_with_offset(1)" in read_tuple
@@ -392,13 +446,64 @@ def audit_buses(a, repo):
          and read_tuple.count("cols::TIMESTAMP_1") == 1,
          "a +1/+2 that could carry into the high limb would break ordering")
 
-    a.ok("both data tuples set w2 = 0, w4 = 0 and w8 = 1 - tail",
-         read_tuple.count("BusValue::constant(0)") >= 2
-         and write_tuple.count("BusValue::constant(0)") >= 2
-         and read_tuple.count("column: cols::TAIL") == 1
-         and write_tuple.count("column: cols::TAIL") == 1,
-         "w8 = 1 - tail is the only link between the width the AIR proves and "
-         "the number of bytes the memory table moves")
+    def pushes(tup):
+        """The tuple's pushed values, in source order, as coarse tags.
+
+        A bus tuple is matched POSITIONALLY against its receiver -- element i
+        of the sender meets element i of the receiver -- so the audit has to
+        read it as a sequence, not as a bag of substrings. Two earlier claims
+        read it as a bag and were both blind:
+
+        - `count("BusValue::constant(0)") >= 2` for `w2 = 0, w4 = 0`. The tuple
+          carries THREE zero constants (is_register, w2, w4), so flipping w2 to
+          1 still left two and passed.
+        - `count("column: cols::TAIL") == 1` for `w8 = 1 - tail`. TAIL appears
+          whatever its coefficient is, so `w8 = tail` passed.
+        - `"// is_register" in tup` for the non-register access. That is the
+          COMMENT: flipping the constant to 1, i.e. DMA reading the REGISTER
+          FILE at address src, passed, while deleting the comment -- a semantic
+          no-op -- failed.
+
+        Tagging by position fixes all three at once and, unlike matching the
+        `// w2` / `// is_register` comments, cannot be broken by a cosmetic
+        comment edit. `BusValue::linear` is tagged `1-tail` only when it is
+        literally `Constant(1)` plus `Column { coefficient: -1, TAIL }`.
+        """
+        out = []
+        for seg in tup.split("tuple.")[1:]:
+            seg = seg.split(";")[0]
+            if seg.startswith(("extend(values", "append(&mut values",
+                               "extend(value_columns()")):
+                out.append("value[8]")
+            elif "BusValue::constant(" in seg:
+                m = re.search(r"BusValue::constant\(([^)]*)\)", seg)
+                out.append(f"const({m.group(1)})")
+            elif "timestamp_with_offset(" in seg:
+                m = re.search(r"timestamp_with_offset\((\d+)\)", seg)
+                out.append(f"ts+{m.group(1)}")
+            elif "BusValue::linear" in seg:
+                ok = re.search(r"LinearTerm::Constant\(1\), LinearTerm::Column \{ "
+                               r"coefficient: -1, column: cols::TAIL", seg)
+                out.append("1-tail" if ok else "linear?")
+            elif "start_column: cols::" in seg:
+                out.append(re.search(r"start_column: cols::(\w+)", seg).group(1))
+            else:
+                out.append("?")
+        return out
+
+    read_shape = pushes(read_tuple)
+    a.ok("the read tuple is old[8], is_register=0, src[2], value[8], ts+1, "
+         "w2=0, w4=0, w8=1-tail, in that order",
+         read_shape == ["value[8]", "const(0)", "SRC_0", "SRC_1", "value[8]",
+                        "ts+1", "TIMESTAMP_1", "const(0)", "const(0)", "1-tail"],
+         f"MEMW's CO24 read receiver expects exactly this order. {read_shape}")
+    write_shape = pushes(write_tuple)
+    a.ok("the write tuple is is_register=0, dst[2], value[8], ts+2, w2=0, "
+         "w4=0, w8=1-tail, in that order",
+         write_shape == ["const(0)", "DST_0", "DST_1", "value[8]", "ts+2",
+                         "TIMESTAMP_1", "const(0)", "const(0)", "1-tail"],
+         "the 16-element CO25 write form: no old[] block, so the write tuple "
+         f"is the read tuple minus its leading value[8]. {write_shape}")
     a.ok("both data tuples have multiplicity `mu - end`",
          len(re.findall(r"BusInteraction::sender\(BusId::Memw, mu_minus_end", buses)) == 2,
          "an `end` row therefore emits NO memory operation -- the premise the "
@@ -406,8 +511,8 @@ def audit_buses(a, repo):
     a.ok("the read addresses src and the write addresses dst",
          "start_column: cols::SRC_0" in read_tuple
          and "start_column: cols::DST_0" in write_tuple)
-    a.ok("both data tuples are non-register accesses",
-         "// is_register" in read_tuple and "// is_register" in write_tuple)
+    # `is_register = 0` on both tuples is pinned by the two shape claims above,
+    # positionally and by value -- see `pushes`.
 
 
 # ---------------------------------------------------------------------------
@@ -673,7 +778,19 @@ def main():
                      ("G. bus packing", audit_packing),
                      ("H. fixture pinning", audit_fixture)):
         before, before_checks = len(a.findings), a.checks
-        fn(a, repo)
+        try:
+            fn(a, repo)
+        except Exception as exc:                                  # noqa: BLE001
+            # A section that DIES has not passed. Most claims slice the source
+            # on a marker (`// 22. MEMW read`, `impl ConstraintSet`, `// 23.`),
+            # and `split(marker)[1]` on a marker that moved raises IndexError,
+            # which used to kill the whole run with no report printed at all --
+            # so a purely cosmetic comment rename became a hard red, and to
+            # anything scoring by exit code a crash was indistinguishable from
+            # a catch. Report it as what it is: the structure this section
+            # assumes really did move, and the remaining sections still run.
+            a.ok(f"{name} could be audited (its source markers still exist)",
+                 False, f"{type(exc).__name__}: {exc}")
         n = a.checks - before_checks
         status = "ok" if len(a.findings) == before else f"{len(a.findings) - before} finding(s)"
         print(f"  {name:20s} {n:3d} claims   {status}")
