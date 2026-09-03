@@ -7,18 +7,40 @@ use crate::vm::{
 
 const REGULAR_PC_UPDATE: u64 = 4;
 
-pub enum SyscallNumbers {
-    // Placeholder discriminant. The actual syscall value is KECCAK_SYSCALL_NUMBER.
+/// Declares `SyscallNumbers` and derives `ALL` from the same variant list, so a
+/// syscall added to the enum is enumerated by everything driven off `ALL` (the
+/// CLI's accelerator-parity test) without a second list to keep in sync.
+macro_rules! syscall_numbers {
+    ($($(#[$meta:meta])* $variant:ident = $discriminant:literal,)+) => {
+        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+        pub enum SyscallNumbers {
+            $($(#[$meta])* $variant = $discriminant,)+
+        }
+
+        impl SyscallNumbers {
+            /// Every variant, generated alongside the enum.
+            pub const ALL: &'static [SyscallNumbers] = &[$(SyscallNumbers::$variant,)+];
+        }
+    };
+}
+
+syscall_numbers! {
+    /// Placeholder discriminant. The actual syscall value is `KECCAK_SYSCALL_NUMBER`.
     KeccakPermute = 0,
     Print = 1,
     Panic = 2,
     Commit = 64,
     Halt = 93,
-    // Placeholder discriminant. The actual syscall value is ECSM_SYSCALL_NUMBER.
+    /// Placeholder discriminant. The actual syscall value is `ECSM_SYSCALL_NUMBER`.
     Ecsm = 94,
-    // Placeholder discriminant. The actual syscall value is HINT_SYSCALL_NUMBER.
-    // Non-constraining hint (host computes modular inverse/sqrt, guest verifies).
+    /// Placeholder discriminant. The actual syscall value is
+    /// `HINT_SYSCALL_NUMBER`. Non-constraining hint (host computes modular
+    /// inverse/sqrt, guest verifies).
     Hint = 95,
+    /// Placeholder discriminant. The actual syscall value is
+    /// `DMA_MEMCPY_SYSCALL_NUMBER`. DMA memcpy chunks are proven by the
+    /// dedicated DMA table.
+    DmaMemcpy = 96,
 }
 
 /// Syscall number for KeccakPermute (u64::MAX - 1 = 0xFFFF_FFFF_FFFF_FFFE).
@@ -33,6 +55,27 @@ const KECCAK_STATE_BYTES: u64 = 25 * 8;
 /// `u64::MAX - 10 = 0xFFFF_FFFF_FFFF_FFF5`, which the ECSM core table puts on the `Ecall`
 /// bus as `[lo32, hi32] = [2^32 - 11, 2^32 - 1]`.
 pub const ECSM_SYSCALL_NUMBER: u64 = u64::MAX - 10;
+
+/// DMA memcpy syscall number. Must match `syscalls/src/syscalls.rs`.
+pub const DMA_MEMCPY_SYSCALL_NUMBER: u64 = u64::MAX - 2;
+/// Maximum bytes accepted by one DMA ecall. The guest `memcpy` stub chunks
+/// larger copies, and the prover enforces this bound on every first DMA row.
+pub const DMA_MEMCPY_MAX_BYTES: u64 = 256;
+
+/// DMA data rows one ecall of `count` bytes produces: one row per eight-byte
+/// chunk while at least eight bytes remain, then one per tail byte.
+pub fn dma_memcpy_data_rows(count: u64) -> u64 {
+    count / 8 + count % 8
+}
+
+/// Total DMA table rows one ecall of `count` bytes produces: its data rows plus
+/// the terminal row. Every consumer that needs a row count — the trace builder,
+/// the sizing pass and the CLI's accelerator report — goes through this function
+/// or [`dma_memcpy_data_rows`], so none of them can drift from the trace the
+/// prover actually builds.
+pub fn dma_memcpy_trace_rows(count: u64) -> u64 {
+    dma_memcpy_data_rows(count) + 1
+}
 
 /// Syscall number for the non-constraining `Hint` ecall.
 ///
@@ -88,6 +131,7 @@ impl TryFrom<u64> for SyscallNumbers {
             93 => Ok(SyscallNumbers::Halt),
             v if v == KECCAK_SYSCALL_NUMBER => Ok(SyscallNumbers::KeccakPermute),
             v if v == ECSM_SYSCALL_NUMBER => Ok(SyscallNumbers::Ecsm),
+            v if v == DMA_MEMCPY_SYSCALL_NUMBER => Ok(SyscallNumbers::DmaMemcpy),
             v if v == HINT_SYSCALL_NUMBER => Ok(SyscallNumbers::Hint),
             _ => Err(()),
         }
@@ -99,9 +143,25 @@ impl TryFrom<u64> for SyscallNumbers {
 pub enum Accelerator {
     Keccak,
     Ecsm,
+    Dma,
 }
 
 impl SyscallNumbers {
+    /// The raw `a7` value this syscall is invoked with. The accelerator numbers
+    /// exceed `isize::MAX`, so they can't be enum discriminants.
+    pub fn raw(self) -> u64 {
+        match self {
+            SyscallNumbers::KeccakPermute => KECCAK_SYSCALL_NUMBER,
+            SyscallNumbers::Ecsm => ECSM_SYSCALL_NUMBER,
+            SyscallNumbers::DmaMemcpy => DMA_MEMCPY_SYSCALL_NUMBER,
+            SyscallNumbers::Hint => HINT_SYSCALL_NUMBER,
+            SyscallNumbers::Print => SyscallNumbers::Print as u64,
+            SyscallNumbers::Panic => SyscallNumbers::Panic as u64,
+            SyscallNumbers::Commit => SyscallNumbers::Commit as u64,
+            SyscallNumbers::Halt => SyscallNumbers::Halt as u64,
+        }
+    }
+
     /// The accelerator this syscall drives, if any. Exhaustive `match self`:
     /// adding a `SyscallNumbers` variant is a compile error here, so a new
     /// accelerator can't be silently missed by counters that consume this.
@@ -109,6 +169,7 @@ impl SyscallNumbers {
         match self {
             SyscallNumbers::KeccakPermute => Some(Accelerator::Keccak),
             SyscallNumbers::Ecsm => Some(Accelerator::Ecsm),
+            SyscallNumbers::DmaMemcpy => Some(Accelerator::Dma),
             SyscallNumbers::Print
             | SyscallNumbers::Panic
             | SyscallNumbers::Commit
@@ -550,6 +611,32 @@ impl Instruction {
                         src2_val = addr_xg;
                         dst_val = addr_k;
                     }
+                    SyscallNumbers::DmaMemcpy => {
+                        // memcpy(dst = x10, src = x11, n = x12). Snapshot the input
+                        // before writing, which also gives this ecall well-defined
+                        // memmove semantics when the regions overlap. The DMA trace
+                        // authenticates the same read-at-T+1/write-at-T+2 relation.
+                        let dst = registers.read(10)?;
+                        let src = registers.read(11)?;
+                        let n = registers.read(12)?;
+                        if n > DMA_MEMCPY_MAX_BYTES {
+                            return Err(ExecutionError::DmaMemcpyChunkTooLarge(n));
+                        }
+                        dst.checked_add(n).ok_or(MemoryError::AddressOverflow)?;
+                        src.checked_add(n).ok_or(MemoryError::AddressOverflow)?;
+
+                        // The fixed-size scratch avoids a heap allocation on every
+                        // hot-path ecall while preserving snapshot semantics.
+                        let mut bytes = [0u8; DMA_MEMCPY_MAX_BYTES as usize];
+                        for (i, byte) in bytes[..n as usize].iter_mut().enumerate() {
+                            *byte = memory.load_byte(src + i as u64);
+                        }
+                        for (i, &byte) in bytes[..n as usize].iter().enumerate() {
+                            memory.store_byte(dst + i as u64, byte);
+                        }
+                        src2_val = src;
+                        dst_val = n;
+                    }
                     SyscallNumbers::Hint => {
                         // Non-constraining hint: host computes a modular inverse/sqrt
                         // and writes it to the guest, which verifies it (and falls back
@@ -766,6 +853,8 @@ pub enum ExecutionError {
     EcsmAddressOverflow,
     #[error("ECSM xG and k operand ranges overlap")]
     EcsmOperandOverlap,
+    #[error("DMA memcpy chunk has {0} bytes; maximum per ecall is {DMA_MEMCPY_MAX_BYTES}")]
+    DmaMemcpyChunkTooLarge(u64),
     #[error("Hint address range overflows the lower 32-bit limb")]
     HintAddressOverflow,
     #[error("Unknown hint selector: {0}")]

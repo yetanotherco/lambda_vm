@@ -11,7 +11,7 @@ use clap::{Parser, Subcommand, ValueHint};
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use executor::vm::instruction::decoding::Instruction;
-use executor::vm::instruction::execution::{Accelerator, SyscallNumbers};
+use executor::vm::instruction::execution::{Accelerator, SyscallNumbers, dma_memcpy_trace_rows};
 use executor::{elf::Elf, flamegraph::FlamegraphGenerator, vm::execution::Executor};
 use prover::VmProof;
 use stark::proof::options::GoldilocksCubicProofOptions;
@@ -142,9 +142,12 @@ enum Commands {
         cycle_budget: Option<u64>,
 
         /// Print the dynamic instruction (cycle) count, plus `Keccak calls` /
-        /// `Ecsm calls` (accelerator syscall invocations). The accelerator lines
-        /// are omitted when combined with --flamegraph (that path has no per-log
-        /// data).
+        /// `Ecsm calls` / `Dma calls` (accelerator syscall invocations), and for
+        /// DMA the `Dma bytes` copied and the `Dma rows` those copies add to the
+        /// trace before its power-of-two padding. One `memcpy` is chunked into
+        /// several DMA ecalls, so the byte and row lines, not the call count, are
+        /// what the copies cost. The accelerator lines are omitted when combined
+        /// with --flamegraph (that path has no per-log data).
         #[arg(long)]
         cycles: bool,
     },
@@ -359,6 +362,38 @@ struct FlamegraphCliOptions {
     checkpoint_cycles: Option<u64>,
 }
 
+/// One tally per [`Accelerator`] variant, printed by `execute --cycles`.
+#[derive(Default)]
+struct AccelCounts {
+    keccak: u64,
+    ecsm: u64,
+    dma: u64,
+    /// Bytes copied and DMA table rows those copies consume. Keccak and ECSM
+    /// cost the same per call, so DMA is the only accelerator whose report needs
+    /// a size next to its count: one `memcpy` becomes as many ecalls as the
+    /// guest stub chunks it into, which makes `dma` alone a poor cost proxy.
+    dma_bytes: u64,
+    dma_rows: u64,
+}
+
+impl AccelCounts {
+    /// Exhaustive `match`: a new `Accelerator` variant is a compile error here,
+    /// so it cannot be executed without also being reported. `dst_val` is the
+    /// ECALL's logged destination operand, which for DMA is the chunk's byte
+    /// count and for the other accelerators is unused.
+    fn tally(&mut self, accelerator: Accelerator, dst_val: u64) {
+        match accelerator {
+            Accelerator::Keccak => self.keccak += 1,
+            Accelerator::Ecsm => self.ecsm += 1,
+            Accelerator::Dma => {
+                self.dma += 1;
+                self.dma_bytes += dst_val;
+                self.dma_rows += dma_memcpy_trace_rows(dst_val);
+            }
+        }
+    }
+}
+
 /// Classifies one executed instruction as an accelerator syscall invocation.
 ///
 /// Delegates to the executor's canonical `SyscallNumbers::accelerator()` so the
@@ -412,7 +447,7 @@ fn cmd_execute(
     // below (the flamegraph path drives execution inside the executor and does
     // not expose per-log data). `None` means "not counted", so the accel lines
     // are omitted rather than printed as misleading zeros.
-    let mut accel_counts: Option<(u64, u64)> = None;
+    let mut accel_counts: Option<AccelCounts> = None;
 
     let cycle_count = if let Some(ref output_path) = flamegraph.path {
         // Shared execute+flamegraph path (executor::flamegraph) instead of
@@ -478,14 +513,13 @@ fn cmd_execute(
         };
 
         let mut cycle_count: u64 = 0;
-        let mut keccak_calls: u64 = 0;
-        let mut ecsm_calls: u64 = 0;
-        // Reused per chunk: `(current_pc, a7)` for logs whose a7 matches an
-        // accelerator syscall number. This is a cheap superset — a non-ECALL
+        let mut counts = AccelCounts::default();
+        // Reused per chunk: `(current_pc, a7, dst_val)` for logs whose a7 matches
+        // an accelerator syscall number. This is a cheap superset — a non-ECALL
         // instruction can hold the same value in src1 — that `accelerator_of`
         // confirms below, once the chunk's `&Log` borrow (tied to the executor's
         // `&mut`) is released so the instruction cache can be read again.
-        let mut accel_candidates: Vec<(u64, u64)> = Vec::new();
+        let mut accel_candidates: Vec<(u64, u64, u64)> = Vec::new();
         loop {
             let logs = match executor.resume_budgeted(cycle_count, cycle_budget) {
                 Ok(logs) => logs,
@@ -502,17 +536,15 @@ fn cmd_execute(
                         .map(|s| s.accelerator().is_some())
                         .unwrap_or(false)
                     {
-                        accel_candidates.push((log.current_pc, log.src1_val));
+                        accel_candidates.push((log.current_pc, log.src1_val, log.dst_val));
                     }
                 }
             }
             // `logs` is no longer used, so the executor's `&mut` borrow is free
             // and the instruction cache can be read to confirm each candidate.
-            for (pc, a7) in accel_candidates.drain(..) {
-                match accelerator_of(executor.instructions.get(pc), a7) {
-                    Some(Accelerator::Keccak) => keccak_calls += 1,
-                    Some(Accelerator::Ecsm) => ecsm_calls += 1,
-                    None => {}
+            for (pc, a7, dst_val) in accel_candidates.drain(..) {
+                if let Some(accelerator) = accelerator_of(executor.instructions.get(pc), a7) {
+                    counts.tally(accelerator, dst_val);
                 }
             }
             if cycle_budget.is_some_and(|budget| cycle_count >= budget) {
@@ -526,16 +558,19 @@ fn cmd_execute(
         }
 
         if cycles {
-            accel_counts = Some((keccak_calls, ecsm_calls));
+            accel_counts = Some(counts);
         }
         cycle_count
     };
 
     if cycles {
         println!("Cycles: {}", cycle_count);
-        if let Some((keccak_calls, ecsm_calls)) = accel_counts {
-            println!("Keccak calls: {}", keccak_calls);
-            println!("Ecsm calls: {}", ecsm_calls);
+        if let Some(counts) = accel_counts {
+            println!("Keccak calls: {}", counts.keccak);
+            println!("Ecsm calls: {}", counts.ecsm);
+            println!("Dma calls: {}", counts.dma);
+            println!("Dma bytes: {}", counts.dma_bytes);
+            println!("Dma rows: {}", counts.dma_rows);
         }
     }
 
@@ -1102,43 +1137,112 @@ mod tests {
         assert_eq!(continuation_epoch_size(20).unwrap(), 1 << 20);
     }
 
+    /// The chip each syscall must drive, written out here rather than read back
+    /// from `SyscallNumbers::accelerator()`. Comparing the CLI against the
+    /// executor alone would pass if both agreed on the wrong answer — a chip
+    /// demoted to `None` has to fail somewhere, and this is that somewhere.
+    ///
+    /// Cross-checked row by row against `SyscallNumbers::ALL`, which the
+    /// executor's macro generates from the enum, so a new syscall fails the test
+    /// until it gets a row here.
+    const EXPECTED_ACCELERATORS: &[(SyscallNumbers, Option<Accelerator>)] = &[
+        (SyscallNumbers::KeccakPermute, Some(Accelerator::Keccak)),
+        (SyscallNumbers::Ecsm, Some(Accelerator::Ecsm)),
+        (SyscallNumbers::DmaMemcpy, Some(Accelerator::Dma)),
+        (SyscallNumbers::Print, None),
+        (SyscallNumbers::Panic, None),
+        (SyscallNumbers::Commit, None),
+        (SyscallNumbers::Halt, None),
+        // `hint` drives its own HINT table, but the executor maps it to no
+        // `Accelerator`: the ecall adds no correctness constraint, so there is no
+        // accelerated work to attribute. `execute --cycles` reports no hint line.
+        (SyscallNumbers::Hint, None),
+    ];
+
     // `accelerator_of` must match the prover's `CpuOperation::from_log`: count an
     // invocation only when the instruction is an ECALL AND a7 is the accelerator
-    // syscall number. Covers both accelerators, the non-accelerator syscalls, a
-    // non-ECALL whose src1 collides with an accelerator number, and a cache miss.
+    // syscall number.
     #[test]
     fn accelerator_of_mirrors_prover_classification() {
-        use executor::vm::instruction::execution::{ECSM_SYSCALL_NUMBER, KECCAK_SYSCALL_NUMBER};
-
         let ecall = Instruction::EcallEbreak;
 
-        assert_eq!(
-            accelerator_of(Some(&ecall), KECCAK_SYSCALL_NUMBER),
-            Some(Accelerator::Keccak)
-        );
-        assert_eq!(
-            accelerator_of(Some(&ecall), ECSM_SYSCALL_NUMBER),
-            Some(Accelerator::Ecsm)
-        );
+        for &syscall in SyscallNumbers::ALL {
+            let rows = EXPECTED_ACCELERATORS
+                .iter()
+                .filter(|(listed, _)| *listed == syscall)
+                .count();
+            assert_eq!(
+                rows, 1,
+                "{syscall:?} needs exactly one row in EXPECTED_ACCELERATORS"
+            );
+        }
 
-        // Non-accelerator syscalls (Commit=64, Halt=93) count as neither.
-        assert_eq!(
-            accelerator_of(Some(&ecall), SyscallNumbers::Commit as u64),
-            None
-        );
-        assert_eq!(
-            accelerator_of(Some(&ecall), SyscallNumbers::Halt as u64),
-            None
-        );
+        for &(syscall, expected) in EXPECTED_ACCELERATORS {
+            assert_eq!(
+                accelerator_of(Some(&ecall), syscall.raw()),
+                expected,
+                "ECALL with a7 of {syscall:?} must classify as {expected:?}"
+            );
+            // A non-ECALL instruction whose src1 happens to equal a syscall a7
+            // must not count — this is the `f.ecall &&` guard the prover applies.
+            assert_eq!(
+                accelerator_of(Some(&Instruction::Fence), syscall.raw()),
+                None,
+                "non-ECALL with a7 of {syscall:?} must not count"
+            );
+            // No decoded instruction at the pc (cache miss) counts as neither.
+            assert_eq!(accelerator_of(None, syscall.raw()), None);
+        }
+    }
 
-        // A non-ECALL instruction whose src1 happens to equal an accelerator a7
-        // must not count — this is the `f.ecall &&` guard the prover applies.
-        assert_eq!(
-            accelerator_of(Some(&Instruction::Fence), KECCAK_SYSCALL_NUMBER),
-            None
-        );
+    // Every tallied accelerator gets its own counter: no two variants may share
+    // a field, and each must land in the one the report prints.
+    #[test]
+    fn accel_counts_tallies_each_accelerator_separately() {
+        for &(_, expected_accelerator) in EXPECTED_ACCELERATORS {
+            let Some(accelerator) = expected_accelerator else {
+                continue;
+            };
+            let mut counts = AccelCounts::default();
+            counts.tally(accelerator, 0);
+            assert_eq!(
+                counts.keccak + counts.ecsm + counts.dma,
+                1,
+                "{accelerator:?} must increment exactly one counter"
+            );
+            let expected = match accelerator {
+                Accelerator::Keccak => counts.keccak,
+                Accelerator::Ecsm => counts.ecsm,
+                Accelerator::Dma => counts.dma,
+            };
+            assert_eq!(
+                expected, 1,
+                "{accelerator:?} must increment its own counter"
+            );
+        }
+    }
 
-        // No decoded instruction at the pc (cache miss) counts as neither.
-        assert_eq!(accelerator_of(None, KECCAK_SYSCALL_NUMBER), None);
+    // The byte and row lines are what make the DMA report a cost figure rather
+    // than a call count, so they must accumulate across chunked ecalls and use
+    // the executor's row formula — the same one trace generation sizes with.
+    #[test]
+    fn accel_counts_sizes_dma_calls() {
+        let mut counts = AccelCounts::default();
+        for bytes in [256, 256, 8, 3, 0] {
+            counts.tally(Accelerator::Dma, bytes);
+        }
+
+        assert_eq!(counts.dma, 5, "every DMA ecall counts as one call");
+        assert_eq!(counts.dma_bytes, 523);
+        // 33 + 33 + 2 + 4 + 1: eight-byte rows, one row per tail byte, and a
+        // terminal row each, with the zero-byte ecall contributing only its
+        // terminal row.
+        assert_eq!(counts.dma_rows, 73);
+
+        // The other accelerators must leave the DMA size lines alone.
+        let mut others = AccelCounts::default();
+        others.tally(Accelerator::Keccak, 200);
+        others.tally(Accelerator::Ecsm, 32);
+        assert_eq!((others.dma, others.dma_bytes, others.dma_rows), (0, 0, 0));
     }
 }

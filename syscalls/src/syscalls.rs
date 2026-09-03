@@ -33,6 +33,14 @@ const KECCAK_SYSCALL_NUMBER: usize = usize::MAX - 1;
 #[cfg(target_arch = "riscv64")]
 const ECSM_SYSCALL_NUMBER: usize = usize::MAX - 10;
 
+/// DMA memcpy syscall number. Must match the executor.
+#[cfg(target_arch = "riscv64")]
+pub(crate) const DMA_MEMCPY_SYSCALL_NUMBER: usize = usize::MAX - 2;
+/// Maximum bytes sent in one DMA ecall. Larger `memcpy` calls are split by the
+/// strong assembly stub so continuation table height remains bounded by cycles.
+#[cfg(target_arch = "riscv64")]
+pub(crate) const DMA_MEMCPY_MAX_BYTES: usize = 256;
+
 /// Syscall number for the non-constraining Hint ecall.
 /// Must match `executor::...::execution::HINT_SYSCALL_NUMBER` (u64::MAX - 30).
 #[cfg(target_arch = "riscv64")]

@@ -354,6 +354,15 @@ pub enum BusId {
     Bit = 30,
 
     // =========================================================================
+    // DMA memcpy accelerator
+    // =========================================================================
+    /// DMA self-referential streaming bus (COMMIT-style): each DMA table row sends
+    /// `(timestamp, src_incr, dst_incr, count_decr)` to the next row and receives
+    /// `(timestamp, src, dst, count)` from the previous row, chaining a variable-length
+    /// copy. Only the first row receives the CPU's `Ecall`; the rest chain here.
+    DmaNext = 29,
+
+    // =========================================================================
     // Continuations
     // =========================================================================
     /// Cross-epoch memory bus: the local-to-global table's per-cell init/fini
@@ -387,6 +396,7 @@ impl BusId {
             BusId::Cpu32 => "Cpu32",
             BusId::Ecdas => "Ecdas",
             BusId::Bit => "Bit",
+            BusId::DmaNext => "DmaNext",
             BusId::GlobalMemory => "GlobalMemory",
         }
     }
@@ -418,6 +428,7 @@ impl TryFrom<u64> for BusId {
             26 => Ok(BusId::MemoryOp),
             27 => Ok(BusId::Cpu32),
             28 => Ok(BusId::Ecdas),
+            29 => Ok(BusId::DmaNext),
             30 => Ok(BusId::Bit),
             31 => Ok(BusId::GlobalMemory),
             other => Err(other),
