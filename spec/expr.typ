@@ -70,7 +70,7 @@
 )
 
 // Mutual recursion through a trick from https://github.com/typst/typst/issues/744
-#let make_expr_formatter(dict, empty: none, var: raw, num: str) = {
+#let make_expr_formatter(dict, empty: none, var: raw, num: str, flatten: (x) => x) = {
   let res(pp, expr) = {
     if expr == none {
       empty
@@ -79,9 +79,9 @@
     } else if type(expr) == int {
       num(expr)
     } else if type(expr) == array {
-      (dict.at(expr.at(0), default: (pp, rec, e) => {
+      flatten((dict.at(expr.at(0), default: (pp, rec, e) => {
         assert(false, message: "Invalid expression: " + repr(e))
-      }))(pp, res, expr)
+      }))(pp, res, expr))
     }
   }
   res.with(PREC.MAX)
@@ -93,6 +93,16 @@
     `(` + expr + `)`
   } else {
     expr
+  }
+}
+
+#let flatten_code(x) = {
+  if type(x) == array {
+    raw(x.map(c => flatten_code(c).text).join(""))
+  } else if x.has("children") {
+    flatten_code(x.children)
+  } else {
+    x
   }
 }
 
@@ -146,6 +156,8 @@
       cwrap(rec(PREC.cast, e.at(1)) + ` as ` + type_to_code(e.at(2)), pp < PREC.cast)
     },
   ),
+  num: (n) => raw(str(n)),
+  flatten: flatten_code
 )
 
 // Wrap math `expr` if `apply = true`

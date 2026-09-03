@@ -39,7 +39,7 @@ pad = 0
 [[variables.output]]
 name = "out"
 type = "DWordWL"
-desc = "$#`in <</>>/>>>` (#`shift` mod 32 dot (2 - #`word_instr`))$"
+desc = "$#`in` <<\\/>>\\/>>> (#`shift` mod 32 dot (2 - #`word_instr`))$"
 pad = 0
 
 # Auxiliary
@@ -127,7 +127,7 @@ def = {idx="i", iter=[0, 3], poly=["+", ["idx", "Y", "i"], ["idx", "X", ["+", "i
 [[variables.virtual]]
 name = "shifted"
 type = "DWordHL"
-desc = "$#`in <</>>/>>>` (#`shift` mod 32 dot (2 - #`word_instr`))$"
+desc = "$#`in` <<\\/>>\\/>>> (#`shift` mod 32 dot (2 - #`word_instr`))$"
 def = {idx="i", iter=[0, 3], poly=["+", ["*", "left", ["sum", ["=", "j", 0], "i", ["*", ["idx", "limb_shift", "j"], ["idx", "intra_limb_left", ["-", "i", "j"]]]]], ["*", "right", ["+", ["sum", ["=", "j", 0], ["-", 3, "i"], ["*", ["idx", "limb_shift", "j"], ["idx", "intra_limb_right", ["+", "i", "j"]]]], ["*", "extension", ["sum", ["=", "j", ["-", 4, "i"]], 3, ["idx", "limb_shift", "j"]]]]]]}
 
 # Multiplicities
