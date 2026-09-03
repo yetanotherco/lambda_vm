@@ -930,6 +930,21 @@ pub fn create_dma_air(proof_options: &ProofOptions) -> ConcreteVmAir<DmaConstrai
     )
 }
 
+/// Create the unified MEMMOVE AIR: one streaming copy primitive for memcpy/memmove,
+/// memset and the commit byte loop, selected by the decoded functionality columns.
+pub fn create_memmove_air(
+    proof_options: &ProofOptions,
+) -> ConcreteVmAir<crate::tables::memmove::MemmoveConstraints> {
+    build_air(
+        crate::tables::memmove::cols::NUM_COLUMNS,
+        crate::tables::memmove::bus_interactions(),
+        proof_options,
+        1,
+        crate::tables::memmove::MemmoveConstraints,
+        "MEMMOVE",
+    )
+}
+
 /// Create DMA memset AIR with streaming arithmetic constraints and bus interactions.
 pub fn create_dma_set_air(proof_options: &ProofOptions) -> ConcreteVmAir<DmaSetConstraints> {
     build_air(

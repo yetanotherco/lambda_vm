@@ -429,7 +429,10 @@ fn test_address_incr_halfword_carry() {
 fn test_bus_interactions_count() {
     use crate::tables::commit::bus_interactions;
     let interactions = bus_interactions();
-    assert_eq!(interactions.len(), 18);
+    // 18 before the byte loop moved to the MEMMOVE chip: the CommitNextByte send and
+    // receive, the per-byte MEMW read and the COMMIT[index, value] send left, and the
+    // CommitDefer hand-off arrived.
+    assert_eq!(interactions.len(), 15);
 }
 
 #[test]

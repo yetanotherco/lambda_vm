@@ -1317,12 +1317,15 @@ fn test_prove_dma_memcpy_cases_rust_guest() {
 
 #[test]
 fn test_prove_dma_memcpy_forged_value_rejected() {
-    use crate::tables::dma::cols as dma_cols;
+    use crate::tables::memmove::cols as dma_cols;
 
     let (elf, mut traces) = dma_memcpy_fixture();
     let forged_row = dma_row_matching(&traces, |_, end, _tail| !end);
-    let original = *traces.dma.main_table.get(forged_row, dma_cols::VALUE[0]);
-    traces.dma.main_table.set(
+    let original = *traces
+        .memmove
+        .main_table
+        .get(forged_row, dma_cols::VALUE[0]);
+    traces.memmove.main_table.set(
         forged_row,
         dma_cols::VALUE[0],
         original + FieldElement::<GoldilocksField>::one(),
@@ -1337,7 +1340,7 @@ fn test_prove_dma_memcpy_forged_value_rejected() {
 
 #[test]
 fn test_prove_dma_memcpy_forged_intermediate_source_rejected() {
-    use crate::tables::dma::cols as dma_cols;
+    use crate::tables::memmove::cols as dma_cols;
 
     let (elf, mut traces) = dma_memcpy_fixture();
     let forged_row = dma_row_matching(&traces, |first, end, _tail| !first && !end);
@@ -1345,14 +1348,17 @@ fn test_prove_dma_memcpy_forged_intermediate_source_rejected() {
     // Shift both the current source and its locally-consistent successor. The
     // row's ADD remains valid, but the predecessor's DmaNext tuple and the
     // source-memory read no longer match.
-    let src_lo = *traces.dma.main_table.get(forged_row, dma_cols::SRC_0);
-    let src_incr_lo = *traces.dma.main_table.get(forged_row, dma_cols::SRC_INCR_0);
-    traces.dma.main_table.set(
+    let src_lo = *traces.memmove.main_table.get(forged_row, dma_cols::SRC_0);
+    let src_incr_lo = *traces
+        .memmove
+        .main_table
+        .get(forged_row, dma_cols::SRC_INCR_0);
+    traces.memmove.main_table.set(
         forged_row,
         dma_cols::SRC_0,
         src_lo + FieldElement::from(8u64),
     );
-    traces.dma.main_table.set(
+    traces.memmove.main_table.set(
         forged_row,
         dma_cols::SRC_INCR_0,
         src_incr_lo + FieldElement::from(8u64),
@@ -1367,12 +1373,12 @@ fn test_prove_dma_memcpy_forged_intermediate_source_rejected() {
 
 #[test]
 fn test_prove_dma_memcpy_forged_early_end_rejected() {
-    use crate::tables::dma::cols as dma_cols;
+    use crate::tables::memmove::cols as dma_cols;
 
     let (elf, mut traces) = dma_memcpy_fixture();
     let forged_row = dma_row_matching(&traces, |_first, end, _tail| !end);
     traces
-        .dma
+        .memmove
         .main_table
         .set(forged_row, dma_cols::END, FieldElement::one());
 
@@ -1381,12 +1387,12 @@ fn test_prove_dma_memcpy_forged_early_end_rejected() {
 
 #[test]
 fn test_prove_dma_memcpy_forged_wide_tail_rejected() {
-    use crate::tables::dma::cols as dma_cols;
+    use crate::tables::memmove::cols as dma_cols;
 
     let (elf, mut traces) = dma_memcpy_fixture();
     let forged_row = dma_row_matching(&traces, |_first, end, tail| !end && !tail);
     traces
-        .dma
+        .memmove
         .main_table
         .set(forged_row, dma_cols::TAIL, FieldElement::one());
 
@@ -1590,21 +1596,19 @@ fn dma_memcpy_fixture() -> (Elf, Traces) {
 }
 
 fn dma_row_matching(traces: &Traces, predicate: impl Fn(bool, bool, bool) -> bool) -> usize {
-    use crate::tables::dma::cols as dma_cols;
+    use crate::tables::memmove::cols as mm_cols;
 
-    (0..traces.dma.num_rows())
+    let one = FieldElement::<GoldilocksField>::one();
+    (0..traces.memmove.num_rows())
         .find(|&row| {
-            let active = *traces.dma.main_table.get(row, dma_cols::MU)
-                == FieldElement::<GoldilocksField>::one();
-            let first = *traces.dma.main_table.get(row, dma_cols::FIRST)
-                == FieldElement::<GoldilocksField>::one();
-            let end = *traces.dma.main_table.get(row, dma_cols::END)
-                == FieldElement::<GoldilocksField>::one();
-            let tail = *traces.dma.main_table.get(row, dma_cols::TAIL)
-                == FieldElement::<GoldilocksField>::one();
-            active && predicate(first, end, tail)
+            let get = |column| *traces.memmove.main_table.get(row, column) == one;
+            // memcpy rows only: memset and commit have their own forgery surface.
+            let is_copy = !get(mm_cols::IS_SET) && !get(mm_cols::IS_COMMIT);
+            get(mm_cols::MU)
+                && is_copy
+                && predicate(get(mm_cols::FIRST), get(mm_cols::END), get(mm_cols::TAIL))
         })
-        .expect("guest must contain the requested real DMA row")
+        .expect("guest must contain the requested real MEMMOVE copy row")
 }
 
 fn assert_dma_forgery_rejected(elf: &Elf, traces: &mut Traces, reason: &str) {

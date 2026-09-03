@@ -237,8 +237,8 @@ pub fn generate_commit_trace(
 /// - **Sends** to Memw for register/memory accesses (×5, mult varies)
 pub fn bus_interactions() -> Vec<BusInteraction> {
     // Reusable multiplicity expressions
-    let mu_minus_end = Multiplicity::Diff(cols::MU, cols::END);
-    let mu_minus_first = Multiplicity::Diff(cols::MU, cols::FIRST);
+    let _mu_minus_end = Multiplicity::Diff(cols::MU, cols::END);
+    let _mu_minus_first = Multiplicity::Diff(cols::MU, cols::FIRST);
 
     vec![
         // 1. Receive ECALL from CPU (mult = first)
@@ -259,13 +259,12 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 BusValue::constant(0),  // syscall number hi32 = 0
             ],
         ),
-        // 2. Send to CommitNextByte (mult = mu - end)
-        // Sends: [timestamp, index + 1, address_incr(as DWordWL), count_decr(as DWordWL)]
+        // 2. Defer the byte loop to the MEMMOVE chip. COMMIT keeps the sys_write
+        //    ecall number and the register-254 update; the copying is handed over.
         BusInteraction::sender(
-            BusId::CommitNextByte,
-            mu_minus_end.clone(),
+            BusId::CommitDefer,
+            Multiplicity::Column(cols::FIRST),
             vec![
-                // timestamp (DWordWL: 2 Direct elements)
                 BusValue::Packed {
                     start_column: cols::TIMESTAMP_0,
                     packing: Packing::Direct,
@@ -274,56 +273,17 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                     start_column: cols::TIMESTAMP_1,
                     packing: Packing::Direct,
                 },
-                // index + 1 (BaseField)
-                BusValue::linear(vec![
-                    LinearTerm::Column {
-                        coefficient: 1,
-                        column: cols::INDEX,
-                    },
-                    LinearTerm::Constant(1),
-                ]),
-                // address_incr (DWordHL → 2 bus elements via DWordHL packing)
-                BusValue::Packed {
-                    start_column: cols::ADDRESS_INCR_0,
-                    packing: Packing::DWordHL,
-                },
-                // count_decr (DWordHL → 2 bus elements via DWordHL packing)
-                BusValue::Packed {
-                    start_column: cols::COUNT_DECR_0,
-                    packing: Packing::DWordHL,
-                },
-            ],
-        ),
-        // 3. Receive from CommitNextByte (mult = mu - first)
-        // Receives: [timestamp, index, address, count]
-        BusInteraction::receiver(
-            BusId::CommitNextByte,
-            mu_minus_first,
-            vec![
-                // timestamp (DWordWL)
-                BusValue::Packed {
-                    start_column: cols::TIMESTAMP_0,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::TIMESTAMP_1,
-                    packing: Packing::Direct,
-                },
-                // index (BaseField)
-                BusValue::Packed {
-                    start_column: cols::INDEX,
-                    packing: Packing::Direct,
-                },
-                // address (DWordWL)
                 BusValue::Packed {
                     start_column: cols::ADDRESS_0,
-                    packing: Packing::Direct,
+                    packing: Packing::DWordWL,
                 },
-                BusValue::Packed {
-                    start_column: cols::ADDRESS_1,
-                    packing: Packing::Direct,
-                },
-                // count (DWordWL → 2 bus elements)
+                // `dst` on the MEMMOVE side is a DWordWL, i.e. two bus elements; the
+                // COMMIT-domain address is the index, whose high word is always zero.
+                BusValue::linear(vec![LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::INDEX,
+                }]),
+                BusValue::constant(0),
                 BusValue::Packed {
                     start_column: cols::COUNT_0,
                     packing: Packing::DWordWL,
@@ -648,76 +608,6 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 BusValue::constant(0),
                 BusValue::constant(0),
                 BusValue::constant(0),
-            ],
-        ),
-        // 17. MEMW read byte at ts (mult = mu - end)
-        BusInteraction::sender(
-            BusId::Memw,
-            mu_minus_end.clone(),
-            vec![
-                // old[0..7] = [VALUE, 0, 0, 0, 0, 0, 0, 0]
-                BusValue::Packed {
-                    start_column: cols::VALUE,
-                    packing: Packing::Direct,
-                },
-                BusValue::constant(0),
-                BusValue::constant(0),
-                BusValue::constant(0),
-                BusValue::constant(0),
-                BusValue::constant(0),
-                BusValue::constant(0),
-                BusValue::constant(0),
-                // is_register = 0
-                BusValue::constant(0),
-                // base_address = [ADDRESS_0, ADDRESS_1]
-                BusValue::Packed {
-                    start_column: cols::ADDRESS_0,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::ADDRESS_1,
-                    packing: Packing::Direct,
-                },
-                // value[0..7] = [VALUE, 0, 0, 0, 0, 0, 0, 0] (read: same as old)
-                BusValue::Packed {
-                    start_column: cols::VALUE,
-                    packing: Packing::Direct,
-                },
-                BusValue::constant(0),
-                BusValue::constant(0),
-                BusValue::constant(0),
-                BusValue::constant(0),
-                BusValue::constant(0),
-                BusValue::constant(0),
-                BusValue::constant(0),
-                // timestamp = [TIMESTAMP_0, TIMESTAMP_1]
-                BusValue::Packed {
-                    start_column: cols::TIMESTAMP_0,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::TIMESTAMP_1,
-                    packing: Packing::Direct,
-                },
-                // w2=0, w4=0, w8=0 (width=1 byte)
-                BusValue::constant(0),
-                BusValue::constant(0),
-                BusValue::constant(0),
-            ],
-        ),
-        // 18. COMMIT[index, value] (mult = mu - end)
-        BusInteraction::sender(
-            BusId::Commit,
-            mu_minus_end,
-            vec![
-                BusValue::Packed {
-                    start_column: cols::INDEX,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::VALUE,
-                    packing: Packing::Direct,
-                },
             ],
         ),
     ]

@@ -55,7 +55,7 @@ use crate::test_utils::{
     create_cpu_air, create_cpu32_air, create_decode_air, create_dma_air, create_dma_set_air,
     create_dvrm_air, create_ecdas_air, create_ecsm_air, create_eq_air, create_halt_air,
     create_hint_air, create_keccak_air, create_keccak_rc_air, create_keccak_rnd_air,
-    create_load_air, create_lt_air, create_memw_air, create_memw_aligned_air,
+    create_load_air, create_lt_air, create_memmove_air, create_memw_air, create_memw_aligned_air,
     create_memw_register_air, create_mul_air, create_page_air, create_register_air,
     create_shift_air, create_store_air,
 };
@@ -84,7 +84,7 @@ pub struct RuntimePageRange {
 /// Number of tables that always contribute exactly one sub-proof, regardless
 /// of `TableCounts`: bitwise, decode, halt, commit, keccak, keccak_rnd,
 /// keccak_rc, register, ecsm, ecdas, hint, dma, dma_set.
-pub const FIXED_TABLE_COUNT: usize = 13;
+pub const FIXED_TABLE_COUNT: usize = 14;
 
 /// Number of chunks for each split table.
 /// The verifier needs this to reconstruct matching AIRs.
@@ -526,6 +526,7 @@ pub(crate) struct VmAirs {
     pub hint: VmAir,
     pub dma: VmAir,
     pub dma_set: VmAir,
+    pub memmove: VmAir,
     pub register: VmAir,
     pub pages: Vec<VmAir>,
     pub memw_registers: Vec<VmAir>,
@@ -554,6 +555,7 @@ impl VmAirs {
             (self.hint.as_ref(), &mut traces.hint, &()),
             (self.dma.as_ref(), &mut traces.dma, &()),
             (self.dma_set.as_ref(), &mut traces.dma_set, &()),
+            (self.memmove.as_ref(), &mut traces.memmove, &()),
             (self.register.as_ref(), &mut traces.register, &()),
         ];
         if self.include_halt {
@@ -631,6 +633,7 @@ impl VmAirs {
             self.hint.as_ref(),
             self.dma.as_ref(),
             self.dma_set.as_ref(),
+            self.memmove.as_ref(),
             self.register.as_ref(),
         ];
         if self.include_halt {
@@ -805,6 +808,7 @@ impl VmAirs {
         let hint: VmAir = Box::new(create_hint_air(proof_options));
         let dma: VmAir = Box::new(create_dma_air(proof_options));
         let dma_set: VmAir = Box::new(create_dma_set_air(proof_options));
+        let memmove: VmAir = Box::new(create_memmove_air(proof_options));
         let register: VmAir =
             if let Some((commitment, num_preprocessed_cols)) = register_preprocessed {
                 Box::new(
@@ -928,6 +932,7 @@ impl VmAirs {
             hint,
             dma,
             dma_set,
+            memmove,
             register,
             pages,
             memw_registers,

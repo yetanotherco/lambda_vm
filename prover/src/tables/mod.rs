@@ -43,6 +43,7 @@ pub mod keccak_rnd;
 pub mod load;
 pub mod local_to_global;
 pub mod lt;
+pub mod memmove;
 pub mod memw;
 pub mod memw_aligned;
 pub mod memw_register;

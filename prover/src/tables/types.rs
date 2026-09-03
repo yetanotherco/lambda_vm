@@ -374,6 +374,21 @@ pub enum BusId {
     /// Cross-epoch memory bus: the local-to-global table's per-cell init/fini
     /// boundary claims, matched across epochs by the final aggregation LogUp.
     GlobalMemory = 31,
+
+    // =========================================================================
+    // Unified memmove primitive
+    // =========================================================================
+    /// MEMMOVE self-referential streaming bus. A row sends
+    /// `(timestamp, src_incr, dst_incr, count_decr, is_set, is_commit)` to the next
+    /// row and receives `(timestamp, src, dst, count, is_set, is_commit)` from the
+    /// previous one. The functionality selectors travel inside the tuple, so a chain
+    /// cannot change operation half way through it — the guarantee the three separate
+    /// DmaNext/DmaSetNext/CommitNextByte buses used to give structurally.
+    MemmoveNext = 33,
+    /// COMMIT → MEMMOVE hand-off: COMMIT keeps the `sys_write` ecall number and the
+    /// register-254 update, and defers its byte loop here as
+    /// `(timestamp, buf_addr, start_index, count)`.
+    CommitDefer = 34,
 }
 
 impl BusId {
@@ -394,6 +409,8 @@ impl BusId {
             BusId::Ecall => "Ecall",
             BusId::CommitNextByte => "CommitNextByte",
             BusId::Commit => "Commit",
+            BusId::MemmoveNext => "MemmoveNext",
+            BusId::CommitDefer => "CommitDefer",
             BusId::Keccak => "Keccak",
             BusId::KeccakRc => "KeccakRc",
             BusId::ByteAlu => "ByteAlu",
@@ -428,6 +445,8 @@ impl TryFrom<u64> for BusId {
             19 => Ok(BusId::Ecall),
             20 => Ok(BusId::CommitNextByte),
             21 => Ok(BusId::Commit),
+            33 => Ok(BusId::MemmoveNext),
+            34 => Ok(BusId::CommitDefer),
             22 => Ok(BusId::Keccak),
             23 => Ok(BusId::KeccakRc),
             24 => Ok(BusId::ByteAlu),
