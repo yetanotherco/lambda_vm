@@ -66,27 +66,37 @@ pub const DMA_MEMCPY_SYSCALL_NUMBER: u64 = u64::MAX - 2;
 /// larger copies, and the prover enforces this bound on every first DMA row.
 pub const DMA_MEMCPY_MAX_BYTES: u64 = 256;
 
-/// DMA data rows one ecall of `count` bytes produces: one row per eight-byte
-/// chunk while at least eight bytes remain, then one per tail byte.
-pub fn dma_memcpy_data_rows(count: u64) -> u64 {
-    count / 8 + count % 8
+/// Width of one MEMMOVE row: one byte until `dst` reaches eight-alignment, then
+/// eight while at least eight bytes remain, then one per remaining byte. Keeping
+/// the body aligned is what lets those rows take the `MEMW_A` fast path.
+pub fn memmove_row_width(destination_addr: u64, remaining: u64) -> u8 {
+    if remaining < 8 || !destination_addr.is_multiple_of(8) {
+        1
+    } else {
+        8
+    }
 }
 
-/// Total DMA table rows one ecall of `count` bytes produces: its data rows plus
-/// the terminal row. Every consumer that needs a row count — the trace builder,
-/// the sizing pass and the CLI's accelerator report — goes through this function
-/// or [`dma_memcpy_data_rows`], so none of them can drift from the trace the
-/// prover actually builds.
-pub fn dma_memcpy_trace_rows(count: u64) -> u64 {
-    dma_memcpy_data_rows(count) + 1
+/// Total MEMMOVE rows one ecall produces: its data rows plus the terminal row.
+///
+/// A pure function of `(dst, count)` — the width now depends on the destination's
+/// alignment, not on `count` alone. Every consumer that needs a row count (the
+/// trace builder, the sizing pass, the CLI's accelerator report) goes through this
+/// function, so none of them can drift from the trace the prover actually builds.
+pub fn memmove_trace_rows(dst: u64, count: u64) -> u64 {
+    let mut rows = 1;
+    let mut offset = 0u64;
+    let mut remaining = count;
+    while remaining != 0 {
+        let width = u64::from(memmove_row_width(dst.wrapping_add(offset), remaining));
+        offset += width;
+        remaining -= width;
+        rows += 1;
+    }
+    rows
 }
 /// DMA memset syscall number. Must match `syscalls/src/syscalls.rs`.
 pub const DMA_MEMSET_SYSCALL_NUMBER: u64 = u64::MAX - 3;
-/// Largest fill value a DMA memset ecall accepts. C's `memset` writes
-/// `(unsigned char)c`, so the guest stub masks `a1` down to this range; a wider
-/// value is a malformed call. Bounding it here lets the DMA_SET AIR prove the
-/// same bound with one ALU LT instead of decomposing the register.
-pub const DMA_MEMSET_MAX_FILL: u64 = 255;
 
 /// Syscall number for the non-constraining `Hint` ecall.
 ///
@@ -647,7 +657,7 @@ impl Instruction {
                         for (i, &byte) in bytes[..n as usize].iter().enumerate() {
                             memory.store_byte(dst + i as u64, byte);
                         }
-                        src2_val = src;
+                        src2_val = dst;
                         dst_val = n;
                     }
                     SyscallNumbers::DmaMemset => {
@@ -672,7 +682,7 @@ impl Instruction {
                             let byte = memory.load_byte(src + i);
                             memory.store_byte(dst + i, byte);
                         }
-                        src2_val = src;
+                        src2_val = dst;
                         dst_val = n;
                     }
                     SyscallNumbers::Hint => {
@@ -893,8 +903,6 @@ pub enum ExecutionError {
     EcsmOperandOverlap,
     #[error("DMA chunk has {0} bytes; maximum per ecall is {DMA_MEMCPY_MAX_BYTES}")]
     DmaChunkTooLarge(u64),
-    #[error("DMA memset fill is {0}; maximum is {DMA_MEMSET_MAX_FILL}")]
-    DmaMemsetFillTooLarge(u64),
     #[error("Hint address range overflows the lower 32-bit limb")]
     HintAddressOverflow,
     #[error("Unknown hint selector: {0}")]

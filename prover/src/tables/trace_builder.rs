@@ -1082,7 +1082,10 @@ fn collect_memmove_ops(
     let mut deferred_writes = Vec::new();
 
     while remaining != 0 {
-        let width = memmove_row_width(dst.wrapping_add(offset), remaining);
+        let width = executor::vm::instruction::execution::memmove_row_width(
+            dst.wrapping_add(offset),
+            remaining,
+        );
         let source_addr = src.wrapping_add(offset);
         let destination_addr = dst.wrapping_add(offset);
         let (value, old_timestamps) = memory_state.read_bytes(source_addr, width as usize);
@@ -1157,21 +1160,34 @@ fn collect_memmove_ops(
     (memw_ops, rows)
 }
 
-/// One-byte rows until `dst` reaches eight-alignment, then eight-byte rows, then
-/// one-byte rows for whatever is left. `src` follows only when the two addresses
-/// share a residue mod 8; otherwise the destination is the side kept aligned.
-fn memmove_row_width(destination_addr: u64, remaining: u64) -> u8 {
-    if remaining < 8 || !destination_addr.is_multiple_of(8) {
-        1
-    } else {
-        8
+/// Sizing-pass replay of one MEMMOVE-driven ecall.
+///
+/// Deliberately delegates to [`collect_memmove_ops`] rather than re-deriving the
+/// schedule: the two used to be separate implementations pinned together by an
+/// assertion, and the schedule is now a function of `dst` as well as `count`, which
+/// is exactly the kind of thing that drifts. The cost is one allocation per ecall.
+#[cfg(feature = "disk-spill")]
+fn replay_memmove_for_sizing(
+    functionality: memmove::Functionality,
+    timestamp: u64,
+    src: u64,
+    dst: u64,
+    count: u64,
+    memory_state: &mut MemoryState,
+    mut visit_memw: impl FnMut(&MemwOperation),
+) -> u64 {
+    let (memw_ops, rows) =
+        collect_memmove_ops(functionality, timestamp, src, dst, count, memory_state);
+    for op in &memw_ops {
+        visit_memw(op);
     }
+    rows.len() as u64
 }
 
 /// Test hook for the schedule, so the MEMMOVE unit tests can pin it.
 #[cfg(test)]
 pub fn memmove_row_width_for_test(destination_addr: u64, remaining: u64) -> u8 {
-    memmove_row_width(destination_addr, remaining)
+    executor::vm::instruction::execution::memmove_row_width(destination_addr, remaining)
 }
 
 /// Collects the memory operations for a `Hint` ecall.
@@ -4021,8 +4037,7 @@ pub struct TableLengths {
     pub dvrm_padded_rows: u64,
     pub branch_padded_rows: u64,
     pub commit_padded_rows: u64,
-    pub dma_padded_rows: u64,
-    pub dma_set_padded_rows: u64,
+    pub memmove_padded_rows: u64,
     pub decode_rows: u64,
     pub unique_page_count: u64,
     pub cycle_count: u64,
@@ -4062,8 +4077,7 @@ pub fn count_table_lengths(
     let mut dvrm_count = 0usize;
     let mut branch_count = 0usize;
     let mut commit_count = 0usize;
-    let mut dma_count = 0usize;
-    let mut dma_set_count = 0usize;
+    let mut memmove_count = 0usize;
     let mut current_commit_index = 0u32;
 
     let partition_memw = |op: &MemwOperation,
@@ -4133,11 +4147,8 @@ pub fn count_table_lengths(
 
         // ECALL Commit
         if cpu_op.ecall_commit {
-            // Match `expand_commit_operations_for_ecall`'s `0..=count` loop
-            // without building the op vector.
-            commit_count += (cpu_op.commit_count as usize)
-                .checked_add(1)
-                .ok_or_else(|| Error::Execution("commit_count overflows usize".into()))?;
+            // COMMIT is one row per ecall now; the byte loop is MEMMOVE's.
+            commit_count += 1;
             let reg_commit_ops =
                 collect_commit_memw_ops(&cpu_op, &mut register_state, &mut memory_state);
             for memw_op in &reg_commit_ops {
@@ -4148,6 +4159,24 @@ pub fn count_table_lengths(
                     &mut memw_register_count,
                 );
             }
+            let rows = replay_memmove_for_sizing(
+                memmove::Functionality::Commit,
+                cpu_op.timestamp,
+                cpu_op.commit_buf_addr,
+                current_commit_index as u64,
+                cpu_op.commit_count,
+                &mut memory_state,
+                |memw_op| {
+                    partition_memw(
+                        memw_op,
+                        &mut memw_by_width,
+                        &mut memw_aligned_count,
+                        &mut memw_register_count,
+                    );
+                },
+            );
+            memmove_count += rows as usize;
+            lt_count += rows as usize;
             let count = u32::try_from(cpu_op.commit_count)
                 .map_err(|_| Error::Execution("commit_count exceeds u32 range".into()))?;
             current_commit_index = current_commit_index
@@ -4155,11 +4184,36 @@ pub fn count_table_lengths(
                 .ok_or_else(|| Error::Execution("commit index exceeds u32 range".into()))?;
         }
 
-        if cpu_op.ecall_dma_memcpy {
-            let dma_rows = replay_dma_memcpy_for_sizing(
-                &cpu_op,
+        if cpu_op.ecall_dma_memcpy || cpu_op.ecall_dma_memset {
+            let functionality = if cpu_op.ecall_dma_memset {
+                memmove::Functionality::Set
+            } else {
+                memmove::Functionality::Copy
+            };
+            let dst = register_state.read(10).0;
+            let src = register_state.read(11).0;
+            let count = register_state.read(12).0;
+            for (reg, value) in [(10u8, dst), (11u8, src), (12u8, count)] {
+                let packed = pack_register_value(value);
+                let (_old_value, old_ts) = register_state.read(reg);
+                let reg_op =
+                    MemwOperation::new(true, 2 * reg as u64, packed, cpu_op.timestamp, 2, true)
+                        .with_old(packed, [old_ts, old_ts, 0, 0, 0, 0, 0, 0]);
+                partition_memw(
+                    &reg_op,
+                    &mut memw_by_width,
+                    &mut memw_aligned_count,
+                    &mut memw_register_count,
+                );
+                register_state.write(reg, value, cpu_op.timestamp);
+            }
+            let rows = replay_memmove_for_sizing(
+                functionality,
+                cpu_op.timestamp,
+                src,
+                dst,
+                count,
                 &mut memory_state,
-                &mut register_state,
                 |memw_op| {
                     partition_memw(
                         memw_op,
@@ -4169,30 +4223,9 @@ pub fn count_table_lengths(
                     );
                 },
             );
-            dma_count += dma_rows;
-            // One LT per row pins the 1-vs-8-byte width, plus one per ecall
-            // proves that its initial count fits the continuation-safe chunk cap.
-            lt_count += dma_rows + 1;
-        }
-
-        if cpu_op.ecall_dma_memset {
-            let rows = replay_dma_memset_for_sizing(
-                &cpu_op,
-                &mut memory_state,
-                &mut register_state,
-                |memw_op| {
-                    partition_memw(
-                        memw_op,
-                        &mut memw_by_width,
-                        &mut memw_aligned_count,
-                        &mut memw_register_count,
-                    );
-                },
-            );
-            dma_set_count += rows;
-            // One LT per row pins the 1-vs-8-byte width; the first row adds two
-            // more (the chunk cap and the fill-byte bound).
-            lt_count += rows + 2;
+            memmove_count += rows as usize;
+            // One LT per row pins `lt8`, plus one per ecall for the chunk cap.
+            lt_count += rows as usize + 1;
         }
 
         if cpu_op.ecall_hint {
@@ -4273,14 +4306,7 @@ pub fn count_table_lengths(
             .checked_next_power_of_two()
             .unwrap_or(usize::MAX)
             .max(4) as u64,
-        dma_padded_rows: dma_count
-            .checked_next_power_of_two()
-            .unwrap_or(usize::MAX)
-            .max(4) as u64,
-        dma_set_padded_rows: dma_set_count
-            .checked_next_power_of_two()
-            .unwrap_or(usize::MAX)
-            .max(4) as u64,
+        memmove_padded_rows: memmove_count.next_power_of_two().max(4) as u64,
         decode_rows,
         unique_page_count,
         cycle_count,

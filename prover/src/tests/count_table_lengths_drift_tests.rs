@@ -52,12 +52,8 @@ fn assert_count_table_lengths_matches(elf: &Elf, logs: &[Log]) {
         "commit"
     );
     assert_eq!(
-        predicted.dma_padded_rows, traces.dma.main_table.height as u64,
-        "dma"
-    );
-    assert_eq!(
-        predicted.dma_set_padded_rows, traces.dma_set.main_table.height as u64,
-        "dma_set"
+        predicted.memmove_padded_rows, traces.memmove.main_table.height as u64,
+        "memmove"
     );
     assert_eq!(
         predicted.decode_rows, traces.decode.main_table.height as u64,
