@@ -11,7 +11,7 @@ use clap::{Parser, Subcommand, ValueHint};
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use executor::vm::instruction::decoding::Instruction;
-use executor::vm::instruction::execution::{Accelerator, SyscallNumbers, memmove_trace_rows};
+use executor::vm::instruction::execution::{Accelerator, SyscallNumbers};
 use executor::{elf::Elf, flamegraph::FlamegraphGenerator, vm::execution::Executor};
 use prover::VmProof;
 use stark::proof::options::GoldilocksCubicProofOptions;
@@ -380,16 +380,17 @@ impl AccelCounts {
     /// Exhaustive `match`: a new `Accelerator` variant is a compile error here,
     /// so it cannot be executed without also being reported. `dst_val` is the
     /// ECALL's logged operands: `dst_val` is the chunk's byte count for DMA and
-    /// unused for the others, and `dst_addr` is the destination address, which the
-    /// row count needs now that the width depends on its alignment.
-    fn tally(&mut self, accelerator: Accelerator, dst_val: u64, dst_addr: u64) {
+    /// unused for the others; `rows` is the MEMMOVE row count the executor derived
+    /// at the ecall, where it knows `src`, `dst` and `count` — the schedule reads
+    /// both ends' residues, so the count cannot be recovered from one address.
+    fn tally(&mut self, accelerator: Accelerator, dst_val: u64, rows: u64) {
         match accelerator {
             Accelerator::Keccak => self.keccak += 1,
             Accelerator::Ecsm => self.ecsm += 1,
             Accelerator::Dma => {
                 self.dma += 1;
                 self.dma_bytes += dst_val;
-                self.dma_rows += memmove_trace_rows(dst_addr, dst_val);
+                self.dma_rows += rows;
             }
         }
     }
@@ -548,9 +549,9 @@ fn cmd_execute(
             }
             // `logs` is no longer used, so the executor's `&mut` borrow is free
             // and the instruction cache can be read to confirm each candidate.
-            for (pc, a7, dst_val, dst_addr) in accel_candidates.drain(..) {
+            for (pc, a7, dst_val, rows) in accel_candidates.drain(..) {
                 if let Some(accelerator) = accelerator_of(executor.instructions.get(pc), a7) {
-                    counts.tally(accelerator, dst_val, dst_addr);
+                    counts.tally(accelerator, dst_val, rows);
                 }
             }
             if cycle_budget.is_some_and(|budget| cycle_count >= budget) {
@@ -1235,28 +1236,16 @@ mod tests {
     #[test]
     fn accel_counts_sizes_dma_calls() {
         let mut counts = AccelCounts::default();
-        for bytes in [256, 256, 8, 3, 0] {
-            counts.tally(Accelerator::Dma, bytes, 0);
+        // (bytes, rows) as the executor derives them at each ecall.
+        for (bytes, rows) in [(256, 33), (256, 33), (8, 2), (3, 4), (0, 1)] {
+            counts.tally(Accelerator::Dma, bytes, rows);
         }
 
         assert_eq!(counts.dma, 5, "every DMA ecall counts as one call");
         assert_eq!(counts.dma_bytes, 523);
-        // An eight-aligned destination: 33 + 33 + 2 + 4 + 1 — eight-byte rows, one
-        // row per tail byte, and a terminal row each, with the zero-byte ecall
-        // contributing only its terminal row.
+        // The rows are the executor's, derived where src, dst and count are all known;
+        // the report only sums them.
         assert_eq!(counts.dma_rows, 73);
-
-        // The same lengths at an unaligned destination cost more rows, because the
-        // schedule walks single bytes until it reaches alignment. That difference is
-        // the whole reason the row count needs the address.
-        let mut unaligned = AccelCounts::default();
-        for bytes in [256, 256, 8, 3, 0] {
-            unaligned.tally(Accelerator::Dma, bytes, 5);
-        }
-        assert!(
-            unaligned.dma_rows > counts.dma_rows,
-            "a misaligned destination cannot be cheaper"
-        );
 
         // The other accelerators must leave the DMA size lines alone.
         let mut others = AccelCounts::default();

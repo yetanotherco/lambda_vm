@@ -822,20 +822,14 @@ mod tests {
     }
 
     #[test]
-    fn the_schedule_aligns_the_destination_before_widening() {
-        // dst = 5: three one-byte rows reach 8-alignment, then eight-byte rows.
-        assert_eq!(
-            super::super::trace_builder::memmove_row_width_for_test(5, 24),
-            1
-        );
-        assert_eq!(
-            super::super::trace_builder::memmove_row_width_for_test(8, 21),
-            8
-        );
-        // and a short remainder falls back to one byte a row.
-        assert_eq!(
-            super::super::trace_builder::memmove_row_width_for_test(16, 5),
-            1
-        );
+    fn the_schedule_aligns_both_ends_or_neither() {
+        use super::super::trace_builder::memmove_row_width_for_test as w;
+        // Matched residues (both 5 mod 8): one-byte rows until alignment, then wide.
+        assert_eq!(w(0x1005, 0x2005, 0, 24), 1);
+        assert_eq!(w(0x1005, 0x2005, 3, 21), 8);
+        // Mismatched: aligning `dst` would misalign `src`, so do not split at all.
+        assert_eq!(w(0x1002, 0x2005, 0, 24), 8);
+        // A short remainder always falls back to one byte a row.
+        assert_eq!(w(0x1000, 0x2000, 16, 5), 1);
     }
 }

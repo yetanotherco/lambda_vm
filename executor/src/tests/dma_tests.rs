@@ -77,22 +77,22 @@ fn dma_memcpy_rejects_oversized_direct_ecall() {
 #[test]
 fn dma_row_helpers_match_the_chunk_loop() {
     for count in 0..=DMA_MEMCPY_MAX_BYTES {
-        // The width now depends on the destination's alignment, so the row count is
-        // pinned for every residue rather than for `count` alone.
-        for dst in [0u64, 1, 3, 5, 7, 8, 16] {
+        // The width depends on both ends' residues now, so the row count is pinned
+        // for matched and mismatched pairs alike.
+        for (src, dst) in [(0u64, 0u64), (5, 5), (7, 7), (0, 5), (2, 5), (8, 16)] {
             let mut chunks = 0u64;
             let mut remaining = count;
             let mut offset = 0u64;
             while remaining != 0 {
-                let width = u64::from(memmove_row_width(dst.wrapping_add(offset), remaining));
+                let width = u64::from(memmove_row_width(src, dst, offset, remaining));
                 remaining -= width;
                 offset += width;
                 chunks += 1;
             }
             assert_eq!(
-                memmove_trace_rows(dst, count),
+                memmove_trace_rows(src, dst, count),
                 chunks + 1,
-                "dst {dst}, count {count}: the terminal row is always emitted"
+                "src {src}, dst {dst}, count {count}: the terminal row is always emitted"
             );
         }
     }
