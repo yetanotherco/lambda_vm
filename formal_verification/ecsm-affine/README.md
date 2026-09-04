@@ -50,7 +50,7 @@ anchor:  28 real witnesses + 4 rejections from ecsm::compute_witness{,_with_y}
 A1 selector    : IS_BIT + µ-gating PROVED, Ecall pinning PROVED, 3 forgery controls
 A2 YrLtP       : lift + strict chain PROVED, forgery instantiated on a real y = 1 point
 A3 parity      : forgery instantiated (2 full witnesses), the yG read PROVED to close it
-A3g            : yG canonicality is UNCHECKED — forgery instantiated, Medium, VM-parity gap
+A3g            : yG canonicality UNCHECKED in spec AND impl — instantiated, Medium
 A4 addressing   : LT bound == executor's predicate PROVED, u64-wrap control FORGES
 ```
 
