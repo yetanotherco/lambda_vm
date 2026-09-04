@@ -1,0 +1,185 @@
+
+=== audit_transcription ===
+[READ      ] P1 column layout [A1/A2]  {'MU': 666, 'IS_AFFINE': 667, 'YR_SUB_P': 668, 'NUM_COLUMNS': 684}; YR_SUB_P + 16 halfwords = 684 == NUM_COLUMNS 684
+[READ      ] P2 constraint count + index map [A1]  idx closes at 423 == 423; header map lists 413..422
+[READ      ] P3 address-limb bounds [A4]  2^32−31 / 2^32−63 match the model's constants
+[READ      ] P4 syscall numbers [A1c]  u64::MAX−10 / u64::MAX−11
+[READ      ] P5 low-word compile-time assert [A1c]  the low-32-bit-word inequality is a compile-time assert
+[READ      ] P6 syscall word is linear in IS_AFFINE [A1c]  both received words are the IS_AFFINE interpolation of the two numbers
+[READ      ] P7 affine-gated bus layout [A1/A3]  2 affine-gated bus blocks (4 dwords each), offsets +32+8i, yG via memw_read at ts and yR via memw_write at ts+3
+[READ      ] P8 YrLtP wiring [A2]  YrLtP → (P_BYTES, YR_SUB_P, YR), byte-stored sum (not bits)
+[READ      ] P9 YrLtP is µ-gated, not IS_AFFINE-gated [A2d]  all four chains share one µ-gated loop; IS_AFFINE does not appear in it ⇒ YrLtP binds x-only rows too (strictly stronger; A2d)
+[READ      ] P10 YR_SUB_P halfword checks [A2]  16 µ-gated IsHalfword sends on yr_sub_p(i)
+[READ      ] P11 Alu LT senders [A4]  3 senders: xG/xR vs addr_bound_by_mode(), k vs the flat 32-byte bound, LT/1
+[READ      ] P12 executor ABI arm [A4]  spans 63/63/31, u128 overlap guard, yG at +32 in, yR at +32 out
+[READ      ] P13 honest y_r_sub_p [A2e]  y_r_sub_p = (2^256 + yR − p), computed in the shared inner fn used by both paths
+[READ      ] P14 carry offsets [A3]  X2 8160 / YG 16319
+[READ      ] P15 INV_SHIFT_32 [A2a]  INV_SHIFT_32 = 18446744065119617026 = 2^-32 mod p_g
+[READ(neg) ] P16 nothing constrains yG's parity [A3]  7 uses of cols::YG, all parity-blind (AreBytes range check (parity-blind), Ecdas seed/drain bus tuples (parity-blind), the Yg relation's yG² term — satisfied by BOTH roots, the affine yG MEMW read (the fix itself), trace fill)
+[READ(neg) ] P17 YR is not byte-checked in ecsm.rs [A2d]  ecsm.rs byte-checks ['Q0', 'Q1', 'X2', 'YG']; YR (and XR) are NOT among them ⇒ C4-YR is a contract, not a local emission
+[READ(neg) ] P20 no yG canonicality chain exists [A3g]  OverflowKind = ['XgLtP', 'KLtN', 'XrLtP', 'YrLtP']; no YgLtP ⇒ yG has no canonicality chain (A3g's subject). xG/xR/yR each do.
+[READ      ] P21 q1 width and boolean top byte [A3g]  Q1 has 33 range-checked byte columns, the Yg convolution reads 33 of them, and idx 388 makes q1(32) boolean ⇒ q1 < 2^264 with a boolean top byte, which is what admits A3g's y + p
+[READ      ] P19 the complete syscall set [A1f]  4 syscalls parsed: ECSM=MAX-10, ECSM_AFFINE=MAX-11, HINT=MAX-30, KECCAK=MAX-1
+[READ      ] P18 instruction timestamp stride [A4f]  builder stride parsed as [4] (model says 4); ECSM uses ts offsets {0} ∪ [1, 2, 3], max 3 == stride−1 ⇒ ts+3 is free and nothing spills
+
+[PROVED    ] mutation testing  21 mutations applied; every premise's check fails on its mutant
+
+TRANSCRIPTION AUDIT: 21/21 premises read from source, 21 mutation controls, 0 failures
+
+=== oracle_anchors ===
+[PASS ] A0 repo constants  4 constants parsed from crypto/ecsm/src/lib.rs match
+[PASS ] A1 curve/group  G on curve, N·G = O, 5 published multiples, 40 negation + 20 additivity checks
+[PASS ] A2 x-only agreement  216 (k, xG) pairs: affine_mul(...).x == x_only_mul(...), incl. k = 1, 2, N−1, N−2, 2^255
+[PASS ] A3 root dependence  200 instances: x invariant under yG → p−yG, y negated in ALL 200 of them ⇒ publishing yR makes the input parity observable
+[PASS ] A4 validation set  8 rejections match the executor's error kinds; k ∈ {1, 2, N−2, N−1} all accepted and ordinary
+[PASS ] A5 ABI predicates  limb bound exact at both spans (31/63), overlap guard == interval disjointness over 193 offsets; u64-wrap control: addr 2^64−64 passes addr_limb_ok (=True) yet the pre-fix guard misses a total overlap
+[PASS ] A6 ecrecover equivalence  60 instances: y recovered from x(k·P) + x((k+1)·P) + the chord law equals the y the affine ecall returns ⇒ dropping `solve_y` is semantics-preserving
+[PASS ] A7 third-party cross-check  25 random k·P against the `ecdsa` package
+[PASS ] A8 LE32 codec  round-trip + endianness
+
+ORACLE STATUS: VALIDATED  (9 pass, 0 skip, 0 fail)
+
+=== small_y_point ===
+Non-canonical band  2^256 - p = 2^32 + 977 = 4294968273
+
+Curve point with y inside the band:
+  y  = 1  (1 < 4294968273: True)
+  x  = 0x1fe1e5ef3fceb5c135ab7741333ce5a6e80d68167653f6b2b24bcbcfaaaff507
+  on curve: True
+  y + p    = 0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc30  (< 2^256: True)
+  headroom: y + p is 4294968272 below 2^256
+
+Reachable through the affine ecall:
+  k   = 2
+  xG  = 0xf2e13fd883d5f5138e1658a6022391495df397acb9a83e861f6bf5181d6c4dbc
+  yG  = 0x264a2700355e78b1e2d5b19fc29ffddaec27243e405d318525f49effa3007229
+  ->  xR = 0x1fe1e5ef3fceb5c135ab7741333ce5a6e80d68167653f6b2b24bcbcfaaaff507
+      yR = 0x0000000000000000000000000000000000000000000000000000000000000001   (== y: True)
+
+So an unconstrained witness may publish yR' = yR + p, a DIFFERENT 32-byte
+value that satisfies every byte range check and the ECDAS yR relation with
+q2 reduced by one. YrLtP is what excludes it.
+
+wrote small_y_point.json
+
+=== harness (cargo) ===
+    Finished `release` profile [optimized] target(s) in 0.04s
+
+=== a6_real_witness ===
+[PROVED      ] A6a real-witness evaluation  28 witnesses from ecsm::compute_witness{,_with_y}: oracle agreement, all four overflow chains, both convolution relations, carry windows, len_k and the ECDAS step count all re-derived
+[PROVED      ] A6b rejections match the oracle  4 rejected by crypto/ecsm: {'k=0': 'ECSM scalar k must be non-zero', 'k=N': 'ECSM scalar k must be < N', 'off-curve yG': 'ECSM input point is not on the curve', 'yG=p': 'ECSM coordinates must be < p'}
+[SAT — FORGES] A6c parity forgery from the repo's generator  9 ±yG witness pairs out of crypto/ecsm itself: every one is valid, agrees on x_r, and publishes a different y_r ⇒ the gap A3 proves is not a modelling artefact
+[PROVED      ] A6d x-only == affine with the even lift  9 labels over G (whose y is even): all 13 witness fields identical ⇒ the affine variant is the same chip, not a parallel one
+[PROVED      ] A6e small-y instance  crypto/ecsm returns y_r = 1 for the constructed point; y_r_sub_p = 0x1000003d2 = 2^256 + 1 − p, and y_r + p < 2^256 ⇒ the A2 forgery's premise holds against the real generator
+
+Summary:
+  PROVED         A6a real-witness evaluation
+  PROVED         A6b rejections match the oracle
+  SAT — FORGES   A6c parity forgery from the repo's generator
+  PROVED         A6d x-only == affine with the even lift
+  PROVED         A6e small-y instance
+
+=== a1_selector ===
+[CERTIFIED] A1-PRIME p_g = 2^64 − 2^32 + 1 is prime  sympy.isprime; the field property every root argument below rests on
+[PROVED  ] A1a IS_BIT(IS_AFFINE) ⇒ a ∈ {0,1}  idx 421; roots over GF(p_g) = [0, 1], split complete: True
+[PROVED  ] A1b AffineZeroOnPadding ⇒ µ=0 forces IS_AFFINE=0  idx 422 at µ=0; IS_BIT(MU) roots [0, 1]; 0.01s
+[PROVED  ] A1c Ecall tuple injective in IS_AFFINE [repo numbers]  [repo numbers] lo: 4294967285 vs 4294967284; hi: 4294967295 vs 4294967295
+[PROVED  ] A1c Ecall tuple injective in IS_AFFINE [equal lo, differing hi (assert fires; still injective)]  [equal lo, differing hi (assert fires; still injective)] lo: 4294967285 vs 4294967285; hi: 1 vs 2
+[SAT — FORGES] A1c Ecall tuple injective in IS_AFFINE [identical numbers (degenerate)]  [identical numbers (degenerate)] lo: 4294967285 vs 4294967285; hi: 4294967295 vs 4294967295  ⇒ IS_AFFINE UNCONSTRAINED
+[PROVED  ] A1c controls  the degenerate choice un-pins the selector; the repo pair does not
+[PROVED  ] A1c assert load-bearing  low word separates modes: True; high word separates modes: False ⇒ execution.rs's low-word assert carries the entire pinning
+[PROVED  ] A1d degree bound  max over new constraints = 3 == declared max_degree 3
+[SAT — FORGES] A1e control [drop idx 422] padding row with IS_AFFINE=1  all 423 constraints walked: idx 422 is the ONLY one violated when kept, and all 422 remaining are satisfied when dropped; honest padding (IS_AFFINE=0) satisfies all 423. The dropped row then fires 8 IS_AFFINE-gated MEMW interactions. idx 422 is LOAD-BEARING.
+[SAT — FORGES] A1f control [drop idx 421] cross-syscall impersonation  high-word coefficient is 0 (blind), low-word is -1, so the received tuple sweeps the whole field. Reachable syscalls: ECSM@IS_AFFINE=0, ECSM_AFFINE@IS_AFFINE=1, HINT@IS_AFFINE=20, KECCAK@IS_AFFINE=18446744069414584312. With idx 421 kept only ['ECSM', 'ECSM_AFFINE'] are admissible; dropped, ['HINT', 'KECCAK'] become reachable ⇒ idx 421 is LOAD-BEARING, and NOT for the reason its comment gives.
+
+Summary:
+  CERTIFIED    A1-PRIME p_g = 2^64 − 2^32 + 1 is prime
+  PROVED       A1a IS_BIT(IS_AFFINE) ⇒ a ∈ {0,1}
+  PROVED       A1b AffineZeroOnPadding ⇒ µ=0 forces IS_AFFINE=0
+  PROVED       A1c Ecall tuple injective in IS_AFFINE [repo numbers]
+  PROVED       A1c Ecall tuple injective in IS_AFFINE [equal lo, differing hi (assert fires; still injective)]
+  SAT — FORGES A1c Ecall tuple injective in IS_AFFINE [identical numbers (degenerate)]
+  PROVED       A1c controls
+  PROVED       A1c assert load-bearing
+  PROVED       A1d degree bound
+  SAT — FORGES A1e control [drop idx 422] padding row with IS_AFFINE=1
+  SAT — FORGES A1f control [drop idx 421] cross-syscall impersonation
+
+=== a2_yr_lt_p ===
+[PROVED      ] A2a YrLtP word-carry lift  |A| < 2^33 ⇒ no p_g wrap; 0.01s
+[PROVED      ] A2b OverflowRequired(YrLtP) ⇒ yR < p  p pinned as a numeral (not a free constant); 0.01s
+[SAT (expected)] A2b non-vacuity  yR = p−1 is satisfiable ⇒ the constraint set is not empty; 0.01s
+[PROVED      ] A2c width [YrLtP pre-lift word]  max|A_i| = 8589934591 = 2^32.. < 2^33 ≪ p_g (4.66e-10·p_g)
+[PROVED      ] A2c width [emitted YrLtP constraints]  µ·c·(1−c) ∈ {0} and µ·(1−c_7) ∈ {0,±1} once c ∈ {0,1}: single-digit ≪ p_g
+[SAT — CATCHES] A2c control [wrong constant p→p+2 / p→N]  honest witness (addend fixed at (2^256+yR−p) mod 2^256) valid under p (True), rejected under p+2 (True) and under N (True) ⇒ the chain binds `p` itself, not just its shape
+[CONTRACT    ] A2d contract C4-YR [YR byte authority]  YR is NOT in ecsm.rs's is_byte list ['Q0', 'Q1', 'X2', 'YG']; bound inherited via 2 exhaustive cases on len_k (bus-level, so outside this gate: C5 + imported L6)
+[NOTED       ] A2d observation [µ-gated, not IS_AFFINE-gated]  YrLtP binds on x-only rows too: strictly stronger (sound), and honest witnesses satisfy it because witness.rs fills y_r_sub_p on both paths
+[PROVED      ] A2e honest-witness anchor  14 witnesses (4 x-only, 10 affine): every c_i ∈ {0,1}, c_7 = 1, YR_SUB_P halfwords in [0,2^16)
+[SAT — FORGES] A2f forgery instantiated (y = 1 point)  yR = 1, yR+p = 0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc30; all 12 checks hold: the forged witness satisfies the ECDAS Yr relation exactly, its carries fit the window, and every byte check passes — YrLtP is the only thing that rejects it
+[SAT — FORGES] A2g control [drop YrLtP]  the A2f witness is accepted and the guest is handed a non-canonical yR ⇒ YrLtP is LOAD-BEARING (the yR-side analogue of the earlier board's N6/XR_SUB_P)
+[PROVED      ] A2h attack band populated  2^256 − p = 4294968273 = 2^32 + 977; a real secp256k1 point has y = 1 (the smallest possible), so y + p is 32-byte representable ⇒ the PR's constructibility claim holds, at the very bottom of the band
+
+Summary:
+  PROVED         A2a YrLtP word-carry lift
+  PROVED         A2b OverflowRequired(YrLtP) ⇒ yR < p
+  SAT (expected) A2b non-vacuity
+  PROVED         A2c width [YrLtP pre-lift word]
+  PROVED         A2c width [emitted YrLtP constraints]
+  SAT — CATCHES  A2c control [wrong constant p→p+2 / p→N]
+  CONTRACT       A2d contract C4-YR [YR byte authority]
+  NOTED          A2d observation [µ-gated, not IS_AFFINE-gated]
+  PROVED         A2e honest-witness anchor
+  SAT — FORGES   A2f forgery instantiated (y = 1 point)
+  SAT — FORGES   A2g control [drop YrLtP]
+  PROVED         A2h attack band populated
+
+=== a3_parity_binding ===
+[PROVED      ] A3a yG parity arithmetically free  Y² − (x³+b) splits into (Y−y)(Y+y) over GF(p) at 6 real x-coordinates; both roots distinct in all 6 (no y=0 point ⇒ never a forced parity)
+[SAT — FORGES] A3b parity forgery instantiated  k = 0x9e3779b97f4a7c15: two full witnesses, all 11 facts hold. Same (xG, k, xR), yR differs: 0x2b8adf37e2371e4d56d0e217e1bb0a05239b3097fb93021a3c1d5d2a2d8f7743 vs 0xd47520c81dc8e1b2a92f1de81e44f5fadc64cf68046cfde5c3e2a2d4d27084ec. Violations — honest: none, forged: none
+[SAT — FORGES] A3b forgery sweep  12 random (base point, k) pairs: both roots always yield a fully valid witness with the same xR and a different yR
+[PROVED      ] A3c yG read covers YG bit-for-bit  4 dwords × 8 bytes: YG[0..32] ↔ addr_xG+[32..64), order-preserving, all 5 facts hold
+[PROVED      ] A3c read closes the forgery  the ±yG witnesses differ in 32 of the 32 read bytes ⇒ distinct MEMW tuples ⇒ at most one matches the caller's buffer (reduction to C4/C5)
+[SAT — FORGES] A3d control [drop the yG read]  both witnesses verify and are indistinguishable without the read ⇒ the IS_AFFINE-gated yG MEMW read is LOAD-BEARING; it is the ONLY thing pinning the input parity, and the affine ABI is what made the parity observable
+[PROVED      ] A3e imported L7 survives  20 instances: x(k·P) = x(k·(−P)) ⇒ the x-only path's conclusion is unaffected by the affine variant, and x-only rows may still leave parity free
+[PROVED      ] A3f YrLtP accepts both parities  both ±yR are canonical ⇒ YrLtP admits either ⇒ it addresses output REPRESENTATION (A2), never input parity. Two orthogonal gaps, two fixes.
+[SAT — FORGES] A3g yG canonicality is UNCHECKED  no YgLtP exists; yG = p + 1 = 0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc30 is accepted by all 423 in-table constraints and rejected by the executor. All 13 facts hold. Margins: q1 256→257 bits with top byte 1 (idx 388 admits only 0/1), c1 window [16318, 26568] ⊂ [0, 65536); band width 2^32+977. Consequence is BENIGN (same reduced point, same output) ⇒ VM-parity gap, not a forgery. Same class as A4c.
+
+Summary:
+  PROVED         A3a yG parity arithmetically free
+  SAT — FORGES   A3b parity forgery instantiated
+  SAT — FORGES   A3b forgery sweep
+  PROVED         A3c yG read covers YG bit-for-bit
+  PROVED         A3c read closes the forgery
+  SAT — FORGES   A3d control [drop the yG read]
+  PROVED         A3e imported L7 survives
+  PROVED         A3f YrLtP accepts both parities
+  SAT — FORGES   A3g yG canonicality is UNCHECKED
+
+=== a4_addressing ===
+[PROVED      ] A4a LT bound == addr_limb_ok [IS_AFFINE=0, span=31]  bound = 4294967265 = 2^32 − 31; 0.00s
+[PROVED      ] A4a LT bound == addr_limb_ok [IS_AFFINE=1, span=63]  bound = 4294967233 = 2^32 − 63; 0.00s
+[PROVED      ] A4a linear bound interpolates the two constants  BOUND_32B + a·(BOUND_64B − BOUND_32B) = 4294967265 at a=0, 4294967233 at a=1
+[PROVED      ] A4b affine span stays inside the limb  128 touched byte offsets (max +63) all < 2^32 for every accepted addr_lo; 0.01s
+[PROVED      ] A4c seven-value band, both modes  32-byte (x-only xG/xR, k): max dword base +24, band size 7 ([2^32−31, 2^32−24]); 64-byte (affine xG‖yG, xR‖yR): max dword base +56, band size 7 ([2^32−63, 2^32−56])
+[PROVED      ] A4c band closed by the LT senders  every band address fails `addr_lo < bound` ⇒ the bus now rejects exactly what the executor rejects (the gap `hint.rs` closes for the Hint ecall)
+[PROVED      ] A4d k bound flat in both modes  ADDR_K_0 < 4294967265 == addr_limb_ok(addr_k, 31); 0.00s
+[PROVED      ] A4e overlap guard == interval disjointness  the u128 clause `k < xg+64 ∧ xg < k+32` is exactly `[xg,xg+64) ∩ [k,k+32) ≠ ∅`; 0.01s
+[SAT — FORGES] A4e control [u64 wrap in the overlap guard]  1 reachable addresses in [2^64−64, 2^64) pass addr_limb_ok, wrap the pre-fix `+64`, and slip a TOTAL operand overlap past the guard ⇒ the u128 widening is LOAD-BEARING
+[PROVED      ] A4f timestamp layout  slots {'xG read': 0, 'yG read': 0, 'k read': 1, 'xR write': 2, 'yR write': 3} within stride 4; xG@ts and yG@ts are address-disjoint so the same-timestamp reads are legal
+[PROVED      ] A4g mode-dependent bound is necessary  a flat 64-byte bound would reject 32 legal x-only addresses (completeness); a flat 32-byte bound would admit 32 illegal affine ones (soundness) ⇒ the IS_AFFINE interpolation is load-bearing in BOTH directions
+
+Summary:
+  PROVED         A4a LT bound == addr_limb_ok [IS_AFFINE=0, span=31]
+  PROVED         A4a LT bound == addr_limb_ok [IS_AFFINE=1, span=63]
+  PROVED         A4a linear bound interpolates the two constants
+  PROVED         A4b affine span stays inside the limb
+  PROVED         A4c seven-value band, both modes
+  PROVED         A4c band closed by the LT senders
+  PROVED         A4d k bound flat in both modes
+  PROVED         A4e overlap guard == interval disjointness
+  SAT — FORGES   A4e control [u64 wrap in the overlap guard]
+  PROVED         A4f timestamp layout
+  PROVED         A4g mode-dependent bound is necessary
+
+========================================
+GATE: all stages green (transcript in gate.log)
