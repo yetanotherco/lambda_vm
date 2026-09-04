@@ -1602,6 +1602,120 @@ fn test_prove_elfs_ecsm_forged_ecdas_mu_rejected() {
     );
 }
 
+/// secp256k1 generator (Gx, Gy) as little-endian 32-byte coordinates.
+fn secp256k1_generator_le() -> ([u8; 32], [u8; 32]) {
+    let mut gx = [
+        0x79u8, 0xBE, 0x66, 0x7E, 0xF9, 0xDC, 0xBB, 0xAC, 0x55, 0xA0, 0x62, 0x95, 0xCE, 0x87, 0x0B,
+        0x07, 0x02, 0x9B, 0xFC, 0xDB, 0x2D, 0xCE, 0x28, 0xD9, 0x59, 0xF2, 0x81, 0x5B, 0x16, 0xF8,
+        0x17, 0x98,
+    ];
+    gx.reverse();
+    let mut gy = [
+        0x48u8, 0x3A, 0xDA, 0x77, 0x26, 0xA3, 0xC4, 0x65, 0x5D, 0xA4, 0xFB, 0xFC, 0x0E, 0x11, 0x08,
+        0xA8, 0xFD, 0x17, 0xB4, 0x48, 0xA6, 0x85, 0x54, 0x19, 0x9C, 0x47, 0xD0, 0x8F, 0xFB, 0x10,
+        0xD4, 0xB8,
+    ];
+    gy.reverse();
+    (gx, gy)
+}
+
+/// Reads the compiled affine ECSM rust guest (`ecsm_mul_affine` → commit xR‖yR).
+fn ecsm_affine_elf_bytes() -> Vec<u8> {
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .to_path_buf();
+    std::fs::read(workspace_root.join("executor/program_artifacts/rust/ecsm_affine.elf"))
+        .expect("ecsm_affine.elf not found — run `make compile-programs-rust`")
+}
+
+/// End-to-end via the **affine** Rust-guest path: `ecsm_mul_affine` computes 5·G and commits
+/// the full 64-byte point xR‖yR. Verifies the affine ecall proves (IS_AFFINE=1: yG read from
+/// memory, yR written back) and that the committed point matches the native reference.
+#[test]
+fn test_prove_ecsm_affine_rust_guest() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let elf_bytes = ecsm_affine_elf_bytes();
+    let proof = prove_vm_minimal(&elf_bytes, &[], &Default::default());
+    assert!(
+        verify_vm_minimal(&proof, &elf_bytes),
+        "ecsm_affine rust guest should verify"
+    );
+
+    // Committed output must equal the full point 5·G = (xR, yR).
+    let (gx, gy) = secp256k1_generator_le();
+    let mut k = [0u8; 32];
+    k[0] = 5;
+    let (xr, yr) = ecsm::scalar_mul_xy_with_y(&k, &gx, &gy).unwrap();
+    let mut expected = xr.to_vec();
+    expected.extend_from_slice(&yr);
+    assert_eq!(proof.public_output, expected);
+}
+
+/// Soundness: forging the returned `yR` on an affine ECSM row must be rejected. `yR` is pinned
+/// both by the affine yR-write MEMW bus (mult = IS_AFFINE) and by the ECDAS final-receiver
+/// tuple, so tampering it unbalances those buses and the proof must fail to verify.
+#[test]
+fn test_prove_ecsm_forged_yr_rejected() {
+    use crate::tables::ecsm::cols as ecsm_cols;
+
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let elf_bytes = ecsm_affine_elf_bytes();
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
+    let result = executor.run().expect("Failed to run program");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
+
+    // Forge the low byte of yR on the (single) real affine ECSM row.
+    let orig = *traces.ecsm.main_table.get(0, ecsm_cols::YR);
+    let forged = orig + FieldElement::<GoldilocksField>::one();
+    traces.ecsm.main_table.set(0, ecsm_cols::YR, forged);
+
+    assert!(
+        !prove_and_verify_vm_minimal(&elf, &mut traces),
+        "Verifier must reject a forged ECSM result yR"
+    );
+}
+
+/// Soundness: `IS_AFFINE` cannot be forged. It is what gates the yG-read and yR-write MEMW
+/// buses, and it is pinned by the `Ecall` receiver, whose syscall word is
+/// `xonly + IS_AFFINE·(affine − xonly)` — the CPU sends the guest's real `a7`, so clearing
+/// the selector on a row that ran the affine ecall leaves that bus (and the two it gates)
+/// unbalanced.
+#[test]
+fn test_prove_ecsm_forged_is_affine_rejected() {
+    use crate::tables::ecsm::cols as ecsm_cols;
+
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let elf_bytes = ecsm_affine_elf_bytes();
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
+    let result = executor.run().expect("Failed to run program");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
+
+    assert_eq!(
+        *traces.ecsm.main_table.get(0, ecsm_cols::IS_AFFINE),
+        FieldElement::<GoldilocksField>::one(),
+        "sanity: the ecsm_affine guest produces an affine row"
+    );
+    traces
+        .ecsm
+        .main_table
+        .set(0, ecsm_cols::IS_AFFINE, FieldElement::zero());
+
+    assert!(
+        !prove_and_verify_vm_minimal(&elf, &mut traces),
+        "Verifier must reject an ECSM row that claims the wrong ecall variant"
+    );
+}
+
 /// Verifier REJECTS a forged trace where an addr byte cell is set to a
 /// non-byte field element.
 ///

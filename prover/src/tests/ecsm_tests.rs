@@ -1,10 +1,11 @@
-//! Tests for the ECSM core table — constraint satisfaction on generated traces,
-//! the single-source constraint count, and isolated negative checks for the
-//! padding closure, the scalar-bit padding guard and the `xG < p` overflow.
+//! Tests for the ECSM core table — constraint satisfaction on generated traces (x-only and
+//! affine rows), the single-source constraint count, and isolated negative checks for the
+//! padding closure, the scalar-bit padding guard, the `xG < p` / `yR < p` overflows and the
+//! `IS_AFFINE` mode selector.
 
 use crate::tables::ecsm::{EcsmConstraints, EcsmOperation, cols, generate_ecsm_trace};
 use crate::tables::types::{FE, GoldilocksExtension, GoldilocksField};
-use ecsm::{N_BYTES, P_BYTES, compute_witness};
+use ecsm::{N_BYTES, P_BYTES, compute_witness, compute_witness_with_y};
 use math::field::element::FieldElement;
 use stark::constraints::builder::{ConstraintSet, ProverEvalFolder};
 use stark::frame::Frame;
@@ -19,6 +20,10 @@ const IDX_YG_CONV0: usize = 323; // ConvCarry(Yg, 0)
 const IDX_Q1_BIT32: usize = 388; // IS_BIT(q1[32])
 const IDX_XG_CARRY0: usize = 389; // CarryBit(XgLtP, 0)
 const IDX_XG_OVERFLOW: usize = 396; // OverflowRequired(XgLtP)
+const IDX_YR_CARRY0: usize = 413; // CarryBit(YrLtP, 0)
+const IDX_YR_OVERFLOW: usize = 420; // OverflowRequired(YrLtP)
+const IDX_IS_AFFINE_BIT: usize = 421; // IS_BIT(IS_AFFINE)
+const IDX_AFFINE_PADDING: usize = 422; // AffineZeroOnPadding
 
 fn gx_le() -> [u8; 32] {
     // secp256k1 Gx, little-endian.
@@ -37,6 +42,17 @@ fn k_le(v: u64) -> [u8; 32] {
     k
 }
 
+fn gy_le() -> [u8; 32] {
+    // secp256k1 Gy, little-endian.
+    let mut be = [
+        0x48, 0x3A, 0xDA, 0x77, 0x26, 0xA3, 0xC4, 0x65, 0x5D, 0xA4, 0xFB, 0xFC, 0x0E, 0x11, 0x08,
+        0xA8, 0xFD, 0x17, 0xB4, 0x48, 0xA6, 0x85, 0x54, 0x19, 0x9C, 0x47, 0xD0, 0x8F, 0xFB, 0x10,
+        0xD4, 0xB8,
+    ];
+    be.reverse();
+    be
+}
+
 fn op_for(k: u64) -> EcsmOperation {
     let witness = compute_witness(&k_le(k), &gx_le()).unwrap();
     EcsmOperation {
@@ -44,6 +60,21 @@ fn op_for(k: u64) -> EcsmOperation {
         addr_xg: 0x2000,
         addr_k: 0x3000,
         addr_xr: 0x1000,
+        is_affine: false,
+        witness,
+    }
+}
+
+/// Affine-variant row: `yG` comes from the caller's buffer instead of the even lift, and
+/// `IS_AFFINE = 1`.
+fn affine_op_for(k: u64) -> EcsmOperation {
+    let witness = compute_witness_with_y(&k_le(k), &gx_le(), &gy_le()).unwrap();
+    EcsmOperation {
+        timestamp: 448,
+        addr_xg: 0x2000,
+        addr_k: 0x3000,
+        addr_xr: 0x1000,
+        is_affine: true,
         witness,
     }
 }
@@ -94,7 +125,93 @@ fn constraints_hold_on_generated_trace() {
 
 #[test]
 fn constraint_set_count() {
-    assert_eq!(EcsmConstraints.meta().len(), 413);
+    assert_eq!(EcsmConstraints.meta().len(), 423);
+}
+
+/// One prover serves both ecall variants, so affine rows (`IS_AFFINE = 1`, `yG` read from
+/// the caller's buffer) and x-only rows must satisfy the same constraint set in one trace.
+/// Covers `IS_BIT(IS_AFFINE)` and `AffineZeroOnPadding` with the selector actually set.
+#[test]
+fn constraints_hold_on_mixed_affine_and_xonly_trace() {
+    let ops = vec![
+        affine_op_for(1),
+        op_for(2),
+        affine_op_for(0xFFFF),
+        op_for(1_000_003),
+    ];
+    let trace = generate_ecsm_trace(&ops);
+    assert_eq!(
+        *trace.main_table.get(0, cols::IS_AFFINE),
+        FE::one(),
+        "row 0 is an affine row"
+    );
+    assert_eq!(
+        *trace.main_table.get(1, cols::IS_AFFINE),
+        FE::zero(),
+        "row 1 is an x-only row"
+    );
+
+    for row in 0..trace.num_rows() {
+        for (i, v) in eval_row(&trace, row).iter().enumerate() {
+            assert_eq!(*v, FE::zero(), "constraint {i} must hold at row {row}");
+        }
+    }
+}
+
+/// `IS_AFFINE` must be a bit, and zero on padding — otherwise a witness could fire the
+/// affine-gated yG-read / yR-write MEMW buses on rows that never ran an affine ecall.
+#[test]
+fn affine_selector_must_be_a_bit_and_zero_on_padding() {
+    let row_with = |mu: u64, is_affine: u64| {
+        let mut main = vec![FE::zero(); cols::NUM_COLUMNS];
+        main[cols::MU] = FE::from(mu);
+        main[cols::IS_AFFINE] = FE::from(is_affine);
+        eval_main_row(main)
+    };
+
+    assert_ne!(
+        row_with(1, 2)[IDX_IS_AFFINE_BIT],
+        FE::zero(),
+        "IS_BIT must fire for a non-boolean IS_AFFINE"
+    );
+    assert_ne!(
+        row_with(0, 1)[IDX_AFFINE_PADDING],
+        FE::zero(),
+        "AffineZeroOnPadding must fire for IS_AFFINE = 1 on a padding row"
+    );
+    for is_affine in [0, 1] {
+        let row = row_with(1, is_affine);
+        assert_eq!(row[IDX_IS_AFFINE_BIT], FE::zero());
+        assert_eq!(row[IDX_AFFINE_PADDING], FE::zero());
+    }
+}
+
+/// OverflowRequired for YrLtP fires when yR = p, the check that keeps the published `yR`
+/// canonical (the byte range checks alone only bound it below 2^256, and the quotient
+/// columns would absorb the extra multiple of p). Mirrors the xG case: all CarryBit
+/// constraints still hold, but the chain never reaches c_7 = 1.
+#[test]
+fn yr_ge_p_overflow_required_fires() {
+    let mut main = vec![FE::zero(); cols::NUM_COLUMNS];
+    main[cols::MU] = FE::one();
+    // yR = p, yr_sub_p = 0 (invalid subtraction witness — fine for this isolation test).
+    for (i, &b) in P_BYTES.iter().enumerate() {
+        main[cols::YR + i] = FE::from(b as u64);
+    }
+    let row = eval_main_row(main);
+
+    for i in 0..7 {
+        assert_eq!(
+            row[IDX_YR_CARRY0 + i],
+            FE::zero(),
+            "carry bit {i}: c_i=0 is a valid bit"
+        );
+    }
+    assert_ne!(
+        row[IDX_YR_OVERFLOW],
+        FE::zero(),
+        "OverflowRequired must fire when yR = p"
+    );
 }
 
 /// The yG carry recurrence closes on all-zero padding because both the `µ·p²` offset and the
@@ -231,6 +348,7 @@ fn q1_bit32_equals_one_path() {
         addr_xg: 0x2000,
         addr_k: 0x3000,
         addr_xr: 0x1000,
+        is_affine: false,
         witness,
     };
     let trace = generate_ecsm_trace(&[op]);
@@ -257,6 +375,7 @@ fn constraints_hold_for_k_eq_n_minus_one() {
         addr_xg: 0x2000,
         addr_k: 0x3000,
         addr_xr: 0x1000,
+        is_affine: false,
         witness,
     };
     let trace = generate_ecsm_trace(&[op]);

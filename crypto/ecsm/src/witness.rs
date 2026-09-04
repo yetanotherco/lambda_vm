@@ -23,7 +23,7 @@ use num_traits::{Signed, Zero};
 use rayon::prelude::*;
 
 use crate::curve::{StepPts, replay_double_and_add};
-use crate::{B, EcsmError, P_BYTES, R_BYTES, n, p, prepare, to_le_32};
+use crate::{B, EcsmError, P_BYTES, R_BYTES, n, p, prepare, prepare_with_y, to_le_32};
 
 /// Full ECSM-chip witness for one scalar multiplication (one ECSM row).
 #[derive(Debug, Clone)]
@@ -47,6 +47,11 @@ pub struct EcsmWitness {
     pub k_sub_n: [u8; 32],
     /// `(xR - p) mod 2^256`
     pub x_r_sub_p: [u8; 32],
+    /// `(yR - p) mod 2^256`. Forces `yR < p`: without it the byte range checks only
+    /// bound `yR < 2^256`, and the quotient columns absorb a multiple of `p`, so a
+    /// witness could publish `yR + p` for any `yR < 2^256 - p` (~2^32) — points with
+    /// such a tiny `y` are constructible, since `3 | p-1` makes cubing 3-to-1.
+    pub y_r_sub_p: [u8; 32],
     /// position of the most significant set bit of `k`
     pub len_k: u8,
     pub x_r: [u8; 32],
@@ -280,7 +285,26 @@ fn shifted_quotient(relation: &str, numerator: &BigInt, p_big: &BigInt, r_big: &
 /// little-endian 32-byte values. This is the prover's entry point.
 pub fn compute_witness(k_le: &[u8; 32], xg_le: &[u8; 32]) -> Result<EcsmWitness, EcsmError> {
     let (k, g) = prepare(k_le, xg_le)?;
+    compute_witness_inner(k_le, k, g)
+}
 
+/// Like [`compute_witness`] but with an explicit input `yG` (the caller's full point),
+/// validated on-curve by [`prepare_with_y`]. The affine path uses this so the witnessed
+/// `yG`/`yR` match the caller's actual point rather than the canonical even lift.
+pub fn compute_witness_with_y(
+    k_le: &[u8; 32],
+    xg_le: &[u8; 32],
+    yg_le: &[u8; 32],
+) -> Result<EcsmWitness, EcsmError> {
+    let (k, g) = prepare_with_y(k_le, xg_le, yg_le)?;
+    compute_witness_inner(k_le, k, g)
+}
+
+fn compute_witness_inner(
+    k_le: &[u8; 32],
+    k: BigUint,
+    g: crate::curve::AffinePoint,
+) -> Result<EcsmWitness, EcsmError> {
     let p_big = BigInt::from(p());
     let r_big = BigInt::from(BigUint::from_bytes_le(&R_BYTES)); // r = 3p
 
@@ -328,6 +352,7 @@ pub fn compute_witness(k_le: &[u8; 32], xg_le: &[u8; 32]) -> Result<EcsmWitness,
     let x_r = to_le_32(&result.x);
     let y_r = to_le_32(&result.y);
     let x_r_sub_p = to_le_32(&((&two_256 + &result.x) - p()));
+    let y_r_sub_p = to_le_32(&((&two_256 + &result.y) - p()));
 
     // Steps are independent witnesses (each builds its own λ/quotient/carry data
     // from one StepPts), so they parallelize freely when rayon is available.
@@ -354,6 +379,7 @@ pub fn compute_witness(k_le: &[u8; 32], xg_le: &[u8; 32]) -> Result<EcsmWitness,
         x_g_sub_p,
         k_sub_n,
         x_r_sub_p,
+        y_r_sub_p,
         len_k,
         x_r,
         y_r,

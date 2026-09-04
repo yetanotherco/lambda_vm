@@ -19,6 +19,8 @@ pub enum SyscallNumbers {
     // Placeholder discriminant. The actual syscall value is HINT_SYSCALL_NUMBER.
     // Non-constraining hint (host computes modular inverse/sqrt, guest verifies).
     Hint = 95,
+    // Placeholder discriminant. The actual syscall value is ECSM_AFFINE_SYSCALL_NUMBER.
+    EcsmAffine = 96,
 }
 
 /// Syscall number for KeccakPermute (u64::MAX - 1 = 0xFFFF_FFFF_FFFF_FFFE).
@@ -32,7 +34,30 @@ const KECCAK_STATE_BYTES: u64 = 25 * 8;
 /// The spec uses ECALL number `-11`; interpreted as an unsigned 64-bit value that is
 /// `u64::MAX - 10 = 0xFFFF_FFFF_FFFF_FFF5`, which the ECSM core table puts on the `Ecall`
 /// bus as `[lo32, hi32] = [2^32 - 11, 2^32 - 1]`.
+///
+/// This is the **x-only** variant: the guest passes only `xG` (32 bytes) and gets back only
+/// the x-coordinate `xR` (32 bytes). See [`ECSM_AFFINE_SYSCALL_NUMBER`] for the affine variant.
 pub const ECSM_SYSCALL_NUMBER: u64 = u64::MAX - 10;
+
+/// Syscall number for the **affine** ECSM accelerator variant.
+///
+/// `u64::MAX - 11 = 0xFFFF_FFFF_FFFF_FFF4`. The guest passes the full point `xG‖yG`
+/// (contiguous 64 bytes) and gets back both coordinates `xR‖yR` (contiguous 64 bytes), so
+/// ECDSA recovery skips the x-only `(k+1)·P` y-reconstruction. The ECSM core table selects
+/// the mode with an `IS_AFFINE` column pinned to this number via the `Ecall` bus.
+pub const ECSM_AFFINE_SYSCALL_NUMBER: u64 = u64::MAX - 11;
+
+// The ECSM table pins `IS_AFFINE` by putting `xonly + IS_AFFINE·(affine − xonly)` on the
+// `Ecall` bus for each 32-bit word, against the CPU's real `a7`. That only pins the
+// selector if the two numbers differ in the LOW word: they share a high word today, so the
+// high word's `IS_AFFINE` coefficient is zero and carries no mode information. Choosing a
+// future variant that differs only in the high word would silently leave `IS_AFFINE`
+// unconstrained — an under-constrained selector, not a compile error. Fail loudly here.
+const _: () = assert!(
+    ECSM_SYSCALL_NUMBER & 0xFFFF_FFFF != ECSM_AFFINE_SYSCALL_NUMBER & 0xFFFF_FFFF,
+    "ECSM syscall numbers must differ in their low 32-bit word, or the ECSM table's \
+     IS_AFFINE pinning degenerates"
+);
 
 /// Syscall number for the non-constraining `Hint` ecall.
 ///
@@ -88,6 +113,7 @@ impl TryFrom<u64> for SyscallNumbers {
             93 => Ok(SyscallNumbers::Halt),
             v if v == KECCAK_SYSCALL_NUMBER => Ok(SyscallNumbers::KeccakPermute),
             v if v == ECSM_SYSCALL_NUMBER => Ok(SyscallNumbers::Ecsm),
+            v if v == ECSM_AFFINE_SYSCALL_NUMBER => Ok(SyscallNumbers::EcsmAffine),
             v if v == HINT_SYSCALL_NUMBER => Ok(SyscallNumbers::Hint),
             _ => Err(()),
         }
@@ -108,7 +134,7 @@ impl SyscallNumbers {
     pub fn accelerator(self) -> Option<Accelerator> {
         match self {
             SyscallNumbers::KeccakPermute => Some(Accelerator::Keccak),
-            SyscallNumbers::Ecsm => Some(Accelerator::Ecsm),
+            SyscallNumbers::Ecsm | SyscallNumbers::EcsmAffine => Some(Accelerator::Ecsm),
             SyscallNumbers::Print
             | SyscallNumbers::Panic
             | SyscallNumbers::Commit
@@ -518,7 +544,7 @@ impl Instruction {
                         src2_val = state_addr;
                     }
                     SyscallNumbers::Ecsm => {
-                        // ECSM(-11): k×G on secp256k1.
+                        // ECSM(-11), x-only: (k·G)_x on secp256k1.
                         // x10 = addr to write xR, x11 = addr of xG, x12 = addr of k.
                         // xG, k, xR are 32-byte little-endian values; xG and xR must be
                         // canonical field elements and k must be in [1, N).
@@ -535,8 +561,7 @@ impl Instruction {
                         // reads each operand as unaligned doubleword MEMW accesses (xG at T,
                         // k at T+1); if the regions overlap, the same address is touched at
                         // both timestamps and the MEMW consistency argument can't prove the
-                        // access chain. The loaded values would still be well-defined — this
-                        // guard is about trace provability, not correctness of the multiply.
+                        // access chain. The guard is about trace provability, not correctness.
                         // xR may alias either: its accesses are at a later timestamp.
                         if addr_xg.abs_diff(addr_k) < 32 {
                             return Err(ExecutionError::EcsmOperandOverlap);
@@ -545,6 +570,60 @@ impl Instruction {
                         let k = load_u256_le(memory, addr_k)?;
                         let xr = ecsm::scalar_mul_x(&k, &xg)?;
                         store_u256_le(memory, addr_xr, &xr)?;
+                        // Carry addr_xG/addr_k in the CPU log; addr_xR is recovered from x10
+                        // by the ECSM register-read path in the trace builder.
+                        src2_val = addr_xg;
+                        dst_val = addr_k;
+                    }
+                    SyscallNumbers::EcsmAffine => {
+                        // ECSM affine: both coordinates of k·(xG, yG) on secp256k1.
+                        // x10 = addr to write xR‖yR, x11 = addr of xG‖yG, x12 = addr of k.
+                        // Input and output are contiguous 64-byte buffers; k is 32B. xG/yG/xR
+                        // must be canonical field elements, (xG, yG) on curve, k in [1, N).
+                        let addr_xr = registers.read(10)?;
+                        let addr_xg = registers.read(11)?;
+                        let addr_k = registers.read(12)?;
+                        // Both the input (xG‖yG) and the output (xR‖yR) are contiguous
+                        // 64-byte buffers, so each spans offset 63; k is 32B.
+                        if !addr_limb_ok(addr_xg, 63)
+                            || !addr_limb_ok(addr_xr, 63)
+                            || !addr_limb_ok(addr_k, 31)
+                        {
+                            return Err(ExecutionError::EcsmAddressOverflow);
+                        }
+                        // The input is a contiguous 64-byte point (xG at +0, yG at +32) and
+                        // k a 32-byte scalar. They must occupy disjoint regions — the trace
+                        // builder reads xG/yG at T and k at T+1 as unaligned doubleword MEMW
+                        // accesses; overlap touches the same address at both timestamps and
+                        // the MEMW consistency argument can't prove the chain. The guard is
+                        // about trace provability, not correctness. xR (output) may alias
+                        // either: its accesses are at a later timestamp.
+                        //
+                        // Exact range test rather than a distance bound: the two operands have
+                        // different sizes, so a k placed just below the point (`addr_k + 32 ==
+                        // addr_xg`) is disjoint at a distance of 32. A `< 64` bound would reject
+                        // it, making the ecall depend on which operand the guest's compiler
+                        // happens to lay out first.
+                        //
+                        // Widened to u128 so the `+ 64` / `+ 32` cannot wrap: `addr_limb_ok`
+                        // bounds only the low limb, so `addr_xg = u64::MAX - 63` passes it while
+                        // `addr_xg + 64` wraps to 0, which would make the first clause vacuously
+                        // false and skip the check entirely. Reachable — `STACK_TOP - 0x30` sits
+                        // in that range.
+                        if (addr_k as u128) < addr_xg as u128 + 64
+                            && (addr_xg as u128) < addr_k as u128 + 32
+                        {
+                            return Err(ExecutionError::EcsmOperandOverlap);
+                        }
+                        let xg = load_u256_le(memory, addr_xg)?;
+                        let yg = load_u256_le(memory, addr_xg.wrapping_add(32))?;
+                        let k = load_u256_le(memory, addr_k)?;
+                        // Caller passes the full point (xG, yG); return both coordinates of
+                        // k·(xG, yG) so the guest skips the x-only (k+1)·P y-reconstruction.
+                        // xR at addr_xr, yR at +32.
+                        let (xr, yr) = ecsm::scalar_mul_xy_with_y(&k, &xg, &yg)?;
+                        store_u256_le(memory, addr_xr, &xr)?;
+                        store_u256_le(memory, addr_xr.wrapping_add(32), &yr)?;
                         // Carry addr_xG/addr_k in the CPU log; addr_xR is recovered from x10
                         // by the ECSM register-read path in the trace builder.
                         src2_val = addr_xg;

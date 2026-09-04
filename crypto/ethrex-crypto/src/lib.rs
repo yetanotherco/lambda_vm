@@ -9,9 +9,10 @@
 //! - `keccak256`: a sponge over the `keccak_permute` precompile (riscv64; on
 //!   host it falls back to software keccak for tests).
 //! - `secp256k1_ecrecover`: the ECDSA recovery's 2-term linear combination is
-//!   evaluated through the ECSM `ecsm_mul` precompile (riscv64), reconstructing
-//!   the full point from x-only queries; on host / degenerate inputs it falls
-//!   back to the pure-Rust `ProjectivePoint::lincomb`.
+//!   evaluated through the affine ECSM `ecsm_mul_affine` precompile (riscv64),
+//!   which returns both coordinates of each `k·P` — so the two products cost one
+//!   query each and are combined with a single chord addition. On host /
+//!   degenerate inputs it falls back to the pure-Rust `ProjectivePoint::lincomb`.
 //!
 //! Every other `Crypto` method inherits the trait default (vetted pure-Rust
 //! crates: `ark-bn254`, `bls12_381`, `p256`, `sha2`, `ripemd`, …).
@@ -29,8 +30,8 @@ use k256::elliptic_curve::sec1::ToEncodedPoint;
 use k256::elliptic_curve::PrimeField;
 use k256::{AffinePoint, FieldBytes, ProjectivePoint, Scalar, U256};
 
-// Used only by the x-only point reconstruction (riscv accelerated path + the
-// host unit tests); unused on a non-test host build.
+// Used by the ECSM oracle plumbing and the affine point helpers (riscv accelerated
+// path + the host unit tests); unused on a non-test host build.
 #[cfg(any(target_arch = "riscv64", test))]
 use k256::elliptic_curve::sec1::FromEncodedPoint;
 #[cfg(any(target_arch = "riscv64", test))]
@@ -288,10 +289,10 @@ fn ecsm_ecrecover(sig: &[u8; 64], recid: u8, msg: &[u8; 32]) -> Result<[u8; 64],
 
 /// ECSM-accelerated 2-term linear combination `k1·P1 + k2·P2`.
 ///
-/// On riscv64 this reconstructs the full affine result from four x-only ECSM
-/// queries (see [`lincomb2_with_oracle`]); on other targets, and whenever a
-/// guard trips (degenerate input or oracle inconsistency), it returns `None`
-/// so the caller uses the pure-Rust `ProjectivePoint::lincomb`.
+/// On riscv64 this uses two affine ECSM queries (the precompile returns `(x, y)`,
+/// see [`lincomb2_with_oracle`]) instead of four x-only queries plus chord-law
+/// y-reconstruction; on other targets, and whenever a guard trips, it returns
+/// `None` so the caller uses the pure-Rust `ProjectivePoint::lincomb`.
 #[cfg(target_arch = "riscv64")]
 fn ecsm_lincomb2(
     a1: &AffinePoint,
@@ -312,27 +313,41 @@ fn ecsm_lincomb2(
     None
 }
 
-/// x-only scalar-mul oracle backed by the ECSM precompile: computes `x(k·P)`
-/// for the curve point P whose x-coordinate is passed in. `x` must be the
-/// x-coordinate of a curve point and `k` in `(0, N)` (N = curve order) —
-/// guaranteed by the guards in [`lincomb2_with_oracle`]. Values cross the ABI
-/// as 32-byte little-endian; `x_le` and `k_le` are distinct stack arrays so
-/// the executor's `|addr_x_le − addr_k_le| ≥ 32` assumption holds by
-/// construction.
+/// AFFINE oracle backed by the ECSM precompile: computes the full point `k·(x, y)` for the
+/// caller's actual input point `(x, y)`. Returns `(xR, yR)` as normalized field elements —
+/// no parity convention or sign flip, because the precompile receives the real `y` and the
+/// prover pins it by a memory read. `(x, y)` must be a curve point and `k` in `(0, N)`.
+/// Values cross the ABI as 32-byte little-endian; `input` is a 64-byte `[xG‖yG]` buffer,
+/// `out` a 64-byte `[xR‖yR]` buffer and `k_le` a distinct 32-byte array, so the two
+/// operand ranges are disjoint as the executor requires (it tests the ranges, not their
+/// distance, so either stack layout is fine).
 #[cfg(target_arch = "riscv64")]
-fn ecsm_oracle(x: &FieldElement, k: &Scalar) -> Option<FieldElement> {
+fn ecsm_oracle(
+    x: &FieldElement,
+    y: &FieldElement,
+    k: &Scalar,
+) -> Option<(FieldElement, FieldElement)> {
     let x_be = x.to_bytes();
+    let y_be = y.to_bytes();
     let k_be = k.to_bytes();
-    let mut x_le = [0u8; 32];
+    let mut input = [0u8; 64];
     let mut k_le = [0u8; 32];
     for i in 0..32 {
-        x_le[i] = x_be[31 - i];
+        input[i] = x_be[31 - i];
+        input[32 + i] = y_be[31 - i];
         k_le[i] = k_be[31 - i];
     }
-    let mut xr_le = [0u8; 32];
-    lambda_vm_syscalls::syscalls::ecsm_mul(&mut xr_le, &x_le, &k_le);
-    xr_le.reverse();
-    Option::from(FieldElement::from_bytes(&xr_le.into()))
+    let mut out = [0u8; 64];
+    lambda_vm_syscalls::syscalls::ecsm_mul_affine(&mut out, &input, &k_le);
+    let mut xr_be = [0u8; 32];
+    let mut yr_be = [0u8; 32];
+    for i in 0..32 {
+        xr_be[i] = out[31 - i];
+        yr_be[i] = out[32 + 31 - i];
+    }
+    let xr = Option::<FieldElement>::from(FieldElement::from_bytes(&xr_be.into()))?;
+    let yr = Option::<FieldElement>::from(FieldElement::from_bytes(&yr_be.into()))?;
+    Some((xr.normalize(), yr.normalize()))
 }
 
 /// Base-field inverse `x⁻¹ mod p`.
@@ -384,18 +399,20 @@ where
     Option::from(x.invert())
 }
 
-/// Computes `k1·P1 + k2·P2` from four x-only oracle queries, or `None` if any
-/// degenerate-configuration guard trips.
+/// Computes `k1·P1 + k2·P2` from two affine oracle queries, or `None` if a
+/// degenerate configuration trips a guard.
 ///
-/// The lambda-vm ECSM precompile returns only `x(k·P)`. For `A = k1·P1` with
-/// `P1 = (xp, yp)` fully known, query `xa = x(k1·P1)` and `xc = x((k1+1)·P1)`.
-/// The chord-addition law gives `λ² = xc + xa + xp =: t` and `ya = yp + λ·dx`
-/// with `dx = xa − xp`; substituting into `ya² = xa³ + b` makes λ *linear*:
-/// `λ = (xa³ − xp³ − t·dx²) / (2·yp·dx)`. The wrong sign `−ya` would force
-/// `x((k1−1)·P1) = xc`, i.e. `k1 ≡ 0` or `2·k1 ≡ 0 (mod n)`, excluded by the
-/// scalar guards. x-only queries are parity-invariant (`x(k·P) = x(k·(−P))`),
-/// so the precompile's canonical-y lift never matters. Same for `B = k2·P2`,
-/// then `Q = A + B` is one affine addition. All three inversions are batched.
+/// The affine ECSM ecall returns the full point, so `A = k1·P1` and `B = k2·P2`
+/// each cost one query and `Q = A + B` is a single chord addition — one field
+/// inversion, for `1/(xb − xa)`. `dx = 0` covers both degenerate cases at once
+/// (two curve points share an x only when they are equal or negatives), so the
+/// caller falls back to the software `lincomb` there.
+///
+/// The x-only predecessor needed a second query `x((k+1)·P)` per point to solve
+/// for `y` through the chord-addition law, which is what made `k1 = 1` and
+/// `k1 = N−1` degenerate; with `y` supplied by the chip those scalars are
+/// ordinary. secp256k1 has cofactor 1 and prime `N`, so `k·P ≠ O` for every
+/// `k ∈ (0, N)` and no further scalar guard is needed.
 ///
 /// Generic over the oracle so unit tests can substitute a software stand-in.
 #[cfg(any(target_arch = "riscv64", test))]
@@ -407,45 +424,33 @@ fn lincomb2_with_oracle<O>(
     oracle: O,
 ) -> Option<AffinePoint>
 where
-    O: Fn(&FieldElement, &Scalar) -> Option<FieldElement>,
+    O: Fn(&FieldElement, &FieldElement, &Scalar) -> Option<(FieldElement, FieldElement)>,
 {
     // Inputs are affine already (the ecrecover path lifts them from known Z=1
     // points), so no projective→affine inversion is needed here.
     if bool::from(a1.is_identity()) || bool::from(a2.is_identity()) {
         return None;
     }
-    if scalar_near_edge(k1) || scalar_near_edge(k2) {
+    if bool::from(k1.is_zero()) || bool::from(k2.is_zero()) {
         return None;
     }
 
     let (x1, y1) = affine_xy(a1)?;
     let (x2, y2) = affine_xy(a2)?;
 
-    let xa = oracle(&x1, k1)?;
-    let xc1 = oracle(&x1, &(*k1 + Scalar::ONE))?;
-    let xb = oracle(&x2, k2)?;
-    let xc2 = oracle(&x2, &(*k2 + Scalar::ONE))?;
+    // The oracle receives the full point (x, y) and returns k·(x, y) directly — no parity
+    // convention or sign flip, since the precompile gets the real y (pinned in the prover
+    // by a memory read).
+    let (xa, ya) = oracle(&x1, &y1, k1)?;
+    let (xb, yb) = oracle(&x2, &y2, k2)?;
 
-    let dx1 = (xa - x1).normalize();
-    let dx2 = (xb - x2).normalize();
+    // Q = A + B via one chord addition (A ≠ ±B ⇒ dxq ≠ 0). One field inversion.
     let dxq = (xb - xa).normalize();
-    if bool::from(dx1.is_zero()) || bool::from(dx2.is_zero()) || bool::from(dxq.is_zero()) {
+    if bool::from(dxq.is_zero()) {
         return None;
     }
-
-    // One shared inversion for the two λ denominators and the final chord.
-    let den1 = y1.double() * dx1;
-    let den2 = y2.double() * dx2;
-    let inv = field_inv(&(den1 * den2 * dxq))?;
-    let inv_den1 = inv * den2 * dxq;
-    let inv_den2 = inv * den1 * dxq;
-    let inv_dxq = inv * den1 * den2;
-
-    let ya = solve_y(&x1, &y1, &xa, &xc1, &dx1, &inv_den1)?;
-    let yb = solve_y(&x2, &y2, &xb, &xc2, &dx2, &inv_den2)?;
-
-    // Q = A + B, with A ≠ ±B ensured by dxq ≠ 0.
-    let lq = (yb - ya) * inv_dxq;
+    let inv_dxq = field_inv(&dxq)?;
+    let lq = ((yb - ya) * inv_dxq).normalize();
     let xq = (lq.square() - xa - xb).normalize();
     let yq = (lq * (xa - xq) - ya).normalize();
 
@@ -454,38 +459,6 @@ where
     // correctness rests on the algebra above — an on-curve-but-wrong point
     // would still pass this check.
     point_from_xy(&xq, &yq)
-}
-
-/// Recovers `y(k·P)` from `xa = x(k·P)` and `xc = x((k+1)·P)`.
-/// Returns `None` if `xc` is inconsistent with the computed `lambda`
-/// (oracle misbehavior); degeneracy guards are in [`lincomb2_with_oracle`].
-#[cfg(any(target_arch = "riscv64", test))]
-fn solve_y(
-    xp: &FieldElement,
-    yp: &FieldElement,
-    xa: &FieldElement,
-    xc: &FieldElement,
-    dx: &FieldElement,
-    inv_den: &FieldElement,
-) -> Option<FieldElement> {
-    let t = *xc + xa + xp;
-    let xa3 = xa.square() * xa;
-    let xp3 = xp.square() * xp;
-    let lambda = (xa3 - xp3 - t * dx.square()) * inv_den;
-    if lambda.square().normalize() != t.normalize() {
-        return None;
-    }
-    Some((*yp + lambda * dx).normalize())
-}
-
-/// `k ∈ {0, 1, n−1}`: fast early-exit before oracle calls.
-/// k=0: invalid ecall scalar. k=1: dx=0. k=n-1: k+1 wraps to 0 mod n.
-#[cfg(any(target_arch = "riscv64", test))]
-fn scalar_near_edge(k: &Scalar) -> bool {
-    use k256::elliptic_curve::subtle::ConstantTimeEq;
-    bool::from(k.is_zero())
-        || bool::from(k.ct_eq(&Scalar::ONE))
-        || bool::from(k.ct_eq(&(-Scalar::ONE)))
 }
 
 /// Affine `(x, y)` of a non-identity point as field elements, via its SEC1

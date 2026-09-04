@@ -847,22 +847,37 @@ fn collect_ecsm_ops(
     Vec<ecdas::EcdasOperation>,
 ) {
     let t = op.timestamp;
+    let is_affine = op.ecsm_affine;
     let addr_xr = register_state.read(10).0;
     let addr_xg = register_state.read(11).0;
     let addr_k = register_state.read(12).0;
 
-    // Read the xG and k operands (32 little-endian bytes each) from memory.
+    // Read the operands from memory. x-only reads xG (32B) + k (32B); affine also reads yG
+    // (the caller's real input y, pinned below by a memory read at T) so the returned point
+    // is the caller's actual point — no even-parity convention.
     let mut xg = [0u8; 32];
+    let mut yg = [0u8; 32];
     let mut k = [0u8; 32];
     for i in 0..32 {
         xg[i] = memory_state.read_byte(addr_xg.wrapping_add(i as u64)).0;
+        if is_affine {
+            yg[i] = memory_state
+                .read_byte(addr_xg.wrapping_add(32 + i as u64))
+                .0;
+        }
         k[i] = memory_state.read_byte(addr_k.wrapping_add(i as u64)).0;
     }
 
-    let witness = ::ecsm::compute_witness(&k, &xg)
-        .expect("ECSM witness: executor validates 0 < k < N and xG on curve");
+    let witness = if is_affine {
+        ::ecsm::compute_witness_with_y(&k, &xg, &yg)
+            .expect("ECSM witness: executor validates 0 < k < N, xG/yG < p, (xG,yG) on curve")
+    } else {
+        ::ecsm::compute_witness(&k, &xg)
+            .expect("ECSM witness: executor validates 0 < k < N and xG on curve")
+    };
 
-    let mut memw_ops = Vec::with_capacity(15);
+    // 15 ops on the x-only path; the affine path adds 4 yG reads and 4 yR writes.
+    let mut memw_ops = Vec::with_capacity(if is_affine { 23 } else { 15 });
 
     // x11 -> addr_xG (register read at T), x12 -> addr_k (register read at T+1).
     {
@@ -887,6 +902,25 @@ fn collect_ecsm_ops(
         let (_old, old_ts) = memory_state.read_bytes(addr, 8);
         memw_ops.push(MemwOperation::new(false, addr, value, t, 8, true).with_old(value, old_ts));
         memory_state.write_bytes(addr, dword, 8, t);
+    }
+
+    // AFFINE only: yG: 4 doubleword reads at T (addr_xG + 32 + 8i). Pins the witnessed yG to
+    // the caller's input, closing the parity soundness gap. x-only guests pass only xG, so
+    // this block (and the ECSM table's yG-read bus, gated by IS_AFFINE) does not run.
+    if is_affine {
+        for i in 0..4 {
+            let addr = addr_xg.wrapping_add((32 + 8 * i) as u64);
+            let mut value = [0u32; 8];
+            let mut dword = 0u64;
+            for j in 0..8 {
+                value[j] = witness.y_g[8 * i + j] as u32;
+                dword |= (witness.y_g[8 * i + j] as u64) << (8 * j);
+            }
+            let (_old, old_ts) = memory_state.read_bytes(addr, 8);
+            memw_ops
+                .push(MemwOperation::new(false, addr, value, t, 8, true).with_old(value, old_ts));
+            memory_state.write_bytes(addr, dword, 8, t);
+        }
     }
 
     // x12 -> addr_k (register read at T+1).
@@ -942,6 +976,26 @@ fn collect_ecsm_ops(
         memory_state.write_bytes(addr, dword, 8, t + 2);
     }
 
+    // AFFINE only: yR writes at T + 3 (4 doublewords at addr_xR + 32 + 8i). Matches the
+    // ecsm.rs YR sender block (gated by IS_AFFINE); the executor wrote yR to addr_xR + 32.
+    // x-only guests get only xR written back.
+    if is_affine {
+        for i in 0..4 {
+            let addr = addr_xr.wrapping_add((32 + 8 * i) as u64);
+            let mut value = [0u32; 8];
+            let mut dword = 0u64;
+            for j in 0..8 {
+                value[j] = witness.y_r[8 * i + j] as u32;
+                dword |= (witness.y_r[8 * i + j] as u64) << (8 * j);
+            }
+            let (old_vals, old_ts) = memory_state.read_bytes(addr, 8);
+            memw_ops.push(
+                MemwOperation::new(false, addr, value, t + 3, 8, false).with_old(old_vals, old_ts),
+            );
+            memory_state.write_bytes(addr, dword, 8, t + 3);
+        }
+    }
+
     let ecdas_ops = witness
         .steps
         .iter()
@@ -953,6 +1007,7 @@ fn collect_ecsm_ops(
         addr_xg,
         addr_k,
         addr_xr,
+        is_affine,
         witness,
     };
 
@@ -2392,7 +2447,7 @@ pub(crate) fn collect_bitwise_from_ecsm(ops: &[ecsm::EcsmOperation]) -> Vec<Bitw
             out.push(is_half_op((w.c0[i] + ecsm::CARRY_OFFSET_X2) as u16));
             out.push(is_half_op((w.c1[i] + ecsm::CARRY_OFFSET_YG) as u16));
         }
-        // IS_HALF on the U256HL limbs of xG_sub_p, k_sub_N and xR_sub_p.
+        // IS_HALF on the U256HL limbs of xG_sub_p, k_sub_N, xR_sub_p and yR_sub_p.
         for i in 0..16 {
             out.push(is_half_op(
                 w.x_g_sub_p[2 * i] as u16 + ((w.x_g_sub_p[2 * i + 1] as u16) << 8),
@@ -2402,6 +2457,9 @@ pub(crate) fn collect_bitwise_from_ecsm(ops: &[ecsm::EcsmOperation]) -> Vec<Bitw
             ));
             out.push(is_half_op(
                 w.x_r_sub_p[2 * i] as u16 + ((w.x_r_sub_p[2 * i + 1] as u16) << 8),
+            ));
+            out.push(is_half_op(
+                w.y_r_sub_p[2 * i] as u16 + ((w.y_r_sub_p[2 * i + 1] as u16) << 8),
             ));
         }
         // ZERO: assert k != 0 (sum of k's bytes).
@@ -3176,6 +3234,22 @@ fn build_traces<I: ImageSource + Sync>(
             LtOperation::new(op.out_addr & 0xFFFF_FFFF, hint::HINT_ADDR_LIMB_BOUND, false),
         ]
     }));
+    // ECSM range-checks: each operand's low address limb < the executor's addr_limb_ok
+    // bound (32-byte operands 2^32-31, the affine variant's 64-byte xG‖yG / xR‖yR
+    // 2^32-63), matching EcsmAddressOverflow. Three LT ops per ECSM call; the ECSM table
+    // sends the matching ALU LT interactions with the bound linear in IS_AFFINE.
+    lt_ops.extend(ecsm_ops.iter().flat_map(|op| {
+        let operand_bound = if op.is_affine {
+            ecsm::ADDR_LIMB_BOUND_64B
+        } else {
+            ecsm::ADDR_LIMB_BOUND_32B
+        };
+        [
+            LtOperation::new(op.addr_xg & 0xFFFF_FFFF, operand_bound, false),
+            LtOperation::new(op.addr_xr & 0xFFFF_FFFF, operand_bound, false),
+            LtOperation::new(op.addr_k & 0xFFFF_FFFF, ecsm::ADDR_LIMB_BOUND_32B, false),
+        ]
+    }));
 
     // =====================================================================
     // PHASE 4: All → Bitwise lookups
@@ -3909,6 +3983,14 @@ pub fn count_table_lengths(
                     &mut memw_register_count,
                 );
             }
+            lt_count += 3;
+        }
+
+        if cpu_op.ecall_ecsm {
+            // Three ALU LT operand range-checks per ECSM call (addr_xG, addr_xR, addr_k
+            // low limbs). The count does not depend on the values or on the mode, so
+            // unlike the hint branch this needs no replay of `collect_ecsm_ops` — which
+            // would mean recomputing the whole EC witness just to count rows.
             lt_count += 3;
         }
 

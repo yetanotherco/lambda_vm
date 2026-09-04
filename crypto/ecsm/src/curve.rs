@@ -18,8 +18,14 @@ pub struct AffinePoint {
 /// Recovers the canonical (even) `y` for a given `x` such that `y^2 = x^3 + b mod p`.
 ///
 /// Both `y` and `p - y` are valid; we pick the even one so the executor and prover agree
-/// deterministically. The chip never constrains the parity (it only writes back `xR`, and
-/// `k·P` and `k·(-P)` share an x-coordinate), so any consistent choice is sound.
+/// deterministically. Any consistent choice is sound **on the x-only path**, which is the
+/// only caller: it writes back just `xR`, and `k·P` and `k·(-P)` share an x-coordinate, so
+/// the parity never escapes the chip and the AIR need not constrain it.
+///
+/// The affine path does not use this function — it takes `yG` from the caller (see
+/// `prepare_with_y`), because there `yR` *is* returned and the parity is observable. There
+/// the AIR pins `yG` to the caller's input buffer with an `IS_AFFINE`-gated memory read
+/// rather than leaving the root to the witness.
 ///
 /// Returns `None` when `x` is not a valid curve x-coordinate (`x^3 + b` is not a quadratic
 /// residue, or `x` is not a canonical field element).
@@ -153,11 +159,19 @@ fn schedule(k: &BigUint) -> Vec<(u8, u8, u8)> {
 /// multiplication. Needs no step list or slopes, so it skips all witness work.
 /// `k` must be in `[1, N)` (guaranteed by `prepare`).
 pub fn scalar_mul_affine_x(k: &BigUint, g: &AffinePoint) -> BigUint {
+    scalar_mul_affine(k, g).x
+}
+
+/// Executor fast path: the full affine point `k·g`, so the `ecsm_mul_affine` syscall can
+/// hand `y` back to the guest. `g` is whatever point the caller prepared — the even-`y` lift
+/// of `xG` on the x-only path, the caller's own input point on the affine one — and `k·g`'s
+/// y matches the ECDAS-constrained `y_r` either way.
+pub fn scalar_mul_affine(k: &BigUint, g: &AffinePoint) -> AffinePoint {
     let scalar = Option::<Scalar>::from(Scalar::from_repr(be32(k).into()))
         .expect("ECSM: scalar k must be < N");
     let g_proj = ProjectivePoint::from(to_k256_affine(g));
     let r = (g_proj * scalar).to_affine();
-    from_k256_affine(&r).x
+    from_k256_affine(&r)
 }
 
 /// Jacobian doubling (dbl-2009-l) for `y² = x³ + 7`: on `(X:Y:Z)` with
