@@ -16,6 +16,10 @@
 //! `IS_AFFINE` is pinned to the actual ecall number by the `Ecall` receiver, so it can't be
 //! forged (see `bus_interactions`).
 //!
+//! The affine `yG` is pinned to the caller's bytes but NOT range-checked: `OverflowKind` has
+//! no `YgLtP`, and every relation on `yG` is a congruence mod `p`, so a non-canonical encoding
+//! is accepted here and rejected by the executor (see `formal_verification/ecsm-affine`, A3g).
+//!
 //! See `spec/src/ecsm.toml`. All multi-limb arithmetic uses 8-bit limbs; the witness is built
 //! by `ecsm::compute_witness`, which reproduces these exact recurrences.
 //!

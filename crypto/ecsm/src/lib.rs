@@ -81,9 +81,11 @@ pub enum EcsmError {
     /// `yG` fails `yG² ≡ xG³ + b`.
     NotOnCurve,
     /// A coordinate is `>= p`, so it is not a canonical field element — `xG` on either path,
-    /// `yG` on the affine one. Reducing it silently would diverge from the prover, whose
-    /// `xR < p` / `yR < p` range checks make a non-canonical input unprovable (with `k = 1`
-    /// the x-only input is echoed back as `xR`).
+    /// `yG` on the affine one. For `xG` and `yR` this matches the prover, whose `xR < p` /
+    /// `yR < p` range checks make a non-canonical value unprovable (with `k = 1` the x-only
+    /// input is echoed back as `xR`). `yG` has no such check — the AIR accepts a non-canonical
+    /// `yG` — so this rejection is the only thing that stops it, and reducing here would hide
+    /// the divergence instead of removing it.
     CoordinateOutOfRange,
 }
 
