@@ -666,7 +666,7 @@ check:
 clippy:
 	cargo clippy --workspace --all-targets -- -D warnings -A clippy::op_ref
 	cargo clippy --workspace --all-targets --no-default-features --features lambda-vm-prover/debug-checks -- -D warnings -A clippy::op_ref
-	cargo clippy --workspace --all-targets --features lambda-vm-prover/disk-spill -- -D warnings -A clippy::op_ref
+	cargo clippy --workspace --all-targets --features lambda-vm-prover/disk-spill,lambda-vm-prover/instruments -- -D warnings -A clippy::op_ref
 
 fmt:
 	cargo fmt --all
@@ -676,7 +676,9 @@ lint:
 	cargo fmt --check --all
 	cargo clippy --workspace --all-targets -- -D warnings -A clippy::op_ref
 	cargo clippy --workspace --all-targets --no-default-features --features lambda-vm-prover/debug-checks -- -D warnings -A clippy::op_ref
-	cargo clippy --workspace --all-targets --features lambda-vm-prover/disk-spill -- -D warnings -A clippy::op_ref
+	# `instruments` rides on this pass rather than adding a fifth one: it gates the per-table
+	# timing plumbing, which no other pass compiles, so breakage there used to reach main.
+	cargo clippy --workspace --all-targets --features lambda-vm-prover/disk-spill,lambda-vm-prover/instruments -- -D warnings -A clippy::op_ref
 	# The cuda feature gates whole modules + cuda-only integration tests. build.rs emits empty
 	# cubin stubs when nvcc is absent, so this checks on a GPU-less host (CI lint runner, dev laptop)
 	# too — no GPU required. Catches cuda-gated breakage that the non-cuda passes above miss.
