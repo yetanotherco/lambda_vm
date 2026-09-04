@@ -269,15 +269,12 @@ where
 /// aux commit and rounds 2-4 into one task:
 /// - main: produced by the Round 1 main commit, which is a phase-wide barrier,
 ///   so all N tables' main LDEs are live at once (O(N × main_cols × lde_size)).
-/// - aux: all N are live at once too in every configuration built today
-///   (O(N × aux_cols × lde_size), and aux is ext3, so 24 B per element).
-///   Under `cuda` the fused task holds only the scheduler's `k` of them, but
-///   `k` there is `num_airs`. CPU builds keep a phase barrier between the
-///   aux/commit stage and rounds 2-4 and stage every table's aux LDE across
-///   it, so `k` does not bound this peak there at all.
+/// - aux: produced and consumed inside the same fused task, so at most the
+///   scheduler's `k` coexist (O(k × aux_cols × lde_size)) — which under `cuda`
+///   is `num_airs`, so there they are all-N-live like the main ones.
 ///
-/// Under `debug-checks` the fused task is split on `cuda` as well, around the
-/// cross-table bus balance check.
+/// Under `debug-checks` the fused task is split around the cross-table bus
+/// balance check, so there the aux LDEs are all-N-live like the main ones.
 struct Lde<Field: IsFFTField, FieldExtension: IsField> {
     /// Row-major main LDE buffer + its column count.
     main: (Vec<FieldElement<Field>>, usize),
@@ -754,6 +751,26 @@ impl Drop for VramPermit<'_> {
     }
 }
 
+/// Debug-only contract check for `run_admitted`: the result slots are addressed
+/// by `order`'s *values*, so every value must index `estimates` and appear at
+/// most once. Callers pass either a full permutation or one group of one, and a
+/// grouping bug would otherwise surface as a confusing `take()` panic inside a
+/// task rather than here.
+fn debug_check_order(order: &[usize], estimates: &[u64]) {
+    if cfg!(debug_assertions) {
+        let mut seen = vec![false; estimates.len()];
+        for &idx in order {
+            assert!(
+                idx < estimates.len(),
+                "run_admitted: order names table {idx}, estimates has {}",
+                estimates.len()
+            );
+            assert!(!seen[idx], "run_admitted: order names table {idx} twice");
+            seen[idx] = true;
+        }
+    }
+}
+
 /// Run `task` once per table index on `workers` OS driver threads, admitting
 /// each index through `gate` with its estimated bytes. `order` fixes the
 /// start order (heaviest table first, so the long pole starts early and small
@@ -767,6 +784,7 @@ fn run_admitted<T: Send>(
     workers: usize,
     task: impl Fn(usize) -> T + Sync,
 ) -> Vec<Option<T>> {
+    debug_check_order(order, estimates);
     let results: Vec<std::sync::Mutex<Option<T>>> = estimates
         .iter()
         .map(|_| std::sync::Mutex::new(None))
@@ -809,6 +827,7 @@ fn run_admitted<T: Send>(
     workers: usize,
     task: impl Fn(usize) -> T + Sync,
 ) -> Vec<Option<T>> {
+    debug_check_order(order, estimates);
     // No interior mutability here, unlike the `cuda` arm: `collect()` joins
     // each chunk, so every slot is written from this thread.
     let mut results: Vec<Option<T>> = (0..estimates.len()).map(|_| None).collect();
@@ -834,6 +853,7 @@ fn run_admitted<T: Send>(
     _workers: usize,
     task: impl Fn(usize) -> T + Sync,
 ) -> Vec<Option<T>> {
+    debug_check_order(order, estimates);
     let mut results: Vec<Option<T>> = (0..estimates.len()).map(|_| None).collect();
     for &idx in order {
         results[idx] = Some(task(idx));
@@ -4030,42 +4050,11 @@ pub trait IsStarkProver<
         // host-bound stretch, the others' GPU stages fill the device. The
         // shared transcript is untouched past this point (each fork is
         // per-table), so any order is sound; proofs are drained in index order.
-        #[cfg(all(feature = "cuda", not(feature = "debug-checks")))]
+        #[cfg(not(feature = "debug-checks"))]
         let table_results = run_admitted(&peak_order, &peak_estimates, &vram_gate, k, |idx| {
             let (commitment, lde) = aux_stage(idx)?;
             rounds_stage(idx, commitment, lde)
         });
-
-        // CPU has no device wait to hide. Keep a phase barrier between the
-        // aux/commit work and rounds 2-4 so Rayon can finish one homogeneous
-        // region before starting the next one, as it did before the GPU
-        // scheduler was introduced. The fused path above is intentionally
-        // CUDA-only; interleaving these CPU-heavy regions regresses the host
-        // prover through cache and memory-bandwidth contention.
-        //
-        // Cost of the barrier: every table's Round 1 result is staged until its
-        // rounds run, so the aux LDE *and* the aux Merkle tree are live for all
-        // N tables where the fused path held at most `k`. Under `disk-spill`'s
-        // Disk mode the trees are spilled but the aux LDE is a plain `Vec` with
-        // no spill path, so Disk does not bound this peak.
-        #[cfg(all(not(feature = "cuda"), not(feature = "debug-checks")))]
-        let table_results = {
-            let aux_outs = run_admitted(&peak_order, &peak_estimates, &vram_gate, k, aux_stage);
-            let mut staged = Vec::with_capacity(num_airs);
-            for out in aux_outs {
-                staged.push(std::sync::Mutex::new(Some(
-                    out.expect("run_admitted fills every slot")?,
-                )));
-            }
-            run_admitted(&peak_order, &peak_estimates, &vram_gate, k, |idx| {
-                let (commitment, lde) = staged[idx]
-                    .lock()
-                    .unwrap()
-                    .take()
-                    .expect("aux result consumed once per table");
-                rounds_stage(idx, commitment, lde)
-            })
-        };
 
         // debug-checks needs every table's commitments and traces between the
         // aux and rounds stages (cross-table bus balance), so it splits the
@@ -4837,5 +4826,75 @@ fn print_bus_balance_report<FieldExtension>(
             let report = tracker.analyze_mismatches();
             report.print_summary();
         }
+    }
+}
+
+#[cfg(test)]
+mod scheduler_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Runs `run_admitted` over `order` with `n` tables and returns how many
+    /// times each table's task ran, plus the slots it wrote.
+    fn calls_and_results(
+        order: &[usize],
+        n: usize,
+        workers: usize,
+    ) -> (Vec<usize>, Vec<Option<usize>>) {
+        let estimates = vec![1u64; n];
+        let gate = VramGate::new(u64::MAX);
+        let calls: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
+        let out = run_admitted(order, &estimates, &gate, workers, |idx| {
+            calls[idx].fetch_add(1, Ordering::Relaxed);
+            idx
+        });
+        (
+            calls.iter().map(|c| c.load(Ordering::Relaxed)).collect(),
+            out,
+        )
+    }
+
+    /// The scheduler's contract, independent of how many tables run at once:
+    /// each table's task runs exactly once and its result lands on its own
+    /// index. Nothing else pins this, and a chunking or sizing bug would only
+    /// show up on hosts with a particular core count.
+    #[test]
+    fn every_table_runs_once_and_lands_on_its_own_slot() {
+        for n in [1usize, 2, 5, 21] {
+            // Heaviest-first, which is the order `multi_prove` passes.
+            let estimates: Vec<u64> = (0..n).map(|i| (n - i) as u64).collect();
+            let order = heaviest_first(&estimates);
+            for workers in [1usize, 2, 3, n, n + 5] {
+                let (calls, out) = calls_and_results(&order, n, workers);
+                assert!(
+                    calls.iter().all(|&c| c == 1),
+                    "n={n} workers={workers} calls={calls:?}"
+                );
+                for (idx, slot) in out.iter().enumerate() {
+                    assert_eq!(*slot, Some(idx), "n={n} workers={workers}");
+                }
+            }
+        }
+    }
+
+    /// What the `Staged(depth)` arm passes once the barrier runs over groups:
+    /// a subset of the permutation. The untouched tables must stay empty.
+    #[test]
+    fn a_group_fills_only_its_own_slots() {
+        let n = 9;
+        let group = [7usize, 1, 4];
+        let (calls, out) = calls_and_results(&group, n, 2);
+        for idx in 0..n {
+            let ran = group.contains(&idx);
+            assert_eq!(calls[idx], ran as usize, "table {idx}");
+            assert_eq!(out[idx], ran.then_some(idx), "table {idx}");
+        }
+    }
+
+    #[test]
+    fn an_empty_order_runs_nothing() {
+        let (calls, out) = calls_and_results(&[], 4, 3);
+        assert!(calls.iter().all(|&c| c == 0));
+        assert!(out.iter().all(|s| s.is_none()));
     }
 }
