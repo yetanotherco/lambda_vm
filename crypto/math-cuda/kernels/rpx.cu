@@ -20,7 +20,7 @@
 // PROVENANCE, layered exactly as the Rust module's own (rpx.rs "PROVENANCE"):
 // the FB round IS RPO's round with RPO's constants, and those are pinned by
 // nineteen EXTERNAL miden-crypto vectors, which `tests/host_kat/rpx_host_kat.cpp`
-// replays through `fb_round<R>` composed seven times. The E round (the cubic
+// replays through `fb_round(s, r)` composed seven times. The E round (the cubic
 // extension) and the schedule have no published vector anywhere; they are
 // pinned to the Rust oracle's output (`prover/tests/rpx_host_kat_vectors.rs`)
 // and, independently, to naive polynomial arithmetic in the harness.
@@ -63,6 +63,17 @@
 #include <cstdint>
 #include "goldilocks.cuh"
 #include "ext3.cuh"
+
+// `permute` is a REAL device function, never inlined (see its CODE SHAPE
+// note). The host shim has no `__noinline__`; on the host the attribute only
+// matters to the code-size probe, which asks for it explicitly.
+#if defined(__CUDACC__)
+#define RPX_NOINLINE __noinline__
+#elif defined(RPX_HOST_NOINLINE)
+#define RPX_NOINLINE __attribute__((noinline))
+#else
+#define RPX_NOINLINE
+#endif
 
 namespace rpx {
 
@@ -142,10 +153,13 @@ __device__ __constant__ uint64_t ARK2[NUM_ROUNDS][STATE_FELTS] = {
      16460604813734957368ull, 9643968136937729763ull, 3611348709641382851ull, 18256379591337759196ull},
 };
 
-// First ROW of the circulant MDS: `M[i][j] = MDS_CIRC_ROW[(j − i) mod 12]`
-// (rpo.rs:107-114). Stored 32-bit so each MDS term is one 32×32→64 MAC. The
-// row sums to 160, which is the bound `mds` rests on.
-__device__ __constant__ uint32_t MDS_CIRC_ROW[STATE_FELTS] = {7, 23, 8, 26, 13, 10, 9, 7, 6, 22, 21, 8};
+// First ROW of the circulant MDS, `M[i][j] = ROW[(j − i) mod 12]`
+// (rpo.rs:107-114), stored TWICE so that `MDS_CIRC_ROW2[j + 12 − i]` is the
+// entry with no modulo: the output-lane loop in `mds` is rolled, so `i` is a
+// runtime value there. 32-bit so each MDS term is one 32×32→64 MAC. The row
+// sums to 160, which is the bound `mds` rests on.
+__device__ __constant__ uint32_t MDS_CIRC_ROW2[2 * STATE_FELTS] = {
+    7, 23, 8, 26, 13, 10, 9, 7, 6, 22, 21, 8, 7, 23, 8, 26, 13, 10, 9, 7, 6, 22, 21, 8};
 
 // ---------------------------------------------------------------------------
 // Field-op forwarders. Under nvcc they are the `goldilocks.cuh` / `ext3.cuh`
@@ -210,12 +224,15 @@ __device__ __forceinline__ void mds(uint64_t s[STATE_FELTS]) {
         hi32[j] = (uint32_t)(s[j] >> 32);
     }
     uint64_t out[STATE_FELTS];
-#pragma unroll
+    // Rolled over output lanes: twelve iterations of twenty-four MACs, one
+    // twelfth of the unrolled body's code for the same instruction count.
+#pragma unroll 1
     for (int i = 0; i < STATE_FELTS; ++i) {
         uint64_t acc_lo = 0, acc_hi = 0;  // Σ c·l_j and Σ c·h_j, each < 2^40
+        const int rot = STATE_FELTS - i;   // MDS_CIRC_ROW2[j + rot] = ROW[(j − i) mod 12]
 #pragma unroll
         for (int j = 0; j < STATE_FELTS; ++j) {
-            const uint32_t c = MDS_CIRC_ROW[(j + STATE_FELTS - i) % STATE_FELTS];
+            const uint32_t c = MDS_CIRC_ROW2[j + rot];
             acc_lo += (uint64_t)c * (uint64_t)lo32[j];
             acc_hi += (uint64_t)c * (uint64_t)hi32[j];
         }
@@ -244,7 +261,9 @@ __device__ __forceinline__ uint64_t sbox(uint64_t x) {
 
 template <int N>
 __device__ __forceinline__ uint64_t square_n(uint64_t x) {
-#pragma unroll
+    // Rolled: the chain is serial anyway, and unrolled it is what made one
+    // permutation ~49k lines of PTX. The unroll factor here is a tuning knob.
+#pragma unroll 1
     for (int i = 0; i < N; ++i) x = fmul(x, x);
     return x;
 }
@@ -311,33 +330,35 @@ __device__ __forceinline__ CubicExt ext_power7(const CubicExt &a) {
 }
 
 // ---------------------------------------------------------------------------
-// Rounds. `R` is the round index into ARK1/ARK2 — a template parameter so the
-// constant-bank offsets fold at compile time.
+// Rounds. `r` is the round index into ARK1/ARK2 — a runtime value, so one copy
+// of each round body serves every round; the constant-bank address is
+// computed, which costs nothing next to the round's arithmetic. Every lane
+// loop is rolled for the same reason (see `permute`'s CODE SHAPE note).
 // ---------------------------------------------------------------------------
 
 // FB: `MDS → +ARK1 → x^7 → MDS → +ARK2 → x^{1/7}` — RPO's round exactly
 // (rpo.rs:561-582, rpx.rs:283-295). RPX runs it at R = 0, 2, 4; RPO at 0..7.
-template <int R>
-__device__ __forceinline__ void fb_round(uint64_t s[STATE_FELTS]) {
+__device__ __forceinline__ void fb_round(uint64_t s[STATE_FELTS], int r) {
     mds(s);
-#pragma unroll
-    for (int i = 0; i < STATE_FELTS; ++i) s[i] = fadd(s[i], ARK1[R][i]);
-#pragma unroll
+#pragma unroll 1
+    for (int i = 0; i < STATE_FELTS; ++i) s[i] = fadd(s[i], ARK1[r][i]);
+#pragma unroll 1
     for (int i = 0; i < STATE_FELTS; ++i) s[i] = sbox(s[i]);
     mds(s);
-#pragma unroll
-    for (int i = 0; i < STATE_FELTS; ++i) s[i] = fadd(s[i], ARK2[R][i]);
-#pragma unroll
+#pragma unroll 1
+    for (int i = 0; i < STATE_FELTS; ++i) s[i] = fadd(s[i], ARK2[r][i]);
+    // The twelve chains are independent; a GPU hides their latency with other
+    // warps, not by unrolling one thread's twelve chains into straight line.
+#pragma unroll 1
     for (int i = 0; i < STATE_FELTS; ++i) s[i] = inv_sbox(s[i]);
 }
 
 // E: `+ARK1 → x^7` in the cubic extension on four lane-triples, NO linear
 // layer (rpx.rs:296-307; the design, not an omission — rpx.rs:275-279).
-template <int R>
-__device__ __forceinline__ void ext_round(uint64_t s[STATE_FELTS]) {
-#pragma unroll
-    for (int i = 0; i < STATE_FELTS; ++i) s[i] = fadd(s[i], ARK1[R][i]);
-#pragma unroll
+__device__ __forceinline__ void ext_round(uint64_t s[STATE_FELTS], int r) {
+#pragma unroll 1
+    for (int i = 0; i < STATE_FELTS; ++i) s[i] = fadd(s[i], ARK1[r][i]);
+#pragma unroll 1
     for (int e = 0; e < EXT_ELEMENTS; ++e) {
         const int base = e * EXT_DEGREE;
         CubicExt x;
@@ -352,23 +373,32 @@ __device__ __forceinline__ void ext_round(uint64_t s[STATE_FELTS]) {
 }
 
 // M: `MDS → +ARK1`, a linear finish with no S-box (rpx.rs:308-313).
-template <int R>
-__device__ __forceinline__ void final_round(uint64_t s[STATE_FELTS]) {
+__device__ __forceinline__ void final_round(uint64_t s[STATE_FELTS], int r) {
     mds(s);
-#pragma unroll
-    for (int i = 0; i < STATE_FELTS; ++i) s[i] = fadd(s[i], ARK1[R][i]);
+#pragma unroll 1
+    for (int i = 0; i < STATE_FELTS; ++i) s[i] = fadd(s[i], ARK1[r][i]);
 }
 
 // The permutation: `FB E FB E FB E M` (rpx.rs:280-316), output CANONICAL.
-__device__ void permute(uint64_t s[STATE_FELTS]) {
-    fb_round<0>(s);
-    ext_round<1>(s);
-    fb_round<2>(s);
-    ext_round<3>(s);
-    fb_round<4>(s);
-    ext_round<5>(s);
-    final_round<6>(s);
-#pragma unroll
+//
+// ★ CODE SHAPE. A real (`RPX_NOINLINE`) function with rolled loops, on
+// purpose. The first cubin build of the fully inlined, fully unrolled form ran
+// 41 minutes and emitted 56 MB of PTX: one permutation was ~49k straight-line
+// lines (the inverse S-box chain unrolled over twelve lanes, three times) and
+// every leaf kernel carried one copy per `permute` call site — seven in the
+// comp-poly kernel. Rolled and called, the whole file is a few thousand lines
+// and every kernel shares one body. The price is loop overhead of order 10% of
+// the permutation's instructions and the state living in local memory across
+// the call; the `-Xptxas -v` report and the unroll factors of `square_n` and
+// the lane loops are the tuning knobs, in that order.
+RPX_NOINLINE __device__ void permute(uint64_t s[STATE_FELTS]) {
+#pragma unroll 1
+    for (int r = 0; r + 1 < NUM_ROUNDS; r += 2) {
+        fb_round(s, r);
+        ext_round(s, r + 1);
+    }
+    final_round(s, NUM_ROUNDS - 1);
+#pragma unroll 1
     for (int i = 0; i < STATE_FELTS; ++i) s[i] = goldilocks::canonical(s[i]);
 }
 

@@ -22,7 +22,7 @@
 //      extension against naive polynomial multiplication reduced by
 //      `φ³ = φ + 1` — the same independent algorithms `rpx.rs`'s own tests use.
 //   3. ★ EXTERNAL: RPX's FB round IS RPO's round with RPO's constants. Seven
-//      `fb_round<R>` compose to RPO256, and that composition is replayed over
+//      `fb_round(s, r)` compose to RPO256, and that composition is replayed over
 //      miden-crypto's nineteen `hash_elements` vectors, which nothing in this
 //      tree produced. That pins ARK1/ARK2, the MDS row and orientation, both
 //      S-box chains and the sponge lane convention from outside.
@@ -316,13 +316,13 @@ void cubic_extension_matches_naive_polynomial_arithmetic() {
 
 // RPO256's permutation composed from the kernel's FB round — rpo.rs:567-583.
 void rpo_permute(uint64_t s[12]) {
-    rpx::fb_round<0>(s);
-    rpx::fb_round<1>(s);
-    rpx::fb_round<2>(s);
-    rpx::fb_round<3>(s);
-    rpx::fb_round<4>(s);
-    rpx::fb_round<5>(s);
-    rpx::fb_round<6>(s);
+    rpx::fb_round(s, 0);
+    rpx::fb_round(s, 1);
+    rpx::fb_round(s, 2);
+    rpx::fb_round(s, 3);
+    rpx::fb_round(s, 4);
+    rpx::fb_round(s, 5);
+    rpx::fb_round(s, 6);
     for (int i = 0; i < 12; ++i) s[i] = goldilocks::canonical(s[i]);
 }
 
@@ -381,7 +381,7 @@ void seven_fb_rounds_reproduce_the_miden_rpo_vectors() {
         for (int d = 0; d < 4; ++d) ok = ok && s[d] == MIDEN_HASH_ELEMENTS[7][d];
         check(ok, "permute([0..8 ‖ 0⁴]) must be miden's eight-element vector (compress layout)");
     }
-    printf("★ EXTERNAL: seven fb_round<R> = RPO256 vs miden-crypto hash_elements: %d/19 matched\n",
+    printf("★ EXTERNAL: seven fb_round(s, r) = RPO256 vs miden-crypto hash_elements: %d/19 matched\n",
            matched);
 }
 
@@ -564,13 +564,13 @@ void the_canonicalisation_loop_is_pinned_by_the_witness() {
 
     uint64_t s[12];
     memcpy(s, w->input, sizeof(s));
-    rpx::fb_round<0>(s);
-    rpx::ext_round<1>(s);
-    rpx::fb_round<2>(s);
-    rpx::ext_round<3>(s);
-    rpx::fb_round<4>(s);
-    rpx::ext_round<5>(s);
-    rpx::final_round<6>(s);
+    rpx::fb_round(s, 0);
+    rpx::ext_round(s, 1);
+    rpx::fb_round(s, 2);
+    rpx::ext_round(s, 3);
+    rpx::fb_round(s, 4);
+    rpx::ext_round(s, 5);
+    rpx::final_round(s, 6);
     int twins = 0;
     for (int i = 0; i < 12; ++i) twins += (s[i] >= P) ? 1 : 0;
     check(twins > 0, "the witness must leave a raw lane >= p before the canonicalisation loop");
@@ -679,9 +679,9 @@ Counted count_ops(F f) {
 void the_cost_model_is_what_the_header_claims() {
     uint64_t s[12];
     for (int i = 0; i < 12; ++i) s[i] = (uint64_t)i + 1;
-    const Counted fb = count_ops([&] { rpx::fb_round<0>(s); });
-    const Counted ext = count_ops([&] { rpx::ext_round<1>(s); });
-    const Counted fin = count_ops([&] { rpx::final_round<6>(s); });
+    const Counted fb = count_ops([&] { rpx::fb_round(s, 0); });
+    const Counted ext = count_ops([&] { rpx::ext_round(s, 1); });
+    const Counted fin = count_ops([&] { rpx::final_round(s, 6); });
     const Counted all = count_ops([&] { rpx::permute(s); });
     const Counted rpo = count_ops([&] { rpo_permute(s); });
     const Counted inv = count_ops([&] { (void)rpx::inv_sbox(s[0]); });
