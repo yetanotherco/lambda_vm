@@ -53,7 +53,6 @@ use super::epoch_tests::RealBatchedEpoch;
 use super::epoch_verify::{TableVerifyShape, boundary_terms};
 use super::executor::execute;
 use super::fri::FriShape;
-use super::hash::TestPermutation;
 use super::sub_proof::{GroupShape, SubProofShape};
 use super::word::{LfmWord, base_word, ext_word, word_as_ext};
 
@@ -506,8 +505,18 @@ fn the_assembled_epoch_verifier_runs() {
     let e = super::epoch_tests::real_epoch();
     let program = super::epoch_tests::epoch_program(&e, true);
     let arenas = super::epoch_tests::epoch_arena_words(&e, true);
-    let exec =
-        execute(&program, &arenas, &TestPermutation).expect("the assembled verifier must execute");
+    // ★ The PINNED socket permutation, not a literal. `epoch_program` builds at
+    // `WrapHash::production()`, and the classification rule is that such a
+    // program emits `Instr::Hash` and must run under `BLOCK_HASHER`; only a
+    // program pinning a byte hash on its own builder may take the default.
+    //
+    // ⚠ Under a BYTE pin this is inert — `ByteWrapHash` lowers to the KECCAK /
+    // `LFM_BLAKE3` chips and emits no `Instr::Hash`, so the socket is never
+    // consulted and a toy permutation was free and correct. Under an ALGEBRAIC
+    // pin the walks ARE `Instr::Hash`: a toy would rebuild roots the host never
+    // committed, and this test would fail on its HONEST path, naming nothing.
+    let exec = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+        .expect("the assembled verifier must execute");
 
     // ---- the spine's differential, unchanged: production's own challenges.
     let pub_ext = |i: usize| word_as_ext(&exec.public_words[i].1).expect("an ext challenge");
@@ -1045,8 +1054,12 @@ fn the_assembled_verifier_rejects_tampered_leg_data() {
     let e = super::epoch_tests::real_epoch();
     let program = super::epoch_tests::epoch_program(&e, true);
     let good = super::epoch_tests::epoch_arena_words(&e, true);
+    // The pin, for the same reason as `the_assembled_epoch_verifier_runs`: this
+    // is the same `WrapHash::production()` program. It matters most on THIS
+    // arm — the honest control is what a wrong socket permutation breaks first,
+    // and a tamper suite whose control is broken rejects everything and passes.
     assert!(
-        execute(&program, &good, &TestPermutation).is_ok(),
+        execute(&program, &good, &crate::hash_pin::BLOCK_HASHER).is_ok(),
         "the untampered assembled verifier must run"
     );
 
@@ -1116,7 +1129,7 @@ fn the_assembled_verifier_rejects_tampered_leg_data() {
         let before = arenas[*arena][*word];
         arenas[*arena][*word][0] = before[0] + FE::one();
         assert!(
-            execute(&program, &arenas, &TestPermutation).is_err(),
+            execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER).is_err(),
             "tampering {label} must make the assembled verifier unexecutable, \
              and did not"
         );
