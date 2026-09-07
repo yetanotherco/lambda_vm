@@ -297,14 +297,19 @@ pub const MEMPOOL_RELEASE_ENV: &str = "LAMBDA_VM_MEMPOOL_RELEASE_MB";
 /// driver and reuses the block, which is what the per-table pipeline's
 /// repeated LDE/FRI buffers want.
 ///
-/// Whether retention can starve a differently-shaped table that follows a
-/// large one is a measurement, not a guess: the stream-ordered allocator
-/// serves a new request from the physical chunks it retains, and the release
-/// threshold governs only what a sync hands back to the OS. The
-/// pre-registered measurement — two commits of unequal shape back to back
-/// under `one_lde_buffer::vram_arm` with the sampler attached, threshold unset
-/// against `0` — decides whether this default moves. The explicit release for
-/// the moments reuse cannot serve is [`Backend::trim_mempool_to`].
+/// Measured, not guessed (RTX 5090, 2026-09-07, `one_lde_buffer::vram_arm`
+/// at 2^21 × 316 @ blowup 2, five commits, in-process 1 kHz peak): retain-all
+/// 1176.9 / 1057.9 / 1055.3 / 1056.2 / 1055.6 ms against release-0
+/// 1178.5 / 1057.2 / 1077.5 / 1081.2 / 1079.3 ms — retention ≈2% faster once
+/// the first commit has populated the pool — and a peak of 15.67 GiB under
+/// both: a same-shape allocation reuses the retained block, so retention adds
+/// nothing to the peak. The unequal-shape case is covered at block scale by
+/// the multi-table q=41 wrap rung under this default (VRAM peak 28,976 MiB, no
+/// device decline): the stream-ordered allocator serves a new request from the
+/// physical chunks it retains, and the release threshold governs only what a
+/// sync hands back to the OS. The explicit release for a moment reuse cannot
+/// serve is [`Backend::trim_mempool_to`]; the sampler runs set the knob to `0`
+/// so `total - free` reads the live set rather than the pool.
 pub const DEFAULT_MEMPOOL_RELEASE_THRESHOLD_BYTES: u64 = u64::MAX;
 
 /// The effective release threshold in bytes: the knob when set and parseable,
