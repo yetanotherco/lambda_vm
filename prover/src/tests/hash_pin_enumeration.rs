@@ -63,7 +63,16 @@ const PIN_CALLS: &[&str] = &["BlockProver::", "BlockVerifier::"];
 /// `gpu_lde.rs`, the cuda tests), where the workspace default IS the correct
 /// hash. `#[deprecated]` would fire on those under `-D warnings`, in the very
 /// crate that must keep using them.
-const CONFIG_ALLOWED: &[&str] = &["Commitment", "CommitmentHash", "StarkHash"];
+/// `DeviceTreeBackend` is allowed for the same reason: it is the marker a Merkle
+/// backend implements to name its OWN hash as the device dispatch key, so it
+/// carries no default — `algebraic_commit` implements it for the algebraic
+/// backends, which is the opposite of reaching a default.
+const CONFIG_ALLOWED: &[&str] = &[
+    "Commitment",
+    "CommitmentHash",
+    "StarkHash",
+    "DeviceTreeBackend",
+];
 
 /// Every item named from `stark::config` on this line, `use` lists included.
 fn config_items(code: &str) -> Vec<String> {
