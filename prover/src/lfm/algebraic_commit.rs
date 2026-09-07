@@ -1015,6 +1015,101 @@ mod tests {
         }
     }
 
+    // ---- the grinding leg: shared fixtures ----
+
+    /// The factor the leg tests grind at: small enough to grind in a unit
+    /// test, big enough that a wrong digest fails with overwhelming
+    /// probability.
+    const GRINDING_FACTOR: u8 = 8;
+
+    /// The leg tests' seed — four felts, the shape `AlgebraicTranscript::state()`
+    /// has in the machine.
+    const GRINDING_SEED_CELL: LfmWord = [
+        FE::const_from_raw(0x0123_4567_89ab_cdef),
+        FE::const_from_raw(0x1111_2222_3333_4444),
+        FE::const_from_raw(0x0fed_cba9_8765_4321),
+        FE::const_from_raw(0x00ff_00ff_00ff_00ff),
+    ];
+
+    /// The seed as the HOST sees it: `AlgebraicTranscript::state()` serialises
+    /// the state cell canonically big-endian, which is `digest_to_commitment`.
+    fn grinding_seed_bytes() -> Commitment {
+        digest_to_commitment(&GRINDING_SEED_CELL)
+    }
+
+    /// The grinding leg as a program. Arena word 0 is the seed cell; word 1
+    /// carries the nonce as `FE::from(nonce)` in lane 0 — the packing the
+    /// production wrap arena uses — and the production emitter itself,
+    /// `epoch::emit_grinding_check`, lays down the assertions. The seed is
+    /// published so the program has an output and the proof is about
+    /// something; the CHECK is the assertions the emitter laid down.
+    fn grinding_leg_program() -> crate::lfm::compiler::LfmProgram {
+        use crate::lfm::builder::{Felt, LfmBuilder};
+        use crate::lfm::compiler::compile;
+        use crate::lfm::edsl::{WrapDigest, WrapHash};
+
+        let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::Algebraic);
+        let arena = b.declare_arena(2);
+        let seed = b.hint_word(arena, 0);
+        let nonce_word = b.hint_word(arena, 1);
+        let [nonce, _, _, _] = b.unpack(nonce_word);
+        crate::lfm::epoch::emit_grinding_check(
+            &mut b,
+            WrapDigest::from_cell(seed),
+            Felt(nonce.as_cell().addr()),
+            GRINDING_FACTOR,
+        );
+        b.public(seed);
+        compile(b.finish())
+    }
+
+    /// `grinding::generate_nonce` under one configuration's `AlgebraicDigest`.
+    type HostGrind = fn(&Commitment, u8) -> Option<u64>;
+    /// `grinding::is_valid_nonce` under one configuration's `AlgebraicDigest` —
+    /// the SPECIFICATION of which nonces the leg must accept.
+    type HostVerdict = fn(&Commitment, u64, u8) -> bool;
+
+    /// The three members that HAVE a commitment type — `HasherKind::Test` has
+    /// none, so there is no host digest to grind against — each with the
+    /// host's grinder and the host's verdict.
+    fn grinding_members() -> [(HasherKind, HostGrind, HostVerdict); 3] {
+        use stark::grinding::{generate_nonce, is_valid_nonce};
+        [
+            (
+                HasherKind::Rpo,
+                |s, f| generate_nonce::<AlgebraicDigest<RpoCommit>>(s, f),
+                |s, n, f| is_valid_nonce::<AlgebraicDigest<RpoCommit>>(s, n, f),
+            ),
+            (
+                HasherKind::Rpx,
+                |s, f| generate_nonce::<AlgebraicDigest<RpxCommit>>(s, f),
+                |s, n, f| is_valid_nonce::<AlgebraicDigest<RpxCommit>>(s, n, f),
+            ),
+            (
+                HasherKind::Poseidon,
+                |s, f| generate_nonce::<AlgebraicDigest<PoseidonCommit>>(s, f),
+                |s, n, f| is_valid_nonce::<AlgebraicDigest<PoseidonCommit>>(s, n, f),
+            ),
+        ]
+    }
+
+    /// The MACHINE's verdict: whether the emitted leg proves for `nonce`.
+    fn leg_proves(
+        program: &crate::lfm::compiler::LfmProgram,
+        artifacts: &crate::lfm::registry::LfmArtifacts,
+        opts: &stark::proof::options::ProofOptions,
+        hasher: HasherKind,
+        nonce: u64,
+    ) -> bool {
+        use crate::lfm::proof::lfm_prove_with_hasher;
+
+        let arena = vec![vec![
+            GRINDING_SEED_CELL,
+            [FE::from(nonce), FE::zero(), FE::zero(), FE::zero()],
+        ]];
+        lfm_prove_with_hasher(program, artifacts, &arena, opts, hasher).is_ok()
+    }
+
     /// ★★ **THE GRINDING LEG GATE.** The production emitter's grinding check —
     /// `epoch::emit_grinding_check`, the thing every wrap program actually calls
     /// — must accept exactly the nonces `grinding::is_valid_nonce` accepts under
@@ -1027,94 +1122,141 @@ mod tests {
     ///
     /// It is a provability gate rather than a value comparison, because that is
     /// what the leg is — it emits assertions and publishes nothing. A real
-    /// ground-out nonce must PROVE; the negative control below is what makes
-    /// that mean something.
+    /// ground-out nonce must PROVE; the negative control is what makes that
+    /// mean something.
+    ///
+    /// ⚠ **The control is chosen by the host's verdict, never as `nonce + 1`.**
+    /// At factor 8 one nonce in 256 is valid, so the successor of a valid nonce
+    /// is itself valid with probability 2⁻⁸ — and `generate_nonce`'s `find_any`
+    /// re-samples the same few chunk-start winners run after run, so once a
+    /// recurring winner has a valid successor the "control" recurs as a failure
+    /// that looks like a value-specific emitter defect. Under Rpo this seed's
+    /// winner 0x1400000000000009 has the valid successor 0x140000000000000A,
+    /// and asking the leg to REJECT it was asking it to disagree with the
+    /// specification
+    /// ([`the_emitted_grinding_check_agrees_with_the_host_on_the_incident_nonces`]
+    /// pins the pair). The control is therefore the first nonce after the
+    /// winner that `is_valid_nonce` REJECTS, asserted as such before the leg is
+    /// asked to agree.
     #[test]
     fn the_emitted_grinding_check_accepts_exactly_the_hosts_nonces() {
-        use crate::lfm::builder::{Felt, LfmBuilder};
-        use crate::lfm::compiler::compile;
-        use crate::lfm::edsl::{WrapDigest, WrapHash};
-        use crate::lfm::proof::lfm_prove_with_hasher;
         use crate::lfm::registry::build_artifacts_with_hasher;
         use stark::proof::options::GoldilocksCubicProofOptions;
 
-        // Small enough to grind in a unit test, big enough that a wrong digest
-        // fails with overwhelming probability.
-        const FACTOR: u8 = 8;
-        const SEED_CELL: LfmWord = [
-            FE::const_from_raw(0x0123_4567_89ab_cdef),
-            FE::const_from_raw(0x1111_2222_3333_4444),
-            FE::const_from_raw(0x0fed_cba9_8765_4321),
-            FE::const_from_raw(0x00ff_00ff_00ff_00ff),
-        ];
-
-        fn program(nonce_arena_len: u32) -> crate::lfm::compiler::LfmProgram {
-            let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::Algebraic);
-            let arena = b.declare_arena(nonce_arena_len);
-            let seed = b.hint_word(arena, 0);
-            let nonce_word = b.hint_word(arena, 1);
-            let [nonce, _, _, _] = b.unpack(nonce_word);
-            crate::lfm::epoch::emit_grinding_check(
-                &mut b,
-                WrapDigest::from_cell(seed),
-                Felt(nonce.as_cell().addr()),
-                FACTOR,
-            );
-            // Published so the program has an output and the proof is about
-            // something; the CHECK is the assertions the emitter just laid down.
-            b.public(seed);
-            compile(b.finish())
-        }
-
         let opts = GoldilocksCubicProofOptions::with_blowup(2).expect("options");
-        let compiled = program(2);
+        let program = grinding_leg_program();
+        let seed = grinding_seed_bytes();
 
-        // The three members that HAVE a commitment type — `HasherKind::Test`
-        // has none, so there is no host digest to grind against.
-        type Grind = fn(&Commitment, u8) -> Option<u64>;
-        let members: [(HasherKind, Grind); 3] = [
-            (HasherKind::Rpo, |s, f| {
-                stark::grinding::generate_nonce::<AlgebraicDigest<RpoCommit>>(s, f)
-            }),
-            (HasherKind::Rpx, |s, f| {
-                stark::grinding::generate_nonce::<AlgebraicDigest<RpxCommit>>(s, f)
-            }),
-            (HasherKind::Poseidon, |s, f| {
-                stark::grinding::generate_nonce::<AlgebraicDigest<PoseidonCommit>>(s, f)
-            }),
-        ];
-
-        for (hasher, grind) in members {
-            // HOST: the seed as `AlgebraicTranscript::state()` would serialise
-            // it, then a real ground-out nonce for this hasher.
-            let seed_bytes = digest_to_commitment(&SEED_CELL);
-            let nonce = grind(&seed_bytes, FACTOR).expect("a nonce must exist at factor 8");
-
-            let arena = vec![vec![
-                SEED_CELL,
-                [FE::from(nonce), FE::zero(), FE::zero(), FE::zero()],
-            ]];
-            let artifacts = build_artifacts_with_hasher(&compiled, &opts, hasher);
+        for (hasher, grind, host_accepts) in grinding_members() {
+            // HOST: a real ground-out nonce for this hasher. WHICH one is
+            // scheduling-dependent (`find_any`), and that is the point of
+            // grinding here rather than pinning: every run samples the leg at
+            // a fresh point of the winners' set.
+            let nonce = grind(&seed, GRINDING_FACTOR).expect("a nonce must exist at factor 8");
             assert!(
-                lfm_prove_with_hasher(&compiled, &artifacts, &arena, &opts, hasher).is_ok(),
-                "{hasher:?}: the host's own ground-out nonce must prove"
+                host_accepts(&seed, nonce, GRINDING_FACTOR),
+                "{hasher:?}: generate_nonce must return a nonce is_valid_nonce accepts"
             );
+            // The control: the first host-REJECTED nonce after the winner.
+            let control = (1u64..=1 << 16)
+                .map(|k| nonce.wrapping_add(k))
+                .find(|&n| !host_accepts(&seed, n, GRINDING_FACTOR))
+                .expect("a rejected nonce exists within 2^16 of any nonce at factor 8");
+            println!("{hasher:?}: ground nonce {nonce:#018x}, control {control:#018x}");
 
+            let artifacts = build_artifacts_with_hasher(&program, &opts, hasher);
+            assert!(
+                leg_proves(&program, &artifacts, &opts, hasher, nonce),
+                "{hasher:?}: the host's own ground-out nonce {nonce:#018x} must prove"
+            );
             // ⚠ THE CONTROL. Without it "it proved" says nothing: an emitter
             // that asserted nothing would pass the line above.
-            let bad = vec![vec![
-                SEED_CELL,
-                [
-                    FE::from(nonce.wrapping_add(1)),
-                    FE::zero(),
-                    FE::zero(),
-                    FE::zero(),
-                ],
-            ]];
             assert!(
-                lfm_prove_with_hasher(&compiled, &artifacts, &bad, &opts, hasher).is_err(),
-                "{hasher:?}: a nonce the host would reject must be unprovable"
+                !leg_proves(&program, &artifacts, &opts, hasher, control),
+                "{hasher:?}: a nonce the host rejects ({control:#018x}) must be unprovable"
             );
+        }
+    }
+
+    /// ★ **THE INCIDENT PAIR, PINNED WITHOUT GRINDING.** Under Rpo, with the
+    /// leg tests' seed at factor 8, the nonce 0x1400000000000009 AND its
+    /// successor 0x140000000000000A are BOTH valid — `is_valid_nonce` accepts
+    /// each — which is what made the old `nonce + 1` control fire whenever
+    /// `find_any` landed on that winner. The leg's job is to agree with the
+    /// host, and on that pair agreeing means PROVING both.
+    ///
+    /// This pins the pair for every tenant, then walks forward SEQUENTIALLY —
+    /// no `find_any`, no scheduling — until each tenant has shown both a
+    /// host-accepted and a host-rejected nonce, and asserts the leg's verdict
+    /// equals the host's on every one of them. The arena is constructed
+    /// directly; nothing here grinds, so the run is deterministic.
+    #[test]
+    fn the_emitted_grinding_check_agrees_with_the_host_on_the_incident_nonces() {
+        use crate::lfm::registry::build_artifacts_with_hasher;
+        use stark::proof::options::GoldilocksCubicProofOptions;
+
+        const INCIDENT: u64 = 0x1400_0000_0000_0009;
+
+        let seed = grinding_seed_bytes();
+
+        // The incident as the host rules it: both valid under Rpo, the next
+        // one not — so `nonce + 1` WAS a valid nonce, and the first real
+        // control was two past the winner.
+        let rpo_accepts = |n: u64| {
+            stark::grinding::is_valid_nonce::<AlgebraicDigest<RpoCommit>>(&seed, n, GRINDING_FACTOR)
+        };
+        assert!(
+            rpo_accepts(INCIDENT),
+            "Rpo: the incident winner is a valid nonce"
+        );
+        assert!(
+            rpo_accepts(INCIDENT + 1),
+            "Rpo: the winner's successor is ALSO valid — the old control was not a control"
+        );
+        assert!(
+            !rpo_accepts(INCIDENT + 2),
+            "Rpo: the first host-rejected nonce after the winner is two past it"
+        );
+
+        let opts = GoldilocksCubicProofOptions::with_blowup(2).expect("options");
+        let program = grinding_leg_program();
+
+        for (hasher, _, host_accepts) in grinding_members() {
+            // The pinned pair, then forward until both verdicts are present:
+            // `seen[0]` = a rejected nonce is in the list, `seen[1]` = an
+            // accepted one is.
+            let mut nonces = vec![INCIDENT, INCIDENT + 1];
+            let mut seen = [false; 2];
+            for n in &nonces {
+                seen[usize::from(host_accepts(&seed, *n, GRINDING_FACTOR))] = true;
+            }
+            for k in 2..=(1u64 << 16) {
+                if seen == [true, true] {
+                    break;
+                }
+                let n = INCIDENT + k;
+                let v = usize::from(host_accepts(&seed, n, GRINDING_FACTOR));
+                if !seen[v] {
+                    seen[v] = true;
+                    nonces.push(n);
+                }
+            }
+            assert_eq!(
+                seen,
+                [true, true],
+                "{hasher:?}: both verdicts must appear within 2^16 of the incident"
+            );
+
+            let artifacts = build_artifacts_with_hasher(&program, &opts, hasher);
+            for n in nonces {
+                let host = host_accepts(&seed, n, GRINDING_FACTOR);
+                let machine = leg_proves(&program, &artifacts, &opts, hasher, n);
+                println!("{hasher:?}: nonce {n:#018x} host={host} machine={machine}");
+                assert_eq!(
+                    machine, host,
+                    "{hasher:?}: nonce {n:#018x}: the emitted check must agree with is_valid_nonce"
+                );
+            }
         }
     }
 
