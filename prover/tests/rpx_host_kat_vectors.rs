@@ -87,7 +87,10 @@ fn permutation_inputs() -> Vec<(&'static str, [u64; HASH_STATE_FELTS])> {
             "alternating 0 / p-1",
             core::array::from_fn(|i| if i % 2 == 0 { 0 } else { P - 1 }),
         ),
-        ("one-hot lane 0", core::array::from_fn(|i| u64::from(i == 0))),
+        (
+            "one-hot lane 0",
+            core::array::from_fn(|i| u64::from(i == 0)),
+        ),
         (
             "one-hot lane 11",
             core::array::from_fn(|i| u64::from(i == HASH_STATE_FELTS - 1)),
@@ -109,7 +112,9 @@ fn print_rpx_host_kat_vectors() {
     out.push_str(
         "//   cargo test -p lambda-vm-prover --test rpx_host_kat_vectors -- --ignored --nocapture\n",
     );
-    out.push_str("// (prover/tests/rpx_host_kat_vectors.rs). Paste verbatim; do not edit by hand.\n\n");
+    out.push_str(
+        "// (prover/tests/rpx_host_kat_vectors.rs). Paste verbatim; do not edit by hand.\n\n",
+    );
 
     // ---- Table 2: the bare permutation ------------------------------------
     let inputs = permutation_inputs();
@@ -170,7 +175,9 @@ fn print_rpx_host_kat_vectors() {
         "inline constexpr int NUM_RPX_PARENT_VECTORS = {};\n",
         parents.len()
     ));
-    out.push_str("inline constexpr RpxParentVector RPX_PARENT_VECTORS[NUM_RPX_PARENT_VECTORS] = {\n");
+    out.push_str(
+        "inline constexpr RpxParentVector RPX_PARENT_VECTORS[NUM_RPX_PARENT_VECTORS] = {\n",
+    );
     for (name, l, r) in &parents {
         let got = HasherKind::Rpx.compress(&fe_array(l), &fe_array(r));
         let got: Vec<u64> = got.iter().map(canonical).collect();
