@@ -115,6 +115,8 @@ mod logup_tests;
 #[cfg(test)]
 mod machine_tests;
 #[cfg(test)]
+mod per_table_census_tests;
+#[cfg(test)]
 mod poseidon_chip_tests;
 #[cfg(test)]
 mod rpo_chip_tests;
