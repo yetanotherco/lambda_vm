@@ -52,8 +52,21 @@ const BLESSED: &[(&str, &str)] = &[
         "`lfm_chip_census` / `lfm_cell_counts` / `LfmAirs::new` default the \
          socket hasher. ✓ VERIFIED test-only: the census pair counts cells and \
          proves nothing, and `LfmAirs::new` has exactly one caller \
-         (`wrap_tests.rs`). Production builds its AIR set through \
-         `LfmAirs::new_with_hasher`.",
+         (`wrap_tests::the_census_agrees_with_the_traces_the_prover_builds`, \
+         over `programs::keccak_chain_program` — which pins keccak on its own \
+         builder, so it emits no `Instr::Hash` and never consults the socket). \
+         Production builds its AIR set through `LfmAirs::new_with_hasher`. \
+         ⚠ AND the defaulted census pair must stay OFF the block path's \
+         NON-IGNORED prove sites, which is a narrower claim than `test-only`: \
+         `wrap_tests::the_fixture_epoch_wraps` proves the assembled PER-TABLE \
+         epoch verifier against artifacts that follow the pin on every suite \
+         run, so it names `lfm_cell_counts_with_hasher(.., BLOCK_HASHER)` and \
+         `build_artifacts_with_hasher(.., BLOCK_HASHER)` rather than either \
+         defaulting form. Pairing this default with a pinned non-default is the \
+         failure the list exists for — the `LFM_HASH` chip's width is \
+         tenant-dependent, so a defaulted census under an algebraic pin reports \
+         the WRONG chip rather than a smaller number. Do not simplify that call \
+         site back to the defaulting pair.",
     ),
     (
         "lfm/trace.rs",
