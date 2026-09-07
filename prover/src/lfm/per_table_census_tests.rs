@@ -82,7 +82,10 @@ use stark::verifier::{IsStarkVerifier, Verifier};
 
 use crate::tables::types::{FE, FEE, GoldilocksExtension, GoldilocksField};
 
-use super::airs::{ChipSet, LFM_CHIP_NAMES, LfmAirs, NUM_LFM_CHIPS};
+use super::airs::{
+    BLAKE3_SLOT, ChipSet, KECCAK_RC_SLOT, KECCAK_RND_SLOT, KECCAK_SLOT, LFM_CHIP_NAMES, LfmAirs,
+    NUM_LFM_CHIPS,
+};
 use super::builder::{Ext, Felt, LfmBuilder};
 use super::compiler::{LfmProgram, compile};
 use super::constraints::{Analysis, QuotientShape, analyze};
@@ -121,9 +124,12 @@ type V = Verifier<Gl, Ext3, ()>;
 const RECORDED_WRAP_LOG_HEIGHTS: [u32; NUM_LFM_CHIPS] =
     [11, 20, 21, 21, 21, 2, 2, 23, 22, 13, 16, 20, 5, 5, 20];
 
-/// `LFM_HASH`'s slot, and `LFM_BLAKE3`'s — the two ends of the swap.
+/// `LFM_HASH`'s slot — the receiving end of the swap whose other end is
+/// [`BLAKE3_SLOT`]. Local because `airs.rs` exports no constant for it; every
+/// other slot this module names is imported from there rather than spelled as a
+/// literal, so a reordering of the frozen chip order cannot silently re-point
+/// this census at the wrong table.
 const HASH_SLOT: usize = 5;
-const BLAKE3_SLOT: usize = 11;
 
 /// A placeholder root. Nothing measured here is a function of a root's VALUE,
 /// only of the AIR's shape and of how many CELLS the root occupies — so one
@@ -180,8 +186,9 @@ struct Tenant {
 /// at all**, so the socket idles at the four-row floor and its width is
 /// `TEST_NUM_COLUMNS`. Naming `HasherKind::Blake3` here instead instantiates the
 /// BLAKE3 *socket* — a 2,980-column chip the real proof does not carry — and
-/// inflates the BLAKE3 baseline by 1,196 blocks per query, which makes lever 0
-/// look BIGGER than it is (0.632× against the true 0.776×).
+/// inflates the BLAKE3 baseline by 1,185 blocks per query (1,201 for the socket
+/// against the idle chip's 16), which makes lever 0 look BIGGER than it is —
+/// 0.632× against the true 0.774×.
 ///
 /// ✓ VERIFIED against the recorded census, which reports `LFM_HASH` at 4 rows,
 /// 0 used, 28 main, 3 aux. [`the_blake3_tenant_socket_matches_the_record`] pins
@@ -259,7 +266,7 @@ impl Tenant {
     /// Is chip class `slot` a sub-proof of this tenant's wrap proof?
     fn has_slot(&self, slot: usize) -> bool {
         match slot {
-            6 | 12 | 13 => self.keccak,
+            KECCAK_SLOT | KECCAK_RND_SLOT | KECCAK_RC_SLOT => self.keccak,
             BLAKE3_SLOT => !self.algebraic,
             _ => true,
         }
@@ -607,6 +614,16 @@ fn the_blake3_tenant_socket_matches_the_record() {
     /// value columns over the 13-column preprocessed prefix, 3 ext aux.
     const RECORDED: (usize, usize) = (28, 3);
 
+    // ★ The tenant's socket IS the pin's, not a value chosen here. A branch that
+    // re-pins `BLOCK_HASHER` moves what a BLAKE3-tenant wrap proof actually
+    // carries, and this census would then be measuring a shape nothing proves.
+    assert_eq!(
+        BLAKE3_TENANT_SOCKET,
+        crate::hash_pin::BLOCK_HASHER,
+        "the BLAKE3 tenant's LFM_HASH socket must be the build's own pin — the \
+         recorded census this census is a ratio against was produced under it"
+    );
+
     let opts = wrap_options();
     for tenant in TENANTS.iter().filter(|t| !t.algebraic) {
         let airs = tenant.airs(&opts);
@@ -870,21 +887,45 @@ fn the_lever_zero_factor_is_measured_per_tenant() {
     );
 }
 
-/// ★★ THE AGGREGATOR — 18 wraps, fan-in 2 / 3 / 6, from the measured leg bill.
+/// ★★ THE AGGREGATOR — [`WRAPS`] wraps, fan-in 2 / 3 / 6, from the measured leg
+/// bill and an IMPORTED glue constant.
 ///
 /// Derives, with every step printed: level-1 node invocations, the `LFM_HASH`
 /// table height against the 2^20 / 2^21 / 2^22 cliffs, cells at each tenant's own
 /// cells-per-permutation, and peak RSS under both affine laws. Then applies the
 /// brief's rule — "≥ 25% headroom under 2^21 at fan-in 3 ⇒ 3, else 2".
+///
+/// ⚠⚠ **The LEG is measured here; the GLUE is not, and the fan-in verdict turns
+/// on the glue.** [`GLUE_ADDITIVE`] is imported from `MEMORY-MODEL` §1.3(iii)'s
+/// batched six-leg model. This module's own emission arm measures glue at ~1.1%
+/// of the leg at 110 queries — but it emits ONE leg, and a single-leg fixture
+/// **structurally cannot contain inter-leg glue**: the binding between legs of a
+/// real multi-leg aggregator has no counterpart in it. So the two numbers do not
+/// contradict each other and neither settles the question.
+///
+/// ★ What that means for the recommendation, stated so the name of this test
+/// cannot be read as a claim it does not support: **fan-in 2 is the CONSERVATIVE
+/// DEFAULT, not a measured result.** If the inter-leg glue is at the single-leg
+/// level, fan-in 3 clears with ~36% headroom and the rule selects it. Lane A's
+/// first real two-leg emission is what settles it.
 #[test]
-fn the_per_table_aggregator_tree_is_derived_from_the_measured_leg() {
+fn the_per_table_aggregator_tree_applies_the_rule() {
     let opts = wrap_options();
 
-    // The MEASURED glue: `MEMORY-MODEL` §1.3(iii) — the emitted batched
-    // aggregation program cost 1,852,068 invocations against a 6-leg model of
-    // 1,382,358. Read additively (the glue is binding legs and statement
-    // absorbs, roughly fixed per node) that is +469,710 per aggregator proof;
-    // read multiplicatively it is ×1.340. Both are carried.
+    // ⚠⚠ IMPORTED, NOT MEASURED HERE — and the fan-in verdict turns on it.
+    //
+    // `MEMORY-MODEL` §1.3(iii): the emitted BATCHED aggregation program cost
+    // 1,852,068 invocations against a six-leg model of 1,382,358. Read additively
+    // that is +469,710 per aggregator proof; read multiplicatively, ×1.340.
+    //
+    // Two reasons it cannot simply be replaced by this module's own measurement.
+    // It is a residual against a DIFFERENT and coarser leg model — its own note
+    // says that model "counts the 6 verify legs, misses the glue", so the
+    // shortfall was attributed wholesale rather than decomposed. And this
+    // module's emission arm emits ONE leg, which structurally cannot contain
+    // INTER-LEG glue: the binding between the legs of a real multi-leg
+    // aggregator has no counterpart in a single-leg fixture. The two numbers
+    // are not in conflict; neither settles the question.
     const GLUE_ADDITIVE: u64 = 469_710;
     const GLUE_MULTIPLICATIVE: f64 = 1.340;
     /// Wraps a block aggregates: base epochs at 2^22 (`PLAN` T2) over the
@@ -912,9 +953,9 @@ fn the_per_table_aggregator_tree_is_derived_from_the_measured_leg() {
     const NONHASH_PER_INVOCATION_HI: f64 = 1727.4;
 
     println!(
-        "\n★★ PER-TABLE AGGREGATOR over {WRAPS} wraps (base epochs 2^22, PLAN T2)\n   \
-         terminal preset blowup 2 / 219 q; leg bill measured at the wrap's own \
-         blowup {} / {} q",
+        "\n★★ PER-TABLE AGGREGATOR over {WRAPS} wraps (base epochs 2^22, 39.6M-cycle \
+         guest)\n   terminal preset blowup 2 / 219 q; leg bill MEASURED at the \
+         wrap's own blowup {} / {} q; glue IMPORTED (see the test's doc)",
         opts.blowup_factor, opts.fri_number_of_queries
     );
 
@@ -1021,7 +1062,10 @@ fn the_per_table_aggregator_tree_is_derived_from_the_measured_leg() {
 
     // ---- THE GATE. The rule, on BOTH keccak readings — because that axis, not
     // the hash, is what decides it.
-    println!("\n   ⇒ DECISION (rule: ≥25% headroom under 2^21 at fan-in 3 ⇒ 3, else 2)");
+    println!(
+        "\n   ⇒ DECISION (rule: ≥25% headroom under 2^21 at fan-in 3 ⇒ 3, else 2)\n      \
+         ⚠ under the IMPORTED glue constant — the leg is measured, the glue is not"
+    );
     for tenant in TENANTS.iter().filter(|t| t.algebraic) {
         let airs = tenant.airs(&opts);
         let tables = tenant_tables(tenant, &airs, &tenant.present_log_heights());
@@ -1124,9 +1168,18 @@ fn the_per_table_aggregator_tree_is_derived_from_the_measured_leg() {
         "\n   ⇒ margin note: under the pessimistic glue, fan-in 3 lands at {} \
          against the 2^21 cliff of {cliff} — over it, but by only {:.2}%. The \
          recommendation does not rest on that 0.6%: fan-in 3 already fails the \
-         rule at 13.6% headroom under the production-anchored additive glue.",
+         rule at 13.6% headroom under the imported additive glue.",
         pess(3),
         100.0 * (pess(3) as f64 / cliff as f64 - 1.0),
+    );
+    println!(
+        "\n   ★ READ THE VERDICT AS: fan-in 2 is the CONSERVATIVE DEFAULT, not a \
+         measured result. The inter-leg glue of a real multi-leg aggregator is \
+         UNMEASURED — a single-leg fixture cannot contain it — and the constant \
+         above is imported from the batched model. If that glue is at the \
+         single-leg level this arm measures (~1.1% of the leg at 110 queries), \
+         fan-in 3 clears with ~36% headroom and the rule selects 3. Lane A's \
+         first real two-leg emission settles it."
     );
 }
 
