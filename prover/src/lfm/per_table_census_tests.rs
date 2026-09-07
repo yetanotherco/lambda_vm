@@ -1209,29 +1209,58 @@ struct LegArenas {
 /// explicit-algebraic build cannot be emitted on this branch, and why it does not
 /// change a permutation count.
 fn tenant_leg_program(tables: &[TableShape]) -> LfmProgram {
+    tenant_node_program(tables, 1)
+}
+
+/// [`tenant_leg_program`] over `legs` wrap proofs in ONE node — the shape a
+/// fan-in-`legs` aggregator has.
+///
+/// Every sub-proof of every leg gets its own fork index over the whole set
+/// (`num_tables = legs · tables.len()`), which is what a real multi-leg
+/// aggregator does. ⚠ It carries no BINDING legs — no register chain, no
+/// attestation join, no published-root compare — because those are lane A's
+/// design and not mine to invent. So the inter-leg glue it measures is a LOWER
+/// BOUND: the shared spine and the widened fork space, and nothing of the
+/// binding.
+fn tenant_node_program(tables: &[TableShape], legs: usize) -> LfmProgram {
     use super::statement_replay::{PhaseATable, replay_phase_a};
 
+    assert!(legs >= 1, "a node verifies at least one leg");
+    // One flat sub-proof list over every leg, re-indexed so each fork is
+    // distinct across the whole node. The SHAPE is borrowed and only the
+    // challenge is owned: `Analysis` is not `Clone`, and it is also the one
+    // field a second leg genuinely shares — the same AIR, the same constraint
+    // program, verified twice.
+    let num_tables = legs * tables.len();
+    let flat: Vec<(&TableShape, TableChallengeShape)> = (0..legs)
+        .flat_map(|_| tables.iter())
+        .enumerate()
+        .map(|(i, t)| {
+            let mut ch = t.challenge.clone();
+            ch.index = i;
+            ch.num_tables = num_tables;
+            (t, ch)
+        })
+        .collect();
+
     let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::Blake3);
-    let n = tables.len();
+    let n = flat.len();
     let per_root = RootCells::words_per_root(&b);
 
     let a_main_roots = b.declare_arena(per_root * n as u32);
-    let per_table: Vec<LegArenas> = tables
+    let per_table: Vec<LegArenas> = flat
         .iter()
-        .map(|t| LegArenas {
-            aux_root: t.challenge.has_aux_root.then(|| b.declare_arena(per_root)),
-            contribution: t.challenge.has_contribution.then(|| b.declare_arena(1)),
+        .map(|(shape, cs)| LegArenas {
+            aux_root: cs.has_aux_root.then(|| b.declare_arena(per_root)),
+            contribution: cs.has_contribution.then(|| b.declare_arena(1)),
             composition_root: b.declare_arena(per_root),
-            ood_current: b.declare_arena(
-                (t.challenge.ood_current_dims.0 * t.challenge.ood_current_dims.1) as u32,
-            ),
-            ood_next: b
-                .declare_arena((t.challenge.ood_next_dims.0 * t.challenge.ood_next_dims.1) as u32),
-            parts: b.declare_arena(t.challenge.num_parts as u32),
-            fri_roots: b.declare_arena(per_root * t.challenge.fri.num_committed() as u32),
-            fri_coeffs: b.declare_arena(t.challenge.fri.num_terminal_coeffs() as u32),
-            nonce: (t.challenge.grinding_factor > 0).then(|| b.declare_arena(1)),
-            legs: super::epoch_verify::declare_table_arenas(&mut b, &t.verify),
+            ood_current: b.declare_arena((cs.ood_current_dims.0 * cs.ood_current_dims.1) as u32),
+            ood_next: b.declare_arena((cs.ood_next_dims.0 * cs.ood_next_dims.1) as u32),
+            parts: b.declare_arena(cs.num_parts as u32),
+            fri_roots: b.declare_arena(per_root * cs.fri.num_committed() as u32),
+            fri_coeffs: b.declare_arena(cs.fri.num_terminal_coeffs() as u32),
+            nonce: (cs.grinding_factor > 0).then(|| b.declare_arena(1)),
+            legs: super::epoch_verify::declare_table_arenas(&mut b, &shape.verify),
         })
         .collect();
 
@@ -1244,14 +1273,14 @@ fn tenant_leg_program(tables: &[TableShape]) -> LfmProgram {
         .map(|i| RootCells::hint(&mut b, a_main_roots, per_root * i as u32))
         .collect();
     let main_halves: Vec<Vec<Felt>> = main_cells.iter().map(RootCells::lanes_flat).collect();
-    let prep_cells: Vec<Option<RootCells>> = tables
+    let prep_cells: Vec<Option<RootCells>> = flat
         .iter()
-        .map(|s| (s.num_precomputed > 0).then(|| RootCells::constant(&mut b, &ZERO_ROOT)))
+        .map(|(s, _)| (s.num_precomputed > 0).then(|| RootCells::constant(&mut b, &ZERO_ROOT)))
         .collect();
-    let phase_a: Vec<PhaseATable> = tables
+    let phase_a: Vec<PhaseATable> = flat
         .iter()
         .enumerate()
-        .map(|(i, s)| PhaseATable {
+        .map(|(i, (s, _))| PhaseATable {
             preprocessed_root: (s.num_precomputed > 0).then_some(
                 super::statement_replay::PhaseAPreprocessed::Constant(&ZERO_ROOT),
             ),
@@ -1263,33 +1292,31 @@ fn tenant_leg_program(tables: &[TableShape]) -> LfmProgram {
     b.public(alpha.as_cell());
 
     let mut contributions: Vec<Ext> = Vec::new();
-    for (i, s) in tables.iter().enumerate() {
+    for (i, (s, cs)) in flat.iter().enumerate() {
         let a = &per_table[i];
         let aux = a.aux_root.map(|id| RootCells::hint(&mut b, id, 0));
         let contribution = a.contribution.map(|id| b.hint_word(id, 0).as_ext());
         let composition = RootCells::hint(&mut b, a.composition_root, 0);
-        let ood_current: Vec<Ext> = (0..(s.challenge.ood_current_dims.0
-            * s.challenge.ood_current_dims.1) as u32)
+        let ood_current: Vec<Ext> = (0..(cs.ood_current_dims.0 * cs.ood_current_dims.1) as u32)
             .map(|k| b.hint_word(a.ood_current, k).as_ext())
             .collect();
-        let ood_next: Vec<Ext> = (0..(s.challenge.ood_next_dims.0 * s.challenge.ood_next_dims.1)
-            as u32)
+        let ood_next: Vec<Ext> = (0..(cs.ood_next_dims.0 * cs.ood_next_dims.1) as u32)
             .map(|k| b.hint_word(a.ood_next, k).as_ext())
             .collect();
-        let parts: Vec<Ext> = (0..s.challenge.num_parts as u32)
+        let parts: Vec<Ext> = (0..cs.num_parts as u32)
             .map(|k| b.hint_word(a.parts, k).as_ext())
             .collect();
-        let fri_roots: Vec<RootCells> = (0..s.challenge.fri.num_committed())
+        let fri_roots: Vec<RootCells> = (0..cs.fri.num_committed())
             .map(|k| RootCells::hint(&mut b, a.fri_roots, per_root * k as u32))
             .collect();
-        let fri_coeffs: Vec<Ext> = (0..s.challenge.fri.num_terminal_coeffs() as u32)
+        let fri_coeffs: Vec<Ext> = (0..cs.fri.num_terminal_coeffs() as u32)
             .map(|k| b.hint_word(a.fri_coeffs, k).as_ext())
             .collect();
         let nonce = a.nonce.map(|id| b.hint_felt(id, 0));
         if let Some(c) = contribution {
             contributions.push(c);
         }
-        let mut fork = fork_table(&t, s.challenge.index, s.challenge.num_tables);
+        let mut fork = fork_table(&t, cs.index, cs.num_tables);
         let absorbs = TableAbsorbs {
             aux_root: aux.as_ref(),
             contribution,
@@ -1301,7 +1328,7 @@ fn tenant_leg_program(tables: &[TableShape]) -> LfmProgram {
             fri_coeffs: &fri_coeffs,
             nonce,
         };
-        let ch = super::epoch::emit_table_challenges(&mut b, &mut fork, &s.challenge, &absorbs);
+        let ch = super::epoch::emit_table_challenges(&mut b, &mut fork, cs, &absorbs);
         super::epoch_verify::emit_table_verification(
             &mut b,
             &s.verify,
@@ -1435,5 +1462,162 @@ fn the_tenant_leg_emits_and_censuses() {
          width-driven and query-invariant, so its share falls as the query count \
          rises from {} to {PRODUCTION_QUERIES}.",
         GLUE_SWEEP[0],
+    );
+}
+
+/// Query counts the production-height arm sweeps.
+///
+/// ★ Small ON PURPOSE, and the reason is the whole design of this test:
+/// **`F` is the query-INVARIANT intercept, so measuring it needs production
+/// HEIGHTS, not production queries.** A 110-query emission at these heights
+/// would materialise ~447,370 compressions, which pads `LFM_BLAKE3` to 2^19
+/// rows × 3,112 columns ≈ 13 GB of column-group data for that chip alone.
+/// Eight queries pads it to 2^15 and costs ~800 MB, and the intercept it
+/// yields is the same number.
+const PRODUCTION_HEIGHT_SWEEP: [usize; 3] = [2, 4, 8];
+
+/// ★★ THE DECIDING MEASUREMENT — `F` at PRODUCTION heights, and how it scales
+/// with the LEG COUNT.
+///
+/// [`the_tenant_leg_emits_and_censuses`] fits the glue at fixture heights
+/// (2^12), where each table commits 4 FRI layers against production's 12. This
+/// arm re-fits it at the recorded per-table wrap's own heights, so the fan-in
+/// verdict stops resting on a height extrapolation.
+///
+/// It also emits at **one leg and at two**, because the single-leg fixture is
+/// exactly what could not answer the open question. The difference between
+/// `F(2 legs)` and `2·F(1 leg)` is the inter-leg glue — the part of a
+/// multi-leg node that is not just its legs added up.
+///
+/// ⚠⚠ **This is still a LOWER BOUND on the inter-leg glue, and the report must
+/// say so.** The two-leg node here shares one transcript, one Phase A and one
+/// LogUp closure over a fork space of `2 · tables` — but it carries **no
+/// binding legs**: no register chain, no attestation join, no published-root
+/// compare. Those are lane A's design and inventing them here would be
+/// measuring my guess rather than the machine. So a fan-in verdict from this
+/// number is safe in one direction only: if fan-in 3 misses the rule even at
+/// this lower bound, it misses. If it clears here, lane A's real node still
+/// decides.
+#[test]
+#[ignore = "production-height emission: seconds and GBs, run explicitly"]
+fn the_rpx_leg_emits_at_production_heights() {
+    // RPX with the keccak family — the shape the record actually exhibits.
+    let tenant = TENANTS[1];
+    assert_eq!(tenant.label, "RPX", "the production-height arm is RPX's");
+
+    // The leg the aggregator really pays, by the closed form at the real preset.
+    let prod_opts = wrap_options();
+    let prod_airs = tenant.airs(&prod_opts);
+    let prod_tables = tenant_tables(&tenant, &prod_airs, &tenant.present_log_heights());
+    let (prod_bill, leg_110) = bill(&prod_tables, WrapHash::Blake3, "LFM_HASH");
+    println!(
+        "\n★★ RPX LEG AT PRODUCTION HEIGHTS — {} sub-proofs at the recorded \
+         per-table wrap's heights\n   \
+         closed form: {} blocks/query × {} queries = {leg_110} compressions per leg",
+        prod_tables.len(),
+        prod_bill.total(),
+        prod_opts.fri_number_of_queries,
+    );
+
+    // ---- fit glue(q) = F + P·q at ONE leg and at TWO.
+    let mut fits: Vec<(usize, f64, f64)> = Vec::new();
+    for legs in [1usize, 2] {
+        let mut points: Vec<(usize, i64)> = Vec::new();
+        println!("\n   ── {legs} leg(s)");
+        for q in PRODUCTION_HEIGHT_SWEEP {
+            let opts = ProofOptions {
+                fri_number_of_queries: q,
+                ..wrap_options()
+            };
+            let airs = tenant.airs(&opts);
+            let tables = tenant_tables(&tenant, &airs, &tenant.present_log_heights());
+            let (_, leg) = bill(&tables, WrapHash::Blake3, "LFM_HASH");
+
+            let program = tenant_node_program(&tables, legs);
+            let emitted = super::wrap_tests::hash_ops(&program, WrapHash::Blake3);
+            let glue = emitted as i64 - (legs * leg) as i64;
+            assert!(
+                glue >= 0,
+                "{legs} leg(s), q={q}: the emitted count cannot be below the legs' \
+                 closed form — the difference IS the glue"
+            );
+            println!(
+                "      q={q:<2} legs {legs}  closed form {:>9}  emitted {emitted:>9}  \
+                 glue {glue:>7}  ({} instructions)",
+                legs * leg,
+                program.instrs.len(),
+            );
+            points.push((q, glue));
+        }
+        let ((q0, g0), (q1, g1), (q2, g2)) = (points[0], points[1], points[2]);
+        let per_query = (g2 - g0) as f64 / (q2 - q0) as f64;
+        let fixed = g0 as f64 - per_query * q0 as f64;
+        let predicted = fixed + per_query * q1 as f64;
+        let residual = (predicted - g1 as f64) / g1 as f64;
+        println!(
+            "      FIT glue(q) = {fixed:.0} + {per_query:.1}·q  (q={q1}: predicted \
+             {predicted:.0} vs measured {g1}, {:+.2}%)",
+            100.0 * residual
+        );
+        assert!(
+            residual.abs() < 0.05,
+            "{legs} leg(s): glue(q) must be affine in the query count; the middle \
+             point missed the line by {:.1}%",
+            100.0 * residual,
+        );
+        fits.push((legs, fixed, per_query));
+    }
+
+    // ---- the inter-leg glue: what a second leg costs BEYOND a copy of the first.
+    let (_, f1, p1) = fits[0];
+    let (_, f2, p2) = fits[1];
+    let inter_f = f2 - 2.0 * f1;
+    let inter_p = p2 - 2.0 * p1;
+    println!(
+        "\n   ── INTER-LEG GLUE (lower bound — no binding legs, see the doc)\n      \
+         F(1 leg) = {f1:.0}, F(2 legs) = {f2:.0}; 2·F(1) = {:.0} ⇒ inter-leg \
+         F = {inter_f:+.0} ({:+.1}% of one leg's)\n      \
+         P(1 leg) = {p1:.1}, P(2 legs) = {p2:.1} ⇒ inter-leg P = {inter_p:+.1}",
+        2.0 * f1,
+        100.0 * inter_f / f1,
+    );
+
+    // ---- the rule, at production heights and the real query count.
+    //
+    // A node of `f` legs costs `f · leg + F(f) + P(f)·q`. F and P are measured
+    // at f ∈ {1,2}; f = 3 extends the per-leg increment linearly, which is the
+    // one modelled step here and is named as such.
+    let f_of = |f: f64| f1 + (f - 1.0) * (f2 - f1);
+    let p_of = |f: f64| p1 + (f - 1.0) * (p2 - p1);
+    println!(
+        "\n   ⇒ THE RULE at production heights, {} queries\n      \
+         {:>7} {:>13} {:>9} {:>8} {:>10} {:>14}",
+        prod_opts.fri_number_of_queries,
+        "fan-in",
+        "invocations",
+        "glue",
+        "height",
+        "headroom",
+        "verdict",
+    );
+    for f in [2u64, 3] {
+        let glue = f_of(f as f64) + p_of(f as f64) * prod_opts.fri_number_of_queries as f64;
+        let inv = (f * leg_110 as u64) + glue.round() as u64;
+        let height = inv.next_power_of_two();
+        let headroom = 1.0 - inv as f64 / height as f64;
+        println!(
+            "      {f:>7} {inv:>13} {:>9.0} {:>8} {:>9.1}% {:>14}",
+            glue,
+            format!("2^{}", height.trailing_zeros()),
+            100.0 * headroom,
+            if headroom >= 0.25 { "clears" } else { "MISSES" },
+        );
+    }
+    println!(
+        "\n   ⚠ Read this as a LOWER BOUND on the inter-leg glue: the two-leg node \
+         emitted here shares a transcript, a Phase A and a LogUp closure but \
+         carries NO binding legs (register chain, attestation join, \
+         published-root compare). If fan-in 3 misses the rule even here, it \
+         misses. If it clears here, lane A's real node still decides."
     );
 }
