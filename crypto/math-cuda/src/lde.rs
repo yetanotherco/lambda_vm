@@ -396,7 +396,7 @@ fn launch_keccak_base_row_major_row_pair_range(
 /// the column-major layout expected by downstream GPU kernels (DEEP, barycentric).
 /// No synchronize — callers on the same stream are ordered; other streams must
 /// synchronize themselves.
-fn launch_row_to_col_major(
+pub(crate) fn launch_row_to_col_major(
     stream: &Arc<CudaStream>,
     be: &Backend,
     src: &CudaSlice<u64>,
