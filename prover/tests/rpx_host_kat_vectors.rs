@@ -7,15 +7,17 @@
 //! the Rust host implementation IS the oracle, and this test prints the tables
 //! the harness embeds, as C++ source:
 //!
-//!   Table 2 — the bare permutation on ten states: all-zero, all-(p−1),
-//!             `0..12`, alternating, two one-hot lanes, four random;
+//!   Table 2 — the bare permutation on eleven states: all-zero, all-(p−1),
+//!             `0..12`, alternating, two one-hot lanes, four random, and the
+//!             canonicalisation witness (see `permutation_inputs`);
 //!   Table 3 — the rate-8 OVERWRITE-duplex leaf (`algebraic_commit::sponge_leaf`)
 //!             at lengths 0, 1, 7, 8, 9, 16, 17 felts;
 //!   Table 4 — the parent `compress(l, r)` = one permutation of `[l ‖ r ‖ 0⁴]`.
 //!
-//! Every printed value is CANONICAL (`< p`); the harness canonicalises the
-//! kernel's output before comparing, so the representation the two sides keep
-//! internally never enters the comparison.
+//! Every printed value is CANONICAL (`< p`), and the harness compares the
+//! kernel's output against it RAW — the kernel's final canonicalisation loop
+//! is part of what these tables pin, so nothing may canonicalise on its
+//! behalf.
 //!
 //! `#[ignore]`d because it prints rather than asserts. Run with
 //!
@@ -76,8 +78,8 @@ fn cpp_list(vals: &[u64]) -> String {
         .join(", ")
 }
 
-/// The ten permutation inputs, each with the name the harness prints on a
-/// failure.
+/// The eleven permutation inputs, each with the name the harness prints on a
+/// failure (and, for the witness, matches on).
 fn permutation_inputs() -> Vec<(&'static str, [u64; HASH_STATE_FELTS])> {
     let mut v: Vec<(&'static str, [u64; HASH_STATE_FELTS])> = vec![
         ("all-zero", [0; HASH_STATE_FELTS]),
@@ -101,6 +103,34 @@ fn permutation_inputs() -> Vec<(&'static str, [u64; HASH_STATE_FELTS])> {
         let mut seed = 0x5250_5800_0000_0000 + k as u64; // "RPX\0" + k
         v.push((name, core::array::from_fn(|_| random_felt(&mut seed))));
     }
+    // ★ The canonicalisation witness (review finding on the phase-1 PR). The
+    // kernel canonicalises its output in a final loop, and a check that
+    // compares canonical values — or raw values that happen to be canonical,
+    // which is all but a 2^-32 slice per lane — cannot see whether that loop
+    // is there. This input is built so that it is not: its M-round MDS output
+    // lane 0 is `p − ARK1[6][0] + 1`, so the device's final `add` yields the
+    // raw twin `p + 1` where the field value is 1. Derived by inverting the
+    // permutation from that target
+    // (`crypto/math-cuda/tests/host_kat/rpx_canon_witness.py`); the harness
+    // matches this row BY NAME, replays the rounds to assert the twin is still
+    // produced, and compares `permute`'s output raw against the digits below.
+    v.push((
+        "canonicalisation witness",
+        [
+            15055324559807314153,
+            10242425218814686878,
+            9326602342065331773,
+            15451135068213333861,
+            17942679252967467289,
+            9284164080268346300,
+            5090350781253234438,
+            9328738269791029498,
+            18385380985273671691,
+            3238854716908013220,
+            5495049682105235955,
+            15773368383738726538,
+        ],
+    ));
     v
 }
 

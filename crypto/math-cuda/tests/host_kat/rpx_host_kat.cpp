@@ -382,6 +382,15 @@ void seven_fb_rounds_reproduce_the_miden_rpo_vectors() {
 
 // ===========================================================================
 // Layer 4 — ★ the Rust oracle.
+//
+// ⚠ Every comparison here is RAW: `s[i] == v.output[i]`, never
+// `canon(s[i]) == …`. The tables are canonical by construction (the generator
+// canonicalises), and `permute` ends in a canonicalisation loop that makes
+// digests byte-comparable to the host's; a check that canonicalised the kernel
+// side would pass with that loop deleted, and so would a raw check on outputs
+// that merely happen to be canonical — all but a 2^-32 slice per lane. The
+// "canonicalisation witness" row and `the_canonicalisation_loop_is_pinned…`
+// below are what make the loop observable.
 // ===========================================================================
 
 void rpx_permutation_matches_the_rust_oracle() {
@@ -402,12 +411,12 @@ void rpx_permutation_matches_the_rust_oracle() {
         saw_p_minus_one = saw_p_minus_one || all_pm1;
         rpx::permute(s);
         bool ok = true;
-        for (int i = 0; i < 12; ++i) ok = ok && canon(s[i]) == v.output[i];
+        for (int i = 0; i < 12; ++i) ok = ok && s[i] == v.output[i];
         if (!ok) {
             printf("FAIL rpx permutation vector %d (%s)\n", n, v.name);
             for (int i = 0; i < 12; ++i) {
-                if (canon(s[i]) != v.output[i]) {
-                    printf("  lane %2d got %llu want %llu\n", i, (unsigned long long)canon(s[i]),
+                if (s[i] != v.output[i]) {
+                    printf("  lane %2d got %llu (raw) want %llu\n", i, (unsigned long long)s[i],
                            (unsigned long long)v.output[i]);
                 }
             }
@@ -479,11 +488,11 @@ void leaf_sponge_matches_the_rust_oracle() {
         uint64_t got[4];
         rpx::sponge_leaf(v.felts, v.len, got);
         bool ok = true;
-        for (int d = 0; d < 4; ++d) ok = ok && canon(got[d]) == v.digest[d];
+        for (int d = 0; d < 4; ++d) ok = ok && got[d] == v.digest[d];
         if (!ok) {
             printf("FAIL rpx leaf vector len=%u\n  got  %llu %llu %llu %llu\n  want %llu %llu %llu %llu\n",
-                   v.len, (unsigned long long)canon(got[0]), (unsigned long long)canon(got[1]),
-                   (unsigned long long)canon(got[2]), (unsigned long long)canon(got[3]),
+                   v.len, (unsigned long long)got[0], (unsigned long long)got[1],
+                   (unsigned long long)got[2], (unsigned long long)got[3],
                    (unsigned long long)v.digest[0], (unsigned long long)v.digest[1],
                    (unsigned long long)v.digest[2], (unsigned long long)v.digest[3]);
             ++failures;
@@ -504,11 +513,11 @@ void parent_matches_the_rust_oracle() {
         uint64_t got[4];
         rpx::compress(v.left, v.right, got);
         bool ok = true;
-        for (int d = 0; d < 4; ++d) ok = ok && canon(got[d]) == v.digest[d];
+        for (int d = 0; d < 4; ++d) ok = ok && got[d] == v.digest[d];
         if (!ok) {
             printf("FAIL rpx parent vector %d (%s)\n  got  %llu %llu %llu %llu\n  want %llu %llu %llu %llu\n",
-                   n, v.name, (unsigned long long)canon(got[0]), (unsigned long long)canon(got[1]),
-                   (unsigned long long)canon(got[2]), (unsigned long long)canon(got[3]),
+                   n, v.name, (unsigned long long)got[0], (unsigned long long)got[1],
+                   (unsigned long long)got[2], (unsigned long long)got[3],
                    (unsigned long long)v.digest[0], (unsigned long long)v.digest[1],
                    (unsigned long long)v.digest[2], (unsigned long long)v.digest[3]);
             ++failures;
@@ -528,6 +537,53 @@ void parent_matches_the_rust_oracle() {
     }
     printf("★ ORACLE: rpx::compress vs Rust HasherKind::Rpx.compress: %d/%d parents matched\n", matched,
            NUM_RPX_PARENT_VECTORS);
+}
+
+// ★ The pin on the canonicalisation loop. The witness row's M-round MDS output
+// lane 0 is `p − ARK1[6][0] + 1`, so the device's final `add` returns the raw
+// twin `p + 1` for a field value of 1 — deterministically, since neither that
+// sum nor the MDS reduction can wrap there. Replaying the rounds without the
+// loop must therefore show a lane ≥ p (or the witness has gone stale and no
+// longer witnesses anything), and `permute` must then return the oracle's
+// canonical digits RAW — which a kernel without the loop cannot.
+void the_canonicalisation_loop_is_pinned_by_the_witness() {
+    const RpxPermutationVector *w = nullptr;
+    for (int n = 0; n < NUM_RPX_PERMUTATION_VECTORS; ++n) {
+        if (strcmp(RPX_PERMUTATION_VECTORS[n].name, "canonicalisation witness") == 0) {
+            w = &RPX_PERMUTATION_VECTORS[n];
+        }
+    }
+    check(w != nullptr,
+          "the permutation table must carry the 'canonicalisation witness' row (run the generator, see rpx_kat_vectors.h)");
+    if (w == nullptr) return;
+
+    uint64_t s[12];
+    memcpy(s, w->input, sizeof(s));
+    rpx::fb_round<0>(s);
+    rpx::ext_round<1>(s);
+    rpx::fb_round<2>(s);
+    rpx::ext_round<3>(s);
+    rpx::fb_round<4>(s);
+    rpx::ext_round<5>(s);
+    rpx::final_round<6>(s);
+    int twins = 0;
+    for (int i = 0; i < 12; ++i) twins += (s[i] >= P) ? 1 : 0;
+    check(twins > 0, "the witness must leave a raw lane >= p before the canonicalisation loop");
+    check(s[0] == P + 1, "the witness's lane 0 must be the raw twin p + 1 before the loop");
+    for (int i = 0; i < 12; ++i) {
+        check(canon(s[i]) == w->output[i], "the witness's field values must be the oracle's");
+    }
+
+    uint64_t full[12];
+    memcpy(full, w->input, sizeof(full));
+    rpx::permute(full);
+    const bool loop_present = memcmp(full, w->output, sizeof(full)) == 0;
+    check(loop_present,
+          "permute must return the witness's digits RAW — the canonicalisation loop is missing");
+    if (loop_present) {
+        printf("★ canonicalisation pin: witness leaves %d raw lane(s) >= p before the loop; permute() returns them canonical\n",
+               twins);
+    }
 }
 
 // ===========================================================================
@@ -671,6 +727,7 @@ int main() {
     rpx_permutation_matches_the_rust_oracle();
     leaf_sponge_matches_the_rust_oracle();
     parent_matches_the_rust_oracle();
+    the_canonicalisation_loop_is_pinned_by_the_witness();
     printf("\n-- layer 5: negative controls and representation --\n");
     rpx_is_not_rpo();
     raw_and_canonical_inputs_agree_and_outputs_are_canonical();

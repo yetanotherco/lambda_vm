@@ -60,7 +60,10 @@ inline constexpr uint64_t MIDEN_HASH_ELEMENTS[NUM_MIDEN_HASH_ELEMENTS][4] = {
 // is self-contained. All values are canonical (`< p`).
 //
 //   Table 2 — the bare permutation: all-zero, all-(p−1), `0..12`, alternating,
-//             two one-hot lanes, four seeded random states.
+//             two one-hot lanes, four seeded random states, and the row named
+//             "canonicalisation witness" — an input whose output lane 0 is the
+//             raw twin `p + 1` before the kernel's final canonicalisation loop
+//             (derived by `rpx_canon_witness.py`; the harness replays it).
 //   Table 3 — the leaf sponge (`algebraic_commit::sponge_leaf`) at 0, 1, 7, 8,
 //             9, 16 and 17 felts; `felts[]` is zero beyond `len`.
 //   Table 4 — the parent `compress(l, r)`.
