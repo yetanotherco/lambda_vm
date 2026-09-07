@@ -338,18 +338,19 @@ pub const BALU_TARGET_CHUNK_ROWS_LOG2: u32 = 22;
 /// | 2^27 | 28.0 GiB      | 14.0 GiB          | 8.0 GiB          | 50 GiB |
 /// | 2^22 | 0.875 GiB     | 0.44 GiB          | 0.25 GiB         | 1.6 GiB|
 ///
-/// and rounds 2–4 add the aux LDE (2 ext3 columns, `2n·2·24`) and its tree,
-/// the two composition parts (`2·2n·24`) and their tree, and the DEEP
-/// codeword (`2n·24`): a whole-prove set of ~96 GiB at `2^27` against a
-/// 32 GiB card, ~3 GiB per chunk at `2^22` (`the_balu_chunk_sizing_is_the_doc`
-/// pins the arithmetic). `2^22` is the height at which eight chunks prove
-/// concurrently inside a 25.6 GiB admission budget, which is why it is the
-/// target: `2^24` chunks (~12 GiB each) would hold the concurrency at two, and
-/// `2^20` chunks would quadruple the per-chunk FRI and query overhead the
-/// verifier pays for nothing. That overhead — one FRI commit and one set of
-/// openings PER CHUNK — is the counter-pressure against smaller chunks, and
-/// the reason the default stays one table until the aggregator is emitted
-/// with the knob set.
+/// and rounds 2–4 add the aux LDE and its tree, the resident aux trace, `H`
+/// and the two composition parts with their tree, the inverted denominators,
+/// the DEEP codeword and the FRI chain — the scheduler's throttle model,
+/// `stark::device_set::table_device_set`, which
+/// `the_balu_chunk_sizing_is_the_doc` reads rather than restates: ~150 GiB at
+/// `2^27` against a 32 GiB card, ~4.9 GiB per chunk at `2^22`, so five chunks
+/// prove concurrently inside a 25.6 GiB admission budget. `2^22` is the
+/// target because `2^24` chunks (~19 GiB each) would serialise the chunks
+/// outright, and `2^20` chunks would quadruple the per-chunk FRI and query
+/// overhead the verifier pays for nothing. That overhead — one FRI commit and
+/// one set of openings PER CHUNK — is the counter-pressure against smaller
+/// chunks, and the reason the default stays one table until the aggregator is
+/// emitted with the knob set.
 ///
 /// # Why row chunking, not column streaming
 ///
@@ -384,8 +385,8 @@ pub const BALU_TARGET_CHUNK_ROWS_LOG2: u32 = 22;
 /// module.
 ///
 /// `LFM_LANES` (4 value + 12 preprocessed, `2^24` rows in the 110-query wrap)
-/// is the next chip of this shape; its whole-prove set at `2^24` is ~14 GiB,
-/// one doubling from needing the same arm.
+/// is the next chip of this shape; its device set at `2^24` is ~23 GiB under
+/// the same model — it proves alone — one doubling from needing the same arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BaluChunking {
     ops_per_chunk: usize,
@@ -674,36 +675,43 @@ mod tests {
         }
     }
 
-    /// The device-set arithmetic the `BaluChunking` doc tabulates: one table at
-    /// `2^27` does not fit a 32 GiB card; a `2^22` chunk's whole-prove set is
-    /// ~3 GiB, so eight prove concurrently inside the 25.6 GiB budget. Columns:
-    /// 14 base (4 value + 10 preprocessed), 2 ext3 aux, 2 ext3 composition
-    /// parts, one ext3 DEEP codeword, blowup 2.
+    /// The device-set arithmetic the `BaluChunking` doc tabulates, read from
+    /// the scheduler's own model (`stark::device_set`) so the doc cannot drift
+    /// from what the throttle admits: one table at `2^27` does not fit a
+    /// 32 GiB card; a `2^22` chunk is ~4.9 GiB, so five prove concurrently
+    /// inside the 25.6 GiB budget and a `2^24` chunk proves alone. Columns:
+    /// 14 base (4 value + 10 preprocessed), 2 ext3 aux, 2 composition parts,
+    /// 2 OOD points, blowup 2.
     #[test]
     fn the_balu_chunk_sizing_is_the_doc() {
+        use stark::device_set::{TableShape, table_device_set};
         const GIB: u64 = 1 << 30;
-        let whole_prove_set = |n: u64| -> u64 {
-            let lde = 2 * n;
-            let tree = (lde - 1) * 32;
-            let main_lde = lde * 14 * 8;
-            let snapshot = n * 14 * 8;
-            let aux_lde = lde * 2 * 24;
-            let parts = lde * 2 * 24;
-            let deep = lde * 24;
-            main_lde + snapshot + tree + aux_lde + tree + parts + tree + deep
+        const BUDGET: u64 = 32 * GIB / 5 * 4;
+        let balu = |n: usize| {
+            table_device_set(TableShape {
+                n,
+                blowup: 2,
+                main_cols: 14,
+                aux_cols: 2,
+                num_parts: 2,
+                num_eval_points: 2,
+            })
         };
-        let one_table = whole_prove_set(1 << 27);
-        assert!(one_table > 95 * GIB && one_table < 97 * GIB, "{one_table}");
-        let r1_only = (1u64 << 28) * 14 * 8 + (1u64 << 27) * 14 * 8 + ((1u64 << 28) - 1) * 32;
-        assert!(r1_only > 49 * GIB && r1_only < 51 * GIB, "{r1_only}");
-        let chunk = whole_prove_set(1 << 22);
-        assert!(chunk < 3 * GIB + GIB / 16, "{chunk}");
+        let one_table = balu(1 << 27);
+        assert!(one_table.main.total() > 50 * GIB && one_table.main.total() < 52 * GIB);
         assert!(
-            8 * chunk <= 32 * GIB / 5 * 4,
-            "eight chunks must fit the budget"
+            one_table.total() > 148 * GIB && one_table.total() < 152 * GIB,
+            "{one_table:?}"
         );
-        let big_chunk = whole_prove_set(1 << 24);
-        assert!(2 * big_chunk <= 32 * GIB / 5 * 4 && 3 * big_chunk > 32 * GIB / 5 * 4);
+        let chunk = balu(1 << 22).total();
+        assert!(
+            chunk > 4 * GIB + GIB / 2 && chunk < 5 * GIB + GIB / 2,
+            "{chunk}"
+        );
+        assert!(5 * chunk <= BUDGET && 6 * chunk > BUDGET);
+        assert_eq!(BaluChunking::target().chunk_count(1 << 27), 32);
+        let big_chunk = balu(1 << 24).total();
+        assert!(big_chunk <= BUDGET && 2 * big_chunk > BUDGET, "{big_chunk}");
     }
 
     /// `split`, `chunk_count` and `chunk_range` are one rule seen three times
