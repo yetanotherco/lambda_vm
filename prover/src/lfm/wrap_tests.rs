@@ -364,6 +364,31 @@ pub(super) fn epoch_profile(e: &super::epoch_tests::RealEpoch) -> String {
 /// in this suite and the run is minutes of CPU and tens of gigabytes. It is the
 /// wrap run's own harness, not a test the suite can afford on every PR.
 ///
+/// ⚠⚠ **BOTH FIGURES ARE UNVERIFIED FOR THE SHAPE THIS SIGNATURE DESCRIBES,
+/// and the same doubt covers [`MEASURED_BYTES_PER_CELL`]'s 481,327,124-cell
+/// point, which is attributed to this test.**
+///
+/// [`wrap_run`] passes [`EpochInputs::from_env`], and with no `LFM_CENSUS_*`
+/// set that is byte-for-byte [`EpochInputs::fixture`] — so in a CLEAN
+/// ENVIRONMENT this test and [`the_fixture_epoch_wraps`] build the same epoch
+/// through the same `real_epoch_from` and emit the same
+/// `epoch_program(&e, true)`. They are ONE program. That program measures
+/// **210,782 instructions** and 82,059,828 base-field-equivalent cells, an
+/// order of magnitude under both numbers above.
+///
+/// ⚖ The likely explanation is that these were recorded under `LFM_CENSUS_*`
+/// overrides — this test reads them, and a real-block run through this harness
+/// is what they exist for — but that is a HYPOTHESIS and is written as one. It
+/// has not been checked, and "the shape shrank since" is not excluded. The
+/// numbers are left in place rather than corrected, because correcting them
+/// would mean inventing replacements: what they need is one `--ignored` run of
+/// this test in a clean environment, after which all three move together or
+/// none do.
+///
+/// ⛔ Until that run exists, do not size a wrap run from anything on this
+/// signature. [`the_fixture_epoch_wraps`] carries measured numbers for the
+/// clean-environment shape.
+///
 /// Run with:
 /// `cargo test --release -p lambda-vm-prover --lib lfm::wrap_tests::the_wrap_proves_and_verifies -- --ignored --nocapture`
 #[test]
@@ -434,12 +459,20 @@ fn the_wrap_proves_and_verifies() {
 /// | wall | 9.20s for the whole test: 3.1s to build and host-verify the epoch, 3.8s to prove, 0.16s to verify |
 /// | wrap proof | 45,953,352 bytes over 15 sub-proofs |
 ///
-/// ⚠ **210,782 instructions, not the ~2.25M this file's slice-0 doc quotes for
-/// the same epoch and preset.** That figure was recorded against a different
-/// shape and is an order of magnitude high for this one; it is left alone above
-/// rather than re-blessed here, because which shape it belongs to is a question
-/// for whoever re-runs slice 0, not something to guess from a neighbouring
-/// measurement. Read the number in this table for THIS test and nothing else.
+/// ⚠ On CI, expect **30-60s** rather than 9.2s: the runners are 2-4 vCPU and
+/// the suite runs `--test-threads=1`, so almost none of the box's parallelism
+/// is there. `? INFERRED` — scaled from the box wall, not measured on a runner.
+/// The batched twin already pays a comparable bill today and is being deleted,
+/// so the steady state is one test of this class, not two.
+///
+/// ⚠ These numbers, and NOT the `~2.25M` instructions the slice-0 doc quotes,
+/// describe this shape. In a clean environment the two tests are the SAME
+/// PROGRAM: `wrap_run` passes `EpochInputs::from_env`, which with no
+/// `LFM_CENSUS_*` set is byte-for-byte [`EpochInputs::fixture`]. Why slice 0's
+/// doc carries a figure an order of magnitude higher for one program is an open
+/// question and is written up on [`the_wrap_proves_and_verifies`]; it is not
+/// settled here, and this table is not evidence about which environment that
+/// number came from.
 ///
 /// The 46 MB proof is a consequence of the WRAP proving at
 /// [`wrap_options`]' framework query count over 15 sub-proofs, not of anything
@@ -1238,6 +1271,16 @@ fn the_wrap_census() {
 /// times the size (allocator behaviour, and the fact that a bigger program is
 /// bigger in different chips), so it is a projection and is labelled as one
 /// wherever it is printed.
+///
+/// ⚠ **The PROVENANCE line is in doubt, the RATIO is not.** Slice 0 in a clean
+/// environment is the same program as [`the_fixture_epoch_wraps`], which
+/// measures 82,059,828 cells — so the 481,327,124 above cannot be that run, and
+/// "the measured point is slice 0" is under-specified about which environment
+/// slice 0 was in. See [`the_wrap_proves_and_verifies`] for what is and is not
+/// known. The value is deliberately UNCHANGED: a ratio of two numbers taken
+/// together on one run stays a valid coefficient whichever shape that run was,
+/// and re-deriving it from a shape nobody measured the RSS of would replace a
+/// misfiled observation with a fabricated one.
 const MEASURED_BYTES_PER_CELL: f64 = 16_228_499_456.0 / 481_327_124.0;
 
 fn projected_peak_bytes(main: u64, aux: u64) -> f64 {
