@@ -90,14 +90,13 @@
 /// Every `multi_prove` / `multi_verify` instantiation in this crate names this
 /// rather than `stark::config::DefaultStarkHash`, so the two can differ on a
 /// branch without the workspace default moving.
-pub type BlockStarkHash = stark::config::DefaultStarkHash;
+pub type BlockStarkHash = crate::lfm::algebraic_commit::RpxStarkHash;
 
 /// The Fiat–Shamir transcript OBJECT the block path builds.
 ///
 /// See the module header for why this is pinned separately from
 /// [`BlockStarkHash`] rather than derived from it.
-pub type BlockTranscript =
-    stark::config::DefaultStarkTranscript<crate::tables::types::GoldilocksExtension>;
+pub type BlockTranscript = crate::lfm::algebraic_transcript::AlgebraicTranscript;
 
 /// A fresh block-path transcript over `seed`.
 ///
@@ -106,7 +105,7 @@ pub type BlockTranscript =
 /// algebraic one absorbs it as its first `append_bytes` call. Callers should not
 /// have to know which.
 pub fn block_transcript(seed: &[u8]) -> BlockTranscript {
-    BlockTranscript::new(seed)
+    BlockTranscript::with_seed(BLOCK_HASHER, seed)
 }
 
 /// The prover the block path drives, at [`BlockStarkHash`].
@@ -145,7 +144,7 @@ pub type BlockVerifier<Field, FieldExtension, PI> =
 /// Every `execute` and prove call on the block path names this rather than a
 /// literal, so the two axes cannot drift apart in a test harness while
 /// production stays correct.
-pub const BLOCK_HASHER: crate::lfm::hash::HasherKind = crate::lfm::hash::HasherKind::Test;
+pub const BLOCK_HASHER: crate::lfm::hash::HasherKind = crate::lfm::hash::HasherKind::Rpx;
 
 /// The [`CommitmentHash`] the block path's roots may be called by.
 ///
