@@ -474,7 +474,7 @@ where
             .constraints
             .len();
         let mut coefficients: Vec<FieldElement<FieldExtension>> =
-            core::iter::successors(Some(FieldElement::one()), |x| Some(x * &beta))
+            core::iter::successors(Some(FieldElement::one()), |x| Some(x * beta))
                 .take(num_boundary_constraints + num_transition_constraints)
                 .collect();
         let transition_coefficients: Vec<_> =
