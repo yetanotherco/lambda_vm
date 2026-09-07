@@ -2141,44 +2141,24 @@ where
     if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
         return None;
     }
-    h.wait_ready_on(stream).ok()?;
-    let slabs = stream.clone_dtoh(h.buf.as_ref()).ok()?;
-    stream.synchronize().ok()?;
-    let (m, lde) = (h.m, h.lde_size);
-    if slabs.len() != m * lde * 3 {
-        return None;
-    }
-    // Per part: de-interleave the 3 slabs into row-major ext3 and reinterpret
-    // the u64 buffer in place — mirroring `materialize_lde_trace_host` rather
-    // than copying again through `u64_to_ext3_vec`. The row fill is parallel;
-    // this path fires often under VRAM pressure and otherwise dominates the
-    // D2H it follows.
-    let parts = (0..m)
-        .map(|p| {
-            let mut interleaved = vec![0u64; lde * 3];
-            #[cfg(feature = "parallel")]
-            interleaved
-                .par_chunks_exact_mut(3)
-                .enumerate()
-                .for_each(|(r, dst)| {
-                    for (k, d) in dst.iter_mut().enumerate() {
-                        *d = slabs[(p * 3 + k) * lde + r];
-                    }
-                });
-            #[cfg(not(feature = "parallel"))]
-            for (r, dst) in interleaved.chunks_exact_mut(3).enumerate() {
-                for (k, d) in dst.iter_mut().enumerate() {
-                    *d = slabs[(p * 3 + k) * lde + r];
-                }
-            }
+    // De-interleave the 3 ext3 slabs into per-column row-major ext3 ON DEVICE,
+    // then a contiguous D2H + split — the strided per-row gather this used to run
+    // on the host dominated the D2H it follows (~40% of the parts download).
+    let interleaved = math_cuda::deep::download_parts_interleaved(h, stream).ok()?;
+    // Each part is `lde` ext3 elements as `lde*3` interleaved u64s; reinterpret
+    // in place as FieldElement<E> (E == Ext3 = [u64; 3], checked above; each
+    // per-part Vec has len == capacity == lde*3 from the contiguous copy).
+    let parts = interleaved
+        .into_iter()
+        .map(|v| {
+            let mut v = std::mem::ManuallyDrop::new(v);
+            debug_assert!(
+                v.len().is_multiple_of(3) && v.capacity().is_multiple_of(3),
+                "interleaved len/capacity must be a multiple of 3 for Fp3 reinterpret"
+            );
             // SAFETY: E == Ext3 per the tower check above; FieldElement<Ext3>
-            // is [u64; 3]. `vec![0u64; lde*3]` has len == capacity == lde*3.
+            // is [u64; 3].
             unsafe {
-                let mut v = std::mem::ManuallyDrop::new(interleaved);
-                debug_assert!(
-                    v.len().is_multiple_of(3) && v.capacity().is_multiple_of(3),
-                    "interleaved len/capacity must be a multiple of 3 for Fp3 reinterpret"
-                );
                 Vec::from_raw_parts(
                     v.as_mut_ptr() as *mut FieldElement<E>,
                     v.len() / 3,
