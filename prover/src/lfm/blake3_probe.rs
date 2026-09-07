@@ -26,8 +26,6 @@
 //!   The permutation count comes from wave 8's rate-parameterised closed form
 //!   and is inherited, not re-established here.
 //! - **Anything cryptographic about the 6-round variant** (assumption A6R).
-
-use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use crypto::fiat_shamir::is_transcript::IsTranscript;
 use stark::config::Commitment;
 use stark::constraints::builder::{
@@ -289,7 +287,12 @@ fn verify_proof(
     );
     let refs: Vec<DynAir> = vec![chip, &mirror, &bw_air];
     let mut vt = transcript();
-    crate::hash_pin::BlockVerifier::multi_verify_views(&refs, MultiProofView::Owned(proof), &mut vt, &FEE::zero())
+    crate::hash_pin::BlockVerifier::multi_verify_views(
+        &refs,
+        MultiProofView::Owned(proof),
+        &mut vt,
+        &FEE::zero(),
+    )
 }
 
 /// Prove + verify, optionally corrupting the chip trace in between.

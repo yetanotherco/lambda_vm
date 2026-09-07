@@ -415,7 +415,6 @@ fn test_preprocessed_commitment_is_nonzero() {
 #[cfg(test)]
 mod soundness_tests {
     use super::*;
-    use crypto::fiat_shamir::default_transcript::DefaultTranscript;
     use stark::lookup::{
         AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, BusValue, Multiplicity,
         NullBoundaryConstraintBuilder, Packing,

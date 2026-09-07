@@ -6,8 +6,6 @@
 //! recursion machine's AIR set: it establishes that the family's only coupling
 //! to the VM is the core chip's two `Keccak` bus tokens, and that a chip owning
 //! nothing but those tokens is a sufficient driver.
-
-use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use crypto::fiat_shamir::is_transcript::IsTranscript;
 use stark::constraints::builder::EmptyConstraints;
 use stark::lookup::{AirWithBuses, AuxiliaryTraceBuildData, NullBoundaryConstraintBuilder};
@@ -140,7 +138,12 @@ fn verify_proof(
     );
     let refs: Vec<DynAir> = vec![adapter, &rnd_air, &rc_air, &bw_air];
     let mut vt = transcript();
-    crate::hash_pin::BlockVerifier::multi_verify_views(&refs, MultiProofView::Owned(proof), &mut vt, &FEE::zero())
+    crate::hash_pin::BlockVerifier::multi_verify_views(
+        &refs,
+        MultiProofView::Owned(proof),
+        &mut vt,
+        &FEE::zero(),
+    )
 }
 
 /// Prove + verify, optionally corrupting the adapter trace in between.
