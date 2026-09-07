@@ -64,7 +64,7 @@ use math::traits::AsBytes;
 
 use crypto::fiat_shamir::transcript_hash::TranscriptHash;
 use crypto::merkle_tree::traits::{IsLeafHasher, IsMerkleTreeBackend, IsStreamingLeafBackend};
-use stark::config::Commitment;
+use stark::config::{Commitment, CommitmentHash, DeviceTreeBackend, StarkHash};
 
 use super::hash::{HASH_STATE_FELTS, HasherKind, LfmHasher};
 use super::rpo::{DOMAIN_LEAF, RATE_FELTS, domain_iv};
@@ -79,10 +79,16 @@ pub const DIGEST_FELTS: usize = 4;
 /// A type-level name for one algebraic permutation.
 ///
 /// The whole reason the backends below are one implementation: a candidate
-/// joins by adding a unit struct and a `KIND`, and nothing else here moves.
+/// joins by adding a unit struct, a `KIND` and a `COMMITMENT_HASH`, and
+/// nothing else here moves.
 pub trait AlgebraicHasher: Clone + Copy + Default + Send + Sync + 'static {
     /// The permutation the `LFM_HASH` socket proves for this commitment.
     const KIND: HasherKind;
+    /// The name a root built by this permutation goes by — what both Merkle
+    /// families report as their device dispatch key and what the `StarkHash`
+    /// built on them reports as its `COMMITMENT_HASH`, stated once here so the
+    /// three cannot disagree.
+    const COMMITMENT_HASH: CommitmentHash;
 }
 
 /// Rescue-Prime Optimized.
@@ -90,6 +96,7 @@ pub trait AlgebraicHasher: Clone + Copy + Default + Send + Sync + 'static {
 pub struct RpoCommit;
 impl AlgebraicHasher for RpoCommit {
     const KIND: HasherKind = HasherKind::Rpo;
+    const COMMITMENT_HASH: CommitmentHash = CommitmentHash::Rpo256;
 }
 
 /// Rescue-Prime eXtended (XHash12).
@@ -97,6 +104,7 @@ impl AlgebraicHasher for RpoCommit {
 pub struct RpxCommit;
 impl AlgebraicHasher for RpxCommit {
     const KIND: HasherKind = HasherKind::Rpx;
+    const COMMITMENT_HASH: CommitmentHash = CommitmentHash::Rpx256;
 }
 
 /// ⚠ Poseidon-original — **UNSHIPPABLE** (broken family; eprint 2026/306 and
@@ -106,6 +114,7 @@ impl AlgebraicHasher for RpxCommit {
 pub struct PoseidonCommit;
 impl AlgebraicHasher for PoseidonCommit {
     const KIND: HasherKind = HasherKind::Poseidon;
+    const COMMITMENT_HASH: CommitmentHash = CommitmentHash::Poseidon;
 }
 
 /// Four felts as a 32-byte `Commitment`, canonical big-endian.
@@ -323,6 +332,32 @@ where
     }
 }
 
+/// ★ The device marker — what makes an algebraic configuration expressible
+/// under `cuda`.
+///
+/// `StarkHash`'s cuda bounds require both families to be [`DeviceTreeBackend`]s,
+/// and the constant is the dispatch key `gpu_lde` hands to `math-cuda`. No
+/// device kernels exist for these permutations yet, so every `math-cuda`
+/// dispatch site aborts with `unimplemented!` naming the hash the moment a
+/// device commit is attempted under one of them — never a byte-hash kernel in
+/// its place. That is the discipline HASH-PINNING.md demands: a build under an
+/// algebraic pin exists and lints on both feature arms, and it still cannot
+/// prove under a hash it is not named for.
+impl<F, H> DeviceTreeBackend for AlgebraicBatchBackend<F, H>
+where
+    Self: IsMerkleTreeBackend<Node = Commitment>,
+    H: AlgebraicHasher,
+{
+    const COMMITMENT_HASH: CommitmentHash = H::COMMITMENT_HASH;
+}
+impl<F, H> DeviceTreeBackend for AlgebraicPairBackend<F, H>
+where
+    Self: IsMerkleTreeBackend<Node = Commitment>,
+    H: AlgebraicHasher,
+{
+    const COMMITMENT_HASH: CommitmentHash = H::COMMITMENT_HASH;
+}
+
 /// ★ A1 — the incremental leaf hasher, which BUFFERS.
 ///
 /// The padding flag is `len mod 8` and the sponge needs it in the capacity
@@ -529,28 +564,21 @@ algebraic_transcript_hash!(
 /// convention: both are the generic algebraic backends at the same `H`, so a
 /// configuration mixing two permutations is not something to assert against —
 /// it is unspellable.
-// Only the non-cuda build can express an algebraic configuration — see the
-// macro's own note — so the imports it needs follow the same gate rather than
-// sitting unused in a cuda build.
-#[cfg(not(feature = "cuda"))]
-use stark::config::{CommitmentHash, StarkHash};
-
-/// ⚠ **NOT AVAILABLE UNDER `cuda`, and that is the `KeccakTreeBackend` marker
-/// working rather than a gap.** A cuda build drives the whole commit phase on
-/// device with the keccak kernels, so `StarkHash` there additionally requires
-/// `Batched` and `Pair` to BE keccak backends — a bound these cannot satisfy and
-/// must not. Under `cuda` an algebraic configuration is therefore not merely
-/// unused, it is inexpressible, which is exactly the property that stops a build
-/// producing keccak trees *labelled* RPO. `Blake3StarkHash` is gated the same way
-/// and for the same reason; the algebraic path is CPU-only, as BLAKE3's already
-/// is.
+/// ★ **Expressible under `cuda`, and still unable to prove under the wrong
+/// hash.** `StarkHash`'s cuda bounds require both families to be
+/// [`DeviceTreeBackend`]s; the algebraic backends are, carrying the tag's own
+/// [`CommitmentHash`] as the device dispatch key. `math-cuda` has no kernels for
+/// these permutations yet, so a device commit under one of them aborts at the
+/// first launch with `unimplemented!` naming the hash. The algebraic path is
+/// CPU-only in fact, and a GPU run under it fails loudly rather than producing
+/// byte-hash trees *labelled* RPO — the property HASH-PINNING.md demands, held
+/// by the dispatch key rather than by forking the build.
 macro_rules! algebraic_stark_hash {
-    ($name:ident, $tag:ty, $transcript:ty, $commitment:expr, $doc:literal) => {
+    ($name:ident, $tag:ty, $transcript:ty, $doc:literal) => {
         #[doc = $doc]
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         pub struct $name;
 
-        #[cfg(not(feature = "cuda"))]
         impl StarkHash for $name {
             type Batched<F>
                 = AlgebraicBatchBackend<F, $tag>
@@ -566,7 +594,11 @@ macro_rules! algebraic_stark_hash {
 
             type Transcript = $transcript;
 
-            const COMMITMENT_HASH: CommitmentHash = $commitment;
+            // Read from the tag rather than restated: it is the same constant
+            // the two families report as their device dispatch key, so the
+            // configuration's name and its kernels' name cannot be edited
+            // apart.
+            const COMMITMENT_HASH: CommitmentHash = <$tag as AlgebraicHasher>::COMMITMENT_HASH;
         }
     };
 }
@@ -575,21 +607,18 @@ algebraic_stark_hash!(
     RpoStarkHash,
     RpoCommit,
     RpoTranscriptHash,
-    CommitmentHash::Rpo256,
     "The RPO256 commitment configuration."
 );
 algebraic_stark_hash!(
     RpxStarkHash,
     RpxCommit,
     RpxTranscriptHash,
-    CommitmentHash::Rpx256,
     "The RPX256 (XHash12) commitment configuration."
 );
 algebraic_stark_hash!(
     PoseidonStarkHash,
     PoseidonCommit,
     PoseidonTranscriptHash,
-    CommitmentHash::Poseidon,
     "⚠ The Poseidon commitment configuration — UNSHIPPABLE, reference only."
 );
 
@@ -601,7 +630,6 @@ algebraic_stark_hash!(
 /// associated types are generic over `F`, and the bound that matters is the one
 /// the prover instantiates them at. This is that instantiation, as a compile-time
 /// check rather than as a comment claiming it holds.
-#[cfg(not(feature = "cuda"))]
 const _: fn() = || {
     fn assert_usable<H: StarkHash>()
     where
@@ -616,6 +644,41 @@ const _: fn() = || {
     assert_usable::<RpoStarkHash>();
     assert_usable::<RpxStarkHash>();
     assert_usable::<PoseidonStarkHash>();
+};
+
+/// ✓ Each configuration's members carry the configuration's own hash as their
+/// device dispatch key — the tie that makes the [`DeviceTreeBackend`] impls
+/// above true statements: `gpu_lde` dispatches kernels on that constant, so a
+/// mismatch here would be a GPU run hashing under a name the roots do not
+/// deserve. The same check `crypto/stark/src/config.rs` runs for the byte
+/// configurations; discriminants are compared because `PartialEq` is not
+/// `const`.
+const _: () = {
+    const fn assert_device_hash<B: DeviceTreeBackend>(expect: CommitmentHash) {
+        assert!(
+            B::COMMITMENT_HASH as u8 == expect as u8,
+            "a configuration's member must name the configuration's own hash as its device key"
+        );
+    }
+
+    assert_device_hash::<<RpoStarkHash as StarkHash>::Batched<GoldilocksField>>(
+        CommitmentHash::Rpo256,
+    );
+    assert_device_hash::<<RpoStarkHash as StarkHash>::Pair<GoldilocksField>>(
+        CommitmentHash::Rpo256,
+    );
+    assert_device_hash::<<RpxStarkHash as StarkHash>::Batched<GoldilocksField>>(
+        CommitmentHash::Rpx256,
+    );
+    assert_device_hash::<<RpxStarkHash as StarkHash>::Pair<GoldilocksField>>(
+        CommitmentHash::Rpx256,
+    );
+    assert_device_hash::<<PoseidonStarkHash as StarkHash>::Batched<GoldilocksField>>(
+        CommitmentHash::Poseidon,
+    );
+    assert_device_hash::<<PoseidonStarkHash as StarkHash>::Pair<GoldilocksField>>(
+        CommitmentHash::Poseidon,
+    );
 };
 
 #[cfg(test)]
@@ -807,7 +870,6 @@ mod tests {
     /// Distinctness is asserted too: two configurations sharing a tag is the same
     /// failure with an extra step.
     #[test]
-    #[cfg(not(feature = "cuda"))]
     fn each_configuration_names_its_own_hash_and_tag() {
         use crate::lfm::statement::commitment_hash_tag;
 

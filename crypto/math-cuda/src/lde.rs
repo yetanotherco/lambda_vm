@@ -1054,6 +1054,9 @@ fn build_inner_tree_levels_for(
         DeviceHash::Blake3 => {
             crate::blake3::build_inner_tree_levels(stream, be, nodes_dev, leaves_len)
         }
+        DeviceHash::Rpo256 | DeviceHash::Rpx256 | DeviceHash::Poseidon => {
+            unimplemented!("{hash:?} device commit not yet ported (inner tree levels)")
+        }
     }
 }
 
@@ -1138,6 +1141,9 @@ fn coset_lde_row_major_inner(
                 log_lde,
                 &mut leaves_view,
             )?,
+            DeviceHash::Rpo256 | DeviceHash::Rpx256 | DeviceHash::Poseidon => {
+                unimplemented!("{hash:?} device commit not yet ported (row-major row-pair leaves)")
+            }
         }
     }
     build_inner_tree_levels_for(hash, stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
@@ -1333,6 +1339,9 @@ pub fn coset_lde_row_major_split_trees(
                     log_lde,
                     &mut leaves_view,
                 )?,
+                DeviceHash::Rpo256 | DeviceHash::Rpx256 | DeviceHash::Poseidon => unimplemented!(
+                    "{hash:?} device commit not yet ported (row-major row-pair leaves, column range)"
+                ),
             }
         }
         build_inner_tree_levels_for(hash, stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
@@ -2145,6 +2154,9 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
                 lde_u64,
                 &mut leaves_view,
             )?,
+            (DeviceHash::Rpo256 | DeviceHash::Rpx256 | DeviceHash::Poseidon, _) => {
+                unimplemented!("{hash:?} device commit not yet ported (column-major base leaves)")
+            }
         }
     }
 
@@ -2387,6 +2399,9 @@ fn evaluate_poly_coset_batch_ext3_into_inner(
                     log_num_rows,
                     &mut leaves_view,
                 )?,
+                DeviceHash::Rpo256 | DeviceHash::Rpx256 | DeviceHash::Poseidon => {
+                    unimplemented!("{hash:?} device commit not yet ported (comp-poly ext3 leaves)")
+                }
             }
         }
         build_inner_tree_levels_for(hash, stream.as_ref(), be, &mut nodes_dev, num_leaves)?;

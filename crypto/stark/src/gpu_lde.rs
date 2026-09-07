@@ -40,27 +40,73 @@ use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut
 use crate::config::{Commitment, CommitmentHash, DeviceTreeBackend};
 use crate::domain::Domain;
 use crate::fri::fri_commitment::FriLayer;
+use crate::fri::fri_decommit::FriDecommitment;
+use crate::trace::LDETraceTable;
+
+/// The `math_cuda` dispatch key for a commitment hash.
+///
+/// Total over [`CommitmentHash`], so a variant added there without a
+/// [`math_cuda::DeviceHash`] twin fails to compile HERE, naming the gap, rather
+/// than at whatever `match` first meets it. Every tree entry point below
+/// dispatches on the result, and `math-cuda` either has kernels for the key or
+/// aborts loudly at the first launch — a build must never quietly commit under
+/// a hash the configuration did not name (HASH-PINNING.md), so there is no
+/// byte-hash fallback anywhere on this path.
+const fn device_hash_for(hash: CommitmentHash) -> math_cuda::DeviceHash {
+    match hash {
+        CommitmentHash::Keccak256 => math_cuda::DeviceHash::Keccak256,
+        CommitmentHash::Blake3 => math_cuda::DeviceHash::Blake3,
+        CommitmentHash::Rpo256 => math_cuda::DeviceHash::Rpo256,
+        CommitmentHash::Rpx256 => math_cuda::DeviceHash::Rpx256,
+        CommitmentHash::Poseidon => math_cuda::DeviceHash::Poseidon,
+    }
+}
+
+/// The inverse of [`device_hash_for`] — total over [`math_cuda::DeviceHash`],
+/// so a device key no commitment hash names fails to compile here too.
+const fn commitment_hash_for(hash: math_cuda::DeviceHash) -> CommitmentHash {
+    match hash {
+        math_cuda::DeviceHash::Keccak256 => CommitmentHash::Keccak256,
+        math_cuda::DeviceHash::Blake3 => CommitmentHash::Blake3,
+        math_cuda::DeviceHash::Rpo256 => CommitmentHash::Rpo256,
+        math_cuda::DeviceHash::Rpx256 => CommitmentHash::Rpx256,
+        math_cuda::DeviceHash::Poseidon => CommitmentHash::Poseidon,
+    }
+}
+
+/// ★ Every [`CommitmentHash`] variant has exactly one [`math_cuda::DeviceHash`]
+/// twin, and the pairing is not crossed.
+///
+/// The two `match`es above being total already proves each side maps
+/// somewhere; this proves the two maps are inverse to each other, which is what
+/// rules out a mis-paired arm (`Rpx256 => DeviceHash::Rpo256`) — the one
+/// editing error that would hand a tree a name its kernels do not deserve once
+/// the algebraic kernels exist. A sixth variant fails `device_hash_for` first
+/// and is added to this list with its arm. Discriminants are compared because
+/// `PartialEq` is not `const`.
+const _: () = {
+    const ALL: [CommitmentHash; 5] = [
+        CommitmentHash::Keccak256,
+        CommitmentHash::Blake3,
+        CommitmentHash::Rpo256,
+        CommitmentHash::Rpx256,
+        CommitmentHash::Poseidon,
+    ];
+    let mut i = 0;
+    while i < ALL.len() {
+        let back = commitment_hash_for(device_hash_for(ALL[i]));
+        assert!(
+            back as u8 == ALL[i] as u8,
+            "a CommitmentHash must round-trip through its DeviceHash twin"
+        );
+        i += 1;
+    }
+};
 
 /// The `math_cuda` dispatch key for `B`'s hash.
 fn device_hash_of<B: DeviceTreeBackend>() -> math_cuda::DeviceHash {
-    match B::COMMITMENT_HASH {
-        CommitmentHash::Keccak256 => math_cuda::DeviceHash::Keccak256,
-        CommitmentHash::Blake3 => math_cuda::DeviceHash::Blake3,
-        // The algebraic hashes have no device kernels yet. Loud by design: a
-        // build must never quietly commit under a hash the configuration did
-        // not name (HASH-PINNING.md), so there is no byte-hash fallback here.
-        // The per-table redo's dispatch lane replaces this arm with real
-        // `DeviceHash` variants once the kernels exist.
-        CommitmentHash::Rpo256 | CommitmentHash::Rpx256 | CommitmentHash::Poseidon => {
-            unimplemented!(
-                "{:?}: device Merkle commits are keccak/BLAKE3-only until the algebraic kernels land",
-                B::COMMITMENT_HASH
-            )
-        }
-    }
+    device_hash_for(B::COMMITMENT_HASH)
 }
-use crate::fri::fri_decommit::FriDecommitment;
-use crate::trace::LDETraceTable;
 
 /// Break-even LDE size. For LDE sizes smaller than this, the CPU
 /// `coset_lde_full_expand` completes in a few hundred microseconds and the
@@ -1376,6 +1422,12 @@ where
         math_cuda::DeviceHash::Blake3 => {
             math_cuda::blake3::build_comp_poly_tree_from_evals_ext3_keep(&raw_parts)
         }
+        math_cuda::DeviceHash::Rpo256
+        | math_cuda::DeviceHash::Rpx256
+        | math_cuda::DeviceHash::Poseidon => unimplemented!(
+            "{:?} device commit not yet ported (comp-poly tree from ext3 evals)",
+            B::COMMITMENT_HASH
+        ),
     } {
         Ok(t) => t,
         Err(_) => return None,
@@ -1418,6 +1470,12 @@ where
             handle.buf.as_ref(),
             handle.m,
             handle.lde_size,
+        ),
+        math_cuda::DeviceHash::Rpo256
+        | math_cuda::DeviceHash::Rpx256
+        | math_cuda::DeviceHash::Poseidon => unimplemented!(
+            "{:?} device commit not yet ported (comp-poly tree from resident slabs)",
+            B::COMMITMENT_HASH
         ),
     }
     .ok()?;
