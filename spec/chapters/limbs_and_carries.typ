@@ -185,7 +185,7 @@ Combining both upper bounds, we now find that
 Given $alpha in [L]$ and $mu in [L/2]$ where at least one of the two is non-zero, 
 then for all $i <= 2n$:
 $
-c_i <= max(&max_(j in [n]) mu (i+1) (L-1) + alpha - mu - delta,\
+c_i <= max(&max_(j in [n]) mu (j+1) (L-1) + alpha - mu - delta,\
   &max_(k in [n]) mu (n-k-1)(L-2) + mu (n-k) - delta')
 $
 And maximizing over both possibilities yields
