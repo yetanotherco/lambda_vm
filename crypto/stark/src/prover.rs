@@ -1090,16 +1090,21 @@ pub trait IsStarkProver<
         //  - The composition path needs a uniform zerofier with ≥1 group. An
         //    empty constraint set makes `all(end_exemptions == 0)` vacuously
         //    true here but `is_uniform()` false downstream (0 groups).
-        //  - The device-resident R2 path exists only for the d=2 quotient
-        //    decomposition, checked below once `n` is in hand.
+        //  - Device-only is entered only for the d=2 quotient decomposition,
+        //    checked below once `n` is in hand. A d=1 table also has a device R2
+        //    path, but the gate below excludes it, so it stays device-additive.
         if !air.has_aux_trace() || air.constraints_meta().is_empty() {
             return false;
         }
         let n = domain.interpolation_domain_size;
-        // The device-resident R2 path only exists for the d=2 quotient
-        // decomposition; any other part count skips it entirely and needs the
-        // host evaluator, which device-only would leave without data until the
-        // R2 downgrade recovered it.
+        // Only the d=2 quotient decomposition has a device-resident R2 path that
+        // can serve every downstream consumer from the handle alone. A d=1 table
+        // does have a device R2 path, but it always drains its single part to host
+        // (the query-0 composition canary reads it), so it gains nothing from
+        // dropping the host trace and this gate keeps it device-additive. Any other
+        // part count has no device R2 path at all and needs the host evaluator,
+        // which device-only would leave without data until the R2 downgrade
+        // recovered it.
         if air.composition_poly_degree_bound(n) / n != 2 {
             return false;
         }
@@ -1538,6 +1543,54 @@ pub trait IsStarkProver<
         }
     }
 
+    /// Decompose the resident composition `H` into device-resident parts per the
+    /// AIR's part count: the trivial d=1 de-interleave (`H` is the single part on
+    /// the LDE coset) or the d=2 quotient split H₀/H₁. Both keep the parts
+    /// device-resident — the commit tree and the R4 openings read `handle.m`, while
+    /// R3 and R4 DEEP read the host part Vec's length (see
+    /// [`crate::gpu_lde::try_comp_h_to_slabs_dev`] for the invariant that ties the
+    /// two together). `None` → the caller falls back to the host path. Shared by the
+    /// R2 producer and the `xcheck` mirror so the two cannot drift. `want_host` gates
+    /// the d=2 host drain only — d=1 tables are never device-only, so they always
+    /// keep their host part.
+    #[cfg(feature = "cuda")]
+    fn decompose_comp_h_dev(
+        number_of_parts: usize,
+        h_dev: &math_cuda::constraint_interp::GpuCompH,
+        domain: &Domain<Field>,
+        twiddles: &LdeTwiddles<Field>,
+        want_host: bool,
+    ) -> Option<(
+        Vec<Vec<FieldElement<FieldExtension>>>,
+        math_cuda::lde::GpuLdeExt3,
+    )> {
+        if number_of_parts == 1 {
+            // d=1 is never device-only (`device_only_for`'s degree gate admits only
+            // d=2), so the single part is always kept on host — `want_host` must
+            // hold, and the d=1 helper ignores it by design.
+            debug_assert!(
+                want_host,
+                "d=1 composition parts are never device-only; want_host must hold"
+            );
+            // The d=1 helper trusts `h_dev.num_rows` as the LDE size; the d=2 arm
+            // gets an incidental domain check via `weights.len() == n`. Pin the
+            // same invariant here so a domain/`H` size mismatch can't slip through.
+            debug_assert_eq!(
+                h_dev.num_rows,
+                domain.interpolation_domain_size * domain.blowup_factor,
+                "d=1 H row count must equal the LDE domain size"
+            );
+            crate::gpu_lde::try_comp_h_to_slabs_dev::<Field, FieldExtension>(h_dev)
+        } else {
+            crate::gpu_lde::try_decompose_extend_d2_dev::<Field, FieldExtension>(
+                h_dev,
+                twiddles.inv_2x(domain),
+                &twiddles.composition(domain).weights,
+                want_host,
+            )
+        }
+    }
+
     /// Algebraically decompose H(x) = H₀(x²) + x·H₁(x²) on the LDE coset, then
     /// extend each half to the full LDE domain. This replaces the expensive
     /// iFFT(2N) + break_in_parts + FFT(2N)×2 pipeline with:
@@ -1671,7 +1724,8 @@ pub trait IsStarkProver<
         #[cfg(feature = "cuda")]
         let mut downloaded_h: Option<Vec<FieldElement<FieldExtension>>> = None;
         #[cfg(feature = "cuda")]
-        if number_of_parts == 2 && !crate::gpu_lde::gpu_force_downgrade() {
+        if (number_of_parts == 1 || number_of_parts == 2) && !crate::gpu_lde::gpu_force_downgrade()
+        {
             // Serializing this window across tables (device constraint eval +
             // decompose, where H is born) empirically eliminates a transient
             // whole-buffer H corruption seen under concurrent R2 windows on
@@ -1690,11 +1744,15 @@ pub trait IsStarkProver<
                 boundary_coefficients,
                 &round_1_result.rap_challenges,
             ) {
-                match crate::gpu_lde::try_decompose_extend_d2_dev::<Field, FieldExtension>(
+                let want_host = !round_1_result.lde_trace.host_trace_empty();
+                // num_parts==1 de-interleaves `H` (the single part); num_parts==2
+                // runs the degree-2 quotient split. Both keep the parts resident.
+                match Self::decompose_comp_h_dev(
+                    number_of_parts,
                     &h_dev,
-                    twiddles.inv_2x(domain),
-                    &twiddles.composition(domain).weights,
-                    !round_1_result.lde_trace.host_trace_empty(),
+                    domain,
+                    twiddles,
+                    want_host,
                 ) {
                     Some((parts, handle)) => {
                         gpu_composition_parts = Some(handle);
@@ -1709,7 +1767,13 @@ pub trait IsStarkProver<
         }
         #[cfg(feature = "cuda")]
         if let Some(h) = downloaded_h.take() {
-            precomputed_parts = Some(Self::decompose_and_extend_d2(&h, domain, twiddles));
+            // num_parts==1: the downloaded `H` IS the single part (no host
+            // decompose); num_parts==2: run the host degree-2 split + extend.
+            precomputed_parts = Some(if number_of_parts == 1 {
+                vec![h]
+            } else {
+                Self::decompose_and_extend_d2(&h, domain, twiddles)
+            });
         }
         #[cfg(not(feature = "cuda"))]
         let precomputed_parts: Option<Vec<Vec<FieldElement<FieldExtension>>>> = None;
@@ -4194,7 +4258,14 @@ pub trait IsStarkProver<
             boundary_coefficients,
             &round_1_result.rap_challenges,
         );
-        let host_parts = Self::decompose_and_extend_d2(&host_h, domain, twiddles);
+        // num_parts==1: `H` IS the single part (no host decompose); num_parts==2:
+        // the degree-2 split. Mirrors the R2 producer so the compare is apples-to-apples.
+        let number_of_parts = air.composition_poly_degree_bound(trace_length) / trace_length;
+        let host_parts = if number_of_parts == 1 {
+            vec![host_h]
+        } else {
+            Self::decompose_and_extend_d2(&host_h, domain, twiddles)
+        };
         let device_parts: Option<Vec<Vec<FieldElement<FieldExtension>>>> = if round_2_result
             .lde_composition_poly_evaluations
             .first()
@@ -4267,13 +4338,8 @@ pub trait IsStarkProver<
                 &round_1_result.rap_challenges,
             )
             .and_then(|h_dev| {
-                crate::gpu_lde::try_decompose_extend_d2_dev::<Field, FieldExtension>(
-                    &h_dev,
-                    twiddles.inv_2x(domain),
-                    &twiddles.composition(domain).weights,
-                    true,
-                )
-                .map(|(parts, _handle)| parts)
+                Self::decompose_comp_h_dev(number_of_parts, &h_dev, domain, twiddles, true)
+                    .map(|(parts, _handle)| parts)
             });
         let rerun_verdict = match &rerun {
             None => "device rerun declined".to_string(),

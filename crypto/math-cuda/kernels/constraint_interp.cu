@@ -495,3 +495,21 @@ extern "C" __global__ void decompose_d2_ext3(
         out[5 * slab_stride + i] = h1.c;
     }
 }
+
+// ============================================================================
+// Degree-1 (num_parts==1) composition part: H IS the single part, already on
+// the LDE coset, so there is no decompose and no re-extension. Only de-interleave
+// the resident ext3 composition evals `h` (num_rows rows, interleaved
+// `h[row*3 + k]`) into the 3-slab layout the commit / DEEP / FRI consumers
+// expect (`out[k*num_rows + row]`).
+extern "C" __global__ void comp_h_to_slabs_ext3(
+    const uint64_t *__restrict__ h,
+    uint64_t num_rows,
+    uint64_t *__restrict__ out) {
+    for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; i < num_rows;
+         i += (uint64_t)gridDim.x * blockDim.x) {
+        out[0 * num_rows + i] = h[i * 3];
+        out[1 * num_rows + i] = h[i * 3 + 1];
+        out[2 * num_rows + i] = h[i * 3 + 2];
+    }
+}
