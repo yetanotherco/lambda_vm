@@ -5,6 +5,12 @@
 //! launch overhead dominates. Produces the same natural-order, non-canonical
 //! LDE evaluations as the CPU path.
 //!
+//! Admission is bytes-aware and the device path, once admitted, is the ONLY
+//! path: see the "Bytes-aware admission" section. A table the device admits
+//! proves on the device or the prove aborts with a diagnostic; host RAM is a
+//! cache, not a compute path, and the one way back to a host commit is the
+//! test-only switch [`TEST_ONLY_HOST_FALLBACK_ENV`].
+//!
 //! The tree-building entries here are generic over a Merkle backend `B` that
 //! they never call: the leaf and parent hashing happens in the `math-cuda`
 //! kernels, and `B` only types the host `MerkleTree` the root is wrapped in.
@@ -154,6 +160,10 @@ fn gpu_lde_threshold() -> usize {
 /// nothing to fall back to and aborts regardless of the host LDE. Lowering
 /// the commit threshold therefore widens that one abort site even though it
 /// leaves this envelope alone.
+///
+/// Inside the envelope the contract is stricter still: a device-only table's
+/// host recovery is refused in production ([`refuse_host_recovery`]), so a
+/// runtime decline there is an abort with a diagnostic, never a slow prove.
 const DEFAULT_DEVICE_ONLY_MIN_LDE: usize = 1 << 19;
 
 fn gpu_device_only_threshold() -> usize {
@@ -166,8 +176,394 @@ fn gpu_device_only_threshold() -> usize {
     })
 }
 
+// ============================================================================
+// Bytes-aware admission — the ONE predicate every dispatch site consults
+// ============================================================================
+//
+// Two rules decide whether a dispatch may ask the device for anything, and
+// both live here so no site carries a private copy of either:
+//
+// - the row FLOOR (`gpu_lde_threshold`): below it the host path is the faster
+//   one — launch overhead dominates — and taking it is policy, not a fallback;
+// - the bytes CEILING (the card's admission budget): what the site is about to
+//   allocate must fit the card. Width enters here and only here: a `2^21 × 449`
+//   table clears the floor at any width, and used to sail into an allocation
+//   failure that quietly became a host commit.
+//
+// What happens past admission is the other half of the contract. Host RAM is a
+// cache, not a compute path: a table the device ADMITS proves on the device or
+// the prove stops, loudly, with the shape, the bytes and the live VRAM in the
+// message ([`abort_or_test_fallback`]). The only way back to a host commit is
+// the test-only switch [`TEST_ONLY_HOST_FALLBACK_ENV`].
+//
+// LOCKSTEP: [`admit`] is a pure function of `(lde_size, bytes)` and two
+// process constants (the floor, the card's budget). R1 sizes its commit and
+// asks; every handle-bearing site re-derives admission later from the same
+// `lde_size` and its own, smaller, transient, and gets the same answer. Live
+// free memory is deliberately NOT an input: it would let a table admitted at
+// R1 be declined at R4, which for a device-only table is an abort with the
+// work already done. FRI re-derives at width 1 (one ext3 column); the ceiling
+// is an upper bound, so a narrow transient always clears it — a cells FLOOR
+// would degenerate there, which is why the floor stays a row count.
+
+/// Bytes per Goldilocks element on device.
+const BASE_BYTES: u64 = 8;
+
+/// Bytes per ext3 element on device — three adjacent base columns.
+const EXT3_BYTES: u64 = 3 * BASE_BYTES;
+
+/// Bytes of one Merkle node. Every commitment hash the device dispatches on
+/// emits a 32-byte digest — a four-felt Goldilocks digest is exactly 32
+/// canonical bytes — so the node buffer costs the same under every hash.
+const MERKLE_NODE_BYTES: u64 = 32;
+
+/// Cap on the in-place transpose's device scratch, mirrored from
+/// `math_cuda::lde::INPLACE_TRANSPOSE_SCRATCH_BYTES` (private there). The
+/// admission wants a bound, not the block geometry.
+const INPLACE_TRANSPOSE_SCRATCH_CAP_BYTES: u64 = 256 << 20;
+
+/// The device working set one fused row-major commit allocates, term by term
+/// (`math_cuda::lde::coset_lde_row_major_inner` after the in-place transpose
+/// of #956): ONE LDE buffer, the optional trace-domain snapshot, the full
+/// Merkle node buffer, and the small scratch (coset weights plus the capped
+/// transpose scratch). `one_lde_buffer::vram_arm` prints the same three big
+/// terms; the model here is the model it measures.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommitDeviceSet {
+    /// `lde_size · base_cols · 8`: the row-major LDE, transposed in place.
+    pub lde_bytes: u64,
+    /// `n · base_cols · 8`: the pre-NTT column-major snapshot the LogUp
+    /// fingerprint kernel reads in place (main commits only).
+    pub snapshot_bytes: u64,
+    /// `(2 · leaves − 1) · 32` with `leaves = lde_size / 2`: one full row-pair
+    /// tree. The preprocessed split path builds two, sequentially on one
+    /// stream — the precomputed tree is downloaded and freed before the
+    /// multiplicity tree is allocated — so one is the peak there too.
+    pub tree_bytes: u64,
+    /// Coset weights (`n · 8`) plus the transpose scratch cap.
+    pub scratch_bytes: u64,
+}
+
+impl CommitDeviceSet {
+    pub const fn total(&self) -> u64 {
+        self.lde_bytes
+            .saturating_add(self.snapshot_bytes)
+            .saturating_add(self.tree_bytes)
+            .saturating_add(self.scratch_bytes)
+    }
+}
+
+/// `(2 · leaves − 1) · 32` for the row-pair tree over `lde_size` rows.
+pub const fn full_tree_bytes(lde_size: u64) -> u64 {
+    lde_size.saturating_sub(1).saturating_mul(MERKLE_NODE_BYTES)
+}
+
+/// Bytes of `cols` ext3 columns over `rows` rows.
+pub const fn ext3_bytes(rows: u64, cols: u64) -> u64 {
+    rows.saturating_mul(cols).saturating_mul(EXT3_BYTES)
+}
+
+/// Size one fused commit's device set. `base_cols` counts BASE-FIELD columns:
+/// `m` for a base table, `3m` for an ext3 one (the ext3 row-major layout is
+/// three adjacent base columns per element). `snapshot` is whether the
+/// trace-domain column-major snapshot is retained (the main commits do, the
+/// aux commits do not).
+pub fn commit_device_set(
+    n: usize,
+    base_cols: usize,
+    blowup: usize,
+    snapshot: bool,
+) -> CommitDeviceSet {
+    let n = n as u64;
+    let cols = base_cols as u64;
+    let lde = n.saturating_mul(blowup as u64);
+    CommitDeviceSet {
+        lde_bytes: lde.saturating_mul(cols).saturating_mul(BASE_BYTES),
+        snapshot_bytes: if snapshot {
+            n.saturating_mul(cols).saturating_mul(BASE_BYTES)
+        } else {
+            0
+        },
+        tree_bytes: full_tree_bytes(lde),
+        scratch_bytes: n
+            .saturating_mul(BASE_BYTES)
+            .saturating_add(INPLACE_TRANSPOSE_SCRATCH_CAP_BYTES),
+    }
+}
+
+/// What the admission predicate decided for one dispatch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Admission {
+    /// No CUDA backend — no GPU, or cubins that would not load. The host path
+    /// is the only one; `math_cuda::device::backend` already warned once. A
+    /// GPU-less host is not the production pipeline, so this is not an abort.
+    NoDevice,
+    /// Below the launch-overhead floor: the host path is the faster one.
+    BelowFloor { lde_size: usize, floor: usize },
+    /// Fits the card's admission budget.
+    Admitted { bytes: u64, budget: u64 },
+    /// Does not fit the card even alone.
+    OverBudget { bytes: u64, budget: u64 },
+}
+
+impl Admission {
+    pub const fn is_admitted(&self) -> bool {
+        matches!(self, Admission::Admitted { .. })
+    }
+}
+
+/// The pure predicate, floor and budget supplied. The row floor is checked
+/// first — a table below it never asks the device for anything, whatever its
+/// width — then the bytes ceiling.
+pub const fn admit_bytes(lde_size: usize, bytes: u64, floor: usize, budget: u64) -> Admission {
+    if lde_size < floor {
+        return Admission::BelowFloor { lde_size, floor };
+    }
+    if bytes > budget {
+        return Admission::OverBudget { bytes, budget };
+    }
+    Admission::Admitted { bytes, budget }
+}
+
+/// The process predicate: `gpu_lde_threshold()` as the floor and the card's
+/// admission budget ([`device_vram_budget_bytes`]: 80% of device memory, or
+/// `LAMBDA_VM_VRAM_BUDGET_MB`) as the ceiling. Both are fixed for the life of
+/// the process, so the same `(lde_size, bytes)` gets the same answer at R1 and
+/// at every later re-derivation.
+pub(crate) fn admit(lde_size: usize, bytes: u64) -> Admission {
+    match device_vram_budget_bytes() {
+        None => Admission::NoDevice,
+        Some(budget) => admit_bytes(lde_size, bytes, gpu_lde_threshold(), budget),
+    }
+}
+
+/// One dispatch's identity for the diagnostics: which device stage, and the
+/// shape it was sized for. The table's NAME is not known at this layer; the
+/// prover's driver re-raises the panic payload with the message intact, and
+/// its own `[gpu]` lines name the table.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DispatchShape {
+    pub what: &'static str,
+    pub n: usize,
+    pub base_cols: usize,
+    pub blowup: usize,
+}
+
+/// Why a stage that must run on the device could not.
+#[derive(Debug)]
+pub(crate) enum DevicePathFailure {
+    OverBudget { bytes: u64, budget: u64 },
+    DeviceError(String),
+}
+
+fn gib(bytes: u64) -> f64 {
+    bytes as f64 / (1u64 << 30) as f64
+}
+
+/// Live `free / total` device memory for the diagnostics — the one place the
+/// live number is read; admission itself never looks at it (LOCKSTEP).
+fn live_vram_line() -> String {
+    match math_cuda::device::backend()
+        .ok()
+        .and_then(|be| be.device_mem_info())
+    {
+        Some((free, total)) => format!(
+            "live VRAM free {:.2} GiB of {:.2} GiB",
+            gib(free),
+            gib(total)
+        ),
+        None => "live VRAM unavailable".to_string(),
+    }
+}
+
+fn mempool_line() -> String {
+    match math_cuda::device::mempool_release_threshold_bytes() {
+        u64::MAX => "mempool retains freed blocks (release threshold unset)".to_string(),
+        t => format!("mempool release threshold {} MiB", t >> 20),
+    }
+}
+
+/// The diagnostic every abort and every test-only fallback prints: the stage
+/// and shape, the device set term by term, the admission budget, the live
+/// free/total VRAM and the mempool posture.
+fn device_path_diagnostic(
+    shape: &DispatchShape,
+    set: Option<&CommitDeviceSet>,
+    failure: &DevicePathFailure,
+) -> String {
+    let DispatchShape {
+        what,
+        n,
+        base_cols,
+        blowup,
+    } = shape;
+    let reason = match failure {
+        DevicePathFailure::OverBudget { bytes, budget } => format!(
+            "over the VRAM admission budget: needs {bytes} B ({:.2} GiB), budget {budget} B ({:.2} GiB)",
+            gib(*bytes),
+            gib(*budget)
+        ),
+        DevicePathFailure::DeviceError(e) => format!("device error after admission: {e}"),
+    };
+    let set_line = match set {
+        Some(s) => format!(
+            "; device set LDE {:.2} GiB + snapshot {:.2} GiB + tree {:.3} GiB + scratch {:.3} GiB = {:.2} GiB",
+            gib(s.lde_bytes),
+            gib(s.snapshot_bytes),
+            gib(s.tree_bytes),
+            gib(s.scratch_bytes),
+            gib(s.total())
+        ),
+        None => String::new(),
+    };
+    format!(
+        "{what}: rows {n} x {base_cols} base cols @ blowup {blowup} (LDE {}); {reason}{set_line}; {}; {}",
+        n.saturating_mul(*blowup),
+        live_vram_line(),
+        mempool_line()
+    )
+}
+
+/// The test-only switch that turns the loud abort back into the old host
+/// commit. Named so it cannot be read as a production knob; a banner is
+/// printed when it is honoured. Production runs never set it.
+pub const TEST_ONLY_HOST_FALLBACK_ENV: &str = "LAMBDA_VM_TEST_ONLY_HOST_FALLBACK";
+
+/// Whether a device failure may fall back to host compute in this process.
+/// `true` under [`TEST_ONLY_HOST_FALLBACK_ENV`], under the
+/// [`gpu_force_downgrade`] test hook (whose whole purpose is to exercise the
+/// host recovery), and in a `test-cuda-faults` build (the fault-injection
+/// suite asserts on the recoveries). None of the three is a production
+/// configuration; the banner says so once.
+pub(crate) fn test_only_host_fallback() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        let by_env = std::env::var(TEST_ONLY_HOST_FALLBACK_ENV).is_ok_and(|v| v != "0");
+        let by_hook = gpu_force_downgrade();
+        let by_feature = cfg!(feature = "test-cuda-faults");
+        let on = by_env || by_hook || by_feature;
+        if on {
+            let why = if by_env {
+                TEST_ONLY_HOST_FALLBACK_ENV
+            } else if by_hook {
+                "LAMBDA_VM_GPU_FORCE_DOWNGRADE"
+            } else {
+                "feature test-cuda-faults"
+            };
+            eprintln!(
+                "[gpu] TEST-ONLY host fallback ENABLED ({why}): a device failure falls back to \
+                 host compute instead of aborting the prove. Never a production configuration."
+            );
+        }
+        on
+    })
+}
+
+/// Refuse the host path — or take it under the test-only switch.
+///
+/// Returns only when [`test_only_host_fallback`] is set, after printing the
+/// diagnostic tagged TEST-ONLY; the caller then returns `None` and its host
+/// arm runs. Otherwise panics with the diagnostic: the prover's driver threads
+/// catch and re-raise it on the calling thread (`run_admitted`), so the prove
+/// stops with the reason instead of finishing hours later on the CPU.
+pub(crate) fn abort_or_test_fallback(
+    shape: &DispatchShape,
+    set: Option<&CommitDeviceSet>,
+    failure: DevicePathFailure,
+) {
+    let msg = device_path_diagnostic(shape, set, &failure);
+    if test_only_host_fallback() {
+        eprintln!("[gpu] TEST-ONLY host fallback: {msg}");
+        return;
+    }
+    panic!("[gpu] ABORT: the device path is the production path and it is unavailable — {msg}");
+}
+
+/// R1 commit admission: `None` when the device is absent or the table is
+/// below the floor (the host commit is the right one), `Some(())` when
+/// admitted. Over budget is an abort — or, under the test-only switch, a
+/// reported host commit.
+fn admit_commit(lde_size: usize, shape: &DispatchShape, set: &CommitDeviceSet) -> Option<()> {
+    match admit(lde_size, set.total()) {
+        Admission::NoDevice | Admission::BelowFloor { .. } => None,
+        Admission::Admitted { .. } => Some(()),
+        Admission::OverBudget { bytes, budget } => {
+            abort_or_test_fallback(
+                shape,
+                Some(set),
+                DevicePathFailure::OverBudget { bytes, budget },
+            );
+            None
+        }
+    }
+}
+
+/// [`admit_commit`] for an input that is ALREADY resident on device (the
+/// LogUp aux build's `ResidentAux`): no row floor — the data is there, and a
+/// decline would not be "take the faster host path" but "download it to
+/// commit on the host" — only the bytes ceiling.
+fn admit_resident_commit(shape: &DispatchShape, set: &CommitDeviceSet) -> Option<()> {
+    let budget = device_vram_budget_bytes()?;
+    match admit_bytes(usize::MAX, set.total(), 0, budget) {
+        Admission::OverBudget { bytes, budget } => {
+            abort_or_test_fallback(
+                shape,
+                Some(set),
+                DevicePathFailure::OverBudget { bytes, budget },
+            );
+            None
+        }
+        _ => Some(()),
+    }
+}
+
+/// Admission for the R2–R4 transients (parts LDE, trees, DEEP, FRI, the
+/// inverted denominators): `true` when admitted. A decline is the caller's
+/// documented host arm; over budget is reported so it is never a silent one.
+/// Whether that arm may run at all is decided downstream, where a device-only
+/// table's recovery goes through [`refuse_host_recovery`].
+fn admit_transient(lde_size: usize, bytes: u64, what: &str) -> bool {
+    match admit(lde_size, bytes) {
+        Admission::Admitted { .. } => true,
+        Admission::NoDevice | Admission::BelowFloor { .. } => false,
+        Admission::OverBudget { bytes, budget } => {
+            eprintln!(
+                "[gpu] {what} declined at LDE {lde_size}: over the VRAM admission budget \
+                 (needs {bytes} B = {:.2} GiB, budget {budget} B = {:.2} GiB); the host arm runs",
+                gib(bytes),
+                gib(budget)
+            );
+            false
+        }
+    }
+}
+
+/// The gate on every "download the resident data and continue on the host"
+/// recovery of a device-only table. In production that recovery IS the
+/// failure to report: it aborts here with the shape and the live VRAM. Under
+/// the test-only switch it prints the same line tagged TEST-ONLY and returns,
+/// and the recovery proceeds.
+fn refuse_host_recovery(what: &str, rows: usize, main_cols: usize, aux_cols: usize) {
+    let msg = format!(
+        "{what}: rows {rows} main cols {main_cols} aux cols {aux_cols}; {}; {}",
+        live_vram_line(),
+        mempool_line()
+    );
+    if test_only_host_fallback() {
+        eprintln!("[gpu] TEST-ONLY host recovery: {msg}");
+        return;
+    }
+    panic!(
+        "[gpu] ABORT: a device-only table would continue on the HOST (host RAM is a cache, \
+         not a compute path) — {msg}"
+    );
+}
+
 /// Test hook: decline the device R2 path unconditionally so device-only
 /// tables exercise the [`materialize_lde_trace_host`] recovery end to end.
+/// Setting it also enables the test-only host fallback
+/// ([`test_only_host_fallback`]) — the recovery it exists to exercise would
+/// otherwise abort.
 pub(crate) fn gpu_force_downgrade() -> bool {
     static CACHED: OnceLock<bool> = OnceLock::new();
     *CACHED.get_or_init(|| std::env::var("LAMBDA_VM_GPU_FORCE_DOWNGRADE").is_ok_and(|v| v != "0"))
@@ -361,15 +757,15 @@ pub(crate) fn device_only_disabled() -> bool {
 /// requires.
 ///
 /// If a precondition is nonetheless violated at runtime (mis-gate or
-/// transient GPU error), what happens depends on the round. R2 and the R1
-/// resident-aux commit recover: they download what the host arms need (the
-/// resident LDEs at R2, the resident aux trace plus the main LDE at R1), bump
-/// their site's counter ([`GPU_DEVICE_ONLY_DOWNGRADES`] at R2,
-/// [`GPU_RESIDENT_AUX_DOWNGRADES`] at R1) and continue host-backed — slower,
-/// never wrong — aborting only when the resident handles cannot serve the
-/// data. R3 and R4 have no such recovery: the R3 barycentric arms assert on
-/// the buffer they are about to read and the R4 guards on `host_trace_empty`,
-/// both failing loudly rather than reading an empty host trace.
+/// transient GPU error), the table's recovery reaches
+/// [`refuse_host_recovery`]: in production that is a loud abort with the shape
+/// and the live VRAM — host RAM is a cache, not a compute path. Under the
+/// test-only fallback ([`test_only_host_fallback`]) R2 and the R1 resident-aux
+/// commit download what the host arms need (the resident LDEs at R2, the
+/// resident aux trace plus the main LDE at R1), bump their site's counter
+/// ([`GPU_DEVICE_ONLY_DOWNGRADES`] at R2, [`GPU_RESIDENT_AUX_DOWNGRADES`] at
+/// R1) and continue host-backed; R3 and R4 have no host recovery of their own
+/// and assert on the buffer they are about to read.
 ///
 /// `zerofier_uniform` must be the R1-derived conservative form (all constraints
 /// share `end_exemptions == 0`), which implies `ZerofierEvaluations::is_uniform`
@@ -454,7 +850,11 @@ where
     }
     let n = columns[0].len();
     let lde_size = n.saturating_mul(blowup_factor);
-    if lde_size < gpu_lde_threshold() {
+    // One fresh LDE output per column on device.
+    let bytes = (lde_size as u64)
+        .saturating_mul(columns.len() as u64)
+        .saturating_mul(BASE_BYTES);
+    if !admit(lde_size, bytes).is_admitted() {
         return LayoutDispatch::Skip;
     }
     if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
@@ -482,7 +882,8 @@ where
     }
     let n = columns[0].len();
     let lde_size = n.saturating_mul(blowup_factor);
-    if lde_size < gpu_lde_threshold() {
+    // One fresh ext3 LDE output per column on device.
+    if !admit(lde_size, ext3_bytes(lde_size as u64, columns.len() as u64)).is_admitted() {
         return LayoutDispatch::Skip;
     }
     if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
@@ -699,13 +1100,15 @@ where
     let n = h0.len();
     let blowup = 2; // extend_half_to_lde extends N → 2N always
     let lde_size = n * blowup;
-    if lde_size < gpu_lde_threshold() {
-        return None;
-    }
     if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
         return None;
     }
     if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
+        return None;
+    }
+    // Two ext3 inputs staged and two ext3 LDE outputs allocated on device.
+    let bytes = ext3_bytes(lde_size as u64, 2).saturating_add(ext3_bytes(n as u64, 2));
+    if !admit_transient(lde_size, bytes, "R2 extend-halves") {
         return None;
     }
     GPU_EXTEND_HALVES_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -766,10 +1169,11 @@ where
 }
 
 /// Shared admission gate for the device composition-parts producers: the tower
-/// must be the Goldilocks/ext3 pair the kernels are written for, and the LDE must
-/// be a power of two at or above the commit threshold. Returns the validated LDE
-/// size so callers can derive from it. Kept in one place so a future condition
-/// (a VRAM check, a tower widening) cannot land on only one of the d=1/d=2 arms.
+/// must be the Goldilocks/ext3 pair the kernels are written for, the LDE must
+/// be a power of two, and the two ext3 part slabs the decompose allocates must
+/// clear [`admit`]. Returns the validated LDE size so callers can derive from
+/// it. Kept in one place so a future condition (a tower widening) cannot land
+/// on only one of the d=1/d=2 arms.
 fn dev_comp_parts_gate<F, E>(num_rows: usize) -> Option<usize>
 where
     F: IsField + 'static,
@@ -781,7 +1185,10 @@ where
     if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
         return None;
     }
-    if num_rows < gpu_lde_threshold() || !num_rows.is_power_of_two() {
+    if !num_rows.is_power_of_two() {
+        return None;
+    }
+    if !admit_transient(num_rows, ext3_bytes(num_rows as u64, 2), "R2 decompose") {
         return None;
     }
     Some(num_rows)
@@ -954,10 +1361,6 @@ where
     E: IsField + 'static,
     B: DeviceTreeBackend,
 {
-    let lde_size = n.saturating_mul(blowup_factor);
-    if lde_size < gpu_lde_threshold() {
-        return None;
-    }
     if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
         return None;
     }
@@ -967,6 +1370,15 @@ where
     if row_major.len() != n * m || m == 0 || n == 0 {
         return None;
     }
+    let lde_size = n.saturating_mul(blowup_factor);
+    let shape = DispatchShape {
+        what: "R1 main commit",
+        n,
+        base_cols: m,
+        blowup: blowup_factor,
+    };
+    let set = commit_device_set(n, m, blowup_factor, true);
+    admit_commit(lde_size, &shape, &set)?;
 
     let raw: &[u64] = unsafe { from_raw_parts(row_major.as_ptr() as *const u64, n * m) };
     let weights_u64 = unsafe { weights_to_u64::<F>(weights) };
@@ -977,7 +1389,8 @@ where
 
     // The keep path keeps the Merkle tree resident on device (in `handle.tree`).
     // `retain_host_lde=false` additionally skips the row-major D2H (device-only).
-    let (handle, lde_u64) = math_cuda::lde::coset_lde_row_major_with_merkle_tree_keep(
+    // Admitted means the device path is the only path: a failure here aborts.
+    let (handle, lde_u64) = match math_cuda::lde::coset_lde_row_major_with_merkle_tree_keep(
         raw,
         predev,
         device_hash_of::<B>(),
@@ -986,8 +1399,17 @@ where
         blowup_factor,
         &weights_u64,
         retain_host_lde,
-    )
-    .ok()?;
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            abort_or_test_fallback(
+                &shape,
+                Some(&set),
+                DevicePathFailure::DeviceError(format!("{e:?}")),
+            );
+            return None;
+        }
+    };
 
     // Transmute Vec<u64> → Vec<FieldElement<E>> (zero-copy, E == GoldilocksField).
     let lde_out: Vec<FieldElement<E>> = unsafe {
@@ -1062,10 +1484,6 @@ where
     E: IsField + 'static,
     B: DeviceTreeBackend,
 {
-    let lde_size = n.saturating_mul(blowup_factor);
-    if lde_size < gpu_lde_threshold() {
-        return None;
-    }
     if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
         return None;
     }
@@ -1078,6 +1496,15 @@ where
     if split_col == 0 || split_col >= m {
         return None;
     }
+    let lde_size = n.saturating_mul(blowup_factor);
+    let shape = DispatchShape {
+        what: "R1 main commit (preprocessed split)",
+        n,
+        base_cols: m,
+        blowup: blowup_factor,
+    };
+    let set = commit_device_set(n, m, blowup_factor, true);
+    admit_commit(lde_size, &shape, &set)?;
 
     let raw: &[u64] = unsafe { from_raw_parts(row_major.as_ptr() as *const u64, n * m) };
     let weights_u64 = unsafe { weights_to_u64::<F>(weights) };
@@ -1086,7 +1513,8 @@ where
     GPU_LEAF_HASH_CALLS.fetch_add(1 + build_precomputed as u64, Ordering::Relaxed);
     GPU_MERKLE_TREE_CALLS.fetch_add(1 + build_precomputed as u64, Ordering::Relaxed);
 
-    let (pre_nodes, handle, lde_u64) = math_cuda::lde::coset_lde_row_major_split_trees(
+    // Admitted means the device path is the only path: a failure here aborts.
+    let (pre_nodes, handle, lde_u64) = match math_cuda::lde::coset_lde_row_major_split_trees(
         raw,
         predev,
         device_hash_of::<B>(),
@@ -1097,8 +1525,17 @@ where
         split_col,
         build_precomputed,
         want_host,
-    )
-    .ok()?;
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            abort_or_test_fallback(
+                &shape,
+                Some(&set),
+                DevicePathFailure::DeviceError(format!("{e:?}")),
+            );
+            return None;
+        }
+    };
 
     let pre_tree = match pre_nodes {
         Some(nodes) => Some(tree_from_node_bytes::<B>(nodes)?),
@@ -1147,10 +1584,6 @@ where
     E: IsField + 'static,
     B: DeviceTreeBackend,
 {
-    let lde_size = n.saturating_mul(blowup_factor);
-    if lde_size < gpu_lde_threshold() {
-        return None;
-    }
     if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
         return None;
     }
@@ -1160,9 +1593,18 @@ where
     if row_major.len() != n * m || m == 0 || n == 0 {
         return None;
     }
-
     // Fp3 = [u64; 3] in memory — reinterpret as flat u64 slice (m3 = m*3).
     let m3 = m * 3;
+    let lde_size = n.saturating_mul(blowup_factor);
+    let shape = DispatchShape {
+        what: "R1 aux commit",
+        n,
+        base_cols: m3,
+        blowup: blowup_factor,
+    };
+    let set = commit_device_set(n, m3, blowup_factor, false);
+    admit_commit(lde_size, &shape, &set)?;
+
     let raw: &[u64] = unsafe { from_raw_parts(row_major.as_ptr() as *const u64, n * m3) };
     let weights_u64 = unsafe { weights_to_u64::<F>(weights) };
 
@@ -1172,7 +1614,8 @@ where
 
     // The keep path keeps the Merkle tree resident on device (in `handle.tree`).
     // `retain_host_lde=false` additionally skips the row-major D2H (device-only).
-    let (handle, lde_u64) = math_cuda::lde::coset_lde_ext3_row_major_with_merkle_tree_keep(
+    // Admitted means the device path is the only path: a failure here aborts.
+    let (handle, lde_u64) = match math_cuda::lde::coset_lde_ext3_row_major_with_merkle_tree_keep(
         raw,
         device_hash_of::<B>(),
         n,
@@ -1180,8 +1623,17 @@ where
         blowup_factor,
         &weights_u64,
         retain_host_lde,
-    )
-    .ok()?;
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            abort_or_test_fallback(
+                &shape,
+                Some(&set),
+                DevicePathFailure::DeviceError(format!("{e:?}")),
+            );
+            return None;
+        }
+    };
 
     // Transmute Vec<u64> → Vec<FieldElement<E>> (zero-copy, E == Fp3 = [u64;3]).
     let lde_out: Vec<FieldElement<E>> = unsafe {
@@ -1391,10 +1843,14 @@ where
     if !lde_size.is_power_of_two() || lde_size < 2 {
         return None;
     }
-    if lde_size < gpu_lde_threshold() {
+    if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
         return None;
     }
-    if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
+    // The parts are re-uploaded (`m` ext3 columns over the LDE) and one full
+    // row-pair tree is built.
+    let bytes = ext3_bytes(lde_size as u64, lde_parts.len() as u64)
+        .saturating_add(full_tree_bytes(lde_size as u64));
+    if !admit_transient(lde_size, bytes, "R2 composition tree") {
         return None;
     }
     // All parts must have the same LDE length.
@@ -1451,8 +1907,15 @@ where
     if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
         return None;
     }
-    if handle.m == 0 || !handle.lde_size.is_power_of_two() || handle.lde_size < gpu_lde_threshold()
-    {
+    if handle.m == 0 || !handle.lde_size.is_power_of_two() {
+        return None;
+    }
+    // Only the tree is fresh: the parts are already resident.
+    if !admit_transient(
+        handle.lde_size,
+        full_tree_bytes(handle.lde_size as u64),
+        "R2 composition tree (resident parts)",
+    ) {
         return None;
     }
     let be = math_cuda::device::backend().ok()?;
@@ -1856,14 +2319,14 @@ pub(crate) static GPU_BATCH_INVERT_CALLS: AtomicU64 = AtomicU64::new(0);
 /// ([`materialize_lde_trace_host`], the sole function that bumps this —
 /// entered from the R2 host evaluator, the R3 barycentric arms and the R4
 /// DEEP host loop). Nonzero means the device-only gate cleared a table whose
-/// downstream dispatch then declined at runtime — the table continued
-/// host-backed, correct but slower. A count is either a gate miss (a static
-/// condition worth mirroring into the gate) or a transient device decline
-/// (VRAM pressure), which by definition cannot be gated out — see
-/// [`materialize_lde_trace_host`]'s own note. The R1 resident-aux downgrade
-/// is counted by [`GPU_RESIDENT_AUX_DOWNGRADES`] instead: it fires on tables
-/// the gate never marked device-only, so summing the two would blame the gate
-/// for declines it never made.
+/// downstream dispatch then declined at runtime. Only reachable under the
+/// test-only host fallback ([`test_only_host_fallback`]): in production the
+/// recovery aborts instead. A count is either a gate miss (a static condition
+/// worth mirroring into the gate) or a transient device decline (VRAM
+/// pressure), which by definition cannot be gated out. The R1 resident-aux
+/// downgrade is counted by [`GPU_RESIDENT_AUX_DOWNGRADES`] instead: it fires
+/// on tables the gate never marked device-only, so summing the two would
+/// blame the gate for declines it never made.
 pub(crate) static GPU_DEVICE_ONLY_DOWNGRADES: AtomicU64 = AtomicU64::new(0);
 pub fn gpu_device_only_downgrades() -> u64 {
     GPU_DEVICE_ONLY_DOWNGRADES.load(Ordering::Relaxed)
@@ -1872,7 +2335,8 @@ pub fn gpu_device_only_downgrades() -> u64 {
 /// R1 downgrades, and only those: times the resident aux trace was downloaded
 /// so the aux commit could continue on the host arms, after the device aux LDE
 /// declined and the drain-and-retry either did not run or declined again
-/// ([`materialize_aux_trace_host`], the sole site that bumps this). Independent
+/// ([`materialize_aux_trace_host`], the sole site that bumps this — and, like
+/// every host recovery, only under the test-only fallback). Independent
 /// of the device-only gate — the site is entered whenever `aux_resident()` is
 /// set, whatever the gate said — so a table that was never device-only can land
 /// here, and a nonzero value points at sustained VRAM pressure rather than a
@@ -1910,14 +2374,18 @@ pub fn gpu_resident_aux_retries() -> u64 {
 /// and aux LDEs from their device handles into the host buffers and clear the
 /// device-only flag. A side whose host buffer is already populated (a mixed
 /// state: one commit fell back to CPU while the other stayed device-only) is
-/// kept as is — only the missing side is downloaded. The class-level safety
-/// net under the device-only gate — a static predicate can never mirror every
-/// reason a dynamic dispatch might decline (kernel eligibility, transient
-/// errors, shapes a new workload brings), so any miss lands here and degrades
-/// to a slower-but-correct CPU round instead of a hard abort. Returns false
-/// (→ the caller's abort) when the resident handles cannot serve the data: a
-/// missing handle or bound stream, a handle whose shape disagrees with the
-/// trace, a failed download or sync, or a field tower with no CUDA lowering.
+/// kept as is — only the missing side is downloaded.
+///
+/// In production this recovery does not run: host RAM is a cache, not a
+/// compute path, so a device-only table whose downstream dispatch declined is
+/// a failure to report, and [`refuse_host_recovery`] aborts here with the
+/// shape and the live VRAM. Under the test-only switch
+/// ([`test_only_host_fallback`]) the download proceeds and the table continues
+/// on the host arms — the fault-injection suites assert on exactly that.
+/// Returns false (→ the caller's abort) when the resident handles cannot serve
+/// the data: a missing handle or bound stream, a handle whose shape disagrees
+/// with the trace, a failed download or sync, or a field tower with no CUDA
+/// lowering.
 pub(crate) fn materialize_lde_trace_host<F, E>(
     lde_trace: &mut crate::trace::LDETraceTable<F, E>,
 ) -> bool
@@ -1928,6 +2396,12 @@ where
     if !lde_trace.host_trace_empty() {
         return true;
     }
+    refuse_host_recovery(
+        "R2/R3/R4 host arm on a device-only trace",
+        lde_trace.num_rows(),
+        lde_trace.num_main_cols(),
+        lde_trace.num_aux_cols(),
+    );
     if !is_goldilocks_ext3_tower::<F, E>() {
         return false;
     }
@@ -2087,7 +2561,9 @@ where
 /// R1 counterpart of [`materialize_lde_trace_host`]: download the resident
 /// aux trace (already row-major ext3, matching the host layout) into the
 /// trace's aux table, so the aux commit continues on the host arms when the
-/// device aux LDE declines at runtime.
+/// device aux LDE declined at runtime — twice, the caller having drained the
+/// device and retried in between. Refused in production on the same terms as
+/// its R2 counterpart ([`refuse_host_recovery`]).
 pub(crate) fn materialize_aux_trace_host<F, E>(trace: &mut crate::trace::TraceTable<F, E>) -> bool
 where
     F: IsField + IsSubFieldOf<E> + 'static,
@@ -2100,6 +2576,13 @@ where
         Some(ra) => (ra.buf.clone(), ra.num_rows, ra.num_aux_cols),
         None => return false,
     };
+    refuse_host_recovery(
+        "R1 aux commit on the host from the resident aux trace (device aux LDE declined after \
+         the drain-and-retry)",
+        rows,
+        trace.num_main_columns,
+        cols,
+    );
     let Ok(be) = math_cuda::device::backend() else {
         return false;
     };
@@ -2260,6 +2743,12 @@ where
     let Some(h) = lde_trace.gpu_composition_parts() else {
         return false;
     };
+    refuse_host_recovery(
+        "host consumer of the composition parts on a device-only table",
+        h.lde_size,
+        lde_trace.num_main_cols(),
+        lde_trace.num_aux_cols(),
+    );
     let Some(stream) = lde_trace.bound_stream() else {
         return false;
     };
@@ -2379,9 +2868,6 @@ where
         return None;
     }
     let lde_size = domain_size.checked_mul(blowup_factor)?;
-    if lde_size < gpu_lde_threshold() {
-        return None;
-    }
     if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
         return None;
     }
@@ -2389,6 +2875,12 @@ where
         return None;
     }
     let m = parts_coefs.len();
+    // `m` ext3 coefficient inputs staged and `m` ext3 LDE parts kept resident.
+    let bytes = ext3_bytes(lde_size as u64, m as u64)
+        .saturating_add(ext3_bytes(domain_size as u64, m as u64));
+    if !admit_transient(lde_size, bytes, "R2 parts LDE") {
+        return None;
+    }
 
     let mut weights_u64 = Vec::with_capacity(domain_size);
     let mut w = FieldElement::<F>::one();
@@ -2476,6 +2968,16 @@ where
     {
         return None;
     }
+    // No row floor: the aux trace is already on device. Only the bytes
+    // ceiling — a resident input that will not fit its own LDE is an abort.
+    let shape = DispatchShape {
+        what: "R1 aux commit (resident)",
+        n: ra.num_rows,
+        base_cols: ra.num_aux_cols * 3,
+        blowup: blowup_factor,
+    };
+    let set = commit_device_set(ra.num_rows, ra.num_aux_cols * 3, blowup_factor, false);
+    admit_resident_commit(&shape, &set)?;
     let weights_u64 = unsafe { weights_to_u64::<F>(weights) };
 
     GPU_LDE_CALLS.fetch_add((ra.num_aux_cols * 3) as u64, Ordering::Relaxed);
@@ -2492,8 +2994,10 @@ where
         retain_host_lde,
     )
     .inspect_err(|e| {
-        // Surface the swallowed driver error (e.g. OOM): the caller drains
-        // the device and retries, then downgrades the table to the host path.
+        // Surface the swallowed driver error (e.g. OOM): the caller drains the
+        // device and retries — a device-side recovery, which is why this is a
+        // decline and not an abort. If the retry declines too, the caller's
+        // host downgrade is refused by `materialize_aux_trace_host`.
         eprintln!(
             "[gpu] resident aux LDE failed (rows={} cols={} blowup={}): {e:?}",
             ra.num_rows, ra.num_aux_cols, blowup_factor
@@ -2578,9 +3082,6 @@ where
     }
     let main = lde_trace.gpu_main()?;
     let lde_size = main.lde_size;
-    if lde_size < gpu_lde_threshold() {
-        return None;
-    }
     if !lde_size.is_power_of_two() {
         return None;
     }
@@ -2590,6 +3091,12 @@ where
     let num_total_cols = num_main + num_aux;
     let num_parts = composition_poly_gammas.len();
     if h_ood.len() != num_parts {
+        return None;
+    }
+    // The DEEP codeword, plus — on the host arms — the parts and the inverted
+    // denominators staged onto the device (an upper bound over the three arms).
+    let bytes = ext3_bytes(lde_size as u64, (2 + num_parts + num_eval_points) as u64);
+    if !admit_transient(lde_size, bytes, "R4 DEEP") {
         return None;
     }
     if trace_ood_columns.len() != num_total_cols
@@ -2784,7 +3291,15 @@ where
     }
     let main = lde_trace.gpu_main()?;
     let lde_size = main.lde_size;
-    if lde_size < gpu_lde_threshold() || !lde_size.is_power_of_two() {
+    if !lde_size.is_power_of_two() {
+        return None;
+    }
+    // Everything is resident but the DEEP codeword itself.
+    if !admit_transient(
+        lde_size,
+        ext3_bytes(lde_size as u64, 1),
+        "R4 DEEP (resident)",
+    ) {
         return None;
     }
     let num_main = main.m;
@@ -2878,7 +3393,9 @@ where
         return None;
     }
     let total = n.checked_mul(k_scalars)?;
-    if total < gpu_lde_threshold() {
+    // The inverted denominators (`total` ext3) plus the coset points.
+    let bytes = ext3_bytes(total as u64, 1).saturating_add((n as u64).saturating_mul(BASE_BYTES));
+    if !admit_transient(total, bytes, "batch invert") {
         return None;
     }
 
@@ -3080,7 +3597,9 @@ where
         return None;
     }
     let total = n.checked_mul(k_scalars)?;
-    if total < gpu_lde_threshold() {
+    // The inverted denominators (`total` ext3) plus the coset points.
+    let bytes = ext3_bytes(total as u64, 1).saturating_add((n as u64).saturating_mul(BASE_BYTES));
+    if !admit_transient(total, bytes, "R3 context") {
         return None;
     }
 
@@ -3160,7 +3679,10 @@ where
     if n0 != domain_size || !n0.is_power_of_two() || n0 < 2 {
         return None;
     }
-    if n0 < gpu_lde_threshold() {
+    // The evals upload, the geometric layer chain (bounded by one more
+    // codeword) and the layer trees (bounded by one full tree).
+    let bytes = ext3_bytes(n0 as u64, 2).saturating_add(full_tree_bytes(n0 as u64));
+    if !admit_transient(n0, bytes, "R4 FRI commit") {
         return None;
     }
     // Mismatched twiddles would panic inside `FriCommitState::new`; gate here
@@ -3232,7 +3754,12 @@ where
         return None;
     }
     let n0 = codeword.n;
-    if !n0.is_power_of_two() || n0 < 2 || n0 < gpu_lde_threshold() {
+    if !n0.is_power_of_two() || n0 < 2 {
+        return None;
+    }
+    // The layer chain and its trees; the codeword is already resident.
+    let bytes = ext3_bytes(n0 as u64, 1).saturating_add(full_tree_bytes(n0 as u64));
+    if !admit_transient(n0, bytes, "R4 FRI commit (resident)") {
         return None;
     }
     // Mismatched twiddles would panic inside `FriCommitState::new_dev`;
@@ -3495,6 +4022,157 @@ where
         })
         .collect();
     Some(decommits)
+}
+
+/// The admission arithmetic, with the floor and the budget supplied: no
+/// device, no backend, pure numbers.
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+
+    const GIB: u64 = 1 << 30;
+    /// `detect_vram_budget_bytes` on a 32 GiB card: 80% of the total.
+    const CARD_32_GIB_BUDGET: u64 = 32 * GIB / 5 * 4;
+    const FLOOR: usize = DEFAULT_GPU_LDE_THRESHOLD;
+
+    /// The brief's synthetic over-budget table: 2^22 rows x 612 columns at
+    /// blowup 2. Its LDE alone is 38.25 GiB; with the snapshot and the tree the
+    /// commit's device set is 57.6 GiB against a 25.6 GiB budget.
+    #[test]
+    fn the_brief_shape_is_over_budget() {
+        let n = 1usize << 22;
+        let set = commit_device_set(n, 612, 2, true);
+        assert_eq!(set.lde_bytes, (n as u64) * 2 * 612 * 8);
+        assert_eq!(set.snapshot_bytes, (n as u64) * 612 * 8);
+        assert_eq!(set.tree_bytes, ((n as u64) * 2 - 1) * 32);
+        assert!(set.lde_bytes > 38 * GIB && set.lde_bytes < 39 * GIB);
+        assert!(set.total() > 57 * GIB && set.total() < 58 * GIB);
+        assert!(matches!(
+            admit_bytes(n * 2, set.total(), FLOOR, CARD_32_GIB_BUDGET),
+            Admission::OverBudget { .. }
+        ));
+    }
+
+    /// LFM_HASH under RPO — 2^21 rows x (436 value + 13 preprocessed) columns —
+    /// fits the card at blowup 2 with one LDE buffer (the point of #956) and
+    /// does not at blowup 4. The GPU-SEAMS arithmetic, at the committed width.
+    #[test]
+    fn lfm_hash_rpo_fits_at_blowup_2_and_not_at_4() {
+        let n = 1usize << 21;
+        let b2 = commit_device_set(n, 449, 2, true);
+        assert!(b2.total() > 21 * GIB && b2.total() < 22 * GIB, "{b2:?}");
+        assert!(admit_bytes(n * 2, b2.total(), FLOOR, CARD_32_GIB_BUDGET).is_admitted());
+        let b4 = commit_device_set(n, 449, 4, true);
+        assert!(b4.total() > 35 * GIB && b4.total() < 36 * GIB, "{b4:?}");
+        assert!(matches!(
+            admit_bytes(n * 4, b4.total(), FLOOR, CARD_32_GIB_BUDGET),
+            Admission::OverBudget { .. }
+        ));
+    }
+
+    /// The aux commit has no snapshot; its ext3 columns count as three base
+    /// columns each.
+    #[test]
+    fn aux_sets_have_no_snapshot() {
+        let set = commit_device_set(1 << 20, 3 * 3, 2, false);
+        assert_eq!(set.snapshot_bytes, 0);
+        assert_eq!(set.lde_bytes, ext3_bytes(1 << 21, 3));
+    }
+
+    /// The row floor is checked before the ceiling: a tiny table with an
+    /// absurd byte count is "too small", never "over budget" — it will not ask
+    /// the device for anything.
+    #[test]
+    fn the_floor_is_checked_before_the_budget() {
+        assert!(matches!(
+            admit_bytes(1 << 13, u64::MAX, FLOOR, CARD_32_GIB_BUDGET),
+            Admission::BelowFloor { .. }
+        ));
+        assert!(matches!(
+            admit_bytes(FLOOR, u64::MAX, FLOOR, CARD_32_GIB_BUDGET),
+            Admission::OverBudget { .. }
+        ));
+    }
+
+    /// FRI re-derives admission at width 1: a narrow transient over a large
+    /// domain always clears the ceiling. The floor stays a row count, so it
+    /// does not degenerate there either.
+    #[test]
+    fn fri_at_width_one_never_degenerates() {
+        let n0 = 1usize << 24;
+        let bytes = ext3_bytes(n0 as u64, 1) + full_tree_bytes(n0 as u64);
+        assert!(admit_bytes(n0, bytes, FLOOR, CARD_32_GIB_BUDGET).is_admitted());
+    }
+
+    /// A budget of `u64::MAX` (query failed) makes the ceiling inert — the
+    /// floor alone decides, which is the pre-admission behaviour.
+    #[test]
+    fn an_unbounded_budget_is_inert() {
+        assert!(admit_bytes(1 << 20, u64::MAX - 1, FLOOR, u64::MAX).is_admitted());
+    }
+
+    /// The table's committed width is what the model takes: the row floor is
+    /// width-blind on purpose, the ceiling is not.
+    #[test]
+    fn width_moves_the_ceiling_not_the_floor() {
+        let n = 1usize << 21;
+        let narrow = commit_device_set(n, 4, 2, true);
+        let wide = commit_device_set(n, 612, 2, true);
+        assert!(admit_bytes(n * 2, narrow.total(), FLOOR, CARD_32_GIB_BUDGET).is_admitted());
+        assert!(matches!(
+            admit_bytes(n * 2, wide.total(), FLOOR, CARD_32_GIB_BUDGET),
+            Admission::OverBudget { .. }
+        ));
+    }
+}
+
+/// The abort itself, on a real device. `LAMBDA_VM_VRAM_BUDGET_MB` is read once
+/// at backend init, so this test runs in its own process with the budget
+/// lowered to 1 GiB — the shape is then over budget on any card while its host
+/// input stays at 1.2 GiB:
+///
+/// ```text
+/// LAMBDA_VM_VRAM_BUDGET_MB=1024 cargo test -p stark --release --features cuda \
+///     --lib gpu_lde::admission_box_tests -- --ignored --nocapture
+/// ```
+#[cfg(all(test, feature = "cuda"))]
+mod admission_box_tests {
+    use super::*;
+    use crate::config::BatchedMerkleTreeBackend;
+
+    type F = GoldilocksField;
+    type Fp = FieldElement<F>;
+
+    /// 2^18 rows x 612 columns at blowup 2: a 2.4 GiB LDE, 3.7 GiB device set
+    /// against the 1 GiB budget the command line sets. Must abort with the
+    /// over-budget diagnostic, never commit on the host.
+    #[test]
+    #[ignore = "requires GPU and LAMBDA_VM_VRAM_BUDGET_MB=1024 in its own process"]
+    #[should_panic(expected = "over the VRAM admission budget")]
+    fn an_over_budget_commit_aborts_instead_of_committing_on_the_host() {
+        let n: usize = 1 << 18;
+        let m: usize = 612;
+        let blowup: usize = 2;
+        let budget = device_vram_budget_bytes().expect("cuda backend");
+        assert!(
+            budget <= 2 << 30,
+            "this test needs LAMBDA_VM_VRAM_BUDGET_MB=1024 set before the backend initialises \
+             (budget is {budget} B)"
+        );
+        let data: Vec<Fp> = (0..n * m).map(|i| Fp::from(i as u64)).collect();
+        let weights: Vec<Fp> = (0..n).map(|i| Fp::from(i as u64 + 1)).collect();
+        let committed = try_expand_leaf_and_tree_row_major_keep::<F, F, BatchedMerkleTreeBackend<F>>(
+            &data, None, n, m, blowup, &weights, true,
+        );
+        panic!(
+            "the over-budget commit returned {} instead of aborting",
+            if committed.is_some() {
+                "a device handle"
+            } else {
+                "None (a silent host commit)"
+            }
+        );
+    }
 }
 
 /// GPU↔CPU parity for the preprocessed split-tree commit path. Requires the
