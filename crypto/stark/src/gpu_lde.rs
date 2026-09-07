@@ -1878,9 +1878,10 @@ where
         math_cuda::DeviceHash::Blake3 => {
             math_cuda::blake3::build_comp_poly_tree_from_evals_ext3_keep(&raw_parts)
         }
-        math_cuda::DeviceHash::Rpo256
-        | math_cuda::DeviceHash::Rpx256
-        | math_cuda::DeviceHash::Poseidon => unimplemented!(
+        math_cuda::DeviceHash::Rpx256 => {
+            math_cuda::rpx::build_comp_poly_tree_from_evals_ext3_keep(&raw_parts)
+        }
+        math_cuda::DeviceHash::Rpo256 | math_cuda::DeviceHash::Poseidon => unimplemented!(
             "{:?} device commit not yet ported (comp-poly tree from ext3 evals)",
             B::COMMITMENT_HASH
         ),
@@ -1934,9 +1935,13 @@ where
             handle.m,
             handle.lde_size,
         ),
-        math_cuda::DeviceHash::Rpo256
-        | math_cuda::DeviceHash::Rpx256
-        | math_cuda::DeviceHash::Poseidon => unimplemented!(
+        math_cuda::DeviceHash::Rpx256 => math_cuda::rpx::build_comp_poly_tree_from_slabs_dev(
+            &stream,
+            handle.buf.as_ref(),
+            handle.m,
+            handle.lde_size,
+        ),
+        math_cuda::DeviceHash::Rpo256 | math_cuda::DeviceHash::Poseidon => unimplemented!(
             "{:?} device commit not yet ported (comp-poly tree from resident slabs)",
             B::COMMITMENT_HASH
         ),
