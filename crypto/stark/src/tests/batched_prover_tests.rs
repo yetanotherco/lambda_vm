@@ -413,7 +413,10 @@ fn streaming_prover_trace_residency_is_flat_in_the_table_count() {
 /// tables, five phases that read a trace LDE — the commit, constraint
 /// evaluation, the OOD evaluations, the DEEP codeword and the query openings —
 /// and no barrier between them can be removed, so `RecomputeLde` pays one
-/// forward NTT per table per phase.
+/// forward NTT per table per phase. Phase 4 (OOD) device-recomputes the full
+/// LDE and reads it via the GPU barycentric fast path (its trace OOD stays on
+/// device — no host size-n coset eval, no D2H download), so it too is a full
+/// expansion: five per table, not four plus a cheap coset materialization.
 #[test_log::test]
 fn the_recompute_budget_is_five_expansions_per_table() {
     let options = folding_options();
@@ -423,21 +426,21 @@ fn the_recompute_budget_is_five_expansions_per_table() {
     let tables = 6;
     assert_eq!(
         recompute.main_lde_expansions,
-        4 * tables,
-        "main LDE: one FULL expansion per table per phase that reads the whole \
-         LDE — phase 4 reads only the stride subsample and materializes the \
-         size-n coset evaluation instead"
+        5 * tables,
+        "main LDE: one FULL expansion per table per phase — phase 4 (OOD) now \
+         device-recomputes the LDE and reads the resident handle via the GPU \
+         barycentric fast path (no host size-n coset eval, no D2H download)"
     );
     assert_eq!(
         recompute.aux_lde_expansions,
-        4 * tables,
-        "aux LDE: every table in this fixture has a RAP, so the same four phases"
+        5 * tables,
+        "aux LDE: every table in this fixture has a RAP, so the same five phases"
     );
     assert_eq!(
-        recompute.main_coset_evals, tables,
-        "phase 4's cheap materialization, once per table"
+        recompute.main_coset_evals, 0,
+        "phase 4 no longer host-coset-evals under RecomputeLde — it device-recomputes"
     );
-    assert_eq!(recompute.aux_coset_evals, tables, "and its aux side");
+    assert_eq!(recompute.aux_coset_evals, 0, "and its aux side");
     assert_eq!(
         retain.main_lde_expansions, tables,
         "retaining pays the floor: one expansion per table"
