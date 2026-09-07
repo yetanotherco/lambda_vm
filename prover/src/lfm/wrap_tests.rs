@@ -422,12 +422,17 @@ fn the_wrap_proves_and_verifies() {
 ///
 /// # The pin, NAMED rather than implied
 ///
-/// `epoch_tests::epoch_program` builds at [`WrapHash::production()`]. Under an
-/// ALGEBRAIC pin that lowers the emitter's Merkle work to `Instr::Hash` and
-/// consults the `LFM_HASH` socket, so `HASH-PINNING.md`'s classification rule
-/// puts this site in the class that must be proved under
-/// [`crate::hash_pin::BLOCK_HASHER`] — which it names twice over, through
-/// `build_artifacts_with_hasher` for the artifacts and
+/// The classification rule, stated here rather than cited — the document that
+/// carries it lands with the RPX pin and does not exist on this branch:
+///
+/// > A program built at `WrapHash::production()` emits `Instr::Hash` and must
+/// > be proved under `BLOCK_HASHER`. A program that pins a byte hash on its own
+/// > builder emits none, never consults the socket, and is correct at the
+/// > registry's blessed default under every pin.
+///
+/// `epoch_tests::epoch_program` builds at [`WrapHash::production()`], so this
+/// site is in the first class and must name [`crate::hash_pin::BLOCK_HASHER`].
+/// It does, twice over: `build_artifacts_with_hasher` for the artifacts and
 /// `lfm_cell_counts_with_hasher` for the numbers, so neither the proof nor the
 /// census can be taken at `HasherKind::default()`.
 ///
@@ -489,15 +494,24 @@ fn the_fixture_epoch_wraps() {
 }
 
 /// [`the_fixture_epoch_wraps`]' body: build the inner epoch, emit the per-table
-/// assembled verifier, prove it under the pin, verify it, and run one tamper
-/// arm.
+/// assembled verifier, prove it under the pin, verify it, and run the two
+/// falsification arms.
+///
+/// **Two, and they are not one check twice.** A flipped root makes the wrap
+/// UNBUILDABLE and never reaches the verifier at all; a moved claimed word
+/// leaves the proof untouched and must be REJECTED by it. Only the second
+/// exercises `verify_against`'s reject path, so a gate carrying only the first
+/// would show that the machine will not lie without ever showing that the
+/// verifier catches a lie.
 ///
 /// Deliberately NOT [`wrap_run_from`], which is the MEASUREMENT harness: that
 /// one emits the program a second time (the spine, for the closed-form
-/// permutation check), walks the chip census and the row-cliff panel, and runs
-/// three falsification arms of which one re-enters `lfm_prove`. Every one of
-/// those earns its cost in a measurement run and none of them is what this gate
-/// claims, so the gate pays for none of them.
+/// permutation check) and walks the chip census and the row-cliff panel. Both
+/// earn their cost in a measurement run and neither is what this gate claims,
+/// so the gate pays for neither. Its third arm, the moved PROGRAM DIGEST, is
+/// the registry premise rather than this program's, and
+/// `machine_tests::verify_against_artifacts_agrees_with_the_registry_path`
+/// already holds it on a trivial program at a fraction of the cost.
 fn fixture_wrap_run(inner: ProofOptions, inputs: EpochInputs) {
     let t = Instant::now();
     let e = super::epoch_tests::real_epoch_from(inner.clone(), inputs);
@@ -666,6 +680,35 @@ fn fixture_wrap_run(inner: ProofOptions, inputs: EpochInputs) {
         }
         Ok(_) => panic!("a tampered main root must not produce a wrap proof"),
     }
+
+    // ---- ARM 2: the honest proof against a MOVED claimed statement must be
+    // REJECTED.
+    //
+    // The other half of the pair, and it is not redundant with arm 1 — the two
+    // exercise different machinery. Arm 1 never reaches the verifier at all: a
+    // false statement has no execution, so `verify_against`'s REJECT path is
+    // untouched by it, and a gate with only that arm would prove the machine
+    // refuses to lie without ever showing that the verifier catches one. This
+    // arm hands the verifier the REAL proof under a claim it does not answer;
+    // `absorb_lfm_statement` binds the proof to its published words, so it must
+    // reject. Costs one verify (~0.16s against a 9s test), which is why the
+    // batched twin carries it and why there was no case for leaving it out.
+    let mut moved = proved.public_words.clone();
+    moved[0].1[0] += FE::one();
+    assert!(
+        !verify_against(
+            &artifacts.roots,
+            &artifacts.program_id,
+            artifacts.keccak_rnd_chunks,
+            &proved.proof,
+            &moved,
+            &opts,
+            artifacts.hasher,
+            artifacts.chip_set,
+        ),
+        "a moved claimed public word must make the wrap proof UNVERIFIABLE"
+    );
+    println!("   MOVED claimed public word 0: the wrap proof is UNVERIFIABLE");
 }
 
 /// ★ SLICE 0's GPU-dispatch census (`thoughts/shared/gpu-recursion/EXPLORATION.md`,
