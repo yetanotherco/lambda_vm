@@ -84,7 +84,7 @@ fn config_items(code: &str) -> Vec<String> {
         if let Some(stripped) = rest.strip_prefix('{') {
             let end = stripped.find('}').unwrap_or(stripped.len());
             for part in stripped[..end].split(',') {
-                let name = part.trim().split_whitespace().next().unwrap_or("");
+                let name = part.split_whitespace().next().unwrap_or("");
                 if !name.is_empty() {
                     out.push(name.to_string());
                 }
