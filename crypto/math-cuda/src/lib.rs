@@ -9,7 +9,10 @@ pub mod barycentric;
 pub mod constraint_interp;
 pub mod deep;
 pub mod device;
+#[cfg(feature = "test-faults")]
+pub mod faults;
 pub mod fri;
+pub mod grinding;
 pub mod inverse;
 pub mod lde;
 pub mod logup;

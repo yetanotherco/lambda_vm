@@ -196,6 +196,7 @@ pub struct Backend {
     pub keccak256_leaves_base_batched: CudaFunction,
     pub keccak256_leaves_base_row_pair_batched: CudaFunction,
     pub keccak256_leaves_ext3_batched: CudaFunction,
+    pub grind_search: CudaFunction,
     pub keccak_comp_poly_leaves_ext3: CudaFunction,
     pub keccak_fri_leaves_ext3: CudaFunction,
     pub keccak_merkle_level: CudaFunction,
@@ -207,6 +208,9 @@ pub struct Backend {
     pub barycentric_ext3_batched: CudaFunction,
     pub barycentric_base_batched_strided: CudaFunction,
     pub barycentric_ext3_batched_strided: CudaFunction,
+    pub barycentric_base_strided_multi: CudaFunction,
+    pub barycentric_ext3_strided_multi: CudaFunction,
+    pub barycentric_combine_partials: CudaFunction,
     pub gather_rows_base: CudaFunction,
     pub gather_rows_ext3: CudaFunction,
 
@@ -239,6 +243,7 @@ pub struct Backend {
     pub constraint_interp_kernel: CudaFunction,
     pub constraint_composition_kernel: CudaFunction,
     pub decompose_d2_kernel: CudaFunction,
+    pub comp_h_to_slabs_kernel: CudaFunction,
 
     // Twiddle caches keyed by log_n.
     fwd_twiddles: Mutex<Vec<Option<Arc<CudaSlice<u64>>>>>,
@@ -427,6 +432,7 @@ impl Backend {
             keccak256_leaves_base_row_pair_batched: keccak
                 .load_function("keccak256_leaves_base_row_pair_batched")?,
             keccak256_leaves_ext3_batched: keccak.load_function("keccak256_leaves_ext3_batched")?,
+            grind_search: keccak.load_function("grind_search")?,
             keccak_comp_poly_leaves_ext3: keccak.load_function("keccak_comp_poly_leaves_ext3")?,
             keccak_fri_leaves_ext3: keccak.load_function("keccak_fri_leaves_ext3")?,
             keccak_merkle_level: keccak.load_function("keccak_merkle_level")?,
@@ -438,6 +444,9 @@ impl Backend {
                 .load_function("barycentric_base_batched_strided")?,
             barycentric_ext3_batched_strided: bary
                 .load_function("barycentric_ext3_batched_strided")?,
+            barycentric_base_strided_multi: bary.load_function("barycentric_base_strided_multi")?,
+            barycentric_ext3_strided_multi: bary.load_function("barycentric_ext3_strided_multi")?,
+            barycentric_combine_partials: bary.load_function("barycentric_combine_partials")?,
             gather_rows_base: bary.load_function("gather_rows_base")?,
             gather_rows_ext3: bary.load_function("gather_rows_ext3")?,
             deep_composition_ext3_row: deep.load_function("deep_composition_ext3_row")?,
@@ -466,6 +475,7 @@ impl Backend {
             constraint_composition_kernel: constraint_interp
                 .load_function("constraint_composition_kernel")?,
             decompose_d2_kernel: constraint_interp.load_function("decompose_d2_ext3")?,
+            comp_h_to_slabs_kernel: constraint_interp.load_function("comp_h_to_slabs_ext3")?,
             fwd_twiddles: Mutex::new(vec![None; max_log]),
             inv_twiddles: Mutex::new(vec![None; max_log]),
             ctx,

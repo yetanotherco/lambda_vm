@@ -666,19 +666,26 @@ fn coset_lde_row_major_inner(
 /// the whole tree copy to host is eliminated; query openings gather paths from
 /// the device tree.
 ///
-/// Input: `row_major` is a flat `n * m` slice in row-major order. Returns the
-/// `GpuLdeBase` handle (column-major buf, plus the device tree) and the
-/// row-major LDE Vec.
+/// Input: `row_major` is a flat `n * m` slice in row-major order; when
+/// `predev` carries the same data already on device (pre-uploaded off the
+/// critical path), the expansion D2D-copies from it instead of a fresh H2D.
+/// Returns the `GpuLdeBase` handle (column-major buf, plus the device tree)
+/// and the row-major LDE Vec.
 pub fn coset_lde_row_major_with_merkle_tree_keep(
     row_major: &[u64],
+    predev: Option<&CudaSlice<u64>>,
     n: usize,
     m: usize,
     blowup_factor: usize,
     weights: &[u64],
     retain_host_lde: bool,
 ) -> Result<(GpuLdeBase, Vec<u64>)> {
+    let input = match predev {
+        Some(d) if d.len() == row_major.len() => InnerInput::Dev(d),
+        _ => InnerInput::Host(row_major),
+    };
     let (tree, col_major_dev, lde_out, trace_col_major, ready) = coset_lde_row_major_inner(
-        InnerInput::Host(row_major),
+        input,
         n,
         m,
         blowup_factor,
@@ -715,14 +722,17 @@ pub fn coset_lde_row_major_with_merkle_tree_keep(
 /// Returns `(precomputed_nodes, handle, row_major_lde)`. The handle also
 /// carries the column-major LDE + trace snapshot for downstream GPU rounds.
 #[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
 pub fn coset_lde_row_major_split_trees(
     row_major: &[u64],
+    predev: Option<&CudaSlice<u64>>,
     n: usize,
     m: usize,
     blowup_factor: usize,
     weights: &[u64],
     split_col: usize,
     build_precomputed: bool,
+    retain_host_lde: bool,
 ) -> Result<(Option<Vec<u8>>, GpuLdeBase, Vec<u64>)> {
     assert!(split_col > 0 && split_col < m, "split inside the row");
     assert!(n.is_power_of_two(), "n must be a power of two");
@@ -744,16 +754,12 @@ pub fn coset_lde_row_major_split_trees(
     let be = backend()?;
     let stream = be.next_stream();
 
-    let (buf, trace_col_major) = expand_row_major_on_stream(
-        &stream,
-        be,
-        InnerInput::Host(row_major),
-        n,
-        m,
-        blowup_factor,
-        weights,
-        true,
-    )?;
+    let input = match predev {
+        Some(d) if d.len() == row_major.len() => InnerInput::Dev(d),
+        _ => InnerInput::Host(row_major),
+    };
+    let (buf, trace_col_major) =
+        expand_row_major_on_stream(&stream, be, input, n, m, blowup_factor, weights, true)?;
 
     // One subset tree per column range, built sequentially on the stream.
     let build_subset_tree_dev = |col_start: u64, col_end: u64| -> Result<CudaSlice<u8>> {
@@ -801,10 +807,13 @@ pub fn coset_lde_row_major_split_trees(
         }
     };
 
-    // D2H the row-major LDE (preprocessed tables always keep the host copy —
-    // they are excluded from the device-only gate).
-    let lde_pending =
-        crate::device::async_dtoh_via(&stream, be.pinned_staging(), &be.ctx, &buf, lde_size * m)?;
+    // D2H the row-major LDE only when the caller keeps a host copy; under
+    // device-only every downstream consumer reads the handle.
+    let lde_pending = retain_host_lde
+        .then(|| {
+            crate::device::async_dtoh_via(&stream, be.pinned_staging(), &be.ctx, &buf, lde_size * m)
+        })
+        .transpose()?;
 
     // Column-major handle for downstream GPU rounds (DEEP, barycentric,
     // constraint composition).
@@ -812,10 +821,13 @@ pub fn coset_lde_row_major_split_trees(
     let ready = be.take_event()?;
     ready.event().record(&stream)?;
 
-    let lde_out = {
-        let mut out = vec![0u64; lde_size * m];
-        lde_pending.wait_into_u64(&mut out)?;
-        out
+    let lde_out = match lde_pending {
+        Some(pending) => {
+            let mut out = vec![0u64; lde_size * m];
+            pending.wait_into_u64(&mut out)?;
+            out
+        }
+        None => Vec::new(),
     };
 
     let handle = GpuLdeBase {
