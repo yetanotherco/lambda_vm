@@ -1,8 +1,9 @@
 // RPX256 (Rescue-Prime eXtended / XHash12) over Goldilocks at width 12 on
 // device — the permutation, the rate-8 overwrite-duplex leaf sponge and the
-// Merkle parent. Phase 1 of the per-table GPU redo's lane K: arithmetic only.
-// The leaf/tree kernels that stream table rows through `rpx::Sponge` and
-// `rpx::compress` are phase 2 and follow `blake3.cu:338-620`'s shape.
+// Merkle parent (lane K phase 1, arithmetic), then the leaf/tree kernels that
+// stream table rows through `rpx::Sponge` and `rpx::compress` and the
+// permutation probe (phase 2, the `extern "C"` surface at the end of the
+// file, kernel for kernel the twin of `blake3.cu:338-620`).
 //
 // THE ORACLE is the Rust host implementation, byte for byte:
 //   `prover/src/lfm/rpx.rs`   `Rpx256::permute` (:280-316) — schedule FB E FB E FB E M,
@@ -19,7 +20,7 @@
 // PROVENANCE, layered exactly as the Rust module's own (rpx.rs "PROVENANCE"):
 // the FB round IS RPO's round with RPO's constants, and those are pinned by
 // nineteen EXTERNAL miden-crypto vectors, which `tests/host_kat/rpx_host_kat.cpp`
-// replays through `fb_round<R>` composed seven times. The E round (the cubic
+// replays through `fb_round(s, r)` composed seven times. The E round (the cubic
 // extension) and the schedule have no published vector anywhere; they are
 // pinned to the Rust oracle's output (`prover/tests/rpx_host_kat_vectors.rs`)
 // and, independently, to naive polynomial arithmetic in the harness.
@@ -62,6 +63,17 @@
 #include <cstdint>
 #include "goldilocks.cuh"
 #include "ext3.cuh"
+
+// `permute` is a REAL device function, never inlined (see its CODE SHAPE
+// note). The host shim has no `__noinline__`; on the host the attribute only
+// matters to the code-size probe, which asks for it explicitly.
+#if defined(__CUDACC__)
+#define RPX_NOINLINE __noinline__
+#elif defined(RPX_HOST_NOINLINE)
+#define RPX_NOINLINE __attribute__((noinline))
+#else
+#define RPX_NOINLINE
+#endif
 
 namespace rpx {
 
@@ -141,10 +153,13 @@ __device__ __constant__ uint64_t ARK2[NUM_ROUNDS][STATE_FELTS] = {
      16460604813734957368ull, 9643968136937729763ull, 3611348709641382851ull, 18256379591337759196ull},
 };
 
-// First ROW of the circulant MDS: `M[i][j] = MDS_CIRC_ROW[(j − i) mod 12]`
-// (rpo.rs:107-114). Stored 32-bit so each MDS term is one 32×32→64 MAC. The
-// row sums to 160, which is the bound `mds` rests on.
-__device__ __constant__ uint32_t MDS_CIRC_ROW[STATE_FELTS] = {7, 23, 8, 26, 13, 10, 9, 7, 6, 22, 21, 8};
+// First ROW of the circulant MDS, `M[i][j] = ROW[(j − i) mod 12]`
+// (rpo.rs:107-114), stored TWICE so that `MDS_CIRC_ROW2[j + 12 − i]` is the
+// entry with no modulo: the output-lane loop in `mds` is rolled, so `i` is a
+// runtime value there. 32-bit so each MDS term is one 32×32→64 MAC. The row
+// sums to 160, which is the bound `mds` rests on.
+__device__ __constant__ uint32_t MDS_CIRC_ROW2[2 * STATE_FELTS] = {
+    7, 23, 8, 26, 13, 10, 9, 7, 6, 22, 21, 8, 7, 23, 8, 26, 13, 10, 9, 7, 6, 22, 21, 8};
 
 // ---------------------------------------------------------------------------
 // Field-op forwarders. Under nvcc they are the `goldilocks.cuh` / `ext3.cuh`
@@ -209,12 +224,15 @@ __device__ __forceinline__ void mds(uint64_t s[STATE_FELTS]) {
         hi32[j] = (uint32_t)(s[j] >> 32);
     }
     uint64_t out[STATE_FELTS];
-#pragma unroll
+    // Rolled over output lanes: twelve iterations of twenty-four MACs, one
+    // twelfth of the unrolled body's code for the same instruction count.
+#pragma unroll 1
     for (int i = 0; i < STATE_FELTS; ++i) {
         uint64_t acc_lo = 0, acc_hi = 0;  // Σ c·l_j and Σ c·h_j, each < 2^40
+        const int rot = STATE_FELTS - i;   // MDS_CIRC_ROW2[j + rot] = ROW[(j − i) mod 12]
 #pragma unroll
         for (int j = 0; j < STATE_FELTS; ++j) {
-            const uint32_t c = MDS_CIRC_ROW[(j + STATE_FELTS - i) % STATE_FELTS];
+            const uint32_t c = MDS_CIRC_ROW2[j + rot];
             acc_lo += (uint64_t)c * (uint64_t)lo32[j];
             acc_hi += (uint64_t)c * (uint64_t)hi32[j];
         }
@@ -243,7 +261,9 @@ __device__ __forceinline__ uint64_t sbox(uint64_t x) {
 
 template <int N>
 __device__ __forceinline__ uint64_t square_n(uint64_t x) {
-#pragma unroll
+    // Rolled: the chain is serial anyway, and unrolled it is what made one
+    // permutation ~49k lines of PTX. The unroll factor here is a tuning knob.
+#pragma unroll 1
     for (int i = 0; i < N; ++i) x = fmul(x, x);
     return x;
 }
@@ -310,33 +330,35 @@ __device__ __forceinline__ CubicExt ext_power7(const CubicExt &a) {
 }
 
 // ---------------------------------------------------------------------------
-// Rounds. `R` is the round index into ARK1/ARK2 — a template parameter so the
-// constant-bank offsets fold at compile time.
+// Rounds. `r` is the round index into ARK1/ARK2 — a runtime value, so one copy
+// of each round body serves every round; the constant-bank address is
+// computed, which costs nothing next to the round's arithmetic. Every lane
+// loop is rolled for the same reason (see `permute`'s CODE SHAPE note).
 // ---------------------------------------------------------------------------
 
 // FB: `MDS → +ARK1 → x^7 → MDS → +ARK2 → x^{1/7}` — RPO's round exactly
 // (rpo.rs:561-582, rpx.rs:283-295). RPX runs it at R = 0, 2, 4; RPO at 0..7.
-template <int R>
-__device__ __forceinline__ void fb_round(uint64_t s[STATE_FELTS]) {
+__device__ __forceinline__ void fb_round(uint64_t s[STATE_FELTS], int r) {
     mds(s);
-#pragma unroll
-    for (int i = 0; i < STATE_FELTS; ++i) s[i] = fadd(s[i], ARK1[R][i]);
-#pragma unroll
+#pragma unroll 1
+    for (int i = 0; i < STATE_FELTS; ++i) s[i] = fadd(s[i], ARK1[r][i]);
+#pragma unroll 1
     for (int i = 0; i < STATE_FELTS; ++i) s[i] = sbox(s[i]);
     mds(s);
-#pragma unroll
-    for (int i = 0; i < STATE_FELTS; ++i) s[i] = fadd(s[i], ARK2[R][i]);
-#pragma unroll
+#pragma unroll 1
+    for (int i = 0; i < STATE_FELTS; ++i) s[i] = fadd(s[i], ARK2[r][i]);
+    // The twelve chains are independent; a GPU hides their latency with other
+    // warps, not by unrolling one thread's twelve chains into straight line.
+#pragma unroll 1
     for (int i = 0; i < STATE_FELTS; ++i) s[i] = inv_sbox(s[i]);
 }
 
 // E: `+ARK1 → x^7` in the cubic extension on four lane-triples, NO linear
 // layer (rpx.rs:296-307; the design, not an omission — rpx.rs:275-279).
-template <int R>
-__device__ __forceinline__ void ext_round(uint64_t s[STATE_FELTS]) {
-#pragma unroll
-    for (int i = 0; i < STATE_FELTS; ++i) s[i] = fadd(s[i], ARK1[R][i]);
-#pragma unroll
+__device__ __forceinline__ void ext_round(uint64_t s[STATE_FELTS], int r) {
+#pragma unroll 1
+    for (int i = 0; i < STATE_FELTS; ++i) s[i] = fadd(s[i], ARK1[r][i]);
+#pragma unroll 1
     for (int e = 0; e < EXT_ELEMENTS; ++e) {
         const int base = e * EXT_DEGREE;
         CubicExt x;
@@ -351,23 +373,32 @@ __device__ __forceinline__ void ext_round(uint64_t s[STATE_FELTS]) {
 }
 
 // M: `MDS → +ARK1`, a linear finish with no S-box (rpx.rs:308-313).
-template <int R>
-__device__ __forceinline__ void final_round(uint64_t s[STATE_FELTS]) {
+__device__ __forceinline__ void final_round(uint64_t s[STATE_FELTS], int r) {
     mds(s);
-#pragma unroll
-    for (int i = 0; i < STATE_FELTS; ++i) s[i] = fadd(s[i], ARK1[R][i]);
+#pragma unroll 1
+    for (int i = 0; i < STATE_FELTS; ++i) s[i] = fadd(s[i], ARK1[r][i]);
 }
 
 // The permutation: `FB E FB E FB E M` (rpx.rs:280-316), output CANONICAL.
-__device__ void permute(uint64_t s[STATE_FELTS]) {
-    fb_round<0>(s);
-    ext_round<1>(s);
-    fb_round<2>(s);
-    ext_round<3>(s);
-    fb_round<4>(s);
-    ext_round<5>(s);
-    final_round<6>(s);
-#pragma unroll
+//
+// ★ CODE SHAPE. A real (`RPX_NOINLINE`) function with rolled loops, on
+// purpose. The first cubin build of the fully inlined, fully unrolled form ran
+// 41 minutes and emitted 56 MB of PTX: one permutation was ~49k straight-line
+// lines (the inverse S-box chain unrolled over twelve lanes, three times) and
+// every leaf kernel carried one copy per `permute` call site — seven in the
+// comp-poly kernel. Rolled and called, the whole file is a few thousand lines
+// and every kernel shares one body. The price is loop overhead of order 10% of
+// the permutation's instructions and the state living in local memory across
+// the call; the `-Xptxas -v` report and the unroll factors of `square_n` and
+// the lane loops are the tuning knobs, in that order.
+RPX_NOINLINE __device__ void permute(uint64_t s[STATE_FELTS]) {
+#pragma unroll 1
+    for (int r = 0; r + 1 < NUM_ROUNDS; r += 2) {
+        fb_round(s, r);
+        ext_round(s, r + 1);
+    }
+    final_round(s, NUM_ROUNDS - 1);
+#pragma unroll 1
     for (int i = 0; i < STATE_FELTS; ++i) s[i] = goldilocks::canonical(s[i]);
 }
 
@@ -449,3 +480,315 @@ __device__ __forceinline__ void compress(const uint64_t left[DIGEST_FELTS],
 }
 
 }  // namespace rpx
+
+// ===========================================================================
+// PHASE 2 — the device-facing surface: node bytes, leaf kernels, Merkle
+// compressors and the permutation probe. Kernel for kernel the twin of
+// `blake3.cu:338-620`, with the chain replaced by `rpx::Sponge` and the parent
+// by `rpx::compress`.
+//
+// NODE BYTES. A node is four canonical felts, each stored as eight BIG-ENDIAN
+// bytes — `digest_to_commitment` (algebraic_commit.rs:112-118) — so 32 bytes,
+// the same slot width as a BLAKE3 or keccak node, and the device tree's bytes
+// equal the host's. Digests leave `permute` canonical; a parent reads its
+// children back with `commitment_to_digest`'s big-endian decoding. The device
+// is little-endian, so both directions byte-swap (`bswap64`); the 32-byte node
+// offsets inside a 256-byte-aligned `cuMemAlloc` buffer make the u64 accesses
+// aligned, the same precondition the BLAKE3 u32 accesses rest on.
+//
+// A LEAF absorbs exactly the felt sequence the host leaf hashes: the same
+// read pattern as the BLAKE3 kernel it twins (`leaves_bit_reversed_grouped`,
+// commitment.rs:67 — bit-reversed rows, each column by column, an ext3 element
+// as its three components), which is the sequence `felts_from_bytes` rebuilds
+// from the leaf bytes, so `hash_bytes == hash_data` holds on device by
+// construction. The felt count is known before the loop, as the overwrite
+// duplex's padding flag needs it (A1). Raw `[0, 2^64)` storage is absorbed as
+// is: the permutation is representation-independent, and the host
+// canonicalises before serialising — same field value, same digest.
+// ===========================================================================
+
+namespace rpx {
+
+// Byte-swap a u64: the device reads a host big-endian felt from a node and
+// writes one back. Plain shifts so the host shim compiles it; nvcc lowers it
+// to two PRMTs.
+__device__ __forceinline__ uint64_t bswap64(uint64_t x) {
+    x = ((x & 0x00FF00FF00FF00FFull) << 8) | ((x >> 8) & 0x00FF00FF00FF00FFull);
+    x = ((x & 0x0000FFFF0000FFFFull) << 16) | ((x >> 16) & 0x0000FFFF0000FFFFull);
+    return (x << 32) | (x >> 32);
+}
+
+// Four felts → one 32-byte node, `digest_to_commitment`'s layout.
+__device__ __forceinline__ void store_digest_be(const uint64_t digest[DIGEST_FELTS], uint8_t *node) {
+    uint64_t *dst = reinterpret_cast<uint64_t *>(node);
+#pragma unroll
+    for (int i = 0; i < DIGEST_FELTS; ++i) dst[i] = bswap64(digest[i]);
+}
+
+// One 32-byte node → four felts, `commitment_to_digest`'s decoding.
+__device__ __forceinline__ void load_digest_be(const uint8_t *node, uint64_t digest[DIGEST_FELTS]) {
+    const uint64_t *src = reinterpret_cast<const uint64_t *>(node);
+#pragma unroll
+    for (int i = 0; i < DIGEST_FELTS; ++i) digest[i] = bswap64(src[i]);
+}
+
+// A Merkle parent in place in the node buffer — `parent` (algebraic_commit.rs
+// :248-252): decode both children, `compress`, encode. Node buffer layout as
+// `blake3.cu` / `keccak.cu` / the CPU `merkle.rs`: children at
+// `nodes[parent_begin + n_pairs .. parent_begin + 3*n_pairs]`, parents at
+// `nodes[parent_begin .. parent_begin + n_pairs]`, 32 bytes per node.
+__device__ __forceinline__ void hash_merkle_parent(uint8_t *nodes, uint64_t parent_begin,
+                                                   uint64_t n_pairs, uint64_t tid) {
+    uint64_t left[DIGEST_FELTS], right[DIGEST_FELTS], out[DIGEST_FELTS];
+    load_digest_be(nodes + (parent_begin + n_pairs + 2 * tid) * 32, left);
+    load_digest_be(nodes + (parent_begin + n_pairs + 2 * tid + 1) * 32, right);
+    compress(left, right, out);
+    store_digest_be(out, nodes + (parent_begin + tid) * 32);
+}
+
+}  // namespace rpx
+
+// ---------------------------------------------------------------------------
+// Leaf kernels. Twins of `blake3_leaves_*` / `blake3_comp_poly_leaves_ext3` /
+// `blake3_fri_leaves_ext3`, argument for argument; one thread hashes one leaf.
+// ---------------------------------------------------------------------------
+
+// Goldilocks BASE-FIELD leaf hashing, one leaf per bit-reversed row: column
+// `c` of row `br` at `columns_base_ptr[c * col_stride + br]`.
+// Twin of `blake3_leaves_base_batched` (`blake3.cu:346`).
+extern "C" __global__ void rpx_leaves_base_batched(
+    const uint64_t *columns_base_ptr,
+    uint64_t col_stride,
+    uint64_t num_cols,
+    uint64_t num_rows,
+    uint64_t log_num_rows,
+    uint8_t *hashed_leaves_out) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_rows) return;
+    uint64_t br = __brevll(tid) >> (64 - log_num_rows);
+
+    rpx::Sponge sp;
+    sp.init(num_cols);
+    for (uint64_t c = 0; c < num_cols; ++c) sp.absorb(columns_base_ptr[c * col_stride + br]);
+    uint64_t digest[rpx::DIGEST_FELTS];
+    sp.finalize(digest);
+    rpx::store_digest_be(digest, hashed_leaves_out + tid * 32);
+}
+
+// BASE-FIELD row-pair leaf hashing: leaf `tid` hashes bit-reversed rows
+// `2*tid` and `2*tid+1`, each column by column, first row then second.
+// `num_leaves = num_rows / 2`. Twin of `blake3_leaves_base_row_pair_batched`.
+extern "C" __global__ void rpx_leaves_base_row_pair_batched(
+    const uint64_t *columns_base_ptr,
+    uint64_t col_stride,
+    uint64_t num_cols,
+    uint64_t num_rows,
+    uint64_t log_num_rows,
+    uint8_t *hashed_leaves_out) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t num_leaves = num_rows >> 1;
+    if (tid >= num_leaves) return;
+    uint64_t br_0 = __brevll(2 * tid) >> (64 - log_num_rows);
+    uint64_t br_1 = __brevll(2 * tid + 1) >> (64 - log_num_rows);
+
+    rpx::Sponge sp;
+    sp.init(2 * num_cols);
+    for (uint64_t c = 0; c < num_cols; ++c) sp.absorb(columns_base_ptr[c * col_stride + br_0]);
+    for (uint64_t c = 0; c < num_cols; ++c) sp.absorb(columns_base_ptr[c * col_stride + br_1]);
+    uint64_t digest[rpx::DIGEST_FELTS];
+    sp.finalize(digest);
+    rpx::store_digest_be(digest, hashed_leaves_out + tid * 32);
+}
+
+// EXT3 leaf hashing, one leaf per bit-reversed row, components in three
+// separate base slabs: column `c` component `k` at
+// `columns_base_ptr[(c*3 + k) * col_stride + br]`; an element is absorbed as
+// `[comp0, comp1, comp2]`, matching `write_bytes_be`.
+// Twin of `blake3_leaves_ext3_batched`.
+extern "C" __global__ void rpx_leaves_ext3_batched(
+    const uint64_t *columns_base_ptr,
+    uint64_t col_stride,
+    uint64_t num_cols,  // number of ext3 columns (NOT slabs)
+    uint64_t num_rows,
+    uint64_t log_num_rows,
+    uint8_t *hashed_leaves_out) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_rows) return;
+    uint64_t br = __brevll(tid) >> (64 - log_num_rows);
+
+    rpx::Sponge sp;
+    sp.init(3 * num_cols);
+    for (uint64_t c = 0; c < num_cols; ++c) {
+#pragma unroll
+        for (int k = 0; k < 3; ++k) {
+            sp.absorb(columns_base_ptr[(c * 3 + (uint64_t)k) * col_stride + br]);
+        }
+    }
+    uint64_t digest[rpx::DIGEST_FELTS];
+    sp.finalize(digest);
+    rpx::store_digest_be(digest, hashed_leaves_out + tid * 32);
+}
+
+// Composition-polynomial leaf hashing: each leaf absorbs `2 * num_parts` ext3
+// values from bit-reversed rows `2*tid` and `2*tid+1`, (row 0: parts) then
+// (row 1: parts), three base components per value.
+// Twin of `blake3_comp_poly_leaves_ext3`.
+extern "C" __global__ void rpx_comp_poly_leaves_ext3(
+    const uint64_t *parts_base_ptr,
+    uint64_t col_stride,
+    uint64_t num_parts,
+    uint64_t num_rows,
+    uint64_t log_num_rows,
+    uint8_t *leaves_out) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t num_leaves = num_rows >> 1;
+    if (tid >= num_leaves) return;
+    uint64_t br_0 = __brevll(2 * tid) >> (64 - log_num_rows);
+    uint64_t br_1 = __brevll(2 * tid + 1) >> (64 - log_num_rows);
+
+    rpx::Sponge sp;
+    sp.init(2 * 3 * num_parts);
+    for (uint64_t p = 0; p < num_parts; ++p) {
+#pragma unroll
+        for (int k = 0; k < 3; ++k) {
+            sp.absorb(parts_base_ptr[(p * 3 + (uint64_t)k) * col_stride + br_0]);
+        }
+    }
+    for (uint64_t p = 0; p < num_parts; ++p) {
+#pragma unroll
+        for (int k = 0; k < 3; ++k) {
+            sp.absorb(parts_base_ptr[(p * 3 + (uint64_t)k) * col_stride + br_1]);
+        }
+    }
+    uint64_t digest[rpx::DIGEST_FELTS];
+    sp.finalize(digest);
+    rpx::store_digest_be(digest, leaves_out + tid * 32);
+}
+
+// FRI layer leaf hashing: each leaf absorbs two consecutive ext3 values from an
+// interleaved eval vector `[a0,a1,a2,b0,b1,b2,...]` — six felts, so a single
+// block, no padding flag (`6 mod 8 = 6` in capacity lane 8). No bit reversal.
+// The host is `AlgebraicPairBackend::hash_data` (algebraic_commit.rs:318-329).
+// Twin of `blake3_fri_leaves_ext3`.
+extern "C" __global__ void rpx_fri_leaves_ext3(
+    const uint64_t *evals_interleaved,  // 3 * num_evals u64s
+    uint64_t num_leaves,                 // = num_evals / 2
+    uint8_t *leaves_out) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_leaves) return;
+    const uint64_t *pair = evals_interleaved + 2 * tid * 3;
+
+    rpx::Sponge sp;
+    sp.init(6);
+#pragma unroll
+    for (int i = 0; i < 6; ++i) sp.absorb(pair[i]);
+    uint64_t digest[rpx::DIGEST_FELTS];
+    sp.finalize(digest);
+    rpx::store_digest_be(digest, leaves_out + tid * 32);
+}
+
+// Row-major ROW-PAIR leaf hashing: leaf `tid` absorbs row `reverse_index(2*tid)`
+// then row `reverse_index(2*tid+1)`, each `m` lanes read contiguously from
+// `data + br * m`. `m` is the row stride in u64s: base trace = column count,
+// ext3 trace = 3 * column count (an ext3 element's components are consecutive).
+// Twin of `blake3_leaves_base_row_major_row_pair`; the fused LDE+commit
+// pipeline's leaf kernel (`lde.rs` `coset_lde_row_major_inner`).
+extern "C" __global__ void rpx_leaves_base_row_major_row_pair(
+    const uint64_t *data,
+    uint64_t m,
+    uint64_t num_rows,
+    uint64_t log_num_rows,
+    uint8_t *hashed_leaves_out) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t num_leaves = num_rows >> 1;
+    if (tid >= num_leaves) return;
+    uint64_t br_0 = __brevll(2 * tid) >> (64 - log_num_rows);
+    uint64_t br_1 = __brevll(2 * tid + 1) >> (64 - log_num_rows);
+    const uint64_t *row_0 = data + br_0 * m;
+    const uint64_t *row_1 = data + br_1 * m;
+
+    rpx::Sponge sp;
+    sp.init(2 * m);
+    for (uint64_t c = 0; c < m; ++c) sp.absorb(row_0[c]);
+    for (uint64_t c = 0; c < m; ++c) sp.absorb(row_1[c]);
+    uint64_t digest[rpx::DIGEST_FELTS];
+    sp.finalize(digest);
+    rpx::store_digest_be(digest, hashed_leaves_out + tid * 32);
+}
+
+// Column-range variant: each leaf absorbs only columns `[col_start, col_end)`
+// of the two bit-reversed rows while `m` stays the full row stride — the CPU
+// `commit_rows_bit_reversed_subset`, how preprocessed tables commit their
+// precomputed and multiplicity column ranges to separate trees over one LDE.
+// Twin of `blake3_leaves_base_row_major_row_pair_range`.
+extern "C" __global__ void rpx_leaves_base_row_major_row_pair_range(
+    const uint64_t *data,
+    uint64_t m,
+    uint64_t col_start,
+    uint64_t col_end,
+    uint64_t num_rows,
+    uint64_t log_num_rows,
+    uint8_t *hashed_leaves_out) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t num_leaves = num_rows >> 1;
+    if (tid >= num_leaves) return;
+    uint64_t br_0 = __brevll(2 * tid) >> (64 - log_num_rows);
+    uint64_t br_1 = __brevll(2 * tid + 1) >> (64 - log_num_rows);
+    const uint64_t *row_0 = data + br_0 * m;
+    const uint64_t *row_1 = data + br_1 * m;
+
+    rpx::Sponge sp;
+    sp.init(2 * (col_end - col_start));
+    for (uint64_t c = col_start; c < col_end; ++c) sp.absorb(row_0[c]);
+    for (uint64_t c = col_start; c < col_end; ++c) sp.absorb(row_1[c]);
+    uint64_t digest[rpx::DIGEST_FELTS];
+    sp.finalize(digest);
+    rpx::store_digest_be(digest, hashed_leaves_out + tid * 32);
+}
+
+// ---------------------------------------------------------------------------
+// Merkle level / tail. Same launch split as BLAKE3's: one thread per pair per
+// level while a level is wide, then ONE single-block launch that grid-strides
+// every remaining level with a barrier between them.
+// ---------------------------------------------------------------------------
+
+// One level of the inner tree: each thread compresses one child pair.
+extern "C" __global__ void rpx_merkle_level(uint8_t *nodes,
+                                            uint64_t parent_begin,  // in 32-byte nodes
+                                            uint64_t n_pairs) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n_pairs) return;
+    rpx::hash_merkle_parent(nodes, parent_begin, n_pairs, tid);
+}
+
+// Every remaining level from `level_begin` up to the root, in one block.
+// Twin of `blake3_merkle_tail`.
+extern "C" __global__ void rpx_merkle_tail(uint8_t *nodes, uint64_t level_begin) {
+    uint64_t lb = level_begin;
+    while (lb != 0) {
+        uint64_t nb = lb / 2;
+        uint64_t n_pairs = lb - nb;
+        for (uint64_t tid = threadIdx.x; tid < n_pairs; tid += blockDim.x) {
+            rpx::hash_merkle_parent(nodes, nb, n_pairs, tid);
+        }
+        __syncthreads();
+        lb = nb;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Parity-harness entry point: `n` independent permutations, one thread each.
+// The bare device permutation is otherwise unreachable from host code; this is
+// what lets the GPU be checked against the host `Rpx256` (and the host-KAT's
+// oracle tables) before any tree is built. Not on any production path.
+// ---------------------------------------------------------------------------
+extern "C" __global__ void rpx_permute_probe(const uint64_t *states, uint64_t n, uint64_t *out) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) return;
+    uint64_t s[rpx::STATE_FELTS];
+#pragma unroll
+    for (int i = 0; i < rpx::STATE_FELTS; ++i) s[i] = states[tid * rpx::STATE_FELTS + i];
+    rpx::permute(s);
+#pragma unroll
+    for (int i = 0; i < rpx::STATE_FELTS; ++i) out[tid * rpx::STATE_FELTS + i] = s[i];
+}

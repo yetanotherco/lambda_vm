@@ -21,6 +21,7 @@ pub mod merkle;
 pub mod mmcs;
 pub mod ntt;
 pub mod nvtx;
+pub mod rpx;
 
 // Re-exported for downstream crates so they can refer to CUDA primitive
 // types without depending on cudarc directly.
@@ -42,8 +43,9 @@ pub type Result<T> = std::result::Result<T, cudarc::driver::DriverError>;
 /// (keccak-256, or `Blake3Chain` at the compiled round count), exactly as on
 /// the host.
 ///
-/// ★ The three ALGEBRAIC keys name hashes whose device kernels are not yet
-/// ported. Every dispatch site in this crate carries an arm for them that
+/// ★ Of the three ALGEBRAIC keys, [`DeviceHash::Rpx256`] is ported
+/// ([`rpx`]); RPO256 and Poseidon name hashes whose device kernels are not.
+/// Every dispatch site in this crate carries an arm for the unported keys that
 /// aborts with `unimplemented!` naming the hash — never an arm that launches a
 /// byte-hash kernel in its place. The keys exist ahead of their kernels so the
 /// host side (`stark::config::DeviceTreeBackend`) can name every commitment
@@ -59,8 +61,8 @@ pub enum DeviceHash {
     /// RPO256 leaves and parents. No device kernels yet: every dispatch site
     /// aborts loudly on this key.
     Rpo256,
-    /// RPX256 (XHash12) leaves and parents. No device kernels yet: every
-    /// dispatch site aborts loudly on this key.
+    /// RPX256 (XHash12) leaves and parents — [`rpx`]'s kernels, the
+    /// algebraic family's first device port.
     Rpx256,
     /// ⚠ Poseidon-original — UNSHIPPABLE on the host side too; present so the
     /// key set mirrors `CommitmentHash` one-to-one. No device kernels.

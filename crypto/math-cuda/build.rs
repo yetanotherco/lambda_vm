@@ -191,6 +191,10 @@ fn main() {
     compile_kernel("deep.cu", "deep.cubin", have_nvcc, &[]);
     compile_kernel("fri.cu", "fri.cubin", have_nvcc, &[]);
     compile_kernel("inverse.cu", "inverse.cubin", have_nvcc, &[]);
+    // RPX256 (XHash12) leaves and parents — the algebraic hash's device
+    // kernels. Pinned on the host by `tests/host_kat/rpx_host_kat.cpp`; the
+    // cubin needs no `-D`: RPX has no compile-time knob.
+    compile_kernel("rpx.cu", "rpx.cubin", have_nvcc, &[]);
     compile_kernel("logup.cu", "logup.cubin", have_nvcc, &[]);
     compile_kernel(
         "constraint_interp.cu",

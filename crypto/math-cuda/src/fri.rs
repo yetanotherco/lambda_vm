@@ -205,7 +205,14 @@ impl FriCommitState {
                     num_leaves_u64,
                     &mut leaves_view,
                 )?,
-                DeviceHash::Rpo256 | DeviceHash::Rpx256 | DeviceHash::Poseidon => unimplemented!(
+                DeviceHash::Rpx256 => crate::rpx::launch_fri_leaves_ext3(
+                    self.stream.as_ref(),
+                    be,
+                    &out,
+                    num_leaves_u64,
+                    &mut leaves_view,
+                )?,
+                DeviceHash::Rpo256 | DeviceHash::Poseidon => unimplemented!(
                     "{:?} device commit not yet ported (FRI layer ext3 leaves)",
                     self.hash
                 ),
@@ -224,7 +231,13 @@ impl FriCommitState {
                 &mut nodes_dev,
                 num_leaves,
             )?,
-            DeviceHash::Rpo256 | DeviceHash::Rpx256 | DeviceHash::Poseidon => unimplemented!(
+            DeviceHash::Rpx256 => crate::rpx::build_inner_tree_levels(
+                self.stream.as_ref(),
+                be,
+                &mut nodes_dev,
+                num_leaves,
+            )?,
+            DeviceHash::Rpo256 | DeviceHash::Poseidon => unimplemented!(
                 "{:?} device commit not yet ported (FRI layer inner tree levels)",
                 self.hash
             ),

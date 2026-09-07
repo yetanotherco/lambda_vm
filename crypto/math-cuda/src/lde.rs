@@ -1054,7 +1054,10 @@ fn build_inner_tree_levels_for(
         DeviceHash::Blake3 => {
             crate::blake3::build_inner_tree_levels(stream, be, nodes_dev, leaves_len)
         }
-        DeviceHash::Rpo256 | DeviceHash::Rpx256 | DeviceHash::Poseidon => {
+        DeviceHash::Rpx256 => {
+            crate::rpx::build_inner_tree_levels(stream, be, nodes_dev, leaves_len)
+        }
+        DeviceHash::Rpo256 | DeviceHash::Poseidon => {
             unimplemented!("{hash:?} device commit not yet ported (inner tree levels)")
         }
     }
@@ -1141,7 +1144,16 @@ fn coset_lde_row_major_inner(
                 log_lde,
                 &mut leaves_view,
             )?,
-            DeviceHash::Rpo256 | DeviceHash::Rpx256 | DeviceHash::Poseidon => {
+            DeviceHash::Rpx256 => crate::rpx::launch_leaves_base_row_major_row_pair(
+                stream.as_ref(),
+                be,
+                &buf,
+                cols_u64,
+                lde_u64,
+                log_lde,
+                &mut leaves_view,
+            )?,
+            DeviceHash::Rpo256 | DeviceHash::Poseidon => {
                 unimplemented!("{hash:?} device commit not yet ported (row-major row-pair leaves)")
             }
         }
@@ -1339,7 +1351,18 @@ pub fn coset_lde_row_major_split_trees(
                     log_lde,
                     &mut leaves_view,
                 )?,
-                DeviceHash::Rpo256 | DeviceHash::Rpx256 | DeviceHash::Poseidon => unimplemented!(
+                DeviceHash::Rpx256 => crate::rpx::launch_leaves_base_row_major_row_pair_range(
+                    stream.as_ref(),
+                    be,
+                    &buf,
+                    cols_u64,
+                    col_start,
+                    col_end,
+                    lde_u64,
+                    log_lde,
+                    &mut leaves_view,
+                )?,
+                DeviceHash::Rpo256 | DeviceHash::Poseidon => unimplemented!(
                     "{hash:?} device commit not yet ported (row-major row-pair leaves, column range)"
                 ),
             }
@@ -2154,7 +2177,23 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
                 lde_u64,
                 &mut leaves_view,
             )?,
-            (DeviceHash::Rpo256 | DeviceHash::Rpx256 | DeviceHash::Poseidon, _) => {
+            (DeviceHash::Rpx256, true) => crate::rpx::launch_leaves_base_row_pair(
+                stream.as_ref(),
+                &buf,
+                col_stride_u64,
+                m as u64,
+                lde_u64,
+                &mut leaves_view,
+            )?,
+            (DeviceHash::Rpx256, false) => crate::rpx::launch_leaves_base(
+                stream.as_ref(),
+                &buf,
+                col_stride_u64,
+                m as u64,
+                lde_u64,
+                &mut leaves_view,
+            )?,
+            (DeviceHash::Rpo256 | DeviceHash::Poseidon, _) => {
                 unimplemented!("{hash:?} device commit not yet ported (column-major base leaves)")
             }
         }
@@ -2399,7 +2438,17 @@ fn evaluate_poly_coset_batch_ext3_into_inner(
                     log_num_rows,
                     &mut leaves_view,
                 )?,
-                DeviceHash::Rpo256 | DeviceHash::Rpx256 | DeviceHash::Poseidon => {
+                DeviceHash::Rpx256 => crate::rpx::launch_comp_poly_leaves_ext3(
+                    stream.as_ref(),
+                    be,
+                    &buf,
+                    col_stride_u64,
+                    num_parts_u64,
+                    lde_u64,
+                    log_num_rows,
+                    &mut leaves_view,
+                )?,
+                DeviceHash::Rpo256 | DeviceHash::Poseidon => {
                     unimplemented!("{hash:?} device commit not yet ported (comp-poly ext3 leaves)")
                 }
             }

@@ -136,6 +136,7 @@ const LOGUP_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/logup.cubin
 const CONSTRAINT_INTERP_CUBIN: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/constraint_interp.cubin"));
 const BLAKE3_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/blake3.cubin"));
+const RPX_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rpx.cubin"));
 
 /// Number of CUDA streams in the pool. Larger pools let many rayon-parallel
 /// callers overlap on the GPU without serializing on stream ownership. The
@@ -237,6 +238,22 @@ pub struct Backend {
     pub blake3_serialize_felts_probe: CudaFunction,
     pub blake3_blocks_of_felts_probe: CudaFunction,
     pub blake3_chain_probe: CudaFunction,
+
+    // rpx.cubin — the RPX256 (XHash12) leaf kernels, Merkle level/tail
+    // compressors and the permutation probe (see `kernels/rpx.cu`). Twin for
+    // twin with the blake3 set above and in the same order; the probe is the
+    // only host-visible handle on the bare device permutation, which the parity
+    // tests check against the host `Rpx256`.
+    pub rpx_leaves_base_row_major_row_pair: CudaFunction,
+    pub rpx_leaves_base_row_major_row_pair_range: CudaFunction,
+    pub rpx_leaves_base_batched: CudaFunction,
+    pub rpx_leaves_base_row_pair_batched: CudaFunction,
+    pub rpx_leaves_ext3_batched: CudaFunction,
+    pub rpx_comp_poly_leaves_ext3: CudaFunction,
+    pub rpx_fri_leaves_ext3: CudaFunction,
+    pub rpx_merkle_level: CudaFunction,
+    pub rpx_merkle_tail: CudaFunction,
+    pub rpx_permute_probe: CudaFunction,
 
     // barycentric.cubin
     pub barycentric_base_batched: CudaFunction,
@@ -448,6 +465,7 @@ impl Backend {
         let constraint_interp =
             ctx.load_module(Ptx::from_binary(CONSTRAINT_INTERP_CUBIN.to_vec()))?;
         let blake3 = ctx.load_module(Ptx::from_binary(BLAKE3_CUBIN.to_vec()))?;
+        let rpx = ctx.load_module(Ptx::from_binary(RPX_CUBIN.to_vec()))?;
 
         let mut streams = Vec::with_capacity(STREAM_POOL_SIZE);
         for _ in 0..STREAM_POOL_SIZE {
@@ -560,6 +578,20 @@ impl Backend {
             blake3_serialize_felts_probe: blake3.load_function("blake3_serialize_felts_probe")?,
             blake3_blocks_of_felts_probe: blake3.load_function("blake3_blocks_of_felts_probe")?,
             blake3_chain_probe: blake3.load_function("blake3_chain_probe")?,
+
+            rpx_leaves_base_row_major_row_pair: rpx
+                .load_function("rpx_leaves_base_row_major_row_pair")?,
+            rpx_leaves_base_row_major_row_pair_range: rpx
+                .load_function("rpx_leaves_base_row_major_row_pair_range")?,
+            rpx_leaves_base_batched: rpx.load_function("rpx_leaves_base_batched")?,
+            rpx_leaves_base_row_pair_batched: rpx
+                .load_function("rpx_leaves_base_row_pair_batched")?,
+            rpx_leaves_ext3_batched: rpx.load_function("rpx_leaves_ext3_batched")?,
+            rpx_comp_poly_leaves_ext3: rpx.load_function("rpx_comp_poly_leaves_ext3")?,
+            rpx_fri_leaves_ext3: rpx.load_function("rpx_fri_leaves_ext3")?,
+            rpx_merkle_level: rpx.load_function("rpx_merkle_level")?,
+            rpx_merkle_tail: rpx.load_function("rpx_merkle_tail")?,
+            rpx_permute_probe: rpx.load_function("rpx_permute_probe")?,
             barycentric_base_batched: bary.load_function("barycentric_base_batched")?,
             barycentric_ext3_batched: bary.load_function("barycentric_ext3_batched")?,
             barycentric_base_batched_strided: bary

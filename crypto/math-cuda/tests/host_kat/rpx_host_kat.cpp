@@ -22,7 +22,7 @@
 //      extension against naive polynomial multiplication reduced by
 //      `φ³ = φ + 1` — the same independent algorithms `rpx.rs`'s own tests use.
 //   3. ★ EXTERNAL: RPX's FB round IS RPO's round with RPO's constants. Seven
-//      `fb_round<R>` compose to RPO256, and that composition is replayed over
+//      `fb_round(s, r)` compose to RPO256, and that composition is replayed over
 //      miden-crypto's nineteen `hash_elements` vectors, which nothing in this
 //      tree produced. That pins ARK1/ARK2, the MDS row and orientation, both
 //      S-box chains and the sponge lane convention from outside.
@@ -35,12 +35,17 @@
 //      reaches the output; raw (`≥ p`) and canonical inputs agree; outputs are
 //      canonical.
 //   6. The cost model, COUNTED rather than asserted from a comment.
+//   7. Every leaf kernel, both Merkle compressors and the permutation probe
+//      replayed thread by thread through the shim against the CPU leaf spec
+//      and the host parent — the read patterns and the node encoding, with the
+//      hash over them anchored by the layers above.
 //
 // Build and run with `make test-rpx-host-kat`.
 
 #include <cstdio>
 #include <cstring>
 #include <set>
+#include <string>
 #include <vector>
 
 #include "cuda_host_shim.h"
@@ -311,13 +316,13 @@ void cubic_extension_matches_naive_polynomial_arithmetic() {
 
 // RPO256's permutation composed from the kernel's FB round — rpo.rs:567-583.
 void rpo_permute(uint64_t s[12]) {
-    rpx::fb_round<0>(s);
-    rpx::fb_round<1>(s);
-    rpx::fb_round<2>(s);
-    rpx::fb_round<3>(s);
-    rpx::fb_round<4>(s);
-    rpx::fb_round<5>(s);
-    rpx::fb_round<6>(s);
+    rpx::fb_round(s, 0);
+    rpx::fb_round(s, 1);
+    rpx::fb_round(s, 2);
+    rpx::fb_round(s, 3);
+    rpx::fb_round(s, 4);
+    rpx::fb_round(s, 5);
+    rpx::fb_round(s, 6);
     for (int i = 0; i < 12; ++i) s[i] = goldilocks::canonical(s[i]);
 }
 
@@ -376,7 +381,7 @@ void seven_fb_rounds_reproduce_the_miden_rpo_vectors() {
         for (int d = 0; d < 4; ++d) ok = ok && s[d] == MIDEN_HASH_ELEMENTS[7][d];
         check(ok, "permute([0..8 ‖ 0⁴]) must be miden's eight-element vector (compress layout)");
     }
-    printf("★ EXTERNAL: seven fb_round<R> = RPO256 vs miden-crypto hash_elements: %d/19 matched\n",
+    printf("★ EXTERNAL: seven fb_round(s, r) = RPO256 vs miden-crypto hash_elements: %d/19 matched\n",
            matched);
 }
 
@@ -559,13 +564,13 @@ void the_canonicalisation_loop_is_pinned_by_the_witness() {
 
     uint64_t s[12];
     memcpy(s, w->input, sizeof(s));
-    rpx::fb_round<0>(s);
-    rpx::ext_round<1>(s);
-    rpx::fb_round<2>(s);
-    rpx::ext_round<3>(s);
-    rpx::fb_round<4>(s);
-    rpx::ext_round<5>(s);
-    rpx::final_round<6>(s);
+    rpx::fb_round(s, 0);
+    rpx::ext_round(s, 1);
+    rpx::fb_round(s, 2);
+    rpx::ext_round(s, 3);
+    rpx::fb_round(s, 4);
+    rpx::ext_round(s, 5);
+    rpx::final_round(s, 6);
     int twins = 0;
     for (int i = 0; i < 12; ++i) twins += (s[i] >= P) ? 1 : 0;
     check(twins > 0, "the witness must leave a raw lane >= p before the canonicalisation loop");
@@ -674,9 +679,9 @@ Counted count_ops(F f) {
 void the_cost_model_is_what_the_header_claims() {
     uint64_t s[12];
     for (int i = 0; i < 12; ++i) s[i] = (uint64_t)i + 1;
-    const Counted fb = count_ops([&] { rpx::fb_round<0>(s); });
-    const Counted ext = count_ops([&] { rpx::ext_round<1>(s); });
-    const Counted fin = count_ops([&] { rpx::final_round<6>(s); });
+    const Counted fb = count_ops([&] { rpx::fb_round(s, 0); });
+    const Counted ext = count_ops([&] { rpx::ext_round(s, 1); });
+    const Counted fin = count_ops([&] { rpx::final_round(s, 6); });
     const Counted all = count_ops([&] { rpx::permute(s); });
     const Counted rpo = count_ops([&] { rpo_permute(s); });
     const Counted inv = count_ops([&] { (void)rpx::inv_sbox(s[0]); });
@@ -712,6 +717,284 @@ void the_cost_model_is_what_the_header_claims() {
     check(rpo.mul == 6384 && rpo.dot3 == 0 && rpo.add == 336, "RPO permutation must be 6384 mul / 336 add");
 }
 
+// ===========================================================================
+// Layer 7 — the leaf kernels, the Merkle compressors and the probe, replayed
+// thread by thread through the shim.
+//
+// What a leaf hashes is the CPU `leaves_bit_reversed_grouped` sequence —
+// bit-reversed rows, each column by column, an ext3 element as its three
+// components — and the hash over it is the `sponge_leaf` transcription pinned
+// in layer 4. So each kernel is checked for its READ PATTERN and its node
+// ENCODING (`digest_to_commitment`: four canonical felts, big-endian), with the
+// permutation anchored separately above. Raw `[p, 2^64)` values are fed in,
+// since that is what an LDE buffer holds.
+// ===========================================================================
+
+uint64_t reverse_index(uint64_t i, uint32_t log_n) { return __brevll(i) >> (64 - log_n); }
+
+// The host leaf over `felts`: `sponge_leaf`, then `digest_to_commitment`.
+void expected_leaf(const std::vector<uint64_t> &felts, uint8_t out[32]) {
+    uint64_t d[4];
+    ref_sponge_leaf(felts.data(), felts.size(), d);
+    for (int i = 0; i < 4; ++i) {
+        const uint64_t c = canon(d[i]);
+        for (int b = 0; b < 8; ++b) out[i * 8 + b] = (uint8_t)(c >> (56 - 8 * b));
+    }
+}
+
+std::string hex32(const uint8_t *b) {
+    std::string s(64, '\0');
+    for (int i = 0; i < 32; ++i) snprintf(&s[i * 2], 3, "%02x", (unsigned)b[i]);
+    return s;
+}
+
+void check_leaves(const std::vector<uint8_t> &got, const std::vector<std::vector<uint64_t>> &want,
+                  const char *what) {
+    if (got.size() != want.size() * 32) {
+        printf("FAIL %s: leaf count %zu vs %zu\n", what, got.size() / 32, want.size());
+        ++failures;
+        return;
+    }
+    for (size_t i = 0; i < want.size(); ++i) {
+        uint8_t expect[32];
+        expected_leaf(want[i], expect);
+        if (memcmp(got.data() + i * 32, expect, 32) != 0) {
+            printf("FAIL %s: leaf %zu\n  got  %s\n  want %s\n", what, i, hex32(got.data() + i * 32).c_str(),
+                   hex32(expect).c_str());
+            ++failures;
+            return;
+        }
+    }
+}
+
+// The two column-major base kernels: one leaf per bit-reversed row, and one per
+// bit-reversed row pair.
+void base_leaf_kernels_read_the_specified_felts() {
+    for (uint32_t log_n : {2u, 4u, 6u}) {
+        for (uint64_t num_cols : {1ull, 5ull, 8ull, 17ull}) {
+            const uint64_t n = 1ull << log_n;
+            std::vector<uint64_t> cols(num_cols * n);
+            uint64_t seed = log_n * 31 + num_cols;
+            for (size_t i = 0; i < cols.size(); ++i) cols[i] = sample(seed, i);
+            {
+                std::vector<uint8_t> out(n * 32, 0);
+                CUDA_HOST_FOR_EACH_THREAD(t, n) {
+                    rpx_leaves_base_batched(cols.data(), n, num_cols, n, log_n, out.data());
+                }
+                std::vector<std::vector<uint64_t>> want(n);
+                for (uint64_t leaf = 0; leaf < n; ++leaf) {
+                    const uint64_t br = reverse_index(leaf, log_n);
+                    for (uint64_t c = 0; c < num_cols; ++c) want[leaf].push_back(cols[c * n + br]);
+                }
+                check_leaves(out, want, "rpx_leaves_base_batched");
+            }
+            {
+                const uint64_t num_leaves = n / 2;
+                std::vector<uint8_t> out(num_leaves * 32, 0);
+                CUDA_HOST_FOR_EACH_THREAD(t, num_leaves) {
+                    rpx_leaves_base_row_pair_batched(cols.data(), n, num_cols, n, log_n, out.data());
+                }
+                std::vector<std::vector<uint64_t>> want(num_leaves);
+                for (uint64_t leaf = 0; leaf < num_leaves; ++leaf) {
+                    for (int k = 0; k < 2; ++k) {
+                        const uint64_t br = reverse_index(2 * leaf + k, log_n);
+                        for (uint64_t c = 0; c < num_cols; ++c) want[leaf].push_back(cols[c * n + br]);
+                    }
+                }
+                check_leaves(out, want, "rpx_leaves_base_row_pair_batched");
+            }
+        }
+    }
+    printf("base leaf kernels: read pattern + node encoding match the CPU leaf spec\n");
+}
+
+// The ext3 kernels over the de-interleaved three-slab layout.
+void ext3_leaf_kernels_read_the_specified_felts() {
+    for (uint32_t log_n : {2u, 4u, 6u}) {
+        for (uint64_t num_cols : {1ull, 3ull, 11ull}) {
+            const uint64_t n = 1ull << log_n;
+            std::vector<uint64_t> cols(num_cols * 3 * n);
+            uint64_t seed = log_n * 17 + num_cols;
+            for (size_t i = 0; i < cols.size(); ++i) cols[i] = sample(seed, i);
+            {
+                std::vector<uint8_t> out(n * 32, 0);
+                CUDA_HOST_FOR_EACH_THREAD(t, n) {
+                    rpx_leaves_ext3_batched(cols.data(), n, num_cols, n, log_n, out.data());
+                }
+                std::vector<std::vector<uint64_t>> want(n);
+                for (uint64_t leaf = 0; leaf < n; ++leaf) {
+                    const uint64_t br = reverse_index(leaf, log_n);
+                    for (uint64_t c = 0; c < num_cols; ++c) {
+                        for (uint64_t k = 0; k < 3; ++k) want[leaf].push_back(cols[(c * 3 + k) * n + br]);
+                    }
+                }
+                check_leaves(out, want, "rpx_leaves_ext3_batched");
+            }
+            {
+                const uint64_t num_leaves = n / 2;
+                std::vector<uint8_t> out(num_leaves * 32, 0);
+                CUDA_HOST_FOR_EACH_THREAD(t, num_leaves) {
+                    rpx_comp_poly_leaves_ext3(cols.data(), n, num_cols, n, log_n, out.data());
+                }
+                std::vector<std::vector<uint64_t>> want(num_leaves);
+                for (uint64_t leaf = 0; leaf < num_leaves; ++leaf) {
+                    for (int j = 0; j < 2; ++j) {
+                        const uint64_t br = reverse_index(2 * leaf + j, log_n);
+                        for (uint64_t c = 0; c < num_cols; ++c) {
+                            for (uint64_t k = 0; k < 3; ++k) want[leaf].push_back(cols[(c * 3 + k) * n + br]);
+                        }
+                    }
+                }
+                check_leaves(out, want, "rpx_comp_poly_leaves_ext3");
+            }
+        }
+    }
+    printf("ext3 + comp-poly leaf kernels: read pattern + node encoding match the CPU leaf spec\n");
+}
+
+// FRI leaves: two consecutive ext3 values from an interleaved vector, six felts,
+// no bit reversal — the Pair backend's `hash_data`.
+void fri_leaf_kernel_reads_the_specified_felts() {
+    for (uint64_t num_leaves : {1ull, 2ull, 8ull, 33ull}) {
+        std::vector<uint64_t> evals(num_leaves * 6);
+        uint64_t seed = 0xF41;
+        for (size_t i = 0; i < evals.size(); ++i) evals[i] = sample(seed, i);
+        std::vector<uint8_t> out(num_leaves * 32, 0);
+        CUDA_HOST_FOR_EACH_THREAD(t, num_leaves) { rpx_fri_leaves_ext3(evals.data(), num_leaves, out.data()); }
+        std::vector<std::vector<uint64_t>> want(num_leaves);
+        for (uint64_t leaf = 0; leaf < num_leaves; ++leaf) {
+            for (int i = 0; i < 6; ++i) want[leaf].push_back(evals[leaf * 6 + i]);
+        }
+        check_leaves(out, want, "rpx_fri_leaves_ext3");
+    }
+    printf("FRI leaf kernel: read pattern + node encoding match the Pair backend's leaf\n");
+}
+
+// The row-major row-pair kernels, plain and column-ranged, every non-empty
+// range.
+void row_major_leaf_kernels_read_the_specified_felts() {
+    for (uint32_t log_n : {2u, 4u, 6u}) {
+        for (uint64_t m : {1ull, 5ull, 13ull}) {
+            const uint64_t n = 1ull << log_n;
+            const uint64_t num_leaves = n / 2;
+            std::vector<uint64_t> data(n * m);
+            uint64_t seed = log_n * 7 + m;
+            for (size_t i = 0; i < data.size(); ++i) data[i] = sample(seed, i);
+            {
+                std::vector<uint8_t> out(num_leaves * 32, 0);
+                CUDA_HOST_FOR_EACH_THREAD(t, num_leaves) {
+                    rpx_leaves_base_row_major_row_pair(data.data(), m, n, log_n, out.data());
+                }
+                std::vector<std::vector<uint64_t>> want(num_leaves);
+                for (uint64_t leaf = 0; leaf < num_leaves; ++leaf) {
+                    for (int k = 0; k < 2; ++k) {
+                        const uint64_t br = reverse_index(2 * leaf + k, log_n);
+                        for (uint64_t c = 0; c < m; ++c) want[leaf].push_back(data[br * m + c]);
+                    }
+                }
+                check_leaves(out, want, "rpx_leaves_base_row_major_row_pair");
+            }
+            for (uint64_t cs = 0; cs < m; ++cs) {
+                for (uint64_t ce = cs + 1; ce <= m; ++ce) {
+                    std::vector<uint8_t> out(num_leaves * 32, 0);
+                    CUDA_HOST_FOR_EACH_THREAD(t, num_leaves) {
+                        rpx_leaves_base_row_major_row_pair_range(data.data(), m, cs, ce, n, log_n, out.data());
+                    }
+                    std::vector<std::vector<uint64_t>> want(num_leaves);
+                    for (uint64_t leaf = 0; leaf < num_leaves; ++leaf) {
+                        for (int k = 0; k < 2; ++k) {
+                            const uint64_t br = reverse_index(2 * leaf + k, log_n);
+                            for (uint64_t c = cs; c < ce; ++c) want[leaf].push_back(data[br * m + c]);
+                        }
+                    }
+                    check_leaves(out, want, "rpx_leaves_base_row_major_row_pair_range");
+                }
+            }
+        }
+    }
+    printf("row-major leaf kernels: read pattern + node encoding match the CPU leaf spec, all column ranges\n");
+}
+
+// The host parent over two nodes: decode big-endian, compress, encode.
+void expected_parent(const uint8_t *left, const uint8_t *right, uint8_t out[32]) {
+    uint64_t l[4], r[4], d[4];
+    for (int i = 0; i < 4; ++i) {
+        l[i] = r[i] = 0;
+        for (int b = 0; b < 8; ++b) {
+            l[i] = (l[i] << 8) | left[i * 8 + b];
+            r[i] = (r[i] << 8) | right[i * 8 + b];
+        }
+    }
+    rpx::compress(l, r, d);
+    for (int i = 0; i < 4; ++i) {
+        for (int b = 0; b < 8; ++b) out[i * 8 + b] = (uint8_t)(canon(d[i]) >> (56 - 8 * b));
+    }
+}
+
+// The Merkle level kernel replayed thread by thread up a 16-leaf tree, and the
+// tail kernel replayed as a one-thread block (the shim's barrier is a no-op,
+// so a single thread walking every pair in order is the tail's sequential
+// meaning), both against the host parent over the same node buffer.
+void merkle_compressors_match_the_host_parent() {
+    const uint64_t num_leaves = 16;
+    const uint64_t total = 2 * num_leaves - 1;
+    // Nodes must be VALID digests (canonical big-endian felts) for the decode to
+    // be meaningful, so the leaves are hashes of random felts, not random bytes.
+    std::vector<uint8_t> leaves(num_leaves * 32);
+    uint64_t seed = 0x3E11;
+    for (uint64_t i = 0; i < num_leaves; ++i) {
+        std::vector<uint64_t> f = {sample(seed, i), sample(seed, i + 1000)};
+        expected_leaf(f, leaves.data() + i * 32);
+    }
+
+    std::vector<uint8_t> want(total * 32, 0);
+    memcpy(want.data() + (num_leaves - 1) * 32, leaves.data(), leaves.size());
+    for (uint64_t parent = num_leaves - 1; parent-- > 0;) {
+        expected_parent(want.data() + (2 * parent + 1) * 32, want.data() + (2 * parent + 2) * 32,
+                        want.data() + parent * 32);
+    }
+
+    // Level by level.
+    std::vector<uint8_t> by_level(total * 32, 0);
+    memcpy(by_level.data() + (num_leaves - 1) * 32, leaves.data(), leaves.size());
+    uint64_t level_begin = num_leaves - 1;
+    while (level_begin != 0) {
+        const uint64_t new_begin = level_begin / 2;
+        const uint64_t n_pairs = level_begin - new_begin;
+        CUDA_HOST_FOR_EACH_THREAD(t, n_pairs) { rpx_merkle_level(by_level.data(), new_begin, n_pairs); }
+        level_begin = new_begin;
+    }
+    check(by_level == want, "rpx_merkle_level must reproduce the host tree");
+
+    // The tail, in one go.
+    std::vector<uint8_t> by_tail(total * 32, 0);
+    memcpy(by_tail.data() + (num_leaves - 1) * 32, leaves.data(), leaves.size());
+    blockIdx.x = 0;
+    threadIdx.x = 0;
+    blockDim.x = 1;
+    rpx_merkle_tail(by_tail.data(), num_leaves - 1);
+    check(by_tail == want, "rpx_merkle_tail must reproduce the host tree");
+    printf("Merkle compressors: level and tail kernels reproduce the host parent over a 16-leaf tree\n");
+}
+
+// The permutation probe replayed over the oracle table: pins its indexing.
+void permute_probe_matches_the_oracle_table() {
+    std::vector<uint64_t> in(NUM_RPX_PERMUTATION_VECTORS * 12), out(NUM_RPX_PERMUTATION_VECTORS * 12, 0);
+    for (int n = 0; n < NUM_RPX_PERMUTATION_VECTORS; ++n) {
+        for (int i = 0; i < 12; ++i) in[n * 12 + i] = RPX_PERMUTATION_VECTORS[n].input[i];
+    }
+    CUDA_HOST_FOR_EACH_THREAD(t, NUM_RPX_PERMUTATION_VECTORS) {
+        rpx_permute_probe(in.data(), (uint64_t)NUM_RPX_PERMUTATION_VECTORS, out.data());
+    }
+    bool ok = true;
+    for (int n = 0; n < NUM_RPX_PERMUTATION_VECTORS; ++n) {
+        for (int i = 0; i < 12; ++i) ok = ok && out[n * 12 + i] == RPX_PERMUTATION_VECTORS[n].output[i];
+    }
+    check(ok, "rpx_permute_probe must reproduce the oracle table, raw");
+    printf("permute probe: %d oracle states reproduced through the kernel entry point\n",
+           NUM_RPX_PERMUTATION_VECTORS);
+}
+
 }  // namespace
 
 int main() {
@@ -734,6 +1017,13 @@ int main() {
     every_input_lane_reaches_the_output();
     printf("\n-- layer 6: cost model --\n");
     the_cost_model_is_what_the_header_claims();
+    printf("\n-- layer 7: leaf kernels, Merkle compressors and the probe, replayed thread by thread --\n");
+    base_leaf_kernels_read_the_specified_felts();
+    ext3_leaf_kernels_read_the_specified_felts();
+    fri_leaf_kernel_reads_the_specified_felts();
+    row_major_leaf_kernels_read_the_specified_felts();
+    merkle_compressors_match_the_host_parent();
+    permute_probe_matches_the_oracle_table();
     if (failures != 0) {
         printf("\n*** %d FAILURE(S) ***\n", failures);
         return 1;
