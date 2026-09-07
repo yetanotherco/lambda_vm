@@ -191,10 +191,41 @@ jobs:
 
   # "Test" is a required check — keep this name to avoid branch protection changes.
   # This gate job passes only when CLI, executor, disk-spill, and prover tests succeed.
+  host-kat:
+    # The device kernels' known-answer gates. `make test-*-host-kat` compiles the
+    # REAL `.cu` sources as host C++ through
+    # `crypto/math-cuda/tests/host_kat/cuda_host_shim.h` and runs them against
+    # external vectors (the official BLAKE3 vectors, miden-crypto's RPO vectors)
+    # and the committed oracle tables — g++ only, no CUDA, no cargo, seconds. It
+    # is the only per-PR check on the kernel arithmetic: the GPU parity suites
+    # (gpu-tests.yml) run on merge_group alone, and until this job existed the
+    # host-KAT targets lived in no workflow at all. Arithmetic only — nvcc
+    # acceptance and everything about execution stay with the GPU tests.
+    name: Host KAT (kernel pins)
+    runs-on: ubuntu-latest
+    if: github.event_name != 'push' || github.actor != 'github-merge-queue[bot]'
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: BLAKE3 host-KAT (7-round and 6-round arms)
+        run: make test-blake3-host-kat
+
+      - name: RPX host-KAT (permutation, leaf sponge, parent, leaf and tree kernels)
+        run: make test-rpx-host-kat
+
+      # Second source for the TABLES the BLAKE3 host-KAT trusts: upstream
+      # BLAKE3's portable C with its round loop parameterised, against the
+      # committed 6-round vectors and the Python oracle. A ~1 s C compile plus a
+      # few seconds of Python (cc + python3, both on the runner); it too had no
+      # workflow before this job.
+      - name: BLAKE3 second-source check of the 6-round tables
+        run: make test-blake3-second-source
+
   test:
     name: Test
     if: always()
-    needs: [test-executor, test-cli, test-prover, test-disk-spill, test-stark-cuda-lib]
+    needs: [test-executor, test-cli, test-prover, test-disk-spill, test-stark-cuda-lib, host-kat]
     runs-on: ubuntu-latest
     steps:
       - name: Check results
@@ -204,12 +235,14 @@ jobs:
           prover="${{ needs.test-prover.result }}"
           disk_spill="${{ needs.test-disk-spill.result }}"
           stark_cuda_lib="${{ needs.test-stark-cuda-lib.result }}"
+          host_kat="${{ needs.host-kat.result }}"
 
           echo "test-executor: $executor"
           echo "test-cli: $cli"
           echo "test-prover: $prover"
           echo "test-disk-spill: $disk_spill"
           echo "test-stark-cuda-lib: $stark_cuda_lib"
+          echo "host-kat: $host_kat"
 
           # Allow "success" or "skipped" (skipped on merge queue pushes)
           if [[ "$executor" != "success" && "$executor" != "skipped" ]]; then
@@ -225,6 +258,9 @@ jobs:
             exit 1
           fi
           if [[ "$stark_cuda_lib" != "success" && "$stark_cuda_lib" != "skipped" ]]; then
+            exit 1
+          fi
+          if [[ "$host_kat" != "success" && "$host_kat" != "skipped" ]]; then
             exit 1
           fi
 
