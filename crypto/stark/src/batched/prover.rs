@@ -2238,6 +2238,26 @@ where
     let trace_term_coeffs = layout.build_trace_term_coeffs(&trace_term_powers);
     let gammas = deep_composition_coefficients;
 
+    // Batched R4: the composition parts live in the host `retained_parts` (they
+    // were downloaded after the R2 device commit), so `gpu_composition_parts` is
+    // unset and the DEEP composition would fall to the host
+    // `build_r4_inv_denoms_cpu` batch-inverse of the denominators (~1.6 s/epoch).
+    // Upload the parts to a device handle so it takes the fully-resident GPU path
+    // (device parts + device inv-denoms) instead. The parts are uploaded either
+    // way — the host arm uploads them in-kernel — the win is running the inverse
+    // on the GPU. The handle is freed with `lde_trace` after this table's DEEP,
+    // so device memory stays O(1) in the table count.
+    #[cfg(feature = "cuda")]
+    if lde_trace.gpu_composition_parts().is_none()
+        && !composition_parts.is_empty()
+        && let Some(h) = crate::gpu_lde::upload_composition_parts_dev::<FieldExtension>(
+            &*composition_parts,
+            lde_trace.num_rows(),
+        )
+    {
+        lde_trace.set_gpu_composition_parts(h);
+    }
+
     P::compute_deep_composition_poly_evaluations(
         lde_trace,
         composition_parts,

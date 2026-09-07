@@ -2494,6 +2494,52 @@ where
     out
 }
 
+/// Upload host composition-part columns (`num_parts` ext3 columns of length
+/// `lde_size`) to a device [`math_cuda::lde::GpuLdeExt3`] in the de-interleaved
+/// slab layout `[(p*3 + k) * lde_size + row]` the DEEP kernel reads. Lets the
+/// batched R4, whose parts live in the host `retained_parts`, take the
+/// fully-resident DEEP path (device parts + device inv-denoms) instead of the
+/// host `build_r4_inv_denoms_cpu` batch-inverse. The staging stream is
+/// synchronised, so the returned handle carries no ready event (`ready: None`).
+/// Returns `None` (→ the caller's host DEEP path) on non-ext3, shape mismatch,
+/// or a device error.
+pub(crate) fn upload_composition_parts_dev<E>(
+    parts: &[Vec<FieldElement<E>>],
+    lde_size: usize,
+) -> Option<math_cuda::lde::GpuLdeExt3>
+where
+    E: IsField + 'static,
+{
+    if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
+        return None;
+    }
+    let num_parts = parts.len();
+    if num_parts == 0 || lde_size == 0 || parts.iter().any(|p| p.len() != lde_size) {
+        return None;
+    }
+    let mut slab = vec![0u64; num_parts * 3 * lde_size];
+    for (p, col) in parts.iter().enumerate() {
+        // SAFETY: E == ext3 (checked); each element is `[u64; 3]`.
+        let s = unsafe { ext3_slice_to_u64::<E>(col) };
+        for (r, chunk) in s.chunks_exact(3).enumerate() {
+            slab[(p * 3) * lde_size + r] = chunk[0];
+            slab[(p * 3 + 1) * lde_size + r] = chunk[1];
+            slab[(p * 3 + 2) * lde_size + r] = chunk[2];
+        }
+    }
+    let be = math_cuda::device::backend().ok()?;
+    let stream = be.next_stream();
+    let dev = stream.clone_htod(&slab).ok()?;
+    stream.synchronize().ok()?;
+    Some(math_cuda::lde::GpuLdeExt3 {
+        buf: std::sync::Arc::new(dev),
+        m: num_parts,
+        lde_size,
+        tree: None,
+        ready: None,
+    })
+}
+
 /// R4 GPU dispatch: per-row DEEP composition over the full LDE domain.
 /// Reuses the device-resident main + (optional) aux LDE handles from R1
 /// and, when supplied, the device-resident composition-parts LDE handle
