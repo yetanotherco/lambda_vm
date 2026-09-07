@@ -907,16 +907,18 @@ fn the_emitted_permutation_count_meets_the_pinned_prediction() {
 ///
 /// ```text
 ///   selects/query = index_bits                     (pow_bits, once per query)
-///                 + 2 · merkle_depth · num_groups  (trace walks)
+///                 + w · merkle_depth · num_groups  (trace walks)
 ///                 + num_committed                  (FRI leaf ordering)
-///                 + 2 · path_steps_per_query       (FRI walks)
+///                 + w · path_steps_per_query       (FRI walks)
 /// ```
 ///
-/// `pow_bits` emits one `Select` per bit (`edsl.rs:257-262`) and each walk level
-/// two, since a digest is two words and both must swap on the same bit
-/// (`edsl.rs:164-169`). A second derivation makes the measured count exceed the
-/// closed form by exactly `index_bits`, and nothing cancels it. Re-falsified in
-/// that form: the injected defect now fails with "a surplus of 11 index bits".
+/// where `w` is the digest's width in arena words — two on a byte hash, one on
+/// an algebraic one. `pow_bits` emits one `Select` per bit (`edsl.rs:257-262`)
+/// and each walk level one per digest word, since every word of a digest must
+/// swap on the same bit (`edsl.rs:164-169`). A second derivation makes the
+/// measured count exceed the closed form by exactly `index_bits`, and nothing
+/// cancels it. Re-falsified in that form: the injected defect now fails with "a
+/// surplus of 11 index bits".
 #[test]
 fn the_fri_join_adds_no_second_point_derivation() {
     let h = host_fri(2048, 2);
@@ -947,10 +949,13 @@ fn the_fri_join_adds_no_second_point_derivation() {
     let per_query_selects = selects(&two) - selects(&one);
     let per_query_decs = decs(&two) - decs(&one);
 
+    // The digest's width, as the HOST reads it: `emit` builds at
+    // `WrapHash::production()`, whose builder width this is the counterpart of.
+    let dw = super::proof_arena::words_per_root();
     let expected_selects = h.shape.index_bits()
-        + 2 * sub.merkle_depth * groups.len()
+        + dw * sub.merkle_depth * groups.len()
         + h.shape.num_committed()
-        + 2 * h.shape.path_steps_per_query();
+        + dw * h.shape.path_steps_per_query();
     assert_eq!(
         per_query_selects,
         expected_selects,
@@ -959,11 +964,11 @@ fn the_fri_join_adds_no_second_point_derivation() {
          steps. A surplus of {} index bits is a second point derivation or a \
          second index decomposition",
         h.shape.index_bits(),
-        2 * sub.merkle_depth * groups.len(),
+        dw * sub.merkle_depth * groups.len(),
         groups.len(),
         sub.merkle_depth,
         h.shape.num_committed(),
-        2 * h.shape.path_steps_per_query(),
+        dw * h.shape.path_steps_per_query(),
         h.shape.path_steps_per_query(),
         h.shape.index_bits(),
     );
@@ -1042,7 +1047,10 @@ fn no_tampered_fri_value_can_pass() {
     execute(&program, &honest, &crate::hash_pin::BLOCK_HASHER)
         .expect("the honest run must execute");
 
-    let stride = h.shape.query_words();
+    // Host-side offsets at the host's digest width; the program was built at
+    // `WrapHash::production()`, which this is the counterpart of.
+    let dw = super::proof_arena::words_per_root();
+    let stride = h.shape.query_words(dw);
     // (label, arena, word) — arena order is the driver's: deep, roots, zetas,
     // coeffs, queries.
     let bump: Vec<(&str, usize, usize)> = vec![
@@ -1059,7 +1067,7 @@ fn no_tampered_fri_value_can_pass() {
         (
             "layer 0 sibling, top level",
             4,
-            2 * h.shape.layer_path_len(0) - 1,
+            dw * h.shape.layer_path_len(0) - 1,
         ),
         ("second query's layer 0 evaluation", 4, stride),
     ];
@@ -1076,7 +1084,7 @@ fn no_tampered_fri_value_can_pass() {
     // decommitment. Every word is a real prover value.
     let mut spliced = honest.clone();
     let (from, to) = (stride, 0usize);
-    let len = 1 + 2 * h.shape.layer_path_len(0);
+    let len = 1 + dw * h.shape.layer_path_len(0);
     let borrowed: Vec<LfmWord> = spliced[4][from..from + len].to_vec();
     assert_ne!(
         borrowed,

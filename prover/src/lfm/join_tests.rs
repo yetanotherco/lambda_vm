@@ -857,8 +857,12 @@ fn control_program_source(
     let uniforms = b.declare_arena(2);
     let ood = b.declare_arena((shape.deep.num_eval_points * shape.deep.num_total_cols) as u32);
     let parts_arena = b.declare_arena(shape.deep.num_composition_parts as u32);
-    let roots = b.declare_arena(2 * groups.len() as u32);
-    let queries = b.declare_arena(shape.query_words() as u32);
+    // The roots and the query stride follow THIS builder's digest width, as the
+    // production emitter's do — a literal two here is a byte-hash assumption
+    // that the executor's arena-length check refuses under an algebraic pin.
+    let dw = super::edsl::digest_words(&b);
+    let roots = b.declare_arena(dw * groups.len() as u32);
+    let queries = b.declare_arena(shape.query_words(dw as usize) as u32);
     let extra = b.declare_arena(match control {
         // A second copy of every folded value, both points.
         Control::SplitValues => {
@@ -888,7 +892,7 @@ fn control_program_source(
     let commitments: Vec<GroupCommitment> = groups
         .iter()
         .enumerate()
-        .map(|(i, g)| GroupCommitment::hint(&mut b, roots, 2 * i as u32, *g))
+        .map(|(i, g)| GroupCommitment::hint(&mut b, roots, dw * i as u32, *g))
         .collect();
     let inv = emit_deep_invariants(&mut b, &shape.deep, gamma, zeta, &ood_steps, &claimed_parts);
 
@@ -1102,7 +1106,8 @@ fn sweep_tampers(h: &HostSubProof, label: &str) {
                 // Offset of this group's value `slot` inside the query arena.
                 let mut off = 1usize;
                 for prior in groups.iter().take(g) {
-                    off += prior.num_values() + 2 * h.shape.merkle_depth;
+                    off += prior.num_values()
+                        + super::proof_arena::words_per_root() * h.shape.merkle_depth;
                 }
                 off + slot
             };
@@ -1225,7 +1230,7 @@ fn sweep_tampers(h: &HostSubProof, label: &str) {
         siblings[level][0] ^= 1;
         let mut arenas = h.arenas(&[q]);
         let base = 1 + groups[0].num_values();
-        arenas[4][base..base + 2 * h.shape.merkle_depth]
+        arenas[4][base..base + super::proof_arena::words_per_root() * h.shape.merkle_depth]
             .copy_from_slice(&commitments_to_arena(&siblings));
         execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
             .err()

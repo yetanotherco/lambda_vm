@@ -127,14 +127,17 @@ impl TableVerifyShape {
         );
     }
 
-    /// Arena words this sub-proof's trace openings occupy.
-    pub fn opening_words(&self) -> usize {
-        self.num_queries * self.sub.opening_words()
+    /// Arena words this sub-proof's trace openings occupy, at `digest_words`
+    /// per sibling digest — the builder's width on the machine side, the host's
+    /// on the host side (see `SubProofShape::query_words`).
+    pub fn opening_words(&self, digest_words: usize) -> usize {
+        self.num_queries * self.sub.opening_words(digest_words)
     }
 
-    /// Arena words this sub-proof's FRI openings occupy.
-    pub fn fri_words(&self) -> usize {
-        self.num_queries * self.fri.query_words()
+    /// Arena words this sub-proof's FRI openings occupy, at `digest_words` per
+    /// sibling digest.
+    pub fn fri_words(&self, digest_words: usize) -> usize {
+        self.num_queries * self.fri.query_words(digest_words)
     }
 }
 
@@ -146,8 +149,9 @@ impl TableVerifyShape {
 /// coefficients — reaches the legs as cells the spine already bound.
 #[derive(Clone, Copy, Debug)]
 pub struct TableQueryArenas {
-    /// Per query, per group: the row-pair values then the sibling digests (two
-    /// words per level). NO index word — the index is the transcript's.
+    /// Per query, per group: the row-pair values then the sibling digests
+    /// (`edsl::digest_words` per level). NO index word — the index is the
+    /// transcript's.
     pub openings: ArenaId,
     /// Per query, per committed FRI layer: the symmetric evaluation then the
     /// sibling digests.
@@ -156,9 +160,10 @@ pub struct TableQueryArenas {
 
 /// Declare the query arenas for one sub-proof.
 pub fn declare_table_arenas(b: &mut LfmBuilder, shape: &TableVerifyShape) -> TableQueryArenas {
+    let digest_words = super::edsl::digest_words(b) as usize;
     TableQueryArenas {
-        openings: b.declare_arena(shape.opening_words() as u32),
-        fri: b.declare_arena(shape.fri_words() as u32),
+        openings: b.declare_arena(shape.opening_words(digest_words) as u32),
+        fri: b.declare_arena(shape.fri_words(digest_words) as u32),
     }
 }
 
@@ -310,7 +315,9 @@ pub fn emit_table_verification(
     };
 
     // ---- (4) per query: authenticate, fold DEEP, then fold FRI.
-    let stride = shape.sub.opening_words();
+    let stride = shape
+        .sub
+        .opening_words(super::edsl::digest_words(b) as usize);
     let mut fri_terminal = Vec::with_capacity(shape.num_queries);
     for (qi, bits) in challenges.iota_bits.iter().enumerate() {
         let mut cursor = (qi * stride) as u32;

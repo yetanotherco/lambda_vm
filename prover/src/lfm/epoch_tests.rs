@@ -4370,7 +4370,8 @@ fn expected_arena_words(e: &RealEpoch, with_legs: bool) -> usize {
         total += s.fri.num_terminal_coeffs();
         total += usize::from(s.grinding_factor > 0);
         if with_legs {
-            total += leg.verify.opening_words() + leg.verify.fri_words();
+            let dw = super::proof_arena::words_per_root();
+            total += leg.verify.opening_words(dw) + leg.verify.fri_words(dw);
         }
     }
     total
