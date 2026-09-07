@@ -103,7 +103,7 @@ fn probe_states(seed: u64, n: usize) -> Vec<[u64; 12]> {
 
 #[test]
 fn rpx_device_permutation_matches_the_host_oracle() {
-    let states = probe_states(0x5250_58, 256);
+    let states = probe_states(0x0052_5058, 256);
     let got = math_cuda::rpx::permute_probe(&states).expect("device permute probe");
     assert_eq!(got.len(), states.len());
     for (n, (input, out)) in states.iter().zip(got.iter()).enumerate() {
