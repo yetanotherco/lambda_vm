@@ -60,7 +60,10 @@ inline constexpr uint64_t MIDEN_HASH_ELEMENTS[NUM_MIDEN_HASH_ELEMENTS][4] = {
 // is self-contained. All values are canonical (`< p`).
 //
 //   Table 2 — the bare permutation: all-zero, all-(p−1), `0..12`, alternating,
-//             two one-hot lanes, four seeded random states.
+//             two one-hot lanes, four seeded random states, and the row named
+//             "canonicalisation witness" — an input whose output lane 0 is the
+//             raw twin `p + 1` before the kernel's final canonicalisation loop
+//             (derived by `rpx_canon_witness.py`; the harness replays it).
 //   Table 3 — the leaf sponge (`algebraic_commit::sponge_leaf`) at 0, 1, 7, 8,
 //             9, 16 and 17 felts; `felts[]` is zero beyond `len`.
 //   Table 4 — the parent `compress(l, r)`.
@@ -89,7 +92,7 @@ struct RpxParentVector {
 //   cargo test -p lambda-vm-prover --test rpx_host_kat_vectors -- --ignored --nocapture
 // (prover/tests/rpx_host_kat_vectors.rs). Paste verbatim; do not edit by hand.
 
-inline constexpr int NUM_RPX_PERMUTATION_VECTORS = 10;
+inline constexpr int NUM_RPX_PERMUTATION_VECTORS = 11;
 inline constexpr RpxPermutationVector RPX_PERMUTATION_VECTORS[NUM_RPX_PERMUTATION_VECTORS] = {
     {"all-zero",
      {0ull, 0ull, 0ull, 0ull, 0ull, 0ull, 0ull, 0ull, 0ull, 0ull, 0ull, 0ull},
@@ -121,6 +124,9 @@ inline constexpr RpxPermutationVector RPX_PERMUTATION_VECTORS[NUM_RPX_PERMUTATIO
     {"random #4",
      {389113379214421922ull, 1947929307647562990ull, 667333451960644926ull, 3487966933876559811ull, 4195385248066926332ull, 2153180418459341747ull, 2727969323864685845ull, 29633526854483411ull, 990649808851061115ull, 1355410330370587755ull, 11605520071788416946ull, 4884409355120715354ull},
      {7025469669435110295ull, 17270957437800346011ull, 13702589935335807876ull, 3666927270871270796ull, 16666721215101099684ull, 531487850530305024ull, 15550553335698242665ull, 8959489596577675281ull, 11020601500923732075ull, 16110845767020565054ull, 4778394010005480449ull, 7715575140819562371ull}},
+    {"canonicalisation witness",
+     {15055324559807314153ull, 10242425218814686878ull, 9326602342065331773ull, 15451135068213333861ull, 17942679252967467289ull, 9284164080268346300ull, 5090350781253234438ull, 9328738269791029498ull, 18385380985273671691ull, 3238854716908013220ull, 5495049682105235955ull, 15773368383738726538ull},
+     {1ull, 9023883145409261355ull, 5839950281880325605ull, 5697668523532261268ull, 13033383890974728246ull, 14801658261553133914ull, 3025695522291518949ull, 12907720598453111556ull, 14827640614007773288ull, 14642633917625231592ull, 3090884930034198616ull, 2894057710100710233ull}},
 };
 
 inline constexpr int NUM_RPX_LEAF_VECTORS = 7;
