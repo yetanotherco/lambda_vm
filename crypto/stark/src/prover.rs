@@ -2001,7 +2001,7 @@ pub trait IsStarkProver<
                 boundary_coefficients,
                 rap_challenges,
             ) {
-                let want_host = !round_1_result.lde_trace.host_trace_empty();
+                let want_host = !lde_trace.host_trace_empty();
                 // num_parts==1 de-interleaves `H` (the single part); num_parts==2
                 // runs the degree-2 quotient split. Both keep the parts resident.
                 match Self::decompose_comp_h_dev(
