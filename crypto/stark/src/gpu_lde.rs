@@ -46,6 +46,17 @@ fn device_hash_of<B: DeviceTreeBackend>() -> math_cuda::DeviceHash {
     match B::COMMITMENT_HASH {
         CommitmentHash::Keccak256 => math_cuda::DeviceHash::Keccak256,
         CommitmentHash::Blake3 => math_cuda::DeviceHash::Blake3,
+        // The algebraic hashes have no device kernels yet. Loud by design: a
+        // build must never quietly commit under a hash the configuration did
+        // not name (HASH-PINNING.md), so there is no byte-hash fallback here.
+        // The per-table redo's dispatch lane replaces this arm with real
+        // `DeviceHash` variants once the kernels exist.
+        CommitmentHash::Rpo256 | CommitmentHash::Rpx256 | CommitmentHash::Poseidon => {
+            unimplemented!(
+                "{:?}: device Merkle commits are keccak/BLAKE3-only until the algebraic kernels land",
+                B::COMMITMENT_HASH
+            )
+        }
     }
 }
 use crate::fri::fri_decommit::FriDecommitment;
