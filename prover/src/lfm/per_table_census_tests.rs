@@ -642,12 +642,28 @@ fn wrap_options() -> ProofOptions {
 
 /// A fixture-scale twin of [`wrap_options`]: the same blowup and the same
 /// terminal degree, two queries, at a height that still folds several FRI layers.
-fn fixture_wrap_options() -> ProofOptions {
+fn fixture_wrap_options_at(queries: usize) -> ProofOptions {
     ProofOptions {
-        fri_number_of_queries: 2,
+        fri_number_of_queries: queries,
         ..wrap_options()
     }
 }
+
+/// Query counts the emission arm sweeps, so the glue can be SPLIT rather than
+/// quoted as one percentage.
+///
+/// ★ Why a sweep and not a single point. Emitted − closed form is
+/// `glue(q) = F + P·q`: `F` is the query-INVARIANT per-table spine (the OOD
+/// blocks, the terminal coefficients, the layer roots, the grinding check) and
+/// `P` is the per-query remainder (index-bit sampling). One point cannot
+/// separate them, and the two extrapolate to production's 110 queries by
+/// factors 55 apart — the difference between the glue being under 1% of the leg
+/// there and 57% of it. Three points fit the line and the middle one checks it.
+const GLUE_SWEEP: [usize; 3] = [2, 4, 8];
+
+/// Queries the wrap preset carries, which is what the glue must be
+/// extrapolated to.
+const PRODUCTION_QUERIES: usize = 110;
 
 const FIXTURE_LOG_HEIGHT: u32 = 12;
 
@@ -1026,6 +1042,42 @@ fn the_per_table_aggregator_tree_is_derived_from_the_measured_leg() {
          not protected against it."
     );
 
+    // ---- the same rule under the MEASURED glue, read multiplicatively.
+    //
+    // The emission arm measures glue at +57.2% of the leg (RPX, fixture heights,
+    // 2 queries — box B at `1de0e3b4`). Read as a multiplier that is the
+    // PESSIMISTIC bound, and it is the reading that decides: a fan-in 3 node
+    // crosses 2^21 outright and doubles its hash table, while fan-in 2 still
+    // clears the rule. The emission arm's query sweep says how much of the
+    // +57.2% survives to 110 queries; this row is the bound if none of it does.
+    const MEASURED_GLUE_MULTIPLIER: f64 = 1.5716;
+    println!(
+        "\n   ⇒ SAME RULE under the MEASURED glue read multiplicatively \
+         (×{MEASURED_GLUE_MULTIPLIER}, the pessimistic bound)"
+    );
+    for tenant in TENANTS.iter().filter(|t| t.algebraic) {
+        let airs = tenant.airs(&opts);
+        let tables = tenant_tables(tenant, &airs, &tenant.present_log_heights());
+        let (_, leg) = bill(&tables, WrapHash::Blake3, "LFM_HASH");
+        for f in [2u64, 3] {
+            let inv = ((f * leg as u64) as f64 * MEASURED_GLUE_MULTIPLIER).round() as u64;
+            let height = inv.next_power_of_two();
+            println!(
+                "      {:<12} fan-in {f}: {inv:>9} → 2^{} ({:>5.1}% of 2^21, \
+                 headroom {:>5.1}% of its own height){}",
+                tenant.label,
+                height.trailing_zeros(),
+                100.0 * inv as f64 / (1u64 << 21) as f64,
+                100.0 * (1.0 - inv as f64 / height as f64),
+                if height > (1u64 << 21) {
+                    "  ⚠ CROSSES 2^21 — the hash table doubles"
+                } else {
+                    ""
+                },
+            );
+        }
+    }
+
     // RPX with the keccak family — the shape the record actually exhibits.
     let airs = TENANTS[1].airs(&opts);
     let tables = tenant_tables(&TENANTS[1], &airs, &TENANTS[1].present_log_heights());
@@ -1042,6 +1094,39 @@ fn the_per_table_aggregator_tree_is_derived_from_the_measured_leg() {
         "fan-in 2 must clear the 25% rule with the keccak family present — that \
          is what makes it the recommendation; headroom {:.1}%",
         100.0 * (1.0 - inv2 as f64 / cliff as f64),
+    );
+
+    // ★ The recommendation's real strength: fan-in 2 clears the rule under the
+    // PESSIMISTIC glue reading as well, and fan-in 3 does not merely fail the
+    // rule there — it crosses the cliff. Asserted so the two do not have to be
+    // re-derived by hand from the printed table.
+    let pess = |f: u64| ((f * leg as u64) as f64 * 1.5716).round() as u64;
+    assert!(
+        1.0 - pess(2) as f64 / cliff as f64 >= 0.25,
+        "fan-in 2 must clear 25% under the measured glue too: {} = {:.1}% of 2^21",
+        pess(2),
+        100.0 * pess(2) as f64 / cliff as f64,
+    );
+    // ⚠ Deliberately NOT `assert!(pess(3) > cliff)`. It is true — 2,109,260
+    // against 2,097,152 — but by 0.58%, and a tripwire that flips on a 0.6%
+    // drift is noise rather than a guard. The robust statement is the one the
+    // rule is about: under the pessimistic reading fan-in 3 is nowhere near 25%
+    // headroom, it is OVER the cliff. That takes a 20%+ move to flip.
+    assert!(
+        pess(3) as f64 / cliff as f64 > 0.75,
+        "under the measured glue a fan-in 3 node must be far outside the 25% \
+         rule — if this ever fails, fan-in 3 has become viable and the \
+         recommendation should be revisited; it stands at {} = {:.1}% of 2^21",
+        pess(3),
+        100.0 * pess(3) as f64 / cliff as f64,
+    );
+    println!(
+        "\n   ⇒ margin note: under the pessimistic glue, fan-in 3 lands at {} \
+         against the 2^21 cliff of {cliff} — over it, but by only {:.2}%. The \
+         recommendation does not rest on that 0.6%: fan-in 3 already fails the \
+         rule at 13.6% headroom under the production-anchored additive glue.",
+        pess(3),
+        100.0 * (pess(3) as f64 / cliff as f64 - 1.0),
     );
 }
 
@@ -1203,56 +1288,99 @@ fn tenant_leg_program(tables: &[TableShape]) -> LfmProgram {
 #[test]
 #[ignore = "emission instrument: run explicitly, prints the census"]
 fn the_tenant_leg_emits_and_censuses() {
-    let opts = fixture_wrap_options();
     println!(
         "\n★ EMITTED PER-TABLE LEG — fixture heights 2^{FIXTURE_LOG_HEIGHT}, \
-         blowup {} / {} queries",
-        opts.blowup_factor, opts.fri_number_of_queries
+         blowup 4, queries swept over {GLUE_SWEEP:?}\n   \
+         glue = emitted − closed form, fitted as F + P·q and extrapolated to the \
+         wrap preset's {PRODUCTION_QUERIES} queries"
     );
 
     for tenant in &TENANTS {
-        let airs = tenant.airs(&opts);
-        let heights = vec![FIXTURE_LOG_HEIGHT; airs.air_refs().len()];
-        let tables = tenant_tables(tenant, &airs, &heights);
         let hash_chip = if tenant.algebraic {
             "LFM_HASH"
         } else {
             "LFM_BLAKE3"
         };
-        let (b_bill, leg) = bill(&tables, WrapHash::Blake3, hash_chip);
+        let mut points: Vec<(usize, i64, usize)> = Vec::new();
+        let mut shape = (0usize, 0usize, 0usize, 0usize, 0u64);
 
-        let program = tenant_leg_program(&tables);
-        let emitted = super::wrap_tests::hash_ops(&program, WrapHash::Blake3);
-        let (main, aux) = super::airs::lfm_cell_counts_with_hasher(&program, tenant.hasher);
-        let cells = main + 3 * aux;
+        for q in GLUE_SWEEP {
+            let opts = fixture_wrap_options_at(q);
+            let airs = tenant.airs(&opts);
+            let heights = vec![FIXTURE_LOG_HEIGHT; airs.air_refs().len()];
+            let tables = tenant_tables(tenant, &airs, &heights);
+            let (b_bill, leg) = bill(&tables, WrapHash::Blake3, hash_chip);
+
+            let program = tenant_leg_program(&tables);
+            let emitted = super::wrap_tests::hash_ops(&program, WrapHash::Blake3);
+            let (main, aux) = super::airs::lfm_cell_counts_with_hasher(&program, tenant.hasher);
+            assert!(
+                emitted >= leg,
+                "{}: the emitted count cannot be below the leg's closed form — the \
+                 difference IS the glue",
+                tenant.label
+            );
+            points.push((q, emitted as i64 - leg as i64, leg));
+            shape = (
+                tables.len(),
+                b_bill.total(),
+                b_bill.hash_matrix_leaves,
+                program.instrs.len(),
+                main + 3 * aux,
+            );
+        }
+
+        // ---- the fit. The endpoints give the line; the middle point checks it.
+        let (q0, g0, leg0) = points[0];
+        let (q2, g2, _) = points[2];
+        let (q1, g1, _) = points[1];
+        let per_query = (g2 - g0) as f64 / (q2 - q0) as f64;
+        let fixed = g0 as f64 - per_query * q0 as f64;
+        let predicted = fixed + per_query * q1 as f64;
+        let residual = (predicted - g1 as f64) / g1 as f64;
+
+        let leg_prod = leg0 as f64 / q0 as f64 * PRODUCTION_QUERIES as f64;
+        let glue_prod = fixed + per_query * PRODUCTION_QUERIES as f64;
 
         println!(
-            "\n   ── {} tenant: {} sub-proofs, {} instructions, {} arena words\n\
-             \x20     per-query bill {} blocks ({} hash matrix), leg closed form \
-             {leg}\n\
-             \x20     EMITTED {emitted} compressions ⇒ glue = {} ({:+.2}% of the \
-             leg)\n\
-             \x20     emitted program: {main} main + {aux} aux ext = {cells} \
-             base-equivalent cells",
-            tenant.label,
-            tables.len(),
-            program.instrs.len(),
-            program
-                .arena_schema
-                .lens
-                .iter()
-                .map(|l| *l as usize)
-                .sum::<usize>(),
-            b_bill.total(),
-            b_bill.hash_matrix_leaves,
-            emitted as i64 - leg as i64,
-            100.0 * (emitted as f64 - leg as f64) / leg as f64,
+            "\n   ── {} tenant: {} sub-proofs, {} blocks/query ({} hash matrix), \
+             {} instructions, {} cells at q={}",
+            tenant.label, shape.0, shape.1, shape.2, shape.3, shape.4, GLUE_SWEEP[2],
         );
+        for (q, g, leg) in &points {
+            println!(
+                "      q={q:<2} leg {leg:>7}  glue {g:>7}  ({:+.1}% of the leg)",
+                100.0 * *g as f64 / *leg as f64
+            );
+        }
+        println!(
+            "      FIT glue(q) = {fixed:.0} + {per_query:.1}·q  (q={q1}: predicted \
+             {predicted:.0} vs measured {g1}, {:+.2}%)\n      \
+             ⇒ at {PRODUCTION_QUERIES} queries: leg {leg_prod:.0}, glue \
+             {glue_prod:.0} = {:.1}% of the leg   [FIXTURE heights — see below]",
+            100.0 * residual,
+            100.0 * glue_prod / leg_prod,
+        );
+
         assert!(
-            emitted >= leg,
-            "{}: the emitted count cannot be below the leg's closed form — the \
-             difference IS the glue",
-            tenant.label
+            residual.abs() < 0.05,
+            "{}: glue(q) must be affine in the query count — the middle point \
+             missed the line through the endpoints by {:.1}%, so the split into a \
+             fixed spine and a per-query remainder does not hold and the \
+             extrapolation is not licensed",
+            tenant.label,
+            100.0 * residual,
         );
     }
+
+    println!(
+        "\n   ⚠ The extrapolation moves the glue's SHARE, not the fan-in verdict \
+         on its own. It is taken at FIXTURE heights (2^{FIXTURE_LOG_HEIGHT}), where \
+         each table commits 4 FRI layers against production's 12 and walks 13 \
+         Merkle levels against 21-25, so the fixed term F is UNDERSTATED at real \
+         heights. What carries is the property, not the constant: F is \
+         width-driven and query-invariant, so its share falls as the query count \
+         rises from {} to {PRODUCTION_QUERIES}.",
+        GLUE_SWEEP[0],
+    );
 }
