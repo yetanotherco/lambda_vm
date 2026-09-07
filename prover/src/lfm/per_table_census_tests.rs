@@ -821,7 +821,14 @@ fn the_per_table_aggregator_tree_is_derived_from_the_measured_leg() {
     // read multiplicatively it is ×1.340. Both are carried.
     const GLUE_ADDITIVE: u64 = 469_710;
     const GLUE_MULTIPLICATIVE: f64 = 1.340;
-    const WRAPS: u64 = 18;
+    /// Wraps a block aggregates: base epochs at 2^22 (`PLAN` T2) over the
+    /// measured 39.6M-cycle guest, so ⌈39.6e6 / 2^22⌉ = **10**, one wrap each.
+    /// MEASURED 2026-09-07 18:35 UTC. `PLAN` T2's 18 is the older guest.
+    ///
+    /// ★ The fan-in DECISION does not move with this number. A level-1 node
+    /// costs `f · leg + glue`, which is a function of the fan-in alone; the wrap
+    /// count sets how MANY nodes there are, not how big the biggest one is.
+    const WRAPS: u64 = 10;
 
     // The non-hash floor, as base-equivalent cells per hash INVOCATION. Two
     // readings, both anchored on a recorded number and both carried:
@@ -899,6 +906,28 @@ fn the_per_table_aggregator_tree_is_derived_from_the_measured_leg() {
                         rss_anchored(cells),
                     );
                 }
+            }
+        }
+
+        // ---- the whole tree, so the node COUNT is visible beside the node SIZE.
+        if tenant.algebraic {
+            for f in [2u64, 3] {
+                let mut level = WRAPS;
+                let mut shape = Vec::new();
+                let mut proofs = 0u64;
+                shape.push(level);
+                while level > 1 {
+                    level = level.div_ceil(f);
+                    shape.push(level);
+                    proofs += level;
+                }
+                let path: Vec<String> = shape.iter().map(|n| n.to_string()).collect();
+                println!(
+                    "      tree at fan-in {f}: {} — {proofs} aggregator proofs, \
+                     {} levels",
+                    path.join(" → "),
+                    shape.len() - 1,
+                );
             }
         }
 
