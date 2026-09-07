@@ -10,9 +10,12 @@
 //! On-device steps, picks a stream from the shared pool so rayon-parallel
 //! callers overlap on the GPU. Twiddles are cached in the backend.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
-use cudarc::driver::{CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
+use cudarc::driver::sys;
+use cudarc::driver::{
+    CudaSlice, CudaStream, CudaView, CudaViewMut, DevicePtrMut, LaunchConfig, PushKernelArg,
+};
 
 use crate::DeviceHash;
 use crate::Result;
@@ -392,24 +395,30 @@ fn launch_keccak_base_row_major_row_pair_range(
     Ok(())
 }
 
-/// Transpose row-major `lde_size × cols` → column-major with stride `lde_size`,
-/// returning the new device buffer. Used to convert the row-major LDE output to
-/// the column-major layout expected by downstream GPU kernels (DEEP, barycentric).
-/// No synchronize — callers on the same stream are ordered; other streams must
-/// synchronize themselves.
-fn launch_row_to_col_major(
-    stream: &Arc<CudaStream>,
+/// One `matrix_transpose_strided` launch: `dst[c * out_stride + r] =
+/// src[r * cols + c]` for `r < rows`, `c < cols`. `src` holds `rows * cols`
+/// contiguous row-major elements; `dst` must reach `(cols - 1) * out_stride +
+/// rows`. No synchronize — callers on the same stream are ordered; other
+/// streams must synchronize themselves.
+fn launch_transpose_tiles(
+    stream: &CudaStream,
     be: &Backend,
-    src: &CudaSlice<u64>,
-    lde_size: usize,
+    src: &CudaView<'_, u64>,
+    dst: &mut CudaViewMut<'_, u64>,
+    rows: usize,
     cols: usize,
-    lde_u64: u64,
-) -> Result<CudaSlice<u64>> {
-    let mut dst = stream.alloc_zeros::<u64>(lde_size * cols)?;
+    out_stride: u64,
+) -> Result<()> {
+    debug_assert!(rows >= 1 && cols >= 1, "empty transpose");
+    debug_assert!(src.len() >= rows * cols, "transpose source too short");
+    debug_assert!(
+        dst.len() >= (cols - 1) * out_stride as usize + rows,
+        "transpose destination too short"
+    );
     let cfg = LaunchConfig {
         grid_dim: (
             (cols as u32).div_ceil(32),
-            (lde_size as u32).div_ceil(32).min(65535),
+            (rows as u32).div_ceil(32).min(65535),
             1,
         ),
         block_dim: (32, 32, 1),
@@ -419,13 +428,508 @@ fn launch_row_to_col_major(
         stream
             .launch_builder(&be.matrix_transpose_strided)
             .arg(src)
-            .arg(&mut dst)
-            .arg(&(lde_size as u32))
+            .arg(dst)
+            .arg(&(rows as u32))
             .arg(&(cols as u32))
-            .arg(&lde_u64)
+            .arg(&out_stride)
             .launch(cfg)?;
     }
+    Ok(())
+}
+
+/// Transpose the first `rows` row-major rows of `src` (`cols` wide) into a
+/// NEW column-major buffer with column stride `out_stride` (the trace-domain
+/// snapshot the LogUp fingerprint kernel reads). The LDE itself is never
+/// transposed this way — see [`transpose_lde_in_place`], which keeps one
+/// LDE-sized buffer live instead of two.
+fn launch_row_to_col_major(
+    stream: &Arc<CudaStream>,
+    be: &Backend,
+    src: &CudaSlice<u64>,
+    rows: usize,
+    cols: usize,
+    out_stride: u64,
+) -> Result<CudaSlice<u64>> {
+    let mut dst = stream.alloc_zeros::<u64>(out_stride as usize * cols)?;
+    launch_transpose_tiles(
+        stream,
+        be,
+        &src.slice(0..rows * cols),
+        &mut dst.slice_mut(..),
+        rows,
+        cols,
+        out_stride,
+    )?;
     Ok(dst)
+}
+
+// ── In-place row-major → column-major transpose of the LDE ──────────────────
+//
+// The fused commit computes the LDE row-major (one H2D, row-major NTT and leaf
+// kernels) but every downstream kernel reads it column-major. Transposing into
+// a fresh buffer held TWO LDE-sized allocations live at once — the peak of the
+// whole per-table commit, and the term that pushed 2^21-row tables past 32 GiB.
+// Here the transpose happens inside the one allocation, in two passes over the
+// same `matrix_transpose_strided` kernel plus device-to-device copies, so the
+// bytes that land are exactly the ones the out-of-place kernel used to write:
+//
+//  1. Block pass. The `rows × cols` matrix is `blocks` row blocks of
+//     `rows_per_block` rows. Each block is transposed on its own into `cols`
+//     runs of `rows_per_block` consecutive rows of one column. Blocks ping-pong
+//     through one spare block of scratch: block 0 lands in the scratch, block
+//     `b` lands where block `b - 1` was, and the scratch finally lands in the
+//     last slot — so slot `s` holds block `(s + 1) mod blocks`.
+//  2. Run pass. Column-major wants the runs ordered `(column, block)`; the
+//     block pass left them ordered `(slot, column)`. That is a permutation of
+//     whole runs, followed cycle by cycle in place with the scratch runs as the
+//     parking space, and issued as batched device copies.
+//
+// Scratch is one block plus one run — capped at
+// `INPLACE_TRANSPOSE_SCRATCH_BYTES` — instead of a second LDE.
+
+/// Cap on the in-place transpose's device scratch: one transposed row block
+/// (`cols` runs) plus one parking run for the cycle walk.
+const INPLACE_TRANSPOSE_SCRATCH_BYTES: usize = 256 << 20;
+
+/// Row-block geometry of the in-place transpose: `rows == blocks *
+/// rows_per_block`, both powers of two, `blocks >= 2`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TransposeGeometry {
+    rows_per_block: usize,
+    blocks: usize,
+}
+
+fn transpose_geometry(rows: usize, cols: usize) -> TransposeGeometry {
+    debug_assert!(rows >= 2 && rows.is_power_of_two(), "rows: {rows}");
+    debug_assert!(cols >= 1, "cols: {cols}");
+    // Longest power-of-two run whose scratch (`cols + 1` runs) fits the cap.
+    let run_cap = (INPLACE_TRANSPOSE_SCRATCH_BYTES / ((cols + 1) * 8)).max(1);
+    let run_cap = 1usize << run_cap.ilog2();
+    // At least eight blocks whenever the matrix has the rows for it, so the
+    // small shapes the parity suites drive take the same multi-block
+    // permutation as production instead of a trivial two-block one.
+    let rows_per_block = run_cap.min((rows / 8).max(1));
+    TransposeGeometry {
+        rows_per_block,
+        blocks: rows / rows_per_block,
+    }
+}
+
+/// A run — `rows_per_block` consecutive rows of one column — by run index,
+/// either inside the LDE buffer or inside the scratch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Run {
+    Buf(usize),
+    Scratch(usize),
+}
+
+/// Sink for the run copies the permutation issues. The pairs inside one
+/// `batch` call are independent — destinations are distinct and no destination
+/// aliases a source of the same batch — so a sink may execute them in any
+/// order or concurrently. Successive batches are ordered.
+trait RunCopier {
+    fn batch(&mut self, copies: &[(Run, Run)]) -> Result<()>;
+}
+
+/// After the block pass, run position `p = slot * cols + c` holds column `c`
+/// of block `(slot + 1) mod blocks`; column-major needs that run at
+/// `c * blocks + block`. This is the inverse map: the position whose run must
+/// end up at `q`.
+fn run_source_of(q: usize, blocks: usize, cols: usize) -> usize {
+    let (c, block) = (q / blocks, q % blocks);
+    ((block + blocks - 1) % blocks) * cols + c
+}
+
+/// Move every run to its column-major position, in place, cycle by cycle.
+/// A cycle `[p0, p1, ..]` (run `p_{i+1}` moves to `p_i`) is served in
+/// segments of at most `cols` moves: one batch parks the segment's sources in
+/// scratch runs `0..m`, the next lands them; run `p0` waits in scratch run
+/// `cols` until the cycle closes. About `2 * blocks + 3 * cycles` batches.
+fn permute_runs_to_col_major(
+    blocks: usize,
+    cols: usize,
+    copier: &mut impl RunCopier,
+) -> Result<()> {
+    let total = blocks * cols;
+    let parked = Run::Scratch(cols);
+    let mut visited = vec![false; total];
+    let mut cycle: Vec<usize> = Vec::new();
+    let mut copies: Vec<(Run, Run)> = Vec::with_capacity(cols + 1);
+    for p0 in 0..total {
+        if visited[p0] {
+            continue;
+        }
+        cycle.clear();
+        let mut p = p0;
+        loop {
+            visited[p] = true;
+            cycle.push(p);
+            p = run_source_of(p, blocks, cols);
+            if p == p0 {
+                break;
+            }
+        }
+        let k = cycle.len();
+        if k == 1 {
+            continue;
+        }
+        copier.batch(&[(parked, Run::Buf(p0))])?;
+        let mut i = 0;
+        while i < k - 1 {
+            let m = cols.min(k - 1 - i);
+            copies.clear();
+            copies.extend((0..m).map(|j| (Run::Scratch(j), Run::Buf(cycle[i + 1 + j]))));
+            copier.batch(&copies)?;
+            copies.clear();
+            copies.extend((0..m).map(|j| (Run::Buf(cycle[i + j]), Run::Scratch(j))));
+            if i + m == k - 1 {
+                copies.push((Run::Buf(cycle[k - 1]), parked));
+            }
+            copier.batch(&copies)?;
+            i += m;
+        }
+    }
+    Ok(())
+}
+
+/// `LAMBDA_VM_LDE_TRANSPOSE_UNBATCHED=1` issues the run pass as one
+/// device-to-device copy per run instead of `cuMemcpyBatchAsync` batches.
+/// Same bytes either way; a measurement and diagnostic knob only.
+fn transpose_copies_batched() -> bool {
+    static BATCHED: OnceLock<bool> = OnceLock::new();
+    *BATCHED.get_or_init(|| std::env::var_os("LAMBDA_VM_LDE_TRANSPOSE_UNBATCHED").is_none())
+}
+
+/// Issues run copies on the device: a batch is one `cuMemcpyBatchAsync`
+/// (source access in stream order, both sides device memory), or one
+/// `cuMemcpyDtoDAsync` per run when unbatched or for a single copy. The
+/// caller keeps the context bound to this thread and both pointers valid
+/// while the copier lives.
+struct DeviceRunCopier<'a> {
+    stream: &'a CudaStream,
+    device: sys::CUdevice,
+    buf: sys::CUdeviceptr,
+    scratch: sys::CUdeviceptr,
+    run_bytes: usize,
+    batched: bool,
+    dsts: Vec<sys::CUdeviceptr>,
+    srcs: Vec<sys::CUdeviceptr>,
+    sizes: Vec<usize>,
+}
+
+impl DeviceRunCopier<'_> {
+    fn addr(&self, run: Run) -> sys::CUdeviceptr {
+        match run {
+            Run::Buf(p) => self.buf + (p * self.run_bytes) as sys::CUdeviceptr,
+            Run::Scratch(j) => self.scratch + (j * self.run_bytes) as sys::CUdeviceptr,
+        }
+    }
+}
+
+impl RunCopier for DeviceRunCopier<'_> {
+    fn batch(&mut self, copies: &[(Run, Run)]) -> Result<()> {
+        if copies.is_empty() {
+            return Ok(());
+        }
+        if !self.batched || copies.len() == 1 {
+            for &(dst, src) in copies {
+                // SAFETY: both addresses lie inside allocations the caller
+                // keeps alive (`buf`, `scratch`), each run is `run_bytes`
+                // long, and the copy is queued on the caller's stream.
+                unsafe {
+                    sys::cuMemcpyDtoDAsync_v2(
+                        self.addr(dst),
+                        self.addr(src),
+                        self.run_bytes,
+                        self.stream.cu_stream(),
+                    )
+                    .result()?;
+                }
+            }
+            return Ok(());
+        }
+        self.dsts.clear();
+        self.srcs.clear();
+        self.sizes.clear();
+        for &(dst, src) in copies {
+            self.dsts.push(self.addr(dst));
+            self.srcs.push(self.addr(src));
+            self.sizes.push(self.run_bytes);
+        }
+        let location = sys::CUmemLocation {
+            type_: sys::CUmemLocationType_enum::CU_MEM_LOCATION_TYPE_DEVICE,
+            id: self.device,
+        };
+        let mut attrs = sys::CUmemcpyAttributes {
+            srcAccessOrder: sys::CUmemcpySrcAccessOrder_enum::CU_MEMCPY_SRC_ACCESS_ORDER_STREAM,
+            srcLocHint: location,
+            dstLocHint: location,
+            flags: 0,
+        };
+        let mut attrs_idxs = [0usize];
+        let mut fail_idx = 0usize;
+        // SAFETY: the three arrays are `copies.len()` long and outlive the
+        // call; one attribute set covers the whole batch (`attrsIdxs[0] ==
+        // 0`); every address is inside `buf` or `scratch`, which the caller
+        // keeps alive; the batch is queued on the caller's stream, and the
+        // pairs are independent (the `RunCopier` contract).
+        unsafe {
+            sys::cuMemcpyBatchAsync(
+                self.dsts.as_mut_ptr(),
+                self.srcs.as_mut_ptr(),
+                self.sizes.as_mut_ptr(),
+                copies.len(),
+                &mut attrs,
+                attrs_idxs.as_mut_ptr(),
+                1,
+                &mut fail_idx,
+                self.stream.cu_stream(),
+            )
+            .result()?;
+        }
+        Ok(())
+    }
+}
+
+/// Transpose the row-major `rows × cols` LDE in `buf` to column-major
+/// (column `c` at `c * rows`) IN PLACE and hand the same allocation back.
+/// Byte for byte the result of the out-of-place kernel — the two passes only
+/// move runs of values — with one block plus one run of scratch instead of a
+/// second LDE. Everything is queued on `stream`; nothing synchronizes.
+fn transpose_lde_in_place(
+    stream: &Arc<CudaStream>,
+    be: &Backend,
+    mut buf: CudaSlice<u64>,
+    rows: usize,
+    cols: usize,
+) -> Result<CudaSlice<u64>> {
+    assert_eq!(buf.len(), rows * cols, "in-place transpose shape");
+    if rows < 2 || cols < 2 {
+        // A single row or a single column reads the same in both layouts.
+        return Ok(buf);
+    }
+    let TransposeGeometry {
+        rows_per_block,
+        blocks,
+    } = transpose_geometry(rows, cols);
+    let block_elems = rows_per_block * cols;
+    // `alloc`, not `alloc_zeros`: every scratch element is written before it is
+    // read — the block pass fills the spare block, and each parking batch
+    // fills the runs the next batch drains.
+    let mut scratch = unsafe { stream.alloc::<u64>((cols + 1) * rows_per_block) }?;
+
+    // Block pass: block 0 → scratch, block b → slot b - 1, scratch → last slot.
+    {
+        let src = buf.slice(0..block_elems);
+        let mut spare = scratch.slice_mut(0..block_elems);
+        launch_transpose_tiles(
+            stream,
+            be,
+            &src,
+            &mut spare,
+            rows_per_block,
+            cols,
+            rows_per_block as u64,
+        )?;
+    }
+    for block in 1..blocks {
+        let (mut lo, hi) = buf.split_at_mut(block * block_elems);
+        let src = hi.slice(0..block_elems);
+        let mut dst = lo.slice_mut((block - 1) * block_elems..block * block_elems);
+        launch_transpose_tiles(
+            stream,
+            be,
+            &src,
+            &mut dst,
+            rows_per_block,
+            cols,
+            rows_per_block as u64,
+        )?;
+    }
+    stream.memcpy_dtod(
+        &scratch.slice(0..block_elems),
+        &mut buf.slice_mut((blocks - 1) * block_elems..blocks * block_elems),
+    )?;
+
+    // Run pass: raw driver copies, so the context must be current here.
+    be.ctx.bind_to_thread()?;
+    {
+        let (buf_ptr, _buf_record) = buf.device_ptr_mut(stream);
+        let (scratch_ptr, _scratch_record) = scratch.device_ptr_mut(stream);
+        let mut copier = DeviceRunCopier {
+            stream,
+            device: be.ctx.cu_device(),
+            buf: buf_ptr,
+            scratch: scratch_ptr,
+            run_bytes: rows_per_block * 8,
+            batched: transpose_copies_batched(),
+            dsts: Vec::with_capacity(cols + 1),
+            srcs: Vec::with_capacity(cols + 1),
+            sizes: Vec::with_capacity(cols + 1),
+        };
+        permute_runs_to_col_major(blocks, cols, &mut copier)?;
+    }
+    // `scratch` drops here: freed stream-ordered behind the copies that read it.
+    Ok(buf)
+}
+
+#[cfg(test)]
+mod inplace_transpose_tests {
+    use super::*;
+
+    #[test]
+    fn geometry_is_power_of_two_blocks_under_the_scratch_cap() {
+        for log_rows in 1..=27u32 {
+            let rows = 1usize << log_rows;
+            for cols in [1usize, 2, 3, 9, 37, 316, 436, 612, 2048, 65535] {
+                let g = transpose_geometry(rows, cols);
+                assert!(g.rows_per_block.is_power_of_two());
+                assert!(g.blocks.is_power_of_two());
+                assert_eq!(g.rows_per_block * g.blocks, rows, "{rows}x{cols}");
+                assert!(g.blocks >= 2, "{rows}x{cols}: {g:?}");
+                assert!(
+                    g.rows_per_block == 1
+                        || (cols + 1) * g.rows_per_block * 8 <= INPLACE_TRANSPOSE_SCRATCH_BYTES,
+                    "{rows}x{cols}: {g:?} busts the scratch cap"
+                );
+                if rows >= 8 && (cols + 1) * (rows / 8) * 8 <= INPLACE_TRANSPOSE_SCRATCH_BYTES {
+                    assert_eq!(g.blocks, 8, "{rows}x{cols}: {g:?}");
+                }
+            }
+        }
+        // The production shapes the brief sizes: LDE 2^22 × 316 and 2^22 × 436.
+        assert_eq!(
+            transpose_geometry(1 << 22, 316),
+            TransposeGeometry {
+                rows_per_block: 1 << 16,
+                blocks: 64
+            }
+        );
+        assert_eq!(
+            transpose_geometry(1 << 22, 436),
+            TransposeGeometry {
+                rows_per_block: 1 << 16,
+                blocks: 64
+            }
+        );
+    }
+
+    /// Host model of the buffer after the block pass: one label `(block, col)`
+    /// per run. Checks the independence contract on every batch.
+    struct ModelCopier {
+        buf: Vec<Option<(usize, usize)>>,
+        scratch: Vec<Option<(usize, usize)>>,
+        batches: usize,
+        copies: usize,
+    }
+
+    impl ModelCopier {
+        fn get(&self, run: Run) -> Option<(usize, usize)> {
+            match run {
+                Run::Buf(p) => self.buf[p],
+                Run::Scratch(j) => self.scratch[j],
+            }
+        }
+        fn set(&mut self, run: Run, v: Option<(usize, usize)>) {
+            match run {
+                Run::Buf(p) => self.buf[p] = v,
+                Run::Scratch(j) => self.scratch[j] = v,
+            }
+        }
+    }
+
+    impl RunCopier for ModelCopier {
+        fn batch(&mut self, copies: &[(Run, Run)]) -> Result<()> {
+            for (i, (dst, src)) in copies.iter().enumerate() {
+                assert!(
+                    copies[..i].iter().all(|(d, _)| d != dst),
+                    "duplicate destination {dst:?} in a batch"
+                );
+                assert!(
+                    copies.iter().all(|(_, s)| s != dst),
+                    "destination {dst:?} aliases a source of the same batch"
+                );
+                assert!(self.get(*src).is_some(), "copy from unwritten run {src:?}");
+            }
+            // Independent pairs: read everything, then write everything.
+            let values: Vec<_> = copies.iter().map(|(_, src)| self.get(*src)).collect();
+            for ((dst, _), v) in copies.iter().zip(values) {
+                self.set(*dst, v);
+            }
+            self.batches += 1;
+            self.copies += copies.len();
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn run_pass_lands_every_run_at_its_column_major_position() {
+        for (blocks, cols) in [
+            (2usize, 2usize),
+            (2, 3),
+            (4, 1),
+            (4, 3),
+            (8, 2),
+            (8, 7),
+            (8, 9),
+            (8, 316),
+            (8, 436),
+            (64, 9),
+            (64, 316),
+            (64, 436),
+            (128, 316),
+            (128, 612),
+            (16, 2048),
+        ] {
+            let mut model = ModelCopier {
+                buf: (0..blocks * cols)
+                    .map(|p| Some(((p / cols + 1) % blocks, p % cols)))
+                    .collect(),
+                scratch: vec![None; cols + 1],
+                batches: 0,
+                copies: 0,
+            };
+            permute_runs_to_col_major(blocks, cols, &mut model).unwrap();
+            for q in 0..blocks * cols {
+                assert_eq!(
+                    model.buf[q],
+                    Some((q % blocks, q / blocks)),
+                    "{blocks}x{cols}: run {q}"
+                );
+            }
+            // Cycle census of the same permutation, independently walked.
+            let total = blocks * cols;
+            let mut seen = vec![false; total];
+            let (mut cycles, mut fixed) = (0usize, 0usize);
+            for p0 in 0..total {
+                if seen[p0] {
+                    continue;
+                }
+                let (mut p, mut len) = (p0, 0usize);
+                loop {
+                    seen[p] = true;
+                    len += 1;
+                    p = run_source_of(p, blocks, cols);
+                    if p == p0 {
+                        break;
+                    }
+                }
+                if len == 1 {
+                    fixed += 1;
+                } else {
+                    cycles += 1;
+                }
+            }
+            // Every moving run is parked once and landed once — no more.
+            assert_eq!(model.copies, 2 * (total - fixed), "{blocks}x{cols}");
+            // One parking batch per cycle, then two batches per `cols` moves.
+            assert!(
+                model.batches <= 2 * blocks + 3 * cycles,
+                "{blocks}x{cols}: {} batches for {cycles} cycles",
+                model.batches
+            );
+        }
+    }
 }
 
 /// Row-major LDE input: either a host slice (uploaded) or an already-resident
@@ -662,9 +1166,10 @@ fn coset_lde_row_major_inner(
         None
     };
 
-    // Transpose row-major buf into column-major for the handle. Downstream
-    // kernels (DEEP, barycentric) expect buf[c * lde_size + r] (column-major).
-    let col_major_dev = launch_row_to_col_major(&stream, be, &buf, lde_size, total_cols, lde_u64)?;
+    // Transpose row-major buf into column-major for the handle, in place —
+    // queued behind the D2H above, so the host copy sees the row-major bytes.
+    // Downstream kernels (DEEP, barycentric) expect buf[c * lde_size + r].
+    let col_major_dev = transpose_lde_in_place(&stream, be, buf, lde_size, total_cols)?;
     // No host synchronize here: the handle carries a `ready` event instead,
     // and consumers on other streams wait on it device-side
     // (`wait_ready_on`). On the device-only path this makes the whole
@@ -867,8 +1372,8 @@ pub fn coset_lde_row_major_split_trees(
         .transpose()?;
 
     // Column-major handle for downstream GPU rounds (DEEP, barycentric,
-    // constraint composition).
-    let col_major_dev = launch_row_to_col_major(&stream, be, &buf, lde_size, m, lde_u64)?;
+    // constraint composition): transposed in place, behind the D2H above.
+    let col_major_dev = transpose_lde_in_place(&stream, be, buf, lde_size, m)?;
     let ready = be.take_event()?;
     ready.event().record(&stream)?;
 
