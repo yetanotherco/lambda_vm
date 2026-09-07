@@ -364,12 +364,351 @@ pub(super) fn epoch_profile(e: &super::epoch_tests::RealEpoch) -> String {
 /// in this suite and the run is minutes of CPU and tens of gigabytes. It is the
 /// wrap run's own harness, not a test the suite can afford on every PR.
 ///
+/// ⚠⚠ **BOTH FIGURES ARE UNVERIFIED FOR THE SHAPE THIS SIGNATURE DESCRIBES,
+/// and the same doubt covers [`MEASURED_BYTES_PER_CELL`]'s 481,327,124-cell
+/// point, which is attributed to this test.**
+///
+/// [`wrap_run`] passes [`EpochInputs::from_env`], and with no `LFM_CENSUS_*`
+/// set that is byte-for-byte [`EpochInputs::fixture`] — so in a CLEAN
+/// ENVIRONMENT this test and [`the_fixture_epoch_wraps`] build the same epoch
+/// through the same `real_epoch_from` and emit the same
+/// `epoch_program(&e, true)`. They are ONE program. That program measures
+/// **210,782 instructions** and 82,059,828 base-field-equivalent cells, an
+/// order of magnitude under both numbers above.
+///
+/// ⚖ The likely explanation is that these were recorded under `LFM_CENSUS_*`
+/// overrides — this test reads them, and a real-block run through this harness
+/// is what they exist for — but that is a HYPOTHESIS and is written as one. It
+/// has not been checked, and "the shape shrank since" is not excluded. The
+/// numbers are left in place rather than corrected, because correcting them
+/// would mean inventing replacements: what they need is one `--ignored` run of
+/// this test in a clean environment, after which all three move together or
+/// none do.
+///
+/// ⛔ Until that run exists, do not size a wrap run from anything on this
+/// signature. [`the_fixture_epoch_wraps`] carries measured numbers for the
+/// clean-environment shape.
+///
 /// Run with:
 /// `cargo test --release -p lambda-vm-prover --lib lfm::wrap_tests::the_wrap_proves_and_verifies -- --ignored --nocapture`
 #[test]
 #[ignore]
 fn the_wrap_proves_and_verifies() {
     wrap_run(super::proof_fixture::fixture_options());
+}
+
+/// ★★ THE SUITE-GATED PER-TABLE WRAP — the per-table twin of
+/// [`the_fixture_epoch_wraps_batched`], and NOT `#[ignore]`d.
+///
+/// # The gap it closes
+///
+/// Every other per-table epoch-verifier wrap is `#[ignore]`d
+/// ([`the_wrap_proves_and_verifies`], [`the_real_block_epoch_wraps`],
+/// [`the_from_proof_final_epoch_wraps`],
+/// [`the_real_block_proves_and_wraps_end_to_end`]), so the only assembled epoch
+/// verifier a suite run ever PROVED was the batched one. The per-table proof
+/// FORMAT was covered — the leg suites prove it, and the batched wrap's own
+/// proof goes through [`lfm_prove`] — but the per-table epoch verifier PROGRAM
+/// was not. This is the arm that keeps it from being the untested one.
+///
+/// # What proving adds to an execution
+///
+/// [`super::epoch_verify_tests::the_assembled_epoch_verifier_runs`] already
+/// EXECUTES this exact program on every suite run, and by the method's rule 2
+/// that says nothing about the chips: where the executor mirrors a computation
+/// the chip also does, only a prove+verify test sees the chip. So the delta here
+/// is the whole LFM machine — traces, AIRs, commitments and verifier — over the
+/// per-table assembled epoch verifier.
+///
+/// # The pin, NAMED rather than implied
+///
+/// The classification rule, stated here rather than cited — the document that
+/// carries it lands with the RPX pin and does not exist on this branch:
+///
+/// > A program built at `WrapHash::production()` emits `Instr::Hash` and must
+/// > be proved under `BLOCK_HASHER`. A program that pins a byte hash on its own
+/// > builder emits none, never consults the socket, and is correct at the
+/// > registry's blessed default under every pin.
+///
+/// `epoch_tests::epoch_program` builds at [`WrapHash::production()`], so this
+/// site is in the first class and must name [`crate::hash_pin::BLOCK_HASHER`].
+/// It does, twice over: `build_artifacts_with_hasher` for the artifacts and
+/// `lfm_cell_counts_with_hasher` for the numbers, so neither the proof nor the
+/// census can be taken at `HasherKind::default()`.
+///
+/// ⚠ **On a BYTE pin that naming is inert, and that is exactly the trap.**
+/// `ByteWrapHash` lowers to the dedicated KECCAK / `LFM_BLAKE3` chips and emits
+/// no `Instr::Hash` at all, so a defaulted socket hasher is free and correct
+/// here and becomes wrong only when the pin moves. Written pinned now so the
+/// flip is not a bug-hunt later — which is what it was the last three times
+/// (`f6ca405c`, then `fri_tests` and `join_tests` at v10).
+///
+/// # The shape
+///
+/// The smallest shape that still exercises every leg: the min preset
+/// ([`super::proof_fixture::fixture_options`] — blowup 2, ONE query) over the
+/// fibonacci fixture epoch ([`EpochInputs::fixture`], `FIXTURE_EPOCH_LOG2`).
+/// `EpochInputs::fixture` rather than `from_env`, deliberately and exactly as
+/// the batched twin does it: a measurement run's `LFM_CENSUS_*` variables must
+/// not be able to turn a suite gate into a real-block run.
+///
+/// # What it costs, MEASURED
+///
+/// One run of this test, 48-core box, at the default (BLAKE3) pin:
+///
+/// | | |
+/// |---|---|
+/// | inner epoch | 25 sub-proofs, trace lengths (log2) `[2 x18, 3, 4 x2, 5 x2, 7, 20]` |
+/// | emitted program | **210,782 instructions**, 16,461 arena words |
+/// | census at the pin | 42,096,912 main + 13,320,972 aux ext = 82,059,828 base-field equivalents |
+/// | wall | 9.20s for the whole test: 3.1s to build and host-verify the epoch, 3.8s to prove, 0.16s to verify |
+/// | wrap proof | 45,953,352 bytes over 15 sub-proofs |
+///
+/// ⚠ On CI, expect **30-60s** rather than 9.2s: the runners are 2-4 vCPU and
+/// the suite runs `--test-threads=1`, so almost none of the box's parallelism
+/// is there. `? INFERRED` — scaled from the box wall, not measured on a runner.
+/// The batched twin already pays a comparable bill today and is being deleted,
+/// so the steady state is one test of this class, not two.
+///
+/// ⚠ These numbers, and NOT the `~2.25M` instructions the slice-0 doc quotes,
+/// describe this shape. In a clean environment the two tests are the SAME
+/// PROGRAM: `wrap_run` passes `EpochInputs::from_env`, which with no
+/// `LFM_CENSUS_*` set is byte-for-byte [`EpochInputs::fixture`]. Why slice 0's
+/// doc carries a figure an order of magnitude higher for one program is an open
+/// question and is written up on [`the_wrap_proves_and_verifies`]; it is not
+/// settled here, and this table is not evidence about which environment that
+/// number came from.
+///
+/// The 46 MB proof is a consequence of the WRAP proving at
+/// [`wrap_options`]' framework query count over 15 sub-proofs, not of anything
+/// about the inner epoch, whose own preset is one query. It is fine for a gate:
+/// the proof is built, verified and dropped inside the test and is never
+/// serialized to disk or carried anywhere. A wrap proof meant to be SHIPPED is
+/// the aggregator's problem and is sized by different levers.
+#[test]
+fn the_fixture_epoch_wraps() {
+    fixture_wrap_run(
+        super::proof_fixture::fixture_options(),
+        EpochInputs::fixture(),
+    );
+}
+
+/// [`the_fixture_epoch_wraps`]' body: build the inner epoch, emit the per-table
+/// assembled verifier, prove it under the pin, verify it, and run the two
+/// falsification arms.
+///
+/// **Two, and they are not one check twice.** A flipped root makes the wrap
+/// UNBUILDABLE and never reaches the verifier at all; a moved claimed word
+/// leaves the proof untouched and must be REJECTED by it. Only the second
+/// exercises `verify_against`'s reject path, so a gate carrying only the first
+/// would show that the machine will not lie without ever showing that the
+/// verifier catches a lie.
+///
+/// Deliberately NOT [`wrap_run_from`], which is the MEASUREMENT harness: that
+/// one emits the program a second time (the spine, for the closed-form
+/// permutation check) and walks the chip census and the row-cliff panel. Both
+/// earn their cost in a measurement run and neither is what this gate claims,
+/// so the gate pays for neither. Its third arm, the moved PROGRAM DIGEST, is
+/// the registry premise rather than this program's, and
+/// `machine_tests::verify_against_artifacts_agrees_with_the_registry_path`
+/// already holds it on a trivial program at a fraction of the cost.
+fn fixture_wrap_run(inner: ProofOptions, inputs: EpochInputs) {
+    let t = Instant::now();
+    let e = super::epoch_tests::real_epoch_from(inner.clone(), inputs);
+    let profile = epoch_profile(&e);
+    println!(
+        "per-table inner epoch: {} sub-proofs, blowup {}, {} quer{} per table, \
+         grinding {} — built and HOST-VERIFIED in {:.1}s",
+        e.legs.len(),
+        1 << e.tables[0].shape.log2_blowup,
+        e.legs[0].verify.num_queries,
+        if e.legs[0].verify.num_queries == 1 {
+            "y"
+        } else {
+            "ies"
+        },
+        e.tables[0].shape.grinding_factor,
+        t.elapsed().as_secs_f64()
+    );
+
+    let t = Instant::now();
+    let program = super::epoch_tests::epoch_program(&e, true);
+    let arenas = super::epoch_tests::epoch_arena_words(&e, true);
+    println!(
+        "   emitted the assembled PER-TABLE verifier in {:.1}s",
+        t.elapsed().as_secs_f64()
+    );
+    report_program("THE PER-TABLE WRAPPED PROGRAM", &profile, &program);
+
+    // ---- the prediction, registered BEFORE the measurement.
+    //
+    // Counted at the pin's own permutation, not at `HasherKind::default()`: the
+    // `LFM_HASH` chip's width is tenant-dependent (Poseidon 612 value columns,
+    // RPO 436, RPX 316), so a defaulted census does not report a smaller number
+    // under an algebraic pin — it reports the wrong chip's.
+    let (main, aux) =
+        super::airs::lfm_cell_counts_with_hasher(&program, crate::hash_pin::BLOCK_HASHER);
+    println!(
+        "   census at {:?}: {main} main + {aux} aux ext = {} base-field equivalents; \
+         PROJECTED peak RSS {:.1} GiB (a projection from slice 0's coefficient, \
+         not a measurement of this run)",
+        crate::hash_pin::BLOCK_HASHER,
+        main + 3 * aux,
+        projected_peak_bytes(main, aux) / (1u64 << 30) as f64,
+    );
+
+    // ---- the artifacts, at the PINNED socket permutation.
+    //
+    // `wrap_options` UNREDUCED, and deliberately with no knob to reduce it. The
+    // wrap's own query count is the one lever that would buy wall time without
+    // touching the emitted program, and at 9.2s for the whole test there is
+    // nothing to buy — so the gate proves under the same options every leg suite
+    // proved under, which is what keeps a wrap cost comparable with a leg cost.
+    // A dormant setting that quietly weakens a suite gate is worse than no
+    // setting; if this shape ever does need trimming, the honest lever is the
+    // one `the_wrap_proves_at_blowup_8_geometry` documents, named per run.
+    let opts = wrap_options();
+    let artifacts = super::registry::build_artifacts_with_hasher(
+        &program,
+        &opts,
+        crate::hash_pin::BLOCK_HASHER,
+    );
+    println!(
+        "   wrap options: blowup {}, {} queries (the framework's 128-bit count), \
+         grinding {}\n   chip log-heights: {:?}",
+        opts.blowup_factor, opts.fri_number_of_queries, opts.grinding_factor, artifacts.log_heights
+    );
+
+    // ---- PROVE.
+    let t = Instant::now();
+    let proved = lfm_prove(&program, &artifacts, &arenas, &opts)
+        .expect("the per-table fixture wrap must prove");
+    let prove_secs = t.elapsed().as_secs_f64();
+    let size = rkyv::to_bytes::<rkyv::rancor::Error>(&proved.proof)
+        .expect("the wrap proof must serialize")
+        .len();
+
+    // ---- VERIFY.
+    let t = Instant::now();
+    assert!(
+        verify_against(
+            &artifacts.roots,
+            &artifacts.program_id,
+            artifacts.keccak_rnd_chunks,
+            &proved.proof,
+            &proved.public_words,
+            &opts,
+            artifacts.hasher,
+            artifacts.chip_set,
+        ),
+        "the per-table fixture wrap proof must verify"
+    );
+    let verify_secs = t.elapsed().as_secs_f64();
+    println!(
+        "\n★ PER-TABLE WRAP PROVED AND VERIFIED (inner epoch {profile}, blowup {}, \
+         {} quer{})\n   prove {prove_secs:.1}s / verify {verify_secs:.2}s / \
+         proof {size} bytes / {} published words / {} sub-proofs",
+        inner.blowup_factor,
+        inner.fri_number_of_queries,
+        if inner.fri_number_of_queries == 1 {
+            "y"
+        } else {
+            "ies"
+        },
+        proved.public_words.len(),
+        proved.proof.proofs.len(),
+    );
+
+    // ---- the PROVED run published the epoch's own oracles, so "it proved" is
+    // "it proved the right thing" rather than "some program proved". Three
+    // reads of `public_words`, which cost nothing next to the prove.
+    let pub_ext =
+        |i: usize| super::word::word_as_ext(&proved.public_words[i].1).expect("an ext challenge");
+    assert_eq!(pub_ext(0), e.z_alpha.0, "the proved run publishes z");
+    assert_eq!(pub_ext(1), e.z_alpha.1, "the proved run publishes alpha");
+    assert_eq!(
+        super::word::word_as_ext(&proved.public_words[proved.public_words.len() - 1].1)
+            .expect("the bus total is ext"),
+        e.expected_bus_balance,
+        "the proved run reaches production's own COMMIT-bus target"
+    );
+
+    // ---- THE TAMPER ARM: a flipped MAIN ROOT must fail.
+    //
+    // Arena 2 is the epoch's main roots — statement, then the ELF-dependent
+    // preprocessed roots, then these (declaration order IS absorb order in
+    // `epoch_tests::epoch_arena_words`). The index is asserted against the
+    // shape rather than trusted, because a declaration-order change would
+    // otherwise leave this tampering some other arena and still reporting a
+    // pass, which is how `arena_index`' own first version came to tamper an
+    // empty arena.
+    const MAIN_ROOTS_ARENA: usize = 2;
+    assert!(
+        MAIN_ROOTS_ARENA < super::epoch_tests::num_epoch_wide_arenas(&e),
+        "the main roots are an EPOCH-WIDE arena"
+    );
+    assert_eq!(
+        arenas[MAIN_ROOTS_ARENA].len(),
+        super::proof_arena::words_per_root() * e.tables.len(),
+        "arena {MAIN_ROOTS_ARENA} must be the main roots — one root per sub-proof, \
+         at the production wrap hash's root width"
+    );
+
+    let mut tampered = arenas.clone();
+    // Assigned rather than incremented: a root word is a packed u32 half on the
+    // byte arm, so `+= 1` on a lane holding `u32::MAX` would be refused for its
+    // RANGE instead of for the root mismatch this arm is about.
+    tampered[MAIN_ROOTS_ARENA][0] = super::word::base_word(FE::from(999_999u64));
+    assert_ne!(
+        tampered[MAIN_ROOTS_ARENA][0], arenas[MAIN_ROOTS_ARENA][0],
+        "the tamper must actually move the root word — an arm that tampers \
+         nothing passes while asserting nothing"
+    );
+
+    // UNBUILDABLE, not unverifiable: every check is an assert inside a
+    // straight-line program, so a false statement has no execution at all and
+    // `lfm_prove` fails in `execute` before a trace exists. A failure in the
+    // PROVER instead would mean the machine admitted the forgery and the
+    // rejection came from somewhere else, so the two are distinguished.
+    match lfm_prove(&program, &artifacts, &tampered, &opts) {
+        Err(LfmProveError::Exec(err)) => println!(
+            "   TAMPERED main root of sub-proof 0: the per-table wrap is \
+             UNBUILDABLE ({err:?})"
+        ),
+        Err(LfmProveError::Prover(err)) => {
+            panic!("a tampered main root must fail in EXECUTION, not in the prover: {err:?}")
+        }
+        Ok(_) => panic!("a tampered main root must not produce a wrap proof"),
+    }
+
+    // ---- ARM 2: the honest proof against a MOVED claimed statement must be
+    // REJECTED.
+    //
+    // The other half of the pair, and it is not redundant with arm 1 — the two
+    // exercise different machinery. Arm 1 never reaches the verifier at all: a
+    // false statement has no execution, so `verify_against`'s REJECT path is
+    // untouched by it, and a gate with only that arm would prove the machine
+    // refuses to lie without ever showing that the verifier catches one. This
+    // arm hands the verifier the REAL proof under a claim it does not answer;
+    // `absorb_lfm_statement` binds the proof to its published words, so it must
+    // reject. Costs one verify (~0.16s against a 9s test), which is why the
+    // batched twin carries it and why there was no case for leaving it out.
+    let mut moved = proved.public_words.clone();
+    moved[0].1[0] += FE::one();
+    assert!(
+        !verify_against(
+            &artifacts.roots,
+            &artifacts.program_id,
+            artifacts.keccak_rnd_chunks,
+            &proved.proof,
+            &moved,
+            &opts,
+            artifacts.hasher,
+            artifacts.chip_set,
+        ),
+        "a moved claimed public word must make the wrap proof UNVERIFIABLE"
+    );
+    println!("   MOVED claimed public word 0: the wrap proof is UNVERIFIABLE");
 }
 
 /// ★ SLICE 0's GPU-dispatch census (`thoughts/shared/gpu-recursion/EXPLORATION.md`,
@@ -975,6 +1314,16 @@ fn the_wrap_census() {
 /// times the size (allocator behaviour, and the fact that a bigger program is
 /// bigger in different chips), so it is a projection and is labelled as one
 /// wherever it is printed.
+///
+/// ⚠ **The PROVENANCE line is in doubt, the RATIO is not.** Slice 0 in a clean
+/// environment is the same program as [`the_fixture_epoch_wraps`], which
+/// measures 82,059,828 cells — so the 481,327,124 above cannot be that run, and
+/// "the measured point is slice 0" is under-specified about which environment
+/// slice 0 was in. See [`the_wrap_proves_and_verifies`] for what is and is not
+/// known. The value is deliberately UNCHANGED: a ratio of two numbers taken
+/// together on one run stays a valid coefficient whichever shape that run was,
+/// and re-deriving it from a shape nobody measured the RSS of would replace a
+/// misfiled observation with a fabricated one.
 const MEASURED_BYTES_PER_CELL: f64 = 16_228_499_456.0 / 481_327_124.0;
 
 fn projected_peak_bytes(main: u64, aux: u64) -> f64 {
