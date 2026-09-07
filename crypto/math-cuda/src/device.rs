@@ -285,40 +285,100 @@ pub struct Backend {
     inv_twiddles: Mutex<Vec<Option<Arc<CudaSlice<u64>>>>>,
 }
 
-/// Raise the device default memory pool's release threshold so freed
-/// stream-ordered allocations are kept for reuse instead of returned to the OS
-/// at each sync. Best-effort: any failure (e.g. a device/driver without
-/// stream-ordered allocator support) leaves the default behaviour untouched.
-fn retain_default_mempool(ctx: &CudaContext) {
-    use cudarc::driver::sys;
-    // SAFETY: raw CUDA driver calls. `ctx.cu_device()` is a valid device for
-    // the just-created context; the out-pointers are valid stack slots; the
-    // threshold is read as a u64 by the driver. Errors are swallowed.
-    unsafe {
-        let dev = ctx.cu_device();
-        let mut pool: sys::CUmemoryPool = std::ptr::null_mut();
-        if sys::cuDeviceGetDefaultMemPool(&mut pool as *mut _, dev)
-            .result()
-            .is_err()
-        {
-            return;
-        }
-        // Default: retain freed stream-ordered blocks indefinitely (u64::MAX)
-        // for reuse. `LAMBDA_VM_MEMPOOL_RELEASE_MB` overrides the cap (bytes the
-        // pool keeps before returning memory to the OS) when retained-pool
-        // growth needs bounding.
-        let threshold: u64 = std::env::var("LAMBDA_VM_MEMPOOL_RELEASE_MB")
+/// The environment knob for the device default memory pool's release
+/// threshold, in MiB: the bytes of freed stream-ordered memory the pool keeps
+/// before handing memory back to the OS at the next sync. Unset means
+/// [`DEFAULT_MEMPOOL_RELEASE_THRESHOLD_BYTES`]. The VRAM sampler runs set it
+/// to `0`, so `total - free` reads the live working set and not the retained
+/// pool.
+pub const MEMPOOL_RELEASE_ENV: &str = "LAMBDA_VM_MEMPOOL_RELEASE_MB";
+
+/// Retain every freed block (`u64::MAX`): a same-shape allocation skips the
+/// driver and reuses the block, which is what the per-table pipeline's
+/// repeated LDE/FRI buffers want.
+///
+/// Measured, not guessed (RTX 5090, 2026-09-07, `one_lde_buffer::vram_arm`
+/// at 2^21 × 316 @ blowup 2, five commits, in-process 1 kHz peak): retain-all
+/// 1176.9 / 1057.9 / 1055.3 / 1056.2 / 1055.6 ms against release-0
+/// 1178.5 / 1057.2 / 1077.5 / 1081.2 / 1079.3 ms — retention ≈2% faster once
+/// the first commit has populated the pool — and a peak of 15.67 GiB under
+/// both: a same-shape allocation reuses the retained block, so retention adds
+/// nothing to the peak. The unequal-shape case is covered at block scale by
+/// the multi-table q=41 wrap rung under this default (VRAM peak 28,976 MiB, no
+/// device decline): the stream-ordered allocator serves a new request from the
+/// physical chunks it retains, and the release threshold governs only what a
+/// sync hands back to the OS. The explicit release for a moment reuse cannot
+/// serve is [`Backend::trim_mempool_to`]; the sampler runs set the knob to `0`
+/// so `total - free` reads the live set rather than the pool.
+pub const DEFAULT_MEMPOOL_RELEASE_THRESHOLD_BYTES: u64 = u64::MAX;
+
+/// The effective release threshold in bytes: the knob when set and parseable,
+/// the default otherwise. Read once per process; the prover's diagnostics
+/// print it so every box log states the posture its run had.
+pub fn mempool_release_threshold_bytes() -> u64 {
+    static CACHED: OnceLock<u64> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var(MEMPOOL_RELEASE_ENV)
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .map(|mb| mb.saturating_mul(1024 * 1024))
-            .unwrap_or(u64::MAX);
-        let _ = sys::cuMemPoolSetAttribute(
-            pool,
-            sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
-            &threshold as *const u64 as *mut core::ffi::c_void,
-        )
-        .result();
+            .unwrap_or(DEFAULT_MEMPOOL_RELEASE_THRESHOLD_BYTES)
+    })
+}
+
+/// The device default memory pool, or `None` on a device/driver without
+/// stream-ordered allocator support.
+///
+/// # Safety
+///
+/// `ctx` must be a live context; its device is queried directly.
+unsafe fn default_mempool(ctx: &CudaContext) -> Option<cudarc::driver::sys::CUmemoryPool> {
+    use cudarc::driver::sys;
+    let mut pool: sys::CUmemoryPool = std::ptr::null_mut();
+    // SAFETY: the out-pointer is a valid stack slot; the device is the
+    // context's own.
+    unsafe {
+        sys::cuDeviceGetDefaultMemPool(&mut pool as *mut _, ctx.cu_device())
+            .result()
+            .ok()
+            .map(|()| pool)
     }
+}
+
+/// Set the device default memory pool's release threshold
+/// ([`mempool_release_threshold_bytes`]) so freed stream-ordered allocations
+/// are kept for reuse instead of returned to the OS at each sync. Best-effort:
+/// any failure leaves the driver default (release everything) untouched, and
+/// the one-line report says so.
+fn retain_default_mempool(ctx: &CudaContext) {
+    use cudarc::driver::sys;
+    let threshold = mempool_release_threshold_bytes();
+    // SAFETY: raw CUDA driver calls on the just-created context's device; the
+    // threshold is read as a u64 by the driver. Errors are swallowed.
+    let set = unsafe {
+        default_mempool(ctx).is_some_and(|pool| {
+            sys::cuMemPoolSetAttribute(
+                pool,
+                sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
+                &threshold as *const u64 as *mut core::ffi::c_void,
+            )
+            .result()
+            .is_ok()
+        })
+    };
+    // One line per process, so the box log states the posture the run had.
+    eprintln!(
+        "[gpu] mempool release threshold: {}{}",
+        match threshold {
+            u64::MAX => "retain all freed blocks".to_string(),
+            t => format!("{} MiB", t >> 20),
+        },
+        if set {
+            ""
+        } else {
+            " (driver refused; the release-on-sync default stays)"
+        }
+    );
 }
 
 /// Device VRAM budget in bytes for table session admission control.
@@ -555,6 +615,36 @@ impl Backend {
     /// when budgeting is disabled (query failed). See the field docs.
     pub fn vram_budget_bytes(&self) -> u64 {
         self.vram_budget_bytes
+    }
+
+    /// Live `(free, total)` device memory in bytes, for diagnostics — the
+    /// admission gates never read it (they must answer the same at R1 and at
+    /// R4). `None` when the query fails.
+    pub fn device_mem_info(&self) -> Option<(u64, u64)> {
+        self.ctx
+            .mem_get_info()
+            .ok()
+            .map(|(free, total)| (free as u64, total as u64))
+    }
+
+    /// Hand the default memory pool's unused reserved memory back to the OS,
+    /// keeping at most `keep_bytes` (`cuMemPoolTrimTo`). Under the retained
+    /// posture ([`mempool_release_threshold_bytes`]) a sync never releases;
+    /// this is the explicit release for the moments reuse cannot serve — a
+    /// differently-shaped table after a large one, or a sampler that must read
+    /// the live working set. Best effort: `false` when the pool cannot be
+    /// queried or the trim fails.
+    pub fn trim_mempool_to(&self, keep_bytes: u64) -> bool {
+        use cudarc::driver::sys;
+        // SAFETY: raw driver calls on this backend's live context; the trim
+        // takes a plain byte count.
+        unsafe {
+            default_mempool(&self.ctx).is_some_and(|pool| {
+                sys::cuMemPoolTrimTo(pool, keep_bytes as usize)
+                    .result()
+                    .is_ok()
+            })
+        }
     }
 
     /// Round-robin over the stream pool. Concurrent callers get different

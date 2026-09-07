@@ -1,9 +1,11 @@
 //! Row chunking — how the machine's splittable tables scale past one instance.
 //!
-//! Two chips are chunked, by the same mechanism and for the same reason:
-//! [`KeccakChunking`] splits `KECCAK_RND`, and [`Blake3Chunking`] splits
-//! `LFM_BLAKE3`. Everything the next paragraphs say about the first holds for
-//! the second; the differences are collected under [`Blake3Chunking`].
+//! Three chips are chunked, by the same mechanism and for the same reason:
+//! [`KeccakChunking`] splits `KECCAK_RND`, [`Blake3Chunking`] splits
+//! `LFM_BLAKE3`, and [`BaluChunking`] splits `LFM_BALU` — the first two because
+//! their matrices are WIDE, the third because its matrix is TALL. Everything
+//! the next paragraphs say about the first holds for the others; the
+//! differences are collected under [`Blake3Chunking`] and [`BaluChunking`].
 //!
 //! `KECCAK_RND` costs 24 rows per permutation at 1480 columns, so a single
 //! instance saturates a 2^19-row table at ~21.8k permutations while a real
@@ -112,6 +114,21 @@ impl Default for KeccakChunking {
     fn default() -> Self {
         Self::from_max_rows(KECCAK_RND_MAX_CHUNK_ROWS)
     }
+}
+
+/// Chunks `total` one-row records need at `per` records per chunk — never
+/// zero, so a chip stays present for an empty program. The one rule
+/// [`Blake3Chunking`] and [`BaluChunking`] share.
+fn row_chunk_count(per: usize, total: usize) -> usize {
+    total.div_ceil(per).max(1)
+}
+
+/// The half-open record range chunk `chunk` covers at `per` records per
+/// chunk, clamped to `total`.
+fn row_chunk_range(per: usize, total: usize, chunk: usize) -> core::ops::Range<usize> {
+    let start = per.saturating_mul(chunk).min(total);
+    let end = start.saturating_add(per).min(total);
+    start..end
 }
 
 /// The environment knob that turns `LFM_BLAKE3` chunking on, read at program
@@ -266,23 +283,14 @@ impl Blake3Chunking {
     /// The chip MASK, not this, is what drops an unused family; see
     /// [`ChipSet::blake3_chunks`](super::airs::ChipSet::blake3_chunks).
     pub fn chunk_count(self, num_compressions: usize) -> usize {
-        num_compressions
-            .div_ceil(self.compressions_per_chunk)
-            .max(1)
+        row_chunk_count(self.compressions_per_chunk, num_compressions)
     }
 
     /// The half-open row range chunk `chunk` covers, clamped to
     /// `num_compressions`. The single rule the group split, the record split and
     /// the census heights all read, so they cannot disagree about a boundary.
     pub fn chunk_range(self, num_compressions: usize, chunk: usize) -> core::ops::Range<usize> {
-        let start = self
-            .compressions_per_chunk
-            .saturating_mul(chunk)
-            .min(num_compressions);
-        let end = start
-            .saturating_add(self.compressions_per_chunk)
-            .min(num_compressions);
-        start..end
+        row_chunk_range(self.compressions_per_chunk, num_compressions, chunk)
     }
 
     /// Splits per-compression records into exactly [`Self::chunk_count`]
@@ -295,6 +303,180 @@ impl Blake3Chunking {
 }
 
 impl Default for Blake3Chunking {
+    fn default() -> Self {
+        Self::unbounded()
+    }
+}
+
+/// The environment knob that turns `LFM_BALU` chunking on, read at program
+/// EMISSION time like [`BLAKE3_MAX_CHUNK_ROWS_LOG2_ENV`].
+///
+/// Unset means one table — today's machine, byte for byte. Set to `k` means
+/// chunks of at most `2^k` rows, i.e. `2^k` ALU operations.
+pub const BALU_MAX_CHUNK_ROWS_LOG2_ENV: &str = "LFM_BALU_MAX_CHUNK_ROWS_LOG2";
+
+/// Trace rows one ALU operation occupies in `LFM_BALU` — exactly one
+/// (`emit_column_groups` opens one row per `Balu` instruction).
+pub const BALU_ROWS_PER_OP: usize = 1;
+
+/// The chunk height the sizing under [`BaluChunking`] arrives at: `2^22` rows.
+pub const BALU_TARGET_CHUNK_ROWS_LOG2: u32 = 22;
+
+/// How a program's ALU operations are distributed over `LFM_BALU` instances —
+/// the row-chunking arm for the machine's TALL-NARROW chips.
+///
+/// # Why this chip needs it
+///
+/// `LFM_BALU` is one row per operation at 4 value + 10 preprocessed columns:
+/// narrow, and on the aggregator very tall — the program pads to `2^27` rows
+/// at 110 queries and `2^28` at 219, a census contribution that is trivial in
+/// cells and enormous in rows. At blowup 2 the ONE-table device set of the R1
+/// commit alone is
+///
+/// | rows | LDE `2n·14·8` | snapshot `n·14·8` | tree `(2n−1)·32` | R1 set |
+/// |------|---------------|-------------------|------------------|--------|
+/// | 2^27 | 28.0 GiB      | 14.0 GiB          | 8.0 GiB          | 50 GiB |
+/// | 2^22 | 0.875 GiB     | 0.44 GiB          | 0.25 GiB         | 1.6 GiB|
+///
+/// and rounds 2–4 add the aux LDE (2 ext3 columns, `2n·2·24`) and its tree,
+/// the two composition parts (`2·2n·24`) and their tree, and the DEEP
+/// codeword (`2n·24`): a whole-prove set of ~96 GiB at `2^27` against a
+/// 32 GiB card, ~3 GiB per chunk at `2^22` (`the_balu_chunk_sizing_is_the_doc`
+/// pins the arithmetic). `2^22` is the height at which eight chunks prove
+/// concurrently inside a 25.6 GiB admission budget, which is why it is the
+/// target: `2^24` chunks (~12 GiB each) would hold the concurrency at two, and
+/// `2^20` chunks would quadruple the per-chunk FRI and query overhead the
+/// verifier pays for nothing. That overhead — one FRI commit and one set of
+/// openings PER CHUNK — is the counter-pressure against smaller chunks, and
+/// the reason the default stays one table until the aggregator is emitted
+/// with the knob set.
+///
+/// # Why row chunking, not column streaming
+///
+/// Streaming the commit column group by column group lowers only the commit's
+/// own peak; rounds 2–4 read every column of every row from the RESIDENT LDE,
+/// so the `2n · cols · 8` buffer has to be on the card for the whole table
+/// however the leaves were hashed. For a tall-narrow chip that buffer IS the
+/// problem (28 GiB at `2^27`), and nothing short of splitting the rows shrinks
+/// it. Column streaming is the shape for SHORT-WIDE chips (`LFM_HASH` at
+/// `2^21 × 449`), and since the fused commit transposes its one LDE buffer in
+/// place it buys little even there: the LDE stays resident for rounds 2–4
+/// either way.
+///
+/// # Why splitting the rows is free
+///
+/// The property [`KeccakChunking`] and [`Blake3Chunking`] rest on, checked on
+/// this chip: every constraint `BaluConstraints` emits reads `main(0, ..)` —
+/// no row-to-row coupling — and every bus interaction is a within-row `LfmMem`
+/// token gated by the row's own selector or multiplicity column. Operands and
+/// results travel by address matching, and the addresses are PREPROCESSED
+/// program data, so which instance a row lives in is invisible to the balance.
+///
+/// # What it costs
+///
+/// Like `LFM_BLAKE3` and unlike `KECCAK_RND`, this chip carries a preprocessed
+/// instruction group, so **each chunk is its own committed matrix with its
+/// own root and its own height**: a chunked program is a different program
+/// identity by name, and the chunk roots ride the artifacts and fold into
+/// `program_id` exactly as the BLAKE3 chunk roots do. Wiring — the program
+/// field, the per-chunk group, the AIR instances, the artifact roots and the
+/// slot map — follows the BLAKE3 template one for one and is not in this
+/// module.
+///
+/// `LFM_LANES` (4 value + 12 preprocessed, `2^24` rows in the 110-query wrap)
+/// is the next chip of this shape; its whole-prove set at `2^24` is ~14 GiB,
+/// one doubling from needing the same arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BaluChunking {
+    ops_per_chunk: usize,
+}
+
+impl BaluChunking {
+    /// One table, whatever the operation count — **the default**, and the
+    /// machine as it stands before the aggregator is emitted chunked.
+    /// `usize::MAX` rather than an `Option` for [`Blake3Chunking::unbounded`]'s
+    /// reason: one code path.
+    pub const fn unbounded() -> Self {
+        Self {
+            ops_per_chunk: usize::MAX,
+        }
+    }
+
+    /// The policy that fills chunks to at most `max_rows` trace rows.
+    pub const fn from_max_rows(max_rows: usize) -> Self {
+        let ops_per_chunk = max_rows / BALU_ROWS_PER_OP;
+        assert!(
+            ops_per_chunk > 0,
+            "an LFM_BALU chunk must hold at least one operation"
+        );
+        Self { ops_per_chunk }
+    }
+
+    /// The policy that puts at most `ops_per_chunk` operations in each chunk.
+    /// The small-limit constructor tests use to force several chunks out of a
+    /// tiny program.
+    pub const fn from_ops(ops_per_chunk: usize) -> Self {
+        assert!(
+            ops_per_chunk > 0,
+            "an LFM_BALU chunk must hold at least one operation"
+        );
+        Self { ops_per_chunk }
+    }
+
+    /// The sizing's target: chunks of `2^22` rows
+    /// ([`BALU_TARGET_CHUNK_ROWS_LOG2`]).
+    pub const fn target() -> Self {
+        Self::from_max_rows(1usize << BALU_TARGET_CHUNK_ROWS_LOG2)
+    }
+
+    /// The policy [`BALU_MAX_CHUNK_ROWS_LOG2_ENV`] names, or `None` when it is
+    /// unset — on [`Blake3Chunking::from_env`]'s terms, including the panic on
+    /// a value that is not a row exponent.
+    pub fn from_env() -> Option<Self> {
+        Self::from_env_value(std::env::var(BALU_MAX_CHUNK_ROWS_LOG2_ENV).ok().as_deref())
+    }
+
+    /// [`Self::from_env`] with the variable's value supplied, so the parse is
+    /// testable without mutating process-global state.
+    pub fn from_env_value(raw: Option<&str>) -> Option<Self> {
+        let raw = raw?;
+        let log2: u32 = raw.parse().unwrap_or_else(|_| {
+            panic!("{BALU_MAX_CHUNK_ROWS_LOG2_ENV} must be a base-2 row exponent, got {raw:?}")
+        });
+        assert!(
+            log2 < usize::BITS,
+            "{BALU_MAX_CHUNK_ROWS_LOG2_ENV}={log2} is not a representable row count"
+        );
+        Some(Self::from_max_rows(1usize << log2))
+    }
+
+    pub const fn ops_per_chunk(self) -> usize {
+        self.ops_per_chunk
+    }
+
+    /// Number of `LFM_BALU` instances a program with `num_ops` operations gets
+    /// — never zero, so the chip is present (and its constraints verified)
+    /// even for a program containing no ALU operation at all.
+    pub fn chunk_count(self, num_ops: usize) -> usize {
+        row_chunk_count(self.ops_per_chunk, num_ops)
+    }
+
+    /// The half-open row range chunk `chunk` covers, clamped to `num_ops` —
+    /// the single rule a group split, a record split and a census height
+    /// would all read.
+    pub fn chunk_range(self, num_ops: usize, chunk: usize) -> core::ops::Range<usize> {
+        row_chunk_range(self.ops_per_chunk, num_ops, chunk)
+    }
+
+    /// Splits per-operation records into exactly [`Self::chunk_count`] slices.
+    pub fn split<T>(self, ops: &[T]) -> Vec<&[T]> {
+        (0..self.chunk_count(ops.len()))
+            .map(|c| &ops[self.chunk_range(ops.len(), c)])
+            .collect()
+    }
+}
+
+impl Default for BaluChunking {
     fn default() -> Self {
         Self::unbounded()
     }
@@ -458,5 +640,97 @@ mod tests {
             assert!(c.split::<u8>(&[])[0].is_empty());
             assert_eq!(c.chunk_range(0, 0), 0..0);
         }
+    }
+
+    /// The default is ONE `LFM_BALU` table at any scale — the machine as it
+    /// stands.
+    #[test]
+    fn the_balu_default_is_a_single_table() {
+        let c = BaluChunking::default();
+        assert_eq!(c, BaluChunking::unbounded());
+        for n in [0usize, 1, 1 << 27, 1 << 28, usize::MAX - 1] {
+            assert_eq!(c.chunk_count(n), 1, "n={n} must stay one table");
+        }
+        assert_eq!(BaluChunking::from_env_value(None), None);
+    }
+
+    /// The target policy splits the aggregator's `2^27` (110 q) and `2^28`
+    /// (219 q) rows into 32 and 64 chunks of `2^22`; the knob names the same
+    /// policy.
+    #[test]
+    fn the_balu_target_sizes_the_aggregator() {
+        let c = BaluChunking::target();
+        assert_eq!(c.ops_per_chunk(), 1 << 22);
+        assert_eq!(c.chunk_count(1 << 27), 32);
+        assert_eq!(c.chunk_count(1 << 28), 64);
+        assert_eq!(c.chunk_count((1 << 27) + 1), 33);
+        assert_eq!(BaluChunking::from_env_value(Some("22")), Some(c));
+        for log2 in [0usize, 3, 18, 22] {
+            assert_eq!(
+                BaluChunking::from_env_value(Some(&log2.to_string())),
+                Some(BaluChunking::from_max_rows(1 << log2)),
+                "{log2} must name 2^{log2} rows per chunk"
+            );
+        }
+    }
+
+    /// The device-set arithmetic the `BaluChunking` doc tabulates: one table at
+    /// `2^27` does not fit a 32 GiB card; a `2^22` chunk's whole-prove set is
+    /// ~3 GiB, so eight prove concurrently inside the 25.6 GiB budget. Columns:
+    /// 14 base (4 value + 10 preprocessed), 2 ext3 aux, 2 ext3 composition
+    /// parts, one ext3 DEEP codeword, blowup 2.
+    #[test]
+    fn the_balu_chunk_sizing_is_the_doc() {
+        const GIB: u64 = 1 << 30;
+        let whole_prove_set = |n: u64| -> u64 {
+            let lde = 2 * n;
+            let tree = (lde - 1) * 32;
+            let main_lde = lde * 14 * 8;
+            let snapshot = n * 14 * 8;
+            let aux_lde = lde * 2 * 24;
+            let parts = lde * 2 * 24;
+            let deep = lde * 24;
+            main_lde + snapshot + tree + aux_lde + tree + parts + tree + deep
+        };
+        let one_table = whole_prove_set(1 << 27);
+        assert!(one_table > 95 * GIB && one_table < 97 * GIB, "{one_table}");
+        let r1_only = (1u64 << 28) * 14 * 8 + (1u64 << 27) * 14 * 8 + ((1u64 << 28) - 1) * 32;
+        assert!(r1_only > 49 * GIB && r1_only < 51 * GIB, "{r1_only}");
+        let chunk = whole_prove_set(1 << 22);
+        assert!(chunk < 3 * GIB + GIB / 16, "{chunk}");
+        assert!(
+            8 * chunk <= 32 * GIB / 5 * 4,
+            "eight chunks must fit the budget"
+        );
+        let big_chunk = whole_prove_set(1 << 24);
+        assert!(2 * big_chunk <= 32 * GIB / 5 * 4 && 3 * big_chunk > 32 * GIB / 5 * 4);
+    }
+
+    /// `split`, `chunk_count` and `chunk_range` are one rule seen three times
+    /// for this chip too.
+    #[test]
+    fn balu_split_agrees_with_chunk_count_and_range() {
+        for per in [1usize, 2, 3, 5, 8] {
+            let c = BaluChunking::from_ops(per);
+            for n in 0..40usize {
+                let ops: Vec<usize> = (0..n).collect();
+                let split = c.split(&ops);
+                assert_eq!(split.len(), c.chunk_count(n), "per={per} n={n}");
+                assert_eq!(split.iter().map(|s| s.len()).sum::<usize>(), n);
+                assert!(split.iter().all(|s| s.len() <= per));
+                for (i, s) in split.iter().enumerate() {
+                    assert_eq!(&ops[c.chunk_range(n, i)], *s, "per={per} n={n} chunk {i}");
+                }
+            }
+            assert_eq!(c.chunk_count(0), 1);
+            assert_eq!(c.chunk_range(0, 0), 0..0);
+        }
+    }
+
+    /// A typo stops the run rather than silently proving a different shape.
+    #[test]
+    #[should_panic(expected = "must be a base-2 row exponent")]
+    fn a_malformed_balu_knob_panics() {
+        let _ = BaluChunking::from_env_value(Some("2^22"));
     }
 }
