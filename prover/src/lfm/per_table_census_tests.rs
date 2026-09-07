@@ -171,10 +171,27 @@ struct Tenant {
     keccak: bool,
 }
 
+/// ⚠⚠ The `LFM_HASH` socket permutation of a BLAKE3-tenant wrap proof is
+/// **`Test`, not `Blake3`** — `hash_pin::BLOCK_HASHER` on a BLAKE3-pinned build.
+///
+/// The two axes are orthogonal and this is the trap in confusing them. Under a
+/// byte hash the emitter's Merkle work goes through `ByteWrapHash::hash_bytes`,
+/// which lowers to the dedicated `LFM_BLAKE3` chip and emits **no `Instr::Hash`
+/// at all**, so the socket idles at the four-row floor and its width is
+/// `TEST_NUM_COLUMNS`. Naming `HasherKind::Blake3` here instead instantiates the
+/// BLAKE3 *socket* — a 2,980-column chip the real proof does not carry — and
+/// inflates the BLAKE3 baseline by 1,196 blocks per query, which makes lever 0
+/// look BIGGER than it is (0.632× against the true 0.776×).
+///
+/// ✓ VERIFIED against the recorded census, which reports `LFM_HASH` at 4 rows,
+/// 0 used, 28 main, 3 aux. [`the_blake3_tenant_socket_matches_the_record`] pins
+/// it so this cannot regress silently.
+const BLAKE3_TENANT_SOCKET: HasherKind = HasherKind::Test;
+
 const TENANTS: [Tenant; 8] = [
     Tenant {
         label: "BLAKE3",
-        hasher: HasherKind::Blake3,
+        hasher: BLAKE3_TENANT_SOCKET,
         algebraic: false,
         keccak: true,
     },
@@ -220,7 +237,7 @@ const TENANTS: [Tenant; 8] = [
     // keccak-less algebraic tenant against a keccak-carrying BLAKE3 one.
     Tenant {
         label: "BLAKE3/no-kec",
-        hasher: HasherKind::Blake3,
+        hasher: BLAKE3_TENANT_SOCKET,
         algebraic: false,
         keccak: false,
     },
@@ -578,6 +595,39 @@ fn the_block_rule_is_hash_invariant_on_every_tenant_group() {
     println!("\n★ rate-8 block rule checked on {checked} tenant groups — invariant");
 }
 
+/// ✓ The BLAKE3 tenant's `LFM_HASH` is the idle 28-column `Test` socket the
+/// record shows — not the 2,980-column BLAKE3 socket.
+///
+/// This is the one number in the census that, if wrong, moves the headline
+/// ratio by a third and in the flattering direction, so it is asserted against
+/// the recorded run rather than left to the tenant table's spelling.
+#[test]
+fn the_blake3_tenant_socket_matches_the_record() {
+    /// `LFM_HASH` as `tip-wrappt-24.stdout`'s CHIP CENSUS reports it: 28 main
+    /// value columns over the 13-column preprocessed prefix, 3 ext aux.
+    const RECORDED: (usize, usize) = (28, 3);
+
+    let opts = wrap_options();
+    for tenant in TENANTS.iter().filter(|t| !t.algebraic) {
+        let airs = tenant.airs(&opts);
+        let tables = tenant_tables(tenant, &airs, &tenant.present_log_heights());
+        let hash = tables
+            .iter()
+            .find(|t| t.name == "LFM_HASH")
+            .expect("every tenant carries LFM_HASH");
+        assert_eq!(
+            (hash.main_cols, hash.aux_cols),
+            RECORDED,
+            "{}: a BLAKE3-tenant wrap proof idles LFM_HASH at the pin's `Test` \
+             socket — naming HasherKind::Blake3 here instantiates the 2,980-column \
+             BLAKE3 socket, a chip the real proof does not carry, and inflates the \
+             baseline this whole census is a ratio against",
+            tenant.label,
+        );
+    }
+    println!("\n★ BLAKE3-tenant LFM_HASH = {RECORDED:?} (main, ext aux) — matches the record");
+}
+
 /// The wrap layer's own preset — blowup 4 / 110 queries (`PLAN` T5). This is the
 /// proof the aggregator OPENS, so its options fix the aggregator's leg bill.
 fn wrap_options() -> ProofOptions {
@@ -910,24 +960,31 @@ fn the_per_table_aggregator_tree_is_derived_from_the_measured_leg() {
         }
 
         // ---- the whole tree, so the node COUNT is visible beside the node SIZE.
+        //
+        // Printed at BOTH wrap counts to make the invariance explicit: the level-1
+        // node size is identical at 10 and at 18, because it is `f · leg + glue`
+        // and carries no wrap count at all. Only the number of nodes moves.
         if tenant.algebraic {
-            for f in [2u64, 3] {
-                let mut level = WRAPS;
-                let mut shape = Vec::new();
-                let mut proofs = 0u64;
-                shape.push(level);
-                while level > 1 {
-                    level = level.div_ceil(f);
+            for wraps in [WRAPS, 18] {
+                for f in [2u64, 3] {
+                    let mut level = wraps;
+                    let mut shape = Vec::new();
+                    let mut proofs = 0u64;
                     shape.push(level);
-                    proofs += level;
+                    while level > 1 {
+                        level = level.div_ceil(f);
+                        shape.push(level);
+                        proofs += level;
+                    }
+                    let path: Vec<String> = shape.iter().map(|n| n.to_string()).collect();
+                    println!(
+                        "      {wraps} wraps, fan-in {f}: {} — {proofs} aggregator \
+                     proofs over {} levels, every node {} invocations",
+                        path.join(" → "),
+                        shape.len() - 1,
+                        f * leg + GLUE_ADDITIVE,
+                    );
                 }
-                let path: Vec<String> = shape.iter().map(|n| n.to_string()).collect();
-                println!(
-                    "      tree at fan-in {f}: {} — {proofs} aggregator proofs, \
-                     {} levels",
-                    path.join(" → "),
-                    shape.len() - 1,
-                );
             }
         }
 
