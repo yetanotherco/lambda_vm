@@ -9,7 +9,7 @@ use crate::tables::types::BusId;
 /// Print a legend mapping numeric bus IDs to their names.
 pub fn print_bus_legend() {
     eprintln!("=== BUS ID LEGEND ===");
-    for id in 0u64..=21 {
+    for id in 0u64..=32 {
         if let Ok(bus) = BusId::try_from(id) {
             eprintln!("  Bus {:2} = {}", id, bus.name());
         }

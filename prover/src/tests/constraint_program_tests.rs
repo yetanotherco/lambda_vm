@@ -177,6 +177,7 @@ fn all_table_programs_match_folders() {
     check_air(&create_keccak_air(&opts), "KECCAK");
     check_air(&create_keccak_rnd_air(&opts), "KECCAK_RND");
     check_air(&create_keccak_rc_air(&opts), "KECCAK_RC");
+    check_air(&create_keccak_sponge_air(&opts), "KECCAK_SPONGE");
     check_air(&create_ecsm_air(&opts), "ECSM");
     check_air(&create_ecdas_air(&opts), "ECDAS");
     check_air(&create_hint_air(&opts), "HINT");

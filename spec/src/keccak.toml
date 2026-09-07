@@ -92,11 +92,13 @@ name = "round"
 [[constraints.round]]
 kind = "interaction"
 tag = "KECCAK"
-input = ["timestamp", 0, "input_state"]
+input = ["timestamp", 0, 0, "input_state"]
 multiplicity = "μ"
+ref = "keccak:c:permute_in"
 
 [[constraints.round]]
 kind = "interaction"
 tag = "KECCAK"
-input = ["timestamp", 24, "output_state"]
+input = ["timestamp", 24, 0, "output_state"]
 multiplicity = ["-", "μ"]
+ref = "keccak:c:permute_out"

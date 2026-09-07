@@ -17,6 +17,7 @@ fn test_pi_virtual_matches_rotate() {
     keccak_f1600(&mut output);
     let op = KeccakRoundOperation {
         timestamp: 42,
+        seq: 0,
         input,
         output,
     };

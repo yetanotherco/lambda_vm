@@ -7,12 +7,13 @@
 //! `KeccakRndConstraints`). ARE_BYTES range checks on the shift outputs and the
 //! IS_BIT constraint on the θ carry are load-bearing for the identities.
 //!
-//! ## Column layout (1,480 columns)
+//! ## Column layout (1,481 columns)
 //!
 //! | Group          | Size | Description                                       |
 //! |----------------|------|---------------------------------------------------|
 //! | timestamp      |    2 | DWordWL                                           |
 //! | round          |    1 | Round index (0..23)                               |
+//! | seq            |    1 | Permutation index within the ecall (see below)    |
 //! | start          |  200 | Input state bytes [5][5][8]                       |
 //! | Cxz            |  160 | Column parity chain [5][4][8]                     |
 //! | Cxz_left       |   40 | Left component of rotated C [5][8]                |
@@ -31,6 +32,16 @@
 //! constants derived from `KECCAK_RHO[x][y]`, not materialized as columns.
 //! `Cxz_right` is typed `[Bit, 4]` per spec d75944ee — a halfword rotate-by-1
 //! carries out a single bit, range-checked via IS_BIT polynomial constraints.
+//!
+//! `seq` is carried through this chip untouched, exactly like `timestamp`: the
+//! Keccak-bus receive and send both include it, so the whole 24-round chain of
+//! one permutation is keyed by `(timestamp, seq)`. The classic KECCAK core
+//! chip always uses `seq = 0`; KECCAK_SPONGE runs one permutation per absorbed
+//! block under a single ecall timestamp and keys block `k` with `seq = k` —
+//! without it, two blocks of one call would share the key and their outputs
+//! could be swapped with the bus still balancing (see `tables::keccak_sponge`).
+//! No constraint on `seq` is needed here: it participates in every bus tuple
+//! of the chain, so any inconsistent value simply fails to match.
 
 use executor::vm::instruction::execution::{KECCAK_RC, KECCAK_RHO};
 use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
@@ -87,12 +98,16 @@ pub mod cols {
     // iota[8] — χ[0][0] ⊕ rc
     pub const IOTA: usize = RC + 8; // 1471
 
+    // seq — permutation index within the ecall (0 for the classic core chip,
+    // the block index for KECCAK_SPONGE). Carried through like timestamp.
+    pub const SEQ: usize = IOTA + 8; // 1479
+
     // mu — multiplicity flag.
     // rnc and rbc (spec [[variables.constant]]) are inlined as compile-time
     // constants from KECCAK_RHO, not allocated as columns.
-    pub const MU: usize = IOTA + 8; // 1479
+    pub const MU: usize = SEQ + 1; // 1480
 
-    pub const NUM_COLUMNS: usize = MU + 1; // 1480
+    pub const NUM_COLUMNS: usize = MU + 1; // 1481
 
     // -------------------------------------------------------------------------
     // Index helpers
@@ -211,6 +226,10 @@ pub mod cols {
 #[derive(Debug, Clone)]
 pub struct KeccakRoundOperation {
     pub timestamp: u64,
+    /// Permutation index within the ecall: 0 for the classic core chip, the
+    /// block index for KECCAK_SPONGE (which shares one timestamp across all
+    /// blocks of a call).
+    pub seq: u64,
     pub input: [u64; 25],
     pub output: [u64; 25],
 }
@@ -261,9 +280,10 @@ pub fn generate_keccak_rnd_trace(
         for round in 0..24 {
             let row_idx = op_idx * 24 + round;
 
-            // Timestamp & round
+            // Timestamp, round & seq
             table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
             table.set_u64(row_idx, cols::ROUND, round as u64);
+            table.set_u64(row_idx, cols::SEQ, op.seq);
 
             // start = current state as bytes
             for x in 0..5 {
@@ -447,9 +467,10 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 
     // --- IO group (3) ---
 
-    // 1. KECCAK bus: receive (timestamp, round, start[200])
+    // 1. KECCAK bus: receive (timestamp, round, seq, start[200])
     // Per spec keccak_round.toml: input = ["timestamp", "round", "start"] where
     // start is [[[Byte, 8], 5], 5] — 200 Byte elements, each its own bus element.
+    // `seq` is a wire-format extension over the spec (see the module docs).
     {
         let mut values = vec![
             BusValue::Packed {
@@ -462,6 +483,10 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             },
             BusValue::Packed {
                 start_column: cols::ROUND,
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::SEQ,
                 packing: Packing::Direct,
             },
         ];
@@ -482,7 +507,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ));
     }
 
-    // 2. KECCAK bus: send (timestamp, round+1, out[200])
+    // 2. KECCAK bus: send (timestamp, round+1, seq, out[200])
     //    out[0][0] = iota, out[x][y] = chi for (x,y) != (0,0)
     {
         let mut values = vec![
@@ -501,6 +526,10 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 },
                 LinearTerm::Constant(1),
             ]),
+            BusValue::Packed {
+                start_column: cols::SEQ,
+                packing: Packing::Direct,
+            },
         ];
         for x in 0..5 {
             for y in 0..5 {

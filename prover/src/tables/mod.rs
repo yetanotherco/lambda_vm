@@ -38,6 +38,7 @@ pub mod hint;
 pub mod keccak;
 pub mod keccak_rc;
 pub mod keccak_rnd;
+pub mod keccak_sponge;
 pub mod load;
 pub mod local_to_global;
 pub mod lt;
