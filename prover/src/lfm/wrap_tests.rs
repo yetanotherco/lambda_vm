@@ -372,37 +372,6 @@ fn the_wrap_proves_and_verifies() {
     wrap_run(super::proof_fixture::fixture_options());
 }
 
-/// The wrap PROOF's own query count for [`the_fixture_epoch_wraps`].
-///
-/// `None` — the default — is [`wrap_options`]' framework count (219 at blowup 2,
-/// the 128-bit target), so the gate proves under the same options every leg
-/// suite proved under and a wrap cost stays comparable with a leg cost.
-///
-/// `Some(n)` trades the WRAP proof's own soundness margin for wall time and
-/// nothing else. The emitted program, its sub-proof count, its cells and every
-/// chip it fills are properties of the INNER epoch and this does not touch one
-/// of them — so a reduced count still proves every chip under the pin. It is
-/// the same honest partial [`the_wrap_proves_at_blowup_8_geometry`] makes about
-/// the inner query count, made on the outer side instead: the CHIPS are proved,
-/// the wrap's own query COUNT is not. A run under `Some(n)` is **not** a
-/// security parameter set, and the run's own label says so.
-///
-/// ⚠ It is the ONLY knob this gate has. `MIN_PROOF_OPTIONS` is already blowup 2
-/// at one query, so the inner preset cannot shrink, and the leg set is the
-/// epoch's own sub-proof count rather than a choice.
-const WRAP_QUERIES: Option<usize> = None;
-
-/// [`wrap_options`] with [`WRAP_QUERIES`] applied.
-fn gate_wrap_options() -> ProofOptions {
-    match WRAP_QUERIES {
-        Some(q) => ProofOptions {
-            fri_number_of_queries: q,
-            ..wrap_options()
-        },
-        None => wrap_options(),
-    }
-}
-
 /// ★★ THE SUITE-GATED PER-TABLE WRAP — the per-table twin of
 /// [`the_fixture_epoch_wraps_batched`], and NOT `#[ignore]`d.
 ///
@@ -453,12 +422,31 @@ fn gate_wrap_options() -> ProofOptions {
 /// the batched twin does it: a measurement run's `LFM_CENSUS_*` variables must
 /// not be able to turn a suite gate into a real-block run.
 ///
-/// ⚠ **This is the ceiling, not a comfortable shape.** Slice 0 is the same
-/// epoch at the same preset and its measured point is recorded in
-/// [`MEASURED_BYTES_PER_CELL`] — 481,327,124 base-field-equivalent cells at
-/// 15.1 GiB of peak RSS. The run prints the projection for its own census
-/// before it proves, so the wall time it then reports is read against a
-/// prediction rather than against nothing.
+/// # What it costs, MEASURED
+///
+/// One run of this test, 48-core box, at the default (BLAKE3) pin:
+///
+/// | | |
+/// |---|---|
+/// | inner epoch | 25 sub-proofs, trace lengths (log2) `[2 x18, 3, 4 x2, 5 x2, 7, 20]` |
+/// | emitted program | **210,782 instructions**, 16,461 arena words |
+/// | census at the pin | 42,096,912 main + 13,320,972 aux ext = 82,059,828 base-field equivalents |
+/// | wall | 9.20s for the whole test: 3.1s to build and host-verify the epoch, 3.8s to prove, 0.16s to verify |
+/// | wrap proof | 45,953,352 bytes over 15 sub-proofs |
+///
+/// ⚠ **210,782 instructions, not the ~2.25M this file's slice-0 doc quotes for
+/// the same epoch and preset.** That figure was recorded against a different
+/// shape and is an order of magnitude high for this one; it is left alone above
+/// rather than re-blessed here, because which shape it belongs to is a question
+/// for whoever re-runs slice 0, not something to guess from a neighbouring
+/// measurement. Read the number in this table for THIS test and nothing else.
+///
+/// The 46 MB proof is a consequence of the WRAP proving at
+/// [`wrap_options`]' framework query count over 15 sub-proofs, not of anything
+/// about the inner epoch, whose own preset is one query. It is fine for a gate:
+/// the proof is built, verified and dropped inside the test and is never
+/// serialized to disk or carried anywhere. A wrap proof meant to be SHIPPED is
+/// the aggregator's problem and is sized by different levers.
 #[test]
 fn the_fixture_epoch_wraps() {
     fixture_wrap_run(
@@ -523,23 +511,25 @@ fn fixture_wrap_run(inner: ProofOptions, inputs: EpochInputs) {
     );
 
     // ---- the artifacts, at the PINNED socket permutation.
-    let opts = gate_wrap_options();
+    //
+    // `wrap_options` UNREDUCED, and deliberately with no knob to reduce it. The
+    // wrap's own query count is the one lever that would buy wall time without
+    // touching the emitted program, and at 9.2s for the whole test there is
+    // nothing to buy — so the gate proves under the same options every leg suite
+    // proved under, which is what keeps a wrap cost comparable with a leg cost.
+    // A dormant setting that quietly weakens a suite gate is worse than no
+    // setting; if this shape ever does need trimming, the honest lever is the
+    // one `the_wrap_proves_at_blowup_8_geometry` documents, named per run.
+    let opts = wrap_options();
     let artifacts = super::registry::build_artifacts_with_hasher(
         &program,
         &opts,
         crate::hash_pin::BLOCK_HASHER,
     );
     println!(
-        "   wrap options: blowup {}, {} queries{}, grinding {}\n   chip log-heights: {:?}",
-        opts.blowup_factor,
-        opts.fri_number_of_queries,
-        if WRAP_QUERIES.is_some() {
-            "  (REDUCED — not a security parameter set)"
-        } else {
-            "  (the framework's 128-bit count)"
-        },
-        opts.grinding_factor,
-        artifacts.log_heights
+        "   wrap options: blowup {}, {} queries (the framework's 128-bit count), \
+         grinding {}\n   chip log-heights: {:?}",
+        opts.blowup_factor, opts.fri_number_of_queries, opts.grinding_factor, artifacts.log_heights
     );
 
     // ---- PROVE.
