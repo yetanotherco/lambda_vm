@@ -73,10 +73,11 @@
 //!
 //! 1. **`LFM_REGISTRY`** — the hasher is folded into every `program_id`.
 //!    `cargo run --bin compute_lfm_registry --release`.
-//! 2. **The static preprocessed commitments** — `bitwise`, `keccak_rc` and
-//!    `page` each return a BLESSED CONSTANT from `preprocessed_commitment`
-//!    rather than recomputing, so under a new pin the prover recomputes an
-//!    RPO root, compares it against a BLAKE3 constant, and fails with
+//! 2. **The static preprocessed commitments** — FOUR families: `bitwise`,
+//!    `keccak_rc`, and `page`'s zero-page AND private-page constants. Each
+//!    returns a BLESSED CONSTANT from `preprocessed_commitment` rather than
+//!    recomputing, so under a new pin the prover recomputes an algebraic
+//!    root, compares it against a BLAKE3 constant, and fails with
 //!    `ProvingError::PrecomputedCommitmentMismatch`.
 //!    `cargo run --bin compute_static_commitments --release`.
 //!
