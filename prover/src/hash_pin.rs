@@ -54,6 +54,18 @@
 //! `IsStreamingLeafBackend` import in `proof_arena` were found. None of those
 //! three shows up on a build that only ever pins BLAKE3.
 //!
+//! # `cuda` on an algebraic pin
+//!
+//! Compiles, and still cannot prove under the wrong hash. The algebraic
+//! backends are `DeviceTreeBackend`s carrying their own `CommitmentHash` as the
+//! device dispatch key, and `math-cuda` has no kernels for those permutations
+//! yet, so a GPU run under an algebraic pin aborts at its first device commit
+//! with `unimplemented!` naming the hash. ⛔ Neither a `compile_error!` nor a
+//! byte-hash fallback belongs here: the first hides the cuda lint arm from the
+//! branch, the second is exactly the silent wrong-hash build this module exists
+//! to make impossible. Proving a block under an algebraic pin on GPU means
+//! landing the kernels, and nothing less.
+//!
 //! # ⚠ TWO regenerations, not one
 //!
 //! A pin change is **not** complete until every root blessed under the old hash

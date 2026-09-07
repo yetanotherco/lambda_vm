@@ -36,17 +36,35 @@ pub type Result<T> = std::result::Result<T, cudarc::driver::DriverError>;
 ///
 /// The fused LDE+commit pipelines ([`lde`]), the composition-poly tree
 /// builders ([`merkle`] / [`blake3`]) and the FRI layer commits ([`fri`])
-/// each exist kernel-for-kernel in both families; this enum is the dispatch
-/// key callers pass down. It deliberately carries no round counts or
+/// each exist kernel-for-kernel in both BYTE families; this enum is the
+/// dispatch key callers pass down. It deliberately carries no round counts or
 /// parameters: within one build each family is a single concrete hash
 /// (keccak-256, or `Blake3Chain` at the compiled round count), exactly as on
 /// the host.
+///
+/// ★ The three ALGEBRAIC keys name hashes whose device kernels are not yet
+/// ported. Every dispatch site in this crate carries an arm for them that
+/// aborts with `unimplemented!` naming the hash — never an arm that launches a
+/// byte-hash kernel in its place. The keys exist ahead of their kernels so the
+/// host side (`stark::config::DeviceTreeBackend`) can name every commitment
+/// hash under `cuda`: a tree labelled RPO is then built by RPO kernels or not
+/// built at all. Porting a family means replacing those arms with launches,
+/// and the set of arms is the checklist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceHash {
     /// Keccak-256 leaves and parents.
     Keccak256,
     /// `Blake3Chain` leaves and parents at the compiled round count.
     Blake3,
+    /// RPO256 leaves and parents. No device kernels yet: every dispatch site
+    /// aborts loudly on this key.
+    Rpo256,
+    /// RPX256 (XHash12) leaves and parents. No device kernels yet: every
+    /// dispatch site aborts loudly on this key.
+    Rpx256,
+    /// ⚠ Poseidon-original — UNSHIPPABLE on the host side too; present so the
+    /// key set mirrors `CommitmentHash` one-to-one. No device kernels.
+    Poseidon,
 }
 
 /// Toolchain sanity: plain wrapping u64 vector add. Not a field op.

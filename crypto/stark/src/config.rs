@@ -68,13 +68,20 @@ pub type FriLayerMerkleTree<F> = MerkleTree<FriLayerMerkleTreeBackend<F>>;
 /// 32-byte-node backend would compile there and hand back trees wearing a
 /// name whose hash the kernels never computed.
 ///
-/// This trait closes that hole from both ends: `COMMITMENT_HASH` is the
-/// dispatch key `gpu_lde` hands to `math-cuda` (selecting the keccak or the
-/// BLAKE3 kernel family at every leaf, level and FRI-layer launch), and
-/// implementing the trait is the reviewable claim that device kernels
-/// producing exactly this backend's hash exist. A backend over some other
-/// hash has no true constant to supply, so writing the impl is a deliberate
-/// false statement rather than an omission nobody had to make.
+/// This trait closes that hole: `COMMITMENT_HASH` is the dispatch key
+/// `gpu_lde` hands to `math-cuda`, which selects the kernel family at every
+/// leaf, level and FRI-layer launch — or, for a hash whose kernels are not yet
+/// ported (the algebraic three), aborts at that launch with `unimplemented!`
+/// naming the hash. Either way a tree labelled `Self` was hashed by `Self`'s
+/// kernels or was not built at all; what the trait rules out is the third
+/// outcome, a tree built by another hash's kernels and labelled `Self`.
+///
+/// Implementing it is therefore the reviewable statement of WHICH hash the
+/// device must compute for this backend, not a claim that it already can. A
+/// backend whose hash no [`CommitmentHash`] variant names has no true constant
+/// to supply, so writing the impl is a deliberate false statement rather than
+/// an omission nobody had to make. The algebraic impls live beside their
+/// backends in `prover::lfm::algebraic_commit`.
 pub trait DeviceTreeBackend: IsMerkleTreeBackend<Node = Commitment> {
     /// The hash the device kernels must compute for trees labelled `Self`.
     const COMMITMENT_HASH: CommitmentHash;
@@ -114,6 +121,12 @@ where
 /// artifacts name a hash. Every such match is a place that has to be revisited
 /// before this crate commits under a second hash; adding [`Self::Blake3`] broke
 /// them, which is what that mechanism is for.
+///
+/// ★ Under `cuda` every variant also needs a `math_cuda::DeviceHash` twin.
+/// `gpu_lde`'s bridge is total in both directions and asserts the pairing at
+/// compile time, so a variant added here without one is a build error naming
+/// the gap, and the bridge cannot cross-pair two hashes. A twin whose kernels
+/// are not yet ported is legal: its dispatch arms abort loudly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommitmentHash {
     /// Keccak-256 at both the leaf and the parent layer.
@@ -382,15 +395,19 @@ const _: fn() = || {
 /// [`DeviceTreeBackend`] impls above true statements rather than decoration —
 /// `gpu_lde` dispatches device kernels on that constant, so a mismatch here
 /// would be a GPU run hashing under a name the roots do not deserve.
-const _: fn() = || {
-    fn assert_device_hash<B: DeviceTreeBackend>(expect: CommitmentHash) {
-        assert!(matches!(
-            (B::COMMITMENT_HASH, expect),
-            (CommitmentHash::Keccak256, CommitmentHash::Keccak256)
-                | (CommitmentHash::Blake3, CommitmentHash::Blake3)
-        ));
+///
+/// A `const` block rather than a never-called closure, so the value comparison
+/// is evaluated at compile time and not merely type-checked. Discriminants are
+/// compared because `PartialEq` is not `const`. The algebraic configurations
+/// carry the same check beside their impls in `prover::lfm::algebraic_commit`.
+const _: () = {
+    const fn assert_device_hash<B: DeviceTreeBackend>(expect: CommitmentHash) {
+        assert!(
+            B::COMMITMENT_HASH as u8 == expect as u8,
+            "a configuration's member must name the configuration's own hash as its device key"
+        );
     }
-    fn assert_same<T>(_: core::marker::PhantomData<(T, T)>) {}
+    const fn assert_same<T>(_: core::marker::PhantomData<(T, T)>) {}
 
     assert_device_hash::<<KeccakStarkHash as StarkHash>::Batched<GoldilocksField>>(
         CommitmentHash::Keccak256,
