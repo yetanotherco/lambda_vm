@@ -171,7 +171,7 @@ struct Tenant {
     keccak: bool,
 }
 
-const TENANTS: [Tenant; 7] = [
+const TENANTS: [Tenant; 8] = [
     Tenant {
         label: "BLAKE3",
         hasher: HasherKind::Blake3,
@@ -212,6 +212,16 @@ const TENANTS: [Tenant; 7] = [
         label: "Pos/no-kec",
         hasher: HasherKind::Poseidon,
         algebraic: true,
+        keccak: false,
+    },
+    // The second BLAKE3 baseline: what a BLAKE3 tenant costs if the keccak
+    // family is retired from it TOO. Carried so the report can quote a
+    // like-for-like pair on both readings of that axis instead of comparing a
+    // keccak-less algebraic tenant against a keccak-carrying BLAKE3 one.
+    Tenant {
+        label: "BLAKE3/no-kec",
+        hasher: HasherKind::Blake3,
+        algebraic: false,
         keccak: false,
     },
 ];
@@ -725,6 +735,47 @@ fn the_lever_zero_factor_is_measured_per_tenant() {
         100.0 * (base_bill.parents + base_bill.fri_paths) as f64 / base_bill.total() as f64,
         rows[1].1.total() as f64 / base_bill.total() as f64,
         rows[0].3 - rows[1].3,
+    );
+
+    // ---- the two LIKE-FOR-LIKE pairs, since the keccak axis has to be held
+    // fixed on both sides of a ratio for it to mean anything.
+    let by = |label: &str| -> Bill {
+        rows.iter()
+            .find(|(t, _, _, _)| t.label == label)
+            .expect("tenant present")
+            .1
+    };
+    println!("\n   ── LIKE-FOR-LIKE (the keccak family held fixed on both sides)");
+    for (alg, b3, tag) in [
+        ("RPX", "BLAKE3", "keccak family PRESENT on both"),
+        (
+            "RPX/no-kec",
+            "BLAKE3/no-kec",
+            "keccak family RETIRED on both",
+        ),
+    ] {
+        println!(
+            "      {tag}: {alg} {} / {b3} {} = {:.4}x",
+            by(alg).total(),
+            by(b3).total(),
+            by(alg).total() as f64 / by(b3).total() as f64,
+        );
+    }
+
+    // ---- FALSIFICATION. The model contradicts its own multiplier, and that is
+    // a stronger check than my arithmetic disagreeing with its arithmetic.
+    //
+    // §1.2 puts the per-table/batched compression ratio at the aggregator at
+    // 2.44x. The LEAF term is format-invariant — each table's leaf is absorbed
+    // once per query either way, and only the Merkle paths multiply — so a
+    // hash matrix that is 67.6% of the BATCHED bill is necessarily 67.6/2.44 =
+    // 27.7% of the per-table one. That is the number MEASURED below, not 67.6%.
+    println!(
+        "\n   ── FALSIFICATION: §1.2's own 2.44x multiplier implies a per-table \
+         hash-matrix share of 67.6%/2.44 = 27.7%.\n      MEASURED: {:.1}% — so \
+         the 0.370x is an internal inconsistency in the model, not a \
+         disagreement with its data.",
+        100.0 * hm_share,
     );
 
     // ---- the assertions: the model's own claim, falsified with a band.
