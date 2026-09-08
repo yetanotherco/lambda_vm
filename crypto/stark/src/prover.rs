@@ -893,25 +893,41 @@ fn name_panic_payload(
 ///
 /// The walk is the order the per-table drivers *start* tables in. At
 /// `TABLE_PARALLELISM=1` it cannot change what is resident on the device (one
-/// table at a time, the gate never blocks), but it does fix the order the host
-/// allocator sees the per-table arenas in, and that is worth 5.9 GiB of host
-/// peak. Measured on the q=20 wrap (2^22, blowup 4, RTX 5090 box, 2026-09-07),
-/// `/usr/bin/time -v` max RSS, with prove time and proof bytes identical across
-/// all four runs:
+/// table at a time, the gate never blocks). What it does change is the order
+/// the host allocator sees the per-table arenas in. Measured on the q=20 wrap
+/// (2^22, blowup 4, RTX 5090 box, 2026-09-07/08), `/usr/bin/time -v` max RSS,
+/// proof bytes identical on every row:
 ///
-/// | walk | max RSS |
-/// |------|---------|
-/// | this weight, before the device-set model landed | 47,307,284 kB = 45.1 GiB |
-/// | this weight, restored under the device-set gate | 47,365,192 kB = 45.2 GiB |
-/// | the device-set model's own order | 53,472,980 kB = 51.0 GiB |
-/// | a fused-phase host-transient order | 53,453,344 kB = 51.0 GiB |
+/// | walk | build | `MALLOC_MMAP_THRESHOLD_` | max RSS |
+/// |------|-------|--------------------------|---------|
+/// | this weight | pre-#964 tip | default | 47,307,284 kB = 45.1 GiB |
+/// | this weight | diagnostic, device-set gate | default | 47,365,192 kB = 45.2 GiB |
+/// | this weight | this one | default | 53,456,648 kB = 51.0 GiB |
+/// | the device-set model's order | this one | default | 53,472,980 kB = 51.0 GiB |
+/// | a fused-phase host-transient order | this one | default | 53,453,344 kB = 51.0 GiB |
+/// | this weight | this one | 1 MiB | 46,053,164 kB = 43.9 GiB |
+/// | this weight | pre-#964 tip | 1 MiB | 46,054,788 kB = 43.9 GiB |
 ///
-/// At q=41 this weight and the device-set order both measure 98.6 GiB, so the
-/// effect is shape-dependent and the mechanism — why reordering only the small
-/// tables moves host peak at all when one table is resident at a time — is
-/// still open. Until it is understood, this order is kept because it is the one
-/// that measures well. That is the whole justification, and it is why the
-/// weight below lives here with the scheduler and not in the device-set model.
+/// Read the first three rows together: the SAME order measures 45.2 GiB in one
+/// build and 51.0 GiB in this one. **The order is a correlate, not a cause.**
+/// The mechanism is glibc arena retention — the test harness installs no
+/// `#[global_allocator]`, and a freed multi-gibibyte buffer is returned to the
+/// OS only when the arena top can be trimmed, which depends on what was
+/// allocated above it. The walk order is one input to that layout; the
+/// allocations made around it are another. The last two rows settle what is
+/// being measured: forcing every allocation of a megabyte or more to be mapped
+/// and unmapped directly collapses a 5.9 GiB spread to 1.6 MB, so none of it
+/// was ever working set. (At q=41 the orders are indistinguishable, 98.5
+/// against 98.6 GiB.)
+///
+/// ⇒ **The durable fix is the allocator, not this weight.** Setting
+/// `MALLOC_MMAP_THRESHOLD_` for the harness removes the effect outright and
+/// takes 1.2 GiB off the good arm too. It is not free: leaving the retentive
+/// state costs ~2.5% prove time (136.4 → 140.2 s here, while a build already
+/// out of it goes 140.3 → 140.1 s), so the time follows the retention state
+/// rather than the order. Until that lands, this order is kept because it is
+/// the one the prover had before #964 — not because reordering is a lever, as
+/// nothing in this file controls the layout that decides the number.
 ///
 /// Its arithmetic is inherited verbatim from the VRAM estimate the prover
 /// sorted by before the device-set model, and it is deliberately NOT re-read as
