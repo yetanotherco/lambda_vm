@@ -42,7 +42,7 @@ The first row's `timestamp` is pinned by @dma:c:receive_ecall to the `CPU`'s pre
 That column also carries $#`timestamp` = 4 dot (i + 1)$, which is what keeps $#`timestamp` + 2$ from leaving the `Word` range in @dma:c:write_value --- `IS_WORD` alone would not.
 
 = Constraints
-In this VM, we assign system call number $-3$ to the #dma accelerator.
+In this VM, we assign system call number $-30$ to the #dma accelerator.
 Since we do not know how many bytes are to be copied, this chip employs the same recursive design as `COMMIT` (@commit):
 each iteration copies one chunk of bytes, and recursively "calls" itself to copy the remainder.
 As such, only the call from the CPU to this chip (i.e., the `first` in the recursion tree) should accept the `ECALL`; later recursive calls should not.

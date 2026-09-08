@@ -115,7 +115,7 @@ name = "incoming"
 [[constraints.incoming]]
 kind = "interaction"
 tag = "ECALL"
-input = ["timestamp", ["arr", ["-", ["^", 2, 32], 3], ["-", ["^", 2, 32], 1]]]
+input = ["timestamp", ["arr", ["-", ["^", 2, 32], 30], ["-", ["^", 2, 32], 1]]]
 multiplicity = ["-", "first"]
 ref = "dma:c:receive_ecall"
 
