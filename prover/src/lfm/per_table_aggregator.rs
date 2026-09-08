@@ -419,80 +419,115 @@ pub fn emit_leg(b: &mut LfmBuilder, child: &ChildShape<'_>, a: &LegArenas) -> Le
 // ============================ the binding legs ============================
 
 /// Where each field of the block-binding schema sits in a child's published
-/// words.
+/// words — for a WRAP child and for a NODE child alike.
 ///
-/// The order is the emitter's, and it is one order: `epoch_tests::epoch_program`
-/// publishes the pair, the attestation id, then this schema, and
-/// `epoch_tests::schema_words` is the same arithmetic as [`Self::schema_words`].
-/// A node indexes by these accessors, so a field inserted on one side and not
-/// the other re-binds every field below it — which is why
-/// [`Self::assert_covers`] is called at assembly time rather than trusted.
+/// The two differ in their head and in two fields, and the difference is real
+/// rather than incidental, so it is a constructor apiece rather than a flag:
+///
+/// | | wrap child | node child |
+/// |---|---|---|
+/// | head | `z, α, id₀, id₁` | `id₀, id₁` — a node has FAN_IN Phase A's and no single pair |
+/// | labels | one epoch label | the FIRST and LAST label of its subtree |
+/// | L2G | the epoch's re-commit root, as lanes | the subtree's FOLDED digest, as cells |
+/// | tail | the closure's bus total | nothing |
+///
+/// A node has no single `(z, α)` because it replays one transcript per child,
+/// and no single epoch label because it covers a RANGE — publishing the range's
+/// two ends is what lets a parent pin them to constants and get contiguity
+/// across siblings for free.
+///
+/// ⚠ `l2g_words` is a WORD count, not a lane count, and the two constructors
+/// disagree on purpose: a wrap publishes `RootCells::lanes_flat` (four lanes per
+/// root word) while a node publishes the fold's digest CELLS. The codebase has
+/// been bitten by lanes-versus-words twice; the field is named for the unit it
+/// actually is.
 pub struct SchemaLayout {
+    /// Where the two attestation-id words start.
+    pub id_at: usize,
+    /// Words published before the schema run.
+    pub head: usize,
     pub num_reg: usize,
+    /// Label words: two for a wrap (one label, lo/hi), four for a node.
+    pub label_words: usize,
     pub out_halves: usize,
-    /// Lanes the L2G root occupies — four on an algebraic hash, eight on a byte
-    /// one. Read from `proof_arena::lanes_per_root` rather than spelled, because
-    /// a reader that spells `8` walks an algebraic schema at twice the stride and
-    /// lands on the wrong field instead of out of bounds.
-    pub root_lanes: usize,
+    pub l2g_words: usize,
+    /// Words published after the schema run.
+    pub tail: usize,
 }
 
 impl SchemaLayout {
-    /// The words published before the schema: the shared pair and the two
-    /// attestation-id words.
-    pub const HEAD: usize = 4;
-
-    pub fn new(out_halves: usize) -> Self {
+    /// The layout of an epoch WRAP published under `Publishes::Aggregation`.
+    pub fn wrap(out_halves: usize) -> Self {
         Self {
+            id_at: 2,
+            head: 4,
             num_reg: crate::tables::register::NUM_REGISTER_ADDRESSES,
+            label_words: 2,
             out_halves,
-            root_lanes: super::proof_arena::lanes_per_root(),
+            l2g_words: super::proof_arena::lanes_per_root(),
+            tail: 1,
+        }
+    }
+
+    /// The layout of an aggregation NODE, at any level.
+    pub fn node(out_halves: usize) -> Self {
+        Self {
+            id_at: 0,
+            head: 2,
+            num_reg: crate::tables::register::NUM_REGISTER_ADDRESSES,
+            label_words: 4,
+            out_halves,
+            l2g_words: super::proof_arena::words_per_root(),
+            tail: 0,
         }
     }
 
     pub fn schema_words(&self) -> usize {
-        2 * self.num_reg + 2 + self.out_halves + self.root_lanes
+        2 * self.num_reg + self.label_words + self.out_halves + self.l2g_words
     }
 
-    /// Total words a child publishes under `Publishes::Aggregation` — the head,
-    /// the schema and the closure's bus total.
+    /// Every word the child publishes.
     pub fn total(&self) -> usize {
-        Self::HEAD + self.schema_words() + 1
+        self.head + self.schema_words() + self.tail
     }
 
     /// Pin the layout against what the child actually publishes.
     ///
-    /// A level confusion — a layout built for one child applied to another — is
-    /// a loud failure here rather than a silent mis-binding fifty asserts later.
+    /// A level confusion — a wrap layout applied to a node, or a layout built
+    /// for one block applied to another — is a loud failure here rather than a
+    /// silent mis-binding fifty asserts later.
     pub fn assert_covers(&self, num_public_words: usize) {
         assert_eq!(
             self.total(),
             num_public_words,
             "the layout must cover the child's published words exactly \
-             (num_reg={}, out_halves={}, root_lanes={})",
+             (head={}, num_reg={}, label_words={}, out_halves={}, l2g_words={}, tail={})",
+            self.head,
             self.num_reg,
+            self.label_words,
             self.out_halves,
-            self.root_lanes,
+            self.l2g_words,
+            self.tail,
         );
     }
 
     pub fn id(&self, half: usize) -> usize {
-        2 + half
+        self.id_at + half
     }
     pub fn reg_init(&self, r: usize) -> usize {
-        Self::HEAD + r
+        self.head + r
     }
     pub fn reg_fini(&self, r: usize) -> usize {
-        Self::HEAD + self.num_reg + r
+        self.head + self.num_reg + r
     }
-    pub fn label(&self, half: usize) -> usize {
-        Self::HEAD + 2 * self.num_reg + half
+    pub fn label(&self, i: usize) -> usize {
+        self.head + 2 * self.num_reg + i
     }
     pub fn out_half(&self, i: usize) -> usize {
-        Self::HEAD + 2 * self.num_reg + 2 + i
+        self.head + 2 * self.num_reg + self.label_words + i
     }
-    pub fn l2g_lane(&self, lane: usize) -> usize {
-        Self::HEAD + 2 * self.num_reg + 2 + self.out_halves + lane
+    pub fn l2g_word(&self, w: usize) -> usize {
+        self.head + 2 * self.num_reg + self.label_words + self.out_halves + w
     }
 }
 
@@ -530,7 +565,7 @@ pub fn emit_chain_bindings(
     b: &mut LfmBuilder,
     legs: &[LegCells],
     layouts: &[SchemaLayout],
-    labels: &[u64],
+    labels: &[&[u64]],
 ) {
     assert_eq!(legs.len(), layouts.len(), "one layout per child");
     assert_eq!(legs.len(), labels.len(), "one chain position per child");
@@ -556,36 +591,234 @@ pub fn emit_chain_bindings(
         }
     }
     // ---- each label pinned to its position, as a constant of THIS program.
-    for (k, &label) in labels.iter().enumerate() {
-        assert_word_is_const(
-            b,
-            &legs[k].publics[layouts[k].label(0)],
-            label & 0xFFFF_FFFF,
+    //
+    // A wrap child carries ONE label; a node child carries the first and last of
+    // its subtree. Pinning every one of them to a constant is what makes
+    // contiguity across siblings free: the emitter knows the true label
+    // sequence, so a child covering the wrong range cannot satisfy the pins.
+    for (k, child_labels) in labels.iter().enumerate() {
+        assert_eq!(
+            2 * child_labels.len(),
+            layouts[k].label_words,
+            "child {k} publishes {} label words but {} labels were given",
+            layouts[k].label_words,
+            child_labels.len()
         );
-        assert_word_is_const(b, &legs[k].publics[layouts[k].label(1)], label >> 32);
+        for (i, &label) in child_labels.iter().enumerate() {
+            assert_word_is_const(
+                b,
+                &legs[k].publics[layouts[k].label(2 * i)],
+                label & 0xFFFF_FFFF,
+            );
+            assert_word_is_const(
+                b,
+                &legs[k].publics[layouts[k].label(2 * i + 1)],
+                label >> 32,
+            );
+        }
     }
 }
 
-/// Assert child `k`'s published L2G re-commit root equals the root the global
-/// proof's verifier published for epoch `k`.
+// ============================ the aggregation node ========================
+
+/// Children per node — the tree's arity.
 ///
-/// The in-VM half of the root-equality binding. In a TREE the two sides are not
-/// generally in the same node — the global wrap rides at the ROOT — so this is
-/// emitted where both are in scope and nowhere else.
-pub fn assert_l2g_roots_equal(
-    b: &mut LfmBuilder,
-    epoch: &LegCells,
-    epoch_layout: &SchemaLayout,
-    global: &LegCells,
-    global_first_root_word: usize,
-    epoch_index: usize,
-) {
-    let lanes = epoch_layout.root_lanes;
-    for lane in 0..lanes {
-        assert_words_equal(
-            b,
-            &epoch.publics[epoch_layout.l2g_lane(lane)],
-            &global.publics[global_first_root_word + lanes * epoch_index + lane],
-        );
+/// A DEFAULT, not an assumption: every emitter below takes a slice, so the
+/// arity is whatever the caller passes and nothing here depends on this value.
+/// It exists so the tree builder has one place to change.
+///
+/// Two is the brief's working default and three is COORD's tie-break, on the
+/// grounds that over ten epochs it is 5 distinct programs / 7 proofs / 3 levels
+/// against two's 6 / 11 / 4. The measured host peak decides; until it has, the
+/// conservative value stands.
+pub const FAN_IN: usize = 2;
+
+/// A digest rebuilt from the lanes a child PUBLISHED for it.
+///
+/// The inverse of `RootCells::lanes_flat`, and correct on both arms — four
+/// lanes pack into one word, and a root is `words_per_root` of them.
+///
+/// ⚠ Deliberately not `RootCells::from_halves`, which asserts EIGHT halves and
+/// is byte-arm-only by construction. Handing it an algebraic root's four felts
+/// fails the assert; handing a byte root's eight halves to a caller expecting
+/// felts would hash four values as if they were eight, silently.
+pub fn digest_from_lanes(b: &mut LfmBuilder, lanes: &[Felt]) -> super::edsl::WrapDigest {
+    let words = super::proof_arena::words_per_root();
+    assert_eq!(
+        lanes.len(),
+        LANES_PER_WORD * words,
+        "a published root is four lanes per root word"
+    );
+    let cells: Vec<super::builder::Cell> = lanes
+        .chunks(LANES_PER_WORD)
+        .map(|c| b.pack_word([c[0], c[1], c[2], c[3]]))
+        .collect();
+    match cells.len() {
+        1 => super::edsl::WrapDigest::from_cell(cells[0]),
+        2 => super::edsl::WrapDigest::from_pair(cells[0], cells[1]),
+        n => unreachable!("a root is one or two words, got {n}"),
     }
+}
+
+/// Fold a subtree's L2G re-commit roots into ONE digest — a left fold of the
+/// production hash's two-to-one compression, identity on a singleton.
+///
+/// # Why a fold and not a list
+///
+/// The batched aggregator compared each epoch's published L2G root against the
+/// global proof's re-commit root for that epoch, and could do it as a local
+/// assert because all six legs were in ONE program. A tree splits them: the
+/// epoch wraps sit in leaf nodes and the global wrap rides at the ROOT, so the
+/// compare must be deferred to their common ancestor.
+///
+/// If each node re-published its subtree's roots as a LIST, the node schema
+/// would grow with the subtree and every level would have a different published
+/// width — which is what makes the parent's leg shape depend on the block's
+/// epoch count. Folding them keeps the node schema FIXED SIZE at every level,
+/// and the root recomputes the same fold over the global wrap's published roots
+/// and compares one digest.
+///
+/// The rule is stated here because the root must replicate it exactly: left
+/// fold, in tree order, `hash_pair(acc, next)`; a single root folds to itself.
+pub fn fold_l2g(
+    b: &mut LfmBuilder,
+    digests: &[super::edsl::WrapDigest],
+) -> super::edsl::WrapDigest {
+    assert!(!digests.is_empty(), "a subtree covers at least one epoch");
+    let hash = b.wrap_hash();
+    let mut acc = digests[0];
+    for next in &digests[1..] {
+        acc = hash.hash_pair(b, acc, *next);
+    }
+    acc
+}
+
+/// What a node publishes, so that its parent binds it exactly as it binds a
+/// wrap. See [`SchemaLayout::node`] for the layout this fills.
+pub struct NodePublishes<'a> {
+    /// The children's legs, in chain order.
+    pub legs: &'a [LegCells],
+    /// One layout per child.
+    pub layouts: &'a [SchemaLayout],
+    /// The first and last epoch label of the subtree — emit-time constants.
+    pub label_range: (u64, u64),
+}
+
+/// Emit a node's published words: the shared attestation id, the first child's
+/// register INIT vector, the last child's register FINI vector, the subtree's
+/// first and last epoch labels, the last child's output halves, and the folded
+/// L2G digest.
+///
+/// Every value is republished in the SAME form the wrap published it, so a
+/// parent's `assert_words_equal` reads a node and a wrap alike: the id as a
+/// four-lane digest word, the register / label / output items as base words.
+pub fn emit_node_publishes(b: &mut LfmBuilder, p: &NodePublishes<'_>) {
+    let NodePublishes {
+        legs,
+        layouts,
+        label_range,
+    } = *p;
+    assert_eq!(legs.len(), layouts.len(), "one layout per child");
+    assert!(!legs.is_empty(), "a node has children");
+    let first = &legs[0];
+    let last = legs.last().expect("nonempty");
+    let l_first = &layouts[0];
+    let l_last = layouts.last().expect("nonempty");
+
+    // ---- the attestation id, as the four-lane word the wrap published.
+    for half in 0..2 {
+        let lanes = &first.publics[l_first.id(half)].lanes;
+        let word = b.pack_word([lanes[0], lanes[1], lanes[2], lanes[3]]);
+        b.public(word);
+    }
+    // ---- the chain's two ends.
+    for r in 0..l_first.num_reg {
+        b.public(first.publics[l_first.reg_init(r)].lanes[0].as_cell());
+    }
+    for r in 0..l_last.num_reg {
+        b.public(last.publics[l_last.reg_fini(r)].lanes[0].as_cell());
+    }
+    // ---- the label RANGE, as constants of this program. Publishing the ends
+    // rather than the list is what keeps the schema fixed-size; the parent pins
+    // both to constants and gets contiguity across siblings for free.
+    for label in [label_range.0, label_range.1] {
+        let lo = b.felt_const(FE::from(label & 0xFFFF_FFFF));
+        b.public(lo.as_cell());
+        let hi = b.felt_const(FE::from(label >> 32));
+        b.public(hi.as_cell());
+    }
+    // ---- the last child's output halves — the block's output, carried up.
+    for i in 0..l_last.out_halves {
+        b.public(last.publics[l_last.out_half(i)].lanes[0].as_cell());
+    }
+    // ---- the folded L2G digest.
+    let digests: Vec<super::edsl::WrapDigest> = legs
+        .iter()
+        .zip(layouts)
+        .map(|(leg, layout)| {
+            let lanes: Vec<Felt> = (0..layout.l2g_words)
+                .map(|w| leg.publics[layout.l2g_word(w)].lanes[0])
+                .collect();
+            digest_from_lanes(b, &lanes)
+        })
+        .collect();
+    let folded = fold_l2g(b, &digests);
+    for cell in folded.cells() {
+        b.public(*cell);
+    }
+}
+
+/// One aggregation node, end to end: verify every child, bind them, publish the
+/// node's own schema.
+///
+/// The SAME function serves every level — a child is a plain per-table
+/// `MultiProof` whether a wrap or another node produced it, and the only thing
+/// that changes is the children's shapes and layouts. What does not carry across
+/// levels is the node's IDENTITY: the legs absorb their children's `program_id`
+/// as emit-time constants, so each level compiles to its own program.
+pub struct NodeInputs<'a> {
+    pub children: &'a [ChildShape<'a>],
+    pub layouts: &'a [SchemaLayout],
+    /// Per child, the epoch labels it must carry: one for a wrap child, the two
+    /// ends of its subtree for a node child.
+    pub labels: &'a [&'a [u64]],
+    /// The first and last epoch label this node's subtree covers.
+    pub label_range: (u64, u64),
+}
+
+/// Declare every arena the node reads, in absorb order, then emit it.
+pub fn emit_node(b: &mut LfmBuilder, inputs: &NodeInputs<'_>) {
+    let NodeInputs {
+        children,
+        layouts,
+        labels,
+        label_range,
+    } = *inputs;
+    assert!(!children.is_empty(), "a node verifies at least one child");
+    assert_eq!(children.len(), layouts.len(), "one layout per child");
+    assert_eq!(children.len(), labels.len(), "one label list per child");
+    for (child, layout) in children.iter().zip(layouts) {
+        layout.assert_covers(child.num_public_words);
+    }
+
+    // Declaration order IS absorb order, end to end: every child's arenas are
+    // declared before any leg is emitted.
+    let arenas: Vec<LegArenas> = children
+        .iter()
+        .map(|child| declare_leg_arenas(b, child))
+        .collect();
+    let legs: Vec<LegCells> = children
+        .iter()
+        .zip(&arenas)
+        .map(|(child, a)| emit_leg(b, child, a))
+        .collect();
+    emit_chain_bindings(b, &legs, layouts, labels);
+    emit_node_publishes(
+        b,
+        &NodePublishes {
+            legs: &legs,
+            layouts,
+            label_range,
+        },
+    );
 }

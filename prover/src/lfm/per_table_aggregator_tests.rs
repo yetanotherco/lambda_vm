@@ -145,8 +145,8 @@ pub(super) fn real_global(
     let lookup: Vec<FEE> = (0..stark::lookup::LOGUP_NUM_CHALLENGES)
         .map(|_| transcript.sample_field_element())
         .collect();
-    let z_alpha = (lookup[0], lookup[1]);
 
+    let z_alpha = (lookup[0], lookup[1]);
     let num_tables = refs.len();
     let tables: Vec<super::epoch_tests::HostTable> = refs
         .iter()
@@ -583,7 +583,7 @@ fn bindings_only_program(children: usize, with_bindings: bool) -> (LfmProgram, u
 
     // A block-final epoch's output length; the schema's only variable term.
     const OUT_HALVES: usize = 8;
-    let layout = SchemaLayout::new(OUT_HALVES);
+    let layout = SchemaLayout::wrap(OUT_HALVES);
     let words = layout.total();
 
     let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
@@ -601,10 +601,12 @@ fn bindings_only_program(children: usize, with_bindings: bool) -> (LfmProgram, u
     }
     if with_bindings {
         let layouts: Vec<SchemaLayout> = (0..children)
-            .map(|_| SchemaLayout::new(OUT_HALVES))
+            .map(|_| SchemaLayout::wrap(OUT_HALVES))
             .collect();
-        let labels: Vec<u64> = (0..children as u64).collect();
-        emit_chain_bindings(&mut b, &legs, &layouts, &labels);
+        // One label per WRAP child, matching `SchemaLayout::wrap`'s two label words.
+        let labels: Vec<[u64; 1]> = (0..children as u64).map(|k| [k]).collect();
+        let label_refs: Vec<&[u64]> = labels.iter().map(|l| &l[..]).collect();
+        emit_chain_bindings(&mut b, &legs, &layouts, &label_refs);
     }
     (compile(b.finish()), words)
 }
@@ -654,9 +656,15 @@ fn the_node_cost_model_is_measured() {
 
     // ---- (a) the per-published-word marginal.
     const OUT_HALVES: usize = 8;
-    let aggregation_words = SchemaLayout::new(OUT_HALVES).total();
-    // The measured diagnostic count at q=110, plus the schema this branch adds.
-    let diagnostic_words = 10_507 + SchemaLayout::new(OUT_HALVES).schema_words();
+    let aggregation_words = SchemaLayout::wrap(OUT_HALVES).total();
+    // ⚠ A SAMPLE POINT, not an assumption. 10,507 is the MEASURED diagnostic
+    // count of the q=110 wrap; the diagnostic set is dominated by per-query terms
+    // (one FRI terminal and one index per query per sub-proof), so this point
+    // goes stale the moment the query count moves — and lane P's re-tune may take
+    // it to 119. Nothing is built against it: what this instrument produces is
+    // the per-word COEFFICIENT, which is a property of the emitter and holds at
+    // any count. The point is here only so the table brackets the real range.
+    let diagnostic_words = 10_507 + SchemaLayout::wrap(OUT_HALVES).schema_words();
     let points = [0, 64, 128, 256, 512, aggregation_words, diagnostic_words];
     println!(
         "\n★ (a) THE PER-PUBLISHED-WORD BILL, at {hash:?}\n   \
@@ -722,4 +730,376 @@ fn the_node_cost_model_is_measured() {
          A child publishing {aggregation_words} words instead of {diagnostic_words} \
          is the whole lever."
     );
+}
+
+// ======================= the child harvest and the node ===================
+
+/// One child LFM proof, production-accepted, harvested for emission.
+///
+/// The per-table sibling of `epoch_tests::RealEpoch`, over an LFM machine's
+/// proof rather than the VM's. ★ Nothing in the harvest is LFM-specific:
+/// `host_table_forked` and `build_table_legs` take `(&dyn AIR,
+/// StarkProofView)`, so the same two functions read a wrap proof, a node proof
+/// and a VM epoch proof alike. That is what makes one node emitter serve every
+/// level.
+pub(super) struct RealChild {
+    pub(super) artifacts: super::registry::LfmArtifacts,
+    pub(super) opts: crate::ProofOptions,
+    pub(super) public_words: Vec<(u32, LfmWord)>,
+    pub(super) tables: Vec<super::epoch_tests::HostTable>,
+    pub(super) legs: Vec<super::epoch_verify_tests::TableLegs>,
+}
+
+// ⚠ The harvested `(z, α)` is deliberately NOT kept. It is the right
+// differential oracle for a leg — it is what the global leg publishes and
+// compares — but a node under `Publishes::Aggregation` publishes no challenges,
+// so there is nowhere to compare it against and a kept field would be dead. What
+// stands in its place is weaker and worth naming: the node EXECUTING at all
+// means the leg derived the child's own challenges, because a leg on different
+// challenges cannot authenticate the child's walks. That is implication, not a
+// value comparison, and it is a real gap in the evidence until a diagnostic node
+// variant exists to publish the pair.
+
+/// Harvest a child from a proof PRODUCTION ACCEPTS. Panics loudly otherwise —
+/// nothing downstream may read a proof the verifier would reject.
+pub(super) fn real_child(
+    artifacts: super::registry::LfmArtifacts,
+    opts: crate::ProofOptions,
+    proved: &super::proof::LfmProof,
+) -> RealChild {
+    use crypto::fiat_shamir::is_transcript::IsTranscript;
+    use stark::proof::view::MultiProofView;
+
+    assert!(
+        super::proof::verify_against_artifacts(
+            &artifacts,
+            &proved.proof,
+            &proved.public_words,
+            &opts
+        ),
+        "the harness only reads children production accepts"
+    );
+
+    let airs = super::airs::LfmAirs::new_chunked(
+        &artifacts.roots,
+        &artifacts.blake3_chunk_roots,
+        &opts,
+        artifacts.keccak_rnd_chunks,
+        artifacts.hasher,
+        artifacts.chip_set,
+    );
+    let refs = airs.air_refs();
+    let view = MultiProofView::Owned(&proved.proof);
+    assert_eq!(refs.len(), view.len(), "one AIR per sub-proof");
+
+    // The seed IS `verify_against_chunked`'s: the LFM statement over the claimed
+    // words, and nothing before it.
+    let seed = || {
+        let mut t = crate::hash_pin::block_transcript(&[]);
+        super::statement::absorb_lfm_statement(
+            &mut t,
+            &artifacts.program_id,
+            &proved.public_words,
+            opts.fri_final_poly_log_degree,
+        );
+        t
+    };
+
+    let mut transcript = seed();
+    for (idx, air) in refs.iter().enumerate() {
+        let v = view.get(idx);
+        if air.is_preprocessed() {
+            transcript.append_bytes(&air.precomputed_commitment());
+        }
+        transcript.append_bytes(v.lde_trace_main_merkle_root());
+    }
+    let lookup: Vec<FEE> = (0..stark::lookup::LOGUP_NUM_CHALLENGES)
+        .map(|_| transcript.sample_field_element())
+        .collect();
+
+    let num_tables = refs.len();
+    let tables: Vec<super::epoch_tests::HostTable> = refs
+        .iter()
+        .enumerate()
+        .map(|(idx, air)| {
+            let v = view.get(idx);
+            let mut fork = transcript.clone();
+            if num_tables > 1 {
+                fork.append_bytes(&(idx as u64).to_le_bytes());
+            }
+            if let Some(root) = v.lde_trace_aux_merkle_root() {
+                fork.append_bytes(root);
+            }
+            if let Some(c) = v.bus_table_contribution() {
+                fork.append_field_element(&c);
+            }
+            super::epoch_tests::host_table_forked(*air, v, idx, num_tables, &mut fork, &lookup)
+        })
+        .collect();
+    let legs = refs
+        .iter()
+        .enumerate()
+        .map(|(idx, air)| super::epoch_verify_tests::build_table_legs(*air, view.get(idx), &lookup))
+        .collect();
+
+    RealChild {
+        artifacts,
+        opts,
+        public_words: proved.public_words.clone(),
+        tables,
+        legs,
+    }
+}
+
+/// The child's shape, as the node's emitter reads it.
+pub(super) fn child_shape(c: &RealChild) -> super::per_table_aggregator::ChildShape<'_> {
+    super::per_table_aggregator::ChildShape {
+        program_id: &c.artifacts.program_id,
+        num_public_words: c.public_words.len(),
+        fri_final_poly_log_degree: c.opts.fri_final_poly_log_degree,
+        tables: c
+            .tables
+            .iter()
+            .zip(&c.legs)
+            .map(|(h, leg)| super::per_table_aggregator::ChildTable {
+                challenge: &h.shape,
+                verify: &leg.verify,
+                analysis: &leg.analysis,
+                precomputed_root: leg.precomputed_commitment.as_ref(),
+            })
+            .collect(),
+    }
+}
+
+/// The child's arenas, in `declare_leg_arenas`' declaration order.
+pub(super) fn child_arena_words(c: &RealChild) -> Vec<Vec<LfmWord>> {
+    let mut arenas: Vec<Vec<LfmWord>> = Vec::new();
+    // The published words, eight halves each — the statement's own layout.
+    let mut publics = Vec::with_capacity(8 * c.public_words.len());
+    for (_, word) in &c.public_words {
+        for lane in word {
+            let v: u64 = lane.canonical();
+            publics.push(base_word(FE::from(v & 0xFFFF_FFFF)));
+            publics.push(base_word(FE::from(v >> 32)));
+        }
+    }
+    arenas.push(publics);
+    arenas.push(super::proof_arena::commitments_to_arena(
+        &c.tables.iter().map(|h| h.main_root).collect::<Vec<_>>(),
+    ));
+    for (h, leg) in c.tables.iter().zip(&c.legs) {
+        if let Some(root) = &h.aux_root {
+            arenas.push(super::proof_arena::commitments_to_arena(&[*root]));
+        }
+        if let Some(l) = &h.contribution {
+            arenas.push(vec![ext_word(l)]);
+        }
+        arenas.push(super::proof_arena::commitments_to_arena(&[
+            h.composition_root
+        ]));
+        arenas.push(h.ood_current.iter().map(ext_word).collect());
+        arenas.push(h.ood_next.iter().map(ext_word).collect());
+        arenas.push(h.parts.iter().map(ext_word).collect());
+        arenas.push(super::proof_arena::commitments_to_arena(&h.fri_roots));
+        arenas.push(h.fri_coeffs.iter().map(ext_word).collect());
+        if let Some(nonce) = h.nonce {
+            arenas.push(vec![base_word(FE::from(nonce))]);
+        }
+        arenas.push(leg.opening_arena());
+        arenas.push(leg.fri_arena());
+    }
+    arenas
+}
+
+/// The aggregation node over `children`, at any level and any arity.
+pub(super) fn node_program(
+    children: &[RealChild],
+    layouts: &[super::per_table_aggregator::SchemaLayout],
+    labels: &[&[u64]],
+    label_range: (u64, u64),
+) -> LfmProgram {
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let shapes: Vec<_> = children.iter().map(child_shape).collect();
+    super::per_table_aggregator::emit_node(
+        &mut b,
+        &super::per_table_aggregator::NodeInputs {
+            children: &shapes,
+            layouts,
+            labels,
+            label_range,
+        },
+    );
+    compile(b.finish())
+}
+
+/// ★ THE LEAF NODE RUNS — the first aggregation node over real per-table wrap
+/// proofs.
+///
+/// # What it is
+///
+/// `FAN_IN` epochs of a fixture continuation, each wrapped by the assembled
+/// per-table epoch verifier under `Publishes::Aggregation`, and ONE emitted
+/// program that verifies both wrap proofs and binds them: the shared attestation
+/// id, the register fini→init seam, and each epoch's label pinned to its chain
+/// position as a constant. The node then publishes the schema its own parent
+/// will read.
+///
+/// # Why the tamper arms are three and not one
+///
+/// Each binding leg can fail on its own and a single arm would not tell them
+/// apart. The register seam, the shared id and the label pin are three
+/// independent claims about the relationship between two proofs that both
+/// verify — and "both children verified" is exactly what a broken binding still
+/// looks like. Each arm moves ONE published word in ONE child's arena and
+/// nothing else, so what fails is named by which arm failed.
+///
+/// # Cost
+///
+/// Box tier and `#[ignore]`d: two epoch wraps proved (a wrap proof carries a
+/// full LFM chip set), then a node program that verifies both. The suite gates
+/// the pieces — `wrap_tests::the_fixture_epoch_wraps` proves one wrap,
+/// `the_global_verifier_leg_runs_and_rejects_tampers` runs a per-table leg, and
+/// `the_aggregation_publish_profile_drops_only_diagnostics` pins what a wrap
+/// publishes — so this is the assembly rather than any of its parts.
+#[test]
+#[ignore = "box tier: proves FAN_IN epoch wraps and a node over them"]
+fn the_leaf_node_verifies_and_binds_two_wraps() {
+    use super::epoch_tests::Publishes;
+    use super::per_table_aggregator::{FAN_IN, SchemaLayout};
+    use super::proof::lfm_prove;
+    use super::registry::build_artifacts_with_hasher;
+    use std::time::Instant;
+
+    let elf_bytes = super::proof_fixture::read_inner_elf();
+    let inner = super::proof_fixture::fixture_options();
+    let bundle = crate::continuation::prove_continuation(
+        &elf_bytes,
+        &[],
+        super::proof_fixture::FIXTURE_EPOCH_LOG2,
+        &inner,
+    )
+    .expect("the fixture continuation must prove");
+    assert!(
+        bundle.num_epochs() >= FAN_IN,
+        "a fan-in-{FAN_IN} leaf needs {FAN_IN} epochs, the fixture has {}",
+        bundle.num_epochs()
+    );
+
+    // ---- the children: one wrap per epoch, at the AGGREGATION publish set.
+    let t = Instant::now();
+    let mut children = Vec::with_capacity(FAN_IN);
+    let mut layouts = Vec::with_capacity(FAN_IN);
+    let mut labels = Vec::with_capacity(FAN_IN);
+    let wrap_opts = super::proof::aggregation_wrap_options();
+    for k in 0..FAN_IN {
+        let e =
+            super::epoch_tests::real_epoch_from_continuation(&inner, &elf_bytes, &bundle, k, None)
+                .expect("every epoch must reconstruct from proofs alone");
+        let out_halves = e.statement.public_output_len.div_ceil(4);
+        let program =
+            super::epoch_tests::epoch_program_publishing(&e, true, Publishes::Aggregation);
+        let arenas = super::epoch_tests::epoch_arena_words(&e, true);
+        let artifacts =
+            build_artifacts_with_hasher(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
+        let proved = lfm_prove(&program, &artifacts, &arenas, &wrap_opts)
+            .expect("the epoch wrap must prove at the aggregation preset");
+        let layout = SchemaLayout::wrap(out_halves);
+        layout.assert_covers(proved.public_words.len());
+        layouts.push(layout);
+        // The label is a pure function of the chain position, exactly as the
+        // global proof's own AIR reconstruction derives it.
+        labels.push([crate::tables::local_to_global::epoch_label(k as u64)]);
+        children.push(real_child(artifacts, wrap_opts.clone(), &proved));
+    }
+    let label_refs: Vec<&[u64]> = labels.iter().map(|l| &l[..]).collect();
+    let label_range = (labels[0][0], labels[FAN_IN - 1][0]);
+    println!(
+        "   {FAN_IN} epoch wraps proved in {:.1}s, {} published words each, \
+         {} sub-proofs each",
+        t.elapsed().as_secs_f64(),
+        children[0].public_words.len(),
+        children[0].tables.len(),
+    );
+
+    // ---- the node.
+    let t = Instant::now();
+    let program = node_program(&children, &layouts, &label_refs, label_range);
+    let arenas: Vec<Vec<LfmWord>> = children.iter().flat_map(child_arena_words).collect();
+    println!(
+        "   leaf node emitted in {:.1}s: {} instructions",
+        t.elapsed().as_secs_f64(),
+        program.instrs.len()
+    );
+
+    let t = Instant::now();
+    let exec = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+        .expect("★ the leaf node must execute");
+    let node_layout = SchemaLayout::node(layouts[FAN_IN - 1].out_halves);
+    node_layout.assert_covers(exec.public_words.len());
+    println!(
+        "   ★ LEAF NODE EXECUTED in {:.1}s: {} published words (schema {} + head {})",
+        t.elapsed().as_secs_f64(),
+        exec.public_words.len(),
+        node_layout.schema_words(),
+        node_layout.head,
+    );
+
+    // ---- the node's own proof, so the level above has something to verify.
+    let artifacts =
+        build_artifacts_with_hasher(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
+    let t = Instant::now();
+    let proved =
+        lfm_prove(&program, &artifacts, &arenas, &wrap_opts).expect("★ THE LEAF NODE MUST PROVE");
+    let prove_secs = t.elapsed().as_secs_f64();
+    let t = Instant::now();
+    assert!(
+        super::proof::verify_against_artifacts(
+            &artifacts,
+            &proved.proof,
+            &proved.public_words,
+            &wrap_opts
+        ),
+        "the leaf node's proof must verify"
+    );
+    println!(
+        "\n★ LEAF NODE PROVED AND VERIFIED\n   prove {prove_secs:.1}s\n   verify {:.2}s\n   \
+         {} sub-proofs, {} published words\n   peak RSS {:?} GiB",
+        t.elapsed().as_secs_f64(),
+        proved.proof.proofs.len(),
+        proved.public_words.len(),
+        super::wrap_tests::peak_rss_gib(),
+    );
+
+    // ---- ONE TAMPER ARM PER BINDING LEG.
+    //
+    // Each moves a single published HALF in one child's publics arena — arena 0
+    // of that child, eight halves per word — and nothing else. Both children's
+    // proofs still verify on their own; what breaks is the relationship.
+    let arena_of = |child: usize| -> usize {
+        // Each child contributes `child_arena_words(child).len()` arenas, and its
+        // publics arena is the first of them. Counted rather than assumed, so a
+        // declaration-order change tampers the right arena or fails loudly.
+        children[..child]
+            .iter()
+            .map(|c| child_arena_words(c).len())
+            .sum()
+    };
+    let bump = |arenas: &mut Vec<Vec<LfmWord>>, arena: usize, word: usize| {
+        let half = 8 * word;
+        arenas[arena][half] =
+            base_word(super::word::word_as_base(&arenas[arena][half]).expect("a half") + FE::one());
+    };
+    for (name, child, word) in [
+        ("the register chain", 0usize, layouts[0].reg_fini(0)),
+        ("the shared attestation id", 1usize, layouts[1].id(0)),
+        ("the epoch label pin", 1usize, layouts[1].label(0)),
+    ] {
+        let mut tampered = arenas.clone();
+        bump(&mut tampered, arena_of(child), word);
+        assert!(
+            execute(&program, &tampered, &crate::hash_pin::BLOCK_HASHER).is_err(),
+            "moving {name} in child {child} must make the node unprovable"
+        );
+        println!("   ✓ tamper arm: {name} rejected");
+    }
 }
