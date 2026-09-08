@@ -33,13 +33,9 @@ The #dma chip is comprised of #nr_variables variables that are expressed using #
 = Assumptions
 #render_chip_assumptions(chip, config)
 
-The obligations on `src`, `dst` and `count` concern the _first_ row of a copy sequence only:
-every subsequent row receives all three over the `DMA_NEXT` bus, whose sender range-checks them (@dma:c:range_src_incr, @dma:c:range_dst_incr and @dma:c:range_count_decr).
-On the first row they are discharged by the register file, outside this chapter.
-
-`timestamp` is different: it is forwarded verbatim by @dma:c:send_copy_next_chunk and never range-checked here.
-The first row's `timestamp` is pinned by @dma:c:receive_ecall to the `CPU`'s preprocessed timestamp column (@vars), and every later row inherits it through the bus.
-That column also carries $#`timestamp` = 4 dot (i + 1)$, which is what keeps $#`timestamp` + 2$ from leaving the `Word` range in @dma:c:write_value --- `IS_WORD` alone would not.
+These assumptions concern the _first_ row of a copy sequence.
+On that row `src`, `dst` and `count` come from the register file and `timestamp` from the `CPU`;
+every later row receives all four over the `DMA_NEXT` bus, where @dma:c:range_src_incr, @dma:c:range_dst_incr and @dma:c:range_count_decr range-check them on the sending side.
 
 = Constraints
 In this VM, we assign system call number $-30$ to the #dma accelerator.
@@ -82,6 +78,7 @@ The guest-side `memcpy` chunks larger copies into multiple `ECALL`s; the executo
 
 == Performing the copy
 The bytes are read from `src` at $#`timestamp` + 1$ and written to `dst` at $#`timestamp` + 2$.
+The `CPU`'s preprocessed timestamp column holds $4 dot (i + 1)$ at row $i$ (@vars), so $#`timestamp` + 2$ cannot leave the `Word` range in @dma:c:write_value --- `IS_WORD` on `timestamp` alone would not rule that out.
 Both interactions are expressed over the _same_ `value` variable, which is what makes the copied bytes equal:
 there is nothing to constrain, since there is only one set of columns.
 The read carries `value` as both its input and its output, so `value` is pinned to whatever the memory argument (@memory) says resides at `src`.
