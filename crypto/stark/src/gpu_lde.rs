@@ -2062,7 +2062,25 @@ where
     if stream.synchronize().is_err() || raw.len() != rows * cols * 3 {
         return false;
     }
-    let data = u64_to_ext3_vec::<E>(&raw);
+    // `raw` is the row-major ext3 aux buffer `[(row*cols+col)*3+limb]` — exactly
+    // the aux table's row-major `[row*cols+col]` ext3 layout. Reinterpret it in
+    // place as `FieldElement<E>` (E == ext3 = [u64;3]) instead of the per-element
+    // `u64_to_ext3_vec` copy (single-threaded over the whole aux). Byte-identical.
+    let data: Vec<FieldElement<E>> = {
+        let mut v = std::mem::ManuallyDrop::new(raw);
+        debug_assert!(
+            v.len().is_multiple_of(3) && v.capacity().is_multiple_of(3),
+            "aux buffer len/capacity must be a multiple of 3 for Fp3 reinterpret"
+        );
+        // SAFETY: E == ext3 (tower checked above); `FieldElement<Ext3>` is [u64; 3].
+        unsafe {
+            Vec::from_raw_parts(
+                v.as_mut_ptr() as *mut FieldElement<E>,
+                v.len() / 3,
+                v.capacity() / 3,
+            )
+        }
+    };
     trace.aux_table = crate::table::Table::new(data, cols);
     trace.num_aux_columns = cols;
     // The declined device LDE attempt can leave kernels enqueued on another
@@ -2732,7 +2750,22 @@ where
     };
     GPU_DEEP_CALLS.fetch_add(1, Ordering::Relaxed);
     debug_assert_eq!(deep_raw.len(), lde_size * 3);
-    Some(u64_to_ext3_vec::<E>(&deep_raw))
+    // `deep_raw` is the DEEP codeword row-major ext3 (`[row*3+limb]`); reinterpret
+    // in place as `FieldElement<E>` (E == ext3 = [u64;3]) rather than the
+    // per-element `u64_to_ext3_vec` copy. Byte-identical.
+    let out: Vec<FieldElement<E>> = {
+        let mut v = std::mem::ManuallyDrop::new(deep_raw);
+        debug_assert!(v.len().is_multiple_of(3) && v.capacity().is_multiple_of(3));
+        // SAFETY: E == ext3 (TypeId-checked at entry); FieldElement<Ext3> = [u64; 3].
+        unsafe {
+            Vec::from_raw_parts(
+                v.as_mut_ptr() as *mut FieldElement<E>,
+                v.len() / 3,
+                v.capacity() / 3,
+            )
+        }
+    };
+    Some(out)
 }
 
 /// Fully-resident DEEP keeping the codeword on device in FRI order (no D2H).
