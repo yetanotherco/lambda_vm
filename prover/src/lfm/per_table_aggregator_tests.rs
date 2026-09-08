@@ -660,10 +660,15 @@ fn the_node_cost_model_is_measured() {
     // ⚠ A SAMPLE POINT, not an assumption. 10,507 is the MEASURED diagnostic
     // count of the q=110 wrap; the diagnostic set is dominated by per-query terms
     // (one FRI terminal and one index per query per sub-proof), so this point
-    // goes stale the moment the query count moves — and lane P's re-tune may take
-    // it to 119. Nothing is built against it: what this instrument produces is
-    // the per-word COEFFICIENT, which is a property of the emitter and holds at
-    // any count. The point is here only so the table brackets the real range.
+    // moves with the query count.
+    //
+    // ✓ The posture is settled and q STAYS AT 110 — the security re-tune holds it
+    // by moving `security_bits` 128 -> 120 at blowup 4 rather than by taking the
+    // count to 119. So this point is current, not provisional.
+    //
+    // Nothing is built against it either way: what this instrument produces is
+    // the per-word COEFFICIENT, a property of the emitter that holds at any
+    // count. The point is here so the table brackets the real range.
     let diagnostic_words = 10_507 + SchemaLayout::wrap(OUT_HALVES).schema_words();
     let points = [0, 64, 128, 256, 512, aggregation_words, diagnostic_words];
     println!(
