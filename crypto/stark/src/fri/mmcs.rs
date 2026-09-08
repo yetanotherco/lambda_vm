@@ -106,9 +106,7 @@
 //! the AIR set rather than read out of the proof.
 //!
 //! `heights` and `widths` must ALSO be bound into the Fiat-Shamir transcript by
-//! the consumer, before any challenge that depends on the epoch's shape — see
-//! [`crate::fri::batched::absorb_shape_histogram`], which is the canonical
-//! encoding of that binding.
+//! the consumer, before any challenge that depends on the shape.
 //!
 //! # Determinism
 //!

@@ -281,9 +281,8 @@ pub trait IsStarkVerifier<
     }
 
     /// The three proof-derived inputs are passed as plain data rather than read
-    /// off a `StarkProofView`, because the batched epoch verifier
-    /// ([`crate::batched::verifier`]) has to run this identical check against a
-    /// proof that has no such view. One constraint check, two callers.
+    /// off a `StarkProofView`, so the check does not require its caller to hold
+    /// one. One constraint check, whatever the caller reads it from.
     #[allow(clippy::too_many_arguments)]
     fn step_2_verify_claimed_composition_polynomial(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
