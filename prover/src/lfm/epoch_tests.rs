@@ -1219,8 +1219,7 @@ pub(super) fn real_epoch_from_continuation(
         recon.runtime_page_ranges,
         position.label,
         decode_root,
-        view.per_table_proof()
-            .expect("the per-table wrap constructor reads per-table bundles"),
+        view.per_table_proof(),
     )
 }
 
