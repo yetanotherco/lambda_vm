@@ -799,13 +799,19 @@ mod keccak_tests {
     /// its bitvectors, so it prints `VERIFIED` either way — see its README,
     /// discipline 1. `witness_fullchip.py` there exhibits the forgery as a
     /// complete, reachable round with zero constraint violations, every lookup
-    /// matching, and two output lanes differing from FIPS-202.
+    /// matching, and one to three output lanes differing from FIPS-202 — exactly
+    /// the lanes χ can reach from the forged source.
     ///
     /// A failure here is not necessarily a bug: it means the round's wiring or its
-    /// constraint bodies changed. Re-run `formal_verification/keccak/` in full (the
-    /// four gates plus `combinatorics.py`, `necessity_theta.py`,
-    /// `necessity_rho.py`, `witness_fullchip.py`), confirm the expected board, then
+    /// constraint bodies changed. Re-run `formal_verification/keccak/` in full
+    /// (`make verify-keccak` plus the z3 gate), confirm the expected board, then
     /// update the digests below in the same commit.
+    ///
+    /// One failure needs no board at all: the IR digest is taken over
+    /// `ConstraintProgram`'s **`Debug`** output, so a change to that `Debug` — a
+    /// field added to the IR types in `stark`, a `Debug` impl reworded, a field
+    /// element printed differently — moves it with this round untouched. Check
+    /// `git log crypto/stark/src/constraint_ir/` before re-running anything.
     #[test]
     fn test_keccak_rnd_air_structure_is_pinned() {
         use crate::tables::types::{GoldilocksExtension, GoldilocksField};
@@ -814,6 +820,9 @@ mod keccak_tests {
         // BusInteraction is not Debug, so serialise its public fields explicitly:
         // bus id, direction, multiplicity, and every BusValue (which carries the
         // column indices, packings and linear-term coefficients).
+        const BUS_DIGEST: u64 = 0x0027_e508_0abb_991f;
+        const IR_DIGEST: u64 = 0x83a3_3324_8bcb_a374;
+
         let bus: String = keccak_rnd::bus_interactions()
             .iter()
             .map(|i| {
@@ -823,22 +832,33 @@ mod keccak_tests {
                 )
             })
             .collect();
-        assert_eq!(
-            fnv1a64(bus.as_bytes()),
-            0x0027_e508_0abb_991f,
-            "KECCAK_RND bus wiring changed (bus ids, multiplicities, column indices \
-             or linear-term coefficients). See this test's doc comment."
-        );
+        let bus_digest = fnv1a64(bus.as_bytes());
 
         let n = keccak_rnd::KeccakRndConstraints.meta().len();
         let mut cb = CaptureBuilder::<GoldilocksField, GoldilocksExtension>::new();
         keccak_rnd::KeccakRndConstraints.eval(&mut cb);
         let (prog, _) = cb.finish(n);
-        assert_eq!(
-            fnv1a64(format!("{prog:?}").as_bytes()),
-            0x83a3_3324_8bcb_a374,
-            "KECCAK_RND constraint IR changed (op tree, dimensions, field constants \
-             or roots). See this test's doc comment."
+        let ir_digest = fnv1a64(format!("{prog:?}").as_bytes());
+
+        // Both are reported together: whoever updates one wants to know whether
+        // the other moved too, and a short-circuiting `assert_eq!` pair hides it.
+        let mut moved = Vec::new();
+        if bus_digest != BUS_DIGEST {
+            moved.push(format!(
+                "bus wiring (bus ids, multiplicities, column indices or \
+                 linear-term coefficients): {bus_digest:#018x}"
+            ));
+        }
+        if ir_digest != IR_DIGEST {
+            moved.push(format!(
+                "constraint IR (op tree, dimensions, field constants or roots): \
+                 {ir_digest:#018x}"
+            ));
+        }
+        assert!(
+            moved.is_empty(),
+            "KECCAK_RND {} — see this test's doc comment for what to do",
+            moved.join(", and ")
         );
     }
 }
