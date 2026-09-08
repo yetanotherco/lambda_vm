@@ -10,6 +10,11 @@
 //! Run with:
 //!     cargo run --bin compute_static_commitments --release
 //!
+//! ⚠ On a hash-pin change run this FIRST and paste before `compute_lfm_registry`:
+//! the registry embeds these constants (slots 13 and 14 of every entry, and
+//! `program_id` folds them), so a registry generated before the paste carries
+//! the outgoing hash's statics and the drift gate catches it.
+//!
 //! ⚠️  Do not run this just to silence a failing drift test — see the
 //! "Regenerating" section on `static_commitment` in `bitwise.rs` /
 //! `keccak_rc.rs` and the two `page.rs` constants for when it's actually

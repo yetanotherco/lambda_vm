@@ -4,6 +4,14 @@
 //! output over the generated block in `prover/src/lfm/registry.rs`. Drift
 //! tests recompute and compare on every PR; a drift failure is investigated,
 //! never re-blessed (the `compute_static_commitments` policy).
+//!
+//! ⚠ ORDER: on a hash-pin change run this AFTER `compute_static_commitments`
+//! has been run and its output pasted. Slots 13 and 14 of every entry are
+//! `keccak_rc` and `bitwise`'s `preprocessed_commitment`, which return the
+//! BLESSED static constants in the tree rather than recomputing, and
+//! `program_id` folds every root — so a table generated before the statics
+//! embeds the outgoing hash's constants, and `machine_tests::registry_drift_*`
+//! fires at exactly those two slots.
 
 use lambda_vm_prover::GoldilocksCubicProofOptions;
 use lambda_vm_prover::lfm::programs::{
