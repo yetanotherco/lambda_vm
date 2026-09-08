@@ -289,6 +289,51 @@ pub fn table_device_set(shape: TableShape) -> TableDeviceSet {
     }
 }
 
+/// The peak device set of one table's FUSED task — the phase the per-table
+/// scheduler admits against ([`prover::VramGate`]).
+///
+/// The task opens with the LogUp aux build and continues into the aux commit
+/// and rounds 2–4, and the two phases do NOT overlap: the build's transient
+/// (four fingerprint buffers alive across the batch inverse) is freed before
+/// the aux LDE is allocated, and the aux LDE is not allocated while the build
+/// runs. So the peak is the larger of them, not the sum — but the build is not
+/// free either, because it runs against what R1 left resident: the main LDE
+/// and the snapshot it reads in place.
+///
+/// Interactions are bounded by twice the aux width — one committed pair per
+/// term column plus the one or two absorbed ones — because the AIR trait
+/// exposes the layout here and not the bus list. The bound is what the gate
+/// spends; the build's own admission (`gpu_lde::admit_aux_build`) sizes the
+/// exact descriptor at the call site.
+///
+/// ⚠ Sizing only the rounds' phase is what put ten 2^22 epochs at 31,896 MiB
+/// of a 32,607 MiB card once the launch-size bound of #969 let those builds
+/// run on the device at all. An overlap that exceeds the card is a loud abort
+/// now that the build is admitted, so the gate has to know the term.
+pub fn fused_task_peak_bytes(shape: TableShape) -> u64 {
+    let rounds = table_device_set(shape).total();
+    if shape.aux_cols == 0 {
+        // No aux trace, so no LogUp build runs and no snapshot is kept.
+        return rounds;
+    }
+    let resident = commit_device_set(shape.n, shape.main_cols, shape.blowup, true);
+    // The build reads the R1 snapshot in place (`ResidentMain::Dev`), so it
+    // uploads no main trace: `main_resident = true`.
+    let build = aux_build_device_set(
+        shape.n,
+        shape.main_cols,
+        2 * shape.aux_cols,
+        shape.aux_cols,
+        true,
+    )
+    .total();
+    let build_phase = resident
+        .lde_bytes
+        .saturating_add(resident.snapshot_bytes)
+        .saturating_add(build);
+    rounds.max(build_phase)
+}
+
 // This module is the SIZE model and nothing else: what a stage puts on the
 // card, so the gate can decide whether it fits. It is deliberately not the
 // prover's table walk. The walk is a scheduling policy, keyed on a weight that
@@ -489,6 +534,98 @@ mod tests {
         assert!(set.term_phase() > set.inverse_phase());
         assert_eq!(set.total(), set.term_phase());
         assert_eq!(set.term_phase(), (1u64 << 10) * 23 * 24);
+    }
+
+    /// A table with an aux trace is admitted on whichever of its two phases is
+    /// larger. LFM_HASH under RPO at blowup 2 (2^21 × 449, 3 aux columns): the
+    /// build phase is the R1 resident main LDE plus its snapshot plus the
+    /// build's own transient, and it must not be silently dropped.
+    #[test]
+    fn the_fused_peak_is_the_larger_of_the_two_phases() {
+        let shape = TableShape {
+            n: 1 << 21,
+            blowup: 2,
+            main_cols: 449,
+            aux_cols: 3,
+            num_parts: 2,
+            num_eval_points: 2,
+        };
+        let rounds = table_device_set(shape).total();
+        let resident = commit_device_set(shape.n, shape.main_cols, shape.blowup, true);
+        let build = aux_build_device_set(shape.n, shape.main_cols, 6, 3, true).total();
+        let build_phase = resident.lde_bytes + resident.snapshot_bytes + build;
+        let peak = fused_task_peak_bytes(shape);
+        assert_eq!(peak, rounds.max(build_phase));
+        assert!(peak >= rounds);
+    }
+
+    /// A wide table with many interactions is sized by its BUILD, not by its
+    /// rounds: 2^22 rows × 40 aux columns puts 80 fingerprint buffers on the
+    /// card during the batch inverse. Sizing only the rounds' phase is what
+    /// let ten epochs reach 31,896 MiB of a 32,607 MiB card.
+    ///
+    /// The crossover is pinned here because it is what says which tables this
+    /// term binds on: at 2^22 rows and blowup 2 the build phase overtakes the
+    /// rounds' phase at SEVEN aux columns, and each column past it opens the
+    /// margin by another 503,316,480 B (0.469 GiB). Both sides carry the
+    /// resident main LDE and snapshot, so the crossover does not move with the
+    /// main width.
+    #[test]
+    fn a_wide_logup_table_is_sized_by_its_build() {
+        let wide = |aux_cols| TableShape {
+            n: 1 << 22,
+            blowup: 2,
+            main_cols: 40,
+            aux_cols,
+            num_parts: 2,
+            num_eval_points: 2,
+        };
+        assert!(fused_task_peak_bytes(wide(40)) > table_device_set(wide(40)).total());
+        for aux in 1..=6 {
+            let shape = wide(aux);
+            assert_eq!(
+                fused_task_peak_bytes(shape),
+                table_device_set(shape).total(),
+                "aux {aux}: the rounds' phase should still bind"
+            );
+        }
+        for aux in 7..=12 {
+            let shape = wide(aux);
+            assert!(
+                fused_task_peak_bytes(shape) > table_device_set(shape).total(),
+                "aux {aux}: the build phase should bind"
+            );
+        }
+        // Past the crossover the peak grows with the build: 4 fingerprint
+        // buffers over 2 more interactions, 805,306,368 B per aux column. The
+        // rounds' phase grows 301,989,888 B per column, so the margin between
+        // them opens by 503,316,480 B (0.469 GiB) each time.
+        let peak_step = fused_task_peak_bytes(wide(9)) - fused_task_peak_bytes(wide(8));
+        let rounds_step = table_device_set(wide(9)).total() - table_device_set(wide(8)).total();
+        assert_eq!(peak_step, 805_306_368);
+        assert_eq!(rounds_step, 301_989_888);
+        assert_eq!(peak_step - rounds_step, 503_316_480);
+        // The crossover is independent of the main width.
+        let mut narrow = wide(7);
+        narrow.main_cols = 900;
+        assert!(fused_task_peak_bytes(narrow) > table_device_set(narrow).total());
+    }
+
+    /// A table with no aux trace runs no LogUp build and keeps no snapshot, so
+    /// its fused peak is its rounds' set exactly.
+    #[test]
+    fn an_aux_less_table_pays_for_neither_snapshot_nor_build() {
+        let shape = TableShape {
+            n: 1 << 20,
+            blowup: 2,
+            main_cols: 8,
+            aux_cols: 0,
+            num_parts: 1,
+            num_eval_points: 1,
+        };
+        let set = table_device_set(shape);
+        assert_eq!(set.main.snapshot_bytes, 0);
+        assert_eq!(fused_task_peak_bytes(shape), set.total());
     }
 
     /// The aux commit has no snapshot; its ext3 columns count as three base

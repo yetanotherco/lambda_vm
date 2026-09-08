@@ -4066,14 +4066,18 @@ pub trait IsStarkProver<
         );
         #[cfg(not(feature = "cuda"))]
         type AuxResult<FE, H> = (Option<TableCommit<FE, H>>, (Vec<FieldElement<FE>>, usize));
-        // R1 aux commit and rounds 2 to 4 share the peak working set: the main
-        // and aux LDEs are co-resident, plus the composition and Merkle
-        // transients (in the scratch factor). The aux width comes from the AIR
-        // layout (the aux build itself runs inside the admitted chain below).
-        let peak_estimates: Vec<u64> = air_trace_pairs
+        // The fused task's peak: the LARGER of its two phases, which do not
+        // overlap. The rounds' phase has the main and aux LDEs co-resident plus
+        // the composition and Merkle transients; the build phase has the LogUp
+        // aux build's transient — four fingerprint buffers across the batch
+        // inverse — running against the main LDE and snapshot R1 left resident.
+        // Sizing only the rounds' phase is what put ten 2^22 epochs at 31,896
+        // MiB of a 32,607 MiB card once #969 let those builds reach the device.
+        // The aux width comes from the AIR layout (the aux build itself runs
+        // inside the admitted chain below).
+        let peak_estimates: Vec<u64> = table_shapes
             .iter()
-            .enumerate()
-            .map(|(idx, _)| crate::device_set::table_device_set(table_shapes[idx]).total())
+            .map(|s| crate::device_set::fused_task_peak_bytes(*s))
             .collect();
 
         // The fused phase's own walk, separate from R1's because the aux
