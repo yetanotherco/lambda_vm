@@ -1298,3 +1298,181 @@ fn a_zero_bit_query_draw_consumes_what_the_host_does() {
          emitter skipped the squeeze, this is the ONLY place it shows"
     );
 }
+
+/// Prove one aggregation node and hand it back as a CHILD of the next level.
+///
+/// The whole composition argument in one function: a node's proof is a plain
+/// per-table `MultiProof`, so `real_child` reads it exactly as it reads a wrap's,
+/// and the layout that describes it is `SchemaLayout::node`. Nothing about the
+/// level appears here — which is what "the same emitter serves every level"
+/// means operationally.
+fn prove_node_as_child(
+    children: &[RealChild],
+    layouts: &[super::per_table_aggregator::SchemaLayout],
+    labels: &[&[u64]],
+    label_range: (u64, u64),
+    out_halves: usize,
+    opts: &crate::ProofOptions,
+) -> (RealChild, super::per_table_aggregator::SchemaLayout) {
+    use super::per_table_aggregator::{NodePublishSet, SchemaLayout};
+
+    let program = node_program(
+        children,
+        layouts,
+        labels,
+        label_range,
+        NodePublishSet::Aggregation,
+    );
+    let arenas: Vec<Vec<LfmWord>> = children.iter().flat_map(child_arena_words).collect();
+    let artifacts =
+        super::registry::build_artifacts_with_hasher(&program, opts, crate::hash_pin::BLOCK_HASHER);
+    let proved = super::proof::lfm_prove(&program, &artifacts, &arenas, opts)
+        .expect("an aggregation node must prove");
+    let layout = SchemaLayout::node(out_halves);
+    layout.assert_covers(proved.public_words.len());
+    (real_child(artifacts, opts.clone(), &proved), layout)
+}
+
+/// ★ THE INNER NODE — a node whose children are NODE proofs.
+///
+/// # What this adds over the leaf gate
+///
+/// The leaf verifies wraps; this verifies leaves. Three things differ and each
+/// is exercised here for the first time:
+///
+/// 1. **`SchemaLayout::node`** rather than `::wrap` — a different head (a node
+///    has FAN_IN Phase A's and so no single `(z, α)`), a four-word label run
+///    rather than two, and no trailing bus total.
+/// 2. **A label RANGE per child**: each leaf carries the first and last label of
+///    its subtree, and the inner node pins both ends of both. That is what makes
+///    contiguity across sibling subtrees a consequence of the pins rather than a
+///    separate check.
+/// 3. **The L2G fold composing**: each leaf published a fold over ITS wraps'
+///    roots, and the inner node folds those two folds. A single-child node folds
+///    to identity and would not exercise `hash_pair` at this level, which is why
+///    this needs two real leaves rather than one.
+///
+/// ⚠ Building this arm is what found the bug it now covers: a node used to
+/// publish its fold as digest CELLS (four lanes in one word) while a wrap
+/// publishes its root as lanes (one lane per word), and `emit_node_publishes`
+/// reads `lanes[0]` of each published l2g word. A node child would have handed
+/// ONE felt to `digest_from_lanes` where four are required. The fix removed the
+/// asymmetry rather than parameterising it, so both layouts now read alike.
+///
+/// # Cost, and why the epoch requirement is asserted rather than worked around
+///
+/// A two-level tree at fan-in N needs N² epochs: N wraps per leaf, N leaves.
+/// Padding the shortfall would mean a pad child with no epoch to belong to,
+/// which breaks the register chain and the label pin — the same trade rejected
+/// when the tree shape was priced. So this asserts the fixture is deep enough
+/// and names the number if it is not.
+#[test]
+#[ignore = "box tier: proves FAN_IN^2 wraps, FAN_IN leaf nodes and one inner node"]
+fn the_inner_node_verifies_two_leaf_nodes() {
+    use super::epoch_tests::Publishes;
+    use super::per_table_aggregator::{FAN_IN, SchemaLayout};
+    use super::proof::lfm_prove;
+    use super::registry::build_artifacts_with_hasher;
+    use std::time::Instant;
+
+    let elf_bytes = super::proof_fixture::read_inner_elf();
+    let inner = super::proof_fixture::fixture_options();
+    let bundle = crate::continuation::prove_continuation(
+        &elf_bytes,
+        &[],
+        super::proof_fixture::FIXTURE_EPOCH_LOG2,
+        &inner,
+    )
+    .expect("the fixture continuation must prove");
+    let needed = FAN_IN * FAN_IN;
+    assert!(
+        bundle.num_epochs() >= needed,
+        "a two-level fan-in-{FAN_IN} tree needs {needed} epochs, the fixture has {}. \
+         Raise FIXTURE_EPOCH_LOG2 or use a longer guest — do NOT pad, a pad child \
+         belongs to no epoch and breaks the register chain and the label pin",
+        bundle.num_epochs()
+    );
+
+    let wrap_opts = super::proof::aggregation_wrap_options();
+    let label_of = |k: usize| crate::tables::local_to_global::epoch_label(k as u64);
+
+    // ---- level 0: one wrap per epoch, then level 1: one leaf per FAN_IN wraps.
+    let t = Instant::now();
+    let mut leaves = Vec::with_capacity(FAN_IN);
+    let mut leaf_layouts = Vec::with_capacity(FAN_IN);
+    let mut leaf_labels: Vec<[u64; 2]> = Vec::with_capacity(FAN_IN);
+    for leaf in 0..FAN_IN {
+        let mut wraps = Vec::with_capacity(FAN_IN);
+        let mut wrap_layouts = Vec::with_capacity(FAN_IN);
+        let mut wrap_labels: Vec<[u64; 1]> = Vec::with_capacity(FAN_IN);
+        let mut out_halves = 0usize;
+        for i in 0..FAN_IN {
+            let k = leaf * FAN_IN + i;
+            let e = super::epoch_tests::real_epoch_from_continuation(
+                &inner, &elf_bytes, &bundle, k, None,
+            )
+            .expect("every epoch must reconstruct from proofs alone");
+            out_halves = e.statement.public_output_len.div_ceil(4);
+            let program =
+                super::epoch_tests::epoch_program_publishing(&e, true, Publishes::Aggregation);
+            let arenas = super::epoch_tests::epoch_arena_words(&e, true);
+            let artifacts =
+                build_artifacts_with_hasher(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
+            let proved = lfm_prove(&program, &artifacts, &arenas, &wrap_opts)
+                .expect("the epoch wrap must prove");
+            let layout = SchemaLayout::wrap(out_halves);
+            layout.assert_covers(proved.public_words.len());
+            wrap_layouts.push(layout);
+            wrap_labels.push([label_of(k)]);
+            wraps.push(real_child(artifacts, wrap_opts.clone(), &proved));
+        }
+        let refs: Vec<&[u64]> = wrap_labels.iter().map(|l| &l[..]).collect();
+        let range = (
+            label_of(leaf * FAN_IN),
+            label_of(leaf * FAN_IN + FAN_IN - 1),
+        );
+        let (child, layout) =
+            prove_node_as_child(&wraps, &wrap_layouts, &refs, range, out_halves, &wrap_opts);
+        println!(
+            "   leaf {leaf}: {} published words, {} sub-proofs",
+            child.public_words.len(),
+            child.tables.len()
+        );
+        leaves.push(child);
+        leaf_layouts.push(layout);
+        leaf_labels.push([range.0, range.1]);
+    }
+    println!(
+        "   {FAN_IN} leaf nodes over {needed} wraps in {:.1}s",
+        t.elapsed().as_secs_f64()
+    );
+
+    // ---- level 2: the inner node, over NODE proofs.
+    let refs: Vec<&[u64]> = leaf_labels.iter().map(|l| &l[..]).collect();
+    let range = (leaf_labels[0][0], leaf_labels[FAN_IN - 1][1]);
+    let out_halves = leaf_layouts[FAN_IN - 1].out_halves;
+    let t = Instant::now();
+    let (inner_node, inner_layout) =
+        prove_node_as_child(&leaves, &leaf_layouts, &refs, range, out_halves, &wrap_opts);
+    println!(
+        "\n★ INNER NODE PROVED AND VERIFIED (a node over {FAN_IN} NODE proofs)\n   \
+         prove+harvest {:.1}s\n   {} published words, {} sub-proofs\n   \
+         schema {} + head {}\n   peak RSS {:?} GiB",
+        t.elapsed().as_secs_f64(),
+        inner_node.public_words.len(),
+        inner_node.tables.len(),
+        inner_layout.schema_words(),
+        inner_layout.head,
+        super::wrap_tests::peak_rss_gib(),
+    );
+
+    // ---- the composition property, asserted rather than implied: an inner
+    // node's published schema has the SAME shape as its children's, which is
+    // what lets the level above it use the identical emitter.
+    assert_eq!(
+        inner_layout.total(),
+        leaf_layouts[0].total(),
+        "a node's published schema must not change with its level — that is what \
+         makes the same emitter serve the level above"
+    );
+}

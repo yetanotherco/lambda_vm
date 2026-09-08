@@ -477,7 +477,18 @@ impl SchemaLayout {
             num_reg: crate::tables::register::NUM_REGISTER_ADDRESSES,
             label_words: 4,
             out_halves,
-            l2g_words: super::proof_arena::words_per_root(),
+            // ★ THE SAME SHAPE A WRAP PUBLISHES ITS ROOT IN — `lanes_per_root`
+            // base words, one lane each — not the fold's digest CELLS.
+            //
+            // Publishing cells would have been one word instead of four, and it
+            // would have made a node child and a wrap child structurally
+            // different to read: `emit_node_publishes` takes `lanes[0]` of each
+            // published l2g word, which is right for a wrap's lane-per-word
+            // layout and silently wrong for a four-lane digest word — it would
+            // hand ONE felt to `digest_from_lanes` where four are required.
+            // Building the inner-node arm is what surfaced that; the asymmetry
+            // is removed here rather than parameterised around.
+            l2g_words: super::proof_arena::lanes_per_root(),
             tail: 0,
         }
     }
@@ -763,8 +774,11 @@ pub fn emit_node_publishes(b: &mut LfmBuilder, p: &NodePublishes<'_>) {
         })
         .collect();
     let folded = fold_l2g(b, &digests);
+    // Unpacked to lanes, so a node's L2G item reads exactly like a wrap's.
     for cell in folded.cells() {
-        b.public(*cell);
+        for lane in b.unpack(*cell) {
+            b.public(lane.as_cell());
+        }
     }
 }
 
