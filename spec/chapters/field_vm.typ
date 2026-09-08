@@ -200,6 +200,10 @@ and the $#`ZERO`'$ register purely depends on $#`args`_0$ and not on `ZERO`.
 
 #render_constraint_table(chip, config, groups: "transition")
 
+== Padding
+
+#rj[...]
+
 = Notes and potential optimizations
 
 - Depending on observed use, in the future, we can restrict this design in some potential ways, to make proving it faster, without sacrificing too much utility:

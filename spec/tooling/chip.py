@@ -70,16 +70,23 @@ class Range:
         return self.low
 
 
-type Type = list[Type] | Range
+@dataclass(frozen=True)
+class Opaque:
+    tag: str
+
+
+type Type = list[Type] | Range | Opaque
 
 DEFAULT_TYPE: Type = Range.const(0)
 
 
 def structure_matches(a: Type, b: Type) -> bool:
-    if isinstance(a, Range) and isinstance(b, (Range, type(None))):
+    if isinstance(a, Range) and isinstance(b, Range):
         return True
     elif isinstance(a, list) and isinstance(b, list):
         return len(a) == len(b) and all(structure_matches(x, y) for x, y in zip(a, b))
+    elif isinstance(a, Opaque) and isinstance(b, Opaque):
+        return a.tag == b.tag
     else:
         return False
 
@@ -87,9 +94,12 @@ def structure_matches(a: Type, b: Type) -> bool:
 def constant_fits(cst: int, target: Type) -> bool:
     if isinstance(target, Range):
         return target.low <= cst <= target.high
-    else:
+    elif isinstance(target, list):
         return constant_fits(cst, target[0])
-
+    else:
+        assert isinstance(target, Opaque)
+        # Let's assume this fits in an opaque
+        return True
 
 type Expr = (
     LitExpr
@@ -163,7 +173,7 @@ class IdxExpr:
             reporter.error(f"Invalid index: {idx!r}")
             return Range.const(-1)
         idxconst = idx.get_const()
-        if isinstance(base, Range):
+        if not isinstance(base, list):
             reporter.error(f"Indexing into non-array type: {self!r}")
             return DEFAULT_TYPE
         if not (0 <= idxconst < len(base)):
@@ -202,6 +212,9 @@ class CastExpr:
             # This may become cleaner if we eventually get to the cast rework from #326
             if isinstance(self.type, Range):
                 return Range.const(0)
+            elif isinstance(self.type, Opaque):
+                # We assume this works for an opaque type, as it's an explicit cast
+                return self.type
             else:
                 return [CastExpr(LitExpr(0), t).typecheck(env) for t in self.type]
         return self.type
@@ -215,10 +228,17 @@ class MulExpr:
         if isinstance(a, list) and isinstance(b, list):
             reporter.error(f"Multiplication of non-scalar types: {self!r}")
             return DEFAULT_TYPE
-        elif not isinstance(a, Range):
+        elif isinstance(a, list):
             return [self.typecheck_binop(x, b) for x in a]
         elif isinstance(b, list):
             return self.typecheck_binop(b, a)
+        elif isinstance(a, Opaque) and isinstance(b, Opaque):
+            reporter.asserts(a.tag == b.tag, f"Multiplication of opaque types with mismatching tags: {a!r} * {b!r}")
+            return a
+        elif isinstance(a, Opaque):
+            return a
+        elif isinstance(b, Opaque):
+            return b
         else:
             extrema = [x * y for x in [a.low, a.high] for y in [b.low, b.high]]
             return Range(min(extrema), max(extrema))
@@ -244,6 +264,10 @@ class AddExpr:
         elif isinstance(a, list) or isinstance(b, list):
             reporter.error(f"Adding of scalar and array types {self!r}")
             return DEFAULT_TYPE
+        elif isinstance(a, Opaque):
+            return a
+        elif isinstance(b, Opaque):
+            return b
         else:
             return Range(a.low + b.low, a.high + b.high)
 
@@ -271,6 +295,10 @@ class SubExpr:
         elif isinstance(a, list) or isinstance(b, list):
             reporter.error(f"Subtraction of scalar and array types {self!r}")
             return DEFAULT_TYPE
+        elif isinstance(a, Opaque):
+            return a
+        elif isinstance(b, Opaque):
+            return b
         else:
             return Range(a.low - b.high, a.high - b.low)
 
@@ -295,6 +323,10 @@ class ModExpr:
         elt = self.elt.typecheck(env)
         modulus = self.modulus.typecheck(env)
 
+        if isinstance(elt, Opaque) or isinstance(modulus, Opaque):
+            reporter.error(f"Cannot take a mod with opaque types: {self!r}")
+            return elt
+
         if isinstance(modulus, list) or not modulus.is_const():
             reporter.error(f"Invalid non-constant modulus: {self.modulus!r}")
             return Range.const(0)
@@ -318,11 +350,15 @@ class PowExpr:
         base = self.base.typecheck(env)
         exp = self.exp.typecheck(env)
         if isinstance(base, list):
-            reporter.error(f"Invalid exponentiation with non-const base: {self.base!r}")
+            reporter.error(f"Invalid exponentiation of a list: {self.base!r}")
             return DEFAULT_TYPE
-        if isinstance(exp, list) or not exp.is_const():
+        if not (isinstance(exp, Range) and exp.is_const()):
             reporter.error(f"Invalid exponentiation with non-const exponent: {self.exp!r}")
             return DEFAULT_TYPE
+
+        if isinstance(base, Opaque):
+            return base
+
         # If const base, we have a const result
         if base.is_const():
             return Range.const(pow(base.get_const(), exp.get_const(), env.config.variables.prime))
@@ -349,6 +385,10 @@ class SumExpr:
         elif isinstance(a, list) or isinstance(b, list):
             reporter.error(f"Summing of scalar and array types {self!r}")
             return DEFAULT_TYPE
+        elif isinstance(a, Opaque):
+            return a
+        elif isinstance(b, Opaque):
+            return b
         else:
             return Range(a.low + b.low, a.high + b.high)
 
@@ -365,7 +405,7 @@ class NotExpr:
 
     def typecheck(self, env: Environment) -> Type:
         inner = self.inner.typecheck(env)
-        if isinstance(inner, list) or not inner.is_bool():
+        if not (isinstance(inner, Range) and inner.is_bool()):
             reporter.error(f"Not a bool passed to `not`: {self.inner!r}")
             return Range(0, 1)
         return Range(1 - inner.high, 1 - inner.low)
@@ -456,11 +496,11 @@ class Iter:
 
     def typecheck[T](self, env: Environment, callback: Callable[[Environment], Iterable[T]]) -> Iterable[T]:
         start = self.start.typecheck(env)
-        if isinstance(start, list) or not start.is_const():
+        if not (isinstance(start, Range) and start.is_const()):
             reporter.error(f"Starting value of iterator not a const: {self!r}")
             start = Range.const(0)
         stop = self.stop.typecheck(env)
-        if isinstance(stop, list) or not stop.is_const():
+        if not (isinstance(stop, Range) and stop.is_const()):
             reporter.error(f"Ending value of iterator not a const: {self!r}")
             stop = Range.const(start.get_const())
 
@@ -503,12 +543,12 @@ def iters_of(obj: dict, config, name=None) -> list[Iter]:
 class TypeConfig:
     label: str
     subtypes: list[Type]
-    range: Optional[Range]
+    scalar_type: Optional[Range | Opaque]
     desc: str
     preprocessed: bool
 
     def __init__(self, default_name: str, lookup: Callable[[str], Type], data: dict):
-        assert_no_unexpected(data, type(self).__annotations__.keys())
+        assert_no_unexpected(data, type(self).__annotations__.keys() - {"scalar_type"} | {"range"})
         self.label = data["label"]
         if "range" in data:
             reporter.asserts(
@@ -527,16 +567,19 @@ class TypeConfig:
                 reporter.error(f"Range end not an int: {data!r}")
                 stop = start
             reporter.asserts(int(start) <= int(stop), f"Inverted range: {data!r}")
-            self.range = Range(int(start), int(stop))
+            self.scalar_type = Range(int(start), int(stop))
+            self.subtypes = []
+        elif data["subtypes"] == [data["label"]]:
+            self.scalar_type = Opaque(data["label"])
             self.subtypes = []
         else:
-            self.range = None
+            self.scalar_type = None
             self.subtypes = [lookup(tp) for tp in data["subtypes"]]
         self.desc = data["desc"]
         self.preprocessed = data.get("preprocessed", False)
 
     def as_type(self) -> Type:
-        return self.range or self.subtypes[:]
+        return self.scalar_type or self.subtypes[:]
 
 
 @dataclass
@@ -733,15 +776,15 @@ class VirtualVariable(Variable):
                 # Some duplicated code/concepts from Iter.typecheck
                 # But threading the extra needed state through overly complicates everything
                 start = it.start.typecheck(env)
-                if isinstance(start, list) or not start.is_const():
+                if not (isinstance(start, Range) and start.is_const):
                     reporter.error(f"Starting value of virtual def iter not a const: {self!r}")
                     start = Range.const(0)
                 stop = it.stop.typecheck(env)
-                if isinstance(stop, list) or not stop.is_const():
+                if not (isinstance(stop, Range) and stop.is_const()):
                     reporter.error(f"Ending value of virtual def iter not a const: {self!r}")
                     stop = Range.const(start.get_const())
 
-                if isinstance(expected, Range):
+                if not isinstance(expected, list):
                     reporter.error(f"Virtual definition has an iter for a scalar: {self!r}")
                     return
 
@@ -768,7 +811,7 @@ class VirtualVariable(Variable):
             return False
 
         def check_covered(t: Type, seen: set[tuple], indices: list[int]):
-            if isinstance(t, Range):
+            if not isinstance(t, list):
                 reporter.asserts(
                     is_covered(seen, indices),
                     f"Virtual column {self.name!r} not completely defined",
@@ -867,7 +910,7 @@ class ArithConstraint:
                     t.low <= 0 <= t.high,
                     f"Unsatisfiable constraint, 0 not in range: {self!r} {t}",
                 )
-            else:
+            elif not isinstance(t, Opaque):
                 reporter.error(f"Non-scalar value for polynomial constraint: {self!r} {t}")
 
         for t in all_iters(self.iters, env, lambda e: [self.poly.typecheck(e)]):
