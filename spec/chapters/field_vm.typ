@@ -194,12 +194,12 @@ Finally, we must ensure the consistency between consecutive rows of the table,
 and allow for hinting.
 We again make use of the multiplexing machinery from before.
 The constraints we want to enforce on a register index $r$ are as follows:
-- $!#`hint_input`_r and !#`hint_output` => #`registers`'_r = #`registers`_r$, `r` could not have been hinted,
-  since it was not input-hinted, and there was no output hint, so the next `r` should remain the same.
-- $!#`hint_input`_r and f_r(#`argument_registers`_0) = 0 => #`registers`'_r = #`registers_r`$
-  `r` was not input-hinted, and it was not the output register, so it once again stays the same.
+- $!#`hint_input`'_r and !#`hint_output` => #`registers`'_r = #`registers`_r$, `r` could not have been hinted,
+  since it was not input-hinted in the next row, and there was no output hint, so the next `r` should remain the same.
+- $!#`hint_input`'_r and f_r(#`argument_registers`_0) = 0 => #`registers`'_r = #`registers_r`$
+  `r` was not input-hinted in the next row, and it was not the output register, so it once again stays the same.
 
-This is equivalent to the logical statement $!#`hint_input`_r and not (#`hint_output` and f_r(#`argument_registers`_0) = 1) => #`registers`'_r = #`registers`_r$, but expressed in a way that polynomial constraints can more easily handle.
+This is equivalent to the logical statement $!#`hint_input`'_r and not (#`hint_output` and f_r(#`argument_registers`_0) = 1) => #`registers`'_r = #`registers`_r$, but expressed in a way that polynomial constraints can more easily handle.
 Naturally, the PC gets an exception since if it is not (output-)hinted, we need $#`pc`' = #`pc` + 1$,
 and the $#`ZERO`'$ register purely depends on $#`args`_0$ and not on `ZERO`.
 

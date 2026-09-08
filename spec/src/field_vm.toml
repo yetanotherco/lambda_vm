@@ -176,16 +176,16 @@ name = "transition"
 
 [[constraints.transition]]
 kind = "arith"
-constraint = "$!#`hint_input`_i and !#`hint_output` => #`registers`'_i = #`registers`_i$"
-poly = ["*", ["not", ["idx", "hint_input", "i"]], ["not", "hint_output"], ["-", ["idx", ["next", "registers"], "i"], ["idx", "registers", "i"]]]
+constraint = "$!#`hint_input`'_i and !#`hint_output` => #`registers`'_i = #`registers`_i$"
+poly = ["*", ["not", ["idx", ["next", "hint_input"], "i"]], ["not", "hint_output"], ["-", ["idx", ["next", "registers"], "i"], ["idx", "registers", "i"]]]
 iter = ["i", 0, 4] # PARAM: ["i", 0, N - 1]
 
 [[constraints.transition]]
 kind = "arith"
-# PARAM: $!#`hint_input`_i and !(limits(sum)_(j = 0)^T #`arg_register_powers`_(0,j) dot limits(sum)_(k = 0)^(d - 2) #`MUX`_(i+2,j,k) dot #`argument_registers`_0^k) => #`registers`'_i = #`registers`_i$
-constraint = "$!#`hint_input`_i and !(limits(sum)_(j = 0)^1 #`arg_register_powers`_(0,j) dot limits(sum)_(k = 0)^3 #`MUX`_(i+2,j,k) dot #`argument_registers`_0^k) => #`registers`'_i = #`registers`_i$"
-# PARAM: ["*", ["not", ["idx", "hint_input", "i"]], ["-", 1, ["sum", ["=", "j", 0], "T", ["*", ["idx", ["idx", "arg_register_powers", 0], "j"], ["sum", ["=", "k", 0], ["-", "d", 2], ["*", ["idx", ["idx", ["idx", "MUX", ["+", "i", 2]], "j"], "k"], ["^", ["idx", "argument_registers", 0], "k"]]]]]], ["-", ["idx", ["next", "registers"], "i"], ["idx", "registers", "i"]]]
-poly = ["*", ["not", ["idx", "hint_input", "i"]], ["-", 1, ["sum", ["=", "j", 0], 1, ["*", ["idx", ["idx", "arg_register_powers", 0], "j"], ["sum", ["=", "k", 0], 3, ["*", ["idx", ["idx", ["idx", "MUX", ["+", "i", 2]], "j"], "k"], ["^", ["idx", "argument_registers", 0], "k"]]]]]], ["-", ["idx", ["next", "registers"], "i"], ["idx", "registers", "i"]]]
+# PARAM: $!#`hint_input`'_i and !(limits(sum)_(j = 0)^T #`arg_register_powers`_(0,j) dot limits(sum)_(k = 0)^(d - 2) #`MUX`_(i+2,j,k) dot #`argument_registers`_0^k) => #`registers`'_i = #`registers`_i$
+constraint = "$!#`hint_input`'_i and !(limits(sum)_(j = 0)^1 #`arg_register_powers`_(0,j) dot limits(sum)_(k = 0)^3 #`MUX`_(i+2,j,k) dot #`argument_registers`_0^k) => #`registers`'_i = #`registers`_i$"
+# PARAM: ["*", ["not", ["idx", ["next", "hint_input"], "i"]], ["-", 1, ["sum", ["=", "j", 0], "T", ["*", ["idx", ["idx", "arg_register_powers", 0], "j"], ["sum", ["=", "k", 0], ["-", "d", 2], ["*", ["idx", ["idx", ["idx", "MUX", ["+", "i", 2]], "j"], "k"], ["^", ["idx", "argument_registers", 0], "k"]]]]]], ["-", ["idx", ["next", "registers"], "i"], ["idx", "registers", "i"]]]
+poly = ["*", ["not", ["idx", ["next", "hint_input"], "i"]], ["-", 1, ["sum", ["=", "j", 0], 1, ["*", ["idx", ["idx", "arg_register_powers", 0], "j"], ["sum", ["=", "k", 0], 3, ["*", ["idx", ["idx", ["idx", "MUX", ["+", "i", 2]], "j"], "k"], ["^", ["idx", "argument_registers", 0], "k"]]]]]], ["-", ["idx", ["next", "registers"], "i"], ["idx", "registers", "i"]]]
 iter = ["i", 0, 4] # PARAM: ["i", 0, N - 1]
 
 [[constraints.transition]]
