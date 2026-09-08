@@ -920,14 +920,24 @@ fn name_panic_payload(
 /// was ever working set. (At q=41 the orders are indistinguishable, 98.5
 /// against 98.6 GiB.)
 ///
-/// ⇒ **The durable fix is the allocator, not this weight.** Setting
-/// `MALLOC_MMAP_THRESHOLD_` for the harness removes the effect outright and
-/// takes 1.2 GiB off the good arm too. It is not free: leaving the retentive
-/// state costs ~2.5% prove time (136.4 → 140.2 s here, while a build already
-/// out of it goes 140.3 → 140.1 s), so the time follows the retention state
-/// rather than the order. Until that lands, this order is kept because it is
-/// the one the prover had before #964 — not because reordering is a lever, as
-/// nothing in this file controls the layout that decides the number.
+/// ⇒ **The durable fix is the allocator, not this weight.** Lane S is landing
+/// it as jemalloc in the test harness; until then the effect is reproducible
+/// with `MALLOC_MMAP_THRESHOLD_=1048576`, which removes it outright and takes
+/// 1.2 GiB off the good arm as well. The MEMORY saving is large and comes with
+/// a control: ≈6 GiB at q=20 and ≈13 GiB at q=41 from a high-retention start,
+/// ≈1.2 GiB from a low-retention one.
+///
+/// The TIME effect is a different matter and is NOT established. In the paired
+/// q=20 comparison above the low-retention arm is ~2.5% slower (135.8/136.2 s
+/// against 139.1/140.3 s, two runs each, consistent sign) — but that does not
+/// carry to the allocator flag, whose four measured cells read −1.6%, +1.4%,
+/// −0.1% and +2.8%, one run each and no consistent sign, three of them inside
+/// what a single run resolves. Quote the memory saving; do not quote a time
+/// cost without paired repeats per shape.
+///
+/// Until the allocator fix lands, this order is kept because it is the one the
+/// prover had before #964 — not because reordering is a lever, since nothing in
+/// this file controls the layout that decides the number.
 ///
 /// Its arithmetic is inherited verbatim from the VRAM estimate the prover
 /// sorted by before the device-set model, and it is deliberately NOT re-read as
