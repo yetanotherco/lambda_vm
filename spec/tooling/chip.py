@@ -206,6 +206,8 @@ class CastExpr:
                     CastExpr(LitExpr(base.get_const() if i == 0 else 0), t).typecheck(env)
                     for i, t in enumerate(self.type)
                 ]
+            elif isinstance(self.type, Opaque):
+                return self.type
             return base
         if isinstance(base, list) and all(b == Range.const(0) for b in base):
             # Workaround for casts of constant zero, to make padding work nicely
@@ -232,13 +234,13 @@ class MulExpr:
             return [self.typecheck_binop(x, b) for x in a]
         elif isinstance(b, list):
             return self.typecheck_binop(b, a)
-        elif isinstance(a, Opaque) and isinstance(b, Opaque):
-            reporter.asserts(a.tag == b.tag, f"Multiplication of opaque types with mismatching tags: {a!r} * {b!r}")
-            return a
         elif isinstance(a, Opaque):
+            if isinstance(b, Opaque):
+                reporter.asserts(a.tag == b.tag, f"Multiplication of two distinct opaque types: {self!r}")
+            # Works to multiply with a constant/Range
             return a
         elif isinstance(b, Opaque):
-            return b
+            return self.typecheck_binop(b, a)
         else:
             extrema = [x * y for x in [a.low, a.high] for y in [b.low, b.high]]
             return Range(min(extrema), max(extrema))
@@ -265,9 +267,12 @@ class AddExpr:
             reporter.error(f"Adding of scalar and array types {self!r}")
             return DEFAULT_TYPE
         elif isinstance(a, Opaque):
+            if isinstance(b, Opaque):
+                reporter.asserts(a.tag == b.tag, f"Addition of two distinct opaque types: {self!r}")
+            # Still works adding Ranges to it
             return a
         elif isinstance(b, Opaque):
-            return b
+            return self.typecheck_binop(b, a)
         else:
             return Range(a.low + b.low, a.high + b.high)
 
@@ -296,19 +301,26 @@ class SubExpr:
             reporter.error(f"Subtraction of scalar and array types {self!r}")
             return DEFAULT_TYPE
         elif isinstance(a, Opaque):
+            if isinstance(b, Opaque):
+                reporter.asserts(a.tag == b.tag, f"Subtraction of two distinct opaque types: {self!r}")
+            # We allow subtracting Ranges
             return a
         elif isinstance(b, Opaque):
-            return b
+            # Flipping the order doesn't matter, as we're returning an Opaque anyway
+            return self.typecheck_binop(b, a)
         else:
             return Range(a.low - b.high, a.high - b.low)
 
     def typecheck(self, env: Environment) -> Type:
         t = self.head.typecheck(env)
         if not self.subs:
-            if not isinstance(t, Range):
+            if isinstance(t, Range):
+                return Range(-t.high, -t.low)
+            elif isinstance(t, Opaque):
+                return t
+            else:
                 reporter.error(f"Negating a non-scalar type: {self!r}")
                 return t
-            return Range(-t.high, -t.low)
         for term in self.subs:
             t = self.typecheck_binop(t, term.typecheck(env))
         return t
@@ -363,8 +375,9 @@ class PowExpr:
         if base.is_const():
             return Range.const(pow(base.get_const(), exp.get_const(), env.config.variables.prime))
         # If we have no modular wrap, we have a correct range
-        elif float(base.high)**exp.get_const() < env.config.variables.prime:
-            e, p = exp.get_const(), env.config.variables.prime
+        e, p = exp.get_const(), env.config.variables.prime
+        small_pow = e * max(0, base.high.bit_length() - 1) <= p.bit_length()
+        if base.low >= 0 and small_pow and base.high ** e < p:
             return Range(pow(base.low, e, p), pow(base.high, e, p))
         # Else, escape hatch to the full base type
         else:
@@ -386,9 +399,11 @@ class SumExpr:
             reporter.error(f"Summing of scalar and array types {self!r}")
             return DEFAULT_TYPE
         elif isinstance(a, Opaque):
+            if isinstance(b, Opaque):
+                reporter.asserts(a.tag == b.tag, f"Summation of two distinct opaque types: {self!r}")
             return a
         elif isinstance(b, Opaque):
-            return b
+            return self.typecheck_binop(b, a)
         else:
             return Range(a.low + b.low, a.high + b.high)
 
@@ -776,7 +791,7 @@ class VirtualVariable(Variable):
                 # Some duplicated code/concepts from Iter.typecheck
                 # But threading the extra needed state through overly complicates everything
                 start = it.start.typecheck(env)
-                if not (isinstance(start, Range) and start.is_const):
+                if not (isinstance(start, Range) and start.is_const()):
                     reporter.error(f"Starting value of virtual def iter not a const: {self!r}")
                     start = Range.const(0)
                 stop = it.stop.typecheck(env)
@@ -821,15 +836,24 @@ class VirtualVariable(Variable):
                     check_covered(elt, seen, indices + [i])
 
         # Special case for better error messages
-        if isinstance(self.type, Range):
+        if not isinstance(self.type, list):
             reporter.asserts(
                 len(self.def_.defs) == 1 and not self.def_.defs[0].iters,
                 f"Invalid def for scalar column: {self!r}",
             )
             assigned_type = self.def_.defs[0].poly.typecheck(env)
-            if not isinstance(assigned_type, Range):
+            if isinstance(assigned_type, list):
                 reporter.error(f"Assigning non-scalar type to scalar virtual column: {self!r}")
                 return self.type
+
+            if isinstance(self.type, Range) and not isinstance(assigned_type, Range):
+                reporter.error(f"Incompatible virtual column type assignment: {self!r}")
+                return self.type
+
+            if isinstance(self.type, Opaque) and (not isinstance(assigned_type, Opaque) or assigned_type.tag != self.type.tag):
+                reporter.error(f"Incompatible virtual column opaque type assignment: {self!r}")
+                return self.type
+
             # Check type fits?
             # Leaving this out because it produces too much noise with one-hot assumptions
             # reporter.asserts(self.type.low <= assigned_type.low <= assigned_type.high <= self.type.high, f"Definition may not fit in virtual column: {self!r}")
