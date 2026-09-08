@@ -1087,10 +1087,11 @@ fn the_leaf_node_verifies_and_binds_two_wraps() {
     let label_range = (labels[0][0], labels[FAN_IN - 1][0]);
     println!(
         "   {FAN_IN} epoch wraps proved in {:.1}s, {} published words each, \
-         {} sub-proofs each",
+         {} sub-proofs each\n   RSS high-water AFTER the wrap proves: {:?} GiB",
         t.elapsed().as_secs_f64(),
         children[0].public_words.len(),
         children[0].tables.len(),
+        super::wrap_tests::peak_rss_gib(),
     );
 
     // ---- the node. Same pre-flight on the CHILD side, so a zero bit width is
@@ -1141,9 +1142,10 @@ fn the_leaf_node_verifies_and_binds_two_wraps() {
     }
     println!(
         "   ✓ differential: every leg reaches its child's OWN (z, alpha) \
-         ({:.1}s, {} instructions)",
+         ({:.1}s, {} instructions)\n   RSS high-water AFTER the diagnostic arm: {:?} GiB",
         t.elapsed().as_secs_f64(),
-        diagnostic.instrs.len()
+        diagnostic.instrs.len(),
+        super::wrap_tests::peak_rss_gib(),
     );
 
     // ---- the node a parent would verify.
@@ -1171,6 +1173,15 @@ fn the_leaf_node_verifies_and_binds_two_wraps() {
         exec.public_words.len(),
         node_layout.schema_words(),
         node_layout.head,
+    );
+    // ★ The reading the fan-in arithmetic needs. `peak_rss_gib` is `VmHWM`, a
+    // PROCESS high-water mark that only ever rises, so the run's final figure
+    // spans the wrap proves, the diagnostic arm and the node alike. Printing it
+    // at each boundary turns one conflated number into a bound per phase: what
+    // the node's own prove costs is at most the rise from here.
+    println!(
+        "   RSS high-water BEFORE the node prove: {:?} GiB",
+        super::wrap_tests::peak_rss_gib()
     );
 
     // ---- the node's own proof, so the level above has something to verify.
@@ -1377,19 +1388,30 @@ fn the_inner_node_verifies_two_leaf_nodes() {
 
     let elf_bytes = super::proof_fixture::read_inner_elf();
     let inner = super::proof_fixture::fixture_options();
-    let bundle = crate::continuation::prove_continuation(
-        &elf_bytes,
-        &[],
-        super::proof_fixture::FIXTURE_EPOCH_LOG2,
-        &inner,
-    )
-    .expect("the fixture continuation must prove");
+    // ★ A LOCAL epoch size, NOT the shared `FIXTURE_EPOCH_LOG2`.
+    //
+    // A two-level tree needs FAN_IN^2 epochs and the shared constant selects two.
+    // `epoch_size_log2` is a PARAMETER of `prove_continuation` (floor 2), so a
+    // smaller epoch here yields more of them from the same guest without moving
+    // the ground under the nine gates that already run against the shared
+    // constant — every one of which would otherwise be re-baselined by a change
+    // whose only purpose is to give THIS test more epochs.
+    //
+    // ⚠ Smaller epochs mean shallower tables, which is where the degenerate
+    // shapes live. That is a feature: the one-row sub-proof and the one-leaf
+    // Merkle tree were both found this way, and both are now gated in
+    // milliseconds. If a third appears, it is a shape the emitter has to handle
+    // and this is the cheapest place to find it.
+    let epoch_log2 = super::proof_fixture::FIXTURE_EPOCH_LOG2 - 1;
+    let bundle = crate::continuation::prove_continuation(&elf_bytes, &[], epoch_log2, &inner)
+        .expect("the fixture continuation must prove");
     let needed = FAN_IN * FAN_IN;
     assert!(
         bundle.num_epochs() >= needed,
-        "a two-level fan-in-{FAN_IN} tree needs {needed} epochs, the fixture has {}. \
-         Raise FIXTURE_EPOCH_LOG2 or use a longer guest — do NOT pad, a pad child \
-         belongs to no epoch and breaks the register chain and the label pin",
+        "a two-level fan-in-{FAN_IN} tree needs {needed} epochs; at epoch_log2 \
+         {epoch_log2} this guest gives {}. Lower `epoch_log2` further (its floor is \
+         2) or use a longer guest — do NOT pad, a pad child belongs to no epoch \
+         and breaks the register chain and the label pin",
         bundle.num_epochs()
     );
 
