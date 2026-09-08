@@ -403,19 +403,18 @@ fn the_wrap_proves_and_verifies() {
     wrap_run(super::proof_fixture::fixture_options());
 }
 
-/// ★★ THE SUITE-GATED PER-TABLE WRAP — the per-table twin of
-/// [`the_fixture_epoch_wraps_batched`], and NOT `#[ignore]`d.
+/// ★★ THE SUITE-GATED WRAP — the one assembled epoch verifier a suite run
+/// PROVES, and NOT `#[ignore]`d.
 ///
 /// # The gap it closes
 ///
-/// Every other per-table epoch-verifier wrap is `#[ignore]`d
+/// Every other epoch-verifier wrap is `#[ignore]`d
 /// ([`the_wrap_proves_and_verifies`], [`the_real_block_epoch_wraps`],
 /// [`the_from_proof_final_epoch_wraps`],
-/// [`the_real_block_proves_and_wraps_end_to_end`]), so the only assembled epoch
-/// verifier a suite run ever PROVED was the batched one. The per-table proof
-/// FORMAT was covered — the leg suites prove it, and the batched wrap's own
-/// proof goes through [`lfm_prove`] — but the per-table epoch verifier PROGRAM
-/// was not. This is the arm that keeps it from being the untested one.
+/// [`the_real_block_proves_and_wraps_end_to_end`]). The proof FORMAT is covered
+/// without this test — the leg suites prove it — but the assembled epoch
+/// verifier PROGRAM is not. This is the arm that keeps it from being the
+/// untested one.
 ///
 /// # What proving adds to an execution
 ///
@@ -454,9 +453,9 @@ fn the_wrap_proves_and_verifies() {
 /// The smallest shape that still exercises every leg: the min preset
 /// ([`super::proof_fixture::fixture_options`] — blowup 2, ONE query) over the
 /// fibonacci fixture epoch ([`EpochInputs::fixture`], `FIXTURE_EPOCH_LOG2`).
-/// `EpochInputs::fixture` rather than `from_env`, deliberately and exactly as
-/// the batched twin does it: a measurement run's `LFM_CENSUS_*` variables must
-/// not be able to turn a suite gate into a real-block run.
+/// `EpochInputs::fixture` rather than `from_env`, deliberately: a measurement
+/// run's `LFM_CENSUS_*` variables must not be able to turn a suite gate into a
+/// real-block run.
 ///
 /// # What it costs, MEASURED
 ///
@@ -473,8 +472,7 @@ fn the_wrap_proves_and_verifies() {
 /// ⚠ On CI, expect **30-60s** rather than 9.2s: the runners are 2-4 vCPU and
 /// the suite runs `--test-threads=1`, so almost none of the box's parallelism
 /// is there. `? INFERRED` — scaled from the box wall, not measured on a runner.
-/// The batched twin already pays a comparable bill today and is being deleted,
-/// so the steady state is one test of this class, not two.
+/// This is the only test of its class, so that bill is paid once per suite run.
 ///
 /// ⚠ These numbers, and NOT the `~2.25M` instructions the slice-0 doc quotes,
 /// describe this shape. In a clean environment the two tests are the SAME
@@ -697,8 +695,8 @@ fn fixture_wrap_run(inner: ProofOptions, inputs: EpochInputs) {
     // refuses to lie without ever showing that the verifier catches one. This
     // arm hands the verifier the REAL proof under a claim it does not answer;
     // `absorb_lfm_statement` binds the proof to its published words, so it must
-    // reject. Costs one verify (~0.16s against a 9s test), which is why the
-    // batched twin carries it and why there was no case for leaving it out.
+    // reject. Costs one verify (~0.16s against a 9s test), so there was no case
+    // for leaving it out.
     let mut moved = proved.public_words.clone();
     moved[0].1[0] += FE::one();
     assert!(
@@ -1723,293 +1721,6 @@ fn the_row_cliff_panel_reproduces_the_artifacts_measured_headroom() {
     }
 }
 
-// ===================== the BATCHED wrap (M-8 / T3) =====================
-
-/// The batched sibling of [`wrap_run_from`]: the same census-env epoch proved
-/// through `multi_prove_batched`, its ASSEMBLED BATCHED verifier emitted, and
-/// that program PROVED on the per-table LFM prover — batching the wrap itself
-/// is out of scope; the wrap-side economy under measurement is the verifier
-/// program's, not the wrap prover's.
-fn batched_wrap_run_from(inner: ProofOptions, inputs: EpochInputs) {
-    let t_epoch = Instant::now();
-    let e = super::epoch_tests::real_batched_epoch_from(inner.clone(), inputs);
-    let n = e.proof.tables.len();
-    let h_min = e.shape.heights.iter().copied().min().expect("tables");
-    let h_max = e.shape.heights.iter().copied().max().expect("tables");
-    let profile = format!(
-        "{n} tables, LDE 2^{h_min}..2^{h_max}, batched {}/standalone {}",
-        e.challenges.fri.plan.batched.len(),
-        e.challenges.fri.plan.standalone.len(),
-    );
-    println!(
-        "batched inner epoch: {profile}, blowup {}, {} queries, grinding {} — built and \
-         HOST-VERIFIED in {:.1}s",
-        inner.blowup_factor,
-        e.fri_params.num_queries,
-        e.fri_params.grinding_factor,
-        t_epoch.elapsed().as_secs_f64()
-    );
-
-    let t = Instant::now();
-    let program = super::epoch_tests::batched_epoch_program_with(&e, true, false);
-    let mut arenas = super::epoch_tests::batched_epoch_arenas(&e);
-    arenas.push(super::epoch_verify_tests::batched_opening_arena(&e));
-    arenas.push(super::epoch_verify_tests::batched_fri_arena(&e));
-    println!(
-        "   emitted the assembled BATCHED verifier in {:.1}s",
-        t.elapsed().as_secs_f64()
-    );
-    report_program("THE BATCHED WRAPPED PROGRAM", &profile, &program);
-    let (main, aux) = report_census(&format!("assembled batched verifier, {profile}"), &program);
-
-    // ---- the spine/legs split, against the batched CLOSED FORM — the number
-    // the campaign predicts: leg hashing collapses to ~one mixed path per
-    // round per query plus the small prep trees.
-    let spine = super::epoch_tests::batched_epoch_program(&e);
-    let wrap_hash = WrapHash::production();
-    let leg_hash_ops = hash_ops(&program, wrap_hash) - hash_ops(&spine, wrap_hash);
-    let per_query = super::batched_epoch_verify::batched_query_permutations_for(
-        &e.shape,
-        &e.fri_params,
-        wrap_hash,
-    );
-    assert_eq!(
-        leg_hash_ops,
-        e.proof.queries.len() * per_query,
-        "the emitted leg {wrap_hash:?} operations must equal the batched closed form"
-    );
-    println!(
-        "   spine {} instr / {} {:?} ops / {} words   legs {} / {} / {}   \
-         per query: {per_query} ops ({} queries, closed form checked)",
-        spine.instrs.len(),
-        hash_ops(&spine, wrap_hash),
-        wrap_hash,
-        arena_words(&spine),
-        program.instrs.len() - spine.instrs.len(),
-        leg_hash_ops,
-        arena_words(&program) - arena_words(&spine),
-        e.proof.queries.len(),
-    );
-    println!(
-        "   projected peak RSS for this run: {:.1} GiB",
-        projected_peak_bytes(main, aux) / (1u64 << 30) as f64
-    );
-
-    let opts = wrap_options();
-    let artifacts = build_artifacts_with_hasher(&program, &opts, crate::hash_pin::BLOCK_HASHER);
-    println!(
-        "   wrap options: blowup {}, {} queries, grinding {}\n   chip log-heights: {:?}",
-        opts.blowup_factor, opts.fri_number_of_queries, opts.grinding_factor, artifacts.log_heights
-    );
-
-    // ---- PROVE (the per-table LFM prover, deliberately).
-    let t = Instant::now();
-    let proved =
-        lfm_prove(&program, &artifacts, &arenas, &opts).expect("the batched wrap must prove");
-    let prove_secs = t.elapsed().as_secs_f64();
-    let size = rkyv::to_bytes::<rkyv::rancor::Error>(&proved.proof)
-        .expect("the wrap proof must serialize")
-        .len();
-
-    // ---- VERIFY.
-    let t = Instant::now();
-    assert!(
-        verify_against(
-            &artifacts.roots,
-            &artifacts.program_id,
-            artifacts.keccak_rnd_chunks,
-            &proved.proof,
-            &proved.public_words,
-            &opts,
-            artifacts.hasher,
-            artifacts.chip_set,
-        ),
-        "the batched wrap proof must verify"
-    );
-    let verify_secs = t.elapsed().as_secs_f64();
-    println!(
-        "\n★ BATCHED WRAP PROVED AND VERIFIED ({profile}, inner blowup {}, {} queries)\n   \
-         prove {prove_secs:.1}s / verify {verify_secs:.2}s / proof {size} bytes / \
-         {} published words / {} sub-proofs\n   cells {main} main + {aux} aux ext",
-        inner.blowup_factor,
-        e.fri_params.num_queries,
-        proved.public_words.len(),
-        proved.proof.proofs.len(),
-    );
-
-    // ---- the published words are the execution's own, so the spine's
-    // differential holds of the PROVED run: the shared pair, the attestation,
-    // and the closure, by value against the harness's oracles.
-    let pub_ext =
-        |i: usize| super::word::word_as_ext(&proved.public_words[i].1).expect("an ext challenge");
-    let [z, alpha] = e.challenges.lookup.as_slice() else {
-        panic!("the shared pair is (z, alpha)");
-    };
-    assert_eq!(pub_ext(0), *z, "the proved run publishes z");
-    assert_eq!(pub_ext(1), *alpha, "the proved run publishes alpha");
-    assert_eq!(
-        super::word::word_as_ext(&proved.public_words[proved.public_words.len() - 1].1)
-            .expect("the bus total is ext"),
-        e.expected_bus_balance,
-        "the proved run reaches production's own COMMIT-bus target"
-    );
-
-    // ---- FALSIFICATION 1: a tampered inner opening makes the wrap
-    // UNBUILDABLE (the checks are asserts in a straight-line program; a false
-    // statement has no execution at all).
-    let open_idx = arenas.len() - 2;
-    let mut tampered = arenas.clone();
-    tampered[open_idx][0][0] += FE::one();
-    match lfm_prove(&program, &artifacts, &tampered, &opts) {
-        Err(LfmProveError::Exec(err)) => {
-            println!("   TAMPERED opening word 0: the batched wrap is UNBUILDABLE ({err:?})")
-        }
-        Err(LfmProveError::Prover(err)) => {
-            panic!("a tampered inner proof must fail in execution, not in the prover: {err:?}")
-        }
-        Ok(_) => panic!("a tampered opened value must not produce a wrap proof"),
-    }
-
-    // ---- FALSIFICATION 2: the honest proof against a MOVED claimed statement
-    // must reject at verification.
-    let mut moved = proved.public_words.clone();
-    moved[0].1[0] += FE::one();
-    assert!(
-        !verify_against(
-            &artifacts.roots,
-            &artifacts.program_id,
-            artifacts.keccak_rnd_chunks,
-            &proved.proof,
-            &moved,
-            &opts,
-            artifacts.hasher,
-            artifacts.chip_set,
-        ),
-        "a moved claimed word must be rejected"
-    );
-    println!("   MOVED claimed word 0: rejected");
-}
-
-/// ★ GATE B's batched sibling — a REAL Ethereum-block epoch, proved through
-/// the BATCHED base layer and wrapped. Same env contract as
-/// [`the_real_block_epoch_wraps`]; run both on the same box for the T3
-/// comparison the campaign exists to make — memory first, at 2^16 and at the
-/// 2^24 posture.
-#[test]
-#[ignore]
-fn the_real_block_epoch_wraps_batched() {
-    for var in ["LFM_CENSUS_ELF", "LFM_CENSUS_INPUT"] {
-        assert!(
-            std::env::var(var).is_ok(),
-            "{var} must name a file: this test wraps a REAL block epoch"
-        );
-    }
-    let inputs = EpochInputs::from_env();
-    let mut inner = crate::recursion::Preset::Blowup4.options();
-    if let Ok(v) = std::env::var("LFM_WRAP_QUERIES") {
-        inner.fri_number_of_queries = v.parse().expect("LFM_WRAP_QUERIES must be an integer");
-    }
-    println!(
-        "★ REAL-BLOCK BATCHED WRAP: guest {}, {} bytes of private input, 2^{} cycles/epoch, \
-         inner blowup {} / {} queries{}",
-        inputs.label,
-        inputs.private_input.len(),
-        inputs.epoch_log2,
-        inner.blowup_factor,
-        inner.fri_number_of_queries,
-        if inner.fri_number_of_queries < 110 {
-            "  (REDUCED — not a security parameter set)"
-        } else {
-            "  (the secure preset)"
-        },
-    );
-    batched_wrap_run_from(inner, inputs);
-}
-
-/// ★ The P2 DRIVER'S FLOW at the fixture, not ignored: a batched-carved
-/// continuation bundle's FINAL epoch reconstructs from proofs alone, its
-/// CARVED program wraps end to end, and the wrap PUBLISHES the carved L2G
-/// root — byte-compared against the bundle's claimed root, exactly the check
-/// P3's aggregator makes. Gated on every suite run, so the block driver's box
-/// run cannot be the first execution of any of it.
-#[test]
-fn the_fixture_continuation_epoch_wraps_batched_from_proofs() {
-    let elf_bytes = super::proof_fixture::read_inner_elf();
-    let inner = super::proof_fixture::fixture_options();
-    let bundle = crate::continuation::prove_continuation_batched(
-        &elf_bytes,
-        &[],
-        super::proof_fixture::FIXTURE_EPOCH_LOG2,
-        &inner,
-    )
-    .expect("the fixture continuation must prove batched");
-    let n = bundle.num_epochs();
-    assert!(n >= 2, "the fixture continuation must have a final epoch");
-
-    let e = super::epoch_tests::real_batched_epoch_from_continuation(
-        &inner,
-        &elf_bytes,
-        &bundle,
-        n - 1,
-        None,
-    )
-    .expect("the final epoch must reconstruct from proofs alone");
-    let program = super::epoch_tests::batched_epoch_program_with(&e, true, false);
-    let mut arenas = super::epoch_tests::batched_epoch_arenas(&e);
-    arenas.push(super::epoch_verify_tests::batched_opening_arena(&e));
-    arenas.push(super::epoch_verify_tests::batched_fri_arena(&e));
-    let opts = wrap_options();
-    let artifacts = build_artifacts_with_hasher(&program, &opts, crate::hash_pin::BLOCK_HASHER);
-
-    let proved =
-        lfm_prove(&program, &artifacts, &arenas, &opts).expect("the carved wrap must prove");
-    assert!(
-        verify_against(
-            &artifacts.roots,
-            &artifacts.program_id,
-            artifacts.keccak_rnd_chunks,
-            &proved.proof,
-            &proved.public_words,
-            &opts,
-            artifacts.hasher,
-            artifacts.chip_set,
-        ),
-        "the carved wrap of the final epoch must verify"
-    );
-
-    // The published-word schema's aggregator-facing check: the last
-    // `lanes_per_root()` words are the carved L2G root — eight byte halves on a
-    // byte hash, four felts on an algebraic one — equal to the bundle's claimed
-    // root as the host publishes it.
-    let root = bundle.epoch_view(n - 1).l2g_root();
-    let lanes = super::proof_arena::lanes_per_root();
-    let published_root: Vec<FE> = proved.public_words[proved.public_words.len() - lanes..]
-        .iter()
-        .map(|w| super::word::word_as_base(&w.1).expect("a root lane is a base word"))
-        .collect();
-    let expected_root: Vec<FE> = super::proof_arena::commitment_lanes(&root);
-    assert_eq!(
-        published_root, expected_root,
-        "the wrap must publish the carved L2G root it verified under"
-    );
-    println!(
-        "★ P2 fixture driver flow: FINAL carved epoch wrapped, verified, and its          published L2G root matches the bundle's claim ({} published words)",
-        proved.public_words.len()
-    );
-}
-
-/// The batched wrap at the FIXTURE, not ignored — the whole T3 instrument's
-/// flow (batched inner, emitted verifier, per-table LFM prove, verify, both
-/// falsification arms) gated on every suite run, so the box run cannot be the
-/// first execution of any of it.
-#[test]
-fn the_fixture_epoch_wraps_batched() {
-    batched_wrap_run_from(
-        super::proof_fixture::fixture_options(),
-        EpochInputs::fixture(),
-    );
-}
-
 /// ★ GATE B (P1) — a from-proof epoch wraps end to end, and it is the FINAL
 /// epoch of its continuation (HALT on board): the shape the real block's last
 /// epoch has, which the session harness cannot build. The epoch reaches the
@@ -2252,15 +1963,6 @@ fn the_real_block_proves_and_wraps_end_to_end() {
     );
 }
 
-/// ★★★ THE P2 BLOCK DRIVER — [`the_real_block_proves_and_wraps_end_to_end`]
-/// on the BATCHED format: every epoch proven as one mixed-MMCS proof with the
-/// L2G main matrix carved standalone (`prove_continuation_batched`), the
-/// bundle completely host-verified (epochs, global proof, the root-equality
-/// binding reading the carved roots), then every epoch wrapped from the
-/// proofs alone through the batched from-proof constructor and the CARVED
-/// emitted verifier. One process; the epoch proves are `Retain`; the wrap
-/// proves are `Retain`. Same env contract as the per-table driver; run both
-/// on the same box for the P2 comparison the campaign exists to make.
 ///
 /// The real block's cross-epoch PAGE CENSUS — execution and collection only,
 /// nothing proven. Prints the numbers the aggregator's closed-form census
@@ -2300,176 +2002,4 @@ fn the_real_blocks_page_census() {
         census.l2g_cells,
     );
     println!("   page-table height histogram (log2 padded rows -> pages): {hist:?}");
-}
-
-/// Run at the 2^24 posture:
-/// ```text
-/// LFM_CENSUS_ELF=/path/to/ethrex.elf \
-/// LFM_CENSUS_INPUT=/path/to/ethrex_mainnet_25368371.bin \
-/// LFM_CENSUS_EPOCH_LOG2=24 LAMBDA_VM_MAX_ROWS_LOG2=24 \
-/// cargo test --release -p lambda-vm-prover --lib \
-///   lfm::wrap_tests::the_real_block_proves_and_wraps_end_to_end_batched -- --ignored --exact --nocapture
-/// ```
-#[test]
-#[ignore]
-fn the_real_block_proves_and_wraps_end_to_end_batched() {
-    for var in ["LFM_CENSUS_ELF", "LFM_CENSUS_INPUT"] {
-        assert!(
-            std::env::var(var).is_ok(),
-            "{var} must name a file: this test proves a REAL block, and without \
-             it the harness would build the fibonacci fixture and report it \
-             under this test's name"
-        );
-    }
-    let inputs = EpochInputs::from_env();
-    let mut inner = crate::recursion::Preset::Blowup4.options();
-    if let Ok(v) = std::env::var("LFM_WRAP_QUERIES") {
-        inner.fri_number_of_queries = v.parse().expect("LFM_WRAP_QUERIES must be an integer");
-    }
-    println!(
-        "★ P2 BLOCK RUN (batched): guest {}, {} bytes of private input, 2^{} cycles/epoch, \
-         inner blowup {} / {} queries{}  — epoch residency Retain, wrap residency Retain",
-        inputs.label,
-        inputs.private_input.len(),
-        inputs.epoch_log2,
-        inner.blowup_factor,
-        inner.fri_number_of_queries,
-        if inner.fri_number_of_queries < 110 {
-            "  (REDUCED — not a security parameter set)"
-        } else {
-            "  (the secure preset)"
-        },
-    );
-
-    let t_total = Instant::now();
-
-    // ---- the base layer: every epoch BATCHED-CARVED + the (per-table)
-    // global proof, production's path.
-    let t = Instant::now();
-    let bundle = crate::continuation::prove_continuation_batched(
-        &inputs.elf_bytes,
-        &inputs.private_input,
-        inputs.epoch_log2,
-        &inner,
-    )
-    .expect("the block must prove batched");
-    let base_secs = t.elapsed().as_secs_f64();
-    let n = bundle.num_epochs();
-    let bundle_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&bundle)
-        .expect("the bundle must serialize")
-        .len();
-    println!(
-        "   base (batched): {n} epochs + global proof in {base_secs:.1}s \
-         ({bundle_bytes} bundle bytes), peak RSS so far {:?} GiB",
-        peak_rss_gib(),
-    );
-
-    // ---- full host verification: every epoch's carved batched verify, the
-    // global proof, and the binding view reading the carved roots.
-    let t = Instant::now();
-    let out = crate::continuation::verify_continuation(&inputs.elf_bytes, &bundle, &inner)
-        .expect("the bundle must be well-formed");
-    assert!(
-        out.is_some(),
-        "the batched block bundle must host-verify (epochs + global + L2G root binding)"
-    );
-    let host_verify_secs = t.elapsed().as_secs_f64();
-    println!("   host verify (epochs + global + binding): {host_verify_secs:.1}s");
-
-    // ---- every epoch, wrapped from the proofs alone: the CARVED program.
-    let elf = executor::elf::Elf::load(&inputs.elf_bytes).expect("the inner ELF must load");
-    let decode = crate::tables::decode::commitment_from_elf(&elf, &inner)
-        .expect("the DECODE commitment must compute");
-    let wrap_opts = wrap_options();
-    let (mut construct_secs, mut wrap_prove_secs, mut wrap_verify_secs) = (0f64, 0f64, 0f64);
-    let mut wrap_sizes = Vec::new();
-    for i in 0..n {
-        let t = Instant::now();
-        let e = super::epoch_tests::real_batched_epoch_from_continuation(
-            &inner,
-            &inputs.elf_bytes,
-            &bundle,
-            i,
-            Some(decode),
-        )
-        .unwrap_or_else(|err| panic!("epoch {i} must reconstruct from the bundle: {err}"));
-        let program = super::epoch_tests::batched_epoch_program_with(&e, true, false);
-        let mut arenas = super::epoch_tests::batched_epoch_arenas(&e);
-        arenas.push(super::epoch_verify_tests::batched_opening_arena(&e));
-        arenas.push(super::epoch_verify_tests::batched_fri_arena(&e));
-        let artifacts =
-            build_artifacts_with_hasher(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
-        let c = t.elapsed().as_secs_f64();
-        construct_secs += c;
-
-        let t = Instant::now();
-        let proved = lfm_prove(&program, &artifacts, &arenas, &wrap_opts)
-            .unwrap_or_else(|err| panic!("epoch {i}'s wrap must prove: {err:?}"));
-        let p = t.elapsed().as_secs_f64();
-        wrap_prove_secs += p;
-
-        let t = Instant::now();
-        assert!(
-            verify_against(
-                &artifacts.roots,
-                &artifacts.program_id,
-                artifacts.keccak_rnd_chunks,
-                &proved.proof,
-                &proved.public_words,
-                &wrap_opts,
-                artifacts.hasher,
-                artifacts.chip_set,
-            ),
-            "epoch {i}'s wrap must verify"
-        );
-        let v = t.elapsed().as_secs_f64();
-        wrap_verify_secs += v;
-
-        // The published-word schema: the wrap's last 8 published words are
-        // the carved L2G root's halves — byte-compare them against the
-        // bundle's claimed root, exactly the check P3's aggregator makes.
-        let root = bundle.epoch_view(i).l2g_root();
-        let published_root: Vec<FE> = proved.public_words[proved.public_words.len() - 8..]
-            .iter()
-            .map(|w| super::word::word_as_base(&w.1).expect("a root half is a base word"))
-            .collect();
-        let expected_root: Vec<FE> = root
-            .chunks(4)
-            .map(|c: &[u8]| {
-                FE::from(u32::from_le_bytes(c.try_into().expect("a root is 32 bytes")) as u64)
-            })
-            .collect();
-        assert_eq!(
-            published_root, expected_root,
-            "epoch {i}: the wrap must publish its carved L2G root"
-        );
-
-        let size = rkyv::to_bytes::<rkyv::rancor::Error>(&proved.proof)
-            .expect("the wrap proof must serialize")
-            .len();
-        wrap_sizes.push(size);
-        println!(
-            "   epoch {i}: reconstruct+emit {c:.1}s, wrap prove {p:.1}s, verify {v:.2}s, \
-             {size} bytes, {} sub-proofs, L2G root published",
-            proved.proof.proofs.len(),
-        );
-    }
-
-    let total = t_total.elapsed().as_secs_f64();
-    println!(
-        "\n★★★ P2 BLOCK RECORD (batched): {n} epochs @2^{} cycles, inner blowup {} / {}q, \
-         wrap blowup {} / {}q, residency Retain both layers\n    \
-         base prove {base_secs:.1}s + host verify {host_verify_secs:.1}s + wrap constructs \
-         {construct_secs:.1}s + wrap proves {wrap_prove_secs:.1}s + wrap verifies \
-         {wrap_verify_secs:.1}s\n    TOTAL WALL {total:.1}s ({:.1} min)\n    \
-         proofs: bundle {bundle_bytes} B, wraps {wrap_sizes:?} B\n    \
-         peak RSS (VmHWM): {:?} GiB",
-        inputs.epoch_log2,
-        inner.blowup_factor,
-        inner.fri_number_of_queries,
-        wrap_opts.blowup_factor,
-        wrap_opts.fri_number_of_queries,
-        total / 60.0,
-        peak_rss_gib(),
-    );
 }

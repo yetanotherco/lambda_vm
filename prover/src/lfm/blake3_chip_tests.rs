@@ -1519,10 +1519,9 @@ fn both_blake3_surfaces_in_one_machine_balance_bitwise() {
 // One row per compression at 3,056 value columns, so the chip's matrix is WIDE:
 // the aggregation program's ~1.39M compressions are a 2^21 x 3,056 table whose
 // blowup-2 LDE is a single ~102 GB allocation. These tests cover the split — the
-// shape it produces, that a multi-chunk program proves and verifies on both the
-// per-table and the batched path, that it proves the SAME thing, and the two
-// ways the split itself can be wrong (a corrupted non-first chunk, a chunk count
-// that does not match the proof).
+// shape it produces, that a multi-chunk program proves and verifies, that it
+// proves the SAME thing, and the two ways the split itself can be wrong (a
+// corrupted non-first chunk, a chunk count that does not match the proof).
 
 use super::chunking::Blake3Chunking;
 
@@ -1646,11 +1645,10 @@ fn the_blake3_chunk_arithmetic_is_the_group_split() {
 }
 
 /// ★ The acceptance test: a program needing three `LFM_BLAKE3` chunks proves and
-/// verifies COMPLETELY, on both the per-table and the batched path, and its
-/// digest is still the host chain's.
+/// verifies COMPLETELY, and its digest is still the host chain's.
 #[test]
 fn chunked_blake3_proves_and_verifies() {
-    use super::proof::{lfm_prove_batched, verify_against_artifacts, verify_against_batched};
+    use super::proof::verify_against_artifacts;
 
     let opts = options();
     let msg = message(CHUNKED_CHAIN_LEN);
@@ -1672,21 +1670,6 @@ fn chunked_blake3_proves_and_verifies() {
     assert!(
         verify_against_artifacts(&artifacts, &proved.proof, &proved.public_words, &opts),
         "a three-chunk LFM_BLAKE3 proof must verify"
-    );
-
-    // The batched path is the one the aggregation layer proves on, so it is the
-    // one that has to carry chunking; verifying only the per-table path would
-    // leave the real consumer untested.
-    let batched = lfm_prove_batched(&program, &artifacts, &sponge_arenas(&msg), &opts)
-        .expect("the chunked program must prove batched");
-    assert_eq!(
-        digest_bytes(&batched.public_words),
-        blake3_chain(&msg),
-        "the batched chunked proof must hash the same"
-    );
-    assert!(
-        verify_against_batched(&artifacts, &batched.proof, &batched.public_words, &opts),
-        "a three-chunk batched proof must verify completely"
     );
 }
 
