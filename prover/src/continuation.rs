@@ -1958,6 +1958,100 @@ mod tests {
     }
 
     // A memory-heavy multi-epoch continuation. `all_loadstore_32` is ~34 cycles, so
+    /// Each epoch drops the chips it never reaches, and it decides that on its
+    /// own: a table missing from one epoch still shows up in another that does
+    /// use it. The skip is not a property of the run, it is a property of the
+    /// epoch — computing it over the whole run instead would drag every table
+    /// used anywhere into every epoch.
+    #[test]
+    fn table_presence_is_decided_per_epoch() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let elf_bytes = asm_elf_bytes("all_loadstore_32");
+        let epoch_size_log2 = 3;
+        let opts = ProofOptions::default_test_options();
+
+        let bundle = prove_continuation(&elf_bytes, &[], epoch_size_log2, &opts).unwrap();
+        // Guard against silent degradation: one epoch cannot disagree with another.
+        assert!(
+            bundle.epochs.len() >= 2,
+            "need at least two epochs, got {}",
+            bundle.epochs.len()
+        );
+
+        // `(name, count)` per epoch, in a fixed order so the rows line up.
+        let per_epoch: Vec<Vec<(&str, usize)>> = bundle
+            .epochs
+            .iter()
+            .map(|e| {
+                let c = &e.table_counts;
+                vec![
+                    ("lt", c.lt),
+                    ("memw", c.memw),
+                    ("memw_aligned", c.memw_aligned),
+                    ("load", c.load),
+                    ("mul", c.mul),
+                    ("dvrm", c.dvrm),
+                    ("shift", c.shift),
+                    ("branch", c.branch),
+                    ("eq", c.eq),
+                    ("bytewise", c.bytewise),
+                    ("store", c.store),
+                    ("cpu32", c.cpu32),
+                ]
+            })
+            .collect();
+        let layout = || {
+            per_epoch
+                .iter()
+                .enumerate()
+                .map(|(i, row)| {
+                    let present: Vec<&str> = row
+                        .iter()
+                        .filter(|(_, n)| *n > 0)
+                        .map(|(t, _)| *t)
+                        .collect();
+                    format!("epoch {i}: {present:?}")
+                })
+                .collect::<Vec<_>>()
+                .join("\n  ")
+        };
+
+        // Something is actually being skipped, or the rest proves nothing.
+        assert!(
+            per_epoch.iter().any(|row| row.iter().any(|(_, n)| *n == 0)),
+            "no epoch skipped any table:\n  {}",
+            layout()
+        );
+
+        // And the epochs disagree: some table is in one and out of another.
+        let disagreeing: Vec<&str> = per_epoch[0]
+            .iter()
+            .enumerate()
+            .filter(|(i, (_, first))| {
+                per_epoch
+                    .iter()
+                    .any(|row| (row[*i].1 == 0) != (*first == 0))
+            })
+            .map(|(_, (name, _))| *name)
+            .collect();
+        assert!(
+            !disagreeing.is_empty(),
+            "every epoch carries the same tables, so per-epoch granularity is \
+             untested here — pick a program or epoch size that varies:\n  {}",
+            layout()
+        );
+        println!("tables present in some epochs but not others: {disagreeing:?}");
+        println!("  {}", layout());
+
+        // The mixed-shape bundle has to verify end to end.
+        assert!(
+            verify_continuation(&elf_bytes, &bundle, &opts)
+                .unwrap()
+                .is_some(),
+            "a bundle whose epochs carry different table sets must still verify"
+        );
+    }
+
     // `epoch_size_log2 = 3` (8 cycles) yields several intermediate epochs (each an
     // exact power-of-two cycle count → no CPU padding rows) plus a final epoch.
     #[test]
