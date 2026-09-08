@@ -813,6 +813,8 @@ dependencies = [
  "math-cuda",
  "rayon",
  "rkyv",
+ "serde",
+ "serde_json",
  "stark",
  "sysinfo",
  "tikv-jemalloc-ctl",
@@ -930,6 +932,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "714098028fe011992e1c3962653c96b2d578c4b4bce9036e15ff220319b1e0e3"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "multilinear"
+version = "0.1.0"
+dependencies = [
+ "crypto",
+ "math",
+ "rayon",
+ "thiserror",
 ]
 
 [[package]]
@@ -1533,6 +1545,7 @@ dependencies = [
  "math",
  "math-cuda",
  "memmap2",
+ "multilinear",
  "rand 0.8.5",
  "rand_chacha 0.3.1",
  "rayon",

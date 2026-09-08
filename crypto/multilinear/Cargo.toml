@@ -1,0 +1,15 @@
+[package]
+name = "multilinear"
+description = "Multilinear extensions, sumcheck and zerocheck over the Boolean hypercube"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[dependencies]
+math = { path = "../math", features = ["std"] }
+crypto = { path = "../crypto", features = ["std"] }
+thiserror = "1.0.38"
+rayon = { version = "1.8.0", optional = true }
+
+[features]
+parallel = ["dep:rayon", "math/parallel", "crypto/parallel"]
