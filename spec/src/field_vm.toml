@@ -82,7 +82,7 @@ type = [["BaseField", 2], 4] # PARAM: [["BaseField", T + 1], 4]
 desc = "A virtual wrapper aroung `arg_reg_pows_computed` to have a 1 at index 0"
 def = {polys = [
     {iters = [["i", 0, 3], ["j", 0]], poly = 1},
-    {iters = [["i", 0, 3], ["j", 1, 1]], poly = ["idx", ["idx", "arg_reg_pows_computed", "j"], ["-", "j", 1]]} # PARAM: iters = ["i", 0, 3], ["j", 1, T]]
+    {iters = [["i", 0, 3], ["j", 1, 1]], poly = ["idx", ["idx", "arg_reg_pows_computed", "i"], ["-", "j", 1]]} # PARAM: iters = ["i", 0, 3], ["j", 1, T]]
   ]}
 
 [[variables.constant]]
@@ -154,8 +154,8 @@ name = "fma"
 kind = "arith"
 constraint = "$#`args[0]` = #`args[1]` dot #`args[2]` + #`args[3]`$"
 poly = ["-", ["idx", "args", 0],
-  ["*", ["idx", "args", 1], ["idx", "args", 2],
-  ["idx", "args", 3]]]
+  ["*", ["idx", "args", 1], ["idx", "args", 2]],
+  ["idx", "args", 3]]
 
 [[constraint_groups]]
 name = "transition"
@@ -170,8 +170,8 @@ iter = ["i", 0, 4] # PARAM: ["i", 0, N - 1]
 kind = "arith"
 # PARAM: $!#`hint_input`_i and !(limits(sum)_(j = 0)^T #`arg_register_powers`_(0,j) dot limits(sum)_(k = 0)^(d - 2) #`MUX`_(i+2,j,k) dot #`argument_registers`_0^k) => #`registers`'_i = #`registers`_i$
 constraint = "$!#`hint_input`_i and !(limits(sum)_(j = 0)^1 #`arg_register_powers`_(0,j) dot limits(sum)_(k = 0)^3 #`MUX`_(i+2,j,k) dot #`argument_registers`_0^k) => #`registers`'_i = #`registers`_i$"
-# PARAM: ["*", ["not", ["idx", "hint_input", "i"]], ["-", 1, ["sum", ["=", "j", 0], "T", ["*", ["idx", ["idx", "arg_register_powers", 0], "j"], ["sum", ["=", "k", 0], ["-", "d", 2], ["*", ["idx", ["idx", ["idx", "MUX", ["+", "i", 2]], "j"], "k"], ["^", ["idx", "argument_registers", 0], "k"]]]]]], ["-", ["next", "pc"], ["+", "pc", 1]]]
-poly = ["*", ["not", ["idx", "hint_input", "i"]], ["-", 1, ["sum", ["=", "j", 0], 1, ["*", ["idx", ["idx", "arg_register_powers", 0], "j"], ["sum", ["=", "k", 0], 3, ["*", ["idx", ["idx", ["idx", "MUX", ["+", "i", 2]], "j"], "k"], ["^", ["idx", "argument_registers", 0], "k"]]]]]], ["-", ["next", "pc"], ["+", "pc", 1]]]
+# PARAM: ["*", ["not", ["idx", "hint_input", "i"]], ["-", 1, ["sum", ["=", "j", 0], "T", ["*", ["idx", ["idx", "arg_register_powers", 0], "j"], ["sum", ["=", "k", 0], ["-", "d", 2], ["*", ["idx", ["idx", ["idx", "MUX", ["+", "i", 2]], "j"], "k"], ["^", ["idx", "argument_registers", 0], "k"]]]]]], ["-", ["idx", ["next", "registers"], "i"], ["idx", "registers", "i"]]]
+poly = ["*", ["not", ["idx", "hint_input", "i"]], ["-", 1, ["sum", ["=", "j", 0], 1, ["*", ["idx", ["idx", "arg_register_powers", 0], "j"], ["sum", ["=", "k", 0], 3, ["*", ["idx", ["idx", ["idx", "MUX", ["+", "i", 2]], "j"], "k"], ["^", ["idx", "argument_registers", 0], "k"]]]]]], ["-", ["idx", ["next", "registers"], "i"], ["idx", "registers", "i"]]]
 iter = ["i", 0, 4] # PARAM: ["i", 0, N - 1]
 
 [[constraints.transition]]
@@ -184,7 +184,7 @@ kind = "arith"
 # PARAM: $!(limits(sum)_(j = 0)^1 #`arg_register_powers`_(0,j) dot limits(sum)_(k = 0)^3 #`MUX`_(1,j,k) dot #`argument_registers`_0^k) => #`pc`' = #`pc` + 1$
 constraint = "$!(limits(sum)_(j = 0)^1 #`arg_register_powers`_(0,j) dot limits(sum)_(k = 0)^3 #`MUX`_(1,j,k) dot #`argument_registers`_0^k) => #`pc`' = #`pc` + 1$"
 # PARAM: ["*", ["-", 1, ["sum", ["=", "j", 0], "T", ["*", ["idx", ["idx", "arg_register_powers", 0], "j"], ["sum", ["=", "k", 0], ["-", "d", 2], ["*", ["idx", ["idx", ["idx", "MUX", 1], "j"], "k"], ["^", ["idx", "argument_registers", 0], "k"]]]]]], ["-", ["next", "pc"], ["+", "pc", 1]]]
-poly = ["*", ["not", ["idx", "hint_input", "i"]], ["-", 1, ["sum", ["=", "j", 0], 1, ["*", ["idx", ["idx", "arg_register_powers", 0], "j"], ["sum", ["=", "k", 0], 3, ["*", ["idx", ["idx", ["idx", "MUX", "i"], "j"], "k"], ["^", ["idx", "argument_registers", 0], "k"]]]]]], ["-", ["next", "pc"], ["+", "pc", 1]]]
+poly = ["*", ["-", 1, ["sum", ["=", "j", 0], 1, ["*", ["idx", ["idx", "arg_register_powers", 0], "j"], ["sum", ["=", "k", 0], 3, ["*", ["idx", ["idx", ["idx", "MUX", 1], "j"], "k"], ["^", ["idx", "argument_registers", 0], "k"]]]]]], ["-", ["next", "pc"], ["+", "pc", 1]]]
 
 [[constraints.transition]]
 kind = "template"
