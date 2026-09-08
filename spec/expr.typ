@@ -158,7 +158,7 @@
     },
     "next": (pp, rec, e) =>  {
       assert(e.len() == 2 and type(e.at(1)) == str, message: "Invalid transition variable: " + repr(e))
-      cwrap(rec(PREC.next, e.at(1)) + ``, pp < PREC.next)
+      cwrap(rec(PREC.next, e.at(1)) + `'`, pp < PREC.next)
     },
   ),
   num: (n) => raw(str(n)),
