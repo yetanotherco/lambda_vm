@@ -293,9 +293,14 @@ pub struct GuestInput {
 /// 4-byte magic identifying a lambda-vm recursion input blob ("LVMR").
 pub const RECURSION_INPUT_MAGIC: [u8; 4] = *b"LVMR";
 
-/// Wire-format version of the recursion input blob. v2: rkyv pointer_width_64
-/// (64-bit rel-ptrs) — v1 archives use 32-bit offsets and are incompatible.
-pub const RECURSION_INPUT_VERSION: u32 = 2;
+/// Wire-format version of the recursion input blob.
+///
+/// - v1: rkyv 32-bit rel-ptrs.
+/// - v2: rkyv pointer_width_64 (64-bit rel-ptrs) — v1 archives are incompatible.
+/// - v3: one epoch proof format. `EpochProof::proof` is a `MultiProof` where v2
+///   had an `EpochProofBody` enum, so every v2 archive carries a discriminant at
+///   an offset a v3 reader does not expect.
+pub const RECURSION_INPUT_VERSION: u32 = 3;
 
 /// Required alignment (bytes) of the archive's first byte in guest memory.
 pub const RECURSION_INPUT_ALIGN: usize = 16;
