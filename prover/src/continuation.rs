@@ -1543,6 +1543,19 @@ fn verify_global(
 /// final epoch keeps its remainder and its HALT, so its padding chain is anchored as
 /// usual. A program that fits in one epoch runs as a single final (monolithic-style)
 /// epoch.
+/// The text of a panic payload, for the pipeline error that reports it in
+/// place of the panic (`panic!` with a string literal or a formatted message
+/// covers every abort the device layer raises).
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
 pub fn prove_continuation(
     elf_bytes: &[u8],
     private_inputs: &[u8],
@@ -1696,21 +1709,48 @@ fn prove_continuation_with_format(
                 register_init: &prepared.register_init,
                 label: prepared.label,
             };
-            match prove_epoch(
-                &elf,
-                elf_bytes,
-                &start,
-                prepared.traces,
-                prepared.is_final,
-                &prepared.boundary,
-                opts,
-                decode_commitment,
-                format,
-            ) {
-                Ok(epoch) => proved.push((prepared.index, epoch)),
-                Err(e) => {
+            #[cfg(test)]
+            if prepared.index == test_fault::FAIL_INDEX && private_inputs == test_fault::PANIC_MAGIC
+            {
+                panic!("injected prover panic (test)");
+            }
+            // A PANIC in the prove — a loud device abort, or any bug — must take
+            // the same drain path as an `Err`. If this thread simply died, `rx`
+            // would close, every builder would stop on its dead sender, and the
+            // producer (which watches `first_err`, never written by a panic)
+            // would block forever in `build_tx.send` on the capacity-1 build
+            // channel, whose receiver lives outside the scope: the prove would
+            // hang instead of failing. Seen once: an aux-build abort slept for
+            // 21 minutes under the CLI.
+            let index = prepared.index;
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                prove_epoch(
+                    &elf,
+                    elf_bytes,
+                    &start,
+                    prepared.traces,
+                    prepared.is_final,
+                    &prepared.boundary,
+                    opts,
+                    decode_commitment,
+                    format,
+                )
+            }));
+            match outcome {
+                Ok(Ok(epoch)) => proved.push((index, epoch)),
+                Ok(Err(e)) => {
                     first_err.lock().unwrap().get_or_insert(e);
                     continue; // drain mode (see loop comment)
+                }
+                Err(payload) => {
+                    first_err
+                        .lock()
+                        .unwrap()
+                        .get_or_insert(Error::ContinuationInvariant(format!(
+                            "epoch {index} prover panicked: {}",
+                            panic_message(&*payload)
+                        )));
+                    continue; // drain mode
                 }
             }
         }
@@ -1752,20 +1792,31 @@ fn prove_continuation_with_format(
             });
             #[cfg(feature = "instruments")]
             let __sp = stark::instruments::span("epoch_trace_build");
-            let traces = Traces::build_from_collected(
-                decode_artifacts_ref,
-                job.collected,
-                // Continuation epochs use the L2G bookend: PAGE tables (the
-                // only image consumers in the build) are skipped.
-                None::<&std::collections::HashMap<u64, u8>>,
-                &job.register_init,
-                &MaxRowsConfig::default(),
-                private_inputs,
-                job.is_final,
-                true,
-                #[cfg(feature = "disk-spill")]
-                stark::storage_mode::StorageMode::Ram,
-            );
+            // Same reason as the prover's guard: a builder that dies leaves the
+            // producer blocked on the build channel once every builder is gone.
+            let build_index = job.index;
+            let traces = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                Traces::build_from_collected(
+                    decode_artifacts_ref,
+                    job.collected,
+                    // Continuation epochs use the L2G bookend: PAGE tables (the
+                    // only image consumers in the build) are skipped.
+                    None::<&std::collections::HashMap<u64, u8>>,
+                    &job.register_init,
+                    &MaxRowsConfig::default(),
+                    private_inputs,
+                    job.is_final,
+                    true,
+                    #[cfg(feature = "disk-spill")]
+                    stark::storage_mode::StorageMode::Ram,
+                )
+            })) {
+                Ok(traces) => traces,
+                Err(payload) => Err(Error::ContinuationInvariant(format!(
+                    "epoch {build_index} trace build panicked: {}",
+                    panic_message(&*payload)
+                ))),
+            };
             // Close the build span BEFORE forwarding: the send below blocks
             // on prove-channel backpressure, which is waiting, not building.
             #[cfg(feature = "instruments")]
@@ -2309,6 +2360,9 @@ pub fn prove_and_verify_continuation(
 #[cfg(test)]
 pub(crate) mod test_fault {
     pub(crate) const MAGIC: &[u8] = b"__inject_pipeline_fault__";
+    /// Same index, but the PROVER thread panics instead of returning `Err`:
+    /// the shutdown path a loud device abort takes.
+    pub(crate) const PANIC_MAGIC: &[u8] = b"__inject_pipeline_panic__";
     pub(crate) const FAIL_INDEX: u64 = 3;
 }
 
@@ -2465,6 +2519,35 @@ mod tests {
             split.as_deref(),
             Some(&expected_output[..]),
             "commit in a later epoch must verify and aggregate to the same output"
+        );
+    }
+
+    // The pipeline's PANIC path: a loud device abort is a panic on the prover
+    // thread, not an `Err`. Before the guard it wedged the pipeline — the
+    // builders stopped on their dead sender and the producer blocked forever
+    // on the build channel — and a real prove slept for 21 minutes. It must
+    // surface as `Err` carrying the panic's own message.
+    #[test]
+    fn test_prover_panic_mid_pipeline_returns_err() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let elf_bytes = asm_elf_bytes("all_loadstore_32");
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let r = prove_continuation(
+                &elf_bytes,
+                test_fault::PANIC_MAGIC,
+                2,
+                &ProofOptions::default_test_options(),
+            );
+            let _ = done_tx.send(r.map(|_| ()));
+        });
+        let result = done_rx
+            .recv_timeout(std::time::Duration::from_secs(300))
+            .expect("prove_continuation wedged: a prover panic did not shut the pipeline down");
+        let err = result.expect_err("the injected panic must surface as Err");
+        assert!(
+            format!("{err:?}").contains("injected prover panic"),
+            "unexpected error: {err:?}"
         );
     }
 
