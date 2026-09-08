@@ -958,6 +958,46 @@ pub(super) fn node_program(
     compile(b.finish())
 }
 
+/// Name any sub-proof whose query sampler would be handed a zero bit width,
+/// BEFORE emission reaches it.
+///
+/// `epoch::emit_table_challenges` samples each query index with
+/// `sample_u64_pow2(shape.index_bits())`, and `index_bits()` is
+/// `log2_trace_length + log2_blowup - 1`. A one-row trace at blowup 2 makes that
+/// ZERO, and the sampler's own assert then fires deep inside emission with no
+/// idea which table or which side of the tree it came from — which is exactly
+/// how it surfaced on box A: a bare "nbits must be in 1..=32, got 0" with
+/// nothing to attach it to.
+///
+/// A diagnostic, not a fix. If it fires, the shape is real and the question is
+/// whether a one-row sub-proof should exist at all at this preset.
+fn assert_samplable(label: &str, shapes: &[&super::epoch::TableChallengeShape]) {
+    for (i, s) in shapes.iter().enumerate() {
+        let lde = s.log2_trace_length + s.log2_blowup;
+        assert!(
+            lde >= 1,
+            "{label} sub-proof {i}: log2_trace {} + log2_blowup {} = {lde}, so \
+             index_bits() would be {} — the query sampler needs at least one bit",
+            s.log2_trace_length,
+            s.log2_blowup,
+            lde as i64 - 1,
+        );
+    }
+    let worst = shapes
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, s)| s.log2_trace_length + s.log2_blowup)
+        .expect("a proof has sub-proofs");
+    println!(
+        "   {label}: {} sub-proofs, shallowest is #{} at log2_trace {} + log2_blowup {} = {} index bits",
+        shapes.len(),
+        worst.0,
+        worst.1.log2_trace_length,
+        worst.1.log2_blowup,
+        worst.1.index_bits(),
+    );
+}
+
 /// ★ THE LEAF NODE RUNS — the first aggregation node over real per-table wrap
 /// proofs.
 ///
@@ -1022,6 +1062,12 @@ fn the_leaf_node_verifies_and_binds_two_wraps() {
             super::epoch_tests::real_epoch_from_continuation(&inner, &elf_bytes, &bundle, k, None)
                 .expect("every epoch must reconstruct from proofs alone");
         let out_halves = e.statement.public_output_len.div_ceil(4);
+        // Pre-flight: the wrap program emits one query sampler per INNER
+        // sub-proof, so a shape it cannot sample must be named here rather than
+        // deep inside `epoch_program_publishing`.
+        let inner_shapes: Vec<&super::epoch::TableChallengeShape> =
+            e.tables.iter().map(|h| &h.shape).collect();
+        assert_samplable(&format!("inner epoch {k}"), &inner_shapes);
         let program =
             super::epoch_tests::epoch_program_publishing(&e, true, Publishes::Aggregation);
         let arenas = super::epoch_tests::epoch_arena_words(&e, true);
@@ -1047,7 +1093,13 @@ fn the_leaf_node_verifies_and_binds_two_wraps() {
         children[0].tables.len(),
     );
 
-    // ---- the node.
+    // ---- the node. Same pre-flight on the CHILD side, so a zero bit width is
+    // attributed to the wrap's own sub-proofs rather than to the inner epoch's.
+    for (k, c) in children.iter().enumerate() {
+        let shapes: Vec<&super::epoch::TableChallengeShape> =
+            c.tables.iter().map(|h| &h.shape).collect();
+        assert_samplable(&format!("child {k} (a wrap proof)"), &shapes);
+    }
     let arenas: Vec<Vec<LfmWord>> = children.iter().flat_map(child_arena_words).collect();
     let node_layout = SchemaLayout::node(layouts[FAN_IN - 1].out_halves);
 

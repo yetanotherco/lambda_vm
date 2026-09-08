@@ -2154,7 +2154,19 @@ fn the_epoch_challenge_spine_matches_production() {
          `program_id_from_digest` over the same inputs"
     );
 
-    let mut cursor = 4usize;
+    // The pair, the two attestation-id words, then the BLOCK-BINDING SCHEMA —
+    // skipped by NAME, never by a literal.
+    //
+    // ⚠ `epoch_challenge_program` is `epoch_program(e, false)`, the SAME emitter
+    // with the legs off — the doc on `epoch_program` says so, and says why: a
+    // second copy of the spine would be a place for the assembled verifier's
+    // Fiat-Shamir to drift from the one this test checks. So every publish the
+    // assembled verifier gained, this spine gained too. A literal 4 here read
+    // register INIT slot 0 as `beta of table 0`, and since x0 is hard-wired zero
+    // the failure printed an all-zero challenge — which reads like a challenge
+    // that was never derived rather than like a cursor pointing at the wrong
+    // field.
+    let mut cursor = 4 + schema_words(&e);
     let mut multi_row_ood = 0;
     for (i, h) in e.tables.iter().enumerate() {
         assert_eq!(pub_ext(cursor), h.beta, "beta of table {i}");
