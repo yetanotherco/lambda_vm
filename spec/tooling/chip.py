@@ -104,6 +104,7 @@ type Expr = (
     | PowExpr
     | SumExpr
     | NotExpr
+    | NextExpr
     | DummyExpr
 )
 
@@ -316,14 +317,22 @@ class PowExpr:
     def typecheck(self, env: Environment) -> Type:
         base = self.base.typecheck(env)
         exp = self.exp.typecheck(env)
-        if isinstance(base, list) or not base.is_const():
+        if isinstance(base, list):
             reporter.error(f"Invalid exponentiation with non-const base: {self.base!r}")
             return DEFAULT_TYPE
         if isinstance(exp, list) or not exp.is_const():
             reporter.error(f"Invalid exponentiation with non-const exponent: {self.exp!r}")
             return DEFAULT_TYPE
-        val = pow(base.get_const(), exp.get_const(), env.config.variables.prime)
-        return Range.const(val)
+        # If const base, we have a const result
+        if base.is_const():
+            return Range.const(pow(base.get_const(), exp.get_const(), env.config.variables.prime))
+        # If we have no modular wrap, we have a correct range
+        elif float(base.high)**exp.get_const() < env.config.variables.prime:
+            e, p = exp.get_const(), env.config.variables.prime
+            return Range(pow(base.low, e, p), pow(base.high, e, p))
+        # Else, escape hatch to the full base type
+        else:
+            return Range(0, env.config.variables.prime - 1)
 
 
 @dataclass
@@ -360,6 +369,14 @@ class NotExpr:
             reporter.error(f"Not a bool passed to `not`: {self.inner!r}")
             return Range(0, 1)
         return Range(1 - inner.high, 1 - inner.low)
+
+
+@dataclass
+class NextExpr:
+    inner: VarExpr
+
+    def typecheck(self, env: Environment) -> Type:
+        return self.inner.typecheck(env)
 
 
 @dataclass
@@ -404,6 +421,10 @@ def build_expr(config: Optional["Config"], data: object) -> Expr:
             return SumExpr(Iter(config, var, start, stop), build_expr(config, terms))
         case ["not", e]:
             return NotExpr(build_expr(config, e))
+        case ["next", str(var)]:
+            inner = build_expr(config, var)
+            assert isinstance(inner, VarExpr), f"Invalid transition variable: {var!r}"
+            return NextExpr(inner)
         case other:
             reporter.error(f"Unknown expression: {other!r}")
             return DummyExpr()

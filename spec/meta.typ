@@ -57,8 +57,8 @@
     )),
     ("RECURSION", (
       ("recursion", [Recursive verification], <recursion>),
-      ("field", [`Field` VM], <field-VM>),
-      ("field_decode", [`Field` `DECODE` table], <field-decode>),
+      ("field_vm", [`Field` VM], <field-VM>),
+      ("field_vm_decode", [`Field` `DECODE` table], <field-decode>),
     )),
     ("MATHEMATICS", (
       ("limbs_and_carries", [On limb decomposition and carries], <limbs>),
