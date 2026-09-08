@@ -3285,7 +3285,13 @@ fn the_merkle_walk_authenticates_a_real_opening() {
     // root the host actually built. The keccak instrument cannot, and the name
     // moved with the hash rather than outliving it.
     let program = merkle_opening_program(R1F_SHAPE);
-    let artifacts = build_artifacts(&program, &opts);
+    // Built at `WrapHash::production()`, so it emits `Instr::Hash` and must be
+    // proved under the pin's tenant — the classification rule in HASH-PINNING.md.
+    let artifacts = super::registry::build_artifacts_with_hasher(
+        &program,
+        &opts,
+        crate::hash_pin::BLOCK_HASHER,
+    );
     let proved = lfm_prove(&program, &artifacts, &merkle_arenas(opening, *index), &opts)
         .expect("the honest opening must execute and prove");
 
@@ -3336,7 +3342,13 @@ fn tampered_merkle_opening_rejects() {
     // Same production twin as the honest-path test above — a tamper control is
     // only a control over the walk the honest path uses.
     let program = merkle_opening_program(R1F_SHAPE);
-    let artifacts = build_artifacts(&program, &opts);
+    // Built at `WrapHash::production()`, so it emits `Instr::Hash` and must be
+    // proved under the pin's tenant — the classification rule in HASH-PINNING.md.
+    let artifacts = super::registry::build_artifacts_with_hasher(
+        &program,
+        &opts,
+        crate::hash_pin::BLOCK_HASHER,
+    );
     let honest = lfm_prove(&program, &artifacts, &merkle_arenas(opening, *index), &opts)
         .expect("honest prove");
 
@@ -3404,7 +3416,7 @@ fn tampered_merkle_opening_rejects() {
         );
 
         // Incoherent: still claiming the real root.
-        let err = super::executor::execute(&program, &arenas, &super::hash::TestPermutation)
+        let err = super::executor::execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
             .err()
             .unwrap_or_else(|| panic!("{what}: claiming the real root must not execute"));
         println!("R1f tamper {what}: incoherent run rejected with {err:?}");
@@ -3796,7 +3808,12 @@ fn l2g_binding_proves_and_verifies() {
     let opts = options();
     let (epoch, global) = r1g_l2g_roots();
     let program = l2g_binding_program(R1G_EPOCHS);
-    let artifacts = build_artifacts(&program, &opts);
+    // A production() program: proved under the pin's tenant, as above.
+    let artifacts = super::registry::build_artifacts_with_hasher(
+        &program,
+        &opts,
+        crate::hash_pin::BLOCK_HASHER,
+    );
     let proved = lfm_prove(&program, &artifacts, &l2g_arenas(epoch, global), &opts)
         .expect("the honest binding must execute and prove");
 
@@ -3833,7 +3850,12 @@ fn tampered_l2g_binding_rejects() {
     let opts = options();
     let (epoch, global) = r1g_l2g_roots();
     let program = l2g_binding_program(R1G_EPOCHS);
-    let artifacts = build_artifacts(&program, &opts);
+    // A production() program: proved under the pin's tenant, as above.
+    let artifacts = super::registry::build_artifacts_with_hasher(
+        &program,
+        &opts,
+        crate::hash_pin::BLOCK_HASHER,
+    );
     let honest =
         lfm_prove(&program, &artifacts, &l2g_arenas(epoch, global), &opts).expect("honest prove");
 
@@ -3861,7 +3883,7 @@ fn tampered_l2g_binding_rejects() {
             l2g_arenas(&swapped_one_side, global),
         ),
     ] {
-        let err = super::executor::execute(&program, &arenas, &super::hash::TestPermutation)
+        let err = super::executor::execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
             .err()
             .unwrap_or_else(|| panic!("{what}: must not execute"));
         println!("R1g tamper {what}: rejected with {err:?}");
