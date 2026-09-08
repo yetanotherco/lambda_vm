@@ -10,6 +10,7 @@
         ("logup", [`LogUp` argument], <logup>),
         ("memory", [Memory argument], <memory>),
         ("streaming", [Streaming prover], <streaming>),
+        ("verifier", [Verification], <verification>),
     )),
     ("OVERVIEW", (
         ("variables", [Variables], <vars>),
@@ -51,6 +52,11 @@
       ("keccak", [`KECCAK` accelerator], <keccak>),
       ("ecsm", [`ECSM` accelerator], <ecsm>),
       ("fext", [Extension field accelerator], <fext>),
+    )),
+    ("RECURSION", (
+      ("recursion", [Recursive verification], <recursion>),
+      ("field", [`Field` VM], <field-VM>),
+      ("field_decode", [`Field` `DECODE` table], <field-decode>),
     )),
     ("MATHEMATICS", (
       ("limbs_and_carries", [On limb decomposition and carries], <limbs>),
