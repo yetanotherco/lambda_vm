@@ -289,7 +289,7 @@ pub fn compute_witness(k_le: &[u8; 32], xg_le: &[u8; 32]) -> Result<EcsmWitness,
 }
 
 /// Like [`compute_witness`] but with an explicit input `yG` (the caller's full point),
-/// validated on-curve by [`prepare_with_y`]. The affine path uses this so the witnessed
+/// validated on-curve by [`prepare_with_y`]. The full-point path uses this so the witnessed
 /// `yG`/`yR` match the caller's actual point rather than the canonical even lift.
 pub fn compute_witness_with_y(
     k_le: &[u8; 32],

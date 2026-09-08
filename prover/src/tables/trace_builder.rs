@@ -847,12 +847,12 @@ fn collect_ecsm_ops(
     Vec<ecdas::EcdasOperation>,
 ) {
     let t = op.timestamp;
-    let is_affine = op.ecsm_affine;
+    let is_full_point = op.ecsm_full_point;
     let addr_xr = register_state.read(10).0;
     let addr_xg = register_state.read(11).0;
     let addr_k = register_state.read(12).0;
 
-    // Read the operands from memory. x-only reads xG (32B) + k (32B); affine also reads yG
+    // Read the operands from memory. x-only reads xG (32B) + k (32B); the full-point mode also reads yG
     // (the caller's real input y, pinned below by a memory read at T) so the returned point
     // is the caller's actual point — no even-parity convention.
     let mut xg = [0u8; 32];
@@ -860,7 +860,7 @@ fn collect_ecsm_ops(
     let mut k = [0u8; 32];
     for i in 0..32 {
         xg[i] = memory_state.read_byte(addr_xg.wrapping_add(i as u64)).0;
-        if is_affine {
+        if is_full_point {
             yg[i] = memory_state
                 .read_byte(addr_xg.wrapping_add(32 + i as u64))
                 .0;
@@ -868,7 +868,7 @@ fn collect_ecsm_ops(
         k[i] = memory_state.read_byte(addr_k.wrapping_add(i as u64)).0;
     }
 
-    let witness = if is_affine {
+    let witness = if is_full_point {
         ::ecsm::compute_witness_with_y(&k, &xg, &yg)
             .expect("ECSM witness: executor validates 0 < k < N, xG/yG < p, (xG,yG) on curve")
     } else {
@@ -876,8 +876,8 @@ fn collect_ecsm_ops(
             .expect("ECSM witness: executor validates 0 < k < N and xG on curve")
     };
 
-    // 15 ops on the x-only path; the affine path adds 4 yG reads and 4 yR writes.
-    let mut memw_ops = Vec::with_capacity(if is_affine { 23 } else { 15 });
+    // 15 ops on the x-only path; the full-point path adds 4 yG reads and 4 yR writes.
+    let mut memw_ops = Vec::with_capacity(if is_full_point { 23 } else { 15 });
 
     // x11 -> addr_xG (register read at T), x12 -> addr_k (register read at T+1).
     {
@@ -904,10 +904,10 @@ fn collect_ecsm_ops(
         memory_state.write_bytes(addr, dword, 8, t);
     }
 
-    // AFFINE only: yG: 4 doubleword reads at T (addr_xG + 32 + 8i). Pins the witnessed yG to
+    // FULL POINT only: yG: 4 doubleword reads at T (addr_xG + 32 + 8i). Pins the witnessed yG to
     // the caller's input, closing the parity soundness gap. x-only guests pass only xG, so
-    // this block (and the ECSM table's yG-read bus, gated by IS_AFFINE) does not run.
-    if is_affine {
+    // this block (and the ECSM table's yG-read bus, gated by IS_FULL_POINT) does not run.
+    if is_full_point {
         for i in 0..4 {
             let addr = addr_xg.wrapping_add((32 + 8 * i) as u64);
             let mut value = [0u32; 8];
@@ -976,10 +976,10 @@ fn collect_ecsm_ops(
         memory_state.write_bytes(addr, dword, 8, t + 2);
     }
 
-    // AFFINE only: yR writes at T + 3 (4 doublewords at addr_xR + 32 + 8i). Matches the
-    // ecsm.rs YR sender block (gated by IS_AFFINE); the executor wrote yR to addr_xR + 32.
+    // FULL POINT only: yR writes at T + 3 (4 doublewords at addr_xR + 32 + 8i). Matches the
+    // ecsm.rs YR sender block (gated by IS_FULL_POINT); the executor wrote yR to addr_xR + 32.
     // x-only guests get only xR written back.
-    if is_affine {
+    if is_full_point {
         for i in 0..4 {
             let addr = addr_xr.wrapping_add((32 + 8 * i) as u64);
             let mut value = [0u32; 8];
@@ -1007,7 +1007,7 @@ fn collect_ecsm_ops(
         addr_xg,
         addr_k,
         addr_xr,
-        is_affine,
+        is_full_point,
         witness,
     };
 
@@ -3235,11 +3235,11 @@ fn build_traces<I: ImageSource + Sync>(
         ]
     }));
     // ECSM range-checks: each operand's low address limb < the executor's addr_limb_ok
-    // bound (32-byte operands 2^32-31, the affine variant's 64-byte xG‖yG / xR‖yR
+    // bound (32-byte operands 2^32-31, the full-point variant's 64-byte xG‖yG / xR‖yR
     // 2^32-63), matching EcsmAddressOverflow. Three LT ops per ECSM call; the ECSM table
-    // sends the matching ALU LT interactions with the bound linear in IS_AFFINE.
+    // sends the matching ALU LT interactions with the bound linear in IS_FULL_POINT.
     lt_ops.extend(ecsm_ops.iter().flat_map(|op| {
-        let operand_bound = if op.is_affine {
+        let operand_bound = if op.is_full_point {
             ecsm::ADDR_LIMB_BOUND_64B
         } else {
             ecsm::ADDR_LIMB_BOUND_32B

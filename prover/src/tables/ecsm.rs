@@ -6,17 +6,17 @@
 //! serves the scalar bits directly via the `Bit` bus, and delegates the double-and-add to ECDAS
 //! over the `Ecdas`/`Bit` buses.
 //!
-//! ## Two modes (`IS_AFFINE` selector)
-//! The chip serves both ecall variants with one prover, selected by the `IS_AFFINE` column:
+//! ## Two modes (`IS_FULL_POINT` selector)
+//! The chip serves both ecall variants with one prover, selected by the `IS_FULL_POINT` column:
 //! - **x-only** (`ECSM_SYSCALL_NUMBER`): input `xG` (32B), output `xR` (32B). `yG` is the
 //!   canonical even lift (not read from memory), `yR` is witnessed only for ECDAS.
-//! - **affine** (`ECSM_AFFINE_SYSCALL_NUMBER`): input `xG‖yG` (64B), output `xR‖yR` (64B);
-//!   the yG-read and yR-write MEMW buses fire with `mult = IS_AFFINE`.
+//! - **full-point** (`ECSM_FULL_POINT_SYSCALL_NUMBER`): input `xG‖yG` (64B), output `xR‖yR` (64B);
+//!   the yG-read and yR-write MEMW buses fire with `mult = IS_FULL_POINT`.
 //!
-//! `IS_AFFINE` is pinned to the actual ecall number by the `Ecall` receiver, so it can't be
+//! `IS_FULL_POINT` is pinned to the actual ecall number by the `Ecall` receiver, so it can't be
 //! forged (see `bus_interactions`).
 //!
-//! The affine `yG` is pinned to the caller's bytes but NOT range-checked: `OverflowKind` has
+//! The full-point `yG` is pinned to the caller's bytes but NOT range-checked: `OverflowKind` has
 //! no `YgLtP`, and every relation on `yG` is a congruence mod `p`, so a non-canonical encoding
 //! is accepted here and rejected by the executor (see `formal_verification/ecsm-affine`, A3g).
 //!
@@ -29,7 +29,7 @@
 //! relation has no standalone constant and also closes at all-zero. The range checks /
 //! virtual-carry checks remain µ-gated as before.
 
-use executor::vm::instruction::execution::{ECSM_AFFINE_SYSCALL_NUMBER, ECSM_SYSCALL_NUMBER};
+use executor::vm::instruction::execution::{ECSM_FULL_POINT_SYSCALL_NUMBER, ECSM_SYSCALL_NUMBER};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
@@ -46,7 +46,7 @@ pub(crate) const CARRY_OFFSET_YG: i64 = 16319;
 /// `addr_limb_ok(addr, 31)`: `(addr % 2^32) + 31 < 2^32`.
 pub const ADDR_LIMB_BOUND_32B: u64 = (1 << 32) - 31;
 
-/// Same, for the affine variant's **64-byte** operands (`xG‖yG`, `xR‖yR`), which reach
+/// Same, for the full-point variant's **64-byte** operands (`xG‖yG`, `xR‖yR`), which reach
 /// offset +63. Mirrors `addr_limb_ok(addr, 63)`.
 pub const ADDR_LIMB_BOUND_64B: u64 = (1 << 32) - 63;
 
@@ -79,9 +79,9 @@ pub mod cols {
     pub const K_SUB_N: usize = 634; // U256HL (16 halfwords)
     pub const XR_SUB_P: usize = 650; // U256HL (16 halfwords)
     pub const MU: usize = 666;
-    /// Mode selector: 1 = affine ecall (read yG, write yR), 0 = x-only / padding.
+    /// Mode selector: 1 = full-point ecall (read yG, write yR), 0 = x-only / padding.
     /// Pinned to the actual ecall number by the `Ecall` receiver (see `bus_interactions`).
-    pub const IS_AFFINE: usize = 667;
+    pub const IS_FULL_POINT: usize = 667;
     /// `(yR - p) mod 2^256`, the addend that forces `yR < p` (see `OverflowKind::YrLtP`).
     pub const YR_SUB_P: usize = 668; // U256HL (16 halfwords)
 
@@ -153,9 +153,9 @@ pub struct EcsmOperation {
     pub addr_xg: u64,
     pub addr_k: u64,
     pub addr_xr: u64,
-    /// Affine variant (full point in/out): drives the `IS_AFFINE` column and the
+    /// Full-point variant (full point in/out): drives the `IS_FULL_POINT` column and the
     /// yG-read / yR-write memory ops. `false` for the x-only variant.
-    pub is_affine: bool,
+    pub is_full_point: bool,
     pub witness: EcsmWitness,
 }
 
@@ -226,8 +226,8 @@ pub fn generate_ecsm_trace(
         }
 
         table.set_fe(row_idx, cols::MU, FE::one());
-        if op.is_affine {
-            table.set_fe(row_idx, cols::IS_AFFINE, FE::one());
+        if op.is_full_point {
+            table.set_fe(row_idx, cols::IS_FULL_POINT, FE::one());
         }
     }
 
@@ -338,31 +338,31 @@ fn k_dword_busvalues(dword_idx: usize) -> [BusValue; 8] {
 
 pub fn bus_interactions() -> Vec<BusInteraction> {
     let mu = || Multiplicity::Column(cols::MU);
-    // Affine-only multiplicity: fires only when IS_AFFINE = 1 (never on x-only or padding
-    // rows, where IS_AFFINE is constrained to 0). Used for the yG-read / yR-write buses.
-    let affine = || Multiplicity::Column(cols::IS_AFFINE);
+    // Full-point-only multiplicity: fires only when IS_FULL_POINT = 1 (never on x-only or padding
+    // rows, where IS_FULL_POINT is constrained to 0). Used for the yG-read / yR-write buses.
+    let full_point = || Multiplicity::Column(cols::IS_FULL_POINT);
     let ts_lo = || packed(cols::TIMESTAMP_0);
     let ts_hi = || packed(cols::TIMESTAMP_1);
     let mut out = Vec::new();
 
     // ECALL receiver (mult = mu): [ts_lo, ts_hi, syscall_lo32, syscall_hi32].
     //
-    // The received syscall number is LINEAR in IS_AFFINE:
-    //   syscall = xonly + IS_AFFINE·(affine − xonly).
-    // The CPU sends the *actual* a7 (rv1) on the `Ecall` bus, so this pins IS_AFFINE to the
-    // real ecall variant — a prover that flips IS_AFFINE without changing the guest's ecall
+    // The received syscall number is LINEAR in IS_FULL_POINT:
+    //   syscall = xonly + IS_FULL_POINT·(full_point − xonly).
+    // The CPU sends the *actual* a7 (rv1) on the `Ecall` bus, so this pins IS_FULL_POINT to the
+    // real ecall variant — a prover that flips IS_FULL_POINT without changing the guest's ecall
     // number makes the bus fingerprint mismatch and the LogUp argument fail. This is the
-    // soundness anchor that lets the yG-read / yR-write buses key off IS_AFFINE below.
+    // soundness anchor that lets the yG-read / yR-write buses key off IS_FULL_POINT below.
     let xonly_lo = (ECSM_SYSCALL_NUMBER & 0xFFFF_FFFF) as i64;
     let xonly_hi = (ECSM_SYSCALL_NUMBER >> 32) as i64;
-    let affine_lo = (ECSM_AFFINE_SYSCALL_NUMBER & 0xFFFF_FFFF) as i64;
-    let affine_hi = (ECSM_AFFINE_SYSCALL_NUMBER >> 32) as i64;
-    let syscall_word = |xonly: i64, affine: i64| {
+    let full_point_lo = (ECSM_FULL_POINT_SYSCALL_NUMBER & 0xFFFF_FFFF) as i64;
+    let full_point_hi = (ECSM_FULL_POINT_SYSCALL_NUMBER >> 32) as i64;
+    let syscall_word = |xonly: i64, full_point: i64| {
         BusValue::linear(vec![
             LinearTerm::Constant(xonly),
             LinearTerm::Column {
-                coefficient: affine - xonly,
-                column: cols::IS_AFFINE,
+                coefficient: full_point - xonly,
+                column: cols::IS_FULL_POINT,
             },
         ])
     };
@@ -372,8 +372,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         vec![
             ts_lo(),
             ts_hi(),
-            syscall_word(xonly_lo, affine_lo),
-            syscall_word(xonly_hi, affine_hi),
+            syscall_word(xonly_lo, full_point_lo),
+            syscall_word(xonly_hi, full_point_hi),
         ],
     ));
 
@@ -391,16 +391,16 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // rejects with `EcsmAddressOverflow` — a provable execution the VM halts on. This is
     // the same gap `hint.rs` closes for the Hint ecall; see `ADDR_LIMB_BOUND_32B`.
     //
-    // xG and xR are 32-byte operands on the x-only path and 64-byte on the affine path,
-    // so their bound is linear in IS_AFFINE: `2^32 - 31 - 32·IS_AFFINE`. A flat 64-byte
+    // xG and xR are 32-byte operands on the x-only path and 64-byte on the full-point path,
+    // so their bound is linear in IS_FULL_POINT: `2^32 - 31 - 32·IS_FULL_POINT`. A flat 64-byte
     // bound would reject legal x-only addresses (a completeness bug); a flat 32-byte one
-    // would leave the affine band open. k is 32 bytes in both modes.
+    // would leave the full-point band open. k is 32 bytes in both modes.
     let addr_bound_by_mode = || {
         BusValue::linear(vec![
             LinearTerm::Constant(ADDR_LIMB_BOUND_32B as i64),
             LinearTerm::Column {
                 coefficient: ADDR_LIMB_BOUND_64B as i64 - ADDR_LIMB_BOUND_32B as i64,
-                column: cols::IS_AFFINE,
+                column: cols::IS_FULL_POINT,
             },
         ])
     };
@@ -465,12 +465,12 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             ),
         ));
     }
-    // AFFINE (mult = IS_AFFINE): read yG: 4 doublewords at addr_xG + 32 + 8i (ts). Pins the
+    // FULL POINT (mult = IS_FULL_POINT): read yG: 4 doublewords at addr_xG + 32 + 8i (ts). Pins the
     // witnessed yG (col YG) to the caller's input point, so the returned yR corresponds to
-    // the caller's actual (xG, yG) — closes the parity soundness gap. Fires only on affine
+    // the caller's actual (xG, yG) — closes the parity soundness gap. Fires only on full-point
     // rows; x-only guests pass a 32-byte xG (no yG in memory), so these must not fire there.
     // The high limb is reused unchanged, which is sound because the ALU LT sender above
-    // range-checks ADDR_XG_0 against the affine 64-byte bound, so the +63 span cannot
+    // range-checks ADDR_XG_0 against the full-point 64-byte bound, so the +63 span cannot
     // cross the 2^32 limb boundary in an accepted trace.
     for i in 0..4 {
         let base_lo = BusValue::linear(vec![
@@ -482,7 +482,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ]);
         out.push(BusInteraction::sender(
             BusId::Memw,
-            affine(),
+            full_point(),
             memw_read(
                 dword_bytes(cols::YG, i),
                 0,
@@ -584,10 +584,10 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ));
     }
 
-    // AFFINE (mult = IS_AFFINE): write yR as 4 doublewords at addr_xR + 32 + 8i (ts + 3).
+    // FULL POINT (mult = IS_FULL_POINT): write yR as 4 doublewords at addr_xR + 32 + 8i (ts + 3).
     // Reuses the ADDR_XR register (output buffer is the contiguous 64-byte [xR‖yR]); no new
     // column or register read. yR (col YR) is the ECDAS-constrained y of k·(xG, yG). Fires
-    // only on affine rows; x-only guests get only xR written back. ts + 3 is the free 4th
+    // only on full-point rows; x-only guests get only xR written back. ts + 3 is the free 4th
     // sub-timestamp (instruction stride is 4; xG@T, k@T+1, xR@T+2 use the first three).
     for i in 0..4 {
         let base_lo = BusValue::linear(vec![
@@ -599,7 +599,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ]);
         out.push(BusInteraction::sender(
             BusId::Memw,
-            affine(),
+            full_point(),
             memw_write(
                 dword_bytes(cols::YR, i),
                 base_lo,
@@ -868,8 +868,8 @@ impl OverflowKind {
 //   412      : OverflowRequired(XrLtP)
 //   413..420 : CarryBit(YrLtP, 0..7)
 //   420      : OverflowRequired(YrLtP)
-//   421      : IS_BIT(IS_AFFINE)
-//   422      : AffineZeroOnPadding — IS_AFFINE·(1−µ)
+//   421      : IS_BIT(IS_FULL_POINT)
+//   422      : FullPointZeroOnPadding — IS_FULL_POINT·(1−µ)
 
 use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
@@ -1086,18 +1086,18 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for EcsmConstraints {
             idx += 1;
         }
 
-        // idx 421: IS_BIT(IS_AFFINE): a·(1−a). The mode selector is a bit. (deg 2)
-        let is_affine = b.main(0, cols::IS_AFFINE);
+        // idx 421: IS_BIT(IS_FULL_POINT): a·(1−a). The mode selector is a bit. (deg 2)
+        let is_full_point = b.main(0, cols::IS_FULL_POINT);
         let one = b.one();
-        b.emit_base(idx, is_affine.clone() * (one - is_affine));
+        b.emit_base(idx, is_full_point.clone() * (one - is_full_point));
         idx += 1;
 
-        // idx 422: AffineZeroOnPadding: IS_AFFINE·(1−µ). Forces IS_AFFINE = 0 on padding
-        // rows (µ=0), so the affine-gated yG-read / yR-write buses can't fire there. (deg 2)
-        let is_affine = b.main(0, cols::IS_AFFINE);
+        // idx 422: FullPointZeroOnPadding: IS_FULL_POINT·(1−µ). Forces IS_FULL_POINT = 0 on padding
+        // rows (µ=0), so the full-point-gated yG-read / yR-write buses can't fire there. (deg 2)
+        let is_full_point = b.main(0, cols::IS_FULL_POINT);
         let mu = b.main(0, cols::MU);
         let one = b.one();
-        b.emit_base(idx, is_affine * (one - mu));
+        b.emit_base(idx, is_full_point * (one - mu));
         idx += 1;
 
         debug_assert_eq!(idx, 423);

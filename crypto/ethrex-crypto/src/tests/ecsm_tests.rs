@@ -4,7 +4,7 @@
 
 use crate::*;
 
-/// Software stand-in for the affine ECSM precompile: form the curve point `(x, y)` from
+/// Software stand-in for the full-point ECSM precompile: form the curve point `(x, y)` from
 /// the caller's actual coordinates and return `(xR, yR)` of `k·(x, y)`. No parity
 /// convention — the real ecall receives the full input point too.
 fn soft_oracle(
@@ -54,7 +54,7 @@ fn matches_software_lincomb_on_recovery_shape() {
 #[test]
 fn edge_scalars_fall_back() {
     // Only k=0 falls back. The old x-only path also rejected k=1 and k=n−1 (the
-    // (k+1)·P query wrapped); the affine oracle makes no such query, so those
+    // (k+1)·P query wrapped); the full-point oracle makes no such query, so those
     // scalars reconstruct normally.
     let p1 = g_times(3);
     let p2 = g_times(5);
@@ -70,7 +70,7 @@ fn edge_scalars_fall_back() {
     for good in [Scalar::ONE, -Scalar::ONE] {
         let expected = ProjectivePoint::lincomb(&p1, &good, &p2, &ok);
         let got = lincomb2_with_oracle(&p1.to_affine(), &good, &p2.to_affine(), &ok, soft_oracle)
-            .expect("k=1 / k=n−1 are valid for the affine oracle");
+            .expect("k=1 / k=n−1 are valid for the full-point oracle");
         assert_eq!(got, expected.to_affine());
     }
 }
@@ -95,7 +95,7 @@ fn cancelling_and_doubling_terms_fall_back() {
 
 #[test]
 fn k_half_n_minus_1_reconstructs_correctly() {
-    // k = (n-1)/2 was a special case for the old x-only path; with the affine
+    // k = (n-1)/2 was a special case for the old x-only path; with the full-point
     // oracle it is an ordinary scalar and must reconstruct correctly.
     let two_inv = Scalar::from(2u64)
         .invert_vartime()
@@ -132,7 +132,7 @@ fn cross_point_cancellation_falls_back() {
 
 #[test]
 fn odd_y_base_point_reconstructs_correctly() {
-    // A base point with odd y needs no special handling: the affine oracle receives the
+    // A base point with odd y needs no special handling: the full-point oracle receives the
     // caller's actual y and returns the actual k·P, so there is no even-y convention to
     // undo. Pins that, by checking the result against ProjectivePoint::lincomb.
     let (p1, _k_gen) = (2u64..200)

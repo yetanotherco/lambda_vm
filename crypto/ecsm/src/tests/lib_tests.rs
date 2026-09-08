@@ -140,14 +140,14 @@ fn rejects_non_canonical_xg() {
     );
 }
 
-/// The affine path must use the caller's `yG`, not the canonical even lift.
+/// The full-point path must use the caller's `yG`, not the canonical even lift.
 ///
 /// This is the one property that distinguishes `prepare_with_y` from `prepare`, and every
-/// other affine test in the tree feeds the generator's `Gy`, which *is* the even lift — so
+/// other full-point test in the tree feeds the generator's `Gy`, which *is* the even lift — so
 /// they cannot observe the difference. Negating the input point must negate the output:
 /// `k·(xG, p − yG) = −(k·(xG, yG))`, i.e. same `xR`, and `yR' = p − yR`.
 #[test]
-fn affine_uses_the_callers_y_not_the_canonical_lift() {
+fn full_point_uses_the_callers_y_not_the_canonical_lift() {
     let gy = be_hex(GY_HEX);
     assert_eq!(&gy % 2u8, BigUint::from(0u8), "Gy is the even lift");
     let odd_gy = p() - &gy;
@@ -174,7 +174,7 @@ fn affine_uses_the_callers_y_not_the_canonical_lift() {
 /// `yG` must be rejected when it is not the y of the given `xG`, and when it is
 /// non-canonical. Complements the x-only `rejects_non_canonical_xg`.
 #[test]
-fn affine_rejects_bad_y() {
+fn full_point_rejects_bad_y() {
     let k = to_le_32(&BigUint::from(5u8));
     let xg = to_le_32(&gx());
     let gy = be_hex(GY_HEX);

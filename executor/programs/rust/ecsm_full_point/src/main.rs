@@ -1,8 +1,8 @@
 use lambda_vm_syscalls as syscalls;
 
-/// Computes 5·G on secp256k1 via the **affine** ECSM precompile (`ecsm_mul_affine`) and
-/// commits the 64-byte result point `xR‖yR` as public output. Exercises the affine ecall
-/// end-to-end (IS_AFFINE=1: yG read from memory, yR written back).
+/// Computes 5·G on secp256k1 via the **full-point** ECSM precompile (`ecsm_mul_full_point`) and
+/// commits the 64-byte result point `xR‖yR` as public output. Exercises the full-point ecall
+/// end-to-end (IS_FULL_POINT=1: yG read from memory, yR written back).
 pub fn main() {
     // secp256k1 generator (Gx, Gy), big-endian then reversed to little-endian.
     let mut gx: [u8; 32] = [
@@ -27,6 +27,6 @@ pub fn main() {
     k[0] = 5;
 
     let mut out = [0u8; 64];
-    syscalls::syscalls::ecsm_mul_affine(&mut out, &input, &k);
+    syscalls::syscalls::ecsm_mul_full_point(&mut out, &input, &k);
     syscalls::syscalls::commit(&out);
 }

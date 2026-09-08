@@ -22,9 +22,9 @@ pub struct AffinePoint {
 /// only caller: it writes back just `xR`, and `k·P` and `k·(-P)` share an x-coordinate, so
 /// the parity never escapes the chip and the AIR need not constrain it.
 ///
-/// The affine path does not use this function — it takes `yG` from the caller (see
+/// The full-point path does not use this function — it takes `yG` from the caller (see
 /// `prepare_with_y`), because there `yR` *is* returned and the parity is observable. There
-/// the AIR pins `yG` to the caller's input buffer with an `IS_AFFINE`-gated memory read
+/// the AIR pins `yG` to the caller's input buffer with an `IS_FULL_POINT`-gated memory read
 /// rather than leaving the root to the witness.
 ///
 /// Returns `None` when `x` is not a valid curve x-coordinate (`x^3 + b` is not a quadratic
@@ -162,9 +162,9 @@ pub fn scalar_mul_affine_x(k: &BigUint, g: &AffinePoint) -> BigUint {
     scalar_mul_affine(k, g).x
 }
 
-/// Executor fast path: the full affine point `k·g`, so the `ecsm_mul_affine` syscall can
+/// Executor fast path: the full affine point `k·g`, so the `ecsm_mul_full_point` syscall can
 /// hand `y` back to the guest. `g` is whatever point the caller prepared — the even-`y` lift
-/// of `xG` on the x-only path, the caller's own input point on the affine one — and `k·g`'s
+/// of `xG` on the x-only path, the caller's own input point on the full-point one — and `k·g`'s
 /// y matches the ECDAS-constrained `y_r` either way.
 pub fn scalar_mul_affine(k: &BigUint, g: &AffinePoint) -> AffinePoint {
     let scalar = Option::<Scalar>::from(Scalar::from_repr(be32(k).into()))
