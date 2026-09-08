@@ -110,6 +110,12 @@ pub enum ProvingError {
     /// `WrongParameter` because the cause is internal prover machinery, not a
     /// caller-supplied parameter. Carries the underlying `FFTError`'s message.
     Fft(String),
+    /// The device path is the production path and it was unavailable for a
+    /// table after its device-side recovery ran: a resident aux LDE that
+    /// declined again after the drain-and-retry. Host RAM is a cache, not a
+    /// compute path, so there is no host arm to continue on; the message names
+    /// the table, the shape and the live device posture.
+    DevicePath(String),
 }
 
 impl From<FFTError> for ProvingError {
@@ -718,23 +724,6 @@ pub fn storage_estimate_parallelism() -> usize {
     }
 }
 
-/// Heuristic peak device bytes for one table: co-resident LDE columns plus the
-/// resident Merkle trees, with a scratch factor for NTT and leaf transients. A
-/// deliberate over estimate for a safety ceiling, not a precise allocator. Pass
-/// aux_cols == 0 when the aux LDE is not yet resident (R1 main commit).
-fn estimate_table_vram_bytes(main_cols: usize, aux_cols: usize, lde_size: usize) -> u64 {
-    const BYTES_PER_BASE: u64 = 8;
-    const EXT3_BYTES: u64 = 24;
-    const SCRATCH_FACTOR: u64 = 2;
-    const RESIDENT_TREE_BYTES_PER_LDE: u64 = 256;
-    let lde = lde_size as u64;
-    let per_row = (main_cols as u64).saturating_mul(BYTES_PER_BASE)
-        + (aux_cols as u64).saturating_mul(EXT3_BYTES);
-    let lde_term = lde.saturating_mul(per_row).saturating_mul(SCRATCH_FACTOR);
-    let tree_term = lde.saturating_mul(RESIDENT_TREE_BYTES_PER_LDE);
-    lde_term.saturating_add(tree_term)
-}
-
 /// Byte-budget admission gate for concurrently proven tables. `acquire`
 /// blocks until the requested bytes fit under the budget, releasing on
 /// permit drop. An oversized request is admitted alone (when nothing else
@@ -785,15 +774,18 @@ impl Drop for VramPermit<'_> {
 }
 
 /// Run `task` once per table index on `workers` OS driver threads, admitting
-/// each index through `gate` with its estimated bytes. `order` fixes the
-/// start order (heaviest table first, so the long pole starts early and small
-/// tables fill around it — the fixed chunks this replaces made every table
-/// wait for the slowest of its chunk). Returns one slot per original index.
+/// each index through `gate` with its estimated bytes. The two array arguments
+/// are deliberately independent: `estimates` is what the gate spends (the
+/// device set, `crate::device_set`), while `order` is the caller's walk — a
+/// scheduling policy keyed on [`table_walk_weight`], heaviest first, so the
+/// long pole starts early and small tables fill around it. Returns one slot
+/// per original index.
 fn run_admitted<T: Send>(
     order: &[usize],
     estimates: &[u64],
     gate: &VramGate,
     workers: usize,
+    label: impl Fn(usize) -> String + Sync,
     task: impl Fn(usize) -> T + Sync,
 ) -> Vec<Option<T>> {
     let results: Vec<std::sync::Mutex<Option<T>>> = estimates
@@ -849,6 +841,9 @@ fn run_admitted<T: Send>(
                     match out {
                         Ok(v) => *results[idx].lock().unwrap() = Some(v),
                         Err(payload) => {
+                            // The worker's message names the stage and the
+                            // shape; the driver knows which table it was.
+                            let payload = name_panic_payload(payload, &label(idx));
                             let mut slot = first_panic.lock().unwrap_or_else(|e| e.into_inner());
                             if slot.is_none() {
                                 *slot = Some(payload);
@@ -875,11 +870,112 @@ fn run_admitted<T: Send>(
         .collect()
 }
 
-/// Table indices sorted heaviest-first by estimate.
-fn heaviest_first(estimates: &[u64]) -> Vec<usize> {
-    let mut order: Vec<usize> = (0..estimates.len()).collect();
-    order.sort_by_key(|&i| std::cmp::Reverse(estimates[i]));
+/// Prefix a string panic payload with the table's name so the re-raised
+/// message says which table failed; a payload that is not a string is passed
+/// through unchanged.
+fn name_panic_payload(
+    payload: Box<dyn std::any::Any + Send>,
+    table: &str,
+) -> Box<dyn std::any::Any + Send> {
+    let message = payload.downcast_ref::<String>().cloned().or_else(|| {
+        payload
+            .downcast_ref::<&'static str>()
+            .map(|m| (*m).to_string())
+    });
+    match message {
+        Some(m) => Box::new(format!("table {table}: {m}")),
+        None => payload,
+    }
+}
+
+/// The sort weight for the table walk. A SCHEDULING policy, not a size model —
+/// see [`crate::device_set`] for the bytes anything is admitted against.
+///
+/// The walk is the order the per-table drivers *start* tables in. At
+/// `TABLE_PARALLELISM=1` it cannot change what is resident on the device (one
+/// table at a time, the gate never blocks). What it does change is the order
+/// the host allocator sees the per-table arenas in. Measured on the q=20 wrap
+/// (2^22, blowup 4, RTX 5090 box, 2026-09-07/08), `/usr/bin/time -v` max RSS,
+/// proof bytes identical on every row:
+///
+/// | walk | build | `MALLOC_MMAP_THRESHOLD_` | max RSS |
+/// |------|-------|--------------------------|---------|
+/// | this weight | pre-#964 tip | default | 47,307,284 kB = 45.1 GiB |
+/// | this weight | diagnostic, device-set gate | default | 47,365,192 kB = 45.2 GiB |
+/// | this weight | this one | default | 53,456,648 kB = 51.0 GiB |
+/// | the device-set model's order | this one | default | 53,472,980 kB = 51.0 GiB |
+/// | a fused-phase host-transient order | this one | default | 53,453,344 kB = 51.0 GiB |
+/// | this weight | this one | 1 MiB | 46,053,164 kB = 43.9 GiB |
+/// | this weight | pre-#964 tip | 1 MiB | 46,054,788 kB = 43.9 GiB |
+///
+/// Read the first three rows together: the SAME order measures 45.2 GiB in one
+/// build and 51.0 GiB in this one. **The order is a correlate, not a cause.**
+/// The mechanism is glibc arena retention — the test harness installs no
+/// `#[global_allocator]`, and a freed multi-gibibyte buffer is returned to the
+/// OS only when the arena top can be trimmed, which depends on what was
+/// allocated above it. The walk order is one input to that layout; the
+/// allocations made around it are another. The last two rows settle what is
+/// being measured: forcing every allocation of a megabyte or more to be mapped
+/// and unmapped directly collapses a 5.9 GiB spread to 1.6 MB, so none of it
+/// was ever working set. (At q=41 the orders are indistinguishable, 98.5
+/// against 98.6 GiB.)
+///
+/// ⇒ **The durable fix is the allocator, not this weight.** Setting
+/// `MALLOC_MMAP_THRESHOLD_` for the harness removes the effect outright and
+/// takes 1.2 GiB off the good arm too. It is not free: leaving the retentive
+/// state costs ~2.5% prove time (136.4 → 140.2 s here, while a build already
+/// out of it goes 140.3 → 140.1 s), so the time follows the retention state
+/// rather than the order. Until that lands, this order is kept because it is
+/// the one the prover had before #964 — not because reordering is a lever, as
+/// nothing in this file controls the layout that decides the number.
+///
+/// Its arithmetic is inherited verbatim from the VRAM estimate the prover
+/// sorted by before the device-set model, and it is deliberately NOT re-read as
+/// a byte count: the factor of two assumed the second LDE buffer that #956's
+/// in-place transpose removed, and the flat 256 B per LDE row stands in for a
+/// tree whose real width depends on the digest. Changing these numbers changes
+/// the schedule, so any change needs a wrap measurement, not an argument about
+/// bytes.
+///
+/// Pass `aux_cols == 0` for the R1 main-commit walk and the AIR's aux width for
+/// the fused rounds walk: the two phases weigh the tables differently, and they
+/// always have.
+fn table_walk_weight(main_cols: usize, aux_cols: usize, lde_size: usize) -> u64 {
+    const BASE_WEIGHT: u64 = 8;
+    const EXT3_WEIGHT: u64 = 24;
+    const WIDTH_WEIGHT: u64 = 2;
+    const PER_LDE_ROW_WEIGHT: u64 = 256;
+    let lde = lde_size as u64;
+    let per_row = (main_cols as u64).saturating_mul(BASE_WEIGHT)
+        + (aux_cols as u64).saturating_mul(EXT3_WEIGHT);
+    let width_term = lde.saturating_mul(per_row).saturating_mul(WIDTH_WEIGHT);
+    let row_term = lde.saturating_mul(PER_LDE_ROW_WEIGHT);
+    width_term.saturating_add(row_term)
+}
+
+/// Table indices sorted heaviest-first by weight. `sort_by_key` is stable, so
+/// tables that weigh the same keep their registry order.
+fn heaviest_first(weights: &[u64]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..weights.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(weights[i]));
     order
+}
+
+/// One line naming the walk a phase took, heaviest first. Printed once per
+/// phase per prove: the walk is a measured choice (see [`table_walk_weight`]),
+/// so a run that moves host peak has to be able to say which order it took.
+fn describe_walk(order: &[usize], weights: &[u64], names: &[String]) -> String {
+    order
+        .iter()
+        .map(|&i| {
+            format!(
+                "{}={:.2}GiB",
+                names[i],
+                weights[i] as f64 / (1u64 << 30) as f64
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// A container for the results of the second round of the STARK Prove protocol.
@@ -1247,8 +1343,10 @@ pub trait IsStarkProver<
     /// `precomputed`: if present, the leading `num_cols` columns are committed
     /// as a separate Merkle tree (the precomputed split for preprocessed
     /// tables) and the root is checked against the AIR-hardcoded commitment.
+    /// `table` is the AIR's name, for the device diagnostics.
     #[allow(clippy::type_complexity)]
     fn commit_main_trace(
+        #[cfg_attr(not(feature = "cuda"), allow(unused_variables))] table: &str,
         trace: &TraceTable<Field, FieldExtension>,
         domain: &Domain<Field>,
         twiddles: &LdeTwiddles<Field>,
@@ -1285,6 +1383,7 @@ pub trait IsStarkProver<
                     Field,
                     H::Batched<Field>,
                 >(
+                    table,
                     trace_slice,
                     trace.main_rowmajor_dev(),
                     n,
@@ -1350,6 +1449,7 @@ pub trait IsStarkProver<
                     Field,
                     H::Batched<Field>,
                 >(
+                    table,
                     trace_slice,
                     trace.main_rowmajor_dev(),
                     n,
@@ -2041,14 +2141,17 @@ pub trait IsStarkProver<
         // Every arm below runs the HOST evaluator, which reads `get_main` /
         // `get_aux`. Under device-only those buffers are intentionally empty,
         // so landing here means the device decompose AND the `H` download both
-        // failed. The gate is a static predicate and cannot mirror every
-        // dynamic decline, so recover rather than abort: download the resident
-        // LDEs into the host buffers (which also clears the device-only flag)
-        // and let the host arms run — slower for this table, never wrong. The
-        // assert is left for the case where the handles themselves cannot
-        // serve the data, so that failure carries the device-only contract's
-        // message rather than a bare index-out-of-bounds from somewhere inside
-        // the evaluator.
+        // failed. In production that is the failure to report — host RAM is a
+        // cache, not a compute path — and `materialize_lde_trace_host` aborts
+        // with the shape and the live VRAM before returning. Only under the
+        // test-only host fallback (`LAMBDA_VM_TEST_ONLY_HOST_FALLBACK`, the
+        // `LAMBDA_VM_GPU_FORCE_DOWNGRADE` hook or the `test-cuda-faults`
+        // feature) does it download the resident LDEs into the host buffers
+        // (clearing the device-only flag) and let the host arms run; the
+        // `gpu_force_downgrade` binary asserts on exactly that. The assert is
+        // left for the case where the handles themselves cannot serve the data,
+        // so that failure carries the device-only contract's message rather
+        // than a bare index-out-of-bounds from somewhere inside the evaluator.
         #[cfg(feature = "cuda")]
         if precomputed_parts.is_none() && lde_trace.host_trace_empty() {
             let recovered = crate::gpu_lde::materialize_lde_trace_host(lde_trace);
@@ -3689,16 +3792,58 @@ pub trait IsStarkProver<
 
         let vram_gate = VramGate::new(vram_budget);
 
-        // R1 main commit: only the main LDE and its Merkle scratch are resident,
-        // so the aux columns add nothing to this phase's working set.
-        let main_estimates: Vec<u64> = air_trace_pairs
+        // The shapes the AIR and the domain fix, read once: the device-set
+        // estimates the gate admits against derive from them
+        // (`crate::device_set`). The walk order does NOT — see
+        // `table_walk_weight`.
+        let table_shapes: Vec<crate::device_set::TableShape> = air_trace_pairs
             .iter()
             .enumerate()
-            .map(|(idx, (_, trace, _))| {
-                let lde_size = domains[idx].interpolation_domain_size * domains[idx].blowup_factor;
-                estimate_table_vram_bytes(trace.num_main_columns, 0, lde_size)
+            .map(|(idx, (air, trace, _))| {
+                let domain = &domains[idx];
+                let n = domain.interpolation_domain_size;
+                let (_, aux_cols) = air.trace_layout();
+                crate::device_set::TableShape {
+                    n,
+                    blowup: domain.blowup_factor,
+                    main_cols: trace.num_main_columns,
+                    aux_cols,
+                    num_parts: air.composition_poly_degree_bound(n) / n,
+                    num_eval_points: air.context().transition_offsets.len() * air.step_size(),
+                }
             })
             .collect();
+
+        // R1 main commit: the fused commit's device set — one LDE buffer, the
+        // trace snapshot, the tree and the scratch — the same model the
+        // dispatch layer admits the commit against.
+        let main_estimates: Vec<u64> = table_shapes
+            .iter()
+            .map(|s| crate::device_set::commit_device_set(s.n, s.main_cols, s.blowup, true).total())
+            .collect();
+
+        // The AIR names, for the driver threads' panic payloads: a device abort
+        // names its stage and shape, the driver adds which table.
+        let table_names: Vec<String> = air_trace_pairs
+            .iter()
+            .map(|(air, _, _)| air.name().to_string())
+            .collect();
+
+        // The R1 walk: the main commit's weight, aux width zero because the aux
+        // columns are not resident yet in this phase. Keyed on
+        // `table_walk_weight`, NOT on `main_estimates` — the estimates above
+        // are what the gate spends, this is the schedule, and the two are no
+        // longer the same function. The weight's doc carries the measurement
+        // that makes this the order rather than any other.
+        let main_walk_weights: Vec<u64> = table_shapes
+            .iter()
+            .map(|s| table_walk_weight(s.main_cols, 0, s.n * s.blowup))
+            .collect();
+        let main_walk_order = heaviest_first(&main_walk_weights);
+        eprintln!(
+            "[prover] table walk R1 (walk weight, largest first): {}",
+            describe_walk(&main_walk_order, &main_walk_weights, &table_names)
+        );
 
         // Spill main traces to mmap before Round 1 LDE.
         #[cfg(feature = "disk-spill")]
@@ -3747,10 +3892,11 @@ pub trait IsStarkProver<
         // sequentially below once every commit completed — the one ordering
         // Fiat-Shamir requires before sampling the shared challenges.
         let main_results = run_admitted(
-            &heaviest_first(&main_estimates),
+            &main_walk_order,
             &main_estimates,
             &vram_gate,
             k,
+            |idx| table_names[idx].clone(),
             |idx| {
                 let (air, trace, _) = &air_trace_pairs[idx];
                 let domain = &domains[idx];
@@ -3766,6 +3912,7 @@ pub trait IsStarkProver<
                 let device_only = Self::device_only_for(*air, domain);
 
                 Self::commit_main_trace(
+                    air.name(),
                     *trace,
                     domain,
                     twiddles,
@@ -3898,11 +4045,16 @@ pub trait IsStarkProver<
         let peak_estimates: Vec<u64> = air_trace_pairs
             .iter()
             .enumerate()
-            .map(|(idx, (air, trace, _))| {
-                let lde_size = domains[idx].interpolation_domain_size * domains[idx].blowup_factor;
-                let (_, aux_cols) = air.trace_layout();
-                estimate_table_vram_bytes(trace.num_main_columns, aux_cols, lde_size)
-            })
+            .map(|(idx, _)| crate::device_set::table_device_set(table_shapes[idx]).total())
+            .collect();
+
+        // The fused phase's own walk, separate from R1's because the aux
+        // columns are resident here and so carry weight. Keyed on
+        // `table_walk_weight`, not on `peak_estimates`: the estimates feed the
+        // gate, the weight fixes the schedule.
+        let peak_walk_weights: Vec<u64> = table_shapes
+            .iter()
+            .map(|s| table_walk_weight(s.main_cols, s.aux_cols, s.n * s.blowup))
             .collect();
 
         // Per-table slots for the fused chain: each driver takes or locks only
@@ -3989,20 +4141,21 @@ pub trait IsStarkProver<
                         // Device-only for the aux commit: the main commit's
                         // gate AND a produced main device handle. The aux side
                         // may be MORE conservative than main (never less) — if
-                        // the GPU main commit declined and fell back to CPU,
-                        // skipping the aux D2H here would leave a device-only
-                        // trace with no main handle to serve it.
+                        // the GPU main commit declined below the floor and
+                        // committed on the host, skipping the aux D2H here would
+                        // leave a device-only trace with no main handle to serve
+                        // it.
                         #[cfg(feature = "cuda")]
-                        let mut device_only = Self::device_only_for(*air, domain)
+                        let device_only = Self::device_only_for(*air, domain)
                             && gpu_main_cells[idx].lock().unwrap().is_some();
 
                         // Resident GPU path: aux columns already on device (from
                         // the resident LogUp aux build) — LDE straight from device
                         // memory, no upload, no host column extraction. When the
                         // resident build fired the host aux trace is empty, so a
-                        // device LDE failure downloads the resident aux trace and
-                        // continues on the host arms below (falling through as-is
-                        // would commit a zero aux trace).
+                        // device LDE failure gets one drain-and-retry and is then
+                        // a clean error (falling through as-is would commit a
+                        // zero aux trace).
                         #[cfg(feature = "cuda")]
                         if trace.aux_resident().is_some() {
                             #[cfg(feature = "instruments")]
@@ -4014,6 +4167,7 @@ pub trait IsStarkProver<
                                     FieldExtension,
                                     H::Batched<FieldExtension>,
                                 >(
+                                    air.name(),
                                     ra,
                                     domain.blowup_factor,
                                     &twiddles.coset_weights,
@@ -4049,80 +4203,19 @@ pub trait IsStarkProver<
                                     Some(handle),
                                 ));
                             }
-                            // The device aux LDE declined at runtime (transient
-                            // VRAM pressure, usually) and there is no host aux
-                            // trace to fall back to. Same class as the R2
-                            // downgrade: download the resident aux trace — and
-                            // the main LDE if this table was device-only — and
-                            // continue fully host-backed on the arms below.
-                            let mut recovered = crate::gpu_lde::materialize_aux_trace_host(*trace);
-                            // Once the aux download lands, the host aux trace is
-                            // populated: a later failure is the main-LDE
-                            // download's, and the error has to name that step
-                            // instead of claiming an empty aux trace.
-                            let aux_recovered = recovered;
-                            if recovered && device_only {
-                                let mut cell = main_lde_cells[idx].lock().unwrap();
-                                // Matched exhaustively on purpose: `MainLdeSlot`
-                                // exists so a consumer between Round 1 and the
-                                // fused task cannot read an empty buffer as if it
-                                // were an LDE, and this recovery is exactly such a
-                                // consumer.
-                                match cell.as_mut() {
-                                    // The retained buffer is the one the fused task
-                                    // reads, so under device-only it is empty and
-                                    // has to come back off the device handle.
-                                    Some(MainLdeSlot::Retained((data, _))) => {
-                                        if data.is_empty() && trace.num_main_columns > 0 {
-                                            recovered = match (
-                                                gpu_main_cells[idx].lock().unwrap().as_ref(),
-                                                math_cuda::device::backend(),
-                                            ) {
-                                                (Some(h), Ok(be)) => {
-                                                    match crate::gpu_lde::download_main_lde_row_major::<
-                                                        Field,
-                                                    >(
-                                                        h, &be.next_stream()
-                                                    ) {
-                                                        Some(v) => {
-                                                            *data = v;
-                                                            true
-                                                        }
-                                                        None => false,
-                                                    }
-                                                }
-                                                _ => false,
-                                            };
-                                        }
-                                    }
-                                    // `RecomputeLde` dropped the buffer by design:
-                                    // the fused task rebuilds the main LDE from the
-                                    // host trace, which a device decline never
-                                    // touched. There is nothing to download and
-                                    // nothing to fail — the aux recovery above is
-                                    // the whole job.
-                                    Some(MainLdeSlot::Dropped { .. }) | None => {}
-                                }
-                            }
-                            if !recovered {
-                                return Err(ProvingError::Fft(
-                                    if aux_recovered {
-                                        "resident aux LDE declined; the aux trace was recovered \
-                                         but the main-LDE download failed"
-                                    } else {
-                                        "resident aux LDE declined and the aux-trace download \
-                                         recovery failed"
-                                    }
-                                    .to_string(),
-                                ));
-                            }
-                            eprintln!(
-                                "[gpu] resident-aux downgrade: table={} rows={} \
-                                 (device aux LDE declined; continuing on host)",
+                            // The device aux LDE declined twice — before and
+                            // after a device drain. There is no host aux trace,
+                            // and host RAM is a cache, not a compute path: this
+                            // is the failure to report, not a downgrade.
+                            return Err(ProvingError::DevicePath(format!(
+                                "table {}: resident aux LDE declined after the drain-and-retry \
+                                 (rows={} aux_cols={} blowup={}); {}",
                                 air.name(),
                                 trace.num_rows(),
-                            );
-                            device_only = false;
+                                num_cols,
+                                domain.blowup_factor,
+                                crate::gpu_lde::device_path_status(),
+                            )));
                         }
 
                         // Fused GPU path (cuda only): row-major ext3 NTT — single
@@ -4143,6 +4236,7 @@ pub trait IsStarkProver<
                                     FieldExtension,
                                     H::Batched<FieldExtension>,
                                 >(
+                                    air.name(),
                                     trace_slice,
                                     n,
                                     num_cols,
@@ -4341,24 +4435,42 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         let __sp = crate::instruments::span("rounds_2to4");
 
-        let peak_order = heaviest_first(&peak_estimates);
+        let peak_order = heaviest_first(&peak_walk_weights);
+        eprintln!(
+            "[prover] table walk rounds 2-4 (walk weight, largest first): {}",
+            describe_walk(&peak_order, &peak_walk_weights, &table_names)
+        );
 
         // One fused task per table: while a heavy table works through a
         // host-bound stretch, the others' GPU stages fill the device. The
         // shared transcript is untouched past this point (each fork is
         // per-table), so any order is sound; proofs are drained in index order.
         #[cfg(not(feature = "debug-checks"))]
-        let table_results = run_admitted(&peak_order, &peak_estimates, &vram_gate, k, |idx| {
-            let (commitment, lde) = aux_stage(idx)?;
-            rounds_stage(idx, commitment, lde)
-        });
+        let table_results = run_admitted(
+            &peak_order,
+            &peak_estimates,
+            &vram_gate,
+            k,
+            |idx| table_names[idx].clone(),
+            |idx| {
+                let (commitment, lde) = aux_stage(idx)?;
+                rounds_stage(idx, commitment, lde)
+            },
+        );
 
         // debug-checks needs every table's commitments and traces between the
         // aux and rounds stages (cross-table bus balance), so it splits the
         // fused chain into two admitted passes around the check.
         #[cfg(feature = "debug-checks")]
         let table_results = {
-            let aux_outs = run_admitted(&peak_order, &peak_estimates, &vram_gate, k, aux_stage);
+            let aux_outs = run_admitted(
+                &peak_order,
+                &peak_estimates,
+                &vram_gate,
+                k,
+                |idx| table_names[idx].clone(),
+                aux_stage,
+            );
             let mut commitments = Vec::with_capacity(num_airs);
             let mut ldes = Vec::with_capacity(num_airs);
             for out in aux_outs {
@@ -4380,10 +4492,17 @@ pub trait IsStarkProver<
                 .zip(ldes)
                 .map(|p| std::sync::Mutex::new(Some(p)))
                 .collect();
-            run_admitted(&peak_order, &peak_estimates, &vram_gate, k, |idx| {
-                let (c, l) = staged[idx].lock().unwrap().take().unwrap();
-                rounds_stage(idx, c, l)
-            })
+            run_admitted(
+                &peak_order,
+                &peak_estimates,
+                &vram_gate,
+                k,
+                |idx| table_names[idx].clone(),
+                |idx| {
+                    let (c, l) = staged[idx].lock().unwrap().take().unwrap();
+                    rounds_stage(idx, c, l)
+                },
+            )
         };
 
         let mut proofs = Vec::with_capacity(num_airs);
@@ -5116,5 +5235,55 @@ fn print_bus_balance_report<FieldExtension>(
             let report = tracker.analyze_mismatches();
             report.print_summary();
         }
+    }
+}
+
+#[cfg(test)]
+mod walk_tests {
+    use super::{heaviest_first, table_walk_weight};
+
+    /// The weight is `2·lde·(8·main + 24·aux) + 256·lde`. These constants are a
+    /// schedule, not a size, so this test exists to make a change to them a
+    /// deliberate act that comes with a wrap measurement.
+    #[test]
+    fn the_walk_weight_is_pinned() {
+        let lde = 1usize << 22;
+        assert_eq!(
+            table_walk_weight(25, 3, lde),
+            (lde as u64) * (2 * (8 * 25 + 24 * 3) + 256)
+        );
+        assert_eq!(table_walk_weight(1, 1, 16), 16 * (2 * (8 + 24) + 256));
+        // No floor: the per-LDE-row term scales with height, so two narrow
+        // tables of different heights never tie. The device-set model's 256 MiB
+        // scratch floor tied six small tables at the wrap, and that tie is
+        // where the two walks first diverge.
+        assert!(table_walk_weight(4, 1, 1 << 16) > table_walk_weight(4, 1, 1 << 15));
+    }
+
+    /// The two phases weigh differently: R1 passes `aux_cols == 0` because the
+    /// aux columns are not resident yet, the fused phase passes the AIR's aux
+    /// width. A table that is narrow in main and wide in aux therefore moves
+    /// between the two walks.
+    #[test]
+    fn the_two_phases_can_walk_differently() {
+        let lde = 1usize << 20;
+        // (main, aux) per table: the second is aux-heavy, the first main-heavy.
+        let main_walk: Vec<u64> = [(60usize, 1usize), (10, 30)]
+            .iter()
+            .map(|&(m, _)| table_walk_weight(m, 0, lde))
+            .collect();
+        let fused_walk: Vec<u64> = [(60usize, 1usize), (10, 30)]
+            .iter()
+            .map(|&(m, a)| table_walk_weight(m, a, lde))
+            .collect();
+        assert_eq!(heaviest_first(&main_walk), vec![0, 1]);
+        assert_eq!(heaviest_first(&fused_walk), vec![1, 0]);
+    }
+
+    /// Ties keep registry order, so equal-weight tables walk in the order the
+    /// registry lists them and the walk is reproducible run to run.
+    #[test]
+    fn ties_keep_registry_order() {
+        assert_eq!(heaviest_first(&[5, 9, 5, 9]), vec![1, 3, 0, 2]);
     }
 }
