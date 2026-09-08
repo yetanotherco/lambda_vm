@@ -236,20 +236,8 @@ pub fn lfm_verify(
 /// `verify_against` takes seven separate pieces of program shape, so every new
 /// thing the registry pins would change its signature and every call site with
 /// it. Taking the struct means a field added to `LfmArtifacts` reaches the
-/// verifier without moving anyone — `prep_root` and `prep_widths` (M-6) were the
-/// first, and `prover/tests/d0_king_gate.rs` compiles unchanged across their
-/// arrival because of it.
-///
-/// # ⚠ What it does NOT do yet
-///
-/// It does not check `prep_root`. The LFM machine proves and verifies a
-/// per-table [`MultiProof`], whose openings are authenticated against the
-/// per-slot `roots`; `prep_root` is a second commitment over those same
-/// preprocessed matrices, gathered into one multi-matrix round, and nothing
-/// reads it. It is plumbing with no consumer, and saying otherwise would
-/// overstate what a passing verification means.
-///
-/// The shape it commits to is [`LfmArtifacts::prep_round_shape`].
+/// verifier without moving anyone, and `prover/tests/d0_king_gate.rs` compiles
+/// unchanged across such an arrival because of it.
 pub fn verify_against_artifacts(
     artifacts: &LfmArtifacts,
     proof: &MultiProof<F, E, ()>,

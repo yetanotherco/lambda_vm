@@ -60,7 +60,7 @@ pub mod word;
 pub use airs::{LfmAirs, NUM_LFM_CHIPS, num_lfm_airs};
 pub use builder::{ArenaSchema, LfmBuilder, LfmProgramSource};
 pub use chunking::{KECCAK_RND_MAX_CHUNK_ROWS, KeccakChunking};
-pub use commit::{PrepRoundBuilder, commit_columns, commit_group, commit_lde_columns, lde_columns};
+pub use commit::{commit_columns, commit_group, commit_lde_columns, lde_columns};
 pub use compiler::{ColumnGroup, LfmColumnGroups, LfmProgram, compile};
 pub use executor::{LfmExecError, LfmExecution, LfmRecords, execute};
 pub use hash::{HasherKind, LfmHasher, TestPermutation};
