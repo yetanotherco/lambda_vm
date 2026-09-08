@@ -21,6 +21,8 @@ pub mod instruments;
 mod paged_mem;
 pub use stark::profile_markers;
 pub mod recursion;
+#[cfg(feature = "shape-profile")]
+pub mod shape_profile;
 mod statement;
 pub mod tables;
 pub mod test_utils;
@@ -1217,8 +1219,11 @@ pub fn prove_with_options_and_inputs(
     // Phase 4: Prove (multi_prove)
     #[cfg(feature = "instruments")]
     let __sp = stark::instruments::span("proving");
+    let pairs = airs.air_trace_pairs(&mut traces);
+    #[cfg(feature = "shape-profile")]
+    shape_profile::capture(pairs.iter().map(|(air, trace, _)| (*air, trace.num_rows())));
     let proof = Prover::multi_prove(
-        airs.air_trace_pairs(&mut traces),
+        pairs,
         &mut transcript,
         #[cfg(feature = "disk-spill")]
         storage_mode,

@@ -739,6 +739,8 @@ fn prove_epoch(
 
     let mut pairs = airs.air_trace_pairs(&mut traces);
     pairs.push((&l2g_air, &mut l2g_trace, &()));
+    #[cfg(feature = "shape-profile")]
+    crate::shape_profile::capture(pairs.iter().map(|(air, trace, _)| (*air, trace.num_rows())));
     let proof = Prover::multi_prove(
         pairs,
         &mut seed(),
@@ -929,6 +931,9 @@ fn prove_global(
     for (air, trace) in gm_airs.iter().zip(gm_traces.iter_mut()) {
         pairs.push((air as AirRef, trace, &()));
     }
+
+    #[cfg(feature = "shape-profile")]
+    crate::shape_profile::capture(pairs.iter().map(|(air, trace, _)| (*air, trace.num_rows())));
 
     Prover::multi_prove(
         pairs,

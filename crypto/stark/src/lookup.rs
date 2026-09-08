@@ -1060,15 +1060,21 @@ where
         self.max_bus_elements
     }
 
-    fn composition_poly_degree_bound(&self, trace_length: usize) -> usize {
-        // Only the per-table MAX degree is consumed. Base constraints declare it
-        // once via `ConstraintSet::max_degree()`; the framework's LogUp
-        // constraints contribute their own known max (batched terms degree 3,
-        // accumulator `1 + absorbed`).
-        let max_degree = self
-            .constraint_set
+    fn bus_interactions(&self) -> &[BusInteraction] {
+        &self.auxiliary_trace_build_data.interactions
+    }
+
+    fn max_constraint_degree(&self) -> usize {
+        // Base constraints declare their max once via `ConstraintSet::max_degree()`;
+        // the framework's LogUp constraints contribute their own known max
+        // (batched terms degree 3, accumulator `1 + absorbed`).
+        self.constraint_set
             .max_degree()
-            .max(logup_max_degree(&self.logup));
+            .max(logup_max_degree(&self.logup))
+    }
+
+    fn composition_poly_degree_bound(&self, trace_length: usize) -> usize {
+        let max_degree = self.max_constraint_degree();
         // The composition polynomial is the constraint QUOTIENT H = Σ βᵢ·Cᵢ/Zᵢ. Its degree is
         // deg(Cᵢ) − deg(Zᵢ) = (max_degree−1)·N − max_degree + eᵢ, so with the end-exemptions
         // eᵢ < max_degree (the max-degree LogUp constraints have eᵢ = 0) it fits in
@@ -2481,12 +2487,12 @@ mod logup_single_source_tests {
         for i in 0..n_rows {
             let mut row_sum = Fp3::zero();
             for col in &term_columns {
-                row_sum = row_sum + &col[i];
+                row_sum += col[i];
             }
             let acc_i = *trace.get_aux(i, acc_col_idx);
             let acc_next = *trace.get_aux((i + 1) % n_rows, acc_col_idx);
-            let lhs = (acc_next - acc_i) * &n_fe;
-            let rhs = row_sum * &n_fe - &l;
+            let lhs = (acc_next - acc_i) * n_fe;
+            let rhs = row_sum * n_fe - l;
             assert_eq!(lhs, rhs, "forward circular recurrence broken at row {i}");
         }
     }

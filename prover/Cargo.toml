@@ -15,6 +15,9 @@ instruments = ["stark/instruments"]
 nvtx = ["cuda", "instruments", "stark/nvtx"]
 profile-markers = ["stark/profile-markers"]
 disk-spill = ["stark/disk-spill"]
+# Trace-shape profile emission (segment-profile JSONL). Host-only: pulls
+# in serde_json, which the RISC-V recursion guest must not carry.
+shape-profile = ["dep:serde", "dep:serde_json"]
 
 [dependencies]
 stark = { path = "../crypto/stark" }
@@ -29,6 +32,8 @@ digest = "0.10.7"
 # pointer_width_64: 32-bit rel-ptrs cap an archive at ~2 GiB, which large
 # continuation proofs exceed. Keep in sync across all proof-format crates.
 rkyv = { version = "0.8.10", default-features = false, features = ["alloc", "bytecheck", "aligned", "pointer_width_64"] }
+serde = { version = "1.0", features = ["derive"], optional = true }
+serde_json = { version = "1.0", optional = true }
 
 [dev-dependencies]
 env_logger = "*"

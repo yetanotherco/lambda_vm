@@ -7,8 +7,10 @@ use math::field::{
 };
 
 use crate::{
-    constraint_ir::ConstraintProgram, constraints::builder::ConstraintMeta, domain::Domain,
-    lookup::BusPublicInputs,
+    constraint_ir::ConstraintProgram,
+    constraints::builder::ConstraintMeta,
+    domain::Domain,
+    lookup::{BusInteraction, BusPublicInputs},
 };
 
 use super::{
@@ -169,6 +171,20 @@ pub trait AIR: Send + Sync {
     /// Used to compute the correct number of alpha powers for LogUp fingerprints.
     fn max_bus_elements(&self) -> usize {
         0
+    }
+
+    /// The table's bus interactions, in declaration order.
+    ///
+    /// Shape-only consumers (profiling, cost models) read this; the proving
+    /// path consumes the `LogUpLayout` built from the same list.
+    fn bus_interactions(&self) -> &[BusInteraction] {
+        &[]
+    }
+
+    /// Highest degree among this table's transition constraints, counting both
+    /// the table's own constraints and the framework-emitted LogUp ones.
+    fn max_constraint_degree(&self) -> usize {
+        1
     }
 
     /// Returns true if this AIR has preprocessed (precomputed) columns.
