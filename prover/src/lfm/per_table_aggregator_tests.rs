@@ -462,3 +462,84 @@ fn the_global_verifier_leg_runs_and_rejects_tampers() {
         "a flipped L2G re-commit root must make the global leg unprovable"
     );
 }
+
+/// ★ THE AGGREGATION PUBLISH PROFILE drops diagnostics and NOTHING else.
+///
+/// # Why this gate exists
+///
+/// A wrap's published words are the only thing an aggregation node can read
+/// about it, and a node pays per word: eight hinted halves, four canonicity
+/// guards, four recombinations, thirty-six bytes of statement absorb and one
+/// extension-field inverse in the `LfmPublic` balance. At the production posture
+/// the diagnostic set is 10,507 words against a binding set of ≈80, so the
+/// profile is what decides whether a fan-in-2 leaf hints ~21,000
+/// canonicity-guarded words before it has verified anything.
+///
+/// A saving of that size is worth exactly as much as the proof that it saves
+/// only what has no consumer. So this asserts the containment directly:
+/// `Aggregation`'s words are `Diagnostic`'s with the per-sub-proof runs cut out,
+/// value for value — the shared pair, the attestation id and the block-binding
+/// schema are identical cells, and the bus total still ends the list.
+///
+/// The arithmetic is asserted alongside, from the epoch's own shapes, so a
+/// diagnostic added to the per-sub-proof block in future fails here naming the
+/// count rather than silently widening what every node above pays for.
+#[test]
+fn the_aggregation_publish_profile_drops_only_diagnostics() {
+    use super::epoch_tests::{Publishes, epoch_program_publishing, schema_words};
+
+    let e = super::epoch_tests::real_epoch();
+    let arenas = super::epoch_tests::epoch_arena_words(&e, true);
+
+    let run = |publishes| {
+        let program = epoch_program_publishing(&e, true, publishes);
+        let exec = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+            .expect("the assembled verifier must execute under either profile");
+        (program.instrs.len(), exec.public_words)
+    };
+    let (diag_instrs, diag) = run(Publishes::Diagnostic);
+    let (agg_instrs, agg) = run(Publishes::Aggregation);
+
+    // ---- the head: the pair, the id and the schema, identical cells.
+    let head = 2 + 2 + schema_words(&e);
+    assert_eq!(
+        diag[..head],
+        agg[..head],
+        "the binding head must not move with the profile"
+    );
+    // ---- the tail: the bus total, which both profiles still publish last.
+    assert_eq!(
+        diag[diag.len() - 1],
+        agg[agg.len() - 1],
+        "the closure's total ends the list under either profile"
+    );
+    assert_eq!(agg.len(), head + 1, "Aggregation is the head and the total");
+
+    // ---- what was dropped, from the epoch's own shapes rather than from a
+    // literal: per sub-proof the composition, one terminal per query, the
+    // (beta, z, gamma) triple, the DEEP zetas and one index per query.
+    let dropped: usize = e
+        .tables
+        .iter()
+        .zip(&e.legs)
+        .map(|(h, leg)| {
+            1 + leg.verify.num_queries + 3 + h.zetas.len() + h.shape.num_queries
+        })
+        .sum();
+    assert_eq!(
+        diag.len(),
+        agg.len() + dropped,
+        "Aggregation must drop exactly the per-sub-proof diagnostics"
+    );
+
+    println!(
+        "★ publish profile over {} sub-proofs: Diagnostic {} words / {diag_instrs} instrs, \\
+         Aggregation {} words / {agg_instrs} instrs ({:.1}% of the words, {:.1}% of the \\
+         instructions)",
+        e.tables.len(),
+        diag.len(),
+        agg.len(),
+        100.0 * agg.len() as f64 / diag.len() as f64,
+        100.0 * agg_instrs as f64 / diag_instrs as f64,
+    );
+}
