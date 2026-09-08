@@ -12,7 +12,7 @@ intersection of two windows instead.
 the checks below cannot be skipped by forgetting to run this file first.
 """
 from keccak_ref import RHO
-from field_model import rho_pi_offsets, theta_carry_source
+from field_model import honest_shift, rho_pi_offsets, theta_carry_source
 
 
 def premises(verbose=True):
@@ -71,9 +71,17 @@ def premises(verbose=True):
 
     say("\n=== (5) theta = all-ones saturates every pi halfword, for EVERY rotation ===")
     # left + right = 0xFFFF whatever rnc is, which is why config C forges on all 25.
-    sat = all(((0xFFFF << (RHO[x][y] % 16)) & 0xFFFF) + (0xFFFF >> (16 - (RHO[x][y] % 16))
-              if RHO[x][y] % 16 else 0) == 0xFFFF for x in range(5) for y in range(5))
-    check(sat, "left + right = 0xFFFF for all 25 lanes -> pi = 0xFF..FF, the saturation config C needs")
+    # Read through honest_shift rather than open-coded shifts, so this premise and
+    # the necessity boards cannot disagree about what the decomposition is.
+    unsaturated = []
+    for x in range(5):
+        for y in range(5):
+            left, right = honest_shift(0xFFFF, RHO[x][y] % 16)
+            if left + right != 0xFFFF:
+                unsaturated.append((x, y, left, right))
+    check(not unsaturated,
+          "left + right = 0xFFFF for all 25 lanes -> pi = 0xFF..FF, the saturation config C needs"
+          f"{'' if not unsaturated else f' — {unsaturated[:2]}'}")
 
     say("\n=== (6) the theta analogue: every Cxz_right carry column is read EXACTLY once ===")
     # cols::cxz_right_bit_for_byte sends the carry of halfword h-1 to the LOW byte

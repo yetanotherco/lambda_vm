@@ -24,7 +24,7 @@ round 0 of a permutation an attacker can request.
 """
 from keccak_ref import RHO, RC, keccak_round
 from model_dataflow import round_dataflow
-from field_model import (P, as_field, honest_shift, identity_holds, deviate,
+from field_model import (as_field, honest_shift, identity_holds, deviate,
                          rho_pi_offsets, theta_operand_bytes, is_byte, THETA_RNC)
 
 FAIL = []
