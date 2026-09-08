@@ -41,6 +41,7 @@ pub mod keccak_host;
 pub mod layout;
 pub mod lde;
 pub mod logup;
+pub mod per_table_aggregator;
 pub mod poseidon;
 pub mod programs;
 pub mod proof;
