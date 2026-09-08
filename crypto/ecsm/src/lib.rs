@@ -12,10 +12,10 @@
 //! - **x-only** (`scalar_mul_x` / [`compute_witness`], via `prepare`): `yG` is recovered as
 //!   the canonical *even* lift of `xG`, so the result is independent of the root — only
 //!   `xR` is returned, and `k·P` and `k·(-P)` share an x.
-//! - **affine** (`scalar_mul_xy_with_y` / [`compute_witness_with_y`], via `prepare_with_y`):
+//! - **full-point** (`scalar_mul_xy_with_y` / [`compute_witness_with_y`], via `prepare_with_y`):
 //!   `yG` is the caller's own value, validated on-curve but *not* canonicalized. The result
 //!   IS root-dependent — `yR` is the y of the caller's chosen lift — which is the whole
-//!   point, since the affine ecall returns `yR` to the guest. In the prover the witnessed
+//!   point, since the full-point ecall returns `yR` to the guest. In the prover the witnessed
 //!   `yG` is pinned to the caller's input buffer by a memory read, so the root is not a
 //!   free choice.
 //!
@@ -77,13 +77,15 @@ pub enum EcsmError {
     /// `k >= N`: outside the valid scalar range `[1, N)`.
     ScalarOutOfRange,
     /// The input point is not on the curve: on the x-only path `x³ + b` is not a quadratic
-    /// residue, so `xG` is not a valid x-coordinate; on the affine path the caller's own
+    /// residue, so `xG` is not a valid x-coordinate; on the full-point path the caller's own
     /// `yG` fails `yG² ≡ xG³ + b`.
     NotOnCurve,
     /// A coordinate is `>= p`, so it is not a canonical field element — `xG` on either path,
-    /// `yG` on the affine one. Reducing it silently would diverge from the prover, whose
-    /// `xR < p` / `yR < p` range checks make a non-canonical input unprovable (with `k = 1`
-    /// the x-only input is echoed back as `xR`).
+    /// `yG` on the full-point one. For `xG` and `yR` this matches the prover, whose `xR < p` /
+    /// `yR < p` range checks make a non-canonical value unprovable (with `k = 1` the x-only
+    /// input is echoed back as `xR`). `yG` has no such check — the AIR accepts a non-canonical
+    /// `yG` — so this rejection is the only thing that stops it, and reducing here would hide
+    /// the divergence instead of removing it.
     CoordinateOutOfRange,
 }
 
@@ -135,7 +137,7 @@ pub(crate) fn prepare(
 
 /// Like [`prepare`] but takes an explicit `yG` (the caller's full input point) instead of
 /// lifting `xG` to the canonical even root. Validates `0 < k < N`, `xG < p`, `yG < p`, and
-/// that `(xG, yG)` is on the curve (`yG² ≡ xG³ + b mod p`). Used by the affine path so the
+/// that `(xG, yG)` is on the curve (`yG² ≡ xG³ + b mod p`). Used by the full-point path so the
 /// returned `yR` matches the caller's actual point (no parity convention / guest-side sign
 /// flip). `yG`'s value is pinned in the prover by a memory read of the caller's input.
 pub(crate) fn prepare_with_y(
@@ -165,7 +167,7 @@ pub(crate) fn prepare_with_y(
     Ok((k, AffinePoint { x: xg, y: yg }))
 }
 
-/// Affine entry point with an explicit input `yG`: both coordinates of `k·(xG, yG)` as
+/// Full-point entry point with an explicit input `yG`: both coordinates of `k·(xG, yG)` as
 /// little-endian 32-byte values. The executor writes `xR` then `yR` back (64-byte output).
 pub fn scalar_mul_xy_with_y(
     k_le: &[u8; 32],

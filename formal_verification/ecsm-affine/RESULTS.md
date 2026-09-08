@@ -1,4 +1,4 @@
-# ECSM affine-selector z3 gate — lemma board & soundness theorem
+# ECSM full-point-selector z3 gate — lemma board & soundness theorem
 
 Reverse-order verification of the surface **PR #879** adds to `prover/src/tables/ecsm.rs` and
 `executor/src/vm/instruction/execution.rs`. Model transcribed from the Rust with `file:line`
@@ -31,22 +31,22 @@ Two earlier campaigns supply the playbook, both on unmerged branches under the g
 | Lemma | Statement | Verdict | Notes |
 |---|---|---|---|
 | **A1-PRIME** | `p_g = 2^64 − 2^32 + 1` is prime | CERTIFIED (sympy) | the one assumed algebraic fact |
-| **A1a** | `IS_BIT(IS_AFFINE)` (idx 421) ⇒ `IS_AFFINE ∈ {0,1}` | PROVED (complete split over GF(p_g)) | root set `{0,1}`, split complete ⇒ exhaustive |
-| **A1b** | `AffineZeroOnPadding` (idx 422) ⇒ `µ=0` forces `IS_AFFINE=0` | PROVED (z3 UNSAT) | lets the `yG`/`yR` buses use `Multiplicity::Column(IS_AFFINE)` with no separate padding argument |
-| **A1c** | the `Ecall` tuple is **injective** in `IS_AFFINE` | PROVED | the pinning: a row flipping the selector no longer matches the CPU's real `a7` |
-| **A1c-ctl** | the degenerate syscall pair un-pins the selector; the repo pair does not | PROVED + 1 SAT | identical numbers ⇒ constant tuple ⇒ `IS_AFFINE` free |
+| **A1a** | `IS_BIT(IS_FULL_POINT)` (idx 421) ⇒ `IS_FULL_POINT ∈ {0,1}` | PROVED (complete split over GF(p_g)) | root set `{0,1}`, split complete ⇒ exhaustive |
+| **A1b** | `FullPointZeroOnPadding` (idx 422) ⇒ `µ=0` forces `IS_FULL_POINT=0` | PROVED (z3 UNSAT) | lets the `yG`/`yR` buses use `Multiplicity::Column(IS_FULL_POINT)` with no separate padding argument |
+| **A1c** | the `Ecall` tuple is **injective** in `IS_FULL_POINT` | PROVED | the pinning: a row flipping the selector no longer matches the CPU's real `a7` |
+| **A1c-ctl** | the degenerate syscall pair un-pins the selector; the repo pair does not | PROVED + 1 SAT | identical numbers ⇒ constant tuple ⇒ `IS_FULL_POINT` free |
 | **A1c-assert** | today's pinning rests **entirely** on the LOW word | PROVED | high word separates nothing (shared `0xFFFF_FFFF`) ⇒ the `const _:` assert is load-bearing |
 | **A1d** | both new constraints are degree 2; `max_degree() == 3` holds | PROVED | `YrLtP` reuses the existing degree-3 shape |
 | **A1e** | **drop idx 422** | **SAT — FORGES** | all 423 walked: idx 422 is the only one violated when kept, all 422 satisfied when dropped, honest padding satisfies all 423 — the dropped row fires 8 gated MEMW ops. **LOAD-BEARING** |
-| **A1f** | **drop idx 421** | **SAT — FORGES** | the row's `Ecall` tuple becomes **another accelerator's**: `IS_AFFINE = 20` → HINT, `p_g − 9` → KECCAK. **LOAD-BEARING**, and not for the reason its comment gives (Finding 7) |
+| **A1f** | **drop idx 421** | **SAT — FORGES** | the row's `Ecall` tuple becomes **another accelerator's**: `IS_FULL_POINT = 20` → HINT, `p_g − 9` → KECCAK. **LOAD-BEARING**, and not for the reason its comment gives (Finding 7) |
 | **A2a** | `YrLtP` word-carry lift: field recurrence ⇒ integer equation | PROVED (z3 UNSAT) | `\|A_i\| < 2^33 ≪ p_g`, so no `p_g` wrap |
 | **A2b** | `OverflowRequired(YrLtP)` ⇒ `yR < p` | PROVED (z3 UNSAT) | `p` pinned as a numeral ⇒ the conclusion is `yR < p`, not `yR < const` |
 | **A2b-nv** | the same system without the denial is SAT | SAT (expected) | non-vacuity: `yR = p−1` reachable |
 | **A2c** | every `YrLtP` LHS integer value ≪ p_g under the contracts | PROVED (exact corners) | `max \|A_i\| = 2^33 − 1 = 4.7·10⁻¹⁰·p_g` |
 | **A2c-ctl** | wrong constant `p → p+2` / `p → N` | **SAT — CATCHES** | witness held FIXED ⇒ honest columns stop satisfying the chain (keccak wrong-RC analogue) |
 | **A2d** | contract **C4-YR**: where `YR`'s byte bound comes from | CONTRACT | `ecsm.rs` byte-checks `{X2, Q0, YG, Q1}` — **not** `YR`; inherited, bus-level, outside this gate |
-| **A2d-obs** | `YrLtP` is **µ**-gated, not `IS_AFFINE`-gated | NOTED | binds x-only rows too: strictly stronger, completeness holds (Finding 3) |
-| **A2e** | honest-witness anchor for the chain | PROVED | 14 witnesses (4 x-only, 10 affine): `c_i ∈ {0,1}`, `c_7 = 1`, halfwords in `[0,2^16)` |
+| **A2d-obs** | `YrLtP` is **µ**-gated, not `IS_FULL_POINT`-gated | NOTED | binds x-only rows too: strictly stronger, completeness holds (Finding 3) |
+| **A2e** | honest-witness anchor for the chain | PROVED | 14 witnesses (4 x-only, 10 full-point): `c_i ∈ {0,1}`, `c_7 = 1`, halfwords in `[0,2^16)` |
 | **A2f** | **the `yR + p` forgery, fully instantiated** | **SAT — FORGES** | 12 facts, incl. the ECDAS `Yr` relation holding **exactly** and the forged carries staying inside `[−16320, 49216)` — a forgery its windows reject is not one |
 | **A2g** | **drop `YrLtP`** | **SAT — FORGES** | the A2f witness is accepted; the guest receives `yR + p`. **LOAD-BEARING** (the `yR`-side analogue of the earlier board's N6 / `XR_SUB_P`) |
 | **A2h** | the excluded band is populated by real curve points | PROVED | `2^256 − p = 2^32 + 977`, and a real secp256k1 point has **`y = 1`** (Finding 1) |
@@ -58,13 +58,13 @@ Two earlier campaigns supply the playbook, both on unmerged branches under the g
 | **A3f** | `YrLtP` is **not** a parity defence | PROVED | both `±yR` are canonical ⇒ two orthogonal gaps (input parity A3, output representation A2), two fixes |
 | **A3g** | `yG` canonicality is **UNCHECKED** | **SAT — FORGES** | no `YgLtP` in `OverflowKind`; the witness with `yG = p + 1` is built and **all 423 in-table constraints are evaluated on it — accepted**, and rejected by the executor. Consequence BENIGN ⇒ VM-parity gap. Survives on two margins: `q1` grows 256 → 257 bits, so its top byte is 1, the only non-zero value idx 388 admits, and the `c1` carries land at `[16318, 26568] ⊂ [0, 2^16)`. **Medium**, Finding 8 |
 | **A4a** | the `Alu` LT bound **==** the executor's `addr_limb_ok`, both modes | PROVED (z3 UNSAT ×2) | same accept set ⇒ no provable-but-halting execution, no legal execution made unprovable |
-| **A4b** | the affine `+32 + 8i` span cannot cross `2^32` | PROVED (z3 UNSAT) | 128 touched offsets, max `+63`, all `< 2^32` ⇒ reusing the high limb is safe |
+| **A4b** | the full-point `+32 + 8i` span cannot cross `2^32` | PROVED (z3 UNSAT) | 128 touched offsets, max `+63`, all `< 2^32` ⇒ reusing the high limb is safe |
 | **A4c** | the **seven-value band** the LT senders close | PROVED | exactly 7 per mode: `[2^32−31, 2^32−24)` and `[2^32−63, 2^32−56)` (Finding 2) |
 | **A4d** | `k`'s bound is flat in both modes, correctly | PROVED (z3 UNSAT) | `k` is 32 B on both arms |
 | **A4e** | the overlap guard **==** exact interval disjointness | PROVED (z3 UNSAT) | not a distance bound: `addr_k + 32 == addr_xg` is legal and must stay legal |
 | **A4e-ctl** | **the `u64` wrap** | **SAT — FORGES** | `addr_xg = 2^64 − 64` passes `addr_limb_ok(·, 63)` and wraps the pre-fix `+64`, slipping a **total** overlap past the guard. The `u128` widening is **LOAD-BEARING** |
 | **A4f** | timestamp layout is collision-free | PROVED | `{xG, yG}@ts`, `k@ts+1`, `xR@ts+2`, `yR@ts+3`, stride 4 parsed from the builder; `xG`/`yG` share `ts` but are address-disjoint |
-| **A4g** | the mode-dependent bound is necessary in **both** directions | PROVED | a flat 64-byte bound rejects 32 legal x-only addresses; a flat 32-byte one admits 32 illegal affine ones |
+| **A4g** | the mode-dependent bound is necessary in **both** directions | PROVED | a flat 64-byte bound rejects 32 legal x-only addresses; a flat 32-byte one admits 32 illegal full-point ones |
 | **A5** | transcription audit | 21/21 premises READ, 21/21 mutations bite | `TRANSCRIPTION-AUDIT.md` |
 | **A6** | real-witness anchor | PROVED (+1 forgery exhibit) | 28 witnesses and 4 rejections from `crypto/ecsm` itself; 9 ±yG pairs reproduce A3b outside the model |
 
@@ -88,7 +88,7 @@ numerator uses the *integer* `yG²`, and `(p−y)² ≠ y²` over ℤ) while agr
 Under contracts C1–C7 (imported) + C4-YR + A1-PRIME, and given the earlier board's L1–L7, any
 accepted trace satisfies, for every ECSM row with `µ = 1` and ecall timestamp `ts`:
 
-> `IS_AFFINE` equals the mode of the ecall the CPU actually executed. When it is 0, the row's
+> `IS_FULL_POINT` equals the mode of the ecall the CPU actually executed. When it is 0, the row's
 > behaviour is **bit-identical** to the pre-PR chip and the imported conclusion stands
 > unchanged: `xR = x(k·P)` for either lift of `xG`. When it is 1, the witnessed `yG` is the
 > 32 bytes the caller placed at `addr_xG + 32`, so `(xG, yG) mod p` is the caller's own point;
@@ -99,8 +99,8 @@ accepted trace satisfies, for every ECSM row with `µ = 1` and ecall timestamp `
 nothing constrains `yG < p` (A3g, Finding 8). The reduction is harmless, but the theorem cannot
 claim the witnessed bytes *are* canonical. `xG` carries no such caveat: `XgLtP` pins it.
 
-Chain of proof: `IS_AFFINE` is a bit (A1a), dead on padding (A1b), pinned to the executed ecall
-(A1c) → the affine buses fire exactly on affine rows → the `yG` read pins the input point
+Chain of proof: `IS_FULL_POINT` is a bit (A1a), dead on padding (A1b), pinned to the executed ecall
+(A1c) → the full-point buses fire exactly on full-point rows → the `yG` read pins the input point
 (A3c), closing the parity freedom A3a/A3b exhibits → imported L1–L7 give
 `(xR, yR) ≡ k·(xG, yG) (mod p)` → `XR_SUB_P` and the new `YrLtP` (A2a/A2b) make both
 coordinates canonical → the LT senders align the AIR's address set with the VM's (A4a–A4c) and
@@ -133,12 +133,12 @@ authority, **C5** LogUp multiset soundness, **C6** Ecall binding, **C7** timesta
    the phrasing used for the `XR_SUB_P` analogue on the earlier board, and it is not rare here.
 2. **[confirmed] The seven-value address band.** `ecsm.rs`'s comment claims the LT senders close
    "a seven-value band per operand". Measured: exactly 7, both modes (A4c). No action.
-3. **[observation] `YrLtP` is µ-gated, not `IS_AFFINE`-gated**, so it binds x-only rows where
+3. **[observation] `YrLtP` is µ-gated, not `IS_FULL_POINT`-gated**, so it binds x-only rows where
    nothing observes `yR`. Strictly stronger ⇒ sound; completeness holds because
-   `compute_witness_inner` fills `y_r_sub_p` on both paths. Gating on `IS_AFFINE` would save 16
+   `compute_witness_inner` fills `y_r_sub_p` on both paths. Gating on `IS_FULL_POINT` would save 16
    halfword sends + 8 constraints; not worth the asymmetry with the other three chains.
-4. **[narrower than it looks] `IS_AFFINE` is separated by ONE 32-bit word.** The two syscall
-   numbers share their high word, so its `IS_AFFINE` coefficient is zero and carries no mode
+4. **[narrower than it looks] `IS_FULL_POINT` is separated by ONE 32-bit word.** The two syscall
+   numbers share their high word, so its `IS_FULL_POINT` coefficient is zero and carries no mode
    information (A1c-assert). The whole pinning is the low word, kept that way by
    `execution.rs`'s `const _: () = assert!`. Audit premise P5 fails if the assert is removed.
 5. **[audit method] A blind check is worse than a missing one.** P18 matched `ecsm.rs`'s
@@ -149,14 +149,14 @@ authority, **C5** LogUp multiset soundness, **C6** Ecall binding, **C7** timesta
    recomputed the witness addend for the perturbed constant, so *any* constant passed. Fixed by
    holding the witness fixed. With Finding 5: a green control is worth nothing until you have
    seen it go red.
-7. **[gap, now closed] `IS_BIT(IS_AFFINE)` is load-bearing for an unrecorded reason.** The first
+7. **[gap, now closed] `IS_BIT(IS_FULL_POINT)` is load-bearing for an unrecorded reason.** The first
    version of this board proved idx 421 *correct* (A1a) and never asked whether it was
    *necessary*. It is, and the argument is not local to the ECSM pair. The receiver's syscall
-   words are `xonly + a·(affine − xonly)` per 32-bit word, with coefficients `−1` (low) and
+   words are `xonly + a·(full_point − xonly)` per 32-bit word, with coefficients `−1` (low) and
    **`0`** (high, both sharing `0xFFFF_FFFF`) — so as `a` sweeps the field the high word is
    constant and the low word sweeps everything. Every syscall is `u64::MAX − k` and shares that
    high word, so each is reachable at `a = (target_lo − xonly_lo)/(−1)`: `ECSM` at 0,
-   `ECSM_AFFINE` at 1, **`HINT` at 20**, **`KECCAK` at `p_g − 9`**. Drop idx 421 and `a` is free
+   `ECSM_FULL_POINT` at 1, **`HINT` at 20**, **`KECCAK` at `p_g − 9`**. Drop idx 421 and `a` is free
    on a `µ=1` row (idx 422 binds only at `µ=0`), so an ECSM row can consume a *different*
    accelerator's `Ecall` send — a HINT call proven as a scalar multiplication writing 32 or 64
    bytes wherever the row's register columns point. `execution.rs`'s assert cannot see this: it
@@ -204,7 +204,7 @@ shape three times, which is enough recurrence to write down the rule rather than
 |---|---|---|
 | A1c-ctl | the repo pair is injective | the degenerate pair collides |
 | A1e | idx 422 is the only violated constraint of 423 | all 422 remaining satisfied, 8 MEMW ops fire |
-| A1f | only ECSM/ECSM_AFFINE reachable | HINT and KECCAK reachable |
+| A1f | only ECSM/ECSM_FULL_POINT reachable | HINT and KECCAK reachable |
 | A2c-ctl | honest witness (addend fixed) valid under `p` | rejected under `p+2` and under `N` |
 | A2g | A2f established every *other* constraint holds | the witness is accepted, guest gets `yR + p` |
 | A3d | A3c: the read's tuples differ between the two | `check_all_constraints` clean on both |
@@ -277,7 +277,7 @@ scripts that read repo source locate the root by marker (a workspace `Cargo.toml
   `prover/src/tests/ecsm_tests.rs` and `prove_elfs_tests.rs` cover that; green on this branch.
 - **The `q1` growth on the `−yG` branch** is checked to fit 33 bytes at the instances tested,
   not proved for all inputs. A completeness question about a witness nobody should build — but
-  if the affine path ever *needs* both roots, it becomes a real bound to establish.
+  if the full-point path ever *needs* both roots, it becomes a real bound to establish.
 - **Nothing here re-proves the double-and-add chain.** If #879's rebase touches the ECDAS chain
   or the `Ecdas`/`Bit` buses, the imported board is the one to re-run, not this one.
 
@@ -285,7 +285,7 @@ scripts that read repo source locate the root by marker (a workspace `Cargo.toml
 
 The ECSM spec **exists**: `spec/ecsm.typ`, `spec/src/ecsm.toml`, `spec/src/ecdas.toml`, on the
 long-lived **`spec/main`** branch. `prover/src/tables/ecsm.rs:19`'s "See `spec/src/ecsm.toml`"
-is a correct reference. PR **#932** specs the affine variant reviewed here, and its constraints
+is a correct reference. PR **#932** specs the full-point variant reviewed here, and its constraints
 correspond to this board's subjects one-for-one; two divergences are deliberate — the spec
 derives `addr_yG`/`addr_yR` with a full 64-bit `ADD` into dedicated columns (so it needs no
 limb bound, where the implementation uses the `Alu` LT senders A4 verifies), and it spends 32

@@ -1,8 +1,8 @@
-# ECSM affine selector — oracle + z3-proved soundness gate
+# ECSM full-point selector — oracle + z3-proved soundness gate
 
-Formal-verification campaign for **PR #879** (`perf/ecsm-affine-selector`), which adds an
-affine variant of the ECSM ecall: input `xG‖yG` (64 B), output `xR‖yR` (64 B), with an
-`IS_AFFINE` selector column so one prover serves both ABIs.
+Formal-verification campaign for **PR #879** (`perf/ecsm-full-point-selector`), which adds an
+full-point variant of the ECSM ecall: input `xG‖yG` (64 B), output `xR‖yR` (64 B), with an
+`IS_FULL_POINT` selector column so one prover serves both ABIs.
 
 Same shape as the two earlier campaigns — an independent Python model of the function,
 anchored against third parties, plus a z3/sympy gate over the constraints, plus a
@@ -56,7 +56,7 @@ A4 addressing   : LT bound == executor's predicate PROVED, u64-wrap control FORG
 
 Eight distinct attacks (12 `SAT` results; several are exhibited from more than one
 angle). **Every new check in PR #879 has a control showing it is
-load-bearing** — the `yG` read, `YrLtP`, `IS_AFFINE`'s bit constraint and its µ-gate, the
+load-bearing** — the `yG` read, `YrLtP`, `IS_FULL_POINT`'s bit constraint and its µ-gate, the
 `Alu` LT senders and the `u128` widening each admit a concrete attack when removed.
 
 ## What is being verified, and what is imported
@@ -67,10 +67,10 @@ C1–C7 are hypotheses here**. What is new, and what this board covers:
 
 | Added by the PR | Lemma |
 |---|---|
-| the `IS_AFFINE` column, `IS_BIT` (idx 421) and `AffineZeroOnPadding` (idx 422) | A1a, A1b, A1e |
-| the `Ecall` receiver's `xonly + IS_AFFINE·(affine − xonly)` syscall words | A1c |
-| the `IS_AFFINE`-gated `yG` read (4 dwords at `addr_xG + 32 + 8i`, `ts`) | A3 |
-| the `IS_AFFINE`-gated `yR` write (4 dwords at `addr_xR + 32 + 8i`, `ts+3`) | A3c, A4f |
+| the `IS_FULL_POINT` column, `IS_BIT` (idx 421) and `FullPointZeroOnPadding` (idx 422) | A1a, A1b, A1e |
+| the `Ecall` receiver's `xonly + IS_FULL_POINT·(full_point − xonly)` syscall words | A1c |
+| the `IS_FULL_POINT`-gated `yG` read (4 dwords at `addr_xG + 32 + 8i`, `ts`) | A3 |
+| the `IS_FULL_POINT`-gated `yR` write (4 dwords at `addr_xR + 32 + 8i`, `ts+3`) | A3c, A4f |
 | `OverflowKind::YrLtP` — the `yR < p` chain (idx 413..420) + 16 halfword columns | A2 |
 | the `Alu` LT address-limb senders and their mode-dependent bound | A4 |
 | the executor's 64-byte spans and `u128` overlap guard | A4e |
@@ -114,7 +114,7 @@ in-table constraint set on each, and shows both are valid with the same `xR` and
 | `small_y_point.py` | constructs the `y = 1` attack instance via cube roots mod `p` |
 | `small_y_point.json` | the instance, consumed by A2 |
 | `affine_common.py` | the transcribed model of the new AIR surface, with citations |
-| `a1_selector.py` | A1 — `IS_AFFINE` is a bit, dead on padding, pinned, and load-bearing |
+| `a1_selector.py` | A1 — `IS_FULL_POINT` is a bit, dead on padding, pinned, and load-bearing |
 | `a2_yr_lt_p.py` | A2 — `YrLtP`: lift, strict chain, width, C4-YR, the forgery |
 | `a3_parity_binding.py` | A3 — the parity forgery, the read that closes it, and the `yG` canonicality gap |
 | `a4_addressing.py` | A4 — address bounds, the `+32…+63` span, the overlap guard |

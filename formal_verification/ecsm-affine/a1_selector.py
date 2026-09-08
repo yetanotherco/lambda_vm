@@ -1,35 +1,35 @@
-"""A1 — the `IS_AFFINE` selector: is it a bit, is it dead on padding, and is it PINNED?
+"""A1 — the `IS_FULL_POINT` selector: is it a bit, is it dead on padding, and is it PINNED?
 
-`IS_AFFINE` is the only thing standing between the two ABIs. Everything the affine path
+`IS_FULL_POINT` is the only thing standing between the two ABIs. Everything the full-point path
 adds keys off it: the `yG` read, the `yR` write, and the address bound. So the question the
 whole board reduces to is whether a prover can choose it freely.
 
-  A1a  `IS_AFFINE ∈ {0,1}`                          — idx 421 does what it says
-  A1b  `IS_AFFINE = 0` whenever `µ = 0`             — idx 422; padding cannot fire the
-                                                      affine buses
-  A1c  the `Ecall` tuple is INJECTIVE in IS_AFFINE  — the pinning. Two rows with the same
+  A1a  `IS_FULL_POINT ∈ {0,1}`                          — idx 421 does what it says
+  A1b  `IS_FULL_POINT = 0` whenever `µ = 0`             — idx 422; padding cannot fire the
+                                                      full-point buses
+  A1c  the `Ecall` tuple is INJECTIVE in IS_FULL_POINT  — the pinning. Two rows with the same
                                                       `ts` but different modes produce
                                                       different bus tuples, so LogUp cannot
                                                       match a flipped selector against the
                                                       CPU's real `a7`.
   A1d  degree bookkeeping                           — both new constraints are degree 2, so
                                                       `max_degree() == 3` still holds.
-  A1f  IS_BIT(IS_AFFINE) is load-bearing      — and not for the reason its comment gives:
+  A1f  IS_BIT(IS_FULL_POINT) is load-bearing      — and not for the reason its comment gives:
                                                     without it the row can impersonate a
                                                     DIFFERENT accelerator's ecall.
   A1e  µ-gating is NOT vacuous                      — with idx 422 dropped, a padding row
-                                                      can set `IS_AFFINE = 1` and satisfy all
+                                                      can set `IS_FULL_POINT = 1` and satisfy all
                                                       422 remaining constraints, and then
-                                                      fires 8 affine-gated MEMW ops. Paired:
+                                                      fires 8 full-point-gated MEMW ops. Paired:
                                                       idx 422 KEPT must block that state.
 
 A1c is where the interesting failure lives, and it is a failure of *arithmetic*, not of
-wiring: the receiver puts `xonly + IS_AFFINE·(affine − xonly)` on the bus PER 32-BIT WORD.
+wiring: the receiver puts `xonly + IS_FULL_POINT·(full_point − xonly)` on the bus PER 32-BIT WORD.
 If the two syscall numbers agreed in their low word and differed only in the high one, the
 low word's coefficient would be zero — and since the high word is where they'd differ, that
 one would carry the information. The dangerous case is when they agree in the word that is
 checked and differ nowhere else: then every coefficient is zero, the tuple is constant, and
-`IS_AFFINE` is free. Today's numbers differ in the LOW word only (`2^32−11` vs `2^32−12`)
+`IS_FULL_POINT` is free. Today's numbers differ in the LOW word only (`2^32−11` vs `2^32−12`)
 and share the high word, so the pinning rests entirely on the low word. `execution.rs`
 guards this with a `const _: () = assert!`; A1c proves the guard is the right guard by
 showing the degenerate choice it forbids really does un-pin the selector.
@@ -47,7 +47,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from affine_common import (  # noqa: E402
     AFFINE_YG_READ_OFFSETS,
     AFFINE_YR_WRITE_OFFSETS,
-    ECSM_AFFINE_SYSCALL_NUMBER,
+    ECSM_FULL_POINT_SYSCALL_NUMBER,
     ECSM_SYSCALL_NUMBER,
     PG,
     SYSCALL_NUMBERS,
@@ -75,7 +75,7 @@ def _unsat(solver, name, detail=""):
     return r
 
 
-# ── A1a: IS_AFFINE is a bit ─────────────────────────────────────────────────
+# ── A1a: IS_FULL_POINT is a bit ─────────────────────────────────────────────────
 
 def a1_prime():
     ok = certify_pg_prime()
@@ -98,7 +98,7 @@ def a1a_is_bit():
     at this modulus (nonlinear integer arithmetic, free quotient). Recorded in RESULTS.md."""
     roots, complete = field_roots([-1, 1, 0])  # −a² + a
     ok = complete and set(roots) == {0, 1}
-    report("A1a IS_BIT(IS_AFFINE) ⇒ a ∈ {0,1}", "PROVED" if ok else "FAIL",
+    report("A1a IS_BIT(IS_FULL_POINT) ⇒ a ∈ {0,1}", "PROVED" if ok else "FAIL",
            f"idx 421; roots over GF(p_g) = {sorted(roots)}, split complete: {complete}")
 
 
@@ -107,7 +107,7 @@ def a1a_is_bit():
 def a1b_padding():
     """Both selector constraints together: `µ ∈ {0,1}` (idx 0, by the same root argument)
     and `a·(1−µ) ≡ 0` (idx 422) force `a = 0` on padding rows. This is what lets the
-    `yG`/`yR` buses use `Multiplicity::Column(IS_AFFINE)` without a separate padding
+    `yG`/`yR` buses use `Multiplicity::Column(IS_FULL_POINT)` without a separate padding
     argument.
 
     On a padding row `µ = 0` substitutes into idx 422 to give `a·1 ≡ 0`, which is LINEAR —
@@ -119,7 +119,7 @@ def a1b_padding():
     s.add(a >= 0, a < PG)
     s.add(a * 1 - m * PG == 0)   # idx 422 at µ = 0, lifted: a ≡ 0 (mod p_g)
     s.add(a != 0)                # deny the conclusion
-    r = _unsat(s, "A1b AffineZeroOnPadding ⇒ µ=0 forces IS_AFFINE=0",
+    r = _unsat(s, "A1b FullPointZeroOnPadding ⇒ µ=0 forces IS_FULL_POINT=0",
                f"idx 422 at µ=0; IS_BIT(MU) roots {sorted(mu_roots)};")
     if not ok:
         report("A1b IS_BIT(MU) root split", "FAIL", "incomplete factorisation")
@@ -128,9 +128,9 @@ def a1b_padding():
 
 # ── A1c: the Ecall pinning ─────────────────────────────────────────────────
 
-def a1c_pinning(xonly=ECSM_SYSCALL_NUMBER, affine=ECSM_AFFINE_SYSCALL_NUMBER,
+def a1c_pinning(xonly=ECSM_SYSCALL_NUMBER, full_point=ECSM_FULL_POINT_SYSCALL_NUMBER,
                 label="repo numbers", expect_proved=True):
-    """The receiver's two syscall words, as functions of `IS_AFFINE`, must SEPARATE the
+    """The receiver's two syscall words, as functions of `IS_FULL_POINT`, must SEPARATE the
     two modes: `(lo(0), hi(0)) ≠ (lo(1), hi(1))`.
 
     Why that is the pinning. The `Ecall` bus is a LogUp argument: the CPU sends the tuple
@@ -145,9 +145,9 @@ def a1c_pinning(xonly=ECSM_SYSCALL_NUMBER, affine=ECSM_AFFINE_SYSCALL_NUMBER,
     < 2^32 ≪ p_g here, so no collision, but the model should not assume it.)"""
     lo0, lo1 = syscall_word_lo(0), syscall_word_lo(1)
     hi0, hi1 = syscall_word_hi(0), syscall_word_hi(1)
-    if (xonly, affine) != (ECSM_SYSCALL_NUMBER, ECSM_AFFINE_SYSCALL_NUMBER):
-        lo_x, lo_a = xonly & 0xFFFF_FFFF, affine & 0xFFFF_FFFF
-        hi_x, hi_a = xonly >> 32, affine >> 32
+    if (xonly, full_point) != (ECSM_SYSCALL_NUMBER, ECSM_FULL_POINT_SYSCALL_NUMBER):
+        lo_x, lo_a = xonly & 0xFFFF_FFFF, full_point & 0xFFFF_FFFF
+        hi_x, hi_a = xonly >> 32, full_point >> 32
         lo0, lo1 = lo_x, lo_x + (lo_a - lo_x)
         hi0, hi1 = hi_x, hi_x + (hi_a - hi_x)
 
@@ -157,8 +157,8 @@ def a1c_pinning(xonly=ECSM_SYSCALL_NUMBER, affine=ECSM_AFFINE_SYSCALL_NUMBER,
     proved = r == z3.unsat
     verdict = ("PROVED" if proved else "SAT — FORGES")
     detail = (f"[{label}] lo: {lo0} vs {lo1}; hi: {hi0} vs {hi1}"
-              + ("" if proved else "  ⇒ IS_AFFINE UNCONSTRAINED"))
-    report(f"A1c Ecall tuple injective in IS_AFFINE [{label}]", verdict, detail)
+              + ("" if proved else "  ⇒ IS_FULL_POINT UNCONSTRAINED"))
+    report(f"A1c Ecall tuple injective in IS_FULL_POINT [{label}]", verdict, detail)
     return proved == expect_proved
 
 
@@ -174,7 +174,7 @@ def a1c_controls():
                       "equal lo, differing hi (assert fires; still injective)",
                       expect_proved=True)
     # CONTROL 2 — the genuinely broken shape: identical numbers. Then every coefficient is
-    # zero, the receiver's tuple is constant, and IS_AFFINE is free. This is the limit the
+    # zero, the receiver's tuple is constant, and IS_FULL_POINT is free. This is the limit the
     # assert's low-word test rules out.
     ok &= a1c_pinning(ECSM_SYSCALL_NUMBER, ECSM_SYSCALL_NUMBER,
                       "identical numbers (degenerate)", expect_proved=False)
@@ -200,8 +200,8 @@ def a1d_degrees():
     """`max_degree()` is still 3. The two new constraints are `a·(1−a)` and `a·(1−µ)`,
     both degree 2; the new `YrLtP` chain reuses the existing shape, whose worst term is
     `µ·c_i·(1−c_i)` at degree 3 — the same bound the chip already declared."""
-    deg = {"idx 421 IS_BIT(IS_AFFINE)": 2,
-           "idx 422 AffineZeroOnPadding": 2,
+    deg = {"idx 421 IS_BIT(IS_FULL_POINT)": 2,
+           "idx 422 FullPointZeroOnPadding": 2,
            "idx 413..419 CarryBit(YrLtP)": 3,
            "idx 420 OverflowRequired(YrLtP)": 2}
     ok = max(deg.values()) == 3
@@ -211,9 +211,9 @@ def a1d_degrees():
 
 # ── A1e: is the µ-gate load-bearing? ───────────────────────────────────────
 
-def _padding_row_constraints(is_affine, include_422):
+def _padding_row_constraints(is_full_point, include_422):
     """Evaluate EVERY emitted ECSM constraint on an all-zero padding row with the given
-    `IS_AFFINE`, returning `{index: value mod p_g}` for the ones that do not vanish.
+    `IS_FULL_POINT`, returning `{index: value mod p_g}` for the ones that do not vanish.
 
     Indices follow `ecsm.rs`'s header map (0..423), and the map is walked in full rather
     than summarised. A control that lists "the constraints I think remain" can report a
@@ -251,9 +251,9 @@ def _padding_row_constraints(is_affine, include_422):
         for j in range(7):
             emit(base + j, mu * 0 * (1 - 0))                # µ·c·(1−c)
         emit(base + 7, mu * (1 - 0))                        # µ·(1−c_7)
-    emit(421, is_affine * (1 - is_affine))                  # IS_BIT(IS_AFFINE)
+    emit(421, is_full_point * (1 - is_full_point))                  # IS_BIT(IS_FULL_POINT)
     if include_422:
-        emit(422, is_affine * (1 - mu))                     # AffineZeroOnPadding
+        emit(422, is_full_point * (1 - mu))                     # FullPointZeroOnPadding
     return bad, count
 
 
@@ -261,9 +261,9 @@ def a1e_padding_control():
     """NEGATIVE CONTROL, paired with the check the premise is load-bearing for.
 
     Drop idx 422 and ask whether a padding row can turn the mode on. It can: with idx 422
-    gone, `IS_AFFINE = 1` on a `µ = 0` row satisfies all 422 remaining constraints. And the
+    gone, `IS_FULL_POINT = 1` on a `µ = 0` row satisfies all 422 remaining constraints. And the
     consequence is checked, not asserted — the `yG`-read and `yR`-write senders use
-    `Multiplicity::Column(IS_AFFINE)`, which evaluates to 1 on that row, so 8 MEMW
+    `Multiplicity::Column(IS_FULL_POINT)`, which evaluates to 1 on that row, so 8 MEMW
     interactions fire at whatever address and timestamp the padding columns hold.
 
     The pairing matters: a control that drops a premise and then re-runs a check which never
@@ -271,46 +271,46 @@ def a1e_padding_control():
     KEEPING idx 422 must block the state (else the control proves nothing about idx 422), and
     dropping it must admit it."""
     # Half 1 — with idx 422 KEPT, the attack state must be blocked.
-    bad_kept, n_kept = _padding_row_constraints(is_affine=1, include_422=True)
+    bad_kept, n_kept = _padding_row_constraints(is_full_point=1, include_422=True)
     blocked_by_422 = set(bad_kept) == {422}
     # Half 2 — with idx 422 DROPPED, nothing else objects.
-    bad_dropped, n_dropped = _padding_row_constraints(is_affine=1, include_422=False)
+    bad_dropped, n_dropped = _padding_row_constraints(is_full_point=1, include_422=False)
     forges = not bad_dropped
-    # And the honest padding row (IS_AFFINE = 0) must satisfy everything, or the constraint
+    # And the honest padding row (IS_FULL_POINT = 0) must satisfy everything, or the constraint
     # would be a completeness bug rather than a soundness fix.
-    bad_honest, _ = _padding_row_constraints(is_affine=0, include_422=True)
-    # The consequence: the affine-gated multiplicity is non-zero on the forged row.
+    bad_honest, _ = _padding_row_constraints(is_full_point=0, include_422=True)
+    # The consequence: the full-point-gated multiplicity is non-zero on the forged row.
     mult_fires = 1 != 0
     n_interactions = len(AFFINE_YG_READ_OFFSETS) + len(AFFINE_YR_WRITE_OFFSETS)
 
     ok = (blocked_by_422 and forges and not bad_honest and mult_fires
           and n_kept == 423 and n_dropped == 422)
-    report("A1e control [drop idx 422] padding row with IS_AFFINE=1",
+    report("A1e control [drop idx 422] padding row with IS_FULL_POINT=1",
            "SAT — FORGES" if ok else "FAIL",
            f"all {n_kept} constraints walked: idx 422 is the ONLY one violated when kept, "
            f"and all {n_dropped} remaining are satisfied when dropped; honest padding "
-           f"(IS_AFFINE=0) satisfies all {n_kept}. The dropped row then fires "
-           f"{n_interactions} IS_AFFINE-gated MEMW interactions. idx 422 is LOAD-BEARING."
+           f"(IS_FULL_POINT=0) satisfies all {n_kept}. The dropped row then fires "
+           f"{n_interactions} IS_FULL_POINT-gated MEMW interactions. idx 422 is LOAD-BEARING."
            if ok else
            f"blocked_by_422={sorted(bad_kept)}, dropped_violations={sorted(bad_dropped)}, "
            f"honest={sorted(bad_honest)}, counts={n_kept}/{n_dropped}")
     return ok
 
 
-# ── A1f: is IS_BIT(IS_AFFINE) itself load-bearing? ─────────────────────────
+# ── A1f: is IS_BIT(IS_FULL_POINT) itself load-bearing? ─────────────────────────
 
 def a1f_cross_syscall_control():
     """NEGATIVE CONTROL for idx 421, and the one this board originally MISSED.
 
-    A1a proves `IS_BIT(IS_AFFINE)` does what it says. That is not the same as showing it is
+    A1a proves `IS_BIT(IS_FULL_POINT)` does what it says. That is not the same as showing it is
     NECESSARY — and the necessity argument turns out to be the most interesting thing on this
     board, because it is not local to the ECSM pair at all.
 
-    The receiver's syscall words are `xonly + a·(affine − xonly)` per 32-bit word. For the
+    The receiver's syscall words are `xonly + a·(full_point − xonly)` per 32-bit word. For the
     repo's numbers the coefficients are:
 
-        low word :  affine_lo − xonly_lo = −1
-        high word:  affine_hi − xonly_hi =  0        (both share 0xFFFF_FFFF)
+        low word :  full_point_lo − xonly_lo = −1
+        high word:  full_point_hi − xonly_hi =  0        (both share 0xFFFF_FFFF)
 
     So as `a` ranges over the field, the received HIGH word is CONSTANT and the received LOW
     word ranges over the whole field. Every syscall that shares the high word — which is all
@@ -326,7 +326,7 @@ def a1f_cross_syscall_control():
 
     i.e. an ECSM row can consume the `Ecall` send of a *different* accelerator's ecall, and
     the guest's HINT (or keccak) call gets proven as a scalar multiplication that writes 32 or
-    64 bytes at whatever addresses the ECSM row's register columns claim. `IS_BIT(IS_AFFINE)`
+    64 bytes at whatever addresses the ECSM row's register columns claim. `IS_BIT(IS_FULL_POINT)`
     is the only thing confining `a` to `{0, 1}`.
 
     Note what does NOT close this: `execution.rs`'s `const _: () = assert!` compares only the
@@ -334,12 +334,12 @@ def a1f_cross_syscall_control():
     offset away, which is exactly the reachable case here.
 
     Paired, both directions:
-      * idx 421 KEPT    — only `a ∈ {0,1}` is admissible ⇒ only ECSM/ECSM_AFFINE reachable;
+      * idx 421 KEPT    — only `a ∈ {0,1}` is admissible ⇒ only ECSM/ECSM_FULL_POINT reachable;
       * idx 421 DROPPED — at least one other real syscall is reachable."""
     lo_x = ECSM_SYSCALL_NUMBER & 0xFFFF_FFFF
     hi_x = ECSM_SYSCALL_NUMBER >> 32
-    coeff_lo = (ECSM_AFFINE_SYSCALL_NUMBER & 0xFFFF_FFFF) - lo_x
-    coeff_hi = (ECSM_AFFINE_SYSCALL_NUMBER >> 32) - hi_x
+    coeff_lo = (ECSM_FULL_POINT_SYSCALL_NUMBER & 0xFFFF_FFFF) - lo_x
+    coeff_hi = (ECSM_FULL_POINT_SYSCALL_NUMBER >> 32) - hi_x
 
     def reached(a):
         return (syscall_word_lo(a) % PG, syscall_word_hi(a) % PG)
@@ -361,7 +361,7 @@ def a1f_cross_syscall_control():
 
     # Half 1: with idx 421 KEPT, a ∈ {0,1}, so only the two ECSM variants are reachable.
     reachable_as_bit = {n for n, a in impersonated.items() if a in (0, 1)}
-    kept_ok = reachable_as_bit == {"ECSM", "ECSM_AFFINE"}
+    kept_ok = reachable_as_bit == {"ECSM", "ECSM_FULL_POINT"}
     # Half 2: with idx 421 DROPPED, at least one OTHER syscall is reachable.
     foreign = {n: a for n, a in impersonated.items() if a not in (0, 1)}
     forges = len(foreign) > 0
@@ -373,7 +373,7 @@ def a1f_cross_syscall_control():
            "SAT — FORGES" if ok else "FAIL",
            f"high-word coefficient is {coeff_hi} (blind), low-word is {coeff_lo}, so the "
            f"received tuple sweeps the whole field. Reachable syscalls: "
-           + ", ".join(f"{n}@IS_AFFINE={a}" for n, a in sorted(impersonated.items(),
+           + ", ".join(f"{n}@IS_FULL_POINT={a}" for n, a in sorted(impersonated.items(),
                                                                key=lambda kv: kv[1]))
            + f". With idx 421 kept only {sorted(reachable_as_bit)} are admissible; dropped, "
              f"{sorted(foreign)} become reachable ⇒ idx 421 is LOAD-BEARING, and NOT for the "

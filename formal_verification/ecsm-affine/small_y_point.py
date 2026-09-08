@@ -102,7 +102,7 @@ def main():
 
     k, pt = ecsm_instance((x, y))
     got = affine_mul(k, pt[0], pt[1])
-    print("Reachable through the affine ecall:")
+    print("Reachable through the full-point ecall:")
     print(f"  k   = {k}")
     print(f"  xG  = 0x{pt[0]:064x}")
     print(f"  yG  = 0x{pt[1]:064x}")

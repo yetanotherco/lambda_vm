@@ -9,7 +9,7 @@
 //! - `keccak256`: a sponge over the `keccak_permute` precompile (riscv64; on
 //!   host it falls back to software keccak for tests).
 //! - `secp256k1_ecrecover`: the ECDSA recovery's 2-term linear combination is
-//!   evaluated through the affine ECSM `ecsm_mul_affine` precompile (riscv64),
+//!   evaluated through the full-point ECSM `ecsm_mul_full_point` precompile (riscv64),
 //!   which returns both coordinates of each `k·P` — so the two products cost one
 //!   query each and are combined with a single chord addition. On host /
 //!   degenerate inputs it falls back to the pure-Rust `ProjectivePoint::lincomb`.
@@ -289,7 +289,7 @@ fn ecsm_ecrecover(sig: &[u8; 64], recid: u8, msg: &[u8; 32]) -> Result<[u8; 64],
 
 /// ECSM-accelerated 2-term linear combination `k1·P1 + k2·P2`.
 ///
-/// On riscv64 this uses two affine ECSM queries (the precompile returns `(x, y)`,
+/// On riscv64 this uses two full-point ECSM queries (the precompile returns `(x, y)`,
 /// see [`lincomb2_with_oracle`]) instead of four x-only queries plus chord-law
 /// y-reconstruction; on other targets, and whenever a guard trips, it returns
 /// `None` so the caller uses the pure-Rust `ProjectivePoint::lincomb`.
@@ -313,7 +313,7 @@ fn ecsm_lincomb2(
     None
 }
 
-/// AFFINE oracle backed by the ECSM precompile: computes the full point `k·(x, y)` for the
+/// FULL-POINT oracle backed by the ECSM precompile: computes the full point `k·(x, y)` for the
 /// caller's actual input point `(x, y)`. Returns `(xR, yR)` as normalized field elements —
 /// no parity convention or sign flip, because the precompile receives the real `y` and the
 /// prover pins it by a memory read. `(x, y)` must be a curve point and `k` in `(0, N)`.
@@ -338,7 +338,7 @@ fn ecsm_oracle(
         k_le[i] = k_be[31 - i];
     }
     let mut out = [0u8; 64];
-    lambda_vm_syscalls::syscalls::ecsm_mul_affine(&mut out, &input, &k_le);
+    lambda_vm_syscalls::syscalls::ecsm_mul_full_point(&mut out, &input, &k_le);
     let mut xr_be = [0u8; 32];
     let mut yr_be = [0u8; 32];
     for i in 0..32 {
@@ -399,10 +399,10 @@ where
     Option::from(x.invert())
 }
 
-/// Computes `k1·P1 + k2·P2` from two affine oracle queries, or `None` if a
+/// Computes `k1·P1 + k2·P2` from two full-point oracle queries, or `None` if a
 /// degenerate configuration trips a guard.
 ///
-/// The affine ECSM ecall returns the full point, so `A = k1·P1` and `B = k2·P2`
+/// The full-point ECSM ecall returns the full point, so `A = k1·P1` and `B = k2·P2`
 /// each cost one query and `Q = A + B` is a single chord addition — one field
 /// inversion, for `1/(xb − xa)`. `dx = 0` covers both degenerate cases at once
 /// (two curve points share an x only when they are equal or negatives), so the

@@ -3,8 +3,9 @@ name: GPU Tests (merge queue)
 # Run the GPU test suite (which CPU CI can't, since GitHub runners have no GPU) on a rented
 # Vast.ai RTX 5090 when a PR is in the merge queue, and block the merge if it fails.
 # Groups (see scripts/gpu_test.sh): math-cuda kernel parity, cuda_path_integration (GPU proof
-# verifies), cuda_fallback (CPU fallback verifies), the prover/stark/crypto/ecsm suite on the
-# GPU path, and the comprehensive all-instructions prove. Orchestration runs on a GitHub-hosted
+# verifies), cuda_d1_path (the num_parts==1 device DEEP/FRI path), cuda_fallback (CPU fallback
+# verifies), the prover/stark/crypto/ecsm suite on the GPU path, and the comprehensive
+# all-instructions prove. Orchestration runs on a GitHub-hosted
 # runner; all GPU work happens on the rented box (provisioned by the template onstart). The box
 # is ALWAYS destroyed at the end.
 #
@@ -55,7 +56,7 @@ jobs:
     # Skip on PRs (reports as Skipped = required check satisfied, no GPU rental); run for
     # real on merge_group and manual dispatch.
     if: github.event_name != 'pull_request'
-    # Provisioning + cuda builds + 5 test groups; the prover suite (single-threaded, real
+    # Provisioning + cuda builds + 6 test groups; the prover suite (single-threaded, real
     # ELF proves) dominates. Generous ceiling; teardown still always destroys the box.
     timeout-minutes: 240
     steps:

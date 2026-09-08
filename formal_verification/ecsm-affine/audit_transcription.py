@@ -38,7 +38,7 @@ from affine_common import (  # noqa: E402
     ADDR_LIMB_BOUND_64B,
     CARRY_OFFSET_X2,
     CARRY_OFFSET_YG,
-    ECSM_AFFINE_SYSCALL_NUMBER,
+    ECSM_FULL_POINT_SYSCALL_NUMBER,
     ECSM_SYSCALL_NUMBER,
     INSTRUCTION_TS_STRIDE,
     SYSCALL_NUMBERS,
@@ -97,8 +97,8 @@ def _src(sources, path):
 def p_columns(s):
     src = _src(s, ECSM_RS)
     got = {n: int(m) for n, m in re.findall(
-        r"pub const (IS_AFFINE|YR_SUB_P|NUM_COLUMNS|MU): usize = (\d+);", src)}
-    want = {"MU": 666, "IS_AFFINE": 667, "YR_SUB_P": 668, "NUM_COLUMNS": 684}
+        r"pub const (IS_FULL_POINT|YR_SUB_P|NUM_COLUMNS|MU): usize = (\d+);", src)}
+    want = {"MU": 666, "IS_FULL_POINT": 667, "YR_SUB_P": 668, "NUM_COLUMNS": 684}
     ok = got == want and got["YR_SUB_P"] + 16 == got["NUM_COLUMNS"]
     return ok, (f"{got}; YR_SUB_P + 16 halfwords = {got.get('YR_SUB_P', 0) + 16} == "
                 f"NUM_COLUMNS {got.get('NUM_COLUMNS')}")
@@ -110,8 +110,8 @@ def p_constraint_count(s):
     ok = m is not None and int(m.group(1)) == 423
     # and the header index map mentions the new blocks
     ok &= "//   413..420 : CarryBit(YrLtP, 0..7)" in src
-    ok &= "//   421      : IS_BIT(IS_AFFINE)" in src
-    ok &= "//   422      : AffineZeroOnPadding" in src
+    ok &= "//   421      : IS_BIT(IS_FULL_POINT)" in src
+    ok &= "//   422      : FullPointZeroOnPadding" in src
     return ok, f"idx closes at {m.group(1) if m else '?'} == 423; header map lists 413..422"
 
 
@@ -129,47 +129,47 @@ def p_addr_bounds(s):
 def p_syscall_numbers(s):
     src = _src(s, EXEC_RS)
     x = re.search(r"ECSM_SYSCALL_NUMBER: u64 = u64::MAX - (\d+);", src)
-    a = re.search(r"ECSM_AFFINE_SYSCALL_NUMBER: u64 = u64::MAX - (\d+);", src)
+    a = re.search(r"ECSM_FULL_POINT_SYSCALL_NUMBER: u64 = u64::MAX - (\d+);", src)
     ok = (x and a
           and 2**64 - 1 - int(x.group(1)) == ECSM_SYSCALL_NUMBER
-          and 2**64 - 1 - int(a.group(1)) == ECSM_AFFINE_SYSCALL_NUMBER)
+          and 2**64 - 1 - int(a.group(1)) == ECSM_FULL_POINT_SYSCALL_NUMBER)
     return ok, f"u64::MAX−{x.group(1) if x else '?'} / u64::MAX−{a.group(1) if a else '?'}"
 
 
 def p_lowword_assert(s):
     """A1c's premise: the low-word inequality is guarded at COMPILE time, so a future
-    variant cannot silently un-pin `IS_AFFINE`."""
+    variant cannot silently un-pin `IS_FULL_POINT`."""
     src = _src(s, EXEC_RS)
     ok = bool(re.search(
         r"const _: \(\) = assert!\(\s*ECSM_SYSCALL_NUMBER & 0xFFFF_FFFF"
-        r"\s*!=\s*ECSM_AFFINE_SYSCALL_NUMBER & 0xFFFF_FFFF", src))
+        r"\s*!=\s*ECSM_FULL_POINT_SYSCALL_NUMBER & 0xFFFF_FFFF", src))
     return ok, "the low-32-bit-word inequality is a compile-time assert"
 
 
 def p_syscall_word_linear(s):
     """A1c's other premise: the Ecall receiver's syscall words really are
-    `xonly + IS_AFFINE·(affine − xonly)`, per word."""
+    `xonly + IS_FULL_POINT·(full_point − xonly)`, per word."""
     src = _src(s, ECSM_RS)
-    ok = ("let syscall_word = |xonly: i64, affine: i64|" in src
+    ok = ("let syscall_word = |xonly: i64, full_point: i64|" in src
           and "LinearTerm::Constant(xonly)" in src
-          and "coefficient: affine - xonly," in src
-          and "column: cols::IS_AFFINE," in src
-          and "syscall_word(xonly_lo, affine_lo)" in src
-          and "syscall_word(xonly_hi, affine_hi)" in src)
-    return ok, "both received words are the IS_AFFINE interpolation of the two numbers"
+          and "coefficient: full_point - xonly," in src
+          and "column: cols::IS_FULL_POINT," in src
+          and "syscall_word(xonly_lo, full_point_lo)" in src
+          and "syscall_word(xonly_hi, full_point_hi)" in src)
+    return ok, "both received words are the IS_FULL_POINT interpolation of the two numbers"
 
 
-def p_affine_gated_buses(s):
-    """A1/A3's premise: the yG read and yR write fire with multiplicity IS_AFFINE, four
+def p_full_point_gated_buses(s):
+    """A1/A3's premise: the yG read and yR write fire with multiplicity IS_FULL_POINT, four
     doublewords each, at `+32 + 8i`, and the yR write at `ts + 3`."""
     src = _src(s, ECSM_RS)
-    ok = "let affine = || Multiplicity::Column(cols::IS_AFFINE);" in src
-    ok &= src.count("            affine(),") == 2          # one per for-loop body
+    ok = "let full_point = || Multiplicity::Column(cols::IS_FULL_POINT);" in src
+    ok &= src.count("            full_point(),") == 2          # one per for-loop body
     ok &= len(re.findall(r"LinearTerm::Constant\(\(32 \+ 8 \* i\) as i64\)", src)) == 2
     ok &= "memw_read(\n                dword_bytes(cols::YG, i)," in src
     ok &= "memw_write(\n                dword_bytes(cols::YR, i)," in src
     ok &= "ts_lo_plus(3)," in src
-    return ok, ("2 affine-gated bus blocks (4 dwords each), offsets +32+8i, yG via "
+    return ok, ("2 full-point-gated bus blocks (4 dwords each), offsets +32+8i, yG via "
                 "memw_read at ts and yR via memw_write at ts+3")
 
 
@@ -187,7 +187,7 @@ def p_yrltp_wiring(s):
 def p_yrltp_mu_gated(s):
     """A2d's premise, and the reason it is an OBSERVATION rather than a bug: `YrLtP` sits in
     the same `for kind in [...]` loop as the other three, so its constraints are µ-gated —
-    NOT IS_AFFINE-gated. It therefore binds on x-only rows too."""
+    NOT IS_FULL_POINT-gated. It therefore binds on x-only rows too."""
     src = _src(s, ECSM_RS)
     m = re.search(r"for kind in \[\s*OverflowKind::XgLtP,\s*OverflowKind::KLtN,\s*"
                   r"OverflowKind::XrLtP,\s*OverflowKind::YrLtP,\s*\] \{(.*?)\n        \}",
@@ -198,8 +198,8 @@ def p_yrltp_mu_gated(s):
         ok = ("let mu = b.main(0, cols::MU);" in body
               and "mu * ci.clone() * (one - ci.clone())" in body
               and "mu * (one - c[7].clone())" in body
-              and "cols::IS_AFFINE" not in body)
-    return ok, ("all four chains share one µ-gated loop; IS_AFFINE does not appear in it ⇒ "
+              and "cols::IS_FULL_POINT" not in body)
+    return ok, ("all four chains share one µ-gated loop; IS_FULL_POINT does not appear in it ⇒ "
                 "YrLtP binds x-only rows too (strictly stronger; A2d)")
 
 
@@ -281,7 +281,7 @@ def p_no_parity_constraint(s):
     lines = {i + 1: ln for i, ln in enumerate(src.splitlines()) if "cols::YG" in ln}
     allowed = {
         "table.set_bytes(row_idx, cols::YG, &w.y_g);": "trace fill",
-        "dword_bytes(cols::YG, i),": "the affine yG MEMW read (the fix itself)",
+        "dword_bytes(cols::YG, i),": "the full-point yG MEMW read (the fix itself)",
         "is_byte(cols::YG, 32, &mut out);": "AreBytes range check (parity-blind)",
         "cols::YG,": "Ecdas seed/drain bus tuples (parity-blind)",
         "s = s + byte(cols::YG, 32, j) * byte(cols::YG, 32, i - j);":
@@ -335,7 +335,7 @@ def p_all_syscall_numbers(s):
     bus, not just the ECSM pair.
 
     A1f's conclusion is about which foreign syscalls the linear syscall word can reach as
-    `IS_AFFINE` sweeps the field. Add a fifth syscall and the reachable set changes — so the
+    `IS_FULL_POINT` sweeps the field. Add a fifth syscall and the reachable set changes — so the
     set has to be read from the source, not remembered. Parsed as `u64::MAX - k` declarations,
     and the parsed set must equal the model's exactly (both directions: a new syscall fails
     this, and so does a stale entry)."""
@@ -384,7 +384,7 @@ def p_q1_width(s):
                 "what admits A3g's y + p")
 
 PREMISES = [
-    Premise("P1 column layout", "A1/A2", "IS_AFFINE=667, YR_SUB_P=668..684, NUM_COLUMNS=684",
+    Premise("P1 column layout", "A1/A2", "IS_FULL_POINT=667, YR_SUB_P=668..684, NUM_COLUMNS=684",
             p_columns,
             mutations=[(ECSM_RS, r"pub const NUM_COLUMNS: usize = 684;",
                         "pub const NUM_COLUMNS: usize = 683;", "off-by-one column count")]),
@@ -396,30 +396,30 @@ PREMISES = [
             mutations=[(ECSM_RS, r"ADDR_LIMB_BOUND_64B: u64 = \(1 << 32\) - 63;",
                         "ADDR_LIMB_BOUND_64B: u64 = (1 << 32) - 64;", "off-by-one bound")]),
     Premise("P4 syscall numbers", "A1c", "u64::MAX−10 and u64::MAX−11", p_syscall_numbers,
-            mutations=[(EXEC_RS, r"ECSM_AFFINE_SYSCALL_NUMBER: u64 = u64::MAX - 11;",
-                        "ECSM_AFFINE_SYSCALL_NUMBER: u64 = u64::MAX - 12;",
-                        "different affine number")]),
+            mutations=[(EXEC_RS, r"ECSM_FULL_POINT_SYSCALL_NUMBER: u64 = u64::MAX - 11;",
+                        "ECSM_FULL_POINT_SYSCALL_NUMBER: u64 = u64::MAX - 12;",
+                        "different full-point number")]),
     Premise("P5 low-word compile-time assert", "A1c",
             "the pinning's only separating word is guarded at compile time", p_lowword_assert,
             mutations=[(EXEC_RS, r"const _: \(\) = assert!\(",
                         "const _UNUSED: () = ((), assert!(", "assert removed/renamed")]),
-    Premise("P6 syscall word is linear in IS_AFFINE", "A1c",
+    Premise("P6 syscall word is linear in IS_FULL_POINT", "A1c",
             "both received words interpolate the two numbers", p_syscall_word_linear,
-            mutations=[(ECSM_RS, r"coefficient: affine - xonly,",
+            mutations=[(ECSM_RS, r"coefficient: full_point - xonly,",
                         "coefficient: 0,", "coefficient zeroed ⇒ selector unpinned")]),
-    Premise("P7 affine-gated bus layout", "A1/A3",
-            "4+4 IS_AFFINE-gated dwords at +32+8i, yR at ts+3", p_affine_gated_buses,
+    Premise("P7 full-point-gated bus layout", "A1/A3",
+            "4+4 IS_FULL_POINT-gated dwords at +32+8i, yR at ts+3", p_full_point_gated_buses,
             mutations=[(ECSM_RS, r"LinearTerm::Constant\(\(32 \+ 8 \* i\) as i64\)",
                         "LinearTerm::Constant((8 * i) as i64)", "offset +32 dropped")]),
     Premise("P8 YrLtP wiring", "A2", "YrLtP → (P_BYTES, YR_SUB_P, YR), byte-stored",
             p_yrltp_wiring,
             mutations=[(ECSM_RS, r"OverflowKind::YrLtP => cols::YR,",
                         "OverflowKind::YrLtP => cols::XR,", "sum column swapped to XR")]),
-    Premise("P9 YrLtP is µ-gated, not IS_AFFINE-gated", "A2d",
+    Premise("P9 YrLtP is µ-gated, not IS_FULL_POINT-gated", "A2d",
             "the four chains share one µ-gated loop", p_yrltp_mu_gated,
             mutations=[(ECSM_RS, r"let mu = b\.main\(0, cols::MU\);\n                let one = b\.one\(\);\n                b\.emit_base\(idx, mu \* ci\.clone\(\)",
-                        "let mu = b.main(0, cols::IS_AFFINE);\n                let one = b.one();\n                b.emit_base(idx, mu * ci.clone()",
-                        "carry bits re-gated on IS_AFFINE")]),
+                        "let mu = b.main(0, cols::IS_FULL_POINT);\n                let one = b.one();\n                b.emit_base(idx, mu * ci.clone()",
+                        "carry bits re-gated on IS_FULL_POINT")]),
     Premise("P10 YR_SUB_P halfword checks", "A2", "16 µ-gated IsHalfword sends",
             p_yr_sub_p_halfword_checks,
             mutations=[(ECSM_RS, r"vec!\[packed\(cols::yr_sub_p\(i\)\)\],",
@@ -496,7 +496,11 @@ def main():
 
     n_ok = 0
     for pr in PREMISES:
+        # `bool(...)`: the premise checks build `ok` by `and`-ing regex match objects, so a
+        # non-match yields None, not False. Without this a broken premise crashes the run
+        # instead of reporting FAIL — which is the one thing this file must never do.
         ok, detail = pr.check(sources)
+        ok = bool(ok)
         n_ok += ok
         tag = "READ" if pr.kind == "assumed" else "READ(neg)"
         report(f"{pr.key} [{pr.lemma}]", tag if ok else "FAIL", detail)
@@ -514,6 +518,7 @@ def main():
                 continue
             mutated[path] = new
             ok, _ = pr.check(mutated)
+            ok = bool(ok)
             n_mut += 1
             if ok:
                 blind.append(f"{pr.key}: survives mutation '{why}' ⇒ the check is BLIND")

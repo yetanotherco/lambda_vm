@@ -40,7 +40,7 @@ all three carry real weight:
   load-bearing" verdict would be *wrong* — the gate would be claiming a fix is necessary when
   something else already covered it. Checked by enumerating **every** appearance of `cols::YG`
   in `ecsm.rs` (there are 7) and confirming each is one of five known parity-blind uses: the
-  trace fill, the affine MEMW read (the fix itself), the `AreBytes` range check, the
+  trace fill, the full-point MEMW read (the fix itself), the `AreBytes` range check, the
   `Ecdas` seed/drain tuples, and the `Yg` relation's `yG²` term. A *new* appearance fails the
   audit, which is the point.
 - **P17 — `YR` is not byte-checked in `ecsm.rs`.** This is contract C4-YR. `YrLtP` reads
@@ -78,15 +78,15 @@ Current state: **21/21 premises read from source, 21/21 mutations bite, 0 failur
 
 | # | Lemma | Premise | Source | Mutation control |
 |---|---|---|---|---|
-| P1 | A1/A2 | `MU=666, IS_AFFINE=667, YR_SUB_P=668..684, NUM_COLUMNS=684` — and `YR_SUB_P + 16 == NUM_COLUMNS`, so the new halfwords fit exactly with no overlap | `ecsm.rs` `mod cols` | `NUM_COLUMNS → 683` |
+| P1 | A1/A2 | `MU=666, IS_FULL_POINT=667, YR_SUB_P=668..684, NUM_COLUMNS=684` — and `YR_SUB_P + 16 == NUM_COLUMNS`, so the new halfwords fit exactly with no overlap | `ecsm.rs` `mod cols` | `NUM_COLUMNS → 683` |
 | P2 | A1 | `debug_assert_eq!(idx, 423)`, and the header index map documents `413..420` / `421` / `422` | `ecsm.rs` | `idx → 421` |
 | P3 | A4 | `ADDR_LIMB_BOUND_32B = 2^32−31`, `..._64B = 2^32−63` | `ecsm.rs:43,47` | `64B → 2^32−64` |
-| P4 | A1c | `ECSM_SYSCALL_NUMBER = u64::MAX−10`, affine `= u64::MAX−11` | `execution.rs:38,47` | affine `→ u64::MAX−12` |
+| P4 | A1c | `ECSM_SYSCALL_NUMBER = u64::MAX−10`, full point `= u64::MAX−11` | `execution.rs:38,47` | full point `→ u64::MAX−12` |
 | P5 | A1c | the low-32-bit-word inequality is a **compile-time** assert | `execution.rs:53-58` | assert renamed away |
-| P6 | A1c | the received syscall words are `xonly + IS_AFFINE·(affine − xonly)`, per word | `ecsm.rs` `syscall_word` | `coefficient: affine - xonly → 0` |
-| P7 | A1/A3 | 2 `IS_AFFINE`-gated bus blocks of 4 dwords, offsets `+32 + 8i`, `yG` via `memw_read` at `ts`, `yR` via `memw_write` at `ts+3` | `ecsm.rs` | offset `+32` dropped |
+| P6 | A1c | the received syscall words are `xonly + IS_FULL_POINT·(full_point − xonly)`, per word | `ecsm.rs` `syscall_word` | `coefficient: full_point - xonly → 0` |
+| P7 | A1/A3 | 2 `IS_FULL_POINT`-gated bus blocks of 4 dwords, offsets `+32 + 8i`, `yG` via `memw_read` at `ts`, `yR` via `memw_write` at `ts+3` | `ecsm.rs` | offset `+32` dropped |
 | P8 | A2 | `YrLtP → (P_BYTES, YR_SUB_P, YR)`, byte-stored sum (only `KLtN` is bit-stored) | `ecsm.rs` `OverflowKind` | sum column `YR → XR` |
-| P9 | A2d | all four chains share ONE `µ`-gated loop; `IS_AFFINE` does not appear inside it | `ecsm.rs` `eval` | carry bits re-gated on `IS_AFFINE` |
+| P9 | A2d | all four chains share ONE `µ`-gated loop; `IS_FULL_POINT` does not appear inside it | `ecsm.rs` `eval` | carry bits re-gated on `IS_FULL_POINT` |
 | P10 | A2 | 16 `µ`-gated `IsHalfword` sends on `yr_sub_p(i)` | `ecsm.rs` | sends aimed at `xr_sub_p` |
 | P11 | A4 | 3 `Alu` LT senders: `xG`/`xR` vs `addr_bound_by_mode()`, `k` vs the flat bound, `LT`/result 1 | `ecsm.rs` | `xR`'s sender deleted |
 | P12 | A4 | executor arm: spans `63/63/31`, the `u128` overlap guard, `yG` read at `+32`, `yR` stored at `+32` | `execution.rs` | `u128 → u64` (the pre-fix wrapping form) |

@@ -17,7 +17,7 @@ It also carries the campaign's most direct exhibit: the parity forgery, produced
 own witness generator rather than by the model. For every scalar, `compute_witness_with_y`
 accepts BOTH roots of `xG³ + b` and returns two complete, internally consistent witnesses with
 the same `x_r` and different `y_r`. Nothing in `crypto/ecsm` objects, and nothing in the AIR's
-arithmetic objects either (A3b) — which is exactly why the `IS_AFFINE`-gated `yG` read has to
+arithmetic objects either (A3b) — which is exactly why the `IS_FULL_POINT`-gated `yG` read has to
 exist.
 
 Input: `real_witnesses.jsonl`, produced by
@@ -182,8 +182,8 @@ def a6c_parity_forgery_from_the_repo(accepted):
     by_label = {}
     for r in accepted:
         by_label.setdefault(r["label"], {})[r["mode"]] = r
-    pairs = [(lab, v["affine/+y"], v["affine/-y"]) for lab, v in by_label.items()
-             if "affine/+y" in v and "affine/-y" in v]
+    pairs = [(lab, v["full-point/+y"], v["full-point/-y"]) for lab, v in by_label.items()
+             if "full-point/+y" in v and "full-point/-y" in v]
     facts = {
         "at least one pair present": len(pairs) > 0,
         "both roots always accepted": all(
@@ -209,7 +209,7 @@ def a6c_parity_forgery_from_the_repo(accepted):
 
 
 def a6d_xonly_equals_even_lift(accepted):
-    """`G`'s y is even, so the x-only witness and the `affine/+y` witness over `G` must be
+    """`G`'s y is even, so the x-only witness and the `full-point/+y` witness over `G` must be
     IDENTICAL, field for field. If they diverged, the two paths would not be the same chip and
     A3e's "x-only is untouched" would be false."""
     by_label = {}
@@ -220,14 +220,14 @@ def a6d_xonly_equals_even_lift(accepted):
     n = 0
     ok = True
     for lab, v in by_label.items():
-        if "x-only" in v and "affine/+y" in v:
-            if le_hex(v["x-only"]["x_g"]) != le_hex(v["affine/+y"]["x_g"]):
+        if "x-only" in v and "full-point/+y" in v:
+            if le_hex(v["x-only"]["x_g"]) != le_hex(v["full-point/+y"]["x_g"]):
                 continue  # different base point (the small-y instance)
-            ok &= all(v["x-only"][f] == v["affine/+y"][f] for f in fields)
+            ok &= all(v["x-only"][f] == v["full-point/+y"][f] for f in fields)
             n += 1
-    report("A6d x-only == affine with the even lift", "PROVED" if ok and n else "FAIL",
+    report("A6d x-only == full-point with the even lift", "PROVED" if ok and n else "FAIL",
            f"{n} labels over G (whose y is even): all {len(fields)} witness fields identical "
-           "⇒ the affine variant is the same chip, not a parallel one")
+           "⇒ the full-point variant is the same chip, not a parallel one")
     return ok and n > 0
 
 

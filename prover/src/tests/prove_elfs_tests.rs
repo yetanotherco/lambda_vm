@@ -1619,28 +1619,28 @@ fn secp256k1_generator_le() -> ([u8; 32], [u8; 32]) {
     (gx, gy)
 }
 
-/// Reads the compiled affine ECSM rust guest (`ecsm_mul_affine` → commit xR‖yR).
-fn ecsm_affine_elf_bytes() -> Vec<u8> {
+/// Reads the compiled full-point ECSM rust guest (`ecsm_mul_full_point` → commit xR‖yR).
+fn ecsm_full_point_elf_bytes() -> Vec<u8> {
     let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("workspace root")
         .to_path_buf();
-    std::fs::read(workspace_root.join("executor/program_artifacts/rust/ecsm_affine.elf"))
-        .expect("ecsm_affine.elf not found — run `make compile-programs-rust`")
+    std::fs::read(workspace_root.join("executor/program_artifacts/rust/ecsm_full_point.elf"))
+        .expect("ecsm_full_point.elf not found — run `make compile-programs-rust`")
 }
 
-/// End-to-end via the **affine** Rust-guest path: `ecsm_mul_affine` computes 5·G and commits
-/// the full 64-byte point xR‖yR. Verifies the affine ecall proves (IS_AFFINE=1: yG read from
+/// End-to-end via the **full-point** Rust-guest path: `ecsm_mul_full_point` computes 5·G and commits
+/// the full 64-byte point xR‖yR. Verifies the full-point ecall proves (IS_FULL_POINT=1: yG read from
 /// memory, yR written back) and that the committed point matches the native reference.
 #[test]
-fn test_prove_ecsm_affine_rust_guest() {
+fn test_prove_ecsm_full_point_rust_guest() {
     let _ = env_logger::builder().is_test(true).try_init();
 
-    let elf_bytes = ecsm_affine_elf_bytes();
+    let elf_bytes = ecsm_full_point_elf_bytes();
     let proof = prove_vm_minimal(&elf_bytes, &[], &Default::default());
     assert!(
         verify_vm_minimal(&proof, &elf_bytes),
-        "ecsm_affine rust guest should verify"
+        "ecsm_full_point rust guest should verify"
     );
 
     // Committed output must equal the full point 5·G = (xR, yR).
@@ -1653,8 +1653,8 @@ fn test_prove_ecsm_affine_rust_guest() {
     assert_eq!(proof.public_output, expected);
 }
 
-/// Soundness: forging the returned `yR` on an affine ECSM row must be rejected. `yR` is pinned
-/// both by the affine yR-write MEMW bus (mult = IS_AFFINE) and by the ECDAS final-receiver
+/// Soundness: forging the returned `yR` on a full-point ECSM row must be rejected. `yR` is pinned
+/// both by the full-point yR-write MEMW bus (mult = IS_FULL_POINT) and by the ECDAS final-receiver
 /// tuple, so tampering it unbalances those buses and the proof must fail to verify.
 #[test]
 fn test_prove_ecsm_forged_yr_rejected() {
@@ -1662,7 +1662,7 @@ fn test_prove_ecsm_forged_yr_rejected() {
 
     let _ = env_logger::builder().is_test(true).try_init();
 
-    let elf_bytes = ecsm_affine_elf_bytes();
+    let elf_bytes = ecsm_full_point_elf_bytes();
     let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
     let executor =
         executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
@@ -1670,7 +1670,7 @@ fn test_prove_ecsm_forged_yr_rejected() {
     let mut traces =
         Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
 
-    // Forge the low byte of yR on the (single) real affine ECSM row.
+    // Forge the low byte of yR on the (single) real full-point ECSM row.
     let orig = *traces.ecsm.main_table.get(0, ecsm_cols::YR);
     let forged = orig + FieldElement::<GoldilocksField>::one();
     traces.ecsm.main_table.set(0, ecsm_cols::YR, forged);
@@ -1681,18 +1681,18 @@ fn test_prove_ecsm_forged_yr_rejected() {
     );
 }
 
-/// Soundness: `IS_AFFINE` cannot be forged. It is what gates the yG-read and yR-write MEMW
+/// Soundness: `IS_FULL_POINT` cannot be forged. It is what gates the yG-read and yR-write MEMW
 /// buses, and it is pinned by the `Ecall` receiver, whose syscall word is
-/// `xonly + IS_AFFINE·(affine − xonly)` — the CPU sends the guest's real `a7`, so clearing
-/// the selector on a row that ran the affine ecall leaves that bus (and the two it gates)
+/// `xonly + IS_FULL_POINT·(full_point − xonly)` — the CPU sends the guest's real `a7`, so clearing
+/// the selector on a row that ran the full-point ecall leaves that bus (and the two it gates)
 /// unbalanced.
 #[test]
-fn test_prove_ecsm_forged_is_affine_rejected() {
+fn test_prove_ecsm_forged_is_full_point_rejected() {
     use crate::tables::ecsm::cols as ecsm_cols;
 
     let _ = env_logger::builder().is_test(true).try_init();
 
-    let elf_bytes = ecsm_affine_elf_bytes();
+    let elf_bytes = ecsm_full_point_elf_bytes();
     let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
     let executor =
         executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
@@ -1701,14 +1701,14 @@ fn test_prove_ecsm_forged_is_affine_rejected() {
         Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
 
     assert_eq!(
-        *traces.ecsm.main_table.get(0, ecsm_cols::IS_AFFINE),
+        *traces.ecsm.main_table.get(0, ecsm_cols::IS_FULL_POINT),
         FieldElement::<GoldilocksField>::one(),
-        "sanity: the ecsm_affine guest produces an affine row"
+        "sanity: the ecsm_full_point guest produces a full-point row"
     );
     traces
         .ecsm
         .main_table
-        .set(0, ecsm_cols::IS_AFFINE, FieldElement::zero());
+        .set(0, ecsm_cols::IS_FULL_POINT, FieldElement::zero());
 
     assert!(
         !prove_and_verify_vm_minimal(&elf, &mut traces),
@@ -3079,8 +3079,8 @@ fn test_prove_wsuffix_64bit() {
 
 /// Proves a minimal Rust std program that uses `init_allocator()` and
 /// `String::from("Hello World") + commit`. Exercises the full Rust-std stack:
-/// TLSF heap init (SRL on high-bit values), CSR instructions injected by
-/// the Rust toolchain, and the allocator's memory access patterns.
+/// guest heap init, CSR instructions injected by the Rust toolchain, and the
+/// allocator's memory access patterns.
 #[test]
 fn test_prove_allocator_minimal_reproducer() {
     let _ = env_logger::builder().is_test(true).try_init();

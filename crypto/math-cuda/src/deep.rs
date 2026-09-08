@@ -41,6 +41,8 @@ pub fn deep_composition_ext3(
     row_stride: usize,
     domain_size: usize,
 ) -> Result<Vec<u64>> {
+    #[cfg(feature = "test-faults")]
+    crate::faults::check_sticky(&crate::faults::FAULT_DEEP_STICKY)?;
     let be = backend()?;
     let stream = be.next_stream();
     deep_composition_ext3_impl(
@@ -86,6 +88,8 @@ pub fn deep_composition_ext3_with_dev_parts(
     row_stride: usize,
     domain_size: usize,
 ) -> Result<Vec<u64>> {
+    #[cfg(feature = "test-faults")]
+    crate::faults::check_sticky(&crate::faults::FAULT_DEEP_STICKY)?;
     let be = backend()?;
     let stream = be.next_stream();
     deep_composition_ext3_impl(
@@ -262,6 +266,8 @@ pub fn deep_composition_ext3_with_dev_parts_and_inv_denoms(
     row_stride: usize,
     domain_size: usize,
 ) -> Result<Vec<u64>> {
+    #[cfg(feature = "test-faults")]
+    crate::faults::check_sticky(&crate::faults::FAULT_DEEP_STICKY)?;
     let deep_out = deep_fully_resident_launch(
         stream,
         main_lde,
@@ -324,6 +330,8 @@ pub fn deep_composition_ext3_fully_resident_keep(
     row_stride: usize,
     domain_size: usize,
 ) -> Result<GpuDeepCodeword> {
+    #[cfg(feature = "test-faults")]
+    crate::faults::check_sticky(&crate::faults::FAULT_DEEP_STICKY)?;
     assert!(
         domain_size.is_power_of_two() && domain_size >= 2,
         "bit-reverse needs a power-of-two codeword"

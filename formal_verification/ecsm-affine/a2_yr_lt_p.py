@@ -218,9 +218,9 @@ def a2d_contract_c4_yr():
 
     `YrLtP`'s `sum_word_bytes` reads `YR`'s 32 columns as bytes. But `ecsm.rs`'s `is_byte`
     list is `{X2, Q0, YG, Q1}` — `YR` is NOT there, and neither is `XR` (whose bytes come
-    from the MEMW write's store-time range check, contract C4). The affine `yR` MEMW write
-    WOULD range-check `YR`, but it fires with multiplicity `IS_AFFINE`, while `YrLtP` is
-    gated on `µ`. So on an x-only row (`µ=1, IS_AFFINE=0`) the write does not fire and the
+    from the MEMW write's store-time range check, contract C4). The full-point `yR` MEMW write
+    WOULD range-check `YR`, but it fires with multiplicity `IS_FULL_POINT`, while `YrLtP` is
+    gated on `µ`. So on an x-only row (`µ=1, IS_FULL_POINT=0`) the write does not fire and the
     byte bound has to come from somewhere else.
 
     It does, by the earlier board's L6 case split on `len_k`:
@@ -248,15 +248,15 @@ def a2d_contract_c4_yr():
     return ok
 
 
-def a2d_affine_gating_asymmetry():
+def a2d_full_point_gating_asymmetry():
     """A recorded observation rather than a lemma: `YrLtP` is `µ`-gated while the `yR` write
-    is `IS_AFFINE`-gated, so the check binds on x-only rows too, where nothing observes `yR`.
+    is `IS_FULL_POINT`-gated, so the check binds on x-only rows too, where nothing observes `yR`.
 
     That direction is harmless — a strictly stronger constraint cannot admit more traces —
     but it must not cost COMPLETENESS. It does not: `compute_witness_inner` fills
     `y_r_sub_p` unconditionally, and `result.y` is a reduced affine coordinate on both paths,
     so `yR < p` holds by construction. Checked concretely in A2e."""
-    report("A2d observation [µ-gated, not IS_AFFINE-gated]", "NOTED",
+    report("A2d observation [µ-gated, not IS_FULL_POINT-gated]", "NOTED",
            "YrLtP binds on x-only rows too: strictly stronger (sound), and honest "
            "witnesses satisfy it because witness.rs fills y_r_sub_p on both paths")
     return True
@@ -272,13 +272,13 @@ def a2e_honest_anchor():
     xg, yg = mul(7, G)
     for k in [1, 2, 3, N - 1, N - 2, 2**255, 2**255 - 1, (N - 1) // 2, 0xDEADBEEF]:
         cases.append(("affine", k, affine_mul(k, xg, yg)))
-    # x-only rows: same chip columns, IS_AFFINE = 0, yR still constrained by YrLtP.
+    # x-only rows: same chip columns, IS_FULL_POINT = 0, yR still constrained by YrLtP.
     for k in [1, 2, N - 1, 0x1234_5678]:
         cases.append(("x-only", k, affine_mul(k, G[0], G[1])))
     # and the y = 1 point, whose yR sits at the very bottom of the non-canonical band
     small = json.loads((Path(__file__).parent / "small_y_point.json").read_text())
     inst = small["ecsm_instance"]
-    cases.append(("affine/small-y", inst["k"],
+    cases.append(("full-point/small-y", inst["k"],
                   affine_mul(inst["k"], int(inst["x_g"], 16), int(inst["y_g"], 16))))
 
     bad = []
@@ -294,7 +294,7 @@ def a2e_honest_anchor():
             bad.append((mode, k, "halfword mismatch"))
     report("A2e honest-witness anchor", "PROVED" if not bad else "FAIL",
            f"{len(cases)} witnesses ({sum(1 for m,_,_ in cases if m=='x-only')} x-only, "
-           f"{sum(1 for m,_,_ in cases if m.startswith('affine'))} affine): every c_i ∈ "
+           f"{sum(1 for m,_,_ in cases if m.startswith('full-point'))} full-point): every c_i ∈ "
            "{0,1}, c_7 = 1, YR_SUB_P halfwords in [0,2^16)"
            if not bad else f"failures: {bad[:3]}")
     return not bad
@@ -445,7 +445,7 @@ def main():
     a2c_width()
     a2c_wrong_constant_control()
     a2d_contract_c4_yr()
-    a2d_affine_gating_asymmetry()
+    a2d_full_point_gating_asymmetry()
     a2e_honest_anchor()
     a2f_forgery()
     a2g_load_bearing()

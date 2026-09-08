@@ -847,12 +847,12 @@ fn collect_ecsm_ops(
     Vec<ecdas::EcdasOperation>,
 ) {
     let t = op.timestamp;
-    let is_affine = op.ecsm_affine;
+    let is_full_point = op.ecsm_full_point;
     let addr_xr = register_state.read(10).0;
     let addr_xg = register_state.read(11).0;
     let addr_k = register_state.read(12).0;
 
-    // Read the operands from memory. x-only reads xG (32B) + k (32B); affine also reads yG
+    // Read the operands from memory. x-only reads xG (32B) + k (32B); the full-point mode also reads yG
     // (the caller's real input y, pinned below by a memory read at T) so the returned point
     // is the caller's actual point — no even-parity convention.
     let mut xg = [0u8; 32];
@@ -860,7 +860,7 @@ fn collect_ecsm_ops(
     let mut k = [0u8; 32];
     for i in 0..32 {
         xg[i] = memory_state.read_byte(addr_xg.wrapping_add(i as u64)).0;
-        if is_affine {
+        if is_full_point {
             yg[i] = memory_state
                 .read_byte(addr_xg.wrapping_add(32 + i as u64))
                 .0;
@@ -868,7 +868,7 @@ fn collect_ecsm_ops(
         k[i] = memory_state.read_byte(addr_k.wrapping_add(i as u64)).0;
     }
 
-    let witness = if is_affine {
+    let witness = if is_full_point {
         ::ecsm::compute_witness_with_y(&k, &xg, &yg)
             .expect("ECSM witness: executor validates 0 < k < N, xG/yG < p, (xG,yG) on curve")
     } else {
@@ -876,8 +876,8 @@ fn collect_ecsm_ops(
             .expect("ECSM witness: executor validates 0 < k < N and xG on curve")
     };
 
-    // 15 ops on the x-only path; the affine path adds 4 yG reads and 4 yR writes.
-    let mut memw_ops = Vec::with_capacity(if is_affine { 23 } else { 15 });
+    // 15 ops on the x-only path; the full-point path adds 4 yG reads and 4 yR writes.
+    let mut memw_ops = Vec::with_capacity(if is_full_point { 23 } else { 15 });
 
     // x11 -> addr_xG (register read at T), x12 -> addr_k (register read at T+1).
     {
@@ -904,10 +904,10 @@ fn collect_ecsm_ops(
         memory_state.write_bytes(addr, dword, 8, t);
     }
 
-    // AFFINE only: yG: 4 doubleword reads at T (addr_xG + 32 + 8i). Pins the witnessed yG to
+    // FULL POINT only: yG: 4 doubleword reads at T (addr_xG + 32 + 8i). Pins the witnessed yG to
     // the caller's input, closing the parity soundness gap. x-only guests pass only xG, so
-    // this block (and the ECSM table's yG-read bus, gated by IS_AFFINE) does not run.
-    if is_affine {
+    // this block (and the ECSM table's yG-read bus, gated by IS_FULL_POINT) does not run.
+    if is_full_point {
         for i in 0..4 {
             let addr = addr_xg.wrapping_add((32 + 8 * i) as u64);
             let mut value = [0u32; 8];
@@ -976,10 +976,10 @@ fn collect_ecsm_ops(
         memory_state.write_bytes(addr, dword, 8, t + 2);
     }
 
-    // AFFINE only: yR writes at T + 3 (4 doublewords at addr_xR + 32 + 8i). Matches the
-    // ecsm.rs YR sender block (gated by IS_AFFINE); the executor wrote yR to addr_xR + 32.
+    // FULL POINT only: yR writes at T + 3 (4 doublewords at addr_xR + 32 + 8i). Matches the
+    // ecsm.rs YR sender block (gated by IS_FULL_POINT); the executor wrote yR to addr_xR + 32.
     // x-only guests get only xR written back.
-    if is_affine {
+    if is_full_point {
         for i in 0..4 {
             let addr = addr_xr.wrapping_add((32 + 8 * i) as u64);
             let mut value = [0u32; 8];
@@ -1007,7 +1007,7 @@ fn collect_ecsm_ops(
         addr_xg,
         addr_k,
         addr_xr,
-        is_affine,
+        is_full_point,
         witness,
     };
 
@@ -3235,11 +3235,11 @@ fn build_traces<I: ImageSource + Sync>(
         ]
     }));
     // ECSM range-checks: each operand's low address limb < the executor's addr_limb_ok
-    // bound (32-byte operands 2^32-31, the affine variant's 64-byte xG‖yG / xR‖yR
+    // bound (32-byte operands 2^32-31, the full-point variant's 64-byte xG‖yG / xR‖yR
     // 2^32-63), matching EcsmAddressOverflow. Three LT ops per ECSM call; the ECSM table
-    // sends the matching ALU LT interactions with the bound linear in IS_AFFINE.
+    // sends the matching ALU LT interactions with the bound linear in IS_FULL_POINT.
     lt_ops.extend(ecsm_ops.iter().flat_map(|op| {
-        let operand_bound = if op.is_affine {
+        let operand_bound = if op.is_full_point {
             ecsm::ADDR_LIMB_BOUND_64B
         } else {
             ecsm::ADDR_LIMB_BOUND_32B
@@ -4061,6 +4061,83 @@ pub fn count_table_lengths(
 }
 
 impl Traces {
+    /// Pre-upload the epoch's biggest main traces to device, called from the
+    /// epoch pipeline's builder thread (idle slack ahead of the prover) so the
+    /// R1 main commits D2D-copy instead of paying the H2D inside their chains.
+    /// Biggest tables first, bounded by `LAMBDA_VM_TRACE_PREUPLOAD_MB` (default
+    /// 4096) of VRAM riding ahead per epoch; tables that don't fit (or are
+    /// below the 8 MiB floor, or whose upload fails) keep the normal H2D path.
+    #[cfg(feature = "cuda")]
+    pub fn preupload_main_traces(&mut self) {
+        const MIN_BYTES: usize = 8 << 20;
+        static BUDGET_BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let budget = *BUDGET_BYTES.get_or_init(|| {
+            // Default OFF: pre-uploading was wall-neutral on the 5090 (the
+            // scheduler already hides the H2D) and its riding-ahead buffers
+            // sit outside the VRAM admission gate — at epoch 2^22 they pushed
+            // the prove past the card's headroom. Opt in for PCIe-bound
+            // setups via the env var.
+            let env_cap = std::env::var("LAMBDA_VM_TRACE_PREUPLOAD_MB")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(0)
+                << 20;
+            // These buffers ride ahead of the prover's own VRAM admission
+            // gate (they exist before their table is admitted), so cap them
+            // to a slice of the device budget rather than competing with the
+            // prove peak on small cards.
+            match stark::gpu_lde::device_vram_budget_bytes() {
+                Some(dev) => env_cap.min((dev / 4) as usize),
+                None => env_cap,
+            }
+        });
+        if budget == 0 {
+            return;
+        }
+
+        let mut tables: Vec<&mut TraceTable<GoldilocksField, GoldilocksExtension>> = Vec::new();
+        tables.extend(self.cpus.iter_mut());
+        tables.extend(self.lts.iter_mut());
+        tables.extend(self.shifts.iter_mut());
+        tables.extend(self.memws.iter_mut());
+        tables.extend(self.memw_aligneds.iter_mut());
+        tables.extend(self.memw_registers.iter_mut());
+        tables.extend(self.loads.iter_mut());
+        tables.extend(self.muls.iter_mut());
+        tables.extend(self.dvrms.iter_mut());
+        tables.extend(self.pages.iter_mut());
+        tables.extend(self.branches.iter_mut());
+        tables.extend(self.eqs.iter_mut());
+        tables.extend(self.bytewises.iter_mut());
+        tables.extend(self.stores.iter_mut());
+        tables.extend(self.cpu32s.iter_mut());
+        // BITWISE is excluded: `prove_epoch` mutates its multiplicities in
+        // place (L2G range-check lookups) after the build, which would leave
+        // a stale device copy to be committed.
+        tables.push(&mut self.decode);
+        tables.push(&mut self.keccak);
+        tables.push(&mut self.keccak_rnd);
+        tables.push(&mut self.ecsm);
+        tables.push(&mut self.ecdas);
+
+        let bytes_of = |t: &TraceTable<GoldilocksField, GoldilocksExtension>| {
+            t.num_rows() * t.num_main_columns * 8
+        };
+        tables.sort_by_key(|t| std::cmp::Reverse(bytes_of(t)));
+
+        let mut left = budget;
+        for t in tables {
+            let est = bytes_of(t);
+            if est < MIN_BYTES {
+                break;
+            }
+            if est > left {
+                continue;
+            }
+            left -= t.preupload_main_to_device(MIN_BYTES);
+        }
+    }
+
     /// Returns the total number of main-trace field elements across all tables.
     ///
     /// Counts only the main (base-field) trace columns — equivalent to SP1's

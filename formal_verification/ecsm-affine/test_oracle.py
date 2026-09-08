@@ -20,7 +20,7 @@ repeated here.
                          on-curve, plus the "k = 1 and k = N−1 are ordinary" claim.
   A5  ABI predicates   — `addr_limb_ok`, the overlap guard as exact interval disjointness,
                          and the u64-wrap negative control.
-  A6  ecrecover use    — the y-from-x reconstruction the affine ecall REPLACES agrees with
+  A6  ecrecover use    — the y-from-x reconstruction the full-point ecall REPLACES agrees with
                          the y the chip now returns, over random instances. Anchors the
                          claim that dropping `solve_y` is semantics-preserving.
   A7  optional cross   — differential against the `ecdsa`/`coincurve` PyPI package if
@@ -181,7 +181,7 @@ def a3_root_dependence(sample=200):
         xr, yr = affine_mul(k, x, y)
         xr2, yr2 = affine_mul(k, x, (P - y) % P)
         ok &= xr2 == xr                    # x-only path cannot see the parity ...
-        ok &= yr2 == (P - yr) % P          # ... but the affine one returns a different y
+        ok &= yr2 == (P - yr) % P          # ... but the full-point one returns a different y
         differed += yr2 != yr
     ok &= differed == sample               # the two roots NEVER agree (y ≠ 0 on secp256k1)
     report("A3 root dependence", "PASS" if ok else "FAIL",
@@ -261,7 +261,7 @@ def a5_abi():
            f"addr_limb_ok (={reachable}) yet the pre-fix guard misses a total overlap")
 
 
-# ── A6: the ecrecover reconstruction the affine ecall replaces ───────────────
+# ── A6: the ecrecover reconstruction the full-point ecall replaces ───────────────
 
 def _solve_y_from_two_x(xg, yg, x1, x2):
     """The x-only recovery the guest used to do: two accelerator queries give
@@ -302,7 +302,7 @@ def a6_ecrecover_equivalence(sample=60):
         n += 1
     report("A6 ecrecover equivalence", "PASS" if ok else "FAIL",
            f"{n} instances: y recovered from x(k·P) + x((k+1)·P) + the chord law "
-           "equals the y the affine ecall returns ⇒ dropping `solve_y` is "
+           "equals the y the full-point ecall returns ⇒ dropping `solve_y` is "
            "semantics-preserving")
 
 

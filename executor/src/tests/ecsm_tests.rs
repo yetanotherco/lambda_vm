@@ -2,7 +2,7 @@
 
 use crate::vm::instruction::decoding::Instruction;
 use crate::vm::instruction::execution::{
-    ECSM_AFFINE_SYSCALL_NUMBER, ECSM_SYSCALL_NUMBER, ExecutionError,
+    ECSM_FULL_POINT_SYSCALL_NUMBER, ECSM_SYSCALL_NUMBER, ExecutionError,
 };
 use crate::vm::memory::Memory;
 use crate::vm::registers::Registers;
@@ -76,9 +76,9 @@ fn k_le(v: u64) -> [u8; 32] {
     k
 }
 
-/// Runs the AFFINE ECSM syscall (full point in/out) with the given scalar, `xG` and `yG`,
+/// Runs the FULL-POINT ECSM syscall (full point in/out) with the given scalar, `xG` and `yG`,
 /// returning the `(xR, yR)` written back to the contiguous 64-byte output buffer.
-fn run_ecsm_affine(
+fn run_ecsm_full_point(
     k_le: &[u8; 32],
     xg_le: &[u8; 32],
     yg_le: &[u8; 32],
@@ -94,7 +94,7 @@ fn run_ecsm_affine(
     write_u256_le(&mut memory, addr_xg + 32, yg_le);
     write_u256_le(&mut memory, addr_k, k_le);
 
-    registers.write(17, ECSM_AFFINE_SYSCALL_NUMBER).unwrap();
+    registers.write(17, ECSM_FULL_POINT_SYSCALL_NUMBER).unwrap();
     registers.write(10, addr_xr).unwrap();
     registers.write(11, addr_xg).unwrap();
     registers.write(12, addr_k).unwrap();
@@ -107,10 +107,10 @@ fn run_ecsm_affine(
 }
 
 #[test]
-fn ecsm_affine_syscall_writes_both_coords() {
+fn ecsm_full_point_syscall_writes_both_coords() {
     let (xg, yg) = (gx_le(), gy_le());
     for v in [1u64, 2, 3, 5, 0xFFFF, 1_000_003] {
-        let (xr, yr) = run_ecsm_affine(&k_le(v), &xg, &yg).unwrap();
+        let (xr, yr) = run_ecsm_full_point(&k_le(v), &xg, &yg).unwrap();
         let (exr, eyr) = ecsm::scalar_mul_xy_with_y(&k_le(v), &xg, &yg).unwrap();
         assert_eq!(xr, exr, "xR mismatch for k = {v}");
         assert_eq!(yr, eyr, "yR mismatch for k = {v}");
@@ -118,12 +118,12 @@ fn ecsm_affine_syscall_writes_both_coords() {
 }
 
 #[test]
-fn ecsm_affine_syscall_rejects_point_not_on_curve() {
+fn ecsm_full_point_syscall_rejects_point_not_on_curve() {
     // A valid xG paired with the wrong yG (here yG = Gy of a different point) must be
     // rejected on-curve, unlike the x-only variant which lifts its own canonical y.
     let mut yg = gy_le();
     yg[0] ^= 1; // perturb so (xG, yG) is no longer on the curve
-    let err = run_ecsm_affine(&k_le(5), &gx_le(), &yg).unwrap_err();
+    let err = run_ecsm_full_point(&k_le(5), &gx_le(), &yg).unwrap_err();
     assert!(matches!(
         err,
         ExecutionError::Ecsm(ecsm::EcsmError::NotOnCurve)
@@ -190,10 +190,10 @@ fn ecsm_syscall_rejects_xg_not_on_curve() {
 }
 
 #[test]
-fn ecsm_affine_syscall_rejects_non_canonical_yg() {
+fn ecsm_full_point_syscall_rejects_non_canonical_yg() {
     // yG = p is a non-canonical zero. The prover reads yG straight out of the caller's
     // buffer, so nothing downstream would reduce it — the executor must reject it.
-    let err = run_ecsm_affine(&k_le(5), &gx_le(), &ecsm::P_BYTES).unwrap_err();
+    let err = run_ecsm_full_point(&k_le(5), &gx_le(), &ecsm::P_BYTES).unwrap_err();
     assert!(matches!(
         err,
         ExecutionError::Ecsm(ecsm::EcsmError::CoordinateOutOfRange)
@@ -201,24 +201,24 @@ fn ecsm_affine_syscall_rejects_non_canonical_yg() {
 }
 
 #[test]
-fn ecsm_affine_syscall_rejects_zero_scalar() {
-    let err = run_ecsm_affine(&k_le(0), &gx_le(), &gy_le()).unwrap_err();
+fn ecsm_full_point_syscall_rejects_zero_scalar() {
+    let err = run_ecsm_full_point(&k_le(0), &gx_le(), &gy_le()).unwrap_err();
     assert!(matches!(
         err,
         ExecutionError::Ecsm(ecsm::EcsmError::ScalarIsZero)
     ));
 }
 
-/// Runs the affine ECSM syscall with caller-chosen operand addresses, input point `G`
+/// Runs the full-point ECSM syscall with caller-chosen operand addresses, input point `G`
 /// and `k = 5`.
-fn run_ecsm_affine_at(addr_xr: u64, addr_xg: u64, addr_k: u64) -> Result<(), ExecutionError> {
+fn run_ecsm_full_point_at(addr_xr: u64, addr_xg: u64, addr_k: u64) -> Result<(), ExecutionError> {
     let mut pc = 0;
     let mut registers = Registers::default();
     let mut memory = Memory::default();
     write_u256_le(&mut memory, addr_xg, &gx_le());
     write_u256_le(&mut memory, addr_xg.wrapping_add(32), &gy_le());
     write_u256_le(&mut memory, addr_k, &k_le(5));
-    registers.write(17, ECSM_AFFINE_SYSCALL_NUMBER).unwrap();
+    registers.write(17, ECSM_FULL_POINT_SYSCALL_NUMBER).unwrap();
     registers.write(10, addr_xr).unwrap();
     registers.write(11, addr_xg).unwrap();
     registers.write(12, addr_k).unwrap();
@@ -227,11 +227,11 @@ fn run_ecsm_affine_at(addr_xr: u64, addr_xg: u64, addr_k: u64) -> Result<(), Exe
 }
 
 #[test]
-fn ecsm_affine_syscall_rejects_overlapping_point_k() {
+fn ecsm_full_point_syscall_rejects_overlapping_point_k() {
     // The input point spans 64 bytes, so any k landing inside [xG, xG + 64) is read at
     // both T and T+1 and makes the trace unprovable.
     for addr_k in [0x2000u64, 0x2008, 0x2020, 0x2038] {
-        let err = run_ecsm_affine_at(0x1000, 0x2000, addr_k).unwrap_err();
+        let err = run_ecsm_full_point_at(0x1000, 0x2000, addr_k).unwrap_err();
         assert!(
             matches!(err, ExecutionError::EcsmOperandOverlap),
             "addr_k = {addr_k:#x} overlaps the 64-byte input point and must be rejected"
@@ -240,11 +240,11 @@ fn ecsm_affine_syscall_rejects_overlapping_point_k() {
     // Disjoint is disjoint regardless of distance: k directly below the point is 32 bytes
     // away, which a `|diff| >= 64` bound would have rejected. Guest stack layouts produce
     // exactly this case, so it must run.
-    run_ecsm_affine_at(0x1000, 0x2000, 0x1FE0).expect("k immediately below the point must run");
-    run_ecsm_affine_at(0x1000, 0x2000, 0x2040).expect("k immediately above the point must run");
+    run_ecsm_full_point_at(0x1000, 0x2000, 0x1FE0).expect("k immediately below the point must run");
+    run_ecsm_full_point_at(0x1000, 0x2000, 0x2040).expect("k immediately above the point must run");
     // The output may alias either operand: its accesses are at later timestamps.
-    run_ecsm_affine_at(0x2000, 0x2000, 0x3000).expect("xR aliasing the input point is allowed");
-    run_ecsm_affine_at(0x3000, 0x2000, 0x3000).expect("xR aliasing k is allowed");
+    run_ecsm_full_point_at(0x2000, 0x2000, 0x3000).expect("xR aliasing the input point is allowed");
+    run_ecsm_full_point_at(0x3000, 0x2000, 0x3000).expect("xR aliasing k is allowed");
 }
 
 /// The overlap guard must not be defeated by 64-bit wraparound.
@@ -255,7 +255,7 @@ fn ecsm_affine_syscall_rejects_overlapping_point_k() {
 /// overlap it exists to reject. Reachable: `STACK_TOP` is `0xFFFF_FFFF_FFFF_FFF0`, so
 /// these addresses sit inside `main`'s first frame.
 #[test]
-fn ecsm_affine_overlap_guard_survives_address_wraparound() {
+fn ecsm_full_point_overlap_guard_survives_address_wraparound() {
     // 0xFFFF_FFFF_FFFF_FFC0 — the largest address passing addr_limb_ok(_, 63), and the one
     // for which addr_xg + 64 wraps to exactly 0.
     let top_point = u64::MAX - 63;
@@ -263,7 +263,7 @@ fn ecsm_affine_overlap_guard_survives_address_wraparound() {
     // additionally makes addr_k + 32 wrap, exercising the second. Both are genuine overlaps
     // (k inside the point's 64 bytes) that the pre-u128 guard accepted.
     for addr_k in [top_point, top_point + 32] {
-        let err = run_ecsm_affine_at(0x1000, top_point, addr_k).unwrap_err();
+        let err = run_ecsm_full_point_at(0x1000, top_point, addr_k).unwrap_err();
         assert!(
             matches!(err, ExecutionError::EcsmOperandOverlap),
             "addr_k = {addr_k:#x} overlaps the point at {top_point:#x} and must be rejected \
@@ -273,7 +273,7 @@ fn ecsm_affine_overlap_guard_survives_address_wraparound() {
 }
 
 #[test]
-fn ecsm_affine_syscall_rejects_address_overflow() {
+fn ecsm_full_point_syscall_rejects_address_overflow() {
     // Point and output span offset 63 (not 31), so their last accessed byte must stay in
     // the limb: 0xFFFF_FFE8 fits a 32-byte operand but not a 64-byte one.
     for (addr_xr, addr_xg, addr_k) in [
@@ -283,7 +283,7 @@ fn ecsm_affine_syscall_rejects_address_overflow() {
         (0x1000, 0xFFFF_FFC8, 0x3000),
         (0x1000, 0x2000, 0xFFFF_FFF0),
     ] {
-        let err = run_ecsm_affine_at(addr_xr, addr_xg, addr_k).unwrap_err();
+        let err = run_ecsm_full_point_at(addr_xr, addr_xg, addr_k).unwrap_err();
         assert!(
             matches!(err, ExecutionError::EcsmAddressOverflow),
             "expected address overflow for xR={addr_xr:#x}, point={addr_xg:#x}, k={addr_k:#x}"

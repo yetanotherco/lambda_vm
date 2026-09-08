@@ -22,7 +22,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 //    siblings overlap in wall time. Read them as per instance wall time.
 //  - `scripts/profiling/phase_table.py` SUMS spans that share a label, so a
 //    label used once per table reports the sum over all tables, which can
-//    exceed the enclosing phase's wall clock by up to `table_parallelism()`.
+//    exceed the enclosing phase's wall clock by up to the scheduler's `k`.
 //    Give a per instance span its own label; never reuse a phase label for it.
 //
 //     let _s = instruments::span("trace_build");   // RAII, stops on drop
@@ -278,8 +278,9 @@ pub struct MultiProveTiming {
     /// root must be absorbed before the shared LogUp challenges are sampled.
     pub main_commits: Duration,
     /// Wall clock of the fused per-table region: aux build, aux commit and
-    /// rounds 2-4, which run as one task per table across `table_parallelism()`
-    /// drivers. There is no phase-level wall for the aux stages on their own
+    /// rounds 2-4, which run as one task per table across
+    /// `table_parallelism(num_airs)` drivers. There is no phase-level wall for
+    /// the aux stages on their own
     /// any more; their CPU time shows up in `round1_sub`.
     pub rounds_2_4: Duration,
     /// Sub-op breakdown for Round 1 (main + aux LDE vs Merkle).

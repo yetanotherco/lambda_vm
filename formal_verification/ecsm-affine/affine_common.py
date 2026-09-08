@@ -1,15 +1,15 @@
-"""Shared model for the ECSM **affine-selector** z3 gate.
+"""Shared model for the ECSM **full-point-selector** z3 gate.
 
-Ground truth: `prover/src/tables/ecsm.rs` on branch `verify/ecsm-affine-selector`
+Ground truth: `prover/src/tables/ecsm.rs` on branch `verify/ecsm-full-point-selector`
 (head of PR #879), plus `executor/src/vm/instruction/execution.rs` for the ABI predicates.
 Every builder below carries the `file:line` it was transcribed from; the audit that checks
 those citations still say what the builder assumes is `TRANSCRIPTION-AUDIT.md`.
 
 Scope. This board covers ONLY the surface PR #879 adds or changes:
 
-  * the `IS_AFFINE` selector column and its two constraints (idx 421, 422),
-  * its `Ecall`-bus pinning (`syscall = xonly + IS_AFFINE·(affine − xonly)`),
-  * the `IS_AFFINE`-gated `yG` read and `yR` write, and their `+32 + 8i` offsets,
+  * the `IS_FULL_POINT` selector column and its two constraints (idx 421, 422),
+  * its `Ecall`-bus pinning (`syscall = xonly + IS_FULL_POINT·(full_point − xonly)`),
+  * the `IS_FULL_POINT`-gated `yG` read and `yR` write, and their `+32 + 8i` offsets,
   * the new `OverflowKind::YrLtP` carry chain (idx 413..420),
   * the `Alu`-LT address-limb senders and their mode-dependent bound.
 
@@ -55,18 +55,18 @@ N_BYTES = list(N.to_bytes(32, "little"))
 # ── syscall numbers (executor/src/vm/instruction/execution.rs:38, 47) ────────
 
 ECSM_SYSCALL_NUMBER = 2**64 - 1 - 10          # u64::MAX - 10, x-only
-ECSM_AFFINE_SYSCALL_NUMBER = 2**64 - 1 - 11   # u64::MAX - 11, affine
+ECSM_FULL_POINT_SYSCALL_NUMBER = 2**64 - 1 - 11   # u64::MAX - 11, affine
 
 # EVERY syscall number the CPU can put on the `Ecall` bus (execution.rs:29, 40, 48, 69).
 # A1f needs the whole set, not just the ECSM pair: the receiver's syscall word is LINEAR in
-# IS_AFFINE with low-word coefficient −1 and high-word coefficient 0, so as `IS_AFFINE` ranges
+# IS_FULL_POINT with low-word coefficient −1 and high-word coefficient 0, so as `IS_FULL_POINT` ranges
 # over the field the received low word ranges over the WHOLE field while the high word stays
-# fixed — which means every other syscall's tuple is reachable at some value of `IS_AFFINE`.
-# `IS_BIT(IS_AFFINE)` is what confines it to {0, 1}. Audit premise P19 keeps this set in sync.
+# fixed — which means every other syscall's tuple is reachable at some value of `IS_FULL_POINT`.
+# `IS_BIT(IS_FULL_POINT)` is what confines it to {0, 1}. Audit premise P19 keeps this set in sync.
 SYSCALL_NUMBERS = {
     "KECCAK": 2**64 - 1 - 1,
     "ECSM": ECSM_SYSCALL_NUMBER,
-    "ECSM_AFFINE": ECSM_AFFINE_SYSCALL_NUMBER,
+    "ECSM_FULL_POINT": ECSM_FULL_POINT_SYSCALL_NUMBER,
     "HINT": 2**64 - 1 - 30,
 }
 
@@ -77,8 +77,8 @@ ADDR_LIMB_BOUND_64B = (1 << 32) - 63
 
 # ── the affine memory-op layout (ecsm.rs, the two `for i in 0..4` blocks) ───
 #
-# yG read : 4 doublewords at ADDR_XG_0 + 32 + 8i, high limb ADDR_XG_1, ts     (mult IS_AFFINE)
-# yR write: 4 doublewords at ADDR_XR_0 + 32 + 8i, high limb ADDR_XR_1, ts + 3 (mult IS_AFFINE)
+# yG read : 4 doublewords at ADDR_XG_0 + 32 + 8i, high limb ADDR_XG_1, ts     (mult IS_FULL_POINT)
+# yR write: 4 doublewords at ADDR_XR_0 + 32 + 8i, high limb ADDR_XR_1, ts + 3 (mult IS_FULL_POINT)
 #
 # The pre-existing x-only ops, for the offset-collision audit:
 # xG read : 4 dwords at ADDR_XG_0 + 8i, ts      ; k read : ADDR_K_0 + 8i, ts + 1
@@ -95,30 +95,30 @@ INSTRUCTION_TS_STRIDE = 4  # cpu.rs: one instruction consumes 4 sub-timestamps
 
 # ── the Ecall syscall-word model (ecsm.rs, `syscall_word` closure) ──────────
 
-def syscall_word_lo(is_affine):
-    """`xonly_lo + IS_AFFINE·(affine_lo − xonly_lo)`, the low 32-bit word the ECSM row
-    puts on the `Ecall` bus (ecsm.rs, ECALL receiver). Linear in IS_AFFINE by design so
+def syscall_word_lo(is_full_point):
+    """`xonly_lo + IS_FULL_POINT·(full_point_lo − xonly_lo)`, the low 32-bit word the ECSM row
+    puts on the `Ecall` bus (ecsm.rs, ECALL receiver). Linear in IS_FULL_POINT by design so
     one receiver serves both modes."""
     lo_x = ECSM_SYSCALL_NUMBER & 0xFFFF_FFFF
-    lo_a = ECSM_AFFINE_SYSCALL_NUMBER & 0xFFFF_FFFF
-    return lo_x + is_affine * (lo_a - lo_x)
+    lo_a = ECSM_FULL_POINT_SYSCALL_NUMBER & 0xFFFF_FFFF
+    return lo_x + is_full_point * (lo_a - lo_x)
 
 
-def syscall_word_hi(is_affine):
-    """Same for the high word. Today both numbers share `0xFFFF_FFFF`, so the IS_AFFINE
+def syscall_word_hi(is_full_point):
+    """Same for the high word. Today both numbers share `0xFFFF_FFFF`, so the IS_FULL_POINT
     coefficient is ZERO and this word carries no mode information — which is exactly what
     the `const _: () = assert!` in execution.rs:53-58 exists to keep true-by-accident from
     becoming true-by-nobody-noticing."""
     hi_x = ECSM_SYSCALL_NUMBER >> 32
-    hi_a = ECSM_AFFINE_SYSCALL_NUMBER >> 32
-    return hi_x + is_affine * (hi_a - hi_x)
+    hi_a = ECSM_FULL_POINT_SYSCALL_NUMBER >> 32
+    return hi_x + is_full_point * (hi_a - hi_x)
 
 
-def addr_bound_by_mode(is_affine):
-    """`ADDR_LIMB_BOUND_32B + IS_AFFINE·(BOUND_64B − BOUND_32B)`, the RHS of the `Alu` LT
+def addr_bound_by_mode(is_full_point):
+    """`ADDR_LIMB_BOUND_32B + IS_FULL_POINT·(BOUND_64B − BOUND_32B)`, the RHS of the `Alu` LT
     senders for `ADDR_XG_0` and `ADDR_XR_0` (ecsm.rs, `addr_bound_by_mode`). `ADDR_K_0`
     uses the flat 32-byte bound in both modes."""
-    return ADDR_LIMB_BOUND_32B + is_affine * (ADDR_LIMB_BOUND_64B - ADDR_LIMB_BOUND_32B)
+    return ADDR_LIMB_BOUND_32B + is_full_point * (ADDR_LIMB_BOUND_64B - ADDR_LIMB_BOUND_32B)
 
 
 # ── the overflow carry chain (ecsm.rs, `EcsmConstraints::carry_chain`) ──────
@@ -191,14 +191,14 @@ def overflow_constraints(mu, c):
 
 # ── the two new selector constraints (ecsm.rs idx 421, 422) ────────────────
 
-def is_bit_is_affine(is_affine):
-    """idx 421 — `IS_AFFINE·(1 − IS_AFFINE)`."""
-    return is_affine * (1 - is_affine)
+def is_bit_is_full_point(is_full_point):
+    """idx 421 — `IS_FULL_POINT·(1 − IS_FULL_POINT)`."""
+    return is_full_point * (1 - is_full_point)
 
 
-def affine_zero_on_padding(is_affine, mu):
-    """idx 422 — `IS_AFFINE·(1 − µ)`."""
-    return is_affine * (1 - mu)
+def full_point_zero_on_padding(is_full_point, mu):
+    """idx 422 — `IS_FULL_POINT·(1 − µ)`."""
+    return is_full_point * (1 - mu)
 
 
 # ── honest witness generation (mirrors crypto/ecsm/src/witness.rs) ──────────

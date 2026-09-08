@@ -1,4 +1,4 @@
-"""Independent reference for the ECSM **affine** ecall (`ECSM_AFFINE_SYSCALL_NUMBER`).
+"""Independent reference for the ECSM **affine** ecall (`ECSM_FULL_POINT_SYSCALL_NUMBER`).
 
 Written from the curve definition, not from the repo: no `k256`, no `ecsm` crate, no
 `num_bigint`. Group law is plain textbook chord/tangent over `F_p` with Python ints, so a
@@ -24,7 +24,7 @@ variant and the reason the AIR has to pin `yG` to the caller's buffer:
 so publishing `yR` makes the input parity observable, while `x_only_mul` cannot see it.
 
 Citations to the code being modelled are inline, `file:line` against the branch
-`verify/ecsm-affine-selector` (head of PR #879 plus this campaign).
+`verify/ecsm-full-point-selector` (head of PR #879 plus this campaign).
 """
 
 # ── secp256k1 (SEC 2 v2 §2.4.1). Recomputed here, cross-checked against
@@ -163,7 +163,7 @@ def x_only_mul(k, xg):
 
 
 def affine_mul(k, xg, yg):
-    """NEW ecall (`ECSM_AFFINE_SYSCALL_NUMBER`): both coordinates of k·(xG, yG).
+    """NEW ecall (`ECSM_FULL_POINT_SYSCALL_NUMBER`): both coordinates of k·(xG, yG).
 
     Mirrors `ecsm::scalar_mul_xy_with_y` / `prepare_with_y`
     (crypto/ecsm/src/lib.rs:136-178). `yG` is the caller's own value — validated on
@@ -191,7 +191,7 @@ def addr_limb_ok(addr, span):
 
 
 def operands_disjoint(addr_xg, addr_k, point_bytes=64, scalar_bytes=32):
-    """The affine overlap guard (`execution.rs`, EcsmAffine arm): the point buffer
+    """The full-point overlap guard (`execution.rs`, EcsmAffine arm): the point buffer
     [addr_xg, +64) and the scalar [addr_k, +32) must not intersect.
 
     Computed in unbounded ints, which is what the branch's `u128` widening buys: the

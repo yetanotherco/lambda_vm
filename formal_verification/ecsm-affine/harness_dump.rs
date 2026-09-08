@@ -66,7 +66,7 @@ fn scalars() -> Vec<(String, BigUint)> {
 }
 
 /// Emits one JSON object per line. Every field the gate's model reads is present, plus the
-/// mode, so `a6_real_witness.py` can check the x-only and affine paths separately.
+/// mode, so `a6_real_witness.py` can check the x-only and full-point paths separately.
 fn emit(label: &str, mode: &str, k: &[u8; 32], xg: &[u8; 32], yg: Option<&[u8; 32]>) {
     let w = match yg {
         Some(y) => compute_witness_with_y(k, xg, y),
@@ -119,10 +119,10 @@ fn main() {
         let k = le32(&k);
         // x-only: yG is the canonical even lift, recovered internally from xG.
         emit(&label, "x-only", &k, &gx, None);
-        // affine, both roots — the pair A3's forgery is built from. Both must produce a
+        // full point, both roots — the pair A3's forgery is built from. Both must produce a
         // valid witness (that is the gap), and their y_r must differ.
-        emit(&label, "affine/+y", &k, &gx, Some(&gy));
-        emit(&label, "affine/-y", &k, &gx, Some(&gy_neg));
+        emit(&label, "full-point/+y", &k, &gx, Some(&gy));
+        emit(&label, "full-point/-y", &k, &gx, Some(&gy_neg));
     }
 
     // The y = 1 point from small_y_point.py, reached as 2·(2^-1·Q), so the honest
@@ -134,7 +134,7 @@ fn main() {
     let two = le32(&BigUint::from(2u8));
     emit(
         "small-y (y_r = 1)",
-        "affine/+y",
+        "full-point/+y",
         &two,
         &small_xg,
         Some(&small_yg),
@@ -142,12 +142,12 @@ fn main() {
 
     // Rejections the executor relies on: the validation set A4 of the oracle anchors.
     let zero = [0u8; 32];
-    emit("k=0", "affine/+y", &zero, &gx, Some(&gy));
+    emit("k=0", "full-point/+y", &zero, &gx, Some(&gy));
     let n_le = le32_from_be_hex(N_BE);
-    emit("k=N", "affine/+y", &n_le, &gx, Some(&gy));
+    emit("k=N", "full-point/+y", &n_le, &gx, Some(&gy));
     let mut off_curve = gy;
     off_curve[0] ^= 1;
-    emit("off-curve yG", "affine/+y", &two, &gx, Some(&off_curve));
+    emit("off-curve yG", "full-point/+y", &two, &gx, Some(&off_curve));
     let p_le = le32_from_be_hex(P_BE);
-    emit("yG=p", "affine/+y", &two, &gx, Some(&p_le));
+    emit("yG=p", "full-point/+y", &two, &gx, Some(&p_le));
 }

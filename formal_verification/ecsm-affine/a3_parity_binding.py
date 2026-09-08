@@ -11,7 +11,7 @@ multiple of a DIFFERENT point, and hand the guest its `y`:
   * the AIR cannot tell — an on-curve check passes for either root;
   * the guest cannot tell — knowing the parity of `k·P` is the work it delegated.
 
-PR #879's answer is an `IS_AFFINE`-gated MEMW read of `yG` from the caller's own buffer. This
+PR #879's answer is an `IS_FULL_POINT`-gated MEMW read of `yG` from the caller's own buffer. This
 board checks that the gap is real and that the read closes it:
 
   A3a  `yG`'s parity is arithmetically FREE       — the root set of the Yg relation is {±y}
@@ -120,7 +120,7 @@ def build_ecsm_witness(k, xg, yg):
     }
 
 
-def check_all_constraints(w, mu=1, is_affine=1):
+def check_all_constraints(w, mu=1, is_full_point=1):
     """Evaluate every emitted ECSM in-table constraint on a witness and return the list of
     violations. The index map in `prover/src/tables/ecsm.rs` (0..423) is walked ONE INDEX AT
     A TIME and the total is asserted, rather than summarised into families: a checker that
@@ -167,8 +167,8 @@ def check_all_constraints(w, mu=1, is_affine=1):
         for j in range(7):
             emit(base + j, mu * c[j] * (1 - c[j]), f"CarryBit({label},{j})")
         emit(base + 7, mu * (1 - c[7]), f"OverflowRequired({label})")
-    emit(421, is_affine * (1 - is_affine), "IS_BIT(IS_AFFINE)")
-    emit(422, is_affine * (1 - mu), "AffineZeroOnPadding")
+    emit(421, is_full_point * (1 - is_full_point), "IS_BIT(IS_FULL_POINT)")
+    emit(422, is_full_point * (1 - mu), "FullPointZeroOnPadding")
     assert count == 423, f"walked {count} constraints, the index map has 423"
 
     # C1/C2/Zero: bus contracts, not in-table constraints.
@@ -253,7 +253,7 @@ def a3b_sweep(sample=12):
 # ── A3c: the read pins yG ──────────────────────────────────────────────────
 
 def a3c_read_pins_yg():
-    """The `IS_AFFINE`-gated read must cover ALL of `YG`, exactly once, at the caller's own
+    """The `IS_FULL_POINT`-gated read must cover ALL of `YG`, exactly once, at the caller's own
     address — a read covering 31 bytes would leave one byte free, and the whole forgery needs
     only one byte to differ.
 
@@ -318,8 +318,8 @@ def a3d_load_bearing(honest, forged):
           and honest["yr"] != forged["yr"])
     report("A3d control [drop the yG read]", "SAT — FORGES" if ok else "FAIL",
            "both witnesses verify and are indistinguishable without the read ⇒ the "
-           "IS_AFFINE-gated yG MEMW read is LOAD-BEARING; it is the ONLY thing pinning the "
-           "input parity, and the affine ABI is what made the parity observable")
+           "IS_FULL_POINT-gated yG MEMW read is LOAD-BEARING; it is the ONLY thing pinning the "
+           "input parity, and the full-point ABI is what made the parity observable")
     return ok
 
 
@@ -343,7 +343,7 @@ def a3e_xonly_unchanged(sample=20):
         ok &= a[0] == b[0]
     report("A3e imported L7 survives", "PROVED" if ok else "FAIL",
            f"{sample} instances: x(k·P) = x(k·(−P)) ⇒ the x-only path's conclusion is "
-           "unaffected by the affine variant, and x-only rows may still leave parity free")
+           "unaffected by the full-point variant, and x-only rows may still leave parity free")
     return ok
 
 

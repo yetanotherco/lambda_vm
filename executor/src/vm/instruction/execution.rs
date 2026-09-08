@@ -19,8 +19,8 @@ pub enum SyscallNumbers {
     // Placeholder discriminant. The actual syscall value is HINT_SYSCALL_NUMBER.
     // Non-constraining hint (host computes modular inverse/sqrt, guest verifies).
     Hint = 95,
-    // Placeholder discriminant. The actual syscall value is ECSM_AFFINE_SYSCALL_NUMBER.
-    EcsmAffine = 96,
+    // Placeholder discriminant. The actual syscall value is ECSM_FULL_POINT_SYSCALL_NUMBER.
+    EcsmFullPoint = 96,
 }
 
 /// Syscall number for KeccakPermute (u64::MAX - 1 = 0xFFFF_FFFF_FFFF_FFFE).
@@ -36,27 +36,27 @@ const KECCAK_STATE_BYTES: u64 = 25 * 8;
 /// bus as `[lo32, hi32] = [2^32 - 11, 2^32 - 1]`.
 ///
 /// This is the **x-only** variant: the guest passes only `xG` (32 bytes) and gets back only
-/// the x-coordinate `xR` (32 bytes). See [`ECSM_AFFINE_SYSCALL_NUMBER`] for the affine variant.
+/// the x-coordinate `xR` (32 bytes). See [`ECSM_FULL_POINT_SYSCALL_NUMBER`] for the full-point variant.
 pub const ECSM_SYSCALL_NUMBER: u64 = u64::MAX - 10;
 
-/// Syscall number for the **affine** ECSM accelerator variant.
+/// Syscall number for the **full-point** ECSM accelerator variant.
 ///
 /// `u64::MAX - 11 = 0xFFFF_FFFF_FFFF_FFF4`. The guest passes the full point `xG‖yG`
 /// (contiguous 64 bytes) and gets back both coordinates `xR‖yR` (contiguous 64 bytes), so
 /// ECDSA recovery skips the x-only `(k+1)·P` y-reconstruction. The ECSM core table selects
-/// the mode with an `IS_AFFINE` column pinned to this number via the `Ecall` bus.
-pub const ECSM_AFFINE_SYSCALL_NUMBER: u64 = u64::MAX - 11;
+/// the mode with an `IS_FULL_POINT` column pinned to this number via the `Ecall` bus.
+pub const ECSM_FULL_POINT_SYSCALL_NUMBER: u64 = u64::MAX - 11;
 
-// The ECSM table pins `IS_AFFINE` by putting `xonly + IS_AFFINE·(affine − xonly)` on the
+// The ECSM table pins `IS_FULL_POINT` by putting `xonly + IS_FULL_POINT·(full_point − xonly)` on the
 // `Ecall` bus for each 32-bit word, against the CPU's real `a7`. That only pins the
 // selector if the two numbers differ in the LOW word: they share a high word today, so the
-// high word's `IS_AFFINE` coefficient is zero and carries no mode information. Choosing a
-// future variant that differs only in the high word would silently leave `IS_AFFINE`
+// high word's `IS_FULL_POINT` coefficient is zero and carries no mode information. Choosing a
+// future variant that differs only in the high word would silently leave `IS_FULL_POINT`
 // unconstrained — an under-constrained selector, not a compile error. Fail loudly here.
 const _: () = assert!(
-    ECSM_SYSCALL_NUMBER & 0xFFFF_FFFF != ECSM_AFFINE_SYSCALL_NUMBER & 0xFFFF_FFFF,
+    ECSM_SYSCALL_NUMBER & 0xFFFF_FFFF != ECSM_FULL_POINT_SYSCALL_NUMBER & 0xFFFF_FFFF,
     "ECSM syscall numbers must differ in their low 32-bit word, or the ECSM table's \
-     IS_AFFINE pinning degenerates"
+     IS_FULL_POINT pinning degenerates"
 );
 
 /// Syscall number for the non-constraining `Hint` ecall.
@@ -113,7 +113,7 @@ impl TryFrom<u64> for SyscallNumbers {
             93 => Ok(SyscallNumbers::Halt),
             v if v == KECCAK_SYSCALL_NUMBER => Ok(SyscallNumbers::KeccakPermute),
             v if v == ECSM_SYSCALL_NUMBER => Ok(SyscallNumbers::Ecsm),
-            v if v == ECSM_AFFINE_SYSCALL_NUMBER => Ok(SyscallNumbers::EcsmAffine),
+            v if v == ECSM_FULL_POINT_SYSCALL_NUMBER => Ok(SyscallNumbers::EcsmFullPoint),
             v if v == HINT_SYSCALL_NUMBER => Ok(SyscallNumbers::Hint),
             _ => Err(()),
         }
@@ -134,7 +134,7 @@ impl SyscallNumbers {
     pub fn accelerator(self) -> Option<Accelerator> {
         match self {
             SyscallNumbers::KeccakPermute => Some(Accelerator::Keccak),
-            SyscallNumbers::Ecsm | SyscallNumbers::EcsmAffine => Some(Accelerator::Ecsm),
+            SyscallNumbers::Ecsm | SyscallNumbers::EcsmFullPoint => Some(Accelerator::Ecsm),
             SyscallNumbers::Print
             | SyscallNumbers::Panic
             | SyscallNumbers::Commit
@@ -575,8 +575,8 @@ impl Instruction {
                         src2_val = addr_xg;
                         dst_val = addr_k;
                     }
-                    SyscallNumbers::EcsmAffine => {
-                        // ECSM affine: both coordinates of k·(xG, yG) on secp256k1.
+                    SyscallNumbers::EcsmFullPoint => {
+                        // ECSM full point: both coordinates of k·(xG, yG) on secp256k1.
                         // x10 = addr to write xR‖yR, x11 = addr of xG‖yG, x12 = addr of k.
                         // Input and output are contiguous 64-byte buffers; k is 32B. xG/yG/xR
                         // must be canonical field elements, (xG, yG) on curve, k in [1, N).

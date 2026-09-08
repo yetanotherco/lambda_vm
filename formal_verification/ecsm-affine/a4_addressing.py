@@ -1,10 +1,10 @@
 """A4 — addressing: does the AIR accept exactly the addresses the VM accepts, and can the
-affine `+32 … +63` span escape its limb?
+full-point `+32 … +63` span escape its limb?
 
-The affine variant doubles both operand buffers to 64 bytes, and the `yG`/`yR` bus tuples are
+The full-point variant doubles both operand buffers to 64 bytes, and the `yG`/`yR` bus tuples are
 built by adding `32 + 8i` to the LOW limb while reusing the high limb unchanged. That is only
 sound if the span provably cannot reach `2^32`. PR #879's answer is a set of `Alu`-LT senders
-whose bound is itself linear in `IS_AFFINE`.
+whose bound is itself linear in `IS_FULL_POINT`.
 
   A4a  the LT bound == the executor's `addr_limb_ok`   — same accept set, both spans
   A4b  the `+32 + 8i` span cannot cross `2^32`         — the reused high limb is safe
@@ -65,7 +65,7 @@ def report(name, verdict, detail=""):
 # ── A4a: the LT bound is the executor's predicate ─────────────────────────
 
 def a4a_bound_matches_executor():
-    """For each mode, the `Alu` LT sender asserts `addr_lo < bound(IS_AFFINE)` with
+    """For each mode, the `Alu` LT sender asserts `addr_lo < bound(IS_FULL_POINT)` with
     `result = 1` and a literal zero high word, so only the low limb is compared — exactly
     what `addr_limb_ok` does (it ignores the high limb by construction).
 
@@ -73,9 +73,9 @@ def a4a_bound_matches_executor():
     UNSAT means the AIR's accept set is the executor's accept set — no provable-but-halting
     execution, and no legal execution made unprovable."""
     ok = True
-    for is_affine, span in [(0, 31), (1, 63)]:
+    for is_full_point, span in [(0, 31), (1, 63)]:
         t0 = time.time()
-        bound = addr_bound_by_mode(is_affine)
+        bound = addr_bound_by_mode(is_full_point)
         s = z3.Solver()
         lo = z3.Int("lo")
         s.add(lo >= 0, lo < LIMB)
@@ -83,7 +83,7 @@ def a4a_bound_matches_executor():
         s.add((lo + span < LIMB) != (lo < bound))
         r = s.check()
         ok &= r == z3.unsat
-        report(f"A4a LT bound == addr_limb_ok [IS_AFFINE={is_affine}, span={span}]",
+        report(f"A4a LT bound == addr_limb_ok [IS_FULL_POINT={is_full_point}, span={span}]",
                "PROVED" if r == z3.unsat else str(r).upper(),
                f"bound = {bound} = 2^32 − {LIMB - bound}; {time.time()-t0:.2f}s")
     # and the linear form really evaluates to those two numbers
@@ -96,21 +96,21 @@ def a4a_bound_matches_executor():
     return ok
 
 
-# ── A4b: the affine span cannot cross the limb ────────────────────────────
+# ── A4b: the full-point span cannot cross the limb ────────────────────────────
 
 def a4b_span_safe():
-    """Every byte the affine ops touch must have a low-limb address `< 2^32`, or the reused
+    """Every byte the full-point ops touch must have a low-limb address `< 2^32`, or the reused
     high limb would name the wrong page.
 
     The worst byte is the last of the highest dword: base `addr_lo + 56`, byte `+7`, i.e.
     `addr_lo + 63`. Under `addr_lo < 2^32 − 63` that is `< 2^32`. Proved over the whole
     accepted range for all 4 dwords × 8 bytes of both the `yG` read and the `yR` write, and
     the pre-existing x-only ops are re-checked under the same bound (they moved: their
-    address column is now bounded by the affine constant on affine rows)."""
+    address column is now bounded by the full-point constant on full-point rows)."""
     t0 = time.time()
     s = z3.Solver()
     lo = z3.Int("lo")
-    s.add(lo >= 0, lo < addr_bound_by_mode(1))   # accepted affine addresses
+    s.add(lo >= 0, lo < addr_bound_by_mode(1))   # accepted full-point addresses
     touched = []
     for offs in (AFFINE_YG_READ_OFFSETS, AFFINE_YR_WRITE_OFFSETS,
                  XONLY_XG_READ_OFFSETS, XONLY_XR_WRITE_OFFSETS):
@@ -120,7 +120,7 @@ def a4b_span_safe():
     s.add(z3.Or([lo + t >= LIMB for t in touched]))   # deny: some byte escapes the limb
     r = s.check()
     ok = r == z3.unsat
-    report("A4b affine span stays inside the limb", "PROVED" if ok else str(r).upper(),
+    report("A4b full-point span stays inside the limb", "PROVED" if ok else str(r).upper(),
            f"{len(touched)} touched byte offsets (max +{max(touched)}) all < 2^32 for every "
            f"accepted addr_lo; {time.time()-t0:.2f}s")
     return ok
@@ -141,7 +141,7 @@ def a4c_band():
     facts = {}
     for label, offs, span in [
         ("32-byte (x-only xG/xR, k)", XONLY_XG_READ_OFFSETS, 31),
-        ("64-byte (affine xG‖yG, xR‖yR)",
+        ("64-byte (full-point xG‖yG, xR‖yR)",
          XONLY_XG_READ_OFFSETS + AFFINE_YG_READ_OFFSETS, 63),
     ]:
         max_base = max(offs)
@@ -161,11 +161,11 @@ def a4c_band():
 def a4c_band_is_closed():
     """And the LT senders close it: no address in either band satisfies `lo < bound`."""
     ok = True
-    for is_affine, span, offs in [
+    for is_full_point, span, offs in [
         (0, 31, XONLY_XG_READ_OFFSETS),
         (1, 63, XONLY_XG_READ_OFFSETS + AFFINE_YG_READ_OFFSETS),
     ]:
-        bound = addr_bound_by_mode(is_affine)
+        bound = addr_bound_by_mode(is_full_point)
         max_base = max(offs)
         band = [lo for lo in range(LIMB - span - 8, LIMB)
                 if not addr_limb_ok(lo, span) and lo + max_base < LIMB]
@@ -180,7 +180,7 @@ def a4c_band_is_closed():
 
 def a4d_scalar_bound():
     """`k` is a 32-byte scalar in BOTH modes, so its LT sender uses the flat
-    `ADDR_LIMB_BOUND_32B`, with no `IS_AFFINE` term. Checked against the executor, which
+    `ADDR_LIMB_BOUND_32B`, with no `IS_FULL_POINT` term. Checked against the executor, which
     calls `addr_limb_ok(addr_k, 31)` on both arms."""
     t0 = time.time()
     s = z3.Solver()
@@ -295,20 +295,20 @@ def a4g_completeness():
     x-only addresses the executor accepts, i.e. break completeness on a path this PR is not
     supposed to touch. Measured: 32 such addresses per operand.
 
-    Conversely a flat 32-byte bound leaves the affine band open (A4c), so neither constant
-    works alone and the `IS_AFFINE` interpolation is doing real work."""
+    Conversely a flat 32-byte bound leaves the full-point band open (A4c), so neither constant
+    works alone and the `IS_FULL_POINT` interpolation is doing real work."""
     flat64_rejects_legal_xonly = [
         lo for lo in range(LIMB - 64, LIMB)
         if addr_limb_ok(lo, 31) and not (lo < ADDR_LIMB_BOUND_64B)]
-    flat32_leaves_affine_open = [
+    flat32_leaves_full_point_open = [
         lo for lo in range(LIMB - 64, LIMB)
         if not addr_limb_ok(lo, 63) and lo < ADDR_LIMB_BOUND_32B]
-    ok = len(flat64_rejects_legal_xonly) > 0 and len(flat32_leaves_affine_open) > 0
+    ok = len(flat64_rejects_legal_xonly) > 0 and len(flat32_leaves_full_point_open) > 0
     report("A4g mode-dependent bound is necessary", "PROVED" if ok else "FAIL",
            f"a flat 64-byte bound would reject {len(flat64_rejects_legal_xonly)} legal "
            f"x-only addresses (completeness); a flat 32-byte bound would admit "
-           f"{len(flat32_leaves_affine_open)} illegal affine ones (soundness) ⇒ the "
-           "IS_AFFINE interpolation is load-bearing in BOTH directions")
+           f"{len(flat32_leaves_full_point_open)} illegal full-point ones (soundness) ⇒ the "
+           "IS_FULL_POINT interpolation is load-bearing in BOTH directions")
     return ok
 
 

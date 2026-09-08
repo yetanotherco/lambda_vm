@@ -186,7 +186,7 @@ fn barycentric_trace_eval_matches_horner_trace_eval() {
         .collect();
 
     // Build LDE trace table
-    let lde_trace = LDETraceTable::from_columns(
+    let mut lde_trace = LDETraceTable::from_columns(
         lde_evaluations,
         Vec::<Vec<Felt>>::new(),
         air.step_size(),
@@ -213,7 +213,7 @@ fn barycentric_trace_eval_matches_horner_trace_eval() {
 
     // Barycentric evaluation (new path)
     let result =
-        get_trace_evaluations_from_lde(&lde_trace, &domain, &z, &frame_offsets, step_size, &dc);
+        get_trace_evaluations_from_lde(&mut lde_trace, &domain, &z, &frame_offsets, step_size, &dc);
 
     assert_eq!(result.width, expected.width);
     assert_eq!(result.height, expected.height);
@@ -607,5 +607,45 @@ fn commit_rows_bit_reversed_matches_commit_bit_reversed() {
                 "commit root mismatch: num_cols={num_cols} log_rows={log_rows}"
             );
         }
+    }
+}
+
+/// `k` is a count of concurrent table drivers — `run_admitted` spawns exactly
+/// this many OS threads and indexes `order` with them — so it has to stay
+/// inside `1..=num_airs` in every arm, including under a `TABLE_PARALLELISM`
+/// override (CI's prover shard 1 sets one).
+#[test]
+fn table_parallelism_stays_within_one_and_num_airs() {
+    use crate::prover::table_parallelism;
+
+    assert_eq!(table_parallelism(0), 1, "no tables still needs one driver");
+    for n in [1usize, 2, 7, 31, 64, 1024] {
+        let k = table_parallelism(n);
+        assert!(k >= 1 && k <= n, "k={k} outside 1..={n}");
+    }
+
+    // Monotone in `num_airs` in every arm: cuda `n`, CPU `min(cores/3, n)`,
+    // override `min(override, n)`.
+    let mut prev = 0;
+    for n in 1..=64 {
+        let k = table_parallelism(n);
+        assert!(k >= prev, "k fell from {prev} to {k} at num_airs={n}");
+        prev = k;
+    }
+}
+
+/// The cuda default is every table: the sweep in `thoughts/k-sweep-877b/` found
+/// no core count at which a smaller `k` wins, and `T(k) = S + max(Tmax, W/k)`
+/// has no term that ever favours one. Skipped when the env var pins `k`.
+#[cfg(all(feature = "cuda", feature = "parallel"))]
+#[test]
+fn cuda_table_parallelism_defaults_to_num_airs() {
+    use crate::prover::table_parallelism;
+
+    if std::env::var("TABLE_PARALLELISM").is_ok() {
+        return;
+    }
+    for n in [1usize, 7, 31, 1024] {
+        assert_eq!(table_parallelism(n), n, "cuda k must be num_airs");
     }
 }

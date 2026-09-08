@@ -4,13 +4,27 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-embedded-alloc = "0.6"
 riscv = { version = "0.15", features = ["critical-section-single-hart"] }
 thiserror = "1.0"
 getrandom = { version = "0.3.4", default-features = false }
 getrandom_v2 = {version = "0.2.15", features = ["custom"], package = "getrandom"}
 lazy_static = "1.5.0"
 rand = "0.9.2"
+# Doug Lea's malloc, behind `dlmalloc-alloc`: slower than the default bump allocator on
+# every workload measured, but it reclaims freed memory, so it is the allocator to pick
+# for a guest whose cumulative allocation has no per-execution bound. Not a
+# continuations criterion: continuations are a prover-side split of a single guest
+# execution and change nothing about what the guest allocates. `critical-section` gives
+# the Sync a #[global_allocator] static needs; its single-hart impl comes from `riscv`
+# above. See `src/allocator.rs`.
+dlmalloc = { version = "0.2.14", default-features = false, optional = true }
+critical-section = { version = "1.2", optional = true }
+
+[features]
+# Guest allocator override. The default (no flag) is the bump allocator; see
+# `src/allocator.rs` for the measurements behind that choice. Select dlmalloc when the
+# execution's cumulative allocation isn't bounded per block.
+dlmalloc-alloc = ["dep:dlmalloc", "dep:critical-section"]
 
 [dev-dependencies]
 keccak = "0.1"
