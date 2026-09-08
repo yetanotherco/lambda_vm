@@ -5,74 +5,87 @@ code = "FVM"
 name = "pc"
 type = "BaseField"
 desc = "The program counter"
+pad = 0 # TODO? Make this a reserved address containing the self loop
 
 [[variables.input]]
 name = "argument_registers"
 type = ["BaseField", 4]
 desc = "The register numbers of the arguments `o`, `a`, `b`, `c`, in that order"
+pad = ["arr", 1, 1, 1, 1]
 
 [[variables.input]]
 name = "argument_scalars"
 type = ["BaseField", 4]
 desc = "The `imm_0` scalars for the arguments `o`, `a`, `b`, `c`, in that order"
+pad = ["arr", 1, 0, 0, 1]
 
 [[variables.input]]
 name = "argument_offsets"
 type = ["BaseField", 4]
 desc = "The `imm_1` offsets for the arguments `o`, `a`, `b`, `c`, in that order"
+pad = 0
 
 [[variables.input]]
 name = "mem_flags"
 type = ["Bit", 4]
 desc = "Whether the argument (`o`, `a`, `b`, `c`, in that order) comes from a memory lookup"
+pad = 0
 
 [[variables.input]]
 name = "hint_input"
 type = ["Bit", 5] # PARAM: ["Bit", N]
 desc = "Whether each input register is hinted this cycle"
+pad = 0
 
 [[variables.input]]
 name = "hint_output"
 type = "Bit"
 desc = "Whether the output register is hinted this cycle"
+pad = 1
 
 [[variables.auxiliary]]
 name = "registers"
 type = ["ExtField", 5] # PARAM: ["ExtField", N]
 desc = "The general purpose registers"
+pad = 0
 
 [[variables.auxiliary]]
 name = "ZERO"
 type = "Bit"
 desc = "Whether the output of the previous instruction was zero"
+pad = 0
 
 [[variables.auxiliary]]
 name = "out_inverse"
 type = "ExtField"
 desc = "The multiplicative inverse of the output, used to check `ZERO`"
+pad = 0
 
 [[variables.auxiliary]]
 name = "arg_reg_pows_computed"
 type = [["BaseField", 1], 4] # PARAM: [["BaseField", T], 4]
 desc = "Powers of the argument register indices to split the MUX polynomials into lower degree parts"
+pad = ["arr", ["arr", 1], ["arr", 1], ["arr", 1], ["arr", 1]]
 
 [[variables.auxiliary]]
 name = "args_premem"
 type = ["ExtField", 4]
 desc = "The argument values, before a potential memory lookup"
+pad = ["arr", ["-", 1], 0, 0, ["-", 1]]
 
 [[variables.auxiliary]]
 name = "args"
 type = ["ExtField", 4]
 desc = "The argument values, after a potential memory lookup"
+pad = ["arr", ["-", 1], 0, 0, ["-", 1]]
 
 [[variables.virtual]]
 name = "all_regs"
 type = ["ExtField", 7] # PARAM: ["ExtField", N + 2]
 desc = "All general purpose registers, followed by `pc` and `ZERO`, matching the decoding indices"
 def = {polys = [
-  {iter = ["i", 0], poly = "ZERO"},
-  {iter = ["i", 1], poly = "pc"},
+  {iter = ["i", 0], poly = ["cast", "ZERO", "ExtField"]},
+  {iter = ["i", 1], poly = ["cast", "pc", "ExtField"]},
   {iter = ["i", 2, 6], poly = ["idx", "registers", ["-", "i", 2]]}, # PARAM: iter = ["i", 2, N + 1]
 ]}
 
@@ -87,8 +100,9 @@ def = {polys = [
 
 [[variables.constant]]
 name = "MUX"
-type = [[["BaseField", 4], 2], 6] # PARAM: [[["BaseField", d - 1], t + 1], N + 1]
+type = [[["BaseField", 4], 2], 7] # PARAM: [[["BaseField", d - 1], t + 1], N + 2]
 desc = "The MUX polynomial coefficients"
+pad = ["arr", 1, 1, 1, 1, 1, 1, 1] # Slightly hacky way to make the typechecker not crash out on the pc constraint
 
 [[constraint_groups]]
 name = "decode"
@@ -104,13 +118,13 @@ name = "mux"
 
 [[constraints.mux]]
 kind = "arith"
-constraint = "$#`arg_reg_pows_computed`_(i,0) = #`arg_registers`_i^4$" # PARAM: power = d - 1
+constraint = "$#`arg_reg_pows_computed`_(i,0) = #`argument_registers`_i^4$" # PARAM: power = d - 1
 poly = ["-", ["idx", ["idx", "arg_reg_pows_computed", "i"], 0],
   ["*",
-    ["idx", "arg_registers", "i"],
-    ["idx", "arg_registers", "i"],
-    ["idx", "arg_registers", "i"],
-    ["idx", "arg_registers", "i"]]]
+    ["idx", "argument_registers", "i"],
+    ["idx", "argument_registers", "i"],
+    ["idx", "argument_registers", "i"],
+    ["idx", "argument_registers", "i"]]]
 iter = ["i", 0, 3]
 
 # PARAM: If T > 1, we need to populate arg_reg_pows_computed[i][j], j > 0, too, with power j * (d - 2) + (d - 1)
@@ -141,8 +155,8 @@ iter = ["i", 0, 3]
 
 [[constraints.memory]]
 kind = "interaction"
-tag = "MEMORY"
-input = [["idx", "args_premem", "i"]]
+tag = "FIELD_VM_MEM"
+input = [["cast", ["idx", "args_premem", "i"], "BaseField"]]
 output = ["idx", "args", "i"]
 multiplicity = ["idx", "mem_flags", "i"]
 iter = ["i", 0, 3]
