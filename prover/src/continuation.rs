@@ -1709,11 +1709,6 @@ fn prove_continuation_with_format(
                 register_init: &prepared.register_init,
                 label: prepared.label,
             };
-            #[cfg(test)]
-            if prepared.index == test_fault::FAIL_INDEX && private_inputs == test_fault::PANIC_MAGIC
-            {
-                panic!("injected prover panic (test)");
-            }
             // A PANIC in the prove — a loud device abort, or any bug — must take
             // the same drain path as an `Err`. If this thread simply died, `rx`
             // would close, every builder would stop on its dead sender, and the
@@ -1724,6 +1719,13 @@ fn prove_continuation_with_format(
             // 21 minutes under the CLI.
             let index = prepared.index;
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // Inside the guard on purpose: a panic raised on this thread
+                // OUTSIDE it reproduces the original wedge (which is what the
+                // test's first placement did, and the test caught it).
+                #[cfg(test)]
+                if index == test_fault::FAIL_INDEX && private_inputs == test_fault::PANIC_MAGIC {
+                    panic!("injected prover panic (test)");
+                }
                 prove_epoch(
                     &elf,
                     elf_bytes,
