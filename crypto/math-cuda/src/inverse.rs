@@ -148,6 +148,56 @@ fn launch_invert_total(
     Ok(())
 }
 
+/// Whether a one-dimensional launch over `total` elements is expressible.
+///
+/// The launches in this crate build their grid as `(total as u32).div_ceil(
+/// BLOCK_SIZE)` blocks of `BLOCK_SIZE` threads, and every kernel behind them
+/// (`logup.cu`, `inverse.cu`) computes its element index as the 64-bit
+/// `blockIdx.x * (uint64_t)blockDim.x + threadIdx.x`. The only thing that
+/// silently breaks is therefore the cast: past `u32::MAX` elements `total as
+/// u32` wraps, too few blocks launch, and a tail of the output is never
+/// written. Up to `u32::MAX` the grid is at most 16,777,216 blocks, far inside
+/// `gridDim.x`'s 2^31 − 1, and the index arithmetic is exact.
+///
+/// Until 2026-09 this bound was `u32::MAX / BLOCK_SIZE` — 256× too strict, as
+/// if the cast applied to the block count rather than the element count. Every
+/// LogUp aux build with more than 16,777,215 interaction·rows (at 2^22 rows,
+/// any table with five or more interactions) and every R3/R4 batch inverse
+/// past that size was refused before any launch and fell to the host, and the
+/// refusal wore a `CUDA_ERROR_INVALID_VALUE` that looked like the driver's.
+pub(crate) const fn launch_total_fits(total: usize) -> bool {
+    total <= u32::MAX as usize
+}
+
+#[cfg(test)]
+mod launch_bound_tests {
+    use super::*;
+
+    /// LOCAL_TO_GLOBAL at 2^22 rows with 6 interactions — the first shape the
+    /// loud aux-build admission surfaced — is expressible; so is the CPU table
+    /// at 2^22 with its full 24, and LFM_BLAKE3 at 2^21 with its 1,261.
+    #[test]
+    fn the_shapes_that_were_refused_fit() {
+        assert!(launch_total_fits(6 << 22));
+        assert!(launch_total_fits(24 << 22));
+        assert!(launch_total_fits(1261 << 21));
+        assert!(launch_total_fits(u32::MAX as usize));
+    }
+
+    /// The truncation hazard is real one past `u32::MAX`, and the old bound
+    /// sat 256× below it.
+    #[test]
+    fn the_bound_is_the_cast_not_the_block_count() {
+        assert!(!launch_total_fits(u32::MAX as usize + 1));
+        assert!(launch_total_fits(
+            u32::MAX as usize / BLOCK_SIZE as usize + 1
+        ));
+        let blocks = (u32::MAX).div_ceil(BLOCK_SIZE);
+        assert_eq!(blocks, 1 << 24);
+        assert!((blocks as u64) < (1u64 << 31));
+    }
+}
+
 /// Device-input batch inverse. Allocates and returns a fresh `CudaSlice<u64>`
 /// of length `3 * n` holding the inverses. Requires `n >= 1`.
 ///
@@ -160,12 +210,11 @@ pub fn batch_inverse_ext3_dev(
     stream: &Arc<CudaStream>,
 ) -> Result<CudaSlice<u64>> {
     assert!(n >= 1, "batch_inverse_ext3_dev requires n >= 1");
-    // Runtime guard (not debug_assert): a u32 grid_dim is truncated past
-    // u32::MAX / BLOCK_SIZE, which would silently launch too few blocks
-    // and leave a tail uninverted. Reachable on LDE size 2^23+ × multi-
-    // eval-point R4. Returning Err lets the dispatcher's Err(_) => None
-    // route the caller to the CPU `inplace_batch_inverse` fallback.
-    if n > u32::MAX as usize / BLOCK_SIZE as usize {
+    // Runtime guard (not debug_assert), see [`launch_total_fits`]: past the
+    // bound the u32 element count the launch is built from would truncate
+    // and leave a tail uninverted. Returning Err lets the dispatcher route
+    // the caller to the CPU `inplace_batch_inverse` fallback, or abort.
+    if !launch_total_fits(n) {
         return Err(cudarc::driver::DriverError(
             cudarc::driver::sys::CUresult::CUDA_ERROR_INVALID_VALUE,
         ));
@@ -259,10 +308,9 @@ pub fn compute_and_invert_denoms_ext3_dev(
     let total = k_scalars
         .checked_mul(n)
         .expect("compute_and_invert_denoms_ext3_dev: k_scalars * n overflow");
-    // See `batch_inverse_ext3_dev` for the rationale: runtime Err, not
-    // debug_assert, so release builds also route past the silent-truncation
-    // hazard via the caller's CPU fallback.
-    if total > u32::MAX as usize / BLOCK_SIZE as usize {
+    // See [`launch_total_fits`]: runtime Err, not debug_assert, so release
+    // builds also route past the truncation hazard.
+    if !launch_total_fits(total) {
         return Err(cudarc::driver::DriverError(
             cudarc::driver::sys::CUresult::CUDA_ERROR_INVALID_VALUE,
         ));
