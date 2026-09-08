@@ -19,10 +19,11 @@ What pins it are the range checks on `left`/`right`.
 THE DIFFERENCE FORM (why no `% p` appears below). If `(L, R)` satisfies the
 identity then so does `(L - 2**16 * d, R + d)` for any `d`, and those are the
 ONLY other solutions. So instead of solving over the field we parameterise the
-deviation directly by `d` per halfword. Every magnitude then stays under 2**18,
-far below `p`, so the field equation and the integer equation coincide and the
-whole analysis is exact integer arithmetic. The field enters in exactly one
-place: a committed column may hold a NEGATIVE integer (as `p - k`), because
+deviation directly by `d` per halfword, which is exact integer arithmetic for
+as long as every magnitude stays far below `p`: 2**18 for theta with its carry
+checked, 2**24 without it, and 2**32.6 for every rho configuration, against a
+`p/2` of 2**63. `difference_form_is_exact` checks that per configuration rather
+than trusting this sentence. The field enters in exactly one place: a committed column may hold a NEGATIVE integer (as `p - k`), because
 nothing bounds it once its range check is gone. `as_field` marks those.
 
 WHAT BOUNDS THE DEVIATION. Two things, and which one bites is the whole result:
@@ -32,6 +33,16 @@ WHAT BOUNDS THE DEVIATION. Two things, and which one bites is the whole result:
     table holds only byte rows, so the operand must be a byte, which leaves a
     residual window on `left` even with no range check of its own. Whether
     `d = +/-1` fits inside that window is what decides necessity.
+
+THE SECOND AXIS: THE BYTE SPLIT. `d` is not the only freedom, because the chip
+commits BYTES and the identity reads a pair only as `lo + 256*hi`. So
+`(lo + 256*k, hi - k)` satisfies the identity exactly, leaves the packed value
+honest, and no sweep over `d` can see it -- while chi and Dxz read the two bytes
+SEPARATELY. A pair whose packed value is pinned therefore still needs its split
+pinned, and that is a second question with its own two answers:
+`checked_split_is_unique` for a pair that kept its range checks, and
+`surviving_byte_split` for one that lost them, whose split is pinned by the
+operand byte that reads each half instead.
 """
 
 P = 2**64 - 2**32 + 1                    # Goldilocks
@@ -121,6 +132,10 @@ def is_byte(v):
 #                    two "implied" verdicts hold.
 BYTE = (0, 255)
 BIT = (0, 1)
+# Not a contract but a wiring fact (cols::cxz_right_bit_for_byte): the odd Dxz
+# operand bytes take no carry, so such a byte IS the operand, and the window the
+# operand leaves it is the whole byte range.
+NO_CARRY = (0, 0)
 
 
 def operand_summand_window(other):
@@ -186,4 +201,75 @@ def surviving_deviation(rnc, left_bounds, right_bounds):
             dev_left, dev_right = deviate(left, right, d)
             if lo_l <= dev_left <= hi_l and lo_r <= dev_right <= hi_r:
                 return in_hw, d
+    return None
+
+
+def checked_split_is_unique(bounds=BYTE):
+    """Given a PINNED packed value, does a range check pin the two bytes?
+
+    Uniqueness of a split is a property of the CHECK's width, not of the
+    identity, which sees only `lo + 256*hi`: complete over every `lo` the check
+    admits, `lo + 256*k` has to leave the interval for every `k != 0`; the two
+    tested cover all of them, since the deviation grows with `|k|`, so escaping
+    at one step escapes at every further one. It holds for a byte check, whose
+    256 values are exactly the packing radix -- and it
+    stops holding one bit wider, which is the sensitivity control the necessity
+    boards run alongside. This is what makes the CHECKED side of a configuration
+    honest byte by byte, the premise `surviving_byte_split` then leans on.
+    """
+    lo_b, hi_b = bounds
+    return all(not lo_b <= lo + 256 * k <= hi_b
+               for lo in range(lo_b, hi_b + 1) for k in (-1, 1))
+
+
+def split_form_is_exact(companion):
+    """Is `lo + 256*hi = packed` the same statement over the field and over Z?
+
+    `surviving_byte_split` parameterises the split by an INTEGER `k`, and over
+    the field the packed value alone allows anything: `256` is invertible, so
+    every `lo` has its `hi` and the redistributions are the whole field, not a
+    sequence of steps of 256. What collapses them to integer ones is the operand
+    window on BOTH bytes of the pair -- each is read by one operand byte, so each
+    is small -- which keeps `lo + 256*hi` far below `p`, making the field
+    equation the integer equation and `k = hi_honest - hi` an integer.
+
+    This is the split axis's analogue of `difference_form_is_exact`, and it fails
+    the same way: a byte with no window at all puts `k` back over the field.
+    """
+    window = operand_summand_window(companion)
+    span = max(abs(window[0]), abs(window[1]))
+    return span + 256 * span < P // 2
+
+
+def surviving_byte_split(companion, companion_moves=(0,)):
+    """Is the split of an UNCHECKED pair pinned by the operand bytes reading it?
+
+    The pair's packed value is pinned (`surviving_deviation`), each of its bytes
+    is read by exactly ONE ByteAlu operand byte (read-once, combinatorics
+    sections 3 and 6) alongside a summand in `companion`, and those windows are
+    what make `k` an integer in the first place (`split_form_is_exact`).
+    Redistributing the pair
+    by `k` moves that operand sum by `256*k`, so the sweep below asks, over every
+    (byte, companion) pair an honest row can present -- their sum is a byte,
+    since the honest row passes the operand lookup -- whether the moved sum is a
+    byte too.
+
+    `companion_moves` is what that summand may do ITSELF, and it is the whole
+    reason the answer is configuration-dependent: `(0,)` when the checked side
+    pinned it to its honest value (`checked_split_is_unique`), and +/-256 when
+    nothing checks it either -- the "both dropped" configuration, where the
+    redistribution is absorbed and the split is as free as the packed value.
+
+    Returns None when the split is pinned, else `(byte, companion, k, move)`.
+    With `companion_moves = (0,)` the two non-zero `k` are exhaustive: a survivor
+    needs both sums inside [0, 255], so it needs `|256*k| <= 255`.
+    """
+    for byte in range(256):
+        for other in range(companion[0], companion[1] + 1):
+            if not is_byte(byte + other):
+                continue
+            for k in (-1, 1):
+                for move in companion_moves:
+                    if is_byte(byte + 256 * k + other + move):
+                        return byte, other, k, move
     return None

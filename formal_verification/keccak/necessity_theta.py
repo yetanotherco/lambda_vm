@@ -24,13 +24,20 @@ the same operand lose their check, the operand then bounds only their SUM,
 there is no per-column window, and the explicit witness below is what decides
 it.
 
+THE SECOND AXIS. The identity only ever reads a byte pair as `lo + 256*hi`, so a
+pinned packed value is half the question: the split `(lo + 256k, hi - k)`
+satisfies the identity too, and what pins it is the Dxz operand bytes that read
+the halves one at a time (`surviving_byte_split`).
+
 Board: A/B/C sound, D forgeable.
 """
 from combinatorics import premises
-from field_model import (P, THETA_RNC, BYTE, BIT, as_field, honest_shift,
-                         identity_holds, deviate, difference_form_is_exact,
-                         operand_summand_window, packed_pair_bounds,
-                         surviving_deviation, theta_operand_bytes, is_byte)
+from field_model import (P, THETA_RNC, BYTE, BIT, NO_CARRY, as_field,
+                         honest_shift, identity_holds, deviate,
+                         difference_form_is_exact, operand_summand_window,
+                         packed_pair_bounds, surviving_deviation,
+                         checked_split_is_unique, split_form_is_exact,
+                         surviving_byte_split, theta_operand_bytes, is_byte)
 
 premises(verbose=False)
 
@@ -49,7 +56,8 @@ def check(cond, msg):
 #   Cxz_right IS_BIT, or -- with that gone -- the Dxz operand alongside a
 #             range-checked Cxz_left byte.
 LEFT_CHECKED = packed_pair_bounds(BYTE, BYTE)
-LEFT_OPERAND_ONLY = packed_pair_bounds(operand_summand_window(BIT), BYTE)
+LEFT_OPERAND_ONLY = packed_pair_bounds(operand_summand_window(BIT),
+                                       operand_summand_window(NO_CARRY))
 RIGHT_CHECKED = BIT
 RIGHT_OPERAND_ONLY = operand_summand_window(BYTE)
 
@@ -75,6 +83,28 @@ for name, left_b, right_b in CONFIGS:
     check(surv is None,
           f"{name}: left in {left_b}, right in {right_b} -> "
           f"{'no deviation survives any of the 2**16 inputs' if surv is None else f'SURVIVOR {surv}'}")
+
+print("\n=== the byte SPLIT of Cxz_left, which the packed sweep cannot see ===")
+# Same second axis: (lo, hi) -> (lo + 256k, hi - k) keeps both the packed value
+# and the identity. A and C keep the ARE_BYTES pair, which pins the split; B
+# drops it, and what pins it there is the Dxz operand byte reading the low half
+# next to the carry (the odd half is read alone, the `NO_CARRY` end of the sweep).
+check(checked_split_is_unique(BYTE),
+      "A/C: ARE_BYTES ships -> ONE split per pinned packed value")
+check(not checked_split_is_unique((0, 511)),
+      "control: it is the check's WIDTH doing that — one bit wider and the split is free again")
+check(split_form_is_exact(BIT),
+      "the Dxz operand windows keep lo + 256*hi below p -> the split moves in integer steps of 256")
+check(not split_form_is_exact((0, P // 4)),
+      "control: with an unbounded companion it does not, and k is back over the whole field")
+split = surviving_byte_split(BIT)
+check(split is None,
+      "B: redistributing Cxz_left by k moves its rotated_C byte by 256k -> no "
+      "(Cxz_left byte, carry, k != 0) leaves that operand a byte"
+      f"{'' if split is None else f' — SURVIVOR {split}'}")
+print("       C drops IS_BIT instead, and Cxz_right is a single column: no split to pin.")
+
+print("\n=== the parity argument behind B, spelled out ===")
 print("       B is the interesting one: d=+1 needs L' = L - 2**16 >= -1, i.e. L = 65535,")
 print("       and L is EVEN, so the sweep finds nothing. d=-1 needs L' > 65535.")
 
@@ -102,6 +132,11 @@ print(f"       honest  rotated_C = {hon_out}")
 print(f"       FORGED  rotated_C = {frg_out}")
 print(f"       forged Cxz_left (as field elements) = {[as_field(v) for v in frg_left[:2]]}...")
 print(f"       forged Cxz_right = {frg_right}")
+
+split_d = surviving_byte_split(BIT, companion_moves=(-256, 256))
+check(split_d is not None,
+      f"and the byte SPLIT of Cxz_left is free too, since an unchecked carry absorbs the "
+      f"redistribution: survivor (byte, carry, k, move) = {split_d}")
 
 # generality: the four carries form a cycle, so an arbitrary target is reachable
 det = (2**16) ** 4 - 1

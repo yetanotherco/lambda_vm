@@ -13,12 +13,19 @@ Downstream, pi is virtual and is consumed as a ByteAlu OPERAND (banners
     pi[z] = rot_left[l(z)] + rot_right[r(z)]      must be a byte
 
 so dropping one column's check does not free it: the operand still confines it
-(`operand_summand_window`), which is what makes configurations A and B sound and
-is the step a bound-vs-bound comparison cannot express. Premises live in
-combinatorics.py and are imported below, not left to be run by hand: the
-offsets are even, so a pi halfword reads one source halfword as
-P_h = L_(h+A) + R_(h+A-1), and every one of the 400 byte columns is read exactly
-once -- a column read twice would need the intersection of two windows.
+(`operand_summand_window`), which is what makes configuration B sound -- A drops
+nothing, its two checks pin both pairs outright -- and is the step a
+bound-vs-bound comparison cannot express. Premises live in combinatorics.py and
+are imported below, not left to be run by hand: the offsets are even, so a pi
+halfword reads one source halfword as P_h = L_(h+A) + R_(h+A-1), and every one
+of the 400 byte columns is read exactly once -- a column read twice would need
+the intersection of two windows.
+
+TWO AXES. The identity constrains the PACKED halfword, so every configuration
+is decided twice. `surviving_deviation` settles the packed value; the byte split
+`(lo, hi) -> (lo + 256k, hi - k)` keeps that value and the identity untouched,
+so the first sweep is blind to it, and what settles it is pi reading the two
+bytes separately.
 
 RESULT, and it is asymmetric — unlike theta, here ONE check is load-bearing on
 its own. `left` and `right` enter the identity with weights 1 and 2**16, so
@@ -29,7 +36,8 @@ from combinatorics import premises
 from field_model import (P, BYTE, as_field, honest_shift, identity_holds,
                          deviate, difference_form_is_exact, operand_summand_window,
                          packed_pair_bounds, rho_pi_offsets, rho_operand_bytes,
-                         surviving_deviation, is_byte)
+                         surviving_deviation, checked_split_is_unique,
+                         split_form_is_exact, surviving_byte_split, is_byte)
 
 premises(verbose=False)
 
@@ -62,6 +70,25 @@ for name, left_b, right_b in (("A: both checked", CHECKED, CHECKED),
           f"{name}: left in {left_b}, right in {right_b} -> pinned on all "
           f"{len(RNCS)} rotations x 2**16 inputs"
           f"{'' if all(s is None for _, s in surv) else f' — SURVIVORS {[s for s in surv if s[1]][:2]}'}")
+
+print("\n=== A / B: the byte SPLIT of each pair, which the packed sweep cannot see ===")
+# A pinned packed value still admits (lo, hi) -> (lo + 256k, hi - k), which the
+# identity accepts exactly. rot_left keeps its checks in both configurations, so
+# they pin its split; rot_right, unchecked in B, is pinned by the single pi
+# operand byte that reads each of its bytes next to a pinned rot_left byte.
+check(checked_split_is_unique(BYTE),
+      "a range-checked pair has ONE split per pinned packed value -> rot_left's bytes are honest")
+check(not checked_split_is_unique((0, 511)),
+      "control: it is the check's WIDTH doing that — one bit wider and the split is free again")
+check(split_form_is_exact(BYTE),
+      "the pi operand windows keep lo + 256*hi below p -> the split moves in integer steps of 256")
+check(not split_form_is_exact((0, P // 4)),
+      "control: with an unbounded companion it does not, and k is back over the whole field")
+split = surviving_byte_split(BYTE)
+check(split is None,
+      "B: redistributing rot_right by k moves its pi operand byte by 256k -> no "
+      "(rot_right byte, rot_left byte, k != 0) leaves that operand a byte"
+      f"{'' if split is None else f' — SURVIVOR {split}'}")
 
 print("\n=== C: rot_left's check dropped — the sweep already says forgeable ===")
 surv_c = {rnc: surviving_deviation(rnc, OPERAND_ONLY, CHECKED) for rnc in RNCS}
@@ -131,6 +158,10 @@ for (sx, sy) in LANES:
     okid = all(identity_holds(in_hws[j], rnc, L[j], R[j]) for j in range(4))
     hits = [(L[(h + A) % 4] + R[(h + A - 1) % 4]) % P for h in range(4)] == [q % P for q in Q]
     free += okid and hits
+split_d = surviving_byte_split(BYTE, companion_moves=(-256, 256))
+check(split_d is not None,
+      f"and so is the byte SPLIT, since the companion rot_left byte can now absorb the "
+      f"redistribution: survivor (byte, companion, k, move) = {split_d}")
 check(free == 25, f"the forged pi halfwords equal the ARBITRARY target on {free}/25 lanes "
                   f"(det = 1 - 2**64 = {(1 - 2**64) % P} mod p, invertible). Per-byte\n"
                   f"                   realizability is the construction exhibited in C.")

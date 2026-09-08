@@ -116,7 +116,30 @@ Each helper lookup is modeled by its contract, not its implementation:
    which is what catches a window modelled wrongly. The "both dropped" row is
    the one configuration with no per-column window at all (the operand bounds
    only the *sum* of two unchecked columns), so it is decided by an explicit
-   witness instead.
+   witness instead — and only ρ's is carried up to a complete row
+   (`witness_fullchip.py`), because ρ's is the claim this directory makes about
+   the *shipped* chip: a check the QF-BV gate treats as redundant is
+   load-bearing. θ's "both dropped" witness stays at four halfwords on purpose —
+   it bounds what θ could ever save, and an error in it would only keep a
+   redundant constraint, never license dropping a live one.
+
+   **That sweep decides the packed halfword, which is only half the question.**
+   The identity reads a byte pair as `lo + 256·hi` and nothing else, so
+   `(lo + 256k, hi − k)` satisfies it exactly at an honest packed value — a
+   redistribution no sweep over `d` can see, while χ and Dxz read the two bytes
+   *separately*. The split is pinned by a second argument: where the pair keeps
+   its range checks, by their width (`checked_split_is_unique`, and 256 admitted
+   values is exactly the packing radix — a check one bit wider would not pin the
+   split, which is the control the boards run); where it does not, by the single
+   operand byte that reads each half (`surviving_byte_split`, read-once again),
+   whose sum moves by `256k` and was already a byte, so `k = 0`. That the split
+   moves in integer steps of 256 at all is the axis's own version of the
+   integrality step (`split_form_is_exact`): over the field `256` is invertible,
+   so the redistributions are the whole field until the operand windows on *both*
+   bytes keep `lo + 256·hi` below `p`. The negative
+   control for that one is the "both dropped" configuration itself: with nothing
+   checking the companion either, it absorbs the `256k` and the split is as free
+   as the packed value.
 
    **The two implied halves are not the same kind of saving.** ρ's is 100
    `AreBytes` sends. θ's is 20 *polynomial* constraints (`IS_BIT`, μ-gated,
@@ -252,7 +275,8 @@ check that changed status, and nothing outside this directory records that.
   modeled equations, validated against the reference over random/structured inputs
   and confirmed to move under each injected bug.
 - `field_model.py` — the companion **integer-mod-`p`** model of the inline θ/ρ shift
-  identities, with a switch per range check. This is the piece the next chip copies
+  identities, with a switch per range check, deciding both axes a byte pair has:
+  the packed deviation and the byte split. This is the piece the next chip copies
   when its bounds are enforced by an identity rather than a lookup.
 - `combinatorics.py` — the solver-free premises the θ and ρ results rest on: π is a
   bijection on the lanes, all 400 ρ byte columns are read exactly once by a pi
