@@ -2,10 +2,13 @@ name: Formal verification gates
 on:
   pull_request:
     branches: ["**"]
-    paths: ["formal_verification/**", ".github/workflows/pr_formal_verification.yaml"]
+    paths:
+      - "formal_verification/**"
+      - "Makefile"                 # the recipe this job runs
+      - ".github/workflows/pr_formal_verification.yaml"
   push:
     branches: ["main"]
-    paths: ["formal_verification/**"]
+    paths: ["formal_verification/**", "Makefile"]
 
 permissions:
   contents: read
@@ -24,4 +27,8 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
+        with:
+          # Pinned: the scripts are pure integer arithmetic, so the version only
+          # matters for reproducing a failure, and an unpinned runner drifts.
+          python-version: "3.12"
       - run: make verify-keccak
