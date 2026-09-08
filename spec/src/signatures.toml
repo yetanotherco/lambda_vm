@@ -132,9 +132,9 @@ tag = "CNB"
 kind = "interaction"
 input = ["Word", "BaseField", "DWordWL", "DWordWL"]
 
-# DMA_NEXT[timestamp, src, dst, count]
+# MEMMOVE_NEXT[timestamp, src, dst, count]
 [[signatures]]
-tag = "DMA_NEXT"
+tag = "MEMMOVE_NEXT"
 kind = "interaction"
 input = ["Word", "DWordWL", "DWordWL", "DWordWL"]
 

@@ -35,4 +35,4 @@ Negative numbers (represented as 2s complement 64-bit numbers), are used for our
 / -20: `FEXT_LOAD` (@fext)
 / -21: `FEXT_FMA` (@fext)
 / -22: `FEXT_ZERO` (@fext)
-/ -30: `DMA`/`memcpy` (@dma)
+/ -30: `MEMMOVE` (@memmove)
