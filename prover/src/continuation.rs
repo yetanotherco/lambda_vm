@@ -1997,6 +1997,12 @@ mod tests {
                     ("bytewise", c.bytewise),
                     ("store", c.store),
                     ("cpu32", c.cpu32),
+                    ("keccak", c.keccak),
+                    ("keccak_rnd", c.keccak_rnd),
+                    ("ecsm", c.ecsm),
+                    ("ecdas", c.ecdas),
+                    ("hint", c.hint),
+                    ("commit", c.commit),
                 ]
             })
             .collect();

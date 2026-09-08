@@ -185,3 +185,75 @@ fn validate_still_requires_cpu_and_the_register_file() {
         "a proof with no register file is rejected"
     );
 }
+
+/// The accelerators are the ones a run most often never reaches, and each cost a
+/// four-row sub-proof regardless. A program with no keccak, no EC and no hint
+/// ecall now carries none of the six.
+#[test]
+fn a_run_without_accelerators_omits_all_six() {
+    let (elf, logs, _instructions) = run_asm_elf("xori");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
+
+    let counts = traces.table_counts();
+    for (name, count) in [
+        ("keccak", counts.keccak),
+        ("keccak_rnd", counts.keccak_rnd),
+        ("ecsm", counts.ecsm),
+        ("ecdas", counts.ecdas),
+        ("hint", counts.hint),
+        ("commit", counts.commit),
+    ] {
+        assert_eq!(
+            count, 0,
+            "{name} should be absent from a plain xori program"
+        );
+    }
+    assert!(counts.validate().is_ok());
+
+    assert!(
+        prove_and_verify(&elf, &mut traces),
+        "a proof without any accelerator table must still verify"
+    );
+}
+
+/// The accelerator counterpart of the forgery above: HINT is the softest table
+/// in the set — it constrains nothing about the hinted value — so it is the one
+/// worth showing cannot simply be dropped. The CPU's ecall send has no receiver
+/// without it, and the bus balance is what notices.
+#[test]
+fn omitting_a_used_accelerator_fails_the_bus_balance() {
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .to_path_buf();
+    let elf_bytes =
+        match std::fs::read(workspace_root.join("executor/program_artifacts/rust/hint_min.elf")) {
+            Ok(bytes) => bytes,
+            // Built by `make compile-programs-rust`; skip rather than fail when the
+            // artifact is absent, matching the other guest-ELF tests.
+            Err(_) => return,
+        };
+    let elf = Elf::load(&elf_bytes).expect("ELF load");
+    let executor = executor::vm::execution::Executor::new(&elf, Vec::new()).expect("executor");
+    let result = executor.run().expect("execution");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
+    assert!(
+        !traces.hints.is_empty(),
+        "hint_min must make a hint ecall for this to be a forgery"
+    );
+
+    assert!(
+        prove_and_verify(&elf, &mut traces),
+        "the honest proof must verify first, or the negative below proves nothing"
+    );
+
+    traces.hints.clear();
+    assert_eq!(traces.table_counts().hint, 0);
+
+    assert!(
+        !prove_and_verify(&elf, &mut traces),
+        "dropping HINT while the CPU still sends its ecall must not verify"
+    );
+}
