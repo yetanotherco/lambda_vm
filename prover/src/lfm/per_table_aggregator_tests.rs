@@ -1232,3 +1232,69 @@ fn the_leaf_node_verifies_and_binds_two_wraps() {
         println!("   ✓ tamper arm: {name} rejected");
     }
 }
+
+/// ★ A ZERO-BIT QUERY DRAW CONSUMES WHAT THE HOST CONSUMES.
+///
+/// # The defect this holds shut
+///
+/// A one-row trace at blowup 2 has a two-leaf LDE, so production's
+/// `sample_query_indexes` calls `sample_u64(domain_size >> 1)` = `sample_u64(1)`
+/// for every query of that table. Both host transcripts CONSUME before masking —
+/// the byte arm draws one `next_sample_u64()`, the pinned algebraic arm squeezes
+/// a cell — and return index 0. The emitted sampler refused `nbits = 0` outright,
+/// so the epoch verifier could not be built over such an epoch at all; that is
+/// what `the_leaf_node_verifies_and_binds_two_wraps` hit on box A, at inner epoch
+/// 1's sub-proof #10.
+///
+/// # Why the obvious fix would have been the bug
+///
+/// "One index, so skip the sample" is wrong: the host does not skip it. An
+/// emitter that skipped would be one squeeze short for that table and every
+/// challenge after it in that fork would diverge.
+///
+/// # Why this test needs the follow-up draw
+///
+/// ⚠ A consumption desync here is invisible to a value differential ON the
+/// table: every index is 0 whether the draw happened or not, and `iota_bits` is
+/// the LAST thing `epoch::emit_table_challenges` samples, so nothing later in
+/// that fork disagrees either. A green leaf test therefore proves nothing about
+/// consumption — it proves only that no panic fired.
+///
+/// So this samples an extension element AFTER the zero-bit draw on both sides.
+/// That element is the single observable that differs if the squeeze is missing,
+/// and comparing it against the HOST's is what makes this emitter-host agreement
+/// rather than emitter self-consistency.
+///
+/// ⓘ It lives here because lane A owns `transcript_replay.rs` only for this fix;
+/// its natural home is beside the other transcript differentials.
+#[test]
+fn a_zero_bit_query_draw_consumes_what_the_host_does() {
+    use crypto::fiat_shamir::is_transcript::IsTranscript;
+
+    const SEED: &[u8] = b"lane-A zero-bit query draw v0";
+
+    // ---- the HOST, exactly as `sample_query_indexes` drives it at a one-row
+    // table: one `sample_u64(1)`, then the next thing the transcript would give.
+    let mut host = crate::hash_pin::block_transcript(SEED);
+    let index = host.sample_u64(1);
+    assert_eq!(index, 0, "a two-leaf domain has exactly one query index");
+    let host_after: FEE = host.sample_field_element();
+
+    // ---- the EMITTER, same seed, same sequence.
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut t = TranscriptReplay::new(SEED);
+    let bits = t.sample_u64_pow2(&mut b, 0);
+    assert!(bits.is_empty(), "a zero-bit draw yields no bits");
+    let after = t.sample_ext(&mut b);
+    b.public(after.as_cell());
+    let program = compile(b.finish());
+    let exec = execute(&program, &[], &crate::hash_pin::BLOCK_HASHER)
+        .expect("a zero-bit query draw must emit and execute");
+
+    assert_eq!(
+        super::word::word_as_ext(&exec.public_words[0].1).expect("an ext"),
+        host_after,
+        "the draw AFTER a zero-bit query index must equal the host's — if the \
+         emitter skipped the squeeze, this is the ONLY place it shows"
+    );
+}
