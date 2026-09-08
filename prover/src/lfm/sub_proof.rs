@@ -173,10 +173,26 @@ impl SubProofShape {
             self.merkle_depth,
             self.log2_lde_length
         );
-        assert!(
-            self.merkle_depth >= 1,
-            "a tree with no levels has no path to walk"
-        );
+        // ⚠ NO `merkle_depth >= 1`. A ONE-PAIR domain — a one-row trace at blowup
+        // 2 — has a single leaf, so the tree has no levels and the LEAF HASH IS
+        // THE ROOT. That is a legitimate degenerate shape, and both sides already
+        // handle it without a special case:
+        //
+        // · the host's `verify_merkle_path_from_leaf_hash` loops over an empty
+        //   path and returns `root_hash == hashed_value`;
+        // · `emit_group_authentication` hashes the leaf, walks zero levels, and
+        //   asserts the result equals the committed root.
+        //
+        // So the walk at depth 0 is NOT a no-op — it is exactly the binding, and
+        // the old assert refused a shape the code below verifies correctly. It
+        // read "a tree with no levels has no path to walk", which is true and
+        // beside the point: there is no path, none is walked, and the leaf-versus
+        // -root compare still happens.
+        //
+        // Found by the leaf-node gate at a real continuation epoch's sub-proof
+        // #10; gated by
+        // `per_table_aggregator_tests::a_depth_zero_walk_still_binds_leaf_to_root`,
+        // whose REJECTION arm is what proves the compare survives.
     }
 }
 

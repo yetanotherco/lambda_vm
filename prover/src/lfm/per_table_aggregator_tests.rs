@@ -1476,3 +1476,118 @@ fn the_inner_node_verifies_two_leaf_nodes() {
          makes the same emitter serve the level above"
     );
 }
+
+/// ★ A DEPTH-ZERO MERKLE WALK STILL BINDS THE LEAF TO THE ROOT.
+///
+/// # The shape
+///
+/// A one-row trace at blowup 2 has a two-leaf LDE, one row PAIR, and therefore a
+/// Merkle tree with a single leaf and no levels — the leaf hash IS the root.
+/// `SubProofShape::check` refused it outright (`merkle_depth >= 1`), which is
+/// what `the_leaf_node_verifies_and_binds_two_wraps` hit once the query sampler
+/// stopped refusing zero index bits.
+///
+/// # Why this is not "make the walk a no-op"
+///
+/// It is not a no-op and must not become one. Both sides do the same thing at
+/// depth 0 and neither needs a special case:
+///
+/// - host `verify_merkle_path_from_leaf_hash` loops over an empty path and
+///   returns `root_hash == hashed_value`;
+/// - `emit_group_authentication` hashes the leaf, walks zero levels, and asserts
+///   the result equals the committed root.
+///
+/// The compare is the entire binding, and it survives. **The rejection arm below
+/// is what proves that** — if relaxing the shape check had let the walk skip its
+/// root comparison, the honest arm would still pass and only this one would fail.
+///
+/// # Where the host enters
+///
+/// The root is not invented here: it is the leaf hash the emitter itself
+/// computes, and `emit_leaf_hash`'s agreement with the host's backend is gated
+/// separately by `algebraic_commit`'s leaf/parent differential. Composing the two
+/// is what makes this emitter-versus-host rather than emitter-versus-itself, and
+/// it is stated rather than assumed because the composition is the argument.
+#[test]
+fn a_depth_zero_walk_still_binds_leaf_to_root() {
+    use super::sub_proof::{
+        GroupCommitment, GroupOpening, GroupShape, emit_group_authentication, emit_leaf_hash,
+    };
+
+    const COLS: usize = 3;
+    let shape = GroupShape {
+        num_columns: COLS,
+        is_ext: false,
+    };
+    let values: Vec<FE> = (0..shape.num_values() as u64)
+        .map(|i| FE::from(7 * i + 1))
+        .collect();
+
+    // ---- the root, from the emitter's own leaf hash over those values.
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let arena = b.declare_arena(shape.num_values() as u32);
+    let cells: Vec<_> = (0..shape.num_values() as u32)
+        .map(|i| b.hint_word(arena, i))
+        .collect();
+    let leaf = emit_leaf_hash(&mut b, shape, &cells);
+    for cell in leaf.cells() {
+        b.public(*cell);
+    }
+    let leaf_program = compile(b.finish());
+    let leaf_arena: Vec<LfmWord> = values.iter().map(|v| base_word(*v)).collect();
+    let leaf_exec = execute(
+        &leaf_program,
+        std::slice::from_ref(&leaf_arena),
+        &crate::hash_pin::BLOCK_HASHER,
+    )
+    .expect("the leaf hash must execute");
+    let root_words: Vec<LfmWord> = leaf_exec.public_words.iter().map(|(_, w)| *w).collect();
+
+    // ---- the authentication at depth ZERO: no bits, no siblings.
+    let build = || {
+        let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+        let a_vals = b.declare_arena(shape.num_values() as u32);
+        let a_root = b.declare_arena(root_words.len() as u32);
+        let vals: Vec<_> = (0..shape.num_values() as u32)
+            .map(|i| b.hint_word(a_vals, i))
+            .collect();
+        let commitment = GroupCommitment::hint(&mut b, a_root, 0, shape);
+        emit_group_authentication(
+            &mut b,
+            &commitment,
+            &GroupOpening {
+                values: vals,
+                siblings: Vec::new(),
+            },
+            &[],
+        );
+        compile(b.finish())
+    };
+    let program = build();
+
+    // ---- the honest arm: the leaf hash IS the root, so this must execute.
+    execute(
+        &program,
+        &[leaf_arena.clone(), root_words.clone()],
+        &crate::hash_pin::BLOCK_HASHER,
+    )
+    .expect("★ a one-leaf tree must authenticate against its own leaf hash");
+
+    // ---- ★ THE REJECTION ARM — the one that proves the compare survives.
+    let mut wrong = root_words.clone();
+    wrong[0][0] += FE::one();
+    assert!(
+        execute(
+            &program,
+            &[leaf_arena, wrong],
+            &crate::hash_pin::BLOCK_HASHER
+        )
+        .is_err(),
+        "a depth-zero walk must still REJECT a root that is not the leaf hash — \
+         if this passes, the walk stopped binding and the honest arm proves nothing"
+    );
+    println!(
+        "   ✓ depth-0 walk: {} column pair binds to its root, and a moved root is rejected",
+        COLS
+    );
+}
