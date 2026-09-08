@@ -37,7 +37,14 @@ use std::path::Path;
 /// Matched as call forms rather than as bare identifiers, because `Prover` and
 /// `Verifier` appear inside `IsStarkProver`, `BlockProver` and ordinary prose.
 /// A line naming the pin is excluded by [`PIN_CALLS`] rather than by the pattern.
-const ALIAS_CALLS: &[&str] = &["Prover::multi_prove", "Verifier::multi_verify"];
+/// `compute_precomputed_commitment_for_testing` joined the list when a test
+/// declared BLAKE3 preprocessed commitments through it while the pinned prover
+/// recomputed them under RPX — the same alias, one more call form.
+const ALIAS_CALLS: &[&str] = &[
+    "Prover::multi_prove",
+    "Verifier::multi_verify",
+    "Prover::compute_precomputed_commitment_for_testing",
+];
 
 /// The pinned spellings, which contain [`ALIAS_CALLS`] as substrings.
 const PIN_CALLS: &[&str] = &["BlockProver::", "BlockVerifier::"];

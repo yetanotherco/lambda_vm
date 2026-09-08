@@ -420,7 +420,7 @@ mod soundness_tests {
         NullBoundaryConstraintBuilder, Packing,
     };
     use stark::proof::options::ProofOptions;
-    use stark::prover::{IsStarkProver, Prover};
+    use stark::prover::IsStarkProver;
     use stark::trace::TraceTable;
     use stark::traits::AIR;
     use stark::verifier::IsStarkVerifier;
@@ -557,8 +557,14 @@ mod soundness_tests {
         let dummy_air = create_receiver_air(proof_options);
 
         // Use the prover's commitment computation (3 precomputed cols: X, Y, AND)
-        Prover::compute_precomputed_commitment_for_testing(trace, &dummy_air, 3)
-            .expect("Failed to compute commitment")
+        // — the PINNED prover, so the commitment the AIRs declare is built under
+        // the same hash `multi_prove_ram` recomputes it with. The workspace
+        // `Prover` alias is BLAKE3 whatever the pin says, and under an algebraic
+        // pin it makes the honest arm fail with PrecomputedCommitmentMismatch.
+        crate::hash_pin::BlockProver::compute_precomputed_commitment_for_testing(
+            trace, &dummy_air, 3,
+        )
+        .expect("Failed to compute commitment")
     }
 
     fn create_sender_trace(x: u8, y: u8, claimed_result: u8) -> TraceTable<F, E> {
