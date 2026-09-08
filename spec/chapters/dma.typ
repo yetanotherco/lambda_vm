@@ -16,11 +16,8 @@
 
 The #dma chip copies a range of bytes from one location in memory to another, that is, it performs a `memcpy`.
 #footnote([Linux man-page on `memcpy`; man7.org. #link("https://man7.org/linux/man-pages/man3/memcpy.3.html")[[src]]])
-The guest performs such a copy with a RISC-V loop --- per copied doubleword a load, a store, two pointer increments and a branch, each of them a `CPU` row (@cpu) together with its memory operations.
-This accelerator replaces all of that with a single row per eight copied bytes.
-An accelerated `memcpy` is expected to conform to the Ethereum Foundation's Accelerated Memory Operations standard, which fixes the semantics the symbol must keep and how it must win linking.
-#footnote([Accelerated Memory Operations; eth-act/zkevm-standards. #link("https://github.com/eth-act/zkevm-standards/tree/main/standards/accelerated-memory-operations")[[src]]])
-Both obligations fall on the guest-side stub and on the link, outside this chapter; what the standard asks of the chip itself is that it assume no particular alignment of `dst`, `src` or `count`, which @dma:c:tail guarantees by choosing the width from `count` alone.
+Without this chip the guest would copy the range with a RISC-V loop --- per doubleword a load, a store, two pointer increments and a branch, five instructions the proof pays for.
+This accelerator replaces the loop with a single `ECALL` that copies eight bytes per row.
 
 = Variables
 #let nr_variables = total_nr_variables(chip)
@@ -164,6 +161,17 @@ Note that this padding row is not all-zero.
 @dma:c:count_decr is unconditional, so a padding row has to satisfy it too: $#`tail` = 1$ makes $#`step` = 1$, which $#`count` = 1$ and $#`count_decr` = 0$ then satisfy.
 The two address updates are conditioned on $#`μ` - #`end`$ and so do not forbid a wraparound here, but their low-limb carry is constrained on every row (@addnw:c:carry), so a padding row must satisfy that relation too; $#`src_incr` = #`dst_incr` = 1$ is the assignment that does so with a zero carry.
 It is not the only one --- @dma:c:range_src_incr and @dma:c:range_dst_incr, which would pin the limbs, carry multiplicity $#`μ`$ and are inert here --- but a padding row feeds no interaction either way.
+
+= The Accelerated Memory Operations standard
+The Ethereum Foundation's Accelerated Memory Operations standard fixes what an accelerated `memcpy` must provide.
+#footnote([Accelerated Memory Operations; eth-act/zkevm-standards. #link("https://github.com/eth-act/zkevm-standards/tree/main/standards/accelerated-memory-operations")[[src]]])
+
+Two of its requirements fall outside this chapter.
+The first is behavioural: the accelerated symbol must behave identically to the C library function, which the guest-side stub is responsible for.
+The second concerns linking: the symbol must be a strong definition in an unconditionally linked object, or be linked with `--whole-archive`, so that a weak definition elsewhere cannot silently displace it.
+
+What the standard asks of the chip itself is that it accept operands of arbitrary alignment.
+@dma:c:tail meets that by choosing each row's width from `count` alone, so no alignment of `dst`, `src` or `count` is assumed.
 
 = Notes/optimizations
 - The copy is a `memmove` per `ECALL`, but _not_ per guest-level `memcpy`: a copy larger than 256 bytes is chunked into several `ECALL`s at distinct timestamps, and chunk $k+1$ reads what chunk $k$ has already written.
