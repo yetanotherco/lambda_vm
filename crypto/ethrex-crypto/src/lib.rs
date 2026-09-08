@@ -2,7 +2,7 @@
 //!
 //! Implements ethrex's `Crypto` trait with LambdaVM precompile acceleration and
 //! is injected into the ethrex guest (`Arc::new(LambdaVmEcsmCrypto)` →
-//! `execution_program`). Living in the lambda_vm repo (not in ethrex) means
+//! `run_stateless_guest`). Living in the lambda_vm repo (not in ethrex) means
 //! accelerator changes don't require an ethrex PR.
 //!
 //! Accelerated today:
@@ -16,6 +16,7 @@
 //! Every other `Crypto` method inherits the trait default (vetted pure-Rust
 //! crates: `ark-bn254`, `bls12_381`, `p256`, `sha2`, `ripemd`, …).
 
+#[cfg(not(target_arch = "riscv64"))]
 use ethrex_crypto::keccak::keccak_hash;
 use ethrex_crypto::{Crypto, CryptoError};
 use k256::elliptic_curve::group::prime::PrimeCurveAffine;

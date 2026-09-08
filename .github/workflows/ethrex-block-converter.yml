@@ -83,15 +83,17 @@ jobs:
           workspaces: |
             tooling/ethrex-tests -> target
 
-      # Fetch-and-verify, not build: no converter, no ethrex-replay cache, no rev pin.
-      # The guard covers the window after a repoint but before the new artifact is
-      # uploaded: the screen below is its only consumer, and failing the job on an
-      # unset URL would block PRs on an upload nobody in the PR can perform.
-      - name: Fetch real-block fixture
+      # Built from the block's replay cache, not downloaded: ethrex 25's guest decodes
+      # only the Amsterdam schema, so no hosted artifact for a pre-Amsterdam block can
+      # be valid. The generator validates the block through the guest before writing,
+      # which is what the screen below then re-checks against the ELF. The guard covers
+      # an unset cache URL, where failing the job would block PRs on an upload nobody
+      # in the PR can perform.
+      - name: Build real-block fixture
         id: fixture
         run: |
-          if [ -z "$(make -s print-real-block-fixture-url)" ]; then
-            echo "::warning::ETHREX_REAL_BLOCK_FIXTURE_URL is unset — skipping the real-block usability screen. Set it in the Makefile once the .bin is hosted."
+          if [ -z "$(make -s print-real-block-cache-url)" ]; then
+            echo "::warning::ETHREX_REAL_BLOCK_CACHE_URL is unset — skipping the real-block usability screen. Set it in the Makefile once the cache is hosted."
             echo "present=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi

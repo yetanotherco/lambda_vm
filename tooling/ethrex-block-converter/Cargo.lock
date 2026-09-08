@@ -854,9 +854,11 @@ dependencies = [
  "ethrex-config",
  "ethrex-crypto",
  "ethrex-guest-program",
+ "ethrex-rlp",
  "k256",
  "lambda-vm-ethrex-crypto",
- "rkyv",
+ "libssz",
+ "libssz-types",
  "serde",
  "serde_json",
  "sha2",
@@ -864,8 +866,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-blockchain"
-version = "23.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git?rev=797df5540c7d35cafd69b6971a74b2a49c67d1dd#797df5540c7d35cafd69b6971a74b2a49c67d1dd"
+version = "25.0.0"
+source = "git+https://github.com/lambdaclass/ethrex.git?rev=2cb18b0b95b27a2555d3debffdebc43c9685d6e3#2cb18b0b95b27a2555d3debffdebc43c9685d6e3"
 dependencies = [
  "bytes",
  "crossbeam",
@@ -889,8 +891,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-common"
-version = "23.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git?rev=797df5540c7d35cafd69b6971a74b2a49c67d1dd#797df5540c7d35cafd69b6971a74b2a49c67d1dd"
+version = "25.0.0"
+source = "git+https://github.com/lambdaclass/ethrex.git?rev=2cb18b0b95b27a2555d3debffdebc43c9685d6e3#2cb18b0b95b27a2555d3debffdebc43c9685d6e3"
 dependencies = [
  "bytes",
  "crc32fast",
@@ -912,6 +914,7 @@ dependencies = [
  "once_cell",
  "rkyv",
  "rustc-hash",
+ "secp256k1",
  "serde",
  "serde_json",
  "sha2",
@@ -921,8 +924,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-config"
-version = "23.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git?rev=797df5540c7d35cafd69b6971a74b2a49c67d1dd#797df5540c7d35cafd69b6971a74b2a49c67d1dd"
+version = "25.0.0"
+source = "git+https://github.com/lambdaclass/ethrex.git?rev=2cb18b0b95b27a2555d3debffdebc43c9685d6e3#2cb18b0b95b27a2555d3debffdebc43c9685d6e3"
 dependencies = [
  "ethrex-common",
  "ethrex-p2p",
@@ -933,8 +936,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-crypto"
-version = "23.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git?rev=797df5540c7d35cafd69b6971a74b2a49c67d1dd#797df5540c7d35cafd69b6971a74b2a49c67d1dd"
+version = "25.0.0"
+source = "git+https://github.com/lambdaclass/ethrex.git?rev=2cb18b0b95b27a2555d3debffdebc43c9685d6e3#2cb18b0b95b27a2555d3debffdebc43c9685d6e3"
 dependencies = [
  "ark-bn254",
  "ark-ec",
@@ -947,6 +950,7 @@ dependencies = [
  "num-bigint",
  "p256",
  "ripemd",
+ "secp256k1",
  "sha2",
  "thiserror 2.0.19",
  "tiny-keccak",
@@ -954,8 +958,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-guest-program"
-version = "23.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git?rev=797df5540c7d35cafd69b6971a74b2a49c67d1dd#797df5540c7d35cafd69b6971a74b2a49c67d1dd"
+version = "25.0.0"
+source = "git+https://github.com/lambdaclass/ethrex.git?rev=2cb18b0b95b27a2555d3debffdebc43c9685d6e3#2cb18b0b95b27a2555d3debffdebc43c9685d6e3"
 dependencies = [
  "bytes",
  "ethereum-types",
@@ -965,6 +969,10 @@ dependencies = [
  "ethrex-rlp",
  "ethrex-vm",
  "hex",
+ "libssz",
+ "libssz-derive",
+ "libssz-merkle",
+ "libssz-types",
  "rkyv",
  "serde",
  "serde_with",
@@ -973,8 +981,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-l2-common"
-version = "23.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git?rev=797df5540c7d35cafd69b6971a74b2a49c67d1dd#797df5540c7d35cafd69b6971a74b2a49c67d1dd"
+version = "25.0.0"
+source = "git+https://github.com/lambdaclass/ethrex.git?rev=2cb18b0b95b27a2555d3debffdebc43c9685d6e3#2cb18b0b95b27a2555d3debffdebc43c9685d6e3"
 dependencies = [
  "bytes",
  "ethereum-types",
@@ -991,8 +999,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-levm"
-version = "23.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git?rev=797df5540c7d35cafd69b6971a74b2a49c67d1dd#797df5540c7d35cafd69b6971a74b2a49c67d1dd"
+version = "25.0.0"
+source = "git+https://github.com/lambdaclass/ethrex.git?rev=2cb18b0b95b27a2555d3debffdebc43c9685d6e3#2cb18b0b95b27a2555d3debffdebc43c9685d6e3"
 dependencies = [
  "bytes",
  "derive_more",
@@ -1009,8 +1017,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-metrics"
-version = "23.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git?rev=797df5540c7d35cafd69b6971a74b2a49c67d1dd#797df5540c7d35cafd69b6971a74b2a49c67d1dd"
+version = "25.0.0"
+source = "git+https://github.com/lambdaclass/ethrex.git?rev=2cb18b0b95b27a2555d3debffdebc43c9685d6e3#2cb18b0b95b27a2555d3debffdebc43c9685d6e3"
 dependencies = [
  "ethrex-common",
  "serde",
@@ -1021,8 +1029,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-p2p"
-version = "23.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git?rev=797df5540c7d35cafd69b6971a74b2a49c67d1dd#797df5540c7d35cafd69b6971a74b2a49c67d1dd"
+version = "25.0.0"
+source = "git+https://github.com/lambdaclass/ethrex.git?rev=2cb18b0b95b27a2555d3debffdebc43c9685d6e3#2cb18b0b95b27a2555d3debffdebc43c9685d6e3"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -1063,8 +1071,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-rlp"
-version = "23.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git?rev=797df5540c7d35cafd69b6971a74b2a49c67d1dd#797df5540c7d35cafd69b6971a74b2a49c67d1dd"
+version = "25.0.0"
+source = "git+https://github.com/lambdaclass/ethrex.git?rev=2cb18b0b95b27a2555d3debffdebc43c9685d6e3#2cb18b0b95b27a2555d3debffdebc43c9685d6e3"
 dependencies = [
  "bytes",
  "ethereum-types",
@@ -1073,8 +1081,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-storage"
-version = "23.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git?rev=797df5540c7d35cafd69b6971a74b2a49c67d1dd#797df5540c7d35cafd69b6971a74b2a49c67d1dd"
+version = "25.0.0"
+source = "git+https://github.com/lambdaclass/ethrex.git?rev=2cb18b0b95b27a2555d3debffdebc43c9685d6e3#2cb18b0b95b27a2555d3debffdebc43c9685d6e3"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1095,8 +1103,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-trie"
-version = "23.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git?rev=797df5540c7d35cafd69b6971a74b2a49c67d1dd#797df5540c7d35cafd69b6971a74b2a49c67d1dd"
+version = "25.0.0"
+source = "git+https://github.com/lambdaclass/ethrex.git?rev=2cb18b0b95b27a2555d3debffdebc43c9685d6e3#2cb18b0b95b27a2555d3debffdebc43c9685d6e3"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1115,8 +1123,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-vm"
-version = "23.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git?rev=797df5540c7d35cafd69b6971a74b2a49c67d1dd#797df5540c7d35cafd69b6971a74b2a49c67d1dd"
+version = "25.0.0"
+source = "git+https://github.com/lambdaclass/ethrex.git?rev=2cb18b0b95b27a2555d3debffdebc43c9685d6e3#2cb18b0b95b27a2555d3debffdebc43c9685d6e3"
 dependencies = [
  "bytes",
  "derive_more",
@@ -1691,18 +1699,18 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "libssz"
-version = "0.2.2"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d498c0482bba87d2647ea4601ea76cf2b498065e3958798a88f49274f3ced5e9"
+checksum = "b4bdd6d63ed811ae164966de20810be780e07de784a4834ccfe6be90480c369e"
 dependencies = [
  "smallvec",
 ]
 
 [[package]]
 name = "libssz-derive"
-version = "0.2.2"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08ddfb5c969c28a4a54043e630f80c723352637bd1020f256ee3ac7a8814922b"
+checksum = "aeee1b9ac9200429f7e9830492765445989ea61c3fb9028ad5a96e1dd5f5e913"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1711,9 +1719,9 @@ dependencies = [
 
 [[package]]
 name = "libssz-merkle"
-version = "0.2.2"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "63c6d6d5ce5d79bba66bc98c99869eedffedf7f14f0aa0915f1a62802650bdf6"
+checksum = "863eca32d1a43e5ec41106a515552efa8307768d37c68d26b7f21ff13cfee1a7"
 dependencies = [
  "libssz",
  "sha2",
@@ -1721,9 +1729,9 @@ dependencies = [
 
 [[package]]
 name = "libssz-types"
-version = "0.2.2"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "747273ab2d923e82ed147091fe0fb3e602dd2012c872cdad5efe69e27c3b4099"
+checksum = "d4231ac301726840a3fe111f11bd4619d3c97ed155cb94c88dbf92b70e04e017"
 dependencies = [
  "libssz",
  "libssz-merkle",

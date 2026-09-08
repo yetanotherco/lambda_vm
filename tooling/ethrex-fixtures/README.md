@@ -1,79 +1,84 @@
 # ethrex-fixtures
 
-Generates synthetic **ethrex block fixtures** — serialized `ProgramInput` `.bin`
-files — for the lambda-vm prover tests and benchmarks. Fully in-memory and
-offline (no RPC, no node): it builds a genesis chain, creates a block with a
-chosen number of signed ETH-transfer transactions, runs ethrex's stateless
-witness generation, and writes the rkyv-encoded `ProgramInput`.
+Generates deterministic synthetic ethrex blocks and writes the
+schema-prefixed SSZ stateless input consumed by the LambdaVM guest. The tool
+builds an in-memory chain, creates signed ETH transfers, generates the raw
+execution witness, and validates the resulting input with ethrex's native
+stateless guest before writing it.
 
-The ethrex dependency is pinned to the **same revision as the guest**
-(`executor/programs/rust/ethrex`), so the produced fixtures deserialize and
-execute in the guest. When you bump the guest's ethrex rev, bump the `rev` in
-this crate's `Cargo.toml` too and regenerate.
-
-## Prerequisites
-- Rust (stable) and network access (the first build fetches the pinned ethrex
-  crates). **No RV64 target or sysroot needed** — this is a host tool.
-
-## How to run
+The ethrex revision is pinned to the same commit as the guest. After changing
+that pin, regenerate the committed fixtures with `make regen-ethrex-fixtures`.
 
 ```bash
 cd tooling/ethrex-fixtures
-cargo run --release -- <n_transfers> <output_path> [mode]
+cargo run --release -- <n_transfers> <output_path> [same|recipients|distinct]
 ```
 
-- `<n_transfers>` — how many ETH transfers to include in the block (`0` = empty
-  block).
-- `<output_path>` — where to write the `.bin` (relative to this directory).
-- `[mode]` — account diversity (optional, default `same`):
-  - `same` — one funded sender (`RICH_PK`) → one fixed recipient (`0xdeadbeef`).
-  - `recipients` — one funded sender → N distinct recipients (1 → N fan-out).
-  - `distinct` — N distinct, genesis-funded senders → N distinct recipients
-    (N independent 1-1 pairs; senders are deterministic synthetic keys injected
-    into the genesis allocation). This is what the CI benchmark uses, since the
-    state-trie witness for many distinct accounts is closer to a real block.
-
-It prints the output size, the number of transactions, and the mode, e.g.:
-
-```
-wrote ../../executor/tests/ethrex_simple_tx.bin (12745 bytes): block #1 with 1/1 transfer(s) [1 sender -> 1 recipient]
-```
-
-Output is deterministic for a given `(n_transfers, mode)`.
-
-## Creating blocks with different numbers of transactions
-
-Just change the first argument:
+`same` uses one funded sender, `recipients` sends to distinct recipients, and
+`distinct` uses deterministic funded senders. The standard fixtures are:
 
 ```bash
-# empty block (0 transactions)
-cargo run --release -- 0 ../../executor/tests/ethrex_empty_block.bin
-
-# 1 transfer
-cargo run --release -- 1 ../../executor/tests/ethrex_simple_tx.bin
-
-# 10 transfers
+cargo run --release -- 0  ../../executor/tests/ethrex_empty_block.bin
+cargo run --release -- 1  ../../executor/tests/ethrex_simple_tx.bin
 cargo run --release -- 10 ../../executor/tests/ethrex_10_transfers.bin
-
-# 50 transfers (custom)
-cargo run --release -- 50 /tmp/ethrex_50_transfers.bin
+cargo run --release -- 4  ../../executor/tests/ethrex_bench_4.bin distinct
 ```
 
-For committed fixtures, prefer `make regen-ethrex-fixtures` from the repo root;
-it regenerates the standard fixtures and refreshes
-`executor/tests/README.md` checksums.
+The generator is host-only; it needs no RV64 target or sysroot. Output is
+deterministic for a given transfer count and mode.
 
-> Note: bigger blocks cost ~4M cycles per transfer (software ecrecover
-> dominates), so they execute fine but may be too heavy to *prove* on a typical
-> machine — e.g. 10 transfers ≈ 42M cycles.
+## The benchmark block: `--bin real_block`
 
-## Details
-- Transactions are plain ETH transfers. In `same`/`recipients` mode they are
-  signed by a funded dev account from `genesis.json` (well-known load-test key —
-  not a secret); in `distinct` mode each is signed by its own synthetic key,
-  funded by injecting an entry into the genesis allocation. Output is
-  deterministic in all modes.
-- Currently only ETH transfers are supported. (ERC20 / contract calls would be
-  a future extension.)
-- Once the upstream LambdaVM-backend ethrex PR merges, this tool can be replaced
-  by `ethrex-replay custom block` on ethrex `main`.
+The synthetic blocks above are transfers, which is not what a real block costs:
+a mainnet block is keccak- and trie-bound, and a prover change can move the two
+numbers in opposite directions. `real_block` produces the benchmark workload
+from a real block instead — its own transactions, its own accounts, its own
+contract code — rebuilt as an Amsterdam block the guest accepts:
+
+```bash
+cargo run --release --bin real_block -- <ethrex-replay-cache.json> <output.bin>
+# or, with the cache fetched for you:
+make regen-real-block-fixture
+```
+
+It reads an ethrex-replay cache, installs the block's pre-state into an
+in-memory store **keyed the way the tries are keyed** — `keccak(address)` and
+`keccak(slot)`, so no key preimages are needed and every account and slot the
+block touches arrives intact — registers a parent header at the block's real
+height, replays the transactions in the block's own order through the t8n
+entry point, and validates the result through the native guest before writing.
+
+Output for mainnet 25368371 (29 transactions, 2,428,684 gas):
+
+```
+installed   91 accounts / 117 storage slots / 91 codes
+rebuilt     #25368371 (29/29 txs, 1803938 gas, 12 reverted)
+```
+
+### Why 12 transactions revert, and why that is not a defect here
+
+Those transactions were signed with gas limits computed under Osaka. Amsterdam
+changes the gas model: cold account access goes from 2600 to 3000, and EIP-8037
+carves a state-gas reservoir out of the transaction's excess gas limit. A
+transfer sent with a limit of exactly 21,000 has no excess to carve, so it runs
+out of gas. The same rebuild under Osaka rules — `REAL_BLOCK_FORK=osaka`, which
+prints the totals and exits without writing, since the guest only decodes the
+Amsterdam schema — reverts **2** transactions instead of 12:
+
+| rules | txs | gas | reverted |
+| --- | --- | ---: | ---: |
+| Osaka (what the block was built for) | 29/29 | 1,473,522 | 2 |
+| Amsterdam | 29/29 | 1,803,938 | 12 |
+| mainnet, as mined | 29 | 2,428,684 | — |
+
+So the gap is the fork, not the reconstruction: a pre-Amsterdam block cannot be
+a faithful Amsterdam workload at any level of tooling effort. What this fixture
+is, therefore, is a *real-mix* Amsterdam block — real contract code, real
+calldata, real signatures (the accelerator counters agree exactly with the
+retired fixture at 116 ECSM calls), real trie depth — and not a replay of
+mainnet economics. For workloads whose gas limits were computed for Amsterdam,
+use the EEST benchmark fixtures; `ETHREX_BENCH_WORKLOAD_AFTER_BUMP.md` in the
+repository root has both sets measured side by side.
+
+Measured on the guest ELF at ethrex `2cb18b0b`: 20,360,647 cycles, 2,701 keccak
+calls, 116 ECSM calls.

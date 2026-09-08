@@ -54,11 +54,7 @@ lambda-vm-ethrex-crypto = { path = "../../../../crypto/ethrex-crypto" }
 #
 # KZG is not linked, so the point-evaluation precompile (0x0a) is unsupported —
 # see src/main.rs.
-ethrex-guest-program = { git = "https://github.com/lambdaclass/ethrex.git", rev = "797df5540c7d35cafd69b6971a74b2a49c67d1dd", package = "ethrex-guest-program", default-features = false }
-# Exact pin: must match the fixture writer (tooling/ethrex-fixtures) and the
-# executor test reader so the rkyv ProgramInput layout stays consistent.
-rkyv = { version = "=0.8.16", features = ["std", "unaligned"] }
-
+ethrex-guest-program = { git = "https://github.com/lambdaclass/ethrex.git", rev = "2cb18b0b95b27a2555d3debffdebc43c9685d6e3", package = "ethrex-guest-program", default-features = false }
 # `lambda-vm-syscalls` can still reach the graph as a git dep pinned to a commit
 # of THIS repo, which upstream bumps on its own schedule. Override it
 # with the working-tree copy so the guest always links the same syscalls as the rest

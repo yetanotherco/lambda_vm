@@ -148,12 +148,11 @@ if [ ! -f "$ELF_REL" ]; then
   make "$ELF_REL"
 fi
 if [ "$WORKLOAD" = "real" ]; then
-  # ~1 MB, gitignored, never in a fresh checkout — and a rented GPU box is always a
-  # fresh checkout. Fetched by URL + sha256, not built: no converter, no ethrex host
-  # dependency tree, so this costs seconds on the box. Unconditional on purpose: the
-  # target hashes whatever is on disk on every invocation, which is what catches a
-  # copy left behind by an earlier run in the same rental. A match costs ~35 ms.
-  echo "==> Verifying ethrex real-block fixture (fetches on a digest miss)"
+  # Gitignored, never in a fresh checkout — and a rented GPU box is always a fresh
+  # checkout. Built from the block's replay cache (fetched by URL + sha256): ethrex 25's
+  # guest decodes only the Amsterdam schema, so no hosted artifact for this block can be
+  # valid. The generator validates the block through the guest before writing.
+  echo "==> Building ethrex real-block fixture (from its replay cache)"
   make ethrex-real-block-fixture
 elif [ ! -f "$INPUT_REL" ]; then
   echo "==> Generating ethrex ${TX_COUNT}-transfer fixture (missing)"
@@ -162,6 +161,30 @@ elif [ ! -f "$INPUT_REL" ]; then
 fi
 ELF="$(cd "$(dirname "$ELF_REL")" && pwd)/$(basename "$ELF_REL")"
 INPUT="$(cd "$(dirname "$INPUT_REL")" && pwd)/$(basename "$INPUT_REL")"
+
+# A workload the guest REJECTS still produces a proof -- of a program that decoded two
+# bytes and gave up. `run_stateless_guest` cannot fail: on a schema it does not
+# recognise it commits `successful_validation = 0` and exits cleanly, which is what the
+# pre-Amsterdam rkyv fixture now does in 496 cycles. Proving that reads as a ~99%
+# improvement, in green, on both sides of the A/B. One cheap execution up front turns
+# that class of mistake -- stale fixture, wrong fork, fixture built against another
+# ethrex rev -- into a hard stop. The floor is far below any real block (the current
+# one is ~20M cycles) and far above a rejected one.
+MIN_PLAUSIBLE_CYCLES=1000000
+if [ ! -x ./target/release/cli ]; then
+  cargo build --release -p cli >/dev/null
+fi
+workload_cycles="$(./target/release/cli execute "$ELF" --private-input "$INPUT" --cycles \
+  | awk '/^Cycles:/ {print $2}')"
+if [ "${workload_cycles:-0}" -lt "$MIN_PLAUSIBLE_CYCLES" ]; then
+  echo "ERROR: the workload executed only ${workload_cycles:-0} cycles, below the" >&2
+  echo "       ${MIN_PLAUSIBLE_CYCLES} floor. The guest almost certainly rejected the input:" >&2
+  echo "         ELF   $ELF" >&2
+  echo "         input $INPUT" >&2
+  echo "       Rebuild the fixture at this ethrex rev (make regen-real-block-fixture)." >&2
+  exit 1
+fi
+echo "==> Workload executes: $workload_cycles cycles"
 
 # --- 2. Build (or reuse) both prover binaries ---
 need_build=0

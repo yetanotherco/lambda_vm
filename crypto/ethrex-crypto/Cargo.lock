@@ -342,8 +342,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-crypto"
-version = "22.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git?rev=4f658c2b3d10e3f21d35ce546870f55ca3f940fc#4f658c2b3d10e3f21d35ce546870f55ca3f940fc"
+version = "25.0.0"
+source = "git+https://github.com/lambdaclass/ethrex.git?rev=2cb18b0b95b27a2555d3debffdebc43c9685d6e3#2cb18b0b95b27a2555d3debffdebc43c9685d6e3"
 dependencies = [
  "ark-bn254",
  "ark-ec",
