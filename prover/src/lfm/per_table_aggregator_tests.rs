@@ -748,17 +748,13 @@ pub(super) struct RealChild {
     pub(super) public_words: Vec<(u32, LfmWord)>,
     pub(super) tables: Vec<super::epoch_tests::HostTable>,
     pub(super) legs: Vec<super::epoch_verify_tests::TableLegs>,
+    /// The child's OWN shared LogUp pair, recovered host-side by
+    /// `verify_against_chunked`'s own Phase A replay — the oracle the node's leg
+    /// must reproduce in-machine. Consumed by
+    /// [`the_leaf_node_verifies_and_binds_two_wraps`] through
+    /// `NodePublishSet::Diagnostic`.
+    pub(super) z_alpha: (FEE, FEE),
 }
-
-// ⚠ The harvested `(z, α)` is deliberately NOT kept. It is the right
-// differential oracle for a leg — it is what the global leg publishes and
-// compares — but a node under `Publishes::Aggregation` publishes no challenges,
-// so there is nowhere to compare it against and a kept field would be dead. What
-// stands in its place is weaker and worth naming: the node EXECUTING at all
-// means the leg derived the child's own challenges, because a leg on different
-// challenges cannot authenticate the child's walks. That is implication, not a
-// value comparison, and it is a real gap in the evidence until a diagnostic node
-// variant exists to publish the pair.
 
 /// Harvest a child from a proof PRODUCTION ACCEPTS. Panics loudly otherwise —
 /// nothing downstream may read a proof the verifier would reject.
@@ -848,6 +844,7 @@ pub(super) fn real_child(
         public_words: proved.public_words.clone(),
         tables,
         legs,
+        z_alpha: (lookup[0], lookup[1]),
     }
 }
 
@@ -917,6 +914,7 @@ pub(super) fn node_program(
     layouts: &[super::per_table_aggregator::SchemaLayout],
     labels: &[&[u64]],
     label_range: (u64, u64),
+    publishes: super::per_table_aggregator::NodePublishSet,
 ) -> LfmProgram {
     let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
     let shapes: Vec<_> = children.iter().map(child_shape).collect();
@@ -927,6 +925,7 @@ pub(super) fn node_program(
             layouts,
             labels,
             label_range,
+            publishes,
         },
     );
     compile(b.finish())
@@ -965,7 +964,7 @@ pub(super) fn node_program(
 #[ignore = "box tier: proves FAN_IN epoch wraps and a node over them"]
 fn the_leaf_node_verifies_and_binds_two_wraps() {
     use super::epoch_tests::Publishes;
-    use super::per_table_aggregator::{FAN_IN, SchemaLayout};
+    use super::per_table_aggregator::{FAN_IN, NodePublishSet, SchemaLayout};
     use super::proof::lfm_prove;
     use super::registry::build_artifacts_with_hasher;
     use std::time::Instant;
@@ -1022,9 +1021,61 @@ fn the_leaf_node_verifies_and_binds_two_wraps() {
     );
 
     // ---- the node.
-    let t = Instant::now();
-    let program = node_program(&children, &layouts, &label_refs, label_range);
     let arenas: Vec<Vec<LfmWord>> = children.iter().flat_map(child_arena_words).collect();
+    let node_layout = SchemaLayout::node(layouts[FAN_IN - 1].out_halves);
+
+    // ---- ★ THE DIFFERENTIAL, on the same shape with the surface restored.
+    //
+    // Without this the only evidence that a leg derived its CHILD's challenges
+    // is that the node executes — a leg on different challenges cannot
+    // authenticate the child's walks, so execution implies agreement. That is
+    // implication, and every other emitted verifier in this crate is held to a
+    // value comparison against production's own replay. This is that comparison:
+    // the pair each leg reaches, against the pair `verify_against_chunked`'s own
+    // Phase A recovered host-side from the same proof.
+    let t = Instant::now();
+    let diagnostic = node_program(
+        &children,
+        &layouts,
+        &label_refs,
+        label_range,
+        NodePublishSet::Diagnostic,
+    );
+    let exec_diag = execute(&diagnostic, &arenas, &crate::hash_pin::BLOCK_HASHER)
+        .expect("the diagnostic node must execute");
+    let tail = node_layout.head + node_layout.schema_words();
+    assert_eq!(
+        exec_diag.public_words.len(),
+        tail + 2 * FAN_IN,
+        "the diagnostic node publishes the schema then one pair per child"
+    );
+    for (k, child) in children.iter().enumerate() {
+        let got = |i: usize| {
+            super::word::word_as_ext(&exec_diag.public_words[i].1).expect("an ext challenge")
+        };
+        assert_eq!(got(tail + 2 * k), child.z_alpha.0, "child {k}: the leg's z");
+        assert_eq!(
+            got(tail + 2 * k + 1),
+            child.z_alpha.1,
+            "child {k}: the leg's alpha"
+        );
+    }
+    println!(
+        "   ✓ differential: every leg reaches its child's OWN (z, alpha) \
+         ({:.1}s, {} instructions)",
+        t.elapsed().as_secs_f64(),
+        diagnostic.instrs.len()
+    );
+
+    // ---- the node a parent would verify.
+    let t = Instant::now();
+    let program = node_program(
+        &children,
+        &layouts,
+        &label_refs,
+        label_range,
+        NodePublishSet::Aggregation,
+    );
     println!(
         "   leaf node emitted in {:.1}s: {} instructions",
         t.elapsed().as_secs_f64(),
@@ -1034,7 +1085,6 @@ fn the_leaf_node_verifies_and_binds_two_wraps() {
     let t = Instant::now();
     let exec = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
         .expect("★ the leaf node must execute");
-    let node_layout = SchemaLayout::node(layouts[FAN_IN - 1].out_halves);
     node_layout.assert_covers(exec.public_words.len());
     println!(
         "   ★ LEAF NODE EXECUTED in {:.1}s: {} published words (schema {} + head {})",

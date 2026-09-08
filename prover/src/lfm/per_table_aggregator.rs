@@ -784,6 +784,34 @@ pub struct NodeInputs<'a> {
     pub labels: &'a [&'a [u64]],
     /// The first and last epoch label this node's subtree covers.
     pub label_range: (u64, u64),
+    /// Which words this node publishes.
+    pub publishes: NodePublishSet,
+}
+
+/// Which words a node publishes — the node-level counterpart of
+/// `epoch_tests::Publishes`, and it exists for a different reason.
+///
+/// A node under [`NodePublishSet::Aggregation`] publishes no challenges at all,
+/// which leaves its legs with no differential surface: the only evidence that a
+/// leg derived its CHILD's challenges is that the node executes, since a leg on
+/// different challenges cannot authenticate the child's walks. That is
+/// implication rather than a value comparison, and it is weaker than what every
+/// other emitted verifier in this crate is held to — the epoch wrap and the
+/// global leg both publish their pair and differential it against production's
+/// own replay.
+///
+/// [`NodePublishSet::Diagnostic`] restores that surface by publishing each
+/// child's `(z, α)` AFTER the schema, so the schema's own indices do not move
+/// and `SchemaLayout::node` reads both variants' heads identically. It is a gate
+/// shape, never a child: nothing verifies a diagnostic node.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NodePublishSet {
+    /// The node schema and nothing else — what a node that will be VERIFIED
+    /// publishes.
+    Aggregation,
+    /// The schema, then each child's `(z, α)` in child order — the differential
+    /// surface.
+    Diagnostic,
 }
 
 /// Declare every arena the node reads, in absorb order, then emit it.
@@ -793,6 +821,7 @@ pub fn emit_node(b: &mut LfmBuilder, inputs: &NodeInputs<'_>) {
         layouts,
         labels,
         label_range,
+        publishes,
     } = *inputs;
     assert!(!children.is_empty(), "a node verifies at least one child");
     assert_eq!(children.len(), layouts.len(), "one layout per child");
@@ -821,4 +850,11 @@ pub fn emit_node(b: &mut LfmBuilder, inputs: &NodeInputs<'_>) {
             label_range,
         },
     );
+    // The differential surface, AFTER the schema so no schema index moves.
+    if publishes == NodePublishSet::Diagnostic {
+        for leg in &legs {
+            b.public(leg.z_alpha.0.as_cell());
+            b.public(leg.z_alpha.1.as_cell());
+        }
+    }
 }
