@@ -23,10 +23,17 @@
 //!
 //! ## What this module cannot see
 //!
-//! The hash. Every permutation here is `TestPermutation` inside the LFM chips
-//! plus the production keccak family hosted for `keccak256`; the point of
-//! measuring cells at all is to have the first column of a matrix whose other
-//! columns (blake, Poseidon) do not exist yet. It also cannot see prove time or
+//! The hash — MOSTLY. This module was written when every permutation here was
+//! `TestPermutation` inside the LFM chips plus the production keccak family
+//! hosted for `keccak256`, and the point of measuring cells at all was to have
+//! the first column of a matrix whose other columns did not exist yet. Those
+//! columns exist now (BLAKE3, RPO, RPX, Poseidon), so
+//! ⚠ [`the_census_agrees_with_the_traces_the_prover_builds`] takes its tenant
+//! from `artifacts.hasher` rather than defaulting: it compares a census, a trace
+//! set and an AIR set, and the socket chip's WIDTH is tenant-dependent, so three
+//! defaults against one pinned artifact set is an out-of-bounds index rather
+//! than a disagreement. Everything else here is still tenant-agnostic. It also
+//! cannot see prove time or
 //! peak memory as a property of the machine — those are measured around the
 //! process, by the harness that runs it, and are reported as observations of one
 //! box rather than as machine invariants.
@@ -40,10 +47,9 @@ use super::compiler::LfmProgram;
 use super::edsl::WrapHash;
 use super::epoch_tests::EpochInputs;
 use super::executor::execute;
-use super::hash::TestPermutation;
 use super::instr::Instr;
 use super::proof::{LfmProveError, lfm_prove, lfm_prove_with_residency, verify_against};
-use super::registry::build_artifacts;
+use super::registry::{build_artifacts, build_artifacts_with_hasher};
 
 use crate::tables::types::FE;
 
@@ -731,7 +737,7 @@ fn the_wrap_reports_gpu_counters() {
     let program = super::epoch_tests::epoch_program(&e, true);
     let arenas = super::epoch_tests::epoch_arena_words(&e, true);
     let opts = wrap_options();
-    let artifacts = build_artifacts(&program, &opts);
+    let artifacts = build_artifacts_with_hasher(&program, &opts, crate::hash_pin::BLOCK_HASHER);
     println!("   chip log-heights: {:?}", artifacts.log_heights);
 
     g::reset_all_gpu_call_counters();
@@ -922,7 +928,7 @@ fn wrap_run_from(inner: ProofOptions, inputs: EpochInputs) {
     report_ratio(&e, main, aux);
 
     let opts = wrap_options();
-    let artifacts = build_artifacts(&program, &opts);
+    let artifacts = build_artifacts_with_hasher(&program, &opts, crate::hash_pin::BLOCK_HASHER);
     println!(
         "   wrap options: blowup {}, {} queries, grinding {}\n   chip log-heights: {:?}",
         opts.blowup_factor, opts.fri_number_of_queries, opts.grinding_factor, artifacts.log_heights
@@ -1101,7 +1107,7 @@ fn the_wrap_commitments_match_across_residency_modes() {
     let program = super::epoch_tests::epoch_program(&e, true);
     let arenas = super::epoch_tests::epoch_arena_words(&e, true);
     let opts = wrap_options();
-    let artifacts = build_artifacts(&program, &opts);
+    let artifacts = build_artifacts_with_hasher(&program, &opts, crate::hash_pin::BLOCK_HASHER);
 
     let prove_under = |residency: ResidencyMode| {
         let t = Instant::now();
@@ -1452,9 +1458,19 @@ fn the_census_agrees_with_the_traces_the_prover_builds() {
     let state: [u64; 25] =
         core::array::from_fn(|i| 0x9E37_79B9_7F4A_7C15u64.wrapping_mul(i as u64 + 1));
     let arenas = vec![super::keccak_adapter::state_to_words(&state).to_vec()];
-    let exec = execute(&program, &arenas, &TestPermutation).expect("the chain program runs");
-    let traces = super::trace::build_traces(&program, &exec.records);
-    let census = lfm_chip_census(&program);
+    // ⚠ ONE tenant for all four of execution, traces, census and AIRs, taken
+    // from the artifacts this test is about to compare against. The four used to
+    // default to `HasherKind::Test` while `build_artifacts` named the pin, and a
+    // trace built for one tenant against constraints built for another is an
+    // out-of-bounds index inside `HashConstraints::eval` — the socket chip's
+    // width is tenant-dependent (436 columns for RPO against 3,056 for BLAKE3).
+    // It surfaces as a bounds panic in a rayon worker, which reaches the test as
+    // "a scoped thread panicked" and names nothing at all.
+    let opts = wrap_options();
+    let artifacts = build_artifacts(&program, &opts);
+    let exec = execute(&program, &arenas, &artifacts.hasher).expect("the chain program runs");
+    let traces = super::trace::build_traces_with_hasher(&program, &exec.records, artifacts.hasher);
+    let census = super::airs::lfm_chip_census_with_hasher(&program, artifacts.hasher);
 
     // The frozen AIR order, as the census emits it and `air_trace_pairs` proves
     // it. Built from the trace set so a chip whose height the census got from the
@@ -1517,12 +1533,11 @@ fn the_census_agrees_with_the_traces_the_prover_builds() {
     }
 
     // ---- the AIR set: the names and the widths, in the frozen order.
-    let opts = wrap_options();
-    let artifacts = build_artifacts(&program, &opts);
-    let airs = super::airs::LfmAirs::new(
+    let airs = super::airs::LfmAirs::new_with_hasher(
         &artifacts.roots,
         &opts,
         artifacts.keccak_rnd_chunks,
+        artifacts.hasher,
         artifacts.chip_set,
     );
     let refs = airs.air_refs();
@@ -1781,7 +1796,7 @@ fn batched_wrap_run_from(inner: ProofOptions, inputs: EpochInputs) {
     );
 
     let opts = wrap_options();
-    let artifacts = build_artifacts(&program, &opts);
+    let artifacts = build_artifacts_with_hasher(&program, &opts, crate::hash_pin::BLOCK_HASHER);
     println!(
         "   wrap options: blowup {}, {} queries, grinding {}\n   chip log-heights: {:?}",
         opts.blowup_factor, opts.fri_number_of_queries, opts.grinding_factor, artifacts.log_heights
@@ -1944,7 +1959,7 @@ fn the_fixture_continuation_epoch_wraps_batched_from_proofs() {
     arenas.push(super::epoch_verify_tests::batched_opening_arena(&e));
     arenas.push(super::epoch_verify_tests::batched_fri_arena(&e));
     let opts = wrap_options();
-    let artifacts = build_artifacts(&program, &opts);
+    let artifacts = build_artifacts_with_hasher(&program, &opts, crate::hash_pin::BLOCK_HASHER);
 
     let proved =
         lfm_prove(&program, &artifacts, &arenas, &opts).expect("the carved wrap must prove");
@@ -1962,19 +1977,17 @@ fn the_fixture_continuation_epoch_wraps_batched_from_proofs() {
         "the carved wrap of the final epoch must verify"
     );
 
-    // The published-word schema's aggregator-facing check: the last 8 words
-    // are the carved L2G root, byte-equal to the bundle's claimed root.
+    // The published-word schema's aggregator-facing check: the last
+    // `lanes_per_root()` words are the carved L2G root — eight byte halves on a
+    // byte hash, four felts on an algebraic one — equal to the bundle's claimed
+    // root as the host publishes it.
     let root = bundle.epoch_view(n - 1).l2g_root();
-    let published_root: Vec<FE> = proved.public_words[proved.public_words.len() - 8..]
+    let lanes = super::proof_arena::lanes_per_root();
+    let published_root: Vec<FE> = proved.public_words[proved.public_words.len() - lanes..]
         .iter()
-        .map(|w| super::word::word_as_base(&w.1).expect("a root half is a base word"))
+        .map(|w| super::word::word_as_base(&w.1).expect("a root lane is a base word"))
         .collect();
-    let expected_root: Vec<FE> = root
-        .chunks(4)
-        .map(|c: &[u8]| {
-            FE::from(u32::from_le_bytes(c.try_into().expect("a root is 32 bytes")) as u64)
-        })
-        .collect();
+    let expected_root: Vec<FE> = super::proof_arena::commitment_lanes(&root);
     assert_eq!(
         published_root, expected_root,
         "the wrap must publish the carved L2G root it verified under"
@@ -2027,7 +2040,7 @@ fn the_from_proof_final_epoch_wraps() {
     let program = super::epoch_tests::epoch_program(&e, true);
     let arenas = super::epoch_tests::epoch_arena_words(&e, true);
     let opts = wrap_options();
-    let artifacts = build_artifacts(&program, &opts);
+    let artifacts = build_artifacts_with_hasher(&program, &opts, crate::hash_pin::BLOCK_HASHER);
 
     let t = Instant::now();
     let proved = lfm_prove(&program, &artifacts, &arenas, &opts).expect("the wrap must prove");
@@ -2181,7 +2194,8 @@ fn the_real_block_proves_and_wraps_end_to_end() {
         .unwrap_or_else(|err| panic!("epoch {i} must reconstruct from the bundle: {err}"));
         let program = super::epoch_tests::epoch_program(&e, true);
         let arenas = super::epoch_tests::epoch_arena_words(&e, true);
-        let artifacts = build_artifacts(&program, &wrap_opts);
+        let artifacts =
+            build_artifacts_with_hasher(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
         let c = t.elapsed().as_secs_f64();
         construct_secs += c;
 
@@ -2383,7 +2397,8 @@ fn the_real_block_proves_and_wraps_end_to_end_batched() {
         let mut arenas = super::epoch_tests::batched_epoch_arenas(&e);
         arenas.push(super::epoch_verify_tests::batched_opening_arena(&e));
         arenas.push(super::epoch_verify_tests::batched_fri_arena(&e));
-        let artifacts = build_artifacts(&program, &wrap_opts);
+        let artifacts =
+            build_artifacts_with_hasher(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
         let c = t.elapsed().as_secs_f64();
         construct_secs += c;
 

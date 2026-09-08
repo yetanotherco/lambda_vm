@@ -285,7 +285,7 @@ use super::layout::keccak as klayout;
 use super::programs::{keccak_chain_program, keccak_chain_program_source};
 use super::proof::prove_traces;
 use super::registry::LfmArtifacts;
-use super::trace::{LfmTraces, build_traces};
+use super::trace::{LfmTraces, build_traces_with_hasher};
 use super::validator::LfmViolation;
 use crate::lfm::chips::keccak as kchip;
 use crate::tables::types::VmTable;
@@ -321,7 +321,7 @@ fn prove_keccak_chain_with_tamper(
     let exec =
         super::executor::execute(program, &keccak_arenas(seed), &super::hash::TestPermutation)
             .expect("honest execution");
-    let mut traces = build_traces(program, &exec.records);
+    let mut traces = build_traces_with_hasher(program, &exec.records, artifacts.hasher);
     mutate(&mut traces);
     let proof = prove_traces(artifacts, &mut traces, &exec.public_words, &opts)?;
     Ok((proof, exec.public_words))
@@ -606,10 +606,33 @@ fn sponge_arenas(msg: &[u8]) -> Vec<Vec<LfmWord>> {
     vec![halves.into_iter().map(super::word::base_word).collect()]
 }
 
-/// The 32-byte digest from the two public words: byte `j` is byte `j % 4` of
-/// half `j / 4`, and half `h` is lane `h % 4` of word `h / 4`.
+/// The 32 bytes a published digest stands for, at whatever width it was
+/// published.
+///
+/// A BYTE digest is two words read as eight little-endian `u32` halves: byte
+/// `j` is byte `j % 4` of half `j / 4`, and half `h` is lane `h % 4` of word
+/// `h / 4`. An ALGEBRAIC digest is ONE word of four canonical felts, and its 32
+/// bytes are the backend's own serialisation of them.
+///
+/// ⛔ **The discriminator is the slice's own length, NOT
+/// `WrapHash::production()`, and that distinction is the whole point.** This
+/// helper's callers mix two kinds of program: ones that pin a byte hash on their
+/// own builder (`keccak_sponge_program`, `blake3_sponge_program` — always two
+/// words, on every branch, because their identity is registry-pinned) and ones
+/// that follow the configuration (`merkle_opening_program` — one word on an
+/// algebraic arm). Branching on the global configuration would render the first
+/// group wrong on an algebraic branch, which is the same scope error as reading
+/// a root's width from the configuration instead of from the root.
 fn digest_bytes(public: &[(u32, LfmWord)]) -> [u8; 32] {
     use math::field::traits::IsPrimeField;
+    if public.len() == 1 {
+        return super::algebraic_commit::digest_to_commitment(&public[0].1);
+    }
+    assert_eq!(
+        public.len(),
+        2,
+        "a digest is one algebraic word or two byte words"
+    );
     let mut out = [0u8; 32];
     for h in 0..8 {
         let lane = public[h / 4].1[h % 4];
@@ -766,7 +789,7 @@ fn tampered_absorb_xor_rejects() {
         &super::hash::TestPermutation,
     )
     .expect("honest execution");
-    let mut traces = build_traces(&program, &exec.records);
+    let mut traces = build_traces_with_hasher(&program, &exec.records, artifacts.hasher);
     // Rate byte 5 of the first absorb row: XOR(state, block) no longer holds.
     let col = kchip::cols::PERM_IN + 5;
     let old = traces.keccak.main_table.get_row(0)[col];
@@ -873,7 +896,7 @@ fn permute_row_cannot_substitute_the_permuted_state() {
     exec.records.public[1] = words[0];
     exec.records.public[2] = words[1];
 
-    let mut traces = build_traces(&program, &exec.records);
+    let mut traces = build_traces_with_hasher(&program, &exec.records, artifacts.hasher);
     let proof = prove_traces(&artifacts, &mut traces, &exec.public_words, &opts)
         .expect("the prover has no constraint checks, so it accepts");
     assert!(
@@ -1272,7 +1295,7 @@ fn canonicity_guard_rejects_an_out_of_range_candidate_in_the_proof() {
     exec.records.public[0] = super::word::base_word(FE::zero());
     exec.public_words[0].1 = super::word::base_word(FE::zero());
 
-    let mut traces = build_traces(&program, &exec.records);
+    let mut traces = build_traces_with_hasher(&program, &exec.records, artifacts.hasher);
     let proof = prove_traces(&artifacts, &mut traces, &exec.public_words, &opts)
         .expect("the prover has no constraint checks, so it accepts");
     assert!(
@@ -2689,7 +2712,7 @@ fn chunking_splits_the_sponge_into_two_uneven_chunks() {
         &super::hash::TestPermutation,
     )
     .expect("honest execution");
-    let traces = build_traces(&program, &exec.records);
+    let traces = build_traces_with_hasher(&program, &exec.records, artifacts.hasher);
     assert_eq!(traces.keccak_rnd.len(), 2, "one KECCAK_RND trace per chunk");
     assert_eq!(
         traces
@@ -2802,7 +2825,7 @@ fn tampered_second_chunk_permutation_rejects() {
     )
     .expect("honest execution");
 
-    let mut traces = build_traces(&program, &exec.records);
+    let mut traces = build_traces_with_hasher(&program, &exec.records, artifacts.hasher);
     assert_eq!(traces.keccak_rnd.len(), 2);
     // Byte 0 of lane (0,0) on the second chunk's first row: the `Keccak`
     // receive token no longer matches the send that fed it.
@@ -2846,7 +2869,7 @@ fn dropping_the_second_chunks_permutation_rejects() {
     )
     .expect("honest execution");
 
-    let mut traces = build_traces(&program, &exec.records);
+    let mut traces = build_traces_with_hasher(&program, &exec.records, artifacts.hasher);
     // Same chunk COUNT — so the AIR set and the digest still match — but the
     // last chunk is now empty.
     traces.keccak_rnd[1] = keccak_rnd::generate_keccak_rnd_trace(&[]);
@@ -2890,7 +2913,7 @@ fn permutations_may_be_reassigned_across_chunk_boundaries() {
     let round_ops = round_ops_of(&program, &sponge_arenas(&msg));
     assert_eq!(round_ops.len(), 3);
 
-    let mut traces = build_traces(&program, &exec.records);
+    let mut traces = build_traces_with_hasher(&program, &exec.records, artifacts.hasher);
     // Canonical split is 2 + 1; re-split as 1 + 2.
     traces.keccak_rnd[0] = keccak_rnd::generate_keccak_rnd_trace(&round_ops[..1]);
     traces.keccak_rnd[1] = keccak_rnd::generate_keccak_rnd_trace(&round_ops[1..]);
@@ -3262,7 +3285,13 @@ fn the_merkle_walk_authenticates_a_real_opening() {
     // root the host actually built. The keccak instrument cannot, and the name
     // moved with the hash rather than outliving it.
     let program = merkle_opening_program(R1F_SHAPE);
-    let artifacts = build_artifacts(&program, &opts);
+    // Built at `WrapHash::production()`, so it emits `Instr::Hash` and must be
+    // proved under the pin's tenant — the classification rule in HASH-PINNING.md.
+    let artifacts = super::registry::build_artifacts_with_hasher(
+        &program,
+        &opts,
+        crate::hash_pin::BLOCK_HASHER,
+    );
     let proved = lfm_prove(&program, &artifacts, &merkle_arenas(opening, *index), &opts)
         .expect("the honest opening must execute and prove");
 
@@ -3313,7 +3342,13 @@ fn tampered_merkle_opening_rejects() {
     // Same production twin as the honest-path test above — a tamper control is
     // only a control over the walk the honest path uses.
     let program = merkle_opening_program(R1F_SHAPE);
-    let artifacts = build_artifacts(&program, &opts);
+    // Built at `WrapHash::production()`, so it emits `Instr::Hash` and must be
+    // proved under the pin's tenant — the classification rule in HASH-PINNING.md.
+    let artifacts = super::registry::build_artifacts_with_hasher(
+        &program,
+        &opts,
+        crate::hash_pin::BLOCK_HASHER,
+    );
     let honest = lfm_prove(&program, &artifacts, &merkle_arenas(opening, *index), &opts)
         .expect("honest prove");
 
@@ -3381,7 +3416,7 @@ fn tampered_merkle_opening_rejects() {
         );
 
         // Incoherent: still claiming the real root.
-        let err = super::executor::execute(&program, &arenas, &super::hash::TestPermutation)
+        let err = super::executor::execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
             .err()
             .unwrap_or_else(|| panic!("{what}: claiming the real root must not execute"));
         println!("R1f tamper {what}: incoherent run rejected with {err:?}");
@@ -3699,16 +3734,12 @@ use super::programs::l2g_binding_program;
 /// loud — the same discipline `R1F_SHAPE` uses.
 const R1G_EPOCHS: usize = 2;
 
-/// The `i`-th 32-byte root in a program's published words.
+/// The `i`-th 32-byte root in a program's published words, at the root's own
+/// width — the L2G binding follows the configuration, so a root is
+/// `words_per_root()` words: two byte words or one algebraic word.
 fn published_root(public: &[(u32, LfmWord)], i: usize) -> [u8; 32] {
-    use math::field::traits::IsPrimeField;
-    let mut out = [0u8; 32];
-    for h in 0..8 {
-        let lane = public[2 * i + h / 4].1[h % 4];
-        let half = crate::tables::types::GoldilocksField::canonical(lane.value()) as u32;
-        out[4 * h..4 * h + 4].copy_from_slice(&half.to_le_bytes());
-    }
-    out
+    let w = super::proof_arena::words_per_root();
+    digest_bytes(&public[w * i..w * (i + 1)])
 }
 
 fn l2g_arenas(
@@ -3777,7 +3808,12 @@ fn l2g_binding_proves_and_verifies() {
     let opts = options();
     let (epoch, global) = r1g_l2g_roots();
     let program = l2g_binding_program(R1G_EPOCHS);
-    let artifacts = build_artifacts(&program, &opts);
+    // A production() program: proved under the pin's tenant, as above.
+    let artifacts = super::registry::build_artifacts_with_hasher(
+        &program,
+        &opts,
+        crate::hash_pin::BLOCK_HASHER,
+    );
     let proved = lfm_prove(&program, &artifacts, &l2g_arenas(epoch, global), &opts)
         .expect("the honest binding must execute and prove");
 
@@ -3814,7 +3850,12 @@ fn tampered_l2g_binding_rejects() {
     let opts = options();
     let (epoch, global) = r1g_l2g_roots();
     let program = l2g_binding_program(R1G_EPOCHS);
-    let artifacts = build_artifacts(&program, &opts);
+    // A production() program: proved under the pin's tenant, as above.
+    let artifacts = super::registry::build_artifacts_with_hasher(
+        &program,
+        &opts,
+        crate::hash_pin::BLOCK_HASHER,
+    );
     let honest =
         lfm_prove(&program, &artifacts, &l2g_arenas(epoch, global), &opts).expect("honest prove");
 
@@ -3842,7 +3883,7 @@ fn tampered_l2g_binding_rejects() {
             l2g_arenas(&swapped_one_side, global),
         ),
     ] {
-        let err = super::executor::execute(&program, &arenas, &super::hash::TestPermutation)
+        let err = super::executor::execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
             .err()
             .unwrap_or_else(|| panic!("{what}: must not execute"));
         println!("R1g tamper {what}: rejected with {err:?}");

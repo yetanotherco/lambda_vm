@@ -3207,17 +3207,19 @@ fn the_assembled_batched_epoch_verifier_runs() {
 /// emitter, so the comparison against the compiled program is absolute.
 fn expected_batched_arena_words(e: &RealBatchedEpoch, with_legs: bool) -> usize {
     let num_reg = crate::tables::register::NUM_REGISTER_ADDRESSES;
+    // A root's width in arena words (see `expected_arena_words`).
+    let dw = super::proof_arena::words_per_root();
     let mut total = 8 + e.statement.public_output_len.div_ceil(4) + 2;
-    total += 2 * e
-        .prep_sources
-        .iter()
-        .filter(|p| p.is_some_and(PrepSource::is_arena))
-        .count();
-    total += 2 * usize::from(e.shape.carved_main.is_some()); // the carved root
-    total += 2; // main_root — ONE, which is the whole batched economy
+    total += dw
+        * e.prep_sources
+            .iter()
+            .filter(|p| p.is_some_and(PrepSource::is_arena))
+            .count();
+    total += dw * usize::from(e.shape.carved_main.is_some()); // the carved root
+    total += dw; // main_root — ONE, which is the whole batched economy
     total += 2 * num_reg;
     total += 2; // pc_start
-    total += 2 * usize::from(e.proof.aux_root.is_some());
+    total += dw * usize::from(e.proof.aux_root.is_some());
     total += e
         .proof
         .tables
@@ -3229,13 +3231,13 @@ fn expected_batched_arena_words(e: &RealBatchedEpoch, with_legs: bool) -> usize 
         total += t.trace_ood_next_evaluations.width * t.trace_ood_next_evaluations.height;
         total += t.composition_poly_parts_ood_evaluation.len();
     }
-    total += 2; // parts_root
+    total += dw; // parts_root
     for t in &e.proof.tables {
         if let Some(coeffs) = t.standalone_final_poly_coeffs.as_ref() {
             total += coeffs.len();
         }
     }
-    total += 2 * e.proof.fri_layer_roots.len();
+    total += dw * e.proof.fri_layer_roots.len();
     total += e.proof.fri_final_poly_coeffs.len();
     total += usize::from(e.fri_params.grinding_factor > 0);
     if with_legs {
@@ -3690,7 +3692,10 @@ fn epoch_program_with(e: &RealEpoch, with_legs: bool, split_decode: bool) -> Lfm
         })
         .collect();
     // Last in declaration order, so turning the control on shifts no other arena.
-    let a_split_decode = split_decode.then(|| b.declare_arena(2));
+    // One root, at THIS builder's digest width — the width `RootCells::hint`
+    // reads it back at.
+    let root_words = RootCells::words_per_root(&b);
+    let a_split_decode = split_decode.then(|| b.declare_arena(root_words));
 
     // ---- the statement ----
     let stmt: Vec<_> = (0..stmt_halves as u32)
@@ -4344,33 +4349,38 @@ fn the_spine_hints_each_proof_value_once() {
 /// comparison against the compiled program is absolute.
 fn expected_arena_words(e: &RealEpoch, with_legs: bool) -> usize {
     let num_reg = crate::tables::register::NUM_REGISTER_ADDRESSES;
+    // A root's width in arena words — the host's counterpart of the emitter's
+    // `digest_words`: two on a byte hash, one on an algebraic one. The register
+    // vectors, `pc_start` and the page bases are NOT roots and keep their own
+    // widths below.
+    let dw = super::proof_arena::words_per_root();
     let mut total = 8 + e.statement.public_output_len.div_ceil(4) + 2;
-    // ★ Two words per ELF-DEPENDENT preprocessed root and NOT ONE MORE. The
-    // options-only roots are program text and the REGISTER root is derived, so a
-    // program that hinted any of them — or that kept a second copy of DECODE for
-    // the attestation fold — declares more words than this.
-    total += 2 * e
-        .phase_a
-        .iter()
-        .filter(|(p, _)| p.is_some_and(PrepSource::is_arena))
-        .count();
-    total += 2 * e.tables.len();
+    // ★ One root's width per ELF-DEPENDENT preprocessed root and NOT ONE MORE.
+    // The options-only roots are program text and the REGISTER root is derived,
+    // so a program that hinted any of them — or that kept a second copy of
+    // DECODE for the attestation fold — declares more words than this.
+    total += dw
+        * e.phase_a
+            .iter()
+            .filter(|(p, _)| p.is_some_and(PrepSource::is_arena))
+            .count();
+    total += dw * e.tables.len();
     total += 2 * num_reg;
     total += 2;
     total += 10 * e.page_commitments.len();
     for (h, leg) in e.tables.iter().zip(&e.legs) {
         let s = &h.shape;
-        total += 2 * usize::from(s.has_aux_root);
+        total += dw * usize::from(s.has_aux_root);
         total += usize::from(s.has_contribution);
-        total += 2;
+        total += dw;
         total += s.ood_current_dims.0 * s.ood_current_dims.1;
         total += s.ood_next_dims.0 * s.ood_next_dims.1;
         total += s.num_parts;
-        total += 2 * s.fri.num_committed();
+        total += dw * s.fri.num_committed();
         total += s.fri.num_terminal_coeffs();
         total += usize::from(s.grinding_factor > 0);
         if with_legs {
-            total += leg.verify.opening_words() + leg.verify.fri_words();
+            total += leg.verify.opening_words(dw) + leg.verify.fri_words(dw);
         }
     }
     total
@@ -4411,9 +4421,9 @@ fn the_assembled_verifier_declares_exactly_the_shape_words() {
     let split_declared: usize = split.arena_schema.lens.iter().map(|l| *l as usize).sum();
     assert_eq!(
         split_declared,
-        expected_arena_words(&e, false) + 2,
-        "the split-cell control must declare exactly two surplus words, or it is \
-         not the forgery this guard claims to deny"
+        expected_arena_words(&e, false) + super::proof_arena::words_per_root(),
+        "the split-cell control must declare exactly one root's width of surplus \
+         words, or it is not the forgery this guard claims to deny"
     );
 }
 

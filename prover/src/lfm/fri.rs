@@ -158,10 +158,14 @@ impl FriShape {
     }
 
     /// Arena words one query's FRI opening occupies: per committed layer the
-    /// symmetric evaluation (one word) and its path (two words per level).
-    pub fn query_words(self) -> usize {
+    /// symmetric evaluation (one word) and its path (`digest_words` per level).
+    ///
+    /// `digest_words` is the BUILDER's digest width on the machine side
+    /// (`edsl::digest_words(b)`) and `proof_arena::words_per_root()` on the
+    /// host side — see `SubProofShape::query_words` for why it is an argument.
+    pub fn query_words(self, digest_words: usize) -> usize {
         // The path stride is the DIGEST's width, not a literal two.
-        self.num_committed() + super::proof_arena::words_per_root() * self.path_steps_per_query()
+        self.num_committed() + digest_words * self.path_steps_per_query()
     }
 
     /// Keccak permutations the whole sub-proof's FRI costs.
@@ -372,7 +376,8 @@ pub fn declare_fri(
     let roots = b.declare_arena(edsl::digest_words(b) * c as u32);
     let zetas = b.declare_arena(num_zetas as u32);
     let coeffs = b.declare_arena(shape.num_terminal_coeffs() as u32);
-    let queries = b.declare_arena((num_queries * shape.query_words()) as u32);
+    let queries =
+        b.declare_arena((num_queries * shape.query_words(edsl::digest_words(b) as usize)) as u32);
 
     let layers = (0..c)
         .map(|i| LayerCommitment::hint(b, roots, edsl::digest_words(b) * i as u32))
@@ -421,7 +426,8 @@ pub fn hint_layer_openings_from(
     arena: ArenaId,
     query: usize,
 ) -> Vec<LayerOpening> {
-    let mut cursor = (query * shape.query_words()) as u32;
+    let stride = shape.query_words(edsl::digest_words(b) as usize);
+    let mut cursor = (query * stride) as u32;
     let openings: Vec<LayerOpening> = (0..shape.num_committed())
         .map(|layer| {
             let sym = b.hint_word(arena, cursor).as_ext();
@@ -439,7 +445,7 @@ pub fn hint_layer_openings_from(
         .collect();
     assert_eq!(
         cursor as usize,
-        (query + 1) * shape.query_words(),
+        (query + 1) * stride,
         "the emitter's cursor must agree with the declared query stride"
     );
     openings

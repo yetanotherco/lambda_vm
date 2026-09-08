@@ -28,11 +28,24 @@ use super::word::{LfmWord, base_word};
 
 type FE = FieldElement<GoldilocksField>;
 
+/// The BATCHED Merkle backend the block path commits under, over any field.
+///
+/// ⛔ Use this rather than `stark::config::BatchedMerkleTreeBackend`, which is
+/// `BatchBlake3Backend` by definition — a workspace-default ALIAS, and therefore
+/// the same silent spelling of the default that `Prover` and `Verifier` are. A
+/// test comparing a machine leaf against that alias compares against BLAKE3
+/// whatever the branch pins.
+pub type BlockBatched<F> =
+    <crate::hash_pin::BlockStarkHash as stark::config::StarkHash>::Batched<F>;
+
+/// The PAIR backend FRI layers commit under. See [`BlockBatched`]; the alias it
+/// replaces is `stark::config::FriLayerMerkleTreeBackend` = `PairBlake3Backend`.
+pub type BlockPair<F> = <crate::hash_pin::BlockStarkHash as stark::config::StarkHash>::Pair<F>;
+
 /// The Merkle backend the main trace is committed under — the BLOCK PATH's pin,
 /// not a locally chosen equivalent and no longer `stark`'s default alias, so a
 /// branch that pins a different hash reaches this module too.
-type MainBackend =
-    <crate::hash_pin::BlockStarkHash as stark::config::StarkHash>::Batched<GoldilocksField>;
+type MainBackend = BlockBatched<GoldilocksField>;
 
 /// Halves in one 32-byte commitment.
 pub const ROOT_HALVES: usize = 8;
@@ -357,6 +370,36 @@ pub fn global_l2g_roots(archive: &FixtureArchive, count: usize) -> Vec<Commitmen
 /// Commitments as arena words, two per root, in order.
 pub fn commitments_to_arena(roots: &[Commitment]) -> Vec<LfmWord> {
     roots.iter().flat_map(commitment_words).collect()
+}
+
+/// [`commitments_to_arena`] at the width of an EXPLICIT wrap hash rather than
+/// the configuration's — the host half of the rule that the arena stride is the
+/// BUILDER's digest width.
+///
+/// A program that pins a byte hash on its own builder reads two words per root
+/// whatever the pin says (`edsl::digest_words` of that builder), so the host
+/// feeding it must serialise at that width too; under an algebraic pin the
+/// configuration-following [`commitments_to_arena`] would hand it one word per
+/// root and the executor's arena-length check refuses the program outright.
+pub fn commitments_to_arena_for(roots: &[Commitment], hash: super::edsl::WrapHash) -> Vec<LfmWord> {
+    roots
+        .iter()
+        .flat_map(|c| commitment_words_for(c, hash))
+        .collect()
+}
+
+/// [`commitment_words`] at the width of an explicit wrap hash. See
+/// [`commitments_to_arena_for`].
+pub fn commitment_words_for(c: &Commitment, hash: super::edsl::WrapHash) -> Vec<LfmWord> {
+    if hash == super::edsl::WrapHash::Algebraic {
+        return vec![super::algebraic_commit::commitment_to_digest(c)];
+    }
+    let halves = pack_stream(c);
+    debug_assert_eq!(halves.len(), ROOT_HALVES);
+    vec![
+        [halves[0], halves[1], halves[2], halves[3]],
+        [halves[4], halves[5], halves[6], halves[7]],
+    ]
 }
 
 // ==================== the attestation's program id ====================

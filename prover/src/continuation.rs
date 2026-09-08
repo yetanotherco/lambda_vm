@@ -2489,7 +2489,15 @@ mod tests {
             let _ = done_tx.send(r.map(|_| ()));
         });
         let result = done_rx
-            .recv_timeout(std::time::Duration::from_secs(300))
+            // 1800 s of headroom rather than 300. This is a liveness guard — the
+            // regression it catches wedges the pipeline FOREVER, so any finite
+            // bound still catches it — and the bound has to clear an honest run
+            // under load: an algebraic hash pin doubles this test's own proving
+            // work (alone, three runs each: 7.3-7.6 s at the BLAKE3 default,
+            // 15.7-15.9 s under RPX), and inside the full `--lib` suite's
+            // parallel load the old 300 s fired while the test was still making
+            // progress.
+            .recv_timeout(std::time::Duration::from_secs(1800))
             .expect("prove_continuation wedged: the pipeline did not shut down on error");
         let err = result.expect_err("the injected fault must surface as Err");
         assert!(

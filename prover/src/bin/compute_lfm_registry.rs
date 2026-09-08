@@ -4,9 +4,16 @@
 //! output over the generated block in `prover/src/lfm/registry.rs`. Drift
 //! tests recompute and compare on every PR; a drift failure is investigated,
 //! never re-blessed (the `compute_static_commitments` policy).
+//!
+//! ⚠ ORDER: on a hash-pin change run this AFTER `compute_static_commitments`
+//! has been run and its output pasted. Slots 13 and 14 of every entry are
+//! `keccak_rc` and `bitwise`'s `preprocessed_commitment`, which return the
+//! BLESSED static constants in the tree rather than recomputing, and
+//! `program_id` folds every root — so a table generated before the statics
+//! embeds the outgoing hash's constants, and `machine_tests::registry_drift_*`
+//! fires at exactly those two slots.
 
 use lambda_vm_prover::GoldilocksCubicProofOptions;
-use lambda_vm_prover::lfm::hash::HasherKind;
 use lambda_vm_prover::lfm::programs::{
     KECCAK_SPONGE_LEN, fri_toy_program, keccak_chain_program, keccak_sponge_program,
     statement_replay_program, transcript_replay_program, trivial_program,
@@ -18,12 +25,10 @@ use lambda_vm_prover::lfm::validate;
 /// other presets come online).
 const REGISTRY_BLOWUP_FACTORS: &[u8] = &[2];
 
-/// The `LFM_HASH` permutation the v0 registry is generated under.
-///
-/// Bound into every digest below, so changing it here is a re-blessing of the
-/// whole table, not a re-run. A second hasher becomes additional rows, never a
-/// silent replacement of these.
-const REGISTRY_HASHER: HasherKind = HasherKind::Test;
+// The permutation this table is blessed under is `registry::REGISTRY_HASHER` —
+// a property of the TABLE rather than of this generator, and the same constant
+// `build_artifacts` defaults to, so the two cannot drift apart.
+use lambda_vm_prover::lfm::registry::REGISTRY_HASHER;
 
 fn fmt_bytes(bytes: &[u8; 32]) -> String {
     let inner = bytes

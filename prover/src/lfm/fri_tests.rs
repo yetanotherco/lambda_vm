@@ -48,7 +48,6 @@ use super::executor::execute;
 use super::fri::{
     FRI_LEAF_GROUP, FriQuery, FriShape, declare_fri, emit_query_fri, hint_layer_openings,
 };
-use super::hash::TestPermutation;
 use super::join_tests::{HostSubProof, build_host_sub_proof};
 use super::validator::validate;
 use super::word::{LfmWord, base_word, ext_word, word_as_ext};
@@ -255,8 +254,8 @@ impl HostFri {
 /// 48, and all of them move at least one.
 #[test]
 fn the_fri_leaf_is_byte_identical_to_productions_own_backends() {
+    use super::proof_arena::{BlockBatched, BlockPair};
     use crypto::merkle_tree::traits::IsMerkleTreeBackend;
-    use stark::config::{BatchedMerkleTreeBackend, FriLayerMerkleTreeBackend};
 
     // Six distinct components, each with six distinct nonzero bytes in
     // descending positions, so no two of the 48 bytes agree and no component is
@@ -291,20 +290,24 @@ fn the_fri_leaf_is_byte_identical_to_productions_own_backends() {
     let v0 = b.hint_word(arena, 0);
     let v1 = b.hint_word(arena, 1);
     let leaf = super::sub_proof::emit_leaf_hash(&mut b, FRI_LEAF_GROUP, &[v0, v1]);
-    b.public(leaf[0]);
-    b.public(leaf[1]);
+    // ⚠ The digest's OWN width. Two publishes assumed a byte digest; an
+    // algebraic one is a single cell whose second slot repeats the first, so
+    // the comparison below would have read one lane twice.
+    for cell in leaf.cells() {
+        b.public(*cell);
+    }
     let program = compile(b.finish());
     validate(&program).expect("the leaf program is admissible");
 
     let mut digests = Vec::new();
     for (i, (a, c)) in vectors.iter().enumerate() {
         let arenas = vec![vec![ext_word(a), ext_word(c)]];
-        let exec = execute(&program, &arenas, &TestPermutation).expect("the leaf hash executes");
-        let got = [exec.public_words[0].1, exec.public_words[1].1];
+        let exec = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+            .expect("the leaf hash executes");
+        let got: Vec<LfmWord> = exec.public_words.iter().map(|(_, w)| *w).collect();
 
-        let batched =
-            <BatchedMerkleTreeBackend<Ext3> as IsMerkleTreeBackend>::hash_data(&vec![*a, *c]);
-        let paired = <FriLayerMerkleTreeBackend<Ext3> as IsMerkleTreeBackend>::hash_data(&[*a, *c]);
+        let batched = <BlockBatched<Ext3> as IsMerkleTreeBackend>::hash_data(&vec![*a, *c]);
+        let paired = <BlockPair<Ext3> as IsMerkleTreeBackend>::hash_data(&[*a, *c]);
         assert_eq!(
             batched, paired,
             "vector {i}: the spec's claim is that the prover's pair backend and \
@@ -622,7 +625,12 @@ fn the_fri_emitter_verifies_every_query_of_a_real_folding_proof() {
         let h = host_fri(rows, 2);
         let all: Vec<usize> = (0..h.trace.iotas.len()).collect();
         let program = fri_only_program(h.shape, all.len());
-        let exec = execute(&program, &h.all_arenas(&all), &TestPermutation).expect(
+        let exec = execute(
+            &program,
+            &h.all_arenas(&all),
+            &crate::hash_pin::BLOCK_HASHER,
+        )
+        .expect(
             "an honest FRI decommitment must authenticate every layer and reach \
              the terminal polynomial",
         );
@@ -707,7 +715,7 @@ fn the_two_legs_verify_one_real_folding_proof_as_one_program() {
 
     let mut arenas = h.trace.arenas(&queries);
     arenas.extend(h.fri_arenas(&queries));
-    let exec = execute(&program, &arenas, &TestPermutation)
+    let exec = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
         .expect("the honest proof must authenticate, fold and reach the terminal");
 
     let codeword = h.terminal_codeword();
@@ -899,16 +907,18 @@ fn the_emitted_permutation_count_meets_the_pinned_prediction() {
 ///
 /// ```text
 ///   selects/query = index_bits                     (pow_bits, once per query)
-///                 + 2 · merkle_depth · num_groups  (trace walks)
+///                 + w · merkle_depth · num_groups  (trace walks)
 ///                 + num_committed                  (FRI leaf ordering)
-///                 + 2 · path_steps_per_query       (FRI walks)
+///                 + w · path_steps_per_query       (FRI walks)
 /// ```
 ///
-/// `pow_bits` emits one `Select` per bit (`edsl.rs:257-262`) and each walk level
-/// two, since a digest is two words and both must swap on the same bit
-/// (`edsl.rs:164-169`). A second derivation makes the measured count exceed the
-/// closed form by exactly `index_bits`, and nothing cancels it. Re-falsified in
-/// that form: the injected defect now fails with "a surplus of 11 index bits".
+/// where `w` is the digest's width in arena words — two on a byte hash, one on
+/// an algebraic one. `pow_bits` emits one `Select` per bit (`edsl.rs:257-262`)
+/// and each walk level one per digest word, since every word of a digest must
+/// swap on the same bit (`edsl.rs:164-169`). A second derivation makes the
+/// measured count exceed the closed form by exactly `index_bits`, and nothing
+/// cancels it. Re-falsified in that form: the injected defect now fails with "a
+/// surplus of 11 index bits".
 #[test]
 fn the_fri_join_adds_no_second_point_derivation() {
     let h = host_fri(2048, 2);
@@ -939,10 +949,13 @@ fn the_fri_join_adds_no_second_point_derivation() {
     let per_query_selects = selects(&two) - selects(&one);
     let per_query_decs = decs(&two) - decs(&one);
 
+    // The digest's width, as the HOST reads it: `emit` builds at
+    // `WrapHash::production()`, whose builder width this is the counterpart of.
+    let dw = super::proof_arena::words_per_root();
     let expected_selects = h.shape.index_bits()
-        + 2 * sub.merkle_depth * groups.len()
+        + dw * sub.merkle_depth * groups.len()
         + h.shape.num_committed()
-        + 2 * h.shape.path_steps_per_query();
+        + dw * h.shape.path_steps_per_query();
     assert_eq!(
         per_query_selects,
         expected_selects,
@@ -951,11 +964,11 @@ fn the_fri_join_adds_no_second_point_derivation() {
          steps. A surplus of {} index bits is a second point derivation or a \
          second index decomposition",
         h.shape.index_bits(),
-        2 * sub.merkle_depth * groups.len(),
+        dw * sub.merkle_depth * groups.len(),
         groups.len(),
         sub.merkle_depth,
         h.shape.num_committed(),
-        2 * h.shape.path_steps_per_query(),
+        dw * h.shape.path_steps_per_query(),
         h.shape.path_steps_per_query(),
         h.shape.index_bits(),
     );
@@ -1031,16 +1044,19 @@ fn no_tampered_fri_value_can_pass() {
     };
     let program = fri_only_program(shape, queries.len());
     let honest = h.all_arenas(&queries);
-    execute(&program, &honest, &TestPermutation).expect("the honest run must execute");
+    execute(&program, &honest, &crate::hash_pin::BLOCK_HASHER)
+        .expect("the honest run must execute");
 
-    let stride = h.shape.query_words();
+    // Host-side offsets at the host's digest width; the program was built at
+    // `WrapHash::production()`, which this is the counterpart of.
+    let dw = super::proof_arena::words_per_root();
+    let stride = h.shape.query_words(dw);
     // (label, arena, word) — arena order is the driver's: deep, roots, zetas,
     // coeffs, queries.
-    let bump: Vec<(&str, usize, usize)> = vec![
+    let mut bump: Vec<(&str, usize, usize)> = vec![
         ("query index", 0, 0),
         ("layer 0 root", 1, 0),
-        ("layer 0 root, second word", 1, 1),
-        ("layer 2 root", 1, 2 * (c - 1)),
+        ("layer 2 root", 1, dw * (c - 1)),
         ("zeta_0 (the DEEP fold's challenge)", 2, 0),
         ("zeta_C (the uncommitted final fold)", 2, c),
         ("terminal coefficient 0", 3, 0),
@@ -1050,16 +1066,20 @@ fn no_tampered_fri_value_can_pass() {
         (
             "layer 0 sibling, top level",
             4,
-            2 * h.shape.layer_path_len(0) - 1,
+            dw * h.shape.layer_path_len(0) - 1,
         ),
         ("second query's layer 0 evaluation", 4, stride),
     ];
+    if dw == 2 {
+        // Only a byte digest has a second word to move; an algebraic root is one.
+        bump.push(("layer 0 root, second word", 1, 1));
+    }
     for (label, arena, word) in bump {
         let mut tampered = honest.clone();
         tampered[arena][word][0] += FE::one();
-        let err = execute(&program, &tampered, &TestPermutation).expect_err(&format!(
-            "moving the {label} must make the program unexecutable"
-        ));
+        let err = execute(&program, &tampered, &crate::hash_pin::BLOCK_HASHER).expect_err(
+            &format!("moving the {label} must make the program unexecutable"),
+        );
         println!("  {label:<40} rejected: {err:?}");
     }
 
@@ -1067,7 +1087,7 @@ fn no_tampered_fri_value_can_pass() {
     // decommitment. Every word is a real prover value.
     let mut spliced = honest.clone();
     let (from, to) = (stride, 0usize);
-    let len = 1 + 2 * h.shape.layer_path_len(0);
+    let len = 1 + dw * h.shape.layer_path_len(0);
     let borrowed: Vec<LfmWord> = spliced[4][from..from + len].to_vec();
     assert_ne!(
         borrowed,
@@ -1076,7 +1096,7 @@ fn no_tampered_fri_value_can_pass() {
          splice is a no-op and this vector proves nothing"
     );
     spliced[4][to..to + len].copy_from_slice(&borrowed);
-    let err = execute(&program, &spliced, &TestPermutation).expect_err(
+    let err = execute(&program, &spliced, &crate::hash_pin::BLOCK_HASHER).expect_err(
         "a REAL leaf and a REAL path, at the wrong index, must still be rejected \
          — the walk climbs at this query's own bits",
     );
@@ -1116,7 +1136,8 @@ fn the_shape_pins_the_lengths_production_must_check_at_runtime() {
     };
     let program = fri_only_program(shape, 1);
     let honest = h.all_arenas(&queries);
-    execute(&program, &honest, &TestPermutation).expect("the honest run must execute");
+    execute(&program, &honest, &crate::hash_pin::BLOCK_HASHER)
+        .expect("the honest run must execute");
 
     // (label, arena, what the truncation would buy a prover)
     let attacks: [(&str, usize, &str); 3] = [
@@ -1140,7 +1161,7 @@ fn the_shape_pins_the_lengths_production_must_check_at_runtime() {
     for (label, arena, mirrors) in attacks {
         let mut truncated = honest.clone();
         truncated[arena].clear();
-        let err = execute(&program, &truncated, &TestPermutation)
+        let err = execute(&program, &truncated, &crate::hash_pin::BLOCK_HASHER)
             .expect_err(&format!("{label} must be refused"));
         assert!(
             matches!(err, LfmExecError::ArenaLenMismatch { .. }),
@@ -1174,7 +1195,7 @@ fn the_shape_pins_the_lengths_production_must_check_at_runtime() {
 #[test]
 fn the_fri_leg_proves_and_verifies() {
     use super::proof::{lfm_prove, verify_against};
-    use super::registry::build_artifacts;
+    use super::registry::build_artifacts_with_hasher;
 
     let h = host_fri(512, 2);
     assert_eq!(
@@ -1201,7 +1222,11 @@ fn the_fri_leg_proves_and_verifies() {
 
     let mut arenas = h.trace.arenas(&queries);
     arenas.extend(h.fri_arenas(&queries));
-    let artifacts = build_artifacts(&program, &opts);
+    // Built at `WrapHash::production()`, so it emits `Instr::Hash` and the
+    // artifacts must carry the pin's tenant — the classification rule in
+    // HASH-PINNING.md. `build_artifacts` defaults to the registry's blessed
+    // hasher, which is correct for registry programs and wrong for this one.
+    let artifacts = build_artifacts_with_hasher(&program, &opts, crate::hash_pin::BLOCK_HASHER);
     let proved = lfm_prove(&program, &artifacts, &arenas, &opts)
         .expect("the joined trace+DEEP+FRI program must prove");
 

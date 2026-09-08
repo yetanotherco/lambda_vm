@@ -6,11 +6,9 @@
 //! - Padding: Auto-padding to power of 2 works correctly
 //! - Border cases: Edge values (0, MAX, signed boundaries) work
 
+use math::field::element::FieldElement;
 use stark::constraints::builder::EmptyConstraints;
 use std::collections::HashMap;
-
-use crypto::fiat_shamir::default_transcript::DefaultTranscript;
-use math::field::element::FieldElement;
 
 use stark::lookup::{
     AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, BusValue, Multiplicity,
@@ -19,7 +17,7 @@ use stark::lookup::{
 use stark::proof::options::ProofOptions;
 use stark::trace::TraceTable;
 use stark::traits::AIR;
-use stark::verifier::{IsStarkVerifier, Verifier};
+use stark::verifier::IsStarkVerifier;
 
 use crate::tables::lt::{LtOperation, cols, generate_lt_trace};
 use crate::tables::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
@@ -289,15 +287,15 @@ fn prove_and_verify(ops: &[LtOperation]) -> bool {
     ];
 
     let multi_proof =
-        multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        multi_prove_ram(air_trace_pairs, &mut crate::hash_pin::block_transcript(&[])).unwrap();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&sender_air, &receiver_air];
 
-    Verifier::multi_verify(
+    crate::hash_pin::BlockVerifier::multi_verify(
         &airs,
         &multi_proof,
-        &mut DefaultTranscript::<E>::new(&[]),
+        &mut crate::hash_pin::block_transcript(&[]),
         &FieldElement::zero(),
     )
 }
@@ -373,15 +371,15 @@ fn prove_and_verify_custom(ops: &[LtOperation], receiver_rows: &[CustomLtRow]) -
     ];
 
     let multi_proof =
-        multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        multi_prove_ram(air_trace_pairs, &mut crate::hash_pin::block_transcript(&[])).unwrap();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&sender_air, &receiver_air];
 
-    Verifier::multi_verify(
+    crate::hash_pin::BlockVerifier::multi_verify(
         &airs,
         &multi_proof,
-        &mut DefaultTranscript::<E>::new(&[]),
+        &mut crate::hash_pin::block_transcript(&[]),
         &FieldElement::zero(),
     )
 }

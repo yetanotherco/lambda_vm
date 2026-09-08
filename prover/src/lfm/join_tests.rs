@@ -26,6 +26,7 @@
 //! distinguish a per-level walk from a two-level one; it is not enough to catch
 //! something that only appears past a word boundary in the index.
 
+use crypto::merkle_tree::traits::IsStreamingLeafBackend;
 use math::field::traits::IsFFTField;
 use stark::config::Commitment;
 use stark::domain::new_verifier_domain;
@@ -38,7 +39,6 @@ use super::builder::LfmBuilder;
 use super::compiler::compile;
 use super::constraint_tests::{deep_shape, open_sub_proof, real_fixture};
 use super::executor::execute;
-use super::hash::TestPermutation;
 use super::sub_proof::{
     GroupShape, ROWS_PER_LEAF, SubProofShape, emit_sub_proof, emit_sub_proof_with_bits,
 };
@@ -398,7 +398,8 @@ fn the_join_premises_hold_on_a_real_proof() {
 
     for (q, iota) in h.iotas.iter().enumerate() {
         let arenas = vec![vec![base_word(FE::from(*iota as u64))]];
-        let exec = execute(&program, &arenas, &TestPermutation).expect("the derivation executes");
+        let exec = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+            .expect("the derivation executes");
         assert_eq!(
             exec.public_words[0].1[0], h.points[q].0,
             "query {q}: the machine's point must be \
@@ -438,7 +439,7 @@ fn the_join_matches_the_production_verifier_on_every_query() {
     let program = compile(b.finish());
     validate(&program).expect("the joined sub-proof program is admissible");
 
-    let exec = execute(&program, &h.arenas(&all), &TestPermutation)
+    let exec = execute(&program, &h.arenas(&all), &crate::hash_pin::BLOCK_HASHER)
         .expect("an honest sub-proof must authenticate and fold");
 
     let mut nonzero = 0usize;
@@ -814,7 +815,7 @@ fn join_leg_cost() {
 use super::builder::{Bit, Cell, Ext, Felt};
 use super::deep::{DeepOpening, emit_deep_invariants, emit_deep_point};
 use super::proof::{lfm_prove, verify_against};
-use super::registry::build_artifacts;
+use super::registry::build_artifacts_with_hasher;
 use super::sub_proof::{
     GroupCommitment, GroupOpening, emit_group_authentication, emit_query_points,
 };
@@ -856,8 +857,12 @@ fn control_program_source(
     let uniforms = b.declare_arena(2);
     let ood = b.declare_arena((shape.deep.num_eval_points * shape.deep.num_total_cols) as u32);
     let parts_arena = b.declare_arena(shape.deep.num_composition_parts as u32);
-    let roots = b.declare_arena(2 * groups.len() as u32);
-    let queries = b.declare_arena(shape.query_words() as u32);
+    // The roots and the query stride follow THIS builder's digest width, as the
+    // production emitter's do — a literal two here is a byte-hash assumption
+    // that the executor's arena-length check refuses under an algebraic pin.
+    let dw = super::edsl::digest_words(&b);
+    let roots = b.declare_arena(dw * groups.len() as u32);
+    let queries = b.declare_arena(shape.query_words(dw as usize) as u32);
     let extra = b.declare_arena(match control {
         // A second copy of every folded value, both points.
         Control::SplitValues => {
@@ -887,7 +892,7 @@ fn control_program_source(
     let commitments: Vec<GroupCommitment> = groups
         .iter()
         .enumerate()
-        .map(|(i, g)| GroupCommitment::hint(&mut b, roots, 2 * i as u32, *g))
+        .map(|(i, g)| GroupCommitment::hint(&mut b, roots, dw * i as u32, *g))
         .collect();
     let inv = emit_deep_invariants(&mut b, &shape.deep, gamma, zeta, &ood_steps, &claimed_parts);
 
@@ -906,10 +911,11 @@ fn control_program_source(
                 .collect();
             let siblings: Vec<super::edsl::WrapDigest> = (0..shape.merkle_depth)
                 .map(|_| {
-                    let lo = b.hint_word(queries, cursor);
-                    let hi = b.hint_word(queries, cursor + 1);
-                    cursor += 2;
-                    super::edsl::WrapDigest::from_pair(lo, hi)
+                    // The stride follows THIS builder's digest width, as the
+                    // production emitter's does — not a literal two.
+                    let d = super::edsl::hint_digest(&mut b, queries, cursor);
+                    cursor += dw;
+                    d
                 })
                 .collect();
             GroupOpening { values, siblings }
@@ -1018,7 +1024,11 @@ fn the_join_proves_and_verifies() {
         b.public(s.as_cell());
     }
     let program = compile(b.finish());
-    let artifacts = build_artifacts(&program, &opts);
+    // Built at `WrapHash::production()`, so it emits `Instr::Hash` and the
+    // artifacts must carry the pin's tenant — the classification rule in
+    // HASH-PINNING.md. `build_artifacts` defaults to the registry's blessed
+    // hasher, which is correct for registry programs and wrong for this one.
+    let artifacts = build_artifacts_with_hasher(&program, &opts, crate::hash_pin::BLOCK_HASHER);
     let proved = lfm_prove(&program, &artifacts, &h.arenas(&queries), &opts)
         .expect("the joined sub-proof must prove");
 
@@ -1084,7 +1094,8 @@ fn sweep_tampers(h: &HostSubProof, label: &str) {
         b.public(s.as_cell());
     }
     let program = compile(b.finish());
-    let honest = execute(&program, &h.arenas(&[q]), &TestPermutation).expect("honest");
+    let honest =
+        execute(&program, &h.arenas(&[q]), &crate::hash_pin::BLOCK_HASHER).expect("honest");
 
     // Sweep every value slot of every group, so no vector class (first group,
     // first column, regular point) is silently the only one tested.
@@ -1096,14 +1107,15 @@ fn sweep_tampers(h: &HostSubProof, label: &str) {
                 // Offset of this group's value `slot` inside the query arena.
                 let mut off = 1usize;
                 for prior in groups.iter().take(g) {
-                    off += prior.num_values() + 2 * h.shape.merkle_depth;
+                    off += prior.num_values()
+                        + super::proof_arena::words_per_root() * h.shape.merkle_depth;
                 }
                 off + slot
             };
             arenas[4][word_of_slot][0] += FE::one();
 
             // Incoherent: the real roots, a moved leaf.
-            let err = execute(&program, &arenas, &TestPermutation)
+            let err = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
                 .err()
                 .unwrap_or_else(|| {
                     panic!("{label}: group {g} slot {slot}: a moved value must not authenticate")
@@ -1121,9 +1133,12 @@ fn sweep_tampers(h: &HostSubProof, label: &str) {
             let mut coherent_roots = h.roots.clone();
             coherent_roots[g] = forged;
             arenas[3] = commitments_to_arena(&coherent_roots);
-            let forged_run = execute(&program, &arenas, &TestPermutation).unwrap_or_else(|e| {
-                panic!("{label}: group {g} slot {slot}: the coherent forgery must execute: {e:?}")
-            });
+            let forged_run = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "{label}: group {g} slot {slot}: the coherent forgery must execute: {e:?}"
+                    )
+                });
             // Which of the two points moves is not incidental: a leaf holds
             // the row PAIR, its first half is the regular point and its second
             // the symmetric, and folding the halves into the wrong point is a
@@ -1171,13 +1186,13 @@ fn sweep_tampers(h: &HostSubProof, label: &str) {
         for (g, group) in groups.iter().enumerate() {
             let words = &h.openings[q][g].values;
             let leaf = if group.is_ext {
-                type ExtBackend = stark::config::BatchedMerkleTreeBackend<Ext3>;
+                type ExtBackend = super::proof_arena::BlockBatched<Ext3>;
                 let v: Vec<FEE> = words.iter().map(|w| FEE::new([w[0], w[1], w[2]])).collect();
-                ExtBackend::hash_data_from_slices(&v, &[])
+                <ExtBackend as IsStreamingLeafBackend<Ext3>>::hash_data_from_slices(&v, &[])
             } else {
-                type BaseBackend = stark::config::BatchedMerkleTreeBackend<Gl>;
+                type BaseBackend = super::proof_arena::BlockBatched<Gl>;
                 let v: Vec<FE> = words.iter().map(|w| w[0]).collect();
-                BaseBackend::hash_data_from_slices(&v, &[])
+                <BaseBackend as IsStreamingLeafBackend<Gl>>::hash_data_from_slices(&v, &[])
             };
             coherent_roots[g] = walk_to_root(leaf, bad, &h.openings[q][g].siblings);
             moved_a_root |= coherent_roots[g] != h.roots[g];
@@ -1188,16 +1203,17 @@ fn sweep_tampers(h: &HostSubProof, label: &str) {
              trees are degenerate at this index and the walk half of this vector \
              tests nothing"
         );
-        execute(&program, &arenas, &TestPermutation)
+        execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
             .err()
             .unwrap_or_else(|| {
                 panic!("{label}: index bit {level}: a moved index must not authenticate")
             });
 
         arenas[3] = commitments_to_arena(&coherent_roots);
-        let forged = execute(&program, &arenas, &TestPermutation).unwrap_or_else(|e| {
-            panic!("{label}: index bit {level}: coherent forgery must execute: {e:?}")
-        });
+        let forged =
+            execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER).unwrap_or_else(|e| {
+                panic!("{label}: index bit {level}: coherent forgery must execute: {e:?}")
+            });
         assert_ne!(
             forged.public_words[0].1, honest.public_words[0].1,
             "{label}: index bit {level}: the index derives the evaluation point, so a \
@@ -1215,9 +1231,9 @@ fn sweep_tampers(h: &HostSubProof, label: &str) {
         siblings[level][0] ^= 1;
         let mut arenas = h.arenas(&[q]);
         let base = 1 + groups[0].num_values();
-        arenas[4][base..base + 2 * h.shape.merkle_depth]
+        arenas[4][base..base + super::proof_arena::words_per_root() * h.shape.merkle_depth]
             .copy_from_slice(&commitments_to_arena(&siblings));
-        execute(&program, &arenas, &TestPermutation)
+        execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
             .err()
             .unwrap_or_else(|| {
                 panic!("{label}: sibling level {level}: a moved path must not authenticate")
@@ -1231,18 +1247,18 @@ fn sweep_tampers(h: &HostSubProof, label: &str) {
     /// The leaf hash a tampered opening really produces, under production's own
     /// backend rather than a local model.
     fn tampered_leaf(h: &HostSubProof, q: usize, g: usize, slot: usize) -> Commitment {
-        type BaseBackend = stark::config::BatchedMerkleTreeBackend<Gl>;
-        type ExtBackend = stark::config::BatchedMerkleTreeBackend<Ext3>;
+        type BaseBackend = super::proof_arena::BlockBatched<Gl>;
+        type ExtBackend = super::proof_arena::BlockBatched<Ext3>;
         let group = h.shape.groups()[g];
         let words = &h.openings[q][g].values;
         if group.is_ext {
             let mut v: Vec<FEE> = words.iter().map(|w| FEE::new([w[0], w[1], w[2]])).collect();
             v[slot] = &v[slot] + FEE::new([FE::one(), FE::zero(), FE::zero()]);
-            ExtBackend::hash_data_from_slices(&v, &[])
+            <ExtBackend as IsStreamingLeafBackend<Ext3>>::hash_data_from_slices(&v, &[])
         } else {
             let mut v: Vec<FE> = words.iter().map(|w| w[0]).collect();
             v[slot] += FE::one();
-            BaseBackend::hash_data_from_slices(&v, &[])
+            <BaseBackend as IsStreamingLeafBackend<Gl>>::hash_data_from_slices(&v, &[])
         }
     }
 }
@@ -1266,7 +1282,7 @@ fn the_controls_show_what_the_join_denies() {
     validate(&program).expect("admissible");
     let mut arenas = h.arenas(&[q]);
     arenas.push(h.split_values(q));
-    let clean = execute(&program, &arenas, &TestPermutation)
+    let clean = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
         .expect("the control must accept honest inputs");
     assert_eq!(
         word_as_ext(&clean.public_words[0].1).expect("ext"),
@@ -1277,7 +1293,7 @@ fn the_controls_show_what_the_join_denies() {
 
     let mut attacked = arenas.clone();
     attacked[5][0][0] += FE::one();
-    let forged = execute(&program, &attacked, &TestPermutation).expect(
+    let forged = execute(&program, &attacked, &crate::hash_pin::BLOCK_HASHER).expect(
         "SplitValues: authenticating one set of values and folding another is \
          exactly what this control permits",
     );
@@ -1298,7 +1314,7 @@ fn the_controls_show_what_the_join_denies() {
     validate(&program).expect("admissible");
     let mut arenas = h.arenas(&[q]);
     arenas.push(vec![base_word(h.points[q].0), base_word(h.points[q].1)]);
-    let clean = execute(&program, &arenas, &TestPermutation).expect("honest");
+    let clean = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER).expect("honest");
     assert_eq!(
         word_as_ext(&clean.public_words[0].1).expect("ext"),
         h.expected[q].0
@@ -1306,7 +1322,7 @@ fn the_controls_show_what_the_join_denies() {
 
     let mut attacked = arenas.clone();
     attacked[5] = vec![base_word(h.points[other].0), base_word(h.points[other].1)];
-    let forged = execute(&program, &attacked, &TestPermutation).expect(
+    let forged = execute(&program, &attacked, &crate::hash_pin::BLOCK_HASHER).expect(
         "HintedPoint: a hinted point is not tied to the authenticated index, \
          which is what this control permits",
     );
@@ -1529,8 +1545,12 @@ fn the_precomputed_group_comes_first_and_that_is_checkable() {
     }
     let program = compile(b.finish());
     validate(&program).expect("admissible");
-    let exec = execute(&program, &h.arenas(&queries), &TestPermutation)
-        .expect("the four-group sub-proof must authenticate and fold");
+    let exec = execute(
+        &program,
+        &h.arenas(&queries),
+        &crate::hash_pin::BLOCK_HASHER,
+    )
+    .expect("the four-group sub-proof must authenticate and fold");
     for (k, q) in queries.iter().enumerate() {
         assert_eq!(
             word_as_ext(&exec.public_words[2 * k].1).expect("ext"),

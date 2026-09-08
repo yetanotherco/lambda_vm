@@ -132,9 +132,18 @@ impl SubProofShape {
     }
 
     /// Arena words one query's openings occupy — every group's values, plus
-    /// the index and the sibling digests (two words per level per group).
-    pub fn query_words(&self) -> usize {
-        1 + self.opening_words()
+    /// the index and the sibling digests (`digest_words` per level per group).
+    ///
+    /// ★ `digest_words` is the DIGEST's width in arena words, and it is an
+    /// argument rather than a read of the configuration: the machine side
+    /// passes `edsl::digest_words(b)` — the BUILDER's width, the one every
+    /// emitter advances its cursor by — and the host side passes
+    /// `proof_arena::words_per_root()`, the width it serialises roots at. A
+    /// shape that read the configuration here would agree with a builder at
+    /// `WrapHash::production()` and disagree with any other, and the
+    /// disagreement would surface as the emitter's own stride assertion.
+    pub fn query_words(&self, digest_words: usize) -> usize {
+        1 + self.opening_words(digest_words)
     }
 
     /// [`Self::query_words`] WITHOUT the index word.
@@ -143,10 +152,9 @@ impl SubProofShape {
     /// all but the transcript's own bits, so the arena carries only the opened
     /// values and the paths. An arena that still carried an index would be
     /// offering the prover a second one.
-    pub fn opening_words(&self) -> usize {
+    pub fn opening_words(&self, digest_words: usize) -> usize {
         let values: usize = self.groups().iter().map(GroupShape::num_values).sum();
-        let siblings =
-            super::proof_arena::words_per_root() * self.merkle_depth * self.groups().len();
+        let siblings = digest_words * self.merkle_depth * self.groups().len();
         values + siblings
     }
 
@@ -570,7 +578,8 @@ pub fn emit_sub_proof_with_bits(
     let ood = b.declare_arena((shape.deep.num_eval_points * shape.deep.num_total_cols) as u32);
     let parts = b.declare_arena(shape.deep.num_composition_parts as u32);
     let roots = b.declare_arena(edsl::digest_words(b) * groups.len() as u32);
-    let queries = b.declare_arena((num_queries * shape.query_words()) as u32);
+    let queries =
+        b.declare_arena((num_queries * shape.query_words(edsl::digest_words(b) as usize)) as u32);
     let arenas = SubProofArenas {
         uniforms,
         ood,
@@ -644,7 +653,7 @@ pub fn emit_sub_proof_with_bits(
     }
     assert_eq!(
         cursor as usize,
-        num_queries * shape.query_words(),
+        num_queries * shape.query_words(edsl::digest_words(b) as usize),
         "the emitter's cursor must agree with the declared query stride"
     );
 

@@ -237,13 +237,18 @@ fn decode_commitment_zero_bytes_rejects() {
 }
 
 /// DECODE preprocessed commitment for the `sub` asm test ELF at blowup=2,
-/// computed offline once. Mirrors how the recursion guest embeds the
-/// commitment as a compile-time constant for its inner program. If the
-/// AIR or FFT pipeline changes, this drifts and the test fails —
-/// regenerate via the `print_decode_commitment_for_sub` helper below.
+/// computed offline once UNDER THE BLOCK PIN (`hash_pin::BLOCK_STARK_HASH`,
+/// RPX256 here). Mirrors how the recursion guest embeds the commitment as a
+/// compile-time constant for its inner program.
+///
+/// ⚠ A fifth blessed constant, outside the four families
+/// `compute_static_commitments` regenerates: it moves with the pin exactly as
+/// they do, and `HASH-PINNING.md` lists it with them. If the pin, the AIR or the
+/// FFT pipeline changes, this drifts and the test fails — regenerate via the
+/// `print_decode_commitment_for_sub` helper below (`--ignored --nocapture`).
 const SUB_DECODE_COMMITMENT_BLOWUP_2: [u8; 32] = [
-    0xcd, 0xf1, 0xa8, 0xdf, 0x5b, 0x32, 0x67, 0xa4, 0x3c, 0x3d, 0x6b, 0x60, 0x1e, 0xe2, 0xbd, 0x22,
-    0xb1, 0xc1, 0x7d, 0xb7, 0x8f, 0x67, 0x59, 0x70, 0x99, 0xbb, 0xa4, 0xfd, 0x0b, 0xca, 0x01, 0x2d,
+    0xe6, 0xa9, 0x9f, 0x70, 0xfd, 0xdc, 0x7a, 0x0a, 0x65, 0xe1, 0x00, 0x56, 0x03, 0x0a, 0xe5, 0xc9,
+    0x25, 0xef, 0xa9, 0x02, 0xe1, 0xd9, 0xd9, 0xd7, 0x62, 0xb1, 0x64, 0x11, 0x65, 0xe3, 0xa1, 0x5e,
 ];
 
 #[test]

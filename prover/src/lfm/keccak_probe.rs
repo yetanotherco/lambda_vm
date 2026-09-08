@@ -6,17 +6,15 @@
 //! recursion machine's AIR set: it establishes that the family's only coupling
 //! to the VM is the core chip's two `Keccak` bus tokens, and that a chip owning
 //! nothing but those tokens is a sufficient driver.
-
-use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use crypto::fiat_shamir::is_transcript::IsTranscript;
 use stark::constraints::builder::EmptyConstraints;
 use stark::lookup::{AirWithBuses, AuxiliaryTraceBuildData, NullBoundaryConstraintBuilder};
 use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};
 use stark::proof::view::MultiProofView;
-use stark::prover::{IsStarkProver, Prover};
+use stark::prover::IsStarkProver;
 use stark::trace::TraceTable;
 use stark::traits::AIR;
-use stark::verifier::{IsStarkVerifier, Verifier};
+use stark::verifier::IsStarkVerifier;
 
 use crate::tables::types::{FE, FEE, GoldilocksExtension, GoldilocksField, VmTable};
 use crate::tables::{bitwise, keccak_rc, keccak_rnd};
@@ -35,8 +33,8 @@ fn options() -> ProofOptions {
     GoldilocksCubicProofOptions::with_blowup(2).expect("probe options")
 }
 
-fn transcript() -> DefaultTranscript<E> {
-    let mut t = DefaultTranscript::<E>::new(&[]);
+fn transcript() -> crate::hash_pin::BlockTranscript {
+    let mut t = crate::hash_pin::block_transcript(&[]);
     t.append_bytes(PROBE_TAG);
     t
 }
@@ -115,7 +113,7 @@ fn prove_traces(
         (&bw_air, t3, &()),
     ];
     let mut t = transcript();
-    Prover::multi_prove(
+    crate::hash_pin::BlockProver::multi_prove(
         pairs,
         &mut t,
         #[cfg(feature = "disk-spill")]
@@ -140,7 +138,12 @@ fn verify_proof(
     );
     let refs: Vec<DynAir> = vec![adapter, &rnd_air, &rc_air, &bw_air];
     let mut vt = transcript();
-    Verifier::multi_verify_views(&refs, MultiProofView::Owned(proof), &mut vt, &FEE::zero())
+    crate::hash_pin::BlockVerifier::multi_verify_views(
+        &refs,
+        MultiProofView::Owned(proof),
+        &mut vt,
+        &FEE::zero(),
+    )
 }
 
 /// Prove + verify, optionally corrupting the adapter trace in between.

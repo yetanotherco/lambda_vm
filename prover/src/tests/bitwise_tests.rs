@@ -415,16 +415,15 @@ fn test_preprocessed_commitment_is_nonzero() {
 #[cfg(test)]
 mod soundness_tests {
     use super::*;
-    use crypto::fiat_shamir::default_transcript::DefaultTranscript;
     use stark::lookup::{
         AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, BusValue, Multiplicity,
         NullBoundaryConstraintBuilder, Packing,
     };
     use stark::proof::options::ProofOptions;
-    use stark::prover::{IsStarkProver, Prover};
+    use stark::prover::IsStarkProver;
     use stark::trace::TraceTable;
     use stark::traits::AIR;
-    use stark::verifier::{IsStarkVerifier, Verifier};
+    use stark::verifier::IsStarkVerifier;
 
     use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 
@@ -558,8 +557,14 @@ mod soundness_tests {
         let dummy_air = create_receiver_air(proof_options);
 
         // Use the prover's commitment computation (3 precomputed cols: X, Y, AND)
-        Prover::compute_precomputed_commitment_for_testing(trace, &dummy_air, 3)
-            .expect("Failed to compute commitment")
+        // — the PINNED prover, so the commitment the AIRs declare is built under
+        // the same hash `multi_prove_ram` recomputes it with. The workspace
+        // `Prover` alias is BLAKE3 whatever the pin says, and under an algebraic
+        // pin it makes the honest arm fail with PrecomputedCommitmentMismatch.
+        crate::hash_pin::BlockProver::compute_precomputed_commitment_for_testing(
+            trace, &dummy_air, 3,
+        )
+        .expect("Failed to compute commitment")
     }
 
     fn create_sender_trace(x: u8, y: u8, claimed_result: u8) -> TraceTable<F, E> {
@@ -626,15 +631,15 @@ mod soundness_tests {
         ];
 
         let multi_proof =
-            multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+            multi_prove_ram(air_trace_pairs, &mut crate::hash_pin::block_transcript(&[])).unwrap();
 
         let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
             vec![&sender_air, &receiver_air];
 
-        let result = Verifier::multi_verify(
+        let result = crate::hash_pin::BlockVerifier::multi_verify(
             &airs,
             &multi_proof,
-            &mut DefaultTranscript::<E>::new(&[]),
+            &mut crate::hash_pin::block_transcript(&[]),
             &FieldElement::zero(),
         );
 
@@ -674,15 +679,15 @@ mod soundness_tests {
         ];
 
         let multi_proof =
-            multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+            multi_prove_ram(air_trace_pairs, &mut crate::hash_pin::block_transcript(&[])).unwrap();
 
         let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
             vec![&sender_air, &receiver_air];
 
-        let result = Verifier::multi_verify(
+        let result = crate::hash_pin::BlockVerifier::multi_verify(
             &airs,
             &multi_proof,
-            &mut DefaultTranscript::<E>::new(&[]),
+            &mut crate::hash_pin::block_transcript(&[]),
             &FieldElement::zero(),
         );
 
@@ -744,16 +749,16 @@ mod soundness_tests {
         ];
 
         let multi_proof =
-            multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+            multi_prove_ram(air_trace_pairs, &mut crate::hash_pin::block_transcript(&[])).unwrap();
 
         // Verifier uses DIFFERENT AIR with honest commitment
         let verifier_airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
             vec![&sender_air, &verifier_receiver_air];
 
-        let result = Verifier::multi_verify(
+        let result = crate::hash_pin::BlockVerifier::multi_verify(
             &verifier_airs,
             &multi_proof,
-            &mut DefaultTranscript::<E>::new(&[]),
+            &mut crate::hash_pin::block_transcript(&[]),
             &FieldElement::zero(),
         );
 

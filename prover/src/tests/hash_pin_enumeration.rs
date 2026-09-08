@@ -24,6 +24,92 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
+/// ★★ Calls that reach a prover or verifier through the WORKSPACE ALIAS.
+///
+/// ⛔ `stark::prover::Prover` and `stark::verifier::Verifier` **are**
+/// `GenericProver` / `GenericVerifier` AT `DefaultStarkHash`. They are the
+/// SILENT spelling of the first symbol below, and this gate's first version
+/// omitted them — so it searched for the class by the one name the class never
+/// uses. Nineteen files kept calling the BLAKE3 alias against artifacts that
+/// follow the pin, on branches whose entire purpose is that the two differ, and
+/// the gate reported green.
+///
+/// Matched as call forms rather than as bare identifiers, because `Prover` and
+/// `Verifier` appear inside `IsStarkProver`, `BlockProver` and ordinary prose.
+/// A line naming the pin is excluded by [`PIN_CALLS`] rather than by the pattern.
+/// `compute_precomputed_commitment_for_testing` joined the list when a test
+/// declared BLAKE3 preprocessed commitments through it while the pinned prover
+/// recomputed them under RPX — the same alias, one more call form.
+const ALIAS_CALLS: &[&str] = &[
+    "Prover::multi_prove",
+    "Verifier::multi_verify",
+    "Prover::compute_precomputed_commitment_for_testing",
+];
+
+/// The pinned spellings, which contain [`ALIAS_CALLS`] as substrings.
+const PIN_CALLS: &[&str] = &["BlockProver::", "BlockVerifier::"];
+
+/// ★★ Items `prover` may name from `stark::config` — the hash-AGNOSTIC three.
+///
+/// **Everything else that module exports is a spelling of the workspace
+/// DEFAULT**, so this is an ALLOWLIST over a namespace rather than a list of
+/// forbidden names, and that difference is the point.
+///
+/// ⚠ The three misses this gate has had — `DefaultStarkHash` as a substring,
+/// then the `Prover`/`Verifier` call forms, then the Merkle backend type
+/// aliases — share one root: **the gate is lexical and the class is
+/// type-level**, so a name list always lags one spelling behind the newest way
+/// to denote the default. An allowlist cannot lag: a new alias added to
+/// `stark::config` is flagged the first time `prover` names it, without anyone
+/// remembering to extend this file.
+///
+/// ⚖ Deletion would be stronger still — let the compiler refuse the spelling
+/// rather than a test — and it was considered and is NOT available:
+/// `BatchedMerkleTreeBackend` and `FriLayerMerkleTreeBackend` have twelve
+/// legitimate consumers inside `crypto/stark` itself (`commitment.rs`,
+/// `gpu_lde.rs`, the cuda tests), where the workspace default IS the correct
+/// hash. `#[deprecated]` would fire on those under `-D warnings`, in the very
+/// crate that must keep using them.
+/// `DeviceTreeBackend` is allowed for the same reason: it is the marker a Merkle
+/// backend implements to name its OWN hash as the device dispatch key, so it
+/// carries no default — `algebraic_commit` implements it for the algebraic
+/// backends, which is the opposite of reaching a default.
+const CONFIG_ALLOWED: &[&str] = &[
+    "Commitment",
+    "CommitmentHash",
+    "StarkHash",
+    "DeviceTreeBackend",
+];
+
+/// Every item named from `stark::config` on this line, `use` lists included.
+fn config_items(code: &str) -> Vec<String> {
+    const PREFIX: &str = "stark::config::";
+    let mut out = Vec::new();
+    let mut rest = code;
+    while let Some(i) = rest.find(PREFIX) {
+        rest = &rest[i + PREFIX.len()..];
+        if let Some(stripped) = rest.strip_prefix('{') {
+            let end = stripped.find('}').unwrap_or(stripped.len());
+            for part in stripped[..end].split(',') {
+                let name = part.split_whitespace().next().unwrap_or("");
+                if !name.is_empty() {
+                    out.push(name.to_string());
+                }
+            }
+            rest = &stripped[end.min(stripped.len())..];
+        } else {
+            let end = rest
+                .find(|c: char| !c.is_alphanumeric() && c != '_')
+                .unwrap_or(rest.len());
+            if end > 0 {
+                out.push(rest[..end].to_string());
+            }
+            rest = &rest[end..];
+        }
+    }
+    out
+}
+
 /// The symbols that silently select a hash when nobody names one.
 const IMPLIED_HASH_SYMBOLS: &[&str] = &[
     // The workspace's commitment configuration, and the `Prover` / `Verifier`
@@ -38,6 +124,25 @@ const IMPLIED_HASH_SYMBOLS: &[&str] = &[
 ];
 
 /// Files allowed to mention an implied-hash symbol, each with its reason.
+///
+/// ⚠⚠ **THE QUESTION THIS LIST ANSWERS IS "IS THIS DEFAULT PAIRED WITH A
+/// NON-DEFAULT?", NOT "IS THIS REACHABLE FROM PRODUCTION?"** The first version
+/// asked the second, and every entry's reasoning was *true* and one scope too
+/// wide. `build_traces` really is test-only and production really does reach
+/// `build_traces_with_hasher` — and twelve tests still built traces at
+/// `HasherKind::Test` while proving against artifacts that followed the pin,
+/// which is an out-of-bounds index inside `HashConstraints::eval` because the
+/// socket chip's width is tenant-dependent.
+///
+/// ★ **"Test-only" is not "safe" — it is only "production-safe."** Before
+/// blessing an entry, name the CONSUMER the default is handed to and check what
+/// tenant *it* follows.
+///
+/// ⚖ And note the subtlest part: that mismatch did not pre-exist. Before
+/// `build_artifacts` was pinned, `artifacts.hasher` was ALSO `Test`, so the pair
+/// agreed **by both being wrong**. A correct fix to one half of a
+/// wrong-but-consistent pair CREATES the failure — so a red test after such a
+/// fix is evidence the fix worked, not that it broke something.
 ///
 /// Paths are relative to `prover/src`. Two files are excluded from the scan
 /// rather than blessed: `hash_pin.rs`, because naming the default is what it is
@@ -91,20 +196,6 @@ const BLESSED: &[(&str, &str)] = &[
         "lfm/machine_tests.rs",
         "Host-side BYTE-transcript differentials: the oracle for the machine's \
          byte `TranscriptReplay` arm is deliberately the byte transcript.",
-    ),
-    (
-        "tests/prove_elfs_tests.rs",
-        "Names `DefaultStarkTranscript` deliberately — its header records that \
-         the production path's transcript must be the one the default \
-         commitment configuration names, and the test exists to hold that.",
-    ),
-    (
-        "tests/recursion_soundness_gap_poc.rs",
-        "A proof-of-concept against the workspace default configuration.",
-    ),
-    (
-        "tests/page_offset_forgery_poc.rs",
-        "As `recursion_soundness_gap_poc.rs`.",
     ),
 ];
 
@@ -166,7 +257,13 @@ fn no_call_site_outside_the_pin_reaches_a_default_alias() {
         let text = std::fs::read_to_string(root.join(rel)).expect("a readable source file");
         for line in text.lines() {
             let Some(code) = code_of(line) else { continue };
-            if IMPLIED_HASH_SYMBOLS.iter().any(|s| code.contains(s)) {
+            let implied = IMPLIED_HASH_SYMBOLS.iter().any(|s| code.contains(s))
+                || config_items(code)
+                    .iter()
+                    .any(|item| !CONFIG_ALLOWED.contains(&item.as_str()));
+            let aliased = ALIAS_CALLS.iter().any(|s| code.contains(s))
+                && !PIN_CALLS.iter().any(|s| code.contains(s));
+            if implied || aliased {
                 found.insert(rel.to_string_lossy().replace('\\', "/"));
             }
         }

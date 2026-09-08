@@ -1,17 +1,25 @@
-//! Prints static `(bitwise, keccak_rc, zero_page)` preprocessed-table commitments
-//! for a fixed set of `blowup_factor` values. The output is pasted into the
+//! Prints the static preprocessed-table commitments — FOUR families: `bitwise`,
+//! `keccak_rc`, and `page`'s zero-page and private-page (OFFSET-only) constants
+//! — for a fixed set of `blowup_factor` values. The output is pasted into the
 //! `static_commitment` match bodies in `prover/src/tables/{bitwise,keccak_rc}.rs`
-//! and the `static_zero_page_commitment` match body in `prover/src/tables/page.rs`.
+//! and the `static_zero_page_commitment` / `static_private_page_commitment`
+//! match bodies in `prover/src/tables/page.rs`.
 //! The `static_commitments_tests` test suite pins the values so any drift in
 //! the AIR or FFT pipeline is caught at test time.
 //!
 //! Run with:
 //!     cargo run --bin compute_static_commitments --release
 //!
+//! ⚠ On a hash-pin change run this FIRST and paste before `compute_lfm_registry`:
+//! the registry embeds these constants (slots 13 and 14 of every entry, and
+//! `program_id` folds them), so a registry generated before the paste carries
+//! the outgoing hash's statics and the drift gate catches it.
+//!
 //! ⚠️  Do not run this just to silence a failing drift test — see the
 //! "Regenerating" section on `static_commitment` in `bitwise.rs` /
-//! `keccak_rc.rs` and `static_zero_page_commitment` in `page.rs` for when
-//! it's actually appropriate to bless new bytes.
+//! `keccak_rc.rs` and the two `page.rs` constants for when it's actually
+//! appropriate to bless new bytes. A hash-pin change is one such time, and it
+//! regenerates all four families together (`prover/src/hash_pin.rs`).
 
 use lambda_vm_prover::tables::{STATIC_BLOWUP_FACTORS, bitwise, keccak_rc, page};
 use stark::config::Commitment;
@@ -37,7 +45,8 @@ fn main() {
     println!(
         "// Paste these match arms into the `static_commitment` match bodies\n\
          // in `prover/src/tables/{{bitwise,keccak_rc}}.rs` and the\n\
-         // `static_zero_page_commitment` match body in `prover/src/tables/page.rs`.\n"
+         // `static_zero_page_commitment` / `static_private_page_commitment`\n\
+         // match bodies in `prover/src/tables/page.rs`.\n"
     );
 
     let zero_page_config = page::PageConfig::zero_init(0);

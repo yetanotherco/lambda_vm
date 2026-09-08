@@ -316,7 +316,8 @@ impl TableLegs {
         }
         assert_eq!(
             out.len(),
-            self.verify.opening_words(),
+            self.verify
+                .opening_words(super::proof_arena::words_per_root()),
             "the opening arena must fill exactly what the shape declares"
         );
         out
@@ -333,7 +334,7 @@ impl TableLegs {
         }
         assert_eq!(
             out.len(),
-            self.verify.fri_words(),
+            self.verify.fri_words(super::proof_arena::words_per_root()),
             "the FRI arena must fill exactly what the shape declares"
         );
         out
@@ -1078,13 +1079,14 @@ fn the_assembled_verifier_rejects_tampered_leg_data() {
         let ix = arena_index(&e, t);
         assert_eq!(
             good[ix.openings].len(),
-            leg.verify.opening_words(),
+            leg.verify
+                .opening_words(super::proof_arena::words_per_root()),
             "table {t}: the arena at the computed openings index is not the \
              openings arena"
         );
         assert_eq!(
             good[ix.fri].len(),
-            leg.verify.fri_words(),
+            leg.verify.fri_words(super::proof_arena::words_per_root()),
             "table {t}: the arena at the computed FRI index is not the FRI arena"
         );
         assert_eq!(
