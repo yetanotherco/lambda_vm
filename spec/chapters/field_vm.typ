@@ -18,7 +18,7 @@ together with the multiplicities with which each element is accessed.
 == Arguments and addressing
 
 The VM has a state consisting of $N$ general purpose extension field registers,
-a base-field `PC` register, and a bit-register `ZERO` bit-register `ZERO`.
+a base-field `PC` register, and a bit-register `ZERO`.
 The number of registers was chosen as a tradeoff between the versatility of having more mutable state,
 and the extra cost in committed columns and decoding logic that grows with $N$.
 #rj[Register index for `ZERO` = $0$ and `PC` = $1$ and gp register `Ri` = $i + 2$]
@@ -65,7 +65,7 @@ instructions of any input-hinting instruction.
 
 The only case in which two consecutive states are not operated on by two consecutive instructions
 is when a jump occurs, which necessarily implies that `PC` was output-hinted in the earlier instruction.
-`PC` can, however, not be output-hinted, so no collision is possible there.
+`PC` can, however, not be input-hinted, so no collision is possible there.
 ]
 
 == Instruction notation
@@ -96,7 +96,7 @@ as experience may point out further useful abstractions.
 / `MUL o, a, b`: Multiplication: `FMA o == a * b + (0 * X), hint out`
 / `INV o, a`: Extension field inversion. Note: `o` and `a` cannot use the same register here: `FMA o == (a + 1) * o - 1, hint <register of o>`
 / `J a`: Jump. Can be to a register, memory content, or absolute address, depending on the addressing mode of `a`, even relative to PC: `FMA PC == a, hint out`
-/ `JZA imm`: Jump if ZERO, absolute target address: `FMA PC == (-1 * ZERO + 1) * (PC - imm) + (imm + 1), hint out`
+/ `JZA imm`: Jump if ZERO, absolute target address: `FMA PC == (ZERO)*(-1*PC+(imm-1))+(1*PC+1), hint out`
 / `JZR a`: Jump if ZERO, PC-relative target address: `FMA PC == (ZERO) * (a - 1) + (PC + 1), hint out`
 / `JNZA imm`: Jump if not ZERO, absolute target address: `FMA PC == ZERO * (PC - imm) + (ZERO + imm), hint out`
 / `JNZR a`: Jump if not ZERO, PC-relative target address: `FMA PC == (a - 1) * (-1 * ZERO + 1) + (PC + 1), hint out`
@@ -166,7 +166,7 @@ $ f_(i)(x) = f_(i, 0)(x) + x^(d - 1) (f_(i, 1)(x) + x^(d - 2) (f_(i, 2) + x^(d -
 for a maximal constraint degree $d$.
 Here, $deg f_(i, 0) <= d - 2$ and $deg f_(i, k) <= d - 3$.
 We denote by $t + 1$ the number of non-zero $f_(i, k)$ for fixed $i$.
-This allows us we to compute first the values of
+This allows us to first compute the values of
 $#`argument_registers[i]`^(d - 1)$, $#`argument_registers[i]`^(2d - 3)$ and so on
 to `arg_register_powers` with constraints of degree $<= d$,
 and then compute $#`args_premem[i]` = #`argument_scalars[i]` dot sum_(j = 0)^(N + 1) #`registers[j]` dot f_(j)(#`argument_registers[i]`) + #`argument_offsets[i]`$.
@@ -179,6 +179,11 @@ which should take its values from the next row in the table.
 #render_constraint_table(chip, config, groups: "mux")
 
 Once we have these values, we can then perform an optional indexing into memory, and copy over the values otherwise.
+The case of the `ExtField` value into `BaseField` is mostly technical here, as a means to make the signature look reasonable.
+Verification should fail if the value does not fit.
+This failure is automatically satisfied by keeping the `ExtField` value as-is, since the `BaseField` would get reinterpreted as `ExtField`
+in the LogUp, and the memory table should only provide `BaseField` addresses.
+
 #render_constraint_table(chip, config, groups: "memory")
 
 Now everything is in place to check the core operation of the VM: the FMA constraint.
@@ -190,12 +195,12 @@ and allow for hinting.
 We again make use of the multiplexing machinery from before.
 The constraints we want to enforce on a register index $r$ are as follows:
 - $!#`hint_input`_r and !#`hint_output` => #`registers`'_r = #`registers`_r$, `r` could not have been hinted,
-  since it was not input-hinted, and there was not output hint, so the next `r` should remain the same.
+  since it was not input-hinted, and there was no output hint, so the next `r` should remain the same.
 - $!#`hint_input`_r and f_r(#`argument_registers`_0) = 0 => #`registers`'_r = #`registers_r`$
   `r` was not input-hinted, and it was not the output register, so it once again stays the same.
 
 This is equivalent to the logical statement $!#`hint_input`_r and not (#`hint_output` and f_r(#`argument_registers`_0) = 1) => #`registers`'_r = #`registers`_r$, but expressed in a way that polynomial constraints can more easily handle.
-Naturally, the PC gets and exception since if it is not (output-)hinted, we need $#`pc`' = #`pc` + 1$,
+Naturally, the PC gets an exception since if it is not (output-)hinted, we need $#`pc`' = #`pc` + 1$,
 and the $#`ZERO`'$ register purely depends on $#`args`_0$ and not on `ZERO`.
 
 #render_constraint_table(chip, config, groups: "transition")
