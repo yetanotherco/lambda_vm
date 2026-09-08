@@ -42,6 +42,23 @@ type E = GoldilocksExtension;
 // Prover test helpers
 // =============================================================================
 
+/// Total MEMW rows across the table's chunks. A program that never reaches MEMW
+/// gets no MEMW table at all, so a chunk count of zero is normal.
+fn memw_rows(traces: &Traces) -> usize {
+    traces.memws.iter().map(|t| t.main_table.height).sum()
+}
+
+/// Every `(chunk, row)` of the MEMW table, over however many chunks it has —
+/// including none.
+fn memw_chunk_rows(
+    traces: &Traces,
+) -> impl Iterator<Item = (&stark::trace::TraceTable<F, E>, usize)> {
+    traces
+        .memws
+        .iter()
+        .flat_map(|t| (0..t.num_rows()).map(move |row| (t, row)))
+}
+
 /// Run multi_prove and multi_verify for all VM tables.
 ///
 /// Includes: CPU + Bitwise + LT + MEMW + LOAD + DECODE + MUL + BRANCH + HALT + REGISTER + PAGEs
@@ -289,11 +306,11 @@ fn test_prove_elfs_sub_neg_result_fast() {
         Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
 
     println!(
-        "Fast SUB_NEG: CPU {} rows, Bitwise {} rows, MEMW {} tables ({} rows in first), REGISTER {} rows",
+        "Fast SUB_NEG: CPU {} rows, Bitwise {} rows, MEMW {} tables ({} rows), REGISTER {} rows",
         traces.cpus[0].main_table.height,
         traces.bitwise.main_table.height,
         traces.memws.len(),
-        traces.memws[0].main_table.height,
+        memw_rows(&traces),
         traces.register.main_table.height,
     );
 
@@ -938,8 +955,9 @@ fn test_prove_elfs_test_sb_sh_8() {
     let mut traces =
         Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
     assert!(
-        !traces.memws.is_empty(),
-        "test_sb_sh_8 should produce MEMW rows for byte/halfword memory accesses"
+        !traces.stores.is_empty() && !traces.memw_aligneds.is_empty(),
+        "test_sb_sh_8 should produce STORE and MEMW_A rows for its byte/halfword \
+         memory accesses (MEMW carries neither)"
     );
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
@@ -1035,12 +1053,16 @@ fn test_prove_elfs_all_instructions_64() {
     // Includes SLT/SLTU instructions - need LT table
 
     println!(
-        "all_instructions_64 (fast): CPU {} rows, Bitwise {} rows, MEMW {} tables ({} rows in first), LOAD {} rows",
+        "all_instructions_64 (fast): CPU {} rows, Bitwise {} rows, MEMW {} tables ({} rows), LOAD {} rows",
         traces.cpus[0].main_table.height,
         traces.bitwise.main_table.height,
         traces.memws.len(),
-        traces.memws[0].main_table.height,
-        traces.loads[0].main_table.height
+        memw_rows(&traces),
+        traces
+            .loads
+            .iter()
+            .map(|t| t.main_table.height)
+            .sum::<usize>()
     );
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
@@ -1813,11 +1835,10 @@ fn test_debug_memory_bus_tokens() {
     let traces =
         Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
 
-    let memw = &traces.memws[0]; // Small test: single MEMW chunk
     println!("DEBUG TABLE SIZES:");
     println!(
         "  MEMW: {} rows ({} tables)",
-        memw.num_rows(),
+        memw_rows(&traces),
         traces.memws.len()
     );
     println!("  REGISTER: {} rows", traces.register.num_rows());
@@ -1831,7 +1852,7 @@ fn test_debug_memory_bus_tokens() {
 
     // === MEMW tokens (for register rows only) ===
     println!("\n=== MEMW Memory Bus Tokens (register rows) ===");
-    for row in 0..memw.num_rows() {
+    for (memw, row) in memw_chunk_rows(&traces) {
         let is_reg = memw.main_table.get(row, memw_cols::IS_REGISTER).to_raw();
         if is_reg == 0 {
             continue; // Skip memory rows (multiplicity = 0)
@@ -1971,7 +1992,7 @@ fn test_debug_memory_bus_tokens() {
     let mut total_sum: f64 = 0.0;
 
     // MEMW tokens
-    for row in 0..memw.num_rows() {
+    for (memw, row) in memw_chunk_rows(&traces) {
         let is_reg = memw.main_table.get(row, memw_cols::IS_REGISTER).to_raw();
         if is_reg == 0 {
             continue;
@@ -2085,11 +2106,10 @@ fn test_debug_memory_tokens_sb_sh() {
     )
     .unwrap();
 
-    let memw = &traces.memws[0]; // Small test: single MEMW chunk
     println!("DEBUG: test_sb_sh_8 Memory bus tokens (FULL)");
     println!(
         "  MEMW rows: {} ({} tables)",
-        memw.num_rows(),
+        memw_rows(&traces),
         traces.memws.len()
     );
     println!("  REGISTER rows: {}", traces.register.num_rows());
@@ -2153,7 +2173,7 @@ fn test_debug_memory_tokens_sb_sh() {
     println!("\n=== MEMW Memory Bus Tokens (ALL rows) ===");
     let mut memw_register_rows = 0;
     let mut memw_memory_rows = 0;
-    for row in 0..memw.num_rows() {
+    for (memw, row) in memw_chunk_rows(&traces) {
         let is_reg = memw.main_table.get(row, memw_cols::IS_REGISTER).to_raw();
 
         // Count row types
@@ -2781,7 +2801,11 @@ fn test_verify_rejects_zero_cpu_count() {
     assert!(result.is_err(), "Got {:?}", result);
 }
 
-/// Verify rejects table_counts with memw=0.
+/// Verify rejects a `table_counts` that under-reports a table the proof carries:
+/// the counts drive the AIR set, so they must match the sub-proof count.
+///
+/// MEMW_A rather than MEMW because `sub` reaches no MEMW rows at all, and a
+/// count that is already zero is not something to tamper with.
 #[test]
 fn test_verify_rejects_zero_memw_count() {
     let elf_bytes = crate::test_utils::asm_elf_bytes("sub");
@@ -2789,10 +2813,14 @@ fn test_verify_rejects_zero_memw_count() {
 
     let vm_proof = crate::prove_with_options(&elf_bytes, &proof_options, &Default::default())
         .expect("Prover should succeed on valid program");
+    assert!(
+        vm_proof.table_counts.memw_aligned > 0,
+        "the program must carry the table this test zeroes out"
+    );
 
     let tampered_proof = crate::VmProof {
         table_counts: crate::TableCounts {
-            memw: 0,
+            memw_aligned: 0,
             ..vm_proof.table_counts.clone()
         },
         ..vm_proof
