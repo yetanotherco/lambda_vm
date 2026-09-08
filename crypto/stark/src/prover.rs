@@ -1354,7 +1354,12 @@ pub trait IsStarkProver<
     /// as a separate Merkle tree (the precomputed split for preprocessed
     /// tables) and the root is checked against the AIR-hardcoded commitment.
     /// `table` is the AIR's name, for the device diagnostics.
-    #[allow(clippy::type_complexity)]
+    ///
+    /// `snapshot_trace` (cuda): whether the device commit keeps the
+    /// trace-domain snapshot the LogUp aux build reads in place — true exactly
+    /// when the table builds an aux trace; otherwise the snapshot has no
+    /// consumer and the card does not pay for it.
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     fn commit_main_trace(
         #[cfg_attr(not(feature = "cuda"), allow(unused_variables))] table: &str,
         trace: &TraceTable<Field, FieldExtension>,
@@ -1362,6 +1367,7 @@ pub trait IsStarkProver<
         twiddles: &LdeTwiddles<Field>,
         precomputed: Option<(Commitment, usize)>,
         #[cfg(feature = "cuda")] device_only: bool,
+        #[cfg(feature = "cuda")] snapshot_trace: bool,
         #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
         #[cfg_attr(not(feature = "cuda"), allow(unused_variables))] residency: ResidencyMode,
     ) -> Result<MainCommitTuple<Field, H>, ProvingError>
@@ -1401,6 +1407,7 @@ pub trait IsStarkProver<
                     domain.blowup_factor,
                     &twiddles.coset_weights,
                     !device_only,
+                    snapshot_trace,
                 )
             {
                 #[cfg(feature = "instruments")]
@@ -1469,6 +1476,7 @@ pub trait IsStarkProver<
                     num_precomputed,
                     cached_pre.is_none(),
                     !device_only,
+                    snapshot_trace,
                 )
             {
                 #[cfg(feature = "instruments")]
@@ -3826,10 +3834,16 @@ pub trait IsStarkProver<
 
         // R1 main commit: the fused commit's device set — one LDE buffer, the
         // trace snapshot, the tree and the scratch — the same model the
-        // dispatch layer admits the commit against.
+        // dispatch layer admits the commit against. The snapshot is kept only
+        // for a table with an aux trace (`commit_main_trace`'s `snapshot_trace`
+        // is `air.has_aux_trace()`, which is `aux_cols != 0`), so the estimate
+        // reads the same flag rather than charging every table for it.
         let main_estimates: Vec<u64> = table_shapes
             .iter()
-            .map(|s| crate::device_set::commit_device_set(s.n, s.main_cols, s.blowup, true).total())
+            .map(|s| {
+                crate::device_set::commit_device_set(s.n, s.main_cols, s.blowup, s.aux_cols != 0)
+                    .total()
+            })
             .collect();
 
         // The AIR names, for the driver threads' panic payloads: a device abort
@@ -3921,6 +3935,8 @@ pub trait IsStarkProver<
                 #[cfg(feature = "cuda")]
                 let device_only = Self::device_only_for(*air, domain);
 
+                // The trace-domain snapshot has exactly one consumer, the
+                // LogUp aux build; a table without an aux trace never runs it.
                 Self::commit_main_trace(
                     air.name(),
                     *trace,
@@ -3929,6 +3945,8 @@ pub trait IsStarkProver<
                     precomputed,
                     #[cfg(feature = "cuda")]
                     device_only,
+                    #[cfg(feature = "cuda")]
+                    air.has_aux_trace(),
                     #[cfg(feature = "disk-spill")]
                     storage_mode,
                     residency,

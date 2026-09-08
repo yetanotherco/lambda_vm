@@ -416,6 +416,7 @@ where
 /// Returns `None` to fall back (non Goldilocks, below threshold, no GPU, GPU
 /// error). This is the residency path that avoids the term-column download.
 pub fn try_build_aux_resident_gpu<'a, F, E>(
+    table: &str,
     interactions: &[BusInteraction],
     num_cols: usize,
     main_cols: impl FnOnce() -> &'a [Vec<FieldElement<F>>],
@@ -451,6 +452,29 @@ where
     // ~3 GB main re-upload.
     let resident_main =
         main_dev.filter(|&(buf, rows)| rows == trace_len && buf.len() == num_cols * trace_len);
+
+    // Bytes admission before any device allocation: the same ceiling as every
+    // commit (the row floor above is this build's own). Over budget aborts —
+    // or, under the test-only switch, reports and returns `None` so the host
+    // arms run. Without it the build allocated about four fingerprint buffers
+    // unchecked and fell to the CPU build through `.ok()?` when the card
+    // refused: a silent production host path, found by reading the code.
+    let shape = crate::gpu_lde::DispatchShape {
+        table,
+        what: "R1 aux build (LogUp, device-resident)",
+        n: trace_len,
+        base_cols: num_cols,
+        blowup: 1,
+    };
+    let set = crate::gpu_lde::aux_build_device_set(
+        trace_len,
+        num_cols,
+        interactions.len(),
+        desc.num_out_cols,
+        resident_main.is_some(),
+    );
+    crate::gpu_lde::admit_aux_build(&shape, &set)?;
+
     let mut main_flat = Vec::new();
     if resident_main.is_none() {
         main_flat = vec![0u64; num_cols * trace_len];
@@ -479,7 +503,9 @@ where
         Some((buf, _)) => math_cuda::logup::ResidentMain::Dev(buf),
         None => math_cuda::logup::ResidentMain::Host(&main_flat),
     };
-    let ra = math_cuda::logup::logup_aux_resident(
+    // Admitted means the device path is the only path: a failure here aborts
+    // (test-only switch: report, and the caller's host arms run).
+    let ra = match math_cuda::logup::logup_aux_resident(
         main,
         trace_len,
         &md,
@@ -487,8 +513,13 @@ where
         z_arr,
         inv_n,
         &stream,
-    )
-    .ok()?;
+    ) {
+        Ok(ra) => ra,
+        Err(e) => {
+            crate::gpu_lde::abort_aux_build_device_error(&shape, &set, &e);
+            return None;
+        }
+    };
     crate::gpu_lde::GPU_LOGUP_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Some(ra)
 }

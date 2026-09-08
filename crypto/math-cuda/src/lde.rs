@@ -1239,6 +1239,37 @@ pub fn coset_lde_row_major_with_merkle_tree_keep(
     weights: &[u64],
     retain_host_lde: bool,
 ) -> Result<(GpuLdeBase, Vec<u64>)> {
+    coset_lde_row_major_with_merkle_tree_keep_snapshot(
+        row_major,
+        predev,
+        hash,
+        n,
+        m,
+        blowup_factor,
+        weights,
+        retain_host_lde,
+        true,
+    )
+}
+
+/// [`coset_lde_row_major_with_merkle_tree_keep`] with the trace-domain
+/// snapshot optional. `retain_trace_snapshot` keeps the pre-NTT column-major
+/// copy of the first `n` rows on device (`n · m · 8` bytes, `handle.trace_dev`)
+/// for the LogUp aux fingerprint kernel, its only consumer; a table that
+/// builds no aux trace passes `false`, and its commit's device set is one LDE
+/// and one tree. With `false`, `trace_dev` is `None` and `trace_rows` is 0.
+#[allow(clippy::too_many_arguments)]
+pub fn coset_lde_row_major_with_merkle_tree_keep_snapshot(
+    row_major: &[u64],
+    predev: Option<&CudaSlice<u64>>,
+    hash: DeviceHash,
+    n: usize,
+    m: usize,
+    blowup_factor: usize,
+    weights: &[u64],
+    retain_host_lde: bool,
+    retain_trace_snapshot: bool,
+) -> Result<(GpuLdeBase, Vec<u64>)> {
     let input = match predev {
         Some(d) if d.len() == row_major.len() => InnerInput::Dev(d),
         _ => InnerInput::Host(row_major),
@@ -1251,9 +1282,10 @@ pub fn coset_lde_row_major_with_merkle_tree_keep(
         blowup_factor,
         weights,
         "coset_lde_row_major lde_size",
-        true,
+        retain_trace_snapshot,
         retain_host_lde,
     )?;
+    let trace_rows = if trace_col_major.is_some() { n } else { 0 };
     let handle = GpuLdeBase {
         buf: Arc::new(col_major_dev),
         m,
@@ -1261,7 +1293,7 @@ pub fn coset_lde_row_major_with_merkle_tree_keep(
         tree: Some(tree),
         ready: Some(ready),
         trace_dev: trace_col_major.map(Arc::new),
-        trace_rows: n,
+        trace_rows,
     };
     Ok((handle, lde_out))
 }
@@ -1295,6 +1327,39 @@ pub fn coset_lde_row_major_split_trees(
     build_precomputed: bool,
     retain_host_lde: bool,
 ) -> Result<(Option<Vec<u8>>, GpuLdeBase, Vec<u64>)> {
+    coset_lde_row_major_split_trees_snapshot(
+        row_major,
+        predev,
+        hash,
+        n,
+        m,
+        blowup_factor,
+        weights,
+        split_col,
+        build_precomputed,
+        retain_host_lde,
+        true,
+    )
+}
+
+/// [`coset_lde_row_major_split_trees`] with the trace-domain snapshot
+/// optional — the same `retain_trace_snapshot` contract as
+/// [`coset_lde_row_major_with_merkle_tree_keep_snapshot`].
+#[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
+pub fn coset_lde_row_major_split_trees_snapshot(
+    row_major: &[u64],
+    predev: Option<&CudaSlice<u64>>,
+    hash: DeviceHash,
+    n: usize,
+    m: usize,
+    blowup_factor: usize,
+    weights: &[u64],
+    split_col: usize,
+    build_precomputed: bool,
+    retain_host_lde: bool,
+    retain_trace_snapshot: bool,
+) -> Result<(Option<Vec<u8>>, GpuLdeBase, Vec<u64>)> {
     assert!(split_col > 0 && split_col < m, "split inside the row");
     assert!(n.is_power_of_two(), "n must be a power of two");
     assert_eq!(weights.len(), n, "weights length must match n");
@@ -1319,8 +1384,16 @@ pub fn coset_lde_row_major_split_trees(
         Some(d) if d.len() == row_major.len() => InnerInput::Dev(d),
         _ => InnerInput::Host(row_major),
     };
-    let (buf, trace_col_major) =
-        expand_row_major_on_stream(&stream, be, input, n, m, blowup_factor, weights, true)?;
+    let (buf, trace_col_major) = expand_row_major_on_stream(
+        &stream,
+        be,
+        input,
+        n,
+        m,
+        blowup_factor,
+        weights,
+        retain_trace_snapshot,
+    )?;
 
     // One subset tree per column range, built sequentially on the stream.
     let build_subset_tree_dev = |col_start: u64, col_end: u64| -> Result<CudaSlice<u8>> {
@@ -1418,6 +1491,7 @@ pub fn coset_lde_row_major_split_trees(
         None => Vec::new(),
     };
 
+    let trace_rows = if trace_col_major.is_some() { n } else { 0 };
     let handle = GpuLdeBase {
         buf: Arc::new(col_major_dev),
         m,
@@ -1425,7 +1499,7 @@ pub fn coset_lde_row_major_split_trees(
         tree: Some(mult_tree),
         ready: Some(Arc::new(ready)),
         trace_dev: trace_col_major.map(Arc::new),
-        trace_rows: n,
+        trace_rows,
     };
     Ok((precomputed_nodes, handle, lde_out))
 }

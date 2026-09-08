@@ -212,7 +212,8 @@ fn gpu_device_only_threshold() -> usize {
 // so the dispatch layer's callers keep one path.
 use crate::device_set::BASE_BYTES;
 pub use crate::device_set::{
-    Admission, CommitDeviceSet, admit_bytes, commit_device_set, ext3_bytes, full_tree_bytes,
+    Admission, AuxBuildDeviceSet, CommitDeviceSet, admit_bytes, aux_build_device_set,
+    commit_device_set, ext3_bytes, full_tree_bytes,
 };
 
 /// The process predicate: `gpu_lde_threshold()` as the floor and the card's
@@ -283,12 +284,29 @@ fn mempool_line() -> String {
     }
 }
 
+/// The commit device set, term by term, for the diagnostic (empty when the
+/// stage has none).
+fn commit_set_line(set: Option<&CommitDeviceSet>) -> String {
+    match set {
+        Some(s) => format!(
+            "; device set LDE {:.2} GiB + snapshot {:.2} GiB + tree {:.3} GiB + scratch {:.3} GiB = {:.2} GiB",
+            gib(s.lde_bytes),
+            gib(s.snapshot_bytes),
+            gib(s.tree_bytes),
+            gib(s.scratch_bytes),
+            gib(s.total())
+        ),
+        None => String::new(),
+    }
+}
+
 /// The diagnostic every abort and every test-only fallback prints: the stage
-/// and shape, the device set term by term, the admission budget, the live
-/// free/total VRAM and the mempool posture.
+/// and shape, the device set term by term (`set_line`, already formatted by
+/// the stage — [`commit_set_line`] for the commits), the admission budget,
+/// the live free/total VRAM and the mempool posture.
 fn device_path_diagnostic(
     shape: &DispatchShape<'_>,
-    set: Option<&CommitDeviceSet>,
+    set_line: &str,
     failure: &DevicePathFailure,
 ) -> String {
     let DispatchShape {
@@ -305,17 +323,6 @@ fn device_path_diagnostic(
             gib(*budget)
         ),
         DevicePathFailure::DeviceError(e) => format!("device error after admission: {e}"),
-    };
-    let set_line = match set {
-        Some(s) => format!(
-            "; device set LDE {:.2} GiB + snapshot {:.2} GiB + tree {:.3} GiB + scratch {:.3} GiB = {:.2} GiB",
-            gib(s.lde_bytes),
-            gib(s.snapshot_bytes),
-            gib(s.tree_bytes),
-            gib(s.scratch_bytes),
-            gib(s.total())
-        ),
-        None => String::new(),
     };
     format!(
         "table {table}: {what}: rows {n} x {base_cols} base cols @ blowup {blowup} (LDE {}); {reason}{set_line}; {}",
@@ -371,7 +378,17 @@ pub(crate) fn abort_or_test_fallback(
     set: Option<&CommitDeviceSet>,
     failure: DevicePathFailure,
 ) {
-    let msg = device_path_diagnostic(shape, set, &failure);
+    abort_or_test_fallback_line(shape, &commit_set_line(set), failure);
+}
+
+/// [`abort_or_test_fallback`] for a stage whose device set is not a commit's
+/// (the LogUp aux build): the stage formats its own set line.
+pub(crate) fn abort_or_test_fallback_line(
+    shape: &DispatchShape,
+    set_line: &str,
+    failure: DevicePathFailure,
+) {
+    let msg = device_path_diagnostic(shape, set_line, &failure);
     if test_only_host_fallback() {
         eprintln!("[gpu] TEST-ONLY host fallback: {msg}");
         return;
@@ -415,6 +432,62 @@ fn admit_resident_commit(shape: &DispatchShape<'_>, set: &CommitDeviceSet) -> Op
         }
         _ => Some(()),
     }
+}
+
+fn aux_build_set_line(s: &AuxBuildDeviceSet) -> String {
+    format!(
+        "; device set main {:.2} GiB + fingerprints {:.2} GiB + inverse scratch {:.2} GiB + \
+         terms {:.2} GiB + scan {:.3} GiB + aux {:.2} GiB = peak {:.2} GiB ({})",
+        gib(s.main_bytes),
+        gib(s.fingerprint_bytes),
+        gib(s.inverse_scratch_bytes),
+        gib(s.terms_bytes),
+        gib(s.scan_bytes),
+        gib(s.aux_bytes),
+        gib(s.total()),
+        if s.inverse_phase() >= s.term_phase() {
+            "inverse phase"
+        } else {
+            "term phase"
+        }
+    )
+}
+
+/// Admission for the resident LogUp aux build: the same bytes ceiling as every
+/// commit, no row floor here (the build's own floor,
+/// `logup_gpu::GPU_LOGUP_MIN_ROWS`, is checked by the caller first). `None`
+/// when there is no device; over budget is an abort — or, under the test-only
+/// switch, a reported host build. This predicate was added by reading, not
+/// after a failure: the build used to allocate about four fingerprint buffers
+/// with no check and fall to the CPU build through `.ok()?` when the card
+/// refused.
+pub(crate) fn admit_aux_build(shape: &DispatchShape, set: &AuxBuildDeviceSet) -> Option<()> {
+    let budget = device_vram_budget_bytes()?;
+    match admit_bytes(usize::MAX, set.total(), 0, budget) {
+        Admission::OverBudget { bytes, budget } => {
+            abort_or_test_fallback_line(
+                shape,
+                &aux_build_set_line(set),
+                DevicePathFailure::OverBudget { bytes, budget },
+            );
+            None
+        }
+        _ => Some(()),
+    }
+}
+
+/// A device error inside an admitted aux build: abort with the set — or, under
+/// the test-only switch, report so the caller takes its host arms.
+pub(crate) fn abort_aux_build_device_error(
+    shape: &DispatchShape,
+    set: &AuxBuildDeviceSet,
+    error: &dyn std::fmt::Debug,
+) {
+    abort_or_test_fallback_line(
+        shape,
+        &aux_build_set_line(set),
+        DevicePathFailure::DeviceError(format!("{error:?}")),
+    );
 }
 
 /// Admission for the R2–R4 transients (parts LDE, trees, DEEP, FRI, the
@@ -1241,6 +1314,11 @@ pub fn gpu_leaf_hash_calls() -> u64 {
 /// Merkle → single D2H. Keeps the Merkle tree resident on device (in the
 /// handle's `.tree`); the returned host `MerkleTree` is root only, so query
 /// openings gather paths from the device tree via [`gather_proofs_dev`].
+///
+/// `snapshot_trace` retains the trace-domain column-major snapshot in the
+/// handle (`n · m · 8` bytes of card) for the LogUp aux build, its only
+/// consumer; a table with no aux trace passes `false` and the device set the
+/// admission sizes has no snapshot term.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn try_expand_leaf_and_tree_row_major_keep<F, E, B>(
     table: &str,
@@ -1251,6 +1329,7 @@ pub(crate) fn try_expand_leaf_and_tree_row_major_keep<F, E, B>(
     blowup_factor: usize,
     weights: &[FieldElement<F>],
     retain_host_lde: bool,
+    snapshot_trace: bool,
 ) -> Option<(
     MerkleTree<B>,
     math_cuda::lde::GpuLdeBase,
@@ -1278,7 +1357,7 @@ where
         base_cols: m,
         blowup: blowup_factor,
     };
-    let set = commit_device_set(n, m, blowup_factor, true);
+    let set = commit_device_set(n, m, blowup_factor, snapshot_trace);
     admit_commit(lde_size, &shape, &set)?;
 
     let raw: &[u64] = unsafe { from_raw_parts(row_major.as_ptr() as *const u64, n * m) };
@@ -1291,7 +1370,7 @@ where
     // The keep path keeps the Merkle tree resident on device (in `handle.tree`).
     // `retain_host_lde=false` additionally skips the row-major D2H (device-only).
     // Admitted means the device path is the only path: a failure here aborts.
-    let (handle, lde_u64) = match math_cuda::lde::coset_lde_row_major_with_merkle_tree_keep(
+    let (handle, lde_u64) = match math_cuda::lde::coset_lde_row_major_with_merkle_tree_keep_snapshot(
         raw,
         predev,
         device_hash_of::<B>(),
@@ -1300,6 +1379,7 @@ where
         blowup_factor,
         &weights_u64,
         retain_host_lde,
+        snapshot_trace,
     ) {
         Ok(v) => v,
         Err(e) => {
@@ -1355,8 +1435,9 @@ where
 /// pair bit for bit. The precomputed tree comes back as a full HOST tree
 /// (it feeds the process-wide cache); the multiplicity tree stays resident
 /// in the handle (root-only host tree, R4 openings gather paths on device).
-/// The handle also keeps the column-major LDE + trace snapshot for the
-/// downstream GPU rounds.
+/// The handle also keeps the column-major LDE for the downstream GPU rounds,
+/// plus the trace snapshot when `snapshot_trace` is set (the LogUp aux build's
+/// input; a table with no aux trace passes `false`).
 ///
 /// `build_precomputed=false` skips the precomputed tree (process-cache hit);
 /// the first element is then `None`. With `want_host=false` the row-major LDE
@@ -1375,6 +1456,7 @@ pub(crate) fn try_expand_split_trees_row_major_keep<F, E, B>(
     split_col: usize,
     build_precomputed: bool,
     want_host: bool,
+    snapshot_trace: bool,
 ) -> Option<(
     Option<MerkleTree<B>>,
     MerkleTree<B>,
@@ -1406,7 +1488,7 @@ where
         base_cols: m,
         blowup: blowup_factor,
     };
-    let set = commit_device_set(n, m, blowup_factor, true);
+    let set = commit_device_set(n, m, blowup_factor, snapshot_trace);
     admit_commit(lde_size, &shape, &set)?;
 
     let raw: &[u64] = unsafe { from_raw_parts(row_major.as_ptr() as *const u64, n * m) };
@@ -1417,28 +1499,30 @@ where
     GPU_MERKLE_TREE_CALLS.fetch_add(1 + build_precomputed as u64, Ordering::Relaxed);
 
     // Admitted means the device path is the only path: a failure here aborts.
-    let (pre_nodes, handle, lde_u64) = match math_cuda::lde::coset_lde_row_major_split_trees(
-        raw,
-        predev,
-        device_hash_of::<B>(),
-        n,
-        m,
-        blowup_factor,
-        &weights_u64,
-        split_col,
-        build_precomputed,
-        want_host,
-    ) {
-        Ok(v) => v,
-        Err(e) => {
-            abort_or_test_fallback(
-                &shape,
-                Some(&set),
-                DevicePathFailure::DeviceError(format!("{e:?}")),
-            );
-            return None;
-        }
-    };
+    let (pre_nodes, handle, lde_u64) =
+        match math_cuda::lde::coset_lde_row_major_split_trees_snapshot(
+            raw,
+            predev,
+            device_hash_of::<B>(),
+            n,
+            m,
+            blowup_factor,
+            &weights_u64,
+            split_col,
+            build_precomputed,
+            want_host,
+            snapshot_trace,
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                abort_or_test_fallback(
+                    &shape,
+                    Some(&set),
+                    DevicePathFailure::DeviceError(format!("{e:?}")),
+                );
+                return None;
+            }
+        };
 
     let pre_tree = match pre_nodes {
         Some(nodes) => Some(tree_from_node_bytes::<B>(nodes)?),
@@ -3926,6 +4010,7 @@ mod admission_box_tests {
             blowup,
             &weights,
             true,
+            true,
         );
         panic!(
             "the over-budget commit returned {} instead of aborting",
@@ -3991,6 +4076,7 @@ mod split_tree_tests {
                 blowup,
                 &weights,
                 split,
+                true,
                 true,
                 true,
             )

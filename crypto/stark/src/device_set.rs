@@ -6,7 +6,11 @@
 //! concurrently and runs on every build, GPU or not) and the GPU dispatch
 //! layer's admission (`gpu_lde::admit`, which asks whether ONE table fits the
 //! card at all). Keeping the arithmetic here, free of any `cuda` gate, is what
-//! lets both read one model instead of each carrying a copy.
+//! lets both read one model instead of each carrying a copy — and is why the
+//! LogUp aux build's set ([`aux_build_device_set`]) lives here too rather than
+//! beside its dispatch: the throttle spends it through
+//! [`fused_task_peak_bytes`] on every build, and the build's own admission
+//! spends it on a `cuda` one.
 //!
 //! Every term mirrors an allocation in `math_cuda` after the in-place LDE
 //! transpose of #956 (one LDE buffer, never two); `one_lde_buffer::vram_arm`
@@ -100,6 +104,92 @@ pub fn commit_device_set(
     }
 }
 
+/// The device working set of the LogUp aux build on the resident path
+/// (`math_cuda::logup::logup_aux_resident`), term by term as the code
+/// allocates it. `I` interactions over `n` trace rows, `out` term columns
+/// (`num_out_cols`: committed + 1 virtual), aux columns = `out` (committed +
+/// the accumulated one), every LogUp value ext3 (24 B):
+///
+/// - `main_bytes`: the column-major main upload, `cols · n · 8`, or 0 when the
+///   R1 snapshot is read in place (`ResidentMain::Dev`).
+/// - `fingerprint_bytes`: `I · n · 24`, alive from the fingerprint kernel to
+///   the end of the build.
+/// - `inverse_scratch_bytes`: the batch inverse's prefix, suffix and output
+///   (`math_cuda::inverse::batch_inverse_ext3_dev`), each `I · n · 24`; prefix
+///   and suffix die when it returns, the output survives as the reciprocals.
+/// - `terms_bytes`: `out · n · 24`; `scan_bytes`: row sum, scan output and the
+///   accumulated column, `3 · n · 24`; `aux_bytes`: the row-major aux buffer,
+///   `out · n · 24`.
+///
+/// The peak is one of two phases: the inverse (`main + 4 · fingerprints`) or
+/// the term/assemble phase (`main + 2 · fingerprints + terms + scan + aux`);
+/// [`AuxBuildDeviceSet::total`] is the larger. Descriptor arrays and block
+/// totals are kilobytes and not counted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AuxBuildDeviceSet {
+    pub main_bytes: u64,
+    pub fingerprint_bytes: u64,
+    pub inverse_scratch_bytes: u64,
+    pub terms_bytes: u64,
+    pub scan_bytes: u64,
+    pub aux_bytes: u64,
+}
+
+impl AuxBuildDeviceSet {
+    /// The inverse phase: main + fingerprints + prefix + suffix + reciprocals.
+    pub const fn inverse_phase(&self) -> u64 {
+        self.main_bytes
+            .saturating_add(self.fingerprint_bytes)
+            .saturating_add(self.inverse_scratch_bytes)
+    }
+
+    /// The term/assemble phase: main + fingerprints + reciprocals + terms +
+    /// scan + aux.
+    pub const fn term_phase(&self) -> u64 {
+        self.main_bytes
+            .saturating_add(self.fingerprint_bytes)
+            .saturating_add(self.fingerprint_bytes)
+            .saturating_add(self.terms_bytes)
+            .saturating_add(self.scan_bytes)
+            .saturating_add(self.aux_bytes)
+    }
+
+    /// The peak of the build: the larger phase.
+    pub const fn total(&self) -> u64 {
+        let inverse = self.inverse_phase();
+        let term = self.term_phase();
+        if inverse > term { inverse } else { term }
+    }
+}
+
+/// Size the resident aux build's device set: `n` trace rows, `main_cols` main
+/// columns, `num_interactions` bus interactions, `num_out_cols` term columns;
+/// `main_resident` is whether the main trace is read from the R1 snapshot
+/// (no upload).
+pub fn aux_build_device_set(
+    n: usize,
+    main_cols: usize,
+    num_interactions: usize,
+    num_out_cols: usize,
+    main_resident: bool,
+) -> AuxBuildDeviceSet {
+    let n = n as u64;
+    let fingerprints = ext3_bytes(n, num_interactions as u64);
+    AuxBuildDeviceSet {
+        main_bytes: if main_resident {
+            0
+        } else {
+            n.saturating_mul(main_cols as u64)
+                .saturating_mul(BASE_BYTES)
+        },
+        fingerprint_bytes: fingerprints,
+        inverse_scratch_bytes: fingerprints.saturating_mul(3),
+        terms_bytes: ext3_bytes(n, num_out_cols as u64),
+        scan_bytes: ext3_bytes(n, 3),
+        aux_bytes: ext3_bytes(n, num_out_cols as u64),
+    }
+}
+
 /// The shape the rounds-2–4 model takes: what the AIR and the domain fix
 /// before any device work starts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -164,7 +254,10 @@ pub fn table_device_set(shape: TableShape) -> TableDeviceSet {
         num_parts,
         num_eval_points,
     } = shape;
-    let main = commit_device_set(n, main_cols, blowup, true);
+    // The trace-domain snapshot has one consumer, the LogUp aux build, so
+    // the main commit keeps it exactly when the table has an aux trace
+    // (`IsAIR::has_aux_trace` is `trace_layout().1 != 0`, this field).
+    let main = commit_device_set(n, main_cols, blowup, aux_cols != 0);
     let (n, k, aux, parts) = (
         n as u64,
         num_eval_points as u64,
@@ -348,6 +441,54 @@ mod tests {
         assert_eq!(set.aux_bytes, 0);
         assert_eq!(set.composition_bytes, 0);
         assert!(set.deep_fri_bytes > 0);
+    }
+
+    /// LFM_BLAKE3 at q=41 (2^19 rows, 3,076 main columns, 1,261 interactions,
+    /// 631 term columns) — the shape the residency probe hit. Reading the R1
+    /// snapshot in place, the build's inverse phase alone is ~59 GiB, more
+    /// than twice the budget of a 32 GiB card; uploading the main trace
+    /// instead adds its 12.02 GiB on top. The old code allocated it unchecked.
+    #[test]
+    fn the_blake3_wrap_aux_build_does_not_fit_a_32_gib_card() {
+        let n = 1usize << 19;
+        let set = aux_build_device_set(n, 3076, 1261, 631, true);
+        let fp = (n as u64) * 1261 * 24;
+        assert_eq!(set.main_bytes, 0);
+        assert_eq!(set.fingerprint_bytes, fp);
+        assert_eq!(set.inverse_scratch_bytes, 3 * fp);
+        assert_eq!(set.inverse_phase(), 4 * fp);
+        assert!(set.inverse_phase() > set.term_phase());
+        assert_eq!(set.total(), set.inverse_phase());
+        assert!(set.total() > 2 * CARD_32_GIB_BUDGET, "{}", set.total());
+        assert!(matches!(
+            admit_bytes(usize::MAX, set.total(), 0, CARD_32_GIB_BUDGET),
+            Admission::OverBudget { .. }
+        ));
+        let uploaded = aux_build_device_set(n, 3076, 1261, 631, false);
+        assert_eq!(uploaded.main_bytes, (n as u64) * 3076 * 8);
+        assert_eq!(uploaded.total() - set.total(), uploaded.main_bytes);
+    }
+
+    /// The pinned wrap's hash chip (LFM_HASH under RPX: 2^20 rows, 329
+    /// committed columns, 13 aux columns → 26 interactions, 13 term columns)
+    /// builds its aux in under 3 GiB and is admitted on a 32 GiB card.
+    #[test]
+    fn the_rpx_hash_chip_aux_build_fits() {
+        let set = aux_build_device_set(1 << 20, 329, 26, 13, true);
+        assert!(set.total() < 3 * GIB, "{}", set.total());
+        assert!(admit_bytes(usize::MAX, set.total(), 0, CARD_32_GIB_BUDGET).is_admitted());
+    }
+
+    /// With few interactions per term column the term/assemble phase is the
+    /// larger one and `total` must report it.
+    #[test]
+    fn the_peak_is_whichever_phase_is_larger() {
+        // 2 interactions, 8 term columns: inverse = 4·fp = 8·n·24; term =
+        // 2·fp + terms + scan + aux = (4 + 8 + 3 + 8)·n·24.
+        let set = aux_build_device_set(1 << 10, 4, 2, 8, true);
+        assert!(set.term_phase() > set.inverse_phase());
+        assert_eq!(set.total(), set.term_phase());
+        assert_eq!(set.term_phase(), (1u64 << 10) * 23 * 24);
     }
 
     /// The aux commit has no snapshot; its ext3 columns count as three base
