@@ -775,9 +775,10 @@ impl Drop for VramPermit<'_> {
 
 /// Run `task` once per table index on `workers` OS driver threads, admitting
 /// each index through `gate` with its estimated bytes. `order` fixes the
-/// start order (heaviest table first, so the long pole starts early and small
-/// tables fill around it — the fixed chunks this replaces made every table
-/// wait for the slowest of its chunk). Returns one slot per original index.
+/// start order — the caller's walk: largest fused-phase host transient first
+/// (`device_set::host_transient_bytes`), so the long pole starts early and
+/// small tables fill around it, and so the host allocator sees the layout the
+/// measured-good walk produces. Returns one slot per original index.
 fn run_admitted<T: Send>(
     order: &[usize],
     estimates: &[u64],
@@ -3707,22 +3708,33 @@ pub trait IsStarkProver<
 
         let vram_gate = VramGate::new(vram_budget);
 
-        // R1 main commit: the fused commit's device set — one LDE buffer, the
-        // trace snapshot, the tree and the scratch — the same model the
-        // dispatch layer admits the commit against (`crate::device_set`).
-        let main_estimates: Vec<u64> = air_trace_pairs
+        // The shapes the AIR and the domain fix, read once: the device-set
+        // estimates the gate admits against and the host-transient key the
+        // walks are sorted by both derive from them (`crate::device_set`).
+        let table_shapes: Vec<crate::device_set::TableShape> = air_trace_pairs
             .iter()
             .enumerate()
-            .map(|(idx, (_, trace, _))| {
+            .map(|(idx, (air, trace, _))| {
                 let domain = &domains[idx];
-                crate::device_set::commit_device_set(
-                    domain.interpolation_domain_size,
-                    trace.num_main_columns,
-                    domain.blowup_factor,
-                    true,
-                )
-                .total()
+                let n = domain.interpolation_domain_size;
+                let (_, aux_cols) = air.trace_layout();
+                crate::device_set::TableShape {
+                    n,
+                    blowup: domain.blowup_factor,
+                    main_cols: trace.num_main_columns,
+                    aux_cols,
+                    num_parts: air.composition_poly_degree_bound(n) / n,
+                    num_eval_points: air.context().transition_offsets.len() * air.step_size(),
+                }
             })
+            .collect();
+
+        // R1 main commit: the fused commit's device set — one LDE buffer, the
+        // trace snapshot, the tree and the scratch — the same model the
+        // dispatch layer admits the commit against.
+        let main_estimates: Vec<u64> = table_shapes
+            .iter()
+            .map(|s| crate::device_set::commit_device_set(s.n, s.main_cols, s.blowup, true).total())
             .collect();
 
         // The AIR names, for the driver threads' panic payloads: a device abort
@@ -3731,6 +3743,29 @@ pub trait IsStarkProver<
             .iter()
             .map(|(air, _, _)| air.name().to_string())
             .collect();
+
+        // The walk order, for BOTH phases: largest fused-phase host transient
+        // first (`device_set::host_transient_bytes` — the measurement behind
+        // the choice is on its doc). Deliberately not the device-set estimate
+        // the gate uses: at `TABLE_PARALLELISM=1` the order moves nothing on
+        // the device and 5.9 GiB of host peak.
+        let walk_keys: Vec<u64> = table_shapes
+            .iter()
+            .map(|&s| crate::device_set::host_transient_bytes(s))
+            .collect();
+        let walk_order = heaviest_first(&walk_keys);
+        eprintln!(
+            "[prover] table walk (fused-phase host transient, largest first): {}",
+            walk_order
+                .iter()
+                .map(|&i| format!(
+                    "{}={:.2}GiB",
+                    table_names[i],
+                    walk_keys[i] as f64 / (1u64 << 30) as f64
+                ))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
 
         // Spill main traces to mmap before Round 1 LDE.
         #[cfg(feature = "disk-spill")]
@@ -3779,7 +3814,7 @@ pub trait IsStarkProver<
         // sequentially below once every commit completed — the one ordering
         // Fiat-Shamir requires before sampling the shared challenges.
         let main_results = run_admitted(
-            &heaviest_first(&main_estimates),
+            &walk_order,
             &main_estimates,
             &vram_gate,
             k,
@@ -3932,20 +3967,7 @@ pub trait IsStarkProver<
         let peak_estimates: Vec<u64> = air_trace_pairs
             .iter()
             .enumerate()
-            .map(|(idx, (air, trace, _))| {
-                let domain = &domains[idx];
-                let n = domain.interpolation_domain_size;
-                let (_, aux_cols) = air.trace_layout();
-                crate::device_set::table_device_set(crate::device_set::TableShape {
-                    n,
-                    blowup: domain.blowup_factor,
-                    main_cols: trace.num_main_columns,
-                    aux_cols,
-                    num_parts: air.composition_poly_degree_bound(n) / n,
-                    num_eval_points: air.context().transition_offsets.len() * air.step_size(),
-                })
-                .total()
-            })
+            .map(|(idx, _)| crate::device_set::table_device_set(table_shapes[idx]).total())
             .collect();
 
         // Per-table slots for the fused chain: each driver takes or locks only
@@ -4326,7 +4348,9 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         let __sp = crate::instruments::span("rounds_2to4");
 
-        let peak_order = heaviest_first(&peak_estimates);
+        // Same walk as R1 (see `walk_order`): the estimates below feed the gate,
+        // the order is the host policy.
+        let peak_order = walk_order.clone();
 
         // One fused task per table: while a heavy table works through a
         // host-bound stretch, the others' GPU stages fill the device. The
