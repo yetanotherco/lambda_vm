@@ -18,8 +18,6 @@
 pub mod airs;
 pub mod algebraic_commit;
 pub mod algebraic_transcript;
-pub mod batched_epoch;
-pub mod batched_epoch_verify;
 pub mod blake3;
 pub mod blake3_chip;
 pub mod blake3_socket;
