@@ -4421,9 +4421,9 @@ fn the_assembled_verifier_declares_exactly_the_shape_words() {
     let split_declared: usize = split.arena_schema.lens.iter().map(|l| *l as usize).sum();
     assert_eq!(
         split_declared,
-        expected_arena_words(&e, false) + 2,
-        "the split-cell control must declare exactly two surplus words, or it is \
-         not the forgery this guard claims to deny"
+        expected_arena_words(&e, false) + super::proof_arena::words_per_root(),
+        "the split-cell control must declare exactly one root's width of surplus \
+         words, or it is not the forgery this guard claims to deny"
     );
 }
 

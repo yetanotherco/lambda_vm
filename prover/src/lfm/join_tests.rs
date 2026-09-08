@@ -911,10 +911,11 @@ fn control_program_source(
                 .collect();
             let siblings: Vec<super::edsl::WrapDigest> = (0..shape.merkle_depth)
                 .map(|_| {
-                    let lo = b.hint_word(queries, cursor);
-                    let hi = b.hint_word(queries, cursor + 1);
-                    cursor += 2;
-                    super::edsl::WrapDigest::from_pair(lo, hi)
+                    // The stride follows THIS builder's digest width, as the
+                    // production emitter's does — not a literal two.
+                    let d = super::edsl::hint_digest(&mut b, queries, cursor);
+                    cursor += dw;
+                    d
                 })
                 .collect();
             GroupOpening { values, siblings }
