@@ -1,0 +1,17 @@
+{
+  "band": 4294968273,
+  "small_y_point": {
+    "x": "1fe1e5ef3fceb5c135ab7741333ce5a6e80d68167653f6b2b24bcbcfaaaff507",
+    "y": "0000000000000000000000000000000000000000000000000000000000000001"
+  },
+  "ecsm_instance": {
+    "k": 2,
+    "x_g": "f2e13fd883d5f5138e1658a6022391495df397acb9a83e861f6bf5181d6c4dbc",
+    "y_g": "264a2700355e78b1e2d5b19fc29ffddaec27243e405d318525f49effa3007229"
+  },
+  "expected": {
+    "x_r": "1fe1e5ef3fceb5c135ab7741333ce5a6e80d68167653f6b2b24bcbcfaaaff507",
+    "y_r": "0000000000000000000000000000000000000000000000000000000000000001"
+  },
+  "forged_y_r": "fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc30"
+}
