@@ -303,8 +303,8 @@ test-rust: compile-programs-rust
 # names a block. Outside this file the repoint touches only REAL_BLOCK_FIXTURE in
 # tooling/ethrex-tests, which points the usability screen at the block actually
 # being proven. The converter's own pins do NOT move — see below.
-# tooling/ethrex-block-converter/README.md carries the procedure and each candidate's
-# measured cost.
+# tooling/ethrex-fixtures/README.md carries what the workload costs and how to pick
+# the epoch size; the converter's README covers converting a cache by hand.
 ETHREX_REAL_BLOCK_NETWORK := mainnet
 ETHREX_REAL_BLOCK := 25368371
 # The fixture is GENERATED from the cache below, not fetched. ethrex 25's guest
@@ -362,8 +362,9 @@ define ensure_verified
 	if [ -z "$(1)" ]; then \
 		echo "$(4): $(5) is unset." >&2; \
 		echo "  The $(ETHREX_REAL_BLOCK_ID) $(4) is fetched, not built. Set $(5) in the" >&2; \
-		echo "  Makefile to wherever the artifact is hosted; see" >&2; \
-		echo "  tooling/ethrex-block-converter/README.md for how to produce and host one." >&2; \
+		echo "  Makefile to wherever it is hosted. The FIXTURE is not fetched at all -" >&2; \
+		echo "  it is built by 'make regen-real-block-fixture'; see" >&2; \
+		echo "  tooling/ethrex-fixtures/README.md." >&2; \
 		exit 1; \
 	fi; \
 	mkdir -p $(dir $(3)); \
@@ -391,7 +392,12 @@ endef
 # cargo build to the critical path.
 ethrex-real-block-fixture: $(ETHREX_REAL_BLOCK_FIXTURE)
 
-$(ETHREX_REAL_BLOCK_FIXTURE): ethrex-real-block-cache
+# No prerequisites on purpose. `ethrex-real-block-cache` is phony (so its digest is
+# re-checked on every call), and a phony prerequisite always reads as newer than its
+# target, which would rebuild the fixture on every single benchmark invocation. The
+# cache is fetched from inside `regen-real-block-fixture` instead, so this recipe runs
+# only when the file is genuinely missing.
+$(ETHREX_REAL_BLOCK_FIXTURE):
 	$(MAKE) regen-real-block-fixture
 
 ethrex-real-block-cache:

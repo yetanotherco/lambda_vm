@@ -131,10 +131,10 @@ jobs:
           cargo test --release -p executor test_ckzg -- --ignored
 
       # ethrex host-reference tests live in the detached `tooling/ethrex-tests`
-      # workspace (ethrex pins rkyv's `unaligned` feature, which must not
-      # feature-unify with the main workspace's aligned proof format), so run
-      # them from that directory to use its isolated Cargo.lock. The guest ELF
-      # and committed fixtures are already present from the steps above.
+      # workspace (the ethrex host dependency tree is heavy and pinned by rev in its
+      # own Cargo.lock, kept out of the main build), so run them from that directory
+      # to use that lockfile. The guest ELF and committed fixtures are already
+      # present from the steps above.
       # --include-ignored also runs the heavier synthetic-block test.
       #
       # `--skip test_ethrex_real_block` is a substring match, so it drops BOTH

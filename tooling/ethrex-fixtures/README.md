@@ -82,3 +82,25 @@ repository root has both sets measured side by side.
 
 Measured on the guest ELF at ethrex `2cb18b0b`: 20,360,647 cycles, 2,701 keccak
 calls, 116 ECSM calls.
+
+### Choosing the epoch size, and what the workload costs
+
+Measured on the bench runner (`vm-benchmarks-1`, 96 cores / 125 GB, idle) on
+2026-09-08, with the guest ELF at ethrex `2cb18b0b`:
+
+| epoch | wall | host RSS | proof |
+| ---: | ---: | ---: | ---: |
+| 2^21 | 78.54 s | 23.93 GiB | 683 MB |
+| **2^22** | **69.10 s** (mean of 10, sd 0.41 s, CV 0.59 %) | **35.75 GiB** | **466 MB** |
+| 2^23 | 63.93 s | 51.46 GiB | 378 MB |
+
+Verifying one 2^22 bundle takes 6.86 s. 2^22 is what `/bench`, `/bench-abba` and
+the GPU bench pin: 2^23 buys 7.5 % of wall but leaves little margin against the
+runner's 64 GiB floor, and 2^21 pays 13.7 % to save memory nobody needs.
+
+With that sd, a two-sided 95 % comparison resolves ~2.08 % at three runs per
+side, ~1.04 % at five and ~0.60 % at ten — which is why a sub-2 % claim needs
+`/bench N` or the ABBA tiebreaker rather than a re-read of a three-run table.
+
+Continuations are not optional here: monolithic proving costs ~4.9 GB of peak
+heap per million cycles on this family, so 20.36M cycles would need ~100 GB.
