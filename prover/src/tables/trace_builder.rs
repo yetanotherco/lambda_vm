@@ -2919,9 +2919,10 @@ struct CollectedOps {
     hint_ops: Vec<hint::HintOperation>,
 }
 
-/// Chunk raw ops and generate one trace table per chunk. When `storage_mode`
-/// is `Disk`, each chunk's main table is spilled to mmap before the next chunk
-/// is built so peak heap usage stays bounded.
+/// Chunk raw ops and generate one trace table per chunk, padding an empty `ops`
+/// to a single chunk so the table is always present in the proof.
+///
+/// For tables that may be omitted entirely, use [`chunk_and_generate_optional`].
 fn chunk_and_generate<T: Sync>(
     ops: &[T],
     max_rows: usize,
@@ -2933,6 +2934,46 @@ fn chunk_and_generate<T: Sync>(
     } else {
         ops.chunks(max_rows).collect()
     };
+    generate_chunks(
+        op_chunks,
+        generate,
+        #[cfg(feature = "disk-spill")]
+        storage_mode,
+    )
+}
+
+/// Like [`chunk_and_generate`], but an empty `ops` yields no table at all: the
+/// chip is left out of the proof instead of costing a padded sub-proof.
+/// `slice::chunks` already yields nothing for an empty slice, so this is the
+/// plain chunking with no special case.
+///
+/// Sound because a chip contributes to the run only through its LogUp bus, and a
+/// chip with no rows contributes zero. A prover that omits a table whose ops did
+/// execute leaves its counterparty's sends unmatched, and the bus-balance check
+/// over the tables that *are* present rejects the proof. See
+/// `TableCounts::validate`.
+fn chunk_and_generate_optional<T: Sync>(
+    ops: &[T],
+    max_rows: usize,
+    generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension> + Send + Sync,
+    #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
+) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
+    generate_chunks(
+        ops.chunks(max_rows).collect(),
+        generate,
+        #[cfg(feature = "disk-spill")]
+        storage_mode,
+    )
+}
+
+/// Generate one trace table per already-chunked op slice. When `storage_mode` is
+/// `Disk`, each chunk's main table is spilled to mmap before the next chunk is
+/// built so peak heap usage stays bounded.
+fn generate_chunks<T: Sync>(
+    op_chunks: Vec<&[T]>,
+    generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension> + Send + Sync,
+    #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
+) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
     // Disk mode generates one chunk at a time so each spills before the next
     // allocates, keeping trace memory bounded.
     #[cfg(feature = "disk-spill")]
@@ -3363,7 +3404,7 @@ fn build_traces<I: ImageSource + Sync>(
         )
     };
     let gen_memws = || {
-        chunk_and_generate(
+        chunk_and_generate_optional(
             &memw_ops,
             max_rows.memw,
             memw::generate_memw_trace,
@@ -3372,7 +3413,7 @@ fn build_traces<I: ImageSource + Sync>(
         )
     };
     let gen_memw_aligneds = || {
-        chunk_and_generate(
+        chunk_and_generate_optional(
             &memw_aligned_ops,
             max_rows.memw_aligned,
             memw_aligned::generate_memw_aligned_trace,
@@ -3392,7 +3433,7 @@ fn build_traces<I: ImageSource + Sync>(
         )
     };
     let gen_loads = || {
-        chunk_and_generate(
+        chunk_and_generate_optional(
             &load_ops,
             max_rows.load,
             load::generate_load_trace,
@@ -3401,7 +3442,7 @@ fn build_traces<I: ImageSource + Sync>(
         )
     };
     let gen_lts = || {
-        chunk_and_generate(
+        chunk_and_generate_optional(
             &lt_ops,
             max_rows.lt,
             lt::generate_lt_trace,
@@ -3410,7 +3451,7 @@ fn build_traces<I: ImageSource + Sync>(
         )
     };
     let gen_shifts = || {
-        chunk_and_generate(
+        chunk_and_generate_optional(
             &shift_ops,
             max_rows.shift,
             shift::generate_shift_trace,
@@ -3419,7 +3460,7 @@ fn build_traces<I: ImageSource + Sync>(
         )
     };
     let gen_muls = || {
-        chunk_and_generate(
+        chunk_and_generate_optional(
             &mul_ops,
             max_rows.mul,
             mul::generate_mul_trace,
@@ -3428,7 +3469,7 @@ fn build_traces<I: ImageSource + Sync>(
         )
     };
     let gen_dvrms = || {
-        chunk_and_generate(
+        chunk_and_generate_optional(
             &dvrm_ops,
             max_rows.dvrm,
             dvrm::generate_dvrm_trace,
@@ -3437,7 +3478,7 @@ fn build_traces<I: ImageSource + Sync>(
         )
     };
     let gen_branches = || {
-        chunk_and_generate(
+        chunk_and_generate_optional(
             &branch_ops,
             max_rows.branch,
             branch::generate_branch_trace,
@@ -3445,11 +3486,10 @@ fn build_traces<I: ImageSource + Sync>(
             storage_mode,
         )
     };
-    // Auxiliary ALU / memory / CPU32 dispatch chips. Not yet driven by the CPU
-    // dispatch, so they are generated empty — one padded (μ=0) chunk each, which
-    // contributes nothing to any bus.
+    // Auxiliary ALU / memory / CPU32 dispatch chips, each filtered out of the CPU
+    // ops above.
     let gen_eqs = || {
-        chunk_and_generate::<eq::EqOperation>(
+        chunk_and_generate_optional::<eq::EqOperation>(
             &eq_ops,
             max_rows.eq,
             eq::generate_eq_trace,
@@ -3458,7 +3498,7 @@ fn build_traces<I: ImageSource + Sync>(
         )
     };
     let gen_bytewises = || {
-        chunk_and_generate::<bytewise::BytewiseOperation>(
+        chunk_and_generate_optional::<bytewise::BytewiseOperation>(
             &bytewise_ops,
             max_rows.bytewise,
             bytewise::generate_bytewise_trace,
@@ -3467,7 +3507,7 @@ fn build_traces<I: ImageSource + Sync>(
         )
     };
     let gen_stores = || {
-        chunk_and_generate::<store::StoreOperation>(
+        chunk_and_generate_optional::<store::StoreOperation>(
             &store_ops,
             max_rows.store,
             store::generate_store_trace,
@@ -3476,7 +3516,7 @@ fn build_traces<I: ImageSource + Sync>(
         )
     };
     let gen_cpu32s = || {
-        chunk_and_generate::<cpu32::Cpu32Operation>(
+        chunk_and_generate_optional::<cpu32::Cpu32Operation>(
             &cpu32_ops,
             max_rows.cpu32,
             cpu32::generate_cpu32_trace,
@@ -3730,14 +3770,19 @@ fn build_traces<I: ImageSource + Sync>(
     })
 }
 
-/// Padded row count after chunking.
+/// Padded row count after chunking, for a table that is always present: an
+/// empty op list still allocates one 4-row padded chunk.
 #[cfg(feature = "disk-spill")]
 fn padded_chunked_rows(ops_count: usize, max_rows: usize) -> u64 {
+    padded_chunked_rows_optional(ops_count, max_rows).max(4)
+}
+
+/// Padded row count after chunking, for a table left out of the proof when
+/// unused. Mirrors [`chunk_and_generate_optional`]: no ops, no rows.
+#[cfg(feature = "disk-spill")]
+fn padded_chunked_rows_optional(ops_count: usize, max_rows: usize) -> u64 {
     // `max_rows <= 0` would loop forever. Called internally with const values > 0.
     assert!(max_rows > 0, "max_rows must be positive");
-    if ops_count == 0 {
-        return 4; // empty-chunk tables still allocate one 4-row padded chunk
-    }
     let mut total: u64 = 0;
     let mut remaining = ops_count;
     while remaining > 0 {
@@ -3958,15 +4003,18 @@ pub fn count_table_lengths(
 
     Ok(TableLengths {
         cpu_padded_rows: padded_chunked_rows(cpu_count, max_rows.cpu),
-        memw_padded_rows: padded_chunked_rows(memw_count, max_rows.memw),
-        memw_aligned_padded_rows: padded_chunked_rows(memw_aligned_count, max_rows.memw_aligned),
+        memw_padded_rows: padded_chunked_rows_optional(memw_count, max_rows.memw),
+        memw_aligned_padded_rows: padded_chunked_rows_optional(
+            memw_aligned_count,
+            max_rows.memw_aligned,
+        ),
         memw_register_padded_rows: padded_chunked_rows(memw_register_count, max_rows.memw_register),
-        load_padded_rows: padded_chunked_rows(load_count, max_rows.load),
-        lt_padded_rows: padded_chunked_rows(lt_count, max_rows.lt),
-        shift_padded_rows: padded_chunked_rows(shift_count, max_rows.shift),
-        mul_padded_rows: padded_chunked_rows(mul_count, max_rows.mul),
-        dvrm_padded_rows: padded_chunked_rows(dvrm_count, max_rows.dvrm),
-        branch_padded_rows: padded_chunked_rows(branch_count, max_rows.branch),
+        load_padded_rows: padded_chunked_rows_optional(load_count, max_rows.load),
+        lt_padded_rows: padded_chunked_rows_optional(lt_count, max_rows.lt),
+        shift_padded_rows: padded_chunked_rows_optional(shift_count, max_rows.shift),
+        mul_padded_rows: padded_chunked_rows_optional(mul_count, max_rows.mul),
+        dvrm_padded_rows: padded_chunked_rows_optional(dvrm_count, max_rows.dvrm),
+        branch_padded_rows: padded_chunked_rows_optional(branch_count, max_rows.branch),
         commit_padded_rows: commit_count
             .checked_next_power_of_two()
             .unwrap_or(usize::MAX)

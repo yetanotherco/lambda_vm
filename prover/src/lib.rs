@@ -125,31 +125,29 @@ impl TableCounts {
             + self.cpu32
     }
 
-    /// Validate that all required tables have at least one chunk.
+    /// Validate that the structurally-required tables have at least one chunk.
     ///
-    /// A zero count for any table would remove its constraints from verification,
-    /// allowing a malicious prover to bypass soundness checks.
+    /// CPU drives the run and MEMW_R carries the register file, so a proof
+    /// without them describes no execution at all and is rejected here.
+    ///
+    /// Every other chip is allowed a zero count: an epoch that runs no
+    /// multiplication has no MUL table, and paying a padded sub-proof for it
+    /// costs a full commitment, FRI chain and OOD opening set.
+    ///
+    /// What keeps a zero count honest is the LogUp bus, not this check. A chip
+    /// influences the run only through its bus interactions, and no chip carries
+    /// boundary constraints of its own, so a chip with no rows contributes zero
+    /// to the bus and removing it changes nothing. A prover that omits a table
+    /// whose operations *did* execute leaves the CPU's sends unmatched, and the
+    /// bus-balance check — summed over the tables that are present — rejects the
+    /// proof. That argument needs each omitted table to be a bus participant;
+    /// `every_table_participates_in_the_bus` pins it down for the whole AIR set.
     pub fn validate(&self) -> Result<(), Error> {
-        let checks = [
-            ("cpu", self.cpu),
-            ("lt", self.lt),
-            ("memw", self.memw),
-            ("memw_aligned", self.memw_aligned),
-            ("load", self.load),
-            ("mul", self.mul),
-            ("dvrm", self.dvrm),
-            ("shift", self.shift),
-            ("branch", self.branch),
-            ("memw_register", self.memw_register),
-            ("eq", self.eq),
-            ("bytewise", self.bytewise),
-            ("store", self.store),
-            ("cpu32", self.cpu32),
-        ];
-        for (name, count) in checks {
+        let required = [("cpu", self.cpu), ("memw_register", self.memw_register)];
+        for (name, count) in required {
             if count == 0 {
                 return Err(Error::InvalidTableCounts(format!(
-                    "{name} count is 0 — every table must have at least 1 chunk"
+                    "{name} count is 0 — required table must have at least 1 chunk"
                 )));
             }
         }
