@@ -1,40 +1,10 @@
-//! The evaluation argument, end to end: proving `f(z) = y` about a *committed*
-//! polynomial.
+//! Proving `f(z) = y` about a committed polynomial, which is what settles the
+//! residual claims the other arguments hand back.
 //!
-//! Every argument built so far ends by handing back a claim it cannot settle —
-//! [`zerocheck`](crate::zerocheck) says "`C` must take this value at this
-//! point", [`gkr`](crate::gkr) says the same about its input layer. This is what
-//! settles them, and it is the piece that makes the rest mean anything: without
-//! it a prover can answer any residual claim with whatever number closes the
-//! proof.
+//! The sumcheck on `Σ_x eq(z, x)·f(x) = y` produces the folding randomness; the
+//! fully folded codeword is the constant `f(α)`. Both must name the same value.
 //!
-//! # The wire
-//!
-//! Proving `f(z) = y` runs a sumcheck on
-//!
-//! ```text
-//! Σ_x eq(z, x)·f(x) = y
-//! ```
-//!
-//! whose round challenges `α` bind `f`'s variables one at a time. The prover
-//! folds the **committed codeword** with those same `α`. Folding every variable
-//! leaves a constant codeword, and that constant is `f(α)`.
-//!
-//! So two independent computations must agree on `f(α)`:
-//!
-//! - the sumcheck's residual claim, which is `expected / eq(z, α)`;
-//! - the folded codeword, spot-checked against the commitment by opening blocks.
-//!
-//! A prover who lies about `y` fails the first; one who lies about the codeword
-//! fails the second; one who lies about both has to make them collide.
-//!
-//! # Scope
-//!
-//! One round, folding all the way down. Real WHIR folds `k` variables at a time
-//! over several rounds, committing an intermediate codeword each time — that
-//! keeps blocks small, since here a block is the whole message. Chaining rounds
-//! is the next step and [`whir_round`](crate::whir_round) already does one link
-//! of it. Out-of-domain sampling and grinding are also still absent.
+//! One round, folding all the way down, so a block is the whole message.
 
 use crypto::fiat_shamir::is_transcript::IsTranscript;
 use math::{

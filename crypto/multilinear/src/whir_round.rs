@@ -1,31 +1,8 @@
-//! One WHIR round, assembled: sample queries, open, fold locally, compare.
+//! One WHIR round: sample queries, open the current codeword's blocks, fold them
+//! locally, and check they match the committed successor.
 //!
-//! The pieces built so far each hold up on their own. This is where they start
-//! rejecting things together.
-//!
-//! A round carries a codeword and its successor, related by folding with the
-//! randomness `α` that the sumcheck produced. The verifier cannot recompute the
-//! fold — it never sees a whole codeword — so instead it spot-checks:
-//!
-//! 1. sample query positions from the transcript,
-//! 2. open the block of the current codeword that folds onto each,
-//! 3. fold that block locally ([`fold_coset`]),
-//! 4. open the successor codeword at the same position and check the two agree.
-//!
-//! Step 4 is what a lying prover cannot fake without breaking a Merkle
-//! commitment: the successor is committed before the queries are drawn, so it
-//! cannot be chosen to match.
-//!
-//! # What a round does not establish
-//!
-//! Consistency is checked only where the queries land, so a codeword that
-//! disagrees with the fold in few places survives with probability decreasing
-//! in the query count. Turning that into a security level is the job of the
-//! parameters — out of scope here, and the reason
-//! [`RoundConfig::num_queries`] is a knob rather than a constant.
-//!
-//! Also absent: the out-of-domain sample and the proof-of-work grinding that a
-//! full round interleaves with these steps.
+//! The successor is committed before the queries are drawn, so it cannot be
+//! chosen to match. Consistency holds only where the queries land.
 
 use crypto::fiat_shamir::is_transcript::IsTranscript;
 use math::{

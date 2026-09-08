@@ -1,20 +1,7 @@
-//! ZeroCheck: proving a polynomial vanishes on the whole hypercube.
+//! `f` vanishes on the whole hypercube, via `Σ_x eq(r, x)·f(x) = 0`.
 //!
-//! This is the multilinear replacement for our quotient argument. Today an AIR
-//! constraint `C` is shown to vanish on every row by dividing by the zerofier;
-//! here the verifier draws a random `r` and the prover shows
-//!
-//! ```text
-//! Σ_{x ∈ {0,1}^n} eq(r, x)·C(x) = 0
-//! ```
-//!
-//! via [`sumcheck`](crate::sumcheck). If `C` is zero on the cube the sum is
-//! zero for every `r`; if `C` is nonzero anywhere, the sum is a nonzero
-//! multilinear polynomial in `r` and vanishes only on a negligible fraction of
-//! the field, which is where the soundness comes from.
-//!
-//! `eq` enters as one more factor, so the round polynomials go up by one degree
-//! relative to `C` alone.
+//! The multilinear replacement for a quotient argument. `eq` adds one degree.
+//! The residual claim about `f` is returned, not decided.
 
 use crypto::fiat_shamir::is_transcript::IsTranscript;
 use math::field::{element::FieldElement, traits::IsField};

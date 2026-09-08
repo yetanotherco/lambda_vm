@@ -1,25 +1,12 @@
-//! Emits a trace-shape profile in the segment-profile JSONL format an external
-//! multilinear prover's benchmark harness consumes.
+//! Emits a per-proof trace-shape profile as JSONL — heights, widths, constraint
+//! and interaction counts, never trace values. One line per proof; a
+//! continuation epoch maps onto one line.
 //!
-//! The profile describes only the *shape* of each AIR — height, widths,
-//! constraint and interaction counts — never trace values. That harness replays
-//! such a profile by synthesizing cost-faithful AIRs from these numbers, which
-//! prices our workload under another proof system without porting an AIR or
-//! changing fields.
-//!
-//! One JSONL line per proof; a continuation epoch maps onto their "segment".
-//!
-//! Four places where our model and theirs do not line up exactly. All four are
-//! shape-only and do not affect the prover-cost dimensions being measured:
-//!
-//! 1. `count_weight` is a LogUp soundness parameter we do not have; emitted as 1.
-//! 2. Our `bus_id` is a sparse `u64`; theirs is a `u16` index. Ids are remapped
-//!    to a dense range, preserving which interactions share a bus.
-//! 3. Our [`BusInteraction::num_bus_elements`] counts the bus id as the first
-//!    element; their `interaction_message_lens` counts only the message fields,
-//!    so we emit one less.
-//! 4. We have no cached-main partitions; preprocessed columns are reported in
-//!    `preprocessed` and `cached_mains` is always empty.
+//! Four deliberate mismatches with the consumer's model, none of which affect
+//! the prover-cost dimensions being measured: `count_weight` is emitted as 1;
+//! bus ids are remapped to a dense `u16` range; message lengths drop our leading
+//! bus-id element; and preprocessed columns are reported in `preprocessed`, with
+//! `cached_mains` always empty.
 
 use std::collections::HashMap;
 
@@ -226,11 +213,9 @@ pub const PROFILE_PATH_ENV: &str = "LAMBDA_VM_SHAPE_PROFILE";
 /// a bus id keeps one index across segments and each proof gets its own line.
 static CAPTURE_STATE: std::sync::Mutex<Option<(BusIndexMap, usize)>> = std::sync::Mutex::new(None);
 
-/// Appends one segment line for this proof, if `LAMBDA_VM_SHAPE_PROFILE` is set.
+/// Appends one line for this proof, if `LAMBDA_VM_SHAPE_PROFILE` is set.
 ///
-/// Called immediately before proving, with the same AIRs and heights the prover
-/// is about to consume. A capture failure is reported and ignored: profiling
-/// must never take down a proof.
+/// A capture failure is logged and ignored: profiling must never fail a proof.
 pub fn capture<'a, A>(airs: impl IntoIterator<Item = (&'a A, usize)>)
 where
     A: AIR + ?Sized + 'a,

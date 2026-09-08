@@ -1,51 +1,8 @@
-//! Multilinear machinery for a sumcheck-based proof system.
+//! Multilinear machinery for a sumcheck-based proof system: extensions over the
+//! Boolean hypercube, sumcheck, zerocheck, LogUp-GKR, stacking and WHIR.
 //!
-//! Our STARK proves an AIR constraint `C` by *dividing*: the trace columns are
-//! univariate polynomials over a multiplicative subgroup, and `C` vanishing on
-//! every row is shown via the quotient `C / Z`. This crate is the other
-//! formulation: a trace of `2^n` rows is a function on the Boolean hypercube
-//! `{0,1}^n`, and `C` vanishing on every row is shown by [`zerocheck`], which
-//! reduces to a [`sumcheck`] — no division, no zerofier, no blown-up domain.
-//!
-//! Layout of the pieces:
-//!
-//! - [`mle`]: a multilinear extension, stored as its `2^n` hypercube evaluations.
-//! - [`eq`]: the equality polynomial `eq(r, x)`, the kernel every zerocheck needs.
-//! - [`poly`]: what sumcheck needs from a polynomial — factors plus a combine
-//!   rule. Keeps an AIR's constraint DAG out of expanded form.
-//! - [`virtual_poly`]: a sum of products of MLEs — one implementation of that.
-//! - [`selector`]: which steps a constraint applies to, for the transition
-//!   constraints that must skip the wrap-around step.
-//! - [`gkr`]: LogUp as a tree of fractions, replacing the committed
-//!   running-sum columns.
-//! - [`stacking`]: packing tables of different heights into shared cubes, so
-//!   the commitment count stops tracking the table count.
-//! - [`sumcheck`]: the interactive proof that `Σ_x f(x)` equals a claimed value.
-//! - [`zerocheck`]: `f` vanishes on the whole hypercube, via `sumcheck`.
-//!
-//! Everything is generic over the field. In this VM the intended instantiation
-//! is Goldilocks for trace values and its degree-3 extension for challenges.
-//!
-//! - [`uni_skip`]: the prism `D × {0,1}^n`, for running the first rounds over a
-//!   subgroup instead of the cube.
-//! - [`whir`]: encoding a multilinear as a Reed–Solomon codeword and folding it
-//!   in step with the sumcheck.
-//! - [`whir_commit`]: committing that codeword and opening the blocks a query
-//!   asks for.
-//! - [`whir_round`]: one round assembled — sample queries, open, fold locally,
-//!   and reject a successor that is not the fold.
-//! - [`whir_eval`]: the evaluation argument end to end, which is what settles
-//!   the residual claims the other arguments hand back.
-//! - [`constraint_argument`]: zerocheck plus `whir_eval`, so a **committed**
-//!   trace can be shown to satisfy a constraint.
-//!
-//! ## Not yet here
-//!
-//! - The base-field optimization: evaluations start in the base field and only
-//!   become extension elements after the first fold. The API does not preclude
-//!   it, but every polynomial currently lives in one field.
-//! - Wiring the univariate skip into `sumcheck`. The prism geometry it needs is
-//!   in [`uni_skip`]; the rounds still run over the cube.
+//! Not wired into the prover. The codeword domain is a two-adic subgroup of the
+//! base field, so extension-valued columns need the field tower generalized.
 
 pub mod constraint_argument;
 pub mod eq;

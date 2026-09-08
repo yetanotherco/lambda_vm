@@ -1,10 +1,5 @@
-//! The equality polynomial `eq(r, x)`.
-//!
-//! `eq(r, x) = Π_i (r_i·x_i + (1 - r_i)(1 - x_i))`.
-//!
-//! On the hypercube it is the indicator of `x == r`, and as a multilinear
-//! extension it is the kernel that turns "vanishes everywhere" into a single
-//! sum: a zerocheck at a random `r` sums `eq(r, x)·f(x)` over the cube.
+//! The equality kernel `eq(r, x) = ∏_i (r_i·x_i + (1 - r_i)(1 - x_i))` and the
+//! cyclic rotation kernel, `rot(x, y) = 1` iff `index(y) = index(x) + 1 mod 2^n`.
 
 use math::field::{element::FieldElement, traits::IsField};
 
@@ -54,22 +49,10 @@ pub fn eq_eval<F: IsField>(
     }))
 }
 
-/// The cyclic rotation kernel, as a multilinear polynomial in both arguments.
+/// `rot` and `eq` together; the recursion needs both.
 ///
-/// `rot(x, y)` is one exactly when `index(y) = index(x) + 1 mod 2^n`, so it is
-/// the kernel that relates a column to the shifted table a `next`-step read
-/// needs:
-///
-/// ```text
-/// next_f(z) = Σ_y rot(z, y)·f(y)
-/// ```
-///
-/// That identity is what a commitment scheme uses to bind a rotated table to
-/// the committed column instead of trusting the prover to have shifted it
-/// honestly.
-///
-/// Returned together with `eq` because the recursion needs both: rotating the
-/// suffix only carries into a higher bit when the suffix wrapped.
+/// `next_f(z) = Σ_y rot(z, y)·f(y)`, which is how a rotated table gets bound to
+/// the committed column.
 pub fn eq_and_rot_eval<F: IsField>(
     x: &[FieldElement<F>],
     y: &[FieldElement<F>],

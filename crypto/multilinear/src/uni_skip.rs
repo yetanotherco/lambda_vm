@@ -1,21 +1,6 @@
-//! The univariate skip: running the first variables over a subgroup instead of
-//! `{0,1}`.
-//!
-//! Sumcheck over a small field pays for its early rounds — the round
-//! polynomials are cheap but the soundness they buy is bounded by the field
-//! size. The skip replaces the first `l_skip` Boolean variables with a single
-//! variable ranging over `D`, the multiplicative subgroup of order `2^l_skip`.
-//! The domain stops being a hypercube and becomes a **prism** `D × {0,1}^n`.
-//!
-//! Everything that indexes the cube then needs a companion that indexes `D`:
-//!
-//! | cube | prism |
-//! |---|---|
-//! | [`eq_eval`](crate::eq::eq_eval) | [`eq_uni`] on the first coordinate |
-//! | [`rot_eval`](crate::eq::rot_eval) | [`rot_kernel_prism`] |
-//!
-//! `eq_D` is the Lagrange kernel on `D`: one when both arguments are the same
-//! element of `D`, zero on distinct ones, and the natural extension elsewhere.
+//! The univariate skip: the first `l_skip` Boolean variables become one variable
+//! ranging over `D`, the multiplicative subgroup of order `2^l_skip`, so the
+//! domain is a prism `D × {0,1}^n`. `eq_D` is the Lagrange kernel on `D`.
 
 use math::field::{
     element::FieldElement,
@@ -42,14 +27,8 @@ fn inv_two_pow<F: IsField>(l_skip: usize) -> FieldElement<F> {
     (0..l_skip).fold(FieldElement::<F>::one(), |acc, _| acc * &half)
 }
 
-/// The Lagrange kernel on `D`, the subgroup of order `2^l_skip`.
-///
-/// ```text
-/// eq_D(x, y) = 2^{-l_skip} · ∏_i [ (x^{2^i} + y^{2^i})·(…) + (x^{2^i} − 1)(y^{2^i} − 1) ]
-/// ```
-///
-/// evaluated by the recurrence below. On `D × D` it is the indicator of
-/// equality, which is what makes it the univariate analogue of `eq`.
+/// The Lagrange kernel on `D`, the subgroup of order `2^l_skip`. On `D × D` it
+/// is the equality indicator.
 pub fn eq_uni<F: IsField>(
     l_skip: usize,
     x: &FieldElement<F>,
@@ -152,13 +131,8 @@ pub fn mobius_eq_eval<F: IsField>(
     }))
 }
 
-/// The rotation kernel on the prism.
-///
-/// Inside `D` a step is a multiplication by `ω`; only when the univariate
-/// coordinate is at the end of `D` does the step carry into the cube
-/// coordinates. That is what the second term corrects.
-///
-/// `omega` must generate `D`, the subgroup of order `2^l_skip`.
+/// The rotation kernel on the prism. A step inside `D` multiplies by `ω`; only
+/// at the end of `D` does it carry into the cube. `omega` must generate `D`.
 pub fn rot_kernel_prism<F: IsField>(
     l_skip: usize,
     omega: &FieldElement<F>,

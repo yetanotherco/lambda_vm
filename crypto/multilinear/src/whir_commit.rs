@@ -1,28 +1,7 @@
-//! Committing a WHIR codeword, and opening it where the verifier asks.
+//! Committing a codeword by fold blocks, so each query is one Merkle opening.
 //!
-//! Folding by `2^k` maps a block of `2^k` codeword positions onto one position
-//! of the folded codeword. Committing to those blocks as **leaves** — rather
-//! than to individual values — makes each query a single Merkle opening,
-//! whatever `k` is.
-//!
-//! Which positions form a block follows from the fold. One fold pairs `j` with
-//! `j + N/2`; two folds pair those pairs; after `k` folds the pre-image of
-//! folded index `j` is
-//!
-//! ```text
-//! { j, j + N/2^k, j + 2·N/2^k, …, j + (2^k − 1)·N/2^k }
-//! ```
-//!
-//! a stride-`N/2^k` coset. [`coset_of`] builds it, [`fold_coset`] collapses one
-//! back down, and `folding_a_coset_matches_folding_the_whole_codeword` is the
-//! test that the local computation the verifier does agrees with the global one
-//! the prover did.
-//!
-//! # What this does not decide
-//!
-//! Nothing here judges whether a codeword is close to the code. It provides the
-//! openings; the proximity argument is the query phase built on top, which
-//! samples indices, folds the openings, and compares against the running claim.
+//! The pre-image of folded index `j` is the stride-`N/2^k` coset
+//! `{ j, j + N/2^k, …, j + (2^k - 1)·N/2^k }`.
 
 use crypto::merkle_tree::{
     backends::types::BatchKeccak256Backend, merkle::MerkleTree, proof::Proof,
@@ -42,7 +21,7 @@ pub type Commitment = [u8; 32];
 type Backend<F> = BatchKeccak256Backend<F>;
 type Tree<F> = MerkleTree<Backend<F>>;
 
-/// A committed codeword, together with the tree needed to open it.
+/// A committed codeword and the tree needed to open it.
 pub struct CodewordCommitment<F: IsField>
 where
     FieldElement<F>: AsBytes + Sync + Send,

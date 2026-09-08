@@ -1,20 +1,6 @@
-//! What sumcheck needs from the polynomial it is summing.
-//!
-//! Sumcheck never needs a polynomial in expanded form. Each round it evaluates
-//! the polynomial at `degree + 1` points along the variable being bound, for
-//! every remaining hypercube index, then folds. So the interface is: hand over
-//! the underlying multilinear factors, say how to *combine* their values into
-//! the polynomial's value, and declare the degree.
-//!
-//! This matters for real AIRs. A constraint arrives as a DAG of adds and
-//! multiplies over column reads; distributing it into a sum of monomials is
-//! exponential in the nesting depth — `(a+b)(c+d)(e+f)…` is `2^k` terms, and
-//! our larger tables carry DAGs of 16–25k nodes. Evaluating the DAG on the
-//! extended values costs one pass instead.
-//!
-//! [`VirtualPolynomial`](crate::virtual_poly::VirtualPolynomial) is the
-//! sum-of-products implementation; an IR-backed one lives with the AIR that
-//! produced the DAG.
+//! What sumcheck needs from a polynomial: its multilinear factors plus a rule
+//! for combining their values. Keeps a constraint DAG out of expanded form,
+//! which would be exponential in the nesting depth.
 
 use math::field::{element::FieldElement, traits::IsField};
 
@@ -67,12 +53,8 @@ pub trait SumcheckPolynomial<F: IsField> {
     }
 }
 
-/// Factors plus a closure that combines them.
-///
-/// The closure is the *shape* of the constraint and holds no trace data, so the
-/// verifier can carry the same one and apply it to values it learned from the
-/// commitment scheme. That split — data on one side, structure on both — is
-/// what lets a constraint argument be checked without the trace.
+/// Factors plus a closure that combines them. The closure holds no trace data,
+/// so the verifier can carry the same one.
 pub struct Composed<F: IsField, C> {
     polys: Vec<Mle<F>>,
     combine: C,

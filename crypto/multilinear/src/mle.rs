@@ -1,9 +1,7 @@
-//! Multilinear extensions over the Boolean hypercube.
+//! Multilinear extensions, held as their `2^n` hypercube evaluations.
 //!
-//! An MLE on `n` variables is stored as its `2^n` evaluations on `{0,1}^n`.
-//! Index `i` holds the evaluation at the bit pattern of `i` read with
-//! **variable 0 as the most significant bit**, so fixing variable 0 splits the
-//! table in half. Every fold in this crate assumes that convention.
+//! Index `i` is read with **variable 0 as the most significant bit**. Every
+//! fold in this crate assumes that.
 
 use math::field::{element::FieldElement, traits::IsField};
 

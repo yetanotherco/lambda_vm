@@ -1,38 +1,8 @@
-//! The algebraic core of WHIR: encoding a multilinear as a Reed–Solomon
-//! codeword, and folding that codeword in step with the sumcheck.
+//! Encoding a multilinear as a Reed-Solomon codeword, and folding it.
 //!
-//! WHIR proves an evaluation claim about a multilinear by testing that its
-//! Reed–Solomon encoding is close to the code, folding both sides down together
-//! until what is left is small enough to send. The whole thing rests on one
-//! identity:
-//!
-//! > **folding the codeword with `α` encodes the polynomial with its last
-//! > variable fixed to `α`.**
-//!
-//! Sumcheck binds a variable; folding shrinks the codeword; the identity is
-//! what keeps them talking about the same object. [`fold_codeword`] and
-//! [`Mle::fix_last_variable_in_place`] are the two sides, and
-//! `folding_commutes_with_fixing_a_variable` is the test that pins them
-//! together.
-//!
-//! # The two representations
-//!
-//! A multilinear on `m` variables is stored by its `2^m` hypercube evaluations.
-//! Its **univariate lift** is the polynomial whose coefficients are the
-//! multilinear's monomial coefficients, read in the same index order:
-//!
-//! ```text
-//! f(x₀..x_{m-1})  ↔  F(X) = Σ_S ĉ_S · X^{index(S)}
-//! ```
-//!
-//! so the last variable is the low bit of the index — the parity `F(X) =
-//! F₀(X²) + X·F₁(X²)` splits on. [`monomial_coefficients`] moves between them.
-//!
-//! # Not here yet
-//!
-//! The commitment layer: Merkle-committing each codeword, the query phase, the
-//! out-of-domain sample, and the proof-of-work grinding. This is the algebra
-//! those are built on.
+//! The identity everything rests on: folding the codeword with `α` encodes the
+//! polynomial with one variable fixed to `α`. [`lift_coefficients`] reverses the
+//! coefficient index so that variable is the *first*, matching sumcheck.
 
 use math::field::{
     element::FieldElement,
@@ -123,13 +93,8 @@ pub fn monomial_coefficients<F: IsField>(mle: &Mle<F>) -> Vec<FieldElement<F>> {
 
 /// The univariate lift used by the folding argument.
 ///
-/// [`monomial_coefficients`] indexes coefficients the way the hypercube is
-/// indexed, with variable 0 as the **high** bit — so the parity split that
-/// folding performs binds the *last* variable. Sumcheck binds the *first*.
-///
-/// Reversing the coefficient index makes variable 0 the low bit, so one fold
-/// binds exactly the variable one sumcheck round binds. That alignment is what
-/// lets the two run in step, and it is the only reason this exists separately.
+/// Reverses the coefficient index so variable 0 is the low bit, making one fold
+/// bind the variable one sumcheck round binds.
 pub fn lift_coefficients<F: IsField>(mle: &Mle<F>) -> Vec<FieldElement<F>> {
     let coeffs = monomial_coefficients(mle);
     let num_vars = mle.num_vars();
@@ -168,18 +133,8 @@ pub fn encode<F: IsFFTField + IsPrimeField>(
         .collect())
 }
 
-/// Folds a codeword once, with folding randomness `alpha`.
-///
-/// Splitting `F(X) = F₀(X²) + X·F₁(X²)` and taking `F_α = F₀ + α·F₁`, the two
-/// halves are recovered from the values at `x` and `−x`:
-///
-/// ```text
-/// F₀(x²) = (F(x) + F(−x)) / 2
-/// F₁(x²) = (F(x) − F(−x)) / 2x
-/// ```
-///
-/// `−x` is the element half a period away, so the pair for index `j` is
-/// `(j, j + N/2)`.
+/// Folds a codeword once: `F_α = F₀ + α·F₁`, recovering the halves from `F(x)`
+/// and `F(−x)`. `−x` is half a period away, so `j` pairs with `j + N/2`.
 pub fn fold_codeword<F: IsFFTField + IsPrimeField>(
     codeword: &[FieldElement<F>],
     domain: &Domain<F>,

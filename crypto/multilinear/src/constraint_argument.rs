@@ -1,33 +1,8 @@
-//! The whole thing: proving a **committed** trace satisfies a constraint.
+//! Zerocheck plus the evaluation argument: a **committed** trace satisfies a
+//! constraint.
 //!
-//! This is where the pieces stop being separately-correct machinery and become
-//! an argument. [`zerocheck`](crate::zerocheck) reduces "`C` vanishes on every
-//! row" to "`C` takes this value at this point", and hands that back unsettled.
-//! [`whir_eval`](crate::whir_eval) settles exactly that kind of claim about a
-//! committed polynomial. Composing them closes the loop:
-//!
-//! 1. commit each trace column;
-//! 2. zerocheck the constraint, leaving a claim at a random point `p`;
-//! 3. prove each column's value at `p` against its commitment;
-//! 4. rebuild `C(p)` from those values and check it against the claim.
-//!
-//! Step 4 is what makes step 3 necessary and step 2 meaningful. Without the
-//! commitments a prover answers step 2 with whatever number closes the proof;
-//! without step 4 the column values are unconstrained.
-//!
-//! # Structure without data
-//!
-//! The verifier needs to recompute `C(p)` but must not have the trace. The
-//! constraint therefore travels as a closure over *values* — see
-//! [`Composed`](crate::poly::Composed) — which both sides hold, while only the
-//! prover holds the columns.
-//!
-//! # Scope
-//!
-//! Columns are committed and opened one at a time. A real system batches both,
-//! and folds `k` variables per WHIR round rather than all at once; see
-//! [`whir_eval`](crate::whir_eval). Nothing here changes what is proven, only
-//! how much it costs.
+//! The constraint travels as a closure over values, so the verifier can rebuild
+//! `C(p)` without the trace. Columns are committed and opened one at a time.
 
 use crypto::fiat_shamir::is_transcript::IsTranscript;
 use math::{

@@ -1,31 +1,8 @@
-//! Packing tables of different heights into shared hypercubes.
+//! Packs columns of differing heights into shared `2^n_stack` polynomials.
 //!
-//! Our tables do not agree on a height: CPU and MEMW are `2^19`, MUL and SHIFT
-//! are `2^20`, BITWISE is a fixed `2^20`, HALT is a single row. A multilinear
-//! commitment works over one cube of a fixed dimension, so committing each
-//! table on its own means many commitments and many openings.
-//!
-//! Stacking flattens every column into shared polynomials of `2^n_stack`
-//! evaluations, so the commitment count stops tracking the table count.
-//!
-//! # Why alignment
-//!
-//! Each column of height `2^m` is placed at an offset that is a multiple of
-//! `2^m`. That makes its cells a **subcube** of the stacked polynomial: the low
-//! `m` variables are the column's own, and the high `n_stack − m` are fixed to
-//! the bits of `offset / 2^m`. So an evaluation claim translates with no
-//! protocol at all —
-//!
-//! ```text
-//! column(z)  =  stacked(prefix_bits ‖ z)
-//! ```
-//!
-//! — which is [`Placement::point_in_stacked`]. Packing without alignment fits
-//! more into a cube but costs a reduction sumcheck to relate the two; that
-//! trade is not taken here.
-//!
-//! The price of alignment is padding, and it depends on the order columns are
-//! registered. Registering widest-first minimizes it.
+//! Each column of height `2^m` sits at an offset that is a multiple of `2^m`,
+//! making it a subcube: `column(z) = stacked(prefix_bits ‖ z)`, with no protocol
+//! needed. The price is alignment padding; registering widest-first minimizes it.
 
 use math::field::{element::FieldElement, traits::IsField};
 

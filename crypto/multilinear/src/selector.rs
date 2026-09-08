@@ -1,19 +1,7 @@
-//! Row selectors: which steps a constraint applies to.
+//! Row selectors: the indicator of `index(x) < 2^n - end_exemptions`.
 //!
-//! A transition constraint that reads the next step cannot hold on the last
-//! step — there is nothing after it. The univariate prover handles this by
-//! shrinking the zerofier; on the hypercube the constraint is instead
-//! multiplied by a **selector** `s(x)`, one on the steps where it applies and
-//! zero elsewhere, so `s·C` really does vanish everywhere.
-//!
-//! Our constraint metadata expresses this as `end_exemptions = k`: the
-//! constraint applies to steps `0 .. N − k`. The selector is therefore the
-//! indicator of `index(x) < N − k`.
-//!
-//! The prover materializes the table; the verifier needs the same value at a
-//! random point without touching `2^n` entries, so [`Selector::evaluate`] is a
-//! closed form costing `O(n)` field operations. Both are multilinear, so a
-//! selector adds exactly one to the degree of whatever it multiplies.
+//! A transition constraint reading the next step cannot hold on the last one.
+//! Multiplying by a selector costs exactly one degree.
 
 use math::field::{element::FieldElement, traits::IsField};
 

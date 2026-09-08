@@ -1,18 +1,7 @@
-//! The sumcheck protocol.
+//! The sumcheck protocol, reducing `Σ_x f(x) = S` to one evaluation of `f`.
 //!
-//! Reduces the claim `Σ_{x ∈ {0,1}^n} f(x) = S` to a single evaluation of `f`
-//! at a random point. One round per variable: the prover sends the univariate
-//! `g_j(t) = Σ_{rest} f(r_0..r_{j-1}, t, rest)`, the verifier checks
-//! `g_j(0) + g_j(1)` against the running claim and answers with a challenge.
-//!
-//! Round polynomials travel as evaluations at `0, 1, .., d`, where `d` is the
-//! polynomial's degree — the natural form, since the prover produces them by
-//! summing over the remaining cube at each of those points.
-//!
-//! What the verifier is left with is a claim about `f` at the challenge point.
-//! Discharging it needs an oracle for `f` there; in a full proof system that is
-//! the polynomial commitment scheme. [`verify`] returns the claim rather than
-//! deciding it.
+//! Round polynomials travel as evaluations at `0, 1, .., d`. [`verify`] returns
+//! the residual claim rather than deciding it — the caller must discharge it.
 
 use crypto::fiat_shamir::is_transcript::IsTranscript;
 use math::field::{element::FieldElement, traits::IsField};
@@ -38,11 +27,8 @@ pub struct SumcheckClaim<F: IsField> {
     pub expected_evaluation: FieldElement<F>,
 }
 
-/// Interpolates a polynomial given by its values at `0, 1, .., d` and evaluates
-/// it at `x`, via the Lagrange basis for that node set.
-///
-/// Round polynomials are small (degree = the AIR's constraint degree), so the
-/// quadratic-time barycentric-free form is the cheap one here.
+/// Lagrange-interpolates values at `0, 1, .., d` and evaluates at `x`. Round
+/// polynomials are small, so the quadratic form is the cheap one.
 fn interpolate<F: IsField>(values: &[FieldElement<F>], x: &FieldElement<F>) -> FieldElement<F> {
     let n = values.len();
     let mut acc = FieldElement::<F>::zero();

@@ -1,44 +1,9 @@
-//! GKR over a tree of fractions — the LogUp argument without auxiliary columns.
+//! LogUp as a tree of fractions: `p₁/q₁ + p₂/q₂ = (p₁q₂ + p₂q₁)/(q₁q₂)`, added
+//! pairwise up a binary tree with GKR proving each layer against the one below.
+//! Only the input layer is ever committed.
 //!
-//! A LogUp bus balances when the signed fractions every row contributes sum to
-//! zero:
-//!
-//! ```text
-//! Σ_rows Σ_interactions  ± multiplicity / (α − fingerprint)  =  0
-//! ```
-//!
-//! Our prover computes that sum with committed running-sum columns in the
-//! extension field, plus transition constraints tying consecutive rows. Here it
-//! is computed by a **circuit** instead: fractions are added pairwise up a
-//! binary tree, and GKR proves each layer against the one below it, so nothing
-//! but the input layer is ever committed.
-//!
-//! Adding fractions is what each layer does:
-//!
-//! ```text
-//! p₁/q₁ + p₂/q₂ = (p₁·q₂ + p₂·q₁) / (q₁·q₂)
-//! ```
-//!
-//! A layer on `k` variables folds into one on `k − 1`, pairing index `i` with
-//! `i + 2^(k-1)` — the same halves [`Mle`](crate::mle::Mle) folds on. The top
-//! of the tree is a single fraction, and the bus balances exactly when its
-//! numerator is zero.
-//!
-//! # What the verifier is left with
-//!
-//! [`verify`] walks down the tree and returns a [`GkrClaim`]: the values `p`
-//! and `q` must take at a point on the **input** layer. Discharging that is the
-//! commitment scheme's job, exactly as with [`zerocheck`](crate::zerocheck).
-//!
-//! # What is not here yet
-//!
-//! - **Deciding the balance.** GKR proves the sum is whatever the output claims
-//!   it is. Checking that the output numerator is zero is the caller's, and it
-//!   is the whole point of running this on a bus.
-//! - **Building the input layer from a trace.** `p` is the signed
-//!   multiplicities and `q` is `α − fingerprint`; both must be tied to the
-//!   committed trace columns. Until that link exists this proves a statement
-//!   about numbers, not about our tables.
+//! Proves the sum is whatever the output claims. Checking that the output
+//! numerator is zero — the bus balance — is the caller's.
 
 use crypto::fiat_shamir::is_transcript::IsTranscript;
 use math::field::{element::FieldElement, traits::IsField};
@@ -131,14 +96,7 @@ impl<F: IsField> FractionTree<F> {
     }
 }
 
-/// The layer relation as a sumcheck polynomial.
-///
-/// Proves both halves of the fold at once, batched with `lambda`:
-///
-/// ```text
-/// Σ_x eq(r, x)·[ p_lo·q_hi + p_hi·q_lo + λ·q_lo·q_hi ]
-/// ```
-///
+/// The layer relation: `Σ_x eq(r,x)·[p_lo·q_hi + p_hi·q_lo + λ·q_lo·q_hi]`,
 /// which equals `p_out(r) + λ·q_out(r)` when the layer really is the fold.
 struct LayerRelation<F: IsField> {
     /// `[eq, p_lo, p_hi, q_lo, q_hi]`.

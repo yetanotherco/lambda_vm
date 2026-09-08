@@ -1,13 +1,5 @@
-//! A sum of products of multilinear polynomials.
-//!
-//! This is the shape an AIR constraint takes once written out: each monomial is
-//! a coefficient times a product of column polynomials. The sumcheck prover
-//! never needs the expanded polynomial — only the ability to evaluate it on a
-//! hypercube index and to fold every factor — so this holds the factors and the
-//! term structure instead.
-//!
-//! Total degree is the largest number of factors in any one term, which is what
-//! bounds the degree of each sumcheck round polynomial.
+//! A sum of products of multilinear polynomials — one implementation of
+//! [`SumcheckPolynomial`](crate::poly::SumcheckPolynomial).
 
 use math::field::{element::FieldElement, traits::IsField};
 

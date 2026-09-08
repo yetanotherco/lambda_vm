@@ -1,35 +1,9 @@
-//! Bridges an AIR's constraint IR to the multilinear world.
+//! Bridges an AIR's constraint IR to the hypercube: one factor per distinct
+//! `(main, offset, col)` trace read, `offset` as a cyclic rotation, and row
+//! domains as [`Selector`]s.
 //!
-//! Our constraints are captured as a flat DAG ([`ConstraintProgram`]) whose
-//! leaves are trace reads `Var { main, offset, col }`. The univariate prover
-//! evaluates that DAG row by row over a blown-up domain; here it is evaluated
-//! over the Boolean hypercube instead, so that
-//! [`zerocheck`](multilinear::zerocheck) can prove the constraints vanish
-//! without ever forming a quotient.
-//!
-//! Three things need translating.
-//!
-//! **Row reads become columns of the cube.** A trace of `2^n` steps gives every
-//! column a multilinear extension on `n` variables. One MLE is materialized per
-//! distinct `(main, offset, col)` leaf.
-//!
-//! **`offset` becomes a rotation.** Reading the next step is free in the
-//! univariate setting — it is evaluation at `g·z`. On the hypercube it is a
-//! shift of the evaluation table, so a leaf at `offset = k` gets its own MLE
-//! holding `column[(step + k) mod 2^n]`.
-//!
-//! **Row domains become selectors.** That rotation is cyclic, so a transition
-//! constraint reading the next step is violated at the wrap. The univariate
-//! prover shrinks the zerofier; here each constraint is multiplied by a
-//! [`Selector`] built from its `end_exemptions`, which is one extra degree.
-//!
-//! # What is deliberately not here yet
-//!
-//! - **Binding a rotation to its source.** The prover materializes the shifted
-//!   table; nothing yet forces it to actually be the shift of the committed
-//!   column. That is a commitment-scheme obligation — a rotation argument — and
-//!   it is the reason this module is not sound on its own.
-//! - **Base-field values.** Everything is lifted into the extension field.
+//! Not sound on its own: nothing yet forces a rotated factor to be the shift of
+//! the column it claims to shift. Values are all lifted to the extension field.
 
 use math::field::{
     element::FieldElement,
@@ -184,14 +158,10 @@ fn node_degrees<F: IsField, E: IsField>(program: &ConstraintProgram<F, E>) -> Ve
     deg
 }
 
-/// An AIR's constraints as one polynomial over the hypercube.
+/// An AIR's constraints as one polynomial: `C = Σ_i beta^i · s_i(x) · C_i(x)`.
 ///
-/// Each selected constraint is multiplied by its row selector and the results
-/// are batched with powers of `beta`, so a single zerocheck covers all of them:
-/// `C = Σ_i beta^i · s_i(x) · C_i(x)`.
-///
-/// The factor list is the trace leaves followed by one table per distinct
-/// non-trivial selector; `combine` indexes it in that order.
+/// Factors are the trace leaves followed by one table per distinct non-trivial
+/// selector, in that order.
 pub struct IrPolynomial<'a, F: IsField, E: IsField> {
     shape: IrShape<'a, F, E>,
     polys: Vec<Mle<E>>,
