@@ -886,6 +886,37 @@ fn name_panic_payload(
     }
 }
 
+/// DIAGNOSTIC (lane M, not for merge): `LAMBDA_VM_DIAG_OLD_TABLE_ORDER=1`
+/// walks the tables in the order the retired estimate (two LDE buffers plus
+/// 256 B per LDE row) would have produced, keeping the device-set estimates
+/// for the gate itself, so a host-peak shift can be attributed to the walk
+/// order alone. Both orders are printed with their estimates either way.
+fn diag_old_table_order() -> bool {
+    std::env::var("LAMBDA_VM_DIAG_OLD_TABLE_ORDER").is_ok_and(|v| v != "0")
+}
+
+/// The retired estimate, for [`diag_old_table_order`] only.
+fn diag_old_estimate(main_cols: usize, aux_cols: usize, lde_size: usize) -> u64 {
+    let lde = lde_size as u64;
+    let per_row = (main_cols as u64) * 8 + (aux_cols as u64) * 24;
+    lde * per_row * 2 + lde * 256
+}
+
+/// Print one walk order with its estimates, for the attribution run.
+fn diag_print_order(phase: &str, order: &[usize], estimates: &[u64], names: &[String]) {
+    let line: Vec<String> = order
+        .iter()
+        .map(|&i| {
+            format!(
+                "{}={:.2}GiB",
+                names[i],
+                estimates[i] as f64 / (1u64 << 30) as f64
+            )
+        })
+        .collect();
+    eprintln!("[diag] {phase} order: {}", line.join(" "));
+}
+
 /// Table indices sorted heaviest-first by estimate.
 fn heaviest_first(estimates: &[u64]) -> Vec<usize> {
     let mut order: Vec<usize> = (0..estimates.len()).collect();
@@ -3778,8 +3809,42 @@ pub trait IsStarkProver<
         // the transcript only needs the roots absorbed in index order, done
         // sequentially below once every commit completed — the one ordering
         // Fiat-Shamir requires before sampling the shared challenges.
+        // DIAGNOSTIC (lane M, not for merge): both walk orders, and the old
+        // one when asked for.
+        let diag_old_main: Vec<u64> = air_trace_pairs
+            .iter()
+            .enumerate()
+            .map(|(idx, (_, trace, _))| {
+                let d = &domains[idx];
+                diag_old_estimate(
+                    trace.num_main_columns,
+                    0,
+                    d.interpolation_domain_size * d.blowup_factor,
+                )
+            })
+            .collect();
+        let new_main_order = heaviest_first(&main_estimates);
+        let old_main_order = heaviest_first(&diag_old_main);
+        diag_print_order(
+            "R1 new-model",
+            &new_main_order,
+            &main_estimates,
+            &table_names,
+        );
+        diag_print_order(
+            "R1 old-model",
+            &old_main_order,
+            &diag_old_main,
+            &table_names,
+        );
+        let main_order = if diag_old_table_order() {
+            eprintln!("[diag] R1 walking the OLD order");
+            old_main_order
+        } else {
+            new_main_order
+        };
         let main_results = run_admitted(
-            &heaviest_first(&main_estimates),
+            &main_order,
             &main_estimates,
             &vram_gate,
             k,
@@ -4326,7 +4391,40 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         let __sp = crate::instruments::span("rounds_2to4");
 
-        let peak_order = heaviest_first(&peak_estimates);
+        // DIAGNOSTIC (lane M, not for merge): both walk orders, and the old
+        // one when asked for.
+        let diag_old_peak: Vec<u64> = (0..num_airs)
+            .map(|idx| {
+                let (air, trace, _) = &*pair_cells[idx].lock().unwrap();
+                let d = &domains[idx];
+                let (_, aux_cols) = air.trace_layout();
+                diag_old_estimate(
+                    trace.num_main_columns,
+                    aux_cols,
+                    d.interpolation_domain_size * d.blowup_factor,
+                )
+            })
+            .collect();
+        let new_peak_order = heaviest_first(&peak_estimates);
+        let old_peak_order = heaviest_first(&diag_old_peak);
+        diag_print_order(
+            "rounds new-model",
+            &new_peak_order,
+            &peak_estimates,
+            &table_names,
+        );
+        diag_print_order(
+            "rounds old-model",
+            &old_peak_order,
+            &diag_old_peak,
+            &table_names,
+        );
+        let peak_order = if diag_old_table_order() {
+            eprintln!("[diag] rounds walking the OLD order");
+            old_peak_order
+        } else {
+            new_peak_order
+        };
 
         // One fused task per table: while a heavy table works through a
         // host-bound stretch, the others' GPU stages fill the device. The
