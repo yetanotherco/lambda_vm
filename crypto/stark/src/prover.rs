@@ -774,11 +774,12 @@ impl Drop for VramPermit<'_> {
 }
 
 /// Run `task` once per table index on `workers` OS driver threads, admitting
-/// each index through `gate` with its estimated bytes. `order` fixes the
-/// start order — the caller's walk: largest fused-phase host transient first
-/// (`device_set::host_transient_bytes`), so the long pole starts early and
-/// small tables fill around it, and so the host allocator sees the layout the
-/// measured-good walk produces. Returns one slot per original index.
+/// each index through `gate` with its estimated bytes. The two array arguments
+/// are deliberately independent: `estimates` is what the gate spends (the
+/// device set, `crate::device_set`), while `order` is the caller's walk — a
+/// scheduling policy keyed on [`table_walk_weight`], heaviest first, so the
+/// long pole starts early and small tables fill around it. Returns one slot
+/// per original index.
 fn run_admitted<T: Send>(
     order: &[usize],
     estimates: &[u64],
@@ -887,11 +888,78 @@ fn name_panic_payload(
     }
 }
 
-/// Table indices sorted heaviest-first by estimate.
-fn heaviest_first(estimates: &[u64]) -> Vec<usize> {
-    let mut order: Vec<usize> = (0..estimates.len()).collect();
-    order.sort_by_key(|&i| std::cmp::Reverse(estimates[i]));
+/// The sort weight for the table walk. A SCHEDULING policy, not a size model —
+/// see [`crate::device_set`] for the bytes anything is admitted against.
+///
+/// The walk is the order the per-table drivers *start* tables in. At
+/// `TABLE_PARALLELISM=1` it cannot change what is resident on the device (one
+/// table at a time, the gate never blocks), but it does fix the order the host
+/// allocator sees the per-table arenas in, and that is worth 5.9 GiB of host
+/// peak. Measured on the q=20 wrap (2^22, blowup 4, RTX 5090 box, 2026-09-07),
+/// `/usr/bin/time -v` max RSS, with prove time and proof bytes identical across
+/// all four runs:
+///
+/// | walk | max RSS |
+/// |------|---------|
+/// | this weight, before the device-set model landed | 47,307,284 kB = 45.1 GiB |
+/// | this weight, restored under the device-set gate | 47,365,192 kB = 45.2 GiB |
+/// | the device-set model's own order | 53,472,980 kB = 51.0 GiB |
+/// | a fused-phase host-transient order | 53,453,344 kB = 51.0 GiB |
+///
+/// At q=41 this weight and the device-set order both measure 98.6 GiB, so the
+/// effect is shape-dependent and the mechanism — why reordering only the small
+/// tables moves host peak at all when one table is resident at a time — is
+/// still open. Until it is understood, this order is kept because it is the one
+/// that measures well. That is the whole justification, and it is why the
+/// weight below lives here with the scheduler and not in the device-set model.
+///
+/// Its arithmetic is inherited verbatim from the VRAM estimate the prover
+/// sorted by before the device-set model, and it is deliberately NOT re-read as
+/// a byte count: the factor of two assumed the second LDE buffer that #956's
+/// in-place transpose removed, and the flat 256 B per LDE row stands in for a
+/// tree whose real width depends on the digest. Changing these numbers changes
+/// the schedule, so any change needs a wrap measurement, not an argument about
+/// bytes.
+///
+/// Pass `aux_cols == 0` for the R1 main-commit walk and the AIR's aux width for
+/// the fused rounds walk: the two phases weigh the tables differently, and they
+/// always have.
+fn table_walk_weight(main_cols: usize, aux_cols: usize, lde_size: usize) -> u64 {
+    const BASE_WEIGHT: u64 = 8;
+    const EXT3_WEIGHT: u64 = 24;
+    const WIDTH_WEIGHT: u64 = 2;
+    const PER_LDE_ROW_WEIGHT: u64 = 256;
+    let lde = lde_size as u64;
+    let per_row = (main_cols as u64).saturating_mul(BASE_WEIGHT)
+        + (aux_cols as u64).saturating_mul(EXT3_WEIGHT);
+    let width_term = lde.saturating_mul(per_row).saturating_mul(WIDTH_WEIGHT);
+    let row_term = lde.saturating_mul(PER_LDE_ROW_WEIGHT);
+    width_term.saturating_add(row_term)
+}
+
+/// Table indices sorted heaviest-first by weight. `sort_by_key` is stable, so
+/// tables that weigh the same keep their registry order.
+fn heaviest_first(weights: &[u64]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..weights.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(weights[i]));
     order
+}
+
+/// One line naming the walk a phase took, heaviest first. Printed once per
+/// phase per prove: the walk is a measured choice (see [`table_walk_weight`]),
+/// so a run that moves host peak has to be able to say which order it took.
+fn describe_walk(order: &[usize], weights: &[u64], names: &[String]) -> String {
+    order
+        .iter()
+        .map(|&i| {
+            format!(
+                "{}={:.2}GiB",
+                names[i],
+                weights[i] as f64 / (1u64 << 30) as f64
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// A container for the results of the second round of the STARK Prove protocol.
@@ -3709,8 +3777,9 @@ pub trait IsStarkProver<
         let vram_gate = VramGate::new(vram_budget);
 
         // The shapes the AIR and the domain fix, read once: the device-set
-        // estimates the gate admits against and the host-transient key the
-        // walks are sorted by both derive from them (`crate::device_set`).
+        // estimates the gate admits against derive from them
+        // (`crate::device_set`). The walk order does NOT — see
+        // `table_walk_weight`.
         let table_shapes: Vec<crate::device_set::TableShape> = air_trace_pairs
             .iter()
             .enumerate()
@@ -3744,27 +3813,20 @@ pub trait IsStarkProver<
             .map(|(air, _, _)| air.name().to_string())
             .collect();
 
-        // The walk order, for BOTH phases: largest fused-phase host transient
-        // first (`device_set::host_transient_bytes` — the measurement behind
-        // the choice is on its doc). Deliberately not the device-set estimate
-        // the gate uses: at `TABLE_PARALLELISM=1` the order moves nothing on
-        // the device and 5.9 GiB of host peak.
-        let walk_keys: Vec<u64> = table_shapes
+        // The R1 walk: the main commit's weight, aux width zero because the aux
+        // columns are not resident yet in this phase. Keyed on
+        // `table_walk_weight`, NOT on `main_estimates` — the estimates above
+        // are what the gate spends, this is the schedule, and the two are no
+        // longer the same function. The weight's doc carries the measurement
+        // that makes this the order rather than any other.
+        let main_walk_weights: Vec<u64> = table_shapes
             .iter()
-            .map(|&s| crate::device_set::host_transient_bytes(s))
+            .map(|s| table_walk_weight(s.main_cols, 0, s.n * s.blowup))
             .collect();
-        let walk_order = heaviest_first(&walk_keys);
+        let main_walk_order = heaviest_first(&main_walk_weights);
         eprintln!(
-            "[prover] table walk (fused-phase host transient, largest first): {}",
-            walk_order
-                .iter()
-                .map(|&i| format!(
-                    "{}={:.2}GiB",
-                    table_names[i],
-                    walk_keys[i] as f64 / (1u64 << 30) as f64
-                ))
-                .collect::<Vec<_>>()
-                .join(" ")
+            "[prover] table walk R1 (walk weight, largest first): {}",
+            describe_walk(&main_walk_order, &main_walk_weights, &table_names)
         );
 
         // Spill main traces to mmap before Round 1 LDE.
@@ -3814,7 +3876,7 @@ pub trait IsStarkProver<
         // sequentially below once every commit completed — the one ordering
         // Fiat-Shamir requires before sampling the shared challenges.
         let main_results = run_admitted(
-            &walk_order,
+            &main_walk_order,
             &main_estimates,
             &vram_gate,
             k,
@@ -3968,6 +4030,15 @@ pub trait IsStarkProver<
             .iter()
             .enumerate()
             .map(|(idx, _)| crate::device_set::table_device_set(table_shapes[idx]).total())
+            .collect();
+
+        // The fused phase's own walk, separate from R1's because the aux
+        // columns are resident here and so carry weight. Keyed on
+        // `table_walk_weight`, not on `peak_estimates`: the estimates feed the
+        // gate, the weight fixes the schedule.
+        let peak_walk_weights: Vec<u64> = table_shapes
+            .iter()
+            .map(|s| table_walk_weight(s.main_cols, s.aux_cols, s.n * s.blowup))
             .collect();
 
         // Per-table slots for the fused chain: each driver takes or locks only
@@ -4348,9 +4419,11 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         let __sp = crate::instruments::span("rounds_2to4");
 
-        // Same walk as R1 (see `walk_order`): the estimates below feed the gate,
-        // the order is the host policy.
-        let peak_order = walk_order.clone();
+        let peak_order = heaviest_first(&peak_walk_weights);
+        eprintln!(
+            "[prover] table walk rounds 2-4 (walk weight, largest first): {}",
+            describe_walk(&peak_order, &peak_walk_weights, &table_names)
+        );
 
         // One fused task per table: while a heavy table works through a
         // host-bound stretch, the others' GPU stages fill the device. The
@@ -5146,5 +5219,55 @@ fn print_bus_balance_report<FieldExtension>(
             let report = tracker.analyze_mismatches();
             report.print_summary();
         }
+    }
+}
+
+#[cfg(test)]
+mod walk_tests {
+    use super::{heaviest_first, table_walk_weight};
+
+    /// The weight is `2·lde·(8·main + 24·aux) + 256·lde`. These constants are a
+    /// schedule, not a size, so this test exists to make a change to them a
+    /// deliberate act that comes with a wrap measurement.
+    #[test]
+    fn the_walk_weight_is_pinned() {
+        let lde = 1usize << 22;
+        assert_eq!(
+            table_walk_weight(25, 3, lde),
+            (lde as u64) * (2 * (8 * 25 + 24 * 3) + 256)
+        );
+        assert_eq!(table_walk_weight(1, 1, 16), 16 * (2 * (8 + 24) + 256));
+        // No floor: the per-LDE-row term scales with height, so two narrow
+        // tables of different heights never tie. The device-set model's 256 MiB
+        // scratch floor tied six small tables at the wrap, and that tie is
+        // where the two walks first diverge.
+        assert!(table_walk_weight(4, 1, 1 << 16) > table_walk_weight(4, 1, 1 << 15));
+    }
+
+    /// The two phases weigh differently: R1 passes `aux_cols == 0` because the
+    /// aux columns are not resident yet, the fused phase passes the AIR's aux
+    /// width. A table that is narrow in main and wide in aux therefore moves
+    /// between the two walks.
+    #[test]
+    fn the_two_phases_can_walk_differently() {
+        let lde = 1usize << 20;
+        // (main, aux) per table: the second is aux-heavy, the first main-heavy.
+        let main_walk: Vec<u64> = [(60usize, 1usize), (10, 30)]
+            .iter()
+            .map(|&(m, _)| table_walk_weight(m, 0, lde))
+            .collect();
+        let fused_walk: Vec<u64> = [(60usize, 1usize), (10, 30)]
+            .iter()
+            .map(|&(m, a)| table_walk_weight(m, a, lde))
+            .collect();
+        assert_eq!(heaviest_first(&main_walk), vec![0, 1]);
+        assert_eq!(heaviest_first(&fused_walk), vec![1, 0]);
+    }
+
+    /// Ties keep registry order, so equal-weight tables walk in the order the
+    /// registry lists them and the walk is reproducible run to run.
+    #[test]
+    fn ties_keep_registry_order() {
+        assert_eq!(heaviest_first(&[5, 9, 5, 9]), vec![1, 3, 0, 2]);
     }
 }

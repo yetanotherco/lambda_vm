@@ -196,29 +196,12 @@ pub fn table_device_set(shape: TableShape) -> TableDeviceSet {
     }
 }
 
-/// The HOST bytes a table's fused task allocates — the walk-order key.
-///
-/// At `TABLE_PARALLELISM=1` the order the tables are walked in changes nothing
-/// on the device (the gate never blocks) and everything about the host
-/// allocator's layout, and that layout is a measured 5.9 GiB of peak at the
-/// wrap (q=20, 2^22, blowup 4, 15 tables, RTX 5090 box, 2026-09-07): walking
-/// by the device-set model peaked at 51.0 GiB max RSS, walking by the retired
-/// `2·lde·(8·main + 24·aux) + 256·lde` key at 45.2 GiB, prove 137.8 vs
-/// 137.9 s. So the walk is a HOST policy, sorted by the host transient of the
-/// fused task under residency recompute: the recomputed main LDE (`8·main`
-/// per LDE row), the aux LDE's host copy (`24·aux`), the parts (`24·parts`),
-/// the DEEP codeword (24) and the FRI chain (48 — two codewords bound the
-/// geometric sum): `lde · (8·main + 24·aux + 24·(parts + 3))`. Per LDE row
-/// that is the retired key's weights with 120 in place of 128 in the
-/// constant, so it walks the tables the retired key did; both phases sort by
-/// it so the two walks agree, and the prover prints the walk it took.
-pub fn host_transient_bytes(shape: TableShape) -> u64 {
-    let lde = (shape.n as u64).saturating_mul(shape.blowup as u64);
-    let per_row = base_bytes(1, shape.main_cols as u64)
-        .saturating_add(ext3_bytes(1, shape.aux_cols as u64))
-        .saturating_add(ext3_bytes(1, shape.num_parts as u64 + 3));
-    lde.saturating_mul(per_row)
-}
+// This module is the SIZE model and nothing else: what a stage puts on the
+// card, so the gate can decide whether it fits. It is deliberately not the
+// prover's table walk. The walk is a scheduling policy, keyed on a weight that
+// is kept for the order it produces rather than for any byte it names, and it
+// lives with the scheduler in `prover::table_walk_weight`. Sorting the walk by
+// this model instead cost a measured 5.9 GiB of host peak at the q=20 wrap.
 
 /// What the admission predicate decided for one dispatch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -348,36 +331,6 @@ mod tests {
         );
         assert!(5 * set.total() <= CARD_32_GIB_BUDGET);
         assert!(6 * set.total() > CARD_32_GIB_BUDGET);
-    }
-
-    /// The walk key is `lde · (8·main + 24·aux + 24·(parts + 3))`: the retired
-    /// key's per-row weights (`16·main + 48·aux + 256`, halved) with 120 in
-    /// place of 128 in the constant, and no scratch floor to tie the small
-    /// tables.
-    #[test]
-    fn the_walk_key_is_the_host_transient() {
-        let shape = TableShape {
-            n: 1 << 20,
-            blowup: 4,
-            main_cols: 25,
-            aux_cols: 3,
-            num_parts: 2,
-            num_eval_points: 2,
-        };
-        assert_eq!(
-            host_transient_bytes(shape),
-            (1u64 << 22) * (8 * 25 + 24 * 3 + 120)
-        );
-        let tiny = TableShape {
-            n: 4,
-            blowup: 4,
-            main_cols: 1,
-            aux_cols: 1,
-            num_parts: 2,
-            num_eval_points: 2,
-        };
-        assert_eq!(host_transient_bytes(tiny), 16 * (8 + 24 + 120));
-        assert!(host_transient_bytes(tiny) < host_transient_bytes(shape));
     }
 
     /// A table without aux or parts (d=1 with no lookups) counts only what it
