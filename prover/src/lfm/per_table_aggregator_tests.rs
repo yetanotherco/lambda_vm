@@ -522,9 +522,7 @@ fn the_aggregation_publish_profile_drops_only_diagnostics() {
         .tables
         .iter()
         .zip(&e.legs)
-        .map(|(h, leg)| {
-            1 + leg.verify.num_queries + 3 + h.zetas.len() + h.shape.num_queries
-        })
+        .map(|(h, leg)| 1 + leg.verify.num_queries + 3 + h.zetas.len() + h.shape.num_queries)
         .sum();
     assert_eq!(
         diag.len(),
